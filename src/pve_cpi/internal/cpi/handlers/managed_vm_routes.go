@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
-	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
-	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"strconv"
 	"strings"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
 

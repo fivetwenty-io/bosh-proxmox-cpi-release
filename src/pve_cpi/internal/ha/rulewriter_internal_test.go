@@ -197,7 +197,8 @@ func TestApplyRefusesAnInfeasibleWriteBeforeSending(t *testing.T) {
 }
 
 func TestApplyCarriesInfeasibleOnAPVERefusal(t *testing.T) {
-	refusal := &sdkerrors.APIError{HTTPCode: 400, Message: "invalid format - resources: rule must specify two"}
+	refusal := &sdkerrors.APIError{HTTPCode: 400, Message: "invalid format",
+		Errors: map[string]string{"resources": "rule must specify at least two resources"}}
 	api := &fakeRuleAPI{faults: map[int]ruleFault{0: {err: refusal}}}
 	w, _ := newTestWriter(api, nil)
 	_, err := w.Apply(context.Background(), "t", ensure(ourAA("aa", "vm:1", "vm:2")))
@@ -207,6 +208,53 @@ func TestApplyCarriesInfeasibleOnAPVERefusal(t *testing.T) {
 	}
 	if len(api.writes) != 1 {
 		t.Fatalf("a refused write was sent again: %v", api.writes)
+	}
+}
+
+func TestApplyKeepsOtherRefusalsApartFromInfeasible(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status string
+	}{
+		{"permission", &sdkerrors.APIError{HTTPCode: 403, Message: "Permission check failed (/, Sys.Console)"},
+			"HTTP 403"},
+		{"parameter", &sdkerrors.APIError{HTTPCode: 400, Message: "Parameter verification failed.",
+			Errors: map[string]string{"nodes": "invalid format"}}, "HTTP 400"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeRuleAPI{faults: map[int]ruleFault{0: {err: tc.err}}}
+			w, _ := newTestWriter(api, nil)
+			_, err := w.Apply(context.Background(), "t", ensure(ourAA("aa", "vm:1", "vm:2")))
+			if errors.Is(err, ErrRuleInfeasible) || !errors.Is(err, ErrRuleRefused) ||
+				!cpierrors.IsType(err, cpierrors.TypeCloud) || !strings.Contains(err.Error(), tc.status) {
+				t.Fatalf("err = %v", err)
+			}
+			if len(api.writes) != 1 {
+				t.Fatalf("a refused write was sent again: %v", api.writes)
+			}
+		})
+	}
+}
+
+func TestIsFeasibilityRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{&sdkerrors.APIError{HTTPCode: 400, Message: "rule 'x' is infeasible"}, true},
+		{&sdkerrors.APIError{HTTPCode: 400, Message: "invalid format", Errors: map[string]string{
+			"resources": "rule defines more resources than available nodes"}}, true},
+		{&sdkerrors.APIError{HTTPCode: 403, Message: "rule defines more resources than available nodes"}, true},
+		{&sdkerrors.APIError{HTTPCode: 403, Message: "Permission check failed"}, false},
+		{&sdkerrors.APIError{HTTPCode: 404, Message: "no such rule"}, false},
+		{&sdkerrors.APIError{HTTPCode: 500, Message: "rule is infeasible"}, false},
+		{errors.New("rule is infeasible"), false},
+	} {
+		if got := IsFeasibilityRefusal(tc.err); got != tc.want {
+			t.Errorf("IsFeasibilityRefusal(%v) = %v, want %v", tc.err, got, tc.want)
+		}
 	}
 }
 
@@ -223,6 +271,10 @@ func TestClassifyRuleWrite(t *testing.T) {
 		{create, errors.New("rule 'x' already defined"), writeHeld},
 		{create, errors.New("detected modified configuration"), writeConflict},
 		{create, &sdkerrors.APIError{HTTPCode: 400, Message: "bad"}, writeRejected},
+		{RuleOp{Kind: OpUpdate, Rule: Rule{ID: "x"}}, &sdkerrors.APIError{HTTPCode: 404, Message: "no such rule"},
+			writeConflict},
+		{RuleOp{Kind: OpUpdate, Rule: Rule{ID: "x"}}, &sdkerrors.APIError{HTTPCode: 403, Message: "denied"},
+			writeRejected},
 		{create, &sdkerrors.APIError{HTTPCode: 503, Message: "busy"}, writeHeld},
 		{create, errors.New("EOF"), writeHeld},
 	} {

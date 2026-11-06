@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -37,10 +38,10 @@ func naRuleNameFor(vmid int) string {
 // pin failure without failing create_vm. A no-op when pinning is disabled.
 //
 // Selective propagation: an error propagateHARuleError names (lock-timeout,
-// verify failure, and in managed mode a pin that is not in effect or that the
-// feasibility checks refused) is returned so the director re-drives rather than
-// silently losing the AZ pin guarantee. Generic HA-API failures (HA
-// unconfigured, rule-write hiccup) are logged as warnings and do not fail
+// verify failure, a hard constraint no configured node satisfies, and in
+// managed mode every pin failure) is returned so the director re-drives rather
+// than silently losing the AZ pin guarantee. In auto, generic HA-API failures
+// (HA unconfigured, rule-write hiccup) are logged as warnings and do not fail
 // create_vm, preserving the best-effort intent.
 //
 // The AZ pin is written into the VM's one merged pin, bosh-na-<vmid>, with the
@@ -253,6 +254,17 @@ func writeMergedPin(
 	ident := haIdentity{Owner: deps.RequestDirectorUUID}
 	marker := ident.marker()
 
+	// A hard constraint that no configured node satisfies leaves the VM nowhere
+	// it may run. The check runs before the registration, so the CPI never
+	// leaves an HA resource without the confinement it needs, and the error is
+	// retriable so the Director re-drives once the node set has changed.
+	if req.Hard != nil {
+		if _, err := ha.AdmissibleHard(req.Hard, profileNodeNames(profile)); err != nil {
+			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("node-affinity: pin %q not written and VM %d not registered with HA", ruleName, vmid))
+		}
+	}
+
 	if req.Register {
 		// Register the VM as an HA resource (idempotent; "already defined" is fine).
 		if err := svc.CreateHaResources(ctx, &cluster.CreateHaResourcesParams{Sid: sid, Comment: &marker}); err != nil {
@@ -277,7 +289,11 @@ func writeMergedPin(
 			}
 			want, err := ha.BuildPin(mergedPinSpec(set, cur, profile, req, ruleName, marker, sid))
 			if err != nil {
-				return nil, fmt.Errorf("node-affinity: %w", err)
+				// The VM is registered by now, so a pin that cannot be built
+				// must fail the call in every mode rather than leave it
+				// unconfined.
+				return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+					fmt.Sprintf("node-affinity: pin %q for VM %d", ruleName, vmid))
 			}
 			switch {
 			case want == nil:

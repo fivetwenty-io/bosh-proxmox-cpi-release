@@ -1,10 +1,33 @@
 package ha
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 )
+
+// ErrNoAdmissibleNode means no configured node satisfies a pin's hard
+// constraints, so the VM has nowhere it may run and must not be left without a
+// pin.
+var ErrNoAdmissibleNode = errors.New("no configured node satisfies the hard constraints")
+
+// AdmissibleHard returns the nodes of hard that the configured node set holds,
+// or every node of hard when the configured set is unknown. An empty answer
+// returns ErrNoAdmissibleNode.
+func AdmissibleHard(hard, configured []string) ([]string, error) {
+	known := toSet(trimmed(configured))
+	var nodes []string
+	for _, n := range trimmed(hard) {
+		if len(known) == 0 || known[n] {
+			nodes = append(nodes, n)
+		}
+	}
+	if len(nodes) == 0 {
+		return nil, fmt.Errorf("%w %s", ErrNoAdmissibleNode, strings.Join(trimmed(hard), ","))
+	}
+	return nodes, nil
+}
 
 // Pin priorities. PVE runs a resource in the highest-priority group of nodes
 // that are available, so the placed node comes first, the other nodes of a
@@ -61,14 +84,9 @@ func BuildPin(spec PinSpec) (*Rule, error) {
 	strict := false
 	switch {
 	case spec.Hard != nil:
-		for _, n := range trimmed(spec.Hard) {
-			if len(configured) == 0 || configured[n] {
-				nodes = append(nodes, n)
-			}
-		}
-		if len(nodes) == 0 {
-			return nil, fmt.Errorf("pin %s: no configured node satisfies the hard constraints %s",
-				spec.ID, strings.Join(trimmed(spec.Hard), ","))
+		var err error
+		if nodes, err = AdmissibleHard(spec.Hard, spec.Configured); err != nil {
+			return nil, fmt.Errorf("pin %s: %w", spec.ID, err)
 		}
 		strict = len(configured) == 0 || len(nodes) < len(configured)
 	case len(trimmed(spec.Preferred)) > 0:

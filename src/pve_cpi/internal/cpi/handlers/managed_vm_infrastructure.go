@@ -68,9 +68,51 @@ func (m *managedVMAllocation) infrastructureMutationParameters(ctx context.Conte
 		fields["version"] = 1
 		fields["kind"] = managedVMHARuleKind
 		return aj.MutationParameters(fields)
+	case "Cluster.UpdateHaRules", "Cluster.DeleteHaRules":
+		return nil, m.admitManagedVMHARuleEdit(ctx, call)
 	default:
 		return nil, nil
 	}
+}
+
+// admitManagedVMHARuleEdit lets a rule update or delete through only when the
+// rule is one of ours. Its name must be a CPI rule name, bosh-na- or bosh-aa-,
+// and the rule as read now must carry this Director's ownership marker. An
+// update must also write that marker. A delete of a rule that is already gone
+// changes nothing and passes. An update or delete need not name the VM,
+// because flattening pin priorities and moving members touch other VMs' rules,
+// so the marker is the backstop that keeps an allocation off any other rule.
+func (m *managedVMAllocation) admitManagedVMHARuleEdit(ctx context.Context, call ManagedAllocationMutation) error {
+	rule, _ := call.Args["rule"].(string)
+	if !strings.HasPrefix(rule, naRuleNamePrefix) && !strings.HasPrefix(rule, haRuleNamePrefix) {
+		return fmt.Errorf("HA rule %q is not a CPI rule", rule)
+	}
+	owner := m.deps.RequestDirectorUUID
+	if owner == "" {
+		return fmt.Errorf("HA rule %q edit lacks a Director to own it", rule)
+	}
+	update := call.Method == "UpdateHaRules"
+	if update {
+		params, ok := call.Args[managedArgumentParams].(*cluster.UpdateHaRulesParams)
+		if !ok || params == nil || params.Comment == nil || haOwnershipOf(*params.Comment, owner) != haOwnedByUs {
+			return fmt.Errorf("HA rule %q update does not carry this Director's ownership marker", rule)
+		}
+	}
+	existing, err := readManagedVMHARule(ctx, m.deps, rule)
+	if err != nil {
+		return err
+	}
+	if existing == nil {
+		if update {
+			return fmt.Errorf("HA rule %q was absent before its update", rule)
+		}
+		return nil
+	}
+	comment, _ := existing["comment"].(string)
+	if haOwnershipOf(comment, owner) != haOwnedByUs {
+		return fmt.Errorf("HA rule %q does not carry this Director's ownership marker", rule)
+	}
+	return nil
 }
 
 func resolveManagedVMRoute(ctx context.Context, deps Deps, route AdvertisedRoute) (managedVMRouteIdentity, error) {

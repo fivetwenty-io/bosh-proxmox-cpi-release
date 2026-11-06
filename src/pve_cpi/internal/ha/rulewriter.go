@@ -53,6 +53,10 @@ var (
 	// ErrRuleInfeasible means the CPI's feasibility checks refused the write
 	// before anything was sent, because it would make a rule infeasible.
 	ErrRuleInfeasible = errors.New("HA rule write would make the rule set infeasible")
+	// ErrRuleRefused means PVE answered a rule write with a refusal that is not
+	// a feasibility error, such as a missing permission or a bad parameter. The
+	// error carries the HTTP status, so the operator sees what to fix.
+	ErrRuleRefused = errors.New("PVE refused the HA rule write")
 	// ErrRuleNotInEffect means a CPI-owned rule is disabled or conflicting
 	// after the write. A caller in managed mode fails the call, and one in auto
 	// logs it.
@@ -180,10 +184,7 @@ func (w *RuleWriter) Apply(ctx context.Context, label string, plan Planner) (*Ap
 			}
 			continue
 		case writeRejected:
-			// PVE refuses a rule it finds infeasible with a 4xx, so the refusal
-			// carries ErrRuleInfeasible the way the CPI's own checks do.
-			return res, cpierrors.WrapAs(fmt.Errorf("%w: %w", ErrRuleInfeasible, sendErr), cpierrors.TypeCloud,
-				fmt.Sprintf("%s: PVE refused to %s rule %q", label, op.Kind, op.Rule.ID))
+			return res, rejectedRuleWrite(label, op, sendErr)
 		}
 		// Held: read again and compare the whole rule.
 		fresh, err := w.read(ctx)
@@ -391,10 +392,25 @@ const (
 	writeHeld
 )
 
+// rejectedRuleWrite wraps a write PVE refused. Only a refusal whose text is
+// one of PVE's feasibility errors carries ErrRuleInfeasible, the way the CPI's
+// own checks do. Any other refusal, such as a 403 for a missing privilege,
+// carries ErrRuleRefused and its HTTP status.
+func rejectedRuleWrite(label string, op RuleOp, sendErr error) error {
+	msg := fmt.Sprintf("%s: PVE refused to %s rule %q", label, op.Kind, op.Rule.ID)
+	if IsFeasibilityRefusal(sendErr) {
+		return cpierrors.WrapAs(fmt.Errorf("%w: %w", ErrRuleInfeasible, sendErr), cpierrors.TypeCloud, msg)
+	}
+	status, _ := pve.AnsweredStatus(sendErr)
+	return cpierrors.WrapAs(fmt.Errorf("%w with HTTP %d: %w", ErrRuleRefused, status, sendErr), cpierrors.TypeCloud,
+		msg)
+}
+
 // classifyRuleWrite sorts a write's error. A digest mismatch is a conflict. A
 // create that finds the rule already there, or any error PVE did not answer
 // with a 4xx, may hide a write that landed, so it is held and settled by a read.
-// A delete of a missing rule has already landed.
+// A delete of a missing rule has already landed. An update of a rule that is
+// gone was planned from a stale read, so it plans again like a conflict.
 func classifyRuleWrite(op RuleOp, err error) writeOutcome {
 	switch {
 	case err == nil:
@@ -403,6 +419,8 @@ func classifyRuleWrite(op RuleOp, err error) writeOutcome {
 		return writeConflict
 	case op.Kind == OpDelete && isRuleNotFound(err):
 		return writeLanded
+	case op.Kind == OpUpdate && pve.IsNotFound(err):
+		return writeConflict
 	case op.Kind == OpCreate && isRuleAlreadyDefined(err):
 		return writeHeld
 	case pve.IsAnsweredConfigRefusal(err) && !pve.IsVMConfigLocked(err):

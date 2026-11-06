@@ -2,10 +2,14 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -284,5 +288,177 @@ func TestObserveUpdatedHARule(t *testing.T) {
 	}
 	if err := call(nil, name); err == nil {
 		t.Fatal("an update without parameters passed")
+	}
+}
+
+func TestMergedPinWithNoAdmissibleNodeFailsBeforeRegistering(t *testing.T) {
+	for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
+		t.Run(mode, func(t *testing.T) {
+			stub := newNAStub()
+			deps := naClusterDeps(stub, "pve01", "pve02")
+			deps.Config.HA = &config.HAConfig{Mode: haChoiceOf(mode)}
+			err := ensureMergedPin(context.Background(), deps, 100,
+				pinRequest{Hard: []string{"pve09"}, Placed: "pve09", Register: true}, log.NewNopLogger())
+			if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !errors.Is(err, ha.ErrNoAdmissibleNode) {
+				t.Fatalf("err = %v", err)
+			}
+			if !propagateHARuleError(deps, err) {
+				t.Fatal("an empty hard set did not fail the call")
+			}
+			if len(stub.resources) != 0 || len(stub.rules) != 0 {
+				t.Fatalf("the VM was registered or pinned: resources %v rules %v", stub.resources, stub.rules)
+			}
+		})
+	}
+}
+
+func TestPropagateHARuleErrorFailsEveryErrorInManagedMode(t *testing.T) {
+	generic := errors.New("rules read failed")
+	for _, tc := range []struct {
+		mode string
+		err  error
+		want bool
+	}{
+		{config.HAModeAuto, nil, false},
+		{config.HAModeAuto, generic, false},
+		{config.HAModeAuto, ha.ErrRuleNotInEffect, true},
+		{config.HAModeAuto, cpierrors.Retriable("lock lost"), true},
+		{config.HAModeAuto, fmt.Errorf("x: %w", ha.ErrRuleInfeasible), false},
+		{config.HAModeManaged, nil, false},
+		{config.HAModeManaged, generic, true},
+		{config.HAModeManaged, fmt.Errorf("x: %w", ha.ErrRuleRefused), true},
+	} {
+		deps := naDeps(newNAStub())
+		deps.Config.HA = &config.HAConfig{Mode: haChoiceOf(tc.mode)}
+		if got := propagateHARuleError(deps, tc.err); got != tc.want {
+			t.Errorf("%s %v = %v, want %v", tc.mode, tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestAntiAffinityWithoutADirectorFailsOnlyInManagedMode(t *testing.T) {
+	for _, tc := range []struct {
+		mode    string
+		wantErr bool
+	}{{config.HAModeAuto, false}, {config.HAModeManaged, true}} {
+		stub := newAAStub()
+		stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+		cfg := aaMembershipConfig("off", false, 0)
+		cfg.HA.Mode = haChoiceOf(tc.mode)
+		deps := aaDepsLock(cfg, stub, newAALockPools(nil))
+		deps.RequestDirectorUUID = ""
+		err := applyAntiAffinityMembership(context.Background(), deps, 101, aaEnvForWebGroup(), log.NewNopLogger())
+		if (err != nil) != tc.wantErr || err != nil && !strings.Contains(err.Error(), "director_uuid") ||
+			stub.createRuleCalls+stub.updateRuleCalls != 0 {
+			t.Fatalf("%s: err %v creates %d updates %d", tc.mode, err, stub.createRuleCalls, stub.updateRuleCalls)
+		}
+	}
+}
+
+func TestRemoveOwnedHaResourceNeedsOurMarker(t *testing.T) {
+	ours, other := haIdentity{Owner: aaDirector}.marker(), haIdentity{Owner: aaOtherDirector}.marker()
+	byHand := "kept by hand"
+	for _, tc := range []struct {
+		name     string
+		present  bool
+		comment  *string
+		wantErr  bool
+		wantGone bool
+	}{
+		{name: "ours", present: true, comment: &ours, wantGone: true},
+		{name: "unmarked", present: true, wantErr: true},
+		{name: "operator comment", present: true, comment: &byHand, wantErr: true},
+		{name: "other Director", present: true, comment: &other, wantErr: true},
+		{name: "absent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newNAStub()
+			if tc.present {
+				stub.resources["vm:100"] = true
+				if tc.comment != nil {
+					stub.resComments["vm:100"] = *tc.comment
+				}
+			}
+			err := removeOwnedHaResource(context.Background(), stub, "vm:100", aaDirector)
+			if (err != nil) != tc.wantErr || (stub.resDelCalls == 1) != tc.wantGone {
+				t.Fatalf("err %v deletes %d", err, stub.resDelCalls)
+			}
+		})
+	}
+}
+
+// badRowCluster lists one HA rule row that does not decode.
+type badRowCluster struct {
+	cluster.Service
+}
+
+func (badRowCluster) ListHaRules(context.Context, *cluster.ListHaRulesParams) (*cluster.ListHaRulesResponse, error) {
+	return &cluster.ListHaRulesResponse{json.RawMessage(`{"rule": 7}`)}, nil
+}
+
+func TestListHaRulesFailsOnAnUndecodableRow(t *testing.T) {
+	if _, err := listHaRules(context.Background(), badRowCluster{}); err == nil {
+		t.Fatal("an undecodable row was skipped")
+	}
+	if _, err := findHaRule(context.Background(), badRowCluster{}, "bosh-aa-x"); err == nil {
+		t.Fatal("findHaRule read past an undecodable row")
+	}
+}
+
+func TestManagedGuardAdmitsOnlyOurRuleEdits(t *testing.T) {
+	ours, other := haIdentity{Owner: aaDirector}.marker(), haIdentity{Owner: aaOtherDirector}.marker()
+	stub := newNAStub()
+	seed := func(name, comment string) {
+		p := cluster.CreateHaRulesParams{Rule: name, Type: ha.RuleTypeResourceAffinity, Resources: "vm:100,vm:101"}
+		if comment != "" {
+			p.Comment = &comment
+		}
+		stub.rules[name] = p
+	}
+	seed("bosh-aa-ours", ours)
+	seed("bosh-aa-legacy", "")
+	seed("bosh-aa-other", other)
+	seed("operator-rule", ours)
+	m := &managedVMAllocation{vmid: 100, deps: Deps{PVE: &haRulesReadClient{svc: stub}, RequestDirectorUUID: aaDirector}}
+	resources := "vm:100,vm:101"
+	update := func(rule string, comment *string) error {
+		_, err := m.infrastructureMutationParameters(context.Background(), ManagedAllocationMutation{
+			Service: "Cluster", Method: "UpdateHaRules", Args: map[string]any{"rule": rule,
+				managedArgumentParams: &cluster.UpdateHaRulesParams{Type: ha.RuleTypeResourceAffinity,
+					Resources: &resources, Comment: comment}}})
+		return err
+	}
+	del := func(rule string) error {
+		_, err := m.infrastructureMutationParameters(context.Background(), ManagedAllocationMutation{
+			Service: "Cluster", Method: "DeleteHaRules", Args: map[string]any{"rule": rule}})
+		return err
+	}
+	if err := update("bosh-aa-ours", &ours); err != nil {
+		t.Fatalf("our rule's update was refused: %v", err)
+	}
+	if err := del("bosh-aa-ours"); err != nil {
+		t.Fatalf("our rule's delete was refused: %v", err)
+	}
+	if err := del("bosh-na-555"); err != nil {
+		t.Fatalf("the delete of a rule that is gone was refused: %v", err)
+	}
+	for name, err := range map[string]error{
+		"update without a marker":       update("bosh-aa-ours", nil),
+		"update writing another marker": update("bosh-aa-ours", &other),
+		"update of an unmarked rule":    update("bosh-aa-legacy", &ours),
+		"update of another's rule":      update("bosh-aa-other", &ours),
+		"update of an operator rule":    update("operator-rule", &ours),
+		"update of an absent rule":      update("bosh-na-555", &ours),
+		"delete of an unmarked rule":    del("bosh-aa-legacy"),
+		"delete of another's rule":      del("bosh-aa-other"),
+		"delete of an operator rule":    del("operator-rule"),
+	} {
+		if err == nil {
+			t.Errorf("%s was admitted", name)
+		}
+	}
+	m.deps.RequestDirectorUUID = ""
+	if err := del("bosh-aa-ours"); err == nil {
+		t.Fatal("a delete without a Director was admitted")
 	}
 }

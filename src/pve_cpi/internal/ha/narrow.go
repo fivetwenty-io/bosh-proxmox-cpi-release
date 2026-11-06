@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
@@ -16,8 +17,17 @@ import (
 // narrowUseRemoval selects the barrier's fallback, which removes the HA
 // resource around the mutation and registers it again, in place of the
 // ignored request. It is an internal switch, off by default, for a PVE release
-// whose CRM keeps acting on an ignored resource.
+// whose CRM keeps acting on an ignored resource. Even when it is on, the
+// fallback removes nothing unless the caller supplies PersistSnapshot, which no
+// caller does yet, because a crash after the removal would otherwise lose the
+// VM's rule memberships.
 var narrowUseRemoval = false
+
+// narrowMarkKey opens the token the barrier appends to the HA resource's
+// comment while it holds the resource in ignored. The token names the state to
+// put back, so a later call can tell the barrier's own ignored from an
+// operator's and can restore what the resource had before.
+const narrowMarkKey = "bosh-narrow-from="
 
 // Defaults for the barrier's waits.
 const (
@@ -98,9 +108,12 @@ type NarrowInput struct {
 	PollInterval time.Duration
 	// Snapshot and Restore serve the removal fallback. Snapshot returns the
 	// CPI-owned rules that name the VM, and Restore writes NewPin and puts the
-	// VM back into those rules.
-	Snapshot func(ctx context.Context) ([]Rule, error)
-	Restore  func(ctx context.Context, rules []Rule, pin *Rule) error
+	// VM back into those rules. PersistSnapshot stores the snapshot where a
+	// later call finds it after a crash, before anything is removed. Without
+	// it the fallback refuses to run.
+	Snapshot        func(ctx context.Context) ([]Rule, error)
+	Restore         func(ctx context.Context, rules []Rule, pin *Rule) error
+	PersistSnapshot func(ctx context.Context, rules []Rule) error
 }
 
 // NarrowActive applies a change that narrows where an HA-managed VM may run,
@@ -111,18 +124,22 @@ type NarrowInput struct {
 //     service, in a CRM round newer than the request on the entry node's
 //     clock, the VM's node has an LRM report newer than that round, the VM
 //     holds no lock, and the scan names the same node. When the VM moved
-//     outside the narrower set, request started again under the old pin and
+//     outside the narrower set, put back the old state under the old pin and
 //     return a retriable error.
 //  3. Write the narrower pin and verify it.
 //  4. Run the mutation.
 //  5. Re-read the config and check volume reach and the VM's node.
-//  6. Request started again. There is no watchdog check here, because the VM
-//     stays where it is.
+//  6. Request the state the resource had before the barrier. There is no
+//     watchdog check here, because the VM stays where it is.
 //
-// A crash at any step leaves an ignored resource, and the next call finds it
-// ignored and finishes the order. A widening change skips the barrier: it runs
-// the mutation and then writes the pin. A resource in error returns a
-// retriable error, and the barrier never requests disabled.
+// The ignored request also appends a token to the resource's comment that
+// names the state to put back, and the last request removes it. A crash at any
+// step leaves an ignored resource that carries the token, and the next call
+// finishes the order and restores that state. A resource an operator set to
+// ignored carries no token: the barrier leaves its state alone and it stays
+// ignored. A widening change skips the barrier: it runs the mutation and then
+// writes the pin. A resource in error returns a retriable error, and the
+// barrier never requests disabled.
 func NarrowActive(ctx context.Context, deps NarrowDeps, in NarrowInput) (pve.VMLocation, error) {
 	b := &barrier{deps: deps, in: in, sid: pve.HAServiceSID(in.VMID)}
 	b.defaults()
@@ -150,24 +167,43 @@ func NarrowActive(ctx context.Context, deps NarrowDeps, in NarrowInput) (pve.VML
 		return pve.VMLocation{}, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("ha narrow: read the HA resource of VM %d", in.VMID))
 	}
-	b.comment = res.Comment
-	// An ignored resource is what a crash inside an earlier barrier leaves, so
-	// the barrier finishes it whether or not this change narrows.
-	resumed := res.State != nil && *res.State == haStateIgnored
+	b.comment = stripNarrowMark(res.Comment)
+	current := haStateStarted
+	if res.State != nil && *res.State != "" {
+		current = *res.State
+	}
+	// An ignored resource that carries the barrier's token is what a crash
+	// inside an earlier barrier leaves, so the barrier finishes it whether or
+	// not this change narrows, and puts back the state the token names. A token
+	// on a resource that is no longer ignored is stale, and the state it has
+	// now is the one to keep.
+	from, marked := narrowMarkOf(res.Comment)
+	resumed := marked && current == haStateIgnored
+	b.restore, b.marked = current, resumed
+	if resumed {
+		b.restore = from
+	}
 	if !narrowing && !resumed {
 		return b.widen(ctx)
 	}
-	if narrowUseRemoval && !resumed {
+	// An operator's ignored resource is out of the CRM's hands already, so it
+	// never needs the removal.
+	if narrowUseRemoval && !resumed && b.restore != haStateIgnored {
 		return b.viaRemoval(ctx)
 	}
 	return b.viaIgnored(ctx, resumed)
 }
 
 type barrier struct {
-	deps    NarrowDeps
-	in      NarrowInput
-	sid     string
+	deps NarrowDeps
+	in   NarrowInput
+	sid  string
+	// comment is the resource's comment without the barrier's token.
 	comment *string
+	// restore is the requested state to put back at the end, and marked says
+	// the resource's comment carries the barrier's token.
+	restore string
+	marked  bool
 }
 
 func (b *barrier) defaults() {
@@ -248,12 +284,12 @@ func (b *barrier) viaIgnored(ctx context.Context, resumed bool) (pve.VMLocation,
 		return pve.VMLocation{}, cpierrors.Retriable("ha narrow: the HA resource of VM %d is in the error state; "+
 			"the operator must clear it, and the CPI never requests disabled", b.in.VMID)
 	}
-	if !resumed {
-		if err := b.request(ctx, haStateIgnored); err != nil {
+	if !resumed && b.restore != haStateIgnored {
+		if err := b.request(ctx, haStateIgnored, true); err != nil {
 			return pve.VMLocation{}, err
 		}
 		b.deps.Logger.Info("ha narrow: requested ignored before a narrowing change",
-			log.Int("vmid", b.in.VMID), log.String("sid", b.sid))
+			log.Int("vmid", b.in.VMID), log.String("sid", b.sid), log.String("restore", b.restore))
 	}
 	// The request time is the entry node's clock read after the request
 	// landed, so any CRM round newer than it came after the request.
@@ -281,7 +317,7 @@ func (b *barrier) viaIgnored(ctx context.Context, resumed bool) (pve.VMLocation,
 		// VM onto a node that cannot reach its volumes. The next call finishes.
 		return loc, err
 	}
-	if err := b.request(ctx, haStateStarted); err != nil {
+	if err := b.finish(ctx); err != nil {
 		return loc, err
 	}
 	return loc, nil
@@ -351,7 +387,7 @@ func (b *barrier) drain(ctx context.Context, requestTime int64, node string) (pv
 			}
 			if !b.inNarrowSet(loc.Node) {
 				return loc, b.restoreAfter(ctx, cpierrors.Retriable("ha narrow: VM %d drained on node %s, which is "+
-					"outside the narrower set; it was set back to started under its old pin", b.in.VMID, loc.Node))
+					"outside the narrower set; its requested state was put back under its old pin", b.in.VMID, loc.Node))
 			}
 			return loc, nil
 		}
@@ -382,41 +418,116 @@ func (b *barrier) readState(ctx context.Context, node string) (*pve.HAServiceSta
 	return st, nil
 }
 
-// request sets the resource's requested state and settles a held error with a
-// read of the resource.
-func (b *barrier) request(ctx context.Context, state string) error {
+// request sets the resource's requested state in one write with its comment.
+// mark puts the barrier's token, which names the state to restore, on the
+// comment, and otherwise the comment goes back to what it was before the
+// barrier. A held error is settled with a read of the resource.
+func (b *barrier) request(ctx context.Context, state string, mark bool) error {
 	want := state
-	err := b.deps.Resources.UpdateHaResources(ctx, b.sid, &sdkcluster.UpdateHaResourcesParams{State: &want})
+	p := &sdkcluster.UpdateHaResourcesParams{State: &want}
+	switch {
+	case mark:
+		c := withNarrowMark(b.comment, b.restore)
+		p.Comment = &c
+	case b.comment != nil && *b.comment != "":
+		p.Comment = b.comment
+	case b.marked:
+		del := "comment"
+		p.Delete = &del
+	}
+	err := b.deps.Resources.UpdateHaResources(ctx, b.sid, p)
 	if err == nil {
+		b.marked = mark
 		return nil
 	}
 	got, readErr := b.deps.Resources.GetHaResources(ctx, b.sid)
 	if readErr == nil && got != nil && got.State != nil && *got.State == state {
-		return nil
+		if _, has := narrowMarkOf(got.Comment); has == mark {
+			b.marked = mark
+			return nil
+		}
 	}
 	return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 		fmt.Sprintf("ha narrow: request %s for %s", state, b.sid))
 }
 
-// restoreAfter requests started again after a failure that left the VM where
-// its old config may run, and returns cause. A failed restore is logged, and
-// the resource stays ignored for the next call to finish.
+// finish puts back the state the resource had before the barrier and drops
+// the token. A resource an operator left ignored was never touched, so it
+// needs no write.
+func (b *barrier) finish(ctx context.Context) error {
+	if !b.marked && b.restore == haStateIgnored {
+		return nil
+	}
+	return b.request(ctx, b.restore, false)
+}
+
+// restoreAfter puts back the state the resource had before the barrier after
+// a failure that left the VM where its old config may run, and returns cause.
+// A failed restore is logged, and the resource stays ignored with its token for
+// the next call to finish.
 func (b *barrier) restoreAfter(ctx context.Context, cause error) error {
-	if err := b.request(ctx, haStateStarted); err != nil {
-		b.deps.Logger.Warn("ha narrow: could not request started again; the resource stays ignored and the next "+
-			"call finishes it", log.String("sid", b.sid), log.Err(err))
+	if err := b.finish(ctx); err != nil {
+		b.deps.Logger.Warn("ha narrow: could not restore the requested state; the resource stays ignored and the "+
+			"next call finishes it", log.String("sid", b.sid), log.String("restore", b.restore), log.Err(err))
 	}
 	return cause
 }
 
+// narrowMarkOf returns the state the barrier's token on comment names, and
+// whether the comment carries one.
+func narrowMarkOf(comment *string) (string, bool) {
+	if comment == nil {
+		return "", false
+	}
+	for _, f := range strings.Fields(*comment) {
+		if state, ok := strings.CutPrefix(f, narrowMarkKey); ok && state != "" {
+			return state, true
+		}
+	}
+	return "", false
+}
+
+// stripNarrowMark returns comment without the barrier's token, keeping the rest
+// as it was. It returns nil when the comment was nil.
+func stripNarrowMark(comment *string) *string {
+	if comment == nil {
+		return nil
+	}
+	out := *comment
+	for _, f := range strings.Fields(*comment) {
+		if !strings.HasPrefix(f, narrowMarkKey) {
+			continue
+		}
+		if strings.Contains(out, " "+f) {
+			out = strings.Replace(out, " "+f, "", 1)
+		} else {
+			out = strings.Replace(out, f, "", 1)
+		}
+	}
+	return &out
+}
+
+// withNarrowMark returns comment with the token that names restore appended.
+func withNarrowMark(comment *string, restore string) string {
+	token := narrowMarkKey + restore
+	if comment == nil || *comment == "" {
+		return token
+	}
+	return *comment + " " + token
+}
+
 // viaRemoval is the fallback barrier. It snapshots the CPI-owned rules that
-// name the VM, removes the HA resource, waits for the CRM and the config to
-// drop it, runs the mutation, registers the resource again as ignored with its
-// old comment and failback off, rewrites the narrower pin and the rule
-// memberships, and requests started.
+// name the VM and persists the snapshot, removes the HA resource, waits for the
+// CRM and the config to drop it, runs the mutation, registers the resource
+// again as ignored with its old comment, the barrier's token, and failback
+// off, rewrites the narrower pin and the rule memberships, and puts back the
+// state the resource had. It refuses before any write unless the snapshot can
+// be persisted, because a crash after the removal would otherwise lose the
+// VM's memberships.
 func (b *barrier) viaRemoval(ctx context.Context) (pve.VMLocation, error) {
-	if b.in.Snapshot == nil || b.in.Restore == nil {
-		return pve.VMLocation{}, cpierrors.Cloud("ha narrow: the removal fallback needs a rule snapshot and restore")
+	if b.in.Snapshot == nil || b.in.Restore == nil || b.in.PersistSnapshot == nil {
+		return pve.VMLocation{}, cpierrors.Cloud("ha narrow: the removal fallback needs a rule snapshot that is " +
+			"persisted before the removal, and a restore")
 	}
 	st, err := b.readState(ctx, b.in.Node)
 	if err != nil {
@@ -429,6 +540,10 @@ func (b *barrier) viaRemoval(ctx context.Context) (pve.VMLocation, error) {
 	rules, err := b.in.Snapshot(ctx)
 	if err != nil {
 		return pve.VMLocation{}, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "ha narrow: snapshot the VM's rules")
+	}
+	if err := b.in.PersistSnapshot(ctx, rules); err != nil {
+		return pve.VMLocation{}, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			"ha narrow: persist the VM's rule snapshot before the removal")
 	}
 	purge := true
 	if err := b.deps.Resources.DeleteHaResources(ctx, b.sid, &sdkcluster.DeleteHaResourcesParams{Purge: &purge}); err != nil &&
@@ -468,18 +583,21 @@ func (b *barrier) viaRemoval(ctx context.Context) (pve.VMLocation, error) {
 	return loc, nil
 }
 
-// reregister registers the resource again as ignored, restores its rules
-// with the narrower pin, and requests started, unless cause is set, in which
-// case the resource stays ignored and cause is returned.
+// reregister registers the resource again as ignored with the barrier's
+// token, restores its rules with the narrower pin, and puts back the state the
+// resource had, unless cause is set, in which case the resource stays ignored
+// and cause is returned.
 func (b *barrier) reregister(ctx context.Context, rules []Rule, cause error) error {
 	ignored, failback := haStateIgnored, false
+	comment := withNarrowMark(b.comment, b.restore)
 	err := b.deps.Resources.CreateHaResources(ctx, &sdkcluster.CreateHaResourcesParams{
-		Sid: b.sid, State: &ignored, Comment: b.comment, Failback: &failback,
+		Sid: b.sid, State: &ignored, Comment: &comment, Failback: &failback,
 	})
 	if err != nil && !isRuleAlreadyDefined(err) {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("ha narrow: register %s again after the fallback barrier", b.sid))
 	}
+	b.marked = true
 	if cause != nil {
 		return cause
 	}
@@ -489,5 +607,5 @@ func (b *barrier) reregister(ctx context.Context, rules []Rule, cause error) err
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("ha narrow: restore the rules of %s", b.sid))
 	}
-	return b.request(ctx, haStateStarted)
+	return b.finish(ctx)
 }

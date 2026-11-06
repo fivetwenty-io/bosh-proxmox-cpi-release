@@ -103,8 +103,10 @@ func newHARuleWriter(deps Deps, profile *ha.Profile, logger *log.Logger) *ha.Rul
 	}
 }
 
-// removeOwnedHaResource purges sid when it carries this Director's marker or
-// none. Another Director's resource, or one whose owner cannot be read, stays.
+// removeOwnedHaResource purges sid only when it carries this Director's
+// marker. An unmarked resource may be an operator's, and nothing here can prove
+// it belongs to this VM, so it stays, as does another Director's resource or one
+// whose owner cannot be read.
 func removeOwnedHaResource(ctx context.Context, svc cluster.Service, sid, owner string) error {
 	got, err := svc.GetHaResources(ctx, sid)
 	switch {
@@ -112,7 +114,11 @@ func removeOwnedHaResource(ctx context.Context, svc cluster.Service, sid, owner 
 		return nil
 	case err != nil:
 		return fmt.Errorf("read the owner of %s: %w", sid, err)
-	case got != nil && got.Comment != nil && haOwnershipOf(*got.Comment, owner) == haOwnedByOther:
+	case got == nil:
+		return fmt.Errorf("read the owner of %s: no resource returned", sid)
+	case got.Comment == nil || haOwnershipOf(*got.Comment, owner) == haUnmarked:
+		return fmt.Errorf("%s carries no ownership marker, so the CPI cannot prove it is this VM's", sid)
+	case haOwnershipOf(*got.Comment, owner) != haOwnedByUs:
 		return fmt.Errorf("%s belongs to another Director", sid)
 	}
 	purge := true
@@ -125,9 +131,18 @@ func removeOwnedHaResource(ctx context.Context, svc cluster.Service, sid, owner 
 
 // propagateHARuleError reports whether a rule writer's error must fail the
 // call instead of being logged. A retriable error always does, so the Director
-// re-drives. A rule that is not in effect does, which the writer returns only
-// in managed mode. In managed mode a write the feasibility checks refused does
-// too, because managed never leaves a VM without the rule it asked for.
+// re-drives, and so does a rule that is not in effect, which the writer returns
+// only in managed mode. A pin with no admissible node is retriable, so it fails
+// the call in either mode.
+//
+// In managed mode every other error fails the call too, because managed never
+// leaves a VM without a rule it asked for. That covers a write the feasibility
+// checks or PVE refused, a rule that carries another Director's marker or has
+// the wrong type, a failed member scan or rules read, a request with no
+// director_uuid to mark the rule with, and the PVE 9 gate. In auto they are
+// logged, which keeps the best-effort intent. A failed HA resource registration
+// is logged in both modes, because the rule write that follows fails on its own
+// when the resource is missing.
 func propagateHARuleError(deps Deps, err error) bool {
 	if err == nil {
 		return false
@@ -135,7 +150,7 @@ func propagateHARuleError(deps Deps, err error) bool {
 	if cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || errors.Is(err, ha.ErrRuleNotInEffect) {
 		return true
 	}
-	return deps.Config.HAModeValue() == config.HAModeManaged && errors.Is(err, ha.ErrRuleInfeasible)
+	return deps.Config.HAModeValue() == config.HAModeManaged
 }
 
 // inResourceAffinityRule reports whether sid is in an enabled resource-affinity

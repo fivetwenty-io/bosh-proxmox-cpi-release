@@ -74,13 +74,13 @@ func haResourceSid(vmid int) string {
 
 // applyAntiAffinityMembership is the create_vm entry point for opt-in HA
 // anti-affinity. It is a no-op unless pve.ha.anti_affinity is "on" in a mode
-// that writes HA and the VM carries an instance-group name. Generic HA failures
-// (HA unconfigured, a transient rule-write hiccup) are logged non-fatally,
-// preserving the best-effort intent. An error propagateHARuleError names is
-// returned so the director re-drives rather than silently dropping the VM from
-// its spread rule: a retriable error (cluster-lock timeout, read-after-write
-// verify failure, rules that kept changing), a rule PVE left out of effect in
-// managed mode, or in managed mode a membership the feasibility checks refused.
+// that writes HA and the VM carries an instance-group name. In auto, generic HA
+// failures (HA unconfigured, a transient rule-write hiccup) are logged
+// non-fatally, preserving the best-effort intent. An error propagateHARuleError
+// names is returned so the director re-drives rather than silently dropping the
+// VM from its spread rule: a retriable error (cluster-lock timeout,
+// read-after-write verify failure, rules that kept changing), and in managed
+// mode every membership failure, including a request with no director_uuid.
 func applyAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, env map[string]any, logger *log.Logger) error {
 	if !deps.Config.HAAntiAffinityRulesEnabled() {
 		return nil
@@ -92,6 +92,12 @@ func applyAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, env m
 	if ident.Owner == "" {
 		// A rule the CPI cannot mark as its own is a rule it could never edit
 		// or clean up safely, so a request without a director_uuid writes none.
+		// Managed never leaves a VM without the rule it asked for, so there
+		// the call fails.
+		if deps.Config.HAModeValue() == config.HAModeManaged {
+			return fmt.Errorf("anti-affinity: the request carries no director_uuid to mark the rule of group %q with",
+				ident.Group)
+		}
 		logger.Warn("create_vm: HA anti-affinity membership skipped because the request carries no director_uuid "+
 			"to mark the rule with", log.Int(metadataKeyVMID, vmid), log.String("group", ident.Group))
 		return nil
@@ -887,7 +893,9 @@ func findHaRule(ctx context.Context, svc cluster.Service, ruleName string) (*haR
 }
 
 // listHaRules fetches and decodes every HA rule. A nil response is treated as
-// an empty list (HA may be unconfigured).
+// an empty list (HA may be unconfigured). A row that does not decode fails the
+// read, the way ha.ParseRuleList does, because a skipped row could be the rule
+// the caller is looking for.
 func listHaRules(ctx context.Context, svc cluster.Service) ([]haRuleEntry, error) {
 	resp, err := svc.ListHaRules(ctx, &cluster.ListHaRulesParams{})
 	if err != nil {
@@ -897,10 +905,10 @@ func listHaRules(ctx context.Context, svc cluster.Service) ([]haRuleEntry, error
 		return nil, nil
 	}
 	out := make([]haRuleEntry, 0, len(*resp))
-	for _, raw := range *resp {
+	for i, raw := range *resp {
 		var e haRuleEntry
-		if json.Unmarshal(raw, &e) != nil {
-			continue
+		if err := json.Unmarshal(raw, &e); err != nil {
+			return nil, fmt.Errorf("HA rules list row %d does not parse: %w", i, err)
 		}
 		out = append(out, e)
 	}

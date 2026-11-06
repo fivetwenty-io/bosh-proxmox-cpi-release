@@ -2,6 +2,9 @@ package ha
 
 import (
 	"sort"
+	"strings"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // CheckFeasibility is the CPI's copy of PVE's rule feasibility checks
@@ -324,4 +327,41 @@ func IntroducedConflicts(before, candidate []Rule, touched []string, clusterNode
 		}
 	}
 	return out
+}
+
+// pveFeasibilityRefusals are fragments of the errors PVE's check_feasibility
+// reports, which its rules API returns when it refuses a rule. They match the
+// messages CheckFeasibility copies.
+var pveFeasibilityRefusals = []string{
+	"infeasible",
+	"is already used in another node affinity rule",
+	"negative node affinity rule must not specify",
+	"rule must specify at least two resources",
+	"rule defines more resources than available nodes",
+	"shares two or more resources with a",
+	"are in node affinity rules with multiple priorities",
+	"cannot be in a node affinity rule with multiple priorities",
+	"resources are in multiple node affinity rules",
+	"there are other resources in at least one other node affinity rule",
+	"restricted to less nodes than available",
+	"would restrict these to less nodes than available",
+}
+
+// IsFeasibilityRefusal reports whether err is PVE's refusal of a rule that its
+// feasibility checks reject. Any other answer, such as a missing privilege, a
+// missing rule, or a bad parameter, is not.
+func IsFeasibilityRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	if status, ok := pve.AnsweredStatus(err); !ok || status < 400 || status >= 500 {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, f := range pveFeasibilityRefusals {
+		if strings.Contains(msg, f) {
+			return true
+		}
+	}
+	return false
 }

@@ -32,6 +32,13 @@ func IsConfigDigestRefusal(err error) bool {
 	return answered
 }
 
+// AnsweredStatus returns the HTTP status of an error PVE answered, and false
+// for a failure PVE never answered, such as a transport error, a gateway status,
+// or a cancelled context.
+func AnsweredStatus(err error) (int, bool) {
+	return pveAnswered(err)
+}
+
 // IsAnsweredConfigRefusal reports whether err is PVE's own answer refusing a
 // configuration update. That's any 4xx status, such as a token that lacks the
 // privilege or a parameter PVE won't take, and a 500 whose message says the VM
