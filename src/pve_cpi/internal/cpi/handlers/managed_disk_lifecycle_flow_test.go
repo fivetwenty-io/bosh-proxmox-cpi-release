@@ -1068,7 +1068,11 @@ func (c lifecycleFlowCluster) ListStatus(context.Context) (*cluster.ListStatusRe
 		if c.c.offlineNodes[node] {
 			online = 0
 		}
-		r = append(r, json.RawMessage(fmt.Sprintf(`{"type":"node","name":%q,"online":%d}`, node, online)))
+		local := 0
+		if node == "n1" {
+			local = 1
+		}
+		r = append(r, json.RawMessage(fmt.Sprintf(`{"type":"node","name":%q,"online":%d,"local":%d}`, node, online, local)))
 	}
 	return &r, nil
 }

@@ -178,7 +178,7 @@ func (managedDiskTestCluster) ListConfigNodes(context.Context) (*cluster.ListCon
 	return &r, nil
 }
 func (managedDiskTestCluster) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
-	r := cluster.ListStatusResponse{json.RawMessage(`{"type":"cluster","quorate":1}`), json.RawMessage(`{"type":"node","name":"n1","online":1}`)}
+	r := cluster.ListStatusResponse{json.RawMessage(`{"type":"cluster","quorate":1}`), json.RawMessage(`{"type":"node","name":"n1","online":1,"local":1}`)}
 	return &r, nil
 }
 

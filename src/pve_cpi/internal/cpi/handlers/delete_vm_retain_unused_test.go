@@ -233,7 +233,8 @@ func (n unlistedNodeNodes) ListQemu(ctx context.Context, node string, p *nodes.L
 type unlistedNodeCluster struct{ cluster.Service }
 
 func (unlistedNodeCluster) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
-	r := cluster.ListStatusResponse{json.RawMessage(`{"type":"cluster","quorate":1}`), json.RawMessage(`{"type":"node","name":"n1","online":1}`), json.RawMessage(`{"type":"node","name":"n2","online":0}`)}
+	r := cluster.ListStatusResponse{json.RawMessage(`{"type":"cluster","quorate":1}`), json.RawMessage(`{"type":"node","name":"n1","online":1,"local":1}`),
+		json.RawMessage(`{"type":"node","name":"n2","online":0}`)}
 	return &r, nil
 }
 

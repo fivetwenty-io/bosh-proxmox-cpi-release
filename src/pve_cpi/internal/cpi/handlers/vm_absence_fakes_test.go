@@ -13,12 +13,17 @@ import (
 // branch exercises the proof without scripting each read.
 
 // AbsenceOnlineStatus is a quorate /cluster/status answer that lists every
-// member online.
+// member online. The first member is the entry node, which PVE marks local,
+// so the HA state that delete_vm reads names the node it came through.
 func AbsenceOnlineStatus(members ...string) *cluster.ListStatusResponse {
 	resp := make(cluster.ListStatusResponse, 0, 1+len(members))
 	resp = append(resp, json.RawMessage(`{"type":"cluster","name":"fixture","quorate":1}`))
-	for _, m := range members {
-		row, _ := json.Marshal(map[string]any{"type": "node", "name": m, "online": 1})
+	for i, m := range members {
+		fields := map[string]any{"type": "node", "name": m, "online": 1}
+		if i == 0 {
+			fields["local"] = 1
+		}
+		row, _ := json.Marshal(fields)
 		resp = append(resp, row)
 	}
 	return &resp

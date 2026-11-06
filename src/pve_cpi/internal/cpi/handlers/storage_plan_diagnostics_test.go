@@ -118,7 +118,7 @@ func (c diagnosticVMClient) Cluster() cluster.Service {
 type diagnosticVMCluster struct{ managedDiskTestCluster }
 
 func (c diagnosticVMCluster) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
-	r := cluster.ListStatusResponse{json.RawMessage(`{"type":"node","name":"n1","online":1,"maxcpu":8,"maxmem":17179869184,"mem":1073741824,"cpu":0.1}`)}
+	r := cluster.ListStatusResponse{json.RawMessage(`{"type":"node","name":"n1","online":1,"local":1,"maxcpu":8,"maxmem":17179869184,"mem":1073741824,"cpu":0.1}`)}
 	return &r, nil
 }
 func TestStoragePlanDiagnosticVMImportUsesProductionPlanner(t *testing.T) {

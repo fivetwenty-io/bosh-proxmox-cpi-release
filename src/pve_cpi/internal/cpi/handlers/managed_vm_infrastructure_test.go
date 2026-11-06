@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -280,7 +281,7 @@ func testManagedVMHAPurgeJournalCase(t *testing.T, unknown bool) {
 	service := &infrastructureHACluster{unknown: unknown, rows: []map[string]any{{"rule": "shared", "type": "resource-affinity", "resources": "vm:123,vm:124", "affinity": "negative"}}}
 	service.beforeDelete = func() { assertManagedVMHAPurgeIntents(t, journal, handle.Record().ID) }
 	deps := Deps{PVE: &infrastructureHAClient{ha: service}}
-	err := managedVMDeleteHA(t.Context(), deps, handle, "pve1", 123)
+	err := managedVMPurgeHAResource(t.Context(), deps, handle, "pve1", 123, true)
 	if (err != nil) != unknown {
 		t.Fatalf("purge outcome: %v", err)
 	}
@@ -292,7 +293,7 @@ func testManagedVMHAPurgeJournalCase(t *testing.T, unknown bool) {
 		}
 	}
 	if unknown {
-		if err := managedVMDeleteHA(t.Context(), deps, handle, "pve1", 123); err == nil {
+		if err := managedVMPurgeHAResource(t.Context(), deps, handle, "pve1", 123, true); err == nil {
 			t.Fatal("unknown purge reissued")
 		}
 	}
@@ -445,7 +446,7 @@ func TestManagedVMHAPurgeRejectsUnreadableResourceIdentity(t *testing.T) {
 			journal, intent := infrastructureJournal(t)
 			handle := infrastructureHandle(t, journal, "ha", intent)
 			service := &infrastructureHACluster{nilResource: missing, wrongResource: !missing}
-			if err := managedVMDeleteHA(t.Context(), Deps{PVE: &infrastructureHAClient{ha: service}}, handle, "pve1", 123); err == nil {
+			if err := managedVMPurgeHAResource(t.Context(), Deps{PVE: &infrastructureHAClient{ha: service}}, handle, "pve1", 123, true); err == nil {
 				t.Fatal("unproven HA identity accepted")
 			}
 			if service.deletes != 0 || len(handle.Record().Steps) != 0 {
@@ -458,7 +459,19 @@ func TestManagedVMHAPurgeRejectsUnreadableResourceIdentity(t *testing.T) {
 func (c *infrastructureHACluster) ListHaResources(context.Context, *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
 	rows := cluster.ListHaResourcesResponse{}
 	if !c.removed {
-		rows = append(rows, json.RawMessage(`{"sid":"vm:123"}`))
+		rows = append(rows, json.RawMessage(`{"sid":"vm:123","state":"stopped"}`))
 	}
 	return &rows, nil
+}
+
+// ListHaStatusManagerStatus is a fresh CRM view entered through pve1 that
+// holds vm:123 stopped there until the purge removes it.
+func (c *infrastructureHACluster) ListHaStatusManagerStatus(
+	context.Context,
+) (*cluster.ListHaStatusManagerStatusResponse, error) {
+	services := map[string]HASceneService{}
+	if !c.removed {
+		services["vm:123"] = HASceneService{State: "stopped", Node: "pve1", UID: "uid-123"}
+	}
+	return HAFreshManagerStatus(time.Now().Unix(), "pve1", nil, services), nil
 }

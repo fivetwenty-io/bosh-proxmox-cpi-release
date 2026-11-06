@@ -10,41 +10,15 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
-	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 )
 
-// Deleting an HA/DLB-registered VM must deregister its HA state BEFORE the
-// stop: while a VM is HA-managed, status/stop is redirected to a CRM request
-// whose task completes on acceptance — not when the guest halts — so a
-// stop-then-deregister sequence races the LRM and the destroy fails with
-// "VM <id> is running - destroy failed". Observed live on a DLB-registered
-// compilation VM. These tests pin the deregister-first order and the
-// wait-and-retry recovery on the running-destroy failure.
-
-// orderRecordingCluster embeds mockClusterSvc and records HA deregistration
-// calls into a shared event log.
-type orderRecordingCluster struct {
-	mockClusterSvc
-	events *[]string
-}
-
-// GetHaResources reports no resource, so the cleanup's ownership check finds
-// nothing to protect.
-func (m *orderRecordingCluster) GetHaResources(context.Context, string) (*cluster.GetHaResourcesResponse, error) {
-	return nil, errors.New("no such resource")
-}
-
-func (m *orderRecordingCluster) DeleteHaResources(_ context.Context, sid string, _ *cluster.DeleteHaResourcesParams) error {
-	*m.events = append(*m.events, "DeleteHaResources:"+sid)
-	return nil
-}
-
-func (m *orderRecordingCluster) DeleteHaRules(_ context.Context, rule string) error {
-	*m.events = append(*m.events, "DeleteHaRules:"+rule)
-	return nil
-}
+// Deleting an HA-managed VM stops it through PVE HA before the destroy. The
+// HA resource stays configured through the stop, so the CRM never sees an
+// unmanaged guest it could restart or move, and the destroy removes the
+// resource with purge. These tests pin that order and the wait-and-retry
+// recovery on the running-destroy failure.
 
 func dlbEnabledConfig() *config.CPIConfig {
 	cfg := *testConfig()
@@ -52,23 +26,21 @@ func dlbEnabledConfig() *config.CPIConfig {
 	return &cfg
 }
 
-func TestHandleDeleteVM_DLB_DeregistersHABeforeStop(t *testing.T) {
+func TestHandleDeleteVM_HAManagedVMStopsThroughHABeforeTheDestroy(t *testing.T) {
 	t.Parallel()
 
-	var events []string
-
+	scene := handlers.NewHADeleteScene()
+	scene.Manage(101, "pve-node1", "started", "started")
+	var purged bool
 	qemuSvc := &mockQEMUService{
-		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
-			events = append(events, "Stop")
-			return "UPID:node:stop-task", nil
-		},
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{}, nil
 		},
 	}
 	nodesSvc := &mockNodesService{
-		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
-			events = append(events, "DeleteQemu")
+		deleteQemuFn: func(_ context.Context, _ string, _ string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			scene.Do(func(s *handlers.HADeleteScene) { s.Events = append(s.Events, "DeleteQemu") })
+			purged = params != nil && params.Purge != nil && *params.Purge
 			raw := nodes.DeleteQemuResponse{}
 			return &raw, nil
 		},
@@ -85,40 +57,40 @@ func TestHandleDeleteVM_DLB_DeregistersHABeforeStop(t *testing.T) {
 	deps := testDepsFoundVM(101, qemuSvc, nodesSvc, tasksSvc, agentSvc)
 	deps.Config = dlbEnabledConfig()
 	deps.PVE = &mockPVEClient{
-		qemuSvc:    qemuSvc,
-		nodesSvc:   nodesSvc,
+		qemuSvc:    &handlers.HASceneQEMU{Service: qemuSvc, Scene: scene},
+		nodesSvc:   &handlers.HASceneNodes{Service: nodesSvc, Scene: scene},
 		tasksSvc:   tasksSvc,
 		storageSvc: &mockStorageService{},
-		clusterSvc: &orderRecordingCluster{
-			mockClusterSvc: *defaultClusterSvc(101, "pve-node1"),
-			events:         &events,
-		},
-		poolsSvc: &noopPoolService{},
+		clusterSvc: &handlers.HASceneCluster{Service: defaultClusterSvc(101, "pve-node1"), Scene: scene},
+		poolsSvc:   &noopPoolService{},
 	}
 
 	h := handlers.HandleDeleteVM(deps)
-	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
-	if err != nil {
+	if _, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	stopIdx, haIdx := -1, -1
+	events := scene.EventsSnapshot()
+	stopIdx, destroyIdx := -1, -1
 	for i, ev := range events {
-		if ev == "Stop" && stopIdx == -1 {
+		switch {
+		case ev == "Stop:pve-node1/101" && stopIdx == -1:
 			stopIdx = i
+		case ev == "DeleteQemu" && destroyIdx == -1:
+			destroyIdx = i
 		}
-		if strings.HasPrefix(ev, "DeleteHaResources:") && haIdx == -1 {
-			haIdx = i
+	}
+	if stopIdx == -1 || destroyIdx == -1 || stopIdx > destroyIdx {
+		t.Fatalf("the HA-managed VM must be stopped through PVE HA before the destroy; events: %v", events)
+	}
+	for _, ev := range events[:destroyIdx] {
+		if strings.HasPrefix(ev, "DeleteHaResources:") {
+			t.Fatalf("the HA resource was removed before the destroy, so the CRM could act on an unmanaged guest; "+
+				"events: %v", events)
 		}
 	}
-	if haIdx == -1 {
-		t.Fatalf("HA resource was never deregistered; events: %v", events)
-	}
-	if stopIdx == -1 {
-		t.Fatalf("VM was never stopped; events: %v", events)
-	}
-	if haIdx > stopIdx {
-		t.Errorf("HA deregistration must happen BEFORE the stop (CRM redirects stop of an HA-managed VM); events: %v", events)
+	if !purged {
+		t.Fatal("the destroy must purge, which removes the HA resource")
 	}
 }
 

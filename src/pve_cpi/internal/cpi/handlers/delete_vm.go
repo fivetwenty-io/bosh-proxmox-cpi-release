@@ -315,7 +315,9 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 // pve.IsRootPamIdentity's doc comment for why) — so the CPI must authenticate
 // as root@pam with a password to clear locked VMs here.
 // Eventual consistency: has_vm may briefly still see this VM after return.
-func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) error {
+func fastPathDeleteVM(
+	ctx context.Context, deps Deps, haState *pve.HAServiceState, node, vmCID string, vmid int, logger *log.Logger,
+) error {
 	// Reap any straggler fast-path VMs cluster-wide before issuing our own
 	// destroy. Best-effort; never blocks the current delete.
 	sweepFastDeleteStragglers(ctx, deps, logger)
@@ -323,24 +325,13 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	// Stamp diagnostic tag — fail-open.
 	stampDeletingTag(ctx, deps, node, vmCID, vmid, logger)
 
-	// Deregister HA state BEFORE the stop. While a VM is HA-managed, a
-	// status/stop call is redirected to a CRM request whose task completes on
-	// acceptance, not when the VM halts — and the destroy below cannot remove
-	// a running VM (skiplock only skips config locks). Deregistering first
-	// restores plain qmstop semantics. Both calls are synchronous and bounded
-	// (no task await) — compatible with the fast path's bounded-time contract.
-	// Idempotent, not-found-tolerant, best-effort.
-	if deps.Config.HAAntiAffinityRulesEnabled() || deps.Config.DLBConfigured() {
-		if aaErr := removeAntiAffinityMembership(ctx, deps, vmid, logger); aaErr != nil {
-			logger.Warn("delete_vm: fast-path HA anti-affinity/DLB cleanup incomplete (non-fatal)", log.Err(aaErr))
-		}
-	}
-	// Remove the node-affinity HA pin as well. The fast path returns before
-	// the sync path's pin cleanup, so without this a pinned VM (AZ pin or PCI
-	// strict pin) deleted via fast_path_delete would leave an orphan
-	// bosh-na-<vmid> rule forever.
-	if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
-		logger.Warn("delete_vm: fast-path HA node-affinity pin cleanup incomplete (non-fatal)", log.Err(pinErr))
+	// Clear the VM's CPI-managed HA rules. Only a VM that is not HA-managed
+	// reaches the fast path, so this deregisters nothing a stop depends on,
+	// and the node-affinity pin it removes would otherwise outlive the VM,
+	// because the fast path returns before the sync path's cleanup. The calls
+	// are synchronous and bounded, with no task await.
+	if err := cleanupHAMembership(ctx, deps, haState, vmid, logger); err != nil {
+		return err
 	}
 
 	// Fire-and-forget stop. The UPID is discarded; no await. PVE may not finish
@@ -397,8 +388,7 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	}
 
 	// Issue destroy with skiplock=true. Discard the UPID; no await.
-	// HA pin and anti-affinity/DLB deregistration already ran before the stop
-	// above (see the CRM-interference comment there).
+	// The HA rule cleanup already ran before the stop above.
 	// Purge's pool-membership interplay: see the synchronous-path DeleteQemu
 	// comment in HandleDeleteVM.
 	//
@@ -665,6 +655,17 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 		return nil, err
 	}
 
+	// --- HA state gate ---
+	// HA membership comes from the normalized HA state, never from the
+	// pve.ha knobs, so a resource an operator registered by hand counts too.
+	// The state table defers a VM in fence, on a node that is not online, or
+	// in an unknown state, waits out HA motion, and runs the recovery grace
+	// window, all before anything below stops, detaches, or destroys it.
+	haState, haErr := gateHADelete(ctx, deps, vmid, node, logger)
+	if haErr != nil {
+		return nil, haErr
+	}
+
 	// --- per-node in-flight gate (opt-in; limit=0 → unlimited, no gating) ---
 	if deps.Config != nil {
 		inflightRelease, inflightErr := deps.Inflight.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
@@ -700,27 +701,50 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 	// The fast path bypasses the §7.15 operation-timeout envelope naturally:
 	// no poll loop runs; the handler returns as soon as the destroy API call
 	// returns (which itself is bounded by the HTTP transport timeout).
+	//
+	// An HA-managed VM never takes the fast path. Its stop goes through PVE HA
+	// and must be awaited, or the CRM could start the VM again before the
+	// destroy, and the fire-and-forget stop cannot wait for it.
 	if deps.Config.FastPathDeleteEnabled() {
-		if fpErr := fastPathDeleteVM(ctx, deps, node, vmCID, vmid, logger); fpErr != nil {
-			return nil, fpErr
+		if !haState.Managed() {
+			if fpErr := fastPathDeleteVM(ctx, deps, haState, node, vmCID, vmid, logger); fpErr != nil {
+				return nil, fpErr
+			}
+			cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
+			return nil, nil
 		}
-		cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
-		return nil, nil
+		logger.Info("delete_vm: VM is HA-managed, so it takes the synchronous delete path despite fast_path_delete",
+			log.String("sid", haState.SID))
 	}
 
-	return deleteLegacyVMAndArtifacts(ctx, deps, node, vmCID, vmid, vmTags, logger)
+	return deleteLegacyVMAndArtifacts(ctx, deps, haState, node, vmCID, vmid, vmTags, logger)
 }
 
-func deleteLegacyVMAndArtifacts(ctx context.Context, deps Deps, node, vmCID string, vmid int, vmTags string, logger *log.Logger) (any, error) {
-	// --- HA anti-affinity / DLB / node-affinity pin cleanup (best-effort) ---
-	cleanupHAMembership(ctx, deps, vmid, logger)
-
+// deleteLegacyVMAndArtifacts stops and destroys a legacy VM that the HA gate
+// allowed. An HA-managed VM is stopped through PVE HA and keeps its HA
+// resource until the destroy, which removes it with purge; its CPI-managed HA
+// rules are cleaned up after the destroy. Any other VM is stopped directly.
+func deleteLegacyVMAndArtifacts(
+	ctx context.Context, deps Deps, haState *pve.HAServiceState, node, vmCID string, vmid int, vmTags string,
+	logger *log.Logger,
+) (any, error) {
 	// --- stop VM (synchronous path) ---
-	if stopDone, stopErr := stopVMBeforeDelete(ctx, deps, node, vmid, vmCID, logger); stopErr != nil {
-		return nil, stopErr
-	} else if stopDone {
-		cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
-		return nil, nil
+	stopDirectly := !haState.Managed()
+	if haState.Managed() {
+		outcome, haStopErr := stopHAManagedVMForDelete(ctx, deps, "delete_vm", haState, vmid, logger)
+		if haStopErr != nil {
+			return nil, haStopErr
+		}
+		stopDirectly = outcome == haStopNotManaged
+	}
+	if stopDirectly {
+		if stopDone, stopErr := stopVMBeforeDelete(ctx, deps, node, vmid, vmCID, logger); stopErr != nil {
+			return nil, stopErr
+		} else if stopDone {
+			cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, logger)
+			cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
+			return nil, nil
+		}
 	}
 
 	// --- protect attached persistent disks: detach foreign-VMID volumes so
@@ -761,6 +785,7 @@ func deleteLegacyVMAndArtifacts(ctx context.Context, deps Deps, node, vmCID stri
 		return nil, deleteErr
 	}
 	if alreadyGone {
+		cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, logger)
 		cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
 		return nil, nil
 	}
@@ -771,6 +796,11 @@ func deleteLegacyVMAndArtifacts(ctx context.Context, deps Deps, node, vmCID stri
 	if awaitErr := awaitDeleteTask(ctx, deps, node, vmCID, vmid, deleteResp, logger); awaitErr != nil {
 		return nil, awaitErr
 	}
+
+	// --- HA anti-affinity / DLB / node-affinity pin cleanup (best-effort) ---
+	// The destroy's purge removed the HA resource, so this only clears CPI
+	// rules that still name the VM.
+	cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, logger)
 
 	// --- opt-in empty-pool reaper: run AFTER the destroy has completed so
 	//     PVE has already dropped this VM's pool membership. Never fails
@@ -889,35 +919,47 @@ func refuseIfParkerVM(ctx context.Context, deps Deps, loc pve.VMLocation, vmid i
 	return loc, false, nil
 }
 
-// cleanupHAMembership removes the VM's CPI-managed HA state before the stop:
-// anti-affinity/DLB membership and the per-VM node-affinity pin. Order
-// matters: while a VM is HA-managed, a status/stop call is redirected to a
-// CRM request whose task completes when the request is accepted — not when
-// the VM actually halts — so a stop-then-deregister sequence races the LRM
-// and the subsequent destroy fails with "VM is running". Deregistering first
-// restores plain qmstop semantics for the stop that follows.
+// cleanupHAMembership removes the VM's CPI-managed HA state: its
+// anti-affinity or DLB rule membership and HA resource, and its per-VM
+// node-affinity pin. It never deregisters an HA-managed VM before its stop:
+// the synchronous delete stops such a VM through PVE HA and runs this cleanup
+// after the destroy, and the fast path takes only VMs that are not HA-managed.
 //
-// The anti-affinity/DLB removal is gated on the pve.ha opt-ins; it also covers
-// DLB-only VMs (removeAntiAffinityMembership purges the HA resource and
-// prunes any associated rules; for a DLB-only VM with no affinity rule it
-// simply deregisters the HA resource). The node-affinity pin removal is
-// unconditional because two writers create that rule: the AZ pin (gated by
-// pve.ha.pin_az) and the PCI strict pin (applied whenever
-// pci_passthroughs is set, regardless of that flag). delete_vm has no
-// cloud_properties, so it cannot know which writer ran; removing
-// unconditionally guarantees no orphan rule survives the VM. For a VM that
-// never had a pin this is two cheap not-found no-ops.
+// It refuses, with a retriable error and without touching anything, when the
+// HA state is not known or the service or its node is in fence. Removing a
+// resource in fence leaves PVE with a fenced node and no service to recover,
+// and the VM config stays stranded on the dead node.
 //
-// Everything here is best-effort: HA failures are logged and never block VM
-// deletion.
-func cleanupHAMembership(ctx context.Context, deps Deps, vmid int, logger *log.Logger) {
-	if deps.Config.HAAntiAffinityRulesEnabled() || deps.Config.DLBConfigured() {
+// HA membership comes from the normalized HA state, not the pve.ha knobs, so a
+// resource registered by hand is cleaned up too. The anti-affinity and DLB
+// removal runs when the state shows the VM HA-managed, because only an HA
+// resource can be a rule member. The node-affinity pin removal runs for every
+// VM, because two writers create that rule, the AZ pin and the PCI strict pin,
+// and delete_vm has no cloud_properties to tell which one ran. For a VM that
+// never had a pin, it costs two cheap not-found no-ops.
+//
+// Past the refusal everything is best-effort: HA failures are logged and never
+// block the delete.
+func cleanupHAMembership(ctx context.Context, deps Deps, haState *pve.HAServiceState, vmid int, logger *log.Logger) error {
+	if err := haRefusesMembershipCleanup(haState, vmid); err != nil {
+		return err
+	}
+	if haState.Managed() {
 		if aaErr := removeAntiAffinityMembership(ctx, deps, vmid, logger); aaErr != nil {
 			logger.Warn("delete_vm: HA anti-affinity/DLB cleanup incomplete (non-fatal)", log.Err(aaErr))
 		}
 	}
 	if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
 		logger.Warn("delete_vm: HA node-affinity pin cleanup incomplete (non-fatal)", log.Err(pinErr))
+	}
+	return nil
+}
+
+// cleanupHAMembershipAfterDestroy runs cleanupHAMembership once the VM is gone,
+// when the delete can no longer fail on it, so a refusal is only logged.
+func cleanupHAMembershipAfterDestroy(ctx context.Context, deps Deps, haState *pve.HAServiceState, vmid int, logger *log.Logger) {
+	if err := cleanupHAMembership(ctx, deps, haState, vmid, logger); err != nil {
+		logger.Warn("delete_vm: HA membership cleanup after the destroy refused", log.Err(err))
 	}
 }
 

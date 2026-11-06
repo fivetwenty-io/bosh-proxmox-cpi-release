@@ -151,6 +151,11 @@ func (cl *allocationAuditCluster) ListConfigNodes(context.Context) (*sdkcluster.
 }
 
 func (cl *allocationAuditCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	// With no scripted rows the cluster is quorate, every member is online,
+	// and the first member is the entry node that answers the HA reads.
+	if len(cl.status) == 0 && len(cl.members) != 0 {
+		return AbsenceOnlineStatus(cl.members...), nil
+	}
 	response := sdkcluster.ListStatusResponse{}
 	for _, row := range cl.status {
 		raw, err := json.Marshal(row)

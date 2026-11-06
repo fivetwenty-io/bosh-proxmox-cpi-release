@@ -105,6 +105,10 @@ func HandleHasVM(deps Deps) cpi.Handler {
 			return false, nil
 		}
 
+		// The answer stays true whatever HA reports, so a VM in fence or
+		// recovery never sends the Director to create_vm with its disk.
+		// The log says why such a VM still exists.
+		logHasVMHAState(ctx, deps, loc, vmid, logger)
 		logger.Debug("has_vm: VM found — returning true", log.String("node", loc.Node))
 		return true, nil
 	})

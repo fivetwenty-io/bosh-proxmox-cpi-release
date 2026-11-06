@@ -98,12 +98,16 @@ func (f *parkerProbeFixture) deps(vmid int) handlers.Deps {
 		listStatusFn: func(_ context.Context) (*cluster.ListStatusResponse, error) {
 			resp := make(cluster.ListStatusResponse, 0, 1+len(members))
 			resp = append(resp, json.RawMessage(`{"type":"cluster","quorate":1}`))
-			for _, n := range members {
+			for i, n := range members {
 				online := 1
 				if n == f.offline {
 					online = 0
 				}
-				raw, _ := json.Marshal(map[string]any{"type": "node", "name": n, "online": online})
+				row := map[string]any{"type": "node", "name": n, "online": online}
+				if i == 0 {
+					row["local"] = 1
+				}
+				raw, _ := json.Marshal(row)
 				resp = append(resp, raw)
 			}
 			return &resp, nil

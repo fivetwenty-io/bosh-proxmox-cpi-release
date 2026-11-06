@@ -4,6 +4,7 @@ import (
 	"fmt"
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	ns "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"reflect"
 	"testing"
 )
@@ -14,6 +15,12 @@ type unknownHACleanupClient struct {
 }
 
 func (c *unknownHACleanupClient) Cluster() cluster.Service { return c.ha }
+
+// Nodes adds the entry node's clock, which the HA read checks the CRM view
+// against.
+func (c *unknownHACleanupClient) Nodes() ns.Service {
+	return HAClockNodes{Service: c.deleteManagedClient.Nodes()}
+}
 func TestCleanupUnknownHAWritePreservesOtherMembers(t *testing.T) {
 	for _, kind := range []string{"vm.Cluster.CreateHaResources", "vm.Cluster.UpdateHaResources", "vm.Cluster.UpdateHaRules", "vm.Cluster.CreateHaRules"} {
 		t.Run(kind, func(t *testing.T) {
@@ -41,6 +48,8 @@ func TestCleanupUnknownHAWritePreservesOtherMembers(t *testing.T) {
 				t.Fatal(err)
 			}
 			ha := &infrastructureHACluster{Service: base.Cluster(), rows: []map[string]any{{"rule": "shared", "type": "resource-affinity", "resources": "vm:123,vm:124", "affinity": "negative"}}}
+			// PVE HA already holds the VM stopped, so the delete asks for nothing.
+			base.stopped = true
 			deps.PVE = &cleanupTaskClient{Client: &unknownHACleanupClient{deleteManagedClient: base, ha: ha}}
 			result, err := CleanupStorageAllocation(t.Context(), deps, j, []string{"pve1"}, cleanupAttestedDecision(record.ID))
 			if err != nil {
@@ -92,6 +101,8 @@ func checkCleanupUnknownHAPurgeRequiresObservedEffectWithoutReplay(t *testing.T,
 			ha.rows = []map[string]any{{"rule": "shared", "type": "resource-affinity", "resources": "vm:124", "affinity": "negative"}}
 		}
 	}
+	// PVE HA already holds the VM stopped, so the delete asks for nothing.
+	base.stopped = true
 	deps.PVE = &cleanupTaskClient{Client: &unknownHACleanupClient{deleteManagedClient: base, ha: ha}}
 	decision := cleanupAttestedDecision(record.ID)
 	if _, err = CleanupStorageAllocation(t.Context(), deps, j, []string{"pve1"}, decision); err == nil {

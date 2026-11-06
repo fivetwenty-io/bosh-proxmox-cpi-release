@@ -14,6 +14,7 @@ import (
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
@@ -219,7 +220,57 @@ func managedVMDeleteTask(ctx context.Context, deps Deps, handle *aj.Handle, kind
 	return storageMutationObserved(handle, step, nil, false)
 }
 
+// managedVMDeleteHA brings the VM's HA state to where the destroy can run. It
+// applies the delete's HA state table first, so a VM in fence, on a node that
+// is not online, in motion, in recovery, or in an unknown state defers before
+// anything is stopped, detached, or destroyed. HA membership comes from the
+// normalized HA state, not the pve.ha knobs.
+//
+// An HA-managed VM is stopped through PVE HA first, so the CRM cannot start or
+// move it again. Only then is its HA resource purged, with the rule steps and
+// the purge step recorded, so a crash between the stop and the purge leaves a
+// stopped VM that the next attempt purges and destroys. A resource in error
+// that the token cannot clear without Sys.Console, on a VM that is already
+// stopped, gets no HA write at all, and the destroy's purge removes it; rule
+// membership that only an HA write could remove is then a retriable refusal.
+// A VM that is not HA-managed must have no rule membership left.
 func managedVMDeleteHA(ctx context.Context, deps Deps, handle *aj.Handle, node string, vmid int) error {
+	if err := storageCleanupSettled(ctx, handle.Record()); err != nil {
+		return err
+	}
+	logger := deps.Log(ctx).With(log.Int("vmid", vmid), log.String("node", node))
+	haState, err := gateHADelete(ctx, deps, vmid, node, logger)
+	if err != nil {
+		return err
+	}
+	sid := haResourceSid(vmid)
+	if haState.Managed() {
+		outcome, stopErr := stopHAManagedVMForDelete(ctx, deps, "delete_vm", haState, vmid, logger)
+		if stopErr != nil {
+			return stopErr
+		}
+		if outcome == haStopNoHAWrite {
+			before, rulesErr := managedVMHARulesForResource(ctx, deps, vmid)
+			if rulesErr != nil {
+				return rulesErr
+			}
+			if len(before) != 0 {
+				return cpierrors.Retriable(
+					"delete_vm: VM %d is stopped and %s is in error, but HA rules still name it and removing "+
+						"them needs Sys.Console on /, which the token lacks; run 'ha-manager set %s --state "+
+						"disabled' and retry", vmid, sid, sid)
+			}
+			return nil
+		}
+	}
+	return managedVMPurgeHAResource(ctx, deps, handle, node, vmid, haState.Managed())
+}
+
+// managedVMPurgeHAResource purges the VM's HA resource after the gate and the
+// HA stop, recording the rule steps and the purge step first. managed is the
+// gate's answer: a resource that is present although the gate saw none is a
+// retriable error, so the retry stops it through PVE HA before any purge.
+func managedVMPurgeHAResource(ctx context.Context, deps Deps, handle *aj.Handle, node string, vmid int, managed bool) error {
 	if err := storageCleanupSettled(ctx, handle.Record()); err != nil {
 		return err
 	}
@@ -238,8 +289,10 @@ func managedVMDeleteHA(ctx context.Context, deps Deps, handle *aj.Handle, node s
 		}
 		return nil
 	}
-	if err != nil {
-		return err
+	if !managed {
+		return cpierrors.Retriable(
+			"delete_vm: HA resource %s appeared after the HA state of VM %d was read; retry so the delete stops "+
+				"it through PVE HA", sid, vmid)
 	}
 	resource, err := deps.PVE.Cluster().GetHaResources(ctx, sid)
 	if err != nil {

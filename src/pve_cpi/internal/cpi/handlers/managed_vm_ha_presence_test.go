@@ -44,7 +44,7 @@ func TestManagedHAAbsentSkipsAmbiguousExactGet(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	if err := managedVMDeleteHA(t.Context(), deps, h, "pve1", 123); err != nil {
+	if err := managedVMPurgeHAResource(t.Context(), deps, h, "pve1", 123, true); err != nil {
 		t.Fatal(err)
 	}
 	if c.gets != 0 {

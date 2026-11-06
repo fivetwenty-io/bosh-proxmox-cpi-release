@@ -192,7 +192,7 @@ func (c rollbackFlowCluster) ListHaRules(ctx context.Context, params *cluster.Li
 func (c rollbackFlowCluster) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
 	r := cluster.ListStatusResponse{
 		json.RawMessage(`{"type":"cluster","quorate":1}`),
-		json.RawMessage(`{"type":"node","name":"n1","online":1,"maxcpu":8,"maxmem":17179869184,"mem":1073741824,"cpu":0.1}`),
+		json.RawMessage(`{"type":"node","name":"n1","online":1,"local":1,"maxcpu":8,"maxmem":17179869184,"mem":1073741824,"cpu":0.1}`),
 		json.RawMessage(`{"type":"node","name":"n2","online":1,"maxcpu":8,"maxmem":536870912,"mem":0,"cpu":0.1}`),
 	}
 	return &r, nil

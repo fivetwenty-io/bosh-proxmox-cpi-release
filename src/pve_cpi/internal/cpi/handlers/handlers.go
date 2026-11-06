@@ -108,6 +108,11 @@ type Deps struct {
 	// it with withRequestHAProfile, so the profile is resolved at most once
 	// per request and every writer reuses it.
 	HAProfile func(ctx context.Context) (*ha.Profile, error)
+	// HAEpisodes records when delete_vm first observed each HA recovery
+	// episode, which starts the episode's grace window. Nil (production and
+	// every existing test literal) uses the record in the endpoint cache
+	// directory; tests point it at a temporary directory and a fixed clock.
+	HAEpisodes *ha.EpisodeStore
 }
 
 // EffectiveISOStorage returns the pool config-drive ISOs live on for this

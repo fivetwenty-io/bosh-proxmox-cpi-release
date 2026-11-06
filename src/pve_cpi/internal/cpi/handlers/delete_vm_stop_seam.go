@@ -12,8 +12,7 @@ var deleteStopPollIntervalNs atomic.Int64
 
 // deleteStopWaitBudgetNs bounds how long delete_vm waits for the VM to reach
 // "stopped" after the stop task completes. Default 120s — a hard qmstop is
-// near-instant, but a graceful guest shutdown (or an HA stop request accepted
-// just before the CPI deregistered the resource) can take tens of seconds.
+// near-instant, but a graceful guest shutdown can take tens of seconds.
 var deleteStopWaitBudgetNs atomic.Int64
 
 func init() {

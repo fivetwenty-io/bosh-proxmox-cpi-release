@@ -92,7 +92,11 @@ func (f *strictVMIDPVE) serve(w http.ResponseWriter, r *http.Request) {
 			"name": "vm-101", "tags": stampedFixtureTags,
 		}}
 	case path == "/cluster/status":
-		data = []any{map[string]any{"type": "node", "name": "pve1", "online": 1}}
+		data = []any{map[string]any{"type": "node", "name": "pve1", "online": 1, "local": 1}}
+	case path == "/cluster/ha/status/manager_status":
+		data = map[string]any{}
+	case path == "/cluster/ha/status/current":
+		data = []any{}
 	case path == "/cluster/config/nodes":
 		data = []any{map[string]any{"name": "pve1"}}
 	case strings.HasSuffix(path, "/status/current"):
