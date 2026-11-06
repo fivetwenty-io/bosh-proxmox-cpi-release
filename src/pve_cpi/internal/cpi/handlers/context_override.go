@@ -431,6 +431,17 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 	} else {
 		_, _ = fmt.Fprintf(h, "placement_marshal_error=%s\x00", perr.Error())
 	}
+	// The HA block is per entry, so two entries that differ only in their HA
+	// settings must not share a cached bundle. It is folded in as canonical
+	// JSON for the same reason as placement. An absent block adds nothing, so
+	// a config without one keys exactly as it did before the block existed.
+	if cfg.HA != nil {
+		if haJSON, herr := json.Marshal(cfg.HA); herr == nil {
+			_, _ = fmt.Fprintf(h, "ha=%s\x00", haJSON)
+		} else {
+			_, _ = fmt.Fprintf(h, "ha_marshal_error=%s\x00", herr.Error())
+		}
+	}
 	// Storage policy belongs to the cached request bundle. Canonical JSON keeps
 	// map iteration order from changing its identity and preserves explicit false.
 	storagePolicy := struct {

@@ -109,16 +109,107 @@ properties:
   pve.require_shared_iso_for_ha:
     description: |
       When true, escalates the config-drive ISO migration-safety warning to a
-      non-retriable error that fails create_vm. The warning (and, when this is
-      true, the error) fires whenever create_vm registers the VM under any
-      HA-driven feature (placement.dlb, placement.pin_az_via_ha_rules, or
-      placement.anti_affinity.use_ha_rules) while pve.iso_storage resolves to
-      a storage pool that /storage does not report as shared. Default false:
-      the hazard is only logged (see docs/configdrive.md), never blocks
-      create_vm.
+      non-retriable error that fails create_vm. The trigger is the resolved HA
+      decision for the VM, which the pve.ha block drives. When pve.ha.mode is
+      "auto", a node-local ISO on a VM that would otherwise get full HA, or on a
+      VM under the "replicate" local policy, fails create_vm instead of
+      downgrading the VM with a warning. When pve.ha.mode is "managed", that is
+      always an error, whatever this key says. The ISO counts as node-local when
+      pve.iso_storage resolves to a storage pool that /storage does not report as
+      shared. Under pve.ha.mode "off" the CPI makes no HA registrations, so no
+      VM is affected. Default false: the hazard is only logged (see
+      docs/configdrive.md), never blocks create_vm.
 
       Overridable per cpi-config entry as pve_require_shared_iso_for_ha.
     default: false
+  pve.ha.mode:
+    description: |
+      Whether the CPI writes PVE HA state at all. "off" (the behavior when the
+      key is unset) registers nothing, writes no rules, and creates no
+      replication jobs, though the CPI still reads HA state where that makes it
+      safer, and still cleans up a VM that is already HA-managed when BOSH
+      deletes or reboots it. "auto" probes the cluster, does exactly what it can
+      safely do, and degrades to a smaller set of features, with a log line, when
+      a probe fails or a prerequisite is missing. "managed" runs the same probes
+      but turns a missing prerequisite into an error, for operators who would
+      rather see a failed deploy than an unprotected VM. The pve.ha block has
+      no spec defaults so that the CPI can tell a key that is set from one that
+      is not; the default of each key is stated in its own description.
+
+      The block can be overridden per cpi-config entry as pve_ha. Each key the
+      entry names replaces the same key of this block, so an entry can change the
+      mode and inherit everything else, and a key the CPI does not know is
+      rejected. A YAML manifest that writes an unquoted on or off is read as a
+      boolean, and the CPI accepts it as "on" or "off".
+  pve.ha.storage_topology:
+    description: |
+      Which disk scenario applies, overriding what the probe found. "auto"
+      (the default) reads the storage definitions and decides per VM. "shared"
+      says every VM must be HA-eligible, so the CPI refuses a placement that puts
+      any volume on node-local storage. "local" says no volume can follow a VM to
+      another node, so every VM follows pve.ha.local_policy. "mixed" decides per
+      VM from the storage that VM actually uses.
+  pve.ha.local_policy:
+    description: |
+      What happens to a VM that has node-local volumes. "none" (the default)
+      leaves the VM without HA and logs why. "hold" and "replicate" are not
+      available in this build, and setting either one is rejected when the
+      configuration loads.
+  pve.ha.anti_affinity:
+    description: |
+      Whether the CPI writes a negative resource-affinity rule for an instance
+      group whose members are HA-managed. "auto" (the default) writes the rule
+      when the cluster profile allows rules, and otherwise skips it with one Info
+      line. "on" makes the rule a requirement, so a group that cannot get it is a
+      warning in auto mode and an error in managed mode. "off" never writes one.
+      "on" needs pve.ha.mode set to "auto" or "managed".
+  pve.ha.anti_affinity_overflow:
+    description: |
+      What happens when an instance group has more members than the cluster has
+      nodes, which PVE cannot satisfy and silently disables. "skip" (the
+      default) writes no rule for such a group and logs why. "split" divides the
+      group into several rules that each fit the cluster.
+  pve.ha.pin_az:
+    description: |
+      Whether the CPI folds a VM's AZ node set into its HA node-affinity pin.
+      "auto" (the default) does so when the VM is HA-managed and placement.az_map
+      defines its AZ. "on" makes the pin a requirement in the same way as
+      pve.ha.anti_affinity "on". "off" never pins to an AZ. "on" needs
+      pve.ha.mode set to "auto" or "managed".
+  pve.ha.pin_az_strict:
+    description: |
+      Whether the AZ part of the pin is strict. Default true. When false, the AZ
+      only raises the priority of its nodes inside the VM's admissible set and
+      never removes a node from that set, so HA can still leave the AZ when every
+      node in it is down.
+  pve.ha.headroom:
+    description: |
+      The N+1 memory check, which asks whether the surviving nodes could absorb
+      the HA VMs of any one node that fails. It is an estimate. "off" skips it,
+      "warn" (the default) logs a warning and places the VM anyway, and "enforce"
+      refuses the placement with an error.
+  pve.ha.dlb.enabled:
+    description: |
+      When true, registers every eligible VM for the PVE Dynamic Load Balancer.
+      Default false. Needs pve.ha.mode set to "auto" or "managed".
+  pve.ha.dlb.az_name:
+    description: |
+      The sentinel availability-zone name that opts a single VM into the Dynamic
+      Load Balancer. Default "dlb". An explicit empty string disables the
+      sentinel. Under pve.ha.mode "off", a create_vm whose AZ is the sentinel
+      name fails, because the sentinel needs the mode set.
+  pve.ha.motion_wait_sec:
+    description: |
+      The budget in seconds for a migrate-lock wait, the HA state poll, and the
+      delete grace window. Default 600. Must be between 1 and 86400.
+  pve.ha.replication.schedule:
+    description: |
+      The PVE schedule of each replication job that the "replicate" local policy
+      creates. Default "*/5".
+  pve.ha.replication.rate_mbps:
+    description: |
+      The rate limit of each replication job in megabytes per second. Default 0,
+      which means no limit.
   pve.iso_storage_follow_vm_storage:
     description: |
       When true (the default), resolves the ConfigDrive ISO pool to

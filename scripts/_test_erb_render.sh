@@ -446,6 +446,66 @@ if [ -n "$SPEC_VM_DISK_FORMAT" ]; then
   FAILED=$((FAILED+1))
 fi
 
+# The pve.ha properties have no spec default, so the template renders an "ha"
+# block only from keys the operator set. A key set to false or to an empty
+# string still counts as set, because the Go config tells those apart from an
+# absent key.
+echo "Case 12: pve.ha block"
+props_with_ha() {
+  printf '%s' "$(build_props 'secret-pw' '')" | ruby -rjson -e '
+    h = eval(STDIN.read)
+    h["pve"]["ha"] = JSON.parse(ARGV[0])
+    print h.inspect
+  ' "$1"
+}
+assert_ha_block() {
+  local label="$1"; local json="$2"; local want="$3"
+  local got
+  got="$(printf '%s' "$json" | ruby -rjson -e 'print JSON.generate(JSON.parse(STDIN.read).fetch("ha", "<absent>"))')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL [${label}]: ha block is ${got}, expected ${want}" >&2
+    FAILED=$((FAILED+1))
+  fi
+}
+assert_json_lacks_key "case12-unset" "$JSON_1" ha || FAILED=$((FAILED+1))
+JSON_12E="$(render "$(props_with_ha '{}')")"
+assert_json_valid     "case12-empty" "$JSON_12E"     || FAILED=$((FAILED+1))
+assert_json_lacks_key "case12-empty" "$JSON_12E" ha  || FAILED=$((FAILED+1))
+JSON_12M="$(render "$(props_with_ha '{"mode":"auto"}')")"
+assert_json_valid "case12-mode" "$JSON_12M" || FAILED=$((FAILED+1))
+assert_ha_block   "case12-mode" "$JSON_12M" '{"mode":"auto"}'
+JSON_12F="$(render "$(props_with_ha '{"mode":"managed","storage_topology":"mixed","local_policy":"none","anti_affinity":"on","anti_affinity_overflow":"split","pin_az":"on","pin_az_strict":false,"headroom":"enforce","dlb":{"enabled":true,"az_name":"balance"},"motion_wait_sec":900,"replication":{"schedule":"*/15","rate_mbps":50}}')")"
+assert_json_valid "case12-full" "$JSON_12F" || FAILED=$((FAILED+1))
+assert_ha_block   "case12-full" "$JSON_12F" '{"mode":"managed","storage_topology":"mixed","local_policy":"none","anti_affinity":"on","anti_affinity_overflow":"split","pin_az":"on","pin_az_strict":false,"headroom":"enforce","motion_wait_sec":900,"dlb":{"enabled":true,"az_name":"balance"},"replication":{"schedule":"*/15","rate_mbps":50}}'
+# Keys set to false, or to an empty string, are still set and still render.
+JSON_12S="$(render "$(props_with_ha '{"mode":false,"pin_az_strict":false,"dlb":{"enabled":false,"az_name":""}}')")"
+assert_json_valid "case12-set-falsy" "$JSON_12S" || FAILED=$((FAILED+1))
+assert_ha_block   "case12-set-falsy" "$JSON_12S" '{"mode":false,"pin_az_strict":false,"dlb":{"enabled":false,"az_name":""}}'
+# A quoted decimal integer renders as a number.
+JSON_12Q="$(render "$(props_with_ha '{"motion_wait_sec":"900","replication":{"rate_mbps":" 25 "}}')")"
+assert_ha_block "case12-quoted-int" "$JSON_12Q" '{"motion_wait_sec":900,"replication":{"rate_mbps":25}}'
+# A value that is not a decimal integer passes through, so the Go decoder
+# rejects it instead of the template turning it into 0.
+JSON_12B="$(render "$(props_with_ha '{"motion_wait_sec":"soon"}')")"
+assert_ha_block "case12-bad-int" "$JSON_12B" '{"motion_wait_sec":"soon"}'
+# Sub-block keys render only when set.
+JSON_12D="$(render "$(props_with_ha '{"dlb":{"enabled":true}}')")"
+assert_ha_block "case12-dlb-only" "$JSON_12D" '{"dlb":{"enabled":true}}'
+JSON_12R="$(render "$(props_with_ha '{"replication":{"schedule":"mon..fri 22:00"}}')")"
+assert_ha_block "case12-replication-only" "$JSON_12R" '{"replication":{"schedule":"mon..fri 22:00"}}'
+# Every pve.ha property the spec declares is one the template reads, and the
+# spec declares no default for any of them.
+SPEC_HA_DEFAULTS="$(ruby -ryaml -e '
+  spec = YAML.load_file(ARGV[0])
+  props = spec.fetch("properties").select { |k, _| k.start_with?("pve.ha.") }
+  puts props.count
+  puts props.select { |_, v| v.key?("default") }.keys.join(",")
+' "${REPO_ROOT}/jobs/pve_cpi/spec")"
+if [ "$(printf '%s' "$SPEC_HA_DEFAULTS" | sed -n 1p)" != "13" ] || [ -n "$(printf '%s' "$SPEC_HA_DEFAULTS" | sed -n 2p)" ]; then
+  echo "FAIL [case12-spec]: expected 13 pve.ha properties with no default, got: ${SPEC_HA_DEFAULTS}" >&2
+  FAILED=$((FAILED+1))
+fi
+
 if [ "$FAILED" -ne 0 ]; then
   echo "RESULT: ${FAILED} assertion(s) FAILED" >&2
   exit 1

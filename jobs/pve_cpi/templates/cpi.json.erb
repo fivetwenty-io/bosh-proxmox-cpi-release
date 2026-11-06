@@ -436,6 +436,37 @@
 
   config["placement"] = placement unless placement.empty?
 
+  # Emit the ha block only when at least one pve.ha property is set. The spec
+  # declares no default for any of them, so if_p fires only on a value the
+  # operator wrote, and an unset block renders no "ha" key at all: the Go
+  # config keeps a nil *HAConfig, the mode is off, and every key reads its
+  # compiled default. Values pass through unchanged, booleans included, so the
+  # Go side can tell a key that is set to false (or to an unquoted YAML off)
+  # from a key that is not set, and does the enum, range, and combination
+  # checks itself. A decimal integer written as a quoted string is converted,
+  # because BOSH renders a quoted manifest scalar as a string and the Go
+  # decoder would otherwise reject it.
+  ha_int = lambda { |v| v.is_a?(String) && v.strip =~ /\A\d+\z/ ? v.strip.to_i : v }
+  ha = {}
+  [ "mode", "storage_topology", "local_policy", "anti_affinity",
+    "anti_affinity_overflow", "pin_az", "pin_az_strict", "headroom",
+  ].each do |key|
+    if_p("pve.ha.#{key}") { |v| ha[key] = v }
+  end
+  if_p("pve.ha.motion_wait_sec") { |v| ha["motion_wait_sec"] = ha_int.call(v) }
+
+  ha_dlb = {}
+  if_p("pve.ha.dlb.enabled") { |v| ha_dlb["enabled"] = v }
+  if_p("pve.ha.dlb.az_name") { |v| ha_dlb["az_name"] = v }
+  ha["dlb"] = ha_dlb unless ha_dlb.empty?
+
+  ha_replication = {}
+  if_p("pve.ha.replication.schedule") { |v| ha_replication["schedule"] = v }
+  if_p("pve.ha.replication.rate_mbps") { |v| ha_replication["rate_mbps"] = ha_int.call(v) }
+  ha["replication"] = ha_replication unless ha_replication.empty?
+
+  config["ha"] = ha unless ha.empty?
+
   # Emit the storage block only when the operator sets a positive utilization
   # ceiling. Zero (default) means the Go nil *int -> 0 -> gate-off accessor
   # preserves byte-identical behavior, so the block is omitted entirely.

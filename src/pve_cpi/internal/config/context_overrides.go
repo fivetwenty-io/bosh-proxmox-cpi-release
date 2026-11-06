@@ -36,6 +36,10 @@ const contextOverridePrefix = "pve_"
 // create_vm on a non-job-level entry hard-fail against the job-level (empty)
 // az_map. See coerceOverridePlacement for the whole-block replace semantics.
 //
+// pve_ha is in scope for the same reason, because each cluster can have a
+// different HA setup. It merges key by key instead of replacing the block (see
+// coerceOverrideHA).
+//
 // The SDN settings, the VM and template pools, the stemcell strategy and
 // template node, the two ISO layout flags, destroy_unreferenced_disks, and
 // the vm_types and disk_types profile maps are in scope because each one
@@ -84,6 +88,7 @@ var contextOverrideFieldOrder = []string{
 	"pve_vm_disk_format",
 	"pve_agent_mbus",
 	"pve_placement",
+	"pve_ha",
 	"pve_storage_sets",
 	"pve_storage_capacity_domains",
 	"pve_ephemeral_storage_set",
@@ -513,6 +518,22 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 		// not ApplyDefaults, so without this an entry setting a partial
 		// weights block would score on zeroed axes.
 		c.applyPlacementDefaults()
+		return nil
+	},
+	// The HA block is per entry because an AZ is usually a separate cluster
+	// or standalone host, and each cluster can have a different HA setup.
+	// Unlike pve_placement it MERGES: every key the entry names replaces the
+	// same key of the job-level block, so an entry can change the mode and
+	// inherit the rest. The merge always yields a freshly allocated block and
+	// never writes through base's pointers. Enum, range, and combination
+	// checks are delegated to the eff.Validate() call at the end of
+	// ApplyContextOverrides, which sees the merged result.
+	"pve_ha": func(c *CPIConfig, v any) error {
+		over, err := coerceOverrideHA(v)
+		if err != nil {
+			return err
+		}
+		c.HA = c.HA.merged(over)
 		return nil
 	},
 	"pve_agent_mbus": func(c *CPIConfig, v any) error {

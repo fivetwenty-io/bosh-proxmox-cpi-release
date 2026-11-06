@@ -136,6 +136,9 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 			"az_map":              map[string]any{"z3": []any{"pve-az2-1"}},
 			"pin_az_via_ha_rules": true,
 		},
+		// The HA block is merged per entry, and two entries that differ only
+		// in their HA settings must not share a cached bundle.
+		"pve_ha":                            map[string]any{"mode": "auto", "headroom": "enforce"},
 		"pve_network_mode":                  config.NetworkModeSDN,
 		"pve_sdn_zone":                      "zone-b",
 		"pve_sdn_zone_type":                 "evpn",

@@ -653,6 +653,14 @@ type CPIConfig struct {
 	// = use default; explicit value overrides.
 	Placement *PlacementConfig `json:"placement,omitempty"`
 
+	// HA is the optional pve.ha block that decides whether the CPI writes PVE HA
+	// state and which HA features it may use. When nil (field absent from JSON)
+	// the mode is off and the CPI makes no HA registrations of its own. Every
+	// sub-field is pointer-typed so nil means "not set", and the HA*Value
+	// accessors supply the defaults. Overridable per cpi-config entry as the
+	// pve_ha block, merged over this one key at a time.
+	HA *HAConfig `json:"ha,omitempty"`
+
 	// Storage is an optional nested block controlling storage-pool capacity
 	// guards that apply across create_vm placement, create_disk, resize_disk,
 	// and snapshot_disk — not only create_vm placement, hence its own top-level
@@ -4364,6 +4372,7 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	c.validateRanges(&errs)
 	c.validateNodeEndpoints(&errs)
 	c.validatePlacement(&errs)
+	c.validateHA(&errs)
 	c.validateStorage(&errs)
 	c.validateHooks(&errs)
 	c.validateMetrics(&errs)
