@@ -594,7 +594,7 @@ func ownedCreateDiskHint(ctx context.Context, deps Deps, vmCID string) (string, 
 	if parseErr != nil {
 		return vmCID, nil
 	}
-	loc, err := pve.FindVMAuthoritative(ctx, deps.PVE, cid.VMID)
+	loc, err := findVMAuthoritative(ctx, deps, cid.VMID)
 	if err != nil {
 		return "", cpierrors.Wrap(err, "create_disk: locate hinted VM "+vmCID)
 	}

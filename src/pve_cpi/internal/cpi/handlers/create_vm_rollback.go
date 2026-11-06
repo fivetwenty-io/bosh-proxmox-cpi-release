@@ -287,7 +287,11 @@ func protectForeignDisksOnRollback(ctx context.Context, deps Deps, node, vmCID s
 		holding, cfgErr := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 		if cfgErr != nil {
 			if pve.IsNotFound(cfgErr) || pve.IsPmxcfsConfigMissing(cfgErr) {
-				return nil // VM gone -- the purge below is idempotent about that
+				// The node holds no config for the VM. Only a VM proven gone
+				// from every member lets the purge below run, idempotent about
+				// the absence; one that moved fails closed into the preserve
+				// branch.
+				return confirmVMGone(ctx, deps, "create_vm: rollback", vmid, node, "the config read before purge")
 			}
 			return cpierrors.Wrap(pve.WrapError(cfgErr),
 				fmt.Sprintf("create_vm: rollback: read config for VM %s before purge", vmCID))

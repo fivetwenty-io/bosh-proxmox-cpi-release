@@ -15,6 +15,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
@@ -308,8 +309,21 @@ func (c ownTestCluster) ListConfigNodes(context.Context) (*sdkcluster.ListConfig
 	return &resp, nil
 }
 
-func (ownTestCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
-	return &sdkcluster.ListStatusResponse{}, nil
+func (c ownTestCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	return AbsenceOnlineStatus(c.nodes...), nil
+}
+
+// The HA reads answer for a cluster with no HA resources and an idle CRM.
+func (ownTestCluster) ListHaResources(context.Context, *sdkcluster.ListHaResourcesParams) (*sdkcluster.ListHaResourcesResponse, error) {
+	return AbsenceHAResources(), nil
+}
+
+func (ownTestCluster) ListHaStatusManagerStatus(context.Context) (*sdkcluster.ListHaStatusManagerStatusResponse, error) {
+	return AbsenceIdleCRM(), nil
+}
+
+func (ownTestCluster) ListHaStatusCurrent(context.Context) (*sdkcluster.ListHaStatusCurrentResponse, error) {
+	return AbsenceNoHAStatus(), nil
 }
 
 // ownTestClient has no cluster service unless one is set, so a re-locate
@@ -322,6 +336,12 @@ type ownTestClient struct {
 
 func (c ownTestClient) QEMU() qemu.Service          { return c.qemu }
 func (c ownTestClient) Cluster() sdkcluster.Service { return c.cluster }
+
+// Nodes serves the node-health read behind a config-missing answer. An idle
+// CRM never asks a node for its clock, so no method is wired.
+func (c ownTestClient) Nodes() sdknodes.Service { return ownTestNodes{} }
+
+type ownTestNodes struct{ sdknodes.Service }
 
 func ownTestDeps(q *ownTestQEMU) Deps {
 	return Deps{

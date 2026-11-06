@@ -165,7 +165,7 @@ func retainedCleanupDecisionAdmission(ctx context.Context, deps Deps, record aj.
 	if retained.VMID <= 0 {
 		return aj.Verification{}, storageRefusal("retained VM disposition identity unavailable")
 	}
-	location, err := pve.FindVMAuthoritative(ctx, deps.PVE, retained.VMID)
+	location, err := findVMAuthoritative(ctx, deps, retained.VMID)
 	if err != nil || location.Found {
 		return aj.Verification{}, storageRefusal("retained cleanup requires absent original VM identity")
 	}

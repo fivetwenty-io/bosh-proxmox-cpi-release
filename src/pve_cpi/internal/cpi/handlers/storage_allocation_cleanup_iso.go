@@ -95,7 +95,7 @@ func observeCleanupUploadedISO(ctx context.Context, deps Deps, record aj.Record,
 // before destruction. Reentry also requires fresh guest absence, all other VM
 // artifacts absent, and the same exact ISO content/task timestamp when present.
 func observeCleanupUploadedISOState(ctx context.Context, deps Deps, journal *aj.Journal, record aj.Record, target aj.Target) (bool, error) {
-	location, err := pve.FindVMAuthoritative(ctx, deps.PVE, target.VMID)
+	location, err := findVMAuthoritative(ctx, deps, target.VMID)
 	if err != nil {
 		return false, err
 	}

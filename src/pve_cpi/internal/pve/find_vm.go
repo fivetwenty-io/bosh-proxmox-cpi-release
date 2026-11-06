@@ -14,14 +14,15 @@ import (
 
 // VMLocation is FindVMAuthoritative's answer: where the guest lives, its raw
 // (semicolon-delimited) tag string, and whether it exists at all. Found=false
-// means absence was proven against every reachable member: each answered the
-// config probe with a clean not-found, never a bare index miss. For
+// means absence was proven, never a bare index miss: two complete sweeps found
+// every reachable member answering the config probe with a clean not-found,
+// /cluster/ha/resources configures no resource for the VMID, and the CRM's
+// service_status holds no service for it (see proveVMAbsent). For
 // FindVMAuthoritative, members the quorate cluster reports offline are
-// excluded from that proof, and absence for their guests rests on the index
+// excluded from the sweeps, and absence for their guests rests on the index
 // rows that persist while a node is down (see the offline-member tolerance
 // paragraph on FindVMAuthoritative). FindVMByConfigProbe never reads the
-// index, so it excludes no member: its Found=false means every member
-// answered a clean not-found, in two complete sweeps.
+// index, so it excludes no member.
 //
 // Template and Type come from the same answer that located the guest, so the
 // VM ownership guard can refuse a template or a container without another
@@ -68,18 +69,23 @@ type VMLocation struct {
 //
 // Fast path: the cluster scan. A hit there is authoritative (a row exists
 // only for a real guest) and costs one listing. On a miss, the fallback
-// proves the answer: enumerate nodes via ListConfigNodes (corosync-backed
-// membership, no lag) and probe GET /nodes/<n>/qemu/<vmid>/config on each.
-// A clean not-found (404, or pmxcfs's config-missing 500) counts as proven
-// absence for that node; a config answer is a hit and returns that node with
-// the config's own tag string. The probes only run on the miss path, so the
-// steady-state cost of this function equals the old cluster-scan-only lookup.
+// proves the answer through proveVMAbsent: enumerate nodes via
+// ListConfigNodes (corosync-backed membership, no lag) and probe
+// GET /nodes/<n>/qemu/<vmid>/config on each, in two complete sweeps. A clean
+// not-found (404, or pmxcfs's config-missing 500) counts as proven absence for
+// that node; a config answer is a hit and returns that node with the config's
+// own tag string. After two clean sweeps the proof still needs the HA
+// resource configuration and the CRM's service state to hold nothing for the
+// VMID, because PVE HA keeps both for a guest it is recovering. The probes
+// only run on the miss path, so the steady-state cost of this function equals
+// the old cluster-scan-only lookup.
 //
 // Any failure that leaves absence unproven — node enumeration failing, an
-// empty node list, or any single node's probe erroring with no hit elsewhere —
-// returns a retriable error, never Found=false: the caller's not-found branch
-// is typically destructive (report deleted, skip a detach) and must not run
-// on partial evidence.
+// empty node list, any single node's probe erroring with no hit elsewhere, an
+// HA source that fails to answer or still holds the guest — returns a
+// retriable error, never Found=false: the caller's not-found branch is
+// typically destructive (report deleted, skip a detach) and must not run on
+// partial evidence.
 //
 // Offline-member tolerance: a member the quorate cluster itself reports
 // offline is excluded from the probe fan-out (its config endpoint can never
@@ -90,13 +96,17 @@ type VMLocation struct {
 // its guests' rows persist in /cluster/resources while the node is down, so
 // an index MISS plus a clean probe of every online member proves absence for
 // everything except a guest created on that member inside the index lag
-// window immediately before it went dark, a corner logged via the Warn on
-// exclusion. Without quorum, or with every member offline, the tolerance is
-// withheld and the fail-loud rule stands.
+// window immediately before it went dark. The tolerance is withheld whenever
+// something still ties the guest to the member: an HA resource or a CRM
+// service for the VMID, which the proof refuses for every member, or a record
+// an OfflineMemberTie option reports, such as a live allocation-journal
+// record. A guest with none of those ties is the remaining corner, logged via
+// the Warn on exclusion. Without quorum, or with every member offline, the
+// tolerance is withheld and the fail-loud rule stands.
 //
 // A nil client/cluster service or non-positive vmid reports not-found with no
 // error, matching FindVMViaCluster's contract for unit-test mocks.
-func FindVMAuthoritative(ctx context.Context, c Client, vmid int) (VMLocation, error) {
+func FindVMAuthoritative(ctx context.Context, c Client, vmid int, opts ...FindVMOption) (VMLocation, error) {
 	if c == nil || c.Cluster() == nil || vmid <= 0 {
 		return VMLocation{}, nil
 	}
@@ -107,15 +117,19 @@ func FindVMAuthoritative(ctx context.Context, c Client, vmid int) (VMLocation, e
 	if row.Found && row.Node != "" {
 		return row, nil
 	}
-	return probeVMConfigs(ctx, c, vmid, "FindVMAuthoritative", "absent from the cluster index", true)
+	var o findVMOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return proveVMAbsent(ctx, c, vmid, "FindVMAuthoritative", "absent from the cluster index", true, o)
 }
 
-// configProbeAbsenceSweeps is how many complete sweeps FindVMByConfigProbe
-// runs before it answers absent. PVE moves a migrating guest's config with a
-// single rename at the end of the migration, so one sequential sweep can
-// probe the target before the rename and the source after it and see the
-// guest nowhere. The rename happens once, so a second sweep that starts after
-// the first one ends sees the config on the target.
+// configProbeAbsenceSweeps is how many complete sweeps the absence proof runs
+// before it answers absent. PVE moves a migrating guest's config with a single
+// rename at the end of the migration, so one sequential sweep can probe the
+// target before the rename and the source after it and see the guest nowhere.
+// The rename happens once, so a second sweep that starts after the first one
+// ends sees the config on the target.
 const configProbeAbsenceSweeps = 2
 
 // FindVMByConfigProbe locates a guest by probing every cluster member's QEMU
@@ -124,20 +138,20 @@ const configProbeAbsenceSweeps = 2
 // the row's node that answered not-found, because the index would only repeat
 // that stale row.
 //
-// A hit returns the node with FromConfig set. Found=false means two complete
-// sweeps each found every member answering a clean not-found (404, or
-// pmxcfs's config-missing 500); the second sweep closes the window in which a
-// migration's config rename lands between two probes of one sweep, and it
-// runs only on the absence path. A hit in the second sweep returns that
-// location.
+// A hit returns the node with FromConfig set. Found=false is the absence proof
+// of proveVMAbsent: two complete sweeps each found every member answering a
+// clean not-found (404, or pmxcfs's config-missing 500), and neither the HA
+// resource configuration nor the CRM's service state holds the VMID. A hit in
+// the second sweep returns that location.
 //
 // The failure rules are stricter than FindVMAuthoritative's. A member the
 // quorate cluster reports offline is not excluded from the proof, because no
 // index row stands in for its guests here, so an offline member makes the
 // answer a retriable error with no hit elsewhere. So do an enumeration
-// failure, an empty member list, and any member's probe error. A nil client,
-// cluster service, or QEMU service is retriable too, because absence cannot
-// be proven without probing the members.
+// failure, an empty member list, any member's probe error, and an HA source
+// that fails to answer or still holds the guest. A nil client, cluster
+// service, or QEMU service is retriable too, because absence cannot be proven
+// without probing the members.
 func FindVMByConfigProbe(ctx context.Context, c Client, vmid int) (VMLocation, error) {
 	if c == nil || c.Cluster() == nil || c.QEMU() == nil {
 		return VMLocation{}, cpierrors.Retriable("FindVMByConfigProbe: VM %d: cluster service unavailable; cannot prove absence", vmid)
@@ -145,35 +159,28 @@ func FindVMByConfigProbe(ctx context.Context, c Client, vmid int) (VMLocation, e
 	if vmid <= 0 {
 		return VMLocation{}, nil
 	}
-	for range configProbeAbsenceSweeps {
-		loc, err := probeVMConfigs(ctx, c, vmid, "FindVMByConfigProbe", "contradicted by its node", false)
-		if err != nil {
-			return VMLocation{}, err
-		}
-		if loc.Found {
-			return loc, nil
-		}
-	}
-	return VMLocation{}, nil
+	return proveVMAbsent(ctx, c, vmid, "FindVMByConfigProbe", "contradicted by its node", false, findVMOptions{})
 }
 
 // probeVMConfigs runs one sweep of the config-probe fan-out behind
-// FindVMAuthoritative's miss path and FindVMByConfigProbe. caller names the
-// public function and why names the reason the index answer was set aside,
-// for the log lines and error messages. tolerateOffline excludes a member the
-// quorate cluster reports offline from the absence proof, which only
-// FindVMAuthoritative may do, because its index fast path still covers that
-// member's guests. Without it, such a member is not probed, since its config
-// endpoint cannot answer while the node is down, and a sweep with no hit
-// returns a retriable error naming it.
-func probeVMConfigs(ctx context.Context, c Client, vmid int, caller, why string, tolerateOffline bool) (VMLocation, error) {
+// proveVMAbsent. caller names the public function and why names the reason
+// the index answer was set aside, for the log lines and error messages.
+// tolerateOffline excludes a member the quorate cluster reports offline from
+// the sweep and returns it in skipped, which only FindVMAuthoritative may do,
+// because its index fast path still covers that member's guests. Without it,
+// such a member is not probed, since its config endpoint cannot answer while
+// the node is down, and a sweep with no hit returns a retriable error naming
+// it.
+func probeVMConfigs(
+	ctx context.Context, c Client, vmid int, caller, why string, tolerateOffline bool,
+) (loc VMLocation, skipped []string, err error) {
 	nodes, enumErr := ListClusterMemberNames(ctx, c)
 	if enumErr != nil {
-		return VMLocation{}, cpierrors.WrapAs(enumErr, cpierrors.TypeRetriableCloud,
+		return VMLocation{}, nil, cpierrors.WrapAs(enumErr, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("%s: VM %d %s, and node enumeration failed; cannot prove absence", caller, vmid, why))
 	}
 	if len(nodes) == 0 {
-		return VMLocation{}, cpierrors.Retriable(
+		return VMLocation{}, nil, cpierrors.Retriable(
 			"%s: VM %d %s, and node enumeration returned zero nodes; cannot prove absence", caller, vmid, why)
 	}
 
@@ -185,8 +192,7 @@ func probeVMConfigs(ctx context.Context, c Client, vmid int, caller, why string,
 	for _, n := range nodes {
 		if offline[n] {
 			if tolerateOffline {
-				log.FromContext(ctx).Warn(caller+": excluding member the cluster reports offline; absence rests on the index for its guests",
-					log.String("node", n), log.Int("vmid", vmid))
+				skipped = append(skipped, n)
 			} else {
 				log.FromContext(ctx).Warn(caller+": member the cluster reports offline cannot answer the config probe; absence stays unproven",
 					log.String("node", n), log.Int("vmid", vmid))
@@ -217,23 +223,23 @@ func probeVMConfigs(ctx context.Context, c Client, vmid int, caller, why string,
 			continue
 		}
 		cfgTags, _ := ConfigString(cfg, "tags")
-		return VMLocation{Node: n, Tags: cfgTags, Found: true, Template: ConfigFlag(cfg, "template"), Type: "qemu", FromConfig: true}, nil
+		return VMLocation{Node: n, Tags: cfgTags, Found: true, Template: ConfigFlag(cfg, "template"), Type: "qemu", FromConfig: true}, nil, nil
 	}
 	if len(failedNodes) > 0 {
-		return VMLocation{}, cpierrors.WrapAs(WrapError(lastProbeErr), cpierrors.TypeRetriableCloud,
+		return VMLocation{}, nil, cpierrors.WrapAs(WrapError(lastProbeErr), cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("%s: VM %d %s, and the config probe failed on node(s) %s; cannot prove absence",
 				caller, vmid, why, strings.Join(failedNodes, ",")))
 	}
 	if len(unprovenOffline) > 0 {
-		return VMLocation{}, cpierrors.Retriable(
+		return VMLocation{}, nil, cpierrors.Retriable(
 			"%s: VM %d %s, and the cluster reports node(s) %s offline, so their configs cannot be probed; cannot prove absence",
 			caller, vmid, why, strings.Join(unprovenOffline, ","))
 	}
 	if !probedAny {
-		return VMLocation{}, cpierrors.Retriable(
+		return VMLocation{}, nil, cpierrors.Retriable(
 			"%s: VM %d %s, and every cluster member reports offline; cannot prove absence", caller, vmid, why)
 	}
-	return VMLocation{}, nil
+	return VMLocation{}, skipped, nil
 }
 
 // ListClusterMemberNames returns the authoritative membership for

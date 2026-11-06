@@ -96,7 +96,7 @@ func HandleGetDisks(deps Deps) Handler {
 		//    probes on an index miss, so a just-created VM the lagging
 		//    index has not caught up with is not misreported as gone).
 		// ----------------------------------------------------------------
-		loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+		loc, lookupErr := findVMAuthoritative(ctx, deps, vmid)
 		if lookupErr != nil {
 			return nil, cpierrors.Wrap(lookupErr, "get_disks: locate VM "+vmCID)
 		}

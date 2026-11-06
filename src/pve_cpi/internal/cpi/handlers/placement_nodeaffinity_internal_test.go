@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -21,9 +22,37 @@ type naClusterStub struct {
 	createCalls int
 	deleteCalls int
 	resDelCalls int
+	// members names the cluster's online members for the reads an absence
+	// proof makes; the HA resources it lists are the ones created through it.
+	members []string
 }
 
 var _ cluster.Service = (*naClusterStub)(nil)
+
+func (s *naClusterStub) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
+	return AbsenceOnlineStatus(s.members...), nil
+}
+
+func (s *naClusterStub) ListConfigNodes(context.Context) (*cluster.ListConfigNodesResponse, error) {
+	return AbsenceConfigNodes(s.members...), nil
+}
+
+func (s *naClusterStub) ListHaResources(context.Context, *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
+	sids := make([]string, 0, len(s.resources))
+	for sid := range s.resources {
+		sids = append(sids, sid)
+	}
+	slices.Sort(sids)
+	return AbsenceHAResources(sids...), nil
+}
+
+func (s *naClusterStub) ListHaStatusManagerStatus(context.Context) (*cluster.ListHaStatusManagerStatusResponse, error) {
+	return AbsenceIdleCRM(), nil
+}
+
+func (s *naClusterStub) ListHaStatusCurrent(context.Context) (*cluster.ListHaStatusCurrentResponse, error) {
+	return AbsenceNoHAStatus(), nil
+}
 
 func newNAStub() *naClusterStub {
 	return &naClusterStub{resources: map[string]bool{}, rules: map[string]cluster.CreateHaRulesParams{}}

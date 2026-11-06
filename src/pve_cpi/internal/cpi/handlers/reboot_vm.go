@@ -74,7 +74,7 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 		// invisible there. Probe failure → retriable. Transport error →
 		// propagate.
 		logger.Debug("reboot_vm: locating VM (cluster scan, per-node probes on miss)")
-		loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+		loc, lookupErr := findVMAuthoritative(ctx, deps, vmid)
 		if lookupErr != nil {
 			return nil, cpierrors.Wrap(lookupErr, fmt.Sprintf("reboot_vm: locate VM %s", vmCID))
 		}

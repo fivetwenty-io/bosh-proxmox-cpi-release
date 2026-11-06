@@ -9,7 +9,6 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
-	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
@@ -20,9 +19,11 @@ import (
 //
 // Logic:
 //  1. Parse vm_cid → vmid int.
-//  2. Locate VM via cluster scan (FindVMNodeViaCluster → /cluster/resources).
-//  3. Not found in cluster → return false, unless a stamped CID names
-//     another cluster or that cannot be decided (see hasVMAbsentAnswer).
+//  2. Locate VM via cluster scan (findVMAuthoritative → /cluster/resources),
+//     proving absence on a miss.
+//  3. Proven absent → return false, unless a stamped CID names another
+//     cluster or that cannot be decided (see hasVMAbsentAnswer). Absence that
+//     cannot be proven is a retriable error, never false.
 //  4. Transport error → propagate as CPI error (caller may retry).
 //  5. Found → check ownership (see ownVM). A foreign VM returns false, or
 //     true with an error log under vm_ownership_guard: warn; a token
@@ -64,11 +65,14 @@ func HandleHasVM(deps Deps) cpi.Handler {
 		// A cluster-scan hit is authoritative even after an HA failover, but a
 		// miss is not: the /cluster/resources index lags by minutes on loaded
 		// clusters, and a false "no" here makes the Director treat a live VM
-		// as gone. FindVMAuthoritative proves absence on a miss with per-node
-		// config probes; a probe failure surfaces retriable instead of a
-		// false no. Transport error → propagate; caller may retry.
+		// as gone. findVMAuthoritative proves absence on a miss: two clean
+		// sweeps of every member's config, no HA resource or CRM service for
+		// the VMID, and no open journal record placing it on a member the
+		// sweeps had to skip. Any source failing or still holding the VM
+		// surfaces retriable instead of a false no. Transport error →
+		// propagate; caller may retry.
 		logger.Debug("has_vm: locating VM (cluster scan, per-node probes on miss)")
-		loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+		loc, lookupErr := findVMAuthoritative(ctx, deps, vmid)
 		if lookupErr != nil {
 			return nil, cpierrors.Wrap(lookupErr, "has_vm: locate VM")
 		}

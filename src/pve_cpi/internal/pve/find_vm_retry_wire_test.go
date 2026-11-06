@@ -18,8 +18,8 @@ func TestFindVMAuthoritativeWireMissingDoesNotRetry(t *testing.T) {
 		wantCalls          int
 		wantErr, wantFound bool
 	}{
-		{name: "missing config", message: "Configuration file 'nodes/pve1/qemu-server/123.conf' does not exist", status: 500, wantCalls: 1},
-		{name: "not found", message: "not found", status: 404, wantCalls: 1},
+		{name: "missing config", message: "Configuration file 'nodes/pve1/qemu-server/123.conf' does not exist", status: 500, wantCalls: 2},
+		{name: "not found", message: "not found", status: 404, wantCalls: 2},
 		{name: "forbidden", message: "permission denied", status: 403, wantCalls: 1, wantErr: true},
 		{name: "transient recovers", message: "internal server error", status: 500, recover: true, wantCalls: 2, wantFound: true},
 	} {
@@ -28,6 +28,8 @@ func TestFindVMAuthoritativeWireMissingDoesNotRetry(t *testing.T) {
 			mux := http.NewServeMux()
 			mux.HandleFunc("/api2/json/cluster/resources", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":[]}`)) })
 			mux.HandleFunc("/api2/json/cluster/config/nodes", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":[{"name":"pve1"}]}`)) })
+			mux.HandleFunc("/api2/json/cluster/ha/resources", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":[]}`)) })
+			mux.HandleFunc("/api2/json/cluster/ha/status/manager_status", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) })
 			mux.HandleFunc("/api2/json/cluster/status", func(w http.ResponseWriter, r *http.Request) {
 				_, _ = w.Write([]byte(`{"data":[{"type":"cluster","quorate":1},{"type":"node","name":"pve1","online":1}]}`))
 			})

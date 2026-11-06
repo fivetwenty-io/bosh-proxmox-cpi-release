@@ -115,7 +115,7 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		// it anyway; VMNotFound is only returned on proven absence, and a
 		// probe failure surfaces retriable. Transport error → propagate.
 		logger.Debug("set_vm_metadata: locating VM (cluster scan, per-node probes on miss)")
-		loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+		loc, lookupErr := findVMAuthoritative(ctx, deps, vmid)
 		if lookupErr != nil {
 			return nil, cpierrors.Wrap(lookupErr, fmt.Sprintf("set_vm_metadata: locate VM %s", vmCID))
 		}

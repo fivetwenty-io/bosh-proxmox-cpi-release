@@ -97,9 +97,13 @@ type rbfdClient struct {
 func (c *rbfdClient) Nodes() sdknodes.Service {
 	return &SlotDeleteNodes{Service: c.nodes, Config: c.qemu.Config, Delete: c.qemu.deleteConfigKey}
 }
-func (c *rbfdClient) QEMU() qemu.Service       { return c.qemu }
-func (c *rbfdClient) Cluster() cluster.Service { return newNAStub() }
-func (c *rbfdClient) Pools() pve.PoolService   { return nil }
+func (c *rbfdClient) QEMU() qemu.Service { return c.qemu }
+func (c *rbfdClient) Cluster() cluster.Service {
+	s := newNAStub()
+	s.members = []string{"pve01"}
+	return s
+}
+func (c *rbfdClient) Pools() pve.PoolService { return nil }
 
 func rbfdDeps(qemuStub *rbfdQEMUStub, nodesStub *rbfdNodesStub) Deps {
 	return Deps{

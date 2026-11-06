@@ -355,8 +355,12 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 			log.Err(stopErr))
 	}
 	if pve.IsNotFound(stopErr) {
-		// VM already gone — clean up agent state and return success.
-		logger.Info("delete_vm: fast-path: VM not found during stop — already deleted")
+		// The node no longer holds the VM. Success only once the VM is proven
+		// gone from the whole cluster; a VM that moved is retried.
+		if goneErr := confirmVMGone(ctx, deps, "delete_vm: fast-path", vmid, node, "the stop"); goneErr != nil {
+			return goneErr
+		}
+		logger.Info("delete_vm: fast-path: VM not found during stop and absent from every member — already deleted")
 		if agentErr := deps.Agent.Remove(ctx, node, vmid); agentErr != nil {
 			logger.Warn("delete_vm: agent.Remove failed after fast-path not-found stop", log.Err(agentErr))
 		}
@@ -416,7 +420,10 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	})
 	if delErr != nil {
 		if pve.IsNotFound(delErr) {
-			logger.Info("delete_vm: fast-path: VM not found during destroy — already deleted")
+			if goneErr := confirmVMGone(ctx, deps, "delete_vm: fast-path", vmid, node, "the destroy"); goneErr != nil {
+				return goneErr
+			}
+			logger.Info("delete_vm: fast-path: VM not found during destroy and absent from every member — already deleted")
 			if agentErr := deps.Agent.Remove(ctx, node, vmid); agentErr != nil {
 				logger.Warn("delete_vm: agent.Remove failed after fast-path idempotent destroy", log.Err(agentErr))
 			}
@@ -450,7 +457,7 @@ func refuseStampedManagedDelete(ctx context.Context, deps Deps, vmCID string, ci
 		return nil
 	}
 	logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", cid.VMID))
-	loc, err := pve.FindVMAuthoritative(ctx, deps.PVE, cid.VMID)
+	loc, err := findVMAuthoritative(ctx, deps, cid.VMID)
 	if err != nil {
 		return cpierrors.Wrap(err, fmt.Sprintf("delete_vm: locate VM %s", vmCID))
 	}
@@ -541,7 +548,7 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 	// may take the idempotent-success branch; any probe failure surfaces
 	// retriable instead. Transport error -> propagate.
 	logger.Debug("delete_vm: locating VM (cluster scan, per-node probes on miss)")
-	loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+	loc, lookupErr := findVMAuthoritative(ctx, deps, vmid)
 	if lookupErr != nil {
 		return nil, cpierrors.Wrap(lookupErr, fmt.Sprintf("delete_vm: locate VM %s", vmCID))
 	}
@@ -592,6 +599,33 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 	// legacy guest and bypass its durable cleanup authority. Both views count,
 	// so a slot whose delete is pending still decides what the destroy takes.
 	holding, configErr := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
+	if configErr != nil && (pve.IsNotFound(configErr) || pve.IsPmxcfsConfigMissing(configErr)) {
+		// The node the scan named holds no config for the VM now. It may
+		// have moved since the scan, or the index row may be the stale one,
+		// so locate it again before deciding anything.
+		moved, lookErr := locateAfterConfigMissing(ctx, deps, "delete_vm: verify allocation provenance", vmid, node)
+		if lookErr != nil {
+			return nil, lookErr
+		}
+		if !moved.Found {
+			if err := refuseAbsentElsewhere(ctx, deps, "delete_vm", vmCID, cid, logger); err != nil {
+				return nil, err
+			}
+			logger.Info("delete_vm: VM config gone from its node and absent from every member's config probe — already deleted, returning success")
+			return nil, nil
+		}
+		// The probe read the whole config on the node that holds the VM
+		// now, so its tags decide the parker check there.
+		if pve.TagsMarkParker(moved.Tags) {
+			return nil, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
+		}
+		logger.Info("delete_vm: VM moved after the cluster scan, continuing on its current node",
+			log.String("scan_node", node), log.String("node", moved.Node))
+		loc = moved
+		node = loc.Node
+		vmTags = loc.Tags
+		holding, configErr = pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
+	}
 	if configErr != nil {
 		return nil, cpierrors.Retriable("delete_vm: cannot verify allocation provenance for VM %s", vmCID)
 	}
@@ -734,7 +768,7 @@ func deleteLegacyVMAndArtifacts(ctx context.Context, deps Deps, node, vmCID stri
 	// Await the destroy task so the VM is fully purged from PVE before we
 	// return. DeleteQemu returns a UPID as a json.RawMessage; an empty or
 	// null response means PVE completed synchronously and no await is needed.
-	if awaitErr := awaitDeleteTask(ctx, deps, node, vmCID, deleteResp, logger); awaitErr != nil {
+	if awaitErr := awaitDeleteTask(ctx, deps, node, vmCID, vmid, deleteResp, logger); awaitErr != nil {
 		return nil, awaitErr
 	}
 
@@ -798,8 +832,9 @@ func parseDeleteVMArgs(args []json.RawMessage) (string, vmcid.VMCID, error) {
 // The fallback read happens at the node the scan named. A not-found or
 // pmxcfs config-missing answer there does not prove the VM is gone, because
 // it may have migrated since the scan. So the VM is located again with
-// pve.FindVMByConfigProbe, which skips the contradicted index row and needs
-// two clean sweeps of every member before it reports absence.
+// locateAfterConfigMissing, which requires the cluster to report the node
+// able to answer, skips the contradicted index row, and needs two clean
+// sweeps of every member and no HA hold on the VMID before it reports absence.
 //
 // It returns the location the rest of the delete must use, which is loc
 // unless the VM moved, and alreadyGone=true only when the probe proved the VM
@@ -833,13 +868,11 @@ func refuseIfParkerVM(ctx context.Context, deps Deps, loc pve.VMLocation, vmid i
 				"delete_vm: could not read config for VMID %d to verify parker status: %s (retry when PVE recovers)",
 				vmid, cfgErr.Error())
 		}
-		moved, lookErr := pve.FindVMByConfigProbe(ctx, deps.PVE, vmid)
+		moved, lookErr := locateAfterConfigMissing(ctx, deps, "delete_vm: verify parker status", vmid, loc.Node)
 		if lookErr != nil {
-			return loc, false, cpierrors.WrapAs(lookErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
-				"delete_vm: VM %d config is gone from node %s, and locating the VM again to verify parker status failed",
-				vmid, loc.Node))
+			return loc, false, lookErr
 		}
-		if !moved.Found || moved.Node == "" {
+		if !moved.Found {
 			return loc, true, nil
 		}
 		// The probe read the whole config on the node that holds the VM now,
@@ -933,7 +966,9 @@ func cleanupHAMembership(ctx context.Context, deps Deps, vmid int, logger *log.L
 // everything else propagates immediately.
 //
 // Returns alreadyGone=true for the idempotent not-found path (agent state
-// already cleaned; the caller finishes route cleanup and returns success).
+// already cleaned; the caller finishes route cleanup and returns success),
+// which it takes only once confirmVMGone proves the VM absent from the whole
+// cluster. A not-found destroy for a VM that moved is retriable.
 func destroyVMWithRecovery(
 	ctx context.Context, deps Deps, node, vmCID string, vmid int, retained bool, logger *log.Logger,
 ) (resp *sdknodes.DeleteQemuResponse, alreadyGone bool, err error) {
@@ -980,7 +1015,10 @@ func destroyVMWithRecovery(
 	}
 	if deleteErr != nil {
 		if pve.IsNotFound(deleteErr) {
-			logger.Info("delete_vm: VM not found during delete -- already deleted, returning success")
+			if goneErr := confirmVMGone(ctx, deps, "delete_vm", vmid, node, "the destroy"); goneErr != nil {
+				return nil, false, goneErr
+			}
+			logger.Info("delete_vm: VM not found during delete and absent from every member -- already deleted, returning success")
 			// Still clean up registry/cloud-init state if it exists; errors
 			// are logged but not fatal.
 			cleanupAgentForVM(ctx, deps, node, vmid, logger)
@@ -1001,7 +1039,9 @@ func destroyVMWithRecovery(
 
 // stopVMBeforeDelete stops the VM and awaits the stop task.
 // Returns (true, nil) when the caller should treat the operation as already complete
-// (idempotent not-found paths). Returns (false, nil) on clean stop. Returns (false, err) on failure.
+// (idempotent not-found paths, taken only once confirmVMGone proves the VM
+// absent from the whole cluster). Returns (false, nil) on clean stop. Returns
+// (false, err) on failure, including a not-found answer for a VM that moved.
 func stopVMBeforeDelete(ctx context.Context, deps Deps, node string, vmid int, vmCID string, logger *log.Logger) (done bool, err error) {
 	// Stop returns a UPID; if VM is not found (already deleted), treat as success.
 	// Wrap in RetryOnTransient so a pvedaemon worker-recycle (HTTP 5xx /
@@ -1017,7 +1057,10 @@ func stopVMBeforeDelete(ctx context.Context, deps Deps, node string, vmid int, v
 	})
 	if stopErr != nil {
 		if pve.IsNotFound(stopErr) {
-			logger.Info("delete_vm: VM not found during stop — already deleted, returning success")
+			if goneErr := confirmVMGone(ctx, deps, "delete_vm", vmid, node, "the stop"); goneErr != nil {
+				return false, goneErr
+			}
+			logger.Info("delete_vm: VM not found during stop and absent from every member — already deleted, returning success")
 			return true, nil
 		}
 		return false, cpierrors.Wrap(pve.WrapError(stopErr), fmt.Sprintf("delete_vm: stop VM %s", vmCID))
@@ -1026,10 +1069,14 @@ func stopVMBeforeDelete(ctx context.Context, deps Deps, node string, vmid int, v
 		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, stopUPID, logger); awaitErr != nil {
 			// A qmstop task can be accepted (Stop returns a UPID) yet fail
 			// when the VM's config has already been removed — surfaced as
-			// "unable to find configuration file for VM ...". For delete_vm
-			// that means the target is already gone, so treat it as success.
+			// "unable to find configuration file for VM ...". The config may
+			// have left the node in a migration rather than a delete, so this
+			// is success only once the VM is proven gone from every member.
 			if pve.IsNotFound(awaitErr) || pve.IsPmxcfsConfigMissing(awaitErr) {
-				logger.Info("delete_vm: VM config missing during stop await — already deleted, returning success")
+				if goneErr := confirmVMGone(ctx, deps, "delete_vm", vmid, node, "the stop task"); goneErr != nil {
+					return false, goneErr
+				}
+				logger.Info("delete_vm: VM config missing during stop await and absent from every member — already deleted, returning success")
 				if agentErr := deps.Agent.Remove(ctx, node, vmid); agentErr != nil {
 					logger.Warn("delete_vm: agent.Remove failed after idempotent stop-await", log.Err(agentErr))
 				}
@@ -1145,8 +1192,12 @@ func protectedUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, 
 		}
 		// A 404 -- or pmxcfs's "Configuration file ... does not exist" 500,
 		// which is the same condition wearing a different status code --
-		// means the VM is gone; fall through to the destroy call below,
-		// which handles the NotFound case idempotently.
+		// means this node holds no config for the VM. Only a VM proven gone
+		// from every member falls through to the destroy call below, which
+		// handles the NotFound case idempotently; one that moved is retried.
+		if goneErr := confirmVMGone(ctx, deps, "delete_vm", vmid, node, "the config read before destroy"); goneErr != nil {
+			return nil, goneErr
+		}
 		return nil, nil
 	}
 	if err := refusePendingDriveReplacement("delete_vm", vmCID, holding); err != nil {
@@ -1274,9 +1325,12 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 	holding, cfgErr := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 	if cfgErr != nil {
 		if pve.IsNotFound(cfgErr) || pve.IsPmxcfsConfigMissing(cfgErr) {
-			// VM gone (404, or pmxcfs's config-missing 500) — the destroy
-			// path handles the absence idempotently.
-			return nil
+			// This node holds no config for the VM (404, or pmxcfs's
+			// config-missing 500). A VM proven gone from every member leaves
+			// nothing to detach, and the destroy path handles the absence
+			// idempotently. A VM that moved keeps its disks attached on the
+			// member that holds it now, so the delete is retried there.
+			return confirmVMGone(ctx, deps, "delete_vm", vmid, node, "the config read before foreign-disk detach")
 		}
 		return cpierrors.Wrap(pve.WrapError(cfgErr),
 			fmt.Sprintf("delete_vm: read config for VM %s before foreign-disk detach", vmCID))
@@ -1432,9 +1486,10 @@ func findEphemeralActiveDisks(cfg map[string]any, ownerVMID int) map[string]stri
 
 // awaitDeleteTask extracts the UPID from the DeleteQemu response and awaits the
 // destroy task. An empty or null response means PVE completed synchronously;
-// NotFound or PmxcfsConfigMissing during the poll is treated as idempotent success.
+// NotFound or PmxcfsConfigMissing during the poll is idempotent success once
+// confirmVMGone proves the VM absent from every member, and retriable otherwise.
 // Returns nil on success or idempotent not-found. Returns a wrapped error otherwise.
-func awaitDeleteTask(ctx context.Context, deps Deps, node, vmCID string, deleteResp *sdknodes.DeleteQemuResponse, logger *log.Logger) error {
+func awaitDeleteTask(ctx context.Context, deps Deps, node, vmCID string, vmid int, deleteResp *sdknodes.DeleteQemuResponse, logger *log.Logger) error {
 	if deleteResp == nil {
 		return nil
 	}
@@ -1450,10 +1505,15 @@ func awaitDeleteTask(ctx context.Context, deps Deps, node, vmCID string, deleteR
 		return nil
 	}
 	if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, deleteUPID, logger); awaitErr != nil {
-		// NotFound or PmxcfsConfigMissing during destroy-await means
-		// the VM was already gone by the time we polled -- idempotent.
+		// NotFound or PmxcfsConfigMissing during destroy-await means the
+		// node held no config for the VM by the time the task ran. That is
+		// idempotent success only when the VM is gone from every member,
+		// because a migration moves the config off the node the same way.
 		if pve.IsNotFound(awaitErr) || pve.IsPmxcfsConfigMissing(awaitErr) {
-			logger.Info("delete_vm: VM config missing during destroy await -- treating as already deleted")
+			if goneErr := confirmVMGone(ctx, deps, "delete_vm", vmid, node, "the destroy task"); goneErr != nil {
+				return goneErr
+			}
+			logger.Info("delete_vm: VM config missing during destroy await and absent from every member -- treating as already deleted")
 			return nil
 		}
 		return cpierrors.Wrap(pve.WrapError(awaitErr),

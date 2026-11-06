@@ -451,11 +451,13 @@ var errVMAbsent = errors.New("the VM exists on no cluster member")
 // node it came from. A not-found or pmxcfs config-missing answer there does
 // not prove the VM is gone, because it may have migrated since the scan, and
 // the scan row may be the stale one. So the VM is located again with
-// pve.FindVMByConfigProbe, which skips the index row that was just
-// contradicted. Proven absence returns errVMAbsent, and a hit runs the read
-// once more on the node it names. Every other failure is retriable,
-// including a member the cluster reports offline, which the probe cannot
-// read and so cannot count as absent.
+// locateAfterConfigMissing, which first requires the cluster to report the
+// node able to answer and then sweeps every member with
+// pve.FindVMByConfigProbe, skipping the index row that was just contradicted.
+// Proven absence returns errVMAbsent, and a hit runs the read once more on
+// the node it names. Every other failure is retriable, including a member the
+// cluster reports offline, which the probe cannot read and so cannot count as
+// absent.
 func readAtVMNode[T any](ctx context.Context, deps Deps, op string, vmid int, node string, read func(node string) (T, error)) (T, string, error) {
 	var zero T
 	got, err := read(node)
@@ -466,12 +468,11 @@ func readAtVMNode[T any](ctx context.Context, deps Deps, op string, vmid int, no
 		return zero, node, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("%s: read VM %d config to check its ownership", op, vmid))
 	}
-	moved, lookErr := pve.FindVMByConfigProbe(ctx, deps.PVE, vmid)
+	moved, lookErr := locateAfterConfigMissing(ctx, deps, op, vmid, node)
 	if lookErr != nil {
-		return zero, node, cpierrors.WrapAs(lookErr, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("%s: VM %d config is gone from node %s, and locating the VM again failed", op, vmid, node))
+		return zero, node, lookErr
 	}
-	if !moved.Found || moved.Node == "" {
+	if !moved.Found {
 		deps.Log(ctx).Info(op+": VM config is gone from its node, and no member holds the VM",
 			log.Int("vmid", vmid), log.String("node", node))
 		return zero, node, errVMAbsent

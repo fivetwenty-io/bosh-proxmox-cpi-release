@@ -69,7 +69,7 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 		//    so absence must be proven (per-node config probes on an index
 		//    miss), never inferred from the lagging /cluster/resources index.
 		// ----------------------------------------------------------------
-		loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+		loc, lookupErr := findVMAuthoritative(ctx, deps, vmid)
 		if lookupErr != nil {
 			return nil, cpierrors.Wrap(lookupErr,
 				fmt.Sprintf("delete_snapshot: locate VM %s", vmCID))

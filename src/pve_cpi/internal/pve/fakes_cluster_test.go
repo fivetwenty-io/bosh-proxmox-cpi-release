@@ -40,6 +40,29 @@ type fakeClusterService struct {
 	createHaRulesFn         func(ctx context.Context, params *cluster.CreateHaRulesParams) error
 	listOptionsFn           func(ctx context.Context) (*cluster.ListOptionsResponse, error)
 	updateOptionsFn         func(ctx context.Context, params *cluster.UpdateOptionsParams) error
+	listHaResourcesFn       func(ctx context.Context, params *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error)
+	listHaManagerStatusFn   func(ctx context.Context) (*cluster.ListHaStatusManagerStatusResponse, error)
+}
+
+// ListHaResources delegates to listHaResourcesFn when scripted; otherwise it
+// reports no HA resources, because the absence proof reads it on every miss
+// path whose tests never wire it.
+func (f *fakeClusterService) ListHaResources(ctx context.Context, params *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
+	if f.listHaResourcesFn != nil {
+		return f.listHaResourcesFn(ctx, params)
+	}
+	empty := cluster.ListHaResourcesResponse{}
+	return &empty, nil
+}
+
+// ListHaStatusManagerStatus delegates to listHaManagerStatusFn when scripted;
+// otherwise it reports an empty manager status, which holds no service.
+func (f *fakeClusterService) ListHaStatusManagerStatus(ctx context.Context) (*cluster.ListHaStatusManagerStatusResponse, error) {
+	if f.listHaManagerStatusFn != nil {
+		return f.listHaManagerStatusFn(ctx)
+	}
+	empty := cluster.ListHaStatusManagerStatusResponse("{}")
+	return &empty, nil
 }
 
 func (f *fakeClusterService) CreateSdnZones(ctx context.Context, params *cluster.CreateSdnZonesParams) error {

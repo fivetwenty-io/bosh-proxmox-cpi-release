@@ -81,7 +81,7 @@ func finishDetachTail(ctx context.Context, deps Deps, op string, rd resolvedDisk
 	if !ok || rd.allocation == nil || sourceVMID <= 0 {
 		return nil
 	}
-	location, err := pve.FindVMAuthoritative(ctx, deps.PVE, sourceVMID)
+	location, err := findVMAuthoritative(ctx, deps, sourceVMID)
 	if err != nil {
 		return detachTailRefused(ctx, managed, retriableUnlessPermanent(err, fmt.Sprintf("%s: locate VM %d to remove disk %s's allocation entry", op, sourceVMID, rd.diskCID)))
 	}
@@ -283,7 +283,7 @@ func detachTailReadFailure(ctx context.Context, deps Deps, err error, sourceVMID
 	if !pve.VMConfigGone(err) {
 		return err
 	}
-	location, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, sourceVMID)
+	location, lookupErr := findVMAuthoritative(ctx, deps, sourceVMID)
 	if lookupErr == nil && !location.Found {
 		return nil
 	}

@@ -50,6 +50,28 @@ type fakeCluster struct {
 	sdkcluster.Service
 	listFn        func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
 	configNodesFn func(ctx context.Context) (*sdkcluster.ListConfigNodesResponse, error)
+	haResourcesFn func(ctx context.Context) (*sdkcluster.ListHaResourcesResponse, error)
+	haManagerFn   func(ctx context.Context) (*sdkcluster.ListHaStatusManagerStatusResponse, error)
+}
+
+// ListHaResources delegates to haResourcesFn when scripted; otherwise it
+// reports no HA resources, the state of a cluster that never configured HA.
+func (f *fakeCluster) ListHaResources(ctx context.Context, _ *sdkcluster.ListHaResourcesParams) (*sdkcluster.ListHaResourcesResponse, error) {
+	if f.haResourcesFn != nil {
+		return f.haResourcesFn(ctx)
+	}
+	empty := sdkcluster.ListHaResourcesResponse{}
+	return &empty, nil
+}
+
+// ListHaStatusManagerStatus delegates to haManagerFn when scripted; otherwise
+// it reports an empty manager status, which holds no service.
+func (f *fakeCluster) ListHaStatusManagerStatus(ctx context.Context) (*sdkcluster.ListHaStatusManagerStatusResponse, error) {
+	if f.haManagerFn != nil {
+		return f.haManagerFn(ctx)
+	}
+	empty := sdkcluster.ListHaStatusManagerStatusResponse("{}")
+	return &empty, nil
 }
 
 func (f *fakeCluster) ListResources(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {

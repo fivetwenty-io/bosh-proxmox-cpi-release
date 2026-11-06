@@ -27,6 +27,29 @@ type lgCluster struct {
 	configNodesFn func() (*sdkcluster.ListConfigNodesResponse, error)
 	// statusFn overrides ListStatus; nil means "no offline members".
 	statusFn func() (*sdkcluster.ListStatusResponse, error)
+	// haResourcesFn overrides ListHaResources; nil means no HA resources.
+	haResourcesFn func() (*sdkcluster.ListHaResourcesResponse, error)
+	// haManagerFn overrides ListHaStatusManagerStatus; nil means an idle CRM
+	// that holds no services.
+	haManagerFn func() (*sdkcluster.ListHaStatusManagerStatusResponse, error)
+}
+
+func (s *lgCluster) ListHaResources(
+	_ context.Context, _ *sdkcluster.ListHaResourcesParams,
+) (*sdkcluster.ListHaResourcesResponse, error) {
+	if s.haResourcesFn != nil {
+		return s.haResourcesFn()
+	}
+	empty := sdkcluster.ListHaResourcesResponse{}
+	return &empty, nil
+}
+
+func (s *lgCluster) ListHaStatusManagerStatus(_ context.Context) (*sdkcluster.ListHaStatusManagerStatusResponse, error) {
+	if s.haManagerFn != nil {
+		return s.haManagerFn()
+	}
+	empty := sdkcluster.ListHaStatusManagerStatusResponse(`{}`)
+	return &empty, nil
 }
 
 func (s *lgCluster) ListConfigNodes(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {

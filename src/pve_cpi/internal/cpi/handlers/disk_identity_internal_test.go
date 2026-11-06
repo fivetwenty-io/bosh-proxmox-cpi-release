@@ -540,8 +540,23 @@ func TestDiskHandlersRouteThroughIdentityResolver(t *testing.T) {
 
 // ListStatus reports no offline members; the fixture cluster is fully online.
 func (cl *idFakeCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
-	empty := sdkcluster.ListStatusResponse{}
-	return &empty, nil
+	return AbsenceOnlineStatus("pve1"), nil
+}
+
+// The HA reads answer for a cluster with no HA resources and an idle CRM,
+// which is what an absence proof finds on a cluster that runs no HA.
+func (cl *idFakeCluster) ListHaResources(
+	context.Context, *sdkcluster.ListHaResourcesParams,
+) (*sdkcluster.ListHaResourcesResponse, error) {
+	return AbsenceHAResources(), nil
+}
+
+func (cl *idFakeCluster) ListHaStatusManagerStatus(context.Context) (*sdkcluster.ListHaStatusManagerStatusResponse, error) {
+	return AbsenceIdleCRM(), nil
+}
+
+func (cl *idFakeCluster) ListHaStatusCurrent(context.Context) (*sdkcluster.ListHaStatusCurrentResponse, error) {
+	return AbsenceNoHAStatus(), nil
 }
 
 // fakeDriveKeyPattern matches the config keys that name a volume.

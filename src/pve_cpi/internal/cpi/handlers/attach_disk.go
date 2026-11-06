@@ -773,7 +773,7 @@ func attachDiskResolveNode(ctx context.Context, deps Deps, vmCID, diskCID, stabl
 	// backend-derived storage node in place — a wrong-node config read that
 	// surfaces as a confusing pmxcfs error. The per-node probes on the miss
 	// path resolve the real node; a probe failure surfaces retriable.
-	loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+	loc, lookupErr := findVMAuthoritative(ctx, deps, vmid)
 	if lookupErr != nil {
 		return "", 0, cpierrors.Wrap(lookupErr, fmt.Sprintf("attach_disk: lookup VM %s node failed", vmCID))
 	}

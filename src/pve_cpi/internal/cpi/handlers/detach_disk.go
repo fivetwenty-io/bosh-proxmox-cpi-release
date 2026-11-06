@@ -75,7 +75,7 @@ func detachDiskResolveSlot(
 	// real node; only a PROVEN absence keeps the backend-derived node,
 	// where the config read's 404 and the existing VM-gone →
 	// already-detached semantics are then genuinely correct.
-	loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+	loc, lookupErr := findVMAuthoritative(ctx, deps, vmid)
 	if lookupErr != nil {
 		return "", "", false, cpierrors.Wrap(lookupErr, fmt.Sprintf("detach_disk: lookup VM %s node failed", vmCID))
 	}
@@ -406,7 +406,7 @@ func refuseUnownedStableIDDetach(ctx context.Context, deps Deps, vmCID string, c
 		loc := pve.VMLocation{Node: rd.holder.Node, Tags: rd.holder.Tags, Found: true}
 		return refuseUnownedVM(ctx, deps, "detach_disk", vmCID, cid, loc, nil, logger)
 	case rd.holder == nil && len(rd.unused) > 0:
-		loc, err := pve.FindVMAuthoritative(ctx, deps.PVE, cid.VMID)
+		loc, err := findVMAuthoritative(ctx, deps, cid.VMID)
 		if err != nil {
 			return cpierrors.Wrap(err, fmt.Sprintf("detach_disk: locate VM %s", vmCID))
 		}
@@ -442,7 +442,7 @@ func refuseStableIDDetachElsewhere(ctx context.Context, deps Deps, vmCID string,
 	if !cid.Stamped() {
 		return nil
 	}
-	loc, err := pve.FindVMAuthoritative(ctx, deps.PVE, cid.VMID)
+	loc, err := findVMAuthoritative(ctx, deps, cid.VMID)
 	if err != nil {
 		return cpierrors.Wrap(err, fmt.Sprintf("detach_disk: locate VM %s", vmCID))
 	}

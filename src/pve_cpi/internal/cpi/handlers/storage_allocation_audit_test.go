@@ -120,6 +120,24 @@ func (cl *allocationAuditCluster) ListResources(ctx context.Context, params *sdk
 	return &moved, nil
 }
 
+// The HA reads answer for a cluster with no HA resources and an idle CRM,
+// which is what an absence proof finds on a cluster that runs no HA.
+func (cl *allocationAuditCluster) ListHaResources(
+	context.Context, *sdkcluster.ListHaResourcesParams,
+) (*sdkcluster.ListHaResourcesResponse, error) {
+	return AbsenceHAResources(), nil
+}
+
+func (cl *allocationAuditCluster) ListHaStatusManagerStatus(
+	context.Context,
+) (*sdkcluster.ListHaStatusManagerStatusResponse, error) {
+	return AbsenceIdleCRM(), nil
+}
+
+func (cl *allocationAuditCluster) ListHaStatusCurrent(context.Context) (*sdkcluster.ListHaStatusCurrentResponse, error) {
+	return AbsenceNoHAStatus(), nil
+}
+
 func (cl *allocationAuditCluster) ListConfigNodes(context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
 	response := sdkcluster.ListConfigNodesResponse{}
 	for _, member := range cl.members {

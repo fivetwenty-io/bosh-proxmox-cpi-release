@@ -469,8 +469,9 @@ func TestRefuseUnownedStableIDDetach_SuccessBranchesRefuseAnotherCluster(t *test
 		}{
 			{name: "bare CID needs no lookup", cid: "101", wantReads: 0},
 			{name: "absent VMID, another cluster", cid: "101-99aabbcc-" + token,
-				wantErr: cpierrors.TypeCloud, wantText: "does not exist on this cluster", wantReads: 1},
-			{name: "absent VMID, this cluster", cid: "101-" + stampTestLive + "-" + token, wantReads: 1},
+				wantErr: cpierrors.TypeCloud, wantText: "does not exist on this cluster", wantReads: 2},
+			// An absence proof sweeps every member twice.
+			{name: "absent VMID, this cluster", cid: "101-" + stampTestLive + "-" + token, wantReads: 2},
 			{name: "present VM, another cluster", cid: "101-99aabbcc-" + token, present: true,
 				wantErr: cpierrors.TypeCloud, wantText: "cluster-mismatch", wantReads: 1},
 			{name: "present VM, another token", cid: "101-" + stampTestLive + "-11112222", present: true, wantReads: 1},

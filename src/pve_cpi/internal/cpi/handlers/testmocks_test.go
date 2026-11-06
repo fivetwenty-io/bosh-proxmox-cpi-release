@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -973,6 +975,18 @@ func (m *mockSDNCluster) ListHaRules(_ context.Context, _ *cluster.ListHaRulesPa
 	return &empty, nil
 }
 
+// The HA reads an absence proof makes answer for a cluster with no HA
+// resources and an idle CRM.
+func (m *mockSDNCluster) ListHaResources(_ context.Context, _ *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
+	return handlers.AbsenceHAResources(), nil
+}
+func (m *mockSDNCluster) ListHaStatusManagerStatus(_ context.Context) (*cluster.ListHaStatusManagerStatusResponse, error) {
+	return handlers.AbsenceIdleCRM(), nil
+}
+func (m *mockSDNCluster) ListHaStatusCurrent(_ context.Context) (*cluster.ListHaStatusCurrentResponse, error) {
+	return handlers.AbsenceNoHAStatus(), nil
+}
+
 // --------------------------------------------------------------------------
 // mockBridgeNodes
 // --------------------------------------------------------------------------
@@ -1029,13 +1043,23 @@ type mockClusterSvc struct {
 	listResourcesFn   func(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error)
 	listStatusFn      func(ctx context.Context) (*cluster.ListStatusResponse, error)
 	listConfigNodesFn func(ctx context.Context) (*cluster.ListConfigNodesResponse, error)
+
+	// seenNodes remembers the nodes the index has placed guests on, so the
+	// default ListStatus can list them online without a read of the index of
+	// its own.
+	seenMu    sync.Mutex
+	seenNodes []string
 }
 
 var _ cluster.Service = (*mockClusterSvc)(nil)
 
 func (m *mockClusterSvc) ListResources(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
 	if m.listResourcesFn != nil {
-		return m.listResourcesFn(ctx, params)
+		rows, err := m.listResourcesFn(ctx, params)
+		if err == nil {
+			m.rememberNodes(rows)
+		}
+		return rows, err
 	}
 	// Default: return an empty resource list. Handlers treat empty-list as
 	// "VM not found". Tests that need a VM to be found must supply listResourcesFn
@@ -1048,11 +1072,51 @@ func (m *mockClusterSvc) ListStatus(ctx context.Context) (*cluster.ListStatusRes
 	if m.listStatusFn != nil {
 		return m.listStatusFn(ctx)
 	}
-	// Default: no offline members (fully online fixture cluster). The
+	// Default: a quorate cluster whose every member is online. The
 	// authoritative enumeration consults this best-effort on many paths whose
-	// tests never script it.
-	empty := cluster.ListStatusResponse{}
-	return &empty, nil
+	// tests never script it, and an absence proof reads it to confirm the
+	// node that answered a config-missing is one that can answer. The members
+	// are the scripted ListConfigNodes answer, or the fixture's fallback node
+	// when membership is derived from the index, so this read never adds a
+	// read of the index that suites count.
+	if m.listConfigNodesFn == nil {
+		m.seenMu.Lock()
+		members := append([]string{"pve-node1"}, m.seenNodes...)
+		m.seenMu.Unlock()
+		return handlers.AbsenceOnlineStatus(members...), nil
+	}
+	nodes, err := m.listConfigNodesFn(ctx)
+	if err != nil || nodes == nil {
+		return handlers.AbsenceOnlineStatus(), nil
+	}
+	var members []string
+	for _, raw := range *nodes {
+		var row struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(raw, &row) == nil && row.Name != "" {
+			members = append(members, row.Name)
+		}
+	}
+	return handlers.AbsenceOnlineStatus(members...), nil
+}
+
+// rememberNodes records the distinct node names of an index answer.
+func (m *mockClusterSvc) rememberNodes(rows *cluster.ListResourcesResponse) {
+	if rows == nil {
+		return
+	}
+	m.seenMu.Lock()
+	defer m.seenMu.Unlock()
+	for _, raw := range *rows {
+		var item struct {
+			Node string `json:"node"`
+		}
+		if json.Unmarshal(raw, &item) == nil && item.Node != "" && item.Node != "pve-node1" &&
+			!slices.Contains(m.seenNodes, item.Node) {
+			m.seenNodes = append(m.seenNodes, item.Node)
+		}
+	}
 }
 
 func (m *mockClusterSvc) ListConfigNodes(ctx context.Context) (*cluster.ListConfigNodesResponse, error) {

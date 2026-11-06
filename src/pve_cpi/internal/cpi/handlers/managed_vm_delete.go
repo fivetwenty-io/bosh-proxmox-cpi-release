@@ -120,7 +120,7 @@ func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, ha
 	}
 	// An absent marker never authorizes destroying a guest at its old numeric ID.
 	if vmid > 0 {
-		location, e := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+		location, e := findVMAuthoritative(ctx, deps, vmid)
 		if e != nil {
 			return proof, e
 		}
@@ -303,7 +303,7 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 		return true, err
 	}
 	if selected == nil {
-		location, e := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+		location, e := findVMAuthoritative(ctx, deps, vmid)
 		if e != nil {
 			return true, e
 		}
@@ -326,7 +326,7 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 	defer func() { retErr = errors.Join(retErr, handle.Close()) }()
 	record := handle.Record()
 	if record.State == aj.VMDeletedRetained || record.State == aj.Deleted || record.State == aj.Cleaned {
-		location, e := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+		location, e := findVMAuthoritative(ctx, deps, vmid)
 		if e != nil {
 			return true, e
 		}
@@ -336,7 +336,7 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 		return true, nil
 	}
 	retain := false
-	location, err := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+	location, err := findVMAuthoritative(ctx, deps, vmid)
 	if err != nil {
 		return true, err
 	}
@@ -449,7 +449,7 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 	if err := storageAuditGateError(ctx, deps, "retained VM cleanup", audit, storageAuditGateComplete|storageAuditGateConflicts); err != nil {
 		return proof, err
 	}
-	location, err := pve.FindVMAuthoritative(ctx, deps.PVE, retention.VMID)
+	location, err := findVMAuthoritative(ctx, deps, retention.VMID)
 	if err != nil {
 		return proof, err
 	}
@@ -731,7 +731,7 @@ func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, rec
 		err = managedVMDeleteTask(ctx, deps, handle, "destroy", aj.Target{Node: node, VMID: vmid}, func() (any, error) {
 			return deps.PVE.Nodes().DeleteQemu(ctx, node, strconv.Itoa(vmid), &nodes.DeleteQemuParams{Purge: &purge, DestroyUnreferencedDisks: &sweep})
 		}, func() error {
-			location, e := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+			location, e := findVMAuthoritative(ctx, deps, vmid)
 			if e != nil {
 				return e
 			}

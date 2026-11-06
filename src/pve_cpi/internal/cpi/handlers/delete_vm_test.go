@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
@@ -22,6 +23,22 @@ import (
 // notFoundAPIErr returns an SDK APIError that IsNotFound() returns true for.
 func notFoundAPIErr() error {
 	return &sdkerrors.APIError{HTTPCode: 404}
+}
+
+// vanishingVM serves the fixture VM's config until the call under test makes
+// the VM vanish, and answers not found on every node after that, the way PVE
+// does once a VM is gone. A not-found stop, destroy, or task await is success
+// only once every member agrees the VM is gone, so a test of that success
+// must make the VM vanish rather than only fail the one call.
+type vanishingVM struct{ gone atomic.Bool }
+
+func (v *vanishingVM) vanish() { v.gone.Store(true) }
+
+func (v *vanishingVM) config(context.Context, string, int) (map[string]any, error) {
+	if v.gone.Load() {
+		return nil, notFoundAPIErr()
+	}
+	return map[string]any{}, nil
 }
 
 // TestHandleDeleteVM_Happy verifies the stop->await->delete->agent.Remove path.
@@ -310,14 +327,18 @@ func TestHandleDeleteVM_IndexMiss_ProbeFindsVM_DestroysOnProbedNode(t *testing.T
 	}
 }
 
-// TestHandleDeleteVM_NotFound_AtStop verifies 404 during stop returns nil (idempotent).
+// TestHandleDeleteVM_NotFound_AtStop verifies 404 during stop returns nil
+// (idempotent) once every member agrees the VM is gone.
 func TestHandleDeleteVM_NotFound_AtStop(t *testing.T) {
 	t.Parallel()
 
+	vm := &vanishingVM{}
 	qemuSvc := &mockQEMUService{
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			vm.vanish()
 			return "", notFoundAPIErr()
 		},
+		configFn: vm.config,
 	}
 	agentSvc := &mockAgentService{}
 
@@ -332,20 +353,21 @@ func TestHandleDeleteVM_NotFound_AtStop(t *testing.T) {
 	}
 }
 
-// TestHandleDeleteVM_NotFound_AtDelete verifies 404 during delete returns nil (idempotent).
+// TestHandleDeleteVM_NotFound_AtDelete verifies 404 during delete returns nil
+// (idempotent) once every member agrees the VM is gone.
 func TestHandleDeleteVM_NotFound_AtDelete(t *testing.T) {
 	t.Parallel()
 
+	vm := &vanishingVM{}
 	qemuSvc := &mockQEMUService{
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "UPID:node:stop-task", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return map[string]any{}, nil
-		},
+		configFn: vm.config,
 	}
 	nodesSvc := &mockNodesService{
 		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			vm.vanish()
 			return nil, notFoundAPIErr()
 		},
 	}
@@ -871,13 +893,12 @@ func TestDeleteVM_AwaitDestroyNotFoundIdempotent(t *testing.T) {
 
 	const destroyUPID = "UPID:pve-node1:00AABBCC:00112233:6789ABCD:qmdestroy:102:root@pam:"
 
+	vm := &vanishingVM{}
 	qemuSvc := &mockQEMUService{
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return map[string]any{}, nil
-		},
+		configFn: vm.config,
 	}
 
 	deleteResp := nodes.DeleteQemuResponse(`"` + destroyUPID + `"`)
@@ -890,6 +911,7 @@ func TestDeleteVM_AwaitDestroyNotFoundIdempotent(t *testing.T) {
 	// Await returns a NotFound-class error: VM config gone before poll completed.
 	tasksSvc := &mockTasksService{
 		waitFn: func(_ context.Context, _, _ string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+			vm.vanish()
 			return nil, &sdkerrors.APIError{HTTPCode: 404}
 		},
 	}
@@ -1112,20 +1134,21 @@ func TestHandleDeleteVM_FastPath_TagFailOpen(t *testing.T) {
 }
 
 // TestHandleDeleteVM_FastPath_NotFound_Idempotent verifies that when the VM is
-// not found during the fast-path destroy call, the handler returns success.
+// not found during the fast-path destroy call, and every member agrees it is
+// gone, the handler returns success.
 func TestHandleDeleteVM_FastPath_NotFound_Idempotent(t *testing.T) {
 	t.Parallel()
 
+	vm := &vanishingVM{}
 	qemuSvc := &mockQEMUService{
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return map[string]any{}, nil
-		},
+		configFn: vm.config,
 	}
 	nodesSvc := &mockNodesService{
 		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			vm.vanish()
 			return nil, notFoundAPIErr()
 		},
 		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
@@ -1808,13 +1831,13 @@ func TestHandleDeleteVM_FastPath_StopNotFound_EarlyReturn(t *testing.T) {
 
 	destroyCalled := false
 
+	vm := &vanishingVM{}
 	qemuSvc := &mockQEMUService{
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			vm.vanish()
 			return "", &sdkerrors.APIError{HTTPCode: 404}
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return map[string]any{}, nil
-		},
+		configFn: vm.config,
 	}
 	nodesSvc := &mockNodesService{
 		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {

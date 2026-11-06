@@ -197,8 +197,8 @@ func TestFindVMAuthoritative_OfflineMemberExcluded_AbsenceProven(t *testing.T) {
 	if loc.Found {
 		t.Fatalf("loc = %+v; want Found=false (absence proven on every online member)", loc)
 	}
-	if len(q.probed) != 1 || q.probed[0] != "pve1" {
-		t.Fatalf("probed %v; want only the online member probed", q.probed)
+	if strings.Join(q.probed, ",") != "pve1,pve1" {
+		t.Fatalf("probed %v; want only the online member probed, once per sweep", q.probed)
 	}
 }
 

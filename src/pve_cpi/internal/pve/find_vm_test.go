@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,8 +149,8 @@ func TestFindVMAuthoritative_IndexMiss_AllNodesCleanAbsent(t *testing.T) {
 	if loc.Found {
 		t.Errorf("loc = %+v; want Found=false, absence proven on every node", loc)
 	}
-	if len(probed) != 2 {
-		t.Errorf("probed %v; want both nodes swept before concluding absence", probed)
+	if strings.Join(probed, ",") != "pve-node1,pve-node2,pve-node1,pve-node2" {
+		t.Errorf("probed %v; want both nodes swept twice before concluding absence", probed)
 	}
 }
 
