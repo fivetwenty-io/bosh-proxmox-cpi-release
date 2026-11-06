@@ -19,11 +19,12 @@ import (
 // default), foreign-disk protection with config reads, per-disk detaches,
 // and — for stable-ID disks — a full parker transfer with its own move_disk
 // task await per disk, the primary destroy's retry budget
-// (rollbackDestroyMaxAttempts, ~16s of backoff), the skiplock or
-// lock-clear recovery (awaitVMConfigLockClear waits up to
-// vmLockClearMaxWait = 120s, and the follow-up skiplock or lock-clear
-// destroy carries its own rollbackDestroyMaxAttempts budget, another ~16s
-// each), the destroy's task await, then ISO removal and HA-pin removal. Ten minutes gives that
+// (rollbackDestroyMaxAttempts, about 15s of backoff on the transient curve
+// and about 30s for a config lock or storage lock, which ride the lock
+// curve), the skiplock or lock-clear recovery (awaitVMConfigLockClear waits
+// up to vmLockClearMaxWait = 120s, and the follow-up skiplock or lock-clear
+// destroy carries its own rollbackDestroyMaxAttempts budget, up to another
+// 30s each), the destroy's task await, then ISO removal and HA-pin removal. Ten minutes gives that
 // stack headroom in the common shapes while still bounding a dead node to
 // minutes, not hours; the pathological worst case (multiple full task
 // awaits back to back) can still exhaust it, and exhausting the bound fails
@@ -67,8 +68,12 @@ const cleanupSweepMaxAttempts = 3
 // removal) shares one detached context bounded by rollbackCleanupTimeout,
 // and a full lock curve on the destroy alone (~124s of backoff plus ten
 // slow lock-wait round trips) could exhaust it and cascade failures into
-// the tail steps. Five attempts (~16s of backoff) retain the retry value
-// against a lock hand-off while leaving the tail its share of the budget.
+// the tail steps. Five attempts, which is about 15s of backoff on the
+// transient curve and about 30s on the lock curve that a config lock or a
+// storage lock rides, retain the retry value against a lock hand-off while
+// leaving the tail its share of the budget. delete_vm's destroy loop uses the
+// same bound, so a config lock answered as a 500 cannot spend the operation
+// timeout before the skiplock recovery runs.
 const rollbackDestroyMaxAttempts = 5
 
 // detachedContext returns a context that survives parent cancellation but is

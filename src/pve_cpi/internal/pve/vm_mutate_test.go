@@ -296,6 +296,101 @@ func TestMutateVMConfig_AmbiguousResultThenTheVMMoved(t *testing.T) {
 	}
 }
 
+// After the ambiguous result, the VM is on pve-node2, so the identities the
+// change names are re-resolved for pve-node2 before the resend goes there.
+func TestMutateVMConfig_AmbiguousMoveReresolvesTheNewNode(t *testing.T) {
+	t.Parallel()
+	clk := newSettleTestClock()
+	moved := false
+	c := scriptedScanClient(clk, 8030, func(time.Duration) *scanRow {
+		if moved {
+			return &scanRow{node: "pve-node2"}
+		}
+		return &scanRow{node: "pve-node1"}
+	})
+	var sent, reresolved []string
+	_, err := MutateVMConfig(clk.ctx(context.Background()), c, nil, VMConfigMutation{
+		VMID: 8030, Node: "pve-node1",
+		Apply: recordingApply(&sent, func(attempt int, _ string) error {
+			if attempt == 1 {
+				moved = true
+				return heldTransportErr()
+			}
+			if len(reresolved) == 0 {
+				t.Error("the resend went out before Reresolve ran")
+			}
+			return nil
+		}),
+		Landed: func(context.Context, string) (bool, error) { return false, nil },
+		Reresolve: func(_ context.Context, vm VMLocation) error {
+			reresolved = append(reresolved, vm.Node)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Join(reresolved, ",") != "pve-node2" || strings.Join(sent, ",") != "pve-node1,pve-node2" {
+		t.Errorf("re-resolved %v and sent to %v; want one re-resolve for pve-node2 before the resend there",
+			reresolved, sent)
+	}
+}
+
+// The re-read finds the VM where it was, so nothing needs re-resolving.
+func TestMutateVMConfig_AmbiguousWithoutAMoveDoesNotReresolve(t *testing.T) {
+	t.Parallel()
+	clk := newSettleTestClock()
+	c := scriptedScanClient(clk, 8031, func(time.Duration) *scanRow { return &scanRow{node: "pve-node1"} })
+	var sent []string
+	_, err := MutateVMConfig(clk.ctx(context.Background()), c, nil, VMConfigMutation{
+		VMID: 8031, Node: "pve-node1",
+		Apply: recordingApply(&sent, func(attempt int, _ string) error {
+			if attempt == 1 {
+				return heldTransportErr()
+			}
+			return nil
+		}),
+		Landed: func(context.Context, string) (bool, error) { return false, nil },
+		Reresolve: func(context.Context, VMLocation) error {
+			t.Error("Reresolve ran although the VM stayed on its node")
+			return nil
+		},
+	})
+	if err != nil || len(sent) != 2 {
+		t.Fatalf("err %v sent %v; want the resend on the same node", err, sent)
+	}
+}
+
+// A Reresolve error after the move stops the protocol and comes back as it is.
+func TestMutateVMConfig_AmbiguousMoveReresolveErrorStops(t *testing.T) {
+	t.Parallel()
+	clk := newSettleTestClock()
+	moved := false
+	c := scriptedScanClient(clk, 8032, func(time.Duration) *scanRow {
+		if moved {
+			return &scanRow{node: "pve-node2"}
+		}
+		return &scanRow{node: "pve-node1"}
+	})
+	want := cpierrors.Retriable("the source parker moved")
+	var sent []string
+	_, err := MutateVMConfig(clk.ctx(context.Background()), c, nil, VMConfigMutation{
+		VMID: 8032, Node: "pve-node1",
+		Apply: recordingApply(&sent, func(int, string) error {
+			moved = true
+			return heldTransportErr()
+		}),
+		Landed:    func(context.Context, string) (bool, error) { return false, nil },
+		Reresolve: func(context.Context, VMLocation) error { return want },
+	})
+	if !errors.Is(err, want) || err.Error() != want.Error() {
+		t.Fatalf("err = %v; want the Reresolve error unchanged", err)
+	}
+	if len(sent) != 1 {
+		t.Errorf("sent %v; want no resend after Reresolve failed", sent)
+	}
+}
+
 func TestMutateVMConfig_AmbiguousWithoutALandedCheckIsNotSentAgain(t *testing.T) {
 	t.Parallel()
 	clk := newSettleTestClock()
@@ -530,6 +625,27 @@ func TestMutateVMConfig_ContextEndedIsAnUnknownOutcome(t *testing.T) {
 		},
 	})
 	requireSettleRetriable(t, err, "unknown outcome")
+}
+
+// A 4xx is PVE's verdict even when the context ends at the same moment, so it
+// comes back as it came, not as an unknown outcome.
+func TestMutateVMConfig_DefiniteErrorWinsOverAnEndedContext(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	clk := newSettleTestClock()
+	c := scriptedScanClient(clk, 8033, func(time.Duration) *scanRow { return &scanRow{node: "pve-node1"} })
+	want := &sdkerrors.APIError{HTTPCode: 400, Message: "parameter verification failed"}
+	_, err := MutateVMConfig(clk.ctx(ctx), c, nil, VMConfigMutation{
+		VMID: 8033, Node: "pve-node1",
+		Apply: func(context.Context, string) error {
+			cancel()
+			return want
+		},
+		Landed: func(context.Context, string) (bool, error) { return false, nil },
+	})
+	if !errors.Is(err, want) || strings.Contains(err.Error(), "unknown outcome") {
+		t.Fatalf("err = %v; want the 400 unchanged", err)
+	}
 }
 
 func TestMutateVMConfig_EmptyNodeWaitsFirst(t *testing.T) {

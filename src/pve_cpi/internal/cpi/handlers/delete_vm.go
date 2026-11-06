@@ -937,9 +937,14 @@ func destroyVMWithRecovery(
 	var deleteResp *sdknodes.DeleteQemuResponse
 	attemptDestroy := func() error {
 		// A config lock the loop does not wait out goes straight to the
-		// skiplock recovery below; see lockForRecovery.
+		// skiplock recovery below; see lockForRecovery. The loop gets the
+		// rollback destroy's small budget, about 30s of backoff for a config
+		// lock answered as a 500, so a lock that does not clear leaves the
+		// skiplock recovery its share of the operation timeout. attemptDestroy
+		// can run twice, and the full storage-lock budget here would let a
+		// held lock spend several minutes before the recovery got its turn.
 		var lockErr error
-		err := pve.RetryOnTransientOrLock(ctx, logger, "delete_vm", 0, func() error {
+		err := pve.RetryOnTransientOrLock(ctx, logger, "delete_vm", rollbackDestroyMaxAttempts, func() error {
 			var innerErr error
 			deleteResp, innerErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmcid.PathOf(vmid), &sdknodes.DeleteQemuParams{
 				Purge:                    &purge,

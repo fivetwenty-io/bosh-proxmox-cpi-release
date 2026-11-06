@@ -57,7 +57,8 @@ type VMConfigMutation struct {
 	// source parker or a replication job, and checks that the storage the
 	// change uses still fits vm.Node. MutateVMConfig calls it after every
 	// refusal for a lock or a missing config, once the VM has settled and
-	// before it sends the change again. An error stops the protocol and is
+	// before it sends the change again, and after an ambiguous result whose
+	// re-read finds the VM on another node, before it sends there. An error stops the protocol and is
 	// returned as it is, so it should be retriable when the identity is only
 	// moving. Nil means the change names no other identity.
 	Reresolve func(ctx context.Context, vm VMLocation) error
@@ -96,7 +97,8 @@ func (m VMConfigMutation) motionWait() time.Duration {
 //  4. When the result is ambiguous, which means a transport fault, a 5xx, or
 //     another answer that may hide a write that landed, the helper re-reads
 //     through m.Landed on the VM's current owner, and it sends again only
-//     when the change did not land.
+//     when the change did not land. When that owner is another node, it calls
+//     m.Reresolve for the new node before it sends there.
 //
 // The budget for the whole protocol is the method's operation timeout, which
 // is the context's deadline. When the context has none, the protocol bounds
@@ -164,20 +166,21 @@ func MutateVMConfig(ctx context.Context, c Client, logger *log.Logger, m VMConfi
 				return VMLocation{}, rerr
 			}
 			loc = next
+		case isAnsweredClientError(err):
+			// PVE answered with a verdict about the request, so the outcome is
+			// known even when the context ended at the same moment.
+			return VMLocation{}, err
 		case ctx.Err() != nil:
 			return VMLocation{}, mutateOutcomeUnknown(m, loc.Node, err)
 		case IsRetryableOrLockFault(err):
 			ambiguous++
-			if ambiguous > mutateMaxAmbiguous || !clk.now().Before(limit) {
-				return VMLocation{}, mutateOutcomeUnknown(m, loc.Node, err)
-			}
-			if m.Landed == nil {
+			if ambiguous > mutateMaxAmbiguous || !clk.now().Before(limit) || m.Landed == nil {
 				return VMLocation{}, mutateOutcomeUnknown(m, loc.Node, err)
 			}
 			logMutateRetry(logger, m, loc.Node, "the result was ambiguous; re-reading before sending again", err)
-			next, landed, cerr := m.recheck(ctx, c, clk, limit, ambiguous, err)
-			if cerr != nil {
-				return VMLocation{}, cerr
+			next, landed, aerr := m.afterAmbiguous(ctx, c, clk, limit, loc, ambiguous, err)
+			if aerr != nil {
+				return VMLocation{}, aerr
 			}
 			if landed {
 				return next, nil
@@ -222,6 +225,25 @@ func (m VMConfigMutation) settleAndReresolve(
 		}
 	}
 	return loc, nil
+}
+
+// afterAmbiguous runs recheck after an ambiguous result on loc. When the
+// change did not land and the VM is now on another node, it calls m.Reresolve
+// for that node, because the identities resolved for the old node no longer
+// hold, and returns its error as it is.
+func (m VMConfigMutation) afterAmbiguous(
+	ctx context.Context, c Client, clk lockClock, limit time.Time, loc VMLocation, ambiguous int, sendErr error,
+) (VMLocation, bool, error) {
+	next, landed, err := m.recheck(ctx, c, clk, limit, ambiguous, sendErr)
+	if err != nil || landed {
+		return next, landed, err
+	}
+	if next.Node != loc.Node && m.Reresolve != nil {
+		if rerr := m.Reresolve(ctx, next); rerr != nil {
+			return VMLocation{}, false, rerr
+		}
+	}
+	return next, false, nil
 }
 
 // recheck is step 4 of the protocol. It finds the VM's current owner and asks
@@ -277,6 +299,13 @@ func (m VMConfigMutation) readLanded(ctx context.Context, c Client) (VMLocation,
 		return loc, false, err
 	}
 	return loc, landed, nil
+}
+
+// isAnsweredClientError reports whether err carries a resolved 4xx other than
+// 429, which is PVE's verdict about the request and never hides a write.
+func isAnsweredClientError(err error) bool {
+	code, ok := apiHTTPCode(err)
+	return ok && code >= 400 && code < 500 && code != 429
 }
 
 // mutateBackoff sleeps the retry curve's wait for attempt before a re-read,
