@@ -34,6 +34,18 @@ import (
 // rather than from the index, which is the config-probe path. Tags and
 // Template are then node-local truth, so a caller that would otherwise read
 // the config to confirm them can judge the location as it stands.
+//
+// Lock, HAState, and Status are the index row's own lock, hastate, and status
+// fields, taken from the same scan at no extra cost. PVE omits lock when the
+// guest has none and hastate when it has no HA resource, so an empty string
+// from a scan row is a real answer. FromScan is true only when the location
+// came from a scan row that supplied them; a location from the config probe,
+// or one built by hand, leaves them unknown, and a caller must not read an
+// empty Lock or HAState there as "no lock" or "not HA-managed". HAState is the
+// scan's raw hint that the CRM or the resource configuration holds the guest,
+// never the normalized state: it falls back to the configured request when the
+// CRM has not processed the service, so it only tells a caller that it needs
+// to read HAServiceState.
 type VMLocation struct {
 	Node       string
 	Tags       string
@@ -41,6 +53,10 @@ type VMLocation struct {
 	Template   bool
 	Type       string
 	FromConfig bool
+	Lock       string
+	HAState    string
+	Status     string
+	FromScan   bool
 }
 
 // FindVMAuthoritative locates a guest without trusting the /cluster/resources

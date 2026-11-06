@@ -1351,8 +1351,9 @@ func FindVMViaCluster(ctx context.Context, c Client, vmid int) (node, tags strin
 
 // findVMRowViaCluster is FindVMViaCluster's scan, returning the whole row the
 // VM ownership guard reads: node, tags, the resource type ("qemu" or "lxc"),
-// and the template flag. The listing is the same single
-// /cluster/resources?type=vm call, so the extra fields cost nothing.
+// the template flag, and the lock, hastate, and status fields that feed the HA
+// decisions. The listing is the same single /cluster/resources?type=vm call,
+// so the extra fields cost nothing.
 func findVMRowViaCluster(ctx context.Context, c Client, vmid int) (VMLocation, error) {
 	// A nil Cluster service is the expected case in unit-test mocks that
 	// don't wire one (mirrors lookupVMStorageType's ClusterStorage guard):
@@ -1383,6 +1384,9 @@ func findVMRowViaCluster(ctx context.Context, c Client, vmid int) (VMLocation, e
 			Tags     string            `json:"tags"`
 			Type     string            `json:"type"`
 			Template sdkclient.PVEBool `json:"template"`
+			Lock     string            `json:"lock"`
+			HAState  string            `json:"hastate"`
+			Status   string            `json:"status"`
 		}
 		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil {
 			continue
@@ -1394,6 +1398,10 @@ func findVMRowViaCluster(ctx context.Context, c Client, vmid int) (VMLocation, e
 				Found:    true,
 				Template: entry.Template.Bool(),
 				Type:     entry.Type,
+				Lock:     entry.Lock,
+				HAState:  entry.HAState,
+				Status:   entry.Status,
+				FromScan: true,
 			}, nil
 		}
 	}
