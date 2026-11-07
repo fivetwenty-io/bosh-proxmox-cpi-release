@@ -268,11 +268,16 @@ func pendingAttachLeave(ctx context.Context, deps Deps, vmCID string, vmid int, 
 }
 
 // attachHAWritable returns the retriable error of an attach that must change a
-// VM's HA state when the profile does not let the CPI write it. It names the
-// Sys.Console privilege when the token lacks it, and the profile's first gap
-// otherwise.
+// VM's HA state when the profile does not let the CPI write it. A node known to
+// run below the PVE 9 floor comes first, named with its version, because the
+// VM then keeps its HA registration as it is until the node is upgraded. The
+// error names the Sys.Console privilege when the token lacks it, and the
+// profile's first gap otherwise.
 func attachHAWritable(profile *ha.Profile, vmid int) error {
 	const op = attachHAOp
+	if err := profile.HAFloorError(vmid); err != nil {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, op)
+	}
 	if profile.WritesAllowed() {
 		return nil
 	}
@@ -304,8 +309,11 @@ func readHARuleSet(ctx context.Context, svc cluster.Service) (*ha.RuleSet, error
 // is not strict, such as the record pin or the placed-node pin a cluster with
 // ha-rebalance-on-start gets, states a preference and confines nothing, so it
 // is no constraint, and only the volumes' access set bounds the decision. A VM
-// whose resource rebalances automatically is a DLB VM. The existing volumes
-// were judged when the VM registered, so only the new disk can be legacy.
+// whose resource rebalances automatically is a DLB VM. The VM runs under HA,
+// so the decision defers rather than take it out of HA when it runs outside its
+// strict pin, and it turns only the dynamic load balancer off when a node runs
+// below PVE 9.2. The existing volumes were judged when the VM registered, so
+// only the new disk can be legacy.
 //
 // The input carries no CRM state, so the decision has no DecisionUID, and the
 // rule writer's repair stays fail-closed at attach. A pin repair that cannot
@@ -324,16 +332,17 @@ func attachHAInput(
 	}
 	liveCPU, _ := pve.ConfigString(cfg, "cpu")
 	in := ha.VMInput{
-		Config:  deps.Config,
-		VMID:    vmid,
-		Node:    node,
-		Volumes: volumes,
-		CPUType: ha.EffectiveCPUType(deps.Config, nil, liveCPU),
-		InDLBAZ: res.AutoRebalance != nil && res.AutoRebalance.Bool(),
+		Config:    deps.Config,
+		VMID:      vmid,
+		Node:      node,
+		Volumes:   volumes,
+		CPUType:   ha.EffectiveCPUType(deps.Config, nil, liveCPU),
+		InDLBAZ:   res.AutoRebalance != nil && res.AutoRebalance.Bool(),
+		HAManaged: true,
 	}
 	if oldPin != nil && oldPin.Strict && !oldPin.Disabled {
 		in.Constraints = append(in.Constraints, ha.NodeConstraint{Name: "the VM's pin " + oldPin.ID,
-			Nodes: oldPin.NodeNames()})
+			Nodes: oldPin.NodeNames(), Pin: true})
 	}
 	if configHasPCIPassthrough(cfg) {
 		in.Constraints = append(in.Constraints, ha.NodeConstraint{Name: pciConstraintName, Nodes: []string{node}})

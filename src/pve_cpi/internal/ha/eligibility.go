@@ -99,6 +99,13 @@ type NodeConstraint struct {
 
 	// Nodes lists the nodes that meet it.
 	Nodes []string
+
+	// Pin marks the strict pin of a VM that already runs under HA, which
+	// bounds the decision like any other constraint. A VM whose node lies
+	// outside its own pin was moved there outside the CPI, so the decision
+	// defers with a retriable error and writes nothing, rather than take the
+	// VM out of HA for a state that a migration back or a wider pin ends.
+	Pin bool
 }
 
 // VMInput is everything DecideVM needs to know about one VM.
@@ -139,6 +146,15 @@ type VMInput struct {
 	// State is the normalized HA state read for this decision. Its CRM uid
 	// becomes VMDecision.DecisionUID. It may be nil when no read was made.
 	State *pve.HAServiceState
+
+	// HAManaged says the VM already runs under HA as this Director's
+	// resource, as it does when attach_disk decides again. Such a VM never
+	// leaves HA for a cluster fact that an upgrade can change. A node below
+	// the PVE 9 floor, or a profile that may not write HA state, ends the
+	// decision with a retriable error that changes nothing in HA, and a
+	// dynamic load balancer that the cluster's lowest version cannot run is
+	// turned off for the VM while it keeps its registration.
+	HAManaged bool
 }
 
 // VMDecision is the one answer rule writes, headroom, and the landing check
@@ -329,7 +345,19 @@ func (e *eligibility) decide() {
 		e.skip("pve.ha.mode is off, so the CPI registers nothing")
 		return
 	}
+	if e.in.HAManaged {
+		if err := e.p.HAFloorError(e.in.VMID); err != nil {
+			e.postpone(err)
+			return
+		}
+	}
 	if !e.p.WritesAllowed() {
+		if e.in.HAManaged {
+			e.postpone(cpierrors.Retriable("VM %d runs under HA, and the CPI may not write HA state on this "+
+				"cluster (%s); the CPI keeps the VM's HA registration as it is and writes nothing to HA",
+				e.in.VMID, e.p.gapText()))
+			return
+		}
 		if err := e.p.PrerequisiteError(); err != nil {
 			e.fail(err)
 			return
@@ -342,11 +370,89 @@ func (e *eligibility) decide() {
 		e.refuse(cpierrors.Cloud("the HA profile lists no cluster node"), true)
 		return
 	}
+	if !e.insidePin() {
+		return
+	}
 	e.placeable = e.p.placeableSet()
 	if !e.resolveDLB() {
 		return
 	}
 	e.classify()
+}
+
+// postpone ends the decision of a VM that runs under HA with the retriable
+// error err, in every mode. The refusal is transient, so the caller keeps the
+// VM's HA resource, tag, and pin as they are and writes nothing to HA.
+func (e *eligibility) postpone(err error) {
+	e.d.Transient = true
+	e.fail(err)
+}
+
+// insidePin reports whether the VM runs inside its own strict pin, and ends the
+// decision when it does not. A VM under HA was inside its pin when the CPI
+// wrote it, so a VM outside it was migrated there out of band. The decision
+// then cannot tell which node set the operator wants, so it defers rather than
+// take the VM out of HA, and the error names both ways out.
+func (e *eligibility) insidePin() bool {
+	for _, c := range e.in.Constraints {
+		if !c.Pin || contains(c.Nodes, e.d.Node) {
+			continue
+		}
+		e.postpone(cpierrors.Retriable("VM %d runs on node %s, which lies outside %s (nodes %s), so it was "+
+			"moved there outside the CPI; the CPI keeps the VM's HA registration and writes nothing to HA until "+
+			"the VM runs inside its pin again. Migrate the VM back to a node of its pin, or widen the pin to "+
+			"include node %s", e.in.VMID, e.d.Node, c.Name, listOrNone(normalizeNodes(c.Nodes)), e.d.Node))
+		return false
+	}
+	return true
+}
+
+// HAFloorError returns the retriable error of a VM that runs under HA on a
+// cluster with a node known to run a PVE version below the PVE 9 floor for HA
+// writes, and nil when no node is known to. It names every such node and its
+// version. Such a node cannot honor the HA rules, and leaving HA cannot be
+// undone by the next call, so the CPI keeps the VM's HA registration as it is
+// and writes nothing to HA until every node is upgraded.
+func (p *Profile) HAFloorError(vmid int) error {
+	below := p.nodesBelowHAFloor()
+	if len(below) == 0 {
+		return nil
+	}
+	subject := "node " + below[0] + " runs"
+	if len(below) > 1 {
+		subject = "nodes " + strings.Join(below, ", ") + " run"
+	}
+	return cpierrors.Retriable("VM %d runs under HA, and %s a PVE version below the PVE %d floor for HA writes; "+
+		"the CPI keeps the VM's HA registration as it is and writes nothing to HA until every node runs PVE %d "+
+		"or later", vmid, subject, minHAVersionMajor, minHAVersionMajor)
+}
+
+// nodesBelowHAFloor lists, as "name (version)", every node whose known version
+// is below the PVE 9 floor for HA writes. A nil profile lists none.
+func (p *Profile) nodesBelowHAFloor() []string {
+	if p == nil {
+		return nil
+	}
+	var below []string
+	for i := range p.Nodes {
+		n := &p.Nodes[i]
+		if v, ok := parseVersion(n.Version); ok && !v.AtLeast(minHAVersionMajor, minHAVersionMinor) {
+			below = append(below, n.Name+" ("+n.Version+")")
+		}
+	}
+	return below
+}
+
+// gapText says why the profile may not write HA state: its first gap, or every
+// gap when no first gap was recorded.
+func (p *Profile) gapText() string {
+	switch {
+	case p.Reason != "":
+		return p.Reason
+	case len(p.Gaps) > 0:
+		return strings.Join(p.Gaps, "; ")
+	}
+	return "the HA profile is " + string(p.Effective)
 }
 
 // skip ends the decision with no HA for the VM.
@@ -386,6 +492,15 @@ func (e *eligibility) resolveDLB() bool {
 	}
 	if e.p.DLBSupported {
 		e.d.DLB = true
+		return true
+	}
+	if e.in.HAManaged {
+		// decide has already deferred a VM on a cluster with a node below the
+		// PVE 9 floor, so every node here runs PVE 9 or later, and only the
+		// dynamic load balancer is out of reach.
+		e.warn("VM %d asks for the dynamic load balancer, which needs PVE 9.2 or later on every online node "+
+			"(lowest version %q); the VM runs under HA, so it keeps its HA registration and pin, and the "+
+			"dynamic load balancer is off for it until every node runs PVE 9.2", e.in.VMID, e.p.MinVersion)
 		return true
 	}
 	err := cpierrors.Cloud("VM %d asks for the dynamic load balancer, which needs PVE 9.2 or later on every "+
@@ -581,9 +696,11 @@ func (e *eligibility) decideShared(access, domain []string, domainErr error) {
 	allowed := access
 	if CPUTypeNeedsDomain(e.in.CPUType) {
 		// The placed node's CPU is unknown when its probe failed, so the
-		// domain cannot be stated only for now.
+		// domain cannot be stated only for now. A probe that can never
+		// succeed defers every call too, so the error names the steps that
+		// end the wait.
 		if domainErr != nil {
-			e.refuse(e.cpuError(domainErr.Error(), true), true)
+			e.refuse(e.unknownCPUError(), true)
 			return
 		}
 		allowed = intersect(access, domain)
@@ -625,6 +742,33 @@ func (e *eligibility) cpuError(detail string, transient bool) error {
 		return cpierrors.Retriable("%s", text)
 	}
 	return cpierrors.Cloud("%s", text)
+}
+
+// unknownCPUError builds the retriable refusal for a host or max CPU type on a
+// placed node whose CPU the profile could not read. It names the node, the
+// probe's failure, and the two steps that end the wait, because a probe that
+// fails for good, such as one the token may not run, defers every call.
+func (e *eligibility) unknownCPUError() error {
+	why := e.p.cpuErrOf(e.d.Node)
+	if why == "" {
+		why = "the probe recorded no reason"
+	}
+	return cpierrors.Retriable("VM %d has CPU type %q, which can live-migrate only between nodes with the same CPU "+
+		"model and flags, and the CPU of its node %s could not be read (%s), so its CPU migration domain cannot "+
+		"be stated until the node reports its CPU. Fix the CPU reporting of node %s, or set pve.cpu_type to a "+
+		"named CPU model that every node of the cluster supports, such as x86-64-v3 or x86-64-v2-AES",
+		e.in.VMID, cpuTypeModel(e.in.CPUType), e.d.Node, why, e.d.Node)
+}
+
+// cpuErrOf returns why the CPU of node is unknown, empty when the profile
+// recorded no reason or does not list the node.
+func (p *Profile) cpuErrOf(node string) string {
+	for i := range p.Nodes {
+		if p.Nodes[i].Name == node {
+			return strings.TrimSpace(p.Nodes[i].CPUErr)
+		}
+	}
+	return ""
 }
 
 // decideLocal applies pve.ha.local_policy to a VM that cannot be HA-managed as

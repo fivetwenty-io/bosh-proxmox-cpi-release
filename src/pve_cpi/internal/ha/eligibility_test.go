@@ -577,7 +577,7 @@ func TestDecideVMCPUMigrationDomain(t *testing.T) {
 		in := baseInput(eligCfg(config.HAModeAuto), disks...)
 		in.CPUType = eligHost
 		d := mustDecide(t, p, in)
-		if d.Outcome != OutcomeSkip || !strings.Contains(d.Reason, "CPU of node pve1 is unknown") {
+		if d.Outcome != OutcomeSkip || !d.Transient || !strings.Contains(d.Reason, "CPU of its node pve1 could not be read") {
 			t.Fatalf("decision = %+v", d)
 		}
 	})
@@ -1240,4 +1240,233 @@ func TestDecideVMReplicateRefusalIsTransientOnlyWithoutAProvenGap(t *testing.T) 
 	if d = mustDecide(t, p, baseInput(replicateCfg(config.HAModeAuto), vols("tank:v")...)); d.Transient {
 		t.Fatalf("a proven missing VM.Replicate grant: decision = %+v", d)
 	}
+}
+
+// managedInput is the input of a VM that already runs under HA, as attach_disk
+// gives it.
+func managedInput(mode string, volumes ...VMVolume) VMInput {
+	in := baseInput(eligCfg(mode), volumes...)
+	in.HAManaged = true
+	return in
+}
+
+// versions sets the pve-manager version of each named node.
+func versions(p *Profile, byNode map[string]string) {
+	for i := range p.Nodes {
+		if v, ok := byNode[p.Nodes[i].Name]; ok {
+			p.Nodes[i].Version = v
+		}
+	}
+}
+
+// deferredRetriable fails the test unless d ends the call with a transient,
+// retriable error whose text holds every part of want.
+func deferredRetriable(t *testing.T, d *VMDecision, want ...string) {
+	t.Helper()
+	if d.Outcome != OutcomeFail || !d.Transient || !cpierrors.IsType(d.Err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("want a transient retriable failure, got outcome %s transient %v err %v", d.Outcome, d.Transient,
+			d.Err)
+	}
+	for _, w := range want {
+		if !strings.Contains(d.Err.Error(), w) {
+			t.Errorf("error %q does not name %q", d.Err, w)
+		}
+	}
+}
+
+// TestDecideVMKeepsAnHAManagedDLBVMOnALowerVersion checks that a node of a
+// lower version never takes a VM under HA out of HA. With every node at PVE 9
+// or later only the dynamic load balancer turns off, and a node below PVE 9
+// defers with a retriable error that names the node and its version.
+func TestDecideVMKeepsAnHAManagedDLBVMOnALowerVersion(t *testing.T) {
+	disks := vols("nfs:100/vm-101-disk-0")
+	for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
+		t.Run(mode+": every node at PVE 9 turns only the dynamic load balancer off", func(t *testing.T) {
+			p := eligProfile(mode, "pve1", "pve2", "pve3")
+			versions(p, map[string]string{"pve1": "9.2.4", "pve2": "9.1.0", "pve3": "9.2.4"})
+			p.DLBSupported, p.MinVersion = false, "9.1.0"
+			in := managedInput(mode, disks...)
+			in.InDLBAZ = true
+			d := mustDecide(t, p, in)
+			if !d.Registers() || d.DLB || d.Transient || d.Policy != PolicyShared {
+				t.Fatalf("decision = %+v", d)
+			}
+			if !warned(d, "keeps its HA registration and pin") || !warned(d, "9.1.0") {
+				t.Fatalf("warnings %v, want the dynamic load balancer turned off by name", d.Warnings)
+			}
+		})
+		t.Run(mode+": dlb.enabled on PVE 9.1 keeps the VM registered", func(t *testing.T) {
+			p := eligProfile(mode, "pve1", "pve2", "pve3")
+			p.DLBSupported, p.MinVersion = false, "9.1.0"
+			in := managedInput(mode, disks...)
+			in.Config = eligCfg(mode, withDLB(true, "dlb"))
+			if d := mustDecide(t, p, in); !d.Registers() || d.DLB {
+				t.Fatalf("decision = %+v", d)
+			}
+		})
+		t.Run(mode+": a node below PVE 9 defers and names the node", func(t *testing.T) {
+			p := eligProfile(mode, "pve1", "pve2", "pve3")
+			versions(p, map[string]string{"pve1": "9.2.4", "pve2": "9.2.4", "pve3": "8.4.1"})
+			p.DLBSupported = false
+			in := managedInput(mode, disks...)
+			in.InDLBAZ = true
+			d := mustDecide(t, p, in)
+			deferredRetriable(t, d, "VM 101", "node pve3 (8.4.1) runs", "PVE 9", "writes nothing to HA")
+			if d.Registers() || d.Hard != nil || d.Admissible != nil {
+				t.Fatalf("a deferral must give no pin: %+v", d)
+			}
+		})
+	}
+	t.Run("every node below PVE 9 is named", func(t *testing.T) {
+		p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+		versions(p, map[string]string{"pve1": "9.2.4", "pve2": "8.4.1", "pve3": "8.3.0"})
+		d := mustDecide(t, p, managedInput(config.HAModeAuto, disks...))
+		deferredRetriable(t, d, "nodes pve2 (8.4.1), pve3 (8.3.0) run")
+	})
+	t.Run("an observe-only profile defers a VM under HA in both modes", func(t *testing.T) {
+		for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
+			p := eligProfile(mode, "pve1", "pve2", "pve3")
+			p.Effective, p.Reason = EffectiveObserveOnly, "the entry node does not report the cluster quorate"
+			p.Gaps = []string{p.Reason}
+			deferredRetriable(t, mustDecide(t, p, managedInput(mode, disks...)), "quorate", "writes nothing to HA")
+			p.Reason = ""
+			deferredRetriable(t, mustDecide(t, p, managedInput(mode, disks...)), "quorate")
+			p.Gaps = nil
+			deferredRetriable(t, mustDecide(t, p, managedInput(mode, disks...)), string(EffectiveObserveOnly))
+		}
+	})
+	t.Run("a create on PVE 9.1 still gives a sentinel VM no HA", func(t *testing.T) {
+		p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+		p.DLBSupported, p.MinVersion = false, "9.1.0"
+		in := baseInput(eligCfg(config.HAModeAuto), disks...)
+		in.InDLBAZ = true
+		if d := mustDecide(t, p, in); d.Outcome != OutcomeSkip || d.Transient {
+			t.Fatalf("decision = %+v", d)
+		}
+	})
+}
+
+func TestHAFloorError(t *testing.T) {
+	var nilProfile *Profile
+	if err := nilProfile.HAFloorError(101); err != nil {
+		t.Fatalf("a nil profile knows no node below the floor: %v", err)
+	}
+	p := eligProfile(config.HAModeAuto, "pve1", "pve2")
+	versions(p, map[string]string{"pve1": "9.0.3", "pve2": "garbage"})
+	if err := p.HAFloorError(101); err != nil {
+		t.Fatalf("PVE 9.0 and an unparsable version are not below the floor: %v", err)
+	}
+	p.Nodes[1].Online, p.Nodes[1].Version = false, "7.4.2"
+	err := p.HAFloorError(101)
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !strings.Contains(err.Error(), "node pve2 (7.4.2) runs") {
+		t.Fatalf("an offline node of a known old version is below the floor too: %v", err)
+	}
+	if gate := p.RuleWriteGate(); gate == nil || !strings.Contains(gate.Error(), "pve2 (7.4.2)") {
+		t.Fatalf("the rule gate names the same node: %v", gate)
+	}
+}
+
+// TestDecideVMUnknownPlacedCPUNamesTheOperatorStep checks that a placed node
+// whose CPU cannot be read defers in both modes, never leaves HA, and names the
+// node, the probe failure, and the two steps that end the wait.
+func TestDecideVMUnknownPlacedCPUNamesTheOperatorStep(t *testing.T) {
+	disks := vols("nfs:100/vm-101-disk-0")
+	steps := []string{"node pve1", "Fix the CPU reporting of node pve1", "pve.cpu_type", "x86-64-v3"}
+	for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
+		t.Run(mode, func(t *testing.T) {
+			p := eligProfile(mode, "pve1", "pve2", "pve3")
+			eligCPUs(p, map[string]string{"pve1": "", "pve2": "Xeon A", "pve3": "Xeon A"})
+			p.Nodes[0].CPUErr = "permission check failed (/nodes/pve1, Sys.Audit)"
+			in := managedInput(mode, disks...)
+			in.CPUType = eligHost
+			d := mustDecide(t, p, in)
+			if !d.Transient || d.Registers() {
+				t.Fatalf("decision = %+v", d)
+			}
+			text := d.Reason
+			if mode == config.HAModeManaged {
+				if d.Outcome != OutcomeFail || !cpierrors.IsType(d.Err, cpierrors.TypeRetriableCloud) {
+					t.Fatalf("managed must fail retriable: %+v", d)
+				}
+				text = d.Err.Error()
+			} else if d.Outcome != OutcomeSkip || !warned(d, "Fix the CPU reporting") {
+				t.Fatalf("auto must skip transient and warn: %+v", d)
+			}
+			for _, w := range append(steps, "Sys.Audit") {
+				if !strings.Contains(text, w) {
+					t.Errorf("%q does not name %q", text, w)
+				}
+			}
+		})
+	}
+	t.Run("no recorded probe failure still names the steps", func(t *testing.T) {
+		p := eligProfile(config.HAModeManaged, "pve1", "pve2", "pve3")
+		eligCPUs(p, map[string]string{"pve1": "", "pve2": "Xeon A", "pve3": "Xeon A"})
+		in := managedInput(config.HAModeManaged, disks...)
+		in.CPUType = eligHost
+		deferredRetriable(t, mustDecide(t, p, in), append(steps, "the probe recorded no reason")...)
+	})
+	t.Run("a node the profile does not list has no recorded failure", func(t *testing.T) {
+		p := eligProfile(config.HAModeAuto, "pve1")
+		if got := p.cpuErrOf("pve9"); got != "" {
+			t.Fatalf("cpuErrOf = %q", got)
+		}
+	})
+}
+
+// TestDecideVMOutsideItsStrictPinDefers checks that a VM under HA that a
+// migration put outside its strict pin never leaves HA. The decision defers
+// with a retriable error that names the VM, its node, and the pin's nodes, in
+// every policy that would otherwise refuse it, and writes no pin.
+func TestDecideVMOutsideItsStrictPinDefers(t *testing.T) {
+	pin := NodeConstraint{Name: "the VM's pin bosh-na-101", Nodes: []string{"pve3", "pve2"}, Pin: true}
+	want := []string{"VM 101", "node pve1", "the VM's pin bosh-na-101", "[pve2,pve3]", "Migrate the VM back",
+		"widen the pin", "writes nothing to HA"}
+	for name, tc := range map[string]struct {
+		mode   string
+		policy string
+		volume string
+	}{
+		"shared volumes in auto":          {config.HAModeAuto, config.HALocalPolicyNone, "nfs:100/vm-101-disk-0"},
+		"shared volumes in managed":       {config.HAModeManaged, config.HALocalPolicyNone, "nfs:100/vm-101-disk-0"},
+		"a local disk under policy none":  {config.HAModeAuto, config.HALocalPolicyNone, "local-lvm:vm-101-disk-0"},
+		"a local disk under policy hold":  {config.HAModeAuto, config.HALocalPolicyHold, "local-lvm:vm-101-disk-0"},
+		"a ZFS disk under policy replica": {config.HAModeAuto, config.HALocalPolicyReplicate, "tank:vm-101-disk-0"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := eligProfile(tc.mode, "pve1", "pve2", "pve3")
+			in := managedInput(tc.mode, vols(tc.volume)...)
+			in.Config = eligCfg(tc.mode, withPolicy(tc.policy))
+			in.Constraints = []NodeConstraint{pin}
+			d := mustDecide(t, p, in)
+			deferredRetriable(t, d, want...)
+			if d.Hard != nil || d.Admissible != nil || d.Priorities != nil {
+				t.Fatalf("a deferral must give no pin: %+v", d)
+			}
+		})
+	}
+	t.Run("a VM inside its pin is decided as before", func(t *testing.T) {
+		p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+		in := managedInput(config.HAModeAuto, vols("nfs:100/vm-101-disk-0")...)
+		in.Constraints = []NodeConstraint{{Name: pin.Name, Nodes: []string{"pve1", "pve2"}, Pin: true}}
+		d := mustDecide(t, p, in)
+		if !d.Registers() || !reflect.DeepEqual(d.Admissible, []string{"pve1", "pve2"}) {
+			t.Fatalf("decision = %+v", d)
+		}
+	})
+	t.Run("a hardware constraint that excludes the node is no pin", func(t *testing.T) {
+		p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+		in := managedInput(config.HAModeAuto, vols("nfs:100/vm-101-disk-0")...)
+		in.Constraints = []NodeConstraint{{Name: "bridge vmbr7", Nodes: []string{"pve2", "pve3"}}}
+		d := mustDecide(t, p, in)
+		if d.Outcome != OutcomeSkip || d.Transient || !strings.Contains(d.Reason, "outside its hard admissible set") {
+			t.Fatalf("decision = %+v", d)
+		}
+	})
+	t.Run("an empty pin defers too", func(t *testing.T) {
+		p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+		in := managedInput(config.HAModeAuto, vols("nfs:100/vm-101-disk-0")...)
+		in.Constraints = []NodeConstraint{{Name: pin.Name, Pin: true}}
+		deferredRetriable(t, mustDecide(t, p, in), "(none)")
+	})
 }
