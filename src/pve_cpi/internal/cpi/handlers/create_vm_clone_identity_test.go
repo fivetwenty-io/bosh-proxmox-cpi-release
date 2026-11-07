@@ -309,9 +309,12 @@ func TestCreateVM_CloneAndImportPaths_AgreeOnVMIdentity(t *testing.T) {
 	// The stemcell tag names each fixture's own stemcell, and the two fixtures
 	// deliberately use different ones (jammy 1.0 for the template, jammy 1.438
 	// for the import), so it is compared separately from the rest of the set.
-	// Each create draws its own token, so the token tag is left out too.
+	// Each create draws its own token and stamps its own birth second, so the
+	// token and birth tags are left out too.
 	cloneTags, _ := withoutTokenTag(*cloneParams.Tags)
+	cloneTags, _ = withoutBirthTag(cloneTags)
 	importTagsNoToken, _ := withoutTokenTag(importTags)
+	importTagsNoToken, _ = withoutBirthTag(importTagsNoToken)
 	cloneRest, cloneStemcell := splitStemcellTag(cloneTags)
 	importRest, importStemcell := splitStemcellTag(importTagsNoToken)
 	if cloneRest != importRest {
