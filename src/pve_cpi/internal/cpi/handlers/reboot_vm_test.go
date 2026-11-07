@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
@@ -73,6 +74,19 @@ func testDepsRebootCluster(
 		},
 		Agent:  &mockAgentService{},
 		Logger: log.NewNopLogger(),
+	}
+}
+
+// vanishingClusterSvc places vmid on node until gone is set, and lists nothing
+// after it, the cluster of a VM that is destroyed while the handler works.
+func vanishingClusterSvc(vmid int, node string, gone *atomic.Bool) *mockClusterSvc {
+	return &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			if gone.Load() {
+				return &cluster.ListResourcesResponse{}, nil
+			}
+			return clusterVMOnNode(vmid, node), nil
+		},
 	}
 }
 
@@ -435,13 +449,20 @@ func TestHandleRebootVM_StoppedStartAlreadyRunning_TaskFailed(t *testing.T) {
 func TestHandleRebootVM_StatusNotFound(t *testing.T) {
 	t.Parallel()
 
+	// The VM is gone from the cluster by the time the status call answers
+	// 404, and every member's config probe agrees, so the answer is proven.
+	var gone atomic.Bool
 	qemuSvc := &mockQEMUService{
 		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			gone.Store(true)
+			return nil, notFoundAPIErr()
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return nil, notFoundAPIErr()
 		},
 	}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "soft"))
+	h := handlers.HandleRebootVM(testDepsRebootCluster(qemuSvc, nil, nil, "soft", 60, vanishingClusterSvc(101, "pve-node1", &gone)))
 	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err == nil {
@@ -492,10 +513,14 @@ func TestHandleRebootVM_RebootNotFound(t *testing.T) {
 	t.Parallel()
 
 	resetCalled := false
+	var gone atomic.Bool
 
 	qemuSvc := &mockQEMUService{
 		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{"status": "running"}, nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return nil, notFoundAPIErr()
 		},
 		resetFn: func(_ context.Context, _ string, _ int) (string, error) {
 			resetCalled = true
@@ -505,11 +530,13 @@ func TestHandleRebootVM_RebootNotFound(t *testing.T) {
 	}
 	nodesSvc := &mockNodesService{
 		createQemuStatusRebootFn: func(_ context.Context, _, _ string, _ *nodes.CreateQemuStatusRebootParams) (*nodes.CreateQemuStatusRebootResponse, error) {
+			gone.Store(true)
 			return nil, notFoundAPIErr()
 		},
 	}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, nil, "soft"))
+	h := handlers.HandleRebootVM(testDepsRebootCluster(qemuSvc, nodesSvc, nil, "soft", 60,
+		vanishingClusterSvc(101, "pve-node1", &gone)))
 	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err == nil {

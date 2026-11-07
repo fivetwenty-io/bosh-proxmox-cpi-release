@@ -33,9 +33,13 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
+	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
 // reconcileVMPoolMembership is the entry point described in the file header.
@@ -192,16 +196,60 @@ func movePoolMember(ctx context.Context, deps Deps, vmid int, desired, currentPo
 	return true
 }
 
-// writePoolSentinel persists the (re)derived pool record. Best-effort — the
-// underlying write logs its own Warn on failure.
+// writePoolSentinel persists the (re)derived pool record. Best-effort — a
+// failure is logged at Warn and never fails set_vm_metadata.
+//
+// The record is a description write, so it goes through MutateVMConfig like
+// the metadata write before it: a migration that starts between the two is
+// waited out, the VM is located again, and the sentinel is merged into the
+// description of the node it is on now. A held transport error is re-read
+// before the write is sent again, so the sentinel is never written twice.
 func writePoolSentinel(ctx context.Context, deps Deps, node string, vmid int, name, director, deployment, instanceGroup string, logger *log.Logger) {
-	pve.UpdatePoolMembership(ctx, deps.PVE, logger, node, vmid, &pve.PoolMembership{
+	if deps.PVE == nil || node == "" || vmid <= 0 {
+		return
+	}
+	pm := &pve.PoolMembership{
 		Name:          name,
 		Layer:         pve.PoolLayerTemplate,
 		Director:      director,
 		Deployment:    deployment,
 		InstanceGroup: instanceGroup,
+	}
+	var rendered string
+	_, err := pve.MutateVMConfig(ctx, deps.PVE, logger, pve.VMConfigMutation{
+		VMID:       vmid,
+		Node:       node,
+		MotionWait: haMotionWait(deps),
+		Label:      "set_vm_metadata.pool_sentinel",
+		Apply: func(ctx context.Context, at string) error {
+			rendered = ""
+			vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, at, vmid)
+			if cfgErr != nil {
+				return cfgErr
+			}
+			desc, renderErr := pve.SetPoolMembershipOnDescription(pve.DescriptionFromConfig(vmCfg), pm)
+			if renderErr != nil {
+				return cpierrors.Wrap(renderErr, "render the pool sentinel")
+			}
+			rendered = desc
+			return deps.PVE.Nodes().UpdateQemuConfig(ctx, at, vmcid.PathOf(vmid),
+				&sdknodes.UpdateQemuConfigParams{Description: &desc})
+		},
+		Landed: func(ctx context.Context, at string) (bool, error) {
+			if rendered == "" {
+				return false, nil
+			}
+			vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, at, vmid)
+			if cfgErr != nil {
+				return false, cfgErr
+			}
+			return strings.TrimSpace(pve.DescriptionFromConfig(vmCfg)) == strings.TrimSpace(rendered), nil
+		},
 	})
+	if err != nil {
+		logger.Warn("set_vm_metadata: pool reconcile: pool membership record not written",
+			log.Int("vmid", vmid), log.String("pool", name), log.Err(err))
+	}
 }
 
 // metadataString extracts metadata[key] as a string, rendering non-string

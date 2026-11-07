@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
@@ -139,21 +140,28 @@ func TestHandleSetVMMetadata_EmptyMetadata(t *testing.T) {
 func TestHandleSetVMMetadata_NotFound(t *testing.T) {
 	t.Parallel()
 
+	// The VM is listed and carries the tag every VM this CPI creates carries.
+	// The write answers 404 and the VM is gone from the cluster after it, so
+	// the absence proof finds it nowhere and the 404 is VMNotFound.
+	var gone atomic.Bool
 	nodesSvc := &mockNodesService{
 		updateQemuConfigFn: func(_ context.Context, _, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			gone.Store(true)
 			return notFoundAPIErr()
 		},
 	}
-
-	// VM 999 misses the index, and the per-node probe still finds it carrying
-	// the tag every VM this CPI creates carries; it is gone by the write.
 	qemuSvc := &mockQEMUService{
 		configFn: func(context.Context, string, int) (map[string]any, error) {
+			if gone.Load() {
+				return nil, notFoundAPIErr()
+			}
 			return map[string]any{"tags": "bosh-cpi"}, nil
 		},
 	}
-	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, qemuSvc, nodesSvc, nil, &mockAgentService{}))
-	_, err := h.Handle(context.Background(), marshalArgs("999", map[string]any{"director": "bosh"}), jsonrpc.Context{})
+	deps := testDepsFoundVM(999, qemuSvc, nodesSvc, nil, &mockAgentService{})
+	deps.PVE.(*mockPVEClient).clusterSvc = vanishingClusterSvc(999, "pve-node1", &gone)
+	h := handlers.HandleSetVMMetadata(deps)
+	_, err := h.Handle(settleTestCtx(), marshalArgs("999", map[string]any{"director": "bosh"}), jsonrpc.Context{})
 
 	if err == nil {
 		t.Fatal("expected VMNotFound error, got nil")

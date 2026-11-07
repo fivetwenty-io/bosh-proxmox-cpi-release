@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -65,8 +66,12 @@ func warnDroppedTags(logger *log.Logger, operation string, guest log.Field, maxB
 //     identifier instead of the placeholder "vm-<vmid>" written at create_vm
 //     time. The UUID-bearing metadata["name"] ("<job>/<id>") is used only as
 //     a fallback when job or index is missing.
-//  6. Call nodes.UpdateQemuConfig with description + tags. Overwrites existing values.
-//  7. 404 → return VMNotFound.
+//  6. Wait for the VM to settle (AwaitVMSettled), then send the description,
+//     tags, and name through MutateVMConfig, which follows the VM when it
+//     migrates, before or after the wait, and re-reads before it sends again
+//     after an ambiguous result. A dead or fenced node is a retriable error.
+//  7. 404 → return VMNotFound only when the VM is proven gone from every
+//     member; a VM found on another node is a retriable error.
 //
 // Empty metadata is valid; description and tags will be empty strings.
 // Returns nil result on success.
@@ -138,6 +143,22 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 			return nil, ownErr
 		}
 
+		// --- wait for motion to end and follow the VM to its node ---
+		// A migration in flight holds the VM's config lock for minutes, so the
+		// write waits for it here instead of failing on the lock. The wait
+		// returns the node the VM is on now, and it refuses a node the cluster
+		// does not report able to answer. A migration that starts after the
+		// wait is handled by MutateVMConfig below.
+		settled, _, settleErr := settleVMForCall(ctx, deps, "set_vm_metadata", vmCID, vmid, logger)
+		if settleErr != nil {
+			return nil, settleErr
+		}
+		if settled.Node != node {
+			logger.Info("set_vm_metadata: VM moved while the call waited for it to settle",
+				log.String("from_node", node), log.String("node", settled.Node))
+		}
+		node = settled.Node
+
 		// --- build description ---
 		// Sorted "key: value\n" lines matching Perl reference behavior.
 		description := buildDescription(metadata)
@@ -173,8 +194,34 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 			recheckOwnership := func(cfg map[string]any) error {
 				return refuseUnownedVM(ctx, deps, "set_vm_metadata", vmCID, cid, loc, cfg, logger)
 			}
-			if rmwErr := setVMMetadataRMW(ctx, deps, node, vmid, vmCID, description, metadata, vmName, recheckOwnership, logger); rmwErr != nil {
-				return rmwErr
+			// MutateVMConfig sends the write to the node the VM is on. When
+			// that node answers that the VM is locked or has no config, or a
+			// transport fault leaves the write ambiguous, it waits, locates
+			// the VM again, and runs the whole read-modify-write on the node
+			// it finds, so the tags are merged against that node's config.
+			var attempt metadataWrite
+			lastNode := node
+			written, mutErr := pve.MutateVMConfig(ctx, deps.PVE, logger, pve.VMConfigMutation{
+				VMID:       vmid,
+				Node:       node,
+				MotionWait: haMotionWait(deps),
+				Label:      "set_vm_metadata",
+				Apply: func(ctx context.Context, at string) error {
+					lastNode = at
+					var rmwErr error
+					attempt, rmwErr = setVMMetadataRMW(
+						ctx, deps, at, vmid, vmCID, description, metadata, vmName, recheckOwnership, logger)
+					return rmwErr
+				},
+				Landed: func(ctx context.Context, at string) (bool, error) {
+					return metadataLanded(ctx, deps, at, vmid, attempt)
+				},
+			})
+			if mutErr != nil {
+				return setVMMetadataFailure(ctx, deps, vmCID, vmid, lastNode, mutErr)
+			}
+			if written.Node != "" {
+				node = written.Node
 			}
 			// Reconcile the VM's resource-pool membership against the
 			// director-level vm_pool_template, inside the same lock so a
@@ -218,7 +265,7 @@ func setVMMetadataRMW(
 	vmName *string,
 	recheckOwnership func(cfg map[string]any) error,
 	logger *log.Logger,
-) error {
+) (metadataWrite, error) {
 	// Read existing tags inside the lock so no concurrent writer can interleave
 	// between the read and the write. The same read supplies the current
 	// description so its shared <!--BOSH:{...}--> sentinel block
@@ -230,7 +277,7 @@ func setVMMetadataRMW(
 	var existingDesc string
 	if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
 		if ownErr := recheckOwnership(cfg); ownErr != nil {
-			return ownErr
+			return metadataWrite{}, ownErr
 		}
 		if s, ok := pve.ConfigString(cfg, jsonKeyTags); ok {
 			existingTags = parseTagsField(s)
@@ -238,19 +285,22 @@ func setVMMetadataRMW(
 		if s, ok := pve.ConfigString(cfg, "description"); ok {
 			existingDesc = s
 		} else if _, present := cfg["description"]; present {
-			return cpierrors.Cloud("set_vm_metadata: existing description is unreadable")
+			return metadataWrite{}, cpierrors.Cloud("set_vm_metadata: existing description is unreadable")
 		}
 	} else if pve.IsNotFound(cfgErr) {
-		return cpierrors.VMNotFound(vmCID)
+		// The raw answer goes back so MutateVMConfig and the caller can tell a
+		// VM that moved from a VM that is gone; the caller maps it.
+		return metadataWrite{}, cfgErr
 	} else {
 		if deps.Config != nil && (deps.Config.StoragePlacementNamespace != "" || deps.Config.StorageAllocationJournalDir != "") {
-			return cpierrors.Cloud("set_vm_metadata: cannot verify existing allocation provenance")
+			return metadataWrite{}, cpierrors.WrapAs(cfgErr, cpierrors.TypeCloud,
+				"set_vm_metadata: cannot verify existing allocation provenance")
 		}
 		// Without the config the ownership recheck cannot run, and neither
 		// can the identity check, so we write nothing. The class is retriable
 		// whatever the read error was, because nothing about the VM has been
 		// judged yet and a later read may well succeed.
-		return cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
+		return metadataWrite{}, cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("set_vm_metadata: read VM %s config to check its ownership and instance identity", vmCID))
 	}
 
@@ -263,7 +313,7 @@ func setVMMetadataRMW(
 			log.String("stored_instance", strings.Join(identity.compared, ",")),
 			log.String("metadata_instance", identity.incoming),
 		)
-		return identityErr
+		return metadataWrite{}, identityErr
 	}
 	ownerBackfill := ownerTagBackfill(identity, existingTags, deps.RequestDirectorUUID, logger)
 
@@ -277,13 +327,13 @@ func setVMMetadataRMW(
 	description = withStemcellNote(description, existingDesc)
 
 	if strings.Contains(description, "<!--BOSH:") {
-		return cpierrors.Cloud("set_vm_metadata: metadata contains reserved description sentinel")
+		return metadataWrite{}, cpierrors.Cloud("set_vm_metadata: metadata contains reserved description sentinel")
 	}
 
 	if _, raw := pve.ParseSentinel(existingDesc); len(raw) > 0 {
 		merged, renderErr := pve.RenderSentinel(strings.TrimSpace(description), raw)
 		if renderErr != nil {
-			return cpierrors.Cloud("set_vm_metadata: cannot preserve existing description sentinel")
+			return metadataWrite{}, cpierrors.Cloud("set_vm_metadata: cannot preserve existing description sentinel")
 		} else {
 			description = merged
 		}
@@ -292,7 +342,7 @@ func setVMMetadataRMW(
 	var markerErr error
 	description, markerErr = preserveVMAllocationMarker(existingDesc, description)
 	if markerErr != nil {
-		return markerErr
+		return metadataWrite{}, markerErr
 	}
 
 	// The ownership record goes at the head of the preserved list, because
@@ -320,6 +370,7 @@ func setVMMetadataRMW(
 		log.String("name", derefStr(vmName)),
 	)
 
+	sent := metadataWrite{sent: true, description: description, tags: tags, name: vmName}
 	updateErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmcid.PathOf(vmid), &sdknodes.UpdateQemuConfigParams{
 		Description: &description,
 		Tags:        &tags,
@@ -327,11 +378,64 @@ func setVMMetadataRMW(
 	})
 	if updateErr != nil {
 		if pve.IsNotFound(updateErr) {
-			return cpierrors.VMNotFound(vmCID)
+			return sent, updateErr
 		}
-		return cpierrors.Wrap(pve.WrapError(updateErr), fmt.Sprintf("set_vm_metadata: update config for VM %s", vmCID))
+		return sent, cpierrors.Wrap(pve.WrapError(updateErr), fmt.Sprintf("set_vm_metadata: update config for VM %s", vmCID))
 	}
-	return nil
+	return sent, nil
+}
+
+// metadataWrite is what one run of setVMMetadataRMW sent to the VM's config. A
+// zero value means the run failed before it sent anything, so there is nothing
+// for metadataLanded to look for.
+type metadataWrite struct {
+	sent        bool
+	description string
+	tags        string
+	name        *string
+}
+
+// metadataLanded reports whether the config on node already holds what w
+// sent. MutateVMConfig asks after an ambiguous result, such as a transport
+// error that may hide a write that landed, before it sends anything again.
+// PVE may return the tags in another order and may trim the description's
+// trailing whitespace, so both compare in that normal form. A run that sent
+// nothing has landed nothing.
+func metadataLanded(ctx context.Context, deps Deps, node string, vmid int, w metadataWrite) (bool, error) {
+	if !w.sent {
+		return false, nil
+	}
+	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if err != nil {
+		return false, err
+	}
+	if w.name != nil {
+		if name, _ := pve.ConfigString(cfg, "name"); name != *w.name {
+			return false, nil
+		}
+	}
+	if strings.TrimSpace(pve.DescriptionFromConfig(cfg)) != strings.TrimSpace(w.description) {
+		return false, nil
+	}
+	have, _ := pve.ConfigString(cfg, jsonKeyTags)
+	return sameTagSet(parseTagsField(have), parseTagsField(w.tags)), nil
+}
+
+// setVMMetadataFailure maps the error of MutateVMConfig to the handler's
+// answer. A raw 404 from the VM's node speaks for that node alone, and the VM
+// may have moved, so it is VMNotFound only when the absence proof finds the
+// VM nowhere, and a VM found elsewhere is a retriable error. Every other error
+// is already the typed answer of the protocol or of the write, and it returns
+// unchanged.
+func setVMMetadataFailure(ctx context.Context, deps Deps, vmCID string, vmid int, node string, err error) error {
+	var typed *cpierrors.Error
+	if pve.IsNotFound(err) && !errors.As(err, &typed) {
+		if goneErr := confirmVMGone(ctx, deps, "set_vm_metadata", vmid, node, "metadata write"); goneErr != nil {
+			return goneErr
+		}
+		return cpierrors.VMNotFound(vmCID)
+	}
+	return err
 }
 
 // buildVMName derives the PVE VM name from BOSH metadata + the operator's

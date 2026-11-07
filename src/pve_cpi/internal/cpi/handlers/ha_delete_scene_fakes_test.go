@@ -63,6 +63,10 @@ type HADeleteScene struct {
 	// A VM without an index node is absent from the index.
 	IndexNode    map[int]string
 	IndexHAState map[int]string
+	// IndexLock is the lock each VM's index row reports, and IndexTags the
+	// tags every row carries. Both are empty by default.
+	IndexLock map[int]string
+	IndexTags string
 	// Rules are the HA rules by name, each a /cluster/ha/rules row.
 	Rules map[string]map[string]any
 	// Perms is the token's privileges on /. Nil makes the read fail.
@@ -101,6 +105,7 @@ func NewHADeleteScene() *HADeleteScene {
 		Power:        map[int]string{},
 		IndexNode:    map[int]string{},
 		IndexHAState: map[int]string{},
+		IndexLock:    map[int]string{},
 		Rules:        map[string]map[string]any{},
 		Perms:        map[string]bool{"Sys.Console": true, "VM.PowerMgmt": true, "VM.Allocate": true},
 		StopApplies:  true,
@@ -181,6 +186,23 @@ func (s *HADeleteScene) applyStop(vmid int) {
 	s.Power[vmid] = "stopped"
 }
 
+// applyStart is the CRM carrying out a start request for vmid. Called locked.
+func (s *HADeleteScene) applyStart(vmid int) {
+	if !s.StopApplies {
+		return
+	}
+	sid := haResourceSid(vmid)
+	if _, ok := s.Requested[sid]; ok {
+		s.Requested[sid] = "started"
+		s.IndexHAState[vmid] = "started"
+	}
+	if svc, ok := s.Services[sid]; ok {
+		svc.State = "started"
+		s.Services[sid] = svc
+	}
+	s.Power[vmid] = "running"
+}
+
 func (s *HADeleteScene) statusRows() *cluster.ListStatusResponse {
 	rows := make(cluster.ListStatusResponse, 0, 1+len(s.Members))
 	rows = append(rows, json.RawMessage(
@@ -258,6 +280,12 @@ func (s *HADeleteScene) indexRows() *cluster.ListResourcesResponse {
 		row := map[string]any{"vmid": vmid, "node": node, "type": "qemu", "status": s.powerOf(vmid)}
 		if hastate := s.IndexHAState[vmid]; hastate != "" {
 			row["hastate"] = hastate
+		}
+		if lock := s.IndexLock[vmid]; lock != "" {
+			row["lock"] = lock
+		}
+		if s.IndexTags != "" {
+			row["tags"] = s.IndexTags
 		}
 		raw, _ := json.Marshal(row)
 		rows = append(rows, raw)
@@ -352,6 +380,8 @@ func (c *HASceneCluster) UpdateHaResources(_ context.Context, sid string, params
 		}
 		c.Scene.applyStop(vmid)
 		c.Scene.Requested[sid] = "disabled"
+	case "started":
+		c.Scene.applyStart(vmid)
 	default:
 		c.Scene.Requested[sid] = state
 	}
@@ -540,6 +570,14 @@ func (q *HASceneQEMU) Stop(_ context.Context, node string, vmid int) (string, er
 	q.Scene.record(fmt.Sprintf("Stop:%s/%d", node, vmid))
 	q.Scene.applyStop(vmid)
 	return fmt.Sprintf("UPID:%s:stop-%d", node, vmid), nil
+}
+
+func (q *HASceneQEMU) Start(_ context.Context, node string, vmid int) (string, error) {
+	q.Scene.mu.Lock()
+	defer q.Scene.mu.Unlock()
+	q.Scene.record(fmt.Sprintf("Start:%s/%d", node, vmid))
+	q.Scene.applyStart(vmid)
+	return fmt.Sprintf("UPID:%s:start-%d", node, vmid), nil
 }
 
 // haSceneTasks answers every task wait with success.
