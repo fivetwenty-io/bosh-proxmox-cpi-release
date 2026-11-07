@@ -57,6 +57,9 @@ type HADeleteScene struct {
 	Services map[string]HASceneService
 	// Requested are the HA resources by SID and their requested state.
 	Requested map[string]string
+	// Comments are the HA resources' comments by SID; a resource without one
+	// has none.
+	Comments map[string]string
 	// Power is each VM's power state on its node; a missing VM is running.
 	Power map[int]string
 	// IndexNode and IndexHAState are the /cluster/resources row of each VM.
@@ -102,6 +105,7 @@ func NewHADeleteScene() *HADeleteScene {
 		CRMAge:       5,
 		Services:     map[string]HASceneService{},
 		Requested:    map[string]string{},
+		Comments:     map[string]string{},
 		Power:        map[int]string{},
 		IndexNode:    map[int]string{},
 		IndexHAState: map[int]string{},
@@ -170,11 +174,19 @@ func (s *HADeleteScene) EventsSnapshot() []string {
 func (s *HADeleteScene) record(event string) { s.Events = append(s.Events, event) }
 
 // applyStop is the CRM carrying out a stop request for vmid. Called locked.
+// A service in recovery keeps its state and its node, as PVE's CRM does: it
+// records the request and acts on it once it has recovered the service.
 func (s *HADeleteScene) applyStop(vmid int) {
 	if !s.StopApplies {
 		return
 	}
 	sid := haResourceSid(vmid)
+	if svc, ok := s.Services[sid]; ok && svc.State == "recovery" {
+		if _, ok := s.Requested[sid]; ok {
+			s.Requested[sid] = "stopped"
+		}
+		return
+	}
 	if _, ok := s.Requested[sid]; ok {
 		s.Requested[sid] = "stopped"
 		s.IndexHAState[vmid] = "stopped"
@@ -353,7 +365,11 @@ func (c *HASceneCluster) GetHaResources(_ context.Context, sid string) (*cluster
 	if !ok {
 		return nil, errors.New("no such resource '" + sid + "' (HTTP500)")
 	}
-	return &cluster.GetHaResourcesResponse{Sid: sid, State: &state}, nil
+	resp := &cluster.GetHaResourcesResponse{Sid: sid, State: &state}
+	if comment, ok := c.Scene.Comments[sid]; ok {
+		resp.Comment = &comment
+	}
+	return resp, nil
 }
 
 func (c *HASceneCluster) UpdateHaResources(_ context.Context, sid string, params *cluster.UpdateHaResourcesParams) error {
@@ -366,6 +382,12 @@ func (c *HASceneCluster) UpdateHaResources(_ context.Context, sid string, params
 	c.Scene.record("UpdateHaResources:" + sid + "=" + state)
 	if _, ok := c.Scene.Requested[sid]; !ok {
 		return errors.New("no such resource '" + sid + "' (HTTP500)")
+	}
+	if params != nil && params.Comment != nil {
+		if c.Scene.Comments == nil {
+			c.Scene.Comments = map[string]string{}
+		}
+		c.Scene.Comments[sid] = *params.Comment
 	}
 	vmid, _ := strconv.Atoi(strings.TrimPrefix(sid, "vm:"))
 	switch state {
@@ -436,6 +458,15 @@ func (c *HASceneCluster) CreateHaRules(_ context.Context, params *cluster.Create
 	}
 	if params.Comment != nil {
 		row["comment"] = *params.Comment
+	}
+	if params.Nodes != nil {
+		row["nodes"] = *params.Nodes
+	}
+	if params.Strict != nil {
+		row["strict"] = *params.Strict
+	}
+	if params.Disable != nil {
+		row["disable"] = *params.Disable
 	}
 	c.Scene.Rules[params.Rule] = row
 	return nil

@@ -83,6 +83,12 @@ type vmTeardown struct {
 
 	gate    vmTeardownGate
 	haState *pve.HAServiceState
+	// deadSource is the dead node a dead-node completion moved the VM's config
+	// off. When set, every absence proof after a step answered missing rests on
+	// the cluster index for that node's guests, because its config endpoint
+	// cannot answer while it is down (see locateAfterDeadNodeMove). Empty keeps
+	// the strict proof, in which any offline member leaves absence unproven.
+	deadSource string
 
 	// skiplock lets a destroy that a config lock refused retry once with
 	// skiplock, for a root@pam password identity and never for a migrate lock.
@@ -241,8 +247,20 @@ func (t *vmTeardown) verifyBeforeDestroy(ctx context.Context, deps Deps) (bool, 
 // confirmGone proves the VM absent after a step on its node answered that the
 // VM is missing, and reports gone when the proof holds.
 func (t *vmTeardown) confirmGone(ctx context.Context, deps Deps, step string) (bool, error) {
-	if err := confirmVMGone(ctx, deps, t.caller, t.vmid, t.node, step); err != nil {
-		return false, err
+	if t.deadSource == "" {
+		if err := confirmVMGone(ctx, deps, t.caller, t.vmid, t.node, step); err != nil {
+			return false, err
+		}
+	} else {
+		loc, err := t.locateAgain(ctx, deps)
+		if err != nil {
+			return false, err
+		}
+		if loc.Found {
+			return false, cpierrors.Retriable(
+				"%s: %s for VM %d on node %s answered that the VM is missing, but node %s holds its config now; retry "+
+					"so the call runs where the VM is", t.caller, step, t.vmid, t.node, loc.Node)
+		}
 	}
 	t.logger.Info(t.caller+": VM is absent from every member; nothing left to destroy",
 		log.Int(metadataKeyVMID, t.vmid), log.String("node", t.node), log.String("step", step))
@@ -322,6 +340,16 @@ func (t *vmTeardown) recheck(ctx context.Context, deps Deps) (bool, error) {
 	return t.verifyBeforeDestroy(ctx, deps)
 }
 
+// locateAgain locates the VM after a step on its node answered that it is
+// missing: through locateAfterConfigMissing, or through
+// locateAfterDeadNodeMove when the VM's config left a dead node.
+func (t *vmTeardown) locateAgain(ctx context.Context, deps Deps) (pve.VMLocation, error) {
+	if t.deadSource != "" {
+		return locateAfterDeadNodeMove(ctx, deps, t.caller, t.vmid, t.node, t.deadSource)
+	}
+	return locateAfterConfigMissing(ctx, deps, t.caller, t.vmid, t.node)
+}
+
 // confirm is step 6. The task's answer alone never decides: the VM's absence
 // from every member and from PVE HA does. A VM proven absent finishes the run
 // even when the await answered an error, and a VM that is still present, or
@@ -334,9 +362,7 @@ func (t *vmTeardown) confirm(ctx context.Context, deps Deps, resp *sdknodes.Dele
 		awaitErr = awaitDeleteTask(ctx, deps, t.node, t.vmCID, t.vmid, resp, t.logger)
 	}
 	loc, err := pollManagedVMDestroyAbsence(ctx, managedVMDestroyCRMWait, managedVMDestroyCRMInterval,
-		func() (pve.VMLocation, error) {
-			return locateAfterConfigMissing(ctx, deps, t.caller, t.vmid, t.node)
-		})
+		func() (pve.VMLocation, error) { return t.locateAgain(ctx, deps) })
 	switch {
 	case err != nil && awaitErr != nil:
 		return errors.Join(awaitErr, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(

@@ -393,9 +393,15 @@ func deleteLegacyVMClaimed(ctx context.Context, deps Deps, vmCID string, cid vmc
 	// not online, or in an unknown state, waits out HA motion, and runs the
 	// recovery grace window, all before anything below stops, detaches, or
 	// destroys it.
+	//
+	// A deferral for a service in recovery on a fenced node goes to the
+	// dead-node completion, which returns the deferral unchanged unless a
+	// fresh read proves the fence and an expired grace window. Past that it
+	// moves the config onto a live node that reaches the VM's storage and
+	// runs this delete again there (see completeDeadNodeDelete).
 	haState, haErr := gateHADelete(ctx, deps, "delete_vm", vmid, node, logger)
 	if haErr != nil {
-		return nil, haErr
+		return completeDeadNodeDelete(ctx, deps, vmCID, cid, loc, haErr, logger)
 	}
 	gatedNode := node
 
@@ -474,6 +480,15 @@ func deleteLegacyVMClaimed(ctx context.Context, deps Deps, vmCID string, cid vmc
 	if err := refuseOwnedLegacyDestroy(holding.WithReplacements(), vmCID, vmid); err != nil {
 		return nil, err
 	}
+	// A config the dead-node completion moved here was moved without being
+	// read, so the delete proves this node reaches every volume it names
+	// before anything stops, detaches, or destroys the VM.
+	deadSource, err := refuseDeadNodeStrandedVolumes(
+		ctx, deps, vmid, node, haState, liveConfig, holding.WithReplacements(), logger,
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	// --- per-node in-flight gate (opt-in; limit=0 → unlimited, no gating) ---
 	if deps.Config != nil {
@@ -543,7 +558,7 @@ func deleteLegacyVMClaimed(ctx context.Context, deps Deps, vmCID string, cid vmc
 		}
 		return refuseOwnedLegacyDestroy(holding.WithReplacements(), vmCID, vmid)
 	}
-	return deleteLegacyVMAndArtifacts(ctx, deps, haState, node, vmCID, vmid, vmTags, identity, owned, logger)
+	return deleteLegacyVMAndArtifacts(ctx, deps, haState, node, deadSource, vmCID, vmid, vmTags, identity, owned, logger)
 }
 
 // readLegacyDeleteHolding reads the holding of the VM that loc names. When the
@@ -590,8 +605,10 @@ func readLegacyDeleteHolding(
 // allowed. An HA-managed VM is stopped through PVE HA and keeps its HA
 // resource until the destroy, which removes it with purge; its CPI-managed HA
 // rules are cleaned up after the destroy. Any other VM is stopped directly.
+// deadSource is the dead node a dead-node completion moved the VM's config
+// off, or empty; the teardown's absence proofs tolerate that node staying down.
 func deleteLegacyVMAndArtifacts(
-	ctx context.Context, deps Deps, haState *pve.HAServiceState, node, vmCID string, vmid int, vmTags string,
+	ctx context.Context, deps Deps, haState *pve.HAServiceState, node, deadSource, vmCID string, vmid int, vmTags string,
 	identity vmIdentity, owned func(context.Context, pve.QemuHolding) error, logger *log.Logger,
 ) (any, error) {
 	// --- opt-in empty-pool reaper: capture membership BEFORE destroy ---
@@ -612,6 +629,7 @@ func deleteLegacyVMAndArtifacts(
 		logger:              logger,
 		gate:                teardownGated,
 		haState:             haState,
+		deadSource:          deadSource,
 		skiplock:            true,
 		destroyUnreferenced: deps.Config != nil && deps.Config.DestroyUnreferencedDisks,
 		preserve: func(ctx context.Context) (bool, error) {
