@@ -21,9 +21,31 @@ const (
 
 const bytesPerMiB = int64(1024 * 1024)
 
+// Prefixes of the rejection reason Filter records for a node the enforced
+// headroom check removes.
+const (
+	// HeadroomShortPrefix starts the reason when the estimate ran and found a
+	// shortfall. A shortfall is a real shortage of memory, so a caller treats
+	// the refusal as permanent until the cluster changes.
+	HeadroomShortPrefix = "headroom short: "
+
+	// HeadroomUnavailablePrefix starts the reason when the estimate could not
+	// run, because the guest list was unreadable, a guest or the VM has no
+	// positive memory figure, or the planned node is not online. The node is
+	// still removed in enforce mode, but the refusal is transient, so a caller
+	// retries it rather than reporting a shortage.
+	HeadroomUnavailablePrefix = "headroom unavailable: "
+)
+
 // ErrHeadroomShort is wrapped by the error EnforceHeadroom returns, so a caller
-// can tell a short N+1 estimate from any other placement failure.
+// can tell a short N+1 estimate from any other placement failure. It is wrapped
+// for an unavailable estimate too, which also wraps ErrHeadroomUnavailable.
 var ErrHeadroomShort = errors.New("ha: headroom estimate short")
+
+// ErrHeadroomUnavailable is wrapped, next to ErrHeadroomShort, by the error
+// EnforceHeadroom returns when the estimate could not run. It marks the refusal
+// as transient, as opposed to a real shortage of memory.
+var ErrHeadroomUnavailable = errors.New("ha: headroom estimate unavailable")
 
 // HeadroomGuest is one guest that already exists in the cluster. The check
 // needs every guest, HA or not, because a survivor's free memory is its total
@@ -36,7 +58,10 @@ type HeadroomGuest struct {
 	// Node is the node the guest runs on.
 	Node string
 
-	// MemBytes is the guest's configured memory, whatever its run state.
+	// MemBytes is the guest's configured memory, whatever its run state. A caller
+	// whose guest has no readable memory figure leaves it zero, and the estimate
+	// then reports itself unavailable, as it does for any figure that is not
+	// positive, when the guest runs on an online node.
 	MemBytes int64
 
 	// HA says the guest is registered with PVE HA, so the CRM would recover it
@@ -157,8 +182,9 @@ func (r HeadroomResult) Lines() []string {
 //
 // The estimate counts memory only. Offline nodes neither fail nor survive, and
 // a node in maintenance can fail but is not a recovery target. A facts list
-// that does not hold plannedNode online, a VM without a positive memory figure,
-// or an unreadable guest list makes the estimate unavailable.
+// that does not hold plannedNode online, a VM or a guest on an online node
+// without a positive memory figure, or an unreadable guest list makes the
+// estimate unavailable.
 func EstimateHeadroom(facts []NodeFacts, check HeadroomCheck, plannedNode string) HeadroomResult {
 	if check.GuestsUnknown {
 		return HeadroomResult{Unavailable: "the cluster's guests could not be read"}
@@ -171,6 +197,11 @@ func EstimateHeadroom(facts []NodeFacts, check HeadroomCheck, plannedNode string
 	}
 
 	guests := estimateGuests(check, plannedNode)
+	for _, g := range guests {
+		if g.MemBytes <= 0 && nodeOnline(facts, g.Node) {
+			return HeadroomResult{Unavailable: fmt.Sprintf("guest %d on %s has no configured memory", g.VMID, g.Node)}
+		}
+	}
 
 	failing := make([]string, 0, len(facts))
 	for _, f := range facts {
@@ -317,7 +348,10 @@ func headroomEnforced(mode string) bool {
 // plannedNode. In off mode it does nothing. In warn mode it logs each line of a
 // short estimate and returns nil, so the VM is placed anyway. In enforce mode,
 // and in any mode it does not recognize, it returns an error that wraps
-// ErrHeadroomShort and carries the same lines. A nil check is a no-op.
+// ErrHeadroomShort and carries the same lines. An estimate that could not run
+// also wraps ErrHeadroomUnavailable, so a caller can tell the transient refusal
+// from a real shortage. A nil check is a no-op, and a nil logger discards the
+// warn-mode lines.
 func EnforceHeadroom(logger *log.Logger, facts []NodeFacts, check *HeadroomCheck, plannedNode string) error {
 	if check == nil || check.Mode == "" || check.Mode == HeadroomOff {
 		return nil
@@ -328,10 +362,17 @@ func EnforceHeadroom(logger *log.Logger, facts []NodeFacts, check *HeadroomCheck
 	}
 	lines := result.Lines()
 	if !headroomEnforced(check.Mode) {
+		if logger == nil {
+			logger = log.NewNopLogger()
+		}
 		for _, line := range lines {
 			logger.Warn(line, log.String("node", plannedNode), log.Int("vmid", check.VM.VMID))
 		}
 		return nil
+	}
+	if result.Unavailable != "" {
+		return fmt.Errorf("%w: %w: placing VM %d on %s: %s", ErrHeadroomShort, ErrHeadroomUnavailable, check.VM.VMID,
+			plannedNode, strings.Join(lines, "; "))
 	}
 	return fmt.Errorf("%w: placing VM %d on %s: %s", ErrHeadroomShort, check.VM.VMID, plannedNode,
 		strings.Join(lines, "; "))
@@ -339,9 +380,8 @@ func EnforceHeadroom(logger *log.Logger, facts []NodeFacts, check *HeadroomCheck
 
 // headroomRejection returns the Filter rejection reason for a candidate node
 // when the check is enforced and the estimate for that node is short, and ""
-// otherwise. The reason is not one of the transient reasons the handlers know,
-// so an all-nodes-short result surfaces as a permanent placement failure
-// rather than a silent retry.
+// otherwise. A shortfall starts HeadroomShortPrefix, and an estimate that could
+// not run starts HeadroomUnavailablePrefix, so a caller can retry the second.
 func headroomRejection(facts []NodeFacts, check *HeadroomCheck, node string) string {
 	if check == nil || !headroomEnforced(check.Mode) {
 		return ""
@@ -350,5 +390,9 @@ func headroomRejection(facts []NodeFacts, check *HeadroomCheck, node string) str
 	if !result.Short() {
 		return ""
 	}
-	return "headroom short: " + strings.Join(result.Lines(), "; ")
+	prefix := HeadroomShortPrefix
+	if result.Unavailable != "" {
+		prefix = HeadroomUnavailablePrefix
+	}
+	return prefix + strings.Join(result.Lines(), "; ")
 }

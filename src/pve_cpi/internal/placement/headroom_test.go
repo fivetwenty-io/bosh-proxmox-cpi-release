@@ -297,6 +297,30 @@ func TestEstimateHeadroom_AdmissibleAndInputs(t *testing.T) {
 			t.Error("unreadable guests did not make the estimate unavailable")
 		}
 	})
+	t.Run("a guest without positive memory is unavailable", func(t *testing.T) {
+		t.Parallel()
+		for _, mem := range []int64{0, -gib} {
+			check := hrCheck(placement.HeadroomWarn, hrVM(1, 4, "pve1", "pve2"),
+				placement.HeadroomGuest{VMID: 9, Node: "pve2", MemBytes: mem, HA: true, Admissible: []string{"pve1", "pve2"}})
+			got := placement.EstimateHeadroom(facts, *check, "pve1")
+			if got.Unavailable == "" || !got.Short() || len(got.Shortfalls) != 0 {
+				t.Errorf("memory %d: result = %+v, want unavailable and short", mem, got)
+			}
+			if !strings.Contains(got.Unavailable, "guest 9 on pve2") {
+				t.Errorf("memory %d: reason %q does not name the guest", mem, got.Unavailable)
+			}
+		}
+	})
+	t.Run("a guest on an offline node without memory is ignored", func(t *testing.T) {
+		t.Parallel()
+		down := placement.NodeFacts{Node: "pve3", Online: false, TotalMemBytes: 16 * gib}
+		check := hrCheck(placement.HeadroomWarn, hrVM(1, 4, "pve1", "pve2"),
+			placement.HeadroomGuest{VMID: 9, Node: "pve3", HA: true, Admissible: []string{"pve1", "pve2"}})
+		got := placement.EstimateHeadroom(append([]placement.NodeFacts{down}, facts...), *check, "pve1")
+		if got.Unavailable != "" {
+			t.Errorf("unavailable: %s", got.Unavailable)
+		}
+	})
 	t.Run("an overcommitted survivor reports zero free", func(t *testing.T) {
 		t.Parallel()
 		check := hrCheck(placement.HeadroomWarn, hrVM(1, 4, "pve1", "pve2"), hrGuest(2, "pve2", 40, false))
@@ -401,6 +425,84 @@ func TestEnforceHeadroom_Modes(t *testing.T) {
 		check.Mode = placement.HeadroomWarn
 		if err := placement.EnforceHeadroom(logger, facts, check, "pve1"); err != nil || obs.Len() != 1 {
 			t.Errorf("warn err = %v, entries = %d; want nil and 1", err, obs.Len())
+		}
+	})
+}
+
+func TestEnforceHeadroom_NilLogger(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{hrNode("pve1", 16), hrNode("pve2", 16)}
+	all := []string{"pve1", "pve2"}
+	guests := []placement.HeadroomGuest{hrGuest(2, "pve2", 16, false)}
+	for _, mode := range []string{"", placement.HeadroomOff, placement.HeadroomWarn, placement.HeadroomEnforce} {
+		t.Run("mode "+mode, func(t *testing.T) {
+			t.Parallel()
+			err := placement.EnforceHeadroom(nil, facts, hrCheck(mode, hrVM(1, 8, all...), guests...), "pve1")
+			if refused := mode == placement.HeadroomEnforce; (err != nil) != refused {
+				t.Errorf("err = %v, want refusal %v", err, refused)
+			}
+		})
+	}
+	t.Run("warn with an unavailable estimate", func(t *testing.T) {
+		t.Parallel()
+		check := hrCheck(placement.HeadroomWarn, hrVM(1, 8, all...), guests...)
+		check.GuestsUnknown = true
+		if err := placement.EnforceHeadroom(nil, facts, check, "pve1"); err != nil {
+			t.Errorf("err = %v", err)
+		}
+	})
+}
+
+func TestEnforceHeadroom_UnavailableIsTransient(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{hrNode("pve1", 16), hrNode("pve2", 16)}
+	all := []string{"pve1", "pve2"}
+	check := hrCheck(placement.HeadroomEnforce, hrVM(1, 8, all...), hrGuest(2, "pve2", 16, false))
+	if err := placement.EnforceHeadroom(nil, facts, check, "pve1"); errors.Is(err, placement.ErrHeadroomUnavailable) {
+		t.Errorf("a shortfall wraps ErrHeadroomUnavailable: %v", err)
+	}
+	check.GuestsUnknown = true
+	err := placement.EnforceHeadroom(nil, facts, check, "pve1")
+	if !errors.Is(err, placement.ErrHeadroomUnavailable) || !errors.Is(err, placement.ErrHeadroomShort) {
+		t.Errorf("err = %v, want ErrHeadroomUnavailable and ErrHeadroomShort", err)
+	}
+}
+
+func TestFilter_HeadroomUnavailableReason(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{hrNode("pve1", 16), hrNode("pve2", 16)}
+	all := []string{"pve1", "pve2"}
+	cases := map[string]*placement.HeadroomCheck{
+		"unreadable guests": func() *placement.HeadroomCheck {
+			c := hrCheck(placement.HeadroomEnforce, hrVM(1, 4, all...))
+			c.GuestsUnknown = true
+			return c
+		}(),
+		"VM without memory": hrCheck(placement.HeadroomEnforce, placement.HeadroomVM{VMID: 1, Admissible: all}),
+		"guest without memory": hrCheck(placement.HeadroomEnforce, hrVM(1, 4, all...),
+			placement.HeadroomGuest{VMID: 2, Node: "pve2", HA: false}),
+	}
+	for name, hc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			pass, rej := placement.Filter(facts, placement.Request{Headroom: hc})
+			if len(pass) != 0 {
+				t.Errorf("pass = %v, want none in enforce mode", pass)
+			}
+			for _, n := range []string{"pve1", "pve2"} {
+				if !strings.HasPrefix(rej[n], placement.HeadroomUnavailablePrefix) ||
+					strings.HasPrefix(rej[n], placement.HeadroomShortPrefix) {
+					t.Errorf("rejection for %s = %q, want the unavailable prefix", n, rej[n])
+				}
+			}
+		})
+	}
+	t.Run("a shortfall keeps the short prefix", func(t *testing.T) {
+		t.Parallel()
+		hc := hrCheck(placement.HeadroomEnforce, hrVM(1, 8, all...), hrGuest(2, "pve2", 16, false))
+		_, rej := placement.Filter(facts, placement.Request{Headroom: hc})
+		if !strings.HasPrefix(rej["pve1"], placement.HeadroomShortPrefix) {
+			t.Errorf("rejection for pve1 = %q", rej["pve1"])
 		}
 	})
 }

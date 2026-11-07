@@ -219,7 +219,10 @@ type Request struct {
 	// Headroom carries the N+1 memory estimate for an HA VM. When it is set and
 	// its Mode is "enforce" (or any value other than "", "off", and "warn"),
 	// Filter rejects every candidate node on which placing the VM leaves the
-	// estimate short, with a reason that starts "headroom short: ". "warn" and
+	// estimate short, with a reason that starts HeadroomShortPrefix ("headroom
+	// short: ") for a shortfall and HeadroomUnavailablePrefix ("headroom
+	// unavailable: ") when the estimate could not run. The second is transient,
+	// so a caller retries it instead of reporting a shortage. "warn" and
 	// "off" never remove a node from the candidate set; the caller runs
 	// EnforceHeadroom against the node it chose, which logs the warning. Nil
 	// means no headroom check, byte-identical to prior releases.
@@ -250,7 +253,11 @@ type ScoredNode struct {
 //   - When req.RequiredBridges is non-empty and req.BridgeChecker is set, the
 //     node must have every bridge (a failed lookup is a transient rejection).
 //   - When req.Headroom is set in enforce mode, placing the VM on the node must
-//     leave the N+1 memory estimate (EstimateHeadroom) with no shortfall.
+//     leave the N+1 memory estimate (EstimateHeadroom) with no shortfall. A node
+//     removed for a shortfall has a reason that starts HeadroomShortPrefix
+//     ("headroom short: "). A node removed because the estimate could not run
+//     has a reason that starts HeadroomUnavailablePrefix ("headroom unavailable:
+//     "), which is transient and worth a retry.
 //
 // Each excluded node is accompanied by a human-readable rejection reason.
 // Filter returns (nil, nil) when facts is empty.
