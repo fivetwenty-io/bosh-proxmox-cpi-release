@@ -2303,7 +2303,7 @@ We run `pve-cid ha` against the cluster. It is read-only. It prints the profile 
 
 **Fix**
 
-For a removed key, we replace it as the error says. For a failed gate, we fix the cluster or the token, and the profile is probed again on the next call. For a deferred delete, we follow [When `delete_vm` defers](operations.md#when-delete_vm-defers), and for a dead node, [the dead-node procedure](operations.md#the-dead-node-procedure). For an `error` resource, we follow [Clearing an HA error by hand](operations.md#clearing-an-ha-error-by-hand). [HA and Resurrection](ha-and-resurrection.md) explains the ownership model behind all four.
+For a removed key, we replace it as the error says. For a failed gate, we fix the cluster or the token, and the profile is probed again on the next call. For a deferred delete, we follow [When `delete_vm` defers](operations.md#when-delete_vm-defers), and for a dead node we follow [the dead-node procedure](operations.md#the-dead-node-procedure). For an `error` resource, we follow [Clearing an HA error by hand](operations.md#clearing-an-ha-error-by-hand). [HA and Resurrection](ha-and-resurrection.md) explains the ownership model behind all four.
 
 ## Task timeouts
 

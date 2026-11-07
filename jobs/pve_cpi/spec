@@ -186,10 +186,10 @@ properties:
       when the cluster profile allows rules, and otherwise skips it with one Info
       line. "on" does the same and adds a warning when the HA decision gives the
       VM no HA, so no rule can be written, plus a strict-config check that
-      pve.placement.anti_affinity.enabled is true. A failed rule write is handled
-      the same in "auto" and "on", by pve.ha.mode: it is logged in auto mode, with
-      a retriable error as the exception that fails the call, and it fails the call
-      in managed mode. "off" never writes one. Every value except "off" writes a
+      pve.placement.anti_affinity.enabled is true. The pve.ha.mode key decides how
+      a failed rule write is handled, and "auto" and "on" handle it the same way.
+      In auto mode the failure is logged, except that a retriable error fails the
+      call. In managed mode the failure fails the call. "off" never writes one. Every value except "off" writes a
       rule only when pve.placement.anti_affinity.enabled is true and the request
       carries an instance-group name. "on" needs pve.ha.mode set to "auto" or
       "managed".

@@ -642,7 +642,7 @@ findings:
 result: 0 problem(s), 0 advice
 ```
 
-The headroom field reads `headroom=ok(42%)` when every single-node failure leaves memory free on the survivors, where the percentage is the smallest margin over all such failures. It reads `short(<node>)` or `short(<node>+N)`, which names the first node whose loss leaves a VM with nowhere to go and counts the N other nodes that are short, and it reads `unavailable` when the CPI could not read what it needs. The number is the same memory-only estimate that `create_vm` uses, so a result of `ok` does not promise that every VM restarts.
+The headroom field reads `headroom=ok(42%)` when every single-node failure leaves memory free on the survivors, where the percentage is the smallest margin over all such failures. It reads `short(<node>)` or `short(<node>+N)` when a failure leaves a VM with nowhere to go. The name is the first node whose loss does that, and N counts the other nodes that are short. It reads `unavailable` when the CPI could not read what it needs. The number is the same memory-only estimate that `create_vm` uses, so a result of `ok` does not promise that every VM restarts.
 
 Each finding is either a problem or advice. The command exits with 0 when the report holds no problem, with 1 when it holds a problem or a source it could not read, and with 2 for a usage error. An unreadable source counts as a problem with the kind `unchecked`, so a clean run proves that every check ran. The finding kinds fall into these groups.
 
@@ -666,7 +666,7 @@ Each finding is either a problem or advice. The command exits with 0 when the re
 
 A `replicate` VM shows `replica_awaiting_sync` as advice while its job works but the pin has not yet widened. It shows `replica_not_recoverable` as a problem only when no usable job exists, the job is disabled, or the first sync is more than twice its schedule plus the clock-skew bound overdue. A schedule the doctor cannot measure, such as a weekday list, gets `replica_schedule_unjudged` and is never called stale or healthy.
 
-With `--cpi-config`, the command also reports overlapping VMID bands on one export, a `next-id` range that overlaps a band or the `next-id` range of another cluster on the same export, and a `next-id` range that overlaps the cluster's own bands when another checked cluster mounts one of its exports. A possible shared backing, which is one export path behind different server strings, is advice and does not fail the run. The command exits with 1 for any failing finding. PVE's default `next-id` range of 100 to 999999 overlaps every band, so a cluster on a shared export keeps getting the finding until the operator sets a range outside the bands, as [Shared-storage rules](multi-cluster.md#shared-storage-rules) says.
+With `--cpi-config`, the command also reports three kinds of overlap. The first is overlapping VMID bands on one export. The second is a `next-id` range that overlaps a band or the `next-id` range of another cluster on the same export. The third is a `next-id` range that overlaps the cluster's own bands when another checked cluster mounts one of its exports. A possible shared backing, which is one export path behind different server strings, is advice and does not fail the run. The command exits with 1 for any failing finding. PVE's default `next-id` range of 100 to 999999 overlaps every band, so a cluster on a shared export keeps getting the finding until the operator sets a range outside the bands, as [Shared-storage rules](multi-cluster.md#shared-storage-rules) says.
 
 ### When `delete_vm` defers
 

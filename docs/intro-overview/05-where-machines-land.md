@@ -41,7 +41,7 @@ One honest trap deserves a spotlight, because it is invisible until the day a no
 
 The CPI places a VM once and exits. But Proxmox's own high-availability machinery can later migrate that VM anywhere — including out of its zone — silently undoing the fault-domain design. For deployments that care, an opt-in setting writes the placement down: the CPI records a node-affinity rule in Proxmox's HA rule store, binding the VM to its zone's nodes even after the CPI process is long gone. A related opt-in covers the opposite case, handing workloads that want *continuous* rebalancing rather than a fixed home to Proxmox's Dynamic Load Balancer.
 
-Both opt-ins share a serious caveat we will meet again in Chapter 9: once Proxmox is allowed to restart or move machines, it recovers first and BOSH's resurrector becomes the fallback. The CPI holds the resurrector back so that the two healers do not race each other and produce duplicates.
+Both opt-ins share a serious caveat, which we will meet again in Chapter 9. Once Proxmox is allowed to restart or move machines, it recovers first and BOSH's resurrector becomes the fallback. The CPI holds the resurrector back so that the two healers do not race each other and produce duplicates.
 
 ## Where this leads
 
