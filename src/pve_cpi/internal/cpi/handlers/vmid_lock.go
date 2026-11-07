@@ -83,6 +83,21 @@ func withVMIDLock(
 	logger *log.Logger,
 	fn func() error,
 ) error {
+	return withVMIDLockFor(ctx, pools, vmid, owner, vmidLockTTLNow(), logger, fn)
+}
+
+// withVMIDLockFor is withVMIDLock with the TTL the holder claims with. A body
+// that can wait out a migration under the lock passes vmidLockTTLFor(its
+// motion wait), so the claim outlasts the wait.
+func withVMIDLockFor(
+	ctx context.Context,
+	pools pve.PoolService,
+	vmid int,
+	owner string,
+	ttl time.Duration,
+	logger *log.Logger,
+	fn func() error,
+) error {
 	// A request that already claims vmid (see withVMIDClaim) holds this very
 	// lock, which is not reentrant, so fn runs under that claim instead. Once
 	// the claim's window has closed it may be stolen, so fn does not run.
@@ -125,7 +140,7 @@ func withVMIDLock(
 	// second one finds the VM gone or defers. A create cannot be the second
 	// holder of a claim on a VM that exists, because PVE refuses a clone or
 	// import onto a VMID in use.
-	handle, err := pve.AcquireClusterLock(ctx, pools, lockName, pve.ProcessLockOwner(owner), vmidLockTTLNow(), vmidLockTimeout)
+	handle, err := pve.AcquireClusterLock(ctx, pools, lockName, pve.ProcessLockOwner(owner), ttl, vmidLockTimeout)
 	if err != nil {
 		if errors.Is(err, pve.ErrClusterLockTimeout) {
 			return vmidLockHeldError(ctx, pools, lockName, err)

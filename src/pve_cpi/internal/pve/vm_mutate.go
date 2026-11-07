@@ -38,6 +38,13 @@ type VMConfigMutation struct {
 	// Label names the calling operation in log lines and errors.
 	Label string
 
+	// Budget, when positive, caps the protocol's time budget at this long from
+	// the start of the call, even when the context's deadline or twice the
+	// motion budget would allow more. A caller that holds a lock for the call
+	// or that runs a best-effort step sets it, so the time it can spend is
+	// known. Zero leaves the budget as MutateVMConfig's own doc describes.
+	Budget time.Duration
+
 	// Apply sends the change to node once. It must not retry on its own,
 	// because the protocol decides whether sending again is safe, and the
 	// context it receives turns off the SDK's own retries for that reason. It
@@ -102,7 +109,8 @@ func (m VMConfigMutation) motionWait() time.Duration {
 //
 // The budget for the whole protocol is the method's operation timeout, which
 // is the context's deadline. When the context has none, the protocol bounds
-// itself at twice the motion budget. Running out of it returns a retriable
+// itself at twice the motion budget. A positive m.Budget shortens either one.
+// Running out of it returns a retriable
 // error that names the lock or the identity that kept moving. A suspended
 // lock returns the retriable lock error at once, because only resuming the VM
 // clears it, and every other error PVE gives is returned as it came.
@@ -119,6 +127,11 @@ func MutateVMConfig(ctx context.Context, c Client, logger *log.Logger, m VMConfi
 	limit := clk.now().Add(2 * m.motionWait())
 	if dl, ok := ctx.Deadline(); ok {
 		limit = dl.Add(-settleDeadlineReserve)
+	}
+	if m.Budget > 0 {
+		if capped := clk.now().Add(m.Budget); capped.Before(limit) {
+			limit = capped
+		}
 	}
 	settleReq := VMSettleRequest{VMID: m.VMID, MotionWait: m.MotionWait, Label: m.label()}
 

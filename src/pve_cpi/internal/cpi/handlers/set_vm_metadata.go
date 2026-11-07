@@ -149,7 +149,7 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		// returns the node the VM is on now, and it refuses a node the cluster
 		// does not report able to answer. A migration that starts after the
 		// wait is handled by MutateVMConfig below.
-		settled, _, settleErr := settleVMForCall(ctx, deps, "set_vm_metadata", vmCID, vmid, logger)
+		settled, _, settleErr := settleVMForCall(ctx, deps, "set_vm_metadata", vmCID, vmid, true, logger)
 		if settleErr != nil {
 			return nil, settleErr
 		}
@@ -188,7 +188,10 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		//
 		// Pool service absent (nil) → retriable error so the director re-drives.
 		lockOwner := fmt.Sprintf("set_vm_metadata/%d", vmid)
-		lockErr := withVMIDLock(ctx, deps.PVE.Pools(), vmid, lockOwner, logger, func() error {
+		// The mutation below can wait out a migration under the lock, so the claim
+		// is sized for that wait (see vmidLockBodies).
+		motionWait := haMotionWait(deps)
+		lockErr := withVMIDLockFor(ctx, deps.PVE.Pools(), vmid, lockOwner, vmidLockTTLFor(motionWait), logger, func() error {
 			// The scan row the guard above judged can be stale, so the
 			// config read under the lock is judged again before the write.
 			recheckOwnership := func(cfg map[string]any) error {
@@ -204,7 +207,8 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 			written, mutErr := pve.MutateVMConfig(ctx, deps.PVE, logger, pve.VMConfigMutation{
 				VMID:       vmid,
 				Node:       node,
-				MotionWait: haMotionWait(deps),
+				MotionWait: motionWait,
+				Budget:     setVMMetadataMutateBudget(motionWait),
 				Label:      "set_vm_metadata",
 				Apply: func(ctx context.Context, at string) error {
 					lastNode = at

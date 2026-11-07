@@ -38,3 +38,14 @@ func SetUntrackedCloneRescanTimeoutForTest(d time.Duration) func() {
 	untrackedCloneRescanTimeout = d
 	return func() { untrackedCloneRescanTimeout = old }
 }
+
+// VMIDLockTTLFor, VMIDLockTTLMargin, and PoolSentinelBudget re-export what the
+// VMID lock budget is built from, for handlers_test package tests that check
+// the time a handler spends under the lock against the TTL it claims with.
+// Test-only.
+var VMIDLockTTLFor = vmidLockTTLFor
+
+const (
+	VMIDLockTTLMargin  = vmidLockTTLMargin
+	PoolSentinelBudget = poolSentinelBudget
+)

@@ -76,6 +76,15 @@ type VMSettleRequest struct {
 	// Label names the calling operation in log lines and errors.
 	Label string
 
+	// ProbeFoundSettles makes a VM that only the config probe found count as
+	// settled, where the wait would otherwise poll for up to a minute until
+	// the cluster index has a row for it. A caller sets it only when its
+	// next step is a MutateVMConfig change, which meets a lock or a move
+	// the probe could not see and handles it, so it needs no scan row to be
+	// safe. A VM that was just created is in that state until the index
+	// catches up.
+	ProbeFoundSettles bool
+
 	// notAfter, when set, ends the wait no later than this time on the wait's
 	// own clock. MutateVMConfig sets it so its settle waits share the
 	// protocol's budget.
@@ -122,7 +131,10 @@ var settleStableHAStates = map[string]struct{}{
 }
 
 // observeSettle classifies one scan location. It never reads anything itself.
-func observeSettle(loc VMLocation, motionWait time.Duration) settleObservation {
+func observeSettle(loc VMLocation, motionWait time.Duration, probeFoundSettles bool) settleObservation {
+	if !loc.FromScan && probeFoundSettles && loc.FromConfig {
+		return settleObservation{settled: true}
+	}
 	if !loc.FromScan {
 		// The index has no row yet, so a config probe found the VM and the
 		// lock and HA state are unknown. The index catches up within seconds,
@@ -210,6 +222,11 @@ func settleLockBudget(lock string, motionWait time.Duration) time.Duration {
 // cannot find is returned as Found=false with no error. That answer is not a
 // proof of absence, and a caller that needs one runs the absence proof.
 //
+// A caller whose next step is a MutateVMConfig change may set
+// req.ProbeFoundSettles, so a VM that only the config probe found, because the
+// index has no row for it yet, ends the wait at once instead of polling for up
+// to a minute for the row.
+//
 // The wait observes one moment. HA can start a migration the instant it
 // returns, so it does not make a mutation safe on its own, and every
 // VM-config change goes through MutateVMConfig, which handles a migration
@@ -235,7 +252,7 @@ func AwaitVMSettled(ctx context.Context, c Client, logger *log.Logger, req VMSet
 			return loc, nil
 		default:
 			lastErr = nil
-			obs = observeSettle(loc, motionWait)
+			obs = observeSettle(loc, motionWait, req.ProbeFoundSettles)
 		}
 		if obs.settled {
 			if poll > 0 && logger != nil {

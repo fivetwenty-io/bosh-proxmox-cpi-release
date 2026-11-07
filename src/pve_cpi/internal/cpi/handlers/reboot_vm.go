@@ -34,10 +34,17 @@ import (
 //  3. GET /qemu/{vmid}/status/current — determine running state.
 //     - 404 or config missing → the VM is proven gone (VMNotFound), or it moved
 //     (retriable); other err → CloudError.
-//     3a. An HA-managed VM is stopped and then started through SetHAState as a
-//     caller that keeps the VM, in every HA mode, and each request is polled
-//     until the VM reaches its state. A running VM whose resource is in error
-//     is never sent disabled; it returns the re-registration error.
+//     3a. When pve.ha.mode is auto or managed, an HA-managed VM is stopped and
+//     then started through SetHAState as a caller that keeps the VM, and each
+//     request is polled until the VM reaches its state. reboot_mode and
+//     reboot_timeout do not apply to it. A running VM whose resource is in
+//     error is never sent disabled; it returns the re-registration error.
+//     When pve.ha.mode is off the HA state is never read, and the reboot goes
+//     straight to the direct path below. An HA view that cannot be proven
+//     defers the reboot in auto and managed mode only.
+//     3b. A migration or a lock that appears after the wait, before any power
+//     call is sent, makes the reboot wait and resolve the VM once more. A
+//     second failure of that kind is returned as a retriable error.
 //  4. If state == "stopped": issue qemu.Start; await UPID; return nil.
 //  5. If mode == "hard": call rebootVMHardReset() directly.
 //  6. If mode == "soft": POST /status/reboot with configured timeout.
@@ -99,66 +106,113 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 			return nil, ownErr
 		}
 
-		// --- wait for motion to end and follow the VM to its node ---
-		// The wait re-resolves the node on every poll, and it refuses a node
-		// the cluster does not report able to answer, so the calls below go
-		// to the node that holds the VM now.
-		settled, health, settleErr := settleVMForCall(ctx, deps, "reboot_vm", vmCID, vmid, logger)
-		if settleErr != nil {
-			return nil, settleErr
+		// A migration or a task that begins after the wait shows up as a lock,
+		// a missing config, or a CRM placement that disagrees with the node
+		// the wait returned. Nothing has been sent at that point, so the
+		// reboot waits and resolves the VM once more before it gives up.
+		var res any
+		for pass := 1; ; pass++ {
+			res, err = rebootOnce(ctx, deps, logger, vmCID, vmid, node)
+			var moved *rebootMovedError
+			if err == nil || !errors.As(err, &moved) {
+				return res, err
+			}
+			if pass >= rebootMaxPasses {
+				return nil, moved.err
+			}
+			logger.Info("reboot_vm: the VM moved or took a lock after the wait; settling and resolving it again",
+				log.Err(moved.err))
 		}
-		if settled.Node != node {
-			logger.Info("reboot_vm: VM moved while the reboot waited for it to settle",
-				log.String("from_node", node), log.String("node", settled.Node))
-		}
-		node = settled.Node
-
-		haState, haErr := readRebootHAState(ctx, deps, vmCID, vmid, node, health)
-		if haErr != nil {
-			return nil, haErr
-		}
-
-		mode := deps.Config.RebootModeValue()
-		timeout := deps.Config.RebootTimeoutValue()
-
-		// --- pre-check: get current VM state ---
-		// Inputs: ctx, node, vmid (all validated).
-		// Failure modes:
-		//   - 404 → VMNotFound (non-retriable; VM is gone).
-		//   - transient → retried by RetryOnTransient; on exhaustion returns Retriable.
-		//   - other → non-retriable CloudError via WrapError.
-		//   - status map missing "status" key → state is "" → treated as running.
-		var st map[string]any
-		statusErr := pve.RetryOnTransient(ctx, logger, "reboot_vm.status", 0, func() error {
-			var inner error
-			st, inner = deps.PVE.QEMU().Status(ctx, node, vmid)
-			return inner
-		})
-		if statusErr != nil {
-			return nil, rebootCallFailure(ctx, deps, "status", vmCID, vmid, node, statusErr)
-		}
-		state, _ := pve.ConfigString(st, "status")
-
-		// --- HA-managed VM: stop and start through PVE HA ---
-		// A direct reset or reboot call never changes the HA state, but a
-		// stop does, and the CRM restarts a VM it still wants started. So the
-		// stop and the start both go through the HA resource.
-		if haState != nil && haState.Managed() {
-			return rebootHAManaged(ctx, deps, logger, vmCID, vmid, haState, state)
-		}
-
-		// --- stopped VM: start instead of reboot ---
-		if state == vmPowerStateStopped {
-			return rebootVMHandleStopped(ctx, deps, logger, node, vmid, vmCID)
-		}
-
-		// --- running VM: hard or soft reboot ---
-		if mode == "hard" {
-			return rebootVMHardReset(ctx, deps, logger, node, vmid, vmCID)
-		}
-
-		return rebootVMSoftWithFallback(ctx, deps, logger, node, vmid, vmCID, timeout)
 	})
+}
+
+// rebootMaxPasses is how many times reboot_vm waits for the VM and resolves it
+// before a motion that keeps happening is returned as a retriable error.
+const rebootMaxPasses = 2
+
+// rebootMovedError marks a retriable failure that a rebootOnce pass met before
+// it sent any power call, because the VM had moved or taken a lock after the
+// wait. HandleRebootVM settles and runs one more pass for it, and returns the
+// error it wraps when the next pass meets the same.
+type rebootMovedError struct{ err error }
+
+func (e *rebootMovedError) Error() string { return e.err.Error() }
+func (e *rebootMovedError) Unwrap() error { return e.err }
+
+// rebootAfterSend strips the mark from the error of a call made after a power
+// call was already sent, such as the hard reset that follows a failed soft
+// reboot, because running the reboot again would power-cycle the VM twice.
+func rebootAfterSend(res any, err error) (any, error) {
+	var moved *rebootMovedError
+	if errors.As(err, &moved) {
+		return res, moved.err
+	}
+	return res, err
+}
+
+// rebootOnce is one pass of reboot_vm for a VM that has passed the ownership
+// guard: the wait for the VM to settle, the HA read, the status read, and the
+// reboot itself. node is where the earlier locate placed the VM.
+func rebootOnce(ctx context.Context, deps Deps, logger *log.Logger, vmCID string, vmid int, node string) (any, error) {
+	// --- wait for motion to end and follow the VM to its node ---
+	// The wait re-resolves the node on every poll, and it refuses a node
+	// the cluster does not report able to answer, so the calls below go
+	// to the node that holds the VM now.
+	settled, health, settleErr := settleVMForCall(ctx, deps, "reboot_vm", vmCID, vmid, false, logger)
+	if settleErr != nil {
+		return nil, settleErr
+	}
+	if settled.Node != node {
+		logger.Info("reboot_vm: VM moved while the reboot waited for it to settle",
+			log.String("from_node", node), log.String("node", settled.Node))
+	}
+	node = settled.Node
+
+	haState, haErr := readRebootHAState(ctx, deps, vmCID, vmid, node, health)
+	if haErr != nil {
+		return nil, haErr
+	}
+
+	mode := deps.Config.RebootModeValue()
+	timeout := deps.Config.RebootTimeoutValue()
+
+	// --- pre-check: get current VM state ---
+	// Inputs: ctx, node, vmid (all validated).
+	// Failure modes:
+	//   - 404 → VMNotFound (non-retriable; VM is gone).
+	//   - transient → retried by RetryOnTransient; on exhaustion returns Retriable.
+	//   - other → non-retriable CloudError via WrapError.
+	//   - status map missing "status" key → state is "" → treated as running.
+	var st map[string]any
+	statusErr := pve.RetryOnTransient(ctx, logger, "reboot_vm.status", 0, func() error {
+		var inner error
+		st, inner = deps.PVE.QEMU().Status(ctx, node, vmid)
+		return inner
+	})
+	if statusErr != nil {
+		return nil, rebootCallFailure(ctx, deps, "status", vmCID, vmid, node, statusErr)
+	}
+	state, _ := pve.ConfigString(st, "status")
+
+	// --- HA-managed VM: stop and start through PVE HA ---
+	// A direct reset or reboot call never changes the HA state, but a
+	// stop does, and the CRM restarts a VM it still wants started. So the
+	// stop and the start both go through the HA resource.
+	if haState != nil && haState.Managed() {
+		return rebootHAManaged(ctx, deps, logger, vmCID, vmid, haState, state)
+	}
+
+	// --- stopped VM: start instead of reboot ---
+	if state == vmPowerStateStopped {
+		return rebootVMHandleStopped(ctx, deps, logger, node, vmid, vmCID)
+	}
+
+	// --- running VM: hard or soft reboot ---
+	if mode == "hard" {
+		return rebootVMHardReset(ctx, deps, logger, node, vmid, vmCID)
+	}
+
+	return rebootVMSoftWithFallback(ctx, deps, logger, node, vmid, vmCID, timeout)
 }
 
 // rebootVMHardReset issues POST /nodes/{node}/qemu/{vmid}/status/reset (immediate
@@ -297,7 +351,7 @@ func rebootVMSoftWithFallback(ctx context.Context, deps Deps, logger *log.Logger
 			return nil, rebootCallFailure(ctx, deps, "reboot", vmCID, vmid, node, rebootErr)
 		}
 		logger.Warn("reboot_vm: graceful reboot call failed, falling back to hard reset", log.Err(rebootErr))
-		return rebootVMHardReset(ctx, deps, logger, node, vmid, vmCID)
+		return rebootAfterSend(rebootVMHardReset(ctx, deps, logger, node, vmid, vmCID))
 	}
 
 	var rawMsg json.RawMessage
@@ -307,13 +361,13 @@ func rebootVMSoftWithFallback(ctx context.Context, deps Deps, logger *log.Logger
 	upid, upidErr := pve.UPIDFromRaw(rawMsg)
 	if upidErr != nil {
 		logger.Warn("reboot_vm: could not parse UPID from reboot response, falling back to hard reset", log.Err(upidErr))
-		return rebootVMHardReset(ctx, deps, logger, node, vmid, vmCID)
+		return rebootAfterSend(rebootVMHardReset(ctx, deps, logger, node, vmid, vmCID))
 	}
 
 	if upid != "" {
 		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, logger); awaitErr != nil {
 			logger.Warn("reboot_vm: graceful reboot task failed, falling back to hard reset", log.Err(awaitErr))
-			return rebootVMHardReset(ctx, deps, logger, node, vmid, vmCID)
+			return rebootAfterSend(rebootVMHardReset(ctx, deps, logger, node, vmid, vmCID))
 		}
 	}
 
@@ -334,19 +388,21 @@ func isConfigMissing(err error) bool {
 // may have migrated since the wait, so it is VMNotFound only when the absence
 // proof finds the VM nowhere. A VM found elsewhere is a retriable error, so the
 // retry locates it on its new node. A config lock after the wait is a motion or
-// a task that began after it, and the retry waits it out. Every other failure
-// keeps the class that WrapError gives it.
+// a task that began after it, and the retry waits it out. Both are returned as
+// a rebootMovedError, because the call sent nothing, so the reboot settles and
+// resolves the VM once more before it gives up. Every other failure keeps the
+// class that WrapError gives it.
 func rebootCallFailure(ctx context.Context, deps Deps, step, vmCID string, vmid int, node string, err error) error {
 	switch {
 	case isConfigMissing(err):
 		if goneErr := confirmVMGone(ctx, deps, "reboot_vm", vmid, node, step+" call"); goneErr != nil {
-			return goneErr
+			return &rebootMovedError{err: goneErr}
 		}
 		return cpierrors.VMNotFound(vmCID)
 	case pve.IsVMConfigLocked(err):
-		return cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, fmt.Sprintf(
+		return &rebootMovedError{err: cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, fmt.Sprintf(
 			"reboot_vm: %s VM %s: the VM is locked (%s) on node %s, so a motion or a task began after the reboot "+
-				"waited for it; retry once it ends", step, vmCID, pve.VMConfigLockType(err), node))
+				"waited for it; retry once it ends", step, vmCID, pve.VMConfigLockType(err), node))}
 	}
 	return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("reboot_vm: %s VM %s", step, vmCID))
 }
@@ -357,7 +413,9 @@ func rebootCallFailure(ctx context.Context, deps Deps, step, vmCID string, vmid 
 // flight is waited out within pve.ha.motion_wait_sec and followed to the VM's
 // new node, and a service in fence or recovery is a retriable error at once.
 // A VM that vanished from the index during the wait is a retriable error,
-// because the wait proves nothing about absence.
+// because the wait proves nothing about absence. probeFoundSettles is for a
+// caller whose next step is a MutateVMConfig change, so a VM that only the
+// config probe found ends the wait at once (see pve.VMSettleRequest).
 //
 // The node it returns must then be one the cluster reports able to answer, so
 // a call about a VM on a dead or fenced node is a retriable error rather than
@@ -365,10 +423,10 @@ func rebootCallFailure(ctx context.Context, deps Deps, step, vmCID string, vmid 
 // health report that check read is returned for the caller's later decisions,
 // and it is nil when the PVE client carries no cluster or nodes service to ask.
 func settleVMForCall(
-	ctx context.Context, deps Deps, op, vmCID string, vmid int, logger *log.Logger,
+	ctx context.Context, deps Deps, op, vmCID string, vmid int, probeFoundSettles bool, logger *log.Logger,
 ) (pve.VMLocation, *pve.NodeHealthReport, error) {
 	settled, err := pve.AwaitVMSettled(ctx, deps.PVE, logger, pve.VMSettleRequest{
-		VMID: vmid, MotionWait: haMotionWait(deps), Label: op,
+		VMID: vmid, MotionWait: haMotionWait(deps), Label: op, ProbeFoundSettles: probeFoundSettles,
 	})
 	if err != nil {
 		return pve.VMLocation{}, nil, cpierrors.Wrap(err, fmt.Sprintf("%s: wait for VM %s to settle", op, vmCID))
@@ -400,13 +458,21 @@ func settleVMForCall(
 }
 
 // readRebootHAState reads the VM's normalized HA state for the reboot, which
-// acts on a live node. It returns nil when the PVE client carries no cluster or
-// nodes service to read it with. A state that does not let the reboot proceed
-// is a retriable error, and so is a CRM that places the service on another
-// node than the one the reboot located, so the retry locates the VM again.
+// acts on a live node. It returns nil without a read when pve.ha.mode is off,
+// because the CPI then leaves HA alone, so a reboot never defers on an HA view
+// that is stale or unreadable and acts on the VM directly. In auto and managed
+// mode an HA view that cannot be proven still defers the reboot, because a
+// direct reset of a VM that turns out to be HA-managed would fight the CRM. It
+// also returns nil when the PVE client carries no cluster or nodes service to
+// read the state with. A state that does not let the reboot proceed is a
+// retriable error, and so is a CRM that places the service on another node
+// than the one the reboot located, so the retry locates the VM again.
 func readRebootHAState(
 	ctx context.Context, deps Deps, vmCID string, vmid int, node string, health *pve.NodeHealthReport,
 ) (*pve.HAServiceState, error) {
+	if !deps.Config.HAWritesEnabled() {
+		return nil, nil
+	}
 	if deps.PVE.Cluster() == nil || deps.PVE.Nodes() == nil {
 		return nil, nil
 	}
@@ -423,9 +489,9 @@ func readRebootHAState(
 			vmCID, disp, reason)
 	}
 	if st.Managed() && st.InCRM && st.Node != node {
-		return nil, cpierrors.Retriable(
+		return nil, &rebootMovedError{err: cpierrors.Retriable(
 			"reboot_vm: the HA manager places %s on node %s, but the reboot located VM %s on node %s; retry so the "+
-				"reboot runs against the node that holds it", st.SID, st.Node, vmCID, node)
+				"reboot runs against the node that holds it", st.SID, st.Node, vmCID, node)}
 	}
 	return st, nil
 }
@@ -436,19 +502,17 @@ func readRebootHAState(
 // token's permissions, and a read that fails, return a retriable error rather
 // than a guess.
 func rebootSysConsole(ctx context.Context, deps Deps, vmCID string, vmid int) (bool, error) {
-	reader, ok := deps.PVE.(pve.TokenPermissionReader)
-	if !ok {
+	held, supported, err := tokenHoldsSysConsole(ctx, deps)
+	switch {
+	case !supported:
 		return false, cpierrors.Retriable(
 			"reboot_vm: VM %s (%d): the PVE client cannot read the token's permissions on /, so the reboot cannot "+
 				"tell whether it may restart the HA-managed VM through its HA resource; retry", vmCID, vmid)
-	}
-	perms, err := reader.EffectivePermissions(ctx, "/")
-	if err != nil {
+	case err != nil:
 		return false, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, fmt.Sprintf(
 			"reboot_vm: VM %s (%d): the token's permissions on / are unreadable, so the reboot cannot tell whether "+
 				"it may restart the HA-managed VM through its HA resource; retry once they read", vmCID, vmid))
 	}
-	_, held := perms["Sys.Console"]
 	return held, nil
 }
 

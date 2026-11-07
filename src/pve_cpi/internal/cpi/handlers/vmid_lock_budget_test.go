@@ -14,13 +14,20 @@ import (
 // pool lookup on the transient attempt budget, the pool ensure on
 // DefaultStorageLockMaxAttempts, and the pool move on cleanupSweepMaxAttempts,
 // with every attempt taking the per-call allowance and every loop sleeping its
-// longest backoff.
-func setVMMetadataLockBudget() time.Duration {
+// longest backoff. With a positive motionWait it adds the time of its two
+// config mutations, which is twice motionWait for the metadata write,
+// poolSentinelBudget for the pool record, and the calls each can still make
+// once its budget ends.
+func setVMMetadataLockBudget(motionWait time.Duration) time.Duration {
 	lookup := pve.TransientMaxAttempts()
 	ensure := pve.DefaultStorageLockMaxAttempts
 	move := cleanupSweepMaxAttempts
 	calls := 5 + lookup + ensure + move
-	return time.Duration(calls)*vmidLockCallAllowance +
+	mutations := time.Duration(0)
+	if motionWait > 0 {
+		mutations = 2*motionWait + poolSentinelBudget + time.Duration(2*vmConfigMutateOverrunCalls)*vmidLockCallAllowance
+	}
+	return mutations + time.Duration(calls)*vmidLockCallAllowance +
 		pve.RetryOnTransientSleepBudget(lookup) +
 		pve.RetryOnTransientOrLockSleepBudget(ensure) +
 		pve.RetryOnTransientOrLockSleepBudget(move)
@@ -31,7 +38,7 @@ func setVMMetadataLockBudget() time.Duration {
 // set_vm_metadata's worst case past the TTL, instead of letting another
 // process steal a lock that is still in use.
 func TestVMIDLockTTLCoversSetVMMetadataRetryBudget(t *testing.T) {
-	budget := setVMMetadataLockBudget()
+	budget := setVMMetadataLockBudget(0)
 	t.Logf("set_vm_metadata worst case %s, margin %s, TTL %s", budget, vmidLockTTLMargin, vmidLockTTL)
 	if vmidLockTTL < budget+vmidLockTTLMargin {
 		t.Fatalf("vmidLockTTL = %s, but set_vm_metadata can hold the lock for %s plus a %s margin; raise the TTL",
@@ -49,7 +56,7 @@ func TestVMIDLockTTLCoversSetVMMetadataRetryBudget(t *testing.T) {
 // uses at run time to the derivation above, and checks that set_vm_metadata
 // is the slowest body, so covering it covers the others.
 func TestVMIDLockBodiesTableMatchesTheDerivation(t *testing.T) {
-	bodies := vmidLockBodies()
+	bodies := vmidLockBodies(0)
 	var setVM *vmidLockBody
 	for i := range bodies {
 		if bodies[i].operation == "set_vm_metadata" {
@@ -59,7 +66,7 @@ func TestVMIDLockBodiesTableMatchesTheDerivation(t *testing.T) {
 	if setVM == nil {
 		t.Fatal("set_vm_metadata is missing from vmidLockBodies")
 	}
-	if got, want := setVM.budget(), setVMMetadataLockBudget(); got != want {
+	if got, want := setVM.budget(), setVMMetadataLockBudget(0); got != want {
 		t.Fatalf("table budget for set_vm_metadata = %s, derivation = %s", got, want)
 	}
 	for _, body := range bodies {
@@ -67,7 +74,7 @@ func TestVMIDLockBodiesTableMatchesTheDerivation(t *testing.T) {
 			t.Fatalf("%s budget %s exceeds set_vm_metadata's %s", body.operation, body.budget(), setVM.budget())
 		}
 	}
-	if got := vmidLockBodyBudget(); got != setVM.budget() {
+	if got := vmidLockBodyBudget(0); got != setVM.budget() {
 		t.Fatalf("vmidLockBodyBudget() = %s, want set_vm_metadata's %s", got, setVM.budget())
 	}
 	if got := vmidLockTTLNow(); got != vmidLockTTL {
@@ -81,7 +88,7 @@ func TestVMIDLockBodiesTableMatchesTheDerivation(t *testing.T) {
 func TestVMIDLockTTLNowFollowsAnOperatorsLongerCurve(t *testing.T) {
 	restore := pve.SetPushbackBackoffForTest(5000, int((15 * time.Minute).Milliseconds()))
 	defer restore()
-	budget := setVMMetadataLockBudget()
+	budget := setVMMetadataLockBudget(0)
 	if budget+vmidLockTTLMargin <= vmidLockTTL {
 		t.Fatalf("test curve too short to exceed the constant: budget %s", budget)
 	}
@@ -126,7 +133,7 @@ func TestWithVMIDLockClaimsTheFullTTL(t *testing.T) {
 // re-read after the linked-clone rescan, and the stamp) plus that rescan, is
 // in the table with the rescan counted at its own deadline.
 func TestVMIDLockBodiesListTheUntrackedDestroy(t *testing.T) {
-	for _, body := range vmidLockBodies() {
+	for _, body := range vmidLockBodies(0) {
 		if body.operation != "stemcell-refs untracked destroy" {
 			continue
 		}
@@ -137,4 +144,57 @@ func TestVMIDLockBodiesListTheUntrackedDestroy(t *testing.T) {
 		return
 	}
 	t.Fatal("the stemcell-refs untracked destroy body is missing from vmidLockBodies")
+}
+
+// TestVMIDLockTTLFollowsTheMotionWait checks that the TTL set_vm_metadata
+// claims with grows with pve.ha.motion_wait_sec, because the metadata write
+// can wait out a migration for twice that long under the lock. At the shipped
+// default it already exceeds the 25 minute floor.
+func TestVMIDLockTTLFollowsTheMotionWait(t *testing.T) {
+	for _, wait := range []time.Duration{pve.DefaultMotionWait, 30 * time.Minute, 24 * time.Hour} {
+		want := setVMMetadataLockBudget(wait) + vmidLockTTLMargin
+		if got := vmidLockTTLFor(wait); got < want {
+			t.Fatalf("vmidLockTTLFor(%s) = %s, want at least %s", wait, got, want)
+		}
+		if got := vmidLockTTLFor(wait); got < 2*wait+poolSentinelBudget {
+			t.Fatalf("vmidLockTTLFor(%s) = %s, shorter than the waits under the lock", wait, got)
+		}
+	}
+	if vmidLockTTLFor(30*time.Minute) <= vmidLockTTLFor(pve.DefaultMotionWait) {
+		t.Fatal("a longer motion wait must lengthen the TTL")
+	}
+	if got := vmidLockTTLNow(); got != vmidLockTTL {
+		t.Fatalf("vmidLockTTLNow() = %s, want the floor %s for holders that wait for no migration", got, vmidLockTTL)
+	}
+}
+
+// TestVMIDLockHolderThatWaitsClaimsTheMotionTTL reads the claim set_vm_metadata
+// writes and checks that its expiry covers the motion wait it can spend under
+// the lock.
+func TestVMIDLockHolderThatWaitsClaimsTheMotionTTL(t *testing.T) {
+	pools := newVMIDLockPools(nil)
+	wait := 30 * time.Minute
+	before := time.Now()
+	var comment string
+	if err := withVMIDLockFor(t.Context(), pools, 5152, "set_vm_metadata/5152", vmidLockTTLFor(wait), nil,
+		func() error {
+			comment = pools.pools["bosh-lock-vm-5152"]
+			return nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+	var exp time.Time
+	for _, field := range strings.Fields(comment) {
+		if v, ok := strings.CutPrefix(field, "exp="); ok {
+			secs, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				t.Fatalf("claim %q has an unreadable expiry: %v", comment, err)
+			}
+			exp = time.Unix(secs, 0)
+		}
+	}
+	if held := exp.Sub(before); held < 2*wait+poolSentinelBudget {
+		t.Fatalf("claim expires %s after acquisition, want more than the %s of waits under the lock",
+			held, 2*wait+poolSentinelBudget)
+	}
 }

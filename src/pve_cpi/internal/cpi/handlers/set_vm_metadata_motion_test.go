@@ -31,6 +31,11 @@ type motionFixture struct {
 	onRead  func(f *motionFixture, reads int)
 	offline map[string]bool
 
+	// indexLag, when set, answers the cluster scan with no row for the VM
+	// while it reports true, the way an index that has not caught up with a
+	// VM that was just created does.
+	indexLag func(reads int) bool
+
 	// descriptions and tags are what the config holds, and writes are the
 	// nodes each description write was sent to.
 	description string
@@ -100,12 +105,21 @@ func newMotionFixture(t *testing.T, node string) *motionFixture {
 			if f.onRead != nil {
 				f.onRead(f, f.reads)
 			}
+			if f.indexLag != nil && f.indexLag(f.reads) {
+				return &cluster.ListResourcesResponse{}, nil
+			}
 			row := map[string]any{"vmid": 101, "node": f.node, "type": "qemu", "tags": "bosh-cpi"}
 			if f.lock != "" {
 				row["lock"] = f.lock
 			}
 			raw, _ := json.Marshal(row)
 			return &cluster.ListResourcesResponse{raw}, nil
+		},
+		listConfigNodesFn: func(context.Context) (*cluster.ListConfigNodesResponse, error) {
+			return &cluster.ListConfigNodesResponse{
+				json.RawMessage(`{"name":"pve-node1","node":"pve-node1"}`),
+				json.RawMessage(`{"name":"pve-node2","node":"pve-node2"}`),
+			}, nil
 		},
 		listStatusFn: func(context.Context) (*cluster.ListStatusResponse, error) {
 			f.mu.Lock()
@@ -325,5 +339,26 @@ func TestSetVMMetadata_PoolSentinelFollowsTheVM(t *testing.T) {
 		if writes[i] != want[i] {
 			t.Fatalf("description writes = %v, want %v", writes, want)
 		}
+	}
+}
+
+// TestHandleSetVMMetadata_VMOnlyTheProbeFindsIsWrittenAtOnce is the call that
+// follows create_vm before the cluster index has a row for the new VM. The
+// config probe finds the VM, and the handler writes to it without waiting for
+// the row, because the write's own protocol meets a lock or a move.
+func TestHandleSetVMMetadata_VMOnlyTheProbeFindsIsWrittenAtOnce(t *testing.T) {
+	t.Parallel()
+	f := newMotionFixture(t, "pve-node1")
+	f.indexLag = func(int) bool { return true }
+	clk := newElapsedClock()
+
+	if err := f.run(clk.ctx()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := f.writeNodes(); len(got) != 1 || got[0] != "pve-node1" {
+		t.Fatalf("description writes = %v, want one on pve-node1", got)
+	}
+	if spent := clk.Since(clk.start); spent != 0 {
+		t.Fatalf("the call waited %s for an index row, want no wait", spent)
 	}
 }

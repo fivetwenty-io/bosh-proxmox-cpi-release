@@ -340,22 +340,37 @@ func haRecoveryGraceError(deps Deps, caller string, st *pve.HAServiceState, reas
 // retriable error, because the stop it chooses depends on the answer: the
 // delete defers rather than guess.
 func haDeleteSysConsole(ctx context.Context, deps Deps, caller string, vmid int) (bool, error) {
-	reader, ok := deps.PVE.(pve.TokenPermissionReader)
-	if !ok {
+	held, supported, err := tokenHoldsSysConsole(ctx, deps)
+	switch {
+	case !supported:
 		return false, cpierrors.Retriable(
 			"%s: VM %d: the PVE client cannot read the token's permissions on /, so the delete cannot tell "+
 				"whether it may stop the HA-managed VM through its HA resource; retry", caller, vmid)
-	}
-	perms, err := reader.EffectivePermissions(ctx, "/")
-	if err != nil {
+	case err != nil:
 		return false, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, fmt.Sprintf(
 			"%s: VM %d: the token's permissions on / are unreadable, so the delete cannot tell whether it may "+
 				"stop the HA-managed VM through its HA resource; retry once they read", caller, vmid))
 	}
+	return held, nil
+}
+
+// tokenHoldsSysConsole reads whether the token holds Sys.Console on /. The
+// delete and the reboot each word the error for a client that cannot read
+// permissions (supported false) and for a read that fails (err) in their own
+// terms, so this returns the facts and leaves the words to them.
+func tokenHoldsSysConsole(ctx context.Context, deps Deps) (held, supported bool, err error) {
+	reader, ok := deps.PVE.(pve.TokenPermissionReader)
+	if !ok {
+		return false, false, nil
+	}
+	perms, err := reader.EffectivePermissions(ctx, "/")
+	if err != nil {
+		return false, true, err
+	}
 	// A privilege is held when its key is present; the value only says
 	// whether it propagates to children of the path.
-	_, held := perms["Sys.Console"]
-	return held, nil
+	_, held = perms["Sys.Console"]
+	return held, true, nil
 }
 
 // haStopOutcome is how stopHAManagedVMForDelete left the VM.

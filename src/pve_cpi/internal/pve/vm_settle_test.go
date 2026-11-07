@@ -406,3 +406,46 @@ func TestAwaitVMSettled_DefaultClockAndLabel(t *testing.T) {
 		t.Errorf("default motion wait = %v", got)
 	}
 }
+
+// A VM that only the config probe found, because the index has no row for it
+// yet, ends the wait at once when the caller says its next step handles a lock
+// or a move itself, and otherwise polls for the row.
+func TestAwaitVMSettled_ProbeFoundSettlesOnRequest(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		settles    bool
+		wantSleeps bool
+	}{
+		{name: "default polls for the row", settles: false, wantSleeps: true},
+		{name: "probe found settles", settles: true, wantSleeps: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			clk := newSettleTestClock()
+			c := scriptedScanClient(clk, 7020, func(e time.Duration) *scanRow {
+				if e < 10*time.Second {
+					return nil
+				}
+				return &scanRow{node: "pve-node2"}
+			})
+			c.qemuSvc = &fakeQEMUService{configFn: func(_ context.Context, node string, _ int) (map[string]any, error) {
+				if node == "pve-node2" {
+					return map[string]any{"name": "vm"}, nil
+				}
+				return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
+			}}
+			loc, err := AwaitVMSettled(clk.ctx(context.Background()), c, nil,
+				VMSettleRequest{VMID: 7020, ProbeFoundSettles: tc.settles})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if loc.Node != "pve-node2" || loc.FromScan == tc.settles {
+				t.Errorf("loc = %+v; want pve-node2, from the probe only when settling on it", loc)
+			}
+			if (clk.sleeps > 0) != tc.wantSleeps {
+				t.Errorf("slept %d times; wantSleeps = %v", clk.sleeps, tc.wantSleeps)
+			}
+		})
+	}
+}

@@ -204,6 +204,11 @@ func movePoolMember(ctx context.Context, deps Deps, vmid int, desired, currentPo
 // waited out, the VM is located again, and the sentinel is merged into the
 // description of the node it is on now. A held transport error is re-read
 // before the write is sent again, so the sentinel is never written twice.
+//
+// The record is advisory, and the next reconcile writes it again, so the
+// mutation gets only poolSentinelBudget. A lock or a move that outlasts it
+// skips the record with a Warn line instead of holding the call, and the VMID
+// lock, open for as long as a migration takes.
 func writePoolSentinel(ctx context.Context, deps Deps, node string, vmid int, name, director, deployment, instanceGroup string, logger *log.Logger) {
 	if deps.PVE == nil || node == "" || vmid <= 0 {
 		return
@@ -220,6 +225,7 @@ func writePoolSentinel(ctx context.Context, deps Deps, node string, vmid int, na
 		VMID:       vmid,
 		Node:       node,
 		MotionWait: haMotionWait(deps),
+		Budget:     poolSentinelBudget,
 		Label:      "set_vm_metadata.pool_sentinel",
 		Apply: func(ctx context.Context, at string) error {
 			rendered = ""

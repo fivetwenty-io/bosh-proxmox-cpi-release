@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
@@ -99,6 +100,8 @@ func newHAReboot(t *testing.T, scene *handlers.HADeleteScene, mode string) *haRe
 	}
 	cfg := testConfig()
 	cfg.RebootMode = mode
+	haMode := config.HAChoice(config.HAModeAuto)
+	cfg.HA = &config.HAConfig{Mode: &haMode}
 	r.deps = handlers.Deps{
 		Config: cfg,
 		Agent:  &mockAgentService{},
@@ -359,4 +362,105 @@ func TestHandleRebootVM_UnreadableTokenPermissionsDefer(t *testing.T) {
 
 	requireHARetriable(t, r.run(settleTestCtx()), "permissions")
 	noHAWrites(t, scene.EventsSnapshot())
+}
+
+// staleHAViewScene is VM 101 on node1, not HA-managed, in a cluster whose CRM
+// timestamp is an hour old, so the HA view cannot be proven.
+func staleHAViewScene() *handlers.HADeleteScene {
+	scene := handlers.NewHADeleteScene()
+	scene.Place(101, "pve-node1")
+	scene.Do(func(s *handlers.HADeleteScene) { s.CRMAge = 3600 })
+	return scene
+}
+
+// TestHandleRebootVM_UnknownHAViewByMode pins what an HA view that cannot be
+// proven does to the reboot of a VM that is not in HA. With pve.ha.mode off the
+// CPI leaves HA alone, so the reboot never reads it and never defers on it. In
+// auto and managed mode the reboot defers, because a direct reset of a VM that
+// turns out to be HA-managed would fight the CRM.
+func TestHandleRebootVM_UnknownHAViewByMode(t *testing.T) {
+	t.Parallel()
+	t.Run("off reboots directly", func(t *testing.T) {
+		t.Parallel()
+		scene := staleHAViewScene()
+		r := newHAReboot(t, scene, "soft")
+		r.deps.Config.HA = nil
+
+		if err := r.run(settleTestCtx()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(r.rebootNodes) != 1 || r.rebootNodes[0] != "pve-node1" {
+			t.Fatalf("soft reboot nodes = %v, want [pve-node1]", r.rebootNodes)
+		}
+		noHAWrites(t, scene.EventsSnapshot())
+	})
+	for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
+		t.Run(mode+" defers", func(t *testing.T) {
+			t.Parallel()
+			scene := staleHAViewScene()
+			r := newHAReboot(t, scene, "soft")
+			m := config.HAChoice(mode)
+			r.deps.Config.HA = &config.HAConfig{Mode: &m}
+
+			requireHARetriable(t, r.run(settleTestCtx()), "HA disposition")
+			if len(r.rebootNodes) != 0 || len(r.resetNodes) != 0 {
+				t.Fatalf("no reboot or reset may be sent on an unknown HA view, got %v %v", r.rebootNodes, r.resetNodes)
+			}
+		})
+	}
+}
+
+// TestHandleRebootVM_MovedAgainAfterTheWaitIsFollowedInTheCall answers config
+// missing to the first status read, because the VM migrated after the wait. The
+// reboot waits again, finds the VM on node2, and reboots it there in the same
+// call.
+func TestHandleRebootVM_MovedAgainAfterTheWaitIsFollowedInTheCall(t *testing.T) {
+	t.Parallel()
+	scene := handlers.NewHADeleteScene()
+	scene.Place(101, "pve-node1")
+	r := newHAReboot(t, scene, "soft")
+	statusCalls := 0
+	r.withStatus(func() (map[string]any, error) {
+		statusCalls++
+		if statusCalls == 1 {
+			scene.Place(101, "pve-node2")
+			return nil, notFoundAPIErr()
+		}
+		return map[string]any{"status": "running"}, nil
+	})
+
+	if err := r.run(settleTestCtx()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(r.rebootNodes) != 1 || r.rebootNodes[0] != "pve-node2" {
+		t.Fatalf("soft reboot nodes = %v, want [pve-node2]", r.rebootNodes)
+	}
+}
+
+// TestHandleRebootVM_MovedTwiceIsRetriableAfterOneMorePass keeps the VM moving
+// under every status read. The reboot resolves it once more, then returns a
+// retriable error and sends nothing.
+func TestHandleRebootVM_MovedTwiceIsRetriableAfterOneMorePass(t *testing.T) {
+	t.Parallel()
+	scene := handlers.NewHADeleteScene()
+	scene.Place(101, "pve-node1")
+	r := newHAReboot(t, scene, "soft")
+	statusCalls := 0
+	r.withStatus(func() (map[string]any, error) {
+		statusCalls++
+		if statusCalls%2 == 1 {
+			scene.Place(101, "pve-node2")
+		} else {
+			scene.Place(101, "pve-node1")
+		}
+		return nil, notFoundAPIErr()
+	})
+
+	requireHARetriable(t, r.run(settleTestCtx()), "answered that the VM is missing")
+	if statusCalls != 2 {
+		t.Fatalf("status read %d times, want 2 passes", statusCalls)
+	}
+	if len(r.rebootNodes) != 0 || len(r.resetNodes) != 0 {
+		t.Fatalf("no reboot or reset may be sent, got %v %v", r.rebootNodes, r.resetNodes)
+	}
 }

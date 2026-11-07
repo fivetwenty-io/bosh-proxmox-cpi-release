@@ -130,14 +130,15 @@ func locateAfterConfigMissing(ctx context.Context, deps Deps, op string, vmid in
 	return loc, nil
 }
 
-// confirmVMGone is the answer of a delete step on node that came back not
-// found or config missing, as a stop, a destroy, a task await, or a config
-// read. It returns nil only when the VM is proven absent from the cluster, so
-// the step may finish as an idempotent success. A VM found anywhere, on node
-// again or on another member it moved to, is a retriable error, so the
-// Director retries the delete and the next attempt locates the VM afresh
-// instead of answering success for a VM that still runs. step names what came
-// back missing, for the error text.
+// confirmVMGone is the answer of a step on node that came back not found or
+// config missing, as a stop, a destroy, a task await, a config read, or a
+// config write. The delete, the reboot, and the metadata write all use it. It
+// returns nil only when the VM is proven absent from the cluster, so the step
+// may finish as an idempotent success. A VM found anywhere, on node again or on
+// another member it moved to, is a retriable error, so the Director retries the
+// call and the next attempt locates the VM afresh instead of answering success
+// for a VM that still runs. step names what came back missing, for the error
+// text.
 func confirmVMGone(ctx context.Context, deps Deps, op string, vmid int, node, step string) error {
 	loc, err := locateAfterConfigMissing(ctx, deps, op, vmid, node)
 	if err != nil {
@@ -146,7 +147,7 @@ func confirmVMGone(ctx context.Context, deps Deps, op string, vmid int, node, st
 	if loc.Found {
 		return cpierrors.Retriable(
 			"%s: %s for VM %d on node %s answered that the VM is missing, but node %s holds its config now; retry so "+
-				"the delete runs where the VM is", op, step, vmid, node, loc.Node)
+				"the call runs where the VM is", op, step, vmid, node, loc.Node)
 	}
 	return nil
 }

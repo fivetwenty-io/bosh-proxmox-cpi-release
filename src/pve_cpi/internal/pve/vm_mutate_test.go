@@ -691,3 +691,25 @@ func TestMutateVMConfig_UsageErrors(t *testing.T) {
 		t.Errorf("default label = %q", got)
 	}
 }
+
+// A positive Budget ends the protocol early, even where the motion budget
+// would let a migrate lock be waited on for ten minutes.
+func TestMutateVMConfig_BudgetCapsTheWait(t *testing.T) {
+	t.Parallel()
+	clk := newSettleTestClock()
+	c := scriptedScanClient(clk, 8020, func(time.Duration) *scanRow {
+		return &scanRow{node: "pve-node1", lock: "migrate", haState: "migrate"}
+	})
+	var sent []string
+	_, err := MutateVMConfig(clk.ctx(context.Background()), c, nil, VMConfigMutation{
+		VMID: 8020, Node: "pve-node1", MotionWait: 10 * time.Minute, Budget: 10 * time.Second,
+		Apply: recordingApply(&sent, func(int, string) error { return lockedErr(8020, "migrate") }),
+	})
+	requireSettleRetriable(t, err, "locked (migrate)")
+	if e := clk.Elapsed(); e != 10*time.Second {
+		t.Errorf("waited %v; want the 10s budget, not the motion budget", e)
+	}
+	if len(sent) != 1 {
+		t.Errorf("sent %v; want one send before the budget ended the wait", sent)
+	}
+}
