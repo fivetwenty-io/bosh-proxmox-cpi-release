@@ -125,6 +125,20 @@ func TestRunHAOffModeStillProbes(t *testing.T) {
 	}
 }
 
+func TestRunHAOffModeFailsOnUnreadableRules(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	f.profile = haHealthyProfile("off")
+	f.profile.Effective = ha.EffectiveOff
+	f.profile.RulesSupported = false
+	f.resources = nil
+	f.rulesErr = errFake
+	code, out, _ := runHATest(t, newHATestDeps(haCfg("off", "none"), f))
+	if code != exitError || !strings.Contains(out, "[problem] unchecked ha-rules") {
+		t.Fatalf("off mode, unreadable rules: code = %d\n%s", code, out)
+	}
+}
+
 func TestRunHAUsageErrors(t *testing.T) {
 	t.Parallel()
 	for name, args := range map[string][]string{
@@ -339,17 +353,54 @@ func TestRunHACPIConfigPossibleSharedBackingDoesNotFail(t *testing.T) {
 	}
 }
 
+func TestParseCPIConfigShapesAndTypes(t *testing.T) {
+	t.Parallel()
+	object, err := parseCPIConfig([]byte(`{"cpis":[{"name":"a","type":"pve"},{"name":" b "},{"name":"c","type":"PVE"}]}`))
+	if err != nil || len(object) != 3 || object[1].Name != "b" {
+		t.Fatalf("object form = %+v, %v", object, err)
+	}
+	bare, err := parseCPIConfig([]byte(` [{"name":"a","type":"pve"}] `))
+	if err != nil || len(bare) != 1 || bare[0].Name != "a" {
+		t.Fatalf("bare list = %+v, %v", bare, err)
+	}
+	mixed, err := parseCPIConfig([]byte(`{"cpis":[{"name":"a","type":"pve"},{"name":"v","type":"vsphere"}]}`))
+	if err != nil || len(mixed) != 1 || mixed[0].Name != "a" {
+		t.Fatalf("a non-pve entry must be dropped: %+v, %v", mixed, err)
+	}
+	// A dropped entry still holds its name, so a duplicate stays an error.
+	if _, err := parseCPIConfig([]byte(`{"cpis":[{"name":"a","type":"pve"},{"name":"a","type":"vsphere"}]}`)); err == nil {
+		t.Fatal("a duplicate name across types should fail")
+	}
+}
+
+func TestRunHACPIConfigSkipsNonPVEEntries(t *testing.T) {
+	t.Parallel()
+	path := writeTemp(t, "cpi.json", `{"cpis":[{"name":"az1","type":"pve","properties":{}},`+
+		`{"name":"other","type":"vsphere","properties":{"pve_vmid_range_start":110000}}]}`)
+	d := newHATestDeps(haCfg("auto", "none"), sharedFake(pve.VMIDBand{Start: 200000, End: 200999}))
+	code, out, errOut := runHATest(t, d, "--cpi-config", path)
+	if code != exitOK || len(d.opened) != 1 || strings.Contains(out, "cluster other") {
+		t.Fatalf("code = %d, opened = %d\n%s\n%s", code, len(d.opened), out, errOut)
+	}
+}
+
 func TestRunHACPIConfigInputFailures(t *testing.T) {
 	t.Parallel()
-	for name, content := range map[string]string{
-		"yaml":       "cpis:\n- name: az1\n",
-		"no entries": `{"cpis":[]}`,
-		"no name":    `{"cpis":[{"properties":{}}]}`,
-		"duplicate":  `{"cpis":[{"name":"a"},{"name":"a"}]}`,
+	for name, tc := range map[string]struct{ content, hint string }{
+		"yaml":       {"cpis:\n- name: az1\n", "yq -o=json"},
+		"no entries": {`{"cpis":[]}`, "no cpis entries"},
+		"empty list": {`[]`, "no cpis entries"},
+		"no name":    {`{"cpis":[{"properties":{}}]}`, "has no name"},
+		"duplicate":  {`{"cpis":[{"name":"a"},{"name":"a"}]}`, "more than once"},
+		"not pve":    {`{"cpis":[{"name":"a","type":"vsphere"}]}`, "no cpis entry of type pve"},
+		"bad list":   {`{"cpis":{"name":"a"}}`, "not a list of entries"},
+		"bad array":  {`[1]`, "yq -o=json"},
+		"rendered":   {`{"host":"pve","node":"n1","vm_storage":"local-lvm"}`, "/var/vcap/jobs/pve_cpi/config/cpi.json"},
+		"no cpis":    {`{"other":1}`, "no cpis entries"},
 	} {
-		path := writeTemp(t, "cpi.json", content)
+		path := writeTemp(t, "cpi.json", tc.content)
 		code, _, errOut := runHATest(t, newHATestDeps(haCfg("auto", "none"), haBaseFake()), "--cpi-config", path)
-		if code != exitUsage || !strings.Contains(errOut, "pve-cid ha:") {
+		if code != exitUsage || !strings.Contains(errOut, "pve-cid ha:") || !strings.Contains(errOut, tc.hint) {
 			t.Errorf("%s: code = %d, stderr = %q", name, code, errOut)
 		}
 	}

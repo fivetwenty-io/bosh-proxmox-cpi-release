@@ -20,22 +20,35 @@ type cpiConfigEntry struct {
 	Properties map[string]any `json:"properties"`
 }
 
-// parseCPIConfig reads the cpis list of a cpi-config document. It accepts JSON
-// only, because the CLI carries no YAML parser; convert a YAML cpi-config with
-// "bosh int cpi-config.yml --path /cpis" or any YAML-to-JSON tool first.
+// haCPIType is the cpis entry type this CPI serves. An entry of any other type
+// belongs to another CPI, so the doctor neither probes nor compares it.
+const haCPIType = "pve"
+
+// cpiConfigRenderedKeys are top-level keys of the CPI's own rendered config,
+// /var/vcap/jobs/pve_cpi/config/cpi.json. A file that holds them and no cpis
+// list is that config, which --config takes.
+var cpiConfigRenderedKeys = []string{"host", "node", "vm_storage", "disk_storage", "user", "realm"}
+
+// parseCPIConfig reads the type: pve entries of a cpi-config document. It
+// accepts JSON only, because the CLI carries no YAML parser. The document is
+// either an object with a cpis list or the bare list. "bosh cpi-config" prints
+// YAML, so convert it first, for example with "yq -o=json . cpi-config.yml".
+// The rendered job config, /var/vcap/jobs/pve_cpi/config/cpi.json, is JSON as
+// well but holds the base config and no cpis, so --config takes it and this
+// flag refuses it. An entry whose type is not pve is dropped, and an entry
+// with no type counts as pve.
 func parseCPIConfig(data []byte) ([]cpiConfigEntry, error) {
-	var doc struct {
-		CPIs []cpiConfigEntry `json:"cpis"`
+	entries, err := decodeCPIEntries(data)
+	if err != nil {
+		return nil, err
 	}
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return nil, fmt.Errorf("the cpi-config file is not JSON with a cpis list (convert YAML to JSON first): %w", err)
-	}
-	if len(doc.CPIs) == 0 {
+	if len(entries) == 0 {
 		return nil, errors.New("the cpi-config file has no cpis entries")
 	}
 	seen := map[string]bool{}
-	for i := range doc.CPIs {
-		name := strings.TrimSpace(doc.CPIs[i].Name)
+	out := make([]cpiConfigEntry, 0, len(entries))
+	for i := range entries {
+		name := strings.TrimSpace(entries[i].Name)
 		if name == "" {
 			return nil, fmt.Errorf("cpis entry %d has no name", i+1)
 		}
@@ -43,9 +56,50 @@ func parseCPIConfig(data []byte) ([]cpiConfigEntry, error) {
 			return nil, fmt.Errorf("cpis entry name %q appears more than once", name)
 		}
 		seen[name] = true
-		doc.CPIs[i].Name = name
+		entries[i].Name = name
+		if kind := strings.TrimSpace(entries[i].Type); kind != "" && !strings.EqualFold(kind, haCPIType) {
+			continue
+		}
+		out = append(out, entries[i])
 	}
-	return doc.CPIs, nil
+	if len(out) == 0 {
+		return nil, fmt.Errorf("the cpi-config file has no cpis entry of type %s", haCPIType)
+	}
+	return out, nil
+}
+
+// decodeCPIEntries decodes the cpis list from either accepted document shape.
+func decodeCPIEntries(data []byte) ([]cpiConfigEntry, error) {
+	const notJSON = "the cpi-config file is not JSON with a cpis list (convert the YAML from \"bosh cpi-config\" first, " +
+		"for example with \"yq -o=json . cpi-config.yml\")"
+	trimmed := strings.TrimSpace(string(data))
+	if strings.HasPrefix(trimmed, "[") {
+		var list []cpiConfigEntry
+		if err := json.Unmarshal([]byte(trimmed), &list); err != nil {
+			return nil, fmt.Errorf("%s: %w", notJSON, err)
+		}
+		return list, nil
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &doc); err != nil {
+		return nil, fmt.Errorf("%s: %w", notJSON, err)
+	}
+	raw, ok := doc["cpis"]
+	if !ok {
+		for _, key := range cpiConfigRenderedKeys {
+			if _, rendered := doc[key]; rendered {
+				return nil, errors.New("the file is the CPI's own config (the rendered " +
+					"/var/vcap/jobs/pve_cpi/config/cpi.json), which --config takes; --cpi-config takes the Director's " +
+					"cpi-config as JSON with a cpis list")
+			}
+		}
+		return nil, errors.New("the cpi-config file has no cpis entries")
+	}
+	var list []cpiConfigEntry
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil, fmt.Errorf("the cpis value of the cpi-config file is not a list of entries: %w", err)
+	}
+	return list, nil
 }
 
 // haSharedFinding is a cross-cluster finding in the JSON output.

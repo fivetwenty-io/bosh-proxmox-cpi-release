@@ -24,6 +24,9 @@ const (
 	haOwnershipTag = "bosh-cpi"
 	// haManagedTag marks a VM the CPI registered with PVE HA.
 	haManagedTag = "bosh-ha-managed"
+	// haReplicaTag marks a VM that the replicate local policy set up a
+	// replication job for.
+	haReplicaTag = "bosh-ha-replica"
 	// haBirthTagPrefix starts the tag a create_vm writes until it finishes.
 	haBirthTagPrefix = "bosh-creating-"
 	// haMarkerPrefix opens the ownership marker in a rule, resource, or
@@ -45,7 +48,7 @@ var (
 	haVolumeGuestPattern = regexp.MustCompile(`^[^:]+:(?:[^/]+/)?vm-(\d+)-`)
 )
 
-// haHAState says whether a requested state leaves the guest running under HA.
+// haRunsUnderHA says whether a requested state leaves the guest running under HA.
 func haRunsUnderHA(state string) bool {
 	switch strings.ToLower(strings.TrimSpace(state)) {
 	case "", "started", "enabled":
@@ -144,6 +147,10 @@ type haCollector struct {
 	storagesOK  bool
 	jobs        []ha.ReplicaJobState
 	jobsOK      bool
+	jobStatus   map[string]ha.ReplicaSyncStatus
+	schedules   map[string]string
+	schedErr    error
+	awaiting    map[int]bool
 	journal     JournalView
 	journalOK   bool
 	memoryErr   error
@@ -156,7 +163,7 @@ func collectHA(ctx context.Context, r HAReader, cfg *config.CPIConfig, owner str
 	c := &haCollector{
 		ctx: ctx, r: r, cfg: cfg, owner: owner, now: now,
 		rep:    &haReport{Mode: cfg.HAModeValue(), Nodes: []haNode{}, CPUDomains: []haDomain{}, Findings: []haFinding{}},
-		byVMID: map[int]*haGuest{},
+		byVMID: map[int]*haGuest{}, jobStatus: map[string]ha.ReplicaSyncStatus{}, awaiting: map[int]bool{},
 	}
 	p, err := r.Profile(ctx)
 	if err != nil || p == nil {
@@ -253,13 +260,11 @@ func (c *haCollector) readResources() {
 func (c *haCollector) readRules() {
 	rules, err := c.r.Rules(c.ctx)
 	if err != nil {
+		why := "so rule problems, pins, and rule leftovers are unchecked"
 		if !c.p.RulesSupported {
-			c.rep.advise(haKindAdvice, "ha-rules",
-				"the HA rules could not be read, and the cluster does not report rule support (PVE 9.0 or later): %v", err)
-			c.rulesOK = true
-			return
+			why += " (the HA rules API needs PVE 9.0 or later, and a refused or timed-out read looks the same)"
 		}
-		c.rep.unchecked("ha-rules", "the HA rules could not be read, so rule problems and pins are unchecked: %v", err)
+		c.rep.unchecked("ha-rules", "the HA rules could not be read, %s: %v", why, err)
 		return
 	}
 	sort.Slice(rules, func(i, j int) bool { return rules[i].ID < rules[j].ID })
@@ -642,7 +647,8 @@ func (c *haCollector) cpuFindings() {
 				"CPU type %s on a cluster with %d CPU migration domains confines the VM's pin to %s; set pve.cpu_type to a named model to let it move",
 				cpu, len(c.p.CPUDomains), where)
 		}
-		if !c.off() && c.resourcesOK && g.resource == nil && (!known || len(dom.Nodes) < 2) {
+		if !c.off() && c.p.Effective != ha.EffectiveObserveOnly && c.resourcesOK && g.resource == nil && !c.inFlight(g) &&
+			(!known || len(dom.Nodes) < 2) {
 			why := "the CPU of node " + g.ref.Node + " is unknown"
 			if known {
 				why = fmt.Sprintf("its CPU migration domain holds %d node(s)", len(dom.Nodes))
@@ -735,7 +741,8 @@ func (c *haCollector) inFlight(g *haGuest) bool {
 }
 
 // birthTagAge is how old a birth tag must be before the sweep looks at its VM:
-// the create timeout plus the HA motion wait.
+// the create timeout plus the HA motion wait. A re-registration tag gets the
+// same allowance, because the order that writes it waits on the same motion.
 func (c *haCollector) birthTagAge() time.Duration {
 	return time.Duration(c.cfg.OperationTimeoutCreateSec()+c.cfg.HAMotionWaitSecValue()) * time.Second
 }
@@ -768,12 +775,12 @@ func (c *haCollector) replicates(vmid int, pin *ha.Rule) bool {
 	return false
 }
 
-// markedJobs returns the usable replication jobs that carry the CPI's marker
-// and are not being removed.
+// markedJobs returns the usable replication jobs that carry the CPI's marker,
+// are not being removed, and do not belong to another Director.
 func (c *haCollector) markedJobs() []ha.ReplicaJobState {
 	var out []ha.ReplicaJobState
 	for _, j := range c.jobs {
-		if j.Fault == "" && j.RemoveJob == "" && haJobMarker(j.Comment) {
+		if j.Fault == "" && j.RemoveJob == "" && haJobMarker(j.Comment) && !c.foreign(j.Comment) {
 			out = append(out, j)
 		}
 	}
@@ -784,21 +791,23 @@ func (c *haCollector) markedJobs() []ha.ReplicaJobState {
 // not recoverable, jobs that are stale or failing, replica volumes no job
 // covers, and the orphan copies a forced retirement recorded.
 func (c *haCollector) replicationFindings() {
-	c.jobHealth()
+	c.readReplicaStatuses()
 	c.recoveryState()
+	c.jobHealth()
 	c.orphanVolumes()
 	c.recordedCopies()
 }
 
-// jobHealth checks each CPI replication job's last sync and failure count.
-func (c *haCollector) jobHealth() {
+// readReplicaStatuses reads the schedule and the status of each CPI
+// replication job once, for the checks that judge a job's syncs.
+func (c *haCollector) readReplicaStatuses() {
 	if !c.jobsOK {
 		return
 	}
-	schedules, schedErr := c.r.ReplicationSchedules(c.ctx)
-	if schedErr != nil {
+	c.schedules, c.schedErr = c.r.ReplicationSchedules(c.ctx)
+	if c.schedErr != nil {
 		c.rep.unchecked("replication-schedules",
-			"the replication schedules could not be read, so stale syncs cannot be judged: %v", schedErr)
+			"the replication schedules could not be read, so stale syncs cannot be judged: %v", c.schedErr)
 	}
 	for _, j := range c.markedJobs() {
 		if j.Source == "" {
@@ -809,6 +818,20 @@ func (c *haCollector) jobHealth() {
 			c.rep.unchecked("job "+j.ID, "the status of replication job %s on %s could not be read: %v", j.ID, j.Source, err)
 			continue
 		}
+		c.jobStatus[j.ID] = st
+	}
+}
+
+// jobHealth checks each CPI replication job's last sync and failure count.
+func (c *haCollector) jobHealth() {
+	if !c.jobsOK {
+		return
+	}
+	for _, j := range c.markedJobs() {
+		st, ok := c.jobStatus[j.ID]
+		if !ok {
+			continue
+		}
 		if st.FailCount > 0 {
 			detail := fmt.Sprintf("replication job %s (%s to %s) has failed %d time(s) in a row", j.ID, j.Source, j.Target, st.FailCount)
 			if st.Error != "" {
@@ -816,14 +839,16 @@ func (c *haCollector) jobHealth() {
 			}
 			c.rep.problem(haKindReplicaJobFailing, "job "+j.ID, "%s", detail)
 		}
-		if schedErr != nil {
+		if c.schedErr != nil {
 			continue
 		}
-		schedule := schedules[j.ID]
+		schedule := c.schedules[j.ID]
 		interval, judged := scheduleInterval(schedule)
 		switch {
 		case st.LastSync.IsZero():
-			c.rep.advise(haKindReplicaJobStale, "job "+j.ID, "replication job %s has not completed a sync yet", j.ID)
+			if !c.awaiting[j.Guest] {
+				c.rep.advise(haKindReplicaJobStale, "job "+j.ID, "replication job %s has not completed a sync yet", j.ID)
+			}
 		case !judged:
 			c.rep.advise(haKindReplicaScheduleSkip, "job "+j.ID,
 				"the schedule %q of replication job %s is not one the doctor can measure staleness against", schedule, j.ID)
@@ -849,12 +874,10 @@ func (c *haCollector) journalRecord(vmid int) *aj.Record {
 	return nil
 }
 
-// recoveryState reports each replicate VM that runs on its partner, and each
-// that PVE could not yet recover from its partner.
-func (c *haCollector) recoveryState() {
-	if !c.guestsOK {
-		return
-	}
+// replicaVMs returns the VMIDs of the VMs that replicate: those a CPI-marked
+// job names, those whose journal record holds a live job, and those that carry
+// the replicate tag, so a VM whose job is gone is still found.
+func (c *haCollector) replicaVMs() []int {
 	vmids := map[int]bool{}
 	for _, j := range c.markedJobs() {
 		vmids[j.Guest] = true
@@ -865,12 +888,50 @@ func (c *haCollector) recoveryState() {
 			vmids[rep.Job.Guest] = true
 		}
 	}
+	for _, g := range c.guests {
+		if g.owned && !g.ref.Template && g.hasTag(haReplicaTag) {
+			vmids[g.ref.VMID] = true
+		}
+	}
 	ids := make([]int, 0, len(vmids))
 	for id := range vmids {
 		ids = append(ids, id)
 	}
 	sort.Ints(ids)
-	for _, id := range ids {
+	return ids
+}
+
+// liveJob returns the CPI-marked replication job of vmid that is still in use.
+func (c *haCollector) liveJob(vmid int) *ha.ReplicaJobState {
+	jobs := c.markedJobs()
+	for i := range jobs {
+		if jobs[i].Guest == vmid {
+			return &jobs[i]
+		}
+	}
+	return nil
+}
+
+// replicaTagged reports whether any CPI-owned VM carries the replicate tag.
+func (c *haCollector) replicaTagged() bool {
+	for _, g := range c.guests {
+		if g.owned && !g.ref.Template && g.hasTag(haReplicaTag) {
+			return true
+		}
+	}
+	return false
+}
+
+// recoveryState reports each replicate VM that runs on its partner, and each
+// that PVE could not yet recover from its partner. A VM whose job is still
+// working toward the sync that lets the CPI widen its pin is awaiting that
+// sync, which is advice, and only a VM with no job that can produce the sync,
+// or whose first sync is overdue, is not recoverable.
+func (c *haCollector) recoveryState() {
+	if !c.guestsOK {
+		return
+	}
+	for _, id := range c.replicaVMs() {
 		g, ok := c.byVMID[id]
 		if !ok {
 			continue
@@ -897,20 +958,93 @@ func (c *haCollector) recoveryState() {
 		if rec != nil {
 			recoverable = rec.Replication.Recoverable()
 		}
-		if !recoverable {
-			c.rep.problem(haKindReplicaNotRecover, g.sid,
-				"replicate VM %d is configured to replicate but is not yet recoverable: no verified sync covers its current volumes", id)
+		if recoverable || c.inFlight(g) || rec != nil && rec.Replication.Retired {
+			continue
+		}
+		c.notRecoverable(g, pin, rec)
+	}
+}
+
+// notRecoverable judges a replicate VM whose pin does not yet record a
+// verified replica. create_vm does not wait for the first sync, and the pin
+// widens on a later reboot_vm or set_vm_metadata once a sync that started
+// after the last volume change is verified, so a VM with a working job is only
+// awaiting that sync.
+func (c *haCollector) notRecoverable(g *haGuest, pin *ha.Rule, rec *aj.Record) {
+	id := g.ref.VMID
+	if !c.jobsOK {
+		return
+	}
+	job := c.liveJob(id)
+	switch {
+	case job == nil:
+		c.rep.problem(haKindReplicaNotRecover, g.sid,
+			"replicate VM %d is configured to replicate but no replication job the CPI marked exists for it, so no replica is kept", id)
+		return
+	case job.Disabled:
+		c.rep.problem(haKindReplicaNotRecover, g.sid,
+			"replicate VM %d is configured to replicate but its replication job %s is disabled, so no replica is kept", id, job.ID)
+		return
+	}
+	st, read := c.jobStatus[job.ID]
+	if !read {
+		return
+	}
+	changed, haveChange := c.volumeChange(pin, rec)
+	const widens = "; the pin widens to the partner on the next reboot_vm or set_vm_metadata call once a sync is verified"
+	switch {
+	case !st.LastSync.IsZero() && (!haveChange || st.LastSync.After(changed.Add(aj.ReplicaClockSkewTolerance))):
+		c.awaiting[id] = true
+		c.rep.advise(haKindReplicaAwaiting, g.sid,
+			"replicate VM %d: job %s synced at %s, but the pin does not yet name the partner as holding a replica%s",
+			id, job.ID, st.LastSync.UTC().Format(time.RFC3339), widens)
+	case c.firstSyncOverdue(job.ID, changed, haveChange):
+		c.rep.problem(haKindReplicaNotRecover, g.sid,
+			"replicate VM %d is configured to replicate but job %s has not completed a sync that started after the volume change at %s, "+
+				"more than twice its schedule since", id, job.ID, changed.UTC().Format(time.RFC3339))
+	default:
+		c.awaiting[id] = true
+		what := "has not completed its first sync"
+		if !st.LastSync.IsZero() {
+			what = "has not completed a sync that started after the last volume change"
+		}
+		c.rep.advise(haKindReplicaAwaiting, g.sid, "replicate VM %d is awaiting its first sync: job %s %s%s", id, job.ID, what, widens)
+	}
+}
+
+// volumeChange returns when the VM's volume set last changed, from the
+// journal record when it holds one and otherwise from the pin's token.
+func (c *haCollector) volumeChange(pin *ha.Rule, rec *aj.Record) (time.Time, bool) {
+	if rec != nil {
+		if set, ok := rec.Replication.LatestVolumeSet(); ok && !set.ChangedAt.IsZero() {
+			return set.ChangedAt, true
 		}
 	}
+	if pin != nil {
+		return ha.ReplicaChanged(pin.Comment)
+	}
+	return time.Time{}, false
+}
+
+// firstSyncOverdue reports whether a job still owes the sync that follows a
+// volume change, more than twice its schedule interval plus the clock-skew
+// tolerance after the change. A schedule the doctor cannot measure never
+// makes a job overdue.
+func (c *haCollector) firstSyncOverdue(jobID string, changed time.Time, haveChange bool) bool {
+	if !haveChange || c.schedErr != nil {
+		return false
+	}
+	interval, judged := scheduleInterval(c.schedules[jobID])
+	return judged && c.now.Sub(changed) > 2*interval+aj.ReplicaClockSkewTolerance
 }
 
 // orphanVolumes lists replica volumes that sit on a node other than their
 // VM's and that no replication job targets.
 func (c *haCollector) orphanVolumes() {
-	if !c.guestsOK || !c.storagesOK || !c.jobsOK || !c.journalOK && c.journal.Configured {
+	if !c.guestsOK || !c.storagesOK || !c.jobsOK {
 		return
 	}
-	want := c.cfg.HALocalPolicyValue() == config.HALocalPolicyReplicate || len(c.jobs) > 0
+	want := c.cfg.HALocalPolicyValue() == config.HALocalPolicyReplicate || len(c.jobs) > 0 || c.replicaTagged()
 	if !want {
 		return
 	}
@@ -982,7 +1116,7 @@ func (c *haCollector) recordedCopies() {
 		return
 	}
 	if !c.journal.Configured {
-		if len(c.markedJobs()) > 0 || c.cfg.HALocalPolicyValue() == config.HALocalPolicyReplicate {
+		if len(c.markedJobs()) > 0 || c.cfg.HALocalPolicyValue() == config.HALocalPolicyReplicate || c.replicaTagged() {
 			c.rep.advise(haKindReplicaNoJournal, "",
 				"no allocation journal is configured, so the orphan copies a forced retirement records are unchecked")
 		}
@@ -1142,10 +1276,10 @@ func (c *haCollector) guestLeftovers() {
 			}
 		}
 		for _, t := range g.tagsWithPrefix(ha.ReaddTagPrefix) {
-			if at, ok := ha.ReaddTagTime(t); ok {
+			if at, ok := ha.ReaddTagTime(t); ok && c.now.Sub(at) > c.birthTagAge() {
 				c.rep.problem(haKindReaddTag, g.sid,
-					"VM %d on %s has carried the re-registration tag %s since %s, so a re-registration did not finish",
-					g.ref.VMID, g.ref.Node, t, at.UTC().Format(time.RFC3339))
+					"VM %d on %s has carried the re-registration tag %s since %s, longer than the %s a re-registration is given, so it did not finish",
+					g.ref.VMID, g.ref.Node, t, at.UTC().Format(time.RFC3339), c.birthTagAge())
 			}
 		}
 		if c.resourcesOK && g.owned && g.hasTag(haManagedTag) && g.resource == nil {

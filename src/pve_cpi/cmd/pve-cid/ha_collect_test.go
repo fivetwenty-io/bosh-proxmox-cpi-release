@@ -210,10 +210,28 @@ func TestCollectRulesUnreadable(t *testing.T) {
 	f.rulesErr = errFake
 	r := runCollect(t, f, haCfg("auto", "none"))
 	want(t, r, haKindUnchecked, haSeverityProblem, "ha-rules")
+	if r.Problems() == 0 {
+		t.Fatalf("an unreadable rules list must fail the run: %+v", r.Findings)
+	}
+
+	// A cluster that reports no rule support reads the same: the listing
+	// failed, so the rules are unchecked, in every mode.
 	f.profile.RulesSupported = false
 	r = runCollect(t, f, haCfg("auto", "none"))
-	wantNone(t, r, haKindUnchecked)
-	want(t, r, haKindAdvice, haSeverityAdvice, "PVE 9.0")
+	want(t, r, haKindUnchecked, haSeverityProblem, "ha-rules", "PVE 9.0")
+	wantNone(t, r, haKindAdvice)
+
+	off := haBaseFake()
+	off.profile = haHealthyProfile("off")
+	off.profile.Effective = ha.EffectiveOff
+	off.resources = nil
+	off.rulesErr = errFake
+	off.profile.RulesSupported = false
+	r = runCollect(t, off, haCfg("off", "none"))
+	want(t, r, haKindUnchecked, haSeverityProblem, "ha-rules")
+	if r.Problems() == 0 {
+		t.Fatalf("mode off must still fail on an unreadable rules list: %+v", r.Findings)
+	}
 }
 
 func TestCollectPinMissingForLocalDiskVM(t *testing.T) {
@@ -299,6 +317,22 @@ func TestCollectCPUFindings(t *testing.T) {
 	want(t, r, haKindCPUDomainTooSmall, haSeverityProblem, "vm:100", "max", "1 node(s)")
 	want(t, r, haKindCPUHostMulti, haSeverityAdvice, "vm:100")
 
+	// An observe-only profile registers nothing, so the profile is the cause.
+	obs := haBaseFake()
+	obs.profile.Effective = ha.EffectiveObserveOnly
+	obs.profile.CPUDomains = f2.profile.CPUDomains
+	obs.resources = nil
+	obs.configs[100]["cpu"] = "max"
+	wantNone(t, runCollect(t, obs, haCfg("auto", "none")), haKindCPUDomainTooSmall)
+
+	// A create still running has not been registered yet.
+	young := haBaseFake()
+	young.profile.CPUDomains = f2.profile.CPUDomains
+	young.resources = nil
+	young.configs[100]["cpu"] = "max"
+	young.guests[0].Tags = "bosh-cpi;bosh-creating-" + itoa(int(haNow.Add(-time.Minute).Unix()))
+	wantNone(t, runCollect(t, young, haCfg("auto", "none")), haKindCPUDomainTooSmall)
+
 	// In mode off the CPI registers nothing, so a missing resource is expected.
 	f2.profile.Mode, f2.profile.Effective = "off", ha.EffectiveOff
 	wantNone(t, runCollect(t, f2, haCfg("off", "none")), haKindCPUDomainTooSmall)
@@ -364,7 +398,7 @@ func TestCollectReplicationHealthy(t *testing.T) {
 	}
 }
 
-func TestCollectReplicaOnPartnerAndNotRecoverable(t *testing.T) {
+func TestCollectReplicaOnPartnerAndAwaitingPinWidening(t *testing.T) {
 	t.Parallel()
 	f := replicaFake()
 	f.guests[1].Node = "n2"
@@ -373,14 +407,141 @@ func TestCollectReplicaOnPartnerAndNotRecoverable(t *testing.T) {
 	}}}}
 	r := runCollect(t, f, haCfg("auto", "replicate"))
 	want(t, r, haKindReplicaOnPartner, haSeverityProblem, "vm:101", "partner n2", "from n2 back to n1")
-	want(t, r, haKindReplicaNotRecover, haSeverityProblem, "vm:101", "not yet recoverable")
+	// The job has synced and the journal holds no verified sync yet, so the pin
+	// has not been widened: that is a wait for the next call, not a fault.
+	want(t, r, haKindReplicaAwaiting, haSeverityAdvice, "vm:101", "synced at", "reboot_vm or set_vm_metadata")
+	wantNone(t, r, haKindReplicaNotRecover)
 
-	// With no pin token and no journal proof, the VM is not recoverable either.
+	// With no pin token and no journal proof, the VM is awaiting the same way.
 	g := replicaFake()
 	g.rules = []ha.Rule{pinRule(101, haMarker, "n1", "n2")}
 	r = runCollect(t, g, haCfg("auto", "replicate"))
-	want(t, r, haKindReplicaNotRecover, haSeverityProblem, "vm:101")
-	wantNone(t, r, haKindReplicaOnPartner)
+	want(t, r, haKindReplicaAwaiting, haSeverityAdvice, "vm:101", "reboot_vm or set_vm_metadata")
+	wantNone(t, r, haKindReplicaNotRecover, haKindReplicaOnPartner, haKindReplicaJobStale)
+	if r.Problems() != 0 {
+		t.Fatalf("a healthy job awaiting its pin must not fail the run: %+v", r.Findings)
+	}
+}
+
+func TestCollectReplicaAwaitingFirstSync(t *testing.T) {
+	t.Parallel()
+	changed := haNow.Add(-time.Minute).Unix()
+	fresh := func() *fakeHA {
+		f := replicaFake()
+		f.rules = []ha.Rule{pinRule(101, haMarker+" "+ha.ReplicaChangedKey+"="+itoa(int(changed)), "n1")}
+		f.status["101-0"] = ha.ReplicaSyncStatus{}
+		return f
+	}
+	r := runCollect(t, fresh(), haCfg("auto", "replicate"))
+	want(t, r, haKindReplicaAwaiting, haSeverityAdvice, "vm:101", "awaiting its first sync", "101-0", "has not completed its first sync")
+	wantNone(t, r, haKindReplicaNotRecover, haKindReplicaJobStale)
+	// The source-only pin leaves headroom short, which is a separate fact.
+	for _, f := range r.Findings {
+		if f.Severity == haSeverityProblem && f.Kind != haKindHeadroomShort {
+			t.Fatalf("a new replicate VM must not fail the run: %+v", r.Findings)
+		}
+	}
+
+	// A sync that started before the volume change does not cover it.
+	f := fresh()
+	f.status["101-0"] = ha.ReplicaSyncStatus{LastSync: haNow.Add(-time.Hour)}
+	f.rules = []ha.Rule{pinRule(101, haMarker+" "+ha.ReplicaChangedKey+"="+itoa(int(changed)), "n1")}
+	r = runCollect(t, f, haCfg("auto", "replicate"))
+	want(t, r, haKindReplicaAwaiting, haSeverityAdvice, "vm:101", "after the last volume change")
+
+	// A first sync that is more than twice the schedule overdue is a fault.
+	old := haNow.Add(-time.Hour).Unix()
+	f = fresh()
+	f.rules = []ha.Rule{pinRule(101, haMarker+" "+ha.ReplicaChangedKey+"="+itoa(int(old)), "n1")}
+	r = runCollect(t, f, haCfg("auto", "replicate"))
+	want(t, r, haKindReplicaNotRecover, haSeverityProblem, "vm:101", "101-0", "more than twice its schedule")
+	wantNone(t, r, haKindReplicaAwaiting)
+	want(t, r, haKindReplicaJobStale, haSeverityAdvice, "101-0")
+
+	// A schedule the doctor cannot measure never makes the first sync overdue.
+	f = fresh()
+	f.rules = []ha.Rule{pinRule(101, haMarker+" "+ha.ReplicaChangedKey+"="+itoa(int(old)), "n1")}
+	f.schedules["101-0"] = "mon..fri 08:00"
+	wantNone(t, runCollect(t, f, haCfg("auto", "replicate")), haKindReplicaNotRecover)
+}
+
+func TestCollectReplicaTagFindsVMWithoutJob(t *testing.T) {
+	t.Parallel()
+	// The job is gone, so only the tag says the VM was meant to replicate.
+	f := replicaFake()
+	f.guests[1].Tags = "bosh-cpi;bosh-ha-managed;bosh-ha-replica"
+	f.jobs = nil
+	f.rules = []ha.Rule{pinRule(101, haMarker, "n1")}
+	r := runCollect(t, f, haCfg("auto", "replicate"))
+	want(t, r, haKindReplicaNotRecover, haSeverityProblem, "vm:101", "no replication job the CPI marked")
+
+	// A job row with a fault or a removal pending is no job.
+	for name, mutate := range map[string]func(*ha.ReplicaJobState){
+		"fault":   func(j *ha.ReplicaJobState) { j.Fault = "id listed twice" },
+		"removal": func(j *ha.ReplicaJobState) { j.RemoveJob = "full" },
+		"foreign": func(j *ha.ReplicaJobState) {
+			j.Comment = "bosh-cpi:v1 owner=aaaaaaaa-0000-0000-0000-000000000000 gen=1"
+		},
+	} {
+		g := replicaFake()
+		g.guests[1].Tags = "bosh-cpi;bosh-ha-managed;bosh-ha-replica"
+		g.rules = []ha.Rule{pinRule(101, haMarker, "n1")}
+		mutate(&g.jobs[0])
+		want(t, runCollect(t, g, haCfg("auto", "replicate")), haKindReplicaNotRecover, haSeverityProblem, "vm:101")
+		_ = name
+	}
+
+	// A create still in flight is not yet expected to have its job.
+	h := replicaFake()
+	h.guests[1].Tags = "bosh-cpi;bosh-ha-replica;bosh-creating-" + itoa(int(haNow.Add(-time.Minute).Unix()))
+	h.jobs = nil
+	wantNone(t, runCollect(t, h, haCfg("auto", "replicate")), haKindReplicaNotRecover)
+
+	// A disabled job produces no sync.
+	d := replicaFake()
+	d.guests[1].Tags = "bosh-cpi;bosh-ha-managed;bosh-ha-replica"
+	d.rules = []ha.Rule{pinRule(101, haMarker, "n1")}
+	d.jobs[0].Disabled = true
+	want(t, runCollect(t, d, haCfg("auto", "replicate")), haKindReplicaNotRecover, haSeverityProblem, "101-0", "disabled")
+
+	// An untagged VM, a tag on a VM the CPI did not create, and a recoverable
+	// tagged VM raise nothing.
+	u := replicaFake()
+	u.guests[1].Tags = "bosh-ha-replica"
+	u.jobs = nil
+	wantNone(t, runCollect(t, u, haCfg("auto", "replicate")), haKindReplicaNotRecover)
+	ok := replicaFake()
+	ok.guests[1].Tags = "bosh-cpi;bosh-ha-managed;bosh-ha-replica"
+	if r := runCollect(t, ok, haCfg("auto", "replicate")); len(r.Findings) != 0 {
+		t.Fatalf("a recoverable tagged VM = %+v, want no findings", r.Findings)
+	}
+}
+
+func TestCollectReplicaTagAloneEnablesVolumeScanAndJournalAdvice(t *testing.T) {
+	t.Parallel()
+	f := replicaFake()
+	f.guests[1].Tags = "bosh-cpi;bosh-ha-managed;bosh-ha-replica"
+	f.jobs = nil
+	f.rules = []ha.Rule{pinRule(101, haMarker+" "+ha.ReplicaPartnerKey+"=n2", "n1", "n2")}
+	f.journal = JournalView{}
+	r := runCollect(t, f, haCfg("auto", "none"))
+	want(t, r, haKindReplicaNoJournal, haSeverityAdvice)
+
+	f.journal = JournalView{Configured: true}
+	f.volumes = map[string]map[string]bool{"n2/local-zfs": {"local-zfs:vm-101-disk-0": true}}
+	r = runCollect(t, f, haCfg("auto", "none"))
+	want(t, r, haKindReplicaOrphanVolume, haSeverityProblem, "local-zfs:vm-101-disk-0")
+}
+
+func TestCollectForeignDirectorJobsAreIgnored(t *testing.T) {
+	t.Parallel()
+	f := replicaFake()
+	f.jobs[0].Comment = "bosh-cpi:v1 owner=aaaaaaaa-0000-0000-0000-000000000000 gen=1"
+	f.status["101-0"] = ha.ReplicaSyncStatus{LastSync: haNow.Add(-time.Hour), FailCount: 3}
+	r := runCollect(t, f, haCfg("auto", "replicate"))
+	wantNone(t, r, haKindReplicaJobFailing, haKindReplicaJobStale)
+	r = collectHA(context.Background(), f, haCfg("auto", "replicate"), "", haNow)
+	want(t, r, haKindReplicaJobFailing, haSeverityProblem, "101-0")
 }
 
 func TestCollectReplicaJobStaleFailingAndUnjudged(t *testing.T) {
@@ -535,8 +696,9 @@ func TestCollectLeftovers(t *testing.T) {
 		pve.GuestRef{VMID: 111, Node: "n1", Tags: "bosh-cpi;bosh-creating-" + itoa(int(fresh))},
 		pve.GuestRef{VMID: 112, Node: "n2", Tags: "bosh-cpi;bosh-ha-readd-" + itoa(int(stale))},
 		pve.GuestRef{VMID: 113, Node: "n3", Tags: "bosh-cpi;bosh-ha-managed"},
+		pve.GuestRef{VMID: 114, Node: "n3", Tags: "bosh-cpi;bosh-ha-readd-" + itoa(int(fresh))},
 	)
-	for _, id := range []int{110, 111, 112, 113} {
+	for _, id := range []int{110, 111, 112, 113, 114} {
 		f.memory[id] = haGiB
 		f.configs[id] = map[string]any{"cpu": "x86-64-v2-AES"}
 	}
@@ -549,6 +711,12 @@ func TestCollectLeftovers(t *testing.T) {
 	want(t, r, haKindResourceIgnored, haSeverityProblem, "vm:110")
 	want(t, r, haKindBirthTagStale, haSeverityProblem, "vm:110", "bosh-creating-")
 	want(t, r, haKindReaddTag, haSeverityProblem, "vm:112", "re-registration")
+	// A re-registration that started a minute ago is still running.
+	for _, f := range findings(r, haKindReaddTag) {
+		if f.Subject == "vm:114" {
+			t.Errorf("a young re-registration tag was reported: %+v", f)
+		}
+	}
 	want(t, r, haKindManagedNoResource, haSeverityProblem, "vm:113", "no HA resource")
 	wantNone(t, r, haKindOffModeResource, haKindOffModeRule)
 }
@@ -714,8 +882,12 @@ func TestReportTextCoversEveryFinding(t *testing.T) {
 	if !strings.Contains(out.String(), "none read") || !strings.Contains(out.String(), "  none") {
 		t.Fatalf("empty report = %s", out.String())
 	}
-	if nodeLine(haNode{Name: "x", Maintenance: true, Watchdog: "active", Version: "9", CPU: "c", Reason: "why"}) !=
-		"x offline placeable=no maintenance=yes watchdog=active pve=9 cpu=c (why)" {
-		t.Fatalf("node line = %q", nodeLine(haNode{Name: "x", Maintenance: true, Watchdog: "active", Version: "9", CPU: "c", Reason: "why"}))
+	// A node whose health was not built prints no placeable answer.
+	if got := nodeLine(haNode{Name: "x", Maintenance: true, Watchdog: "active", Version: "9", CPU: "c", Reason: "why"}); got !=
+		"x offline maintenance=yes watchdog=active pve=9 cpu=c (why)" {
+		t.Fatalf("node line = %q", got)
+	}
+	if got := nodeLine(haNode{Name: "y", Online: true, Health: "online"}); got != "y online health=online placeable=no" {
+		t.Fatalf("node line = %q", got)
 	}
 }

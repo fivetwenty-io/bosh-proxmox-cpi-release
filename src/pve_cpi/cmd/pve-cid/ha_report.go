@@ -35,6 +35,7 @@ const (
 	haKindLocalUnprotected    = "local_unprotected"
 	haKindReplicaOnPartner    = "replica_on_partner"
 	haKindReplicaNotRecover   = "replica_not_recoverable"
+	haKindReplicaAwaiting     = "replica_awaiting_sync"
 	haKindReplicaJobStale     = "replica_job_stale"
 	haKindReplicaJobFailing   = "replica_job_failing"
 	haKindReplicaScheduleSkip = "replica_schedule_unjudged"
@@ -192,7 +193,9 @@ func nodeLine(n haNode) string {
 	if n.Health != "" {
 		parts = append(parts, "health="+n.Health)
 	}
-	parts = append(parts, "placeable="+yesNo(n.Placeable))
+	if n.Health != "" {
+		parts = append(parts, "placeable="+yesNo(n.Placeable))
+	}
 	if n.Maintenance {
 		parts = append(parts, "maintenance=yes")
 	}

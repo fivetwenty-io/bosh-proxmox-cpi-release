@@ -60,8 +60,9 @@
 //	    running unprotected, replication state, stale tags, and objects that
 //	    outlive an off mode. --request applies the cpi_config properties of a
 //	    CPI request's context to the config first. --cpi-config reads a BOSH
-//	    cpi-config (JSON) and runs the same checks against every cpis entry,
-//	    then checks that clusters mounting one shared export do not overlap on
+//	    cpi-config converted to JSON and runs the same checks against every
+//	    cpis entry of type pve (it is not the rendered cpi.json, which --config
+//	    takes), then checks that clusters mounting one shared export do not overlap on
 //	    VMID bands or next-id ranges. It exits 1 when any problem is found.
 //
 // # Config resolution (locate, stemcells, ha)
