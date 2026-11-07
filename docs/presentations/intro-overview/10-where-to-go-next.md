@@ -34,7 +34,7 @@ layout: section
 
 - **Read the bands** — 100s are machines, 9000s are disks, 30000s are templates
 - **`bosh cloud-check`, then re-deploy** — retries are the design
-- **One healer per deployment** — decide which, deliberately
+- **Who recovers first** — Proxmox HA when it is on, the resurrector as the fallback
 
 # Questions
 

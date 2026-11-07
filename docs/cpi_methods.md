@@ -153,7 +153,7 @@ A VMID is allocated from `[vmid_range_start, vmid_range_end]` (default: `[100, 8
 - Each object has a single field: `address` (String) — the PCI device address in `DDDD:BB:SS.F` format (e.g. `"0000:01:00.0"`), matching the address the PVE node's hardware PCI list reports.
 - The CPI validates all addresses before creating any VM resource. An invalid or empty address is a non-retriable error.
 - At placement time, the CPI restricts candidate nodes to those that expose all requested addresses via `/nodes/{node}/hardware/pci`.
-- A strict single-node HA pin (`bosh-na-<vmid>`) is applied automatically to prevent live migration, which is incompatible with PCI passthrough. This pin is applied regardless of whether `pve.ha.pin_az` is set, and only when `pve.ha.mode` is `auto` or `managed`.
+- Live migration is incompatible with PCI passthrough, so a VM with a PCI device stays out of PVE HA under the default `pve.ha.local_policy: none`. Under `hold`, and only when `pve.ha.mode` is `auto` or `managed`, the CPI registers the VM with a strict single-node pin (`bosh-na-<vmid>`). Earlier releases pinned every PCI VM without any key.
 - The host must have IOMMU enabled. IOMMU group isolation is the operator's responsibility; the CPI does not validate group boundaries.
 
 **Router/NAT VMs:** Two `cloud_properties` fields support VMs that forward traffic between networks:
@@ -183,7 +183,7 @@ Every VM is also created with `serial0=socket`, adding a virtual serial console.
 
 **Health gate:** When `pve.health_check.enabled` is `true`, `create_vm` polls for an agent response before returning. `pve.health_check.timeout_sec` controls the poll timeout. If the agent does not respond in time, the VM is destroyed via the standard rollback path.
 
-**Placement:** The CPI selects a node using AZ map, anti-affinity scoring, DLB integration, and post-selection fallback. When `pve.ha.pin_az` is `on`, a PVE HA node-affinity rule (`bosh-na-{vmid}`) pins the VM to its AZ node set, surviving DLB rebalance and HA failover. See [dlb-aware-placement.md](dlb-aware-placement.md) and [configuration.md](configuration.md) for tuning options.
+**Placement:** The CPI selects a node using AZ map, anti-affinity scoring, DLB integration, and post-selection fallback. When `pve.ha.mode` is `auto` or `managed`, the CPI decides whether the VM can run under PVE HA from its volumes, its devices, and the cluster profile. It registers a VM that passes as an HA resource in the `ignored` state, writes a node-affinity pin (`bosh-na-<vmid>`) and any anti-affinity rule, reads them back, and only then requests `started`. The pin carries the VM's AZ node set when `pve.ha.pin_az` allows it, and it survives DLB rebalance and HA failover. With `pve.ha.headroom` set to `warn` or `enforce`, placement also checks, as an estimate, that the surviving nodes could absorb the HA VMs of any one node that fails. For a `replicate` VM, the call requests the first replication sync and returns without waiting for it. See [HA and Resurrection](ha-and-resurrection.md), [dlb-aware-placement.md](dlb-aware-placement.md), and [configuration.md](configuration.md) for tuning options.
 
 **Failure inspection:** `pve.debug.keep_failed_vms=true` preserves the VM and skips rollback on `create_vm` failure, for operator inspection. When PVE HA started the VM on another node before the create failed, the `bosh-create-failed` tag and the call's error name the node the VM runs on now. When the CPI cannot prove that node, it logs a warning and tags the node the create last placed the VM on, so the tag may be missing.
 
@@ -204,6 +204,8 @@ Every VM is also created with `serial0=socket`, adding a virtual serial console.
 **Returns:** `null`
 
 **Errors:** `Bosh::Clouds::CloudError` if deletion is not certain (to prevent orphaned VMs)
+
+**HA gate:** Before it stops anything, `delete_vm` reads the VM's PVE HA state. While PVE HA is fencing the VM, recovering it, or moving it, the call returns a retriable error that names the state, so the BOSH resurrector cannot tear down a guest that PVE HA is about to restart. A service in `recovery` gets a grace window of `pve.ha.motion_wait_sec`, after which the CPI can finish the delete itself for a legacy VM on shared storage. A resource in the `error` state is cleared before the stop. The table in [HA and Resurrection](ha-and-resurrection.md#when-delete_vm-defers) lists each state, and [Operations](operations.md#when-delete_vm-defers) gives the runbook. A `replicate` VM's replication job is retired before the destroy. With `pve.ha.mode` at `off`, the call still handles a VM that is already HA-managed.
 
 **Notes:** Stops the VM if running, then destroys it. Two destroy paths are available:
 
@@ -262,7 +264,7 @@ flowchart TD
 
 **Errors:** `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** Used by the BOSH cloudcheck tool to detect orphaned or missing VMs.
+**Notes:** Used by the BOSH cloudcheck tool to detect orphaned or missing VMs. The call never answers `false` for a VM that PVE HA is fencing or recovering. It answers `false` only after an absence proof, which takes two clean sweeps of every online node, finds no HA resource or cluster resource manager service for the VMID, and finds no open allocation journal record that places the VMID on a node the sweeps had to skip. When the CPI cannot prove absence, it returns a retriable error.
 
 ---
 
@@ -284,6 +286,8 @@ flowchart TD
 - **hard**: issues an immediate hard reset (power cycle) with no grace period. This was the only behavior before the `reboot_mode` option was introduced.
 
 If the VM is stopped when `reboot_vm` is called, the CPI starts it so the VM ends up running, matching the BOSH expectation. The BOSH wire contract is unchanged: `reboot_vm` accepts only `vm_cid`.
+
+For a VM under PVE HA, `reboot_vm` waits out VM motion before it acts and follows a VM that moved to another node. A `replicate` VM whose pin still names its own node alone is checked again here, and the pin widens once a verified sync exists. When the VM's HA resource is in the `error` state and the VM runs, the call clears the error without stopping the guest, by removing the resource and registering it again, as [HA and Resurrection](ha-and-resurrection.md#clearing-an-ha-error) describes. Without `Sys.Console` it returns a retriable error that names the `ha-manager` commands to run by hand.
 
 ---
 

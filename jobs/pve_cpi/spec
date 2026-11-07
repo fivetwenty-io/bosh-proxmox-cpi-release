@@ -477,6 +477,21 @@ properties:
       onward; for hardware older than that baseline, use the cluster's
       lowest-common-denominator named model.
 
+      HA guidance: with pve.ha.mode set to "auto" or "managed", a VM whose
+      cpu type is "host" or "max" can be moved by HA only to nodes that report
+      the same CPU model and the same flags, which the CPI calls the VM's CPU
+      migration domain. On a cluster of identical nodes the domain is the whole
+      cluster and "host" loses nothing. When the domain leaves fewer than two
+      placeable nodes, "auto" gives the VM no HA and logs a warning that names
+      this key, and "managed" fails the call. Set this key to the newest named
+      model that every node of the cluster supports, such as "x86-64-v3" or
+      "Cascadelake-Server", with "x86-64-v2-AES" as the floor, and a VM with a
+      named model keeps the full set of nodes. HA never moves a VM between
+      clusters, so CPU differences between AZ clusters do not matter. Nodes of
+      one generation with different SKUs form separate domains, which a named
+      model joins. The command "pve-cid ha" lists the cluster's CPU migration
+      domains.
+
       Precedence (highest wins): cloud_properties.cpu_type (per-instance-group,
       resolved through the same call/disk_type/vm_type layered resolver as
       other create_vm knobs; the "pve-default" sentinel works there too) >
@@ -713,6 +728,12 @@ properties:
       disjoint per-CPI VMID banding instead -- orphaned own-cluster volumes
       then accumulate and are visible to scripts/disk-audit rather than
       being swept automatically.
+
+      Whatever this key says, the CPI sends the destroy with the sweep off
+      while the node it talks to sees an enabled images storage that is
+      shared, and also when it cannot list that node's storages. The first
+      time that happens in a process the CPI logs a warning that names this
+      key, and later suppressions log at debug level.
 
       Overridable per cpi-config entry as
       pve_destroy_unreferenced_disks. An entry that targets another PVE

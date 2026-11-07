@@ -30,7 +30,7 @@ flowchart LR
 - We propose splitting it: Sys.Audit comes from the built-in PVEAuditor role on /, so BoshOperator stays focused on VM and storage mutation only.
 - The one irreducible cost: delete_vm's skiplock flag (clears locked/running VMs) is gated by PVE to the literal root@pam user — no role or ACL can grant it; a least-privilege bosh@pve will still work on unlocked VMs, just fail on locked ones.
 - privsep=0 is safe here because the token inherits a user whose ACL is already minimal — the same setting on a root@pam token is full datacenter admin. Same knob, different trust boundary.
-- Bridge-only, no-HA deployments need just VM.* + Datastore.*; SDN.Allocate and Sys.Console stay opt-in for SDN and HA-placement features.
+- Bridge-only, no-HA deployments need just VM.* + Datastore.*; SDN.Allocate stays opt-in for SDN, and the HA features add their own privileges in two tiers, which docs/pve-api-permissions.md lists.
 - Gotcha worth pre-empting: import-from's volume form is ACL-gated but NOT root-restricted; only the filesystem path form is root-only, and we will never use it — so stemcell upload will work under least privilege.
 -->
 

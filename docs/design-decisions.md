@@ -18,7 +18,7 @@ This is the operator-facing record of the design decisions behind the pre-releas
 | D8 | Copy-vs-move / storage identity | Full backing-identity normalization: two storage IDs pointing at the same export are recognized as the same storage at every point the CPI compares two storage identities |
 | D9 | Cross-cluster delete safety | `pve.destroy_unreferenced_disks` now defaults to `false` |
 | D10 | qcow2 deletion policy | `:light:` files are never deleted by the CPI; `:heavy:` files are deleted only at the last director reference within a cluster, except under a cpi-config entry on shared storage, where the file is kept |
-| D11 | HA versus the BOSH resurrector | An active, once-per-process warning plus a dedicated ownership doc; no change to `has_vm` behavior |
+| D11 | HA versus the BOSH resurrector | PVE HA is the first responder and the resurrector is the fallback. The CPI defers `delete_vm`, proves absence in `has_vm`, and guards `attach_disk` while PVE HA fences or recovers a VM |
 | D12 | Per-request cloud-property overrides | BOSH's nested cpi-config context flattened into a closed `pve_*` override registry, with every overridable field in the client-bundle cache key |
 | D13 | Stable disk identity and ownership transfer | A drive `serial=` token becomes the disk's stable identity; ownership transfers by `move_disk` reassignment; the envelope volid becomes a birth record with legacy fallback forever |
 | D14 | Upload node targeting | Address the node, no direct dial |
@@ -209,6 +209,8 @@ Both were already anticipated in the pre-existing per-NIC design; the bridge-mod
 
 **A companion fix.** The VMID-allocation-time storage scan (`WithStorageScan`, which prevents a *new* allocation from colliding with a foreign cluster's existing volumes) previously covered only the VM-storage and disk-storage pools. It now also covers parker-VM allocation (the `detached_disk_strategy: parked` band) and the ISO-storage pool, closing two allocation-time gaps that mirrored the same underlying hazard.
 
+**A later hardening.** The default alone left two gaps, because an operator could still set the key to `true` on storage that a second cluster reaches, and a volume delete could still name a volume that another cluster owns. The client now sends every destroy with the sweep off while the node sees an enabled images storage that is shared, or when it cannot list that node's storages, whatever the key says. It also refuses to delete a volume on shared storage whose owner ID lies outside every VMID band of the cluster or whose name carries another namespace's allocation locator, and allocation reserves the ID of every config-drive ISO it finds. See [Multi-Cluster Deployments](multi-cluster.md#shared-storage-rules).
+
 **Operator-visible consequences.** Single-cluster deployments that relied on the automatic orphan-volume sweep at delete time must now either set `pve.destroy_unreferenced_disks: true` explicitly, or rely on `scripts/disk-audit` for the class of orphan volumes that are no longer swept automatically. Multi-cluster and shared-storage deployments are protected by default with no configuration required.
 
 **Migration.** If you run a genuinely single-cluster deployment and want the previous automatic-sweep behavior back, set `pve.destroy_unreferenced_disks: true` explicitly after confirming your storage pools are not shared with anything else that allocates VMIDs. See [Multi-Cluster Deployments](multi-cluster.md) for the full shared-storage guidance.
@@ -233,15 +235,15 @@ There is one exception to the `:heavy:` rule. When a `delete_stemcell` request c
 
 ## D11: HA versus the BOSH resurrector, warn, document, and race-test
 
-**Context.** PVE HA and the BOSH resurrector can independently detect the same stopped guest and both try to recover it, which produces a duplicate VM that conflicts on IP address, VMID, or agent credentials. The CPI has no API surface to read or control the resurrector's state, so this was previously documented in [DLB-Aware Placement](dlb-aware-placement.md) but entirely unenforced, since an operator who enabled DLB or an HA-rules feature without separately remembering to disable the resurrector got no signal from the CPI at all.
+**Context.** PVE HA and the BOSH resurrector can independently detect the same stopped guest and both try to recover it, which produces a duplicate VM that conflicts on IP address, VMID, or agent credentials. The CPI has no API surface to read or control the resurrector's state. The first answer to this was a warning and a document, which told operators to turn the resurrector off for any deployment that used an HA feature.
 
-**Options considered.** Have the CPI attempt to detect or control resurrector state (rejected because no PVE-API-only mechanism exists for this and the CPI has no shell access to the Director); document only, with no runtime signal (the status quo, which is easy to miss); an active, once-per-process warning plus a dedicated ownership-matrix document plus a live node-kill race test in the validation matrix.
+**Options considered.** Keep the warning and the document, and leave the two systems to race (the status quo, which relies on the operator remembering a Director setting the CPI cannot see). Have the CPI attempt to detect or control resurrector state (rejected because no PVE-API-only mechanism exists for this, and the CPI has no shell access to the Director). Let the CPI coordinate from its own side, so that both systems can stay on, with PVE HA as the first responder and the resurrector as the fallback.
 
-**Chosen: the active warning plus documentation.** `create_vm` now logs one warning per CPI process the first time any HA-registration feature (`pve.ha.dlb`, `pve.ha.anti_affinity`, `pve.ha.pin_az`) is active for a VM, naming `bosh update-resurrection off` as the fix. `has_vm` semantics are unchanged. Reporting a VM as present based on cluster-wide visibility, even on a node that has gone unresponsive, remains the deliberate, fail-toward-retry behavior. See [HA and Resurrection](ha-and-resurrection.md) for the full ownership matrix and the reasoning.
+**Chosen: coordinate from the CPI side.** The CPI reads the VM's HA state, which is the cluster resource manager's service state and the resource's requested state, and it acts on that state in the three calls the resurrector makes. `has_vm` never answers false for a VM in fence or recovery, and it answers false only after an absence proof of two clean sweeps of every online node. `delete_vm` defers with a retriable error while PVE HA is fencing or recovering the VM, waits for motion that is in flight, and hands the VM to BOSH only after a grace window of `pve.ha.motion_wait_sec` for a service stuck in `recovery`. `attach_disk` refuses a second holder of a disk while the first holder is in fence or recovery. Operators no longer need to turn the resurrector off, and we recommend an `agent_timeout` of 240 seconds or more so that PVE HA finishes most recoveries first. The once-per-process warning in `create_vm` remains in the code, and its text still advises turning the resurrector off. That advice is withdrawn, and the warning is stale. See [HA and Resurrection](ha-and-resurrection.md) for the ownership model, the defer table, and the reasoning.
 
-**Operator-visible consequences.** The first HA-registered `create_vm` in a CPI process's lifetime produces a clear, actionable warning in the CPI log. See [HA and Resurrection](ha-and-resurrection.md) for the complete ownership model, the double-healing race in detail, and remediation.
+**Operator-visible consequences.** A `delete_vm` for a VM that PVE HA is recovering fails the task with a retriable error that says what it is waiting for, and the Health Monitor asks again on its next cycle. If many instances defer at once, the Health Monitor's meltdown limit can stop resurrection for the whole deployment, so [Operations](operations.md#when-delete_vm-defers) gives a runbook for resolving a defer.
 
-**Migration.** None, because this is warn-only and does not change `create_vm`'s or `has_vm`'s success/failure outcomes.
+**Migration.** None for a deployment that leaves `pve.ha.mode` at `off`. A deployment that turned the resurrector off for HA can turn it back on.
 
 ---
 
@@ -370,9 +372,6 @@ A few adjacent ideas were explicitly weighed and rejected for this pass:
 
 - **Cross-cluster distributed refcounting** (a sidecar file or external coordination layer tracking stemcell references across independent PVE clusters)
   We rejected this. Per-cluster reference sets (D3) are sufficient given `:light:`/`:heavy:` self-healing (D10); a distributed refcounting layer would add an external dependency for a problem the cutover already solves at the file level.
-
-- **HA-aware `has_vm`** (consulting PVE HA status to distinguish "genuinely gone" from "HA is mid-recovery")
-  We rejected this. See [HA and Resurrection](ha-and-resurrection.md) for why fail-toward-retry is the correct default without it.
 
 - **Multi-node `create_network` bridge provisioning**
   The bridge-creation path remains single-node only, and `managed: false` against a pre-provisioned bridge is the documented multi-node pattern (see [Networks](networks.md)).

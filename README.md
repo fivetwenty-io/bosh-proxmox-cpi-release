@@ -14,6 +14,9 @@ Naming note: this release was named `bosh-pve-cpi` through v0.4.0 and continues 
 
 - API token or password authentication; TLS verification on by default
 
+- [PVE HA integration](docs/ha-and-resurrection.md)
+  Opt-in registration of BOSH VMs with PVE HA through the `pve.ha` block, with PVE HA recovering first and the BOSH resurrector as the fallback, plus a read-only `pve-cid ha` doctor
+
 - [Light stemcells](docs/light-stemcells.md)
   Pre-uploaded or CPI-fetched qcow2 images, with no director-side re-upload on redeploy
 
@@ -113,12 +116,17 @@ The CPI exposes properties under the `pve.*` and `agent.*` namespaces. The most 
 | `pve.balloon` | Memory ballooning (`"0"` disables the balloon device; a MiB floor enables auto-ballooning; `pve-default` restores PVE's default) | `"0"` |
 | `pve.network_mode` | Managed-network mode (`bridge`, `sdn`, `auto`) | `bridge` |
 | `pve.agent_mode` | Agent bootstrap mode (`cloudinit`, `noagent`, `auto`) | `cloudinit` |
+| `pve.ha.mode` | PVE HA integration (`off`, `auto`, `managed`); the rest of the `pve.ha` block applies only when this is `auto` or `managed` | `off` |
 
 The full table covers the remaining properties, including SDN zone management, snapshot guards, hotplug flags, reboot strategy, VMID allocation range, detached-disk lifecycle strategy, and the `agent.*` mbus fallback. See the [configuration reference](docs/configuration.md).
 
 ## Multi-CPI usage (multi-AZ / multiple PVE clusters)
 
 A single BOSH Director can register multiple named `type: pve` cpi-config entries, one per PVE cluster. Each availability zone then gets its own independent cluster, with no release code change and no extra job colocation. The [Multi-Cluster Deployments](docs/multi-cluster.md) guide covers the cpi-config walkthrough, AZ-to-CPI binding, stemcell registration across entries, and a worked `cpi-config.yml` example. It also covers disjoint VMID banding, the safety pattern that keeps two clusters with shared storage from corrupting each other's data, and the AZ-reassignment trap to avoid.
+
+## PVE HA
+
+The `pve.ha` block is off by default. With `pve.ha.mode` set to `auto` or `managed`, the CPI registers each VM that PVE can recover with PVE HA, writes its node pin and anti-affinity rules, and can hand it to the PVE 9.2 Dynamic Load Balancer. PVE HA then recovers first, and the BOSH resurrector is the fallback. The CPI refuses to write HA state on a cluster that would lose quorum after one node fails, so a two-node cluster needs a QDevice. The nine `pve.placement` keys that earlier releases used for HA are removed, and a manifest that still sets one fails to render with the replacement named. [HA and Resurrection](docs/ha-and-resurrection.md) is the guide, [Operations](docs/operations.md#pve-ha) holds the procedures, and `pve-cid ha` reads a cluster's HA state without changing it.
 
 ## Operations
 

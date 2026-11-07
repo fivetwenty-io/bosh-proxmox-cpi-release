@@ -1,123 +1,371 @@
 # HA and Resurrection
 
-Two independent systems can restart a BOSH-managed VM that has stopped responding: PVE HA at the cluster level, and the BOSH resurrector at the Director level. Run both against the same VM and they race each other, producing a duplicate guest. This document defines who owns recovery by default, describes the race in detail, and covers the guard rail the CPI provides plus how to safely opt into PVE HA ownership instead.
+Two systems can restart a BOSH-managed VM that has stopped responding. PVE HA works at the cluster level, and the BOSH resurrector works at the Director level. This page explains who recovers a VM in each configuration, how the CPI keeps the two from fighting, what the CPI needs from the cluster before it hands a VM to PVE HA, and what we can and cannot promise about data when a node fails.
 
-## Ownership model
+For the property reference, see [Configuration, HA](configuration.md#ha). For the commands and procedures an operator runs, see [Operations, PVE HA](operations.md#pve-ha).
 
-| | Recovery owner | VM registered in PVE `ha-manager`? | What you do |
+## Who recovers a VM
+
+PVE HA is the first responder for every VM it manages, and the BOSH resurrector stays on as the fallback. The CPI defers `delete_vm` while PVE HA is fencing or recovering a VM, so the resurrector cannot tear down a guest that PVE HA is about to restart. We no longer ask operators to turn the resurrector off.
+
+| Mode | VM state | First responder | Fallback |
 |---|---|---|---|
-| **Default (zero-config)** | BOSH resurrector | No | Nothing, so leave the resurrector on (the Director default) |
-| **Opt-in (any HA-registration feature active)** | PVE HA | Yes | Disable the resurrector for that deployment: `bosh update-resurrection off` |
+| `off` | Any | BOSH resurrector, once the VM's node is back or an operator has moved the config | None |
+| `auto` or `managed` | Not HA-managed, such as local volumes with `local_policy: none`, or a cluster that failed a prerequisite | BOSH resurrector, once the VM's node is back or an operator has moved the config | None |
+| `auto` or `managed` | HA-managed, shared volumes | PVE HA | BOSH resurrector, when HA puts the VM in `error` or leaves it in recovery past the grace window |
+| `auto` or `managed` | HA-managed with `hold` | PVE HA, restart in place only | Operator, because the disks cannot leave the node |
+| `auto` or `managed` | HA-managed with `replicate` | PVE HA, onto the partner node | BOSH resurrector, when HA puts the VM in `error` or leaves it in recovery past the grace window |
 
-With a stock configuration, where `pve.ha.mode` is left at `off`, the CPI never registers a VM as a PVE HA resource. Zero HA API calls are made. The BOSH resurrector is the sole recovery mechanism, so this is the correct, zero-configuration default, and we leave resurrection on.
+With a stock configuration, where `pve.ha.mode` stays at `off`, the CPI never registers a VM as a PVE HA resource. The BOSH resurrector is the only recovery mechanism, and it works as it always has. The CPI still reads HA state in that mode where doing so is safer, and it still handles a VM that is already HA-managed correctly when BOSH deletes or reboots it, because PVE routes a stop or a destroy of an HA-managed VM through its HA manager whatever the CPI's mode is.
 
-Setting `pve.ha.mode` to `auto` or `managed` opts VMs into PVE HA. At each `create_vm` the CPI decides whether the VM can run under HA, from its volumes, its devices, and what the cluster profile allows. Under the default `pve.ha.local_policy: none`, a VM with a node-local volume or a PCI passthrough device stays out of HA. Under `pve.ha.local_policy: hold`, such a VM is registered and gets a strict pin to the one node that holds its volumes, so HA restarts it in place and never moves it. A VM that HA would hold on node-local storage gets a full clone, including when a storage plan places its root disk, because a linked clone's base template stays on one node. An explicit `clone_mode: linked` keeps the linked clone and runs the VM without HA in `auto` mode, or fails `create_vm` in `managed` mode, and so does a recorded storage plan that already chose a linked clone there. Every VM the decision registers gets a node-affinity pin named `bosh-na-<vmid>` and the `bosh-ha-managed` tag. Three configuration knobs shape what the CPI writes for a registered VM:
+Setting `pve.ha.mode` to `auto` or `managed` opts VMs into PVE HA. The two modes differ only in how they treat a gap. In `auto` the CPI probes the cluster, does exactly what it can safely do, and falls back to a smaller set of features with a log line when a probe fails or a prerequisite is missing. In `managed` the same probe turns a gap into an error, which suits operators who would rather see a failed deploy than an unprotected VM.
 
-- `pve.ha.dlb` (Dynamic Load Balancer rebalancing); see [DLB-Aware Placement](dlb-aware-placement.md)
-- `placement.anti_affinity.enabled` with `pve.ha.anti_affinity` at its default of `auto`, or `on` (PVE-enforced negative affinity between instance-group members)
-- `pve.ha.pin_az` at its default of `auto`, or `on`, with a non-empty `placement.az_map` (a hard or preferred node-affinity pin keeping a VM's AZ durable across HA failover)
+### What the CPI registers
 
-Each one needs `pve.ha.mode` set to `auto` or `managed`. Under `off` the CPI affects no VM through HA, and a `create_vm` in the DLB sentinel AZ fails instead of creating a VM that nothing manages. The release removed the earlier `pve.placement` keys for these features, and [Removed placement keys](configuration.md#removed-placement-keys) maps each one to its replacement.
+At each `create_vm` the CPI decides whether the VM can run under HA, from its volumes, its devices, and what the cluster profile allows. A VM it registers gets these things.
 
-Once a VM is registered in `ha-manager`, **you must disable the BOSH resurrector for that deployment**, via `bosh update-resurrection off` or `resurrector_enabled: false` in the Director manifest.
+- **An HA resource**
 
-### Two prerequisites that are easy to miss
+  The CPI adds the resource as `ignored`, so PVE HA does not start the VM before its confinement exists. It writes the pin and any anti-affinity rule, reads them back, and only then requests `started`. The `bosh-ha-managed` tag marks the VM.
 
-**`pve.ha.pin_az` also needs `cloud_properties.availability_zone`, and `az_map` spreads VMs only across the nodes inside one AZ.** On Proxmox an AZ is a separate cluster or a standalone host, reached through its own cpi-config entry. The `az_map` in this document is secondary to that binding, because it spreads VMs across the nodes of one AZ's cluster. See [Multi-Cluster Deployments](multi-cluster.md#per-entry-placement-and-node-spreading) for the model and for the per-entry copy of the placement block. BOSH does not pass the cloud-config AZ *name* to `create_vm`, since an AZ block selects which CPI runs and which subnet the VM gets. The CPI therefore learns a VM's AZ only from `cloud_properties.availability_zone`, and it must name an AZ that appears in `placement.az_map`. We put that property on the AZ's `cloud_properties` so that every VM in the AZ receives it, and a `vm_type` can set it too. Setting `pve.ha.pin_az` and `az_map` without it yields no AZ pin, because the CPI cannot tell which AZ the VM is in. A registered VM then gets a pin that holds every node it may run on, and nothing keeps it inside its AZ. When `pve.ha.pin_az` is `on`, the CPI warns once per VM that it could not pin to an AZ:
+- **A node-affinity pin**
 
-> `create_vm: HA node-affinity pin is enabled but this VM was not pinned to an AZ — no availability_zone resolved for the placed node; BOSH does not pass the cloud-config AZ name to the CPI, so each cloud-config AZ needs cloud_properties.availability_zone naming a key of placement.az_map, and BOSH merges an AZ's cloud_properties into every VM in that AZ ...`
+  The rule `bosh-na-<vmid>` holds every node the VM may run on, and its comment records the storages of the VM's volumes. When nothing constrains the VM, the pin is not strict. When the VM's volumes, its CPU type, a PCI device, or a strict AZ narrow the nodes, the pin is strict and names only the nodes that remain.
 
-The CPI's full message goes on to list the other ways a VM can reach this warning, such as a `target_node`, a local-disk pin, or the `node` fallback placing it outside its requested AZ.
+- **An ownership marker**
 
-A minimal AZ that carries it:
+  Every rule and resource the CPI writes carries a marker in its comment with the Director's UUID. The CPI edits or deletes only objects whose marker matches its own Director, so an operator's resource or another Director's stays untouched.
 
-```yaml
-azs:
-- name: z1
-  cpi: pve-cluster-a
-  cloud_properties:
-    availability_zone: z1   # must be a key in pve.placement.az_map
+- **An anti-affinity rule, when it applies**
+
+  With `placement.anti_affinity.enabled` and `pve.ha.anti_affinity` at `auto` or `on`, the members of an instance group join a negative resource-affinity rule named `bosh-aa-<hash12>`. The hash covers the Director UUID, the deployment, and the instance group, so two deployments that both have a `router` group never share a rule.
+
+Each VM gets at most one node-affinity rule, because PVE disables both rules when one resource appears in two of them. The CPI builds that one rule from every node constraint that applies. The constraints that remove nodes are hard, and they make the rule strict. The constraints that only express a preference become priorities inside the rule, so a preference can never turn into confinement by being merged with one.
+
+Under the default `pve.ha.local_policy: none`, a VM with a node-local volume or a PCI passthrough device stays out of HA. Earlier releases registered every PCI VM with a strict pin, and that no longer happens unless `local_policy` is `hold`. A VM that HA would hold on node-local storage gets a full clone of the stemcell, because a linked clone's base template stays on one node. An explicit `clone_mode: linked` keeps the linked clone and runs the VM without HA in `auto` mode, and it fails `create_vm` in `managed` mode.
+
+The DLB features need the same mode. See [DLB-Aware Placement](dlb-aware-placement.md). The earlier `pve.placement` keys for these features are gone, and [Removed placement keys](configuration.md#removed-placement-keys) maps each one to its replacement.
+
+### The cluster has to pass the profile first
+
+The CPI probes the cluster before it writes any HA state. It runs the probe on every call, with no cache, so the answer is always current and each call that touches HA pays for the reads. The CPI logs one line with the result.
+
+```
+ha: mode=auto effective=full topology=mixed pve=9.2.4 rules=yes crm=master@pve1 quorum=yes votes=3/3 survives_one=yes qdevice=no nodes=3/3 sys_console=yes crs=static rebalance_on_start=no
 ```
 
-**PVE HA recovers a guest only when it can establish that the failed node is gone.** Relocation waits on fencing confirmation. A node that keeps running with corosync stopped is never confirmed dead, so the cluster resource manager parks the service in the `fence` state and refuses to move it. That is the correct split-brain-safe refusal, but it means the guest stays down until an operator intervenes. Opting into PVE HA ownership therefore assumes a cluster that can actually fence: quorum plus a watchdog (`softdog` by default, or hardware/IPMI). Without that, disabling the BOSH resurrector removes the recovery mechanism that would have worked and replaces it with one that will not.
+The effective state is `full`, `observe-only`, or `off`. In `observe-only` the CPI reads HA state, filters nodes by health, and defers deletes during recovery, but it registers nothing and writes no rules. The line then carries `reason=` with the first gap it found. The gates are these.
 
-That refusal window is also the widest opening for the double-healing race described below: throughout it the guest is still running on the partitioned node while the cluster considers it lost, so a live resurrector would build its replacement against an original that was never actually down. [Observed timings](#observed-timings) measures a real instance, and the window there lasted roughly six minutes.
+- **Quorum**
 
-**Shared storage is a third prerequisite.** A guest whose root disk (`pve.vm_storage`) or ConfigDrive ISO (`pve.iso_storage`) lives on node-local storage cannot start on any other node, so HA relocation always fails. Point both at a pool every node mounts before enabling any HA feature; the CPI's `checkISOStorageForHA` check and the DLB shared-storage guard exist to catch this, but they warn rather than block.
+  The entry node must be quorate, and the cluster resource manager must have a master with a fresh timestamp.
 
-**The allocation audit follows a VM that moved on shared storage.** With storage-set placement, the CPI's allocation journal records the node each VM and disk was created on. When a VM is registered with PVE HA, its plan also lists the nodes HA may move it to, and the audit already accepts the VM on any of them. A VM that lands anywhere else, whether a manual migration during node maintenance or a bulk migrate put it there, is accepted too when everything it holds sits on shared storage that the new node can see. That means every storage involved was already shared when the plan was frozen, still has the backing that plan froze, lists the new node or no nodes at all, and shows the volume in the new node's listing. Persistent disks and parked disks that move with their VMs follow the same rule. A VM that moved with a node-local disk stays a conflict, and every `create_vm` in the namespace then fails until the VM is back on its recorded node, which is one more reason to keep HA-managed VMs entirely on shared storage. The audit decides each move afresh on every call and never records it in the journal. [An operation fails with an allocation audit refusal](troubleshooting.md#an-operation-fails-with-an-allocation-audit-refusal) covers both cases.
+- **Survival of one failure**
 
-**One exception, and it is automatic.** A VM that declares `cloud_properties.pci_passthroughs` is always registered with a strict, single-node HA pin, with no config knob to opt out, because PCI passthrough is incompatible with live migration and the VM can never move off its assigned node regardless. This pin is deliberately excluded from the HA-registration warning below: a PCI-pinned VM is not expected to migrate, so the double-healing race this document otherwise addresses does not apply to it in the same way.
+  The configured votes must survive the loss of any one node. We explain the arithmetic below.
 
-## The double-healing race
+- **PVE 9 or later**
 
-When a VM registered under PVE HA stops responding, both systems act independently and roughly concurrently:
+  PVE 9 replaced HA groups with node-affinity and resource-affinity rules, and the CPI writes only rules. Every online node must report PVE 9 or later, and the rules endpoint must answer. A cluster in the middle of an upgrade stays without CPI HA until its last node finishes. The dynamic load balancer needs PVE 9.2.
 
-1. The VM stops (crash, OOM, hypervisor issue).
-2. PVE HA's cluster resource manager detects the failure and begins relocating the guest to another node.
-3. The BOSH Director, seeing the original VM's agent go unresponsive on its heartbeat timeout, independently issues its own `create_vm` to replace it.
-4. Both recoveries can complete: the PVE-HA-relocated original guest, and the Director-spawned replacement. They now conflict on IP address, on VMID, or on agent credentials, and the resulting orphaned HA resources can block future operations against either VM.
+- **Sys.Console**
 
-Both systems act on similar timescales (each has roughly a one-minute detection window, and the two are tuned independently, with PVE HA's own failure-detection interval on one side and the Director's agent-heartbeat timeout on the other). Nothing in the CPI coordinates the two; they are entirely separate control loops with no shared state.
+  The token must hold `Sys.Console` on `/`, because every HA write needs it. [PVE API Permissions](pve-api-permissions.md#2-privileges-the-cpi-actually-uses) lists the two tiers of access.
 
-The duplicate hazard requires both loops to be live. Director-only recovery cannot duplicate: the resurrector's scan-and-fix deletes the failed VM (`delete_vm`, disks reaped) before it issues the replacement `create_vm`, so there is no window in which two guests exist. We have observed exactly this delete-then-create ordering live. The race arises only when PVE HA is also registered, because PVE HA restarts the *existing* guest in place or on another node while the Director, unaware, builds a *new* one.
+- **Two online nodes**
 
-## The CPI's guard rail: a once-per-process warning
+  At least two nodes must be online.
 
-The CPI cannot read or set the BOSH resurrector's state, because there is no PVE-API-only mechanism for that and the CPI has no shell access to the Director. What it can do is warn whenever it is about to make PVE HA a co-owner of recovery. `create_vm` logs this once per CPI process, the first time any HA-registration feature fires:
+In `auto`, a failed gate leaves the call running as observe-only. In `managed`, it fails the call with an error that lists every gap.
 
-> `create_vm: this VM is registered as a PVE HA resource; the BOSH resurrector must be disabled for HA-managed deployments, or PVE HA and the resurrector can both try to recover the same failed guest independently, producing a duplicate VM that conflicts on IP, VMID, or agent credentials -- run` `bosh update-resurrection off` `(or set` `resurrector_enabled: false` `in the Director manifest) for any deployment using` `pve.ha.dlb, pve.ha.anti_affinity, or pve.ha.pin_az; see docs/ha-and-resurrection.md`
+### Quorum, votes, and the QDevice
 
-The warning fires once per process, not once per VM, so later HA-registered `create_vm` calls in the same CPI process do not repeat it, even under a different combination of features. It always fires when any HA-registration feature is active, because the CPI has no way to know whether the resurrector has actually been disabled; it only knows that HA registration is about to happen.
+PVE HA is only as safe as the quorum behind it. A cluster that loses quorum fences its nodes, and the CPI will not register a VM on a cluster that one more failure would put in that state. The check works on configured votes. A cluster passes when it keeps a majority of its expected votes after the loss of the heaviest node, and the QDevice's votes count only when the QDevice is connected.
 
-## `has_vm` semantics on a dead node
+Some consequences follow from that arithmetic.
 
-`has_vm` answers from a cluster-wide resource scan (`GET /cluster/resources`), not from PVE HA status. A VM sitting on a node that has gone unresponsive is still listed in that scan, with a `status: unknown`, for as long as the cluster retains quorum, so `has_vm` reports `true` even though the guest is currently unreachable.
+- **A cluster of two nodes**
 
-If the cluster loses quorum entirely, the scan itself fails, and that failure propagates as a retriable transport error rather than being interpreted as "the VM is gone." This fail-toward-retry direction is deliberate on both sides of the ownership split: it is what PVE HA recovery needs (a VM that still exists but is temporarily unreachable must never be treated as deleted), and it is what `bosh cloud-check` needs (a transient scan failure must not make the Director conclude a VM has disappeared and offer to recreate it).
+  Two nodes survive the loss of one only with a QDevice. We accept a two-node cluster with a QDevice, and we recommend three or more nodes for any cluster that runs HA VMs.
 
-## The small-node-set AZ pin wedge
+- **An even number of voting nodes**
 
-`pve.ha.pin_az_strict` defaults to `true` once `pve.ha.pin_az` is `on`: the resulting node-affinity pin is a hard guarantee, and PVE HA will not relocate the VM off its assigned AZ node set even if every node in that set is simultaneously down. This is a deliberate trade-off of durability of AZ locality over availability, but it carries a real wedge risk on a small node set. The CPI warns when a strict pin targets an AZ with two or fewer nodes:
+  A cluster with an even number of voting nodes and no QDevice can split evenly, and neither half would hold quorum. The profile line then ends with `advice=add-qdevice(4 voting nodes can split evenly)`. This is a recommendation. It changes nothing else about the line, and the CPI never prints it for an odd number of voting nodes.
 
-> `create_vm: strict AZ node-affinity pin targets a small node set; if every pinned node is simultaneously down or drained for maintenance, PVE HA has nowhere in the AZ left to fail over to and the VM stays down until a pinned node returns (map the AZ to >= 3 nodes to avoid this wedge risk, or set` `pve.ha.pin_az_strict=false` `to allow HA to relocate off-AZ instead)`
+- **One failure from losing quorum**
 
-Two concrete triggers: every node in a one- or two-node AZ going down simultaneously, or one node down while the other is drained for maintenance. Either case leaves PVE HA with no legal placement target in that AZ, and the VM stays down until a pinned node returns. Mitigate by mapping each `az_map` entry to at least three nodes, or by setting `pve.ha.pin_az_strict: false` so HA can relocate off-AZ instead of wedging.
+  Even a passing cluster can be one failure from losing quorum, for example when a node is already down. The doctor names the node whose loss would cost quorum, and the watchdog check below applies.
+
+The CPI reads the QDevice from the cluster's QDevice status. An answer with a body that does not state a connection is treated as one vote with an unknown status, and that vote does not count as participating. The first lab pass against a real QDevice is the place to confirm the response shape, so treat the QDevice reading as best effort until then.
+
+### Test each node's watchdog before you turn HA on
+
+A node that loses quorum while its local resource manager holds an active HA service stops renewing its watchdog and resets itself. That reset is what lets the quorate side of the cluster treat the node as fenced and recover its services. The cluster resource manager trusts the watchdog completely, so a node whose watchdog is missing, misconfigured, or blocked can keep its guest running after the survivors have recovered that guest elsewhere, and then two writers share one disk. The CPI cannot detect that from the API.
+
+The watchdog is armed only while a node's resource manager counts an active service, and a service that is `stopped`, in `error`, frozen, or waiting to start does not count. The first HA service on a node therefore arms its watchdog. To avoid arming one by surprise, the CPI makes a check at activation. When the cluster is one failure from losing quorum, and a node the VM may start on shows no armed watchdog, then in `auto` mode the CPI removes the staged resource and the VM runs without HA, and in `managed` mode it logs a warning that the node will reboot itself if it loses quorum and carries on. The check covers every node of the VM's admissible set.
+
+Before we enable HA on a cluster, we test the watchdog of each node with a throwaway VM that is not a BOSH instance. We put the VM under HA on one node, stop corosync on that node, and confirm that the node resets itself and that the survivors start the VM. The node reboots during this drill, so we run it during a maintenance window. We also confirm that the `watchdog-mux` service is running and that the node has a watchdog module loaded, `softdog` by default or a hardware watchdog.
+
+## The timeline of a node failure
+
+PVE fences a node no sooner than about two minutes after it loses quorum, and then the cluster resource manager steals the config and starts the VM elsewhere. The BOSH Health Monitor sees the agent go quiet after its `agent_timeout`, which defaults to 60 seconds, and the resurrector then runs a scan-and-fix that calls `has_vm`, then `delete_vm`, then `create_vm`. Without coordination, the resurrector would start about a minute before PVE HA has even fenced the node. The times in the diagram are estimates from the PVE fencing defaults.
+
+```mermaid
+sequenceDiagram
+    participant N as Failed node
+    participant HA as PVE HA CRM
+    participant HM as BOSH Health Monitor
+    participant D as Director
+    participant C as CPI
+    Note over N: t=0 node dies
+    HM->>HM: t=60s agent_timeout passes
+    HM->>D: t=60s scan_and_fix
+    D->>C: has_vm
+    C-->>D: true, the VM exists with hastate fence
+    D->>C: delete_vm
+    C-->>D: retriable error, the VM is in fence
+    HA->>N: t=120-180s fence acknowledged
+    HA->>HA: steal config, state=recovery
+    HA->>HA: start on a surviving node
+    Note over HA: VM running elsewhere a short time later
+    HM->>HM: agent heartbeats return
+    HM->>D: no further resurrection
+    Note over HM,D: If HA puts the VM in error, or leaves it in recovery past the grace window, the next scan_and_fix completes the delete and recreates the VM
+```
+
+We recommend that operators who use HA raise `agent_timeout` to 240 seconds or more. That lets PVE HA finish most recoveries before the resurrector looks at the VM. The defer in `delete_vm` keeps things safe even if the timeout stays at its default, but a longer timeout means fewer deferred tasks to read.
+
+## How the CPI prevents double recovery
+
+Double recovery happens when PVE HA starts the VM on a new node while the resurrector creates a replacement with the same persistent disk attached. The CPI closes it in four places.
+
+- **`has_vm`**
+
+  It never returns false while a VM is in fence or recovery. It answers false only after an absence proof, which takes two clean sweeps of every online node, finds no HA resource or CRM service for the VMID, and finds no open allocation journal record that puts the VMID on a node the sweeps had to skip. Absence that the CPI cannot prove is a retriable error, never false. If `has_vm` returned false for a VM that PVE HA was recovering, the Director would skip `delete_vm` and go straight to `create_vm`, which is the most dangerous path. A VM that none of those sources ties to an offline node can still read as absent, as it did before. Such a VM is not HA-managed, so PVE never moves it.
+
+- **`delete_vm`**
+
+  It defers with a retriable error in the cases below, and it never removes an HA resource while the resource is in `fence`. Every other path that destroys a VM, which includes the `create_vm` rollbacks and the sweep of unfinished teardowns, goes through the same teardown protocol, so none of them can bypass the rule.
+
+- **`attach_disk`**
+
+  The guard that refuses a second holder of a disk is a retriable error that names the holder's HA state when the holder is in fence or recovery, or when its node is not online. The Director retries rather than failing the deploy.
+
+- **The delete-time foreign-disk step**
+
+  It returns a retriable error instead of detaching when the VM's node is not online or its HA state is fence or recovery, and it never treats a config-missing answer from a node other than the owner as proof that the VM is gone.
+
+### When `delete_vm` defers
+
+The CPI reads one normalized view of the VM's HA state, built from the cluster resource manager's service state and the resource's configured request. It trusts that view only when it is fresh and comes from one quorate entry node. A stale, partial, or mixed view means the state is unknown, and an unknown state defers in every mode. A decision that acts on a live node also needs the node's local resource manager timestamp to be fresh. The table shows what `delete_vm` does for each raw state.
+
+| Raw state | Node | `delete_vm` does |
+|---|---|---|
+| Not in the CRM's state, and the request is `ignored` | Online | Proceeds, because the CRM never fences or moves an ignored resource |
+| Not in the CRM's state, and any other request | Any | Waits for motion, because the CRM has not processed the service yet |
+| `stopped`, `started`, or `error` | Online | Proceeds through the teardown protocol |
+| `request_stop`, `request_start`, `request_start_balance`, `migrate`, or `relocate` | Online | Waits for motion |
+| `freeze` | Online | Waits for motion, because the LRM is restarting and will unfreeze the service |
+| `fence`, or any state while the node is in `fence` | Any | Defers |
+| Any state except `recovery`, while the node is `unknown` or not online | Not online | Defers |
+| `recovery` | Fenced | Runs the grace window |
+| A VM that is not HA-managed | Not online | Defers, because PVE gives no proof of death for such a node |
+| Unknown | Any | Defers |
+
+Waiting for motion and deferring both return a retriable error, and the error text says what the CPI is waiting for. Waiting for motion has a budget, which is `pve.ha.motion_wait_sec`. A defer has no time limit, and the text tells the operator to resolve the fence or bring the node back.
+
+The grace window applies only to a service in `recovery`, which means PVE has fenced the node but has not yet placed the service anywhere. The CPI measures the window from the moment it first saw that recovery episode, not from the last heartbeat, because a long fencing delay could otherwise use up the whole window before HA had its first chance. The service ID together with the CRM's `uid` names an episode, and the CPI records the time it first saw the pair in a small file. A lost or unreadable record restarts the clock, which only delays the handover to BOSH. The window is as long as `pve.ha.motion_wait_sec`, 600 seconds by default. While it runs, PVE HA keeps trying to recover the VM, and the CPI logs the expiry when it comes.
+
+### When the grace window expires on a dead node
+
+After the window expires, the CPI can finish a `delete_vm` on a dead node, but only for a legacy VM, meaning a VM that the allocation journal does not record. The CPI requests the state `stopped`, which PVE accepts during recovery. It then narrows the VM's pin to a strict rule that names only the live nodes the VM's recorded storages reach, and removes the VM from its anti-affinity rule. The cluster resource manager steals the config onto one of those nodes and, because the request is `stopped`, leaves the VM stopped. The CPI waits for the scan to show it there and runs the normal teardown. It never removes the pin outright, because recovery would then pick any node, including one without the VM's volumes.
+
+This path has preconditions, and a missing one leaves the delete deferring with an error that names it.
+
+- **The mode writes HA state**
+
+  `pve.ha.mode` must be `auto` or `managed`, and the request must carry a `director_uuid`.
+
+- **The token holds Sys.Console**
+
+  The rule edits need it.
+
+- **The VM and its resource are ours**
+
+  The scan must prove this Director owns the VM, and the HA resource must carry this Director's marker. A resource in an HA group is refused, because the CPI cannot narrow a group.
+
+- **The rules can be edited**
+
+  Rules that the CPI does not own and cannot edit must not block the narrowing.
+
+- **A live node reaches every volume**
+
+  The VM's recorded storages must be reachable from at least one online node with a fresh timestamp. A VM with a node-local volume, a `hold` VM, a VM whose pin records no storages, and a VM that the allocation journal records all keep deferring. For a `replicate` VM, the destination is the partner only when its job is this Director's, enabled, and between the dead node and the partner.
+
+For every case the completion does not cover, an operator follows [the dead-node procedure](operations.md#the-dead-node-procedure).
+
+### Clearing an HA error
+
+PVE refuses every state request for a resource in `error` except `disabled`, and `disabled` stops the guest. The CPI therefore chooses by what happens to the VM next.
+
+- **A delete, or a VM that is already stopped**
+
+  The CPI requests `disabled`, waits until the service shows `stopped`, checks on the owner node that the VM is stopped and still ours, and destroys it with `purge`. Without `Sys.Console`, a stopped VM can still be destroyed with `purge`, and a running VM gets a retriable error that names the privilege and the command `ha-manager set vm:<vmid> --state disabled`.
+
+- **A running VM that BOSH keeps**
+
+  `disabled` would stop it, so the CPI removes the resource and registers it again, which leaves the guest running. It marks the work with a `bosh-ha-readd-<unix seconds>` tag until the registration finishes, and it does the work only while the VM runs on its own pin, holds no lock, and has no migration, relocation, or disk move task. Without `Sys.Console` it returns a retriable error that names `ha-manager remove vm:<vmid>` followed by `ha-manager add vm:<vmid>`. The VM is unmanaged between the removal and the return to `started`, so a node failure in that window leaves it down until the node returns or the resurrector acts. A crash inside the window extends it until the next call that touches the VM, and the tag keeps it visible to the doctor.
+
+## What happens to the disks
+
+A VM is only as recoverable as its volumes. The CPI computes the VM's access set, which is the intersection of the node sets of every volume the VM holds, including its config-drive ISO and its snapshot and state volumes. It narrows that set by the hardware and network needs placement already enforces. A VM is eligible as shared only when the set holds at least two placeable nodes, and when the set is smaller than the cluster, it joins the pin as a strict constraint.
+
+### Shared storage
+
+With shared storage, PVE HA moves a VM by live migration or by stealing its config onto a surviving node and starting it there. The disks stay where they are. The CPI re-reads the config after any move, because a rename can change a volume ID, and it resolves persistent disks by their serial. A disk without a stable ID depends on its volume ID, and the CPI warns once per such disk at attach time in `auto` mode.
+
+A cluster whose every volume lives on NFS, such as one backed by a NetApp array, resolves to shared for every VM, so it never reaches the local-disk policies and `local_policy` can stay at `none`. The one volume such a cluster can still get wrong is the config-drive ISO, so `pve.iso_storage` should point at the same shared storage. [ConfigDrive](configdrive.md#migration-and-ha-interaction) explains why.
+
+Parker VMs, which hold persistent disks for stopped instances, are registered as `stopped` HA resources when every disk they hold sits on shared storage that at least two placeable nodes reach. Their config then follows a failover of their node, and because a parker never runs, there is no second writer. A park never puts a disk into a registered parker unless the disk's storage reaches every node of that parker's access set.
+
+### Local storage
+
+Local disks live on one node. A planned maintenance migration can copy them, but a failure recovery cannot, because the source node is gone. The CPI therefore never registers a local-disk VM for HA without a pin that keeps it where its disks are. The three policies are these.
+
+- **`none`, the default**
+
+  The VM is not HA-managed. HA maintenance mode does not touch it, so it keeps running until the node is rebooted, and then it goes down with the node. After a hard failure, `delete_vm` defers while the node is down, and the resurrector recreates the VM once the node is back. An operator who cannot wait uses the dead-node procedure.
+
+- **`hold`**
+
+  The VM is HA-managed with a strict pin that names only its own node. After a failure, HA waits for the node and restarts the VM in place, which is faster than waiting for the resurrector. HA cannot evacuate such a VM for maintenance, because the pin forbids every other node, so the maintenance request on the node never completes while the VM runs. Operators stop `hold` VMs before node maintenance, as [the maintenance procedure](operations.md#node-maintenance-with-hold-vms) describes.
+
+- **`replicate`**
+
+  The CPI creates a ZFS storage replication job from the VM's node to a partner node. During maintenance, HA migrates the VM to the partner, and the replica makes that quick. After a hard failure, HA recovers the VM on the partner from the last replica, and every write since the last sync is lost.
+
+#### The replicate data-loss window
+
+The window runs from the last successful sync, not from the schedule. With the default schedule of every five minutes, a small delta, and a job that keeps succeeding, we expect to lose up to about six minutes of writes on a hard failure. A job that keeps failing makes the window grow without limit, and a failed sync is invisible to BOSH. The doctor reports the age of the last successful sync and the job's failure count, and the schedule is only a target. The window applies to hard failures, because a maintenance migration syncs before it moves. BOSH operators may assume a persistent disk never loses data, and a `replicate` VM breaks that assumption, so we state it plainly. A CPI persistent disk on node-local storage is not replicated at all, because PVE replicates only the volumes the VM itself owns, and a VM that holds one keeps its pin on its own node.
+
+After a failover, PVE reverses the replication job so that it runs from the partner back to the old node. The job's next run receives with `zfs recv -F`, which rolls the old node's dataset back to the last common snapshot, so any writes that still existed on the old node's disk are destroyed on that first sync. Every resource the CPI registers has `failback` set to 0, so the VM stays on the partner when the old node returns. When those older writes matter, [the replicate failover procedure](operations.md#replicate-failover-and-the-old-nodes-writes) saves them before the job runs.
+
+A replication job that exists is not yet a replica HA can recover from. While the job exists but has not copied every current volume, the VM's pin names its own node alone, and it behaves like `hold`. The pin names the partner too only after the job reports a sync that started more than five minutes after the last change to the VM's volumes, with no error, a failure count of zero, and every volume on the partner. The five minutes is a fixed bound on clock skew between the Director and the PVE nodes. The CPI measures no real skew, so a node whose clock runs further off than that can delay or wrongly allow the widening.
+
+The CPI requests the first sync when it creates the job, and `create_vm` returns without waiting for it. A sync that starts within five minutes of the change cannot count anyway. The VM therefore stays on the narrow pin until a later `reboot_vm` or `set_vm_metadata` call finds a verified sync and widens the pin, and the doctor reports the VM as awaiting its first sync until then. Plan for the first several minutes of a new `replicate` VM to behave like `hold`.
+
+Three more facts matter for `replicate`.
+
+- **The partner's capacity is not charged**
+
+  The partner holds a full copy of the VM's volumes, and placement does not reserve that space against the partner. Leave room in the partner's pool, because a pool that fills makes the job fail and the data-loss window grow.
+
+- **Deleting the job**
+
+  `delete_vm` retires the job before it destroys the VM. When the partner is offline, or the job is still there after `pve.ha.motion_wait_sec`, the CPI drops it with `force=1`, which leaves the partner's copy behind as an orphan. It logs the node and the volumes to remove by hand, and the doctor reports them. A job that names no node besides the VM's own is never forced.
+
+- **The journal records the job**
+
+  A `replicate` VM that the allocation journal manages has a `replication` section in its record. Older releases refuse a record with that section, which creates a downgrade hazard that the [changelog](../CHANGELOG.md) names.
+
+### What to expect
+
+| Scenario | Shared disks | Local disks, `none` | Local disks, `hold` | Local disks, `replicate` |
+|---|---|---|---|---|
+| Node enters maintenance | HA live-migrates the VM with no downtime, within its CPU migration domain when its CPU type is `host` or `max` | The VM keeps running until the node is rebooted, then goes down with it | The VM keeps running, and maintenance never completes until the operator stops the VM | HA migrates the VM to the partner after a sync, with a short downtime |
+| Node fails hard | HA restarts the VM elsewhere, usually within a few minutes | The VM stays down until the node returns or an operator moves its config | HA restarts the VM in place when the node returns | HA restarts the VM on the partner and loses the writes since the last sync |
+| Data loss on a hard failure | None | None, but the disk is unavailable | None, but the VM waits | Everything since the last successful sync, and the old node's newer writes are destroyed on its first sync after it returns |
+
+## Choose a CPU type for HA
+
+The CPI writes `cpu: host` by default. That is the fastest choice, and it is safe on a cluster of identical nodes, because every node then has the same CPU. A live migration of a `host` VM to a node of an older CPU generation can crash the guest, and HA maintenance moves VMs by live migration. When the CPU type is `host` or `max`, the CPI therefore treats the nodes that report the same CPU model and the same flags as the VM's CPU migration domain, and it confines the VM's pin to that domain. A cluster whose nodes all share one model loses nothing. When the domain leaves fewer than two placeable nodes, `auto` gives that VM no HA and logs a warning that names `pve.cpu_type`, and `managed` fails the call with the same text.
+
+We recommend setting `pve.cpu_type` to the newest CPU model that every node of the cluster supports, such as `x86-64-v3` or a named model like `Cascadelake-Server`, with `x86-64-v2-AES` as the floor. Even the floor keeps AES-NI, so TLS-heavy jobs such as routers keep their hardware crypto, and what a VM loses is mainly AVX and AVX2. A VM with a named model keeps the full set of nodes.
+
+HA never moves a VM from one cluster to another, and BOSH never live-migrates a VM between AZs, so CPU differences between the clusters that serve as AZs do not matter. Differences inside one cluster do. Two nodes of one generation can be different SKUs, and when their model strings or their flags differ, they form separate domains, which in a small cluster can leave a `host` VM with too few nodes for HA. Setting `pve.cpu_type` to the named model for that generation joins them into one domain. The CPI never changes the CPU type of an existing VM, so a changed value applies to VMs created afterward. The `pve-cid ha` command prints the cluster's CPU migration domains, so you can see a split and pick the common model.
+
+## Placement under HA
+
+- **The AZ pin**
+
+  With `pve.ha.pin_az` at `auto` or `on` and a non-empty `placement.az_map`, a registered VM's pin includes its AZ's node set. BOSH does not pass the cloud-config AZ name to `create_vm`, so the CPI learns a VM's AZ only from `cloud_properties.availability_zone`, which must name a key of `az_map`. Put it on the AZ's `cloud_properties` so every VM in the AZ receives it. Without it the VM gets no AZ pin, and with `pin_az: on` the CPI warns once per VM. On Proxmox an AZ is a separate cluster or a standalone host, so `az_map` only spreads VMs across the nodes inside one AZ's cluster. See [Multi-Cluster Deployments](multi-cluster.md#per-entry-placement-and-node-spreading).
+
+  ```yaml
+  azs:
+  - name: z1
+    cpi: pve-cluster-a
+    cloud_properties:
+      availability_zone: z1   # must be a key in pve.placement.az_map
+  ```
+
+- **The small-node-set wedge**
+
+  `pve.ha.pin_az_strict` defaults to `true`, so the AZ part of the pin is a hard guarantee. PVE HA will not relocate the VM off its AZ node set even when every node in that set is down. The CPI warns when a strict pin resolves to a single node, because that node has no failover target and cannot be drained. Map each AZ that uses a strict pin to at least two nodes, and preferably three. Setting `pve.ha.pin_az_strict: false` lets HA leave the AZ instead.
+
+- **Full anti-affinity groups**
+
+  A negative rule with more members than the cluster has nodes cannot be satisfied, and PVE disables it silently. `pve.ha.anti_affinity_overflow` decides what the CPI does. The default `skip` writes no rule and logs why, and `split` divides the group into rules that each fit. A group whose size equals the node count fits, but it leaves no legal target for a member whose node fails, so PVE cannot recover that member. It waits in `recovery`, the grace window then hands it to BOSH, and the replacement shares a node with another member until the failed node returns. A group that fills every node gets no anti-affinity protection during a node failure.
+
+- **N+1 headroom**
+
+  A cluster can only absorb a failed node if the survivors have room for its VMs. With `pve.ha.headroom` at `warn`, the default, `create_vm` logs a warning when the VM it places would leave some single-node failure without room, and it places the VM anyway. With `enforce`, it skips nodes that fall short and refuses the placement with a retriable error when none is left. The number is an estimate. It counts only the configured memory of every guest, and it ignores host overhead, ballooning, and the order in which the cluster resource manager recovers services, so a cluster that passes can still fail to restart every VM. That is one reason `warn` is the default. The check runs only for a node where the VM would be registered with HA, and only when placement scores the cluster's nodes. See the `pve.ha.headroom` row in [Configuration](configuration.md#ha) for the cases where it does not run.
+
+- **PCI passthrough**
+
+  PCI passthrough is incompatible with live migration, so a VM with a PCI device stays out of HA under `local_policy: none`. Under `hold` it is registered with a strict pin to its node.
+
+## Sizing a small cluster
+
+A cluster that serves as one AZ needs room on its survivors for the VMs of a failed node. A three-node cluster needs roughly a third of its capacity free, and a five-node cluster needs about a fifth. Size for that before splitting a large cluster into several small ones. The `headroom` field of `pve-cid ha` reports the margin as `headroom=ok(42%)`, or it names each node whose loss leaves a VM with nowhere to go.
+
+When several clusters that serve as AZs mount one storage array, an outage of the array takes every AZ down at once, and neither PVE HA nor BOSH can work around it. We treat the array as a shared failure domain, and we recommend a separate array or storage path per AZ where the budget allows. Clusters that mount one export also share a volume namespace, so they need disjoint VMID bands. [Multi-Cluster Deployments](multi-cluster.md#shared-storage-rules) covers that.
 
 ## DLB caveats
 
-The Dynamic Load Balancer (`pve.ha.dlb`) is a third HA-registering feature and carries its own prerequisites beyond the resurrector conflict above. See [DLB-Aware Placement](dlb-aware-placement.md) for the full guard ladder. The parts most relevant to HA ownership:
+The Dynamic Load Balancer is one more HA-registering feature, and [DLB-Aware Placement](dlb-aware-placement.md) covers its guard ladder in full. Three points matter for HA ownership.
 
-- **Shared storage required.** Live migration, which both DLB rebalancing and PVE HA recovery depend on, requires the VM's root disk, persistent disks, and its ConfigDrive ISO (which lives at `scsi30` for the VM's entire life, not just at boot) to all sit on storage reachable from every cluster node. `pve.iso_storage_follow_vm_storage` (see [Design Decisions, D7](design-decisions.md#d7-iso_storage-default-follow-vm_storage)) helps here by pointing the ISO pool at an already-shared `vm_storage` without a separate manifest edit. If any of the three pools resolves to node-local storage, the CPI silently skips DLB registration for that VM.
-- **Multi-node cluster required.** PVE HA requires quorum, with three nodes as the recommended minimum. On a single-node cluster, the CPI detects the node count and skips all DLB registration silently. The feature is entirely inert there, and no resurrector conflict can arise.
-- **The BOSH Director and bootstrap VMs must never be DLB- or HA-managed.** A `bosh create-env` Director VM that gets live-migrated mid-deploy loses its in-flight CPI RPC connections, and the deployment fails. Use a separate `cpi.json` for the `create-env` step that omits the `pve.ha` block or sets `pve.ha.mode: off`, because the config accessors return safe off defaults when the block is absent.
+- **Shared storage is required**
+
+  Live migration needs the root disk, the persistent disks, and the config-drive ISO, which stays at `scsi30` for the VM's whole life, on storage every node reaches. A VM with a node-local volume is never registered for DLB.
+
+- **A multi-node cluster is required**
+
+  PVE HA needs quorum, and we recommend three nodes at least. A single-node cluster fails the profile gate, so the feature stays inert.
+
+- **The Director and bootstrap VMs stay out of HA**
+
+  A `bosh create-env` Director VM that is live-migrated mid-deploy loses its in-flight CPI connections, and the deployment fails. Use a separate `cpi.json` for the `create-env` step that omits the `pve.ha` block or sets `pve.ha.mode: off`.
 
 ## Observed timings
 
-Measured 2026-08-04 on a three-node PVE 9.2.4 cluster (`lab-pve-cpi-az2`), one BOSH instance with its root disk and its `scsi30` ConfigDrive ISO on shared NFS, polled once per second from a surviving node's API. Two kill mechanisms, because they produce materially different outcomes:
+We measured these on 2026-08-04 on a three-node PVE 9.2.4 cluster (`lab-pve-cpi-az2`), with one BOSH instance whose root disk and `scsi30` config-drive ISO sat on shared NFS, polled once per second from a surviving node's API.
 
 | Failure | Node offline | HA acts | VM running again | Recovered where |
 |---|---|---|---|---|
-| Abrupt crash (`sysrq-b`), node reboots in ~26 s | +8 s | restart in place | **+152 s** | same node |
-| Sustained partition (corosync stopped), node stays up | +2 s | service parked in `fence` | **+245 s** | different node |
+| Abrupt crash (`sysrq-b`), node reboots in about 26 seconds | +8 s | restart in place | +152 s | same node |
+| Sustained partition (corosync stopped), node stays up | +2 s | service parked in `fence` | +245 s | different node |
 
-Neither run ever produced a second guest: exactly one VMID and one VM name throughout, and with the resurrector off the Director issued no scan-and-fix.
+Neither run ever produced a second guest. Three points are worth carrying forward.
 
-Three things are worth carrying forward from these numbers.
+A fast reboot never reaches HA failover. The crashed node returned well inside the fence timeout, so the cluster resource manager never fenced it. Recovery was the returning node's own resource manager restarting the VM after it reacquired the agent lock, and that lock wait accounts for most of the 152 seconds.
 
-**A fast reboot never reaches HA failover.** The crashed node returned well inside the fence timeout, so the cluster resource manager never fenced it and never relocated the guest. Recovery was the returning node's own LRM restarting the VM after it reacquired the agent lock, and that lock wait, not the 26-second reboot, accounts for most of the 152 seconds.
+The partition run recovered only after an operator restored corosync by hand. We have not proved why the node's watchdog did not end the partition sooner. A node whose local resource manager holds active services and loses quorum should stop renewing its watchdog and reset, and the survivors' resource manager should then treat the node as fenced once its agent lock expires. PVE's own documentation puts a fence at three to five minutes after the loss of quorum, so the run most likely ended before the watchdog fired, but this is a guess. The 245 seconds therefore measures operator-assisted recovery. It is not an unattended failover time, and we should not quote it as one. The lesson is the one in the watchdog section above, which is to test each node's watchdog before relying on HA.
 
-**Relocation needs a node that can actually be fenced.** In the partition run the node kept running with corosync stopped, so no fencing confirmation ever reached the CRM. The CRM correctly parked the service in the `fence` state and refused to move it, which is the textbook split-brain-safe refusal, and relocation only proceeded once we restored corosync by hand. The 245 seconds therefore measures operator-assisted recovery, not an unattended failover, and should not be quoted as one. The general point stands regardless of the mechanism: PVE HA recovers a guest only when it can establish that the failed node is gone.
-
-**That refusal window is the widest opening for the double-healing race.** For roughly six minutes the guest was still running on the partitioned node while the cluster considered it lost. A live resurrector, working from the Director's own agent-heartbeat timeout, would have built its replacement squarely inside that window, against an original that was never actually down.
+For roughly six minutes in that run the guest was still running on the partitioned node while the cluster considered it lost. That is the widest opening for the double-healing race, and it is why the CPI defers `delete_vm` while a service sits in `fence`. A resurrector without that defer would have built its replacement against an original that was never actually down.
 
 ## See also
 
+- [Operations, PVE HA](operations.md#pve-ha)
+  This holds the doctor command, the defer runbook, the dead-node procedure, and the maintenance and failover procedures.
+
+- [Configuration, HA](configuration.md#ha)
+  This lists every `pve.ha` property.
+
 - [Design Decisions, D11](design-decisions.md#d11-ha-versus-the-bosh-resurrector-warn-document-and-race-test)
-  This explains why we chose warn-and-document over attempting resurrector detection.
+  This records how the CPI's approach to the resurrector has changed.
 
 - [DLB-Aware Placement](dlb-aware-placement.md)
-  This covers the full DLB guard ladder, CRS cluster-option interplay, and migration prerequisites.
+  This covers the DLB guard ladder, the CRS cluster option, and the migration prerequisites.
 
 - [ConfigDrive, migration and HA interaction](configdrive.md#migration-and-ha-interaction)
-  This explains why the ConfigDrive ISO pool matters for migration and HA recovery.
+  This explains why the config-drive ISO pool matters for migration and HA recovery.

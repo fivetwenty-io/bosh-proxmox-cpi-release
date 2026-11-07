@@ -2275,6 +2275,36 @@ The CPI classifies this condition as retriable and injects an operator hint into
 
 To restore quorum, bring the missing node(s) back online or resolve the corosync network partition. No CPI-side action is needed or possible, because the CPI cannot restore cluster membership and can only wait for `/etc/pve` to become writable again. Once `pvecm status` reports `Quorate: Yes`, mutating operations resume automatically on the next CPI retry.
 
+## PVE HA
+
+**Symptom**
+
+A deploy fails or a VM is not registered, and the message names a removed `pve.placement` key, a failed HA profile gate, a deferred `delete_vm`, or an HA resource in the `error` state.
+
+**Cause**
+
+Each message maps to one of four causes.
+
+- **A removed key**
+  The job properties set one of the nine `pve.placement` HA keys that the `pve.ha` block replaced. The job refuses to render with `the job properties set properties that were removed, and the CPI refuses to run with a feature silently switched off`, followed by the replacement for each key, and a cpi-config entry that carries a removed key fails the same way. The mapping is in the [changelog](../CHANGELOG.md).
+
+- **A failed profile gate**
+  The cluster has no quorum, no fresh CRM master, no node that survives a single loss, or too few online nodes, or the token lacks a privilege that HA needs, or PVE is older than 9. With `pve.ha.mode` at `auto` the call carries on as observe-only and the log line names the first gap in `reason=`. With `managed` the call fails and lists every gap.
+
+- **A deferred delete**
+  `delete_vm` found PVE HA fencing, recovering, or moving the VM, and it returned a retriable error that names the VM, its HA state, and its node's state.
+
+- **An HA error state**
+  PVE put the resource into `error` after a failed start or relocate, and it will not act on the resource until an operator clears the state.
+
+**Diagnosis**
+
+We run `pve-cid ha` against the cluster. It is read-only. It prints the profile line, the node states, the CPU migration domains, and the findings, which cover the CPI-owned HA resources and replication jobs. See [Reading the cluster with `pve-cid ha`](operations.md#reading-the-cluster-with-pve-cid-ha).
+
+**Fix**
+
+For a removed key, we replace it as the error says. For a failed gate, we fix the cluster or the token, and the profile is probed again on the next call. For a deferred delete, we follow [When `delete_vm` defers](operations.md#when-delete_vm-defers), and for a dead node, [the dead-node procedure](operations.md#the-dead-node-procedure). For an `error` resource, we follow [Clearing an HA error by hand](operations.md#clearing-an-ha-error-by-hand). [HA and Resurrection](ha-and-resurrection.md) explains the ownership model behind all four.
+
 ## Task timeouts
 
 **Symptom**

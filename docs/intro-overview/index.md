@@ -16,7 +16,7 @@ Ten chapters, fifty-five minutes of talk, and the rest for questions. Timings ar
 | 0:05–0:11 | [2 — The Cast of Characters](02-the-cast.md) | Director, stemcell, agent, cluster, and the CPI — a program, not a service |
 | 0:11–0:17 | [3 — What Happens When We Deploy](03-what-a-deploy-does.md) | The chain of small retriable steps, data versus compute, and the VMID bands that make the cluster legible |
 | 0:17–0:22 | [4 — Machines from a Mold](04-machines-from-a-mold.md) | Template cloning in seconds, and identity delivered on a sealed disc |
-| 0:22–0:27 | [5 — Where Machines Land](05-where-machines-land.md) | The manufactured scheduler, availability zones as a written map, and one healer at a time |
+| 0:22–0:27 | [5 — Where Machines Land](05-where-machines-land.md) | The manufactured scheduler, availability zones as a written map, and who recovers first |
 | 0:27–0:33 | [6 — The Network Story](06-networks.md) | Borrowed bridges, managed cluster-wide networks, and owning the address space on a provided network |
 | 0:33–0:39 | [7 — Disks That Outlive Their Machines](07-disks-that-outlive.md) | The invented durable volume, ID envelopes, the parked-disk coat-check, and the audit habit |
 | 0:39–0:46 | [8 — How We Configure It](08-how-we-configure-it.md) | Five required properties, the scoped credential, layered settings, and the additive-upgrade promise |

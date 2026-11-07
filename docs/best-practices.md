@@ -246,9 +246,9 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Shared ISO storage for migration-capable VMs.**
 
-**Best practice.** A config-drive ISO on node-local storage blocks live migration and HA recovery of that VM, since the file does not exist on any other node — silently defeating DLB rebalancing, HA AZ pinning, and HA anti-affinity, all of which depend on migration actually working.
+**Best practice.** A config-drive ISO on node-local storage blocks live migration and HA recovery of that VM, since the file does not exist on any other node — silently defeating DLB rebalancing, HA failover, HA AZ pinning, and HA anti-affinity, all of which depend on migration actually working.
 
-**CPI behavior.** `pve.iso_storage` defaults to `local` (node-local). `pve.require_shared_iso_for_ha` (default `false`) escalates the CPI's migration-safety warning to a hard `create_vm` error whenever the VM is being HA-registered and the resolved ISO pool is not shared; `pve.iso_storage_follow_vm_storage` (default `true`) already offers a path off `local`, resolving the ISO pool to `vm_storage` whenever that pool is shared and advertises `iso` content. Because BOSH renders the `local` spec default for `iso_storage` unconditionally, the flag treats the literal value `local` as the "unset" signal — set `iso_storage` to any other value to pin a pool the flag will never override, or set the flag `false` to use `iso_storage` as configured.
+**CPI behavior.** `pve.iso_storage` defaults to `local` (node-local). The ISO counts toward a VM's HA eligibility like any other volume, so with `pve.ha.mode` at `auto` a node-local ISO takes a VM out of full HA with a warning, and at `managed` it fails `create_vm`. `pve.require_shared_iso_for_ha` (default `false`) escalates the same downgrade to a hard `create_vm` error in `auto` mode too; `pve.iso_storage_follow_vm_storage` (default `true`) already offers a path off `local`, resolving the ISO pool to `vm_storage` whenever that pool is shared and advertises `iso` content. Because BOSH renders the `local` spec default for `iso_storage` unconditionally, the flag treats the literal value `local` as the "unset" signal — set `iso_storage` to any other value to pin a pool the flag will never override, or set the flag `false` to use `iso_storage` as configured.
 
 **Status.** Configurable — recommended: point `iso_storage` at a shared pool whenever DLB, HA AZ pinning, or HA anti-affinity is in use, or rely on the default `iso_storage_follow_vm_storage: true` when `vm_storage` is itself shared and advertises `iso` content; set `require_shared_iso_for_ha: true` to make the gap fail closed.
 
@@ -380,7 +380,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** Destroying a VM while it is still a registered HA resource (or still a member of a CPI-managed anti-affinity rule) leaves stale HA state referencing a VMID that no longer exists.
 
-**CPI behavior.** `delete_vm` removes the VM from any anti-affinity or DLB-related HA rule and deregisters its HA resource, and separately removes any node-affinity pin rule, before the destructive `purge=1` destroy call — every step best-effort and logged, never blocking the delete on an HA-cleanup failure.
+**CPI behavior.** `delete_vm` first reads the VM's HA state and defers with a retriable error while PVE HA is fencing, recovering, or moving the VM, so it never deregisters a resource that PVE is acting on. Once the delete may proceed, it stops the VM through PVE HA, removes the VM from its anti-affinity rules, and removes the node-affinity pin and the HA resource only when they carry this Director's ownership marker, before the destructive `purge=1` destroy call. A cleanup failure after the destroy is logged and never blocks the delete.
 
 **Status.** Meets.
 
@@ -410,13 +410,25 @@ The HA pin only protects a VM once it exists. At creation, when no node in the r
 
 **Status.** Meets.
 
-**Resurrection authority left to BOSH.**
+**Recovery ownership: PVE HA first, the BOSH resurrector as the fallback.**
 
-**Best practice.** A CPI that lets PVE's own HA subsystem restart a failed guest independently of the BOSH Director creates two competing authorities over the same VM's lifecycle.
+**Best practice.** Two systems that can each restart a failed guest need one rule for who goes first. Leaving both on with no coordination produces a duplicate VM, and turning one off throws away the protection it offers.
 
-**CPI behavior.** Every VM the CPI creates carries `onboot: 0` — PVE never auto-starts it on node boot or recovery outside of an explicit HA resource restart the CPI itself registered. Instance-level resurrection is BOSH's resurrector, not PVE's own restart-on-failure policy.
+**CPI behavior.** With `pve.ha.mode` at `off`, which is the default, the CPI registers no VM with PVE HA, and the BOSH resurrector is the only recovery mechanism. Every VM carries `onboot: 0`, so PVE never starts it on its own. With `auto` or `managed`, PVE HA recovers the VMs the CPI registers, and the CPI makes the resurrector wait. `delete_vm` defers while PVE HA fences or recovers a VM, `has_vm` answers false only after an absence proof, and `attach_disk` refuses a second holder of a disk. We raise `agent_timeout` to 240 seconds or more so that PVE HA finishes most recoveries before the resurrector looks at the VM, and we test each node's watchdog before we turn HA on. See [HA and Resurrection](ha-and-resurrection.md).
 
 **Status.** Meets.
+
+---
+
+**Disjoint VMID bands and `next-id` ranges on shared exports.**
+
+**Best practice.** PVE names every volume for the VM ID that owns it, so clusters that mount one export share one namespace. Each cluster needs its own VM, disk, stemcell template, and parker bands, and the datacenter `next-id` range must sit outside every band of every cluster on the export.
+
+**CPI behavior.** Allocation reserves the ID of every config-drive ISO it finds, a destroy keeps the unreferenced-disk sweep off on shared storage, and a volume delete is refused when the volume's owner lies outside every band of the cluster. The CPI logs one line of advice when it sees network file storage with every band at its default, and `pve-cid ha --cpi-config` checks a set of clusters for overlapping bands and `next-id` ranges.
+
+**Status.** Configurable. See [Multi-Cluster Deployments](multi-cluster.md#shared-storage-rules).
+
+---
 
 ## 7. API usage
 

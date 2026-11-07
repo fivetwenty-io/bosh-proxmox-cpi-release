@@ -52,17 +52,17 @@ flowchart LR
 
 ---
 
-## One healer at a time
+## Who recovers first
 
 | | Recovery owner | Our action |
 |---|---|---|
 | Default | BOSH resurrector | Nothing |
-| HA features opted in | Proxmox HA | `bosh update-resurrection off` |
+| HA opted in | Proxmox HA first, resurrector as fallback | Raise `agent_timeout` to 240 seconds or more |
 
-- Two healers race → duplicate machines fighting over an address
+- Two healers left uncoordinated → duplicate machines fighting over an address
 
 <!--
 - Out of the box: zero HA registrations, BOSH alone heals, no conflict possible.
-- Opting into ch 5's HA-backed features makes Proxmox a healer too: it relocates the existing guest while the Director independently builds a replacement — both succeed, and the duplicates conflict on IP and identity.
-- One sentence to remember: for any deployment, exactly one system owns recovery. The CPI warns on the risky combination; docs/ha-and-resurrection.md has the ownership matrix and measured failover timings.
+- Opting into pve.ha makes Proxmox a healer too, and it recovers first. The CPI holds the resurrector back: delete_vm defers while PVE HA is fencing or recovering a VM, has_vm answers false only after an absence proof, and attach_disk refuses a second holder of a disk.
+- One sentence to remember: for any deployment, one system recovers first and the other waits. docs/ha-and-resurrection.md has the ownership model, the quorum rules, and the dead-node procedure.
 -->

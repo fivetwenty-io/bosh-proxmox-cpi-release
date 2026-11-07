@@ -74,7 +74,7 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 - [DLB-Aware Placement](dlb-aware-placement.md): This guide covers opt-in integration with the PVE 9.2 Dynamic Load Balancer, including node scoring, availability-zone pinning, and HA node-affinity rules.
 
-- [HA and Resurrection](ha-and-resurrection.md): Ownership matrix for BOSH-resurrector-owned versus PVE-HA-owned recovery, the double-healing race, and the CPI's warning guard rail.
+- [HA and Resurrection](ha-and-resurrection.md): The ownership model with PVE HA recovering first and the BOSH resurrector as the fallback, the cluster profile and quorum rules, the delete defer rules, the local-disk policies, and the dead-node and error-clearing procedures.
 
 - [Multi-Cluster Deployments](multi-cluster.md): cpi-config walkthrough for multiple PVE clusters, AZ-to-CPI binding, disjoint VMID banding, and shared-storage safety rules.
 

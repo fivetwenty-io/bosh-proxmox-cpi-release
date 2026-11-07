@@ -61,13 +61,10 @@ This page collects every known limitation of the CPI in one place. Each entry is
 ## Cluster topology and multi-cluster
 
 - Strict AZ pins can wedge on small node sets
-  With `pve.ha.pin_az: on` and the default strict pin, an AZ mapped to one or two nodes can leave PVE HA with no legal failover target when those nodes are down together. See [HA and Resurrection](ha-and-resurrection.md#the-small-node-set-az-pin-wedge).
+  With `pve.ha.pin_az: on` and the default strict pin, an AZ mapped to one or two nodes can leave PVE HA with no legal failover target when those nodes are down together. See [HA and Resurrection](ha-and-resurrection.md#placement-under-ha).
 
 - DLB placement has hard prerequisites
   DLB registration silently skips VMs on node-local storage or single-node clusters, and the Director itself must never be DLB- or HA-managed. See [HA and Resurrection](ha-and-resurrection.md#dlb-caveats).
-
-- `has_vm` is not HA-aware
-  The CPI does not consult PVE HA status to distinguish a genuinely gone VM from one mid-recovery; the design fails toward retry instead. See [Design Decisions](design-decisions.md#out-of-scope) and [HA and Resurrection](ha-and-resurrection.md).
 
 - No cross-cluster VMID coordination
   The allocation-time storage scan and the pool-comment lock both stop at cluster boundaries, so disjoint VMID banding across cpi-config entries that share storage is an operator obligation, not something the CPI can enforce. See [Multi-Cluster Deployments](multi-cluster.md#disjoint-vmid-banding-the-multi-cluster-safety-pattern).
@@ -77,6 +74,47 @@ This page collects every known limitation of the CPI in one place. Each entry is
 
 - Two entries on one cluster share a journal namespace and can share a parker band
   The CPI warns about these shapes and does not refuse them. It records the set of entry bindings that have admitted a create into the namespace, each one the VM prefix, parker prefix, and VMID bands of one entry. It warns once when a create brings a binding that is new to the set, and `storage-journal audit` lists every binding while comparing them with the job-level configuration only. When it lists parkers, it warns about parkers of another prefix inside its parker band, even when two entries share the band on purpose, because those look the same as the leftovers of a parker prefix change. A parker of another prefix whose `director--` tag names another Director gets a separate warning that never advises removing it. It also warns about parkers with its own director tag and prefix outside the band, and it refuses to attach, update, or delete a disk parked on one of those until the band covers it again. See [Two cpi-config entries on one cluster](troubleshooting.md#two-cpi-config-entries-on-one-cluster).
+
+## PVE HA
+
+- The cluster profile is probed on every call
+  The CPI reads quorum, the CRM master, node versions, and the token's privileges each time it needs the HA profile, and it keeps no cache. Every call that touches HA pays for those reads. See [HA and Resurrection](ha-and-resurrection.md#the-cluster-has-to-pass-the-profile-first).
+
+- A two-node cluster passes the profile only with a QDevice
+  The CPI counts a QDevice's votes only while it is connected, and it treats a QDevice answer that does not state a connection as one vote with an unknown status. We recommend three or more nodes. See [HA and Resurrection](ha-and-resurrection.md#quorum-votes-and-the-qdevice).
+
+- The CPI reads whether a watchdog is armed, not whether it works
+  A missing, misconfigured, or blocked watchdog cannot be seen from the API, so operators test each node's watchdog before enabling HA. See [HA and Resurrection](ha-and-resurrection.md#test-each-nodes-watchdog-before-you-turn-ha-on).
+
+- `replicate` loses writes since the last successful sync on a hard failure
+  The window runs from the last successful sync, and a job that keeps failing makes it grow without limit. After a failover, the old node's copy is rolled back on its first sync. See [HA and Resurrection](ha-and-resurrection.md#the-replicate-data-loss-window).
+
+- `create_vm` does not wait for a `replicate` VM's first sync
+  The CPI requests the sync and returns, so the VM keeps its narrow pin until a later `reboot_vm` or `set_vm_metadata` call finds a verified sync. See [HA and Resurrection](ha-and-resurrection.md#the-replicate-data-loss-window).
+
+- The replica's capacity is not charged to the partner node
+  Placement does not reserve the space that a `replicate` VM's copy takes on the partner, so an operator leaves room in the partner's pool. See [HA and Resurrection](ha-and-resurrection.md#the-replicate-data-loss-window).
+
+- The replica clock-skew bound is fixed at five minutes
+  The CPI measures no skew between the Director and the PVE nodes. See [HA and Resurrection](ha-and-resurrection.md#the-replicate-data-loss-window).
+
+- A journal record with a `replication` section is a downgrade hazard
+  A release older than the one that introduced `pve.ha.local_policy: replicate` refuses such a record. See the [changelog](../CHANGELOG.md) and [Operations](operations.md#pve-ha).
+
+- The N+1 headroom check is a memory-only estimate
+  It ignores host overhead, ballooning, and recovery order, so a cluster that passes can still fail to restart every VM. See [HA and Resurrection](ha-and-resurrection.md#placement-under-ha).
+
+- `hold` VMs block node maintenance until an operator stops them
+  The strict one-node pin forbids every other node, so HA cannot evacuate the VM. See [Operations](operations.md#node-maintenance-with-hold-vms).
+
+- Dead-node delete completion covers legacy VMs on reachable storage only
+  A VM that the allocation journal records, a VM with a node-local volume, and a `hold` VM keep deferring, and the operator follows the dead-node procedure. See [Operations](operations.md#the-dead-node-procedure).
+
+- Without `Sys.Console`, the CPI cannot clear the HA error of a running VM
+  PVE accepts only `disabled` for a resource in `error`, and `disabled` stops the guest, so a VM that BOSH keeps needs its resource removed and added again. Both steps need `Sys.Console` on `/`, so a deployment in observe-only gets a retriable error that names the privilege and the `ha-manager` commands to run by hand. See [HA and Resurrection](ha-and-resurrection.md#clearing-an-ha-error) and [Operations](operations.md#clearing-an-ha-error-by-hand).
+
+- The doctor reads a cpi-config entry from JSON or a bare list
+  `pve-cid ha --cpi-config` accepts a JSON document or a bare list of entries, not the rendered `cpi.json`. A YAML cpi-config converts with `yq -o=json`. See [Operations](operations.md#pve-ha).
 
 ## Permissions
 

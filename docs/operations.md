@@ -601,6 +601,190 @@ See [PVE Storage Locking](pve-storage-locking.md) for full lock mechanics.
 
 ---
 
+## PVE HA
+
+This section is for operators who set `pve.ha.mode` to `auto` or `managed`, and for anyone who finds HA objects on a cluster after switching back to `off`. [HA and Resurrection](ha-and-resurrection.md) explains the model, and [Configuration, HA](configuration.md#ha) lists the properties. The commands below run on a PVE node as root unless they say otherwise.
+
+### Reading the cluster with `pve-cid ha`
+
+The `pve-cid ha` subcommand is a read-only doctor. It never writes to PVE, and it runs in every mode, `off` included. On the Director VM we run it with the full path, because `pve-cid` is not on `PATH`.
+
+```bash
+/var/vcap/packages/pve_cpi/bin/pve-cid ha --config /var/vcap/jobs/pve_cpi/config/cpi.json
+```
+
+The command takes these flags.
+
+- `--config PATH`
+  This names the CPI configuration file. The rendered `cpi.json` is the usual value.
+
+- `--request PATH`
+  This names a CPI request, or a bare context object, whose context picks a cpi-config entry. The request's Director UUID also filters ownership markers, so the report skips another Director's rules and resources. Without a UUID, every marker counts.
+
+- `--cpi-config PATH`
+  This names a BOSH cpi-config as JSON, and the command then checks every `pve` entry and the exports they share. The file holds either `{"cpis": [...]}` or a bare list of entries. It is not the rendered `cpi.json`, which describes one cluster and belongs to `--config`, and a file that holds the rendered keys gets an error that says so. A YAML cpi-config converts with `yq -o=json . cpi-config.yml > cpi-config.json`. The flags `--request` and `--cpi-config` cannot be used together.
+
+- `--json`
+  This prints the report as JSON.
+
+The report starts with the profile line that the CPI logs, with the headroom result added at its end. It then lists the nodes, the CPU migration domains, and the findings, and it ends with a count.
+
+```
+ha: mode=auto effective=full topology=mixed pve=9.2.4 rules=yes crm=master@pve1 quorum=yes votes=3/3 survives_one=yes qdevice=no nodes=3/3 sys_console=yes crs=static rebalance_on_start=no headroom=ok(42%)
+nodes:
+  pve1 online votes=1 health=ok placeable=yes watchdog=armed pve=9.2.4 cpu=Cascadelake-Server
+  pve2 online votes=1 health=ok placeable=yes watchdog=unknown pve=9.2.4 cpu=Cascadelake-Server
+  pve3 online votes=1 health=ok placeable=yes watchdog=unknown pve=9.2.4 cpu=Cascadelake-Server
+cpu migration domains:
+  domain 1: Cascadelake-Server (flags aes,avx2) on pve1, pve2, pve3
+findings:
+  none
+result: 0 problem(s), 0 advice
+```
+
+The headroom field reads `headroom=ok(42%)` when every single-node failure leaves memory free on the survivors, where the percentage is the smallest margin over all such failures. It reads `short(<node>)` and names each node whose loss leaves a VM with nowhere to go, and it reads `unavailable` when the CPI could not read what it needs. The number is the same memory-only estimate that `create_vm` uses, so a result of `ok` does not promise that every VM restarts.
+
+Each finding is either a problem or advice. The command exits with 0 when the report holds no problem, with 1 when it holds a problem or a source it could not read, and with 2 for a usage error. An unreadable source counts as a problem with the kind `unchecked`, so a clean run proves that every check ran. The finding kinds fall into these groups.
+
+- Cluster and quorum
+  `observe_only`, `node_down`, `quorum_fragile`, `qdevice_advice`, `advice`, and `crs_mode`.
+
+- Rules and resources
+  `rule_problem`, `rule_unmarked`, `pin_missing`, `anti_affinity_skipped`, `anti_affinity_split`, `anti_affinity_short`, `resource_ignored`, and `managed_without_resource`.
+
+- CPU and local storage
+  `cpu_unknown`, `cpu_host_multi_domain`, `cpu_domain_too_small`, `local_unprotected`, and `hold_blocks_maintenance`.
+
+- Replication
+  `replica_on_partner`, `replica_awaiting_sync`, `replica_not_recoverable`, `replica_job_stale`, `replica_job_failing`, `replica_schedule_unjudged`, `replica_orphan_volume`, `replica_recorded_orphan`, `replica_superseded_copy`, and `replica_journal_unconfigured`.
+
+- Headroom
+  `headroom_short` and `headroom_unavailable`.
+
+- Leftovers and gaps
+  `birth_tag_stale`, `readd_tag`, `off_mode_resource`, `off_mode_rule`, `guests_not_enumerated`, and `unchecked`.
+
+A `replicate` VM shows `replica_awaiting_sync` as advice while its job works but the pin has not yet widened. It shows `replica_not_recoverable` as a problem only when no usable job exists, the job is disabled, or the first sync is more than twice its schedule plus the clock-skew bound overdue. A schedule the doctor cannot measure, such as a weekday list, gets `replica_schedule_unjudged` and is never called stale or healthy.
+
+With `--cpi-config`, the command also reports overlapping VMID bands on one export, a `next-id` range that overlaps a band or the `next-id` range of another cluster on the same export, and a `next-id` range that overlaps the cluster's own bands when another checked cluster mounts one of its exports. A possible shared backing, which is one export path behind different server strings, is advice and does not fail the run. The command exits with 1 for any failing finding. PVE's default `next-id` range of 100 to 999999 overlaps every band, so a cluster on a shared export keeps getting the finding until the operator sets a range outside the bands, as [Shared-storage rules](multi-cluster.md#shared-storage-rules) says.
+
+### When `delete_vm` defers
+
+A deferred `delete_vm` fails the Director's task with a retriable error that names the VM, its HA state, and its node's state. The Director does not wait for a deferred delete forever. When its retries run out, the `scan_and_fix` task fails with the defer message, and the Health Monitor asks again on its next cycle. If many instances defer at once, the Health Monitor's meltdown limit can stop resurrection for the whole deployment, so we resolve a defer rather than wait it out.
+
+1. Find the defer message with `bosh task <id>` or `bosh tasks --recent`.
+
+2. Run `pve-cid ha` against that cluster to see the node states and every CPI-owned HA resource.
+
+3. Act on the state.
+   For `fence` on a node that is still running, restore corosync or power the node off, so that PVE can fence it and recover the VM. For a dead node that PVE cannot fence, or a VM that is not HA-managed, follow [the dead-node procedure](#the-dead-node-procedure).
+
+4. Run `bosh cck`, or wait for the next resurrection, and the delete then completes.
+
+### The dead-node procedure
+
+A delete on a dead node cannot complete through the normal path, because every call about the VM goes to its node. After the grace window, the CPI finishes the delete itself for a legacy VM on shared storage, as [HA and Resurrection](ha-and-resurrection.md#when-the-grace-window-expires-on-a-dead-node) describes. This procedure covers every other case, which includes a VM that is not HA-managed, a `hold` VM, a VM that the allocation journal records, a VM with a node-local volume, and a cluster whose token lacks `Sys.Console`.
+
+Only follow it once the node is certain to be powered off. A node that is only partitioned may still run the guest, and moving its config then puts two writers on one disk.
+
+1. Confirm that the node is powered off, through IPMI or at the machine.
+   A missing ping is not proof, because a partitioned node still runs its guests.
+
+2. For a VM whose volumes are on shared storage, or whose ephemeral disk can be thrown away, move the config from a quorate node.
+
+   ```bash
+   mv /etc/pve/nodes/<dead>/qemu-server/<vmid>.conf /etc/pve/nodes/<live>/qemu-server/
+   ```
+
+   The next `delete_vm` retry finds the VM on the live node and completes.
+
+3. For a VM whose persistent disk lives on the dead node, either bring the node back or decide that the data is lost.
+   When the data is lost, remove the disk reference with `bosh cck`. PVE logs a warning for each local volume it cannot find during the destroy and finishes anyway.
+
+4. Run `bosh cck`, or wait for the next resurrection.
+
+### Clearing an HA error by hand
+
+PVE refuses every state request for a resource in `error` except `disabled`. The CPI clears the error itself when it holds `Sys.Console` on `/`. Without that privilege, it returns a retriable error that tells us which command to run.
+
+For a delete, or for a VM that is already stopped, we set the resource to `disabled`, wait until `ha-manager status` shows it `stopped`, and retry.
+
+```bash
+ha-manager set vm:<vmid> --state disabled
+```
+
+For a running VM that BOSH keeps, `disabled` would stop the guest, so we remove the resource and add it again, which leaves the guest running.
+
+```bash
+ha-manager remove vm:<vmid>
+ha-manager add vm:<vmid> --state started
+```
+
+The VM has no HA protection between those two commands, and a hand-made resource carries no pin or ownership marker, so we restore its rules afterward. When the CPI does the same work, it tags the VM `bosh-ha-readd-<unix seconds>` until the registration finishes. A tag that lingers past the create timeout plus `pve.ha.motion_wait_sec` means the registration did not finish, and the doctor reports it as `readd_tag`. We then add the resource with the command above, restore the VM's rules, and remove the tag.
+
+### Node maintenance with `hold` VMs
+
+PVE HA cannot evacuate a `hold` VM, because its strict pin forbids every other node. The maintenance request on the node therefore never completes while the VM runs. Before we put a node into maintenance, we stop its `hold` VMs, either with `bosh stop --hard` for the instance or with the command below, and we start them again afterward.
+
+```bash
+ha-manager set vm:<vmid> --state stopped
+```
+
+The doctor lists a `hold` VM on a node that is entering maintenance as `hold_blocks_maintenance`. A VM under `local_policy: none` is not HA-managed, so maintenance mode does not touch it. It keeps running until the node reboots, and then it goes down with the node.
+
+### Replicate failover and the old node's writes
+
+After a `replicate` VM fails over, PVE reverses its replication job, so that the job runs from the partner back to the old node. The job's next run receives with `zfs recv -F`, which rolls the old node's dataset back to the last common snapshot. Any write that existed only on the old node, which means every write since the last successful sync, is destroyed by that first run. Every resource the CPI registers has `failback` set to 0, so the VM stays on the partner when the old node returns.
+
+When those writes do not matter, we do nothing, and replication resumes in the new direction by itself. When they do matter, we save them first.
+
+1. Before the old node rejoins the cluster, disable the VM's replication job from a quorate node.
+
+   ```bash
+   pvesr disable <job>
+   ```
+
+2. Bring the old node back, and copy what is needed from its dataset, for example with `zfs send` of the newest snapshot or by mounting a clone of it.
+
+3. Enable the job again.
+
+   ```bash
+   pvesr enable <job>
+   ```
+
+   The job then overwrites the old node's dataset from the partner.
+
+The doctor reports a `replicate` VM that runs on its partner as `replica_on_partner`, which tells us about the reversed job.
+
+### Removing orphan replicas
+
+`delete_vm` retires a `replicate` VM's job before it destroys the VM. When the partner is offline, or the job is still there after `pve.ha.motion_wait_sec`, the CPI deletes the job with `force=1`. That call drops the job configuration without removing the partner's copy. The CPI logs the partner and the volume IDs that stay behind, and it records them in the allocation journal when the VM had a journal record. The doctor reports an unattended copy as `replica_orphan_volume` or `replica_recorded_orphan`, and it reports an older copy that a later retirement will remove as the advice `replica_superseded_copy`.
+
+We remove an orphan by hand, once nothing needs the copy. We check that the VM it belonged to is gone or runs elsewhere, and then we free the volume on the node that holds it.
+
+```bash
+pvesm free <storage>:<volume>
+```
+
+### Turning HA off after it was on
+
+Setting `pve.ha.mode: off` makes the CPI write no more HA state, but it does not remove the resources and rules that the CPI or an older release created. Until we remove them, the CPI still stops and deletes those VMs correctly, because the delete path reads the HA state and stops an HA-managed VM through PVE HA whatever the mode is. The doctor lists what is left as `off_mode_resource` and `off_mode_rule`. We remove each leftover in the PVE UI, or with the following commands.
+
+```bash
+ha-manager remove vm:<vmid>
+ha-manager rules remove <rule-id>
+```
+
+Removing a resource does not stop its guest.
+
+### Clusters that share an export
+
+Several clusters that mount one export share a volume namespace, so they need disjoint VMID bands and disjoint `next-id` ranges. [Shared-storage rules](multi-cluster.md#shared-storage-rules) covers the rules, including how the CPI refuses to delete a volume that another cluster owns. We run `pve-cid ha --cpi-config` against the cpi-config to check the pair.
+
+`qm rescan` on one cluster can add another cluster's volume to a VM's config as an `unusedN` entry. We never remove such an entry with `qm set --delete`, because that frees the volume and destroys the other cluster's disk. We edit the VM's config file under `/etc/pve/qemu-server/` and remove the line instead.
+
+---
+
 ## Applying or changing a cpi-config on a live Director
 
 A cpi-config gives a Director several named CPI entries, and each entry reaches one cluster or host. Once it is active, the Director refuses every deploy against a cloud-config whose AZs don't name an entry. We apply a new or changed cpi-config in this order, and [Multi-Cluster Deployments](multi-cluster.md#applying-a-cpi-config-on-a-live-director) explains the model behind it.

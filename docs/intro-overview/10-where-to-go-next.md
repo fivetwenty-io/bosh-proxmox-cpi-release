@@ -21,7 +21,7 @@ Everything this hour compressed into five-minute chapters exists somewhere in `d
 `docs/persistent-disks.md` for how disks map onto storage backends, and `docs/persistent-disk-strategy.md` for the detached-disk story — free-floating versus parked — and the disk-audit tool.
 
 - **Day two**
-`docs/operations.md` is the runbook: log access, health checks, the pre-deploy checklist, orphan cleanup. `docs/troubleshooting.md` is the symptom-indexed triage guide. `docs/ha-and-resurrection.md` settles the one-healer question with an ownership matrix and measured timings.
+`docs/operations.md` is the runbook: log access, health checks, the pre-deploy checklist, orphan cleanup. `docs/troubleshooting.md` is the symptom-indexed triage guide. `docs/ha-and-resurrection.md` sets out who recovers first, with the quorum rules, the dead-node procedure, and measured timings.
 
 - **The deep why**
 `docs/architecture/` — thirteen chapters deriving this whole design from first principles, for anyone who enjoyed today's story and wants the unabridged edition. `docs/design-decisions.md` records the judgment calls and the alternatives they beat.

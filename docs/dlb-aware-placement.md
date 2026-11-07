@@ -86,7 +86,7 @@ VMs in `z1` are scored and placed on `pve01` or `pve02`. VMs in `dlb-zone` are p
 | `pve.ha.dlb.az_name` | string | `"dlb"` | Sentinel AZ name. A VM with this AZ value is DLB-delegated even when `pve.ha.dlb.enabled` is false. Set to `""` to disable the sentinel. |
 | `pve.require_shared_iso_for_ha` | bool | `false` | When true, escalates the config-drive ISO migration-safety warning (see [Shared Storage Required](#shared-storage-required)) to a create_vm error instead of only logging it. |
 | `pve.ha.anti_affinity` | string | `auto` | `on` makes the CPI encode anti-affinity as PVE HA negative resource-affinity rules (`bosh-aa-<group>`), giving the scheduler a formal constraint rather than only a scored preference. It needs `pve.placement.anti_affinity.enabled` and a `pve.ha.mode` of `auto` or `managed`. The rules are always strict. |
-| `pve.placement.anti_affinity.verify` | bool | `false` | When true, the CPI performs a read-after-write check after updating the HA anti-affinity rule membership (via `verifyAntiAffinityMember`). A verify failure surfaces as a retriable error so the director re-drives. |
+| `pve.antiaffinity_verify` | bool | `false` | When true, the CPI re-lists the HA rules after recreating an anti-affinity rule and asserts that the target VM is a member (via `verifyAntiAffinityMember`). A verify failure surfaces as a retriable error so the director re-drives. |
 | `pve.ha.pin_az` | string | `auto` | `on` makes the CPI create a `bosh-na-{vmid}` HA node-affinity rule after placement to durably bind the VM to its AZ node set. It needs a non-empty `pve.placement.az_map` and a `pve.ha.mode` of `auto` or `managed`. See [HA Node-Affinity Pin](#ha-node-affinity-pin). |
 | `pve.ha.pin_az_strict` | bool | `true` | When true, the node-affinity pin is a hard constraint (PVE will not migrate the VM off the AZ node set even on total node-set failure). When false, the pin is preferred. See [Strict Pin Hazards](#strict-pin-hazards-single-node-az) for the single-node-AZ caveat. |
 
@@ -113,29 +113,11 @@ The CPI never writes the cluster CRS option. It reads `/cluster/options` each ti
 
 ## Safety Prerequisites
 
-### BOSH Resurrector Must Be Disabled
+### The BOSH Resurrector Stays On
 
-**The BOSH resurrector must be turned off for any deployment that uses DLB or HA-rule registration.** Both PVE HA and the BOSH resurrector independently detect that a VM is stopped and restart it. When both are active simultaneously:
+We no longer ask operators to turn the BOSH resurrector off. PVE HA is the first responder for a registered VM, and the resurrector is the fallback. The CPI defers `delete_vm` while PVE HA is fencing or recovering a VM, `has_vm` never reports a VM in fence or recovery as gone, and `attach_disk` refuses a second holder of a disk with a retriable error, so the resurrector cannot build a replacement beside a guest that PVE HA is about to restart. Earlier releases told operators to run `bosh update-resurrection off` for these deployments. That advice is withdrawn.
 
-- A VM that stops triggers both PVE HA and the BOSH resurrector.
-
-- PVE HA restarts the guest on a different node; the BOSH Director sees the original VM ID as unresponsive and issues a `create_vm`, producing a duplicate.
-
-- The original HA-managed guest and the Director-spawned replacement can conflict on IP, VMID, or agent credentials, leaving orphaned HA resources that block future operations.
-
-
-The CPI cannot detect the resurrector's state, so this is the operator's responsibility. Disable the resurrector via:
-
-```yaml
-# In bosh-deployment / manifest resurrector property
-resurrector_enabled: false
-```
-
-Or through the BOSH CLI:
-
-```bash
-bosh update-resurrection off
-```
+DLB adds one more thing to know. The cluster resource manager can move a DLB-registered VM at any time to rebalance load, and a migration in flight makes `delete_vm` wait for motion, as the defer table in [HA and Resurrection](ha-and-resurrection.md#when-delete_vm-defers) shows. Raise `agent_timeout` to 240 seconds or more, as that page recommends, so that a short pause during a migration does not start a resurrection.
 
 ### Shared Storage Required
 
@@ -306,7 +288,7 @@ On `delete_vm`, the CPI removes the VM from all associated PVE HA rules:
 
 - `removeAntiAffinityMembership` removes the VM from `bosh-aa-<group>` rules (runs when `pve.ha.anti_affinity` is `on` **or** DLB is configured, meaning the master flag is on or the sentinel name is non-empty, and the mode is `auto` or `managed` in both cases).
 
-Both cleanups are best-effort and do not block VM deletion.
+The cleanups run after the HA delete gate in [HA and Resurrection](ha-and-resurrection.md#when-delete_vm-defers) has let the delete proceed. A VM that PVE HA is fencing or recovering is not cleaned up at all, because `delete_vm` defers with a retriable error first.
 
 ---
 

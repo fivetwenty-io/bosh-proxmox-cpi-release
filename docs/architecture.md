@@ -168,7 +168,7 @@ The dispatcher wraps every handler call in `recover()`. A recovered panic become
 
 ### Placement and AZ anti-affinity
 
-`GatherNodeFacts` queries `/cluster/status`, `/cluster/resources`, and per-node storage to build each node's memory, CPU, storage, guest count, and HA tags. `ScoreNodes` computes a weighted sum (memory 1.0, storage 0.5, CPU 0.5, guest count 0.3, anti-affinity penalty 5.0×). The `create_vm` handler calls `SelectNode`, feeds the winner to every subsequent clone and attach call, and optionally writes a PVE HA node-affinity rule (`bosh-na-{vmid}`). A sentinel AZ value of `dlb` hands placement to the PVE 9.2 Dynamic Load Balancer instead; see [DLB-Aware Placement](dlb-aware-placement.md). VMs land on nodes that can host them, and anti-affinity groups spread across failure domains.
+`GatherNodeFacts` queries `/cluster/status`, `/cluster/resources`, and per-node storage to build each node's memory, CPU, storage, guest count, and HA tags. `ScoreNodes` computes a weighted sum (memory 1.0, storage 0.5, CPU 0.5, guest count 0.3, anti-affinity penalty 5.0×). The `create_vm` handler calls `SelectNode`, feeds the winner to every subsequent clone and attach call, and, when `pve.ha.mode` is `auto` or `managed`, registers the VM with PVE HA and writes its node-affinity rule (`bosh-na-{vmid}`) and any anti-affinity rule. A sentinel AZ value of `dlb` hands placement to the PVE 9.2 Dynamic Load Balancer instead; see [DLB-Aware Placement](dlb-aware-placement.md) and [HA and Resurrection](ha-and-resurrection.md). VMs land on nodes that can host them, and anti-affinity groups spread across failure domains.
 
 ### Cluster pool lock
 
