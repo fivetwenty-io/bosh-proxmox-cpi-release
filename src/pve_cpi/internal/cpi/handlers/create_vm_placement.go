@@ -324,6 +324,10 @@ func resolveTargetNodeWithBridges(
 		// Storage-utilization ceiling gate (same computation as non-fallback path).
 		utilCeilingPctFB, utilAddBytesFB, warnUtilChosenFB := utilizationGateForRequest(deps.Config, cp, storageName, facts, logger)
 
+		// The N+1 headroom check. It is nil with pve.ha.mode or pve.ha.headroom off,
+		// and then no read is made and Request.Headroom stays nil.
+		headroom := buildHeadroomPlan(ctx, deps, cp, cpResolver, bridges, facts, logger)
+
 		// One record per AZ attempt, so a reason recorded while filtering one AZ
 		// never masks another AZ's own reason.
 		inCluster := make(map[string]struct{}, len(facts))
@@ -346,6 +350,7 @@ func resolveTargetNodeWithBridges(
 				PlannedAddBytes:      utilAddBytesFB,
 			}
 			bridges.apply(&req)
+			headroom.apply(&req)
 			pass, rejections := placement.Filter(facts, req)
 			bridges.warnGaps(logger, pass, "")
 			azRecords = append(azRecords, newAZRejectionRecord("", nil, rejections, inCluster))
@@ -353,6 +358,7 @@ func resolveTargetNodeWithBridges(
 			logFilterRejections(logger, rejections, "")
 			if chosen, ranked := scoreAndPickWithRanked(pass, weights, logger, ""); chosen != "" {
 				warnUtilChosenFB(chosen)
+				headroom.warnChosen(logger, facts, chosen)
 				alts := buildAlternates(chosen, ranked, fallbackMax)
 				return chosen, alts, nil
 			}
@@ -371,6 +377,7 @@ func resolveTargetNodeWithBridges(
 					PlannedAddBytes:      utilAddBytesFB,
 				}
 				bridges.apply(&req)
+				headroom.apply(&req)
 				pass, rejections := placement.Filter(facts, req)
 				bridges.warnGaps(logger, pass, az)
 				azRecords = append(azRecords, newAZRejectionRecord(az, candidateSet, rejections, inCluster))
@@ -378,12 +385,22 @@ func resolveTargetNodeWithBridges(
 				logFilterRejections(logger, rejections, az)
 				if chosen, ranked := scoreAndPickWithRanked(pass, weights, logger, az); chosen != "" {
 					warnUtilChosenFB(chosen)
+					headroom.warnChosen(logger, facts, chosen)
 					alts := buildAlternates(chosen, ranked, fallbackMax)
 					return chosen, alts, nil
 				}
 				logger.Debug("create_vm: placement: AZ exhausted, trying next",
 					log.String("az", az),
 				)
+			}
+		}
+
+		// An enforced headroom check that took part in the exhaustion refuses the
+		// create. Falling back to config.node would place the VM on a node the
+		// check did not clear, which is what enforce exists to prevent.
+		if headroom.enforced() {
+			if flat := flattenAZRecords(azRecords); headroomRejected(flat) {
+				return "", nil, noViableCandidatesError(flat, azRecordsRetriable(azRecords))
 			}
 		}
 
@@ -408,19 +425,7 @@ func resolveTargetNodeWithBridges(
 			}
 		}
 		if fallback == "" {
-			allRejections := legacyRejections
-			if classifyFilterResult(allRejections) {
-				return "", nil, cpierrors.Retriable(
-					"create_vm: no viable placement candidates (transient); "+
-						"all nodes rejected: %s",
-					formatRejections(allRejections),
-				)
-			}
-			return "", nil, cpierrors.Cloud(
-				"create_vm: no viable placement candidates; "+
-					"all nodes rejected: %s",
-				formatRejections(allRejections),
-			)
+			return "", nil, noViableCandidatesError(legacyRejections, classifyFilterResult(legacyRejections))
 		}
 		return fallback, nil, nil
 	}
@@ -781,10 +786,11 @@ func scoreAndPickWithRanked(pass []placement.NodeFacts, weights placement.Weight
 }
 
 // logFilterRejections emits a Debug entry for each rejection. A bridge rejection
-// is an operator-actionable problem, so it logs at Warn instead.
+// or a headroom refusal is an operator-actionable problem, so it logs at Warn instead.
 func logFilterRejections(logger *log.Logger, rejections map[string]string, az string) {
 	for n, reason := range rejections {
-		if strings.HasPrefix(reason, "missing bridge ") || strings.HasPrefix(reason, "network lookup failed: ") {
+		if strings.HasPrefix(reason, "missing bridge ") || strings.HasPrefix(reason, "network lookup failed: ") ||
+			isHeadroomRejectionReason(reason) {
 			logger.Warn("create_vm: placement: node filtered",
 				log.String("node", n),
 				log.String("reason", reason),
@@ -865,7 +871,13 @@ func isTransientRejectionReason(reason string) bool {
 	// A failed network listing is transient in the same way. "missing bridge
 	// <name>" stays permanent, because the node answered and the bridge is not
 	// there.
-	return strings.HasPrefix(reason, "network lookup failed: ")
+	if strings.HasPrefix(reason, "network lookup failed: ") {
+		return true
+	}
+	// A headroom shortfall is transient because capacity frees up when a guest
+	// is deleted or moved, and an estimate that could not run is not a proven
+	// refusal, since an unreadable guest list says nothing about the memory.
+	return isHeadroomRejectionReason(reason)
 }
 
 // formatRejections returns a compact human-readable summary of a rejection map.
