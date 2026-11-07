@@ -9,7 +9,7 @@ Two independent systems can restart a BOSH-managed VM that has stopped respondin
 | **Default (zero-config)** | BOSH resurrector | No | Nothing, so leave the resurrector on (the Director default) |
 | **Opt-in (any HA-registration feature active)** | PVE HA | Yes | Disable the resurrector for that deployment: `bosh update-resurrection off` |
 
-With a stock configuration, where `pve.ha.mode` is left at `off`, the CPI never registers a VM as a PVE HA resource. Zero HA API calls are made. The BOSH resurrector is the sole recovery mechanism, and this is the correct, zero-configuration default: leave resurrection on.
+With a stock configuration, where `pve.ha.mode` is left at `off`, the CPI never registers a VM as a PVE HA resource. Zero HA API calls are made. The BOSH resurrector is the sole recovery mechanism, so this is the correct, zero-configuration default, and we leave resurrection on.
 
 Setting `pve.ha.mode` to `auto` or `managed` opts VMs into PVE HA. At each `create_vm` the CPI decides whether the VM can run under HA, from its volumes, its devices, and what the cluster profile allows. Under the default `pve.ha.local_policy: none`, a VM with a node-local volume or a PCI passthrough device stays out of HA. Every VM the decision registers gets a node-affinity pin named `bosh-na-<vmid>` and the `bosh-ha-managed` tag. Three configuration knobs shape what the CPI writes for a registered VM:
 
@@ -19,7 +19,7 @@ Setting `pve.ha.mode` to `auto` or `managed` opts VMs into PVE HA. At each `crea
 
 Each one needs `pve.ha.mode` set to `auto` or `managed`. Under `off` the CPI affects no VM through HA, and a `create_vm` in the DLB sentinel AZ fails instead of creating a VM that nothing manages. The release removed the earlier `pve.placement` keys for these features, and [Removed placement keys](configuration.md#removed-placement-keys) maps each one to its replacement.
 
-A registered VM is in `ha-manager`. The moment that happens, **you must disable the BOSH resurrector for that deployment**, via `bosh update-resurrection off` or `resurrector_enabled: false` in the Director manifest.
+Once a VM is registered in `ha-manager`, **you must disable the BOSH resurrector for that deployment**, via `bosh update-resurrection off` or `resurrector_enabled: false` in the Director manifest.
 
 ### Two prerequisites that are easy to miss
 
