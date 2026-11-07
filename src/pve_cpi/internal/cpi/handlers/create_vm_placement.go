@@ -13,6 +13,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -325,8 +326,10 @@ func resolveTargetNodeWithBridges(
 		utilCeilingPctFB, utilAddBytesFB, warnUtilChosenFB := utilizationGateForRequest(deps.Config, cp, storageName, facts, logger)
 
 		// The N+1 headroom check. It is nil with pve.ha.mode or pve.ha.headroom off,
-		// and then no read is made and Request.Headroom stays nil.
-		headroom := buildHeadroomPlan(ctx, deps, cp, cpResolver, bridges, facts, logger)
+		// and then no read is made and Request.Headroom stays nil. It belongs to
+		// this scoring branch alone, so target_node, a local-disk pin, placement
+		// disabled, and a storage plan skip it, as the spec and changelog say.
+		headroom := buildHeadroomPlan(ctx, deps, cp, cloudPropsMap, cpResolver, diskCIDs, bridges, facts, logger)
 
 		// One record per AZ attempt, so a reason recorded while filtering one AZ
 		// never masks another AZ's own reason.
@@ -350,8 +353,7 @@ func resolveTargetNodeWithBridges(
 				PlannedAddBytes:      utilAddBytesFB,
 			}
 			bridges.apply(&req)
-			headroom.apply(&req)
-			pass, rejections := placement.Filter(facts, req)
+			pass, rejections := headroom.filter(facts, req, logger)
 			bridges.warnGaps(logger, pass, "")
 			azRecords = append(azRecords, newAZRejectionRecord("", nil, rejections, inCluster))
 			mergeRejections(legacyRejections, rejections)
@@ -377,8 +379,7 @@ func resolveTargetNodeWithBridges(
 					PlannedAddBytes:      utilAddBytesFB,
 				}
 				bridges.apply(&req)
-				headroom.apply(&req)
-				pass, rejections := placement.Filter(facts, req)
+				pass, rejections := headroom.filter(facts, req, logger)
 				bridges.warnGaps(logger, pass, az)
 				azRecords = append(azRecords, newAZRejectionRecord(az, candidateSet, rejections, inCluster))
 				mergeRejections(legacyRejections, rejections)
@@ -635,6 +636,26 @@ type diskFaultConstraints struct {
 	// requiredAZs collects AZ labels from shared-storage disks. Empty means
 	// no AZ constraint from persistent disks.
 	requiredAZs map[string]struct{}
+}
+
+// placementDiskVolume names the volume a persistent disk's CID stands for as a
+// decision input, from the CID alone. Like deriveDiskFaultConstraints it reads
+// only the CID's metadata and the storage prefix of its volume ID, which a
+// reassignment rename never changes, so it makes no cluster read. A disk with
+// no stable ID is legacy. The bool is false when the CID names no storage.
+func placementDiskVolume(cid string) (ha.VMVolume, bool) {
+	bare, meta, err := pve.ParseEncodedDiskCID(cid)
+	if err != nil {
+		bare, meta = cid, nil
+	}
+	if _, _, err := pve.ParseDiskCID(bare); err != nil {
+		return ha.VMVolume{}, false
+	}
+	vol := ha.VMVolume{Volume: bare, Legacy: meta == nil || meta.ID == ""}
+	if meta != nil {
+		vol.HomeNode = meta.Node
+	}
+	return vol, true
 }
 
 // deriveDiskFaultConstraints inspects each disk CID and builds the set of

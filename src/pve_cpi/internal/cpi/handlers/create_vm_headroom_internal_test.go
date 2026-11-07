@@ -17,6 +17,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 const headroomMiB = int64(1024 * 1024)
@@ -125,6 +126,7 @@ func newHeadroomRig(t *testing.T, haMode, headroom string, guests []map[string]a
 		[]map[string]any{onlineNode("pve01"), onlineNode("pve02"), onlineNode("pve03")},
 		func(c *config.CPIConfig) {
 			c.VMStorage = "nfs"
+			c.ISOStorage = "nfs"
 			c.HA = &config.HAConfig{Mode: haChoiceOf(haMode), Headroom: haChoiceOf(headroom)}
 			if cfgFn != nil {
 				cfgFn(c)
@@ -133,6 +135,7 @@ func newHeadroomRig(t *testing.T, haMode, headroom string, guests []map[string]a
 	base := deps.PVE.(*placementInternalTestPVE)
 	cluster := &headroomCluster{fullClusterAdapter: &fullClusterAdapter{sub: base.clusterClient}, guests: guests}
 	deps.PVE = &headroomPVE{placementInternalTestPVE: base, cluster: cluster}
+	deps.RequestDirectorUUID = "director-1"
 	logger, obs := log.NewObservedLogger(log.LevelDebug)
 	deps.Logger = logger
 	calls := new(int)
@@ -142,6 +145,19 @@ func newHeadroomRig(t *testing.T, haMode, headroom string, guests []map[string]a
 		return profile, nil
 	}
 	return &headroomRig{deps: deps, cluster: cluster, profileCalls: calls, logs: obs}
+}
+
+// testBuildPlan builds the plan for a VM with no persistent disks and no
+// storage selector. A nil resolver stands for a request with no cloud properties.
+func testBuildPlan(
+	t *testing.T, deps Deps, cp createVMCloudProps, resolver *layeredResolver, bridges bridgePlan,
+	facts []placement.NodeFacts, logger *log.Logger,
+) *headroomPlan {
+	t.Helper()
+	if resolver == nil {
+		resolver = mustResolver(t, deps)
+	}
+	return buildHeadroomPlan(context.Background(), deps, cp, nil, resolver, nil, bridges, facts, logger)
 }
 
 func (r *headroomRig) place(t *testing.T, cp createVMCloudProps) (string, []string, error) {
@@ -315,14 +331,14 @@ func TestHeadroom_OffMakesNoReadsAndLeavesTheRequestAlone(t *testing.T) {
 			if *rig.profileCalls != 0 {
 				t.Errorf("the HA profile was resolved %d times; want none", *rig.profileCalls)
 			}
-			if plan := buildHeadroomPlan(context.Background(), rig.deps, createVMCloudProps{Memory: 4096}, nil,
+			if plan := testBuildPlan(t, rig.deps, createVMCloudProps{Memory: 4096}, nil,
 				bridgePlan{}, nil, rig.deps.Logger); plan != nil {
 				t.Errorf("plan = %+v; want nil", plan)
 			}
-			var req placement.Request
-			(*headroomPlan)(nil).apply(&req)
-			if req.Headroom != nil {
-				t.Errorf("Request.Headroom = %+v; want nil", req.Headroom)
+			pass, rejections := (*headroomPlan)(nil).filter(factsOf("pve01", "pve02"), placement.Request{},
+				rig.deps.Logger)
+			if len(pass) != 2 || rejections != nil {
+				t.Errorf("nil plan filtered to %v with rejections %v; want every node and none", pass, rejections)
 			}
 		})
 	}
@@ -333,15 +349,19 @@ func TestHeadroom_DefaultModeIsWarn(t *testing.T) {
 	rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomWarn, nil, func(c *config.CPIConfig) {
 		c.HA.Headroom = nil
 	})
-	plan := buildHeadroomPlan(context.Background(), rig.deps, createVMCloudProps{Memory: 4096}, nil, bridgePlan{},
+	plan := testBuildPlan(t, rig.deps, createVMCloudProps{Memory: 4096}, nil, bridgePlan{},
 		factsOf("pve01", "pve02", "pve03"), rig.deps.Logger)
 	if plan == nil || plan.check.Mode != config.HAHeadroomWarn {
 		t.Fatalf("plan = %+v; want a warn-mode check", plan)
 	}
-	var req placement.Request
-	plan.apply(&req)
-	if req.Headroom != plan.check {
-		t.Error("apply did not set Request.Headroom")
+	// The filter keeps every node in warn mode, and the guests are not read until
+	// a node is chosen.
+	pass, rejections := plan.filter(factsOf("pve01", "pve02", "pve03"), placement.Request{}, rig.deps.Logger)
+	if len(pass) != 3 || rejections != nil {
+		t.Errorf("warn filtered to %v with rejections %v; want every node and none", pass, rejections)
+	}
+	if got := rig.cluster.reads(); got != 0 {
+		t.Errorf("%d reads before a node was chosen; want none in warn mode", got)
 	}
 }
 
@@ -412,7 +432,7 @@ func TestHeadroom_StrictAZNarrowsTheVMsAdmissibleSet(t *testing.T) {
 	for _, strict := range []bool{true, false} {
 		rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce, guests, setAZ(strict))
 		cp := createVMCloudProps{AvailabilityZone: "zone-a", Memory: 4096}
-		plan := buildHeadroomPlan(context.Background(), rig.deps, cp, mustResolver(t, rig.deps), bridgePlan{},
+		plan := testBuildPlan(t, rig.deps, cp, mustResolver(t, rig.deps), bridgePlan{},
 			factsOf("pve01", "pve02", "pve03"), rig.deps.Logger)
 		if plan == nil {
 			t.Fatalf("strict=%v: no plan", strict)
@@ -477,7 +497,7 @@ func TestHeadroom_BridgeConstraintNarrowsTheAdmissibleSet(t *testing.T) {
 		},
 	}
 	facts := factsOf("pve01", "pve02", "pve03")
-	plan := buildHeadroomPlan(context.Background(), rig.deps, createVMCloudProps{Memory: 4096}, nil, bridges,
+	plan := testBuildPlan(t, rig.deps, createVMCloudProps{Memory: 4096}, nil, bridges,
 		facts, rig.deps.Logger)
 	if plan == nil {
 		t.Fatal("no plan; two nodes hold the bridge, so the VM registers")
@@ -485,14 +505,14 @@ func TestHeadroom_BridgeConstraintNarrowsTheAdmissibleSet(t *testing.T) {
 	if got := plan.check.VM.AdmissibleFor("pve01"); !sameNodeSet(got, []string{"pve01", "pve02"}) {
 		t.Errorf("admissible set = %v; want the two nodes that hold the bridge", got)
 	}
-	// pve03 cannot run the VM at all, so no decision registers it there and
-	// the set falls back to every node, which over-counts and so errs safe.
-	if got := plan.check.VM.AdmissibleFor("pve03"); !sameNodeSet(got, []string{"pve01", "pve02", "pve03"}) {
-		t.Errorf("admissible set of a node outside the bridge's holders = %v; want every node", got)
+	// pve03 cannot run the VM at all, so no decision registers it there and the
+	// check does not apply to it.
+	if !plan.exempt["pve03"] || plan.exempt["pve01"] || plan.exempt["pve02"] {
+		t.Errorf("exempt = %v; want only pve03, which does not hold the bridge", plan.exempt)
 	}
 
 	holders = map[string]bool{"pve01": true}
-	if plan := buildHeadroomPlan(context.Background(), rig.deps, createVMCloudProps{Memory: 4096}, nil, bridges,
+	if plan := testBuildPlan(t, rig.deps, createVMCloudProps{Memory: 4096}, nil, bridges,
 		facts, rig.deps.Logger); plan != nil {
 		t.Errorf("plan = %+v; want none, because one holder leaves the VM without a recovery node", plan.check.VM)
 	}
@@ -502,7 +522,7 @@ func TestHeadroom_PCIPassthroughPinsTheVMToItsNode(t *testing.T) {
 	t.Parallel()
 	rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce, nil, nil)
 	cp := createVMCloudProps{Memory: 4096, PCIPassthroughs: []PCIPassthrough{{Address: "0000:01:00.0"}}}
-	plan := buildHeadroomPlan(context.Background(), rig.deps, cp, nil, bridgePlan{},
+	plan := testBuildPlan(t, rig.deps, cp, nil, bridgePlan{},
 		factsOf("pve01", "pve02", "pve03"), rig.deps.Logger)
 	if plan != nil {
 		t.Fatalf("plan = %+v; want none, because a PCI VM is pinned to its node and gets no HA recovery", plan.check.VM)
@@ -518,25 +538,25 @@ func TestHeadroom_StoragePoolOverrideSelectsTheDecisionStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newLayeredResolver: %v", err)
 	}
-	plan := buildHeadroomPlan(context.Background(), rig.deps, createVMCloudProps{Memory: 4096}, resolver,
+	plan := testBuildPlan(t, rig.deps, createVMCloudProps{Memory: 4096}, resolver,
 		bridgePlan{}, factsOf("pve01", "pve02", "pve03"), rig.deps.Logger)
 	if plan == nil {
 		t.Fatal("no plan; storage_pool nfs is shared and registers the VM")
 	}
 }
 
-func TestHeadroom_OfflineNodeGetsTheAllNodesSet(t *testing.T) {
+func TestHeadroom_OfflineNodeIsExempt(t *testing.T) {
 	t.Parallel()
 	rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce, nil, nil)
 	facts := factsOf("pve01", "pve02", "pve03")
 	facts[2].Online = false
-	plan := buildHeadroomPlan(context.Background(), rig.deps, createVMCloudProps{Memory: 4096}, nil, bridgePlan{},
+	plan := testBuildPlan(t, rig.deps, createVMCloudProps{Memory: 4096}, nil, bridgePlan{},
 		facts, rig.deps.Logger)
 	if plan == nil {
 		t.Fatal("no plan")
 	}
-	if got := plan.check.VM.AdmissibleFor("pve03"); !sameNodeSet(got, []string{"pve01", "pve02", "pve03"}) {
-		t.Errorf("admissible set of the offline node = %v; want every node", got)
+	if !plan.exempt["pve03"] || plan.exempt["pve01"] {
+		t.Errorf("exempt = %v; want only the offline pve03", plan.exempt)
 	}
 }
 
@@ -552,7 +572,7 @@ func TestHeadroom_VMMemoryComesFromTheRequest(t *testing.T) {
 		{createVMCloudProps{RAM: 1024}, 1024},
 		{createVMCloudProps{}, 512},
 	} {
-		plan := buildHeadroomPlan(context.Background(), rig.deps, tc.cp, nil, bridgePlan{}, facts, rig.deps.Logger)
+		plan := testBuildPlan(t, rig.deps, tc.cp, nil, bridgePlan{}, facts, rig.deps.Logger)
 		if plan == nil || plan.check.VM.MemBytes != tc.want*headroomMiB {
 			t.Errorf("cp %+v: VM memory = %+v; want %d MiB", tc.cp, plan, tc.want)
 		}
@@ -790,5 +810,417 @@ func TestHeadroom_WarnInAZOrderPlacesAndLogs(t *testing.T) {
 	}
 	if entry.Attrs["node"] != node {
 		t.Errorf("warning names node %v; want the chosen %s", entry.Attrs["node"], node)
+	}
+}
+
+// placeWith places a VM like place, with the persistent disk CIDs, cloud
+// properties map, and bridge plan the caller names.
+func (r *headroomRig) placeWith(
+	cp createVMCloudProps, diskCIDs []string, cpMap map[string]any, bridges bridgePlan,
+) (string, []string, error) {
+	cp.Memory = 4096
+	return resolveTargetNodeWithBridges(context.Background(), r.deps, cp, scorerGroup{}, diskCIDs, nil, cpMap, 3,
+		bridges)
+}
+
+// assertPlacedWithNoCheck fails unless the placement succeeded and made no
+// headroom read, which is what a VM that gets no HA must see even in enforce
+// mode over a cluster with no room.
+func assertPlacedWithNoCheck(t *testing.T, rig *headroomRig, node string, err error) {
+	t.Helper()
+	if err != nil || node == "" {
+		t.Fatalf("placement = %q, %v; want the VM placed, because the real decision registers no HA for it", node, err)
+	}
+	if got := rig.cluster.reads(); got != 0 {
+		t.Errorf("%d headroom reads; want none", got)
+	}
+}
+
+func TestHeadroom_NoDirectorUUIDMeansNoCheck(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{config.HAHeadroomEnforce, config.HAHeadroomWarn} {
+		for _, haMode := range []string{config.HAModeAuto, config.HAModeManaged} {
+			t.Run(haMode+"/"+mode, func(t *testing.T) {
+				t.Parallel()
+				rig := newHeadroomRig(t, haMode, mode, fullNonHAGuests("pve01", "pve02", "pve03"), nil)
+				rig.deps.RequestDirectorUUID = ""
+				node, _, err := rig.place(t, createVMCloudProps{})
+				assertPlacedWithNoCheck(t, rig, node, err)
+				if *rig.profileCalls != 0 {
+					t.Errorf("the HA profile was resolved %d times; want none, because the gate comes first",
+						*rig.profileCalls)
+				}
+				if _, ok := hasWarn(rig.logs, "headroom estimate"); ok {
+					t.Errorf("a headroom warning for a VM that gets no HA; logs: %v", rig.logs.All())
+				}
+				if !hasDebug(rig.logs, "the request carries no director_uuid") {
+					t.Errorf("no Debug line naming the skipped check; logs: %v", rig.logs.All())
+				}
+			})
+		}
+	}
+}
+
+func hasDebug(obs *log.Observer, substr string) bool {
+	for _, e := range obs.All() {
+		if e.Level == log.LevelDebug && strings.Contains(e.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestHeadroom_EveryVolumeOfTheConfigDecidesWhetherTheVMRegisters(t *testing.T) {
+	t.Parallel()
+	local := testPinStorage
+	cases := []struct {
+		name   string
+		mutate func(*config.CPIConfig)
+		cp     createVMCloudProps
+		cpMap  map[string]any
+		disks  []string
+		// refuse is true when every volume is shared, so the real decision
+		// registers the VM and enforce refuses it on a full cluster.
+		refuse bool
+	}{
+		{name: "root and ISO on shared storage", refuse: true},
+		{
+			name: "ephemeral disk on shared storage", refuse: true,
+			cp: createVMCloudProps{EphemeralDiskSizeMB: 10240, EphemeralStoragePool: "nfs"},
+		},
+		{
+			name: "ephemeral disk on local storage",
+			cp:   createVMCloudProps{EphemeralDiskSizeMB: 10240, EphemeralStoragePool: local},
+		},
+		{
+			name:  "ephemeral disk on local storage from the layered pool",
+			cp:    createVMCloudProps{EphemeralDiskSizeMB: 10240},
+			cpMap: map[string]any{"ephemeral_storage_pool": local},
+		},
+		{
+			name: "ephemeral disk falls back to a local vm_storage root", cp: createVMCloudProps{EphemeralDiskSizeMB: 10240},
+			cpMap:  map[string]any{"storage_pool": "nfs"},
+			mutate: func(c *config.CPIConfig) { c.VMStorage = local },
+		},
+		{
+			name:   "config-drive ISO on local storage",
+			mutate: func(c *config.CPIConfig) { c.ISOStorage = local },
+		},
+		{
+			name: "no agent means no ISO", refuse: true,
+			mutate: func(c *config.CPIConfig) { c.ISOStorage = local; c.AgentMode = config.AgentModeNoAgent },
+		},
+		{
+			name:  "persistent disk on local storage",
+			disks: []string{local + ":vm-9-disk-1"},
+		},
+		{
+			name:  "persistent disk on shared storage",
+			disks: []string{"nfs:vm-9-disk-1"}, refuse: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce,
+				fullNonHAGuests("pve01", "pve02", "pve03"), func(c *config.CPIConfig) {
+					c.HA.LocalPolicy = haChoiceOf(config.HALocalPolicyNone)
+					if tc.mutate != nil {
+						tc.mutate(c)
+					}
+				})
+			node, _, err := rig.placeWith(tc.cp, tc.disks, tc.cpMap, bridgePlan{})
+			if tc.refuse {
+				if err == nil {
+					t.Fatalf("placement chose %q; want a refusal, because the VM registers and no node has room", node)
+				}
+				return
+			}
+			assertPlacedWithNoCheck(t, rig, node, err)
+		})
+	}
+}
+
+func TestHeadroom_UnknownPoolsRunNoCheckAndLogAtDebug(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		cp     createVMCloudProps
+		cpMap  map[string]any
+		disks  []string
+		mutate func(*config.CPIConfig)
+		want   string
+	}{
+		{name: "root storage tier", cpMap: map[string]any{"storage_tier": "fast"}, want: "a storage tier picks the root"},
+		{
+			name: "ephemeral storage tier", cp: createVMCloudProps{EphemeralDiskSizeMB: 1024},
+			cpMap: map[string]any{"ephemeral_storage_tier": "fast"}, want: "picks the ephemeral disk's pool",
+		},
+		{
+			name: "encrypted ephemeral disk", cp: createVMCloudProps{EphemeralDiskSizeMB: 1024},
+			cpMap: map[string]any{"encrypted": true, "ephemeral_storage_tier": "enc"}, want: "encrypted ephemeral disk",
+			mutate: func(c *config.CPIConfig) {
+				enc := true
+				c.StorageTiers = map[string]config.StorageTierCriteria{"enc": {Encrypted: &enc}}
+			},
+		},
+		{name: "no root pool", mutate: func(c *config.CPIConfig) { c.VMStorage = "" }, want: "root disk's pool is not known"},
+		{
+			name: "no ISO pool", mutate: func(c *config.CPIConfig) { c.ISOStorage = "" },
+			want: "config-drive ISO's pool is not known",
+		},
+		{name: "persistent disk with no pool", disks: []string{"nopool"}, want: "names no pool"},
+		{
+			name: "storage selectors that do not resolve", cpMap: map[string]any{"storage_set": "set-a"},
+			want: "the storage selectors do not resolve",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce,
+				fullNonHAGuests("pve01", "pve02", "pve03"), tc.mutate)
+			node, _, err := rig.placeWith(tc.cp, tc.disks, tc.cpMap, bridgePlan{})
+			assertPlacedWithNoCheck(t, rig, node, err)
+			if !hasDebug(rig.logs, tc.want) {
+				t.Errorf("no Debug line containing %q; logs: %v", tc.want, rig.logs.All())
+			}
+		})
+	}
+}
+
+func TestHeadroom_LinkedCloneReadingNeverRefuses(t *testing.T) {
+	t.Parallel()
+	// The root disk is on node-local ZFS under the replicate policy. A full clone
+	// registers, and a linked clone cannot be replicated, so the real decision
+	// leaves the VM unregistered if create_vm clones it linked. Whether it does is
+	// known only after placement, so the prediction runs no check.
+	rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce,
+		fullNonHAGuests("pve01", "pve02", "pve03"), func(c *config.CPIConfig) {
+			c.VMStorage = "tank"
+			c.HA.LocalPolicy = haChoiceOf(config.HALocalPolicyReplicate)
+		})
+	profile := stagingProfile(config.HAModeAuto)
+	profile.Storages = append(profile.Storages, pve.StorageInfo{Name: "tank", Type: pve.StorageTypeZFSPool, Content: "images"})
+	rig.deps.HAProfile = func(context.Context) (*ha.Profile, error) { return profile, nil }
+	volumes := []ha.VMVolume{
+		{Volume: "tank:vm-1-disk-0"}, {Volume: "nfs:iso/vm-1-config.iso", Kind: ha.VolumeISO},
+	}
+	for _, linked := range []bool{false, true} {
+		in := ha.VMInput{Config: rig.deps.Config, VMID: 1, Node: "pve01", Volumes: slices.Clone(volumes), LinkedClone: linked}
+		in.Volumes[0].LinkedClone = linked
+		d, err := profile.DecideVM(in)
+		if err != nil {
+			t.Fatalf("linked=%v: %v", linked, err)
+		}
+		if d.Registers() == linked {
+			t.Fatalf("linked=%v: registers = %v; the test premise is that only the full clone registers",
+				linked, d.Registers())
+		}
+	}
+	node, _, err := rig.place(t, createVMCloudProps{})
+	assertPlacedWithNoCheck(t, rig, node, err)
+}
+
+func TestHeadroom_NodeWhereTheVMWouldNotRegisterIsNotRefused(t *testing.T) {
+	t.Parallel()
+	// pve02 lacks the bridge, and bridge_check is warn, so the filter keeps it.
+	// The real decision registers the VM on pve01 and pve03 and not on pve02. All
+	// three nodes are full. The VM would be refused on pve01 and pve03, where it
+	// is an HA guest and has nowhere to go, and it is not refused on pve02.
+	rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce,
+		fullNonHAGuests("pve01", "pve02", "pve03"), nil)
+	bridges := bridgePlan{
+		required: []string{"vmbr7"},
+		warnOnly: true,
+		checker:  func(node, _ string) (bool, error) { return node != "pve02", nil },
+	}
+	node, alternates, err := rig.placeWith(createVMCloudProps{}, nil, nil, bridges)
+	if err != nil {
+		t.Fatalf("placement: %v", err)
+	}
+	if node != "pve02" || len(alternates) != 0 {
+		t.Errorf("chose %q with alternates %v; want pve02 alone, because the VM is not an HA guest there", node, alternates)
+	}
+	if !hasDebug(rig.logs, "would not be an HA guest on this node") {
+		t.Errorf("no Debug line for the exempt node; logs: %v", rig.logs.All())
+	}
+}
+
+func TestHeadroomFilter_RestoresExemptNodesInFactOrderAndKeepsOtherRejections(t *testing.T) {
+	t.Parallel()
+	rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce,
+		fullNonHAGuests("pve01", "pve02", "pve03"), nil)
+	facts := factsOf("pve01", "pve02", "pve03")
+	plan := testBuildPlan(t, rig.deps, createVMCloudProps{Memory: 4096}, nil, bridgePlan{}, facts, rig.deps.Logger)
+	if plan == nil {
+		t.Fatal("no plan")
+	}
+	plan.exempt = map[string]bool{"pve02": true, "pve03": true}
+	// pve03 misses the PCI device, which Filter tests before headroom, so the
+	// exemption must not bring it back.
+	req := placement.Request{
+		RequiredPCIAddresses: []string{"0000:01:00.0"},
+		PCIChecker:           func(node string) (bool, error) { return node != "pve03", nil },
+	}
+	pass, rejections := plan.filter(facts, req, rig.deps.Logger)
+	names := make([]string, 0, len(pass))
+	for _, f := range pass {
+		names = append(names, f.Node)
+	}
+	if !slices.Equal(names, []string{"pve02"}) {
+		t.Errorf("pass = %v; want pve02, restored; pve01 is short and pve03 lacks the device", names)
+	}
+	if reason := rejections["pve03"]; reason != "missing required PCI device" {
+		t.Errorf("pve03 reason = %q; want the PCI reason", reason)
+	}
+	if reason := rejections["pve01"]; !strings.HasPrefix(reason, placement.HeadroomShortPrefix) {
+		t.Errorf("pve01 reason = %q; want a shortfall", reason)
+	}
+	if _, ok := rejections["pve02"]; ok {
+		t.Error("pve02 is still rejected")
+	}
+}
+
+func TestHeadroom_MixedRejectionsStayPermanent(t *testing.T) {
+	t.Parallel()
+	rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce,
+		fullNonHAGuests("pve01", "pve02", "pve03"), func(c *config.CPIConfig) { c.Node = "" })
+	bridges := bridgePlan{
+		required: []string{"vmbr7"},
+		checker:  func(node, _ string) (bool, error) { return node != "pve03", nil },
+	}
+	_, _, err := rig.placeWith(createVMCloudProps{}, nil, nil, bridges)
+	if err == nil {
+		t.Fatal("placement succeeded; want a refusal")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) || cpiErr.OkToRetry() {
+		t.Fatalf("error = %v; want a permanent Cloud error, because a missing bridge is permanent", err)
+	}
+	if !strings.Contains(err.Error(), "missing bridge vmbr7") || !strings.Contains(err.Error(), placement.HeadroomShortPrefix) {
+		t.Errorf("error = %v; want both the bridge and the headroom reasons", err)
+	}
+}
+
+func TestHeadroom_PathsThatSkipTheNodeScoringMakeNoReads(t *testing.T) {
+	t.Parallel()
+	t.Run("target_node", func(t *testing.T) {
+		t.Parallel()
+		rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce,
+			fullNonHAGuests("pve01", "pve02", "pve03"), nil)
+		node, _, err := rig.placeWith(createVMCloudProps{TargetNode: "pve02"}, nil, nil, bridgePlan{})
+		assertPlacedWithNoCheck(t, rig, node, err)
+		if node != "pve02" {
+			t.Errorf("node = %q; want the operator's pin", node)
+		}
+	})
+	t.Run("local disk pin", func(t *testing.T) {
+		t.Parallel()
+		rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce,
+			fullNonHAGuests("pve01", "pve02", "pve03"), nil)
+		rig.deps.Resolver = &staticKindResolver{sharedPools: nil}
+		node, _, err := rig.placeWith(createVMCloudProps{}, []string{encodeLocalCID(t, "pve01")}, nil, bridgePlan{})
+		assertPlacedWithNoCheck(t, rig, node, err)
+		if node != "pve01" {
+			t.Errorf("node = %q; want the local disk's node", node)
+		}
+	})
+	t.Run("placement disabled", func(t *testing.T) {
+		t.Parallel()
+		deps := Deps{Config: &config.CPIConfig{
+			Host: "pve.test", Node: "pve02", VMStorage: "nfs", NetworkBridge: "vmbr0",
+			HA: &config.HAConfig{Mode: haChoiceOf(config.HAModeAuto), Headroom: haChoiceOf(config.HAHeadroomEnforce)},
+		}, Logger: log.NewNopLogger(), RequestDirectorUUID: "director-1"}
+		node, _, err := resolveTargetNodeWithBridges(context.Background(), deps, createVMCloudProps{}, scorerGroup{}, nil,
+			nil, nil, 0, bridgePlan{})
+		if err != nil || node != "pve02" {
+			t.Errorf("placement = %q, %v; want config.node", node, err)
+		}
+	})
+}
+
+func TestHeadroom_WarnReadsOnlyAfterANodeIsChosen(t *testing.T) {
+	t.Parallel()
+	rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomWarn,
+		fullNonHAGuests("pve01", "pve02", "pve03"), nil)
+	if _, _, err := rig.place(t, createVMCloudProps{}); err != nil {
+		t.Fatalf("placement: %v", err)
+	}
+	if rig.cluster.guestReads != 1 || rig.cluster.haReads != 1 || rig.cluster.ruleReads != 1 {
+		t.Errorf("reads = %d/%d/%d; want one of each, made after the pick",
+			rig.cluster.guestReads, rig.cluster.haReads, rig.cluster.ruleReads)
+	}
+
+	// A chosen node where the VM is no HA guest costs no read and logs nothing.
+	rig = newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomWarn,
+		fullNonHAGuests("pve01", "pve02", "pve03"), nil)
+	facts := factsOf("pve01", "pve02", "pve03")
+	plan := testBuildPlan(t, rig.deps, createVMCloudProps{Memory: 4096}, nil, bridgePlan{}, facts, rig.deps.Logger)
+	plan.exempt = map[string]bool{"pve02": true}
+	plan.warnChosen(rig.deps.Logger, facts, "pve02")
+	if got := rig.cluster.reads(); got != 0 {
+		t.Errorf("%d reads for an exempt chosen node; want none", got)
+	}
+	if _, ok := hasWarn(rig.logs, "headroom estimate"); ok {
+		t.Errorf("a warning for an exempt chosen node; logs: %v", rig.logs.All())
+	}
+}
+
+func TestHeadroom_LinesNameTheNewVMNotVMZero(t *testing.T) {
+	t.Parallel()
+	enforce := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce,
+		fullNonHAGuests("pve01", "pve02", "pve03"), nil)
+	_, _, err := enforce.place(t, createVMCloudProps{})
+	if err == nil {
+		t.Fatal("placement succeeded; want a refusal")
+	}
+	if strings.Contains(err.Error(), "VM 0") || !strings.Contains(err.Error(), "the new VM (4096 MiB)") {
+		t.Errorf("error = %v; want the new VM named, never VM 0", err)
+	}
+
+	warn := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomWarn,
+		fullNonHAGuests("pve01", "pve02", "pve03"), nil)
+	if _, _, err := warn.place(t, createVMCloudProps{}); err != nil {
+		t.Fatalf("placement: %v", err)
+	}
+	entry, ok := hasWarn(warn.logs, "headroom estimate")
+	if !ok {
+		t.Fatalf("no warning; logs: %v", warn.logs.All())
+	}
+	if strings.Contains(entry.Message, "VM 0") || !strings.Contains(entry.Message, "the new VM (4096 MiB)") {
+		t.Errorf("warning = %q; want the new VM named, never VM 0", entry.Message)
+	}
+	if _, has := entry.Attrs["vmid"]; has {
+		t.Errorf("warning carries vmid=%v; the VM has no ID yet", entry.Attrs["vmid"])
+	}
+}
+
+func TestRelabelNewVM(t *testing.T) {
+	t.Parallel()
+	for in, want := range map[string]string{
+		"x: VM 0 (4096 MiB) fits on no node":                 "x: the new VM (4096 MiB) fits on no node",
+		"VM 0 has no configured memory":                      "the new VM has no configured memory",
+		"VM 301 (5120 MiB) fits on no node, VM 100 fits too": "VM 301 (5120 MiB) fits on no node, VM 100 fits too",
+		"VM 10 (1 MiB)": "VM 10 (1 MiB)",
+	} {
+		if got := relabelNewVM(in); got != want {
+			t.Errorf("relabelNewVM(%q) = %q; want %q", in, got, want)
+		}
+	}
+}
+
+func TestPlacementDiskVolume(t *testing.T) {
+	t.Parallel()
+	vol, ok := placementDiskVolume("nfs:vm-9-disk-1")
+	if !ok || vol.Volume != "nfs:vm-9-disk-1" || !vol.Legacy || vol.HomeNode != "" {
+		t.Errorf("bare CID = %+v, %v; want a legacy volume with no home node", vol, ok)
+	}
+	vol, ok = placementDiskVolume(encodeLocalCID(t, "pve01"))
+	if !ok || vol.HomeNode != "pve01" || vol.Volume == "" {
+		t.Errorf("encoded CID = %+v, %v; want the CID's volume on its home node", vol, ok)
+	}
+	if _, ok := placementDiskVolume("nopool"); ok {
+		t.Error("a CID with no storage prefix produced a volume")
 	}
 }

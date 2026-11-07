@@ -982,13 +982,21 @@ func resolveEphemeralStorage(
 			return resolveStorageTier(ctx, lister, cfg, tier, false)
 		}
 	}
+	return ephemeralPoolSetting(cfg, r, cp), nil
+}
+
+// ephemeralPoolSetting returns the pool the unencrypted ephemeral disk lands on
+// when no storage tier names it: the layered ephemeral_storage_pool, then the
+// struct field, then vm_storage. It makes no cluster read, so a caller that must
+// know the pool before placement can use it.
+func ephemeralPoolSetting(cfg *config.CPIConfig, r *layeredResolver, cp createVMCloudProps) string {
 	if pool, ok := r.String("ephemeral_storage_pool"); ok {
-		return pool, nil
+		return pool
 	}
 	if cp.EphemeralStoragePool != "" {
-		return cp.EphemeralStoragePool, nil
+		return cp.EphemeralStoragePool
 	}
-	return cfg.VMStorage, nil
+	return cfg.VMStorage
 }
 
 // resolveEphemeralStorageEncrypted handles the encrypted=true path for

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
@@ -27,35 +29,63 @@ const headroomDecisionVMID = 1
 // longer manages. Such a guest is not recovered when its node fails.
 const haResourceStateIgnored = "ignored"
 
+// headroomNewVMLabel names the VM being placed in the lines the estimate
+// writes. The VM has no ID yet, and the estimate prints a zero ID as "VM 0".
+const headroomNewVMLabel = "the new VM"
+
 // headroomPlan carries the N+1 memory check of one create_vm placement. A nil
 // plan means the check does not run for this call, which is what pve.ha.mode
-// off, pve.ha.headroom off, a cluster where the CPI may not write HA state, and
-// a VM that no node would register all give. Every method is safe on nil.
+// off, pve.ha.headroom off, a request that carries no director_uuid, a cluster
+// where the CPI may not write HA state, a VM whose pools are not known before
+// placement, and a VM that no node would register all give. Every method is
+// safe on nil.
+//
+// The plan holds the rule that enforce never refuses a VM the real HA decision
+// would not register on the node being checked. exempt lists the nodes where
+// the prediction says the VM would not register, and neither the filter nor the
+// warning counts the VM as an HA guest there.
 type headroomPlan struct {
-	check *placement.HeadroomCheck
+	check  *placement.HeadroomCheck
+	exempt map[string]bool
+
+	// read lists the cluster's guests. It runs at most once, when the first
+	// estimate needs the guests, so warn mode reads only after placement has
+	// chosen a node and a node the VM would not be HA on reads nothing.
+	read func() ([]placement.HeadroomGuest, error)
+	once sync.Once
+	log  *log.Logger
 }
 
-// buildHeadroomPlan reads what the estimate needs and returns the plan, or nil
-// when the check does not run. With pve.ha.mode off or pve.ha.headroom off it
-// returns before any read, so Request.Headroom stays nil and the filter behaves
-// as it did before the key existed.
+// buildHeadroomPlan decides whether the check runs and returns the plan, or nil
+// when it does not. With pve.ha.mode off or pve.ha.headroom off it returns
+// before any read, so Request.Headroom stays nil and the filter behaves as it
+// did before the key existed. The cluster's guests are not read here. The plan
+// reads them when the first estimate needs them.
 //
 // The estimate counts the VM as an HA guest because the check exists for HA VMs.
-// A VM that no online node would register for HA, because the cluster may not
-// write HA state or the eligibility decision skips or fails it, is not recovered
-// when its node fails, so it needs no room and no check runs. The decision is
-// made once for each online node, from the VM's root disk storage, its strict
-// availability zone, its CPU type, its PCI devices, and the plain bridges it
-// needs. The VM's hard admissible set for a planned node is the decision's
-// admissible set for that node. A hold VM is never recovered on another node, so
-// it counts as no HA VM.
+// A VM that the real HA decision would not register is not recovered when its
+// node fails, so it needs no room. The prediction therefore follows that
+// decision. A request with no director_uuid gets no HA, as it does in
+// decideCreatedVMHA. The decision is made for each online node over every
+// volume the VM's config will reference, which are its root disk, its ephemeral
+// disk, its config-drive ISO, and its persistent disks, with the same
+// availability zone, CPU type, PCI, and bridge inputs the real decision reads.
+// A linked clone is decided only when the VM clones its root disk, which is
+// known after placement, so the VM counts as HA on a node only if it registers
+// both ways. A node where it does not register is exempt from the check, and a
+// hold VM is never recovered on another node, so it is exempt too.
 //
-// A read that fails does not fail the call. It marks the guest list unknown, so
-// the estimate is unavailable, which enforce refuses as a transient condition
-// and warn only logs.
+// Where an input is not known before placement, because a storage tier, a
+// storage selector, or a storage plan picks a pool, or because a persistent
+// disk's CID names no pool, the check does not run and the reason is logged at
+// Debug. That is the reading that never refuses.
+//
+// A read of the guests that fails does not fail the call. It marks the guest
+// list unknown, so the estimate is unavailable, which enforce refuses as a
+// transient condition and warn only logs.
 func buildHeadroomPlan(
-	ctx context.Context, deps Deps, cp createVMCloudProps, resolver *layeredResolver, bridges bridgePlan,
-	facts []placement.NodeFacts, logger *log.Logger,
+	ctx context.Context, deps Deps, cp createVMCloudProps, cloudPropsMap map[string]any, resolver *layeredResolver,
+	diskCIDs []string, bridges bridgePlan, facts []placement.NodeFacts, logger *log.Logger,
 ) *headroomPlan {
 	if deps.Config == nil || deps.PVE == nil || deps.Config.HAModeValue() == config.HAModeOff {
 		return nil
@@ -64,8 +94,20 @@ func buildHeadroomPlan(
 	if mode == config.HAHeadroomOff {
 		return nil
 	}
+	// decideCreatedVMHA gives a request with no director_uuid no HA, because the
+	// CPI could not mark the HA resource as its own, so the VM needs no room.
+	if deps.RequestDirectorUUID == "" {
+		logger.Debug("create_vm: placement: headroom check skipped, because the request carries no director_uuid " +
+			"and the VM gets no HA")
+		return nil
+	}
 	api := deps.PVE.Cluster()
 	if api == nil {
+		return nil
+	}
+	volumes, unknown := headroomVolumes(ctx, deps, cp, cloudPropsMap, resolver, diskCIDs)
+	if unknown != "" {
+		logger.Debug("create_vm: placement: headroom check skipped, because " + unknown)
 		return nil
 	}
 	profile, err := resolveHAProfile(ctx, deps)
@@ -81,10 +123,16 @@ func buildHeadroomPlan(
 	}
 
 	nodes := factNodeNames(facts)
-	admissible, recoverable := headroomAdmissibleSets(deps, cp, resolver, bridges, profile, facts)
+	admissible, recoverable := headroomAdmissibleSets(deps, cp, resolver, bridges, profile, facts, volumes)
 	if !recoverable {
 		logger.Debug("create_vm: placement: headroom check skipped, because no node would register the VM for HA")
 		return nil
+	}
+	exempt := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		if _, registers := admissible[n]; !registers {
+			exempt[n] = true
+		}
 	}
 
 	_, _, memMiB := resolveVMShapeCPUMem(cp)
@@ -100,23 +148,26 @@ func buildHeadroomPlan(
 			},
 		},
 	}
-	guests, err := readHeadroomGuests(ctx, api, nodes)
-	if err != nil {
-		logger.Warn("create_vm: placement: the cluster's guests could not be read for the headroom estimate",
-			log.Err(err))
-		check.GuestsUnknown = true
+	return &headroomPlan{
+		check:  check,
+		exempt: exempt,
+		read:   func() ([]placement.HeadroomGuest, error) { return readHeadroomGuests(ctx, api, nodes) },
+		log:    logger,
 	}
-	check.Guests = guests
-	return &headroomPlan{check: check}
 }
 
-// apply sets the headroom check on req. In warn mode the filter keeps every
-// node, so the check only decides what warn logs for the chosen node.
-func (h *headroomPlan) apply(req *placement.Request) {
-	if h == nil {
-		return
-	}
-	req.Headroom = h.check
+// ensureGuests reads the cluster's guests into the check the first time an
+// estimate needs them. A read that fails marks the guest list unknown.
+func (h *headroomPlan) ensureGuests() {
+	h.once.Do(func() {
+		guests, err := h.read()
+		if err != nil {
+			h.log.Warn("create_vm: placement: the cluster's guests could not be read for the headroom estimate",
+				log.Err(err))
+			h.check.GuestsUnknown = true
+		}
+		h.check.Guests = guests
+	})
 }
 
 // enforced reports whether a short estimate removes a node from placement.
@@ -124,16 +175,86 @@ func (h *headroomPlan) enforced() bool {
 	return h != nil && h.check.Mode == config.HAHeadroomEnforce
 }
 
+// filter runs placement.Filter with the headroom check on req. A node the
+// estimate rejects but where the VM would not be an HA guest stays in the
+// result, because enforce must not refuse a VM the real decision would leave
+// unregistered. Headroom is the last test Filter makes, so every node rejected
+// for headroom has passed the others and can be restored as it is. The reasons
+// of the nodes that stay rejected name the VM as "the new VM", because it has no
+// ID yet. In warn mode the filter keeps every node, and the guests are not read.
+func (h *headroomPlan) filter(
+	facts []placement.NodeFacts, req placement.Request, logger *log.Logger,
+) (pass []placement.NodeFacts, rejections map[string]string) {
+	if h != nil {
+		if h.enforced() {
+			h.ensureGuests()
+		}
+		req.Headroom = h.check
+	}
+	pass, rejections = placement.Filter(facts, req)
+	if !h.enforced() {
+		return pass, rejections
+	}
+	restored := make(map[string]bool)
+	for node, reason := range rejections {
+		if !isHeadroomRejectionReason(reason) {
+			continue
+		}
+		if h.exempt[node] {
+			logger.Debug("create_vm: placement: headroom check does not apply, because the VM would not be an "+
+				"HA guest on this node", log.String("node", node))
+			delete(rejections, node)
+			restored[node] = true
+			continue
+		}
+		rejections[node] = relabelNewVM(reason)
+	}
+	if len(restored) > 0 {
+		inPass := make(map[string]bool, len(pass))
+		for i := range pass {
+			inPass[pass[i].Node] = true
+		}
+		pass = pass[:0:0]
+		for i := range facts {
+			if inPass[facts[i].Node] || restored[facts[i].Node] {
+				pass = append(pass, facts[i])
+			}
+		}
+	}
+	if len(rejections) == 0 {
+		rejections = nil
+	}
+	return pass, rejections
+}
+
 // warnChosen logs the estimate for the node placement chose when the mode is
 // warn. The filter keeps every node in that mode, so the warning is the whole
-// effect. It places the VM anyway.
+// effect, and it places the VM anyway. A node where the VM would not be an HA
+// guest gets no estimate and no read.
 func (h *headroomPlan) warnChosen(logger *log.Logger, facts []placement.NodeFacts, node string) {
 	if h == nil || h.check.Mode != config.HAHeadroomWarn {
 		return
 	}
-	if err := placement.EnforceHeadroom(logger, facts, h.check, node); err != nil {
-		logger.Warn("create_vm: placement: headroom estimate", log.Err(err))
+	if h.exempt[node] {
+		logger.Debug("create_vm: placement: headroom check does not apply, because the VM would not be an HA "+
+			"guest on this node", log.String("node", node))
+		return
 	}
+	h.ensureGuests()
+	result := placement.EstimateHeadroom(facts, *h.check, node)
+	if !result.Short() {
+		return
+	}
+	for _, line := range result.Lines() {
+		logger.Warn("create_vm: placement: headroom estimate: "+relabelNewVM(line), log.String("node", node))
+	}
+}
+
+// relabelNewVM replaces the zero VM ID the estimate prints for the VM being
+// placed with a name an operator can read. A real VM ID is positive, so "VM 0 "
+// never names another guest.
+func relabelNewVM(text string) string {
+	return strings.ReplaceAll(text, "VM 0 ", headroomNewVMLabel+" ")
 }
 
 // headroomRejected reports whether any rejection reason comes from the headroom
@@ -163,20 +284,102 @@ func factNodeNames(facts []placement.NodeFacts) []string {
 	return out
 }
 
+// headroomVolumes lists the volumes the VM's config will reference, as the
+// decision input names them, for the prediction made before placement. The
+// first is the root disk. The second return value is empty when every volume is
+// known, and otherwise says why one is not, so the caller runs no check. It
+// reads nothing from the cluster, except the config-drive pool that
+// deps.EffectiveISOStorage resolves once for the whole call, as the agent does
+// when it writes the ISO.
+//
+// A pool a storage tier, a storage selector, or a storage plan picks is not
+// known, nor is the pool of an encrypted ephemeral disk or of a persistent disk
+// whose CID names none.
+func headroomVolumes(
+	ctx context.Context, deps Deps, cp createVMCloudProps, cloudPropsMap map[string]any, resolver *layeredResolver,
+	diskCIDs []string,
+) (volumes []ha.VMVolume, unknown string) {
+	cfg := deps.Config
+	if resolver == nil {
+		return nil, "the VM's cloud properties are not resolved"
+	}
+	selection, err := ResolveStoragePlacementSelectors(cfg, "create_vm", cloudPropsMap, cp.EphemeralDiskSizeMB > 0)
+	if err != nil {
+		return nil, "the storage selectors do not resolve: " + err.Error()
+	}
+	if selection.SetManaged || selection.UsesAtomicSelectors || selection.FuturePersistentSet != "" {
+		return nil, "a storage selector or plan picks the VM's pools"
+	}
+
+	root := cfg.VMStorage
+	if pool, ok := resolver.String("storage_pool"); ok {
+		root = pool
+	} else if _, ok := resolver.String("storage_tier"); ok {
+		return nil, "a storage tier picks the root disk's pool"
+	}
+	if root == "" {
+		return nil, "the root disk's pool is not known before placement"
+	}
+	volumes = append(volumes, ha.VMVolume{Volume: root + ":vm-" + strconv.Itoa(headroomDecisionVMID) + "-disk-0"})
+
+	if cp.EphemeralDiskSizeMB > 0 {
+		var encrypted *bool
+		if v, ok := resolver.Bool("encrypted"); ok {
+			encrypted = &v
+		}
+		if ResolveEncrypted(cfg.Encrypted, encrypted) {
+			return nil, "an encrypted ephemeral disk's pool is picked by a storage tier"
+		}
+		if _, ok := resolver.String("ephemeral_storage_tier"); ok {
+			return nil, "a storage tier picks the ephemeral disk's pool"
+		}
+		pool := ephemeralPoolSetting(cfg, resolver, cp)
+		if pool == "" {
+			return nil, "the ephemeral disk's pool is not known before placement"
+		}
+		volumes = append(volumes, ha.VMVolume{
+			Volume: pool + ":vm-" + strconv.Itoa(headroomDecisionVMID) + "-ephemeral-0",
+		})
+	}
+
+	if cfg.BootAgentMode() != config.AgentModeNoAgent {
+		iso := deps.EffectiveISOStorage(ctx)
+		if iso == "" {
+			return nil, "the config-drive ISO's pool is not known"
+		}
+		volumes = append(volumes, ha.VMVolume{
+			Volume: iso + ":iso/vm-" + strconv.Itoa(headroomDecisionVMID) + "-config.iso", Kind: ha.VolumeISO,
+		})
+	}
+
+	for _, cid := range diskCIDs {
+		if cid == "" {
+			continue
+		}
+		vol, ok := placementDiskVolume(cid)
+		if !ok {
+			return nil, "a persistent disk's CID names no pool"
+		}
+		volumes = append(volumes, vol)
+	}
+	return volumes, ""
+}
+
 // headroomAdmissibleSets runs the eligibility decision for the VM on each
-// online node and returns the hard admissible set of every node whose decision
-// registers the VM for recovery elsewhere. The bool is false when no node does.
+// online node, over the volumes the VM's config will reference, and returns the
+// hard admissible set of every node where the decision registers the VM for
+// recovery elsewhere. The bool is false when no node does.
+//
+// Whether the root disk is a linked clone is decided after placement, so the
+// decision runs both ways. A node counts only if the VM registers either way,
+// which keeps a prediction from marking a VM as HA that the real decision
+// leaves unregistered. The set is the union of the two, so a node the VM could
+// be recovered on is never left out.
 func headroomAdmissibleSets(
 	deps Deps, cp createVMCloudProps, resolver *layeredResolver, bridges bridgePlan,
-	profile *ha.Profile, facts []placement.NodeFacts,
+	profile *ha.Profile, facts []placement.NodeFacts, volumes []ha.VMVolume,
 ) (map[string][]string, bool) {
 	cfg := deps.Config
-	storage := cfg.VMStorage
-	if resolver != nil {
-		if pool, ok := resolver.String("storage_pool"); ok {
-			storage = pool
-		}
-	}
 	var perVMCPU *string
 	if resolver != nil {
 		cpu := resolveVMShapeCPUType(resolver, cfg)
@@ -194,32 +397,34 @@ func headroomAdmissibleSets(
 	recoverable := false
 	for i := range facts {
 		f := facts[i]
-		if !f.Online || storage == "" {
+		if !f.Online {
 			continue
 		}
-		in := base
-		in.Node = f.Node
-		in.Volumes = []ha.VMVolume{{Volume: storage + ":vm-" + fmt.Sprint(headroomDecisionVMID) + "-disk-0"}}
-		in.Constraints = append(in.Constraints, bridgeConstraints...)
-		if len(cp.PCIPassthroughs) > 0 {
-			in.Constraints = append(in.Constraints, ha.NodeConstraint{Name: pciConstraintName, Nodes: []string{f.Node}})
-		}
-		if az := pinAZForNode(cp, cfg, f.Node); az != "" {
-			if azNodes, ok := cfg.AZCandidates(az); ok {
-				in.AZ, in.AZNodes = az, azNodes
+		var set []string
+		registers := true
+		for _, linked := range []bool{false, true} {
+			in := base
+			in.Node = f.Node
+			in.LinkedClone = linked
+			in.Volumes = slices.Clone(volumes)
+			in.Volumes[0].LinkedClone = linked
+			scopeHAInputToNode(&in, cfg, cp, f.Node)
+			in.Constraints = append(in.Constraints, bridgeConstraints...)
+			decision, err := profile.DecideVM(in)
+			if err != nil || !decision.Registers() || decision.Policy == ha.PolicyHold {
+				registers = false
+				break
+			}
+			for _, n := range append(slices.Clone(decision.Admissible), decision.Widened...) {
+				if !slices.Contains(set, n) {
+					set = append(set, n)
+				}
 			}
 		}
-		decision, err := profile.DecideVM(in)
-		if err != nil || !decision.Registers() || decision.Policy == ha.PolicyHold {
+		if !registers {
 			continue
 		}
 		recoverable = true
-		set := slices.Clone(decision.Admissible)
-		for _, n := range decision.Widened {
-			if !slices.Contains(set, n) {
-				set = append(set, n)
-			}
-		}
 		out[f.Node] = set
 	}
 	return out, recoverable

@@ -186,16 +186,26 @@ func createdVMHAInput(
 		LinkedClone: configHasLinkedClone(cfg) || shape.linkedClone,
 	}
 	markLinkedRootDisk(in.Volumes, cfg, shape)
-	if az := pinAZForNode(parsed.cloudProps, deps.Config, node); az != "" {
-		if nodes, ok := deps.Config.AZCandidates(az); ok {
+	scopeHAInputToNode(&in, deps.Config, parsed.cloudProps, node)
+	in.Constraints = append(in.Constraints, createdVMBridgeConstraints(ctx, deps, parsed, profileNodeNames(profile))...)
+	return in
+}
+
+// scopeHAInputToNode sets the parts of a decision input that depend on the node
+// the VM runs on and on its cloud properties alone: the strict availability
+// zone the node falls in, and the PCI constraint that holds a VM with
+// passthrough devices to that node. The decision made after the VM exists and
+// the prediction made before placement both use it, so the two read these
+// inputs the same way.
+func scopeHAInputToNode(in *ha.VMInput, cfg *config.CPIConfig, cp createVMCloudProps, node string) {
+	if az := pinAZForNode(cp, cfg, node); az != "" {
+		if nodes, ok := cfg.AZCandidates(az); ok {
 			in.AZ, in.AZNodes = az, nodes
 		}
 	}
-	if len(parsed.cloudProps.PCIPassthroughs) > 0 {
+	if len(cp.PCIPassthroughs) > 0 {
 		in.Constraints = append(in.Constraints, ha.NodeConstraint{Name: pciConstraintName, Nodes: []string{node}})
 	}
-	in.Constraints = append(in.Constraints, createdVMBridgeConstraints(ctx, deps, parsed, profileNodeNames(profile))...)
-	return in
 }
 
 // createdVMBridgeConstraints returns one constraint for each plain bridge the
