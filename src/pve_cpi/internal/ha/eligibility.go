@@ -81,6 +81,11 @@ type VMVolume struct {
 	// NoReplicate marks a drive whose replicate flag is off, which PVE
 	// silently skips when it replicates the guest.
 	NoReplicate bool
+
+	// LinkedClone marks a disk that is a linked clone of a base template. The
+	// base lives on the same storage, so on node-local storage the disk cannot
+	// follow its VM to another node, and a hold pin cannot protect it.
+	LinkedClone bool
 }
 
 func (v VMVolume) kind() VolumeKind {
@@ -293,8 +298,9 @@ func (d *VMDecision) PinSpec(id, comment string, configured []string, rebalanceO
 //   - A VM with a node-local volume, or whose access set is too small, follows
 //     pve.ha.local_policy: none registers nothing, hold pins the VM to its own
 //     node, and replicate pins it to its own node until a verified replica
-//     exists. A replicate VM that misses a prerequisite gets no HA in auto and
-//     an error in managed.
+//     exists. A hold VM with a linked clone on node-local storage, and a
+//     replicate VM that misses a prerequisite, get no HA in auto and an error
+//     in managed.
 //
 // DecideVM returns an error only for a caller mistake. A decision that fails the
 // call is returned with Outcome OutcomeFail and Err set.
@@ -784,6 +790,16 @@ func (e *eligibility) decideLocal(
 	}
 	switch policy {
 	case config.HALocalPolicyHold:
+		if linked := e.localLinkedClones(classes); len(linked) > 0 {
+			// The operator asked for a linked clone and for HA on node-local
+			// storage, and a linked clone's base stays on one node. The
+			// volumes are proven facts, so the refusal is permanent.
+			e.refuse(cpierrors.Cloud("VM %d cannot use local_policy hold (%s): the linked clone disks %s have a "+
+				"base template on node-local storage, which stays on one node; set clone_mode to auto or full so "+
+				"the CPI makes a full clone, or use shared storage", e.in.VMID, why, strings.Join(linked, ", ")),
+				false)
+			return
+		}
 		if !contains(access, e.d.Node) {
 			e.refuse(cpierrors.Cloud("VM %d cannot be pinned to node %s, because its volumes are not all reachable "+
 				"from it (access set %s)", e.in.VMID, e.d.Node, listOrNone(access)), false)
@@ -796,6 +812,17 @@ func (e *eligibility) decideLocal(
 	default:
 		e.skip("local_policy is none and the VM cannot be HA-managed as shared (" + why + ")")
 	}
+}
+
+// localLinkedClones lists the node-local disks that are linked clones.
+func (e *eligibility) localLinkedClones(classes []*volumeClass) []string {
+	var out []string
+	for _, c := range classes {
+		if c.local && c.vol.kind() == VolumeDisk && c.vol.LinkedClone {
+			out = append(out, c.vol.Volume)
+		}
+	}
+	return out
 }
 
 // register ends the decision with a registration whose hard constraints are

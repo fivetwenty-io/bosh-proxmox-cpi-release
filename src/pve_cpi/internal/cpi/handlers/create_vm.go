@@ -421,16 +421,21 @@ type createVMShape struct {
 	// as linked-capable (permissive default).
 	vmStorageType string
 	vmDiskFormat  string
-	rootDiskGiB   int
-	cores         int
-	sockets       int
-	memMiB        int
-	hotplug       string
-	numaEnabled   bool
-	initialTags   string
-	rangeStart    int
-	maxAttempts   int
-	initialName   string
+	// linkedClone is true when the current create attempt cloned the root disk
+	// as a linked clone, which the HA decision cannot read from the volume
+	// name on LVM-thin or ZFS. cloneFromTemplate and the managed root clone
+	// set it, and attemptCreateVM clears it before each attempt.
+	linkedClone bool
+	rootDiskGiB int
+	cores       int
+	sockets     int
+	memMiB      int
+	hotplug     string
+	numaEnabled bool
+	initialTags string
+	rangeStart  int
+	maxAttempts int
+	initialName string
 	// cloudPropsMap is the raw cloud_properties map from the parsed args. It is
 	// carried forward so cloneFromTemplate can consult it for clone_mode resolution
 	// via the layered resolver (vm_type profile may override config.CloneMode).
@@ -1494,6 +1499,9 @@ func attemptCreateVM(
 	candidate int,
 ) error {
 	candidateName := candidateVMName(shape.initialName, parsed.agentID, candidate)
+	// An earlier attempt may have cloned linked and failed, so the flag
+	// describes only the attempt that is running.
+	shape.linkedClone = false
 
 	// PCI guard: every node-resolution outcome funnels through here, including
 	// the static paths that never run the placement filter (operator

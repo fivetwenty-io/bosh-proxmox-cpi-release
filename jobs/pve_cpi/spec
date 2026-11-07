@@ -152,8 +152,15 @@ properties:
   pve.ha.local_policy:
     description: |
       What happens to a VM that has node-local volumes. "none" (the default)
-      leaves the VM without HA and logs why. "hold" and "replicate" are not
-      available in this build, and setting either one is rejected when the
+      leaves the VM without HA and logs why. "hold" registers the VM with HA and
+      pins it strictly to the one node its volumes live on, so HA restarts the
+      VM in place and never moves it, and a local persistent disk that arrives
+      on an HA-managed VM keeps the VM in HA with that pin. A VM that HA would
+      manage on node-local storage gets a full clone of the stemcell template,
+      because a linked clone's base template stays on one node. An explicit
+      clone_mode of "linked" keeps the linked clone and runs the VM without HA
+      in auto mode, and fails create_vm in managed mode. "replicate" is not
+      available in this build, and setting it is rejected when the
       configuration loads.
   pve.ha.anti_affinity:
     description: |

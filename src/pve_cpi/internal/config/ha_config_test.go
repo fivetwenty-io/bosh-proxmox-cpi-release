@@ -257,11 +257,23 @@ func TestHAConfig_AcceptsOnAndDLBWhenModeIsSet(t *testing.T) {
 
 func TestHAConfig_RejectsPoliciesNotYetAvailable(t *testing.T) {
 	t.Parallel()
-	for _, policy := range []string{"hold", "replicate"} {
-		for _, mode := range []string{"auto", "managed"} {
-			block := fmt.Sprintf(`{"mode":%q,"local_policy":%q}`, mode, policy)
-			_, err := mustLoad(t, haJSON(block))
-			assertCloudError(t, err, fmt.Sprintf(`ha.local_policy %q is not available in this build`, policy))
+	for _, mode := range []string{"off", "auto", "managed"} {
+		block := fmt.Sprintf(`{"mode":%q,"local_policy":"replicate"}`, mode)
+		_, err := mustLoad(t, haJSON(block))
+		assertCloudError(t, err, `ha.local_policy "replicate" is not available in this build`)
+	}
+}
+
+func TestHAConfig_AcceptsTheHoldPolicy(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"off", "auto", "managed"} {
+		block := fmt.Sprintf(`{"mode":%q,"local_policy":"hold"}`, mode)
+		cfg, err := mustLoad(t, haJSON(block))
+		if err != nil {
+			t.Fatalf("mode %s with local_policy hold must load: %v", mode, err)
+		}
+		if got := cfg.HALocalPolicyValue(); got != config.HALocalPolicyHold {
+			t.Errorf("mode %s: local policy = %q, want hold", mode, got)
 		}
 	}
 }
@@ -315,6 +327,22 @@ func TestApplyContextOverrides_HA_OnlyModeInheritsTheRest(t *testing.T) {
 	}
 	if base.HAModeValue() != "off" {
 		t.Errorf("the override must not change the job-level config, base mode = %s", base.HAModeValue())
+	}
+}
+
+func TestApplyContextOverrides_HA_EntryCanSetTheHoldPolicy(t *testing.T) {
+	t.Parallel()
+	base := haBase(t, `{"mode":"auto"}`)
+
+	eff, _, _, err := config.ApplyContextOverrides(base, map[string]any{
+		"pve_ha": map[string]any{"local_policy": "hold"},
+	})
+	if err != nil {
+		t.Fatalf("an entry that sets local_policy hold must validate: %v", err)
+	}
+	if eff.HALocalPolicyValue() != config.HALocalPolicyHold || base.HALocalPolicyValue() != config.HALocalPolicyNone {
+		t.Errorf("effective policy = %s, base policy = %s, want hold over none", eff.HALocalPolicyValue(),
+			base.HALocalPolicyValue())
 	}
 }
 
@@ -452,8 +480,6 @@ func TestApplyContextOverrides_HA_ValidatesTheMergedResult(t *testing.T) {
 		{"entry sets on under mode off", `{}`, map[string]any{"pin_az": "on"}, `ha.pin_az "on" requires pve.ha.mode`},
 		{"entry sets dlb under mode off", `{}`, map[string]any{"dlb": map[string]any{"enabled": true}},
 			`ha.dlb.enabled requires pve.ha.mode`},
-		{"hold", `{"mode":"auto"}`, map[string]any{"local_policy": "hold"},
-			`ha.local_policy "hold" is not available in this build`},
 		{"replicate", `{"mode":"auto"}`, map[string]any{"local_policy": "replicate"},
 			`ha.local_policy "replicate" is not available in this build`},
 		{"motion wait", `{}`, map[string]any{"motion_wait_sec": 0}, `ha.motion_wait_sec must be between`},

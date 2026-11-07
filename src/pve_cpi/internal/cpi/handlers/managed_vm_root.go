@@ -58,6 +58,7 @@ func cloneManagedVMRoot(ctx context.Context, deps Deps, shape *createVMShape, ta
 		return fmt.Errorf("managed clone lacks frozen template identity")
 	}
 	full := target.Mechanism == storageMechanismFullClone
+	shape.linkedClone = !full
 	params := &sdknodes.CreateQemuCloneParams{Newid: int64(vmid), Name: &name, Full: &full, Description: &marker}
 	if full {
 		params.Storage = &shape.vmStorage

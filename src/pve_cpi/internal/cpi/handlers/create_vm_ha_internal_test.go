@@ -124,6 +124,10 @@ type stagingRig struct {
 	started   int
 	startErr  error
 	cloudProp createVMCloudProps
+
+	// decision replaces the shared-storage decision stage builds, for a test
+	// that stages the decision of another policy.
+	decision *ha.VMDecision
 }
 
 // newStagingRig returns a rig for VM 100 placed on pve01 in AZ z1 of pve01 and
@@ -156,7 +160,10 @@ func newStagingRig(t *testing.T, mode string, strict bool) *stagingRig {
 // stager's resource client, watchdog read, and state wait on the rig.
 func (r *stagingRig) stage(t *testing.T) {
 	t.Helper()
-	d := testRegisteredDecision(r.deps, 100, r.parsed.cloudProps, "pve01")
+	d := r.decision
+	if d == nil {
+		d = testRegisteredDecision(r.deps, 100, r.parsed.cloudProps, "pve01")
+	}
 	profile, _ := r.deps.HAProfile(context.Background())
 	h := &createdVMHA{
 		deps: r.deps, logger: log.NewNopLogger(), vmid: 100, ident: haIdentity{Owner: aaDirector},

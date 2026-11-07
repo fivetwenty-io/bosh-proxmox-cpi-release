@@ -309,9 +309,8 @@ func (c *CPIConfig) HAReplicationRateMbpsValue() int {
 // Three combinations are rejected because each one would otherwise switch a
 // feature off without a word. anti_affinity on, pin_az on, and dlb.enabled
 // true all need an effective mode of auto or managed, and the error names
-// pve.ha.mode. local_policy hold and replicate are rejected as not yet
-// available, so a manifest cannot ask for protection this build does not
-// provide.
+// pve.ha.mode. local_policy replicate is rejected as not yet available, so a
+// manifest cannot ask for protection this build does not provide.
 func (c *CPIConfig) validateHA(errs *[]string) {
 	h := c.HA
 	if h == nil {
@@ -327,21 +326,19 @@ func (c *CPIConfig) validateHA(errs *[]string) {
 				rule.key, strings.Join(rule.allowed, ", "), string(*p)))
 		}
 	}
-	c.validateHAUnavailablePolicies(errs)
+	c.validateHAUnavailablePolicy(errs)
 	c.validateHAModeCombinations(errs)
 	c.validateHAPinAZ(errs)
 	c.validateHAMotionWait(errs)
 	c.validateHAReplication(errs)
 }
 
-// validateHAUnavailablePolicies rejects the local policies this build does not
-// implement.
-func (c *CPIConfig) validateHAUnavailablePolicies(errs *[]string) {
-	for _, policy := range []string{HALocalPolicyHold, HALocalPolicyReplicate} {
-		if c.HA.LocalPolicy != nil && string(*c.HA.LocalPolicy) == policy {
-			*errs = append(*errs, fmt.Sprintf("ha.local_policy %q is not available in this build; use %q",
-				policy, HALocalPolicyNone))
-		}
+// validateHAUnavailablePolicy rejects the local policy this build does not
+// implement, which is replicate.
+func (c *CPIConfig) validateHAUnavailablePolicy(errs *[]string) {
+	if c.HA.LocalPolicy != nil && string(*c.HA.LocalPolicy) == HALocalPolicyReplicate {
+		*errs = append(*errs, fmt.Sprintf("ha.local_policy %q is not available in this build; use %q or %q",
+			HALocalPolicyReplicate, HALocalPolicyNone, HALocalPolicyHold))
 	}
 }
 

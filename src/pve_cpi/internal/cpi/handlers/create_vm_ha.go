@@ -182,8 +182,9 @@ func createdVMHAInput(
 		Volumes:     haVolumesOfConfig(cfg, node, parsed.legacyDiskVolids),
 		CPUType:     ha.EffectiveCPUType(deps.Config, &shape.cpuType, liveCPU),
 		InDLBAZ:     vmInDLBAZ(parsed.cloudProps, deps.Config),
-		LinkedClone: configHasLinkedClone(cfg),
+		LinkedClone: configHasLinkedClone(cfg) || shape.linkedClone,
 	}
+	markLinkedRootDisk(in.Volumes, cfg, shape)
 	if az := pinAZForNode(parsed.cloudProps, deps.Config, node); az != "" {
 		if nodes, ok := deps.Config.AZCandidates(az); ok {
 			in.AZ, in.AZNodes = az, nodes
@@ -235,7 +236,10 @@ func haVolumesOfConfig(cfg map[string]any, node string, legacy map[string]bool) 
 	opts := driveOptionsByVolume(cfg)
 	out := make([]ha.VMVolume, 0, len(access))
 	for _, v := range access {
-		vol := ha.VMVolume{Volume: v.Volume, HomeNode: v.HomeNode, Kind: ha.VolumeDisk, Legacy: legacy[v.Volume]}
+		vol := ha.VMVolume{
+			Volume: v.Volume, HomeNode: v.HomeNode, Kind: ha.VolumeDisk, Legacy: legacy[v.Volume],
+			LinkedClone: volumeIsLinkedClone(v.Volume),
+		}
 		o := opts[v.Volume]
 		if o["media"] == "cdrom" {
 			vol.Kind = ha.VolumeISO
@@ -291,15 +295,43 @@ func (p *createVMParsedArgs) recordLegacyDisk(rd resolvedDisk) {
 // configHasLinkedClone reports whether a disk of the config is a linked clone
 // whose volume name shows its base, which is the form file storages give it.
 // LVM-thin and ZFS name a linked clone like any other volume, so the check
-// cannot see those, and a VM cloned on them reads as a full clone here.
+// cannot see those, and a VM cloned on them reads as a full clone here. A
+// create_vm that chose a linked clone itself marks it in markLinkedRootDisk.
 func configHasLinkedClone(cfg map[string]any) bool {
 	for _, v := range pve.ConfigAccessVolumes(cfg, "") {
-		_, name, _ := strings.Cut(v.Volume, ":")
-		if base, _, ok := strings.Cut(name, "/"); ok && strings.HasPrefix(base, "base-") {
+		if volumeIsLinkedClone(v.Volume) {
 			return true
 		}
 	}
 	return false
+}
+
+// volumeIsLinkedClone reports whether a volume ID names a linked clone by the
+// base volume its name carries, as file storages give it.
+func volumeIsLinkedClone(volid string) bool {
+	_, name, _ := strings.Cut(volid, ":")
+	base, _, ok := strings.Cut(name, "/")
+	return ok && strings.HasPrefix(base, "base-")
+}
+
+// markLinkedRootDisk marks the root disk of a VM that create_vm cloned as a
+// linked clone, because LVM-thin and ZFS give such a disk an ordinary volume
+// name that haVolumesOfConfig cannot recognize. It leaves the volumes alone
+// when the call made a full clone or an import.
+func markLinkedRootDisk(volumes []ha.VMVolume, cfg map[string]any, shape *createVMShape) {
+	if shape == nil || !shape.linkedClone {
+		return
+	}
+	drive, ok := pve.ConfigString(cfg, shape.rootDiskKey)
+	if !ok {
+		return
+	}
+	volid, _, _ := strings.Cut(strings.TrimSpace(strings.TrimPrefix(drive, "file=")), ",")
+	for i := range volumes {
+		if volumes[i].Volume == volid && volumes[i].Kind != ha.VolumeISO {
+			volumes[i].LinkedClone = true
+		}
+	}
 }
 
 // newStager wires the staging order to the cluster.

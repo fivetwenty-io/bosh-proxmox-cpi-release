@@ -540,6 +540,11 @@ func cloneFromTemplate(
 	if err != nil {
 		return err
 	}
+	// A VM that would run under HA on node-local storage gets a full clone, and
+	// a managed call that insists on a linked one fails before anything changes.
+	if mode, err = cloneModeForHA(ctx, deps, logger, shape, mode); err != nil {
+		return err
+	}
 
 	templateStorage, templateRootKey, templateStorageErr := resolveTemplateDiskStorage(ctx, deps, templateNode, templateVMID)
 	templateStorageKnown := templateStorageErr == nil
@@ -575,6 +580,9 @@ func cloneFromTemplate(
 	if fullErr != nil {
 		return fullErr
 	}
+	// The HA decision reads this back, because a linked clone on LVM-thin or
+	// ZFS has an ordinary volume name.
+	shape.linkedClone = full == nil || !*full
 
 	newid := int64(candidate)
 	params := &sdknodes.CreateQemuCloneParams{
