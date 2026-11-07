@@ -246,6 +246,14 @@ type ReregisterInput struct {
 	// Decide makes the VM's eligibility decision on node from its volumes now,
 	// with st as its state read and rec as what the resource and pin held.
 	Decide func(ctx context.Context, node string, st *pve.HAServiceState, rec ReaddRecord) (*VMDecision, error)
+	// Moving reports whether the VM on node holds a config lock or has a
+	// migration, relocation, or disk move task running. The order changes
+	// nothing in HA while it does.
+	Moving func(ctx context.Context, node string) (bool, error)
+	// PendingOnly finishes only an order an earlier call left part way: a VM
+	// with no re-registration tag is left as it is, even when its resource is
+	// in error.
+	PendingOnly bool
 	// LeaveRules removes the VM from its own rules and leaves the resource,
 	// for a removal that PVE refuses while a rule names the resource.
 	LeaveRules func(ctx context.Context) error
@@ -273,9 +281,9 @@ func (in *ReregisterInput) validate() error {
 		return cpierrors.Cloud("ha readd: the stager, its resource client, its ownership check, and its rules " +
 			"reader must be set")
 	case in.Power == nil || in.ReadIntent == nil || in.WriteIntent == nil || in.ClearIntent == nil ||
-		in.Decide == nil || in.LeaveRules == nil || in.Confine == nil || in.WithoutHA == nil:
-		return cpierrors.Cloud("ha readd: the power read, the intent reads and writes, the decision, the rule " +
-			"leave, the confinement write, and the without-HA cleanup must be set")
+		in.Decide == nil || in.Moving == nil || in.LeaveRules == nil || in.Confine == nil || in.WithoutHA == nil:
+		return cpierrors.Cloud("ha readd: the power read, the intent reads and writes, the decision, the task " +
+			"check, the rule leave, the confinement write, and the without-HA cleanup must be set")
 	case strings.TrimSpace(in.PinID) == "":
 		return cpierrors.Cloud("ha readd: the pin ID must be set")
 	}
@@ -299,7 +307,11 @@ func (in *ReregisterInput) validate() error {
 //     and the order goes on from the confinement.
 //   - A tag with this Director's active resource is a crash after the started
 //     request, and the order checks the landing and removes the tag.
-//   - No tag and no error is nothing to do.
+//   - No tag and no error is nothing to do, and with PendingOnly no tag is
+//     nothing to do whatever the resource's state.
+//
+// No step that changes HA runs while the VM holds a config lock or has a
+// migration, relocation, or disk move task running (see Moving).
 //
 // Every transient condition is a retriable error that writes nothing more, and
 // the tag stays for the next call. A condition a retry does not clear is a
@@ -340,6 +352,9 @@ func (r *readd) run(ctx context.Context) (ReregisterResult, error) {
 	if err != nil {
 		return ReregisterResult{}, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("ha readd: read the re-registration tag of VM %d", r.in.VMID))
+	}
+	if r.in.PendingOnly && !intent.Tagged() {
+		return ReregisterResult{Outcome: ReaddNothing, Node: r.in.Node}, nil
 	}
 	res, err := r.in.Stager.Resources.GetHaResources(ctx, r.sid)
 	switch {
@@ -452,6 +467,9 @@ func (r *readd) removeAndRegister(
 			return ReregisterResult{}, err
 		}
 	}
+	if err := r.settled(ctx, st.Node); err != nil {
+		return ReregisterResult{}, err
+	}
 	// The tag already on the VM keeps its age, so a crash loop never resets
 	// the sweep's clock.
 	tag := intent.Tag
@@ -514,13 +532,21 @@ func (r *readd) resumeRemoved(ctx context.Context, intent ReaddIntent) (Reregist
 }
 
 // register runs the order from the drain on, for a VM whose resource is gone.
-// removedHere says this call removed it, which is when Between runs.
+// removedHere says this call removed it, which is when Between runs. A call
+// that removed the resource checked for a running task before the removal, and
+// Between is its own change, so only a call that finishes an earlier one's
+// removal checks again here.
 func (r *readd) register(ctx context.Context, rec ReaddRecord, node string, removedHere bool) (ReregisterResult, error) {
 	loc, err := drainRemoved(ctx, r.deps, r.in.VMID, node, r.in.Budget, r.in.PollInterval, true)
 	if err != nil {
 		return ReregisterResult{}, err
 	}
 	node = loc.Node
+	if !removedHere {
+		if err := r.settled(ctx, node); err != nil {
+			return ReregisterResult{}, err
+		}
+	}
 	if removedHere && r.in.Between != nil {
 		moved, err := r.in.Between(ctx, node)
 		if err != nil {
@@ -556,6 +582,9 @@ func (r *readd) resumeStaged(
 			"call that may write HA state finishes it", log.String("sid", r.sid), log.Err(err))
 		return ReregisterResult{}, err
 	}
+	if err := r.settled(ctx, st.Node); err != nil {
+		return ReregisterResult{}, err
+	}
 	rec, err := r.snapshot(ctx, res, intent.Record)
 	if err != nil {
 		return ReregisterResult{}, err
@@ -576,6 +605,9 @@ func (r *readd) resumeActive(
 	node := st.Node
 	if requested == haStateStarted {
 		if err := r.writable(node); err != nil {
+			return ReregisterResult{}, err
+		}
+		if err := r.settled(ctx, node); err != nil {
 			return ReregisterResult{}, err
 		}
 		rec, err := r.snapshot(ctx, res, intent.Record)
@@ -718,27 +750,34 @@ func (r *readd) withoutHA(
 // errReaddNoHA is judge's answer for a decision that gives the VM no HA.
 var errReaddNoHA = errors.New("the decision gives the VM no HA")
 
-// judge checks a decision. A failing decision returns its error, one that
-// refused HA for a reason that may pass returns a retriable error, one that
-// gives no HA returns errReaddNoHA, and with needNode a node outside the hard
-// admissible set returns a blocked error that names it, because registering
-// the VM there would ask the CRM to move it.
+// judge checks a decision. One that refused HA for a reason that may pass
+// returns a retriable error in every mode, managed included, where the refusal
+// is also a failure, so the transient answer comes before the failure's own.
+// Fewer placeable nodes than the VM's shared volumes reach is retriable too.
+// Any other failing decision returns its error, one that gives no HA returns
+// errReaddNoHA, and with needNode a node outside the hard admissible set
+// returns a blocked error that names it, because registering the VM there
+// would ask the CRM to move it.
 func (r *readd) judge(d *VMDecision, node string, needNode bool) error {
 	switch {
 	case d == nil:
 		return cpierrors.Cloud("ha readd: the decision for VM %d is missing", r.in.VMID)
+	case d.Transient:
+		msg := fmt.Sprintf("ha readd: the HA decision for VM %d refused HA for a reason that may pass; the "+
+			"re-registration waits", r.in.VMID)
+		if failure := d.Failure(); failure != nil {
+			return cpierrors.WrapAs(failure, cpierrors.TypeRetriableCloud, msg)
+		}
+		return cpierrors.Retriable("%s (%s)", msg, d.Reason)
+	case d.PlaceableShortfall:
+		return cpierrors.Retriable("ha readd: nodes %s reach every volume of VM %d, but fewer than two of them can "+
+			"take it now; the re-registration waits until enough of them are healthy", strings.Join(d.Access, ","),
+			r.in.VMID)
 	case d.Outcome == OutcomeFail:
 		if failure := d.Failure(); failure != nil {
 			return failure
 		}
 		return cpierrors.Cloud("ha readd: VM %d: the HA decision failed the call: %s", r.in.VMID, d.Reason)
-	case d.PlaceableShortfall:
-		return cpierrors.Retriable("ha readd: nodes %s reach every volume of VM %d, but fewer than two of them can "+
-			"take it now; the re-registration waits until enough of them are healthy", strings.Join(d.Access, ","),
-			r.in.VMID)
-	case d.Transient:
-		return cpierrors.Retriable("ha readd: the HA decision for VM %d refused HA for a reason that may pass "+
-			"(%s); the re-registration waits", r.in.VMID, d.Reason)
 	case !d.Registers():
 		return errReaddNoHA
 	case needNode && !slices.Contains(d.Admissible, node):
@@ -771,6 +810,25 @@ func (r *readd) writable(node string) error {
 		"cannot register it again: %s; clear the error without stopping the guest by running 'ha-manager remove "+
 		"%s' and then 'ha-manager add %s --state started', restore the resource's HA rules, and retry",
 		r.sid, orDash(node), why, r.sid, r.sid)
+}
+
+// settled returns a retriable error while the VM on node holds a config lock
+// or has a migration, relocation, or disk move task running, and when that
+// cannot be told, so the order changes nothing in HA until the task is done.
+func (r *readd) settled(ctx context.Context, node string) error {
+	moving, err := r.in.Moving(ctx, node)
+	switch {
+	case err != nil:
+		return r.transient(err, "could not tell whether a migration, relocation, or disk move task for VM %d is "+
+			"running on node %s, so nothing more changes in HA; retry", r.in.VMID, orDash(node))
+	case moving:
+		r.deps.Logger.Info("ha readd: the VM holds a config lock or a task moves it; the re-registration waits",
+			log.String("sid", r.sid), log.String("node", node))
+		return cpierrors.Retriable("ha readd: VM %d on node %s holds a config lock or has a migration, relocation, "+
+			"or disk move task running, so nothing more changes in HA; retry once the task is done", r.in.VMID,
+			orDash(node))
+	}
+	return nil
 }
 
 // nodeReady checks that the VM's node is online with a fresh LRM, which the

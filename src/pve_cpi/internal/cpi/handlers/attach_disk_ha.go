@@ -181,12 +181,21 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 		deps: deps, logger: logger, vmCID: vmCID, disk: rd, vmid: vmid, sid: sid, node: loc.Node,
 		profile: profile, decision: d, oldPin: oldPin, narrow: ha.NarrowDepsFor(deps.PVE, logger, haMotionWait(deps)),
 	}
+	// A transient refusal and a placeable shortfall come before the failure,
+	// because in managed mode a refusal for a reason that may pass is also a
+	// failure, and it must defer rather than fail the attach for good.
 	switch {
-	case d.Outcome == ha.OutcomeFail:
+	case d.Transient:
+		// The decision refused HA for a reason that may pass, such as a node
+		// of the VM's CPU domain that is down or unreadable, or a storage read
+		// that failed. Leaving HA cannot be undone by the next attach, so the
+		// attach waits and the VM keeps its HA resource, its tag, and its pin.
+		msg := fmt.Sprintf("%s: VM %d is HA-managed, and the HA decision refused HA with the new disk for a "+
+			"reason that may pass; the attach waits rather than take the VM out of HA for it", op, vmid)
 		if failure := d.Failure(); failure != nil {
-			return nil, failure
+			return nil, cpierrors.WrapAs(failure, cpierrors.TypeRetriableCloud, msg)
 		}
-		return nil, cpierrors.Cloud("%s: VM %d: the HA decision failed the call: %s", op, vmid, d.Reason)
+		return nil, cpierrors.Retriable("%s (%s)", msg, d.Reason)
 	case d.PlaceableShortfall:
 		// Enough nodes reach the VM's volumes, and the VM misses full HA only
 		// because some of them are unhealthy or in maintenance now. A VM that
@@ -196,14 +205,11 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 			"new disk, but fewer than two of them can take the VM now; the attach waits until enough of them "+
 			"are healthy again rather than take the VM out of HA for a temporary outage", op, vmid,
 			strings.Join(d.Access, ","))
-	case d.Transient:
-		// The decision refused HA for a reason that may pass, such as a node
-		// of the VM's CPU domain that is down or unreadable, or a storage read
-		// that failed. Leaving HA cannot be undone by the next attach, so the
-		// attach waits and the VM keeps its HA resource, its tag, and its pin.
-		return nil, cpierrors.Retriable("%s: VM %d is HA-managed, and the HA decision refused HA with the new disk "+
-			"for a reason that may pass (%s); the attach waits rather than take the VM out of HA for it", op, vmid,
-			d.Reason)
+	case d.Outcome == ha.OutcomeFail:
+		if failure := d.Failure(); failure != nil {
+			return nil, failure
+		}
+		return nil, cpierrors.Cloud("%s: VM %d: the HA decision failed the call: %s", op, vmid, d.Reason)
 	case d.Outcome == ha.OutcomeRegister:
 		newPin, err := attachNewPin(d, oldPin, profile, set, ha.VolumeStorages(in.Volumes), owner)
 		if err != nil {
@@ -324,6 +330,16 @@ func attachHAInput(
 	deps Deps, vmid int, node string, cfg map[string]any, res *cluster.GetHaResourcesResponse, oldPin *ha.Rule,
 	rd resolvedDisk,
 ) ha.VMInput {
+	return attachDecisionInput(deps, vmid, node, cfg, res.AutoRebalance != nil && res.AutoRebalance.Bool(), oldPin,
+		rd)
+}
+
+// attachDecisionInput is attachHAInput with the resource's auto-rebalance flag
+// given as inDLB, for a caller whose resource is gone and whose record keeps
+// the flag.
+func attachDecisionInput(
+	deps Deps, vmid int, node string, cfg map[string]any, inDLB bool, oldPin *ha.Rule, rd resolvedDisk,
+) ha.VMInput {
 	volumes := haVolumesOfConfig(cfg, node, nil)
 	if !slices.ContainsFunc(volumes, func(v ha.VMVolume) bool { return v.Volume == rd.volid }) {
 		volumes = append(volumes, ha.VMVolume{
@@ -337,7 +353,7 @@ func attachHAInput(
 		Node:      node,
 		Volumes:   volumes,
 		CPUType:   ha.EffectiveCPUType(deps.Config, nil, liveCPU),
-		InDLBAZ:   res.AutoRebalance != nil && res.AutoRebalance.Bool(),
+		InDLBAZ:   inDLB,
 		HAManaged: true,
 	}
 	if oldPin != nil && oldPin.Strict && !oldPin.Disabled {
@@ -500,7 +516,7 @@ func (h *attachHA) reregister(
 	if _, wrapped := h.deps.PVE.(guardWrappedClient); wrapped {
 		return pve.VMLocation{}, h.errAttachReaddGuarded()
 	}
-	ran := false
+	readd := &attachReadd{h: h, register: true}
 	var landed pve.VMLocation
 	node := h.node
 	if st != nil && st.Node != "" {
@@ -510,25 +526,18 @@ func (h *attachHA) reregister(
 		decided: st,
 		profile: h.profile,
 		between: func(ctx context.Context, node string) (pve.VMLocation, error) {
-			ran = true
+			readd.ran = true
 			loc, err := between(ctx, node)
 			landed = loc
 			return loc, err
 		},
-		decide: func(context.Context, string, *pve.HAServiceState, ha.ReaddRecord) (*ha.VMDecision, error) {
-			return h.decision, nil
-		},
-		writePin: func(ctx context.Context, _ *ha.VMDecision) (*ha.Rule, error) {
-			if err := h.writePin(ctx, h.newPin); err != nil {
-				return nil, err
-			}
-			return h.newPin, nil
-		},
+		decide:   readd.decide,
+		writePin: readd.writePin,
 	})
 	if err != nil {
 		return pve.VMLocation{}, err
 	}
-	if !ran {
+	if !readd.ran {
 		return pve.VMLocation{}, cpierrors.Retriable("%s: the HA re-registration of VM %d ended (%s) without "+
 			"running the attach; retry", attachHAOp, h.vmid, res.Outcome)
 	}
@@ -537,6 +546,92 @@ func (h *attachHA) reregister(
 	}
 	landed.Found = true
 	return landed, nil
+}
+
+// attachReadd is the attach's part of a re-registration that runs the attach
+// between the removal and the registration, or that removes the VM from HA
+// before the attach. Its decision runs under the VM's claim, over the VM's
+// config, pin, and record as they are there, with the new disk added, so it
+// never acts on what the attach read before the claim.
+type attachReadd struct {
+	h *attachHA
+	// register says the attach, deciding before the claim, kept the VM in HA
+	// with the new disk.
+	register bool
+	// ran says the attach has run between the removal and the registration.
+	ran bool
+	// oldPin and set are the VM's strict pin and the rules the last decision
+	// read, which the pin write builds on.
+	oldPin *ha.Rule
+	set    *ha.RuleSet
+}
+
+// decide makes the attach decision again under the claim. A decision before
+// the attach ran that no longer matches the one the attach planned with, which
+// kept the VM in HA or took it out, returns a retriable error before anything
+// changes, so the next attach plans again. A deferring or failing decision is
+// left to the order, which defers or fails the call.
+func (a *attachReadd) decide(
+	ctx context.Context, node string, _ *pve.HAServiceState, rec ha.ReaddRecord,
+) (*ha.VMDecision, []ha.VMVolume, error) {
+	const op = attachHAOp
+	h := a.h
+	cfg, err := h.deps.PVE.QEMU().Config(ctx, node, h.vmid)
+	if err != nil {
+		return nil, nil, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: read the config of VM %d for its HA decision", op, h.vmid))
+	}
+	set, err := readHARuleSet(ctx, h.deps.PVE.Cluster())
+	if err != nil {
+		return nil, nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: read the HA rules for VM %d", op, h.vmid))
+	}
+	pin := set.Find(naRuleNameFor(h.vmid))
+	if pin != nil && haOwnershipOf(pin.Comment, h.deps.RequestDirectorUUID) == haOwnedByOther {
+		return nil, nil, cpierrors.Cloud("%s: the pin %s of VM %d carries another Director's ownership marker", op,
+			pin.ID, h.vmid)
+	}
+	var strict *ha.Rule
+	if pin != nil && pin.Strict && !pin.Disabled {
+		strict = pin
+	}
+	in := attachDecisionInput(h.deps, h.vmid, node, cfg, rec.AutoRebalance, strict, h.disk)
+	if c, ok := recordedPinConstraint(h.vmid, rec); ok && strict == nil {
+		// PVE pruned the pin together with the resource, and the record keeps
+		// its nodes.
+		in.Constraints = append(in.Constraints, c)
+	}
+	d, err := h.profile.DecideVM(in)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, w := range d.Warnings {
+		h.logger.Warn(op+": "+w, log.Int(metadataKeyVMID, h.vmid))
+	}
+	settled := !d.Transient && !d.PlaceableShortfall && d.Outcome != ha.OutcomeFail
+	if !a.ran && settled && d.Registers() != a.register {
+		return nil, nil, cpierrors.Retriable("%s: the HA decision for VM %d with the new disk changed since the "+
+			"attach made it (%s); nothing changed, and a retry decides again", op, h.vmid, d.Reason)
+	}
+	a.oldPin, a.set = strict, set
+	return d, in.Volumes, nil
+}
+
+// writePin writes the pin the decision gives with the new disk, recording
+// storages, and verifies it.
+func (a *attachReadd) writePin(ctx context.Context, d *ha.VMDecision, storages []string) (*ha.Rule, error) {
+	h := a.h
+	if a.set == nil {
+		return nil, cpierrors.Cloud("%s: VM %d: the pin was asked for before its decision", attachHAOp, h.vmid)
+	}
+	pin, err := attachNewPin(d, a.oldPin, h.profile, a.set, storages, h.deps.RequestDirectorUUID)
+	if err != nil {
+		return nil, err
+	}
+	if err := h.writePinFor(ctx, d, pin); err != nil {
+		return nil, err
+	}
+	return pin, nil
 }
 
 // leaveErrored clears the error of a resource the attach removes from HA, by
@@ -561,9 +656,7 @@ func (h *attachHA) leaveErrored(ctx context.Context) (pve.VMLocation, bool, erro
 	}
 	opts := readdOptions{decided: st, stopAfterRemoval: true, profile: h.profile}
 	if h.decision != nil {
-		opts.decide = func(context.Context, string, *pve.HAServiceState, ha.ReaddRecord) (*ha.VMDecision, error) {
-			return h.decision, nil
-		}
+		opts.decide = (&attachReadd{h: h}).decide
 	}
 	node := h.node
 	if st.Node != "" {
@@ -659,23 +752,29 @@ func (h *attachHA) attachUnchanged(ctx context.Context, node string) (bool, erro
 
 // attachMoving answers the barrier's Moving after an attach that returned an
 // error. A failed wait does not stop a PVE task, so the disk may still land
-// after the attach gave up on it. A config lock, such as the migrate lock a
-// migration or an HA relocation holds, and a qmmove task in node's active
-// task list that moves a disk from or onto the VM, such as the transfer from
-// a parker, each answer true. PVE lists a task as active until it archives
-// it, so a task that has just ended still answers true, and the attach then
-// defers once more. The listing needs Sys.Audit on the node. A client that
-// cannot list tasks, a missing privilege, and a failed read are errors, which
-// keep the narrower pin.
+// after the attach gave up on it (see vmMoveInFlight). An error keeps the
+// narrower pin.
 func (h *attachHA) attachMoving(ctx context.Context, node string) (bool, error) {
-	cfg, err := h.deps.PVE.QEMU().Config(ctx, node, h.vmid)
+	return vmMoveInFlight(ctx, h.deps, h.vmid, node)
+}
+
+// vmMoveInFlight reports whether the VM vmid on node holds a config lock or
+// has a disk move task running. A config lock, such as the migrate lock a
+// migration or an HA relocation holds, and a qmmove task in node's active task
+// list that moves a disk from or onto the VM, such as the transfer from a
+// parker, each answer true. PVE lists a task as active until it archives it,
+// so a task that has just ended still answers true, and the caller then
+// defers once more. The listing needs Sys.Audit on the node. A client that
+// cannot list tasks, a missing privilege, and a failed read are errors.
+func vmMoveInFlight(ctx context.Context, deps Deps, vmid int, node string) (bool, error) {
+	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
 	if err != nil {
-		return false, fmt.Errorf("read the config of VM %d: %w", h.vmid, pve.WrapError(err))
+		return false, fmt.Errorf("read the config of VM %d: %w", vmid, pve.WrapError(err))
 	}
 	if lock, _ := pve.ConfigString(cfg, "lock"); strings.TrimSpace(lock) != "" {
 		return true, nil
 	}
-	reader, ok := h.deps.PVE.(pve.ActiveMoveTaskReader)
+	reader, ok := deps.PVE.(pve.ActiveMoveTaskReader)
 	if !ok {
 		return false, fmt.Errorf("the PVE client cannot list the active move tasks on node %s", node)
 	}
@@ -684,7 +783,7 @@ func (h *attachHA) attachMoving(ctx context.Context, node string) (bool, error) 
 		return false, fmt.Errorf("list the active move tasks on node %s: %w", node, err)
 	}
 	for _, task := range tasks {
-		if pve.MoveTaskIDTouchesVM(task.ID, h.vmid) {
+		if pve.MoveTaskIDTouchesVM(task.ID, vmid) {
 			return true, nil
 		}
 	}
@@ -699,9 +798,15 @@ func (h *attachHA) writePin(ctx context.Context, pin *ha.Rule) error {
 	if pin == nil {
 		return h.removeAttachPin(ctx)
 	}
+	return h.writePinFor(ctx, h.decision, pin)
+}
+
+// writePinFor writes pin under the rules lock and verifies it against the
+// decision d.
+func (h *attachHA) writePinFor(ctx context.Context, d *ha.VMDecision, pin *ha.Rule) error {
 	owner := h.deps.RequestDirectorUUID
 	err := withHARulesLock(ctx, h.deps, h.vmid, h.logger, func() error {
-		writer := newHARuleWriterFor(h.deps, h.profile, h.logger, h.decision)
+		writer := newHARuleWriterFor(h.deps, h.profile, h.logger, d)
 		_, err := writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			cur := set.Find(pin.ID)
 			switch {
@@ -728,7 +833,7 @@ func (h *attachHA) writePin(ctx context.Context, pin *ha.Rule) error {
 		Managed:   h.deps.Config.HAModeValue() == config.HAModeManaged,
 		Logger:    h.logger,
 	}
-	return stager.Verify(ctx, h.decision, pin, "")
+	return stager.Verify(ctx, d, pin, "")
 }
 
 // removeAttachPin deletes the node-affinity pin this attach wrote for a VM

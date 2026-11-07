@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -33,14 +34,35 @@ type readdOptions struct {
 	// between is the change the caller makes while the VM has no HA resource,
 	// nil for none.
 	between func(ctx context.Context, node string) (pve.VMLocation, error)
-	// decide replaces the decision over the VM's volumes, for a caller that
-	// made its own over the volumes the change gives the VM.
-	decide func(ctx context.Context, node string, st *pve.HAServiceState, rec ha.ReaddRecord) (*ha.VMDecision, error)
+	// decide replaces the decision over the VM's volumes, for a caller whose
+	// change gives the VM other volumes. It runs under the VM's claim, reads
+	// everything it decides on there, and returns the volumes it decided
+	// over, which the pin's volume record names.
+	decide func(
+		ctx context.Context, node string, st *pve.HAServiceState, rec ha.ReaddRecord,
+	) (*ha.VMDecision, []ha.VMVolume, error)
 	// writePin replaces the merged pin write of the confinement, for a caller
-	// that knows the pin its change needs.
-	writePin func(ctx context.Context, d *ha.VMDecision) (*ha.Rule, error)
+	// that knows the pin its change needs. storages are the storages of the
+	// volumes the last decision ran over, which the pin must record.
+	writePin func(ctx context.Context, d *ha.VMDecision, storages []string) (*ha.Rule, error)
+	// pendingOnly finishes only an order an earlier call left part way, and
+	// leaves a VM whose config carries no re-registration tag as it is.
+	pendingOnly bool
 	// profile is the resolved HA profile, nil to resolve it here.
 	profile *ha.Profile
+}
+
+// readdLockMotionWaits is how many waits bounded by the HA motion wait one
+// re-registration can run in a row under the VM's claim: the tag write, the
+// drain, the started wait, and the tag removal.
+const readdLockMotionWaits = 4
+
+// readdLockTTL is the TTL of the VMID claim a re-registration holds. Like a
+// disposal's claim, it covers the request's remaining time plus the lock
+// margin, and for a request with no deadline it covers the slowest metadata
+// body plus the order's own motion waits.
+func readdLockTTL(ctx context.Context, deps Deps) time.Duration {
+	return max(disposalClaimTTL(ctx), vmidLockTTLNow()+readdLockMotionWaits*haMotionWait(deps))
 }
 
 // readdError wraps msg as a blocked re-registration, a retriable error that
@@ -53,6 +75,15 @@ func readdError(op, msg string) error {
 // reregisterErroredVM runs the re-registration order for the VM vmid on node,
 // or finishes one an earlier call left part way. It refuses a request with no
 // director_uuid, because the CPI could not prove the resource its own.
+//
+// The whole order runs under the VM's VMID claim (see withVMIDLockFor), which
+// the deferred-teardown sweep takes too, so two callers never start, resume, or
+// finish one VM's re-registration at once. A request that already holds the
+// claim, as the sweep does, runs the order under it. The order reads the VM's
+// tag, HA resource, pin, and volumes after the claim is taken, and a caller's
+// decision callback reads its own inputs there as well. A claim another
+// process holds, or one that cannot be taken, returns a retriable error, and
+// nothing changes.
 func reregisterErroredVM(
 	ctx context.Context, deps Deps, op string, vmid int, node string, logger *log.Logger, opts readdOptions,
 ) (ha.ReregisterResult, error) {
@@ -67,6 +98,26 @@ func reregisterErroredVM(
 			"'ha-manager remove %s' and then 'ha-manager add %s --state started'", vmid, haResourceSid(vmid),
 			haResourceSid(vmid)))
 	}
+	var res ha.ReregisterResult
+	ran := false
+	err := withVMIDLockFor(ctx, deps.PVE.Pools(), vmid, fmt.Sprintf("ha-readd/%d", vmid), readdLockTTL(ctx, deps),
+		logger, func() error {
+			ran = true
+			var err error
+			res, err = reregisterClaimed(ctx, deps, op, vmid, node, owner, logger, opts)
+			return err
+		})
+	if err != nil && !ran && !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		err = cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf("%s: take the VMID claim on VM %d "+
+			"to re-register its HA resource; nothing changed, retry", op, vmid))
+	}
+	return res, err
+}
+
+// reregisterClaimed is reregisterErroredVM's order, run under the VM's claim.
+func reregisterClaimed(
+	ctx context.Context, deps Deps, op string, vmid int, node, owner string, logger *log.Logger, opts readdOptions,
+) (ha.ReregisterResult, error) {
 	profile := opts.profile
 	if profile == nil {
 		resolved, err := resolveHAProfile(ctx, deps)
@@ -78,16 +129,13 @@ func reregisterErroredVM(
 	}
 	managed := deps.Config.HAModeValue() == config.HAModeManaged
 	w := &readdWiring{deps: deps, op: op, vmid: vmid, owner: owner, profile: profile, logger: logger, opts: opts}
-	decide := w.decide
-	if opts.decide != nil {
-		decide = opts.decide
-	}
 	in := ha.ReregisterInput{
 		VMID:             vmid,
 		Node:             node,
 		Profile:          profile,
 		Decided:          opts.decided,
 		StopAfterRemoval: opts.stopAfterRemoval,
+		PendingOnly:      opts.pendingOnly,
 		PinID:            naRuleNameFor(vmid),
 		Budget:           haMotionWait(deps),
 		Stager:           newHAStager(deps, owner, profile, managed, logger),
@@ -95,7 +143,8 @@ func reregisterErroredVM(
 		ReadIntent:       w.readIntent,
 		WriteIntent:      w.writeIntent,
 		ClearIntent:      w.clearIntent,
-		Decide:           decide,
+		Decide:           w.decide,
+		Moving:           w.moving,
 		LeaveRules:       w.leaveRules,
 		Between:          opts.between,
 		Confine:          w.confine,
@@ -192,33 +241,67 @@ func withReaddTag(tags []string, tag string) []string {
 	return append(ha.WithoutReaddTags(tags), tag)
 }
 
-// decide makes the VM's eligibility decision over the volumes its config holds
-// on node now. The record keeps what the removal took away: a strict pin is a
-// constraint, so the decision never widens where the VM may run, and an
-// auto-rebalance flag says the VM is a DLB VM. A VM that is not a DLB VM and
-// whose node lies in exactly one AZ of the AZ map gets that AZ, which pin_az
-// then confines it to as create_vm does.
+// decide makes the VM's eligibility decision, through the caller's decision
+// when it brings one, and records the volumes the decision ran over, which
+// every pin the confinement writes names. A decision that registers the VM over
+// no volume is refused, because its pin would record none.
 func (w *readdWiring) decide(
 	ctx context.Context, node string, st *pve.HAServiceState, rec ha.ReaddRecord,
 ) (*ha.VMDecision, error) {
+	decide := w.decideVolumes
+	if w.opts.decide != nil {
+		decide = w.opts.decide
+	}
+	d, volumes, err := decide(ctx, node, st, rec)
+	if err != nil {
+		return nil, err
+	}
+	if d.Registers() && len(volumes) == 0 {
+		return nil, cpierrors.Cloud("%s: the HA decision for VM %d names no volume, so its pin could not record "+
+			"one", w.op, w.vmid)
+	}
+	w.volumes = volumes
+	return d, nil
+}
+
+// decideVolumes makes the VM's eligibility decision over the volumes its
+// config holds on node now. The record keeps what the removal took away: a
+// strict pin is a constraint, so the decision never widens where the VM may
+// run, and an auto-rebalance flag says the VM is a DLB VM. A VM that is not a
+// DLB VM and whose node lies in exactly one AZ of the AZ map gets that AZ,
+// which pin_az then confines it to as create_vm does.
+func (w *readdWiring) decideVolumes(
+	ctx context.Context, node string, st *pve.HAServiceState, rec ha.ReaddRecord,
+) (*ha.VMDecision, []ha.VMVolume, error) {
 	cfg, err := w.deps.PVE.QEMU().Config(ctx, node, w.vmid)
 	if err != nil {
-		return nil, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
+		return nil, nil, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("%s: read the config of VM %d for its HA decision", w.op, w.vmid))
 	}
 	in := readdDecisionInput(w.deps.Config, w.vmid, node, cfg, st, rec)
 	d, err := w.profile.DecideVM(in)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, msg := range d.Warnings {
 		w.logger.Warn(w.op+": "+msg, log.Int(metadataKeyVMID, w.vmid))
 	}
-	w.volumes = in.Volumes
-	return d, nil
+	return d, in.Volumes, nil
 }
 
-// readdDecisionInput builds the decision input of a re-registration.
+// moving reports whether the VM on node holds a config lock or has a move task
+// running (see vmMoveInFlight).
+func (w *readdWiring) moving(ctx context.Context, node string) (bool, error) {
+	return vmMoveInFlight(ctx, w.deps, w.vmid, node)
+}
+
+// readdDecisionInput builds the decision input of a re-registration. Every
+// re-registration is of a resource this Director registered before, so the VM
+// is HA-managed: a cluster fact an upgrade can change, such as a node below
+// the PVE 9 floor or one too old for the dynamic load balancer, defers the
+// order or turns the balancer off rather than take the VM out of HA. The
+// recorded strict pin is the VM's own pin, so a VM that runs outside it defers
+// too, as the attach path does.
 func readdDecisionInput(
 	cfg *config.CPIConfig, vmid int, node string, vmCfg map[string]any, st *pve.HAServiceState, rec ha.ReaddRecord,
 ) ha.VMInput {
@@ -232,10 +315,10 @@ func readdDecisionInput(
 		InDLBAZ:     rec.AutoRebalance,
 		LinkedClone: configHasLinkedClone(vmCfg),
 		State:       st,
+		HAManaged:   true,
 	}
-	if rec.PinStrict && len(rec.PinNodes) > 0 {
-		in.Constraints = append(in.Constraints, ha.NodeConstraint{Name: "the VM's pin " + naRuleNameFor(vmid),
-			Nodes: slices.Clone(rec.PinNodes)})
+	if c, ok := recordedPinConstraint(vmid, rec); ok {
+		in.Constraints = append(in.Constraints, c)
 	}
 	if configHasPCIPassthrough(vmCfg) {
 		in.Constraints = append(in.Constraints, ha.NodeConstraint{Name: pciConstraintName, Nodes: []string{node}})
@@ -247,6 +330,17 @@ func readdDecisionInput(
 		}
 	}
 	return in
+}
+
+// recordedPinConstraint returns the strict pin a re-registration record keeps
+// as a constraint marked as the VM's own pin, and false when the record holds
+// no strict pin.
+func recordedPinConstraint(vmid int, rec ha.ReaddRecord) (ha.NodeConstraint, bool) {
+	if !rec.PinStrict || len(rec.PinNodes) == 0 {
+		return ha.NodeConstraint{}, false
+	}
+	return ha.NodeConstraint{Name: "the VM's pin " + naRuleNameFor(vmid), Nodes: slices.Clone(rec.PinNodes),
+		Pin: true}, true
 }
 
 // soleAZOfNode returns the one AZ of the AZ map, the DLB AZ aside, that lists
@@ -335,11 +429,12 @@ func (w *readdWiring) confine(
 	}
 	var pin *ha.Rule
 	var err error
+	storages := ha.VolumeStorages(w.volumes)
 	if w.opts.writePin != nil {
-		pin, err = w.opts.writePin(ctx, d)
+		pin, err = w.opts.writePin(ctx, d, storages)
 	} else {
-		pin, err = writeMergedPinRule(ctx, w.deps, w.profile, w.vmid,
-			pinRequest{Decision: d, Storages: ha.VolumeStorages(w.volumes)}, w.logger)
+		pin, err = writeMergedPinRule(ctx, w.deps, w.profile, w.vmid, pinRequest{Decision: d, Storages: storages},
+			w.logger)
 	}
 	if err == nil && pin == nil {
 		err = fmt.Errorf("node-affinity: no pin was planned for VM %d", w.vmid)
@@ -413,7 +508,9 @@ func enableOwnedGroupRules(ctx context.Context, deps Deps, ident haIdentity, vmi
 
 // finishPendingHAReadd finishes the HA re-registration of a VM that carries
 // the re-registration tag, before a handler changes the VM. loc is the VM's
-// location with the tags the caller read. Mode off, a VM with no tag, and a
+// location with the tags the caller read, which only says whether to look:
+// the order reads the tag again under the VM's claim, and a VM whose tag is
+// gone by then is left as it is. Mode off, a VM with no tag, and a
 // client the managed lifecycle guard wraps, whose HA writes the guard refuses,
 // do nothing here. A re-registration that cannot go on for a reason a retry
 // does not clear is logged and the handler goes on, because the VM runs as it
@@ -438,7 +535,7 @@ func finishPendingHAReadd(ctx context.Context, deps Deps, op string, vmid int, l
 			"lifecycle finishes it", log.Int(metadataKeyVMID, vmid), log.String("tag", tag))
 		return nil
 	}
-	res, err := reregisterErroredVM(ctx, deps, op, vmid, loc.Node, logger, readdOptions{})
+	res, err := reregisterErroredVM(ctx, deps, op, vmid, loc.Node, logger, readdOptions{pendingOnly: true})
 	switch {
 	case err == nil:
 		logger.Info(op+": finished the VM's HA re-registration", log.Int(metadataKeyVMID, vmid),

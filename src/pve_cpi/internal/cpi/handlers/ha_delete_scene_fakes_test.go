@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -104,6 +105,15 @@ type HADeleteScene struct {
 	Tick int64
 	// uidSerial numbers the uid of a service the scene creates.
 	uidSerial int
+
+	// MoveTasks are the qmmove tasks each node's active task list holds, and
+	// MoveTasksErr fails every listing when set.
+	MoveTasks    map[string][]pve.ActiveTask
+	MoveTasksErr error
+	// lockPools backs the client's pool service, whose create refuses a pool
+	// that exists, so the VMID locks the scene's handlers take exclude each
+	// other. Its calls are not events.
+	lockPools *exclusiveLockPools
 
 	// Events records every mutation in order.
 	Events []string
@@ -811,6 +821,35 @@ func (c *haSceneClient) Nodes() nodes.Service { return &HASceneNodes{Scene: c.sc
 func (c *haSceneClient) QEMU() qemu.Service   { return &HASceneQEMU{Scene: c.scene} }
 func (c *haSceneClient) Tasks() tasks.Service { return haSceneTasks{} }
 
+// Pools serves the scene's lock pools (see HADeleteScene.lockPoolService).
+func (c *haSceneClient) Pools() pve.PoolService { return c.scene.lockPoolService() }
+
+// ActiveMoveTasks serves the scene's MoveTasks for node.
+func (c *haSceneClient) ActiveMoveTasks(_ context.Context, node string) ([]pve.ActiveTask, error) {
+	return c.scene.activeMoveTasks(node)
+}
+
+// activeMoveTasks returns the scene's MoveTasks for node, or MoveTasksErr.
+func (s *HADeleteScene) activeMoveTasks(node string) ([]pve.ActiveTask, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.MoveTasksErr != nil {
+		return nil, s.MoveTasksErr
+	}
+	return slices.Clone(s.MoveTasks[node]), nil
+}
+
+// lockPoolService returns the pool service the scene's VMID locks live in, made on
+// first use.
+func (s *HADeleteScene) lockPoolService() *exclusiveLockPools {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lockPools == nil {
+		s.lockPools = newExclusiveLockPools()
+	}
+	return s.lockPools
+}
+
 func (c *haSceneClient) EffectivePermissions(context.Context, string) (map[string]bool, error) {
 	return c.scene.perms()
 }
@@ -840,4 +879,9 @@ type HAScenePermsClient struct {
 
 func (c *HAScenePermsClient) EffectivePermissions(context.Context, string) (map[string]bool, error) {
 	return c.Scene.perms()
+}
+
+// ActiveMoveTasks serves the scene's MoveTasks for node.
+func (c *HAScenePermsClient) ActiveMoveTasks(_ context.Context, node string) ([]pve.ActiveTask, error) {
+	return c.Scene.activeMoveTasks(node)
 }

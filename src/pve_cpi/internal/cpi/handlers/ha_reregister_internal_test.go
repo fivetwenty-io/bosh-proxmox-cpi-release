@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -294,14 +295,32 @@ func TestReregisterErroredVM_PreconditionsWriteNothing(t *testing.T) {
 		"a stale LRM": {func(r *readdRig) {
 			r.scene.Do(func(s *HADeleteScene) { s.LRMAge["pve-node1"] = 3600 })
 		}, ""},
-		"outside the admissible set": {func(r *readdRig) {
+		// The VM's own strict pin no longer holds its node, so it was moved
+		// out of band, and the order defers and names both ways out.
+		"outside its strict pin": {func(r *readdRig) {
 			r.scene.Do(func(s *HADeleteScene) {
 				s.Rules[naRuleNameFor(readdVMID)]["nodes"] = "pve-node2,pve-node3"
 				s.Rules[naRuleNameFor(readdVMID)]["strict"] = 1
 			})
-		}, "admissible"},
+		}, "widen the pin"},
+		"a config lock": {func(r *readdRig) {
+			r.scene.Do(func(s *HADeleteScene) { s.Configs[readdVMID]["lock"] = "migrate" })
+		}, "config lock"},
+		"a disk move task": {func(r *readdRig) {
+			r.scene.Do(func(s *HADeleteScene) {
+				s.MoveTasks = map[string][]pve.ActiveTask{"pve-node1": {{Type: "qmmove", ID: "101"}}}
+			})
+		}, "disk move task"},
+		"an unreadable task list": {func(r *readdRig) {
+			r.scene.Do(func(s *HADeleteScene) { s.MoveTasksErr = errors.New("permission denied - (HTTP403)") })
+		}, "could not tell"},
+		"a node below the PVE 9 floor": {func(r *readdRig) { r.profile.Nodes[2].Version = "8.4.1" }, "PVE 9 floor"},
+		"another holder of the VMID claim": {func(r *readdRig) {
+			r.scene.lockPoolService().hold(readdVMID, "set_vm_metadata/101", time.Now().Add(time.Hour))
+		}, "set_vm_metadata/101"},
 	} {
 		t.Run(name, func(t *testing.T) {
+			shortenVMIDLockWait(t, 50*time.Millisecond)
 			r := newReaddRig(t, config.HAModeAuto)
 			tc.edit(r)
 			_, err := r.run(t, readdOptions{})
@@ -419,7 +438,7 @@ func TestSoleAZOfNode(t *testing.T) {
 // take its VMID claims.
 type readdPoolsClient struct {
 	*haSceneClient
-	pools *wbNoopPoolService
+	pools pve.PoolService
 }
 
 func (c *readdPoolsClient) Pools() pve.PoolService { return c.pools }
@@ -646,5 +665,284 @@ func TestFinishPendingHAReaddForCID(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// gatedLockPools holds the first acquire of one VMID claim open. The create
+// that takes the claim closes entered and waits for release before it
+// returns, so a test can run a second caller while the first holds the claim.
+type gatedLockPools struct {
+	*exclusiveLockPools
+	pool    string
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newGatedLockPools(vmid int) *gatedLockPools {
+	return &gatedLockPools{exclusiveLockPools: newExclusiveLockPools(), pool: vmidLockPool(vmid),
+		entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (p *gatedLockPools) CreatePool(ctx context.Context, poolID, comment string) error {
+	if err := p.exclusiveLockPools.CreatePool(ctx, poolID, comment); err != nil {
+		return err
+	}
+	if poolID == p.pool {
+		p.once.Do(func() {
+			close(p.entered)
+			<-p.release
+		})
+	}
+	return nil
+}
+
+// createAttempts counts the creates every caller tried, taken or refused.
+func (p *gatedLockPools) createAttempts() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.creates
+}
+
+func (p *gatedLockPools) waitEntered(t *testing.T) {
+	t.Helper()
+	select {
+	case <-p.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first caller never took the VMID claim")
+	}
+}
+
+// requireStagedOnce fails unless the events stage the VM's HA resource exactly
+// once.
+func requireStagedOnce(t *testing.T, events []string) {
+	t.Helper()
+	staged := 0
+	for _, e := range events {
+		if e == "CreateHaResources:vm:101=ignored" {
+			staged++
+		}
+	}
+	if staged != 1 {
+		t.Fatalf("events %v, want the HA resource staged exactly once", events)
+	}
+}
+
+// requireNoHAWrite fails when any event touched an HA resource.
+func requireNoHAWrite(t *testing.T, events []string) {
+	t.Helper()
+	for _, e := range events {
+		if strings.Contains(e, "HaResources") || strings.HasPrefix(e, "Update") || strings.HasPrefix(e, "Create") {
+			t.Fatalf("events %v, want nothing written", events)
+		}
+	}
+}
+
+// TestReaddRace_HandlerClaimMakesTheSweepSkip races a handler's hook and the
+// sweep on the same due re-registration. The hook takes the VMID claim first,
+// so the sweep skips the VM and writes nothing, and the hook finishes the
+// order alone.
+func TestReaddRace_HandlerClaimMakesTheSweepSkip(t *testing.T) {
+	r := newReaddRig(t, config.HAModeAuto)
+	r.crashAfterRemoval(t, time.Now().Add(-24*time.Hour))
+	pools := newGatedLockPools(readdVMID)
+	r.deps.PVE = &readdPoolsClient{haSceneClient: r.deps.PVE.(*haSceneClient), pools: pools}
+	loc := pve.VMLocation{Node: "pve-node1", Tags: strings.Join(r.tags(), ";"), Found: true}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- finishPendingHAReadd(ctx, r.deps, "set_vm_metadata", readdVMID, loc, log.NewNopLogger())
+	}()
+	pools.waitEntered(t)
+	// The sweep sizes its budget from its own context, which a request
+	// deadline this short would leave no time to claim in.
+	sweepDeferredTeardowns(context.Background(), r.deps, log.NewNopLogger())
+	requireNoHAWrite(t, r.scene.EventsSnapshot())
+	if _, ok := r.requested(); ok {
+		t.Fatal("the sweep registered the VM while the hook held its claim")
+	}
+	if n := pools.createAttempts(); n < 2 {
+		t.Fatalf("%d claim attempts, want the sweep to have tried the claim the hook holds", n)
+	}
+	close(pools.release)
+	if err := <-done; err != nil {
+		t.Fatalf("the hook: %v", err)
+	}
+	r.requireRegisteredAgain(t)
+	events := r.scene.EventsSnapshot()
+	requireStagedOnce(t, events)
+	requireNeverDisabled(t, events)
+}
+
+// TestReaddRace_SweepClaimMakesTheHandlerDefer is the other order: the sweep
+// takes the VMID claim first, so the hook defers with a retriable error and
+// writes nothing, and the sweep finishes the order alone.
+func TestReaddRace_SweepClaimMakesTheHandlerDefer(t *testing.T) {
+	shortenVMIDLockWait(t, 50*time.Millisecond)
+	r := newReaddRig(t, config.HAModeAuto)
+	r.crashAfterRemoval(t, time.Now().Add(-24*time.Hour))
+	pools := newGatedLockPools(readdVMID)
+	r.deps.PVE = &readdPoolsClient{haSceneClient: r.deps.PVE.(*haSceneClient), pools: pools}
+	loc := pve.VMLocation{Node: "pve-node1", Tags: strings.Join(r.tags(), ";"), Found: true}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	swept := make(chan struct{})
+	go func() {
+		defer close(swept)
+		sweepDeferredTeardowns(context.Background(), r.deps, log.NewNopLogger())
+	}()
+	pools.waitEntered(t)
+	err := finishPendingHAReadd(ctx, r.deps, "set_vm_metadata", readdVMID, loc, log.NewNopLogger())
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("err = %v, want a retriable deferral while the sweep holds the claim", err)
+	}
+	requireNoHAWrite(t, r.scene.EventsSnapshot())
+	close(pools.release)
+	<-swept
+	r.requireRegisteredAgain(t)
+	events := r.scene.EventsSnapshot()
+	requireStagedOnce(t, events)
+	requireNeverDisabled(t, events)
+}
+
+// editReaddRecord rewrites the re-registration record a crash after the
+// removal left in the VM's description.
+func (r *readdRig) editReaddRecord(t *testing.T, edit func(*ha.ReaddRecord)) {
+	t.Helper()
+	rec, err := ha.ReaddRecordOf(r.description())
+	if err != nil || rec == nil {
+		t.Fatalf("record %+v err %v, want the record a crash leaves", rec, err)
+	}
+	edit(rec)
+	desc, err := ha.WithReaddRecord(r.description(), rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.scene.Do(func(s *HADeleteScene) { s.Configs[readdVMID]["description"] = desc })
+}
+
+// TestReregisterErroredVM_ResumeOutsideTheRecordedStrictPinDefers resumes an
+// order whose record keeps a strict pin the VM's node lies outside. The order
+// defers and keeps its tag, as the attach does for a VM under HA, rather than
+// leave the VM without HA.
+func TestReregisterErroredVM_ResumeOutsideTheRecordedStrictPinDefers(t *testing.T) {
+	r := newReaddRig(t, config.HAModeAuto)
+	r.crashAfterRemoval(t, time.Now())
+	r.editReaddRecord(t, func(rec *ha.ReaddRecord) { rec.PinNodes, rec.PinStrict = []string{"pve-node2"}, true })
+	_, err := r.run(t, readdOptions{})
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !strings.Contains(err.Error(), "widen the pin") {
+		t.Fatalf("err = %v, want a retriable deferral naming the pin", err)
+	}
+	if _, _, tagged := ha.ReaddTagOf(r.tags()); !tagged {
+		t.Fatalf("tags %v, want the re-registration tag kept", r.tags())
+	}
+	requireNoHAWrite(t, r.scene.EventsSnapshot())
+}
+
+// TestReregisterErroredVM_ResumeKeepsHAWithoutTheDynamicLoadBalancer resumes
+// an order for a VM in the DLB AZ on a cluster where a node runs below PVE
+// 9.2. The VM ran under HA, so it registers again with the dynamic load
+// balancer off instead of leaving HA.
+func TestReregisterErroredVM_ResumeKeepsHAWithoutTheDynamicLoadBalancer(t *testing.T) {
+	r := newReaddRig(t, config.HAModeAuto)
+	r.crashAfterRemoval(t, time.Now())
+	r.editReaddRecord(t, func(rec *ha.ReaddRecord) { rec.AutoRebalance = true })
+	r.profile.DLBSupported, r.profile.MinVersion = false, "9.1.2"
+	if _, err := r.run(t, readdOptions{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	r.requireRegisteredAgain(t)
+	requireNeverDisabled(t, r.scene.EventsSnapshot())
+}
+
+func TestReaddDecisionInput_MatchesTheAttach(t *testing.T) {
+	cfg := icMinConfig()
+	vmCfg := map[string]any{"scsi0": "nfs:vm-101-disk-0,size=10G", "cpu": "x86-64-v3"}
+	in := readdDecisionInput(cfg, readdVMID, "pve-node1", vmCfg, nil,
+		ha.ReaddRecord{Comment: "c", PinNodes: []string{"pve-node1", "pve-node2"}, PinStrict: true})
+	if !in.HAManaged {
+		t.Fatal("a re-registration decides for a VM under HA")
+	}
+	if len(in.Constraints) != 1 || !in.Constraints[0].Pin ||
+		!slices.Equal(in.Constraints[0].Nodes, []string{"pve-node1", "pve-node2"}) {
+		t.Fatalf("constraints %+v, want the recorded strict pin marked as the VM's pin", in.Constraints)
+	}
+	in = readdDecisionInput(cfg, readdVMID, "pve-node1", vmCfg, nil,
+		ha.ReaddRecord{Comment: "c", PinNodes: []string{"pve-node1"}})
+	if len(in.Constraints) != 0 {
+		t.Fatalf("constraints %+v, want none for a non-strict pin", in.Constraints)
+	}
+}
+
+// TestAttachHA_ErroredVMDecisionChangedUnderTheClaimDefers changes the VM's
+// disks between the attach's decision and its run, so the decision under the
+// VMID claim no longer registers. The attach defers and writes nothing.
+func TestAttachHA_ErroredVMDecisionChangedUnderTheClaimDefers(t *testing.T) {
+	r := newReaddRig(t, config.HAModeAuto)
+	r.profile.Storages = append(r.profile.Storages, pve.StorageInfo{Name: "nfs-ab", Type: pve.StorageTypeNFS,
+		Nodes: []string{"pve-node1", "pve-node2"}, Content: "images"})
+	r.deps.PVE = readdAttachClient{haSceneClient: r.deps.PVE.(*haSceneClient)}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	h, err := decideAttachHA(ctx, r.deps, "101", resolvedDisk{volid: "nfs-ab:vm-101-disk-1", stableID: "abcd1234"})
+	if err != nil || h == nil {
+		t.Fatalf("h %v err %v, want an HA action", h, err)
+	}
+	r.scene.Do(func(s *HADeleteScene) { s.Configs[readdVMID]["scsi2"] = testPinStorage + ":vm-101-disk-2,size=1G" })
+	err = h.run(ctx, func(context.Context) (string, error) {
+		t.Fatal("the attach ran on a decision that changed")
+		return "", nil
+	})
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !strings.Contains(err.Error(), "changed since") {
+		t.Fatalf("err = %v, want a retriable deferral", err)
+	}
+	requireNoHAWrite(t, r.scene.EventsSnapshot())
+	if state, ok := r.requested(); !ok || state != "started" {
+		t.Fatalf("resource %q %v, want it left in place", state, ok)
+	}
+}
+
+// TestDecideAttachHA_ManagedTransientRefusalDefers checks that a refusal for
+// a reason that may pass defers the attach in managed mode instead of failing
+// it for good.
+func TestDecideAttachHA_ManagedTransientRefusalDefers(t *testing.T) {
+	r := newReaddRig(t, config.HAModeManaged)
+	r.profile.Storages = append(r.profile.Storages, pve.StorageInfo{Name: "nfs-ab", Type: pve.StorageTypeNFS,
+		Nodes: []string{"pve-node1", "pve-node2"}, Content: "images"})
+	r.profile.Nodes[2].Version = "8.4.1"
+	r.deps.PVE = readdAttachClient{haSceneClient: r.deps.PVE.(*haSceneClient)}
+	_, err := decideAttachHA(context.Background(), r.deps, "101",
+		resolvedDisk{volid: "nfs-ab:vm-101-disk-1", stableID: "abcd1234"})
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("err = %v, want a retriable deferral", err)
+	}
+	requireNoHAWrite(t, r.scene.EventsSnapshot())
+}
+
+// TestReregisterErroredVM_DecisionWithoutVolumesWritesNothing gives the order
+// a registering decision that names no volume. The pin could not record any,
+// so the order fails before the removal and writes nothing.
+func TestReregisterErroredVM_DecisionWithoutVolumesWritesNothing(t *testing.T) {
+	r := newReaddRig(t, config.HAModeAuto)
+	decided := false
+	_, err := r.run(t, readdOptions{decide: func(
+		_ context.Context, node string, st *pve.HAServiceState, rec ha.ReaddRecord,
+	) (*ha.VMDecision, []ha.VMVolume, error) {
+		var vmCfg map[string]any
+		r.scene.Do(func(s *HADeleteScene) { vmCfg = s.Configs[readdVMID] })
+		d, err := r.profile.DecideVM(readdDecisionInput(r.deps.Config, readdVMID, node, vmCfg, st, rec))
+		decided = err == nil && d.Registers()
+		return d, nil, err
+	}})
+	if !decided {
+		t.Fatal("the decision must register, so the missing volumes are what refuses the order")
+	}
+	if err == nil || !strings.Contains(err.Error(), "names no volume") {
+		t.Fatalf("err = %v, want the refusal of a decision without volumes", err)
+	}
+	requireNoHAWrite(t, r.scene.EventsSnapshot())
+	if state, ok := r.requested(); !ok || state != "started" {
+		t.Fatalf("resource %q %v, want it left in place", state, ok)
 	}
 }

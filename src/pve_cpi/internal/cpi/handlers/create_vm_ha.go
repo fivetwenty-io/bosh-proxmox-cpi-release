@@ -114,7 +114,15 @@ func decideCreatedVMHA(
 	}
 	switch decision.Outcome {
 	case ha.OutcomeFail:
-		if failure := decision.Failure(); failure != nil {
+		failure := decision.Failure()
+		if failure != nil && decision.Transient {
+			// Managed mode fails a refusal for a reason that may pass, such as
+			// a node that is down or a storage read that failed, and the
+			// Director retries it rather than fail the create for good.
+			return nil, cpierrors.WrapAs(failure, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+				"create_vm: VM %d: the HA decision refused HA for a reason that may pass; retry", vmid))
+		}
+		if failure != nil {
 			return nil, failure
 		}
 		return nil, cpierrors.Cloud("create_vm: VM %d: the HA decision failed the call: %s", vmid, decision.Reason)

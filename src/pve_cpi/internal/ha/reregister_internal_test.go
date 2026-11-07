@@ -60,6 +60,10 @@ type readdRig struct {
 	fail map[string]error
 	// answered makes the first removal a refusal PVE answered.
 	answered bool
+	// moving makes the task check report a config lock or a running task, and
+	// movingChecks counts the checks.
+	moving       bool
+	movingChecks int
 }
 
 func newReaddRig() *readdRig {
@@ -274,6 +278,13 @@ func (r *readdRig) input() ReregisterInput {
 			}
 			return r.decision(node), nil
 		},
+		Moving: func(context.Context, string) (bool, error) {
+			r.movingChecks++
+			if err := r.failOnce("moving"); err != nil {
+				return false, err
+			}
+			return r.moving, nil
+		},
 		LeaveRules: func(context.Context) error {
 			r.events = append(r.events, "leave-rules")
 			return r.failOnce("leave-rules")
@@ -437,7 +448,19 @@ func TestReregisterPreconditionsWriteNothing(t *testing.T) {
 		"placeable shortfall": {setup: func(r *readdRig, _ *ReregisterInput) {
 			r.decide = func(d *VMDecision) { d.Outcome, d.PlaceableShortfall = OutcomeSkip, true }
 		}},
-		"tag write": {setup: func(r *readdRig, _ *ReregisterInput) { r.fail["tag"] = errCrash }},
+		"managed transient decision": {setup: func(r *readdRig, _ *ReregisterInput) {
+			r.decide = func(d *VMDecision) {
+				d.Outcome, d.Transient, d.Err = OutcomeFail, true, cpierrors.Cloud("storage definitions unreadable")
+			}
+		}},
+		"managed placeable shortfall": {setup: func(r *readdRig, _ *ReregisterInput) {
+			r.decide = func(d *VMDecision) {
+				d.Outcome, d.PlaceableShortfall, d.Err = OutcomeFail, true, cpierrors.Cloud("one placeable node")
+			}
+		}},
+		"config lock or running task": {setup: func(r *readdRig, _ *ReregisterInput) { r.moving = true }},
+		"task check failure":          {setup: func(r *readdRig, _ *ReregisterInput) { r.fail["moving"] = errCrash }},
+		"tag write":                   {setup: func(r *readdRig, _ *ReregisterInput) { r.fail["tag"] = errCrash }},
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := newReaddRig()
@@ -459,6 +482,94 @@ func TestReregisterPreconditionsWriteNothing(t *testing.T) {
 			r.neverDisabled(t)
 		})
 	}
+}
+
+// TestReregisterTransientRefusalDefersBeforeTheFailure checks that a managed
+// decision that refused HA for a reason that may pass reaches the caller as a
+// retriable error that keeps the refusal's text, never as the permanent
+// failure the managed refusal also carries.
+func TestReregisterTransientRefusalDefersBeforeTheFailure(t *testing.T) {
+	r := newReaddRig()
+	r.decide = func(d *VMDecision) {
+		d.Outcome, d.Transient = OutcomeFail, true
+		d.Err, d.Reason = cpierrors.Cloud("the storage definitions could not be read"), "storage read"
+	}
+	_, err := r.run(t, r.input())
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || errors.Is(err, ErrReaddBlocked) {
+		t.Fatalf("err = %v, want a retriable deferral", err)
+	}
+	if !strings.Contains(err.Error(), "the storage definitions could not be read") {
+		t.Fatalf("err = %v, want the refusal's text", err)
+	}
+	if !r.exists || len(r.events) != 0 {
+		t.Fatalf("events %v, want nothing written", r.events)
+	}
+}
+
+// TestReregisterResumeWaitsForARunningTask checks that each resume point
+// defers while the VM holds a config lock or has a move task running, and
+// that the order finishes once the task is done.
+func TestReregisterResumeWaitsForARunningTask(t *testing.T) {
+	for _, step := range []string{"stage", "confine", "wait"} {
+		t.Run(step, func(t *testing.T) {
+			r := newReaddRig()
+			r.fail[step] = errCrash
+			if _, err := r.run(t, r.input()); err == nil {
+				t.Fatalf("the crash at %s did not stop the order (events %v)", step, r.events)
+			}
+			r.moving = true
+			r.events = nil
+			_, err := r.run(t, r.input())
+			if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || errors.Is(err, ErrReaddBlocked) {
+				t.Fatalf("err = %v, want a retriable deferral", err)
+			}
+			if !strings.Contains(err.Error(), "config lock") {
+				t.Fatalf("err = %v, want the lock or task named", err)
+			}
+			if len(r.events) != 0 {
+				t.Fatalf("events %v, want nothing written while the task runs", r.events)
+			}
+			r.moving = false
+			res, err := r.run(t, r.input())
+			r.registeredAgain(t, res, err)
+		})
+	}
+}
+
+// TestReregisterBetweenSkipsTheTaskCheck checks that the call that removed the
+// resource does not check for a task again after its own change, which may be
+// a disk move PVE still lists.
+func TestReregisterBetweenSkipsTheTaskCheck(t *testing.T) {
+	r := newReaddRig()
+	in := r.input()
+	in.Between = func(context.Context, string) (pve.VMLocation, error) {
+		r.moving = true
+		return pve.VMLocation{Node: "a", Found: true}, nil
+	}
+	res, err := r.run(t, in)
+	r.registeredAgain(t, res, err)
+	if r.movingChecks != 1 {
+		t.Fatalf("task checks = %d, want only the one before the removal", r.movingChecks)
+	}
+}
+
+// TestReregisterPendingOnlyLeavesAnUntaggedVM checks that a caller that only
+// finishes an earlier order leaves a VM with no tag as it is, even when its
+// resource is in error.
+func TestReregisterPendingOnlyLeavesAnUntaggedVM(t *testing.T) {
+	r := newReaddRig()
+	in := r.input()
+	in.PendingOnly = true
+	res, err := r.run(t, in)
+	if err != nil || res.Outcome != ReaddNothing {
+		t.Fatalf("res %+v err %v", res, err)
+	}
+	if !r.exists || len(r.events) != 0 {
+		t.Fatalf("events %v, want nothing written", r.events)
+	}
+	r.tags = []string{ReaddTag(time.Unix(1000, 0))}
+	res, err = r.run(t, in)
+	r.registeredAgain(t, res, err)
 }
 
 func TestReregisterWithoutSysConsoleNamesTheCommands(t *testing.T) {
@@ -914,6 +1025,7 @@ func TestReregisterRefusesInvalidInput(t *testing.T) {
 		"profile": func(in *ReregisterInput) { in.Profile = nil },
 		"stager":  func(in *ReregisterInput) { in.Stager = nil },
 		"power":   func(in *ReregisterInput) { in.Power = nil },
+		"moving":  func(in *ReregisterInput) { in.Moving = nil },
 		"pin":     func(in *ReregisterInput) { in.PinID = "" },
 	} {
 		in := r.input()

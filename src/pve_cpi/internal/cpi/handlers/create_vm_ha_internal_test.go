@@ -497,6 +497,21 @@ func TestDecideCreatedVMHA_ProfileError(t *testing.T) {
 	}
 }
 
+// TestDecideCreatedVMHA_ManagedTransientRefusalIsRetriable checks that managed
+// mode fails a refusal for a reason that may pass with a retriable error, and
+// writes nothing.
+func TestDecideCreatedVMHA_ManagedTransientRefusalIsRetriable(t *testing.T) {
+	deps, rules, parsed := decideRig(config.HAModeManaged, aaDirector, nil)
+	profile := stagingProfile(config.HAModeManaged)
+	profile.Nodes = nil
+	deps.HAProfile = func(context.Context) (*ha.Profile, error) { return profile, nil }
+	_, err := decideCreatedVMHA(context.Background(), deps, log.NewNopLogger(), parsed,
+		&createVMShape{node: "pve01"}, 100)
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || len(rules.resources) != 0 {
+		t.Fatalf("err = %v resources %v, want a retriable error and nothing staged", err, rules.resources)
+	}
+}
+
 func TestDecideCreatedVMHA_ConfigReadErrorIsRetriable(t *testing.T) {
 	deps, rules, parsed := decideRig(config.HAModeAuto, aaDirector, nil)
 	deps.PVE = &icPVEClient{clusterSvc: rules, qemuSvc: &icQEMUService{
