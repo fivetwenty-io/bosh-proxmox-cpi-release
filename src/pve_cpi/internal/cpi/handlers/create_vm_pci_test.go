@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"slices"
 	"testing"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -523,9 +522,13 @@ func TestCleanupVM_RemovesNodeAffinityPin_WithoutPinFlag(t *testing.T) {
 	scene := NewHADeleteScene()
 	scene.Manage(4242, "pve-node1", "started", "started")
 	scene.Rules["bosh-na-4242"] = map[string]any{"type": "node-affinity", "resources": "vm:4242", "nodes": "pve-node1"}
+	// The resource carries this Director's marker, which the deregistration
+	// requires before it removes anything the destroy's purge left.
+	scene.Comments["vm:4242"] = haIdentity{Owner: aaDirector}.marker()
 	deps := Deps{
-		PVE:    &rollbackHAClient{kfClient: &kfClient{nodes: &kfNodes{}, qemu: &kfQEMU{}}, scene: scene},
-		Logger: log.NewNopLogger(),
+		PVE:                 &rollbackHAClient{kfClient: &kfClient{nodes: &kfNodes{}, qemu: &kfQEMU{}}, scene: scene},
+		Logger:              log.NewNopLogger(),
+		RequestDirectorUUID: aaDirector,
 	}
 
 	cleanupVM(context.Background(), deps, "pve-node1", 4242, nil, deps.Logger)
@@ -533,7 +536,11 @@ func TestCleanupVM_RemovesNodeAffinityPin_WithoutPinFlag(t *testing.T) {
 	if _, ok := scene.Rules["bosh-na-4242"]; ok {
 		t.Error("cleanupVM must delete the bosh-na-<vmid> HA rule even with the AZ-pin flag off")
 	}
-	if !slices.Contains(scene.EventsSnapshot(), "DeleteHaResources:vm:4242") {
-		t.Error("cleanupVM must deregister the VM's HA resource on rollback")
-	}
+	// The destroy's purge removes the HA resource, as PVE does, so the
+	// deregistration finds it gone and has nothing left to remove.
+	scene.Do(func(s *HADeleteScene) {
+		if _, ok := s.Requested["vm:4242"]; ok {
+			t.Error("cleanupVM must leave no HA resource for the VM on rollback")
+		}
+	})
 }

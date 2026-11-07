@@ -19,7 +19,7 @@ PVE 9.2 introduced a Cluster Resource Scheduler (CRS) dynamic mode that, when en
 
 CRS/DLB acts **only on HA-managed guests**, so an ordinary VM not registered as a PVE HA resource is invisible to the DLB.
 
-This CPI feature bridges the gap. When enabled, the CPI registers newly created BOSH VMs as PVE HA resources with `auto-rebalance=1` and `state=started`, making them eligible for DLB placement and ongoing rebalancing. The feature is **off by default** and requires explicit operator opt-in through the `pve.ha` block, and it needs `pve.ha.mode` set to `auto` or `managed`.
+This CPI feature bridges the gap. When enabled, the CPI registers newly created BOSH VMs as PVE HA resources with `auto-rebalance=1`, which makes them eligible for DLB placement and ongoing rebalancing. It adds each resource in the `ignored` state, writes the VM's pin and any anti-affinity rule, and then requests `started`, so PVE HA starts the VM only once its rules are in place. The feature is **off by default** and requires explicit operator opt-in through the `pve.ha` block, and it needs `pve.ha.mode` set to `auto` or `managed`.
 
 For the broader placement architecture, see [Architecture, Placement and AZ anti-affinity](architecture.md#placement-and-az-anti-affinity).
 
@@ -41,9 +41,9 @@ The sentinel AZ provides per-workload opt-in without changing the global flag. L
 
 - All online nodes become candidates for the initial placement.
 
-- The VM is registered as a PVE HA resource with `auto-rebalance=1` so CRS/DLB places and rebalances it.
+- When the HA decision registers the VM, the CPI adds it as a PVE HA resource with `auto-rebalance=1`, so CRS/DLB places and rebalances it.
 
-- The HA node-affinity pin is intentionally **skipped** for sentinel-AZ VMs, because there is no fixed AZ to pin to.
+- The VM gets no AZ pin, because there is no fixed AZ to pin to. Like every registered VM, it still carries a pin that is not strict, names every node it may run on, and records the storages of its volumes.
 
 To disable the sentinel entirely, set `pve.ha.dlb.az_name: ""`. With the sentinel disabled, only the master flag can trigger DLB.
 
@@ -179,7 +179,7 @@ VMs with a large working set of dirty memory pages incur a significant migration
 
 ## Placement Scoring Flow
 
-The `create_vm` handler always calls `GatherNodeFacts` to collect live cluster state before selecting a node. The DLB sentinel AZ bypasses the AZ-map filter and scorer, routing directly to `ensureDLBMembership`.
+The `create_vm` handler always calls `GatherNodeFacts` to collect live cluster state before selecting a node. The DLB sentinel AZ bypasses the AZ-map filter and scorer. After placement, the HA decision runs for every VM, and a registered sentinel-AZ VM is staged with `auto-rebalance=1`. `ensureDLBMembership` then checks the cluster's CRS mode and logs a warning when it is not `dynamic`.
 
 ```mermaid
 flowchart TD
@@ -193,11 +193,11 @@ flowchart TD
     F --> G[Filter: AZ map, maintenance, capacity]
     G --> H{Sentinel AZ?}
     H -- Yes --> I[All online nodes as candidates\nskip AZ-map filter and scorer]
-    I --> J[ensureDLBMembership\nregister HA resource auto-rebalance=1]
+    I --> J[HA staging\nresource ignored with auto-rebalance=1\npin, CRS check, then started]
     H -- No --> K[Score nodes\nmem×1.0 + storage×0.5 + cpu×0.5\nguest-count×0.3 − anti-affinity×5.0]
     K --> L[Select winner node]
-    L --> M[applyAntiAffinityMembership\nif pve.ha.anti_affinity is on]
-    M --> N[applyAZNodeAffinityPin\nbosh-na-vmid if pve.ha.pin_az is on]
+    L --> M[HA staging when the decision registers the VM\nresource ignored, anti-affinity rule]
+    M --> N[applyAZNodeAffinityPin\nbosh-na-vmid pin, then started]
 ```
 
 ---
@@ -212,7 +212,7 @@ The same `pve.storage.max_utilization_pct` ceiling also gates `create_disk`, `re
 
 ## HA Node-Affinity Pin
 
-When `pve.ha.pin_az` is `on` and `pve.ha.mode` is `auto` or `managed`, `create_vm` calls `applyAZNodeAffinityPin` after the winning node is selected. This step creates a PVE HA rule named `bosh-na-{vmid}` with:
+When `pve.ha.mode` is `auto` or `managed` and the HA decision registers a VM, `create_vm` calls `applyAZNodeAffinityPin` after the winning node is selected. With `pve.ha.pin_az` at `auto` or `on` and the VM's AZ in `pve.placement.az_map`, this step creates a PVE HA rule named `bosh-na-{vmid}` with:
 
 - **Type:** `node-affinity`
 
@@ -220,13 +220,15 @@ When `pve.ha.pin_az` is `on` and `pve.ha.mode` is `auto` or `managed`, `create_v
 
 - **Strict:** value of `pve.ha.pin_az_strict`
 
+- **Comment:** the Director's ownership marker and a record of the storages of the VM's volumes
+
 The AZ is derived from the **placed node**, and `pinAZForNode` walks the AZ order and returns the first AZ whose node set contains the winner. This is correct for both singular `availability_zone` and plural `availability_zones` cloud-property forms.
 
 The pin ensures that PVE HA failover and DLB rebalance keep the VM within its AZ node set even after the CPI call returns. Without this rule, DLB could migrate a VM to a node outside its intended AZ.
 
-**DLB sentinel exclusion:** `pinAZForNode` explicitly skips the DLB sentinel AZ name. A VM placed via the sentinel has no fixed AZ node set, so no pin is created.
+**DLB sentinel exclusion:** `pinAZForNode` explicitly skips the DLB sentinel AZ name. A VM placed via the sentinel has no fixed AZ node set, so it gets no AZ pin. It still gets the pin that every registered VM carries, which is not strict and names every node the VM may run on.
 
-**Rollback:** `delete_vm` cleanup calls `removeNodeAffinityPin`, which deletes the `bosh-na-{vmid}` rule and deregisters the HA resource. The cleanup is best-effort and idempotent, so a missing rule or resource is a no-op.
+**Rollback:** When a create fails after PVE HA started the VM, the rollback first finds the node the VM runs on now, takes the VM out of HA, and destroys it there. When it cannot prove that node, it tags the VM and leaves it for a later retry. `removeNodeAffinityPin` then deletes the `bosh-na-{vmid}` rule and removes the HA resource, but only when the resource carries this Director's ownership marker, so an operator's resource or another Director's is left in place. The cleanup is best-effort and idempotent, so a missing rule or resource is a no-op.
 
 **Cluster lock:** The node-affinity pin does **not** acquire the cluster pool lock (`AcquireClusterLock`). The rule is keyed on `vmid` (not a shared group), so the only contention is a `create_vm` retry of the same VMID, which is already serialized by the VMID allocation model.
 
@@ -300,7 +302,7 @@ To reduce this divergence, use `pve.ha.anti_affinity: on` alongside DLB. This en
 
 On `delete_vm`, the CPI removes the VM from all associated PVE HA rules:
 
-- `removeNodeAffinityPin` deletes the `bosh-na-{vmid}` rule and deregisters the HA resource (runs when `pve.ha.pin_az` is `on`).
+- `removeNodeAffinityPin` deletes the `bosh-na-{vmid}` rule and removes the HA resource when it carries this Director's ownership marker. It runs for every VM whatever `pve.ha.pin_az` says, because every registered VM carries a pin.
 
 - `removeAntiAffinityMembership` removes the VM from `bosh-aa-<group>` rules (runs when `pve.ha.anti_affinity` is `on` **or** DLB is configured, meaning the master flag is on or the sentinel name is non-empty, and the mode is `auto` or `managed` in both cases).
 

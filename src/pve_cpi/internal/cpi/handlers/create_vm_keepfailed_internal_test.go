@@ -23,7 +23,9 @@ type kfNodes struct {
 	updatedTags *string
 	updateCalls int
 	deleteCalls int
-	updateErr   error // when set, UpdateQemuConfig fails (best-effort path)
+	// deletedOn is the node of the last destroy.
+	deletedOn string
+	updateErr error // when set, UpdateQemuConfig fails (best-effort path)
 	// destroyed records a destroy, after which kfClient's QEMU view answers
 	// not found for the VM, the way PVE does once the VM is gone.
 	destroyed bool
@@ -44,9 +46,10 @@ func (n *kfNodes) UpdateQemuConfig(_ context.Context, _, _ string, params *sdkno
 }
 
 func (n *kfNodes) DeleteQemu(
-	_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams,
+	_ context.Context, node, _ string, _ *sdknodes.DeleteQemuParams,
 ) (*sdknodes.DeleteQemuResponse, error) {
 	n.deleteCalls++
+	n.deletedOn = node
 	n.destroyed = true
 	return &sdknodes.DeleteQemuResponse{}, nil
 }
@@ -135,7 +138,7 @@ func TestRollbackOnExit_KeepFailed_TagsAndPreserves(t *testing.T) {
 	vmCreated := true
 	retErr := errors.New("stage 8: agent never came up")
 
-	rollbackOnExit(context.Background(), deps, "pve01", 100, kfEnv(), log.NewNopLogger(), &vmCreated, &retErr)
+	rollbackOnExit(context.Background(), deps, kfNode, 100, kfEnv(), log.NewNopLogger(), &vmCreated, &retErr)
 
 	if q.stopCalls != 0 || nodes.deleteCalls != 0 {
 		t.Fatalf("keep-failed must NOT destroy: stop=%d delete=%d", q.stopCalls, nodes.deleteCalls)
@@ -168,7 +171,7 @@ func TestRollbackOnExit_DefaultDestroys(t *testing.T) {
 	vmCreated := true
 	retErr := errors.New("stage 8 failed")
 
-	rollbackOnExit(context.Background(), deps, "pve01", 100, kfEnv(), log.NewNopLogger(), &vmCreated, &retErr)
+	rollbackOnExit(context.Background(), deps, kfNode, 100, kfEnv(), log.NewNopLogger(), &vmCreated, &retErr)
 
 	if q.stopCalls != 1 {
 		t.Errorf("default mode must call cleanupVM (Stop); stopCalls=%d", q.stopCalls)
@@ -191,7 +194,7 @@ func TestRollbackOnExit_SuccessNoAction(t *testing.T) {
 	vmCreated := true
 	var retErr error // nil = success
 
-	rollbackOnExit(context.Background(), deps, "pve01", 100, kfEnv(), log.NewNopLogger(), &vmCreated, &retErr)
+	rollbackOnExit(context.Background(), deps, kfNode, 100, kfEnv(), log.NewNopLogger(), &vmCreated, &retErr)
 
 	if q.stopCalls != 0 || nodes.updateCalls != 0 {
 		t.Errorf("success path must take no action; stop=%d tag=%d", q.stopCalls, nodes.updateCalls)
@@ -212,7 +215,7 @@ func TestRollbackOnExit_PanicKeepFailed_TagsAndRepanics(t *testing.T) {
 		}()
 		vmCreated := true
 		var retErr error
-		defer rollbackOnExit(context.Background(), deps, "pve01", 100, kfEnv(), log.NewNopLogger(), &vmCreated, &retErr)
+		defer rollbackOnExit(context.Background(), deps, kfNode, 100, kfEnv(), log.NewNopLogger(), &vmCreated, &retErr)
 		panic("boom in stage 9")
 	}()
 
@@ -298,14 +301,17 @@ func TestCleanupVM_RemovesPinEvenWhenAZPinDisabled(t *testing.T) {
 func TestDisposeFailedVM_KeepTagsDefaultDestroys(t *testing.T) {
 	// keep mode: tag, no destroy.
 	kn, kq := &kfNodes{}, &kfQEMU{}
-	disposeFailedVM(context.Background(), kfDeps(true, kn, kq), "pve01", 100, kfEnv(), log.NewNopLogger())
+	disposeFailedVM(context.Background(), kfDeps(true, kn, kq), kfNode, 100, kfEnv(), log.NewNopLogger())
 	if kq.stopCalls != 0 || kn.updateCalls != 1 {
 		t.Errorf("keep: want tag-no-destroy; stop=%d tag=%d", kq.stopCalls, kn.updateCalls)
 	}
 	// default mode: destroy, no tag.
 	dn, dq := &kfNodes{}, &kfQEMU{}
-	disposeFailedVM(context.Background(), kfDeps(false, dn, dq), "pve01", 100, kfEnv(), log.NewNopLogger())
+	disposeFailedVM(context.Background(), kfDeps(false, dn, dq), kfNode, 100, kfEnv(), log.NewNopLogger())
 	if dq.stopCalls != 1 || dn.deleteCalls != 1 || (dn.updatedTags != nil && strings.Contains(*dn.updatedTags, tagCreateFailed)) {
 		t.Errorf("default: want destroy-no-tag; stop=%d delete=%d tags=%v", dq.stopCalls, dn.deleteCalls, dn.updatedTags)
 	}
 }
+
+// kfNode is the node the rollback reads for the VM in these tests.
+func kfNode() string { return "pve01" }

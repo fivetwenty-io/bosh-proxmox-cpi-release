@@ -437,8 +437,11 @@ func (m *icQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _
 func (m *icQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
 	panic("icQEMUService.DeleteSnapshot: not expected")
 }
+
+// ListSnapshots answers that the VM has no snapshots, which is what the
+// attach_disk snapshot guard reads before an HA change.
 func (m *icQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]any, error) {
-	panic("icQEMUService.ListSnapshots: not expected")
+	return nil, nil
 }
 func (m *icQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
 	panic("icQEMUService.RollbackSnapshot: not expected")

@@ -785,31 +785,55 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logg
 	return err
 }
 
-// deregisterHaResource purges the VM's HA resource, which also removes it from
-// any remaining rules. It leaves a resource whose marker names another
-// Director, and treats a missing resource as done. A not-found read still sends
-// the not-found-tolerant purge. When the ownership read fails for any other
-// reason, it cannot tell whose the resource is, so it skips the purge rather
-// than guess. Failures are only logged,
-// because deregistering is best-effort cleanup and every caller logs and
-// carries on.
-func deregisterHaResource(ctx context.Context, svc cluster.Service, sid, owner string, logger *log.Logger) {
-	got, readErr := svc.GetHaResources(ctx, sid)
-	switch {
-	case readErr != nil && !isHaNotFound(readErr) && !pve.IsNotFound(readErr):
-		logger.Warn("anti-affinity: HA resource purge skipped because its ownership could not be read",
-			log.String("sid", sid), log.Err(readErr))
-		return
-	case readErr == nil && got != nil && got.Comment != nil && haOwnershipOf(*got.Comment, owner) == haOwnedByOther:
-		logger.Debug("anti-affinity: HA resource belongs to another Director; leaving it", log.String("sid", sid))
-		return
+// pruneGroupAntiAffinityRules deletes every anti-affinity rule of ident's
+// group that this Director owns and that holds fewer than two members. A VM
+// leaving HA through the purge of its resource drops out of its rule, and a
+// rule left with one member spreads nothing, which some PVE versions keep as a
+// rule rather than removing it. The group's rules are its hashed rule and that
+// rule's chunks. A rule another Director owns, or one with no marker, is left
+// alone. It runs under the HA rules lock and reports the writer's error.
+func pruneGroupAntiAffinityRules(ctx context.Context, deps Deps, ident haIdentity, vmid int, logger *log.Logger) error {
+	if !ident.valid() {
+		return nil
 	}
-	purge := true
-	if err := svc.DeleteHaResources(ctx, sid, &cluster.DeleteHaResourcesParams{Purge: &purge}); err != nil {
-		if !isHaNotFound(err) {
-			logger.Debug("anti-affinity: deregister HA resource (non-fatal)",
-				log.String("sid", sid), log.Err(err))
-		}
+	base := ident.ruleName()
+	err := withHARulesLock(ctx, deps, vmid, logger, func() error {
+		// No profile: a deletion only shrinks rules, as in
+		// removeAntiAffinityMembership.
+		writer := newHARuleWriter(deps, nil, logger)
+		_, err := writer.Apply(ctx, "anti-affinity prune", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+			var ops []ha.RuleOp
+			for i := range set.Rules {
+				r := &set.Rules[i]
+				if _, ok := aaChunkIndex(base, r.ID); !ok || r.Type != haRuleType {
+					continue
+				}
+				if haOwnershipOf(r.Comment, ident.Owner) != haOwnedByUs || len(r.Resources) >= 2 {
+					continue
+				}
+				ops = append(ops, ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: r.ID}})
+			}
+			return ops, nil
+		})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("anti-affinity: prune the rules of group %s: %w", base, err)
+	}
+	return nil
+}
+
+// deregisterHaResource purges the VM's HA resource, which also removes it from
+// any remaining rules, but only when the resource carries this Director's
+// ownership marker (see removeOwnedHaResource). A resource with no marker, as
+// an operator's own or an older CPI's carries, and one whose marker names
+// another Director are left in place, and a missing resource is done. When the
+// ownership read fails, it cannot tell whose the resource is, so it skips the
+// purge rather than guess. Failures are only logged, because deregistering is
+// best-effort cleanup and every caller logs and carries on.
+func deregisterHaResource(ctx context.Context, svc cluster.Service, sid, owner string, logger *log.Logger) {
+	if err := removeOwnedHaResource(ctx, svc, sid, owner); err != nil {
+		logger.Warn("anti-affinity: HA resource left in place (non-fatal)", log.String("sid", sid), log.Err(err))
 	}
 }
 

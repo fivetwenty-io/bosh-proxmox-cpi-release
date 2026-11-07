@@ -469,6 +469,40 @@ func TestRemoveAntiAffinity_DeletesWhenSingleMemberRemains(t *testing.T) {
 	}
 }
 
+func TestPruneGroupAntiAffinityRules_DeletesOnlyOurRulesWithOneMember(t *testing.T) {
+	// A purged resource drops out of its rules, so the group's rule and chunks
+	// may hold one member. The prune deletes those of ours, and keeps a rule
+	// that still spreads two VMs, another Director's rule, an unmarked rule,
+	// and a rule of another group.
+	stub := newAAStub()
+	stub.seedRule(aaRule, "vm:100")
+	stub.seedRule(aaRule+"-2", "vm:102,vm:103")
+	stub.seedRule(aaRule+"-3", "vm:104")
+	stub.seedRuleWithComment(aaRule+"-4", "vm:105", haIdentity{Owner: aaOtherDirector, Deployment: aaDeployment,
+		Group: "web"}.marker())
+	stub.seedRuleWithComment(aaRule+"-5", "vm:106", "")
+	other := aaIdent("api").ruleName()
+	stub.seedRuleWithComment(other, "vm:107", aaIdent("api").marker())
+	if err := pruneGroupAntiAffinityRules(context.Background(), aaDeps(stub), aaIdent("web"), 100,
+		log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, gone := range []string{aaRule, aaRule + "-3"} {
+		if _, ok := stub.rules[gone]; ok {
+			t.Errorf("rule %s with one member was kept", gone)
+		}
+	}
+	for _, kept := range []string{aaRule + "-2", aaRule + "-4", aaRule + "-5", other} {
+		if _, ok := stub.rules[kept]; !ok {
+			t.Errorf("rule %s was deleted", kept)
+		}
+	}
+	if err := pruneGroupAntiAffinityRules(context.Background(), aaDeps(stub), haIdentity{}, 100,
+		log.NewNopLogger()); err != nil {
+		t.Fatalf("an identity with no group prunes nothing: %v", err)
+	}
+}
+
 func TestRemoveAntiAffinity_NonMemberNoOp(t *testing.T) {
 	stub := newAAStub()
 	stub.seedRule(aaRule, "vm:100,vm:102")

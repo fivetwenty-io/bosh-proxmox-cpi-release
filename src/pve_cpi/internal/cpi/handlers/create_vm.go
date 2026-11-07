@@ -745,7 +745,10 @@ func createVM(
 	// Arm rollback for stages 4b–8: any failure after this point destroys the
 	// winning VM. See rollbackOnExit for the error-path and panic-path handling.
 	vmCreated := true
-	defer rollbackOnExit(ctx, deps, shape.node, vmid, parsed.env, logger, &vmCreated, &retErr)
+	// The node is read when the rollback runs, so a VM PVE HA started on
+	// another node is torn down where it is.
+	currentNode := func() string { return shape.node }
+	defer rollbackOnExit(ctx, deps, currentNode, vmid, parsed.env, logger, &vmCreated, &retErr)
 	// Registered AFTER the rollback arm so it runs FIRST (defer is LIFO): the
 	// per-node in-flight slot must be released before the rollback runs, not
 	// after — a slow rollback otherwise pins the slot for its whole duration
@@ -763,7 +766,7 @@ func createVM(
 	// Honors keep_failed_vms: a post-hook failure preserves+tags the VM instead
 	// of destroying it, matching the handler-failure path.
 	cpi.RegisterRollback(ctx, func(c context.Context) {
-		disposeFailedVM(c, deps, shape.node, vmid, parsed.env, logger)
+		disposeFailedVM(c, deps, currentNode, vmid, parsed.env, logger)
 	})
 
 	created, err := finishCreatedVM(ctx, deps, logger, parsed, shape, vmid, vmName)
@@ -998,13 +1001,19 @@ func createVMWithFallback(
 		}
 
 		// Success on this candidate. Arm rollback for post-start steps 8b-11.
-		// shape.node is set to the winning candidateNode for all subsequent calls.
+		// A node-specific shape copy carries the winning candidateNode for the
+		// post-start steps that read shape.node. The rollback reads its node
+		// when it runs, so a VM PVE HA started on another node is torn down
+		// where it is.
 		winningNode := candidateNode
 		winningVMID := vmid
+		winShape := *shape
+		winShape.node = winningNode
+		winningCurrentNode := func() string { return winShape.node }
 		vmCreated := true
-		defer rollbackOnExit(ctx, deps, winningNode, winningVMID, parsed.env, logger, &vmCreated, retErr) //nolint:gocritic // deferInLoop: intentional — defer fires at function return, not loop-end; only one candidate succeeds
+		defer rollbackOnExit(ctx, deps, winningCurrentNode, winningVMID, parsed.env, logger, &vmCreated, retErr) //nolint:gocritic // deferInLoop: intentional — defer fires at function return, not loop-end; only one candidate succeeds
 		cpi.RegisterRollback(ctx, func(c context.Context) {
-			disposeFailedVM(c, deps, winningNode, winningVMID, parsed.env, logger)
+			disposeFailedVM(c, deps, winningCurrentNode, winningVMID, parsed.env, logger)
 		})
 
 		logger.Info("create_vm: vm created and disk imported",
@@ -1015,10 +1024,6 @@ func createVMWithFallback(
 			log.String("node", winningNode),
 			log.Int("attempt", attemptIdx+1),
 		)
-
-		// Build a node-specific shape copy for post-start steps that read shape.node.
-		winShape := *shape
-		winShape.node = winningNode
 
 		// Steps 8b-11 as in finishCreatedVM. A staged VM is started here, by PVE
 		// HA, and winShape.node follows it to the node it lands on.

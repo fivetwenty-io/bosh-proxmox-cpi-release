@@ -277,6 +277,7 @@ func TestRemoveNodeAffinityPin_DeletesRuleAndResource(t *testing.T) {
 	stub := newNAStub()
 	stub.rules["bosh-na-100"] = cluster.CreateHaRulesParams{Rule: "bosh-na-100"}
 	stub.resources["vm:100"] = true
+	stub.resComments["vm:100"] = haIdentity{Owner: aaDirector}.marker()
 
 	if err := removeNodeAffinityPin(context.Background(), naDeps(stub), 100, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -286,6 +287,32 @@ func TestRemoveNodeAffinityPin_DeletesRuleAndResource(t *testing.T) {
 	}
 	if stub.resources["vm:100"] {
 		t.Error("HA resource vm:100 must be deregistered")
+	}
+}
+
+// TestRemoveNodeAffinityPin_LeavesAResourceItCannotProveOurs keeps the
+// deregistration off an HA resource with no ownership marker, as an operator's
+// own or an older CPI's carries, and off another Director's resource.
+func TestRemoveNodeAffinityPin_LeavesAResourceItCannotProveOurs(t *testing.T) {
+	for name, comment := range map[string]*string{
+		"unmarked":         nil,
+		"operator comment": new("operator: keep under HA"),
+		"another Director": new(haIdentity{Owner: aaOtherDirector}.marker()),
+	} {
+		t.Run(name, func(t *testing.T) {
+			stub := newNAStub()
+			stub.rules["bosh-na-100"] = cluster.CreateHaRulesParams{Rule: "bosh-na-100"}
+			stub.resources["vm:100"] = true
+			if comment != nil {
+				stub.resComments["vm:100"] = *comment
+			}
+			if err := removeNodeAffinityPin(context.Background(), naDeps(stub), 100, log.NewNopLogger()); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !stub.resources["vm:100"] || stub.resDelCalls != 0 {
+				t.Errorf("the resource was purged (deletes=%d); it is not provably this Director's", stub.resDelCalls)
+			}
+		})
 	}
 }
 

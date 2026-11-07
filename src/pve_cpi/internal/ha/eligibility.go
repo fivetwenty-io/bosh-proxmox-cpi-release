@@ -167,6 +167,13 @@ type VMDecision struct {
 	// that are not placeable now.
 	Access []string
 
+	// PlaceableShortfall is true when every volume of the VM is shared and at
+	// least two nodes of Access reach them all, but fewer than two of those
+	// nodes are placeable now. The VM then misses full HA only because a node
+	// is unhealthy or in maintenance, which a caller whose VM already runs
+	// under HA treats as temporary rather than as a reason to leave HA.
+	PlaceableShortfall bool
+
 	// CPUDomain is the CPU migration domain of the placed node when the CPU type
 	// is host or max, and nil otherwise.
 	CPUDomain []string
@@ -455,6 +462,7 @@ func (e *eligibility) classify() {
 	if !someLocal && e.countPlaceable(allAccess) >= 2 {
 		e.decideShared(allAccess, domain, domainErr)
 	} else {
+		e.d.PlaceableShortfall = !someLocal && len(allAccess) >= 2
 		reason := "its access set holds fewer than two placeable nodes"
 		if someLocal {
 			reason = "it holds node-local volumes " + strings.Join(append(append([]string{}, diskLocal...), isoLocal...), ", ")

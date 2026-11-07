@@ -412,7 +412,10 @@ func TestDeregisterSkipsPurgeWhenOwnershipReadFails(t *testing.T) {
 	}
 }
 
-func TestDeregisterPurgesWhenOwnershipReadSaysNotFound(t *testing.T) {
+// TestDeregisterTreatsANotFoundReadAsDone checks that a resource the read
+// reports missing gets no purge, because a purge needs a marker that proves the
+// resource is this Director's, and a missing resource has none to read.
+func TestDeregisterTreatsANotFoundReadAsDone(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
 	stub.getResErr = fmt.Errorf("no such resource 'vm:101'")
@@ -420,7 +423,7 @@ func TestDeregisterPurgesWhenOwnershipReadSaysNotFound(t *testing.T) {
 	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if stub.resources["vm:101"] {
-		t.Error("a not-found read must still send the not-found-tolerant purge")
+	if !stub.resources["vm:101"] {
+		t.Error("a resource the read reports missing was purged without an ownership marker")
 	}
 }

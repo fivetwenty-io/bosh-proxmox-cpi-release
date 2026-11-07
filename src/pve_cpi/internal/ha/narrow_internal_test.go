@@ -464,3 +464,40 @@ func TestNarrowRemovalFallback(t *testing.T) {
 		t.Fatalf("a failed persist: err %v events %v", err, r.events)
 	}
 }
+
+func TestNarrowRevertsThePinOnlyWhenTheFailedChangeProvedUnlanded(t *testing.T) {
+	for name, tc := range map[string]struct {
+		unchanged bool
+		err       error
+		revert    bool
+	}{
+		"proved unlanded": {unchanged: true, revert: true},
+		"landed":          {unchanged: false},
+		"unreadable":      {err: errors.New("config unreadable")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := &barrierRig{state: "started", settleOn: []string{"a"}, mutErr: errors.New("attach refused"),
+				states: []*pve.HAServiceState{crm("started", 100, 90, 95), dropped("a", 110, 120, 125)}}
+			in := r.input(&pinAB, &pinA)
+			asked := ""
+			in.Unchanged = func(_ context.Context, node string) (bool, error) {
+				asked = node
+				return tc.unchanged, tc.err
+			}
+			if _, err := NarrowActive(context.Background(), r.deps(), in); err == nil {
+				t.Fatal("a failed mutation must return its error")
+			}
+			if asked != "a" {
+				t.Fatalf("Unchanged asked about %q, want the drained node a", asked)
+			}
+			want := []string{"request:ignored", "pin:a", "mutate:a"}
+			if tc.revert {
+				want = append(want, "pin:"+pinAB.NodesParam())
+			}
+			want = append(want, "request:started")
+			if !slices.Equal(r.events, want) {
+				t.Fatalf("events %v, want %v", r.events, want)
+			}
+		})
+	}
+}

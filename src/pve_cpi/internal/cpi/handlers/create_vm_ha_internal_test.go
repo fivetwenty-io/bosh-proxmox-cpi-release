@@ -229,9 +229,12 @@ func TestCreatedVMHA_LandingOutsideTheAdmissibleSetFails(t *testing.T) {
 	r := newStagingRig(t, config.HAModeAuto, true)
 	r.landing = "pve03"
 	r.stage(t)
-	_, err := r.confineAndActivate()
+	landing, err := r.confineAndActivate()
 	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !strings.Contains(err.Error(), "outside its hard") {
 		t.Fatalf("err = %v, want a retriable landing refusal", err)
+	}
+	if landing != "pve03" {
+		t.Fatalf("landing %q, want pve03, where PVE HA started the VM, so the rollback acts there", landing)
 	}
 }
 
@@ -626,6 +629,28 @@ func TestCompleteCreatedVM_ActivatesTagsAndFollowsTheLanding(t *testing.T) {
 	}
 	if r.started != 0 {
 		t.Error("PVE HA starts a registered VM; the CPI must not start it directly")
+	}
+}
+
+func TestCompleteCreatedVM_FailedLandingStillMovesTheShape(t *testing.T) {
+	// PVE HA started the VM outside its hard set. The create fails, and the
+	// shape names the node the VM runs on, because the rollback tears it down
+	// from there.
+	r := newStagingRig(t, config.HAModeAuto, true)
+	r.landing = "pve03"
+	tags, writes := "bosh-cpi", []string{}
+	r.deps.PVE = taggedVMClient(r.rules, &tags, &writes)
+	r.stage(t)
+	shape := &createVMShape{node: "pve01"}
+	err := completeCreatedVM(crhCtx(), r.deps, log.NewNopLogger(), r.parsed, shape, 100, r.h, r.start)
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("err = %v, want the retriable landing refusal", err)
+	}
+	if shape.node != "pve03" {
+		t.Fatalf("shape node %q, want pve03, where PVE HA started the VM", shape.node)
+	}
+	if len(writes) != 0 {
+		t.Errorf("tag writes %v; a failed activation writes no tag", writes)
 	}
 }
 

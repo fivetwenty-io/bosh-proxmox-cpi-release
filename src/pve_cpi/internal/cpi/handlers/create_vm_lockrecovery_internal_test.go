@@ -150,6 +150,8 @@ type lrQEMUStub struct {
 	statusCalls int
 	// status is the power state Status answers; empty answers stopped.
 	status string
+	// snapshots is what ListSnapshots answers.
+	snapshots []map[string]any
 }
 
 func (q *lrQEMUStub) Stop(_ context.Context, _ string, _ int) (string, error) {
@@ -177,6 +179,12 @@ func (q *lrQEMUStub) Status(_ context.Context, _ string, _ int) (map[string]any,
 		return map[string]any{"status": q.status}, nil
 	}
 	return map[string]any{"status": "stopped"}, nil
+}
+
+// ListSnapshots answers snapshots, which is what the attach_disk snapshot
+// guard reads before an HA change.
+func (q *lrQEMUStub) ListSnapshots(context.Context, string, int) ([]map[string]any, error) {
+	return q.snapshots, nil
 }
 
 // --------------------------------------------------------------------------

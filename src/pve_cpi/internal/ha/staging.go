@@ -302,13 +302,16 @@ func (s *Stager) Verify(ctx context.Context, d *VMDecision, want *Rule, antiAffi
 	case s.ReadRules == nil:
 		return cpierrors.Cloud("ha verify: the rules reader must be set")
 	}
+	// A rules read that fails or returns nothing proves no confinement, so
+	// its error wraps ErrConfinementUnverified like any other failed check.
 	set, err := s.ReadRules(ctx)
 	if err != nil {
-		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("ha verify: re-read the HA rules for %s", d.SID))
+		return cpierrors.WrapAs(fmt.Errorf("%w: the HA rules could not be re-read: %w", ErrConfinementUnverified, err),
+			cpierrors.TypeRetriableCloud, fmt.Sprintf("ha verify: re-read the HA rules for %s", d.SID))
 	}
 	if set == nil {
-		return cpierrors.Retriable("ha verify: the re-read of the HA rules for %s returned nothing", d.SID)
+		return cpierrors.WrapAs(fmt.Errorf("%w: the re-read of the HA rules returned nothing", ErrConfinementUnverified),
+			cpierrors.TypeRetriableCloud, fmt.Sprintf("ha verify: re-read the HA rules for %s", d.SID))
 	}
 	var problems []string
 	pinProblem := pinMismatch(set.Find(want.ID), want)
@@ -382,35 +385,49 @@ func pinMismatch(got, want *Rule) string {
 	return fmt.Sprintf("pin %q differs in %s", want.ID, strings.Join(RuleDiff(want, got), ","))
 }
 
-// CheckWatchdog applies the watchdog check to node. It passes when the cluster
-// is not one failure from losing quorum, or when node's watchdog is armed,
-// because one more service changes nothing there. Otherwise auto gets an
-// error that wraps ErrWatchdogNotArmed, and managed passes with a warning. A
-// failed read counts as an unknown watchdog.
+// CheckWatchdog applies the watchdog check to node and to every node of the
+// VM's hard admissible set, because PVE HA may start the VM on any of them.
+// It passes when the cluster is not one failure from losing quorum, or when
+// every one of those nodes has its watchdog armed, because one more service
+// changes nothing there. Otherwise auto gets an error that wraps
+// ErrWatchdogNotArmed and names the nodes, and managed passes with a warning.
+// A failed read counts as an unknown watchdog.
 func (s *Stager) CheckWatchdog(ctx context.Context, d *VMDecision, node string) error {
 	if !s.FragileQuorum {
 		return nil
 	}
-	state := pve.WatchdogUnknown
-	if s.Watchdog != nil {
-		got, err := s.Watchdog(ctx, node)
-		if err != nil {
-			s.logger().Warn("ha: could not read the node's watchdog state; it counts as unknown",
-				log.String("sid", d.SID), log.String("node", node), log.Err(err))
-		} else {
-			state = got
+	nodes := []string{node}
+	for _, n := range d.Admissible {
+		if n != "" && !slices.Contains(nodes, n) {
+			nodes = append(nodes, n)
 		}
 	}
-	if state == pve.WatchdogArmed {
+	var unarmed []string
+	for _, n := range nodes {
+		state := pve.WatchdogUnknown
+		if s.Watchdog != nil {
+			got, err := s.Watchdog(ctx, n)
+			if err != nil {
+				s.logger().Warn("ha: could not read the node's watchdog state; it counts as unknown",
+					log.String("sid", d.SID), log.String("node", n), log.Err(err))
+			} else {
+				state = got
+			}
+		}
+		if state != pve.WatchdogArmed {
+			unarmed = append(unarmed, fmt.Sprintf("node %s is %s", n, state))
+		}
+	}
+	if len(unarmed) == 0 {
 		return nil
 	}
 	if s.Managed {
-		s.logger().Warn("ha: activating the VM arms the HA watchdog of its node while the cluster is one failure "+
-			"from losing quorum; that node reboots itself if it loses quorum",
-			log.String("sid", d.SID), log.String("node", node), log.String("watchdog", string(state)))
+		s.logger().Warn("ha: activating the VM arms the HA watchdog of the node it starts on while the cluster is "+
+			"one failure from losing quorum; that node reboots itself if it loses quorum",
+			log.String("sid", d.SID), log.String("watchdog", strings.Join(unarmed, "; ")))
 		return nil
 	}
-	return fmt.Errorf("%w: %s on node %s is %s", ErrWatchdogNotArmed, d.SID, node, state)
+	return fmt.Errorf("%w: %s: %s", ErrWatchdogNotArmed, d.SID, strings.Join(unarmed, "; "))
 }
 
 // Activate takes the resource out of staging and starts the VM with one

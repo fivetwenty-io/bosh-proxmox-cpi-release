@@ -49,7 +49,7 @@ var reservedBoshTagPrefixes = []string{
 // Every entry is lowercase, because hasCPIOwnedPrefix lowercases before it
 // compares.
 var createTimeTagPrefixes = []string{
-	stemcellTagPrefix, ownerTagPrefix, cidStampTagPrefix, clusterStampTagPrefix, haRuleNamePrefix,
+	stemcellTagPrefix, ownerTagPrefix, cidStampTagPrefix, clusterStampTagPrefix, haRuleNamePrefix, haManagedTag,
 }
 
 // ownerTagPrefix names the Director that created a VM. create_vm stamps

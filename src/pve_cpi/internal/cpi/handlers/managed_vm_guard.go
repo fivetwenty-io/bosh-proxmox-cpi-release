@@ -30,6 +30,10 @@ type managedVMAllocation struct {
 	// config write that deletes or reverts a key, so its readback can tell a
 	// pending delete that changed nothing else from any other outcome.
 	configBefore map[string]map[string]any
+	// haResourceStaged is set once this call has created the VM's HA resource
+	// as ignored and proved the creation, so the guard admits the removal
+	// that undoes the staging (see admitHAResourceDelete).
+	haResourceStaged bool
 }
 
 func (m *managedVMAllocation) revalidate(ctx context.Context) error {
@@ -53,7 +57,7 @@ func (m *managedVMAllocation) newGuard() error {
 	}
 	guard, err := NewManagedAllocationGuard(m.deps.PVE, ManagedAllocationHooks{Before: m.beforeMutation, After: m.afterMutation, Failed: func(_ context.Context, call ManagedAllocationMutation, _ string, _ error) error {
 		return storageAllocationUncertain(m.handle, "VM "+call.Service+"."+call.Method)
-	}, SettleFailedWrite: m.settleFailedConfigDelete})
+	}, SettleFailedWrite: m.settleFailedWrite})
 	if err != nil {
 		return err
 	}
@@ -61,10 +65,18 @@ func (m *managedVMAllocation) newGuard() error {
 	return nil
 }
 func (m *managedVMAllocation) beforeMutation(ctx context.Context, call ManagedAllocationMutation) (string, error) {
+	method := call.Service + "." + call.Method
+	// An HA resource removal is admitted, or refused without locking the
+	// guard, before any other check, so a refused unstage leaves the
+	// allocation as it found it.
+	if method == managedVMCallDeleteHAResource {
+		if err := m.admitHAResourceDelete(ctx, call); err != nil {
+			return "", err
+		}
+	}
 	if err := m.revalidate(ctx); err != nil {
 		return "", err
 	}
-	method := call.Service + "." + call.Method
 	target := aj.Target{Node: m.shape.node, VMID: m.vmid}
 	var role string
 	switch method {
@@ -77,7 +89,7 @@ func (m *managedVMAllocation) beforeMutation(ctx context.Context, call ManagedAl
 		role = storageRoleEphemeral
 	case managedVMCallUpload:
 		role = storageRoleISO
-	case "QEMU.ResizeDisk", managedVMCallResize, managedVMCallAttach, managedVMCallDetach, managedVMCallStart, managedVMCallUpdateConfig, "Nodes.CreateQemuAgentExec", "Nodes.CreateQemuFirewallIpset", "Nodes.CreateQemuFirewallIpset2", "Nodes.CreateQemuFirewallRules", "Nodes.UpdateQemuFirewallOptions", "Cluster.CreateHaResources", "Cluster.UpdateHaResources", "Cluster.CreateHaRules", "Cluster.UpdateHaRules", "Cluster.DeleteHaRules", "Cluster.CreateSdnVnetsSubnets", "Cluster.UpdateSdn", "Pool.AddVM", "Pool.MoveVMToPool", "Pool.CreatePool":
+	case "QEMU.ResizeDisk", managedVMCallResize, managedVMCallAttach, managedVMCallDetach, managedVMCallStart, managedVMCallUpdateConfig, "Nodes.CreateQemuAgentExec", "Nodes.CreateQemuFirewallIpset", "Nodes.CreateQemuFirewallIpset2", "Nodes.CreateQemuFirewallRules", "Nodes.UpdateQemuFirewallOptions", "Cluster.CreateHaResources", "Cluster.UpdateHaResources", managedVMCallDeleteHAResource, "Cluster.CreateHaRules", "Cluster.UpdateHaRules", "Cluster.DeleteHaRules", "Cluster.CreateSdnVnetsSubnets", "Cluster.UpdateSdn", "Pool.AddVM", "Pool.MoveVMToPool", "Pool.CreatePool":
 	case "Pool.DeletePool":
 		// The anti-affinity lock releases its sentinel through this guard. No
 		// other pool may be deleted during a VM allocation, and that includes
@@ -254,6 +266,9 @@ func (m *managedVMAllocation) afterMutation(ctx context.Context, call ManagedAll
 	default:
 		if err := m.observePolicyMutation(ctx, call, step, result); err != nil {
 			return err
+		}
+		if method == "Cluster.CreateHaResources" {
+			m.noteStagedHAResource(call)
 		}
 	}
 	return storageMutationObserved(m.handle, step, volumes, false)

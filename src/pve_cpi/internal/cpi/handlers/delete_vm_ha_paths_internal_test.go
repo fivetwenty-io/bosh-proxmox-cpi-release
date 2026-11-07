@@ -356,8 +356,12 @@ func TestCleanupVM_RemovesNodeAffinityPinWhenEnabled(t *testing.T) {
 	scene := NewHADeleteScene()
 	scene.Manage(100, "pve-node1", "started", "started")
 	scene.Rules["bosh-na-100"] = map[string]any{"type": "node-affinity", "resources": "vm:100", "nodes": "pve-node1"}
+	// The resource carries this Director's marker, which the deregistration
+	// requires before it removes anything the destroy's purge left.
+	scene.Comments["vm:100"] = haIdentity{Owner: aaDirector}.marker()
 	nodes, q := &kfNodes{}, &kfQEMU{}
 	deps := rollbackHADeps(scene, nodes, q)
+	deps.RequestDirectorUUID = aaDirector
 
 	cleanupVM(context.Background(), deps, "pve-node1", 100, nil, log.NewNopLogger())
 
@@ -374,8 +378,74 @@ func TestCleanupVM_RemovesNodeAffinityPinWhenEnabled(t *testing.T) {
 	if _, ok := scene.Rules["bosh-na-100"]; ok {
 		t.Error("cleanupVM must remove the node-affinity pin rule on rollback")
 	}
-	if !slices.Contains(events, "DeleteHaResources:vm:100") {
-		t.Errorf("cleanupVM must deregister the HA resource on rollback, got %v", events)
+	// The destroy's purge removes the HA resource, as PVE does, so the
+	// deregistration finds it gone and has nothing left to remove.
+	scene.Do(func(s *HADeleteScene) {
+		if _, ok := s.Requested["vm:100"]; ok {
+			t.Errorf("cleanupVM must leave no HA resource for the VM on rollback, got %v", events)
+		}
+	})
+}
+
+// TestCleanupVM_TearsDownAVMPVEHAMovedWhereItIsNow creates the VM on
+// pve-node1 and lets PVE HA run it on pve-node2 before the create fails. The
+// rollback finds the VM where it is now, takes it out of HA, and destroys it
+// there.
+func TestCleanupVM_TearsDownAVMPVEHAMovedWhereItIsNow(t *testing.T) {
+	scene := NewHADeleteScene()
+	scene.Manage(100, "pve-node2", "started", "started")
+	scene.Rules["bosh-na-100"] = map[string]any{"type": "node-affinity", "resources": "vm:100", "nodes": "pve-node2"}
+	scene.Comments["vm:100"] = haIdentity{Owner: aaDirector}.marker()
+	nodes, q := &kfNodes{}, &kfQEMU{}
+	deps := rollbackHADeps(scene, nodes, q)
+	deps.RequestDirectorUUID = aaDirector
+
+	cleanupVM(context.Background(), deps, "pve-node1", 100, kfEnv(), log.NewNopLogger())
+
+	events := scene.EventsSnapshot()
+	if len(events) == 0 || events[0] != "UpdateHaResources:vm:100=stopped" {
+		t.Fatalf("the rollback must stop the moved VM through PVE HA first, got %v", events)
+	}
+	if nodes.deleteCalls != 1 || nodes.deletedOn != "pve-node2" {
+		t.Fatalf("destroys %d on %q, want one on pve-node2, where PVE HA moved the VM", nodes.deleteCalls,
+			nodes.deletedOn)
+	}
+	if _, ok := scene.Rules["bosh-na-100"]; ok {
+		t.Error("the rollback must remove the moved VM's pin")
+	}
+	scene.Do(func(s *HADeleteScene) {
+		if _, ok := s.Requested["vm:100"]; ok {
+			t.Errorf("the rollback must take the moved VM out of HA, got %v", events)
+		}
+	})
+}
+
+// TestCleanupVM_DefersAnHAVMWhoseNodeCannotBeProved lists the VM in HA but
+// leaves it out of the cluster index, so its current node cannot be proved.
+// The rollback tags the VM and leaves it and its HA state as they are.
+func TestCleanupVM_DefersAnHAVMWhoseNodeCannotBeProved(t *testing.T) {
+	scene := NewHADeleteScene()
+	scene.Manage(100, "pve-node2", "started", "started")
+	scene.Do(func(s *HADeleteScene) { delete(s.IndexNode, 100) })
+	scene.Rules["bosh-na-100"] = map[string]any{"type": "node-affinity", "resources": "vm:100", "nodes": "pve-node2"}
+	scene.Comments["vm:100"] = haIdentity{Owner: aaDirector}.marker()
+	nodes, q := &kfNodes{}, &kfQEMU{}
+	deps := rollbackHADeps(scene, nodes, q)
+	deps.RequestDirectorUUID = aaDirector
+
+	cleanupVM(context.Background(), deps, "pve-node1", 100, kfEnv(), log.NewNopLogger())
+
+	if nodes.deleteCalls != 0 {
+		t.Fatalf("a rollback that cannot prove the VM's node must not destroy it, got %d destroys", nodes.deleteCalls)
+	}
+	if events := scene.EventsSnapshot(); len(events) != 0 {
+		t.Fatalf("a deferred rollback must write nothing to HA, got %v", events)
+	}
+	if _, ok := scene.Rules["bosh-na-100"]; !ok {
+		t.Fatal("a deferred rollback must keep the pin rule")
+	}
+	if nodes.failedTagCalls != 1 {
+		t.Fatalf("a deferred rollback must tag the VM it leaves, got %d tag writes", nodes.failedTagCalls)
 	}
 }
 

@@ -145,12 +145,14 @@ func handleAwaitError(
 // Go does not assign the named return on a panic unwind, so the *retErr guard
 // alone would miss the panic path. vmCreated and retErr are read through
 // pointers because both are still mutating when the defer is registered.
-// deferred guard that must observe createVM's final named-return error and the
-// latest vmCreated value, both still mutating when the defer is registered.
 //
-//nolint:gocritic // retErr and vmCreated are pointers by necessity: this is a
+// node is read when the rollback runs, not when the defer is registered,
+// because PVE HA may start a staged VM on a node other than the one it was
+// created on, and the create records that landing node before it fails.
+//
+//nolint:gocritic // retErr and vmCreated are pointers because the deferred guard reads their final values.
 func rollbackOnExit(
-	ctx context.Context, deps Deps, node string, vmid int, env map[string]any,
+	ctx context.Context, deps Deps, node func() string, vmid int, env map[string]any,
 	logger *log.Logger, vmCreated *bool, retErr *error,
 ) {
 	if r := recover(); r != nil {
@@ -162,26 +164,30 @@ func rollbackOnExit(
 		panic(r)
 	}
 	if *retErr != nil && *vmCreated {
+		current := node()
 		if deps.Config.KeepFailedVMsEnabled() {
 			rbCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
-			keepFailedVM(rbCtx, deps, node, vmid, env, logger)
+			keepFailedVM(rbCtx, deps, current, vmid, env, logger)
 			rbCancel()
-			*retErr = preserveFailedVMError(*retErr, vmid, node)
+			*retErr = preserveFailedVMError(*retErr, vmid, current)
 			return
 		}
-		cleanupVMDetached(ctx, deps, node, vmid, env, logger)
+		cleanupVMDetached(ctx, deps, current, vmid, env, logger)
 	}
 }
 
 // disposeFailedVM either preserves (keep-failed mode) or destroys a VM that is
 // being abandoned on the panic path. On the panic path retErr is not assigned,
-// so the caller re-panics afterward; here we only need to tag-or-destroy.
-func disposeFailedVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
+// so the caller re-panics afterward; here we only need to tag-or-destroy. node
+// is read when the disposal runs, as in rollbackOnExit.
+func disposeFailedVM(
+	ctx context.Context, deps Deps, node func() string, vmid int, env map[string]any, logger *log.Logger,
+) {
 	if deps.Config.KeepFailedVMsEnabled() {
-		keepFailedVM(ctx, deps, node, vmid, env, logger)
+		keepFailedVM(ctx, deps, node(), vmid, env, logger)
 		return
 	}
-	cleanupVM(ctx, deps, node, vmid, env, logger)
+	cleanupVM(ctx, deps, node(), vmid, env, logger)
 }
 
 // tagFailedVM marks a VM that failed mid-creation with "bosh-create-failed"
@@ -465,6 +471,11 @@ func cleanupVMClaimed(ctx context.Context, deps Deps, node string, vmid int, env
 	// This create allocated the VMID itself, so its config-drive ISO is ours to
 	// remove at the end of the rollback whatever band the VMID lies in.
 	ctx = pve.WithOwnedConfigDriveISO(ctx, vmid)
+	node, gate, err := rollbackTeardownNode(ctx, deps, caller, node, vmid, logger)
+	if err != nil {
+		cleanupVMLeftVM(ctx, deps, node, vmid, env, teardownStageHA, err, logger)
+		return
+	}
 	// The diagnostic marker. The birth tag already queues the VM, so a write
 	// that fails here, as it does under fencing or a quorum loss, loses only
 	// the marker.
@@ -477,7 +488,7 @@ func cleanupVMClaimed(ctx context.Context, deps Deps, node string, vmid int, env
 		vmid:                vmid,
 		node:                node,
 		logger:              logger,
-		gate:                teardownGateListed,
+		gate:                gate,
 		skiplock:            true,
 		awaitLockClear:      true,
 		destroyUnreferenced: deps.Config != nil && deps.Config.DestroyUnreferencedDisks,
@@ -508,6 +519,44 @@ func cleanupVMClaimed(ctx context.Context, deps Deps, node string, vmid int, env
 		logger.Info("create_vm: rollback complete", log.Int(metadataKeyVMID, vmid))
 	}
 	cleanupRollbackArtifacts(ctx, deps, identity, logger)
+}
+
+// rollbackTeardownNode resolves the node the rollback tears the VM down on,
+// and the HA gate its teardown runs. node is where the create last placed the
+// VM. A VM that PVE HA's resource configuration lists may have been started
+// elsewhere, or moved since, so its current node comes from the authoritative
+// lookup, and the teardown gates it on that node. A VM PVE HA does not list
+// cannot have been moved by it, and its teardown starts from no HA state.
+//
+// A listed VM the lookup cannot place returns a retriable deferral, so the VM
+// is tagged and left for the deferred-teardown sweep, never torn down on a
+// node it may no longer be on. A listing that cannot be read keeps node and
+// the listed gate, whose own read defers the teardown when it fails again.
+func rollbackTeardownNode(
+	ctx context.Context, deps Deps, caller, node string, vmid int, logger *log.Logger,
+) (string, vmTeardownGate, error) {
+	listed, err := managedVMHAResourcePresent(ctx, deps, haResourceSid(vmid))
+	if err != nil {
+		return node, teardownGateListed, nil
+	}
+	if !listed {
+		return node, teardownGated, nil
+	}
+	loc, err := findVMAuthoritative(ctx, deps, vmid)
+	if err != nil {
+		return node, teardownGateListed, deferHA(cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+			"%s: VM %d is under PVE HA and its current node could not be proved before the teardown", caller, vmid)))
+	}
+	if !loc.Found || loc.Node == "" {
+		// The lookup proved the VM gone. The teardown's own absence proof
+		// settles it on the node the create last placed it on.
+		return node, teardownGateListed, nil
+	}
+	if loc.Node != node {
+		logger.Warn("create_vm: rollback: PVE HA placed the VM on another node; tearing it down there",
+			log.Int(metadataKeyVMID, vmid), log.String("created_on", node), log.String("node", loc.Node))
+	}
+	return loc.Node, teardownGateListed, nil
 }
 
 // cleanupVMLeftVM logs and tags a VM the rollback's teardown did not destroy,

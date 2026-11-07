@@ -99,6 +99,13 @@ type NarrowInput struct {
 	// CheckReach re-reads the config after the mutation and checks that every
 	// node of NewPin reaches the VM's volumes. nil checks nothing.
 	CheckReach func(ctx context.Context, node string) error
+	// Unchanged answers, after a mutation that returned an error, whether the
+	// VM's config on node provably holds none of the change. When it does, the
+	// barrier writes OldPin back before it restores the state, so a change that
+	// never landed leaves the VM no narrower than before. nil, false, or an
+	// error keeps the narrower pin, which over-confines the VM but never lets
+	// PVE HA move it to a node the change does not reach.
+	Unchanged func(ctx context.Context, node string) (bool, error)
 	// SysConsole says the token holds Sys.Console, which the ignored and
 	// started requests need.
 	SysConsole bool
@@ -306,10 +313,13 @@ func (b *barrier) viaIgnored(ctx context.Context, resumed bool) (pve.VMLocation,
 			return loc, b.restoreAfter(ctx, fmt.Errorf("ha narrow: write the narrower pin of VM %d: %w", b.in.VMID, err))
 		}
 	}
-	loc, err = b.mutate(ctx, loc.Node)
+	drained := loc.Node
+	loc, err = b.mutate(ctx, drained)
 	if err != nil {
 		// The VM sits inside the narrower set, which the old config allows
 		// too, so starting it again is safe whether the mutation landed or not.
+		// A mutation proven not to have landed gets the old pin back first.
+		b.revertPin(ctx, drained)
 		return loc, b.restoreAfter(ctx, err)
 	}
 	if err := b.checkLanding(ctx, loc.Node); err != nil {
@@ -321,6 +331,32 @@ func (b *barrier) viaIgnored(ctx context.Context, resumed bool) (pve.VMLocation,
 		return loc, err
 	}
 	return loc, nil
+}
+
+// revertPin writes OldPin back after a mutation that failed, when Unchanged
+// proves the config holds none of the change. Any other answer keeps the
+// narrower pin. A failed write is logged, because the narrower pin it leaves
+// only over-confines the VM, and the restore that follows must still run.
+func (b *barrier) revertPin(ctx context.Context, node string) {
+	if b.in.Unchanged == nil || b.in.WritePin == nil || node == "" {
+		return
+	}
+	unchanged, err := b.in.Unchanged(ctx, node)
+	switch {
+	case err != nil:
+		b.deps.Logger.Warn("ha narrow: could not tell whether the failed change landed; the narrower pin stays",
+			log.Int("vmid", b.in.VMID), log.String("sid", b.sid), log.Err(err))
+		return
+	case !unchanged:
+		return
+	}
+	if err := b.in.WritePin(ctx, b.in.OldPin); err != nil {
+		b.deps.Logger.Warn("ha narrow: the change did not land, and the old pin could not be written back; the "+
+			"narrower pin stays", log.Int("vmid", b.in.VMID), log.String("sid", b.sid), log.Err(err))
+		return
+	}
+	b.deps.Logger.Info("ha narrow: the change did not land, so the old pin is back",
+		log.Int("vmid", b.in.VMID), log.String("sid", b.sid))
 }
 
 // checkLanding re-reads the config, checks volume reach from the narrower

@@ -318,9 +318,13 @@ func TestVerifyInputs(t *testing.T) {
 	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Errorf("a failed read is retriable: %v", err)
 	}
+	if !errors.Is(err, ErrConfinementUnverified) {
+		t.Errorf("a failed read proves no confinement and must say so: %v", err)
+	}
 	empty := &Stager{ReadRules: func(context.Context) (*RuleSet, error) { return nil, nil }}
-	if err := empty.Verify(context.Background(), stageDecision(), verifyPin(), ""); err == nil {
-		t.Error("a read that returns no rule set must be an error")
+	err = empty.Verify(context.Background(), stageDecision(), verifyPin(), "")
+	if err == nil || !errors.Is(err, ErrConfinementUnverified) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("a read that returns no rule set must be a retriable unverified confinement: %v", err)
 	}
 }
 
@@ -350,6 +354,32 @@ func TestCheckWatchdog(t *testing.T) {
 		if tc.refused != errors.Is(err, ErrWatchdogNotArmed) || !tc.refused && err != nil {
 			t.Errorf("%s: got %v, refused want %v", tc.name, err, tc.refused)
 		}
+	}
+}
+
+func TestCheckWatchdogReadsEveryAdmissibleNode(t *testing.T) {
+	t.Parallel()
+	// The VM may start on any admissible node, so each one must be armed. The
+	// placed node is read once even when it is admissible too.
+	states := map[string]pve.WatchdogState{"a": pve.WatchdogArmed, "b": pve.WatchdogArmed, "c": pve.WatchdogIdle}
+	var read []string
+	s := &Stager{FragileQuorum: true, Watchdog: func(_ context.Context, node string) (pve.WatchdogState, error) {
+		read = append(read, node)
+		return states[node], nil
+	}}
+	d := stageDecision()
+	d.Admissible = []string{"a", "b", "c"}
+	err := s.CheckWatchdog(context.Background(), d, "a")
+	if !errors.Is(err, ErrWatchdogNotArmed) || !strings.Contains(err.Error(), "node c") ||
+		strings.Contains(err.Error(), "node a") {
+		t.Fatalf("err = %v, want a refusal that names only node c", err)
+	}
+	if !slices.Equal(read, []string{"a", "b", "c"}) {
+		t.Fatalf("read %v, want each node once", read)
+	}
+	states["c"] = pve.WatchdogArmed
+	if err := s.CheckWatchdog(context.Background(), d, "a"); err != nil {
+		t.Fatalf("every node armed: %v", err)
 	}
 }
 

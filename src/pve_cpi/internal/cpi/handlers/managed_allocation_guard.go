@@ -130,13 +130,16 @@ func (g *ManagedAllocationGuard) begin(ctx context.Context, m ManagedAllocationM
 		err = fmt.Errorf("managed mutation did not produce durable intent identity")
 	}
 	if errors.Is(err, errManagedRequestEnded) || errors.Is(err, errManagedDescriptionDigestStale) ||
-		errors.Is(err, errManagedTailReadFailed) || errors.Is(err, errManagedAdmissionReadFailed) {
+		errors.Is(err, errManagedTailReadFailed) || errors.Is(err, errManagedAdmissionReadFailed) ||
+		errors.Is(err, errManagedHAResourceDeleteRefused) {
 		// The request's context ended before or during the checks for this
 		// mutation, a description-only write carried a digest the guard's own
-		// read no longer matches, or a read the guard makes to admit the
-		// mutation returned an error, and the refusal came before any intent
-		// was written or PVE was called. Nothing is uncertain, so the guard
-		// stays usable, the way a cut-off protection write leaves it.
+		// read no longer matches, a read the guard makes to admit the
+		// mutation returned an error, or a VM allocation refused an HA
+		// resource removal that does not undo its own staging. Each refusal
+		// came before any intent was written or PVE was called. Nothing is
+		// uncertain, so the guard stays usable, the way a cut-off protection
+		// write leaves it.
 		g.mu.Unlock()
 		return "", &managedMutationNotAttempted{err: err}
 	}

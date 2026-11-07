@@ -158,7 +158,9 @@ func warnRequestedHAWithoutRegistration(
 }
 
 // createdVMHAInput builds the decision input from the VM's config, its shape,
-// and its cloud properties.
+// and its cloud properties. It leaves State nil, because the VM was created by
+// this call and has no HA state for the decision to read yet, so the decision
+// carries no CRM uid.
 func createdVMHAInput(
 	ctx context.Context, deps Deps, parsed *createVMParsedArgs, shape *createVMShape, vmid int,
 	cfg map[string]any, profile *ha.Profile,
@@ -280,6 +282,8 @@ func (p *createVMParsedArgs) recordLegacyDisk(rd resolvedDisk) {
 
 // configHasLinkedClone reports whether a disk of the config is a linked clone
 // whose volume name shows its base, which is the form file storages give it.
+// LVM-thin and ZFS name a linked clone like any other volume, so the check
+// cannot see those, and a VM cloned on them reads as a full clone here.
 func configHasLinkedClone(cfg map[string]any) bool {
 	for _, v := range pve.ConfigAccessVolumes(cfg, "") {
 		_, name, _ := strings.Cut(v.Volume, ":")
@@ -296,6 +300,9 @@ func (h *createdVMHA) newStager(managed bool) *ha.Stager {
 	svc := deps.PVE.Cluster()
 	owner := h.ident.Owner
 	sysConsole := h.profile.SysConsole
+	// The watchdog check reads every admissible node, and one health report
+	// answers them all, so the first successful read is kept for the call.
+	var health *pve.NodeHealthReport
 	return &ha.Stager{
 		Resources: svc,
 		Owned:     func(comment string) bool { return haOwnershipOf(comment, owner) == haOwnedByUs },
@@ -307,11 +314,14 @@ func (h *createdVMHA) newStager(managed bool) *ha.Stager {
 			return ha.ParseRuleList(resp)
 		},
 		Watchdog: func(ctx context.Context, node string) (pve.WatchdogState, error) {
-			report, err := pve.NodeHealth(ctx, svc, deps.PVE.Nodes(), haHealthOptions(deps))
-			if err != nil {
-				return pve.WatchdogUnknown, err
+			if health == nil {
+				report, err := pve.NodeHealth(ctx, svc, deps.PVE.Nodes(), haHealthOptions(deps))
+				if err != nil {
+					return pve.WatchdogUnknown, err
+				}
+				health = report
 			}
-			return report.WatchdogOf(node), nil
+			return health.WatchdogOf(node), nil
 		},
 		SetStarted: func(ctx context.Context, vmid int, node string) (*pve.SetHAStateResult, error) {
 			return pve.SetHAState(ctx, pve.HAStateDepsFor(deps.PVE), pve.SetHAStateInput{
@@ -403,27 +413,37 @@ func (h *createdVMHA) activate(ctx context.Context, node string, start func(cont
 	}
 	landing, err := h.stager.Activate(ctx, h.decision, node)
 	if err != nil {
+		// A landing outside the admissible set still names where PVE HA
+		// started the VM, and the rollback must act there.
+		if landing != "" {
+			return landing, err
+		}
 		return node, err
 	}
 	h.activated, h.landing = true, landing
 	return landing, nil
 }
 
-// runWithoutHA removes the staged resource, removes the pin the call wrote,
-// and starts the VM directly. The removal purges the resource from every rule,
-// the anti-affinity rule included, and a pin that cannot be deleted then names
-// no resource and confines nothing, so its failure is only logged.
+// runWithoutHA removes the staged resource, removes the VM's pin and the
+// anti-affinity rules its group no longer needs, and starts the VM directly.
+// The removal purges the resource from every rule, and the pin and the rules
+// are then removed by name whether or not this call recorded writing them,
+// because a write that failed part way can leave a rule behind. A rule that
+// cannot be deleted then names no resource of this VM and confines nothing, so
+// those failures are only logged.
 func (h *createdVMHA) runWithoutHA(ctx context.Context, reason string, start func(context.Context) error) error {
 	if err := h.stager.Unstage(ctx, h.decision, reason); err != nil {
 		return err
 	}
-	if h.pin != nil {
-		if err := removeNodeAffinityPin(ctx, h.deps, h.vmid, h.logger); err != nil {
-			h.logger.Warn("create_vm: the pin of the VM that runs without HA could not be removed; it names no "+
-				"resource now, and delete_vm removes it", log.Int(metadataKeyVMID, h.vmid), log.Err(err))
-		}
-		h.pin = nil
+	if err := removeNodeAffinityPin(ctx, h.deps, h.vmid, h.logger); err != nil {
+		h.logger.Warn("create_vm: the pin of the VM that runs without HA could not be removed; it names no "+
+			"resource now, and delete_vm removes it", log.Int(metadataKeyVMID, h.vmid), log.Err(err))
 	}
+	if err := pruneGroupAntiAffinityRules(ctx, h.deps, h.ident, h.vmid, h.logger); err != nil {
+		h.logger.Warn("create_vm: the anti-affinity rules the VM that runs without HA left could not be pruned; "+
+			"they name no resource of this VM now", log.Int(metadataKeyVMID, h.vmid), log.Err(err))
+	}
+	h.pin = nil
 	h.aaRule = ""
 	return start(ctx)
 }
@@ -448,18 +468,25 @@ func completeCreatedVM(
 	if err := checkISOStorageForHA(ctx, deps, vmid, parsed.cloudProps, shape.node, parsed.env, logger); err != nil {
 		return err
 	}
+	// shape.node follows the VM to the node PVE HA started it on before the
+	// error is returned, because the rollback reads shape.node and must tear
+	// the VM down where it runs.
 	landing, err := h.activate(ctx, shape.node, start)
-	if err != nil {
-		return err
-	}
 	if landing != "" && landing != shape.node {
-		logger.Info("create_vm: PVE HA started the VM on another node of its admissible set",
+		logger.Info("create_vm: PVE HA started the VM on another node",
 			log.Int(metadataKeyVMID, vmid), log.String("placed", shape.node), log.String("node", landing))
 		shape.node = landing
 	}
+	if err != nil {
+		return err
+	}
+	// The tag is a marker for operators. delete_vm finds an HA-managed VM by
+	// its HA resource, so a failed tag write is logged and the create goes on
+	// rather than tearing down a VM that runs under HA.
 	if h.haActivated() {
 		if err := addHAManagedTag(ctx, deps, shape.node, vmid, logger); err != nil {
-			return err
+			logger.Warn("create_vm: the bosh-ha-managed tag could not be written; the VM runs under PVE HA without it",
+				log.Int(metadataKeyVMID, vmid), log.String("node", shape.node), log.Err(err))
 		}
 	}
 	if deps.Config.HealthCheckEnabled() {
