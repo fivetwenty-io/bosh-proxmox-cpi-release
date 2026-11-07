@@ -215,6 +215,15 @@ type Request struct {
 
 	// BridgeChecker reports whether the named node has the named bridge.
 	BridgeChecker func(node, bridge string) (bool, error)
+
+	// Headroom carries the N+1 memory estimate for an HA VM. When it is set and
+	// its Mode is "enforce" (or any value other than "", "off", and "warn"),
+	// Filter rejects every candidate node on which placing the VM leaves the
+	// estimate short, with a reason that starts "headroom short: ". "warn" and
+	// "off" never remove a node from the candidate set; the caller runs
+	// EnforceHeadroom against the node it chose, which logs the warning. Nil
+	// means no headroom check, byte-identical to prior releases.
+	Headroom *HeadroomCheck
 }
 
 // ScoredNode is a node with its computed score.
@@ -240,6 +249,8 @@ type ScoredNode struct {
 //     node must pass the PCI device check (fail-safe: error → reject).
 //   - When req.RequiredBridges is non-empty and req.BridgeChecker is set, the
 //     node must have every bridge (a failed lookup is a transient rejection).
+//   - When req.Headroom is set in enforce mode, placing the VM on the node must
+//     leave the N+1 memory estimate (EstimateHeadroom) with no shortfall.
 //
 // Each excluded node is accompanied by a human-readable rejection reason.
 // Filter returns (nil, nil) when facts is empty.
@@ -315,6 +326,11 @@ func Filter(facts []NodeFacts, req Request) (pass []NodeFacts, rejections map[st
 		}
 
 		if reason := bridgeRejection(f.Node, req); reason != "" {
+			rejections[f.Node] = reason
+			continue
+		}
+
+		if reason := headroomRejection(facts, req.Headroom, f.Node); reason != "" {
 			rejections[f.Node] = reason
 			continue
 		}
