@@ -277,3 +277,70 @@ func TestParkDisk_ParkerMovedToAnotherNodeIsNotReused(t *testing.T) {
 		t.Fatal("the moved parker's config must never be read on pve1")
 	}
 }
+
+// goneParkerClient lists parkers 90000 and 90001 on pve1. The config of 90000
+// answers the holder scan's and the listing's reads and then reads as
+// missing, the way a parker a retirement destroyed between the listing and
+// the attach looks. The returned func counts the reads of 90000.
+func goneParkerClient(rig *admitRig) (pve.Client, func() int) {
+	q := rig.qemu(nil)
+	base := q.configFn
+	var mu sync.Mutex
+	reads := 0
+	q.configFn = func(node string, vmid int) (map[string]any, error) {
+		if vmid == 90000 {
+			mu.Lock()
+			reads++
+			gone := reads > 2
+			mu.Unlock()
+			if gone {
+				return nil, errors.New("Configuration file 'nodes/pve1/qemu-server/90000.conf' does not exist")
+			}
+		}
+		return base(node, vmid)
+	}
+	count := func() int { mu.Lock(); defer mu.Unlock(); return reads }
+	return buildParkerClient(q, listRows(
+		map[string]any{"vmid": int64(90000), "node": "pve1"},
+		map[string]any{"vmid": int64(90001), "node": "pve1"},
+	)), count
+}
+
+// TestParkDisk_AGoneParkerIsSkipped proves a park passes over a listed parker
+// whose config is gone when parkers may be retired, and lands the disk in the
+// next parker.
+func TestParkDisk_AGoneParkerIsSkipped(t *testing.T) {
+	t.Parallel()
+	rig := &admitRig{}
+	cfg := parkerTestCfg()
+	cfg.RetiresParkers = true
+
+	c, reads := goneParkerClient(rig)
+	err := pve.ParkDisk(admitCtx(), c, nopLogger(), "pve1", "nfs:vm-700-disk-1", cfg, pve.ParkContext{})
+	if err != nil {
+		t.Fatalf("ParkDisk: %v", err)
+	}
+	if reads() < 3 {
+		t.Fatalf("the park must have tried the listed parker 90000; reads %d", reads())
+	}
+	if got := rig.attachedTo(); len(got) != 1 || got[0] != 90001 {
+		t.Fatalf("the disk must land in parker 90001; attaches %v", got)
+	}
+}
+
+// TestParkDisk_AGoneParkerFailsWithoutRetirement proves that, with parker
+// retirement off, a listed parker whose config is gone fails the park as it
+// always has, and nothing is attached.
+func TestParkDisk_AGoneParkerFailsWithoutRetirement(t *testing.T) {
+	t.Parallel()
+	rig := &admitRig{}
+
+	c, _ := goneParkerClient(rig)
+	err := pve.ParkDisk(admitCtx(), c, nopLogger(), "pve1", "nfs:vm-700-disk-1", parkerTestCfg(), pve.ParkContext{})
+	if err == nil || !errors.Is(err, pve.ErrParkerGone) {
+		t.Fatalf("want the gone parker to fail the park; err %v", err)
+	}
+	if got := rig.attachedTo(); len(got) != 0 {
+		t.Fatalf("nothing may be attached; attaches %v", got)
+	}
+}

@@ -188,14 +188,14 @@ func TestAdmitIntoParker(t *testing.T) {
 	}
 	refuse := ParkerConfig{Admit: func(context.Context, string, int, string) (bool, error) { return false, nil }}
 	err := admitIntoParker(ctx, refuse, "pve1", 90000, "nfs:vm-1-disk-0")
-	if !errors.Is(err, ErrParkerNotAdmitted) || !isParkerSkipError(err) {
+	if !errors.Is(err, ErrParkerNotAdmitted) || !isParkerSkipError(err, ParkerConfig{}) {
 		t.Fatalf("a refusal must be a skip error; got %v", err)
 	}
 	fail := ParkerConfig{Admit: func(context.Context, string, int, string) (bool, error) {
 		return true, errors.New("boom")
 	}}
 	err = admitIntoParker(ctx, fail, "pve1", 90000, "nfs:vm-1-disk-0")
-	if err == nil || isParkerSkipError(err) || !strings.Contains(err.Error(), "boom") {
+	if err == nil || isParkerSkipError(err, ParkerConfig{}) || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("an unanswered rule must fail and never skip; got %v", err)
 	}
 }
@@ -254,6 +254,7 @@ func TestResolveDiskHolder_RescanFindsTheNewHolder(t *testing.T) {
 	c := &vanishThenMoveClient{scanFakeClient: inner, volid: volid}
 	cfg := transferTestCfg
 	cfg.AnchorStrict = true
+	cfg.RetiresParkers = true
 
 	holder, err := resolveDiskHolder(context.Background(), c, nil, volid, cfg)
 	if err != nil {
@@ -264,5 +265,129 @@ func TestResolveDiskHolder_RescanFindsTheNewHolder(t *testing.T) {
 	}
 	if c.followUps != 1 {
 		t.Fatalf("the parker's config must be read once, by the first scan's follow-up; read %d times", c.followUps)
+	}
+}
+
+// TestResolveDiskHolder_NoRescanWhenParkersAreNeverRetired proves that, with
+// parker retirement off, a holder scan whose in-band holder vanished answers
+// as it always has, without a second scan.
+func TestResolveDiskHolder_NoRescanWhenParkersAreNeverRetired(t *testing.T) {
+	t.Parallel()
+	const volid = "data:vm-9001-disk-0"
+	inner := newScanFakeClient(map[int]map[string]any{
+		90000: {cfgKeyTags: "bosh-cpi;bosh-parker", "scsi0": volid},
+		700:   {},
+	})
+	inner.rows = []map[string]any{clusterRow(90000, "bosh-cpi;bosh-parker"), clusterRow(700, "")}
+	c := &vanishThenMoveClient{scanFakeClient: inner, volid: volid}
+	cfg := transferTestCfg
+	cfg.AnchorStrict = true
+
+	holder, err := resolveDiskHolder(context.Background(), c, nil, volid, cfg)
+	if err == nil && holder.found && holder.vmid == 700 {
+		t.Fatalf("without parker retirement the scan must not rescan; got holder %+v", holder)
+	}
+	if c.followUps != 1 {
+		t.Fatalf("the parker's config must be read once; read %d times", c.followUps)
+	}
+}
+
+// goneAfterListClient is the two-parker fake whose parker 90000 answers its
+// first config read, the listing's, and then reads as missing, the way a
+// parker a retirement destroyed between the listing and the transfer's first
+// read looks.
+type goneAfterListClient struct {
+	*scanFakeClient
+	mu    sync.Mutex
+	reads int
+}
+
+func (c *goneAfterListClient) QEMU() qemu.Service {
+	svc := c.scanFakeClient.QEMU()
+	inner, ok := svc.(*fakeQEMUService)
+	if !ok {
+		panic("scanFakeClient.QEMU is not a *fakeQEMUService")
+	}
+	passThrough := inner.configFn
+	inner.configFn = func(ctx context.Context, node string, vmid int) (map[string]any, error) {
+		if vmid == 90000 {
+			c.mu.Lock()
+			c.reads++
+			first := c.reads == 1
+			c.mu.Unlock()
+			if !first {
+				return nil, errors.New("Configuration file 'nodes/pve1/qemu-server/90000.conf' does not exist")
+			}
+		}
+		return passThrough(ctx, node, vmid)
+	}
+	return svc
+}
+
+func goneParkerTransferClient() *goneAfterListClient {
+	return &goneAfterListClient{scanFakeClient: twoParkerTransferClient(map[int]map[string]any{
+		700: {"scsi1": "data:vm-700-disk-1,serial=" + transferStableID + ",size=10G"},
+	})}
+}
+
+// TestTransferDiskToParker_AGoneParkerIsSkipped proves a transfer passes over
+// a listed parker whose config is gone when parkers may be retired, and moves
+// the disk into the next parker.
+func TestTransferDiskToParker_AGoneParkerIsSkipped(t *testing.T) {
+	t.Parallel()
+	c := goneParkerTransferClient()
+	cfg := transferTestCfg
+	cfg.RetiresParkers = true
+	pctx := ParkContext{DiskCID: "pvd-test", SourceVMCID: "700", StableID: transferStableID}
+
+	landed, err := TransferDiskToParker(context.Background(), c, nil, "pve1", 700, "data:vm-700-disk-1", cfg, pctx)
+	if err != nil {
+		t.Fatalf("TransferDiskToParker: %v", err)
+	}
+	if !strings.HasPrefix(landed, "data:vm-90001-disk-") {
+		t.Fatalf("landed = %q, want a volume of parker 90001", landed)
+	}
+}
+
+// TestTransferDiskToParker_AGoneParkerFailsWithoutRetirement proves that,
+// with parker retirement off, a listed parker whose config is gone fails the
+// transfer as it always has.
+func TestTransferDiskToParker_AGoneParkerFailsWithoutRetirement(t *testing.T) {
+	t.Parallel()
+	c := goneParkerTransferClient()
+	pctx := ParkContext{DiskCID: "pvd-test", SourceVMCID: "700", StableID: transferStableID}
+
+	landed, err := TransferDiskToParker(context.Background(), c, nil, "pve1", 700, "data:vm-700-disk-1",
+		transferTestCfg, pctx)
+	if err == nil {
+		t.Fatalf("want the gone parker to fail the transfer; landed %q", landed)
+	}
+	if !errors.Is(err, ErrParkerGone) || isParkerSkipError(err, transferTestCfg) {
+		t.Fatalf("without retirement a gone parker must fail the transfer, not be skipped: %v", err)
+	}
+	if c.reads < 2 {
+		t.Fatalf("the transfer must have read the listed parker; reads %d", c.reads)
+	}
+}
+
+// TestParkerGoneMark proves only a missing config marks a parker gone, and
+// that the mark keeps the error's text and type.
+func TestParkerGoneMark(t *testing.T) {
+	t.Parallel()
+	missing := errors.New("Configuration file 'nodes/pve1/qemu-server/90000.conf' does not exist")
+	wrapped := cpierrors.Wrap(missing, "read parker")
+	marked := markParkerGone(wrapped, missing)
+	if !errors.Is(marked, ErrParkerGone) || marked.Error() != wrapped.Error() {
+		t.Fatalf("a missing config must mark the parker gone and keep the text; got %v", marked)
+	}
+	if !isParkerSkipError(marked, ParkerConfig{RetiresParkers: true}) || isParkerSkipError(marked, ParkerConfig{}) {
+		t.Fatal("a gone parker is skipped only when parkers may be retired")
+	}
+	other := errors.New("500 pmxcfs timeout")
+	if errors.Is(markParkerGone(other, other), ErrParkerGone) {
+		t.Fatal("a server error must not mark the parker gone")
+	}
+	if markParkerGone(nil, missing) != nil {
+		t.Fatal("a nil error stays nil")
 	}
 }

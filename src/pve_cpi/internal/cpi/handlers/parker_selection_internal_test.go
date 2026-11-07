@@ -2,9 +2,10 @@ package handlers
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
+
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
@@ -25,7 +26,7 @@ func admit(t *testing.T, r *phRig, volid string) (bool, error) {
 }
 
 func TestAdmitDiskIntoParker_UnregisteredTakesEveryDisk(t *testing.T) {
-	r := newPHRig(config.HAModeOff, map[int]map[string]any{90000: phParker("ab:vm-90000-disk-0")})
+	r := newPHRig(config.HAModeAuto, map[int]map[string]any{90000: phParker("ab:vm-90000-disk-0")})
 	for _, volid := range []string{"ac:vm-700-disk-1", "local-lvm:vm-700-disk-1", "gone:vm-700-disk-1"} {
 		ok, err := admit(t, r, volid)
 		if err != nil || !ok {
@@ -35,9 +36,7 @@ func TestAdmitDiskIntoParker_UnregisteredTakesEveryDisk(t *testing.T) {
 }
 
 func TestAdmitDiskIntoParker_StrictPinKeepsTheReach(t *testing.T) {
-	// Off mode on purpose: a parker registered while HA was on keeps its
-	// resource, and the rule reads it in every mode.
-	r := registeredParkerRig(config.HAModeOff, "ab:vm-90000-disk-0")
+	r := registeredParkerRig(config.HAModeAuto, "ab:vm-90000-disk-0")
 	r.cluster.setPin(true, "pve01,pve02", ourMarker()+" bosh-vols=ab")
 	for volid, want := range map[string]bool{
 		"ab:vm-700-disk-1":        true,
@@ -97,19 +96,22 @@ func TestAdmitDiskIntoParker_StorageTopologyLocal(t *testing.T) {
 	}
 }
 
-func TestAdmitDiskIntoParker_UnknownAnswersAreRetriable(t *testing.T) {
-	cases := map[string]func(*phRig){
-		"HA resource read": func(r *phRig) { r.cluster.getErr = errors.New("500 pve02 unreachable") },
-		"HA rules read":    func(r *phRig) { r.cluster.rulesErr = errors.New("500 rules unavailable") },
-		"parker config":    func(r *phRig) { r.client.configErr[90000] = errors.New("500 pmxcfs timeout") },
+// phForbidden is PVE's answer to a read the token lacks Sys.Audit on / for.
+func phForbidden() error {
+	return &sdkerrors.APIError{HTTPCode: 403, Message: "Permission check failed (/, Sys.Audit)"}
+}
+
+func TestAdmitDiskIntoParker_FailedReadsAreClassifiedByCause(t *testing.T) {
+	retriable := map[string]func(*phRig){
+		"HA resource read": func(r *phRig) { r.cluster.getErr = crh500("pve02 unreachable") },
+		"HA rules read":    func(r *phRig) { r.cluster.rulesErr = crh500("rules unavailable") },
+		"parker config":    func(r *phRig) { r.client.configErr[90000] = crh500("pmxcfs timeout") },
 		"HA profile": func(r *phRig) {
-			r.deps.HAProfile = func(context.Context) (*ha.Profile, error) { return nil, errors.New("boom") }
+			r.deps.HAProfile = func(context.Context) (*ha.Profile, error) { return nil, crh500("boom") }
 		},
-		"storage reads": func(r *phRig) { r.profile.StoragesErr = "500 storage.cfg unreadable" },
-		"no node":       func(r *phRig) { r.profile.Nodes = nil },
 	}
-	for name, mutate := range cases {
-		t.Run(name, func(t *testing.T) {
+	for name, mutate := range retriable {
+		t.Run(name+" 5xx is retriable", func(t *testing.T) {
 			r := registeredParkerRig(config.HAModeAuto, "nfs:vm-90000-disk-0")
 			mutate(r)
 			ok, err := admit(t, r, "nfs:vm-700-disk-1")
@@ -118,19 +120,113 @@ func TestAdmitDiskIntoParker_UnknownAnswersAreRetriable(t *testing.T) {
 			}
 		})
 	}
-	t.Run("a storage the profile does not list", func(t *testing.T) {
-		r := registeredParkerRig(config.HAModeAuto, "nfs:vm-90000-disk-0")
-		ok, err := admit(t, r, "gone:vm-700-disk-1")
-		if ok || err == nil || !okToRetryCPIError(err) || !strings.Contains(err.Error(), "gone") {
-			t.Fatalf("want a retriable error naming the storage; ok %v err %v", ok, err)
+	permanent := map[string]func(*phRig){
+		"HA resource read": func(r *phRig) {
+			r.cluster.getErr = &sdkerrors.APIError{HTTPCode: 400, Message: "invalid sid"}
+		},
+		"HA rules read": func(r *phRig) {
+			r.cluster.rulesErr = &sdkerrors.APIError{HTTPCode: 400, Message: "invalid parameter"}
+		},
+	}
+	for name, mutate := range permanent {
+		t.Run(name+" 4xx is permanent", func(t *testing.T) {
+			r := registeredParkerRig(config.HAModeAuto, "nfs:vm-90000-disk-0")
+			mutate(r)
+			ok, err := admit(t, r, "nfs:vm-700-disk-1")
+			if ok || err == nil || okToRetryCPIError(err) {
+				t.Fatalf("a refusal of the request cannot pass on a retry; ok %v err %v", ok, err)
+			}
+		})
+	}
+}
+
+func TestAdmitDiskIntoParker_FactsItCannotProveRefuseTheParker(t *testing.T) {
+	cases := map[string]struct {
+		mutate func(*phRig)
+		volid  string
+	}{
+		"storage reads": {mutate: func(r *phRig) { r.profile.StoragesErr = "500 storage.cfg unreadable" },
+			volid: "nfs:vm-700-disk-1"},
+		"no node":                             {mutate: func(r *phRig) { r.profile.Nodes = nil }, volid: "nfs:vm-700-disk-1"},
+		"a storage the profile does not list": {volid: "gone:vm-700-disk-1"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := registeredParkerRig(config.HAModeAuto, "nfs:vm-90000-disk-0")
+			if tc.mutate != nil {
+				tc.mutate(r)
+			}
+			ok, err := admit(t, r, tc.volid)
+			if ok || err != nil {
+				t.Fatalf("an unprovable fact refuses this parker, so the park moves on; ok %v err %v", ok, err)
+			}
+		})
+	}
+}
+
+func TestAdmitDiskIntoParker_PermissionDenied(t *testing.T) {
+	reads := map[string]func(*phRig){
+		"HA resource read": func(r *phRig) { r.cluster.getErr = phForbidden() },
+		"HA rules read":    func(r *phRig) { r.cluster.rulesErr = phForbidden() },
+	}
+	for name, mutate := range reads {
+		t.Run(name+" in auto mode parks as before", func(t *testing.T) {
+			r := registeredParkerRig(config.HAModeAuto, "nfs:vm-90000-disk-0")
+			r.cluster.setPin(true, "pve01", ourMarker())
+			mutate(r)
+			ok, err := admit(t, r, "ab:vm-700-disk-1")
+			if !ok || err != nil {
+				t.Fatalf("auto mode without the grant parks as if HA managed no parker; ok %v err %v", ok, err)
+			}
+		})
+		t.Run(name+" in managed mode fails and names the grant", func(t *testing.T) {
+			r := registeredParkerRig(config.HAModeManaged, "nfs:vm-90000-disk-0")
+			mutate(r)
+			ok, err := admit(t, r, "nfs:vm-700-disk-1")
+			if ok || err == nil || okToRetryCPIError(err) || !strings.Contains(err.Error(), parkerHAReadPrivilege) {
+				t.Fatalf("want a non-retriable error naming %s; ok %v err %v", parkerHAReadPrivilege, ok, err)
+			}
+		})
+	}
+}
+
+func TestParkerAdmitFor_OffModeReadsNoHAState(t *testing.T) {
+	r := registeredParkerRig(config.HAModeOff, "ab:vm-90000-disk-0")
+	r.cluster.setPin(true, "pve01", ourMarker())
+	r.cluster.getErr = phForbidden()
+	if parkerAdmitFor(r.deps) != nil {
+		t.Fatal("off mode must carry no parker selection rule")
+	}
+	ok, err := admit(t, r, "local-lvm:vm-700-disk-1")
+	if !ok || err != nil || r.cluster.getCalls != 0 {
+		t.Fatalf("off mode admits every disk without an HA read; ok %v err %v reads %d", ok, err, r.cluster.getCalls)
+	}
+}
+
+func TestParkerAdmitFor_SharesOneProfilePerRule(t *testing.T) {
+	r := registeredParkerRig(config.HAModeAuto, "nfs:vm-90000-disk-0")
+	resolved := 0
+	profile := r.profile
+	r.deps.HAProfile = func(context.Context) (*ha.Profile, error) { resolved++; return profile, nil }
+	rule := parkerAdmitFor(r.deps)
+	for range 3 {
+		if ok, err := rule(context.Background(), phNode, 90000, "nfs:vm-700-disk-1"); err != nil || !ok {
+			t.Fatalf("ok %v err %v", ok, err)
 		}
-	})
+	}
+	if resolved != 1 {
+		t.Fatalf("one park resolves the HA profile once; resolved %d times", resolved)
+	}
 }
 
 func TestParkerWriteConfigFor_CarriesTheSelectionRule(t *testing.T) {
 	deps := idTestDeps(newIDFakeClient(nil))
-	if parkerWriteConfigFor(deps).Admit == nil {
-		t.Fatal("every park must carry the parker selection rule")
+	if parkerWriteConfigFor(deps).Admit != nil || parkerWriteConfigFor(deps).RetiresParkers {
+		t.Fatal("off mode parks as it did before parkers had HA: no selection rule and no retired parkers")
+	}
+	deps.Config.HA = &config.HAConfig{Mode: haChoiceOf(config.HAModeAuto)}
+	if parkerWriteConfigFor(deps).Admit == nil || !parkerWriteConfigFor(deps).RetiresParkers {
+		t.Fatal("every park in auto mode must carry the parker selection rule and expect retired parkers")
 	}
 	if parkerReadConfigFor(deps).Admit != nil {
 		t.Fatal("a read never parks, so the read config carries no rule")
@@ -152,8 +248,8 @@ func TestVolumeStorageAndNodesOutside(t *testing.T) {
 // detachABAC runs the AB then AC case on the detach path. Parker 90000 holds
 // a disk on storage ab, and, when registered is true, PVE HA manages it with
 // a strict pin on pve1 and pve2. Parker 90001 is empty. The detach parks a
-// disk on storage ac, which pve2 cannot reach.
-func detachABAC(t *testing.T, registered bool) (*idFakeClient, *phCluster) {
+// disk on storage ac, which pve2 cannot reach. mode is pve.ha.mode.
+func detachABAC(t *testing.T, registered bool, mode string) (*idFakeClient, *phCluster) {
 	t.Helper()
 	const birth = "ac:vm-9001-disk-0"
 	const attachedVolid = "ac:vm-700-disk-1"
@@ -170,6 +266,7 @@ func detachABAC(t *testing.T, registered bool) (*idFakeClient, *phCluster) {
 	c.ha = hac
 	deps := idTestDeps(c)
 	deps.Config.DiskStorage = "ac"
+	deps.Config.HA = &config.HAConfig{Mode: haChoiceOf(mode)}
 	deps.RequestDirectorUUID = aaDirector
 	profile := &ha.Profile{
 		Effective: ha.EffectiveFull,
@@ -217,7 +314,7 @@ func TestHandleDetachStableID_KeepsARegisteredParkersReach(t *testing.T) {
 	t.Parallel()
 	t.Run("registered", func(t *testing.T) {
 		t.Parallel()
-		c, hac := detachABAC(t, true)
+		c, hac := detachABAC(t, true, config.HAModeAuto)
 		if !holdsStorage(c.configs[90001], "ac") || holdsStorage(c.configs[90000], "ac") {
 			t.Fatalf("the ac disk must land in parker 90001; 90001 %v, 90000 %v", c.configs[90001], c.configs[90000])
 		}
@@ -226,9 +323,20 @@ func TestHandleDetachStableID_KeepsARegisteredParkersReach(t *testing.T) {
 			t.Fatalf("the pin must stay as it was; pin %+v events %v", pin, hac.log.events)
 		}
 	})
+	t.Run("off mode parks as before", func(t *testing.T) {
+		t.Parallel()
+		c, hac := detachABAC(t, true, config.HAModeOff)
+		if !holdsStorage(c.configs[90000], "ac") || !holdsStorage(c.configs[90000], "ab") {
+			t.Fatalf("off mode reads no HA state, so the ac disk lands in the first parker; 90000 %v",
+				c.configs[90000])
+		}
+		if hac.getCalls != 0 || len(hac.log.events) != 0 {
+			t.Fatalf("off mode must make no HA read or write; reads %d events %v", hac.getCalls, hac.log.events)
+		}
+	})
 	t.Run("unregistered control", func(t *testing.T) {
 		t.Parallel()
-		c, _ := detachABAC(t, false)
+		c, _ := detachABAC(t, false, config.HAModeAuto)
 		if !holdsStorage(c.configs[90000], "ac") {
 			t.Fatalf("without a registration the ac disk lands in the first parker; 90000 %v", c.configs[90000])
 		}

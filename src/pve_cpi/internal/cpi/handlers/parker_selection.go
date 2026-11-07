@@ -37,42 +37,71 @@ import (
 // the node, or create one, and a parker the loop creates is unregistered, so
 // it takes the disk.
 //
-// The rule reads PVE HA in every mode, mode off included, because a parker
-// registered while HA was on keeps its HA resource after the mode changes,
-// and reading the resource makes the park safer, never riskier. A read that
-// fails leaves the answer unknown, so the park fails with a retriable error
-// and writes nothing.
+// The rule runs only when pve.ha.mode is auto or managed. In off mode it
+// reads no HA state, and a park behaves as it did before parkers were ever
+// registered. A parker registered while HA was on keeps its HA resource after
+// a change to off, and nothing then keeps a disk out of it.
+//
+// Every answer the rule cannot prove refuses the parker rather than failing
+// the park, because a refusal is always safe: the loop moves on, and the
+// fresh parker it ends at is unregistered. Only an HA read that fails is an
+// error. A refusal by PVE for a missing grant (HTTP 403) never comes right on
+// its own: auto mode then parks as if PVE HA managed no parker, with a
+// warning that names the privilege, and managed mode fails the park with a
+// non-retriable error that names it. Any other failed read is retriable when
+// it may pass, which is a server error or a transport fault, and permanent
+// when it is PVE's verdict about the request.
+
+// parkerHAReadPrivilege is the privilege PVE checks for the HA reads of the
+// parker rules, GET /cluster/ha/resources/{sid} and GET /cluster/ha/rules.
+const parkerHAReadPrivilege = "Sys.Audit on /"
 
 // parkerAdmitFor returns the parker selection rule for deps, which reads PVE
 // HA through the client no managed allocation guard wraps, because the guard
-// admits only the writes a park plans.
+// admits only the writes a park plans. It returns nil in off mode, which
+// leaves every park as it was before the rule existed.
 func parkerAdmitFor(deps Deps) func(ctx context.Context, node string, parkerVMID int, bareVolid string) (bool, error) {
+	if deps.Config == nil || deps.Config.HAModeValue() == config.HAModeOff {
+		return nil
+	}
+	// A park may ask about several parkers; they share one HA profile.
+	deps = withRequestHAProfile(deps)
 	return func(ctx context.Context, node string, parkerVMID int, bareVolid string) (bool, error) {
 		return admitDiskIntoParker(ctx, deps, node, parkerVMID, bareVolid)
 	}
 }
 
 // admitDiskIntoParker answers the parker selection rule for one disk and one
-// parker on node. It answers true for a parker PVE HA does not know. For a
-// registered parker, including one staged as ignored and one another owner
-// registered, it answers true only when the disk is on shared storage whose
-// nodes cover the parker's reach (parkerReach). Every read that fails, and a
-// storage the HA profile does not list, returns a retriable error.
+// parker on node. It answers true for a parker PVE HA does not know, and in
+// off mode for every parker. For a registered parker, including one staged as
+// ignored and one another owner registered, it answers true only when the
+// disk is on shared storage whose nodes cover the parker's reach
+// (parkerReach). A fact it cannot prove, such as a storage the HA profile
+// does not list, refuses the parker. A failed HA read is an error, classified
+// by parkerHAReadFailure.
 func admitDiskIntoParker(ctx context.Context, deps Deps, node string, parkerVMID int, bareVolid string) (bool, error) {
+	if deps.Config == nil || deps.Config.HAModeValue() == config.HAModeOff {
+		return true, nil
+	}
 	client := unguardedPVE(deps.PVE)
 	if client == nil || client.Cluster() == nil {
 		// No HA client means nothing could have registered the parker through
 		// it either.
 		return true, nil
 	}
-	svc := client.Cluster()
+	logger := deps.Log(ctx).With(log.Int("parker_vmid", parkerVMID), log.String("node", node),
+		log.String("volid", bareVolid))
+	refuse := func(reason string, err error) (bool, error) {
+		logger.Info("parker selection: "+reason+", so the disk goes to another parker", log.Err(err))
+		return false, nil
+	}
 	sid := haResourceSid(parkerVMID)
-	res, err := svc.GetHaResources(ctx, sid)
+	res, err := client.Cluster().GetHaResources(ctx, sid)
 	switch {
 	case err != nil && (isHaNotFound(err) || pve.IsNotFound(err)):
 		return true, nil
 	case err != nil:
-		return false, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, fmt.Sprintf(
+		return parkerHAReadFailure(deps, logger, err, fmt.Sprintf(
 			"parker selection: read the HA resource of parker vmid %d before parking %s in it", parkerVMID, bareVolid))
 	case res == nil:
 		return false, cpierrors.Retriable(
@@ -81,45 +110,96 @@ func admitDiskIntoParker(ctx context.Context, deps Deps, node string, parkerVMID
 
 	profile, err := resolveHAProfile(ctx, deps)
 	if err != nil {
-		return false, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+		if pve.IsPermissionDenied(err) {
+			return parkerHAReadFailure(deps, logger, err, fmt.Sprintf(
+				"parker selection: resolve the HA profile to check whether registered parker vmid %d may take %s",
+				parkerVMID, bareVolid))
+		}
+		return false, cpierrors.Wrap(pve.WrapErrorKeepingClass(err), fmt.Sprintf(
 			"parker selection: resolve the HA profile to check whether registered parker vmid %d may take %s",
 			parkerVMID, bareVolid))
 	}
 	index, members, err := parkerStorageIndex(profile, deps.Config)
 	if err != nil {
-		return false, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
-			"parker selection: registered parker vmid %d", parkerVMID))
+		return refuse("the storages or nodes PVE HA may move the registered parker to are unknown", err)
 	}
-	logger := deps.Log(ctx)
-
 	info, err := index.Get(ctx, volumeStorage(bareVolid))
 	if err != nil {
-		return false, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
-			"parker selection: classify the storage of %s for registered parker vmid %d", bareVolid, parkerVMID))
+		return refuse("the disk's storage is not one the HA profile lists", err)
 	}
 	if !info.IsShared() {
-		logger.Info("parker selection: the disk is on node-local storage, so it stays out of the parker that PVE HA "+
-			"manages", log.Int("parker_vmid", parkerVMID), log.String("node", node), log.String("volid", bareVolid))
-		return false, nil
+		return refuse("the disk is on node-local storage, which a parker that PVE HA manages never takes", nil)
 	}
 	diskReach, err := pve.VolumeAccessSet(ctx, index, members, []pve.AccessVolume{{Volume: bareVolid, HomeNode: node}})
 	if err != nil {
-		return false, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
-			"parker selection: find the nodes that reach %s", bareVolid))
+		return refuse("the nodes that reach the disk are unknown", err)
 	}
-	reach, err := parkerReach(ctx, client, index, members, node, parkerVMID)
-	if err != nil {
+	reach, answer, err := parkerReach(ctx, deps, logger, profile, index, members, node, parkerVMID)
+	switch {
+	case err != nil:
 		return false, err
+	case answer == parkerReachUnknown:
+		return refuse("the nodes PVE HA may move the registered parker to are unknown", nil)
+	case answer == parkerReachUnguarded:
+		return true, nil
 	}
 	if missing := nodesOutside(reach, diskReach); len(missing) > 0 {
 		logger.Info("parker selection: the disk's storage does not reach every node PVE HA may move the parker to, "+
-			"so the disk goes to another parker", log.Int("parker_vmid", parkerVMID), log.String("node", node),
-			log.String("volid", bareVolid), log.String("parker_reach", strings.Join(reach, ",")),
+			"so the disk goes to another parker", log.String("parker_reach", strings.Join(reach, ",")),
 			log.String("disk_reach", strings.Join(diskReach, ",")), log.String("missing", strings.Join(missing, ",")))
 		return false, nil
 	}
 	return true, nil
 }
+
+// parkerHAReadFailure answers a failed HA read of the parker selection rule.
+// A refusal for a missing grant never comes right on its own: auto mode
+// admits the disk, as a park did before parkers were registered, and warns
+// with the privilege to grant, and managed mode fails the park with a
+// non-retriable error that names it. Every other failure keeps the class its
+// cause gives it, so a server error or a transport fault is retriable and a
+// verdict about the request is not.
+func parkerHAReadFailure(deps Deps, logger *log.Logger, err error, msg string) (bool, error) {
+	if !pve.IsPermissionDenied(err) {
+		return false, parkerHAReadError(err, msg)
+	}
+	if deps.Config != nil && deps.Config.HAModeValue() == config.HAModeManaged {
+		return false, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf(
+			"%s: PVE refused the read, because the token lacks %s, which pve.ha.mode managed needs to keep a disk "+
+				"out of a parker PVE HA could move to a node without the disk's storage; grant %s and retry",
+			msg, parkerHAReadPrivilege, parkerHAReadPrivilege))
+	}
+	logger.Warn("parker selection: PVE refused an HA read, because the token lacks "+parkerHAReadPrivilege+
+		"; the disk is parked as if PVE HA managed no parker, until the privilege is granted", log.Err(err))
+	return true, nil
+}
+
+// parkerHAReadError wraps a failed HA read with the class its cause gives it:
+// a server error, a pushback, or a transport fault may pass and is retriable,
+// while PVE's verdict about the request, any other 4xx, is not. An error
+// that carries no status and is not a known transport fault is treated as one
+// that may pass, because no verdict was given.
+func parkerHAReadError(err error, msg string) error {
+	if pve.IsRequestVerdict(err) {
+		return cpierrors.Wrap(pve.WrapError(err), msg)
+	}
+	return cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, msg)
+}
+
+// parkerReachAnswer says how far parkerReach got.
+type parkerReachAnswer int
+
+const (
+	// parkerReachKnown: the reach is proven.
+	parkerReachKnown parkerReachAnswer = iota
+	// parkerReachUnknown: a fact the reach needs cannot be proven, such as a
+	// held volume on a storage the profile does not list, or the parker is
+	// gone. The parker is refused.
+	parkerReachUnknown
+	// parkerReachUnguarded: auto mode, and PVE refused the rules read for a
+	// missing grant. The park goes ahead as without HA.
+	parkerReachUnguarded
+)
 
 // parkerReach returns the nodes a disk must reach before it may go into the
 // registered parker: the nodes of every enabled strict node-affinity rule
@@ -127,56 +207,83 @@ func admitDiskIntoParker(ctx context.Context, deps Deps, node string, parkerVMID
 // with the nodes that reach every volume the parker holds now. The second
 // half keeps the parker's access set as it is, even where disks that left it
 // widened it past its pin.
+//
+// Every configured node is the widest reach a pin can give, so a cluster
+// whose profile says PVE does not answer the rules read, and a rules answer
+// that does not parse, count as no strict pin, which is never less strict.
 func parkerReach(
-	ctx context.Context, client pve.Client, index pve.StorageInfoGetter, members []string, node string, parkerVMID int,
-) ([]string, error) {
-	sid := haResourceSid(parkerVMID)
-	resp, err := client.Cluster().ListHaRules(ctx, &cluster.ListHaRulesParams{})
-	if err != nil {
-		return nil, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, fmt.Sprintf(
-			"parker selection: read the HA rules of registered parker vmid %d", parkerVMID))
-	}
-	set, err := ha.ParseRuleList(resp)
-	if err != nil {
-		return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
-			"parker selection: parse the HA rules of registered parker vmid %d", parkerVMID))
-	}
-	reach := map[string]bool{}
+	ctx context.Context, deps Deps, logger *log.Logger, profile *ha.Profile, index pve.StorageInfoGetter,
+	members []string, node string, parkerVMID int,
+) ([]string, parkerReachAnswer, error) {
+	client := unguardedPVE(deps.PVE)
+	set := map[string]bool{}
 	pinned := false
-	for i := range set.Rules {
-		r := &set.Rules[i]
+	if profile.RulesSupported {
+		resp, err := client.Cluster().ListHaRules(ctx, &cluster.ListHaRulesParams{})
+		if err != nil {
+			admit, failErr := parkerHAReadFailure(deps, logger, err, fmt.Sprintf(
+				"parker selection: read the HA rules of registered parker vmid %d", parkerVMID))
+			if failErr != nil || !admit {
+				return nil, parkerReachUnknown, failErr
+			}
+			return nil, parkerReachUnguarded, nil
+		}
+		pinned = addStrictPinNodes(set, resp, haResourceSid(parkerVMID), logger)
+	}
+	if !pinned {
+		for _, n := range members {
+			set[n] = true
+		}
+	}
+	views, err := pve.ReadQemuViews(ctx, client, node, parkerVMID)
+	if err != nil {
+		if pve.IsNotFound(err) || pve.IsPmxcfsConfigMissing(err) {
+			// The parker is gone, so it takes nothing, and the loop moves on.
+			return nil, parkerReachUnknown, nil
+		}
+		return nil, parkerReachUnknown, cpierrors.Wrap(pve.WrapConfigReadError(err), fmt.Sprintf(
+			"parker selection: read the config of registered parker vmid %d on node %s", parkerVMID, node))
+	}
+	held, err := pve.VolumeAccessSet(ctx, index, members, parkerAccessVolumes(views, node))
+	if err != nil {
+		logger.Info("parker selection: the nodes that reach the registered parker's volumes are unknown",
+			log.Err(err))
+		return nil, parkerReachUnknown, nil
+	}
+	for _, n := range held {
+		set[n] = true
+	}
+	out := make([]string, 0, len(set))
+	for n := range set {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out, parkerReachKnown, nil
+}
+
+// addStrictPinNodes adds to set the nodes of every enabled strict
+// node-affinity rule in resp that names sid, and reports whether any did. A
+// rules answer that does not parse adds nothing, so the caller counts every
+// configured node.
+func addStrictPinNodes(set map[string]bool, resp *cluster.ListHaRulesResponse, sid string, logger *log.Logger) bool {
+	rules, err := ha.ParseRuleList(resp)
+	if err != nil {
+		logger.Info("parker selection: the HA rules did not parse, so the registered parker's reach counts every "+
+			"configured node", log.Err(err))
+		return false
+	}
+	pinned := false
+	for i := range rules.Rules {
+		r := &rules.Rules[i]
 		if r.Type != ha.RuleTypeNodeAffinity || r.Disabled || !r.Strict || !r.HasResource(sid) {
 			continue
 		}
 		pinned = true
 		for _, n := range r.NodeNames() {
-			reach[n] = true
+			set[n] = true
 		}
 	}
-	if !pinned {
-		for _, n := range members {
-			reach[n] = true
-		}
-	}
-	views, err := pve.ReadQemuViews(ctx, client, node, parkerVMID)
-	if err != nil {
-		return nil, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, fmt.Sprintf(
-			"parker selection: read the config of registered parker vmid %d on node %s", parkerVMID, node))
-	}
-	held, err := pve.VolumeAccessSet(ctx, index, members, parkerAccessVolumes(views, node))
-	if err != nil {
-		return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
-			"parker selection: find the nodes that reach the volumes of registered parker vmid %d", parkerVMID))
-	}
-	for _, n := range held {
-		reach[n] = true
-	}
-	out := make([]string, 0, len(reach))
-	for n := range reach {
-		out = append(out, n)
-	}
-	sort.Strings(out)
-	return out, nil
+	return pinned
 }
 
 // parkerAccessVolumes lists every volume a parker holds or is receiving: the

@@ -151,9 +151,20 @@ type ParkerConfig struct {
 	// strict refuses with a Cloud error naming the vanished parker and the
 	// recovery, instead of silently treating the volume as free-floating.
 	// The CPI destroys a parker only after its last disk left it, so a parker
-	// that vanishes while it still holds a disk means an out-of-band deletion. Gated on ParkedEnabled: under "free"
-	// or a stood-down default the permissive behavior stands regardless.
+	// that vanishes while it still holds a disk means an out-of-band deletion.
+	// Gated on ParkedEnabled: under "free" or a stood-down default the
+	// permissive behavior stands regardless.
 	AnchorStrict bool
+	// RetiresParkers reports whether the CPI destroys an emptied parker that
+	// PVE HA manages, which it does when pve.ha.mode is auto or managed. A
+	// parker can then vanish in a benign race: its last disk left and the
+	// parker was retired between a listing that named it and the read that
+	// followed. With it set, a holder scan whose holder vanished scans once
+	// more, and the park and transfer loops move on from a parker whose config
+	// was gone at their first read of it, before they wrote anything. Unset,
+	// the holder scan and the loops answer a vanished parker as they did
+	// before parkers were ever retired.
+	RetiresParkers bool
 	// EmptyListingCorroborators supplies the second opinions the keep rule
 	// hands to ProveVolumeAbsent when it weighs whether a transfer record's
 	// volume is gone. It's the same supplier the local backend's sweep gets
@@ -554,7 +565,9 @@ func parkerProvenanceRoom(
 ) error {
 	vmCfg, err := c.QEMU().Config(ctx, node, parkerVMID)
 	if err != nil {
-		return cpierrors.Wrap(WrapConfigReadError(err), "parker provenance: capacity probe")
+		// The probe is the park's first read of the parker, so a config that
+		// is gone here was never written to.
+		return markParkerGone(cpierrors.Wrap(WrapConfigReadError(err), "parker provenance: capacity probe"), err)
 	}
 	// The landed slot is unknown before the attach. Probe with the widest slot
 	// name a parker can hand out so the estimate is never optimistic.
@@ -1746,7 +1759,7 @@ func resolveDiskHolderScan(
 			// and a scan that finds it nowhere, or on a vanished holder again,
 			// gets the answer the strict invariant gives.
 			gone := vanishedParker{vmid: holderVMID, node: holderNode}
-			if vanished == nil {
+			if vanished == nil && cfg.RetiresParkers {
 				if logger != nil {
 					logger.Info("the parker the holder scan named is gone; scanning once more for the disk's holder",
 						log.Int("vmid", holderVMID), log.String("node", holderNode), log.String("volid", bareVolid))
@@ -2061,28 +2074,37 @@ func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bar
 		return cpierrors.Wrap(listErr, "ParkDisk: list parkers")
 	}
 
-	// No parker exists yet → create the first one and try it like any other.
-	// EnsureParker may adopt a parker that already exists, and the selection
-	// rule may refuse that one, which falls through to a fresh parker below.
+	// No parker exists yet → create the first one and attach there.
+	// EnsureParker may adopt a parker that already exists. A refusal by the
+	// selection rule, or that parker's retirement, falls through to a fresh
+	// parker below, and every other failure, a full parker included, fails
+	// the park as it always has.
 	if len(parkers) == 0 {
 		parkerVMID, ensureErr := EnsureParker(ctx, c, logger, node, cfg)
 		if ensureErr != nil {
 			return cpierrors.Wrap(ensureErr, "ParkDisk: ensure parker")
 		}
-		parkers = []int{parkerVMID}
+		attachErr := attachAndSecure(ctx, c, logger, node, parkerVMID, bareVolid, cfg, pctx)
+		if attachErr == nil {
+			return nil
+		}
+		if !isParkerHASkipError(attachErr, cfg) {
+			return cpierrors.Wrap(attachErr, "ParkDisk: attach to parker")
+		}
 	}
 
 	// Try existing parkers in ascending VMID order. Attach to the first one
 	// with a free slot that the selection rule admits. ErrNoSlots on a parker
-	// means it is full, and ErrParkerNotAdmitted means the disk's storage does
-	// not cover where HA may move it — either way, move to the next. Any other
-	// error is a real failure and propagates.
+	// means it is full, ErrParkerNotAdmitted means the disk's storage does
+	// not cover where HA may move it, and ErrParkerGone means it was retired
+	// after the listing — in each case, move to the next. Any other error is a
+	// real failure and propagates.
 	for _, parkerVMID := range parkers {
 		attachErr := attachAndSecure(ctx, c, logger, node, parkerVMID, bareVolid, cfg, pctx)
 		if attachErr == nil {
 			return nil
 		}
-		if isParkerSkipError(attachErr) {
+		if isParkerSkipError(attachErr, cfg) {
 			continue
 		}
 		return cpierrors.Wrap(attachErr, "ParkDisk: attach to parker")
@@ -2106,7 +2128,7 @@ func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bar
 		if attachErr == nil {
 			return nil
 		}
-		if !isParkerSkipError(attachErr) {
+		if !isParkerSkipError(attachErr, cfg) {
 			return cpierrors.Wrap(attachErr, "ParkDisk: attach to fresh parker")
 		}
 		if logger != nil {
@@ -2161,10 +2183,45 @@ func isParkerCapacityError(err error) bool {
 // and try the next one.
 var ErrParkerNotAdmitted = errors.New("the parker selection rule refuses this parker for the disk")
 
+// ErrParkerGone means a parker's config was gone at the first read a park or
+// a transfer made of it, before either wrote anything to the parker. Under
+// ParkerConfig.RetiresParkers that is the benign race of a parker retired
+// after the listing that named it, and the selection loops move on to the
+// next parker.
+var ErrParkerGone = errors.New("the parker's config is gone")
+
+// parkerGoneMark marks a config read error that proved the parker gone before
+// anything was written to it. Its text and its class are those of the error
+// it marks, so a caller that does not skip a gone parker reports the failure
+// as it always has.
+type parkerGoneMark struct{ err error }
+
+func (e *parkerGoneMark) Error() string        { return e.err.Error() }
+func (e *parkerGoneMark) Unwrap() error        { return e.err }
+func (e *parkerGoneMark) Is(target error) bool { return target == ErrParkerGone }
+
+// markParkerGone marks err with ErrParkerGone when raw, the read's own error,
+// says the parker's config does not exist. Every other error is returned as
+// it is.
+func markParkerGone(err, raw error) error {
+	if err == nil || !parkerConfigGone(raw) {
+		return err
+	}
+	return &parkerGoneMark{err: err}
+}
+
 // isParkerSkipError reports whether the park loops should move on from this
-// parker to the next one: it is full, or the selection rule refused it.
-func isParkerSkipError(err error) bool {
-	return isParkerCapacityError(err) || errors.Is(err, ErrParkerNotAdmitted)
+// parker to the next one: it is full, the selection rule refused it, or it
+// was retired after the listing (isParkerHASkipError).
+func isParkerSkipError(err error, cfg ParkerConfig) bool {
+	return isParkerCapacityError(err) || isParkerHASkipError(err, cfg)
+}
+
+// isParkerHASkipError reports whether err skips this parker for a reason only
+// parker HA gives: the selection rule refused it, or, when the CPI retires
+// parkers, its config was gone before anything was written to it.
+func isParkerHASkipError(err error, cfg ParkerConfig) bool {
+	return errors.Is(err, ErrParkerNotAdmitted) || (cfg.RetiresParkers && errors.Is(err, ErrParkerGone))
 }
 
 // admitIntoParker applies the parker selection rule of cfg to one parker. It
@@ -2326,8 +2383,14 @@ func attachToParkerLocked(ctx context.Context, c Client, logger *log.Logger, nod
 			// VM.Audit/VM.Config.Disk grant never comes right on its own, and
 			// labelling it retriable makes the Director drive a park forever
 			// against a permission that has to be granted by hand.
-			return "", cpierrors.Wrap(WrapConfigReadError(cfgErr),
+			wrapped := cpierrors.Wrap(WrapConfigReadError(cfgErr),
 				fmt.Sprintf("attachToParker: config fetch for parker vmid %d", parkerVMID))
+			if attempt > 0 {
+				return "", wrapped
+			}
+			// Nothing was attached before the first read, so a config that is
+			// gone there is a parker the loop may move on from.
+			return "", markParkerGone(wrapped, cfgErr)
 		}
 
 		// A slot that another disk's unfinished transfer record names is where

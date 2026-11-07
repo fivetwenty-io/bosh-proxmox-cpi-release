@@ -46,8 +46,25 @@ import (
 // HA state, change nothing here.
 
 // parkerHAReconcileTimeout bounds the HA pass of one parker pool sweep, so a
-// slow cluster never holds up the request whose park has already landed.
+// slow cluster never holds up the request whose park has already landed. A
+// retirement runs under a budget of its own (parkerRetireBudget).
 const parkerHAReconcileTimeout = 2 * time.Minute
+
+// parkerRetireStopMargin is the time a retirement keeps for the HA stop of its
+// teardown, on top of the destroy reserve the stop leaves. A parker the
+// retirement takes is stopped and requests stopped, so the stop writes
+// nothing and only reads the CRM's view until it shows stopped.
+const parkerRetireStopMargin = time.Minute
+
+// parkerRetireBudget is the deadline one retirement runs under: the destroy
+// reserve that the teardown's HA stop leaves free (haDeleteDestroyReserve),
+// plus the stop's own margin. It is longer than the pass's budget, which is
+// why the retirement does not run under the pass's deadline.
+func parkerRetireBudget() time.Duration { return haDeleteDestroyReserve() + parkerRetireStopMargin }
+
+// parkerRetireRestoreTimeout bounds the write that sets a parker's
+// protection again after a retirement failed past clearing it.
+const parkerRetireRestoreTimeout = 30 * time.Second
 
 // parkerHAStateIgnored and parkerHAStateStopped are the requested states a
 // parker's HA resource passes through.
@@ -64,6 +81,14 @@ const parkerRetireCaller = "parker retirement"
 // of this Director on node, as the package comment above describes. It never
 // returns an error, because the park it follows has already landed; every
 // failure is logged and left to the next sweep.
+//
+// The pass keeps its reads few. A parker that needs nothing costs one read of
+// its HA resource and one of its config, and the HA profile is resolved only
+// when some parker needs more, at most once per pass. An unregistered parker
+// with a disk on storage that is not shared can never register, so it costs
+// nothing more, and any other refusal of an unregistered parker is decided
+// before a claim is taken, because it writes nothing. At most one parker is
+// retired per pass, and the others wait for the next sweep.
 func reconcileParkerHA(ctx context.Context, deps Deps, node string, cfg pve.ParkerConfig) {
 	if deps.Config == nil || deps.Config.HAModeValue() == config.HAModeOff {
 		return
@@ -78,15 +103,15 @@ func reconcileParkerHA(ctx context.Context, deps Deps, node string, cfg pve.Park
 	if client == nil || client.Cluster() == nil {
 		return
 	}
-	udeps := deps
+	udeps := withRequestHAProfile(deps)
 	udeps.PVE = client
 
-	rctx, cancel := context.WithTimeout(ctx, parkerHAReconcileTimeout)
-	defer cancel()
 	// The pass takes claims of its own, one parker at a time. A claim set
 	// the park carried would let withVMIDClaim reuse a claim the park holds,
 	// so the pass drops it.
-	rctx = context.WithValue(rctx, vmidClaimSetKey{}, (*vmidClaimSet)(nil))
+	base := context.WithValue(ctx, vmidClaimSetKey{}, (*vmidClaimSet)(nil))
+	rctx, cancel := context.WithTimeout(base, parkerHAReconcileTimeout)
+	defer cancel()
 
 	parkers, err := pve.ListParkersForNode(rctx, client, node, cfg)
 	if err != nil {
@@ -97,21 +122,11 @@ func reconcileParkerHA(ctx context.Context, deps Deps, node string, cfg pve.Park
 	if len(parkers) == 0 {
 		return
 	}
-	profile, err := resolveHAProfile(rctx, udeps)
-	if err != nil {
-		logger.Info("parker HA: the HA profile could not be resolved; the parkers stay as they are until the next "+
-			"sweep", log.String("node", node), log.Err(err))
-		return
-	}
-	if !profile.WritesAllowed() {
-		logger.Debug("parker HA: the CPI may not write HA state on this cluster, so the parkers stay as they are",
-			log.String("node", node), log.String("reason", profile.Reason))
-		return
-	}
 	r := &parkerHA{
-		deps: udeps, logger: logger, node: node, cfg: cfg, profile: profile,
+		deps: udeps, logger: logger, node: node, cfg: cfg,
 		owner:   deps.RequestDirectorUUID,
 		managed: deps.Config.HAModeValue() == config.HAModeManaged,
+		base:    base,
 	}
 	for _, vmid := range parkers {
 		if rctx.Err() != nil {
@@ -119,7 +134,11 @@ func reconcileParkerHA(ctx context.Context, deps Deps, node string, cfg pve.Park
 				"sweep", log.String("node", node))
 			return
 		}
-		if err := r.reconcile(rctx, vmid); err != nil {
+		err := r.reconcile(rctx, vmid)
+		if r.halted {
+			return
+		}
+		if err != nil {
 			logger.Info("parker HA: the parker's HA registration did not change; the next sweep tries again",
 				log.Int("parker_vmid", vmid), log.String("node", node), log.Err(err))
 		}
@@ -136,6 +155,16 @@ type parkerHA struct {
 	profile *ha.Profile
 	owner   string
 	managed bool
+	// base is the request's context without the pass's deadline, which a
+	// retirement takes its own deadline from. Nil makes a retirement run on
+	// the context reconcile is given.
+	base context.Context //nolint:containedctx // The pass hands the request's context to each retirement it starts.
+	// retired is set once the pass has started a retirement.
+	retired bool
+	// halted is set when the pass stops early, because the HA profile could
+	// not be resolved, the CPI may not write HA state, or PVE refused an HA
+	// read for a missing grant. The remaining parkers wait for the next sweep.
+	halted bool
 }
 
 // parkerHAAction is what one parker needs from the pass.
@@ -157,16 +186,34 @@ type parkerSnapshot struct {
 
 // reconcile brings one parker's HA registration in line with what it holds.
 // It decides from reads that take no lock first, so a parker that needs
-// nothing costs no claim, and it reads again under the parker's claim before
-// it changes anything.
+// nothing, and an unregistered parker the decision refuses, costs no claim,
+// and it reads again under the parker's claim before it changes anything.
 func (r *parkerHA) reconcile(ctx context.Context, vmid int) error {
 	snap, err := r.read(ctx, vmid)
 	if err != nil {
 		return err
 	}
-	if r.action(vmid, snap) == parkerHANothing {
+	action := r.action(vmid, snap)
+	if action == parkerHANothing || !r.loadProfile(ctx) {
 		return nil
 	}
+	switch action {
+	case parkerHARetire:
+		return r.retireWithBudget(vmid)
+	case parkerHARegister:
+		registers, err := r.wouldRegister(ctx, vmid, snap.views)
+		if err != nil || !registers {
+			return err
+		}
+	}
+	return r.claimed(ctx, vmid, false)
+}
+
+// claimed runs the parker's change under its VMID claim, from a fresh read.
+// A parker whose action turned into a retirement since the unlocked read is
+// retired only when retire is set, which is when ctx carries a retirement's
+// budget; otherwise the next sweep retires it.
+func (r *parkerHA) claimed(ctx context.Context, vmid int, retire bool) error {
 	claimErr := withVMIDClaim(ctx, r.deps, vmid, "parker-ha/"+strconv.Itoa(vmid), claimForSweep, r.logger,
 		func(claimCtx context.Context) error {
 			snap, err := r.read(claimCtx, vmid)
@@ -177,7 +224,12 @@ func (r *parkerHA) reconcile(ctx context.Context, vmid int) error {
 			case parkerHARegister, parkerHAFinishStaging:
 				return r.register(claimCtx, vmid, snap)
 			case parkerHARetire:
-				return r.retire(claimCtx, vmid)
+				if !retire {
+					r.logger.Debug("parker HA: the parker emptied since the pass read it; the next sweep retires it",
+						log.Int("parker_vmid", vmid), log.String("node", r.node))
+					return nil
+				}
+				return r.retire(claimCtx, vmid, snap)
 			default:
 				return nil
 			}
@@ -190,10 +242,111 @@ func (r *parkerHA) reconcile(ctx context.Context, vmid int) error {
 	return claimErr
 }
 
+// loadProfile resolves the HA profile once per pass and reports whether the
+// pass may go on. A profile that cannot be resolved, or that does not let the
+// CPI write HA state, halts the pass.
+func (r *parkerHA) loadProfile(ctx context.Context) bool {
+	if r.halted {
+		return false
+	}
+	if r.profile == nil {
+		profile, err := resolveHAProfile(ctx, r.deps)
+		if err != nil {
+			r.halt("parker HA: the HA profile could not be resolved; the parkers stay as they are until the next sweep",
+				log.Err(err))
+			return false
+		}
+		r.profile = profile
+	}
+	if !r.profile.WritesAllowed() {
+		r.halted = true
+		r.logger.Debug("parker HA: the CPI may not write HA state on this cluster, so the parkers stay as they are",
+			log.String("node", r.node), log.String("reason", r.profile.Reason))
+		return false
+	}
+	return true
+}
+
+// halt stops the pass and logs why.
+func (r *parkerHA) halt(msg string, fields ...log.Field) {
+	r.halted = true
+	r.logger.Info(msg, append([]log.Field{log.String("node", r.node)}, fields...)...)
+}
+
+// retireWithBudget retires one empty parker under its own deadline, taken
+// from the request's context rather than the pass's, whose budget is shorter
+// than the teardown's destroy reserve. A request with less time left than a
+// retirement needs leaves the parker for a later sweep, as does a pass that
+// already started a retirement. Neither counts as a failure.
+func (r *parkerHA) retireWithBudget(vmid int) error {
+	logger := r.logger.With(log.Int("parker_vmid", vmid), log.String("node", r.node))
+	if r.retired {
+		logger.Info("parker HA: this sweep already retired a parker, so the next sweep retires this empty one")
+		return nil
+	}
+	base := r.base
+	if base == nil {
+		base = context.Background()
+	}
+	budget := parkerRetireBudget()
+	if dl, ok := base.Deadline(); ok && time.Until(dl) < budget {
+		logger.Info("parker HA: the request has too little time left to retire the empty parker, so a later sweep "+
+			"retires it", log.String("needs", budget.String()),
+			log.String("left", time.Until(dl).Round(time.Second).String()))
+		return nil
+	}
+	rctx, cancel := context.WithTimeout(base, budget)
+	defer cancel()
+	r.retired = true
+	return r.claimed(rctx, vmid, true)
+}
+
+// wouldRegister decides, from reads that take no lock, whether an
+// unregistered parker registers. A refusal of an unregistered parker writes
+// nothing, so deciding it here spares the claim. A parker that holds a disk
+// on storage that is not shared can never register, and it costs no read
+// beyond the ones the pass has made.
+func (r *parkerHA) wouldRegister(ctx context.Context, vmid int, views pve.QemuViews) (bool, error) {
+	if !r.sharedEligible(ctx, views) {
+		r.logger.Debug("parker HA: the parker holds a disk on storage that is not shared, so it stays unregistered",
+			log.Int("parker_vmid", vmid), log.String("node", r.node))
+		return false, nil
+	}
+	d, _, err := r.decide(ctx, vmid, views)
+	if err != nil {
+		return false, err
+	}
+	if !d.Registers() || d.Policy != ha.PolicyShared {
+		return false, r.refuse(ctx, vmid, d, false)
+	}
+	return true, nil
+}
+
+// sharedEligible reports whether every volume the config views and the
+// provenance records name is on storage the HA profile lists as shared. A
+// storage the profile does not list, or a profile whose storages could not be
+// read, counts as not shared, which leaves an unregistered parker as it is.
+func (r *parkerHA) sharedEligible(ctx context.Context, views pve.QemuViews) bool {
+	index, _, err := parkerStorageIndex(r.profile, r.deps.Config)
+	if err != nil {
+		return false
+	}
+	for _, v := range parkerAccessVolumes(views, r.node) {
+		info, err := index.Get(ctx, volumeStorage(v.Volume))
+		if err != nil || !info.IsShared() {
+			return false
+		}
+	}
+	return true
+}
+
 // read reads the parker's HA resource and both views of its config on the
 // pass's node. A parker whose config left the node, because HA moved it or
 // it was destroyed, reads as gone, and the sweep of the node it is on now
-// handles it.
+// handles it. A read PVE refuses for a missing grant halts the pass with a
+// warning that names the grant. Any other failed read is classified by its
+// cause: a transport fault or a server error may pass, and a refusal of the
+// request does not.
 func (r *parkerHA) read(ctx context.Context, vmid int) (parkerSnapshot, error) {
 	sid := haResourceSid(vmid)
 	res, err := r.deps.PVE.Cluster().GetHaResources(ctx, sid)
@@ -201,8 +354,8 @@ func (r *parkerHA) read(ctx context.Context, vmid int) (parkerSnapshot, error) {
 	case err != nil && (isHaNotFound(err) || pve.IsNotFound(err)):
 		res = nil
 	case err != nil:
-		return parkerSnapshot{}, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("parker HA: read the HA resource of parker vmid %d", vmid))
+		return parkerSnapshot{}, r.readFailure(err, fmt.Sprintf("parker HA: read the HA resource of parker vmid %d",
+			vmid))
 	case res == nil:
 		return parkerSnapshot{}, cpierrors.Retriable("parker HA: the read of the HA resource of parker vmid %d "+
 			"returned nothing", vmid)
@@ -212,10 +365,24 @@ func (r *parkerHA) read(ctx context.Context, vmid int) (parkerSnapshot, error) {
 		if pve.IsNotFound(err) || pve.IsPmxcfsConfigMissing(err) {
 			return parkerSnapshot{resource: res, gone: true}, nil
 		}
-		return parkerSnapshot{}, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("parker HA: read the config of parker vmid %d on node %s", vmid, r.node))
+		return parkerSnapshot{}, cpierrors.Wrap(pve.WrapConfigReadError(err), fmt.Sprintf(
+			"parker HA: read the config of parker vmid %d on node %s", vmid, r.node))
 	}
 	return parkerSnapshot{resource: res, views: views}, nil
+}
+
+// readFailure classifies a failed HA read of the pass. A read PVE refused for
+// a missing grant halts the pass, because every later parker would be refused
+// the same way, and the warning names the grant the pass needs.
+func (r *parkerHA) readFailure(err error, msg string) error {
+	if pve.IsPermissionDenied(err) {
+		r.halted = true
+		r.logger.Warn("parker HA: PVE refused an HA read, because the token lacks "+parkerHAReadPrivilege+
+			"; the parkers stay as they are until the privilege is granted", log.String("node", r.node),
+			log.Err(err))
+		return cpierrors.Wrap(pve.WrapError(err), msg)
+	}
+	return parkerHAReadError(err, msg)
 }
 
 // action decides what the parker needs. Only a parker that is still this
@@ -268,11 +435,7 @@ func parkerEmpty(views pve.QemuViews) bool {
 // step that fails leaves the resource staged as ignored, which the CRM never
 // acts on, and the next sweep finishes it.
 func (r *parkerHA) register(ctx context.Context, vmid int, snap parkerSnapshot) error {
-	vols, err := r.volumes(ctx, vmid, snap.views)
-	if err != nil {
-		return err
-	}
-	d, err := r.profile.DecideVM(ha.VMInput{Config: r.deps.Config, VMID: vmid, Node: r.node, Volumes: vols})
+	d, vols, err := r.decide(ctx, vmid, snap.views)
 	if err != nil {
 		return err
 	}
@@ -314,6 +477,19 @@ func (r *parkerHA) register(ctx context.Context, vmid int, snap parkerSnapshot) 
 		"of its node", log.Int("parker_vmid", vmid), log.String("node", r.node),
 		log.String("nodes", strings.Join(d.Admissible, ",")), log.Bool("strict_pin", pin.Strict))
 	return nil
+}
+
+// decide lists the parker's volumes and takes the HA decision on them.
+func (r *parkerHA) decide(ctx context.Context, vmid int, views pve.QemuViews) (*ha.VMDecision, []ha.VMVolume, error) {
+	vols, err := r.volumes(ctx, vmid, views)
+	if err != nil {
+		return nil, nil, err
+	}
+	d, err := r.profile.DecideVM(ha.VMInput{Config: r.deps.Config, VMID: vmid, Node: r.node, Volumes: vols})
+	if err != nil {
+		return nil, nil, err
+	}
+	return d, vols, nil
 }
 
 // refuse handles a decision that does not register the parker with shared
@@ -372,7 +548,7 @@ func (r *parkerHA) volumes(ctx context.Context, vmid int, views pve.QemuViews) (
 	}
 	all, err := pve.VMAccessVolumes(ctx, r.deps.PVE, r.node, vmid, holding)
 	if err != nil {
-		return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+		return nil, cpierrors.Wrap(pve.WrapConfigReadError(err), fmt.Sprintf(
 			"parker HA: read the snapshot volumes of parker vmid %d", vmid))
 	}
 	for _, v := range all {
@@ -413,15 +589,23 @@ func (r *parkerHA) requestStopped(ctx context.Context, sid string) error {
 
 // retire destroys an empty parker of this Director that PVE HA manages,
 // through the teardown protocol, whose destroy passes purge=1 and so removes
-// the parker's HA resource and its rule memberships. The teardown reads the
-// HA state once and defers on anything but a state that lets the destroy
-// proceed on this node. Its preserve and ownership steps prove the parker
-// still empty and still this Director's right before the destroy, and the
-// ownership step clears the parker's protection last, because PVE refuses to
-// destroy a protected VM. A teardown that fails after that sets protection
-// again.
-func (r *parkerHA) retire(ctx context.Context, vmid int) error {
+// the parker's HA resource and its rule memberships. Before the teardown makes
+// any HA read or write, retireGuard proves from snap and fresh reads that the
+// parker is still an empty parker of this Director with no snapshot, that it
+// is stopped, and that its HA resource carries this Director's marker and
+// requests stopped or ignored. The teardown then reads the HA state once and
+// defers on anything but a state that lets the destroy proceed on this node.
+// Its preserve and ownership steps prove the parker still empty and still
+// this Director's right before the destroy, and the ownership step clears the
+// parker's protection last, because PVE refuses to destroy a protected VM. A
+// teardown that fails after that sets protection again, on a context of its
+// own when ctx has ended.
+func (r *parkerHA) retire(ctx context.Context, vmid int, snap parkerSnapshot) error {
 	logger := r.logger.With(log.Int("parker_vmid", vmid), log.String("node", r.node))
+	proceed, err := r.retireGuard(ctx, vmid, snap)
+	if err != nil || !proceed {
+		return err
+	}
 	cleared := false
 	teardown := r.retireTeardown(vmid, logger, &cleared)
 	result, err := teardown.run(ctx, r.deps)
@@ -439,6 +623,64 @@ func (r *parkerHA) retire(ctx context.Context, vmid int) error {
 		}
 	}
 	logger.Info("parker HA: the last disk left the parker, so it was destroyed with its HA resource")
+	return nil
+}
+
+// retireGuard runs every check a retirement makes before the teardown reads
+// or writes HA state, so a parker that must stay costs no HA write. snap is
+// the read the pass made under the parker's claim. It reports false with no
+// error for a parker whose config left the node, which the sweep of its new
+// node handles.
+func (r *parkerHA) retireGuard(ctx context.Context, vmid int, snap parkerSnapshot) (bool, error) {
+	if err := r.retireProven(ctx, vmid, snap.views.Holding(), snap.views.PendingReplacements()); err != nil {
+		return false, err
+	}
+	status, err := r.deps.PVE.QEMU().Status(ctx, r.node, vmid)
+	switch {
+	case err != nil && (pve.IsNotFound(err) || pve.IsPmxcfsConfigMissing(err)):
+		r.logger.Debug("parker HA: the parker left the node before its retirement; the sweep of its node handles "+
+			"it", log.Int("parker_vmid", vmid), log.String("node", r.node))
+		return false, nil
+	case err != nil:
+		return false, cpierrors.Wrap(pve.WrapConfigReadError(err), fmt.Sprintf(
+			"%s: read the power state of parker vmid %d", parkerRetireCaller, vmid))
+	}
+	if state, _ := pve.ConfigString(status, "status"); state != vmPowerStateStopped {
+		return false, cpierrors.Cloud("%s: parker vmid %d on node %s is %s, and a parker never runs, so the CPI "+
+			"leaves it for an operator to inspect", parkerRetireCaller, vmid, r.node, orUnsetState(state))
+	}
+	if snap.resource == nil || haOwnershipOf(resourceComment(snap.resource), r.owner) != haOwnedByUs {
+		return false, cpierrors.Cloud("%s: the HA resource of parker vmid %d does not carry this Director's "+
+			"marker, so the parker stays", parkerRetireCaller, vmid)
+	}
+	if state := resourceState(snap.resource); state != parkerHAStateStopped && state != parkerHAStateIgnored {
+		return false, cpierrors.Cloud("%s: the HA resource of parker vmid %d requests %q, and a parker only ever "+
+			"requests stopped, so it stays for an operator to inspect", parkerRetireCaller, vmid, state)
+	}
+	return true, nil
+}
+
+// retireProven proves, on the config views given, that the VM is still an
+// empty parker of this Director, and on a fresh read that it carries no
+// snapshot, whose volumes the destroy would free.
+func (r *parkerHA) retireProven(ctx context.Context, vmid int, holding, replaced map[string]any) error {
+	if !r.ownsParker(vmid, holding) {
+		return cpierrors.Cloud("%s: VM %d on node %s is no longer a parker of this Director, so it stays",
+			parkerRetireCaller, vmid, r.node)
+	}
+	if len(pve.ConfigAccessVolumes(holding, "")) > 0 || len(pve.ConfigAccessVolumes(replaced, "")) > 0 ||
+		pve.ParkerHasRecords(holding) {
+		return cpierrors.Retriable("%s: parker vmid %d holds a disk again, so it stays", parkerRetireCaller, vmid)
+	}
+	snaps, err := pve.HasSnapshots(ctx, r.deps.PVE, r.node, vmid)
+	if err != nil {
+		return cpierrors.Wrap(pve.WrapConfigReadError(err), fmt.Sprintf(
+			"%s: list the snapshots of parker vmid %d", parkerRetireCaller, vmid))
+	}
+	if len(snaps) > 0 {
+		return cpierrors.Cloud("%s: parker vmid %d carries snapshots %s, whose volumes the destroy would free, so "+
+			"it stays for an operator to inspect", parkerRetireCaller, vmid, strings.Join(snaps, ","))
+	}
 	return nil
 }
 
@@ -461,7 +703,7 @@ func (r *parkerHA) retireTeardown(vmid int, logger *log.Logger, cleared *bool) *
 		preserve: func(ctx context.Context) (bool, error) {
 			views, err := pve.ReadQemuViews(ctx, r.deps.PVE, r.node, vmid)
 			if err != nil {
-				return false, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, fmt.Sprintf(
+				return false, cpierrors.Wrap(pve.WrapConfigReadError(err), fmt.Sprintf(
 					"%s: read the config of parker vmid %d", parkerRetireCaller, vmid))
 			}
 			if !parkerEmpty(views) {
@@ -490,7 +732,7 @@ func (r *parkerHA) retireStopCheck(ctx context.Context, vmid int) (bool, error) 
 			}
 			return true, nil
 		}
-		return false, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, fmt.Sprintf(
+		return false, cpierrors.Wrap(pve.WrapConfigReadError(err), fmt.Sprintf(
 			"%s: read the power state of parker vmid %d", parkerRetireCaller, vmid))
 	}
 	if state, _ := pve.ConfigString(status, "status"); state != vmPowerStateStopped {
@@ -508,33 +750,19 @@ func (r *parkerHA) retireStopCheck(ctx context.Context, vmid int) (bool, error) 
 func (r *parkerHA) retireOwned(
 	ctx context.Context, vmid int, holding pve.QemuHolding, logger *log.Logger, cleared *bool,
 ) error {
-	if !r.ownsParker(vmid, holding.Config) {
-		return cpierrors.Cloud("%s: VM %d on node %s is no longer a parker of this Director, so it stays",
-			parkerRetireCaller, vmid, r.node)
-	}
-	if len(pve.ConfigAccessVolumes(holding.Config, "")) > 0 || len(pve.ConfigAccessVolumes(holding.Replaced, "")) > 0 ||
-		pve.ParkerHasRecords(holding.Config) {
-		return cpierrors.Retriable("%s: parker vmid %d holds a disk again, so it stays", parkerRetireCaller, vmid)
-	}
-	snaps, err := pve.HasSnapshots(ctx, r.deps.PVE, r.node, vmid)
-	if err != nil {
-		return cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, fmt.Sprintf(
-			"%s: list the snapshots of parker vmid %d", parkerRetireCaller, vmid))
-	}
-	if len(snaps) > 0 {
-		return cpierrors.Cloud("%s: parker vmid %d carries snapshots %s, whose volumes the destroy would free, so "+
-			"it stays for an operator to inspect", parkerRetireCaller, vmid, strings.Join(snaps, ","))
+	if err := r.retireProven(ctx, vmid, holding.Config, holding.Replaced); err != nil {
+		return err
 	}
 	res, err := r.deps.PVE.Cluster().GetHaResources(ctx, haResourceSid(vmid))
 	switch {
 	case err != nil && (isHaNotFound(err) || pve.IsNotFound(err)):
-		return cpierrors.Retriable("%s: the HA resource of parker vmid %d is gone, so the parker stays",
+		return cpierrors.Cloud("%s: the HA resource of parker vmid %d is gone, so the parker stays",
 			parkerRetireCaller, vmid)
 	case err != nil:
-		return cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, fmt.Sprintf(
-			"%s: read the HA resource of parker vmid %d", parkerRetireCaller, vmid))
+		return parkerHAReadError(err, fmt.Sprintf("%s: read the HA resource of parker vmid %d",
+			parkerRetireCaller, vmid))
 	case res == nil || haOwnershipOf(resourceComment(res), r.owner) != haOwnedByUs:
-		return cpierrors.Retriable("%s: the HA resource of parker vmid %d does not carry this Director's marker, so "+
+		return cpierrors.Cloud("%s: the HA resource of parker vmid %d does not carry this Director's marker, so "+
 			"the parker stays", parkerRetireCaller, vmid)
 	}
 	if err := pve.SetParkerProtection(ctx, r.deps.PVE, logger, r.node, vmid, false); err != nil {
@@ -546,9 +774,14 @@ func (r *parkerHA) retireOwned(
 }
 
 // restoreProtection sets the parker's protection again after a retirement
-// that cleared it and then failed. A parker that is gone needs none.
+// that cleared it and then failed. The write runs on a context of its own,
+// bounded by parkerRetireRestoreTimeout and free of ctx's cancellation,
+// because the likeliest reason the retirement failed is that ctx ran out. A
+// parker that is gone needs none.
 func (r *parkerHA) restoreProtection(ctx context.Context, vmid int, logger *log.Logger) {
-	if err := pve.SetParkerProtection(ctx, r.deps.PVE, logger, r.node, vmid, true); err != nil {
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), parkerRetireRestoreTimeout)
+	defer cancel()
+	if err := pve.SetParkerProtection(restoreCtx, r.deps.PVE, logger, r.node, vmid, true); err != nil {
 		if pve.IsNotFound(err) || pve.IsPmxcfsConfigMissing(err) {
 			return
 		}

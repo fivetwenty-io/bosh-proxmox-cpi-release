@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -57,6 +58,10 @@ func parkerReadConfigFor(deps Deps) pve.ParkerConfig {
 		// read (or before an unpark detach) is refused under strict rather
 		// than silently treated as free-floating. See ParkerConfig.AnchorStrict.
 		AnchorStrict: deps.Config.ParkedAnchorStrictValue(),
+		// The parker HA pass retires an emptied registered parker in every
+		// mode but off, so only there can a parker vanish in a benign race.
+		// See ParkerConfig.RetiresParkers.
+		RetiresParkers: deps.Config.HAModeValue() != config.HAModeOff,
 		// The keep rule proves a transfer record's volume gone with the same
 		// second opinions the local backend's sweep gets.
 		EmptyListingCorroborators: BackendCorroborators(deps.Config, deps.PVE),

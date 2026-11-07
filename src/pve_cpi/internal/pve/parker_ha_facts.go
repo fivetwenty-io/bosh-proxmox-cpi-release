@@ -2,8 +2,11 @@ package pve
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
+
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -63,4 +66,34 @@ func SetParkerProtection(
 		return cpierrors.Cloud("SetParkerProtection: node and parker VMID are required")
 	}
 	return setParkerProtection(ctx, c, logger, node, parkerVMID, on)
+}
+
+// IsPermissionDenied reports whether err is PVE refusing the call for a grant
+// the token lacks, an HTTP 403. No retry adds a grant, so a caller that sees
+// one names the privilege rather than retrying.
+func IsPermissionDenied(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, sdkerrors.ErrForbidden) {
+		return true
+	}
+	var permErr *sdkerrors.PermissionError
+	if errors.As(err, &permErr) {
+		return true
+	}
+	code, ok := apiHTTPCode(err)
+	return ok && code == 403
+}
+
+// IsRequestVerdict reports whether err is PVE's verdict about the request
+// itself, an HTTP 4xx other than 404 and 429, which no retry of the same
+// request changes. A 404 answers that the object is missing, a 429 is
+// pushback, and both are left to the caller.
+func IsRequestVerdict(err error) bool {
+	if err == nil || IsNotFound(err) {
+		return false
+	}
+	code, ok := apiHTTPCode(err)
+	return ok && code >= 400 && code < 500 && code != 429
 }

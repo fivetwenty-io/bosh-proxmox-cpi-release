@@ -181,7 +181,7 @@ func TestParkerHA_AStoppedRequestThatDoesNotLandIsRetriable(t *testing.T) {
 func TestParkerHA_ReadFailuresDeferWithoutWrites(t *testing.T) {
 	t.Run("HA resource", func(t *testing.T) {
 		r := newPHRig(config.HAModeAuto, map[int]map[string]any{90000: phParker("nfs:vm-90000-disk-0")})
-		r.cluster.getErr = errors.New("500 pve02 unreachable")
+		r.cluster.getErr = crh500("pve02 unreachable")
 		err := r.reconcile(t)
 		if err == nil || !okToRetryCPIError(err) || len(r.cluster.log.events) != 0 {
 			t.Fatalf("want a retriable deferral and no write; err %v events %v", err, r.cluster.log.events)
@@ -189,7 +189,7 @@ func TestParkerHA_ReadFailuresDeferWithoutWrites(t *testing.T) {
 	})
 	t.Run("parker config", func(t *testing.T) {
 		r := newPHRig(config.HAModeAuto, map[int]map[string]any{90000: phParker("nfs:vm-90000-disk-0")})
-		r.client.configErr[90000] = errors.New("500 pmxcfs timeout")
+		r.client.configErr[90000] = crh500("pmxcfs timeout")
 		err := r.reconcile(t)
 		if err == nil || !okToRetryCPIError(err) || len(r.cluster.log.events) != 0 {
 			t.Fatalf("want a retriable deferral and no write; err %v events %v", err, r.cluster.log.events)
@@ -331,6 +331,7 @@ func TestParkerHA_WatchdogNotArmedLeavesTheParker(t *testing.T) {
 type retireCluster struct {
 	*naClusterStub
 	comment string
+	state   string
 	missing bool
 }
 
@@ -339,6 +340,9 @@ func (c *retireCluster) GetHaResources(_ context.Context, sid string) (*cluster.
 		return nil, errors.New("no such resource '" + sid + "'")
 	}
 	state, comment := "stopped", c.comment
+	if c.state != "" {
+		state = c.state
+	}
 	return &cluster.GetHaResourcesResponse{Sid: sid, State: &state, Comment: &comment}, nil
 }
 
@@ -368,6 +372,20 @@ func newRetireRig(parkerCfg map[string]any) *retireRig {
 	}}
 }
 
+// retire runs the retirement on a fresh read of the parker, the way the pass
+// runs it under the parker's claim. between, when set, runs after the read.
+func (rr *retireRig) retire(t *testing.T, ctx context.Context, between func()) error {
+	t.Helper()
+	snap, err := rr.r.read(ctx, 90000)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if between != nil {
+		between()
+	}
+	return rr.r.retire(ctx, 90000, snap)
+}
+
 func (rr *retireRig) protectionWrites() []bool {
 	var out []bool
 	for _, p := range rr.nodes.updateParams {
@@ -380,7 +398,7 @@ func (rr *retireRig) protectionWrites() []bool {
 
 func TestParkerRetire_DestroysAnEmptyParkerWithPurge(t *testing.T) {
 	rr := newRetireRig(phParker())
-	if err := rr.r.retire(crhCtx(), 90000); err != nil {
+	if err := rr.retire(t, crhCtx(), nil); err != nil {
 		t.Fatalf("retire: %v", err)
 	}
 	if len(rr.nodes.deleteCalls) != 1 {
@@ -400,7 +418,7 @@ func TestParkerRetire_DestroysAnEmptyParkerWithPurge(t *testing.T) {
 func TestParkerRetire_RestoresProtectionWhenTheDestroyFails(t *testing.T) {
 	rr := newRetireRig(phParker())
 	rr.nodes.deleteErrs = []error{errors.New("500 storage busy")}
-	if err := rr.r.retire(crhCtx(), 90000); err == nil {
+	if err := rr.retire(t, crhCtx(), nil); err == nil {
 		t.Fatal("a failed destroy must fail the retirement")
 	}
 	if got := rr.protectionWrites(); len(got) < 2 || got[0] || !got[len(got)-1] {
@@ -412,6 +430,7 @@ func TestParkerRetire_Refusals(t *testing.T) {
 	cases := map[string]struct {
 		cfg       map[string]any
 		mutate    func(*retireRig)
+		between   func(*retireRig)
 		retriable bool
 		want      string
 	}{
@@ -423,10 +442,17 @@ func TestParkerRetire_Refusals(t *testing.T) {
 		"running": {cfg: phParker(), retriable: false, want: "never runs",
 			mutate: func(rr *retireRig) { rr.qemu.status = "running" }},
 		"not a parker": {cfg: map[string]any{}, retriable: false, want: "no longer a parker"},
-		"resource gone": {cfg: phParker(), retriable: true, want: "is gone",
+		"no resource": {cfg: phParker(), retriable: false, want: "does not carry this Director's marker",
 			mutate: func(rr *retireRig) { rr.cluster.missing = true }},
-		"foreign marker": {cfg: phParker(), retriable: true, want: "does not carry this Director's marker",
+		"resource gone since the read": {cfg: phParker(), retriable: false, want: "is gone",
+			between: func(rr *retireRig) { rr.cluster.missing = true }},
+		"foreign marker": {cfg: phParker(), retriable: false, want: "does not carry this Director's marker",
 			mutate: func(rr *retireRig) { rr.cluster.comment = haIdentity{Owner: "dir-other"}.marker() }},
+		"foreign marker since the read": {cfg: phParker(), retriable: false,
+			want:    "does not carry this Director's marker",
+			between: func(rr *retireRig) { rr.cluster.comment = haIdentity{Owner: "dir-other"}.marker() }},
+		"requests started": {cfg: phParker(), retriable: false, want: "only ever requests stopped",
+			mutate: func(rr *retireRig) { rr.cluster.state = "started" }},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -434,7 +460,11 @@ func TestParkerRetire_Refusals(t *testing.T) {
 			if tc.mutate != nil {
 				tc.mutate(rr)
 			}
-			err := rr.r.retire(crhCtx(), 90000)
+			var between func()
+			if tc.between != nil {
+				between = func() { tc.between(rr) }
+			}
+			err := rr.retire(t, crhCtx(), between)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err %v, want it to name %q", err, tc.want)
 			}

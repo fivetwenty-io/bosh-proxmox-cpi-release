@@ -864,7 +864,7 @@ func transferAcrossParkers(
 		if err == nil {
 			return landed, nil
 		}
-		if isParkerSkipError(err) {
+		if isParkerSkipError(err, cfg) {
 			continue
 		}
 		return "", cpierrors.Wrap(err, "TransferDiskToParker: transfer to parker")
@@ -878,7 +878,7 @@ func transferAcrossParkers(
 		if err == nil {
 			return landed, nil
 		}
-		if !isParkerSkipError(err) {
+		if !isParkerSkipError(err, cfg) {
 			return "", cpierrors.Wrap(err, "TransferDiskToParker: transfer to fresh parker")
 		}
 	}
@@ -1146,8 +1146,10 @@ func transferIntoParkerLocked(
 	// 1. Choose the receiving slot on the parker.
 	parkerCfg, cfgErr := c.QEMU().Config(ctx, node, parkerVMID)
 	if cfgErr != nil {
-		return "", cpierrors.Wrap(WrapConfigReadError(cfgErr),
-			fmt.Sprintf("transfer in: config read for parker vmid %d", parkerVMID))
+		// The window's first read: a parker that is gone here carries nothing
+		// of this transfer, so the loop may move on from it.
+		return "", markParkerGone(cpierrors.Wrap(WrapConfigReadError(cfgErr),
+			fmt.Sprintf("transfer in: config read for parker vmid %d", parkerVMID)), cfgErr)
 	}
 	// The caller resolved the disk before it held any lock, so another
 	// transfer of the same disk may have finished since. A parker that
