@@ -3,6 +3,7 @@ package ha
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -604,8 +605,9 @@ func TestEffectiveCPUTypeFollowsTheWriteOrder(t *testing.T) {
 		pass string
 		want string
 	}{
-		{"nil config defaults to host", nil, nil, "", eligHost},
-		{"unset pve.cpu_type defaults to host", &config.CPIConfig{}, nil, "", eligHost},
+		{"nil config leaves the choice to PVE", nil, nil, "", ""},
+		{"unset pve.cpu_type leaves the choice to PVE", &config.CPIConfig{}, nil, "", ""},
+		{"defaulted pve.cpu_type is host", &config.CPIConfig{CPUType: config.DefaultCPUType}, nil, "", config.DefaultCPUType},
 		{"pve.cpu_type", &config.CPIConfig{CPUType: " x86-64-v3 "}, nil, "", "x86-64-v3"},
 		{"pve-default sentinel", &config.CPIConfig{CPUType: config.CPUTypePVEDefault}, nil, "", ""},
 		{"cloud_properties.cpu_type wins over pve.cpu_type", &config.CPIConfig{CPUType: eligHost}, str("x86-64-v2-AES"), "",
@@ -1042,4 +1044,91 @@ func TestRepairDepsOfANilDecision(t *testing.T) {
 	if d.Registers() || d.Failure() != nil {
 		t.Fatal("a nil decision registers nothing")
 	}
+}
+
+// repairDecision decides VM 101 from a state read that carries uid, and
+// returns the decision with the repair deps it feeds the rule writer.
+func repairDecision(
+	t *testing.T, st *pve.HAServiceState, remove func(context.Context, string) error,
+	read func(context.Context, int) (*pve.HAServiceState, error),
+) (*VMDecision, RepairDeps) {
+	t.Helper()
+	p := eligProfile(config.HAModeAuto, "pve1", "pve2")
+	in := baseInput(eligCfg(config.HAModeAuto), vols("nfs:100/a")...)
+	in.State = st
+	d := mustDecide(t, p, in)
+	deps := d.RepairDeps(read, remove)
+	return d, deps
+}
+
+// TestDecisionFieldsReachTheRemovalRepair drives a decision through the rule
+// writer's removal repair, the way the writer reaches it when a pin cannot be
+// repaired. A decision that carries the uid of the episode it read, and a
+// resource that is still the CRM's same episode, lets the repair remove the
+// resource, where a repair without the decision fails closed. A staged
+// resource is removed directly, and an activated one goes back to the
+// proof-by-uid path.
+func TestDecisionFieldsReachTheRemovalRepair(t *testing.T) {
+	var removed []string
+	remove := func(_ context.Context, sid string) error {
+		if sid != "vm:101" {
+			return fmt.Errorf("the repair asked to remove %s, which is not the decided VM", sid)
+		}
+		removed = append(removed, sid)
+		return nil
+	}
+	same := func(context.Context, int) (*pve.HAServiceState, error) { return goodState("vm:101", "u1"), nil }
+
+	t.Run("fails closed without the decision", func(t *testing.T) {
+		removed = nil
+		err := applyUnrepairable(t, RepairDeps{RemoveResource: remove, ReadState: same})
+		if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || len(removed) != 0 {
+			t.Fatalf("err = %v, removed %v; want a retriable error and no removal", err, removed)
+		}
+	})
+	t.Run("a decision that read no episode fails closed", func(t *testing.T) {
+		removed = nil
+		_, deps := repairDecision(t, nil, remove, same)
+		err := applyUnrepairable(t, deps)
+		if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || len(removed) != 0 {
+			t.Fatalf("err = %v, removed %v; want a retriable error and no removal", err, removed)
+		}
+	})
+	t.Run("the decision's uid proves the same episode", func(t *testing.T) {
+		removed = nil
+		d, deps := repairDecision(t, goodState("vm:101", "u1"), remove, same)
+		if d.DecisionUID != "u1" {
+			t.Fatalf("DecisionUID = %q, want the uid of the state it read", d.DecisionUID)
+		}
+		if err := applyUnrepairable(t, deps); err != nil || !reflect.DeepEqual(removed, []string{"vm:101"}) {
+			t.Fatalf("err = %v, removed %v; want the repair to remove vm:101", err, removed)
+		}
+	})
+	t.Run("a changed episode keeps the resource", func(t *testing.T) {
+		removed = nil
+		_, deps := repairDecision(t, goodState("vm:101", "u1"), remove,
+			func(context.Context, int) (*pve.HAServiceState, error) { return goodState("vm:101", "u2"), nil })
+		err := applyUnrepairable(t, deps)
+		if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || len(removed) != 0 {
+			t.Fatalf("err = %v, removed %v; want a retriable error and no removal", err, removed)
+		}
+	})
+	t.Run("a staged resource is removed without a state read", func(t *testing.T) {
+		removed = nil
+		d, deps := repairDecision(t, nil, remove, nil)
+		d.MarkStaged()
+		if err := applyUnrepairable(t, deps); err != nil || !reflect.DeepEqual(removed, []string{"vm:101"}) {
+			t.Fatalf("err = %v, removed %v; want the staged resource removed", err, removed)
+		}
+	})
+	t.Run("an activated resource is no longer removed as staged", func(t *testing.T) {
+		removed = nil
+		d, deps := repairDecision(t, nil, remove, nil)
+		d.MarkStaged()
+		d.MarkActivated()
+		err := applyUnrepairable(t, deps)
+		if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || len(removed) != 0 {
+			t.Fatalf("err = %v, removed %v; want a retriable error and no removal", err, removed)
+		}
+	})
 }

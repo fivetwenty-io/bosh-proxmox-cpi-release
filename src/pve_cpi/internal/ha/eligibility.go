@@ -522,7 +522,9 @@ func (s storageIndex) Get(_ context.Context, name string) (pve.StorageInfo, erro
 }
 
 // narrow returns the access set of volumes, narrowed by the node constraints.
-// VolumeAccessSet reads from memory, so the background context never waits.
+// VolumeAccessSet reads an in-memory storage index and never uses its context,
+// so the background context never waits, and DecideVM stays a pure function
+// with no context parameter.
 func (e *eligibility) narrow(getter pve.StorageInfoGetter, volumes []pve.AccessVolume) ([]string, error) {
 	access, err := pve.VolumeAccessSet(context.Background(), getter, e.members, volumes)
 	if err != nil {
@@ -870,7 +872,10 @@ func (p *Profile) placeableSet() map[string]bool {
 // EffectiveCPUType resolves the CPU type a VM runs with, in the order the CPI
 // writes it. A cloud_properties.pve_config.cpu passthrough is the last write,
 // so it wins. Otherwise cloud_properties.cpu_type wins over pve.cpu_type, and
-// an unset pve.cpu_type is config.DefaultCPUType. The pve-default sentinel at
+// the config layer is config.CPIConfig.CPUTypeValue, which is the read create_vm
+// resolves the VM's shape with, so the two cannot drift. A config that went
+// through ApplyDefaults has config.DefaultCPUType in pve.cpu_type, and an
+// unset value in a config that never did gives "". The pve-default sentinel at
 // either layer gives "", which leaves the choice to PVE's own default.
 func EffectiveCPUType(cfg *config.CPIConfig, perVM *string, passthrough string) string {
 	if v := strings.TrimSpace(passthrough); v != "" {
@@ -883,17 +888,7 @@ func EffectiveCPUType(cfg *config.CPIConfig, perVM *string, passthrough string) 
 		}
 		return v
 	}
-	if cfg == nil {
-		return config.DefaultCPUType
-	}
-	switch v := strings.TrimSpace(cfg.CPUType); v {
-	case "":
-		return config.DefaultCPUType
-	case config.CPUTypePVEDefault:
-		return ""
-	default:
-		return v
-	}
+	return cfg.CPUTypeValue()
 }
 
 // cpuTypeModel returns the model name of a PVE cpu property, which is its first
