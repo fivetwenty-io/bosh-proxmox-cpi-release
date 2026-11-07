@@ -314,6 +314,17 @@ func TestIsoStorageScanTarget(t *testing.T) {
 // D11: HA-vs-resurrector one-per-process warning
 // ---------------------------------------------------------------------------
 
+// infoLogger returns a logger that records Info lines and above, because the
+// HA ownership line is logged at Info.
+func infoLogger(t *testing.T, buf *bytes.Buffer) *log.Logger {
+	t.Helper()
+	logger, err := log.NewLogger("info", buf)
+	if err != nil {
+		t.Fatalf("NewLogger: %v", err)
+	}
+	return logger
+}
+
 // resetHAResurrectorWarnOnce lets each test observe a fresh first-fire,
 // keeping the suite repeat-safe under -count=N. Routed through the
 // resetHAResurrectorWarnOnceForTest seam (ha_warn_seam.go) so the swap is
@@ -331,7 +342,7 @@ func resetHAResurrectorWarnOnce(t *testing.T) {
 func TestWarnHAResurrectorConflictOnce_EmptyFeatures_NoWarn(t *testing.T) {
 	resetHAResurrectorWarnOnce(t)
 	var buf bytes.Buffer
-	warnHAResurrectorConflictOnce(100, nil, warnLogger(t, &buf))
+	warnHAResurrectorConflictOnce(100, nil, infoLogger(t, &buf))
 	if out := buf.String(); out != "" {
 		t.Errorf("empty feature list must not warn, got %q", out)
 	}
@@ -345,13 +356,30 @@ func TestWarnHAResurrectorConflictOnce_NilLogger_NoPanic(t *testing.T) {
 func TestWarnHAResurrectorConflictOnce_FiresOncePerProcess(t *testing.T) {
 	resetHAResurrectorWarnOnce(t)
 	var buf bytes.Buffer
-	logger := warnLogger(t, &buf)
+	logger := infoLogger(t, &buf)
 	features := []haRegistrationFeature{haFeatureDLB, haFeatureAZPin}
 
 	warnHAResurrectorConflictOnce(100, features, logger)
 	first := buf.String()
-	if !strings.Contains(first, "update-resurrection off") {
-		t.Errorf("expected the warning to name the bosh update-resurrection off remediation, got %q", first)
+	for _, want := range []string{
+		"registered as a PVE HA resource",
+		"PVE HA recovers it first",
+		"BOSH resurrector is the fallback",
+		"agent_timeout",
+		"240 seconds or more",
+		"docs/ha-and-resurrection.md",
+	} {
+		if !strings.Contains(first, want) {
+			t.Errorf("expected the ownership line to contain %q, got %q", want, first)
+		}
+	}
+	if !strings.Contains(first, `"level":"INFO"`) {
+		t.Errorf("expected the ownership line at Info level, got %q", first)
+	}
+	for _, banned := range []string{"update-resurrection", "must be disabled", "resurrector_enabled"} {
+		if strings.Contains(first, banned) {
+			t.Errorf("the ownership line must not tell operators to turn the resurrector off (%q), got %q", banned, first)
+		}
 	}
 	if !strings.Contains(first, string(haFeatureDLB)) || !strings.Contains(first, string(haFeatureAZPin)) {
 		t.Errorf("expected the warning to name both triggering features, got %q", first)
@@ -374,17 +402,17 @@ func TestCheckISOStorageForHA_DLBActive_SharedISO_StillWarnsHAResurrector(t *tes
 	cp := createVMCloudProps{}
 
 	var buf bytes.Buffer
-	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, warnLogger(t, &buf))
+	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, infoLogger(t, &buf))
 	if err != nil {
 		t.Fatalf("shared iso_storage: expected nil error, got %v", err)
 	}
 	// The ISO-storage migration-safety warning must NOT fire (shared pool),
-	// but the HA-vs-resurrector warning fires regardless of ISO sharing.
+	// but the HA ownership line is logged regardless of ISO sharing.
 	if strings.Contains(buf.String(), "config-drive ISO on non-shared storage") {
 		t.Errorf("did not expect the ISO migration-safety warning for a shared pool, got %q", buf.String())
 	}
-	if !strings.Contains(buf.String(), "update-resurrection off") {
-		t.Errorf("expected the HA-vs-resurrector warning even with a shared iso_storage pool, got %q", buf.String())
+	if !strings.Contains(buf.String(), "BOSH resurrector is the fallback") {
+		t.Errorf("expected the HA ownership line even with a shared iso_storage pool, got %q", buf.String())
 	}
 }
 
@@ -395,7 +423,7 @@ func TestCheckISOStorageForHA_NoFeatureActive_NoHAResurrectorWarn(t *testing.T) 
 	cp := createVMCloudProps{}
 
 	var buf bytes.Buffer
-	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, warnLogger(t, &buf))
+	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, infoLogger(t, &buf))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -436,14 +464,14 @@ func TestResetHAResurrectorWarnOnceForTest_ReArmsAndRestores(t *testing.T) {
 
 	restore := resetHAResurrectorWarnOnceForTest()
 	var rearmed bytes.Buffer
-	warnHAResurrectorConflictOnce(2, features, warnLogger(t, &rearmed))
+	warnHAResurrectorConflictOnce(2, features, infoLogger(t, &rearmed))
 	if rearmed.Len() == 0 {
 		t.Error("a re-armed gate must allow exactly one fresh firing")
 	}
 	restore()
 
 	var afterRestore bytes.Buffer
-	warnHAResurrectorConflictOnce(3, features, warnLogger(t, &afterRestore))
+	warnHAResurrectorConflictOnce(3, features, infoLogger(t, &afterRestore))
 	if afterRestore.Len() != 0 {
 		t.Errorf("restore must reinstate the spent gate, got: %s", afterRestore.String())
 	}

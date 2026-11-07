@@ -2784,12 +2784,13 @@ func (c *CPIConfig) AntiAffinityEnabled() bool {
 	return *c.Placement.AntiAffinity.Enabled
 }
 
-// HAAntiAffinityRulesEnabled reports whether PVE HA negative-affinity rules
-// should be maintained on top of scheduler-soft spreading. It is true only
-// when the mode lets the CPI write HA state, pve.ha.anti_affinity is
+// HAAntiAffinityRulesEnabled reports whether the operator explicitly asked for
+// PVE HA negative-affinity rules on top of scheduler-soft spreading. It is true
+// only when the mode lets the CPI write HA state, pve.ha.anti_affinity is
 // explicitly "on", and scheduler-soft anti-affinity is enabled. The default
-// "auto" does not count: it waits for the cluster probe, so until the probe
-// exists the unset value writes no rule, exactly as the removed key did.
+// "auto" does not count here, because this predicate reports the explicit
+// request alone. The create_vm HA decision runs the cluster probe, and under
+// "auto" it writes the rule when the profile allows rules.
 func (c *CPIConfig) HAAntiAffinityRulesEnabled() bool {
 	if !c.HAWritesEnabled() || c.HAAntiAffinityValue() != HARuleOn {
 		return false
@@ -2797,12 +2798,13 @@ func (c *CPIConfig) HAAntiAffinityRulesEnabled() bool {
 	return c.AntiAffinityEnabled()
 }
 
-// HANodeAffinityPinEnabled reports whether create_vm should write a PVE HA
-// node-affinity rule binding the VM to its AZ node set. It requires a mode
+// HANodeAffinityPinEnabled reports whether the operator explicitly asked for a
+// PVE HA node-affinity rule that binds the VM to its AZ node set. It requires a mode
 // that lets the CPI write HA state, pve.ha.pin_az explicitly "on" (the default
-// "auto" waits for the cluster probe and writes no pin until then), and a
-// non-empty placement.az_map, since a pin is meaningless without AZ-to-node
-// mappings.
+// "auto" does not count here, because this predicate reports the explicit
+// request alone, and the create_vm HA decision folds the AZ into the pin under
+// "auto" when az_map defines the AZ), and a non-empty placement.az_map, since
+// a pin is meaningless without AZ-to-node mappings.
 func (c *CPIConfig) HANodeAffinityPinEnabled() bool {
 	if c == nil || !c.HAWritesEnabled() || c.HAPinAZValue() != HARuleOn {
 		return false

@@ -246,7 +246,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Shared ISO storage for migration-capable VMs.**
 
-**Best practice.** A config-drive ISO on node-local storage blocks live migration and HA recovery of that VM, since the file does not exist on any other node — silently defeating DLB rebalancing, HA failover, HA AZ pinning, and HA anti-affinity, all of which depend on migration actually working.
+**Best practice.** A config-drive ISO on node-local storage blocks live migration and HA recovery of that VM, since the file does not exist on any other node, and that silently defeats DLB rebalancing, HA failover, HA AZ pinning, and HA anti-affinity, all of which depend on migration working.
 
 **CPI behavior.** `pve.iso_storage` defaults to `local` (node-local). The ISO counts toward a VM's HA eligibility like any other volume, so with `pve.ha.mode` at `auto` a node-local ISO takes a VM out of full HA with a warning, and at `managed` it fails `create_vm`. `pve.require_shared_iso_for_ha` (default `false`) escalates the same downgrade to a hard `create_vm` error in `auto` mode too; `pve.iso_storage_follow_vm_storage` (default `true`) already offers a path off `local`, resolving the ISO pool to `vm_storage` whenever that pool is shared and advertises `iso` content. Because BOSH renders the `local` spec default for `iso_storage` unconditionally, the flag treats the literal value `local` as the "unset" signal — set `iso_storage` to any other value to pin a pool the flag will never override, or set the flag `false` to use `iso_storage` as configured.
 
@@ -414,7 +414,7 @@ The HA pin only protects a VM once it exists. At creation, when no node in the r
 
 **Best practice.** Two systems that can each restart a failed guest need one rule for who goes first. Leaving both on with no coordination produces a duplicate VM, and turning one off throws away the protection it offers.
 
-**CPI behavior.** With `pve.ha.mode` at `off`, which is the default, the CPI registers no VM with PVE HA, and the BOSH resurrector is the only recovery mechanism. Every VM carries `onboot: 0`, so PVE never starts it on its own. With `auto` or `managed`, PVE HA recovers the VMs the CPI registers, and the CPI makes the resurrector wait. `delete_vm` defers while PVE HA fences or recovers a VM, `has_vm` answers false only after an absence proof, and `attach_disk` refuses a second holder of a disk. We raise `agent_timeout` to 240 seconds or more so that PVE HA finishes most recoveries before the resurrector looks at the VM, and we test each node's watchdog before we turn HA on. See [HA and Resurrection](ha-and-resurrection.md).
+**CPI behavior.** With `pve.ha.mode` at `off`, which is the default, the CPI registers no VM with PVE HA, and the BOSH resurrector is the only recovery mechanism. Every VM carries `onboot: 0`, so PVE never starts it on its own. With `auto` or `managed`, PVE HA recovers the VMs the CPI registers, and the CPI makes the resurrector wait. `delete_vm` defers while PVE HA fences or recovers a VM, `has_vm` answers false only after an absence proof, and `attach_disk` refuses a second holder of a disk. We raise the Director's `hm.intervals.agent_timeout` property to 240 seconds or more so that PVE HA finishes most recoveries before the resurrector looks at the VM, and we test each node's watchdog before we turn HA on. See [HA and Resurrection](ha-and-resurrection.md).
 
 **Status.** Meets.
 

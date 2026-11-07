@@ -42,7 +42,7 @@ var removedKeys = []removedKey{
 	{[]string{"dlb", "manage_cluster_crs"},
 		`delete it; the CPI no longer writes the cluster CRS mode, so set the CRS mode in PVE`},
 	{[]string{"dlb", "require_shared_storage"},
-		`delete it; a VM with a node-local volume is never registered for DLB`},
+		`delete it; a VM with a node-local volume gets no DLB movement, because local_policy none skips it and hold and replicate pin it to its node`},
 	{[]string{"exclude_maintenance_nodes"},
 		`delete it; the node health check always runs`},
 }

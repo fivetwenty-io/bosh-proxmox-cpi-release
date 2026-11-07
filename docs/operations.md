@@ -607,16 +607,16 @@ This section is for operators who set `pve.ha.mode` to `auto` or `managed`, and 
 
 ### Reading the cluster with `pve-cid ha`
 
-The `pve-cid ha` subcommand is a read-only doctor. It never writes to PVE, and it runs in every mode, `off` included. On the Director VM we run it with the full path, because `pve-cid` is not on `PATH`.
+The `pve-cid ha` subcommand is a read-only doctor. It never writes to PVE, and it runs in every mode, `off` included. On the Director VM we run it with the full path, because `pve-cid` is not on `PATH`. The `--config` flag is optional there, because the command looks for the configuration in `--config`, then in `$PVE_CPI_CONFIG`, and then at `/var/vcap/jobs/pve_cpi/config/cpi.json`.
 
 ```bash
-/var/vcap/packages/pve_cpi/bin/pve-cid ha --config /var/vcap/jobs/pve_cpi/config/cpi.json
+/var/vcap/packages/pve_cpi/bin/pve-cid ha
 ```
 
 The command takes these flags.
 
 - `--config PATH`
-  This names the CPI configuration file. The rendered `cpi.json` is the usual value.
+  This names the CPI configuration file. The rendered `cpi.json` is the usual value, and it is the default when neither the flag nor `$PVE_CPI_CONFIG` is set.
 
 - `--request PATH`
   This names a CPI request, or a bare context object, whose context picks a cpi-config entry. The request's Director UUID also filters ownership markers, so the report skips another Director's rules and resources. Without a UUID, every marker counts.
@@ -642,7 +642,7 @@ findings:
 result: 0 problem(s), 0 advice
 ```
 
-The headroom field reads `headroom=ok(42%)` when every single-node failure leaves memory free on the survivors, where the percentage is the smallest margin over all such failures. It reads `short(<node>)` and names each node whose loss leaves a VM with nowhere to go, and it reads `unavailable` when the CPI could not read what it needs. The number is the same memory-only estimate that `create_vm` uses, so a result of `ok` does not promise that every VM restarts.
+The headroom field reads `headroom=ok(42%)` when every single-node failure leaves memory free on the survivors, where the percentage is the smallest margin over all such failures. It reads `short(<node>)` or `short(<node>+N)`, which names the first node whose loss leaves a VM with nowhere to go and counts the N other nodes that are short, and it reads `unavailable` when the CPI could not read what it needs. The number is the same memory-only estimate that `create_vm` uses, so a result of `ok` does not promise that every VM restarts.
 
 Each finding is either a problem or advice. The command exits with 0 when the report holds no problem, with 1 when it holds a problem or a source it could not read, and with 2 for a usage error. An unreadable source counts as a problem with the kind `unchecked`, so a clean run proves that every check ran. The finding kinds fall into these groups.
 
@@ -690,18 +690,30 @@ Only follow it once the node is certain to be powered off. A node that is only p
 1. Confirm that the node is powered off, through IPMI or at the machine.
    A missing ping is not proof, because a partitioned node still runs its guests.
 
-2. For a VM whose volumes are on shared storage, or whose ephemeral disk can be thrown away, move the config from a quorate node.
+2. Check that no BOSH task is running against the instance, with `bosh tasks`.
+   A running `reboot_vm`, `set_vm_metadata`, or `attach_disk` can register the VM's HA resource again while it finishes, so we let it end or cancel it before we remove anything.
+
+3. For a VM that PVE HA manages, remove its HA resource from a quorate node, and wait until `ha-manager status` no longer lists it.
+   The CPI decides what to do with a delete from the CRM's own record of the service. After a fence, that record holds `vm:<vmid>` in `recovery` on the dead node, and moving the config by hand does not change it. A retried `delete_vm` would then keep deferring, and the dead-node completion would refuse, even though the config is on a live node. Once the resource is gone and the CRM has dropped the service, the CPI sees an unmanaged VM on a live node and the delete proceeds. A VM that is not HA-managed has no resource, so we skip this step for it.
+
+   ```bash
+   ha-manager remove vm:<vmid>
+   ```
+
+   We remove the resource only because step 1 proved that the node is off. The CPI registers a resource for an existing VM only inside a change that has already removed it, such as a pin narrowing or a clearing of an HA error, so with no task running, nothing puts the resource back.
+
+4. For a VM whose volumes are on shared storage, or whose ephemeral disk can be thrown away, move the config from a quorate node.
 
    ```bash
    mv /etc/pve/nodes/<dead>/qemu-server/<vmid>.conf /etc/pve/nodes/<live>/qemu-server/
    ```
 
-   The next `delete_vm` retry finds the VM on the live node and completes.
+   The next `delete_vm` retry finds the VM on the live node and completes. It removes any node-affinity pin the VM still has. Afterward we run `pve-cid ha`, and we delete any rule that it reports as a `rule_problem` for the removed VM.
 
-3. For a VM whose persistent disk lives on the dead node, either bring the node back or decide that the data is lost.
+5. For a VM whose persistent disk lives on the dead node, either bring the node back or decide that the data is lost.
    When the data is lost, remove the disk reference with `bosh cck`. PVE logs a warning for each local volume it cannot find during the destroy and finishes anyway.
 
-4. Run `bosh cck`, or wait for the next resurrection.
+6. Run `bosh cck`, or wait for the next resurrection.
 
 ### Clearing an HA error by hand
 
@@ -724,21 +736,27 @@ The VM has no HA protection between those two commands, and a hand-made resource
 
 ### Node maintenance with `hold` VMs
 
-PVE HA cannot evacuate a `hold` VM, because its strict pin forbids every other node. The maintenance request on the node therefore never completes while the VM runs. Before we put a node into maintenance, we stop its `hold` VMs, either with `bosh stop --hard` for the instance or with the command below, and we start them again afterward.
+PVE HA cannot evacuate a `hold` VM, because its strict pin forbids every other node. The maintenance request on the node therefore never completes while the VM runs. Before we put a node into maintenance, we stop its `hold` VMs with the command below, and we start them again afterward. A soft `bosh stop` stops only the jobs and leaves the guest running, and `bosh stop --hard` deletes the VM, so a recreated VM with a node-local disk would have to land back on the node that holds the disk. The `ha-manager` command avoids both problems.
 
 ```bash
 ha-manager set vm:<vmid> --state stopped
+```
+
+When the maintenance is over, we start the VM again.
+
+```bash
+ha-manager set vm:<vmid> --state started
 ```
 
 The doctor lists a `hold` VM on a node that is entering maintenance as `hold_blocks_maintenance`. A VM under `local_policy: none` is not HA-managed, so maintenance mode does not touch it. It keeps running until the node reboots, and then it goes down with the node.
 
 ### Replicate failover and the old node's writes
 
-After a `replicate` VM fails over, PVE reverses its replication job, so that the job runs from the partner back to the old node. The job's next run receives with `zfs recv -F`, which rolls the old node's dataset back to the last common snapshot. Any write that existed only on the old node, which means every write since the last successful sync, is destroyed by that first run. Every resource the CPI registers has `failback` set to 0, so the VM stays on the partner when the old node returns.
+After a `replicate` VM fails over, PVE reverses its replication job, so that the job runs from the partner back to the old node. The job's next run receives with `zfs recv -F`, which rolls the old node's dataset back to the last common snapshot. Any write that existed only on the old node, which means every write since the last successful sync, is destroyed by that first run. Every resource the CPI registers has `failback` set to 0, so the VM stays on the partner when the old node returns. The next `reboot_vm` or `set_vm_metadata` call that touches the VM narrows its pin to the partner alone, and in the same step the CPI asks the job to sync from the partner. From then on the VM behaves like a `hold` VM on the partner, and the destructive first sync can start at the CPI's next touch of the VM, and not only on the job's own schedule.
 
 When those writes do not matter, we do nothing, and replication resumes in the new direction by itself. When they do matter, we save them first.
 
-1. Before the old node rejoins the cluster, disable the VM's replication job from a quorate node.
+1. Before any BOSH call touches the VM, and before the old node rejoins the cluster, disable the VM's replication job from a quorate node.
 
    ```bash
    pvesr disable <job>
@@ -754,7 +772,7 @@ When those writes do not matter, we do nothing, and replication resumes in the n
 
    The job then overwrites the old node's dataset from the partner.
 
-The doctor reports a `replicate` VM that runs on its partner as `replica_on_partner`, which tells us about the reversed job.
+The doctor reports a `replicate` VM that runs on its partner as `replica_on_partner`, which tells us about the reversed job. That finding is a problem, so the doctor exits with 1 after every failover until the condition clears.
 
 ### Removing orphan replicas
 

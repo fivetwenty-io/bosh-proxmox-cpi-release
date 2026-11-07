@@ -484,7 +484,7 @@ diagnostics gap never fails `create_vm`.
 (`MaintenanceNodeTags`), marking a node `InMaintenance` when its HA state is
 `maintenance`, `error`, `fence`, or `recovery`, or when it carries a maintenance tag.
 `Filter()` (`internal/placement/scorer.go:158-160`) then hard-rejects those nodes before
-scoring whenever `Request.ExcludeMaintenanceNodes` is set. A status-fetch error fails open
+scoring on every call. A status-fetch error fails open
 per node (`InMaintenance` stays false). **Why it matters here.** This removes the
 draining-node foot-gun directly: an operator can put a node into PVE HA maintenance — or
 just tag it — for a kernel/PVE upgrade, and the scorer stops landing diego-cells or

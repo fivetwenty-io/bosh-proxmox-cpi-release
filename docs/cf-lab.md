@@ -84,6 +84,10 @@ Applied automatically by `scripts/bosh create-env`:
   widens `agent_timeout` to 180 s + `analyze_agents` to 120 s. In a
   single-PVE-host lab a genuinely dead VM stays dead until the operator
   recreates it; that is the expected workflow. Trade-off accepted.
+  The 180 s value and the disabled resurrector suit this lab only, and they
+  are not HA guidance. A deployment that enables `pve.ha` keeps the
+  resurrector on as the fallback and raises `hm.intervals.agent_timeout` to
+  240 s or more, as [HA and Resurrection](ha-and-resurrection.md) says.
 
 Applied automatically by `scripts/cf bosh-deploy`:
 

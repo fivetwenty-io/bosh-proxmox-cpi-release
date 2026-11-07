@@ -76,7 +76,7 @@ class: visual-right
 
 <!--
 - The seam: our scorer runs once and the process exits, but PVE HA can migrate a VM off our chosen node minutes later. The score alone has no memory.
-- pve.ha.pin_az (set to on, with pve.ha.mode at auto or managed) writes a per-VM bosh-na-{vmid} node-affinity rule pinning the VM to its AZ's node set — that survives our exit and keeps HA failover and DLB inside the AZ.
+- With pve.ha.mode at auto or managed, every HA-registered VM gets a per-VM bosh-na-{vmid} node-affinity rule that survives our exit. pve.ha.pin_az (auto or on) folds the VM's AZ node set into it, so HA failover and DLB stay inside the AZ.
 - pve.ha.pin_az_strict defaults true (hard: HA won't relocate off-AZ even if every AZ node is down); set false for a preferred pin that allows off-AZ relocation on total AZ failure.
 - PCI passthrough is incompatible with live migration, so a VM with pci_passthroughs gets a strict node-affinity pin automatically when HA is on, and it is not operator-tunable.
 - The per-VM pin needs no cluster lock (keyed on vmid, not a shared group); delete_vm removes the rule when it carries this Director's ownership marker. The pin is mutually exclusive with the DLB sentinel — a sentinel VM has no fixed AZ to pin to.
@@ -104,7 +104,7 @@ flowchart LR
 <!--
 - The honest admission: a one-shot scorer can't chase load that shifts after create. PVE 9.2's DLB is the continuous rebalancer we lack, so for HA guests we will register and step aside instead of pretending to balance.
 - Two opt-in triggers: the master flag (every VM, still inside its AZ node set) or the sentinel AZ "dlb" — which skips az_map and the scorer, lands on any online node, registers auto-rebalance=1, and skips the AZ pin. Both need pve.ha.mode at auto or managed, and the sentinel fails create_vm when the mode is off.
-- The ownership rule that matters: PVE HA recovers first and the BOSH resurrector is the fallback. delete_vm defers while PVE HA fences or recovers the VM, and operators raise agent_timeout to 240 seconds or more, so the resurrector does not build a duplicate that collides on IP, VMID, and agent credentials. The CPI cannot see the resurrector's state, so the timeout is the operator's half of the arrangement.
+- The ownership rule that matters: PVE HA recovers first and the BOSH resurrector is the fallback. delete_vm defers while PVE HA fences or recovers the VM, and operators raise the Director's hm.intervals.agent_timeout to 240 seconds or more, so the resurrector does not build a duplicate that collides on IP, VMID, and agent credentials. The CPI cannot see the resurrector's state, so the timeout is the operator's half of the arrangement.
 - More gates before DLB does anything: shared storage (live migration can't move local disks — the CPI always checks and silently skips them), 3-node quorum, and SDN that keeps IP+MAC across migration. Single-node or pre-9.2 clusters make the whole feature inert.
 - Two things to never DLB: the Director itself (a mid-deploy migration drops in-flight CPI RPCs) and large-dirty-memory VMs (migration pause can exceed the agent heartbeat). The CPI never writes the dynamic-mode CRS setting, because that's a cluster-wide change affecting every HA guest. It reads the setting and warns, and the operator applies it.
 -->

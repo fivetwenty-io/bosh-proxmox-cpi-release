@@ -544,7 +544,7 @@ REMOVED_KEYS_TSV="$(cat <<'KEYS'
 {"dlb":{"enabled":VAL}}|pve.placement.dlb.enabled|use pve.ha.dlb.enabled with pve.ha.mode: auto
 {"dlb":{"az_name":VAL}}|pve.placement.dlb.az_name|use pve.ha.dlb.az_name
 {"dlb":{"manage_cluster_crs":VAL}}|pve.placement.dlb.manage_cluster_crs|delete it; the CPI no longer writes the cluster CRS mode, so set the CRS mode in PVE
-{"dlb":{"require_shared_storage":VAL}}|pve.placement.dlb.require_shared_storage|delete it; a VM with a node-local volume is never registered for DLB
+{"dlb":{"require_shared_storage":VAL}}|pve.placement.dlb.require_shared_storage|delete it; a VM with a node-local volume gets no DLB movement, because local_policy none skips it and hold and replicate pin it to its node
 {"exclude_maintenance_nodes":VAL}|pve.placement.exclude_maintenance_nodes|delete it; the node health check always runs
 KEYS
 )"

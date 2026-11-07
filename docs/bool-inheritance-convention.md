@@ -132,9 +132,10 @@ A deployment that adds no new spec properties gets exactly the behavior it had b
   TLS field), not `false`. The six-level chain still applies; Level 6 is `true`.
   `pve_verify_ssl` is also a Level-4 override key, so one cpi-config entry can
   differ from the job-level setting.
-- `PlacementConfig.ExcludeMaintenanceNodes` defaults to `true` for the same
-  reason (protective default).
-- `PlacementConfig.PinAZStrict` defaults to `true` when `PinAZViaHARules` is enabled.
+- `pve.ha.pin_az_strict` defaults to `true` for the same reason (protective
+  default), read through `HAPinAZStrictValue()`. The earlier
+  `PlacementConfig.ExcludeMaintenanceNodes` and `PlacementConfig.PinAZStrict`
+  fields were removed with their placement keys.
 
 These fields use accessor methods that encode the Level 6 constant explicitly
 rather than relying on the Go zero value.

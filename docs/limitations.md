@@ -81,7 +81,7 @@ This page collects every known limitation of the CPI in one place. Each entry is
   The CPI reads quorum, the CRM master, node versions, and the token's privileges each time it needs the HA profile, and it keeps no cache. Every call that touches HA pays for those reads. See [HA and Resurrection](ha-and-resurrection.md#the-cluster-has-to-pass-the-profile-first).
 
 - A two-node cluster passes the profile only with a QDevice
-  The CPI counts a QDevice's votes only while it is connected, and it treats a QDevice answer that does not state a connection as one vote with an unknown status. We recommend three or more nodes. See [HA and Resurrection](ha-and-resurrection.md#quorum-votes-and-the-qdevice).
+  The survives-one check counts every vote a configured QDevice carries, connected or not, and it treats a QDevice answer that does not state a connection as one configured vote with an unknown status. A configured QDevice that is disconnected still lets a two-node cluster pass the profile. Only the check for a fragile node counts a QDevice's votes while it is connected, so a disconnected QDevice shows up as a `quorum_fragile` finding and triggers the watchdog check. We recommend three or more nodes. See [HA and Resurrection](ha-and-resurrection.md#quorum-votes-and-the-qdevice).
 
 - The CPI reads whether a watchdog is armed, not whether it works
   A missing, misconfigured, or blocked watchdog cannot be seen from the API, so operators test each node's watchdog before enabling HA. See [HA and Resurrection](ha-and-resurrection.md#test-each-nodes-watchdog-before-you-turn-ha-on).

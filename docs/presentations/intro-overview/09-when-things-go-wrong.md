@@ -57,7 +57,7 @@ flowchart LR
 | | Recovery owner | Our action |
 |---|---|---|
 | Default | BOSH resurrector | Nothing |
-| HA opted in | Proxmox HA first, resurrector as fallback | Raise `agent_timeout` to 240 seconds or more |
+| HA opted in | Proxmox HA first, resurrector as fallback | Raise `hm.intervals.agent_timeout` to 240 seconds or more |
 
 - Two healers left uncoordinated → duplicate machines fighting over an address
 

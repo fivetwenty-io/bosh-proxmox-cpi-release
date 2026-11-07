@@ -60,19 +60,18 @@ func haRegistrationFeatures(deps Deps, cp createVMCloudProps, node string, env m
 	return out
 }
 
-// warnHAResurrectorConflictOnce emits the single warning create_vm makes per
-// CPI process when it registers a VM under any HA-registration feature (DLB,
-// anti-affinity HA rules, or AZ node-affinity pinning). PVE HA and the BOSH
-// resurrector independently detect and restart a failed guest: PVE HA
-// relocates the guest to another node while the Director, seeing the
-// original VMID become unresponsive, issues its own create_vm, producing a
-// duplicate that conflicts with the HA-recovered guest on IP, VMID, or agent
-// credentials. The CPI cannot detect the resurrector's runtime state, so it
-// can only warn, not prevent the race — see docs/dlb-aware-placement.md and
-// docs/ha-and-resurrection.md for the full ownership matrix and the
-// `bosh update-resurrection off` remediation.
+// warnHAResurrectorConflictOnce logs, once per CPI process, the line that
+// create_vm writes when it registers a VM under any HA-registration feature
+// (DLB, anti-affinity HA rules, or AZ node-affinity pinning). PVE HA and the
+// BOSH resurrector can both try to restart a failed guest. The CPI keeps them
+// from fighting: PVE HA recovers the guest first, the resurrector stays on as
+// the fallback, and delete_vm defers while PVE HA is fencing or recovering
+// the VM. The line tells the operator that ownership model and recommends a
+// Director agent_timeout of 240 seconds or more, so PVE HA finishes most
+// recoveries before the resurrector looks at the VM. See
+// docs/ha-and-resurrection.md for the full ownership matrix.
 //
-// One warning per CPI process is enough to alert the operator without
+// One line per CPI process is enough to inform the operator without
 // flooding logs on every subsequent HA-registered create_vm — mirrors the
 // vniZoneListWarnOnce once-per-process idiom (internal/pve/vni.go). The gate
 // itself and its test seam live in ha_warn_seam.go.
@@ -83,7 +82,7 @@ func haRegistrationFeatures(deps Deps, cp createVMCloudProps, node string, env m
 // HA-registration feature fired for this VM) or logger is nil.
 //
 // NOTE for tests asserting on checkISOStorageForHA's logger: that function
-// writes BOTH this once-per-process warning and the per-call ISO
+// writes BOTH this once-per-process line and the per-call ISO
 // migration-safety warning to the same logger. Assert on the specific message
 // under test rather than on buffer emptiness or length — otherwise whichever
 // test reaches this gate first in the binary captures an extra line and the
@@ -97,13 +96,10 @@ func warnHAResurrectorConflictOnce(vmid int, features []haRegistrationFeature, l
 		for i, f := range features {
 			featureNames[i] = string(f)
 		}
-		logger.Warn("create_vm: this VM is registered as a PVE HA resource; the BOSH resurrector "+
-			"must be disabled for HA-managed deployments, or PVE HA and the resurrector can both "+
-			"try to recover the same failed guest independently, producing a duplicate VM that "+
-			"conflicts on IP, VMID, or agent credentials -- run `bosh update-resurrection off` "+
-			"(or set resurrector_enabled: false in the Director manifest) for any deployment using "+
-			"pve.ha.dlb, pve.ha.anti_affinity, or pve.ha.pin_az; "+
-			"see docs/ha-and-resurrection.md",
+		logger.Info("create_vm: this VM is registered as a PVE HA resource; PVE HA recovers it first and the "+
+			"BOSH resurrector is the fallback, and delete_vm defers while PVE HA is fencing or recovering the "+
+			"VM; we recommend a Director agent_timeout (hm.intervals.agent_timeout) of 240 seconds or more so "+
+			"PVE HA can finish most recoveries first; see docs/ha-and-resurrection.md",
 			log.Int(metadataKeyVMID, vmid),
 			log.String("features", strings.Join(featureNames, ",")),
 		)
