@@ -199,21 +199,45 @@ func storageAuditReplicaTargetMatches(record aj.Record, step aj.Step, stores map
 }
 
 // storageAuditReplicationRead is the one read of PVE's replication jobs that
-// an audit makes, taken the first time a move rule needs it.
+// an audit makes, taken the first time a move rule needs it. failure is a
+// problem with the listing as a whole. faults are the entries that could not
+// be used, each kept with the guest it provably belongs to, so a VM's audit
+// can ignore the ones that belong to another guest.
 type storageAuditReplicationRead struct {
 	jobs    map[string]sdkcluster.GetReplicationResponse
 	failure string
+	faults  []storageAuditReplicationFault
 }
 
-// replicationJobs returns PVE's replication jobs by ID, reading them on first
-// use. On a failed or malformed read it returns the reason, which leaves
-// every move that needs a job undecided rather than refused, because a
-// failed read proves nothing about the job.
-func (r *StorageAllocationAudit) replicationJobs(ctx context.Context, deps Deps) (map[string]sdkcluster.GetReplicationResponse, string) {
+// storageAuditReplicationFault is a listed entry that is malformed or repeats
+// an ID. guest is the VMID the entry provably names, and known is false when
+// the entry names none or names two that disagree.
+type storageAuditReplicationFault struct {
+	guest  int
+	known  bool
+	reason string
+}
+
+// replicationJobs returns PVE's replication jobs by ID for the audit of VM
+// vmid, reading them on first use. On a failed read, or when the listing holds
+// a fault that belongs to vmid or to no provable guest, it returns the reason,
+// which leaves every move that needs a job undecided rather than refused,
+// because a failed read proves nothing about the job. A fault that provably
+// belongs to another guest is ignored, so that guest's permanent oddity cannot
+// defer this VM's audit.
+func (r *StorageAllocationAudit) replicationJobs(ctx context.Context, deps Deps, vmid int) (map[string]sdkcluster.GetReplicationResponse, string) {
 	if r.replication == nil {
 		r.replication = readStorageAuditReplication(ctx, deps)
 	}
-	return r.replication.jobs, r.replication.failure
+	if r.replication.failure != "" {
+		return nil, r.replication.failure
+	}
+	for _, fault := range r.replication.faults {
+		if !fault.known || fault.guest == vmid {
+			return nil, fault.reason
+		}
+	}
+	return r.replication.jobs, ""
 }
 
 func readStorageAuditReplication(ctx context.Context, deps Deps) *storageAuditReplicationRead {
@@ -228,18 +252,59 @@ func readStorageAuditReplication(ctx context.Context, deps Deps) *storageAuditRe
 	if response == nil {
 		return &storageAuditReplicationRead{failure: "replication jobs could not be listed: PVE returned no listing"}
 	}
-	jobs := map[string]sdkcluster.GetReplicationResponse{}
+	read := &storageAuditReplicationRead{jobs: map[string]sdkcluster.GetReplicationResponse{}}
 	for entry, raw := range *response {
+		guest, known := storageAuditReplicationEntryGuest(raw)
 		var job sdkcluster.GetReplicationResponse
 		if err := json.Unmarshal(raw, &job); err != nil || job.Id == "" {
-			return &storageAuditReplicationRead{failure: fmt.Sprintf("replication jobs could not be listed: entry %d is malformed", entry)}
+			read.faults = append(read.faults, storageAuditReplicationFault{guest: guest, known: known, reason: fmt.Sprintf("replication jobs could not be listed: entry %d is malformed", entry)})
+			continue
 		}
-		if _, repeated := jobs[job.Id]; repeated {
-			return &storageAuditReplicationRead{failure: fmt.Sprintf("replication jobs could not be listed: job %s is listed twice", storageAuditField(job.Id))}
+		if _, repeated := read.jobs[job.Id]; repeated {
+			read.faults = append(read.faults, storageAuditReplicationFault{guest: guest, known: known, reason: fmt.Sprintf("replication jobs could not be listed: job %s is listed twice", storageAuditField(job.Id))})
+			continue
 		}
-		jobs[job.Id] = job
+		read.jobs[job.Id] = job
 	}
-	return &storageAuditReplicationRead{jobs: jobs}
+	return read
+}
+
+// storageAuditReplicationEntryGuest reads the VMID that a listed job entry
+// names, from its guest field and from the guest part of its ID, without
+// requiring the rest of the entry to be well formed. known is false when the
+// entry names no guest or its two fields name different ones.
+func storageAuditReplicationEntryGuest(raw json.RawMessage) (int, bool) {
+	var entry struct {
+		ID    json.RawMessage `json:"id"`
+		Guest json.RawMessage `json:"guest"`
+	}
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		return 0, false
+	}
+	var fromGuest, fromID int
+	var number json.Number
+	if json.Unmarshal(entry.Guest, &number) == nil {
+		if value, err := strconv.Atoi(number.String()); err == nil && value > 0 {
+			fromGuest = value
+		}
+	}
+	var id string
+	if json.Unmarshal(entry.ID, &id) == nil {
+		if prefix, _, found := strings.Cut(id, "-"); found {
+			if value, err := strconv.Atoi(prefix); err == nil && value > 0 {
+				fromID = value
+			}
+		}
+	}
+	switch {
+	case fromGuest != 0 && fromID != 0 && fromGuest != fromID:
+		return 0, false
+	case fromGuest != 0:
+		return fromGuest, true
+	case fromID != 0:
+		return fromID, true
+	}
+	return 0, false
 }
 
 // deferReplication records an issue that a failed replication read raised.
@@ -374,7 +439,7 @@ func storageAuditObservedReplicatedMove(ctx context.Context, deps Deps, result *
 	}
 	detail := &StorageReplicaMove{VolumeSetGeneration: set.Generation, Failover: plan.failover}
 	if plan.failover {
-		jobs, failure := result.replicationJobs(ctx, deps)
+		jobs, failure := result.replicationJobs(ctx, deps, evidence.VMID)
 		if failure != "" {
 			return storageAuditMoveVerdict{refusal: failure, deferred: true, replicated: true}
 		}

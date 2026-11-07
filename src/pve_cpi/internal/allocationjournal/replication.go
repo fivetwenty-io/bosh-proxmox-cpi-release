@@ -140,21 +140,39 @@ func (r Replication) Candidates() []ReplicaJob {
 	return jobs
 }
 
+// ReplicaClockSkewTolerance bounds how far the clock of a PVE node may differ
+// from the clock of the node that runs the CPI. A volume set's ChangedAt comes
+// from the CPI clock and a sync's LastSync from the PVE clock, so a sync only
+// counts as later than a change when it is later by more than this bound.
+// Without it, a PVE clock that runs ahead could make a sync that began before
+// the change look as if it followed it. A sync inside the bound is refused,
+// which leaves the replica unproven until the next sync.
+const ReplicaClockSkewTolerance = 5 * time.Minute
+
+// syncFollowsChange reports whether a sync's last_sync, read from the PVE
+// clock, is later than a volume set's change on the CPI clock by more than
+// the clock-skew tolerance.
+func syncFollowsChange(lastSync, changedAt time.Time) bool {
+	return lastSync.After(changedAt.Add(ReplicaClockSkewTolerance))
+}
+
 // CoveredVolumeSet returns the volume set that the last verified sync of
 // job's direction covered, and reports false unless the replica on
 // job.Target is recoverable. It is recoverable only when no volume change is
-// in flight that could outdate it, when the sync covered
-// the newest committed set through this job in this direction, and when its
-// last_sync is later than that set's change.
+// in flight that could outdate it, when the sync covered the newest committed
+// set through this job, in this generation and direction, and when its
+// last_sync is later than that set's change by more than the clock skew. A
+// sync of an older generation of the job never covers the set, because the
+// job's replica may have been removed since.
 func (r Replication) CoveredVolumeSet(job ReplicaJob) (ReplicaVolumeSet, bool) {
 	if _, pending := r.PendingVolumeSet(); pending || r.Sync == nil {
 		return ReplicaVolumeSet{}, false
 	}
 	set, ok := r.CommittedVolumeSet()
-	if !ok || r.Sync.VolumeSetGeneration != set.Generation || !r.Sync.LastSync.After(set.ChangedAt) {
+	if !ok || r.Sync.VolumeSetGeneration != set.Generation || !syncFollowsChange(r.Sync.LastSync, set.ChangedAt) {
 		return ReplicaVolumeSet{}, false
 	}
-	if r.Sync.JobID != job.ID || r.Sync.Source != job.Source || r.Sync.Target != job.Target {
+	if r.Sync.JobID != job.ID || r.Sync.JobGeneration != job.Generation || r.Sync.Source != job.Source || r.Sync.Target != job.Target {
 		return ReplicaVolumeSet{}, false
 	}
 	return set, true
@@ -335,7 +353,7 @@ func validateReplicaSync(rep Replication) error {
 		return fmt.Errorf("%w: replica sync names no volume set", ErrCorrupt)
 	}
 	set := rep.VolumeSets[sync.VolumeSetGeneration-1]
-	if set.Pending || set.Abandoned || !sync.LastSync.After(set.ChangedAt) {
+	if set.Pending || set.Abandoned || !syncFollowsChange(sync.LastSync, set.ChangedAt) {
 		return fmt.Errorf("%w: replica sync predates or misses its volume set", ErrCorrupt)
 	}
 	return nil
@@ -526,7 +544,7 @@ func settleReplicaVolumeSet(rep *Replication, generation uint64, abandon bool) e
 // RecordReplicaSync records the evidence of a verified sync before the CPI
 // widens the VM's pin. The sync must name the confirmed job in its recorded
 // direction and the newest committed volume set, with a last_sync later than
-// that set's change, and no change or job generation may be in flight. The
+// that set's change by more than the clock skew, and no change or job generation may be in flight. The
 // caller has checked the rest of the evidence in PVE just before.
 func (h *Handle) RecordReplicaSync(sync ReplicaSync) error {
 	return h.saveReplication(false, func(rep *Replication) error {
@@ -541,8 +559,8 @@ func (h *Handle) RecordReplicaSync(sync ReplicaSync) error {
 		if !ok || sync.VolumeSetGeneration != set.Generation || sync.JobID != job.ID || sync.JobGeneration != job.Generation || sync.Source != job.Source || sync.Target != job.Target {
 			return fmt.Errorf("%w: the sync does not name the current job and volume set", ErrConflict)
 		}
-		if !sync.LastSync.After(set.ChangedAt) {
-			return fmt.Errorf("%w: the sync started before volume set %d changed", ErrConflict, set.Generation)
+		if !syncFollowsChange(sync.LastSync, set.ChangedAt) {
+			return fmt.Errorf("%w: the sync did not start clearly after volume set %d changed", ErrConflict, set.Generation)
 		}
 		sync.LastSync, sync.VerifiedAt = utc(sync.LastSync), utc(sync.VerifiedAt)
 		rep.Sync = &sync

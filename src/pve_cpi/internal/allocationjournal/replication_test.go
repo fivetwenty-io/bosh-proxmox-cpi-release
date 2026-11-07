@@ -205,12 +205,12 @@ func TestReplicaVolumeSetsAndSyncEvidence(t *testing.T) {
 	if err := h.RecordReplicaSync(replicaSyncOf(job, 2, replicaEpoch.Add(time.Minute))); !errors.Is(err, ErrConflict) {
 		t.Fatalf("a sync of an unknown set: %v", err)
 	}
-	wrong := replicaSyncOf(job, 1, replicaEpoch.Add(time.Minute))
+	wrong := replicaSyncOf(job, 1, replicaEpoch.Add(time.Hour))
 	wrong.Target = "node-c"
 	if err := h.RecordReplicaSync(wrong); !errors.Is(err, ErrConflict) {
 		t.Fatalf("a sync in another direction: %v", err)
 	}
-	if err := h.RecordReplicaSync(replicaSyncOf(job, 1, replicaEpoch.Add(time.Minute))); err != nil {
+	if err := h.RecordReplicaSync(replicaSyncOf(job, 1, replicaEpoch.Add(time.Hour))); err != nil {
 		t.Fatal(err)
 	}
 	rep := h.Record().Replication
@@ -257,7 +257,7 @@ func TestReplicaVolumeSetsAndSyncEvidence(t *testing.T) {
 	if err := h.RecordReplicaSync(replicaSyncOf(job, 2, changed.Add(-time.Second))); !errors.Is(err, ErrConflict) {
 		t.Fatalf("a sync that began before the change: %v", err)
 	}
-	if err := h.RecordReplicaSync(replicaSyncOf(job, 2, changed.Add(time.Second))); err != nil {
+	if err := h.RecordReplicaSync(replicaSyncOf(job, 2, changed.Add(time.Hour))); err != nil {
 		t.Fatal(err)
 	}
 	if !h.Record().Replication.Recoverable() {
@@ -381,7 +381,11 @@ func TestReplicationRecordValidation(t *testing.T) {
 		"zero change time":       func(r *Replication) { r.VolumeSets[0].ChangedAt = time.Time{} },
 		"zero charge":            func(r *Replication) { r.VolumeSets[0].Charges = []ReplicaCharge{{CapacityKey: "k"}} },
 		"sync before its change": func(r *Replication) { s := replicaSyncOf(*r.Job, 1, replicaEpoch); r.Sync = &s },
-		"sync of no set":         func(r *Replication) { s := replicaSyncOf(*r.Job, 4, replicaEpoch.Add(time.Hour)); r.Sync = &s },
+		"sync within the skew": func(r *Replication) {
+			s := replicaSyncOf(*r.Job, 1, replicaEpoch.Add(ReplicaClockSkewTolerance))
+			r.Sync = &s
+		},
+		"sync of no set": func(r *Replication) { s := replicaSyncOf(*r.Job, 4, replicaEpoch.Add(time.Hour)); r.Sync = &s },
 		"copy without volids": func(r *Replication) {
 			r.Copies = []ReplicaCopy{{Kind: ReplicaCopyOrphan, Node: "node-c", JobID: "101-0", RecordedAt: replicaEpoch}}
 		},
@@ -426,7 +430,7 @@ func TestReplicationTransitionRules(t *testing.T) {
 		})
 	}
 	withSync := cloneRecord(old)
-	s := replicaSyncOf(*old.Replication.Job, 1, replicaEpoch.Add(time.Minute))
+	s := replicaSyncOf(*old.Replication.Job, 1, replicaEpoch.Add(time.Hour))
 	withSync.Replication.Sync = &s
 	dropped := cloneRecord(withSync)
 	dropped.Replication.Sync = nil
@@ -469,5 +473,68 @@ func TestReplicationCrashBetweenPendingAndConfirm(t *testing.T) {
 	stored, err = j.Inspect(id)
 	if err != nil || stored.Replication.PendingJob == nil || stored.Replication.Job.Generation != 1 {
 		t.Fatalf("the faulted confirm changed the record: %+v, %v", stored.Replication, err)
+	}
+}
+
+func TestReplicaSyncOfAnOlderJobGenerationDoesNotCover(t *testing.T) {
+	j, _ := fixture(t)
+	h := replicatedVM(t, j)
+	defer closeHandle(t, h)
+	first := *h.Record().Replication.Job
+	if err := h.RecordReplicaSync(replicaSyncOf(first, 1, replicaEpoch.Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	if !h.Record().Replication.Recoverable() {
+		t.Fatal("a sync of the current job generation is not recoverable")
+	}
+	// The job comes back under the same ID and direction as generation 2,
+	// which can have removed the replica the first generation's sync covered.
+	generation, err := h.PrepareReplicationJob(replicaJob("node-a", "node-b"))
+	if err != nil || generation != 2 {
+		t.Fatalf("prepare job = %d, %v", generation, err)
+	}
+	if err := h.ConfirmReplicationJob(2); err != nil {
+		t.Fatal(err)
+	}
+	rep := h.Record().Replication
+	if rep.Job.Generation != 2 || rep.Sync == nil || rep.Sync.JobGeneration != 1 {
+		t.Fatalf("expected the generation 1 sync to outlive the confirm: %+v", rep)
+	}
+	if _, covered := rep.CoveredVolumeSet(*rep.Job); covered || rep.Recoverable() {
+		t.Fatal("a sync of job generation 1 covers generation 2")
+	}
+	if err := h.RecordReplicaSync(replicaSyncOf(*rep.Job, 1, replicaEpoch.Add(2*time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	if !h.Record().Replication.Recoverable() {
+		t.Fatal("a sync of generation 2 is not recoverable")
+	}
+}
+
+func TestReplicaSyncMustFollowTheChangeBeyondTheClockSkew(t *testing.T) {
+	j, _ := fixture(t)
+	h := replicatedVM(t, j)
+	defer closeHandle(t, h)
+	job := *h.Record().Replication.Job
+	for name, lastSync := range map[string]time.Time{
+		"at the change":       replicaEpoch,
+		"inside the skew":     replicaEpoch.Add(ReplicaClockSkewTolerance - time.Second),
+		"exactly at the skew": replicaEpoch.Add(ReplicaClockSkewTolerance),
+	} {
+		if err := h.RecordReplicaSync(replicaSyncOf(job, 1, lastSync)); !errors.Is(err, ErrConflict) {
+			t.Fatalf("a sync %s: %v", name, err)
+		}
+	}
+	if err := h.RecordReplicaSync(replicaSyncOf(job, 1, replicaEpoch.Add(ReplicaClockSkewTolerance+time.Second))); err != nil {
+		t.Fatalf("a sync beyond the skew: %v", err)
+	}
+	rep := h.Record().Replication
+	if !rep.Recoverable() {
+		t.Fatalf("a sync beyond the skew does not cover the set: %+v", rep)
+	}
+	// A record that carries a sync inside the skew covers nothing.
+	rep.Sync.LastSync = replicaEpoch.Add(ReplicaClockSkewTolerance - time.Second)
+	if _, covered := rep.CoveredVolumeSet(*rep.Job); covered {
+		t.Fatal("a sync inside the clock skew covers the set")
 	}
 }

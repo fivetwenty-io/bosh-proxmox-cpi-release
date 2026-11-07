@@ -78,6 +78,8 @@ type replicaFixture struct {
 	attached []string
 	// listedOn adds nodes whose listings hold every node-local volume.
 	listedOn []string
+	// otherJobs are further entries in PVE's job list, after pveJob.
+	otherJobs []map[string]any
 
 	vm, disk          aj.Record
 	root, eph, pdisk  string
@@ -139,6 +141,7 @@ func (f *replicaFixture) build() []aj.Record {
 	if f.pveJob != nil {
 		f.jobs.jobs = []map[string]any{f.pveJob}
 	}
+	f.jobs.jobs = append(f.jobs.jobs, f.otherJobs...)
 	return []aj.Record{f.vm, f.disk}
 }
 
@@ -506,6 +509,64 @@ func TestAllocationAuditDefersReplicaMoveOnFailedReplicationRead(t *testing.T) {
 	report = f.audit()
 	if !findingWith(report.Issues, "remote allocation "+f.vm.ID, "replication jobs could not be listed: entry 0 is malformed") {
 		t.Fatalf("malformed listing: %s", strings.Join(report.Issues, "\n"))
+	}
+}
+
+// TestAllocationAuditIgnoresMalformedJobsOfAnotherGuest pins that an entry in
+// PVE's job list that provably belongs to another VMID does not defer this
+// VM's audit, however malformed it is, while an entry that names this VM or
+// no readable VMID still does.
+func TestAllocationAuditIgnoresMalformedJobsOfAnotherGuest(t *testing.T) {
+	foreign := map[string]map[string]any{
+		"unusable body, guest field":     {"id": "456-0", "guest": 456, "type": []int{1}},
+		"no id, guest field":             {"guest": 456, "target": "pve2"},
+		"no id, string guest field":      {"guest": "456"},
+		"no guest field, id names guest": {"id": "456-0", "type": []int{1}},
+	}
+	for name, entry := range foreign {
+		t.Run("foreign "+name, func(t *testing.T) {
+			f := newReplicaFixture(t)
+			f.otherJobs = []map[string]any{entry}
+			report := f.audit()
+			requireClean(t, report)
+			if _, found := f.vmMove(report); !found {
+				t.Fatalf("failover not accepted beside a foreign malformed job: %+v", report.ObservedMoves)
+			}
+			if err := storageAuditGateError(context.Background(), f.deps, "VM cleanup", report, storageAuditGateAll); err != nil {
+				t.Fatalf("a foreign malformed job deferred the cleanup gate: %v", err)
+			}
+		})
+	}
+	t.Run("foreign repeated ID", func(t *testing.T) {
+		f := newReplicaFixture(t)
+		other := map[string]any{"id": "456-0", "type": "local", "guest": 456, "jobnum": 0, "target": "pve3", "schedule": "*/15"}
+		f.otherJobs = []map[string]any{other, other}
+		requireClean(t, f.audit())
+	})
+	deferring := map[string]struct {
+		entry  map[string]any
+		reason string
+	}{
+		"names this VM":                 {map[string]any{"id": "123-1", "guest": 123, "type": []int{1}}, "entry 1 is malformed"},
+		"names this VM only by its ID":  {map[string]any{"id": "123-1", "type": []int{1}}, "entry 1 is malformed"},
+		"names no guest":                {map[string]any{"target": "pve2"}, "entry 1 is malformed"},
+		"guest field and ID disagree":   {map[string]any{"id": "123-1", "guest": 456, "type": []int{1}}, "entry 1 is malformed"},
+		"guest field names no VMID":     {map[string]any{"id": "x-1", "guest": "none", "type": []int{1}}, "entry 1 is malformed"},
+		"repeats this VM's job ID":      {map[string]any{"id": "123-0", "type": "local", "guest": 123, "jobnum": 0, "target": "pve2"}, "job 123-0 is listed twice"},
+		"repeats an ID, guest disagree": {map[string]any{"id": "123-0", "type": "local", "guest": 456, "jobnum": 0, "target": "pve2"}, "job 123-0 is listed twice"},
+	}
+	for name, tc := range deferring {
+		t.Run("defers "+name, func(t *testing.T) {
+			f := newReplicaFixture(t)
+			f.otherJobs = []map[string]any{tc.entry}
+			report := f.audit()
+			if len(report.Conflicts) != 0 || report.Complete {
+				t.Fatalf("a job of this VM or of no known guest did not defer: %+v", report.Conflicts)
+			}
+			if !findingWith(report.Issues, "remote allocation "+f.vm.ID, "replication jobs could not be listed: "+tc.reason) {
+				t.Fatalf("no undecided issue: %s", strings.Join(report.Issues, "\n"))
+			}
+		})
 	}
 }
 
