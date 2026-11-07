@@ -1413,23 +1413,35 @@ func attachPersistentDisks(
 		if resolveErr != nil {
 			return resolveErr
 		}
+		// The VM was created moments ago, and an HA service or an operator can
+		// start moving it before the last disk is attached. The wait follows
+		// the VM to the node it is on now, so each attach below runs there,
+		// and refuses a node the cluster does not report able to answer.
+		attachNode := shape.node
+		settled, settleErr := settleDiskVM(ctx, deps, "create_vm", vmCID, vmid, true)
+		if settleErr != nil {
+			return settleErr
+		}
+		if settled.Found {
+			attachNode = settled.Node
+		}
 		if rd.allocation != nil || parsed.storageRuntime != nil {
 			var attachErr error
 			if parsed.storageRuntime != nil {
 				attachErr = parsed.storageRuntime.attachPersistent(ctx, rd)
 			} else {
-				_, attachErr = attachManagedPersistentDisk(ctx, deps, vmCID, shape.node, vmid, rd)
+				_, attachErr = attachManagedPersistentDisk(ctx, deps, vmCID, attachNode, vmid, rd)
 			}
 			if attachErr != nil {
 				return attachErr
 			}
 			continue
 		}
-		plan, guardErr := guardAndUnparkBeforeAttach(ctx, deps, "create_vm", &rd, shape.node, vmid)
+		plan, guardErr := guardAndUnparkBeforeAttach(ctx, deps, "create_vm", &rd, attachNode, vmid)
 		if guardErr != nil {
 			return guardErr
 		}
-		diskID, devPath, err := attachDiskCore(ctx, deps, "create_vm", vmCID, shape.node, vmid, diskCID, rd, plan)
+		diskID, devPath, err := attachDiskCore(ctx, deps, "create_vm", vmCID, attachNode, vmid, diskCID, rd, plan)
 		if err != nil {
 			return err
 		}

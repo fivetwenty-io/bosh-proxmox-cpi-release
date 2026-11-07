@@ -237,7 +237,9 @@ func TestHandleDeleteSnapshot_MissingNode(t *testing.T) {
 		PVE:    &mockPVEClient{qemuSvc: qemuSvc, clusterSvc: clusterSvc},
 		Logger: log.NewNopLogger(),
 	})
-	_, err := h.Handle(context.Background(), marshalArgs("100:bosh-snap"), jsonrpc.Context{})
+	// The settle wait polls a failing scan for its whole budget, so the wait
+	// runs on a fake clock.
+	_, err := h.Handle(settleTestCtx(), marshalArgs("100:bosh-snap"), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when cluster service fails")
 	}

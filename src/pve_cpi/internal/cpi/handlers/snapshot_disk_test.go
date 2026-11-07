@@ -119,6 +119,39 @@ func (m *snapClusterService) ListConfigNodes(ctx context.Context) (*sdkclusterap
 	return authConfigNodesFromResources(rows, testNode), nil
 }
 
+// ListStatus reports every node of the index fixture, and testNode, online, so
+// the health check the disk handlers make before acting on a VM finds its node
+// able to answer.
+func (m *snapClusterService) ListStatus(ctx context.Context) (*sdkclusterapi.ListStatusResponse, error) {
+	rows, err := m.ListResources(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return onlineStatusFromResources(rows), nil
+}
+
+// ListHaStatusManagerStatus is an idle CRM, which is what a cluster with no HA
+// services reports.
+func (m *snapClusterService) ListHaStatusManagerStatus(
+	_ context.Context,
+) (*sdkclusterapi.ListHaStatusManagerStatusResponse, error) {
+	return handlers.AbsenceIdleCRM(), nil
+}
+
+// ListHaStatusCurrent is a cluster with no HA services.
+func (m *snapClusterService) ListHaStatusCurrent(
+	_ context.Context,
+) (*sdkclusterapi.ListHaStatusCurrentResponse, error) {
+	return handlers.AbsenceNoHAStatus(), nil
+}
+
+// ListHaResources is a cluster with no HA resources.
+func (m *snapClusterService) ListHaResources(
+	_ context.Context, _ *sdkclusterapi.ListHaResourcesParams,
+) (*sdkclusterapi.ListHaResourcesResponse, error) {
+	return handlers.AbsenceHAResources(), nil
+}
+
 // ---------------------------------------------------------------------------
 // helper: build a cluster response with one VM entry.
 // ---------------------------------------------------------------------------
@@ -860,12 +893,6 @@ func TestHandleSnapshotDisk_InRangeNoParkerTag_Proceeds(t *testing.T) {
 // integration-test harness provides a cifs pool via env.
 //
 // func TestHandleSnapshotDisk_CIFS_CID(t *testing.T) { ... }
-
-// ListStatus reports no offline members; the fixture cluster is fully online.
-func (m *snapClusterService) ListStatus(context.Context) (*sdkclusterapi.ListStatusResponse, error) {
-	empty := sdkclusterapi.ListStatusResponse{}
-	return &empty, nil
-}
 
 // TestHandleSnapshotDisk_SnapshotCIDNamesTheHolderCID pins the snapshot CID's
 // VM half. It is the holder's stamped CID, rebuilt from the holder's cluster

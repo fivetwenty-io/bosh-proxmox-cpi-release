@@ -948,15 +948,17 @@ func TestHandleDeleteDisk_Guard_Off_NoOwnerLookup(t *testing.T) {
 		t.Error("guard off: delete must proceed")
 	}
 	// The delete-state guard is off, so the only lookups left belong to the
-	// unconditional holder scan: two fixture reads (the authoritative
-	// enumeration derives cluster membership and the per-node listing from
-	// the same fixture) and one config read to find the volume in that VM.
+	// unconditional holder scan and the wait for the holder to settle: three
+	// fixture reads (the settle wait reads the index once, and the
+	// authoritative enumeration derives cluster membership and the per-node
+	// listing from the same fixture) and one config read to find the volume in
+	// that VM.
 	// The stranded-parker decision reads the tags that same read returned, so
 	// it adds nothing, which is also what keeps it from having to decide
 	// what an unreadable config means on a path whose fallback is destroying
 	// the volume. The guard would add its own owner lookup on top.
-	if *listCalls != 2 || *configReads != 1 {
-		t.Errorf("guard off: only the holder scan should look (config=%d want 1, list=%d want 2)", *configReads, *listCalls)
+	if *listCalls != 3 || *configReads != 1 {
+		t.Errorf("guard off: only the holder scan should look (config=%d want 1, list=%d want 3)", *configReads, *listCalls)
 	}
 }
 

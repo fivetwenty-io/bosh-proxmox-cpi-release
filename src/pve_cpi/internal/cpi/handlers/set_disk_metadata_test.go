@@ -1714,10 +1714,13 @@ func TestHandleSetDiskMetadata_TagsPathPreservesForeignSentinelKeys(t *testing.T
 	}
 }
 
-// ListStatus reports no offline members; the fixture cluster is fully online.
-func (m *diskMetaClusterSvc) ListStatus(context.Context) (*sdkclusterapi.ListStatusResponse, error) {
-	empty := sdkclusterapi.ListStatusResponse{}
-	return &empty, nil
+// ListStatus reports every node of the index fixture, and testNode, online.
+func (m *diskMetaClusterSvc) ListStatus(ctx context.Context) (*sdkclusterapi.ListStatusResponse, error) {
+	rows, err := m.ListResources(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return onlineStatusFromResources(rows), nil
 }
 
 // ListNodes reports an empty node list; the standalone-membership

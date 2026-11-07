@@ -353,7 +353,7 @@ func finishParkedDetachTail(ctx context.Context, deps Deps, op string, rd resolv
 // runs the detach tail for the disk once it is parked, so the source VM's
 // entries are gone before the caller goes on.
 func resumeAndFinishParkedTail(ctx context.Context, deps Deps, op string, rd resolvedDisk) (resolvedDisk, error) {
-	rd, err := resumeTransferIfNeeded(ctx, deps, op, rd)
+	rd, err := resumeTransferSettled(ctx, deps, op, rd)
 	if err != nil {
 		return resolvedDisk{}, err
 	}

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -96,6 +97,13 @@ func HandleGetDisks(deps Deps) Handler {
 		//    probes on an index miss, so a just-created VM the lagging
 		//    index has not caught up with is not misreported as gone).
 		// ----------------------------------------------------------------
+		// A VM mid-migration is waited out, and a node the cluster does not
+		// report able to answer is a retriable error, because the config is
+		// read only through the node that owns the VM. A VM the wait does not
+		// find is left to the lookup below and its absence proof.
+		if _, settleErr := settleDiskVM(ctx, deps, "get_disks", vmCID, vmid, true); settleErr != nil {
+			return nil, settleErr
+		}
 		loc, lookupErr := findVMAuthoritative(ctx, deps, vmid)
 		if lookupErr != nil {
 			return nil, cpierrors.Wrap(lookupErr, "get_disks: locate VM "+vmCID)
@@ -119,12 +127,20 @@ func HandleGetDisks(deps Deps) Handler {
 		//    told such a disk is missing, so the list takes every disk either
 		//    view names.
 		// ----------------------------------------------------------------
-		views, err := pve.ReadQemuViews(ctx, deps.PVE, node, vmid)
+		// The read goes through readAtVMNode, so a VM that migrated between the
+		// lookup and the read is followed to its new node. A not-found answer
+		// is VMNotFound only when two sweeps of every member find the VM
+		// nowhere.
+		views, readNode, err := readAtVMNode(ctx, deps, "get_disks", vmid, node,
+			func(at string) (pve.QemuViews, error) { return pve.ReadQemuViews(ctx, deps.PVE, at, vmid) })
 		if err != nil {
-			if pve.IsNotFound(err) {
+			if errors.Is(err, errVMAbsent) {
 				return nil, cpierrors.VMNotFound(vmCID)
 			}
-			return nil, cpierrors.Wrap(pve.WrapError(err), "get_disks: fetch config for VM "+vmCID)
+			return nil, err
+		}
+		if readNode != node {
+			loc.Node = readNode
 		}
 		cfg := views.Applied()
 

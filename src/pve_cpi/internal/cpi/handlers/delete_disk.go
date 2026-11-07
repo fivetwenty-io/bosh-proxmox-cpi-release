@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -87,6 +88,21 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node st
 	}
 	if strandedErr := strandedParkerRefusal(deps, "delete_disk", rd.diskCID, holder); strandedErr != nil {
 		return false, strandedErr
+	}
+	// The holder VM may be mid-migration, and its node may not answer. Every
+	// step below writes to the holder's node, and none of them is safe to send
+	// to a node that cannot answer or that the holder has left. The wait
+	// follows a holder that moved and returns a retriable error for one on a
+	// node that cannot answer, so the volume is never deleted while its holder
+	// cannot be unparked.
+	if holder.Found && holder.VMID > 0 {
+		settled, settleErr := settleDiskVM(ctx, deps, "delete_disk", strconv.Itoa(holder.VMID), holder.VMID, true)
+		if settleErr != nil {
+			return false, settleErr
+		}
+		if settled.Found {
+			holder.Node = settled.Node
+		}
 	}
 	if holder.Found && holder.IsParker && rd.stableID != "" {
 		if embedded, ok := pve.EmbeddedDiskVMID(rd.volid); ok && embedded == holder.VMID {

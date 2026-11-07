@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -81,7 +82,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// parker's record, and the record names the volume the disk had
 		// before the move. Another disk can hold that name by now, so we
 		// finish the transfer first and look for the VM where it settles.
-		rd, resumeErr := resumeTransferIfNeeded(ctx, deps, "snapshot_disk", rd)
+		rd, resumeErr := resumeTransferSettled(ctx, deps, "snapshot_disk", rd)
 		if resumeErr != nil {
 			return nil, resumeErr
 		}
@@ -111,6 +112,12 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		//    form — the disk_cid is that form.
 		// ----------------------------------------------------------------
 		vmid, node, holderTags, err := pve.FindVMByDiskVolidTagged(ctx, deps.PVE, bareDiskCID)
+		if err != nil {
+			return nil, err
+		}
+		// The holder may be mid-migration or on a node that cannot answer.
+		// Waiting here also follows a holder that moved since the scan.
+		node, err = settleSnapshotHolder(ctx, deps, vmid, node)
 		if err != nil {
 			return nil, err
 		}
@@ -176,15 +183,13 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// operations on zfs/lvm/btrfs storages take the per-storage lock,
 		// so retry the submit+await pair on IsStorageLockTimeout.
 		// ----------------------------------------------------------------
-		serr := takeVMSnapshotConverging(ctx, deps, node, vmid, snapName, snapOpts)
+		// A migration that starts after the settle above refuses the snapshot
+		// with a lock or leaves its answer lost. pve.MutateVMConfig settles,
+		// follows the VM, and looks for the snapshot by its name before it
+		// sends again, so the snapshot is taken once.
+		node, serr := mutateSnapshotTake(ctx, deps, vmid, node, snapName, snapOpts)
 		if serr != nil {
-			deps.Log(ctx).Error("snapshot_disk: Snapshot failed",
-				log.String("disk_cid", diskCID),
-				log.Int("vmid", vmid),
-				log.String("snap_name", snapName),
-				log.Err(serr),
-			)
-			return nil, cpierrors.Wrap(pve.WrapError(serr), fmt.Sprintf("snapshot_disk: Snapshot failed for VM %d disk %s", vmid, diskCID))
+			return nil, snapshotTakeFailure(ctx, deps, diskCID, vmid, node, snapName, serr)
 		}
 
 		// ----------------------------------------------------------------
@@ -200,6 +205,61 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		)
 
 		return snapshotCID, nil
+	})
+}
+
+// settleSnapshotHolder waits for the holder VM to settle and returns the node
+// it is on, which is node unless the holder moved since the scan found it.
+func settleSnapshotHolder(ctx context.Context, deps Deps, vmid int, node string) (string, error) {
+	settled, err := settleDiskVM(ctx, deps, "snapshot_disk", strconv.Itoa(vmid), vmid, true)
+	if err != nil {
+		return "", err
+	}
+	if settled.Found {
+		return settled.Node, nil
+	}
+	return node, nil
+}
+
+// snapshotTakeFailure logs the failure of the snapshot and maps it to the
+// handler's answer. A not-found answer goes through the absence proof first.
+func snapshotTakeFailure(
+	ctx context.Context, deps Deps, diskCID string, vmid int, node, snapName string, serr error,
+) error {
+	serr = diskMutationFailure(ctx, deps, "snapshot_disk", strconv.Itoa(vmid), vmid, node, "take the snapshot", serr)
+	deps.Log(ctx).Error("snapshot_disk: Snapshot failed",
+		log.String("disk_cid", diskCID),
+		log.Int("vmid", vmid),
+		log.String("snap_name", snapName),
+		log.Err(serr),
+	)
+	return cpierrors.Wrap(pve.WrapError(serr), fmt.Sprintf("snapshot_disk: Snapshot failed for VM %d disk %s", vmid, diskCID))
+}
+
+// mutateSnapshotTake takes the snapshot through pve.MutateVMConfig and returns
+// the node it landed on. A send after the first looks for the snapshot by its
+// name first, so a snapshot whose answer was lost is never taken twice.
+func mutateSnapshotTake(
+	ctx context.Context, deps Deps, vmid int, node, snapName string, snapOpts map[string]any,
+) (string, error) {
+	var sentOnce bool
+	return mutateDiskVM(ctx, deps, diskVMMutation{
+		op: "snapshot_disk", vmCID: strconv.Itoa(vmid), vmid: vmid, node: node,
+		apply: func(ctx context.Context, at string) error {
+			if sentOnce {
+				if done, err := snapshotCommitted(ctx, deps, at, vmid, snapName); err != nil || done {
+					return err
+				}
+			}
+			sentOnce = true
+			return takeVMSnapshotConverging(ctx, deps, at, vmid, snapName, snapOpts)
+		},
+		landed: func(ctx context.Context, at string) (bool, error) {
+			return snapshotCommitted(ctx, deps, at, vmid, snapName)
+		},
+		reresolve: func(ctx context.Context, vm pve.VMLocation) error {
+			return requireNodeAnswers(ctx, deps, "snapshot_disk", fmt.Sprintf("VM %d", vmid), vm.Node)
+		},
 	})
 }
 
@@ -223,7 +283,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 func takeVMSnapshotConverging(ctx context.Context, deps Deps, node string, vmid int, snapName string, snapOpts map[string]any) error {
 	firstAttempt := true
 	pendingUPID := ""
-	return pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "snapshot_disk", 0, func() error {
+	return retryOnTransientOrLockUntilMissing(ctx, deps.Log(ctx), "snapshot_disk", 0, func() error {
 		replay := !firstAttempt
 		firstAttempt = false
 
@@ -285,9 +345,17 @@ func takeVMSnapshotConverging(ctx context.Context, deps Deps, node string, vmid 
 // state, so it reports false and the replay's own error stands. A listing
 // error also reports false for the same reason.
 func snapshotAlreadyCommitted(ctx context.Context, deps Deps, node string, vmid int, snapName string) bool {
+	done, err := snapshotCommitted(ctx, deps, node, vmid, snapName)
+	return err == nil && done
+}
+
+// snapshotCommitted is snapshotAlreadyCommitted with the listing error kept,
+// for a caller that must tell "the snapshot is not there" from "the listing
+// failed".
+func snapshotCommitted(ctx context.Context, deps Deps, node string, vmid int, snapName string) (bool, error) {
 	entries, listErr := deps.PVE.QEMU().ListSnapshots(ctx, node, vmid)
 	if listErr != nil {
-		return false
+		return false, listErr
 	}
 	for _, entry := range entries {
 		name, _ := pve.ConfigString(entry, "name")
@@ -295,9 +363,9 @@ func snapshotAlreadyCommitted(ctx context.Context, deps Deps, node string, vmid 
 			continue
 		}
 		state, _ := pve.ConfigString(entry, "snapstate")
-		return state == ""
+		return state == "", nil
 	}
-	return false
+	return false, nil
 }
 
 // guardSnapshotParked rejects a snapshot operation when the disk's holder VM is

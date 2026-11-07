@@ -173,6 +173,21 @@ func settleStrandedBeforeAttach(ctx context.Context, deps Deps, op string, rd *r
 	}
 
 	logger := deps.Log(ctx)
+	// The stranded VM may be locked by a migration or may have moved since the
+	// disk was resolved, and the move to a parker is a pair of config changes
+	// on its node. So it is settled and located again first, and every step
+	// below addresses the node it is on now. The move itself runs its own
+	// multi-step protocol, so a motion that starts inside it comes back as a
+	// retriable error and the retry resumes the transfer from the record.
+	settled, settleErr := settleDiskVM(ctx, deps, op, strconv.Itoa(ref.VMID), ref.VMID, false)
+	if settleErr != nil {
+		return false, settleErr
+	}
+	if settled.Found && settled.Node != "" && settled.Node != ref.Node {
+		logger.Info(op+": the VM the disk is stranded on moved; moving the disk off it on its new node",
+			log.Int("stranded_vmid", ref.VMID), log.String("from_node", ref.Node), log.String("node", settled.Node))
+		ref.Node = settled.Node
+	}
 	// Moving the disk off the stranded VM detaches it from that VM, so the
 	// same snapshot guard detach_disk runs applies to it first.
 	if err := strandedAttachSnapshotGuard(ctx, deps, op, *rd, ref, targetVMID); err != nil {

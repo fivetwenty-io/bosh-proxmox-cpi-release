@@ -248,6 +248,15 @@ func HandleDetachDisk(deps Deps) Handler {
 		}
 		vmid := parsedCID.VMID
 
+		// Wait out a migration or another task on the VM before the detach
+		// resolves its slot, and refuse a node the cluster does not report able
+		// to answer. A VM the wait does not find keeps the answers below, which
+		// run the absence proof. The slot change is sent through MutateVMConfig,
+		// which handles a migration that starts after this wait.
+		if _, settleErr := settleDiskVM(ctx, deps, "detach_disk", vmCID, vmid, true); settleErr != nil {
+			return nil, settleErr
+		}
+
 		// Stable-ID disks detach by ownership transfer: the volume is
 		// reassigned onto a parker rather than config-edited off the VM. The
 		// two flows share nothing past this point — a renamed volume must
@@ -346,7 +355,8 @@ func HandleDetachDisk(deps Deps) Handler {
 		// stable-ID branch takes every renamed one. A delete PVE can only
 		// record as pending is reverted and refused, so the disk is never
 		// parked while the running guest still has it.
-		if err := detachLegacySlot(ctx, deps, vmCID, diskCID, bareDiskCID, node, vmid, diskID); err != nil {
+		vmNode, err := detachLegacySlot(ctx, deps, vmCID, diskCID, bareDiskCID, node, vmid, diskID)
+		if err != nil {
 			return nil, err
 		}
 
@@ -361,7 +371,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		//     sentinel (mirror of attach_disk's UpdateAttachedDiskCID write).
 		//     Best-effort: never fails the detach.
 		// --------------------------------------------------------------------
-		pve.RemoveAttachedDiskCID(ctx, deps.PVE, deps.Log(ctx), node, vmid, bareDiskCID)
+		pve.RemoveAttachedDiskCID(ctx, deps.PVE, deps.Log(ctx), vmNode, vmid, bareDiskCID)
 
 		// --------------------------------------------------------------------
 		// 5. Park disk when detached_disk_strategy=parked (fail-closed
@@ -379,7 +389,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		//     dropped it). Best-effort: a leftover entry names a disk this VM
 		//     no longer holds and is overwritten by the disk's next attach.
 		// --------------------------------------------------------------------
-		pve.RemoveVMDiskOptOverlay(ctx, deps.PVE, deps.Log(ctx), node, vmid, bareDiskCID)
+		pve.RemoveVMDiskOptOverlay(ctx, deps.PVE, deps.Log(ctx), vmNode, vmid, bareDiskCID)
 
 		return nil, nil
 	})
@@ -481,7 +491,7 @@ func refuseStableIDDetachElsewhere(ctx context.Context, deps Deps, vmCID string,
 func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int, rd resolvedDisk) error {
 	logger := deps.Log(ctx)
 	if rd.intent != nil {
-		refreshed, err := resumeTransferIfNeeded(ctx, deps, "detach_disk", rd)
+		refreshed, err := resumeTransferSettled(ctx, deps, "detach_disk", rd)
 		if err != nil {
 			if pve.IsMoveDiskSnapshotRefusal(err) {
 				// A deferred park (see the transfer fallback below) whose
@@ -854,20 +864,59 @@ func detachDiskSnapshotGuard(ctx context.Context, deps Deps, vmCID, node string,
 
 // detachLegacySlot runs detach_disk's legacy slot detach and classes its
 // failure. A pending delete gets the class the pending-delete mapping
-// chooses, a VM that's gone is VMNotFound, and anything else keeps the class
-// PVE's error carries.
-func detachLegacySlot(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID, node string, vmid int, diskID string) error {
-	err := detachDriveSlot(ctx, deps, node, vmid, diskID, bareDiskCID)
+// chooses, a VM that's gone is VMNotFound once the absence proof agrees, and
+// anything else keeps the class PVE's error carries. It returns the node the
+// detach landed on, which is not the node it started on when the VM migrated.
+//
+// The detach is a config change, so it goes through MutateVMConfig. A
+// migration that starts after the caller's wait is waited out, the slot is
+// resolved again on the node the VM reached, and a detach whose answer was
+// lost is not sent twice: the config is read first, and a volume that no
+// longer sits on a bus slot has landed.
+func detachLegacySlot(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID, node string, vmid int, diskID string) (string, error) {
+	sent := 0
+	landedNode, err := mutateDiskVM(ctx, deps, diskVMMutation{
+		op: "detach_disk", vmCID: vmCID, vmid: vmid, node: node,
+		apply: func(ctx context.Context, at string) error {
+			slot := diskID
+			if sent > 0 || at != node {
+				var resolveErr error
+				slot, resolveErr = pve.ResolveAttachedSlot(ctx, deps.PVE, at, vmid, bareDiskCID)
+				if errors.Is(resolveErr, pve.ErrDiskNotAttached) {
+					return nil
+				}
+				if resolveErr != nil {
+					return resolveErr
+				}
+			}
+			sent++
+			return detachDriveSlotOnce(ctx, deps, at, vmid, slot, bareDiskCID)
+		},
+		landed: func(ctx context.Context, at string) (bool, error) {
+			_, resolveErr := pve.ResolveDiskID(ctx, deps.PVE, at, vmid, bareDiskCID)
+			if errors.Is(resolveErr, pve.ErrDiskNotAttached) {
+				return true, nil
+			}
+			return false, resolveErr
+		},
+		reresolve: func(ctx context.Context, vm pve.VMLocation) error {
+			return requireNodeAnswers(ctx, deps, "detach_disk", "the VM "+vmCID, vm.Node)
+		},
+	})
 	if err == nil {
-		return nil
+		return landedNode, nil
 	}
 	if pending := driveDeletePendingDiskError("detach_disk", err); pending != nil {
-		return pending
+		return "", pending
 	}
-	if pve.IsNotFound(err) {
-		return cpierrors.VMNotFound(vmCID)
+	var typed *cpierrors.Error
+	if errors.As(err, &typed) {
+		return "", err
 	}
-	return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("detach_disk: DetachDisk failed for VM %s disk %s (diskID=%s)", vmCID, diskCID, diskID))
+	if isConfigMissing(err) {
+		return "", diskMutationFailure(ctx, deps, "detach_disk", vmCID, vmid, landedNode, "the slot detach", err)
+	}
+	return "", cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("detach_disk: DetachDisk failed for VM %s disk %s (diskID=%s)", vmCID, diskCID, diskID))
 }
 
 // detachDriveSlot detaches one bus slot that names volid through the
@@ -877,10 +926,20 @@ func detachLegacySlot(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCI
 // config write to the journal guard and sends its bus-slot delete through the
 // same helper.
 func detachDriveSlot(ctx context.Context, deps Deps, node string, vmid int, slot, volid string) error {
+	return detachDriveSlotAttempts(ctx, deps, node, vmid, slot, volid, 0)
+}
+
+// detachDriveSlotOnce is detachDriveSlot with one attempt, for a caller that
+// decides itself whether to send the change again, as MutateVMConfig does.
+func detachDriveSlotOnce(ctx context.Context, deps Deps, node string, vmid int, slot, volid string) error {
+	return detachDriveSlotAttempts(ctx, deps, node, vmid, slot, volid, 1)
+}
+
+func detachDriveSlotAttempts(ctx context.Context, deps Deps, node string, vmid int, slot, volid string, attempts int) error {
 	if managed, ok := deps.PVE.(*managedDiskLifecycleClient); ok {
 		return managed.QEMU().DetachDisk(ctx, node, vmid, slot)
 	}
-	return pve.DetachDriveSlot(ctx, deps.PVE, deps.Log(ctx), node, vmid, slot, volid, 0)
+	return pve.DetachDriveSlot(ctx, deps.PVE, deps.Log(ctx), node, vmid, slot, volid, attempts)
 }
 
 // parkAfterDetach parks bareDiskCID onto a parker VM after a successful
@@ -978,19 +1037,65 @@ func sweepUnusedDiskSlot(
 		if refusal := refuseOwnedLegacyDetach(vmCID, vmid, diskCID, diskCID, slot); refusal != nil {
 			return false, refusal
 		}
-		// RetryOnTransientOrLock, matching the parker twin of this sweep:
-		// removing the unusedN reference contends on the same VM config and
-		// storage locks the detach itself just released. The budget is passed
-		// explicitly rather than left at 0: the OrLock helper's zero-value
-		// fallback is the ten-attempt storage-lock budget, while this sweep
-		// runs on the transient budget, including the operator's
-		// retry.transient override, exactly as it did before lock timeouts
-		// joined its retry union.
-		if sweepErr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "detach_disk.sweep", pve.TransientMaxAttempts(), func() error {
-			return deps.PVE.QEMU().DetachDisk(ctx, node, vmid, slot)
-		}); sweepErr != nil {
-			if pve.IsNotFound(sweepErr) {
-				return true, nil // slot already gone
+		// The sweep is a config change, so it goes through MutateVMConfig: a
+		// migration that starts after the caller's wait is waited out, the
+		// entry is read again on the node the VM reached, and a sweep whose
+		// answer was lost is not sent twice, because the config is read
+		// first and an entry that is gone has landed.
+		entryOn := func(ctx context.Context, at string) (string, error) {
+			current, readErr := deps.PVE.QEMU().Config(ctx, at, vmid)
+			if readErr != nil {
+				return "", readErr
+			}
+			for key, v := range pve.FindUnusedDiskEntries(current) {
+				if v == diskCID {
+					return key, nil
+				}
+			}
+			return "", nil
+		}
+		sent := 0
+		sweptNode, sweepErr := mutateDiskVM(ctx, deps, diskVMMutation{
+			op: "detach_disk", vmCID: vmCID, vmid: vmid, node: node,
+			apply: func(ctx context.Context, at string) error {
+				target := slot
+				if sent > 0 || at != node {
+					var readErr error
+					if target, readErr = entryOn(ctx, at); readErr != nil || target == "" {
+						return readErr
+					}
+				}
+				sent++
+				// Removing the unusedN reference contends on the same VM config
+				// and storage locks the detach itself just released, so a lock
+				// timeout is retried in place on the transient budget, which
+				// includes the operator's retry.transient override. A VM that
+				// left the node ends the loop at once for MutateVMConfig to
+				// follow.
+				return retryOnTransientOrLockUntilMissing(ctx, deps.Log(ctx), "detach_disk.sweep",
+					pve.TransientMaxAttempts(), func() error {
+						return deps.PVE.QEMU().DetachDisk(ctx, at, vmid, target)
+					})
+			},
+			landed: func(ctx context.Context, at string) (bool, error) {
+				key, readErr := entryOn(ctx, at)
+				return key == "", readErr
+			},
+			reresolve: func(ctx context.Context, vm pve.VMLocation) error {
+				return requireNodeAnswers(ctx, deps, "detach_disk", "the VM "+vmCID, vm.Node)
+			},
+		})
+		if sweepErr != nil {
+			if isConfigMissing(sweepErr) {
+				// The slot is gone when the VM is, once the absence proof agrees.
+				if goneErr := confirmVMGone(ctx, deps, "detach_disk", vmid, sweptNode, "the unused slot sweep"); goneErr != nil {
+					return false, goneErr
+				}
+				return true, nil
+			}
+			var typed *cpierrors.Error
+			if errors.As(sweepErr, &typed) {
+				return false, sweepErr
 			}
 			return false, cpierrors.Wrap(pve.WrapError(sweepErr), fmt.Sprintf("detach_disk: remove lingering unused slot %s for disk %s on VM %s", slot, diskCID, vmCID))
 		}

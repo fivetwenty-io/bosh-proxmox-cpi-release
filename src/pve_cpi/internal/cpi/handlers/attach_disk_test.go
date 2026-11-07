@@ -50,6 +50,9 @@ type attachQEMUService struct {
 	configErrOnCall map[int]error
 	// configCallsAtAttach is configCalls when AttachDisk ran.
 	configCallsAtAttach int
+	// configErrAfterAttach, when set, fails every Config call made after
+	// AttachDisk ran, which is a VM that was deleted under the attach.
+	configErrAfterAttach error
 
 	// DetachDisk control — records calls and may inject error.
 	detachCalls []string
@@ -69,6 +72,9 @@ func (m *attachQEMUService) AttachDisk(_ context.Context, _ string, _ int, volid
 
 func (m *attachQEMUService) Config(_ context.Context, _ string, _ int) (map[string]any, error) {
 	m.configCalls++
+	if m.configErrAfterAttach != nil && m.configCallsAtAttach > 0 {
+		return nil, m.configErrAfterAttach
+	}
 	if err, ok := m.configErrOnCall[m.configCalls]; ok {
 		return nil, err
 	}
@@ -329,14 +335,19 @@ func TestHandleAttachDisk_AlreadyAttached(t *testing.T) {
 	}
 }
 
-// TestHandleAttachDisk_VMNotFound verifies that a 404 from AttachDisk maps to VMNotFound.
+// TestHandleAttachDisk_VMNotFound verifies that a 404 from AttachDisk maps to
+// VMNotFound once the VM is proven gone. A 404 alone does not prove it, because
+// a VM that moved answers the same way from the node it left, so the handler
+// looks for the VM again and only an absence proof turns the 404 into
+// VMNotFound.
 func TestHandleAttachDisk_VMNotFound(t *testing.T) {
 	t.Parallel()
 	// The VM is still found when the handler looks it up, carrying the tag
 	// every VM this CPI creates carries, and is gone by the attach.
 	qemuSvc := &attachQEMUService{
-		configCfg: map[string]any{"tags": "bosh-cpi"},
-		attachErr: &sdkerrors.APIError{Code: 404, Message: "not found"},
+		configCfg:            map[string]any{"tags": "bosh-cpi"},
+		attachErr:            &sdkerrors.APIError{Code: 404, Message: "not found"},
+		configErrAfterAttach: &sdkerrors.APIError{Code: 404, Message: "Configuration file 'nodes/pve1/qemu-server/999.conf' does not exist"},
 	}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, &captureAgent{}))
 
@@ -1877,12 +1888,14 @@ func TestHandleAttachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 	if len(qemuSvc.detachCalls) != 0 {
 		t.Errorf("strategy=free: expected no DetachDisk calls; got %v", qemuSvc.detachCalls)
 	}
-	// Three fixture reads: the VM-node lookup reads the index once, and the
-	// holder guard's authoritative enumeration derives cluster membership and
-	// the per-node listing from the same fixture (one read each). The point
-	// of the assertion is unchanged: no parker scan beyond the guard.
-	if listCalls != 3 {
-		t.Errorf("strategy=free: expected 3 fixture reads (VM-node lookup + holder-guard membership + node listing); got %d", listCalls)
+	// Five fixture reads: the VM-node lookup reads the index once, the wait
+	// for the VM to settle runs one authoritative scan (membership and the
+	// per-node listing, one read each), and the holder guard's authoritative
+	// enumeration derives its membership and listing from the same fixture
+	// (one read each). The point of the assertion is unchanged: no parker scan
+	// beyond the guard.
+	if listCalls != 5 {
+		t.Errorf("strategy=free: expected 5 fixture reads (VM-node lookup + settle scan + holder-guard membership + node listing); got %d", listCalls)
 	}
 }
 

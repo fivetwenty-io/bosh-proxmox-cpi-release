@@ -1272,8 +1272,11 @@ func TestVMOwnershipGuard_ReadCountsBeforeTheWrite(t *testing.T) {
 		if _, err := handlers.HandleAttachDisk(deps).Handle(context.Background(), attachArgs(t, "100", diskCID), ownRPC); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if qemuSvc.configCallsAtAttach != 2 {
-			t.Errorf("config reads before the attach = %d, want 2 (the probe and the slot read)", qemuSvc.configCallsAtAttach)
+		// The VM is in no index row, so each wait for it to settle finds it by a
+		// config probe too: the lookup's probe, the two settle waits' probes,
+		// and the slot read.
+		if qemuSvc.configCallsAtAttach != 4 {
+			t.Errorf("config reads before the attach = %d, want 4 (three probes and the slot read)", qemuSvc.configCallsAtAttach)
 		}
 	})
 }

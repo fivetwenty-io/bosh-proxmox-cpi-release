@@ -132,6 +132,16 @@ func HandleUpdateDisk(deps Deps) Handler {
 		if strandedErr := strandedParkerRefusal(deps, "update_disk", diskCID, holder); strandedErr != nil {
 			return nil, strandedErr
 		}
+		// The holder may be mid-migration or on a node that cannot answer, and
+		// the holder scan may be a moment old. Waiting here follows a holder
+		// that moved to the node it is on now.
+		settled, settleErr := settleDiskVM(ctx, deps, "update_disk", strconv.Itoa(holder.VMID), holder.VMID, true)
+		if settleErr != nil {
+			return nil, settleErr
+		}
+		if settled.Found {
+			holder.Node = settled.Node
+		}
 		if holder.IsParker {
 			return nil, updateParkedDisk(ctx, deps, diskCID, rd, holder, updateSpec)
 		}
@@ -181,7 +191,7 @@ func resumeUpdateDiskTransfer(ctx context.Context, deps Deps, rd resolvedDisk) (
 		rd = lifecycle.disk
 		defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
 	}
-	return resumeTransferIfNeeded(ctx, local, "update_disk", rd)
+	return resumeTransferSettled(ctx, local, "update_disk", rd)
 }
 
 // updateSpecSizeMB extracts and validates the optional "size" field. Returns
@@ -206,6 +216,39 @@ func updateSpecSizeMB(updateSpec map[string]any) (int, bool, error) {
 // would leave a drive updated with no record, the exact silent-revert state
 // this method exists to prevent.
 func updateAttachedDisk(ctx context.Context, deps Deps, diskCID string, rd resolvedDisk, holder pve.DiskHolder, updateSpec map[string]any) error {
+	return updateHolderVM(ctx, deps, diskCID, holder, func(ctx context.Context, at string) error {
+		moved := holder
+		moved.Node = at
+		return applyAttachedUpdate(ctx, deps, diskCID, rd, moved, updateSpec)
+	})
+}
+
+// updateHolderVM sends one update through pve.MutateVMConfig. Every step of an
+// update is safe to run again: the resize recomputes its delta from the live
+// size, the override record merges the same values over what it holds, and the
+// drive rewrite merges over the live drive string. A migration that starts
+// after the wait therefore resends the whole update on the node the VM
+// reached. The update has no check for a lost answer, so one comes back as a
+// retriable error and the Director's retry runs the update again.
+func updateHolderVM(
+	ctx context.Context, deps Deps, diskCID string, holder pve.DiskHolder, apply func(ctx context.Context, node string) error,
+) error {
+	vmCID := strconv.Itoa(holder.VMID)
+	_, err := mutateDiskVM(ctx, deps, diskVMMutation{
+		op: "update_disk", vmCID: vmCID, vmid: holder.VMID, node: holder.Node,
+		apply: apply,
+		reresolve: func(ctx context.Context, vm pve.VMLocation) error {
+			return requireNodeAnswers(ctx, deps, "update_disk", fmt.Sprintf("VM %s holding disk %s", vmCID, diskCID), vm.Node)
+		},
+	})
+	if err != nil {
+		return diskMutationFailure(ctx, deps, "update_disk", vmCID, holder.VMID, holder.Node, "update the disk", err)
+	}
+	return nil
+}
+
+// applyAttachedUpdate is the update of an attached disk, sent to holder.Node.
+func applyAttachedUpdate(ctx context.Context, deps Deps, diskCID string, rd resolvedDisk, holder pve.DiskHolder, updateSpec map[string]any) error {
 	node, vmid := holder.Node, holder.VMID
 
 	diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, rd.volid)
@@ -278,6 +321,15 @@ func updateAttachedDisk(ctx context.Context, deps Deps, diskCID string, rd resol
 // string stays CPI-owned (volid plus serial) — the next attach bakes the
 // merged string, which is when the option update takes effect.
 func updateParkedDisk(ctx context.Context, deps Deps, diskCID string, rd resolvedDisk, holder pve.DiskHolder, updateSpec map[string]any) error {
+	return updateHolderVM(ctx, deps, diskCID, holder, func(ctx context.Context, at string) error {
+		moved := holder
+		moved.Node = at
+		return applyParkedUpdate(ctx, deps, diskCID, rd, moved, updateSpec)
+	})
+}
+
+// applyParkedUpdate is the update of a parked disk, sent to holder.Node.
+func applyParkedUpdate(ctx context.Context, deps Deps, diskCID string, rd resolvedDisk, holder pve.DiskHolder, updateSpec map[string]any) error {
 	newSizeMB, hasSz, sizeErr := updateSpecSizeMB(updateSpec)
 	if sizeErr != nil {
 		return sizeErr

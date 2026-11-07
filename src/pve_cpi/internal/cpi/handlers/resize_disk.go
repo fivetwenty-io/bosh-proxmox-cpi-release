@@ -92,7 +92,7 @@ func HandleResizeDisk(deps Deps) Handler {
 		// parker's record, and the record names the volume the disk had
 		// before the move. Another disk can hold that name by now, so we
 		// finish the transfer first and resize the volume it settles on.
-		rd, resumeErr := resumeTransferIfNeeded(ctx, deps, "resize_disk", rd)
+		rd, resumeErr := resumeTransferSettled(ctx, deps, "resize_disk", rd)
 		if resumeErr != nil {
 			return nil, resumeErr
 		}
@@ -125,6 +125,15 @@ func HandleResizeDisk(deps Deps) Handler {
 		vmid, node, err := pve.FindVMByDiskVolid(ctx, deps.PVE, bareDiskCID)
 		if err != nil {
 			return nil, err
+		}
+		// The disk's VM may be mid-migration or on a node that cannot answer.
+		// Waiting here also follows a VM that moved since the locator ran.
+		settled, settleErr := settleDiskVM(ctx, deps, "resize_disk", strconv.Itoa(vmid), vmid, true)
+		if settleErr != nil {
+			return nil, settleErr
+		}
+		if settled.Found {
+			node = settled.Node
 		}
 
 		// Parker VMs are always stopped (onboot=0, never started). Resizing a
@@ -251,8 +260,38 @@ func HandleResizeDisk(deps Deps) Handler {
 		// The retry recomputes the remaining delta from the live config so
 		// a committed-then-dropped attempt is not replayed on top of itself.
 		// ----------------------------------------------------------------
-		rerr := resizeDiskConverging(ctx, deps, deps.Log(ctx), "resize_disk", node, vmid, diskID, currentGiB, newGiB, 0)
+		// A migration that starts after the settle above refuses the resize
+		// with a lock, or leaves its answer lost. pve.MutateVMConfig settles,
+		// follows the VM, and reads the size before it sends again, and the
+		// converging resize recomputes its delta from that read.
+		var sentOnce bool
+		node, rerr := mutateDiskVM(ctx, deps, diskVMMutation{
+			op: "resize_disk", vmCID: strconv.Itoa(vmid), vmid: vmid, node: node,
+			apply: func(ctx context.Context, at string) error {
+				known := currentGiB
+				if sentOnce || at != node {
+					live, readErr := readDiskSizeGiB(ctx, deps, "resize_disk", at, vmid, diskID)
+					if readErr != nil {
+						return readErr
+					}
+					known = live
+				}
+				sentOnce = true
+				return resizeDiskConverging(ctx, deps, deps.Log(ctx), "resize_disk", at, vmid, diskID, known, newGiB, 0)
+			},
+			landed: func(ctx context.Context, at string) (bool, error) {
+				live, readErr := readDiskSizeGiB(ctx, deps, "resize_disk", at, vmid, diskID)
+				if readErr != nil {
+					return false, readErr
+				}
+				return live >= newGiB, nil
+			},
+			reresolve: func(ctx context.Context, vm pve.VMLocation) error {
+				return requireNodeAnswers(ctx, deps, "resize_disk", fmt.Sprintf("VM %d", vmid), vm.Node)
+			},
+		})
 		if rerr != nil {
+			rerr = diskMutationFailure(ctx, deps, "resize_disk", strconv.Itoa(vmid), vmid, node, "resize the disk", rerr)
 			return nil, cpierrors.Wrap(pve.WrapError(rerr), fmt.Sprintf("resize_disk: ResizeDisk failed for VM %d disk %s (+%dG)", vmid, diskCID, deltaGiB))
 		}
 
@@ -395,7 +434,7 @@ func resizeDiskConverging(
 	firstAttempt := true
 	pendingUPID := ""      // prior attempt's task whose completion is unresolved
 	submitDropped := false // prior POST's response dropped: an unnamed task may exist
-	return pve.RetryOnTransientOrLock(ctx, logger, op, maxAttempts, func() error {
+	return retryOnTransientOrLockUntilMissing(ctx, logger, op, maxAttempts, func() error {
 		if !firstAttempt {
 			if pendingUPID != "" {
 				awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, pendingUPID, logger)

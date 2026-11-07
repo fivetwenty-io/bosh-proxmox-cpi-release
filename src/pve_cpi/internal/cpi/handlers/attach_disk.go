@@ -135,7 +135,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		// finish the transfer first, inside the lifecycle when the journal
 		// manages the disk, so the node lookup below finds the disk where it
 		// landed. A resume that can't run comes back retriable.
-		rd, err = resumeTransferIfNeeded(ctx, deps, "attach_disk", rd)
+		rd, err = resumeTransferSettled(ctx, deps, "attach_disk", rd)
 		if err != nil {
 			return nil, err
 		}
@@ -146,6 +146,22 @@ func HandleAttachDisk(deps Deps) Handler {
 		node, vmid, err := attachDiskResolveNode(ctx, deps, vmCID, rd.volid, rd.stableID)
 		if err != nil {
 			return nil, err
+		}
+		// Wait out a migration or another task on the target VM before the
+		// holder guard starts its steps, which can take minutes and can move
+		// the disk to the node the VM is on. The wait refuses a node the
+		// cluster does not report able to answer, and it runs after the node
+		// lookup above so a cluster that cannot answer at all fails there. The
+		// lookup is authoritative about where the VM is, so the wait changes
+		// the node only when the VM moved since. The attach's config change is
+		// sent through MutateVMConfig, which handles a migration that starts
+		// after this.
+		settled, err := settleDiskVM(ctx, deps, "attach_disk", vmCID, vmid, true)
+		if err != nil {
+			return nil, err
+		}
+		if settled.Found && settled.Node != "" {
+			node = settled.Node
 		}
 
 		// --------------------------------------------------------------------
@@ -165,6 +181,14 @@ func HandleAttachDisk(deps Deps) Handler {
 		// valid.
 		// --------------------------------------------------------------------
 		plan, err := guardAndUnparkBeforeAttach(ctx, deps, "attach_disk", &rd, node, vmid)
+		if err != nil {
+			return nil, err
+		}
+		// The guard can take minutes when it migrates the disk, and the VM can
+		// migrate in that time. So the VM is settled and located again, and a
+		// move to another node is checked against the parker and the storage
+		// before any step below uses the node from before.
+		node, err = attachSettleAfterGuard(ctx, deps, vmCID, vmid, node, rd, &plan)
 		if err != nil {
 			return nil, err
 		}
@@ -331,7 +355,7 @@ func attachDiskCore(
 	if plan.viaTransfer {
 		return attachDiskViaTransfer(ctx, deps, op, vmCID, node, vmid, diskCID, rd, plan, desiredDiskID, effectiveOpts)
 	}
-	return attachDiskConfigPut(ctx, deps, op, vmCID, node, vmid, diskCID, rd, desiredDiskID, effectiveOpts)
+	return attachDiskConfigPut(ctx, deps, op, vmCID, node, vmid, diskCID, rd, desiredDiskID, effectiveOpts, plan.judgeTarget)
 }
 
 // attachDiskConfigPut is the config-edit attach tail: the volid (plus baked
@@ -339,6 +363,14 @@ func attachDiskCore(
 // legacy disks, and the fallback for stable-ID disks whose reassignment is
 // not available (cross-node parker with a birth-named volume, or a snapshot
 // refusal).
+//
+// The PUT goes through MutateVMConfig, so a migration that starts after the
+// caller's wait is waited out and the PUT is sent again on the node the VM
+// reached. The slot is chosen again on every node the PUT is sent to, because
+// the slot the first node's config allowed says nothing about the next one's,
+// and the choice reuses the slot a landed PUT already filled, so sending the
+// PUT again never attaches the volume twice. judge is the ownership judgment
+// of each config the slot choice reads (see attachPlan.judgeTarget).
 func attachDiskConfigPut(
 	ctx context.Context,
 	deps Deps,
@@ -350,6 +382,7 @@ func attachDiskConfigPut(
 	rd resolvedDisk,
 	desiredDiskID string,
 	effectiveOpts map[string]string,
+	judge func(cfg map[string]any) error,
 ) (diskID, devicePath string, err error) {
 	const bus = "scsi"
 
@@ -359,19 +392,39 @@ func attachDiskConfigPut(
 		volidArg = buildDiskOptStr(rd.volid, effectiveOpts)
 	}
 
-	err = pve.RetryOnTransient(ctx, deps.Log(ctx), op, 0, func() error {
-		var attachErr error
-		diskID, attachErr = deps.PVE.QEMU().AttachDisk(ctx, node, vmid, volidArg, bus, &qemu.AttachOpts{
-			DiskID: desiredDiskID,
-		})
-		return attachErr
+	homeNode := node
+	sent := 0
+	node, err = mutateDiskVM(ctx, deps, diskVMMutation{
+		op: op, vmCID: vmCID, vmid: vmid, node: node,
+		apply: func(ctx context.Context, at string) error {
+			slot := desiredDiskID
+			if sent > 0 || at != homeNode {
+				var prepErr error
+				slot, prepErr = chooseSCSISlotSkippingZero(ctx, deps, op, at, vmid, rd.volid, judge)
+				if prepErr != nil {
+					return prepErr
+				}
+			}
+			sent++
+			var attachErr error
+			diskID, attachErr = deps.PVE.QEMU().AttachDisk(ctx, at, vmid, volidArg, bus, &qemu.AttachOpts{DiskID: slot})
+			return attachErr
+		},
+		landed: func(ctx context.Context, at string) (bool, error) {
+			slot, resolveErr := pve.ResolveDiskID(ctx, deps.PVE, at, vmid, rd.volid)
+			if errors.Is(resolveErr, pve.ErrDiskNotAttached) {
+				return false, nil
+			}
+			if resolveErr != nil {
+				return false, resolveErr
+			}
+			diskID = slot
+			return true, nil
+		},
+		reresolve: attachReresolve(deps, op, rd.volid, homeNode, nil),
 	})
 	if err != nil {
-		wrapped := pve.WrapError(err)
-		if pve.IsNotFound(err) {
-			return "", "", cpierrors.VMNotFound(vmCID)
-		}
-		return "", "", cpierrors.Wrap(wrapped, fmt.Sprintf("%s: AttachDisk failed for VM %s disk %s", op, vmCID, diskCID))
+		return "", "", attachWriteFailure(ctx, deps, op, vmCID, vmid, node, diskCID, "AttachDisk", err)
 	}
 
 	// Confirm attachment (resolve diskID) and derive device path.
@@ -392,6 +445,71 @@ func attachDiskConfigPut(
 	pve.UpdateAttachedDiskCID(ctx, deps.PVE, deps.Log(ctx), node, vmid, rd.sentinelKey(), diskCID)
 
 	return diskID, devicePath, nil
+}
+
+// attachWriteFailure maps the failure of the attach's config change to the
+// handler's answer. The target's refusal and a pending drive delete come back
+// as the slot choice classed them, a typed error is the protocol's own answer
+// and comes back unchanged, a not-found answer goes through the absence proof,
+// and anything else is wrapped with the call that failed.
+func attachWriteFailure(
+	ctx context.Context, deps Deps, op, vmCID string, vmid int, node, diskCID, call string, err error,
+) error {
+	var refusal attachTargetRefusal
+	if errors.As(err, &refusal) {
+		return refusal.err
+	}
+	if _, pending := pve.IsDriveDeletePending(err); pending {
+		return err
+	}
+	var typed *cpierrors.Error
+	if errors.As(err, &typed) {
+		return err
+	}
+	if isConfigMissing(err) {
+		return diskMutationFailure(ctx, deps, op, vmCID, vmid, node, call, err)
+	}
+	return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("%s: %s failed for VM %s disk %s", op, call, vmCID, diskCID))
+}
+
+// attachReresolve is the Reresolve step of the attach's config change. After a
+// refusal or a lost answer it runs on the node the VM was found on, and it
+// checks that the node can answer, that a transfer's parker is on that node,
+// and that the node reaches the volume. parker is the transfer's source holder,
+// or nil for a config-edit attach. A parker that moved is followed to its new
+// node, and one that is not on the VM's node is a retriable error, because PVE
+// moves a disk only between VMs on one node.
+func attachReresolve(
+	deps Deps, op, volid, homeNode string, parker *pve.DiskHolder,
+) func(ctx context.Context, vm pve.VMLocation) error {
+	return func(ctx context.Context, vm pve.VMLocation) error {
+		if err := requireNodeAnswers(ctx, deps, op, "the target VM", vm.Node); err != nil {
+			return err
+		}
+		home := homeNode
+		if parker != nil {
+			loc, err := findVMAuthoritative(ctx, deps, parker.VMID)
+			if err != nil {
+				return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+					fmt.Sprintf("%s: locate parker %d again after the target VM moved", op, parker.VMID))
+			}
+			if !loc.Found || loc.Node == "" {
+				return cpierrors.Retriable("%s: parker %d is not in the cluster index after the target VM moved; retry",
+					op, parker.VMID)
+			}
+			if err := requireNodeAnswers(ctx, deps, op, fmt.Sprintf("parker %d", parker.VMID), loc.Node); err != nil {
+				return err
+			}
+			parker.Node = loc.Node
+			if loc.Node != vm.Node {
+				return cpierrors.Retriable(
+					"%s: the target VM is on node %s and parker %d is on node %s, and PVE moves a disk only between VMs "+
+						"on one node; retry once they are on the same node", op, vm.Node, parker.VMID, loc.Node)
+			}
+			home = loc.Node
+		}
+		return storageFitsVMNode(ctx, deps, op, volid, home, vm.Node)
+	}
 }
 
 // attachDiskViaTransfer attaches a parked stable-ID disk by move_disk
@@ -421,18 +539,55 @@ func attachDiskViaTransfer(
 	preVolid := rd.volid
 	optStr := buildDiskOptStr(preVolid, effectiveOpts)
 	parkerCfg := parkerReadConfigFor(deps)
+	parker := plan.parker
 
-	landed, terr := pve.TransferDiskFromParker(ctx, deps.PVE, deps.Log(ctx), plan.parker, vmid, targetSlot, preVolid, optStr, parkerCfg)
-	// A protection restore cut off after the disk landed does not stop the
-	// attach. The disk is on the VM under its new name either way, so the
-	// receiving side is recorded first, exactly as on success, and the cut-off
-	// is reported last. Every write below already runs after the parker's
-	// window has closed.
+	// The reassignment goes through MutateVMConfig, so a migration of the target
+	// that starts after the caller's wait is waited out, and the parker is
+	// located again on the node the VM reached before the move is sent there.
+	// A move whose answer was lost, or that a lock refused after it began, may
+	// have landed already, in which case the parker has nothing left to give.
+	// So a move that is sent again first looks for the disk on the target.
+	var landed string
 	var restoreCutOff error
-	var cutOff *pve.ProtectionRestoreCutOffError
-	if terr != nil && landed != "" && errors.As(terr, &cutOff) {
-		restoreCutOff, terr = terr, nil
-	}
+	sent := 0
+	node, terr := mutateDiskVM(ctx, deps, diskVMMutation{
+		op: op, vmCID: vmCID, vmid: vmid, node: node,
+		apply: func(ctx context.Context, at string) error {
+			if sent > 0 {
+				if volid, found, readErr := transferredVolidOn(ctx, deps, at, vmid, rd.stableID); readErr != nil {
+					return readErr
+				} else if found {
+					landed = volid
+					return nil
+				}
+			}
+			sent++
+			var moveErr error
+			landed, moveErr = pve.TransferDiskFromParker(
+				ctx, deps.PVE, deps.Log(ctx), parker, vmid, targetSlot, preVolid, optStr, parkerCfg)
+			// A protection restore cut off after the disk landed does not stop the
+			// attach. The disk is on the VM under its new name either way, so the
+			// receiving side is recorded first, exactly as on success, and the
+			// cut-off is reported last. Every write below already runs after the
+			// parker's window has closed.
+			var cutOff *pve.ProtectionRestoreCutOffError
+			if moveErr != nil && landed != "" && errors.As(moveErr, &cutOff) {
+				restoreCutOff = moveErr
+				return nil
+			}
+			return moveErr
+		},
+		landed: func(ctx context.Context, at string) (bool, error) {
+			volid, found, readErr := transferredVolidOn(ctx, deps, at, vmid, rd.stableID)
+			if found {
+				landed = volid
+			}
+			return found, readErr
+		},
+		reresolve:   attachReresolve(deps, op, preVolid, parker.Node, &parker),
+		ownsOutcome: true,
+	})
+	plan.parker = parker
 	if terr != nil {
 		if errors.Is(terr, pve.ErrMoveDiskSnapshotRefused) {
 			if embedded, ok := pve.EmbeddedDiskVMID(preVolid); ok && embedded == plan.parker.VMID {
@@ -450,7 +605,8 @@ func attachDiskViaTransfer(
 			if unErr := pve.UnparkDiskAt(ctx, deps.PVE, deps.Log(ctx), preVolid, plan.parker, parkerCfg); unErr != nil {
 				return "", "", retriableUnlessPermanent(unErr, fmt.Sprintf("%s: unpark disk %s (snapshot fallback)", op, diskCID))
 			}
-			slot, devicePath, putErr := attachDiskConfigPut(ctx, deps, op, vmCID, node, vmid, diskCID, rd, targetSlot, effectiveOpts)
+			slot, devicePath, putErr := attachDiskConfigPut(
+				ctx, deps, op, vmCID, node, vmid, diskCID, rd, targetSlot, effectiveOpts, plan.judgeTarget)
 			// A volume named for its mover takes the hard error above, so a
 			// mover only gets here holding a volume named for something else.
 			// It goes through the same function as the mainline transfer below,
@@ -1089,6 +1245,38 @@ type attachTargetRefusal struct{ err error }
 func (r attachTargetRefusal) Error() string { return r.err.Error() }
 func (r attachTargetRefusal) Unwrap() error { return r.err }
 
+// attachSettleAfterGuard settles the target VM once more after the holder guard
+// and returns the node the attach should use. A VM the wait does not find keeps
+// the node it had, so the attach's own answer for a missing VM stays as it is.
+// A VM that moved while the guard ran is checked the way a re-resolve inside
+// MutateVMConfig checks it: its node must answer, a transfer's parker must be
+// on it, and its storage must reach it. A parker that moved is followed in plan.
+func attachSettleAfterGuard(
+	ctx context.Context, deps Deps, vmCID string, vmid int, node string, rd resolvedDisk, plan *attachPlan,
+) (string, error) {
+	loc, err := settleDiskVM(ctx, deps, "attach_disk", vmCID, vmid, true)
+	if err != nil {
+		return "", err
+	}
+	if !loc.Found || loc.Node == "" || loc.Node == node {
+		return node, nil
+	}
+	deps.Log(ctx).Info("attach_disk: the target VM moved while the holder guard ran; attaching on its new node",
+		log.String("vm_cid", vmCID), log.String("from_node", node), log.String("node", loc.Node))
+	var parker *pve.DiskHolder
+	if plan.viaTransfer {
+		held := plan.parker
+		parker = &held
+	}
+	if err := attachReresolve(deps, "attach_disk", rd.volid, node, parker)(ctx, loc); err != nil {
+		return "", err
+	}
+	if parker != nil {
+		plan.parker = *parker
+	}
+	return loc.Node, nil
+}
+
 // attachDiskTargetJudge returns attach_disk's judgeTarget. It judges the
 // config it is handed as node-local truth, so it never reads, and its answers
 // are refuseUnownedVM's.
@@ -1196,7 +1384,7 @@ func guardHolderAndUnpark(ctx context.Context, deps Deps, op string, rd *resolve
 	}
 
 	if holder.Found && !holder.IsParker && holder.VMID != targetVMID {
-		return attachPlan{}, foreignHolderError(deps, op, rd.diskCID, targetVMID, holder)
+		return attachPlan{}, foreignHolderError(ctx, deps, op, rd.diskCID, targetVMID, holder)
 	}
 
 	// The disk's recorded drive-option overrides ride wherever it lives; read
@@ -1374,9 +1562,23 @@ func attachOverlayForHolder(ctx context.Context, deps Deps, op string, rd *resol
 // other than the target, separating the two cases an operator handles
 // differently: a parker stranded outside the configured band by a strategy or
 // band change, and a genuine second attachment.
-func foreignHolderError(deps Deps, op, diskCID string, targetVMID int, holder pve.DiskHolder) error {
+//
+// The refusal stands whatever the holder's HA state is, because the volume is
+// still referenced by that VM. When the holder is in fence or recovery, or its
+// node is not online, it is a retriable error that names that state instead,
+// because the holder is being recovered or moved and the Director's retry finds
+// the volume where it ends up rather than failing the deploy.
+func foreignHolderError(ctx context.Context, deps Deps, op, diskCID string, targetVMID int, holder pve.DiskHolder) error {
 	if strandedErr := strandedParkerRefusal(deps, op, diskCID, holder); strandedErr != nil {
 		return strandedErr
+	}
+	if why := holderUnavailable(ctx, deps, holder); why != "" {
+		return cpierrors.Retriable(
+			"%s: disk %s is attached to VM %d (node %s), which is being recovered or is down (%s), and it cannot be "+
+				"attached to VM %d as well; attaching one volume to two VMs corrupts it. Retry once VM %d has settled; "+
+				"the disk stays attached to it until then",
+			op, diskCID, holder.VMID, holder.Node, why, targetVMID, holder.VMID,
+		)
 	}
 	return cpierrors.Cloud(
 		"%s: disk %s is already attached to VM %d (node %s) and cannot be attached to VM %d as well; "+

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 
@@ -145,17 +147,43 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 			//
 			// Pool service absent (nil) → retriable error so the director re-drives.
 			vmid := matches[0].vmid
+			motionWait := haMotionWait(deps)
+			// The holder may be mid-migration, and the scan above may be a
+			// moment old. The wait follows a holder that moved, and refuses one
+			// on a node the cluster does not report able to answer.
+			holder := matches[0]
+			settled, settleErr := settleDiskVM(ctx, deps, "set_disk_metadata", strconv.Itoa(vmid), vmid, true)
+			if settleErr != nil {
+				return nil, settleErr
+			}
+			if settled.Found {
+				holder.node = settled.Node
+			}
+			// Both writes ride pve.MutateVMConfig, so a migration that starts
+			// after the wait is waited out under the lock and the write is
+			// sent again on the node the VM reached. The lock claims with the
+			// TTL that covers that wait.
+			diskTags = dropReservedDiskTags(ctx, deps, diskTags, diskCID)
 			lockOwner := fmt.Sprintf("set_disk_metadata/%d", vmid)
-			lockErr := withVMIDLock(ctx, deps.PVE.Pools(), vmid, lockOwner, deps.Log(ctx), func() error {
-				if err := persistMetadata(ctx, deps, matches[0], rd.sentinelKey(), metadata); err != nil {
+			lockErr := withVMIDLockFor(ctx, deps.PVE.Pools(), vmid, lockOwner, vmidLockTTLFor(motionWait), deps.Log(ctx), func() error {
+				node, err := mutateDiskMetadata(ctx, deps, diskCID, holder, motionWait, func(ctx context.Context, at string) error {
+					return persistMetadata(ctx, deps, attachedVM{node: at, vmid: vmid}, rd.sentinelKey(), metadata)
+				}, func(ctx context.Context, at string) (bool, error) {
+					return diskMetadataLanded(ctx, deps, at, vmid, rd.sentinelKey(), metadata)
+				})
+				if err != nil {
 					return err
 				}
-				if len(diskTags) > 0 {
-					if err := applyCustomTagsToVM(ctx, deps, matches[0].node, vmid, diskTags, diskCID); err != nil {
-						return err
-					}
+				holder.node = node
+				if len(diskTags) == 0 {
+					return nil
 				}
-				return nil
+				_, err = mutateDiskMetadata(ctx, deps, diskCID, holder, motionWait, func(ctx context.Context, at string) error {
+					return applyCustomTagsToVM(ctx, deps, at, vmid, diskTags, diskCID)
+				}, func(ctx context.Context, at string) (bool, error) {
+					return diskTagsLanded(ctx, deps, at, vmid, diskCID, diskTags)
+				})
+				return err
 			})
 			if lockErr != nil {
 				return nil, lockErr
@@ -190,7 +218,7 @@ func resumeSetDiskMetadataTransfer(ctx context.Context, deps Deps, rd resolvedDi
 		rd = lifecycle.disk
 		defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
 	}
-	return resumeTransferIfNeeded(ctx, local, "set_disk_metadata", rd)
+	return resumeTransferSettled(ctx, local, "set_disk_metadata", rd)
 }
 
 // coerceTagMap accepts an arbitrary JSON value supplied under metadata[jsonKeyTags]
@@ -503,4 +531,98 @@ func dropReservedDiskTags(ctx context.Context, deps Deps, tags map[string]string
 		)
 	}
 	return kept
+}
+
+// mutateDiskMetadata sends one write to the holder VM's description or tags
+// through pve.MutateVMConfig and returns the node it landed on. Both writes
+// read the description and merge into it, so sending one again is safe, and
+// landed says whether a lost answer already put the change in the config.
+func mutateDiskMetadata(
+	ctx context.Context, deps Deps, diskCID string, holder attachedVM, motionWait time.Duration,
+	apply func(ctx context.Context, node string) error,
+	landed func(ctx context.Context, node string) (bool, error),
+) (string, error) {
+	vmCID := strconv.Itoa(holder.vmid)
+	node, err := mutateDiskVM(ctx, deps, diskVMMutation{
+		op: "set_disk_metadata", vmCID: vmCID, vmid: holder.vmid, node: holder.node,
+		apply: apply, landed: landed,
+		reresolve: func(ctx context.Context, vm pve.VMLocation) error {
+			return requireNodeAnswers(ctx, deps, "set_disk_metadata",
+				fmt.Sprintf("VM %s holding disk %s", vmCID, diskCID), vm.Node)
+		},
+		budget: setVMMetadataMutateBudget(motionWait),
+	})
+	if err != nil {
+		return node, diskMutationFailure(ctx, deps, "set_disk_metadata", vmCID, holder.vmid, node, "metadata write", err)
+	}
+	return node, nil
+}
+
+// sentinelOnNode returns the raw sentinel keys of the description of VM vmid
+// on node.
+func sentinelOnNode(ctx context.Context, deps Deps, node string, vmid int) (map[string]json.RawMessage, error) {
+	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if err != nil {
+		return nil, err
+	}
+	desc, _ := pve.ConfigString(cfg, "description")
+	_, raw := pve.ParseSentinel(desc)
+	return raw, nil
+}
+
+// diskMetadataLanded reports whether the sentinel on the VM already holds
+// metadata under key. A sentinel key that is absent or unreadable is not
+// landed.
+func diskMetadataLanded(
+	ctx context.Context, deps Deps, node string, vmid int, key string, metadata map[string]any,
+) (bool, error) {
+	raw, err := sentinelOnNode(ctx, deps, node, vmid)
+	if err != nil {
+		return false, err
+	}
+	payload, ok := raw[sentinelKeyDiskMetadata]
+	if !ok {
+		return false, nil
+	}
+	recorded := make(map[string]map[string]any)
+	if json.Unmarshal(payload, &recorded) != nil {
+		return false, nil
+	}
+	entry, ok := recorded[key]
+	if !ok {
+		return false, nil
+	}
+	return sameJSON(entry, metadata), nil
+}
+
+// diskTagsLanded reports whether the sentinel on the VM already holds tags
+// under diskCID.
+func diskTagsLanded(
+	ctx context.Context, deps Deps, node string, vmid int, diskCID string, tags map[string]string,
+) (bool, error) {
+	raw, err := sentinelOnNode(ctx, deps, node, vmid)
+	if err != nil {
+		return false, err
+	}
+	payload, ok := raw[sentinelKeyDiskTags]
+	if !ok {
+		return false, nil
+	}
+	recorded := make(map[string]map[string]string)
+	if json.Unmarshal(payload, &recorded) != nil {
+		return false, nil
+	}
+	entry, ok := recorded[diskCID]
+	if !ok {
+		return false, nil
+	}
+	return sameJSON(entry, tags), nil
+}
+
+// sameJSON reports whether a and b encode to the same JSON. Map keys encode in
+// sorted order, so equal maps encode alike.
+func sameJSON(a, b any) bool {
+	left, errA := json.Marshal(a)
+	right, errB := json.Marshal(b)
+	return errA == nil && errB == nil && string(left) == string(right)
 }

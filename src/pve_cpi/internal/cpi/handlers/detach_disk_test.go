@@ -32,6 +32,10 @@ type detachQEMUService struct {
 	configCalls         int
 	configCallsAtDetach int
 
+	// configErrAfterDetach, when set, fails every Config call made after
+	// DetachDisk ran, which is a VM that was deleted under the detach.
+	configErrAfterDetach error
+
 	// DetachDisk control.
 	detachErr      error
 	detachCalled   bool
@@ -43,6 +47,9 @@ type detachQEMUService struct {
 
 func (m *detachQEMUService) Config(_ context.Context, _ string, _ int) (map[string]any, error) {
 	m.configCalls++
+	if m.configErrAfterDetach != nil && m.detachCalled {
+		return nil, m.configErrAfterDetach
+	}
 	return m.configCfg, m.configErr
 }
 
@@ -291,7 +298,9 @@ func TestHandleDetachDisk_DetachFail(t *testing.T) {
 	}
 }
 
-// TestHandleDetachDisk_VMNotFound verifies 404 from DetachDisk maps to VMNotFound.
+// TestHandleDetachDisk_VMNotFound verifies 404 from DetachDisk maps to
+// VMNotFound once the VM is proven gone. A 404 alone does not prove it, because
+// a VM that moved answers the same way from the node it left.
 func TestHandleDetachDisk_VMNotFound(t *testing.T) {
 	t.Parallel()
 	const (
@@ -300,8 +309,9 @@ func TestHandleDetachDisk_VMNotFound(t *testing.T) {
 	)
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]any{diskSlot: volid},
-		detachErr: &sdkerrors.APIError{Code: 404, Message: "VM not found"},
+		configCfg:            map[string]any{diskSlot: volid},
+		detachErr:            &sdkerrors.APIError{Code: 404, Message: "VM not found"},
+		configErrAfterDetach: &sdkerrors.APIError{Code: 404, Message: "Configuration file 'nodes/pve1/qemu-server/999.conf' does not exist"},
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
@@ -1489,14 +1499,15 @@ func TestHandleDetachDisk_RealVMHolder_OneClusterSweep(t *testing.T) {
 	if _, err := h.Handle(context.Background(), detachArgs(t, "100", parkedVolid), jsonrpc.Context{}); err != nil {
 		t.Fatalf("expected idempotent success; got: %v", err)
 	}
-	// Three fixture reads total: one locates the source VM's node, and the
-	// single holder sweep's authoritative enumeration derives cluster
-	// membership and the per-node listing from the same fixture (one read
-	// each). The holder sweep used to run twice (once for the parked check,
-	// once for the real-VM check) against the same unchanged answer; a
-	// second sweep would now show up as five reads.
-	if sweeps != 3 {
-		t.Errorf("already-detached path must resolve the holder with a single sweep (3 fixture reads); got %d", sweeps)
+	// Four fixture reads total: one locates the source VM's node, the wait
+	// for the VM to settle reads the index once more, and the single holder
+	// sweep's authoritative enumeration derives cluster membership and the
+	// per-node listing from the same fixture (one read each). The holder sweep
+	// used to run twice (once for the parked check, once for the real-VM
+	// check) against the same unchanged answer; a second sweep would now show
+	// up as six reads.
+	if sweeps != 4 {
+		t.Errorf("already-detached path must resolve the holder with a single sweep (4 fixture reads); got %d", sweeps)
 	}
 }
 

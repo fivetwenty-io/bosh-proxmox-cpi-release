@@ -438,10 +438,13 @@ func TestDeleteVM_StampDeletingTag_NilPoolsFallback(t *testing.T) {
 	}
 }
 
-// ListStatus reports no offline members; the fixture cluster is fully online.
-func (c *ldmCluster) ListStatus(context.Context) (*sdkclusterapi.ListStatusResponse, error) {
-	empty := sdkclusterapi.ListStatusResponse{}
-	return &empty, nil
+// ListStatus reports every node of the index fixture, and testNode, online.
+func (c *ldmCluster) ListStatus(ctx context.Context) (*sdkclusterapi.ListStatusResponse, error) {
+	rows, err := c.ListResources(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return onlineStatusFromResources(rows), nil
 }
 
 // ListNodes reports an empty node list; the standalone-membership

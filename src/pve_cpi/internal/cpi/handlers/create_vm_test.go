@@ -1481,9 +1481,11 @@ func TestCreateVM_NICConfigTransient_Retriable(t *testing.T) {
 // returns a transient connection error, the returned cpierror is classified as
 // RetriableCloudError AND the VM rollback (DeleteQemu) is invoked.
 //
-// The retry ladder runs on the zeroed test backoff curve, so the attach is
-// still attempted the full DefaultTransientMaxAttempts times without paying
-// the production waits between them.
+// The attach is a VM config change, so it runs under the config mutation
+// protocol: one send, then a re-read of the VM and a resend for each ambiguous
+// answer, up to the protocol's bound. The retry ladder runs on the zeroed test
+// backoff curve, so the attach is still attempted that many times without
+// paying the production waits between them.
 func TestCreateVM_AttachDiskTransient_Retriable(t *testing.T) {
 	t.Parallel()
 	transientErr := &sdkerrors.ConnectionError{
@@ -1513,8 +1515,8 @@ func TestCreateVM_AttachDiskTransient_Retriable(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from transient AttachDisk failure")
 	}
-	if got := attachCalls.Load(); got != pve.DefaultTransientMaxAttempts {
-		t.Errorf("expected %d AttachDisk attempts, got %d", pve.DefaultTransientMaxAttempts, got)
+	if got, want := attachCalls.Load(), int32(1+pve.DefaultStorageLockMaxAttempts); got != want {
+		t.Errorf("expected %d AttachDisk attempts, got %d", want, got)
 	}
 
 	var cpiErr *cpierrors.Error
@@ -5248,7 +5250,7 @@ func TestCreateVM_DiskCIDs_AnchorPromise_DiskOnAnotherNode_KeepsRefusal(t *testi
 	q := &vmMockQEMU{}
 	n := &vmMockNodes{}
 	c := &vmMockCluster{listStatusFn: func(context.Context) (*sdkcluster.ListStatusResponse, error) {
-		return handlers.AbsenceOnlineStatus(createVMCrossNodeVM, createVMCrossNodeDisk), nil
+		return handlers.AbsenceOnlineStatus(createVMCrossNodeVM, createVMCrossNodeDisk, "pve"), nil
 	}}
 	deps := buildVMDeps(q, n, c, &vmMockAgent{})
 	deps.Config.Node = createVMCrossNodeVM
@@ -5308,7 +5310,7 @@ func TestCreateVM_DiskCIDs_AnchorPromise_DiskOnNoNode_ReportsGone(t *testing.T) 
 	q := &vmMockQEMU{}
 	n := &vmMockNodes{}
 	c := &vmMockCluster{listStatusFn: func(context.Context) (*sdkcluster.ListStatusResponse, error) {
-		return handlers.AbsenceOnlineStatus(createVMCrossNodeVM, createVMCrossNodeDisk), nil
+		return handlers.AbsenceOnlineStatus(createVMCrossNodeVM, createVMCrossNodeDisk, "pve"), nil
 	}}
 	deps := buildVMDeps(q, n, c, &vmMockAgent{})
 	deps.Config.Node = createVMCrossNodeVM

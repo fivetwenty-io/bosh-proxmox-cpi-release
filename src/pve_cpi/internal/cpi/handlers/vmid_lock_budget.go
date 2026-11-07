@@ -53,6 +53,19 @@ func setVMMetadataMutationTime(motionWait time.Duration) time.Duration {
 	return setVMMetadataMutateBudget(motionWait) + poolSentinelBudget + overrun
 }
 
+// setDiskMetadataMutationTime is the most time set_disk_metadata spends in its
+// two config mutations under the lock, beyond the calls the body already
+// counts: each mutation's budget, and the calls each can still make once its
+// budget ends. A body that waits for no motion has motionWait zero and spends
+// none.
+func setDiskMetadataMutationTime(motionWait time.Duration) time.Duration {
+	if motionWait <= 0 {
+		return 0
+	}
+	overrun := time.Duration(2*vmConfigMutateOverrunCalls) * vmidLockCallAllowance
+	return 2*setVMMetadataMutateBudget(motionWait) + overrun
+}
+
 // vmidLockRetryLoop is one retry loop that runs under the VMID lock: how many
 // attempts it makes, and the helper that gives the longest total time the
 // loop's retry helper can sleep between that many attempts.
@@ -104,11 +117,14 @@ func (b vmidLockBody) budget() time.Duration {
 // ensures the pool in at most three calls with no retry, so the unmanaged path
 // is the longer one and is the one counted.
 //
-// The other bodies are fixed read-modify-writes: set_disk_metadata reads and
-// writes the config twice, and the stemcell reference updates, delete_vm's
-// deleting tag, and create_vm's failure tag each read and write it once. The
-// stemcell template destroy runs after the lock is released, so it is not
-// counted.
+// set_disk_metadata reads and writes the config twice, as two config mutations
+// that may wait out a migration, so their time is counted as bounded at their
+// Budgets (setDiskMetadataMutationTime).
+//
+// The other bodies are fixed read-modify-writes: the stemcell reference
+// updates, delete_vm's deleting tag, and create_vm's failure tag each read and
+// write it once. The stemcell template destroy runs after the lock is released,
+// so it is not counted.
 //
 // The stemcell-refs untracked destroy reads the config and the status, runs
 // the linked-clone rescan, reads the config again to compare its digest,
@@ -118,9 +134,9 @@ func (b vmidLockBody) budget() time.Duration {
 // which is counted as a bounded step.
 //
 // motionWait is pve.ha.motion_wait_sec, which sets how long set_vm_metadata
-// can wait out a migration under the lock. Zero means the holder runs no config
-// mutation, which is what vmidLockTTLNow asks for. The other bodies wait for no
-// motion, so they ignore it.
+// and set_disk_metadata can wait out a migration under the lock. Zero means the
+// holder runs no config mutation, which is what vmidLockTTLNow asks for. The
+// other bodies wait for no motion, so they ignore it.
 func vmidLockBodies(motionWait time.Duration) []vmidLockBody {
 	return []vmidLockBody{
 		{
@@ -133,7 +149,7 @@ func vmidLockBodies(motionWait time.Duration) []vmidLockBody {
 				{site: "pool move", attempts: cleanupSweepMaxAttempts, sleep: pve.RetryOnTransientOrLockSleepBudget},
 			},
 		},
-		{operation: "set_disk_metadata", singleCalls: 4},
+		{operation: "set_disk_metadata", singleCalls: 4, bounded: setDiskMetadataMutationTime(motionWait)},
 		{operation: "stemcell director reference", singleCalls: 2},
 		{operation: "delete_vm deleting tag", singleCalls: 2},
 		{operation: "create_vm failure tag", singleCalls: 2},
@@ -162,8 +178,8 @@ func vmidLockTTLFor(motionWait time.Duration) time.Duration {
 
 // vmidLockTTLNow is the TTL withVMIDLock claims with. It is for the holders
 // that wait for no migration under the lock, so it counts none. set_vm_metadata
-// waits, and claims with vmidLockTTLFor(its motion wait) through
-// withVMIDLockFor.
+// and set_disk_metadata wait, and claim with vmidLockTTLFor(their motion wait)
+// through withVMIDLockFor.
 func vmidLockTTLNow() time.Duration {
 	return vmidLockTTLFor(0)
 }
