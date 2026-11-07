@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
@@ -62,7 +63,16 @@ type diskMotionFixture struct {
 	calls       []string
 	counts      map[string]int
 
-	// haServiceReads counts reads of the HA service list.
+	// missingIs404 makes a node that holds no config answer 404 instead of the
+	// 500 that PVE gives, which is how a node record that has gone looks.
+	missingIs404 bool
+	// haState is the hastate the index row carries.
+	haState string
+
+	// deleted records the volumes the storage service was asked to delete.
+	deleted []string
+
+	// haServiceReads counts reads of any HA source.
 	haServiceReads atomic.Int32
 
 	deps handlers.Deps
@@ -90,7 +100,21 @@ func newDiskMotionFixture(t *testing.T, node string) *diskMotionFixture {
 			return err
 		},
 	}
-	f.deps = testDepsFoundVM(101, svc, nodesSvc, nil, &mockAgentService{})
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, volume string) error {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.deleted = append(f.deleted, volume)
+			return nil
+		},
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, volume string) (bool, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.deleted = append(f.deleted, volume)
+			return true, nil
+		},
+	}
+	f.deps = testDepsFoundVMWithStorage(101, svc, nodesSvc, nil, &mockAgentService{}, storageSvc)
 	// A detached disk is left free, so no test needs a parker VM.
 	f.deps.Config.DetachedDiskStrategy = "free"
 	mc := f.deps.PVE.(*mockPVEClient)
@@ -105,6 +129,9 @@ func newDiskMotionFixture(t *testing.T, node string) *diskMotionFixture {
 			row := map[string]any{"vmid": 101, "node": f.node, "type": "qemu", "tags": "bosh-cpi"}
 			if f.lock != "" {
 				row["lock"] = f.lock
+			}
+			if f.haState != "" {
+				row["hastate"] = f.haState
 			}
 			raw, _ := json.Marshal(row)
 			return &cluster.ListResourcesResponse{raw}, nil
@@ -128,15 +155,63 @@ func newDiskMotionFixture(t *testing.T, node string) *diskMotionFixture {
 		},
 	}
 	mc.clusterSvc = &haReadCountingCluster{mockClusterSvc: inner, reads: &f.haServiceReads}
+	// The disk lives on shared storage, so a VM that moved still reaches it.
+	mc.clusterStorageSvc = &mockClusterStorage{storageName: "local-lvm", storageType: "rbd", shared: true}
 	return f
 }
 
-// haReadCountingCluster counts the reads of the HA service list, which is the
-// read of a VM's HA state. The node health check reads the CRM's manager view
-// and the cluster status, and neither is counted.
+// withHAMode sets pve.ha.mode for the fixture's deps.
+func (f *diskMotionFixture) withHAMode(mode string) {
+	choice := config.HAChoice(mode)
+	f.deps.Config.HA = &config.HAConfig{Mode: &choice}
+}
+
+// haReadCountingCluster counts every read of an HA source: the HA service list,
+// the HA status rows, and the CRM's manager view. With pve.ha.mode off none may
+// happen.
 type haReadCountingCluster struct {
 	*mockClusterSvc
 	reads *atomic.Int32
+}
+
+// haSceneReadCounter counts the same reads in front of any cluster fake.
+type haSceneReadCounter struct {
+	cluster.Service
+	reads *atomic.Int32
+}
+
+func (c *haSceneReadCounter) ListHaStatusCurrent(ctx context.Context) (*cluster.ListHaStatusCurrentResponse, error) {
+	c.reads.Add(1)
+	return c.Service.ListHaStatusCurrent(ctx)
+}
+
+func (c *haSceneReadCounter) ListHaStatusManagerStatus(
+	ctx context.Context,
+) (*cluster.ListHaStatusManagerStatusResponse, error) {
+	c.reads.Add(1)
+	return c.Service.ListHaStatusManagerStatus(ctx)
+}
+
+func (c *haSceneReadCounter) ListHaResources(
+	ctx context.Context, params *cluster.ListHaResourcesParams,
+) (*cluster.ListHaResourcesResponse, error) {
+	c.reads.Add(1)
+	return c.Service.ListHaResources(ctx, params)
+}
+
+// ListHaStatusManagerStatus counts the read of the CRM's manager view.
+func (c *haReadCountingCluster) ListHaStatusManagerStatus(
+	ctx context.Context,
+) (*cluster.ListHaStatusManagerStatusResponse, error) {
+	c.reads.Add(1)
+	return handlers.AbsenceIdleCRM(), nil
+}
+
+func (c *haReadCountingCluster) ListHaStatusCurrent(
+	ctx context.Context,
+) (*cluster.ListHaStatusCurrentResponse, error) {
+	c.reads.Add(1)
+	return c.mockClusterSvc.ListHaStatusCurrent(ctx)
 }
 
 func (c *haReadCountingCluster) ListHaResources(
@@ -156,6 +231,9 @@ func (f *diskMotionFixture) home() string {
 
 // missing is the answer of a node that holds no config for the VM.
 func (f *diskMotionFixture) missing(node string) error {
+	if f.missingIs404 {
+		return notFoundAPIErr()
+	}
 	return makeAPIErr(500, fmt.Sprintf("Configuration file 'nodes/%s/qemu-server/101.conf' does not exist", node))
 }
 
@@ -403,6 +481,25 @@ func TestHandleResizeDisk_MoveAfterTheWaitIsFollowed(t *testing.T) {
 	f.requireWrites(t, "resize", motionNode1, motionNode2)
 	if f.sizeGiB != 20 {
 		t.Fatalf("size = %d GiB, want 20 (grown once)", f.sizeGiB)
+	}
+}
+
+// TestHandleResizeDisk_MoveAfterTheWaitIsFollowedWithHAOffAndAFencedRow follows
+// a VM that moved after the first wait while the row shows an HA state of fence.
+// With pve.ha.mode off the settle inside the mutation ignores that state too, so
+// the resize lands on the new node.
+func TestHandleResizeDisk_MoveAfterTheWaitIsFollowedWithHAOffAndAFencedRow(t *testing.T) {
+	t.Parallel()
+	f := newDiskMotionFixture(t, motionNode1)
+	f.haState = "fence"
+	f.beforeWrite = moveOnFirst("resize")
+
+	if err := f.resize(settleTestCtx()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	f.requireWrites(t, "resize", motionNode1, motionNode2)
+	if got := f.haServiceReads.Load(); got != 0 {
+		t.Fatalf("read an HA source %d times with pve.ha.mode off", got)
 	}
 }
 
@@ -762,6 +859,36 @@ func TestHandleSetDiskMetadata_DeadNodeDefersWithoutWrite(t *testing.T) {
 	f.requireWrites(t, "config")
 }
 
+// TestHandleSetDiskMetadata_NotFoundOnTheWriteWithTheVMStillListedIsRetriable
+// answers 404 to every metadata write while the VM is present. The 404 speaks
+// for the node that gave it, so the call is a retriable error, never a VM that
+// is gone.
+func TestHandleSetDiskMetadata_NotFoundOnTheWriteWithTheVMStillListedIsRetriable(t *testing.T) {
+	t.Parallel()
+	f := newDiskMotionFixture(t, motionNode1)
+	f.writeFn = func(string, string, int) (error, bool) { return notFoundAPIErr(), false }
+
+	err := f.setDiskMetadata(settleTestCtx())
+	requireHARetriable(t, err)
+	requireNotGone(t, err)
+}
+
+// TestHandleSetDiskMetadata_NotFoundOnTheWriteWithTheVMGoneIsVMNotFound makes
+// the VM vanish as the first write arrives, so every member answers 404 and the
+// absence proof finds it nowhere.
+func TestHandleSetDiskMetadata_NotFoundOnTheWriteWithTheVMGoneIsVMNotFound(t *testing.T) {
+	t.Parallel()
+	f := newDiskMotionFixture(t, motionNode1)
+	f.missingIs404 = true
+	f.beforeWrite = func(f *diskMotionFixture, _, _ string, _ int) { f.configNode = "nowhere" }
+
+	err := f.setDiskMetadata(settleTestCtx())
+	var typed *cpierrors.Error
+	if !errors.As(err, &typed) || typed.Type() != cpierrors.TypeVMNotFound {
+		t.Fatalf("want VMNotFound once every member agrees the VM is gone, got %v", err)
+	}
+}
+
 func TestHandleSetDiskMetadata_LostAnswerThatLandedIsNotResent(t *testing.T) {
 	t.Parallel()
 	f := newDiskMotionFixture(t, motionNode1)
@@ -857,6 +984,41 @@ func TestHandleDetachDisk_MoveAfterTheWaitIsFollowed(t *testing.T) {
 	}
 }
 
+// TestHandleDetachDisk_FailingClusterScanFailsClosedWithinTheDiskBudget keeps
+// the cluster scan failing from the start. The detach has written nothing, so
+// it gives up with a retriable error after the disk handlers' scan budget, not
+// after the minute a lock earns, and it sends no write.
+func TestHandleDetachDisk_FailingClusterScanFailsClosedWithinTheDiskBudget(t *testing.T) {
+	t.Parallel()
+	f := newDiskMotionFixture(t, motionNode1)
+	mc := f.deps.PVE.(*mockPVEClient)
+	inner := mc.clusterSvc.(*haReadCountingCluster).mockClusterSvc
+	inner.listResourcesFn = func(context.Context, *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return nil, errors.New("list resources: connection refused")
+	}
+	var mu sync.Mutex
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := start
+	ctx := pve.WithVMSettleClockForTest(context.Background(),
+		func() time.Time { mu.Lock(); defer mu.Unlock(); return now },
+		func(ctx context.Context, d time.Duration) error {
+			mu.Lock()
+			now = now.Add(d)
+			mu.Unlock()
+			return ctx.Err()
+		})
+
+	err := f.detach(ctx)
+	requireHARetriable(t, err, "connection refused")
+	mu.Lock()
+	waited := now.Sub(start)
+	mu.Unlock()
+	if waited > 15*time.Second {
+		t.Fatalf("the failing scan held the detach for %v, want at most 15s", waited)
+	}
+	f.requireWrites(t, "config")
+}
+
 func TestHandleAttachDisk_DeadNodeDefersWithoutWrite(t *testing.T) {
 	t.Parallel()
 	f := newDiskMotionFixture(t, motionNode2)
@@ -867,6 +1029,44 @@ func TestHandleAttachDisk_DeadNodeDefersWithoutWrite(t *testing.T) {
 	f.requireWrites(t, "config")
 }
 
+func TestHandleAttachDisk_WaitsOutMigrationAndAttachesOnNewNode(t *testing.T) {
+	t.Parallel()
+	f := newDiskMotionFixture(t, motionNode1)
+	f.migratesDuringTheWait()
+
+	if err := f.attach(settleTestCtx()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	f.requireWrites(t, "drive", motionNode2)
+}
+
+func TestHandleAttachDisk_MoveAfterTheWaitIsFollowed(t *testing.T) {
+	t.Parallel()
+	f := newDiskMotionFixture(t, motionNode1)
+	f.beforeWrite = moveOnFirst("drive")
+
+	if err := f.attach(settleTestCtx()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	f.requireWrites(t, "drive", motionNode1, motionNode2)
+}
+
+func TestHandleAttachDisk_LostAnswerThatLandedIsNotResent(t *testing.T) {
+	t.Parallel()
+	f := newDiskMotionFixture(t, motionNode1)
+	f.writeFn = func(_, _ string, call int) (error, bool) {
+		if call == 1 {
+			return fmt.Errorf("read tcp 10.0.0.1:44312->10.0.0.2:8006: %w", syscall.ECONNRESET), true
+		}
+		return nil, true
+	}
+
+	if err := f.attach(settleTestCtx()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	f.requireWrites(t, "drive", motionNode1)
+}
+
 func TestHandleDeleteDisk_HolderOnDeadNodeDefersWithoutWrite(t *testing.T) {
 	t.Parallel()
 	f := newDiskMotionFixture(t, motionNode2)
@@ -875,15 +1075,130 @@ func TestHandleDeleteDisk_HolderOnDeadNodeDefersWithoutWrite(t *testing.T) {
 	requireHARetriable(t, f.deleteDisk(settleTestCtx()), motionNode2)
 	f.requireWrites(t, "config")
 	f.requireWrites(t, "drive")
+	if len(f.deleted) != 0 {
+		t.Fatalf("deleted %v from storage, want nothing while the holder cannot answer", f.deleted)
+	}
+}
+
+// holderMigratesAfterTheScan keeps the holder locked for migration until the
+// settle has polled the index a few times past the holder scan, then lands it
+// on node2. The holder scan reads the index three times first.
+func (f *diskMotionFixture) holderMigratesAfterTheScan() {
+	f.lock = "migrate"
+	f.onRead = func(f *diskMotionFixture, reads int) {
+		if reads >= 6 {
+			f.node, f.lock = motionNode2, ""
+		}
+	}
+}
+
+func TestHandleDeleteDisk_WaitsOutTheHolderMigrationBeforeDeleting(t *testing.T) {
+	t.Parallel()
+	f := newDiskMotionFixture(t, motionNode1)
+	f.holderMigratesAfterTheScan()
+
+	if err := f.deleteDisk(settleTestCtx()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if f.lock != "" || f.node != motionNode2 {
+		t.Fatalf("the delete returned while the holder was still locked on %s (lock %q)", f.node, f.lock)
+	}
+	if f.reads < 6 {
+		t.Fatalf("index reads = %d, want the settle to have polled until the migration ended", f.reads)
+	}
+}
+
+func TestHandleDeleteDisk_HolderThatKeepsMigratingDefersWithoutDeleting(t *testing.T) {
+	t.Parallel()
+	f := newDiskMotionFixture(t, motionNode1)
+	f.lock = "migrate"
+
+	err := f.deleteDisk(settleTestCtx())
+	requireHARetriable(t, err, "migrate")
+	if len(f.deleted) != 0 {
+		t.Fatalf("deleted %v from storage while the holder was mid-migration", f.deleted)
+	}
+}
+
+func TestHandleDeleteDisk_HolderBeingRecoveredDefersWithoutDeleting(t *testing.T) {
+	t.Parallel()
+	f := newDiskMotionFixture(t, motionNode1)
+	f.haState = "recovery"
+	f.withHAMode(config.HAModeAuto)
+
+	err := f.deleteDisk(settleTestCtx())
+	requireHARetriable(t, err, "recovery")
+	if len(f.deleted) != 0 {
+		t.Fatalf("deleted %v from storage while the holder was in recovery", f.deleted)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the interrupted transfer's identities
+// ---------------------------------------------------------------------------
+
+// TestSettleTransferIdentities_ParkerThatMovedResumesOnItsNewNode records the
+// parker on node1 while the index shows it on node2. The resume must use node2,
+// and the journal's record stays as it was written.
+func TestSettleTransferIdentities_ParkerThatMovedResumesOnItsNewNode(t *testing.T) {
+	t.Parallel()
+	f := newDiskMotionFixture(t, motionNode2)
+	intent := &pve.DiskTransferIntent{ParkerVMID: 101, ParkerNode: motionNode1}
+
+	node, err := handlers.SettleTransferIdentitiesForTest(settleTestCtx(), f.deps, "attach_disk", intent)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != motionNode2 {
+		t.Fatalf("parker node = %q, want %q", node, motionNode2)
+	}
+	if intent.ParkerNode != motionNode1 {
+		t.Fatalf("the recorded intent changed to %q; the settle works on a copy", intent.ParkerNode)
+	}
+}
+
+func TestSettleTransferIdentities_ParkerMigratingIsWaitedOut(t *testing.T) {
+	t.Parallel()
+	f := newDiskMotionFixture(t, motionNode1)
+	f.migratesDuringTheWait()
+	intent := &pve.DiskTransferIntent{ParkerVMID: 101, ParkerNode: motionNode1}
+
+	node, err := handlers.SettleTransferIdentitiesForTest(settleTestCtx(), f.deps, "attach_disk", intent)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != motionNode2 {
+		t.Fatalf("parker node = %q, want %q after the migration", node, motionNode2)
+	}
+}
+
+// TestSettleTransferIdentities_SourceAndParkerOnDifferentNodesIsRetriable
+// refuses the resume when PVE could not move the disk between the two VMs.
+func TestSettleTransferIdentities_SourceAndParkerOnDifferentNodesIsRetriable(t *testing.T) {
+	t.Parallel()
+	f := newDiskMotionFixture(t, motionNode1)
+	mc := f.deps.PVE.(*mockPVEClient)
+	inner := mc.clusterSvc.(*haReadCountingCluster).mockClusterSvc
+	inner.listResourcesFn = func(context.Context, *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return &cluster.ListResourcesResponse{
+			json.RawMessage(`{"vmid":101,"node":"pve-node1","type":"qemu","tags":"bosh-cpi"}`),
+			json.RawMessage(`{"vmid":9100,"node":"pve-node2","type":"qemu","tags":"bosh-cpi"}`),
+		}, nil
+	}
+	intent := &pve.DiskTransferIntent{ParkerVMID: 9100, ParkerNode: motionNode2, SourceVMCID: "101"}
+
+	_, err := handlers.SettleTransferIdentitiesForTest(settleTestCtx(), f.deps, "detach_disk", intent)
+	requireHARetriable(t, err, motionNode1, motionNode2, "one node")
 }
 
 // ---------------------------------------------------------------------------
 // HA mode and the method table
 // ---------------------------------------------------------------------------
 
-// TestDiskHandlersReadNoHAServiceStateWhenHAIsOff runs each handler of the
-// fixture with pve.ha.mode off and checks that none of them reads a VM's HA
-// state, and that a VM in no HA service is not deferred on an HA view.
+// TestDiskHandlersReadNoHAServiceStateWhenHAIsOff runs every disk handler of the
+// fixture with pve.ha.mode off against a VM whose index row says it is in
+// fence. None of them may read any HA source (the service list, the status rows,
+// or the CRM's manager view), and none may defer on the row's HA state.
 func TestDiskHandlersReadNoHAServiceStateWhenHAIsOff(t *testing.T) {
 	t.Parallel()
 	for name, run := range diskMotionRuns() {
@@ -893,21 +1208,100 @@ func TestDiskHandlersReadNoHAServiceStateWhenHAIsOff(t *testing.T) {
 			if name == "delete_snapshot" {
 				f.snaps = []string{"snap1"}
 			}
-			f.deps.Config.HA = nil
+			f.haState = "fence"
+			f.withHAMode(config.HAModeOff)
 			if err := run(f, fastRetryCtx(settleTestCtx())); err != nil {
-				t.Fatalf("unexpected error: %v", err)
+				t.Fatalf("a VM in HA state fence must not defer the call when pve.ha.mode is off: %v", err)
 			}
 			if got := f.haServiceReads.Load(); got != 0 {
-				t.Fatalf("%s read the HA service list %d times with pve.ha.mode off", name, got)
+				t.Fatalf("%s read an HA source %d times with pve.ha.mode off", name, got)
 			}
 		})
 	}
 }
 
-// diskMotionRuns are the handlers the fixture drives, by method name, each
+// TestDiskHandlersDeferOnAnHAStateWhenHAIsOn is the control for the test above.
+// With pve.ha.mode auto the same row defers every handler that waits on the VM,
+// so the off-mode test passes because the mode is off and not because the
+// fixture never shows an HA state.
+func TestDiskHandlersDeferOnAnHAStateWhenHAIsOn(t *testing.T) {
+	t.Parallel()
+	for name, run := range diskMotionRuns() {
+		if name == "get_disks" {
+			// get_disks reads the VM's config and defers on a node that cannot
+			// answer, not on the HA state of the VM.
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newDiskMotionFixture(t, motionNode1)
+			if name == "delete_snapshot" {
+				f.snaps = []string{"snap1"}
+			}
+			f.haState = "fence"
+			f.withHAMode(config.HAModeAuto)
+			requireHARetriable(t, run(f, fastRetryCtx(settleTestCtx())), "fence")
+		})
+	}
+}
+
+// TestForeignHolderRefusalReadsNoHAStateWhenHAIsOff gives the refusal a holder
+// in recovery with pve.ha.mode off. The refusal is the plain permanent one, and
+// no HA source is read. A holder on a node that cluster status lists offline is
+// still named.
+func TestForeignHolderRefusalReadsNoHAStateWhenHAIsOff(t *testing.T) {
+	t.Parallel()
+	holder := pve.DiskHolder{Found: true, VMID: 101, Node: "pve-node1"}
+	cases := []struct {
+		name      string
+		setup     func(s *handlers.HADeleteScene)
+		retriable bool
+		want      string
+	}{
+		{name: "holder in recovery",
+			setup: func(s *handlers.HADeleteScene) { s.Manage(101, "pve-node1", "started", "recovery") },
+			want:  "already attached to VM 101"},
+		{name: "holder on a dead node", retriable: true,
+			setup: func(s *handlers.HADeleteScene) { s.Place(101, "pve-node1"); s.MarkNodeDead("pve-node1") },
+			want:  "node pve-node1 is not online"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			scene := handlers.NewHADeleteScene()
+			tc.setup(scene)
+			deps := foreignHolderDeps(scene)
+			choice := config.HAChoice(config.HAModeOff)
+			deps.Config.HA = &config.HAConfig{Mode: &choice}
+			var reads atomic.Int32
+			client := deps.PVE.(*handlers.HAScenePermsClient).Client.(*mockPVEClient)
+			client.clusterSvc = &haSceneReadCounter{Service: client.clusterSvc, reads: &reads}
+
+			err := handlers.ForeignHolderErrorForTest(settleTestCtx(), deps, "attach_disk",
+				"local-lvm:vm-9001-disk-0", 202, holder)
+			var typed *cpierrors.Error
+			if !errors.As(err, &typed) {
+				t.Fatalf("want a CPI error, got %T %v", err, err)
+			}
+			if typed.OkToRetry() != tc.retriable || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("retriable = %v, error %q; want retriable %v naming %q", typed.OkToRetry(), err, tc.retriable, tc.want)
+			}
+			if strings.Contains(err.Error(), "HA state") {
+				t.Fatalf("the refusal names an HA state with pve.ha.mode off: %v", err)
+			}
+			if got := reads.Load(); got != 0 {
+				t.Fatalf("the refusal read an HA source %d times with pve.ha.mode off", got)
+			}
+		})
+	}
+}
+
+// diskMotionRuns are the disk handlers the fixture drives, by method name, each
 // against a healthy VM.
 func diskMotionRuns() map[string]func(f *diskMotionFixture, ctx context.Context) error {
 	return map[string]func(f *diskMotionFixture, ctx context.Context) error{
+		"attach_disk":       func(f *diskMotionFixture, ctx context.Context) error { return f.attach(ctx) },
+		"delete_disk":       func(f *diskMotionFixture, ctx context.Context) error { return f.deleteDisk(ctx) },
 		"resize_disk":       func(f *diskMotionFixture, ctx context.Context) error { return f.resize(ctx) },
 		"snapshot_disk":     func(f *diskMotionFixture, ctx context.Context) error { _, err := f.snapshot(ctx); return err },
 		"delete_snapshot":   func(f *diskMotionFixture, ctx context.Context) error { return f.deleteSnapshot(ctx) },
@@ -920,8 +1314,9 @@ func diskMotionRuns() map[string]func(f *diskMotionFixture, ctx context.Context)
 
 // diskMethodsWithoutAMotionWait are the CPI methods that are not disk handlers
 // acting on a VM's config, or that act on no VM at all, and the reason each
-// needs no settle of a disk's holder. The table covers the same 22 methods as
-// the dispatcher's, so a method added without a decision here fails the test.
+// needs no settle of a disk's holder. A method that cpi.Methods() registers
+// must appear here or in diskMotionRuns, and the test names the one that does
+// not.
 var diskMethodsWithoutAMotionWait = map[string]string{
 	"info":                          "no VM",
 	"create_stemcell":               "no VM",
@@ -939,26 +1334,52 @@ var diskMethodsWithoutAMotionWait = map[string]string{
 }
 
 // TestEveryDiskMethodIsCoveredByAMotionTest ties the CPI method table to the
-// motion tests: a method is either exercised against a VM that moves or sits on
-// a dead node, or it is listed with the reason it needs neither.
+// fixture. A method is either exempt with a reason, or it is run here against a
+// VM on a node that cannot answer, and the run must come back a retriable error
+// that names the node, with nothing written to the VM and nothing deleted from
+// storage. A method in neither table, or in both, or a table entry for a method
+// the dispatcher no longer registers, fails by name.
 func TestEveryDiskMethodIsCoveredByAMotionTest(t *testing.T) {
 	t.Parallel()
-	covered := map[string]bool{"attach_disk": true, "delete_disk": true}
-	for name := range diskMotionRuns() {
-		covered[name] = true
-	}
-	methods := cpi.Methods()
-	if len(methods) != 22 {
-		t.Fatalf("Methods() returned %d entries, want 22; classify the new method in this test", len(methods))
-	}
-	for _, m := range methods {
+	runs := diskMotionRuns()
+	registered := map[string]bool{}
+	for _, m := range cpi.Methods() {
+		registered[m] = true
 		_, exempt := diskMethodsWithoutAMotionWait[m]
+		_, run := runs[m]
 		switch {
-		case covered[m] && exempt:
-			t.Errorf("%s is listed as covered and as exempt", m)
-		case !covered[m] && !exempt:
+		case run && exempt:
+			t.Errorf("%s is run by a motion test and listed as exempt", m)
+		case !run && !exempt:
 			t.Errorf("%s has no motion test and no exemption", m)
 		}
+	}
+	for name := range runs {
+		if !registered[name] {
+			t.Errorf("%s has a motion test but cpi.Methods() does not register it", name)
+		}
+	}
+	for name := range diskMethodsWithoutAMotionWait {
+		if !registered[name] {
+			t.Errorf("%s is listed as exempt but cpi.Methods() does not register it", name)
+		}
+	}
+	for name, run := range runs {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newDiskMotionFixture(t, motionNode2)
+			if name == "delete_snapshot" {
+				f.snaps = []string{"snap1"}
+			}
+			f.offline[motionNode2] = true
+			requireHARetriable(t, run(f, settleTestCtx()), motionNode2)
+			for _, op := range []string{"config", "drive", "resize", "snapshot", "delsnap"} {
+				f.requireWrites(t, op)
+			}
+			if len(f.deleted) != 0 {
+				t.Fatalf("%s deleted %v from storage on a node that cannot answer", name, f.deleted)
+			}
+		})
 	}
 }
 

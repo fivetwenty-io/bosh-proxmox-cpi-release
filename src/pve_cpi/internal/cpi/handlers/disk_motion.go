@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -19,9 +18,15 @@ import (
 // for it to settle, which follows a migration to the VM's new node and refuses
 // a node the cluster does not report able to answer, and every config change
 // then goes through pve.MutateVMConfig, which handles a migration that starts
-// after the wait. The helpers here are that shared shape. They read no HA state
-// of their own: the wait polls the cluster scan the handlers already run, so
-// pve.ha.mode "off" never reads HA through them.
+// after the wait. The helpers here are that shared shape.
+//
+// With pve.ha.mode "off" none of them reads any HA state. The settle wait and
+// the mutation protocol ignore the HA state in the scan row, the foreign-holder
+// refusal leaves the holder's HA state out, and the node health check reads
+// /cluster/status alone, with no manager status, status rows, or node clock. A
+// node that is online in cluster status but fenced by HA reads as able to
+// answer in that mode, and the call then meets the config-missing or lock
+// answers that the mutation protocol handles.
 
 // settleDiskVM waits until VM vmid is safe to act on and returns where it is
 // now. It differs from settleVMForCall in one way. A VM that is absent from the
@@ -32,6 +37,10 @@ import (
 //
 // A VM that is found must sit on a node the cluster reports able to answer, or
 // the call is a retriable error. A node in maintenance can answer.
+//
+// The handlers that call this have written nothing yet, so a cluster scan that
+// keeps failing ends the wait after diskScanFailureBudget with a retriable
+// error, not the minute that a lock earns.
 func settleDiskVM(
 	ctx context.Context, deps Deps, op, vmCID string, vmid int, probeFoundSettles bool,
 ) (pve.VMLocation, error) {
@@ -40,6 +49,7 @@ func settleDiskVM(
 	}
 	settled, err := pve.AwaitVMSettled(ctx, deps.PVE, deps.Log(ctx), pve.VMSettleRequest{
 		VMID: vmid, MotionWait: haMotionWait(deps), Label: op, ProbeFoundSettles: probeFoundSettles,
+		ScanFailureBudget: diskScanFailureBudget, IgnoreHAState: haStateUnread(deps),
 	})
 	if err != nil {
 		return pve.VMLocation{}, cpierrors.Wrap(err, fmt.Sprintf("%s: wait for VM %s to settle", op, vmCID))
@@ -53,6 +63,28 @@ func settleDiskVM(
 	return settled, nil
 }
 
+// diskScanFailureBudget is how long a disk handler's settle polls a cluster
+// scan that keeps failing before it fails closed. A handler waits here before
+// its first write, so a cluster API that is down costs the operator this much
+// and no more, and the retry finds the cluster when it is back.
+const diskScanFailureBudget = 15 * time.Second
+
+// haStateUnread reports that pve.ha.mode is off, where the disk handlers read
+// no HA state and defer on none. A deps with no config reads as HA on, the
+// safer side.
+func haStateUnread(deps Deps) bool {
+	return deps.Config != nil && !deps.Config.HAWritesEnabled()
+}
+
+// diskHealthOptions are the node health inputs of the disk handlers. With
+// pve.ha.mode off they read no HA source, so cluster status alone says whether
+// a node can answer.
+func diskHealthOptions(deps Deps) pve.NodeHealthOptions {
+	opts := haHealthOptions(deps)
+	opts.SkipHA = haStateUnread(deps)
+	return opts
+}
+
 // requireNodeAnswers returns nil when the cluster reports node able to answer a
 // call addressed to it, and a retriable error naming what for otherwise. A PVE
 // client with no cluster or nodes service has nothing to ask, so it passes, the
@@ -61,7 +93,7 @@ func requireNodeAnswers(ctx context.Context, deps Deps, op, what, node string) e
 	if deps.PVE == nil || deps.PVE.Cluster() == nil || deps.PVE.Nodes() == nil {
 		return nil
 	}
-	report, err := pve.NodeHealth(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), haHealthOptions(deps))
+	report, err := pve.NodeHealth(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), diskHealthOptions(deps))
 	if err != nil {
 		return cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, fmt.Sprintf(
 			"%s: %s is on node %s, and the cluster status could not be read to confirm that node can answer",
@@ -122,11 +154,12 @@ func mutateDiskVM(ctx context.Context, deps Deps, m diskVMMutation) (string, err
 	lastNode := m.node
 	var own error
 	loc, err := pve.MutateVMConfig(ctx, deps.PVE, deps.Log(ctx), pve.VMConfigMutation{
-		VMID:       m.vmid,
-		Node:       m.node,
-		MotionWait: haMotionWait(deps),
-		Label:      m.op,
-		Budget:     m.budget,
+		VMID:          m.vmid,
+		Node:          m.node,
+		MotionWait:    haMotionWait(deps),
+		Label:         m.op,
+		Budget:        m.budget,
+		IgnoreHAState: haStateUnread(deps),
 		Apply: func(ctx context.Context, at string) error {
 			lastNode = at
 			applyErr := m.apply(ctx, at)
@@ -155,11 +188,14 @@ func mutateDiskVM(ctx context.Context, deps Deps, m diskVMMutation) (string, err
 // node to the handler's answer. A raw not-found or config-missing answer speaks
 // for the node that gave it alone, and the VM may have moved, so it is
 // VMNotFound only when the absence proof finds the VM nowhere, and a VM found
-// elsewhere is a retriable error. Every other error is already typed or is the
-// caller's to wrap, and it returns unchanged.
+// elsewhere is a retriable error. That holds for a 404 that pve.WrapError has
+// already typed as a permanent error, because its cause still says 404 and the
+// type does not say the VM is gone. Only an error that is already VMNotFound or
+// DiskNotFound is a settled answer and passes through without the proof. Every
+// other error is already typed or is the caller's to wrap, and it returns
+// unchanged.
 func diskMutationFailure(ctx context.Context, deps Deps, op, vmCID string, vmid int, node, step string, err error) error {
-	var typed *cpierrors.Error
-	if isConfigMissing(err) && !errors.As(err, &typed) {
+	if isConfigMissing(err) && !cpierrors.IsNotFound(err) {
 		if goneErr := confirmVMGone(ctx, deps, op, vmid, node, step); goneErr != nil {
 			return goneErr
 		}
@@ -323,23 +359,36 @@ func transferredVolidOn(ctx context.Context, deps Deps, node string, vmid int, s
 // holderUnavailable says why a VM that holds a disk cannot be acted on now,
 // or returns "" when nothing is known against it. It looks for the two things
 // the plan treats as a holder that is down or being recovered: an HA state of
-// fence or recovery, and a node the cluster does not report online. Any lookup
-// that fails returns "" because the refusal that calls this keeps its meaning
-// without the extra detail.
+// fence or recovery, and a node the cluster does not report online. With
+// pve.ha.mode off it leaves the HA state out and reads the node alone. A lookup
+// that fails returns no reason for its half, because the refusal that calls
+// this keeps its meaning without the extra detail, and the failure is logged at
+// debug so a refusal that reads as a plain foreign-holder refusal can be traced.
 func holderUnavailable(ctx context.Context, deps Deps, holder pve.DiskHolder) string {
 	var reasons []string
 	node := holder.Node
-	if loc, err := findVMAuthoritative(ctx, deps, holder.VMID); err == nil && loc.Found {
+	loc, err := findVMAuthoritative(ctx, deps, holder.VMID)
+	switch {
+	case err != nil:
+		deps.Log(ctx).Debug("disk handler: could not look up the holder of a disk, so its HA state is not named",
+			log.Int("holder_vmid", holder.VMID), log.Err(err))
+	case loc.Found:
 		if loc.Node != "" {
 			node = loc.Node
 		}
-		switch state := strings.ToLower(strings.TrimSpace(loc.HAState)); state {
-		case "fence", "recovery":
-			reasons = append(reasons, fmt.Sprintf("its HA state is %s", state))
+		if !haStateUnread(deps) {
+			switch state := strings.ToLower(strings.TrimSpace(loc.HAState)); state {
+			case "fence", "recovery":
+				reasons = append(reasons, fmt.Sprintf("its HA state is %s", state))
+			}
 		}
 	}
 	if node != "" && deps.PVE != nil && deps.PVE.Cluster() != nil && deps.PVE.Nodes() != nil {
-		if report, err := pve.NodeHealth(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), haHealthOptions(deps)); err == nil {
+		report, err := pve.NodeHealth(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), diskHealthOptions(deps))
+		if err != nil {
+			deps.Log(ctx).Debug("disk handler: could not read node health for the holder of a disk",
+				log.Int("holder_vmid", holder.VMID), log.String("node", node), log.Err(err))
+		} else {
 			entry, listed := report.Node(node)
 			if !listed || !entry.ProxyTarget {
 				reason := "the cluster does not list it"

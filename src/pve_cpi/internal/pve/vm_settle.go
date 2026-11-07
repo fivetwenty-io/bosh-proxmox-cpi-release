@@ -85,6 +85,20 @@ type VMSettleRequest struct {
 	// catches up.
 	ProbeFoundSettles bool
 
+	// ScanFailureBudget caps how long a cluster scan that keeps failing is
+	// polled before the wait gives up with the scan's last error. Zero or
+	// less means the 60-second default. A caller that holds up an operator,
+	// or that has not written anything yet and can fail closed at once, sets
+	// a smaller figure. It never lengthens a budget a lock or an HA state
+	// has set.
+	ScanFailureBudget time.Duration
+
+	// IgnoreHAState makes the wait read nothing of the row's HA state: it
+	// neither refuses a service in fence or recovery nor waits for an HA
+	// migration. A caller sets it when pve.ha.mode is off, where the CPI reads
+	// no HA state. The lock on the row still holds the wait.
+	IgnoreHAState bool
+
 	// notAfter, when set, ends the wait no later than this time on the wait's
 	// own clock. MutateVMConfig sets it so its settle waits share the
 	// protocol's budget.
@@ -96,6 +110,13 @@ func (r VMSettleRequest) motionWait() time.Duration {
 		return DefaultMotionWait
 	}
 	return r.MotionWait
+}
+
+func (r VMSettleRequest) scanFailureBudget() time.Duration {
+	if r.ScanFailureBudget <= 0 {
+		return settleOtherLockBudget
+	}
+	return r.ScanFailureBudget
 }
 
 func (r VMSettleRequest) label() string {
@@ -131,7 +152,7 @@ var settleStableHAStates = map[string]struct{}{
 }
 
 // observeSettle classifies one scan location. It never reads anything itself.
-func observeSettle(loc VMLocation, motionWait time.Duration, probeFoundSettles bool) settleObservation {
+func observeSettle(loc VMLocation, motionWait time.Duration, probeFoundSettles, ignoreHAState bool) settleObservation {
 	if !loc.FromScan && probeFoundSettles && loc.FromConfig {
 		return settleObservation{settled: true}
 	}
@@ -146,6 +167,9 @@ func observeSettle(loc VMLocation, motionWait time.Duration, probeFoundSettles b
 	}
 	lock := strings.ToLower(strings.TrimSpace(loc.Lock))
 	haState := strings.ToLower(strings.TrimSpace(loc.HAState))
+	if ignoreHAState {
+		haState = ""
+	}
 
 	switch haState {
 	case haRawFence, haRawRecovery:
@@ -217,8 +241,9 @@ func settleLockBudget(lock string, motionWait time.Duration) time.Duration {
 // which mean the node is dead or being fenced, and a suspended lock, which
 // only resuming the VM clears.
 //
-// A scan that fails is polled again under the 60-second budget, and the last
-// failure is returned when the budget runs out. A VM that FindVMAuthoritative
+// A scan that fails is polled again under the 60-second budget, or under
+// req.ScanFailureBudget when that is smaller, and the last failure is returned
+// when the budget runs out. A VM that FindVMAuthoritative
 // cannot find is returned as Found=false with no error. That answer is not a
 // proof of absence, and a caller that needs one runs the absence proof.
 //
@@ -247,12 +272,12 @@ func AwaitVMSettled(ctx context.Context, c Client, logger *log.Logger, req VMSet
 		switch {
 		case err != nil:
 			lastErr = err
-			obs = settleObservation{budget: settleOtherLockBudget, reason: "the cluster scan failed"}
+			obs = settleObservation{budget: req.scanFailureBudget(), reason: "the cluster scan failed"}
 		case !loc.Found:
 			return loc, nil
 		default:
 			lastErr = nil
-			obs = observeSettle(loc, motionWait, req.ProbeFoundSettles)
+			obs = observeSettle(loc, motionWait, req.ProbeFoundSettles, req.IgnoreHAState)
 		}
 		if obs.settled {
 			if poll > 0 && logger != nil {

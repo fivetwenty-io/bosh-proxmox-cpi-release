@@ -45,6 +45,11 @@ type VMConfigMutation struct {
 	// known. Zero leaves the budget as MutateVMConfig's own doc describes.
 	Budget time.Duration
 
+	// IgnoreHAState keeps the protocol's waits from reading the HA state in
+	// the cluster scan, as VMSettleRequest.IgnoreHAState describes. A caller
+	// sets it when pve.ha.mode is off.
+	IgnoreHAState bool
+
 	// Apply sends the change to node once. It must not retry on its own,
 	// because the protocol decides whether sending again is safe, and the
 	// context it receives turns off the SDK's own retries for that reason. It
@@ -133,7 +138,9 @@ func MutateVMConfig(ctx context.Context, c Client, logger *log.Logger, m VMConfi
 			limit = capped
 		}
 	}
-	settleReq := VMSettleRequest{VMID: m.VMID, MotionWait: m.MotionWait, Label: m.label()}
+	settleReq := VMSettleRequest{
+		VMID: m.VMID, MotionWait: m.MotionWait, Label: m.label(), IgnoreHAState: m.IgnoreHAState,
+	}
 
 	loc := VMLocation{Node: m.Node, Found: m.Node != ""}
 	if m.Node == "" {

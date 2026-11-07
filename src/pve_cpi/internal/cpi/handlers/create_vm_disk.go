@@ -870,7 +870,7 @@ func resizeRootDisk(
 	// remaining delta from the live config so a committed-then-dropped
 	// attempt is not replayed on top of itself.
 	rerr := resizeDiskConverging(ctx, deps, logger, "resize_root_disk",
-		shape.node, vmid, shape.rootDiskKey, actualTemplateGiB, shape.rootDiskGiB, shape.maxAttempts)
+		shape.node, vmid, shape.rootDiskKey, actualTemplateGiB, shape.rootDiskGiB, shape.maxAttempts, false)
 	if rerr != nil {
 		// Route through WrapError so task-level transients (LVM command
 		// timeouts under VG contention, pmxcfs sync races where the just-

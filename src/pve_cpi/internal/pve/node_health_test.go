@@ -231,6 +231,33 @@ func TestNodeHealth_OperatorTagWithoutHASources(t *testing.T) {
 	}
 }
 
+// SkipHA reads no HA source: no manager status, no status rows, and no clock.
+// Cluster status alone classifies the nodes, so a node listed offline is still
+// dead, and the operator's maintenance tag still applies.
+func TestNodeHealth_SkipHAReadsNoHASource(t *testing.T) {
+	t.Parallel()
+	c := nhHealthy()
+	c.rows = []json.RawMessage{
+		nhClusterRow(1), nhNode("pve1", 1, true, ""), nhNode("pve2", 1, false, "maintenance"), nhNode("pve3", 0, false, ""),
+	}
+	r, n := nhRun(t, c, pve.NodeHealthOptions{SkipHA: true, MaintenanceTags: []string{"maintenance"}})
+	if r.HA != pve.HAViewNotRead {
+		t.Fatalf("HA = %q, want %q", r.HA, pve.HAViewNotRead)
+	}
+	if c.managerCalls != 0 || c.currentCalls != 0 || len(n.asked) != 0 {
+		t.Fatalf("read an HA source: manager %d, status rows %d, clock %v", c.managerCalls, c.currentCalls, n.asked)
+	}
+	if e := nhEntry(t, r, "pve1"); !e.ProxyTarget || e.DeadOrFenced {
+		t.Errorf("pve1 is online in cluster status: %+v", e)
+	}
+	if e := nhEntry(t, r, "pve2"); !e.Maintenance || !e.ProxyTarget {
+		t.Errorf("pve2 carries the maintenance tag and answers: %+v", e)
+	}
+	if e := nhEntry(t, r, "pve3"); e.ProxyTarget || !e.DeadOrFenced {
+		t.Errorf("pve3 is offline in cluster status: %+v", e)
+	}
+}
+
 // One errored VM on a healthy node must not mark the node. The old check read the
 // state field of every entry in status/current and condemned the node for it.
 func TestNodeHealth_ErroredServiceDoesNotMarkNode(t *testing.T) {

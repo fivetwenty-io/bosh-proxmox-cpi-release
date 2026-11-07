@@ -94,7 +94,9 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node st
 	// to a node that cannot answer or that the holder has left. The wait
 	// follows a holder that moved and returns a retriable error for one on a
 	// node that cannot answer, so the volume is never deleted while its holder
-	// cannot be unparked.
+	// cannot be unparked. The plan waits whenever the disk's VM is locked, not
+	// only for a parker, and a holder that is not locked settles on the one
+	// index read, so the wait stays on every holder.
 	if holder.Found && holder.VMID > 0 {
 		settled, settleErr := settleDiskVM(ctx, deps, "delete_disk", strconv.Itoa(holder.VMID), holder.VMID, true)
 		if settleErr != nil {

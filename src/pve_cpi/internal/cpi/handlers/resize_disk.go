@@ -277,7 +277,7 @@ func HandleResizeDisk(deps Deps) Handler {
 					known = live
 				}
 				sentOnce = true
-				return resizeDiskConverging(ctx, deps, deps.Log(ctx), "resize_disk", at, vmid, diskID, known, newGiB, 0)
+				return resizeDiskConverging(ctx, deps, deps.Log(ctx), "resize_disk", at, vmid, diskID, known, newGiB, 0, true)
 			},
 			landed: func(ctx context.Context, at string) (bool, error) {
 				live, readErr := readDiskSizeGiB(ctx, deps, "resize_disk", at, vmid, diskID)
@@ -421,6 +421,13 @@ func settleDroppedResizeGiB(
 //
 // currentGiB is the size the caller already read for its first-attempt delta,
 // so the steady-state path issues no extra config reads.
+//
+// insideMutation says the call runs inside pve.MutateVMConfig. There a
+// config-missing answer ends the loop at once and goes back to the mutation,
+// which settles and follows a VM that left the node. Outside a mutation, such
+// as the root-disk resize in create_vm, nothing follows the VM, and the same
+// answer is a just-cloned config that pmxcfs has not synced to the node yet, so
+// the loop retries it with its backoff.
 func resizeDiskConverging(
 	ctx context.Context,
 	deps Deps,
@@ -429,12 +436,17 @@ func resizeDiskConverging(
 	vmid int,
 	diskID string,
 	currentGiB, targetGiB, maxAttempts int,
+	insideMutation bool,
 ) error {
 	knownGiB := currentGiB
 	firstAttempt := true
 	pendingUPID := ""      // prior attempt's task whose completion is unresolved
 	submitDropped := false // prior POST's response dropped: an unnamed task may exist
-	return retryOnTransientOrLockUntilMissing(ctx, logger, op, maxAttempts, func() error {
+	retry := pve.RetryOnTransientOrLock
+	if insideMutation {
+		retry = retryOnTransientOrLockUntilMissing
+	}
+	return retry(ctx, logger, op, maxAttempts, func() error {
 		if !firstAttempt {
 			if pendingUPID != "" {
 				awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, pendingUPID, logger)

@@ -332,6 +332,52 @@ func TestAwaitVMSettled_ScanFailures(t *testing.T) {
 	}
 }
 
+// ScanFailureBudget shortens the wait for a scan that keeps failing, and it
+// never reaches past the figure the caller set.
+func TestAwaitVMSettled_ScanFailureBudgetCapsAFailingScan(t *testing.T) {
+	t.Parallel()
+	listErr := errors.New("list resources: connection refused")
+	clk := newSettleTestClock()
+	c := &findVMTestClient{backendTestClient: backendTestClient{clusterSvc: &fakeCluster{
+		listFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			return nil, listErr
+		},
+	}}}
+	_, err := AwaitVMSettled(clk.ctx(context.Background()), c, nil, VMSettleRequest{
+		VMID: 7009, ScanFailureBudget: 15 * time.Second,
+	})
+	requireSettleRetriable(t, err, "the cluster scan failed", "connection refused")
+	if e := clk.Elapsed(); e != 15*time.Second {
+		t.Errorf("waited %v; want the 15s the caller set", e)
+	}
+}
+
+// IgnoreHAState leaves a service in fence or recovery, and an HA migration,
+// out of the wait, while the row's lock still holds it.
+func TestAwaitVMSettled_IgnoreHAStateReadsNoHAState(t *testing.T) {
+	t.Parallel()
+	for _, state := range []string{"fence", "recovery", "migrate"} {
+		clk := newSettleTestClock()
+		c := scriptedScanClient(clk, 7011, func(time.Duration) *scanRow {
+			return &scanRow{node: "pve-node1", haState: state}
+		})
+		loc, err := AwaitVMSettled(clk.ctx(context.Background()), c, nil, VMSettleRequest{VMID: 7011, IgnoreHAState: true})
+		if err != nil || loc.Node != "pve-node1" {
+			t.Errorf("HA state %s: loc, err = %+v, %v; want settled at once", state, loc, err)
+		}
+		if clk.Elapsed() != 0 {
+			t.Errorf("HA state %s: waited %v, want no wait", state, clk.Elapsed())
+		}
+	}
+
+	clk := newSettleTestClock()
+	c := scriptedScanClient(clk, 7012, func(time.Duration) *scanRow {
+		return &scanRow{node: "pve-node1", lock: "backup", haState: "fence"}
+	})
+	_, err := AwaitVMSettled(clk.ctx(context.Background()), c, nil, VMSettleRequest{VMID: 7012, IgnoreHAState: true})
+	requireSettleRetriable(t, err, "locked (backup)")
+}
+
 // A VM the index has not caught up with is found by the config probe, whose
 // answer carries no lock or HA state, so the wait polls until the row shows.
 func TestAwaitVMSettled_IndexLagPollsUntilTheRowAppears(t *testing.T) {

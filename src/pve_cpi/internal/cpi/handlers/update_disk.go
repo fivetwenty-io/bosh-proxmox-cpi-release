@@ -419,7 +419,7 @@ func resizeDiskInternal(
 	// ... got timeout". Retry the full submit+await pair on that signal. The
 	// retry recomputes the remaining delta from the live config so a
 	// committed-then-dropped attempt is not replayed on top of itself.
-	rerr := resizeDiskConverging(ctx, deps, deps.Log(ctx), "update_disk_resize", node, vmid, diskID, currentGiB, newGiB, 0)
+	rerr := resizeDiskConverging(ctx, deps, deps.Log(ctx), "update_disk_resize", node, vmid, diskID, currentGiB, newGiB, 0, true)
 	if rerr != nil {
 		return cpierrors.Wrap(pve.WrapError(rerr), fmt.Sprintf("update_disk: ResizeDisk failed for %s (+%dG)", diskCID, deltaGiB))
 	}

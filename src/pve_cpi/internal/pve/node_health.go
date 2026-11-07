@@ -123,6 +123,10 @@ const (
 	// clock could not be read, so no HA source was trusted.
 	HAViewUnreadable HAView = "unreadable"
 
+	// HAViewNotRead means the caller asked for no HA source, so only cluster
+	// status classified the nodes.
+	HAViewNotRead HAView = "not_read"
+
 	// HAViewNotQuorate means the entry node is not quorate. No HA source was
 	// read, and every node is reported as unknown.
 	HAViewNotQuorate HAView = "not_quorate"
@@ -148,6 +152,14 @@ type NodeHealthOptions struct {
 	// in maintenance. A node that carries any of them is in maintenance whatever
 	// PVE reports, and the result is the union of both sources.
 	MaintenanceTags []string
+
+	// SkipHA keeps NodeHealth from reading any HA source: the manager status,
+	// the entry node's clock, and the lrm text. Cluster status alone then
+	// classifies the nodes, as it does when no HA source can be trusted. A
+	// caller sets it when pve.ha.mode is off and the call must read no HA
+	// state, at the cost of a node that is online in cluster status but
+	// fenced by HA reading as online.
+	SkipHA bool
 }
 
 // NodeHealthEntry is the helper's answer for one node.
@@ -307,7 +319,8 @@ const (
 // status, the structured manager status with its node_status and lrm_status
 // maps, the entry node's clock, and, only when manager status is empty or
 // unreadable, the text of the lrm entries in status/current. It then applies
-// the operator's maintenance tags as an extra input.
+// the operator's maintenance tags as an extra input. With opts.SkipHA it reads
+// no HA source at all.
 //
 // Only a failed cluster status read returns an error, because without the
 // membership list nothing can be classified. Every other failed source degrades
@@ -340,6 +353,14 @@ func NodeHealth(
 		report.HA = HAViewNotQuorate
 		report.HAReason = "entry node does not report the cluster quorate"
 		report.Nodes = unknownEntries(view, opts, report.HAReason)
+		report.reindex()
+		return report, nil
+	}
+
+	if opts.SkipHA {
+		report.HA = HAViewNotRead
+		report.HAReason = "the caller asked for no HA source"
+		report.Nodes = classifyNodes(view, report.HA, haInputs{}, opts)
 		report.reindex()
 		return report, nil
 	}
