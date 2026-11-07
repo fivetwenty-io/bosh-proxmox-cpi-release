@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -233,37 +235,25 @@ func applyPostCloneConfig(
 	return applyPCIPassthroughWithCleanup(ctx, deps, node, candidate, parsed.cloudProps.PCIPassthroughs, logger)
 }
 
-// applyPCINodeAffinityPin writes a strict single-node HA pin when the VM has
-// PCI passthrough configured. PCI passthrough blocks live migration; a strict
-// node pin makes that constraint durable across HA failover and DLB rebalance.
-//
-// When pts is empty, or pve.ha.mode is "off", this is a no-op: the off mode
-// registers nothing and writes no rule, so a VM with PCI passthrough stays
-// outside HA. Errors follow the same selective propagation as
-// applyAZNodeAffinityPin: retriable errors (lock-timeout, verify failure)
-// propagate; generic HA-API failures are logged as non-fatal warnings.
-func applyPCINodeAffinityPin(
-	ctx context.Context,
-	deps Deps,
-	vmid int,
-	node string,
-	pts []PCIPassthrough,
-	logger *log.Logger,
-) error {
-	if len(pts) == 0 || !deps.Config.HAWritesEnabled() {
+// applyPCINodeAffinityPin checks that the pin of a VM with PCI passthrough
+// devices confines it to its node alone. PCI passthrough blocks live migration,
+// and the device exists only on the node the VM was placed on, so the HA
+// decision carries that node as a hard constraint and the merged pin must be
+// strict with exactly that node. A VM with no passthrough device, or whose
+// decision does not register it, needs no check. A pin that does not hold the
+// constraint fails the call rather than let PVE HA move the VM off its device.
+func applyPCINodeAffinityPin(d *ha.VMDecision, pin *ha.Rule, node string, pts []PCIPassthrough) error {
+	if len(pts) == 0 || !d.Registers() {
 		return nil
 	}
-	// PCI passthrough requires a strict single-node pin so HA cannot relocate
-	// the VM to a node that may lack the device.
-	if pinErr := ensureNodeAffinityPin(ctx, deps, vmid, []string{node}, true, logger); pinErr != nil {
-		if cpierrors.IsType(pinErr, cpierrors.TypeRetriableCloud) {
-			return pinErr
+	if pin == nil || !pin.Strict || pin.Disabled || !slices.Equal(pin.NodeNames(), []string{node}) {
+		got := "no pin"
+		if pin != nil {
+			got = fmt.Sprintf("pin %s on nodes %v (strict=%t, disabled=%t)", pin.ID, pin.NodeNames(), pin.Strict,
+				pin.Disabled)
 		}
-		logger.Warn("create_vm: PCI strict node-affinity pin not fully applied (non-fatal)",
-			log.Int(metadataKeyVMID, vmid),
-			log.String("node", node),
-			log.Err(pinErr),
-		)
+		return cpierrors.Cloud("create_vm: VM %d has PCI passthrough devices on node %s, but its HA confinement "+
+			"is %s, not a strict pin to that node alone", d.VMID, node, got)
 	}
 	return nil
 }

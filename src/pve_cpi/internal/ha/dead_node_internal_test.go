@@ -20,12 +20,28 @@ func placeableExcept(down ...string) func(string) bool {
 // strict is true.
 func deadNodePin(strict bool, nodes map[string]int) Rule {
 	return Rule{ID: "bosh-na-101", Type: RuleTypeNodeAffinity, Affinity: AffinityPositive, Strict: strict,
-		Nodes: nodes, Resources: []string{"vm:101"}, Comment: "owner=us"}
+		Nodes: nodes, Resources: []string{"vm:101"}, Comment: "owner=us bosh-vols=nfs"}
 }
 
-func deletionDestinations(set *RuleSet, down ...string) (DeadNodeReach, error) {
+// deadNodeStorages indexes a shared storage every member reaches, one that
+// reaches a and b alone, and a node-local one.
+func deadNodeStorages(t *testing.T) StorageIndex {
+	t.Helper()
+	idx, err := NewStorageIndex([]pve.StorageInfo{
+		{Name: "nfs", Type: "nfs", Shared: true},
+		{Name: "ab", Type: "nfs", Shared: true, Nodes: []string{"a", "b"}},
+		{Name: "local-lvm", Type: "lvmthin"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return idx
+}
+
+func deletionDestinations(t *testing.T, set *RuleSet, down ...string) (DeadNodeReach, error) {
+	t.Helper()
 	return DeletionDestinations("a", deadNodeMembers, set, "vm:101", "bosh-na-101", ownedByUs,
-		placeableExcept(down...))
+		placeableExcept(down...), deadNodeStorages(t))
 }
 
 // TestDeletionDestinationsNamesOnlyTheSharedAccessSet is the three-node case:
@@ -34,7 +50,7 @@ func deletionDestinations(set *RuleSet, down ...string) (DeadNodeReach, error) {
 // config onto c.
 func TestDeletionDestinationsNamesOnlyTheSharedAccessSet(t *testing.T) {
 	t.Parallel()
-	got, err := deletionDestinations(deadNodeRules(deadNodePin(true, map[string]int{"a": 2, "b": 0})), "a")
+	got, err := deletionDestinations(t, deadNodeRules(deadNodePin(true, map[string]int{"a": 2, "b": 0})), "a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +70,11 @@ func TestDeletionDestinationsCases(t *testing.T) {
 	errored := deadNodePin(true, map[string]int{"a": 0, "c": 0})
 	errored.Errors = []string{"resources: conflict"}
 	narrowed := deadNodePin(true, map[string]int{"c": 0})
-	narrowed.Comment = "owner=us dead-node-from=a"
+	narrowed.Comment = "owner=us bosh-vols=nfs dead-node-from=a"
+	partial := deadNodePin(false, map[string]int{"a": 0, "b": 0, "c": 0})
+	partial.Comment = "owner=us bosh-vols=ab"
+	local := deadNodePin(false, map[string]int{"a": 0, "b": 0, "c": 0})
+	local.Comment = "owner=us bosh-vols=local-lvm,nfs"
 	cases := []struct {
 		name        string
 		set         *RuleSet
@@ -64,9 +84,14 @@ func TestDeletionDestinationsCases(t *testing.T) {
 		pinned      bool
 		toSource    bool
 	}{
-		{name: "no pin admits every member", set: deadNodeRules(), down: []string{"a"}, dests: []string{"b", "c"}},
-		{name: "the failed source's stale LRM never blocks", set: deadNodeRules(), down: []string{"a"},
-			dests: []string{"b", "c"}},
+		{name: "a non-strict pin over every node admits every member", set: deadNodeRules(deadNodePin(false,
+			map[string]int{"a": 0, "b": 0, "c": 0})), down: []string{"a"}, dests: []string{"b", "c"}},
+		{name: "the failed source's stale LRM never blocks", set: deadNodeRules(deadNodePin(false,
+			map[string]int{"b": 0})), down: []string{"a"}, dests: []string{"b", "c"}},
+		{name: "the recorded storage bounds a non-strict pin", set: deadNodeRules(partial), down: []string{"a"},
+			dests: []string{"b"}},
+		{name: "a recorded node-local storage keeps the VM on its source", set: deadNodeRules(local),
+			down: []string{"a"}},
 		{name: "a non-strict pin only orders the nodes", set: deadNodeRules(deadNodePin(false,
 			map[string]int{"a": 2})), down: []string{"a"}, dests: []string{"b", "c"}},
 		{name: "a pin to the dead node alone", set: deadNodeRules(deadNodePin(true, map[string]int{"a": 0})),
@@ -81,12 +106,12 @@ func TestDeletionDestinationsCases(t *testing.T) {
 			down: []string{"a", "b"}, unplaceable: []string{"b"}, pinned: true},
 		{name: "a pin node that is no member is ignored", set: deadNodeRules(deadNodePin(true,
 			map[string]int{"a": 0, "b": 0, "gone": 0})), down: []string{"a"}, dests: []string{"b"}, pinned: true},
-		{name: "other VMs' pins do not count", set: deadNodeRules(Rule{ID: "bosh-na-102",
-			Type: RuleTypeNodeAffinity, Strict: true, Nodes: map[string]int{"c": 0}, Resources: []string{"vm:102"}}),
-			down: []string{"a"}, dests: []string{"b", "c"}},
+		{name: "other VMs' pins do not count", set: deadNodeRules(deadNodePin(false, map[string]int{"a": 0}),
+			Rule{ID: "bosh-na-102", Type: RuleTypeNodeAffinity, Strict: true, Nodes: map[string]int{"c": 0},
+				Resources: []string{"vm:102"}}), down: []string{"a"}, dests: []string{"b", "c"}},
 	}
 	for _, tc := range cases {
-		got, err := deletionDestinations(tc.set, tc.down...)
+		got, err := deletionDestinations(t, tc.set, tc.down...)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
@@ -112,38 +137,56 @@ func TestDeletionDestinationsRefusesBadInput(t *testing.T) {
 	empty := deadNodePin(true, map[string]int{})
 	elsewhere := deadNodePin(true, map[string]int{"b": 0})
 	otherToken := deadNodePin(true, map[string]int{"b": 0})
-	otherToken.Comment = "owner=us dead-node-from=c"
+	otherToken.Comment = "owner=us bosh-vols=nfs dead-node-from=c"
+	unrecorded := deadNodePin(true, map[string]int{"a": 0})
+	unrecorded.Comment = "owner=us"
+	emptyRecord := deadNodePin(true, map[string]int{"a": 0})
+	emptyRecord.Comment = "owner=us bosh-vols="
+	unknownStorage := deadNodePin(true, map[string]int{"a": 0})
+	unknownStorage.Comment = "owner=us bosh-vols=gone"
+	idx := deadNodeStorages(t)
 	cases := []struct {
 		name   string
 		source string
 		set    *RuleSet
 		place  func(string) bool
 		owned  func(*Rule) bool
+		index  pve.StorageInfoGetter
 		want   string
 	}{
-		{"empty source", " ", rules, ok, ownedByUs, "not named"},
-		{"source not a member", "z", rules, ok, ownedByUs, "not a cluster member"},
-		{"no health answer", "a", rules, nil, ownedByUs, "no node health"},
-		{"no rules read", "a", nil, ok, ownedByUs, "rules were not read"},
+		{"empty source", " ", rules, ok, ownedByUs, idx, "not named"},
+		{"source not a member", "z", rules, ok, ownedByUs, idx, "not a cluster member"},
+		{"no health answer", "a", rules, nil, ownedByUs, idx, "no node health"},
+		{"no rules read", "a", nil, ok, ownedByUs, idx, "rules were not read"},
+		{"no storage index", "a", rules, ok, ownedByUs, nil, "storage index was not read"},
+		{"no pin", "a", rules, ok, ownedByUs, idx, "no record of where its volumes are"},
 		{"pin is a resource-affinity rule", "a", deadNodeRules(Rule{ID: "bosh-na-101",
-			Type: RuleTypeResourceAffinity, Resources: []string{"vm:101", "vm:9"}}), ok, ownedByUs,
+			Type: RuleTypeResourceAffinity, Resources: []string{"vm:101", "vm:9"}}), ok, ownedByUs, idx,
 			"not a node-affinity pin"},
-		{"foreign pin", "a", deadNodeRules(foreign), ok, ownedByUs, "ownership marker"},
-		{"no ownership answer", "a", deadNodeRules(deadNodePin(true, map[string]int{"a": 0})), ok, nil,
+		{"foreign pin", "a", deadNodeRules(foreign), ok, ownedByUs, idx, "ownership marker"},
+		{"no ownership answer", "a", deadNodeRules(deadNodePin(true, map[string]int{"a": 0})), ok, nil, idx,
 			"ownership marker"},
-		{"pin holds another resource", "a", deadNodeRules(shared), ok, ownedByUs, "not vm:101 alone"},
-		{"strict pin with no node", "a", deadNodeRules(empty), ok, ownedByUs, "names no node"},
-		{"strict pin without the dead node", "a", deadNodeRules(elsewhere), ok, ownedByUs, "does not name dead node"},
-		{"token naming another node", "a", deadNodeRules(otherToken), ok, ownedByUs, "does not name dead node"},
+		{"pin holds another resource", "a", deadNodeRules(shared), ok, ownedByUs, idx, "not vm:101 alone"},
+		{"strict pin with no node", "a", deadNodeRules(empty), ok, ownedByUs, idx, "names no node"},
+		{"pin without a volume record", "a", deadNodeRules(unrecorded), ok, ownedByUs, idx,
+			"carries no bosh-vols record"},
+		{"pin with an empty volume record", "a", deadNodeRules(emptyRecord), ok, ownedByUs, idx,
+			"carries no bosh-vols record"},
+		{"recorded storage not indexed", "a", deadNodeRules(unknownStorage), ok, ownedByUs, idx,
+			"reach of the recorded storages gone"},
+		{"strict pin without the dead node", "a", deadNodeRules(elsewhere), ok, ownedByUs, idx,
+			"does not name dead node"},
+		{"token naming another node", "a", deadNodeRules(otherToken), ok, ownedByUs, idx, "does not name dead node"},
 	}
 	for _, tc := range cases {
 		_, err := DeletionDestinations(tc.source, deadNodeMembers, tc.set, "vm:101", "bosh-na-101", tc.owned,
-			tc.place)
+			tc.place, tc.index)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: got %v, want an error naming %q", tc.name, err, tc.want)
 		}
 	}
-	if _, err := DeletionDestinations("a", deadNodeMembers, rules, "", "bosh-na-101", ownedByUs, ok); err == nil {
+	if _, err := DeletionDestinations("a", deadNodeMembers, rules, "", "bosh-na-101", ownedByUs, ok,
+		idx); err == nil {
 		t.Error("an unnamed resource must be an error")
 	}
 }

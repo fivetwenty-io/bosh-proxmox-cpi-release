@@ -81,6 +81,9 @@ type deadNodeCompletion struct {
 	owner   string
 	profile *ha.Profile
 	reach   ha.DeadNodeReach
+	// storages is the storage index the deletion destinations read the reach
+	// of the VM's recorded storages from, read once per completion.
+	storages ha.StorageIndex
 }
 
 // completeDeadNodeDelete runs the completion for the legacy delete of the VM
@@ -350,7 +353,7 @@ func (c *deadNodeCompletion) computeReach(ctx context.Context, set *ha.RuleSet) 
 	if err != nil {
 		return c.deferWrap(err, "read node health to compute the deletion destinations")
 	}
-	reach, err := c.destinations(report, set)
+	reach, err := c.destinations(ctx, report, set)
 	if err != nil {
 		return err
 	}
@@ -358,14 +361,29 @@ func (c *deadNodeCompletion) computeReach(ctx context.Context, set *ha.RuleSet) 
 	return nil
 }
 
-// destinations computes the deletion destinations from report and set, and
-// defers when there are none.
-func (c *deadNodeCompletion) destinations(report *pve.NodeHealthReport, set *ha.RuleSet) (ha.DeadNodeReach, error) {
+// destinations computes the deletion destinations from report, set, and the
+// storage index, and defers when there are none. A VM whose pin carries no
+// record of its volumes defers too, because nothing then says which nodes
+// reach them.
+func (c *deadNodeCompletion) destinations(
+	ctx context.Context, report *pve.NodeHealthReport, set *ha.RuleSet,
+) (ha.DeadNodeReach, error) {
 	if report == nil {
 		return ha.DeadNodeReach{}, c.deferf("no node health was read to compute the deletion destinations")
 	}
+	if c.storages == nil {
+		storages, err := readStorageIndex(ctx, c.deps)
+		if err != nil {
+			return ha.DeadNodeReach{}, c.deferWrap(err, "read the storage index to compute the deletion destinations")
+		}
+		index, err := ha.NewStorageIndex(storages)
+		if err != nil {
+			return ha.DeadNodeReach{}, c.deferWrap(err, "index the storages to compute the deletion destinations")
+		}
+		c.storages = index
+	}
 	reach, err := ha.DeletionDestinations(c.source, reportMembers(report), set, c.sid, naRuleNameFor(c.vmid),
-		c.ownedRule, report.Placeable)
+		c.ownedRule, report.Placeable, c.storages)
 	if err != nil {
 		return reach, c.deferWrap(err, "compute the deletion destinations")
 	}
@@ -395,6 +413,9 @@ func (c *deadNodeCompletion) noDestinations(reach ha.DeadNodeReach) error {
 		why = fmt.Sprintf("the VM's strict pin %s admits dead node %s alone, which is the pin of a VM with a "+
 			"node-local volume, of a hold VM, or of a VM whose hard constraints leave one node, so no live node "+
 			"is known to reach its volumes", naRuleNameFor(c.vmid), c.source)
+	case len(reach.Reach) == 0 && len(reach.Admissible) > 0:
+		why = fmt.Sprintf("the storages %s that the VM's pin records reach dead node %s alone, so the VM holds a "+
+			"volume no live node can reach", strings.Join(reach.Recorded, ", "), c.source)
 	case len(reach.Unplaceable) > 0:
 		why = fmt.Sprintf("node %s is admitted by the VM's pin but is not online with a fresh LRM timestamp",
 			strings.Join(reach.Unplaceable, ", "))
@@ -535,7 +556,7 @@ func (c *deadNodeCompletion) narrowRules(ctx context.Context) ([]string, error) 
 		if blockers := ha.DeadNodeRuleBlockers(set, c.sid, pinID, c.ownedRule); len(blockers) > 0 {
 			return c.blocked(blockers)
 		}
-		reach, err := c.destinations(report, set)
+		reach, err := c.destinations(ctx, report, set)
 		if err != nil {
 			return err
 		}

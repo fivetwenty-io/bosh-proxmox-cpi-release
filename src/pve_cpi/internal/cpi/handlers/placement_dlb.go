@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdkclusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
@@ -19,175 +19,21 @@ import (
 // the Dynamic Load Balancer; set via /cluster/options crs=ha=dynamic.
 const crsModeDynamic = "dynamic"
 
-// ensureDLBMembership registers an eligible VM as a PVE HA resource with
-// auto-rebalance enabled so the PVE 9.2+ Dynamic Load Balancer places and
-// continuously rebalances it. It is best-effort: every guard failure or PVE
-// API error is returned for the caller to log as a warning — it never blocks
-// create_vm.
-//
-// Guards evaluated in order:
-//  1. PVE version >= 9.2 (nodes.ListVersion); if older or undeterminable as
-//     older → log debug and return nil (skip).
-//  2. Cluster has >= 2 nodes (ListConfigNodes); single-node = DLB is inert.
-//  3. Shared-storage guard: if the VM storage pool, disk pool, or ConfigDrive
-//     ISO pool is local → skip registration. If undeterminable → proceed
-//     (fail-open) with a debug log.
-//  4. Register: CreateHaResources with State=started, AutoRebalance=true, and
-//     the ownership marker when the request names its Director. If already
-//     registered → UpdateHaResources to ensure the flags are set, adding the
-//     marker to an unmarked resource and leaving another Director's alone.
-//  5. CRS: read the cluster crs option and, when it is not dynamic, log a WARN
-//     with the corrective pvesh command. The CPI never writes the CRS mode.
-func ensureDLBMembership(ctx context.Context, deps Deps, vmid int, az string, logger *log.Logger) error {
-	logger.Debug("DLB: evaluating membership", log.Int("vmid", vmid), log.String("az", az))
-
-	// Guard 1: version check.
-	nodeName := ""
-	if deps.Config != nil {
-		nodeName = deps.Config.Node
-	}
-	if nodeName == "" {
-		// Fall back to first node from cluster config.
-		if nodeName2, err := firstClusterNode(ctx, deps); err == nil {
-			nodeName = nodeName2
-		}
-	}
-	if nodeName == "" {
-		logger.Debug("DLB: no node name available for version check, skipping DLB")
+// ensureDLBMembership checks the cluster's CRS mode for a VM whose HA decision
+// registers it in the DLB AZ. The decision already settled whether the VM may
+// join the PVE 9.2+ Dynamic Load Balancer: the version floor, a cluster with
+// two or more placeable nodes, and shared storage for every volume. Staging
+// already registered the resource with auto-rebalance, so what remains is the
+// CRS check, which logs a WARN with the corrective pvesh command when the
+// cluster's crs is not dynamic. The CPI never writes the CRS mode. A VM outside
+// the DLB AZ, or one the decision does not register, needs no check. A failed
+// read is returned for the caller to log.
+func ensureDLBMembership(ctx context.Context, deps Deps, d *ha.VMDecision, logger *log.Logger) error {
+	if !d.Registers() || !d.DLB {
 		return nil
 	}
-	if deps.PVE == nil || deps.PVE.Nodes() == nil {
-		logger.Debug("DLB: nodes service unavailable, skipping DLB")
-		return nil
-	}
-	verResp, verErr := deps.PVE.Nodes().ListVersion(ctx, nodeName)
-	if verErr != nil {
-		return fmt.Errorf("DLB: version check for node %q: %w", nodeName, verErr)
-	}
-	if verResp == nil {
-		return fmt.Errorf("DLB: nil version response for node %q", nodeName)
-	}
-	if !pveVersionAtLeast(verResp.Version, 9, 2) {
-		logger.Debug("DLB: PVE < 9.2, skipping",
-			log.String("node", nodeName), log.String("version", verResp.Version))
-		return nil
-	}
-
-	// Guard 2: cluster must have >= 2 nodes.
-	nodeCount, countErr := clusterNodeCount(ctx, deps)
-	if countErr != nil {
-		return fmt.Errorf("DLB: cluster node count: %w", countErr)
-	}
-	if nodeCount < 2 {
-		logger.Debug("DLB: single-node cluster, DLB is inert")
-		return nil
-	}
-
-	// Guard 3: shared-storage requirement. A VM whose root pool, persistent
-	// disk pool, OR config-drive ISO pool resides on node-local storage cannot
-	// be live-migrated (the ISO pool holds the scsi30 CD-ROM that lives for the
-	// VM's whole life, not only at boot — see the ISOStorage field doc in
-	// internal/config/config.go), so any one of them being local disqualifies
-	// the VM from DLB registration. Check all distinct, non-empty pools;
-	// undeterminable shared-ness is fail-open (proceed).
-	if deps.Config != nil {
-		checked := map[string]struct{}{}
-		for _, stg := range []string{deps.Config.VMStorage, deps.Config.DiskStorage, deps.EffectiveISOStorage(ctx)} {
-			if stg == "" {
-				continue
-			}
-			if _, dup := checked[stg]; dup {
-				continue
-			}
-			checked[stg] = struct{}{}
-			shared, knownErr := dlbStorageIsShared(ctx, deps, stg)
-			if knownErr != nil {
-				// Undeterminable → fail-open, proceed with debug log.
-				logger.Debug("DLB: storage shared-ness undeterminable, proceeding fail-open",
-					log.String("storage", stg), log.Err(knownErr))
-				continue
-			}
-			if !shared {
-				logger.Debug("DLB: local storage detected, skip HA registration",
-					log.String("storage", stg))
-				return nil
-			}
-		}
-	}
-
-	// Guard 4: register or update the HA resource. The resource carries the
-	// ownership marker, the same one the anti-affinity and node-affinity
-	// writers stamp, so the cleanup paths can tell it is this Director's.
-	svc := deps.PVE.Cluster()
-	sid := haResourceSid(vmid)
-	owner := deps.RequestDirectorUUID
-	stateVal := "started"
-	arVal := true
-	createParams := &cluster.CreateHaResourcesParams{
-		Sid:           sid,
-		State:         &stateVal,
-		AutoRebalance: &arVal,
-	}
-	if owner != "" {
-		marker := haIdentity{Owner: owner}.marker()
-		createParams.Comment = &marker
-	} else {
-		logger.Warn("DLB: the request carries no director_uuid, so the HA resource is registered without "+
-			"an ownership marker", log.String("sid", sid))
-	}
-	if createErr := svc.CreateHaResources(ctx, createParams); createErr != nil {
-		if !isHaAlreadyExists(createErr) {
-			return fmt.Errorf("DLB: register HA resource %q: %w", sid, createErr)
-		}
-		// Resource exists (possibly from anti-affinity path); update flags.
-		if updErr := updateDLBHaResource(ctx, svc, sid, owner, logger); updErr != nil {
-			return updErr
-		}
-	}
-
-	// Guard 5: CRS option.
-	if err := ensureDLBClusterCRS(ctx, svc, logger); err != nil {
+	if err := ensureDLBClusterCRS(ctx, deps.PVE.Cluster(), logger); err != nil {
 		return fmt.Errorf("DLB: cluster CRS check: %w", err)
-	}
-
-	return nil
-}
-
-// updateDLBHaResource sets the DLB flags on an HA resource that already exists.
-// It reads the resource first so it can judge ownership by the marker. A
-// resource marked for another Director is left alone. An unmarked one, from an
-// older CPI or a writer that sent no marker, gains this Director's marker in
-// the same update, and a resource already marked as ours keeps its comment. An
-// unreadable resource is not written, because its owner is unknown.
-func updateDLBHaResource(ctx context.Context, svc cluster.Service, sid, owner string, logger *log.Logger) error {
-	got, readErr := svc.GetHaResources(ctx, sid)
-	if readErr != nil {
-		return fmt.Errorf("DLB: read HA resource %q before updating its flags: %w", sid, readErr)
-	}
-	comment := ""
-	if got != nil && got.Comment != nil {
-		comment = *got.Comment
-	}
-	stateVal := "started"
-	arVal := true
-	params := &cluster.UpdateHaResourcesParams{
-		State:         &stateVal,
-		AutoRebalance: &arVal,
-	}
-	switch haOwnershipOf(comment, owner) {
-	case haOwnedByOther:
-		return fmt.Errorf("DLB: HA resource %q carries another Director's ownership marker; leaving it alone", sid)
-	case haUnmarked:
-		if owner != "" {
-			marker := haIdentity{Owner: owner}.marker()
-			params.Comment = &marker
-			logger.Debug("DLB: adding the ownership marker to an unmarked HA resource",
-				log.String("sid", sid), log.String("previous_comment", comment))
-		}
-	case haOwnedByUs:
-	}
-	if updErr := svc.UpdateHaResources(ctx, sid, params); updErr != nil {
-		return fmt.Errorf("DLB: update HA resource %q flags: %w", sid, updErr)
 	}
 	return nil
 }
@@ -238,29 +84,6 @@ func withRequiredCRS(m map[string]string) map[string]string {
 	return out
 }
 
-// firstClusterNode returns the name of the first node from ListConfigNodes,
-// used when deps.Config.Node is empty.
-func firstClusterNode(ctx context.Context, deps Deps) (string, error) {
-	if deps.PVE == nil || deps.PVE.Cluster() == nil {
-		return "", fmt.Errorf("cluster service unavailable")
-	}
-	resp, err := deps.PVE.Cluster().ListConfigNodes(ctx)
-	if err != nil || resp == nil || len(*resp) == 0 {
-		return "", fmt.Errorf("no cluster nodes available")
-	}
-	var n struct {
-		Node string `json:"node"`
-		Name string `json:"name"`
-	}
-	if jerr := json.Unmarshal((*resp)[0], &n); jerr != nil {
-		return "", jerr
-	}
-	if n.Node != "" {
-		return n.Node, nil
-	}
-	return n.Name, nil
-}
-
 // dlbStorageIsShared classifies whether the named storage is shared.
 // Returns (true, nil) for shared, (false, nil) for local,
 // (false, non-nil) when the classification cannot be determined.
@@ -307,56 +130,6 @@ func dlbStorageIsShared(ctx context.Context, deps Deps, storage string) (bool, e
 		return false, fmt.Errorf("DLB storage guard: storage %q not found in cluster storage list", storage)
 	}
 	return pve.SharedViaBacking(target, all), nil
-}
-
-// pveVersionAtLeast parses a PVE version string (e.g. "9.2-1", "9.2", "10.0")
-// and reports whether it is >= major.minor. The version string format is:
-//
-//	"<major>.<minor>[-<build>]"  (e.g. "9.2-1", "9.1-3", "10.0", "8.4-2")
-//
-// Inputs and edge cases:
-//   - empty string → false (version is unknown; skip conservatively)
-//   - missing minor segment → false (not determinable as >=, skip conservatively)
-//   - build suffix after "-" in the minor segment is stripped before comparison
-//   - major > target_major → true regardless of minor
-//   - major == target_major, minor >= target_minor → true
-//   - major < target_major → false
-func pveVersionAtLeast(version string, major, minor int) bool {
-	if version == "" {
-		return false
-	}
-	// Strip any trailing whitespace.
-	version = strings.TrimSpace(version)
-	// Split into major and the rest (e.g. "9" and "2-1" or "2").
-	parts := strings.SplitN(version, ".", 2)
-	if len(parts) < 2 {
-		// No "." → cannot determine minor; skip conservatively.
-		return false
-	}
-	gotMajor, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return false
-	}
-	// Strip build suffix from the minor segment: "2-1" → "2".
-	minorPart := parts[1]
-	if idx := strings.IndexByte(minorPart, '-'); idx >= 0 {
-		minorPart = minorPart[:idx]
-	}
-	// Minor may itself contain a further "." (e.g. "2.3"); take only the first component.
-	if idx := strings.IndexByte(minorPart, '.'); idx >= 0 {
-		minorPart = minorPart[:idx]
-	}
-	gotMinor, err := strconv.Atoi(minorPart)
-	if err != nil {
-		return false
-	}
-	if gotMajor > major {
-		return true
-	}
-	if gotMajor == major && gotMinor >= minor {
-		return true
-	}
-	return false
 }
 
 // parseCRSRaw parses the crs field of GET /cluster/options into the same

@@ -164,7 +164,7 @@ func TestMergedPinIntersectsAZAndPCIInEitherOrder(t *testing.T) {
 }
 
 func TestMergedPinPrioritiesFlattenInAResourceAffinityRule(t *testing.T) {
-	req := pinRequest{Preferred: []string{"pve01", "pve02"}, Placed: "pve01", Register: true}
+	req := pinRequest{Preferred: []string{"pve01", "pve02"}, Placed: "pve01", Storages: []string{testPinStorage}}
 	stub := newNAStub()
 	deps := naClusterDeps(stub, "pve01", "pve02", "pve03")
 	if err := ensureMergedPin(context.Background(), deps, 100, req, log.NewNopLogger()); err != nil {
@@ -188,7 +188,12 @@ func TestMergedPinPrioritiesFlattenInAResourceAffinityRule(t *testing.T) {
 	}
 }
 
-func TestRebalancePin(t *testing.T) {
+// TestDecisionPinKeepsThePlacedNodeUnderRebalanceOnStart shows a registered VM
+// with no node constraint gets the placed-node pin while the CRS rebalances at
+// start, so the CRM cannot start it on a node the CPI did not choose, and
+// otherwise the record pin over its admissible set. Both record the volumes,
+// and neither is strict, because neither confines the VM.
+func TestDecisionPinKeepsThePlacedNodeUnderRebalanceOnStart(t *testing.T) {
 	rebalance := func(on bool) func(context.Context) (*ha.Profile, error) {
 		return func(context.Context) (*ha.Profile, error) {
 			p, _ := pve9ClusterProfile("pve01", "pve02", "pve03")(context.Background())
@@ -196,41 +201,40 @@ func TestRebalancePin(t *testing.T) {
 			return p, nil
 		}
 	}
-	registered := func() *naClusterStub {
-		stub := newNAStub()
-		stub.resources["vm:100"] = true
-		return stub
-	}
-
-	stub := registered()
-	deps := naDeps(stub)
-	deps.HAProfile = rebalance(true)
-	if err := ensureRebalancePin(context.Background(), deps, 100, createVMCloudProps{}, "pve02",
-		log.NewNopLogger()); err != nil {
-		t.Fatal(err)
-	}
-	rule, ok := stub.rules[naRuleNameFor(100)]
-	if !ok || ptrStr(rule.Nodes) != "pve02" || (rule.Strict != nil && *rule.Strict) {
-		t.Fatalf("placed-node pin = %+v", rule)
-	}
-
 	for name, tc := range map[string]struct {
-		stub *naClusterStub
-		cp   createVMCloudProps
-		on   bool
+		on    bool
+		nodes string
 	}{
-		"dlb":           {registered(), createVMCloudProps{AvailabilityZone: "dlb"}, true},
-		"unregistered":  {newNAStub(), createVMCloudProps{}, true},
-		"rebalance off": {registered(), createVMCloudProps{}, false},
+		"rebalance on":  {true, "pve02"},
+		"rebalance off": {false, "pve01,pve02,pve03"},
 	} {
-		deps := naDeps(tc.stub)
-		deps.HAProfile = rebalance(tc.on)
-		if err := ensureRebalancePin(context.Background(), deps, 100, tc.cp, "pve02", log.NewNopLogger()); err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if len(tc.stub.rules) != 0 {
-			t.Fatalf("%s: wrote %v", name, tc.stub.rules)
-		}
+		t.Run(name, func(t *testing.T) {
+			stub := newNAStub()
+			stub.resources["vm:100"] = true
+			deps := naDeps(stub)
+			deps.HAProfile = rebalance(tc.on)
+			d := &ha.VMDecision{VMID: 100, SID: "vm:100", Node: "pve02", Outcome: ha.OutcomeRegister,
+				Placed: "pve02", Admissible: []string{"pve01", "pve02", "pve03"}}
+			profile, err := deps.HAProfile(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			pin, err := writeMergedPinRule(context.Background(), deps, profile, 100,
+				pinRequest{Decision: d, Storages: []string{testPinStorage}}, log.NewNopLogger())
+			if err != nil {
+				t.Fatal(err)
+			}
+			rule, ok := stub.rules[naRuleNameFor(100)]
+			if !ok || ptrStr(rule.Nodes) != tc.nodes || (rule.Strict != nil && *rule.Strict) {
+				t.Fatalf("pin = %+v nodes %s", rule, ptrStr(rule.Nodes))
+			}
+			if got, ok := ha.VolumeRecord(ptrStr(rule.Comment)); !ok || len(got) != 1 || got[0] != testPinStorage {
+				t.Fatalf("pin comment %q records %v", ptrStr(rule.Comment), got)
+			}
+			if pin == nil || pin.ID != naRuleNameFor(100) {
+				t.Fatalf("returned pin %+v", pin)
+			}
+		})
 	}
 }
 
@@ -299,7 +303,7 @@ func TestMergedPinWithNoAdmissibleNodeFailsBeforeRegistering(t *testing.T) {
 			deps := naClusterDeps(stub, "pve01", "pve02")
 			deps.Config.HA = &config.HAConfig{Mode: haChoiceOf(mode)}
 			err := ensureMergedPin(context.Background(), deps, 100,
-				pinRequest{Hard: []string{"pve09"}, Placed: "pve09", Register: true}, log.NewNopLogger())
+				pinRequest{Hard: []string{"pve09"}, Placed: "pve09", Storages: []string{testPinStorage}}, log.NewNopLogger())
 			if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !errors.Is(err, ha.ErrNoAdmissibleNode) {
 				t.Fatalf("err = %v", err)
 			}
@@ -348,7 +352,7 @@ func TestAntiAffinityWithoutADirectorFailsOnlyInManagedMode(t *testing.T) {
 		cfg.HA.Mode = haChoiceOf(tc.mode)
 		deps := aaDepsLock(cfg, stub, newAALockPools(nil))
 		deps.RequestDirectorUUID = ""
-		err := applyAntiAffinityMembership(context.Background(), deps, 101, aaEnvForWebGroup(), log.NewNopLogger())
+		err := aaApply(context.Background(), deps, 101, aaEnvForWebGroup(), log.NewNopLogger())
 		if (err != nil) != tc.wantErr || err != nil && !strings.Contains(err.Error(), "director_uuid") ||
 			stub.createRuleCalls+stub.updateRuleCalls != 0 {
 			t.Fatalf("%s: err %v creates %d updates %d", tc.mode, err, stub.createRuleCalls, stub.updateRuleCalls)
@@ -555,7 +559,7 @@ func TestManagedCreateVMMigratesALegacyRule(t *testing.T) {
 	guarded := m.deps
 	guarded.PVE = m.guard.Client()
 
-	if err := applyAntiAffinityMembership(context.Background(), guarded, m.vmid, aaEnvForWebGroup(), log.NewNopLogger()); err != nil {
+	if err := aaApply(context.Background(), guarded, m.vmid, aaEnvForWebGroup(), log.NewNopLogger()); err != nil {
 		t.Fatalf("managed create_vm failed on a legacy rule: %v (guard: %v)", err, m.guard.Err())
 	}
 	if err := m.guard.Err(); err != nil {

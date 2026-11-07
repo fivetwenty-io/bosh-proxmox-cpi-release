@@ -2,9 +2,11 @@ package handlers
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
@@ -110,55 +112,68 @@ func TestDLBEligibility_UnderMode(t *testing.T) {
 	}
 }
 
-// TestApplyPCINodeAffinityPin_UnderMode shows the strict PCI pin is a no-op
-// under mode off and is written under a mode that writes HA, whatever the
-// pin_az key says.
-func TestApplyPCINodeAffinityPin_UnderMode(t *testing.T) {
+// TestApplyPCINodeAffinityPin_Confinement shows the PCI check passes only a
+// strict, enabled pin to the VM's node alone, and that a VM with no passthrough
+// device or no registration needs no pin.
+func TestApplyPCINodeAffinityPin_Confinement(t *testing.T) {
 	t.Parallel()
 	pts := []PCIPassthrough{{Address: "0000:01:00.0"}}
+	registered := &ha.VMDecision{VMID: 321, SID: "vm:321", Outcome: ha.OutcomeRegister, Hard: []string{"pve01"}}
+	skipped := &ha.VMDecision{VMID: 321, SID: "vm:321", Outcome: ha.OutcomeSkip}
+	pin := func(strict, disabled bool, nodes ...string) *ha.Rule {
+		r := &ha.Rule{ID: "bosh-pin-vm-321", Type: "node-affinity", Strict: strict, Disabled: disabled,
+			Nodes: map[string]int{}}
+		for _, n := range nodes {
+			r.Nodes[n] = 0
+		}
+		return r
+	}
 	cases := []struct {
-		name      string
-		ha        *config.HAConfig
-		wantRules int
+		name    string
+		d       *ha.VMDecision
+		pin     *ha.Rule
+		pts     []PCIPassthrough
+		wantErr bool
 	}{
-		{"no ha block", nil, 0},
-		{"mode off", haModeOff(), 0},
-		{"mode auto", haModeAuto(), 1},
-		{"mode managed", &config.HAConfig{Mode: haChoiceOf("managed")}, 1},
+		{"no decision", nil, nil, pts, false},
+		{"skipped", skipped, nil, pts, false},
+		{"no device", registered, nil, nil, false},
+		{"strict pin to the node", registered, pin(true, false, "pve01"), pts, false},
+		{"no pin", registered, nil, pts, true},
+		{"non-strict pin", registered, pin(false, false, "pve01"), pts, true},
+		{"disabled pin", registered, pin(true, true, "pve01"), pts, true},
+		{"pin to another node", registered, pin(true, false, "pve02"), pts, true},
+		{"pin to a node set", registered, pin(true, false, "pve01", "pve02"), pts, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			stub := newNAStub()
-			deps := naDeps(stub)
-			deps.Config.HA = tc.ha
-			if err := applyPCINodeAffinityPin(context.Background(), deps, 321, "pve01", pts, log.NewNopLogger()); err != nil {
-				t.Fatalf("unexpected error: %v", err)
+			err := applyPCINodeAffinityPin(tc.d, tc.pin, "pve01", tc.pts)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
 			}
-			if len(stub.rules) != tc.wantRules {
-				t.Errorf("rules written = %d, want %d (%v)", len(stub.rules), tc.wantRules, stub.rules)
-			}
-			if tc.wantRules == 0 && (len(stub.resources) != 0 || stub.createCalls != 0) {
-				t.Errorf("mode off wrote HA state: resources=%v createCalls=%d", stub.resources, stub.createCalls)
-			}
-			if tc.wantRules == 1 && !stub.resources["vm:321"] {
-				t.Error("the pinned VM must be registered as an HA resource")
+			if err != nil && !strings.Contains(err.Error(), "not a strict pin to that node alone") {
+				t.Errorf("error must name the missing confinement, got %v", err)
 			}
 		})
 	}
 }
 
-// TestApplyAZNodeAffinityPin_AutoAlone_WritesNothing shows the AZ pin needs an
-// explicit "on".
-func TestApplyAZNodeAffinityPin_AutoAlone_WritesNothing(t *testing.T) {
+// TestApplyAZNodeAffinityPin_UnderMode shows the pin writer is silent under
+// mode off and pins a registered VM to its AZ under a writing mode: pin_az
+// defaults to auto and pin_az_strict to true, so the AZ is hard unless
+// pin_az_strict is false.
+func TestApplyAZNodeAffinityPin_UnderMode(t *testing.T) {
 	t.Parallel()
 	for name, tc := range map[string]struct {
-		ha        *config.HAConfig
-		wantRules int
+		ha         *config.HAConfig
+		wantRules  int
+		wantStrict bool
 	}{
-		"mode off":   {haModeOff(), 0},
-		"auto alone": {haModeAuto(), 0},
-		"pin on":     {haPinOn(nil), 1},
+		"mode off":   {haModeOff(), 0, false},
+		"auto alone": {haModeAuto(), 1, true},
+		"pin on":     {haPinOn(nil), 1, true},
+		"not strict": {haPinOn(new(false)), 1, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -167,12 +182,22 @@ func TestApplyAZNodeAffinityPin_AutoAlone_WritesNothing(t *testing.T) {
 			cfg.HA = tc.ha
 			deps := Deps{Config: cfg, PVE: &icPVEClient{clusterSvc: stub}, Agent: &icAgentStub{}, Logger: log.NewNopLogger(),
 				RequestDirectorUUID: aaDirector, HAProfile: pve9Profile}
-			if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
+			if err := azPinApply(context.Background(), deps, 100,
 				createVMCloudProps{AvailabilityZone: "z1"}, "pve01", log.NewNopLogger()); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if len(stub.rules) != tc.wantRules {
-				t.Errorf("rules written = %d, want %d", len(stub.rules), tc.wantRules)
+				t.Fatalf("rules written = %d, want %d", len(stub.rules), tc.wantRules)
+			}
+			if tc.wantRules == 0 {
+				return
+			}
+			rule := stub.rules["bosh-na-100"]
+			if got := rule.Strict != nil && *rule.Strict; got != tc.wantStrict {
+				t.Errorf("strict = %v, want %v", got, tc.wantStrict)
+			}
+			if rule.Nodes == nil || !strings.Contains(*rule.Nodes, "pve01") || !strings.Contains(*rule.Nodes, "pve02") {
+				t.Errorf("nodes = %v, want both AZ nodes", rule.Nodes)
 			}
 		})
 	}
@@ -190,7 +215,7 @@ func TestApplyAntiAffinityMembership_AutoAlone_WritesNothing(t *testing.T) {
 			cfg := aaMembershipConfig("", false, 0)
 			cfg.HA = ha
 			deps := aaDepsLock(cfg, stub, newAALockPools(nil))
-			if err := applyAntiAffinityMembership(context.Background(), deps, 100, isoHAGroupEnv("web"), log.NewNopLogger()); err != nil {
+			if err := aaApply(context.Background(), deps, 100, isoHAGroupEnv("web"), log.NewNopLogger()); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if len(stub.resources) != 0 || len(stub.rules) != 0 || stub.createRuleCalls != 0 {

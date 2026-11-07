@@ -190,19 +190,26 @@ type deadNodeDeleteFixture struct {
 	pinAtMove atomic.Value
 	// pinCommentAtMove is the pin's comment when the CRM moved the VM.
 	pinCommentAtMove atomic.Value
+	// record is the volume record pin writes into the pin's comment.
+	record string
 }
 
 // newDeadNodeDelete builds the fixture: VM 101 requests started, the CRM
 // holds it in recovery on the dead pve-node2, its HA resource carries this
-// Director's marker, the VM has no pin, so every member is admissible, and the
-// recovery episode began an hour ago, so the grace window has expired.
+// Director's marker, the VM's pin is the non-strict record pin over every
+// member that create_vm writes for a VM on Ceph alone, so every member is
+// admissible, and the recovery episode began an hour ago, so the grace window
+// has expired.
 func newDeadNodeDelete(t *testing.T) *deadNodeDeleteFixture {
 	t.Helper()
 	t.Cleanup(handlers.SetHADeleteMotionPollForTest(10 * time.Millisecond))
-	f := &deadNodeDeleteFixture{t: t, scene: handlers.NewHADeleteScene(), configs: map[string]map[string]any{}}
+	f := &deadNodeDeleteFixture{t: t, scene: handlers.NewHADeleteScene(), configs: map[string]map[string]any{},
+		record: "ceph"}
 	f.scene.Manage(101, deadNode, "started", "recovery")
 	f.scene.MarkNodeDead(deadNode)
 	f.scene.Comments["vm:101"] = deadNodeMarker
+	f.scene.Rules["bosh-na-101"] = map[string]any{"type": "node-affinity", "resources": "vm:101",
+		"nodes": "pve-node1,pve-node2,pve-node3", "comment": f.recordComment(deadNodeMarker)}
 	f.storage = &deadNodeStorage{entries: []map[string]any{
 		{"storage": "ceph", "type": "rbd", "shared": 1, "content": "images"},
 		{"storage": "backups", "type": "dir", "content": "backup"},
@@ -358,10 +365,16 @@ func (f *deadNodeDeleteFixture) run() error {
 
 func (f *deadNodeDeleteFixture) events() []string { return f.scene.EventsSnapshot() }
 
-// pin presets VM 101's strict pin, this Director's, naming nodes.
+// recordComment is comment with the fixture's volume record.
+func (f *deadNodeDeleteFixture) recordComment(comment string) string {
+	return ha.WithVolumeRecord(comment, strings.Split(f.record, ","))
+}
+
+// pin presets VM 101's strict pin, this Director's, naming nodes and carrying
+// the fixture's volume record.
 func (f *deadNodeDeleteFixture) pin(nodes string, extra map[string]any) {
 	rule := map[string]any{"type": "node-affinity", "resources": "vm:101", "nodes": nodes, "strict": 1,
-		"comment": deadNodeMarker}
+		"comment": f.recordComment(deadNodeMarker)}
 	for k, v := range extra {
 		rule[k] = v
 	}
@@ -418,7 +431,8 @@ func TestDeadNodeDelete_PinNamesOnlyTheNodeThatReachesTheStorage(t *testing.T) {
 		{"storage": "nfs-23", "type": "nfs", "shared": 1, "nodes": "pve-node2,pve-node3", "content": "images,iso"},
 		{"storage": "backups", "type": "dir", "content": "backup"},
 	}
-	pinComment := "bosh-cpi:v1 owner=" + deadNodeOwner + " deployment=cf group=router"
+	f.record = "nfs-23"
+	pinComment := f.recordComment("bosh-cpi:v1 owner=" + deadNodeOwner + " deployment=cf group=router")
 	f.pin("pve-node2:2,pve-node3", map[string]any{"comment": pinComment})
 	f.configs["pve-node3"] = map[string]any{"scsi0": "nfs-23:101/vm-101-disk-0.raw,size=10G"}
 
@@ -446,7 +460,8 @@ func TestDeadNodeDelete_PinNamesOnlyTheNodeThatReachesTheStorage(t *testing.T) {
 // TestDeadNodeDelete_CompletesOnAClusterWithNodeLocalStorage is the common
 // cluster: every node also carries the stock local and local-lvm storages, and
 // a disabled NFS storage is left in the index. The VM's disks are all on Ceph,
-// so it has no strict pin, and those storages must not block the delete.
+// so its pin is the non-strict record pin, and those storages must not block
+// the delete.
 func TestDeadNodeDelete_CompletesOnAClusterWithNodeLocalStorage(t *testing.T) {
 	f := newDeadNodeDelete(t)
 	f.storage.entries = []map[string]any{
@@ -462,8 +477,8 @@ func TestDeadNodeDelete_CompletesOnAClusterWithNodeLocalStorage(t *testing.T) {
 	if got, _ := f.pinAtMove.Load().(string); got != "pve-node1,pve-node3" {
 		t.Fatalf("the pin named %q at the move; want every live node", got)
 	}
-	if got, _ := f.pinCommentAtMove.Load().(string); got != deadNodeMarker+" dead-node-from="+deadNode {
-		t.Fatalf("a new pin starts from the marker: %q", got)
+	if got, _ := f.pinCommentAtMove.Load().(string); got != f.recordComment(deadNodeMarker)+" dead-node-from="+deadNode {
+		t.Fatalf("the pin keeps its comment and its volume record: %q", got)
 	}
 }
 
@@ -486,8 +501,8 @@ func TestDeadNodeDelete_StrictPinThatBlockedRecovery(t *testing.T) {
 }
 
 // TestDeadNodeDelete_FullAntiAffinityGroup removes the VM from a full
-// anti-affinity rule. The VM has no strict pin, so every node the rules allow
-// is admissible, and the release goes first, then the pin.
+// anti-affinity rule. The VM's pin is not strict, so every node the rules
+// allow is admissible, and the release goes first, then the pin.
 func TestDeadNodeDelete_FullAntiAffinityGroup(t *testing.T) {
 	f := newDeadNodeDelete(t)
 	f.scene.Rules["bosh-aa-0123456789ab"] = map[string]any{
@@ -500,7 +515,7 @@ func TestDeadNodeDelete_FullAntiAffinityGroup(t *testing.T) {
 	f.requireCompletedOn("pve-node1")
 	ev := f.events()
 	release := eventIndex(ev, "UpdateHaRules:bosh-aa-0123456789ab=vm:102,vm:103")
-	pin := eventIndex(ev, "CreateHaRules:bosh-na-101")
+	pin := eventIndex(ev, "UpdateHaRules:bosh-na-101=vm:101")
 	if release == -1 || pin == -1 || release > pin {
 		t.Fatalf("want the anti-affinity release and then the pin; events: %v", ev)
 	}
@@ -517,6 +532,7 @@ func TestDeadNodeDelete_PinGoesFirstWhenTheRulesAllowAnUnreachableNode(t *testin
 	f.storage.entries = []map[string]any{
 		{"storage": "nfs-23", "type": "nfs", "shared": 1, "nodes": "pve-node2,pve-node3", "content": "images"},
 	}
+	f.record = "nfs-23"
 	f.pin("pve-node2,pve-node3", map[string]any{"disable": 1})
 	f.configs["pve-node3"] = map[string]any{"scsi0": "nfs-23:101/vm-101-disk-0.raw,size=10G"}
 	f.scene.Rules["bosh-aa-0123456789ab"] = map[string]any{
@@ -566,6 +582,7 @@ func TestDeadNodeDelete_PinToTheDeadNodeAloneKeepsDeferring(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newDeadNodeDelete(t)
 			f.storage.entries = append(f.storage.entries, tc.storage)
+			f.record = tc.storage["storage"].(string)
 			f.pin(tc.nodes, nil)
 			requireHARetriable(t, f.run(), "no deletion destination", "admits dead node "+deadNode+" alone",
 				"Bring the node back", "bosh cck")
@@ -650,6 +667,25 @@ func TestDeadNodeDelete_RefusalsWriteNothing(t *testing.T) {
 		}, []string{"cannot be narrowed", "ownership marker"}},
 		{"strict pin that leaves out the dead node", func(f *deadNodeDeleteFixture) { f.pin("pve-node1", nil) },
 			[]string{"compute the deletion destinations", "does not name dead node " + deadNode}},
+		{"no pin, as on a VM registered before the CPI recorded its volumes", func(f *deadNodeDeleteFixture) {
+			delete(f.scene.Rules, "bosh-na-101")
+		}, []string{"compute the deletion destinations", "no record of where its volumes are"}},
+		{"pin without a volume record", func(f *deadNodeDeleteFixture) {
+			f.pin("pve-node1,pve-node2", map[string]any{"comment": deadNodeMarker})
+		}, []string{"compute the deletion destinations", "carries no bosh-vols record"}},
+		{"recorded storage not in the index", func(f *deadNodeDeleteFixture) {
+			f.record = "gone"
+			f.pin("pve-node1,pve-node2", nil)
+		}, []string{"compute the deletion destinations", "storage gone is not in the storage index"}},
+		{"storage index unreadable", func(f *deadNodeDeleteFixture) {
+			f.storage.err = errors.New("500 storage read failed (HTTP500)")
+		}, []string{"read the storage index"}},
+		{"recorded storage reaches the dead node alone", func(f *deadNodeDeleteFixture) {
+			f.storage.entries = append(f.storage.entries, map[string]any{"storage": "local-lvm", "type": "lvmthin",
+				"content": "images"})
+			f.record = "ceph,local-lvm"
+			f.scene.Rules["bosh-na-101"]["comment"] = f.recordComment(deadNodeMarker)
+		}, []string{"no deletion destination", "reach dead node " + deadNode + " alone"}},
 		{"pin of another resource too", func(f *deadNodeDeleteFixture) {
 			f.pin("pve-node1,pve-node2", map[string]any{"resources": "vm:101,vm:102"})
 		}, []string{"cannot be narrowed", "not vm:101 alone"}},
@@ -734,7 +770,7 @@ func TestDeadNodeDelete_RulesChangeBeforeTheRuleEdits(t *testing.T) {
 func TestDeadNodeDelete_NodeComesBackWhileTheCRMMoves(t *testing.T) {
 	f := newDeadNodeDelete(t)
 	f.scene.OnRead = func(s *handlers.HADeleteScene, _ int) {
-		if _, ok := s.Rules["bosh-na-101"]; !ok || f.gone.Load() {
+		if pin, ok := s.Rules["bosh-na-101"]; !ok || pin["strict"] != true || f.gone.Load() {
 			return
 		}
 		s.Offline[deadNode] = false

@@ -32,7 +32,7 @@ type DeadNodeReach struct {
 	// Source is the dead node the VM's config is on.
 	Source string
 	// Pinned says the VM's strict pin bounded Admissible. Without one, every
-	// member is admissible.
+	// member the recorded storages reach is admissible.
 	Pinned bool
 	// Admissible holds the members the VM's pin admits, Source included when
 	// the pin names it, sorted.
@@ -45,6 +45,8 @@ type DeadNodeReach struct {
 	// Unplaceable holds the members of Reach that are not placeable, sorted,
 	// such as a node with a stale LRM timestamp.
 	Unplaceable []string
+	// Recorded holds the storages the pin's volume record names, sorted.
+	Recorded []string
 }
 
 // PinnedToSource reports whether the VM's strict pin admits the dead node
@@ -57,27 +59,34 @@ func (r DeadNodeReach) PinnedToSource() bool {
 // DeletionDestinations returns the nodes a fenced VM's config may move to so
 // that its delete can complete there. The dead node's config cannot be read,
 // so the VM's volumes are known only from the record the CPI keeps of them
-// while the node is down: the VM's strict node-affinity pin, pinID, which
-// names the VM's hard admissible set. That set is the VM's volume access set
-// cut down by its hard constraints, so every node it names reaches every
-// volume the VM holds. A VM with a node-local volume is pinned to its own node
-// alone, and one whose access set covers every configured node needs no
-// strict pin, so a missing or non-strict pin admits every member. A disabled
-// pin, or one PVE reports in error, still records the set, because neither
-// moves a volume.
+// while the node is down: the VM's node-affinity pin, pinID, and the volume
+// record its comment carries (VolumeRecordKey). The CPI writes that pin for
+// every VM it registers, from the VM's eligibility decision, so a strict pin
+// names the VM's hard admissible set, which is the access set of its volumes
+// cut down by its other hard constraints, and a non-strict pin means every
+// configured node reaches them. The record names the storages of those
+// volumes, and the answer is also bounded by their reach in storages, with a
+// node-local storage counted as living on source. A VM with a node-local
+// volume therefore reaches source alone. A disabled pin, or one PVE reports
+// in error, still records the set, because neither moves a volume.
+//
+// The answer is an error, which the caller turns into a deferral, when the VM
+// has no pin or its pin carries no volume record, because such a VM was
+// registered before the CPI recorded its volumes and nothing says where they
+// are. It is also an error when source is not a member, when the pin is not
+// this Director's node-affinity pin of sid alone, when a strict pin names no
+// node, when a strict pin leaves out source without the dead-node token
+// naming source, because such a pin is not a record of the reach of the
+// volumes on source, and when a recorded storage is not in storages.
 //
 // The destinations are the admitted members other than source that placeable
 // accepts, which is a fresh LRM timestamp, online, quorate, and not in
 // maintenance. The failed source's own state never counts, because it is
-// never a destination. The answer is an error when source is not a member,
-// when the pin is not this Director's node-affinity pin of sid alone, when it
-// names no node, or when a strict pin leaves out source without the dead-node
-// token naming source, because such a pin is not a record of the reach of the
-// volumes on source. The delete on the destination checks every volume again
-// against the config it then reads.
+// never a destination. The delete on the destination checks every volume
+// again against the config it then reads.
 func DeletionDestinations(
 	source string, members []string, set *RuleSet, sid, pinID string, owned func(*Rule) bool,
-	placeable func(string) bool,
+	placeable func(string) bool, storages pve.StorageInfoGetter,
 ) (DeadNodeReach, error) {
 	out := DeadNodeReach{Source: source}
 	switch {
@@ -89,33 +98,54 @@ func DeletionDestinations(
 		return out, errors.New("deletion destinations: no node health answer was given")
 	case set == nil:
 		return out, errors.New("deletion destinations: the HA rules were not read")
+	case storages == nil:
+		return out, errors.New("deletion destinations: the storage index was not read")
 	case strings.TrimSpace(sid) == "" || strings.TrimSpace(pinID) == "":
 		return out, errors.New("deletion destinations: the HA resource or its pin is not named")
 	}
-	admissible := slices.Clone(members)
-	if pin := set.Find(pinID); pin != nil {
-		switch {
-		case pin.Type != RuleTypeNodeAffinity || pin.Affinity == AffinityNegative:
-			return out, fmt.Errorf("deletion destinations: rule %q is not a node-affinity pin", pinID)
-		case owned == nil || !owned(pin):
-			return out, fmt.Errorf("deletion destinations: pin %q does not carry this Director's ownership marker",
-				pinID)
-		case !slices.Equal(pin.Resources, []string{sid}):
-			return out, fmt.Errorf("deletion destinations: pin %q holds %s, not %s alone", pinID,
-				pin.ResourcesParam(), sid)
-		case pin.Strict && len(pin.Nodes) == 0:
-			return out, fmt.Errorf("deletion destinations: strict pin %q names no node", pinID)
-		}
-		if pin.Strict {
-			if _, named := pin.Nodes[source]; !named {
-				if from, ok := DeadNodeSource(pin.Comment); !ok || from != source {
-					return out, fmt.Errorf("deletion destinations: strict pin %q does not name dead node %s, "+
-						"which holds the VM, so it is no record of the reach of the VM's volumes", pinID, source)
-				}
+	pin := set.Find(pinID)
+	switch {
+	case pin == nil:
+		return out, fmt.Errorf("deletion destinations: %s has no pin %q, so the CPI holds no record of where its "+
+			"volumes are", sid, pinID)
+	case pin.Type != RuleTypeNodeAffinity || pin.Affinity == AffinityNegative:
+		return out, fmt.Errorf("deletion destinations: rule %q is not a node-affinity pin", pinID)
+	case owned == nil || !owned(pin):
+		return out, fmt.Errorf("deletion destinations: pin %q does not carry this Director's ownership marker",
+			pinID)
+	case !slices.Equal(pin.Resources, []string{sid}):
+		return out, fmt.Errorf("deletion destinations: pin %q holds %s, not %s alone", pinID,
+			pin.ResourcesParam(), sid)
+	case pin.Strict && len(pin.Nodes) == 0:
+		return out, fmt.Errorf("deletion destinations: strict pin %q names no node", pinID)
+	}
+	recorded, ok := VolumeRecord(pin.Comment)
+	if !ok {
+		return out, fmt.Errorf("deletion destinations: pin %q carries no %s record of the VM's volumes, so its "+
+			"nodes say nothing about where they are", pinID, VolumeRecordKey)
+	}
+	out.Recorded = recorded
+	vols := make([]pve.AccessVolume, 0, len(recorded))
+	for _, storage := range recorded {
+		vols = append(vols, pve.AccessVolume{Volume: storage + ":" + sid, HomeNode: source})
+	}
+	// VolumeAccessSet reads the in-memory index the caller passes, so the
+	// background context never waits.
+	reachable, err := pve.VolumeAccessSet(context.Background(), storages, members, vols)
+	if err != nil {
+		return out, fmt.Errorf("deletion destinations: the reach of the recorded storages %s: %w",
+			strings.Join(recorded, ","), err)
+	}
+	admissible := slices.Clone(reachable)
+	if pin.Strict {
+		if _, named := pin.Nodes[source]; !named {
+			if from, ok := DeadNodeSource(pin.Comment); !ok || from != source {
+				return out, fmt.Errorf("deletion destinations: strict pin %q does not name dead node %s, "+
+					"which holds the VM, so it is no record of the reach of the VM's volumes", pinID, source)
 			}
-			out.Pinned = true
-			admissible = slices.DeleteFunc(admissible, func(n string) bool { _, ok := pin.Nodes[n]; return !ok })
 		}
+		out.Pinned = true
+		admissible = slices.DeleteFunc(admissible, func(n string) bool { _, ok := pin.Nodes[n]; return !ok })
 	}
 	for _, m := range admissible {
 		if strings.TrimSpace(m) == "" || slices.Contains(out.Admissible, m) {

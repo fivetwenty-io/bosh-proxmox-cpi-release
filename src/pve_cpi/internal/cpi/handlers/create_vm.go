@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	mrand "math/rand/v2"
+	"slices"
 	"strings"
 	"time"
 
@@ -354,6 +355,10 @@ func (v *jsonScalarString) UnmarshalJSON(data []byte) error {
 
 // createVMParsedArgs holds the validated, unmarshalled create_vm arguments.
 type createVMParsedArgs struct {
+	// legacyDiskVolids holds the volume IDs of the persistent disks the call
+	// attached whose CIDs carry no stable ID. The HA decision marks them
+	// legacy, because BOSH finds such a disk only by its volume ID.
+	legacyDiskVolids map[string]bool
 	// nodeBridgeCheck is the call-scoped bridge checker the placement filter and
 	// the pre-clone guard share (see sharedBridgeChecker). Nil until first use.
 	nodeBridgeCheck *nodeBridgeChecker
@@ -848,182 +853,40 @@ func finishCreatedVM(ctx context.Context, deps Deps, logger *log.Logger, parsed 
 	}
 
 	// -----------------------------------------------------------------------
-	// 8. Start VM + read back VM config to extract assigned MAC addresses
+	// 7b. PVE HA decision and staging. Every volume is in the config now, so
+	// the decision sees them all. A VM the decision registers gets its HA
+	// resource as ignored, and it is not started here: PVE HA starts it once
+	// its confinement exists (see completeCreatedVM).
 	// -----------------------------------------------------------------------
-	responseNetworks, err := startCreatedVMAndReadConfig(ctx, deps, logger, parsed, shape, vmid, nicPlan)
+	h, err := decideCreatedVMHA(ctx, deps, logger, parsed, shape, vmid)
 	if err != nil {
 		return nil, err
 	}
 
 	// -----------------------------------------------------------------------
-	// 8b. Firewall: resolve and apply security groups and VM-level firewall flag.
-	//
-	// Precedence for security_groups: per-call > vm_type/disk_type profile >
-	// config global default. Precedence for firewall flag: per-call cloud_properties
-	// > profile > config.VMFirewall.
-	//
-	// Behavior:
-	//   - effective groups non-empty  => applySecurityGroups (attaches rules +
-	//     enables firewall); the flag is NOT checked here to prevent double-enable.
-	//   - no groups but firewall flag true => enableVMFirewall (standalone enable).
-	//   - no groups and flag false/unset => no firewall API calls (byte-identical
-	//     to prior behavior when VMFirewall is nil and no groups are set).
-	//
-	// Any error triggers the create_vm rollback (the VM is destroyed) so a
-	// half-firewalled VM is never left behind.
+	// 8. Start VM + read back VM config to extract assigned MAC addresses
 	// -----------------------------------------------------------------------
-	effectiveGroups, groupErr := resolveEffectiveSecurityGroups(
-		parsed.cloudPropsMap, deps.Config, parsed.cloudProps.SecurityGroups)
-	if groupErr != nil {
-		return nil, groupErr
+	var responseNetworks map[string]createVMNetworkSpec
+	if h.staged() {
+		responseNetworks, err = readCreatedVMNetworks(ctx, deps, logger, parsed, shape, vmid, nicPlan)
+	} else {
+		responseNetworks, err = startCreatedVMAndReadConfig(ctx, deps, logger, parsed, shape, vmid, nicPlan)
 	}
-	firewallEnabled, fwFlagErr := resolveEffectiveFirewall(parsed.cloudPropsMap, deps.Config)
-	if fwFlagErr != nil {
-		return nil, fwFlagErr
-	}
-	// One-time datacenter firewall master-switch probe (§1.4): whenever this VM
-	// requests any firewall-affecting feature, verify — once per process — that
-	// the cluster-wide master switch is actually enabled, since every API call
-	// below succeeds regardless of it and a disabled master switch means none of
-	// the rules programmed here filter any traffic. Best-effort and fail-open;
-	// never blocks or fails create_vm. See probeFirewallMasterSwitch.
-	if firewallFeatureInPlay(effectiveGroups, firewallEnabled, parsed.networks) {
-		probeFirewallMasterSwitch(ctx, deps, logger)
-	}
-	if len(effectiveGroups) > 0 {
-		if fwErr := applySecurityGroups(ctx, deps, shape.node, vmid, effectiveGroups, logger); fwErr != nil {
-			return nil, fwErr
-		}
-	} else if firewallEnabled {
-		if fwErr := enableVMFirewall(ctx, deps, shape.node, vmid, logger); fwErr != nil {
-			return nil, fwErr
-		}
+	if err != nil {
+		return nil, err
 	}
 
 	// -----------------------------------------------------------------------
-	// 8c. VIP allowed-address-pairs: seed per-NIC ipfilter ipsets and enable the
-	// VM-level ipfilter option when any NIC declares allowed_address_pairs.
-	//
-	// Best-effort and non-fatal: PVE API failures are logged as warnings and
-	// leave ipfilter OFF rather than risk locking out the VM. The safety guard in
-	// applyVIPAllowedAddressPairs ensures ipfilter is never enabled unless every
-	// firewalled NIC ipset is fully seeded. Unset manifest = byte-identical (no
-	// PVE calls). Entry format errors were rejected at step 1b before VM mutation.
-	//
-	// NICs with ip_forwarding=true are excluded from ipset seeding: a router VM
-	// forwards traffic not in its own ipset, so ipfilter on those NICs would
-	// silently drop forwarded packets. applyVIPAllowedAddressPairs receives the
-	// full network map; per-NIC exclusion is enforced inside that function.
+	// 8b-11. Firewall, VIP ipfilter, IP forwarding, advertised routes, the HA
+	// confinement and activation, the config-drive ISO check, and the health
+	// gate. See completeCreatedVM.
 	// -----------------------------------------------------------------------
-	if vipErr := applyVIPAllowedAddressPairs(ctx, deps, shape.node, vmid, parsed.networks, logger); vipErr != nil {
-		logger.Warn("create_vm: VIP ipfilter not fully applied (non-fatal)",
-			log.Int(metadataKeyVMID, vmid), log.Err(vipErr))
+	start := func(ctx context.Context) error {
+		_, err := startCreatedVMAndReadConfig(ctx, deps, logger, parsed, shape, vmid, nicPlan)
+		return err
 	}
-
-	// -----------------------------------------------------------------------
-	// 8d. ip_forwarding per-NIC: for any NIC with cloud_properties.ip_forwarding=true,
-	// set firewall=0 on that NIC via UpdateQemuConfig. Router/NAT VMs need this so
-	// forwarded packets (not addressed to the NIC's own IP) are not dropped by the
-	// PVE per-NIC firewall. Nil/unset → no API calls (byte-identical).
-	// Errors propagate and trigger rollback so a half-configured router NIC is
-	// never left behind.
-	// -----------------------------------------------------------------------
-	if fwdErr := applyIPForwarding(ctx, deps, shape.node, vmid, parsed.networks, logger); fwdErr != nil {
-		return nil, fwdErr
-	}
-
-	// -----------------------------------------------------------------------
-	// 8e. Advertised routes: for each entry in cloud_properties.advertised_routes,
-	// create an SDN vnet subnet then call applySDN to commit the OVN logical-router
-	// route. Empty list → no API calls (byte-identical). Errors propagate and
-	// trigger rollback; subnets injected before a failure are removed best-effort.
-	// -----------------------------------------------------------------------
-	if routeErr := applyCreatedVMRoutes(ctx, deps, parsed, shape, vmid, logger); routeErr != nil {
-		return nil, routeErr
-	}
-
-	// -----------------------------------------------------------------------
-	// 9. PVE HA anti-affinity membership (opt-in: pve.ha.anti_affinity "on").
-	//
-	// Errors propagate: a TypeRetriableCloud error (e.g. lock-timeout) is
-	// returned so the director re-drives. A non-retriable failure (e.g. HA
-	// not configured) is also returned — callers must treat it accordingly.
-	// Scheduler-soft spreading via the node scorer remains in effect
-	// regardless.
-	// -----------------------------------------------------------------------
-	if aaErr := applyAntiAffinityMembership(ctx, deps, vmid, parsed.env, logger); aaErr != nil {
-		return nil, aaErr
-	}
-
-	// -----------------------------------------------------------------------
-	// 9b. AZ node-affinity HA pin (opt-in: pve.ha.pin_az "on").
-	//
-	// After scoring placed the VM on a node within its AZ, write a PVE HA
-	// node-affinity rule binding it to the AZ node set, so the AZ placement is
-	// durable across HA failover and DLB rebalance (scoring alone only pins at
-	// birth). TypeRetriableCloud (lock-timeout, verify failure) is returned so
-	// the director re-drives rather than silently losing the pin guarantee.
-	// Non-retriable failures also propagate.
-	// -----------------------------------------------------------------------
-	if naErr := applyAZNodeAffinityPin(ctx, deps, vmid, parsed.cloudProps, shape.node, logger); naErr != nil {
-		return nil, naErr
-	}
-
-	// -----------------------------------------------------------------------
-	// 9c. PCI strict node-affinity pin (automatic when pci_passthroughs set).
-	//
-	// PCI passthrough is incompatible with live migration. When the VM has any
-	// passthrough devices, a strict single-node HA pin is applied so the HA
-	// manager cannot relocate the VM to a node that may lack the device.
-	// Empty pci_passthroughs → no-op (byte-identical). TypeRetriableCloud
-	// errors propagate; generic HA-API failures are logged as non-fatal.
-	// -----------------------------------------------------------------------
-	if pciPinErr := applyPCINodeAffinityPin(ctx, deps, vmid, shape.node, parsed.cloudProps.PCIPassthroughs, logger); pciPinErr != nil {
-		return nil, pciPinErr
-	}
-
-	// -----------------------------------------------------------------------
-	// 10. PVE Dynamic Load Balancer membership (opt-in: pve.ha.dlb or the sentinel AZ).
-	//
-	// Best-effort and non-fatal. When the VM is DLB-eligible (master flag or
-	// sentinel AZ) it is registered as a PVE HA resource with auto-rebalance so
-	// the 9.2 CRS dynamic load balancer places and rebalances it. All guards
-	// (PVE>=9.2, multi-node, shared storage) live in ensureDLBMembership; any
-	// failure is logged and never fails create_vm.
-	// -----------------------------------------------------------------------
-	if deps.Config.DLBEligibleForAZ(parsed.cloudProps.AvailabilityZone) {
-		if dlbErr := ensureDLBMembership(ctx, deps, vmid, parsed.cloudProps.AvailabilityZone, logger); dlbErr != nil {
-			logger.Warn("create_vm: DLB membership not fully applied (non-fatal)",
-				log.Int(metadataKeyVMID, vmid), log.Err(dlbErr))
-		}
-	}
-
-	// -----------------------------------------------------------------------
-	// 10b. Config-drive ISO migration-safety check. Runs whenever this VM was
-	// (or was eligible to be) HA-registered by any path above — DLB, AZ
-	// node-affinity pin, or anti-affinity HA rules: a non-shared iso_storage
-	// pool means the scsi30 CD-ROM cannot follow the VM across live migration
-	// or HA recovery, silently defeating all three features. Warns by default;
-	// escalates to a CloudError (failing create_vm, triggering rollback) when
-	// require_shared_iso_for_ha is true.
-	// -----------------------------------------------------------------------
-	if isoErr := checkISOStorageForHA(ctx, deps, vmid, parsed.cloudProps, shape.node, parsed.env, logger); isoErr != nil {
-		return nil, isoErr
-	}
-
-	// -----------------------------------------------------------------------
-	// 11. Post-create health gate (opt-in: health_check.enabled).
-	//
-	// When enabled, poll the QEMU guest agent until it answers or the deadline
-	// expires. On failure, diagnostics from ListQemuStatusCurrent are folded
-	// into the error before the standard rollback defer fires and destroys the
-	// VM. Default off — behavior is byte-identical to prior releases when the
-	// block is absent or Enabled is false.
-	// -----------------------------------------------------------------------
-	if deps.Config.HealthCheckEnabled() {
-		if hcErr := runHealthGate(ctx, deps, shape.node, vmid, logger); hcErr != nil {
-			return nil, hcErr
-		}
+	if err := completeCreatedVM(ctx, deps, logger, parsed, shape, vmid, h, start); err != nil {
+		return nil, err
 	}
 
 	vmCID := directorVMCID(deps.Config, vmid, shape.initialTags)
@@ -1089,8 +952,9 @@ func createVMWithFallback(
 			continue
 		}
 
-		vmid, responseNetworks, allocErr, startErr, otherErr := buildAndStartVMAttempt(
-			ctx, deps, logger, parsed, shape, candidateNode)
+		attempt := buildAndStartVMAttempt(ctx, deps, logger, parsed, shape, candidateNode)
+		vmid, responseNetworks, h, nicPlan := attempt.vmid, attempt.responseNetworks, attempt.ha, attempt.nicPlan
+		allocErr, startErr, otherErr := attempt.allocErr, attempt.startErr, attempt.otherErr
 
 		// Determine whether to fall back or commit.
 		var attemptErr error
@@ -1156,102 +1020,14 @@ func createVMWithFallback(
 		winShape := *shape
 		winShape.node = winningNode
 
-		// -----------------------------------------------------------------------
-		// 8b. Firewall
-		// -----------------------------------------------------------------------
-		effectiveGroups, groupErr := resolveEffectiveSecurityGroups(
-			parsed.cloudPropsMap, deps.Config, parsed.cloudProps.SecurityGroups)
-		if groupErr != nil {
-			return nil, groupErr
+		// Steps 8b-11 as in finishCreatedVM. A staged VM is started here, by PVE
+		// HA, and winShape.node follows it to the node it lands on.
+		start := func(ctx context.Context) error {
+			_, err := startVMAndReadConfig(ctx, deps, logger, parsed, &winShape, winningVMID, nicPlan)
+			return err
 		}
-		firewallEnabled, fwFlagErr := resolveEffectiveFirewall(parsed.cloudPropsMap, deps.Config)
-		if fwFlagErr != nil {
-			return nil, fwFlagErr
-		}
-		// One-time datacenter firewall master-switch probe (§1.4) — see the
-		// step-8b comment in createVM for the full rationale.
-		if firewallFeatureInPlay(effectiveGroups, firewallEnabled, parsed.networks) {
-			probeFirewallMasterSwitch(ctx, deps, logger)
-		}
-		if len(effectiveGroups) > 0 {
-			if fwErr := applySecurityGroups(ctx, deps, winShape.node, winningVMID, effectiveGroups, logger); fwErr != nil {
-				return nil, fwErr
-			}
-		} else if firewallEnabled {
-			if fwErr := enableVMFirewall(ctx, deps, winShape.node, winningVMID, logger); fwErr != nil {
-				return nil, fwErr
-			}
-		}
-
-		// -----------------------------------------------------------------------
-		// 8c. VIP ipfilter
-		// -----------------------------------------------------------------------
-		if vipErr := applyVIPAllowedAddressPairs(ctx, deps, winShape.node, winningVMID, parsed.networks, logger); vipErr != nil {
-			logger.Warn("create_vm: VIP ipfilter not fully applied (non-fatal)",
-				log.Int(metadataKeyVMID, winningVMID), log.Err(vipErr))
-		}
-
-		// -----------------------------------------------------------------------
-		// 8d. ip_forwarding per-NIC: disable per-NIC firewall for router/NAT NICs.
-		// -----------------------------------------------------------------------
-		if fwdErr := applyIPForwarding(ctx, deps, winShape.node, winningVMID, parsed.networks, logger); fwdErr != nil {
-			return nil, fwdErr
-		}
-
-		// -----------------------------------------------------------------------
-		// 8e. Advertised routes: inject OVN SDN subnets for router VMs.
-		// -----------------------------------------------------------------------
-		if routeErr := applyAdvertisedRoutes(ctx, deps, winShape.node, winningVMID, parsed.cloudProps.AdvertisedRoutes, logger); routeErr != nil {
-			return nil, routeErr
-		}
-
-		// -----------------------------------------------------------------------
-		// 9. HA anti-affinity — errors propagate (retriable ones re-drive).
-		// -----------------------------------------------------------------------
-		if aaErr := applyAntiAffinityMembership(ctx, deps, winningVMID, parsed.env, logger); aaErr != nil {
-			return nil, aaErr
-		}
-
-		// -----------------------------------------------------------------------
-		// 9b. AZ node-affinity HA pin — errors propagate (retriable ones re-drive).
-		// -----------------------------------------------------------------------
-		if naErr := applyAZNodeAffinityPin(ctx, deps, winningVMID, parsed.cloudProps, winShape.node, logger); naErr != nil {
-			return nil, naErr
-		}
-
-		// -----------------------------------------------------------------------
-		// 9c. PCI strict node-affinity pin — errors propagate (retriable ones
-		// re-drive). No-op when pci_passthroughs is empty.
-		// -----------------------------------------------------------------------
-		if pciPinErr := applyPCINodeAffinityPin(ctx, deps, winningVMID, winShape.node, parsed.cloudProps.PCIPassthroughs, logger); pciPinErr != nil {
-			return nil, pciPinErr
-		}
-
-		// -----------------------------------------------------------------------
-		// 10. DLB membership
-		// -----------------------------------------------------------------------
-		if deps.Config.DLBEligibleForAZ(parsed.cloudProps.AvailabilityZone) {
-			if dlbErr := ensureDLBMembership(ctx, deps, winningVMID, parsed.cloudProps.AvailabilityZone, logger); dlbErr != nil {
-				logger.Warn("create_vm: DLB membership not fully applied (non-fatal)",
-					log.Int(metadataKeyVMID, winningVMID), log.Err(dlbErr))
-			}
-		}
-
-		// -----------------------------------------------------------------------
-		// 10b. Config-drive ISO migration-safety check — see the step-10b comment
-		// in createVM for the full rationale.
-		// -----------------------------------------------------------------------
-		if isoErr := checkISOStorageForHA(ctx, deps, winningVMID, parsed.cloudProps, winShape.node, parsed.env, logger); isoErr != nil {
-			return nil, isoErr
-		}
-
-		// -----------------------------------------------------------------------
-		// 11. Health gate
-		// -----------------------------------------------------------------------
-		if deps.Config.HealthCheckEnabled() {
-			if hcErr := runHealthGate(ctx, deps, winShape.node, winningVMID, logger); hcErr != nil {
-				return nil, hcErr
-			}
+		if err := completeCreatedVM(ctx, deps, logger, parsed, &winShape, winningVMID, h, start); err != nil {
+			return nil, err
 		}
 
 		// The create succeeded, so its birth tag goes as its last mutation; see
@@ -1486,20 +1262,33 @@ func isTransientStartError(err error) bool {
 		strings.Contains(msg, "deadline exceeded")
 }
 
+// vmAttempt is the outcome of one buildAndStartVMAttempt.
+//
+// Three error fields distinguish error categories for the fallback loop:
+//   - allocErr: allocateVM failed (eligible for fallback on transient).
+//   - startErr: startVMAndReadConfig failed (eligible for fallback on transient).
+//   - otherErr: any intermediate step (resize, NICs, disks, agent, the HA
+//     decision and staging) failed (permanent, no fallback).
+type vmAttempt struct {
+	vmid             int
+	responseNetworks map[string]createVMNetworkSpec
+	nicPlan          []nicPlanEntry
+	ha               *createdVMHA
+	allocErr         error
+	startErr         error
+	otherErr         error
+}
+
 // buildAndStartVMAttempt runs steps 4–8 (allocate, resize, NICs, disks,
-// ephemeral, agent, start) on the given candidate node. On success it returns
-// the allocated VMID and populated response-networks map.
+// ephemeral, agent, HA decision and staging, start) on the given candidate
+// node. On success it returns the allocated VMID and populated
+// response-networks map. A VM the HA decision registers is staged and not
+// started, because PVE HA starts it once its confinement exists.
 // On any error it is the CALLER's responsibility to call cleanupVM when the
 // VMID is non-zero (the VM was created but a later step failed).
 //
 // shape.node is overridden with candidateNode for this attempt; the shape
 // struct is not mutated — a local copy is used.
-//
-// Three error outputs distinguish error categories for the fallback loop:
-//   - allocErr: returned when allocateVM fails (eligible for fallback on transient).
-//   - startErr: returned when startVMAndReadConfig fails (eligible for fallback on transient).
-//   - otherErr: returned when any intermediate step (resize, NICs, etc.) fails
-//     (permanent, no fallback).
 func buildAndStartVMAttempt(
 	ctx context.Context,
 	deps Deps,
@@ -1507,15 +1296,16 @@ func buildAndStartVMAttempt(
 	parsed *createVMParsedArgs,
 	shape *createVMShape,
 	candidateNode string,
-) (vmid int, responseNetworks map[string]createVMNetworkSpec, allocErr error, startErr error, otherErr error) {
+) vmAttempt {
 	// Use a node-overridden copy so we never mutate the caller's shape.
 	nodeShape := *shape
 	nodeShape.node = candidateNode
 
 	vmid, err := allocateVMForFallback(ctx, deps, logger, parsed, &nodeShape)
 	if err != nil {
-		return 0, nil, cpierrors.Wrap(err, "create_vm: allocate+create VM"), nil, nil
+		return vmAttempt{allocErr: cpierrors.Wrap(err, "create_vm: allocate+create VM")}
 	}
+	out := vmAttempt{vmid: vmid}
 
 	// Record the create-time provenance now that the VM exists (the clone
 	// path's post-clone description clear already ran inside the allocate
@@ -1525,37 +1315,53 @@ func buildAndStartVMAttempt(
 	vmName := candidateVMName(nodeShape.initialName, parsed.agentID, vmid)
 
 	if err := resizeRootDisk(ctx, deps, logger, &nodeShape, vmid); err != nil {
-		return vmid, nil, nil, nil, err
+		out.otherErr = err
+		return out
 	}
 
-	nicPlan, err := configureNICs(ctx, deps, logger, parsed, &nodeShape, vmid)
-	if err != nil {
-		return vmid, nil, nil, nil, err
+	if out.nicPlan, err = configureNICs(ctx, deps, logger, parsed, &nodeShape, vmid); err != nil {
+		out.otherErr = err
+		return out
 	}
 
 	if err := runIPConflictChecks(ctx, deps, logger, parsed, vmid); err != nil {
-		return vmid, nil, nil, nil, err
+		out.otherErr = err
+		return out
 	}
 
 	if err := attachPersistentDisks(ctx, deps, logger, parsed, &nodeShape, vmid); err != nil {
-		return vmid, nil, nil, nil, err
+		out.otherErr = err
+		return out
 	}
 
 	ephemeralDevPath, err := attachEphemeralDisk(ctx, deps, logger, &nodeShape, vmid)
 	if err != nil {
-		return vmid, nil, nil, nil, err
+		out.otherErr = err
+		return out
 	}
 
 	if err := configureAgent(ctx, deps, logger, parsed, &nodeShape, vmid, vmName, ephemeralDevPath); err != nil {
-		return vmid, nil, nil, nil, err
+		out.otherErr = err
+		return out
 	}
 
-	responseNetworks, err = startVMAndReadConfig(ctx, deps, logger, parsed, &nodeShape, vmid, nicPlan)
-	if err != nil {
-		return vmid, nil, nil, err, nil
+	if out.ha, err = decideCreatedVMHA(ctx, deps, logger, parsed, &nodeShape, vmid); err != nil {
+		out.otherErr = err
+		return out
 	}
 
-	return vmid, responseNetworks, nil, nil, nil
+	if out.ha.staged() {
+		out.responseNetworks, err = readCreatedVMNetworks(ctx, deps, logger, parsed, &nodeShape, vmid, out.nicPlan)
+		if err != nil {
+			out.otherErr = err
+		}
+		return out
+	}
+	if out.responseNetworks, err = startVMAndReadConfig(ctx, deps, logger, parsed, &nodeShape, vmid,
+		out.nicPlan); err != nil {
+		out.startErr = err
+	}
+	return out
 }
 
 // allocateVM runs AllocateWithRetry: picks a free VMID, calls QEMU.Create,
@@ -2314,6 +2120,56 @@ func startVMAndReadConfig(
 	vmid int,
 	nicPlan []nicPlanEntry,
 ) (map[string]createVMNetworkSpec, error) {
+	if err := startCreatedVM(ctx, deps, logger, shape, vmid); err != nil {
+		return nil, err
+	}
+	return readCreatedVMNetworks(ctx, deps, logger, parsed, shape, vmid, nicPlan)
+}
+
+// readCreatedVMNetworks reads back the VM config to extract the MAC addresses
+// PVE assigned, and returns the populated response networks map. On the plain
+// path a failed read is not fatal: the networks are returned without MACs
+// rather than rolling the VM back. On the managed storage path the read must
+// succeed and the config must carry the VM's ownership marker, as the managed
+// start requires.
+func readCreatedVMNetworks(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	parsed *createVMParsedArgs,
+	shape *createVMShape,
+	vmid int,
+	nicPlan []nicPlanEntry,
+) (map[string]createVMNetworkSpec, error) {
+	vmCfg, err := deps.PVE.QEMU().Config(ctx, shape.node, vmid)
+	if parsed.storageRuntime != nil {
+		if err != nil {
+			return nil, err
+		}
+		if err := parsed.storageRuntime.verifyMarker(vmCfg); err != nil {
+			return nil, err
+		}
+		return buildResponseNetworks(parsed.networks, nicPlan, vmCfg), nil
+	}
+	if err != nil {
+		// Non-fatal: return networks without MAC rather than rolling back
+		logger.Warn("create_vm: could not read VM config for MAC extraction",
+			log.Int(metadataKeyVMID, vmid),
+			log.Err(err),
+		)
+		vmCfg = map[string]any{}
+	}
+	return buildResponseNetworks(parsed.networks, nicPlan, vmCfg), nil
+}
+
+// startCreatedVM starts the VM and awaits the start task.
+func startCreatedVM(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	shape *createVMShape,
+	vmid int,
+) error {
 	// -----------------------------------------------------------------------
 	// 8. Start VM
 	// -----------------------------------------------------------------------
@@ -2345,7 +2201,7 @@ func startVMAndReadConfig(
 		if startUPID != "" {
 			if err := pve.AwaitTaskWithLogger(ctx, deps.PVE, shape.node, startUPID, logger); err != nil {
 				if !vmAlreadyRunning(err) && !vmRunningNow(ctx, deps, logger, shape.node, vmid) {
-					return nil, cpierrors.Wrap(pve.WrapErrorKeepingClass(err),
+					return cpierrors.Wrap(pve.WrapErrorKeepingClass(err),
 						fmt.Sprintf("create_vm: await start task vmid=%d", vmid))
 				}
 				logger.Info("create_vm: start task raced a prior committed start; VM already running",
@@ -2359,26 +2215,12 @@ func startVMAndReadConfig(
 		// WrapErrorKeepingClass: the exhausted retry error is the raw last
 		// SDK error, and flattening it to a permanent Cloud made a transient
 		// start failure non-retriable for the Director.
-		return nil, cpierrors.Wrap(pve.WrapErrorKeepingClass(startErr),
+		return cpierrors.Wrap(pve.WrapErrorKeepingClass(startErr),
 			fmt.Sprintf("create_vm: start vmid=%d", vmid))
 	}
 
 	logger.Info("create_vm: VM started", log.Int(metadataKeyVMID, vmid))
-
-	// -----------------------------------------------------------------------
-	// 9. Read back VM config to extract assigned MAC addresses
-	// -----------------------------------------------------------------------
-	vmCfg, err := deps.PVE.QEMU().Config(ctx, shape.node, vmid)
-	if err != nil {
-		// Non-fatal: return networks without MAC rather than rolling back
-		logger.Warn("create_vm: could not read VM config for MAC extraction",
-			log.Int(metadataKeyVMID, vmid),
-			log.Err(err),
-		)
-		vmCfg = map[string]any{}
-	}
-
-	return buildResponseNetworks(parsed.networks, nicPlan, vmCfg), nil
+	return nil
 }
 
 // keepEarlierAttemptError chooses the error the fallback loop surfaces when a
@@ -2420,17 +2262,26 @@ const birthTagDigestAttempts = 3
 const birthTagDigestRetryPause = 150 * time.Millisecond
 
 // removeBirthTag removes every birth tag from the VM's tags through
-// pve.MutateVMConfig, so the write survives a migration that starts mid-call.
-// The write carries the config digest it read, so it never overwrites a tag
-// change that landed in between, and a config without a birth tag is left
-// alone. A digest refusal proves the write changed nothing, so it pauses for
-// birthTagDigestRetryPause, reads the config again, and resends, up to
-// birthTagDigestAttempts times. Any other
-// failure, and a refusal on the last attempt, is returned, wrapped as a CPI
-// error. The create then fails and rolls back, because a VM that kept its
-// birth tag would be queued for teardown once the create released its claim.
+// mutateVMTags. A failure is returned, and the create then fails and rolls
+// back, because a VM that kept its birth tag would be queued for teardown once
+// the create released its claim.
 func removeBirthTag(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) error {
-	const label = "create_vm: remove the birth tag"
+	return mutateVMTags(ctx, deps, node, vmid, "create_vm: remove the birth tag", logger, withoutBirthTags)
+}
+
+// mutateVMTags rewrites the VM's tags with edit through pve.MutateVMConfig, so
+// the write survives a migration that starts mid-call. edit must return its
+// input unchanged once its change is present, which is how the write learns it
+// has nothing to do. The write carries the config digest it read, so it never
+// overwrites a tag change that landed in between. A digest refusal proves the
+// write changed nothing, so it pauses for birthTagDigestRetryPause, reads the
+// config again, and resends, up to birthTagDigestAttempts times. Any other
+// failure, and a refusal on the last attempt, is returned, wrapped as a CPI
+// error.
+func mutateVMTags(
+	ctx context.Context, deps Deps, node string, vmid int, label string, logger *log.Logger,
+	edit func([]string) []string,
+) error {
 	_, err := pve.MutateVMConfig(ctx, deps.PVE, logger, pve.VMConfigMutation{
 		VMID:       vmid,
 		Node:       node,
@@ -2439,13 +2290,13 @@ func removeBirthTag(ctx context.Context, deps Deps, node string, vmid int, logge
 		Apply: func(ctx context.Context, node string) error {
 			var err error
 			for attempt := 1; attempt <= birthTagDigestAttempts; attempt++ {
-				if err = removeBirthTagOnce(ctx, deps, node, vmid); err == nil || !pve.IsConfigDigestRefusal(err) {
+				if err = mutateVMTagsOnce(ctx, deps, node, vmid, edit); err == nil || !pve.IsConfigDigestRefusal(err) {
 					return err
 				}
 				if attempt == birthTagDigestAttempts {
 					break
 				}
-				logger.Info("create_vm: another writer changed the config before the birth tag write; reading it again",
+				logger.Info(label+": another writer changed the config before the tag write; reading it again",
 					log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Int("attempt", attempt), log.Err(err))
 				if sleepErr := sleepOrDone(ctx, birthTagDigestRetryPause); sleepErr != nil {
 					return err
@@ -2459,12 +2310,8 @@ func removeBirthTag(ctx context.Context, deps Deps, node string, vmid int, logge
 				return false, err
 			}
 			raw, _ := pve.ConfigString(cfg, jsonKeyTags)
-			for _, tag := range parseTagsField(raw) {
-				if isBirthTag(tag) {
-					return false, nil
-				}
-			}
-			return true, nil
+			entries := parseTagsField(raw)
+			return slices.Equal(edit(entries), entries), nil
 		},
 	})
 	if err != nil {
@@ -2477,27 +2324,29 @@ func removeBirthTag(ctx context.Context, deps Deps, node string, vmid int, logge
 	return nil
 }
 
-// removeBirthTagOnce reads the VM's config on node and, when its tags carry a
-// birth tag, writes them back without it, guarded by the digest it read.
-func removeBirthTagOnce(ctx context.Context, deps Deps, node string, vmid int) error {
+// mutateVMTagsOnce reads the VM's config on node and, when edit changes its
+// tags, writes them back, guarded by the digest it read.
+func mutateVMTagsOnce(ctx context.Context, deps Deps, node string, vmid int, edit func([]string) []string) error {
 	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
 	if err != nil {
 		return err
 	}
 	raw, _ := pve.ConfigString(cfg, jsonKeyTags)
 	entries := parseTagsField(raw)
-	kept := withoutBirthTags(entries)
-	if len(kept) == len(entries) {
+	kept := edit(entries)
+	if slices.Equal(kept, entries) {
 		return nil
 	}
-	tags := strings.Join(kept, ";")
-	params := &sdknodes.UpdateQemuConfigParams{Tags: &tags}
-	if digest, ok := pve.ConfigString(cfg, "digest"); ok && digest != "" {
-		params.Digest = &digest
+	var digest *string
+	if d, ok := pve.ConfigString(cfg, "digest"); ok && d != "" {
+		digest = &d
 	}
 	if len(kept) == 0 {
 		del := jsonKeyTags
-		params = &sdknodes.UpdateQemuConfigParams{Delete: &del, Digest: params.Digest}
+		return deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmcid.PathOf(vmid),
+			&sdknodes.UpdateQemuConfigParams{Delete: &del, Digest: digest})
 	}
-	return deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmcid.PathOf(vmid), params)
+	tags := strings.Join(kept, ";")
+	return deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmcid.PathOf(vmid),
+		&sdknodes.UpdateQemuConfigParams{Tags: &tags, Digest: digest})
 }

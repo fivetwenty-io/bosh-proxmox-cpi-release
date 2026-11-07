@@ -1413,6 +1413,7 @@ func attachPersistentDisks(
 		if resolveErr != nil {
 			return resolveErr
 		}
+		parsed.recordLegacyDisk(rd)
 		// The VM was created moments ago, and an HA service or an operator can
 		// start moving it before the last disk is attached. The wait follows
 		// the VM to the node it is on now, so each attach below runs there,

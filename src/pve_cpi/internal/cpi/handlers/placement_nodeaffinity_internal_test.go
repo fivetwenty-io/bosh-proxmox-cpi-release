@@ -228,8 +228,8 @@ func TestEnsureNodeAffinityPin_CreatesStrictRule(t *testing.T) {
 	if rule.Strict == nil || !*rule.Strict {
 		t.Errorf("Strict = %v; want true", rule.Strict)
 	}
-	if !stub.resources["vm:100"] {
-		t.Error("vm:100 must be registered as an HA resource")
+	if stub.resources["vm:100"] {
+		t.Error("the pin writer must not register vm:100; the staging order registers it first")
 	}
 }
 
@@ -409,7 +409,7 @@ func TestApplyAZNodeAffinityPin_SingleNodeAZ_WarnsEndToEnd(t *testing.T) {
 		Logger:              log.NewNopLogger(),
 	}
 	logger := warnLogger(t, &buf)
-	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
+	if err := azPinApply(context.Background(), deps, 100,
 		createVMCloudProps{AvailabilityZone: "z1"}, "pve01", logger); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -430,7 +430,7 @@ func TestApplyAZNodeAffinityPin_TwoNodeAZ_WarnsEndToEnd(t *testing.T) {
 		Logger:              log.NewNopLogger(),
 	}
 	logger := warnLogger(t, &buf)
-	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
+	if err := azPinApply(context.Background(), deps, 100,
 		createVMCloudProps{AvailabilityZone: "z1"}, "pve01", logger); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -451,7 +451,7 @@ func TestApplyAZNodeAffinityPin_ThreeNodeAZ_NoSmallNodeSetWarn(t *testing.T) {
 		Logger:              log.NewNopLogger(),
 	}
 	logger := warnLogger(t, &buf)
-	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
+	if err := azPinApply(context.Background(), deps, 100,
 		createVMCloudProps{AvailabilityZone: "z1"}, "pve01", logger); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -474,7 +474,7 @@ func TestApplyAZNodeAffinityPin_PluralAZ_PinsChosenAZ(t *testing.T) {
 	// fix closes: the old code read the singular AvailabilityZone (empty here)
 	// and never pinned.
 	cp := createVMCloudProps{AvailabilityZones: []string{"z1", "z2"}}
-	if err := applyAZNodeAffinityPin(context.Background(), deps, 100, cp, "pve03", log.NewNopLogger()); err != nil {
+	if err := azPinApply(context.Background(), deps, 100, cp, "pve03", log.NewNopLogger()); err != nil {
 		t.Fatalf("pin must succeed for plural-AZ placement: %v", err)
 	}
 
@@ -491,7 +491,7 @@ func TestApplyAZNodeAffinityPin_PluralAZ_PinsChosenAZ(t *testing.T) {
 func TestApplyAZNodeAffinityPin_DisabledNoOp(t *testing.T) {
 	stub := newNAStub()
 	deps := naDeps(stub) // icMinConfig has no Placement → pin disabled
-	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
+	if err := azPinApply(context.Background(), deps, 100,
 		createVMCloudProps{AvailabilityZone: "z1"}, "pve01", log.NewNopLogger()); err != nil {
 		t.Fatalf("disabled pin must be a no-op, not an error: %v", err)
 	}
@@ -500,7 +500,7 @@ func TestApplyAZNodeAffinityPin_DisabledNoOp(t *testing.T) {
 	}
 }
 
-func TestApplyAZNodeAffinityPin_FallbackNodeSkips(t *testing.T) {
+func TestApplyAZNodeAffinityPin_FallbackNodeWritesRecordPinOnly(t *testing.T) {
 	stub := newNAStub()
 	deps := Deps{
 		RequestDirectorUUID: aaDirector,
@@ -510,14 +510,25 @@ func TestApplyAZNodeAffinityPin_FallbackNodeSkips(t *testing.T) {
 		Agent:               &icAgentStub{},
 		Logger:              log.NewNopLogger(),
 	}
-	// VM requested z1 but landed on config.node "pve99" (fallback) → no AZ
-	// membership → no pin (skipped, not errored).
-	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
+	// VM requested z1 but landed on config.node "pve99" (fallback), so it
+	// belongs to no AZ and gets no AZ constraint. A registered VM still gets
+	// the record pin, which names its admissible node and records its volumes.
+	if err := azPinApply(context.Background(), deps, 100,
 		createVMCloudProps{AvailabilityZone: "z1"}, "pve99", log.NewNopLogger()); err != nil {
-		t.Fatalf("fallback-node skip must not error: %v", err)
+		t.Fatalf("fallback node must not error: %v", err)
 	}
-	if stub.createCalls != 0 {
-		t.Errorf("fallback node outside AZ must not pin; createCalls=%d", stub.createCalls)
+	rule, ok := stub.rules["bosh-na-100"]
+	if !ok {
+		t.Fatalf("a registered VM needs its record pin; rules=%v", stub.rules)
+	}
+	if rule.Nodes == nil || !strings.HasPrefix(*rule.Nodes, "pve99") || strings.Contains(*rule.Nodes, "pve01") {
+		t.Errorf("record pin nodes = %v; want the fallback node alone, not the AZ", rule.Nodes)
+	}
+	if rule.Strict != nil && *rule.Strict {
+		t.Error("the record pin must not be strict")
+	}
+	if rule.Comment == nil || !strings.Contains(*rule.Comment, "bosh-vols="+testPinStorage) {
+		t.Errorf("record pin comment = %v; want the volume record", rule.Comment)
 	}
 }
 
@@ -579,7 +590,7 @@ func TestApplyAZNodeAffinityPin_NoResolvableAZ_Warns(t *testing.T) {
 				Agent:               &icAgentStub{},
 				Logger:              log.NewNopLogger(),
 			}
-			if err := applyAZNodeAffinityPin(context.Background(), deps, 100, tc.cp, tc.node,
+			if err := azPinApply(context.Background(), deps, 100, tc.cp, tc.node,
 				warnLogger(t, &buf)); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -611,7 +622,7 @@ func TestApplyAZNodeAffinityPin_Disabled_StaysSilent(t *testing.T) {
 		Agent:               &icAgentStub{},
 		Logger:              log.NewNopLogger(),
 	}
-	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
+	if err := azPinApply(context.Background(), deps, 100,
 		createVMCloudProps{}, "pve01", warnLogger(t, &buf)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -632,7 +643,7 @@ func TestApplyAZNodeAffinityPin_ResolvableAZ_NoInertWarn(t *testing.T) {
 		Agent:               &icAgentStub{},
 		Logger:              log.NewNopLogger(),
 	}
-	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
+	if err := azPinApply(context.Background(), deps, 100,
 		createVMCloudProps{AvailabilityZone: "z1"}, "pve01", warnLogger(t, &buf)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

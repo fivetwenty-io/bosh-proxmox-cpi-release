@@ -299,8 +299,8 @@ func TestEnsureAntiAffinity_CreatesRuleWithTwoMembers(t *testing.T) {
 	if got := stub.rules[aaRule]; got != "vm:100,vm:101" {
 		t.Errorf("rule resources = %q; want %q", got, "vm:100,vm:101")
 	}
-	if !stub.resources["vm:101"] {
-		t.Error("vm:101 should be registered as an HA resource")
+	if stub.resources["vm:101"] {
+		t.Error("the anti-affinity writer must not register vm:101; the staging order registers it first")
 	}
 }
 
@@ -312,8 +312,8 @@ func TestEnsureAntiAffinity_SingleMemberNoRule(t *testing.T) {
 	if len(stub.rules) != 0 {
 		t.Errorf("no rule expected with a single member; got %v", stub.rules)
 	}
-	if !stub.resources["vm:100"] {
-		t.Error("vm:100 should still be registered as an HA resource")
+	if stub.resources["vm:100"] {
+		t.Error("the anti-affinity writer must not register vm:100; the staging order registers it first")
 	}
 }
 

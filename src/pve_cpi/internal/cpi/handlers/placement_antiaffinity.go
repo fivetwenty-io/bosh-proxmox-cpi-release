@@ -72,51 +72,50 @@ func haResourceSid(vmid int) string {
 	return "vm:" + strconv.Itoa(vmid)
 }
 
-// applyAntiAffinityMembership is the create_vm entry point for opt-in HA
-// anti-affinity. It is a no-op unless pve.ha.anti_affinity is "on" in a mode
-// that writes HA and the VM carries an instance-group name. In auto, generic HA
-// failures (HA unconfigured, a transient rule-write hiccup) are logged
-// non-fatally, preserving the best-effort intent. An error propagateHARuleError
-// names is returned so the director re-drives rather than silently dropping the
-// VM from its spread rule: a retriable error (cluster-lock timeout,
-// read-after-write verify failure, rules that kept changing), and in managed
-// mode every membership failure, including a request with no director_uuid.
-func applyAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, env map[string]any, logger *log.Logger) error {
-	if !deps.Config.HAAntiAffinityRulesEnabled() {
-		return nil
+// applyAntiAffinityMembership is the create_vm entry point for HA
+// anti-affinity, and it returns the name of the rule the VM was placed in, or
+// "" when it was placed in none. It writes only for a VM whose HA decision
+// registers it, when pve.ha.anti_affinity is not off, scheduler-soft
+// anti-affinity is enabled, and the VM carries an instance-group name. The
+// decision already required a profile that lets the CPI write HA state. Every
+// failure is returned for the caller, which fails the call when
+// propagateHARuleError says so and otherwise runs the VM without HA, so a VM
+// never runs under HA without the spread rule it was meant to join.
+func applyAntiAffinityMembership(
+	ctx context.Context, deps Deps, d *ha.VMDecision, env map[string]any, logger *log.Logger,
+) (string, error) {
+	if !d.Registers() || deps.Config.HAAntiAffinityValue() == config.HARuleOff || !deps.Config.AntiAffinityEnabled() {
+		return "", nil
 	}
 	ident := haIdentityFor(deps, env)
 	if ident.Group == "" {
-		return nil
+		return "", nil
 	}
 	if ident.Owner == "" {
 		// A rule the CPI cannot mark as its own is a rule it could never edit
 		// or clean up safely, so a request without a director_uuid writes none.
-		// Managed never leaves a VM without the rule it asked for, so there
-		// the call fails.
-		if deps.Config.HAModeValue() == config.HAModeManaged {
-			return fmt.Errorf("anti-affinity: the request carries no director_uuid to mark the rule of group %q with",
-				ident.Group)
-		}
-		logger.Warn("create_vm: HA anti-affinity membership skipped because the request carries no director_uuid "+
-			"to mark the rule with", log.Int(metadataKeyVMID, vmid), log.String("group", ident.Group))
-		return nil
+		return "", fmt.Errorf("anti-affinity: the request carries no director_uuid to mark the rule of group %q with",
+			ident.Group)
 	}
-	if aaErr := ensureAntiAffinityMembership(ctx, deps, ident, vmid, logger); aaErr != nil {
-		if propagateHARuleError(deps, aaErr) {
-			return aaErr
-		}
-		logger.Warn("create_vm: HA anti-affinity membership not fully applied (non-fatal)",
-			log.Int(metadataKeyVMID, vmid), log.String("group", ident.Group), log.Err(aaErr))
-	}
-	return nil
+	return ensureAntiAffinityMembershipFor(ctx, deps, ident, d.VMID, d, logger)
 }
 
-// ensureAntiAffinityMembership registers the VM as a PVE HA resource and adds it
-// to the cluster-level negative resource-affinity rule for its BOSH instance
-// group, so PVE enforces spreading at the hypervisor level. Every PVE failure
-// (including "HA not configured on this cluster") is returned for the caller,
-// which logs it unless it must fail the call (propagateHARuleError).
+// ensureAntiAffinityMembership adds the VM to the cluster-level negative
+// resource-affinity rule of its BOSH instance group with no eligibility
+// decision. See ensureAntiAffinityMembershipFor.
+func ensureAntiAffinityMembership(ctx context.Context, deps Deps, ident haIdentity, vmid int, logger *log.Logger) error {
+	_, err := ensureAntiAffinityMembershipFor(ctx, deps, ident, vmid, nil, logger)
+	return err
+}
+
+// ensureAntiAffinityMembershipFor adds the VM to the cluster-level negative
+// resource-affinity rule for its BOSH instance group, so PVE enforces spreading
+// at the hypervisor level, and returns the name of the rule it was placed in.
+// The VM's HA resource must already exist: create_vm stages it before any rule
+// names it. Every PVE failure (including "HA not configured on this cluster")
+// is returned for the caller. d is the VM's eligibility decision, or nil when
+// there is none, and it lets the rule writer remove a resource this call staged
+// when a repair cannot be verified.
 //
 // A negative resource-affinity rule is only meaningful with two or more members,
 // so the rule is materialized from the live set of same-group guests plus this
@@ -127,9 +126,11 @@ func applyAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, env m
 // when the cluster lock is enabled, and the rule writer changes members with a
 // PUT that carries the read's digest, so there is never a window without the
 // rule.
-func ensureAntiAffinityMembership(ctx context.Context, deps Deps, ident haIdentity, vmid int, logger *log.Logger) error {
+func ensureAntiAffinityMembershipFor(
+	ctx context.Context, deps Deps, ident haIdentity, vmid int, d *ha.VMDecision, logger *log.Logger,
+) (string, error) {
 	if !ident.valid() {
-		return nil
+		return "", nil
 	}
 
 	// The version gate resolves the HA profile, which probes the whole
@@ -137,12 +138,16 @@ func ensureAntiAffinityMembership(ctx context.Context, deps Deps, ident haIdenti
 	// the probe never eats into the lock's window.
 	profile, err := haRuleWriteProfile(ctx, deps)
 	if err != nil {
-		return fmt.Errorf("anti-affinity: %w", err)
+		return "", fmt.Errorf("anti-affinity: %w", err)
 	}
 
-	return withHARulesLock(ctx, deps, vmid, logger, func() error {
-		return ensureAntiAffinityMembershipLocked(ctx, deps, profile, ident, vmid, logger)
+	var placedIn string
+	err = withHARulesLock(ctx, deps, vmid, logger, func() error {
+		var lockedErr error
+		placedIn, lockedErr = ensureAntiAffinityMembershipLocked(ctx, deps, profile, ident, vmid, d, logger)
+		return lockedErr
 	})
+	return placedIn, err
 }
 
 // releaseAntiAffinityLock releases an anti-affinity lock. The release is
@@ -189,55 +194,49 @@ func acquireAntiAffinityLock(ctx context.Context, deps Deps, key string, vmid in
 }
 
 // ensureAntiAffinityMembershipLocked is the read-modify-write body, run under
-// the rules lock when enabled and after the PVE 9 gate has passed. It registers
-// the HA resource with the ownership marker, plans the group's rules from the
-// scan and a fresh read, and lets the rule writer apply the plan. It then moves
-// this Director's members out of the group's unmarked rule from an older CPI.
+// the rules lock when enabled and after the PVE 9 gate has passed. It plans the
+// group's rules from the scan and a fresh read, lets the rule writer apply the
+// plan, and returns the rule the VM was placed in. It then moves this
+// Director's members out of the group's unmarked rule from an older CPI.
 func ensureAntiAffinityMembershipLocked(
-	ctx context.Context, deps Deps, profile *ha.Profile, ident haIdentity, vmid int, logger *log.Logger,
-) error {
-	svc := deps.PVE.Cluster()
+	ctx context.Context, deps Deps, profile *ha.Profile, ident haIdentity, vmid int, d *ha.VMDecision,
+	logger *log.Logger,
+) (string, error) {
 	sid := haResourceSid(vmid)
-	marker := ident.marker()
 
-	// 1. Register the VM as an HA resource (idempotent; "already defined" is fine).
-	if err := svc.CreateHaResources(ctx, &cluster.CreateHaResourcesParams{Sid: sid, Comment: &marker}); err != nil {
-		if !isHaAlreadyExists(err) {
-			logger.Warn("anti-affinity: register HA resource failed (continuing best-effort)",
-				log.String("sid", sid), log.Err(err))
-		}
-	}
-
-	// 2. Compute the full member set: existing same-group guests + this VM.
+	// 1. Compute the full member set: existing same-group guests + this VM.
 	scan, scanErr := collectGroupMemberSids(ctx, deps, ident)
 	if scanErr != nil {
 		// Without the member set we cannot safely write the rule. Warn and stop.
-		return fmt.Errorf("anti-affinity: scan group members: %w", scanErr)
+		return "", fmt.Errorf("anti-affinity: scan group members: %w", scanErr)
 	}
 
-	// 3. Plan and write the group's rules.
+	// 2. Plan and write the group's rules.
 	planner := &aaPlanner{
 		ident: ident, sid: sid, scan: scan, logger: logger,
 		nodes:     len(profileNodeNames(profile)),
 		placeable: placeableNodeCount(profile),
 		split:     deps.Config.HAAntiAffinityOverflowValue() == config.HAOverflowSplit,
 	}
-	writer := newHARuleWriter(deps, profile, logger)
+	writer := newHARuleWriterFor(deps, profile, logger, d)
 	res, err := writer.Apply(ctx, "anti-affinity", planner.plan)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if planner.placedIn != "" && len(res.Wrote) > 0 {
 		if err := verifyAntiAffinityMember(ctx, deps, planner.placedIn, sid, logger); err != nil {
-			return err
+			return "", err
 		}
 	}
 
-	// 4. The unmarked rule from an older CPI gives up the members of ours that
+	// 3. The unmarked rule from an older CPI gives up the members of ours that
 	// the hashed rules now hold. A member the overflow or the placeable cap left
 	// out keeps the old rule's protection.
-	return migrateLegacyAntiAffinityRule(ctx, deps, writer, ident, heldByChunks(res.Set, ident, scan.legacy), vmid,
-		logger)
+	if err := migrateLegacyAntiAffinityRule(ctx, deps, writer, ident, heldByChunks(res.Set, ident, scan.legacy),
+		vmid, logger); err != nil {
+		return "", err
+	}
+	return planner.placedIn, nil
 }
 
 // aaPlanner plans a group's negative rules from the member scan and a read of
@@ -1005,16 +1004,6 @@ func tagsContain(tags, want string) bool {
 		}
 	}
 	return false
-}
-
-// isHaAlreadyExists reports whether err indicates the HA resource is already
-// defined (an idempotent no-op for ensureAntiAffinityMembership).
-func isHaAlreadyExists(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "already defined") || strings.Contains(msg, "already exists")
 }
 
 // isHaNotFound reports whether err indicates the HA rule/resource is absent

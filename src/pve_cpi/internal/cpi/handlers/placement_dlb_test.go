@@ -1,4 +1,4 @@
-// Package handlers — internal tests for DLB membership, version guard, CRS helpers.
+// Package handlers — internal tests for the DLB CRS check and CRS helpers.
 package handlers
 
 import (
@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
@@ -227,141 +228,59 @@ func dlbDeps(clusterSvc cluster.Service, nodesSvc nodes.Service, storageSvc clus
 // ensureDLBMembership tests
 // --------------------------------------------------------------------------
 
-func TestDLBMembership_EligibleAllGuardsPass_RegistersWithAutoRebalance(t *testing.T) {
-	clusterSvc := &dlbClusterStub{}
-	nodesSvc := &dlbNodesStub{} // default 9.2, multi-node
-	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
-	cfg := dlbConfigWithDLB()
+// dlbDecision is the eligibility decision of a VM registered in a DLB AZ.
+func dlbDecision(vmid int) *ha.VMDecision {
+	return &ha.VMDecision{VMID: vmid, SID: haResourceSid(vmid), Outcome: ha.OutcomeRegister, DLB: true}
+}
 
-	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
-	if err := ensureDLBMembership(context.Background(), deps, 100, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestDLBMembership_NoDLBDecision_ReadsNothing(t *testing.T) {
+	// A nil decision, a skipped VM, and a registered VM outside a DLB AZ make no
+	// CRS read: the stub panics on any cluster call it was not configured for,
+	// and ListOptions fails so a read would surface as an error.
+	clusterSvc := &dlbClusterStub{listOptionsErr: fmt.Errorf("must not be read")}
+	deps := dlbSharedDeps(clusterSvc)
+	cases := map[string]*ha.VMDecision{
+		"nil":         nil,
+		"skip in dlb": {VMID: 120, SID: "vm:120", Outcome: ha.OutcomeSkip, DLB: true},
+		"register":    {VMID: 121, SID: "vm:121", Outcome: ha.OutcomeRegister},
+		"fail in dlb": {VMID: 122, SID: "vm:122", Outcome: ha.OutcomeFail, DLB: true},
 	}
-
-	if len(clusterSvc.createHACalls) != 1 {
-		t.Fatalf("expected 1 CreateHaResources call, got %d", len(clusterSvc.createHACalls))
+	for name, d := range cases {
+		if err := ensureDLBMembership(context.Background(), deps, d, log.NewNopLogger()); err != nil {
+			t.Errorf("%s: want no CRS read, got %v", name, err)
+		}
 	}
-	p := clusterSvc.createHACalls[0]
-	if p.Sid != "vm:100" {
-		t.Errorf("sid: want %q, got %q", "vm:100", p.Sid)
-	}
-	if p.AutoRebalance == nil || !*p.AutoRebalance {
-		t.Error("AutoRebalance must be true")
-	}
-	if p.State == nil || *p.State != "started" {
-		t.Errorf("State: want %q, got %v", "started", p.State)
+	if len(clusterSvc.updateOptsCRS) != 0 {
+		t.Errorf("UpdateOptions must NOT be called, got %v", clusterSvc.updateOptsCRS)
 	}
 }
 
-func TestDLBMembership_SingleNode_SkipsRegistration(t *testing.T) {
-	// Override ListConfigNodes to return one node.
-	raw, _ := json.Marshal(map[string]any{"node": "pve01"})
-	singleNode := cluster.ListConfigNodesResponse{raw}
-	clusterSvc := &dlbClusterStub{listConfigResp: &singleNode}
-	nodesSvc := &dlbNodesStub{}
-	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
-	cfg := dlbConfigWithDLB()
-
-	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
-	if err := ensureDLBMembership(context.Background(), deps, 101, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(clusterSvc.createHACalls) != 0 {
-		t.Errorf("single-node: CreateHaResources must not be called, got %d calls", len(clusterSvc.createHACalls))
+func TestDLBMembership_ErrorNamesTheCRSCheck(t *testing.T) {
+	clusterSvc := &dlbClusterStub{listOptionsErr: fmt.Errorf("boom")}
+	err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), dlbDecision(123), log.NewNopLogger())
+	if err == nil || !strings.HasPrefix(err.Error(), "DLB: cluster CRS check: ") {
+		t.Errorf("want the CRS check prefix, got %v", err)
 	}
 }
-
-func TestDLBMembership_OldPVEVersion_Skips(t *testing.T) {
-	clusterSvc := &dlbClusterStub{}
-	nodesSvc := &dlbNodesStub{
-		versionResp: &nodes.ListVersionResponse{Version: "9.1-3"},
-	}
-	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
-	cfg := dlbConfigWithDLB()
-
-	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
-	if err := ensureDLBMembership(context.Background(), deps, 102, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(clusterSvc.createHACalls) != 0 {
-		t.Errorf("old PVE: CreateHaResources must not be called")
-	}
-}
-
-func TestDLBMembership_LocalStorage_RequireSharedTrue_Skips(t *testing.T) {
-	clusterSvc := &dlbClusterStub{}
-	nodesSvc := &dlbNodesStub{}
-	// dir-type is local (not shared by default flag).
-	storageSvc := &dlbStorageStub{storageType: "dir", shared: false}
-	cfg := dlbConfigWithDLB() // the shared-storage guard is always on
-
-	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
-	if err := ensureDLBMembership(context.Background(), deps, 103, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(clusterSvc.createHACalls) != 0 {
-		t.Errorf("local storage: CreateHaResources must not be called")
-	}
-}
-
-func TestDLBMembership_AlreadyExists_UpdatesFlags(t *testing.T) {
-	// CreateHaResources returns "already defined" → UpdateHaResources must be called.
-	// Override to return already-exists error.
-	alreadyStub := &dlbClusterStubAlreadyExists{dlbClusterStub: dlbClusterStub{}}
-	nodesSvc := &dlbNodesStub{}
-	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
-	cfg := dlbConfigWithDLB()
-
-	deps := dlbDeps(alreadyStub, nodesSvc, storageSvc, cfg)
-	if err := ensureDLBMembership(context.Background(), deps, 104, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(alreadyStub.updateHACalls) != 1 {
-		t.Fatalf("expected 1 UpdateHaResources call, got %d", len(alreadyStub.updateHACalls))
-	}
-	u := alreadyStub.updateHACalls[0]
-	if u.Sid != "vm:104" {
-		t.Errorf("update sid: want %q, got %q", "vm:104", u.Sid)
-	}
-	if u.Params.AutoRebalance == nil || !*u.Params.AutoRebalance {
-		t.Error("UpdateHaResources AutoRebalance must be true")
-	}
-	if u.Params.State == nil || *u.Params.State != "started" {
-		t.Errorf("UpdateHaResources State must be %q", "started")
-	}
-}
-
-// dlbClusterStubAlreadyExists wraps dlbClusterStub to make CreateHaResources
-// return "already defined" on the first call.
-type dlbClusterStubAlreadyExists struct {
-	dlbClusterStub
-}
-
-func (s *dlbClusterStubAlreadyExists) CreateHaResources(_ context.Context, _ *cluster.CreateHaResourcesParams) error {
-	return fmt.Errorf("already defined")
-}
-
-// --------------------------------------------------------------------------
-// parseCRS / formatCRS / crsHasDynamic unit tests
-// --------------------------------------------------------------------------
-
-func TestDLBMembership_CRS_NotDynamic_NeverWritesAndStillRegisters(t *testing.T) {
+func TestDLBMembership_CRS_NotDynamic_NeverWritesAndRegistersNothing(t *testing.T) {
 	// The CPI reads the cluster CRS mode and warns. It never writes it, because
-	// the mode affects every HA guest in the cluster, and the VM still registers.
+	// the mode affects every HA guest in the cluster. The check registers no
+	// resource either: the staging order registers the VM before it runs.
 	svc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`{"ha":"static"}`)}
 	nodesSvc := &dlbNodesStub{}
 	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
 
 	logger, obs := log.NewObservedLogger(slog.LevelDebug)
 	deps := dlbDeps(svc, nodesSvc, storageSvc, dlbConfigWithDLB())
-	if err := ensureDLBMembership(context.Background(), deps, 106, "dlb", logger); err != nil {
+	if err := ensureDLBMembership(context.Background(), deps, dlbDecision(106), logger); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(svc.updateOptsCRS) != 0 {
 		t.Errorf("UpdateOptions must NOT be called, got %d calls", len(svc.updateOptsCRS))
 	}
-	if len(svc.createHACalls) != 1 {
-		t.Errorf("CreateHaResources should still be called; got %d calls", len(svc.createHACalls))
+	if len(svc.createHACalls) != 0 || len(svc.updateHACalls) != 0 {
+		t.Errorf("the CRS check must write no HA resource; got %d creates and %d updates",
+			len(svc.createHACalls), len(svc.updateHACalls))
 	}
 	warned := false
 	for _, e := range obs.All() {
@@ -385,7 +304,7 @@ func TestDLBMembership_CRS_AlreadyDynamic_NoUpdateOptions(t *testing.T) {
 	cfg := dlbConfigWithDLB()
 
 	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
-	if err := ensureDLBMembership(context.Background(), deps, 107, "dlb", log.NewNopLogger()); err != nil {
+	if err := ensureDLBMembership(context.Background(), deps, dlbDecision(107), log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(clusterSvc.updateOptsCRS) != 0 {
@@ -402,7 +321,7 @@ func TestDLBMembership_CRS_UndecodableCRS_ErrorsWithoutWriting(t *testing.T) {
 	// that write would drop every sub-option the operator configured.
 	for _, raw := range []string{`["ha=dynamic"]`, `{"ha":{"mode":"dynamic"}}`, `{`} {
 		clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(raw)}
-		err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), 111, "dlb", log.NewNopLogger())
+		err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), dlbDecision(111), log.NewNopLogger())
 		if err == nil || !strings.Contains(err.Error(), "decode cluster crs") {
 			t.Errorf("crs %s: want a decode error, got %v", raw, err)
 		}
@@ -414,7 +333,7 @@ func TestDLBMembership_CRS_UndecodableCRS_ErrorsWithoutWriting(t *testing.T) {
 
 func TestDLBMembership_CRS_UndecodableCRS_Errors(t *testing.T) {
 	clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`["ha=dynamic"]`)}
-	err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), 112, "dlb", log.NewNopLogger())
+	err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), dlbDecision(112), log.NewNopLogger())
 	if err == nil || !strings.Contains(err.Error(), "decode cluster crs") {
 		t.Errorf("want a decode error, got %v", err)
 	}
@@ -422,7 +341,7 @@ func TestDLBMembership_CRS_UndecodableCRS_Errors(t *testing.T) {
 
 func TestDLBMembership_CRS_ListOptionsError_Wrapped(t *testing.T) {
 	clusterSvc := &dlbClusterStub{listOptionsErr: fmt.Errorf("boom")}
-	err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), 113, "dlb", log.NewNopLogger())
+	err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), dlbDecision(113), log.NewNopLogger())
 	if err == nil || !strings.Contains(err.Error(), "read cluster options: boom") {
 		t.Errorf("want the wrapped ListOptions error, got %v", err)
 	}
@@ -438,7 +357,7 @@ func TestDLBMembership_CRS_WarnHintPreservesOperatorSubOptions(t *testing.T) {
 		listOptionsRaw: dlbListOptions(`{"ha":"static","ha-auto-rebalance-margin":50}`),
 	}
 	logger, obs := log.NewObservedLogger(slog.LevelDebug)
-	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), 115, "dlb", logger); err != nil {
+	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), dlbDecision(115), logger); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	var warn *log.Entry
@@ -465,7 +384,7 @@ func TestDLBMembership_CRS_Dynamic_NoWarn(t *testing.T) {
 	// the rebalance flags say; that is the noise the object decode removes.
 	clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`{"ha":"dynamic","ha-auto-rebalance":0}`)}
 	logger, obs := log.NewObservedLogger(slog.LevelDebug)
-	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), 116, "dlb", logger); err != nil {
+	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), dlbDecision(116), logger); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	for _, e := range obs.All() {
@@ -474,7 +393,6 @@ func TestDLBMembership_CRS_Dynamic_NoWarn(t *testing.T) {
 		}
 	}
 }
-
 func TestParseCRSRaw(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -674,41 +592,6 @@ func TestParseCRS_BareTokenIsKeptOnRead(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// pveVersionAtLeast tests
-// --------------------------------------------------------------------------
-
-func TestPVEVersionAtLeast(t *testing.T) {
-	cases := []struct {
-		version string
-		major   int
-		minor   int
-		want    bool
-	}{
-		{"9.2-1", 9, 2, true},
-		{"9.1-3", 9, 2, false},
-		{"9.3-0", 9, 2, true},
-		{"10.0", 9, 2, true},
-		{"10.0-1", 9, 2, true},
-		{"8.4-2", 9, 2, false},
-		{"9.2", 9, 2, true},
-		{"", 9, 2, false},
-		{"9", 9, 2, false}, // no minor segment → unknown → false
-		{"abc", 9, 2, false},
-		{"9.abc-1", 9, 2, false},
-		{"9.2-1", 10, 0, false}, // 9.x < 10.x
-		{"10.0", 10, 0, true},
-		{"10.1-2", 10, 0, true},
-	}
-	for _, tc := range cases {
-		got := pveVersionAtLeast(tc.version, tc.major, tc.minor)
-		if got != tc.want {
-			t.Errorf("pveVersionAtLeast(%q, %d, %d): want %v, got %v",
-				tc.version, tc.major, tc.minor, tc.want, got)
-		}
-	}
-}
-
-// --------------------------------------------------------------------------
 // dlbMultiStorageStub — name-aware storage list for the root+disk pool guard.
 // Embeds dlbStorageStub to inherit the panic stubs for the unused methods and
 // shadows ListStorage to return a distinct entry per configured pool name.
@@ -755,221 +638,4 @@ func (s *dlbMultiStorageStub) ListStorage(_ context.Context, _ *clusterstorage.L
 		resp = append(resp, json.RawMessage(raw))
 	}
 	return &resp, nil
-}
-
-// TestDLBMembership_LocalPersistentDisk_RequireSharedTrue_Skips verifies the
-// shared-storage guard checks the persistent disk pool too: a VM with a shared
-// root pool but a node-local persistent disk pool must NOT be DLB-registered,
-// since a local disk blocks live migration.
-func TestDLBMembership_LocalPersistentDisk_RequireSharedTrue_Skips(t *testing.T) {
-	clusterSvc := &dlbClusterStub{}
-	nodesSvc := &dlbNodesStub{} // 9.2, multi-node
-	storageSvc := &dlbMultiStorageStub{entries: map[string]dlbStorageEntry{
-		"shared-root": {storageType: "rbd", shared: true},
-		"local-data":  {storageType: "lvm", shared: false},
-	}}
-	cfg := dlbConfigWithDLB() // the shared-storage guard is always on
-	cfg.VMStorage = "shared-root"
-	cfg.DiskStorage = "local-data"
-
-	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
-	if err := ensureDLBMembership(context.Background(), deps, 104, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(clusterSvc.createHACalls) != 0 {
-		t.Errorf("local persistent disk: CreateHaResources must not be called, got %d", len(clusterSvc.createHACalls))
-	}
-}
-
-// TestDLBMembership_SharedRootAndDisk_Registers verifies that when BOTH the
-// root and persistent disk pools are shared, DLB registration proceeds.
-func TestDLBMembership_SharedRootAndDisk_Registers(t *testing.T) {
-	clusterSvc := &dlbClusterStub{}
-	nodesSvc := &dlbNodesStub{}
-	storageSvc := &dlbMultiStorageStub{entries: map[string]dlbStorageEntry{
-		"shared-root": {storageType: "rbd", shared: true},
-		"shared-data": {storageType: "nfs", shared: true},
-	}}
-	cfg := dlbConfigWithDLB()
-	cfg.VMStorage = "shared-root"
-	cfg.DiskStorage = "shared-data"
-
-	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
-	if err := ensureDLBMembership(context.Background(), deps, 105, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(clusterSvc.createHACalls) != 1 {
-		t.Fatalf("shared root+disk: expected 1 CreateHaResources call, got %d", len(clusterSvc.createHACalls))
-	}
-}
-
-// TestDLBMembership_LocalISOStorage_RequireSharedTrue_Skips verifies the
-// shared-storage guard also checks the resolved ConfigDrive ISO pool: a VM
-// with a shared root pool and shared disk pool but a node-local iso_storage
-// pool must NOT be DLB-registered, since the scsi30 CD-ROM cannot follow the
-// VM across live migration.
-func TestDLBMembership_LocalISOStorage_RequireSharedTrue_Skips(t *testing.T) {
-	clusterSvc := &dlbClusterStub{}
-	nodesSvc := &dlbNodesStub{} // 9.2, multi-node
-	storageSvc := &dlbMultiStorageStub{entries: map[string]dlbStorageEntry{
-		"shared-root": {storageType: "rbd", shared: true},
-		"shared-data": {storageType: "nfs", shared: true},
-		"local":       {storageType: "dir", shared: false},
-	}}
-	cfg := dlbConfigWithDLB() // the shared-storage guard is always on
-	cfg.VMStorage = "shared-root"
-	cfg.DiskStorage = "shared-data"
-	cfg.ISOStorage = "local"
-
-	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
-	if err := ensureDLBMembership(context.Background(), deps, 106, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(clusterSvc.createHACalls) != 0 {
-		t.Errorf("local iso_storage: CreateHaResources must not be called, got %d", len(clusterSvc.createHACalls))
-	}
-}
-
-// TestDLBMembership_SharedRootDiskAndISO_Registers verifies that when the
-// root pool, persistent disk pool, AND ConfigDrive ISO pool are all shared,
-// DLB registration proceeds.
-func TestDLBMembership_SharedRootDiskAndISO_Registers(t *testing.T) {
-	clusterSvc := &dlbClusterStub{}
-	nodesSvc := &dlbNodesStub{}
-	storageSvc := &dlbMultiStorageStub{entries: map[string]dlbStorageEntry{
-		"shared-root": {storageType: "rbd", shared: true},
-		"shared-data": {storageType: "nfs", shared: true},
-		"shared-iso":  {storageType: "nfs", shared: true},
-	}}
-	cfg := dlbConfigWithDLB()
-	cfg.VMStorage = "shared-root"
-	cfg.DiskStorage = "shared-data"
-	cfg.ISOStorage = "shared-iso"
-
-	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
-	if err := ensureDLBMembership(context.Background(), deps, 107, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(clusterSvc.createHACalls) != 1 {
-		t.Fatalf("shared root+disk+iso: expected 1 CreateHaResources call, got %d", len(clusterSvc.createHACalls))
-	}
-}
-
-// ListStatus reports no offline members; the fixture cluster is fully online.
-func (s *dlbClusterStub) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
-	empty := cluster.ListStatusResponse{}
-	return &empty, nil
-}
-
-// --------------------------------------------------------------------------
-// ownership marker on DLB-registered HA resources
-// --------------------------------------------------------------------------
-
-// dlbDepsForDirector is dlbDeps for a request from the fixture Director.
-func dlbDepsForDirector(clusterSvc cluster.Service) Deps {
-	deps := dlbDeps(clusterSvc, &dlbNodesStub{}, &dlbStorageStub{storageType: "nfs", shared: true}, dlbConfigWithDLB())
-	deps.RequestDirectorUUID = aaDirector
-	return deps
-}
-
-func TestDLBMembership_RegistersWithOwnershipMarker(t *testing.T) {
-	t.Parallel()
-	svc := &dlbClusterStub{}
-	if err := ensureDLBMembership(context.Background(), dlbDepsForDirector(svc), 110, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(svc.createHACalls) != 1 {
-		t.Fatalf("expected 1 CreateHaResources call, got %d", len(svc.createHACalls))
-	}
-	want := haIdentity{Owner: aaDirector}.marker()
-	if c := svc.createHACalls[0].Comment; c == nil || *c != want {
-		t.Errorf("CreateHaResources comment = %v; want the ownership marker %q", c, want)
-	}
-	if got := haOwnershipOf(*svc.createHACalls[0].Comment, aaDirector); got != haOwnedByUs {
-		t.Errorf("the marker must read back as ours, got %v", got)
-	}
-}
-
-func TestDLBMembership_NoDirectorUUIDRegistersUnmarkedAndWarns(t *testing.T) {
-	t.Parallel()
-	svc := &dlbClusterStub{}
-	logger, obs := log.NewObservedLogger(slog.LevelDebug)
-	deps := dlbDeps(svc, &dlbNodesStub{}, &dlbStorageStub{storageType: "nfs", shared: true}, dlbConfigWithDLB())
-	if err := ensureDLBMembership(context.Background(), deps, 111, "dlb", logger); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(svc.createHACalls) != 1 {
-		t.Fatalf("expected 1 CreateHaResources call, got %d", len(svc.createHACalls))
-	}
-	if c := svc.createHACalls[0].Comment; c != nil {
-		t.Errorf("without a director_uuid no marker can be written, got comment %q", *c)
-	}
-	warned := false
-	for _, e := range obs.All() {
-		if e.Level == slog.LevelWarn && strings.Contains(e.Message, "no director_uuid") {
-			warned = true
-		}
-	}
-	if !warned {
-		t.Error("a request without a director_uuid must log that the marker is missing")
-	}
-}
-
-func TestDLBMembership_AlreadyExistsUnmarkedGainsMarker(t *testing.T) {
-	t.Parallel()
-	svc := &dlbClusterStubAlreadyExists{}
-	if err := ensureDLBMembership(context.Background(), dlbDepsForDirector(svc), 112, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(svc.updateHACalls) != 1 {
-		t.Fatalf("expected 1 UpdateHaResources call, got %d", len(svc.updateHACalls))
-	}
-	want := haIdentity{Owner: aaDirector}.marker()
-	u := svc.updateHACalls[0].Params
-	if u.Comment == nil || *u.Comment != want {
-		t.Errorf("update comment = %v; want the ownership marker %q", u.Comment, want)
-	}
-	if u.AutoRebalance == nil || !*u.AutoRebalance || u.State == nil || *u.State != "started" {
-		t.Error("the update must still set the DLB flags")
-	}
-}
-
-func TestDLBMembership_AlreadyExistsOwnedKeepsComment(t *testing.T) {
-	t.Parallel()
-	ours := aaIdent("web").marker()
-	svc := &dlbClusterStubAlreadyExists{dlbClusterStub: dlbClusterStub{haComment: &ours}}
-	if err := ensureDLBMembership(context.Background(), dlbDepsForDirector(svc), 113, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(svc.updateHACalls) != 1 {
-		t.Fatalf("expected 1 UpdateHaResources call, got %d", len(svc.updateHACalls))
-	}
-	if c := svc.updateHACalls[0].Params.Comment; c != nil {
-		t.Errorf("a resource already marked as ours must keep its comment, got %q", *c)
-	}
-}
-
-func TestDLBMembership_AlreadyExistsForeignLeftAlone(t *testing.T) {
-	t.Parallel()
-	foreign := haIdentity{Owner: aaOtherDirector}.marker()
-	svc := &dlbClusterStubAlreadyExists{dlbClusterStub: dlbClusterStub{haComment: &foreign}}
-	err := ensureDLBMembership(context.Background(), dlbDepsForDirector(svc), 114, "dlb", log.NewNopLogger())
-	if err == nil || !strings.Contains(err.Error(), "another Director") {
-		t.Fatalf("err = %v; want a refusal naming another Director", err)
-	}
-	if len(svc.updateHACalls) != 0 {
-		t.Errorf("a resource marked for another Director must not be updated, got %d updates", len(svc.updateHACalls))
-	}
-}
-
-func TestDLBMembership_AlreadyExistsUnreadableNotUpdated(t *testing.T) {
-	t.Parallel()
-	svc := &dlbClusterStubAlreadyExists{dlbClusterStub: dlbClusterStub{getHAErr: fmt.Errorf("connection reset")}}
-	err := ensureDLBMembership(context.Background(), dlbDepsForDirector(svc), 115, "dlb", log.NewNopLogger())
-	if err == nil || !strings.Contains(err.Error(), "connection reset") {
-		t.Fatalf("err = %v; want the read failure", err)
-	}
-	if len(svc.updateHACalls) != 0 {
-		t.Errorf("a resource whose owner is unknown must not be updated, got %d updates", len(svc.updateHACalls))
-	}
 }

@@ -65,7 +65,7 @@ func TestApplyAntiAffinityMembership_RetriableLockLost_Propagates(t *testing.T) 
 
 	cfg := aaMembershipConfig("pool", false, 1)
 	deps := aaDepsLock(cfg, stub, lockPools)
-	err := applyAntiAffinityMembership(context.Background(), deps, 101, aaEnvForWebGroup(), log.NewNopLogger())
+	err := aaApply(context.Background(), deps, 101, aaEnvForWebGroup(), log.NewNopLogger())
 	if err == nil {
 		t.Fatal("applyAntiAffinityMembership must propagate the lock-acquire retriable to the director")
 	}
@@ -86,7 +86,7 @@ func TestApplyAntiAffinityMembership_RetriableVerify_Propagates(t *testing.T) {
 
 	cfg := aaMembershipConfig("off", true, 0) // verify on, lock off
 	deps := aaDepsLock(cfg, stub, newAALockPools(nil))
-	err := applyAntiAffinityMembership(context.Background(), deps, 101, aaEnvForWebGroup(), log.NewNopLogger())
+	err := aaApply(context.Background(), deps, 101, aaEnvForWebGroup(), log.NewNopLogger())
 	if err == nil {
 		t.Fatal("applyAntiAffinityMembership must propagate the verify-absent retriable to the director")
 	}
@@ -106,7 +106,7 @@ func TestApplyAntiAffinityMembership_GenericFail_Swallowed(t *testing.T) {
 
 	cfg := aaMembershipConfig("off", false, 0)
 	deps := aaDepsLock(cfg, stub, newAALockPools(nil))
-	err := applyAntiAffinityMembership(context.Background(), deps, 101, aaEnvForWebGroup(), log.NewNopLogger())
+	err := aaApply(context.Background(), deps, 101, aaEnvForWebGroup(), log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("generic HA failure must be swallowed by applyAntiAffinityMembership; got %v", err)
 	}
@@ -145,7 +145,7 @@ func TestApplyAZNodeAffinityPin_RetriableVerify_Propagates(t *testing.T) {
 	stub.dropOnRead(4, "vm:101")
 	deps := naVerifyDeps(stub, true)
 	cp := createVMCloudProps{AvailabilityZone: "z1"}
-	err := applyAZNodeAffinityPin(context.Background(), deps, 101, cp, "pve-node1", log.NewNopLogger())
+	err := azPinApply(context.Background(), deps, 101, cp, "pve-node1", log.NewNopLogger())
 	if err == nil {
 		t.Fatal("expected retriable error when verify sees member absent in node-affinity rule")
 	}
@@ -163,7 +163,7 @@ func TestApplyAZNodeAffinityPin_GenericFail_Swallowed(t *testing.T) {
 	stub.failListRules = true         // causes ensureNodeAffinityPin to return a generic error
 	deps := naVerifyDeps(stub, false) // verify off so only the list-rules error fires
 	cp := createVMCloudProps{AvailabilityZone: "z1"}
-	err := applyAZNodeAffinityPin(context.Background(), deps, 101, cp, "pve-node1", log.NewNopLogger())
+	err := azPinApply(context.Background(), deps, 101, cp, "pve-node1", log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("generic HA failure must be swallowed by applyAZNodeAffinityPin; got %v", err)
 	}

@@ -130,112 +130,26 @@ func HandleAttachDisk(deps Deps) Handler {
 			ctx = managedLockWaitContext(ctx)
 			defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
 		}
-		// A transfer to a parker that stopped after its move leaves rd naming
-		// the volume the disk had before the move, and that name is gone. We
-		// finish the transfer first, inside the lifecycle when the journal
-		// manages the disk, so the node lookup below finds the disk where it
-		// landed. A resume that can't run comes back retriable.
-		rd, err = resumeTransferSettled(ctx, deps, "attach_disk", rd)
+		// The attach-time HA decision reads the VM's HA resource, its pin, and
+		// its config before the first mutation below, the resume of an
+		// interrupted transfer included. It decides whether the attach runs as
+		// before, removes the VM from HA first, or runs inside the narrowing
+		// barrier, so PVE HA never moves the VM to a node the new disk does not
+		// reach.
+		haAttach, err := decideAttachHA(ctx, deps, vmCID, rd)
 		if err != nil {
 			return nil, err
 		}
-
-		// --------------------------------------------------------------------
-		// 2. Parse vm_cid → VMID; parse disk_cid → storage + volid.
-		// --------------------------------------------------------------------
-		node, vmid, err := attachDiskResolveNode(ctx, deps, vmCID, rd.volid, rd.stableID)
-		if err != nil {
-			return nil, err
-		}
-		// Wait out a migration or another task on the target VM before the
-		// holder guard starts its steps, which can take minutes and can move
-		// the disk to the node the VM is on. The wait refuses a node the
-		// cluster does not report able to answer, and it runs after the node
-		// lookup above so a cluster that cannot answer at all fails there. The
-		// lookup is authoritative about where the VM is, so the wait changes
-		// the node only when the VM moved since. The attach's config change is
-		// sent through MutateVMConfig, which handles a migration that starts
-		// after this.
-		settled, err := settleDiskVM(ctx, deps, "attach_disk", vmCID, vmid, true)
-		if err != nil {
-			return nil, err
-		}
-		if settled.Found && settled.Node != "" {
-			node = settled.Node
-		}
-
-		// --------------------------------------------------------------------
-		// 3. Resolve the volume's current holder, then unpark, plan a
-		// reassignment transfer, or refuse.
-		//
-		// One cluster scan answers both questions this handler has to settle
-		// before it writes a volid into a VM config: a parker holder must be
-		// unparked (or reassigned) first, and any other holder means the
-		// volume is already attached elsewhere. Unpark failure → retriable
-		// error; the disk remains parked and the next BOSH retry will
-		// re-attempt here.
-		//
-		// Co-location check (local backend) is unaffected: UnparkDisk performs
-		// a DetachDisk on the parker VM but does not move the volume between
-		// nodes, so the disk node established by attachDiskResolveNode remains
-		// valid.
-		// --------------------------------------------------------------------
-		plan, err := guardAndUnparkBeforeAttach(ctx, deps, "attach_disk", &rd, node, vmid)
-		if err != nil {
-			return nil, err
-		}
-		// The guard can take minutes when it migrates the disk, and the VM can
-		// migrate in that time. So the VM is settled and located again, and a
-		// move to another node is checked against the parker and the storage
-		// before any step below uses the node from before.
-		node, err = attachSettleAfterGuard(ctx, deps, vmCID, vmid, node, rd, &plan)
-		if err != nil {
-			return nil, err
-		}
-		// The ownership guard above judged the VM before the holder guard ran,
-		// and the holder guard can take minutes when it migrates the disk. So
-		// the slot choice judges the config it reads once more before the
-		// first write, which costs no extra call.
-		plan.judgeTarget = attachDiskTargetJudge(ctx, deps, vmCID, node, vmid)
-
-		// --------------------------------------------------------------------
-		// 4. Snapshot pre-flight guard.
-		//
-		// PVE permits attaching a disk to a VM that has existing snapshots, but the
-		// newly attached disk is absent from all prior snapshots — on rollback the
-		// disk disappears, causing silent data loss. Guard before any mutating PVE
-		// call to surface the risk early with an actionable message.
-		//
-		// Policy (D2-C, D3-C):
-		//   HasSnapshots error + RequireSnapshotCheckPass=true  → fail-closed (abort)
-		//   HasSnapshots error + RequireSnapshotCheckPass=false → WARN + proceed
-		//   Snapshots present + AllowDiskOpsWithSnapshots=false → Cloud error (hard fail)
-		//   Snapshots present + AllowDiskOpsWithSnapshots=true  → WARN + proceed
-		//   No snapshots                                        → proceed normally
-		// --------------------------------------------------------------------
-		if err := attachDiskSnapshotGuard(ctx, deps, vmCID, node, vmid, deps.Config, deps.Log(ctx)); err != nil {
-			return nil, err
-		}
-
-		// --------------------------------------------------------------------
-		// 4b. Per-node in-flight gate (opt-in; limit=0 → unlimited, no gating).
-		// --------------------------------------------------------------------
-		if deps.Config != nil {
-			inflightRelease, inflightErr := deps.Inflight.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
-			if inflightErr != nil {
-				return nil, cpierrors.Retriable("attach_disk: in-flight limit exceeded or context cancelled on node %s: %s", node, inflightErr.Error())
+		var diskID, devicePath string
+		attach := func(ctx context.Context) (string, error) {
+			node, id, path, err := attachDiskSteps(ctx, deps, vmCID, diskCID, rd)
+			if err != nil {
+				return "", err
 			}
-			defer inflightRelease()
+			diskID, devicePath = id, path
+			return node, nil
 		}
-
-		// --------------------------------------------------------------------
-		// 5–8. Shared attach core: slot choice, perf merge + invariants, the
-		// reassignment transfer or config PUT, confirmation, and the sentinel
-		// CID record. create_vm's disk_cids pre-attach runs the identical
-		// sequence (see attachDiskCore).
-		// --------------------------------------------------------------------
-		diskID, devicePath, err := attachDiskCore(ctx, deps, "attach_disk", vmCID, node, vmid, diskCID, rd, plan)
-		if err != nil {
+		if err := haAttach.run(ctx, attach); err != nil {
 			return nil, err
 		}
 
@@ -251,6 +165,127 @@ func HandleAttachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		return diskHints{Path: devicePath}, nil
 	})
+}
+
+// attachDiskSteps runs attach_disk's mutations for the resolved disk rd: it
+// resumes an interrupted transfer, locates and settles the VM, runs the holder
+// guard, the snapshot guard, and the per-node in-flight gate, and then the
+// shared attach core. It returns the node the disk was attached on, the disk
+// ID, and the device path. The attach-time HA decision runs it, inside the
+// narrowing barrier when the attach narrows where the VM may run.
+func attachDiskSteps(
+	ctx context.Context, deps Deps, vmCID, diskCID string, rd resolvedDisk,
+) (string, string, string, error) {
+	// A transfer to a parker that stopped after its move leaves rd naming
+	// the volume the disk had before the move, and that name is gone. We
+	// finish the transfer first, inside the lifecycle when the journal
+	// manages the disk, so the node lookup below finds the disk where it
+	// landed. A resume that can't run comes back retriable.
+	rd, err := resumeTransferSettled(ctx, deps, "attach_disk", rd)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	// --------------------------------------------------------------------
+	// 2. Parse vm_cid → VMID; parse disk_cid → storage + volid.
+	// --------------------------------------------------------------------
+	node, vmid, err := attachDiskResolveNode(ctx, deps, vmCID, rd.volid, rd.stableID)
+	if err != nil {
+		return "", "", "", err
+	}
+	// Wait out a migration or another task on the target VM before the
+	// holder guard starts its steps, which can take minutes and can move
+	// the disk to the node the VM is on. The wait refuses a node the
+	// cluster does not report able to answer, and it runs after the node
+	// lookup above so a cluster that cannot answer at all fails there. The
+	// lookup is authoritative about where the VM is, so the wait changes
+	// the node only when the VM moved since. The attach's config change is
+	// sent through MutateVMConfig, which handles a migration that starts
+	// after this.
+	settled, err := settleDiskVM(ctx, deps, "attach_disk", vmCID, vmid, true)
+	if err != nil {
+		return "", "", "", err
+	}
+	if settled.Found && settled.Node != "" {
+		node = settled.Node
+	}
+
+	// --------------------------------------------------------------------
+	// 3. Resolve the volume's current holder, then unpark, plan a
+	// reassignment transfer, or refuse.
+	//
+	// One cluster scan answers both questions this handler has to settle
+	// before it writes a volid into a VM config: a parker holder must be
+	// unparked (or reassigned) first, and any other holder means the
+	// volume is already attached elsewhere. Unpark failure → retriable
+	// error; the disk remains parked and the next BOSH retry will
+	// re-attempt here.
+	//
+	// Co-location check (local backend) is unaffected: UnparkDisk performs
+	// a DetachDisk on the parker VM but does not move the volume between
+	// nodes, so the disk node established by attachDiskResolveNode remains
+	// valid.
+	// --------------------------------------------------------------------
+	plan, err := guardAndUnparkBeforeAttach(ctx, deps, "attach_disk", &rd, node, vmid)
+	if err != nil {
+		return "", "", "", err
+	}
+	// The guard can take minutes when it migrates the disk, and the VM can
+	// migrate in that time. So the VM is settled and located again, and a
+	// move to another node is checked against the parker and the storage
+	// before any step below uses the node from before.
+	node, err = attachSettleAfterGuard(ctx, deps, vmCID, vmid, node, rd, &plan)
+	if err != nil {
+		return "", "", "", err
+	}
+	// The ownership guard above judged the VM before the holder guard ran,
+	// and the holder guard can take minutes when it migrates the disk. So
+	// the slot choice judges the config it reads once more before the
+	// first write, which costs no extra call.
+	plan.judgeTarget = attachDiskTargetJudge(ctx, deps, vmCID, node, vmid)
+
+	// --------------------------------------------------------------------
+	// 4. Snapshot pre-flight guard.
+	//
+	// PVE permits attaching a disk to a VM that has existing snapshots, but the
+	// newly attached disk is absent from all prior snapshots — on rollback the
+	// disk disappears, causing silent data loss. Guard before any mutating PVE
+	// call to surface the risk early with an actionable message.
+	//
+	// Policy (D2-C, D3-C):
+	//   HasSnapshots error + RequireSnapshotCheckPass=true  → fail-closed (abort)
+	//   HasSnapshots error + RequireSnapshotCheckPass=false → WARN + proceed
+	//   Snapshots present + AllowDiskOpsWithSnapshots=false → Cloud error (hard fail)
+	//   Snapshots present + AllowDiskOpsWithSnapshots=true  → WARN + proceed
+	//   No snapshots                                        → proceed normally
+	// --------------------------------------------------------------------
+	if err := attachDiskSnapshotGuard(ctx, deps, vmCID, node, vmid, deps.Config, deps.Log(ctx)); err != nil {
+		return "", "", "", err
+	}
+
+	// --------------------------------------------------------------------
+	// 4b. Per-node in-flight gate (opt-in; limit=0 → unlimited, no gating).
+	// --------------------------------------------------------------------
+	if deps.Config != nil {
+		inflightRelease, inflightErr := deps.Inflight.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
+		if inflightErr != nil {
+			return "", "", "", cpierrors.Retriable("attach_disk: in-flight limit exceeded or context cancelled on node %s: %s", node, inflightErr.Error())
+		}
+		defer inflightRelease()
+	}
+
+	// --------------------------------------------------------------------
+	// 5–8. Shared attach core: slot choice, perf merge + invariants, the
+	// reassignment transfer or config PUT, confirmation, and the sentinel
+	// CID record. create_vm's disk_cids pre-attach runs the identical
+	// sequence (see attachDiskCore).
+	// --------------------------------------------------------------------
+	diskID, devicePath, err := attachDiskCore(ctx, deps, "attach_disk", vmCID, node, vmid, diskCID, rd, plan)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	return node, diskID, devicePath, nil
 }
 
 // attachDiskCore is the shared attach sequence used by attach_disk and by

@@ -188,8 +188,8 @@ func TestEnsureAntiAffinityWritesHashedRuleWithMarkers(t *testing.T) {
 	if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker() {
 		t.Errorf("rule comment = %q; want the ownership marker", got)
 	}
-	if got := stub.resComments["vm:101"]; got != aaIdent("web").marker() {
-		t.Errorf("resource comment = %q; want the ownership marker", got)
+	if _, wrote := stub.resComments["vm:101"]; wrote {
+		t.Error("the anti-affinity writer must not write the HA resource; the staging order owns it")
 	}
 }
 
@@ -324,7 +324,7 @@ func TestApplyAntiAffinityMembershipSkipsWithoutDirectorUUID(t *testing.T) {
 	deps := aaDeps(stub)
 	deps.Config = aaMembershipConfig("off", false, 1)
 	deps.RequestDirectorUUID = ""
-	if err := applyAntiAffinityMembership(context.Background(), deps, 101, aaEnvForWebGroup(), log.NewNopLogger()); err != nil {
+	if err := aaApply(context.Background(), deps, 101, aaEnvForWebGroup(), log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(stub.rules) != 0 || len(stub.resources) != 0 {
@@ -414,13 +414,13 @@ func TestEnsureNodeAffinityPinWritesMarkers(t *testing.T) {
 		log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := haIdentity{Owner: aaDirector}.marker()
+	want := ha.WithVolumeRecord(haIdentity{Owner: aaDirector}.marker(), []string{testPinStorage})
 	rule := stub.rules["bosh-na-100"]
 	if rule.Comment == nil || *rule.Comment != want {
 		t.Errorf("rule comment = %v; want %q", rule.Comment, want)
 	}
-	if got := stub.resComments["vm:100"]; got != want {
-		t.Errorf("resource comment = %q; want %q", got, want)
+	if _, wrote := stub.resComments["vm:100"]; wrote {
+		t.Error("the pin writer must not write the HA resource; the staging order owns it")
 	}
 }
 
@@ -433,8 +433,9 @@ func TestEnsureNodeAffinityPinAddsMarkerToUnmarkedRule(t *testing.T) {
 		log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := stub.rules["bosh-na-100"].Comment; got == nil || *got != (haIdentity{Owner: aaDirector}).marker() {
-		t.Errorf("rule comment = %v; want the marker", got)
+	want := ha.WithVolumeRecord(haIdentity{Owner: aaDirector}.marker(), []string{testPinStorage})
+	if got := stub.rules["bosh-na-100"].Comment; got == nil || *got != want {
+		t.Errorf("rule comment = %v; want the marker with the volume record", got)
 	}
 }
 
