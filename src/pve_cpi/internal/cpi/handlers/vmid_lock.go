@@ -116,6 +116,15 @@ func withVMIDLock(
 	// justify. The parker and anti-affinity locks share the sentinel mechanism
 	// but not this reasoning, because a double holder there races disk moves
 	// or places two instances on one node.
+	//
+	// The VMID claim (see withVMIDClaim) takes this lock too, and it gates the
+	// deferred-teardown sweep's destroys, so the overlap above can also put two
+	// disposals on one VM. That is harmless as well. Each disposal re-reads
+	// the VM's authoritative config and ownership before it acts, the teardown
+	// steps are idempotent, and the destroy proves the VM absent, so the
+	// second one finds the VM gone or defers. A create cannot be the second
+	// holder of a claim on a VM that exists, because PVE refuses a clone or
+	// import onto a VMID in use.
 	handle, err := pve.AcquireClusterLock(ctx, pools, lockName, pve.ProcessLockOwner(owner), vmidLockTTLNow(), vmidLockTimeout)
 	if err != nil {
 		if errors.Is(err, pve.ErrClusterLockTimeout) {

@@ -121,10 +121,13 @@ func withBirthTag(tags, tag string) (string, []string) {
 // deferredTeardownAge is how old a birth tag must be before the sweep looks
 // at its VM: the create_vm operation timeout plus the HA motion wait. The age
 // is a settling delay that keeps the sweep from claiming fresh creates on
-// every request. It is not what proves a create abandoned, because nothing
-// enforces the create timeout when the operation-timeout envelope is off. The
-// proof is the VMID claim: a create holds it until it has finished or rolled
-// back, and the sweep skips any VM whose claim another process holds.
+// every request. It is not what proves a create abandoned. The proof is the
+// VMID claim: a create holds it until it has finished or rolled back, and the
+// sweep skips any VM whose claim another process holds. The create's claim is
+// sized from the same create timeout, which bounds the create even with the
+// operation-timeout envelope off, so a crashed create's claim lapses the
+// rollback budget and the lock margin after that timeout, close to when its
+// birth tag reaches this age.
 func deferredTeardownAge(deps Deps) time.Duration {
 	return time.Duration(deps.Config.OperationTimeoutCreateSec()+deps.Config.HAMotionWaitSecValue()) * time.Second
 }
@@ -253,8 +256,10 @@ func sweepContext(ctx context.Context) (context.Context, context.CancelFunc) {
 //   - Best-effort: every failure is logged, never propagated.
 //   - Bounded: at most sweepStragglersMaxPerSweep teardowns and
 //     sweepClaimAttemptsMaxPerSweep claim attempts, within its budget.
-//   - Fail-closed: without a pool service there is no claim to take, so
-//     nothing is swept. An index row is re-checked on the VM's authoritative
+//   - Fail-closed: without a pool service there is no claim to take, and
+//     when PVE refuses the claim for lack of permission no claim can be
+//     taken, so nothing is swept either way. Any other claim failure leaves
+//     that VM for the next sweep. An index row is re-checked on the VM's authoritative
 //     config, a VM the allocation journal names is left to the journal, and
 //     a VM the protocol cannot prove safe to destroy is left as it is.
 func sweepDeferredTeardowns(ctx context.Context, deps Deps, logger *log.Logger) {
@@ -308,6 +313,10 @@ func sweepDeferredTeardowns(ctx context.Context, deps Deps, logger *log.Logger) 
 	}
 	sweepCtx, cancel := sweepContext(ctx)
 	defer cancel()
+	// The sweep takes claims of its own. A claim set the caller's context
+	// carried would let withVMIDClaim reuse a claim the caller holds, so the
+	// sweep drops it, and a VM the caller claims reads as held like any other.
+	sweepCtx = context.WithValue(sweepCtx, vmidClaimSetKey{}, (*vmidClaimSet)(nil))
 	processed, attempts, deferred := 0, 0, 0
 	for _, row := range rows {
 		vmid := int(row.VMID.Int())
@@ -319,15 +328,9 @@ func sweepDeferredTeardowns(ctx context.Context, deps Deps, logger *log.Logger) 
 			continue
 		}
 		sweepLogger := logger.With(log.String("node", row.Node), log.String("vmid", strconv.Itoa(vmid)))
-		// A VM this request claims is the one it is creating or disposing
-		// of right now. Never sweep it from under the request itself.
-		if _, held := heldVMIDClaimWindow(sweepCtx, vmid); held {
-			sweepLogger.Debug("deferred teardown sweep: this request claims the VM; leaving it")
-			continue
-		}
 		attempts++
 		tornDown := false
-		claimErr := withVMIDClaim(sweepCtx, deps, vmid, "deferred-teardown-sweep/"+strconv.Itoa(vmid), false, sweepLogger,
+		claimErr := withVMIDClaim(sweepCtx, deps, vmid, "deferred-teardown-sweep/"+strconv.Itoa(vmid), claimForSweep, sweepLogger,
 			func(claimCtx context.Context) error {
 				tornDown = true
 				sweepDeferredTeardown(claimCtx, deps, row, queue, sweepLogger)
@@ -341,6 +344,13 @@ func sweepDeferredTeardowns(ctx context.Context, deps Deps, logger *log.Logger) 
 		case isVMIDClaimHeld(claimErr):
 			sweepLogger.Info("deferred teardown sweep: another process claims the VM, so its create or disposal is "+
 				"still running; leaving it", log.Err(claimErr))
+		case pve.IsClusterLockPermissionRefused(claimErr):
+			// Every claim this sweep tries would draw the same refusal, and
+			// without a claim no queued VM can be proven abandoned.
+			logger.Warn("deferred teardown sweep: PVE refused the VMID claim for lack of permission, so no claim can "+
+				"prove a queued VM abandoned; the sweep destroys nothing. Grant Pool.Allocate and Pool.Audit on /pool "+
+				"so the CPI can create bosh-lock-vm-<vmid>", log.Int("queued", len(rows)), log.Err(claimErr))
+			return
 		default:
 			sweepLogger.Warn("deferred teardown sweep: could not claim the VM; leaving it for the next sweep (non-fatal)",
 				log.Err(claimErr))

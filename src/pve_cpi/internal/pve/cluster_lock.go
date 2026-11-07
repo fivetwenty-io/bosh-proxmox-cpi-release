@@ -1140,6 +1140,20 @@ var ErrClusterLockClaimTooShort = errors.New("cluster lock claim confirmed too l
 // work unserialized.
 var ErrClusterLockCreateRefused = errors.New("cluster lock create refused")
 
+// IsClusterLockPermissionRefused reports whether err is an acquire whose
+// sentinel create PVE refused for lack of permission, which is
+// ErrClusterLockCreateRefused carrying an HTTP 403. It is narrower than
+// ErrClusterLockCreateRefused, which also matches a 400 for a pool name PVE
+// rejects or a 401 for a token it no longer accepts. A caller that may run
+// unserialized only when the token lacks the grant checks this instead.
+func IsClusterLockPermissionRefused(err error) bool {
+	if !errors.Is(err, ErrClusterLockCreateRefused) {
+		return false
+	}
+	code, ok := apiHTTPCode(err)
+	return ok && code == 403
+}
+
 // ErrClusterLockTimeout marks the acquire that ran out its timeout waiting for a
 // holder that was live on every attempt. It is distinct from every other acquire
 // failure: an expired or unreadable holder is stolen rather than waited on, so a

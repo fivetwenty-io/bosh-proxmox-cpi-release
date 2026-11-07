@@ -30,7 +30,7 @@ func TestWithVMIDClaim_HoldsTheClaimForTheWorkAndReleasesIt(t *testing.T) {
 	logger := log.NewNopLogger()
 
 	ran := false
-	err := withVMIDClaim(crhCtx(), deps, 100, "delete_vm/100", true, logger, func(ctx context.Context) error {
+	err := withVMIDClaim(crhCtx(), deps, 100, "delete_vm/100", claimForDisposal, logger, func(ctx context.Context) error {
 		ran = true
 		if !pools.held(100) {
 			t.Error("the claim must be held while the work runs")
@@ -63,8 +63,8 @@ func TestWithVMIDClaim_NestedClaimAndLockReuseTheOuterClaim(t *testing.T) {
 	logger := log.NewNopLogger()
 
 	nestedRan, lockRan := false, false
-	err := withVMIDClaim(crhCtx(), deps, 100, "create_vm/100", true, logger, func(ctx context.Context) error {
-		if err := withVMIDClaim(ctx, deps, 100, "create_vm-rollback/100", true, logger, func(context.Context) error {
+	err := withVMIDClaim(crhCtx(), deps, 100, "create_vm/100", claimForDisposal, logger, func(ctx context.Context) error {
+		if err := withVMIDClaim(ctx, deps, 100, "create_vm-rollback/100", claimForDisposal, logger, func(context.Context) error {
 			nestedRan = true
 			return nil
 		}); err != nil {
@@ -92,7 +92,7 @@ func TestWithVMIDClaim_TryOnceLeavesALiveHolderAlone(t *testing.T) {
 	deps := claimDeps(pools)
 
 	ran := false
-	err := withVMIDClaim(crhCtx(), deps, 100, "deferred-teardown-sweep/100", false, log.NewNopLogger(),
+	err := withVMIDClaim(crhCtx(), deps, 100, "deferred-teardown-sweep/100", claimForSweep, log.NewNopLogger(),
 		func(context.Context) error {
 			ran = true
 			return nil
@@ -114,7 +114,7 @@ func TestWithVMIDClaim_TryOnceStealsAnExpiredClaim(t *testing.T) {
 	deps := claimDeps(pools)
 
 	ran := false
-	err := withVMIDClaim(crhCtx(), deps, 100, "deferred-teardown-sweep/100", false, log.NewNopLogger(),
+	err := withVMIDClaim(crhCtx(), deps, 100, "deferred-teardown-sweep/100", claimForSweep, log.NewNopLogger(),
 		func(context.Context) error {
 			ran = true
 			return nil
@@ -130,7 +130,7 @@ func TestWithVMIDClaim_ClosedWindowRunsNothing(t *testing.T) {
 	ctx := vmidClaimContextWithWindow(crhCtx(), 100, time.Now().Add(-time.Second))
 
 	ran := false
-	err := withVMIDClaim(ctx, deps, 100, "delete_vm/100", true, log.NewNopLogger(), func(context.Context) error {
+	err := withVMIDClaim(ctx, deps, 100, "delete_vm/100", claimForDisposal, log.NewNopLogger(), func(context.Context) error {
 		ran = true
 		return nil
 	})
@@ -151,7 +151,7 @@ func TestWithVMIDClaim_ClosedWindowRunsNothing(t *testing.T) {
 
 func TestWithVMIDClaim_NoPoolServiceRunsUnclaimed(t *testing.T) {
 	ran := false
-	err := withVMIDClaim(crhCtx(), claimDeps(nil), 100, "delete_vm/100", true, log.NewNopLogger(),
+	err := withVMIDClaim(crhCtx(), claimDeps(nil), 100, "delete_vm/100", claimForDisposal, log.NewNopLogger(),
 		func(context.Context) error {
 			ran = true
 			return nil
@@ -165,10 +165,14 @@ func TestRunCreateAttempt_ClaimsEachCandidateAndReleasesOnFailure(t *testing.T) 
 	pools := newExclusiveLockPools()
 	deps := claimDeps(pools)
 	logger := log.NewNopLogger()
-	ctx, releaseClaims := bindCreateVMIDClaims(context.Background(), logger)
+	budget := createVMIDClaimBudget(deps)
+	if budget != 30*time.Minute {
+		t.Fatalf("the create budget must default to operation_timeout.create_sec's 1800s, got %v", budget)
+	}
+	ctx, releaseClaims := bindCreateVMIDClaims(context.Background(), budget, logger)
 
 	dl, ok := ctx.Deadline()
-	if !ok || time.Until(dl) > createVMIDClaimBodyBudget || time.Until(dl) < createVMIDClaimBodyBudget-time.Minute {
+	if !ok || time.Until(dl) > budget || time.Until(dl) < budget-time.Minute {
 		t.Fatalf("a create with no deadline must be bounded by the body budget; deadline %v, ok %v", dl, ok)
 	}
 
@@ -202,7 +206,9 @@ func TestRunCreateAttempt_ClaimsEachCandidateAndReleasesOnFailure(t *testing.T) 
 		t.Fatalf("the create's claim must outlast its deadline plus the rollback; expiry %v, deadline %v", exp, dl)
 	}
 
-	releaseClaims()
+	if err := releaseClaims(nil); err != nil {
+		t.Fatalf("a create that succeeded must stay a success, got %v", err)
+	}
 	if pools.held(202) {
 		t.Fatal("the create's release must give up every claim it holds")
 	}
@@ -220,11 +226,17 @@ func TestVMIDClaimTTLs(t *testing.T) {
 	if got := disposalClaimTTL(ctx); got < 2*time.Hour {
 		t.Fatalf("a disposal's claim must cover its request, got %v", got)
 	}
-	if got := createClaimTTL(ctx); got < 2*time.Hour+rollbackCleanupTimeout {
+	if got := createClaimTTL(ctx, 30*time.Minute); got < 2*time.Hour+rollbackCleanupTimeout {
 		t.Fatalf("a create's claim must cover its request and the rollback, got %v", got)
 	}
-	if got := createClaimTTL(context.Background()); got < createVMIDClaimBodyBudget+rollbackCleanupTimeout {
-		t.Fatalf("a create without a deadline must be covered for the body budget, got %v", got)
+	budget := 30 * time.Minute
+	got := createClaimTTL(context.Background(), budget)
+	if got < budget+rollbackCleanupTimeout {
+		t.Fatalf("a create without a deadline must be covered for its budget, got %v", got)
+	}
+	if got > budget+rollbackCleanupTimeout+vmidLockTTLMargin+time.Second {
+		t.Fatalf("a create without a deadline must be claimed for its budget, not longer, so a crash's claim "+
+			"lapses soon; got %v", got)
 	}
 }
 

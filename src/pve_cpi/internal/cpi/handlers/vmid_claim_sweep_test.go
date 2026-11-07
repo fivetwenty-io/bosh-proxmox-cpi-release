@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
@@ -21,9 +23,13 @@ import (
 
 // exclusiveClaimPools is a pool service whose create refuses a pool that
 // already exists, the way PVE does, so two VMID claims exclude each other.
+//
+// With refuseLocks set, it answers every lock-pool create with the 403 that a
+// token without Pool.Allocate on /pool draws, and it creates other pools.
 type exclusiveClaimPools struct {
-	mu    sync.Mutex
-	pools map[string]string
+	mu          sync.Mutex
+	pools       map[string]string
+	refuseLocks bool
 }
 
 func newExclusiveClaimPools() *exclusiveClaimPools {
@@ -39,6 +45,10 @@ func (p *exclusiveClaimPools) PoolHasVM(context.Context, string, int64) (bool, e
 func (p *exclusiveClaimPools) CreatePool(_ context.Context, poolID, comment string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.refuseLocks && strings.HasPrefix(poolID, "bosh-lock-") {
+		return sdkerrors.ParseAPIError(403, []byte(`{"data":null,"message":"Permission check failed (/pool/`+poolID+
+			`, Pool.Allocate)\n"}`))
+	}
 	if _, ok := p.pools[poolID]; ok {
 		return fmt.Errorf("pool '%s' already exists", poolID)
 	}
@@ -330,5 +340,99 @@ func TestCreateVM_ReleasesTheClaimOfAFailedClone(t *testing.T) {
 	}
 	if !pools.empty() {
 		t.Fatal("a failed create must release every claim it took")
+	}
+}
+
+// TestDeleteVM_RefusedClaimDeletesUnclaimedAndSweepsNothing covers a token
+// without Pool.Allocate on the lock pools. Its delete_vm still destroys the VM,
+// without a claim, and its sweep destroys nothing, because no claim can prove
+// the queued VM abandoned.
+func TestDeleteVM_RefusedClaimDeletesUnclaimedAndSweepsNothing(t *testing.T) {
+	pools := newExclusiveClaimPools()
+	pools.refuseLocks = true
+	f := newClaimSweepFixture(t, "bosh-cpi;bosh-creating-1000", pools)
+
+	f.deleteVM(t, 810)
+	if f.destroyed(810) != 1 {
+		t.Fatal("a refused claim must not stop the delete of the VM itself")
+	}
+	if got := f.destroyed(claimSweepStraggler); got != 0 {
+		t.Fatalf("the sweep must destroy nothing without a claim; %d destroys", got)
+	}
+}
+
+// TestCreateVM_RefusedClaimCreatesAndRollsBackUnclaimed covers the same token
+// on create_vm. A create succeeds without the claim, and a create that fails
+// after its VM exists still rolls the VM back.
+func TestCreateVM_RefusedClaimCreatesAndRollsBackUnclaimed(t *testing.T) {
+	args := mkArgs("agent-claim-refused", testStemcellCID, map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	t.Run("a create succeeds", func(t *testing.T) {
+		pools := newExclusiveClaimPools()
+		pools.refuseLocks = true
+		deps := buildVMDeps(&vmMockQEMU{}, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{})
+		deps.PVE.(*mockPVEClient).poolsSvc = pools
+		if _, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx("claim-refused")); err != nil {
+			t.Fatalf("a refused claim must not fail the create: %v", err)
+		}
+	})
+
+	t.Run("a failed create rolls back", func(t *testing.T) {
+		pools := newExclusiveClaimPools()
+		pools.refuseLocks = true
+		q := &vmMockQEMU{startFn: func(context.Context, string, int) (string, error) {
+			return "", fmt.Errorf("simulated start failure")
+		}}
+		n := &vmMockNodes{}
+		deps := buildVMDeps(q, n, &vmMockCluster{}, &vmMockAgent{})
+		deps.PVE.(*mockPVEClient).poolsSvc = pools
+		if _, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx("claim-refused-rb")); err == nil {
+			t.Fatal("the start failure must fail the create")
+		}
+		if len(n.deleteQemuCalls) != 1 {
+			t.Fatalf("the rollback must destroy the VM without a claim; %d destroys", len(n.deleteQemuCalls))
+		}
+	})
+}
+
+// TestCreateVM_PanicRollsBackUnderTheClaimAndReleasesIt pins the panic path.
+// rollbackOnExit destroys the VM and panics again, and the release, deferred
+// ahead of it, still runs, so a panicking create never leaves a claim behind.
+func TestCreateVM_PanicRollsBackUnderTheClaimAndReleasesIt(t *testing.T) {
+	pools := newExclusiveClaimPools()
+	q := &vmMockQEMU{startFn: func(context.Context, string, int) (string, error) {
+		panic("simulated start panic")
+	}}
+	heldAtDestroy := false
+	n := &vmMockNodes{deleteQemuFn: func(_ context.Context, _, vmid string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+		id, err := strconv.Atoi(vmid)
+		if err != nil {
+			return nil, err
+		}
+		heldAtDestroy = pools.held(id)
+		return &nodes.DeleteQemuResponse{}, nil
+	}}
+	deps := buildVMDeps(q, n, &vmMockCluster{}, &vmMockAgent{})
+	deps.PVE.(*mockPVEClient).poolsSvc = pools
+	args := mkArgs("agent-claim-panic", testStemcellCID, map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	recovered := func() (r any) {
+		defer func() { r = recover() }()
+		_, _ = handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx("claim-panic"))
+		return nil
+	}()
+	if recovered == nil {
+		t.Fatal("the panic must propagate after the rollback")
+	}
+	if len(n.deleteQemuCalls) != 1 || !heldAtDestroy {
+		t.Fatalf("the rollback must destroy the VM while the create still claims it; destroys %d, held %v",
+			len(n.deleteQemuCalls), heldAtDestroy)
+	}
+	if !pools.empty() {
+		t.Fatal("a panicking create must still release its claim")
 	}
 }

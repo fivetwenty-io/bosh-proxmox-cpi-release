@@ -32,11 +32,16 @@ func vmidClaimContextWithWindow(ctx context.Context, vmid int, windowEnd time.Ti
 
 // exclusiveLockPools is a pool service whose create refuses a pool that
 // already exists, the way PVE does, so two claims on one VMID exclude each
-// other the way they do against a cluster.
+// other the way they do against a cluster. createErr, when set, answers every
+// create, and deleteErrs answers the next deletes in order before they go
+// through.
 type exclusiveLockPools struct {
-	mu      sync.Mutex
-	pools   map[string]string
-	creates int
+	mu         sync.Mutex
+	pools      map[string]string
+	creates    int
+	deletes    int
+	createErr  error
+	deleteErrs []error
 }
 
 func newExclusiveLockPools() *exclusiveLockPools {
@@ -53,6 +58,9 @@ func (p *exclusiveLockPools) CreatePool(_ context.Context, poolID, comment strin
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.creates++
+	if p.createErr != nil {
+		return p.createErr
+	}
 	if _, ok := p.pools[poolID]; ok {
 		return fmt.Errorf("pool '%s' already exists", poolID)
 	}
@@ -63,6 +71,12 @@ func (p *exclusiveLockPools) CreatePool(_ context.Context, poolID, comment strin
 func (p *exclusiveLockPools) DeletePool(_ context.Context, poolID string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.deletes++
+	if len(p.deleteErrs) > 0 {
+		err := p.deleteErrs[0]
+		p.deleteErrs = p.deleteErrs[1:]
+		return err
+	}
 	if _, ok := p.pools[poolID]; !ok {
 		return fmt.Errorf("pool '%s' does not exist", poolID)
 	}

@@ -680,9 +680,11 @@ func createVM(
 	// and stays claimed until the create returns, its rollback included, so
 	// the deferred-teardown sweep never takes a VM this create still owns.
 	// The release is deferred here, ahead of the rollback arms below, so it
-	// runs after them.
-	ctx, releaseClaims := bindCreateVMIDClaims(ctx, logger)
-	defer releaseClaims()
+	// runs after them. With the operation-timeout envelope off, the create is
+	// bounded at its create_sec budget so the claim has an expiry, and a create
+	// that bound cuts off returns a retriable error.
+	ctx, releaseClaims := bindCreateVMIDClaims(ctx, createVMIDClaimBudget(deps), logger)
+	defer func() { retErr = releaseClaims(retErr) }()
 
 	if fallbackMax > 0 && parsed.storagePlan == nil {
 		return createVMWithFallback(ctx, deps, logger, parsed, fallbackMax, &retErr)
@@ -2412,12 +2414,18 @@ func addBirthTag(shape *createVMShape, now time.Time, logger *log.Logger) {
 // the read, such as a set_vm_metadata call, an HA rule edit, or PVE itself.
 const birthTagDigestAttempts = 3
 
+// birthTagDigestRetryPause is the pause before removeBirthTag reads the config
+// again after a digest refusal, so a writer that is still changing the config
+// has time to finish.
+const birthTagDigestRetryPause = 150 * time.Millisecond
+
 // removeBirthTag removes every birth tag from the VM's tags through
 // pve.MutateVMConfig, so the write survives a migration that starts mid-call.
 // The write carries the config digest it read, so it never overwrites a tag
 // change that landed in between, and a config without a birth tag is left
-// alone. A digest refusal proves the write changed nothing, so it reads the
-// config again and resends, up to birthTagDigestAttempts times. Any other
+// alone. A digest refusal proves the write changed nothing, so it pauses for
+// birthTagDigestRetryPause, reads the config again, and resends, up to
+// birthTagDigestAttempts times. Any other
 // failure, and a refusal on the last attempt, is returned, wrapped as a CPI
 // error. The create then fails and rolls back, because a VM that kept its
 // birth tag would be queued for teardown once the create released its claim.
@@ -2434,8 +2442,14 @@ func removeBirthTag(ctx context.Context, deps Deps, node string, vmid int, logge
 				if err = removeBirthTagOnce(ctx, deps, node, vmid); err == nil || !pve.IsConfigDigestRefusal(err) {
 					return err
 				}
+				if attempt == birthTagDigestAttempts {
+					break
+				}
 				logger.Info("create_vm: another writer changed the config before the birth tag write; reading it again",
 					log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Int("attempt", attempt), log.Err(err))
+				if sleepErr := sleepOrDone(ctx, birthTagDigestRetryPause); sleepErr != nil {
+					return err
+				}
 			}
 			return err
 		},

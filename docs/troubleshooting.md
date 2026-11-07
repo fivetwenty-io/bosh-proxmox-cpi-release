@@ -530,6 +530,8 @@ pvesh delete /pools --poolid bosh-lock-vm-4242
 
 Deleting the pool while the process that holds it is still alive lets two writers into the VM's metadata at the same time, which is exactly what the lock exists to prevent. Each writer reads the tags and rewrites them, and whichever writes last silently drops the other's changes. We never delete the pool on a guess.
 
+The VMID claim that `create_vm`, `delete_vm`, the `create_vm` rollback, and the deferred-teardown sweep hold uses the same pool name. Its claim names `create_vm/<vmid>`, `delete_vm/<vmid>`, `create_vm-rollback/<vmid>`, or `deferred-teardown-sweep/<vmid>`. A delete's claim lasts about 25 minutes, or the request's deadline when that is longer, and a create's claim lasts `pve.operation_timeout.create_sec` plus about 12 minutes. While a claim that a dead process left behind stands, `delete_vm` of that VM fails with the error above, and the sweep leaves the VM alone. We clear it with the same checks and the same two commands. Deleting a claim whose create is still running lets the sweep destroy a VM that the create is still building, so we confirm that the process is gone first here too.
+
 A parker's protection lock uses the same pool name. Its claim names a parker operation such as `transfer_out/90000`, and it lasts just under four minutes on the shipped retry settings, longer when `pve.retry` lengthens the curves, so we let it lapse rather than delete it.
 
 ### Every create_vm times out reaching the PVE API

@@ -333,11 +333,13 @@ func managedDeleteVMError(err error) error {
 // takes the VMID while the cleanups that key on it still run. A claim that
 // another process keeps holding returns a retriable error naming the holder.
 // The delete must finish inside the claim's window, which is the request's
-// deadline or, without one, a little under vmidLockTTL.
+// deadline or, without one, a little under vmidLockTTL, and a delete the window
+// cuts off fails retriably. A claim PVE refuses for lack of permission lets
+// the delete run unclaimed.
 func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCID) (any, error) {
 	vmid := cid.VMID
 	var result any
-	err := withVMIDClaim(ctx, deps, vmid, "delete_vm/"+strconv.Itoa(vmid), true, deps.Log(ctx),
+	err := withVMIDClaim(ctx, deps, vmid, "delete_vm/"+strconv.Itoa(vmid), claimForDisposal, deps.Log(ctx),
 		func(claimCtx context.Context) error {
 			var inner error
 			result, inner = deleteLegacyVMClaimed(claimCtx, deps, vmCID, cid)

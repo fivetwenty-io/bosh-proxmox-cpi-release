@@ -771,6 +771,43 @@ func TestAcquireClusterLock_DeniedCreateIsMarkedRefused(t *testing.T) {
 	}
 }
 
+// TestIsClusterLockPermissionRefused pins that only a create PVE refused with
+// a 403 counts as a permission refusal. Another 4xx is a refused create too,
+// but not one that says the token lacks the grant.
+func TestIsClusterLockPermissionRefused(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		status int
+		body   string
+		want   bool
+	}{
+		"403 missing Pool.Allocate": {403, `{"data":null,"message":"Permission check failed (/pool/bosh-lock-web, Pool.Allocate)\n"}`, true},
+		"400 bad pool name":         {400, `{"data":null,"message":"invalid pool name\n"}`, false},
+		"401 token rejected":        {401, `{"data":null,"message":"authentication failure\n"}`, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newFakeLockPools()
+			f.createFn = func(string, string) error { return sdkerrors.ParseAPIError(tc.status, []byte(tc.body)) }
+			_, err := acquireClusterLockWithClock(context.Background(), f, "web", "me", time.Minute, 30*time.Second,
+				fixedClock(time.Unix(1000, 0), time.Second))
+			if !errors.Is(err, ErrClusterLockCreateRefused) {
+				t.Fatalf("want a refused create, got %v", err)
+			}
+			if got := IsClusterLockPermissionRefused(err); got != tc.want {
+				t.Fatalf("IsClusterLockPermissionRefused = %v, want %v (err %v)", got, tc.want, err)
+			}
+		})
+	}
+	if IsClusterLockPermissionRefused(sdkerrors.ParseAPIError(403, []byte(`{"data":null,"message":"denied\n"}`))) {
+		t.Fatal("a 403 that is not a refused lock create must not count")
+	}
+	if IsClusterLockPermissionRefused(nil) {
+		t.Fatal("nil is not a refusal")
+	}
+}
+
 // TestAcquireClusterLock_NotAttemptedCreateIsNotAbandoned covers a create the
 // client refused before it reached PVE, as a poisoned allocation guard does.
 // Nothing reached PVE, so the acquire reads and deletes nothing, and the error

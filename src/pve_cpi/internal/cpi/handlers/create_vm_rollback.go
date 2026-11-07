@@ -442,9 +442,10 @@ func stopVMForRollback(ctx context.Context, deps Deps, node string, vmid int, lo
 // create that claimed the VMID it reuses that claim. The middleware rollback
 // runs after the create has released it, so it takes the claim again, waiting
 // up to vmidLockTimeout. A claim it cannot take leaves the VM to the sweep,
-// which its birth tag queues it for.
+// which its birth tag queues it for. A claim PVE refuses for lack of
+// permission does not stop the rollback, which then runs unclaimed.
 func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
-	claimErr := withVMIDClaim(ctx, deps, vmid, "create_vm-rollback/"+strconv.Itoa(vmid), true, logger,
+	claimErr := withVMIDClaim(ctx, deps, vmid, "create_vm-rollback/"+strconv.Itoa(vmid), claimForDisposal, logger,
 		func(claimCtx context.Context) error {
 			cleanupVMClaimed(claimCtx, deps, node, vmid, env, logger)
 			return nil
