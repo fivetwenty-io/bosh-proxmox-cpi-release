@@ -416,3 +416,12 @@ func journalContradictionDetail(n int, probe pve.EmptyListingProbe) string {
 	}
 	return fmt.Sprintf("%d volumes allocated on the storage%s have no recorded delete", n, scope)
 }
+
+// BackendReplicaLookup is the resolver option that makes the local backends
+// replica-aware while the replicate local policy is configured. A replicated
+// VM's volumes carry the same volume ID on two nodes, and the lookup has to
+// return the copy on the node the owner VM runs on, never the replica. A nil
+// configuration, or any other policy, leaves the first-hit sweep in place.
+func BackendReplicaLookup(cfg *config.CPIConfig) pve.BackendResolverOption {
+	return pve.WithReplicaAwareLookup(cfg != nil && cfg.HALocalPolicyValue() == config.HALocalPolicyReplicate)
+}

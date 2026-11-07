@@ -70,6 +70,7 @@ type teardownResult struct {
 //     preserve hook, which runs the guards that path has always run.
 //  4. Check on the owner node that the VM is stopped, holds no migrate lock,
 //     and that the caller's ownership check still passes on both config views.
+//     A VM with the replicate tag then has its replication job retired.
 //  5. Destroy with purge=1 and the caller's lock recovery.
 //  6. Await the destroy task and prove the VM absent from every member and
 //     from PVE HA. A task whose answer is an error is re-read before the run
@@ -241,7 +242,13 @@ func (t *vmTeardown) verifyBeforeDestroy(ctx context.Context, deps Deps) (bool, 
 			log.Int(metadataKeyVMID, t.vmid), log.String("node", t.node))
 		return false, migrationLockDeferral(t.caller, t.vmid, t.node)
 	}
-	return false, t.owned(ctx, holding)
+	if err := t.owned(ctx, holding); err != nil {
+		return false, err
+	}
+	// The destroy's purge would drop a replication job without cleanup, so
+	// the job of a replicate VM is retired first, once the VM is stopped and
+	// proven this Director's.
+	return false, retireTornDownReplica(ctx, deps, t.logger, t.caller, t.vmid, t.node, holding.Config, nil)
 }
 
 // confirmGone proves the VM absent after a step on its node answered that the

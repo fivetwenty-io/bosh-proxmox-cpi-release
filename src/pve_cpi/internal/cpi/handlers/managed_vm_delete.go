@@ -845,6 +845,25 @@ func managedVMRollbackFailure(handle *aj.Handle, err error) error {
 	return joinReconciliation(describeStorageListingFailure(err), storageAllocationUncertain(handle, "VM create rollback"))
 }
 
+// retireManagedVMReplica retires the replication job of a stopped managed VM
+// before its destroy, for a VM whose record is replicated or whose config
+// carries the replicate tag (see retireTornDownReplica). The destroy's purge
+// would drop the job without cleanup, and the record keeps any copy a dead
+// partner leaves as an orphan.
+func retireManagedVMReplica(ctx context.Context, deps Deps, handle *aj.Handle, node string, vmid int) error {
+	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if err != nil {
+		// A replicated record names the job's volumes itself, so only a VM
+		// whose tag is the sole sign of a job needs the config.
+		if handle == nil || handle.Record().Replication == nil {
+			return cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("delete_vm: read the config of VM %d for its replication job", vmid))
+		}
+		cfg = nil
+	}
+	return retireTornDownReplica(ctx, deps, deps.Log(ctx), "delete_vm", vmid, node, cfg, handle)
+}
+
 func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, record aj.Record, node string, vmid int, owned map[string]bool, retain, moved bool) ([]aj.Target, error) {
 	var err error
 	if node == "" {
@@ -882,6 +901,9 @@ func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, rec
 			return nil, err
 		}
 
+		if err := retireManagedVMReplica(ctx, deps, handle, node, vmid); err != nil {
+			return nil, err
+		}
 		if err := verifyManagedVMDestroyDevices(ctx, deps, record, node, vmid, owned); err != nil {
 			return nil, err
 		}

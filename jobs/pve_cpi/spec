@@ -161,9 +161,18 @@ properties:
       clone's base template stays on one node. An explicit clone_mode of
       "linked" keeps the linked clone and runs the VM without HA in auto mode,
       and fails create_vm in managed mode, as does a recorded storage plan that
-      already chose a linked clone there. "replicate" is not
-      available in this build, and setting it is rejected when the
-      configuration loads.
+      already chose a linked clone there. "replicate" registers a VM whose
+      volumes sit on node-local ZFS pool storage, creates a PVE storage
+      replication job that copies them to a partner node, and tags the VM
+      bosh-ha-replica. The pin names the VM's own node alone until the job
+      reports a sync that started more than five minutes after the last change
+      to the VM's volumes, with no error and a failure count of zero, and with
+      every volume on the partner. Only then does the pin name the partner too.
+      A failover to the partner loses every write made after the last sync, and
+      the next call that touches the VM narrows its pin to the partner.
+      delete_vm removes the job before the destroy, and when the partner is
+      offline it drops the job with force=1, which leaves the partner's copy
+      behind and logs the node and the volumes to remove by hand.
   pve.ha.anti_affinity:
     description: |
       Whether the CPI writes a negative resource-affinity rule for an instance

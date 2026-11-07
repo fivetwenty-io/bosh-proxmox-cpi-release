@@ -255,12 +255,24 @@ func TestHAConfig_AcceptsOnAndDLBWhenModeIsSet(t *testing.T) {
 	}
 }
 
-func TestHAConfig_RejectsPoliciesNotYetAvailable(t *testing.T) {
+func TestHAConfig_AcceptsTheReplicatePolicy(t *testing.T) {
 	t.Parallel()
 	for _, mode := range []string{"off", "auto", "managed"} {
-		block := fmt.Sprintf(`{"mode":%q,"local_policy":"replicate"}`, mode)
-		_, err := mustLoad(t, haJSON(block))
-		assertCloudError(t, err, `ha.local_policy "replicate" is not available in this build`)
+		block := fmt.Sprintf(`{"mode":%q,"local_policy":"replicate","replication":{"schedule":"*/15","rate_mbps":40}}`,
+			mode)
+		cfg, err := mustLoad(t, haJSON(block))
+		if err != nil {
+			t.Fatalf("mode %s with local_policy replicate must load: %v", mode, err)
+		}
+		if got := cfg.HALocalPolicyValue(); got != config.HALocalPolicyReplicate {
+			t.Errorf("mode %s: local policy = %q, want replicate", mode, got)
+		}
+		if got := cfg.HAReplicationScheduleValue(); got != "*/15" {
+			t.Errorf("mode %s: schedule = %q", mode, got)
+		}
+		if got := cfg.HAReplicationRateMbpsValue(); got != 40 {
+			t.Errorf("mode %s: rate = %d", mode, got)
+		}
 	}
 }
 
@@ -480,8 +492,9 @@ func TestApplyContextOverrides_HA_ValidatesTheMergedResult(t *testing.T) {
 		{"entry sets on under mode off", `{}`, map[string]any{"pin_az": "on"}, `ha.pin_az "on" requires pve.ha.mode`},
 		{"entry sets dlb under mode off", `{}`, map[string]any{"dlb": map[string]any{"enabled": true}},
 			`ha.dlb.enabled requires pve.ha.mode`},
-		{"replicate", `{"mode":"auto"}`, map[string]any{"local_policy": "replicate"},
-			`ha.local_policy "replicate" is not available in this build`},
+		{"replicate with a bad schedule", `{"mode":"auto"}`,
+			map[string]any{"local_policy": "replicate", "replication": map[string]any{"schedule": " "}},
+			`ha.replication.schedule must not be empty`},
 		{"motion wait", `{}`, map[string]any{"motion_wait_sec": 0}, `ha.motion_wait_sec must be between`},
 	}
 	for _, tc := range tests {

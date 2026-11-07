@@ -9,6 +9,7 @@ import (
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 
+	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
@@ -498,7 +499,9 @@ func (h *createdVMHA) runWithoutHA(ctx context.Context, reason string, start fun
 // forwarding, and the advertised routes, then writes the HA confinement, runs
 // the config-drive ISO check, and activates the staged VM. A VM PVE HA started
 // elsewhere has shape.node moved to its landing node, and an HA-managed VM
-// gets the bosh-ha-managed tag. The health gate runs last, on the VM's node.
+// gets the bosh-ha-managed tag. A VM under the replicate policy then gets its
+// replication job (see setUpCreatedReplica). The health gate runs last, on the
+// VM's node.
 func completeCreatedVM(
 	ctx context.Context, deps Deps, logger *log.Logger, parsed *createVMParsedArgs, shape *createVMShape, vmid int,
 	h *createdVMHA, start func(context.Context) error,
@@ -531,6 +534,13 @@ func completeCreatedVM(
 		if err := addHAManagedTag(ctx, deps, shape.node, vmid, logger); err != nil {
 			logger.Warn("create_vm: the bosh-ha-managed tag could not be written; the VM runs under PVE HA without it",
 				log.Int(metadataKeyVMID, vmid), log.String("node", shape.node), log.Err(err))
+		}
+		var handle *aj.Handle
+		if parsed.storageRuntime != nil {
+			handle = parsed.storageRuntime.handle
+		}
+		if err := setUpCreatedReplica(ctx, deps, logger, shape.node, vmid, h.decision, h.profile, handle); err != nil {
+			return err
 		}
 	}
 	if deps.Config.HealthCheckEnabled() {

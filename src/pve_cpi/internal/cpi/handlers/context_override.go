@@ -377,7 +377,8 @@ func (r *RequestOverrideRuntime) buildBundle(cfg *config.CPIConfig) (*overrideBu
 	// allocation journal of this bundle's own configuration, and PVE's status
 	// for the storage read through this bundle's own client.
 	backendResolver := pve.NewBackendResolver(client, storageInfoCache, cfg.Node,
-		pve.WithEmptyListingCorroborators(BackendCorroborators(cfg, client)))
+		pve.WithEmptyListingCorroborators(BackendCorroborators(cfg, client)),
+		BackendReplicaLookup(cfg))
 
 	return &overrideBundle{client: client, agent: bootAgent, resolver: backendResolver, nodeEndpoints: nodeEndpoints, iso: iso}, nil
 }

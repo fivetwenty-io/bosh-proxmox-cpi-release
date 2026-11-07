@@ -47,6 +47,9 @@ type DeadNodeReach struct {
 	Unplaceable []string
 	// Recorded holds the storages the pin's volume record names, sorted.
 	Recorded []string
+	// Replica names the partner whose verified replica of the VM's node-local
+	// volumes the pin records, empty when the pin records none.
+	Replica string
 }
 
 // PinnedToSource reports whether the VM's strict pin admits the dead node
@@ -67,7 +70,12 @@ func (r DeadNodeReach) PinnedToSource() bool {
 // configured node reaches them. The record names the storages of those
 // volumes, and the answer is also bounded by their reach in storages, with a
 // node-local storage counted as living on source. A VM with a node-local
-// volume therefore reaches source alone. A disabled pin, or one PVE reports
+// volume therefore reaches source alone, unless its strict pin records a
+// verified replica (ReplicaPartnerKey) on a partner the pin also names. The
+// CPI writes that token only with a pin it widened after a sync it verified,
+// and removes it before any volume change, so while it stands the partner
+// holds a recoverable copy of every node-local volume, and the partner's
+// reach of those volumes counts as well. A disabled pin, or one PVE reports
 // in error, still records the set, because neither moves a volume.
 //
 // The answer is an error, which the caller turns into a deferral, when the VM
@@ -136,6 +144,16 @@ func DeletionDestinations(
 		return out, fmt.Errorf("deletion destinations: the reach of the recorded storages %s: %w",
 			strings.Join(recorded, ","), err)
 	}
+	partner, fromReplica, err := replicaReach(pin, source, sid, members, recorded, storages)
+	if err != nil {
+		return out, err
+	}
+	out.Replica = partner
+	for _, n := range fromReplica {
+		if !slices.Contains(reachable, n) {
+			reachable = append(reachable, n)
+		}
+	}
 	admissible := slices.Clone(reachable)
 	if pin.Strict {
 		if _, named := pin.Nodes[source]; !named {
@@ -167,6 +185,32 @@ func DeletionDestinations(
 	sort.Strings(out.Destinations)
 	sort.Strings(out.Unplaceable)
 	return out, nil
+}
+
+// replicaReach returns the partner of a verified replica that the strict pin
+// records and names, with the reach of the recorded storages counted from
+// that partner. A pin with no such partner returns an empty answer.
+func replicaReach(
+	pin *Rule, source, sid string, members, recorded []string, storages pve.StorageInfoGetter,
+) (string, []string, error) {
+	partner, ok := ReplicaPartner(pin.Comment)
+	if !ok || !pin.Strict || partner == source || !slices.Contains(members, partner) {
+		return "", nil, nil
+	}
+	if _, named := pin.Nodes[partner]; !named {
+		return "", nil, nil
+	}
+	replicas := make([]pve.AccessVolume, 0, len(recorded))
+	for _, storage := range recorded {
+		replicas = append(replicas, pve.AccessVolume{Volume: storage + ":" + sid, HomeNode: partner})
+	}
+	// VolumeAccessSet reads the in-memory index the caller passes, so the
+	// background context never waits.
+	fromReplica, err := pve.VolumeAccessSet(context.Background(), storages, members, replicas)
+	if err != nil {
+		return "", nil, fmt.Errorf("deletion destinations: the reach of the replica on %s: %w", partner, err)
+	}
+	return partner, fromReplica, nil
 }
 
 // StorageIndex serves VolumeAccessSet from one read of the storage index, so

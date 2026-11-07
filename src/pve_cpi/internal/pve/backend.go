@@ -123,6 +123,9 @@ type resolver struct {
 	// package owns the journal while this package owns the proof. Nil means no
 	// corroboration, which is what every caller had before the option existed.
 	corroborate func() []EmptyListingCorroborator
+	// replicaAware turns on the replica-aware sweep of the local backends it
+	// builds (see WithReplicaAwareLookup).
+	replicaAware bool
 }
 
 // BackendResolverOption configures the production resolver at construction.
@@ -143,6 +146,16 @@ type BackendResolverOption func(*resolver)
 // behavior in place.
 func WithEmptyListingCorroborators(supply func() []EmptyListingCorroborator) BackendResolverOption {
 	return func(r *resolver) { r.corroborate = supply }
+}
+
+// WithReplicaAwareLookup makes the local backends sweep every node for a
+// volume on ZFS pool storage, or on storage of unknown type, and settle a
+// volume found on more than one node by the node its owner VM runs on. Storage
+// replication keeps the same volume ID on the job's target, so the first node
+// that holds the volume may hold the replica rather than the live copy. The
+// CPI turns it on while the replicate local policy is configured.
+func WithReplicaAwareLookup(enabled bool) BackendResolverOption {
+	return func(r *resolver) { r.replicaAware = enabled }
 }
 
 // NewBackendResolver builds the production resolver. The cache may be nil — in
@@ -182,7 +195,7 @@ func (r *resolver) Resolve(ctx context.Context, storage string) (Backend, error)
 				// listing to weigh and takes no corroborators.
 				return newSharedBackend(r.client, info, r.defaultNode), nil
 			}
-			return newLocalBackend(r.client, info, r.defaultNode, r.corroborate), nil
+			return r.local(info), nil
 		}
 		// StorageInfoCache.Get returns a non-nil error for two very different
 		// conditions: the storage genuinely absent from the PVE index (a plain
@@ -207,7 +220,16 @@ func (r *resolver) Resolve(ctx context.Context, storage string) (Backend, error)
 	// No cache configured or storage not found: treat as local. Tests that
 	// don't wire a resolver use NewStaticBackendResolver instead; this branch
 	// is for production lookups that miss.
-	return newLocalBackend(r.client, StorageInfo{Name: storage}, r.defaultNode, r.corroborate), nil
+	return r.local(StorageInfo{Name: storage}), nil
+}
+
+// local builds a local backend for info with the resolver's options.
+func (r *resolver) local(info StorageInfo) Backend {
+	b := newLocalBackend(r.client, info, r.defaultNode, r.corroborate)
+	if lb, ok := b.(*localBackend); ok {
+		lb.replicaAware = r.replicaAware
+	}
+	return b
 }
 
 // staticResolver is a deterministic resolver used by tests that don't exercise

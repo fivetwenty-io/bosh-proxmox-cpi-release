@@ -12,6 +12,9 @@ package pve
 
 import (
 	"context"
+	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -46,6 +49,11 @@ type localBackend struct {
 	liveOnce sync.Once
 	liveInfo StorageInfo
 	liveOK   bool
+	// replicaAware makes the sweep of a ZFS pool storage, or of a storage of
+	// unknown type, probe every node and resolve a volume found on more than
+	// one of them, because storage replication keeps a copy of the same
+	// volume ID on a second node (see WithReplicaAwareLookup).
+	replicaAware bool
 }
 
 func newLocalBackend(
@@ -135,6 +143,9 @@ func (l *localBackend) nodeForExisting(
 	// allocation journal reads a file on local disk to answer it, so building
 	// them per node would read that file once per node in the cluster.
 	corroborators := l.emptyListingCorroborators(extra)
+	if l.replicaAware && (l.info.Type == StorageTypeZFSPool || l.info.Type == "") {
+		return l.nodeForReplicatedVolume(ctx, volume, candidates, corroborators)
+	}
 
 	var lastProbeErr error
 
@@ -171,12 +182,71 @@ func (l *localBackend) nodeForExisting(
 	// has_disk into a false no, and detach_disk into a phantom
 	// already-detached. Any probe error with no hit is therefore retriable so
 	// the director re-drives the action once PVE recovers.
+	return "", sweepMissError(storage, volume, lastProbeErr)
+}
+
+// sweepMissError is the answer of a sweep that found the volume on no node.
+// DiskNotFound needs every node to have answered; any probe error makes the
+// miss retriable.
+func sweepMissError(storage, volume string, lastProbeErr error) error {
 	if lastProbeErr != nil {
-		return "", cpierrors.WrapAs(lastProbeErr, cpierrors.TypeRetriableCloud,
+		return cpierrors.WrapAs(lastProbeErr, cpierrors.TypeRetriableCloud,
 			"NodeForExisting: node probe(s) failed with no hit on the reachable nodes; cannot prove the volume absent")
 	}
+	return cpierrors.DiskNotFound(FormatDiskCID(storage, volume))
+}
 
-	return "", cpierrors.DiskNotFound(FormatDiskCID(storage, volume))
+// nodeForReplicatedVolume is the sweep of a storage that replication may
+// copy. It probes every candidate rather than stopping at the first hit. One
+// copy found with every node answering is the volume. Two or more copies, or
+// one copy while a node could not be asked, are settled by the node the
+// volume's owner VM runs on: the copy there is the live one. When the owner
+// is not on a node that holds a copy, the sweep cannot tell which copy is
+// live, and it returns an error rather than pick one: a retriable one when a
+// node could not be asked, and an ambiguity error otherwise.
+func (l *localBackend) nodeForReplicatedVolume(
+	ctx context.Context, volume string, candidates []string, corroborators []EmptyListingCorroborator,
+) (string, error) {
+	storage := l.info.Name
+	var hits []string
+	var lastProbeErr error
+	for _, node := range candidates {
+		absent, err := ProveVolumeAbsent(ctx, l.client, node, storage, volume, l.classifyStorage, corroborators...)
+		if err != nil {
+			lastProbeErr = err
+			continue
+		}
+		if !absent {
+			hits = append(hits, node)
+		}
+	}
+	switch {
+	case len(hits) == 0:
+		return "", sweepMissError(storage, volume, lastProbeErr)
+	case len(hits) == 1 && lastProbeErr == nil:
+		return hits[0], nil
+	}
+	owner, ok := volumeOwnerVMID(volume)
+	vmid, convErr := strconv.Atoi(owner)
+	if ok && convErr == nil {
+		node, found, err := FindVMNodeViaCluster(ctx, l.client, vmid)
+		if err != nil {
+			return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+				"NodeForExisting: volume %s:%s is on nodes %s, and the node of its owner VM %d could not be read",
+				storage, volume, strings.Join(hits, ","), vmid))
+		}
+		if found && slices.Contains(hits, node) {
+			return node, nil
+		}
+	}
+	if lastProbeErr != nil {
+		return "", cpierrors.WrapAs(lastProbeErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+			"NodeForExisting: volume %s:%s is on nodes %s, a node could not be asked, and its owner VM is on none "+
+				"of them; the CPI cannot tell which copy is live", storage, volume, strings.Join(hits, ",")))
+	}
+	return "", cpierrors.Cloud("NodeForExisting: volume %s:%s is on nodes %s, and its owner VM runs on none of "+
+		"them, so the CPI cannot tell which copy is live and acts on neither; remove the stale replica by hand",
+		storage, volume, strings.Join(hits, ","))
 }
 
 // emptyListingCorroborators orders the second opinions one sweep hands to an

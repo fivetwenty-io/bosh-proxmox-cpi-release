@@ -6,6 +6,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 
@@ -61,6 +62,10 @@ type attachHA struct {
 	// narrow holds the reads and writes of the barrier and of the removal
 	// from HA, wired to the VM's client.
 	narrow ha.NarrowDeps
+
+	// replicaChanged is when the attach changed a replicate VM's volume set,
+	// zero for any other VM.
+	replicaChanged time.Time
 }
 
 // decideAttachHA makes the attach-time HA decision for attaching the disk rd
@@ -135,15 +140,9 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 		return nil, cpierrors.Cloud("%s: the pin %s of VM %d carries another Director's ownership marker", op,
 			oldPin.ID, vmid)
 	}
-	// A barrier an earlier attach left part way must be finished, so only a
-	// resource with no pending barrier skips the decision. A legacy disk in
-	// managed mode never skips it, because the decision is what refuses a
-	// disk with no stable ID there.
 	legacyManaged := rd.stableID == "" && deps.Config.HAModeValue() == config.HAModeManaged
-	if oldPin != nil && !legacyManaged && !ha.NarrowPending(res.State, res.Comment) {
-		if recorded, ok := ha.VolumeRecord(oldPin.Comment); ok && slices.Contains(recorded, storage) {
-			return nil, nil
-		}
+	if attachSkipsHADecision(oldPin, res, storage, legacyManaged) {
+		return nil, nil
 	}
 
 	profile, err := resolveHAProfile(ctx, deps)
@@ -214,6 +213,13 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 		newPin, err := attachNewPin(d, oldPin, profile, set, ha.VolumeStorages(in.Volumes), owner)
 		if err != nil {
 			return nil, err
+		}
+		if d.Policy == ha.PolicyReplicate {
+			// The pin names the VM's node alone while the new disk has no
+			// replica, and it records when the volume set changed, which the
+			// next verified sync must follow.
+			h.replicaChanged = time.Now()
+			newPin.Comment = ha.WithReplicaChanged(ha.WithReplicaPartner(newPin.Comment, ""), h.replicaChanged)
 		}
 		h.action, h.newPin = attachHAGuarded, newPin
 	default:
@@ -489,7 +495,64 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 		SysConsole: h.profile.SysConsole,
 		Budget:     haMotionWait(h.deps),
 	})
-	return err
+	if err != nil || h.replicaChanged.IsZero() {
+		return err
+	}
+	h.widenReplica(ctx, landed)
+	return nil
+}
+
+// widenReplica requests a sync of a replicate VM after the attach and widens
+// its pin when the sync is verified within the HA motion wait. The attach is
+// done either way: a replica that is not verified yet leaves the source-only
+// pin, which a later call that touches the VM widens. A VM whose journal
+// record must carry the evidence is left to that later call, because the
+// attach of a managed disk holds the disk's record and the VM's record is
+// acquired only outside it.
+func (h *attachHA) widenReplica(ctx context.Context, node string) {
+	if node == "" {
+		node = h.node
+	}
+	if h.deps.Config.StoragePlacementNamespace != "" || h.deps.Config.StorageAllocationJournalDir != "" {
+		h.logger.Info(attachHAOp+": the replicate VM's pin keeps its node alone; the next call that touches the VM "+
+			"checks the replica against the journal", log.Int(metadataKeyVMID, h.vmid))
+		return
+	}
+	w := &replicaWiden{
+		deps: h.deps, logger: h.logger, api: replicationAPIFor(h.deps), profile: h.profile, vmid: h.vmid,
+		node: node, wait: &ha.ReplicaSyncWait{Budget: haMotionWait(h.deps), Logger: h.logger},
+		changedAfter: time.Now(),
+	}
+	if _, err := w.run(ctx); err != nil {
+		h.logger.Warn(attachHAOp+": the replica of the new disk could not be checked; the pin keeps the VM's node "+
+			"alone, and a later call that touches the VM checks again", log.Int(metadataKeyVMID, h.vmid),
+			log.Err(err))
+	}
+}
+
+// attachSkipsHADecision reports whether an attach to a VM under HA needs no
+// HA decision, because the VM's pin already records the disk's storage. A
+// barrier an earlier attach left part way must be finished, so only a
+// resource with no pending barrier skips the decision. A legacy disk in
+// managed mode never skips it, because the decision is what refuses a disk
+// with no stable ID there. A replicate VM's volume set is what its replica
+// must cover, so every attach to it is decided, and its pin keeps the source
+// alone until a sync covers the new set.
+func attachSkipsHADecision(oldPin *ha.Rule, res *cluster.GetHaResourcesResponse, storage string, legacyManaged bool) bool {
+	if oldPin == nil || legacyManaged || ha.NarrowPending(res.State, res.Comment) ||
+		replicaPinComment(oldPin.Comment) {
+		return false
+	}
+	recorded, ok := ha.VolumeRecord(oldPin.Comment)
+	return ok && slices.Contains(recorded, storage)
+}
+
+// replicaPinComment reports whether a pin's comment carries a token of the
+// replicate policy.
+func replicaPinComment(comment string) bool {
+	_, partner := ha.ReplicaPartner(comment)
+	_, changed := ha.ReplicaChanged(comment)
+	return partner || changed
 }
 
 // errAttachReaddGuarded is the refusal of an HA re-registration under the

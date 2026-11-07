@@ -394,7 +394,8 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// nothing on every node. The corroborators give that sweep the same
 	// contradiction sources the handlers use.
 	backendResolver := pve.NewBackendResolver(client, storageInfoCache, cfg.Node,
-		pve.WithEmptyListingCorroborators(handlers.BackendCorroborators(cfg, client)))
+		pve.WithEmptyListingCorroborators(handlers.BackendCorroborators(cfg, client)),
+		handlers.BackendReplicaLookup(cfg))
 
 	// Resolve configured middleware hooks via the registry. config.Validate has
 	// already rejected unknown names, so a miss here is defensive only.

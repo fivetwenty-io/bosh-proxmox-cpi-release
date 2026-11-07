@@ -109,8 +109,11 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 
 		// An HA re-registration an earlier call left part way is finished
 		// before the reboot reads the VM's HA state.
-		if readdErr := finishPendingHAReadd(ctx, deps, "reboot_vm", vmid, loc, logger); readdErr != nil {
-			return nil, readdErr
+		// A replicate VM that failed over has its pin narrowed to the node it
+		// runs on now, and one whose replica a sync now covers has its pin
+		// widened to the partner.
+		if haErr := reconcileTouchedVMHA(ctx, deps, "reboot_vm", vmCID, vmid, loc, logger); haErr != nil {
+			return nil, haErr
 		}
 
 		// A migration or a task that begins after the wait shows up as a lock,

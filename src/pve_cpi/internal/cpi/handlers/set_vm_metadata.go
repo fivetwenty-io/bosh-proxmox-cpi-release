@@ -144,8 +144,11 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		}
 		// An HA re-registration an earlier call left part way is finished
 		// before the metadata write.
-		if readdErr := finishPendingHAReadd(ctx, deps, "set_vm_metadata", vmid, loc, logger); readdErr != nil {
-			return nil, readdErr
+		// A replicate VM that failed over has its pin narrowed to the node it
+		// runs on now, and one whose replica a sync now covers has its pin
+		// widened to the partner.
+		if haErr := reconcileTouchedVMHA(ctx, deps, "set_vm_metadata", vmCID, vmid, loc, logger); haErr != nil {
+			return nil, haErr
 		}
 
 		// --- wait for motion to end and follow the VM to its node ---

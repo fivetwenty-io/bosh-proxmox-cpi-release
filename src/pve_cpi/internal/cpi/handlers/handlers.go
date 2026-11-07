@@ -113,6 +113,12 @@ type Deps struct {
 	// every existing test literal) uses the record in the endpoint cache
 	// directory; tests point it at a temporary directory and a fixed clock.
 	HAEpisodes *ha.EpisodeStore
+	// Replication serves the replicate policy's job, status, and storage
+	// listing calls. Nil (production and every existing test literal) builds
+	// the surface over PVE; tests that drive the policy set a fake here
+	// rather than through a package variable, so parallel tests cannot race
+	// on it.
+	Replication ha.ReplicationAPI
 }
 
 // EffectiveISOStorage returns the pool config-drive ISOs live on for this
