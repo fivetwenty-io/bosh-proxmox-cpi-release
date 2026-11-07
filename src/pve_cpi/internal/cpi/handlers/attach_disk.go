@@ -121,6 +121,11 @@ func HandleAttachDisk(deps Deps) Handler {
 		if err := refuseStrandedManagedAttach(deps, vmCID, rd); err != nil {
 			return nil, err
 		}
+		// An HA re-registration an earlier call left part way is finished
+		// before the attach reads the VM's HA state.
+		if err := finishPendingHAReaddForCID(ctx, deps, "attach_disk", vmCID); err != nil {
+			return nil, err
+		}
 		deps, lifecycle, lifecycleErr := managedDiskOperation(ctx, deps, rd, "attach_disk")
 		if lifecycleErr != nil {
 			return nil, lifecycleErr

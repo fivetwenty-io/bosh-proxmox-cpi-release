@@ -49,3 +49,10 @@ const (
 	VMIDLockTTLMargin  = vmidLockTTLMargin
 	PoolSentinelBudget = poolSentinelBudget
 )
+
+// HAOwnerMarkerForTest returns the HA resource comment that marks a resource
+// as owned by the Director with the given UUID, for handlers_test package tests
+// that build an HA scene this Director owns. Test-only.
+func HAOwnerMarkerForTest(owner string) string {
+	return haIdentity{Owner: owner}.marker()
+}

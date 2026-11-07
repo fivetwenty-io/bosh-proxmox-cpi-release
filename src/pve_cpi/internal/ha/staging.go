@@ -563,22 +563,35 @@ func LeaveHA(
 				fmt.Sprintf("ha leave: remove %s", sid))
 		}
 	}
-	// The barrier with nothing to restore: restore is ignored and no token is
-	// on the comment, so a failed drain writes nothing back.
-	b := &barrier{deps: deps, in: NarrowInput{VMID: vmid, Node: node, Budget: budget}, sid: sid,
-		restore: haStateIgnored}
+	loc, err := drainRemoved(ctx, deps, vmid, node, budget, 0, false)
+	if err != nil {
+		return loc, err
+	}
+	if deps.Logger == nil {
+		deps.Logger = log.NewNopLogger()
+	}
+	deps.Logger.Info("ha: removed the VM's HA resource and the CRM let go of it", log.String("sid", sid),
+		log.String("node", loc.Node))
+	return loc, nil
+}
+
+// drainRemoved waits until the CRM has let go of the VM's removed HA resource,
+// with the narrowing barrier's drain, and returns where the VM is. The barrier
+// it runs has nothing to restore: restore is ignored and no token is on the
+// comment, so a failed drain writes nothing back. tolerateError waits out a
+// service the CRM still lists in the error state, which a removed errored
+// resource leaves until the CRM's next round.
+func drainRemoved(
+	ctx context.Context, deps NarrowDeps, vmid int, node string, budget, poll time.Duration, tolerateError bool,
+) (pve.VMLocation, error) {
+	b := &barrier{deps: deps, in: NarrowInput{VMID: vmid, Node: node, Budget: budget, PollInterval: poll},
+		sid: pve.HAServiceSID(vmid), restore: haStateIgnored, tolerateError: tolerateError}
 	b.defaults()
 	after, err := b.readState(ctx, node)
 	if err != nil {
 		return pve.VMLocation{}, err
 	}
-	loc, err := b.drain(ctx, after.EntryTime, after.Node)
-	if err != nil {
-		return loc, err
-	}
-	b.deps.Logger.Info("ha: removed the VM's HA resource and the CRM let go of it", log.String("sid", sid),
-		log.String("node", loc.Node))
-	return loc, nil
+	return b.drain(ctx, after.EntryTime, after.Node)
 }
 
 // NarrowPending reports whether a resource with the requested state and the

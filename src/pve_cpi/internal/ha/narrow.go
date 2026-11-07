@@ -130,6 +130,15 @@ type NarrowInput struct {
 	Snapshot        func(ctx context.Context) ([]Rule, error)
 	Restore         func(ctx context.Context, rules []Rule, pin *Rule) error
 	PersistSnapshot func(ctx context.Context, rules []Rule) error
+	// Reregister clears a resource the barrier finds in the error state. A
+	// running guest that BOSH keeps must never get disabled, so the barrier
+	// hands such a resource to the re-registration order of
+	// ReregisterErrored, with st as the decision read and between as the
+	// change to make while the VM has no HA resource. between runs the
+	// mutation and the landing check of the barrier. nil keeps the retriable
+	// error that tells the operator to clear the error.
+	Reregister func(ctx context.Context, st *pve.HAServiceState,
+		between func(ctx context.Context, node string) (pve.VMLocation, error)) (pve.VMLocation, error)
 }
 
 // NarrowActive applies a change that narrows where an HA-managed VM may run,
@@ -220,6 +229,10 @@ type barrier struct {
 	// the resource's comment carries the barrier's token.
 	restore string
 	marked  bool
+	// tolerateError makes the drain wait out a service the CRM still lists in
+	// the error state, which is what a removed errored resource leaves until
+	// the CRM's next round drops it.
+	tolerateError bool
 }
 
 func (b *barrier) defaults() {
@@ -297,8 +310,7 @@ func (b *barrier) viaIgnored(ctx context.Context, resumed bool) (pve.VMLocation,
 		return pve.VMLocation{}, err
 	}
 	if st.Raw == haStateError {
-		return pve.VMLocation{}, cpierrors.Retriable("ha narrow: the HA resource of VM %d is in the error state; "+
-			"the operator must clear it, and the CPI never requests disabled", b.in.VMID)
+		return b.errored(ctx, st)
 	}
 	if !resumed && b.restore != haStateIgnored {
 		if err := b.request(ctx, haStateIgnored, true); err != nil {
@@ -345,6 +357,27 @@ func (b *barrier) viaIgnored(ctx context.Context, resumed bool) (pve.VMLocation,
 		return loc, err
 	}
 	return loc, nil
+}
+
+// errored hands a resource in the error state to the caller's re-registration,
+// with the barrier's mutation and landing check as the change to make while
+// the VM has no HA resource. Without a re-registration it returns the
+// retriable error that tells the operator to clear the error. The barrier
+// never requests disabled.
+func (b *barrier) errored(ctx context.Context, st *pve.HAServiceState) (pve.VMLocation, error) {
+	if b.in.Reregister == nil {
+		return pve.VMLocation{}, cpierrors.Retriable("ha narrow: the HA resource of VM %d is in the error state; "+
+			"the operator must clear it, and the CPI never requests disabled", b.in.VMID)
+	}
+	b.deps.Logger.Info("ha narrow: the HA resource is in the error state, so the change runs inside its "+
+		"re-registration", log.Int("vmid", b.in.VMID), log.String("sid", b.sid), log.String("uid", st.UID))
+	return b.in.Reregister(ctx, st, func(ctx context.Context, node string) (pve.VMLocation, error) {
+		loc, err := b.mutate(ctx, node)
+		if err != nil {
+			return loc, err
+		}
+		return loc, b.checkLanding(ctx, loc.Node)
+	})
 }
 
 // revertPin writes OldPin back after a mutation that failed, when Moving says
@@ -432,7 +465,7 @@ func (b *barrier) drain(ctx context.Context, requestTime int64, node string) (pv
 			why = err.Error()
 		case !st.Known:
 			why = st.Reason
-		case st.Raw == haStateError:
+		case st.Raw == haStateError && !b.tolerateError:
 			return pve.VMLocation{}, cpierrors.Retriable("ha narrow: the HA resource of VM %d went into the error "+
 				"state during the drain; the CPI never requests disabled", b.in.VMID)
 		case st.InCRM:
@@ -607,8 +640,7 @@ func (b *barrier) viaRemoval(ctx context.Context) (pve.VMLocation, error) {
 		return pve.VMLocation{}, err
 	}
 	if st.Raw == haStateError {
-		return pve.VMLocation{}, cpierrors.Retriable("ha narrow: the HA resource of VM %d is in the error state; "+
-			"the operator must clear it, and the CPI never requests disabled", b.in.VMID)
+		return b.errored(ctx, st)
 	}
 	rules, err := b.in.Snapshot(ctx)
 	if err != nil {

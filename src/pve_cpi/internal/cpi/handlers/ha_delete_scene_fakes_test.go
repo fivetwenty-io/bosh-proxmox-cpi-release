@@ -15,6 +15,7 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
 // HASceneService is one service_status entry of the CRM view.
@@ -84,6 +85,25 @@ type HADeleteScene struct {
 	// read, which is what the settle wait polls, so a test can end the
 	// motion while the wait runs.
 	OnIndexRead func(s *HADeleteScene, reads int)
+
+	// Configs are the VM configs by VMID. A VM with a config here has its
+	// config read, its config writes, and its index tags served from it, so a
+	// test can follow the tags and the description an order writes.
+	Configs map[int]map[string]any
+	// RefuseRemoval refuses an HA resource removal while a rule names the
+	// resource, one answer PVE may give.
+	RefuseRemoval bool
+	// PurgeKeepsRules leaves the rules that name a removed resource as they
+	// were, and DisableOrphanRules disables each of them, as PVE may for a
+	// rule that names a missing resource. With neither, a removal prunes the
+	// resource from every rule and deletes a rule it leaves empty.
+	PurgeKeepsRules    bool
+	DisableOrphanRules bool
+	// Tick advances Now by this many seconds on every manager status read,
+	// so a CRM round newer than a request can be seen. Zero leaves the clock.
+	Tick int64
+	// uidSerial numbers the uid of a service the scene creates.
+	uidSerial int
 
 	// Events records every mutation in order.
 	Events []string
@@ -207,12 +227,61 @@ func (s *HADeleteScene) applyStart(vmid int) {
 	if _, ok := s.Requested[sid]; ok {
 		s.Requested[sid] = "started"
 		s.IndexHAState[vmid] = "started"
+		if _, held := s.Services[sid]; !held {
+			// The CRM takes up a resource that leaves ignored on the node the
+			// VM runs on, under a uid of its own.
+			s.uidSerial++
+			s.Services[sid] = HASceneService{State: "started", Node: s.IndexNode[vmid],
+				UID: fmt.Sprintf("uid-%d-%d", vmid, s.uidSerial)}
+		}
 	}
 	if svc, ok := s.Services[sid]; ok {
 		svc.State = "started"
 		s.Services[sid] = svc
 	}
 	s.Power[vmid] = "running"
+}
+
+// rulesNaming returns the names of the rules whose resources name sid.
+// Called locked.
+func (s *HADeleteScene) rulesNaming(sid string) []string {
+	var out []string
+	for name, row := range s.Rules {
+		res, _ := row["resources"].(string)
+		for _, r := range strings.Split(res, ",") {
+			if strings.TrimSpace(r) == sid {
+				out = append(out, name)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// pruneRules applies what a removal of sid does to the rules that name it.
+// Called locked.
+func (s *HADeleteScene) pruneRules(sid string) {
+	for _, name := range s.rulesNaming(sid) {
+		row := s.Rules[name]
+		switch {
+		case s.DisableOrphanRules:
+			row["disable"] = 1
+		case s.PurgeKeepsRules:
+		default:
+			res, _ := row["resources"].(string)
+			var kept []string
+			for _, r := range strings.Split(res, ",") {
+				if r = strings.TrimSpace(r); r != "" && r != sid {
+					kept = append(kept, r)
+				}
+			}
+			if len(kept) == 0 {
+				delete(s.Rules, name)
+				continue
+			}
+			row["resources"] = strings.Join(kept, ",")
+		}
+	}
 }
 
 func (s *HADeleteScene) statusRows() *cluster.ListStatusResponse {
@@ -236,6 +305,7 @@ func (s *HADeleteScene) statusRows() *cluster.ListStatusResponse {
 
 func (s *HADeleteScene) managerBody() *cluster.ListHaStatusManagerStatusResponse {
 	s.ManagerReads++
+	s.Now += s.Tick
 	if s.OnRead != nil {
 		s.OnRead(s, s.ManagerReads)
 	}
@@ -298,6 +368,12 @@ func (s *HADeleteScene) indexRows() *cluster.ListResourcesResponse {
 		}
 		if s.IndexTags != "" {
 			row["tags"] = s.IndexTags
+		}
+		if cfg, ok := s.Configs[vmid]; ok {
+			delete(row, "tags")
+			if tags, _ := cfg["tags"].(string); tags != "" {
+				row["tags"] = tags
+			}
 		}
 		raw, _ := json.Marshal(row)
 		rows = append(rows, raw)
@@ -417,8 +493,39 @@ func (c *HASceneCluster) DeleteHaResources(_ context.Context, sid string, _ *clu
 	if _, ok := c.Scene.Requested[sid]; !ok {
 		return errors.New("no such resource '" + sid + "' (HTTP500)")
 	}
+	if c.Scene.RefuseRemoval && len(c.Scene.rulesNaming(sid)) > 0 {
+		return &sdkerrors.APIError{HTTPCode: 500, Message: "resource '" + sid + "' is used in a rule"}
+	}
 	delete(c.Scene.Requested, sid)
 	delete(c.Scene.Services, sid)
+	delete(c.Scene.Comments, sid)
+	c.Scene.pruneRules(sid)
+	return nil
+}
+
+// CreateHaResources registers a resource in the state it names. An ignored
+// resource is not one the CRM holds, so it gets no service entry until it is
+// asked for started.
+func (c *HASceneCluster) CreateHaResources(_ context.Context, params *cluster.CreateHaResourcesParams) error {
+	c.Scene.mu.Lock()
+	defer c.Scene.mu.Unlock()
+	state := "started"
+	if params.State != nil {
+		state = *params.State
+	}
+	c.Scene.record("CreateHaResources:" + params.Sid + "=" + state)
+	if _, ok := c.Scene.Requested[params.Sid]; ok {
+		return errors.New("resource ID '" + params.Sid + "' already defined (HTTP500)")
+	}
+	c.Scene.Requested[params.Sid] = state
+	if params.Comment != nil {
+		c.Scene.Comments[params.Sid] = *params.Comment
+	}
+	vmid, _ := strconv.Atoi(strings.TrimPrefix(params.Sid, "vm:"))
+	c.Scene.IndexHAState[vmid] = state
+	if state == "started" {
+		c.Scene.applyStart(vmid)
+	}
 	return nil
 }
 
@@ -582,6 +689,59 @@ func (n *HASceneNodes) DeleteQemu(
 	return resp, err
 }
 
+// ListQemu lists the VMs the scene places on node, with the tags their index
+// rows carry.
+func (n *HASceneNodes) ListQemu(_ context.Context, node string, _ *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
+	n.Scene.mu.Lock()
+	defer n.Scene.mu.Unlock()
+	resp := nodes.ListQemuResponse{}
+	for _, raw := range *n.Scene.indexRows() {
+		var row map[string]any
+		if json.Unmarshal(raw, &row) != nil || row["node"] != node {
+			continue
+		}
+		delete(row, "node")
+		out, _ := json.Marshal(row)
+		resp = append(resp, out)
+	}
+	return &resp, nil
+}
+
+// UpdateQemuConfig applies the tags and the description of a write to a VM
+// whose config the scene holds, and delegates every other write.
+func (n *HASceneNodes) UpdateQemuConfig(
+	ctx context.Context, node, vmid string, params *nodes.UpdateQemuConfigParams,
+) error {
+	id, _ := strconv.Atoi(vmid)
+	n.Scene.mu.Lock()
+	cfg, held := n.Scene.Configs[id]
+	if !held {
+		n.Scene.mu.Unlock()
+		return n.Service.UpdateQemuConfig(ctx, node, vmid, params)
+	}
+	defer n.Scene.mu.Unlock()
+	n.Scene.record("UpdateQemuConfig:" + vmid)
+	if params.Digest != nil {
+		if cur, _ := cfg["digest"].(string); cur != *params.Digest {
+			return errors.New("detected modified configuration - file changed by other user? Try again. (HTTP500)")
+		}
+	}
+	if params.Delete != nil {
+		for _, field := range strings.Split(*params.Delete, ",") {
+			delete(cfg, strings.TrimSpace(field))
+		}
+	}
+	if params.Tags != nil {
+		cfg["tags"] = *params.Tags
+	}
+	if params.Description != nil {
+		cfg["description"] = *params.Description
+	}
+	n.Scene.uidSerial++
+	cfg["digest"] = fmt.Sprintf("digest-%d", n.Scene.uidSerial)
+	return nil
+}
+
 // HASceneQEMU serves the VM's power state and the direct stop, and delegates
 // every other call.
 type HASceneQEMU struct {
@@ -593,6 +753,23 @@ func (q *HASceneQEMU) Status(_ context.Context, _ string, vmid int) (map[string]
 	q.Scene.mu.Lock()
 	defer q.Scene.mu.Unlock()
 	return map[string]any{"status": q.Scene.powerOf(vmid)}, nil
+}
+
+// Config serves a VM config the scene holds, a copy so a caller's edit never
+// writes through, and delegates any other read.
+func (q *HASceneQEMU) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
+	q.Scene.mu.Lock()
+	cfg, held := q.Scene.Configs[vmid]
+	if !held {
+		q.Scene.mu.Unlock()
+		return q.Service.Config(ctx, node, vmid)
+	}
+	defer q.Scene.mu.Unlock()
+	out := make(map[string]any, len(cfg))
+	for k, v := range cfg {
+		out[k] = v
+	}
+	return out, nil
 }
 
 func (q *HASceneQEMU) Stop(_ context.Context, node string, vmid int) (string, error) {

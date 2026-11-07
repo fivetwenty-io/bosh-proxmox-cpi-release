@@ -142,6 +142,11 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		if ownErr := refuseUnownedVM(ctx, deps, "set_vm_metadata", vmCID, cid, loc, nil, logger); ownErr != nil {
 			return nil, ownErr
 		}
+		// An HA re-registration an earlier call left part way is finished
+		// before the metadata write.
+		if readdErr := finishPendingHAReadd(ctx, deps, "set_vm_metadata", vmid, loc, logger); readdErr != nil {
+			return nil, readdErr
+		}
 
 		// --- wait for motion to end and follow the VM to its node ---
 		// A migration in flight holds the VM's config lock for minutes, so the

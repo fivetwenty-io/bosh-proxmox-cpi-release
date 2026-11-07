@@ -148,8 +148,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// as a bare VMID.
 		// ----------------------------------------------------------------
 		holderLoc := pve.VMLocation{Node: node, Tags: holderTags, Found: true}
-		if err := refuseUnownedVM(ctx, deps, "snapshot_disk", vmcid.PathOf(vmid), vmcid.VMCID{VMID: vmid}, holderLoc, nil,
-			deps.Log(ctx).With(log.String("disk_cid", diskCID), log.Int("vmid", vmid))); err != nil {
+		if err := snapshotHolderReady(ctx, deps, diskCID, vmid, holderLoc); err != nil {
 			return nil, err
 		}
 
@@ -415,4 +414,16 @@ func generateSnapName() (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("bosh-%d-%s", time.Now().Unix(), hex.EncodeToString(buf)), nil
+}
+
+// snapshotHolderReady refuses a holder VM this Director does not own, and then
+// finishes an HA re-registration an earlier call left part way on the holder,
+// so the snapshot never lands on a VM whose HA resource is half registered.
+func snapshotHolderReady(ctx context.Context, deps Deps, diskCID string, vmid int, holderLoc pve.VMLocation) error {
+	logger := deps.Log(ctx).With(log.String("disk_cid", diskCID), log.Int("vmid", vmid))
+	if err := refuseUnownedVM(ctx, deps, "snapshot_disk", vmcid.PathOf(vmid), vmcid.VMCID{VMID: vmid}, holderLoc, nil,
+		logger); err != nil {
+		return err
+	}
+	return finishPendingHAReadd(ctx, deps, "snapshot_disk", vmid, holderLoc, logger)
 }

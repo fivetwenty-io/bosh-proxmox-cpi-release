@@ -251,6 +251,14 @@ func pendingAttachLeave(ctx context.Context, deps Deps, vmCID string, vmid int, 
 	if !loc.Found || loc.Node == "" {
 		return nil, cpierrors.VMNotFound(vmCID)
 	}
+	if tag, _, tagged := ha.ReaddTagOf(parseTagsField(loc.Tags)); tagged {
+		// The VM's resource is gone because an HA re-registration removed it,
+		// and that order, not a removal from HA, finishes it. Its decision
+		// runs over the VM's volumes then, the new disk included.
+		logger.Info(op+": the VM's HA resource is gone for a re-registration that is not finished, so the "+
+			"attach leaves its pin to that order", log.Int(metadataKeyVMID, vmid), log.String("tag", tag))
+		return nil, nil
+	}
 	logger.Warn(op+": the VM's HA resource is gone but its pin is still there, so the attach finishes its "+
 		"removal from HA first", log.Int(metadataKeyVMID, vmid), log.String("pin", pin.ID))
 	return &attachHA{
@@ -398,9 +406,15 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 		return haOwnershipOf(comment, h.deps.RequestDirectorUUID) == haOwnedByUs
 	}
 	if h.action == attachHALeave {
-		loc, err := ha.LeaveHA(ctx, narrowDeps, h.vmid, h.node, haMotionWait(h.deps), owned)
+		loc, cleared, err := h.leaveErrored(ctx)
 		if err != nil {
 			return err
+		}
+		if !cleared {
+			loc, err = ha.LeaveHA(ctx, narrowDeps, h.vmid, h.node, haMotionWait(h.deps), owned)
+			if err != nil {
+				return err
+			}
 		}
 		// The pin goes last, so a removal that stops part way leaves the pin,
 		// and the next attach finds it and finishes (see pendingAttachLeave).
@@ -446,11 +460,126 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 		CheckReach: h.checkReach,
 		Unchanged:  h.attachUnchanged,
 		Moving:     h.attachMoving,
+		Reregister: h.reregister,
 		SysConsole: h.profile.SysConsole,
 		Budget:     haMotionWait(h.deps),
 	})
 	return err
 }
+
+// errAttachReaddGuarded is the refusal of an HA re-registration under the
+// managed disk lifecycle, whose guard admits no HA resource write and no
+// description write, so a re-registration there would poison the lifecycle.
+func (h *attachHA) errAttachReaddGuarded() error {
+	sid := haResourceSid(h.vmid)
+	return cpierrors.Retriable("%s: the HA resource of VM %d is in the error state, and the attach of a "+
+		"managed disk cannot clear it inside its lifecycle; a reboot_vm clears it, or clear it without stopping "+
+		"the guest by running 'ha-manager remove %s' and then 'ha-manager add %s --state started', and retry",
+		attachHAOp, h.vmid, sid, sid)
+}
+
+// reregister is the barrier's answer to a resource it finds in the error
+// state. It clears the error by removing the resource and registering it
+// again, with the attach between the two and the pin the attach decision gives
+// written in the confinement step, so the resource is never asked for
+// disabled. An order that ends without running the attach, such as one a
+// concurrent call finished, returns a retriable error, so the Director retries
+// the attach.
+func (h *attachHA) reregister(
+	ctx context.Context, st *pve.HAServiceState, between func(ctx context.Context, node string) (pve.VMLocation, error),
+) (pve.VMLocation, error) {
+	if _, wrapped := h.deps.PVE.(guardWrappedClient); wrapped {
+		return pve.VMLocation{}, h.errAttachReaddGuarded()
+	}
+	ran := false
+	var landed pve.VMLocation
+	node := h.node
+	if st != nil && st.Node != "" {
+		node = st.Node
+	}
+	res, err := reregisterErroredVM(ctx, h.deps, attachHAOp, h.vmid, node, h.logger, readdOptions{
+		decided: st,
+		profile: h.profile,
+		between: func(ctx context.Context, node string) (pve.VMLocation, error) {
+			ran = true
+			loc, err := between(ctx, node)
+			landed = loc
+			return loc, err
+		},
+		decide: func(context.Context, string, *pve.HAServiceState, ha.ReaddRecord) (*ha.VMDecision, error) {
+			return h.decision, nil
+		},
+		writePin: func(ctx context.Context, _ *ha.VMDecision) (*ha.Rule, error) {
+			if err := h.writePin(ctx, h.newPin); err != nil {
+				return nil, err
+			}
+			return h.newPin, nil
+		},
+	})
+	if err != nil {
+		return pve.VMLocation{}, err
+	}
+	if !ran {
+		return pve.VMLocation{}, cpierrors.Retriable("%s: the HA re-registration of VM %d ended (%s) without "+
+			"running the attach; retry", attachHAOp, h.vmid, res.Outcome)
+	}
+	if res.Node != "" {
+		landed.Node = res.Node
+	}
+	landed.Found = true
+	return landed, nil
+}
+
+// leaveErrored clears the error of a resource the attach removes from HA, by
+// removing the resource without ever asking for disabled, which would stop
+// the guest. It reports cleared when the resource is gone, so the attach
+// skips its own removal, and not cleared when the resource is not in the
+// error state, which the attach's own removal then handles.
+func (h *attachHA) leaveErrored(ctx context.Context) (pve.VMLocation, bool, error) {
+	if h.narrow.ReadState == nil {
+		return pve.VMLocation{}, false, nil
+	}
+	st, err := h.narrow.ReadState(ctx, h.vmid, h.node)
+	if err != nil {
+		return pve.VMLocation{}, false, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: read the HA state of VM %d before it leaves HA", attachHAOp, h.vmid))
+	}
+	if st == nil || !st.Known || st.Raw != pveHAStateError {
+		return pve.VMLocation{}, false, nil
+	}
+	if _, wrapped := h.deps.PVE.(guardWrappedClient); wrapped {
+		return pve.VMLocation{}, false, h.errAttachReaddGuarded()
+	}
+	opts := readdOptions{decided: st, stopAfterRemoval: true, profile: h.profile}
+	if h.decision != nil {
+		opts.decide = func(context.Context, string, *pve.HAServiceState, ha.ReaddRecord) (*ha.VMDecision, error) {
+			return h.decision, nil
+		}
+	}
+	node := h.node
+	if st.Node != "" {
+		node = st.Node
+	}
+	res, err := reregisterErroredVM(ctx, h.deps, attachHAOp, h.vmid, node, h.logger, opts)
+	if err != nil {
+		return pve.VMLocation{}, false, err
+	}
+	switch res.Outcome {
+	case ha.ReaddRemoved, ha.ReaddWithoutHA:
+		if res.Node != "" {
+			node = res.Node
+		}
+		return pve.VMLocation{Node: node, Found: true}, true, nil
+	case ha.ReaddNothing:
+		return pve.VMLocation{}, false, nil
+	default:
+		return pve.VMLocation{}, false, cpierrors.Retriable("%s: the HA error of VM %d was cleared (%s) while the "+
+			"attach removes it from HA; retry", attachHAOp, h.vmid, res.Outcome)
+	}
+}
+
+// pveHAStateError is the raw CRM state of a resource in the error state.
+const pveHAStateError = "error"
 
 // preflight runs the attach's refusals that only read, before the attach
 // changes anything in HA. They are the refusal of a legacy disk named for the

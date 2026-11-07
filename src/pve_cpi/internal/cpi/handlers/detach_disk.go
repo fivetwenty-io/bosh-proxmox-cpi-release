@@ -253,7 +253,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		// to answer. A VM the wait does not find keeps the answers below, which
 		// run the absence proof. The slot change is sent through MutateVMConfig,
 		// which handles a migration that starts after this wait.
-		if _, settleErr := settleDiskVM(ctx, deps, "detach_disk", vmCID, vmid, true); settleErr != nil {
+		if settleErr := settleDetachVM(ctx, deps, vmCID, vmid); settleErr != nil {
 			return nil, settleErr
 		}
 
@@ -1130,4 +1130,14 @@ func detachDiskArguments(args []json.RawMessage) (string, string, error) {
 		return "", "", cpierrors.Cloud("detach_disk: args[1] disk_cid must not be empty")
 	}
 	return vmCID, diskCID, nil
+}
+
+// settleDetachVM waits out a migration of the VM, and then finishes an HA
+// re-registration an earlier call left part way, before the detach changes the
+// VM.
+func settleDetachVM(ctx context.Context, deps Deps, vmCID string, vmid int) error {
+	if _, err := settleDiskVM(ctx, deps, "detach_disk", vmCID, vmid, true); err != nil {
+		return err
+	}
+	return finishPendingHAReaddForCID(ctx, deps, "detach_disk", vmCID)
 }

@@ -296,10 +296,14 @@ func configHasLinkedClone(cfg map[string]any) bool {
 
 // newStager wires the staging order to the cluster.
 func (h *createdVMHA) newStager(managed bool) *ha.Stager {
-	deps := h.deps
+	return newHAStager(h.deps, h.ident.Owner, h.profile, managed, h.logger)
+}
+
+// newHAStager builds the stager that registers a VM with PVE HA in the staging
+// order for owner, the Director whose markers the CPI may write over.
+func newHAStager(deps Deps, owner string, profile *ha.Profile, managed bool, logger *log.Logger) *ha.Stager {
 	svc := deps.PVE.Cluster()
-	owner := h.ident.Owner
-	sysConsole := h.profile.SysConsole
+	sysConsole := profile.SysConsole
 	// The watchdog check reads every admissible node, and one health report
 	// answers them all, so the first successful read is kept for the call.
 	var health *pve.NodeHealthReport
@@ -330,8 +334,8 @@ func (h *createdVMHA) newStager(managed bool) *ha.Stager {
 			})
 		},
 		Managed:       managed,
-		FragileQuorum: h.profile.Quorum.OneFailureFromLoss(),
-		Logger:        h.logger,
+		FragileQuorum: profile.Quorum.OneFailureFromLoss(),
+		Logger:        logger,
 	}
 }
 

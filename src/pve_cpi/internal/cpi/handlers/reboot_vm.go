@@ -11,6 +11,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
@@ -104,6 +105,12 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 		// --- ownership guard: never power-cycle another Director's VM ---
 		if ownErr := refuseUnownedVM(ctx, deps, "reboot_vm", vmCID, cid, loc, nil, logger); ownErr != nil {
 			return nil, ownErr
+		}
+
+		// An HA re-registration an earlier call left part way is finished
+		// before the reboot reads the VM's HA state.
+		if readdErr := finishPendingHAReadd(ctx, deps, "reboot_vm", vmid, loc, logger); readdErr != nil {
+			return nil, readdErr
 		}
 
 		// A migration or a task that begins after the wait shows up as a lock,
@@ -585,9 +592,49 @@ func rebootSetHAState(
 	case res.Outcome == pve.HAStateReached:
 		return res, nil
 	case res.Outcome == pve.HAStateNeedsReregistration:
-		return nil, res.ReregistrationError()
+		return rebootReregister(ctx, deps, vmCID, vmid, target, res)
 	default:
 		return nil, cpierrors.Retriable("reboot_vm: bring HA-managed VM %s to %s: PVE HA answered %q, which a reboot "+
 			"cannot act on", vmCID, target, res.Outcome)
+	}
+}
+
+// rebootReregister clears the HA error state of a VM that runs, which the only
+// request PVE accepts in that state, disabled, would stop, by removing the
+// resource and registering it again in the staging order. On the stop request
+// the reboot then resolves the VM once more and restarts it the way its new
+// state calls for. On the start request a VM that runs again, with HA or
+// without it, has reached the target.
+func rebootReregister(
+	ctx context.Context, deps Deps, vmCID string, vmid int, target pve.HATarget, res *pve.SetHAStateResult,
+) (*pve.SetHAStateResult, error) {
+	logger := deps.Log(ctx)
+	logger.Warn("reboot_vm: the VM's HA resource is in the error state while the VM runs; removing it and "+
+		"registering it again", log.Int(metadataKeyVMID, vmid), log.String("node", res.Node),
+		log.String("target", string(target)))
+	out, err := reregisterErroredVM(ctx, deps, "reboot_vm", vmid, res.Node, logger, readdOptions{decided: res.State})
+	if err != nil {
+		if target == pve.HATargetStopped && errors.Is(err, ha.ErrReaddVMStopped) {
+			return nil, &rebootMovedError{err: cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("reboot_vm: VM %s stopped while its HA error was cleared", vmCID))}
+		}
+		return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("reboot_vm: clear the HA error of VM %s", vmCID))
+	}
+	runs := out.Outcome == ha.ReaddRegistered || out.Outcome == ha.ReaddWithoutHA
+	switch {
+	case target == pve.HATargetStopped:
+		return nil, &rebootMovedError{err: cpierrors.Retriable(
+			"reboot_vm: the HA resource of VM %s was in the error state and the CPI cleared it (%s), so the reboot "+
+				"resolves the VM again", vmCID, out.Outcome)}
+	case runs:
+		node := out.Node
+		if node == "" {
+			node = res.Node
+		}
+		return &pve.SetHAStateResult{Outcome: pve.HAStateReached, SID: res.SID, VMID: vmid, Node: node}, nil
+	default:
+		return nil, cpierrors.Retriable("reboot_vm: the HA error of VM %s is not cleared yet (%s); retry the reboot",
+			vmCID, out.Outcome)
 	}
 }

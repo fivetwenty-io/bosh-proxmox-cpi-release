@@ -9,7 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
@@ -32,7 +34,7 @@ var birthTagPattern = regexp.MustCompile(`^bosh-creating-(\d{1,19})$`)
 // haReaddTagPrefix starts the tag of a VM whose HA re-registration has not
 // finished. Such a VM is finished by the re-registration, never torn down by
 // the sweep.
-const haReaddTagPrefix = "bosh-ha-readd-"
+const haReaddTagPrefix = ha.ReaddTagPrefix
 
 // tagCreateFailed is the tag a failed create leaves on a VM it preserved.
 const tagCreateFailed = "bosh-create-failed"
@@ -175,6 +177,14 @@ func (q deferredTeardownQueue) queued(tagsRaw string) bool {
 	return deleting || (expired && !q.keepFailed)
 }
 
+// readdDue reports whether tagsRaw carries an HA re-registration tag older
+// than the queue's age, the same age a birth tag must reach. A younger tag
+// belongs to an order that may still be running, so the sweep leaves it.
+func (q deferredTeardownQueue) readdDue(tagsRaw string) bool {
+	_, started, ok := ha.ReaddTagOf(parseTagsField(tagsRaw))
+	return ok && q.now.Sub(started) > q.age
+}
+
 // stragglerRowForeign reports whether a queued row's own tags already prove
 // the VM is not this Director's to reap: an owner tag naming another
 // Director, two different owners, a parker, or a stemcell template. A row
@@ -194,6 +204,20 @@ type stragglerRow struct {
 	VMID sdkclient.PVEInt `json:"vmid"`
 	Node string           `json:"node"`
 	Tags string           `json:"tags"`
+
+	// readd marks a row the sweep takes to finish its HA re-registration
+	// rather than to tear it down.
+	readd bool
+}
+
+// readdCandidate reports whether the row is a VM whose HA re-registration the
+// sweep may finish: a QEMU guest with a VMID and a node, a due re-registration
+// tag, and no tag that proves it foreign.
+func (r stragglerRow) readdCandidate(queue deferredTeardownQueue, requestUUID string) bool {
+	if r.Type != resourceTypeQemu || r.VMID.Int() == 0 || r.Node == "" {
+		return false
+	}
+	return queue.readdDue(r.Tags) && !stragglerRowForeign(r.Tags, requestUUID)
 }
 
 // candidate reports whether the row is a VM the sweep may consider: a QEMU
@@ -279,6 +303,10 @@ func sweepDeferredTeardowns(ctx context.Context, deps Deps, logger *log.Logger) 
 	if resp == nil {
 		return
 	}
+	// An owned VM whose HA re-registration tag is as old as an expired birth
+	// tag is finished, never torn down. Mode off writes no HA objects, so it
+	// finishes none.
+	readd := deps.Config.HAModeValue() != config.HAModeOff
 	var rows []stragglerRow
 	var kept []int
 	for _, raw := range *resp {
@@ -286,9 +314,13 @@ func sweepDeferredTeardowns(ctx context.Context, deps Deps, logger *log.Logger) 
 		if json.Unmarshal(raw, &row) != nil {
 			continue
 		}
-		if row.candidate(queue, deps.RequestDirectorUUID) {
+		switch {
+		case row.candidate(queue, deps.RequestDirectorUUID):
 			rows = append(rows, row)
-		} else if row.keptBirthTag(queue, deps.RequestDirectorUUID) {
+		case readd && row.readdCandidate(queue, deps.RequestDirectorUUID):
+			row.readd = true
+			rows = append(rows, row)
+		case row.keptBirthTag(queue, deps.RequestDirectorUUID):
 			kept = append(kept, int(row.VMID.Int()))
 		}
 	}
@@ -333,6 +365,10 @@ func sweepDeferredTeardowns(ctx context.Context, deps Deps, logger *log.Logger) 
 		claimErr := withVMIDClaim(sweepCtx, deps, vmid, "deferred-teardown-sweep/"+strconv.Itoa(vmid), claimForSweep, sweepLogger,
 			func(claimCtx context.Context) error {
 				tornDown = true
+				if row.readd {
+					sweepFinishHAReadd(claimCtx, deps, row, queue, sweepLogger)
+					return nil
+				}
 				sweepDeferredTeardown(claimCtx, deps, row, queue, sweepLogger)
 				return nil
 			})
@@ -384,6 +420,42 @@ func logKeptBirthTags(logger *log.Logger, vmids []int) {
 	logger.Warn("deferred teardown sweep: debug.keep_failed_vms is on, so VMs with an expired birth tag are kept "+
 		"and never reaped; delete them by hand or turn the setting off once they are no longer needed",
 		log.Int("count", len(vmids)), log.Any("vmids", named))
+}
+
+// sweepFinishHAReadd finishes the HA re-registration of one VM whose tag is
+// due. The authoritative config is read first, because the index row can be
+// minutes stale and the VMID may hold another VM now, and the tag is tested
+// on it again. A VM this Director does not own, one that holds a lock, and
+// every failure are logged and left for the next sweep or the next call.
+func sweepFinishHAReadd(
+	ctx context.Context, deps Deps, row stragglerRow, queue deferredTeardownQueue, sweepLogger *log.Logger,
+) {
+	vmid := int(row.VMID.Int())
+	cfg, err := deps.PVE.QEMU().Config(ctx, row.Node, vmid)
+	if err != nil {
+		sweepLogger.Warn("deferred teardown sweep: config read failed; leaving the VM's HA re-registration to the "+
+			"next sweep (non-fatal)", log.Err(err))
+		return
+	}
+	authTags, _ := pve.ConfigString(cfg, jsonKeyTags)
+	if !queue.readdDue(authTags) {
+		sweepLogger.Info("deferred teardown sweep: the VM's config carries no due HA re-registration tag; " +
+			"leaving it")
+		return
+	}
+	loc := pve.VMLocation{Node: row.Node, Tags: authTags, Found: true, Type: row.Type}
+	if !stragglerOwned(ctx, deps, vmid, loc, cfg, sweepLogger) {
+		return
+	}
+	if lock, _ := pve.ConfigString(cfg, "lock"); strings.TrimSpace(lock) != "" {
+		sweepLogger.Info("deferred teardown sweep: the VM holds a lock; leaving its HA re-registration to the next "+
+			"sweep", log.String("lock", lock))
+		return
+	}
+	if err := finishPendingHAReadd(ctx, deps, "deferred teardown sweep", vmid, loc, sweepLogger); err != nil {
+		sweepLogger.Warn("deferred teardown sweep: the VM's HA re-registration did not finish; it keeps its tag "+
+			"for the next sweep (non-fatal)", log.Err(err))
+	}
 }
 
 // sweepDeferredTeardown tears down one queued VM through the protocol.

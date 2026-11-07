@@ -2274,18 +2274,29 @@ func removeBirthTag(ctx context.Context, deps Deps, node string, vmid int, logge
 	return mutateVMTags(ctx, deps, node, vmid, "create_vm: remove the birth tag", logger, withoutBirthTags)
 }
 
-// mutateVMTags rewrites the VM's tags with edit through pve.MutateVMConfig, so
-// the write survives a migration that starts mid-call. edit must return its
-// input unchanged once its change is present, which is how the write learns it
-// has nothing to do. The write carries the config digest it read, so it never
-// overwrites a tag change that landed in between. A digest refusal proves the
-// write changed nothing, so it pauses for birthTagDigestRetryPause, reads the
-// config again, and resends, up to birthTagDigestAttempts times. Any other
-// failure, and a refusal on the last attempt, is returned, wrapped as a CPI
-// error.
+// mutateVMTags rewrites the VM's tags with edit through
+// mutateVMTagsAndDescription. edit must return its input unchanged once its
+// change is present, which is how the write learns it has nothing to do.
 func mutateVMTags(
 	ctx context.Context, deps Deps, node string, vmid int, label string, logger *log.Logger,
 	edit func([]string) []string,
+) error {
+	return mutateVMTagsAndDescription(ctx, deps, node, vmid, label, logger,
+		func(tags []string, desc string) ([]string, string, error) { return edit(tags), desc, nil })
+}
+
+// mutateVMTagsAndDescription rewrites the VM's tags and description with edit
+// through pve.MutateVMConfig, so the write survives a migration that starts
+// mid-call. edit must return its input unchanged once its change is present,
+// which is how the write learns it has nothing to do. The write carries the
+// config digest it read, so it never overwrites a change that landed in
+// between. A digest refusal proves the write changed nothing, so it pauses for
+// birthTagDigestRetryPause, reads the config again, and resends, up to
+// birthTagDigestAttempts times. An edit failure, any other write failure, and a
+// refusal on the last attempt are returned, wrapped as a CPI error.
+func mutateVMTagsAndDescription(
+	ctx context.Context, deps Deps, node string, vmid int, label string, logger *log.Logger,
+	edit func(tags []string, desc string) ([]string, string, error),
 ) error {
 	_, err := pve.MutateVMConfig(ctx, deps.PVE, logger, pve.VMConfigMutation{
 		VMID:       vmid,
@@ -2301,7 +2312,7 @@ func mutateVMTags(
 				if attempt == birthTagDigestAttempts {
 					break
 				}
-				logger.Info(label+": another writer changed the config before the tag write; reading it again",
+				logger.Info(label+": another writer changed the config before the write; reading it again",
 					log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Int("attempt", attempt), log.Err(err))
 				if sleepErr := sleepOrDone(ctx, birthTagDigestRetryPause); sleepErr != nil {
 					return err
@@ -2316,7 +2327,12 @@ func mutateVMTags(
 			}
 			raw, _ := pve.ConfigString(cfg, jsonKeyTags)
 			entries := parseTagsField(raw)
-			return slices.Equal(edit(entries), entries), nil
+			desc := pve.DescriptionFromConfig(cfg)
+			kept, nextDesc, err := edit(entries, desc)
+			if err != nil {
+				return false, err
+			}
+			return slices.Equal(kept, entries) && nextDesc == desc, nil
 		},
 	})
 	if err != nil {
@@ -2330,28 +2346,50 @@ func mutateVMTags(
 }
 
 // mutateVMTagsOnce reads the VM's config on node and, when edit changes its
-// tags, writes them back, guarded by the digest it read.
-func mutateVMTagsOnce(ctx context.Context, deps Deps, node string, vmid int, edit func([]string) []string) error {
+// tags or description, writes the changed fields back, guarded by the digest
+// it read.
+func mutateVMTagsOnce(
+	ctx context.Context, deps Deps, node string, vmid int,
+	edit func(tags []string, desc string) ([]string, string, error),
+) error {
 	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
 	if err != nil {
 		return err
 	}
 	raw, _ := pve.ConfigString(cfg, jsonKeyTags)
 	entries := parseTagsField(raw)
-	kept := edit(entries)
-	if slices.Equal(kept, entries) {
+	desc := pve.DescriptionFromConfig(cfg)
+	kept, nextDesc, err := edit(entries, desc)
+	if err != nil {
+		return err
+	}
+	tagsChanged := !slices.Equal(kept, entries)
+	if !tagsChanged && nextDesc == desc {
 		return nil
 	}
-	var digest *string
+	params := &sdknodes.UpdateQemuConfigParams{}
 	if d, ok := pve.ConfigString(cfg, "digest"); ok && d != "" {
-		digest = &d
+		params.Digest = &d
 	}
-	if len(kept) == 0 {
-		del := jsonKeyTags
-		return deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmcid.PathOf(vmid),
-			&sdknodes.UpdateQemuConfigParams{Delete: &del, Digest: digest})
+	var deletes []string
+	if tagsChanged {
+		if len(kept) == 0 {
+			deletes = append(deletes, jsonKeyTags)
+		} else {
+			tags := strings.Join(kept, ";")
+			params.Tags = &tags
+		}
 	}
-	tags := strings.Join(kept, ";")
-	return deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmcid.PathOf(vmid),
-		&sdknodes.UpdateQemuConfigParams{Tags: &tags, Digest: digest})
+	if nextDesc != desc {
+		if nextDesc == "" {
+			deletes = append(deletes, pveConfigKeyDescription)
+		} else {
+			params.Description = &nextDesc
+		}
+	}
+	if len(deletes) > 0 {
+		del := strings.Join(deletes, ",")
+		params.Delete = &del
+	}
+	return deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmcid.PathOf(vmid), params)
 }

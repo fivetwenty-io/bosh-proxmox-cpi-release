@@ -11,6 +11,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -66,6 +67,8 @@ type haReboot struct {
 	// reset were sent to.
 	rebootNodes []string
 	resetNodes  []string
+	// director is the director_uuid the request carries.
+	director string
 }
 
 func newHAReboot(t *testing.T, scene *handlers.HADeleteScene, mode string) *haReboot {
@@ -119,7 +122,8 @@ func newHAReboot(t *testing.T, scene *handlers.HADeleteScene, mode string) *haRe
 }
 
 func (r *haReboot) run(ctx context.Context) error {
-	_, err := handlers.HandleRebootVM(r.deps).Handle(ctx, marshalArgs("101"), jsonrpc.Context{})
+	_, err := handlers.HandleRebootVM(r.deps).Handle(ctx, marshalArgs("101"),
+		jsonrpc.Context{DirectorUUID: r.director})
 	return err
 }
 
@@ -286,12 +290,14 @@ func TestHandleRebootVM_HAManagedStoppedOnlyStarts(t *testing.T) {
 }
 
 // TestHandleRebootVM_HAErrorStates covers a resource in error. A running guest
-// is never sent disabled, and the reboot returns the retriable error that names
-// the ha-manager commands. A stopped guest is cleared with disabled and then
-// started.
+// is never sent disabled. Without a Director UUID the CPI cannot prove it owns
+// the resource, so the reboot writes nothing and returns the retriable error
+// that names the ha-manager commands. With one, the CPI removes the resource,
+// registers it again in the staging order, and restarts the VM through it. A
+// stopped guest is cleared with disabled and then started.
 func TestHandleRebootVM_HAErrorStates(t *testing.T) {
 	t.Parallel()
-	t.Run("running guest is never disabled", func(t *testing.T) {
+	t.Run("running guest without a Director UUID is never disabled", func(t *testing.T) {
 		t.Parallel()
 		scene := handlers.NewHADeleteScene()
 		scene.Manage(101, "pve-node1", "started", "error")
@@ -300,6 +306,53 @@ func TestHandleRebootVM_HAErrorStates(t *testing.T) {
 
 		requireHARetriable(t, r.run(settleTestCtx()), "ha-manager remove")
 		noHAWrites(t, scene.EventsSnapshot())
+	})
+	t.Run("running guest of this Director is registered again and rebooted", func(t *testing.T) {
+		t.Parallel()
+		const director = "dir-reboot"
+		scene := handlers.NewHADeleteScene()
+		scene.Manage(101, "pve-node1", "started", "error")
+		scene.Do(func(s *handlers.HADeleteScene) {
+			s.Tick = 10
+			s.Power[101] = "running"
+			s.Comments["vm:101"] = handlers.HAOwnerMarkerForTest(director)
+			s.Configs = map[int]map[string]any{101: {
+				"tags": "bosh-cpi;bosh-ha-managed", "scsi0": "nfs:vm-101-disk-0,size=10G", "digest": "d0",
+			}}
+		})
+		r := newHAReboot(t, scene, "soft")
+		profile := &ha.Profile{
+			Mode: config.HAModeAuto, Effective: ha.EffectiveFull, MinVersion: "9.2.4", HAVersionOK: true,
+			RulesSupported: true, SysConsole: true, VMReplicate: true,
+			Storages: []pve.StorageInfo{{Name: "nfs", Type: pve.StorageTypeNFS, Content: "images"}},
+		}
+		for _, n := range scene.Members {
+			profile.Nodes = append(profile.Nodes, ha.NodeFacts{Name: n, Online: true, Version: "9.2.4"})
+		}
+		r.director = director
+		r.deps.HAProfile = func(context.Context) (*ha.Profile, error) { return profile, nil }
+
+		if err := r.run(settleTestCtx()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		events := scene.EventsSnapshot()
+		if eventIndex(events, "UpdateHaResources:vm:101=disabled") >= 0 {
+			t.Fatalf("a running guest must never be sent disabled, got %v", events)
+		}
+		removed := eventIndex(events, "DeleteHaResources:vm:101")
+		staged := eventIndex(events, "CreateHaResources:vm:101=ignored")
+		stopped := eventIndex(events, "UpdateHaResources:vm:101=stopped")
+		if removed < 0 || staged < removed || stopped < staged {
+			t.Fatalf("want the removal, the staging, and then the restart through HA, got %v", events)
+		}
+		if eventIndex(events[stopped:], "UpdateHaResources:vm:101=started") < 0 {
+			t.Fatalf("want the VM started through HA after the stop, got %v", events)
+		}
+		var tags string
+		scene.Do(func(s *handlers.HADeleteScene) { tags, _ = s.Configs[101]["tags"].(string) })
+		if strings.Contains(tags, ha.ReaddTagPrefix) {
+			t.Fatalf("tags %q still carry the re-registration tag", tags)
+		}
 	})
 	t.Run("stopped guest is cleared and started", func(t *testing.T) {
 		t.Parallel()
