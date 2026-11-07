@@ -46,6 +46,18 @@ func MoveTaskIDNamesVM(id string, vmid int) bool {
 	return id == own || strings.HasPrefix(id, own+"-")
 }
 
+// MoveTaskIDTouchesVM reports whether a qmmove task's ID names vmid as the VM
+// it moves a disk from, or as the VM a move to another VM gives the disk to.
+// The second kind has the ID "<vmid>-<disk>><target-vmid>-<target-disk>"
+// (qemu-server Qemu.pm:5196-5199), so its target follows the '>'.
+func MoveTaskIDTouchesVM(id string, vmid int) bool {
+	if MoveTaskIDNamesVM(id, vmid) {
+		return true
+	}
+	_, target, ok := strings.Cut(id, ">")
+	return ok && vmid > 0 && strings.HasPrefix(target, strconv.Itoa(vmid)+"-")
+}
+
 // ActiveMoveTasks lists every qmmove task in node's active task list. PVE
 // shows another user's tasks only to a caller with Sys.Audit on the node
 // (pve-manager Tasks.pm:184 and :190), so the listing first proves that grant

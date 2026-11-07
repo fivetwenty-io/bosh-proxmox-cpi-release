@@ -10,7 +10,10 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
 
-const managedVMCallDeleteHAResource = "Cluster.DeleteHaResources"
+const (
+	managedVMCallDeleteHAResource = "Cluster.DeleteHaResources"
+	managedVMCallUpdateHAResource = "Cluster.UpdateHaResources"
+)
 
 // errManagedHAResourceDeleteRefused marks an HA resource removal that a VM
 // allocation's guard refused before it wrote any intent or called PVE. The
@@ -73,6 +76,24 @@ func (m *managedVMAllocation) noteStagedHAResource(call ManagedAllocationMutatio
 		return
 	}
 	m.haResourceStaged = true
+}
+
+// noteHAResourceActivation ends the staged admission once this call sends a
+// request that moves the allocated VM's HA resource out of ignored, such as
+// the started request that activates it. From then on the resource is no
+// longer only staged, so admitHAResourceDelete refuses its removal. An update
+// of another resource, one that keeps the resource ignored, and one that sets
+// no state leave the admission as it was.
+func (m *managedVMAllocation) noteHAResourceActivation(call ManagedAllocationMutation) {
+	if call.Service+"."+call.Method != managedVMCallUpdateHAResource {
+		return
+	}
+	sid, _ := call.Args["sid"].(string)
+	params, ok := call.Args[managedArgumentParams].(*cluster.UpdateHaResourcesParams)
+	if sid != haResourceSid(m.vmid) || !ok || params == nil || params.State == nil || *params.State == "ignored" {
+		return
+	}
+	m.haResourceStaged = false
 }
 
 // observeDeletedHAResource proves that the allocated VM's HA resource is gone

@@ -174,6 +174,15 @@ type VMDecision struct {
 	// under HA treats as temporary rather than as a reason to leave HA.
 	PlaceableShortfall bool
 
+	// Transient is true when the decision refused HA for a reason that may
+	// pass on its own, such as a node of the VM's access set or CPU domain
+	// that is down or unreadable, or a storage read that failed. A refusal
+	// whose cause the decision cannot tell is transient too. A caller whose VM
+	// already runs under HA defers on a transient refusal and never takes the
+	// VM out of HA for it. Only a refusal on proven, permanent facts leaves
+	// Transient false.
+	Transient bool
+
 	// CPUDomain is the CPU migration domain of the placed node when the CPU type
 	// is host or max, and nil otherwise.
 	CPUDomain []string
@@ -330,7 +339,7 @@ func (e *eligibility) decide() {
 	}
 	e.members = e.p.nodeNames()
 	if len(e.members) == 0 {
-		e.refuse(cpierrors.Cloud("the HA profile lists no cluster node"))
+		e.refuse(cpierrors.Cloud("the HA profile lists no cluster node"), true)
 		return
 	}
 	e.placeable = e.p.placeableSet()
@@ -351,8 +360,10 @@ func (e *eligibility) fail(err error) {
 }
 
 // refuse ends the decision the way a missing prerequisite does: no HA for the VM
-// in auto, an error in managed.
-func (e *eligibility) refuse(err error) {
+// in auto, an error in managed. transient says the refusal may pass on its own
+// (see VMDecision.Transient), and a call site that cannot tell passes true.
+func (e *eligibility) refuse(err error, transient bool) {
+	e.d.Transient = transient
 	if e.managed {
 		e.fail(err)
 		return
@@ -403,9 +414,9 @@ type volumeClass struct {
 // classify reads the volumes and ends the decision.
 func (e *eligibility) classify() {
 	topology := e.cfg.HAStorageTopologyValue()
-	classes, err := e.classifyVolumes(topology)
+	classes, transient, err := e.classifyVolumes(topology)
 	if err != nil {
-		e.refuse(err)
+		e.refuse(err, transient)
 		return
 	}
 	var diskLocal, isoLocal []string
@@ -430,14 +441,17 @@ func (e *eligibility) classify() {
 		return
 	}
 	getter := e.storageGetter(topology)
+	// Every volume was classified against the same storage index, so an access
+	// set that still cannot be read has a cause the decision cannot tell, and
+	// the refusal is transient.
 	diskAccess, err := e.narrow(getter, disks)
 	if err != nil {
-		e.refuse(err)
+		e.refuse(err, true)
 		return
 	}
 	allAccess, err := e.narrow(getter, append(append([]pve.AccessVolume{}, disks...), isos...))
 	if err != nil {
-		e.refuse(err)
+		e.refuse(err, true)
 		return
 	}
 	e.d.Access = allAccess
@@ -475,10 +489,13 @@ func (e *eligibility) classify() {
 }
 
 // classifyVolumes pairs every volume with its storage. A volume whose storage
-// the profile does not carry cannot be placed, so it ends the decision.
-func (e *eligibility) classifyVolumes(topology string) ([]*volumeClass, error) {
+// the profile does not carry cannot be placed, so it ends the decision. The
+// bool says the error is transient: storage definitions that could not be
+// read, or that do not list a storage a volume is on, may be a failed or
+// stale read, while a volume ID with no storage is a proven, permanent fault.
+func (e *eligibility) classifyVolumes(topology string) ([]*volumeClass, bool, error) {
 	if len(e.in.Volumes) > 0 && e.p.StoragesErr != "" {
-		return nil, cpierrors.Cloud("the storage definitions could not be read (%s), so the volumes of VM %d "+
+		return nil, true, cpierrors.Cloud("the storage definitions could not be read (%s), so the volumes of VM %d "+
 			"cannot be classified", e.p.StoragesErr, e.in.VMID)
 	}
 	e.infos = make(map[string]pve.StorageInfo, len(e.p.Storages))
@@ -490,11 +507,11 @@ func (e *eligibility) classifyVolumes(topology string) ([]*volumeClass, error) {
 		v := e.in.Volumes[i]
 		storage, name, ok := strings.Cut(v.Volume, ":")
 		if !ok || storage == "" || name == "" {
-			return nil, cpierrors.Cloud("%q is not a storage-qualified volume ID", v.Volume)
+			return nil, false, cpierrors.Cloud("%q is not a storage-qualified volume ID", v.Volume)
 		}
 		info, known := e.infos[storage]
 		if !known {
-			return nil, cpierrors.Cloud("volume %s is on storage %q, which the storage definitions do not list",
+			return nil, true, cpierrors.Cloud("volume %s is on storage %q, which the storage definitions do not list",
 				v.Volume, storage)
 		}
 		if strings.TrimSpace(v.HomeNode) == "" {
@@ -503,7 +520,7 @@ func (e *eligibility) classifyVolumes(topology string) ([]*volumeClass, error) {
 		local := topology == config.HAStorageTopologyLocal || !info.IsShared()
 		out = append(out, &volumeClass{vol: v, info: info, local: local})
 	}
-	return out, nil
+	return out, false, nil
 }
 
 // storageGetter answers VolumeAccessSet from the profile's storage definitions.
@@ -563,14 +580,21 @@ func (e *eligibility) cpuDomain() ([]string, error) {
 func (e *eligibility) decideShared(access, domain []string, domainErr error) {
 	allowed := access
 	if CPUTypeNeedsDomain(e.in.CPUType) {
+		// The placed node's CPU is unknown when its probe failed, so the
+		// domain cannot be stated only for now.
 		if domainErr != nil {
-			e.refuse(e.cpuError(domainErr.Error(), false))
+			e.refuse(e.cpuError(domainErr.Error(), true), true)
 			return
 		}
 		allowed = intersect(access, domain)
 		if n := e.countPlaceable(allowed); n < 2 {
+			// The domain is too small only for now when it holds enough nodes
+			// that are not placeable, or when a node of the access set has a
+			// CPU the probe could not read, because a node that is down or was
+			// not probed may belong to the domain.
+			transient := len(allowed) >= 2 || e.unknownCPUIn(access)
 			e.refuse(e.cpuError(fmt.Sprintf("its CPU migration domain %s holds %d placeable node(s)",
-				listOrNone(allowed), n), len(allowed) >= 2))
+				listOrNone(allowed), n), transient), transient)
 			return
 		}
 	}
@@ -578,9 +602,20 @@ func (e *eligibility) decideShared(access, domain []string, domainErr error) {
 	e.register(PolicyShared, allowed, "every volume is on shared storage that at least two placeable nodes reach")
 }
 
+// unknownCPUIn reports whether a node of nodes has a CPU the profile could not
+// read, which is what a node that is down or was not probed shows.
+func (e *eligibility) unknownCPUIn(nodes []string) bool {
+	for _, n := range e.p.UnknownCPUNodes {
+		if contains(nodes, n) {
+			return true
+		}
+	}
+	return false
+}
+
 // cpuError builds the refusal for a host or max CPU type whose migration
-// domain is too small. transient is true when the domain holds enough nodes
-// and only their health is missing.
+// domain is too small or cannot be stated. transient is true when the domain
+// may only be missing nodes that are unhealthy or unreadable now.
 func (e *eligibility) cpuError(detail string, transient bool) error {
 	text := fmt.Sprintf("VM %d gets no HA: its CPU type %q can live-migrate only between nodes with the same CPU "+
 		"model and flags, and %s. Set pve.cpu_type to the newest CPU model that every node of the cluster "+
@@ -599,14 +634,15 @@ func (e *eligibility) decideLocal(
 ) {
 	policy := e.cfg.HALocalPolicyValue()
 	if topology == config.HAStorageTopologyShared {
-		e.refuse(cpierrors.Cloud("pve.ha.storage_topology is shared, and VM %d cannot be HA-managed: %s", e.in.VMID, why))
+		e.refuse(cpierrors.Cloud("pve.ha.storage_topology is shared, and VM %d cannot be HA-managed: %s", e.in.VMID, why),
+			false)
 		return
 	}
 	switch policy {
 	case config.HALocalPolicyHold:
 		if !contains(access, e.d.Node) {
 			e.refuse(cpierrors.Cloud("VM %d cannot be pinned to node %s, because its volumes are not all reachable "+
-				"from it (access set %s)", e.in.VMID, e.d.Node, listOrNone(access)))
+				"from it (access set %s)", e.in.VMID, e.d.Node, listOrNone(access)), false)
 			return
 		}
 		e.register(PolicyHold, []string{e.d.Node},
@@ -628,12 +664,12 @@ func (e *eligibility) register(policy Policy, hard []string, reason string) {
 	}
 	if len(set) == 0 {
 		e.refuse(cpierrors.Cloud("VM %d has an empty hard admissible set: its volumes, hardware, CPU model, and "+
-			"availability zone %q leave no node that satisfies all of them", e.in.VMID, e.in.AZ))
+			"availability zone %q leave no node that satisfies all of them", e.in.VMID, e.in.AZ), false)
 		return
 	}
 	if !contains(set, e.d.Node) {
 		e.refuse(cpierrors.Cloud("VM %d is placed on node %s, which lies outside its hard admissible set %s",
-			e.in.VMID, e.d.Node, strings.Join(set, ",")))
+			e.in.VMID, e.d.Node, strings.Join(set, ",")), false)
 		return
 	}
 	e.d.Outcome, e.d.Policy, e.d.Reason = OutcomeRegister, policy, reason
@@ -707,26 +743,34 @@ func (e *eligibility) checkLegacy(classes []*volumeClass) {
 }
 
 // decideReplicate checks the replication prerequisites and picks the partner.
+// A refusal is transient unless one of its gaps rests on proven, permanent
+// facts, such as a linked clone or a storage that is not a ZFS pool.
 func (e *eligibility) decideReplicate(
 	classes []*volumeClass, domain []string, domainErr error, isoLocal bool, why string,
 ) {
 	var gaps []string
+	permanent := false
+	gap := func(proven bool, text string) {
+		gaps = append(gaps, text)
+		permanent = permanent || proven
+	}
 	if isoLocal {
 		if e.managed || e.cfg.RequireSharedISOForHAEnabled() {
 			e.fail(cpierrors.Cloud("VM %d holds a node-local ISO, and replication does not copy it; point "+
 				"pve.iso_storage at shared storage", e.in.VMID))
 			return
 		}
-		gaps = append(gaps, "its config-drive ISO is node-local and replication does not copy it")
+		gap(true, "its config-drive ISO is node-local and replication does not copy it")
 	}
 	if !e.p.VMReplicate {
-		gaps = append(gaps, "the token lacks VM.Replicate on /vms")
+		// A permissions read that failed leaves the privilege unknown.
+		gap(e.p.PermissionsErr == "", "the token lacks VM.Replicate on /vms")
 	}
 	if e.in.LinkedClone {
-		gaps = append(gaps, "its disks are linked clones whose base may live only on the source")
+		gap(true, "its disks are linked clones whose base may live only on the source")
 	}
 	if domainErr != nil {
-		gaps = append(gaps, domainErr.Error())
+		gap(false, domainErr.Error())
 	}
 	candidates := e.replicaCandidates(domain)
 	var sharedVols []pve.AccessVolume
@@ -738,7 +782,7 @@ func (e *eligibility) decideReplicate(
 	if len(sharedVols) > 0 {
 		sa, err := e.narrow(storageIndex{infos: e.infos}, sharedVols)
 		if err != nil {
-			gaps = append(gaps, err.Error())
+			gap(false, err.Error())
 		} else {
 			candidates = intersect(candidates, sa)
 		}
@@ -747,12 +791,14 @@ func (e *eligibility) decideReplicate(
 	for _, c := range classes {
 		if c.local && c.vol.kind() == VolumeDisk {
 			localDisks++
-			gaps = append(gaps, e.zfsGaps(c)...)
+			for _, g := range e.zfsGaps(c) {
+				gap(true, g)
+			}
 			candidates = intersect(candidates, e.zfsNodes(c.info))
 		}
 	}
 	if localDisks == 0 {
-		gaps = append(gaps, "it holds no node-local disk for a replication job to copy")
+		gap(true, "it holds no node-local disk for a replication job to copy")
 	}
 	candidates = remove(candidates, e.d.Node)
 	var partners []string
@@ -762,10 +808,15 @@ func (e *eligibility) decideReplicate(
 		}
 	}
 	if len(partners) == 0 {
-		gaps = append(gaps, "no placeable partner node has the same ZFS storage and reaches the shared volumes")
+		// A candidate that is not placeable now, or a node whose CPU the probe
+		// could not read and that may belong to the domain, can come back.
+		mayJoin := CPUTypeNeedsDomain(e.in.CPUType) && e.unknownCPUIn(e.members)
+		gone := len(candidates) == 0 && !mayJoin
+		gap(gone, "no placeable partner node has the same ZFS storage and reaches the shared volumes")
 	}
 	if len(gaps) > 0 {
-		e.refuse(cpierrors.Cloud("VM %d cannot use local_policy replicate (%s): %s", e.in.VMID, why, strings.Join(gaps, "; ")))
+		e.refuse(cpierrors.Cloud("VM %d cannot use local_policy replicate (%s): %s", e.in.VMID, why,
+			strings.Join(gaps, "; ")), !permanent)
 		return
 	}
 	partner := partners[0]

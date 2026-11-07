@@ -75,9 +75,12 @@ type attachHA struct {
 // VM's volumes and the new disk:
 //
 //   - A failing decision returns its error.
-//   - A decision that gives the VM no HA, such as a local disk under
-//     pve.ha.local_policy none or a narrowed set with fewer than two
-//     placeable nodes, makes the attach remove the VM from HA first.
+//   - A decision that refuses HA for a reason that may pass, such as a node
+//     that is down, in maintenance, or unreadable, or a storage read that
+//     failed, returns a retriable error and changes nothing in HA.
+//   - A decision that gives the VM no HA on proven facts, such as a local
+//     disk under pve.ha.local_policy none, makes the attach remove the VM
+//     from HA first.
 //   - A decision that registers the VM makes the attach run inside the
 //     narrowing barrier with the pin it gives.
 //
@@ -193,6 +196,14 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 			"new disk, but fewer than two of them can take the VM now; the attach waits until enough of them "+
 			"are healthy again rather than take the VM out of HA for a temporary outage", op, vmid,
 			strings.Join(d.Access, ","))
+	case d.Transient:
+		// The decision refused HA for a reason that may pass, such as a node
+		// of the VM's CPU domain that is down or unreadable, or a storage read
+		// that failed. Leaving HA cannot be undone by the next attach, so the
+		// attach waits and the VM keeps its HA resource, its tag, and its pin.
+		return nil, cpierrors.Retriable("%s: VM %d is HA-managed, and the HA decision refused HA with the new disk "+
+			"for a reason that may pass (%s); the attach waits rather than take the VM out of HA for it", op, vmid,
+			d.Reason)
 	case d.Outcome == ha.OutcomeRegister:
 		newPin, err := attachNewPin(d, oldPin, profile, set, ha.VolumeStorages(in.Volumes), owner)
 		if err != nil {
@@ -434,6 +445,7 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 		},
 		CheckReach: h.checkReach,
 		Unchanged:  h.attachUnchanged,
+		Moving:     h.attachMoving,
 		SysConsole: h.profile.SysConsole,
 		Budget:     haMotionWait(h.deps),
 	})
@@ -507,11 +519,47 @@ func (h *attachHA) attachUnchanged(ctx context.Context, node string) (bool, erro
 	return true, nil
 }
 
+// attachMoving answers the barrier's Moving after an attach that returned an
+// error. A failed wait does not stop a PVE task, so the disk may still land
+// after the attach gave up on it. A config lock, such as the migrate lock a
+// migration or an HA relocation holds, and a qmmove task in node's active
+// task list that moves a disk from or onto the VM, such as the transfer from
+// a parker, each answer true. PVE lists a task as active until it archives
+// it, so a task that has just ended still answers true, and the attach then
+// defers once more. The listing needs Sys.Audit on the node. A client that
+// cannot list tasks, a missing privilege, and a failed read are errors, which
+// keep the narrower pin.
+func (h *attachHA) attachMoving(ctx context.Context, node string) (bool, error) {
+	cfg, err := h.deps.PVE.QEMU().Config(ctx, node, h.vmid)
+	if err != nil {
+		return false, fmt.Errorf("read the config of VM %d: %w", h.vmid, pve.WrapError(err))
+	}
+	if lock, _ := pve.ConfigString(cfg, "lock"); strings.TrimSpace(lock) != "" {
+		return true, nil
+	}
+	reader, ok := h.deps.PVE.(pve.ActiveMoveTaskReader)
+	if !ok {
+		return false, fmt.Errorf("the PVE client cannot list the active move tasks on node %s", node)
+	}
+	tasks, err := reader.ActiveMoveTasks(ctx, node)
+	if err != nil {
+		return false, fmt.Errorf("list the active move tasks on node %s: %w", node, err)
+	}
+	for _, task := range tasks {
+		if pve.MoveTaskIDTouchesVM(task.ID, h.vmid) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // writePin writes the VM's pin under the rules lock and verifies it. A nil pin
-// removes it, which the barrier asks for only when the change needs no pin.
+// is the barrier putting back a VM that had no pin, after an attach that
+// provably changed nothing, so it removes only the pin this attach wrote (see
+// removeAttachPin) and never the VM's HA resource.
 func (h *attachHA) writePin(ctx context.Context, pin *ha.Rule) error {
 	if pin == nil {
-		return removeNodeAffinityPin(ctx, h.deps, h.vmid, h.logger)
+		return h.removeAttachPin(ctx)
 	}
 	owner := h.deps.RequestDirectorUUID
 	err := withHARulesLock(ctx, h.deps, h.vmid, h.logger, func() error {
@@ -543,6 +591,30 @@ func (h *attachHA) writePin(ctx context.Context, pin *ha.Rule) error {
 		Logger:    h.logger,
 	}
 	return stager.Verify(ctx, h.decision, pin, "")
+}
+
+// removeAttachPin deletes the node-affinity pin this attach wrote for a VM
+// that had none before. It never touches the VM's HA resource, which stays
+// registered and is restored by the barrier. A rule that is not this
+// Director's, or not the pin this attach wrote, stays, and the error says so,
+// because the barrier then keeps what is there, which over-confines the VM at
+// worst.
+func (h *attachHA) removeAttachPin(ctx context.Context) error {
+	if h.newPin == nil {
+		return fmt.Errorf("node-affinity: VM %d has no pin from this attach to remove", h.vmid)
+	}
+	owner := h.deps.RequestDirectorUUID
+	return deleteNodeAffinityRule(ctx, h.deps, h.vmid, h.logger, func(cur *ha.Rule) error {
+		switch {
+		case owner == "" || haOwnershipOf(cur.Comment, owner) != haOwnedByUs:
+			return fmt.Errorf("rule %q does not carry this Director's ownership marker; leaving it", cur.ID)
+		case cur.Type != ha.RuleTypeNodeAffinity:
+			return fmt.Errorf("rule %q is a %s rule, not a node-affinity pin; leaving it", cur.ID, cur.Type)
+		case !ha.SameRule(h.newPin, cur):
+			return fmt.Errorf("rule %q is not the pin this attach wrote; leaving it", cur.ID)
+		}
+		return nil
+	})
 }
 
 // checkReach re-reads the VM's config after the attach and checks that every

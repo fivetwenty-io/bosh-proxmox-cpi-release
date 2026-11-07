@@ -167,6 +167,7 @@ func rollbackOnExit(
 		current := node()
 		if deps.Config.KeepFailedVMsEnabled() {
 			rbCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
+			current = rollbackTagNode(rbCtx, deps, current, vmid, logger)
 			keepFailedVM(rbCtx, deps, current, vmid, env, logger)
 			rbCancel()
 			*retErr = preserveFailedVMError(*retErr, vmid, current)
@@ -174,6 +175,27 @@ func rollbackOnExit(
 		}
 		cleanupVMDetached(ctx, deps, current, vmid, env, logger)
 	}
+}
+
+// rollbackTagNode returns the node a failed create's tag is written on: the
+// node the rollback resolves for the VM, which for a VM PVE HA lists is where
+// it runs now (see rollbackTeardownNode). When that node cannot be proved, the
+// tag goes to node, the last place the create put the VM, and a warning says
+// the tag may be missing, because a VM PVE HA moved does not answer there.
+func rollbackTagNode(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) string {
+	resolved, _, err := rollbackTeardownNode(ctx, deps, "create_vm: rollback", node, vmid, logger)
+	if err != nil {
+		warnTagNodeUnproved(logger, node, vmid, err)
+	}
+	return resolved
+}
+
+// warnTagNodeUnproved logs that a failed create's tag is written on node
+// without proof that the VM is still there.
+func warnTagNodeUnproved(logger *log.Logger, node string, vmid int, err error) {
+	logger.Warn("create_vm: rollback: the VM is under PVE HA and its current node could not be proved, so its "+
+		"bosh-create-failed tag goes to the node the create last placed it on and may be missing",
+		log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Err(err))
 }
 
 // disposeFailedVM either preserves (keep-failed mode) or destroys a VM that is
@@ -184,7 +206,7 @@ func disposeFailedVM(
 	ctx context.Context, deps Deps, node func() string, vmid int, env map[string]any, logger *log.Logger,
 ) {
 	if deps.Config.KeepFailedVMsEnabled() {
-		keepFailedVM(ctx, deps, node(), vmid, env, logger)
+		keepFailedVM(ctx, deps, rollbackTagNode(ctx, deps, node(), vmid, logger), vmid, env, logger)
 		return
 	}
 	cleanupVM(ctx, deps, node(), vmid, env, logger)
@@ -473,6 +495,9 @@ func cleanupVMClaimed(ctx context.Context, deps Deps, node string, vmid int, env
 	ctx = pve.WithOwnedConfigDriveISO(ctx, vmid)
 	node, gate, err := rollbackTeardownNode(ctx, deps, caller, node, vmid, logger)
 	if err != nil {
+		if env != nil {
+			warnTagNodeUnproved(logger, node, vmid, err)
+		}
 		cleanupVMLeftVM(ctx, deps, node, vmid, env, teardownStageHA, err, logger)
 		return
 	}

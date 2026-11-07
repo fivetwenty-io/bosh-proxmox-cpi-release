@@ -32,7 +32,9 @@ type managedVMAllocation struct {
 	configBefore map[string]map[string]any
 	// haResourceStaged is set once this call has created the VM's HA resource
 	// as ignored and proved the creation, so the guard admits the removal
-	// that undoes the staging (see admitHAResourceDelete).
+	// that undoes the staging (see admitHAResourceDelete). A request that
+	// moves the resource out of ignored clears it, because the removal of an
+	// active resource undoes no staging.
 	haResourceStaged bool
 }
 
@@ -159,6 +161,9 @@ func (m *managedVMAllocation) beforeMutation(ctx context.Context, call ManagedAl
 		m.chargeSteps[charge.Charge.ID] = step
 		m.chargeIndices[charge.Charge.ID] = index
 	}
+	// The call goes to PVE once its intent is recorded, so an activation ends
+	// the staged admission here, whether its answer comes back or not.
+	m.noteHAResourceActivation(call)
 	return step, nil
 }
 

@@ -92,7 +92,9 @@ type NarrowInput struct {
 	OldPin *Rule
 	NewPin *Rule
 	// WritePin writes a pin through the rules writer and verifies it. A nil
-	// pin removes the VM's pin.
+	// pin comes only from putting OldPin back on a VM that had no pin, and it
+	// removes the pin the change wrote and nothing else: the VM's HA resource
+	// stays, because the barrier restores its state next.
 	WritePin func(ctx context.Context, pin *Rule) error
 	// Mutation is the config change. Its Node is set from the drain.
 	Mutation pve.VMConfigMutation
@@ -106,6 +108,13 @@ type NarrowInput struct {
 	// error keeps the narrower pin, which over-confines the VM but never lets
 	// PVE HA move it to a node the change does not reach.
 	Unchanged func(ctx context.Context, node string) (bool, error)
+	// Moving answers, after a mutation that returned an error and before
+	// Unchanged, whether a migration, relocation, or disk move task for the
+	// VM is still running on node. Such a task can still land the change
+	// after the old pin is back, so true keeps the narrower pin and makes the
+	// barrier's error retriable. An error, or a nil Moving, also keeps the
+	// narrower pin, so a caller that cannot tell never gets a wider pin.
+	Moving func(ctx context.Context, node string) (bool, error)
 	// SysConsole says the token holds Sys.Console, which the ignored and
 	// started requests need.
 	SysConsole bool
@@ -318,8 +327,13 @@ func (b *barrier) viaIgnored(ctx context.Context, resumed bool) (pve.VMLocation,
 	if err != nil {
 		// The VM sits inside the narrower set, which the old config allows
 		// too, so starting it again is safe whether the mutation landed or not.
-		// A mutation proven not to have landed gets the old pin back first.
-		b.revertPin(ctx, drained)
+		// A mutation proven not to have landed gets the old pin back first. A
+		// task that is still running may land it yet, so it keeps the
+		// narrower pin, and the call defers until the task is done.
+		if running := b.revertPin(ctx, drained); running != nil {
+			err = cpierrors.WrapAs(fmt.Errorf("%w; %w", err, running), cpierrors.TypeRetriableCloud, fmt.Sprintf(
+				"ha narrow: VM %d keeps its narrower pin until the task is done", b.in.VMID))
+		}
 		return loc, b.restoreAfter(ctx, err)
 	}
 	if err := b.checkLanding(ctx, loc.Node); err != nil {
@@ -333,30 +347,53 @@ func (b *barrier) viaIgnored(ctx context.Context, resumed bool) (pve.VMLocation,
 	return loc, nil
 }
 
-// revertPin writes OldPin back after a mutation that failed, when Unchanged
-// proves the config holds none of the change. Any other answer keeps the
-// narrower pin. A failed write is logged, because the narrower pin it leaves
-// only over-confines the VM, and the restore that follows must still run.
-func (b *barrier) revertPin(ctx context.Context, node string) {
+// revertPin writes OldPin back after a mutation that failed, when Moving says
+// no task for the VM is still running and Unchanged then proves the config
+// holds none of the change. Moving is asked first, because a task that has
+// ended cannot land the change after Unchanged reads, while one that ends
+// between the two reads could. Any other answer keeps the narrower pin. A
+// failed write is logged, because the narrower pin it leaves only
+// over-confines the VM, and the restore that follows must still run. It
+// returns an error that names the running task when one is still running,
+// and nil otherwise.
+func (b *barrier) revertPin(ctx context.Context, node string) error {
 	if b.in.Unchanged == nil || b.in.WritePin == nil || node == "" {
-		return
+		return nil
+	}
+	if b.in.Moving == nil {
+		b.deps.Logger.Warn("ha narrow: whether a task for the VM is still running cannot be told; the narrower "+
+			"pin stays", log.Int("vmid", b.in.VMID), log.String("sid", b.sid))
+		return nil
+	}
+	moving, err := b.in.Moving(ctx, node)
+	switch {
+	case err != nil:
+		b.deps.Logger.Warn("ha narrow: could not tell whether a task for the VM is still running; the narrower "+
+			"pin stays", log.Int("vmid", b.in.VMID), log.String("sid", b.sid), log.Err(err))
+		return nil
+	case moving:
+		b.deps.Logger.Warn("ha narrow: a migration, relocation, or disk move task for the VM is still running; "+
+			"the narrower pin stays", log.Int("vmid", b.in.VMID), log.String("sid", b.sid))
+		return fmt.Errorf("a migration, relocation, or disk move task for VM %d is still running on node %s",
+			b.in.VMID, node)
 	}
 	unchanged, err := b.in.Unchanged(ctx, node)
 	switch {
 	case err != nil:
 		b.deps.Logger.Warn("ha narrow: could not tell whether the failed change landed; the narrower pin stays",
 			log.Int("vmid", b.in.VMID), log.String("sid", b.sid), log.Err(err))
-		return
+		return nil
 	case !unchanged:
-		return
+		return nil
 	}
 	if err := b.in.WritePin(ctx, b.in.OldPin); err != nil {
 		b.deps.Logger.Warn("ha narrow: the change did not land, and the old pin could not be written back; the "+
 			"narrower pin stays", log.Int("vmid", b.in.VMID), log.String("sid", b.sid), log.Err(err))
-		return
+		return nil
 	}
 	b.deps.Logger.Info("ha narrow: the change did not land, so the old pin is back",
 		log.Int("vmid", b.in.VMID), log.String("sid", b.sid))
+	return nil
 }
 
 // checkLanding re-reads the config, checks volume reach from the narrower

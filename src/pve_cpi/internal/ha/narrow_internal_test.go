@@ -469,26 +469,53 @@ func TestNarrowRevertsThePinOnlyWhenTheFailedChangeProvedUnlanded(t *testing.T) 
 	for name, tc := range map[string]struct {
 		unchanged bool
 		err       error
+		noMoving  bool
+		moving    bool
+		movingErr error
 		revert    bool
+		asks      bool
+		retriable bool
 	}{
-		"proved unlanded": {unchanged: true, revert: true},
-		"landed":          {unchanged: false},
-		"unreadable":      {err: errors.New("config unreadable")},
+		"proved unlanded":         {unchanged: true, revert: true, asks: true},
+		"landed":                  {unchanged: false, asks: true},
+		"unreadable":              {err: errors.New("config unreadable"), asks: true},
+		"a task is still running": {unchanged: true, moving: true, retriable: true},
+		"the task list is unread": {unchanged: true, movingErr: errors.New("needs Sys.Audit")},
+		"the caller cannot tell":  {unchanged: true, noMoving: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := &barrierRig{state: "started", settleOn: []string{"a"}, mutErr: errors.New("attach refused"),
 				states: []*pve.HAServiceState{crm("started", 100, 90, 95), dropped("a", 110, 120, 125)}}
 			in := r.input(&pinAB, &pinA)
-			asked := ""
+			asked, askedMoving := "", ""
 			in.Unchanged = func(_ context.Context, node string) (bool, error) {
 				asked = node
 				return tc.unchanged, tc.err
 			}
-			if _, err := NarrowActive(context.Background(), r.deps(), in); err == nil {
+			if !tc.noMoving {
+				in.Moving = func(_ context.Context, node string) (bool, error) {
+					askedMoving = node
+					if asked != "" {
+						t.Error("Moving must be asked before Unchanged")
+					}
+					return tc.moving, tc.movingErr
+				}
+			}
+			_, err := NarrowActive(context.Background(), r.deps(), in)
+			if err == nil {
 				t.Fatal("a failed mutation must return its error")
 			}
-			if asked != "a" {
-				t.Fatalf("Unchanged asked about %q, want the drained node a", asked)
+			if !errors.Is(err, r.mutErr) {
+				t.Errorf("err = %v, want it to carry the mutation's error", err)
+			}
+			if got := cpierrors.IsType(err, cpierrors.TypeRetriableCloud); got != tc.retriable {
+				t.Errorf("retriable %v, want %v: %v", got, tc.retriable, err)
+			}
+			if !tc.noMoving && askedMoving != "a" {
+				t.Fatalf("Moving asked about %q, want the drained node a", askedMoving)
+			}
+			if tc.asks != (asked == "a") {
+				t.Fatalf("Unchanged asked about %q, want asked %v on the drained node a", asked, tc.asks)
 			}
 			want := []string{"request:ignored", "pin:a", "mutate:a"}
 			if tc.revert {

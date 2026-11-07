@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -578,4 +579,24 @@ func (d *managedVMGuardDefinitions) ListStorage(context.Context, *clusterstorage
 		rows = append(rows, raw)
 	}
 	return &rows, nil
+}
+
+// TestManagedVMGuardEndsTheStagedAdmissionWhenItActivatesTheResource sends the
+// started request for the allocated VM's staged HA resource through the
+// allocation's own admission. Once its intent is recorded, the resource is no
+// longer only staged, so the guard refuses to remove it.
+func TestManagedVMGuardEndsTheStagedAdmissionWhenItActivatesTheResource(t *testing.T) {
+	m, _, _, _ := newManagedVMGuardCase(t, managedVMGuardCase{})
+	m.noteStagedHAResource(stagedHAResourceCall("vm:101", "ignored"))
+	started := "started"
+	if _, err := m.beforeMutation(context.Background(), updateHAResourceCall("vm:101", &started)); err != nil {
+		t.Fatalf("the activation was refused: %v", err)
+	}
+	if m.haResourceStaged {
+		t.Fatal("the guard still admits the unstage of a resource it activated")
+	}
+	if _, err := m.beforeMutation(context.Background(), haResourceDeleteCall("vm:101")); !errors.Is(err,
+		errManagedHAResourceDeleteRefused) {
+		t.Fatalf("the removal of an activated resource: err = %v, want a refusal", err)
+	}
 }

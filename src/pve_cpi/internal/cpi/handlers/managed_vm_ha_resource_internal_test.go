@@ -180,3 +180,46 @@ func TestManagedGuardSettlesARemovalPVEFoundNothingFor(t *testing.T) {
 		}
 	}
 }
+
+func updateHAResourceCall(sid string, state *string) ManagedAllocationMutation {
+	return ManagedAllocationMutation{Service: "Cluster", Method: "UpdateHaResources", Args: map[string]any{
+		"sid": sid, managedArgumentParams: &cluster.UpdateHaResourcesParams{State: state}}}
+}
+
+// TestManagedGuardEndsTheStagedAdmissionOnceTheResourceIsActivated refuses the
+// removal of the allocated VM's HA resource once this call has asked PVE HA to
+// move it out of ignored, because from then on the resource is live HA state
+// rather than a staging. An update that keeps it ignored, sets no state, or
+// names another VM leaves the admission in place.
+func TestManagedGuardEndsTheStagedAdmissionOnceTheResourceIsActivated(t *testing.T) {
+	ours := haIdentity{Owner: aaDirector}.marker()
+	state := func(s string) *string { return &s }
+	for name, tc := range map[string]struct {
+		call       ManagedAllocationMutation
+		wantStaged bool
+	}{
+		"started":       {updateHAResourceCall("vm:100", state("started")), false},
+		"stopped":       {updateHAResourceCall("vm:100", state("stopped")), false},
+		"still ignored": {updateHAResourceCall("vm:100", state("ignored")), true},
+		"no state":      {updateHAResourceCall("vm:100", nil), true},
+		"another VM":    {updateHAResourceCall("vm:101", state("started")), true},
+		"no parameters": {ManagedAllocationMutation{Service: "Cluster", Method: "UpdateHaResources",
+			Args: map[string]any{"sid": "vm:100"}}, true},
+		"a creation": {stagedHAResourceCall("vm:100", "started"), true},
+	} {
+		m := &managedVMAllocation{vmid: 100, deps: Deps{PVE: &haRulesReadClient{
+			svc: &haResourceReadCluster{comment: &ours}}, RequestDirectorUUID: aaDirector}}
+		m.noteStagedHAResource(stagedHAResourceCall("vm:100", "ignored"))
+		m.noteHAResourceActivation(tc.call)
+		if m.haResourceStaged != tc.wantStaged {
+			t.Errorf("%s: staged %v, want %v", name, m.haResourceStaged, tc.wantStaged)
+		}
+		err := m.admitHAResourceDelete(context.Background(), haResourceDeleteCall("vm:100"))
+		if tc.wantStaged && err != nil {
+			t.Errorf("%s: the unstage of a resource still staged was refused: %v", name, err)
+		}
+		if !tc.wantStaged && !errors.Is(err, errManagedHAResourceDeleteRefused) {
+			t.Errorf("%s: the removal of an activated resource: err = %v, want a refusal", name, err)
+		}
+	}
+}

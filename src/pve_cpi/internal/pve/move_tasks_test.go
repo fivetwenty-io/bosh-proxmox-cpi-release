@@ -169,3 +169,23 @@ func TestMoveTaskIDNamesVM(t *testing.T) {
 		t.Error("a VMID that is not positive matched")
 	}
 }
+
+func TestMoveTaskIDTouchesVM(t *testing.T) {
+	for id, want := range map[string]bool{
+		"777":                     true,
+		"777-unused0>90030-scsi0": true,
+		"90030-scsi0>777-scsi1":   true,
+		"90030-scsi0>7770-scsi1":  false,
+		"90030-scsi0>77-scsi1":    false,
+		"90030-scsi0>777":         false,
+		"90030":                   false,
+		"":                        false,
+	} {
+		if got := pve.MoveTaskIDTouchesVM(id, 777); got != want {
+			t.Errorf("MoveTaskIDTouchesVM(%q, 777) = %v, want %v", id, got, want)
+		}
+	}
+	if pve.MoveTaskIDTouchesVM("5-scsi0>0-scsi1", 0) || pve.MoveTaskIDTouchesVM("5-scsi0>-1-scsi1", -1) {
+		t.Error("a VMID that is not positive matched")
+	}
+}

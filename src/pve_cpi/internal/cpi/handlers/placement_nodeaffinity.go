@@ -334,10 +334,23 @@ func vmInDLBAZ(cp createVMCloudProps, cfg *config.CPIConfig) bool {
 // not-found-tolerant purge). The delete runs under the rules lock, and a pin
 // that carries another Director's marker stays.
 func removeNodeAffinityPin(ctx context.Context, deps Deps, vmid int, logger *log.Logger) error {
-	svc := deps.PVE.Cluster()
-	ruleName := naRuleNameFor(vmid)
-	sid := haResourceSid(vmid)
+	err := deleteNodeAffinityRule(ctx, deps, vmid, logger, nil)
 
+	// Deregister the HA resource (purge removes it from any remaining rules).
+	// Not-found is a no-op — anti-affinity cleanup may have purged it already.
+	deregisterHaResource(ctx, deps.PVE.Cluster(), haResourceSid(vmid), deps.RequestDirectorUUID, logger)
+	return err
+}
+
+// deleteNodeAffinityRule deletes a VM's node-affinity rule under the rules lock
+// and leaves the VM's HA resource alone. A missing rule is a no-op, and a rule
+// that carries another Director's marker stays. When keep is set, it answers
+// for the rule as read under the lock, and a non-nil answer leaves the rule in
+// place and is returned, so a caller removes only the rule it knows.
+func deleteNodeAffinityRule(
+	ctx context.Context, deps Deps, vmid int, logger *log.Logger, keep func(cur *ha.Rule) error,
+) error {
+	ruleName := naRuleNameFor(vmid)
 	err := withHARulesLock(ctx, deps, vmid, logger, func() error {
 		writer := newHARuleWriter(deps, nil, logger)
 		foreign := false
@@ -350,6 +363,11 @@ func removeNodeAffinityPin(ctx context.Context, deps Deps, vmid int, logger *log
 				foreign = true
 				return nil, nil
 			}
+			if keep != nil {
+				if err := keep(cur); err != nil {
+					return nil, err
+				}
+			}
 			return []ha.RuleOp{{Kind: ha.OpDelete, Rule: ha.Rule{ID: ruleName}}}, nil
 		})
 		if foreign {
@@ -358,13 +376,9 @@ func removeNodeAffinityPin(ctx context.Context, deps Deps, vmid int, logger *log
 		return err
 	})
 	if err != nil {
-		err = fmt.Errorf("node-affinity: delete rule %q: %w", ruleName, err)
+		return fmt.Errorf("node-affinity: delete rule %q: %w", ruleName, err)
 	}
-
-	// Deregister the HA resource (purge removes it from any remaining rules).
-	// Not-found is a no-op — anti-affinity cleanup may have purged it already.
-	deregisterHaResource(ctx, svc, sid, deps.RequestDirectorUUID, logger)
-	return err
+	return nil
 }
 
 // sortedNodesCSV renders a deduplicated, sorted, comma-separated node list,

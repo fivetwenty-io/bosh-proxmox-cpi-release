@@ -1132,3 +1132,112 @@ func TestDecisionFieldsReachTheRemovalRepair(t *testing.T) {
 		}
 	})
 }
+
+// TestDecideVMMarksTransientRefusals checks that a refusal whose cause may pass
+// is marked transient, so a caller whose VM runs under HA defers on it, and
+// that a refusal on proven, permanent facts is not.
+func TestDecideVMMarksTransientRefusals(t *testing.T) {
+	disks := vols("nfs:100/vm-101-disk-0")
+	host := func(in VMInput) VMInput { in.CPUType = eligHost; return in }
+	for name, tc := range map[string]struct {
+		profile   func(*Profile)
+		in        func(VMInput) VMInput
+		transient bool
+	}{
+		"the placed node's CPU is unreadable": {
+			profile: func(p *Profile) {
+				eligCPUs(p, map[string]string{"pve1": "", "pve2": "Xeon A", "pve3": "Xeon A"})
+			},
+			in: host, transient: true,
+		},
+		"a domain of one beside a node whose CPU is unreadable": {
+			profile: func(p *Profile) {
+				eligCPUs(p, map[string]string{"pve1": "Xeon A", "pve2": "", "pve3": "Xeon B"})
+			},
+			in: host, transient: true,
+		},
+		"a domain of two with one node in maintenance": {
+			profile: func(p *Profile) {
+				eligCPUs(p, map[string]string{"pve1": "Xeon A", "pve2": "Xeon A", "pve3": "Xeon B"})
+				p.Health = &pve.NodeHealthReport{Nodes: []pve.NodeHealthEntry{
+					{Name: "pve1", Placeable: true}, {Name: "pve2", Maintenance: true}, {Name: "pve3", Placeable: true},
+				}}
+			},
+			in: host, transient: true,
+		},
+		"a domain of one with every CPU known": {
+			profile: func(p *Profile) {
+				eligCPUs(p, map[string]string{"pve1": "Xeon A", "pve2": "Xeon B", "pve3": "Xeon B"})
+			},
+			in: host,
+		},
+		"storage definitions that could not be read": {
+			profile:   func(p *Profile) { p.StoragesErr = "connection reset" },
+			transient: true,
+		},
+		"a storage the definitions do not list": {
+			in:        func(in VMInput) VMInput { in.Volumes = vols("gone:100/vm-101-disk-0"); return in },
+			transient: true,
+		},
+		"a volume ID with no storage": {
+			in: func(in VMInput) VMInput { in.Volumes = vols("vm-101-disk-0"); return in },
+		},
+		"a node-local disk under local_policy none": {
+			in: func(in VMInput) VMInput { in.Volumes = vols("local-lvm:vm-101-disk-0"); return in },
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+			if tc.profile != nil {
+				tc.profile(p)
+			}
+			in := baseInput(eligCfg(config.HAModeAuto), disks...)
+			if tc.in != nil {
+				in = tc.in(in)
+			}
+			d := mustDecide(t, p, in)
+			if d.Outcome != OutcomeSkip || d.Transient != tc.transient {
+				t.Fatalf("outcome %s transient %v, want skip with transient %v: %s", d.Outcome, d.Transient,
+					tc.transient, d.Reason)
+			}
+		})
+	}
+}
+
+// TestDecideVMReplicateRefusalIsTransientOnlyWithoutAProvenGap marks a
+// replicate refusal transient when every gap may pass, such as a partner that
+// is only in maintenance, and permanent when any gap is proven.
+func TestDecideVMReplicateRefusalIsTransientOnlyWithoutAProvenGap(t *testing.T) {
+	maintenance := func(p *Profile) {
+		p.Health = &pve.NodeHealthReport{Nodes: []pve.NodeHealthEntry{
+			{Name: "pve1", Placeable: true}, {Name: "pve2", Maintenance: true}, {Name: "pve3", Maintenance: true},
+		}}
+	}
+	p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+	maintenance(p)
+	d := mustDecide(t, p, baseInput(replicateCfg(config.HAModeAuto), vols("tank:vm-101-disk-0")...))
+	if d.Outcome != OutcomeSkip || !d.Transient || !strings.Contains(d.Reason, "no placeable partner") {
+		t.Fatalf("a partner in maintenance: decision = %+v", d)
+	}
+
+	p = eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+	p.VMReplicate, p.PermissionsErr = false, "permissions unreadable"
+	d = mustDecide(t, p, baseInput(replicateCfg(config.HAModeAuto), vols("tank:vm-101-disk-0")...))
+	if d.Outcome != OutcomeSkip || !d.Transient {
+		t.Fatalf("an unreadable VM.Replicate grant: decision = %+v", d)
+	}
+
+	p = eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+	maintenance(p)
+	in := baseInput(replicateCfg(config.HAModeAuto), vols("tank:vm-101-disk-0")...)
+	in.LinkedClone = true
+	if d = mustDecide(t, p, in); d.Outcome != OutcomeSkip || d.Transient {
+		t.Fatalf("a linked clone beside a partner in maintenance: decision = %+v", d)
+	}
+
+	p = eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+	p.VMReplicate = false
+	if d = mustDecide(t, p, baseInput(replicateCfg(config.HAModeAuto), vols("tank:v")...)); d.Transient {
+		t.Fatalf("a proven missing VM.Replicate grant: decision = %+v", d)
+	}
+}

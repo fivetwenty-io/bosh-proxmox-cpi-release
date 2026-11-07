@@ -32,14 +32,17 @@ type kfNodes struct {
 	// failedTagCalls counts the tag writes that carry bosh-create-failed, as
 	// opposed to the bosh-deleting stamp a destroying rollback writes first.
 	failedTagCalls int
+	// failedTagOn is the node of the last bosh-create-failed tag write.
+	failedTagOn string
 }
 
-func (n *kfNodes) UpdateQemuConfig(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+func (n *kfNodes) UpdateQemuConfig(_ context.Context, node, _ string, params *sdknodes.UpdateQemuConfigParams) error {
 	n.updateCalls++
 	if params != nil && params.Tags != nil {
 		n.updatedTags = params.Tags
 		if strings.Contains(*params.Tags, tagCreateFailed) {
 			n.failedTagCalls++
+			n.failedTagOn = node
 		}
 	}
 	return n.updateErr
