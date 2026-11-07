@@ -57,7 +57,7 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 	fs.SetOutput(io.Discard)
 	configPath := fs.String("config", "", "CPI configuration file")
 	requestPath := fs.String("request", "", "CPI request JSON file whose context selects a cpi_config entry")
-	cpiConfigPath := fs.String("cpi-config", "", "BOSH cpi-config as JSON, not the rendered cpi.json; checks every type: pve cpis entry and their shared exports")
+	cpiConfigPath := fs.String("cpi-config", "", "BOSH cpi-config as JSON (not the rendered cpi.json), used to check every cpis entry of type pve and the exports they share")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args); errors.Is(err, flag.ErrHelp) {
 		fs.SetOutput(stderr)

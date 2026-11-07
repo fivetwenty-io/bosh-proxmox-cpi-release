@@ -211,13 +211,14 @@ properties:
       The N+1 memory check, which asks whether the surviving nodes could absorb
       the HA VMs of any one node that fails. It is an estimate, and create_vm
       runs it for a node only when the VM would be registered with HA there,
-      judged from the director_uuid, the root, ephemeral, config-drive, and
-      persistent disks, and the AZ, CPU, PCI, and bridge needs. A VM that gets no
-      HA on a node is never refused for that node, and the check is skipped when
-      a pool is not known before placement. It runs only when placement scores
-      the cluster's nodes, so it does not apply with cloud_properties.target_node,
-      a node-local persistent disk that pins the VM, placement disabled, or a
-      storage plan. "off" skips it, as does pve.ha.mode "off". "warn" (the
+      judged from the director_uuid and from the root, ephemeral, config-drive,
+      and persistent disks, together with the AZ, CPU, PCI, and bridge needs. A
+      VM that gets no HA on a node is never refused for that node, and the check
+      is skipped when a pool is not known before placement. It runs only when
+      placement scores the cluster's nodes, so it does not apply when
+      cloud_properties.target_node is set, when a node-local persistent disk pins
+      the VM, when placement is disabled, or when a storage plan places the VM.
+      "off" skips it, as does pve.ha.mode "off". "warn" (the
       default) logs a warning and places the VM anyway. "enforce" skips nodes
       that fall short, and it refuses the placement with a retriable error when
       none is left, or when the estimate cannot be read, without falling back to
