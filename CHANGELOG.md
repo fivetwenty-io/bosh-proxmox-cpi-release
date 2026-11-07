@@ -36,7 +36,7 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - With `pve.debug.keep_failed_vms` on, the sweep keeps every VM whose birth tag has expired, and it logs a warning that names up to ten of them, because nothing reaps them until we delete them or turn the setting off.
 
-- The cleanups that follow a VM destroy, of the agent state, the HA rule memberships, the node-affinity pin, and the advertised routes, now check first that the VMID is free or still holds the destroyed VM. They skip a VMID that another VM has taken, and they skip when the check can't finish.
+- Before the cleanups that follow a VM destroy run, the CPI now checks that the VMID is free or still holds the destroyed VM. The cleanups cover the agent state, the HA rule memberships, the node-affinity pin, and the advertised routes. They skip a VMID that another VM has taken, and they skip when the check can't finish.
 
 - The `create_vm` rollback no longer retries a refused stop with `skiplock` while the VM holds a `migrate` lock or when its lock can't be read. It leaves the VM tagged, and the sweep takes it once the migration has finished.
 
