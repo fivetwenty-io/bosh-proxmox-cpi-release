@@ -52,6 +52,17 @@ type fakeCluster struct {
 	configNodesFn func(ctx context.Context) (*sdkcluster.ListConfigNodesResponse, error)
 	haResourcesFn func(ctx context.Context) (*sdkcluster.ListHaResourcesResponse, error)
 	haManagerFn   func(ctx context.Context) (*sdkcluster.ListHaStatusManagerStatusResponse, error)
+	replicationFn func(ctx context.Context) (*sdkcluster.ListReplicationResponse, error)
+}
+
+// ListReplication delegates to replicationFn when scripted; otherwise it
+// reports no replication job, the state of a cluster that never replicates.
+func (f *fakeCluster) ListReplication(ctx context.Context) (*sdkcluster.ListReplicationResponse, error) {
+	if f.replicationFn != nil {
+		return f.replicationFn(ctx)
+	}
+	empty := sdkcluster.ListReplicationResponse{}
+	return &empty, nil
 }
 
 // ListHaResources delegates to haResourcesFn when scripted; otherwise it

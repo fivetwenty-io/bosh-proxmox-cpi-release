@@ -498,35 +498,40 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 	if err != nil || h.replicaChanged.IsZero() {
 		return err
 	}
-	h.widenReplica(ctx, landed)
+	h.restampReplica(ctx, landed)
 	return nil
 }
 
-// widenReplica requests a sync of a replicate VM after the attach and widens
-// its pin when the sync is verified within the HA motion wait. The attach is
-// done either way: a replica that is not verified yet leaves the source-only
-// pin, which a later call that touches the VM widens. A VM whose journal
-// record must carry the evidence is left to that later call, because the
-// attach of a managed disk holds the disk's record and the VM's record is
-// acquired only outside it.
-func (h *attachHA) widenReplica(ctx context.Context, node string) {
+// restampReplica records on a replicate VM's pin, after the attach, the time
+// the attach finished as the time its volume set changed. The barrier wrote
+// the pin before the attach with the time the decision ran, and a sync must
+// start after the change has landed, not only after it was decided. The
+// attach does not wait for a sync and never widens the pin: a later call that
+// touches the VM checks the replica. A VM that now holds a persistent disk
+// keeps the source-only pin while the disk is attached, because replication
+// does not copy a volume a disk ID owns. A pin that changed since, or a write
+// that fails, is logged, and the earlier time stays on the pin.
+func (h *attachHA) restampReplica(ctx context.Context, node string) {
 	if node == "" {
 		node = h.node
 	}
-	if h.deps.Config.StoragePlacementNamespace != "" || h.deps.Config.StorageAllocationJournalDir != "" {
-		h.logger.Info(attachHAOp+": the replicate VM's pin keeps its node alone; the next call that touches the VM "+
-			"checks the replica against the journal", log.Int(metadataKeyVMID, h.vmid))
+	logger := h.logger.With(log.Int(metadataKeyVMID, h.vmid), log.String("node", node))
+	pin, source, partner, err := readOwnedReplicaPin(ctx, h.deps, h.vmid)
+	switch {
+	case err != nil:
+		logger.Warn(attachHAOp+": the replicate VM's pin could not be read to record when the attach finished",
+			log.Err(err))
+		return
+	case pin == nil || source != node || partner != "":
+		logger.Info(attachHAOp + ": the replicate VM's pin is not the source-only pin on its node; the time of " +
+			"the change stays as it is")
 		return
 	}
-	w := &replicaWiden{
-		deps: h.deps, logger: h.logger, api: replicationAPIFor(h.deps), profile: h.profile, vmid: h.vmid,
-		node: node, wait: &ha.ReplicaSyncWait{Budget: haMotionWait(h.deps), Logger: h.logger},
-		changedAfter: time.Now(),
-	}
-	if _, err := w.run(ctx); err != nil {
-		h.logger.Warn(attachHAOp+": the replica of the new disk could not be checked; the pin keeps the VM's node "+
-			"alone, and a later call that touches the VM checks again", log.Int(metadataKeyVMID, h.vmid),
-			log.Err(err))
+	stamped := *pin
+	stamped.Comment = ha.WithReplicaChanged(pin.Comment, time.Now())
+	if err := writeReplicaPin(ctx, h.deps, h.profile, logger, h.vmid, pin, &stamped); err != nil {
+		logger.Warn(attachHAOp+": the replicate VM's pin could not record when the attach finished; it keeps the "+
+			"time the attach was decided", log.Err(err))
 	}
 }
 
@@ -926,28 +931,5 @@ func (h *attachHA) removeAttachPin(ctx context.Context) error {
 // checkReach re-reads the VM's config after the attach and checks that every
 // node of the new pin reaches every volume the VM now holds.
 func (h *attachHA) checkReach(ctx context.Context, node string) error {
-	cfg, err := h.deps.PVE.QEMU().Config(ctx, node, h.vmid)
-	if err != nil {
-		return fmt.Errorf("read the config of VM %d: %w", h.vmid, pve.WrapError(err))
-	}
-	index, err := ha.NewStorageIndex(h.profile.Storages)
-	if err != nil {
-		return err
-	}
-	want := h.newPin.NodeNames()
-	reach, err := pve.VolumeAccessSet(ctx, index, want, pve.ConfigAccessVolumes(cfg, node))
-	if err != nil {
-		return err
-	}
-	var missing []string
-	for _, n := range want {
-		if !slices.Contains(reach, n) {
-			missing = append(missing, n)
-		}
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("nodes %s of the pin of VM %d do not reach all of its volumes",
-			strings.Join(missing, ","), h.vmid)
-	}
-	return nil
+	return checkPinReach(ctx, h.deps, h.profile, h.vmid, node, h.newPin.NodeNames())
 }

@@ -106,6 +106,10 @@ type ReplicaJobState struct {
 	Comment   string
 	RemoveJob string
 	Disabled  bool
+	// Fault names why the row cannot be used, such as a malformed field or an
+	// ID listed twice. Guest is then the guest the row provably names, and 0
+	// when it names none.
+	Fault string
 }
 
 // ReplicaSyncStatus is the part of a job's status on its source node that the
@@ -151,23 +155,34 @@ func ReplicaJobID(guest, jobnum int) string {
 	return strconv.Itoa(guest) + "-" + strconv.Itoa(jobnum)
 }
 
-// GuestJobs returns the jobs of guest, sorted by job number.
-func GuestJobs(jobs []ReplicaJobState, guest int) []ReplicaJobState {
+// GuestJobs returns the usable jobs of guest, sorted by job number. A faulted
+// row that belongs to guest, or to no provable guest, is an error, because it
+// could be the job a caller looks for. A faulted row that provably belongs to
+// another guest is ignored, so that guest's oddity never blocks this one.
+func GuestJobs(jobs []ReplicaJobState, guest int) ([]ReplicaJobState, error) {
 	var out []ReplicaJobState
 	for _, j := range jobs {
-		if j.Guest == guest {
+		switch {
+		case j.Fault != "" && (j.Guest == 0 || j.Guest == guest):
+			return nil, fmt.Errorf("the replication jobs of guest %d cannot be told apart: %s", guest, j.Fault)
+		case j.Fault != "":
+			continue
+		case j.Guest == guest:
 			out = append(out, j)
 		}
 	}
 	sort.Slice(out, func(a, b int) bool { return out[a].JobNum < out[b].JobNum })
-	return out
+	return out, nil
 }
 
-// NextJobNum returns the lowest job number guest's jobs do not use.
+// NextJobNum returns the lowest job number no row of guest uses, faulted rows
+// included.
 func NextJobNum(jobs []ReplicaJobState, guest int) int {
 	used := map[int]bool{}
-	for _, j := range GuestJobs(jobs, guest) {
-		used[j.JobNum] = true
+	for _, j := range jobs {
+		if j.Guest == guest {
+			used[j.JobNum] = true
+		}
 	}
 	n := 0
 	for used[n] {
@@ -197,44 +212,100 @@ func (r *replicationClient) ListJobs(ctx context.Context) ([]ReplicaJobState, er
 	if resp == nil {
 		return nil, errors.New("the replication job list returned nothing")
 	}
-	return ParseReplicaJobs(*resp)
+	return ParseReplicaJobs(*resp), nil
 }
 
-// ParseReplicaJobs reads the rows of GET /cluster/replication. A row that does
-// not parse, or that carries no ID, guest, or target, is an error rather than
-// a row to skip, because a skipped row could be the job a caller looks for.
-func ParseReplicaJobs(rows []json.RawMessage) ([]ReplicaJobState, error) {
+// ParseReplicaJobs reads the rows of GET /cluster/replication. A row that
+// does not parse, that carries no <guest>-<jobnum> ID or no target, that names
+// a guest its ID disagrees with, or whose ID another row repeats, is kept with
+// its Fault set and the guest it provably names, rather than skipped, because
+// a skipped row could be the job a caller looks for. GuestJobs turns a fault
+// into an error only for the guest it may belong to.
+func ParseReplicaJobs(rows []json.RawMessage) []ReplicaJobState {
 	jobs := make([]ReplicaJobState, 0, len(rows))
-	for _, raw := range rows {
-		var row struct {
-			ID        string             `json:"id"`
-			Guest     sdkclient.PVEInt   `json:"guest"`
-			JobNum    sdkclient.PVEInt   `json:"jobnum"`
-			Target    string             `json:"target"`
-			Source    string             `json:"source"`
-			Comment   string             `json:"comment"`
-			RemoveJob string             `json:"remove_job"`
-			Disable   *sdkclient.PVEBool `json:"disable"`
+	byID := map[string]int{}
+	for i, raw := range rows {
+		job := parseReplicaJobRow(raw, i)
+		if job.Fault == "" {
+			if first, dup := byID[job.ID]; dup {
+				fault := fmt.Sprintf("replication job %q is listed twice", job.ID)
+				job.Fault = fault
+				jobs[first].Fault = fault
+			} else {
+				byID[job.ID] = len(jobs)
+			}
 		}
-		if err := json.Unmarshal(raw, &row); err != nil {
-			return nil, fmt.Errorf("a replication job row is unreadable: %w", err)
-		}
-		guest, num, ok := parseReplicaJobID(row.ID)
-		switch {
-		case !ok:
-			return nil, fmt.Errorf("replication job %q has no <guest>-<jobnum> ID", row.ID)
-		case row.Guest.Int() != 0 && int(row.Guest.Int()) != guest:
-			return nil, fmt.Errorf("replication job %q names guest %d", row.ID, row.Guest.Int())
-		case strings.TrimSpace(row.Target) == "":
-			return nil, fmt.Errorf("replication job %q names no target", row.ID)
-		}
-		jobs = append(jobs, ReplicaJobState{
-			ID: row.ID, Guest: guest, JobNum: num, Target: row.Target, Source: row.Source, Comment: row.Comment,
-			RemoveJob: row.RemoveJob, Disabled: row.Disable != nil && row.Disable.Bool(),
-		})
+		jobs = append(jobs, job)
 	}
-	sort.Slice(jobs, func(a, b int) bool { return jobs[a].ID < jobs[b].ID })
-	return jobs, nil
+	sort.SliceStable(jobs, func(a, b int) bool { return jobs[a].ID < jobs[b].ID })
+	return jobs
+}
+
+// parseReplicaJobRow reads one row of the job list, which is entry i.
+func parseReplicaJobRow(raw json.RawMessage, i int) ReplicaJobState {
+	var row struct {
+		ID        string             `json:"id"`
+		Guest     sdkclient.PVEInt   `json:"guest"`
+		JobNum    sdkclient.PVEInt   `json:"jobnum"`
+		Target    string             `json:"target"`
+		Source    string             `json:"source"`
+		Comment   string             `json:"comment"`
+		RemoveJob string             `json:"remove_job"`
+		Disable   *sdkclient.PVEBool `json:"disable"`
+	}
+	if err := json.Unmarshal(raw, &row); err != nil {
+		guest, _ := replicaRowGuest(raw)
+		return ReplicaJobState{Guest: guest, Fault: fmt.Sprintf("replication job entry %d is unreadable: %v", i, err)}
+	}
+	guest, num, ok := parseReplicaJobID(row.ID)
+	named := int(max(row.Guest.Int(), 0))
+	job := ReplicaJobState{
+		ID: row.ID, Guest: guest, JobNum: num, Target: row.Target, Source: row.Source, Comment: row.Comment,
+		RemoveJob: row.RemoveJob, Disabled: row.Disable != nil && row.Disable.Bool(),
+	}
+	switch {
+	case !ok:
+		job.Guest = named
+		job.Fault = fmt.Sprintf("replication job %q has no <guest>-<jobnum> ID", row.ID)
+	case named != 0 && named != guest:
+		job.Guest = 0
+		job.Fault = fmt.Sprintf("replication job %q names guest %d", row.ID, named)
+	case strings.TrimSpace(row.Target) == "":
+		job.Fault = fmt.Sprintf("replication job %q names no target", row.ID)
+	}
+	return job
+}
+
+// replicaRowGuest reads the guest an unreadable row names in its ID or its
+// guest field, and is 0 when the row names none or names two that disagree.
+func replicaRowGuest(raw json.RawMessage) (int, bool) {
+	var row struct {
+		ID    json.RawMessage `json:"id"`
+		Guest json.RawMessage `json:"guest"`
+	}
+	if err := json.Unmarshal(raw, &row); err != nil {
+		return 0, false
+	}
+	fromID, fromGuest := 0, 0
+	var id string
+	if json.Unmarshal(row.ID, &id) == nil {
+		if g, _, ok := parseReplicaJobID(id); ok {
+			fromID = g
+		}
+	}
+	var guest sdkclient.PVEInt
+	if json.Unmarshal(row.Guest, &guest) == nil && guest.Int() > 0 {
+		fromGuest = int(guest.Int())
+	}
+	switch {
+	case fromID != 0 && fromGuest != 0 && fromID != fromGuest:
+		return 0, false
+	case fromID != 0:
+		return fromID, true
+	case fromGuest != 0:
+		return fromGuest, true
+	}
+	return 0, false
 }
 
 // parseReplicaJobID splits "<guest>-<jobnum>".
@@ -450,80 +521,6 @@ func CheckReplicaSync(ctx context.Context, api ReplicationAPI, c ReplicaSyncChec
 	return v, nil
 }
 
-// ReplicaSyncWait bounds AwaitReplicaSync.
-type ReplicaSyncWait struct {
-	Budget       time.Duration
-	PollInterval time.Duration
-	Now          func() time.Time
-	Sleep        func(ctx context.Context, d time.Duration) error
-	Logger       *log.Logger
-}
-
-// AwaitReplicaSync asks the job's source to run the job now and then runs the
-// sync gate until it passes or the budget ends. When no sync that starts
-// inside the budget could count, because the clock-skew tolerance puts the
-// earliest one past the deadline, it returns after the request without
-// polling. A failed request is logged and the wait goes on, because the job's
-// schedule runs it anyway. A gate read that fails is retried until the
-// deadline, and the last read error is returned only when no gate ran. The
-// verdict that ends the wait unverified is returned with a nil error.
-func AwaitReplicaSync(ctx context.Context, api ReplicationAPI, c ReplicaSyncCheck, w ReplicaSyncWait) (
-	ReplicaSyncVerdict, error,
-) {
-	if api == nil {
-		return ReplicaSyncVerdict{}, errors.New("replica sync wait: no replication client")
-	}
-	now := w.Now
-	if now == nil {
-		now = time.Now
-	}
-	sleep := w.Sleep
-	if sleep == nil {
-		sleep = sleepCtx
-	}
-	poll := w.PollInterval
-	if poll <= 0 {
-		poll = 5 * time.Second
-	}
-	logger := w.Logger
-	if logger == nil {
-		logger = log.NewNopLogger()
-	}
-	if err := api.ScheduleNow(ctx, c.Source, c.JobID); err != nil {
-		logger.Warn("replicate: the request to sync the replication job now failed; its schedule runs it",
-			log.String("job", c.JobID), log.String("node", c.Source), log.Err(err))
-	}
-	deadline := now().Add(w.Budget)
-	if !c.ChangedAt.IsZero() && !ReplicaSyncEarliest(c.ChangedAt).Before(deadline) {
-		return ReplicaSyncVerdict{Reason: fmt.Sprintf("no sync can count before %s, which is past the wait",
-			ReplicaSyncEarliest(c.ChangedAt).Format(time.RFC3339))}, nil
-	}
-	var lastErr error
-	ran := false
-	var last ReplicaSyncVerdict
-	for {
-		v, err := CheckReplicaSync(ctx, api, c)
-		if err != nil {
-			lastErr = err
-		} else {
-			ran, last = true, v
-			if v.Verified {
-				return v, nil
-			}
-		}
-		if !now().Add(poll).Before(deadline) {
-			break
-		}
-		if err := sleep(ctx, poll); err != nil {
-			return ReplicaSyncVerdict{}, err
-		}
-	}
-	if !ran {
-		return ReplicaSyncVerdict{}, lastErr
-	}
-	return last, nil
-}
-
 // sleepCtx pauses for d or until ctx ends.
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
@@ -584,8 +581,12 @@ var ErrReplicaRetireIncomplete = errors.New("the replication job is still config
 // after the wait, and AllowForce is set, the copy left behind is recorded and
 // logged first and the job is dropped with force=1. Without AllowForce the
 // retirement returns ErrReplicaRetireIncomplete and leaves the job. A job
-// that is already gone returns Gone with nothing done. The caller passes only
-// a job it owns.
+// whose row names no node besides the live one is never forced, because the
+// copy it leaves could not be named; it gets the removal that cleans up, and
+// ErrReplicaRetireIncomplete when that does not finish. A wait whose job list
+// could not be read returns the read error and never forces. A job that is
+// already gone returns Gone with nothing done. The caller passes only a job
+// it owns.
 func RetireReplicaJob(ctx context.Context, api ReplicationAPI, in ReplicaRetirement) (ReplicaRetireOutcome, error) {
 	if api == nil {
 		return ReplicaRetireOutcome{}, errors.New("replica retirement: no replication client")
@@ -607,7 +608,20 @@ func RetireReplicaJob(ctx context.Context, api ReplicationAPI, in ReplicaRetirem
 		// is not live is on the job's recorded source.
 		other = job.Source
 	}
-	if other != "" && replicaPartnerOnline(ctx, in, other) {
+	if other == "" {
+		// The row names no node besides the live one, so the copy a forced
+		// drop would leave cannot be named or recorded. The removal that
+		// cleans up is still tried, and the force is never sent.
+		in.Logger.Warn("replicate: the replication job names no node besides the live one; trying the removal "+
+			"that cleans up, without a forced drop", log.String("job", in.JobID), log.String("node", in.LiveNode))
+		out, done, err := retireWithCleanup(ctx, api, in, job)
+		if err != nil || done {
+			return out, err
+		}
+		return ReplicaRetireOutcome{}, fmt.Errorf("%w: job %s names no node that holds its copy, so the CPI does "+
+			"not drop it with force; remove the job and the copy by hand", ErrReplicaRetireIncomplete, in.JobID)
+	}
+	if replicaPartnerOnline(ctx, in, other) {
 		out, done, err := retireWithCleanup(ctx, api, in, job)
 		if err != nil || done {
 			return out, err
@@ -657,6 +671,8 @@ func replicaPartnerOnline(ctx context.Context, in ReplicaRetirement, other strin
 // retireWithCleanup deletes the job without keep, asks for its run now, and
 // waits up to the budget for it to disappear. It reports done when the job
 // is gone; a job still there after the wait returns not done and no error.
+// A wait whose last read of the job list failed returns that error, because
+// the job may be gone already and a forced drop would rest on no evidence.
 func retireWithCleanup(
 	ctx context.Context, api ReplicationAPI, in ReplicaRetirement, job ReplicaJobState,
 ) (ReplicaRetireOutcome, bool, error) {
@@ -684,6 +700,10 @@ func retireWithCleanup(
 			return ReplicaRetireOutcome{Gone: true}, true, nil
 		}
 		if !in.Now().Add(in.PollInterval).Before(deadline) {
+			if rerr != nil {
+				return ReplicaRetireOutcome{}, false, fmt.Errorf("confirm the removal of replication job %s: %w",
+					in.JobID, rerr)
+			}
 			return ReplicaRetireOutcome{}, false, nil
 		}
 		if err := in.Sleep(ctx, in.PollInterval); err != nil {
@@ -699,7 +719,7 @@ func forceRetireReplicaJob(
 ) (ReplicaRetireOutcome, error) {
 	volids := slices.Clone(in.VolIDs)
 	sort.Strings(volids)
-	if in.RecordOrphan != nil && other != "" {
+	if in.RecordOrphan != nil {
 		if err := in.RecordOrphan(ctx, other, volids); err != nil {
 			return ReplicaRetireOutcome{}, fmt.Errorf("record the copy that replication job %s leaves on node %s: "+
 				"%w", in.JobID, other, err)
@@ -724,13 +744,22 @@ func forceRetireReplicaJob(
 	return ReplicaRetireOutcome{Gone: true, Forced: true, Orphan: other}, nil
 }
 
-// findReplicaJob reads the job id from the cluster's job list.
+// findReplicaJob reads the job id from the cluster's job list. A faulted row
+// that may belong to the job's guest is an error, because it may be the job.
 func findReplicaJob(ctx context.Context, api ReplicationAPI, id string) (ReplicaJobState, bool, error) {
+	guest, _, ok := parseReplicaJobID(id)
+	if !ok {
+		return ReplicaJobState{}, false, fmt.Errorf("replication job %q has no <guest>-<jobnum> ID", id)
+	}
 	jobs, err := api.ListJobs(ctx)
 	if err != nil {
 		return ReplicaJobState{}, false, fmt.Errorf("list the replication jobs: %w", err)
 	}
-	for _, j := range jobs {
+	mine, err := GuestJobs(jobs, guest)
+	if err != nil {
+		return ReplicaJobState{}, false, err
+	}
+	for _, j := range mine {
 		if j.ID == id {
 			return j, true, nil
 		}
@@ -738,27 +767,65 @@ func findReplicaJob(ctx context.Context, api ReplicationAPI, id string) (Replica
 	return ReplicaJobState{}, false, nil
 }
 
-// ReplicaVolIDs returns the volumes of a VM that a replication job copies:
-// the ones on node-local ZFS pool storage, which the replicate decision
-// requires of every node-local volume. Volumes on shared storage and the ones
-// whose replicate flag is off are left out, and the answer is sorted.
-func ReplicaVolIDs(volumes []VMVolume, storages []pve.StorageInfo) []string {
+// ReplicaVolumes splits the volumes of guest into the ones a replication job
+// of guest copies and the gaps, the node-local volumes it leaves on the
+// source. PVE replicates a volume only when it sits on node-local ZFS pool
+// storage, is not a CD-ROM, has its replicate flag on, and is owned by the
+// guest itself (get_replicatable_volumes in qemu-server), so a persistent disk
+// the CPI names after a disk ID is a gap. A volume on shared storage needs no
+// copy and is in neither list. A volume on a storage the index does not hold,
+// or one that names no storage, is a gap, because nothing proves it is
+// shared. Both answers are sorted, and each gap is a sentence that names the
+// volume.
+func ReplicaVolumes(guest int, volumes []VMVolume, storages []pve.StorageInfo) (replicated, gaps []string) {
 	byName := make(map[string]pve.StorageInfo, len(storages))
 	for i := range storages {
 		byName[storages[i].Name] = storages[i]
 	}
-	var out []string
+	seen := map[string]bool{}
 	for _, v := range volumes {
-		storage, _, ok := strings.Cut(v.Volume, ":")
-		if !ok || v.NoReplicate {
+		if seen[v.Volume] {
 			continue
 		}
-		info, known := byName[storage]
-		if !known || info.Shared || info.Type != pve.StorageTypeZFSPool {
+		seen[v.Volume] = true
+		if gap := replicaGap(guest, v, byName); gap != "" {
+			gaps = append(gaps, gap)
 			continue
 		}
-		out = append(out, v.Volume)
+		storage, _, _ := strings.Cut(v.Volume, ":")
+		if info := byName[storage]; !info.IsShared() {
+			replicated = append(replicated, v.Volume)
+		}
 	}
-	sort.Strings(out)
-	return slices.Compact(out)
+	sort.Strings(replicated)
+	sort.Strings(gaps)
+	return replicated, gaps
+}
+
+// replicaGap names why a replication job of guest leaves v on the source, and
+// is empty when the job copies v or v is on shared storage.
+func replicaGap(guest int, v VMVolume, byName map[string]pve.StorageInfo) string {
+	storage, _, ok := strings.Cut(v.Volume, ":")
+	if !ok || storage == "" {
+		return fmt.Sprintf("volume %s names no storage, so nothing shows a replica of it", v.Volume)
+	}
+	info, known := byName[storage]
+	switch {
+	case !known:
+		return fmt.Sprintf("volume %s is on storage %s, which the storage index does not hold", v.Volume, storage)
+	case info.IsShared():
+		return ""
+	case v.kind() == VolumeISO:
+		return fmt.Sprintf("volume %s is a node-local CD-ROM, which replication does not copy", v.Volume)
+	case info.Type != pve.StorageTypeZFSPool:
+		return fmt.Sprintf("volume %s is on node-local %s storage, which replication does not copy", v.Volume,
+			info.Type)
+	case v.NoReplicate:
+		return fmt.Sprintf("volume %s has its replicate flag off", v.Volume)
+	}
+	if owner, ok := pve.VolumeOwnerVMID(v.Volume); !ok || owner != guest {
+		return fmt.Sprintf("volume %s is not owned by VM %d, and replication copies only the volumes a guest "+
+			"owns", v.Volume, guest)
+	}
+	return ""
 }

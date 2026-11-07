@@ -7,16 +7,23 @@
 //     cloud_properties.node, then config.node.
 //   - existing volumes are located via a cluster-wide scan. Every node is
 //     probed through ProveVolumeAbsent, and the first node that does not prove
-//     the volume absent wins.
+//     the volume absent wins. With replica-aware lookup on, a ZFS volume that
+//     a replication job of its owner may have copied is instead swept on
+//     every node and settled by the node its owner VM runs on.
 package pve
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -144,7 +151,14 @@ func (l *localBackend) nodeForExisting(
 	// them per node would read that file once per node in the cluster.
 	corroborators := l.emptyListingCorroborators(extra)
 	if l.replicaAware && (l.info.Type == StorageTypeZFSPool || l.info.Type == "") {
-		return l.nodeForReplicatedVolume(ctx, volume, candidates, corroborators)
+		// Only a volume that a replication job may have copied takes the
+		// replica-aware sweep. Every other volume, which includes each CPI
+		// persistent disk because a disk ID owns it, keeps the first-hit sweep
+		// below exactly as it was.
+		covered, coverErr := l.replicationMayCover(ctx, volume)
+		if covered || coverErr != nil {
+			return l.nodeForReplicatedVolume(ctx, volume, candidates, corroborators, coverErr)
+		}
 	}
 
 	var lastProbeErr error
@@ -196,16 +210,84 @@ func sweepMissError(storage, volume string, lastProbeErr error) error {
 	return cpierrors.DiskNotFound(FormatDiskCID(storage, volume))
 }
 
-// nodeForReplicatedVolume is the sweep of a storage that replication may
-// copy. It probes every candidate rather than stopping at the first hit. One
-// copy found with every node answering is the volume. Two or more copies, or
-// one copy while a node could not be asked, are settled by the node the
-// volume's owner VM runs on: the copy there is the live one. When the owner
-// is not on a node that holds a copy, the sweep cannot tell which copy is
-// live, and it returns an error rather than pick one: a retriable one when a
-// node could not be asked, and an ambiguity error otherwise.
+// replicationMayCover reports whether a replication job of the volume's
+// owner exists, which is the only way storage replication puts a copy of the
+// volume on a second node: PVE replicates a guest's volumes only when the
+// guest owns them (get_replicatable_volumes in qemu-server). A volume whose
+// name gives PVE no owner, and a volume whose owner has no job, are never
+// replicated, and the answer is false with no error. An error means the job
+// list could not be read or holds a row whose guest cannot be told, so the
+// volume may be replicated.
+func (l *localBackend) replicationMayCover(ctx context.Context, volume string) (bool, error) {
+	owner, ok := VolumeOwnerVMID(volume)
+	if !ok || l.client == nil {
+		return false, nil
+	}
+	var resp *sdkcluster.ListReplicationResponse
+	err := RetryOnTransient(ctx, nil, "backend_local_replication_list", 0, func() error {
+		var inner error
+		resp, inner = l.client.Cluster().ListReplication(ctx)
+		return inner
+	})
+	if err != nil {
+		return false, fmt.Errorf("list the replication jobs: %w", err)
+	}
+	if resp == nil {
+		return false, errors.New("the replication job list returned nothing")
+	}
+	for _, raw := range *resp {
+		guest, known := replicationRowGuest(raw)
+		if !known {
+			return false, errors.New("the replication job list holds a row whose guest cannot be read")
+		}
+		if guest == owner {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// replicationRowGuest returns the guest of one row of GET /cluster/replication,
+// from the "<guest>-<jobnum>" form of its ID and from its guest field. The
+// guest is unknown when the row names none, or when the two name different
+// guests.
+func replicationRowGuest(raw json.RawMessage) (int, bool) {
+	var row struct {
+		ID    string           `json:"id"`
+		Guest sdkclient.PVEInt `json:"guest"`
+	}
+	if err := json.Unmarshal(raw, &row); err != nil {
+		return 0, false
+	}
+	fromID := 0
+	if g, _, ok := strings.Cut(row.ID, "-"); ok {
+		if guest, err := strconv.Atoi(g); err == nil && guest > 0 {
+			fromID = guest
+		}
+	}
+	fromGuest := int(max(row.Guest.Int(), 0))
+	switch {
+	case fromID != 0 && fromGuest != 0 && fromID != fromGuest:
+		return 0, false
+	case fromID != 0:
+		return fromID, true
+	case fromGuest != 0:
+		return fromGuest, true
+	}
+	return 0, false
+}
+
+// nodeForReplicatedVolume is the sweep of a volume that a replication job may
+// have copied. It probes every candidate rather than stopping at the first
+// hit. One copy found with every node answering is the volume. Two or more
+// copies, or one copy while a node could not be asked, are settled by the node
+// the volume's owner VM runs on: the copy there is the live one. When the
+// owner is not on a node that holds a copy, or the job list could not be read
+// (coverErr), the sweep cannot tell which copy is live, and it returns a
+// retriable error rather than pick one.
 func (l *localBackend) nodeForReplicatedVolume(
 	ctx context.Context, volume string, candidates []string, corroborators []EmptyListingCorroborator,
+	coverErr error,
 ) (string, error) {
 	storage := l.info.Name
 	var hits []string
@@ -225,10 +307,12 @@ func (l *localBackend) nodeForReplicatedVolume(
 		return "", sweepMissError(storage, volume, lastProbeErr)
 	case len(hits) == 1 && lastProbeErr == nil:
 		return hits[0], nil
+	case coverErr != nil:
+		return "", cpierrors.WrapAs(coverErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+			"NodeForExisting: volume %s:%s is on nodes %s%s, and the replication jobs that say whether one copy "+
+				"is a replica could not be read", storage, volume, strings.Join(hits, ","), probeGapNote(lastProbeErr)))
 	}
-	owner, ok := volumeOwnerVMID(volume)
-	vmid, convErr := strconv.Atoi(owner)
-	if ok && convErr == nil {
+	if vmid, ok := VolumeOwnerVMID(volume); ok {
 		node, found, err := FindVMNodeViaCluster(ctx, l.client, vmid)
 		if err != nil {
 			return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
@@ -244,9 +328,18 @@ func (l *localBackend) nodeForReplicatedVolume(
 			"NodeForExisting: volume %s:%s is on nodes %s, a node could not be asked, and its owner VM is on none "+
 				"of them; the CPI cannot tell which copy is live", storage, volume, strings.Join(hits, ",")))
 	}
-	return "", cpierrors.Cloud("NodeForExisting: volume %s:%s is on nodes %s, and its owner VM runs on none of "+
-		"them, so the CPI cannot tell which copy is live and acts on neither; remove the stale replica by hand",
-		storage, volume, strings.Join(hits, ","))
+	return "", cpierrors.Retriable("NodeForExisting: volume %s:%s is on nodes %s, and its owner VM runs on none of "+
+		"them, so the CPI cannot tell which copy is live and acts on neither; once the VM is back on a node that "+
+		"holds a copy the call succeeds, or remove the stale replica by hand", storage, volume, strings.Join(hits, ","))
+}
+
+// probeGapNote names a probe failure in a sweep's error, and is empty when
+// every node answered.
+func probeGapNote(lastProbeErr error) string {
+	if lastProbeErr == nil {
+		return ""
+	}
+	return " (and a node could not be asked: " + lastProbeErr.Error() + ")"
 }
 
 // emptyListingCorroborators orders the second opinions one sweep hands to an

@@ -71,11 +71,14 @@ func (r DeadNodeReach) PinnedToSource() bool {
 // volumes, and the answer is also bounded by their reach in storages, with a
 // node-local storage counted as living on source. A VM with a node-local
 // volume therefore reaches source alone, unless its strict pin records a
-// verified replica (ReplicaPartnerKey) on a partner the pin also names. The
-// CPI writes that token only with a pin it widened after a sync it verified,
-// and removes it before any volume change, so while it stands the partner
-// holds a recoverable copy of every node-local volume, and the partner's
-// reach of those volumes counts as well. A disabled pin, or one PVE reports
+// verified replica (ReplicaPartnerKey) on a partner the pin also names and
+// every recorded node-local storage is a ZFS pool. The CPI writes that token
+// only with a pin it widened after a sync it verified for every node-local
+// volume, and removes it before any volume change, so while it stands the
+// partner's reach of those volumes counts as well, and Replica names the
+// partner. The token is a claim, not proof: the caller confirms the job that
+// keeps the copy before it acts on a destination the replica adds, and the
+// delete on that destination proves each copy is on the node. A disabled pin, or one PVE reports
 // in error, still records the set, because neither moves a volume.
 //
 // The answer is an error, which the caller turns into a deferral, when the VM
@@ -189,7 +192,11 @@ func DeletionDestinations(
 
 // replicaReach returns the partner of a verified replica that the strict pin
 // records and names, with the reach of the recorded storages counted from
-// that partner. A pin with no such partner returns an empty answer.
+// that partner. A pin with no such partner returns an empty answer, and so
+// does a pin whose record names a node-local storage that is not a ZFS pool,
+// because replication copies no volume there and the token cannot speak for
+// it. The token is the pin's claim alone: the caller confirms the job that
+// keeps the copy before it counts the partner.
 func replicaReach(
 	pin *Rule, source, sid string, members, recorded []string, storages pve.StorageInfoGetter,
 ) (string, []string, error) {
@@ -199,6 +206,15 @@ func replicaReach(
 	}
 	if _, named := pin.Nodes[partner]; !named {
 		return "", nil, nil
+	}
+	for _, storage := range recorded {
+		info, err := storages.Get(context.Background(), storage)
+		if err != nil {
+			return "", nil, fmt.Errorf("deletion destinations: recorded storage %s: %w", storage, err)
+		}
+		if !info.IsShared() && info.Type != pve.StorageTypeZFSPool {
+			return "", nil, nil
+		}
 	}
 	replicas := make([]pve.AccessVolume, 0, len(recorded))
 	for _, storage := range recorded {

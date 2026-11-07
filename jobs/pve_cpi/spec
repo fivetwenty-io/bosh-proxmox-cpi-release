@@ -168,11 +168,17 @@ properties:
       reports a sync that started more than five minutes after the last change
       to the VM's volumes, with no error and a failure count of zero, and with
       every volume on the partner. Only then does the pin name the partner too.
+      create_vm requests the first sync and doesn't wait for it, so a later
+      reboot_vm or set_vm_metadata call widens the pin. PVE replicates only the
+      volumes the VM owns, so a VM with a CPI persistent disk on node-local ZFS
+      storage keeps the pin to its own node. The partner's copy isn't counted
+      against the partner's capacity.
       A failover to the partner loses every write made after the last sync, and
       the next call that touches the VM narrows its pin to the partner.
       delete_vm removes the job before the destroy, and when the partner is
       offline it drops the job with force=1, which leaves the partner's copy
-      behind and logs the node and the volumes to remove by hand.
+      behind and logs the node and the volumes to remove by hand. A job that
+      names no node besides the VM's own is never forced.
   pve.ha.anti_affinity:
     description: |
       Whether the CPI writes a negative resource-affinity rule for an instance
@@ -219,7 +225,9 @@ properties:
   pve.ha.motion_wait_sec:
     description: |
       The budget in seconds for a migrate-lock wait, the HA state poll, and the
-      delete grace window. Default 600. Must be between 1 and 86400.
+      delete grace window. It also bounds the wait for a "replicate" VM's
+      replication job to go when delete_vm retires it. Default 600. Must be
+      between 1 and 86400.
   pve.ha.replication.schedule:
     description: |
       The PVE schedule of each replication job that the "replicate" local policy

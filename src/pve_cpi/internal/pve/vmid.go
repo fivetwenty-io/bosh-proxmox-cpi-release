@@ -594,6 +594,22 @@ func volumeOwnerVMID(volid string) (string, bool) {
 	return m[1], true
 }
 
+// VolumeOwnerVMID returns the VMID PVE treats as the owner of an images
+// volume, such as 100 for "local-zfs:vm-100-disk-0", and false for a name
+// PVE gives no owner. Storage replication copies only the volumes a guest
+// owns, so a volume another VMID owns never has a replica of that guest.
+func VolumeOwnerVMID(volid string) (int, bool) {
+	text, ok := volumeOwnerVMID(volid)
+	if !ok {
+		return 0, false
+	}
+	vmid, err := strconv.Atoi(text)
+	if err != nil || vmid <= 0 {
+		return 0, false
+	}
+	return vmid, true
+}
+
 // storageScanTargets collects every (node, storage) pair NextVMID reads, in
 // option order, with each pair once. A pair named by more than one option
 // keeps the owner rule if any of them asks for it.

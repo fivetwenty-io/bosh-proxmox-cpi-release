@@ -387,10 +387,47 @@ func (c *deadNodeCompletion) destinations(
 	if err != nil {
 		return reach, c.deferWrap(err, "compute the deletion destinations")
 	}
+	if reach.Replica != "" {
+		if err := c.confirmReplicaJob(ctx, reach.Replica); err != nil {
+			return reach, err
+		}
+	}
 	if len(reach.Destinations) == 0 {
 		return reach, c.noDestinations(reach)
 	}
 	return reach, nil
+}
+
+// confirmReplicaJob checks the replication job behind a replica the VM's pin
+// claims on partner before the completion moves the config there. The job
+// must carry this Director's marker, be enabled and not marked for removal,
+// and pair the dead node with partner in either direction. Anything else, a
+// job list that cannot be read included, defers, because the token alone does
+// not prove a copy exists. The delete on the partner then proves each copy is
+// on the node.
+func (c *deadNodeCompletion) confirmReplicaJob(ctx context.Context, partner string) error {
+	jobs, err := replicationAPIFor(c.deps).ListJobs(ctx)
+	if err != nil {
+		return c.deferWrap(err, "list the replication jobs to confirm the replica on node %s", partner)
+	}
+	job, _, err := guestReplicaJobs(jobs, c.vmid, c.deps.RequestDirectorUUID)
+	switch {
+	case err != nil:
+		return c.deferWrap(err, "read the replication job behind the replica on node %s", partner)
+	case job == nil:
+		return c.deferf("the pin claims a replica on node %s, and the VM has no replication job of this Director",
+			partner)
+	case job.Disabled || job.RemoveJob != "":
+		return c.deferf("the pin claims a replica on node %s, and replication job %s is disabled or marked for "+
+			"removal", partner, job.ID)
+	}
+	forward := job.Target == partner && (job.Source == "" || job.Source == c.source)
+	swapped := job.Target == c.source && job.Source == partner
+	if !forward && !swapped {
+		return c.deferf("the pin claims a replica on node %s, and replication job %s runs from %s to %s", partner,
+			job.ID, orNone(job.Source), job.Target)
+	}
+	return nil
 }
 
 // reportMembers returns the cluster members a node health report names.
@@ -705,9 +742,11 @@ func (c *deadNodeCompletion) scanShows(ctx context.Context, node string) (bool, 
 // marks. The move was decided without the config, so before anything stops,
 // detaches, or destroys the VM, the delete proves from the config it now reads
 // that node reaches every volume, with each node-local volume counted as
-// living on the dead node. A VM it cannot prove that for defers, so a volume
-// the destroy could not reach is never left behind as an orphan, and a
-// persistent disk is never destroyed. It returns the dead node the token
+// living on the dead node, unless the VM's pin names node as the partner that
+// holds a verified replica and node's storage listing shows the copy of a
+// volume the replication job copies (see deadNodeReplicaCopies). A VM it
+// cannot prove that for defers, so a volume the destroy could not reach is
+// never left behind as an orphan, and a persistent disk is never destroyed. It returns the dead node the token
 // names when the check passes, so the teardown can prove the VM's absence
 // while that node stays down. A VM without a configured HA resource, or whose
 // resource carries no token, passes with no source, and so does a VM back on
@@ -753,9 +792,6 @@ func refuseDeadNodeStrandedVolumes(
 			volumes = append(volumes, v)
 		}
 	}
-	for i := range volumes {
-		volumes[i].HomeNode = source
-	}
 	storages, err := readStorageIndex(ctx, deps)
 	if err != nil {
 		return "", refuse("read the storage index: %v; retry", err)
@@ -763,6 +799,16 @@ func refuseDeadNodeStrandedVolumes(
 	index, err := ha.NewStorageIndex(storages)
 	if err != nil {
 		return "", refuse("index the storages: %v; retry", err)
+	}
+	onNode, err := deadNodeReplicaCopies(ctx, deps, vmid, node, storages, liveConfig, pending)
+	if err != nil {
+		return "", refuse("%v; retry", err)
+	}
+	for i := range volumes {
+		volumes[i].HomeNode = source
+		if onNode[volumes[i].Volume] {
+			volumes[i].HomeNode = node
+		}
 	}
 	reach, err := pve.VolumeAccessSet(ctx, index, []string{node, source}, volumes)
 	if err != nil {
@@ -778,6 +824,52 @@ func refuseDeadNodeStrandedVolumes(
 	logger.Info(deadNodeDelete+": the moved VM's volumes are all reachable from its node",
 		log.String("sid", sid), log.String("dead_node", source), log.String("node", node))
 	return source, nil
+}
+
+// deadNodeReplicaCopies returns the volumes of a VM moved off a dead node that
+// a verified replica holds on node, the node the config moved to. Only a VM
+// whose pin carries this Director's marker and names node as its replication
+// partner has any: those are the volumes its replication job copies (see
+// ha.ReplicaVolumes), each kept only when node's storage listing shows it.
+// Every other volume, a persistent disk a disk ID owns included, still lives
+// on the dead node. A VM with no such pin returns none and reads nothing past
+// the rules. A read that fails is an error, which the caller defers on.
+func deadNodeReplicaCopies(
+	ctx context.Context, deps Deps, vmid int, node string, storages []pve.StorageInfo,
+	liveConfig, pending map[string]any,
+) (map[string]bool, error) {
+	set, err := readHARuleSet(ctx, deps.PVE.Cluster())
+	if err != nil {
+		return nil, fmt.Errorf("read the HA rules to check for a replica on node %s: %w", node, err)
+	}
+	pin := set.Find(naRuleNameFor(vmid))
+	if pin == nil || haOwnershipOf(pin.Comment, deps.RequestDirectorUUID) != haOwnedByUs {
+		return nil, nil
+	}
+	if partner, ok := ha.ReplicaPartner(pin.Comment); !ok || partner != node {
+		return nil, nil
+	}
+	vols := append(haVolumesOfConfig(liveConfig, node, nil), haVolumesOfConfig(pending, node, nil)...)
+	replicated, _ := ha.ReplicaVolumes(vmid, vols, storages)
+	api := replicationAPIFor(deps)
+	listings := map[string]map[string]bool{}
+	out := make(map[string]bool, len(replicated))
+	for _, volid := range replicated {
+		storage, _, _ := strings.Cut(volid, ":")
+		listed, read := listings[storage]
+		if !read {
+			listed, err = api.Volumes(ctx, node, storage)
+			if err != nil {
+				return nil, fmt.Errorf("list storage %s on node %s to find the replica of volume %s: %w", storage,
+					node, volid, err)
+			}
+			listings[storage] = listed
+		}
+		if listed[volid] {
+			out[volid] = true
+		}
+	}
+	return out, nil
 }
 
 // locateAfterDeadNodeMove locates VM vmid again after a step on node answered

@@ -39,6 +39,7 @@ type fakeReplica struct {
 	status           ha.ReplicaSyncStatus
 	statusErr        error
 	listed           map[string]bool
+	volumesErr       error
 }
 
 func newFakeReplica() *fakeReplica {
@@ -70,8 +71,13 @@ func (f *fakeReplica) addJob(id, source, target, comment string) {
 		Comment: comment})
 }
 
-func (f *fakeReplica) SetComment(_ context.Context, id, _ string) error {
+func (f *fakeReplica) SetComment(_ context.Context, id, comment string) error {
 	f.calls = append(f.calls, "comment:"+id)
+	for i := range f.jobs {
+		if f.jobs[i].ID == id {
+			f.jobs[i].Comment = comment
+		}
+	}
 	return nil
 }
 
@@ -106,6 +112,9 @@ func (f *fakeReplica) Status(_ context.Context, node, id string) (ha.ReplicaSync
 
 func (f *fakeReplica) Volumes(_ context.Context, node, storage string) (map[string]bool, error) {
 	f.calls = append(f.calls, "volumes:"+node+"/"+storage)
+	if f.volumesErr != nil {
+		return nil, f.volumesErr
+	}
 	return f.listed, nil
 }
 
@@ -344,20 +353,67 @@ func TestSetUpCreatedReplica_CreatesTheJobAndKeepsTheSourcePin(t *testing.T) {
 	}
 }
 
-func TestSetUpCreatedReplica_FirstSyncThatFailsKeepsTheSourcePin(t *testing.T) {
-	// A sync that failed, and one that cannot be verified inside the wait,
-	// both leave the source-only pin and the create succeeds.
-	for name, status := range map[string]ha.ReplicaSyncStatus{
-		"failed":    {FailCount: 2, Error: "zfs recv failed"},
-		"timed out": {},
-	} {
-		r := newReplicaRig(config.HAModeManaged)
+func TestSetUpCreatedReplica_NeverWaitsForTheFirstSync(t *testing.T) {
+	// The create requests the first sync and returns. It never reads the sync
+	// status or the target's listing, so even a sync that would verify leaves
+	// the source-only pin, and a later touch call widens it.
+	for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
+		r := newReplicaRig(mode)
 		r.setPin("pve01", nil)
-		r.repl.status = status
+		r.repl.status = ha.ReplicaSyncStatus{LastSync: time.Now().Add(time.Hour)}
+		r.repl.listed[replicaRootVolume] = true
 		err := setUpCreatedReplica(crhCtx(), r.deps, log.NewNopLogger(), "pve01", 100, replicaDecision(), r.profile,
 			nil)
 		if err != nil || r.pinNodes() != "pve01" {
-			t.Fatalf("%s: err %v pin %q", name, err, r.pinNodes())
+			t.Fatalf("%s: err %v pin %q", mode, err, r.pinNodes())
+		}
+		if !r.repl.called("schedule:pve01/100-0") || r.repl.called("status") || r.repl.called("volumes") {
+			t.Fatalf("%s: calls %v; the create requests the sync and reads no sync state", mode, r.repl.calls)
+		}
+	}
+}
+
+func TestSetUpCreatedReplica_ScheduleFailureKeepsTheCreate(t *testing.T) {
+	r := newReplicaRig(config.HAModeManaged)
+	r.setPin("pve01", nil)
+	r.repl.scheduleErr = errors.New("connection reset")
+	err := setUpCreatedReplica(crhCtx(), r.deps, log.NewNopLogger(), "pve01", 100, replicaDecision(), r.profile, nil)
+	if err != nil || len(r.repl.created) != 1 || r.pinNodes() != "pve01" {
+		t.Fatalf("err %v created %v pin %q; PVE's schedule runs the first sync", err, r.repl.created, r.pinNodes())
+	}
+}
+
+func TestSetUpCreatedReplica_TransientFailureIsRetriableInEveryMode(t *testing.T) {
+	for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
+		r := newReplicaRig(mode)
+		r.setPin("pve01", nil)
+		r.repl.listErr = errors.New("connection reset")
+		err := setUpCreatedReplica(crhCtx(), r.deps, log.NewNopLogger(), "pve01", 100, replicaDecision(), r.profile,
+			nil)
+		if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || len(r.repl.created) != 0 {
+			t.Fatalf("%s: err %v created %v; a failure that proves nothing defers", mode, err, r.repl.created)
+		}
+	}
+}
+
+func TestSetUpCreatedReplica_VolumeTheJobCannotCopy(t *testing.T) {
+	// A persistent disk a disk ID owns sits on node-local ZFS storage, and
+	// PVE's job never copies it. The VM keeps the source-only pin in auto and
+	// the create is refused in managed.
+	for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
+		r := newReplicaRig(mode)
+		r.setPin("pve01", nil)
+		r.cfg["scsi1"] = "local-zfs:vm-9001-disk-0,size=5G"
+		err := setUpCreatedReplica(crhCtx(), r.deps, log.NewNopLogger(), "pve01", 100, replicaDecision(), r.profile,
+			nil)
+		if len(r.repl.created) != 0 || r.pinNodes() != "pve01" {
+			t.Fatalf("%s: created %v pin %q", mode, r.repl.created, r.pinNodes())
+		}
+		switch {
+		case mode == config.HAModeAuto && err != nil:
+			t.Fatalf("auto keeps the source-only pin, got %v", err)
+		case mode == config.HAModeManaged && (err == nil || cpierrors.IsType(err, cpierrors.TypeRetriableCloud)):
+			t.Fatalf("managed refuses, got %v", err)
 		}
 	}
 }
@@ -662,6 +718,9 @@ func TestReconcileVMReplica_NoAction(t *testing.T) {
 		if r.pinNodes() != before || r.repl.called("schedule") || r.repl.called("status") {
 			t.Fatalf("%s: pin %q calls %v", name, r.pinNodes(), r.repl.calls)
 		}
+		if name == "mode off" && (r.repl.listCalls != 0 || len(r.repl.calls) != 0) {
+			t.Fatalf("mode off: %d list reads and calls %v; off mode reads nothing", r.repl.listCalls, r.repl.calls)
+		}
 	}
 }
 
@@ -825,20 +884,42 @@ func TestReplicaPinComment(t *testing.T) {
 }
 
 func TestBackendReplicaLookup(t *testing.T) {
-	cfg := lrTokenConfig()
-	cfg.HA = &config.HAConfig{LocalPolicy: haChoiceOf(config.HALocalPolicyReplicate)}
-	for _, c := range []*config.CPIConfig{nil, lrTokenConfig(), cfg} {
-		if BackendReplicaLookup(c) == nil {
-			t.Fatal("the option must always be set")
+	withPolicy := func(mode string) *config.CPIConfig {
+		cfg := lrTokenConfig()
+		cfg.HA = &config.HAConfig{LocalPolicy: haChoiceOf(config.HALocalPolicyReplicate)}
+		if mode != "" {
+			cfg.HA.Mode = haChoiceOf(mode)
+		}
+		return cfg
+	}
+	cases := []struct {
+		name string
+		cfg  *config.CPIConfig
+		want bool
+	}{
+		{"nil config", nil, false},
+		{"no HA block", lrTokenConfig(), false},
+		{"replicate with mode unset", withPolicy(""), false},
+		{"replicate with mode off", withPolicy(config.HAModeOff), false},
+		{"replicate in auto", withPolicy(config.HAModeAuto), true},
+		{"replicate in managed", withPolicy(config.HAModeManaged), true},
+	}
+	for _, c := range cases {
+		if got := replicaLookupEnabled(c.cfg); got != c.want {
+			t.Fatalf("%s: lookup enabled %v, want %v", c.name, got, c.want)
+		}
+		if BackendReplicaLookup(c.cfg) == nil {
+			t.Fatalf("%s: the option must always be set", c.name)
 		}
 	}
 }
 
-func TestAttachToAReplicateVMNarrowsAndWaitsForTheFirstSync(t *testing.T) {
+func TestAttachToAReplicateVMNarrowsAndRestampsTheChange(t *testing.T) {
 	// The VM's widened pin names pve01 and its partner pve02. A new disk on
 	// node-local ZFS storage has no replica yet, so the attach narrows the pin
-	// to pve01 inside the barrier, records the change, and leaves the pin
-	// there because no sync can count inside the wait.
+	// to pve01 inside the barrier and records the change. After the disk
+	// lands it stamps the change again, and it requests no sync and reads no
+	// sync state, so only a sync after the attach finished can widen the pin.
 	deps, stub, profile := attachRig(config.HAModeAuto)
 	wait := 60
 	deps.Config.HA.LocalPolicy = haChoiceOf(config.HALocalPolicyReplicate)
@@ -885,10 +966,314 @@ func TestAttachToAReplicateVMNarrowsAndWaitsForTheFirstSync(t *testing.T) {
 	if derefString(pin.Nodes) != "pve01" {
 		t.Fatalf("pin nodes %q; the attach before the first sync keeps the source alone", derefString(pin.Nodes))
 	}
-	if _, ok := ha.ReplicaChanged(derefString(pin.Comment)); !ok {
-		t.Fatalf("pin comment %q records no change", derefString(pin.Comment))
+	stamped, ok := ha.ReplicaChanged(derefString(pin.Comment))
+	if !ok || stamped.Before(h.replicaChanged.Truncate(time.Second)) {
+		t.Fatalf("pin comment %q; the change is stamped no earlier than the decision at %v",
+			derefString(pin.Comment), h.replicaChanged)
 	}
-	if !slices.Contains(repl.calls, "schedule:pve01/100-0") {
-		t.Fatalf("calls %v; the attach requests a sync of the new disk", repl.calls)
+	if len(repl.calls) != 0 {
+		t.Fatalf("calls %v; the attach requests no sync and reads no sync state", repl.calls)
 	}
+}
+
+func widenOf(r *replicaRig, handle *aj.Handle) *replicaWiden {
+	return &replicaWiden{deps: r.deps, logger: log.NewNopLogger(), api: r.repl, profile: r.profile, vmid: 100,
+		node: "pve01", handle: handle}
+}
+
+func TestWidenStampsAMissingChangeAndWaitsForALaterCall(t *testing.T) {
+	r := newReplicaRig(config.HAModeAuto)
+	r.setPin("pve01", nil)
+	r.ownJob(1)
+	r.repl.status = ha.ReplicaSyncStatus{LastSync: time.Now().Add(time.Hour)}
+	r.repl.listed[replicaRootVolume] = true
+	at := time.Unix(7000, 0)
+	w := widenOf(r, nil)
+	w.now = func() time.Time { return at }
+	widened, err := w.run(crhCtx())
+	if err != nil || widened || r.pinNodes() != "pve01" {
+		t.Fatalf("widened %v err %v pin %q; a pin with no change time never widens", widened, err, r.pinNodes())
+	}
+	if got, ok := ha.ReplicaChanged(r.pinComment()); !ok || !got.Equal(at) {
+		t.Fatalf("pin comment %q, want the change stamped at %v", r.pinComment(), at)
+	}
+	if r.repl.listCalls != 0 || len(r.repl.calls) != 0 {
+		t.Fatalf("reads %d calls %v; the stamp reads no job state", r.repl.listCalls, r.repl.calls)
+	}
+}
+
+func TestWidenRefusesAJobThatCannotCopy(t *testing.T) {
+	changed := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	cases := map[string]func(r *replicaRig){
+		"disabled job":            func(r *replicaRig) { r.repl.jobs[0].Disabled = true },
+		"job marked for removal":  func(r *replicaRig) { r.repl.jobs[0].RemoveJob = "full" },
+		"persistent disk on ZFS":  func(r *replicaRig) { r.cfg["scsi1"] = "local-zfs:vm-9001-disk-0,size=5G" },
+		"volume on unknown store": func(r *replicaRig) { r.cfg["scsi1"] = "elsewhere:vm-100-disk-1,size=5G" },
+	}
+	for name, setup := range cases {
+		r := newReplicaRig(config.HAModeAuto)
+		r.setPin("pve01", func(c string) string { return ha.WithReplicaChanged(c, changed) })
+		r.ownJob(1)
+		r.repl.status = verifiedSync(changed)
+		r.repl.listed[replicaRootVolume] = true
+		r.repl.listed["local-zfs:vm-9001-disk-0"] = true
+		setup(r)
+		widened, err := widenOf(r, nil).run(crhCtx())
+		if err != nil || widened || r.pinNodes() != "pve01" {
+			t.Fatalf("%s: widened %v err %v pin %q", name, widened, err, r.pinNodes())
+		}
+		if r.repl.called("status") {
+			t.Fatalf("%s: calls %v; a job that cannot cover the VM is never checked", name, r.repl.calls)
+		}
+	}
+}
+
+func TestWidenAfterAFailoverAdoptsTheSwappedJob(t *testing.T) {
+	// HA moved VM 100 to pve02, the narrowing pinned it there, and PVE swapped
+	// job 100-0 to run from pve02 to pve01. The record still names the old
+	// direction, so the widen moves it to the new one under generation 2.
+	changed := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	r := newReplicaRig(config.HAModeManaged)
+	r.setPin("pve02", func(c string) string { return ha.WithReplicaChanged(c, changed) })
+	r.repl.source = "pve02"
+	r.repl.addJob("100-0", "pve02", "pve01", renderReplicaJobMarker(aaDirector, 1))
+	r.repl.status = verifiedSync(changed)
+	r.repl.listed[replicaRootVolume] = true
+	handle := replicaHandle(t, changed)
+	w := widenOf(r, handle)
+	w.node = "pve02"
+	widened, err := w.run(crhCtx())
+	if err != nil || !widened {
+		t.Fatalf("widened %v err %v", widened, err)
+	}
+	rep := handle.Record().Replication
+	if rep.PendingJob != nil || rep.Job == nil || rep.Job.Source != "pve02" || rep.Job.Target != "pve01" ||
+		rep.Job.Generation != 2 {
+		t.Fatalf("record job %+v pending %+v, want pve02 to pve01 at generation 2", rep.Job, rep.PendingJob)
+	}
+	if marker, ok := parseReplicaJobMarker(r.repl.jobs[0].Comment); !ok || marker.Generation != 2 {
+		t.Fatalf("job comment %q, want the marker at generation 2", r.repl.jobs[0].Comment)
+	}
+	if r.pinNodes() != "pve01,pve02" {
+		t.Fatalf("pin nodes %q, want the old source added back as the partner", r.pinNodes())
+	}
+}
+
+func TestWidenAfterAFailoverRefusesAJobOfAnotherOwner(t *testing.T) {
+	changed := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	r := newReplicaRig(config.HAModeManaged)
+	r.setPin("pve02", func(c string) string { return ha.WithReplicaChanged(c, changed) })
+	r.repl.addJob("100-0", "pve02", "pve01", renderReplicaJobMarker(aaDirector, 5))
+	r.repl.status = verifiedSync(changed)
+	r.repl.listed[replicaRootVolume] = true
+	handle := replicaHandle(t, changed)
+	w := widenOf(r, handle)
+	w.node = "pve02"
+	if widened, err := w.run(crhCtx()); err != nil || widened || r.pinNodes() != "pve02" {
+		t.Fatalf("widened %v err %v pin %q; a marker of another generation proves nothing", widened, err,
+			r.pinNodes())
+	}
+	if rep := handle.Record().Replication; rep.Job.Generation != 1 || rep.PendingJob != nil {
+		t.Fatalf("record %+v; a refused adoption records nothing", rep)
+	}
+}
+
+// rulesErrCluster fails every HA rule read.
+type rulesErrCluster struct {
+	*attachHAStub
+	err error
+}
+
+func (c *rulesErrCluster) ListHaRules(context.Context, *cluster.ListHaRulesParams) (*cluster.ListHaRulesResponse,
+	error,
+) {
+	return nil, c.err
+}
+
+func TestReconcileVMReplica_UnreadablePinDefers(t *testing.T) {
+	r := newReplicaRig(config.HAModeAuto)
+	r.setPin("pve01,pve02", func(c string) string { return ha.WithReplicaPartner(c, "pve02") })
+	client, ok := r.deps.PVE.(*attachRunClient)
+	if !ok {
+		t.Fatal("the rig's client is not an attachRunClient")
+	}
+	client.cluster = &rulesErrCluster{attachHAStub: r.stub, err: errors.New("connection reset")}
+	loc := pve.VMLocation{Node: "pve02", Found: true, Tags: haReplicaTag}
+	err := reconcileVMReplica(crhCtx(), r.deps, "reboot_vm", "100", 100, loc, log.NewNopLogger())
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("err %v; a narrowing the VM may owe is never skipped for a failed read", err)
+	}
+}
+
+func TestReconcileVMReplica_ProfileFailure(t *testing.T) {
+	boom := func(context.Context) (*ha.Profile, error) { return nil, errors.New("cluster status unreadable") }
+	t.Run("on the partner it defers", func(t *testing.T) {
+		r := newReplicaRig(config.HAModeAuto)
+		r.setPin("pve01,pve02", func(c string) string { return ha.WithReplicaPartner(c, "pve02") })
+		r.deps.HAProfile = boom
+		loc := pve.VMLocation{Node: "pve02", Found: true, Tags: haReplicaTag}
+		err := reconcileVMReplica(crhCtx(), r.deps, "reboot_vm", "100", 100, loc, log.NewNopLogger())
+		if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || r.pinNodes() != "pve01,pve02" {
+			t.Fatalf("err %v pin %q", err, r.pinNodes())
+		}
+	})
+	t.Run("on the source it leaves the pin", func(t *testing.T) {
+		r := newReplicaRig(config.HAModeAuto)
+		r.setPin("pve01", func(c string) string { return ha.WithReplicaChanged(c, time.Now().Add(-time.Hour)) })
+		r.deps.HAProfile = boom
+		loc := pve.VMLocation{Node: "pve01", Found: true, Tags: haReplicaTag}
+		err := reconcileVMReplica(crhCtx(), r.deps, "reboot_vm", "100", 100, loc, log.NewNopLogger())
+		if err != nil || r.pinNodes() != "pve01" {
+			t.Fatalf("err %v pin %q; a widen that cannot run waits for a later call", err, r.pinNodes())
+		}
+	})
+}
+
+func TestNarrowAfterFailover_ErroredResourceReregistersUnderTheClaim(t *testing.T) {
+	// HA recovered the VM to pve02 and left its resource in the error state.
+	// The narrowing runs inside the re-registration, which takes the VMID
+	// claim before it writes anything. This rig has no claim pool, so the
+	// claim fails and nothing in HA changes.
+	r := newReplicaRig(config.HAModeAuto)
+	r.setPin("pve01,pve02", func(c string) string { return ha.WithReplicaPartner(c, "pve02") })
+	r.repl.addJob("100-0", "pve02", "pve01", renderReplicaJobMarker(aaDirector, 1))
+	set, err := readHARuleSet(context.Background(), r.deps.PVE.Cluster())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sl := &stagingLog{}
+	res := &attachRunRes{log: sl, state: "error", comment: r.stub.comment}
+	view := failoverView(res, "pve02")
+	read := view.ReadState
+	view.ReadState = func(ctx context.Context, vmid int, n string) (*pve.HAServiceState, error) {
+		st, err := read(ctx, vmid, n)
+		if st != nil && st.Raw == "started" {
+			st.Raw = "error"
+		}
+		return st, err
+	}
+	err = narrowAfterFailover(crhCtx(), r.deps, log.NewNopLogger(), "reboot_vm", r.repl, view, r.profile, 100,
+		"pve02", set.Find("bosh-na-100"))
+	if err == nil || strings.Contains(err.Error(), "operator must clear") || !strings.Contains(err.Error(), "vm-100") {
+		t.Fatalf("err %v; the errored resource goes to the re-registration, which takes the VMID claim", err)
+	}
+	if r.pinNodes() != "pve01,pve02" || len(sl.events) != 0 {
+		t.Fatalf("pin %q events %v; a re-registration that cannot take the claim writes nothing", r.pinNodes(),
+			sl.events)
+	}
+}
+
+func TestConfirmReplicaJobForTheDeadNodeCompletion(t *testing.T) {
+	cases := map[string]struct {
+		setup func(f *fakeReplica)
+		ok    bool
+	}{
+		"forward job":           {setup: func(f *fakeReplica) { f.addJob("100-0", "pve01", "pve02", "") }, ok: true},
+		"swapped job":           {setup: func(f *fakeReplica) { f.addJob("100-0", "pve02", "pve01", "") }, ok: true},
+		"job with no source":    {setup: func(f *fakeReplica) { f.addJob("100-0", "", "pve02", "") }, ok: true},
+		"no job":                {setup: func(*fakeReplica) {}},
+		"foreign job":           {setup: func(f *fakeReplica) { f.addJob("100-0", "pve01", "pve02", "operator job") }},
+		"job to another node":   {setup: func(f *fakeReplica) { f.addJob("100-0", "pve01", "pve03", "") }},
+		"job from another node": {setup: func(f *fakeReplica) { f.addJob("100-0", "pve03", "pve02", "") }},
+		"disabled job": {setup: func(f *fakeReplica) {
+			f.addJob("100-0", "pve01", "pve02", "")
+			f.jobs[0].Disabled = true
+		}},
+		"job marked for removal": {setup: func(f *fakeReplica) {
+			f.addJob("100-0", "pve01", "pve02", "")
+			f.jobs[0].RemoveJob = "full"
+		}},
+		"list fails": {setup: func(f *fakeReplica) { f.listErr = errors.New("connection reset") }},
+	}
+	for name, tc := range cases {
+		r := newReplicaRig(config.HAModeAuto)
+		tc.setup(r.repl)
+		for i := range r.repl.jobs {
+			if r.repl.jobs[i].Comment == "" {
+				r.repl.jobs[i].Comment = renderReplicaJobMarker(aaDirector, 1)
+			}
+		}
+		c := &deadNodeCompletion{deps: r.deps, vmid: 100, source: "pve01", logger: log.NewNopLogger()}
+		err := c.confirmReplicaJob(crhCtx(), "pve02")
+		if (err == nil) != tc.ok {
+			t.Fatalf("%s: err %v, want ok %v", name, err, tc.ok)
+		}
+	}
+}
+
+func TestDeadNodeReplicaCopies(t *testing.T) {
+	// VM 100's config moved from dead pve01 to its partner pve02. Only a
+	// volume the job copies and pve02 lists counts as living on pve02.
+	storages := []pve.StorageInfo{{Name: "local-zfs", Type: pve.StorageTypeZFSPool, Content: "images"},
+		{Name: "nfs", Type: pve.StorageTypeNFS, Shared: true, Content: "images"}}
+	live := map[string]any{"scsi0": replicaRootVolume + ",size=10G", "scsi1": "local-zfs:vm-9001-disk-0,size=5G",
+		"scsi2": "nfs:vm-100-disk-2,size=5G"}
+	wide := func(c string) string { return ha.WithReplicaPartner(c, "pve02") }
+	t.Run("listed copy counts and the persistent disk does not", func(t *testing.T) {
+		r := newReplicaRig(config.HAModeAuto)
+		r.setPin("pve01,pve02", wide)
+		r.repl.listed[replicaRootVolume] = true
+		r.repl.listed["local-zfs:vm-9001-disk-0"] = true
+		got, err := deadNodeReplicaCopies(crhCtx(), r.deps, 100, "pve02", storages, live, nil)
+		if err != nil || len(got) != 1 || !got[replicaRootVolume] {
+			t.Fatalf("copies %v err %v; the job never copies a disk ID's volume", got, err)
+		}
+		if !slices.Equal(r.repl.calls, []string{"volumes:pve02/local-zfs"}) {
+			t.Fatalf("calls %v; each storage is listed once", r.repl.calls)
+		}
+	})
+	t.Run("missing copy does not count", func(t *testing.T) {
+		r := newReplicaRig(config.HAModeAuto)
+		r.setPin("pve01,pve02", wide)
+		got, err := deadNodeReplicaCopies(crhCtx(), r.deps, 100, "pve02", storages, live, nil)
+		if err != nil || len(got) != 0 {
+			t.Fatalf("copies %v err %v", got, err)
+		}
+	})
+	t.Run("no replicate pin reads nothing", func(t *testing.T) {
+		for name, setup := range map[string]func(r *replicaRig){
+			"no pin":          func(*replicaRig) {},
+			"source-only pin": func(r *replicaRig) { r.setPin("pve01", nil) },
+			"partner is elsewhere": func(r *replicaRig) {
+				r.setPin("pve01,pve03", func(c string) string { return ha.WithReplicaPartner(c, "pve03") })
+			},
+		} {
+			r := newReplicaRig(config.HAModeAuto)
+			setup(r)
+			r.repl.listed[replicaRootVolume] = true
+			got, err := deadNodeReplicaCopies(crhCtx(), r.deps, 100, "pve02", storages, live, nil)
+			if err != nil || len(got) != 0 || len(r.repl.calls) != 0 {
+				t.Fatalf("%s: copies %v err %v calls %v", name, got, err, r.repl.calls)
+			}
+		}
+	})
+	t.Run("pin of another Director reads nothing", func(t *testing.T) {
+		r := newReplicaRig(config.HAModeAuto)
+		r.setPin("pve01,pve02", wide)
+		r.deps.RequestDirectorUUID = "another-director"
+		r.repl.listed[replicaRootVolume] = true
+		got, err := deadNodeReplicaCopies(crhCtx(), r.deps, 100, "pve02", storages, live, nil)
+		if err != nil || len(got) != 0 || len(r.repl.calls) != 0 {
+			t.Fatalf("copies %v err %v calls %v", got, err, r.repl.calls)
+		}
+	})
+	t.Run("unreadable listing is an error", func(t *testing.T) {
+		r := newReplicaRig(config.HAModeAuto)
+		r.setPin("pve01,pve02", wide)
+		r.repl.volumesErr = errors.New("storage offline")
+		if _, err := deadNodeReplicaCopies(crhCtx(), r.deps, 100, "pve02", storages, live, nil); err == nil {
+			t.Fatal("a listing that fails must be an error")
+		}
+	})
+	t.Run("unreadable rules are an error", func(t *testing.T) {
+		r := newReplicaRig(config.HAModeAuto)
+		client, ok := r.deps.PVE.(*attachRunClient)
+		if !ok {
+			t.Fatal("the rig's client is not an attachRunClient")
+		}
+		client.cluster = &rulesErrCluster{attachHAStub: r.stub, err: errors.New("connection reset")}
+		if _, err := deadNodeReplicaCopies(crhCtx(), r.deps, 100, "pve02", storages, live, nil); err == nil {
+			t.Fatal("a rule read that fails must be an error")
+		}
+	})
 }

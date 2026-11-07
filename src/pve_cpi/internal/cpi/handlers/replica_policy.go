@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,11 +59,16 @@ func replicaJobOwned(job ha.ReplicaJobState, owner string) bool {
 
 // guestReplicaJobs splits the jobs of guest vmid into the one this Director
 // owns and the others. More than one owned job is an error, because the CPI
-// creates one job per VM and cannot tell which of several the pin speaks for.
+// creates one job per VM and cannot tell which of several the pin speaks for,
+// and so is a faulted row that may be the guest's (see ha.GuestJobs).
 func guestReplicaJobs(
 	jobs []ha.ReplicaJobState, vmid int, owner string,
 ) (owned *ha.ReplicaJobState, foreign []ha.ReplicaJobState, err error) {
-	for _, j := range ha.GuestJobs(jobs, vmid) {
+	mine, err := ha.GuestJobs(jobs, vmid)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, j := range mine {
 		if !replicaJobOwned(j, owner) {
 			foreign = append(foreign, j)
 			continue
@@ -205,13 +211,17 @@ func readOwnedReplicaPin(ctx context.Context, deps Deps, vmid int) (pin *ha.Rule
 }
 
 // replicaVolumesOn returns the replicated volumes of the VM as its config on
-// node holds them now.
-func replicaVolumesOn(ctx context.Context, deps Deps, profile *ha.Profile, node string, vmid int) ([]string, error) {
+// node holds them now, and the gaps, the node-local volumes its job leaves on
+// the source (see ha.ReplicaVolumes).
+func replicaVolumesOn(
+	ctx context.Context, deps Deps, profile *ha.Profile, node string, vmid int,
+) (volids, gaps []string, err error) {
 	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
 	if err != nil {
-		return nil, fmt.Errorf("read the config of VM %d on node %s: %w", vmid, node, pve.WrapError(err))
+		return nil, nil, fmt.Errorf("read the config of VM %d on node %s: %w", vmid, node, pve.WrapError(err))
 	}
-	return ha.ReplicaVolIDs(haVolumesOfConfig(cfg, node, nil), profile.Storages), nil
+	volids, gaps = ha.ReplicaVolumes(vmid, haVolumesOfConfig(cfg, node, nil), profile.Storages)
+	return volids, gaps, nil
 }
 
 // replicaNodeOnline answers whether node is an online member, from the
@@ -246,23 +256,22 @@ type replicaWiden struct {
 	vmid    int
 	// node is where the VM runs.
 	node string
-	// wait, when set, asks for a sync and waits for it within its budget.
-	// Without it the check reads the job's last sync once.
-	wait *ha.ReplicaSyncWait
 	// handle is the VM's journal record, nil when the VM has none. A record
 	// must carry the evidence before the pin names the partner.
 	handle *aj.Handle
-	// changedAfter is the end of a change this call made, which a sync must
-	// also follow.
-	changedAfter time.Time
-	now          func() time.Time
+	now    func() time.Time
 }
 
-// run checks the replica and widens the pin when the check passes. It reports
-// whether the pin names the partner afterwards. A replica that is not yet
-// verified, or a VM whose state does not let the policy widen, is no error:
-// the pin keeps the source alone and a later call that touches the VM checks
-// again. An error is a read or a write that failed.
+// run checks the replica once and widens the pin when the check passes. It
+// reports whether the pin names the partner afterwards. A replica that is not
+// yet verified, or a VM whose state does not let the policy widen, is no
+// error: the pin keeps the source alone and a later call that touches the VM
+// checks again. The pin stays on the source while the job is disabled or
+// marked for removal, and while the VM holds a node-local volume the job does
+// not copy, such as a persistent disk, which replication never copies because
+// a disk ID owns it. A pin that records no time of its last change gets that
+// time now, so a later sync can cover it. An error is a read or a write that
+// failed.
 func (w *replicaWiden) run(ctx context.Context) (bool, error) {
 	if w.now == nil {
 		w.now = time.Now
@@ -285,12 +294,14 @@ func (w *replicaWiden) run(ctx context.Context) (bool, error) {
 	}
 	changedAt, ok := ha.ReplicaChanged(pin.Comment)
 	if !ok {
-		logger.Warn(replicaOp + ": the VM's pin records no time of its last change, so no sync can be shown to " +
-			"cover it; the pin keeps the source alone")
+		stamped := *pin
+		stamped.Comment = ha.WithReplicaChanged(pin.Comment, w.now())
+		if err := writeReplicaPin(ctx, w.deps, w.profile, logger, w.vmid, pin, &stamped); err != nil {
+			return false, fmt.Errorf("record the time of the last change on the pin of VM %d: %w", w.vmid, err)
+		}
+		logger.Info(replicaOp + ": the VM's pin recorded no time of its last change, and records now as that " +
+			"time; a sync that follows it can widen the pin")
 		return false, nil
-	}
-	if w.changedAfter.After(changedAt) {
-		changedAt = w.changedAfter
 	}
 	jobs, err := w.api.ListJobs(ctx)
 	if err != nil {
@@ -304,31 +315,37 @@ func (w *replicaWiden) run(ctx context.Context) (bool, error) {
 		logger.Info(replicaOp + ": the VM has no replication job of this Director; the pin keeps the source alone")
 		return false, nil
 	}
+	if job.Disabled || job.RemoveJob != "" {
+		logger.Info(replicaOp+": the VM's replication job is disabled or marked for removal; the pin keeps the "+
+			"source alone", log.String("job", job.ID), log.String("remove_job", job.RemoveJob))
+		return false, nil
+	}
 	target := replicaOtherNode(*job, w.node)
 	if target == "" {
 		return false, nil
 	}
-	volids, err := replicaVolumesOn(ctx, w.deps, w.profile, w.node, w.vmid)
+	volids, gaps, err := replicaVolumesOn(ctx, w.deps, w.profile, w.node, w.vmid)
 	if err != nil {
 		return false, err
+	}
+	if len(gaps) > 0 {
+		logger.Warn(replicaOp+": the VM holds node-local volumes its replication job does not copy, so the "+
+			"partner would hold no copy of them; the pin keeps the source alone", log.String("job", job.ID),
+			log.String("gaps", strings.Join(gaps, "; ")))
+		return false, nil
 	}
 	if len(volids) == 0 {
 		logger.Warn(replicaOp + ": the VM holds no volume on node-local ZFS storage that the profile knows; the " +
 			"pin keeps the source alone")
 		return false, nil
 	}
-	evidence, err := w.journalEvidence(*job, target, volids, changedAt, logger)
+	evidence, err := w.journalEvidence(ctx, *job, target, volids, changedAt, logger)
 	if err != nil || evidence == nil {
 		return false, err
 	}
-	check := ha.ReplicaSyncCheck{JobID: job.ID, Source: w.node, Target: target, VolIDs: volids,
-		ChangedAt: evidence.changedAt}
-	var verdict ha.ReplicaSyncVerdict
-	if w.wait != nil {
-		verdict, err = ha.AwaitReplicaSync(ctx, w.api, check, *w.wait)
-	} else {
-		verdict, err = ha.CheckReplicaSync(ctx, w.api, check)
-	}
+	verdict, err := ha.CheckReplicaSync(ctx, w.api, ha.ReplicaSyncCheck{
+		JobID: job.ID, Source: w.node, Target: target, VolIDs: volids, ChangedAt: evidence.changedAt,
+	})
 	if err != nil {
 		return false, err
 	}
@@ -367,10 +384,13 @@ type replicaEvidence struct {
 // time of change. A record must name the job in this direction, with the
 // marker's generation, no generation in flight, and the volume set the VM
 // holds now; a set that differs is recorded, before the sync check, as the
-// set changed at the pin's time of change. nil with no error means the record
-// does not let the pin widen now, which is logged.
+// set changed at the pin's time of change. A record that names the job in the
+// other direction, after a failover PVE has swapped the job for, is moved to
+// this direction first (see adoptSwappedReplicaJob). nil with no error means
+// the record does not let the pin widen now, which is logged.
 func (w *replicaWiden) journalEvidence(
-	job ha.ReplicaJobState, target string, volids []string, changedAt time.Time, logger *log.Logger,
+	ctx context.Context, job ha.ReplicaJobState, target string, volids []string, changedAt time.Time,
+	logger *log.Logger,
 ) (*replicaEvidence, error) {
 	if w.handle == nil {
 		return &replicaEvidence{changedAt: changedAt}, nil
@@ -379,15 +399,15 @@ func (w *replicaWiden) journalEvidence(
 		logger.Info(replicaOp+": the journal record does not let the pin widen yet: "+why, log.String("job", job.ID))
 		return nil, nil
 	}
-	rep := w.handle.Record().Replication
+	adopted, why, err := w.adoptSwappedReplicaJob(ctx, job, target, logger)
 	switch {
-	case rep == nil || rep.Job == nil || rep.Retired:
-		return refuse("it records no live replication job")
-	case rep.PendingJob != nil:
-		return refuse("a job generation is pending")
-	case rep.Job.ID != job.ID || rep.Job.Source != w.node || rep.Job.Target != target:
-		return refuse(fmt.Sprintf("it records job %s from %s to %s", rep.Job.ID, rep.Job.Source, rep.Job.Target))
+	case err != nil:
+		return nil, err
+	case why != "":
+		return refuse(why)
 	}
+	job = adopted
+	rep := w.handle.Record().Replication
 	marker, ok := parseReplicaJobMarker(job.Comment)
 	if !ok || marker.Generation != rep.Job.Generation {
 		return refuse(fmt.Sprintf("the job's marker does not carry generation %d", rep.Job.Generation))
@@ -419,6 +439,89 @@ func (w *replicaWiden) journalEvidence(
 		changedAt = set.ChangedAt
 	}
 	return &replicaEvidence{changedAt: changedAt, jobGeneration: rep.Job.Generation, setGeneration: set.Generation}, nil
+}
+
+// adoptSwappedReplicaJob checks that the VM's journal record names job as it
+// runs now, from w.node to target, and returns the job as PVE then lists it.
+// A record that names the same job from target to w.node is the state after a
+// failover: PVE swapped the job's direction when HA moved the VM, and the CPI
+// narrowed the pin to w.node. The record moves to the new direction under the
+// next job generation, which is recorded as pending, written into the job's
+// marker, read back, and confirmed, so a crash at any step resumes with the
+// same generation. The old direction is accepted only while PVE's job still
+// carries the record's generation, or the pending one an earlier attempt
+// wrote, which proves the job is the one the record names. why is non-empty
+// when the record does not let the pin widen now.
+func (w *replicaWiden) adoptSwappedReplicaJob(
+	ctx context.Context, job ha.ReplicaJobState, target string, logger *log.Logger,
+) (ha.ReplicaJobState, string, error) {
+	rep := w.handle.Record().Replication
+	if rep == nil || rep.Job == nil || rep.Retired {
+		return job, "it records no live replication job", nil
+	}
+	forward := func(j *aj.ReplicaJob) bool {
+		return j != nil && j.ID == job.ID && j.Source == w.node && j.Target == target
+	}
+	reversed := func(j *aj.ReplicaJob) bool {
+		return j != nil && j.ID == job.ID && j.Source == target && j.Target == w.node
+	}
+	switch {
+	case rep.PendingJob == nil && forward(rep.Job):
+		return job, "", nil
+	case rep.PendingJob != nil && (!forward(rep.PendingJob) || !reversed(rep.Job)):
+		return job, "a job generation is pending", nil
+	case rep.PendingJob == nil && !reversed(rep.Job):
+		return job, fmt.Sprintf("it records job %s from %s to %s", rep.Job.ID, rep.Job.Source, rep.Job.Target), nil
+	case job.Target != target:
+		// PVE has not swapped the job yet, so it does not run from w.node.
+		return job, fmt.Sprintf("PVE still runs job %s toward node %s", job.ID, job.Target), nil
+	}
+	marker, ok := parseReplicaJobMarker(job.Comment)
+	pendingGen := uint64(0)
+	if rep.PendingJob != nil {
+		pendingGen = rep.PendingJob.Generation
+	}
+	if !ok || marker.Owner != markerValue(rep.Owner) ||
+		(marker.Generation != rep.Job.Generation && marker.Generation != pendingGen) {
+		return job, fmt.Sprintf("the job's marker carries neither generation %d nor a pending one",
+			rep.Job.Generation), nil
+	}
+	gen, err := w.handle.PrepareReplicationJob(aj.ReplicaJob{
+		ID: rep.Job.ID, Guest: rep.Job.Guest, JobNum: rep.Job.JobNum, Source: w.node, Target: target,
+	})
+	if err != nil {
+		return job, "", fmt.Errorf("record the new direction of replication job %s: %w", job.ID, err)
+	}
+	comment := renderReplicaJobMarker(rep.Owner, gen)
+	if marker.Generation != gen {
+		if err := w.api.SetComment(ctx, job.ID, comment); err != nil {
+			return job, "", fmt.Errorf("write generation %d into the marker of replication job %s: %w", gen, job.ID,
+				pve.WrapError(err))
+		}
+	}
+	jobs, err := w.api.ListJobs(ctx)
+	if err != nil {
+		return job, "", fmt.Errorf("read replication job %s back after its marker write: %w", job.ID, err)
+	}
+	owned, _, err := guestReplicaJobs(jobs, w.vmid, rep.Owner)
+	if err != nil {
+		return job, "", err
+	}
+	if owned == nil || owned.ID != job.ID || owned.Target != target {
+		return job, "", fmt.Errorf("replication job %s is not listed from node %s to node %s after its marker write",
+			job.ID, w.node, target)
+	}
+	if m, ok := parseReplicaJobMarker(owned.Comment); !ok || m.Generation != gen {
+		return job, "", fmt.Errorf("replication job %s does not carry generation %d after its marker write", job.ID,
+			gen)
+	}
+	if err := w.handle.ConfirmReplicationJob(gen); err != nil {
+		return job, "", fmt.Errorf("confirm the new direction of replication job %s: %w", job.ID, err)
+	}
+	logger.Info(replicaOp+": the journal record follows the replication job's new direction after a failover",
+		log.String("job", job.ID), log.String("source", w.node), log.String("target", target),
+		log.Any("generation", gen))
+	return *owned, "", nil
 }
 
 // normalizedVolIDs is volids sorted with repeats removed, the form the
@@ -559,9 +662,10 @@ func retireTornDownReplica(
 			"prove the job is this Director's; the destroy waits", caller, vmid)
 	}
 	profile, profileErr := resolveHAProfile(ctx, deps)
-	var volids []string
-	if profileErr == nil && profile != nil && profile.StoragesErr == "" {
-		volids = ha.ReplicaVolIDs(haVolumesOfConfig(cfg, node, nil), profile.Storages)
+	volids, err := tornDownReplicaVolumes(ctx, deps, profile, profileErr, vmid, cfg, node)
+	if err != nil {
+		logger.Warn(caller+": the replicated volumes of the VM could not be listed; the journal record names "+
+			"them if it holds a volume set", log.Int(metadataKeyVMID, vmid), log.Err(err))
 	}
 	r := &replicaRetire{
 		deps: deps, logger: logger, api: replicationAPIFor(deps), caller: caller, vmid: vmid, node: node,
@@ -570,16 +674,42 @@ func retireTornDownReplica(
 	return r.run(ctx)
 }
 
+// tornDownReplicaVolumes returns the volumes of a VM being torn down that its
+// replication job copies, which a forced removal leaves on the other node. The
+// storages come from the HA profile, and from the storage index when the
+// profile holds none, as in mode off or a profile resolved in part.
+func tornDownReplicaVolumes(
+	ctx context.Context, deps Deps, profile *ha.Profile, profileErr error, vmid int, cfg map[string]any, node string,
+) ([]string, error) {
+	var storages []pve.StorageInfo
+	if profileErr == nil && profile != nil && profile.StoragesErr == "" {
+		storages = profile.Storages
+	}
+	if len(storages) == 0 {
+		read, err := readStorageIndex(ctx, deps)
+		if err != nil {
+			return nil, err
+		}
+		storages = read
+	}
+	volids, _ := ha.ReplicaVolumes(vmid, haVolumesOfConfig(cfg, node, nil), storages)
+	return volids, nil
+}
+
 // setUpCreatedReplica runs the replicate policy's steps of create_vm once the
 // VM runs under PVE HA with its source-only pin. It tags the VM, creates the
 // replication job with the configured schedule and rate and this Director's
-// marker, requests the first sync, and widens the pin to the partner only
-// when that sync is verified within the HA motion wait. A sync that misses the
-// wait leaves the source-only pin, and a later call that touches the VM
-// checks again. A VM with a journal record gets its replication recorded
-// before each PVE write. In auto, a tag or a job that cannot be written leaves
-// the VM under HA pinned to its node with a warning; in managed, it fails the
-// call, and the rollback's teardown retires a job that was created.
+// marker, records the job's start on the pin, and asks the job to run now. It
+// does not wait for that first sync: a sync counts only when it starts after
+// the change by more than the clock-skew tolerance, so the pin widens to the
+// partner on a later call that touches the VM, once a sync is verified. A VM
+// with a journal record gets its replication recorded before each PVE write.
+// A read or write that fails transiently, or for a reason it cannot classify,
+// fails the call with a retriable error in every mode, so the Director
+// retries and the rollback's teardown retires a job that was created. A
+// proven refusal, such as a VM with no volume to copy, fails the call in
+// managed; in auto it leaves the VM under HA pinned to its node with a
+// warning, and no later call creates the job.
 func setUpCreatedReplica(
 	ctx context.Context, deps Deps, logger *log.Logger, node string, vmid int, d *ha.VMDecision,
 	profile *ha.Profile, handle *aj.Handle,
@@ -590,7 +720,10 @@ func setUpCreatedReplica(
 	logger = logger.With(log.Int(metadataKeyVMID, vmid), log.String("node", node), log.String("partner", d.Partner))
 	managed := deps.Config.HAModeValue() == config.HAModeManaged
 	degrade := func(what string, err error) error {
-		if managed {
+		switch {
+		case !replicaRefusalProven(err):
+			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "create_vm: "+what)
+		case managed:
 			return err
 		}
 		logger.Warn("create_vm: "+what+"; the VM runs under PVE HA pinned to its node without a replica",
@@ -610,12 +743,16 @@ func setUpCreatedReplica(
 		}); err != nil {
 		return degrade("the bosh-ha-replica tag could not be written", err)
 	}
-	volids, err := replicaVolumesOn(ctx, deps, profile, node, vmid)
+	volids, gaps, err := replicaVolumesOn(ctx, deps, profile, node, vmid)
 	if err != nil {
 		return degrade("the VM's volumes could not be read", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 			"create_vm: read the replicated volumes"))
 	}
-	if len(volids) == 0 {
+	switch {
+	case len(gaps) > 0:
+		return degrade("the VM holds node-local volumes replication does not copy", cpierrors.Cloud("create_vm: "+
+			"VM %d holds node-local volumes its replication job would not copy: %s", vmid, strings.Join(gaps, "; ")))
+	case len(volids) == 0:
 		return degrade("the VM holds no volume on node-local ZFS storage", cpierrors.Cloud("create_vm: VM %d "+
 			"holds no volume for its replication job to copy", vmid))
 	}
@@ -637,21 +774,31 @@ func setUpCreatedReplica(
 			stamped := *pin
 			stamped.Comment = ha.WithReplicaChanged(pin.Comment, changedAt)
 			if err := writeReplicaPin(ctx, deps, profile, logger, vmid, pin, &stamped); err != nil {
-				return degrade("the pin could not record the job's start", err)
+				// A later call that touches the VM records the time on a pin
+				// that has none, so the job stands.
+				logger.Warn("create_vm: the pin could not record the job's start; the next call that touches the "+
+					"VM records it", log.Err(err))
 			}
 		}
 	}
-	logger.Info("create_vm: the VM's replication job is configured; the pin names the source alone until a sync "+
-		"is verified", log.String("job", job))
-	w := &replicaWiden{
-		deps: deps, logger: logger, api: api, profile: profile, vmid: vmid, node: node, handle: handle,
-		wait: &ha.ReplicaSyncWait{Budget: haMotionWait(deps), Logger: logger},
+	if err := api.ScheduleNow(ctx, node, job); err != nil {
+		logger.Info("create_vm: the request to run the replication job now failed; its schedule runs it",
+			log.String("job", job), log.Err(err))
 	}
-	if _, err := w.run(ctx); err != nil {
-		logger.Warn("create_vm: the first sync of the VM's replica could not be checked; the pin names the source "+
-			"alone, and a later call that touches the VM checks again", log.Err(err))
-	}
+	logger.Info("create_vm: the VM's replication job is configured; the pin names the source alone until a call "+
+		"that touches the VM sees a verified sync", log.String("job", job))
 	return nil
+}
+
+// replicaRefusalProven reports whether err is a refusal that rests on proven
+// facts, which a retry would meet again. A retriable error, and an error that
+// carries no CPI type, are not.
+func replicaRefusalProven(err error) bool {
+	var typed *cpierrors.Error
+	if err == nil || !errors.As(err, &typed) {
+		return false
+	}
+	return !typed.OkToRetry() && !cpierrors.IsType(err, cpierrors.TypeRetriableCloud)
 }
 
 // ensureCreatedReplicaJob creates the VM's replication job, or finds the one
@@ -676,7 +823,7 @@ func ensureCreatedReplicaJob(
 	}
 	owned, foreign, err := guestReplicaJobs(jobs, vmid, owner)
 	if err != nil {
-		return "", cpierrors.Wrap(err, "create_vm: set up the replication job")
+		return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "create_vm: set up the replication job")
 	}
 	if len(foreign) > 0 {
 		return "", cpierrors.Cloud("create_vm: VM %d already has replication job %s, which does not carry this "+
@@ -764,7 +911,17 @@ func settleFailedReplicaCreate(
 		return cpierrors.WrapAs(pve.WrapError(createErr), cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("create_vm: create replication job %s (and the re-read of the jobs failed: %v)", id, err))
 	}
-	for _, j := range jobs {
+	guest, _, _ := strings.Cut(id, "-")
+	vmid, convErr := strconv.Atoi(guest)
+	if convErr != nil {
+		return cpierrors.Cloud("create_vm: replication job ID %q names no guest", id)
+	}
+	mine, err := ha.GuestJobs(jobs, vmid)
+	if err != nil {
+		return cpierrors.WrapAs(pve.WrapError(createErr), cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("create_vm: create replication job %s (and the re-read of the jobs is unusable: %v)", id, err))
+	}
+	for _, j := range mine {
 		if j.ID != id {
 			continue
 		}
@@ -808,8 +965,10 @@ func reconcileTouchedVMHA(ctx context.Context, deps Deps, op, vmCID string, vmid
 // partner's and the next sync rolls it back. The barrier's change asks the
 // job for a sync from the new source. A VM on its source with the
 // source-only pin gets one check of its replica, and the pin widens when a
-// sync is verified. A narrowing that cannot finish returns its error, so the
-// Director retries the call; a widening that cannot finish is logged.
+// sync is verified. A pin that cannot be read, a profile that cannot be
+// resolved for a narrowing, and a narrowing that cannot finish return a
+// retriable error, so the Director retries the call; a widening that cannot
+// finish, the profile it needs included, is logged.
 func reconcileVMReplica(ctx context.Context, deps Deps, op, vmCID string, vmid int, loc pve.VMLocation,
 	logger *log.Logger,
 ) error {
@@ -823,17 +982,12 @@ func reconcileVMReplica(ctx context.Context, deps Deps, op, vmCID string, vmid i
 	logger = logger.With(log.Int(metadataKeyVMID, vmid), log.String("node", loc.Node))
 	pin, source, partner, err := readOwnedReplicaPin(ctx, deps, vmid)
 	if err != nil {
-		logger.Warn(op+": the VM's pin could not be read to check its replica; a later call checks again",
-			log.Err(err))
-		return nil
+		// The VM may have failed over, and a narrowing it owes must not be
+		// skipped for a read that failed.
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: read the pin of replicated VM %d to reconcile it with where the VM runs", op, vmid))
 	}
 	if pin == nil {
-		return nil
-	}
-	profile, err := resolveHAProfile(ctx, deps)
-	if err != nil {
-		logger.Warn(op+": the HA profile could not be resolved to check the VM's replica; a later call checks "+
-			"again", log.Err(err))
 		return nil
 	}
 	api := replicationAPIFor(deps)
@@ -842,7 +996,13 @@ func reconcileVMReplica(ctx context.Context, deps Deps, op, vmCID string, vmid i
 		if partner != "" {
 			return nil
 		}
-		err := withVMReplicaRecord(ctx, deps, vmCID, func(handle *aj.Handle) error {
+		profile, err := resolveHAProfile(ctx, deps)
+		if err != nil {
+			logger.Warn(op+": the HA profile could not be resolved to check the VM's replica; a later call checks "+
+				"again", log.Err(err))
+			return nil
+		}
+		err = withVMReplicaRecord(ctx, deps, vmCID, func(handle *aj.Handle) error {
 			w := &replicaWiden{deps: deps, logger: logger, api: api, profile: profile, vmid: vmid, node: loc.Node,
 				handle: handle}
 			_, err := w.run(ctx)
@@ -853,6 +1013,11 @@ func reconcileVMReplica(ctx context.Context, deps Deps, op, vmCID string, vmid i
 		}
 		return nil
 	case partner:
+		profile, err := resolveHAProfile(ctx, deps)
+		if err != nil {
+			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf("%s: resolve the HA profile to "+
+				"narrow the pin of VM %d after its failover", op, vmid))
+		}
 		narrow := ha.NarrowDepsFor(deps.PVE, logger, haMotionWait(deps))
 		return narrowAfterFailover(ctx, deps, logger, op, api, narrow, profile, vmid, loc.Node, pin)
 	}
@@ -863,7 +1028,12 @@ func reconcileVMReplica(ctx context.Context, deps Deps, op, vmCID string, vmid i
 
 // narrowAfterFailover narrows the pin of a VM that runs on its partner to
 // that node alone, through the narrowing barrier that narrow reads and writes
-// with, and asks the job for a sync from the new source inside it.
+// with, and asks the job for a sync from the new source inside it. A resource
+// the barrier finds in the error state is registered again under the VM's
+// claim, with the narrowed pin written in the confinement step. The barrier
+// checks after the request that node reaches every volume. A failed request
+// is logged and never undoes the narrowing, because the wide pin names the
+// old source, whose copy is behind.
 func narrowAfterFailover(
 	ctx context.Context, deps Deps, logger *log.Logger, op string, api ha.ReplicationAPI, narrow ha.NarrowDeps,
 	profile *ha.Profile, vmid int, node string, pin *ha.Rule,
@@ -881,21 +1051,22 @@ func narrowAfterFailover(
 	logger.Warn(op+": the VM runs on its replication partner after a failover; its pin narrows to this node, and "+
 		"writes made on the old source after its last sync are lost when the next sync runs",
 		log.String("old_pin", strings.Join(pin.NodeNames(), ",")))
+	writePin := func(ctx context.Context, p *ha.Rule) error {
+		cur, _, _, err := readOwnedReplicaPin(ctx, deps, vmid)
+		if err != nil {
+			return err
+		}
+		if cur == nil {
+			return fmt.Errorf("node-affinity: the pin of VM %d is not this Director's replicate pin", vmid)
+		}
+		return writeReplicaPin(ctx, deps, profile, logger, vmid, cur, p)
+	}
 	_, err = ha.NarrowActive(ctx, narrow, ha.NarrowInput{
-		VMID:   vmid,
-		Node:   node,
-		OldPin: pin,
-		NewPin: newPin,
-		WritePin: func(ctx context.Context, p *ha.Rule) error {
-			cur, _, _, err := readOwnedReplicaPin(ctx, deps, vmid)
-			if err != nil {
-				return err
-			}
-			if cur == nil {
-				return fmt.Errorf("node-affinity: the pin of VM %d is not this Director's replicate pin", vmid)
-			}
-			return writeReplicaPin(ctx, deps, profile, logger, vmid, cur, p)
-		},
+		VMID:     vmid,
+		Node:     node,
+		OldPin:   pin,
+		NewPin:   newPin,
+		WritePin: writePin,
 		Mutation: pve.VMConfigMutation{
 			VMID: vmid, Node: node, MotionWait: haMotionWait(deps),
 			Label: op + ": request a sync from the new source inside the HA barrier",
@@ -911,10 +1082,99 @@ func narrowAfterFailover(
 				return nil
 			},
 		},
+		CheckReach: func(ctx context.Context, at string) error {
+			return checkPinReach(ctx, deps, profile, vmid, at, newPin.NodeNames())
+		},
+		// Unchanged stays nil: the barrier then never writes the old pin
+		// back, which would name the old source again.
+		Reregister: func(ctx context.Context, st *pve.HAServiceState,
+			between func(ctx context.Context, node string) (pve.VMLocation, error),
+		) (pve.VMLocation, error) {
+			return reregisterAfterFailover(ctx, deps, logger, op, profile, vmid, node, st, between)
+		},
 		SysConsole: profile.SysConsole,
 		Budget:     haMotionWait(deps),
 	})
 	return err
+}
+
+// reregisterAfterFailover is the failover narrowing's answer to a resource
+// the barrier finds in the error state, which a VM that has just failed over
+// is the most likely to be in. It removes the resource and registers it
+// again under the VM's claim (see reregisterErroredVM), which reads the VM's
+// state again there, with the sync request between the two. The decision
+// under the claim confines the VM to the node it runs on, and the pin it
+// writes records the time of the change, so a sync must follow it before the
+// pin names a partner again.
+func reregisterAfterFailover(
+	ctx context.Context, deps Deps, logger *log.Logger, op string, profile *ha.Profile, vmid int, node string,
+	st *pve.HAServiceState, between func(ctx context.Context, node string) (pve.VMLocation, error),
+) (pve.VMLocation, error) {
+	if st != nil && st.Node != "" {
+		node = st.Node
+	}
+	var landed pve.VMLocation
+	res, err := reregisterErroredVM(ctx, deps, op, vmid, node, logger, readdOptions{
+		decided: st,
+		profile: profile,
+		between: func(ctx context.Context, node string) (pve.VMLocation, error) {
+			loc, err := between(ctx, node)
+			landed = loc
+			return loc, err
+		},
+		writePin: func(ctx context.Context, d *ha.VMDecision, storages []string) (*ha.Rule, error) {
+			pin, err := writeMergedPinRule(ctx, deps, profile, vmid, pinRequest{Decision: d, Storages: storages},
+				logger)
+			if err != nil || pin == nil {
+				return pin, err
+			}
+			stamped := *pin
+			stamped.Comment = ha.WithReplicaChanged(ha.WithReplicaPartner(pin.Comment, ""), time.Now())
+			if err := writeReplicaPin(ctx, deps, profile, logger, vmid, pin, &stamped); err != nil {
+				return nil, err
+			}
+			return &stamped, nil
+		},
+	})
+	if err != nil {
+		return pve.VMLocation{}, err
+	}
+	if res.Node != "" {
+		landed.Node = res.Node
+	}
+	if landed.Node == "" {
+		landed.Node = node
+	}
+	landed.Found = true
+	return landed, nil
+}
+
+// checkPinReach re-reads the VM's config on node and checks that every node
+// of want reaches every volume the VM holds.
+func checkPinReach(ctx context.Context, deps Deps, profile *ha.Profile, vmid int, node string, want []string) error {
+	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if err != nil {
+		return fmt.Errorf("read the config of VM %d: %w", vmid, pve.WrapError(err))
+	}
+	index, err := ha.NewStorageIndex(profile.Storages)
+	if err != nil {
+		return err
+	}
+	reach, err := pve.VolumeAccessSet(ctx, index, want, pve.ConfigAccessVolumes(cfg, node))
+	if err != nil {
+		return err
+	}
+	var missing []string
+	for _, n := range want {
+		if !slices.Contains(reach, n) {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("nodes %s of the pin of VM %d do not reach all of its volumes",
+			strings.Join(missing, ","), vmid)
+	}
+	return nil
 }
 
 // withVMReplicaRecord runs fn with the VM's journal record when the journal

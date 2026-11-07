@@ -31,13 +31,24 @@ type fakeReplication struct {
 	// removeOnSchedule makes a job marked for removal disappear when its run
 	// is requested, the way PVE's runner removes it.
 	removeOnSchedule bool
-	calls            []string
+	// listFailFrom, when set, fails the job list from that read on, counted
+	// from 1, with listErr or a default error.
+	listFailFrom int
+	lists        int
+	calls        []string
 }
 
 func (f *fakeReplication) log(s string) { f.calls = append(f.calls, s) }
 
 func (f *fakeReplication) ListJobs(context.Context) ([]ReplicaJobState, error) {
 	f.log("list")
+	f.lists++
+	if f.listFailFrom > 0 && f.lists >= f.listFailFrom {
+		if f.listErr != nil {
+			return nil, f.listErr
+		}
+		return nil, errors.New("the job list could not be read")
+	}
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -166,12 +177,9 @@ func TestParseReplicaJobs(t *testing.T) {
 		json.RawMessage(`{"id":"101-1","guest":101,"jobnum":1,"target":"b","source":"a","comment":"c","disable":1}`),
 		json.RawMessage(`{"id":"101-0","guest":"101","target":"c","remove_job":"full"}`),
 	}
-	jobs, err := ParseReplicaJobs(rows)
-	if err != nil {
-		t.Fatal(err)
-	}
+	jobs := ParseReplicaJobs(rows)
 	if len(jobs) != 2 || jobs[0].ID != "101-0" || jobs[0].RemoveJob != "full" || jobs[1].JobNum != 1 ||
-		!jobs[1].Disabled || jobs[1].Source != "a" {
+		!jobs[1].Disabled || jobs[1].Source != "a" || jobs[0].Fault != "" || jobs[1].Fault != "" {
 		t.Fatalf("jobs = %+v", jobs)
 	}
 	if n := NextJobNum(jobs, 101); n != 2 {
@@ -183,13 +191,67 @@ func TestParseReplicaJobs(t *testing.T) {
 	if got := ReplicaJobID(101, 2); got != "101-2" {
 		t.Fatalf("id = %q", got)
 	}
-	for _, bad := range []string{
-		`{"id":"x","target":"b"}`, `{"id":"101-0","guest":102,"target":"b"}`, `{"id":"101-0","guest":101}`,
-		`{"id":"0-1","target":"b"}`, `{"id":"101--1","target":"b"}`, `not json`,
+	mine, err := GuestJobs(jobs, 101)
+	if err != nil || len(mine) != 2 || mine[0].JobNum != 0 {
+		t.Fatalf("guest jobs = %+v, %v", mine, err)
+	}
+	// Each bad row is kept with a fault and the guest it provably names.
+	for bad, guest := range map[string]int{
+		`{"id":"x","target":"b"}`:                 0,
+		`{"id":"x","guest":101,"target":"b"}`:     101,
+		`{"id":"101-0","guest":102,"target":"b"}`: 0,
+		`{"id":"101-0","guest":101}`:              101,
+		`{"id":"0-1","target":"b"}`:               0,
+		`{"id":"101--1","target":"b"}`:            0,
+		`not json`:                                0,
+		`{"id":7}`:                                0,
 	} {
-		if _, err := ParseReplicaJobs([]json.RawMessage{json.RawMessage(bad)}); err == nil {
-			t.Fatalf("row %s parsed", bad)
+		got := ParseReplicaJobs([]json.RawMessage{json.RawMessage(bad)})
+		if len(got) != 1 || got[0].Fault == "" || got[0].Guest != guest {
+			t.Fatalf("row %s: %+v; want a fault for guest %d", bad, got, guest)
 		}
+	}
+}
+
+// A faulted row blocks only the guest it may belong to, so one guest's broken
+// row never stops another guest's replication calls.
+func TestGuestJobsScopesFaults(t *testing.T) {
+	t.Parallel()
+	rows := []json.RawMessage{
+		json.RawMessage(`{"id":"101-0","guest":101,"target":"b"}`),
+		json.RawMessage(`{"id":"555-0","guest":555}`),
+	}
+	jobs := ParseReplicaJobs(rows)
+	if mine, err := GuestJobs(jobs, 101); err != nil || len(mine) != 1 {
+		t.Fatalf("guest 101 = %+v, %v; want its job, with 555's fault ignored", mine, err)
+	}
+	if _, err := GuestJobs(jobs, 555); err == nil {
+		t.Fatal("guest 555's faulted row read as no job")
+	}
+	unknown := ParseReplicaJobs([]json.RawMessage{rows[0], rows[1], json.RawMessage(`{"id":"x","target":"b"}`)})
+	if _, err := GuestJobs(unknown, 101); err == nil {
+		t.Fatal("a row of no provable guest did not block the lookup")
+	}
+	dup := ParseReplicaJobs([]json.RawMessage{
+		json.RawMessage(`{"id":"101-0","guest":101,"target":"b"}`),
+		json.RawMessage(`{"id":"101-0","guest":101,"target":"c"}`),
+		json.RawMessage(`{"id":"202-0","guest":202,"target":"c"}`),
+	})
+	if _, err := GuestJobs(dup, 101); err == nil || !strings.Contains(err.Error(), "listed twice") {
+		t.Fatalf("a repeated ID read as one job: %v", err)
+	}
+	if mine, err := GuestJobs(dup, 202); err != nil || len(mine) != 1 {
+		t.Fatalf("guest 202 = %+v, %v", mine, err)
+	}
+	if n := NextJobNum(unknown, 555); n != 1 {
+		t.Fatalf("next job number = %d; a faulted row's number is still taken", n)
+	}
+	f := &fakeReplication{jobs: dup}
+	if _, _, err := findReplicaJob(context.Background(), f, "101-0"); err == nil {
+		t.Fatal("findReplicaJob took the first of two rows with one ID")
+	}
+	if _, _, err := findReplicaJob(context.Background(), f, "bad"); err == nil {
+		t.Fatal("findReplicaJob looked up an ID with no guest")
 	}
 }
 
@@ -304,75 +366,6 @@ func TestCheckReplicaSyncReadErrorsAndBadInput(t *testing.T) {
 	c.VolIDs = []string{"nostorage"}
 	if _, err := CheckReplicaSync(context.Background(), syncedReplication(), c); err == nil {
 		t.Fatal("a volume with no storage passed")
-	}
-}
-
-func TestAwaitReplicaSyncVerifiesAfterPolls(t *testing.T) {
-	t.Parallel()
-	clock := &fakeClock{t: replicaT0.Add(10 * time.Minute)}
-	f := syncedReplication()
-	f.statusSeq = []ReplicaSyncStatus{{}, {}, {LastSync: replicaT0.Add(10 * time.Minute)}}
-	v, err := AwaitReplicaSync(context.Background(), f, syncCheck(), ReplicaSyncWait{
-		Budget: time.Minute, PollInterval: 5 * time.Second, Now: clock.now, Sleep: clock.sleep,
-	})
-	if err != nil || !v.Verified {
-		t.Fatalf("verdict = %+v, %v", v, err)
-	}
-	if f.calls[0] != "schedule:a:101-0" {
-		t.Fatalf("the wait did not ask for the sync first: %v", f.calls)
-	}
-}
-
-func TestAwaitReplicaSyncTimesOut(t *testing.T) {
-	t.Parallel()
-	clock := &fakeClock{t: replicaT0.Add(10 * time.Minute)}
-	f := syncedReplication()
-	f.status["a/101-0"] = ReplicaSyncStatus{Error: "port blocked", FailCount: 1}
-	f.schedErr = errors.New("schedule refused")
-	v, err := AwaitReplicaSync(context.Background(), f, syncCheck(), ReplicaSyncWait{
-		Budget: 20 * time.Second, PollInterval: 5 * time.Second, Now: clock.now, Sleep: clock.sleep,
-	})
-	if err != nil || v.Verified || !strings.Contains(v.Reason, "port blocked") {
-		t.Fatalf("verdict = %+v, %v; want the job's error", v, err)
-	}
-}
-
-func TestAwaitReplicaSyncSkipsAWaitThatCannotPass(t *testing.T) {
-	t.Parallel()
-	clock := &fakeClock{t: replicaT0}
-	f := syncedReplication()
-	v, err := AwaitReplicaSync(context.Background(), f, syncCheck(), ReplicaSyncWait{
-		Budget: time.Minute, Now: clock.now, Sleep: clock.sleep,
-	})
-	if err != nil || v.Verified || !strings.Contains(v.Reason, "past the wait") {
-		t.Fatalf("verdict = %+v, %v", v, err)
-	}
-	if !slices.Equal(f.calls, []string{"schedule:a:101-0"}) {
-		t.Fatalf("calls = %v; want the sync request alone", f.calls)
-	}
-}
-
-func TestAwaitReplicaSyncReturnsTheReadErrorWhenNoGateRan(t *testing.T) {
-	t.Parallel()
-	clock := &fakeClock{t: replicaT0.Add(10 * time.Minute)}
-	f := syncedReplication()
-	f.statusErr = errors.New("status unreadable")
-	_, err := AwaitReplicaSync(context.Background(), f, syncCheck(), ReplicaSyncWait{
-		Budget: 12 * time.Second, PollInterval: 5 * time.Second, Now: clock.now, Sleep: clock.sleep,
-	})
-	if err == nil || !strings.Contains(err.Error(), "status unreadable") {
-		t.Fatalf("err = %v", err)
-	}
-	if _, err := AwaitReplicaSync(context.Background(), nil, syncCheck(), ReplicaSyncWait{}); err == nil {
-		t.Fatal("a nil client waited")
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	f = syncedReplication()
-	f.status["a/101-0"] = ReplicaSyncStatus{}
-	if _, err := AwaitReplicaSync(ctx, f, syncCheck(), ReplicaSyncWait{Budget: time.Hour, PollInterval: time.Second,
-		Now: func() time.Time { return replicaT0.Add(10 * time.Minute) }}); !errors.Is(err, context.Canceled) {
-		t.Fatalf("a cancelled wait returned %v", err)
 	}
 }
 
@@ -544,20 +537,77 @@ func TestRetireReplicaJobFailures(t *testing.T) {
 	}
 }
 
-func TestReplicaVolIDs(t *testing.T) {
+// A job list that keeps failing during the wait proves nothing about the
+// job, so the retirement returns the read error and never forces.
+func TestRetireReplicaJobUnreadableWaitNeverForces(t *testing.T) {
+	t.Parallel()
+	clock := &fakeClock{t: replicaT0}
+	f := &fakeReplication{jobs: []ReplicaJobState{{ID: "101-0", Guest: 101, Target: "b"}}, listFailFrom: 2}
+	var rec []string
+	_, err := RetireReplicaJob(context.Background(), f, retirement(clock, true, true, &rec))
+	if err == nil || !strings.Contains(err.Error(), "confirm the removal") {
+		t.Fatalf("err = %v; want the read error", err)
+	}
+	if slices.Contains(f.calls, "force:101-0") || len(rec) != 0 {
+		t.Fatalf("calls %v, records %v; want no force and no orphan record", f.calls, rec)
+	}
+}
+
+// A row that names no node besides the live one gets the cleaning removal,
+// and is never forced, because the copy it leaves could not be named.
+func TestRetireReplicaJobWithNoOtherNodeNeverForces(t *testing.T) {
+	t.Parallel()
+	clock := &fakeClock{t: replicaT0}
+	f := &fakeReplication{jobs: []ReplicaJobState{{ID: "101-0", Guest: 101, Target: "a"}}}
+	var rec []string
+	_, err := RetireReplicaJob(context.Background(), f, retirement(clock, false, true, &rec))
+	if !errors.Is(err, ErrReplicaRetireIncomplete) {
+		t.Fatalf("err = %v; want an incomplete retirement", err)
+	}
+	if !slices.Contains(f.calls, "delete:101-0") || slices.Contains(f.calls, "force:101-0") || len(rec) != 0 {
+		t.Fatalf("calls %v, records %v; want the cleaning removal alone", f.calls, rec)
+	}
+	f = &fakeReplication{jobs: []ReplicaJobState{{ID: "101-0", Guest: 101, Target: "a"}}, removeOnSchedule: true}
+	out, err := RetireReplicaJob(context.Background(), f, retirement(clock, false, true, &rec))
+	if err != nil || !out.Gone || out.Forced {
+		t.Fatalf("outcome = %+v, %v; want the cleaning removal to finish", out, err)
+	}
+}
+
+func TestReplicaVolumes(t *testing.T) {
 	t.Parallel()
 	storages := []pve.StorageInfo{
 		{Name: "local-zfs", Type: pve.StorageTypeZFSPool},
 		{Name: "nfs", Type: pve.StorageTypeNFS, Shared: true},
 		{Name: "local-lvm", Type: pve.StorageTypeLVMThin},
+		{Name: "local", Type: pve.StorageTypeDir},
 	}
-	got := ReplicaVolIDs([]VMVolume{
-		{Volume: "local-zfs:vm-101-disk-1"}, {Volume: "nfs:101/cloudinit.iso"}, {Volume: "local-zfs:vm-101-disk-0"},
-		{Volume: "local-lvm:vm-101-disk-2"}, {Volume: "local-zfs:vm-101-disk-3", NoReplicate: true},
-		{Volume: "unknown:vm-101-disk-4"}, {Volume: "nostorage"}, {Volume: "local-zfs:vm-101-disk-0"},
+	got, gaps := ReplicaVolumes(101, []VMVolume{
+		{Volume: "local-zfs:vm-101-disk-1"}, {Volume: "nfs:101/cloudinit.iso", Kind: VolumeISO},
+		{Volume: "local-zfs:vm-101-disk-0"}, {Volume: "local-zfs:vm-101-disk-0"},
+		{Volume: "nfs:101/vm-101-disk-5.qcow2", NoReplicate: true},
+		{Volume: "local-zfs:base-101-disk-6"},
 	}, storages)
-	if !slices.Equal(got, []string{"local-zfs:vm-101-disk-0", "local-zfs:vm-101-disk-1"}) {
-		t.Fatalf("got %v", got)
+	if !slices.Equal(got, []string{"local-zfs:base-101-disk-6", "local-zfs:vm-101-disk-0",
+		"local-zfs:vm-101-disk-1"}) || len(gaps) != 0 {
+		t.Fatalf("got %v, gaps %v", got, gaps)
+	}
+	for vol, want := range map[VMVolume]string{
+		{Volume: "local-lvm:vm-101-disk-2"}:                     "node-local lvmthin storage",
+		{Volume: "local-zfs:vm-101-disk-3", NoReplicate: true}:  "replicate flag off",
+		{Volume: "unknown:vm-101-disk-4"}:                       "does not hold",
+		{Volume: "nostorage"}:                                   "names no storage",
+		{Volume: "local:iso/seed.iso", Kind: VolumeISO}:         "CD-ROM",
+		{Volume: "local-zfs:vm-9001-disk-0"}:                    "not owned by VM 101",
+		{Volume: "local-zfs:subvol-101-disk-0"}:                 "not owned by VM 101",
+		{Volume: "local-zfs:vm-101-disk-7", Kind: VolumeISO}:    "CD-ROM",
+		{Volume: "local:101/vm-101-disk-8.qcow2", Legacy: true}: "node-local dir storage",
+	} {
+		got, gaps := ReplicaVolumes(101, []VMVolume{{Volume: "local-zfs:vm-101-disk-0"}, vol}, storages)
+		if !slices.Equal(got, []string{"local-zfs:vm-101-disk-0"}) || len(gaps) != 1 ||
+			!strings.Contains(gaps[0], want) || !strings.Contains(gaps[0], vol.Volume) {
+			t.Fatalf("%+v: got %v, gaps %v; want a gap that says %q", vol, got, gaps, want)
+		}
 	}
 }
 
@@ -596,5 +646,28 @@ func TestDeletionDestinationsCountsAVerifiedReplica(t *testing.T) {
 		ownedByUs, placeableExcept("a"), idx)
 	if err != nil || !got.PinnedToSource() {
 		t.Fatalf("got %+v, %v; want the source alone", got, err)
+	}
+	// A token that names the dead node itself counts no replica.
+	self := deadNodePin(true, map[string]int{"a": 0, "b": 0})
+	self.Comment = "owner=us bosh-vols=local-zfs bosh-replica=a"
+	got, err = DeletionDestinations("a", deadNodeMembers, deadNodeRules(self), "vm:101", "bosh-na-101",
+		ownedByUs, placeableExcept("a"), idx)
+	if err != nil || !got.PinnedToSource() || got.Replica != "" {
+		t.Fatalf("got %+v, %v; want the source alone for a token naming the dead node", got, err)
+	}
+	// A recorded node-local storage that is not a ZFS pool has no replica,
+	// whatever the token says.
+	mixed, err := NewStorageIndex([]pve.StorageInfo{
+		{Name: "local-zfs", Type: pve.StorageTypeZFSPool}, {Name: "local-lvm", Type: pve.StorageTypeLVMThin},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lvm := deadNodePin(true, map[string]int{"a": 0, "b": 0})
+	lvm.Comment = "owner=us bosh-vols=local-lvm,local-zfs bosh-replica=b"
+	got, err = DeletionDestinations("a", deadNodeMembers, deadNodeRules(lvm), "vm:101", "bosh-na-101",
+		ownedByUs, placeableExcept("a"), mixed)
+	if err != nil || !got.PinnedToSource() || got.Replica != "" {
+		t.Fatalf("got %+v, %v; want the source alone with a non-ZFS node-local storage recorded", got, err)
 	}
 }
