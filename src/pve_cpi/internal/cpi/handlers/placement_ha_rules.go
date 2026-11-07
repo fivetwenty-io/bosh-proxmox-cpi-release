@@ -85,9 +85,18 @@ func withHARulesLock(ctx context.Context, deps Deps, vmid int, logger *log.Logge
 // rules lock (withHARulesLock), so the writer takes none itself, which lets the
 // unmarked-rule migration take the older CPI's key inside the same lock.
 func newHARuleWriter(deps Deps, profile *ha.Profile, logger *log.Logger) *ha.RuleWriter {
+	return newHARuleWriterFor(deps, profile, logger, nil)
+}
+
+// newHARuleWriterFor is newHARuleWriter for a call that holds the eligibility
+// decision of one VM. The decision carries the CRM uid its state read saw and
+// whether this call staged the VM's resource as ignored, which lets the writer
+// remove that resource when a repair of its confinement pin cannot be verified.
+// Without a decision the writer never removes a resource.
+func newHARuleWriterFor(deps Deps, profile *ha.Profile, logger *log.Logger, decision *ha.VMDecision) *ha.RuleWriter {
 	owner := deps.RequestDirectorUUID
 	svc := deps.PVE.Cluster()
-	return &ha.RuleWriter{
+	writer := &ha.RuleWriter{
 		API: svc,
 		Owned: func(r *ha.Rule) bool {
 			return owner != "" && haOwnershipOf(r.Comment, owner) == haOwnedByUs
@@ -101,6 +110,17 @@ func newHARuleWriter(deps Deps, profile *ha.Profile, logger *log.Logger) *ha.Rul
 			},
 		},
 	}
+	if decision != nil {
+		writer.Repair = decision.RepairDeps(
+			func(ctx context.Context, vmid int) (*pve.HAServiceState, error) {
+				return pve.ReadHAServiceState(ctx, svc, deps.PVE.Nodes(), pve.HAServiceStateInput{
+					VMID: vmid, VMNode: decision.Node, Kind: pve.HADecisionLive, HealthOptions: haHealthOptions(deps),
+				})
+			},
+			writer.Repair.RemoveResource,
+		)
+	}
+	return writer
 }
 
 // removeOwnedHaResource purges sid only when it carries this Director's

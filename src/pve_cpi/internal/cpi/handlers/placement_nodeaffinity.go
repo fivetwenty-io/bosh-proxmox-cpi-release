@@ -208,6 +208,12 @@ type pinRequest struct {
 
 	// Register registers the VM as an HA resource before the pin is written.
 	Register bool
+
+	// Decision is the VM's eligibility decision, or nil when the caller made
+	// none. It lets the rule writer remove a resource this call staged, or one
+	// whose CRM episode is the one the decision read, when a repair of the
+	// confinement pin cannot be verified.
+	Decision *ha.VMDecision
 }
 
 // ensureMergedPin writes the VM's one merged node-affinity pin. The pin names
@@ -276,7 +282,7 @@ func writeMergedPin(
 	}
 
 	return withHARulesLock(ctx, deps, vmid, logger, func() error {
-		writer := newHARuleWriter(deps, profile, logger)
+		writer := newHARuleWriterFor(deps, profile, logger, req.Decision)
 		res, err := writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			cur := set.Find(ruleName)
 			if cur != nil && haOwnershipOf(cur.Comment, ident.Owner) == haOwnedByOther {

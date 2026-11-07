@@ -622,3 +622,43 @@ type legacyRuleManagedNodes struct {
 func (n legacyRuleManagedNodes) ListQemu(ctx context.Context, node string, params *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
 	return n.guests.ListQemu(ctx, node, params)
 }
+
+// TestNewHARuleWriterForWiresTheDecision checks that the eligibility decision
+// reaches the rule writer's repair: the staged flag and the CRM uid answer for
+// the decision's own VM, the state read goes through the cluster, and the
+// removal path purges only a resource that carries this Director's marker.
+func TestNewHARuleWriterForWiresTheDecision(t *testing.T) {
+	stub := newNAStub()
+	deps := naClusterDeps(stub, "pve01", "pve02")
+	plain := newHARuleWriter(deps, nil, log.NewNopLogger())
+	if plain.Repair.StagedIgnored != nil || plain.Repair.DecisionUID != nil || plain.Repair.ReadState != nil ||
+		plain.Repair.RemoveResource == nil {
+		t.Fatalf("a writer with no decision may only carry the removal path: %+v", plain.Repair)
+	}
+	d := &ha.VMDecision{VMID: 7, SID: "vm:7", Node: "pve01", DecisionUID: "uid-7"}
+	w := newHARuleWriterFor(deps, nil, log.NewNopLogger(), d)
+	if w.Repair.ReadState == nil || w.Repair.RemoveResource == nil || w.Repair.StagedIgnored("vm:7") {
+		t.Fatalf("repair = %+v", w.Repair)
+	}
+	if uid, ok := w.Repair.DecisionUID("vm:7"); !ok || uid != "uid-7" {
+		t.Fatalf("DecisionUID = %q, %v", uid, ok)
+	}
+	if _, ok := w.Repair.DecisionUID("vm:8"); ok {
+		t.Fatal("the decision must not answer for another VM")
+	}
+	d.MarkStaged()
+	if !w.Repair.StagedIgnored("vm:7") || w.Repair.StagedIgnored("vm:8") {
+		t.Fatal("the writer must see the staged flag set after it was built, for its own VM only")
+	}
+	// The fixture client has no nodes service, so the read stops at the guard
+	// of ReadHAServiceState, which proves the closure reaches it.
+	if _, err := w.Repair.ReadState(context.Background(), 7); err == nil || !strings.Contains(err.Error(), "ReadHAServiceState") {
+		t.Fatalf("ReadState must go through ReadHAServiceState, got %v", err)
+	}
+
+	marker := haIdentity{Owner: deps.RequestDirectorUUID}.marker()
+	stub.resources["vm:7"], stub.resComments["vm:7"] = true, marker
+	if err := w.Repair.RemoveResource(context.Background(), "vm:7"); err != nil || stub.resources["vm:7"] {
+		t.Fatalf("an owned resource must be purged: %v, %v", err, stub.resources)
+	}
+}
