@@ -301,12 +301,29 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		// marker differs from the record, and only this CPI writes that
 		// marker, so a foreign VM at the VMID never passes it. The ownership
 		// guard covers the legacy path below, which has no record to check.
-		if handled, managedErr := deleteManagedVMIfRecorded(ctx, deps, vmcid.PathOf(vmid), vmid); handled || managedErr != nil {
+		//
+		// A VM the journal does not record, whose config is on a dead node,
+		// comes back as an HA deferral marked unrecorded. It goes to the
+		// legacy delete, whose dead-node completion can move the config off
+		// that node, and the journal's check runs again on the destination.
+		handled, managedErr := deleteManagedVMIfRecorded(ctx, deps, vmcid.PathOf(vmid), vmid)
+		if managedDeleteAnswers(handled, managedErr) {
 			return nil, managedDeleteVMError(managedErr)
 		}
 
 		return deleteLegacyVM(ctx, deps, vmCID, cid)
 	})
+}
+
+// managedDeleteAnswers reports whether the journal's answer, handled and err,
+// ends the delete. An HA deferral of a VM the journal does not record does not
+// (see unrecordedVMDeferral): the legacy delete runs instead.
+func managedDeleteAnswers(handled bool, err error) bool {
+	var unrecorded *unrecordedVMDeferral
+	if errors.As(err, &unrecorded) {
+		return false
+	}
+	return handled || err != nil
 }
 
 // managedDeleteVMError decides what the Director reads when a journal-managed
@@ -397,8 +414,8 @@ func deleteLegacyVMClaimed(ctx context.Context, deps Deps, vmCID string, cid vmc
 	// A deferral for a service in recovery on a fenced node goes to the
 	// dead-node completion, which returns the deferral unchanged unless a
 	// fresh read proves the fence and an expired grace window. Past that it
-	// moves the config onto a live node that reaches the VM's storage and
-	// runs this delete again there (see completeDeadNodeDelete).
+	// moves the config onto a live node the VM's pin admits and runs this
+	// delete again there (see completeDeadNodeDelete).
 	haState, haErr := gateHADelete(ctx, deps, "delete_vm", vmid, node, logger)
 	if haErr != nil {
 		return completeDeadNodeDelete(ctx, deps, vmCID, cid, loc, haErr, logger)

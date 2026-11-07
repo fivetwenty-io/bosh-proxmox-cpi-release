@@ -147,9 +147,11 @@ func haDeleteWaitLimit(ctx context.Context, budget, reserve time.Duration) (time
 //     A resource the CRM has not processed yet is read again on every poll.
 //   - The grace window runs for a service in recovery on a fenced node. It is
 //     measured from the CPI's first observation of the service ID and uid
-//     pair, and it defers both while it runs and after it expires, because
-//     this CPI does not complete a delete on a fenced node. The expiry is
-//     logged.
+//     pair, and it defers both while it runs and after it expires. The expiry
+//     is logged. Past the window the legacy delete hands the deferral to the
+//     dead-node completion (see completeDeadNodeDelete), which moves the
+//     config off the fenced node when it can prove the fence and edit the
+//     VM's HA rules, and returns the deferral unchanged otherwise.
 //   - Defer and unknown are retriable errors that say what the CPI waits for.
 //
 // caller names the operation in the log and the errors.
@@ -300,10 +302,10 @@ func logHADeleteState(logger *log.Logger, caller string, st *pve.HAServiceState,
 
 // haRecoveryGraceError is the deferral of a service in recovery on a fenced
 // node. While the grace window runs, PVE HA keeps trying to recover the VM.
-// Once it expires the expiry is logged, and the delete keeps deferring, because
-// this CPI does not complete the delete of an HA-managed VM on a fenced node.
-// The error says only that: PVE HA can still recover the VM onto a node its
-// rules allow, and the delete proceeds once it has.
+// Once it expires the expiry is logged, and the deferral stands unless the
+// dead-node completion takes over. The error after the expiry is the one the
+// operator reads when the completion cannot start, so it says what the
+// completion needs and what the operator can do instead.
 func haRecoveryGraceError(deps Deps, caller string, st *pve.HAServiceState, reason string, logger *log.Logger) error {
 	window := haMotionWait(deps)
 	ep, recErr := haEpisodes(deps).Observe(st.SID, st.UID)
@@ -325,10 +327,12 @@ func haRecoveryGraceError(deps Deps, caller string, st *pve.HAServiceState, reas
 	}
 	logger.Warn(caller+": the HA recovery grace window expired", fields...)
 	return cpierrors.Retriable(
-		"%s: VM %d deferred: %s, and the %s grace window expired %s ago without PVE HA recovering it. This CPI "+
-			"does not complete the delete of an HA-managed VM on a fenced node, so the delete keeps deferring "+
-			"until PVE HA recovers the VM onto a live node that its HA rules allow; check 'ha-manager status' "+
-			"for %s, and the next retry proceeds once the VM is recovered",
+		"%s: VM %d deferred: %s, and the %s grace window expired %s ago without PVE HA recovering it. Past the "+
+			"window, the delete_vm of a VM the storage allocation journal does not record completes once a fresh "+
+			"HA view proves the fence and the CPI can edit the VM's HA rules: it moves the config onto a live "+
+			"node the VM's pin admits and deletes the VM there. Until then this call keeps deferring; check "+
+			"'ha-manager status' for %s. The next retry tries again, and it proceeds at once if PVE HA recovers "+
+			"the VM or the node comes back",
 		caller, st.VMID, reason, window, (elapsed - window).Round(time.Second), st.SID)
 }
 

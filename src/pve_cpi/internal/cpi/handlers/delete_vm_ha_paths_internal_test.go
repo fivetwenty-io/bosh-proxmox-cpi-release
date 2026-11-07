@@ -18,6 +18,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // --- HA deferral marking ---
@@ -114,6 +115,86 @@ func TestHADeferralForUnreadableConfigNamesTheHAState(t *testing.T) {
 	g := newHADeleteFixture(t, healthy, 1)
 	if err := haDeferralForUnreadableConfig(t.Context(), g.deps, "delete_vm", 101, "pve-node1", g.logger); err != nil {
 		t.Fatalf("an HA state that lets the delete proceed leaves the config error to the caller, got %v", err)
+	}
+}
+
+// TestUnrecordedVMConfigReadFailureRoutesTheDeadNodeDeferral marks the HA
+// deferral of a VM the allocation journal does not record, so HandleDeleteVM
+// sends it to the legacy delete and its dead-node completion. A delete that
+// already ran the completion, and an HA state that lets the delete proceed,
+// are not marked.
+func TestUnrecordedVMConfigReadFailureRoutesTheDeadNodeDeferral(t *testing.T) {
+	readErr := errors.New("proxy loop detected - no route to host (HTTP595)")
+	f := newHADeleteFixture(t, recoveryScene(), 1)
+	err := unrecordedVMConfigReadFailure(t.Context(), f.deps, 101, "pve-node2", readErr)
+	var unrecorded *unrecordedVMDeferral
+	if !errors.As(err, &unrecorded) {
+		t.Fatalf("the deferral of an unrecorded VM must be marked: %v", err)
+	}
+	if managedDeleteAnswers(true, err) {
+		t.Fatal("a marked deferral must send the delete to the legacy path")
+	}
+	requireHADeferral(t, err, "pve-node2")
+
+	doneCtx := withDeadNodeCompletionDone(t.Context())
+	done := unrecordedVMConfigReadFailure(doneCtx, f.deps, 101, "pve-node2", readErr)
+	if errors.As(done, &unrecorded) || !isWholeHADeferral(done) {
+		t.Fatalf("after the completion the deferral is returned as it is: %v", done)
+	}
+	if !managedDeleteAnswers(true, done) {
+		t.Fatal("an unmarked deferral ends the delete")
+	}
+
+	healthy := NewHADeleteScene()
+	healthy.Manage(101, "pve-node1", "started", "started")
+	g := newHADeleteFixture(t, healthy, 1)
+	got := unrecordedVMConfigReadFailure(t.Context(), g.deps, 101, "pve-node1", readErr)
+	if !errors.Is(got, readErr) || errors.As(got, &unrecorded) {
+		t.Fatalf("an HA state that lets the delete proceed returns the read's own error, got %v", got)
+	}
+}
+
+// TestRecordedVMConfigReadFailureNamesTheJournalAudit keeps the deferral of a
+// journal-recorded VM in recovery on a dead node, and says why the CPI does
+// not move its config and what the operator can do. Any other HA state keeps
+// the gate's own deferral.
+func TestRecordedVMConfigReadFailureNamesTheJournalAudit(t *testing.T) {
+	readErr := errors.New("proxy loop detected - no route to host (HTTP595)")
+	f := newHADeleteFixture(t, recoveryScene(), 1)
+	loc := pve.VMLocation{Found: true, Node: "pve-node2", HAState: "recovery"}
+	err := recordedVMConfigReadFailure(t.Context(), f.deps, 101, loc, readErr)
+	requireHADeferral(t, err, "recorded in the storage allocation journal", "dead node pve-node2",
+		"storage audit must read the storage of every node", "Bring node pve-node2 back", "dead-node procedure")
+	if !isWholeHADeferral(err) || !managedDeleteAnswers(true, err) {
+		t.Fatalf("the recorded VM's deferral is an HA deferral that ends the delete: %v", err)
+	}
+
+	fenced := NewHADeleteScene()
+	fenced.Manage(101, "pve-node2", "started", "fence")
+	deadNode(fenced)
+	g := newHADeleteFixture(t, fenced, 1)
+	loc.HAState = "fence"
+	got := recordedVMConfigReadFailure(t.Context(), g.deps, 101, loc, readErr)
+	requireHADeferral(t, got, "fenced")
+	if strings.Contains(got.Error(), "storage allocation journal") {
+		t.Fatalf("a VM in fence keeps the gate's own deferral: %v", got)
+	}
+}
+
+// TestManagedDeleteAnswers covers the journal's answers that end the delete.
+func TestManagedDeleteAnswers(t *testing.T) {
+	if managedDeleteAnswers(false, nil) {
+		t.Fatal("a VM the journal does not handle goes to the legacy delete")
+	}
+	if !managedDeleteAnswers(true, nil) || !managedDeleteAnswers(false, errors.New("x")) {
+		t.Fatal("a handled VM and an error end the delete")
+	}
+	marked := errors.Join(&unrecordedVMDeferral{err: deferHA(errors.New("deferred"))}, nil)
+	if managedDeleteAnswers(true, marked) {
+		t.Fatal("a marked deferral goes to the legacy delete")
+	}
+	if got := (&unrecordedVMDeferral{err: errors.New("deferred")}).Error(); got != "deferred" {
+		t.Fatalf("the mark keeps the deferral's text: %q", got)
 	}
 }
 

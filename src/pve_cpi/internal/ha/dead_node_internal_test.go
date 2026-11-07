@@ -16,100 +16,84 @@ func placeableExcept(down ...string) func(string) bool {
 	return func(n string) bool { return !slices.Contains(down, n) }
 }
 
-func TestStorageMayHoldGuestVolume(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name string
-		info pve.StorageInfo
-		want bool
-	}{
-		{"no content list", pve.StorageInfo{Name: "s"}, true},
-		{"images", pve.StorageInfo{Name: "s", Content: "images"}, true},
-		{"rootdir", pve.StorageInfo{Name: "s", Content: "rootdir"}, true},
-		{"iso among others", pve.StorageInfo{Name: "s", Content: "backup, iso"}, true},
-		{"snippets", pve.StorageInfo{Name: "s", Content: "snippets"}, true},
-		{"backup and templates only", pve.StorageInfo{Name: "s", Content: "backup,vztmpl"}, false},
-		{"node list names the source", pve.StorageInfo{Name: "s", Nodes: []string{"a", "b"}}, true},
-		{"node list leaves out the source", pve.StorageInfo{Name: "s", Nodes: []string{"b", "c"}}, false},
-		{"disabled still counts", pve.StorageInfo{Name: "s", Disabled: true, Content: "images"}, true},
-	}
-	for _, tc := range cases {
-		if got := StorageMayHoldGuestVolume(tc.info, "a"); got != tc.want {
-			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
-		}
-	}
+// deadNodePin is this Director's pin of vm:101 naming nodes, strict when
+// strict is true.
+func deadNodePin(strict bool, nodes map[string]int) Rule {
+	return Rule{ID: "bosh-na-101", Type: RuleTypeNodeAffinity, Affinity: AffinityPositive, Strict: strict,
+		Nodes: nodes, Resources: []string{"vm:101"}, Comment: "owner=us"}
+}
+
+func deletionDestinations(set *RuleSet, down ...string) (DeadNodeReach, error) {
+	return DeletionDestinations("a", deadNodeMembers, set, "vm:101", "bosh-na-101", ownedByUs,
+		placeableExcept(down...))
 }
 
 // TestDeletionDestinationsNamesOnlyTheSharedAccessSet is the three-node case:
-// the VM's storage reaches nodes a and b, node a dies, and the destinations
-// name b alone, so the CRM can never steal the config onto c.
+// the VM's storage reaches nodes a and b, so its strict pin names them, node a
+// dies, and the destinations name b alone, so the CRM can never steal the
+// config onto c.
 func TestDeletionDestinationsNamesOnlyTheSharedAccessSet(t *testing.T) {
 	t.Parallel()
-	storages := []pve.StorageInfo{
-		{Name: "nfs-ab", Type: "nfs", Shared: true, Nodes: []string{"a", "b"}, Content: "images,iso"},
-		{Name: "backups", Type: "dir", Content: "backup"},
-		{Name: "zfs-c", Type: "zfspool", Nodes: []string{"c"}, Content: "images"},
-	}
-	got, err := DeletionDestinations(context.Background(), "a", deadNodeMembers, storages, placeableExcept("a"))
+	got, err := deletionDestinations(deadNodeRules(deadNodePin(true, map[string]int{"a": 2, "b": 0})), "a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(got.Destinations, []string{"b"}) || !slices.Equal(got.Reach, []string{"b"}) {
-		t.Fatalf("destinations = %v reach = %v; want b alone", got.Destinations, got.Reach)
+	if !slices.Equal(got.Destinations, []string{"b"}) || !slices.Equal(got.Reach, []string{"b"}) ||
+		!slices.Equal(got.Admissible, []string{"a", "b"}) || !got.Pinned || got.PinnedToSource() {
+		t.Fatalf("got %+v; want b alone, bounded by the pin", got)
 	}
-	if len(got.Blocking) != 0 || len(got.Unplaceable) != 0 {
-		t.Fatalf("nothing blocks or is unplaceable here: %+v", got)
+	if len(got.Unplaceable) != 0 {
+		t.Fatalf("nothing is unplaceable here: %+v", got)
 	}
 }
 
 func TestDeletionDestinationsCases(t *testing.T) {
 	t.Parallel()
-	shared := pve.StorageInfo{Name: "ceph", Type: "rbd", Content: "images"}
+	off := deadNodePin(true, map[string]int{"a": 0, "c": 0})
+	off.Disabled = true
+	errored := deadNodePin(true, map[string]int{"a": 0, "c": 0})
+	errored.Errors = []string{"resources: conflict"}
+	narrowed := deadNodePin(true, map[string]int{"c": 0})
+	narrowed.Comment = "owner=us dead-node-from=a"
 	cases := []struct {
 		name        string
-		storages    []pve.StorageInfo
+		set         *RuleSet
 		down        []string
 		dests       []string
-		blocking    []string
 		unplaceable []string
+		pinned      bool
+		toSource    bool
 	}{
-		{name: "shared everywhere", storages: []pve.StorageInfo{shared}, down: []string{"a"},
+		{name: "no pin admits every member", set: deadNodeRules(), down: []string{"a"}, dests: []string{"b", "c"}},
+		{name: "the failed source's stale LRM never blocks", set: deadNodeRules(), down: []string{"a"},
 			dests: []string{"b", "c"}},
-		{name: "the failed source's stale LRM never blocks", storages: []pve.StorageInfo{shared},
+		{name: "a non-strict pin only orders the nodes", set: deadNodeRules(deadNodePin(false,
+			map[string]int{"a": 2})), down: []string{"a"}, dests: []string{"b", "c"}},
+		{name: "a pin to the dead node alone", set: deadNodeRules(deadNodePin(true, map[string]int{"a": 0})),
+			down: []string{"a"}, pinned: true, toSource: true},
+		{name: "a disabled pin still records the set", set: deadNodeRules(off), down: []string{"a"},
+			dests: []string{"c"}, pinned: true},
+		{name: "a pin in error still records the set", set: deadNodeRules(errored), down: []string{"a"},
+			dests: []string{"c"}, pinned: true},
+		{name: "a pin an earlier attempt narrowed", set: deadNodeRules(narrowed), down: []string{"a"},
+			dests: []string{"c"}, pinned: true},
+		{name: "both admitted nodes dead", set: deadNodeRules(deadNodePin(true, map[string]int{"a": 0, "b": 0})),
+			down: []string{"a", "b"}, unplaceable: []string{"b"}, pinned: true},
+		{name: "a pin node that is no member is ignored", set: deadNodeRules(deadNodePin(true,
+			map[string]int{"a": 0, "b": 0, "gone": 0})), down: []string{"a"}, dests: []string{"b"}, pinned: true},
+		{name: "other VMs' pins do not count", set: deadNodeRules(Rule{ID: "bosh-na-102",
+			Type: RuleTypeNodeAffinity, Strict: true, Nodes: map[string]int{"c": 0}, Resources: []string{"vm:102"}}),
 			down: []string{"a"}, dests: []string{"b", "c"}},
-		{name: "node-local images on the dead node",
-			storages: []pve.StorageInfo{shared, {Name: "local-lvm", Type: "lvmthin", Content: "images,rootdir"}},
-			down:     []string{"a"}, blocking: []string{"local-lvm"}},
-		{name: "node-local ISO storage on the dead node",
-			storages: []pve.StorageInfo{shared, {Name: "local", Type: "dir", Content: "iso,vztmpl,backup"}},
-			down:     []string{"a"}, blocking: []string{"local"}},
-		{name: "disabled storage", storages: []pve.StorageInfo{shared,
-			{Name: "nfs-off", Type: "nfs", Shared: true, Disabled: true, Content: "images"}},
-			down: []string{"a"}, blocking: []string{"nfs-off"}},
-		{name: "both access nodes dead",
-			storages: []pve.StorageInfo{{Name: "nfs-ab", Type: "nfs", Shared: true, Nodes: []string{"a", "b"}}},
-			down:     []string{"a", "b"}, unplaceable: []string{"b"}},
-		{name: "the other access node has a stale LRM",
-			storages: []pve.StorageInfo{{Name: "nfs-ab", Type: "nfs", Shared: true, Nodes: []string{"a", "b"}}},
-			down:     []string{"a", "b"}, unplaceable: []string{"b"}},
-		{name: "storage on other nodes only is skipped",
-			storages: []pve.StorageInfo{shared, {Name: "zfs-b", Type: "zfspool", Nodes: []string{"b"}}},
-			down:     []string{"a"}, dests: []string{"b", "c"}},
-		{name: "a storage reaching only the dead node",
-			storages: []pve.StorageInfo{{Name: "nfs-a", Type: "nfs", Shared: true, Nodes: []string{"a"}}},
-			down:     []string{"a"}, blocking: []string{"nfs-a"}},
-		{name: "no storage", down: []string{"a"}, dests: []string{"b", "c"}},
 	}
 	for _, tc := range cases {
-		got, err := DeletionDestinations(context.Background(), "a", deadNodeMembers, tc.storages,
-			placeableExcept(tc.down...))
+		got, err := deletionDestinations(tc.set, tc.down...)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
-		if !slices.Equal(got.Destinations, tc.dests) || !slices.Equal(got.Blocking, tc.blocking) ||
-			!slices.Equal(got.Unplaceable, tc.unplaceable) {
-			t.Errorf("%s: got dests %v blocking %v unplaceable %v; want %v %v %v", tc.name,
-				got.Destinations, got.Blocking, got.Unplaceable, tc.dests, tc.blocking, tc.unplaceable)
+		if !slices.Equal(got.Destinations, tc.dests) || !slices.Equal(got.Unplaceable, tc.unplaceable) ||
+			got.Pinned != tc.pinned || got.PinnedToSource() != tc.toSource {
+			t.Errorf("%s: got %+v; want dests %v unplaceable %v pinned %v to source %v", tc.name, got,
+				tc.dests, tc.unplaceable, tc.pinned, tc.toSource)
 		}
 		if got.Source != "a" || slices.Contains(got.Reach, "a") {
 			t.Errorf("%s: the dead node is never in the reach: %+v", tc.name, got)
@@ -119,26 +103,68 @@ func TestDeletionDestinationsCases(t *testing.T) {
 
 func TestDeletionDestinationsRefusesBadInput(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
 	ok := placeableExcept()
+	rules := deadNodeRules()
+	foreign := deadNodePin(true, map[string]int{"a": 0})
+	foreign.Comment = "owner=them"
+	shared := deadNodePin(true, map[string]int{"a": 0})
+	shared.Resources = []string{"vm:101", "vm:9"}
+	empty := deadNodePin(true, map[string]int{})
+	elsewhere := deadNodePin(true, map[string]int{"b": 0})
+	otherToken := deadNodePin(true, map[string]int{"b": 0})
+	otherToken.Comment = "owner=us dead-node-from=c"
 	cases := []struct {
-		name     string
-		source   string
-		storages []pve.StorageInfo
-		place    func(string) bool
-		want     string
+		name   string
+		source string
+		set    *RuleSet
+		place  func(string) bool
+		owned  func(*Rule) bool
+		want   string
 	}{
-		{"empty source", " ", nil, ok, "not named"},
-		{"source not a member", "z", nil, ok, "not a cluster member"},
-		{"no health answer", "a", nil, nil, "no node health"},
-		{"unnamed storage", "a", []pve.StorageInfo{{Type: "dir"}}, ok, "no name"},
-		{"duplicate storage", "a", []pve.StorageInfo{{Name: "s"}, {Name: "s"}}, ok, "twice"},
+		{"empty source", " ", rules, ok, ownedByUs, "not named"},
+		{"source not a member", "z", rules, ok, ownedByUs, "not a cluster member"},
+		{"no health answer", "a", rules, nil, ownedByUs, "no node health"},
+		{"no rules read", "a", nil, ok, ownedByUs, "rules were not read"},
+		{"pin is a resource-affinity rule", "a", deadNodeRules(Rule{ID: "bosh-na-101",
+			Type: RuleTypeResourceAffinity, Resources: []string{"vm:101", "vm:9"}}), ok, ownedByUs,
+			"not a node-affinity pin"},
+		{"foreign pin", "a", deadNodeRules(foreign), ok, ownedByUs, "ownership marker"},
+		{"no ownership answer", "a", deadNodeRules(deadNodePin(true, map[string]int{"a": 0})), ok, nil,
+			"ownership marker"},
+		{"pin holds another resource", "a", deadNodeRules(shared), ok, ownedByUs, "not vm:101 alone"},
+		{"strict pin with no node", "a", deadNodeRules(empty), ok, ownedByUs, "names no node"},
+		{"strict pin without the dead node", "a", deadNodeRules(elsewhere), ok, ownedByUs, "does not name dead node"},
+		{"token naming another node", "a", deadNodeRules(otherToken), ok, ownedByUs, "does not name dead node"},
 	}
 	for _, tc := range cases {
-		_, err := DeletionDestinations(ctx, tc.source, deadNodeMembers, tc.storages, tc.place)
+		_, err := DeletionDestinations(tc.source, deadNodeMembers, tc.set, "vm:101", "bosh-na-101", tc.owned,
+			tc.place)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: got %v, want an error naming %q", tc.name, err, tc.want)
 		}
+	}
+	if _, err := DeletionDestinations("a", deadNodeMembers, rules, "", "bosh-na-101", ownedByUs, ok); err == nil {
+		t.Error("an unnamed resource must be an error")
+	}
+}
+
+func TestDeadNodePinComment(t *testing.T) {
+	t.Parallel()
+	marker := "owner=us deployment=- group=-"
+	cur := deadNodePin(true, map[string]int{"a": 0})
+	cur.Comment = "owner=us deployment=cf group=router"
+	if got := DeadNodePinComment(&cur, ownedByUs, marker, "a"); got != cur.Comment+" dead-node-from=a" {
+		t.Fatalf("an owned pin's comment is kept: %q", got)
+	}
+	foreign := cur.Clone()
+	foreign.Comment = "owner=them deployment=x"
+	for _, c := range []*Rule{nil, &foreign} {
+		if got := DeadNodePinComment(c, ownedByUs, marker, "a"); got != marker+" dead-node-from=a" {
+			t.Fatalf("a missing or foreign pin starts from the marker: %q", got)
+		}
+	}
+	if got := DeadNodePinComment(&cur, nil, marker, "a"); got != marker+" dead-node-from=a" {
+		t.Fatalf("with no ownership answer the marker is used: %q", got)
 	}
 }
 

@@ -21,82 +21,63 @@ import (
 // rule writes; the handler runs them under the rules lock.
 
 // DeadNodeSourceKey is the key of the token the completion adds to the comment
-// of the VM's HA resource. Its value names the dead node the config left, so
-// the delete that runs on the destination can check that node reaches every
-// volume the config names, with each node-local volume counted as living on
-// the dead node.
+// of the VM's HA resource and of its pin. Its value names the dead node the
+// config left, so the delete that runs on the destination can check that node
+// reaches every volume the config names, with each node-local volume counted
+// as living on the dead node.
 const DeadNodeSourceKey = "dead-node-from"
-
-// deadNodeReachVolume is the volume name VolumeAccessSet is handed for a
-// storage the dead node's VM may hold volumes on. VolumeAccessSet needs a
-// storage-qualified volume ID, and only the storage part decides the reach.
-const deadNodeReachVolume = "dead-node-reach"
-
-// guestContentTypes are the PVE storage content types a QEMU config can name:
-// disk images, container volumes, ISO images, and snippets. A storage that
-// carries none of them, such as a backup-only one, cannot hold a volume of the
-// VM.
-var guestContentTypes = []string{"images", "rootdir", "iso", "snippets"}
-
-// StorageMayHoldGuestVolume reports whether a VM on the dead node source can
-// hold a volume on the storage. A storage whose node list leaves out source is
-// not one PVE activates there, so the VM could not use it. A storage with no
-// content list, or one that names a guest content type, may hold a volume.
-// A disabled storage still counts, because disabling a storage does not move
-// the volumes on it.
-func StorageMayHoldGuestVolume(info pve.StorageInfo, source string) bool {
-	if len(info.Nodes) > 0 && !slices.Contains(info.Nodes, source) {
-		return false
-	}
-	content := strings.TrimSpace(info.Content)
-	if content == "" {
-		return true
-	}
-	for _, c := range strings.Split(content, ",") {
-		if slices.Contains(guestContentTypes, strings.TrimSpace(c)) {
-			return true
-		}
-	}
-	return false
-}
 
 // DeadNodeReach is the answer of DeletionDestinations.
 type DeadNodeReach struct {
 	// Source is the dead node the VM's config is on.
 	Source string
-	// Reach holds the members other than Source that reach every storage the
-	// VM may hold volumes on, sorted.
+	// Pinned says the VM's strict pin bounded Admissible. Without one, every
+	// member is admissible.
+	Pinned bool
+	// Admissible holds the members the VM's pin admits, Source included when
+	// the pin names it, sorted.
+	Admissible []string
+	// Reach holds the members of Admissible other than Source, sorted.
 	Reach []string
 	// Destinations holds the members of Reach that the health report shows
 	// placeable, sorted. Only these may receive the config.
 	Destinations []string
-	// Blocking names the storages that no member other than Source reaches,
-	// sorted. A node-local storage on Source and a disabled storage are among
-	// them, because the VM's volumes there cannot leave the dead node.
-	Blocking []string
 	// Unplaceable holds the members of Reach that are not placeable, sorted,
 	// such as a node with a stale LRM timestamp.
 	Unplaceable []string
 }
 
+// PinnedToSource reports whether the VM's strict pin admits the dead node
+// alone, which is the pin of a hold VM, of a VM with a node-local volume, or
+// of a VM whose hard constraints leave one node.
+func (r DeadNodeReach) PinnedToSource() bool {
+	return r.Pinned && len(r.Reach) == 0
+}
+
 // DeletionDestinations returns the nodes a fenced VM's config may move to so
 // that its delete can complete there. The dead node's config cannot be read,
-// so the VM's own volume list is unknown. The answer is computed from every
-// storage the VM may hold a volume on (StorageMayHoldGuestVolume) instead,
-// which is a superset of the volumes the config names, so a node it returns
-// reaches every volume whatever the config holds. Each storage contributes
-// its reach as VolumeAccessSet computes it for a volume homed on source: a
-// node-local storage reaches source alone, a disabled one reaches no node,
-// and a shared one reaches its node list or every member. The destinations
-// are the members other than source in the intersection that placeable
+// so the VM's volumes are known only from the record the CPI keeps of them
+// while the node is down: the VM's strict node-affinity pin, pinID, which
+// names the VM's hard admissible set. That set is the VM's volume access set
+// cut down by its hard constraints, so every node it names reaches every
+// volume the VM holds. A VM with a node-local volume is pinned to its own node
+// alone, and one whose access set covers every configured node needs no
+// strict pin, so a missing or non-strict pin admits every member. A disabled
+// pin, or one PVE reports in error, still records the set, because neither
+// moves a volume.
+//
+// The destinations are the admitted members other than source that placeable
 // accepts, which is a fresh LRM timestamp, online, quorate, and not in
 // maintenance. The failed source's own state never counts, because it is
-// never a destination.
-//
-// storages is the whole storage index. A duplicate storage name is an error,
-// because the two entries could disagree on the reach.
+// never a destination. The answer is an error when source is not a member,
+// when the pin is not this Director's node-affinity pin of sid alone, when it
+// names no node, or when a strict pin leaves out source without the dead-node
+// token naming source, because such a pin is not a record of the reach of the
+// volumes on source. The delete on the destination checks every volume again
+// against the config it then reads.
 func DeletionDestinations(
-	ctx context.Context, source string, members []string, storages []pve.StorageInfo, placeable func(string) bool,
+	source string, members []string, set *RuleSet, sid, pinID string, owned func(*Rule) bool,
+	placeable func(string) bool,
 ) (DeadNodeReach, error) {
 	out := DeadNodeReach{Source: source}
 	switch {
@@ -106,43 +87,44 @@ func DeletionDestinations(
 		return out, fmt.Errorf("deletion destinations: dead node %s is not a cluster member", source)
 	case placeable == nil:
 		return out, errors.New("deletion destinations: no node health answer was given")
+	case set == nil:
+		return out, errors.New("deletion destinations: the HA rules were not read")
+	case strings.TrimSpace(sid) == "" || strings.TrimSpace(pinID) == "":
+		return out, errors.New("deletion destinations: the HA resource or its pin is not named")
 	}
-	index, err := NewStorageIndex(storages)
-	if err != nil {
-		return out, fmt.Errorf("deletion destinations: %w", err)
-	}
-	reach := make(map[string]bool, len(members))
-	for _, m := range members {
-		if m != "" && m != source {
-			reach[m] = true
+	admissible := slices.Clone(members)
+	if pin := set.Find(pinID); pin != nil {
+		switch {
+		case pin.Type != RuleTypeNodeAffinity || pin.Affinity == AffinityNegative:
+			return out, fmt.Errorf("deletion destinations: rule %q is not a node-affinity pin", pinID)
+		case owned == nil || !owned(pin):
+			return out, fmt.Errorf("deletion destinations: pin %q does not carry this Director's ownership marker",
+				pinID)
+		case !slices.Equal(pin.Resources, []string{sid}):
+			return out, fmt.Errorf("deletion destinations: pin %q holds %s, not %s alone", pinID,
+				pin.ResourcesParam(), sid)
+		case pin.Strict && len(pin.Nodes) == 0:
+			return out, fmt.Errorf("deletion destinations: strict pin %q names no node", pinID)
+		}
+		if pin.Strict {
+			if _, named := pin.Nodes[source]; !named {
+				if from, ok := DeadNodeSource(pin.Comment); !ok || from != source {
+					return out, fmt.Errorf("deletion destinations: strict pin %q does not name dead node %s, "+
+						"which holds the VM, so it is no record of the reach of the VM's volumes", pinID, source)
+				}
+			}
+			out.Pinned = true
+			admissible = slices.DeleteFunc(admissible, func(n string) bool { _, ok := pin.Nodes[n]; return !ok })
 		}
 	}
-	names := make([]string, 0, len(index))
-	for name := range index {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		info := index[name]
-		if !StorageMayHoldGuestVolume(info, source) {
+	for _, m := range admissible {
+		if strings.TrimSpace(m) == "" || slices.Contains(out.Admissible, m) {
 			continue
 		}
-		nodes, err := pve.VolumeAccessSet(ctx, index, members, []pve.AccessVolume{
-			{Volume: name + ":" + deadNodeReachVolume, HomeNode: source},
-		})
-		if err != nil {
-			return out, fmt.Errorf("deletion destinations: reach of storage %s: %w", name, err)
+		out.Admissible = append(out.Admissible, m)
+		if m == source {
+			continue
 		}
-		for m := range reach {
-			if !slices.Contains(nodes, m) {
-				delete(reach, m)
-			}
-		}
-		if !slices.ContainsFunc(nodes, func(n string) bool { return n != source }) {
-			out.Blocking = append(out.Blocking, name)
-		}
-	}
-	for m := range reach {
 		out.Reach = append(out.Reach, m)
 		if placeable(m) {
 			out.Destinations = append(out.Destinations, m)
@@ -150,6 +132,7 @@ func DeletionDestinations(
 			out.Unplaceable = append(out.Unplaceable, m)
 		}
 	}
+	sort.Strings(out.Admissible)
 	sort.Strings(out.Reach)
 	sort.Strings(out.Destinations)
 	sort.Strings(out.Unplaceable)
@@ -157,7 +140,7 @@ func DeletionDestinations(
 }
 
 // StorageIndex serves VolumeAccessSet from one read of the storage index, so
-// every storage is classified from the same answer.
+// every volume of a config is classified from the same answer.
 type StorageIndex map[string]pve.StorageInfo
 
 // NewStorageIndex indexes storages by name. An entry with no name and a name
@@ -221,6 +204,19 @@ func WithDeadNodeSource(comment, source string) string {
 		kept = append(kept, f)
 	}
 	return strings.Join(append(kept, DeadNodeSourceKey+"="+source), " ")
+}
+
+// DeadNodePinComment returns the comment of the pin the completion writes. It
+// keeps the comment of the VM's current pin, cur, when owned reports that pin
+// as this Director's, so tokens such as the deployment and the group survive,
+// and starts from marker otherwise. Either way the dead-node token names
+// source.
+func DeadNodePinComment(cur *Rule, owned func(*Rule) bool, marker, source string) string {
+	base := marker
+	if cur != nil && owned != nil && owned(cur) && strings.TrimSpace(cur.Comment) != "" {
+		base = cur.Comment
+	}
+	return WithDeadNodeSource(base, source)
 }
 
 // DeadNodeSource returns the dead node a comment's token names, and false when

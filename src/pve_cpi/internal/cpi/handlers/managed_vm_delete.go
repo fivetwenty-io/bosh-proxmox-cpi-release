@@ -387,7 +387,7 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 		if location.Found {
 			cfg, e := deps.PVE.QEMU().Config(ctx, location.Node, vmid)
 			if e != nil {
-				return true, managedVMConfigReadFailure(ctx, deps, vmid, location.Node, e)
+				return true, unrecordedVMConfigReadFailure(ctx, deps, vmid, location.Node, e)
 			}
 			_, found, e := pve.ParseStorageAllocationMarker(pve.DescriptionFromConfig(cfg))
 			if e != nil || found {
@@ -420,7 +420,7 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 	if location.Found {
 		cfg, e := deps.PVE.QEMU().Config(ctx, location.Node, vmid)
 		if e != nil {
-			return true, managedVMConfigReadFailure(ctx, deps, vmid, location.Node, e)
+			return true, recordedVMConfigReadFailure(ctx, deps, vmid, location, e)
 		}
 		tags, _ := pve.ConfigString(cfg, "tags")
 		retain = tagsContain(tags, tagRetainEphemeral)
@@ -451,6 +451,50 @@ func managedVMConfigReadFailure(ctx context.Context, deps Deps, vmid int, node s
 		return deferral
 	}
 	return readErr
+}
+
+// unrecordedVMDeferral marks the HA deferral of a VM the allocation journal
+// does not record, whose config did not read. Such a VM is a legacy VM as far
+// as the journal knows, so HandleDeleteVM sends it to the legacy delete, whose
+// dead-node completion can move its config off a fenced node. The journal's
+// marker check then runs again once the config reads on the destination.
+type unrecordedVMDeferral struct{ err error }
+
+func (e *unrecordedVMDeferral) Error() string { return e.err.Error() }
+
+func (e *unrecordedVMDeferral) Unwrap() error { return e.err }
+
+// unrecordedVMConfigReadFailure is managedVMConfigReadFailure for a VM the
+// journal does not record. An HA deferral is marked as unrecordedVMDeferral,
+// unless the delete already ran the dead-node completion, so the legacy
+// delete can complete it.
+func unrecordedVMConfigReadFailure(ctx context.Context, deps Deps, vmid int, node string, readErr error) error {
+	err := managedVMConfigReadFailure(ctx, deps, vmid, node, readErr)
+	if deadNodeCompletionDone(ctx) || !isWholeHADeferral(err) {
+		return err
+	}
+	return &unrecordedVMDeferral{err: err}
+}
+
+// recordedVMConfigReadFailure is managedVMConfigReadFailure for a VM the
+// journal records. Its delete does not run the dead-node completion: the
+// journal's storage audit must read the storage of every node before it lets
+// the CPI destroy a recorded VM, and a dead node's storage does not read. So a
+// recorded VM in recovery on a fenced node keeps deferring, and the error says
+// what the operator can do.
+func recordedVMConfigReadFailure(
+	ctx context.Context, deps Deps, vmid int, location pve.VMLocation, readErr error,
+) error {
+	err := managedVMConfigReadFailure(ctx, deps, vmid, location.Node, readErr)
+	if location.HAState != haRawStateRecovery || !isWholeHADeferral(err) {
+		return err
+	}
+	return deferHA(cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+		"delete_vm: VM %d is recorded in the storage allocation journal, and PVE HA holds it in recovery on "+
+			"dead node %s. The journal's storage audit must read the storage of every node before the CPI "+
+			"destroys a recorded VM, so the CPI does not move this VM's config off the dead node. Bring node %s "+
+			"back, or follow the dead-node procedure in the operations guide, which moves the config by hand; "+
+			"the next retry then deletes the VM", vmid, location.Node, location.Node)))
 }
 
 // closeDisposedManagedVM closes a generation whose VM a disposal has just

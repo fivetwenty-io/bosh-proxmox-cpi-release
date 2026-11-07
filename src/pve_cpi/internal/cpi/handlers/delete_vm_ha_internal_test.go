@@ -290,8 +290,8 @@ func TestGateHADeleteRecoveryGraceWindow(t *testing.T) {
 
 	f.clock.t = f.clock.t.Add(7 * time.Minute)
 	_, err = f.gate(t, "pve-node2")
-	requireHADeferral(t, err, "grace window expired 1m0s ago", "keeps deferring until PVE HA recovers the VM",
-		"'ha-manager status'")
+	requireHADeferral(t, err, "grace window expired 1m0s ago",
+		"moves the config onto a live node the VM's pin admits", "'ha-manager status'")
 	if strings.Contains(err.Error(), "mv ") || strings.Contains(err.Error(), "back to BOSH") {
 		t.Fatalf("the expired grace window must not advise a config move or promise a handover: %v", err)
 	}

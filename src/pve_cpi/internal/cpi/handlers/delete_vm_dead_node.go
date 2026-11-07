@@ -24,12 +24,14 @@ import (
 // that the VM stopped is the fence itself: the CRM holds the service in
 // recovery on a node it reports unknown. Once the recovery grace window has
 // expired without PVE HA recovering the VM, the completion requests stopped,
-// narrows the VM's node-affinity pin to the live nodes that reach every
-// storage the VM may hold volumes on, removes the VM from its anti-affinity
-// rules, and waits for the CRM's recovery to move the config onto one of
-// those nodes. The delete then runs again against that node, through the
-// same gate, ownership guard, and teardown as any other delete, and the
-// destroy removes the pin with the HA resource.
+// narrows the VM's node-affinity pin to the live nodes of the VM's hard
+// admissible set, which its pin records, removes the VM from its
+// anti-affinity rules, and waits for the CRM's recovery to move the config
+// onto one of those nodes. The delete then runs again against that node,
+// through the same gate, ownership guard, and teardown as any other delete,
+// and the destroy removes the pin with the HA resource. Before anything is
+// stopped or destroyed there, the delete checks every volume the config names
+// against the node it now runs on.
 //
 // The completion never removes the pin, because the CRM's recovery may then
 // pick any node, including one that lacks the VM's volumes. Every refusal and
@@ -72,7 +74,10 @@ type deadNodeCompletion struct {
 	// evidence does not prove a fenced node with an expired grace window.
 	gateErr error
 
-	source  string
+	source string
+	// uid is the CRM's uid of the recovery episode the first read proved, so
+	// the proof under the rules lock can tell a new episode apart.
+	uid     string
 	owner   string
 	profile *ha.Profile
 	reach   ha.DeadNodeReach
@@ -118,7 +123,23 @@ func completeDeadNodeDelete(
 	c.logger.Info(deadNodeDelete+": the CRM moved the fenced VM's config onto a deletion destination; "+
 		"running the delete there", log.String("sid", c.sid), log.String("dead_node", c.source),
 		log.String("node", node))
-	return deleteLegacyVMClaimed(withDeadNodeCompletionDone(ctx), deps, vmCID, cid)
+	return deleteAfterDeadNodeMove(ctx, deps, vmCID, cid)
+}
+
+// deleteAfterDeadNodeMove runs the delete again once the CRM has moved the
+// config onto a deletion destination. With an allocation journal configured
+// the delete first runs the journal's check again, which now reads the config
+// on the destination: a VM whose description carries an allocation marker
+// without a journal record is refused there, before anything is destroyed. The
+// context marks the completion as done, so the delete it runs never starts a
+// second one.
+func deleteAfterDeadNodeMove(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCID) (any, error) {
+	done := withDeadNodeCompletionDone(ctx)
+	handled, err := deleteManagedVMIfRecorded(done, deps, vmcid.PathOf(cid.VMID), cid.VMID)
+	if handled || err != nil {
+		return nil, managedDeleteVMError(err)
+	}
+	return deleteLegacyVMClaimed(done, deps, vmCID, cid)
 }
 
 // deferf is a retriable HA deferral that names the VM and the dead node.
@@ -202,7 +223,7 @@ func (c *deadNodeCompletion) proveExpiredFence(ctx context.Context) (bool, error
 			log.String("reason", gap))
 		return false, nil
 	}
-	c.source = st.Node
+	c.source, c.uid = st.Node, st.UID
 	ep, recErr := haEpisodes(c.deps).Observe(st.SID, st.UID)
 	if recErr != nil {
 		c.logger.Warn(deadNodeDelete+": the HA recovery episode record is unavailable, so the dead-node "+
@@ -247,11 +268,16 @@ func (c *deadNodeCompletion) checkPreconditions(ctx context.Context) error {
 		return err
 	}
 	if blockers := ha.DeadNodeRuleBlockers(set, c.sid, naRuleNameFor(c.vmid), c.ownedRule); len(blockers) > 0 {
-		return c.deferf("the HA rules cannot be narrowed to move the config off the dead node: %s; the CPI "+
-			"edits only its own pin and anti-affinity rules, so resolve these rules or follow the dead-node "+
-			"procedure in the operations guide", strings.Join(blockers, "; "))
+		return c.blocked(blockers)
 	}
-	return c.computeReach(ctx)
+	return c.computeReach(ctx, set)
+}
+
+// blocked is the deferral for HA rules the completion may not edit.
+func (c *deadNodeCompletion) blocked(blockers []string) error {
+	return c.deferf("the HA rules cannot be narrowed to move the config off the dead node: %s; the CPI "+
+		"edits only its own pin and anti-affinity rules, so resolve these rules or follow the dead-node "+
+		"procedure in the operations guide", strings.Join(blockers, "; "))
 }
 
 // checkOwnership proves the VM and its HA resource are this Director's before
@@ -316,53 +342,72 @@ func (c *deadNodeCompletion) readRules(ctx context.Context) (*ha.RuleSet, error)
 	return set, nil
 }
 
-// computeReach reads the storage index and the node health and computes the
-// deletion destinations. An empty set defers, naming the storages that keep
-// the volumes on the dead node and the nodes that reach them but cannot
-// receive the config.
-func (c *deadNodeCompletion) computeReach(ctx context.Context) error {
-	storages, err := readStorageIndex(ctx, c.deps)
-	if err != nil {
-		return c.deferWrap(err, "read the storage index to compute the deletion destinations")
-	}
+// computeReach reads the node health and computes the deletion destinations
+// from the VM's pin in set. An empty set defers, naming what keeps the config
+// on the dead node.
+func (c *deadNodeCompletion) computeReach(ctx context.Context, set *ha.RuleSet) error {
 	report, err := pve.NodeHealth(ctx, c.deps.PVE.Cluster(), c.deps.PVE.Nodes(), haHealthOptions(c.deps))
 	if err != nil {
 		return c.deferWrap(err, "read node health to compute the deletion destinations")
+	}
+	reach, err := c.destinations(report, set)
+	if err != nil {
+		return err
+	}
+	c.reach = reach
+	return nil
+}
+
+// destinations computes the deletion destinations from report and set, and
+// defers when there are none.
+func (c *deadNodeCompletion) destinations(report *pve.NodeHealthReport, set *ha.RuleSet) (ha.DeadNodeReach, error) {
+	if report == nil {
+		return ha.DeadNodeReach{}, c.deferf("no node health was read to compute the deletion destinations")
+	}
+	reach, err := ha.DeletionDestinations(c.source, reportMembers(report), set, c.sid, naRuleNameFor(c.vmid),
+		c.ownedRule, report.Placeable)
+	if err != nil {
+		return reach, c.deferWrap(err, "compute the deletion destinations")
+	}
+	if len(reach.Destinations) == 0 {
+		return reach, c.noDestinations(reach)
+	}
+	return reach, nil
+}
+
+// reportMembers returns the cluster members a node health report names.
+func reportMembers(report *pve.NodeHealthReport) []string {
+	if report == nil {
+		return nil
 	}
 	members := make([]string, 0, len(report.Nodes))
 	for i := range report.Nodes {
 		members = append(members, report.Nodes[i].Name)
 	}
-	reach, err := ha.DeletionDestinations(ctx, c.source, members, storages, report.Placeable)
-	if err != nil {
-		return c.deferWrap(err, "compute the deletion destinations")
-	}
-	c.reach = reach
-	if len(reach.Destinations) == 0 {
-		return c.noDestinations(reach)
-	}
-	return nil
+	return members
 }
 
 // noDestinations is the deferral for an empty set of deletion destinations.
 func (c *deadNodeCompletion) noDestinations(reach ha.DeadNodeReach) error {
-	var why []string
-	if len(reach.Blocking) > 0 {
-		why = append(why, fmt.Sprintf("storage %s is reachable from the dead node alone, so a volume there "+
-			"cannot leave it", strings.Join(reach.Blocking, ", ")))
-	}
-	if len(reach.Unplaceable) > 0 {
-		why = append(why, fmt.Sprintf("node %s reaches every storage but is not online with a fresh LRM "+
-			"timestamp", strings.Join(reach.Unplaceable, ", ")))
-	}
-	if len(why) == 0 {
-		why = append(why, "no live node reaches every storage the VM may hold volumes on")
+	var why string
+	switch {
+	case reach.PinnedToSource():
+		why = fmt.Sprintf("the VM's strict pin %s admits dead node %s alone, which is the pin of a VM with a "+
+			"node-local volume, of a hold VM, or of a VM whose hard constraints leave one node, so no live node "+
+			"is known to reach its volumes", naRuleNameFor(c.vmid), c.source)
+	case len(reach.Unplaceable) > 0:
+		why = fmt.Sprintf("node %s is admitted by the VM's pin but is not online with a fresh LRM timestamp",
+			strings.Join(reach.Unplaceable, ", "))
+	default:
+		why = "no live node is admitted by the VM's pin"
 	}
 	c.logger.Warn(deadNodeDelete+": no deletion destination for the fenced VM; deferring",
-		log.String("sid", c.sid), log.String("dead_node", c.source), log.String("reason", strings.Join(why, "; ")))
+		log.String("sid", c.sid), log.String("dead_node", c.source), log.String("reason", why))
 	return c.deferf("the recovery grace window expired, and there is no deletion destination: %s. The delete "+
-		"keeps deferring; bring the node back, or follow the dead-node procedure in the operations guide",
-		strings.Join(why, "; "))
+		"keeps deferring. Bring the node back, or follow the dead-node procedure in the operations guide. That "+
+		"procedure moves the config by hand for a VM whose volumes are shared or disposable, and for a "+
+		"persistent disk on the dead node it removes the disk reference with bosh cck once the data is given up",
+		why)
 }
 
 // readStorageIndex reads and decodes the whole PVE storage index. An entry
@@ -449,18 +494,28 @@ func resourceRequestsStopped(res *cluster.GetHaResourcesResponse, source string)
 
 // narrowRules writes the strict pin and removes the VM from its anti-affinity
 // rules under the rules lock, and returns the destinations the pin names. The
-// fence is proven again under the lock, so a node that came back since the
-// first read stops the completion before any rule changes. The order of the
-// two edits keeps the recovery inside the reach at every step: the pin goes
-// first unless every node the current rules allow already reaches every
-// storage, because removing the VM from an anti-affinity rule can let the
-// CRM recover it at once. When the current rules allow only reachable nodes,
-// the anti-affinity release goes first, because a strict pin next to a full
-// anti-affinity rule can make the rule set infeasible.
+// fence is proven again under the lock, for the same recovery episode, and
+// the destinations are computed again from that read, so a node that came
+// back or a rule that changed since the first read stops the completion
+// before any rule changes.
+//
+// The order of the edits keeps the recovery inside the destinations at every
+// step. When every node the current rules allow, other than the dead one, is
+// in the reach, the anti-affinity release goes first, because a strict pin
+// next to a full anti-affinity rule can make the rule set infeasible.
+// Otherwise the pin goes first, because removing the VM from an anti-affinity
+// rule can let the CRM recover it at once. That first pin is a bridge: it
+// names the destinations and the dead node, so the anti-affinity rule's
+// members keep enough nodes for the rule set to stay feasible, while the CRM
+// still cannot recover the VM outside the destinations, because the dead node
+// cannot receive it. The release follows, and then the final pin, which names
+// the destinations alone. A bridge that is not in effect stops the completion
+// with nothing else changed, because a release without a pin in effect would
+// let the CRM recover the VM onto any node.
 func (c *deadNodeCompletion) narrowRules(ctx context.Context) ([]string, error) {
 	var dests []string
 	err := withHARulesLock(ctx, c.deps, c.vmid, c.logger, func() error {
-		report, _, gap, err := c.readFenceEvidence(ctx)
+		report, st, gap, err := c.readFenceEvidence(ctx)
 		if err != nil {
 			return c.deferWrap(err, "read the HA view again before the rule edits")
 		}
@@ -468,41 +523,42 @@ func (c *deadNodeCompletion) narrowRules(ctx context.Context) ([]string, error) 
 			return c.deferf("the fence is no longer proven (%s), so no HA rule was changed; the next retry "+
 				"reads the VM's state again", gap)
 		}
-		for _, n := range c.reach.Reach {
-			if report.Placeable(n) {
-				dests = append(dests, n)
-			}
-		}
-		if len(dests) == 0 {
-			return c.noDestinations(ha.DeadNodeReach{Blocking: c.reach.Blocking, Unplaceable: c.reach.Reach})
+		if st.UID != c.uid {
+			return c.deferf("the CRM began a new recovery episode for %s (uid %s, was %s), so no HA rule was "+
+				"changed; the grace window runs again for the new episode", c.sid, orNone(st.UID), orNone(c.uid))
 		}
 		set, err := c.readRules(ctx)
 		if err != nil {
 			return err
 		}
 		pinID := naRuleNameFor(c.vmid)
-		comment := ha.WithDeadNodeSource(haIdentity{Owner: c.owner}.marker(), c.source)
-		want := ha.DeadNodePin(pinID, c.sid, comment, dests)
-		members := make([]string, 0, len(report.Nodes))
-		for i := range report.Nodes {
-			members = append(members, report.Nodes[i].Name)
+		if blockers := ha.DeadNodeRuleBlockers(set, c.sid, pinID, c.ownedRule); len(blockers) > 0 {
+			return c.blocked(blockers)
 		}
+		reach, err := c.destinations(report, set)
+		if err != nil {
+			return err
+		}
+		c.reach, dests = reach, reach.Destinations
+		comment := ha.DeadNodePinComment(set.Find(pinID), c.ownedRule, haIdentity{Owner: c.owner}.marker(),
+			c.source)
+		final := ha.DeadNodePin(pinID, c.sid, comment, dests)
 		writer := newHARuleWriter(c.deps, c.profile, c.logger)
 		// A rule that is not in effect after a write fails the completion in
 		// every mode, and the writer never removes the HA resource: the
 		// resource is what lets the CRM recover the VM at all.
 		writer.Managed = true
 		writer.Repair = ha.RepairDeps{}
-		if c.allowedWithinReach(set, members) {
-			if err := c.releaseAntiAffinity(ctx, writer, pinID); err != nil {
+		if !c.allowedWithinReach(set, reportMembers(report)) {
+			bridge := ha.DeadNodePin(pinID, c.sid, comment, append(slices.Clone(dests), c.source))
+			if err := c.writePin(ctx, writer, bridge, "bridge pin"); err != nil {
 				return err
 			}
-			return c.writePin(ctx, writer, want)
 		}
-		if err := c.writePin(ctx, writer, want); err != nil {
+		if err := c.releaseAntiAffinity(ctx, writer, pinID); err != nil {
 			return err
 		}
-		return c.releaseAntiAffinity(ctx, writer, pinID)
+		return c.writePin(ctx, writer, final, "strict pin")
 	})
 	if err != nil {
 		return nil, deferHA(err)
@@ -511,8 +567,7 @@ func (c *deadNodeCompletion) narrowRules(ctx context.Context) ([]string, error) 
 }
 
 // allowedWithinReach reports whether every node other than the dead one that
-// the current rules let the recovery choose reaches every storage the VM may
-// hold volumes on.
+// the current rules let the recovery choose is in the reach.
 func (c *deadNodeCompletion) allowedWithinReach(set *ha.RuleSet, members []string) bool {
 	for _, n := range ha.AllowedNodes(set, c.sid, members) {
 		if n != c.source && !slices.Contains(c.reach.Reach, n) {
@@ -522,11 +577,12 @@ func (c *deadNodeCompletion) allowedWithinReach(set *ha.RuleSet, members []strin
 	return true
 }
 
-// writePin writes the strict pin and checks that it is in effect.
-func (c *deadNodeCompletion) writePin(ctx context.Context, writer *ha.RuleWriter, want ha.Rule) error {
-	res, err := writer.Apply(ctx, "dead-node pin", ha.PlanDeadNodePin(want, c.ownedRule))
+// writePin writes want, which what names in the logs and errors, and checks
+// that it is in effect.
+func (c *deadNodeCompletion) writePin(ctx context.Context, writer *ha.RuleWriter, want ha.Rule, what string) error {
+	res, err := writer.Apply(ctx, "dead-node "+what, ha.PlanDeadNodePin(want, c.ownedRule))
 	if err != nil {
-		return c.deferWrap(err, "write the strict pin %q", want.ID)
+		return c.deferWrap(err, "write the %s %q", what, want.ID)
 	}
 	set := res.Set
 	if len(res.Wrote) == 0 {
@@ -537,11 +593,11 @@ func (c *deadNodeCompletion) writePin(ctx context.Context, writer *ha.RuleWriter
 		}
 	}
 	if ok, why := ha.DeadNodePinInEffect(set, want); !ok {
-		return c.deferf("the strict pin is not in effect (%s), so the CPI changes nothing else; the next "+
-			"retry writes it again", why)
+		return c.deferf("the %s is not in effect (%s), so the CPI changes nothing else; the next retry writes "+
+			"it again", what, why)
 	}
-	c.logger.Info(deadNodeDelete+": the strict pin names only the deletion destinations",
-		log.String("sid", c.sid), log.String("rule", want.ID), log.String("nodes", want.NodesParam()))
+	c.logger.Info(deadNodeDelete+": the "+what+" is in effect", log.String("sid", c.sid),
+		log.String("rule", want.ID), log.String("nodes", want.NodesParam()))
 	return nil
 }
 
@@ -590,9 +646,13 @@ func (c *deadNodeCompletion) awaitMove(ctx context.Context, dests []string) (str
 				if moved {
 					return st.Node, nil
 				}
+			case st.Raw != haRawStateRecovery && st.Node == c.source:
+				return "", c.deferf("dead node %s is back, and the CRM holds %s there in %q; the next retry "+
+					"runs the delete against that node", c.source, st.SID, st.Raw)
 			case st.Raw != haRawStateRecovery:
-				return "", c.deferf("the CRM holds %s on node %s in %q, which is not a deletion destination; "+
-					"retry so the delete runs against the node that holds the VM", st.SID, st.Node, st.Raw)
+				return "", c.deferf("the CRM holds %s on node %s in %q, outside the deletion destinations %s; "+
+					"the next retry locates the VM again and runs the delete against the node that holds it",
+					st.SID, st.Node, st.Raw, strings.Join(dests, ", "))
 			}
 		}
 		remaining := time.Until(limit)
@@ -625,11 +685,12 @@ func (c *deadNodeCompletion) scanShows(ctx context.Context, node string) (bool, 
 // detaches, or destroys the VM, the delete proves from the config it now reads
 // that node reaches every volume, with each node-local volume counted as
 // living on the dead node. A VM it cannot prove that for defers, so a volume
-// the destroy could not reach is never left behind as an orphan. It returns
-// the dead node the token names when the check passes, so the teardown can
-// prove the VM's absence while that node stays down. A VM without a
-// configured HA resource, or whose resource carries no token, passes with no
-// source.
+// the destroy could not reach is never left behind as an orphan, and a
+// persistent disk is never destroyed. It returns the dead node the token
+// names when the check passes, so the teardown can prove the VM's absence
+// while that node stays down. A VM without a configured HA resource, or whose
+// resource carries no token, passes with no source, and so does a VM back on
+// the node the token names, which came back before the config moved.
 func refuseDeadNodeStrandedVolumes(
 	ctx context.Context, deps Deps, vmid int, node string, st *pve.HAServiceState, liveConfig, pending map[string]any,
 	logger *log.Logger,
@@ -650,7 +711,7 @@ func refuseDeadNodeStrandedVolumes(
 		return "", nil
 	}
 	source, moved := ha.DeadNodeSource(*res.Comment)
-	if !moved {
+	if !moved || source == node {
 		return "", nil
 	}
 	refuse := func(format string, args ...any) error {
