@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,6 +73,8 @@ type deadNodeCluster struct {
 	loseStopAnswer bool
 	// failGetResource fails every HA resource read.
 	failGetResource bool
+	// failListRules fails every HA rules read.
+	failListRules bool
 	// ruleErrors adds PVE feasibility errors to the named rule on every read.
 	ruleErrors map[string]string
 	// onRulesRead runs before every rules read with its count.
@@ -144,7 +147,11 @@ func (c *deadNodeCluster) ListHaRules(
 	c.rulesReads++
 	n, hook := c.rulesReads, c.onRulesRead
 	inject := c.ruleErrors
+	fail := c.failListRules
 	c.mu.Unlock()
+	if fail {
+		return nil, errors.New("503 Service Unavailable (HTTP503)")
+	}
 	if hook != nil {
 		hook(n)
 	}
@@ -965,4 +972,222 @@ func TestDeadNodeDelete_AbsenceProofToleratesOnlyTheDeadSource(t *testing.T) {
 	f.scene.MarkNodeDead("pve-node3")
 	requireHARetriable(t, f.run(), "ties it to member pve-node3", "covers only dead node "+deadNode)
 	f.requireCompletedOn("pve-node1")
+}
+
+// deadNodeReplication is the replication API of the replica-partner delete
+// tests. Only the storage listing of the partner is read there, so every other
+// call fails the test.
+type deadNodeReplication struct {
+	t *testing.T
+	// listed is the volume IDs the partner's storage listing shows.
+	listed map[string]bool
+	// err fails every storage listing.
+	err error
+	// listCalls records the "node/storage" of each listing read.
+	listCalls []string
+}
+
+func (r *deadNodeReplication) Volumes(_ context.Context, node, storage string) (map[string]bool, error) {
+	r.listCalls = append(r.listCalls, node+"/"+storage)
+	if r.err != nil {
+		return nil, r.err
+	}
+	out := make(map[string]bool, len(r.listed))
+	for k, v := range r.listed {
+		out[k] = v
+	}
+	return out, nil
+}
+
+func (r *deadNodeReplication) ListJobs(context.Context) ([]ha.ReplicaJobState, error) {
+	r.t.Helper()
+	r.t.Fatal("the delete's stranded-volume check must not read the replication jobs")
+	return nil, nil
+}
+
+func (r *deadNodeReplication) CreateJob(context.Context, ha.ReplicaJobSpec) error {
+	r.t.Fatal("the delete must not create a replication job")
+	return nil
+}
+
+func (r *deadNodeReplication) SetComment(context.Context, string, string) error {
+	r.t.Fatal("the delete must not rewrite a replication job")
+	return nil
+}
+
+func (r *deadNodeReplication) DeleteJob(context.Context, string, bool) error {
+	r.t.Fatal("the delete must not delete a replication job")
+	return nil
+}
+
+func (r *deadNodeReplication) ScheduleNow(context.Context, string, string) error {
+	r.t.Fatal("the delete must not schedule a replication run")
+	return nil
+}
+
+func (r *deadNodeReplication) Status(context.Context, string, string) (ha.ReplicaSyncStatus, error) {
+	r.t.Fatal("the delete must not read a replication job's status")
+	return ha.ReplicaSyncStatus{}, nil
+}
+
+// replicaPartnerPin presets the VM's pin as a replicate VM's pin names it: this
+// Director's marker, the volume record, and the replica token naming partner
+// (none when partner is empty).
+func (f *deadNodeDeleteFixture) replicaPartnerPin(partner string) {
+	comment := deadNodeMarker
+	if partner != "" {
+		comment = ha.WithReplicaPartner(comment, partner)
+	}
+	f.scene.Rules["bosh-na-101"]["comment"] = f.recordComment(comment)
+}
+
+// TestDeadNodeDelete_MovedVMWithVolumesOnTheReplicaPartner runs the delete of
+// a VM whose config the dead-node completion moved onto pve-node3, with its
+// root on node-local ZFS. The root counts as living on pve-node3 only when
+// the pin names pve-node3 as the replica partner, the replication job copies
+// the volume (a ZFS volume the VM owns, with the replicate flag on), and
+// pve-node3's storage listing shows it. Any other case leaves the volume homed
+// on the dead node, so the delete defers and destroys nothing. A listing or
+// rules read that fails defers as well. A VM whose pin carries no replica
+// token keeps the refusal it had before replicas counted.
+func TestDeadNodeDelete_MovedVMWithVolumesOnTheReplicaPartner(t *testing.T) {
+	const (
+		root      = "local-zfs:vm-101-disk-0"
+		otherRoot = "local-zfs:vm-102-disk-0"
+		dirRoot   = "local-dir:101/vm-101-disk-0.qcow2"
+	)
+	zfs := map[string]any{"storage": "local-zfs", "type": "zfspool", "content": "images"}
+	dir := map[string]any{"storage": "local-dir", "type": "dir", "content": "images"}
+	rootConfig := func(volume string) map[string]any {
+		return map[string]any{"scsi0": volume + ",size=10G"}
+	}
+
+	cases := []struct {
+		name string
+		// storage is the node-local storage the config's root lives on.
+		storage map[string]any
+		// config is the VM's config on pve-node3.
+		config map[string]any
+		// partner is the replica partner the pin names, none when empty.
+		partner string
+		// noPin removes the pin from the rules altogether.
+		noPin bool
+		// foreignPin writes the pin under another Director's marker.
+		foreignPin bool
+		listed     []string
+		listErr    error
+		rulesErr   bool
+		// wantDefer names the substrings of the retriable error, nil when the
+		// delete proceeds against pve-node3.
+		wantDefer []string
+		// wantListed is the listing reads the check makes.
+		wantListed []string
+	}{
+		{
+			name: "pin, job, and listing all hold", storage: zfs, config: rootConfig(root), partner: "pve-node3",
+			listed: []string{root}, wantListed: []string{"pve-node3/local-zfs"},
+		},
+		{
+			name: "pin names no partner", storage: zfs, config: rootConfig(root), partner: "",
+			listed: []string{root}, wantDefer: []string{"does not reach every volume"},
+		},
+		{
+			name: "pin names another node as partner", storage: zfs, config: rootConfig(root), partner: "pve-node1",
+			listed: []string{root}, wantDefer: []string{"does not reach every volume"},
+		},
+		{
+			name: "pin of another Director", storage: zfs, config: rootConfig(root), partner: "pve-node3",
+			foreignPin: true, listed: []string{root}, wantDefer: []string{"does not reach every volume"},
+		},
+		{
+			name: "volume belongs to another VMID", storage: zfs, config: rootConfig(otherRoot), partner: "pve-node3",
+			listed: []string{otherRoot}, wantDefer: []string{"does not reach every volume"},
+		},
+		{
+			name: "persistent disk the job does not copy", storage: zfs, partner: "pve-node3",
+			config: map[string]any{
+				"scsi0": root + ",size=10G", "scsi1": "local-zfs:vm-9001-disk-0,size=50G",
+			},
+			listed: []string{root, "local-zfs:vm-9001-disk-0"}, wantDefer: []string{"does not reach every volume"},
+			wantListed: []string{"pve-node3/local-zfs"},
+		},
+		{
+			name: "replicate flag off", storage: zfs, partner: "pve-node3",
+			config:     map[string]any{"scsi0": root + ",size=10G,replicate=0"},
+			listed:     []string{root},
+			wantDefer:  []string{"does not reach every volume"},
+			wantListed: nil,
+		},
+		{
+			name: "partner listing does not show the volume", storage: zfs, config: rootConfig(root),
+			partner: "pve-node3", listed: []string{"local-zfs:vm-101-disk-5"},
+			wantDefer: []string{"does not reach every volume"}, wantListed: []string{"pve-node3/local-zfs"},
+		},
+		{
+			name: "partner listing is empty", storage: zfs, config: rootConfig(root), partner: "pve-node3",
+			wantDefer: []string{"does not reach every volume"}, wantListed: []string{"pve-node3/local-zfs"},
+		},
+		{
+			name: "partner listing fails", storage: zfs, config: rootConfig(root), partner: "pve-node3",
+			listErr:    errors.New("503 Service Unavailable (HTTP503)"),
+			wantDefer:  []string{"list storage local-zfs on node pve-node3", "retry"},
+			wantListed: []string{"pve-node3/local-zfs"},
+		},
+		{
+			name: "rules read fails", storage: zfs, config: rootConfig(root), partner: "pve-node3",
+			rulesErr: true, listed: []string{root},
+			wantDefer: []string{"read the HA rules to check for a replica on node pve-node3", "retry"},
+		},
+		{
+			name: "non-ZFS node-local storage", storage: dir, config: rootConfig(dirRoot), partner: "pve-node3",
+			listed: []string{dirRoot}, wantDefer: []string{"does not reach every volume"},
+		},
+		{
+			name: "no replica pin at all", storage: zfs, config: rootConfig(root), noPin: true,
+			listed: []string{root}, wantDefer: []string{"does not reach every volume"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDeadNodeDelete(t)
+			f.storage.entries = append(f.storage.entries, tc.storage)
+			f.movedTo("pve-node3")
+			f.configs["pve-node3"] = tc.config
+			f.replicaPartnerPin(tc.partner)
+			if tc.foreignPin {
+				f.scene.Rules["bosh-na-101"]["comment"] = f.recordComment(
+					ha.WithReplicaPartner("bosh-cpi:v1 owner=another-director deployment=- group=-", tc.partner))
+			}
+			if tc.noPin {
+				delete(f.scene.Rules, "bosh-na-101")
+			}
+			repl := &deadNodeReplication{t: t, err: tc.listErr, listed: map[string]bool{}}
+			for _, v := range tc.listed {
+				repl.listed[v] = true
+			}
+			f.deps.Replication = repl
+			if tc.rulesErr {
+				f.cluster.failListRules = true
+			}
+
+			err := f.run()
+			if !slices.Equal(repl.listCalls, tc.wantListed) {
+				t.Fatalf("storage listing reads %v; want %v", repl.listCalls, tc.wantListed)
+			}
+			if tc.wantDefer != nil {
+				requireHARetriable(t, err, append([]string{"dead node " + deadNode}, tc.wantDefer...)...)
+				f.requireNoRuleWrites()
+				return
+			}
+			if err != nil {
+				t.Fatalf("the delete of a VM whose volumes live on the replica partner failed: %v", err)
+			}
+			if at := eventIndex(f.events(), "DeleteQemu:pve-node3"); at == -1 {
+				t.Fatalf("want the destroy on pve-node3; events: %v", f.events())
+			}
+			if at := eventIndex(f.events(), "DeleteQemu:"+deadNode); at != -1 {
+				t.Fatalf("nothing may be destroyed on the dead node; events: %v", f.events())
+			}
+		})
+	}
 }
