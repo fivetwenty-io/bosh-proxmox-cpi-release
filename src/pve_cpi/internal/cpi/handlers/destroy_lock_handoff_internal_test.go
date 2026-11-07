@@ -82,9 +82,9 @@ func TestDestroyVMWithRecovery_TaskTextLock_GoesStraightToSkiplock(t *testing.T)
 	q := &lrQEMUStub{}
 	deps := Deps{Config: lrRootPamConfig(), PVE: &lrClient{nodes: nodes, qemu: q}, Logger: log.NewNopLogger()}
 
-	_, gone, err := destroyVMWithRecovery(crhCtx(), deps)
+	_, gone, err := destroyStepOnlyBypassingGates(crhCtx(), deps)
 	if err != nil || gone {
-		t.Fatalf("destroyVMWithRecovery = gone %v, err %v; want a clean destroy", gone, err)
+		t.Fatalf("destroyStepOnlyBypassingGates = gone %v, err %v; want a clean destroy", gone, err)
 	}
 	if len(nodes.deleteCalls) != 2 {
 		t.Fatalf("expected 2 DeleteQemu calls (locked + skiplock), got %d", len(nodes.deleteCalls))
@@ -112,9 +112,9 @@ func TestDestroyVMWithRecovery_LockAs500_IsBoundedBeforeSkiplock(t *testing.T) {
 		return 0
 	})
 
-	_, gone, err := destroyVMWithRecovery(ctx, deps)
+	_, gone, err := destroyStepOnlyBypassingGates(ctx, deps)
 	if err != nil || gone {
-		t.Fatalf("destroyVMWithRecovery = gone %v, err %v; want a clean skiplock destroy", gone, err)
+		t.Fatalf("destroyStepOnlyBypassingGates = gone %v, err %v; want a clean skiplock destroy", gone, err)
 	}
 	if len(nodes.deleteCalls) != rollbackDestroyMaxAttempts+1 {
 		t.Fatalf("DeleteQemu calls = %d; want %d plain attempts and one skiplock", len(nodes.deleteCalls),
@@ -147,9 +147,9 @@ func TestDestroyVMWithRecovery_SuspendedLockAs500_ReturnsAtOnce(t *testing.T) {
 	q := &lrQEMUStub{}
 	deps := Deps{Config: lrRootPamConfig(), PVE: &lrClient{nodes: nodes, qemu: q}, Logger: log.NewNopLogger()}
 
-	_, gone, err := destroyVMWithRecovery(crhCtx(), deps)
+	_, gone, err := destroyStepOnlyBypassingGates(crhCtx(), deps)
 	if err != nil || gone {
-		t.Fatalf("destroyVMWithRecovery = gone %v, err %v; want a clean destroy", gone, err)
+		t.Fatalf("destroyStepOnlyBypassingGates = gone %v, err %v; want a clean destroy", gone, err)
 	}
 	if len(nodes.deleteCalls) != 2 {
 		t.Fatalf("expected 2 DeleteQemu calls (suspended lock + skiplock), got %d", len(nodes.deleteCalls))
@@ -171,9 +171,9 @@ func TestDestroyVMWithRecovery_LockWithRetryableText_GoesStraightToSkiplock(t *t
 			q := &lrQEMUStub{}
 			deps := Deps{Config: lrRootPamConfig(), PVE: &lrClient{nodes: nodes, qemu: q}, Logger: log.NewNopLogger()}
 
-			_, gone, err := destroyVMWithRecovery(crhCtx(), deps)
+			_, gone, err := destroyStepOnlyBypassingGates(crhCtx(), deps)
 			if err != nil || gone {
-				t.Fatalf("destroyVMWithRecovery = gone %v, err %v; want a clean destroy", gone, err)
+				t.Fatalf("destroyStepOnlyBypassingGates = gone %v, err %v; want a clean destroy", gone, err)
 			}
 			if len(nodes.deleteCalls) != 2 {
 				t.Fatalf("expected 2 DeleteQemu calls (locked + skiplock), got %d", len(nodes.deleteCalls))

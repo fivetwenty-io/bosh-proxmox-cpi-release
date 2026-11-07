@@ -39,6 +39,12 @@ func (s *naClusterStub) ListStatus(context.Context) (*cluster.ListStatusResponse
 	return AbsenceOnlineStatus(s.members...), nil
 }
 
+// ListResources lists no guests, so a post-destroy identity check that falls
+// back to the cluster index reads the VMID as free.
+func (s *naClusterStub) ListResources(context.Context, *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+	return &cluster.ListResourcesResponse{}, nil
+}
+
 func (s *naClusterStub) ListConfigNodes(context.Context) (*cluster.ListConfigNodesResponse, error) {
 	return AbsenceConfigNodes(s.members...), nil
 }

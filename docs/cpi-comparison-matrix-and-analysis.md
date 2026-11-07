@@ -1777,11 +1777,12 @@ to prior releases). When enabled:
 
 **Eventual-consistency tradeoff:** a subsequent `has_vm` or `has_disk` call may briefly still
 see the resource until PVE's async destroy completes. A stalled async destroy is reaped by
-`sweepFastDeleteStragglers`, which runs at the start of every fast-path `delete_vm`: it scans the
-cluster for VMs still carrying `bosh-deleting` and re-issues a `skiplock`+`purge` destroy for
-each (best-effort, fire-and-forget, idempotent on 404). The `bosh-deleting` tag therefore acts as
-a self-draining work queue, so leftover VMs do not accumulate across deployments. (This is a
-fast-delete-specific sweep, distinct from the §7.13 orphan-GC, which keys on stemcell sha and
+the deferred teardown sweep, which runs at the start of every legacy `create_vm` and every `delete_vm`. It scans the
+cluster for VMs that still carry `bosh-deleting` or an expired `bosh-creating-<unix>` birth tag, claims each
+VMID without waiting, skips any VM whose claim another request holds, and tears the rest down through the
+same protocol as `delete_vm`, without `skiplock`. The `bosh-deleting` tag therefore acts as
+a self-draining work queue, so leftover VMs do not accumulate across deployments. (This sweep
+is distinct from the §7.13 orphan-GC, which keys on stemcell sha and
 director-scoped base volumes rather than this tag.) The fast path bypasses the §7.15
 operation-timeout envelope naturally: the handler returns before any task-poll loop begins, so
 the two are complementary fixes — bound the wait (§7.15) and skip the wait (§7.32) cover
@@ -2635,7 +2636,7 @@ the flag is forced false on the retain path (and only there; non-retain deletes 
 Tag presence — not unlink success — gates the destroy flag, which makes the path safe to
 re-enter: a retried `delete_vm` whose prior attempt already unlinked and swept the disk
 finds no active ephemeral slot but still forces `destroyUnreferencedDisks=false`. The
-fast-path straggler sweep (`sweepFastDeleteStragglers`) applies the same rule: a
+deferred teardown sweep applies the same rule: a
 `bosh-deleting` straggler that also carries `bosh-retain-ephemeral` gets the detach re-run
 (finishing any pending unlink) and its re-issued destroy forced to
 `destroyUnreferencedDisks=false`; if the detach fails, the straggler is deferred to the

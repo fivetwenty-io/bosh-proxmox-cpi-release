@@ -5,6 +5,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -368,7 +369,13 @@ func cleanupVMDetached(ctx context.Context, deps Deps, node string, vmid int, en
 // even an API token owned by root@pam qualifies, see pve.IsRootPamIdentity).
 // Otherwise the lock rejection stands, which is fine: Stop is best-effort
 // and the purge is where the orphan actually matters.
-func stopVMForRollback(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) {
+//
+// A VM that holds a migrate lock is never stopped with skiplock, because that
+// would interrupt the migration. The skiplock retry refuses it, and so does
+// one whose lock cannot be read, and that refusal is the one error returned,
+// so the teardown defers the VM to the sweep. Every other stop failure is
+// logged and returns nil, and the protocol's wait for the VM to halt decides.
+func stopVMForRollback(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) error {
 	var stopUPID string
 	stopErr := pve.RetryOnTransient(ctx, logger, "create_vm.cleanup.stop", 0, func() error {
 		var innerErr error
@@ -376,13 +383,22 @@ func stopVMForRollback(ctx context.Context, deps Deps, node string, vmid int, lo
 		return innerErr
 	})
 	if stopErr != nil && pve.IsVMConfigLocked(stopErr) {
-		stopUPID, stopErr = retryStopWithSkiplock(ctx, deps, node, vmid, stopErr, logger)
+		stopUPID, stopErr = retryStopWithSkiplock(ctx, deps, "create_vm: rollback", node, vmid, stopErr, logger)
+		if errors.Is(stopErr, errSkiplockStopDuringMigration) {
+			return stopErr
+		}
 	}
-	if stopErr == nil && stopUPID != "" {
+	if stopErr != nil {
+		logger.Debug("create_vm: rollback stop failed (best-effort; the teardown waits for the VM to halt)",
+			log.Int(metadataKeyVMID, vmid), log.Err(stopErr))
+		return nil
+	}
+	if stopUPID != "" {
 		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, stopUPID, logger); awaitErr != nil {
 			logger.Warn("create_vm: rollback stop task failed", log.Int(metadataKeyVMID, vmid), log.Err(awaitErr))
 		}
 	}
+	return nil
 }
 
 // cleanupVM tears down a VM whose create failed through the teardown
@@ -421,7 +437,27 @@ func stopVMForRollback(ctx context.Context, deps Deps, node string, vmid int, lo
 // env carries the BOSH deploy identity used to tag a VM the rollback leaves
 // "bosh-create-failed". It is nil for callers that clean up an intermediate
 // placement-fallback or VMID-retry candidate, and tagging is skipped then.
+//
+// The rollback runs under the VM's VMID claim (see withVMIDClaim). Inside the
+// create that claimed the VMID it reuses that claim. The middleware rollback
+// runs after the create has released it, so it takes the claim again, waiting
+// up to vmidLockTimeout. A claim it cannot take leaves the VM to the sweep,
+// which its birth tag queues it for.
 func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
+	claimErr := withVMIDClaim(ctx, deps, vmid, "create_vm-rollback/"+strconv.Itoa(vmid), true, logger,
+		func(claimCtx context.Context) error {
+			cleanupVMClaimed(claimCtx, deps, node, vmid, env, logger)
+			return nil
+		})
+	if claimErr != nil {
+		logger.Error("create_vm: rollback: could not claim the VM, so it is not destroyed here; it stays queued "+
+			"for the deferred-teardown sweep", log.Int(metadataKeyVMID, vmid), log.String("node", node),
+			log.Err(claimErr))
+	}
+}
+
+// cleanupVMClaimed is cleanupVM's body, run under the VMID claim.
+func cleanupVMClaimed(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
 	const caller = "create_vm: rollback"
 	logger.Warn("create_vm: rolling back, destroying created VM", log.Int(metadataKeyVMID, vmid))
 	vmCID := strconv.Itoa(vmid)
@@ -433,6 +469,7 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 	// the marker.
 	stampDeletingTag(ctx, deps, node, vmCID, vmid, logger)
 
+	identity := vmIdentity{node: node, vmid: vmid}
 	teardown := &vmTeardown{
 		caller:              caller,
 		vmCID:               vmCID,
@@ -444,13 +481,15 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 		awaitLockClear:      true,
 		destroyUnreferenced: deps.Config != nil && deps.Config.DestroyUnreferencedDisks,
 		stop: func(ctx context.Context) (bool, error) {
-			stopVMForRollback(ctx, deps, node, vmid, logger)
-			return false, nil
+			return false, stopVMForRollback(ctx, deps, node, vmid, logger)
 		},
 		preserve: func(ctx context.Context) (bool, error) {
 			return false, protectForeignDisksOnRollback(ctx, deps, node, vmCID, vmid, logger)
 		},
 		owned: func(_ context.Context, holding pve.QemuHolding) error {
+			// The config read right before the destroy names the VM the
+			// destroy takes, so its identity is what the cleanups compare.
+			identity = captureVMIdentity(node, vmid, holding.Config)
 			return refuseForeignRollbackVM(deps, vmCID, holding)
 		},
 		awaitTask: func(ctx context.Context, resp *sdknodes.DeleteQemuResponse) error {
@@ -467,7 +506,7 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 	} else {
 		logger.Info("create_vm: rollback complete", log.Int(metadataKeyVMID, vmid))
 	}
-	cleanupRollbackArtifacts(ctx, deps, node, vmid, logger)
+	cleanupRollbackArtifacts(ctx, deps, identity, logger)
 }
 
 // cleanupVMLeftVM logs and tags a VM the rollback's teardown did not destroy,
@@ -564,16 +603,24 @@ func awaitRollbackDestroy(
 // reference is gone first. The node-affinity pin (bosh-na-<vmid>) is removed
 // too, because the purge does not GC the cluster-level rule, and two writers
 // create it: the AZ pin and the PCI strict pin. Both steps are idempotent and
-// best-effort.
-func cleanupRollbackArtifacts(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) {
+// best-effort. Both key on the VMID alone, so each first checks that the
+// VMID is free or still holds the VM the rollback destroyed (see
+// cleanupTargetStillOurs). A VM that was gone before the rollback's destroy
+// has no captured identity, so its cleanups run only when the VMID is free.
+func cleanupRollbackArtifacts(ctx context.Context, deps Deps, identity vmIdentity, logger *log.Logger) {
+	node, vmid := identity.node, identity.vmid
 	if deps.Agent != nil {
-		if remErr := deps.Agent.Remove(ctx, node, vmid); remErr != nil {
-			logger.Warn("create_vm: rollback agent remove failed",
-				log.Int(metadataKeyVMID, vmid), log.Err(remErr))
+		runPostDestroyCleanup(ctx, deps, identity, "agent", logger, func() {
+			if remErr := deps.Agent.Remove(ctx, node, vmid); remErr != nil {
+				logger.Warn("create_vm: rollback agent remove failed",
+					log.Int(metadataKeyVMID, vmid), log.Err(remErr))
+			}
+		})
+	}
+	runPostDestroyCleanup(ctx, deps, identity, "node_affinity_pin", logger, func() {
+		if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
+			logger.Warn("create_vm: rollback node-affinity pin cleanup incomplete (non-fatal)",
+				log.Int(metadataKeyVMID, vmid), log.Err(pinErr))
 		}
-	}
-	if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
-		logger.Warn("create_vm: rollback node-affinity pin cleanup incomplete (non-fatal)",
-			log.Int(metadataKeyVMID, vmid), log.Err(pinErr))
-	}
+	})
 }

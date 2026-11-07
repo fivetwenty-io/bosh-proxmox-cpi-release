@@ -30,6 +30,18 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - The CPI now treats `iscsi`, `iscsidirect`, ZFS over iSCSI (`zfs`), and `drbd` storage as shared, whether or not `storage.cfg` sets the shared flag. Before this change only the types `rbd`, `cephfs`, `nfs`, `cifs`, `glusterfs`, and `pbs`, or a storage flagged shared, counted. For a deployment on these storage types, disk and VM operations now route to the shared backend, so they pick a node by health and no longer insist on an explicit node for each volume. The VMID guard now refuses to delete a volume that belongs to another owner or namespace on them, as it already does on NFS and Ceph. The CPI also keeps the destroy-unreferenced-disks sweep off on a node that sees one of these storages, because other nodes can see the same volumes. If you relied on the old local treatment, review any scripts that delete volumes outside the CPI's own VMID bands.
 
+- A legacy `delete_vm`, the `create_vm` rollback, and the sweep that drains unfinished disposals now hold a per-VMID claim, the `bosh-lock-vm-<vmid>` cluster lock, for the whole disposal. A legacy `create_vm`, one the allocation journal doesn't manage, claims each VMID before its clone or import, writes a `bosh-creating-<unix seconds>` birth tag, and keeps the claim until it returns, with its rollback included. The sweep used to run only at the start of a fast-path `delete_vm`. It now runs at the start of every legacy `create_vm` and every `delete_vm`, it also reaps failed creates whose birth tag has expired, and it skips any VM whose claim another request holds, so it never tears down a create, delete, or rollback that is still running. Without a pool service the sweep doesn't run. With the operation-timeout envelope off, a legacy create now runs under a six-hour bound so that its claim has an expiry, and the work under a `delete_vm` claim is cut off after about 23 minutes so that the Director's retry takes a fresh claim.
+
+- A create that can't remove its birth tag because another writer changed the VM's config now reads the config again and retries, up to three attempts in all. A removal that still fails fails the create, and the rollback destroys the new VM.
+
+- With `pve.debug.keep_failed_vms` on, the sweep keeps every VM whose birth tag has expired, and it logs a warning that names up to ten of them, because nothing reaps them until we delete them or turn the setting off.
+
+- The cleanups that follow a VM destroy, of the agent state, the HA rule memberships, the node-affinity pin, and the advertised routes, now check first that the VMID is free or still holds the destroyed VM. They skip a VMID that another VM has taken, and they skip when the check can't finish.
+
+- The `create_vm` rollback no longer retries a refused stop with `skiplock` while the VM holds a `migrate` lock or when its lock can't be read. It leaves the VM tagged, and the sweep takes it once the migration has finished.
+
+- The `bosh-creating-` and `bosh-deleting` tags are now reserved to the CPI, like its other `bosh-` tags, because the sweep reads them as a disposal that didn't finish.
+
 ### Removed
 
 - Nine `pve.placement` properties are removed, and the CPI refuses to run while any of them is set. The job spec still declares each one with no default, so BOSH can't drop a stale value silently. The job template fails to render when a manifest sets one of them to any value, `false` included, and a `cpi-config` entry that carries one is rejected with a non-retriable error. Both errors list every removed key found, and the replacement for each. The table gives the replacements.

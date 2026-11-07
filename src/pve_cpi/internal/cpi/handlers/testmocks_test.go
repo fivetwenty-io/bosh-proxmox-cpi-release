@@ -1613,6 +1613,9 @@ func testDepsWithCluster(
 			tasksSvc:   tasksSvc,
 			storageSvc: storageSvc,
 			clusterSvc: clusterSvc,
+			// A lock-capable pool service, so delete_vm takes its VMID claim
+			// and the deferred-teardown sweep, which needs one, runs.
+			poolsSvc: &noopPoolService{},
 		},
 		Agent:  agentSvc,
 		Logger: log.NewNopLogger(),

@@ -135,6 +135,9 @@ type ClusterLockOption func(*clusterLockSettings)
 
 type clusterLockSettings struct {
 	grace bool
+	// noWait makes an acquire that finds a live holder give up at once
+	// instead of polling until its timeout.
+	noWait bool
 	// claimReserve is the time the caller needs on its claim after the
 	// acquire returns. Zero leaves only the release margin.
 	claimReserve time.Duration
@@ -147,6 +150,16 @@ type clusterLockSettings struct {
 // withVMIDLock says why its remaining window is accepted.
 func WithCreateGrace() ClusterLockOption {
 	return func(s *clusterLockSettings) { s.grace = true }
+}
+
+// WithoutWait makes the acquire try once. When a live holder has the lock, it
+// returns at once with ErrClusterLockHeld joined with ErrClusterLockTimeout
+// instead of polling until its timeout. An expired or unreadable holder is
+// still stolen, and the timeout still bounds the confirming reads. The
+// deferred-teardown sweep and the create_vm VMID claim use it, because both
+// would rather move on to other work than wait on a VM another process holds.
+func WithoutWait() ClusterLockOption {
+	return func(s *clusterLockSettings) { s.noWait = true }
 }
 
 // WithClaimReserve tells the acquire how much time the caller needs on its
@@ -398,7 +411,12 @@ func acquireClusterLockWithClock(
 			return stole, nil
 		}
 
-		// Held by a live owner: wait and retry until the timeout.
+		// Held by a live owner: wait and retry until the timeout, or give up at
+		// once when the caller asked not to wait.
+		if settings.noWait {
+			return nil, cpierrors.WrapAs(errors.Join(ErrClusterLockHeld, ErrClusterLockTimeout), cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("AcquireClusterLock: lock %q is held by another process, and this acquire does not wait", pool))
+		}
 		now := clk.now()
 		if !now.Before(deadline) {
 			if createErr == nil {
@@ -1131,6 +1149,12 @@ var ErrClusterLockCreateRefused = errors.New("cluster lock create refused")
 // deadline came first, less clusterLockContextMargin, returns it too, having
 // changed nothing, and so does one that starts with less than that margin left.
 var ErrClusterLockTimeout = errors.New("cluster lock acquire timed out")
+
+// ErrClusterLockHeld marks the acquire that WithoutWait ended at once because a
+// live holder had the lock. It comes joined with ErrClusterLockTimeout, so a
+// caller that treats a timeout as "somebody is locked here" reads it the same
+// way.
+var ErrClusterLockHeld = errors.New("cluster lock is held by a live owner")
 
 // ErrClusterLockNoTimeToWait marks the lock timeout of an acquire that gave up
 // before it waited at all, because its request's deadline left less than

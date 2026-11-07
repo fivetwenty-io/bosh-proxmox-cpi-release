@@ -676,6 +676,14 @@ func createVM(
 		fallbackMax = deps.Config.PlacementFallbackMaxValue()
 	}
 
+	// Every VMID this create allocates is claimed before its clone or import
+	// and stays claimed until the create returns, its rollback included, so
+	// the deferred-teardown sweep never takes a VM this create still owns.
+	// The release is deferred here, ahead of the rollback arms below, so it
+	// runs after them.
+	ctx, releaseClaims := bindCreateVMIDClaims(ctx, logger)
+	defer releaseClaims()
+
 	if fallbackMax > 0 && parsed.storagePlan == nil {
 		return createVMWithFallback(ctx, deps, logger, parsed, fallbackMax, &retErr)
 	}
@@ -1099,9 +1107,11 @@ func createVMWithFallback(
 		}
 
 		if attemptErr != nil {
-			// Clean up this attempt's partial VM (if any was created).
+			// Clean up this attempt's partial VM (if any was created), under
+			// the attempt's VMID claim, and then give the claim up.
 			if vmid != 0 {
 				cleanupVMDetached(ctx, deps, candidateNode, vmid, parsed.env, logger)
+				releaseVMIDClaim(ctx, vmid, logger)
 			}
 
 			if !shouldFallback || isLast {
@@ -1586,12 +1596,16 @@ func allocateVM(
 		if pve.IsCloneToNonSharedStorage(e) {
 			return false
 		}
-		return pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e) || pve.IsTransientTransport(e)
+		// A VMID another process claims is in use even when no VM holds it
+		// yet, so it is retried with a fresh VMID like a conflict.
+		return isVMIDClaimHeld(e) || pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e) || pve.IsTransientTransport(e)
 	}
 
 	vmid, err := pve.AllocateWithRetry(ctx, deps.PVE,
 		func(candidate int) error {
-			return attemptCreateVM(ctx, deps, logger, parsed, shape, candidate)
+			return runCreateAttempt(ctx, deps, candidate, logger, func() error {
+				return attemptCreateVM(ctx, deps, logger, parsed, shape, candidate)
+			})
 		},
 		isRetryable,
 		shape.maxAttempts,
@@ -1630,12 +1644,14 @@ func allocateVMForFallback(
 		if pve.IsTransientTransport(e) {
 			return false
 		}
-		return pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e)
+		return isVMIDClaimHeld(e) || pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e)
 	}
 
 	vmid, err := pve.AllocateWithRetry(ctx, deps.PVE,
 		func(candidate int) error {
-			return attemptCreateVM(ctx, deps, logger, parsed, shape, candidate)
+			return runCreateAttempt(ctx, deps, candidate, logger, func() error {
+				return attemptCreateVM(ctx, deps, logger, parsed, shape, candidate)
+			})
 		},
 		isRetryable,
 		shape.maxAttempts,
@@ -2391,11 +2407,20 @@ func addBirthTag(shape *createVMShape, now time.Time, logger *log.Logger) {
 	shape.initialTags = tags
 }
 
+// birthTagDigestAttempts bounds how many times removeBirthTag sends its tag
+// write when PVE refuses it because another writer changed the config after
+// the read, such as a set_vm_metadata call, an HA rule edit, or PVE itself.
+const birthTagDigestAttempts = 3
+
 // removeBirthTag removes every birth tag from the VM's tags through
 // pve.MutateVMConfig, so the write survives a migration that starts mid-call.
 // The write carries the config digest it read, so it never overwrites a tag
 // change that landed in between, and a config without a birth tag is left
-// alone. Any failure is returned, wrapped as a CPI error.
+// alone. A digest refusal proves the write changed nothing, so it reads the
+// config again and resends, up to birthTagDigestAttempts times. Any other
+// failure, and a refusal on the last attempt, is returned, wrapped as a CPI
+// error. The create then fails and rolls back, because a VM that kept its
+// birth tag would be queued for teardown once the create released its claim.
 func removeBirthTag(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) error {
 	const label = "create_vm: remove the birth tag"
 	_, err := pve.MutateVMConfig(ctx, deps.PVE, logger, pve.VMConfigMutation{
@@ -2404,26 +2429,15 @@ func removeBirthTag(ctx context.Context, deps Deps, node string, vmid int, logge
 		MotionWait: haMotionWait(deps),
 		Label:      label,
 		Apply: func(ctx context.Context, node string) error {
-			cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
-			if err != nil {
-				return err
+			var err error
+			for attempt := 1; attempt <= birthTagDigestAttempts; attempt++ {
+				if err = removeBirthTagOnce(ctx, deps, node, vmid); err == nil || !pve.IsConfigDigestRefusal(err) {
+					return err
+				}
+				logger.Info("create_vm: another writer changed the config before the birth tag write; reading it again",
+					log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Int("attempt", attempt), log.Err(err))
 			}
-			raw, _ := pve.ConfigString(cfg, jsonKeyTags)
-			entries := parseTagsField(raw)
-			kept := withoutBirthTags(entries)
-			if len(kept) == len(entries) {
-				return nil
-			}
-			tags := strings.Join(kept, ";")
-			params := &sdknodes.UpdateQemuConfigParams{Tags: &tags}
-			if digest, ok := pve.ConfigString(cfg, "digest"); ok && digest != "" {
-				params.Digest = &digest
-			}
-			if len(kept) == 0 {
-				del := jsonKeyTags
-				params = &sdknodes.UpdateQemuConfigParams{Delete: &del, Digest: params.Digest}
-			}
-			return deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmcid.PathOf(vmid), params)
+			return err
 		},
 		Landed: func(ctx context.Context, node string) (bool, error) {
 			cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
@@ -2447,4 +2461,29 @@ func removeBirthTag(ctx context.Context, deps Deps, node string, vmid int, logge
 		return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("%s of VM %d", label, vmid))
 	}
 	return nil
+}
+
+// removeBirthTagOnce reads the VM's config on node and, when its tags carry a
+// birth tag, writes them back without it, guarded by the digest it read.
+func removeBirthTagOnce(ctx context.Context, deps Deps, node string, vmid int) error {
+	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if err != nil {
+		return err
+	}
+	raw, _ := pve.ConfigString(cfg, jsonKeyTags)
+	entries := parseTagsField(raw)
+	kept := withoutBirthTags(entries)
+	if len(kept) == len(entries) {
+		return nil
+	}
+	tags := strings.Join(kept, ";")
+	params := &sdknodes.UpdateQemuConfigParams{Tags: &tags}
+	if digest, ok := pve.ConfigString(cfg, "digest"); ok && digest != "" {
+		params.Digest = &digest
+	}
+	if len(kept) == 0 {
+		del := jsonKeyTags
+		params = &sdknodes.UpdateQemuConfigParams{Delete: &del, Digest: params.Digest}
+	}
+	return deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmcid.PathOf(vmid), params)
 }

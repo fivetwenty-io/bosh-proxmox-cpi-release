@@ -126,7 +126,7 @@ func TestDestroyVMWithRecovery_MigrateLockNeverSkiplocks(t *testing.T) {
 	}
 	nodes := &lrNodesStub{deleteErrs: errs}
 	deps := Deps{Config: lrRootPamConfig(), PVE: &lrClient{nodes: nodes, qemu: &lrQEMUStub{}}, Logger: log.NewNopLogger()}
-	_, _, err := destroyVMWithRecovery(crhCtx(), deps)
+	_, _, err := destroyStepOnlyBypassingGates(crhCtx(), deps)
 	requireHADeferral(t, err, "holds a migrate lock", "never destroys a VM with skiplock")
 	for i, call := range nodes.deleteCalls {
 		if call.Skiplock != nil && *call.Skiplock {

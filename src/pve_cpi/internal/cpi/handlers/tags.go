@@ -155,8 +155,31 @@ func hasHeadTagPrefix(entry string) bool {
 // they have always had. The create-time prefixes are matched without regard to
 // case, because an operator key of "Stemcell" is plainly an attempt at the same
 // namespace and there is no reason to let a shift key through a guard.
+//
+// The teardown queue tags are CPI-owned too, so a custom tag can never
+// render one, or one that only starts like one.
 func hasCPIOwnedPrefix(entry string) bool {
-	return hasReservedBoshPrefix(entry) || hasCreateTimePrefix(entry)
+	return hasReservedBoshPrefix(entry) || hasCreateTimePrefix(entry) || hasTeardownQueuePrefix(entry)
+}
+
+// teardownQueueTagPrefixes are the tags that queue a VM for the
+// deferred-teardown sweep: the birth tag and bosh-deleting. Only the CPI
+// writes them, and the sweep reads them as a disposal that did not finish, so
+// they are kept apart from the metadata namespaces above, which the sweep
+// never reads.
+var teardownQueueTagPrefixes = []string{birthTagPrefix, tagDeletingVM}
+
+// hasTeardownQueuePrefix reports whether entry starts with one of the
+// teardownQueueTagPrefixes, ignoring case, because the sweep lowers the tags
+// it reads.
+func hasTeardownQueuePrefix(entry string) bool {
+	lowered := strings.ToLower(entry)
+	for _, p := range teardownQueueTagPrefixes {
+		if strings.HasPrefix(lowered, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // jsonKeyTags is the PVE "tags" field key in qemu config/create payloads and

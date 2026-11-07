@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -82,6 +83,17 @@ func stampDeletingTag(ctx context.Context, deps Deps, node, vmCID string, vmid i
 //     awaiting the returned task UPID.
 //  5. Returns immediately — no unbounded get_task poll on any task.
 //
+// The fast path keeps this sequence of its own instead of running the
+// teardown protocol (see vmTeardown), because the protocol awaits the stop
+// and the destroy, and the fast path's contract is to await neither. It runs
+// under delete_vm's VMID claim, so the deferred-teardown sweep cannot take the
+// VM between the bosh-deleting stamp and the destroy. The migrate-lock check
+// reads the config immediately before the skiplock destroy, but it is still a
+// check and then an act: a migration that starts in the moment between the
+// two is one the destroy can run through. The synchronous path has the same
+// check in step 4 of the protocol and a destroy that refuses a migrate lock
+// on its own.
+//
 // The fast path intentionally does NOT run the pve.pool_reap_empty reaper: it
 // is the bounded-time, "known-simple" path and the reaper needs a pre-destroy
 // pool lookup plus a post-destroy task await, neither of which fit its
@@ -96,7 +108,8 @@ func stampDeletingTag(ctx context.Context, deps Deps, node, vmCID string, vmid i
 // as root@pam with a password to clear locked VMs here.
 // Eventual consistency: has_vm may briefly still see this VM after return.
 func fastPathDeleteVM(
-	ctx context.Context, deps Deps, haState *pve.HAServiceState, node, vmCID string, vmid int, logger *log.Logger,
+	ctx context.Context, deps Deps, haState *pve.HAServiceState, node, vmCID string, vmid int, identity vmIdentity,
+	logger *log.Logger,
 ) error {
 	// Clear the VM's CPI-managed HA rules. Only a VM that is not HA-managed
 	// reaches the fast path, so this deregisters nothing a stop depends on,
@@ -204,8 +217,11 @@ func fastPathDeleteVM(
 		return cpierrors.Wrap(pve.WrapError(delErr), fmt.Sprintf("delete_vm: fast-path destroy VM %s", vmCID))
 	}
 
-	// Agent cleanup is best-effort; VM may still be tearing down asynchronously.
-	cleanupAgentForVM(ctx, deps, node, vmid, logger)
+	// Agent cleanup is best-effort; VM may still be tearing down asynchronously,
+	// which the identity check allows, because the VMID still holds this VM.
+	runPostDestroyCleanup(ctx, deps, identity, "agent", logger, func() {
+		cleanupAgentForVM(ctx, deps, node, vmid, logger)
+	})
 	logger.Info("delete_vm: fast-path: destroy issued, returning without task await (eventual consistency)")
 	return nil
 }
@@ -309,7 +325,29 @@ func managedDeleteVMError(err error) error {
 	return storageDecisionSourceError(err)
 }
 
+// deleteLegacyVM deletes a VM the allocation journal does not record. The
+// whole delete, its post-destroy cleanups included, runs under the VM's VMID
+// claim (see withVMIDClaim), waiting up to vmidLockTimeout for it. So the
+// deferred-teardown sweep never races a fast-path delete that has stamped
+// bosh-deleting and not yet destroyed the VM, and no create through this CPI
+// takes the VMID while the cleanups that key on it still run. A claim that
+// another process keeps holding returns a retriable error naming the holder.
+// The delete must finish inside the claim's window, which is the request's
+// deadline or, without one, a little under vmidLockTTL.
 func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCID) (any, error) {
+	vmid := cid.VMID
+	var result any
+	err := withVMIDClaim(ctx, deps, vmid, "delete_vm/"+strconv.Itoa(vmid), true, deps.Log(ctx),
+		func(claimCtx context.Context) error {
+			var inner error
+			result, inner = deleteLegacyVMClaimed(claimCtx, deps, vmCID, cid)
+			return inner
+		})
+	return result, err
+}
+
+// deleteLegacyVMClaimed is deleteLegacyVM's body, run under the VMID claim.
+func deleteLegacyVMClaimed(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCID) (any, error) {
 	vmid := cid.VMID
 	logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))
 
@@ -391,6 +429,7 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 	node = loc.Node
 	vmTags := loc.Tags
 	liveConfig := holding.Config
+	identity := captureVMIdentity(node, vmid, liveConfig)
 	if node != gatedNode {
 		// The VM moved after the gate read its HA state, so that state is
 		// about the node it left. Read it again on the node that holds it now.
@@ -476,10 +515,12 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 	// destroy, and the fire-and-forget stop cannot wait for it.
 	if deps.Config.FastPathDeleteEnabled() {
 		if !haState.Managed() {
-			if fpErr := fastPathDeleteVM(ctx, deps, haState, node, vmCID, vmid, logger); fpErr != nil {
+			if fpErr := fastPathDeleteVM(ctx, deps, haState, node, vmCID, vmid, identity, logger); fpErr != nil {
 				return nil, fpErr
 			}
-			cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
+			runPostDestroyCleanup(ctx, deps, identity, "advertised_routes", logger, func() {
+				cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
+			})
 			return nil, nil
 		}
 		logger.Info("delete_vm: VM is HA-managed, so it takes the synchronous delete path despite fast_path_delete",
@@ -500,7 +541,7 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 		}
 		return refuseOwnedLegacyDestroy(holding.WithReplacements(), vmCID, vmid)
 	}
-	return deleteLegacyVMAndArtifacts(ctx, deps, haState, node, vmCID, vmid, vmTags, owned, logger)
+	return deleteLegacyVMAndArtifacts(ctx, deps, haState, node, vmCID, vmid, vmTags, identity, owned, logger)
 }
 
 // readLegacyDeleteHolding reads the holding of the VM that loc names. When the
@@ -549,7 +590,7 @@ func readLegacyDeleteHolding(
 // rules are cleaned up after the destroy. Any other VM is stopped directly.
 func deleteLegacyVMAndArtifacts(
 	ctx context.Context, deps Deps, haState *pve.HAServiceState, node, vmCID string, vmid int, vmTags string,
-	owned func(context.Context, pve.QemuHolding) error, logger *log.Logger,
+	identity vmIdentity, owned func(context.Context, pve.QemuHolding) error, logger *log.Logger,
 ) (any, error) {
 	// --- opt-in empty-pool reaper: capture membership BEFORE destroy ---
 	// The /cluster/resources row for this vmid (and therefore its pool
@@ -580,19 +621,30 @@ func deleteLegacyVMAndArtifacts(
 	if err != nil {
 		return nil, err
 	}
+	// Every cleanup below keys on the VMID alone, so each first checks that
+	// the VMID is free or still holds the VM this delete destroyed (see
+	// cleanupTargetStillOurs).
 	if result.gone {
 		if result.stage == teardownStageDestroy {
-			cleanupAgentForVM(ctx, deps, node, vmid, logger)
+			runPostDestroyCleanup(ctx, deps, identity, "agent", logger, func() {
+				cleanupAgentForVM(ctx, deps, node, vmid, logger)
+			})
 		}
-		cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, logger)
-		cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
+		runPostDestroyCleanup(ctx, deps, identity, "ha_membership", logger, func() {
+			cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, logger)
+		})
+		runPostDestroyCleanup(ctx, deps, identity, "advertised_routes", logger, func() {
+			cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
+		})
 		return nil, nil
 	}
 
 	// --- HA anti-affinity / DLB / node-affinity pin cleanup (best-effort) ---
 	// The destroy's purge removed the HA resource, so this only clears CPI
 	// rules that still name the VM.
-	cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, logger)
+	runPostDestroyCleanup(ctx, deps, identity, "ha_membership", logger, func() {
+		cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, logger)
+	})
 
 	// --- opt-in empty-pool reaper: run AFTER the destroy has completed so
 	//     PVE has already dropped this VM's pool membership. Never fails
@@ -600,11 +652,15 @@ func deleteLegacyVMAndArtifacts(
 	reapEmptyPoolIfManaged(ctx, deps, reapPool, logger)
 
 	// --- agent cleanup ---
-	cleanupAgentForVM(ctx, deps, node, vmid, logger)
+	runPostDestroyCleanup(ctx, deps, identity, "agent", logger, func() {
+		cleanupAgentForVM(ctx, deps, node, vmid, logger)
+	})
 
 	// --- advertised-route SDN subnet cleanup (provenance-tagged, refcounted,
 	//     entirely fail-open — see delete_vm_routes.go) ---
-	cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
+	runPostDestroyCleanup(ctx, deps, identity, "advertised_routes", logger, func() {
+		cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
+	})
 
 	logger.Info("delete_vm: VM deleted successfully", log.String("node", node))
 	return nil, nil

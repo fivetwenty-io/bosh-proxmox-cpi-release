@@ -1262,8 +1262,9 @@ func TestHandleDeleteVM_FastPath_ExplicitFalse_AwaitsTask(t *testing.T) {
 }
 
 // TestHandleDeleteVM_FastPath_StaggerSweepReapsStraggler verifies that the
-// straggler sweep (sweepFastDeleteStragglers) finds a VM tagged bosh-deleting
-// in the cluster list and re-issues a destroy for it before the current delete.
+// deferred-teardown sweep (sweepDeferredTeardowns) finds a VM tagged
+// bosh-deleting in the cluster list, claims its VMID, and re-issues a destroy
+// for it before the current delete.
 func TestHandleDeleteVM_FastPath_StaggerSweepReapsStraggler(t *testing.T) {
 	t.Parallel()
 

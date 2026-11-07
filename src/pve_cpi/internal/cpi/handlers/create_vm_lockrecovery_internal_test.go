@@ -53,6 +53,10 @@ type lrNodesStub struct {
 	// onUpdate, when set, runs after each recorded config write, so a test
 	// can make the config read that follows see the write land.
 	onUpdate func()
+	// updateErrs are consumed in FIFO order, one per UpdateQemuConfig call;
+	// when exhausted, the last entry repeats. A write that returns an error
+	// does not run onUpdate, because it did not land.
+	updateErrs []error
 }
 
 func (n *lrNodesStub) DeleteQemu(
@@ -107,8 +111,15 @@ func (n *lrNodesStub) CreateQemuStatusStop(
 }
 
 func (n *lrNodesStub) UpdateQemuConfig(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+	idx := n.updateCalls
 	n.updateCalls++
 	n.updateParams = append(n.updateParams, params)
+	switch {
+	case idx < len(n.updateErrs) && n.updateErrs[idx] != nil:
+		return n.updateErrs[idx]
+	case idx >= len(n.updateErrs) && len(n.updateErrs) > 0 && n.updateErrs[len(n.updateErrs)-1] != nil:
+		return n.updateErrs[len(n.updateErrs)-1]
+	}
 	if params != nil && params.Tags != nil {
 		n.updatedTags = params.Tags
 		if strings.Contains(*params.Tags, tagCreateFailed) {

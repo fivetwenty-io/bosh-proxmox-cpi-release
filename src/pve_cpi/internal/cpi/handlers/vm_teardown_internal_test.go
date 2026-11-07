@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
@@ -397,5 +398,89 @@ func TestRequireStoppedOnOwner(t *testing.T) {
 			}
 			requireRetriableTeardown(t, err, tc.wantErr)
 		})
+	}
+}
+
+// haReadFailingCluster is the node-affinity cluster stub whose HA resource
+// list cannot be read.
+type haReadFailingCluster struct{ *naClusterStub }
+
+func (haReadFailingCluster) ListHaResources(context.Context, *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
+	return nil, errors.New("500 ha resource list unavailable")
+}
+
+// gateClient is the lock-recovery client with a cluster service of the test's
+// choosing, so the teardown's HA gate reads a scripted HA state.
+type gateClient struct {
+	*lrClient
+	cluster cluster.Service
+}
+
+func (c gateClient) Cluster() cluster.Service { return c.cluster }
+
+func TestVMTeardown_GateNoWaitProceedsOnAnUnmanagedVM(t *testing.T) {
+	f := newTeardownFixture(&lrNodesStub{}, &lrQEMUStub{})
+	td := f.teardown()
+	td.gate = teardownGateNoWait
+
+	if _, err := td.run(crhCtx(), f.deps); err != nil {
+		t.Fatalf("an unmanaged VM passes the no-wait gate, got %v", err)
+	}
+	if len(f.nodes.deleteCalls) != 1 {
+		t.Fatalf("want one destroy, got %d", len(f.nodes.deleteCalls))
+	}
+}
+
+func TestVMTeardown_GatesDeferWhenTheHAStateCannotBeRead(t *testing.T) {
+	for name, gate := range map[string]vmTeardownGate{
+		"listed":  teardownGateListed,
+		"no wait": teardownGateNoWait,
+	} {
+		t.Run(name, func(t *testing.T) {
+			nodes, q := &lrNodesStub{}, &lrQEMUStub{}
+			f := newTeardownFixture(nodes, q)
+			f.deps.PVE = gateClient{
+				lrClient: &lrClient{nodes: nodes, qemu: q}, cluster: haReadFailingCluster{newNAStub()},
+			}
+			td := f.teardown()
+			td.gate = gate
+			stopped := false
+			td.stop = func(context.Context) (bool, error) {
+				stopped = true
+				return false, nil
+			}
+
+			result, err := td.run(crhCtx(), f.deps)
+			var deferral *haDeferral
+			if !errors.As(err, &deferral) || !okToRetryCPIError(err) {
+				t.Fatalf("want a retriable HA deferral, got %v", err)
+			}
+			if result.stage != teardownStageHA || stopped || len(nodes.deleteCalls) != 0 || f.preserveCalls != 0 {
+				t.Fatalf("an unreadable HA state must touch nothing; stage %q, stopped %v, destroys %d, preserves %d",
+					result.stage, stopped, len(nodes.deleteCalls), f.preserveCalls)
+			}
+		})
+	}
+}
+
+func TestVMTeardown_LockClearRecheckOwnershipRefusalStopsTheSecondDestroy(t *testing.T) {
+	defer SetVMLockClearBounds(time.Millisecond, time.Second)()
+	nodes := &lrNodesStub{deleteErrs: []error{errors.New(lockedCloneMsg), nil}}
+	f := newTeardownFixture(nodes, &lrQEMUStub{})
+	td := f.teardown()
+	td.owned = func(context.Context, pve.QemuHolding) error {
+		f.ownedCalls++
+		if f.ownedCalls > 1 {
+			return cpierrors.Retriable("the VMID now holds a VM this Director does not own")
+		}
+		return nil
+	}
+
+	if _, err := td.run(crhCtx(), f.deps); err == nil {
+		t.Fatal("an ownership refusal on the recheck must fail the teardown")
+	}
+	if len(nodes.deleteCalls) != 1 || f.ownedCalls != 2 {
+		t.Fatalf("the recheck must re-prove ownership and keep the second destroy from running; "+
+			"destroys %d, ownership checks %d", len(nodes.deleteCalls), f.ownedCalls)
 	}
 }

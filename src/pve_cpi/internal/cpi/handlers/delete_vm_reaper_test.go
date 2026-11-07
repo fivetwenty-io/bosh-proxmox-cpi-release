@@ -25,6 +25,10 @@ import (
 // reaperPoolService is a PoolService fake recording GetPoolComment/DeletePool
 // calls so tests can assert which branch of reapEmptyPoolIfManaged ran.
 type reaperPoolService struct {
+	// lockClaims holds delete_vm's VMID claim, a lock sentinel pool the
+	// reaper assertions ignore.
+	lockClaims
+
 	getCommentFn func(ctx context.Context, poolID string) (string, bool, error)
 	deletePoolFn func(ctx context.Context, poolID string) error
 
@@ -34,9 +38,21 @@ type reaperPoolService struct {
 
 func (p *reaperPoolService) AddVM(_ context.Context, _ string, _ int64) error        { return nil }
 func (p *reaperPoolService) MoveVMToPool(_ context.Context, _ string, _ int64) error { return nil }
-func (p *reaperPoolService) CreatePool(_ context.Context, _, _ string) error         { return nil }
+func (p *reaperPoolService) CreatePool(_ context.Context, poolID, comment string) error {
+	if isLockSentinelPool(poolID) {
+		p.put(poolID, comment)
+	}
+	return nil
+}
+
+// isLockSentinelPool reports whether poolID is a cluster lock's sentinel.
+func isLockSentinelPool(poolID string) bool { return strings.HasPrefix(poolID, "bosh-lock-") }
 
 func (p *reaperPoolService) DeletePool(ctx context.Context, poolID string) error {
+	if isLockSentinelPool(poolID) {
+		p.drop(poolID)
+		return nil
+	}
 	p.deletePoolCalls = append(p.deletePoolCalls, poolID)
 	if p.deletePoolFn != nil {
 		return p.deletePoolFn(ctx, poolID)
@@ -45,6 +61,9 @@ func (p *reaperPoolService) DeletePool(ctx context.Context, poolID string) error
 }
 
 func (p *reaperPoolService) GetPoolComment(ctx context.Context, poolID string) (string, bool, error) {
+	if isLockSentinelPool(poolID) {
+		return p.get(poolID)
+	}
 	p.getCommentCalls = append(p.getCommentCalls, poolID)
 	if p.getCommentFn != nil {
 		return p.getCommentFn(ctx, poolID)

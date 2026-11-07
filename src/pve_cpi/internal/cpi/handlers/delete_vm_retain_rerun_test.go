@@ -188,7 +188,10 @@ func assertRetentionFinished(t *testing.T, client *retainRerunPVE, volume string
 // place. Both the block and the file-backed form get there for real.
 func cutShortRetention(t *testing.T, deps Deps, client *retainRerunPVE, volume string, fastPath bool) {
 	t.Helper()
-	if err := deleteVMCall(t, lockTimeoutContext(t), deps, "777"); err == nil {
+	// The short deadline that times out the parker lock would refuse the
+	// delete's VMID claim the same way, before the retention starts, so the
+	// call runs as if it already held that claim.
+	if err := deleteVMCall(t, heldVMIDClaimContext(lockTimeoutContext(t), 777), deps, "777"); err == nil {
 		t.Fatal("the first delete must fail when its parker lock times out")
 	}
 	assertCutShortRetention(t, client, volume)

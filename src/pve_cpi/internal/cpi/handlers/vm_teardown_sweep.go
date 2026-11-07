@@ -20,8 +20,9 @@ import (
 // birthTagPrefix starts the birth tag every legacy create_vm writes with the
 // VM's first workload tags, bosh-creating-<unix seconds>. A create that
 // succeeds removes it as its last mutation, so a VM that still carries it is
-// a failed or abandoned attempt, and the deferred-teardown sweep reaps it once
-// it is older than any create could still be running.
+// a failed attempt or one still running. The create holds the VMID claim
+// for as long as it runs (see withVMIDClaim), so the deferred-teardown sweep
+// reaps a birth-tagged VM only once that claim is free.
 const birthTagPrefix = "bosh-creating-"
 
 // birthTagPattern matches a birth tag and nothing else, so a custom tag that
@@ -41,6 +42,15 @@ const tagCreateFailed = "bosh-create-failed"
 // delete_vm, so they converge without holding one request for more than this
 // many teardowns.
 const sweepStragglersMaxPerSweep = 5
+
+// sweepClaimAttemptsMaxPerSweep caps how many VMID claims one sweep tries,
+// counting the ones another process holds. A queued VM whose claim is held is
+// still being worked on, and many of them, as during a large delete, must not
+// make every sweep pay a claim attempt for each.
+const sweepClaimAttemptsMaxPerSweep = 4 * sweepStragglersMaxPerSweep
+
+// sweepKeptBirthTagsLogged caps how many VMIDs the keep_failed warning names.
+const sweepKeptBirthTagsLogged = 10
 
 // deferredTeardownSweepBudgetNs bounds one sweep, stored as nanoseconds so
 // tests can shrink it race-safely. The sweep also leaves at least half of the
@@ -108,9 +118,13 @@ func withBirthTag(tags, tag string) (string, []string) {
 	return mergeTagListReporting(ordered, nil, maxTagLength)
 }
 
-// deferredTeardownAge is how old a birth tag must be before the sweep treats
-// its VM as abandoned: the create_vm operation timeout plus the HA motion
-// wait, so the sweep never touches a create that another process still runs.
+// deferredTeardownAge is how old a birth tag must be before the sweep looks
+// at its VM: the create_vm operation timeout plus the HA motion wait. The age
+// is a settling delay that keeps the sweep from claiming fresh creates on
+// every request. It is not what proves a create abandoned, because nothing
+// enforces the create timeout when the operation-timeout envelope is off. The
+// proof is the VMID claim: a create holds it until it has finished or rolled
+// back, and the sweep skips any VM whose claim another process holds.
 func deferredTeardownAge(deps Deps) time.Duration {
 	return time.Duration(deps.Config.OperationTimeoutCreateSec()+deps.Config.HAMotionWaitSecValue()) * time.Second
 }
@@ -120,6 +134,17 @@ type deferredTeardownQueue struct {
 	now        time.Time
 	age        time.Duration
 	keepFailed bool
+}
+
+// expiredBirthTag reports whether tagsRaw carries a birth tag older than the
+// queue's age.
+func (q deferredTeardownQueue) expiredBirthTag(tagsRaw string) bool {
+	for _, tag := range lowerTags(parseTagsField(tagsRaw)) {
+		if born, ok := birthTagTime(tag); ok && q.now.Sub(born) > q.age {
+			return true
+		}
+	}
+	return false
 }
 
 // queued reports whether tagsRaw queues its VM: bosh-deleting, or a birth tag
@@ -217,16 +242,21 @@ func sweepContext(ctx context.Context) (context.Context, context.CancelFunc) {
 
 // sweepDeferredTeardowns drains the queue of VMs a disposal could not finish:
 // those that carry bosh-deleting, which the fast path and the rollback stamp,
-// and those whose birth tag is older than any create could still be running.
-// It runs at the start of every legacy create_vm and every delete_vm, in every
-// HA mode. Each queued VM this Director owns goes through the teardown
-// protocol without skiplock, with the HA state read once and no wait, and a VM
-// the protocol defers stays queued for the next sweep. The sweep is:
+// and those whose birth tag is older than the settling age. It runs at the
+// start of every legacy create_vm and every delete_vm, in every HA mode. Each
+// queued VM is claimed first, trying once (see withVMIDClaim), and a VM whose
+// claim another process holds is skipped, because that process is still
+// creating or disposing of it. Each claimed VM this Director owns goes through
+// the teardown protocol without skiplock, with the HA state read once and no
+// wait, and a VM the protocol defers stays queued for the next sweep. The
+// sweep is:
 //   - Best-effort: every failure is logged, never propagated.
-//   - Bounded: at most sweepStragglersMaxPerSweep VMs, within its budget.
-//   - Fail-closed: an index row is re-checked on the VM's authoritative
-//     config, a VM the allocation journal names is left to the journal, and a
-//     VM the protocol cannot prove safe to destroy is left as it is.
+//   - Bounded: at most sweepStragglersMaxPerSweep teardowns and
+//     sweepClaimAttemptsMaxPerSweep claim attempts, within its budget.
+//   - Fail-closed: without a pool service there is no claim to take, so
+//     nothing is swept. An index row is re-checked on the VM's authoritative
+//     config, a VM the allocation journal names is left to the journal, and
+//     a VM the protocol cannot prove safe to destroy is left as it is.
 func sweepDeferredTeardowns(ctx context.Context, deps Deps, logger *log.Logger) {
 	if deps.PVE == nil || deps.Config == nil || deps.PVE.Cluster() == nil {
 		return
@@ -245,6 +275,7 @@ func sweepDeferredTeardowns(ctx context.Context, deps Deps, logger *log.Logger) 
 		return
 	}
 	var rows []stragglerRow
+	var kept []int
 	for _, raw := range *resp {
 		var row stragglerRow
 		if json.Unmarshal(raw, &row) != nil {
@@ -252,9 +283,22 @@ func sweepDeferredTeardowns(ctx context.Context, deps Deps, logger *log.Logger) 
 		}
 		if row.candidate(queue, deps.RequestDirectorUUID) {
 			rows = append(rows, row)
+		} else if row.keptBirthTag(queue, deps.RequestDirectorUUID) {
+			kept = append(kept, int(row.VMID.Int()))
 		}
 	}
+	if len(kept) > 0 {
+		logKeptBirthTags(logger, kept)
+	}
 	if len(rows) == 0 {
+		return
+	}
+	// The VMID claim is what proves a queued VM abandoned. Without a pool
+	// service there is no claim to take, so a VM another process is still
+	// creating or disposing of cannot be told apart from an abandoned one.
+	if deps.PVE.Pools() == nil {
+		logger.Warn("deferred teardown sweep: no pool service, so no VMID claim can prove a queued VM abandoned; "+
+			"skipping the sweep", log.Int("queued", len(rows)))
 		return
 	}
 	protected, err := legacySweepJournalVMIDs(ctx, deps)
@@ -264,23 +308,72 @@ func sweepDeferredTeardowns(ctx context.Context, deps Deps, logger *log.Logger) 
 	}
 	sweepCtx, cancel := sweepContext(ctx)
 	defer cancel()
-	processed, deferred := 0, 0
+	processed, attempts, deferred := 0, 0, 0
 	for _, row := range rows {
-		if protected[int(row.VMID.Int())] {
+		vmid := int(row.VMID.Int())
+		if protected[vmid] {
 			continue
 		}
-		if processed >= sweepStragglersMaxPerSweep || sweepCtx.Err() != nil {
+		if processed >= sweepStragglersMaxPerSweep || attempts >= sweepClaimAttemptsMaxPerSweep || sweepCtx.Err() != nil {
 			deferred++
 			continue
 		}
-		processed++
-		sweepDeferredTeardown(sweepCtx, deps, row, queue, logger.With(
-			log.String("node", row.Node), log.String("vmid", strconv.FormatInt(row.VMID.Int(), 10))))
+		sweepLogger := logger.With(log.String("node", row.Node), log.String("vmid", strconv.Itoa(vmid)))
+		// A VM this request claims is the one it is creating or disposing
+		// of right now. Never sweep it from under the request itself.
+		if _, held := heldVMIDClaimWindow(sweepCtx, vmid); held {
+			sweepLogger.Debug("deferred teardown sweep: this request claims the VM; leaving it")
+			continue
+		}
+		attempts++
+		tornDown := false
+		claimErr := withVMIDClaim(sweepCtx, deps, vmid, "deferred-teardown-sweep/"+strconv.Itoa(vmid), false, sweepLogger,
+			func(claimCtx context.Context) error {
+				tornDown = true
+				sweepDeferredTeardown(claimCtx, deps, row, queue, sweepLogger)
+				return nil
+			})
+		if tornDown {
+			processed++
+		}
+		switch {
+		case claimErr == nil:
+		case isVMIDClaimHeld(claimErr):
+			sweepLogger.Info("deferred teardown sweep: another process claims the VM, so its create or disposal is "+
+				"still running; leaving it", log.Err(claimErr))
+		default:
+			sweepLogger.Warn("deferred teardown sweep: could not claim the VM; leaving it for the next sweep (non-fatal)",
+				log.Err(claimErr))
+		}
 	}
 	if deferred > 0 {
 		logger.Info("deferred teardown sweep: cap or budget reached; remaining VMs deferred to the next sweep",
-			log.Int("processed", processed), log.Int("deferred", deferred))
+			log.Int("processed", processed), log.Int("claim_attempts", attempts), log.Int("deferred", deferred))
 	}
+}
+
+// keptBirthTag reports whether the row is a VM this Director may own whose
+// expired birth tag the sweep leaves alone only because debug.keep_failed_vms
+// is on.
+func (r stragglerRow) keptBirthTag(queue deferredTeardownQueue, requestUUID string) bool {
+	if !queue.keepFailed || r.Type != resourceTypeQemu || r.VMID.Int() == 0 {
+		return false
+	}
+	return queue.expiredBirthTag(r.Tags) && !stragglerRowForeign(r.Tags, requestUUID)
+}
+
+// logKeptBirthTags warns about VMs that keep an expired birth tag because
+// debug.keep_failed_vms is on. Such a VM is a create that failed or was
+// abandoned, possibly before it could write the failed tag, and nothing
+// reaps it until an operator deletes it or turns the setting off.
+func logKeptBirthTags(logger *log.Logger, vmids []int) {
+	named := vmids
+	if len(named) > sweepKeptBirthTagsLogged {
+		named = named[:sweepKeptBirthTagsLogged]
+	}
+	logger.Warn("deferred teardown sweep: debug.keep_failed_vms is on, so VMs with an expired birth tag are kept "+
+		"and never reaped; delete them by hand or turn the setting off once they are no longer needed",
+		log.Int("count", len(vmids)), log.Any("vmids", named))
 }
 
 // sweepDeferredTeardown tears down one queued VM through the protocol.
@@ -339,17 +432,30 @@ func sweepDeferredTeardown(
 			return sweepStillOwned(ctx, deps, row, vmid, holding, queue, sweepLogger)
 		},
 	}
+	identity := captureVMIdentity(row.Node, vmid, cfg)
 	result, err := teardown.run(ctx, deps)
 	if err != nil {
 		sweepLogger.Warn("deferred teardown sweep: the teardown did not finish; the VM stays queued for the next sweep",
 			log.String("stage", string(result.stage)), log.Err(err))
 		return
 	}
+	// A VM that was already gone before this sweep destroyed anything was
+	// destroyed by someone else, so the VMID's agent state, HA rules, and
+	// routes may already belong to whatever holds it now. Only a teardown
+	// that destroyed the VM itself runs the cleanups, and each one first
+	// checks that the VMID is free or still holds the destroyed VM.
 	if !result.gone || result.stage == teardownStageDestroy {
-		cleanupAgentForVM(ctx, deps, row.Node, vmid, sweepLogger)
+		node := teardown.node
+		runPostDestroyCleanup(ctx, deps, identity, "agent", sweepLogger, func() {
+			cleanupAgentForVM(ctx, deps, node, vmid, sweepLogger)
+		})
+		runPostDestroyCleanup(ctx, deps, identity, "ha_membership", sweepLogger, func() {
+			cleanupHAMembershipAfterDestroy(ctx, deps, teardown.haState, vmid, sweepLogger)
+		})
+		runPostDestroyCleanup(ctx, deps, identity, "advertised_routes", sweepLogger, func() {
+			cleanupAdvertisedRoutes(ctx, deps, vmid, authTags, sweepLogger)
+		})
 	}
-	cleanupHAMembershipAfterDestroy(ctx, deps, teardown.haState, vmid, sweepLogger)
-	cleanupAdvertisedRoutes(ctx, deps, vmid, authTags, sweepLogger)
 	sweepLogger.Info("deferred teardown sweep: VM torn down", log.Bool("already_gone", result.gone))
 }
 

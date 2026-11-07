@@ -17,6 +17,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -119,6 +120,18 @@ func migrationLockDeferral(caller string, vmid int, node string) error {
 			"migrates; retry once the migration has finished", caller, vmid, node)
 }
 
+// errSkiplockStopDuringMigration marks a skiplock stop that was not sent
+// because the VM holds a migrate lock, or because its lock could not be read.
+var errSkiplockStopDuringMigration = errors.New("skiplock stop refused while the VM may be migrating")
+
+// migrationStopDeferral is the retriable error of a skiplock stop that met a
+// VM holding a migrate lock.
+func migrationStopDeferral(caller string, vmid int, node string) error {
+	return errors.Join(errSkiplockStopDuringMigration, cpierrors.Retriable(
+		"%s: VM %d on node %s holds a migrate lock, and the CPI never stops a VM with skiplock while it "+
+			"migrates; retry once the migration has finished", caller, vmid, node))
+}
+
 // vmConfigLock reads the lock field of the VM's config on node.
 func vmConfigLock(ctx context.Context, deps Deps, node string, vmid int) (string, error) {
 	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
@@ -168,13 +181,36 @@ func lockForRecovery(err error) bool {
 // the UPID (empty string for a synchronous completion) on success, or
 // origErr unretried when identity does not qualify (not root@pam via
 // password — see retryDestroyWithSkiplock and pve.IsRootPamIdentity).
+//
+// skiplock would stop the VM through a live migration's config lock, so a VM
+// that holds a migrate lock gets no skiplock stop, and neither does one whose
+// lock cannot be read. Both return an error that carries
+// errSkiplockStopDuringMigration, the first a retriable deferral and the
+// second the read failure joined with origErr.
 func retryStopWithSkiplock(
-	ctx context.Context, deps Deps, node string, vmid int, origErr error, logger *log.Logger,
+	ctx context.Context, deps Deps, caller, node string, vmid int, origErr error, logger *log.Logger,
 ) (string, error) {
 	if !pve.IsRootPamIdentity(deps.Config) {
 		return "", origErr
 	}
 	lockType := pve.VMConfigLockType(origErr)
+	if lockType == "" {
+		lock, readErr := vmConfigLock(ctx, deps, node, vmid)
+		switch {
+		case readErr != nil && (pve.IsNotFound(readErr) || pve.IsPmxcfsConfigMissing(readErr)):
+			return "", origErr
+		case readErr != nil:
+			logger.Warn(caller+": the VM's config lock could not be read; not stopping it with skiplock",
+				log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Err(readErr))
+			return "", errors.Join(errSkiplockStopDuringMigration, origErr, readErr)
+		}
+		lockType = lock
+	}
+	if lockType == vmLockMigrate {
+		logger.Warn(caller+": VM holds a migrate lock; not stopping it with skiplock",
+			log.Int(metadataKeyVMID, vmid), log.String("node", node))
+		return "", migrationStopDeferral(caller, vmid, node)
+	}
 	logger.Warn("stop rejected -- VM config is locked; retrying with skiplock (root@pam)",
 		log.Int(metadataKeyVMID, vmid), log.String("node", node), log.String("lock_type", lockType))
 	skiplock := true

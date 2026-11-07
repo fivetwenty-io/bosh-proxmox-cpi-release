@@ -216,7 +216,10 @@ func (t *vmTeardown) verifyBeforeDestroy(ctx context.Context, deps Deps) (bool, 
 		t.logger.Info(t.caller+": VM is not stopped yet; waiting for it to halt before the destroy",
 			log.Int(metadataKeyVMID, t.vmid), log.String("node", t.node), log.String("state", state))
 		if err := waitForVMStopped(ctx, deps, t.node, t.vmid, t.vmCID, t.logger); err != nil {
-			return false, err
+			return false, cpierrors.Wrap(err, fmt.Sprintf(
+				"%s: VM %d on node %s did not halt before the destroy; this step only waits and sends no stop of its "+
+					"own, so the VM stays running until the stop sent earlier or another actor halts it", t.caller,
+				t.vmid, t.node))
 		}
 	}
 	holding, err := pve.ReadQemuHolding(ctx, deps.PVE, t.node, t.vmid)

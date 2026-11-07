@@ -36,13 +36,15 @@ func (v destroyedQEMUView) Status(ctx context.Context, node string, vmid int) (m
 	return v.Service.Status(ctx, node, vmid)
 }
 
-// destroyVMWithRecovery runs step 5 of the teardown alone, the way the
-// delete_vm fast path configures it: skiplock allowed and the operator's
+// destroyStepOnlyBypassingGates runs step 5 of the teardown alone and skips
+// steps 1 to 4, so a test that calls it covers the destroy's lock recovery and
+// none of the HA gate, power, preserve, or verify steps. It configures the
+// destroy the way delete_vm does: skiplock allowed and the operator's
 // destroy_unreferenced_disks knob applied, against VM 100 on pve01 with no
 // retained disk. A destroy that finds the VM gone cleans the agent's state, as
 // delete_vm does. The lock-recovery tests drive the destroy's retry curve
 // through it without the steps around it.
-func destroyVMWithRecovery(ctx context.Context, deps Deps) (*sdknodes.DeleteQemuResponse, bool, error) {
+func destroyStepOnlyBypassingGates(ctx context.Context, deps Deps) (*sdknodes.DeleteQemuResponse, bool, error) {
 	const (
 		node = "pve01"
 		vmid = 100

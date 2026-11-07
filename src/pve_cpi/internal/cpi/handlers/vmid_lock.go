@@ -64,6 +64,8 @@ const vmidLockClaimLimit = 256
 // and delete_vm on that VMID can interleave freely between the clusters.
 //
 // Failure modes:
+//   - ctx already claims vmid: fn runs under that claim while its window is
+//     open, and a retriable error returns once the window has closed.
 //   - pools == nil: returns a retriable error immediately; fn is not called.
 //   - AcquireClusterLock failure: returns the retriable error from the lock
 //     infrastructure; fn is not called.
@@ -81,6 +83,16 @@ func withVMIDLock(
 	logger *log.Logger,
 	fn func() error,
 ) error {
+	// A request that already claims vmid (see withVMIDClaim) holds this very
+	// lock, which is not reentrant, so fn runs under that claim instead. Once
+	// the claim's window has closed it may be stolen, so fn does not run.
+	if windowEnd, held := heldVMIDClaimWindow(ctx, vmid); held {
+		if !time.Now().Before(windowEnd) {
+			return cpierrors.Retriable("withVMIDLock: the claim on VM %d has run out its window; retry so a fresh claim "+
+				"covers the write", vmid)
+		}
+		return fn()
+	}
 	if pools == nil {
 		return cpierrors.WrapAs(
 			cpierrors.Cloud("withVMIDLock: pool service is nil for vmid=%d", vmid),
