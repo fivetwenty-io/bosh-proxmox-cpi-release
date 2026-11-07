@@ -256,6 +256,16 @@ func estimateGuests(check HeadroomCheck, plannedNode string) []HeadroomGuest {
 // estimateFailure plays out the loss of one node. It returns the shortfall and
 // true when an HA guest of the failed node fits on no survivor in its set.
 func estimateFailure(facts []NodeFacts, guests []HeadroomGuest, failed string) (HeadroomShortfall, bool) {
+	s, short, _ := packFailure(facts, guests, failed)
+	return s, short
+}
+
+// packFailure is the packing core of estimateFailure. Besides the shortfall it
+// returns the free memory of every surviving node, as it stands when the
+// packing ends: after every lost HA guest was placed, or at the guest that fit
+// nowhere. A survivor is an online node that is not the failed one and is not
+// in maintenance.
+func packFailure(facts []NodeFacts, guests []HeadroomGuest, failed string) (HeadroomShortfall, bool, map[string]int64) {
 	used := make(map[string]int64, len(facts))
 	for _, g := range guests {
 		used[g.Node] += g.MemBytes
@@ -290,11 +300,11 @@ func estimateFailure(facts []NodeFacts, guests []HeadroomGuest, failed string) (
 				MemBytes:         g.MemBytes,
 				LargestFreeBytes: largest,
 				LargestFreeNode:  largestNode,
-			}, true
+			}, true, free
 		}
 		free[node] -= g.MemBytes
 	}
-	return HeadroomShortfall{}, false
+	return HeadroomShortfall{}, false, free
 }
 
 // bestSurvivor picks, among the survivors in admissible, the one with the most
@@ -395,4 +405,111 @@ func headroomRejection(facts []NodeFacts, check *HeadroomCheck, node string) str
 		prefix = HeadroomUnavailablePrefix
 	}
 	return prefix + strings.Join(result.Lines(), "; ")
+}
+
+// HeadroomMargin is the N+1 memory margin of a cluster as it stands, which the
+// doctor command reports. Unlike EstimateHeadroom it places no new VM: it plays
+// out the loss of each online node against the guests that exist.
+type HeadroomMargin struct {
+	// Percent is the smallest margin across the scenarios, rounded down. It is
+	// meaningful only when the margin is neither short nor unavailable.
+	Percent int
+
+	// TightestNode is the failed node of the scenario that gave Percent.
+	TightestNode string
+
+	// Shortfalls holds one entry for each failing node whose HA guests do not
+	// all fit on the survivors, sorted by node name.
+	Shortfalls []HeadroomShortfall
+
+	// Unavailable is non-empty when the margin could not be worked out, such as
+	// when a guest has no memory figure or no node loss leaves a survivor.
+	Unavailable string
+}
+
+// Short reports whether some node loss leaves an HA guest without a place.
+func (m HeadroomMargin) Short() bool { return m.Unavailable == "" && len(m.Shortfalls) > 0 }
+
+// Summary renders the margin as the doctor prints it after "headroom=", which
+// is ok(N%), short(<node>) with a "+" and the count of further nodes when more
+// than one node loss is short, or unavailable.
+func (m HeadroomMargin) Summary() string {
+	switch {
+	case m.Unavailable != "":
+		return "unavailable"
+	case len(m.Shortfalls) > 0:
+		out := "short(" + m.Shortfalls[0].FailedNode
+		if extra := len(m.Shortfalls) - 1; extra > 0 {
+			out += fmt.Sprintf("+%d", extra)
+		}
+		return out + ")"
+	default:
+		return fmt.Sprintf("ok(%d%%)", m.Percent)
+	}
+}
+
+// EstimateHeadroomMargin works out the margin of the cluster described by facts
+// and guests. For each online node taken as the one that fails, it packs that
+// node's HA guests onto the survivors exactly as EstimateHeadroom does, and the
+// scenario's margin is the free memory left on the survivors divided by their
+// total memory. A survivor is an online node that is not in maintenance and is
+// not the failed one, and a survivor's free memory is never counted below zero.
+// The result's Percent is the smallest margin across the scenarios, rounded
+// down. A scenario in which an HA guest fits on no survivor is a shortfall, and
+// a scenario that leaves no survivor with memory figures has no margin and is
+// skipped. The margin is unavailable when the guest list could not be read, an
+// online node or a guest on one has no positive memory figure, no node is
+// online, or no scenario has a margin.
+func EstimateHeadroomMargin(facts []NodeFacts, guests []HeadroomGuest, guestsUnknown bool) HeadroomMargin {
+	if guestsUnknown {
+		return HeadroomMargin{Unavailable: "the cluster's guests could not be read"}
+	}
+	var failing []string
+	for _, f := range facts {
+		if !f.Online {
+			continue
+		}
+		if f.TotalMemBytes <= 0 {
+			return HeadroomMargin{Unavailable: fmt.Sprintf("node %s has no total memory figure", f.Node)}
+		}
+		failing = append(failing, f.Node)
+	}
+	if len(failing) == 0 {
+		return HeadroomMargin{Unavailable: "the cluster has no online node"}
+	}
+	for _, g := range guests {
+		if g.MemBytes <= 0 && nodeOnline(facts, g.Node) {
+			return HeadroomMargin{Unavailable: fmt.Sprintf("guest %d on %s has no configured memory", g.VMID, g.Node)}
+		}
+	}
+	sort.Strings(failing)
+
+	var m HeadroomMargin
+	measured := false
+	for _, failed := range failing {
+		shortfall, short, free := packFailure(facts, guests, failed)
+		if short {
+			m.Shortfalls = append(m.Shortfalls, shortfall)
+			continue
+		}
+		var left, total int64
+		for _, f := range facts {
+			if f.Node == failed || !f.Online || f.InMaintenance {
+				continue
+			}
+			total += f.TotalMemBytes
+			left += max(free[f.Node], 0)
+		}
+		if total <= 0 {
+			continue
+		}
+		percent := int(left * 100 / total)
+		if !measured || percent < m.Percent {
+			m.Percent, m.TightestNode, measured = percent, failed, true
+		}
+	}
+	if !measured && len(m.Shortfalls) == 0 {
+		return HeadroomMargin{Unavailable: "no node loss leaves a surviving node to measure"}
+	}
+	return m
 }

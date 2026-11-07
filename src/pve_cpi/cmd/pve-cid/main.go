@@ -52,7 +52,19 @@
 //	    with no correlated template (kind unknown), or templates whose
 //	    backing file is gone — the "what is safe to delete" view.
 //
-// # Config resolution (locate, stemcells)
+//	pve-cid ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]
+//	    Online. The HA doctor. Probes the cluster even when pve.ha.mode is
+//	    off, then prints the HA profile (nodes, quorum, CPU migration
+//	    domains, N+1 memory headroom) and everything the CPI left that
+//	    needs an operator: rule and resource problems, local-disk VMs
+//	    running unprotected, replication state, stale tags, and objects that
+//	    outlive an off mode. --request applies the cpi_config properties of a
+//	    CPI request's context to the config first. --cpi-config reads a BOSH
+//	    cpi-config (JSON) and runs the same checks against every cpis entry,
+//	    then checks that clusters mounting one shared export do not overlap on
+//	    VMID bands or next-id ranges. It exits 1 when any problem is found.
+//
+// # Config resolution (locate, stemcells, ha)
 //
 // The online subcommands load the same cpi.json the pve_cpi job runs
 // against, resolved in this order: --config flag, then the PVE_CPI_CONFIG
@@ -116,6 +128,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runLocate(args[1:], stdout, stderr)
 	case "stemcells":
 		return runStemcells(args[1:], stdout, stderr)
+	case "ha":
+		return runHA(args[1:], stdout, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "pve-cid: unknown subcommand %q\n\n", args[0])
 		printUsage(stderr)
@@ -132,11 +146,12 @@ Usage:
   pve-cid locate <cid|volid> [--config PATH] [--json]
   pve-cid storage-plan --request PATH [--config PATH] [--json]
   pve-cid stemcells [--storage ID] [--node N] [--orphans] [--config PATH] [--json]
+  pve-cid ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]
   pve-cid version
   pve-cid help
 
-decode and encode are fully offline (no PVE API calls). locate and stemcells
-are read-only online commands: they load the CPI's cpi.json (--config flag,
+decode and encode are fully offline (no PVE API calls). locate, stemcells,
+and ha are read-only online commands: they load the CPI's cpi.json (--config flag,
 then $PVE_CPI_CONFIG, then /var/vcap/jobs/pve_cpi/config/cpi.json) and query
 the configured PVE cluster; pve-cid never mutates PVE.
 

@@ -212,15 +212,12 @@ func (r *pveReader) StorageIsShared(ctx context.Context, storage string) (shared
 	return false, false
 }
 
-// loadConfigAndReader resolves the CPI config path (configPath flag value,
+// loadConfigAndLogger resolves the CPI config path (configPath flag value,
 // falling back to $PVE_CPI_CONFIG, then defaultConfigPath), loads it via the
-// same config.LoadFile the cpi binary itself uses, and constructs a live
-// Reader against the configured PVE cluster reusing pve.NewClientWithTracer
-// — the identical client-construction path cmd/cpi/main.go uses, so
-// pve-cid's connection/auth/retry behavior matches the CPI exactly.
-//
-// stderr receives any client-init log output (transport warnings, etc.).
-func loadConfigAndReader(configPath string, stderr io.Writer) (*config.CPIConfig, Reader, error) {
+// same config.LoadFile the cpi binary itself uses, and builds the logger the
+// client reports through. It does not construct a client, so a caller that
+// applies per-request overrides to the config can do that first.
+func loadConfigAndLogger(configPath string, stderr io.Writer) (*config.CPIConfig, *log.Logger, error) {
 	if configPath == "" {
 		configPath = os.Getenv(envConfigPath)
 	}
@@ -237,14 +234,35 @@ func loadConfigAndReader(configPath string, stderr io.Writer) (*config.CPIConfig
 	if err != nil {
 		return nil, nil, fmt.Errorf("pve-cid: logger init failed: %w", err)
 	}
+	return cfg, logger, nil
+}
 
-	// Nil tracer: pve.NewClientWithTracer skips the tracing decorator layer
-	// entirely on nil (mirrors cmd/cpi/main.go's tracing-disabled path) — a
-	// read-only inspection tool has no reason to stand up an OTel pipeline.
+// newPVEClient constructs a live client against the cluster cfg names, reusing
+// pve.NewClientWithTracer, which is the client-construction path cmd/cpi/main.go
+// uses, so pve-cid's connection, auth, and retry behavior matches the CPI
+// exactly. The nil tracer makes pve.NewClientWithTracer skip the tracing
+// decorator layer entirely, as in the cpi binary's tracing-disabled path: a
+// read-only inspection tool has no reason to stand up an OTel pipeline.
+func newPVEClient(cfg *config.CPIConfig, logger *log.Logger) (pve.Client, error) {
 	client, err := pve.NewClientWithTracer(cfg, logger, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("pve-cid: pve client init failed: %w", err)
+		return nil, fmt.Errorf("pve-cid: pve client init failed: %w", err)
 	}
+	return client, nil
+}
 
+// loadConfigAndReader loads the config as loadConfigAndLogger does and
+// constructs a live Reader against the configured PVE cluster.
+//
+// stderr receives any client-init log output (transport warnings, etc.).
+func loadConfigAndReader(configPath string, stderr io.Writer) (*config.CPIConfig, Reader, error) {
+	cfg, logger, err := loadConfigAndLogger(configPath, stderr)
+	if err != nil {
+		return nil, nil, err
+	}
+	client, err := newPVEClient(cfg, logger)
+	if err != nil {
+		return nil, nil, err
+	}
 	return cfg, newPVEReader(client), nil
 }

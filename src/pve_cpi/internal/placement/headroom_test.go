@@ -573,3 +573,207 @@ func TestFilter_Headroom(t *testing.T) {
 		}
 	})
 }
+
+func TestEstimateHeadroomMargin_OkReportsSmallestMargin(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{hrNode("pve1", 32), hrNode("pve2", 32), hrNode("pve3", 32)}
+	all := []string{"pve1", "pve2", "pve3"}
+	guests := []placement.HeadroomGuest{
+		hrGuest(101, "pve1", 16, true, all...),
+		hrGuest(102, "pve2", 16, true, all...),
+		hrGuest(103, "pve3", 16, true, all...),
+	}
+	m := placement.EstimateHeadroomMargin(facts, guests, false)
+	if m.Short() || m.Unavailable != "" {
+		t.Fatalf("margin = %+v, want ok", m)
+	}
+	// Losing any node leaves 64 GiB on the survivors with 16 GiB free after the
+	// lost guest is placed, which is 25%.
+	if m.Percent != 25 || m.Summary() != "ok(25%)" {
+		t.Fatalf("margin = %d%% (%s), want 25%%", m.Percent, m.Summary())
+	}
+	if m.TightestNode != "pve1" {
+		t.Fatalf("tightest node = %q, want pve1 (ties go to the lowest name)", m.TightestNode)
+	}
+}
+
+func TestEstimateHeadroomMargin_TightestScenarioWins(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{hrNode("pve1", 64), hrNode("pve2", 32), hrNode("pve3", 32)}
+	all := []string{"pve1", "pve2", "pve3"}
+	guests := []placement.HeadroomGuest{
+		hrGuest(101, "pve1", 40, true, all...),
+		hrGuest(102, "pve2", 8, true, all...),
+		hrGuest(103, "pve3", 8, true, all...),
+	}
+	m := placement.EstimateHeadroomMargin(facts, guests, false)
+	// Losing pve1 moves the 40 GiB guest onto pve2 or pve3 (24 GiB free each) and
+	// does not fit, so that scenario is a shortfall.
+	if !m.Short() || m.Summary() != "short(pve1)" {
+		t.Fatalf("margin = %+v (%s), want short(pve1)", m, m.Summary())
+	}
+
+	guests[0] = hrGuest(101, "pve1", 20, true, all...)
+	m = placement.EstimateHeadroomMargin(facts, guests, false)
+	if m.Short() || m.Unavailable != "" {
+		t.Fatalf("margin = %+v, want ok", m)
+	}
+	// pve1 lost: survivors pve2+pve3 hold 64 GiB, used 8+8+20, so 28/64 is 43%.
+	// pve2 lost: survivors hold 96 GiB, used 20+8+8, so 60/96 is 62%. pve3 lost
+	// gives the same 62%. The smallest is 43%.
+	if m.Percent != 43 || m.TightestNode != "pve1" {
+		t.Fatalf("margin = %d%% on %q, want 43%% on pve1", m.Percent, m.TightestNode)
+	}
+}
+
+func TestEstimateHeadroomMargin_RoundsDown(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{hrNode("pve1", 30), hrNode("pve2", 30), hrNode("pve3", 30)}
+	guests := []placement.HeadroomGuest{hrGuest(101, "pve1", 10, true, "pve1", "pve2", "pve3")}
+	m := placement.EstimateHeadroomMargin(facts, guests, false)
+	// Every scenario leaves 50 of 60 GiB free, which is 83.33%.
+	if m.Percent != 83 {
+		t.Fatalf("margin = %d%%, want 83%% (rounded down)", m.Percent)
+	}
+}
+
+func TestEstimateHeadroomMargin_ShortNamesEveryFailingNode(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{hrNode("pve1", 32), hrNode("pve2", 32), hrNode("pve3", 32)}
+	all := []string{"pve1", "pve2", "pve3"}
+	guests := []placement.HeadroomGuest{
+		hrGuest(101, "pve1", 24, true, all...),
+		hrGuest(102, "pve2", 24, true, all...),
+		hrGuest(103, "pve3", 24, true, all...),
+	}
+	m := placement.EstimateHeadroomMargin(facts, guests, false)
+	if !m.Short() || len(m.Shortfalls) != 3 {
+		t.Fatalf("margin = %+v, want three shortfalls", m)
+	}
+	if got := m.Summary(); got != "short(pve1+2)" {
+		t.Fatalf("summary = %q, want short(pve1+2)", got)
+	}
+	if m.Shortfalls[0].FailedNode != "pve1" || m.Shortfalls[0].VMID != 101 {
+		t.Fatalf("first shortfall = %+v", m.Shortfalls[0])
+	}
+}
+
+func TestEstimateHeadroomMargin_PinnedGuestOnlyFitsItsSet(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{hrNode("pve1", 32), hrNode("pve2", 32), hrNode("pve3", 32)}
+	guests := []placement.HeadroomGuest{
+		hrGuest(101, "pve1", 16, true, "pve1"),
+		hrGuest(102, "pve2", 4, true, "pve2", "pve3"),
+	}
+	m := placement.EstimateHeadroomMargin(facts, guests, false)
+	// Guest 101 is pinned to pve1 alone, so losing pve1 leaves it no survivor.
+	if !m.Short() || m.Summary() != "short(pve1)" {
+		t.Fatalf("margin = %+v (%s), want short(pve1)", m, m.Summary())
+	}
+}
+
+func TestEstimateHeadroomMargin_NonHAGuestsOccupyButDoNotMove(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{hrNode("pve1", 32), hrNode("pve2", 32)}
+	guests := []placement.HeadroomGuest{
+		hrGuest(101, "pve1", 8, false),
+		hrGuest(102, "pve2", 16, false),
+	}
+	m := placement.EstimateHeadroomMargin(facts, guests, false)
+	// Losing pve1 leaves pve2 with 16 of 32 GiB free, which is 50%. Losing pve2
+	// leaves pve1 with 24 of 32 GiB free, which is 75%. Nothing is HA, so
+	// nothing moves.
+	if m.Short() || m.Percent != 50 || m.TightestNode != "pve1" {
+		t.Fatalf("margin = %+v, want ok(50%%) on pve1", m)
+	}
+}
+
+func TestEstimateHeadroomMargin_MaintenanceAndOfflineNodesAreNotSurvivors(t *testing.T) {
+	t.Parallel()
+	maint := hrNode("pve2", 32)
+	maint.InMaintenance = true
+	off := hrNode("pve3", 32)
+	off.Online = false
+	facts := []placement.NodeFacts{hrNode("pve1", 32), maint, off, hrNode("pve4", 32)}
+	guests := []placement.HeadroomGuest{hrGuest(101, "pve1", 8, true, "pve1", "pve2", "pve3", "pve4")}
+	m := placement.EstimateHeadroomMargin(facts, guests, false)
+	// Losing pve1 can only move the guest to pve4, leaving 24 of 32 GiB, which
+	// is 75%. Losing pve2 leaves pve1 and pve4 with 56 of 64 GiB, 87%. Losing
+	// pve4 leaves pve1 alone with 24 of 32 GiB, 75%.
+	if m.Short() || m.Percent != 75 {
+		t.Fatalf("margin = %+v, want ok(75%%)", m)
+	}
+}
+
+func TestEstimateHeadroomMargin_Unavailable(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{hrNode("pve1", 32), hrNode("pve2", 32)}
+	offline := hrNode("pve2", 32)
+	offline.Online = false
+	cases := []struct {
+		name          string
+		facts         []placement.NodeFacts
+		guests        []placement.HeadroomGuest
+		guestsUnknown bool
+		wantContains  string
+	}{
+		{"guest list unreadable", facts, nil, true, "guests could not be read"},
+		{"online guest without memory", facts, []placement.HeadroomGuest{hrGuest(101, "pve1", 0, true, "pve1")}, false,
+			"guest 101 on pve1 has no configured memory"},
+		{"node without total memory", []placement.NodeFacts{{Node: "pve1", Online: true}, hrNode("pve2", 32)}, nil, false,
+			"node pve1 has no total memory"},
+		{"no online node", []placement.NodeFacts{{Node: "pve1", TotalMemBytes: 32 * gib}}, nil, false, "no online node"},
+		{"single node leaves no survivor", []placement.NodeFacts{hrNode("pve1", 32), offline}, nil, false,
+			"no node loss leaves a surviving node"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			m := placement.EstimateHeadroomMargin(tc.facts, tc.guests, tc.guestsUnknown)
+			if m.Unavailable == "" || !strings.Contains(m.Unavailable, tc.wantContains) {
+				t.Fatalf("unavailable = %q, want it to contain %q", m.Unavailable, tc.wantContains)
+			}
+			if m.Short() || m.Summary() != "unavailable" {
+				t.Fatalf("summary = %q (short=%v), want unavailable", m.Summary(), m.Short())
+			}
+		})
+	}
+}
+
+func TestEstimateHeadroomMargin_OfflineGuestWithoutMemoryIsIgnored(t *testing.T) {
+	t.Parallel()
+	down := hrNode("pve3", 32)
+	down.Online = false
+	facts := []placement.NodeFacts{hrNode("pve1", 32), hrNode("pve2", 32), down}
+	guests := []placement.HeadroomGuest{{VMID: 301, Node: "pve3", MemBytes: 0, HA: true, Admissible: []string{"pve1"}}}
+	m := placement.EstimateHeadroomMargin(facts, guests, false)
+	if m.Unavailable != "" || m.Short() || m.Percent != 100 {
+		t.Fatalf("margin = %+v, want ok(100%%)", m)
+	}
+}
+
+func TestEstimateHeadroomMargin_NegativeFreeCountsAsZero(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{hrNode("pve1", 32), hrNode("pve2", 16), hrNode("pve3", 32)}
+	guests := []placement.HeadroomGuest{hrGuest(102, "pve2", 24, false)}
+	m := placement.EstimateHeadroomMargin(facts, guests, false)
+	// Losing pve1 leaves pve2 oversubscribed by 8 GiB, which counts as zero, and
+	// pve3 with 32, so 32 of 48 GiB is 66%.
+	if m.Short() || m.Percent != 66 {
+		t.Fatalf("margin = %+v, want ok(66%%)", m)
+	}
+}
+
+func TestEstimateHeadroomUnchangedByMargin(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{hrNode("pve1", 32), hrNode("pve2", 32), hrNode("pve3", 32)}
+	all := []string{"pve1", "pve2", "pve3"}
+	guests := []placement.HeadroomGuest{
+		hrGuest(101, "pve1", 24, true, all...),
+		hrGuest(102, "pve2", 24, true, all...),
+	}
+	got := placement.EstimateHeadroom(facts, placement.HeadroomCheck{Guests: guests, VM: hrVM(103, 24, all...)}, "pve3")
+	if len(got.Shortfalls) != 3 || got.Shortfalls[0].FailedNode != "pve1" {
+		t.Fatalf("EstimateHeadroom = %+v, want three shortfalls led by pve1", got)
+	}
+}
