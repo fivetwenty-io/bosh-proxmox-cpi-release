@@ -284,9 +284,16 @@ func resumeRunsDetachTail(op string) bool {
 // from both functions. A caller that genuinely wants the job-level node sets
 // the field back on the result, and handleAlreadyDetachedParked is the one that
 // does.
+//
+// It also carries the parker selection rule (parkerAdmitFor), so every park,
+// transfer, and resumed transfer keeps a disk out of a parker that PVE HA
+// manages unless the disk's storage reaches every node HA may move that
+// parker to. A read path never attaches a disk, so the read builder leaves
+// the rule unset.
 func parkerWriteConfigFor(deps Deps) pve.ParkerConfig {
 	cfg := parkerReadConfigFor(deps)
 	cfg.DiskStorage = deps.Config.DiskStorage
 	cfg.FallbackNode = ""
+	cfg.Admit = parkerAdmitFor(deps)
 	return cfg
 }

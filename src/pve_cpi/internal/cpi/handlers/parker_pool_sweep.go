@@ -56,7 +56,8 @@ func init() {
 // a funnel cannot tell which of the two it was handed, so it happens here once
 // on behalf of every one of them.
 //
-// The same pass deletes the per-disk transfer locks whose claims have expired
+// The same pass runs the parker HA pass of the node (reconcileParkerHA), and
+// it deletes the per-disk transfer locks whose claims have expired
 // (sweepExpiredDiskLocks), so a disk that never transfers again doesn't keep
 // the sentinel a crashed transfer left.
 func sweepParkerPool(ctx context.Context, deps Deps, node string, cfg pve.ParkerConfig) {
@@ -69,6 +70,11 @@ func sweepParkerPool(ctx context.Context, deps Deps, node string, cfg pve.Parker
 			log.Err(err),
 		)
 	}
+	// The parker HA pass registers the node's parkers that hold disks and
+	// retires the registered ones that hold none (parker_ha.go). It runs on
+	// the caller's deps, because it unwraps the guard itself and needs the
+	// request's Director and config.
+	reconcileParkerHA(ctx, deps, node, cfg)
 	sweepExpiredDiskLocks(ctx, client, logger)
 }
 

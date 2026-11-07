@@ -150,8 +150,8 @@ type ParkerConfig struct {
 	// (resolveDiskHolder) or before the unpark detach runs (unparkAtLocked),
 	// strict refuses with a Cloud error naming the vanished parker and the
 	// recovery, instead of silently treating the volume as free-floating.
-	// A parker is durable infrastructure the CPI never deletes, so a vanished
-	// one means an out-of-band deletion. Gated on ParkedEnabled: under "free"
+	// The CPI destroys a parker only after its last disk left it, so a parker
+	// that vanishes while it still holds a disk means an out-of-band deletion. Gated on ParkedEnabled: under "free"
 	// or a stood-down default the permissive behavior stands regardless.
 	AnchorStrict bool
 	// EmptyListingCorroborators supplies the second opinions the keep rule
@@ -163,6 +163,18 @@ type ParkerConfig struct {
 	// empty listing as an absence and keeps the record. A listing that carries
 	// other volumes still proves an absence without one.
 	EmptyListingCorroborators func() []EmptyListingCorroborator
+	// Admit is the parker selection rule. A park, a transfer, and a resumed
+	// transfer call it inside the parker's protection window, before they
+	// write anything to the parker, with the node the parker is on, the
+	// parker's VMID, and the storage-qualified volume of the disk. It answers
+	// false when this parker must not take the disk, which is when the parker
+	// is registered with PVE HA and the disk's storage does not reach every
+	// node HA may recover the parker onto. The selection loops then move on to
+	// the next parker, or create one. An error means the answer is unknown,
+	// such as a failed read, and the park fails with it and writes nothing.
+	// Nil admits every disk, which is what every caller that never sets it
+	// had before.
+	Admit func(ctx context.Context, node string, parkerVMID int, bareVolid string) (bool, error)
 }
 
 // ---------------------------------------------------------------------------
@@ -1684,12 +1696,31 @@ type diskHolder struct {
 // of the same answer, so ParkDisk resolves the holder once and reads both from
 // it rather than paying for the sweep twice on every detach.
 func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVolid string, cfg ParkerConfig) (diskHolder, error) {
+	return resolveDiskHolderScan(ctx, c, logger, bareVolid, cfg, nil)
+}
+
+// vanishedParker names an in-band holder whose config vanished between the
+// holder scan and its config read.
+type vanishedParker struct {
+	vmid int
+	node string
+}
+
+// resolveDiskHolderScan is resolveDiskHolder. vanished is nil on the first
+// scan, and it names the gone holder on the one scan that follows a holder
+// whose config vanished.
+func resolveDiskHolderScan(
+	ctx context.Context, c Client, logger *log.Logger, bareVolid string, cfg ParkerConfig, vanished *vanishedParker,
+) (diskHolder, error) {
 	hit, found, err := findVMByDiskVolidHit(ctx, c, bareVolid)
 	if err != nil {
 		return diskHolder{}, err
 	}
 	refs := hit.StorageReferences
 	if !found {
+		if vanished != nil {
+			return vanishedHolderAnswer(cfg, *vanished, bareVolid, refs)
+		}
 		return diskHolder{storageReferences: refs}, nil
 	}
 	holderVMID, holderNode, holderTags := hit.VMID, hit.Node, hit.Tags
@@ -1708,22 +1739,21 @@ func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 		if parkerConfigGone(cfgErr) {
 			// Holder vanished between the scan and the read. The cluster
 			// listing said a VM inside the parker band references the volume,
-			// and now that VM has no config: the CPI never deletes parkers, so
-			// under the strict invariant this is an out-of-band deletion, not
-			// a benign race, and proceeding as free-floating would run against
-			// a volume whose anchor vanished.
-			if cfg.AnchorStrict && cfg.ParkedEnabled {
-				return diskHolder{}, cpierrors.Cloud(
-					"disk holder vmid %d (node %s) sits inside the parker band [%d,%d] but its config "+
-						"vanished mid-scan; a parker VM holding %s was likely deleted out-of-band. Verify the "+
-						"volume is intact, then set pve.parked_anchor_strict: false to treat it as "+
-						"free-floating and retry",
-					holderVMID, holderNode, cfg.VMIDRangeStart, cfg.VMIDRangeEnd, bareVolid,
-				)
+			// and now that VM has no config. The CPI destroys a parker only
+			// after its last disk left it, so one benign race remains: the
+			// disk moved to a VM and the empty parker was retired between the
+			// scan and the read. One more scan finds the disk where it went,
+			// and a scan that finds it nowhere, or on a vanished holder again,
+			// gets the answer the strict invariant gives.
+			gone := vanishedParker{vmid: holderVMID, node: holderNode}
+			if vanished == nil {
+				if logger != nil {
+					logger.Info("the parker the holder scan named is gone; scanning once more for the disk's holder",
+						log.Int("vmid", holderVMID), log.String("node", holderNode), log.String("volid", bareVolid))
+				}
+				return resolveDiskHolderScan(ctx, c, logger, bareVolid, cfg, &gone)
 			}
-			// Permissive: the disk is free-floating as far as this call is
-			// concerned.
-			return diskHolder{storageReferences: refs}, nil
+			return vanishedHolderAnswer(cfg, gone, bareVolid, refs)
 		}
 		// WrapError keeps a 403 permanent: it names a grant to add, and no
 		// number of retries adds it.
@@ -1759,6 +1789,27 @@ func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 		found: true, vmid: holderVMID, node: holderNode, isParker: true, slot: slot, tags: tagsRaw,
 		storageReferences: refs,
 	}, nil
+}
+
+// vanishedHolderAnswer answers for a disk whose in-band holder vanished and
+// that no later scan found on a live holder. Under the strict invariant that
+// means a parker went while it still held the disk, which is an out-of-band
+// deletion, not a benign race, and proceeding as free-floating would run
+// against a volume whose anchor vanished. Otherwise the disk is free-floating
+// as far as this call is concerned.
+func vanishedHolderAnswer(
+	cfg ParkerConfig, gone vanishedParker, bareVolid string, refs StorageReferenceCounts,
+) (diskHolder, error) {
+	if cfg.AnchorStrict && cfg.ParkedEnabled {
+		return diskHolder{}, cpierrors.Cloud(
+			"disk holder vmid %d (node %s) sits inside the parker band [%d,%d] but its config "+
+				"vanished mid-scan; a parker VM holding %s was likely deleted out-of-band. Verify the "+
+				"volume is intact, then set pve.parked_anchor_strict: false to treat it as "+
+				"free-floating and retry",
+			gone.vmid, gone.node, cfg.VMIDRangeStart, cfg.VMIDRangeEnd, bareVolid,
+		)
+	}
+	return diskHolder{storageReferences: refs}, nil
 }
 
 // IsDiskParked reports whether bareVolid is currently held on a parker VM.
@@ -2010,27 +2061,28 @@ func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bar
 		return cpierrors.Wrap(listErr, "ParkDisk: list parkers")
 	}
 
-	// No parker exists yet → create the first one and attach there.
+	// No parker exists yet → create the first one and try it like any other.
+	// EnsureParker may adopt a parker that already exists, and the selection
+	// rule may refuse that one, which falls through to a fresh parker below.
 	if len(parkers) == 0 {
 		parkerVMID, ensureErr := EnsureParker(ctx, c, logger, node, cfg)
 		if ensureErr != nil {
 			return cpierrors.Wrap(ensureErr, "ParkDisk: ensure parker")
 		}
-		if attachErr := attachAndSecure(ctx, c, logger, node, parkerVMID, bareVolid, cfg, pctx); attachErr != nil {
-			return cpierrors.Wrap(attachErr, "ParkDisk: attach to parker")
-		}
-		return nil
+		parkers = []int{parkerVMID}
 	}
 
 	// Try existing parkers in ascending VMID order. Attach to the first one
-	// with a free slot. ErrNoSlots on a parker means it is full — move to the
-	// next. Any other error is a real failure and propagates.
+	// with a free slot that the selection rule admits. ErrNoSlots on a parker
+	// means it is full, and ErrParkerNotAdmitted means the disk's storage does
+	// not cover where HA may move it — either way, move to the next. Any other
+	// error is a real failure and propagates.
 	for _, parkerVMID := range parkers {
 		attachErr := attachAndSecure(ctx, c, logger, node, parkerVMID, bareVolid, cfg, pctx)
 		if attachErr == nil {
 			return nil
 		}
-		if isParkerCapacityError(attachErr) {
+		if isParkerSkipError(attachErr) {
 			continue
 		}
 		return cpierrors.Wrap(attachErr, "ParkDisk: attach to parker")
@@ -2054,7 +2106,7 @@ func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bar
 		if attachErr == nil {
 			return nil
 		}
-		if !isParkerCapacityError(attachErr) {
+		if !isParkerSkipError(attachErr) {
 			return cpierrors.Wrap(attachErr, "ParkDisk: attach to fresh parker")
 		}
 		if logger != nil {
@@ -2103,6 +2155,40 @@ func isParkerCapacityError(err error) bool {
 	return errors.Is(err, ErrNoSlots) || errors.Is(err, ErrProvenanceFull)
 }
 
+// ErrParkerNotAdmitted means the parker selection rule (ParkerConfig.Admit)
+// refused this parker for the disk. The refusal comes before anything is
+// written to the parker, so the selection loops treat it like a full parker
+// and try the next one.
+var ErrParkerNotAdmitted = errors.New("the parker selection rule refuses this parker for the disk")
+
+// isParkerSkipError reports whether the park loops should move on from this
+// parker to the next one: it is full, or the selection rule refused it.
+func isParkerSkipError(err error) bool {
+	return isParkerCapacityError(err) || errors.Is(err, ErrParkerNotAdmitted)
+}
+
+// admitIntoParker applies the parker selection rule of cfg to one parker. It
+// returns nil when the parker may take the disk, an error wrapping
+// ErrParkerNotAdmitted when it may not, and the rule's own error, which keeps
+// its type, when the rule could not answer. Callers run it inside the
+// parker's protection window, so a registration of the parker, which holds
+// the same lock, cannot land between the answer and the write it allows.
+func admitIntoParker(ctx context.Context, cfg ParkerConfig, node string, parkerVMID int, bareVolid string) error {
+	if cfg.Admit == nil {
+		return nil
+	}
+	ok, err := cfg.Admit(ctx, node, parkerVMID, bareVolid)
+	if err != nil {
+		return cpierrors.Wrap(err, fmt.Sprintf("parker selection: check whether parker vmid %d on node %s may take %s",
+			parkerVMID, node, bareVolid))
+	}
+	if !ok {
+		return fmt.Errorf("%w: parker vmid %d on node %s may not take %s", ErrParkerNotAdmitted, parkerVMID, node,
+			bareVolid)
+	}
+	return nil
+}
+
 // attachAndSecure performs one park onto a known parker with that parker's
 // protection window held: attach, put protection back, record provenance.
 //
@@ -2123,6 +2209,9 @@ func attachAndSecure(ctx context.Context, c Client, logger *log.Logger, node str
 
 	var landedSlot string
 	if lockErr := withParkerProtectionLock(ctx, c, logger, parkerVMID, "park", func(wctx context.Context) error {
+		if admitErr := admitIntoParker(wctx, cfg, node, parkerVMID, bareVolid); admitErr != nil {
+			return admitErr
+		}
 		slot, attachErr := attachToParkerLocked(wctx, c, logger, node, parkerVMID, bareVolid, pctx.StableID)
 		if attachErr != nil {
 			return attachErr

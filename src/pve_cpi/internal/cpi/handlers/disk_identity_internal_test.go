@@ -80,6 +80,10 @@ type idFakeClient struct {
 	// shows, the way a stale index row still shows the tags of the VM a
 	// reused VMID held before. The config keeps its own tags.
 	rowTags map[int]string
+	// ha, when set, serves the HA resources and rules, so the parker
+	// selection rule sees registered parkers. Without it PVE HA manages no
+	// guest and lists no rule.
+	ha *phCluster
 }
 
 // idDescWrite is one recorded description write: which VM, and the full
@@ -328,6 +332,26 @@ func (n *idFakeNodes) CreateQemuMoveDisk(_ context.Context, _ string, vmidStr st
 type idFakeCluster struct {
 	sdkcluster.Service
 	c *idFakeClient
+}
+
+// GetHaResources serves the HA resources of ha, or reports that PVE HA
+// manages no guest, so the parker selection rule admits every disk into these
+// parkers.
+func (cl *idFakeCluster) GetHaResources(ctx context.Context, sid string) (*sdkcluster.GetHaResourcesResponse, error) {
+	if cl.c.ha != nil {
+		return cl.c.ha.GetHaResources(ctx, sid)
+	}
+	return nil, fmt.Errorf("no such resource '%s'", sid)
+}
+
+// ListHaRules serves the rules of ha, or none.
+func (cl *idFakeCluster) ListHaRules(
+	ctx context.Context, p *sdkcluster.ListHaRulesParams,
+) (*sdkcluster.ListHaRulesResponse, error) {
+	if cl.c.ha != nil {
+		return cl.c.ha.ListHaRules(ctx, p)
+	}
+	return &sdkcluster.ListHaRulesResponse{}, nil
 }
 
 // ListConfigNodes reports the single test node "pve1" so

@@ -864,7 +864,7 @@ func transferAcrossParkers(
 		if err == nil {
 			return landed, nil
 		}
-		if isParkerCapacityError(err) {
+		if isParkerSkipError(err) {
 			continue
 		}
 		return "", cpierrors.Wrap(err, "TransferDiskToParker: transfer to parker")
@@ -878,7 +878,7 @@ func transferAcrossParkers(
 		if err == nil {
 			return landed, nil
 		}
-		if !isParkerCapacityError(err) {
+		if !isParkerSkipError(err) {
 			return "", cpierrors.Wrap(err, "TransferDiskToParker: transfer to fresh parker")
 		}
 	}
@@ -1155,6 +1155,11 @@ func transferIntoParkerLocked(
 	// is done without writing anything.
 	if parkedSlot, parkedVolid, parked := parkerSlotCarryingSerial(parkerCfg, pctx.StableID); parked {
 		return finishAlreadyParked(ctx, c, logger, node, node, parkerVMID, srcVMID, bareVolid, parkedSlot, parkedVolid, parkerCfg, cfg, pctx)
+	}
+	// The selection rule answers before the intent record or the move, so a
+	// parker it refuses carries nothing of this disk and the loop moves on.
+	if admitErr := admitIntoParker(ctx, cfg, node, parkerVMID, bareVolid); admitErr != nil {
+		return "", admitErr
 	}
 	// The source is read before anything is written, so a transfer whose disk
 	// has already left the source writes no intent at all. Both views count,
@@ -1867,6 +1872,19 @@ func resumeMoveWindow(
 	}
 	if proofErr := proveSourceNamesDisk(ctx, c, intent, stableID, srcVMID, srcViews); proofErr != nil {
 		return "", true, proofErr
+	}
+	// The move is the first write of this window, and the record fixes the
+	// parker it lands on. A parker the selection rule now refuses, such as a
+	// parker HA may recover onto a node the disk's storage does not reach,
+	// takes nothing, and the resume defers rather than land the disk there.
+	if admitErr := admitIntoParker(ctx, cfg, intent.ParkerNode, intent.ParkerVMID, intent.Volid); admitErr != nil {
+		if errors.Is(admitErr, ErrParkerNotAdmitted) {
+			return "", true, cpierrors.WrapAs(admitErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+				"transfer resume: the record of disk %s names parker vmid %d, which the parker selection rule "+
+					"refuses for %s; the disk stays on source vm %d until the parker may take it", stableID,
+				intent.ParkerVMID, intent.Volid, srcVMID))
+		}
+		return "", true, admitErr
 	}
 	// The proof read srcViews, but the pending delete that resumeSourceOffBus
 	// applies isn't pinned to that read. DeleteDriveSlot takes a digest, but on a

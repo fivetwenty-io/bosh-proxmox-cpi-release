@@ -165,6 +165,13 @@ func (q managedDiskTestQEMU) Config(_ context.Context, _ string, vmid int) (map[
 	}
 	return cloned, nil
 }
+
+// GetHaResources reports that PVE HA manages no guest, so the parker
+// selection rule admits every disk into the fake's parkers.
+func (c managedDiskTestCluster) GetHaResources(_ context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {
+	return nil, fmt.Errorf("no such resource '%s'", sid)
+}
+
 func (c managedDiskTestCluster) ListResources(context.Context, *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
 	r := make(cluster.ListResourcesResponse, 0, len(c.state.configs))
 	for vmid, vm := range c.state.configs {
