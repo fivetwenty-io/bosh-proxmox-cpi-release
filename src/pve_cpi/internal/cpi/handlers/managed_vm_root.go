@@ -9,7 +9,10 @@ import (
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
-const storageMechanismFullClone = "full_clone"
+const (
+	storageMechanismFullClone   = "full_clone"
+	storageMechanismLinkedClone = "linked_clone"
+)
 
 // createManagedVMRoot consumes the frozen mechanism and source. The supplied
 // client must be guarded; it never retries, reselects a source, or cleans up.
@@ -40,7 +43,7 @@ func createManagedVMRoot(ctx context.Context, deps Deps, parsed *createVMParsedA
 		if _, err = managedMutationUPID(upid); err != nil {
 			return err
 		}
-	case storageMechanismFullClone, "linked_clone":
+	case storageMechanismFullClone, storageMechanismLinkedClone:
 		if err := cloneManagedVMRoot(ctx, deps, shape, target, vmid, name, marker); err != nil {
 			return err
 		}

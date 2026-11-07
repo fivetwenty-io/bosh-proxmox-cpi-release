@@ -109,9 +109,14 @@ type StoragePlanRequest struct {
 	// Group identifies the instance group this allocation belongs to, already
 	// sanitized for use as a tag value. It is empty when the request carries no
 	// instance group, which is the common create-env shape.
-	Group        string
-	SearchBudget int
-	Clock        func() time.Time
+	Group string
+	// HoldsLocalRoot reports whether a root on the named storage would run under
+	// PVE HA on node-local storage, where a linked clone cannot follow the VM.
+	// The plan clones such a root in full, unless clone_mode is linked. A nil
+	// function means no root needs it.
+	HoldsLocalRoot func(storageID string) bool `json:"-"`
+	SearchBudget   int
+	Clock          func() time.Time
 }
 
 // StoragePlanTarget freezes one role's physical destination and virtual size.
@@ -514,6 +519,12 @@ func (i *StoragePlanIterator) rankRootSources(candidates []StorageRootSource, id
 	})
 }
 
+// holdsLocalRoot reports whether a root on storage id would run under PVE HA on
+// node-local storage, which is the case that takes a full clone.
+func (i *StoragePlanIterator) holdsLocalRoot(id string) bool {
+	return i.req.HoldsLocalRoot != nil && i.req.HoldsLocalRoot(id)
+}
+
 func (i *StoragePlanIterator) sourceFor(node, id string) (*StorageRootSource, string, error) {
 	target, _ := i.req.Inventory.Definition(id)
 	var candidates []StorageRootSource
@@ -559,8 +570,8 @@ func (i *StoragePlanIterator) sourceFor(node, id string) (*StorageRootSource, st
 			continue
 		}
 		mode := storageMechanismFullClone
-		if linked && i.req.CloneMode != "full" {
-			mode = "linked_clone"
+		if linked && i.req.CloneMode != "full" && (i.req.CloneMode == "linked" || !i.holdsLocalRoot(id)) {
+			mode = storageMechanismLinkedClone
 		}
 		cloned := s
 		return &cloned, mode, nil

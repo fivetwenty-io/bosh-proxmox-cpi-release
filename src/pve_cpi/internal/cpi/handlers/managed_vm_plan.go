@@ -209,6 +209,9 @@ func observeManagedVMPlan(ctx context.Context, deps Deps, parsed *createVMParsed
 		return observed, err
 	}
 	request.OnCandidateRejected = deps.storageCandidateRejectionObserver(ctx, selection)
+	// The plan clones in full the root that HA would hold on node-local storage.
+	// The answer is read here, ahead of the ranking, which runs under the lock.
+	request.HoldsLocalRoot = haLocalRootPredicate(ctx, deps)
 	observed.request = request
 	return observed, nil
 }
@@ -226,6 +229,14 @@ func rankManagedVMPlan(ctx context.Context, deps Deps, parsed *createVMParsedArg
 	plan, err := iterator.Next(ctx)
 	if err != nil {
 		return err
+	}
+	// Refuse a linked root that managed HA cannot protect before anything is
+	// journaled or cloned. Only clone_mode=linked reaches this, because the
+	// plan forces every other root on such storage to a full clone.
+	if root, ok := managedVMRoleTarget(plan, storageRoleRoot); ok {
+		if err := managedLinkedRootRefusal(deps, observed.request.HoldsLocalRoot, root, false); err != nil {
+			return err
+		}
 	}
 	// A root that falls back to a full clone under storage-set replicas
 	// means the placed member has no cache template of its own. Say so on

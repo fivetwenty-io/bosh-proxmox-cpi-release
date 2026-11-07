@@ -203,6 +203,17 @@ func continueManagedVM(ctx context.Context, deps Deps, parsed *createVMParsedArg
 		}
 	}
 
+	if observed == nil {
+		// The root is not created yet, so a recorded plan that clones it linked
+		// on storage managed HA cannot protect is refused before the clone.
+		if root, ok := managedVMRoleTarget(plan, storageRoleRoot); ok {
+			holds := haLocalRootPredicate(ctx, deps)
+			if err := managedLinkedRootRefusal(deps, holds, root, true); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	shape, err := plan.VMExecution.shape(deps.Config)
 	if err != nil {
 		return nil, cpierrors.Cloud("%s", err.Error())

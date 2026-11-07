@@ -157,9 +157,11 @@ properties:
       VM in place and never moves it, and a local persistent disk that arrives
       on an HA-managed VM keeps the VM in HA with that pin. A VM that HA would
       manage on node-local storage gets a full clone of the stemcell template,
-      because a linked clone's base template stays on one node. An explicit
-      clone_mode of "linked" keeps the linked clone and runs the VM without HA
-      in auto mode, and fails create_vm in managed mode. "replicate" is not
+      including when a storage plan places the root disk, because a linked
+      clone's base template stays on one node. An explicit clone_mode of
+      "linked" keeps the linked clone and runs the VM without HA in auto mode,
+      and fails create_vm in managed mode, as does a recorded storage plan that
+      already chose a linked clone there. "replicate" is not
       available in this build, and setting it is rejected when the
       configuration loads.
   pve.ha.anti_affinity:
