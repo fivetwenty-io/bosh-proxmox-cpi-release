@@ -210,7 +210,7 @@ func (h *Handle) CompleteAttempt(v AttemptVerification) error {
 	r.Verifications = append(r.Verifications, v.Verification)
 	r.State = ReconciliationRequired
 	r.Reason = "attempt verified absent; a new audited plan is required"
-	return h.saveLocked(r, true)
+	return h.saveLocked(r, saveAttemptTransition)
 }
 
 // BeginAttempt atomically freezes a new plan after fresh complete external
@@ -241,7 +241,7 @@ func (h *Handle) BeginAttempt(p AttemptPlan, v AttemptVerification) error {
 	r.Verifications = append(r.Verifications, v.Verification)
 	r.State = Planned
 	r.Reason = ""
-	return h.saveLocked(r, true)
+	return h.saveLocked(r, saveAttemptTransition)
 }
 
 // Only the explicit transition methods may invoke this validator; Save retains

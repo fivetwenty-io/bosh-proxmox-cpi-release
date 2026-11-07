@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -98,6 +99,16 @@ type StorageAllocationAudit struct {
 	holders map[string][]StorageAllocationEvidence
 	// stores holds the storage definitions the audit read.
 	stores map[string]pve.StorageInfo
+	// replicas maps each node-local volume a live replicated VM record names
+	// to the nodes where its replication keeps a copy, so a copy there is
+	// the record's volume rather than one outside its targets.
+	replicas storageAuditReplicaIndex
+	// replication is the read of PVE's replication jobs, taken only when a
+	// replicated move needs it.
+	replication *storageAuditReplicationRead
+	// deferred holds the issues of moves that a failed replication read left
+	// undecided. A gate that refuses on nothing else defers.
+	deferred map[string]bool
 }
 
 // storageAuditClaim is what one VM's configuration says about a volume it
@@ -560,6 +571,14 @@ func auditStorageAllocationRecords(ctx context.Context, deps Deps, records []aj.
 		markVMScanIncomplete(&result, "cluster-wide VM and storage audit visibility is unproven: "+pve.DescribeAuditError(err))
 	}
 	byID, historical, knownVolumes := storageAuditRecordIndex(records)
+	replicas, replicaListings := storageAuditReplicaIndexFor(records)
+	result.replicas = replicas
+	for storage, nodes := range replicaListings {
+		if historical[storage] == nil {
+			historical[storage] = map[string]bool{}
+		}
+		maps.Copy(historical[storage], nodes)
+	}
 	// The storage definitions come first, because deciding whether a VM's
 	// drive holds a record's volume needs to know whether the storage is
 	// shared.
@@ -1237,7 +1256,7 @@ func storageAuditTargets(ctx context.Context, deps Deps, nodes []string, histori
 // neither evidence of that record nor a disagreement with its targets. A
 // volume under a name the record has given up (storageAuditNameGivenUp) is a
 // reused name too.
-func storageAuditKnownVolume(target storageAuditTarget, stores map[string]pve.StorageInfo, records []aj.Record, claims []storageAuditClaim, volume string) ([]StorageAllocationEvidence, []string, map[string]bool) {
+func storageAuditKnownVolume(target storageAuditTarget, stores map[string]pve.StorageInfo, replicas storageAuditReplicaIndex, records []aj.Record, claims []storageAuditClaim, volume string) ([]StorageAllocationEvidence, []string, map[string]bool) {
 	var observations []StorageAllocationEvidence
 	var issues []string
 	seen := map[string]bool{}
@@ -1251,7 +1270,7 @@ func storageAuditKnownVolume(target storageAuditTarget, stores map[string]pve.St
 		var miss storageAuditMiss
 		for stepIndex := range record.Steps {
 			step := record.Steps[stepIndex]
-			match, reason := storageAuditVolumeTargetMatches(record, step, stores, target.node, volume)
+			match, reason := storageAuditReplicaTargetMatches(record, step, stores, replicas, target.node, volume)
 			matched = matched || match
 			if !match {
 				miss.consider(step, reason)
@@ -1272,7 +1291,7 @@ func storageAuditKnownVolume(target storageAuditTarget, stores map[string]pve.St
 // storageAuditContent lists one storage on one node. Beside the evidence and
 // issues, it returns every volid the listing held, or nil when the listing
 // failed or held a malformed entry and so proves nothing about its content.
-func storageAuditContent(ctx context.Context, deps Deps, target storageAuditTarget, stores map[string]pve.StorageInfo, knownVolumes map[string][]aj.Record, claims map[string][]storageAuditClaim, namespace string) ([]StorageAllocationEvidence, map[string]bool, []string) {
+func storageAuditContent(ctx context.Context, deps Deps, target storageAuditTarget, stores map[string]pve.StorageInfo, replicas storageAuditReplicaIndex, knownVolumes map[string][]aj.Record, claims map[string][]storageAuditClaim, namespace string) ([]StorageAllocationEvidence, map[string]bool, []string) {
 	response, e := deps.PVE.Nodes().ListStorageContent(ctx, target.node, target.storage, nil)
 	observations := []StorageAllocationEvidence{}
 	var issues []string
@@ -1294,7 +1313,7 @@ func storageAuditContent(ctx context.Context, deps Deps, target storageAuditTarg
 				continue
 			}
 			listed[item.VolID] = true
-			known, knownIssues, seenRecords := storageAuditKnownVolume(target, stores, knownVolumes[item.VolID], claims[item.VolID], item.VolID)
+			known, knownIssues, seenRecords := storageAuditKnownVolume(target, stores, replicas, knownVolumes[item.VolID], claims[item.VolID], item.VolID)
 			observations = append(observations, known...)
 			issues = append(issues, knownIssues...)
 			locator, id, ok := pve.ParseAllocationVolumeID(item.VolID)
@@ -1317,14 +1336,14 @@ func storageAuditContent(ctx context.Context, deps Deps, target storageAuditTarg
 
 func collectStorageAuditContent(ctx context.Context, deps Deps, targets []storageAuditTarget, stores map[string]pve.StorageInfo, knownVolumes map[string][]aj.Record, result *StorageAllocationAudit) error {
 	// The VM scan has finished, so the workers only read the claims.
-	claims := result.claims
+	claims, replicas := result.claims, result.replicas
 	jobs := make(chan storageAuditTarget)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	for range min(4, len(targets)) {
 		wg.Go(func() {
 			for target := range jobs {
-				observations, listed, issues := storageAuditContent(ctx, deps, target, stores, knownVolumes, claims, deps.Config.StoragePlacementNamespace)
+				observations, listed, issues := storageAuditContent(ctx, deps, target, stores, replicas, knownVolumes, claims, deps.Config.StoragePlacementNamespace)
 				mu.Lock()
 				result.Evidence = append(result.Evidence, observations...)
 				if listed != nil {
@@ -1388,7 +1407,7 @@ func correlateStorageAuditEvidence(result *StorageAllocationAudit, byID map[stri
 			if evidence.Kind == "vm" && evidence.VolumeID == "" {
 				match, reason = storageAuditVMTargetMatches(record, step, evidence.Node, evidence.VMID)
 			} else if evidence.VolumeID != "" {
-				match, reason = storageAuditVolumeTargetMatches(record, step, stores, evidence.Node, evidence.VolumeID)
+				match, reason = storageAuditReplicaTargetMatches(record, step, stores, result.replicas, evidence.Node, evidence.VolumeID)
 			}
 			if !match {
 				miss.consider(step, reason)
@@ -1402,6 +1421,9 @@ func correlateStorageAuditEvidence(result *StorageAllocationAudit, byID map[stri
 
 		if !matchedTarget {
 			storageAuditTargetMiss(result, record, evidence, miss)
+		}
+		if activeTarget && evidence.Kind == "vm" && evidence.VolumeID == "" && storageAuditReplicaAway(record, evidence.Node) {
+			storageAuditReplicaAwayMove(result, record, evidence)
 		}
 		if evidence.Kind == "vm" && evidence.VolumeID == "" {
 			sum := sha256.Sum256([]byte(record.AgentID))
@@ -1437,6 +1459,18 @@ func storageAuditTargetMiss(result *StorageAllocationAudit, record aj.Record, ev
 	result.addConflict(conflict, brief)
 }
 
+// storageAuditReplicaAwayMove sends a VM that a step places but its
+// replication places elsewhere to the replicated move rule. The steps keep
+// the node the VM was created on, so after a failover and a failback the VM
+// sits on a step node while its record names the partner as the source. Only
+// the replicated rule can tell whether the replica it runs from was current.
+func storageAuditReplicaAwayMove(result *StorageAllocationAudit, record aj.Record, evidence StorageAllocationEvidence) {
+	source := storageAuditReplicaJobOf(*record.Replication).Source
+	conflict := fmt.Sprintf("remote allocation %s (VM %d) is away from its replication source: observed on %s, replication source %s", record.ID, evidence.VMID, evidence.Node, source)
+	brief := fmt.Sprintf("VM %d on %s, replication source %s, allocation %s", evidence.VMID, evidence.Node, source, record.ID)
+	result.pending = append(result.pending, storageAuditPendingMove{kind: "vm", evidence: evidence, conflict: conflict, brief: brief})
+}
+
 // settleStorageAuditRaces drops the conflict of each unsettled sighting that a
 // record in a second journal read explains, and raises every other one as
 // written. The read follows the VM scan and every storage listing, so it sees
@@ -1458,7 +1492,7 @@ func settleStorageAuditRaces(ctx context.Context, deps Deps, result *StorageAllo
 		}
 	}
 	for _, candidate := range unsettled {
-		if record, ok := byID[candidate.evidence.AllocationID]; ok && storageAuditActiveStepExplains(record, stores, namespace, candidate.evidence) {
+		if record, ok := byID[candidate.evidence.AllocationID]; ok && storageAuditActiveStepExplains(record, stores, result.replicas, namespace, candidate.evidence) {
 			continue
 		}
 		result.addConflict(candidate.conflict, candidate.brief)
@@ -1469,7 +1503,7 @@ func settleStorageAuditRaces(ctx context.Context, deps Deps, result *StorageAllo
 // namespace and kind owns evidence through a step of its active attempt. A VM
 // marker must also carry the record's agent. A Planned step counts, because a
 // create saves its step before it clones the VM or creates the volume.
-func storageAuditActiveStepExplains(record aj.Record, stores map[string]pve.StorageInfo, namespace string, evidence StorageAllocationEvidence) bool {
+func storageAuditActiveStepExplains(record aj.Record, stores map[string]pve.StorageInfo, replicas storageAuditReplicaIndex, namespace string, evidence StorageAllocationEvidence) bool {
 	if record.State == aj.Deleted || record.State == aj.Cleaned || record.Namespace != namespace || record.Kind != evidence.Kind {
 		return false
 	}
@@ -1489,7 +1523,7 @@ func storageAuditActiveStepExplains(record aj.Record, stores map[string]pve.Stor
 		if marker {
 			match, _ = storageAuditVMTargetMatches(record, step, evidence.Node, evidence.VMID)
 		} else if evidence.VolumeID != "" {
-			match, _ = storageAuditVolumeTargetMatches(record, step, stores, evidence.Node, evidence.VolumeID)
+			match, _ = storageAuditReplicaTargetMatches(record, step, stores, replicas, evidence.Node, evidence.VolumeID)
 		}
 		if match {
 			return true
@@ -1538,7 +1572,7 @@ func correlateRetainedAuditEvidence(result *StorageAllocationAudit, record aj.Re
 			if json.Unmarshal([]byte(verification.EvidenceJSON), &disposition) == nil {
 				for _, target := range disposition.RetainedArtifacts {
 					if evidence.VolumeID != "" && target.IntendedVolume == evidence.VolumeID {
-						matched, _ := storageAuditVolumeTargetMatches(record, aj.Step{Target: target}, stores, evidence.Node, evidence.VolumeID)
+						matched, _ := storageAuditReplicaTargetMatches(record, aj.Step{Target: target}, stores, result.replicas, evidence.Node, evidence.VolumeID)
 						retained = retained || matched
 					}
 				}

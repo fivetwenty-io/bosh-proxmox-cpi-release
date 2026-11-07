@@ -68,7 +68,10 @@ type storageAuditGateFinding struct {
 
 // storageAuditGateError returns nil when report passes gate. Otherwise it logs
 // the full report once at Error level and returns a CloudError that names only
-// the findings the gate refused on. The message leads with the operation, the
+// the findings the gate refused on. When every such finding is a move that a
+// failed read of PVE's replication jobs left undecided, the error is
+// retriable instead, because nothing was proven wrong and the next read can
+// decide the move. The message leads with the operation, the
 // counts, and the first finding's brief, because the Director's task list
 // keeps only about the first 75 characters of a CPI error.
 func storageAuditGateError(ctx context.Context, deps Deps, operation string, report StorageAllocationAudit, gate storageAuditGate) error {
@@ -119,6 +122,9 @@ func storageAuditGateError(ctx context.Context, deps Deps, operation string, rep
 		log.String("vm_scan_issues", log.ScrubMessage(strings.Join(report.VMScanIssues, " | "))),
 		log.String("issues", log.ScrubMessage(strings.Join(report.Issues, " | "))),
 		log.String("observed_moves", log.ScrubMessage(strings.Join(storageAuditMoveLines(report.ObservedMoves), " | "))))
+	if storageAuditGateDeferred(report, gate) {
+		return cpierrors.WrapAs(&storageAuditGateFailure{summary: log.ScrubMessage(summary), hint: hint}, cpierrors.TypeRetriableCloud, operation+" deferred until the replication jobs can be read")
+	}
 	return cpierrors.WrapAs(&storageAuditGateFailure{summary: log.ScrubMessage(summary), hint: hint}, cpierrors.TypeCloud, operation+" refused")
 }
 

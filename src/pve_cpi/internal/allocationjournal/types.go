@@ -119,8 +119,12 @@ type Record struct {
 	CID            string         `json:"cid,omitempty"`
 	Reason         string         `json:"reason,omitempty"`
 	Verifications  []Verification `json:"verifications,omitempty"`
-	CreatedAt      time.Time      `json:"created_at"`
-	UpdatedAt      time.Time      `json:"updated_at"`
+	// Replication is the replicated allocation of a VM whose node-local
+	// volumes PVE storage replication copies to a partner node. Save keeps it
+	// unchanged; only the Handle's replication methods write it.
+	Replication *Replication `json:"replication,omitempty"`
+	CreatedAt   time.Time    `json:"created_at"`
+	UpdatedAt   time.Time    `json:"updated_at"`
 }
 
 // Enrollment is explicit operator evidence, not automatic discovery. A complete
@@ -204,6 +208,9 @@ func validateRecord(r Record) error {
 		return err
 	}
 	if err := validateRecordSteps(r); err != nil {
+		return err
+	}
+	if err := validateReplication(r); err != nil {
 		return err
 	}
 	return validateRecordDisposition(r)
@@ -456,5 +463,6 @@ func cloneRecord(r Record) Record {
 		r.Steps[i].Charges = append([]Charge(nil), r.Steps[i].Charges...)
 	}
 	r.Verifications = append([]Verification(nil), r.Verifications...)
+	r.Replication = cloneReplication(r.Replication)
 	return r
 }

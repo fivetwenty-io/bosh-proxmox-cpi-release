@@ -63,6 +63,8 @@ func StorageAllocationCharging(state aj.State) bool {
 // StartedAt, which decides whether a sibling's acquired bytes still count.
 //
 // A record in a terminal state feeds neither result, so it is never decoded.
+// A live replicated VM record also charges its partner for the replica until
+// a verified sync covers it (addSiblingReplicaBytes), whatever its state.
 // A charging record whose plan is invalid JSON or carries an unknown plan
 // version returns an error, because a namespace we cannot read in full cannot
 // be accounted for in full, and the caller surfaces that the way it surfaces an
@@ -78,6 +80,9 @@ func siblingCharges(records []aj.Record, self, group, scope string, snapshotStar
 		record := records[i]
 		if record.ID == self {
 			continue
+		}
+		if err := addSiblingReplicaBytes(member, domain, record, snapshotStart); err != nil {
+			return nil, nil, nil, err
 		}
 		charging := StorageAllocationCharging(record.State)
 		// The count's state list is wider than the byte maps' list on purpose:
@@ -169,6 +174,39 @@ func addSiblingRecordBytes(member, domain map[string]uint64, record aj.Record, p
 	}
 	if err := mergeSiblingLarger(domain, planDomain, stepDomain); err != nil {
 		return siblingBytesError(record, err)
+	}
+	return nil
+}
+
+// addSiblingReplicaBytes charges the replica a live replicated VM record
+// keeps on its partner against the partner's capacity, in whatever state the
+// record is. PVE's free space counts the replica once a sync has written it,
+// so the charge stands only until a verified sync covers the newest volume
+// set, and for the clock-skew window after that verification, the same
+// window acquired step bytes get. A volume change in flight or an unconfirmed
+// job keeps the newest set's charges standing. A retired replication charges
+// nothing, because its job no longer writes the partner.
+func addSiblingReplicaBytes(member, domain map[string]uint64, record aj.Record, snapshotStart time.Time) error {
+	rep := record.Replication
+	if record.Kind != "vm" || rep == nil || rep.Retired || record.State == aj.Deleted || record.State == aj.Cleaned {
+		return nil
+	}
+	set, ok := rep.LatestVolumeSet()
+	if !ok {
+		return nil
+	}
+	if rep.Job != nil && rep.PendingJob == nil {
+		if _, covered := rep.CoveredVolumeSet(*rep.Job); covered && !rep.Sync.VerifiedAt.After(snapshotStart.Add(-siblingAcquiredClockSkewTolerance)) {
+			return nil
+		}
+	}
+	for _, charge := range set.Charges {
+		if err := addSiblingKeyBytes(member, charge.CapacityKey, charge.Bytes); err != nil {
+			return siblingBytesError(record, err)
+		}
+		if err := addSiblingKeyBytes(domain, charge.DomainKey, charge.Bytes); err != nil {
+			return siblingBytesError(record, err)
+		}
 	}
 	return nil
 }

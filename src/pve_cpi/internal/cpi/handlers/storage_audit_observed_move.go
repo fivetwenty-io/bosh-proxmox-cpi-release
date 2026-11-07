@@ -23,16 +23,19 @@ const storageAuditReasonListingFailed = "listing_failed"
 
 // StorageAllocationMove is a VM, disk, or parker that the audit found on a
 // node other than the one the journal records, and accepted as a move on
-// shared storage. Kind is vm, disk, or parker. RecordedNodes are the nodes
-// the journal or the disk provenance names, and Volumes are every volume the
-// audit checked before it accepted the move.
+// shared storage or between the nodes of a recorded replication. Kind is vm,
+// disk, or parker. RecordedNodes are the nodes the journal or the disk
+// provenance names, and Volumes are every volume the audit checked before it
+// accepted the move. Replication is set only for a replicated move, and is
+// omitted otherwise so a shared move serializes as it always has.
 type StorageAllocationMove struct {
-	AllocationID  string   `json:"allocation_id"`
-	Kind          string   `json:"kind"`
-	VMID          int      `json:"vmid"`
-	RecordedNodes []string `json:"recorded_nodes"`
-	ObservedNode  string   `json:"observed_node"`
-	Volumes       []string `json:"volumes"`
+	AllocationID  string              `json:"allocation_id"`
+	Kind          string              `json:"kind"`
+	VMID          int                 `json:"vmid"`
+	RecordedNodes []string            `json:"recorded_nodes"`
+	ObservedNode  string              `json:"observed_node"`
+	Volumes       []string            `json:"volumes"`
+	Replication   *StorageReplicaMove `json:"replication,omitempty"`
 }
 
 // String renders the move as one line for logs and summaries.
@@ -89,38 +92,91 @@ type storageAuditFrozen struct {
 	found   bool
 }
 
+// storageAuditMoveVerdict is a move rule's decision. An empty refusal accepts
+// move. Otherwise refusal is the reason, and unread or deferred mark a move
+// left undecided because a storage listing or the replication read failed.
+// replicated is true when the replicated VM rule judged the sighting, so a
+// disk the VM holds moves with it.
+type storageAuditMoveVerdict struct {
+	move       StorageAllocationMove
+	refusal    string
+	unread     bool
+	deferred   bool
+	replicated bool
+}
+
 // resolveStorageAuditMoves decides each pending node mismatch after the
 // storage listings and correlation have run. An accepted move is reported in
 // ObservedMoves; a refused one raises its conflict with the reason appended.
 // A move that rests on a listing that failed stays undecided. It raises an
 // issue instead of a conflict, because a failed read proves nothing about
-// the volume. It reads PVE only for snapshot configurations and never writes
-// anything.
+// the volume. A move that rests on a failed replication read is undecided the
+// same way, and its issue is marked so a gate can defer instead of refusing.
+// VM sightings are decided first, because a disk held by a replicated VM
+// moves with it. It reads PVE only for snapshot configurations and
+// replication jobs, and never writes anything.
 func resolveStorageAuditMoves(ctx context.Context, deps Deps, result *StorageAllocationAudit, index storageAuditMoveIndex) {
-	for pendingIndex := range result.pending {
-		pending := &result.pending[pendingIndex]
-		var move StorageAllocationMove
-		var refusal string
-		var unread bool
-		if pending.kind == "vm" {
-			move, refusal, unread = storageAuditObservedSharedMove(ctx, deps, result, index, pending.evidence)
-		} else {
-			move, refusal, unread = storageAuditObservedSharedDiskMove(result, index, *pending)
+	holders := map[storageAuditHolderKey]storageAuditMoveVerdict{}
+	for _, vms := range []bool{true, false} {
+		for pendingIndex := range result.pending {
+			pending := &result.pending[pendingIndex]
+			if (pending.kind == "vm") != vms {
+				continue
+			}
+			var verdict storageAuditMoveVerdict
+			key := storageAuditHolderKey{vmid: pending.evidence.VMID, node: pending.evidence.Node}
+			switch holder, judged := holders[key]; {
+			case pending.kind == "vm":
+				verdict = storageAuditObservedVMMove(ctx, deps, result, index, pending.evidence)
+				if verdict.replicated {
+					holders[key] = verdict
+				}
+			case pending.kind == allocationKindDisk && judged:
+				verdict = storageAuditReplicatedDiskMove(index, *pending, holder)
+			default:
+				move, refusal, unread := storageAuditObservedSharedDiskMove(result, index, *pending)
+				verdict = storageAuditMoveVerdict{move: move, refusal: refusal, unread: unread}
+			}
+			settleStorageAuditMove(result, *pending, verdict)
 		}
-		switch {
-		case unread:
-			undecided := "; move undecided (" + storageAuditReasonListingFailed + "): " + refusal
-			result.addIssue(pending.conflict+undecided, pending.brief+undecided)
-			continue
-		case refusal != "":
-			result.addConflict(pending.conflict+"; not accepted as a move because "+refusal, pending.brief+"; not a move: "+refusal)
-			continue
-		}
-		result.ObservedMoves = append(result.ObservedMoves, move)
 	}
 	result.pending = nil
 	sort.Slice(result.ObservedMoves, func(i, j int) bool { return result.ObservedMoves[i].String() < result.ObservedMoves[j].String() })
 	result.ObservedMoves = slices.CompactFunc(result.ObservedMoves, func(a, b StorageAllocationMove) bool { return a.String() == b.String() })
+}
+
+// settleStorageAuditMove records one verdict: an accepted move, a conflict
+// with its reason, or an issue for a move left undecided.
+func settleStorageAuditMove(result *StorageAllocationAudit, pending storageAuditPendingMove, verdict storageAuditMoveVerdict) {
+	switch {
+	case verdict.deferred:
+		undecided := "; move undecided (" + storageAuditReasonReplicationUnread + "): " + verdict.refusal
+		result.addIssue(pending.conflict+undecided, pending.brief+undecided)
+		result.deferReplication(pending.conflict + undecided)
+	case verdict.unread:
+		undecided := "; move undecided (" + storageAuditReasonListingFailed + "): " + verdict.refusal
+		result.addIssue(pending.conflict+undecided, pending.brief+undecided)
+	case verdict.refusal != "":
+		result.addConflict(pending.conflict+"; not accepted as a move because "+verdict.refusal, pending.brief+"; not a move: "+verdict.refusal)
+	default:
+		result.ObservedMoves = append(result.ObservedMoves, verdict.move)
+	}
+}
+
+// storageAuditObservedVMMove decides one VM sighting. The record checks that
+// need only the journal and the VM scan come first, and then a replicated
+// record follows the replicated rule and every other record the shared one.
+func storageAuditObservedVMMove(ctx context.Context, deps Deps, result *StorageAllocationAudit, index storageAuditMoveIndex, evidence StorageAllocationEvidence) storageAuditMoveVerdict {
+	record, recorded, refusal := storageAuditMovedVMRecord(result, index, evidence)
+	replicated := refusal == "" && storageAuditReplicated(record)
+	switch {
+	case refusal != "":
+		return storageAuditMoveVerdict{refusal: refusal, replicated: storageAuditReplicated(record)}
+	case replicated:
+		return storageAuditObservedReplicatedMove(ctx, deps, result, index, evidence, record, recorded)
+	}
+	move, refusal, unread := storageAuditObservedSharedMove(ctx, deps, result, index, evidence, record, recorded)
+	return storageAuditMoveVerdict{move: move, refusal: refusal, unread: unread}
 }
 
 // storageAuditObservedSharedMove decides whether a VM sighted on a node its
@@ -129,43 +185,79 @@ func resolveStorageAuditMoves(ctx context.Context, deps Deps, result *StorageAll
 // result is true when the only reason is a failed listing, which leaves the
 // move undecided.
 //
-// It accepts only a returned or adopted record whose active attempt targets
-// this VMID, whose marker was sighted exactly once in a complete VM scan, and
-// whose agent digest matches. Every config volume must belong to this record
+// record and recorded come from storageAuditMovedVMRecord, which accepts only
+// a returned or adopted record whose active attempt targets this VMID, whose
+// marker was sighted exactly once in a complete VM scan, and whose agent
+// digest matches. Every config volume must belong to this record
 // or to a disk record whose provenance this VM carries. Every volume the VM
 // holds, including its vmstate and every snapshot's volumes, and every volume
 // the active attempt recorded, must sit on storage that is shared now, was
 // shared and had the same backing when the owning plan was frozen, is
 // available on the new node, and listed that volume there in this audit.
-func storageAuditObservedSharedMove(ctx context.Context, deps Deps, result *StorageAllocationAudit, index storageAuditMoveIndex, evidence StorageAllocationEvidence) (StorageAllocationMove, string, bool) {
-	if !result.VMScanComplete {
-		return StorageAllocationMove{}, result.incompleteScan() + ", so another sighting could be hidden", false
-	}
-	record, found := index.byID[evidence.AllocationID]
-	if !found || record.Kind != "vm" || record.Namespace != index.namespace {
-		return StorageAllocationMove{}, "no VM record of this namespace owns the allocation", false
-	}
-	if record.State != aj.ReadyToReturn && record.State != aj.Adopted && !storageAuditDeletionKeepsMove(record, evidence) {
-		return StorageAllocationMove{}, fmt.Sprintf("the record is in state %s, not ready_to_return or adopted", record.State), false
-	}
-	recorded := storageAuditActiveVMNodes(record, evidence.VMID)
-	if len(recorded) == 0 {
-		return StorageAllocationMove{}, fmt.Sprintf("VM %d is not a target of the record's active attempt", evidence.VMID), false
-	}
-	if sightings := storageAuditMarkerSightings(result, record.ID); sightings != 1 {
-		return StorageAllocationMove{}, fmt.Sprintf("the allocation marker was sighted %d times", sightings), false
-	}
-	digest := sha256.Sum256([]byte(record.AgentID))
-	if evidence.AgentSHA256 != hex.EncodeToString(digest[:]) {
-		return StorageAllocationMove{}, "the VM carries a different agent digest", false
-	}
-	vm, refusal := storageAuditHolder(result, evidence.Node, evidence.VMID)
+func storageAuditObservedSharedMove(ctx context.Context, deps Deps, result *StorageAllocationAudit, index storageAuditMoveIndex, evidence StorageAllocationEvidence, record aj.Record, recorded []string) (StorageAllocationMove, string, bool) {
+	held, volumes, refusal := storageAuditMovedVMVolumes(ctx, deps, result, index, evidence, record)
 	if refusal != "" {
 		return StorageAllocationMove{}, refusal, false
 	}
+	// A volume that fails a condition the audit did read refuses the move,
+	// even when the listing of another volume failed.
+	unlisted := ""
+	for _, volume := range volumes {
+		refusal, failed := storageAuditSharedVolumeRefusal(result, index, evidence.Node, volume, held[volume])
+		switch {
+		case refusal == "":
+		case !failed:
+			return StorageAllocationMove{}, refusal, false
+		case unlisted == "":
+			unlisted = refusal
+		}
+	}
+	if unlisted != "" {
+		return StorageAllocationMove{}, unlisted, true
+	}
+	return StorageAllocationMove{AllocationID: record.ID, Kind: "vm", VMID: evidence.VMID, RecordedNodes: recorded, ObservedNode: evidence.Node, Volumes: volumes}, "", false
+}
+
+// storageAuditMovedVMRecord runs the checks of a VM sighting that need only
+// the journal and the VM scan. It returns the record and the nodes its
+// active attempt names for the VM, or the reason the sighting is refused.
+func storageAuditMovedVMRecord(result *StorageAllocationAudit, index storageAuditMoveIndex, evidence StorageAllocationEvidence) (aj.Record, []string, string) {
+	if !result.VMScanComplete {
+		return aj.Record{}, nil, result.incompleteScan() + ", so another sighting could be hidden"
+	}
+	record, found := index.byID[evidence.AllocationID]
+	if !found || record.Kind != "vm" || record.Namespace != index.namespace {
+		return aj.Record{}, nil, "no VM record of this namespace owns the allocation"
+	}
+	if record.State != aj.ReadyToReturn && record.State != aj.Adopted && !storageAuditDeletionKeepsMove(record, evidence) {
+		return record, nil, fmt.Sprintf("the record is in state %s, not ready_to_return or adopted", record.State)
+	}
+	recorded := storageAuditActiveVMNodes(record, evidence.VMID)
+	if len(recorded) == 0 {
+		return record, nil, fmt.Sprintf("VM %d is not a target of the record's active attempt", evidence.VMID)
+	}
+	if sightings := storageAuditMarkerSightings(result, record.ID); sightings != 1 {
+		return record, nil, fmt.Sprintf("the allocation marker was sighted %d times", sightings)
+	}
+	digest := sha256.Sum256([]byte(record.AgentID))
+	if evidence.AgentSHA256 != hex.EncodeToString(digest[:]) {
+		return record, nil, "the VM carries a different agent digest"
+	}
+	return record, recorded, ""
+}
+
+// storageAuditMovedVMVolumes collects every volume a sighted VM holds: its
+// config volumes, each of which needs a journal owner, its vmstate, every
+// snapshot's volumes, and every volume the record's active attempt recorded.
+// It maps each to the definition its owner froze, and returns them sorted.
+func storageAuditMovedVMVolumes(ctx context.Context, deps Deps, result *StorageAllocationAudit, index storageAuditMoveIndex, evidence StorageAllocationEvidence, record aj.Record) (map[string]storageAuditFrozen, []string, string) {
+	vm, refusal := storageAuditHolder(result, evidence.Node, evidence.VMID)
+	if refusal != "" {
+		return nil, nil, refusal
+	}
 	plan, err := activeStorageAllocationPlan(record)
 	if err != nil {
-		return StorageAllocationMove{}, "the record's plan could not be decoded", false
+		return nil, nil, "the record's plan could not be decoded"
 	}
 	// Every volume maps to the backing its owner froze. Config volumes need a
 	// journal owner; other held volumes fall back to the VM's own plan.
@@ -173,13 +265,13 @@ func storageAuditObservedSharedMove(ctx context.Context, deps Deps, result *Stor
 	for _, volume := range storageAuditSortedValues(vm.volumes) {
 		frozen, owned := storageAuditConfigVolumeOwner(index, record, plan, vm, volume)
 		if !owned {
-			return StorageAllocationMove{}, fmt.Sprintf("volume %s is owned by no journal record of this VM", volume), false
+			return nil, nil, fmt.Sprintf("volume %s is owned by no journal record of this VM", volume)
 		}
 		held[volume] = frozen
 	}
 	extra, refusal := storageAuditSnapshotVolumes(ctx, deps, vm)
 	if refusal != "" {
-		return StorageAllocationMove{}, refusal, false
+		return nil, nil, refusal
 	}
 	if vm.hasVMState {
 		extra = append(extra, vm.vmstate)
@@ -200,23 +292,7 @@ func storageAuditObservedSharedMove(ctx context.Context, deps Deps, result *Stor
 		volumes = append(volumes, volume)
 	}
 	sort.Strings(volumes)
-	// A volume that fails a condition the audit did read refuses the move,
-	// even when the listing of another volume failed.
-	unlisted := ""
-	for _, volume := range volumes {
-		refusal, failed := storageAuditSharedVolumeRefusal(result, index, evidence.Node, volume, held[volume])
-		switch {
-		case refusal == "":
-		case !failed:
-			return StorageAllocationMove{}, refusal, false
-		case unlisted == "":
-			unlisted = refusal
-		}
-	}
-	if unlisted != "" {
-		return StorageAllocationMove{}, unlisted, true
-	}
-	return StorageAllocationMove{AllocationID: record.ID, Kind: "vm", VMID: evidence.VMID, RecordedNodes: recorded, ObservedNode: evidence.Node, Volumes: volumes}, "", false
+	return held, volumes, ""
 }
 
 // storageAuditDeletionKeepsMove reports whether a record that delete or an
@@ -275,6 +351,15 @@ func storageAuditObservedSharedDiskMove(result *StorageAllocationAudit, index st
 // comes back with true, and only after every condition the audit could read
 // has passed.
 func storageAuditSharedVolumeRefusal(result *StorageAllocationAudit, index storageAuditMoveIndex, node, volume string, frozen storageAuditFrozen) (string, bool) {
+	return storageAuditVolumeRefusal(result, index, node, volume, frozen, false)
+}
+
+// storageAuditVolumeRefusal applies the storage conditions of a moved volume.
+// With replica false the volume must sit on shared storage, as
+// storageAuditSharedVolumeRefusal describes. With replica true it must sit on
+// node-local storage that was node-local when its owner froze it, because a
+// replication copies it to the node, and every other condition is the same.
+func storageAuditVolumeRefusal(result *StorageAllocationAudit, index storageAuditMoveIndex, node, volume string, frozen storageAuditFrozen, replica bool) (string, bool) {
 	storage, _, err := pve.ParseDiskCID(volume)
 	if err != nil {
 		return fmt.Sprintf("volume %s names no storage", volume), false
@@ -283,13 +368,19 @@ func storageAuditSharedVolumeRefusal(result *StorageAllocationAudit, index stora
 	if !defined {
 		return fmt.Sprintf("storage %q of volume %s is not defined", storage, volume), false
 	}
-	if !current.IsShared() {
+	if current.IsShared() == replica {
+		if replica {
+			return fmt.Sprintf("volume %s is on shared storage, which a replication does not copy", volume), false
+		}
 		return fmt.Sprintf("volume %s is node-local", volume), false
 	}
 	if !frozen.found {
 		return fmt.Sprintf("the owning record froze no definition of storage %q for volume %s", storage, volume), false
 	}
-	if !frozen.shared {
+	if frozen.shared == replica {
+		if replica {
+			return fmt.Sprintf("storage %q of volume %s was shared when its plan was frozen", storage, volume), false
+		}
 		return fmt.Sprintf("storage %q of volume %s was node-local when its plan was frozen", storage, volume), false
 	}
 	if frozen.backing == "" || current.BackingKey() != frozen.backing {

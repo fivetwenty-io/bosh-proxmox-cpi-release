@@ -601,9 +601,22 @@ func (h *Handle) Record() Record { h.mu.Lock(); defer h.mu.Unlock(); return clon
 func (h *Handle) Save(next Record) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.saveLocked(next, false)
+	return h.saveLocked(next, saveEvidence)
 }
-func (h *Handle) saveLocked(next Record, attemptTransition bool) error {
+
+// saveKind names which part of a record a write may change beyond what Save
+// allows. Save keeps the attempts and the replication section; an attempt
+// transition may change the attempts, and a replication transition only the
+// replication section.
+type saveKind int
+
+const (
+	saveEvidence saveKind = iota
+	saveAttemptTransition
+	saveReplicationTransition
+)
+
+func (h *Handle) saveLocked(next Record, kind saveKind) error {
 	if h.closed {
 		return ErrClosed
 	}
@@ -618,17 +631,24 @@ func (h *Handle) saveLocked(next Record, attemptTransition bool) error {
 		v := next.Verifications[len(next.Verifications)-1]
 		reconciled = validateVerification(v) && (v.OwnershipVerified || v.AbsenceVerified || next.State == VMDeletedRetained && v.VMAbsenceVerified && v.ArtifactDispositionVerified)
 	}
-	if h.requiresReconciliation && next.State != ReconciliationRequired && !reconciled && !settlesPlannedSteps(h.record, next) {
+	if h.requiresReconciliation && next.State != ReconciliationRequired && !reconciled && !settlesPlannedSteps(h.record, next) && kind != saveReplicationTransition {
 		return ErrReconciliationRequired
 	}
 	old := h.record
-	if attemptTransition {
+	switch kind {
+	case saveAttemptTransition:
 		if err := validateAttemptTransition(old, next); err != nil {
 			return err
 		}
 		old = cloneRecord(old)
 		old.Attempts = cloneAttempts(next.Attempts)
 		old.State = next.State
+	case saveReplicationTransition:
+		if err := validateReplicationTransition(old, next); err != nil {
+			return err
+		}
+		old = cloneRecord(old)
+		old.Replication = cloneReplication(next.Replication)
 	}
 	if err := validateUpdate(old, next); err != nil {
 		return err

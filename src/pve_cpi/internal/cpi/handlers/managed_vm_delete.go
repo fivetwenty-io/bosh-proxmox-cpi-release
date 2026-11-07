@@ -101,15 +101,8 @@ func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, ha
 	if err := storageCleanupSettledAfter(ctx, record, gaps); err != nil {
 		return proof, err
 	}
-	clusterNodes, err := clusterNodeNames(ctx, deps)
+	clusterNodes, audit, err := auditManagedVMCleanup(ctx, deps, journal)
 	if err != nil {
-		return proof, err
-	}
-	audit, err := AuditStorageAllocations(ctx, deps, journal, clusterNodes)
-	if err != nil {
-		return proof, err
-	}
-	if err := storageAuditGateError(ctx, deps, "VM cleanup", audit, storageAuditGateAll); err != nil {
 		return proof, err
 	}
 	node, vmid, owned, err := managedVMDisposalIdentity(record, audit)
@@ -194,6 +187,27 @@ func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, ha
 		return proof, err
 	}
 	return managedVMDispositionProof(ctx, deps, audit, record, vmid, retainedTargets)
+}
+
+// auditManagedVMCleanup runs the audit that gates a VM cleanup and returns
+// the cluster's nodes with it. The gate needs a complete audit with no
+// conflict, so a VM found on a node its steps do not name passes only as a
+// move the audit accepted, on shared storage or between the nodes of a
+// replication it proved. A move that a failed read of the replication jobs
+// left undecided defers with a retriable error, and nothing is destroyed.
+func auditManagedVMCleanup(ctx context.Context, deps Deps, journal *aj.Journal) ([]string, StorageAllocationAudit, error) {
+	clusterNodes, err := clusterNodeNames(ctx, deps)
+	if err != nil {
+		return nil, StorageAllocationAudit{}, err
+	}
+	audit, err := AuditStorageAllocations(ctx, deps, journal, clusterNodes)
+	if err != nil {
+		return nil, StorageAllocationAudit{}, err
+	}
+	if err := storageAuditGateError(ctx, deps, "VM cleanup", audit, storageAuditGateAll); err != nil {
+		return nil, StorageAllocationAudit{}, err
+	}
+	return clusterNodes, audit, nil
 }
 
 // locateAndGateManagedVM proves the recorded VM is where the record places
