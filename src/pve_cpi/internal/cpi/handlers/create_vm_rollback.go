@@ -11,7 +11,6 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
-	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
@@ -164,7 +163,7 @@ func rollbackOnExit(
 	if *retErr != nil && *vmCreated {
 		if deps.Config.KeepFailedVMsEnabled() {
 			rbCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
-			tagFailedVM(rbCtx, deps, node, vmid, env, logger)
+			keepFailedVM(rbCtx, deps, node, vmid, env, logger)
 			rbCancel()
 			*retErr = preserveFailedVMError(*retErr, vmid, node)
 			return
@@ -178,7 +177,7 @@ func rollbackOnExit(
 // so the caller re-panics afterward; here we only need to tag-or-destroy.
 func disposeFailedVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
 	if deps.Config.KeepFailedVMsEnabled() {
-		tagFailedVM(ctx, deps, node, vmid, env, logger)
+		keepFailedVM(ctx, deps, node, vmid, env, logger)
 		return
 	}
 	cleanupVM(ctx, deps, node, vmid, env, logger)
@@ -196,7 +195,20 @@ func disposeFailedVM(ctx context.Context, deps Deps, node string, vmid int, env 
 // Lock acquisition failure is also best-effort: logged, then the RMW proceeds
 // unlocked rather than skipping the failure tag entirely.
 func tagFailedVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
-	entries := []string{"bosh-create-failed"}
+	tagFailedVMFor(ctx, deps, node, vmid, env, false, logger)
+}
+
+// keepFailedVM tags a VM that debug.keep_failed_vms preserves. It is
+// tagFailedVM that also drops the VM's birth tag, so the deferred-teardown
+// sweep never destroys a VM the operator asked to keep.
+func keepFailedVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
+	tagFailedVMFor(ctx, deps, node, vmid, env, true, logger)
+}
+
+func tagFailedVMFor(
+	ctx context.Context, deps Deps, node string, vmid int, env map[string]any, kept bool, logger *log.Logger,
+) {
+	entries := []string{tagCreateFailed}
 	// instanceGroupName falls back to the env.bosh.instance name on the
 	// create-env path (where env.bosh.group is absent), so a failed bootstrap VM
 	// still gets a job tag.
@@ -223,6 +235,9 @@ func tagFailedVM(ctx context.Context, deps Deps, node string, vmid int, env map[
 
 		// hoistHeadTags keeps the ownership record ahead of the tail the
 		// byte cap truncates, whatever order PVE returned the tags in.
+		if kept {
+			existing = withoutBirthTags(existing)
+		}
 		tags := mergeTagList(hoistHeadTags(existing), entries, maxTagLength)
 		if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, strconv.Itoa(vmid),
 			&sdknodes.UpdateQemuConfigParams{Tags: &tags}); err != nil {
@@ -370,204 +385,193 @@ func stopVMForRollback(ctx context.Context, deps Deps, node string, vmid int, lo
 	}
 }
 
-// stopVMForRollbackThroughHA stops the VM ahead of the rollback purge. A VM
-// that PVE HA's resource configuration does not list is stopped directly, as
-// the CRM manages only the services that configuration names. A VM it lists
-// passes the same HA gate as delete_vm and is stopped through PVE HA. It
-// returns false, after logging why, when the HA membership cannot be read or
-// the VM's HA state does not allow the destroy yet; the caller then preserves
-// the VM, and nothing is written to HA.
-func stopVMForRollbackThroughHA(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) bool {
-	const caller = "create_vm: rollback"
-	preserve := func(err error) bool {
-		logger.Error(caller+": the VM's HA state does not allow the destroy yet; preserving the VM instead of "+
-			"purging it (remove it with delete_vm or qm destroy once PVE HA has settled it)",
-			log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Err(err))
-		return false
-	}
-	listed, err := managedVMHAResourcePresent(ctx, deps, haResourceSid(vmid))
-	if err != nil {
-		return preserve(err)
-	}
-	if !listed {
-		stopVMForRollback(ctx, deps, node, vmid, logger)
-		return true
-	}
-	haState, err := gateHADelete(ctx, deps, caller, vmid, node, logger)
-	if err != nil {
-		return preserve(err)
-	}
-	stopDirectly := !haState.Managed()
-	if haState.Managed() {
-		outcome, stopErr := stopHAManagedVMForDelete(ctx, deps, caller, haState, vmid, logger)
-		if stopErr != nil {
-			return preserve(stopErr)
-		}
-		stopDirectly = outcome == haStopNotManaged
-	}
-	if stopDirectly {
-		stopVMForRollback(ctx, deps, node, vmid, logger)
-	}
-	return true
-}
-
-//nolint:gocognit // Best-effort rollback chain: stop, purge, and per-step logging for each failure path. golangci-lint v2.15.0 scores it 43.
+// cleanupVM tears down a VM whose create failed through the teardown
+// protocol (see vmTeardown). Every failure is logged and suppressed, so the
+// create's own error reaches the Director unchanged. A VM the protocol cannot
+// destroy stays queued: its birth tag, and the bosh-deleting tag written here
+// as a diagnostic, hand it to sweepDeferredTeardowns.
+//
+// The create may already have put the VM under PVE HA. A VM that PVE HA's
+// resource configuration lists passes the same HA gate as delete_vm, and is
+// stopped through PVE HA. One in fence, in recovery, in motion, on a node
+// that is not online, or in a state that cannot be read is tagged and LEFT,
+// with nothing written to HA, because a direct stop or destroy there races
+// the CRM. Any other VM is stopped directly, best-effort, and the protocol
+// waits on its owner node until it reports stopped.
+//
+// Persistent disks are protected before the purge (see
+// protectForeignDisksOnRollback). The purge destroys every disk the VM config
+// references, including a persistent disk attachPersistentDisks already
+// attached when a later create stage failed. When the disks cannot be moved
+// to safety, the VM is tagged and LEFT: an orphaned VM is recoverable, a
+// purged persistent volume is not.
+//
+// DestroyUnreferencedDisks follows pve.destroy_unreferenced_disks (default
+// false; see the config field doc for the cross-cluster shared-storage
+// data-loss hazard enabling it introduces). This rollback fires on every
+// failed create, a routine path, so it honors the same safety default every
+// other destroy does. deps.Config may be nil here, because cleanupVM is a
+// shared rollback helper reachable with deps.Config unset.
+//
+// A config lock rides the destroy loop's lock curve first, then the skiplock
+// recovery for a root@pam password identity, then a bounded wait for the
+// lock to clear followed by a second check and destroy. A migrate lock is
+// never skipped or waited out.
+//
+// env carries the BOSH deploy identity used to tag a VM the rollback leaves
+// "bosh-create-failed". It is nil for callers that clean up an intermediate
+// placement-fallback or VMID-retry candidate, and tagging is skipped then.
 func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
+	const caller = "create_vm: rollback"
 	logger.Warn("create_vm: rolling back, destroying created VM", log.Int(metadataKeyVMID, vmid))
 	vmCID := strconv.Itoa(vmid)
 	// This create allocated the VMID itself, so its config-drive ISO is ours to
 	// remove at the end of the rollback whatever band the VMID lies in.
 	ctx = pve.WithOwnedConfigDriveISO(ctx, vmid)
+	// The diagnostic marker. The birth tag already queues the VM, so a write
+	// that fails here, as it does under fencing or a quorum loss, loses only
+	// the marker.
+	stampDeletingTag(ctx, deps, node, vmCID, vmid, logger)
 
-	// The create may already have put the VM under PVE HA. Such a VM passes
-	// the same HA gate as delete_vm: one in fence, in recovery, in motion, on
-	// a node that is not online, or in a state that cannot be read is tagged
-	// and LEFT, with nothing written to HA, because a direct stop or destroy
-	// there races the CRM. Otherwise it is stopped through PVE HA, and the
-	// destroy's purge removes its HA resource.
-	if !stopVMForRollbackThroughHA(ctx, deps, node, vmid, logger) {
+	teardown := &vmTeardown{
+		caller:              caller,
+		vmCID:               vmCID,
+		vmid:                vmid,
+		node:                node,
+		logger:              logger,
+		gate:                teardownGateListed,
+		skiplock:            true,
+		awaitLockClear:      true,
+		destroyUnreferenced: deps.Config != nil && deps.Config.DestroyUnreferencedDisks,
+		stop: func(ctx context.Context) (bool, error) {
+			stopVMForRollback(ctx, deps, node, vmid, logger)
+			return false, nil
+		},
+		preserve: func(ctx context.Context) (bool, error) {
+			return false, protectForeignDisksOnRollback(ctx, deps, node, vmCID, vmid, logger)
+		},
+		owned: func(_ context.Context, holding pve.QemuHolding) error {
+			return refuseForeignRollbackVM(deps, vmCID, holding)
+		},
+		awaitTask: func(ctx context.Context, resp *sdknodes.DeleteQemuResponse) error {
+			return awaitRollbackDestroy(ctx, deps, node, vmid, resp, logger)
+		},
+	}
+	result, err := teardown.run(ctx, deps)
+	if err != nil {
+		cleanupVMLeftVM(ctx, deps, node, vmid, env, result.stage, err, logger)
+		return
+	}
+	if result.gone {
+		logger.Info("create_vm: rollback -- VM already gone (idempotent)", log.Int(metadataKeyVMID, vmid))
+	} else {
+		logger.Info("create_vm: rollback complete", log.Int(metadataKeyVMID, vmid))
+	}
+	cleanupRollbackArtifacts(ctx, deps, node, vmid, logger)
+}
+
+// cleanupVMLeftVM logs and tags a VM the rollback's teardown did not destroy,
+// by the step that stopped it.
+func cleanupVMLeftVM(
+	ctx context.Context, deps Deps, node string, vmid int, env map[string]any, stage teardownStage, err error,
+	logger *log.Logger,
+) {
+	switch {
+	case stage == teardownStageHA || stage == teardownStageStop && isWholeHADeferral(err):
+		logger.Error("create_vm: rollback: the VM's HA state does not allow the destroy yet; preserving the VM "+
+			"instead of purging it (the deferred-teardown sweep or delete_vm removes it once PVE HA has settled it)",
+			log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Err(err))
 		if env != nil {
 			tagFailedVM(ctx, deps, node, vmid, env, logger)
 		}
-		return
-	}
-
-	// Protect persistent disks before the purge. The purge below destroys
-	// every disk the VM config references -- including a persistent disk
-	// attachPersistentDisks already attached when a later create stage (agent
-	// configure, start, post-start checks) failed and armed this rollback.
-	// delete_vm runs detachForeignActiveDisks for exactly this reason; the
-	// rollback path must too, or a routine start timeout turns into the loss
-	// of the very volume the recreate was trying to re-attach. Fail-closed:
-	// when the disks cannot be moved to safety, the VM is tagged and LEFT --
-	// an orphaned VM is recoverable, a purged persistent volume is not.
-	if protErr := protectForeignDisksOnRollback(ctx, deps, node, vmCID, vmid, logger); protErr != nil {
-		logger.Error("create_vm: rollback: persistent disks could not be detached to safety; preserving the VM instead of purging it (detach the disks, then remove the VM with delete_vm or qm destroy)",
-			log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Err(protErr))
+	case stage == teardownStagePreserve:
+		logger.Error("create_vm: rollback: persistent disks could not be detached to safety; preserving the VM "+
+			"instead of purging it (detach the disks, then remove the VM with delete_vm or qm destroy)",
+			log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Err(err))
 		if env != nil {
 			tagFailedVM(ctx, deps, node, vmid, env, logger)
 		}
 		// The preserved VM is outside BOSH's view (no CID was ever returned),
-		// so nothing will ever GC its cluster-level HA rule; drop the pin now.
-		// The ConfigDrive ISO is deliberately kept -- the preserved VM still
-		// references it, and the operator's eventual delete removes it.
+		// so nothing GCs its cluster-level HA rule; drop the pin now. The
+		// ConfigDrive ISO is deliberately kept, because the preserved VM still
+		// references it.
 		if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
 			logger.Warn("create_vm: rollback node-affinity pin cleanup incomplete on preserved VM (non-fatal)",
 				log.Int(metadataKeyVMID, vmid), log.Err(pinErr))
 		}
-		return
+	case pve.IsVMConfigLocked(err):
+		// The skiplock retry either was not attempted (identity is not
+		// root@pam) or still failed, and the lock did not clear: the VM is
+		// locked and not destroyed. Tag it, when a deploy identity is
+		// available, so operators can find it.
+		logUnresolvedVMLock(logger, "create_vm: rollback delete failed", vmid, node, err)
+		if env != nil {
+			tagFailedVM(ctx, deps, node, vmid, env, logger)
+		}
+	default:
+		logger.Error("create_vm: rollback delete failed; the VM stays queued for the deferred-teardown sweep",
+			log.Int(metadataKeyVMID, vmid), log.String("node", node), log.String("stage", string(stage)),
+			log.Err(err))
 	}
+}
 
-	// Purge the VM. DestroyUnreferencedDisks follows pve.destroy_unreferenced_disks
-	// (default false; see the config field doc for the cross-cluster shared-storage
-	// data-loss hazard enabling it introduces). This rollback fires on every failed
-	// create (placement rejection, cloud-init error, NIC validation error, ...) —
-	// a routine path, not an exceptional one — so it must honor the same safety
-	// default every other DeleteQemu call site does (delete_vm.go's straggler
-	// sweep, sync path, and fast path all read the same config field). deps.Config
-	// nil-checked here (unlike a method call such as KeepFailedVMsEnabled, a plain
-	// field read has no nil-receiver safety of its own) because cleanupVM is a
-	// shared rollback helper reachable with deps.Config unset.
-	purge := true
-	destroyUnref := deps.Config != nil && deps.Config.DestroyUnreferencedDisks
-	// The destroy rides RetryOnTransientOrLock: this rollback usually fires
-	// because a storage fault just failed the create, so the very next
-	// mutation into the same contended storage lock must not be single-shot
-	// (one cfs-lock timeout would otherwise orphan the VM permanently, since
-	// no caller ever retries a rollback). The budget is bounded
-	// (rollbackDestroyMaxAttempts) because this retry shares the detached
-	// rollback context with the task await, ISO removal, and HA pin removal
-	// that follow. A config lock that PVE answers as a 5xx rides the loop's
-	// lock curve, so a short lock clears before any skiplock. Any other
-	// config-lock rejection ("lock: clone" and friends in task text) is
-	// returned from the closure at once and falls through unchanged to the
-	// skiplock and lock-clear branches below; already-gone verdicts (404, pmxcfs
-	// config-missing 500) are short-circuited inside the closure so the
-	// blanket 5xx transient rule cannot spend the budget on a VM that no
-	// longer exists, and the switch below still sees them via delErr.
-	var delResp *sdknodes.DeleteQemuResponse
-	var delErr error
-	_ = pve.RetryOnTransientOrLock(ctx, logger, "create_vm.cleanup.destroy", rollbackDestroyMaxAttempts, func() error {
-		delResp, delErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmcid.PathOf(vmid), &sdknodes.DeleteQemuParams{
-			Purge:                    &purge,
-			DestroyUnreferencedDisks: &destroyUnref,
-		})
-		if delErr != nil && (pve.IsNotFound(delErr) || pve.IsPmxcfsConfigMissing(delErr)) {
+// refuseForeignRollbackVM is step 4's ownership check for the rollback. This
+// create allocated the VMID, so a VM with no ownership tags yet, as a create
+// that failed before its first config write leaves, is still its own. A VM
+// whose tags name another Director, two owners, a parker, or a stemcell
+// template is not, because the VMID then holds something else.
+func refuseForeignRollbackVM(deps Deps, vmCID string, holding pve.QemuHolding) error {
+	tags, _ := pve.ConfigString(holding.Config, jsonKeyTags)
+	if stragglerRowForeign(tags, deps.RequestDirectorUUID) {
+		return cpierrors.Cloud(
+			"create_vm: rollback: VM %s carries tags %q that do not belong to this create; refusing to destroy it",
+			vmCID, tags)
+	}
+	return nil
+}
+
+// awaitRollbackDestroy awaits the rollback's destroy task. An unparseable
+// response has no task to wait for, and the absence proof decides.
+func awaitRollbackDestroy(
+	ctx context.Context, deps Deps, node string, vmid int, resp *sdknodes.DeleteQemuResponse, logger *log.Logger,
+) error {
+	if resp == nil {
+		return nil
+	}
+	upid, err := pve.UPIDFromRaw(*resp)
+	if err != nil {
+		logger.Warn("create_vm: cannot parse UPID from rollback delete response -- the absence proof decides",
+			log.Int(metadataKeyVMID, vmid), log.Err(err))
+		return nil
+	}
+	if upid == "" {
+		return nil
+	}
+	if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, logger); awaitErr != nil {
+		if pve.IsNotFound(awaitErr) || pve.IsPmxcfsConfigMissing(awaitErr) {
+			logger.Info("create_vm: rollback destroy await -- VM config already gone; the absence proof decides",
+				log.Int(metadataKeyVMID, vmid))
 			return nil
 		}
-		if lockForRecovery(delErr) {
-			return nil
-		}
-		return delErr
-	})
-	if delErr != nil && pve.IsVMConfigLocked(delErr) {
-		delResp, delErr = retryDestroyWithSkiplock(ctx, deps, node, vmid, purge, destroyUnref, delErr, logger)
+		return cpierrors.Wrap(pve.WrapError(awaitErr), fmt.Sprintf("create_vm: rollback: await destroy of VM %d", vmid))
 	}
-	if delErr != nil && pve.IsVMConfigLocked(delErr) {
-		delResp, delErr = retryDestroyAfterLockClear(ctx, deps, node, vmid, purge, destroyUnref, delErr, logger)
-	}
-	if delErr != nil {
-		switch {
-		case pve.IsNotFound(delErr) || pve.IsPmxcfsConfigMissing(delErr):
-			logger.Info("create_vm: rollback delete -- VM already gone (idempotent)", log.Int(metadataKeyVMID, vmid))
-		case pve.IsVMConfigLocked(delErr):
-			// Skiplock retry above either was not attempted (identity is not
-			// root@pam) or was attempted and still failed: the VM is orphaned,
-			// locked, and not destroyed. Surface the actionable recovery
-			// command and tag it (when a deploy identity is available) so
-			// keep_failed_vms tooling and operators can find it — this VM was
-			// never meant to be preserved, but ended up stuck, so visibility
-			// matters regardless of the keep_failed_vms setting.
-			logUnresolvedVMLock(logger, "create_vm: rollback delete failed", vmid, node, delErr)
-			if env != nil {
-				tagFailedVM(ctx, deps, node, vmid, env, logger)
-			}
-		default:
-			logger.Error("create_vm: rollback delete failed", log.Int(metadataKeyVMID, vmid), log.Err(delErr))
-		}
-	} else {
-		// Await the destroy task so PVE fully releases the VMID before we return.
-		// An empty UPID means synchronous completion; skip await in that case.
-		if delResp != nil {
-			delUPID, upidErr := pve.UPIDFromRaw(*delResp)
-			if upidErr != nil {
-				logger.Warn("create_vm: cannot parse UPID from rollback delete response -- skipping await",
-					log.Int(metadataKeyVMID, vmid), log.Err(upidErr))
-			} else if delUPID != "" {
-				if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, delUPID, logger); awaitErr != nil {
-					if pve.IsNotFound(awaitErr) || pve.IsPmxcfsConfigMissing(awaitErr) {
-						logger.Info("create_vm: rollback destroy await -- VM already gone (idempotent)",
-							log.Int(metadataKeyVMID, vmid))
-					} else {
-						logger.Error("create_vm: rollback destroy await failed",
-							log.Int(metadataKeyVMID, vmid), log.Err(awaitErr))
-					}
-				}
-			}
-		}
-		logger.Info("create_vm: rollback complete", log.Int(metadataKeyVMID, vmid))
-	}
+	return nil
+}
 
-	// Remove any agent-side artifacts (e.g. the ConfigDrive ISO uploaded by
-	// the configdrive agent). VM purge removes referenced disk volumes
-	// but does not touch independent content uploaded with content=iso, so
-	// the ISO must be deleted via the agent. Order matters: purge first, so
-	// the CD-ROM reference is gone before the underlying volume is removed.
+// cleanupRollbackArtifacts removes what the destroy leaves behind once the VM
+// is gone. The agent removes the ConfigDrive ISO uploaded with content=iso,
+// which the purge does not touch, and runs after the destroy so the CD-ROM
+// reference is gone first. The node-affinity pin (bosh-na-<vmid>) is removed
+// too, because the purge does not GC the cluster-level rule, and two writers
+// create it: the AZ pin and the PCI strict pin. Both steps are idempotent and
+// best-effort.
+func cleanupRollbackArtifacts(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) {
 	if deps.Agent != nil {
 		if remErr := deps.Agent.Remove(ctx, node, vmid); remErr != nil {
 			logger.Warn("create_vm: rollback agent remove failed",
 				log.Int(metadataKeyVMID, vmid), log.Err(remErr))
 		}
 	}
-
-	// Remove the node-affinity HA pin (bosh-na-<vmid>) and deregister its HA
-	// resource. VM purge does not GC the cluster-level HA rule, so without this
-	// a rolled-back create that reached a pin step would leave an orphan rule
-	// referencing a destroyed VM. Unconditional because two writers create this
-	// rule: the AZ pin (gated by HANodeAffinityPinEnabled) and the PCI strict
-	// pin (applied whenever pci_passthroughs is set, regardless of that flag).
-	// removeNodeAffinityPin is idempotent and not-found-tolerant, so for a VM
-	// that never had a pin this is two cheap no-op HA calls. Best-effort.
 	if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
 		logger.Warn("create_vm: rollback node-affinity pin cleanup incomplete (non-fatal)",
 			log.Int(metadataKeyVMID, vmid), log.Err(pinErr))

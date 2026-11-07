@@ -6,6 +6,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -37,6 +38,21 @@ type lrNodesStub struct {
 	stopCalls   []*sdknodes.CreateQemuStatusStopParams
 	updateCalls int
 	updatedTags *string
+	// destroyed records a DeleteQemu that succeeded, so the QEMU view of
+	// lrClient answers not found afterwards, the way PVE does once the VM is
+	// gone and the teardown's absence proof reads it.
+	destroyed bool
+	// failedTagCalls counts the tag writes that carry bosh-create-failed, as
+	// opposed to the bosh-deleting stamp the rollback writes first.
+	failedTagCalls int
+	// survives leaves the VM in place after a destroy PVE accepted, the shape
+	// of a destroy task that did not remove the VM.
+	survives bool
+	// updateParams records every config write.
+	updateParams []*sdknodes.UpdateQemuConfigParams
+	// onUpdate, when set, runs after each recorded config write, so a test
+	// can make the config read that follows see the write land.
+	onUpdate func()
 }
 
 func (n *lrNodesStub) DeleteQemu(
@@ -59,6 +75,9 @@ func (n *lrNodesStub) DeleteQemu(
 		resp = n.deleteResps[len(n.deleteResps)-1]
 	default:
 		resp = &sdknodes.DeleteQemuResponse{}
+	}
+	if err == nil && !n.survives {
+		n.destroyed = true
 	}
 	return resp, err
 }
@@ -89,8 +108,15 @@ func (n *lrNodesStub) CreateQemuStatusStop(
 
 func (n *lrNodesStub) UpdateQemuConfig(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
 	n.updateCalls++
+	n.updateParams = append(n.updateParams, params)
 	if params != nil && params.Tags != nil {
 		n.updatedTags = params.Tags
+		if strings.Contains(*params.Tags, tagCreateFailed) {
+			n.failedTagCalls++
+		}
+	}
+	if n.onUpdate != nil {
+		n.onUpdate()
 	}
 	return nil
 }
@@ -109,6 +135,10 @@ type lrQEMUStub struct {
 	// guest lock, so tests script when the lock clears through it.
 	configFn    func(call int) (map[string]any, error)
 	configCalls int
+	statusErr   error
+	statusCalls int
+	// status is the power state Status answers; empty answers stopped.
+	status string
 }
 
 func (q *lrQEMUStub) Stop(_ context.Context, _ string, _ int) (string, error) {
@@ -124,6 +154,20 @@ func (q *lrQEMUStub) Config(_ context.Context, _ string, _ int) (map[string]inte
 	return map[string]interface{}{}, nil
 }
 
+// Status answers status, or stopped when it is empty, unless statusErr is
+// set: the rollback stops the VM before its destroy, and the teardown reads
+// the status once more before it.
+func (q *lrQEMUStub) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
+	q.statusCalls++
+	if q.statusErr != nil {
+		return nil, q.statusErr
+	}
+	if q.status != "" {
+		return map[string]any{"status": q.status}, nil
+	}
+	return map[string]any{"status": "stopped"}, nil
+}
+
 // --------------------------------------------------------------------------
 // lrClient -- pve.Client fake wiring the stubs above.
 // --------------------------------------------------------------------------
@@ -137,10 +181,12 @@ type lrClient struct {
 // Nodes serves the pending read from the QEMU stub's config read.
 func (c *lrClient) Nodes() sdknodes.Service {
 	return &configPendingNodes{Service: c.nodes, config: func(ctx context.Context, node string, vmid int) (map[string]any, error) {
-		return c.qemu.Config(ctx, node, vmid)
+		return c.QEMU().Config(ctx, node, vmid)
 	}}
 }
-func (c *lrClient) QEMU() qemu.Service       { return c.qemu }
+func (c *lrClient) QEMU() qemu.Service {
+	return destroyedQEMUView{Service: c.qemu, gone: func() bool { return c.nodes.destroyed }}
+}
 func (c *lrClient) Cluster() cluster.Service { return newNAStub() }
 
 // Pools returns nil so tagFailedVM's withVMIDLock falls back to the
@@ -207,8 +253,8 @@ func TestCleanupVM_DeleteLocked_RootPam_RetriesWithSkiplockAndSucceeds(t *testin
 	if second.Skiplock == nil || !*second.Skiplock {
 		t.Error("retry DeleteQemu call must carry skiplock=true")
 	}
-	if nodes.updateCalls != 0 {
-		t.Errorf("skiplock retry succeeded: bosh-create-failed tag must NOT be written, got %d tag writes", nodes.updateCalls)
+	if nodes.failedTagCalls != 0 {
+		t.Errorf("skiplock retry succeeded: bosh-create-failed tag must NOT be written, got %d tag writes", nodes.failedTagCalls)
 	}
 }
 
@@ -233,8 +279,8 @@ func TestCleanupVM_DeleteLocked_NonRootPam_NoSkiplockRetry_TagsFailedVM(t *testi
 			t.Errorf("DeleteQemu call %d must not carry skiplock=true for a non-root@pam identity", i)
 		}
 	}
-	if nodes.updateCalls != 1 {
-		t.Fatalf("VM remains locked and orphaned: expected 1 bosh-create-failed tag write, got %d", nodes.updateCalls)
+	if nodes.failedTagCalls != 1 {
+		t.Fatalf("VM remains locked and orphaned: expected 1 bosh-create-failed tag write, got %d", nodes.failedTagCalls)
 	}
 	if nodes.updatedTags == nil {
 		t.Fatal("expected non-nil tags written")
@@ -266,8 +312,8 @@ func TestCleanupVM_DeleteLocked_RootPamOwnedToken_NoSkiplockRetry_TagsFailedVM(t
 			t.Errorf("DeleteQemu call %d must not carry skiplock=true for a root@pam-owned token identity", i)
 		}
 	}
-	if nodes.updateCalls != 1 {
-		t.Fatalf("VM remains locked and orphaned: expected 1 bosh-create-failed tag write, got %d", nodes.updateCalls)
+	if nodes.failedTagCalls != 1 {
+		t.Fatalf("VM remains locked and orphaned: expected 1 bosh-create-failed tag write, got %d", nodes.failedTagCalls)
 	}
 }
 
@@ -282,8 +328,8 @@ func TestCleanupVM_DeleteLocked_NonRootPam_NilEnv_TaggingSkipped(t *testing.T) {
 	// intermediate placement-fallback candidate cleanup).
 	cleanupVM(context.Background(), deps, "pve01", 100, nil, log.NewNopLogger())
 
-	if nodes.updateCalls != 0 {
-		t.Errorf("nil env: tagging must be skipped, got %d tag writes", nodes.updateCalls)
+	if nodes.failedTagCalls != 0 {
+		t.Errorf("nil env: tagging must be skipped, got %d tag writes", nodes.failedTagCalls)
 	}
 }
 
@@ -375,8 +421,8 @@ func TestCleanupVM_DeleteLocked_WaitsForLockClearThenDestroys(t *testing.T) {
 	if q.configCalls < 3 {
 		t.Errorf("the retry destroy must fire only after the lock cleared (>=3 config polls), got %d", q.configCalls)
 	}
-	if nodes.updateCalls != 0 {
-		t.Errorf("the post-lock-clear destroy succeeded: no bosh-create-failed tag may be written, got %d", nodes.updateCalls)
+	if nodes.failedTagCalls != 0 {
+		t.Errorf("the post-lock-clear destroy succeeded: no bosh-create-failed tag may be written, got %d", nodes.failedTagCalls)
 	}
 }
 
@@ -398,8 +444,8 @@ func TestCleanupVM_DeleteLocked_LockNeverClears_TagsWithoutRetry(t *testing.T) {
 	if len(nodes.deleteCalls) != 1 {
 		t.Fatalf("lock never cleared: expected exactly 1 DeleteQemu call, got %d", len(nodes.deleteCalls))
 	}
-	if nodes.updateCalls != 1 {
-		t.Fatalf("wedged locked orphan: expected 1 bosh-create-failed tag write, got %d", nodes.updateCalls)
+	if nodes.failedTagCalls != 1 {
+		t.Fatalf("wedged locked orphan: expected 1 bosh-create-failed tag write, got %d", nodes.failedTagCalls)
 	}
 }
 

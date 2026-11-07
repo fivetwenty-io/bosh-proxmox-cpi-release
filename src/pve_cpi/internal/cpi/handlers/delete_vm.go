@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -17,18 +16,17 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
-	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdkqemu "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
-	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 )
 
-// tagDeletingVM is the PVE tag stamped on a VM before an async fast-path destroy.
-// It is a diagnostic marker: any operator or script can list VMs tagged
-// bosh-deleting to find those whose fast-path destroy was issued but has not
-// yet completed. The sweepFastDeleteStragglers function consumes this tag on
-// subsequent fast-path deletes to re-issue destroy for any straggler VM, making
-// the tag part of a self-draining work queue.
+// tagDeletingVM is the PVE tag stamped on a VM before an async fast-path
+// destroy, and by a create_vm rollback before its teardown. Any operator or
+// script can list VMs tagged bosh-deleting to find those whose disposal was
+// issued but has not yet completed. sweepDeferredTeardowns consumes this tag
+// at the start of every create_vm and delete_vm and tears each such VM down
+// through the teardown protocol, making the tag part of a self-draining work
+// queue.
 const tagDeletingVM = "bosh-deleting"
 
 // stampDeletingTag reads the VM's current tags, merges in tagDeletingVM, and
@@ -76,265 +74,8 @@ func stampDeletingTag(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	}
 }
 
-// sweepStragglersMaxPerSweep caps how many straggler VMs are reaped in a single
-// sweepFastDeleteStragglers call. Stragglers beyond the cap are left for the
-// next sweep (which runs on every fast-path delete_vm), so they converge
-// without blocking the current delete for more than this many sequential
-// round-trips.
-const sweepStragglersMaxPerSweep = 5
-
-// stragglerRowForeign reports whether a straggler row's own tags already prove
-// the VM is not this Director's to reap: an owner tag naming another
-// Director, two different owners, a parker, or a stemcell template. A row
-// that proves none of these goes on to the full ownership check on the
-// authoritative config.
-func stragglerRowForeign(rowTags, requestUUID string) bool {
-	tags := lowerTags(parseTagsField(rowTags))
-	if contains(tags, pve.ParkerTag) || contains(tags, stemcellCacheTag) || contains(tags, stemcellMarkerTag) {
-		return true
-	}
-	return otherOwner(tagValues(tags, ownerTagPrefix), strings.ToLower(sanitizeTagValue(requestUUID)))
-}
-
-// stragglerRow is the part of a /cluster/resources row the straggler sweep
-// reads.
-type stragglerRow struct {
-	Type string           `json:"type"`
-	VMID sdkclient.PVEInt `json:"vmid"`
-	Node string           `json:"node"`
-	Tags string           `json:"tags"`
-}
-
-// candidate reports whether the row is a straggler the sweep may consider: a
-// QEMU guest with a VMID and a node, no journal history protecting it, and
-// the bosh-deleting tag. Another Director's mid-delete VM, a parker, or a
-// template is never ours to reap. The row's tags settle those before the row
-// counts against the per-sweep cap, so a foreign straggler cannot hold a slot
-// on every sweep.
-func (r stragglerRow) candidate(protected map[int]bool, requestUUID string) bool {
-	if r.Type != resourceTypeQemu || r.VMID.Int() == 0 || r.Node == "" {
-		return false
-	}
-	if protected[int(r.VMID.Int())] || !tagsContain(r.Tags, tagDeletingVM) {
-		return false
-	}
-	return !stragglerRowForeign(r.Tags, requestUUID)
-}
-
-// stragglerOwned runs the full ownership check on a straggler's
-// authoritative config and reports whether the sweep may reap it. A legacy
-// straggler, one with bosh-cpi or Director notes and no owner tag, stays in
-// scope, because nothing tells it apart from our own until it is stamped. Any
-// other foreign verdict is left alone, and a check that cannot finish defers
-// the straggler to the next sweep.
-func stragglerOwned(ctx context.Context, deps Deps, vmid int, loc pve.VMLocation, cfg map[string]any, sweepLogger *log.Logger) bool {
-	verdict, err := checkVMOwnership(ctx, deps, "delete_vm", vmcid.VMCID{VMID: vmid}, loc, cfg)
-	if err != nil {
-		sweepLogger.Warn("delete_vm: straggler sweep: could not check the straggler's ownership; deferring it to the next sweep (non-fatal)",
-			log.Err(err))
-		return false
-	}
-	if !verdict.Owned {
-		sweepLogger.Info("delete_vm: straggler sweep: the straggler is not owned by this Director; leaving it",
-			log.String("ownership_reason", verdict.Reason),
-			log.String("ownership_detail", verdict.Detail))
-		return false
-	}
-	return true
-}
-
-// stragglerHAAllowsSweep reports whether the sweep may reap a straggler. It
-// reads the straggler's HA state once, with no wait, and allows the reap only
-// when the state table lets a delete proceed and PVE HA does not manage the
-// VM, and the straggler's config holds no migrate lock. Every other answer,
-// including a state that cannot be read, defers the straggler.
-func stragglerHAAllowsSweep(
-	ctx context.Context, deps Deps, vmid int, node string, cfg map[string]any, sweepLogger *log.Logger,
-) bool {
-	if lock, _ := pve.ConfigString(cfg, "lock"); strings.TrimSpace(lock) == vmLockMigrate {
-		sweepLogger.Info("delete_vm: straggler sweep: the straggler holds a migrate lock; deferring it")
-		return false
-	}
-	st, err := readHADeleteState(ctx, deps, "delete_vm: straggler sweep", vmid, node)
-	if err != nil {
-		sweepLogger.Warn("delete_vm: straggler sweep: the straggler's HA state is unreadable; deferring it",
-			log.Err(err))
-		return false
-	}
-	disp, reason := st.Disposition()
-	switch {
-	case disp != pve.HAProceed || st.Node != node:
-		sweepLogger.Info("delete_vm: straggler sweep: the straggler's HA state does not allow the reap; deferring it",
-			log.String("disposition", string(disp)), log.String("reason", reason), log.String("ha_node", st.Node))
-		return false
-	case st.Managed():
-		sweepLogger.Info("delete_vm: straggler sweep: the straggler is HA-managed; leaving it for the delete_vm retry",
-			log.String("sid", st.SID), log.String("raw_state", st.Raw))
-		return false
-	}
-	return true
-}
-
-// sweepFastDeleteStragglers scans the cluster for VMs carrying tagDeletingVM
-// (bosh-deleting) and re-issues a skiplock+purge destroy for each one. This
-// makes fast-path deletes self-healing: a VM whose async destroy stalled is
-// reaped by the next fast-path delete call. The sweep is:
-//   - Best-effort: all errors are logged, never propagated.
-//   - Bounded: processes at most sweepStragglersMaxPerSweep per call; any
-//     remainder is logged and left for the next sweep invocation.
-//   - Idempotent: a VM already gone (IsNotFound) is silently skipped.
-//
-// Call from the fast path before issuing the current delete so a straggler
-// accumulation does not grow unbounded across deployments.
-func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logger) {
-	if deps.PVE == nil || deps.PVE.Cluster() == nil {
-		return
-	}
-	protected, err := legacySweepJournalVMIDs(ctx, deps)
-	if err != nil {
-		logger.Warn("delete_vm: journal history unavailable; deferring legacy sweep")
-		return
-	}
-	resp, err := deps.PVE.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{})
-	if err != nil {
-		logger.Warn("delete_vm: straggler sweep: ListResources failed (non-fatal)", log.Err(err))
-		return
-	}
-	if resp == nil {
-		return
-	}
-
-	purge := true
-	skiplock := true
-	processed := 0
-	skipped := 0
-	for _, raw := range *resp {
-		var item stragglerRow
-		if json.Unmarshal(raw, &item) != nil {
-			continue
-		}
-		if !item.candidate(protected, deps.RequestDirectorUUID) {
-			continue
-		}
-		if processed >= sweepStragglersMaxPerSweep {
-			skipped++
-			continue
-		}
-		processed++
-		vmIDStr := strconv.FormatInt(item.VMID.Int(), 10)
-		sweepLogger := logger.With(
-			log.String("node", item.Node),
-			log.String("vmid", vmIDStr),
-		)
-		// Authoritative config read comes FIRST — before any mutation this
-		// straggler triggers. The index row that selected this VMID can be
-		// minutes stale: the tagged VM may already be destroyed and the VMID
-		// reused by a live, untagged VM, in which case the skiplock+purge
-		// below would destroy a healthy guest and every disk it references.
-		// The config read is node-local truth. A "VM already gone" shape
-		// (404, or pmxcfs's config-missing 500) means there is nothing left
-		// to reap; any other read failure defers the straggler (fail-closed).
-		strCfg, authTags, allowed := legacySweepConfig(ctx, deps, item.Node, int(item.VMID.Int()), sweepLogger)
-		if !allowed {
-			continue
-		}
-		sweepLoc := pve.VMLocation{Node: item.Node, Tags: authTags, Found: true, Type: item.Type}
-		if !stragglerOwned(ctx, deps, int(item.VMID.Int()), sweepLoc, strCfg, sweepLogger) {
-			continue
-		}
-		// The sweep's fire-and-forget stop and skiplock destroy suit only a VM
-		// that PVE HA does not manage, on an online node, that holds no
-		// migrate lock. Any other straggler is left for the Director's
-		// delete_vm retry, which runs the HA gate and stops it through PVE HA.
-		if !stragglerHAAllowsSweep(ctx, deps, int(item.VMID.Int()), item.Node, strCfg, sweepLogger) {
-			continue
-		}
-		// A straggler holding a legacy persistent disk named for it would lose
-		// that disk to the purge, and no retry can make the destroy safe. It
-		// stays tagged for the operator, before anything below mutates it.
-		if owned := pve.FindOwnedLegacyPersistentDisks(strCfg, int(item.VMID.Int())); len(owned) > 0 {
-			sweepLogger.Warn("delete_vm: straggler sweep: a legacy persistent disk is named for this VM, so the destroy would free it; leaving the straggler for the operator",
-				log.String("slots", ownedLegacySlots(owned)))
-			continue
-		}
-		// Base value is pve.destroy_unreferenced_disks (default false; see the
-		// config field doc for the cross-cluster shared-storage data-loss
-		// hazard enabling it introduces).
-		//
-		// A straggler may carry tagRetainEphemeral. Its original fast-path delete
-		// stamped bosh-deleting before the retention ran, so the straggler may
-		// still hold its ephemeral disk, or an earlier attempt may already have
-		// transferred that disk to a parker. Re-running the retention transfers a
-		// volume the guest still holds and verifies one that is already parked,
-		// and the destroy flag is forced false for retain-tagged stragglers
-		// regardless of the config knob. When the retention fails, the straggler
-		// is skipped and left for the next sweep rather than destroyed with the
-		// volume in an unknown state. The tag is read from the authoritative
-		// config for the same staleness reason as the deleting tag above.
-		destroyDisks := deps.Config.DestroyUnreferencedDisks
-		if tagsContain(authTags, tagRetainEphemeral) {
-			retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, item.Node, vmIDStr, int(item.VMID.Int()), sweepLogger)
-			if retainErr != nil {
-				sweepLogger.Warn("delete_vm: straggler sweep: retain-ephemeral detach failed; deferring straggler to next sweep (non-fatal)",
-					log.Err(retainErr))
-				continue
-			}
-			destroyDisks = destroyDisks && !retained
-		}
-		// A straggler can still hold a foreign persistent disk on an active
-		// slot: fastPathDeleteVM stamps bosh-deleting BEFORE its
-		// detachForeignActiveDisks call, so a failed detach leaves a tagged
-		// VM whose purge here would destroy the volume. Defer such a
-		// straggler instead of destroying it -- the Director's delete_vm
-		// retry re-runs the real detach (including parker transfers), and
-		// once the disks are off, a later sweep or the retry itself reaps
-		// the VM.
-		if foreign := pve.FindForeignActiveDisks(strCfg, int(item.VMID.Int())); len(foreign) > 0 {
-			sweepLogger.Warn("delete_vm: straggler sweep: foreign persistent disks still attached; deferring to the delete_vm retry to detach them",
-				log.Any("slots", foreign))
-			continue
-		}
-		// Same unusedN protection the sync and fast paths run: a persistent
-		// volume demoted to unusedN (snapshot-pinned, sweep-resistant) would
-		// be destroyed with the VM.
-		if guardErr := guardUnusedVolumes(ctx, deps, item.Node, vmIDStr, int(item.VMID.Int()), deps.Config.DiskStorage); guardErr != nil {
-			sweepLogger.Warn("delete_vm: straggler sweep: unused-volume guard refused destroy; deferring straggler to next sweep (non-fatal)",
-				log.Err(guardErr))
-			continue
-		}
-		// Fire-and-forget: discard the UPID, no await. Purge's pool-membership
-		// interplay: see the synchronous-path DeleteQemu comment in
-		// HandleDeleteVM. Deliberately single-shot, unlike the other cleanup
-		// mutations: the sweep is a self-draining queue (a straggler whose
-		// destroy loses a lock race stays tagged bosh-deleting and the next
-		// fast-path delete re-issues it), so an in-place retry would only
-		// serialize the request path behind contention the queue absorbs for
-		// free.
-		_, delErr := deps.PVE.Nodes().DeleteQemu(ctx, item.Node, vmIDStr, &sdknodes.DeleteQemuParams{
-			Purge:                    &purge,
-			DestroyUnreferencedDisks: &destroyDisks,
-			Skiplock:                 &skiplock,
-		})
-		if delErr != nil {
-			if pve.IsNotFound(delErr) {
-				sweepLogger.Debug("delete_vm: straggler sweep: VM already gone")
-			} else {
-				sweepLogger.Warn("delete_vm: straggler sweep: destroy failed (non-fatal)", log.Err(delErr))
-			}
-			continue
-		}
-		sweepLogger.Info("delete_vm: straggler sweep: re-issued destroy for bosh-deleting VM")
-	}
-	if skipped > 0 {
-		logger.Info("delete_vm: straggler sweep: cap reached; remaining stragglers deferred to next sweep",
-			log.Int("processed", processed),
-			log.Int("deferred", skipped),
-		)
-	}
-}
-
 // fastPathDeleteVM executes the fast-path delete for a single VM. It:
-//  1. Runs sweepFastDeleteStragglers to reap any prior stalled fast-path destroys.
+//  1. Clears the VM's CPI-managed HA rules.
 //  2. Stamps bosh-deleting on the current VM (best-effort, fail-open).
 //  3. Issues Stop fire-and-forget (UPID discarded, no await).
 //  4. Issues DeleteQemu with skiplock=true (handles running/locked VMs) without
@@ -357,10 +98,6 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 func fastPathDeleteVM(
 	ctx context.Context, deps Deps, haState *pve.HAServiceState, node, vmCID string, vmid int, logger *log.Logger,
 ) error {
-	// Reap any straggler fast-path VMs cluster-wide before issuing our own
-	// destroy. Best-effort; never blocks the current delete.
-	sweepFastDeleteStragglers(ctx, deps, logger)
-
 	// Clear the VM's CPI-managed HA rules. Only a VM that is not HA-managed
 	// reaches the fast path, so this deregisters nothing a stop depends on,
 	// and the node-affinity pin it removes would otherwise outlive the VM,
@@ -377,7 +114,7 @@ func fastPathDeleteVM(
 	// Fire-and-forget stop. The UPID is discarded; no await. PVE may not finish
 	// the stop before destroy arrives; the destroy task can still fail on a
 	// running VM, in which case the bosh-deleting stamp above queues this VM for
-	// sweepFastDeleteStragglers to reap on a later fast-path delete.
+	// sweepDeferredTeardowns to reap at the start of a later create_vm or delete_vm.
 	logger.Debug("delete_vm: fast-path: issuing stop fire-and-forget")
 	_, stopErr := deps.PVE.QEMU().Stop(ctx, node, vmid)
 	if stopErr != nil && !pve.IsNotFound(stopErr) {
@@ -401,7 +138,7 @@ func fastPathDeleteVM(
 	// Protect attached persistent disks before the skiplock destroy. Synchronous
 	// config PUTs only — does not introduce an unbounded await. When this detach
 	// fails, the VM stays tagged bosh-deleting with the disk still attached;
-	// sweepFastDeleteStragglers defers exactly that shape (it re-checks for
+	// sweepDeferredTeardowns defers exactly that shape (it re-checks for
 	// foreign active disks before destroying), so the disk survives until a
 	// delete_vm retry detaches it.
 	if protErr := detachForeignActiveDisks(ctx, deps, node, vmCID, vmid, logger); protErr != nil {
@@ -535,6 +272,9 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			return nil, err
 		}
 		vmid := cid.VMID
+		// Drain the queue of disposals an earlier request could not finish
+		// before this delete starts. Best-effort and bounded.
+		sweepDeferredTeardowns(ctx, deps, deps.Log(ctx))
 		// The journal names a VM by its VMID alone, so a stamped CID's
 		// cluster and token are checked before the journal is consulted.
 		if err := refuseStampedManagedDelete(ctx, deps, vmCID, cid); err != nil {
@@ -721,8 +461,9 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 	//
 	// Eventual consistency: a subsequent has_vm call may briefly still see the
 	// VM while PVE's async destroy runs. The bosh-deleting tag marks VMs whose
-	// fast-path destroy was issued but may not have completed; sweepFastDeleteStragglers
-	// reaps them on the next fast-path delete (a self-draining work queue), so a
+	// fast-path destroy was issued but may not have completed; sweepDeferredTeardowns
+	// reaps them at the start of the next create_vm or delete_vm (a self-draining
+	// work queue), so a
 	// stalled async destroy is retried automatically rather than left for manual
 	// `qm destroy <vmid>` cleanup.
 	//
@@ -745,7 +486,21 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 			log.String("sid", haState.SID))
 	}
 
-	return deleteLegacyVMAndArtifacts(ctx, deps, haState, node, vmCID, vmid, vmTags, logger)
+	// Step 4 of the teardown runs the ownership guard and the owned-disk
+	// refusal again on the config the owner node holds right before the
+	// destroy, so nothing the stop or the detaches changed slips past them.
+	owned := func(ctx context.Context, holding pve.QemuHolding) error {
+		checkLoc := loc
+		checkLoc.Node = node
+		if err := refuseUnownedVM(ctx, deps, "delete_vm", vmCID, cid, checkLoc, holding.Config, logger); err != nil {
+			return err
+		}
+		if err := refuseOwnedLegacyDestroy(holding.Config, vmCID, vmid); err != nil {
+			return err
+		}
+		return refuseOwnedLegacyDestroy(holding.WithReplacements(), vmCID, vmid)
+	}
+	return deleteLegacyVMAndArtifacts(ctx, deps, haState, node, vmCID, vmid, vmTags, owned, logger)
 }
 
 // readLegacyDeleteHolding reads the holding of the VM that loc names. When the
@@ -794,75 +549,44 @@ func readLegacyDeleteHolding(
 // rules are cleaned up after the destroy. Any other VM is stopped directly.
 func deleteLegacyVMAndArtifacts(
 	ctx context.Context, deps Deps, haState *pve.HAServiceState, node, vmCID string, vmid int, vmTags string,
-	logger *log.Logger,
+	owned func(context.Context, pve.QemuHolding) error, logger *log.Logger,
 ) (any, error) {
-	// --- stop VM (synchronous path) ---
-	stopDirectly := !haState.Managed()
-	if haState.Managed() {
-		outcome, haStopErr := stopHAManagedVMForDelete(ctx, deps, "delete_vm", haState, vmid, logger)
-		if haStopErr != nil {
-			return nil, haStopErr
-		}
-		stopDirectly = outcome == haStopNotManaged
-	}
-	if stopDirectly {
-		if stopDone, stopErr := stopVMBeforeDelete(ctx, deps, node, vmid, vmCID, logger); stopErr != nil {
-			return nil, stopErr
-		} else if stopDone {
-			cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, logger)
-			cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
-			return nil, nil
-		}
-	}
-
-	// --- protect attached persistent disks: detach foreign-VMID volumes so
-	//     the destroy below cannot take them; refuse if a detach is not
-	//     guaranteed (fail-closed, retriable) ---
-	if protErr := detachForeignActiveDisks(ctx, deps, node, vmCID, vmid, logger); protErr != nil {
-		return nil, deleteVMDriveDeletePendingError(protErr, vmCID, deleteVMStopAwaited)
-	}
-
-	// --- preserve the VM's own ephemeral disk when retain_ephemeral_on_delete is set ---
-	// Retention transfers the volume to a parker before the destroy below.
-	// retained=true whenever the retain tag is present, including when an
-	// earlier attempt already parked the disk, and DestroyUnreferencedDisks is
-	// false on that path. See function doc.
-	retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, node, vmCID, vmid, logger)
-	if retainErr != nil {
-		return nil, deleteVMDriveDeletePendingError(retainErr, vmCID, deleteVMStopAwaited)
-	}
-
-	// --- guard: refuse to destroy if a persistent volume is still attached,
-	//     after finishing any transfer to a parker that stopped after the slot
-	//     delete ---
-	if guardErr := guardUnusedVolumesResumingTransfers(ctx, deps, node, vmCID, vmid, deps.Config.DiskStorage, logger); guardErr != nil {
-		return nil, guardErr
-	}
-
 	// --- opt-in empty-pool reaper: capture membership BEFORE destroy ---
 	// The /cluster/resources row for this vmid (and therefore its pool
 	// membership) disappears once the VM is destroyed, and delete_vm has
 	// no env.bosh to re-derive a pool name from -- so the lookup must run
-	// here, before the destroy call below.
+	// here, before the teardown below.
 	reapPool := capturePoolForReap(ctx, deps, vmid, logger)
 
-	// --- delete VM (synchronous path; see destroyVMWithRecovery for the
-	//     purge/DestroyUnreferencedDisks semantics and recovery ladder) ---
-	deleteResp, alreadyGone, deleteErr := destroyVMWithRecovery(ctx, deps, node, vmCID, vmid, retained, logger)
-	if deleteErr != nil {
-		return nil, deleteErr
+	// --- teardown: stop (through PVE HA for an HA-managed VM), protect the
+	//     disks that must outlive the VM, re-check it on its owner node,
+	//     destroy with purge, and prove it absent (see vmTeardown) ---
+	teardown := &vmTeardown{
+		caller:              "delete_vm",
+		vmCID:               vmCID,
+		vmid:                vmid,
+		node:                node,
+		logger:              logger,
+		gate:                teardownGated,
+		haState:             haState,
+		skiplock:            true,
+		destroyUnreferenced: deps.Config != nil && deps.Config.DestroyUnreferencedDisks,
+		preserve: func(ctx context.Context) (bool, error) {
+			return preserveForLegacyDelete(ctx, deps, node, vmCID, vmid, logger)
+		},
+		owned: owned,
 	}
-	if alreadyGone {
+	result, err := teardown.run(ctx, deps)
+	if err != nil {
+		return nil, err
+	}
+	if result.gone {
+		if result.stage == teardownStageDestroy {
+			cleanupAgentForVM(ctx, deps, node, vmid, logger)
+		}
 		cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, logger)
 		cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
 		return nil, nil
-	}
-
-	// Await the destroy task so the VM is fully purged from PVE before we
-	// return. DeleteQemu returns a UPID as a json.RawMessage; an empty or
-	// null response means PVE completed synchronously and no await is needed.
-	if awaitErr := awaitDeleteTask(ctx, deps, node, vmCID, vmid, deleteResp, logger); awaitErr != nil {
-		return nil, awaitErr
 	}
 
 	// --- HA anti-affinity / DLB / node-affinity pin cleanup (best-effort) ---
@@ -884,6 +608,29 @@ func deleteLegacyVMAndArtifacts(
 
 	logger.Info("delete_vm: VM deleted successfully", log.String("node", node))
 	return nil, nil
+}
+
+// preserveForLegacyDelete is step 3 of delete_vm's teardown. It detaches
+// foreign-VMID volumes so the destroy cannot take them, retains the VM's own
+// ephemeral disk when retain_ephemeral_on_delete is set, and refuses the
+// destroy while an unusedN slot still holds a persistent volume, after
+// finishing any transfer to a parker that stopped after the slot delete. A
+// detach that is not guaranteed fails closed with a retriable error. It
+// reports whether the ephemeral disk was retained, which is true whenever the
+// retain tag is present, including when an earlier attempt already parked the
+// disk, and which forces DestroyUnreferencedDisks off.
+func preserveForLegacyDelete(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) (bool, error) {
+	if protErr := detachForeignActiveDisks(ctx, deps, node, vmCID, vmid, logger); protErr != nil {
+		return false, deleteVMDriveDeletePendingError(protErr, vmCID, deleteVMStopAwaited)
+	}
+	retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, node, vmCID, vmid, logger)
+	if retainErr != nil {
+		return false, deleteVMDriveDeletePendingError(retainErr, vmCID, deleteVMStopAwaited)
+	}
+	if guardErr := guardUnusedVolumesResumingTransfers(ctx, deps, node, vmCID, vmid, deps.Config.DiskStorage, logger); guardErr != nil {
+		return false, guardErr
+	}
+	return retained, nil
 }
 
 // parseDeleteVMArgs extracts and validates the vm_cid argument, returning the
@@ -1029,126 +776,6 @@ func cleanupHAMembershipAfterDestroy(ctx context.Context, deps Deps, haState *pv
 	if err := cleanupHAMembership(ctx, deps, haState, vmid, logger); err != nil {
 		logger.Warn("delete_vm: HA membership cleanup after the destroy refused", log.Err(err))
 	}
-}
-
-// destroyVMWithRecovery issues the DeleteQemu destroy with the standard
-// transient/lock retry, then works the two recoverable refusals PVE can
-// answer with:
-//
-//   - "VM is running - destroy failed": the stop above completed its task,
-//     but a stop accepted while the VM was still HA-managed (the CRM files
-//     the request and the task ends before the LRM halts the guest) can
-//     leave the VM briefly running. Wait until it actually reports stopped,
-//     then destroy once more. Observed live on a DLB-registered compilation
-//     VM.
-//   - config lock (lock: clone|create|...): a killed worker or node reboot
-//     mid-clone/mid-create leaves the guest config locked, which PVE rejects
-//     the destroy against — without recovery the Director would retry
-//     delete_vm forever against a VM that can never come unstuck on its own.
-//     Retry once with skiplock=true when the CPI is authenticated as
-//     root@pam (the only identity PVE honors skiplock for); otherwise
-//     retryDestroyWithSkiplock returns the error unretried and the
-//     still-locked branch below surfaces the actionable `qm unlock` error.
-//
-// Purge removes the VMID from backup/HA/replication configs (per PVE's own
-// API description). Resource-pool membership (pve.vm_pool,
-// stemcell_template_pool) is not explicitly documented as part of what purge
-// cleans up — the delete endpoint's own description separately says it
-// "Removes any VM specific permissions [ACLs] and firewall rules", which is a
-// related but distinct PVE construct from pool membership. A stale
-// pool-membership entry for a deleted VMID (if PVE leaves one) carries no
-// capability risk — there is no VM behind that VMID to act on — but this is
-// not verified against a live cluster; do not depend on the pool member list
-// shrinking immediately after delete_vm without checking your PVE version.
-//
-// DestroyUnreferencedDisks is pve.destroy_unreferenced_disks (default false)
-// AND-ed with !retained, so it is always false on the retain path regardless
-// of the config knob, and otherwise reflects the operator's opt-in. On the
-// retain path the retention has already transferred the ephemeral volume to a
-// parker, which renames it for the parker's VMID, so this destroy neither
-// references nor owns it, and the forced false is a second guard. See
-// detachRetainedEphemeralDisk for the retain rationale and the
-// DestroyUnreferencedDisks field doc on config.CPIConfig for the
-// cross-cluster shared-storage data-loss hazard enabling the knob
-// introduces. When true it triggers pvesm free under the per-storage
-// lockfile for every attached volume, so on bursty deploys this can surface
-// "can't lock file ... got timeout" — the retry wrapper absorbs that signal;
-// everything else propagates immediately.
-//
-// Returns alreadyGone=true for the idempotent not-found path (agent state
-// already cleaned; the caller finishes route cleanup and returns success),
-// which it takes only once confirmVMGone proves the VM absent from the whole
-// cluster. A not-found destroy for a VM that moved is retriable.
-func destroyVMWithRecovery(
-	ctx context.Context, deps Deps, node, vmCID string, vmid int, retained bool, logger *log.Logger,
-) (resp *sdknodes.DeleteQemuResponse, alreadyGone bool, err error) {
-	purge := true
-	destroyDisks := deps.Config.DestroyUnreferencedDisks && !retained
-	logger.Debug("delete_vm: deleting VM")
-	var deleteResp *sdknodes.DeleteQemuResponse
-	attemptDestroy := func() error {
-		// A config lock the loop does not wait out goes straight to the
-		// skiplock recovery below; see lockForRecovery. The loop gets the
-		// rollback destroy's small budget, about 30s of backoff for a config
-		// lock answered as a 500, so a lock that does not clear leaves the
-		// skiplock recovery its share of the operation timeout. attemptDestroy
-		// can run twice, and the full storage-lock budget here would let a
-		// held lock spend several minutes before the recovery got its turn.
-		var lockErr error
-		err := pve.RetryOnTransientOrLock(ctx, logger, "delete_vm", rollbackDestroyMaxAttempts, func() error {
-			var innerErr error
-			deleteResp, innerErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmcid.PathOf(vmid), &sdknodes.DeleteQemuParams{
-				Purge:                    &purge,
-				DestroyUnreferencedDisks: &destroyDisks,
-			})
-			if lockForRecovery(innerErr) {
-				lockErr = innerErr
-				return nil
-			}
-			return innerErr
-		})
-		if lockErr != nil {
-			return lockErr
-		}
-		return err
-	}
-	deleteErr := attemptDestroy()
-	if deleteErr != nil && pve.IsVMRunningDestroyFailure(deleteErr) {
-		logger.Info("delete_vm: VM still running after stop task — waiting for it to halt before destroy retry")
-		if waitErr := waitForVMStopped(ctx, deps, node, vmid, vmCID, logger); waitErr != nil {
-			return nil, false, waitErr
-		}
-		deleteErr = attemptDestroy()
-	}
-	if deleteErr != nil && pve.IsVMConfigLocked(deleteErr) {
-		deleteResp, deleteErr = retryDestroyWithSkiplock(ctx, deps, node, vmid, purge, destroyDisks, deleteErr, logger)
-	}
-	if deleteErr != nil {
-		if pve.IsNotFound(deleteErr) {
-			if goneErr := confirmVMGone(ctx, deps, "delete_vm", vmid, node, "the destroy"); goneErr != nil {
-				return nil, false, goneErr
-			}
-			logger.Info("delete_vm: VM not found during delete and absent from every member -- already deleted, returning success")
-			// Still clean up registry/cloud-init state if it exists; errors
-			// are logged but not fatal.
-			cleanupAgentForVM(ctx, deps, node, vmid, logger)
-			return nil, true, nil
-		}
-		var migrating *skiplockMigrationRefusal
-		if errors.As(deleteErr, &migrating) {
-			return nil, false, migrating.deferral("delete_vm")
-		}
-		if pve.IsVMConfigLocked(deleteErr) {
-			// Still locked after any skiplock attempt: surface an
-			// actionable, retriable error naming the lock type and the
-			// `qm unlock <vmid>` recovery command, instead of a generic
-			// 5xx the Director would retry forever with no diagnostic value.
-			logUnresolvedVMLock(logger, "delete_vm: delete failed", vmid, node, deleteErr)
-			return nil, false, pve.WrapVMConfigLocked(deleteErr, vmid, node)
-		}
-		return nil, false, cpierrors.Wrap(pve.WrapError(deleteErr), fmt.Sprintf("delete_vm: delete VM %s", vmCID))
-	}
-	return deleteResp, false, nil
 }
 
 // stopVMBeforeDelete stops the VM and awaits the stop task.
@@ -1775,39 +1402,4 @@ func reapEmptyPoolIfManaged(ctx context.Context, deps Deps, poolID string, logge
 		logger.Warn("delete_vm: reaper: empty-pool reap failed (non-fatal)",
 			log.String("pool", poolID), log.Err(deleteErr))
 	}
-}
-
-func legacySweepConfig(ctx context.Context, deps Deps, node string, vmid int, sweepLogger *log.Logger) (map[string]any, string, bool) {
-	// Both views, so a straggler whose disk slot has a pending delete still
-	// shows that disk to the sweep's guards.
-	holding, strCfgErr := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
-	if strCfgErr != nil {
-		if pve.IsNotFound(strCfgErr) || pve.IsPmxcfsConfigMissing(strCfgErr) {
-			sweepLogger.Debug("delete_vm: straggler sweep: VM already gone")
-			return nil, "", false
-		}
-		sweepLogger.Warn("delete_vm: straggler sweep: config read failed; deferring straggler to next sweep (non-fatal)",
-			log.Err(strCfgErr))
-		return nil, "", false
-	}
-	if err := refusePendingDriveReplacement("delete_vm: straggler sweep", strconv.Itoa(vmid), holding); err != nil {
-		sweepLogger.Warn("delete_vm: straggler sweep: a pending drive change names a second volume; deferring straggler to next sweep (non-fatal)",
-			log.Err(err))
-		return nil, "", false
-	}
-	strCfg := holding.Config
-	// Re-test the deleting tag from the authoritative config, not the
-	// index row. Tag absent means the row is stale — this VMID's current
-	// occupant was never marked for deletion, so it must not be destroyed.
-	authTags, _ := pve.ConfigString(strCfg, jsonKeyTags)
-	if _, managed, markerErr := pve.ParseStorageAllocationMarker(pve.DescriptionFromConfig(strCfg)); markerErr != nil || managed {
-		sweepLogger.Warn("delete_vm: allocation provenance requires journal reconciliation; skipping legacy sweep")
-		return nil, "", false
-	}
-	if !tagsContain(authTags, tagDeletingVM) {
-		sweepLogger.Warn("delete_vm: straggler sweep: index row is stale — the VM's authoritative config does not carry the deleting tag; skipping (VMID likely reused by a live VM)")
-		return nil, "", false
-	}
-
-	return strCfg, authTags, true
 }

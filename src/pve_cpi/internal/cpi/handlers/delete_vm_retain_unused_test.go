@@ -48,10 +48,10 @@ func TestLegacyStragglerSweepRetainsEphemeralInUnusedSlot(t *testing.T) {
 			deps, client, recorder, journal := legacyRetainVolumeFixture(t, volume, "unused0")
 			client.state.configs[777]["tags"] = ownershipTag + ";" + tagRetainEphemeral + ";" + tagDeletingVM
 			before := journalRecords(t, journal)
-			sweepFastDeleteStragglers(context.Background(), deps, deps.Logger)
+			sweepDeferredTeardowns(context.Background(), deps, deps.Logger)
 			assertLegacyRetained(t, deps, client, recorder, volume)
-			if skiplock := recorder.guestDestroys()[0].params.Skiplock; skiplock == nil || !*skiplock {
-				t.Fatalf("the sweep's destroy did not carry skiplock: %v", skiplock)
+			if skiplock := recorder.guestDestroys()[0].params.Skiplock; skiplock != nil && *skiplock {
+				t.Fatal("the sweep's teardown must never destroy with skiplock")
 			}
 			assertJournalUntouched(t, journal, before)
 		})

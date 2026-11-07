@@ -326,9 +326,11 @@ func TestDeleteVM_ReaperPoolLookupFails_NoOp(t *testing.T) {
 	const vmid = 9006
 	fx := newReaperTestFixture(t, vmid, true, "bosh")
 
-	// Override the cluster service: the first ListResources call (locate VM
-	// via FindVMViaCluster) succeeds; the second (the reaper's pre-destroy
-	// FindVMPoolViaCluster lookup) fails.
+	// Override the cluster service: the first two ListResources calls (the
+	// deferred-teardown sweep, then locate VM via FindVMViaCluster) succeed;
+	// the third (the reaper's pre-destroy FindVMPoolViaCluster lookup) fails.
+	// Later calls, the member list the absence proof after the destroy reads,
+	// succeed again.
 	var calls int
 	fx.deps.PVE = &mockPVEClient{
 		qemuSvc:  fx.deps.PVE.QEMU(),
@@ -337,10 +339,10 @@ func TestDeleteVM_ReaperPoolLookupFails_NoOp(t *testing.T) {
 		clusterSvc: &mockClusterSvc{
 			listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
 				calls++
-				if calls == 1 {
-					return clusterVMOnNodeWithPool(vmid, vmNode, "bosh"), nil
+				if calls == 3 {
+					return nil, errors.New("simulated: pool lookup transport failure")
 				}
-				return nil, errors.New("simulated: pool lookup transport failure")
+				return clusterVMOnNodeWithPool(vmid, vmNode, "bosh"), nil
 			},
 		},
 		storageSvc: &mockStorageService{},

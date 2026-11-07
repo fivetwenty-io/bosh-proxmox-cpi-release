@@ -24,12 +24,21 @@ type kfNodes struct {
 	updateCalls int
 	deleteCalls int
 	updateErr   error // when set, UpdateQemuConfig fails (best-effort path)
+	// destroyed records a destroy, after which kfClient's QEMU view answers
+	// not found for the VM, the way PVE does once the VM is gone.
+	destroyed bool
+	// failedTagCalls counts the tag writes that carry bosh-create-failed, as
+	// opposed to the bosh-deleting stamp a destroying rollback writes first.
+	failedTagCalls int
 }
 
 func (n *kfNodes) UpdateQemuConfig(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
 	n.updateCalls++
 	if params != nil && params.Tags != nil {
 		n.updatedTags = params.Tags
+		if strings.Contains(*params.Tags, tagCreateFailed) {
+			n.failedTagCalls++
+		}
 	}
 	return n.updateErr
 }
@@ -38,6 +47,7 @@ func (n *kfNodes) DeleteQemu(
 	_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams,
 ) (*sdknodes.DeleteQemuResponse, error) {
 	n.deleteCalls++
+	n.destroyed = true
 	return &sdknodes.DeleteQemuResponse{}, nil
 }
 
@@ -61,6 +71,12 @@ func (q *kfQEMU) Config(_ context.Context, _ string, _ int) (map[string]interfac
 	return map[string]interface{}{"tags": q.existingTag}, nil
 }
 
+// Status answers stopped: the rollback reads the status once more before
+// its destroy.
+func (q *kfQEMU) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
+	return map[string]any{"status": "stopped"}, nil
+}
+
 type kfClient struct {
 	pve.Client
 	nodes   sdknodes.Service
@@ -71,10 +87,14 @@ type kfClient struct {
 // Nodes serves the pending read from the QEMU fake's config read.
 func (c *kfClient) Nodes() sdknodes.Service {
 	return &configPendingNodes{Service: c.nodes, config: func(ctx context.Context, node string, vmid int) (map[string]any, error) {
-		return c.qemu.Config(ctx, node, vmid)
+		return c.QEMU().Config(ctx, node, vmid)
 	}}
 }
-func (c *kfClient) QEMU() qemu.Service { return c.qemu }
+
+func (c *kfClient) QEMU() qemu.Service {
+	n, _ := c.nodes.(*kfNodes)
+	return destroyedQEMUView{Service: c.qemu, gone: func() bool { return n != nil && n.destroyed }}
+}
 func (c *kfClient) Cluster() cluster.Service {
 	if c.cluster == nil {
 		return newNAStub()
@@ -153,8 +173,11 @@ func TestRollbackOnExit_DefaultDestroys(t *testing.T) {
 	if q.stopCalls != 1 {
 		t.Errorf("default mode must call cleanupVM (Stop); stopCalls=%d", q.stopCalls)
 	}
-	if nodes.updateCalls != 0 {
-		t.Errorf("default mode must NOT tag-preserve; updateCalls=%d", nodes.updateCalls)
+	if nodes.updatedTags != nil && strings.Contains(*nodes.updatedTags, tagCreateFailed) {
+		t.Errorf("default mode must NOT tag-preserve; tags=%q", *nodes.updatedTags)
+	}
+	if nodes.deleteCalls != 1 {
+		t.Errorf("default mode must destroy the VM once; deleteCalls=%d", nodes.deleteCalls)
 	}
 	if retErr.Error() != "stage 8 failed" {
 		t.Errorf("default mode must leave the error unchanged; got %v", retErr)
@@ -282,7 +305,7 @@ func TestDisposeFailedVM_KeepTagsDefaultDestroys(t *testing.T) {
 	// default mode: destroy, no tag.
 	dn, dq := &kfNodes{}, &kfQEMU{}
 	disposeFailedVM(context.Background(), kfDeps(false, dn, dq), "pve01", 100, kfEnv(), log.NewNopLogger())
-	if dq.stopCalls != 1 || dn.updateCalls != 0 {
-		t.Errorf("default: want destroy-no-tag; stop=%d tag=%d", dq.stopCalls, dn.updateCalls)
+	if dq.stopCalls != 1 || dn.deleteCalls != 1 || (dn.updatedTags != nil && strings.Contains(*dn.updatedTags, tagCreateFailed)) {
+		t.Errorf("default: want destroy-no-tag; stop=%d delete=%d tags=%v", dq.stopCalls, dn.deleteCalls, dn.updatedTags)
 	}
 }

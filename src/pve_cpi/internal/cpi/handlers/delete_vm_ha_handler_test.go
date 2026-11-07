@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -25,6 +26,9 @@ type legacyHADelete struct {
 	scene  *handlers.HADeleteScene
 	deps   handlers.Deps
 	purged bool
+	// gone is the VM after its destroy: the config read answers not found
+	// on every node, so the absence proof after the destroy holds.
+	gone atomic.Bool
 }
 
 func newLegacyHADelete(t *testing.T, scene *handlers.HADeleteScene, node string, cfg *config.CPIConfig) *legacyHADelete {
@@ -32,12 +36,16 @@ func newLegacyHADelete(t *testing.T, scene *handlers.HADeleteScene, node string,
 	d := &legacyHADelete{scene: scene}
 	qemuSvc := &mockQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			if d.gone.Load() {
+				return nil, notFoundAPIErr()
+			}
 			return map[string]any{}, nil
 		},
 	}
 	nodesSvc := &mockNodesService{
 		deleteQemuFn: func(_ context.Context, _ string, _ string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
 			d.purged = params != nil && params.Purge != nil && *params.Purge
+			d.gone.Store(true)
 			// The destroy with purge removes the HA resource, as PVE does.
 			scene.Do(func(s *handlers.HADeleteScene) {
 				s.Events = append(s.Events, "DeleteQemu")

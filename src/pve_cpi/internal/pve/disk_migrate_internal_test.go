@@ -370,3 +370,28 @@ func TestDestroyEmptyMover_Guards(t *testing.T) {
 		}
 	})
 }
+
+// TestDestroyEmptyMover_RefusesADiskInThePendingView covers the volumes a
+// current-config read alone misses: a disk whose attach is still pending, and
+// one whose detach is still pending. The mover's destroy would take either, so
+// both refuse the destroy before it is sent.
+func TestDestroyEmptyMover_RefusesADiskInThePendingView(t *testing.T) {
+	t.Parallel()
+	const tags = `{"key":"tags","value":"bosh-cpi;bosh-parker;bosh-disk-mover"}`
+	for name, item := range map[string]string{
+		"pending attach": `{"key":"scsi1","pending":"data:vm-90007-disk-0,serial=` + dmToken + `"}`,
+		"pending detach": `{"key":"scsi1","value":"data:vm-90007-disk-0,serial=` + dmToken + `","delete":1}`,
+		"pending unused": `{"key":"unused0","pending":"data:vm-90007-disk-0"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			c := &pendingViewsClient{resp: sdknodes.ListQemuPendingResponse{
+				json.RawMessage(tags), json.RawMessage(item),
+			}}
+			err := DestroyEmptyMover(context.Background(), c, nil, dmMoverHolder(90007))
+			if err == nil || !strings.Contains(err.Error(), "still references volumes") {
+				t.Fatalf("err = %v, want the still-references refusal", err)
+			}
+		})
+	}
+}

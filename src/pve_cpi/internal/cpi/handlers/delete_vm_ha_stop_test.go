@@ -173,14 +173,14 @@ func TestHandleDeleteVM_RunningDestroy_WaitBudgetExhausted_Retriable(t *testing.
 	if !strings.Contains(err.Error(), "still") {
 		t.Errorf("error should name the stuck state for the operator; got: %v", err)
 	}
-	if deleteCalls != 1 {
-		t.Errorf("DeleteQemu: want exactly 1 call (no blind retry against a running VM), got %d", deleteCalls)
+	if deleteCalls != 0 {
+		t.Errorf("DeleteQemu: want no call against a VM that never stops, got %d", deleteCalls)
 	}
 }
 
-// The happy path must not issue any status polls — the wait only runs on the
-// running-destroy refusal. Guarded by the mock's panic-on-unconfigured Status
-// in every pre-existing delete test, but pinned explicitly here.
+// The happy path reads the power state once, ahead of the destroy, and
+// never polls: the wait only runs when that read or the destroy finds the VM
+// still running.
 func TestHandleDeleteVM_CleanDestroy_NoStatusPolls(t *testing.T) {
 	t.Parallel()
 
@@ -217,7 +217,7 @@ func TestHandleDeleteVM_CleanDestroy_NoStatusPolls(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if statusCalls != 0 {
-		t.Errorf("Status: want 0 polls on the clean-destroy path, got %d", statusCalls)
+	if statusCalls != 1 {
+		t.Errorf("Status: want only the pre-destroy read on the clean-destroy path, got %d", statusCalls)
 	}
 }

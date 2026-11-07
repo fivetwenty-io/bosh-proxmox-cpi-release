@@ -827,6 +827,12 @@ func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, rec
 		if err := verifyManagedVMDestroyDevices(ctx, deps, record, node, vmid, owned); err != nil {
 			return nil, err
 		}
+		// The owner node must still report the VM stopped right before the
+		// destroy intent is recorded, because the detaches above ran on a
+		// stopped VM and the destroy must not race a restart.
+		if err := requireStoppedOnOwner(ctx, deps, "delete_vm", node, vmid); err != nil {
+			return nil, err
+		}
 
 		purge, sweep := true, false
 		err = managedVMDeleteTask(ctx, deps, handle, "destroy", aj.Target{Node: node, VMID: vmid}, func() (any, error) {

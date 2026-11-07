@@ -669,7 +669,10 @@ func DestroyEmptyMover(ctx context.Context, c Client, logger *log.Logger, mover 
 			mover.VMID, DiskMoverTag)
 	}
 
-	vmCfg, cfgErr := c.QEMU().Config(ctx, mover.Node, mover.VMID)
+	// Both views: a volume whose detach is still pending counts as held, so a
+	// mover is destroyed only when its current config and its pending changes
+	// both show that it holds no disk.
+	holding, cfgErr := ReadQemuHolding(ctx, c, mover.Node, mover.VMID)
 	if cfgErr != nil {
 		if parkerConfigGone(cfgErr) {
 			return nil
@@ -677,6 +680,7 @@ func DestroyEmptyMover(ctx context.Context, c Client, logger *log.Logger, mover 
 		return cpierrors.Wrap(WrapConfigReadError(cfgErr),
 			fmt.Sprintf("DestroyEmptyMover: config read for mover vmid %d", mover.VMID))
 	}
+	vmCfg := holding.Config
 	// The caller's tags came from a scan; the config is authoritative. Both
 	// tags must be present, or this is not a mover no matter what the caller
 	// believed.
@@ -691,15 +695,17 @@ func DestroyEmptyMover(ctx context.Context, c Client, logger *log.Logger, mover 
 			"DestroyEmptyMover: mover vmid %d holds config lock %q (an in-flight operation); deferring the destroy",
 			mover.VMID, lock)
 	}
-	if disks := qemu.ParseDisks(vmCfg); len(disks) > 0 {
-		return cpierrors.Cloud(
-			"DestroyEmptyMover: mover vmid %d still references volumes on active slots %v; refusing to destroy it",
-			mover.VMID, sortedKeys(disks))
-	}
-	if unused := FindUnusedDiskEntries(vmCfg); len(unused) > 0 {
-		return cpierrors.Cloud(
-			"DestroyEmptyMover: mover vmid %d still references volumes on unused entries %v; refusing to destroy it",
-			mover.VMID, sortedKeys(unused))
+	for _, view := range []map[string]any{vmCfg, holding.Replaced} {
+		if disks := qemu.ParseDisks(view); len(disks) > 0 {
+			return cpierrors.Cloud(
+				"DestroyEmptyMover: mover vmid %d still references volumes on active slots %v; refusing to destroy it",
+				mover.VMID, sortedKeys(disks))
+		}
+		if unused := FindUnusedDiskEntries(view); len(unused) > 0 {
+			return cpierrors.Cloud(
+				"DestroyEmptyMover: mover vmid %d still references volumes on unused entries %v; refusing to destroy it",
+				mover.VMID, sortedKeys(unused))
+		}
 	}
 
 	if protErr := setParkerProtection(ctx, c, logger, mover.Node, mover.VMID, false); protErr != nil {

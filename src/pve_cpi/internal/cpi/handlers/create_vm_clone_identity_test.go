@@ -248,9 +248,13 @@ func TestCreateVM_ClonePath_ReplacesInheritedStemcellIdentity(t *testing.T) {
 	// dash in place of the version's dot.
 	// The cluster stamp and the per-VM token follow bosh-cpi. The token is
 	// random, so it is checked for its form and then left out of the compare.
+	// The create's birth tag rides along until its last write removes it, so
+	// it is checked for once and then left out of the compare too.
 	wantTags := "bosh-cpi;bosh-cluster--" + testClusterStamp + ";stemcell--ubuntu-jammy-1-0"
-	if got, token := withoutTokenTag(*params.Tags); got != wantTags || !vmcid.IsStamp(token) {
-		t.Errorf("post-clone params.Tags = %q; want the workload tag set %q with one token tag", *params.Tags, wantTags)
+	withoutBirth, births := withoutBirthTag(*params.Tags)
+	if got, token := withoutTokenTag(withoutBirth); got != wantTags || !vmcid.IsStamp(token) || births != 1 {
+		t.Errorf("post-clone params.Tags = %q; want the workload tag set %q with one token tag and one birth tag",
+			*params.Tags, wantTags)
 	}
 	if params.Description == nil {
 		t.Fatal("post-clone params.Description is nil; the clone keeps the template's provenance JSON")

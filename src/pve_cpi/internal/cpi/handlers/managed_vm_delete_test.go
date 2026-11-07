@@ -243,7 +243,7 @@ func TestLegacySweepProtectsJournalIdentityAfterMarkerRemoval(t *testing.T) {
 	deps, _, client, _ := deleteManagedFixture(t)
 	client.configs[123]["description"] = ""
 	client.configs[123]["tags"] = tagDeletingVM
-	sweepFastDeleteStragglers(t.Context(), deps, deps.Log(t.Context()))
+	sweepDeferredTeardowns(t.Context(), deps, deps.Log(t.Context()))
 	if client.stopCount != 0 || client.destroyCount != 0 {
 		t.Fatal("legacy sweep bypassed retained journal authority")
 	}

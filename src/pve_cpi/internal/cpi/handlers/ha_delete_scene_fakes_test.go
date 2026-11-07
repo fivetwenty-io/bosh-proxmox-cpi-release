@@ -288,6 +288,18 @@ func (c *HASceneCluster) ListStatus(context.Context) (*cluster.ListStatusRespons
 	return c.Scene.statusRows(), nil
 }
 
+// ListConfigNodes names the scene's members when no embedded service answers
+// the member list, so an absence proof that runs after a destroy has members
+// to probe.
+func (c *HASceneCluster) ListConfigNodes(ctx context.Context) (*cluster.ListConfigNodesResponse, error) {
+	if c.Service != nil {
+		return c.Service.ListConfigNodes(ctx)
+	}
+	c.Scene.mu.Lock()
+	defer c.Scene.mu.Unlock()
+	return AbsenceConfigNodes(c.Scene.Members...), nil
+}
+
 func (c *HASceneCluster) ListHaStatusManagerStatus(context.Context) (*cluster.ListHaStatusManagerStatusResponse, error) {
 	c.Scene.mu.Lock()
 	defer c.Scene.mu.Unlock()
@@ -492,6 +504,21 @@ func (n *HASceneNodes) ListTime(context.Context, string) (*nodes.ListTimeRespons
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// DeleteQemu delegates the destroy and, when it purges, removes the VM's HA
+// resource, as PVE's destroy with purge does.
+func (n *HASceneNodes) DeleteQemu(
+	ctx context.Context, node, vmid string, params *nodes.DeleteQemuParams,
+) (*nodes.DeleteQemuResponse, error) {
+	resp, err := n.Service.DeleteQemu(ctx, node, vmid, params)
+	if err == nil && params != nil && params.Purge != nil && *params.Purge {
+		n.Scene.mu.Lock()
+		delete(n.Scene.Requested, "vm:"+vmid)
+		delete(n.Scene.Services, "vm:"+vmid)
+		n.Scene.mu.Unlock()
+	}
+	return resp, err
 }
 
 // HASceneQEMU serves the VM's power state and the direct stop, and delegates

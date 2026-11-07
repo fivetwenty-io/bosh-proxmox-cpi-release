@@ -479,10 +479,17 @@ func TestCreateVM_Fallback_KeepFailed_IntermediateNotTagged(t *testing.T) {
 		t.Errorf("expected 2 Create calls (winner + 1 alternate), got %d", createCalls.Load())
 	}
 	// handleCreateError may call cleanupVM on transient Create errors (VMID sweep).
-	// This is correct — no orphan is left. The key assertion: no UpdateQemuConfig
+	// This is correct — no orphan is left, and that cleanup stamps bosh-deleting
+	// on the VMID before its destroy. The key assertion: no UpdateQemuConfig
 	// was called for keep-failed tagging (no VM was successfully created).
-	if len(n2.updateConfigCalls) != 0 {
-		t.Errorf("expected 0 UpdateQemuConfig calls (no VMs to tag), got %d", len(n2.updateConfigCalls))
+	failedTags := 0
+	for _, call := range n2.updateConfigCalls {
+		if call.params != nil && call.params.Tags != nil && strings.Contains(*call.params.Tags, "bosh-create-failed") {
+			failedTags++
+		}
+	}
+	if failedTags != 0 {
+		t.Errorf("expected 0 bosh-create-failed tag writes (no VMs to tag), got %d", failedTags)
 	}
 }
 

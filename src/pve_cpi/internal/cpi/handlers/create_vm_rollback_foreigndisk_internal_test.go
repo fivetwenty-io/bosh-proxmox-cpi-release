@@ -8,6 +8,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
@@ -30,17 +31,30 @@ type rbfdNodesStub struct {
 	callLog     *[]string
 	deleteCalls int
 	tagWrites   int
+	stampWrites int
+	// destroyed records a destroy, so the client's QEMU view answers not
+	// found for the VM afterwards.
+	destroyed bool
 }
 
 func (n *rbfdNodesStub) DeleteQemu(
 	_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams,
 ) (*sdknodes.DeleteQemuResponse, error) {
 	n.deleteCalls++
+	n.destroyed = true
 	*n.callLog = append(*n.callLog, "delete")
 	return &sdknodes.DeleteQemuResponse{}, nil
 }
 
-func (n *rbfdNodesStub) UpdateQemuConfig(_ context.Context, _, _ string, _ *sdknodes.UpdateQemuConfigParams) error {
+// UpdateQemuConfig tells the bosh-deleting stamp the rollback writes before
+// its teardown apart from the bosh-create-failed tag it writes on a VM it
+// preserves.
+func (n *rbfdNodesStub) UpdateQemuConfig(_ context.Context, _, _ string, p *sdknodes.UpdateQemuConfigParams) error {
+	if p != nil && p.Tags != nil && !strings.Contains(*p.Tags, tagCreateFailed) {
+		n.stampWrites++
+		*n.callLog = append(*n.callLog, "stamp")
+		return nil
+	}
 	n.tagWrites++
 	*n.callLog = append(*n.callLog, "tag")
 	return nil
@@ -64,6 +78,11 @@ type rbfdQEMUStub struct {
 }
 
 func (q *rbfdQEMUStub) Stop(_ context.Context, _ string, _ int) (string, error) { return "", nil }
+
+// Status answers stopped, for the read the teardown makes before its destroy.
+func (q *rbfdQEMUStub) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
+	return map[string]any{"status": "stopped"}, nil
+}
 
 func (q *rbfdQEMUStub) Config(_ context.Context, _ string, _ int) (map[string]any, error) {
 	if q.configErr != nil {
@@ -95,9 +114,11 @@ type rbfdClient struct {
 // Nodes hands the slot-delete helper's raw delete and pending read to the
 // QEMU stub and every other call to the nodes stub.
 func (c *rbfdClient) Nodes() sdknodes.Service {
-	return &SlotDeleteNodes{Service: c.nodes, Config: c.qemu.Config, Delete: c.qemu.deleteConfigKey}
+	return &SlotDeleteNodes{Service: c.nodes, Config: c.QEMU().Config, Delete: c.qemu.deleteConfigKey}
 }
-func (c *rbfdClient) QEMU() qemu.Service { return c.qemu }
+func (c *rbfdClient) QEMU() qemu.Service {
+	return destroyedQEMUView{Service: c.qemu, gone: func() bool { return c.nodes.destroyed }}
+}
 func (c *rbfdClient) Cluster() cluster.Service {
 	s := newNAStub()
 	s.members = []string{"pve01"}
@@ -137,10 +158,11 @@ func TestCleanupVM_ForeignDisk_DetachedBeforePurge(t *testing.T) {
 	callLog := []string{}
 	qemuStub := &rbfdQEMUStub{
 		callLog: &callLog,
-		// Scan read and the slot-delete helper's read before its delete see
-		// the foreign disk; the helper's reads after it, the confirm re-read,
-		// and the unusedN guard read see it gone after the detach.
-		configs: []map[string]any{rbfdForeignCfg(), rbfdForeignCfg(), rbfdCleanCfg(), rbfdCleanCfg()},
+		// The bosh-deleting stamp's read, the scan read, and the slot-delete
+		// helper's read before its delete see the foreign disk; the helper's
+		// reads after it, the confirm re-read, the unusedN guard read, and the
+		// pre-destroy read see it gone after the detach.
+		configs: []map[string]any{rbfdForeignCfg(), rbfdForeignCfg(), rbfdForeignCfg(), rbfdCleanCfg(), rbfdCleanCfg()},
 	}
 	nodesStub := &rbfdNodesStub{callLog: &callLog}
 	deps := rbfdDeps(qemuStub, nodesStub)
@@ -153,7 +175,7 @@ func TestCleanupVM_ForeignDisk_DetachedBeforePurge(t *testing.T) {
 	if nodesStub.deleteCalls != 1 {
 		t.Fatalf("expected 1 DeleteQemu call, got %d", nodesStub.deleteCalls)
 	}
-	if len(callLog) < 2 || callLog[0] != "detach:scsi1" || callLog[len(callLog)-1] != "delete" {
+	if len(callLog) < 3 || callLog[0] != "stamp" || callLog[1] != "detach:scsi1" || callLog[len(callLog)-1] != "delete" {
 		t.Errorf("expected detach before delete, got order %v", callLog)
 	}
 }
@@ -205,8 +227,9 @@ func TestCleanupVM_ForeignDisk_DetachFails_TaggedWhenEnvPresent(t *testing.T) {
 // TestCleanupVM_PmxcfsConfigMissing_PurgeProceeds: pmxcfs reports a vanished
 // VM as a 500 with "Configuration file ... does not exist" prose rather than
 // a 404. The guard must treat that exactly like NotFound -- the VM is gone,
-// there is nothing to protect, and the (idempotent) purge must proceed
-// instead of spuriously preserving a non-existent VM.
+// there is nothing to protect, and the rollback must finish as an idempotent
+// success instead of spuriously preserving a non-existent VM. The teardown
+// proves the absence before its destroy, so no destroy is sent at all.
 func TestCleanupVM_PmxcfsConfigMissing_PurgeProceeds(t *testing.T) {
 	callLog := []string{}
 	qemuStub := &rbfdQEMUStub{
@@ -221,8 +244,11 @@ func TestCleanupVM_PmxcfsConfigMissing_PurgeProceeds(t *testing.T) {
 	if len(qemuStub.detaches) != 0 {
 		t.Errorf("expected no detach attempts for a vanished VM, got %v", qemuStub.detaches)
 	}
-	if nodesStub.deleteCalls != 1 {
-		t.Fatalf("expected the idempotent purge to proceed (1 DeleteQemu call), got %d", nodesStub.deleteCalls)
+	if nodesStub.deleteCalls != 0 {
+		t.Fatalf("a VM proven absent needs no destroy, got %d DeleteQemu calls", nodesStub.deleteCalls)
+	}
+	if nodesStub.tagWrites != 0 {
+		t.Errorf("a vanished VM must not be tagged as preserved, got %d tag writes", nodesStub.tagWrites)
 	}
 }
 

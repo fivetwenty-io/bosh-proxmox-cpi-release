@@ -62,6 +62,36 @@ type mockPVEClient struct {
 	// cpiTaggedQEMU give an untagged fixture VM, so a suite can model a VM
 	// with a stamp or an owner tag without rewriting every row.
 	fixtureTags string
+	// destroyed holds the VMIDs a DeleteQemu through Nodes destroyed, keyed by
+	// VMID. cpiTaggedQEMU answers not found for them afterwards, the way PVE
+	// does once a VM is gone, so the absence proof a teardown runs after its
+	// destroy holds.
+	destroyed sync.Map
+	// pendingDestroys holds the VMIDs a DeleteQemu submitted as a task, keyed
+	// by UPID. The VM is destroyed once that task's await answers OK, so a
+	// destroy task that fails leaves the VM in place, as PVE does.
+	pendingDestroys sync.Map
+}
+
+// markDestroyed records vmid as destroyed. A VMID that does not parse is left
+// alone, because PVE would have refused the destroy.
+func (m *mockPVEClient) markDestroyed(vmid string) {
+	if id, err := strconv.Atoi(vmid); err == nil {
+		m.destroyed.Store(id, true)
+	}
+}
+
+// markCreated clears a destroy record for a VMID a create or clone reused.
+func (m *mockPVEClient) markCreated(vmid any) {
+	if id, err := strconv.Atoi(fmt.Sprint(vmid)); err == nil {
+		m.destroyed.Delete(id)
+	}
+}
+
+// isDestroyed reports whether a destroy removed vmid.
+func (m *mockPVEClient) isDestroyed(vmid int) bool {
+	_, ok := m.destroyed.Load(vmid)
+	return ok
 }
 
 // defaultGuestTags is the tags value an untagged fixture VM is served with.
@@ -77,7 +107,7 @@ func (m *mockPVEClient) QEMU() qemu.Service {
 	if m.qemuSvc == nil {
 		return nil
 	}
-	return cpiTaggedQEMU{Service: m.qemuSvc, tags: m.defaultGuestTags()}
+	return cpiTaggedQEMU{Service: m.qemuSvc, tags: m.defaultGuestTags(), client: m}
 }
 
 // cpiTaggedQEMU gives a fixture VM config the tag every VM this CPI creates
@@ -86,12 +116,43 @@ func (m *mockPVEClient) QEMU() qemu.Service {
 // because the ownership guard judges a VM by the config a handler read and a
 // real VM config is never empty. A nil config and one that sets tags, even to
 // "", are served verbatim.
+//
+// A VM the client's nodes fake destroyed answers not found for its config and
+// status, and the power state of a VM whose QEMU fake scripts no status read
+// is stopped, which is what the teardown reads ahead of its destroy.
 type cpiTaggedQEMU struct {
 	qemu.Service
-	tags string
+	tags   string
+	client *mockPVEClient
+}
+
+func (q cpiTaggedQEMU) destroyed(vmid int) bool { return q.client != nil && q.client.isDestroyed(vmid) }
+
+func (q cpiTaggedQEMU) Status(ctx context.Context, node string, vmid int) (map[string]any, error) {
+	if q.destroyed(vmid) {
+		return nil, &sdkerrors.APIError{HTTPCode: 404}
+	}
+	if m, ok := q.Service.(*mockQEMUService); ok && m.statusFn == nil {
+		return map[string]any{"status": vmStatus}, nil
+	}
+	return q.Service.Status(ctx, node, vmid)
+}
+
+// Create delegates the create and clears the destroy record of the VMID it
+// reused, so a retry that draws a VMID an earlier rollback freed reads the new
+// VM.
+func (q cpiTaggedQEMU) Create(ctx context.Context, node string, params map[string]any) (string, error) {
+	upid, err := q.Service.Create(ctx, node, params)
+	if err == nil && q.client != nil {
+		q.client.markCreated(params["vmid"])
+	}
+	return upid, err
 }
 
 func (q cpiTaggedQEMU) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
+	if q.destroyed(vmid) {
+		return nil, &sdkerrors.APIError{HTTPCode: 404}
+	}
 	cfg, err := q.Service.Config(ctx, node, vmid)
 	if err != nil || cfg == nil {
 		return cfg, err
@@ -191,7 +252,45 @@ func storageStatusResponse(active bool, used, total int64) *nodes.ListStorageSta
 	}
 	return out
 }
-func (m *mockPVEClient) Tasks() tasks.Service         { return m.tasksSvc }
+
+// Tasks serves the wired tasks fake through destroyTaskTracker, so a destroy
+// submitted as a task lands when its await answers OK.
+func (m *mockPVEClient) Tasks() tasks.Service {
+	if m.tasksSvc == nil {
+		return nil
+	}
+	return destroyTaskTracker{Service: m.tasksSvc, client: m}
+}
+
+// destroyTaskTracker delegates every task call and marks the VM of a pending
+// destroy task destroyed once the task is reported finished with OK.
+type destroyTaskTracker struct {
+	tasks.Service
+	client *mockPVEClient
+}
+
+func (d destroyTaskTracker) settle(upid string, status *tasks.Status, err error) {
+	if err != nil || status == nil || status.ExitStatus != "OK" {
+		return
+	}
+	if vmid, ok := d.client.pendingDestroys.LoadAndDelete(upid); ok {
+		d.client.markDestroyed(vmid.(string))
+	}
+}
+
+func (d destroyTaskTracker) Wait(ctx context.Context, node, upid string, opts *tasks.WaitOptions) (*tasks.Status, error) {
+	status, err := d.Service.Wait(ctx, node, upid, opts)
+	d.settle(upid, status, err)
+	return status, err
+}
+
+func (d destroyTaskTracker) GetStatus(ctx context.Context, node, upid string) (*tasks.Status, error) {
+	status, err := d.Service.GetStatus(ctx, node, upid)
+	if status != nil && status.Status == "stopped" {
+		d.settle(upid, status, err)
+	}
+	return status, err
+}
 func (m *mockPVEClient) Storage() storage.Service     { return m.storageSvc }
 func (m *mockPVEClient) CloudInit() cloudinit.Service { return m.cloudInitSvc }
 
@@ -1204,6 +1303,41 @@ func clientConfigRead(c pve.Client) configReadFn {
 	return func(ctx context.Context, node string, vmid int) (map[string]any, error) {
 		return c.QEMU().Config(ctx, node, vmid)
 	}
+}
+
+// DeleteQemu delegates the destroy and records a VM it destroyed on the
+// building client, so the client's QEMU view answers not found for it. A
+// destroy that answers with a task UPID lands when that task's await answers
+// OK.
+func (s *authNodesService) DeleteQemu(
+	ctx context.Context, node, vmid string, params *nodes.DeleteQemuParams,
+) (*nodes.DeleteQemuResponse, error) {
+	resp, err := s.Service.DeleteQemu(ctx, node, vmid, params)
+	if err != nil || s.client == nil {
+		return resp, err
+	}
+	upid := ""
+	if resp != nil {
+		upid, _ = pve.UPIDFromRaw(*resp)
+	}
+	if upid == "" || s.client.tasksSvc == nil {
+		s.client.markDestroyed(vmid)
+	} else {
+		s.client.pendingDestroys.Store(upid, vmid)
+	}
+	return resp, err
+}
+
+// CreateQemuClone delegates the clone and clears the destroy record of the
+// VMID the clone reused.
+func (s *authNodesService) CreateQemuClone(
+	ctx context.Context, node, vmid string, params *nodes.CreateQemuCloneParams,
+) (*nodes.CreateQemuCloneResponse, error) {
+	resp, err := s.Service.CreateQemuClone(ctx, node, vmid, params)
+	if err == nil && s.client != nil && params != nil {
+		s.client.markCreated(params.Newid)
+	}
+	return resp, err
 }
 
 // ListQemuPending serves the pending read from the client's config read.

@@ -126,7 +126,7 @@ func TestDestroyVMWithRecovery_MigrateLockNeverSkiplocks(t *testing.T) {
 	}
 	nodes := &lrNodesStub{deleteErrs: errs}
 	deps := Deps{Config: lrRootPamConfig(), PVE: &lrClient{nodes: nodes, qemu: &lrQEMUStub{}}, Logger: log.NewNopLogger()}
-	_, _, err := destroyVMWithRecovery(crhCtx(), deps, "pve01", "vm-cid", 100, false, log.NewNopLogger())
+	_, _, err := destroyVMWithRecovery(crhCtx(), deps)
 	requireHADeferral(t, err, "holds a migrate lock", "never destroys a VM with skiplock")
 	for i, call := range nodes.deleteCalls {
 		if call.Skiplock != nil && *call.Skiplock {
@@ -196,35 +196,40 @@ func TestRefuseSkiplockDuringMigration(t *testing.T) {
 
 // --- the straggler sweep ---
 
-func TestStragglerHAAllowsSweep(t *testing.T) {
+// TestSweepTeardownGateReadsHAOnceWithoutWaiting pins the sweep's HA gate:
+// one read, no wait, and only a state the table lets proceed on the located
+// node goes on. An HA-managed VM that may proceed goes on too, because the
+// teardown then stops it through PVE HA.
+func TestSweepTeardownGateReadsHAOnceWithoutWaiting(t *testing.T) {
 	for name, tc := range map[string]struct {
 		setup func(*HADeleteScene)
 		node  string
-		cfg   map[string]any
 		want  bool
 	}{
 		"not HA-managed": {setup: func(s *HADeleteScene) { s.Place(101, "pve-node1") }, node: "pve-node1", want: true},
-		"migrate lock": {
-			setup: func(s *HADeleteScene) { s.Place(101, "pve-node1") }, node: "pve-node1",
-			cfg: map[string]any{"lock": "migrate"},
-		},
-		"HA-managed":     {setup: func(s *HADeleteScene) { s.Manage(101, "pve-node1", "started", "started") }, node: "pve-node1"},
+		"HA-managed":     {setup: func(s *HADeleteScene) { s.Manage(101, "pve-node1", "started", "started") }, node: "pve-node1", want: true},
 		"in fence":       {setup: func(s *HADeleteScene) { s.Manage(101, "pve-node2", "started", "fence"); deadNode(s) }, node: "pve-node2"},
 		"unreadable":     {setup: func(s *HADeleteScene) { s.Place(101, "pve-node1"); s.NoLocal = true }, node: "pve-node1"},
 		"HA in motion":   {setup: func(s *HADeleteScene) { s.Manage(101, "pve-node1", "started", "migrate") }, node: "pve-node1"},
-		"ignored by HA":  {setup: func(s *HADeleteScene) { s.Manage(101, "pve-node1", "ignored", "") }, node: "pve-node1"},
-		"stopped by HA":  {setup: func(s *HADeleteScene) { s.Manage(101, "pve-node1", "stopped", "stopped") }, node: "pve-node1"},
+		"ignored by HA":  {setup: func(s *HADeleteScene) { s.Manage(101, "pve-node1", "ignored", "") }, node: "pve-node1", want: true},
+		"stopped by HA":  {setup: func(s *HADeleteScene) { s.Manage(101, "pve-node1", "stopped", "stopped") }, node: "pve-node1", want: true},
 		"offline member": {setup: func(s *HADeleteScene) { s.Place(101, "pve-node2"); deadNode(s) }, node: "pve-node2"},
+		"another node":   {setup: func(s *HADeleteScene) { s.Manage(101, "pve-node1", "started", "started") }, node: "pve-node2"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			scene := NewHADeleteScene()
 			tc.setup(scene)
 			f := newHADeleteFixture(t, scene, 1)
-			if got := stragglerHAAllowsSweep(t.Context(), f.deps, 101, tc.node, tc.cfg, f.logger); got != tc.want {
-				t.Fatalf("sweep allowed = %v, want %v", got, tc.want)
+			teardown := &vmTeardown{caller: "deferred teardown sweep", vmid: 101, node: tc.node, logger: f.logger, gate: teardownGateNoWait}
+			err := teardown.settleHAGate(t.Context(), f.deps)
+			if got := err == nil; got != tc.want {
+				t.Fatalf("sweep gate allowed = %v (err %v), want %v", got, err, tc.want)
+			}
+			if err != nil && !isWholeHADeferral(err) {
+				t.Fatalf("a sweep gate refusal must be an HA deferral, got %T %v", err, err)
 			}
 			if events := scene.EventsSnapshot(); len(events) != 0 {
-				t.Fatalf("the sweep's HA check must write nothing, got %v", events)
+				t.Fatalf("the sweep's HA gate must write nothing, got %v", events)
 			}
 		})
 	}
@@ -315,8 +320,9 @@ func TestCleanupVM_PreservesAnHAManagedVMTheGateDefers(t *testing.T) {
 			if nodes.deleteCalls != 0 {
 				t.Fatalf("a deferred rollback must not destroy the VM, got %d DeleteQemu calls", nodes.deleteCalls)
 			}
-			if nodes.updateCalls != 1 || nodes.updatedTags == nil || !strings.Contains(*nodes.updatedTags, "bosh-create-failed") {
-				t.Fatalf("a deferred rollback must tag the VM it leaves, got %d writes, tags %v", nodes.updateCalls,
+			if nodes.failedTagCalls != 1 || nodes.updatedTags == nil ||
+				!strings.Contains(*nodes.updatedTags, "bosh-create-failed") {
+				t.Fatalf("a deferred rollback must tag the VM it leaves, got %d writes, tags %v", nodes.failedTagCalls,
 					nodes.updatedTags)
 			}
 			if events := scene.EventsSnapshot(); len(events) != 0 {
@@ -359,8 +365,8 @@ func TestCleanupVM_PreservesTheVMWhenHAMembershipIsUnreadable(t *testing.T) {
 		t.Fatalf("an unreadable HA membership must leave the VM, got %d destroys and %d stops", nodes.deleteCalls,
 			q.stopCalls)
 	}
-	if nodes.updateCalls != 1 {
-		t.Fatalf("the preserved VM must be tagged, got %d tag writes", nodes.updateCalls)
+	if nodes.failedTagCalls != 1 {
+		t.Fatalf("the preserved VM must be tagged, got %d tag writes", nodes.failedTagCalls)
 	}
 	if _, ok := cl.rules["bosh-na-100"]; !ok {
 		t.Fatal("the preserved VM must keep its pin rule")

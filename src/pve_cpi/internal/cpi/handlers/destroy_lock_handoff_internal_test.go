@@ -70,8 +70,8 @@ func TestCleanupVM_DestroyLockAs500_ClearsBeforeSkiplock(t *testing.T) {
 			t.Errorf("DeleteQemu call %d carried skiplock; a lock that clears needs none", i)
 		}
 	}
-	if nodes.updateCalls != 0 {
-		t.Errorf("destroy succeeded; the VM must not be tagged as failed (got %d tag writes)", nodes.updateCalls)
+	if nodes.failedTagCalls != 0 {
+		t.Errorf("destroy succeeded; the VM must not be tagged as failed (got %d tag writes)", nodes.failedTagCalls)
 	}
 }
 
@@ -82,7 +82,7 @@ func TestDestroyVMWithRecovery_TaskTextLock_GoesStraightToSkiplock(t *testing.T)
 	q := &lrQEMUStub{}
 	deps := Deps{Config: lrRootPamConfig(), PVE: &lrClient{nodes: nodes, qemu: q}, Logger: log.NewNopLogger()}
 
-	_, gone, err := destroyVMWithRecovery(crhCtx(), deps, "pve01", "vm-cid", 100, false, log.NewNopLogger())
+	_, gone, err := destroyVMWithRecovery(crhCtx(), deps)
 	if err != nil || gone {
 		t.Fatalf("destroyVMWithRecovery = gone %v, err %v; want a clean destroy", gone, err)
 	}
@@ -112,7 +112,7 @@ func TestDestroyVMWithRecovery_LockAs500_IsBoundedBeforeSkiplock(t *testing.T) {
 		return 0
 	})
 
-	_, gone, err := destroyVMWithRecovery(ctx, deps, "pve01", "vm-cid", 100, false, log.NewNopLogger())
+	_, gone, err := destroyVMWithRecovery(ctx, deps)
 	if err != nil || gone {
 		t.Fatalf("destroyVMWithRecovery = gone %v, err %v; want a clean skiplock destroy", gone, err)
 	}
@@ -147,7 +147,7 @@ func TestDestroyVMWithRecovery_SuspendedLockAs500_ReturnsAtOnce(t *testing.T) {
 	q := &lrQEMUStub{}
 	deps := Deps{Config: lrRootPamConfig(), PVE: &lrClient{nodes: nodes, qemu: q}, Logger: log.NewNopLogger()}
 
-	_, gone, err := destroyVMWithRecovery(crhCtx(), deps, "pve01", "vm-cid", 100, false, log.NewNopLogger())
+	_, gone, err := destroyVMWithRecovery(crhCtx(), deps)
 	if err != nil || gone {
 		t.Fatalf("destroyVMWithRecovery = gone %v, err %v; want a clean destroy", gone, err)
 	}
@@ -171,7 +171,7 @@ func TestDestroyVMWithRecovery_LockWithRetryableText_GoesStraightToSkiplock(t *t
 			q := &lrQEMUStub{}
 			deps := Deps{Config: lrRootPamConfig(), PVE: &lrClient{nodes: nodes, qemu: q}, Logger: log.NewNopLogger()}
 
-			_, gone, err := destroyVMWithRecovery(crhCtx(), deps, "pve01", "vm-cid", 100, false, log.NewNopLogger())
+			_, gone, err := destroyVMWithRecovery(crhCtx(), deps)
 			if err != nil || gone {
 				t.Fatalf("destroyVMWithRecovery = gone %v, err %v; want a clean destroy", gone, err)
 			}

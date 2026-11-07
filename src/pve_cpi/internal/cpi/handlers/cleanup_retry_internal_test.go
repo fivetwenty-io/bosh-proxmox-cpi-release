@@ -172,8 +172,9 @@ func TestCleanupVM_DestroyLockTimeout_RetriesAndSucceeds(t *testing.T) {
 	if second := nodes.deleteCalls[1]; second.Skiplock != nil && *second.Skiplock {
 		t.Error("a cfs-lock timeout is not a config lock; the retry must not carry skiplock")
 	}
-	if nodes.updateCalls != 0 {
-		t.Errorf("rollback succeeded after retry; the VM must not be tagged as failed (got %d tag writes)", nodes.updateCalls)
+	if nodes.failedTagCalls != 0 {
+		t.Errorf("rollback succeeded after retry; the VM must not be tagged as failed (got %d tag writes)",
+			nodes.failedTagCalls)
 	}
 }
 
@@ -202,8 +203,9 @@ func TestCleanupVM_SkiplockDestroy_LockTimeout_RetriesAndSucceeds(t *testing.T) 
 			t.Errorf("DeleteQemu call %d must carry skiplock=true", i)
 		}
 	}
-	if nodes.updateCalls != 0 {
-		t.Errorf("destroy succeeded after retry; the VM must not be tagged as failed (got %d tag writes)", nodes.updateCalls)
+	if nodes.failedTagCalls != 0 {
+		t.Errorf("destroy succeeded after retry; the VM must not be tagged as failed (got %d tag writes)",
+			nodes.failedTagCalls)
 	}
 }
 
@@ -231,8 +233,9 @@ func TestCleanupVM_LockClearDestroy_LockTimeout_RetriesAndSucceeds(t *testing.T)
 			t.Errorf("DeleteQemu call %d must not carry skiplock=true for a token identity", i)
 		}
 	}
-	if nodes.updateCalls != 0 {
-		t.Errorf("destroy succeeded after retry; the VM must not be tagged as failed (got %d tag writes)", nodes.updateCalls)
+	if nodes.failedTagCalls != 0 {
+		t.Errorf("destroy succeeded after retry; the VM must not be tagged as failed (got %d tag writes)",
+			nodes.failedTagCalls)
 	}
 }
 
@@ -518,8 +521,9 @@ func TestCleanupVM_ConfigMissing500_SingleCall(t *testing.T) {
 		t.Fatalf("an already-gone verdict must not spend the retry budget: expected 1 DeleteQemu call, got %d",
 			len(nodes.deleteCalls))
 	}
-	if nodes.updateCalls != 0 {
-		t.Errorf("already-gone is idempotent success; the VM must not be tagged as failed (got %d tag writes)", nodes.updateCalls)
+	if nodes.failedTagCalls != 0 {
+		t.Errorf("already-gone is idempotent success; the VM must not be tagged as failed (got %d tag writes)",
+			nodes.failedTagCalls)
 	}
 }
 

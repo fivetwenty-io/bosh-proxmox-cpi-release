@@ -51,13 +51,32 @@ func (q *etQEMU) Config(ctx context.Context, node string, vmid int) (map[string]
 	return map[string]any{}, nil
 }
 
+// Status answers stopped, for the read the rollback's teardown makes before
+// its destroy.
+func (q *etQEMU) Status(context.Context, string, int) (map[string]any, error) {
+	return map[string]any{"status": "stopped"}, nil
+}
+
 type etNodes struct {
 	sdknodes.Service
 	deleteFn func(ctx context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
+	// destroyed records a destroy deleteFn accepted, so the client's QEMU view
+	// answers not found for the VM afterwards.
+	destroyed bool
 }
 
 func (n *etNodes) DeleteQemu(ctx context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-	return n.deleteFn(ctx, node, vmid, params)
+	resp, err := n.deleteFn(ctx, node, vmid, params)
+	if err == nil {
+		n.destroyed = true
+	}
+	return resp, err
+}
+
+// UpdateQemuConfig accepts the bosh-deleting stamp a rollback writes before
+// its destroy.
+func (n *etNodes) UpdateQemuConfig(context.Context, string, string, *sdknodes.UpdateQemuConfigParams) error {
+	return nil
 }
 
 type etClient struct {
@@ -66,18 +85,37 @@ type etClient struct {
 	nodes sdknodes.Service
 }
 
-func (c *etClient) QEMU() qemu.Service { return c.qemu }
+// QEMU answers not found for the VM once the nodes fake records its destroy.
+func (c *etClient) QEMU() qemu.Service {
+	if c.qemu == nil {
+		return nil
+	}
+	return destroyedQEMUView{Service: c.qemu, gone: func() bool {
+		n, ok := c.nodes.(*etNodes)
+		return ok && n.destroyed
+	}}
+}
 
 // Nodes serves the pending read from the QEMU fake's config read.
 func (c *etClient) Nodes() sdknodes.Service {
 	return &configPendingNodes{Service: c.nodes, config: func(ctx context.Context, node string, vmid int) (map[string]any, error) {
-		return c.qemu.Config(ctx, node, vmid)
+		return c.QEMU().Config(ctx, node, vmid)
 	}}
 }
 
 // Cluster returns a fresh not-found-tolerant HA stub: cleanupVM now removes the
 // node-affinity pin unconditionally, so every rollback path touches Cluster().
-func (c *etClient) Cluster() cluster.Service { return newNAStub() }
+// Its members include node1, the node these rollbacks run on, for the absence
+// proof after the destroy.
+func (c *etClient) Cluster() cluster.Service {
+	s := newNAStub()
+	s.members = []string{"node1"}
+	return s
+}
+
+// Pools returns nil, so the rollback's bosh-deleting stamp takes its
+// unlocked best-effort path.
+func (c *etClient) Pools() pve.PoolService { return nil }
 
 type etAgent struct {
 	configureFn func(ctx context.Context, node string, vmid int, cfg agent.AgentConfig) error

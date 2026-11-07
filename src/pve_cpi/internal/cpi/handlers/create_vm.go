@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	mrand "math/rand/v2"
 	"strings"
@@ -14,6 +15,8 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
+	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
 // newCreateVMRetryBackoff builds the backoff function used between
@@ -621,6 +624,11 @@ func createVM(
 		return nil, poolErr
 	}
 
+	// Drain the queue of disposals an earlier request could not finish: VMs
+	// tagged bosh-deleting, and failed or abandoned creates whose birth tag
+	// has aged past any create still running. Best-effort and bounded.
+	sweepDeferredTeardowns(ctx, deps, logger)
+
 	if existing, found, resumeErr := resumeExistingManagedVM(ctx, deps, args, parsed); found || resumeErr != nil {
 		return existing, resumeErr
 	}
@@ -680,6 +688,7 @@ func createVM(
 	if err != nil {
 		return nil, err
 	}
+	addBirthTag(shape, time.Now(), logger)
 
 	// Pre-clone bridge guard: covers the node choices the placement filter
 	// never vetted (target_node pin, local-disk pin, placement disabled).
@@ -742,7 +751,17 @@ func createVM(
 		disposeFailedVM(c, deps, shape.node, vmid, parsed.env, logger)
 	})
 
-	return finishCreatedVM(ctx, deps, logger, parsed, shape, vmid, vmName)
+	created, err := finishCreatedVM(ctx, deps, logger, parsed, shape, vmid, vmName)
+	if err != nil {
+		return nil, err
+	}
+	// The create succeeded, so its birth tag goes as its last mutation. A
+	// failed removal fails the call, and the rollback above destroys the VM,
+	// because a VM that kept the tag would be queued for teardown.
+	if err := removeBirthTag(ctx, deps, shape.node, vmid, logger); err != nil {
+		return nil, err
+	}
+	return created, nil
 }
 
 // finishCreatedVM applies the common post-create phases. The caller owns rollback
@@ -1036,6 +1055,7 @@ func createVMWithFallback(
 	if err != nil {
 		return nil, err
 	}
+	addBirthTag(shape, time.Now(), logger)
 
 	// Build the ordered list of candidates: [winner, alternates...].
 	candidates := make([]string, 0, 1+len(alternates))
@@ -1222,6 +1242,11 @@ func createVMWithFallback(
 			}
 		}
 
+		// The create succeeded, so its birth tag goes as its last mutation; see
+		// createVM.
+		if err := removeBirthTag(ctx, deps, winShape.node, winningVMID, logger); err != nil {
+			return nil, err
+		}
 		vmCID := directorVMCID(deps.Config, winningVMID, winShape.initialTags)
 		return []any{vmCID, responseNetworks}, nil
 	}
@@ -2347,4 +2372,79 @@ func keepEarlierAttemptError(earlier, guard error) error {
 		return earlier
 	}
 	return guard
+}
+
+// addBirthTag puts the create's birth tag (see birthTagPrefix) into the shape's
+// initial tags, right behind the ownership and stamp tags, so the first config
+// write that carries the workload tags carries it too: the create parameters
+// on the import path, and the first resource update after a clone. A failed or
+// abandoned create therefore always leaves the tag behind, and the
+// deferred-teardown sweep reaps the VM once the tag is older than any create
+// could still be running. When the byte cap has to drop a tail tag to make
+// room, the dropped tag is logged.
+func addBirthTag(shape *createVMShape, now time.Time, logger *log.Logger) {
+	tags, dropped := withBirthTag(shape.initialTags, birthTagFor(now))
+	if len(dropped) > 0 {
+		logger.Warn("create_vm: tag-length cap dropped tags to make room for the birth tag",
+			log.String("dropped", strings.Join(dropped, ";")))
+	}
+	shape.initialTags = tags
+}
+
+// removeBirthTag removes every birth tag from the VM's tags through
+// pve.MutateVMConfig, so the write survives a migration that starts mid-call.
+// The write carries the config digest it read, so it never overwrites a tag
+// change that landed in between, and a config without a birth tag is left
+// alone. Any failure is returned, wrapped as a CPI error.
+func removeBirthTag(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) error {
+	const label = "create_vm: remove the birth tag"
+	_, err := pve.MutateVMConfig(ctx, deps.PVE, logger, pve.VMConfigMutation{
+		VMID:       vmid,
+		Node:       node,
+		MotionWait: haMotionWait(deps),
+		Label:      label,
+		Apply: func(ctx context.Context, node string) error {
+			cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+			if err != nil {
+				return err
+			}
+			raw, _ := pve.ConfigString(cfg, jsonKeyTags)
+			entries := parseTagsField(raw)
+			kept := withoutBirthTags(entries)
+			if len(kept) == len(entries) {
+				return nil
+			}
+			tags := strings.Join(kept, ";")
+			params := &sdknodes.UpdateQemuConfigParams{Tags: &tags}
+			if digest, ok := pve.ConfigString(cfg, "digest"); ok && digest != "" {
+				params.Digest = &digest
+			}
+			if len(kept) == 0 {
+				del := jsonKeyTags
+				params = &sdknodes.UpdateQemuConfigParams{Delete: &del, Digest: params.Digest}
+			}
+			return deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmcid.PathOf(vmid), params)
+		},
+		Landed: func(ctx context.Context, node string) (bool, error) {
+			cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+			if err != nil {
+				return false, err
+			}
+			raw, _ := pve.ConfigString(cfg, jsonKeyTags)
+			for _, tag := range parseTagsField(raw) {
+				if isBirthTag(tag) {
+					return false, nil
+				}
+			}
+			return true, nil
+		},
+	})
+	if err != nil {
+		var typed *cpierrors.Error
+		if errors.As(err, &typed) {
+			return err
+		}
+		return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("%s of VM %d", label, vmid))
+	}
+	return nil
 }

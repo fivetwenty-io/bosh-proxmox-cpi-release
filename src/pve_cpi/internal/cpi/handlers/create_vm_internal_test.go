@@ -1453,6 +1453,17 @@ type templateGapNodesSvc struct {
 	cloneCapture     *struct{ node, vmidStr string }
 	cloneErr         error
 	deleteQemuFn     func(ctx context.Context, node, vmidStr string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
+	// destroyed records a destroy deleteQemuFn accepted, so the client's QEMU
+	// view answers not found for the VM afterwards.
+	destroyed bool
+	// tagWrites counts the config writes, which a rollback sends as its
+	// bosh-deleting stamp and as the bosh-create-failed tag.
+	tagWrites int
+}
+
+func (n *templateGapNodesSvc) UpdateQemuConfig(context.Context, string, string, *sdknodes.UpdateQemuConfigParams) error {
+	n.tagWrites++
+	return nil
 }
 
 // ListTime fails, which the node health helper reads as an unreadable clock and
@@ -1463,7 +1474,11 @@ func (n *templateGapNodesSvc) ListTime(context.Context, string) (*sdknodes.ListT
 
 func (n *templateGapNodesSvc) DeleteQemu(ctx context.Context, node, vmidStr string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
 	if n.deleteQemuFn != nil {
-		return n.deleteQemuFn(ctx, node, vmidStr, params)
+		resp, err := n.deleteQemuFn(ctx, node, vmidStr, params)
+		if err == nil {
+			n.destroyed = true
+		}
+		return resp, err
 	}
 	panic("templateGapNodesSvc.DeleteQemu: not expected (set deleteQemuFn to intercept)")
 }
@@ -1538,11 +1553,15 @@ type templateGapPVE struct {
 // resolution "undeterminable", which fails open to this test's pre-existing
 // (vm_storage-keyed) expectations — the test asserts on clone-error handling
 // and ListQemu, not on clone-mode selection.
+//
+// Once the nodes fake records a destroy, the VM's config and status answer not
+// found, the way PVE does once the VM is gone.
 func (p *templateGapPVE) QEMU() sdkqemu.Service {
+	var svc sdkqemu.Service = &etQEMU{}
 	if p.qemu != nil {
-		return p.qemu
+		svc = p.qemu
 	}
-	return &etQEMU{}
+	return destroyedQEMUView{Service: svc, gone: func() bool { return p.nodes != nil && p.nodes.destroyed }}
 }
 
 // Nodes wraps the test's nodes service so the authoritative template lookup

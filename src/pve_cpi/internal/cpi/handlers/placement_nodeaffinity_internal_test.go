@@ -64,6 +64,9 @@ func newNAStub() *naClusterStub {
 	return &naClusterStub{
 		resources: map[string]bool{}, resComments: map[string]string{},
 		rules: map[string]cluster.CreateHaRulesParams{},
+		// pve01 is the node the rollback and delete fixtures run on, so the
+		// absence proof after their destroy has a member to probe.
+		members: []string{"pve01"},
 	}
 }
 

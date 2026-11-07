@@ -30,7 +30,9 @@ var vmidPathSegment = regexp.MustCompile(`^/nodes/[^/]+/(?:qemu|lxc)/([^/]+)`)
 
 // strictVMIDPVE is an httptest PVE that answers 400 for any request whose vmid
 // path segment is not all digits, the way real PVE does, and records every
-// such request. It serves one running VM, 101, on node pve1.
+// such request. It serves one running VM, 101, on node pve1. A stop request
+// powers the VM off, and a destroy removes it, so a delete's checks before and
+// after its destroy see what PVE would answer.
 type strictVMIDPVE struct {
 	server *httptest.Server
 
@@ -38,6 +40,22 @@ type strictVMIDPVE struct {
 	pools      map[string]string
 	badVMID    []string
 	vmRequests []string
+	stopped    bool
+	destroyed  bool
+}
+
+// vmState applies a stop or destroy request for VM 101 and reports the VM's
+// state after it.
+func (f *strictVMIDPVE) vmState(r *http.Request, path string) (stopped, destroyed bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch {
+	case r.Method == http.MethodPost && path == "/nodes/pve1/qemu/101/status/stop":
+		f.stopped = true
+	case r.Method == http.MethodDelete && path == "/nodes/pve1/qemu/101":
+		f.destroyed = true
+	}
+	return f.stopped, f.destroyed
 }
 
 func newStrictVMIDPVE(t *testing.T) *strictVMIDPVE {
@@ -74,6 +92,20 @@ func (f *strictVMIDPVE) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	stopped, destroyed := f.vmState(r, path)
+	if destroyed && r.Method == http.MethodGet && strings.HasPrefix(path, "/nodes/pve1/qemu/101/") {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data":    nil,
+			"message": "Configuration file 'nodes/pve1/qemu-server/101.conf' does not exist",
+		})
+		return
+	}
+	power := "running"
+	if stopped {
+		power = "stopped"
+	}
+
 	var data any
 	switch {
 	case path == "/access/ticket":
@@ -86,9 +118,11 @@ func (f *strictVMIDPVE) serve(w http.ResponseWriter, r *http.Request) {
 		data = map[string]any{"version": "8.4.1", "release": "8.4", "repoid": "fake"}
 	case path == "/nodes":
 		data = []any{map[string]any{"node": "pve1", "status": "online"}}
+	case path == "/cluster/resources" && destroyed:
+		data = []any{}
 	case path == "/cluster/resources":
 		data = []any{map[string]any{
-			"id": "qemu/101", "type": "qemu", "vmid": 101, "node": "pve1", "status": "running",
+			"id": "qemu/101", "type": "qemu", "vmid": 101, "node": "pve1", "status": power,
 			"name": "vm-101", "tags": stampedFixtureTags,
 		}}
 	case path == "/cluster/status":
@@ -100,7 +134,7 @@ func (f *strictVMIDPVE) serve(w http.ResponseWriter, r *http.Request) {
 	case path == "/cluster/config/nodes":
 		data = []any{map[string]any{"name": "pve1"}}
 	case strings.HasSuffix(path, "/status/current"):
-		data = map[string]any{"status": "running", "vmid": 101}
+		data = map[string]any{"status": power, "vmid": 101}
 	case strings.HasSuffix(path, "/pending") && r.Method == http.MethodGet:
 		data = []any{
 			map[string]any{"key": "name", "value": "vm-101"},
@@ -108,8 +142,10 @@ func (f *strictVMIDPVE) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	case strings.HasSuffix(path, "/config") && r.Method == http.MethodGet:
 		data = map[string]any{"name": "vm-101", "tags": stampedFixtureTags, "description": ""}
+	case r.Method == http.MethodGet && strings.HasSuffix(path, "/qemu") && destroyed:
+		data = []any{}
 	case r.Method == http.MethodGet && strings.HasSuffix(path, "/qemu"):
-		data = []any{map[string]any{"vmid": 101, "status": "running", "name": "vm-101", "tags": stampedFixtureTags}}
+		data = []any{map[string]any{"vmid": 101, "status": power, "name": "vm-101", "tags": stampedFixtureTags}}
 	case strings.Contains(path, "/tasks/"):
 		data = map[string]any{"status": "stopped", "exitstatus": "OK"}
 	case r.Method == http.MethodGet:

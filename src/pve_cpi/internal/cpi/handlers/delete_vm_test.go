@@ -1431,14 +1431,14 @@ func TestHandleDeleteVM_FastPath_SweepSkipsGoneStraggler(t *testing.T) {
 }
 
 // TestHandleDeleteVM_FastPath_SweepFailOpen verifies that a ListResources
-// failure in the straggler sweep does not block the current delete.
+// failure in the deferred-teardown sweep does not block the current delete.
 //
-// HandleDeleteVM calls ListResources TWICE when fast_path_delete is on:
-//   - Call #1: FindVMNodeViaCluster (locate step) — must succeed so the delete proceeds.
-//   - Call #2: sweepFastDeleteStragglers — may fail; failure must be non-fatal.
+// HandleDeleteVM runs the sweep before it locates the VM:
+//   - Call #1: sweepDeferredTeardowns — may fail; failure must be non-fatal.
+//   - Later calls: FindVMNodeViaCluster (locate step) — must succeed so the delete proceeds.
 //
-// The call-counter mock returns the target VM on the first call and an error on
-// the second, proving locate succeeds while sweep fails open.
+// The call-counter mock returns an error on the first call and the target VM on
+// every later one, proving the sweep fails open while locate succeeds.
 func TestHandleDeleteVM_FastPath_SweepFailOpen(t *testing.T) {
 	t.Parallel()
 
@@ -1458,11 +1458,11 @@ func TestHandleDeleteVM_FastPath_SweepFailOpen(t *testing.T) {
 		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
 			listCallCount++
 			if listCallCount == 1 {
-				// First call: FindVMNodeViaCluster — return the target VM so locate succeeds.
-				return &locateResp, nil
+				// First call: sweepDeferredTeardowns — simulate cluster unreachable.
+				return nil, errors.New("cluster: connection refused")
 			}
-			// Second call: sweepFastDeleteStragglers — simulate cluster unreachable.
-			return nil, errors.New("cluster: connection refused")
+			// Later calls: FindVMNodeViaCluster — return the target VM so locate succeeds.
+			return &locateResp, nil
 		},
 	}
 
@@ -2238,10 +2238,12 @@ func TestHandleDeleteVM_TaggedRow_NoParkerConfigFallback(t *testing.T) {
 	//   1. detachForeignActiveDisks — foreign-disk guard
 	//   2. detachRetainedEphemeralDisk — retain-ephemeral tag check (exits early on no tag)
 	//   3. guardUnusedVolumes — unusedN guard
-	// Totalling 3 when no detach occurs. The parker check must add zero additional
-	// config calls when ParkedStrategyActive=false (range unset). Assert count ≤ 3.
-	if configCalls > 4 {
-		t.Errorf("range-unset: Config called %d times; expected ≤4 (including allocation provenance verification)", configCalls)
+	//   4. the pre-destroy ownership and lock check on both config views
+	// plus the allocation provenance verification, totalling 5 when no detach
+	// occurs. The parker check must add zero additional config calls when
+	// ParkedStrategyActive=false (range unset). Assert count ≤ 5.
+	if configCalls > 5 {
+		t.Errorf("range-unset: Config called %d times; expected ≤5 (including allocation provenance verification)", configCalls)
 	}
 }
 

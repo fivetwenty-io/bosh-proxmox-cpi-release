@@ -96,3 +96,17 @@ func withoutTokenTag(tags string) (rest, token string) {
 	}
 	return strings.Join(kept, ";"), token
 }
+
+// withoutBirthTag drops the bosh-creating-<unix> birth tag a create carries
+// until its last write, and reports how many it dropped.
+func withoutBirthTag(tags string) (rest string, births int) {
+	kept := make([]string, 0, 8)
+	for _, entry := range strings.Split(tags, ";") {
+		if strings.HasPrefix(entry, "bosh-creating-") {
+			births++
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	return strings.Join(kept, ";"), births
+}

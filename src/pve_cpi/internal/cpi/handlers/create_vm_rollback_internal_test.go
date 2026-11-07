@@ -24,12 +24,16 @@ type rbNodesStub struct {
 	sdknodes.Service // embedded nil: panics on any unconfigured method
 
 	deleteCalls []*sdknodes.DeleteQemuParams
+	// destroyed records a destroy, so the client's QEMU view answers not
+	// found for the VM afterwards.
+	destroyed bool
 }
 
 func (n *rbNodesStub) DeleteQemu(
 	_ context.Context, _, _ string, params *sdknodes.DeleteQemuParams,
 ) (*sdknodes.DeleteQemuResponse, error) {
 	n.deleteCalls = append(n.deleteCalls, params)
+	n.destroyed = true
 	return &sdknodes.DeleteQemuResponse{}, nil
 }
 
@@ -46,6 +50,11 @@ type rbQEMUStub struct {
 }
 
 func (q *rbQEMUStub) Stop(_ context.Context, _ string, _ int) (string, error) { return "", nil }
+
+// Status answers stopped, for the read the teardown makes before its destroy.
+func (q *rbQEMUStub) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
+	return map[string]any{"status": "stopped"}, nil
+}
 
 func (q *rbQEMUStub) Config(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
 	return map[string]interface{}{}, nil
@@ -64,10 +73,12 @@ type rbClient struct {
 // Nodes serves the pending read from the QEMU stub's config read.
 func (c *rbClient) Nodes() sdknodes.Service {
 	return &configPendingNodes{Service: c.nodes, config: func(ctx context.Context, node string, vmid int) (map[string]any, error) {
-		return c.qemu.Config(ctx, node, vmid)
+		return c.QEMU().Config(ctx, node, vmid)
 	}}
 }
-func (c *rbClient) QEMU() qemu.Service       { return c.qemu }
+func (c *rbClient) QEMU() qemu.Service {
+	return destroyedQEMUView{Service: c.qemu, gone: func() bool { return c.nodes.destroyed }}
+}
 func (c *rbClient) Cluster() cluster.Service { return newNAStub() }
 
 // Pools returns nil so tagFailedVM's withVMIDLock falls back to the

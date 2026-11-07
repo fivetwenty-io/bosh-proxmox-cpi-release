@@ -273,12 +273,20 @@ func SetVMLockClearBounds(interval, maxWait time.Duration) func() {
 // bounded for it to clear (awaitVMConfigLockClear), then destroy once more.
 // Without this, every token-authenticated deploy that loses a clone mid-task
 // leaks a locked orphan that only `qm unlock` can free. When the lock never
-// clears, origErr is returned unchanged so the caller's lock classification
-// still fires.
+// clears, or its state cannot be read, origErr is returned unchanged so the
+// caller's lock classification still fires.
+//
+// recheck runs before the second destroy, because the task that held the lock
+// may have attached a volume or started the VM while the destroy waited. Its
+// error is returned and nothing is destroyed. When it reports the VM gone,
+// no destroy is sent, and the nil response hands the decision to the
+// caller's absence proof.
 func retryDestroyAfterLockClear(
 	ctx context.Context, deps Deps, node string, vmid int,
-	purge, destroyUnref bool, origErr error, logger *log.Logger,
+	destroyUnref bool, origErr error, recheck func(context.Context) (bool, error), logger *log.Logger,
 ) (*sdknodes.DeleteQemuResponse, error) {
+	// Every teardown destroy purges, so PVE drops the VM's HA resource with it.
+	purge := true
 	logger.Info("create_vm: rollback delete blocked by a config lock; waiting for the in-flight task to release it",
 		log.Int(metadataKeyVMID, vmid),
 		log.String("node", node),
@@ -287,10 +295,19 @@ func retryDestroyAfterLockClear(
 	if !awaitVMConfigLockClear(ctx, deps, node, vmid, logger) {
 		return nil, origErr
 	}
+	if recheck != nil {
+		gone, err := recheck(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if gone {
+			return nil, nil
+		}
+	}
 	// Not single-shot: the post-lock-clear destroy is the last chance to
-	// reclaim this VM (nothing re-drives a rollback), and storage contention
-	// that outlived the lock would otherwise orphan it on one timeout. Same
-	// budget and already-gone short-circuit as the primary destroy.
+	// reclaim this VM in this request, and storage contention that outlived
+	// the lock would otherwise orphan it on one timeout. Same budget and
+	// already-gone short-circuit as the primary destroy.
 	var resp *sdknodes.DeleteQemuResponse
 	var delErr error
 	_ = pve.RetryOnTransientOrLock(ctx, logger, "vm_lock_recovery.lockclear_destroy", rollbackDestroyMaxAttempts, func() error {
@@ -314,19 +331,31 @@ func retryDestroyAfterLockClear(
 // cannot skiplock (every API token): a destroy refused with `lock: clone` is
 // usually blocked by the failed clone's own in-flight task, which finishes or
 // dies on its own, so a bounded wait converts a guaranteed orphan into a
-// completed cleanup. Config-read errors and a VM that disappears mid-poll
-// both report true: the follow-up destroy is the authority on what remains
-// (a gone VM makes it an idempotent 404), and a read blip must not strand
-// the orphan without even attempting the retry.
+// completed cleanup. A VM that disappears mid-poll reports true, because the
+// follow-up recheck and destroy prove its absence. A config read that fails
+// any other way reports false: the lock's state is unknown, and the destroy
+// never runs on a lock it cannot see. A migrate lock reports false at once,
+// because the CPI never destroys a VM while it migrates.
 func awaitVMConfigLockClear(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) bool {
 	deadline := time.Now().Add(time.Duration(vmLockClearMaxWaitNs.Load()))
 	for {
 		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
 		if cfgErr != nil {
-			return true
+			if pve.IsNotFound(cfgErr) || pve.IsPmxcfsConfigMissing(cfgErr) {
+				return true
+			}
+			logger.Warn("VM config could not be read while waiting for its lock to clear; not destroying it",
+				log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Err(cfgErr))
+			return false
 		}
-		if lock, _ := pve.ConfigString(cfg, "lock"); lock == "" {
+		lock, _ := pve.ConfigString(cfg, "lock")
+		switch strings.TrimSpace(lock) {
+		case "":
 			return true
+		case vmLockMigrate:
+			logger.Warn("VM holds a migrate lock; not waiting to destroy it during the migration",
+				log.Int(metadataKeyVMID, vmid), log.String("node", node))
+			return false
 		}
 		if time.Now().After(deadline) {
 			logger.Warn("VM config lock did not clear within the wait budget",
