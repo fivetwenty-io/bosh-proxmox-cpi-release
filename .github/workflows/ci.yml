@@ -89,6 +89,11 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # The template render check reads the v0.9.5 template with git show,
+          # so the checkout needs the full history and every tag.
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Mark workspace safe for git
         # The host-mounted workspace has a different owner than the container

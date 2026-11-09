@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# _test_erb_render.sh — render jobs/pve_cpi/templates/cpi.json.erb under three
-# credential combinations and assert the resulting JSON has the expected shape:
+# _test_erb_render.sh — render jobs/pve_cpi/templates/cpi.json.erb under each
+# case below and assert the resulting JSON has the expected shape. The first
+# three cases cover the credential combinations:
 #
 #   1. password-only   → JSON includes "password" key, omits "api_token" key
 #   2. api_token-only  → JSON includes "api_token" key, omits "password" key
@@ -15,7 +16,7 @@
 #
 # Usage: bash scripts/_test_erb_render.sh
 # Exit:  0 = all renders + assertions passed
-#        1 = an assertion failed
+#        1 = an assertion failed (including a missing v0.9.5 tag when CI is set)
 #        2 = ruby not installed (soft skip)
 
 set -euo pipefail
@@ -656,6 +657,21 @@ for host_json in '{"host":null,"endpoints":["a.example.com:9000","b.example.com"
   assert_json_key_equals "case14-hostless" "$JSON_14H" host "" || FAILED=$((FAILED+1))
 done
 
+# A blank pve.host counts as unset: with a list it renders an empty host, and
+# the CPI takes the first entry; without one the render raises.
+JSON_14B="$(render "$(props_with_pve '{"host":"  ","endpoints":["a.example.com:9000"]}')")"
+assert_json_valid "case14-blank-host" "$JSON_14B" || FAILED=$((FAILED+1))
+assert_json_key_equals "case14-blank-host" "$JSON_14B" host "" || FAILED=$((FAILED+1))
+assert_pve_render_raises "case14-blank-host-alone" '{"host":"  "}' "pve.host or pve.endpoints is required"
+
+# The list must be an array of strings; the CPI's JSON parser rejects anything
+# else at run time, so the render raises at deploy time instead.
+assert_pve_render_raises "case14-scalar" '{"endpoints":"a.example.com"}' "pve.endpoints must be a list of strings"
+assert_pve_render_raises "case14-scalar-empty" '{"endpoints":""}' "pve.endpoints must be a list of strings"
+assert_pve_render_raises "case14-map" '{"endpoints":{"a":"b"}}' "pve.endpoints must be a list of strings"
+assert_pve_render_raises "case14-nonstring-entry" '{"endpoints":["a.example.com",8006]}' "pve.endpoints must be a list of strings"
+assert_pve_render_raises "case14-null-entry" '{"endpoints":["a.example.com",null]}' "pve.endpoints must be a list of strings"
+
 # Neither property set: the render raises and names both.
 assert_pve_render_raises "case14-neither-unset" '{"host":null}' "pve.host or pve.endpoints is required"
 assert_pve_render_raises "case14-neither-empty" '{"host":"","endpoints":[]}' "pve.host or pve.endpoints is required"
@@ -663,7 +679,9 @@ assert_pve_render_raises "case14-neither-null-list" '{"host":null,"endpoints":nu
 
 # The recommended rollback manifest sets both pve.host and pve.endpoints. The
 # 0.9.5 template does not know pve.endpoints, and it has to render that
-# manifest anyway, with the host it reads. CI checks out every tag.
+# manifest anyway, with the host it reads. A developer checkout without tags
+# skips this case; with CI set, a missing tag fails the script so the check
+# cannot go quiet.
 OLD_ERB="$(mktemp "${TMPDIR:-/tmp}/cpi-0.9.5.XXXXXX")"
 trap 'rm -f "$OLD_ERB"' EXIT
 if git -C "$REPO_ROOT" show v0.9.5:jobs/pve_cpi/templates/cpi.json.erb > "$OLD_ERB" 2>/dev/null; then
@@ -671,6 +689,9 @@ if git -C "$REPO_ROOT" show v0.9.5:jobs/pve_cpi/templates/cpi.json.erb > "$OLD_E
   assert_json_valid      "case14-rollback" "$JSON_14R"                     || FAILED=$((FAILED+1))
   assert_json_key_equals "case14-rollback" "$JSON_14R" host pve.example.com || FAILED=$((FAILED+1))
   assert_json_lacks_key  "case14-rollback" "$JSON_14R" endpoints           || FAILED=$((FAILED+1))
+elif [ -n "${CI:-}" ]; then
+  echo "FAIL [case14-rollback]: tag v0.9.5 is not in this checkout, and CI requires it (fetch with tags)" >&2
+  FAILED=$((FAILED+1))
 else
   echo "SKIP [case14-rollback]: tag v0.9.5 is not in this checkout (fetch tags to run it)" >&2
 fi
@@ -691,5 +712,5 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
-echo "RESULT: all 3 cred combinations rendered and asserted clean"
+echo "RESULT: every case rendered and asserted clean"
 exit 0

@@ -1,6 +1,6 @@
 <%=
   config = {
-    "host"             => p("pve.host", ""),
+    "host"             => (pve_host = p("pve.host", "").to_s).strip.empty? ? "" : pve_host,
     "port"             => p("pve.port"),
     "user"             => p("pve.user"),
     "realm"            => p("pve.realm"),
@@ -684,12 +684,16 @@
 
   # Ordered API endpoint list. Omitted when empty so a single pve.host renders
   # exactly as before. pve.host has no spec default, so a manifest that sets
-  # neither property fails here at render time, as it did when p("pve.host")
-  # had no default; the CPI validates the list's grammar and agreement with
-  # pve.host at run time.
+  # neither property fails here at render time, as the bare p("pve.host") call
+  # did. A blank pve.host counts as unset, and the list must be an array of
+  # strings, which the CPI's JSON parser would otherwise reject at run time;
+  # the CPI validates each entry's grammar and the agreement with pve.host.
   endpoints = p("pve.endpoints", [])
+  unless endpoints.nil? || (endpoints.is_a?(Array) && endpoints.all? { |e| e.is_a?(String) })
+    raise "pve.endpoints must be a list of strings"
+  end
   config["endpoints"] = endpoints unless endpoints.nil? || endpoints.empty?
-  if config["host"].to_s.strip.empty? && config["endpoints"].nil?
+  if config["host"].empty? && config["endpoints"].nil?
     raise "pve.host or pve.endpoints is required"
   end
 
