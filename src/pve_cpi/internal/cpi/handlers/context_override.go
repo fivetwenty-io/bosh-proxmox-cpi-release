@@ -479,6 +479,13 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 	if len(cfg.ClusterStampAliases) > 0 {
 		_, _ = fmt.Fprintf(h, "cluster_stamp_aliases=%s\x00", strings.Join(cfg.ClusterStampAliases, ","))
 	}
+	// The endpoint list is ordered, since the order is the order the client
+	// tries endpoints in. An empty list adds nothing, so a config without one
+	// keys exactly as it did before the list existed. %q quotes each element,
+	// so no element can run into the next.
+	if len(cfg.Endpoints) > 0 {
+		_, _ = fmt.Fprintf(h, "endpoints=%q\x00", cfg.Endpoints)
+	}
 	if cfg.PVECACertPEM != "" {
 		caHash := sha256.Sum256([]byte(cfg.PVECACertPEM))
 		_, _ = fmt.Fprintf(h, "ca_cert_sha=%s\x00", hex.EncodeToString(caHash[:]))

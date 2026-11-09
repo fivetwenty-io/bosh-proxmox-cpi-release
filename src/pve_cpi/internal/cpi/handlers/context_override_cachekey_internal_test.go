@@ -98,6 +98,7 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		"pve_ca_cert":                            selfSignedCAPEMForCacheKeyTest(t),
 		"pve_host":                               "pve-b.example",
 		"pve_port":                               float64(9999), // JSON numbers decode as float64
+		"pve_endpoints":                          []any{"pve-a.example", "pve-c.example"},
 		"pve_user":                               "other",
 		"pve_password":                           "pw-two",
 		"pve_api_token":                          "tok-two",
@@ -178,8 +179,10 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 	// can see (the password row also clears nothing, because the base holds
 	// no token).
 	companions := map[string]map[string]any{
-		"pve_host":      {"pve_user": "cpi", "pve_password": "pw-one"},
-		"pve_port":      {"pve_user": "cpi", "pve_password": "pw-one"},
+		"pve_host": {"pve_user": "cpi", "pve_password": "pw-one"},
+		"pve_port": {"pve_user": "cpi", "pve_password": "pw-one"},
+		// A second endpoint the job never named gets no inherited credentials.
+		"pve_endpoints": {"pve_user": "cpi", "pve_password": "pw-one"},
 		"pve_user":      {"pve_password": "pw-one"},
 		"pve_password":  {"pve_user": "cpi"},
 		"pve_api_token": {"pve_user": "cpi"},
@@ -236,6 +239,43 @@ func TestRequestOverrideCacheKey_CACertSeparatesSameHost(t *testing.T) {
 	}
 	same := *a
 	if requestOverrideCacheKey(&same) != keyA {
+		t.Error("the cache key must be deterministic")
+	}
+}
+
+// TestRequestOverrideCacheKey_EndpointListSeparatesConfigs asserts that two
+// configs that differ only in their endpoint list never share a cached
+// client, that the order of the list counts, that no list keys exactly as a
+// config did before the list existed, and that elements cannot run together.
+func TestRequestOverrideCacheKey_EndpointListSeparatesConfigs(t *testing.T) {
+	t.Parallel()
+	mk := func(list ...string) *config.CPIConfig {
+		return &config.CPIConfig{Host: "pve-a.example", Port: 8006, User: "cpi", Password: "pw-one", Endpoints: list}
+	}
+	none := requestOverrideCacheKey(mk())
+	if empty := requestOverrideCacheKey(&config.CPIConfig{
+		Host: "pve-a.example", Port: 8006, User: "cpi", Password: "pw-one", Endpoints: []string{},
+	}); empty != none {
+		t.Error("an empty list must key like no list")
+	}
+	keys := map[string]string{
+		"no list":        none,
+		"one":            requestOverrideCacheKey(mk("pve-a.example:8006")),
+		"two":            requestOverrideCacheKey(mk("pve-a.example:8006", "pve-b.example:8006")),
+		"two, other":     requestOverrideCacheKey(mk("pve-a.example:8006", "pve-c.example:8006")),
+		"two, reordered": requestOverrideCacheKey(mk("pve-b.example:8006", "pve-a.example:8006")),
+		"joined":         requestOverrideCacheKey(mk("pve-a.example:8006,pve-b.example:8006")),
+		"three": requestOverrideCacheKey(mk("pve-a.example:8006", "pve-b.example:8006",
+			"pve-c.example:8006")),
+	}
+	seen := map[string]string{}
+	for name, key := range keys {
+		if prev, dup := seen[key]; dup {
+			t.Errorf("%q and %q share a cache key", prev, name)
+		}
+		seen[key] = name
+	}
+	if requestOverrideCacheKey(mk("pve-a.example:8006", "pve-b.example:8006")) != keys["two"] {
 		t.Error("the cache key must be deterministic")
 	}
 }

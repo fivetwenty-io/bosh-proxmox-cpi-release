@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"net"
 	"slices"
 	"sort"
 	"strconv"
@@ -56,6 +57,7 @@ const contextOverridePrefix = "pve_"
 var contextOverrideFieldOrder = []string{
 	"pve_host",
 	"pve_port",
+	"pve_endpoints",
 	"pve_user",
 	"pve_password",
 	"pve_api_token",
@@ -160,6 +162,20 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 		// accepting pve_port=0; see the H1 finding in the A13 review. One
 		// source of truth for value constraints avoids that class of drift.
 		c.Port = n
+		return nil
+	},
+	// The endpoint list names machines of one cluster, so it follows the same
+	// reset rule as the stamp aliases (see resetEndpointScopedPolicy). An
+	// entry that names it and no host takes its host and port from the first
+	// element, and one that names both must agree with it (see
+	// resolveOverrideEndpoints). Grammar and agreement are checked there and
+	// again by eff.Validate().
+	"pve_endpoints": func(c *CPIConfig, v any) error {
+		endpoints, err := coerceOverrideStringList(v)
+		if err != nil {
+			return err
+		}
+		c.Endpoints = endpoints
 		return nil
 	},
 	"pve_user": func(c *CPIConfig, v any) error {
@@ -905,6 +921,58 @@ func SameEndpoint(a, b *CPIConfig) bool {
 	return aHost == bHost && aPort == bPort
 }
 
+// SameEndpointSet reports whether a and b carry the same ordered endpoint
+// list. It decides whether an entry may inherit the job's credentials, which
+// are vouched for by the list the job's operator wrote and not by the
+// primary alone: an entry that kept the job's primary and added a machine
+// the operator never named would otherwise send the job's token there.
+//
+// A config with no list holds just its primary, so when neither config sets
+// a list the answer equals SameEndpoint and existing entries behave as they
+// always have. Entries compare host case-insensitively, without a trailing
+// dot, with an IPv6 literal in its canonical spelling, and with a bare entry
+// read at the config's own port, in order.
+//
+// The check fails closed. It reports false for a nil config, for different
+// primaries, for a list whose first entry is not the config's own primary,
+// and for a list with an entry that does not meet the endpoint grammar,
+// since none of those can prove the two lists name the same machines.
+func SameEndpointSet(a, b *CPIConfig) bool {
+	if a == nil || b == nil || !SameEndpoint(a, b) {
+		return false
+	}
+	aKeys, aOK := endpointSetKeys(a)
+	bKeys, bOK := endpointSetKeys(b)
+	return aOK && bOK && slices.Equal(aKeys, bKeys)
+}
+
+// endpointSetKeys returns c's endpoint list as normalized "host:port" keys in
+// order, with the primary alone standing in for an unset list. ok is false
+// when an entry does not meet the endpoint grammar or when the first entry
+// is not c's own primary.
+func endpointSetKeys(c *CPIConfig) (keys []string, ok bool) {
+	primaryHost, primaryPort := normalizedEndpoint(c)
+	primary := net.JoinHostPort(primaryHost, strconv.Itoa(primaryPort))
+	if len(c.Endpoints) == 0 {
+		return []string{primary}, true
+	}
+	keys = make([]string, 0, len(c.Endpoints))
+	for _, entry := range c.Endpoints {
+		host, port, hasPort, valid := splitEndpoint(entry)
+		if !valid || endpointExtraProblem("", entry) != "" {
+			return nil, false
+		}
+		if !hasPort {
+			port = c.defaultEndpointPort()
+		}
+		keys = append(keys, net.JoinHostPort(canonicalEndpointHost(host), strconv.Itoa(port)))
+	}
+	if keys[0] != primary {
+		return nil, false
+	}
+	return keys, true
+}
+
 // overrideCredentialKeysSet returns, in group order, the credential keys an
 // entry named. A key counts as named whenever it is present, including with
 // an empty value, because an entry that writes the key is stating its own
@@ -922,8 +990,9 @@ func overrideCredentialKeysSet(present func(key string) bool) []string {
 // OverrideCredentialGroup reports which credential group an effective config
 // built by ApplyContextOverrides authenticates with, given the job config
 // and the applied key list ApplyContextOverrides returned with it. The
-// answer is CredentialGroupEntry whenever the endpoint changed or the entry
-// named any credential key, and CredentialGroupInherited otherwise. It reads
+// answer is CredentialGroupEntry whenever the endpoint list changed (see
+// SameEndpointSet) or the entry named any credential key, and
+// CredentialGroupInherited otherwise. It reads
 // key names and endpoints only, never a credential value, so callers may log
 // the result.
 func OverrideCredentialGroup(base, effective *CPIConfig, applied []string) string {
@@ -933,7 +1002,7 @@ func OverrideCredentialGroup(base, effective *CPIConfig, applied []string) strin
 		return CredentialGroupEntry
 	}
 	named := overrideCredentialKeysSet(func(key string) bool { return slices.Contains(applied, key) })
-	if !SameEndpoint(base, effective) || len(named) > 0 {
+	if !SameEndpointSet(base, effective) || len(named) > 0 {
 		return CredentialGroupEntry
 	}
 	return CredentialGroupInherited
@@ -950,12 +1019,16 @@ func OverrideCredentialGroup(base, effective *CPIConfig, applied []string) strin
 // An entry that set only a password while the job held a token kept both,
 // and the job's token again won on the wire.
 //
-// The rules are these. When the endpoint changes, or the entry names any
-// credential key, every credential key the entry did not name is cleared, so
-// nothing from the job's group survives. When the endpoint changes, the job's
-// pve.ca_cert is cleared too unless the entry names pve_ca_cert, so an entry
-// that keeps verify_ssl on gets the system trust pool rather than a private
-// CA issued for another host. The job's token-over-password rule then
+// The rules are these. The CA follows the primary and the credentials follow
+// the whole endpoint list. When the entry's list is not the job's (see
+// SameEndpointSet), or the entry names any credential key, every credential
+// key the entry did not name is cleared, so nothing from the job's group
+// survives. That covers an entry that keeps the job's primary and adds an
+// endpoint the job's operator never named. When the primary changes, the
+// job's pve.ca_cert is cleared too unless the entry names pve_ca_cert, so an
+// entry that keeps verify_ssl on gets the system trust pool rather than a
+// private CA issued for another host. An entry that only adds endpoints to
+// the job's primary keeps the CA. The job's token-over-password rule then
 // applies, and the result must hold an api_token, or a user together with a
 // password. Errors name property keys only, never a value.
 func resolveOverrideCredentials(base, eff *CPIConfig, extra map[string]any) error {
@@ -969,9 +1042,9 @@ func resolveOverrideCredentials(base, eff *CPIConfig, extra map[string]any) erro
 	}
 
 	named := overrideCredentialKeysSet(present)
-	if !endpointChanged && len(named) == 0 {
-		// Same endpoint and no credential key named: the request keeps the
-		// job's whole group, which already passed startup validation.
+	if SameEndpointSet(base, eff) && len(named) == 0 {
+		// Same endpoint list and no credential key named: the request keeps
+		// the job's whole group, which already passed startup validation.
 		return nil
 	}
 
@@ -997,10 +1070,15 @@ func resolveOverrideCredentials(base, eff *CPIConfig, extra map[string]any) erro
 		remedy += ", and pve.ca_cert if that cluster uses a private CA"
 	}
 	if len(named) == 0 {
-		changed := "pve.host"
-		baseHost, _ := normalizedEndpoint(base)
-		if effHost, _ := normalizedEndpoint(eff); effHost == baseHost {
-			changed = "pve.port"
+		// Only the list differs when the primary matches, and the primary
+		// cannot be told apart from it by host or port.
+		changed := "pve.endpoints"
+		if endpointChanged {
+			changed = "pve.host"
+			baseHost, _ := normalizedEndpoint(base)
+			if effHost, _ := normalizedEndpoint(eff); effHost == baseHost {
+				changed = "pve.port"
+			}
 		}
 		return fmt.Errorf("config: context entry for host %q changes %s but supplies no credentials; %s",
 			eff.Host, changed, remedy)
@@ -1152,6 +1230,9 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 	// any early return below that could hand back eff, and before
 	// validation, so an incomplete group fails with its own message.
 	if len(appliedKeys) > 0 {
+		if endpointErr := resolveOverrideEndpoints(&eff, extra); endpointErr != nil {
+			return nil, nil, nil, endpointErr
+		}
 		if credErr := resolveOverrideCredentials(base, &eff, extra); credErr != nil {
 			return nil, nil, nil, credErr
 		}

@@ -165,10 +165,43 @@ func (c *CPIConfig) IgnoredProfileFields() []string {
 	return c.ignoredProfileFields
 }
 
+// resolveOverrideEndpoints settles an entry's endpoint list before the
+// credentials are judged, because the list decides the entry's primary. It
+// does nothing for an entry that does not name pve_endpoints. For one that
+// does, a bare element takes the entry's effective port, an entry with no
+// host takes its host and port from the first element (the first element's
+// own port wins over pve.port, as it does for the job), and the list must
+// then pass the job-level rules: the grammar, the cap, no repeats, and
+// agreement of an explicit pve.host with the first element. The error names
+// property keys and endpoint addresses, never a credential.
+func resolveOverrideEndpoints(eff *CPIConfig, extra map[string]any) error {
+	if _, named := extra["pve_endpoints"]; !named {
+		return nil
+	}
+	eff.fillEndpointPorts()
+	if len(eff.Endpoints) == 0 {
+		return nil
+	}
+	if _, hostNamed := extra["pve_host"]; !hostNamed || eff.Host == "" {
+		if host, port, hasPort, ok := splitEndpoint(eff.Endpoints[0]); ok {
+			eff.Host = host
+			if hasPort {
+				eff.Port = port
+			}
+		}
+	}
+	var problems []string
+	eff.validateEndpoints(&problems)
+	if len(problems) > 0 {
+		return fmt.Errorf("config: context entry pve.endpoints is invalid: %s", strings.Join(problems, "; "))
+	}
+	return nil
+}
+
 // resetEndpointScopedPolicy clears the job-level policy that must never
-// follow a request to another PVE endpoint unless the entry names it. Two
-// items qualify, destroy_unreferenced_disks and cluster_stamp_aliases, and
-// each is judged on its own.
+// follow a request to another PVE endpoint unless the entry names it. Three
+// items qualify, destroy_unreferenced_disks, cluster_stamp_aliases, and the
+// endpoint list, and each is judged on its own.
 //
 // destroy_unreferenced_disks makes every non-retain delete_vm ask PVE to free
 // each volume that carries the VM's VMID and is not referenced by its config.
@@ -193,6 +226,13 @@ func resetEndpointScopedPolicy(base, eff *CPIConfig, extra map[string]any) {
 	// still exists elsewhere.
 	if _, named := extra["pve_cluster_stamp_aliases"]; !named {
 		eff.ClusterStampAliases = nil
+	}
+	// The list names machines of the job's cluster. Inherited by an entry on
+	// another primary it would send the entry's requests, and with them the
+	// entry's credentials, to machines of the wrong cluster. The entry's list
+	// is then just its own host.
+	if _, named := extra["pve_endpoints"]; !named {
+		eff.Endpoints = nil
 	}
 }
 
