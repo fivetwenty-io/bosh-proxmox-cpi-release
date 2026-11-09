@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -79,7 +78,8 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 		_, _ = fmt.Fprintln(stderr, err)
 		return exitError
 	}
-	ctx := context.Background()
+	ctx, release := commandContext()
+	defer release()
 	if *cpiConfigPath != "" {
 		return runHACPIConfig(ctx, *cpiConfigPath, base, logger, *asJSON, stdout, stderr, deps)
 	}

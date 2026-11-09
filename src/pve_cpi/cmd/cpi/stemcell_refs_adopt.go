@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -113,7 +112,7 @@ func runStemcellRefsAdopt(args []string, stdout, stderr io.Writer, opts runOptio
 		return 2
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), stemcellRefsTimeout)
+	ctx, cancel := commandContext(stemcellRefsTimeout)
 	defer cancel()
 	deps, scan, ok := openStemcellRefs(ctx, *configPath, stderr, opts)
 	if !ok {

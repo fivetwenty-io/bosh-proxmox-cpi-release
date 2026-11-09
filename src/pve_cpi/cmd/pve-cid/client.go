@@ -13,6 +13,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 )
 
 // envConfigPath is the environment variable checked when --config is not
@@ -249,6 +250,19 @@ func newPVEClient(cfg *config.CPIConfig, logger *log.Logger) (pve.Client, error)
 		return nil, fmt.Errorf("pve-cid: pve client init failed: %w", err)
 	}
 	return client, nil
+}
+
+// readerOpener loads the CPI config at a path and opens the Reader a
+// subcommand reads the cluster through. loadConfigAndReader is the production
+// one, and tests substitute their own.
+type readerOpener func(configPath string, stderr io.Writer) (*config.CPIConfig, Reader, error)
+
+// commandContext returns the context a subcommand runs its PVE calls under.
+// Like the CPI dispatcher does for each call, it installs an affinity scope, so
+// a tether the command's mutations make lasts as long as the command. The
+// returned function releases the scope, and the caller defers it.
+func commandContext() (context.Context, func()) {
+	return endpointpool.WithAffinityScope(context.Background())
 }
 
 // loadConfigAndReader loads the config as loadConfigAndLogger does and

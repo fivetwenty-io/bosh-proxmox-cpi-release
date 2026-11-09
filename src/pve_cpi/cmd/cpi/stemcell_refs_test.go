@@ -51,6 +51,15 @@ type refsCLIClient struct {
 	sizes map[string]int64
 	// deleteErr is what a guest destroy returns; nil destroys the guest.
 	deleteErr error
+	// onCall, when set, sees the context of every listing and every write.
+	onCall func(context.Context)
+}
+
+// saw reports a call's context to onCall.
+func (c *refsCLIClient) saw(ctx context.Context) {
+	if c.onCall != nil {
+		c.onCall(ctx)
+	}
 }
 
 // refsCLIPools is a pool store that answers the cluster lock's create, read
@@ -112,7 +121,8 @@ type refsCLINodes struct {
 	c *refsCLIClient
 }
 
-func (n refsCLINodes) UpdateQemuConfig(_ context.Context, _, vmid string, p *nodes.UpdateQemuConfigParams) error {
+func (n refsCLINodes) UpdateQemuConfig(ctx context.Context, _, vmid string, p *nodes.UpdateQemuConfigParams) error {
+	n.c.saw(ctx)
 	n.c.mu.Lock()
 	defer n.c.mu.Unlock()
 	id, _ := strconv.Atoi(vmid)
@@ -132,7 +142,8 @@ func (n refsCLINodes) UpdateQemuConfig(_ context.Context, _, vmid string, p *nod
 	return errors.New("unexpected config write")
 }
 
-func (n refsCLINodes) ListQemu(context.Context, string, *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
+func (n refsCLINodes) ListQemu(ctx context.Context, _ string, _ *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
+	n.c.saw(ctx)
 	n.c.mu.Lock()
 	defer n.c.mu.Unlock()
 	resp := make(nodes.ListQemuResponse, 0, len(n.c.guests))
@@ -160,8 +171,9 @@ func (n refsCLINodes) GetStorageContent(
 }
 
 func (n refsCLINodes) DeleteQemu(
-	_ context.Context, _, vmid string, _ *nodes.DeleteQemuParams,
+	ctx context.Context, _, vmid string, _ *nodes.DeleteQemuParams,
 ) (*nodes.DeleteQemuResponse, error) {
+	n.c.saw(ctx)
 	n.c.mu.Lock()
 	defer n.c.mu.Unlock()
 	if n.c.deleteErr != nil {

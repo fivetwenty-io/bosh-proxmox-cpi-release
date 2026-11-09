@@ -690,7 +690,7 @@ func storageJournalBudget(action string) time.Duration {
 
 // storageJournalContext is the context an action runs under.
 func storageJournalContext(action string) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), storageJournalBudget(action))
+	return commandContext(storageJournalBudget(action))
 }
 
 func supportedStorageJournalAction(action string) bool {

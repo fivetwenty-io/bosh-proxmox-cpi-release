@@ -12,6 +12,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 )
 
 // Handler is implemented by per-method handlers in internal/cpi/handlers/.
@@ -227,7 +228,8 @@ func (d *Dispatcher) Register(method string, h Handler) error {
 // Dispatch rules:
 //  1. Look up handlers[req.Method].
 //  2. If absent: return CloudError "unknown method: <method>".
-//  3. Call handler.Handle(ctx, req.Arguments, req.Context).
+//  3. Call handler.Handle(ctx, req.Arguments, req.Context) with a context that
+//     carries the call's endpoint affinity scope, released when Handle returns.
 //  4. On *cpierrors.Error: build error response using the error's Type/Message/OkToRetry.
 //  5. On any other non-nil error: wrap as CloudError, OkToRetry=false.
 //  6. On success: marshal result to json.RawMessage and build success response.
@@ -320,6 +322,15 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 			defer cancel()
 		}
 	}
+
+	// Every call gets its own affinity scope, so the endpoint state a call
+	// makes, such as a tether on the endpoint that took its first mutation,
+	// lasts as long as the call and no longer. The release is deferred so it
+	// runs when the call returns by any path, including an error or a panic
+	// the recover above turns into an error response.
+	var releaseScope func()
+	callCtx, releaseScope = endpointpool.WithAffinityScope(callCtx)
+	defer releaseScope()
 
 	d.traceRequest(ctx, req.Method, requestID, req.Arguments)
 

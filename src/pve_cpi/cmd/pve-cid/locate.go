@@ -331,6 +331,11 @@ func resolveBareVolid(raw string) (bareVolid, stableID string, err error) {
 
 // runLocate implements "pve-cid locate <cid|volid> [--config PATH] [--json]".
 func runLocate(args []string, stdout, stderr io.Writer) int {
+	return runLocateWith(args, stdout, stderr, loadConfigAndReader)
+}
+
+// runLocateWith runs the locate subcommand, opening its reader through open.
+func runLocateWith(args []string, stdout, stderr io.Writer, open readerOpener) int {
 	fs := flag.NewFlagSet("pve-cid locate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "path to CPI JSON config file (default: $PVE_CPI_CONFIG or "+defaultConfigPath+")")
@@ -350,13 +355,14 @@ func runLocate(args []string, stdout, stderr io.Writer) int {
 	}
 	raw := positionals[0]
 
-	_, reader, err := loadConfigAndReader(*configPath, stderr)
+	_, reader, err := open(*configPath, stderr)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return exitError
 	}
 
-	ctx := context.Background()
+	ctx, release := commandContext()
+	defer release()
 
 	if strings.HasPrefix(raw, ":") {
 		decoded, decErr := DecodeCID(raw)

@@ -399,6 +399,12 @@ func filterOrphans(entries []StemcellInventoryEntry) []StemcellInventoryEntry {
 //
 //	pve-cid stemcells [--storage ID] [--node N] [--orphans] [--config PATH] [--json]
 func runStemcells(args []string, stdout, stderr io.Writer) int {
+	return runStemcellsWith(args, stdout, stderr, loadConfigAndReader)
+}
+
+// runStemcellsWith runs the stemcells subcommand, opening its reader through
+// open.
+func runStemcellsWith(args []string, stdout, stderr io.Writer, open readerOpener) int {
 	fs := flag.NewFlagSet("pve-cid stemcells", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "path to CPI JSON config file (default: $PVE_CPI_CONFIG or "+defaultConfigPath+")")
@@ -419,13 +425,14 @@ func runStemcells(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	cfg, reader, err := loadConfigAndReader(*configPath, stderr)
+	cfg, reader, err := open(*configPath, stderr)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return exitError
 	}
 
-	ctx := context.Background()
+	ctx, release := commandContext()
+	defer release()
 
 	storage := *storageFlag
 	if storage == "" {

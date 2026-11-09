@@ -98,7 +98,9 @@ func runStoragePlanWithObserver(args []string, stdout, stderr io.Writer, load fu
 		_, _ = fmt.Fprintln(stderr, "storage-plan: configuration or client unavailable")
 		return exitError
 	}
-	report, err := observe(context.Background(), deps, request)
+	ctx, release := commandContext()
+	defer release()
+	report, err := observe(ctx, deps, request)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, "storage-plan: diagnostic observation failed")
 		return exitError
