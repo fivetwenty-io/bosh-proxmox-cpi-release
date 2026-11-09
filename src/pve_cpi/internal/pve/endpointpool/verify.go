@@ -12,11 +12,13 @@ import (
 )
 
 // ErrPinMismatch is the cause a discovered endpoint's verify callback gives
-// when it refuses the certificate the endpoint presented. The handshake error
-// is a *tls.CertificateVerificationError whose Err wraps it, so the SDK still
-// reports a certificate failure, and the pool's dialer tags the failure with
-// PhasePin.
-var ErrPinMismatch = errors.New("certificate is not one the endpoint's node is pinned to")
+// when it refuses the certificate the endpoint presented, for any reason. The
+// handshake error is a *tls.CertificateVerificationError whose Err wraps it, so
+// the SDK still reports a certificate failure, and the pool's dialer tags the
+// failure with PhasePin. The cause it wraps says what failed: a leaf outside
+// the pin set, a chain that does not verify, a leaf outside the pin set that
+// does not cover the endpoint's name, or a missing certificate.
+var ErrPinMismatch = errors.New("certificate refused for this discovered endpoint")
 
 // errNoPeerCertificate is the cause when a handshake reaches the verify
 // callback without a server certificate.
@@ -149,7 +151,11 @@ func (v *verifier) verifyConnection(cs tls.ConnectionState) error {
 		return nil
 	}
 	if err := leaf.VerifyHostname(v.host); err != nil {
-		return v.refuse(cs, err)
+		if v.candidate {
+			return v.refuse(cs, err)
+		}
+		return v.refuse(cs, fmt.Errorf("certificate sha256 %s is not one of the %d pinned for %s, and %w",
+			PinOf(leaf.Raw), len(v.pins), v.host, err))
 	}
 	if !v.candidate && v.refreshDue != nil {
 		v.refreshDue()

@@ -694,3 +694,432 @@ func TestCanonicalAddress(t *testing.T) {
 		}
 	}
 }
+
+// The pool's own refusals carry the connect-phase tag, because no byte of the
+// request left, and each is told apart from a dial failure the endpoint
+// caused, so the walk never demotes or marks down an endpoint for one. A real
+// dial failure still classifies as the endpoint's own, with its phase and
+// cause unchanged. Every case goes through the http.Client, which is how the
+// SDK sees it, and every case is a mutation that the tag still proves unsent.
+func TestPoolRefusalsAreToldApartFromDialFailures(t *testing.T) {
+	ca := pvetest.NewCA(t)
+	refused := pvetest.NewRefused(t)
+	dropped := pvetest.NewDropped(t)
+	live := pvetest.NewLive(t, ca.NewLeaf(t, pvetest.LeafOptions{}), nil)
+	other := pvetest.NewLive(t, ca.NewLeaf(t, pvetest.LeafOptions{}), nil)
+	d := &dialers{}
+	d.set(refused.Addr, refused.DialContext)
+	d.set(dropped.Addr, dropped.DialContext)
+	p := newPool(t, Config{
+		Base: baseFor(ca, d),
+		Endpoints: []Endpoint{
+			configured(refused.Addr), configured(dropped.Addr), discovered(live.Addr, PinOf(live.Leaf.DER)),
+		},
+	})
+	refusals := map[string]error{
+		"ErrSendByPassed":     ErrSendByPassed,
+		"errWrongAddress":     errWrongAddress,
+		"errPlaintextRefused": errPlaintextRefused,
+	}
+	past := time.Now().Add(-time.Second)
+	cases := []struct {
+		name     string
+		endpoint string
+		req      func(t *testing.T) *http.Request
+		refusal  error
+		check    func(t *testing.T, err error)
+	}{
+		{
+			name: "a refused dial", endpoint: refused.Addr,
+			req: func(t *testing.T) *http.Request {
+				return apiRequest(t, context.Background(), http.MethodPost, refused.Addr, "/pools", "poolid=x")
+			},
+			check: func(t *testing.T, err error) {
+				if !errors.Is(err, syscall.ECONNREFUSED) {
+					t.Errorf("want ECONNREFUSED in the chain: %v", err)
+				}
+			},
+		},
+		{
+			name: "a send-by deadline that passed before the dial", endpoint: refused.Addr,
+			req: func(t *testing.T) *http.Request {
+				ctx := WithSendBy(context.Background(), past, http.MethodDelete, "/pools/x")
+				return apiRequest(t, ctx, http.MethodDelete, refused.Addr, "/pools/x", "")
+			},
+			refusal: ErrSendByPassed,
+		},
+		{
+			name: "a send-by deadline that passed during the dial", endpoint: dropped.Addr,
+			req: func(t *testing.T) *http.Request {
+				ctx := WithSendBy(context.Background(), time.Now().Add(100*time.Millisecond), http.MethodPut, "/pools/x")
+				return apiRequest(t, ctx, http.MethodPut, dropped.Addr, "/pools/x", "comment=x")
+			},
+			refusal: ErrSendByPassed,
+		},
+		{
+			name: "an owned transport asked for another address", endpoint: refused.Addr,
+			req: func(t *testing.T) *http.Request {
+				return apiRequest(t, context.Background(), http.MethodPost, other.Addr, "/pools", "poolid=x")
+			},
+			refusal: errWrongAddress,
+			check: func(t *testing.T, _ error) {
+				if n := other.Counts.Conns.Load(); n != 0 {
+					t.Errorf("the other server saw %d connections", n)
+				}
+			},
+		},
+		{
+			name: "plain http to a discovered endpoint", endpoint: live.Addr,
+			req: func(t *testing.T) *http.Request {
+				req := apiRequest(t, context.Background(), http.MethodPost, live.Addr, "/access/ticket", "password=x")
+				req.URL.Scheme = "http"
+				return req
+			},
+			refusal: errPlaintextRefused,
+			check: func(t *testing.T, _ error) {
+				if n := live.Counts.Conns.Load(); n != 0 {
+					t.Errorf("the discovered server saw %d connections", n)
+				}
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dialsBefore := refused.Counts.Dials.Load()
+			req := c.req(t)
+			client := &http.Client{Transport: endpointOf(t, p, c.endpoint).transports.pick(false)}
+			resp, err := client.Do(req)
+			closeBody(resp)
+			var ue *url.Error
+			if !errors.As(err, &ue) {
+				t.Fatalf("want a *url.Error, got %T: %v", err, err)
+			}
+			mustConnectPhase(t, err, c.endpoint, PhaseDial)
+			if got, want := blamesEndpoint(err), c.refusal == nil; got != want {
+				t.Fatalf("blamesEndpoint = %v, want %v: %v", got, want, err)
+			}
+			for name, sentinel := range refusals {
+				if got, want := errors.Is(err, sentinel), c.refusal != nil && errors.Is(sentinel, c.refusal); got != want {
+					t.Errorf("errors.Is(err, %s) = %v, want %v: %v", name, got, want, err)
+				}
+			}
+			if !provesNeverSent(req, err) {
+				t.Errorf("the tag should still prove the mutation unsent: %v", err)
+			}
+			if errors.Is(c.refusal, ErrSendByPassed) && c.endpoint == refused.Addr {
+				if n := refused.Counts.Dials.Load() - dialsBefore; n != 0 {
+					t.Errorf("a passed deadline dialed %d times", n)
+				}
+			}
+			if c.check != nil {
+				c.check(t, err)
+			}
+		})
+	}
+}
+
+// blamesEndpoint is true for a connect-phase failure of every phase, however
+// deeply it is wrapped, and false for the pool's own refusals in any phase, for
+// a failure without the tag, and for nil.
+func TestBlamesEndpoint(t *testing.T) {
+	cause := errors.New("connection refused")
+	for _, phase := range []Phase{PhaseDial, PhaseDNS, PhaseTLSHandshake, PhaseTLSVerify, PhasePin} {
+		err := &ConnectPhaseError{Phase: phase, Endpoint: "pve1:8006", Err: cause}
+		if !blamesEndpoint(err) || !blamesEndpoint(fmt.Errorf("post: %w", &url.Error{Op: "Post", Err: err})) {
+			t.Errorf("%s: a connect-phase failure should blame the endpoint", phase)
+		}
+		for _, refusal := range []error{ErrSendByPassed, errWrongAddress, errPlaintextRefused} {
+			refused := &ConnectPhaseError{Phase: phase, Endpoint: "pve1:8006", Err: fmt.Errorf("%w: %w", refusal, cause)}
+			if blamesEndpoint(refused) || blamesEndpoint(fmt.Errorf("post: %w", refused)) {
+				t.Errorf("%s: %v should not blame the endpoint", phase, refusal)
+			}
+		}
+	}
+	for name, err := range map[string]error{
+		"nil":                nil,
+		"an untagged error":  cause,
+		"a maybe-sent error": &MaybeSentError{Err: cause},
+		"a bare refusal":     ErrSendByPassed,
+	} {
+		if blamesEndpoint(err) {
+			t.Errorf("%s should not blame an endpoint", name)
+		}
+	}
+}
+
+// provesNeverSent mirrors the cases in which Go's transport replays a request
+// after a written attempt, and a redirect's later legs, and holds for any
+// other request whose error carries the tag.
+func TestProvesNeverSent(t *testing.T) {
+	tagged := &ConnectPhaseError{Phase: PhaseDial, Endpoint: "pve1:8006", Err: errors.New("refused")}
+	refusal := &ConnectPhaseError{Phase: PhaseDial, Endpoint: "pve1:8006", Err: ErrSendByPassed}
+	build := func(method, body string, edit func(*http.Request)) *http.Request {
+		var r io.Reader
+		if body != "" {
+			r = strings.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(context.Background(), method, "https://pve1:8006/api2/json/pools", r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if edit != nil {
+			edit(req)
+		}
+		return req
+	}
+	streamed := func(req *http.Request) {
+		req.Body = io.NopCloser(strings.NewReader("poolid=x"))
+		req.GetBody = nil
+	}
+	cases := []struct {
+		name string
+		req  *http.Request
+		err  error
+		want bool
+	}{
+		{"a POST with a body", build(http.MethodPost, "poolid=x", nil), tagged, true},
+		{"a POST without a body", build(http.MethodPost, "", nil), tagged, true},
+		{"a DELETE", build(http.MethodDelete, "", nil), tagged, true},
+		{"a refused send-by", build(http.MethodDelete, "", nil), refusal, true},
+		{"a PUT with Idempotency-Key", build(http.MethodPut, "comment=x", func(r *http.Request) {
+			r.Header.Set("Idempotency-Key", "k")
+		}), tagged, false},
+		{"a POST with X-Idempotency-Key", build(http.MethodPost, "", func(r *http.Request) {
+			r.Header.Set("X-Idempotency-Key", "k")
+		}), tagged, false},
+		{"a POST with Idempotency-Key and a streamed body", build(http.MethodPost, "", func(r *http.Request) {
+			r.Header.Set("Idempotency-Key", "k")
+			streamed(r)
+		}), tagged, true},
+		{"a POST with the key under a name Go does not check", build(http.MethodPost, "", func(r *http.Request) {
+			r.Header["idempotency-key"] = []string{"k"}
+		}), tagged, true},
+		{"a GET", build(http.MethodGet, "", nil), tagged, false},
+		{"a HEAD", build(http.MethodHead, "", nil), tagged, false},
+		{"an OPTIONS", build(http.MethodOptions, "", nil), tagged, false},
+		{"a TRACE", build(http.MethodTrace, "", nil), tagged, false},
+		{"an empty method", build(http.MethodPost, "", func(r *http.Request) { r.Method = "" }), tagged, false},
+		{"a redirect leg", build(http.MethodPost, "poolid=x", func(r *http.Request) {
+			r.Response = &http.Response{StatusCode: http.StatusTemporaryRedirect}
+		}), tagged, false},
+		{"an untagged error", build(http.MethodPost, "", nil), errors.New("reset"), false},
+		{"a maybe-sent error around the tag", build(http.MethodPost, "", nil), &MaybeSentError{Err: tagged}, false},
+		{"no request", nil, tagged, false},
+		{"no error", build(http.MethodPost, "", nil), nil, false},
+	}
+	for _, c := range cases {
+		if got := provesNeverSent(c.req, c.err); got != c.want {
+			t.Errorf("%s: provesNeverSent = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// Go counts a mutation that carries an Idempotency-Key or X-Idempotency-Key
+// header as replayable, so it replays it after a written attempt dies on a
+// reused connection. When the replay's dial fails, the final error carries the
+// tag although the first attempt reached the server, so provesNeverSent must
+// not call the mutation unsent. Without either header Go does not replay the
+// mutation, and its error is not a connect-phase failure at all.
+func TestGoReplayOfAMutationWithAnIdempotencyKey(t *testing.T) {
+	for _, header := range []string{"Idempotency-Key", "X-Idempotency-Key", ""} {
+		name := header
+		if name == "" {
+			name = "no header"
+		}
+		t.Run(name, func(t *testing.T) {
+			ca := pvetest.NewCA(t)
+			rc := pvetest.NewReuseCloser(t, ca.NewLeaf(t, pvetest.LeafOptions{}), nil)
+			p := newPool(t, Config{Base: baseFor(ca, nil), Endpoints: []Endpoint{configured(rc.Addr)}})
+			tr := endpointOf(t, p, rc.Addr).transports.pick(false)
+			mustOK(t, tr, http.MethodPost, rc.Addr, "/pools", "poolid=a")
+
+			rc.SetOnReuse(rc.StopListening)
+			req := apiRequest(t, context.Background(), http.MethodPost, rc.Addr, "/pools", "poolid=b")
+			if header != "" {
+				req.Header.Set(header, "pool-b")
+			}
+			resp, err := tr.RoundTrip(req)
+			closeBody(resp)
+			if n := rc.Counts.Reused.Load(); n != 1 {
+				t.Fatalf("the second POST should have reached the server on the reused connection: reused = %d", n)
+			}
+			if provesNeverSent(req, err) {
+				t.Fatalf("a POST that reached the server is not proven unsent: %v", err)
+			}
+			if header == "" {
+				if err == nil || IsConnectPhase(err) {
+					t.Fatalf("Go should not replay a mutation without the header: %v", err)
+				}
+				return
+			}
+			mustConnectPhase(t, err, rc.Addr, PhaseDial)
+			if !errors.Is(err, syscall.ECONNREFUSED) {
+				t.Errorf("want the replay's refused dial in the chain: %v", err)
+			}
+		})
+	}
+}
+
+// legRecorder sends each leg of a client's request through the pool's
+// transports for the leg's URL host, and records every leg it sent.
+type legRecorder struct {
+	p    *Pool
+	legs []recordedLeg
+}
+
+type recordedLeg struct {
+	req *http.Request
+	err error
+}
+
+func (r *legRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	o, err := r.p.routedTransports(req.URL)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := o.pick(false).RoundTrip(req)
+	r.legs = append(r.legs, recordedLeg{req: req, err: err})
+	return resp, err
+}
+
+// The http.Client sends a redirect's next leg through the transport after the
+// first leg was written and answered. When that leg fails in the connect
+// phase, its error carries the tag although the mutation reached a server, so
+// provesNeverSent must not call it unsent.
+func TestRedirectLegIsNotProvenUnsent(t *testing.T) {
+	ca := pvetest.NewCA(t)
+	refused := pvetest.NewRefused(t)
+	routes := pvetest.NewRoutes()
+	routes.HandleFunc(http.MethodPost, "/pools", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://"+refused.Addr+pvetest.APIPrefix+"/pools", http.StatusTemporaryRedirect)
+	})
+	live := pvetest.NewLive(t, ca.NewLeaf(t, pvetest.LeafOptions{}), routes)
+	d := &dialers{}
+	d.set(refused.Addr, refused.DialContext)
+	p := newPool(t, Config{
+		Base:      baseFor(ca, d),
+		Endpoints: []Endpoint{configured(live.Addr), configured(refused.Addr)},
+	})
+	rec := &legRecorder{p: p}
+	req := apiRequest(t, context.Background(), http.MethodPost, live.Addr, "/pools", "poolid=x")
+	resp, err := (&http.Client{Transport: rec}).Do(req)
+	closeBody(resp)
+	mustConnectPhase(t, err, refused.Addr, PhaseDial)
+	if n := live.Counts.Method(http.MethodPost); n != 1 {
+		t.Fatalf("the first leg should have reached the server: POSTs = %d", n)
+	}
+	if len(rec.legs) != 2 {
+		t.Fatalf("legs = %d, want 2", len(rec.legs))
+	}
+	first, second := rec.legs[0], rec.legs[1]
+	if first.err != nil || first.req.Response != nil {
+		t.Fatalf("the first leg should be answered and carry no redirect response: %v", first.err)
+	}
+	if second.req.Response == nil || !IsConnectPhase(second.err) {
+		t.Fatalf("the second leg should be a redirect leg that failed to connect: %v", second.err)
+	}
+	if provesNeverSent(second.req, second.err) {
+		t.Fatalf("a redirect leg after a written leg is not proven unsent: %v", second.err)
+	}
+	if !blamesEndpoint(second.err) {
+		t.Fatalf("the refused dial on the redirect leg is still the endpoint's own failure: %v", second.err)
+	}
+}
+
+// A discovered endpoint and a cold-start candidate check certificates with the
+// pool's own callback, so both of their clones refuse a plain http connection,
+// which would carry the request and its credential with no check at all.
+func TestPinnedClonesRefusePlainHTTP(t *testing.T) {
+	ca := pvetest.NewCA(t)
+	live := pvetest.NewLive(t, ca.NewLeaf(t, pvetest.LeafOptions{}), nil)
+	p := newPool(t, Config{
+		Base:      baseFor(ca, nil),
+		Endpoints: []Endpoint{configured("pve1:8006"), discovered(live.Addr, PinOf(live.Leaf.DER))},
+	})
+	v, err := newCandidateVerifier(live.Host, true, ca.Pool(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := newOwnedTransports(baseFor(ca, nil), transportSpec{addr: live.Addr, verify: v.verifyConnection})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(candidate.closeIdle)
+	for name, o := range map[string]*ownedTransports{
+		"discovered": endpointOf(t, p, live.Addr).transports,
+		"candidate":  candidate,
+	} {
+		for _, tr := range []*http.Transport{o.plain, o.idempotent} {
+			req := apiRequest(t, context.Background(), http.MethodPost, live.Addr, "/access/ticket", "password=x")
+			req.URL.Scheme = "http"
+			resp, err := tr.RoundTrip(req)
+			closeBody(resp)
+			mustConnectPhase(t, err, live.Addr, PhaseDial)
+			if !errors.Is(err, errPlaintextRefused) || blamesEndpoint(err) {
+				t.Fatalf("%s: want a plaintext refusal that does not blame the endpoint: %v", name, err)
+			}
+		}
+		if _, err := o.plain.DialContext(context.Background(), "tcp", "elsewhere:1"); !errors.Is(err, errWrongAddress) {
+			t.Fatalf("%s: the address check comes first: %v", name, err)
+		}
+	}
+	if n := live.Counts.Conns.Load(); n != 0 {
+		t.Fatalf("the server saw %d connections", n)
+	}
+	mustOK(t, endpointOf(t, p, live.Addr).transports.pick(false), http.MethodGet, live.Addr, "/version", "")
+}
+
+// The pool compares addresses in canonical form, but the host goes out as SNI
+// in the spelling the request named, as it does from Go's own transport. A
+// configured endpoint and a routed host keep the spelling they were given as
+// their clones' default, and a dial for another spelling of the same address
+// sends that spelling without changing the clone's config.
+func TestHostSpellingReachesTheWire(t *testing.T) {
+	ca := pvetest.NewCA(t)
+	s := pvetest.NewLive(t, ca.NewLeaf(t, pvetest.LeafOptions{}), nil)
+	port := fmt.Sprint(s.Port)
+	wire := net.JoinHostPort("PVE1.Example.COM", port)
+	canonical := net.JoinHostPort("pve1.example.com", port)
+	routed := net.JoinHostPort("Stemcells.Example.COM", port)
+	d := &dialers{}
+	for _, a := range []string{wire, canonical, routed, strings.ToUpper(routed)} {
+		d.set(a, func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, s.Addr)
+		})
+	}
+	p := newPool(t, Config{Base: baseFor(nil, d), Endpoints: []Endpoint{configured(wire)}})
+	ep := endpointOf(t, p, wire)
+	if ep.addr != canonical || ep.urlHost != wire {
+		t.Fatalf("addr %q urlHost %q, want the canonical key and the configured spelling", ep.addr, ep.urlHost)
+	}
+	cfg := ep.transports.plain.TLSClientConfig
+	if cfg.ServerName != "PVE1.Example.COM" {
+		t.Fatalf("ServerName %q, want the configured spelling", cfg.ServerName)
+	}
+	mustOK(t, ep.transports.pick(false), http.MethodGet, wire, "/version", "")
+	mustOK(t, ep.transports.pick(false), http.MethodGet, canonical, "/version", "")
+
+	o, err := p.routedTransports(&url.URL{Scheme: "https", Host: routed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.plain.TLSClientConfig.ServerName != "Stemcells.Example.COM" {
+		t.Fatalf("routed ServerName %q, want the URL's spelling", o.plain.TLSClientConfig.ServerName)
+	}
+	mustOK(t, o.pick(false), http.MethodGet, routed, "/version", "")
+	mustOK(t, o.pick(false), http.MethodGet, strings.ToUpper(routed), "/version", "")
+
+	want := []string{"PVE1.Example.COM", "pve1.example.com", "Stemcells.Example.COM", "STEMCELLS.EXAMPLE.COM"}
+	seen := s.Seen()
+	if len(seen) != len(want) {
+		t.Fatalf("requests = %d, want %d", len(seen), len(want))
+	}
+	for i, w := range want {
+		if seen[i].ServerName != w {
+			t.Errorf("request %d: SNI %q, want %q", i, seen[i].ServerName, w)
+		}
+	}
+	if cfg.ServerName != "PVE1.Example.COM" || o.plain.TLSClientConfig.ServerName != "Stemcells.Example.COM" {
+		t.Fatal("a dial for another spelling changed the clone's own config")
+	}
+}

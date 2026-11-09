@@ -125,10 +125,14 @@ func TestWrongLeafFailsBeforeTheHandler(t *testing.T) {
 		node      *pvetest.Server
 		pins      []Pin
 		cause     func(error) bool
+		// unpinned says whether the leaf is outside the pin set, which the
+		// refusal's text must say only when it is true.
+		unpinned bool
 	}{
 		{
 			name: "verify_ssl false and a leaf outside the set", node: f.nodeB, pins: []Pin{PinOf(f.leafA.DER)},
-			cause: func(err error) bool { return strings.Contains(err.Error(), "is not one of the 1 pinned") },
+			cause:    func(err error) bool { return strings.Contains(err.Error(), "is not one of the 1 pinned") },
+			unpinned: true,
 		},
 		{
 			name: "verify_ssl true and a leaf for another name", verifySSL: true, node: nameless,
@@ -137,6 +141,7 @@ func TestWrongLeafFailsBeforeTheHandler(t *testing.T) {
 				var he x509.HostnameError
 				return errors.As(err, &he)
 			},
+			unpinned: true,
 		},
 		{
 			name: "verify_ssl true and a pinned leaf from another CA", verifySSL: true, node: untrusted,
@@ -166,6 +171,12 @@ func TestWrongLeafFailsBeforeTheHandler(t *testing.T) {
 				}
 				if !c.cause(err) {
 					t.Fatalf("unexpected cause: %v", err)
+				}
+				if !strings.Contains(err.Error(), ErrPinMismatch.Error()) {
+					t.Fatalf("want the neutral refusal text: %v", err)
+				}
+				if said := strings.Contains(err.Error(), "is not one of"); said != c.unpinned {
+					t.Fatalf("the refusal says the leaf is outside the pin set = %v, want %v: %v", said, c.unpinned, err)
 				}
 			}
 			if n := c.node.Counts.Requests.Load(); n != 0 {
@@ -198,6 +209,32 @@ func TestExpiredPinnedLeaf(t *testing.T) {
 	var ie x509.CertificateInvalidError
 	if !errors.As(err, &ie) || ie.Reason != x509.Expired {
 		t.Fatalf("want an expired-certificate cause: %v", err)
+	}
+	if strings.Contains(err.Error(), "is not one of") || strings.Contains(err.Error(), "not pinned") {
+		t.Fatalf("the refusal of a pinned leaf must not call it unpinned: %v", err)
+	}
+}
+
+// Under verify_ssl true, a leaf in the pin set connects even when it covers
+// none of the endpoint's names, because a pin match needs no hostname match.
+// Stock Proxmox certificates rarely carry the name discovery derives, so this
+// is the usual path for a discovered endpoint. It makes no refresh due.
+func TestPinnedLeafWithoutTheEndpointsNameConnects(t *testing.T) {
+	f := newPinFixture(t)
+	leaf := f.ca.NewLeaf(t, pvetest.LeafOptions{DNSNames: []string{"pve3.other.example"}})
+	node := pvetest.NewLive(t, leaf, nil)
+	if err := leaf.X509.VerifyHostname(node.Host); err == nil {
+		t.Fatalf("the leaf must not cover the endpoint's host %s", node.Host)
+	}
+	p := f.pool(t, true, node, PinOf(leaf.DER))
+	if err := getVersion(t, p, node.Addr); err != nil {
+		t.Fatalf("GET with a pinned leaf for another name: %v", err)
+	}
+	if p.RefreshDue() {
+		t.Fatal("a pin match makes no refresh due")
+	}
+	if n := node.Counts.Method(http.MethodGet); n != 1 {
+		t.Fatalf("GETs = %d, want 1", n)
 	}
 }
 

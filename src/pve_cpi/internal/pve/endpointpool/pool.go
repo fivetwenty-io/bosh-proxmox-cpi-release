@@ -81,7 +81,12 @@ type Config struct {
 // endpoint is one endpoint of a pool. Everything but demoted is fixed at
 // construction.
 type endpoint struct {
-	addr       string
+	// addr is the canonical host:port, the key every comparison uses.
+	addr string
+	// urlHost is the host:port as the caller wrote it. The walk puts it in a
+	// request's URL.Host, so the Host header and SNI keep the spelling the SDK
+	// sends today, and the clones send its host as SNI.
+	urlHost    string
 	kind       Kind
 	node       string
 	pins       int
@@ -156,10 +161,12 @@ func New(cfg Config) (*Pool, error) {
 		}
 	}
 	for i, in := range eps {
-		ep := &endpoint{addr: in.Address, kind: in.Kind, node: in.Node, pins: len(in.Pins), rank: i}
-		spec := transportSpec{addr: in.Address, headerDeadline: headerDeadline}
+		ep := &endpoint{
+			addr: in.Address, urlHost: in.urlHost, kind: in.Kind, node: in.Node, pins: len(in.Pins), rank: i,
+		}
+		spec := transportSpec{addr: in.Address, serverName: hostOf(in.urlHost), headerDeadline: headerDeadline}
 		if in.Kind == KindDiscovered {
-			v, verr := p.discoveredVerifier(in)
+			v, verr := p.discoveredVerifier(in.Endpoint)
 			if verr != nil {
 				return nil, verr
 			}
@@ -176,25 +183,33 @@ func New(cfg Config) (*Pool, error) {
 	return p, nil
 }
 
+// orderedEndpoint is an endpoint that passed validation. Its Address is in
+// canonical form, and urlHost keeps the address as the caller wrote it.
+type orderedEndpoint struct {
+	Endpoint
+	urlHost string
+}
+
 // orderEndpoints validates the endpoints, canonicalizes their addresses, and
 // returns the configured ones in their order followed by the discovered ones
 // in theirs.
-func orderEndpoints(in []Endpoint) ([]Endpoint, error) {
+func orderEndpoints(in []Endpoint) ([]orderedEndpoint, error) {
 	if len(in) == 0 {
 		return nil, errors.New("endpoint pool: no endpoints")
 	}
-	configured := make([]Endpoint, 0, len(in))
-	var discovered []Endpoint
+	configured := make([]orderedEndpoint, 0, len(in))
+	var discovered []orderedEndpoint
 	seen := make(map[string]struct{}, len(in))
-	for _, ep := range in {
-		addr, err := canonicalAddress(ep.Address)
+	for _, raw := range in {
+		addr, err := canonicalAddress(raw.Address)
 		if err != nil {
-			return nil, fmt.Errorf("endpoint pool: endpoint %q: %w", ep.Address, err)
+			return nil, fmt.Errorf("endpoint pool: endpoint %q: %w", raw.Address, err)
 		}
 		if _, dup := seen[addr]; dup {
 			return nil, fmt.Errorf("endpoint pool: endpoint %s is listed twice", addr)
 		}
 		seen[addr] = struct{}{}
+		ep := orderedEndpoint{Endpoint: raw, urlHost: raw.Address}
 		ep.Address = addr
 		ep.Node = strings.TrimSpace(ep.Node)
 		switch ep.Kind {
@@ -415,7 +430,7 @@ func (p *Pool) routedTransports(u *url.URL) (*ownedTransports, error) {
 	if o := p.routed[addr]; o != nil {
 		return o, nil
 	}
-	o, err := newOwnedTransports(p.base, transportSpec{addr: addr})
+	o, err := newOwnedTransports(p.base, transportSpec{addr: addr, serverName: u.Hostname()})
 	if err != nil {
 		return nil, err
 	}
@@ -423,7 +438,7 @@ func (p *Pool) routedTransports(u *url.URL) (*ownedTransports, error) {
 	return o, nil
 }
 
-// hostOf returns the host of a canonical host:port, which has already passed
+// hostOf returns the host of a host:port that has already passed
 // canonicalAddress, so the split cannot fail.
 func hostOf(addr string) string {
 	host, _, err := net.SplitHostPort(addr)

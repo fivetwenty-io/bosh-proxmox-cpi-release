@@ -76,10 +76,90 @@ func (handshakeTimeoutError) Temporary() bool { return true }
 // its credential, through another endpoint's verifier.
 var errWrongAddress = errors.New("owned transport asked to dial another address")
 
+// errPlaintextRefused is the cause when an owned transport that verifies
+// certificates with its own callback, which a discovered endpoint and a
+// cold-start candidate have, is asked for a plain http connection. Such a
+// connection would carry the request, and its credential, without any
+// certificate check, so no address reaches it without its pin.
+var errPlaintextRefused = errors.New("owned transport refuses plain http to an endpoint whose certificate it checks")
+
+// blamesEndpoint reports whether err is a connect-phase failure that counts
+// against the endpoint it names, so the walk may demote the endpoint and mark
+// it down. It is false for nil, for an error without the connect-phase tag,
+// and for the refusals the pool makes itself:
+//
+//   - ErrSendByPassed, a send-by deadline that had passed before the dial
+//     started or passed while the connection was being set up, which is the
+//     caller's own deadline and says nothing about the endpoint.
+//   - errWrongAddress, an owned transport asked to dial another address, which
+//     is a routing defect in the pool.
+//   - errPlaintextRefused, a plain http connection to an endpoint whose
+//     certificate the pool checks itself, which is a routing defect too.
+//
+// Each of those refusals still carries the connect-phase tag, because no byte
+// of the request left the machine, so IsConnectPhase and provesNeverSent treat
+// them as they treat any connect-phase failure.
+func blamesEndpoint(err error) bool {
+	if !IsConnectPhase(err) {
+		return false
+	}
+	return !errors.Is(err, ErrSendByPassed) && !errors.Is(err, errWrongAddress) &&
+		!errors.Is(err, errPlaintextRefused)
+}
+
+// provesNeverSent reports whether err, the final error a request got from an
+// owned transport, proves that no attempt at the request was ever written. It
+// needs the connect-phase tag, and it needs a request for which neither Go's
+// transport nor the http.Client could have written an earlier attempt before
+// the one that failed to connect. Two things can write such an attempt.
+//
+//   - Go's transport replays a request it counts as replayable after a written
+//     attempt dies on a reused connection, and the replay's dial is what
+//     carries the tag. Request.isReplayable counts GET, HEAD, OPTIONS, and
+//     TRACE, and any request that carries an Idempotency-Key or
+//     X-Idempotency-Key header, when its body is empty or GetBody can rebuild
+//     it.
+//   - The http.Client sends each leg of a redirect through the transport after
+//     the previous leg was written and answered, and it sets Response on every
+//     leg after the first.
+//
+// An error marked with MaybeSentError is never proof, whatever it wraps. A
+// false result for a request that failed in the connect phase means that
+// the request may have been sent, so a mutation must be treated as sent. A GET
+// is always false, because Go may have replayed it, which the walk accepts for
+// an idempotent request.
+func provesNeverSent(req *http.Request, err error) bool {
+	if req == nil || !IsConnectPhase(err) || IsMaybeSent(err) {
+		return false
+	}
+	return req.Response == nil && !goMayReplay(req)
+}
+
+// goMayReplay reports whether Go's transport counts req as replayable after a
+// written attempt, mirroring Request.isReplayable. Header presence is checked
+// on the canonical keys, as Go checks it.
+func goMayReplay(req *http.Request) bool {
+	if req.Body != nil && req.Body != http.NoBody && req.GetBody == nil {
+		return false
+	}
+	switch req.Method {
+	case "", http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	}
+	_, key := req.Header["Idempotency-Key"]
+	_, xkey := req.Header["X-Idempotency-Key"]
+	return key || xkey
+}
+
 // transportSpec describes the clones to build for one address.
 type transportSpec struct {
 	// addr is the canonical host:port the clones dial.
 	addr string
+	// serverName is the host as the operator, discovery, or a routed URL
+	// spelled it, which the clones send as SNI by default. Empty means the
+	// host of addr. A dial for another spelling of the same address sends
+	// that spelling, as Go's own transport does.
+	serverName string
 	// verify, when set, replaces Go's certificate verification with the
 	// pinned callback of a discovered endpoint or a candidate.
 	verify func(tls.ConnectionState) error
@@ -143,6 +223,9 @@ func newClone(base *http.Transport, spec transportSpec, headerDeadline time.Dura
 	if err != nil {
 		return nil, fmt.Errorf("endpoint pool: address %q: %w", spec.addr, err)
 	}
+	if spec.serverName != "" {
+		host = spec.serverName
+	}
 	var cfg *tls.Config
 	if base.TLSClientConfig != nil {
 		cfg = base.TLSClientConfig.Clone()
@@ -150,8 +233,9 @@ func newClone(base *http.Transport, spec transportSpec, headerDeadline time.Dura
 		cfg = &tls.Config{MinVersion: tls.VersionTLS12}
 	}
 	// The SDK never sets ServerName, so net/http would derive it from the URL
-	// host. The pool's dialer does the TLS itself, so it sets the name from
-	// the host it dials, which drives SNI and the name check alike.
+	// host as written. The pool's dialer does the TLS itself, so it sets the
+	// name from the host it dials, in the spelling it was given, which drives
+	// SNI and the name check alike.
 	cfg.ServerName = host
 	cfg.NextProtos = slices.DeleteFunc(slices.Clone(cfg.NextProtos), func(p string) bool { return p == h2Proto })
 	if spec.verify != nil {
@@ -166,6 +250,7 @@ func newClone(base *http.Transport, spec transportSpec, headerDeadline time.Dura
 
 	d := &connectDialer{
 		addr:             spec.addr,
+		tlsOnly:          spec.verify != nil,
 		tlsConfig:        cfg,
 		handshakeTimeout: base.TLSHandshakeTimeout,
 		dialCap:          spec.dialCap,
@@ -194,10 +279,14 @@ func newClone(base *http.Transport, spec transportSpec, headerDeadline time.Dura
 
 // connectDialer dials one address for one owned clone and tags every failure
 // with the connect phase it happened in. Go writes no request byte before it
-// has a connection, so a final error that carries the tag proves the request
-// was never sent.
+// has a connection, so the attempt that gets a tagged error was never sent.
+// Whether an earlier attempt of the same request was is what provesNeverSent
+// decides.
 type connectDialer struct {
-	addr             string
+	addr string
+	// tlsOnly refuses plain http connections, for a clone whose certificate
+	// check is the pool's own callback.
+	tlsOnly          bool
 	dial             func(ctx context.Context, network, addr string) (net.Conn, error)
 	tlsConfig        *tls.Config
 	handshakeTimeout time.Duration
@@ -206,10 +295,21 @@ type connectDialer struct {
 }
 
 // dialPlain is the clone's DialContext, which net/http uses for an http URL.
+// A clone with its own certificate callback refuses it after the address
+// check, so a discovered endpoint or a candidate is never reached without its
+// certificate being checked.
 func (d *connectDialer) dialPlain(ctx context.Context, network, addr string) (net.Conn, error) {
 	ctx, cancel, bound, err := d.begin(ctx, addr)
 	if err != nil {
 		return nil, err
+	}
+	if d.tlsOnly {
+		cancel()
+		return nil, &ConnectPhaseError{
+			Phase:    PhaseDial,
+			Endpoint: d.addr,
+			Err:      fmt.Errorf("%w: %s", errPlaintextRefused, addr),
+		}
 	}
 	defer cancel()
 	conn, err := d.dialTCP(ctx, network, addr)
@@ -233,7 +333,7 @@ func (d *connectDialer) dialTLS(ctx context.Context, network, addr string) (net.
 	if err != nil {
 		return nil, d.fail(dialPhase(err), err, bound)
 	}
-	conn := tls.Client(raw, d.tlsConfig)
+	conn := tls.Client(raw, d.configFor(addr))
 	hctx, hcancel, timed := d.handshakeContext(ctx)
 	defer hcancel()
 	if err := conn.HandshakeContext(hctx); err != nil {
@@ -244,6 +344,21 @@ func (d *connectDialer) dialTLS(ctx context.Context, network, addr string) (net.
 		return nil, d.fail(handshakePhase(err), err, bound)
 	}
 	return conn, nil
+}
+
+// configFor returns the TLS config for a dial to addr, which begin has already
+// checked is this dialer's address. When the dial's host is spelled other than
+// the config's ServerName, such as a routed URL that capitalizes the name, the
+// config is copied with that spelling, so SNI goes out as Go's own transport
+// would send it.
+func (d *connectDialer) configFor(addr string) *tls.Config {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || host == d.tlsConfig.ServerName {
+		return d.tlsConfig
+	}
+	cfg := d.tlsConfig.Clone()
+	cfg.ServerName = host
+	return cfg
 }
 
 // begin checks the address and the send-by bound and returns the context the
@@ -300,9 +415,9 @@ func (d *connectDialer) handshakeContext(ctx context.Context) (context.Context, 
 
 // fail tags err with its phase. When the send-by bound has passed by the time
 // the setup failed, the request could not have been sent in time on any
-// endpoint, so the error also wraps ErrSendByPassed. The walk checks for that
-// before it treats the failure as the endpoint's fault, so a deadline the
-// caller set never demotes a healthy endpoint.
+// endpoint, so the error also wraps ErrSendByPassed. blamesEndpoint is false
+// for such an error, so a deadline the caller set never demotes a healthy
+// endpoint or marks it down.
 func (d *connectDialer) fail(phase Phase, err error, bound time.Time) error {
 	if !bound.IsZero() && !time.Now().Before(bound) {
 		err = fmt.Errorf("%w: %w", ErrSendByPassed, err)

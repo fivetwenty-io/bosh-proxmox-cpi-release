@@ -27,6 +27,9 @@ const h2Proto = "h2"
 //     the connect phase of the endpoint.
 //   - A DialTLSContext, because the pool replaces it with its own tagging
 //     dialer and would silently drop the caller's.
+//   - A deprecated Dial or DialTLS, for the same reason. The pool's clones
+//     set DialContext and DialTLSContext, which take priority, so either one
+//     would be dropped without a word.
 //   - A MaxConnsPerHost limit, because a request that waits for a connection
 //     slot starts no dial of its own, so the send-by bound on its dial could
 //     not stop it from being handed a connection after its deadline.
@@ -51,6 +54,16 @@ func checkBase(base *http.Transport) error {
 	}
 	if base.DialTLSContext != nil {
 		return fmt.Errorf("%w: it sets its own DialTLSContext, which the pool's connect-phase dialer "+
+			"would replace", ErrUnsupportedBase)
+	}
+	//lint:ignore SA1019 the deprecated fields are read only to refuse a base that sets them
+	if base.Dial != nil { //nolint:staticcheck // SA1019: read only to refuse a base that sets it
+		return fmt.Errorf("%w: it sets the deprecated Dial, which the pool's connect-phase dialer "+
+			"would replace", ErrUnsupportedBase)
+	}
+	//lint:ignore SA1019 the deprecated fields are read only to refuse a base that sets them
+	if base.DialTLS != nil { //nolint:staticcheck // SA1019: read only to refuse a base that sets it
+		return fmt.Errorf("%w: it sets the deprecated DialTLS, which the pool's connect-phase dialer "+
 			"would replace", ErrUnsupportedBase)
 	}
 	if base.MaxConnsPerHost > 0 {

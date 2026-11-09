@@ -101,6 +101,13 @@ func endpointOf(t *testing.T, p *Pool, addr string) *endpoint {
 func send(t *testing.T, ctx context.Context, tr http.RoundTripper, method, addr, path, body string,
 ) (*http.Response, error) {
 	t.Helper()
+	return tr.RoundTrip(apiRequest(t, ctx, method, addr, path, body))
+}
+
+// apiRequest builds the request send makes, so a test can inspect it after
+// the round trip.
+func apiRequest(t *testing.T, ctx context.Context, method, addr, path, body string) *http.Request {
+	t.Helper()
 	var r io.Reader
 	if body != "" {
 		r = strings.NewReader(body)
@@ -110,7 +117,14 @@ func send(t *testing.T, ctx context.Context, tr http.RoundTripper, method, addr,
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	return tr.RoundTrip(req)
+	return req
+}
+
+// closeBody closes a response's body when there is one.
+func closeBody(resp *http.Response) {
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
 }
 
 // mustOK sends a request that must get a 200, and drains and closes the body

@@ -14,12 +14,21 @@ import (
 
 // The pool refuses a base transport whose settings its clones cannot keep.
 func TestCheckBaseRefusals(t *testing.T) {
+	noDial := func(string, string) (net.Conn, error) { return nil, nil }
 	cases := map[string]func(*http.Transport){
 		"proxy": func(b *http.Transport) {
 			b.Proxy = func(*http.Request) (*url.URL, error) { return nil, nil }
 		},
 		"DialTLSContext": func(b *http.Transport) {
 			b.DialTLSContext = func(context.Context, string, string) (net.Conn, error) { return nil, nil }
+		},
+		"Dial": func(b *http.Transport) {
+			//lint:ignore SA1019 the deprecated field is the input under test
+			b.Dial = noDial //nolint:staticcheck // SA1019: the deprecated field is the input under test
+		},
+		"DialTLS": func(b *http.Transport) {
+			//lint:ignore SA1019 the deprecated field is the input under test
+			b.DialTLS = noDial //nolint:staticcheck // SA1019: the deprecated field is the input under test
 		},
 		"MaxConnsPerHost":       func(b *http.Transport) { b.MaxConnsPerHost = 4 },
 		"ResponseHeaderTimeout": func(b *http.Transport) { b.ResponseHeaderTimeout = time.Second },

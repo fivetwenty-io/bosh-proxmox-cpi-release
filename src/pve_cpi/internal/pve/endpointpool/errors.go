@@ -47,8 +47,11 @@ func (p Phase) Valid() bool {
 
 // ConnectPhaseError wraps a failure that happened while the pool's own dial or
 // TLS code was establishing a connection. Go writes no request byte before it
-// has a connection, so a final error that unwraps to a ConnectPhaseError
-// proves the request was never sent.
+// has a connection, so the attempt that got the error was never sent. Go's
+// transport can replay a request it counts as replayable after an earlier
+// attempt was written, and the http.Client sends a redirect's next leg after
+// the previous one was answered, so for a whole request the tag is proof only
+// when neither applies, which provesNeverSent checks.
 type ConnectPhaseError struct {
 	// Phase is the step that failed.
 	Phase Phase
@@ -88,7 +91,8 @@ func AsConnectPhase(err error) (*ConnectPhaseError, bool) {
 }
 
 // IsConnectPhase reports whether err carries a ConnectPhaseError, which proves
-// the request was never sent.
+// the failed attempt was never sent. See ConnectPhaseError for when it proves
+// the same of the whole request.
 func IsConnectPhase(err error) bool {
 	_, ok := AsConnectPhase(err)
 	return ok
