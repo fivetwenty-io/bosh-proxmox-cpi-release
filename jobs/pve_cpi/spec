@@ -13,10 +13,36 @@ packages:
 
 properties:
   pve.host:
-    description: "PVE host"
+    description: |
+      The PVE API host, which is the first endpoint the CPI dials. Required
+      unless pve.endpoints is set. When both are set, pve.host and pve.port
+      must name the same host and port as the first entry of pve.endpoints,
+      so pve.host: a with pve.endpoints: [a:9000] is rejected unless pve.port
+      is 9000. Existing manifests that set only pve.host keep working
+      unchanged.
   pve.port:
-    description: "PVE API port"
+    description: |
+      PVE API port. It applies to pve.host and to every pve.endpoints entry
+      that does not carry its own port.
     default: 8006
+  pve.endpoints:
+    description: |
+      Optional ordered list of PVE API endpoints for this cluster, each a
+      hostname, an IPv4 literal, a bare IPv6 literal, or any of those followed
+      by a port (an IPv6 literal with a port is written [literal]:port). No
+      scheme, path, user info, or whitespace is allowed, a port runs from 1 to
+      65535, and an entry without a port takes pve.port. The list holds at most
+      16 entries, and no two entries may be equal after the host is lowercased,
+      a trailing dot is removed, and the port is filled in. The first entry is
+      the preferred endpoint. When pve.host is empty it takes the first entry.
+      When both are set they must agree (see pve.host). Unset or empty (the
+      default) leaves the single pve.host endpoint in place and renders the
+      same cpi.json as before. When the list holds more than one endpoint and
+      pve.api_dial_timeout_sec or pve.api_tls_handshake_timeout_sec is 0, the
+      CPI uses 5 seconds and 10 seconds for them. This list controls which
+      endpoints the PVE API client uses; it never changes the direct-to-node
+      upload routing that pve.node_endpoints and pve.node_endpoints_discovery
+      control, and the CPI does not copy pve.node_endpoints values into it.
   pve.user:
     description: |
       PVE username. Required with password. An API token already names its
@@ -916,16 +942,20 @@ properties:
     description: |
       Optional. Bounds the TCP dial step of every PVE API HTTP request.
       0 (default) leaves the transport at the SDK default (no explicit dial
-      timeout). When set, the TCP dial is cancelled if it has not completed
-      within this many seconds. Useful on high-latency or flaky networks to
-      surface connection failures faster. Must be >= 0.
+      timeout) when only one endpoint is configured. When pve.endpoints holds
+      more than one endpoint, 0 means 5 seconds, so a node that drops packets
+      fails over quickly instead of holding each dial until the operating
+      system gives up. When set, the TCP dial is cancelled if it has not
+      completed within this many seconds. Useful on high-latency or flaky
+      networks to surface connection failures faster. Must be >= 0.
     default: 0
   pve.api_tls_handshake_timeout_sec:
     description: |
       Optional. Bounds the TLS handshake step of every PVE API HTTPS request.
       0 (default) leaves the transport at the SDK default (no explicit handshake
-      timeout). When set, the handshake is cancelled if it has not completed
-      within this many seconds. Must be >= 0.
+      timeout) when only one endpoint is configured. When pve.endpoints holds
+      more than one endpoint, 0 means 10 seconds. When set, the handshake is
+      cancelled if it has not completed within this many seconds. Must be >= 0.
     default: 0
   pve.api_max_idle_conns_per_host:
     description: |

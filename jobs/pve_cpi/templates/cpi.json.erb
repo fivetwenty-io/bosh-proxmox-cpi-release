@@ -1,6 +1,6 @@
 <%=
   config = {
-    "host"             => p("pve.host"),
+    "host"             => p("pve.host", ""),
     "port"             => p("pve.port"),
     "user"             => p("pve.user"),
     "realm"            => p("pve.realm"),
@@ -681,6 +681,17 @@
   # Omitted when empty so uploads keep the discovery-or-proxied behavior.
   node_endpoints = p("pve.node_endpoints", {})
   config["node_endpoints"] = node_endpoints unless node_endpoints.nil? || node_endpoints.empty?
+
+  # Ordered API endpoint list. Omitted when empty so a single pve.host renders
+  # exactly as before. pve.host has no spec default, so a manifest that sets
+  # neither property fails here at render time, as it did when p("pve.host")
+  # had no default; the CPI validates the list's grammar and agreement with
+  # pve.host at run time.
+  endpoints = p("pve.endpoints", [])
+  config["endpoints"] = endpoints unless endpoints.nil? || endpoints.empty?
+  if config["host"].to_s.strip.empty? && config["endpoints"].nil?
+    raise "pve.host or pve.endpoints is required"
+  end
 
   # node_endpoints_discovery has no spec default (see jobs/pve_cpi/spec), so
   # if_p fires only when the operator sets it explicitly; the Go *bool field

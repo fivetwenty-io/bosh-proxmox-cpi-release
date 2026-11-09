@@ -51,6 +51,7 @@ var jobSpecPropertyNames = []string{
 	"pve.disk_vmid_range_end",
 	"pve.disk_vmid_range_start",
 	"pve.encrypted",
+	"pve.endpoints",
 	"pve.ensure_no_ip_conflicts",
 	"pve.ephemeral_disk_min_mode",
 	"pve.ephemeral_disk_min_ratio",

@@ -584,6 +584,108 @@ if [ -n "$SPEC_REMOVED" ]; then
   FAILED=$((FAILED+1))
 fi
 
+# pve.endpoints follows the omit-when-empty idiom, and pve.host is optional once
+# the list supplies an endpoint. A manifest that sets neither fails at render
+# time, which keeps the deploy-time failure the required pve.host gave before.
+echo "Case 14: pve.endpoints and optional pve.host"
+# props_with_pve merges a JSON object into the base pve map. A null value
+# deletes that key, so {"host":null} models a manifest that never sets pve.host.
+props_with_pve() {
+  printf '%s' "$(build_props 'secret-pw' '')" | ruby -rjson -e '
+    h = eval(STDIN.read)
+    JSON.parse(ARGV[0]).each { |k, v| v.nil? ? h["pve"].delete(k) : h["pve"][k] = v }
+    print h.inspect
+  ' "$1"
+}
+assert_pve_render_raises() {
+  local label="$1"; local pve_json="$2"; shift 2
+  local out rc=0
+  out="$(render "$(props_with_pve "$pve_json")" 2>&1)" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "FAIL [${label}]: expected the render to raise, it succeeded" >&2
+    FAILED=$((FAILED+1))
+    return
+  fi
+  local needle
+  for needle in "$@"; do
+    if ! printf '%s' "$out" | grep -qF -- "$needle"; then
+      echo "FAIL [${label}]: the error does not contain: ${needle}" >&2
+      echo "       output was: ${out}" >&2
+      FAILED=$((FAILED+1))
+    fi
+  done
+}
+# Compact JSON of one rendered key, or <absent>.
+json_value() {
+  printf '%s' "$1" | ruby -rjson -e 'print JSON.generate(JSON.parse(STDIN.read).fetch(ARGV[0], "<absent>"))' "$2"
+}
+assert_json_value() {
+  local label="$1"; local json="$2"; local key="$3"; local want="$4"
+  local got
+  got="$(json_value "$json" "$key")"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL [${label}]: key \"${key}\" is ${got}, expected ${want}" >&2
+    echo "       JSON was: ${json}" >&2
+    FAILED=$((FAILED+1))
+  fi
+}
+
+# Unset: the base manifest renders as before, with no endpoints key.
+assert_json_lacks_key "case14-unset" "$JSON_1" endpoints || FAILED=$((FAILED+1))
+assert_json_key_equals "case14-unset" "$JSON_1" host pve.example.com || FAILED=$((FAILED+1))
+
+# Empty list: the key is left out.
+JSON_14E="$(render "$(props_with_pve '{"endpoints":[]}')")"
+assert_json_valid     "case14-empty" "$JSON_14E"           || FAILED=$((FAILED+1))
+assert_json_lacks_key "case14-empty" "$JSON_14E" endpoints || FAILED=$((FAILED+1))
+assert_json_key_equals "case14-empty" "$JSON_14E" host pve.example.com || FAILED=$((FAILED+1))
+
+# A list alongside pve.host: both reach cpi.json, and the order is preserved.
+JSON_14L="$(render "$(props_with_pve '{"endpoints":["pve.example.com","pve2.example.com:9000","[fd00::3]:8006"]}')")"
+assert_json_valid "case14-list" "$JSON_14L" || FAILED=$((FAILED+1))
+assert_json_value "case14-list" "$JSON_14L" endpoints '["pve.example.com","pve2.example.com:9000","[fd00::3]:8006"]'
+assert_json_key_equals "case14-list" "$JSON_14L" host pve.example.com || FAILED=$((FAILED+1))
+
+# A list with no pve.host renders an empty host and leaves the first entry to
+# the CPI, whether pve.host is absent or an explicit empty string.
+for host_json in '{"host":null,"endpoints":["a.example.com:9000","b.example.com"]}' \
+                 '{"host":"","endpoints":["a.example.com:9000","b.example.com"]}'; do
+  JSON_14H="$(render "$(props_with_pve "$host_json")")"
+  assert_json_valid "case14-hostless" "$JSON_14H" || FAILED=$((FAILED+1))
+  assert_json_value "case14-hostless" "$JSON_14H" endpoints '["a.example.com:9000","b.example.com"]'
+  assert_json_key_equals "case14-hostless" "$JSON_14H" host "" || FAILED=$((FAILED+1))
+done
+
+# Neither property set: the render raises and names both.
+assert_pve_render_raises "case14-neither-unset" '{"host":null}' "pve.host or pve.endpoints is required"
+assert_pve_render_raises "case14-neither-empty" '{"host":"","endpoints":[]}' "pve.host or pve.endpoints is required"
+assert_pve_render_raises "case14-neither-null-list" '{"host":null,"endpoints":null}' "pve.host or pve.endpoints is required"
+
+# The recommended rollback manifest sets both pve.host and pve.endpoints. The
+# 0.9.5 template does not know pve.endpoints, and it has to render that
+# manifest anyway, with the host it reads. CI checks out every tag.
+OLD_ERB="$(mktemp "${TMPDIR:-/tmp}/cpi-0.9.5.XXXXXX")"
+trap 'rm -f "$OLD_ERB"' EXIT
+if git -C "$REPO_ROOT" show v0.9.5:jobs/pve_cpi/templates/cpi.json.erb > "$OLD_ERB" 2>/dev/null; then
+  JSON_14R="$(ERB_PATH="$OLD_ERB" render "$(props_with_pve '{"endpoints":["pve.example.com","pve2.example.com"]}')")"
+  assert_json_valid      "case14-rollback" "$JSON_14R"                     || FAILED=$((FAILED+1))
+  assert_json_key_equals "case14-rollback" "$JSON_14R" host pve.example.com || FAILED=$((FAILED+1))
+  assert_json_lacks_key  "case14-rollback" "$JSON_14R" endpoints           || FAILED=$((FAILED+1))
+else
+  echo "SKIP [case14-rollback]: tag v0.9.5 is not in this checkout (fetch tags to run it)" >&2
+fi
+
+# pve.endpoints is in the job spec with no default, and it is not on the retired
+# list, so cpi_config entries may carry it.
+SPEC_ENDPOINTS="$(ruby -ryaml -e '
+  props = YAML.load_file(ARGV[0]).fetch("properties")
+  print(props.key?("pve.endpoints") && !props["pve.endpoints"].key?("default") ? "ok" : "bad")
+' "${REPO_ROOT}/jobs/pve_cpi/spec")"
+if [ "$SPEC_ENDPOINTS" != "ok" ]; then
+  echo "FAIL [case14-spec]: pve.endpoints missing from the job spec or carrying a default" >&2
+  FAILED=$((FAILED+1))
+fi
+
 if [ "$FAILED" -ne 0 ]; then
   echo "RESULT: ${FAILED} assertion(s) FAILED" >&2
   exit 1
