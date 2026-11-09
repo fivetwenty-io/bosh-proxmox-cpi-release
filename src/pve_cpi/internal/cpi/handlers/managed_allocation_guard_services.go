@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
@@ -586,11 +587,31 @@ func (t *managedPoolService) DeletePool(ctx context.Context, poolID string) (err
 		result = claim
 	}
 	err = t.PoolService.DeletePool(ctx, poolID)
-	if isManagedLockPool(poolID) && exactPoolDoesNotExist(err, poolID) {
+	if lockDeleteRefused(poolID, err) {
 		return t.guard.settleRefused(ctx, m, token, managedLockPoolRejection{poolID: poolID, method: m.Method}, err)
 	}
 	err = t.guard.finish(ctx, m, token, result, err)
 	return
+}
+
+// lockDeleteRefused reports whether a failed sentinel delete is proven to have
+// changed nothing, so the guard settles it as a refusal and hands it back
+// unchanged. Two failures prove it.
+//
+//   - PVE's exact verdict that the sentinel does not exist, which it raises
+//     under its user.cfg lock before it writes anything.
+//   - A steal or sweep delete refused for its send-by deadline
+//     (endpointpool.ErrSendByPassed). The failover transport refuses it
+//     before any byte leaves, and the SDK resends a DELETE only after PVE
+//     answered it with a 401, which changed nothing. The lock code then
+//     abandons the steal, and the sweep leaves the sentinel.
+//
+// A pool that is not a lock sentinel is never settled this way.
+func lockDeleteRefused(poolID string, err error) bool {
+	if !isManagedLockPool(poolID) {
+		return false
+	}
+	return exactPoolDoesNotExist(err, poolID) || errors.Is(err, endpointpool.ErrSendByPassed)
 }
 
 // ReadPoolComment forwards pve.RawPoolCommentReader, so a guard built over

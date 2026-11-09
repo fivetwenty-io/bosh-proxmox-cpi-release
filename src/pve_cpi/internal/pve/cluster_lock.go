@@ -38,6 +38,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -48,6 +49,7 @@ import (
 	"unicode/utf8"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
@@ -72,6 +74,27 @@ const clusterLockPollInterval = 500 * time.Millisecond
 // value measured the span, and on a cluster that answers in tens of
 // milliseconds two seconds is several times its worst case.
 const clusterLockStealBudget = 2 * time.Second
+
+// lockSentinelDeletePath is the API route a sentinel delete is sent to,
+// DELETE /pools?poolid=<poolid>. A send-by marker names it without the query.
+const lockSentinelDeletePath = "/pools"
+
+// withLockStealSendBy returns ctx carrying a send-by deadline for a
+// steal-shaped sentinel delete, the steal's own and the expired-lock sweep's.
+// Both rest on one timing argument. The delete must reach PVE within
+// clusterLockStealBudget of the moment its last re-read was sent, so the
+// deadline is started plus the budget. A delete that the failover transport
+// cannot start writing by then is refused with endpointpool.ErrSendByPassed,
+// and no byte of it leaves the machine.
+//
+// The marker names DELETE /pools only. The managed allocation guard reads the
+// sentinel before the delete and reads it back after it on the same context,
+// and those reads must still run once the deadline has passed. A context that
+// carries the marker must therefore stay with the one delete it guards, and
+// never reach a release or an abandon, which delete our own claim.
+func withLockStealSendBy(ctx context.Context, started time.Time) context.Context {
+	return endpointpool.WithSendBy(ctx, started.Add(clusterLockStealBudget), http.MethodDelete, lockSentinelDeletePath)
+}
 
 // clusterLockRoundTrip is the allowance for one PVE API round trip in the lock
 // arithmetic below.
@@ -490,8 +513,9 @@ func clusterLockPollWait(ctx context.Context, now, deadline time.Time) time.Dura
 // to steal the lock via delete+recreate. It returns a non-nil handle ONLY after
 // confirmLockCreate has confirmed the new sentinel carries OUR claim. It returns
 // (nil, nil) when the lock is still live, when the claim changed before the
-// delete, when the steal ran over its budget, or when another acquirer won the
-// recreate, signalling the caller to wait/retry.
+// delete, when the steal ran over its budget, when its delete could not be
+// sent before its send-by deadline, or when another acquirer won the recreate,
+// signalling the caller to wait/retry.
 //
 // PVE has no compare-and-delete, so two stealers that both judged the same
 // claim expired race each other, and a stale delete can remove the claim the
@@ -507,6 +531,10 @@ func clusterLockPollWait(ctx context.Context, now, deadline time.Time) time.Dura
 //   - The steal budget runs from the moment the re-read is sent, not from when
 //     it returns. A stealer that has not finished its delete within
 //     clusterLockStealBudget of that moment abandons the steal without creating.
+//     The delete also carries a send-by deadline at the end of the budget
+//     (withLockStealSendBy), so a failover transport that would have to try
+//     another endpoint first refuses to start it late, and the steal is
+//     abandoned with the claim left in place.
 //   - A lock that takes WithCreateGrace makes every create, a steal's or a plain
 //     one, wait out a grace pause of at least the budget plus a round trip and
 //     confirm its claim a second time.
@@ -579,8 +607,13 @@ func tryStealExpired(
 		// another acquirer's grace covers. Leave the sentinel alone.
 		return nil, nil
 	}
-	delErr := pools.DeletePool(WithExpectedLockClaim(ctx, comment), pool)
+	delErr := pools.DeletePool(withLockStealSendBy(WithExpectedLockClaim(ctx, comment), started), pool)
 	switch {
+	case errors.Is(delErr, endpointpool.ErrSendByPassed):
+		// The delete could not be sent within the budget, so none of it
+		// reached PVE and the expired claim still stands. Abandon the steal
+		// as for a changed claim; the next poll decides afresh.
+		return nil, nil
 	case delErr == nil, isPoolNotFound(delErr):
 	case errors.Is(delErr, ErrLockClaimChanged):
 		return nil, nil

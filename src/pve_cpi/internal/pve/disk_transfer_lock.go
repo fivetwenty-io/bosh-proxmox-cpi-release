@@ -10,6 +10,7 @@ import (
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 )
 
 // diskTransferLockName is the logical lock key for the per-disk transfer lock
@@ -307,7 +308,9 @@ const diskTransferLockSweepReadTimeout = 5 * time.Second
 // Each removal follows the discipline a stealing acquirer follows. The
 // sentinel is read again right before the delete, and the delete happens only
 // when that read shows the exact claim the listing showed and came back within
-// clusterLockStealBudget. The delete itself is unconditional. The sweep runs
+// clusterLockStealBudget. The delete carries the steal's send-by deadline, so
+// a failover transport never starts it after the budget that re-read opened
+// has run out. The delete itself is unconditional. The sweep runs
 // on the client the parker pool sweep hands it, which isn't the journal's
 // guarded pool service, and the SDK's DeletePool ignores the expected claim
 // the context carries (WithExpectedLockClaim), so nothing on the PVE side
@@ -383,7 +386,11 @@ func sweepExpiredLockAge() time.Duration {
 // sweepExpiredLockSentinel deletes the sentinel pool when it still carries
 // exactly comment, which the caller judged expired. It reports whether it
 // deleted it. A sentinel that is gone, carries another claim, or whose re-read
-// took longer than clusterLockStealBudget is left alone.
+// took longer than clusterLockStealBudget is left alone. So is one whose
+// delete could not be sent before the steal's send-by deadline, which the
+// delete carries for the same reason a steal's does (withLockStealSendBy).
+// None of that delete reached PVE, so the sentinel is left for the next sweep
+// and no error is reported.
 func sweepExpiredLockSentinel(ctx context.Context, pools PoolService, name, comment string, clk lockClock) (bool, error) {
 	started := clk.now()
 	readCtx, cancel := context.WithTimeout(ctx, diskTransferLockSweepReadTimeout)
@@ -397,8 +404,10 @@ func sweepExpiredLockSentinel(ctx context.Context, pools PoolService, name, comm
 	}
 	// The expected claim is passed for a guarded pool service that checks it.
 	// The SDK service the sweep normally runs on deletes unconditionally.
-	delErr := pools.DeletePool(WithExpectedLockClaim(ctx, comment), name)
+	delErr := pools.DeletePool(withLockStealSendBy(WithExpectedLockClaim(ctx, comment), started), name)
 	switch {
+	case errors.Is(delErr, endpointpool.ErrSendByPassed):
+		return false, nil
 	case delErr == nil:
 		return true, nil
 	case isPoolNotFound(delErr), errors.Is(delErr, ErrLockClaimChanged):
