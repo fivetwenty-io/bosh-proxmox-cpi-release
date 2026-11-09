@@ -3368,13 +3368,17 @@ func uploadStemcellImage(
 	}
 	rerr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "create_stemcell_upload", pve.StorageUploadMaxAttempts(), func() error {
 		err := run()
-		if err != nil && directHost != "" && pve.IsRoutedUploadFallbackEligible(err) {
+		// pve.UploadFallbackEligible judges the fault by the phase it came
+		// from, the same decision the pinned task poll makes: a fault from the
+		// POST is narrowed when the endpoint wrapper marked it as possibly
+		// sent, and a fault from the pending UPID's poll is not.
+		if err != nil && directHost != "" && pve.UploadFallbackEligible(err, pve.UploadPhaseFor(pendingUPID)) {
 			// The direct address is unusable: the node certificate does not
 			// cover it, the dial itself failed (wrong entry, unreachable
 			// address), or the TLS handshake failed for some other reason (a
-			// non-TLS listener on the port, a handshake reset or stall).
-			// Nothing was sent when the handshake or dial failed
-			// (neither sets sweepNeeded), and a failure past the POST leaves
+			// non-TLS listener on the port, a handshake reset or stall). A
+			// fault from the POST is eligible only when nothing was sent
+			// (neither sets sweepNeeded), and a fault from the await leaves
 			// pendingUPID set, which the re-run resolves un-pinned before any
 			// re-upload, so re-running through the configured endpoint (the
 			// pre-existing path) is safe. The dead route is memoized on the

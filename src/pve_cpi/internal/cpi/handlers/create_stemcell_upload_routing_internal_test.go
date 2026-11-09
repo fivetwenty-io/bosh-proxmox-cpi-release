@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 
 	sdkstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/storage"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 )
 
 // routeStorage records the CPI upload-host context stamp per Upload call.
@@ -287,3 +289,85 @@ type stemcellRoutingTimeoutErr struct{}
 func (stemcellRoutingTimeoutErr) Error() string   { return "i/o timeout" }
 func (stemcellRoutingTimeoutErr) Timeout() bool   { return true }
 func (stemcellRoutingTimeoutErr) Temporary() bool { return true }
+
+// routeSweepStorage adds the pre-retry name sweep to routeStorage, so a retry
+// that re-uploads after a dropped POST doesn't reach the nil embedded service.
+type routeSweepStorage struct {
+	routeStorage
+}
+
+func (s *routeSweepStorage) DeleteVolumeIfExistsAsync(context.Context, string, string, string) (bool, string, error) {
+	return false, "", nil
+}
+
+// markedReset is a connection reset the endpoint wrapper marked as possibly
+// sent, which is what every routed non-dial fault looks like once the wrapper
+// is installed.
+func markedReset() error {
+	return &endpointpool.MaybeSentError{Err: fmt.Errorf("request failed: %w",
+		&net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET})}
+}
+
+// TestUploadStemcellImage_MarkedResetOnPollFallsBackAtOnce drives the loop
+// through the poll phase: the POST returned a UPID, so a marked reset on the
+// pinned poll only re-awaits the same UPID through the configured endpoint and
+// can't upload anything twice.
+func TestUploadStemcellImage_MarkedResetOnPollFallsBackAtOnce(t *testing.T) {
+	t.Parallel()
+
+	const upid = "UPID:pve2:00001234:00000000:66aabbcc:imgcopy:local:root@pam:"
+	storage := &routeStorage{uploadFn: func(int) (string, error) { return upid, nil }}
+	tasks := &routeTasks{
+		waitFn: func(call int, _ string) (*sdktasks.Status, error) {
+			if call == 1 {
+				return nil, markedReset()
+			}
+			return &sdktasks.Status{ExitStatus: "OK"}, nil
+		},
+	}
+	deps := urDepsWithTasks(storage, tasks)
+	deps.NodeEndpoints = routeResolver("10.0.0.2")
+
+	err := uploadStemcellImage(urCtx(), deps, "pve2", "stemcells", "img.qcow2", urImageFile(t), "")
+	if err != nil {
+		t.Fatalf("uploadStemcellImage must succeed via the un-pinned re-await: %v", err)
+	}
+	if len(storage.hosts) != 1 || storage.hosts[0] != "10.0.0.2" {
+		t.Errorf("upload ctx hosts = %v, want the single pinned POST", storage.hosts)
+	}
+	if len(tasks.hosts) != 2 || tasks.hosts[0] != "10.0.0.2" || tasks.hosts[1] != "" {
+		t.Errorf("await ctx hosts = %v, want [10.0.0.2 \"\"]", tasks.hosts)
+	}
+	if _, ok := deps.NodeEndpoints.HostFor(context.Background(), "pve2"); ok {
+		t.Error("HostFor(pve2) after the fallback: expected the failed route to be memoized away")
+	}
+}
+
+// TestUploadStemcellImage_MarkedResetOnPostDoesNotFallBack drives the loop
+// through the POST phase: the reset may have come after the body started, so
+// the loop keeps the route pinned and never hands the upload to the proxied
+// path, which could send the same bytes twice.
+func TestUploadStemcellImage_MarkedResetOnPostDoesNotFallBack(t *testing.T) {
+	t.Parallel()
+
+	storage := &routeSweepStorage{}
+	storage.uploadFn = func(call int) (string, error) {
+		if call == 1 {
+			return "", markedReset()
+		}
+		return "", nil
+	}
+	deps := urDeps(storage)
+	deps.NodeEndpoints = routeResolver("10.0.0.2")
+
+	err := uploadStemcellImage(urCtx(), deps, "pve2", "stemcells", "img.qcow2", urImageFile(t), "")
+	if err != nil {
+		t.Fatalf("uploadStemcellImage: %v", err)
+	}
+	if len(storage.hosts) != 2 || storage.hosts[0] != "10.0.0.2" || storage.hosts[1] != "10.0.0.2" {
+		t.Errorf("upload ctx hosts = %v, want both attempts pinned to 10.0.0.2", storage.hosts)
+	}
+	if h, ok := deps.NodeEndpoints.HostFor(context.Background(), "pve2"); !ok || h != "10.0.0.2" {
+		t.Errorf("HostFor(pve2) = %q, %v; a marked POST fault must not memoize the route away", h, ok)
+	}
+}

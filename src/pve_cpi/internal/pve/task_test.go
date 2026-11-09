@@ -2,6 +2,8 @@ package pve_test
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -1419,19 +1421,24 @@ func TestAwaitTask_WithPollIntervalForTest_Zero(t *testing.T) {
 	}
 }
 
-// TestAwaitTask_RoutedUploadHostAgreesWithUploadLoopPredicate pins that the
-// pinned poll and the upload loops in the agent and the stemcell handler answer
-// the same question. The poll returns a routed-upload fault at once exactly
-// when IsRoutedUploadFallbackEligible accepts it, and the error it returns
-// still satisfies that predicate, so the loop falls back on it. Every fault the
-// predicate rejects, including a read error or a "tls:" text error the endpoint
-// wrapper marked as possibly sent, is re-polled to the deadline, and the error
-// that then comes back is unresolved, which the loops do not fall back on.
-func TestAwaitTask_RoutedUploadHostAgreesWithUploadLoopPredicate(t *testing.T) {
+// TestAwaitTask_RoutedUploadHostFollowsSharedPollDecision pins that the pinned
+// poll answers through the same helper the upload loops call. The poll returns
+// a routed-upload fault at once exactly when UploadFallbackEligible accepts it
+// at the poll phase, so a read error or a "tls:" text error the endpoint
+// wrapper marked as possibly sent falls back at once, because the upload's POST
+// already finished. The error it returns still satisfies the helper, so the
+// loop falls back on it. Every fault the helper rejects is re-polled to the
+// deadline, and the error that then comes back is unresolved, which the loops
+// do not fall back on.
+func TestAwaitTask_RoutedUploadHostFollowsSharedPollDecision(t *testing.T) {
 	t.Parallel()
 	read := &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
 	tlsText := &sdkerrors.ConnectionError{Host: "10.0.0.2", Port: 8006, Message: "failed to establish a connection",
 		Cause: errors.New("tls: bad record MAC")}
+	pinTag := &endpointpool.ConnectPhaseError{Phase: endpointpool.PhasePin, Endpoint: "10.0.0.2:8006",
+		Err: errors.New("certificate does not match the pin")}
+	cert := fmt.Errorf("Get: %w", &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}})
+	record := fmt.Errorf("Get: %w", tls.RecordHeaderError{Msg: "oversized record received with length 20000"})
 	cases := []struct {
 		name     string
 		fault    error
@@ -1439,16 +1446,21 @@ func TestAwaitTask_RoutedUploadHostAgreesWithUploadLoopPredicate(t *testing.T) {
 	}{
 		{"refused dial", dialRefused(), true},
 		{"unmarked read error", fmt.Errorf("failed to get task status: %w", read), true},
-		{"marked read error", &endpointpool.MaybeSentError{Err: fmt.Errorf("failed to get task status: %w", read)}, false},
+		{"marked read error", &endpointpool.MaybeSentError{Err: fmt.Errorf("failed to get task status: %w", read)}, true},
 		{"unmarked tls text", tlsText, true},
-		{"marked tls text", &endpointpool.MaybeSentError{Err: tlsText}, false},
+		{"marked tls text", &endpointpool.MaybeSentError{Err: tlsText}, true},
 		{"marked refused dial", &endpointpool.MaybeSentError{Err: dialRefused()}, true},
+		{"marked certificate failure", &endpointpool.MaybeSentError{Err: cert}, true},
+		{"marked record header", &endpointpool.MaybeSentError{Err: record}, true},
+		{"connect-phase tag", pinTag, true},
+		{"marked connect-phase tag", &endpointpool.MaybeSentError{Err: pinTag}, true},
 		{"5xx", sdkerrors.ParseAPIError(500, []byte(`{"errors":"internal error"}`)), false},
+		{"5xx quoting tls", sdkerrors.ParseAPIError(500, []byte(`{"message":"upstream said tls: handshake failure"}`)), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			eligible := pve.IsRoutedUploadFallbackEligible(tc.fault)
+			eligible := pve.UploadFallbackEligible(tc.fault, pve.UploadPollPhase)
 			if eligible != tc.eligible {
 				t.Fatalf("test fault eligibility = %v, want %v: %v", eligible, tc.eligible, tc.fault)
 			}
@@ -1465,8 +1477,8 @@ func TestAwaitTask_RoutedUploadHostAgreesWithUploadLoopPredicate(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected an error, got nil")
 			}
-			if got := pve.IsRoutedUploadFallbackEligible(err); got != eligible {
-				t.Errorf("IsRoutedUploadFallbackEligible on the poll's error = %v, want %v (the fault's own answer): %v",
+			if got := pve.UploadFallbackEligible(err, pve.UploadPollPhase); got != eligible {
+				t.Errorf("UploadFallbackEligible on the poll's error = %v, want %v (the fault's own answer): %v",
 					got, eligible, err)
 			}
 			if eligible {

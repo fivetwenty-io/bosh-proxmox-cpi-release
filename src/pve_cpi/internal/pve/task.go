@@ -185,8 +185,9 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 // licenses a resubmit. A transient error is never what comes back.
 //
 // A poll stamped with a routed upload host is the one exception, and only
-// for a fault IsRoutedUploadFallbackEligible accepts: that fault returns at
-// once, before the deadline; see the comment at that return. Every other
+// for a fault UploadFallbackEligible accepts at UploadPollPhase: that fault
+// returns at once, before the deadline, whether or not the endpoint wrapper
+// marked it as possibly sent; see the comment at that return. Every other
 // transient fault on a pinned poll is re-polled like any other, and a pinned
 // poll whose deadline has passed returns unresolved like any other.
 //
@@ -304,14 +305,18 @@ func waitTaskThroughTransientFaults(
 		// A poll pinned to a routed upload host (UploadHostFromContext)
 		// returns a fallback-eligible fault at once, as it always has. The
 		// upload loops above AwaitTask read exactly that fault
-		// (IsRoutedUploadFallbackEligible) to drop the pin and re-await the
-		// SAME pending UPID through the configured endpoint (a refused dial
-		// fails over to the proxied path), and they never re-POST on it
-		// because it carries no task verdict. Re-polling here would hold them
-		// on a dead direct host for the task's whole window before that
-		// fallback could run. The loops act on no other fault, so every other
-		// transient fault is re-polled below.
-		if UploadHostFromContext(ctx) != "" && IsRoutedUploadFallbackEligible(err) {
+		// (UploadFallbackEligible at UploadPollPhase, the same decision) to
+		// drop the pin and re-await the SAME pending UPID through the
+		// configured endpoint (a refused dial fails over to the proxied
+		// path), and they never re-POST on it because it carries no task
+		// verdict. The upload already finished, so a fallback from a poll
+		// can't duplicate anything, and the maybe-sent marker the wrapper puts
+		// on every routed GET is ignored here; it narrows only a fault from the
+		// upload's own POST. Re-polling would hold the loops on a dead direct
+		// host for the task's whole window before that fallback could run. The
+		// loops act on no other fault, so every other transient fault is
+		// re-polled below.
+		if UploadHostFromContext(ctx) != "" && UploadFallbackEligible(err, UploadPollPhase) {
 			return nil, wrapPollError(err, upid)
 		}
 

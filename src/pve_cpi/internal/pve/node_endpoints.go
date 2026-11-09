@@ -6,10 +6,12 @@ import (
 	"crypto/x509"
 	"errors"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 
 	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
@@ -314,31 +316,56 @@ func IsDirectDialFailure(err error) bool {
 // client.go's buildTransportOpts). Ambiguity therefore resolves toward
 // fallback here, deliberately more aggressively than IsDirectDialFailure.
 //
-// An error that carries endpointpool.MaybeSentError makes the read arm and the
-// "tls:" text arm return false, because the request may have started; the
-// record-header and alert arms are unchanged.
+// An error that carries endpointpool.MaybeSentError changes three arms, and
+// only for a fault from the upload's own POST (see UploadFaultPhase):
+//
+//   - The read arm returns false, because the connection may have dropped
+//     after the body started.
+//   - The "tls:" text arm returns false, for the same reason.
+//   - The record-header arm accepts only a RecordHeaderError whose Conn field
+//     is non-nil, which Go sets for the first record of a handshake that did
+//     not look like TLS. The messages Go emits on an established connection
+//     leave Conn nil and are rejected, because bytes may already have gone
+//     out.
+//
+// The alert arm is unchanged. The dial and certificate arms of
+// IsRoutedUploadFallbackEligible ignore the marker on purpose, because the
+// spec lists them as proof that nothing was sent.
+//
+// A fault from the poll of an upload task that already finished ignores the
+// marker; UploadFallbackEligible chooses between the two readings.
 //
 // nil → false.
 func IsRoutedHandshakeFailure(err error) bool {
+	return routedHandshakeFailure(err, true)
+}
+
+// routedHandshakeFailure is IsRoutedHandshakeFailure with the maybe-sent
+// narrowing switched by honorMaybeSent. With honorMaybeSent false every arm
+// answers as it did before the narrowing existed.
+func routedHandshakeFailure(err error, honorMaybeSent bool) bool {
 	if err == nil {
 		return false
 	}
+	// The marker is read once so every arm answers from the same fact. When
+	// the endpoint wrapper is installed it marks every routed error that is
+	// not a connect-phase failure with endpointpool.MaybeSentError, and a
+	// marked error may be a connection dropped after the upload's body
+	// started, so the ambiguous arms may not send it to the proxied path,
+	// which would upload the same bytes a second time. A client without the
+	// wrapper never produces the marker, and these arms behave as they
+	// always have.
+	maybeSent := honorMaybeSent && endpointpool.IsMaybeSent(err)
 	var recErr tls.RecordHeaderError
 	if errors.As(err, &recErr) {
-		return true
+		// Conn is nil once a handshake finished or an alert was written, so
+		// a marked error without it came from an established connection.
+		return !maybeSent || recErr.Conn != nil
 	}
 	var alertErr tls.AlertError
 	if errors.As(err, &alertErr) {
 		return true
 	}
-	// The two arms below are ambiguous about whether the request left. When
-	// the endpoint wrapper is installed it marks every routed error that is
-	// not a connect-phase failure with endpointpool.MaybeSentError, and a
-	// marked error may be a connection dropped after the upload's body
-	// started, so neither arm may send it to the proxied path, which would
-	// upload the same bytes a second time. A client without the wrapper never
-	// produces the marker, and these arms behave as they always have.
-	maybeSent := endpointpool.IsMaybeSent(err)
 	var opErr *net.OpError
 	if errors.As(err, &opErr) && opErr.Op == "read" {
 		return !maybeSent
@@ -346,10 +373,73 @@ func IsRoutedHandshakeFailure(err error) bool {
 	// Textual safety net for TLS handshake failures the SDK's transport
 	// re-wraps into a shape errors.As cannot see through (e.g. a
 	// non-standard-library HTTP transport, or a future crypto/tls error
-	// type). Every crypto/tls error message is "tls: ..."-prefixed; a false
-	// positive here still only widens the fallback-eligible set at the same
-	// bounded call sites described above.
-	return !maybeSent && strings.Contains(strings.ToLower(err.Error()), "tls:")
+	// type). See tlsTransportText for what counts as a match.
+	return !maybeSent && tlsTransportText(err)
+}
+
+// tlsTextMarker finds "tls:" as the start of a crypto/tls message, either at
+// the start of the text or after a space or colon, so a word that merely ends
+// in "tls" does not match. A remote alert reads "remote error: tls: ...", which
+// this covers through the colon.
+var tlsTextMarker = regexp.MustCompile(`(^|[\s:])tls: `)
+
+// tlsTransportText reports whether err's text carries a crypto/tls message and
+// the error is a transport failure. An error that holds a PVE response (an
+// API error or any of its subtypes) never counts, because the server answered
+// and its body can quote "tls:" in a message that says nothing about this
+// connection.
+func tlsTransportText(err error) bool {
+	if sdkerrors.IsAPIError(err) {
+		return false
+	}
+	return tlsTextMarker.MatchString(strings.ToLower(err.Error()))
+}
+
+// UploadFaultPhase names the step of a direct-to-node upload that a fault came
+// from, because the same fault means different things before and after the
+// upload's POST completed.
+type UploadFaultPhase int
+
+const (
+	// UploadPostPhase is a fault from the upload's own POST, or from any step
+	// that holds no pending UPID. The POST may already have reached the routed
+	// node, so a fallback could upload the same bytes twice, and only
+	// IsRoutedUploadFallbackEligible's narrowed answer counts. It is the zero
+	// value, so an unset phase fails closed.
+	UploadPostPhase UploadFaultPhase = iota
+	// UploadPollPhase is a fault from polling an upload task whose POST
+	// already finished. A fallback from it only awaits the same UPID again
+	// through the configured endpoint, so it can't duplicate anything and the
+	// maybe-sent marker is ignored.
+	UploadPollPhase
+)
+
+// UploadPhaseFor returns the phase a fault belongs to given the loop's pending
+// UPID: a loop that holds one is polling, and one that doesn't is judging the
+// POST.
+func UploadPhaseFor(pendingUPID string) UploadFaultPhase {
+	if pendingUPID != "" {
+		return UploadPollPhase
+	}
+	return UploadPostPhase
+}
+
+// UploadFallbackEligible is the one decision the pinned task poll and both
+// upload loops (the config drive and the stemcell upload) share, so they can't
+// drift apart. It reports whether err, seen at phase of a direct-to-node
+// upload, should drop the pin and fall back to the configured endpoint.
+//
+// For UploadPollPhase it accepts a certificate failure, a dial failure, a
+// routed handshake failure, and a connect-phase tagged fault, and it ignores
+// the maybe-sent marker. For every other phase it answers
+// IsRoutedUploadFallbackEligible, which narrows under the marker. The poll-phase
+// answer is a superset of the POST-phase one.
+func UploadFallbackEligible(err error, phase UploadFaultPhase) bool {
+	if phase == UploadPollPhase {
+		return IsTLSCertVerificationFailure(err) || IsDirectDialFailure(err) ||
+			routedHandshakeFailure(err, false) || endpointpool.IsConnectPhase(err)
+	}
+	return IsRoutedUploadFallbackEligible(err)
 }
 
 // IsRoutedUploadFallbackEligible reports whether err, observed on a
@@ -358,7 +448,11 @@ func IsRoutedHandshakeFailure(err error) bool {
 // IsRoutedHandshakeFailure, plus an error that carries the endpoint wrapper's
 // connect-phase tag, which proves the request never left; a marked error that
 // also carries the tag is not counted, because a maybe-sent marker is never
-// proof. Upload call sites already gate on
+// proof. The certificate and dial arms ignore the marker on purpose, because
+// the spec lists them as proof that nothing was sent. It judges a fault from
+// the upload's own POST; a fault from polling the
+// finished upload's task goes through UploadFallbackEligible with
+// UploadPollPhase. Upload call sites already gate on
 // directHost != "" (equivalently, UploadHostFromContext(ctx) != "") before
 // calling this, so it is deliberately not context-aware itself. Extracted
 // as one call so each fallback site's own control flow — reopening the

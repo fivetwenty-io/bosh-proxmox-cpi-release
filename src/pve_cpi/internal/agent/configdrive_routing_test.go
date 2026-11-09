@@ -9,12 +9,14 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"syscall"
 	"testing"
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdktasks "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
@@ -466,5 +468,86 @@ func TestConfigDrive_Configure_UploadBudgetHonorsOverride(t *testing.T) {
 	}
 	if attempts != 3 {
 		t.Errorf("upload attempts = %d, want the overridden budget 3", attempts)
+	}
+}
+
+// markedResetErr is a connection reset the endpoint wrapper marked as possibly
+// sent, which is what every routed non-dial fault looks like once the wrapper
+// is installed.
+func markedResetErr() error {
+	return &endpointpool.MaybeSentError{Err: fmt.Errorf("request failed: %w",
+		&net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET})}
+}
+
+// TestConfigDrive_Configure_MarkedResetOnPollFallsBackAtOnce drives the loop
+// through the poll phase: the POST returned a UPID, so a marked reset on the
+// pinned poll only re-awaits the same UPID through the configured endpoint and
+// can't upload anything twice.
+func TestConfigDrive_Configure_MarkedResetOnPollFallsBackAtOnce(t *testing.T) {
+	t.Parallel()
+
+	const upid = "UPID:pve2:00001234:00000000:66aabbcc:imgcopy:local:root@pam:"
+	attempts := 0
+	storageSvc := &fakeStorageSvc{}
+	storageSvc.uploadFn = func(_ context.Context, _, _, _, _ string, _ io.Reader) (string, error) {
+		attempts++
+		return upid, nil
+	}
+	tasksSvc := &routedTasksSvc{
+		waitFn: func(call int, _ string) (*sdktasks.Status, error) {
+			if call == 1 {
+				return nil, markedResetErr()
+			}
+			return &sdktasks.Status{ExitStatus: "OK"}, nil
+		},
+	}
+	a := newRoutedISOAgent(storageSvc, nil, "10.0.0.2")
+	base, _ := a.pveSvc.(*fakePVEClient)
+	a.pveSvc = &routedTasksClient{fakePVEClient: base, tasksSvc: tasksSvc}
+
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	if err := a.Configure(ctx, "pve2", 200, baseISOConfig()); err != nil {
+		t.Fatalf("Configure must succeed via the un-pinned re-await: %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("upload attempts = %d, want 1 (the POST is never re-submitted)", attempts)
+	}
+	if len(tasksSvc.hosts) != 2 || tasksSvc.hosts[0] != "10.0.0.2" || tasksSvc.hosts[1] != "" {
+		t.Errorf("await hosts = %v, want [10.0.0.2 \"\"]", tasksSvc.hosts)
+	}
+	if _, ok := a.nodeEndpoints.HostFor(context.Background(), "pve2"); ok {
+		t.Error("HostFor(pve2) after the fallback: expected the failed route to be memoized away")
+	}
+}
+
+// TestConfigDrive_Configure_MarkedResetOnPostDoesNotFallBack drives the loop
+// through the POST phase: the reset may have come after the body started, so
+// the loop keeps the route pinned and never hands the upload to the proxied
+// path, which could send the same bytes twice.
+func TestConfigDrive_Configure_MarkedResetOnPostDoesNotFallBack(t *testing.T) {
+	t.Parallel()
+
+	attempts := 0
+	var hosts []string
+	storageSvc := &fakeStorageSvc{}
+	storageSvc.uploadFn = func(ctx context.Context, _, _, _, _ string, _ io.Reader) (string, error) {
+		attempts++
+		hosts = append(hosts, pve.UploadHostFromContext(ctx))
+		if attempts == 1 {
+			return "", markedResetErr()
+		}
+		return "", nil
+	}
+	a := newRoutedISOAgent(storageSvc, nil, "10.0.0.2")
+
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	if err := a.Configure(ctx, "pve2", 200, baseISOConfig()); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if len(hosts) != 2 || hosts[0] != "10.0.0.2" || hosts[1] != "10.0.0.2" {
+		t.Errorf("attempt hosts = %v, want both attempts pinned to 10.0.0.2", hosts)
+	}
+	if h, ok := a.nodeEndpoints.HostFor(context.Background(), "pve2"); !ok || h != "10.0.0.2" {
+		t.Errorf("HostFor(pve2) = %q, %v; a marked POST fault must not memoize the route away", h, ok)
 	}
 }

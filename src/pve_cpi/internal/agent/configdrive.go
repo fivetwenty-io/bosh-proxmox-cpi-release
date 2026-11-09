@@ -419,20 +419,24 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 		}
 
 		err := attempt(uploadCtx)
-		if err != nil && directHost != "" && pve.IsRoutedUploadFallbackEligible(err) {
+		// pve.UploadFallbackEligible judges the fault by the phase it came
+		// from, the same decision the pinned task poll makes: a fault from the
+		// POST is narrowed when the endpoint wrapper marked it as possibly
+		// sent, and a fault from the pending UPID's poll is not.
+		if err != nil && directHost != "" && pve.UploadFallbackEligible(err, pve.UploadPhaseFor(pendingUPID)) {
 			// The direct address is unusable: the node certificate does not
 			// cover it, the dial itself failed (wrong entry, unreachable
 			// address), or the TLS handshake failed for some other reason
 			// (a non-TLS listener on the port, a handshake reset or stall).
-			// Nothing was sent in any of these cases, so re-attempting
-			// un-pinned through the configured endpoint (the pre-existing
-			// path) needs no pre-sweep. The dead route is memoized on the
-			// resolver so later uploads this process skip it, and the
-			// remaining attempts here stay un-pinned. When the failure
-			// surfaced in the await phase the POST already went through, so
-			// the inline re-attempt is skipped: the retry loop re-enters with
-			// the (now un-pinned) pending-UPID re-await / evidence-gated sweep
-			// before any next upload.
+			// A fault from the POST is eligible only when nothing was sent, so
+			// re-attempting un-pinned through the configured endpoint (the
+			// pre-existing path) needs no pre-sweep. A fault from the await
+			// phase leaves pendingUPID set, and the POST already went through,
+			// so the inline re-attempt is skipped. The dead route is memoized
+			// on the resolver so later uploads this process skip it, and the
+			// remaining attempts here stay un-pinned. The retry loop re-enters
+			// with the (now un-pinned) pending-UPID re-await / evidence-gated
+			// sweep before any next upload.
 			a.logger.Warn("configdrive: direct-to-node dial failed; falling back to the configured endpoint",
 				log.String("node", node),
 				log.String("direct_host", directHost),
