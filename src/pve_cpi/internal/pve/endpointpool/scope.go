@@ -11,7 +11,10 @@ type scopeKey struct{}
 // operator command, puts one on the call's context. A pool ties each tether it
 // makes to the scope on the request's context, and drops those tethers when the
 // scope is released, so a tether lasts as long as the call that made it. A
-// tether made on a context without a scope lasts for the process.
+// tether made on a context without a scope is dropped when a call's scope is
+// released, so it too ends with the call that made it, even in a process that
+// serves more than one call. A tether that a request still holds at that
+// moment outlives the call instead.
 //
 // A Scope is compared by identity, so it must come from WithAffinityScope and
 // be passed around as the pointer that function put on the context.
@@ -19,6 +22,10 @@ type Scope struct {
 	mu       sync.Mutex
 	released bool
 	fns      []func()
+	// nested says the scope replaced another one on its context, so it is not
+	// a call's own scope, and its release leaves the tethers made without a
+	// scope to the release of the call's.
+	nested bool
 }
 
 // WithAffinityScope returns a context that carries a new scope, and a release
@@ -27,9 +34,10 @@ type Scope struct {
 // release when the call ends.
 //
 // When ctx already carries a scope, the new one replaces it for requests on the
-// returned context and does not release the outer one.
+// returned context and does not release the outer one, and its release leaves
+// the tethers made without a scope to the outer one's.
 func WithAffinityScope(ctx context.Context) (context.Context, func()) {
-	s := &Scope{}
+	s := &Scope{nested: ScopeFromContext(ctx) != nil}
 	return context.WithValue(ctx, scopeKey{}, s), s.release
 }
 
@@ -85,7 +93,8 @@ func (s *Scope) sees(made *Scope) bool {
 // function that panics does not keep the rest from running, and its panic is
 // dropped. The dispatcher calls release from a defer after a call's work has
 // finished, and the registered functions only drop tethers, so a faulty one
-// must not crash the CPI at that point.
+// must not crash the CPI at that point. The release of a scope that is not
+// nested then drops, from every pool, the tethers made without a scope.
 func (s *Scope) release() {
 	s.mu.Lock()
 	if s.released {
@@ -102,5 +111,8 @@ func (s *Scope) release() {
 			defer func() { _ = recover() }()
 			fn()
 		}()
+	}
+	if !s.nested {
+		dropScopelessTethers()
 	}
 }

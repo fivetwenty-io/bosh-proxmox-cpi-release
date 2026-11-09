@@ -37,8 +37,8 @@ type tether struct {
 	// holders counts the requests in flight that hold the tether.
 	holders int
 	// fixed says a request holding the tether may have been sent, so the
-	// tether stays on its target until its scope is released, or for the
-	// process when it has no scope.
+	// tether stays on its target until the call that made it returns, or for
+	// the process when it outlived that call.
 	fixed bool
 	// logged says the Debug line for the fixed tether has been written.
 	logged bool
@@ -46,20 +46,39 @@ type tether struct {
 	// another address, which only a defect can cause. Every later mutation
 	// that sees the tether is refused with ErrTetherConflict.
 	conflicted bool
-	// gone says the tether is no longer in the table, because it was
-	// released or its scope was.
-	gone bool
+	// outlived says the call that made the tether returned while a request
+	// still held it, or before the request that made it claimed. No scope's
+	// release drops it. It is removed when its last holder settles sentNever
+	// and it was never fixed, and otherwise it stays for the process, so a
+	// late replay on that call's context still goes only to its target.
+	outlived bool
+	// splitLogged says the Error line for a request refused because it saw
+	// this tether beside one on another address has been written.
+	splitLogged bool
 }
 
 // tetherTable holds every tether of one pool, reserved or fixed, under one
 // lock. A tether made through one pool never steers a request that another
-// pool handles. The zero value is ready to use.
+// pool handles. The zero value is ready to use. Its lock may be held while a
+// scope's lock or scopelessTables.mu is taken, and never the other way round.
 type tetherTable struct {
 	mu    sync.Mutex
 	byKey map[tetherKey][]*tether
 	// watched holds the scopes whose release already drops their tethers,
 	// so each scope registers one release function per pool.
 	watched map[*Scope]struct{}
+	// registered says the table is in scopelessTables, because it holds a
+	// tether made without a scope that no call's release has dropped yet.
+	registered bool
+}
+
+// scopelessTables holds every tether table with a tether made without a
+// scope that may still be dropped, so the release of a call's scope reaches it
+// even when none of the call's own requests went through its pool. A table
+// leaves the set at the first release after it joined.
+var scopelessTables struct {
+	mu  sync.Mutex
+	set map[*tetherTable]struct{}
 }
 
 // tetherHold is one request's hold on the tethers of its key. A request
@@ -103,18 +122,24 @@ func newTetherHold(req *http.Request) *tetherHold {
 //     the target they name, without waiting for the requests that hold them,
 //     so two requests in flight with one key share one endpoint.
 //   - When the tethers it sees name more than one address, which happens only
-//     to a request without a scope while two calls in one process each
-//     tethered the key to a different endpoint, it is refused with an error
-//     that wraps ErrTetherConflict. Either address could be the one its call
-//     sent to, so neither is safe.
+//     to a request without a scope, or one whose call already returned, that
+//     sees the tethers two calls made on different endpoints, it is refused
+//     with an error that wraps ErrTetherConflict, and the pool logs it at
+//     Error once per key. Either address could be the one its call sent to,
+//     so neither is safe.
 //
-// Scope.sees decides which tethers a request can see. A new reservation made
-// under a scope registers the release that drops the scope's tethers, once per
-// scope, outside the table's lock, as Scope.OnRelease asks.
+// Scope.sees decides which tethers a request can see, and a request whose
+// scope was already released also sees every tether that outlived the call
+// that made it, so late requests with one key share one tether. A new reservation made under
+// a scope that is not yet released registers the release that drops the
+// scope's tethers, once per scope, outside the table's lock, as
+// Scope.OnRelease asks. One made under a released scope has outlived its call
+// already, and one made without a scope puts the table in scopelessTables.
 func (p *Pool) claim(h *tetherHold, planned tetherTarget) error {
 	t := &p.tethers
 	t.mu.Lock()
-	visible := t.visibleLocked(h.key, h.scope)
+	late := h.scope.Released()
+	visible := t.visibleLocked(h.key, h.scope, late)
 	for _, x := range visible {
 		if x.conflicted {
 			t.mu.Unlock()
@@ -125,7 +150,11 @@ func (p *Pool) claim(h *tetherHold, planned tetherTarget) error {
 		target := visible[0].target
 		for _, x := range visible[1:] {
 			if x.target.addr != target.addr {
+				first := markSplitLocked(visible)
 				t.mu.Unlock()
+				if first {
+					p.logSplit(h, target.addr, x.target.addr)
+				}
 				return fmt.Errorf("endpoint pool: refusing %s %s, whose tether key is tethered to both %s and %s "+
 					"by different calls: %w", h.method, h.route, target.addr, x.target.addr, ErrTetherConflict)
 			}
@@ -137,14 +166,17 @@ func (p *Pool) claim(h *tetherHold, planned tetherTarget) error {
 		t.mu.Unlock()
 		return nil
 	}
-	x := &tether{key: h.key, scope: h.scope, target: planned, holders: 1}
+	x := &tether{key: h.key, scope: h.scope, target: planned, holders: 1, outlived: late}
 	if t.byKey == nil {
 		t.byKey = make(map[tetherKey][]*tether)
 	}
 	t.byKey[h.key] = append(t.byKey[h.key], x)
 	h.held, h.target, h.following = []*tether{x}, planned, false
 	watch := false
-	if h.scope != nil {
+	switch {
+	case h.scope == nil:
+		t.registerLocked()
+	case !late:
 		if _, ok := t.watched[h.scope]; !ok {
 			if t.watched == nil {
 				t.watched = make(map[*Scope]struct{})
@@ -161,13 +193,14 @@ func (p *Pool) claim(h *tetherHold, planned tetherTarget) error {
 }
 
 // watchScope registers the release that drops s's tethers from this pool.
-// When s was already released, which only a request still in flight after
-// its call returned can meet, no release will ever come, so the tethers made
-// under s stay for the process, as a tether without a scope does. Dropping
-// them early would let a late replay on that context reach another endpoint,
-// and keeping them only keeps more mutations on their endpoints.
+// When s was released after claim found it live, its release has already run
+// without this pool, so the pool drops s's tethers itself, as that release
+// would have. The tether the claim made is still held, so it outlives the call
+// rather than being dropped under its request.
 func (p *Pool) watchScope(s *Scope) {
-	_ = s.OnRelease(func() { p.tethers.dropScope(s) })
+	if !s.OnRelease(func() { p.tethers.dropScope(s) }) {
+		p.tethers.dropScope(s)
+	}
 }
 
 // release drops h's hold after a hop or a request that proved nothing was
@@ -176,8 +209,8 @@ func (p *Pool) watchScope(s *Scope) {
 // removed, because nothing with its key has left the machine. A request that
 // followed a tether never hops, and neither does one whose tether another
 // request still holds or has fixed: it returns its error, and the next
-// attempt meets whatever the tether has become by then. A tether whose scope
-// was released while the request was in flight no longer counts.
+// attempt meets whatever the tether has become by then. A tether that outlived
+// its call is removed by the same rule.
 func (p *Pool) release(h *tetherHold) bool {
 	t := &p.tethers
 	t.mu.Lock()
@@ -185,9 +218,6 @@ func (p *Pool) release(h *tetherHold) bool {
 	remaining := false
 	for _, x := range h.held {
 		x.holders--
-		if x.gone {
-			continue
-		}
 		if x.holders <= 0 && !x.fixed && !x.conflicted {
 			t.removeLocked(x)
 			continue
@@ -217,9 +247,6 @@ func (p *Pool) fix(h *tetherHold, sent string) {
 	newlyFixed, newlyConflicted := false, false
 	for _, x := range h.held {
 		x.holders--
-		if x.gone {
-			continue
-		}
 		x.fixed = true
 		if mismatch {
 			if !x.conflicted {
@@ -259,21 +286,48 @@ func (p *Pool) settle(h *tetherHold, oc outcome) {
 }
 
 // visibleLocked returns the tethers for key that a request under scope can
-// see, in the order they were made. t.mu must be held. The slice is new, so a
-// hold may keep it.
-func (t *tetherTable) visibleLocked(key tetherKey, scope *Scope) []*tether {
+// see, in the order they were made. A late request, one whose scope was
+// already released, also sees every tether that outlived the call that made
+// it. t.mu must be held. The slice is new, so a hold may keep it.
+func (t *tetherTable) visibleLocked(key tetherKey, scope *Scope, late bool) []*tether {
 	var out []*tether
 	for _, x := range t.byKey[key] {
-		if scope.sees(x.scope) {
+		if scope.sees(x.scope) || late && x.outlived {
 			out = append(out, x)
 		}
 	}
 	return out
 }
 
+// markSplitLocked marks the tethers a refused request saw on two addresses,
+// and reports whether any of them was not marked yet, so the refusal is logged
+// once per key for as long as those tethers last. t.mu must be held.
+func markSplitLocked(visible []*tether) bool {
+	first := false
+	for _, x := range visible {
+		if !x.splitLogged {
+			x.splitLogged, first = true, true
+		}
+	}
+	return first
+}
+
+// registerLocked puts the table in scopelessTables once. t.mu must be held.
+func (t *tetherTable) registerLocked() {
+	if t.registered {
+		return
+	}
+	t.registered = true
+	scopelessTables.mu.Lock()
+	defer scopelessTables.mu.Unlock()
+	if scopelessTables.set == nil {
+		scopelessTables.set = make(map[*tetherTable]struct{})
+	}
+	scopelessTables.set[t] = struct{}{}
+}
+
 // removeLocked takes x out of the table. t.mu must be held.
 func (t *tetherTable) removeLocked(x *tether) {
-	x.gone = true
 	list := t.byKey[x.key]
 	kept := make([]*tether, 0, len(list))
 	for _, y := range list {
@@ -288,17 +342,45 @@ func (t *tetherTable) removeLocked(x *tether) {
 	t.byKey[x.key] = kept
 }
 
-// dropScope removes every tether made under s, reserved, fixed, or
-// conflicted, when the call that owns s returns.
+// dropScope ends the call that owns s for the tethers made under s, as
+// endCallLocked does, and stops watching s.
 func (t *tetherTable) dropScope(s *Scope) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.endCallLocked(func(x *tether) bool { return x.scope == s })
+	delete(t.watched, s)
+}
+
+// dropScopeless ends the call for the tethers made without a scope, as
+// endCallLocked does, and takes the table out of scopelessTables, because no
+// tether it holds is left for a later release to drop.
+func (t *tetherTable) dropScopeless() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.endCallLocked(func(x *tether) bool { return x.scope == nil })
+	if !t.registered {
+		return
+	}
+	t.registered = false
+	scopelessTables.mu.Lock()
+	defer scopelessTables.mu.Unlock()
+	delete(scopelessTables.set, t)
+}
+
+// endCallLocked handles the tethers that made selects, which have not yet
+// outlived a call, when their call returns. A tether that no request holds is
+// removed, reserved, fixed, or conflicted. A tether that a request still holds
+// outlives the call, so its request still settles it and a replay of that
+// request still meets it. t.mu must be held.
+func (t *tetherTable) endCallLocked(made func(*tether) bool) {
 	for key, list := range t.byKey {
 		kept := make([]*tether, 0, len(list))
 		for _, x := range list {
-			if x.scope == s {
-				x.gone = true
-				continue
+			if made(x) && !x.outlived {
+				if x.holders <= 0 {
+					continue
+				}
+				x.outlived = true
 			}
 			kept = append(kept, x)
 		}
@@ -308,7 +390,22 @@ func (t *tetherTable) dropScope(s *Scope) {
 		}
 		t.byKey[key] = kept
 	}
-	delete(t.watched, s)
+}
+
+// dropScopelessTethers runs dropScopeless on every table in scopelessTables.
+// The release of a call's scope calls it, because a tether made without a
+// scope ends with the call that made it. It takes each table's lock only after
+// it lets go of scopelessTables.mu.
+func dropScopelessTethers() {
+	scopelessTables.mu.Lock()
+	tables := make([]*tetherTable, 0, len(scopelessTables.set))
+	for t := range scopelessTables.set {
+		tables = append(tables, t)
+	}
+	scopelessTables.mu.Unlock()
+	for _, t := range tables {
+		t.dropScopeless()
+	}
 }
 
 // logTethered logs, at Debug and once per tether, that a mutation may have
@@ -334,6 +431,19 @@ func (p *Pool) logConflict(h *tetherHold, tethered, sent string) {
 	p.logger.Error("pve endpoints: "+h.method+" "+h.route+" may have reached both "+tethered+" and "+
 		sentName(sent)+"; "+refusing,
 		append(tetherFields(h, tethered), log.String("sent", sentName(sent)))...)
+}
+
+// logSplit logs, at Error and once per key for as long as the tethers it saw
+// last, that a request was refused because the tethers it sees name two
+// addresses, each of which a mutation from another call may have reached.
+func (p *Pool) logSplit(h *tetherHold, first, second string) {
+	refusing := "refusing further mutations with this key that see both"
+	if h.key.family != "" {
+		refusing = "refusing further " + string(h.key.family) + " mutations that see both"
+	}
+	p.logger.Error("pve endpoints: "+h.method+" "+h.route+" is tethered to both "+first+" and "+second+
+		" by different calls; "+refusing,
+		append(tetherFields(h, first), log.String("other", second))...)
 }
 
 // sentName names the address a maybe-sent request went to, which is empty

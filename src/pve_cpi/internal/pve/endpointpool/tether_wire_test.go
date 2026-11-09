@@ -715,3 +715,121 @@ func TestTetherFamiliesKeepRePlannedWritesOnOneEndpoint(t *testing.T) {
 		})
 	}
 }
+
+// A scope released while its first mutation is still in flight on A keeps the
+// tether that request holds, so a late replay on the same context, after a
+// read moved the active endpoint to B, still goes to A, and B never sees the
+// key.
+func TestTetherScopeReleaseInFlightLateReplayStaysOnA(t *testing.T) {
+	l := newLab(t)
+	arrived := make(chan struct{})
+	gate := make(chan struct{})
+	var open sync.Once
+	defer open.Do(func() { close(gate) })
+	var posts atomic.Int32
+	routes := pvetest.NewRoutes()
+	routes.HandleFunc(http.MethodPost, fanOutRoute, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if posts.Add(1) == 1 {
+			close(arrived)
+			<-gate
+			w.WriteHeader(statusBrokenBackend)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	routes.Fail(http.MethodGet, "/cluster/resources", http.StatusServiceUnavailable, "busy")
+	a := l.live(t, routes)
+	b := l.live(t, nil)
+	p := l.pool(t, 0, configured(a.Addr), configured(b.Addr))
+	ctx, release := WithAffinityScope(context.Background())
+	type result struct {
+		status int
+		err    error
+	}
+	first := make(chan result, 1)
+	go func() {
+		status, err := postOnce(ctx, p, a.Addr, "vmid=101")
+		first <- result{status, err}
+	}()
+	select {
+	case <-arrived:
+	case <-time.After(waitFor):
+		t.Fatal("the first POST never reached A")
+	}
+	release()
+	moveActive(t, ctx, p, a.Addr, b.Addr)
+	status, err := postOnce(ctx, p, a.Addr, "vmid=101")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("late replay: status %d, err %v, want A's 200", status, err)
+	}
+	open.Do(func() { close(gate) })
+	if r := <-first; r.err != nil || r.status != statusBrokenBackend {
+		t.Fatalf("first POST: status %d, err %v, want A's 596", r.status, r.err)
+	}
+	if got, other := a.Counts.Method(http.MethodPost), b.Counts.Method(http.MethodPost); got != 2 || other != 0 {
+		t.Fatalf("POSTs A=%d B=%d, want A=2 B=0", got, other)
+	}
+}
+
+// Fifty POSTs, each on a context whose scope was released before it was sent,
+// leave no scope watched and share one tether for their key.
+func TestTetherLateRequestsLeaveNothingWatched(t *testing.T) {
+	l := newLab(t)
+	a, b := l.live(t, nil), l.live(t, nil)
+	p := l.pool(t, 0, configured(a.Addr), configured(b.Addr))
+	for i := range 50 {
+		ctx, release := WithAffinityScope(context.Background())
+		release()
+		if status, err := postOnce(ctx, p, a.Addr, "vmid=1"); err != nil || status != http.StatusOK {
+			t.Fatalf("late POST %d: status %d, err %v", i, status, err)
+		}
+	}
+	key := tetherKeyOf(apiRequest(t, context.Background(), http.MethodPost, a.Addr, fanOutRoute, ""))
+	p.tethers.mu.Lock()
+	watched, tethers := len(p.tethers.watched), len(p.tethers.byKey[key])
+	p.tethers.mu.Unlock()
+	if watched != 0 || tethers != 1 {
+		t.Fatalf("watched=%d tethers for the key=%d, want 0 and 1", watched, tethers)
+	}
+	if got := a.Counts.Method(http.MethodPost); got != 50 {
+		t.Fatalf("A read %d POSTs, want 50", got)
+	}
+}
+
+// A tether that a rollback path made without a scope in one call ends with that
+// call, so the next call in the same process walks past a dead A to B, and a
+// call that sends many distinct scopeless mutations leaves none behind.
+func TestTetherScopelessTetherDoesNotSteerTheNextCall(t *testing.T) {
+	l := newLab(t)
+	a, b := l.live(t, nil), l.live(t, nil)
+	p := l.pool(t, 0, configured(a.Addr), configured(b.Addr))
+
+	_, release1 := WithAffinityScope(context.Background())
+	if status, err := postOnce(context.Background(), p, a.Addr, "vmid=101"); err != nil || status != http.StatusOK {
+		t.Fatalf("call 1's scopeless POST: status %d, err %v", status, err)
+	}
+	release1()
+	l.d.set(a.Addr, pvetest.NewRefused(t).DialContext)
+	p.CloseIdleConnections()
+
+	ctx2, release2 := WithAffinityScope(context.Background())
+	if status, err := postOnce(ctx2, p, a.Addr, "vmid=101"); err != nil || status != http.StatusOK {
+		t.Fatalf("call 2's POST with A dead: status %d, err %v, want B's 200", status, err)
+	}
+	if got := b.Counts.Method(http.MethodPost); got != 1 {
+		t.Fatalf("B read %d POSTs, want 1", got)
+	}
+	for i := range 500 {
+		resp, err := send(t, context.Background(), p, http.MethodPost, b.Addr,
+			fmt.Sprintf("/nodes/pve1/qemu/%d/config", i), "x=1")
+		mustStatus(t, resp, err, http.StatusOK)
+	}
+	release2()
+	p.tethers.mu.Lock()
+	keys := len(p.tethers.byKey)
+	p.tethers.mu.Unlock()
+	if keys != 0 {
+		t.Fatalf("%d keys left after call 2 returned, want 0", keys)
+	}
+}
