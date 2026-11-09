@@ -382,7 +382,10 @@ func (c *deadNodeCompletion) destinations(
 		}
 		c.storages = index
 	}
-	reach, err := ha.DeletionDestinations(ctx, c.source, reportMembers(report), set, c.sid, naRuleNameFor(c.vmid),
+	// The reach reads the in-memory storage index, so it runs detached from the
+	// call's cancellation as it always has, while keeping the call's affinity
+	// scope.
+	reach, err := ha.DeletionDestinations(context.WithoutCancel(ctx), c.source, reportMembers(report), set, c.sid, naRuleNameFor(c.vmid),
 		c.ownedRule, report.Placeable, c.storages)
 	if err != nil {
 		return reach, c.deferWrap(err, "compute the deletion destinations")
