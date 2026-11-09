@@ -134,30 +134,32 @@ func (m *connectMeter) result() (time.Duration, bool) {
 // failures collects the hops of a walk that got no answer.
 type failures struct {
 	attempts []EndpointFailure
-	// other is set when a hop failed with something other than a
-	// connect-phase failure or a header-deadline expiry.
-	other bool
-	last  error
+	// other is the last hop that failed with something other than a
+	// connect-phase failure or a header-deadline expiry, such as a reset of a
+	// read, or nil when every hop was unreachable.
+	other error
 }
 
 // add records one failed hop. unreachable says whether it failed in the
 // connect phase or on the header deadline.
 func (f *failures) add(endpoint string, err error, unreachable bool) {
 	f.attempts = append(f.attempts, EndpointFailure{Endpoint: endpoint, Err: err})
-	if !unreachable {
-		f.other = true
+	if !unreachable && err != nil {
+		f.other = err
 	}
-	f.last = err
 }
 
 // err returns the error a walk that ended without an answer gives back. When
 // every hop failed in the connect phase or on the header deadline it is an
 // *EntryUnreachableError listing each endpoint with its cause, which unwraps
 // to one dial-shaped *net.OpError, or to the certificate errors when every hop
-// failed verification. Otherwise it is the last hop's error, unchanged.
+// failed verification or its pin. Otherwise it is the last hop's error that
+// was not unreachable, unchanged. That error is what makes the walk
+// retryable, so a connect-phase failure on a later hop, such as a certificate
+// error the SDK never retries, never takes its place.
 func (f *failures) err() error {
-	if f.other && f.last != nil {
-		return f.last
+	if f.other != nil {
+		return f.other
 	}
 	return NewEntryUnreachableError(f.attempts)
 }

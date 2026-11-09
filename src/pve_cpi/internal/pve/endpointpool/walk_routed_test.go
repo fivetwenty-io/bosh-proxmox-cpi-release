@@ -198,3 +198,55 @@ func TestURLAddress(t *testing.T) {
 		}
 	}
 }
+
+// A routed request that reaches a discovered endpoint over plain http is
+// refused by the endpoint's transport, which checks the certificate itself.
+// Only a defect routes a request that way, so the refusal is logged at Error
+// once per address, and it never demotes the endpoint.
+func TestRoutedPlaintextRefusalLogsAtError(t *testing.T) {
+	l := newLab(t)
+	a := l.live(t, nil)
+	d := l.live(t, nil)
+	p := l.pool(t, 0, configured(a.Addr), discovered(d.Addr, PinOf(l.leaf.DER)))
+	for range 2 {
+		req := apiRequest(t, context.Background(), http.MethodGet, d.Addr, "/version", "")
+		req.URL.Scheme = "http"
+		_, oc, err := p.dispatch(req, defaultBounds())
+		if !errors.Is(err, errPlaintextRefused) || IsMaybeSent(err) || oc.sent != sentNever {
+			t.Fatalf("err = %v, sent = %d, want an unmarked plaintext refusal", err, oc.sent)
+		}
+	}
+	if n := d.Counts.Conns.Load(); n != 0 {
+		t.Fatalf("the discovered endpoint got %d connections", n)
+	}
+	mustDemoted(t, p, d.Addr, false)
+	lines := l.entries(slog.LevelError, "pve endpoint ")
+	if len(lines) != 1 {
+		t.Fatalf("Error lines = %d, want 1", len(lines))
+	}
+	const tail = "this is a defect in the endpoint pool; no other endpoint is tried for this request"
+	if !strings.HasSuffix(lines[0].Message, tail) {
+		t.Fatalf("defect line = %q", lines[0].Message)
+	}
+	mustAttrs(t, lines[0], map[string]string{"endpoint": d.Addr})
+}
+
+// A routed POST with an Idempotency-Key whose send-by deadline passes during
+// the dial may have left on an earlier attempt Go replayed, so its refusal is
+// marked maybe sent.
+func TestRoutedSendByOnAReplayablePostIsMaybeSent(t *testing.T) {
+	l := newLab(t)
+	a := l.live(t, nil)
+	r := l.dropped(t)
+	p := l.pool(t, 0, configured(a.Addr), configured(l.live(t, nil).Addr))
+	ctx := WithSendBy(context.Background(), time.Now().Add(150*time.Millisecond), http.MethodPost, "/nodes/pve3/qemu")
+	req := apiRequest(t, ctx, http.MethodPost, r.Addr, "/nodes/pve3/qemu", "vmid=101")
+	req.Header.Set("Idempotency-Key", "k1")
+	_, oc, err := p.dispatch(req, defaultBounds())
+	if !errors.Is(err, ErrSendByPassed) || !IsMaybeSent(err) {
+		t.Fatalf("err = %v, want ErrSendByPassed marked maybe sent", err)
+	}
+	if !oc.sendBy || oc.sent != sentMaybe {
+		t.Fatalf("outcome = %+v, want a maybe-sent send-by refusal", oc)
+	}
+}

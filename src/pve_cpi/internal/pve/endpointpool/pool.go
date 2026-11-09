@@ -350,33 +350,37 @@ func (p *Pool) demotedNow(ep *endpoint) bool {
 // is cleared, and the generation goes up if the active endpoint changed. A
 // stale success changes nothing, so a slow request that started on an
 // endpoint before a failover cannot make that endpoint active again. It
-// reports whether the success was applied.
-func (p *Pool) promote(ep *endpoint, gen uint64) bool {
+// reports whether the success was applied and, when it moved the active
+// endpoint, the endpoint that was active before, which is nil otherwise.
+func (p *Pool) promote(ep *endpoint, gen uint64) (*endpoint, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if gen != p.generation {
-		return false
+		return nil, false
 	}
 	ep.demoted = false
-	if p.active != ep {
-		p.active = ep
-		p.generation++
+	if p.active == ep {
+		return nil, true
 	}
-	return true
+	prev := p.active
+	p.active = ep
+	p.generation++
+	return prev, true
 }
 
 // advance demotes from and, when from is still the active endpoint under
 // generation gen, makes the next endpoint in walk order active and raises the
 // generation. A streamed upload uses it after a connect-phase failure, because
 // it cannot hop inside one request and its next attempt must start on another
-// endpoint. It reports whether the active endpoint changed. A pool of one
-// endpoint, or a stale generation, leaves the active endpoint where it is.
-func (p *Pool) advance(from *endpoint, gen uint64) bool {
+// endpoint. It returns the endpoint it made active, or nil when the active
+// endpoint did not change. A pool of one endpoint, or a stale generation,
+// leaves the active endpoint where it is.
+func (p *Pool) advance(from *endpoint, gen uint64) *endpoint {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	from.demoted = true
 	if p.active != from || gen != p.generation {
-		return false
+		return nil
 	}
 	var next *endpoint
 	for _, demoted := range []bool{false, true} {
@@ -391,11 +395,11 @@ func (p *Pool) advance(from *endpoint, gen uint64) bool {
 		}
 	}
 	if next == nil {
-		return false
+		return nil
 	}
 	p.active = next
 	p.generation++
-	return true
+	return next
 }
 
 // routedTransports returns the owned clones for a request whose URL host a

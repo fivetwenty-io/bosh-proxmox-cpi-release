@@ -3,6 +3,7 @@ package endpointpool
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -50,33 +51,55 @@ func (p *Pool) RoundTrip(req *http.Request) (*http.Response, error) {
 	return p.roundTrip(req, defaultBounds())
 }
 
-// roundTrip is RoundTrip under the given bounds.
+// roundTrip is RoundTrip under the given bounds. It logs a send-by refusal
+// once, whichever path refused the request.
 func (p *Pool) roundTrip(req *http.Request, b bounds) (*http.Response, error) {
+	resp, oc, err := p.dispatch(req, b)
+	if oc.sendBy {
+		p.logSendBy(methodOf(req), req.URL.Path)
+	}
+	return resp, err
+}
+
+// unsent is the outcome of a request the pool refuses before it hands the
+// request to any transport, which therefore never left the machine.
+var unsent = outcome{action: actReturn, sent: sentNever, class: classRequest}
+
+// dispatch sends req and returns what the caller gets, with the outcome of the
+// hop that ended the request. Every kind of request ends here with an outcome,
+// so a mutation's tether is released or fixed in one place from its sent
+// state.
+func (p *Pool) dispatch(req *http.Request, b bounds) (*http.Response, outcome, error) {
 	if req == nil {
-		return nil, errNilRequest
+		return nil, unsent, errNilRequest
 	}
 	if p == nil {
 		closeRequestBody(req)
-		return nil, errNilPool
+		return nil, unsent, errNilPool
 	}
 	if req.URL == nil {
 		closeRequestBody(req)
-		return nil, errNoURL
+		return nil, unsent, errNoURL
 	}
 	method := methodOf(req)
+	addr, addrErr := urlAddress(req.URL)
 	if err := CheckSendBy(req.Context(), time.Now(), method, req.URL.Path); err != nil {
 		closeRequestBody(req)
-		p.logSendBy(method, req.URL.Path)
-		return nil, &ConnectPhaseError{Phase: PhaseDial, Endpoint: req.URL.Host, Err: err}
+		endpoint := addr
+		if addrErr != nil {
+			endpoint = req.URL.Host
+		}
+		oc := unsent
+		oc.sendBy, oc.class = true, classSendBy
+		return nil, oc, &ConnectPhaseError{Phase: PhaseDial, Endpoint: endpoint, Err: err}
 	}
-	addr, err := urlAddress(req.URL)
-	if err != nil {
+	if addrErr != nil {
 		closeRequestBody(req)
-		return nil, err
+		return nil, unsent, addrErr
 	}
 	// A tethered mutation goes only to its tethered endpoint, so a tether
 	// check belongs here, ahead of the routed and configured-only kinds it
-	// overrides.
+	// overrides, and the outcome each kind returns releases or fixes it.
 	configuredOnly := IsConfiguredOnly(req.Context()) || isLogin(req)
 	if addr != p.endpoints[0].addr {
 		return p.sendRouted(req, addr, configuredOnly)
@@ -93,47 +116,72 @@ func (p *Pool) roundTrip(req *http.Request, b bounds) (*http.Response, error) {
 // configured endpoint, so a credential never reaches an address the operator
 // did not list. A failure that blamesEndpoint counts against one of the pool's
 // endpoints demotes it, and nothing a routed request gets ever makes an
-// endpoint active. The error is marked with MaybeSentError unless it is a
-// connect-phase failure of an idempotent request, or of a mutation that
-// provesNeverSent clears.
-func (p *Pool) sendRouted(req *http.Request, addr string, configuredOnly bool) (*http.Response, error) {
+// endpoint active. The error is marked with MaybeSentError unless its outcome
+// is sentNever, which takes a connect-phase failure of an idempotent request
+// or the login, or of a mutation that provesNeverSent clears.
+func (p *Pool) sendRouted(req *http.Request, addr string, configuredOnly bool) (*http.Response, outcome, error) {
 	ep := p.byAddr[addr]
 	if configuredOnly && (ep == nil || ep.kind != KindConfigured) {
 		closeRequestBody(req)
-		return nil, fmt.Errorf("endpoint pool: refusing a configured-only request to %s, which is not a configured endpoint",
-			addr)
+		return nil, unsent, fmt.Errorf(
+			"endpoint pool: refusing a configured-only request to %s, which is not a configured endpoint", addr)
 	}
 	o, err := p.routedTransports(req.URL)
 	if err != nil {
 		closeRequestBody(req)
-		return nil, err
+		return nil, unsent, err
 	}
-	method := methodOf(req)
-	clone := req.Clone(connectContext(req.Context(), method, req.URL.Path))
+	clone := req.Clone(connectContext(req.Context(), methodOf(req), req.URL.Path))
 	resp, err := o.pick(false).RoundTrip(clone)
-	if err == nil {
-		if resp == nil {
-			return nil, &MaybeSentError{Err: errNoResponse}
-		}
-		resp.Request = req
-		return resp, nil
+	if err == nil && resp == nil {
+		err = errNoResponse
 	}
-	if errors.Is(err, ErrSendByPassed) {
-		p.logSendBy(method, req.URL.Path)
-		return nil, err
+	oc := routedOutcome(classOf(req), clone, err)
+	if err == nil {
+		resp.Request = req
+		return resp, oc, nil
 	}
 	if ep != nil && blamesEndpoint(err) {
-		cpe, _ := AsConnectPhase(err)
 		p.demote(ep)
-		p.walk.note(ep, noteOf(nil, err, string(cpe.Phase)))
-		if cpe.Phase == PhaseTLSVerify && ep.kind == KindConfigured {
+		p.walk.note(ep, noteOf(nil, err, oc.class))
+		if oc.class == string(PhaseTLSVerify) && ep.kind == KindConfigured {
 			p.alertVerify(ep, err, false)
 		}
 	}
-	if !IsConnectPhase(err) || (classOf(req) == classMutation && !provesNeverSent(clone, err)) {
-		return nil, &MaybeSentError{Err: err}
+	if oc.defectAlert {
+		p.alertDefect(addr, err, oc.class, false)
 	}
-	return nil, err
+	if oc.sent != sentNever {
+		return nil, oc, &MaybeSentError{Err: err}
+	}
+	return nil, oc, err
+}
+
+// routedOutcome is the outcome of a routed request of the given class, which
+// sent clone and got err. A routed request never hops and never promotes, so
+// the outcome only says what was sent, whether a send-by deadline refused it,
+// and whether the pool refused it for a defect. It is sentNever only on a
+// connect-phase failure, which for a mutation also needs provesNeverSent. A
+// refused send-by carries the tag and follows the same rule, so a mutation Go
+// may have replayed is maybe sent.
+func routedOutcome(class reqClass, clone *http.Request, err error) outcome {
+	if err == nil {
+		return outcome{action: actReturn, sent: sentAnswered}
+	}
+	oc := outcome{action: actReturn, sent: sentMaybe, class: classTransport}
+	cpe, tagged := AsConnectPhase(err)
+	if !tagged {
+		return oc
+	}
+	oc.class = string(cpe.Phase)
+	if class != classMutation || provesNeverSent(clone, err) {
+		oc.sent = sentNever
+	}
+	oc.defectAlert = isPoolRefusal(err)
+	if errors.Is(err, ErrSendByPassed) {
+		oc.sendBy, oc.class = true, classSendBy
+	}
+	return oc
 }
 
 // errNoResponse stands in for the error when a transport returns neither a
@@ -159,8 +207,9 @@ type walker struct {
 	// one generation.
 	gen  uint64
 	from *endpoint
-	// statusHopped says the request has spent its one status hop, and held
-	// is the response that hop moved away from.
+	// statusHopped says the request has spent its one status hop, in this
+	// walk or in an earlier round trip of the same request, and held is the
+	// response this walk's status hop moved away from.
 	statusHopped bool
 	held         *heldResponse
 	fails        failures
@@ -187,15 +236,23 @@ const (
 	stopCaller
 	// stopSendBy means the request's send-by deadline passed.
 	stopSendBy
-	// stopBody means the request body cannot be rebuilt for another hop.
+	// stopBody means the request body cannot be rebuilt for another hop,
+	// because it has no GetBody.
 	stopBody
+	// stopRebuild means GetBody failed to rebuild the body for the next hop.
+	stopRebuild
 )
 
 // newWalker reads the active endpoint, the walk order, and the generation for
 // a walk. The active endpoint and the order are read under separate locks, so
 // it reads them again when a failover elsewhere moved the generation between
 // the two reads. After snapshotTries it walks without knowing which endpoint
-// was active, which only costs the failover line of a change it causes.
+// was active, which a configured-only walk reads as a discovered one when it
+// decides whether its answer may move the active endpoint.
+//
+// It also reads whether an earlier round trip of the same request already
+// spent the request's status hop, so the SDK's retries of one request share
+// one status hop.
 func (p *Pool) newWalker(req *http.Request, configuredOnly bool, b bounds) *walker {
 	w := &walker{
 		p:              p,
@@ -216,38 +273,55 @@ func (p *Pool) newWalker(req *http.Request, configuredOnly bool, b bounds) *walk
 	}
 	w.limit = b.hopLimit(len(w.order))
 	w.budget = b.begin()
+	w.statusHopped = p.walk.statusHopSpent(req.URL, b.now())
 	return w
 }
 
-// run makes the walk's hops and returns what the caller gets.
-func (w *walker) run() (*http.Response, error) {
+// run makes the walk's hops and returns what the caller gets, with the outcome
+// of the hop that ended the request.
+func (w *walker) run() (*http.Response, outcome, error) {
+	defer w.rememberStatusHop()
 	if w.limit <= 0 {
 		closeRequestBody(w.req)
-		return nil, NewEntryUnreachableError(nil)
+		return nil, unsent, NewEntryUnreachableError(nil)
 	}
+	var body io.ReadCloser
 	for i := 0; ; i++ {
-		h := w.try(i, w.order[i])
+		h := w.try(i, w.order[i], body)
 		if h.oc.action != actHop {
 			return w.finish(h)
 		}
 		if stop := w.stopBefore(i + 1); stop != stopNone {
-			return w.halt(h, stop, i+1)
+			return w.halt(h, stop, i+1, nil)
+		}
+		var err error
+		if body, err = w.nextBody(); err != nil {
+			return w.halt(h, stopRebuild, i+1, err)
 		}
 		w.proceed(h)
 	}
 }
 
-// try makes hop i, to ep.
-func (w *walker) try(i int, ep *endpoint) hopResult {
+// rememberStatusHop records, when the request has spent its status hop, that
+// it has, so the next round trip of the same request does not hop on a status
+// again. A request that spent it in an earlier round trip refreshes the
+// record, which keeps it for as long as the request's retries go on.
+func (w *walker) rememberStatusHop() {
+	if w.statusHopped {
+		w.p.walk.spendStatusHop(w.req.URL, w.bounds.now())
+	}
+}
+
+// try makes hop i, to ep. body is the request body rebuilt for a hop after
+// the first, and nil for the first hop or a request without a body.
+func (w *walker) try(i int, ep *endpoint, body io.ReadCloser) hopResult {
 	ctx := w.req.Context()
 	meter := newConnectMeter(w.bounds.now)
 	clone := w.req.Clone(connectContext(httptrace.WithClientTrace(ctx, meter.trace()), w.method, w.req.URL.Path))
 	clone.URL.Host = ep.urlHost
 	clone.Host = ""
-	if i > 0 {
-		if err := w.rebuildBody(clone); err != nil {
-			return hopResult{ep: ep, err: err, oc: outcome{action: actReturn, sent: sentNever, class: classRequest}}
-		}
+	if body != nil {
+		clone.Body = body
 	}
 	attr := attributable(w.req.URL.Path, ep)
 	withDeadline := w.wantsDeadline(i, attr)
@@ -282,21 +356,28 @@ func (w *walker) wantsDeadline(i int, attributable bool) bool {
 	return w.class == classIdempotent && attributable && !finalHop(i, w.limit)
 }
 
-// rebuildBody gives the clone of a hop after the first a fresh body, because
-// the transport closed the one before. A request without a body needs none.
-func (w *walker) rebuildBody(clone *http.Request) error {
+// errNoGetBodyResult stands in for the error when GetBody returns neither a
+// body nor an error.
+var errNoGetBodyResult = errors.New("GetBody returned neither a body nor an error")
+
+// nextBody rebuilds the request body for the next hop, because the transport
+// closed the one before. A request without a body needs none and gets nil.
+// stopBefore has already refused a body without GetBody.
+func (w *walker) nextBody() (io.ReadCloser, error) {
 	if !hasBody(w.req) {
-		return nil
+		return nil, nil
 	}
 	if w.req.GetBody == nil {
-		return errors.New("endpoint pool: request body cannot be rebuilt for another endpoint")
+		return nil, errors.New("endpoint pool: request body cannot be rebuilt for another endpoint")
 	}
 	body, err := w.req.GetBody()
-	if err != nil {
-		return fmt.Errorf("endpoint pool: rebuilding the request body for another endpoint: %w", err)
+	if err == nil && body == nil {
+		err = errNoGetBodyResult
 	}
-	clone.Body = body
-	return nil
+	if err != nil {
+		return nil, fmt.Errorf("endpoint pool: rebuilding the request body for another endpoint: %w", err)
+	}
+	return body, nil
 }
 
 // stopBefore reports why hop next may not start, or stopNone when it may.
@@ -318,25 +399,20 @@ func (w *walker) stopBefore(next int) stopReason {
 }
 
 // finish ends the walk on a hop whose outcome is to answer or to return.
-func (w *walker) finish(h hopResult) (*http.Response, error) {
+func (w *walker) finish(h hopResult) (*http.Response, outcome, error) {
 	w.record(h)
-	if h.oc.verifyAlert {
-		w.p.alertVerify(h.ep, h.err, false)
-	}
+	w.alert(h, false)
 	if h.err != nil {
-		if h.oc.sendBy {
-			w.p.logSendBy(w.method, w.req.URL.Path)
-		}
 		if h.oc.sent == sentMaybe && IsConnectPhase(h.err) {
-			return nil, &MaybeSentError{Err: h.err}
+			return nil, h.oc, &MaybeSentError{Err: h.err}
 		}
-		return nil, h.err
+		return nil, h.oc, h.err
 	}
 	if h.oc.action == actAnswer {
 		w.promote(h.ep)
 	}
 	h.resp.Request = w.req
-	return h.resp, nil
+	return h.resp, h.oc, nil
 }
 
 // proceed applies the effects of a hop the walk moves on from.
@@ -348,9 +424,7 @@ func (w *walker) proceed(h hopResult) {
 		return
 	}
 	w.record(h)
-	if h.oc.verifyAlert {
-		w.p.alertVerify(h.ep, h.err, true)
-	}
+	w.alert(h, true)
 	w.fails.add(h.ep.addr, h.err, h.oc.unreachable)
 }
 
@@ -358,36 +432,59 @@ func (w *walker) proceed(h hopResult) {
 // may not start. A status hop that cannot proceed returns its response with no
 // effect. Any other hop keeps its effects, and the walk returns the caller's
 // context error, the send-by refusal, the response a status hop moved away
-// from, or the walk's failures, in that order.
+// from, or the walk's failures, in that order. When GetBody failed, its error
+// is joined to the walk's failures, so the caller still sees why every
+// earlier hop failed.
+//
+// The hop that would have come next sent nothing, so the outcome the walk
+// returns keeps h's sent state, which for a mutation is the connect-phase
+// proof that let it hop.
 //
 // A streamed upload cannot hop inside one request, so when its body cannot be
 // rebuilt and the endpoint failed in the connect phase, the pool advances the
 // active endpoint, and the upload's next attempt starts on another one.
-func (w *walker) halt(h hopResult, stop stopReason, next int) (*http.Response, error) {
+func (w *walker) halt(h hopResult, stop stopReason, next int, rebuildErr error) (*http.Response, outcome, error) {
+	oc := outcome{action: actReturn, sent: h.oc.sent, class: h.oc.class}
 	if h.oc.statusHop {
 		h.resp.Request = w.req
-		return h.resp, nil
+		return h.resp, oc, nil
 	}
 	w.record(h)
-	if h.oc.verifyAlert {
-		w.p.alertVerify(h.ep, h.err, false)
-	}
+	w.alert(h, false)
 	w.fails.add(h.ep.addr, h.err, h.oc.unreachable)
-	if hasBody(w.req) && w.req.GetBody == nil && blamesEndpoint(h.err) && w.p.advance(h.ep, w.gen) {
-		to, _ := w.p.current()
-		w.p.logFailover(h.ep, to, false)
+	if hasBody(w.req) && w.req.GetBody == nil && blamesEndpoint(h.err) {
+		if to := w.p.advance(h.ep, w.gen); to != nil {
+			w.p.logFailover(h.ep, to, false)
+		}
 	}
 	switch stop {
 	case stopCaller:
-		return nil, w.req.Context().Err()
+		oc.class = classCancelled
+		return nil, oc, w.req.Context().Err()
 	case stopSendBy:
-		w.p.logSendBy(w.method, w.req.URL.Path)
-		return nil, &ConnectPhaseError{Phase: PhaseDial, Endpoint: w.order[next].addr, Err: ErrSendByPassed}
+		oc.sendBy, oc.class = true, classSendBy
+		return nil, oc, &ConnectPhaseError{Phase: PhaseDial, Endpoint: w.order[next].addr, Err: ErrSendByPassed}
 	}
 	if w.held != nil {
-		return w.held.response(w.req), nil
+		oc.sent = sentAnswered
+		return w.held.response(w.req), oc, nil
 	}
-	return nil, w.fails.err()
+	if stop == stopRebuild {
+		oc.class = classRequest
+		return nil, oc, errors.Join(rebuildErr, w.fails.err())
+	}
+	return nil, oc, w.fails.err()
+}
+
+// alert logs the Error lines a hop's outcome calls for. hopping says whether
+// the request moves on to another endpoint.
+func (w *walker) alert(h hopResult, hopping bool) {
+	if h.oc.verifyAlert {
+		w.p.alertVerify(h.ep, h.err, hopping)
+	}
+	if h.oc.defectAlert {
+		w.p.alertDefect(h.ep.addr, h.err, h.oc.class, hopping)
+	}
 }
 
 // record applies a hop's demotion and keeps its failure for the failover
@@ -409,16 +506,43 @@ func (w *walker) promote(ep *endpoint) {
 	if w.configuredOnly && (w.from == nil || w.from.kind != KindConfigured) {
 		return
 	}
-	w.p.promoteAfter(ep, w.from, w.gen)
+	w.p.promoteAfter(ep, w.gen)
 }
 
-// walkState is what the walks of one pool remember for its log lines: the last
-// failure of each endpoint, for the failover line, and which configured
-// endpoints have logged a verification failure. The zero value is ready to use.
+// The limits on what a pool remembers of the status hops its requests spent.
+// A record lasts statusHopTTL from the last round trip that used it, which
+// covers the SDK's backoff between retries many times over, and the pool keeps
+// at most statusHopCap of them. A record that expires or is evicted early only
+// lets a later round trip of its request hop on a status once more, which is
+// a status hop of a read or the login and never moves a mutation.
+const (
+	statusHopTTL = 10 * time.Minute
+	statusHopCap = 1024
+)
+
+// walkState is what the walks of one pool remember across requests: the last
+// failure of each endpoint, for the failover line, which configured endpoints
+// have logged a verification failure, which addresses have logged a refusal
+// the pool made for a defect, and which requests have spent their status hop.
+// The zero value is ready to use.
+//
+// A status hop is remembered by the request's *url.URL. The SDK sends every
+// retry of one request, including its re-authentication retry, as the same
+// *http.Request, and the http.Client's per-attempt fork is a shallow copy that
+// keeps the URL pointer, while its client timeout gives each attempt a context
+// of its own that ends with the attempt. So the URL pointer is what stays the
+// same across the round trips of one request, and the context is not. A layer
+// that deep-copies the request before the pool, such as one calling req.Clone,
+// gives each round trip a status hop of its own again, which is the cost of
+// one extra status hop per round trip and nothing more.
 type walkState struct {
 	mu      sync.Mutex
 	notes   map[*endpoint]failureNote
 	alerted map[*endpoint]bool
+	defects map[string]bool
+	// statusHops maps a request's URL to the last time a round trip of it
+	// used its spent status hop.
+	statusHops map[*url.URL]time.Time
 }
 
 // note keeps n as ep's last failure.
@@ -452,6 +576,75 @@ func (s *walkState) firstAlert(ep *endpoint) bool {
 	}
 	s.alerted[ep] = true
 	return true
+}
+
+// firstDefect reports whether addr has not yet logged a refusal the pool made
+// for a defect, and records that it now has. It is keyed by address, because a
+// routed host outside the pool has no endpoint of its own.
+func (s *walkState) firstDefect(addr string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.defects[addr] {
+		return false
+	}
+	if s.defects == nil {
+		s.defects = make(map[string]bool)
+	}
+	s.defects[addr] = true
+	return true
+}
+
+// statusHopSpent reports whether a round trip of the request with URL u spent
+// its status hop no longer than statusHopTTL before now. A record past that
+// is dropped.
+func (s *walkState) statusHopSpent(u *url.URL, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	last, ok := s.statusHops[u]
+	if !ok {
+		return false
+	}
+	if now.Sub(last) >= statusHopTTL {
+		delete(s.statusHops, u)
+		return false
+	}
+	return true
+}
+
+// spendStatusHop records at now that the request with URL u has spent its
+// status hop. When the pool already keeps statusHopCap records, it first drops
+// the expired ones and then, if none expired, the one used longest ago.
+func (s *walkState) spendStatusHop(u *url.URL, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.statusHops == nil {
+		s.statusHops = make(map[*url.URL]time.Time)
+	}
+	if _, ok := s.statusHops[u]; !ok && len(s.statusHops) >= statusHopCap {
+		s.evictStatusHopsLocked(now)
+	}
+	s.statusHops[u] = now
+}
+
+// evictStatusHopsLocked drops every expired status-hop record, or the oldest
+// one when none has expired. s.mu must be held.
+func (s *walkState) evictStatusHopsLocked(now time.Time) {
+	var (
+		oldest     *url.URL
+		oldestTime time.Time
+	)
+	for u, last := range s.statusHops {
+		if now.Sub(last) >= statusHopTTL {
+			delete(s.statusHops, u)
+			continue
+		}
+		if oldest == nil || last.Before(oldestTime) {
+			oldest, oldestTime = u, last
+		}
+	}
+	if len(s.statusHops) >= statusHopCap && oldest != nil {
+		delete(s.statusHops, oldest)
+	}
 }
 
 // logFailover logs the change of the active endpoint from one endpoint to
@@ -492,6 +685,29 @@ func (p *Pool) alertVerify(ep *endpoint, err error, hopping bool) {
 	p.logger.Error("pve endpoint "+ep.addr+": TLS verification failed ("+cause+"); this can mean interception; "+next,
 		log.String("endpoint", ep.addr),
 		log.String("class", string(PhaseTLSVerify)),
+		log.String("error", cause),
+	)
+}
+
+// alertDefect logs, once per address for the life of the pool, that the pool
+// refused to send a request through the owned transport for addr, because the
+// transport was built for another address or because it checks its endpoint's
+// certificate itself and was asked for plain http. Only a defect in the pool
+// routes a request that way, so the line is an Error. hopping says whether the
+// request moves on to another endpoint, and class is the refusal's phase.
+func (p *Pool) alertDefect(addr string, err error, class string, hopping bool) {
+	if !p.walk.firstDefect(addr) {
+		return
+	}
+	cause := log.ScrubMessage(noteOf(nil, err, class).text)
+	next := "trying the next endpoint"
+	if !hopping {
+		next = "no other endpoint is tried for this request"
+	}
+	p.logger.Error("pve endpoint "+addr+": the pool refused to send through its transport ("+cause+
+		"); this is a defect in the endpoint pool; "+next,
+		log.String("endpoint", addr),
+		log.String("class", class),
 		log.String("error", cause),
 	)
 }

@@ -51,6 +51,7 @@ func TestClassifyErrors(t *testing.T) {
 	dial := &ConnectPhaseError{Phase: PhaseDial, Endpoint: "a:8006", Err: syscall.ECONNREFUSED}
 	verify := &ConnectPhaseError{Phase: PhaseTLSVerify, Endpoint: "a:8006", Err: errors.New("x509: bad name")}
 	plaintext := &ConnectPhaseError{Phase: PhaseDial, Endpoint: "a:8006", Err: errPlaintextRefused}
+	wrongAddr := &ConnectPhaseError{Phase: PhaseDial, Endpoint: "a:8006", Err: errWrongAddress}
 	sendBy := &ConnectPhaseError{Phase: PhaseDial, Endpoint: "a:8006", Err: ErrSendByPassed}
 	reset := errors.New("read: connection reset by peer")
 
@@ -65,14 +66,39 @@ func TestClassifyErrors(t *testing.T) {
 			outcome{action: actReturn, sent: sentNever, sendBy: true, class: classSendBy},
 		},
 		{
-			"send-by refusal of a mutation after a connection",
-			attempt{class: classMutation, err: sendBy, gotConn: true, callerDone: true},
+			"send-by refusal of a mutation proven unsent",
+			attempt{class: classMutation, err: sendBy, gotConn: true, callerDone: true, provenUnsent: true},
 			outcome{action: actReturn, sent: sentNever, sendBy: true, class: classSendBy},
 		},
 		{
-			"caller gave up before a connection, even with the dial's tag",
-			attempt{class: classMutation, err: dial, callerDone: true},
+			"send-by refusal of a mutation Go may have replayed",
+			attempt{class: classMutation, err: sendBy, gotConn: true},
+			outcome{action: actReturn, sent: sentMaybe, sendBy: true, class: classSendBy},
+		},
+		{
+			"caller gave up on a mutation before a connection, with the dial's tag and the proof",
+			attempt{class: classMutation, err: dial, callerDone: true, provenUnsent: true},
 			outcome{action: actReturn, sent: sentNever, class: classCancelled},
+		},
+		{
+			"caller gave up on a mutation before a connection, with the dial's tag but no proof",
+			attempt{class: classMutation, err: dial, callerDone: true},
+			outcome{action: actReturn, sent: sentMaybe, class: classCancelled},
+		},
+		{
+			"caller gave up on a mutation before a connection, without the tag",
+			attempt{class: classMutation, err: context.Canceled, callerDone: true},
+			outcome{action: actReturn, sent: sentMaybe, class: classCancelled},
+		},
+		{
+			"caller gave up on a read before a connection, with the dial's tag",
+			attempt{class: classIdempotent, err: dial, callerDone: true},
+			outcome{action: actReturn, sent: sentNever, class: classCancelled},
+		},
+		{
+			"caller gave up on a read before a connection, without the tag",
+			attempt{class: classIdempotent, err: context.Canceled, callerDone: true},
+			outcome{action: actReturn, sent: sentMaybe, class: classCancelled},
 		},
 		{
 			"caller gave up on a read after the connection",
@@ -120,12 +146,22 @@ func TestClassifyErrors(t *testing.T) {
 		{
 			"plain http refused by the pool hops without blame",
 			attempt{class: classIdempotent, kind: KindDiscovered, err: plaintext},
-			outcome{action: actHop, sent: sentNever, unreachable: true, class: "dial"},
+			outcome{action: actHop, sent: sentNever, unreachable: true, defectAlert: true, class: "dial"},
 		},
 		{
-			"untagged error before any connection",
+			"wrong address refused by the pool hops a proven mutation without blame",
+			attempt{class: classMutation, kind: KindConfigured, err: wrongAddr, provenUnsent: true},
+			outcome{action: actHop, sent: sentNever, unreachable: true, defectAlert: true, class: "dial"},
+		},
+		{
+			"untagged error of a read before any connection",
 			attempt{class: classIdempotent, err: errors.New("unsupported protocol scheme")},
-			outcome{action: actReturn, sent: sentNever, class: classRequest},
+			outcome{action: actReturn, sent: sentMaybe, class: classRequest},
+		},
+		{
+			"untagged error of a mutation before any connection proves nothing",
+			attempt{class: classMutation, err: errors.New("unsupported protocol scheme")},
+			outcome{action: actReturn, sent: sentMaybe, class: classRequest},
 		},
 		{
 			"header deadline on a hop that had one",
@@ -190,8 +226,10 @@ func TestClassifyStatuses(t *testing.T) {
 			"second 503 after the status hop",
 			attempt{class: classIdempotent, status: 503, attributable: true, statusHopped: true}, ret,
 		},
-		{"596 read", attempt{class: classIdempotent, status: 596, attributable: true}, broken},
-		{"596 login", attempt{class: classLogin, status: 596}, broken},
+		{"596 read from the entry", attempt{class: classIdempotent, status: 596, attributable: true}, broken},
+		{"596 login from the entry", attempt{class: classLogin, status: 596, attributable: true}, broken},
+		{"596 read for another node", attempt{class: classIdempotent, status: 596}, ret},
+		{"596 login for another node", attempt{class: classLogin, status: 596}, ret},
 		{"597 read", attempt{class: classIdempotent, status: 597, attributable: true}, ret},
 		{"599 read", attempt{class: classIdempotent, status: 599, attributable: true}, ret},
 		{"600 read", attempt{class: classIdempotent, status: 600, attributable: true}, answer},

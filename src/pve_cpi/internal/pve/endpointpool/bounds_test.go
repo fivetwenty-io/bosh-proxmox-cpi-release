@@ -1,6 +1,7 @@
 package endpointpool
 
 import (
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/http/httptrace"
@@ -168,20 +169,37 @@ func TestFailuresAllVerificationIsTheCertificateError(t *testing.T) {
 }
 
 // A walk whose hops include a failure that is not unreachable returns the last
-// hop's error as it is.
-func TestFailuresWithAnotherFailureReturnTheLastError(t *testing.T) {
+// such failure, so a connect-phase failure on a later hop never takes the place
+// of the error that keeps the walk retryable.
+func TestFailuresWithAnotherFailureReturnTheLastOtherError(t *testing.T) {
 	var f failures
 	f.add("a:8006", &ConnectPhaseError{Phase: PhaseDial, Endpoint: "a:8006", Err: syscall.ECONNREFUSED}, true)
 	reset := errors.New("read: connection reset by peer")
 	f.add("b:8006", reset, false)
 	f.add("c:8006", &ConnectPhaseError{Phase: PhaseDial, Endpoint: "c:8006", Err: syscall.ECONNREFUSED}, true)
-	last := f.last
-	if err := f.err(); !errors.Is(err, last) {
-		t.Fatalf("err = %v, want the last hop's error %v", err, last)
+	var eu *EntryUnreachableError
+	if err := f.err(); !errors.Is(err, reset) || errors.As(err, &eu) || IsConnectPhase(err) {
+		t.Fatalf("err = %v, want the reset %v alone", err, reset)
 	}
+
 	var g failures
-	g.add("a:8006", reset, false)
-	if err := g.err(); !errors.Is(err, reset) {
-		t.Fatalf("err = %v, want %v", err, reset)
+	g.add("a:8006", errors.New("EOF"), false)
+	g.add("b:8006", reset, false)
+	if err := g.err(); !errors.Is(err, reset) || errors.As(err, &eu) {
+		t.Fatalf("err = %v, want the last other error %v", err, reset)
+	}
+
+	var h failures
+	h.add("a:8006", reset, false)
+	cert := &tls.CertificateVerificationError{Err: errors.New("x509: certificate is valid for other.example")}
+	h.add("b:8006", &ConnectPhaseError{Phase: PhaseTLSVerify, Endpoint: "b:8006", Err: cert}, true)
+	h.add("c:8006", &ConnectPhaseError{Phase: PhasePin, Endpoint: "c:8006", Err: ErrPinMismatch}, true)
+	err := h.err()
+	if !errors.Is(err, reset) || errors.As(err, &eu) {
+		t.Fatalf("err = %v, want the reset %v", err, reset)
+	}
+	var cv *tls.CertificateVerificationError
+	if errors.As(err, &cv) || IsConnectPhase(err) {
+		t.Fatalf("a mixed walk surfaced a verification failure: %v", err)
 	}
 }

@@ -141,7 +141,7 @@ func TestWalkOrderStartsAtTheActiveEndpoint(t *testing.T) {
 		},
 	})
 	pve2, pve3 := endpointOf(t, p, "pve2:8006"), endpointOf(t, p, "pve3:8006")
-	if !p.promote(pve2, 0) {
+	if _, ok := p.promote(pve2, 0); !ok {
 		t.Fatal("promote under the current generation should apply")
 	}
 	order, gen := p.walkOrder(false)
@@ -149,7 +149,7 @@ func TestWalkOrderStartsAtTheActiveEndpoint(t *testing.T) {
 	if gen != 1 {
 		t.Fatalf("generation = %d, want 1", gen)
 	}
-	if !p.promote(pve3, gen) {
+	if _, ok := p.promote(pve3, gen); !ok {
 		t.Fatal("promote under the current generation should apply")
 	}
 	order, _ = p.walkOrder(false)
@@ -174,10 +174,11 @@ func TestPromoteGenerationGuard(t *testing.T) {
 	_, started := p.current()
 
 	p.demote(pve1)
-	if !p.promote(pve2, started) {
-		t.Fatal("the failover's success should apply")
+	if prev, ok := p.promote(pve2, started); !ok || prev != pve1 {
+		t.Fatalf("the failover's success should apply and name pve1 as the endpoint it replaced, got %v, %v",
+			prev, ok)
 	}
-	if p.promote(pve1, started) {
+	if _, ok := p.promote(pve1, started); ok {
 		t.Fatal("a stale success must not apply")
 	}
 	active, gen := p.current()
@@ -188,15 +189,15 @@ func TestPromoteGenerationGuard(t *testing.T) {
 	// A success on the active endpoint under the current generation clears a
 	// demotion without raising the generation.
 	p.demote(pve2)
-	if !p.promote(pve2, gen) {
-		t.Fatal("a current success should apply")
+	if prev, ok := p.promote(pve2, gen); !ok || prev != nil {
+		t.Fatalf("a current success on the active endpoint should apply without a change, got %v, %v", prev, ok)
 	}
 	if _, g := p.current(); g != gen || p.demotedNow(pve2) {
 		t.Fatalf("generation %d (want %d), demoted %v", g, gen, p.demotedNow(pve2))
 	}
 
 	// A current success on a demoted endpoint brings it back as active.
-	if !p.promote(pve1, gen) {
+	if _, ok := p.promote(pve1, gen); !ok {
 		t.Fatal("a current success should apply")
 	}
 	if active, g := p.current(); active != pve1 || g != gen+1 || p.demotedNow(pve1) {
@@ -214,16 +215,16 @@ func TestAdvance(t *testing.T) {
 		},
 	})
 	pve1, pve2, pve3 := endpointOf(t, p, "pve1:8006"), endpointOf(t, p, "pve2:8006"), endpointOf(t, p, "pve3:8006")
-	if !p.advance(pve1, 0) {
-		t.Fatal("advance from the active endpoint should move it")
+	if to := p.advance(pve1, 0); to != pve2 {
+		t.Fatalf("advance from the active endpoint should install pve2, got %v", to)
 	}
 	if active, gen := p.current(); active != pve2 || gen != 1 || !p.demotedNow(pve1) {
 		t.Fatalf("active %s gen %d", active.addr, gen)
 	}
-	if p.advance(pve1, 0) {
+	if p.advance(pve1, 0) != nil {
 		t.Fatal("a stale advance must not move the active endpoint")
 	}
-	if p.advance(pve3, 1) {
+	if p.advance(pve3, 1) != nil {
 		t.Fatal("advance from an endpoint that is not active must not move it")
 	}
 	if !p.demotedNow(pve3) {
@@ -231,8 +232,8 @@ func TestAdvance(t *testing.T) {
 	}
 	// Every other endpoint is demoted, so the next one in preference order is
 	// chosen among the demoted.
-	if !p.advance(pve2, 1) {
-		t.Fatal("advance should move on to a demoted endpoint when nothing else is left")
+	if to := p.advance(pve2, 1); to != pve1 {
+		t.Fatalf("advance should install the demoted pve1 when nothing else is left, got %v", to)
 	}
 	if active, _ := p.current(); active != pve1 {
 		t.Fatalf("active = %s, want pve1:8006", active.addr)
@@ -240,7 +241,7 @@ func TestAdvance(t *testing.T) {
 
 	single := newPool(t, Config{Base: baseFor(nil, nil), Endpoints: []Endpoint{configured("pve1:8006")}})
 	only := endpointOf(t, single, "pve1:8006")
-	if single.advance(only, 0) {
+	if single.advance(only, 0) != nil {
 		t.Fatal("a pool of one endpoint has nowhere to advance to")
 	}
 	if active, gen := single.current(); active != only || gen != 0 {

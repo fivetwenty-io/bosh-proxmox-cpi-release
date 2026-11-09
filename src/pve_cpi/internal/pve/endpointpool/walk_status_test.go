@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/pvetest"
 )
@@ -222,4 +223,67 @@ func TestStatusHopReturnsTheHeldResponse(t *testing.T) {
 	}
 	mustDemoted(t, p, a.Addr, true)
 	mustDemoted(t, p, b.Addr, true)
+}
+
+// The SDK's retries of one request share its one status hop. The SDK sends
+// every retry as the same *http.Request through an http.Client whose timeout
+// gives each round trip a context of its own, so four round trips of one read
+// against three endpoints that all answer 503 cost the SDK's four tries plus
+// one status hop. After the hop the retries go to the endpoint that answered,
+// and only the entry the status hop moved away from is demoted.
+func TestStatusHopIsSharedAcrossSDKRetries(t *testing.T) {
+	l := newLab(t)
+	busy := func() *pvetest.Server {
+		return l.live(t, failing(http.MethodGet, "/cluster/resources", http.StatusServiceUnavailable, "busy"))
+	}
+	a, b, c := busy(), busy(), busy()
+	p := l.pool(t, 0, configured(a.Addr), configured(b.Addr), configured(c.Addr))
+	client := &http.Client{Transport: p, Timeout: time.Minute}
+	req := apiRequest(t, context.Background(), http.MethodGet, a.Addr, "/cluster/resources", "")
+	for range 4 {
+		resp, err := client.Do(req)
+		mustStatus(t, resp, err, http.StatusServiceUnavailable)
+	}
+	sa, sb, sc := a.Counts.Requests.Load(), b.Counts.Requests.Load(), c.Counts.Requests.Load()
+	if sa != 1 || sb != 4 || sc != 0 {
+		t.Fatalf("sends A=%d B=%d C=%d, want 1, 4, 0 (five in all)", sa, sb, sc)
+	}
+	mustDemoted(t, p, a.Addr, true)
+	mustDemoted(t, p, b.Addr, false)
+	mustDemoted(t, p, c.Addr, false)
+
+	// Another request has a status hop of its own.
+	resp, err := client.Do(apiRequest(t, context.Background(), http.MethodGet, a.Addr, "/cluster/resources", ""))
+	mustStatus(t, resp, err, http.StatusServiceUnavailable)
+	if n := c.Counts.Requests.Load(); n != 1 {
+		t.Fatalf("C got %d requests, want the new request's status hop", n)
+	}
+}
+
+// A 596 demotes the entry only when the entry caused it, by the same
+// attribution as a 502, 503, or 595. One for another node's path says nothing
+// about the entry. Neither hops.
+func TestStatus596ByNode(t *testing.T) {
+	cases := []struct {
+		path    string
+		demoted bool
+	}{
+		{"/nodes/pve1/status", true},
+		{"/nodes/pve9/status", false},
+	}
+	for _, c := range cases {
+		t.Run(c.path, func(t *testing.T) {
+			l := newLab(t)
+			a := l.live(t, failing(http.MethodGet, c.path, statusBrokenBackend, "broken"))
+			b := l.live(t, nil)
+			p := l.pool(t, 0, Endpoint{Address: a.Addr, Kind: KindConfigured, Node: "pve1"}, configured(b.Addr))
+			resp, err := send(t, context.Background(), p, http.MethodGet, a.Addr, c.path, "")
+			mustStatus(t, resp, err, statusBrokenBackend)
+			if n := b.Counts.Requests.Load(); n != 0 {
+				t.Fatalf("B got %d requests, want 0", n)
+			}
+			mustDemoted(t, p, a.Addr, c.demoted)
+			mustActive(t, p, a.Addr)
+		})
+	}
 }

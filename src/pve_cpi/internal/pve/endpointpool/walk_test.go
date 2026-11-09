@@ -2,11 +2,14 @@ package endpointpool
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -504,7 +507,7 @@ func TestWalkConfiguredVerificationFailureLogsAtError(t *testing.T) {
 	}
 
 	_, gen := p.current()
-	if !p.promote(endpointOf(t, p, a.Addr), gen) {
+	if _, ok := p.promote(endpointOf(t, p, a.Addr), gen); !ok {
 		t.Fatal("promote A")
 	}
 	resp, err = send(t, context.Background(), p, http.MethodGet, a.Addr, "/version", "")
@@ -797,7 +800,7 @@ func TestWalkConfiguredOnlyKeepsADiscoveredActiveEndpoint(t *testing.T) {
 	d1 := l.live(t, nil)
 	p := l.pool(t, 0, configured(c1.Addr), discovered(d1.Addr, PinOf(l.leaf.DER)))
 	_, gen := p.current()
-	if !p.promote(endpointOf(t, p, d1.Addr), gen) {
+	if _, ok := p.promote(endpointOf(t, p, d1.Addr), gen); !ok {
 		t.Fatal("promote the discovered endpoint")
 	}
 	resp, err := send(t, context.Background(), p, http.MethodPost, c1.Addr, "/access/ticket",
@@ -869,7 +872,9 @@ func TestRoundTripRefusesUnroutableRequests(t *testing.T) {
 
 // A walk that ends because the caller's context ended between hops returns
 // the context's error, and one that ends because the send-by deadline passed
-// between hops returns the refusal and logs it.
+// between hops returns the refusal and reports it for the log. Either keeps
+// the last hop's sent state, because the hop that would have come next sent
+// nothing.
 func TestWalkHaltBetweenHops(t *testing.T) {
 	l := newLab(t)
 	a := l.refused(t)
@@ -881,20 +886,21 @@ func TestWalkHaltBetweenHops(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	w := p.newWalker(apiRequest(t, ctx, http.MethodGet, a.Addr, "/version", ""), false, defaultBounds())
-	if _, err := w.halt(hop, stopCaller, 1); !errors.Is(err, context.Canceled) {
-		t.Fatalf("caller stop: %v", err)
+	_, oc, err := w.halt(hop, stopCaller, 1, nil)
+	if !errors.Is(err, context.Canceled) || oc.sent != sentNever || oc.sendBy {
+		t.Fatalf("caller stop: %v, %+v", err, oc)
 	}
 	mustDemoted(t, p, a.Addr, true)
 
 	w = p.newWalker(apiRequest(t, context.Background(), http.MethodGet, a.Addr, "/version", ""), false,
 		defaultBounds())
-	_, err := w.halt(hop, stopSendBy, 1)
+	_, oc, err = w.halt(hop, stopSendBy, 1, nil)
 	cpe, ok := AsConnectPhase(err)
 	if !errors.Is(err, ErrSendByPassed) || !ok || cpe.Endpoint != w.order[1].addr {
 		t.Fatalf("send-by stop: %v", err)
 	}
-	if n := len(l.entries(slog.LevelDebug, "pve endpoints: GET /version not sent")); n != 1 {
-		t.Fatalf("send-by lines = %d, want 1", n)
+	if !oc.sendBy || oc.sent != sentNever {
+		t.Fatalf("send-by stop outcome = %+v, want a send-by refusal that keeps sentNever", oc)
 	}
 }
 
@@ -931,5 +937,281 @@ func TestWalkStopBefore(t *testing.T) {
 	}
 	if got := mk(context.Background(), http.MethodPost, "x").stopBefore(1); got != stopNone {
 		t.Fatalf("rebuildable body: %v", got)
+	}
+}
+
+// A walk that meets a reset on one endpoint and a verification failure on the
+// final hop returns the reset, which the SDK retries, and not the certificate
+// error, which it never retries.
+func TestWalkMixedWalkStaysRetryable(t *testing.T) {
+	l := newLab(t)
+	a := pvetest.NewBodyThenHijack(t, l.leaf)
+	b := pvetest.NewLive(t, l.ca.NewLeaf(t, pvetest.LeafOptions{DNSNames: []string{"other.example"}}), nil)
+	p := l.pool(t, 0, configured(a.Addr), configured(b.Addr))
+	_, err := send(t, context.Background(), p, http.MethodGet, a.Addr, "/version", "")
+	if err == nil {
+		t.Fatal("the walk succeeded")
+	}
+	var cv *tls.CertificateVerificationError
+	if errors.As(err, &cv) || IsConnectPhase(err) {
+		t.Fatalf("a mixed walk surfaced the final hop's verification failure: %T %v", err, err)
+	}
+	var eu *EntryUnreachableError
+	if errors.As(err, &eu) {
+		t.Fatalf("a walk with a reset in it reads as unreachable: %v", err)
+	}
+	mustDemoted(t, p, a.Addr, true)
+	mustDemoted(t, p, b.Addr, true)
+	if n := len(l.entries(slog.LevelError, "pve endpoint "+b.Addr+": TLS verification failed")); n != 1 {
+		t.Fatalf("verification lines = %d, want 1", n)
+	}
+}
+
+// A body that GetBody cannot rebuild ends the walk. The error joins the
+// GetBody failure to the earlier hops' failures, and the outcome keeps the
+// earlier hop's proof that the mutation was never sent, because the hop that
+// failed to rebuild its body sent nothing.
+func TestWalkGetBodyFailureKeepsTheEarlierHops(t *testing.T) {
+	l := newLab(t)
+	a := l.refused(t)
+	b := l.live(t, nil)
+	p := l.pool(t, 0, configured(a.Addr), configured(b.Addr))
+	req := apiRequest(t, context.Background(), http.MethodPost, a.Addr, "/nodes/pve1/qemu", "vmid=101")
+	cause := errors.New("body source closed")
+	req.GetBody = func() (io.ReadCloser, error) { return nil, cause }
+	_, oc, err := p.dispatch(req, defaultBounds())
+	if !errors.Is(err, cause) {
+		t.Fatalf("err = %v, want the GetBody failure", err)
+	}
+	var eu *EntryUnreachableError
+	if !errors.As(err, &eu) || len(eu.Attempts) != 1 || eu.Attempts[0].Endpoint != a.Addr {
+		t.Fatalf("err = %v, want A's connect-phase failure joined to it", err)
+	}
+	if !IsConnectPhase(err) || IsMaybeSent(err) {
+		t.Fatalf("err = %v, want the connect-phase proof and no maybe-sent mark", err)
+	}
+	if oc.sent != sentNever {
+		t.Fatalf("outcome sent = %d, want sentNever", oc.sent)
+	}
+	if n := b.Counts.Requests.Load(); n != 0 {
+		t.Fatalf("B got %d requests, want 0", n)
+	}
+
+	// A is demoted now, so a fresh pool puts the refused endpoint first again.
+	p = l.pool(t, 0, configured(a.Addr), configured(b.Addr))
+	nilBody := apiRequest(t, context.Background(), http.MethodPost, a.Addr, "/nodes/pve1/qemu", "vmid=101")
+	nilBody.GetBody = func() (io.ReadCloser, error) { return nil, nil }
+	if _, err := p.RoundTrip(nilBody); !errors.Is(err, errNoGetBodyResult) {
+		t.Fatalf("err = %v, want the empty GetBody result", err)
+	}
+}
+
+// A status hop that cannot rebuild its body for the next endpoint returns the
+// entry's response with no effect, as any status hop that cannot proceed does.
+func TestWalkGetBodyFailureOnAStatusHop(t *testing.T) {
+	l := newLab(t)
+	a := l.live(t, failing(http.MethodPost, "/access/ticket", http.StatusServiceUnavailable, "busy"))
+	b := l.live(t, nil)
+	p := l.pool(t, 0, configured(a.Addr), configured(b.Addr))
+	req := apiRequest(t, context.Background(), http.MethodPost, a.Addr, "/access/ticket", "username=root&password=x")
+	req.GetBody = func() (io.ReadCloser, error) { return nil, errors.New("body source closed") }
+	resp, oc, err := p.dispatch(req, defaultBounds())
+	mustStatus(t, resp, err, http.StatusServiceUnavailable)
+	if oc.sent != sentAnswered {
+		t.Fatalf("outcome sent = %d, want sentAnswered", oc.sent)
+	}
+	if n := b.Counts.Requests.Load(); n != 0 {
+		t.Fatalf("B got %d requests, want 0", n)
+	}
+	mustDemoted(t, p, a.Addr, false)
+}
+
+// A refusal the pool makes because a request reached the wrong owned transport
+// can only come from a defect in the pool. The request hops without blaming
+// the endpoint, and the refusal is logged at Error once per endpoint.
+func TestWalkWrongAddressRefusalLogsAtError(t *testing.T) {
+	l := newLab(t)
+	a := l.refused(t)
+	b, c := l.live(t, nil), l.live(t, nil)
+	p := l.pool(t, 0, configured(a.Addr), configured(b.Addr), configured(c.Addr))
+	endpointOf(t, p, b.Addr).transports = endpointOf(t, p, c.Addr).transports
+	for range 2 {
+		resp, err := send(t, context.Background(), p, http.MethodPost, a.Addr, "/nodes/pve1/qemu", "vmid=1")
+		mustStatus(t, resp, err, http.StatusOK)
+	}
+	if n := pvetest.TotalMethod(http.MethodPost, b, c); n != 2 {
+		t.Fatalf("POSTs = %d, want 2", n)
+	}
+	mustDemoted(t, p, b.Addr, false)
+	lines := l.entries(slog.LevelError, "pve endpoint ")
+	if len(lines) != 1 {
+		t.Fatalf("Error lines = %d, want one for B", len(lines))
+	}
+	if !strings.Contains(lines[0].Message, "this is a defect in the endpoint pool; trying the next endpoint") {
+		t.Fatalf("defect line = %q", lines[0].Message)
+	}
+	mustAttrs(t, lines[0], map[string]string{"endpoint": b.Addr, "class": "dial"})
+	if !strings.Contains(lines[0].Attrs["error"].(string), errWrongAddress.Error()) {
+		t.Fatalf("defect line error = %v", lines[0].Attrs["error"])
+	}
+}
+
+// An answer that moves the active endpoint is logged even when the walk could
+// not read which endpoint was active when it started. The pool names the
+// endpoint that lost the active role.
+func TestWalkPromotionWithoutAStartingEndpointIsLogged(t *testing.T) {
+	l := newLab(t)
+	a, b := l.live(t, nil), l.live(t, nil)
+	p := l.pool(t, 0, configured(a.Addr), configured(b.Addr))
+	w := p.newWalker(apiRequest(t, context.Background(), http.MethodGet, a.Addr, "/version", ""), false,
+		defaultBounds())
+	w.from = nil
+	w.promote(endpointOf(t, p, b.Addr))
+	mustActive(t, p, b.Addr)
+	warns := l.failovers()
+	if len(warns) != 1 {
+		t.Fatalf("failover lines = %d, want 1", len(warns))
+	}
+	mustAttrs(t, warns[0], map[string]string{"from": a.Addr, "to": b.Addr})
+}
+
+// A POST with an Idempotency-Key that Go may have replayed may have left on an
+// earlier attempt, so a send-by deadline that passes during the replay's dial
+// does not prove it unsent. The refusal stays on the entry, is marked maybe
+// sent, and never blames the entry.
+func TestWalkSendByOnAReplayablePostIsMaybeSent(t *testing.T) {
+	l := newLab(t)
+	a := l.dropped(t)
+	b := l.live(t, nil)
+	p := l.pool(t, 0, configured(a.Addr), configured(b.Addr))
+	ctx := WithSendBy(context.Background(), time.Now().Add(150*time.Millisecond), http.MethodPost, "/pools")
+	req := apiRequest(t, ctx, http.MethodPost, a.Addr, "/pools", "poolid=cpi")
+	req.Header.Set("Idempotency-Key", "k1")
+	_, oc, err := p.dispatch(req, defaultBounds())
+	if !errors.Is(err, ErrSendByPassed) || !IsMaybeSent(err) {
+		t.Fatalf("err = %v, want ErrSendByPassed marked maybe sent", err)
+	}
+	if oc.sent != sentMaybe || !oc.sendBy {
+		t.Fatalf("outcome = %+v, want a maybe-sent send-by refusal", oc)
+	}
+	if n := b.Counts.Requests.Load(); n != 0 {
+		t.Fatalf("B got %d requests, want 0", n)
+	}
+	mustDemoted(t, p, a.Addr, false)
+}
+
+// The send-by check in front of every dial names the canonical address, the
+// same spelling as every other connect-phase error, and its outcome is
+// sentNever with the send-by mark.
+func TestRoundTripSendByPreCheckNamesTheCanonicalAddress(t *testing.T) {
+	p := newPool(t, Config{Base: baseFor(nil, nil), Endpoints: []Endpoint{configured("pve1.example:443")}})
+	ctx := WithSendBy(context.Background(), time.Now().Add(-time.Second), http.MethodDelete, "/pools")
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, "https://PVE1.Example"+pvetest.APIPrefix+"/pools",
+		nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, oc, err := p.dispatch(req, defaultBounds())
+	cpe, ok := AsConnectPhase(err)
+	if !errors.Is(err, ErrSendByPassed) || !ok || cpe.Endpoint != "pve1.example:443" {
+		t.Fatalf("err = %v, want a refusal naming pve1.example:443", err)
+	}
+	if oc.sent != sentNever || !oc.sendBy {
+		t.Fatalf("outcome = %+v, want sentNever with the send-by mark", oc)
+	}
+
+	// A URL the pool cannot route still gets the refusal, naming the host as
+	// the caller wrote it, because no canonical address exists for it.
+	req.URL.Scheme, req.URL.Host = "ftp", "PVE1.Example"
+	_, _, err = p.dispatch(req, defaultBounds())
+	if cpe, ok := AsConnectPhase(err); !errors.Is(err, ErrSendByPassed) || !ok || cpe.Endpoint != "PVE1.Example" {
+		t.Fatalf("err = %v, want a refusal naming the raw host", err)
+	}
+}
+
+// dispatch returns an outcome on every path, which is what a mutation's tether
+// follows.
+func TestDispatchOutcomes(t *testing.T) {
+	l := newLab(t)
+	a := l.refused(t)
+	b := l.live(t, nil)
+	p := l.pool(t, 0, configured(a.Addr), configured(b.Addr))
+
+	resp, oc, err := p.dispatch(apiRequest(t, context.Background(), http.MethodPost, a.Addr, "/nodes/pve1/qemu",
+		"vmid=101"), defaultBounds())
+	mustStatus(t, resp, err, http.StatusOK)
+	if oc.sent != sentAnswered {
+		t.Fatalf("hopped POST: sent = %d, want sentAnswered", oc.sent)
+	}
+
+	// A is demoted now, so a fresh pool puts the refused endpoint first again.
+	fresh := l.pool(t, 0, configured(a.Addr), configured(b.Addr))
+	keyed := apiRequest(t, context.Background(), http.MethodPost, a.Addr, "/nodes/pve1/qemu", "vmid=102")
+	keyed.Header.Set("Idempotency-Key", "k2")
+	_, oc, err = fresh.dispatch(keyed, defaultBounds())
+	if !IsMaybeSent(err) || oc.sent != sentMaybe {
+		t.Fatalf("replayable POST: %v, sent = %d, want sentMaybe", err, oc.sent)
+	}
+
+	if _, oc, err = p.dispatch(nil, defaultBounds()); !errors.Is(err, errNilRequest) || oc.sent != sentNever {
+		t.Fatalf("nil request: %v, sent = %d", err, oc.sent)
+	}
+	routed := apiRequest(t, context.Background(), http.MethodGet, "pve9.invalid:8006", "/version", "")
+	routed = routed.WithContext(WithConfiguredOnly(routed.Context()))
+	if _, oc, err = p.dispatch(routed, defaultBounds()); err == nil || oc.sent != sentNever {
+		t.Fatalf("configured-only request to an unlisted host: %v, sent = %d", err, oc.sent)
+	}
+}
+
+// A pool remembers a spent status hop by the request's URL, for statusHopTTL
+// after the last round trip that used it, and keeps at most statusHopCap
+// records.
+func TestStatusHopMemory(t *testing.T) {
+	var s walkState
+	now := time.Unix(1_700_000_000, 0)
+	u := &url.URL{Scheme: "https", Host: "pve1:8006", Path: "/api2/json/version"}
+	same := *u
+	if s.statusHopSpent(u, now) {
+		t.Fatal("a request that never hopped reads as spent")
+	}
+	s.spendStatusHop(u, now)
+	if !s.statusHopSpent(u, now.Add(statusHopTTL-time.Second)) {
+		t.Fatal("a fresh record reads as unspent")
+	}
+	if s.statusHopSpent(&same, now) {
+		t.Fatal("another request with an equal URL shares the record")
+	}
+	s.spendStatusHop(u, now.Add(statusHopTTL-time.Second))
+	if !s.statusHopSpent(u, now.Add(2*statusHopTTL-2*time.Second)) {
+		t.Fatal("a refreshed record expired from its first use")
+	}
+	if s.statusHopSpent(u, now.Add(3*statusHopTTL)) {
+		t.Fatal("an expired record reads as spent")
+	}
+	if _, ok := s.statusHops[u]; ok {
+		t.Fatal("an expired record was kept")
+	}
+
+	urls := make([]*url.URL, statusHopCap)
+	for i := range urls {
+		urls[i] = &url.URL{Path: "/" + strconv.Itoa(i)}
+		s.spendStatusHop(urls[i], now.Add(time.Duration(i)*time.Millisecond))
+	}
+	extra := &url.URL{Path: "/extra"}
+	s.spendStatusHop(extra, now.Add(time.Second))
+	if len(s.statusHops) != statusHopCap {
+		t.Fatalf("records = %d, want the cap %d", len(s.statusHops), statusHopCap)
+	}
+	if _, ok := s.statusHops[urls[0]]; ok {
+		t.Fatal("the oldest record survived an eviction at the cap")
+	}
+	if !s.statusHopSpent(extra, now.Add(time.Second)) || !s.statusHopSpent(urls[1], now.Add(time.Second)) {
+		t.Fatal("eviction dropped a record it should keep")
+	}
+
+	later := now.Add(statusHopTTL + 2*time.Second)
+	s.spendStatusHop(&url.URL{Path: "/late"}, later)
+	if len(s.statusHops) != 1 {
+		t.Fatalf("records = %d, want every expired one dropped and only the new one left", len(s.statusHops))
 	}
 }
