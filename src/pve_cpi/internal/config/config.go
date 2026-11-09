@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/hooks"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -32,6 +33,16 @@ type CPIConfig struct {
 	APIToken string `json:"api_token,omitempty"`
 	Realm    string `json:"realm,omitempty"`
 	Node     string `json:"node,omitempty"`
+
+	// Endpoints is the ordered list of PVE API endpoints for this cluster.
+	// The first entry is the preferred endpoint and the discovery seed. Each
+	// entry is a host or host:port in the node_endpoints grammar; Load gives
+	// an entry with no port of its own the value of Port (8006 when unset),
+	// and ApplyDefaults takes Host and Port from the first entry when Host is
+	// empty, so every consumer of Host keeps reading "the first endpoint".
+	// When both Host and Endpoints are set, Host and Port must name the same
+	// endpoint as the first entry. Validated only when set.
+	Endpoints []string `json:"endpoints,omitempty"`
 
 	// NodeEndpoints maps a PVE node name to the address (host or host:port,
 	// no scheme, no path) its own pveproxy is reachable at. Storage uploads
@@ -2204,6 +2215,9 @@ func Load(r io.Reader) (*CPIConfig, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return nil, cpierrors.Cloud("config: decode failed: %s", err.Error())
 	}
+	// Port fill-in runs before ApplyDefaults: ApplyDefaults copies the first
+	// entry into Host and Port, and an entry's port has to be settled by then.
+	cfg.fillEndpointPorts()
 	cfg.ApplyDefaults()
 
 	// Collect strict unknown-key errors here (needs raw bytes) alongside the
@@ -2294,6 +2308,9 @@ func normalizeAPIToken(s string) string {
 // Callers must invoke this before Validate when constructing a CPIConfig manually.
 func (c *CPIConfig) ApplyDefaults() {
 	c.APIToken = normalizeAPIToken(c.APIToken)
+	// The first endpoint stands in for an unset host. This runs before the
+	// port default so a first entry's own port wins over the 8006 fallback.
+	c.adoptFirstEndpoint()
 	if c.Port == 0 {
 		c.Port = 8006
 	}
@@ -4226,6 +4243,7 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	c.validateSDNFields(&errs)
 	c.validateRanges(&errs)
 	c.validateNodeEndpoints(&errs)
+	c.validateEndpoints(&errs)
 	c.validatePlacement(&errs)
 	c.validateHA(&errs)
 	c.validateStorage(&errs)
@@ -4263,8 +4281,8 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 // never reads the user field in token mode, so a token-only config is
 // complete.
 func (c *CPIConfig) validateRequiredFields(errs *[]string) {
-	if c.Host == "" {
-		*errs = append(*errs, "host is required")
+	if c.Host == "" && len(c.Endpoints) == 0 {
+		*errs = append(*errs, "host is required: set pve.host or pve.endpoints")
 	}
 	if c.User == "" && c.APIToken == "" {
 		*errs = append(*errs, "user is required")
@@ -4997,54 +5015,227 @@ func (c *CPIConfig) validateNodeEndpoints(errs *[]string) {
 			*errs = append(*errs, fmt.Sprintf("node_endpoints key %q must not carry surrounding whitespace", node))
 			continue
 		}
-		if strings.TrimSpace(addr) == "" {
-			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must not be empty", node))
-			continue
-		}
-		if addr != strings.TrimSpace(addr) {
-			// applyHostOverride joins the raw value into the request host
-			// verbatim; a padded value would validate no further checks below
-			// (SplitHostPort rejects the leading/trailing space and every
-			// later case in this switch also falls through) and only fail at
-			// runtime as an unresolvable DNS name.
-			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] value must not carry surrounding whitespace, got %q", node, addr))
-			continue
-		}
-		if strings.Contains(addr, "://") {
-			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must be host or host:port without a scheme, got %q", node, addr))
-			continue
-		}
-		if strings.Contains(addr, "/") {
-			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must be host or host:port without a path, got %q", node, addr))
-			continue
-		}
-		host, port, splitErr := net.SplitHostPort(addr)
-		switch {
-		case splitErr == nil:
-			if strings.TrimSpace(host) == "" {
-				*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must carry a host before the port, got %q", node, addr))
-				continue
-			}
-			n, convErr := strconv.Atoi(port)
-			if convErr != nil || n < 1 || n > 65535 {
-				*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] port must be 1-65535, got %q", node, port))
-			}
-		case strings.HasPrefix(addr, "["):
-			// Brackets that SplitHostPort rejected: "[fd00::1]" without a
-			// port. The dialer would re-bracket the value into an
-			// unresolvable host, so demand the port or the bare literal.
-			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] bracketed address must be [host]:port, got %q", node, addr))
-		case strings.Count(addr, ":") == 1:
-			// One colon but SplitHostPort rejected it: a malformed host:port
-			// (empty port, stray colon).
-			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must be host or host:port, got %q", node, addr))
-		case strings.Contains(addr, ":") && net.ParseIP(addr) == nil:
-			// More colons without brackets is acceptable only as a bare IPv6
-			// literal (the SDK brackets it when dialing); anything else here
-			// is a typo like "host:8006:8006".
-			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must be host, host:port, or a bare IPv6 literal, got %q", node, addr))
+		if problem := endpointGrammarProblem(fmt.Sprintf("node_endpoints[%q]", node), addr); problem != "" {
+			*errs = append(*errs, problem)
 		}
 	}
+}
+
+// endpointGrammarProblem checks addr against the address grammar shared by
+// node_endpoints values and the endpoints list: a hostname, an IPv4 literal,
+// or a bare IPv6 literal, each optionally followed by a port, where an IPv6
+// literal with a port is written [literal]:port. There is no scheme and no
+// path, and any port must parse in 1-65535. It returns "" when addr is
+// acceptable, and otherwise a message that starts with label, which names the
+// value being checked.
+func endpointGrammarProblem(label, addr string) string {
+	if strings.TrimSpace(addr) == "" {
+		return fmt.Sprintf("%s must not be empty", label)
+	}
+	if addr != strings.TrimSpace(addr) {
+		// applyHostOverride joins the raw value into the request host
+		// verbatim; a padded value would validate no further checks below
+		// (SplitHostPort rejects the leading/trailing space and every
+		// later case in this switch also falls through) and only fail at
+		// runtime as an unresolvable DNS name.
+		return fmt.Sprintf("%s value must not carry surrounding whitespace, got %q", label, addr)
+	}
+	if strings.Contains(addr, "://") {
+		return fmt.Sprintf("%s must be host or host:port without a scheme, got %q", label, addr)
+	}
+	if strings.Contains(addr, "/") {
+		return fmt.Sprintf("%s must be host or host:port without a path, got %q", label, addr)
+	}
+	host, port, splitErr := net.SplitHostPort(addr)
+	switch {
+	case splitErr == nil:
+		if strings.TrimSpace(host) == "" {
+			return fmt.Sprintf("%s must carry a host before the port, got %q", label, addr)
+		}
+		n, convErr := strconv.Atoi(port)
+		if convErr != nil || n < 1 || n > 65535 {
+			return fmt.Sprintf("%s port must be 1-65535, got %q", label, port)
+		}
+	case strings.HasPrefix(addr, "["):
+		// Brackets that SplitHostPort rejected: "[fd00::1]" without a
+		// port. The dialer would re-bracket the value into an
+		// unresolvable host, so demand the port or the bare literal.
+		return fmt.Sprintf("%s bracketed address must be [host]:port, got %q", label, addr)
+	case strings.Count(addr, ":") == 1:
+		// One colon but SplitHostPort rejected it: a malformed host:port
+		// (empty port, stray colon).
+		return fmt.Sprintf("%s must be host or host:port, got %q", label, addr)
+	case strings.Contains(addr, ":") && net.ParseIP(addr) == nil:
+		// More colons without brackets is acceptable only as a bare IPv6
+		// literal (the SDK brackets it when dialing); anything else here
+		// is a typo like "host:8006:8006".
+		return fmt.Sprintf("%s must be host, host:port, or a bare IPv6 literal, got %q", label, addr)
+	}
+	return ""
+}
+
+// maxEndpoints caps the endpoints list. A walk may try every entry, and a
+// cluster this CPI drives never has more API endpoints than that.
+const maxEndpoints = 16
+
+// endpointExtraProblem rejects what the endpoints list forbids on top of the
+// shared grammar: user info, a query or fragment, a backslash, and whitespace
+// inside the value. node_endpoints keeps its looser rule so a manifest that
+// validates today still does. It returns "" when addr is acceptable.
+func endpointExtraProblem(label, addr string) string {
+	if strings.ContainsAny(addr, "@?#\\") || strings.IndexFunc(addr, unicode.IsSpace) >= 0 {
+		return fmt.Sprintf("%s must be host or host:port with no user info, query, or whitespace, got %q", label, addr)
+	}
+	return ""
+}
+
+// splitEndpoint splits a grammar-valid endpoint into its host and port. A
+// bracketed IPv6 literal comes back without its brackets. hasPort is false
+// for a bare host or a bare IPv6 literal. ok is false when addr does not meet
+// the grammar, so callers never need to call endpointGrammarProblem first.
+func splitEndpoint(addr string) (host string, port int, hasPort, ok bool) {
+	if endpointGrammarProblem("", addr) != "" {
+		return "", 0, false, false
+	}
+	h, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, 0, false, true
+	}
+	n, convErr := strconv.Atoi(p)
+	if convErr != nil {
+		return "", 0, false, false
+	}
+	return h, n, true, true
+}
+
+// canonicalEndpointHost returns host in the form endpoint comparison uses,
+// which is normalizedEndpoint's form (trimmed, lowercased, no trailing dot)
+// plus the canonical spelling of an IPv6 literal, so two spellings of one
+// address compare equal.
+func canonicalEndpointHost(host string) string {
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if strings.Contains(h, ":") {
+		if ip := net.ParseIP(h); ip != nil {
+			return ip.String()
+		}
+	}
+	return h
+}
+
+// defaultEndpointPort is the port an endpoint with none of its own takes: the
+// configured Port, or the PVE API default when Port is unset.
+func (c *CPIConfig) defaultEndpointPort() int {
+	if c.Port == 0 {
+		return defaultPVEAPIPort
+	}
+	return c.Port
+}
+
+// fillEndpointPorts gives every well-formed Endpoints entry that has no port
+// of its own the default endpoint port. Entries that fail the grammar stay as
+// written so validation reports them, and so does every entry when Port is
+// out of range, which validateRanges already reports once.
+func (c *CPIConfig) fillEndpointPorts() {
+	port := c.defaultEndpointPort()
+	if port < 1 || port > 65535 {
+		return
+	}
+	for i, entry := range c.Endpoints {
+		host, _, hasPort, ok := splitEndpoint(entry)
+		if !ok || hasPort {
+			continue
+		}
+		c.Endpoints[i] = net.JoinHostPort(host, strconv.Itoa(port))
+	}
+}
+
+// adoptFirstEndpoint fills Host from the first Endpoints entry when Host is
+// empty, and Port too when that entry carries a port. It does nothing when
+// Host is set or the first entry is malformed, since validation reports the
+// entry and Host stays empty.
+func (c *CPIConfig) adoptFirstEndpoint() {
+	if c.Host != "" || len(c.Endpoints) == 0 {
+		return
+	}
+	host, port, hasPort, ok := splitEndpoint(c.Endpoints[0])
+	if !ok {
+		return
+	}
+	c.Host = host
+	if hasPort {
+		c.Port = port
+	}
+}
+
+// validateEndpoints validates the optional endpoints list. Skipped entirely
+// when the list is empty (validate-only-when-set). Checks:
+//   - at most maxEndpoints entries;
+//   - every entry meets the shared endpoint grammar;
+//   - no two entries are equal after normalization (lowercased host, no
+//     trailing dot, the default port filled in);
+//   - when Host is also set, Host and Port name the same endpoint as the
+//     first entry.
+func (c *CPIConfig) validateEndpoints(errs *[]string) {
+	if len(c.Endpoints) == 0 {
+		return
+	}
+	if len(c.Endpoints) > maxEndpoints {
+		*errs = append(*errs, fmt.Sprintf("endpoints holds %d entries, at most %d are allowed",
+			len(c.Endpoints), maxEndpoints))
+	}
+	defaultPort := c.defaultEndpointPort()
+	seen := make(map[string]int, len(c.Endpoints))
+	firstKey := ""
+	for i, entry := range c.Endpoints {
+		label := fmt.Sprintf("endpoints[%d]", i)
+		if problem := endpointGrammarProblem(label, entry); problem != "" {
+			*errs = append(*errs, problem)
+			continue
+		}
+		if problem := endpointExtraProblem(label, entry); problem != "" {
+			*errs = append(*errs, problem)
+			continue
+		}
+		host, port, hasPort, _ := splitEndpoint(entry)
+		if !hasPort {
+			port = defaultPort
+		}
+		key := net.JoinHostPort(canonicalEndpointHost(host), strconv.Itoa(port))
+		if i == 0 {
+			firstKey = key
+		}
+		if prev, dup := seen[key]; dup {
+			*errs = append(*errs, fmt.Sprintf("endpoints[%d] %q repeats endpoints[%d]; each endpoint may appear once",
+				i, entry, prev))
+			continue
+		}
+		seen[key] = i
+	}
+	if c.Host != "" && firstKey != "" {
+		c.validateHostAgreesWithEndpoints(firstKey, errs)
+	}
+}
+
+// validateHostAgreesWithEndpoints appends an error when Host and Port do not
+// name the same endpoint as the first Endpoints entry, whose normalized
+// host:port is firstKey. The message names both values, neither of which is a
+// secret, and says which setting to change.
+func (c *CPIConfig) validateHostAgreesWithEndpoints(firstKey string, errs *[]string) {
+	hostKey := net.JoinHostPort(canonicalEndpointHost(c.Host), strconv.Itoa(c.defaultEndpointPort()))
+	if hostKey == firstKey {
+		return
+	}
+	firstHost, firstPort, err := net.SplitHostPort(firstKey)
+	if err != nil {
+		return
+	}
+	remedy := "set pve.host to the first endpoint, or drop pve.host"
+	if canonicalEndpointHost(c.Host) == firstHost {
+		remedy = fmt.Sprintf("set pve.port: %s, or drop pve.host", firstPort)
+	}
+	*errs = append(*errs, fmt.Sprintf(
+		"pve.host %q with port %d does not match the first entry of pve.endpoints (%s); %s",
+		c.Host, c.defaultEndpointPort(), firstKey, remedy))
 }
 
 // validatePlacement validates the optional Placement block. Skipped entirely
