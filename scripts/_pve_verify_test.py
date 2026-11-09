@@ -117,6 +117,41 @@ class TestPVEVerifierConstruction(unittest.TestCase):
             PVEVerifier(cfg)
         self.assertIn("host", str(ctx.exception))
 
+    def test_hostless_config_takes_the_harness_endpoint_from_the_environment(self) -> None:
+        cfg = _token_config(host="", endpoints=["192.0.2.1", "pve.example.com"])
+        cfg.pop("port")
+        env = {"PVE_HARNESS_HOST": "pve.example.com", "PVE_HARNESS_PORT": "8007"}
+        with unittest.mock.patch.dict(os.environ, env):
+            v = PVEVerifier(cfg)
+        self.assertEqual(v.host, "pve.example.com")
+        self.assertEqual(v.port, 8007)
+
+    def test_hostless_config_without_the_harness_endpoint_still_raises(self) -> None:
+        cfg = _token_config(host="")
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PVE_HARNESS_HOST", None)
+            with self.assertRaises(PVEVerifyError):
+                PVEVerifier(cfg)
+
+    def test_config_host_wins_over_the_harness_endpoint(self) -> None:
+        env = {"PVE_HARNESS_HOST": "other.example.com", "PVE_HARNESS_PORT": "9999"}
+        with unittest.mock.patch.dict(os.environ, env):
+            v = PVEVerifier(_token_config())
+        self.assertEqual(v.host, "pve.example.com")
+        self.assertEqual(v.port, 8006)
+
+    def test_harness_endpoint_host_without_a_port_leaves_the_default(self) -> None:
+        filled = _pve_verify.with_harness_endpoint({"user": "u"}, {"PVE_HARNESS_HOST": "h"})
+        self.assertEqual(filled, {"user": "u", "host": "h"})
+
+    def test_harness_endpoint_rejects_a_bad_port(self) -> None:
+        for bad in ("abc", "0", "-1"):
+            with self.subTest(port=bad):
+                with self.assertRaises(PVEVerifyError):
+                    _pve_verify.with_harness_endpoint(
+                        {}, {"PVE_HARNESS_HOST": "h", "PVE_HARNESS_PORT": bad}
+                    )
+
     def test_missing_both_credentials_raises(self) -> None:
         cfg = {
             "host": "pve.example.com",

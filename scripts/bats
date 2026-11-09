@@ -1712,7 +1712,7 @@ class BATS:
 
         pve_version = "unknown"
         try:
-            cpi_cfg = _integration.build_cpi_config(self.cfg, dry_run=False)
+            cpi_cfg = _integration.harness_pve_config(self.cfg, dry_run=False)
             data = _integration.pve_api_get(cpi_cfg, "/version")
             if isinstance(data, dict) and data.get("version"):
                 pve_version = str(data["version"])

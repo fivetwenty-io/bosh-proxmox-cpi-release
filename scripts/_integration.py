@@ -148,7 +148,7 @@ def bosh_int(file: "str | Path", path: str, dry_run: bool = False) -> str:
     return result.stdout.rstrip("\n")
 
 
-def bosh_int_optional(file: "str | Path", path: str, dry_run: bool = False) -> "str | None":
+def bosh_int_optional(file: "str | Path", path: str) -> "str | None":
     """Run ``bosh int`` for a top-level path that may be absent from the file.
 
     ``bosh int --path`` exits nonzero for a missing key, which bosh_int turns
@@ -158,20 +158,15 @@ def bosh_int_optional(file: "str | Path", path: str, dry_run: bool = False) -> "
     key is interpolated exactly the way every required variable is.
 
     Args:
-        file:    Path to the vars YAML file passed to bosh int.
-        path:    Top-level bosh-interpolation path, e.g. ``/pve_endpoints``.
-        dry_run: When True, return None without reading or shelling out.
+        file: Path to the vars YAML file passed to bosh int.
+        path: Top-level bosh-interpolation path, e.g. ``/pve_endpoints``.
 
     Returns:
-        Stripped bosh int stdout, or None when dry_run is set or the key is
-        absent from the file.
+        Stripped bosh int stdout, or None when the key is absent from the file.
 
     Raises:
         SystemExit: the file cannot be read or parsed, or bosh int exits nonzero.
     """
-    if dry_run:
-        return None
-
     key = path.lstrip("/")
     try:
         data = yaml.safe_load(Path(file).read_text(encoding="utf-8"))
@@ -183,16 +178,16 @@ def bosh_int_optional(file: "str | Path", path: str, dry_run: bool = False) -> "
     return bosh_int(file, path)
 
 
-def parse_endpoints(raw: "str | None", source: str) -> "list[str]":
-    """Parse the ``bosh int`` output for ``/pve_endpoints`` into an endpoint list.
+def validate_endpoints(value: "Any", source: str) -> "list[str]":
+    """Check a parsed ``pve_endpoints`` value and return it as an endpoint list.
 
     The CPI owns the endpoint grammar and rejects a malformed entry when it
     loads its config, so this only enforces the JSON shape the config expects:
-    a list of non-empty strings. An absent or empty variable yields an empty
-    list, which the caller leaves out of the config.
+    a list of non-empty strings. A null or empty value yields an empty list,
+    which the caller leaves out of the config.
 
     Args:
-        raw:    Stripped ``bosh int`` stdout, or None when the variable is unset.
+        value:  The value parsed from YAML.
         source: Vars file path, used in error messages.
 
     Returns:
@@ -201,12 +196,6 @@ def parse_endpoints(raw: "str | None", source: str) -> "list[str]":
     Raises:
         ValueError: the value is not a list of non-empty strings.
     """
-    if raw is None or not raw.strip():
-        return []
-    try:
-        value = yaml.safe_load(raw)
-    except yaml.YAMLError as exc:
-        raise ValueError(f"pve_endpoints in {source} is not valid YAML: {exc}") from exc
     if value is None:
         return []
     if not isinstance(value, list):
@@ -219,6 +208,117 @@ def parse_endpoints(raw: "str | None", source: str) -> "list[str]":
                 f"pve_endpoints[{index}] in {source} must be a non-empty string, got {entry!r}"
             )
     return list(value)
+
+
+def parse_endpoints(raw: "str | None", source: str) -> "list[str]":
+    """Parse the ``bosh int`` output for ``/pve_endpoints`` into an endpoint list.
+
+    Args:
+        raw:    Stripped ``bosh int`` stdout, or None when the variable is unset.
+        source: Vars file path, used in error messages.
+
+    Returns:
+        The endpoints in the order given; empty when the variable is unset.
+
+    Raises:
+        ValueError: the output is not valid YAML or not a list of non-empty strings.
+    """
+    if raw is None or not raw.strip():
+        return []
+    try:
+        value = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"pve_endpoints in {source} is not valid YAML: {exc}") from exc
+    return validate_endpoints(value, source)
+
+
+def read_endpoints(bosh_vars: "str | Path", dry_run: bool = False) -> "list[str]":
+    """Read the optional ``pve_endpoints`` list from the harness's vars file.
+
+    A live run interpolates the value through ``bosh int`` like every other
+    variable. A dry run reads the key straight from the file with PyYAML, so it
+    never shells out but still rejects a malformed list. A dry run that cannot
+    open the file reports no endpoints, because it never needed the file before.
+
+    Args:
+        bosh_vars: Path to the vars YAML file.
+        dry_run:   When True, read the file directly instead of running bosh int.
+
+    Returns:
+        The endpoints in order; empty when the variable is absent, null, or empty.
+
+    Raises:
+        SystemExit:  the file cannot be parsed (or read, in a live run), or bosh int fails.
+        ValueError:  the value is not a list of non-empty strings.
+    """
+    source = str(bosh_vars)
+    if not dry_run:
+        return parse_endpoints(bosh_int_optional(bosh_vars, "/pve_endpoints"), source)
+    try:
+        data = yaml.safe_load(Path(bosh_vars).read_text(encoding="utf-8"))
+    except OSError:
+        return []
+    except yaml.YAMLError as exc:
+        sys.exit(f"cannot read optional var '/pve_endpoints' from {source}: {exc}")
+    if not isinstance(data, dict) or "pve_endpoints" not in data:
+        return []
+    return validate_endpoints(data["pve_endpoints"], source)
+
+
+def _coerce_port(port_raw: str, bosh_vars: "str | Path") -> int:
+    """Turn a ``bosh int`` port string into an int, defaulting an empty one to 8006.
+
+    Raises:
+        ValueError: the value is present but not an integer.
+    """
+    if not port_raw or port_raw == "<dry-run:REDACTED>":
+        return 8006
+    try:
+        return int(port_raw)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"pve_port value {port_raw!r} in {bosh_vars} is not a valid integer") from exc
+
+
+def harness_pve_endpoint(cfg: dict, *, dry_run: bool = False) -> "tuple[str, int]":
+    """Return the PVE host and port the harness itself talks to.
+
+    These come from ``/pve_host`` and ``/pve_port`` and never from the endpoint
+    list, because the list may lead with an endpoint that is dead on purpose.
+
+    Args:
+        cfg:     Validated config dict from load_config.
+        dry_run: When True, bosh int returns placeholder strings.
+
+    Returns:
+        (host, port).
+
+    Raises:
+        SystemExit: bosh int fails.
+        ValueError: pve_port present but not an integer.
+    """
+    bosh_vars = cfg["bosh_vars"]
+    host = bosh_int(bosh_vars, "/pve_host", dry_run=dry_run)
+    port = _coerce_port(bosh_int(bosh_vars, "/pve_port", dry_run=dry_run), bosh_vars)
+    return host, port
+
+
+def harness_pve_config(cfg: dict, *, dry_run: bool = False) -> dict:
+    """Return build_cpi_config's dict with the harness's own PVE host and port filled in.
+
+    Use this for every direct PVE read the harness makes. The CPI config leaves
+    host and port out when ``pve_endpoints`` is set, and this dict is never
+    written to a file for the CPI.
+
+    Args:
+        cfg:     Validated config dict from load_config.
+        dry_run: When True, bosh int returns placeholder strings.
+
+    Returns:
+        The CPI config dict plus ``host`` and ``port`` from the harness vars.
+    """
+    conf = build_cpi_config(cfg, dry_run=dry_run)
+    conf["host"], conf["port"] = harness_pve_endpoint(cfg, dry_run=dry_run)
+    return conf
 
 
 def build_cpi_config(
@@ -244,6 +344,9 @@ def build_cpi_config(
         dry_run:               When True, bosh int returns placeholder strings.
         disk_storage_override: When not None, overrides the disk_storage value
                                read from bosh_vars.
+
+    When ``pve_endpoints`` is set, host and port are left out, because the CPI
+    takes the first listed endpoint. Use harness_pve_config for PVE reads.
 
     Returns:
         CPI config dict suitable for JSON serialization.
@@ -280,17 +383,9 @@ def build_cpi_config(
     tier1_bridge = str(tier1.get("network_bridge", "")).strip()
     network_bridge = tier1_bridge if tier1_bridge else network_bridge_pve
 
-    # Port coercion — bosh int returns a string; CPI expects int.
-    # Absent/empty → default 8006.  Present but non-integer → error.
-    if not port_raw or port_raw == "<dry-run:REDACTED>":
-        port = 8006
-    else:
-        try:
-            port = int(port_raw)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(
-                f"pve_port value {port_raw!r} in {cfg['bosh_vars']} is not a valid integer"
-            ) from exc
+    # Port coercion: bosh int returns a string; CPI expects int.
+    # Absent/empty -> default 8006.  Present but non-integer -> error.
+    port = _coerce_port(port_raw, bosh_vars)
 
     # verify_ssl: always false for test isolation regardless of vars value.
     del verify_ssl_raw  # intentionally ignored
@@ -303,9 +398,16 @@ def build_cpi_config(
     # overrides the standard bootstrap bind URL.
     agent_mbus = str(tier1.get("agent_mbus", "")).strip() or "https://mbus:mbus@0.0.0.0:6868"
 
-    cpi_cfg: dict = {
-        "host": host,
-        "port": port,
+    # Optional ordered endpoint list for failover. Left out of the config when
+    # /pve_endpoints is absent or empty so a harness without it renders the
+    # same config as before. When it is set, host and port are left out too,
+    # because the CPI takes the first listed endpoint when no host is set, and
+    # the list may lead with an endpoint that is dead on purpose. The harness's
+    # own PVE reads use harness_pve_config instead.
+    endpoints = read_endpoints(bosh_vars, dry_run=dry_run)
+
+    cpi_cfg: dict = {} if endpoints else {"host": host, "port": port}
+    cpi_cfg |= {
         "user": user,
         "node": node,
         "vm_storage": vm_storage,
@@ -318,13 +420,6 @@ def build_cpi_config(
         "agent_mbus": agent_mbus,
     }
 
-    # Optional ordered endpoint list for failover. Left out of the config when
-    # /pve_endpoints is absent or empty so a harness without it renders the
-    # same config as before. When present, the CPI requires pve_host and
-    # pve_port to name the first entry.
-    endpoints = parse_endpoints(
-        bosh_int_optional(bosh_vars, "/pve_endpoints", dry_run=dry_run), str(bosh_vars)
-    )
     if endpoints:
         cpi_cfg["endpoints"] = endpoints
 
@@ -709,7 +804,7 @@ def detect_disk_storage_pools(cfg: dict) -> "list[str]":
                       invalid tier1.disk_storage_types value.
     """
     types = disk_storage_types(cfg)
-    cpi_cfg = build_cpi_config(cfg, dry_run=False)
+    cpi_cfg = harness_pve_config(cfg, dry_run=False)
     entries = fetch_storage_index(cpi_cfg)
     return select_local_disk_pools(entries, types=types)
 
@@ -821,7 +916,7 @@ def detect_network_modes(cfg: dict) -> "list[dict]":
     bridge_cfg = nt.get("bridge", {}) or {}
     bridge_iface = str(bridge_cfg.get("iface", "")).strip()
 
-    cpi_cfg = build_cpi_config(cfg, dry_run=False)
+    cpi_cfg = harness_pve_config(cfg, dry_run=False)
     node = str(cpi_cfg.get("node", "")).strip()
 
     # SDN capability: a present /cluster/sdn/zones endpoint means SDN is
@@ -892,8 +987,8 @@ def tier1_env(cfg: dict, cpi_config_path: "str | Path", dry_run: bool = False) -
     Args:
         cfg:             Validated config dict from load_config.
         cpi_config_path: Path to the CPI JSON config written by write_cpi_config.
-        dry_run:         Accepted for interface consistency; has no effect here
-                         (all values come from config, no shell calls).
+        dry_run:         When True, the endpoint list is read straight from the
+                         vars file and bosh int returns placeholder strings.
 
     Returns:
         Dict of env var names to string values.
@@ -921,6 +1016,13 @@ def tier1_env(cfg: dict, cpi_config_path: "str | Path", dry_run: bool = False) -
         "VM_MEMORY_MIB": str(tier1["vm_memory_mib"]),
         "DISK_SIZE_MIB": str(tier1["disk_size_mib"]),
     }
+
+    # With an endpoint list, the CPI config has no host or port, so the
+    # lifecycle verifier reads the harness's own PVE host and port from here.
+    if read_endpoints(cfg["bosh_vars"], dry_run=dry_run):
+        harness_host, harness_port = harness_pve_endpoint(cfg, dry_run=dry_run)
+        env_out["PVE_HARNESS_HOST"] = harness_host
+        env_out["PVE_HARNESS_PORT"] = str(harness_port)
 
     # Optional network-test parameters consumed by create_network/delete_network
     # in scripts/lifecycle. NETWORK_TEST_MODE itself is injected per-pass by

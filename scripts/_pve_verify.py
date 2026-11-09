@@ -420,6 +420,43 @@ def parse_stemcell_path_cid(cid: str) -> "tuple[str, str, str]":
     return kind, storage, volume_path
 
 
+HARNESS_HOST_ENV = "PVE_HARNESS_HOST"
+HARNESS_PORT_ENV = "PVE_HARNESS_PORT"
+
+
+def with_harness_endpoint(config: dict[str, Any], environ: "dict[str, str] | None" = None) -> dict[str, Any]:
+    """Return config with the harness's own PVE host and port filled in when it has no host.
+
+    A CPI config that lists endpoints leaves host and port out, because the CPI
+    takes the first listed endpoint. The harness reads PVE directly and must not
+    follow that list, since its first entry can be a dead one on purpose. The
+    harness passes the host and port it reads from its vars file in
+    PVE_HARNESS_HOST and PVE_HARNESS_PORT, and those fill the gap here. A
+    config that has a host is returned unchanged.
+
+    Raises:
+        PVEVerifyError: the port variable is set but not a positive integer.
+    """
+    if str(config.get("host", "") or "").strip():
+        return config
+    env = os.environ if environ is None else environ
+    host = (env.get(HARNESS_HOST_ENV) or "").strip()
+    if not host:
+        return config
+    filled = dict(config)
+    filled["host"] = host
+    port_raw = (env.get(HARNESS_PORT_ENV) or "").strip()
+    if port_raw:
+        try:
+            port = int(port_raw)
+        except ValueError as exc:
+            raise PVEVerifyError(f"{HARNESS_PORT_ENV} must be an integer, got {port_raw!r}") from exc
+        if port <= 0:
+            raise PVEVerifyError(f"{HARNESS_PORT_ENV} must be a positive integer, got {port_raw!r}")
+        filled["port"] = port
+    return filled
+
+
 class PVEVerifier:
     """Minimal PVE REST API client built from a CPI config dict.
 
@@ -429,6 +466,7 @@ class PVEVerifier:
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
+        config = with_harness_endpoint(config)
         self._transport = os.environ.get("PVE_VERIFY_TRANSPORT", "urllib")
         if self._transport not in {"urllib", "pmx"}:
             raise PVEVerifyError("PVE_VERIFY_TRANSPORT must be urllib or pmx")

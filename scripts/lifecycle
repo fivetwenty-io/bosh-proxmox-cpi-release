@@ -61,6 +61,9 @@ Required environment:
 
 Optional environment:
     CPI_BIN          path to compiled cpi binary  (default: ./bin/cpi)
+    PVE_HARNESS_HOST PVE host the verifier reads when CPI_CONFIG lists endpoints
+                     and so has no host (default: none)
+    PVE_HARNESS_PORT its port                     (default: 8006)
     AGENT_ID         agent UUID used in create_vm (default: lifecycle-<pid>)
     NETWORK_RANGE    CIDR for the test network    (default: 192.168.1.0/24)
     NETWORK_GATEWAY  gateway for the test network (default: 192.168.1.1)
@@ -314,6 +317,16 @@ except (OSError, ValueError) as _cfg_exc:
 if not isinstance(_base_cfg, dict):
     sys.exit(f"CPI_CONFIG must contain a JSON object, got {type(_base_cfg).__name__}")
 
+# The config the PVE verifier reads. When CPI_CONFIG lists endpoints it has no
+# host or port, because the CPI takes the first entry, which can be a dead one
+# on purpose. The harness hands the verifier its own host and port in
+# PVE_HARNESS_HOST and PVE_HARNESS_PORT, and this view fills them in. The CPI
+# keeps reading _base_cfg and CPI_CONFIG itself.
+try:
+    _verify_base_cfg = _pve_verify.with_harness_endpoint(_base_cfg)
+except _pve_verify.PVEVerifyError as _verify_exc:
+    sys.exit(str(_verify_exc))
+
 # Optional request context. Without CPI_CONTEXT_FILE every request carries only
 # request_id, exactly as it always has. With it, the file's keys ride along on
 # every call, the way a Director merges a cpi_config entry's properties in.
@@ -338,8 +351,8 @@ if FOREIGN_VM_TEST == "on":
         FOREIGN_CONTEXT = _lifecycle_foreign.load_context_file(FOREIGN_CONTEXT_FILE, "FOREIGN_CONTEXT_FILE")
     except _lifecycle_foreign.ContextFileError as _ctx_exc:
         sys.exit(str(_ctx_exc))
-    if _lifecycle_foreign.endpoint(_lifecycle_foreign.verifier_config(_base_cfg, DEFAULT_CONTEXT)) == \
-            _lifecycle_foreign.endpoint(_lifecycle_foreign.verifier_config(_base_cfg, FOREIGN_CONTEXT)):
+    if _lifecycle_foreign.endpoint(_lifecycle_foreign.verifier_config(_verify_base_cfg, DEFAULT_CONTEXT)) == \
+            _lifecycle_foreign.endpoint(_lifecycle_foreign.verifier_config(_verify_base_cfg, FOREIGN_CONTEXT)):
         sys.exit(
             "FOREIGN_CONTEXT_FILE must name a different PVE endpoint than the az1 context "
             "(CPI_CONFIG plus CPI_CONTEXT_FILE); set pve.host there, with that cluster's credentials"
@@ -1585,17 +1598,17 @@ def main() -> int:
     try:
         # Out-of-band PVE verifier (same host+auth as the CPI binary). A run
         # that cannot reach PVE to verify must not be able to report success.
-        verifier = _pve_verify.PVEVerifier.from_config_file(CPI_CONFIG)
+        verifier = _pve_verify.PVEVerifier(_verify_base_cfg)
         if DEFAULT_CONTEXT:
             # A context file can point the run at another cluster, and the
             # out-of-band checks must read the cluster the CPI is writing to.
-            verifier = _pve_verify.PVEVerifier(_lifecycle_foreign.verifier_config(_base_cfg, DEFAULT_CONTEXT))
+            verifier = _pve_verify.PVEVerifier(_lifecycle_foreign.verifier_config(_verify_base_cfg, DEFAULT_CONTEXT))
         foreign_verifier = None
         if FOREIGN_VM_TEST == "on":
             # Built before anything is created, so a context that cannot reach
             # the second cluster fails the run before it touches either one.
             foreign_verifier = _pve_verify.PVEVerifier(
-                _lifecycle_foreign.verifier_config(_base_cfg, FOREIGN_CONTEXT)
+                _lifecycle_foreign.verifier_config(_verify_base_cfg, FOREIGN_CONTEXT)
             )
             _lifecycle_foreign.preflight(foreign_verifier)
         placement = None

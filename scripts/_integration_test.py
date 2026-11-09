@@ -266,7 +266,7 @@ class TestDiskStorageTypes(unittest.TestCase):
         ]
         cfg = self._cfg({"disk_storage_types": ["rbd"]})
         with unittest.mock.patch.object(
-            _integration, "build_cpi_config", return_value={}
+            _integration, "harness_pve_config", return_value={}
         ), unittest.mock.patch.object(
             _integration, "fetch_storage_index", return_value=entries
         ):
@@ -279,7 +279,7 @@ class TestDiskStorageTypes(unittest.TestCase):
         ]
         cfg = self._cfg({})
         with unittest.mock.patch.object(
-            _integration, "build_cpi_config", return_value={}
+            _integration, "harness_pve_config", return_value={}
         ), unittest.mock.patch.object(
             _integration, "fetch_storage_index", return_value=entries
         ):
@@ -814,7 +814,6 @@ class TestBuildCpiConfigEndpoints(unittest.TestCase):
             endpoints_out="- pve.example.com\n- pve2.example.com:8007",
         )
         self.assertEqual(built["endpoints"], ["pve.example.com", "pve2.example.com:8007"])
-        self.assertEqual(built["host"], "pve.example.com")
 
     def test_ipv6_with_port_entry_survives(self):
         built = self._build(
@@ -830,9 +829,34 @@ class TestBuildCpiConfigEndpoints(unittest.TestCase):
         built = self._build("pve_endpoints: ~\n", endpoints_out="null")
         self.assertNotIn("endpoints", built)
 
-    def test_dry_run_omits_endpoints_without_reading_the_variable(self):
-        built = self._build("pve_endpoints: [a]\n", endpoints_out="- a", dry_run=True)
+    def test_dry_run_reads_the_list_from_the_file_without_running_bosh(self):
+        built = self._build("pve_endpoints: [a, 'b:8007']\n", dry_run=True)
+        self.assertEqual(built["endpoints"], ["a", "b:8007"])
+        self.assertNotIn("host", built)
+        paths = [call.args[1] for call in self.stub.call_args_list]
+        self.assertNotIn("/pve_endpoints", paths)
+
+    def test_dry_run_without_the_variable_has_no_endpoints(self):
+        built = self._build("pve_host: pve.example.com\n", dry_run=True)
         self.assertNotIn("endpoints", built)
+        self.assertEqual(built["host"], "pve.example.com")
+
+    def test_dry_run_rejects_a_malformed_list(self):
+        with self.assertRaisesRegex(ValueError, "must be a list"):
+            self._build("pve_endpoints: not-a-list\n", dry_run=True)
+
+    def test_dry_run_rejects_a_non_string_entry(self):
+        with self.assertRaisesRegex(ValueError, r"pve_endpoints\[1\].*non-empty string"):
+            self._build("pve_endpoints: [a, 8006]\n", dry_run=True)
+
+    def test_dry_run_with_an_unreadable_vars_file_has_no_endpoints(self):
+        cfg = {"bosh_vars": str(Path(self._tmp.name) / "missing.yml"), "tier1": {"vmid_range_start": 100}}
+        with unittest.mock.patch.object(_integration, "bosh_int", return_value="8006"):
+            self.assertNotIn("endpoints", _integration.build_cpi_config(cfg, dry_run=True))
+
+    def test_dry_run_with_unparseable_vars_file_exits(self):
+        with self.assertRaises(SystemExit):
+            self._build("pve_endpoints: [unclosed\n", dry_run=True)
 
     def test_scalar_value_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "must be a list"):
@@ -857,6 +881,94 @@ class TestBuildCpiConfigEndpoints(unittest.TestCase):
     def test_optional_read_returns_none_for_non_mapping_file(self):
         self._vars.write_text("- just\n- a list\n", encoding="utf-8")
         self.assertIsNone(_integration.bosh_int_optional(self._vars, "/pve_endpoints"))
+
+    def test_set_list_leaves_host_and_port_out_of_the_cpi_config(self):
+        built = self._build("pve_endpoints: x\n", endpoints_out="- pve.example.com")
+        self.assertNotIn("host", built)
+        self.assertNotIn("port", built)
+        self.assertEqual(built["user"], "root@pam")
+
+    def test_list_led_by_a_dead_endpoint_keeps_the_real_host_for_harness_reads(self):
+        vars_yaml = "pve_endpoints: x\n"
+        dead_first = "- 192.0.2.1\n- pve.example.com:8007"
+        built = self._build(vars_yaml, endpoints_out=dead_first)
+        self.assertEqual(built["endpoints"], ["192.0.2.1", "pve.example.com:8007"])
+        self.assertNotIn("host", built)
+        self.assertNotIn("port", built)
+        self.assertEqual(json.loads(json.dumps(built)).get("host"), None)
+
+        cfg = {"bosh_vars": str(self._vars), "tier1": {"vmid_range_start": 100}}
+        answers = dict(self._REQUIRED, **{"/pve_endpoints": dead_first, "/pve_port": "8007"})
+        with unittest.mock.patch.object(
+            _integration, "bosh_int", side_effect=lambda file, path, dry_run=False: answers[path]
+        ):
+            harness = _integration.harness_pve_config(cfg)
+            self.assertEqual(_integration.harness_pve_endpoint(cfg), ("pve.example.com", 8007))
+            seen = []
+            with unittest.mock.patch.object(
+                _integration, "pve_api_get", side_effect=lambda conf, path, **kw: seen.append(dict(conf)) or []
+            ):
+                _integration.fetch_storage_index(harness)
+        self.assertEqual(harness["host"], "pve.example.com")
+        self.assertEqual(harness["port"], 8007)
+        self.assertEqual(harness["endpoints"], ["192.0.2.1", "pve.example.com:8007"])
+        self.assertEqual(seen[0]["host"], "pve.example.com")
+
+    def test_unset_variable_harness_config_equals_the_cpi_config(self):
+        self._vars.write_text("pve_host: pve.example.com\n", encoding="utf-8")
+        cfg = {"bosh_vars": str(self._vars), "tier1": {"vmid_range_start": 100}}
+        with unittest.mock.patch.object(
+            _integration, "bosh_int", side_effect=lambda file, path, dry_run=False: self._REQUIRED[path]
+        ):
+            self.assertEqual(_integration.harness_pve_config(cfg), _integration.build_cpi_config(cfg))
+
+    def test_harness_endpoint_rejects_a_non_integer_port(self):
+        self._vars.write_text("pve_host: x\n", encoding="utf-8")
+        cfg = {"bosh_vars": str(self._vars), "tier1": {"vmid_range_start": 100}}
+        answers = dict(self._REQUIRED, **{"/pve_port": "abc"})
+        with unittest.mock.patch.object(
+            _integration, "bosh_int", side_effect=lambda file, path, dry_run=False: answers[path]
+        ):
+            with self.assertRaisesRegex(ValueError, "not a valid integer"):
+                _integration.harness_pve_endpoint(cfg)
+
+    def test_tier1_env_hands_the_lifecycle_the_harness_host_when_a_list_is_set(self):
+        self._vars.write_text("pve_endpoints: x\n", encoding="utf-8")
+        answers = dict(self._REQUIRED, **{"/pve_endpoints": "- 192.0.2.1\n- pve.example.com", "/pve_port": "8007"})
+        env = self._tier1_env(answers)
+        self.assertEqual(env["PVE_HARNESS_HOST"], "pve.example.com")
+        self.assertEqual(env["PVE_HARNESS_PORT"], "8007")
+
+    def test_tier1_env_is_unchanged_when_no_list_is_set(self):
+        self._vars.write_text("pve_host: pve.example.com\n", encoding="utf-8")
+        env = self._tier1_env(dict(self._REQUIRED))
+        self.assertNotIn("PVE_HARNESS_HOST", env)
+        self.assertNotIn("PVE_HARNESS_PORT", env)
+
+    def _tier1_env(self, answers: dict) -> dict:
+        tier1 = {
+            "vmid_range_start": 100, "network_ip": "10.0.0.5", "network_range": "10.0.0.0/24",
+            "network_gateway": "10.0.0.1", "network_bridge": "vmbr0", "vm_cores": 2,
+            "vm_memory_mib": 1024, "disk_size_mib": 4096, "stemcell_path": "/tmp/stemcell.tgz",
+        }
+        cfg = {"bosh_vars": str(self._vars), "tier1": tier1}
+        with unittest.mock.patch.object(
+            _integration, "bosh_int", side_effect=lambda file, path, dry_run=False: answers[path]
+        ):
+            return _integration.tier1_env(cfg, "/tmp/cpi.json")
+
+    def test_real_bosh_list_output_parses_with_quoted_ipv6_and_host_port_entries(self):
+        captured = (
+            "- 192.0.2.1\n"
+            "- pve2.example.com:8007\n"
+            "- '[2001:db8::1]:8006'\n"
+            "- 2001:db8::2\n"
+            "- 10.0.0.9"
+        )
+        self.assertEqual(
+            _integration.parse_endpoints(captured, "vars.yml"),
+            ["192.0.2.1", "pve2.example.com:8007", "[2001:db8::1]:8006", "2001:db8::2", "10.0.0.9"],
+        )
 
 
 class TestCfScripts_AdminPassword_UsesDirectorName(unittest.TestCase):

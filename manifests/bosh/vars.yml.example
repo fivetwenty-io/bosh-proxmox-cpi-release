@@ -4,6 +4,13 @@
 # --- PVE target -----------------------------------------------------------
 pve_host:            pve.example.com
 pve_port:            8006
+# Optional: an ordered list of PVE endpoints the CPI fails over across. When it
+# is set, the harness leaves host and port out of the CPI config, so the first
+# entry may be a dead address on purpose. The harness's own PVE reads keep using
+# pve_host and pve_port above, so those must name the real host.
+# pve_endpoints:
+#   - 192.0.2.1
+#   - pve.example.com:8006
 pve_user:            root@pam
 pve_password:        REPLACE_ME
 # Optional: API token alternative to password auth. Provide exactly one of
