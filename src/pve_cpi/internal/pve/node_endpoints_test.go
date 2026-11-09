@@ -17,6 +17,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 )
 
 func TestClusterNodeAddressMap_DecodesNameAndIP(t *testing.T) {
@@ -368,5 +369,114 @@ func TestIsTLSCertVerificationFailure(t *testing.T) {
 		if got := pve.IsTLSCertVerificationFailure(tc.err); got != tc.want {
 			t.Errorf("%s: IsTLSCertVerificationFailure = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// uploadFallbackFaults are the routed-upload faults the fallback predicates are
+// pinned against. The first group is what a client without the endpoint wrapper
+// produces, so an unmarked error must keep the answer it has always had.
+func uploadFallbackFaults() []struct {
+	name string
+	err  error
+	want bool
+} {
+	refused := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+	cert := &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}
+	read := &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}
+	record := &url.Error{Op: "Post", URL: "https://10.0.0.13:22/x",
+		Err: tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}}
+	alert := &url.Error{Op: "Post", URL: "https://10.0.0.13:8006/x", Err: tls.AlertError(40)}
+	tlsText := errors.New("request failed: tls: handshake failure")
+	return []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"refused dial", fmt.Errorf("Post: %w", refused), true},
+		{"certificate failure", fmt.Errorf("Post: %w", cert), true},
+		{"read error", fmt.Errorf("Post: %w", read), true},
+		{"record header error", fmt.Errorf("Post: %w", record), true},
+		{"alert error", fmt.Errorf("Post: %w", alert), true},
+		{"tls text error", fmt.Errorf("Post: %w", tlsText), true},
+		{"mid-request EOF", fmt.Errorf("upload: %w", io.EOF), false},
+		{"unrelated", errors.New("boom"), false},
+		{"nil", nil, false},
+	}
+}
+
+func TestIsRoutedUploadFallbackEligible_UnmarkedErrorsKeepTheirAnswer(t *testing.T) {
+	t.Parallel()
+	for _, tc := range uploadFallbackFaults() {
+		if got := pve.IsRoutedUploadFallbackEligible(tc.err); got != tc.want {
+			t.Errorf("%s: IsRoutedUploadFallbackEligible = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestIsRoutedUploadFallbackEligible_MaybeSentNarrowsTheAmbiguousArms verifies
+// the read arm and the "tls:" text arm return false for an error the endpoint
+// wrapper marked as possibly sent, while a refused dial, a certificate failure,
+// a record-header error, and an alert error keep their answer.
+func TestIsRoutedUploadFallbackEligible_MaybeSentNarrowsTheAmbiguousArms(t *testing.T) {
+	t.Parallel()
+	want := map[string]bool{
+		"refused dial":        true,
+		"certificate failure": true,
+		"read error":          false,
+		"record header error": true,
+		"alert error":         true,
+		"tls text error":      false,
+	}
+	for _, tc := range uploadFallbackFaults() {
+		w, ok := want[tc.name]
+		if !ok {
+			continue
+		}
+		marked := &endpointpool.MaybeSentError{Err: tc.err}
+		if got := pve.IsRoutedUploadFallbackEligible(marked); got != w {
+			t.Errorf("%s (marked): IsRoutedUploadFallbackEligible = %v, want %v", tc.name, got, w)
+		}
+		wrapped := fmt.Errorf("request failed after 1 attempt(s): %w", marked)
+		if got := pve.IsRoutedUploadFallbackEligible(wrapped); got != w {
+			t.Errorf("%s (marked, wrapped): IsRoutedUploadFallbackEligible = %v, want %v", tc.name, got, w)
+		}
+	}
+}
+
+func TestIsRoutedHandshakeFailure_MaybeSentReadAndTLSTextArmsReturnFalse(t *testing.T) {
+	t.Parallel()
+	read := &endpointpool.MaybeSentError{Err: fmt.Errorf("Post: %w",
+		&net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")})}
+	if pve.IsRoutedHandshakeFailure(read) {
+		t.Error("a marked read-phase error must not be a handshake failure")
+	}
+	text := &endpointpool.MaybeSentError{Err: errors.New("request failed: tls: bad record MAC")}
+	if pve.IsRoutedHandshakeFailure(text) {
+		t.Error("a marked \"tls:\" text error must not be a handshake failure")
+	}
+	record := &endpointpool.MaybeSentError{Err: tls.RecordHeaderError{Msg: "not tls"}}
+	if !pve.IsRoutedHandshakeFailure(record) {
+		t.Error("a record-header error keeps its answer under the marker")
+	}
+}
+
+// TestIsRoutedUploadFallbackEligible_ConnectPhaseTag verifies a connect-phase
+// tagged error is one more positive signal, that a tagged error which also
+// carries the maybe-sent marker is not counted, and that a refused dial under
+// the marker still falls back.
+func TestIsRoutedUploadFallbackEligible_ConnectPhaseTag(t *testing.T) {
+	t.Parallel()
+	tagged := &endpointpool.ConnectPhaseError{Phase: endpointpool.PhasePin, Endpoint: "10.0.0.2:8006",
+		Err: errors.New("certificate does not match the pin")}
+	if !pve.IsRoutedUploadFallbackEligible(fmt.Errorf("Post: %w", tagged)) {
+		t.Error("a connect-phase tagged error must be fallback-eligible")
+	}
+	if pve.IsRoutedUploadFallbackEligible(&endpointpool.MaybeSentError{Err: tagged}) {
+		t.Error("a maybe-sent marker must not be overridden by a connect-phase tag")
+	}
+	refused := &endpointpool.ConnectPhaseError{Phase: endpointpool.PhaseDial, Endpoint: "10.0.0.2:8006",
+		Err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}}
+	if !pve.IsRoutedUploadFallbackEligible(&endpointpool.MaybeSentError{Err: refused}) {
+		t.Error("a refused dial must still fall back under the marker")
 	}
 }

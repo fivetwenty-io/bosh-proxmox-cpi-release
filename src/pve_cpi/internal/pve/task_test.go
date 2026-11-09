@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 )
 
 // ---- mock task service ----
@@ -1414,5 +1416,69 @@ func TestAwaitTask_WithPollIntervalForTest_Zero(t *testing.T) {
 	// default is 2000 ms
 	if capturedOpts.IntervalMillis != 2000 {
 		t.Errorf("expected default IntervalMillis 2000 for zero opt, got %d", capturedOpts.IntervalMillis)
+	}
+}
+
+// TestAwaitTask_RoutedUploadHostAgreesWithUploadLoopPredicate pins that the
+// pinned poll and the upload loops in the agent and the stemcell handler answer
+// the same question. The poll returns a routed-upload fault at once exactly
+// when IsRoutedUploadFallbackEligible accepts it, and the error it returns
+// still satisfies that predicate, so the loop falls back on it. Every fault the
+// predicate rejects, including a read error or a "tls:" text error the endpoint
+// wrapper marked as possibly sent, is re-polled to the deadline, and the error
+// that then comes back is unresolved, which the loops do not fall back on.
+func TestAwaitTask_RoutedUploadHostAgreesWithUploadLoopPredicate(t *testing.T) {
+	t.Parallel()
+	read := &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
+	tlsText := &sdkerrors.ConnectionError{Host: "10.0.0.2", Port: 8006, Message: "failed to establish a connection",
+		Cause: errors.New("tls: bad record MAC")}
+	cases := []struct {
+		name     string
+		fault    error
+		eligible bool
+	}{
+		{"refused dial", dialRefused(), true},
+		{"unmarked read error", fmt.Errorf("failed to get task status: %w", read), true},
+		{"marked read error", &endpointpool.MaybeSentError{Err: fmt.Errorf("failed to get task status: %w", read)}, false},
+		{"unmarked tls text", tlsText, true},
+		{"marked tls text", &endpointpool.MaybeSentError{Err: tlsText}, false},
+		{"marked refused dial", &endpointpool.MaybeSentError{Err: dialRefused()}, true},
+		{"5xx", sdkerrors.ParseAPIError(500, []byte(`{"errors":"internal error"}`)), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			eligible := pve.IsRoutedUploadFallbackEligible(tc.fault)
+			if eligible != tc.eligible {
+				t.Fatalf("test fault eligibility = %v, want %v: %v", eligible, tc.eligible, tc.fault)
+			}
+			var calls atomic.Int32
+			svc := &mockTasksService{
+				waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+					calls.Add(1)
+					return nil, tc.fault
+				},
+			}
+			ctx := pve.UploadContext(context.Background(), "10.0.0.2")
+			err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:abc",
+				pve.WithMaxWait(time.Second), pve.WithPollIntervalForTest(time.Millisecond))
+			if err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			if got := pve.IsRoutedUploadFallbackEligible(err); got != eligible {
+				t.Errorf("IsRoutedUploadFallbackEligible on the poll's error = %v, want %v (the fault's own answer): %v",
+					got, eligible, err)
+			}
+			if eligible {
+				if calls.Load() != 1 {
+					t.Errorf("an eligible fault must return at once; Wait called %d times", calls.Load())
+				}
+				return
+			}
+			if calls.Load() < 2 {
+				t.Errorf("a fault the loops do not act on must be re-polled; Wait called %d times", calls.Load())
+			}
+			requireUnresolvedPoll(t, err)
+		})
 	}
 }

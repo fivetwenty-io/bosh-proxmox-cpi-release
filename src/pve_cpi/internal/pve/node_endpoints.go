@@ -12,6 +12,7 @@ import (
 	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 )
 
 // NodeEndpointResolver resolves the pveproxy address to dial for a node-scoped
@@ -313,6 +314,10 @@ func IsDirectDialFailure(err error) bool {
 // client.go's buildTransportOpts). Ambiguity therefore resolves toward
 // fallback here, deliberately more aggressively than IsDirectDialFailure.
 //
+// An error that carries endpointpool.MaybeSentError makes the read arm and the
+// "tls:" text arm return false, because the request may have started; the
+// record-header and alert arms are unchanged.
+//
 // nil → false.
 func IsRoutedHandshakeFailure(err error) bool {
 	if err == nil {
@@ -326,9 +331,17 @@ func IsRoutedHandshakeFailure(err error) bool {
 	if errors.As(err, &alertErr) {
 		return true
 	}
+	// The two arms below are ambiguous about whether the request left. When
+	// the endpoint wrapper is installed it marks every routed error that is
+	// not a connect-phase failure with endpointpool.MaybeSentError, and a
+	// marked error may be a connection dropped after the upload's body
+	// started, so neither arm may send it to the proxied path, which would
+	// upload the same bytes a second time. A client without the wrapper never
+	// produces the marker, and these arms behave as they always have.
+	maybeSent := endpointpool.IsMaybeSent(err)
 	var opErr *net.OpError
 	if errors.As(err, &opErr) && opErr.Op == "read" {
-		return true
+		return !maybeSent
 	}
 	// Textual safety net for TLS handshake failures the SDK's transport
 	// re-wraps into a shape errors.As cannot see through (e.g. a
@@ -336,18 +349,22 @@ func IsRoutedHandshakeFailure(err error) bool {
 	// type). Every crypto/tls error message is "tls: ..."-prefixed; a false
 	// positive here still only widens the fallback-eligible set at the same
 	// bounded call sites described above.
-	return strings.Contains(strings.ToLower(err.Error()), "tls:")
+	return !maybeSent && strings.Contains(strings.ToLower(err.Error()), "tls:")
 }
 
 // IsRoutedUploadFallbackEligible reports whether err, observed on a
 // direct-to-node upload dial, should fall back to the configured (proxied)
 // endpoint: the OR of IsTLSCertVerificationFailure, IsDirectDialFailure, and
-// IsRoutedHandshakeFailure. Upload call sites already gate on
+// IsRoutedHandshakeFailure, plus an error that carries the endpoint wrapper's
+// connect-phase tag, which proves the request never left; a marked error that
+// also carries the tag is not counted, because a maybe-sent marker is never
+// proof. Upload call sites already gate on
 // directHost != "" (equivalently, UploadHostFromContext(ctx) != "") before
 // calling this, so it is deliberately not context-aware itself. Extracted
 // as one call so each fallback site's own control flow — reopening the
 // upload un-pinned, memoizing the route as failed — stays the readable part
 // of the function.
 func IsRoutedUploadFallbackEligible(err error) bool {
-	return IsTLSCertVerificationFailure(err) || IsDirectDialFailure(err) || IsRoutedHandshakeFailure(err)
+	return IsTLSCertVerificationFailure(err) || IsDirectDialFailure(err) || IsRoutedHandshakeFailure(err) ||
+		(endpointpool.IsConnectPhase(err) && !endpointpool.IsMaybeSent(err))
 }
