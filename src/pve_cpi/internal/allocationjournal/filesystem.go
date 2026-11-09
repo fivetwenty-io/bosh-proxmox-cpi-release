@@ -125,9 +125,6 @@ func openPrivateRoot(path string) (*os.Root, error) { return privateFiles.OpenRo
 func openPrivate(r *os.Root, name string, flags int) (*os.File, error) {
 	return privateFiles.Open(r, name, flags)
 }
-func openPrivateWith(r *os.Root, name string, flags int, open func(int, string, int) (int, error)) (*os.File, error) {
-	return privateFiles.OpenWith(r, name, flags, open)
-}
 
 func readJSON(r *os.Root, name string, out any) error {
 	env, err := readEnvelope(r, name)

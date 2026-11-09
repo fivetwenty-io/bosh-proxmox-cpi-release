@@ -77,28 +77,42 @@ func StrictDecode(data []byte, out any) error {
 // this many losses the Changed error is returned to the caller unchanged.
 const ReadRetries = 3
 
-// ReadEnvelope opens name under the private-file rules, reads it within the
-// size limit, and decodes the outer envelope without judging its version, so
-// a caller whose file versions on its own schedule can tell a newer file
-// from a damaged one before it decides what to do.
-func (p Policy) ReadEnvelope(r *os.Root, name string) (Envelope, error) {
-	if err := p.check(); err != nil {
-		return Envelope{}, err
+// ReadFile opens name under the private-file rules and returns its bytes. A
+// file longer than limit is refused as corrupt, and a file replaced during the
+// open is reopened up to ReadRetries times before the Changed error comes back.
+func (p Policy) ReadFile(r *os.Root, name string, limit int) ([]byte, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("%s: size limit not set", p.label())
 	}
 	f, err := p.Open(r, name, os.O_RDONLY)
 	for attempt := 0; attempt < ReadRetries && errors.Is(err, p.changed()); attempt++ {
 		f, err = p.Open(r, name, os.O_RDONLY)
 	}
 	if err != nil {
-		return Envelope{}, err
+		return nil, err
 	}
-	data, readErr := io.ReadAll(io.LimitReader(f, int64(p.MaxBytes)+1))
+	data, readErr := io.ReadAll(io.LimitReader(f, int64(limit)+1))
 	closeErr := f.Close()
 	if err := errors.Join(readErr, closeErr); err != nil {
+		return nil, err
+	}
+	if len(data) > limit {
+		return nil, fmt.Errorf("%w: oversized file", p.corrupt())
+	}
+	return data, nil
+}
+
+// ReadEnvelope reads name within the size limit and decodes the outer
+// envelope without judging its version, so a caller whose file versions on
+// its own schedule can tell a newer file from a damaged one before it decides
+// what to do.
+func (p Policy) ReadEnvelope(r *os.Root, name string) (Envelope, error) {
+	if err := p.check(); err != nil {
 		return Envelope{}, err
 	}
-	if len(data) > p.MaxBytes {
-		return Envelope{}, fmt.Errorf("%w: oversized file", p.corrupt())
+	data, err := p.ReadFile(r, name, p.MaxBytes)
+	if err != nil {
+		return Envelope{}, err
 	}
 	env, err := p.decodeWire(data)
 	if err != nil {
@@ -123,15 +137,11 @@ func (p Policy) DecodeEnvelope(env Envelope, version int, out any) error {
 }
 
 // WriteEnvelope marshals value into an envelope of the given version and
-// replaces name with it atomically: it writes a temporary file opened with
-// O_EXCL, syncs it, renames it over name, and syncs the directory, each
-// through ops. A failure may follow a committed rename, so a caller that
-// needs durability treats any error as an unknown outcome.
-func (p Policy) WriteEnvelope(r *os.Root, name string, version int, value any, ops Ops) (retErr error) {
+// replaces name with it through WriteFile.
+func (p Policy) WriteEnvelope(r *os.Root, name string, version int, value any, ops Ops) error {
 	if err := p.check(); err != nil {
 		return err
 	}
-	ops = ops.withDefaults()
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return err
@@ -140,6 +150,23 @@ func (p Policy) WriteEnvelope(r *os.Root, name string, version int, value any, o
 	if err != nil {
 		return err
 	}
+	return p.WriteFile(r, name, data, ops)
+}
+
+// TempPrefix starts the name of the temporary file WriteFile creates, so a
+// sweep can recognize the leftovers of a write that was cut short.
+const TempPrefix = ".tmp-"
+
+// WriteFile replaces name with data atomically: it writes a temporary file
+// opened with O_EXCL, syncs it, renames it over name, and syncs the
+// directory, each through ops. Data longer than MaxBytes is refused. A failure
+// may follow a committed rename, so a caller that needs durability treats any
+// error as an unknown outcome.
+func (p Policy) WriteFile(r *os.Root, name string, data []byte, ops Ops) (retErr error) {
+	if err := p.checkSize(); err != nil {
+		return err
+	}
+	ops = ops.withDefaults()
 	if len(data) > p.MaxBytes {
 		return fmt.Errorf("%s: record exceeds size limit", p.label())
 	}
@@ -154,7 +181,7 @@ func (p Policy) WriteEnvelope(r *os.Root, name string, version int, value any, o
 	if err != nil {
 		return err
 	}
-	temp := ".tmp-" + id
+	temp := TempPrefix + id
 	f, err := p.Open(r, temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
 	if err != nil {
 		return err

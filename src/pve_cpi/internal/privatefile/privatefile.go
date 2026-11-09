@@ -63,8 +63,9 @@ type Policy struct {
 	// absolute". An empty label reads "private file".
 	Label string
 	// Ownership, Mode, and FileType are the causes an UnsafePathError carries.
-	// A nil one uses the package's own error of the same name, and a caller's
-	// must match it under errors.Is, which Sentinel guarantees.
+	// A nil one uses the package's own error of the same name. A caller's should
+	// match it under errors.Is, which Sentinel guarantees, and one that does not
+	// is joined with it when PrivateInfo reports it.
 	Ownership, Mode, FileType error
 	// Changed is wrapped around the error for a file replaced during an open,
 	// and a read retries on it. Nil uses ErrChanged.
@@ -87,11 +88,20 @@ type Policy struct {
 
 var integrityKeyPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
+// checkSize refuses a Policy with no size limit.
+func (p Policy) checkSize() error {
+	if p.MaxBytes <= 0 {
+		return fmt.Errorf("%s: size limit not set", p.label())
+	}
+	return nil
+}
+
 // check refuses a Policy that cannot read or write an envelope.
 func (p Policy) check() error {
+	if err := p.checkSize(); err != nil {
+		return err
+	}
 	switch {
-	case p.MaxBytes <= 0:
-		return fmt.Errorf("%s: size limit not set", p.label())
 	case p.Integrity == nil:
 		return fmt.Errorf("%s: integrity function not set", p.label())
 	case !integrityKeyPattern.MatchString(p.IntegrityKey) || p.IntegrityKey == "version" || p.IntegrityKey == "payload":
@@ -107,9 +117,9 @@ func (p Policy) label() string {
 	return p.Label
 }
 
-func (p Policy) ownership() error { return firstError(p.Ownership, ErrUnsafeOwnership) }
-func (p Policy) mode() error      { return firstError(p.Mode, ErrUnsafeMode) }
-func (p Policy) fileType() error  { return firstError(p.FileType, ErrUnsafeFileType) }
+func (p Policy) ownership() error { return matching(p.Ownership, ErrUnsafeOwnership) }
+func (p Policy) mode() error      { return matching(p.Mode, ErrUnsafeMode) }
+func (p Policy) fileType() error  { return matching(p.FileType, ErrUnsafeFileType) }
 func (p Policy) changed() error   { return firstError(p.Changed, ErrChanged) }
 func (p Policy) corrupt() error   { return firstError(p.Corrupt, ErrCorrupt) }
 
@@ -122,6 +132,27 @@ func (p Policy) newID() (string, error) {
 		return "", fmt.Errorf("%s: generate temporary name: %w", p.label(), err)
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+// joined prints cause's text and matches both cause and base under errors.Is.
+type joined struct {
+	cause, base error
+}
+
+func (j *joined) Error() string   { return j.cause.Error() }
+func (j *joined) Unwrap() []error { return []error{j.cause, j.base} }
+
+// matching returns cause, or base when cause is nil. A cause that does not
+// already match base under errors.Is is joined with it, so a Policy built
+// without Sentinel is still classified correctly and keeps its own wording.
+func matching(cause, base error) error {
+	switch {
+	case cause == nil:
+		return base
+	case errors.Is(cause, base):
+		return cause
+	}
+	return &joined{cause: cause, base: base}
 }
 
 func firstError(a, b error) error {

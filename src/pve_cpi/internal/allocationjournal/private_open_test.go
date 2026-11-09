@@ -40,7 +40,7 @@ func TestPrivateOpenRejectsReplacementBeforeTruncation(t *testing.T) {
 		if err := j.root.WriteFile("replacement", []byte("preserve"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		f, err := openPrivateWith(j.root, "old", os.O_WRONLY|os.O_TRUNC, func(fd int, name string, flags int) (int, error) {
+		f, err := privateFiles.OpenWith(j.root, "old", os.O_WRONLY|os.O_TRUNC, func(fd int, name string, flags int) (int, error) {
 			if replacementSymlink {
 				if err := j.root.Remove("old"); err != nil {
 					return -1, err

@@ -56,7 +56,7 @@ func TestKeyedEnvelopeRoundTrip(t *testing.T) {
 	p := keyedPolicy([]byte("k1"), 1<<16)
 	root, dir := privateRoot(t, p)
 	want := sample{Name: "pve1", Count: 3}
-	if err := p.WriteEnvelope(root, "entry.json", 7, want, DefaultOps(false)); err != nil {
+	if err := p.WriteEnvelope(root, "entry.json", 7, want, NoSyncOps()); err != nil {
 		t.Fatalf("WriteEnvelope: %v", err)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "entry.json"))
@@ -90,7 +90,7 @@ func TestKeyedEnvelopeRoundTrip(t *testing.T) {
 func TestKeyedEnvelopeRejectsWrongKeyVersionAndTamper(t *testing.T) {
 	p := keyedPolicy([]byte("k1"), 1<<16)
 	root, dir := privateRoot(t, p)
-	if err := p.WriteEnvelope(root, "entry.json", 1, sample{Name: "a"}, DefaultOps(false)); err != nil {
+	if err := p.WriteEnvelope(root, "entry.json", 1, sample{Name: "a"}, NoSyncOps()); err != nil {
 		t.Fatal(err)
 	}
 	env, err := p.ReadEnvelope(root, "entry.json")
@@ -141,11 +141,11 @@ func TestKeyedEnvelopeRejectsWrongKeyVersionAndTamper(t *testing.T) {
 func TestSizeParameterBoundsReadAndWrite(t *testing.T) {
 	small := plainPolicy(128)
 	root, dir := privateRoot(t, small)
-	if err := small.WriteEnvelope(root, "ok.json", 1, sample{Name: "x"}, DefaultOps(false)); err != nil {
+	if err := small.WriteEnvelope(root, "ok.json", 1, sample{Name: "x"}, NoSyncOps()); err != nil {
 		t.Fatalf("a record under the limit: %v", err)
 	}
 	big := sample{Name: strings.Repeat("n", 200)}
-	err := small.WriteEnvelope(root, "big.json", 1, big, DefaultOps(false))
+	err := small.WriteEnvelope(root, "big.json", 1, big, NoSyncOps())
 	if err == nil || err.Error() != "private file: record exceeds size limit" {
 		t.Fatalf("oversized write = %v; want the size error", err)
 	}
@@ -155,7 +155,7 @@ func TestSizeParameterBoundsReadAndWrite(t *testing.T) {
 	// The same record fits under a larger limit, and the smaller limit then
 	// refuses to read it.
 	large := plainPolicy(1 << 12)
-	if err := large.WriteEnvelope(root, "big.json", 1, big, DefaultOps(false)); err != nil {
+	if err := large.WriteEnvelope(root, "big.json", 1, big, NoSyncOps()); err != nil {
 		t.Fatalf("a record under the larger limit: %v", err)
 	}
 	if _, err := small.ReadEnvelope(root, "big.json"); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "oversized file") {
@@ -177,7 +177,7 @@ func TestPolicyMustBeComplete(t *testing.T) {
 	root, _ := privateRoot(t, plainPolicy(10))
 	for name, p := range cases {
 		t.Run(name, func(t *testing.T) {
-			if err := p.WriteEnvelope(root, "x.json", 1, 1, DefaultOps(false)); err == nil {
+			if err := p.WriteEnvelope(root, "x.json", 1, 1, NoSyncOps()); err == nil {
 				t.Error("WriteEnvelope accepted the policy")
 			}
 			if _, err := p.ReadEnvelope(root, "x.json"); err == nil {
@@ -206,22 +206,25 @@ func TestDurabilityFlagControlsSyncs(t *testing.T) {
 	if err := closedRoot.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := DefaultOps(true).SyncFile(closed); err == nil {
+	if err := DefaultOps().SyncFile(closed); err == nil {
 		t.Error("a durable file sync on a closed file reported success, so it did not reach the file")
 	}
-	if err := DefaultOps(true).SyncDir(closedRoot); err == nil {
+	if err := DefaultOps().SyncDir(closedRoot); err == nil {
 		t.Error("a durable directory sync on a closed root reported success, so it did not reach the directory")
 	}
-	if err := DefaultOps(false).SyncFile(closed); err != nil {
+	if err := NoSyncOps().SyncFile(closed); err != nil {
 		t.Errorf("a non-durable file sync = %v; want a no-op", err)
 	}
-	if err := DefaultOps(false).SyncDir(closedRoot); err != nil {
+	if err := NoSyncOps().SyncDir(closedRoot); err != nil {
 		t.Errorf("a non-durable directory sync = %v; want a no-op", err)
 	}
 
 	p := plainPolicy(1 << 10)
 	for _, durable := range []bool{true, false} {
-		ops := DefaultOps(durable)
+		ops := NoSyncOps()
+		if durable {
+			ops = DefaultOps()
+		}
 		fileSyncs, dirSyncs := 0, 0
 		inner := ops
 		ops.SyncFile = func(f *os.File) error { fileSyncs++; return inner.SyncFile(f) }
@@ -247,7 +250,7 @@ func TestWriteEnvelopeFailuresLeaveNoTempFile(t *testing.T) {
 	}
 	for name, inject := range cases {
 		t.Run(name, func(t *testing.T) {
-			ops := DefaultOps(false)
+			ops := NoSyncOps()
 			inject(&ops)
 			if err := p.WriteEnvelope(root, "f.json", 1, sample{}, ops); err == nil {
 				t.Fatal("WriteEnvelope succeeded")
@@ -260,12 +263,12 @@ func TestWriteEnvelopeFailuresLeaveNoTempFile(t *testing.T) {
 			}
 		})
 	}
-	dirSyncErr := DefaultOps(false)
+	dirSyncErr := NoSyncOps()
 	dirSyncErr.SyncDir = func(*os.Root) error { return boom }
 	if err := p.WriteEnvelope(root, "f.json", 1, sample{}, dirSyncErr); !errors.Is(err, boom) {
 		t.Fatalf("directory sync failure = %v; want the injected error", err)
 	}
-	if err := p.WriteEnvelope(root, "g.json", 1, make(chan int), DefaultOps(false)); err == nil {
+	if err := p.WriteEnvelope(root, "g.json", 1, make(chan int), NoSyncOps()); err == nil {
 		t.Fatal("an unmarshalable value was written")
 	}
 }
@@ -422,7 +425,7 @@ func TestPrivateInfoPrecedenceAndText(t *testing.T) {
 func TestOpenWithUsesTheSuppliedOpenat(t *testing.T) {
 	p := plainPolicy(1 << 10)
 	root, _ := privateRoot(t, p)
-	if err := p.WriteEnvelope(root, "r.json", 1, sample{Name: "a"}, DefaultOps(false)); err != nil {
+	if err := p.WriteEnvelope(root, "r.json", 1, sample{Name: "a"}, NoSyncOps()); err != nil {
 		t.Fatal(err)
 	}
 	calls := 0
@@ -498,10 +501,217 @@ func TestNewIDDefaultsAndOverride(t *testing.T) {
 	}
 	p.NewID = func() (string, error) { return "", io.ErrUnexpectedEOF }
 	root, dir := privateRoot(t, p)
-	if err := p.WriteEnvelope(root, "x.json", 1, sample{}, DefaultOps(false)); !errors.Is(err, io.ErrUnexpectedEOF) {
+	if err := p.WriteEnvelope(root, "x.json", 1, sample{}, NoSyncOps()); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("WriteEnvelope with a failing id source = %v", err)
 	}
 	if left, _ := filepath.Glob(filepath.Join(dir, "*")); len(left) != 0 {
 		t.Fatalf("files left behind: %v", left)
+	}
+}
+
+func TestWriteFileAndReadFileRoundTripRawBytes(t *testing.T) {
+	p := Policy{Label: "secret", MaxBytes: 32}
+	root, dir := privateRoot(t, p)
+	want := []byte("0123456789abcdef0123456789abcdef")
+	var steps []string
+	ops := NoSyncOps()
+	ops.Write = func(f *os.File, b []byte) (int, error) { steps = append(steps, "write"); return f.Write(b) }
+	ops.SyncFile = func(*os.File) error { steps = append(steps, "syncFile"); return nil }
+	ops.Rename = func(r *os.Root, a, b string) error {
+		if !strings.HasPrefix(a, TempPrefix) || b != "secret" {
+			t.Errorf("rename %q to %q; want a %q file onto secret", a, b, TempPrefix)
+		}
+		steps = append(steps, "rename")
+		return r.Rename(a, b)
+	}
+	ops.SyncDir = func(*os.Root) error { steps = append(steps, "syncDir"); return nil }
+	if err := p.WriteFile(root, "secret", want, ops); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if got := strings.Join(steps, ","); got != "write,syncFile,rename,syncDir" {
+		t.Fatalf("steps = %s; want write, syncFile, rename, syncDir", got)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "secret"))
+	if err != nil || string(raw) != string(want) {
+		t.Fatalf("file = %q, %v; want the exact bytes with no envelope", raw, err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, TempPrefix+"*")); len(left) != 0 {
+		t.Fatalf("temporary files left behind: %v", left)
+	}
+	got, err := p.ReadFile(root, "secret", 32)
+	if err != nil || string(got) != string(want) {
+		t.Fatalf("ReadFile = %q, %v; want %q", got, err, want)
+	}
+	// A second write replaces the first.
+	if err := p.WriteFile(root, "secret", []byte("short"), NoSyncOps()); err != nil {
+		t.Fatalf("replacing WriteFile: %v", err)
+	}
+	if got, err := p.ReadFile(root, "secret", 32); err != nil || string(got) != "short" {
+		t.Fatalf("ReadFile after replace = %q, %v", got, err)
+	}
+}
+
+func TestWriteFileRefusals(t *testing.T) {
+	p := Policy{MaxBytes: 8}
+	root, dir := privateRoot(t, p)
+	if err := p.WriteFile(root, "big", []byte("123456789"), NoSyncOps()); err == nil || err.Error() != "private file: record exceeds size limit" {
+		t.Fatalf("oversized WriteFile = %v; want the size error", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "big")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("oversized WriteFile left a file: %v", err)
+	}
+	if err := (Policy{}).WriteFile(root, "x", []byte("a"), NoSyncOps()); err == nil || !strings.Contains(err.Error(), "size limit not set") {
+		t.Fatalf("WriteFile with no size limit = %v", err)
+	}
+	if err := p.WriteFile(root, "../x", []byte("a"), NoSyncOps()); err == nil {
+		t.Fatal("WriteFile accepted a name outside the root")
+	}
+	open := filepath.Join(dir, "open")
+	if err := os.WriteFile(open, []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(open, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.WriteFile(root, "open", []byte("b"), NoSyncOps()); !errors.Is(err, ErrUnsafeMode) {
+		t.Fatalf("WriteFile over an open file = %v; want ErrUnsafeMode", err)
+	}
+	if raw, _ := os.ReadFile(open); string(raw) != "a" {
+		t.Fatalf("refused WriteFile changed the file to %q", raw)
+	}
+	boom := errors.New("injected")
+	for name, inject := range map[string]func(*Ops){
+		"short write": func(o *Ops) { o.Write = func(f *os.File, b []byte) (int, error) { return f.Write(b[:1]) } },
+		"file sync":   func(o *Ops) { o.SyncFile = func(*os.File) error { return boom } },
+		"rename":      func(o *Ops) { o.Rename = func(*os.Root, string, string) error { return boom } },
+	} {
+		ops := NoSyncOps()
+		inject(&ops)
+		if err := p.WriteFile(root, "f", []byte("ab"), ops); err == nil {
+			t.Fatalf("%s: WriteFile succeeded", name)
+		}
+		if left, _ := filepath.Glob(filepath.Join(dir, TempPrefix+"*")); len(left) != 0 {
+			t.Fatalf("%s: temporary files left behind: %v", name, left)
+		}
+	}
+}
+
+func TestReadFileRefusals(t *testing.T) {
+	p := Policy{Label: "secret", MaxBytes: 64}
+	root, dir := privateRoot(t, p)
+	if err := p.WriteFile(root, "s", []byte("0123456789"), NoSyncOps()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := p.ReadFile(root, "s", 10); err != nil || string(got) != "0123456789" {
+		t.Fatalf("ReadFile at exactly the limit = %q, %v", got, err)
+	}
+	if _, err := p.ReadFile(root, "s", 9); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "oversized file") {
+		t.Fatalf("ReadFile over the limit = %v; want ErrCorrupt oversized file", err)
+	}
+	if _, err := p.ReadFile(root, "s", 0); err == nil || !strings.Contains(err.Error(), "size limit not set") {
+		t.Fatalf("ReadFile with no limit = %v", err)
+	}
+	if _, err := p.ReadFile(root, "absent", 10); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ReadFile of an absent file = %v; want not exist", err)
+	}
+	if err := os.Chmod(filepath.Join(dir, "s"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.ReadFile(root, "s", 10); !errors.Is(err, ErrUnsafeMode) {
+		t.Fatalf("ReadFile of an open file = %v; want ErrUnsafeMode", err)
+	}
+}
+
+func TestPrivateInfoJoinsAPlainCauseWithTheBase(t *testing.T) {
+	own := uint32(os.Geteuid())
+	plain := errors.New("custom words")
+	p := Policy{Ownership: plain, Mode: plain, FileType: plain}
+	cases := []struct {
+		name     string
+		info     stubInfo
+		base     error
+		contains string
+	}{
+		{"ownership", stubInfo{0o600, &syscall.Stat_t{Uid: own + 1, Nlink: 1}}, ErrUnsafeOwnership, "is owned by uid"},
+		{"mode", stubInfo{0o640, &syscall.Stat_t{Uid: own, Nlink: 1}}, ErrUnsafeMode, "has mode 0640"},
+		{"file type", stubInfo{os.ModeDir | 0o700, &syscall.Stat_t{Uid: own, Nlink: 1}}, ErrUnsafeFileType, "is not a regular file"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := p.PrivateInfo("/p", tc.info, false)
+			var unsafe *UnsafePathError
+			if !errors.As(err, &unsafe) || !errors.Is(err, plain) || !errors.Is(err, tc.base) {
+				t.Fatalf("PrivateInfo = %v; want the plain cause and %v both matching", err, tc.base)
+			}
+			if !strings.HasPrefix(err.Error(), "custom words: /p ") {
+				t.Fatalf("PrivateInfo = %q; want the policy's own wording", err)
+			}
+			if !strings.Contains(err.Error(), tc.contains) {
+				t.Fatalf("PrivateInfo = %q; want %q", err, tc.contains)
+			}
+		})
+	}
+	// A cause that already matches the base is used as it is.
+	own1 := Sentinel("wording", ErrUnsafeMode)
+	var rewrapped *joined
+	if errors.As(matching(own1, ErrUnsafeMode), &rewrapped) {
+		t.Fatal("matching rewrapped a cause that already matches")
+	}
+}
+
+func TestReadRetriesAReplacedFileThenReturnsChanged(t *testing.T) {
+	changedErr := errors.New("replaced")
+	for name, tc := range map[string]struct {
+		policy  Policy
+		changed error
+	}{
+		"default cause": {plainPolicy(1 << 10), ErrChanged},
+		"policy cause":  {Policy{MaxBytes: 1 << 10, IntegrityKey: "sha256", Integrity: SHA256Hex, Changed: changedErr}, changedErr},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := tc.policy
+			root, dir := privateRoot(t, p)
+			if err := p.WriteEnvelope(root, "r.json", 1, sample{Name: "a"}, NoSyncOps()); err != nil {
+				t.Fatal(err)
+			}
+			valid, err := os.ReadFile(filepath.Join(dir, "r.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Each open finds the name replaced by a new inode after the lstat.
+			opens, replaceFor := 0, 0
+			prev := openat
+			t.Cleanup(func() { openat = prev })
+			openat = func(fd int, name string, flags int) (int, error) {
+				if name == "r.json" {
+					opens++
+					if opens <= replaceFor {
+						if err := root.WriteFile("swap", valid, 0o600); err != nil {
+							return -1, err
+						}
+						if err := root.Rename("swap", name); err != nil {
+							return -1, err
+						}
+					}
+				}
+				return prev(fd, name, flags)
+			}
+
+			replaceFor = 1 << 20
+			_, err = p.ReadEnvelope(root, "r.json")
+			if !errors.Is(err, tc.changed) || !strings.Contains(err.Error(), "private file changed during open") {
+				t.Fatalf("ReadEnvelope = %v; want the unchanged Changed error", err)
+			}
+			if opens != ReadRetries+1 {
+				t.Fatalf("opens = %d; want the first try plus %d retries", opens, ReadRetries)
+			}
+
+			// A reader that loses the race once reads the new file.
+			opens, replaceFor = 0, 1
+			env, err := p.ReadEnvelope(root, "r.json")
+			if err != nil || env.Version != 1 || opens != 2 {
+				t.Fatalf("ReadEnvelope after one loss = %+v, %v after %d opens; want success on the second", env, err, opens)
+			}
+		})
 	}
 }

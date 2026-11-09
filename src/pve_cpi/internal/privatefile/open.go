@@ -116,8 +116,12 @@ func (p Policy) OpenRoot(path string) (*os.Root, error) {
 // openat is intentional: os.Root.OpenFile resolves relative symlinks
 // itself on some platforms before applying O_NOFOLLOW to the final open.
 func (p Policy) Open(r *os.Root, name string, flags int) (*os.File, error) {
-	return p.OpenWith(r, name, flags, func(fd int, name string, flags int) (int, error) { return unix.Openat(fd, name, flags, 0o600) })
+	return p.OpenWith(r, name, flags, openat)
 }
+
+// openat is the native openat call Open performs. It is a variable only so a
+// test in this package can replace a file between the lstat and the open.
+var openat = func(fd int, name string, flags int) (int, error) { return unix.Openat(fd, name, flags, 0o600) }
 
 // OpenWith is Open with the openat call supplied by the caller, so a test can
 // observe or replace it.
