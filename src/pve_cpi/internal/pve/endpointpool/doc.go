@@ -19,8 +19,14 @@
 //     tether key is conflicted for the rest of the call.
 //   - WithSendBy, WithConfiguredOnly, and WithAffinityScope put the request
 //     markers and the per-call scope on a context.
+//   - Pool holds the ordered endpoints, the active endpoint and its
+//     generation, the in-process demotions, and the transports it owns. Every
+//     owned transport is a clone of the SDK's base transport that dials
+//     through the pool's own tagging dialer and speaks only HTTP/1.1, and a
+//     discovered endpoint's clones accept only a certificate its pin set, or
+//     under verify_ssl true its name, vouches for.
 //
-// The package imports only the standard library. It must never import
-// internal/pve, internal/endpointcache, or the handlers, so that every one of
-// those packages can import it.
+// The package imports only the standard library and the CPI's logger in
+// internal/log. It must never import internal/pve, internal/endpointcache, or
+// the handlers, so that every one of those packages can import it.
 package endpointpool

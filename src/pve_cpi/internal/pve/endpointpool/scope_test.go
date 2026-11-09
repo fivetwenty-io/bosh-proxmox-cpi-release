@@ -194,9 +194,15 @@ func TestScopeReleaseDropsPanicsAndRunsTheRest(t *testing.T) {
 	release() // already released, so nothing runs and nothing panics
 }
 
-// The package sits below everything that uses it, so it must import only the
-// standard library.
-func TestPackageImportsOnlyTheStandardLibrary(t *testing.T) {
+// The package sits below everything that uses it, so its production files
+// import only the standard library and the CPI's logger, and never
+// internal/pve, internal/endpointcache, or the handlers. Its tests may also
+// import the shared TLS test servers.
+func TestPackageImportsStayBelowThePVEPackage(t *testing.T) {
+	const (
+		logPkg  = "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+		testPkg = "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/pvetest"
+	)
 	files, err := filepath.Glob("*.go")
 	if err != nil || len(files) == 0 {
 		t.Fatalf("glob: %v, %d files", err, len(files))
@@ -207,14 +213,17 @@ func TestPackageImportsOnlyTheStandardLibrary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
+		isTest := strings.HasSuffix(name, "_test.go")
 		for _, imp := range f.Imports {
 			path, err := strconv.Unquote(imp.Path.Value)
 			if err != nil {
 				t.Fatalf("%s: bad import %s", name, imp.Path.Value)
 			}
-			if first, _, _ := strings.Cut(path, "/"); strings.Contains(first, ".") {
-				t.Errorf("%s imports %s, which is not in the standard library", name, path)
+			first, _, _ := strings.Cut(path, "/")
+			if !strings.Contains(first, ".") || path == logPkg || (isTest && path == testPkg) {
+				continue
 			}
+			t.Errorf("%s imports %s, which is outside the standard library and the allowed CPI packages", name, path)
 		}
 	}
 }

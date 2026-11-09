@@ -1,0 +1,434 @@
+package endpointpool
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+)
+
+// Kind says where an endpoint came from.
+type Kind int
+
+// The kinds of endpoint a pool holds.
+const (
+	// KindConfigured is an endpoint the operator listed. Its clones follow the
+	// operator's TLS settings exactly, as pve.host does.
+	KindConfigured Kind = iota + 1
+	// KindDiscovered is an endpoint that discovery learned through a
+	// configured endpoint. Its clones accept only a certificate that its
+	// node's pin set, or under verify_ssl true its name, vouches for.
+	KindDiscovered
+)
+
+// String returns "configured" or "discovered".
+func (k Kind) String() string {
+	switch k {
+	case KindConfigured:
+		return "configured"
+	case KindDiscovered:
+		return "discovered"
+	default:
+		return "kind(" + strconv.Itoa(int(k)) + ")"
+	}
+}
+
+// Endpoint describes one endpoint handed to New.
+type Endpoint struct {
+	// Address is the endpoint's host:port. An IPv6 literal is written in
+	// brackets.
+	Address string
+	// Kind says whether the operator configured the endpoint or discovery
+	// found it.
+	Kind Kind
+	// Node is the name of the Proxmox node the endpoint serves, when it is
+	// known, and empty otherwise. Discovery records it for every discovered
+	// endpoint, and for a configured endpoint that /cluster/status reported as
+	// local.
+	Node string
+	// Pins is a discovered endpoint's pin set, which must not be empty. A
+	// configured endpoint carries no pins.
+	Pins []Pin
+}
+
+// Config is what New needs to build a pool.
+type Config struct {
+	// Base is the transport the SDK built, with the operator's TLS settings,
+	// dialer, and timeouts. The pool never sends on it. It clones it for every
+	// endpoint and for every routed host.
+	Base *http.Transport
+	// Logger receives the pool's log lines. A nil Logger discards them.
+	Logger *log.Logger
+	// Endpoints lists the configured and discovered endpoints. The configured
+	// endpoints keep their relative order and come first, and the discovered
+	// ones keep theirs after them. The first configured endpoint is the
+	// primary, whose host:port the SDK puts on every request.
+	Endpoints []Endpoint
+
+	// headerDeadline replaces the 60-second response-header deadline. Only
+	// the package's tests set it. Zero means the default.
+	headerDeadline time.Duration
+}
+
+// endpoint is one endpoint of a pool. Everything but demoted is fixed at
+// construction.
+type endpoint struct {
+	addr       string
+	kind       Kind
+	node       string
+	pins       int
+	rank       int
+	transports *ownedTransports
+	// demoted is guarded by Pool.mu.
+	demoted bool
+}
+
+// Pool holds the ordered endpoints of one cluster, the active endpoint with
+// its generation counter, the in-process demotions, and every transport it
+// owns. It is safe for concurrent use.
+type Pool struct {
+	logger    *log.Logger
+	base      *http.Transport
+	verifySSL bool
+
+	// endpoints is in preference order, the configured endpoints first.
+	endpoints []*endpoint
+	byAddr    map[string]*endpoint
+
+	// refreshDue is set when a discovered endpoint was accepted on its name
+	// with a certificate outside its pin set, so the next discovery through a
+	// configured endpoint should record the new pin.
+	refreshDue atomic.Bool
+
+	mu sync.Mutex
+	// active is where the next walk starts.
+	active *endpoint
+	// generation goes up each time active changes.
+	generation uint64
+	// routed holds the clones built on first use for a routed host that is
+	// not one of the pool's endpoints.
+	routed map[string]*ownedTransports
+}
+
+// New builds a pool. It refuses a base transport that checkBase refuses, an
+// empty endpoint list, a list without a configured endpoint, an address that
+// is not a valid host:port, an address listed twice, an unknown kind, a
+// configured endpoint with pins, and a discovered endpoint without them.
+//
+// A pool of more than one endpoint gives each endpoint's idempotent clone the
+// 60-second response-header deadline. A pool of one endpoint keeps today's
+// behavior, so its one clone has no header deadline.
+func New(cfg Config) (*Pool, error) {
+	if err := checkBase(cfg.Base); err != nil {
+		return nil, err
+	}
+	base := cfg.Base.Clone()
+	logger := cfg.Logger
+	if logger == nil {
+		logger = log.NewNopLogger()
+	}
+	eps, err := orderEndpoints(cfg.Endpoints)
+	if err != nil {
+		return nil, err
+	}
+
+	p := &Pool{
+		logger:    logger,
+		base:      base,
+		verifySSL: base.TLSClientConfig == nil || !base.TLSClientConfig.InsecureSkipVerify,
+		endpoints: make([]*endpoint, 0, len(eps)),
+		byAddr:    make(map[string]*endpoint, len(eps)),
+		routed:    make(map[string]*ownedTransports),
+	}
+	headerDeadline := time.Duration(0)
+	if len(eps) > 1 {
+		headerDeadline = defaultHeaderDeadline
+		if cfg.headerDeadline > 0 {
+			headerDeadline = cfg.headerDeadline
+		}
+	}
+	for i, in := range eps {
+		ep := &endpoint{addr: in.Address, kind: in.Kind, node: in.Node, pins: len(in.Pins), rank: i}
+		spec := transportSpec{addr: in.Address, headerDeadline: headerDeadline}
+		if in.Kind == KindDiscovered {
+			v, verr := p.discoveredVerifier(in)
+			if verr != nil {
+				return nil, verr
+			}
+			spec.verify = v.verifyConnection
+		}
+		if ep.transports, err = newOwnedTransports(base, spec); err != nil {
+			return nil, err
+		}
+		p.endpoints = append(p.endpoints, ep)
+		p.byAddr[ep.addr] = ep
+	}
+	p.active = p.endpoints[0]
+	p.logger.Debug(p.describe())
+	return p, nil
+}
+
+// orderEndpoints validates the endpoints, canonicalizes their addresses, and
+// returns the configured ones in their order followed by the discovered ones
+// in theirs.
+func orderEndpoints(in []Endpoint) ([]Endpoint, error) {
+	if len(in) == 0 {
+		return nil, errors.New("endpoint pool: no endpoints")
+	}
+	configured := make([]Endpoint, 0, len(in))
+	var discovered []Endpoint
+	seen := make(map[string]struct{}, len(in))
+	for _, ep := range in {
+		addr, err := canonicalAddress(ep.Address)
+		if err != nil {
+			return nil, fmt.Errorf("endpoint pool: endpoint %q: %w", ep.Address, err)
+		}
+		if _, dup := seen[addr]; dup {
+			return nil, fmt.Errorf("endpoint pool: endpoint %s is listed twice", addr)
+		}
+		seen[addr] = struct{}{}
+		ep.Address = addr
+		ep.Node = strings.TrimSpace(ep.Node)
+		switch ep.Kind {
+		case KindConfigured:
+			if len(ep.Pins) > 0 {
+				return nil, fmt.Errorf("endpoint pool: configured endpoint %s carries pins, and a configured "+
+					"endpoint follows the operator's TLS settings", addr)
+			}
+			configured = append(configured, ep)
+		case KindDiscovered:
+			if len(ep.Pins) == 0 {
+				return nil, fmt.Errorf("endpoint pool: discovered endpoint %s has no pins", addr)
+			}
+			ep.Pins = append([]Pin(nil), ep.Pins...)
+			discovered = append(discovered, ep)
+		default:
+			return nil, fmt.Errorf("endpoint pool: endpoint %s has unknown %s", addr, ep.Kind)
+		}
+	}
+	if len(configured) == 0 {
+		return nil, errors.New("endpoint pool: no configured endpoint")
+	}
+	return append(configured, discovered...), nil
+}
+
+// discoveredVerifier builds the pinned callback for a discovered endpoint from
+// the operator's TLS settings on the base transport.
+func (p *Pool) discoveredVerifier(ep Endpoint) (*verifier, error) {
+	host := hostOf(ep.Address)
+	cfg := p.base.TLSClientConfig
+	if cfg == nil {
+		return newDiscoveredVerifier(host, p.verifySSL, nil, nil, ep.Pins, p.markRefreshDue)
+	}
+	return newDiscoveredVerifier(host, p.verifySSL, cfg.RootCAs, cfg.Time, ep.Pins, p.markRefreshDue)
+}
+
+// describe returns the pool-built line, which lists every endpoint in
+// preference order with its kind and names the endpoint the pool starts on.
+func (p *Pool) describe() string {
+	parts := make([]string, 0, len(p.endpoints))
+	for _, ep := range p.endpoints {
+		parts = append(parts, ep.addr+" "+ep.kind.String())
+	}
+	return fmt.Sprintf("pve endpoints: pool [%s], starting on %s", strings.Join(parts, ", "), p.active.addr)
+}
+
+// Len returns the number of configured and discovered endpoints.
+func (p *Pool) Len() int { return len(p.endpoints) }
+
+// RefreshDue reports whether a discovered endpoint was accepted on its name
+// with a certificate outside its pin set in this process, so the next
+// discovery through a configured endpoint should run and record the new pin.
+func (p *Pool) RefreshDue() bool { return p.refreshDue.Load() }
+
+func (p *Pool) markRefreshDue() { p.refreshDue.Store(true) }
+
+// CloseIdleConnections closes the idle connections of every transport the pool
+// owns, the routed ones included.
+func (p *Pool) CloseIdleConnections() {
+	for _, ep := range p.endpoints {
+		ep.transports.closeIdle()
+	}
+	p.mu.Lock()
+	routed := make([]*ownedTransports, 0, len(p.routed))
+	for _, o := range p.routed {
+		routed = append(routed, o)
+	}
+	p.mu.Unlock()
+	for _, o := range routed {
+		o.closeIdle()
+	}
+}
+
+// lookup returns the endpoint with the given address, which may be written in
+// any spelling canonicalAddress accepts, or nil.
+func (p *Pool) lookup(addr string) *endpoint {
+	canon, err := canonicalAddress(addr)
+	if err != nil {
+		return nil
+	}
+	return p.byAddr[canon]
+}
+
+// current returns the active endpoint and the generation it became active in.
+func (p *Pool) current() (*endpoint, uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.active, p.generation
+}
+
+// walkOrder returns the endpoints a walk tries, in order, and the current
+// generation. The endpoints that are not demoted come first in preference
+// order, and the demoted ones follow in theirs, so a demotion only reorders
+// and never removes an endpoint. The active endpoint leads unless it is
+// demoted. With configuredOnly, only the configured endpoints are returned,
+// which is the order for a ticket login and for a request with the
+// configured-only marker.
+func (p *Pool) walkOrder(configuredOnly bool) ([]*endpoint, uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	order := make([]*endpoint, 0, len(p.endpoints))
+	var lead *endpoint
+	if !p.active.demoted && (!configuredOnly || p.active.kind == KindConfigured) {
+		lead = p.active
+		order = append(order, lead)
+	}
+	for _, demoted := range []bool{false, true} {
+		for _, ep := range p.endpoints {
+			if ep == lead || ep.demoted != demoted || (configuredOnly && ep.kind != KindConfigured) {
+				continue
+			}
+			order = append(order, ep)
+		}
+	}
+	return order, p.generation
+}
+
+// demote moves ep behind every endpoint that is not demoted, for the rest of
+// the process or until a request on it succeeds under the current generation.
+func (p *Pool) demote(ep *endpoint) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ep.demoted = true
+}
+
+// demotedNow reports whether ep is demoted in this process.
+func (p *Pool) demotedNow(ep *endpoint) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return ep.demoted
+}
+
+// promote records a success on ep for an attempt that started under
+// generation gen. When gen is still current, ep becomes active, its demotion
+// is cleared, and the generation goes up if the active endpoint changed. A
+// stale success changes nothing, so a slow request that started on an
+// endpoint before a failover cannot make that endpoint active again. It
+// reports whether the success was applied.
+func (p *Pool) promote(ep *endpoint, gen uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if gen != p.generation {
+		return false
+	}
+	ep.demoted = false
+	if p.active != ep {
+		p.active = ep
+		p.generation++
+	}
+	return true
+}
+
+// advance demotes from and, when from is still the active endpoint under
+// generation gen, makes the next endpoint in walk order active and raises the
+// generation. A streamed upload uses it after a connect-phase failure, because
+// it cannot hop inside one request and its next attempt must start on another
+// endpoint. It reports whether the active endpoint changed. A pool of one
+// endpoint, or a stale generation, leaves the active endpoint where it is.
+func (p *Pool) advance(from *endpoint, gen uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	from.demoted = true
+	if p.active != from || gen != p.generation {
+		return false
+	}
+	var next *endpoint
+	for _, demoted := range []bool{false, true} {
+		for _, ep := range p.endpoints {
+			if ep != from && ep.demoted == demoted {
+				next = ep
+				break
+			}
+		}
+		if next != nil {
+			break
+		}
+	}
+	if next == nil {
+		return false
+	}
+	p.active = next
+	p.generation++
+	return true
+}
+
+// routedTransports returns the owned clones for a request whose URL host a
+// caller chose with WithHost, such as a routed upload. A host that is one of
+// the pool's endpoints uses that endpoint's clones, so a discovered address is
+// never reached without its pin. Any other host gets one clone of the base
+// transport, built on first use and owned for the rest of the process, with
+// the connect-phase tag and the operator's TLS settings and no pin. That clone
+// has no header deadline, because a routed request never hops and the
+// deadline exists only to make a hop.
+func (p *Pool) routedTransports(u *url.URL) (*ownedTransports, error) {
+	if u == nil {
+		return nil, errors.New("endpoint pool: routed request has no URL")
+	}
+	port := u.Port()
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		default:
+			return nil, fmt.Errorf("endpoint pool: routed request has unsupported scheme %q", u.Scheme)
+		}
+	}
+	addr, err := canonicalHostPort(u.Hostname(), port)
+	if err != nil {
+		return nil, fmt.Errorf("endpoint pool: routed host %q: %w", u.Host, err)
+	}
+	if ep := p.byAddr[addr]; ep != nil {
+		return ep.transports, nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if o := p.routed[addr]; o != nil {
+		return o, nil
+	}
+	o, err := newOwnedTransports(p.base, transportSpec{addr: addr})
+	if err != nil {
+		return nil, err
+	}
+	p.routed[addr] = o
+	return o, nil
+}
+
+// hostOf returns the host of a canonical host:port, which has already passed
+// canonicalAddress, so the split cannot fail.
+func hostOf(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return host
+}
