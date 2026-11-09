@@ -872,8 +872,10 @@ func TestAwaitTask_TransientFaultShrinksWaitWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(windows) != 2 || windows[0] != 10 || windows[1] != 9 {
-		t.Errorf("Wait windows = %v, want [10 9]", windows)
+	// The first fault sleeps 1.1 s, so the second window is 9; a runner that
+	// stalls past 2 s sees 8.
+	if len(windows) != 2 || windows[0] != 10 || (windows[1] != 9 && windows[1] != 8) {
+		t.Errorf("Wait windows = %v, want [10 9] or [10 8]", windows)
 	}
 }
 
@@ -907,19 +909,28 @@ func TestAwaitTask_TransientFaultContextCancelledIsRetriable(t *testing.T) {
 	}
 }
 
-// TestAwaitTask_RoutedUploadHostReturnsTransientFaultAtOnce verifies a poll
-// stamped with a routed upload host returns its fault without re-polling, so
-// the upload loop can drop the pin and re-await the same UPID through the
-// configured endpoint instead of waiting out the task's window on a dead
-// direct host.
-func TestAwaitTask_RoutedUploadHostReturnsTransientFaultAtOnce(t *testing.T) {
+// dialRefused is a dial-phase refusal, the shape IsRoutedUploadFallbackEligible
+// accepts on a direct-to-node upload dial.
+func dialRefused() error {
+	return &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+}
+
+// TestAwaitTask_RoutedUploadHostReturnsFallbackEligibleFaultAtOnce verifies a
+// poll stamped with a routed upload host returns a fallback-eligible fault
+// without re-polling, so the upload loop can drop the pin and re-await the
+// same UPID through the configured endpoint instead of waiting out the task's
+// window on a dead direct host.
+func TestAwaitTask_RoutedUploadHostReturnsFallbackEligibleFaultAtOnce(t *testing.T) {
 	t.Parallel()
-	connErr := &sdkerrors.ConnectionError{Host: "10.0.0.2", Port: 8006, Message: "connection refused"}
+	refused := dialRefused()
+	if !pve.IsRoutedUploadFallbackEligible(refused) {
+		t.Fatalf("test fault must be fallback-eligible: %v", refused)
+	}
 	var calls atomic.Int32
 	svc := &mockTasksService{
 		waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
 			calls.Add(1)
-			return nil, connErr
+			return nil, refused
 		},
 	}
 	ctx := pve.UploadContext(context.Background(), "10.0.0.2")
@@ -930,7 +941,7 @@ func TestAwaitTask_RoutedUploadHostReturnsTransientFaultAtOnce(t *testing.T) {
 		t.Fatal("expected the poll fault, got nil")
 	}
 	if calls.Load() != 1 {
-		t.Errorf("a pinned poll must not re-poll; Wait called %d times", calls.Load())
+		t.Errorf("a pinned poll must not re-poll a fallback-eligible fault; Wait called %d times", calls.Load())
 	}
 	if time.Since(start) > 5*time.Second {
 		t.Errorf("a pinned poll must return at once; took %v", time.Since(start))
@@ -938,8 +949,187 @@ func TestAwaitTask_RoutedUploadHostReturnsTransientFaultAtOnce(t *testing.T) {
 	if pve.IsTaskExitVerdict(err) || pve.IsTaskPollUnresolved(err) {
 		t.Errorf("the pinned fault must keep the raw poll-fault shape the upload loops read: %v", err)
 	}
-	if !pve.IsTransientTransport(err) {
-		t.Errorf("the pinned fault must stay classifiable as a transport fault: %v", err)
+	if !pve.IsRoutedUploadFallbackEligible(err) {
+		t.Errorf("the pinned fault must stay fallback-eligible for the upload loops: %v", err)
+	}
+}
+
+// TestAwaitTask_RoutedUploadHostRePollsNonFallbackFaults verifies a pinned poll
+// re-polls a 5xx or a pushback fault, which the upload loops do not act on,
+// and completes when the task does.
+func TestAwaitTask_RoutedUploadHostRePollsNonFallbackFaults(t *testing.T) {
+	t.Parallel()
+	faults := map[string]error{
+		"5xx":      sdkerrors.ParseAPIError(500, []byte(`{"errors":"internal error"}`)),
+		"pushback": errors.New("failed to get task status: pveproxy: too many requests, please try again later"),
+	}
+	for name, fault := range faults {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if pve.IsRoutedUploadFallbackEligible(fault) {
+				t.Fatalf("test fault must not be fallback-eligible: %v", fault)
+			}
+			var calls atomic.Int32
+			svc := &mockTasksService{
+				waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+					if calls.Add(1) <= 2 {
+						return nil, fault
+					}
+					return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+				},
+			}
+			ctx := pve.UploadContext(context.Background(), "10.0.0.2")
+			err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:abc", shortPollOpts()...)
+			if err != nil {
+				t.Fatalf("a pinned poll must re-poll a non-fallback fault to completion; got: %v", err)
+			}
+			if calls.Load() != 3 {
+				t.Errorf("Wait calls = %d, want 3", calls.Load())
+			}
+		})
+	}
+}
+
+// TestAwaitTask_RoutedUploadHostMeetsDeadlineIsUnresolved verifies a pinned
+// poll whose deadline has passed returns unresolved, including when the SDK's
+// own window cut a status read short with a fault that is not
+// fallback-eligible.
+func TestAwaitTask_RoutedUploadHostMeetsDeadlineIsUnresolved(t *testing.T) {
+	t.Parallel()
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			time.Sleep(1100 * time.Millisecond)
+			return nil, fmt.Errorf("failed to get task status: %w", context.DeadlineExceeded)
+		},
+	}
+	ctx := pve.UploadContext(context.Background(), "10.0.0.2")
+	err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:abc",
+		pve.WithMaxWait(time.Second), pve.WithPollIntervalForTest(time.Millisecond))
+	requireUnresolvedPoll(t, err)
+}
+
+// TestAwaitTask_DeadlineInsideSleepMakesFinalPoll verifies that when the
+// deadline falls inside the sleep between polls, one last poll with a
+// one-second window runs, and a task that finished in the last interval reads
+// as finished.
+func TestAwaitTask_DeadlineInsideSleepMakesFinalPoll(t *testing.T) {
+	t.Parallel()
+	connErr := &sdkerrors.ConnectionError{Host: "pve1", Port: 8006, Message: "connection refused"}
+	var mu sync.Mutex
+	var windows []int
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, opts *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			windows = append(windows, opts.TimeoutSeconds)
+			if len(windows) == 1 {
+				return nil, connErr
+			}
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+		},
+	}
+	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc",
+		pve.WithMaxWait(time.Second), pve.WithPollIntervalForTest(time.Hour))
+	if err != nil {
+		t.Fatalf("a task that finished in the last interval must read as finished; got: %v", err)
+	}
+	if len(windows) != 2 || windows[1] != 1 {
+		t.Errorf("Wait windows = %v, want two polls with a one-second final window", windows)
+	}
+}
+
+// TestAwaitTask_DeadlineInsideSleepFinalPollFailsIsUnresolved verifies the
+// final poll's own transient fault still ends in the unresolved error, after
+// exactly one extra poll.
+func TestAwaitTask_DeadlineInsideSleepFinalPollFailsIsUnresolved(t *testing.T) {
+	t.Parallel()
+	connErr := &sdkerrors.ConnectionError{Host: "pve1", Port: 8006, Message: "connection refused"}
+	var calls atomic.Int32
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			calls.Add(1)
+			return nil, connErr
+		},
+	}
+	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc",
+		pve.WithMaxWait(time.Second), pve.WithPollIntervalForTest(time.Hour))
+	requireUnresolvedPoll(t, err)
+	if calls.Load() != 2 {
+		t.Errorf("Wait calls = %d, want 2 (one fault, one final poll)", calls.Load())
+	}
+}
+
+// TestAwaitTask_DeadlineInsideSleepFinalPollFailedExitIsVerdict verifies a
+// task that resolved to a failing exit in the last interval reports its own
+// verdict from the final poll.
+func TestAwaitTask_DeadlineInsideSleepFinalPollFailedExitIsVerdict(t *testing.T) {
+	t.Parallel()
+	connErr := &sdkerrors.ConnectionError{Host: "pve1", Port: 8006, Message: "connection refused"}
+	var calls atomic.Int32
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			if calls.Add(1) == 1 {
+				return nil, connErr
+			}
+			return &sdktasks.Status{Status: "stopped", ExitStatus: permanentExit, UpID: upid},
+				fmt.Errorf("task failed: %s", permanentExit)
+		},
+	}
+	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc",
+		pve.WithMaxWait(time.Second), pve.WithPollIntervalForTest(time.Hour))
+	if !pve.IsTaskExitVerdict(err) {
+		t.Errorf("a failing exit seen on the final poll must carry the verdict shape: %v", err)
+	}
+}
+
+// TestAwaitTask_NotFoundThenFoundWithinRetriesCompletes verifies a 404 for a
+// freshly returned UPID is retried and the poll completes once the task is
+// registered.
+func TestAwaitTask_NotFoundThenFoundWithinRetriesCompletes(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			if calls.Add(1) <= 2 {
+				return nil, fmt.Errorf("failed to get task status: %w", sdkerrors.ErrNotFound)
+			}
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+		},
+	}
+	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:new", shortPollOpts()...)
+	if err != nil {
+		t.Fatalf("a task-index miss within the retries must complete; got: %v", err)
+	}
+	if calls.Load() != 3 {
+		t.Errorf("Wait calls = %d, want 3 (two misses, one success)", calls.Load())
+	}
+}
+
+// TestAwaitTask_NotFoundPastRetriesIsNotFound verifies a task that stays
+// absent returns not-found after the bounded retries, with IsNotFound still
+// true and the error non-retriable.
+func TestAwaitTask_NotFoundPastRetriesIsNotFound(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			calls.Add(1)
+			return nil, fmt.Errorf("failed to get task status: %w", sdkerrors.ErrNotFound)
+		},
+	}
+	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:gone",
+		pve.WithMaxWait(30*time.Second), pve.WithPollIntervalForTest(time.Millisecond))
+	if err == nil {
+		t.Fatal("expected a not-found error, got nil")
+	}
+	if !pve.IsNotFound(err) {
+		t.Errorf("IsNotFound must stay true: %v", err)
+	}
+	if cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("a persistent 404 must stay non-retriable: %v", err)
+	}
+	if got, want := int(calls.Load()), 1+3; got != want {
+		t.Errorf("Wait calls = %d, want %d (first read plus three retries)", got, want)
 	}
 }
 
