@@ -1,0 +1,26 @@
+// Package endpointpool holds the types and context markers that the failover
+// transport for the Proxmox API shares with the rest of the CPI.
+//
+// A pool tries an ordered list of endpoints for one cluster. A request that
+// fails before a connection exists provably never left the machine, so it may
+// try the next endpoint. A request that may have been written is tethered to
+// the endpoint it went to, so no layer above can replay it on another node.
+// This package defines the vocabulary for that rule.
+//
+//   - ConnectPhaseError tags a failure that happened before any request byte
+//     could be written, with the phase that failed. A final error that unwraps
+//     to it proves the request was never sent.
+//   - MaybeSentError marks an error from a request that may have reached the
+//     endpoint.
+//   - EntryUnreachableError reports a walk in which every hop failed in the
+//     connect phase or on the header deadline.
+//   - ErrSendByPassed is the refusal a request gets when its send-by deadline
+//     has passed, and ErrTetherConflict is the refusal a mutation gets when its
+//     tether key is conflicted for the rest of the call.
+//   - WithSendBy, WithConfiguredOnly, and WithAffinityScope put the request
+//     markers and the per-call scope on a context.
+//
+// The package imports only the standard library. It must never import
+// internal/pve, internal/endpointcache, or the handlers, so that every one of
+// those packages can import it.
+package endpointpool
