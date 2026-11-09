@@ -25,6 +25,11 @@
 //     through the pool's own tagging dialer and speaks only HTTP/1.1, and a
 //     discovered endpoint's clones accept only a certificate its pin set, or
 //     under verify_ssl true its name, vouches for.
+//   - A pool's tether table ties each mutation that may have been sent to the
+//     endpoint it went to, by a tether key of its method and path, or of its
+//     family for the HA, replication, and pool writers. The first mutation
+//     with a key reserves the tether before any byte can leave, every later
+//     one follows it, and a scope's tethers are dropped when its call ends.
 //
 // The package imports only the standard library and the CPI's logger in
 // internal/log. It must never import internal/pve, internal/endpointcache, or

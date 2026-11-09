@@ -156,6 +156,11 @@ type outcome struct {
 	defectAlert bool
 	// class names the failure for the log lines, and is empty for an answer.
 	class string
+	// addr is the canonical address of the endpoint or routed host that the
+	// hop ending the request went to, which a maybe-sent mutation's tether
+	// is fixed on. It is empty when the pool handed the request to no
+	// transport.
+	addr string
 }
 
 // classify applies the outcome table to one hop.

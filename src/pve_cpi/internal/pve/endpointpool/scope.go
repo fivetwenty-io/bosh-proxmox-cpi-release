@@ -10,7 +10,8 @@ type scopeKey struct{}
 // Scope is the affinity scope of one CPI call. The dispatcher, and each
 // operator command, puts one on the call's context. A pool ties each tether it
 // makes to the scope on the request's context, and drops those tethers when the
-// scope is released, so a tether lasts as long as the call that made it.
+// scope is released, so a tether lasts as long as the call that made it. A
+// tether made on a context without a scope lasts for the process.
 //
 // A Scope is compared by identity, so it must come from WithAffinityScope and
 // be passed around as the pointer that function put on the context.
@@ -68,6 +69,16 @@ func (s *Scope) Released() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.released
+}
+
+// sees reports whether a request whose context carries scope s sees a tether
+// made under scope made. A request with a scope sees the tethers its own scope
+// made and the tethers made without a scope. A request without a scope sees
+// every tether, so a mutation sent on a context that a rollback or parker path
+// built from context.Background() still meets a tether its call made. Two
+// calls with different scopes never see each other's tethers.
+func (s *Scope) sees(made *Scope) bool {
+	return s == nil || made == nil || made == s
 }
 
 // release marks the scope released and runs the registered functions once. A

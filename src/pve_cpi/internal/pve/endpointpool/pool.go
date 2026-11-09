@@ -124,6 +124,8 @@ type Pool struct {
 
 	// walk is what the pool's walks remember for their log lines.
 	walk walkState
+	// tethers holds every mutation tether this pool made, under its own lock.
+	tethers tetherTable
 }
 
 // New builds a pool. It refuses a base transport that checkBase refuses, an
@@ -418,6 +420,13 @@ func (p *Pool) routedTransports(u *url.URL) (*ownedTransports, error) {
 	if err != nil {
 		return nil, err
 	}
+	return p.routedTransportsAt(addr, u.Hostname())
+}
+
+// routedTransportsAt returns the owned clones for the canonical address addr,
+// as routedTransports does, building a clone outside the pool with serverName
+// as its SNI on first use.
+func (p *Pool) routedTransportsAt(addr, serverName string) (*ownedTransports, error) {
 	if ep := p.byAddr[addr]; ep != nil {
 		return ep.transports, nil
 	}
@@ -426,7 +435,7 @@ func (p *Pool) routedTransports(u *url.URL) (*ownedTransports, error) {
 	if o := p.routed[addr]; o != nil {
 		return o, nil
 	}
-	o, err := newOwnedTransports(p.base, transportSpec{addr: addr, serverName: u.Hostname()})
+	o, err := newOwnedTransports(p.base, transportSpec{addr: addr, serverName: serverName})
 	if err != nil {
 		return nil, err
 	}

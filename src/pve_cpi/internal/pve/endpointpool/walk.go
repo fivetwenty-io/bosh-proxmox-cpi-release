@@ -30,8 +30,12 @@ const snapshotTries = 3
 // RoundTrip sends req through the pool. It implements http.RoundTripper.
 //
 // It first refuses a request whose send-by deadline has passed, with an error
-// that wraps ErrSendByPassed, before any dial. It then sorts the request into
-// one of three kinds:
+// that wraps ErrSendByPassed, before any dial. A mutation then claims its
+// key's tether, before it is handed to any transport. A mutation whose key
+// is conflicted is refused with an error that wraps ErrTetherConflict, and
+// one whose key already has a tether goes only to that tether's endpoint and
+// never walks, whatever kind it would otherwise be. Every other request is
+// sorted into one of three kinds:
 //
 //   - A request whose URL host is not the primary endpoint's is routed. A
 //     caller chose that host, so the request goes once through the owned
@@ -47,6 +51,13 @@ const snapshotTries = 3
 // body from GetBody after the first hop. What each hop's outcome does is the
 // outcome table in classify, and how far a walk goes is set by bounds. The
 // response carries the caller's request in its Request field.
+//
+// A mutation that reserved its tether releases it when its request ends with
+// a proof that nothing was sent, and fixes it on the endpoint it went to on
+// every other outcome, a status of any kind included. A walk that hops after
+// such a proof claims the tether again for its next endpoint, unless another
+// request still holds the reservation, in which case it returns its error
+// without hopping.
 func (p *Pool) RoundTrip(req *http.Request) (*http.Response, error) {
 	return p.roundTrip(req, defaultBounds())
 }
@@ -97,20 +108,80 @@ func (p *Pool) dispatch(req *http.Request, b bounds) (*http.Response, outcome, e
 		closeRequestBody(req)
 		return nil, unsent, addrErr
 	}
-	// A tethered mutation goes only to its tethered endpoint, so a tether
-	// check belongs here, ahead of the routed and configured-only kinds it
-	// overrides, and the outcome each kind returns releases or fixes it.
 	configuredOnly := IsConfiguredOnly(req.Context()) || isLogin(req)
-	if addr != p.endpoints[0].addr {
-		return p.sendRouted(req, addr, configuredOnly)
+	routed := addr != p.endpoints[0].addr
+	if classOf(req) == classMutation {
+		h := newTetherHold(req)
+		resp, oc, err := p.dispatchMutation(req, h, addr, routed, configuredOnly, b)
+		p.settle(h, oc)
+		return resp, oc, err
+	}
+	if routed {
+		return p.sendRouted(req, tetherTarget{addr: addr, urlHost: req.URL.Host}, nil, configuredOnly)
 	}
 	return p.newWalker(req, configuredOnly, b).run()
 }
 
-// sendRouted sends a routed request once, through the owned clone for its
-// host, which is an endpoint's own clone when the host is one of the pool's
-// endpoints. It uses the clone without a header deadline, because a routed
-// request never hops.
+// dispatchMutation sends a mutation after it claims its key's tether in h,
+// and dispatch settles h from the outcome. The claim names the address the
+// request is about to try, which is the routed host for a routed request and
+// the first endpoint of the walk otherwise. A conflicted key is refused here,
+// before the request is handed to any transport. A key that already has a
+// tether sends the request only to that tether's target, and a fresh
+// reservation sends it the way its kind does.
+func (p *Pool) dispatchMutation(req *http.Request, h *tetherHold, addr string, routed, configuredOnly bool, b bounds,
+) (*http.Response, outcome, error) {
+	planned := tetherTarget{addr: addr, urlHost: req.URL.Host}
+	var w *walker
+	if !routed {
+		w = p.newWalker(req, configuredOnly, b)
+		if w.limit <= 0 {
+			return w.run()
+		}
+		planned = targetOf(w.order[0])
+	}
+	if err := p.claim(h, planned); err != nil {
+		closeRequestBody(req)
+		return nil, unsent, err
+	}
+	if h.following {
+		return p.sendFollowing(req, h.target, configuredOnly, b)
+	}
+	if routed {
+		return p.sendRouted(req, planned, nil, configuredOnly)
+	}
+	w.hold = h
+	return w.run()
+}
+
+// sendFollowing sends a mutation whose key already had a tether, once, to the
+// tether's target, without a walk. A target that is one of the pool's
+// endpoints gets a walk of that one endpoint, so its outcome follows the
+// outcome table as a walk's first hop does, and a connect-phase failure
+// returns the walk's error without trying another endpoint. A routed host
+// outside the pool gets the routed path. A configured-only request whose
+// tether names an endpoint that is not configured is refused by the routed
+// path before any dial, so a credential never reaches an address the
+// operator did not list.
+func (p *Pool) sendFollowing(req *http.Request, target tetherTarget, configuredOnly bool, b bounds,
+) (*http.Response, outcome, error) {
+	ep := p.byAddr[target.addr]
+	if ep == nil || (configuredOnly && ep.kind != KindConfigured) {
+		return p.sendRouted(req, target, nil, configuredOnly)
+	}
+	w := p.newWalker(req, configuredOnly, b)
+	w.order, w.limit, w.tethered = []*endpoint{ep}, 1, true
+	return w.run()
+}
+
+// sendRouted sends a request once to target, through the owned clone for its
+// address, which is an endpoint's own clone when the address is one of the
+// pool's endpoints. It uses the clone without a header deadline, because a
+// routed request never hops. When target's spelling differs from the
+// request's URL host, which is so for a mutation that follows its key's
+// tether to a routed host, the clone carries target's spelling and an empty
+// Host. body is the request body rebuilt for a hop after a walk's first, and
+// nil otherwise.
 //
 // A configured-only request goes to a routed host only when that host is a
 // configured endpoint, so a credential never reaches an address the operator
@@ -119,24 +190,34 @@ func (p *Pool) dispatch(req *http.Request, b bounds) (*http.Response, outcome, e
 // endpoint active. The error is marked with MaybeSentError unless its outcome
 // is sentNever, which takes a connect-phase failure of an idempotent request
 // or the login, or of a mutation that provesNeverSent clears.
-func (p *Pool) sendRouted(req *http.Request, addr string, configuredOnly bool) (*http.Response, outcome, error) {
+func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCloser, configuredOnly bool,
+) (*http.Response, outcome, error) {
+	addr := target.addr
 	ep := p.byAddr[addr]
 	if configuredOnly && (ep == nil || ep.kind != KindConfigured) {
-		closeRequestBody(req)
+		closeSendBody(req, body)
 		return nil, unsent, fmt.Errorf(
 			"endpoint pool: refusing a configured-only request to %s, which is not a configured endpoint", addr)
 	}
-	o, err := p.routedTransports(req.URL)
+	o, err := p.routedTransportsAt(addr, (&url.URL{Host: target.urlHost}).Hostname())
 	if err != nil {
-		closeRequestBody(req)
+		closeSendBody(req, body)
 		return nil, unsent, err
 	}
 	clone := req.Clone(connectContext(req.Context(), methodOf(req), req.URL.Path))
+	if target.urlHost != req.URL.Host {
+		clone.URL.Host = target.urlHost
+		clone.Host = ""
+	}
+	if body != nil {
+		clone.Body = body
+	}
 	resp, err := o.pick(false).RoundTrip(clone)
 	if err == nil && resp == nil {
 		err = errNoResponse
 	}
 	oc := routedOutcome(classOf(req), clone, err)
+	oc.addr = addr
 	if err == nil {
 		resp.Request = req
 		return resp, oc, nil
@@ -213,6 +294,21 @@ type walker struct {
 	statusHopped bool
 	held         *heldResponse
 	fails        failures
+	// hold is a mutation's hold on its key's tethers, which the walk
+	// releases after a hop that proved nothing was sent and claims again for
+	// the next hop. It is nil for a read, for the login, and for a walk that
+	// follows a tether, whose hold dispatch settles.
+	hold *tetherHold
+	// tethered says the request goes only to the endpoint its key's tether
+	// names, so the walk never hops.
+	tethered bool
+}
+
+// walkEnd is what a walk returns when it ends before a hop.
+type walkEnd struct {
+	resp *http.Response
+	oc   outcome
+	err  error
 }
 
 // hopResult is one hop and the outcome table's verdict on it.
@@ -241,6 +337,10 @@ const (
 	stopBody
 	// stopRebuild means GetBody failed to rebuild the body for the next hop.
 	stopRebuild
+	// stopTethered means the request is a mutation that may not hop: it
+	// follows its key's tether, or another request still holds or has fixed
+	// the reservation it released.
+	stopTethered
 )
 
 // newWalker reads the active endpoint, the walk order, and the generation for
@@ -287,9 +387,20 @@ func (w *walker) run() (*http.Response, outcome, error) {
 	}
 	var body io.ReadCloser
 	for i := 0; ; i++ {
+		if i > 0 && w.hold != nil {
+			if end := w.reclaim(i, body); end != nil {
+				return end.resp, end.oc, end.err
+			}
+		}
 		h := w.try(i, w.order[i], body)
 		if h.oc.action != actHop {
 			return w.finish(h)
+		}
+		// Only a proof that nothing was sent hops a mutation, so its hold is
+		// released here, and the request hops only when that removed the
+		// reservation.
+		if w.tethered || (w.hold != nil && !w.p.release(w.hold)) {
+			return w.halt(h, stopTethered, i+1, nil)
 		}
 		if stop := w.stopBefore(i + 1); stop != stopNone {
 			return w.halt(h, stop, i+1, nil)
@@ -300,6 +411,33 @@ func (w *walker) run() (*http.Response, outcome, error) {
 		}
 		w.proceed(h)
 	}
+}
+
+// reclaim claims the tether of a mutation for hop i, after the hop before it
+// released the request's hold, and returns nil when hop i goes ahead. body is
+// the request body rebuilt for hop i.
+//
+// A conflicted key ends the walk with the refusal, and nothing more is sent.
+// When the key gained a tether since the release, the request follows it and
+// never hops again: hop i goes to the tether's endpoint instead of the one the
+// walk order names, and a tether on a routed host outside the pool, or on an
+// endpoint a configured-only request may not reach, ends the walk through the
+// routed path.
+func (w *walker) reclaim(i int, body io.ReadCloser) *walkEnd {
+	if err := w.p.claim(w.hold, targetOf(w.order[i])); err != nil {
+		closeSendBody(w.req, body)
+		return &walkEnd{oc: unsent, err: err}
+	}
+	if !w.hold.following {
+		return nil
+	}
+	w.tethered = true
+	if ep := w.p.byAddr[w.hold.target.addr]; ep != nil && (!w.configuredOnly || ep.kind == KindConfigured) {
+		w.order[i] = ep
+		return nil
+	}
+	resp, oc, err := w.p.sendRouted(w.req, w.hold.target, body, w.configuredOnly)
+	return &walkEnd{resp: resp, oc: oc, err: err}
 }
 
 // rememberStatusHop records, when the request has spent its status hop, that
@@ -402,17 +540,19 @@ func (w *walker) stopBefore(next int) stopReason {
 func (w *walker) finish(h hopResult) (*http.Response, outcome, error) {
 	w.record(h)
 	w.alert(h, false)
+	oc := h.oc
+	oc.addr = h.ep.addr
 	if h.err != nil {
-		if h.oc.sent == sentMaybe && IsConnectPhase(h.err) {
-			return nil, h.oc, &MaybeSentError{Err: h.err}
+		if oc.sent == sentMaybe && IsConnectPhase(h.err) {
+			return nil, oc, &MaybeSentError{Err: h.err}
 		}
-		return nil, h.oc, h.err
+		return nil, oc, h.err
 	}
-	if h.oc.action == actAnswer {
+	if oc.action == actAnswer {
 		w.promote(h.ep)
 	}
 	h.resp.Request = w.req
-	return h.resp, h.oc, nil
+	return h.resp, oc, nil
 }
 
 // proceed applies the effects of a hop the walk moves on from.
@@ -429,7 +569,10 @@ func (w *walker) proceed(h hopResult) {
 }
 
 // halt ends the walk on a hop whose outcome is to hop, when stop says hop next
-// may not start. A status hop that cannot proceed returns its response with no
+// may not start. A mutation that may not hop because of its tether ends as a
+// walk that ran out of endpoints does, with the walk's failures, so a
+// tethered request whose endpoint fails in the connect phase returns that
+// error. A status hop that cannot proceed returns its response with no
 // effect. Any other hop keeps its effects, and the walk returns the caller's
 // context error, the send-by refusal, the response a status hop moved away
 // from, or the walk's failures, in that order. When GetBody failed, its error
@@ -444,7 +587,7 @@ func (w *walker) proceed(h hopResult) {
 // rebuilt and the endpoint failed in the connect phase, the pool advances the
 // active endpoint, and the upload's next attempt starts on another one.
 func (w *walker) halt(h hopResult, stop stopReason, next int, rebuildErr error) (*http.Response, outcome, error) {
-	oc := outcome{action: actReturn, sent: h.oc.sent, class: h.oc.class}
+	oc := outcome{action: actReturn, sent: h.oc.sent, class: h.oc.class, addr: h.ep.addr}
 	if h.oc.statusHop {
 		h.resp.Request = w.req
 		return h.resp, oc, nil
@@ -742,6 +885,16 @@ func closeRequestBody(req *http.Request) {
 	if hasBody(req) {
 		_ = req.Body.Close()
 	}
+}
+
+// closeSendBody closes the body a refused send would have carried: body when
+// a walk rebuilt one for the hop, and the request's own body otherwise.
+func closeSendBody(req *http.Request, body io.ReadCloser) {
+	if body != nil {
+		_ = body.Close()
+		return
+	}
+	closeRequestBody(req)
 }
 
 // urlAddress returns the canonical host:port a URL addresses, with the
