@@ -2,14 +2,19 @@ package pvetest
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 // APIPrefix is the path every PVE API route lives under. Route paths given to
 // Routes are relative to it, so "/version" serves "/api2/json/version".
 const APIPrefix = "/api2/json"
+
+// maxStatus is the largest status code net/http writes.
+const maxStatus = 999
 
 type routeKey struct {
 	method string
@@ -28,8 +33,9 @@ type Routes struct {
 
 // NewRoutes returns a table with the routes most tests need. GET /version
 // reports a PVE 9 release, GET /nodes and GET /cluster/resources return empty
-// lists, and every other path under the API prefix answers a PVE envelope
-// whose data is an empty list for GET and null for every other method.
+// lists, POST /access/ticket answers a login with a fresh ticket, a CSRF token,
+// and the user name, and every other path under the API prefix answers a PVE
+// envelope whose data is an empty list for GET and null for every other method.
 func NewRoutes() *Routes {
 	r := &Routes{entries: make(map[routeKey]http.Handler)}
 	r.JSON(http.MethodGet, "/version", http.StatusOK, map[string]string{
@@ -39,9 +45,34 @@ func NewRoutes() *Routes {
 	})
 	r.JSON(http.MethodGet, "/nodes", http.StatusOK, []any{})
 	r.JSON(http.MethodGet, "/cluster/resources", http.StatusOK, []any{})
+	r.HandleFunc(http.MethodPost, "/access/ticket", ticketHandler)
 	r.JSON(http.MethodGet, "/", http.StatusOK, []any{})
 	r.JSON("", "/", http.StatusOK, nil)
 	return r
+}
+
+// ticketHandler answers a password login the way pveproxy does. The ticket's
+// time stamp is the current time, so a client that reads it does not think the
+// ticket has already expired.
+func ticketHandler(w http.ResponseWriter, req *http.Request) {
+	user := "root@pam"
+	if err := req.ParseForm(); err == nil && req.PostForm.Get("username") != "" {
+		user = req.PostForm.Get("username")
+		if !strings.Contains(user, "@") {
+			realm := req.PostForm.Get("realm")
+			if realm == "" {
+				realm = "pam"
+			}
+			user += "@" + realm
+		}
+	}
+	stamp := fmt.Sprintf("%08X", time.Now().Unix())
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+		"ticket":              "PVE:" + user + ":" + stamp + "::pvetest",
+		"CSRFPreventionToken": stamp + ":pvetest",
+		"username":            user,
+	}})
 }
 
 // Handle registers h for the method and the API-relative path.
@@ -70,9 +101,14 @@ func (r *Routes) JSON(method, path string, status int, data any) {
 }
 
 // Fail registers a route that answers status with an empty data envelope and
-// reason as its message. Any status from 100 to 999 works, so Fail serves the
-// 596 and 595 codes that pveproxy uses for backend trouble.
+// reason as its message. Any status from 200 to 999 works, so Fail serves the
+// 502, 503, 595, and 596 codes that pveproxy uses for backend trouble. It
+// panics on a status below 200, because Go's server sends a 1xx other than 101
+// as an interim response and then the real 200, so the route would not fail.
 func (r *Routes) Fail(method, path string, status int, reason string) {
+	if status < http.StatusOK || status > maxStatus {
+		panic(fmt.Sprintf("pvetest: Fail status %d is outside 200 to %d", status, maxStatus))
+	}
 	body, err := json.Marshal(map[string]any{"data": nil, "message": reason})
 	if err != nil {
 		panic("pvetest: marshal failure message: " + err.Error())

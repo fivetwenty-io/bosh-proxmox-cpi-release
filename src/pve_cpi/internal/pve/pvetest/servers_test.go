@@ -107,7 +107,9 @@ func TestLive_ServesRoutesAndRecords(t *testing.T) {
 	if ev := s.Wait(t, pvetest.EventRequest); ev.Request.Method != "POST" {
 		t.Fatalf("second request event = %+v", ev)
 	}
-	s.Wait(t, pvetest.EventConn)
+	if ev := s.Wait(t, pvetest.EventConn); !strings.HasPrefix(ev.Addr, "127.0.0.1:") {
+		t.Fatalf("conn event Addr = %q, want the client's loopback address", ev.Addr)
+	}
 }
 
 func TestLive_FailRouteAndRequestHook(t *testing.T) {
@@ -119,6 +121,7 @@ func TestLive_FailRouteAndRequestHook(t *testing.T) {
 	c := client(ca, false, 0)
 
 	entered, release := make(chan struct{}), make(chan struct{})
+	var released atomic.Bool
 	s.SetOnRequest(func(*http.Request) {
 		close(entered)
 		select {
@@ -129,26 +132,24 @@ func TestLive_FailRouteAndRequestHook(t *testing.T) {
 	type result struct {
 		code int
 		err  error
+		// early is true when the response ended before the test released the hook.
+		early bool
 	}
 	done := make(chan result, 1)
 	go func() {
 		resp, err := get(c, s.URL+"/api2/json/cluster/resources")
 		if err != nil {
-			done <- result{err: err}
+			done <- result{err: err, early: !released.Load()}
 			return
 		}
 		_ = readBody(t, resp)
-		done <- result{code: resp.StatusCode}
+		done <- result{code: resp.StatusCode, early: !released.Load()}
 	}()
 	<-entered
-	select {
-	case r := <-done:
-		t.Fatalf("response arrived while the hook held it: %+v", r)
-	default:
-	}
+	released.Store(true)
 	close(release)
-	if r := <-done; r.err != nil || r.code != 503 {
-		t.Fatalf("held response = %+v, want 503", r)
+	if r := <-done; r.err != nil || r.code != 503 || r.early {
+		t.Fatalf("held response = %+v, want 503 after the release", r)
 	}
 	s.SetOnRequest(nil)
 }
@@ -200,18 +201,44 @@ func TestLive_WrongCAFailsBeforeHandler(t *testing.T) {
 	}
 }
 
-func TestRefused_DialIsRefused(t *testing.T) {
+func TestRefused_ResetsTheHandshakeAndKeepsItsPort(t *testing.T) {
 	t.Parallel()
 	ca := pvetest.NewCA(t)
 	s := pvetest.NewRefused(t)
 
+	// The listener stays bound, so no other server can be handed the port.
+	if ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", s.Addr); err == nil {
+		_ = ln.Close()
+		t.Fatalf("a refused server's port %s must stay bound", s.Addr)
+	}
+
 	_, err := get(client(ca, false, 0), s.URL+"/api2/json/version")
 	var op *net.OpError
-	if !errors.As(err, &op) || op.Op != "dial" || !errors.Is(err, syscall.ECONNREFUSED) {
-		t.Fatalf("GET = %v, want a refused dial", err)
+	if !errors.As(err, &op) || op.Op != "read" || !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("GET = %v, want a handshake read that the server reset", err)
 	}
-	if s.Counts.Conns.Load() != 0 || s.Counts.Requests.Load() != 0 {
-		t.Fatalf("refused server counted Conns=%d Requests=%d", s.Counts.Conns.Load(), s.Counts.Requests.Load())
+	if errors.As(err, &op) && op.Op == "dial" {
+		t.Fatalf("GET = %v: the TCP connect must succeed", err)
+	}
+	if s.Counts.Conns.Load() != 1 || s.Counts.Handshakes.Load() != 0 || s.Counts.Requests.Load() != 0 {
+		t.Fatalf("Conns=%d Handshakes=%d Requests=%d, want 1, 0, 0", s.Counts.Conns.Load(),
+			s.Counts.Handshakes.Load(), s.Counts.Requests.Load())
+	}
+}
+
+func TestRefused_ResetsEveryMethodBeforeARequestExists(t *testing.T) {
+	t.Parallel()
+	ca := pvetest.NewCA(t)
+	s := pvetest.NewRefused(t)
+	c := client(ca, false, 0)
+
+	for range 3 {
+		if _, err := post(c, s.URL+"/api2/json/pools", "poolid=a"); !errors.Is(err, syscall.ECONNRESET) {
+			t.Fatalf("POST = %v, want a reset", err)
+		}
+	}
+	if s.Counts.Conns.Load() != 3 || s.Counts.Requests.Load() != 0 || len(s.Seen()) != 0 {
+		t.Fatalf("Conns=%d Requests=%d, want 3 and 0", s.Counts.Conns.Load(), s.Counts.Requests.Load())
 	}
 }
 
@@ -274,16 +301,13 @@ func TestDropped_HandshakeGetsNoReply(t *testing.T) {
 	tc := tls.Client(conn, ca.ClientConfig("localhost"))
 	hs := make(chan error, 1)
 	go func() { hs <- tc.HandshakeContext(context.Background()) }()
-	// The handshake can only end when the client closes its side, because the
-	// server never writes. Closing the connection here is the client giving up.
-	select {
-	case err := <-hs:
-		t.Fatalf("handshake ended with no server reply: %v", err)
-	default:
-	}
+	// The server never writes, so the only thing that can end the handshake is
+	// the client giving up. Closing the connection here is that, and the handshake
+	// error being the client's own closed connection proves the server sent
+	// neither a reply nor a reset beforehand.
 	_ = conn.Close()
-	if err := <-hs; err == nil {
-		t.Fatal("handshake must fail once the client gives up")
+	if err := <-hs; !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("handshake = %v, want the client's own closed connection", err)
 	}
 	if d.Counts.Handshakes.Load() != 0 || d.Counts.Requests.Load() != 0 {
 		t.Fatal("a dropped server completes no handshake and reads no request")
@@ -336,20 +360,28 @@ func TestHung_HoldsTheConnectionUntilClose(t *testing.T) {
 	s := pvetest.NewHung(t, ca.NewLeaf(t, pvetest.LeafOptions{}))
 	c := client(ca, false, 0)
 
-	errc := make(chan error, 1)
+	type result struct {
+		err error
+		// early is true when the request ended before the test closed the server.
+		early bool
+	}
+	var closing atomic.Bool
+	errc := make(chan result, 1)
 	go func() {
-		_, err := get(c, s.URL+"/api2/json/cluster/resources")
-		errc <- err
+		resp, err := get(c, s.URL+"/api2/json/cluster/resources")
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		errc <- result{err: err, early: !closing.Load()}
 	}()
 	s.Wait(t, pvetest.EventRequest)
-	select {
-	case err := <-errc:
-		t.Fatalf("hung server answered or dropped the request: %v", err)
-	default:
-	}
+	closing.Store(true)
 	s.Close()
-	if err := <-errc; err == nil {
-		t.Fatal("closing the server must fail the waiting request")
+	if r := <-errc; r.err == nil || r.early {
+		t.Fatalf("waiting request = %+v, want a failure that only the server's Close caused", r)
+	}
+	if s.Counts.Method("GET") != 1 {
+		t.Fatalf("GET count = %d, want 1", s.Counts.Method("GET"))
 	}
 }
 
@@ -432,6 +464,89 @@ func TestReuseCloser_RetryReachesLiveListenerWithoutHook(t *testing.T) {
 	s.SetOnReuse(nil)
 }
 
+func TestReuseCloser_HeadAnswerLeavesTheConnectionInSync(t *testing.T) {
+	t.Parallel()
+	ca := pvetest.NewCA(t)
+	s := pvetest.NewReuseCloser(t, ca.NewLeaf(t, pvetest.LeafOptions{}), nil)
+	c := client(ca, true, 0)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodHead, s.URL+"/api2/json/version", nil)
+	if err != nil {
+		t.Fatalf("new HEAD: %v", err)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("HEAD: %v", err)
+	}
+	if resp.ContentLength <= 0 || readBody(t, resp) != "" {
+		t.Fatalf("HEAD answered Content-Length %d and a body, want a length and no body", resp.ContentLength)
+	}
+	// A body that leaked after the HEAD headers would reach the idle connection
+	// as bytes nobody asked for, and the client would drop it. The reused
+	// connection must still be there for the next request to find and close.
+	resp, err = get(c, s.URL+"/api2/json/version")
+	if err != nil {
+		t.Fatalf("GET after HEAD: %v", err)
+	}
+	_ = readBody(t, resp)
+	if s.Counts.Reused.Load() != 1 || s.Counts.Conns.Load() != 2 || s.Counts.Requests.Load() != 2 {
+		t.Fatalf("Reused=%d Conns=%d Requests=%d, want 1, 2, 2", s.Counts.Reused.Load(), s.Counts.Conns.Load(),
+			s.Counts.Requests.Load())
+	}
+}
+
+func TestLive_CountsARequestBeforeItsBodyArrives(t *testing.T) {
+	t.Parallel()
+	ca := pvetest.NewCA(t)
+	s := pvetest.NewLive(t, ca.NewLeaf(t, pvetest.LeafOptions{}), nil)
+	tr := &http.Transport{TLSClientConfig: ca.ClientConfig("localhost"), ExpectContinueTimeout: waitFailsafe}
+	c := &http.Client{Transport: tr}
+	t.Cleanup(tr.CloseIdleConnections)
+
+	// Expect: 100-continue makes the client flush the headers and hold the body
+	// until the server reads it, so the body stalls with no bytes sent at all.
+	pr, pw := io.Pipe()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, s.URL+"/api2/json/pools", pr)
+	if err != nil {
+		t.Fatalf("new POST: %v", err)
+	}
+	req.ContentLength = int64(len("poolid=a"))
+	req.Header.Set("Expect", "100-continue")
+	type result struct {
+		code int
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := c.Do(req)
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		_ = readBody(t, resp)
+		done <- result{code: resp.StatusCode}
+	}()
+
+	ev := s.Wait(t, pvetest.EventRequest)
+	if ev.Request.Method != "POST" || s.Counts.Requests.Load() != 1 || s.Counts.Method("POST") != 1 {
+		t.Fatalf("event %+v, Requests=%d: a stalled upload must show before its body", ev, s.Counts.Requests.Load())
+	}
+	if seen := s.Seen(); len(seen) != 1 || len(seen[0].Body) != 0 {
+		t.Fatalf("Seen = %+v, want the request with no body yet", seen)
+	}
+
+	if _, err = pw.Write([]byte("poolid=a")); err != nil {
+		t.Fatalf("write body: %v", err)
+	}
+	_ = pw.Close()
+	if r := <-done; r.err != nil || r.code != 200 {
+		t.Fatalf("POST = %+v", r)
+	}
+	if seen := s.Seen(); len(seen) != 1 || string(seen[0].Body) != "poolid=a" {
+		t.Fatalf("Seen after the body = %+v, want the body filled in", seen)
+	}
+}
+
 func TestTotalMethodSumsAcrossServers(t *testing.T) {
 	t.Parallel()
 	ca := pvetest.NewCA(t)
@@ -452,6 +567,8 @@ func TestTotalMethodSumsAcrossServers(t *testing.T) {
 		t.Fatal("TotalMethod(GET) must be 0")
 	}
 }
+
+const waitFailsafe = 30 * time.Second
 
 func TestWaitFailsWhenServerCloses(t *testing.T) {
 	t.Parallel()

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -83,5 +84,45 @@ func TestRoutes_FailAndHandleFunc(t *testing.T) {
 	})
 	if code, _ := serve(r, http.MethodPut, pvetest.APIPrefix+"/custom"); code != http.StatusTeapot {
 		t.Errorf("HandleFunc route = %d, want 418", code)
+	}
+}
+
+func TestRoutes_FailRejectsStatusesThatCannotFail(t *testing.T) {
+	t.Parallel()
+	r := pvetest.NewRoutes()
+	for _, status := range []int{-1, 0, 100, 101, 199, 1000} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("Fail with status %d must panic", status)
+				}
+			}()
+			r.Fail(http.MethodGet, "/x", status, "no")
+		}()
+	}
+	r.Fail(http.MethodGet, "/x", 200, "edge")
+	r.Fail(http.MethodGet, "/y", 999, "edge")
+}
+
+func TestRoutes_FailStatusesReachARealClient(t *testing.T) {
+	t.Parallel()
+	ca := pvetest.NewCA(t)
+	routes := pvetest.NewRoutes()
+	statuses := []int{502, 503, 595, 596, 597, 599}
+	for _, status := range statuses {
+		routes.Fail(http.MethodGet, "/status/"+strconv.Itoa(status), status, "backend trouble")
+	}
+	s := pvetest.NewLive(t, ca.NewLeaf(t, pvetest.LeafOptions{}), routes)
+	c := client(ca, false, 0)
+
+	for _, status := range statuses {
+		resp, err := get(c, s.URL+pvetest.APIPrefix+"/status/"+strconv.Itoa(status))
+		if err != nil {
+			t.Fatalf("GET %d: %v", status, err)
+		}
+		body := readBody(t, resp)
+		if resp.StatusCode != status || body != `{"data":null,"message":"backend trouble"}` {
+			t.Errorf("status %d answered %d %q", status, resp.StatusCode, body)
+		}
 	}
 }

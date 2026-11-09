@@ -41,6 +41,8 @@ const (
 	EventDial
 	// EventReuse fires when a ReuseCloser is about to close a reused connection.
 	EventReuse
+
+	eventKinds
 )
 
 const (
@@ -51,7 +53,9 @@ const (
 	waitLimit = 30 * time.Second
 )
 
-// Request is one request a server read.
+// Request is one request a server read. The Request in an Event leaves Body
+// empty, because the event fires before the body is read, and Seen holds the
+// body once it has been read.
 type Request struct {
 	Method     string
 	Path       string
@@ -145,6 +149,10 @@ type Server struct {
 	seen   []Request
 	events map[EventKind]chan Event
 
+	// dropped counts, per event kind, the events emit discarded because the
+	// kind's queue was full.
+	dropped [eventKinds]atomic.Int32
+
 	onRequest atomic.Pointer[func(*http.Request)]
 	onReuse   atomic.Pointer[func()]
 }
@@ -229,7 +237,9 @@ func (s *Server) Seen() []Request {
 // Wait blocks until the server announces an event of the kind and returns it.
 // Each kind has its own queue, so waiting for one kind never discards another.
 // The test fails when the server closes first or after thirty seconds, which
-// is a failsafe and not a delay a passing test pays.
+// is a failsafe and not a delay a passing test pays. A failure names how many
+// events of the kind the server dropped because the queue held 1024 unread
+// events.
 func (s *Server) Wait(tb testing.TB, kind EventKind) Event {
 	tb.Helper()
 	timer := time.NewTimer(waitLimit)
@@ -238,16 +248,31 @@ func (s *Server) Wait(tb testing.TB, kind EventKind) Event {
 	case ev := <-s.events[kind]:
 		return ev
 	case <-s.done:
-		tb.Fatalf("pvetest: %s server on %s closed while waiting for event %d", s.Kind, s.Addr, kind)
+		tb.Fatalf("pvetest: %s server on %s closed while waiting for event %d (%d events of that kind dropped)",
+			s.Kind, s.Addr, kind, s.Dropped(kind))
 	case <-timer.C:
-		tb.Fatalf("pvetest: %s server on %s saw no event %d within %v", s.Kind, s.Addr, kind, waitLimit)
+		tb.Fatalf("pvetest: %s server on %s saw no event %d within %v (%d events of that kind dropped)",
+			s.Kind, s.Addr, kind, waitLimit, s.Dropped(kind))
 	}
 	return Event{}
 }
 
+// Dropped returns how many events of the kind the server discarded because the
+// kind's queue was full. A test that expects more than 1024 unread events of a
+// kind reads them with Wait as they arrive.
+func (s *Server) Dropped(kind EventKind) int32 {
+	if kind < 0 || kind >= eventKinds {
+		return 0
+	}
+	return s.dropped[kind].Load()
+}
+
 // StopListening closes the listener and leaves established connections open,
 // so later dials are refused while a reused connection still answers. It is
-// safe to call more than once and from inside a hook.
+// safe to call more than once and from inside a hook. The port is free from
+// then on, so a server that a parallel test starts could be handed it, which
+// leaves a short window between this call and the dial that is meant to be
+// refused.
 func (s *Server) StopListening() {
 	s.listenOnce.Do(func() { _ = s.listener.Close() })
 }
@@ -288,32 +313,40 @@ func (s *Server) emit(kind EventKind, ev Event) {
 	select {
 	case s.events[kind] <- ev:
 	default:
+		s.dropped[kind].Add(1)
 	}
 }
 
-// observe counts and records a request and runs the request hook. It leaves
-// r.Body readable from its first byte.
+// observe counts and records a request and runs the request hook. It counts and
+// announces the request before it reads any of the body, so a client that
+// stalls a streamed upload still shows in Counts and Wait. The recorded body
+// is filled in once the first 64 KiB, or all of the body when it is shorter,
+// has been read. It leaves r.Body readable from its first byte.
 func (s *Server) observe(r *http.Request, serverName string) {
+	rec := Request{
+		Method:     r.Method,
+		Path:       r.URL.Path,
+		RawQuery:   r.URL.RawQuery,
+		Header:     r.Header.Clone(),
+		ServerName: serverName,
+	}
+	s.Counts.Requests.Add(1)
+	s.Counts.addMethod(r.Method)
+	s.mu.Lock()
+	idx := len(s.seen)
+	s.seen = append(s.seen, rec)
+	s.mu.Unlock()
+	s.emit(EventRequest, Event{Request: rec})
+
 	head, _ := io.ReadAll(io.LimitReader(r.Body, maxRecordedBody))
 	orig := r.Body
 	r.Body = struct {
 		io.Reader
 		io.Closer
 	}{io.MultiReader(bytes.NewReader(head), orig), orig}
-	rec := Request{
-		Method:     r.Method,
-		Path:       r.URL.Path,
-		RawQuery:   r.URL.RawQuery,
-		Header:     r.Header.Clone(),
-		Body:       head,
-		ServerName: serverName,
-	}
-	s.Counts.Requests.Add(1)
-	s.Counts.addMethod(r.Method)
 	s.mu.Lock()
-	s.seen = append(s.seen, rec)
+	s.seen[idx].Body = head
 	s.mu.Unlock()
-	s.emit(EventRequest, Event{Request: rec})
 	if f := s.onRequest.Load(); f != nil {
 		(*f)(r)
 	}
@@ -367,10 +400,10 @@ func (s *Server) serveHTTP(leaf *Leaf, h http.Handler) {
 		Handler:           h,
 		TLSConfig:         s.tlsConfig(leaf),
 		ReadHeaderTimeout: waitLimit,
-		ConnState: func(_ net.Conn, st http.ConnState) {
+		ConnState: func(c net.Conn, st http.ConnState) {
 			if st == http.StateNew {
 				s.Counts.Conns.Add(1)
-				s.emit(EventConn, Event{})
+				s.emit(EventConn, Event{Addr: c.RemoteAddr().String()})
 			}
 		},
 	}

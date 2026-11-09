@@ -32,13 +32,32 @@ func NewLive(tb testing.TB, leaf *Leaf, routes *Routes) *Server {
 	return s
 }
 
-// NewRefused returns a server whose port nothing listens on, so a dial gets
-// ECONNREFUSED at once. The port was free when the call returned, and a test
-// that runs for long could in principle meet another process on it.
+// NewRefused returns a server that refuses every client at the first byte. Its
+// listener stays bound for the life of the test, so no parallel test's server
+// can be handed the port, and it accepts each connection, reads one byte of what
+// the client sent, and closes with a TCP reset.
+//
+// The TCP connect succeeds, so a client does not see ECONNREFUSED from its dial.
+// A TLS client has just written its hello, and its handshake read fails with
+// ECONNRESET ("read: connection reset by peer"). The read happens after the
+// client sent the hello and before any request byte exists, so the spec counts
+// it as a connect-phase failure in the handshake phase and a request never
+// reaches the server, whatever its method. A pool's transport tags it
+// tls_handshake where a free port would be tagged dial, and every row of the
+// outcome table treats the two alike. A test that needs the dial phase or an
+// ECONNREFUSED errno stops a live server's listener with StopListening.
 func NewRefused(tb testing.TB) *Server {
 	tb.Helper()
 	s := newServer(tb, KindRefused, listenLoopback(tb), nil)
-	s.StopListening()
+	s.serveRaw(func(conn net.Conn) {
+		var one [1]byte
+		if _, err := conn.Read(one[:]); err != nil {
+			return
+		}
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+	})
 	return s
 }
 
@@ -153,6 +172,13 @@ func NewBodyThenHijack(tb testing.TB, leaf *Leaf) *Server {
 // that request. Go's transport sees a reused connection die without a response
 // and retries an idempotent request, so a test closes the listener from the
 // reuse hook to make that retry a refused dial.
+//
+// The server covers a GET, which Go retries after an EOF on a reused
+// connection. It does not cover a POST. Go replays a non-idempotent request
+// only after a nothingWrittenError, which means the write to the reused
+// connection failed before any byte went out, and this server closes after the
+// client has already written. A test of the POST case needs a DialTLSContext
+// fake on the transport whose first connection fails its first write.
 type ReuseCloser struct {
 	*Server
 }
@@ -210,6 +236,9 @@ func writeRouted(w io.Writer, routes *Routes, req *http.Request) error {
 	rec := httptest.NewRecorder()
 	routes.ServeHTTP(rec, req)
 	resp := rec.Result()
+	// Response.Write omits the body of a HEAD answer only when it knows the
+	// request, and without it a HEAD would carry bytes the client never expects.
+	resp.Request = req
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
