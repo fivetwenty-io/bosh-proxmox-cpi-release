@@ -20,6 +20,7 @@ type Kind string
 // The server kinds.
 const (
 	KindLive           Kind = "live"
+	KindReset          Kind = "reset"
 	KindRefused        Kind = "refused"
 	KindDropped        Kind = "dropped"
 	KindGarbage        Kind = "garbage"
@@ -37,7 +38,7 @@ const (
 	EventConn EventKind = iota
 	// EventRequest fires when the server reads a request.
 	EventRequest
-	// EventDial fires when a Dropped server's DialContext is entered.
+	// EventDial fires when a Dropped or Refused server's DialContext is entered.
 	EventDial
 	// EventReuse fires when a ReuseCloser is about to close a reused connection.
 	EventReuse
@@ -83,7 +84,7 @@ type Counters struct {
 	Requests atomic.Int32
 	// Reused counts connections a ReuseCloser closed on a later request.
 	Reused atomic.Int32
-	// Dials counts DialContext calls on a Dropped server.
+	// Dials counts DialContext calls on a Dropped or Refused server.
 	Dials atomic.Int32
 
 	mu      sync.Mutex

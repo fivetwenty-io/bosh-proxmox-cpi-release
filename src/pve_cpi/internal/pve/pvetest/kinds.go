@@ -8,7 +8,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
+	"syscall"
 	"testing"
 )
 
@@ -32,7 +34,7 @@ func NewLive(tb testing.TB, leaf *Leaf, routes *Routes) *Server {
 	return s
 }
 
-// NewRefused returns a server that refuses every client at the first byte. Its
+// NewReset returns a server that resets every client at the first byte. Its
 // listener stays bound for the life of the test, so no parallel test's server
 // can be handed the port, and it accepts each connection, reads one byte of what
 // the client sent, and closes with a TCP reset.
@@ -43,12 +45,15 @@ func NewLive(tb testing.TB, leaf *Leaf, routes *Routes) *Server {
 // client sent the hello and before any request byte exists, so the spec counts
 // it as a connect-phase failure in the handshake phase and a request never
 // reaches the server, whatever its method. A pool's transport tags it
-// tls_handshake where a free port would be tagged dial, and every row of the
-// outcome table treats the two alike. A test that needs the dial phase or an
-// ECONNREFUSED errno stops a live server's listener with StopListening.
-func NewRefused(tb testing.TB) *Server {
+// tls_handshake. A test that needs the dial class uses NewRefused.
+func NewReset(tb testing.TB) *Server {
 	tb.Helper()
-	s := newServer(tb, KindRefused, listenLoopback(tb), nil)
+	return newResetServer(tb, KindReset)
+}
+
+func newResetServer(tb testing.TB, kind Kind) *Server {
+	tb.Helper()
+	s := newServer(tb, kind, listenLoopback(tb), nil)
 	s.serveRaw(func(conn net.Conn) {
 		var one [1]byte
 		if _, err := conn.Read(one[:]); err != nil {
@@ -59,6 +64,42 @@ func NewRefused(tb testing.TB) *Server {
 		}
 	})
 	return s
+}
+
+// Refused stands for an endpoint whose port refuses connections. Its DialContext
+// returns the error a refused dial returns, without depending on a free port,
+// so no parallel test can turn the refusal into an answer. Install it as a
+// transport's DialContext, and give the fake routes its Addr to name. A client
+// that dials Addr for real reaches a held listener that resets the connection,
+// which is the NewReset behavior.
+type Refused struct {
+	*Server
+}
+
+// NewRefused starts a Refused server.
+func NewRefused(tb testing.TB) *Refused {
+	tb.Helper()
+	return &Refused{Server: newResetServer(tb, KindRefused)}
+}
+
+// DialContext fails at once with a *net.OpError whose Op is "dial", whose Net is
+// the network asked for, and whose Err is an *os.SyscallError for "connect"
+// wrapping syscall.ECONNREFUSED. That is the error a dial to a closed port
+// returns on Linux and macOS, so errors.Is matches syscall.ECONNREFUSED and the
+// pool tags it as the dial class. A context that has already ended wins, as it
+// does for a real dial, and the error wraps ctx.Err() instead.
+func (r *Refused) DialContext(ctx context.Context, network, _ string) (net.Conn, error) {
+	r.Counts.Dials.Add(1)
+	r.emit(EventDial, Event{Addr: r.Addr})
+	if err := ctx.Err(); err != nil {
+		return nil, &net.OpError{Op: "dial", Net: network, Addr: r.listener.Addr(), Err: err}
+	}
+	return nil, &net.OpError{
+		Op:   "dial",
+		Net:  network,
+		Addr: r.listener.Addr(),
+		Err:  &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED},
+	}
 }
 
 // Dropped stands for an endpoint whose packets vanish. Its TCP listener

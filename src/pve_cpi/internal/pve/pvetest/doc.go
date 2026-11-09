@@ -6,7 +6,10 @@
 // can drive a real net/http transport against it:
 //
 //   - Live answers fake PVE routes and records every request.
-//   - Refused owns a loopback port that nothing listens on, so a dial is refused.
+//   - Reset holds a loopback port and resets each connection after one byte, so a
+//     TLS handshake fails with a connection reset and no request exists.
+//   - Refused offers a DialContext that fails like a dial to a closed port, with
+//     an ECONNREFUSED dial error, and owns a held address for routes to name.
 //   - Dropped accepts TCP and never answers, and offers a DialContext that blocks
 //     until its context ends, so a dial or a handshake times out.
 //   - Garbage writes bytes that are not a TLS record when a client connects.

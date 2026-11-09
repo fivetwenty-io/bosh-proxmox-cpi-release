@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -201,10 +202,10 @@ func TestLive_WrongCAFailsBeforeHandler(t *testing.T) {
 	}
 }
 
-func TestRefused_ResetsTheHandshakeAndKeepsItsPort(t *testing.T) {
+func TestReset_ResetsTheHandshakeAndKeepsItsPort(t *testing.T) {
 	t.Parallel()
 	ca := pvetest.NewCA(t)
-	s := pvetest.NewRefused(t)
+	s := pvetest.NewReset(t)
 
 	// The listener stays bound, so no other server can be handed the port.
 	if ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", s.Addr); err == nil {
@@ -226,10 +227,10 @@ func TestRefused_ResetsTheHandshakeAndKeepsItsPort(t *testing.T) {
 	}
 }
 
-func TestRefused_ResetsEveryMethodBeforeARequestExists(t *testing.T) {
+func TestReset_ResetsEveryMethodBeforeARequestExists(t *testing.T) {
 	t.Parallel()
 	ca := pvetest.NewCA(t)
-	s := pvetest.NewRefused(t)
+	s := pvetest.NewReset(t)
 	c := client(ca, false, 0)
 
 	for range 3 {
@@ -239,6 +240,57 @@ func TestRefused_ResetsEveryMethodBeforeARequestExists(t *testing.T) {
 	}
 	if s.Counts.Conns.Load() != 3 || s.Counts.Requests.Load() != 0 || len(s.Seen()) != 0 {
 		t.Fatalf("Conns=%d Requests=%d, want 3 and 0", s.Counts.Conns.Load(), s.Counts.Requests.Load())
+	}
+}
+
+func TestRefused_DialContextReturnsADialClassRefusal(t *testing.T) {
+	t.Parallel()
+	r := pvetest.NewRefused(t)
+
+	_, err := r.DialContext(context.Background(), "tcp", r.Addr)
+	var op *net.OpError
+	if !errors.As(err, &op) || op.Op != "dial" || op.Net != "tcp" || op.Addr == nil || op.Addr.String() != r.Addr {
+		t.Fatalf("DialContext = %#v, want a dial OpError for %s", err, r.Addr)
+	}
+	var sc *os.SyscallError
+	if !errors.As(err, &sc) || sc.Syscall != "connect" {
+		t.Fatalf("DialContext = %v, want a connect SyscallError", err)
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("DialContext = %v, want ECONNREFUSED", err)
+	}
+	if want := "dial tcp " + r.Addr + ": connect: connection refused"; err.Error() != want {
+		t.Fatalf("error text = %q, want %q", err, want)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a refusal must not look like a context ending: %v", err)
+	}
+	if r.Counts.Dials.Load() != 1 || r.Counts.Conns.Load() != 0 {
+		t.Fatalf("Dials=%d Conns=%d, want 1 and 0", r.Counts.Dials.Load(), r.Counts.Conns.Load())
+	}
+	if ev := r.Wait(t, pvetest.EventDial); ev.Addr != r.Addr {
+		t.Fatalf("dial event = %+v", ev)
+	}
+
+	canceled, stop := context.WithCancel(context.Background())
+	stop()
+	if _, err = r.DialContext(canceled, "tcp", r.Addr); !errors.Is(err, context.Canceled) ||
+		errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("canceled DialContext = %v, want the context's error", err)
+	}
+}
+
+func TestRefused_WorksAsATransportDialer(t *testing.T) {
+	t.Parallel()
+	ca := pvetest.NewCA(t)
+	r := pvetest.NewRefused(t)
+	tr := &http.Transport{TLSClientConfig: ca.ClientConfig("localhost"), DialContext: r.DialContext}
+	t.Cleanup(tr.CloseIdleConnections)
+
+	_, err := get(&http.Client{Transport: tr}, r.URL+"/api2/json/version")
+	var op *net.OpError
+	if !errors.As(err, &op) || op.Op != "dial" || !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("GET = %v, want a refused dial", err)
 	}
 }
 
@@ -572,7 +624,7 @@ const waitFailsafe = 30 * time.Second
 
 func TestWaitFailsWhenServerCloses(t *testing.T) {
 	t.Parallel()
-	s := pvetest.NewRefused(t)
+	s := pvetest.NewReset(t)
 	s.Close()
 	ft := &fakeTB{TB: t}
 	func() {
