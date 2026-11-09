@@ -148,6 +148,79 @@ def bosh_int(file: "str | Path", path: str, dry_run: bool = False) -> str:
     return result.stdout.rstrip("\n")
 
 
+def bosh_int_optional(file: "str | Path", path: str, dry_run: bool = False) -> "str | None":
+    """Run ``bosh int`` for a top-level path that may be absent from the file.
+
+    ``bosh int --path`` exits nonzero for a missing key, which bosh_int turns
+    into a fatal error, so an optional variable cannot be read through it
+    directly. This checks that the top-level key exists in the YAML file first
+    and returns None when it does not, then delegates to bosh_int so a present
+    key is interpolated exactly the way every required variable is.
+
+    Args:
+        file:    Path to the vars YAML file passed to bosh int.
+        path:    Top-level bosh-interpolation path, e.g. ``/pve_endpoints``.
+        dry_run: When True, return None without reading or shelling out.
+
+    Returns:
+        Stripped bosh int stdout, or None when dry_run is set or the key is
+        absent from the file.
+
+    Raises:
+        SystemExit: the file cannot be read or parsed, or bosh int exits nonzero.
+    """
+    if dry_run:
+        return None
+
+    key = path.lstrip("/")
+    try:
+        data = yaml.safe_load(Path(file).read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        sys.exit(f"cannot read optional var {path!r} from {file}: {exc}")
+
+    if not isinstance(data, dict) or key not in data:
+        return None
+    return bosh_int(file, path)
+
+
+def parse_endpoints(raw: "str | None", source: str) -> "list[str]":
+    """Parse the ``bosh int`` output for ``/pve_endpoints`` into an endpoint list.
+
+    The CPI owns the endpoint grammar and rejects a malformed entry when it
+    loads its config, so this only enforces the JSON shape the config expects:
+    a list of non-empty strings. An absent or empty variable yields an empty
+    list, which the caller leaves out of the config.
+
+    Args:
+        raw:    Stripped ``bosh int`` stdout, or None when the variable is unset.
+        source: Vars file path, used in error messages.
+
+    Returns:
+        The endpoints in the order given.
+
+    Raises:
+        ValueError: the value is not a list of non-empty strings.
+    """
+    if raw is None or not raw.strip():
+        return []
+    try:
+        value = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"pve_endpoints in {source} is not valid YAML: {exc}") from exc
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(
+            f"pve_endpoints in {source} must be a list of endpoints, got {type(value).__name__}"
+        )
+    for index, entry in enumerate(value):
+        if not isinstance(entry, str) or not entry.strip():
+            raise ValueError(
+                f"pve_endpoints[{index}] in {source} must be a non-empty string, got {entry!r}"
+            )
+    return list(value)
+
+
 def build_cpi_config(
     cfg: dict,
     *,
@@ -177,7 +250,8 @@ def build_cpi_config(
 
     Raises:
         SystemExit: bosh int fails for any required var.
-        ValueError:  pve_port present but not an integer.
+        ValueError:  pve_port present but not an integer, or pve_endpoints
+                     present but not a list of non-empty strings.
     """
     bosh_vars = cfg["bosh_vars"]
     tier1 = cfg["tier1"]
@@ -243,6 +317,16 @@ def build_cpi_config(
         "vmid_range_start": int(tier1["vmid_range_start"]),
         "agent_mbus": agent_mbus,
     }
+
+    # Optional ordered endpoint list for failover. Left out of the config when
+    # /pve_endpoints is absent or empty so a harness without it renders the
+    # same config as before. When present, the CPI requires pve_host and
+    # pve_port to name the first entry.
+    endpoints = parse_endpoints(
+        bosh_int_optional(bosh_vars, "/pve_endpoints", dry_run=dry_run), str(bosh_vars)
+    )
+    if endpoints:
+        cpi_cfg["endpoints"] = endpoints
 
     # vmid_range_end must reach the CPI: its default (8999) is a hard upper
     # bound the CPI validates vmid_range_start against, so any range starting

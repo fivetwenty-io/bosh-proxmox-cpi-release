@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.machinery as _ilm
 import importlib.util as _ilu
+import json
 import sys
 import tempfile
 import types as _types
@@ -739,6 +740,123 @@ class TestBuildCpiConfigParkerPool(unittest.TestCase):
 
     def test_explicit_pool_wins(self):
         self.assertEqual(self._build({"pool": "lab-parker"})["parker_pool"], "lab-parker")
+
+
+class TestBuildCpiConfigEndpoints(unittest.TestCase):
+    """Tests for the optional /pve_endpoints variable build_cpi_config passes through."""
+
+    _REQUIRED = {
+        "/pve_host": "pve.example.com",
+        "/pve_port": "8006",
+        "/pve_user": "root@pam",
+        "/pve_node": "pve1",
+        "/pve_vm_storage": "local-lvm",
+        "/pve_disk_storage": "local-lvm",
+        "/pve_stemcell_storage": "local",
+        "/pve_iso_storage": "local",
+        "/pve_network_bridge": "vmbr0",
+        "/pve_verify_ssl": "false",
+        "/pve_api_token": "root@pam!t=secret",
+        "/pve_password": "",
+    }
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._vars = Path(self._tmp.name) / "vars.yml"
+
+    def _build(self, vars_yaml: str, endpoints_out: "str | None" = None, dry_run: bool = False) -> dict:
+        """Build a config against a real vars file with bosh int stubbed per path."""
+        self._vars.write_text(vars_yaml, encoding="utf-8")
+        answers = dict(self._REQUIRED)
+        if endpoints_out is not None:
+            answers["/pve_endpoints"] = endpoints_out
+
+        def fake_bosh_int(file, path, dry_run=False):
+            return answers[path]
+
+        cfg = {"bosh_vars": str(self._vars), "tier1": {"vmid_range_start": 100}}
+        with unittest.mock.patch.object(_integration, "bosh_int", side_effect=fake_bosh_int) as stub:
+            result = _integration.build_cpi_config(cfg, dry_run=dry_run)
+        self.stub = stub
+        return result
+
+    def test_unset_variable_leaves_config_without_endpoints(self):
+        built = self._build("pve_host: pve.example.com\n")
+        self.assertNotIn("endpoints", built)
+        paths = [call.args[1] for call in self.stub.call_args_list]
+        self.assertNotIn("/pve_endpoints", paths)
+
+    def test_unset_variable_config_is_byte_identical_to_the_prior_shape(self):
+        built = self._build("pve_host: pve.example.com\n")
+        expected = {
+            "host": "pve.example.com",
+            "port": 8006,
+            "user": "root@pam",
+            "node": "pve1",
+            "vm_storage": "local-lvm",
+            "disk_storage": "local-lvm",
+            "stemcell_storage": "local",
+            "iso_storage": "local",
+            "network_bridge": "vmbr0",
+            "verify_ssl": False,
+            "vmid_range_start": 100,
+            "agent_mbus": "https://mbus:mbus@0.0.0.0:6868",
+            "parker_pool": "{prefix}-parker",
+            "api_token": "root@pam!t=secret",
+        }
+        self.assertEqual(built, expected)
+        self.assertEqual(json.dumps(built, indent=2), json.dumps(expected, indent=2))
+
+    def test_set_variable_carries_the_list_in_order(self):
+        built = self._build(
+            "pve_endpoints: [pve.example.com, pve2.example.com:8007]\n",
+            endpoints_out="- pve.example.com\n- pve2.example.com:8007",
+        )
+        self.assertEqual(built["endpoints"], ["pve.example.com", "pve2.example.com:8007"])
+        self.assertEqual(built["host"], "pve.example.com")
+
+    def test_ipv6_with_port_entry_survives(self):
+        built = self._build(
+            "pve_endpoints: x\n", endpoints_out="- '[2001:db8::1]:8006'\n- 2001:db8::2"
+        )
+        self.assertEqual(built["endpoints"], ["[2001:db8::1]:8006", "2001:db8::2"])
+
+    def test_empty_list_is_treated_as_unset(self):
+        built = self._build("pve_endpoints: []\n", endpoints_out="[]")
+        self.assertNotIn("endpoints", built)
+
+    def test_null_value_is_treated_as_unset(self):
+        built = self._build("pve_endpoints: ~\n", endpoints_out="null")
+        self.assertNotIn("endpoints", built)
+
+    def test_dry_run_omits_endpoints_without_reading_the_variable(self):
+        built = self._build("pve_endpoints: [a]\n", endpoints_out="- a", dry_run=True)
+        self.assertNotIn("endpoints", built)
+
+    def test_scalar_value_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "must be a list"):
+            self._build("pve_endpoints: a\n", endpoints_out="pve.example.com")
+
+    def test_non_string_entry_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, r"pve_endpoints\[1\].*non-empty string"):
+            self._build("pve_endpoints: x\n", endpoints_out="- pve.example.com\n- 8006")
+
+    def test_blank_entry_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, r"pve_endpoints\[0\].*non-empty string"):
+            self._build("pve_endpoints: x\n", endpoints_out="- ''")
+
+    def test_unparseable_value_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "not valid YAML"):
+            self._build("pve_endpoints: x\n", endpoints_out="- [unclosed")
+
+    def test_unreadable_vars_file_exits(self):
+        with self.assertRaises(SystemExit):
+            _integration.bosh_int_optional(Path(self._tmp.name) / "missing.yml", "/pve_endpoints")
+
+    def test_optional_read_returns_none_for_non_mapping_file(self):
+        self._vars.write_text("- just\n- a list\n", encoding="utf-8")
+        self.assertIsNone(_integration.bosh_int_optional(self._vars, "/pve_endpoints"))
 
 
 class TestCfScripts_AdminPassword_UsesDirectorName(unittest.TestCase):
