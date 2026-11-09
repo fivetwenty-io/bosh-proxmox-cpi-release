@@ -65,8 +65,12 @@ func WithMaxWait(d time.Duration) AwaitOption {
 //   - ctx is nil — non-retriable CloudError (programming error).
 //   - ctx cancelled / deadline exceeded — retriable RetriableCloudError; the
 //     BOSH director re-issues the CPI action with a new VMID.
-//   - transient poll fault (5xx, connection error, network timeout) — retriable
-//     RetriableCloudError via WrapError classification.
+//   - transient poll fault (5xx, connection error, network timeout, 595 from
+//     a down task node) — re-polled at the poll interval until the task's
+//     deadline; at the deadline the poll-timeout-unresolved error is returned
+//     (retriable to the director, never a transient shape, so no retry helper
+//     re-submits the task's mutation).
+//   - permanent poll fault (4xx, 404, unknown shape) — returned at once.
 //   - nil status — non-retriable CloudError (SDK contract violation).
 //   - empty exit status — non-retriable CloudError (PVE never wrote outcome).
 //   - non-OK, non-WARNINGS exit status — non-retriable CloudError (permanent
@@ -131,45 +135,9 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 		JitterPct:         pollJitterPct,
 	}
 
-	status, err := c.Tasks().Wait(ctx, node, upid, waitOpts)
+	status, err := waitTaskThroughTransientFaults(ctx, c, node, upid, waitOpts, ao)
 	if err != nil {
-		// ctx cancellation / deadline: retriable so the director re-issues the
-		// CPI action. The in-flight PVE task is orphaned; the director supplies
-		// a fresh VMID on retry and the VMID range-scan prevents collision.
-		if ctx.Err() != nil {
-			return cpierrors.WrapAs(ctx.Err(), cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("AwaitTask %s: context cancelled", upid))
-		}
-		// The SDK reports a RESOLVED task's failing exit status as an error
-		// of its own ("task failed: <exit text>", parseTaskStatus in
-		// pkg/api/tasks) rather than through the returned status, so it
-		// arrives here alongside genuine poll faults. Render and classify it
-		// exactly as the adaptive path's classifyTaskExit does: WrapError
-		// keeps a contention exit (cfs-lock timeout) retriable and a genuine
-		// verdict permanent, and IsTaskExitVerdict has one "failed: exit
-		// status" shape to match across both polling modes.
-		if exit, resolved := sdkTaskFailureExit(err); resolved {
-			return WrapError(fmt.Errorf("task %s failed: exit status %q", upid, exit))
-		}
-		// The vendored poller's own TimeoutSeconds window (derived from ao.
-		// maxWaitSeconds via context.WithTimeout, independent of the caller's
-		// ctx already excluded above) can elapse while a poll interval sleep
-		// or an in-flight status read is outstanding; both arms return
-		// "task polling canceled...: %w" wrapping that derived context's
-		// DeadlineExceeded (vendor tasks.go waitForInterval / poll "before
-		// start"). Reaching here with ctx.Err() == nil proves the outer ctx
-		// is fine and it was the poller's own budget that ran out — the PVE
-		// task named by upid may still be executing. Classify it exactly
-		// like the empty-exit-status case below (poll gave up, task
-		// unresolved), NOT as a transient transport fault: a caller
-		// wrapping AwaitTask in RetryOnTransientOrLock must not treat this
-		// as license to re-submit the mutation the task belongs to.
-		if errors.Is(err, context.DeadlineExceeded) {
-			return pollTimeoutUnresolved(upid)
-		}
-		// Route through WrapError: 5xx, ConnectionError, TimeoutError, net.Error
-		// Timeout all surface as retriable; permanent SDK errors stay non-retriable.
-		return wrapPollError(err, upid)
+		return err
 	}
 
 	if status == nil {
@@ -203,6 +171,157 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 	// true by construction rather than by two independently maintained
 	// copies drifting apart.
 	return classifyTaskExit(upid, exit, status.Warned)
+}
+
+// waitTaskThroughTransientFaults runs the SDK's Wait for the default (fixed
+// interval) poll path and keeps going through transient poll faults. Wait
+// returns on the first error that is not "task still in progress", so a
+// single refused connection, 5xx, or pushback answer ends a poll whose task
+// is very likely still running, and the error that came back looked like a
+// transient fault a retry helper above AwaitTask would answer by submitting
+// the whole mutation again. Instead this loop re-polls a transient fault at
+// the poll interval, as the adaptive loop does, until the task's deadline,
+// and at the deadline returns pollTimeoutUnresolved, the one shape that never
+// licenses a resubmit. A transient error is never what comes back.
+//
+// A poll stamped with a routed upload host is the one exception and returns
+// its transient fault at once; see the comment at that return.
+//
+// A task whose own node is down ends the same way: every entry node answers
+// 595 for the task's status path, the wrapper passes it through, and the
+// poll waits out the task's deadline and returns unresolved.
+//
+// The returned status is non-nil only with a nil error. A non-nil error is
+// final and already classified: ctx cancellation, a resolved task's failing
+// exit, the poller's own window elapsing, a permanent fault (including a 404),
+// or the deadline.
+func waitTaskThroughTransientFaults(
+	ctx context.Context, c Client, node, upid string, waitOpts *sdktasks.WaitOptions, ao *awaitOptions,
+) (*sdktasks.Status, error) {
+	maxWait := ao.maxWaitSeconds
+	if maxWait <= 0 {
+		maxWait = defaultMaxWaitSeconds
+	}
+	deadline := time.Now().Add(time.Duration(maxWait) * time.Second)
+	interval := time.Duration(ao.pollIntervalMs) * time.Millisecond
+
+	deadlineTimer := time.NewTimer(time.Until(deadline))
+	defer deadlineTimer.Stop()
+
+	for attempt := 0; ; attempt++ {
+		// Each Wait call gets only what is left of the task's window, so the
+		// loop as a whole never outlives the deadline the caller asked for.
+		attemptOpts := *waitOpts
+		attemptOpts.TimeoutSeconds = remainingWaitSeconds(deadline)
+
+		status, err := c.Tasks().Wait(ctx, node, upid, &attemptOpts)
+		if err == nil {
+			return status, nil
+		}
+		// ctx cancellation / deadline: retriable so the director re-issues the
+		// CPI action. The in-flight PVE task is orphaned; the director supplies
+		// a fresh VMID on retry and the VMID range-scan prevents collision.
+		if ctx.Err() != nil {
+			return nil, cpierrors.WrapAs(ctx.Err(), cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("AwaitTask %s: context cancelled", upid))
+		}
+		// The SDK reports a RESOLVED task's failing exit status as an error
+		// of its own ("task failed: <exit text>", parseTaskStatus in
+		// pkg/api/tasks) rather than through the returned status, so it
+		// arrives here alongside genuine poll faults. Render and classify it
+		// exactly as the adaptive path's classifyTaskExit does: WrapError
+		// keeps a contention exit (cfs-lock timeout) retriable and a genuine
+		// verdict permanent, and IsTaskExitVerdict has one "failed: exit
+		// status" shape to match across both polling modes.
+		if exit, resolved := sdkTaskFailureExit(err); resolved {
+			return nil, WrapError(fmt.Errorf("task %s failed: exit status %q", upid, exit))
+		}
+		// The vendored poller's own TimeoutSeconds window (derived from the
+		// remaining budget via context.WithTimeout, independent of the
+		// caller's ctx already excluded above) can elapse while a poll
+		// interval sleep or an in-flight status read is outstanding; both
+		// arms return "task polling canceled...: %w" wrapping that derived
+		// context's DeadlineExceeded (vendor tasks.go waitForInterval / poll
+		// "before start"). Reaching here with ctx.Err() == nil proves the
+		// outer ctx is fine and it was the poller's own budget that ran out
+		// -- the PVE task named by upid may still be executing. Classify it
+		// as the poll giving up with the task unresolved, NOT as a transient
+		// transport fault: a caller wrapping AwaitTask in
+		// RetryOnTransientOrLock must not treat this as license to re-submit
+		// the mutation the task belongs to.
+		if sdkPollWindowElapsed(err) {
+			return nil, pollTimeoutUnresolved(upid)
+		}
+		// A permanent fault (4xx non-404, a 404 for the task, or an unknown
+		// error shape) will not change on a re-poll, so it ends the poll.
+		if !isTransientPollFault(err) {
+			return nil, wrapPollError(err, upid)
+		}
+
+		// A poll pinned to a routed upload host (UploadHostFromContext) returns
+		// its fault at once, as it always has. The upload loops above AwaitTask
+		// read that fault to drop the pin and re-await the SAME pending UPID
+		// through the configured endpoint (a refused dial fails over to the
+		// proxied path), and they never re-POST on it because it carries no
+		// task verdict. Re-polling here would hold them on a dead direct host
+		// for the task's whole window before that fallback could run.
+		if UploadHostFromContext(ctx) != "" {
+			return nil, wrapPollError(err, upid)
+		}
+
+		// Transient fault: the task may well still be running. Sleep the poll
+		// interval and ask again, until the task's deadline.
+		if !time.Now().Before(deadline) {
+			return nil, pollTimeoutUnresolved(upid)
+		}
+		d := interval
+		if override := backoffFromCtx(ctx); override != nil {
+			d = override(attempt)
+		}
+		sleep := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			sleep.Stop()
+			return nil, cpierrors.WrapAs(ctx.Err(), cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("AwaitTask %s: context cancelled", upid))
+		case <-deadlineTimer.C:
+			sleep.Stop()
+			return nil, pollTimeoutUnresolved(upid)
+		case <-sleep.C:
+		}
+	}
+}
+
+// remainingWaitSeconds rounds the time left before deadline up to whole
+// seconds, the unit of the SDK's WaitOptions.TimeoutSeconds, with a floor of
+// one second because zero would select the SDK's own five-minute default.
+func remainingWaitSeconds(deadline time.Time) int {
+	left := time.Until(deadline)
+	secs := int((left + time.Second - 1) / time.Second)
+	if secs < 1 {
+		return 1
+	}
+	return secs
+}
+
+// sdkPollWindowElapsed reports whether err is the SDK poller giving up on its
+// own derived timeout ("task polling canceled[ before start]: context
+// deadline exceeded"). A transport timeout on one status read also wraps
+// context.DeadlineExceeded, but it comes back under "failed to get task
+// status", so it is not mistaken for the poller's window and is retried like
+// any other transient fault.
+func sdkPollWindowElapsed(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) && strings.Contains(err.Error(), "task polling canceled")
+}
+
+// isTransientPollFault reports whether a failed task-status read is a fault a
+// later poll can be expected to get past: a transport fault (5xx, connection
+// error, network timeout), storage-lock contention, a pmxcfs race, or a PVE
+// pushback phrase. Both poll paths use it to choose between sleeping and
+// retrying and ending the poll.
+func isTransientPollFault(err error) bool {
+	return IsTransientTransport(err) || IsStorageLockTimeout(err) ||
+		IsPmxcfsConfigMissing(err) || IsPVEPushback(err)
 }
 
 // adaptiveTaskPollBounds are the clamp on the progress-derived poll interval.
@@ -301,8 +420,7 @@ func awaitTaskAdaptive(ctx context.Context, c Client, node, upid string, opts ..
 			// through to the sleep-and-retry path. Permanent faults (4xx non-404,
 			// generic unknown) are returned immediately so they are not misclassified
 			// as a retriable poll-timeout when actx eventually fires.
-			if !IsTransientTransport(err) && !IsStorageLockTimeout(err) &&
-				!IsPmxcfsConfigMissing(err) && !IsPVEPushback(err) {
+			if !isTransientPollFault(err) {
 				return wrapPollError(err, upid)
 			}
 			// Transient read fault: fall through and retry until the deadline.
