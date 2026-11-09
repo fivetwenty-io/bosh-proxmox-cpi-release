@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	pvehttp "github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/http"
@@ -100,6 +101,10 @@ type Response struct {
 type client struct {
 	options    *Options
 	httpClient HTTPClient
+
+	// tuneMu guards the options writes in SetTimeout and SetKeepAlive. It is
+	// never held while calling the inner client, which may call caller code.
+	tuneMu sync.Mutex
 }
 
 // HTTPClient defines the interface for HTTP operations.
@@ -166,7 +171,10 @@ func (c *client) Get(path string, params map[string]interface{}) (interface{}, e
 	return resp.Data, nil
 }
 
-// SetMetrics attaches a Prometheus-friendly metrics collector. Optional.
+// SetMetrics attaches a Prometheus-friendly metrics collector, or detaches it
+// when m is nil. Optional. A request records its whole lifecycle on the
+// collector in effect when it started. It is safe to call while requests are
+// in flight.
 func (c *client) SetMetrics(m *pmetrics.DefaultMetrics) {
 	if a, ok := c.httpClient.(*internalHTTPAdapter); ok && a.inner != nil {
 		a.inner.SetMetrics(m)
@@ -373,23 +381,45 @@ func (c *client) UpdateCSRFToken(token string) {
 	}
 }
 
-// SetTimeout sets the request timeout, applying it to the live HTTP client
-// (both the request deadline and the underlying transport) so it takes
-// effect for subsequent requests without reconstructing the client.
+// SetTimeout sets the request timeout (http.Client.Timeout) for subsequent
+// requests, including ticket logins, without reconstructing the client. It is
+// safe to call while requests are in flight: it switches later requests to a
+// copy of the underlying http.Client carrying the new timeout rather than
+// writing the one in use. The timeout applies to each HTTP attempt, not to a
+// whole SDK request: an attempt already in flight keeps the timeout it started
+// with, and a later attempt of the same request, such as a retry or the resend
+// after a forced re-login, uses the new one. It works the same with and without
+// Options.WrapTransport, because the timeout applies above the transport.
 func (c *client) SetTimeout(timeout time.Duration) {
+	c.tuneMu.Lock()
 	c.options.Timeout = timeout
+	c.tuneMu.Unlock()
+
+	// Called after tuneMu is released: the inner client may call the
+	// caller's logger, which may call back into this client.
 	c.httpClient.SetTimeout(timeout)
 }
 
-// SetKeepAlive sets the number of keep-alive connections, applying it to the
-// live transport so it takes effect for subsequent requests without
-// reconstructing the client.
+// SetKeepAlive sets the number of keep-alive connections for subsequent
+// requests without reconstructing the client. It is safe to call while
+// requests are in flight: it switches later requests to a retuned copy of the
+// transport rather than writing the one in use. It closes the replaced
+// transport's idle connections on a separate goroutine and does not wait, so
+// a connection's Close from Options.DialContext may call it. When
+// Options.WrapTransport is set it records the value and changes no
+// transport, as that option describes.
 func (c *client) SetKeepAlive(connections int) {
+	c.tuneMu.Lock()
 	c.options.KeepAlive = connections
+	c.tuneMu.Unlock()
+
+	// Called after tuneMu is released: the inner client may call the
+	// caller's logger, which may call back into this client.
 	c.httpClient.SetKeepAlive(connections)
 }
 
-// SetLogger installs a structured logger for HTTP requests.
+// SetLogger installs a structured logger for HTTP requests. It is safe to call
+// while requests are in flight.
 func (c *client) SetLogger(l Logger) {
 	if a, ok := c.httpClient.(*internalHTTPAdapter); ok && a.inner != nil {
 		a.inner.SetLogger(l)
@@ -397,20 +427,25 @@ func (c *client) SetLogger(l Logger) {
 }
 
 // SetLogConfig configures logging behavior (redaction, body sampling, etc.).
+// The client keeps its own copy of the redaction lists. It is safe to call
+// while requests are in flight.
 func (c *client) SetLogConfig(cfg LogConfig) {
 	if a, ok := c.httpClient.(*internalHTTPAdapter); ok && a.inner != nil {
 		a.inner.SetLogConfig(cfg)
 	}
 }
 
-// AddLogHook adds a logging event hook.
+// AddLogHook adds a logging event hook. It is safe to call while requests are
+// in flight.
 func (c *client) AddLogHook(h Hook) {
 	if a, ok := c.httpClient.(*internalHTTPAdapter); ok && a.inner != nil {
 		a.inner.AddHook(h)
 	}
 }
 
-// GetLogConfig returns the current logging config snapshot.
+// GetLogConfig returns a copy of the current logging config, including its
+// redaction lists, so changing it does not change the client's until it is
+// passed to SetLogConfig.
 func (c *client) GetLogConfig() LogConfig {
 	if a, ok := c.httpClient.(*internalHTTPAdapter); ok && a.inner != nil {
 		return a.inner.LogConfig()
@@ -421,7 +456,8 @@ func (c *client) GetLogConfig() LogConfig {
 	return zero
 }
 
-// SetTFAHandler installs a TFA handler used by the underlying HTTP client to auto-complete challenges.
+// SetTFAHandler installs a TFA handler used by the underlying HTTP client to auto-complete challenges, or
+// removes it when h is nil. It is safe to call while requests are in flight.
 func (c *client) SetTFAHandler(h TFAHandler) {
 	if a, ok := c.httpClient.(*internalHTTPAdapter); ok && a.inner != nil {
 		a.inner.SetTFAHandler(h)
@@ -645,6 +681,7 @@ func internalHTTPNew(opts *Options) (*pvehttp.Client, error) {
 		TCPKeepAliveSec:             opts.TCPKeepAliveSec,
 		DialContext:                 opts.DialContext,
 		Proxy:                       opts.Proxy,
+		WrapTransport:               opts.WrapTransport,
 		CacheConfig:                 opts.CacheConfig,
 		CookieName:                  opts.CookieName,
 		PVENewFormat:                opts.PVENewFormat,

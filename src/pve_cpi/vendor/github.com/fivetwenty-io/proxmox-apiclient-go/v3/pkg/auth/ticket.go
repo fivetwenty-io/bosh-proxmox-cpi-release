@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/constants"
@@ -40,11 +41,12 @@ var (
 // TicketAuthenticator provides ticket-based authentication for PVE.
 // mu guards all reads and writes of the ticket field; Refresh/RefreshForce/
 // SetTicket/CompleteTFA/processTFAResult acquire the write lock, GetTicket/
-// GetHeaders/IsAuthenticated acquire the read lock.
+// GetHeaders/IsAuthenticated acquire the read lock. httpClient is loaded
+// atomically so SetHTTPClient can replace it while logins run.
 type TicketAuthenticator struct {
 	mu           sync.RWMutex
 	baseURL      string
-	httpClient   *http.Client
+	httpClient   atomic.Pointer[http.Client]
 	credentials  *Credentials
 	ticket       *Ticket
 	cookieName   string
@@ -63,13 +65,15 @@ func NewTicketAuthenticator(
 		credentials.Realm = realmPAM
 	}
 
-	return &TicketAuthenticator{
+	ticketAuth := &TicketAuthenticator{
 		baseURL:      baseURL,
-		httpClient:   httpClient,
 		credentials:  credentials,
 		cookieName:   firstNonEmpty(cookieName, "PVEAuthCookie"),
 		pveNewFormat: pveNewFormat,
 	}
+	ticketAuth.httpClient.Store(httpClient)
+
+	return ticketAuth
 }
 
 // NewTicketAuthenticatorFromTicket creates a ticket authenticator seeded with a
@@ -101,11 +105,11 @@ func NewTicketAuthenticatorFromTicket(
 
 	ticketAuth := &TicketAuthenticator{
 		baseURL:      baseURL,
-		httpClient:   httpClient,
 		credentials:  credentials,
 		cookieName:   firstNonEmpty(cookieName, "PVEAuthCookie"),
 		pveNewFormat: pveNewFormat,
 	}
+	ticketAuth.httpClient.Store(httpClient)
 
 	if ticketValue != "" {
 		validUntil := time.Now().Add(constants.TicketValidity())
@@ -271,7 +275,7 @@ func (ta *TicketAuthenticator) Logout() error {
 		req.Header.Set(key, value)
 	}
 
-	resp, err := ta.httpClient.Do(req)
+	resp, err := ta.httpClient.Load().Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send logout request: %w", err)
 	}
@@ -293,6 +297,19 @@ func (ta *TicketAuthenticator) Logout() error {
 	ta.mu.Unlock()
 
 	return nil
+}
+
+// SetHTTPClient replaces the *http.Client the authenticator sends login,
+// renewal, TFA, and logout requests with. Requests already sent keep the
+// client they started with. It is safe to call while those requests run. A
+// nil client is ignored, so the authenticator always keeps a client to send
+// with.
+func (ta *TicketAuthenticator) SetHTTPClient(httpClient *http.Client) {
+	if httpClient == nil {
+		return
+	}
+
+	ta.httpClient.Store(httpClient)
 }
 
 // SetTicket sets the authentication ticket.
@@ -387,7 +404,7 @@ func (ta *TicketAuthenticator) createTFARequest(challenge *TFAChallenge, respons
 }
 
 func (ta *TicketAuthenticator) sendTFARequest(req *http.Request) (*http.Response, error) {
-	resp, err := ta.httpClient.Do(req)
+	resp, err := ta.httpClient.Load().Do(req)
 	if err != nil {
 		return nil, &apierrors.ConnectionError{
 			Message: "TFA request failed",
@@ -514,7 +531,7 @@ func (ta *TicketAuthenticator) createLoginRequest(loginURL string, data url.Valu
 }
 
 func (ta *TicketAuthenticator) sendLoginRequest(req *http.Request) (*http.Response, error) {
-	resp, err := ta.httpClient.Do(req)
+	resp, err := ta.httpClient.Load().Do(req)
 	if err != nil {
 		return nil, &apierrors.ConnectionError{
 			Message: "login request failed",

@@ -2,6 +2,7 @@ package http
 
 import (
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -87,16 +88,100 @@ func redact(in map[string][]string, redactKeys []string) map[string]interface{} 
 	return out
 }
 
-func (c *Client) SetLogger(l Logger)         { c.logger = l }
-func (c *Client) SetLogConfig(cfg LogConfig) { c.logConfig = cfg }
-func (c *Client) AddHook(h Hook)             { c.hooks = append(c.hooks, h) }
+// logState is the logger, logging configuration, and hook list requests read.
+// A published logState is never modified: SetLogger, SetLogConfig, and AddHook
+// install a changed copy, so each logging call, such as one request log line
+// or one round of hooks, reads one consistent set without a lock while those
+// setters run. The separate calls a request makes may see different sets when
+// a setter runs during the request.
+type logState struct {
+	logger Logger
+	config LogConfig
+	hooks  []Hook
+}
 
-// LogConfig returns the current logging configuration.
-func (c *Client) LogConfig() LogConfig { return c.logConfig }
+// noLogging is the logState of a Client built without NewClient and before any
+// logging setter runs: no logger, logging disabled, and no hooks.
+var noLogging = &logState{} //nolint:gochecknoglobals // read-only zero value shared by every such Client
+
+// active reports whether the state has a logger and logging is enabled.
+func (s *logState) active() bool {
+	return s.logger != nil && s.config.Enabled
+}
+
+// cloneLogConfig returns cfg with its slices copied, so neither the caller nor
+// the client can change the other's copy through a shared backing array.
+func cloneLogConfig(cfg LogConfig) LogConfig {
+	cfg.RedactHeaders = slices.Clone(cfg.RedactHeaders)
+	cfg.RedactParams = slices.Clone(cfg.RedactParams)
+
+	return cfg
+}
+
+// logging returns the logState in effect, for reading only.
+func (c *Client) logging() *logState {
+	if state := c.logs.Load(); state != nil {
+		return state
+	}
+
+	return noLogging
+}
+
+// updateLogging installs a copy of the current logState changed by apply.
+// logMu serializes the copy and the store, so concurrent setters never lose
+// each other's change.
+func (c *Client) updateLogging(apply func(next *logState)) {
+	c.logMu.Lock()
+	defer c.logMu.Unlock()
+
+	next := *c.logging()
+	apply(&next)
+	c.logs.Store(&next)
+}
+
+// SetLogger installs the structured logger for subsequent requests. It is safe
+// to call while requests are in flight.
+func (c *Client) SetLogger(l Logger) {
+	c.updateLogging(func(next *logState) { next.logger = l })
+}
+
+// SetLogConfig installs the logging configuration for subsequent requests. The
+// client keeps its own copy of the redaction lists. It is safe to call while
+// requests are in flight.
+func (c *Client) SetLogConfig(cfg LogConfig) {
+	cfg = cloneLogConfig(cfg)
+
+	c.updateLogging(func(next *logState) { next.config = cfg })
+}
+
+// AddHook appends a hook that receives an event after each request. Requests
+// already in flight may not call it. It is safe to call while requests are in
+// flight.
+func (c *Client) AddHook(h Hook) {
+	c.updateLogging(func(next *logState) {
+		// Clip forces append to copy, leaving the published list untouched.
+		next.hooks = append(slices.Clip(next.hooks), h)
+	})
+}
+
+// LogConfig returns a copy of the current logging configuration, including
+// its redaction lists, so changing it does not change the client's.
+func (c *Client) LogConfig() LogConfig { return cloneLogConfig(c.logging().config) }
+
+// logWarn logs msg at Warn when a logger is set and logging is enabled.
+func (c *Client) logWarn(msg string, fields map[string]interface{}) {
+	logs := c.logging()
+	if !logs.active() {
+		return
+	}
+
+	logs.logger.Warn(msg, fields)
+}
 
 // logRequest logs the request metadata according to config.
 func (c *Client) logRequest(req *http.Request, msg string, extra map[string]interface{}) {
-	if c.logger == nil || !c.logConfig.Enabled {
+	logs := c.logging()
+	if !logs.active() {
 		return
 	}
 
@@ -109,26 +194,28 @@ func (c *Client) logRequest(req *http.Request, msg string, extra map[string]inte
 		fields[k] = v
 	}
 
-	if c.logConfig.LogRequestHeader {
-		fields["headers"] = redact(req.Header, c.logConfig.RedactHeaders)
+	if logs.config.LogRequestHeader {
+		fields["headers"] = redact(req.Header, logs.config.RedactHeaders)
 	}
 
-	if c.logConfig.LogQueryParams {
-		fields["query"] = redact(req.URL.Query(), c.logConfig.RedactParams)
+	if logs.config.LogQueryParams {
+		fields["query"] = redact(req.URL.Query(), logs.config.RedactParams)
 	}
 
-	c.logger.Info(msg, fields)
+	logs.logger.Info(msg, fields)
 }
 
 func (c *Client) fireHook(event *Event) {
-	for _, hook := range c.hooks {
+	logs := c.logging()
+
+	for _, hook := range logs.hooks {
 		// Hooks are best-effort and must not panic or block. Recover so one
 		// misbehaving hook cannot crash the request path, but surface the panic
 		// at Warn instead of swallowing it silently.
 		func(hook Hook) {
 			defer func() {
-				if r := recover(); r != nil && c.logger != nil {
-					c.logger.Warn("log hook panicked", map[string]interface{}{"panic": r})
+				if r := recover(); r != nil && logs.logger != nil {
+					logs.logger.Warn("log hook panicked", map[string]interface{}{"panic": r})
 				}
 			}()
 

@@ -13,14 +13,17 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crypto/x509"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/constants"
 	issl "github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/ssl"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/swaptransport"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/auth"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/cache"
 	apierrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
@@ -36,26 +39,43 @@ import (
 var ErrHostOverrideFingerprint = errors.New(
 	"per-request host override is not supported with TLS fingerprint pinning")
 
+// ErrWrapTransportNil is returned by NewClient when Options.WrapTransport
+// returns a nil RoundTripper, or a RoundTripper holding a nil pointer, map,
+// slice, func, or channel such as (*http.Transport)(nil), which would leave
+// the client without a usable transport.
+var ErrWrapTransportNil = errors.New("WrapTransport returned a nil RoundTripper")
+
 // Client implements the HTTP client for PVE API communication.
 type Client struct {
-	baseURL       string
-	httpClient    *http.Client
+	baseURL string
+
+	// httpClient is the *http.Client requests are sent with. SetTimeout
+	// replaces it with a copy rather than writing the Timeout field that
+	// http.Client.Do reads, so it is loaded atomically on every request.
+	httpClient atomic.Pointer[http.Client]
+
 	authenticator auth.Authenticator
 	middleware    []Middleware
 	timeout       time.Duration
-	maxRetries    int
-	retryDelay    time.Duration
 
-	metrics   ClientMetrics
-	logger    Logger
-	logConfig LogConfig
-	hooks     []Hook
+	// maxRetries and retryDelay (a time.Duration) are read by every request
+	// and may be changed while requests run, so they are atomic.
+	maxRetries atomic.Int64
+	retryDelay atomic.Int64
+
+	metrics ClientMetrics
+
+	// logs holds the logger, logging configuration, and hooks; see logState.
+	// logMu serializes the setters that replace it.
+	logs  atomic.Pointer[logState]
+	logMu sync.Mutex
 
 	// Optional Prometheus-friendly metrics collector
-	prom *pmetrics.DefaultMetrics
+	prom atomic.Pointer[pmetrics.DefaultMetrics]
 
-	// Optional TFA handler for auto-completion of two-factor challenges
-	tfaHandler auth.TFAHandler
+	// Optional TFA handler for auto-completion of two-factor challenges,
+	// held by pointer because atomic.Pointer cannot hold an interface.
+	tfaHandler atomic.Pointer[auth.TFAHandler]
 
 	// Auto-login state management
 	options        *Options
@@ -68,6 +88,35 @@ type Client struct {
 
 	// Caching
 	cache *cache.Cache
+
+	// baseTransport is the *http.Transport NewClient built and handed to
+	// WrapTransport, kept so Close reaches its idle connections when a
+	// wrapper hides it behind another RoundTripper. Nil only for a Client
+	// built without NewClient.
+	baseTransport *http.Transport
+
+	// swap is the RoundTripper NewClient installs when no WrapTransport
+	// option is set, so SetKeepAlive can replace the transport without
+	// writing one that requests are using. Nil when a wrapper is installed.
+	swap *swaptransport.Transport
+
+	// tuneMu serializes SetTimeout and SetKeepAlive. It is never held while
+	// calling caller code, such as the logger or the Close method of a
+	// connection from a caller's DialContext, which may call either setter.
+	tuneMu sync.Mutex
+
+	// retiring tracks the goroutines SetKeepAlive starts to close the idle
+	// connections of the transports it replaced. SetKeepAlive does not wait
+	// for them, because it can run inside a connection's Close while net/http
+	// holds the lock that closing needs. Tests wait on it to observe the close.
+	retiring sync.WaitGroup
+}
+
+// httpClientSetter is implemented by authenticators that send requests with
+// their own reference to the client's *http.Client, such as the ticket
+// authenticator, so SetTimeout can hand them the replacement.
+type httpClientSetter interface {
+	SetHTTPClient(httpClient *http.Client)
 }
 
 // Middleware defines a function that can modify requests or responses.
@@ -89,8 +138,13 @@ func NewClient(options *Options) (*Client, error) {
 		transport.TLSClientConfig = tlsConfig
 	}
 
+	roundTripper, swap, err := installTransport(options, transport)
+	if err != nil {
+		return nil, err
+	}
+
 	httpClient := &http.Client{
-		Transport: transport,
+		Transport: roundTripper,
 		Timeout:   options.Timeout,
 	}
 
@@ -98,14 +152,17 @@ func NewClient(options *Options) (*Client, error) {
 
 	client := &Client{
 		baseURL:       options.BaseURL(),
-		httpClient:    httpClient,
 		authenticator: authenticator,
 		timeout:       options.Timeout,
-		maxRetries:    constants.DefaultMaxRetries,
-		retryDelay:    time.Second,
-		logConfig:     defaultLogConfig(),
 		options:       options,
+
+		baseTransport: transport,
+		swap:          swap,
 	}
+	client.httpClient.Store(httpClient)
+	client.maxRetries.Store(constants.DefaultMaxRetries)
+	client.retryDelay.Store(int64(time.Second))
+	client.logs.Store(&logState{config: defaultLogConfig()})
 
 	// Initialize cache if configured
 	if options.CacheConfig != nil && options.CacheConfig.Enabled {
@@ -127,6 +184,46 @@ func NewClient(options *Options) (*Client, error) {
 	}
 
 	return client, nil
+}
+
+// installTransport returns the RoundTripper the http.Client uses. With a
+// WrapTransport option that is the wrapper's result, called once with
+// transport; otherwise it is a swaptransport.Transport holding transport,
+// which it also returns so SetKeepAlive can retune it.
+func installTransport(
+	options *Options,
+	transport *http.Transport,
+) (http.RoundTripper, *swaptransport.Transport, error) {
+	if options.WrapTransport == nil {
+		swap := swaptransport.New(transport)
+
+		return swap, swap, nil
+	}
+
+	wrapped := options.WrapTransport(transport)
+	if isNilRoundTripper(wrapped) {
+		return nil, nil, fmt.Errorf("%w (got %T)", ErrWrapTransportNil, wrapped)
+	}
+
+	return wrapped, nil, nil
+}
+
+// isNilRoundTripper reports whether rt is nil or an interface holding a nil
+// value of a kind that can be nil. A typed nil passes a plain nil check and
+// panics on the first request or in Close, so NewClient rejects both forms.
+func isNilRoundTripper(rt http.RoundTripper) bool {
+	if rt == nil {
+		return true
+	}
+
+	v := reflect.ValueOf(rt)
+
+	switch v.Kind() { //nolint:exhaustive // only these kinds can hold nil
+	case reflect.Pointer, reflect.UnsafePointer, reflect.Map, reflect.Func, reflect.Chan, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
+	}
 }
 
 func createHTTPTransport(options *Options) *http.Transport {
@@ -495,11 +592,11 @@ func (c *Client) DoWithContext(ctx context.Context, method, path string, params 
 
 	start := time.Now()
 
-	c.recordRequestStart(req)
+	prom := c.recordRequestStart(req)
 
 	resp, err := c.executeWithMiddleware(req)
 	if err != nil {
-		c.recordRequestError(start)
+		recordRequestError(prom, start)
 
 		return nil, err
 	}
@@ -507,16 +604,14 @@ func (c *Client) DoWithContext(ctx context.Context, method, path string, params 
 	defer func() {
 		closeErr := resp.Body.Close()
 		if closeErr != nil {
-			if c.logger != nil && c.logConfig.Enabled {
-				c.logger.Warn("failed to close response body", map[string]interface{}{
-					logFieldError: closeErr.Error(),
-				})
-			}
+			c.logWarn("failed to close response body", map[string]interface{}{
+				logFieldError: closeErr.Error(),
+			})
 		}
 	}()
 
 	r, bodyBytes, perr := c.parseResponse(resp)
-	c.recordRequestComplete(req, resp, bodyBytes, start, perr)
+	c.recordRequestComplete(prom, req, resp, bodyBytes, start, perr)
 
 	return r, perr
 }
@@ -537,11 +632,11 @@ func (c *Client) DoBytesWithContext(ctx context.Context, method, path string, pa
 
 	start := time.Now()
 
-	c.recordRequestStart(req)
+	prom := c.recordRequestStart(req)
 
 	resp, err := c.executeWithMiddleware(req)
 	if err != nil {
-		c.recordRequestError(start)
+		recordRequestError(prom, start)
 
 		return nil, err
 	}
@@ -549,29 +644,27 @@ func (c *Client) DoBytesWithContext(ctx context.Context, method, path string, pa
 	defer func() {
 		closeErr := resp.Body.Close()
 		if closeErr != nil {
-			if c.logger != nil && c.logConfig.Enabled {
-				c.logger.Warn("failed to close response body", map[string]interface{}{
-					logFieldError: closeErr.Error(),
-				})
-			}
+			c.logWarn("failed to close response body", map[string]interface{}{
+				logFieldError: closeErr.Error(),
+			})
 		}
 	}()
 
 	body, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
-		c.recordRequestComplete(req, resp, nil, start, readErr)
+		c.recordRequestComplete(prom, req, resp, nil, start, readErr)
 
 		return nil, fmt.Errorf("failed to read response body: %w", readErr)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		apiErr := fmt.Errorf("API request failed: %w", apierrors.ParseAPIError(resp.StatusCode, body))
-		c.recordRequestComplete(req, resp, body, start, apiErr)
+		c.recordRequestComplete(prom, req, resp, body, start, apiErr)
 
 		return nil, apiErr
 	}
 
-	c.recordRequestComplete(req, resp, body, start, nil)
+	c.recordRequestComplete(prom, req, resp, body, start, nil)
 
 	return body, nil
 }
@@ -585,7 +678,7 @@ func (c *Client) UploadWithContext(ctx context.Context, path string, fields map[
 
 	start := time.Now()
 
-	c.recordRequestStart(req)
+	prom := c.recordRequestStart(req)
 
 	resp, err := c.executeWithMiddleware(req)
 	if err != nil {
@@ -597,7 +690,7 @@ func (c *Client) UploadWithContext(ctx context.Context, path string, fields map[
 			_ = req.Body.Close()
 		}
 
-		c.recordRequestError(start)
+		recordRequestError(prom, start)
 
 		return nil, err
 	}
@@ -605,16 +698,14 @@ func (c *Client) UploadWithContext(ctx context.Context, path string, fields map[
 	defer func() {
 		closeErr := resp.Body.Close()
 		if closeErr != nil {
-			if c.logger != nil && c.logConfig.Enabled {
-				c.logger.Warn("failed to close response body", map[string]interface{}{
-					logFieldError: closeErr.Error(),
-				})
-			}
+			c.logWarn("failed to close response body", map[string]interface{}{
+				logFieldError: closeErr.Error(),
+			})
 		}
 	}()
 
 	r, bodyBytes, perr := c.parseResponse(resp)
-	c.recordRequestComplete(req, resp, bodyBytes, start, perr)
+	c.recordRequestComplete(prom, req, resp, bodyBytes, start, perr)
 
 	return r, perr
 }
@@ -639,43 +730,92 @@ func (c *Client) RemoveHeader(key string) {
 	delete(c.headers, key)
 }
 
-// SetTimeout sets the request timeout.
+// SetTimeout sets the request timeout (http.Client.Timeout) for subsequent
+// requests, including ticket logins, without reconstructing the client.
+// http.Client.Do reads Timeout while requests run, so SetTimeout never writes
+// the http.Client in use: it installs a copy carrying the new timeout, which
+// shares the transport or WrapTransport wrapper, and hands that copy to the
+// ticket authenticator. The timeout applies to each HTTP attempt, not to a
+// whole SDK request: an attempt already in flight keeps the timeout it
+// started with, and a later attempt of the same request, such as a retry or
+// the resend after a forced re-login, uses the new one. It behaves the same
+// with and without a WrapTransport option,
+// because the timeout applies above the transport. It is safe to call while
+// requests are in flight.
 func (c *Client) SetTimeout(timeout time.Duration) {
+	c.tuneMu.Lock()
+	defer c.tuneMu.Unlock()
+
 	c.timeout = timeout
-	c.httpClient.Timeout = timeout
-}
 
-// SetKeepAlive updates the number of idle keep-alive connections retained by
-// the live transport (MaxIdleConns, and MaxIdleConnsPerHost when no explicit
-// MaxIdleConnsPerHost override was configured), taking effect for subsequent
-// requests without reconstructing the client. It is a no-op if the transport
-// is not the *http.Transport this client constructs (never true in practice:
-// NewClient always builds one via createHTTPTransport).
-func (c *Client) SetKeepAlive(connections int) {
-	if c.options != nil {
-		c.options.KeepAlive = connections
-	}
-
-	t, ok := c.httpClient.Transport.(*http.Transport)
-	if !ok {
+	current := c.httpClient.Load()
+	if current == nil || current.Timeout == timeout {
 		return
 	}
 
-	t.MaxIdleConns = connections
+	next := *current
+	next.Timeout = timeout
+	c.httpClient.Store(&next)
 
-	if c.options == nil || c.options.MaxIdleConnsPerHost <= 0 {
-		t.MaxIdleConnsPerHost = connections
+	if setter, ok := c.authenticator.(httpClientSetter); ok {
+		setter.SetHTTPClient(&next)
 	}
 }
 
-// SetMaxRetries sets the maximum number of retries.
-func (c *Client) SetMaxRetries(retries int) {
-	c.maxRetries = retries
+// SetKeepAlive sets the number of idle keep-alive connections the client
+// retains (MaxIdleConns, and MaxIdleConnsPerHost when no explicit
+// MaxIdleConnsPerHost override was configured) for subsequent requests,
+// without reconstructing the client. net/http reads those fields while
+// requests run, so SetKeepAlive never writes a transport in use. Without a
+// WrapTransport option it installs a Clone of the current transport carrying
+// the new limits, which later requests and logins use, and starts closing the
+// idle connections of the transport it replaced on a separate goroutine,
+// without waiting for that to finish. It does not wait because it can run
+// inside a connection's Close while net/http holds the transport's idle lock,
+// as the swaptransport package explains. Requests already in flight finish on
+// the replaced transport, and a connection one of them returns to that
+// transport's pool afterwards is closed by its idle timeout, or sooner by
+// Close. With a WrapTransport option it records the value
+// in the options and leaves every transport unchanged, because NewClient
+// calls the wrapper once and the wrapper keeps the base it was handed. Such a
+// wrapper keeps the idle limits it had when NewClient returned, and one that
+// needs other limits sets them on the base, or on its clone, inside the hook.
+// It is safe to call while requests are in flight.
+func (c *Client) SetKeepAlive(connections int) {
+	retuned, idle := c.setKeepAlive(connections)
+
+	// Closed after tuneMu is released and on another goroutine: closing a
+	// connection runs its net.Conn's Close, which may come from a caller's
+	// DialContext and may call SetTimeout or SetKeepAlive itself. net/http
+	// calls that Close while holding the transport's idle lock when it expires
+	// or evicts an idle connection, and closing that transport's idle
+	// connections needs the same lock, so waiting here would never return.
+	// Logged after tuneMu is released too, because the logger is caller code.
+	idle.CloseInBackground(&c.retiring)
+
+	if !retuned {
+		c.logWarn("SetKeepAlive left the transport unchanged", map[string]interface{}{
+			"keep_alive": connections,
+			"reason":     "the client's transport comes from WrapTransport, which owns its idle limits",
+		})
+	}
 }
 
-// SetRetryDelay sets the delay between retries.
+// SetMaxRetries sets the maximum number of retries for subsequent requests.
+// The count is read once when a request starts its round of retries, so a
+// round already running keeps the count it started with. The resend after a
+// forced re-login starts a new round and reads the count again. It is safe to
+// call while requests are in flight.
+func (c *Client) SetMaxRetries(retries int) {
+	c.maxRetries.Store(int64(retries))
+}
+
+// SetRetryDelay sets the delay between retries for subsequent requests. Like
+// the retry count, the delay is read once when a request starts its round of
+// retries, so a round already running keeps the delay it started with. It is
+// safe to call while requests are in flight.
 func (c *Client) SetRetryDelay(delay time.Duration) {
-	c.retryDelay = delay
+	c.retryDelay.Store(int64(delay))
 }
 
 // ClientMetrics holds simple counters and durations.
@@ -706,11 +846,16 @@ func (c *Client) Metrics() ClientMetrics {
 	return ClientMetrics{Requests: c.metrics.Requests, Errors: c.metrics.Errors, TotalDuration: c.metrics.TotalDuration}
 }
 
-// SetMetrics attaches a Prometheus-friendly metrics collector.
-func (c *Client) SetMetrics(m *pmetrics.DefaultMetrics) { c.prom = m }
+// SetMetrics attaches a Prometheus-friendly metrics collector, or detaches it
+// when m is nil. A request records its whole lifecycle on the collector in
+// effect when it started, so the active-connections gauge stays balanced. It
+// is safe to call while requests are in flight.
+func (c *Client) SetMetrics(m *pmetrics.DefaultMetrics) { c.prom.Store(m) }
 
-// SetTFAHandler installs a handler to automatically complete two-factor authentication challenges.
-func (c *Client) SetTFAHandler(h auth.TFAHandler) { c.tfaHandler = h }
+// SetTFAHandler installs a handler to automatically complete two-factor
+// authentication challenges, or removes it when h is nil. It is safe to call
+// while requests are in flight.
+func (c *Client) SetTFAHandler(h auth.TFAHandler) { c.tfaHandler.Store(&h) }
 
 // Authenticate performs explicit authentication with the PVE API.
 // This is a public wrapper around ensureAuthentication for use by the client package.
@@ -734,15 +879,26 @@ func (c *Client) Logout() error {
 
 // Close releases resources held by the client: it stops the response-cache
 // cleanup goroutine (if caching is enabled) and closes idle HTTP connections.
-// It is safe to call Close more than once. After Close the client should not
-// be used for further requests.
+// It closes the idle connections of the transport NewClient built as well as
+// those the http.Client reaches, because a WrapTransport wrapper that
+// implements only RoundTrip hides the base from the http.Client. Without a
+// wrapper that includes the most recent transports SetKeepAlive replaced.
+// Close closes those connections itself and does not wait for the closing
+// SetKeepAlive started in the background. Unlike SetKeepAlive, Close waits
+// for net/http to release each transport's idle lock, so a connection's Close
+// must not call it. It is safe to call Close more than once. After Close the
+// client should not be used for further requests.
 func (c *Client) Close() error {
 	if c.cache != nil {
 		c.cache.Close()
 	}
 
-	if c.httpClient != nil {
-		c.httpClient.CloseIdleConnections()
+	if httpClient := c.httpClient.Load(); httpClient != nil {
+		httpClient.CloseIdleConnections()
+	}
+
+	if c.baseTransport != nil {
+		c.baseTransport.CloseIdleConnections()
 	}
 
 	return nil
@@ -773,6 +929,49 @@ func (c *Client) CacheStats() *cache.CacheStats {
 		stats := c.cache.Stats()
 
 		return &stats
+	}
+
+	return nil
+}
+
+// setKeepAlive records connections and retunes the transport under tuneMu,
+// reporting false when there is no swappable transport to retune. It returns
+// the replaced transports for SetKeepAlive to close once tuneMu is released.
+func (c *Client) setKeepAlive(connections int) (bool, swaptransport.Idle) {
+	c.tuneMu.Lock()
+	defer c.tuneMu.Unlock()
+
+	if c.options != nil {
+		c.options.KeepAlive = connections
+	}
+
+	if c.swap == nil {
+		return false, nil
+	}
+
+	perHost := c.options == nil || c.options.MaxIdleConnsPerHost <= 0
+
+	idle := c.swap.Update(func(next *http.Transport) bool {
+		if next.MaxIdleConns == connections && (!perHost || next.MaxIdleConnsPerHost == connections) {
+			return false
+		}
+
+		next.MaxIdleConns = connections
+
+		if perHost {
+			next.MaxIdleConnsPerHost = connections
+		}
+
+		return true
+	})
+
+	return true, idle
+}
+
+// tfa returns the TFA handler in effect, or nil when none is set.
+func (c *Client) tfa() auth.TFAHandler { //nolint:ireturn // the handler is caller-supplied; its type is unknown
+	if handler := c.tfaHandler.Load(); handler != nil {
+		return *handler
 	}
 
 	return nil
@@ -859,50 +1058,59 @@ func (c *Client) buildUploadRequest(ctx context.Context, path string, fields map
 	return req, nil
 }
 
-func (c *Client) recordRequestStart(req *http.Request) {
-	if c.prom != nil {
-		c.prom.ActiveConnections.Inc()
+// recordRequestStart records a request's start on the metrics collector in
+// effect and returns that collector, which may be nil, so the request records
+// its end on the same one even if SetMetrics runs in between.
+func (c *Client) recordRequestStart(req *http.Request) *pmetrics.DefaultMetrics {
+	prom := c.prom.Load()
+	if prom != nil {
+		prom.ActiveConnections.Inc()
 
 		if req != nil && req.ContentLength > 0 {
-			c.prom.BytesSent.Add(req.ContentLength)
+			prom.BytesSent.Add(req.ContentLength)
 		}
 	}
+
+	return prom
 }
 
-func (c *Client) recordRequestError(start time.Time) {
-	if c.prom != nil {
-		c.prom.RequestsTotal.Inc()
-		c.prom.RequestsFailedTotal.Inc()
-		c.prom.RequestDuration.Observe(time.Since(start).Seconds())
-		c.prom.ActiveConnections.Dec()
+func recordRequestError(prom *pmetrics.DefaultMetrics, start time.Time) {
+	if prom != nil {
+		prom.RequestsTotal.Inc()
+		prom.RequestsFailedTotal.Inc()
+		prom.RequestDuration.Observe(time.Since(start).Seconds())
+		prom.ActiveConnections.Dec()
 	}
 }
 
-func (c *Client) recordRequestComplete(req *http.Request, resp *http.Response, bodyBytes []byte, start time.Time, perr error) {
+func (c *Client) recordRequestComplete(
+	prom *pmetrics.DefaultMetrics, req *http.Request, resp *http.Response, bodyBytes []byte, start time.Time, perr error,
+) {
 	dur := time.Since(start)
 	c.metrics.addRequest(dur, perr)
 
-	if c.prom != nil {
-		c.prom.RequestsTotal.Inc()
+	if prom != nil {
+		prom.RequestsTotal.Inc()
 
 		if perr != nil || resp.StatusCode >= 400 {
-			c.prom.RequestsFailedTotal.Inc()
+			prom.RequestsFailedTotal.Inc()
 		}
 
-		c.prom.RequestDuration.Observe(dur.Seconds())
+		prom.RequestDuration.Observe(dur.Seconds())
 
 		if bodyBytes != nil {
-			c.prom.BytesReceived.Add(int64(len(bodyBytes)))
+			prom.BytesReceived.Add(int64(len(bodyBytes)))
 		}
 
-		c.prom.ActiveConnections.Dec()
+		prom.ActiveConnections.Dec()
 	}
 
 	c.logResponse(req, resp, bodyBytes, start, perr)
 }
 
 func (c *Client) logResponse(req *http.Request, resp *http.Response, bodyBytes []byte, start time.Time, perr error) {
-	if c.logger == nil || !c.logConfig.Enabled {
+	logs := c.logging()
+	if !logs.active() {
 		return
 	}
 
@@ -913,12 +1121,12 @@ func (c *Client) logResponse(req *http.Request, resp *http.Response, bodyBytes [
 		"duration":     int64(time.Since(start) / time.Millisecond),
 	}
 
-	if c.logConfig.LogResponseHeader {
-		fields["resp_headers"] = redact(resp.Header, c.logConfig.RedactHeaders)
+	if logs.config.LogResponseHeader {
+		fields["resp_headers"] = redact(resp.Header, logs.config.RedactHeaders)
 	}
 
-	if c.logConfig.LogResponseBody && len(bodyBytes) > 0 {
-		limit := c.logConfig.MaxBodyBytes
+	if logs.config.LogResponseBody && len(bodyBytes) > 0 {
+		limit := logs.config.MaxBodyBytes
 		if limit <= 0 || limit > len(bodyBytes) {
 			limit = len(bodyBytes)
 		}
@@ -927,9 +1135,9 @@ func (c *Client) logResponse(req *http.Request, resp *http.Response, bodyBytes [
 	}
 
 	if perr != nil {
-		c.logger.Error("http.response", fields)
+		logs.logger.Error("http.response", fields)
 	} else {
-		c.logger.Info("http.response", fields)
+		logs.logger.Info("http.response", fields)
 	}
 }
 
@@ -1041,7 +1249,7 @@ func (c *Client) buildRequestWithContext(ctx context.Context, method, path strin
 func (c *Client) executeWithMiddleware(req *http.Request) (*http.Response, error) {
 	// Create the final handler that executes the actual request
 	finalHandler := func(r *http.Request) (*http.Response, error) {
-		return c.httpClient.Do(r)
+		return c.httpClient.Load().Do(r)
 	}
 
 	// Build the middleware chain in reverse order
@@ -1132,7 +1340,8 @@ func (c *Client) ensureAuthentication() error {
 
 // handleTFAAuthentication processes TFA challenges if a TFA handler is configured.
 func (c *Client) handleTFAAuthentication(authErr error) error {
-	if c.tfaHandler == nil {
+	tfaHandler := c.tfa()
+	if tfaHandler == nil {
 		return nil
 	}
 
@@ -1152,7 +1361,7 @@ func (c *Client) handleTFAAuthentication(authErr error) error {
 		Types:     tferr.Types,
 	}
 
-	response, err := c.tfaHandler.HandleTFAChallenge(challenge)
+	response, err := tfaHandler.HandleTFAChallenge(challenge)
 	if err != nil {
 		return fmt.Errorf("tfa handling failed: %w", err)
 	}
@@ -1420,11 +1629,7 @@ func (c *Client) renewTicketIfNeeded() {
 
 // logTicketRenewalFailure logs ticket renewal failures if logging is enabled.
 func (c *Client) logTicketRenewalFailure(err error) {
-	if c.logger == nil || !c.logConfig.Enabled {
-		return
-	}
-
-	c.logger.Warn("automatic ticket renewal failed", map[string]interface{}{
+	c.logWarn("automatic ticket renewal failed", map[string]interface{}{
 		"error": err.Error(),
 	})
 }
@@ -1776,8 +1981,8 @@ func newConnectionError(req *http.Request, cause error) error {
 // resolveRetryPolicy returns the effective retry count, delay, and force-retry
 // flag for a request, applying any per-request context overrides.
 func (c *Client) resolveRetryPolicy(req *http.Request) (int, time.Duration, bool) {
-	retries := c.maxRetries
-	delay := c.retryDelay
+	retries := int(c.maxRetries.Load())
+	delay := time.Duration(c.retryDelay.Load())
 	force := false
 
 	if opts := FromContext(req.Context()); opts != nil {
@@ -1887,7 +2092,7 @@ func (c *Client) loggingMiddleware(req *http.Request, next Handler) (*http.Respo
 		event.Status = resp.StatusCode
 	}
 
-	if c.logger != nil && c.logConfig.Enabled {
+	if logs := c.logging(); logs.active() {
 		fields := map[string]interface{}{
 			logFieldMethod: event.Method,
 			logFieldURL:    event.URL,
@@ -1900,9 +2105,9 @@ func (c *Client) loggingMiddleware(req *http.Request, next Handler) (*http.Respo
 		}
 
 		if err != nil {
-			c.logger.Error("http.response", fields)
+			logs.logger.Error("http.response", fields)
 		} else {
-			c.logger.Info("http.response", fields)
+			logs.logger.Info("http.response", fields)
 		}
 	}
 

@@ -10,6 +10,11 @@ import (
 // override while TLS fingerprint pinning is enabled; see WithHost.
 var ErrHostOverrideFingerprint = pvehttp.ErrHostOverrideFingerprint
 
+// ErrWrapTransportNil is returned by NewClient when Options.WrapTransport
+// returns a nil RoundTripper, or an interface holding a nil value; see
+// Options.WrapTransport.
+var ErrWrapTransportNil = pvehttp.ErrWrapTransportNil
+
 // NewSizedReader wraps r with its exact byte count so file uploads stream the
 // multipart body with an explicit Content-Length instead of buffering the
 // whole payload in memory to measure it. An *os.File needs no wrapping — its

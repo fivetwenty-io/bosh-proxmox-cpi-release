@@ -136,6 +136,32 @@ type Options struct {
 	// http.ProxyFromEnvironment to honour those variables.
 	Proxy func(*http.Request) (*url.URL, error)
 
+	// WrapTransport, when non-nil, is called once while the client is built,
+	// with the *http.Transport the client would otherwise use. That base
+	// transport already carries the TLS configuration, dial function, proxy,
+	// and timeouts these options asked for. The returned RoundTripper becomes
+	// the transport of the underlying http.Client, so it sees every request,
+	// including the ticket login and any forced re-login. It sits below the
+	// client's retry layer, so it observes each attempt separately, while
+	// the hook itself still runs only once. The wrapper may Clone the base
+	// transport. A wrapper that returns nil, or a typed nil such as
+	// (*http.Transport)(nil), makes NewClient fail. With a wrapper installed,
+	// Client.SetKeepAlive records its value but changes no transport, because
+	// the wrapper keeps the base it was handed and net/http reads a
+	// transport's idle limits while requests run. A wrapper that needs other
+	// idle limits sets MaxIdleConns and MaxIdleConnsPerHost on the base, or on
+	// its clone, inside the hook before it returns. Client.SetTimeout works
+	// the same with or without a wrapper, because the timeout applies in the
+	// http.Client above it.
+	// Client.Close closes the idle connections of the base transport, so a
+	// wrapper that owns additional transports should also implement
+	// CloseIdleConnections and the client reaches it through the http.Client.
+	// The hook covers HTTP requests only: the WebSocket APIs in
+	// pkg/websocket dial through their own configuration and bypass it.
+	// Opt-in; nil (default) leaves the transport configured exactly as it is
+	// without the field.
+	WrapTransport func(base *http.Transport) http.RoundTripper
+
 	// Caching
 	CacheConfig *CacheConfig // Cache configuration (nil = disabled)
 
