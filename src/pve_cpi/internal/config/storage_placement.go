@@ -437,6 +437,7 @@ func validatePlacementNames(field string, values []string, errs *[]string) {
 // fields retain the existing shallow-cloned contract used by context overrides.
 func (c *CPIConfig) CloneStoragePlacement() CPIConfig {
 	cloned := *c
+	cloned.Endpoints = slices.Clone(c.Endpoints)
 	if c.StorageSets != nil {
 		cloned.StorageSets = make(map[string]StorageSet, len(c.StorageSets))
 		for name := range c.StorageSets {

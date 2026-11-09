@@ -881,10 +881,11 @@ const (
 const defaultPVEAPIPort = 8006
 
 // normalizedEndpoint returns c's PVE API endpoint in the form endpoint
-// comparison uses: the host trimmed of surrounding space, lowercased, and
-// without a trailing dot, and the port with 0 read as the default 8006.
+// comparison uses: the host trimmed of surrounding space, lowercased, without
+// a trailing dot, and with an IPv6 literal in its canonical spelling, and the
+// port with 0 read as the default 8006.
 func normalizedEndpoint(c *CPIConfig) (host string, port int) {
-	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(c.Host)), ".")
+	host = canonicalEndpointHost(c.Host)
 	port = c.Port
 	if port == 0 {
 		port = defaultPVEAPIPort

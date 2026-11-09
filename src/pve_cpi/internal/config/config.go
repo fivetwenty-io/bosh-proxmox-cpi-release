@@ -2215,9 +2215,6 @@ func Load(r io.Reader) (*CPIConfig, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return nil, cpierrors.Cloud("config: decode failed: %s", err.Error())
 	}
-	// Port fill-in runs before ApplyDefaults: ApplyDefaults copies the first
-	// entry into Host and Port, and an entry's port has to be settled by then.
-	cfg.fillEndpointPorts()
 	cfg.ApplyDefaults()
 
 	// Collect strict unknown-key errors here (needs raw bytes) alongside the
@@ -2308,6 +2305,11 @@ func normalizeAPIToken(s string) string {
 // Callers must invoke this before Validate when constructing a CPIConfig manually.
 func (c *CPIConfig) ApplyDefaults() {
 	c.APIToken = normalizeAPIToken(c.APIToken)
+	// Bare entries take the port first, while Port still holds what the
+	// operator set (or 0 for 8006), because adoptFirstEndpoint below may
+	// overwrite Port with the first entry's own port. The step is idempotent,
+	// so a config built by Load and one built by hand fill alike.
+	c.fillEndpointPorts()
 	// The first endpoint stands in for an unset host. This runs before the
 	// port default so a first entry's own port wins over the 8006 fallback.
 	c.adoptFirstEndpoint()
@@ -5079,14 +5081,67 @@ func endpointGrammarProblem(label, addr string) string {
 const maxEndpoints = 16
 
 // endpointExtraProblem rejects what the endpoints list forbids on top of the
-// shared grammar: user info, a query or fragment, a backslash, and whitespace
-// inside the value. node_endpoints keeps its looser rule so a manifest that
+// shared grammar: user info, a query or fragment, a backslash, whitespace
+// inside the value, a port written with anything but digits (the grammar
+// accepts "+80", which no dialer does), and a host with a character outside
+// letters, digits, ".", "-", "_", and the colons of an IPv6 literal, such as
+// the comma of "a,b". node_endpoints keeps its looser rule so a manifest that
 // validates today still does. It returns "" when addr is acceptable.
 func endpointExtraProblem(label, addr string) string {
 	if strings.ContainsAny(addr, "@?#\\") || strings.IndexFunc(addr, unicode.IsSpace) >= 0 {
 		return fmt.Sprintf("%s must be host or host:port with no user info, query, or whitespace, got %q", label, addr)
 	}
+	host, port := addr, ""
+	if h, p, err := net.SplitHostPort(addr); err == nil {
+		host, port = h, p
+	}
+	if strings.IndexFunc(port, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+		return fmt.Sprintf("%s port must be digits only, got %q", label, port)
+	}
+	if !validEndpointHost(host) || (strings.HasPrefix(addr, "[") && net.ParseIP(host) == nil) {
+		return fmt.Sprintf("%s host must hold only letters, digits, '.', '-', '_', or an IPv6 literal, got %q",
+			label, addr)
+	}
 	return ""
+}
+
+// validEndpointHost reports whether host is made of characters a hostname, an
+// IPv4 literal, or an IPv6 literal can hold, and does not start with a hyphen.
+// A host with a colon must parse as an IP address.
+func validEndpointHost(host string) bool {
+	if host == "" || host[0] == '-' {
+		return false
+	}
+	for _, r := range host {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '-', r == '_', r == ':':
+		default:
+			return false
+		}
+	}
+	return !strings.Contains(host, ":") || net.ParseIP(host) != nil
+}
+
+// NormalizeEndpoint parses one entry of the endpoints list into the form
+// endpoint comparison uses: the host trimmed, lowercased, and without a
+// trailing dot, an IPv6 literal in its canonical spelling and without
+// brackets, and the port as a number, with a missing port read as the PVE API
+// default of 8006. ok is false when addr does not meet the endpoints list
+// grammar. The endpoint pool compares and keys endpoints with this function so
+// it agrees with validation and with SameEndpoint.
+func NormalizeEndpoint(addr string) (host string, port int, ok bool) {
+	if endpointGrammarProblem("", addr) != "" || endpointExtraProblem("", addr) != "" {
+		return "", 0, false
+	}
+	h, p, hasPort, ok := splitEndpoint(addr)
+	if !ok {
+		return "", 0, false
+	}
+	if !hasPort {
+		p = defaultPVEAPIPort
+	}
+	return canonicalEndpointHost(h), p, true
 }
 
 // splitEndpoint splits a grammar-valid endpoint into its host and port. A

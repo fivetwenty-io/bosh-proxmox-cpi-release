@@ -96,6 +96,10 @@ func TestValidateEndpoints_RejectsBadValues(t *testing.T) {
 		{"query", "pve2.example.com?x=1", "no user info, query, or whitespace"},
 		{"fragment", "pve2.example.com#frag", "no user info, query, or whitespace"},
 		{"backslash", `pve2.example.com\x`, "no user info, query, or whitespace"},
+		{"signed port", "pve2.example.com:+80", `endpoints[1] port must be digits only, got "+80"`},
+		{"comma joined", "a,b", "endpoints[1] host must hold only letters, digits"},
+		{"leading hyphen", "-a", "endpoints[1] host must hold only letters, digits"},
+		{"bracketed non-address", "[abc]:8006", "endpoints[1] host must hold only letters, digits"},
 		{"bracketed without port", "[fd00::1]", "endpoints[1] bracketed address must be [host]:port"},
 		{"double port typo", "pve2:8006:8006", "endpoints[1] must be host, host:port, or a bare IPv6 literal"},
 	}
@@ -420,5 +424,78 @@ func TestValidateEndpoints_ReportsEveryProblem(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not contain %q", err.Error(), want)
 		}
+	}
+}
+
+// TestApplyDefaults_FillsEndpointPortsLikeLoad pins that a config built by
+// hand validates the same list the same way Load does: the bare "b" takes the
+// default port before the first entry's port replaces Port, so "b:9000" is a
+// different endpoint from "b".
+func TestApplyDefaults_FillsEndpointPortsLikeLoad(t *testing.T) {
+	t.Parallel()
+	list := []string{"a.example.com:9000", "b.example.com", "b.example.com:9000"}
+
+	byHand := baseValidCfg()
+	byHand.Host = ""
+	byHand.Port = 0
+	byHand.Endpoints = append([]string(nil), list...)
+	byHand.ApplyDefaults()
+	if err := byHand.Validate(); err != nil {
+		t.Fatalf("hand-built config rejected: %v", err)
+	}
+	if byHand.Endpoints[1] != "b.example.com:8006" {
+		t.Errorf("Endpoints[1] = %q, want b.example.com:8006", byHand.Endpoints[1])
+	}
+
+	loaded, err := mustLoad(t, endpointsLoadJSON(`"endpoints": ["a.example.com:9000", "b.example.com", "b.example.com:9000"]`))
+	if err != nil {
+		t.Fatalf("Load rejected the list: %v", err)
+	}
+	if !reflect.DeepEqual(loaded.Endpoints, byHand.Endpoints) {
+		t.Errorf("Load Endpoints = %v, ApplyDefaults Endpoints = %v", loaded.Endpoints, byHand.Endpoints)
+	}
+}
+
+func TestNormalizeEndpoint(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		addr     string
+		wantHost string
+		wantPort int
+		wantOK   bool
+	}{
+		{"PVE1.Example.COM", "pve1.example.com", 8006, true},
+		{"pve1.example.com.:9000", "pve1.example.com", 9000, true},
+		{"[FD00::1]:8006", "fd00::1", 8006, true},
+		{"FD00:0:0::1", "fd00::1", 8006, true},
+		{"10.0.0.5", "10.0.0.5", 8006, true},
+		{"", "", 0, false},
+		{"https://a", "", 0, false},
+		{"a:+80", "", 0, false},
+		{"a,b", "", 0, false},
+		{"root@a", "", 0, false},
+	}
+	for _, tc := range cases {
+		host, port, ok := config.NormalizeEndpoint(tc.addr)
+		if host != tc.wantHost || port != tc.wantPort || ok != tc.wantOK {
+			t.Errorf("NormalizeEndpoint(%q) = %q, %d, %v; want %q, %d, %v",
+				tc.addr, host, port, ok, tc.wantHost, tc.wantPort, tc.wantOK)
+		}
+	}
+}
+
+// TestNormalizeEndpoint_AgreesWithSameEndpoint pins that the list normalizer
+// and the credential-inheritance comparison treat two IPv6 spellings alike.
+func TestNormalizeEndpoint_AgreesWithSameEndpoint(t *testing.T) {
+	t.Parallel()
+	a := &config.CPIConfig{Host: "FD00::1", Port: 8006}
+	b := &config.CPIConfig{Host: "fd00:0:0::1.", Port: 0}
+	if !config.SameEndpoint(a, b) {
+		t.Error("SameEndpoint treats two spellings of one IPv6 address as different endpoints")
+	}
+	ah, ap, _ := config.NormalizeEndpoint("[FD00::1]:8006")
+	bh, bp, _ := config.NormalizeEndpoint("fd00:0:0::1")
+	if ah != bh || ap != bp {
+		t.Errorf("NormalizeEndpoint disagrees: %q:%d vs %q:%d", ah, ap, bh, bp)
 	}
 }

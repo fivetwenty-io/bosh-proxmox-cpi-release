@@ -396,3 +396,20 @@ func TestStorageSetEffectiveAntiAffinityDefaultsNeverMaterializePointer(t *testi
 		t.Fatal("reading the effective defaults must never materialize the pointer")
 	}
 }
+
+// TestCloneStoragePlacementDeepCopiesEndpoints pins that the clone owns its
+// endpoints list: a change to the clone must never reach the job config.
+func TestCloneStoragePlacementDeepCopiesEndpoints(t *testing.T) {
+	t.Parallel()
+	c := validBaseCfg()
+	c.Endpoints = []string{"a.example.com:8006", "b.example.com:8006"}
+	cloned := c.CloneStoragePlacement()
+	cloned.Endpoints[0] = "changed.example.com:8006"
+	if c.Endpoints[0] != "a.example.com:8006" {
+		t.Errorf("job Endpoints[0] = %q after editing the clone", c.Endpoints[0])
+	}
+	empty := validBaseCfg().CloneStoragePlacement()
+	if empty.Endpoints != nil {
+		t.Errorf("clone of a config with no list has Endpoints %v", empty.Endpoints)
+	}
+}
