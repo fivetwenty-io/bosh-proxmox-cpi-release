@@ -169,3 +169,20 @@ func TestStorageJournalRunsUnderAnAffinityScope(t *testing.T) {
 	}
 	rec.requireOneLiveScope(t, 1)
 }
+
+func TestStemcellRefsPruneApplyKeepsOneAffinityScope(t *testing.T) {
+	cfgPath := writeStorageJournalConfig(t, minimalCfg())
+	client := &refsCLIClient{pools: &refsCLIPools{}, guests: []refsCLIGuest{
+		{vmid: 101, name: "bosh-stemcell-a-1-aaaa1111", template: true,
+			tags: "bosh-stemcell-cache;bosh-stemcell-sha-aaaa1111;director--old-uuid;director--new-uuid",
+			desc: `{"name":"a","version":"1","sha8":"aaaa1111","kind":"heavy","director_refs":["old-uuid","new-uuid"]}`},
+	}}
+	rec := &scopeRecorder{}
+	client.onCall = rec.observe
+	code, stdout, stderr := runStemcellRefsTest(t, client, "prune", "--config", cfgPath, "--director", "old-uuid", "--apply")
+	if code != 0 || !strings.Contains(stdout, "applied") {
+		t.Fatalf("exit %d stdout %q stderr %q", code, stdout, stderr)
+	}
+	// The scan and the tag write run under the one scope.
+	rec.requireOneLiveScope(t, 2)
+}

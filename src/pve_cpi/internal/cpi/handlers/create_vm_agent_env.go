@@ -503,7 +503,7 @@ func waitUntilAgentReady(
 // On ListQemuStatusCurrent error the base message is returned without
 // enrichment (best-effort). Always returns a non-retriable CloudError.
 func gatherHealthDiagnostics(
-	_ context.Context,
+	ctx context.Context,
 	deps Deps,
 	node string,
 	vmid int,
@@ -511,9 +511,10 @@ func gatherHealthDiagnostics(
 	logger *log.Logger,
 	baseMsg string,
 ) error {
-	// Use a fresh context for the diagnostic scrape; the original context may
-	// already be cancelled or at its deadline.
-	diagCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Use a fresh deadline for the diagnostic scrape; the original context may
+	// already be cancelled or at its deadline. The scrape keeps the call's values,
+	// so it runs inside the call's affinity scope.
+	diagCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 
 	status, statusErr := deps.PVE.Nodes().ListQemuStatusCurrent(diagCtx, node, vmidStr)

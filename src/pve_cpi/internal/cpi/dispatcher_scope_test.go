@@ -149,3 +149,31 @@ func TestDispatcher_EachCallGetsItsOwnScope(t *testing.T) {
 		t.Error("two calls shared one affinity scope")
 	}
 }
+
+func TestDispatcher_RejectedAndUnknownMethodsMakeNoScope(t *testing.T) {
+	t.Parallel()
+
+	probe := &scopeProbe{}
+	d := cpi.NewDispatcher(nopLogger())
+	mustRegister(t, d, "has_vm", probe)
+
+	// "create_vm" is a canonical name with no handler, and "not_a_cpi_method"
+	// is not canonical, so both return before a scope or a handler exists.
+	for _, method := range []string{"create_vm", "not_a_cpi_method"} {
+		if resp := d.Handle(context.Background(), scopeRequest(method)); resp.Error == nil {
+			t.Fatalf("%s: expected an error response, got success", method)
+		}
+	}
+	if probe.finished.Load() || probe.scope != nil || probe.releaseRuns.Load() != 0 {
+		t.Errorf("a probe handler ran for a rejected or unknown method: finished=%v scope=%v releases=%d",
+			probe.finished.Load(), probe.scope, probe.releaseRuns.Load())
+	}
+
+	// A registered method still gets a scope on the same dispatcher.
+	if resp := d.Handle(context.Background(), scopeRequest("has_vm")); resp.Error != nil {
+		t.Fatalf("has_vm: unexpected error response: %+v", resp.Error)
+	}
+	if probe.scope == nil {
+		t.Error("a registered method ran without an affinity scope")
+	}
+}

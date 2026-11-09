@@ -382,7 +382,7 @@ func (c *deadNodeCompletion) destinations(
 		}
 		c.storages = index
 	}
-	reach, err := ha.DeletionDestinations(c.source, reportMembers(report), set, c.sid, naRuleNameFor(c.vmid),
+	reach, err := ha.DeletionDestinations(ctx, c.source, reportMembers(report), set, c.sid, naRuleNameFor(c.vmid),
 		c.ownedRule, report.Placeable, c.storages)
 	if err != nil {
 		return reach, c.deferWrap(err, "compute the deletion destinations")

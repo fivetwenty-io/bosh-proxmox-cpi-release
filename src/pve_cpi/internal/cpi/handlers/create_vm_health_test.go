@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdktasks "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
@@ -353,6 +355,45 @@ func TestCreateVM_HealthGate_Enabled_Timeout_EnrichedErrorAndRollback(t *testing
 	// Rollback must fire: the existing defer cleanupVM runs when retErr != nil.
 	if !deleteQemuCalled {
 		t.Error("expected rollback (DeleteQemu) to run after health gate timeout, but it did not")
+	}
+}
+
+// TestCreateVM_HealthGate_Timeout_DiagnosticsRunInTheCallsAffinityScope checks
+// that the diagnostic status read keeps the call's affinity scope while it takes
+// a fresh deadline of its own.
+func TestCreateVM_HealthGate_Timeout_DiagnosticsRunInTheCallsAffinityScope(t *testing.T) {
+	t.Parallel()
+	seam := handlers.WithHealthPollMinIntervalForTest(context.Background(), time.Millisecond)
+	ctx, release := endpointpool.WithAffinityScope(seam)
+	defer release()
+	callScope := endpointpool.ScopeFromContext(ctx)
+
+	var statusScope atomic.Pointer[endpointpool.Scope]
+	var statusLive atomic.Bool
+	n := &healthNodes{
+		pingFn: func(_ context.Context, _, _ string) (*sdknodes.CreateQemuAgentPingResponse, error) {
+			return nil, &sdkerrors.ConnectionError{Cause: errors.New("agent not ready")}
+		},
+		statusFn: func(c context.Context, _, _ string) (*sdknodes.ListQemuStatusCurrentResponse, error) {
+			statusScope.Store(endpointpool.ScopeFromContext(c))
+			_, hasDeadline := c.Deadline()
+			statusLive.Store(c.Err() == nil && hasDeadline)
+			return &sdknodes.ListQemuStatusCurrentResponse{Status: "running", Vmid: 200}, nil
+		},
+	}
+	deps := buildHealthDeps(n, healthCheckCfg(true, 1, 0))
+	args := mkArgs("agent-health-scope", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512},
+		standardNetworks(), []string{}, map[string]any{})
+
+	if _, err := handlers.HandleCreateVM(deps).Handle(ctx, args, mkCtx("health-scope")); err == nil {
+		t.Fatal("expected error when agent ping times out, got nil")
+	}
+	if got := statusScope.Load(); got == nil || got != callScope {
+		t.Errorf("diagnostic status read ran under scope %p; want the call's scope %p", got, callScope)
+	}
+	if !statusLive.Load() {
+		t.Error("diagnostic status read ran without a live context and its own deadline")
 	}
 }
 

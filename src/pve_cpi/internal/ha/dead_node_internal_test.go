@@ -40,7 +40,7 @@ func deadNodeStorages(t *testing.T) StorageIndex {
 
 func deletionDestinations(t *testing.T, set *RuleSet, down ...string) (DeadNodeReach, error) {
 	t.Helper()
-	return DeletionDestinations("a", deadNodeMembers, set, "vm:101", "bosh-na-101", ownedByUs,
+	return DeletionDestinations(context.Background(), "a", deadNodeMembers, set, "vm:101", "bosh-na-101", ownedByUs,
 		placeableExcept(down...), deadNodeStorages(t))
 }
 
@@ -179,13 +179,13 @@ func TestDeletionDestinationsRefusesBadInput(t *testing.T) {
 		{"token naming another node", "a", deadNodeRules(otherToken), ok, ownedByUs, idx, "does not name dead node"},
 	}
 	for _, tc := range cases {
-		_, err := DeletionDestinations(tc.source, deadNodeMembers, tc.set, "vm:101", "bosh-na-101", tc.owned,
+		_, err := DeletionDestinations(context.Background(), tc.source, deadNodeMembers, tc.set, "vm:101", "bosh-na-101", tc.owned,
 			tc.place, tc.index)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: got %v, want an error naming %q", tc.name, err, tc.want)
 		}
 	}
-	if _, err := DeletionDestinations("a", deadNodeMembers, rules, "", "bosh-na-101", ownedByUs, ok,
+	if _, err := DeletionDestinations(context.Background(), "a", deadNodeMembers, rules, "", "bosh-na-101", ownedByUs, ok,
 		idx); err == nil {
 		t.Error("an unnamed resource must be an error")
 	}
@@ -429,5 +429,50 @@ func TestOrDash(t *testing.T) {
 	t.Parallel()
 	if orDash("") != "-" || orDash("x") != "x" {
 		t.Fatal("orDash")
+	}
+}
+
+type ctxMarkerKey struct{}
+
+// markedStorages is a storage getter that records whether each Get ran under a
+// context that carries the caller's marker value.
+type markedStorages struct {
+	StorageIndex
+	marked, unmarked int
+}
+
+func (m *markedStorages) Get(ctx context.Context, name string) (pve.StorageInfo, error) {
+	if ctx.Value(ctxMarkerKey{}) == "caller" {
+		m.marked++
+	} else {
+		m.unmarked++
+	}
+	return m.StorageIndex.Get(ctx, name)
+}
+
+// TestDeletionDestinationsReadsStorageUnderTheCallersContext checks that every
+// storage read, including the replica's, carries the caller's context values
+// (such as its affinity scope), so a getter that reads PVE runs inside it.
+func TestDeletionDestinationsReadsStorageUnderTheCallersContext(t *testing.T) {
+	t.Parallel()
+	idx, err := NewStorageIndex([]pve.StorageInfo{{Name: "local-zfs", Type: pve.StorageTypeZFSPool}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	getter := &markedStorages{StorageIndex: idx}
+	widened := deadNodePin(true, map[string]int{"a": 0, "b": 0})
+	widened.Comment = "owner=us bosh-vols=local-zfs bosh-replica=b"
+	ctx := context.WithValue(context.Background(), ctxMarkerKey{}, "caller")
+	got, err := DeletionDestinations(ctx, "a", deadNodeMembers, deadNodeRules(widened), "vm:101", "bosh-na-101",
+		ownedByUs, placeableExcept("a"), getter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Replica != "b" {
+		t.Fatalf("got %+v; want the replica path taken", got)
+	}
+	if getter.marked == 0 || getter.unmarked != 0 {
+		t.Errorf("storage reads under the caller's context = %d, under another = %d; want all under the caller's",
+			getter.marked, getter.unmarked)
 	}
 }

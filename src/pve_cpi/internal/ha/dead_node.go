@@ -96,7 +96,7 @@ func (r DeadNodeReach) PinnedToSource() bool {
 // never a destination. The delete on the destination checks every volume
 // again against the config it then reads.
 func DeletionDestinations(
-	source string, members []string, set *RuleSet, sid, pinID string, owned func(*Rule) bool,
+	ctx context.Context, source string, members []string, set *RuleSet, sid, pinID string, owned func(*Rule) bool,
 	placeable func(string) bool, storages pve.StorageInfoGetter,
 ) (DeadNodeReach, error) {
 	out := DeadNodeReach{Source: source}
@@ -140,14 +140,14 @@ func DeletionDestinations(
 	for _, storage := range recorded {
 		vols = append(vols, pve.AccessVolume{Volume: storage + ":" + sid, HomeNode: source})
 	}
-	// VolumeAccessSet reads the in-memory index the caller passes, so the
-	// background context never waits.
-	reachable, err := pve.VolumeAccessSet(context.Background(), storages, members, vols)
+	// The caller's context carries its affinity scope, so a storage getter that
+	// reads PVE runs inside it.
+	reachable, err := pve.VolumeAccessSet(ctx, storages, members, vols)
 	if err != nil {
 		return out, fmt.Errorf("deletion destinations: the reach of the recorded storages %s: %w",
 			strings.Join(recorded, ","), err)
 	}
-	partner, fromReplica, err := replicaReach(pin, source, sid, members, recorded, storages)
+	partner, fromReplica, err := replicaReach(ctx, pin, source, sid, members, recorded, storages)
 	if err != nil {
 		return out, err
 	}
@@ -198,7 +198,7 @@ func DeletionDestinations(
 // it. The token is the pin's claim alone: the caller confirms the job that
 // keeps the copy before it counts the partner.
 func replicaReach(
-	pin *Rule, source, sid string, members, recorded []string, storages pve.StorageInfoGetter,
+	ctx context.Context, pin *Rule, source, sid string, members, recorded []string, storages pve.StorageInfoGetter,
 ) (string, []string, error) {
 	partner, ok := ReplicaPartner(pin.Comment)
 	if !ok || !pin.Strict || partner == source || !slices.Contains(members, partner) {
@@ -208,7 +208,7 @@ func replicaReach(
 		return "", nil, nil
 	}
 	for _, storage := range recorded {
-		info, err := storages.Get(context.Background(), storage)
+		info, err := storages.Get(ctx, storage)
 		if err != nil {
 			return "", nil, fmt.Errorf("deletion destinations: recorded storage %s: %w", storage, err)
 		}
@@ -220,9 +220,9 @@ func replicaReach(
 	for _, storage := range recorded {
 		replicas = append(replicas, pve.AccessVolume{Volume: storage + ":" + sid, HomeNode: partner})
 	}
-	// VolumeAccessSet reads the in-memory index the caller passes, so the
-	// background context never waits.
-	fromReplica, err := pve.VolumeAccessSet(context.Background(), storages, members, replicas)
+	// The caller's context carries its affinity scope, so a storage getter that
+	// reads PVE runs inside it.
+	fromReplica, err := pve.VolumeAccessSet(ctx, storages, members, replicas)
 	if err != nil {
 		return "", nil, fmt.Errorf("deletion destinations: the reach of the replica on %s: %w", partner, err)
 	}
