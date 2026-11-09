@@ -282,14 +282,131 @@ func TestNestedGuardSettlesASendByRefusal(t *testing.T) {
 // TestGuardedOperatorPoolSendByRefusalStaysUncertain keeps the new arm to
 // lock sentinels. A send-by refusal on any other pool is not something the
 // lock code sends, so it is not settled as a sentinel refusal and fails closed.
+// After never runs, which holds only when lockDeleteRefused declines the pool:
+// a settle would call After, and the test guard's After would then poison the
+// guard through observeLockPoolMutation on its own. The same holds for a
+// deadline that has already passed, which the pre-send check leaves to the
+// transport for any pool that is not a lock sentinel.
 func TestGuardedOperatorPoolSendByRefusalStaysUncertain(t *testing.T) {
-	pools := &lockGuardPools{found: true}
+	for name, deadline := range map[string]time.Time{
+		"refused by the transport": time.Now().Add(time.Minute),
+		"already passed":           time.Now().Add(-time.Minute),
+	} {
+		t.Run(name, func(t *testing.T) {
+			pools := &lockGuardPools{found: true}
+			wire := &sendByWire{}
+			events := &lockGuardEvents{}
+			guard := newLockGuardOver(t, storeClient{pools: sendByWirePools{PoolService: pools, wire: wire}}, events)
+			ctx := endpointpool.WithSendBy(t.Context(), deadline, http.MethodDelete, "/pools")
+			if err := guard.Client().Pools().DeletePool(ctx, "bosh-director"); err == nil || guard.Err() == nil || events.failed != 1 {
+				t.Fatalf("a refused operator pool delete was settled: err=%v guard=%v failed=%d", err, guard.Err(), events.failed)
+			}
+			if len(events.after) != 0 {
+				t.Fatalf("a refused operator pool delete reached After: %v", events.after)
+			}
+			if refused, _ := wire.refusedDeletes(); refused != 1 {
+				t.Fatalf("the operator pool delete did not meet the transport: %+v", wire.recorded())
+			}
+		})
+	}
+}
+
+// TestGuardedStealDeletePastSendByIsRefusedBeforeTheJournal sends a steal's
+// delete whose send-by deadline has already passed. The guard refuses it
+// before it plans a step, so Before never runs, nothing reaches PVE or the
+// wire, the guard stays usable, and the error has the SDK's shape around
+// endpointpool.ErrSendByPassed, as a refusal from the transport has. The next
+// delete, on time, goes through the journal as usual.
+func TestGuardedStealDeletePastSendByIsRefusedBeforeTheJournal(t *testing.T) {
+	claim := "owner=crashed@h/3-c-1 exp=2"
+	pools := &lockGuardPools{found: true, comment: claim}
+	wire := &sendByWire{late: func(int) bool { return false }}
+	client := storeClient{pools: sendByWirePools{PoolService: pools, wire: wire}}
+	var before, after, failed int
+	guard, err := NewManagedAllocationGuard(client, ManagedAllocationHooks{
+		Before: func(context.Context, ManagedAllocationMutation) (string, error) {
+			before++
+			return "step", nil
+		},
+		After: func(ctx context.Context, call ManagedAllocationMutation, _ string, result any) error {
+			after++
+			return observeLockPoolMutation(ctx, client.Pools(), call, result, "test")
+		},
+		Failed: func(context.Context, ManagedAllocationMutation, string, error) error {
+			failed++
+			return errors.New("allocation requires reconciliation")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	late := endpointpool.WithSendBy(pve.WithExpectedLockClaim(t.Context(), claim), time.Now().Add(-time.Millisecond),
+		http.MethodDelete, "/pools")
+
+	err = guard.Client().Pools().DeletePool(late, lockGuardPool)
+	if !errors.Is(err, endpointpool.ErrSendByPassed) {
+		t.Fatalf("want the send-by refusal, got %v", err)
+	}
+	transport := sdkSendByRefusal(http.MethodDelete, endpointpool.APIPrefix+"/pools", endpointpool.ErrSendByPassed)
+	var got, want *url.Error
+	if !errors.As(err, &got) || !errors.As(transport, &want) || got.Op != want.Op ||
+		!strings.Contains(err.Error(), "request failed after 1 attempt(s)") ||
+		!strings.Contains(got.URL, endpointpool.APIPrefix+"/pools?poolid="+lockGuardPool) {
+		t.Fatalf("the refusal does not have the SDK's shape: %v", err)
+	}
+	if before != 0 || after != 0 || failed != 0 {
+		t.Fatalf("the refused delete reached the journal: before=%d after=%d failed=%d", before, after, failed)
+	}
+	if guard.Err() != nil || len(wire.recorded()) != 0 || len(pools.calls) != 0 {
+		t.Fatalf("the refused delete went on: guard=%v wire=%+v pools=%v", guard.Err(), wire.recorded(), pools.calls)
+	}
+
+	if err := guard.Client().Pools().DeletePool(stealContext(t.Context(), claim), lockGuardPool); err != nil {
+		t.Fatalf("the next steal delete failed: %v", err)
+	}
+	if before != 1 || after != 1 || failed != 0 || guard.Err() != nil || pools.found {
+		t.Fatalf("the next delete did not go through the journal: before=%d after=%d failed=%d guard=%v found=%v",
+			before, after, failed, guard.Err(), pools.found)
+	}
+}
+
+// TestManagedVMGuardJournalsNoStepForAPastSendByDelete sends a sentinel
+// delete whose send-by deadline has passed through the VM allocation guard,
+// which journals every planned step. The record gains no DeletePool step, the
+// allocation stays usable, and the sentinel is untouched.
+func TestManagedVMGuardJournalsNoStepForAPastSendByDelete(t *testing.T) {
+	m, fixture, _, _ := newManagedVMGuardCase(t, managedVMGuardCase{})
+	locks := newLockContention(t)
+	sentinel := pve.ClusterLockPoolName("aa-web")
+	claim := expiredClaim("other-director")
+	locks.pools[sentinel] = claim
 	wire := &sendByWire{}
-	events := &lockGuardEvents{}
-	guard := newLockGuardOver(t, storeClient{pools: sendByWirePools{PoolService: pools, wire: wire}}, events)
-	ctx := endpointpool.WithSendBy(t.Context(), time.Now().Add(time.Second), http.MethodDelete, "/pools")
-	if err := guard.Client().Pools().DeletePool(ctx, "bosh-director"); err == nil || guard.Err() == nil || events.failed != 1 {
-		t.Fatalf("a refused operator pool delete was settled: err=%v guard=%v failed=%d", err, guard.Err(), events.failed)
+	m.deps.PVE = sendByVMClient{lockedVMClient: lockedVMClient{managedVMGuardFixture: fixture, locks: locks}, wire: wire}
+	m.guard = nil
+	if err := m.newGuard(); err != nil {
+		t.Fatal(err)
+	}
+	steps := len(m.handle.Record().Steps)
+	late := endpointpool.WithSendBy(pve.WithExpectedLockClaim(t.Context(), claim), time.Now().Add(-time.Millisecond),
+		http.MethodDelete, "/pools")
+
+	if err := m.guard.Client().Pools().DeletePool(late, sentinel); !errors.Is(err, endpointpool.ErrSendByPassed) {
+		t.Fatalf("want the send-by refusal, got %v", err)
+	}
+	if err := m.guard.Err(); err != nil {
+		t.Fatalf("the refused delete poisoned the VM allocation: %v", err)
+	}
+	record := m.handle.Record()
+	if len(record.Steps) != steps || poolStepKinds(t, record, "vm.Pool.DeletePool") != 0 {
+		t.Fatalf("the refused delete journaled a step: %d steps before, %+v", steps, record.Steps)
+	}
+	if len(wire.recorded()) != 0 {
+		t.Fatalf("the refused delete reached the wire: %+v", wire.recorded())
+	}
+	locks.mu.Lock()
+	defer locks.mu.Unlock()
+	if locks.pools[sentinel] != claim {
+		t.Fatalf("the refused delete disturbed the sentinel: %q", locks.pools[sentinel])
 	}
 }
 
@@ -379,7 +496,9 @@ func TestManagedLifecycleSettlesASendByRefusedSteal(t *testing.T) {
 	}
 	record := disk.record(t)
 	assertReturnedRecord(t, "attach", record)
-	if deletes := poolStepKinds(t, record, "_Pool_DeletePool"); deletes < 3 {
+	// The detach that parked the disk journaled its own sentinel deletes in
+	// the same record, so only the attach's are counted.
+	if deletes := poolStepKinds(t, record, "attach_disk_Pool_DeletePool"); deletes != 3 {
 		t.Fatalf("journaled %d sentinel deletes, want the refused steal, the steal, and the release", deletes)
 	}
 	if refused, sent := wire.refusedDeletes(); refused != 1 || sent != 1 {
@@ -422,7 +541,7 @@ func TestManagedParkSettlesASendByRefusedSteal(t *testing.T) {
 	if record.State != aj.ReadyToReturn {
 		t.Fatalf("allocation state = %s (reason %q), want %s", record.State, record.Reason, aj.ReadyToReturn)
 	}
-	if deletes := poolStepKinds(t, record, "park_Pool_DeletePool"); deletes < 3 {
+	if deletes := poolStepKinds(t, record, "park_Pool_DeletePool"); deletes != 3 {
 		t.Fatalf("journaled %d sentinel deletes, want the refused steal, the steal, and the release", deletes)
 	}
 	if refused, sent := wire.refusedDeletes(); refused != 1 || sent != 1 {

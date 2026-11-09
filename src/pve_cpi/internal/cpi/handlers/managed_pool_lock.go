@@ -3,10 +3,14 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 )
 
 // A cluster lock is a bosh-lock- sentinel pool, and contention on it is normal.
@@ -174,6 +178,38 @@ func expectedLockClaimRefusal(ctx context.Context, poolID string, claim managedL
 		return pve.ErrLockClaimChanged
 	}
 	return nil
+}
+
+// lockDeletePastSendBy returns the refusal a failover transport would give a
+// sentinel delete whose send-by deadline has already passed, and nil when the
+// delete may still be sent. DeletePool checks it before the guard plans a
+// step, so a steal or a sweep delete that can no longer be sent is refused
+// without touching the journal. Each planned step rewrites and syncs the whole
+// record, and a wait in which every steal is refused would otherwise add one
+// per poll, each one slower than the last and each spent inside the next
+// steal's budget.
+//
+// The error has the shape the SDK gives a transport's refusal of DELETE
+// /pools, the retry loop's wrap around a *url.Error whose cause is
+// endpointpool.ErrSendByPassed. The lock code, and a guard stacked over this
+// one, read it exactly as they read a refusal from the transport. The URL is
+// API-relative, because no endpoint was chosen for a request never sent.
+// Pools other than lock sentinels are not checked here, so a marker that
+// reached one meets the transport and fails closed in finish.
+func lockDeletePastSendBy(ctx context.Context, poolID string) error {
+	if !isManagedLockPool(poolID) {
+		return nil
+	}
+	path := endpointpool.APIPrefix + "/pools"
+	refusal := endpointpool.CheckSendBy(ctx, time.Now(), http.MethodDelete, path)
+	if refusal == nil {
+		return nil
+	}
+	return fmt.Errorf("pools.DeletePools: request failed after 1 attempt(s): %w", &url.Error{
+		Op:  "Delete",
+		URL: path + "?" + url.Values{"poolid": {poolID}}.Encode(),
+		Err: refusal,
+	})
 }
 
 // releasePoisonedSentinel releases our own lock sentinel after this guard was

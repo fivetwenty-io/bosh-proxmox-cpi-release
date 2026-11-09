@@ -572,6 +572,9 @@ func (t *managedPoolService) DeletePool(ctx context.Context, poolID string) (err
 	if _, own := pve.OwnLockClaim(ctx); own && isManagedLockPool(poolID) && t.guard.Err() != nil {
 		return t.releasePoisonedSentinel(ctx, poolID)
 	}
+	if refusal := lockDeletePastSendBy(ctx, poolID); refusal != nil {
+		return refusal
+	}
 	m := ManagedAllocationMutation{Service: managedDiskServicePool, Method: "DeletePool", Args: map[string]any{managedArgumentPoolID: poolID}}
 	token, err := t.guard.begin(ctx, m)
 	if err != nil {

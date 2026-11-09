@@ -120,24 +120,39 @@ func assertNoMarker(t *testing.T, w *sendByWire) {
 	}
 }
 
+// assertStealDeadline fails the test unless deadline is what a steal's marker
+// set between the real times before and after carries, with left of the budget
+// remaining on the lock clock. The deadline is in real time whatever the lock
+// clock reads.
+func assertStealDeadline(t *testing.T, deadline, before, after time.Time, left time.Duration) {
+	t.Helper()
+	if deadline.Before(before.Add(left)) || deadline.After(after.Add(left)) {
+		t.Fatalf("the send-by deadline is %v, want real time plus %s, between %v and %v",
+			deadline, left, before.Add(left), after.Add(left))
+	}
+}
+
 // TestSteal_SendByPassedAbandonsTheSteal refuses the steal's delete for its
 // send-by deadline. Nothing reached PVE, so the steal is abandoned like one
-// whose claim changed. It returns (nil, nil) rather than reaching holderUnknown
-// and ErrClusterLockStateUnknown, the expired claim still stands, and no
-// create follows.
+// whose claim changed. It returns a *lockStealNotSent that wraps the refusal,
+// rather than reaching holderUnknown and ErrClusterLockStateUnknown, the
+// expired claim still stands, and no create follows.
 func TestSteal_SendByPassedAbandonsTheSteal(t *testing.T) {
 	start := time.Unix(10_000, 0)
 	crashed := encodeLockComment("crashed@h/1-a-1", start.Add(-time.Second))
 	f := newFakeLockPools()
 	f.pools[stealPool] = crashed
 	clk := fixedClock(start, time.Second)
-	// The delete arrives exactly at its deadline, which counts as passed.
-	wire := &sendByWire{PoolService: f, now: func() time.Time { return clk.now().Add(clusterLockStealBudget) }}
+	// The delete arrives no earlier than its deadline, which counts as passed.
+	wire := &sendByWire{PoolService: f, now: func() time.Time { return time.Now().Add(clusterLockStealBudget) }}
 
+	before := time.Now()
 	h, err := tryStealExpired(context.Background(), wire, stealPool, "S@h/2-b-1", time.Minute,
 		start.Add(time.Minute), clusterLockSettings{}, clk)
-	if h != nil || err != nil {
-		t.Fatalf("tryStealExpired = (%v, %v), want (nil, nil) for a delete refused by its send-by deadline", h, err)
+	after := time.Now()
+	var notSent *lockStealNotSent
+	if h != nil || !errors.As(err, &notSent) || !errors.Is(err, endpointpool.ErrSendByPassed) {
+		t.Fatalf("tryStealExpired = (%v, %v), want the refused steal for a delete refused by its send-by deadline", h, err)
 	}
 	if errors.Is(err, ErrClusterLockStateUnknown) {
 		t.Fatalf("a refused steal delete left the holder unknown: %v", err)
@@ -146,9 +161,7 @@ func TestSteal_SendByPassedAbandonsTheSteal(t *testing.T) {
 	if len(deletes) != 1 || !deletes[0].refused {
 		t.Fatalf("want one refused delete, got %+v", deletes)
 	}
-	if want := start.Add(clusterLockStealBudget); !deletes[0].deadline.Equal(want) {
-		t.Fatalf("the steal's send-by deadline is %v, want started plus the steal budget (%v)", deletes[0].deadline, want)
-	}
+	assertStealDeadline(t, deletes[0].deadline, before, after, clusterLockStealBudget)
 	if f.deleteN != 0 || f.createN != 0 {
 		t.Fatalf("the refused steal reached the store: deletes=%d creates=%d", f.deleteN, f.createN)
 	}
@@ -171,13 +184,15 @@ func TestSteal_SendByMarksOnlyTheDelete(t *testing.T) {
 	clock := &sharedClock{t: start}
 	clk := clock.lockClock()
 	var late time.Duration
-	wire := &sendByWire{PoolService: f, now: func() time.Time { return clk.now().Add(late) }}
+	wire := &sendByWire{PoolService: f, now: func() time.Time { return time.Now().Add(late) }}
 	// Once the steal's delete is in, every later call runs long after its
 	// deadline.
 	wire.afterDelete = func() { late = time.Hour }
 
 	ctx := context.Background()
+	before := time.Now()
 	h, err := acquireClusterLockWithClock(ctx, wire, "vm-90000", "S@h/2-b-1", 3*time.Minute, time.Minute, clk, WithCreateGrace())
+	after := time.Now()
 	if err != nil || h == nil {
 		t.Fatalf("steal under grace: handle %v, err %v", h, err)
 	}
@@ -199,9 +214,7 @@ func TestSteal_SendByMarksOnlyTheDelete(t *testing.T) {
 	if len(marked) != 1 || marked[0].method != http.MethodDelete {
 		t.Fatalf("want only the steal's delete marked, got %+v of %+v", marked, calls)
 	}
-	if want := start.Add(clusterLockStealBudget); !marked[0].deadline.Equal(want) {
-		t.Fatalf("the steal's send-by deadline is %v, want %v", marked[0].deadline, want)
-	}
+	assertStealDeadline(t, marked[0].deadline, before, after, clusterLockStealBudget)
 	deletes := wire.deletes()
 	if len(deletes) != 2 || deletes[1].guarded {
 		t.Fatalf("want the steal's delete and an unmarked release, got %+v", deletes)
@@ -226,9 +239,9 @@ func TestSteal_SendByRefusalWaitsAPollAndStealsAgain(t *testing.T) {
 	wire.now = func() time.Time {
 		if len(wire.deletes()) == 0 {
 			// The first steal's delete arrives a second after its budget.
-			return clk.now().Add(clusterLockStealBudget + time.Second)
+			return time.Now().Add(clusterLockStealBudget + time.Second)
 		}
-		return clk.now()
+		return time.Now()
 	}
 	clock.onSleep = func(string, time.Duration) {
 		wire.mu.Lock()
@@ -263,14 +276,15 @@ func TestSteal_SendByRefusalWaitsAPollAndStealsAgain(t *testing.T) {
 // TestSteal_EverySendByRefusalEndsInATimeout keeps refusing the steal's
 // delete. Each attempt is abandoned and the claim left alone, so the acquire
 // runs out its wait with ErrClusterLockTimeout and never reports the holder
-// as unknown.
+// as unknown. The timeout carries the last refusal and says the expired
+// holder's steal could not be sent, rather than reading like a live holder.
 func TestSteal_EverySendByRefusalEndsInATimeout(t *testing.T) {
 	start := time.Unix(10_000, 0)
 	crashed := encodeLockComment("crashed@h/1-a-1", start.Add(-time.Second))
 	f := newFakeLockPools()
 	f.pools[stealPool] = crashed
 	clk := fixedClock(start, time.Second)
-	wire := &sendByWire{PoolService: f, now: func() time.Time { return clk.now().Add(time.Hour) }}
+	wire := &sendByWire{PoolService: f, now: func() time.Time { return time.Now().Add(time.Hour) }}
 
 	h, err := acquireClusterLockWithClock(context.Background(), wire, "vm-90000", "S@h/2-b-1", time.Minute, 5*time.Second, clk)
 	if h != nil {
@@ -278,6 +292,13 @@ func TestSteal_EverySendByRefusalEndsInATimeout(t *testing.T) {
 	}
 	if !errors.Is(err, ErrClusterLockTimeout) || errors.Is(err, ErrClusterLockStateUnknown) {
 		t.Fatalf("want ErrClusterLockTimeout without ErrClusterLockStateUnknown, got %v", err)
+	}
+	if !errors.Is(err, endpointpool.ErrSendByPassed) || errors.Is(err, ErrClusterLockHeld) {
+		t.Fatalf("want the timeout to carry the steal's refusal and not ErrClusterLockHeld, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "the expired holder's steal could not be sent before its send-by deadline") ||
+		strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("the timeout does not say the expired holder's steal could not be sent: %v", err)
 	}
 	deletes := wire.deletes()
 	if len(deletes) < 2 {
@@ -313,7 +334,7 @@ func TestNoWaitAcquire_CarriesNoMarker(t *testing.T) {
 		f := newFakeLockPools()
 		f.pools["bosh-lock-web"] = encodeLockComment("dead-owner", time.Unix(500, 0))
 		clk := fixedClock(time.Unix(1000, 0), time.Second)
-		wire := &sendByWire{PoolService: f, now: clk.now}
+		wire := &sendByWire{PoolService: f, now: time.Now}
 		h, err := acquireClusterLockWithClock(context.Background(), wire, "web", "me", time.Minute, 30*time.Second, clk, WithoutWait())
 		if err != nil || h == nil {
 			t.Fatalf("no-wait steal: handle %v, err %v", h, err)
@@ -324,6 +345,70 @@ func TestNoWaitAcquire_CarriesNoMarker(t *testing.T) {
 			}
 		}
 	})
+	t.Run("expired holder whose steal is refused", func(t *testing.T) {
+		f := newFakeLockPools()
+		dead := encodeLockComment("dead-owner", time.Unix(500, 0))
+		f.pools["bosh-lock-web"] = dead
+		clk := fixedClock(time.Unix(1000, 0), time.Second)
+		wire := &sendByWire{PoolService: f, now: func() time.Time { return time.Now().Add(time.Hour) }}
+		h, err := acquireClusterLockWithClock(context.Background(), wire, "web", "me", time.Minute, 30*time.Second, clk, WithoutWait())
+		if h != nil {
+			t.Fatal("a no-wait acquire whose steal was refused took the lock")
+		}
+		if !errors.Is(err, ErrClusterLockHeld) || !errors.Is(err, ErrClusterLockTimeout) ||
+			!errors.Is(err, endpointpool.ErrSendByPassed) || errors.Is(err, ErrClusterLockStateUnknown) {
+			t.Fatalf("want ErrClusterLockHeld and ErrClusterLockTimeout with the refusal, got %v", err)
+		}
+		text := err.Error()
+		if !strings.Contains(text, "the expired holder's steal could not be sent before its send-by deadline") ||
+			strings.Contains(text, ErrClusterLockHeld.Error()) || strings.Contains(text, "held by another process") {
+			t.Fatalf("the no-wait error reads like a live holder: %v", err)
+		}
+		if deletes := wire.deletes(); len(deletes) != 1 || !deletes[0].refused {
+			t.Fatalf("want one refused steal delete, got %+v", deletes)
+		}
+		if f.deleteN != 0 || f.createN != 1 || f.pools["bosh-lock-web"] != dead {
+			t.Fatalf("the refused steal changed the store: deletes=%d creates=%d claim=%q",
+				f.deleteN, f.createN, f.pools["bosh-lock-web"])
+		}
+	})
+}
+
+// TestWithLockStealSendBy_DeadlineIsInRealTime sets the steal's marker under
+// lock clocks far in the past and far in the future, and under one that has
+// run part of the budget. Each deadline is what is left of the budget on the
+// lock clock, added to the real time, so a transport that compares with
+// time.Now neither refuses it at once nor lets it through after the budget.
+func TestWithLockStealSendBy_DeadlineIsInRealTime(t *testing.T) {
+	path := endpointpool.APIPrefix + lockSentinelDeletePath
+	for name, tc := range map[string]struct {
+		start   time.Time
+		elapsed time.Duration
+	}{
+		"far in the past":        {start: time.Unix(10_000, 0)},
+		"far in the future":      {start: time.Now().Add(100 * 365 * 24 * time.Hour)},
+		"part of the budget run": {start: time.Unix(10_000, 0), elapsed: 1500 * time.Millisecond},
+	} {
+		t.Run(name, func(t *testing.T) {
+			at := tc.start.Add(tc.elapsed)
+			clk := lockClock{now: func() time.Time { return at }}
+			left := clusterLockStealBudget - tc.elapsed
+			before := time.Now()
+			ctx := withLockStealSendBy(context.Background(), clk, tc.start)
+			after := time.Now()
+			deadline, ok := endpointpool.SendBy(ctx, http.MethodDelete, path)
+			if !ok {
+				t.Fatal("the steal's marker does not name DELETE /pools")
+			}
+			assertStealDeadline(t, deadline, before, after, left)
+			if err := endpointpool.CheckSendBy(ctx, time.Now(), http.MethodDelete, path); err != nil {
+				t.Fatalf("a transport on real time refused the steal at once: %v", err)
+			}
+			if err := endpointpool.CheckSendBy(ctx, time.Now().Add(left), http.MethodDelete, path); !errors.Is(err, endpointpool.ErrSendByPassed) {
+				t.Fatalf("a transport on real time sent the steal after its budget: %v", err)
+			}
+		})
+	}
 }
 
 // TestCreateUnderGrace_CarriesNoMarker takes a free lock with the create grace

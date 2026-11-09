@@ -355,7 +355,7 @@ func SweepExpiredDiskTransferLocks(ctx context.Context, c Client, logger *log.Lo
 		if !parsed || !clk.now().After(expiry.Add(sweepExpiredLockAge())) {
 			continue
 		}
-		deleted, sweepErr := sweepExpiredLockSentinel(ctx, pools, name, comment, clk)
+		deleted, sweepErr := sweepExpiredLockSentinel(ctx, pools, name, comment, clk, logger)
 		if sweepErr != nil {
 			errs = append(errs, sweepErr)
 			continue
@@ -390,8 +390,12 @@ func sweepExpiredLockAge() time.Duration {
 // delete could not be sent before the steal's send-by deadline, which the
 // delete carries for the same reason a steal's does (withLockStealSendBy).
 // None of that delete reached PVE, so the sentinel is left for the next sweep
-// and no error is reported.
-func sweepExpiredLockSentinel(ctx context.Context, pools PoolService, name, comment string, clk lockClock) (bool, error) {
+// and no error is reported. Of the sentinels the sweep leaves, that one is
+// the case that repeats on the next sweep, so it is logged at Debug when
+// logger is not nil.
+func sweepExpiredLockSentinel(
+	ctx context.Context, pools PoolService, name, comment string, clk lockClock, logger *log.Logger,
+) (bool, error) {
 	started := clk.now()
 	readCtx, cancel := context.WithTimeout(ctx, diskTransferLockSweepReadTimeout)
 	current, found, err := pools.GetPoolComment(readCtx, name)
@@ -404,9 +408,16 @@ func sweepExpiredLockSentinel(ctx context.Context, pools PoolService, name, comm
 	}
 	// The expected claim is passed for a guarded pool service that checks it.
 	// The SDK service the sweep normally runs on deletes unconditionally.
-	delErr := pools.DeletePool(withLockStealSendBy(WithExpectedLockClaim(ctx, comment), started), name)
+	delErr := pools.DeletePool(withLockStealSendBy(WithExpectedLockClaim(ctx, comment), clk, started), name)
 	switch {
 	case errors.Is(delErr, endpointpool.ErrSendByPassed):
+		if logger != nil {
+			logger.Debug("disk transfer: left an expired per-disk lock for the next sweep, because its delete "+
+				"could not be sent before its send-by deadline",
+				log.String("pool", name),
+				log.Err(delErr),
+			)
+		}
 		return false, nil
 	case delErr == nil:
 		return true, nil

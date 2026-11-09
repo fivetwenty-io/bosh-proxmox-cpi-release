@@ -65,8 +65,20 @@ const clusterLockPollInterval = 500 * time.Millisecond
 // clusterLockStealBudget bounds one steal. It runs from the moment the stealer
 // sends the re-read that confirms the expired claim to the moment its delete of
 // that claim returns. A stealer that has not finished its delete within the
-// budget abandons the steal instead of creating, and the next poll starts over
-// with an ordinary create, so running over costs one poll and nothing else.
+// budget abandons the steal instead of creating. When the delete landed late,
+// the sentinel is gone and the next poll starts over with an ordinary create,
+// so running over costs one poll.
+//
+// A delete that could not be sent before the steal's send-by deadline costs
+// more. The deadline falls at the end of this budget (withLockStealSendBy), and
+// a delete refused for it never reached PVE, so the expired sentinel still
+// stands and the next poll steals it again. When the overhead before the send
+// stays above the budget, every guarded steal of that sentinel is refused the
+// same way, and the acquire waits until it times out. Its timeout then names
+// the refused steal rather than a live holder. Another acquirer whose steal
+// goes out in time can still replace the sentinel, and the expired-lock sweep
+// removes a per-disk one, but nothing else removes it. The VMID, anti-affinity,
+// and HA rules locks have no sweep.
 //
 // A journal-managed steal delete makes several PVE calls in that span: the
 // re-read, the guard's admission reads, the guard's own read of the claim, the
@@ -81,20 +93,63 @@ const lockSentinelDeletePath = "/pools"
 
 // withLockStealSendBy returns ctx carrying a send-by deadline for a
 // steal-shaped sentinel delete, the steal's own and the expired-lock sweep's.
-// Both rest on one timing argument. The delete must reach PVE within
+// Both rest on one timing argument. The delete must start writing within
 // clusterLockStealBudget of the moment its last re-read was sent, so the
 // deadline is started plus the budget. A delete that the failover transport
 // cannot start writing by then is refused with endpointpool.ErrSendByPassed,
-// and no byte of it leaves the machine.
+// and no byte of it leaves the machine. The deadline bounds when the delete
+// starts writing, not when PVE commits it. The network, PVE's processing, and
+// any wait on PVE's cluster-wide user.cfg lock come after it, and the round
+// trip in clusterLockDefaultGrace has to absorb them.
+//
+// started is a reading of clk, which tests can replace, while the transport
+// compares the deadline with its own time.Now. So the deadline is expressed
+// in real time, as what is left of the budget on clk added to time.Now. The
+// real reading is taken first, so under the production clock, which is
+// time.Now, the deadline never falls later than started plus the budget. A
+// fake clock far from the wall clock therefore yields a deadline the
+// transport can meet, rather than one it refuses at once or never.
 //
 // The marker names DELETE /pools only. The managed allocation guard reads the
 // sentinel before the delete and reads it back after it on the same context,
 // and those reads must still run once the deadline has passed. A context that
 // carries the marker must therefore stay with the one delete it guards, and
 // never reach a release or an abandon, which delete our own claim.
-func withLockStealSendBy(ctx context.Context, started time.Time) context.Context {
-	return endpointpool.WithSendBy(ctx, started.Add(clusterLockStealBudget), http.MethodDelete, lockSentinelDeletePath)
+func withLockStealSendBy(ctx context.Context, clk lockClock, started time.Time) context.Context {
+	now := time.Now()
+	left := clusterLockStealBudget - clk.now().Sub(started)
+	return endpointpool.WithSendBy(ctx, now.Add(left), http.MethodDelete, lockSentinelDeletePath)
 }
+
+// lockStealNotSent is what tryStealExpired returns for a steal it abandoned
+// because its delete of the expired claim could not be sent before its
+// send-by deadline. None of the delete reached PVE, and the expired claim
+// still stands. The acquire loop does not fail on it. It waits a poll as it
+// does for any abandoned steal, and it keeps the refusal, so that a timeout or
+// a no-wait give-up that follows says why the expired holder was not
+// replaced. err is the delete's own error, which wraps
+// endpointpool.ErrSendByPassed.
+type lockStealNotSent struct {
+	pool string
+	err  error
+}
+
+func (e *lockStealNotSent) Error() string {
+	return fmt.Sprintf("lock %q: the expired holder's steal could not be sent before its send-by deadline: %v", e.pool, e.err)
+}
+
+func (e *lockStealNotSent) Unwrap() error { return e.err }
+
+// clusterLockHeldMark marks the no-wait give-up after a steal that could not
+// be sent with ErrClusterLockHeld, so the callers that move on from a held
+// lock move on from this one too. Its text is that of the error it marks,
+// because the holder had expired and ErrClusterLockHeld's own text would call
+// it live.
+type clusterLockHeldMark struct{ err error }
+
+func (e *clusterLockHeldMark) Error() string        { return e.err.Error() }
+func (e *clusterLockHeldMark) Unwrap() error        { return e.err }
+func (e *clusterLockHeldMark) Is(target error) bool { return target == ErrClusterLockHeld }
 
 // clusterLockRoundTrip is the allowance for one PVE API round trip in the lock
 // arithmetic below.
@@ -178,9 +233,12 @@ func WithCreateGrace() ClusterLockOption {
 // WithoutWait makes the acquire try once. When a live holder has the lock, it
 // returns at once with ErrClusterLockHeld joined with ErrClusterLockTimeout
 // instead of polling until its timeout. An expired or unreadable holder is
-// still stolen, and the timeout still bounds the confirming reads. The
-// deferred-teardown sweep and the create_vm VMID claim use it, because both
-// would rather move on to other work than wait on a VM another process holds.
+// still stolen, and the timeout still bounds the confirming reads. A steal
+// whose delete could not be sent before its send-by deadline gives up the same
+// way, with endpointpool.ErrSendByPassed in the chain and text that says the
+// holder expired. The deferred-teardown sweep and the create_vm VMID claim use
+// it, because both would rather move on to other work than wait on a VM
+// another process holds.
 func WithoutWait() ClusterLockOption {
 	return func(s *clusterLockSettings) { s.noWait = true }
 }
@@ -423,6 +481,13 @@ func acquireClusterLockWithClock(
 
 		// Pool exists: inspect the holder's recorded expiry to decide steal-or-wait.
 		stole, stealErr := tryStealExpired(ctx, pools, pool, owner, ttl, deadline, settings, clk)
+		// A steal whose delete could not be sent changed nothing, so this poll
+		// waits like any other abandoned steal. Its refusal is kept for the
+		// give-up below, which would otherwise read like a live holder.
+		var notSent *lockStealNotSent
+		if errors.As(stealErr, &notSent) {
+			stealErr = nil
+		}
 		retake, stealErr := retakeShortClaim(ctx, stealErr, ttl, deadline, settings, clk)
 		if retake {
 			continue
@@ -437,15 +502,25 @@ func acquireClusterLockWithClock(
 		// Held by a live owner: wait and retry until the timeout, or give up at
 		// once when the caller asked not to wait.
 		if settings.noWait {
+			if notSent != nil {
+				return nil, cpierrors.WrapAs(errors.Join(&clusterLockHeldMark{err: notSent}, ErrClusterLockTimeout),
+					cpierrors.TypeRetriableCloud,
+					fmt.Sprintf("AcquireClusterLock: lock %q has an expired holder this acquire could not replace, "+
+						"and it does not wait", pool))
+			}
 			return nil, cpierrors.WrapAs(errors.Join(ErrClusterLockHeld, ErrClusterLockTimeout), cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("AcquireClusterLock: lock %q is held by another process, and this acquire does not wait", pool))
 		}
 		now := clk.now()
 		if !now.Before(deadline) {
-			if createErr == nil {
-				createErr = errors.New("sentinel displaced after create")
+			cause := createErr
+			switch {
+			case notSent != nil:
+				cause = notSent
+			case cause == nil:
+				cause = errors.New("sentinel displaced after create")
 			}
-			return nil, timedOut(createErr)
+			return nil, timedOut(cause)
 		}
 		if sleepErr := clk.sleep(ctx, clusterLockPollWait(ctx, now, deadline)); sleepErr != nil {
 			return nil, cpierrors.WrapAs(errors.Join(sleepErr, ErrClusterLockInterrupted), cpierrors.TypeRetriableCloud,
@@ -513,9 +588,10 @@ func clusterLockPollWait(ctx context.Context, now, deadline time.Time) time.Dura
 // to steal the lock via delete+recreate. It returns a non-nil handle ONLY after
 // confirmLockCreate has confirmed the new sentinel carries OUR claim. It returns
 // (nil, nil) when the lock is still live, when the claim changed before the
-// delete, when the steal ran over its budget, when its delete could not be
-// sent before its send-by deadline, or when another acquirer won the recreate,
-// signalling the caller to wait/retry.
+// delete, when the steal ran over its budget, or when another acquirer won the
+// recreate, signalling the caller to wait/retry. A steal whose delete could
+// not be sent before its send-by deadline returns a *lockStealNotSent, which
+// the caller treats like (nil, nil) but keeps for the error it gives up with.
 //
 // PVE has no compare-and-delete, so two stealers that both judged the same
 // claim expired race each other, and a stale delete can remove the claim the
@@ -534,7 +610,8 @@ func clusterLockPollWait(ctx context.Context, now, deadline time.Time) time.Dura
 //     The delete also carries a send-by deadline at the end of the budget
 //     (withLockStealSendBy), so a failover transport that would have to try
 //     another endpoint first refuses to start it late, and the steal is
-//     abandoned with the claim left in place.
+//     abandoned with the expired claim left in place. The next poll meets that
+//     claim and steals again, as clusterLockStealBudget describes.
 //   - A lock that takes WithCreateGrace makes every create, a steal's or a plain
 //     one, wait out a grace pause of at least the budget plus a round trip and
 //     confirm its claim a second time.
@@ -607,13 +684,13 @@ func tryStealExpired(
 		// another acquirer's grace covers. Leave the sentinel alone.
 		return nil, nil
 	}
-	delErr := pools.DeletePool(withLockStealSendBy(WithExpectedLockClaim(ctx, comment), started), pool)
+	delErr := pools.DeletePool(withLockStealSendBy(WithExpectedLockClaim(ctx, comment), clk, started), pool)
 	switch {
 	case errors.Is(delErr, endpointpool.ErrSendByPassed):
 		// The delete could not be sent within the budget, so none of it
 		// reached PVE and the expired claim still stands. Abandon the steal
 		// as for a changed claim; the next poll decides afresh.
-		return nil, nil
+		return nil, &lockStealNotSent{pool: pool, err: delErr}
 	case delErr == nil, isPoolNotFound(delErr):
 	case errors.Is(delErr, ErrLockClaimChanged):
 		return nil, nil
@@ -1195,12 +1272,19 @@ func IsClusterLockPermissionRefused(err error) bool {
 // can lock here" from "somebody is locked here". An acquire whose request
 // deadline came first, less clusterLockContextMargin, returns it too, having
 // changed nothing, and so does one that starts with less than that margin left.
+// So does an acquire whose last steal of an expired holder could not be sent
+// before its send-by deadline, with endpointpool.ErrSendByPassed in the chain.
+// That holder had expired, but its sentinel still stands and nobody could
+// replace it, so a caller reads it as "somebody is locked here" and does not
+// proceed unserialized.
 var ErrClusterLockTimeout = errors.New("cluster lock acquire timed out")
 
 // ErrClusterLockHeld marks the acquire that WithoutWait ended at once because a
 // live holder had the lock. It comes joined with ErrClusterLockTimeout, so a
 // caller that treats a timeout as "somebody is locked here" reads it the same
-// way.
+// way. It also marks the no-wait acquire whose steal of an expired holder
+// could not be sent before its send-by deadline, whose text names the refused
+// steal instead of this one.
 var ErrClusterLockHeld = errors.New("cluster lock is held by a live owner")
 
 // ErrClusterLockNoTimeToWait marks the lock timeout of an acquire that gave up
