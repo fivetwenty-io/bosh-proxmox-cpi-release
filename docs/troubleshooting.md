@@ -80,7 +80,7 @@ Grant the missing privilege in the PVE web UI under Datacenter → Permissions. 
 **Symptom**
 
 ```text
-config validation failed: host is required; user is required; vm_storage is required; disk_storage is required; network_bridge is required
+config validation failed: host is required: set pve.host or pve.endpoints; user is required; vm_storage is required; disk_storage is required; network_bridge is required
 ```
 
 or
