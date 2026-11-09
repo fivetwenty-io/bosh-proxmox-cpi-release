@@ -1,6 +1,7 @@
 package endpointpool
 
 import (
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -118,6 +119,12 @@ func dialFailure(endpoint string) EndpointFailure {
 	}
 }
 
+// certVerifyError wraps cause the way a real handshake reports a refused
+// certificate.
+func certVerifyError(cause error) error {
+	return &tls.CertificateVerificationError{Err: cause}
+}
+
 func verifyFailure(endpoint string, cause error) EndpointFailure {
 	return EndpointFailure{
 		Endpoint: endpoint,
@@ -127,10 +134,11 @@ func verifyFailure(endpoint string, cause error) EndpointFailure {
 
 func TestEntryUnreachableUnwrapsToDialError(t *testing.T) {
 	headerTimeout := EndpointFailure{Endpoint: "pve3:8006", Err: errors.New("response header timeout")}
+	verify := verifyFailure("pve2:8006", certVerifyError(x509.UnknownAuthorityError{}))
 	orders := [][]EndpointFailure{
-		{dialFailure("pve1:8006"), verifyFailure("pve2:8006", x509.UnknownAuthorityError{}), headerTimeout},
-		{headerTimeout, verifyFailure("pve2:8006", x509.UnknownAuthorityError{}), dialFailure("pve1:8006")},
-		{verifyFailure("pve2:8006", x509.UnknownAuthorityError{}), headerTimeout, dialFailure("pve1:8006")},
+		{dialFailure("pve1:8006"), verify, headerTimeout},
+		{headerTimeout, verify, dialFailure("pve1:8006")},
+		{verify, headerTimeout, dialFailure("pve1:8006")},
 	}
 	for i, attempts := range orders {
 		err := error(NewEntryUnreachableError(attempts))
@@ -159,11 +167,11 @@ func TestEntryUnreachableUnwrapsToDialError(t *testing.T) {
 }
 
 func TestEntryUnreachableAllVerifyUnwrapsToCertificateError(t *testing.T) {
-	unknown := x509.UnknownAuthorityError{}
+	unknown := certVerifyError(x509.UnknownAuthorityError{})
 	host := x509.HostnameError{Host: "pve2"}
 	err := error(NewEntryUnreachableError([]EndpointFailure{
 		verifyFailure("pve1:8006", unknown),
-		verifyFailure("pve2:8006", host),
+		verifyFailure("pve2:8006", certVerifyError(host)),
 	}))
 	var op *net.OpError
 	if errors.As(err, &op) {
@@ -181,7 +189,7 @@ func TestEntryUnreachableAllVerifyUnwrapsToCertificateError(t *testing.T) {
 
 func TestEntryUnreachableMixedWithOneVerifyIsDial(t *testing.T) {
 	err := error(NewEntryUnreachableError([]EndpointFailure{
-		verifyFailure("pve1:8006", x509.UnknownAuthorityError{}),
+		verifyFailure("pve1:8006", certVerifyError(x509.UnknownAuthorityError{})),
 		dialFailure("pve2:8006"),
 	}))
 	var op *net.OpError
@@ -241,5 +249,24 @@ func TestEntryUnreachableThroughWrapping(t *testing.T) {
 	var op *net.OpError
 	if !errors.As(wrapped, &op) || op.Op != "dial" {
 		t.Error("the dial classification should survive wrapping")
+	}
+}
+
+// A pin failure is not a configured endpoint's refused certificate. It makes a
+// refresh due and heals later, so any walk holding one reads as a dial error.
+func TestEntryUnreachableWithPinFailureIsDial(t *testing.T) {
+	pin := EndpointFailure{
+		Endpoint: "pve2:8006",
+		Err:      &ConnectPhaseError{Phase: PhasePin, Endpoint: "pve2:8006", Err: errors.New("fingerprint mismatch")},
+	}
+	verify := verifyFailure("pve1:8006", certVerifyError(x509.UnknownAuthorityError{}))
+	for name, attempts := range map[string][]EndpointFailure{
+		"verify and pin": {verify, pin},
+		"pin only":       {pin},
+	} {
+		var op *net.OpError
+		if !errors.As(NewEntryUnreachableError(attempts), &op) || op.Op != "dial" {
+			t.Errorf("%s: should unwrap to a dial error", name)
+		}
 	}
 }

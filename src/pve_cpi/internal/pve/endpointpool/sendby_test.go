@@ -111,3 +111,37 @@ func TestSendByDoesNotChangeContextCancellation(t *testing.T) {
 		t.Error("cancelling the parent should cancel the derived context")
 	}
 }
+
+// The SDK builds every request URL from a base that ends in /api2/json, so a
+// transport sees "/api2/json/pools" for the route the marker names "/pools".
+func TestSendByMatchesTheSDKPrefixedPath(t *testing.T) {
+	deadline := time.Unix(1000, 0)
+	ctx := WithSendBy(context.Background(), deadline, "DELETE", "/pools")
+
+	if got, ok := SendBy(ctx, "DELETE", APIPrefix+"/pools"); !ok || !got.Equal(deadline) {
+		t.Errorf("SendBy on the prefixed path = %v, %v; want the marker's deadline", got, ok)
+	}
+	if err := CheckSendBy(ctx, deadline, "DELETE", "/api2/json/pools"); !errors.Is(err, ErrSendByPassed) {
+		t.Errorf("CheckSendBy on the prefixed path at the deadline = %v, want ErrSendByPassed", err)
+	}
+	for _, other := range [][2]string{
+		{"GET", "/api2/json/pools"},
+		{"DELETE", "/api2/json/pools/x"},
+		{"DELETE", "/api2/json/nodes/pools"},
+		{"DELETE", "/api2/jsonpools"},
+		{"DELETE", "/api2/json"},
+	} {
+		if err := CheckSendBy(ctx, deadline.Add(time.Hour), other[0], other[1]); err != nil {
+			t.Errorf("%s %s should be unguarded, got %v", other[0], other[1], err)
+		}
+	}
+
+	// A marker written with the prefix guards the same request.
+	prefixed := WithSendBy(context.Background(), deadline, "DELETE", "/api2/json/pools")
+	if _, ok := SendBy(prefixed, "DELETE", "/api2/json/pools"); !ok {
+		t.Error("a prefixed marker should match the prefixed request path")
+	}
+	if _, ok := SendBy(prefixed, "DELETE", "/pools"); !ok {
+		t.Error("a prefixed marker should match the API-relative path")
+	}
+}

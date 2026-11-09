@@ -12,8 +12,8 @@ type scopeKey struct{}
 // makes to the scope on the request's context, and drops those tethers when the
 // scope is released, so a tether lasts as long as the call that made it.
 //
-// A Scope is compared by identity. Its zero value is not usable, and
-// WithAffinityScope is the only constructor.
+// A Scope is compared by identity, so it must come from WithAffinityScope and
+// be passed around as the pointer that function put on the context.
 type Scope struct {
 	mu       sync.Mutex
 	released bool
@@ -71,8 +71,10 @@ func (s *Scope) Released() bool {
 }
 
 // release marks the scope released and runs the registered functions once. A
-// function that panics does not keep the rest from running, and the first panic
-// is raised again after they have all run.
+// function that panics does not keep the rest from running, and its panic is
+// dropped. The dispatcher calls release from a defer after a call's work has
+// finished, and the registered functions only drop tethers, so a faulty one
+// must not crash the CPI at that point.
 func (s *Scope) release() {
 	s.mu.Lock()
 	if s.released {
@@ -84,21 +86,10 @@ func (s *Scope) release() {
 	s.fns = nil
 	s.mu.Unlock()
 
-	var (
-		panicked bool
-		first    any
-	)
 	for _, fn := range fns {
 		func() {
-			defer func() {
-				if r := recover(); r != nil && !panicked {
-					panicked, first = true, r
-				}
-			}()
+			defer func() { _ = recover() }()
 			fn()
 		}()
-	}
-	if panicked {
-		panic(first)
 	}
 }

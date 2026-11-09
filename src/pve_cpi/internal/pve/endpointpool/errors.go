@@ -139,6 +139,12 @@ type EndpointFailure struct {
 // connection error. The exception is a walk in which every hop failed
 // certificate verification. That one unwraps to the joined verification
 // errors, so the SDK reports a certificate failure as it does today.
+//
+// Only the PhaseTLSVerify phase counts as a certificate verification failure
+// here. A PhasePin failure is a discovered endpoint whose certificate
+// changed outside its pin set, which makes a refresh due and heals on a later
+// call, so a walk with a pin failure in it reads as a dial error and stays
+// transient, whether the other hops failed verification, dialing, or pinning.
 type EntryUnreachableError struct {
 	// Attempts lists every hop in the order the walk tried it.
 	Attempts []EndpointFailure

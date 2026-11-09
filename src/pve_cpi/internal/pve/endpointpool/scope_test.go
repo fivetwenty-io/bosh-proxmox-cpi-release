@@ -173,7 +173,7 @@ func TestScopeFunctionMayUseTheScope(t *testing.T) {
 	}
 }
 
-func TestScopeReleasePanicStillRunsTheRest(t *testing.T) {
+func TestScopeReleaseDropsPanicsAndRunsTheRest(t *testing.T) {
 	ctx, release := WithAffinityScope(context.Background())
 	s := ScopeFromContext(ctx)
 	var ran atomic.Int32
@@ -182,16 +182,14 @@ func TestScopeReleasePanicStillRunsTheRest(t *testing.T) {
 	s.OnRelease(func() { ran.Add(1) })
 	s.OnRelease(func() { panic("second") })
 
-	func() {
-		defer func() {
-			if r := recover(); r != "first" {
-				t.Errorf("recovered %v, want the first panic", r)
-			}
-		}()
-		release()
-	}()
+	// The dispatcher calls release from a defer after the call's work is done,
+	// so a faulty callback must not raise a panic out of it.
+	release()
 	if ran.Load() != 2 {
 		t.Errorf("%d healthy functions ran, want 2", ran.Load())
+	}
+	if !s.Released() {
+		t.Error("the scope should read as released after a panicking callback")
 	}
 	release() // already released, so nothing runs and nothing panics
 }
