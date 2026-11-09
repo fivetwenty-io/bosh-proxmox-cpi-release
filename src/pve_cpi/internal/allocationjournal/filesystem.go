@@ -1,22 +1,16 @@
 package allocationjournal
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
-	"syscall"
-	"time"
 
-	"golang.org/x/sys/unix"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/privatefile"
 )
 
 // DurabilityError means the caller must not submit another mutation. Atomic
@@ -82,14 +76,8 @@ func defaultFileOps() fileOps {
 		},
 	}
 }
-func syncDirectory(r *os.Root) error {
-	f, err := r.Open(".")
-	if err != nil {
-		return err
-	}
-	return errors.Join(f.Sync(), f.Close())
-}
-func pathKey(value string) string { s := sha256.Sum256([]byte(value)); return hex.EncodeToString(s[:]) }
+func syncDirectory(r *os.Root) error { return privatefile.SyncDirectory(r) }
+func pathKey(value string) string    { s := sha256.Sum256([]byte(value)); return hex.EncodeToString(s[:]) }
 func validateNamespace(namespace string) error {
 	if !nonblank(namespace) || namespace != strings.TrimSpace(namespace) || len(namespace) > 1024 || strings.ContainsAny(namespace, "/\\\x00") || namespace == "." || namespace == ".." {
 		return fmt.Errorf("journal: invalid namespace")
@@ -99,11 +87,12 @@ func validateNamespace(namespace string) error {
 
 // Unsafe path causes. An UnsafePathError wraps exactly one of them, so a
 // caller can tell an ownership mismatch, which a rerun as the owner fixes,
-// from a mode or file type that only the operator can repair.
+// from a mode or file type that only the operator can repair. Each carries
+// the journal's wording and still matches the shared package's cause.
 var (
-	ErrUnsafeOwnership = errors.New("journal: unsafe ownership")
-	ErrUnsafeMode      = errors.New("journal: unsafe permissions")
-	ErrUnsafeFileType  = errors.New("journal: unsafe file type")
+	ErrUnsafeOwnership = privatefile.Sentinel("journal: unsafe ownership", privatefile.ErrUnsafeOwnership)
+	ErrUnsafeMode      = privatefile.Sentinel("journal: unsafe permissions", privatefile.ErrUnsafeMode)
+	ErrUnsafeFileType  = privatefile.Sentinel("journal: unsafe file type", privatefile.ErrUnsafeFileType)
 )
 
 // UnsafePathError names a journal path that privateInfo refused. UID is the
@@ -111,168 +100,34 @@ var (
 // EUID is the effective UID the check compared it against. WantDirectory
 // says which file type the check expected. Its text carries only the path,
 // the two UIDs, and the mode, so the CLI may print it.
-type UnsafePathError struct {
-	Path          string
-	UID, EUID     int
-	Mode          os.FileMode
-	WantDirectory bool
-	Cause         error
+type UnsafePathError = privatefile.UnsafePathError
+
+// privateFiles is the journal's private-file policy: its own wording and
+// error classes, its record size cap, its plain SHA-256 checksum, and a
+// temporary name drawn from the allocation UUID source.
+var privateFiles = privatefile.Policy{
+	Label:        "journal",
+	Ownership:    ErrUnsafeOwnership,
+	Mode:         ErrUnsafeMode,
+	FileType:     ErrUnsafeFileType,
+	Changed:      ErrReconciliationRequired,
+	Corrupt:      ErrCorrupt,
+	MaxBytes:     maxRecordBytes,
+	IntegrityKey: "sha256",
+	Integrity:    privatefile.SHA256Hex,
+	NewID:        NewAllocationID,
 }
 
-func (e *UnsafePathError) Error() string {
-	switch {
-	case errors.Is(e.Cause, ErrUnsafeOwnership) && e.UID < 0:
-		return fmt.Sprintf("%v: %s has no ownership metadata", e.Cause, e.Path)
-	case errors.Is(e.Cause, ErrUnsafeOwnership):
-		return fmt.Sprintf("%v: %s is owned by uid %d, not effective uid %d", e.Cause, e.Path, e.UID, e.EUID)
-	case errors.Is(e.Cause, ErrUnsafeMode):
-		return fmt.Sprintf("%v: %s has mode %04o and must grant no group or other access", e.Cause, e.Path, e.Mode.Perm())
-	case e.WantDirectory:
-		return fmt.Sprintf("%v: %s is not a directory", e.Cause, e.Path)
-	default:
-		return fmt.Sprintf("%v: %s is not a regular file", e.Cause, e.Path)
-	}
-}
-
-func (e *UnsafePathError) Unwrap() error { return e.Cause }
-
-// privateInfo refuses a journal path that another user owns, whose type is
-// not the one expected, or that grants any group or other access, in that
-// order of precedence. path is only reported; every check reads info.
 func privateInfo(path string, info os.FileInfo, directory bool) error {
-	euid := os.Geteuid()
-	st, ok := info.Sys().(*syscall.Stat_t)
-	unsafe := &UnsafePathError{Path: path, UID: -1, EUID: euid, Mode: info.Mode(), WantDirectory: directory}
-	if ok {
-		unsafe.UID = int(st.Uid)
-	}
-	switch {
-	case !ok || int64(st.Uid) != int64(euid):
-		unsafe.Cause = ErrUnsafeOwnership
-	case info.IsDir() != directory || !directory && !info.Mode().IsRegular():
-		unsafe.Cause = ErrUnsafeFileType
-	case info.Mode().Perm()&0o077 != 0:
-		unsafe.Cause = ErrUnsafeMode
-	}
-	if unsafe.Cause != nil {
-		return unsafe
-	}
-	// Reject a second link, not a missing one. A link count of zero is what a
-	// concurrent atomicJSON rename looks like from the reader's side: the
-	// victim inode is unlinked while the name still resolves to it, so an
-	// lstat or an fstat a moment later sees a live name on a zero-link inode.
-	// Measured on APFS that is about one lookup in five hundred under load,
-	// and "!= 1" turned every one of them into a hard failure no caller
-	// recognised. An inode nothing links to cannot be reached by name by any
-	// new opener, so accepting it gives an attacker nothing, while nlink >= 2
-	// stays refused and that is what the message has always claimed to catch.
-	// Reading a doomed inode is handled where it belongs, by the SameFile
-	// check in openPrivateWith and the retry in readJSON.
-	if !directory && st.Nlink > 1 {
-		return fmt.Errorf("journal: multiply linked file rejected")
-	}
-	return nil
+	return privateFiles.PrivateInfo(path, info, directory)
 }
-func openPrivateRoot(path string) (*os.Root, error) {
-	if !filepath.IsAbs(path) {
-		return nil, fmt.Errorf("journal: directory must be absolute")
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("journal: symlink directory rejected")
-	}
-	if err := privateInfo(path, info, true); err != nil {
-		return nil, err
-	}
-	r, err := os.OpenRoot(path)
-	if err != nil {
-		return nil, err
-	}
-	// Check the opened inode as well, so replacement between Lstat and OpenRoot
-	// cannot silently grant access to a different directory.
-	f, err := r.Open(".")
-	if err != nil {
-		return nil, errors.Join(err, r.Close())
-	}
-	opened, statErr := f.Stat()
-	closeErr := f.Close()
-	if statErr != nil || closeErr != nil || !os.SameFile(info, opened) {
-		return nil, errors.Join(fmt.Errorf("journal: directory changed while opening"), statErr, closeErr, r.Close())
-	}
-	return r, nil
-}
-
-// Native openat is intentional: os.Root.OpenFile resolves relative symlinks
-// itself on some platforms before applying O_NOFOLLOW to the final open.
+func openPrivateRoot(path string) (*os.Root, error) { return privateFiles.OpenRoot(path) }
 func openPrivate(r *os.Root, name string, flags int) (*os.File, error) {
-	return openPrivateWith(r, name, flags, func(fd int, name string, flags int) (int, error) { return unix.Openat(fd, name, flags, 0o600) })
+	return privateFiles.Open(r, name, flags)
 }
 func openPrivateWith(r *os.Root, name string, flags int, open func(int, string, int) (int, error)) (*os.File, error) {
-	if name == "" || filepath.Base(name) != name || name == "." || name == ".." {
-		return nil, fmt.Errorf("journal: private file name must be a basename")
-	}
-	prior, err := r.Lstat(name)
-	if err == nil {
-		if err := privateInfo(filepath.Join(r.Name(), name), prior, false); err != nil {
-			return nil, err
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	dir, err := r.Open(".")
-	if err != nil {
-		return nil, err
-	}
-	// Defer truncation until after the opened inode is validated.
-	fd, openErr := open(int(dir.Fd()), name, (flags&^os.O_TRUNC)|unix.O_NOFOLLOW|unix.O_CLOEXEC)
-	closeErr := dir.Close()
-	if openErr != nil {
-		return nil, errors.Join(openErr, closeErr)
-	}
-	f := os.NewFile(uintptr(fd), name)
-	if closeErr != nil {
-		return nil, errors.Join(closeErr, f.Close())
-	}
-	info, err := f.Stat()
-	if err == nil {
-		err = privateInfo(filepath.Join(r.Name(), name), info, false)
-	}
-	if err == nil && prior != nil && !os.SameFile(prior, info) {
-		err = fmt.Errorf("%w: private file changed during open", ErrReconciliationRequired)
-	}
-	if err == nil && flags&os.O_TRUNC != 0 {
-		err = f.Truncate(0)
-	}
-	if err != nil {
-		return nil, errors.Join(err, f.Close())
-	}
-	return f, nil
+	return privateFiles.OpenWith(r, name, flags, open)
 }
-
-func strictDecode(data []byte, out any) error {
-	d := json.NewDecoder(bytes.NewReader(data))
-	d.DisallowUnknownFields()
-	if err := d.Decode(out); err != nil {
-		return err
-	}
-	var extra any
-	if err := d.Decode(&extra); err != io.EOF {
-		return fmt.Errorf("trailing JSON data")
-	}
-	return nil
-}
-
-// readRetries bounds how many times readJSON reopens a file whose inode was
-// replaced between the lstat and the fstat inside openPrivate. A concurrent
-// atomic rename is exactly what atomicJSON is built to do, so a reader losing
-// that race is ordinary and deserves another look rather than a reconciliation
-// record. Writers hold the exclusive lock and are not exposed this way. The
-// bound keeps a genuinely unstable file from spinning: after this many losses
-// the ErrReconciliationRequired is returned to the caller unchanged.
-const readRetries = 3
 
 func readJSON(r *os.Root, name string, out any) error {
 	env, err := readEnvelope(r, name)
@@ -287,39 +142,17 @@ func readJSON(r *os.Root, name string, out any) error {
 // version, so a caller whose file versions on its own schedule can tell a
 // newer file from a damaged one before it decides what to do.
 func readEnvelope(r *os.Root, name string) (diskEnvelope, error) {
-	f, err := openPrivate(r, name, os.O_RDONLY)
-	for attempt := 0; attempt < readRetries && errors.Is(err, ErrReconciliationRequired); attempt++ {
-		f, err = openPrivate(r, name, os.O_RDONLY)
-	}
+	env, err := privateFiles.ReadEnvelope(r, name)
 	if err != nil {
 		return diskEnvelope{}, err
 	}
-	data, readErr := io.ReadAll(io.LimitReader(f, maxRecordBytes+1))
-	closeErr := f.Close()
-	if err := errors.Join(readErr, closeErr); err != nil {
-		return diskEnvelope{}, err
-	}
-	if len(data) > maxRecordBytes {
-		return diskEnvelope{}, fmt.Errorf("%w: oversized file", ErrCorrupt)
-	}
-	var env diskEnvelope
-	if err = strictDecode(data, &env); err != nil {
-		return diskEnvelope{}, fmt.Errorf("%w: malformed envelope: %w", ErrCorrupt, err)
-	}
-	return env, nil
+	return diskEnvelope{Version: env.Version, SHA256: env.Integrity, Payload: env.Payload}, nil
 }
 
 // decodeEnvelope checks env against the expected version and its checksum and
 // strictly decodes the payload into out.
 func decodeEnvelope(env diskEnvelope, version int, out any) error {
-	sum := sha256.Sum256(env.Payload)
-	if env.Version != version || env.SHA256 != hex.EncodeToString(sum[:]) {
-		return fmt.Errorf("%w: envelope version/checksum", ErrCorrupt)
-	}
-	if err := strictDecode(env.Payload, out); err != nil {
-		return fmt.Errorf("%w: malformed payload: %w", ErrCorrupt, err)
-	}
-	return nil
+	return privateFiles.DecodeEnvelope(privatefile.Envelope{Version: env.Version, Integrity: env.SHA256, Payload: env.Payload}, version, out)
 }
 
 func atomicJSON(r *os.Root, name string, value any, ops fileOps) error {
@@ -328,116 +161,33 @@ func atomicJSON(r *os.Root, name string, value any, ops fileOps) error {
 
 // atomicEnvelope is atomicJSON with the envelope version chosen by the caller.
 // Journal records, the index, and the authority always use Version; the entry
-// binding sidecar uses its own schema version.
-func atomicEnvelope(r *os.Root, name string, version int, value any, ops fileOps) (retErr error) {
-	defer func() {
-		if retErr != nil {
-			retErr = &DurabilityError{Err: retErr}
-		}
-	}()
-	payload, err := json.Marshal(value)
+// binding sidecar uses its own schema version. Any failure may follow a
+// committed rename, so it comes back as a DurabilityError.
+func atomicEnvelope(r *os.Root, name string, version int, value any, ops fileOps) error {
+	err := privateFiles.WriteEnvelope(r, name, version, value, privatefile.Ops{
+		Write: ops.write, SyncFile: ops.syncFile, Rename: ops.rename, SyncDir: ops.syncDir,
+	})
 	if err != nil {
-		return err
+		return &DurabilityError{Err: err}
 	}
-	sum := sha256.Sum256(payload)
-	data, err := json.Marshal(diskEnvelope{Version: version, SHA256: hex.EncodeToString(sum[:]), Payload: payload})
-	if err != nil {
-		return err
-	}
-	if len(data) > maxRecordBytes {
-		return fmt.Errorf("journal: record exceeds size limit")
-	}
-	if info, err := r.Lstat(name); err == nil {
-		if err := privateInfo(filepath.Join(r.Name(), name), info, false); err != nil {
-			return err
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	id, err := NewAllocationID()
-	if err != nil {
-		return err
-	}
-	temp := ".tmp-" + id
-	f, err := openPrivate(r, temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
-	if err != nil {
-		return err
-	}
-	closed := false
-	renamed := false
-	defer func() {
-		if !closed {
-			retErr = errors.Join(retErr, f.Close())
-		}
-		if !renamed {
-			retErr = errors.Join(retErr, r.Remove(temp))
-		}
-	}()
-	n, err := ops.write(f, data)
-	if err != nil {
-		return err
-	}
-	if n != len(data) {
-		return io.ErrShortWrite
-	}
-	if err := ops.syncFile(f); err != nil {
-		return err
-	}
-	err = f.Close()
-	closed = true
-	if err != nil {
-		return err
-	}
-	if err := ops.rename(r, temp, name); err != nil {
-		return err
-	}
-	renamed = true
-	return ops.syncDir(r)
+	return nil
 }
 
 type fileLock struct{ file *os.File }
 
 func tryLock(r *os.Root, name string) (*fileLock, bool, error) {
-	f, err := openPrivate(r, name, os.O_RDWR|os.O_CREATE)
-	if err != nil {
+	l, ok, err := privateFiles.TryLock(r, name)
+	if !ok || err != nil {
 		return nil, false, err
 	}
-	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-		return nil, false, f.Close()
-	}
-	if err != nil {
-		return nil, false, errors.Join(err, f.Close())
-	}
-	return &fileLock{file: f}, true, nil
+	return &fileLock{file: l.File}, true, nil
 }
-func (l *fileLock) close() error {
-	return errors.Join(syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN), l.file.Close())
-}
+func (l *fileLock) close() error { return (&privatefile.Lock{File: l.file}).Close() }
 func waitLock(ctx context.Context, r *os.Root, name string) (*fileLock, error) {
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		l, ok, err := tryLock(r, name)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			return l, nil
-		}
-		if err := pause(ctx); err != nil {
-			return nil, err
-		}
+	l, err := privateFiles.WaitLock(ctx, r, name)
+	if err != nil {
+		return nil, err
 	}
+	return &fileLock{file: l.File}, nil
 }
-func pause(ctx context.Context) error {
-	timer := time.NewTimer(10 * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
+func pause(ctx context.Context) error { return privatefile.Pause(ctx) }
