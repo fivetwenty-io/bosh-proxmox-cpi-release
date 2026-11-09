@@ -72,6 +72,14 @@ func TestIsTransientTransportClassifiesEntryUnreachableWalks(t *testing.T) {
 		}, true, true},
 		{"empty walk", nil, true, true},
 		{"all-verify walk", []endpointpool.EndpointFailure{verify("pve1:8006"), verify("pve2:8006")}, false, false},
+		{"verify and pin walk", []endpointpool.EndpointFailure{
+			verify("pve1:8006"),
+			walkFailure("pve2:8006", endpointpool.PhasePin, errors.New("fingerprint mismatch")),
+		}, false, false},
+		{"pin and dial walk", []endpointpool.EndpointFailure{
+			walkFailure("pve1:8006", endpointpool.PhasePin, errors.New("fingerprint mismatch")),
+			walkFailure("pve2:8006", endpointpool.PhaseDial, refused),
+		}, true, true},
 		{"single verify hop", []endpointpool.EndpointFailure{verify("pve1:8006")}, false, false},
 	}
 	for _, tc := range cases {

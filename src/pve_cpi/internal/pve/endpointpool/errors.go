@@ -140,11 +140,14 @@ type EndpointFailure struct {
 // certificate verification. That one unwraps to the joined verification
 // errors, so the SDK reports a certificate failure as it does today.
 //
-// Only the PhaseTLSVerify phase counts as a certificate verification failure
-// here. A PhasePin failure is a discovered endpoint whose certificate
-// changed outside its pin set, which makes a refresh due and heals on a later
-// call, so a walk with a pin failure in it reads as a dial error and stays
-// transient, whether the other hops failed verification, dialing, or pinning.
+// A pin failure counts as a verification failure here, together with
+// PhaseTLSVerify. A pin failure leaves the endpoint ineligible for the rest of
+// the process, and the refresh it triggers cannot run again within ten
+// minutes, so a retry inside the same call cannot heal it. A walk in which
+// every hop failed with one of those two phases unwraps to the joined
+// certificate errors. A walk that mixes any dial, DNS, handshake, or
+// header-deadline failure with verification failures reads as a dial error and
+// stays retryable.
 type EntryUnreachableError struct {
 	// Attempts lists every hop in the order the walk tried it.
 	Attempts []EndpointFailure
@@ -183,7 +186,7 @@ func (e *EntryUnreachableError) Unwrap() error {
 			continue
 		}
 		causes = append(causes, a.Err)
-		if cpe, ok := AsConnectPhase(a.Err); !ok || cpe.Phase != PhaseTLSVerify {
+		if cpe, ok := AsConnectPhase(a.Err); !ok || (cpe.Phase != PhaseTLSVerify && cpe.Phase != PhasePin) {
 			allVerify = false
 		}
 	}

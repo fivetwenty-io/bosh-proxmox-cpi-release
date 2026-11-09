@@ -252,17 +252,48 @@ func TestEntryUnreachableThroughWrapping(t *testing.T) {
 	}
 }
 
-// A pin failure is not a configured endpoint's refused certificate. It makes a
-// refresh due and heals later, so any walk holding one reads as a dial error.
-func TestEntryUnreachableWithPinFailureIsDial(t *testing.T) {
+// A pin failure counts as a verification failure. A walk in which every hop
+// failed verification or pin unwraps to the certificate errors, and one that
+// mixes in any other failure reads as a dial error.
+func TestEntryUnreachablePinFailureCountsAsVerification(t *testing.T) {
+	pinCause := errors.New("fingerprint mismatch")
 	pin := EndpointFailure{
 		Endpoint: "pve2:8006",
-		Err:      &ConnectPhaseError{Phase: PhasePin, Endpoint: "pve2:8006", Err: errors.New("fingerprint mismatch")},
+		Err:      &ConnectPhaseError{Phase: PhasePin, Endpoint: "pve2:8006", Err: pinCause},
 	}
 	verify := verifyFailure("pve1:8006", certVerifyError(x509.UnknownAuthorityError{}))
+	handshake := EndpointFailure{
+		Endpoint: "pve3:8006",
+		Err:      &ConnectPhaseError{Phase: PhaseTLSHandshake, Endpoint: "pve3:8006", Err: errors.New("reset")},
+	}
+	headerTimeout := EndpointFailure{Endpoint: "pve4:8006", Err: errors.New("response header timeout")}
+
 	for name, attempts := range map[string][]EndpointFailure{
-		"verify and pin": {verify, pin},
 		"pin only":       {pin},
+		"verify and pin": {verify, pin},
+		"pin and verify": {pin, verify},
+	} {
+		err := error(NewEntryUnreachableError(attempts))
+		var op *net.OpError
+		if errors.As(err, &op) {
+			t.Errorf("%s: an all-verification walk must not read as a dial error", name)
+		}
+		if name == "pin only" && !errors.Is(err, pinCause) {
+			t.Errorf("%s: pin cause not reachable", name)
+		}
+		for _, a := range attempts {
+			if !errors.Is(err, a.Err) {
+				t.Errorf("%s: cause for %s not reachable", name, a.Endpoint)
+			}
+		}
+	}
+	for name, attempts := range map[string][]EndpointFailure{
+		"pin and dial":      {pin, dialFailure("pve5:8006")},
+		"dial and pin":      {dialFailure("pve5:8006"), pin},
+		"verify pin dial":   {verify, pin, dialFailure("pve5:8006")},
+		"pin and handshake": {pin, handshake},
+		"pin and header":    {pin, headerTimeout},
+		"verify and header": {verify, headerTimeout},
 	} {
 		var op *net.OpError
 		if !errors.As(NewEntryUnreachableError(attempts), &op) || op.Op != "dial" {
