@@ -121,6 +121,9 @@ type Pool struct {
 	// routed holds the clones built on first use for a routed host that is
 	// not one of the pool's endpoints.
 	routed map[string]*ownedTransports
+
+	// walk is what the pool's walks remember for their log lines.
+	walk walkState
 }
 
 // New builds a pool. It refuses a base transport that checkBase refuses, an
@@ -407,20 +410,9 @@ func (p *Pool) routedTransports(u *url.URL) (*ownedTransports, error) {
 	if u == nil {
 		return nil, errors.New("endpoint pool: routed request has no URL")
 	}
-	port := u.Port()
-	if port == "" {
-		switch strings.ToLower(u.Scheme) {
-		case "https":
-			port = "443"
-		case "http":
-			port = "80"
-		default:
-			return nil, fmt.Errorf("endpoint pool: routed request has unsupported scheme %q", u.Scheme)
-		}
-	}
-	addr, err := canonicalHostPort(u.Hostname(), port)
+	addr, err := urlAddress(u)
 	if err != nil {
-		return nil, fmt.Errorf("endpoint pool: routed host %q: %w", u.Host, err)
+		return nil, err
 	}
 	if ep := p.byAddr[addr]; ep != nil {
 		return ep.transports, nil
