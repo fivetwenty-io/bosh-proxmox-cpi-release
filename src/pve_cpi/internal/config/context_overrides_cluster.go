@@ -165,24 +165,44 @@ func (c *CPIConfig) IgnoredProfileFields() []string {
 	return c.ignoredProfileFields
 }
 
-// resolveOverrideEndpoints settles an entry's endpoint list before the
-// credentials are judged, because the list decides the entry's primary. It
-// does nothing for an entry that does not name pve_endpoints. For one that
-// does, a bare element takes the entry's effective port, an entry with no
-// host takes its host and port from the first element (the first element's
-// own port wins over pve.port, as it does for the job), and the list must
-// then pass the job-level rules: the grammar, the cap, no repeats, and
-// agreement of an explicit pve.host with the first element. The error names
-// property keys and endpoint addresses, never a credential.
-func resolveOverrideEndpoints(eff *CPIConfig, extra map[string]any) error {
-	if _, named := extra["pve_endpoints"]; !named {
+// resolveOverrideEndpoints settles an entry's port and endpoint list before
+// the credentials are judged, because the list decides the entry's primary.
+//
+// Bare list elements are read at the port the job read them at, so a list
+// means the same thing in an entry as it does in the job. That is the entry's
+// own pve_port when it names one, and otherwise the port the job's bare
+// elements took (base.endpointReadPort), which differs from the job's Port
+// when the job named no host and adopted its first element's own port. An
+// entry that names a host but no port reads that same port, rather than the
+// adopted one, because the adopted port belongs to the job's first element.
+//
+// For an entry that names pve_endpoints, a bare element takes that port, an
+// entry with no host takes its host and port from the first element (the
+// first element's own port wins over pve.port, as it does for the job), and
+// the list must then pass the job-level rules: the grammar, the cap, no
+// repeats, and agreement of an explicit pve.host with the first element. The
+// error names property keys and endpoint addresses, never a credential.
+func resolveOverrideEndpoints(base, eff *CPIConfig, extra map[string]any) error {
+	_, portNamed := extra["pve_port"]
+	_, hostNamed := extra["pve_host"]
+	_, listNamed := extra["pve_endpoints"]
+	if hostNamed && !portNamed {
+		eff.Port = base.endpointReadPort()
+	}
+	if !listNamed {
 		return nil
 	}
-	eff.fillEndpointPorts()
+	readPort := eff.defaultEndpointPort()
+	portNote := ""
+	if !portNamed {
+		readPort = base.endpointReadPort()
+		portNote = " (inherited from the job's pve.port)"
+	}
+	eff.fillEndpointPortsAt(readPort)
 	if len(eff.Endpoints) == 0 {
 		return nil
 	}
-	if _, hostNamed := extra["pve_host"]; !hostNamed || eff.Host == "" {
+	if !hostNamed || eff.Host == "" {
 		if host, port, hasPort, ok := splitEndpoint(eff.Endpoints[0]); ok {
 			eff.Host = host
 			if hasPort {
@@ -191,7 +211,7 @@ func resolveOverrideEndpoints(eff *CPIConfig, extra map[string]any) error {
 		}
 	}
 	var problems []string
-	eff.validateEndpoints(&problems)
+	eff.validateEndpointsNoting(portNote, &problems)
 	if len(problems) > 0 {
 		return fmt.Errorf("config: context entry pve.endpoints is invalid: %s", strings.Join(problems, "; "))
 	}

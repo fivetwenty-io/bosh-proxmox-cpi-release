@@ -704,3 +704,371 @@ func TestOverrideCredentialGroup_FollowsTheList(t *testing.T) {
 		t.Errorf("no lists: group = %q, want inherited", got)
 	}
 }
+
+// endpointsDefaultedJob returns a token job built the way Load builds one:
+// the host, port, and list are set as the operator wrote them and then go
+// through ApplyDefaults and Validate. A job with no host and a first element
+// that carries its own port ends up with Port set to that element's port.
+func endpointsDefaultedJob(t *testing.T, host string, port int, list []string, caPEM string) *config.CPIConfig {
+	t.Helper()
+	job := credTestTokenJob()
+	job.Host = host
+	job.Port = port
+	job.Endpoints = slices.Clone(list)
+	job.PVECACertPEM = caPEM
+	job.ApplyDefaults()
+	if err := job.Validate(); err != nil {
+		t.Fatalf("job config is invalid: %v", err)
+	}
+	return job
+}
+
+// The job in the tests below names no host, sets pve.port 8006, and writes a
+// first element with port 9000. Its bare element reads at 8006, and its Port
+// becomes 9000.
+var (
+	endpointsHostlessList = []string{epHostA + ":9000", epHostB}
+	endpointsHostlessWant = []string{epHostA + ":9000", epHostB + ":8006"}
+)
+
+func TestApplyContextOverrides_Endpoints_BareElementsReadAtTheJobsPort(t *testing.T) {
+	t.Parallel()
+	list, wantList := endpointsHostlessList, endpointsHostlessWant
+
+	t.Run("the fixture resolves as the job reads it", func(t *testing.T) {
+		t.Parallel()
+		job := endpointsDefaultedJob(t, "", 8006, list, "")
+		if job.Host != epHostA || job.Port != 9000 || !slices.Equal(job.Endpoints, wantList) {
+			t.Fatalf("job = %q:%d %v, want %q:9000 %v", job.Host, job.Port, job.Endpoints, epHostA, wantList)
+		}
+	})
+
+	t.Run("an entry that copies the job's list keeps the job's credentials", func(t *testing.T) {
+		t.Parallel()
+		for name, jobPort := range map[string]int{"pve.port 8006": 8006, "pve.port unset": 0} {
+			job := endpointsDefaultedJob(t, "", jobPort, list, "")
+			eff, _, _, err := config.ApplyContextOverrides(job, map[string]any{"pve_endpoints": slices.Clone(list)})
+			if err != nil {
+				t.Fatalf("%s: unexpected error: %v", name, err)
+			}
+			if eff.APIToken != credTestJobToken {
+				t.Errorf("%s: token = %q, want the job's", name, eff.APIToken)
+			}
+			if eff.Host != epHostA || eff.Port != 9000 || !slices.Equal(eff.Endpoints, wantList) {
+				t.Errorf("%s: entry = %q:%d %v, want %q:9000 %v", name, eff.Host, eff.Port, eff.Endpoints,
+					epHostA, wantList)
+			}
+			if got := config.OverrideCredentialGroup(job, eff, []string{"pve_endpoints"}); got != config.CredentialGroupInherited {
+				t.Errorf("%s: group = %q, want inherited", name, got)
+			}
+		}
+	})
+
+	t.Run("an entry with its own token reads the bare element at the job's port", func(t *testing.T) {
+		t.Parallel()
+		job := endpointsDefaultedJob(t, "", 8006, list, "")
+		eff, _, _, err := config.ApplyContextOverrides(job, endpointsEntryWithToken(map[string]any{
+			"pve_endpoints": []any{epHostA + ":9000", epHostB},
+		}))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !slices.Equal(eff.Endpoints, wantList) {
+			t.Errorf("Endpoints = %v, want %v", eff.Endpoints, wantList)
+		}
+		if eff.APIToken != credTestEntryToken {
+			t.Errorf("token = %q, want the entry's", eff.APIToken)
+		}
+	})
+
+	t.Run("naming the job's port reads the same list", func(t *testing.T) {
+		t.Parallel()
+		job := endpointsDefaultedJob(t, "", 8006, list, "")
+		eff, _, _, err := config.ApplyContextOverrides(job, map[string]any{
+			"pve_endpoints": slices.Clone(list),
+			"pve_port":      8006,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if eff.APIToken != credTestJobToken || !slices.Equal(eff.Endpoints, wantList) {
+			t.Errorf("token=%q Endpoints=%v, want the job's token and %v", eff.APIToken, eff.Endpoints, wantList)
+		}
+	})
+
+}
+
+func TestApplyContextOverrides_Endpoints_PortRulesForAnEntry(t *testing.T) {
+	t.Parallel()
+	list := endpointsHostlessList
+
+	t.Run("an entry's own port fills the bare element and sends no job credential", func(t *testing.T) {
+		t.Parallel()
+		job := endpointsDefaultedJob(t, "", 8006, list, "")
+		extra := map[string]any{"pve_endpoints": slices.Clone(list), "pve_port": 9100}
+		_, _, _, err := config.ApplyContextOverrides(job, extra)
+		if err == nil || !strings.Contains(err.Error(), "changes pve.endpoints") {
+			t.Fatalf("err = %v, want the changes pve.endpoints refusal", err)
+		}
+		extra["pve_api_token"] = credTestEntryToken
+		eff, _, _, err := config.ApplyContextOverrides(job, extra)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []string{epHostA + ":9000", epHostB + ":9100"}
+		if !slices.Equal(eff.Endpoints, want) || eff.APIToken != credTestEntryToken {
+			t.Errorf("Endpoints=%v token=%q, want %v and the entry's token", eff.Endpoints, eff.APIToken, want)
+		}
+	})
+
+	t.Run("a new host reads at the job's port, not the first element's port", func(t *testing.T) {
+		t.Parallel()
+		job := endpointsDefaultedJob(t, "", 8006, list, "")
+		eff, _, _, err := config.ApplyContextOverrides(job, map[string]any{
+			"pve_host":      epHostC,
+			"pve_api_token": credTestEntryToken,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if eff.Host != epHostC || eff.Port != 8006 {
+			t.Errorf("entry = %q:%d, want %q:8006", eff.Host, eff.Port, epHostC)
+		}
+		if len(eff.Endpoints) != 0 {
+			t.Errorf("Endpoints = %v, want the job's list dropped", eff.Endpoints)
+		}
+		named, _, _, err := config.ApplyContextOverrides(job, map[string]any{
+			"pve_host":      epHostC,
+			"pve_port":      9100,
+			"pve_api_token": credTestEntryToken,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if named.Port != 9100 {
+			t.Errorf("Port = %d, want the entry's 9100", named.Port)
+		}
+	})
+
+	t.Run("a new host without credentials is refused", func(t *testing.T) {
+		t.Parallel()
+		job := endpointsDefaultedJob(t, "", 8006, list, "")
+		_, _, _, err := config.ApplyContextOverrides(job, map[string]any{"pve_host": epHostC})
+		if err == nil || !strings.Contains(err.Error(), "changes pve.host") {
+			t.Fatalf("err = %v, want the changes pve.host refusal", err)
+		}
+	})
+
+	t.Run("an entry that leaves the endpoint alone keeps the job's primary", func(t *testing.T) {
+		t.Parallel()
+		job := endpointsDefaultedJob(t, "", 8006, list, "")
+		eff, _, _, err := config.ApplyContextOverrides(job, map[string]any{"pve_vm_storage": "other"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if eff.Host != epHostA || eff.Port != 9000 || eff.APIToken != credTestJobToken {
+			t.Errorf("entry = %q:%d token %q, want the job's primary and token", eff.Host, eff.Port, eff.APIToken)
+		}
+	})
+
+	t.Run("a job with a host reads exactly as before", func(t *testing.T) {
+		t.Parallel()
+		job := endpointsDefaultedJob(t, epHostA, 9000, []string{epHostA, epHostB + ":8006"}, "")
+		eff, _, _, err := config.ApplyContextOverrides(job, map[string]any{
+			"pve_endpoints": []any{epHostA, epHostB + ":8006"},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if eff.APIToken != credTestJobToken || eff.Port != 9000 {
+			t.Errorf("token=%q port=%d, want the job's token and port 9000", eff.APIToken, eff.Port)
+		}
+	})
+}
+
+func TestCanonicalEndpointHost_FoldsASCIICaseOnly(t *testing.T) {
+	t.Parallel()
+	const kelvinHost = "Kube.example"
+	list := []string{"kube.example", epHostB}
+	ca := selfSignedCAPEMForConfigTest(t)
+	job := endpointsDefaultedJob(t, "kube.example", 0, list, ca)
+
+	a := &config.CPIConfig{Host: "KUBE.Example.", Port: 8006}
+	b := &config.CPIConfig{Host: "kube.example", Port: 0}
+	if !config.SameEndpoint(a, b) {
+		t.Error("ASCII case and a trailing dot must still compare equal")
+	}
+	if config.SameEndpoint(&config.CPIConfig{Host: kelvinHost}, b) {
+		t.Error("U+212A KELVIN SIGN must not compare equal to k")
+	}
+
+	t.Run("a Kelvin-sign pve_host inherits neither the token nor the CA", func(t *testing.T) {
+		t.Parallel()
+		_, _, _, err := config.ApplyContextOverrides(job, map[string]any{"pve_host": kelvinHost})
+		if err == nil || !strings.Contains(err.Error(), "changes pve.host") {
+			t.Fatalf("err = %v, want the changes pve.host refusal", err)
+		}
+		eff, _, _, err := config.ApplyContextOverrides(job, map[string]any{
+			"pve_host":      kelvinHost,
+			"pve_api_token": credTestEntryToken,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if eff.APIToken != credTestEntryToken {
+			t.Errorf("token = %q, want the entry's", eff.APIToken)
+		}
+		if eff.PVECACertPEM != "" {
+			t.Error("the job's CA must not follow a primary that is not the job's")
+		}
+		if got := config.OverrideCredentialGroup(job, eff, []string{"pve_host", "pve_api_token"}); got != config.CredentialGroupEntry {
+			t.Errorf("group = %q, want entry", got)
+		}
+	})
+
+	t.Run("a Kelvin-sign pve_host beside the job's own list inherits nothing", func(t *testing.T) {
+		t.Parallel()
+		_, _, _, err := config.ApplyContextOverrides(job, map[string]any{
+			"pve_host":      kelvinHost,
+			"pve_endpoints": slices.Clone(list),
+		})
+		if err == nil {
+			t.Fatal("want an error, got none")
+		}
+		assertNoSecretInError(t, err)
+	})
+
+	t.Run("an ASCII upper-case pve_host still inherits", func(t *testing.T) {
+		t.Parallel()
+		eff, _, _, err := config.ApplyContextOverrides(job, map[string]any{"pve_host": "KUBE.EXAMPLE"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if eff.APIToken != credTestJobToken || eff.PVECACertPEM != ca {
+			t.Error("a host that differs only in ASCII case must keep the job's token and CA")
+		}
+	})
+}
+
+func TestApplyContextOverrides_Endpoints_NullIsUnset(t *testing.T) {
+	t.Parallel()
+	job := endpointsTokenJob()
+
+	for name, extra := range map[string]map[string]any{
+		"flat":   {"pve_endpoints": nil, "pve_vm_storage": "other"},
+		"nested": {"pve": map[string]any{"endpoints": nil, "vm_storage": "other"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			eff, applied, _, err := config.ApplyContextOverrides(job, extra)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if slices.Contains(applied, "pve_endpoints") {
+				t.Errorf("applied = %v, want pve_endpoints left out", applied)
+			}
+			if eff.APIToken != credTestJobToken || !slices.Equal(eff.Endpoints, job.Endpoints) {
+				t.Errorf("token=%q Endpoints=%v, want the job's token and list", eff.APIToken, eff.Endpoints)
+			}
+		})
+	}
+
+	t.Run("null alone leaves the job config untouched", func(t *testing.T) {
+		t.Parallel()
+		eff, applied, _, err := config.ApplyContextOverrides(job, map[string]any{"pve_endpoints": nil})
+		if err != nil || eff != job || len(applied) != 0 {
+			t.Errorf("eff==job: %v, applied=%v, err=%v", eff == job, applied, err)
+		}
+	})
+
+	t.Run("the caller's map keeps its null", func(t *testing.T) {
+		t.Parallel()
+		extra := map[string]any{"pve_endpoints": nil, "pve_vm_storage": "other"}
+		if _, _, _, err := config.ApplyContextOverrides(job, extra); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, still := extra["pve_endpoints"]; !still {
+			t.Error("ApplyContextOverrides removed a key from the caller's map")
+		}
+	})
+
+	t.Run("an empty list is still a list", func(t *testing.T) {
+		t.Parallel()
+		_, _, _, err := config.ApplyContextOverrides(job, map[string]any{"pve_endpoints": []any{}})
+		if err == nil || !strings.Contains(err.Error(), "changes pve.endpoints") {
+			t.Fatalf("err = %v, want the changes pve.endpoints refusal", err)
+		}
+	})
+}
+
+func TestEndpointErrors_NeverEchoUserInfo(t *testing.T) {
+	t.Parallel()
+	secrets := []string{"SECRETPW", "pw@", "token=SECRET"}
+	elements := []string{
+		"https://u:SECRETPW@" + epHostA,
+		"u:SECRETPW@" + epHostA,
+		epHostA + ":pw@x",
+		epHostA + ":8006:SECRETPW@x",
+		epHostA + "?token=SECRET",
+		"[u:SECRETPW@fd00::1]:8006",
+		epHostA + ":8006#SECRETPW@frag",
+	}
+	check := func(t *testing.T, where string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Errorf("%s: want an error, got none", where)
+			return
+		}
+		for _, secret := range secrets {
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("%s: error %q echoes %q", where, err.Error(), secret)
+			}
+		}
+	}
+	for _, el := range elements {
+		job := endpointsTokenJob()
+		_, _, _, err := config.ApplyContextOverrides(job, endpointsEntryWithToken(map[string]any{
+			"pve_endpoints": []any{epHostA, el},
+		}))
+		check(t, "entry list "+el, err)
+
+		bad := credTestTokenJob()
+		bad.Endpoints = []string{epHostA, el}
+		check(t, "job list "+el, bad.Validate())
+
+		hostile := credTestTokenJob()
+		hostile.Host = el
+		hostile.Endpoints = []string{epHostA}
+		check(t, "job host "+el, hostile.Validate())
+	}
+}
+
+func TestApplyContextOverrides_Endpoints_HostDisagreementNamesTheInheritedPort(t *testing.T) {
+	t.Parallel()
+	job := credTestTokenJob()
+
+	_, _, _, err := config.ApplyContextOverrides(job, map[string]any{
+		"pve_host":      epHostB,
+		"pve_endpoints": []any{epHostB + ":9000"},
+		"pve_api_token": credTestEntryToken,
+	})
+	if err == nil {
+		t.Fatal("want a disagreement error, got none")
+	}
+	if !strings.Contains(err.Error(), "with port 8006 (inherited from the job's pve.port)") {
+		t.Errorf("error = %q, want it to say the port is inherited from the job", err.Error())
+	}
+
+	_, _, _, err = config.ApplyContextOverrides(job, map[string]any{
+		"pve_host":      epHostB,
+		"pve_port":      8006,
+		"pve_endpoints": []any{epHostB + ":9000"},
+		"pve_api_token": credTestEntryToken,
+	})
+	if err == nil {
+		t.Fatal("want a disagreement error, got none")
+	}
+	if strings.Contains(err.Error(), "inherited") {
+		t.Errorf("error = %q, want no inheritance note when the entry names pve.port", err.Error())
+	}
+}

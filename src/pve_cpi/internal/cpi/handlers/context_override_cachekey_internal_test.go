@@ -279,3 +279,24 @@ func TestRequestOverrideCacheKey_EndpointListSeparatesConfigs(t *testing.T) {
 		t.Error("the cache key must be deterministic")
 	}
 }
+
+// TestRequestOverrideCacheKey_NoListKeysAsBeforeTheListExisted pins the key of
+// a fixed config that holds no endpoint list to the value the key function
+// produced before the list was folded in. A later edit that writes anything
+// for an empty list changes the key and fails here, which would otherwise
+// drop every warm cached client on upgrade.
+func TestRequestOverrideCacheKey_NoListKeysAsBeforeTheListExisted(t *testing.T) {
+	t.Parallel()
+	const golden = "e1b319f637957cfa0d54052d63706dd2951c0350482db1975f46542f0d2d84d3"
+	cfg := &config.CPIConfig{
+		Host: "pve-a.example", Port: 8006, User: "cpi", Realm: "pam", Node: "pve1", Password: "pw-one",
+		VMStorage: "local-lvm", DiskStorage: "local-lvm", NetworkBridge: "vmbr0",
+	}
+	if got := requestOverrideCacheKey(cfg); got != golden {
+		t.Errorf("key = %s, want %s", got, golden)
+	}
+	cfg.Endpoints = []string{}
+	if got := requestOverrideCacheKey(cfg); got != golden {
+		t.Errorf("key with an empty list = %s, want %s", got, golden)
+	}
+}

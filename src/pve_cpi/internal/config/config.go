@@ -910,6 +910,17 @@ type CPIConfig struct {
 	// ever set on an effective config. See IgnoredProfileFields.
 	ignoredProfileFields []string
 
+	// listReadPort and listAdoptedPort record what adoptFirstEndpoint did to
+	// Port. When the job named no host and its first endpoint carried a port,
+	// the job's bare endpoints were read at the port the operator set
+	// (listReadPort) before Port took the first endpoint's own port
+	// (listAdoptedPort). A cpi-config entry reads its bare elements at
+	// listReadPort too, so a list means the same thing there as in the job.
+	// Unexported and untagged like parkedDefaultBandCollision, and both zero
+	// when no port was adopted.
+	listReadPort    int
+	listAdoptedPort int
+
 	// parkerStartDefaulted and parkerEndDefaulted record, per bound, that
 	// ApplyDefaults rather than the operator put the value in the range field.
 	// Same unexported/untagged treatment as parkedDefaultBandCollision.
@@ -5031,6 +5042,7 @@ func (c *CPIConfig) validateNodeEndpoints(errs *[]string) {
 // acceptable, and otherwise a message that starts with label, which names the
 // value being checked.
 func endpointGrammarProblem(label, addr string) string {
+	shown := redactEndpoint(addr)
 	if strings.TrimSpace(addr) == "" {
 		return fmt.Sprintf("%s must not be empty", label)
 	}
@@ -5040,38 +5052,38 @@ func endpointGrammarProblem(label, addr string) string {
 		// (SplitHostPort rejects the leading/trailing space and every
 		// later case in this switch also falls through) and only fail at
 		// runtime as an unresolvable DNS name.
-		return fmt.Sprintf("%s value must not carry surrounding whitespace, got %q", label, addr)
+		return fmt.Sprintf("%s value must not carry surrounding whitespace, got %q", label, shown)
 	}
 	if strings.Contains(addr, "://") {
-		return fmt.Sprintf("%s must be host or host:port without a scheme, got %q", label, addr)
+		return fmt.Sprintf("%s must be host or host:port without a scheme, got %q", label, shown)
 	}
 	if strings.Contains(addr, "/") {
-		return fmt.Sprintf("%s must be host or host:port without a path, got %q", label, addr)
+		return fmt.Sprintf("%s must be host or host:port without a path, got %q", label, shown)
 	}
 	host, port, splitErr := net.SplitHostPort(addr)
 	switch {
 	case splitErr == nil:
 		if strings.TrimSpace(host) == "" {
-			return fmt.Sprintf("%s must carry a host before the port, got %q", label, addr)
+			return fmt.Sprintf("%s must carry a host before the port, got %q", label, shown)
 		}
 		n, convErr := strconv.Atoi(port)
 		if convErr != nil || n < 1 || n > 65535 {
-			return fmt.Sprintf("%s port must be 1-65535, got %q", label, port)
+			return fmt.Sprintf("%s port must be 1-65535, got %q", label, redactEndpoint(port))
 		}
 	case strings.HasPrefix(addr, "["):
 		// Brackets that SplitHostPort rejected: "[fd00::1]" without a
 		// port. The dialer would re-bracket the value into an
 		// unresolvable host, so demand the port or the bare literal.
-		return fmt.Sprintf("%s bracketed address must be [host]:port, got %q", label, addr)
+		return fmt.Sprintf("%s bracketed address must be [host]:port, got %q", label, shown)
 	case strings.Count(addr, ":") == 1:
 		// One colon but SplitHostPort rejected it: a malformed host:port
 		// (empty port, stray colon).
-		return fmt.Sprintf("%s must be host or host:port, got %q", label, addr)
+		return fmt.Sprintf("%s must be host or host:port, got %q", label, shown)
 	case strings.Contains(addr, ":") && net.ParseIP(addr) == nil:
 		// More colons without brackets is acceptable only as a bare IPv6
 		// literal (the SDK brackets it when dialing); anything else here
 		// is a typo like "host:8006:8006".
-		return fmt.Sprintf("%s must be host, host:port, or a bare IPv6 literal, got %q", label, addr)
+		return fmt.Sprintf("%s must be host, host:port, or a bare IPv6 literal, got %q", label, shown)
 	}
 	return ""
 }
@@ -5079,6 +5091,18 @@ func endpointGrammarProblem(label, addr string) string {
 // maxEndpoints caps the endpoints list. A walk may try every entry, and a
 // cluster this CPI drives never has more API endpoints than that.
 const maxEndpoints = 16
+
+// redactEndpoint returns addr as an error message may echo it. A value that
+// holds "@", "?", or "#" may carry user info or a query string with a
+// secret in it, as in "https://user:pw@host" or "host?token=...", so such a
+// value is replaced whole and never echoed in part. Every other value is
+// returned unchanged.
+func redactEndpoint(addr string) string {
+	if strings.ContainsAny(addr, "@?#") {
+		return "<redacted>"
+	}
+	return addr
+}
 
 // endpointExtraProblem rejects what the endpoints list forbids on top of the
 // shared grammar: user info, a query or fragment, a backslash, whitespace
@@ -5088,19 +5112,21 @@ const maxEndpoints = 16
 // the comma of "a,b". node_endpoints keeps its looser rule so a manifest that
 // validates today still does. It returns "" when addr is acceptable.
 func endpointExtraProblem(label, addr string) string {
+	shown := redactEndpoint(addr)
 	if strings.ContainsAny(addr, "@?#\\") || strings.IndexFunc(addr, unicode.IsSpace) >= 0 {
-		return fmt.Sprintf("%s must be host or host:port with no user info, query, or whitespace, got %q", label, addr)
+		return fmt.Sprintf("%s must be host or host:port with no user info, query, or whitespace, got %q",
+			label, shown)
 	}
 	host, port := addr, ""
 	if h, p, err := net.SplitHostPort(addr); err == nil {
 		host, port = h, p
 	}
 	if strings.IndexFunc(port, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
-		return fmt.Sprintf("%s port must be digits only, got %q", label, port)
+		return fmt.Sprintf("%s port must be digits only, got %q", label, redactEndpoint(port))
 	}
 	if !validEndpointHost(host) || (strings.HasPrefix(addr, "[") && net.ParseIP(host) == nil) {
 		return fmt.Sprintf("%s host must hold only letters, digits, '.', '-', '_', or an IPv6 literal, got %q",
-			label, addr)
+			label, shown)
 	}
 	return ""
 }
@@ -5163,12 +5189,25 @@ func splitEndpoint(addr string) (host string, port int, hasPort, ok bool) {
 	return h, n, true, true
 }
 
+// asciiLower lowercases the ASCII letters of s and leaves every other rune
+// as it is. strings.ToLower also folds some non-ASCII runes onto ASCII
+// letters (U+212A KELVIN SIGN becomes "k"), which would make a host that no
+// resolver reads as the job's host compare equal to it.
+func asciiLower(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, s)
+}
+
 // canonicalEndpointHost returns host in the form endpoint comparison uses,
-// which is normalizedEndpoint's form (trimmed, lowercased, no trailing dot)
-// plus the canonical spelling of an IPv6 literal, so two spellings of one
+// which is normalizedEndpoint's form (trimmed, ASCII-lowercased, no trailing
+// dot) plus the canonical spelling of an IPv6 literal, so two spellings of one
 // address compare equal.
 func canonicalEndpointHost(host string) string {
-	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	h := strings.TrimSuffix(asciiLower(strings.TrimSpace(host)), ".")
 	if strings.Contains(h, ":") {
 		if ip := net.ParseIP(h); ip != nil {
 			return ip.String()
@@ -5191,7 +5230,12 @@ func (c *CPIConfig) defaultEndpointPort() int {
 // written so validation reports them, and so does every entry when Port is
 // out of range, which validateRanges already reports once.
 func (c *CPIConfig) fillEndpointPorts() {
-	port := c.defaultEndpointPort()
+	c.fillEndpointPortsAt(c.defaultEndpointPort())
+}
+
+// fillEndpointPortsAt is fillEndpointPorts with the port the bare entries
+// take given by the caller.
+func (c *CPIConfig) fillEndpointPortsAt(port int) {
 	if port < 1 || port > 65535 {
 		return
 	}
@@ -5218,8 +5262,22 @@ func (c *CPIConfig) adoptFirstEndpoint() {
 	}
 	c.Host = host
 	if hasPort {
+		c.listReadPort = c.defaultEndpointPort()
+		c.listAdoptedPort = port
 		c.Port = port
 	}
+}
+
+// endpointReadPort returns the port the job's bare endpoint elements were
+// read at. That is the operator's pve.port (or 8006) even when
+// adoptFirstEndpoint then moved Port to the first element's own port. The
+// recorded value counts only while Port still holds the adopted port, so a
+// config whose Port was changed afterwards falls back to Port.
+func (c *CPIConfig) endpointReadPort() int {
+	if c.listReadPort != 0 && c.Port == c.listAdoptedPort {
+		return c.listReadPort
+	}
+	return c.defaultEndpointPort()
 }
 
 // validateEndpoints validates the optional endpoints list. Skipped entirely
@@ -5231,6 +5289,14 @@ func (c *CPIConfig) adoptFirstEndpoint() {
 //   - when Host is also set, Host and Port name the same endpoint as the
 //     first entry.
 func (c *CPIConfig) validateEndpoints(errs *[]string) {
+	c.validateEndpointsNoting("", errs)
+}
+
+// validateEndpointsNoting is validateEndpoints with portNote added after the
+// port in the host-agreement message. A cpi-config entry that did not name
+// pve.port passes a note saying the port came from the job, because the
+// entry never wrote the number the message quotes.
+func (c *CPIConfig) validateEndpointsNoting(portNote string, errs *[]string) {
 	if len(c.Endpoints) == 0 {
 		return
 	}
@@ -5267,15 +5333,16 @@ func (c *CPIConfig) validateEndpoints(errs *[]string) {
 		seen[key] = i
 	}
 	if c.Host != "" && firstKey != "" {
-		c.validateHostAgreesWithEndpoints(firstKey, errs)
+		c.validateHostAgreesWithEndpoints(firstKey, portNote, errs)
 	}
 }
 
 // validateHostAgreesWithEndpoints appends an error when Host and Port do not
 // name the same endpoint as the first Endpoints entry, whose normalized
-// host:port is firstKey. The message names both values, neither of which is a
+// host:port is firstKey. portNote, when set, follows the port in the message.
+// The message names both values, neither of which is a
 // secret, and says which setting to change.
-func (c *CPIConfig) validateHostAgreesWithEndpoints(firstKey string, errs *[]string) {
+func (c *CPIConfig) validateHostAgreesWithEndpoints(firstKey, portNote string, errs *[]string) {
 	hostKey := net.JoinHostPort(canonicalEndpointHost(c.Host), strconv.Itoa(c.defaultEndpointPort()))
 	if hostKey == firstKey {
 		return
@@ -5289,8 +5356,8 @@ func (c *CPIConfig) validateHostAgreesWithEndpoints(firstKey string, errs *[]str
 		remedy = fmt.Sprintf("set pve.port: %s, or drop pve.host", firstPort)
 	}
 	*errs = append(*errs, fmt.Sprintf(
-		"pve.host %q with port %d does not match the first entry of pve.endpoints (%s); %s",
-		c.Host, c.defaultEndpointPort(), firstKey, remedy))
+		"pve.host %q with port %d%s does not match the first entry of pve.endpoints (%s); %s",
+		redactEndpoint(c.Host), c.defaultEndpointPort(), portNote, firstKey, remedy))
 }
 
 // validatePlacement validates the optional Placement block. Skipped entirely

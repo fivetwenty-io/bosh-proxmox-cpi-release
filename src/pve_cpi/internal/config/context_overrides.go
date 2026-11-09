@@ -873,6 +873,19 @@ func flattenNestedContextOverrides(extra map[string]any) map[string]any {
 	return merged
 }
 
+// dropNullEndpointList returns extra without a pve_endpoints key whose value
+// is null, so an explicit null counts as unset, the same as leaving the key
+// out. The empty list [] stays, since it names a list with nothing in it.
+// extra is never modified, a copy is made when the key has to go.
+func dropNullEndpointList(extra map[string]any) map[string]any {
+	if v, named := extra["pve_endpoints"]; !named || v != nil {
+		return extra
+	}
+	out := maps.Clone(extra)
+	delete(out, "pve_endpoints")
+	return out
+}
+
 // overrideCredentialKeys is the credential group: the context keys that
 // authenticate a request to one PVE endpoint. They travel as a group, so an
 // effective config holds either all three exactly as the job config has
@@ -1190,7 +1203,7 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 	if len(extra) == 0 {
 		return base, nil, nil, nil
 	}
-	extra = flattenNestedContextOverrides(extra)
+	extra = dropNullEndpointList(flattenNestedContextOverrides(extra))
 	if err := checkRemovedContextKeys(extra); err != nil {
 		return nil, nil, nil, err
 	}
@@ -1230,7 +1243,7 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 	// any early return below that could hand back eff, and before
 	// validation, so an incomplete group fails with its own message.
 	if len(appliedKeys) > 0 {
-		if endpointErr := resolveOverrideEndpoints(&eff, extra); endpointErr != nil {
+		if endpointErr := resolveOverrideEndpoints(base, &eff, extra); endpointErr != nil {
 			return nil, nil, nil, endpointErr
 		}
 		if credErr := resolveOverrideCredentials(base, &eff, extra); credErr != nil {

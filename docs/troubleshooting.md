@@ -217,6 +217,12 @@ After:
 config: context entry for host "pve2.example.com" changes pve.host but supplies no credentials; set pve.api_token, or pve.user and pve.password, and pve.ca_cert if that cluster uses a private CA
 ```
 
+or, when the entry keeps the job's host and port and changes only its `endpoints` list
+
+```text
+config: context entry for host "pve1.example.com" changes pve.endpoints but supplies no credentials; set pve.api_token, or pve.user and pve.password
+```
+
 or
 
 ```text
@@ -225,11 +231,11 @@ config: context entry for host "pve2.example.com" sets pve.password but its cred
 
 **Diagnosis**
 
-Credentials travel with the endpoint as a group of `user`, `password`, and `api_token`. An entry that changes `host` or `port` inherits none of the job-level group, and an entry that names any credential key gets only the credentials it names. The effective group must hold an `api_token`, or a `user` together with a `password`, so a bare `password` or a bare `user` fails. The message names the entry's host and the property keys, and never a credential value. The CPI does this on purpose, because an entry that inherited the job token would send it to the other cluster.
+Credentials travel with the whole ordered endpoint list as a group of `user`, `password`, and `api_token`. An entry inherits the job-level group only when its primary endpoint and its whole `endpoints` list match the job's. An entry that changes `host` or `port`, or that adds, drops, replaces, or reorders an endpoint, inherits none of the group, and an entry that names any credential key gets only the credentials it names. The effective group must hold an `api_token`, or a `user` together with a `password`, so a bare `password` or a bare `user` fails. The message names the entry's host and the property keys, and never a credential value. The CPI does this on purpose, because an entry that inherited the job token would send it to the other cluster.
 
 **Fix**
 
-Set `api_token` on the entry, or set both `user` and `password`. If the cluster sits behind a private CA, set `ca_cert` on the entry too, because the job-level CA does not follow the request to another endpoint. When the entry uses `user` and the cluster's realm differs from the job's, set `realm` or write `user` as `user@realm`. [Multi-Cluster Deployments](multi-cluster.md#per-entry-credentials-and-ca) covers the full rules.
+Set `api_token` on the entry, or set both `user` and `password`. If the cluster sits behind a private CA, set `ca_cert` on the entry too, because the job-level CA does not follow the request to another primary endpoint. An entry that keeps the job's primary and changes only its list keeps the CA but still needs its own credentials. When the entry uses `user` and the cluster's realm differs from the job's, set `realm` or write `user` as `user@realm`. [Multi-Cluster Deployments](multi-cluster.md#per-entry-credentials-and-ca) covers the full rules.
 
 ### The Director rejects a deploy with "must specify a CPI"
 
