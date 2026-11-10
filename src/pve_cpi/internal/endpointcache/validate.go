@@ -56,6 +56,12 @@ const (
 	// DropNotConfigured means the record names an endpoint that is not one of
 	// the key's configured endpoints.
 	DropNotConfigured DropReason = "not_configured"
+	// DropConfiguredEndpoint means the node's derived address is one of the
+	// key's configured endpoints, which includes the seed's own node whenever
+	// its name derives to the seed. The pool already holds that endpoint under
+	// the configured rules, so a discovered entry would hold it a second time
+	// under the pin rules.
+	DropConfiguredEndpoint DropReason = "configured_endpoint"
 	// DropInvalid means the record is malformed in a way that does not make
 	// the file unusable, such as a mark for something that is not an endpoint.
 	DropInvalid DropReason = "invalid"
@@ -96,6 +102,7 @@ func (d Drop) String() string { return d.Record + " dropped: " + string(d.Reason
 // is all digits, a 0x hex spelling, or a loopback alias, when a node's address
 // and port are not what the key's seed derives for its name, when a node's
 // confirmation is more than NodeTTL old or more than FutureSkew ahead, when a
+// node's derived address is one of the key's configured endpoints, when a
 // mark is older than MarkTTL, ahead, or names something that is not an
 // endpoint or a class that is not enumerated, when observed_via names an
 // endpoint outside the key, and when the hint is older than HintTTL or ahead.
@@ -152,7 +159,7 @@ func readStored(p *Payload, key Key, now time.Time) (storedState, []Drop, error)
 		out.Cluster = &cluster
 	}
 	if p.Discovery != nil {
-		section, known, found, err := validateDiscovery(p.Discovery, keyDerivation(key), now)
+		section, known, found, err := validateDiscovery(p.Discovery, keyDerivation(key), now, nil)
 		if err != nil {
 			return storedState{}, nil, err
 		}
@@ -239,8 +246,14 @@ func normalizeHex(s string) (string, bool) {
 // beside it every node the section knows, as storedState describes. The
 // section is nil, with no error, when its own time is ahead of now, and the
 // known nodes are still returned.
+//
+// held is nil on read. A writer passes it to keep in the section a node that
+// would be dropped only for its confirmation time, which is a node held reports
+// true for. The merge uses it under verify_ssl false for a known node that a
+// result carries with its stored pins and its stored confirmation, so the node
+// stays known, and its pins keep binding, after the pool stops loading it.
 func validateDiscovery(
-	d *DiscoverySection, derive derivation, now time.Time,
+	d *DiscoverySection, derive derivation, now time.Time, held func(DiscoveredNode) bool,
 ) (*DiscoverySection, []DiscoveredNode, []Drop, error) {
 	if !d.Outcome.Valid() {
 		return nil, nil, nil, fmt.Errorf("%w: discovery outcome is not one of the enumerated values", ErrPayloadInvalid)
@@ -276,6 +289,9 @@ func validateDiscovery(
 		if reason == "" {
 			known = append(known, kept)
 			reason = nodeUse(kept, derive, now)
+			if (reason == DropExpired || reason == DropFuture) && held != nil && held(kept) {
+				reason = ""
+			}
 		}
 		if reason != "" {
 			drops = append(drops, Drop{Record: record, Reason: reason})
@@ -326,8 +342,9 @@ func validateNode(n DiscoveredNode) (DiscoveredNode, DropReason, error) {
 
 // nodeUse reports why a node the file knows is not one a reader may use now,
 // or "" when it is. The node's address and port must be what derive gives for
-// its name, and its confirmation must be at most NodeTTL old and at most
-// FutureSkew ahead.
+// its name, that address must not be one of the key's configured endpoints,
+// and its confirmation must be at most NodeTTL old and at most FutureSkew
+// ahead.
 func nodeUse(n DiscoveredNode, derive derivation, now time.Time) DropReason {
 	if reason := derive.check(n); reason != "" {
 		return reason
@@ -355,23 +372,37 @@ func validateNodeAddress(n DiscoveredNode) (string, error) {
 
 // derivation is the address derivation under a key's seed, which is its first
 // endpoint. err is why NewDeriver refused the seed, and then no node derives.
+// configured holds the key's endpoints in their normalized host:port spelling,
+// so a node that derives to one of them is left out.
 type derivation struct {
-	deriver *Deriver
-	err     error
+	deriver    *Deriver
+	err        error
+	configured []string
 }
 
-// keyDerivation prepares the derivation for key's seed.
+// keyDerivation prepares the derivation for key's seed and endpoints.
 func keyDerivation(key Key) derivation {
 	if len(key.Endpoints) == 0 {
 		return derivation{err: ErrSeedEndpoint}
 	}
 	d, err := NewDeriver(key.Endpoints[0])
-	return derivation{deriver: d, err: err}
+	configured := make([]string, 0, len(key.Endpoints))
+	for _, endpoint := range key.Endpoints {
+		if host, port, ok := config.NormalizeEndpoint(endpoint); ok {
+			configured = append(configured, net.JoinHostPort(host, strconv.Itoa(port)))
+		}
+	}
+	return derivation{deriver: d, err: err, configured: configured}
 }
 
 // check reports why n's address and port are not what the derivation gives
 // for its name, or "" when they are. The host is compared without regard to
-// case, because a node keeps its own spelling.
+// case, because a node keeps its own spelling. A node whose derived address is
+// one of the key's configured endpoints is DropConfiguredEndpoint, because the
+// pool already holds that endpoint. That covers the seed's own node whenever
+// its name derives to the seed. A seed whose host is not its node's name, such
+// as an IP literal, gives the cache no way to name that node, and the
+// discovery worker leaves it out by the local flag of /cluster/status.
 func (d derivation) check(n DiscoveredNode) DropReason {
 	err := d.err
 	var address string
@@ -387,6 +418,9 @@ func (d derivation) check(n DiscoveredNode) DropReason {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil || !strings.EqualFold(host, n.Address) || port != strconv.Itoa(n.Port) {
 		return DropNotDerived
+	}
+	if normalized, ok := normalizeMarkEndpoint(address); ok && slices.Contains(d.configured, normalized) {
+		return DropConfiguredEndpoint
 	}
 	return ""
 }

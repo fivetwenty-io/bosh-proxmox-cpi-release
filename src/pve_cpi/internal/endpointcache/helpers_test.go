@@ -24,7 +24,7 @@ const storeTestUser = "cpi@pve!cache"
 // storeTestConfig is a two-endpoint configuration with the system trust store.
 func storeTestConfig() KeyConfig {
 	return KeyConfig{
-		Endpoints: []string{"pve1.dc1.example.com:8006", "pve2.dc1.example.com:8006"},
+		Endpoints: []string{"pve1.dc1.example.com:8006", "pve1b.dc1.example.com:8006"},
 		VerifySSL: true,
 		User:      storeTestUser,
 	}

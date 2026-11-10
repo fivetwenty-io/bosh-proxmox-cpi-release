@@ -26,26 +26,29 @@ var ErrIdentityConflict = errors.New("endpoint cache: stored identity conflict s
 // Trust refusals under verify_ssl false. Merge returns them as a
 // *TrustRefusalError, which matches ErrTrustRefused and the one of the other
 // two that applies. ErrIdentityChanged means a result's root CA differs from
-// the stored one. ErrPinsChanged means a result changes the pin set of a node
-// the stored file knows, including a node past NodeTTL. Nothing is written.
+// the stored one. ErrPinsChanged means a result leaves out a stored pin of a
+// node the stored file knows, including a node past NodeTTL. A result that
+// keeps every stored pin, and may add more, is not a refused change. Nothing
+// is written.
 var (
 	ErrTrustRefused    = errors.New("endpoint cache: discovery result refused under verify_ssl false")
 	ErrIdentityChanged = errors.New("endpoint cache: cluster identity differs from the stored one")
-	ErrPinsChanged     = errors.New("endpoint cache: pin set differs from a known node's stored pins")
+	ErrPinsChanged     = errors.New("endpoint cache: pin set leaves out a known node's stored pins")
 )
 
 // TrustRefusalError is a discovery result that a verify_ssl false trust rule
 // refused. The caller turns an identity change into a recorded conflict with
 // a Change whose Conflict is set, which stops discovery until the operator
-// deletes the file. A refused pin change needs no record, because the node
-// keeps its stored pins, and the caller logs it. The text never echoes a node
-// name, and Nodes is for the caller's own log line.
+// deletes the file. A refused pin change is written instead as a result that
+// carries the node's stored pins, as DecideTrust builds it, and the caller
+// logs it. The text never echoes a node name, and Nodes is for the caller's
+// own log line.
 type TrustRefusalError struct {
 	// IdentityChanged is set when the result's root CA differs from the
 	// stored one. The pins are then not compared.
 	IdentityChanged bool
-	// Nodes names the known nodes whose pin sets the result changes, in the
-	// result's order.
+	// Nodes names the known nodes whose stored pins the result leaves out, in
+	// the result's order.
 	Nodes []string
 }
 
@@ -93,7 +96,8 @@ type Change struct {
 	// Result replaces the stored identity and node list, and removes a stored
 	// cold-start hint, because the next discovery through a configured
 	// endpoint supersedes it. A change without one writes the stored
-	// discovery section back as it was read.
+	// discovery section back as it was read, apart from the two times an
+	// Attempt moves.
 	Result *DiscoveryResult
 	// Hint replaces the stored cold-start hint. A writer that has no hint of
 	// its own leaves this nil, and the stored hint stays. A change that
@@ -104,6 +108,28 @@ type Change struct {
 	// sets the flag on the stored identity and changes nothing else, and it
 	// needs a stored identity and no Result.
 	Conflict bool
+	// Attempt records a discovery that ran and records no result, so the
+	// stored refresh time moves and the refresh is not due again on every
+	// call. It sets the stored section's discovered_at and next_refresh_after
+	// and changes nothing else, so every node, pin, confirmation, the outcome,
+	// and the identity stay as stored. It is accepted while a conflict stands
+	// and alongside Conflict. A change that carries it with a Result or a Hint
+	// is refused. When the file holds no discovery section, there is no
+	// refresh time to move, and the attempt records nothing.
+	Attempt *DiscoveryAttempt
+}
+
+// DiscoveryAttempt is a discovery that ran without a result to record.
+type DiscoveryAttempt struct {
+	// At is when the discovery ran. It becomes discovered_at, which is the
+	// last attempt that RefreshDue measures the pin-failure floor from. A
+	// zero time, or one more than FutureSkew ahead of the merge's clock, is
+	// refused.
+	At time.Time
+	// NextRefreshAfter is when the next discovery is due. A time further
+	// ahead than MaxRefreshWait is dropped, as validation drops it on read, so
+	// the refresh is due at once.
+	NextRefreshAfter time.Time
 }
 
 // Stored is the stored file as a writer's build function sees it under the
@@ -121,6 +147,12 @@ type Stored struct {
 	// leaves it out. The trust rules read this view, because a known node's
 	// pins still bind under verify_ssl false after the pool stops loading it.
 	Known []DiscoveredNode
+	// Now is the clock UpdatePayload was given, which the merge of the
+	// returned change uses and both views were read at. A decision made in
+	// build, such as DecideTrust, takes this time, so the decision and the
+	// merge stamp and check one clock. It is zero in a view that
+	// UpdatePayload did not build.
+	Now time.Time
 }
 
 // Merge merges change into stored at time now and returns the payload to
@@ -146,9 +178,14 @@ type Stored struct {
 // The merge refuses every result while the stored identity holds a conflict,
 // with ErrIdentityConflict. Under verify_ssl false it refuses, with a
 // *TrustRefusalError, a result whose root CA differs from the stored one and
-// a result that changes the pin set of a node the stored file knows, which
-// includes a node past NodeTTL. A node the file does not know is added on
-// first use. A change that breaks the change's own rules is refused with
+// a result that leaves out a stored pin of a node the stored file knows,
+// which includes a node past NodeTTL. A known node's result may keep its
+// stored pins or add to them. A known node that the result carries with its
+// stored pins and its stored confirmation stays in the file even when that
+// confirmation is past NodeTTL or ahead of now, so the node stays known while
+// the pool no longer loads it. A node the file does not know is added on
+// first use. An attempt moves the stored section's two times and nothing
+// else. A change that breaks the change's own rules is refused with
 // ErrInvalidChange.
 func Merge(stored *Payload, key Key, change Change, now time.Time) (*Payload, []Drop, error) {
 	state, drops := readState(stored, key, now)
@@ -170,9 +207,9 @@ func readState(stored *Payload, key Key, now time.Time) (storedState, []Drop) {
 	return state, drops
 }
 
-// view returns the build function's copy of the state.
-func (s storedState) view() Stored {
-	return Stored{Usable: s.usable.clone(), Known: cloneNodes(s.known)}
+// view returns the build function's copy of the state, read at now.
+func (s storedState) view(now time.Time) Stored {
+	return Stored{Usable: s.usable.clone(), Known: cloneNodes(s.known), Now: now}
 }
 
 // merge is Merge for a stored state that readStored returned at the same now.
@@ -203,6 +240,11 @@ func merge(state storedState, key Key, change Change, now time.Time) (*Payload, 
 	}
 	if change.Conflict {
 		if err := applyConflict(next, key, change); err != nil {
+			return nil, nil, err
+		}
+	}
+	if change.Attempt != nil {
+		if err := applyAttempt(next, change, now, &drops); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -237,6 +279,33 @@ func applyConflict(next *Payload, key Key, change Change) error {
 	return nil
 }
 
+// applyAttempt moves next's stored discovery section to change.Attempt's two
+// times. next.Discovery is the raw stored section, so every node, pin, and
+// confirmation, and the outcome, stay as stored.
+func applyAttempt(next *Payload, change Change, now time.Time, drops *[]Drop) error {
+	attempt := change.Attempt
+	switch {
+	case change.Result != nil:
+		return fmt.Errorf("%w: change carries both a discovery result and a discovery attempt", ErrInvalidChange)
+	case change.Hint != nil:
+		return fmt.Errorf("%w: change carries both a cold_start hint and a discovery attempt", ErrInvalidChange)
+	case attempt.At.IsZero():
+		return fmt.Errorf("%w: discovery attempt carries no time", ErrInvalidChange)
+	case attempt.At.After(now.Add(FutureSkew)):
+		return fmt.Errorf("%w: discovery attempt time is in the future", ErrInvalidChange)
+	}
+	if next.Discovery == nil {
+		return nil
+	}
+	next.Discovery.DiscoveredAt = attempt.At.UTC()
+	next.Discovery.NextRefreshAfter = attempt.NextRefreshAfter.UTC()
+	if attempt.NextRefreshAfter.After(now.Add(MaxRefreshWait + FutureSkew)) {
+		next.Discovery.NextRefreshAfter = time.Time{}
+		*drops = append(*drops, Drop{Record: "next_refresh_after", Reason: DropFuture})
+	}
+	return nil
+}
+
 // applyResult replaces next's identity and node list with result, after the
 // same checks a reader applies and the trust rules the stored state calls
 // for, and removes the stored hint.
@@ -256,7 +325,11 @@ func applyResult(
 	if len(found) > 0 {
 		return fmt.Errorf("%w: cluster observed_via is not a configured endpoint", ErrInvalidChange)
 	}
-	section, _, found, err := validateDiscovery(&result.Discovery, keyDerivation(key), now)
+	var held func(DiscoveredNode) bool
+	if !key.VerifySSL {
+		held = state.holds
+	}
+	section, _, found, err := validateDiscovery(&result.Discovery, keyDerivation(key), now, held)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidChange, err)
 	}
@@ -275,11 +348,24 @@ func applyResult(
 	return nil
 }
 
+// holds reports whether n is a node the stored file knows, carried with its
+// stored pins and its stored confirmation, which is how DecideTrust writes a
+// known node whose observed pins share none of the stored ones.
+func (s storedState) holds(n DiscoveredNode) bool {
+	for _, node := range s.known {
+		if strings.EqualFold(node.Name, n.Name) {
+			return samePins(node.Pins, n.Pins) && node.ConfirmedAt.Equal(n.ConfirmedAt)
+		}
+	}
+	return false
+}
+
 // trustOnFirstUse applies the verify_ssl false rules to a result that would
 // replace state. The first discovery records the identity and the pins. Once
 // an identity is stored, a result with another root CA is refused, and so is
-// a result that changes the pin set of a node the file knows. A node the file
-// does not know is added.
+// a result that leaves out any stored pin of a node the file knows. A known
+// node's result may keep its stored pins or add to them, which is the trust
+// a node the file does not know gets when it is added on first use.
 func trustOnFirstUse(state storedState, cluster ClusterIdentity, section *DiscoverySection) error {
 	if state.usable == nil || state.usable.Cluster == nil {
 		return nil
@@ -293,7 +379,7 @@ func trustOnFirstUse(state storedState, cluster ClusterIdentity, section *Discov
 	}
 	var changed []string
 	for _, node := range section.Nodes {
-		if pins, ok := known[strings.ToLower(node.Name)]; ok && !samePins(pins, node.Pins) {
+		if pins, ok := known[strings.ToLower(node.Name)]; ok && !holdsPins(node.Pins, pins) {
 			changed = append(changed, node.Name)
 		}
 	}
@@ -306,11 +392,14 @@ func trustOnFirstUse(state storedState, cluster ClusterIdentity, section *Discov
 // samePins reports whether a and b hold the same pins in any order. Both are
 // in validatePins' form, lowercase and without repeats.
 func samePins(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for _, pin := range a {
-		if !slices.Contains(b, pin) {
+	return len(a) == len(b) && holdsPins(a, b)
+}
+
+// holdsPins reports whether set holds every pin in pins. Both are in
+// validatePins' form, lowercase and without repeats.
+func holdsPins(set, pins []string) bool {
+	for _, pin := range pins {
+		if !slices.Contains(set, pin) {
 			return false
 		}
 	}
@@ -488,10 +577,11 @@ type UpdateResult struct {
 // UpdatePayload reads, merges, and writes the store's file under the key's
 // lock, and sweeps the cache directory under the same lock. build receives
 // the stored file's two views, which are empty when the file is absent,
-// invalid, or fails validation, and returns the change to record. A trust
-// decision for a discovery result belongs in build, because it needs the
-// stored state and the lock is what keeps that state from changing under it,
-// and the merge applies the verify_ssl false rules again as Merge describes.
+// invalid, or fails validation, and now as Stored.Now, and returns the change
+// to record. A trust decision for a discovery result belongs in build, because
+// it needs the stored state and the lock is what keeps that state from
+// changing under it. It takes Stored.Now as its clock, and the merge applies
+// the verify_ssl false rules again as Merge describes.
 // build may return a change that records nothing. An error from build or from
 // the merge writes nothing and is returned.
 //
@@ -510,7 +600,7 @@ func (s *Store) UpdatePayload(
 		result.Swept = Sweep(s.root, now, s.key.LockName(), s.key.FileName())
 		state, drops := readState(current, s.key, now)
 		result.Dropped = append(result.Dropped, drops...)
-		change, err := build(state.view())
+		change, err := build(state.view(now))
 		if err != nil {
 			return nil, err
 		}

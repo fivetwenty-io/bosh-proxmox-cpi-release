@@ -7,12 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"path/filepath"
+	"net"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 )
 
 // trustSecond is the second configured endpoint of trustKey.
@@ -62,7 +65,7 @@ func trustObservation(nodes ...ObservedNode) Observation {
 // the build function.
 func trustView(stored *Payload, key Key) Stored {
 	state, _ := readState(stored, key, payloadNow)
-	return state.view()
+	return state.view(payloadNow)
 }
 
 // trustStored is one stored file the trust tests decide against.
@@ -145,36 +148,44 @@ func trustObservations() []trustObserved {
 	}
 	via := trustObservation(trustSame("pve2"), trustSame("pve3"))
 	via.Via = "PVE1B.dc1.example.com"
+	changedVia := changed(trustSame("pve2"), trustSame("pve3"))
+	changedVia.Via = trustSecond
 	notDerived := trustObservation(trustNode("pve2", 0x55), trustSame("pve3"))
 	notDerived.Nodes[0].Address = "pve2.attacker.example:8006"
+	noStatus := trustObservation(trustSame("pve2"), trustSame("pve3"))
+	noStatus.Outcome, noStatus.Quorate = OutcomeNoStatus, false
+	noStatus.Nodes[1].Online = false
 	return []trustObserved{
 		{"the same nodes and pins", trustObservation(trustSame("pve2"), trustSame("pve3"))},
 		{"a new node", trustObservation(trustSame("pve2"), trustSame("pve3"), trustNode("pve4", 0x44))},
 		{"a node left out", trustObservation(trustSame("pve3"))},
 		{"the same pins reordered and repeated", trustObservation(trustNode("pve2", 0x9e, 0xa1, 0x9e), trustSame("pve3"))},
-		{"a changed pin set", trustObservation(trustNode("pve2", 0xa1, 0x55), trustSame("pve3"))},
+		{"a partially overlapping pin set", trustObservation(trustNode("pve2", 0xa1, 0x55), trustSame("pve3"))},
 		{"a pin set that only grows", trustObservation(trustNode("pve2", 0xa1, 0x9e, 0x55), trustSame("pve3"))},
+		{"a pin set that shrinks", trustObservation(trustNode("pve2", 0xa1), trustSame("pve3"))},
+		{"a disjoint pin set", trustObservation(trustNode("pve2", 0x55, 0x56), trustSame("pve3"))},
+		{"a shrink and a disjoint set together", trustObservation(trustNode("pve2", 0x9e), trustNode("pve3", 0x57))},
 		{"a changed identity", changed(trustSame("pve2"), trustSame("pve3"))},
 		{"a changed identity and pins", changed(trustNode("pve2", 0x55), trustSame("pve3"))},
+		{"a changed identity through the second configured endpoint", changedVia},
 		{"no_candidates", noNodes(OutcomeNoCandidates)},
 		{"standalone", noNodes(OutcomeStandalone)},
 		{"public_suffix", noNodes(OutcomePublicSuffix)},
-		{"no_status", func() Observation {
-			obs := trustObservation(trustSame("pve2"), trustSame("pve3"))
-			obs.Outcome, obs.Quorate = OutcomeNoStatus, false
-			return obs
-		}()},
+		{"no_status with an offline node", noStatus},
 		{"through the second configured endpoint", via},
 		{"an ambiguous node", trustObservation(trustSame("pve2"), trustNode("0x7f000001", 0x55))},
 		{"a node the seed does not derive", notDerived},
+		{"the seed's own node", trustObservation(trustNode("pve1", 0x11), trustSame("pve2"), trustSame("pve3"))},
+		{"the second configured endpoint's node", trustObservation(trustSame("pve2"), trustNode("PVE1B", 0x12), trustSame("pve3"))},
 	}
 }
 
 // TestDecideTrustAgreesWithMerge runs every stored file and observation under
 // both verify_ssl values through DecideTrust, and every decision through
-// Merge. Merge never refuses a change trust accepted. A result trust refused
-// for a trust rule is one Merge refuses too, for the same reason and the same
-// nodes.
+// Merge. The merged file must equal the one expectTrust builds from the
+// fixture and the observation alone. Merge must also accept the observation
+// as observed exactly when the rules accept every pin, and refuse it for the
+// same reason and the same nodes when they do not.
 func TestDecideTrustAgreesWithMerge(t *testing.T) {
 	decided := map[TrustOutcome]int{}
 	for _, verify := range []bool{true, false} {
@@ -206,46 +217,235 @@ func TestDecideTrustAgreesWithMerge(t *testing.T) {
 	}
 }
 
-// checkAgreement runs decision through Merge against stored and checks that
-// the two agree.
-func checkAgreement(t *testing.T, stored *Payload, key Key, obs Observation, decision TrustDecision) {
+// trustExpectation is what the trust rules should make of one observation.
+type trustExpectation struct {
+	outcome TrustOutcome
+	log     TrustLog
+	drop    bool
+	changed []string
+	via     string
+	// file is the file Merge should write for the decision.
+	file *Payload
+	// observed is the observation as a result with no pin rule applied,
+	// which Merge must accept or refuse as the outcome says.
+	observed *DiscoveryResult
+}
+
+// expectTrust builds the expected decision and merged file from the stored
+// fixture and the observation, at payloadNow. It uses only the derivation,
+// the node-name check, and the endpoint grammar, and never observedResult,
+// validateDiscovery, or the pin comparisons under test. Whether the stored
+// fixture is a usable file at all is Validate's answer.
+func expectTrust(t *testing.T, stored *Payload, key Key, obs Observation) trustExpectation {
 	t.Helper()
-	if decision.Writes() {
-		next, _, err := Merge(stored, key, decision.Change, payloadNow)
-		if err != nil || next == nil {
-			t.Fatalf("Merge refused an accepted %s decision: %+v, %v", decision.Outcome, next, err)
+	now := payloadNow
+	host, port, ok := config.NormalizeEndpoint(obs.Via)
+	if !ok {
+		t.Fatalf("the matrix holds an observation through %q", obs.Via)
+	}
+	via := net.JoinHostPort(host, strconv.Itoa(port))
+	root := hex.EncodeToString(obs.RootCA[:])
+
+	var prior *ClusterIdentity
+	var known []DiscoveredNode
+	var marks map[string]DownMark
+	if stored != nil {
+		if _, _, err := Validate(stored, key, now); err == nil {
+			prior = stored.Cluster
+			if stored.Discovery != nil {
+				known = stored.Discovery.Nodes
+			}
+			marks = stored.Marks
 		}
-		if decision.Change.Result != nil {
-			via := next.Cluster.ObservedVia
-			if via != "" && via != mergeSeed && via != trustSecond {
-				t.Errorf("observed_via %q is not a configured endpoint", via)
+	}
+
+	nodes := expectedNodes(key, obs, now)
+	wait := time.Hour
+	if obs.Outcome != OutcomeOK && obs.Outcome != OutcomeNoStatus {
+		wait = 24 * time.Hour
+	}
+	section := func(nodes []DiscoveredNode) *DiscoverySection {
+		return &DiscoverySection{
+			DiscoveredAt: now, NextRefreshAfter: now.Add(wait), Outcome: obs.Outcome, Quorate: obs.Quorate, Nodes: nodes,
+		}
+	}
+	e := trustExpectation{via: via, observed: &DiscoveryResult{
+		Cluster:   ClusterIdentity{RootCASHA256: root, ObservedAt: now, ObservedVia: via},
+		Discovery: *section(cloneNodes(nodes)),
+	}}
+	written := func(cluster ClusterIdentity, nodes []DiscoveredNode) *Payload {
+		file := &Payload{Key: key, Cluster: &cluster, Discovery: section(nodes), Marks: marks}
+		file.Key.Endpoints = slices.Clone(key.Endpoints)
+		return file
+	}
+	attempted := func(conflict bool) *Payload {
+		file := stored.clone()
+		file.Cluster.IdentityConflict = file.Cluster.IdentityConflict || conflict
+		if file.Discovery != nil {
+			file.Discovery.DiscoveredAt, file.Discovery.NextRefreshAfter = now, now.Add(24*time.Hour)
+		}
+		return file
+	}
+
+	switch {
+	case prior != nil && prior.IdentityConflict:
+		e.outcome, e.log, e.drop, e.file = TrustConflictStands, TrustLogWarn, true, attempted(false)
+		return e
+	case prior != nil && prior.RootCASHA256 != root && !key.VerifySSL:
+		e.outcome, e.log, e.drop, e.file = TrustIdentityRefused, TrustLogError, true, attempted(true)
+		return e
+	case prior != nil && prior.RootCASHA256 != root:
+		e.outcome, e.log, e.drop = TrustIdentityReplaced, TrustLogError, true
+		e.file = written(e.observed.Cluster, cloneNodes(nodes))
+		return e
+	}
+
+	e.changed = expectPins(nodes, known, key.VerifySSL)
+	cluster := e.observed.Cluster
+	if prior != nil {
+		cluster.ObservedAt, cluster.ObservedVia = prior.ObservedAt, prior.ObservedVia
+	}
+	e.file = written(cluster, nodes)
+	switch {
+	case len(e.changed) > 0 && !key.VerifySSL:
+		e.outcome, e.log = TrustPinsRefused, TrustLogWarn
+	case len(e.changed) > 0:
+		e.outcome = TrustPinsReplaced
+	case prior == nil:
+		e.outcome = TrustFirstUse
+	default:
+		e.outcome = TrustConfirmed
+	}
+	return e
+}
+
+// expectedNodes returns the nodes of obs that the result keeps, in the form
+// the file stores, confirmed at now. A node is kept when its name is valid, its
+// address is the one the seed derives for that name, and that address is not a
+// configured endpoint.
+func expectedNodes(key Key, obs Observation, now time.Time) []DiscoveredNode {
+	nodes := make([]DiscoveredNode, 0, len(obs.Nodes))
+	for _, n := range obs.Nodes {
+		if ValidateNodeName(n.Name) != nil {
+			continue
+		}
+		derived, err := DeriveAddress(key.Endpoints[0], n.Name)
+		if err != nil || !strings.EqualFold(derived, n.Address) || slices.Contains(key.Endpoints, strings.ToLower(n.Address)) {
+			continue
+		}
+		nodeHost, nodePort, _ := net.SplitHostPort(n.Address)
+		portNumber, _ := strconv.Atoi(nodePort)
+		var pins []string
+		for _, pin := range n.Pins {
+			if text := hex.EncodeToString(pin[:]); !slices.Contains(pins, text) {
+				pins = append(pins, text)
 			}
 		}
-		return
+		nodes = append(nodes, DiscoveredNode{
+			Name: n.Name, Address: strings.ToLower(nodeHost), Port: portNumber, Pins: pins, Online: n.Online, ConfirmedAt: now,
+		})
 	}
-	_, raw, _, err := observedResult(obs, key, payloadNow)
-	if err != nil {
-		t.Fatal(err)
+	return nodes
+}
+
+// expectPins applies the pin rule to nodes against the known nodes by counting
+// the stored pins each observed set keeps and the pins it adds, and returns the
+// names of the nodes whose pins changed. Under verify_ssl false a node that
+// keeps every stored pin is unchanged, and any other known node takes its
+// stored pins, and its stored confirmation too when it keeps none of them.
+func expectPins(nodes, known []DiscoveredNode, verify bool) []string {
+	var changed []string
+	for i := range nodes {
+		j := slices.IndexFunc(known, func(k DiscoveredNode) bool { return strings.EqualFold(k.Name, nodes[i].Name) })
+		if j < 0 {
+			continue
+		}
+		old := known[j]
+		var kept int
+		for _, pin := range nodes[i].Pins {
+			if slices.Contains(old.Pins, pin) {
+				kept++
+			}
+		}
+		added := len(nodes[i].Pins) - kept
+		switch {
+		case kept == len(old.Pins) && added == 0:
+		case verify:
+			changed = append(changed, nodes[i].Name)
+		case kept == len(old.Pins):
+		default:
+			changed = append(changed, nodes[i].Name)
+			nodes[i].Pins = slices.Clone(old.Pins)
+			if kept == 0 {
+				nodes[i].ConfirmedAt = old.ConfirmedAt
+			}
+		}
 	}
-	cluster := ClusterIdentity{RootCASHA256: decision.ObservedRootCA, ObservedVia: mergeSeed, ObservedAt: payloadNow}
-	_, _, err = Merge(stored, key, Change{Result: &DiscoveryResult{Cluster: cluster, Discovery: raw}}, payloadNow)
+	return changed
+}
+
+// checkAgreement checks decision against expectTrust, runs it through Merge
+// against stored, and checks the merged file and Merge's own reading of the
+// observation as observed.
+func checkAgreement(t *testing.T, stored *Payload, key Key, obs Observation, decision TrustDecision) {
+	t.Helper()
+	want := expectTrust(t, stored, key, obs)
+	if decision.Outcome != want.outcome || decision.Log != want.log || decision.DropDiscovered != want.drop ||
+		!reflect.DeepEqual(decision.PinsChanged, want.changed) || decision.Via != want.via {
+		t.Fatalf("decision %s log %d drop %v changed %v via %q, want %s log %d drop %v changed %v via %q",
+			decision.Outcome, decision.Log, decision.DropDiscovered, decision.PinsChanged, decision.Via,
+			want.outcome, want.log, want.drop, want.changed, want.via)
+	}
+	if !decision.Writes() {
+		t.Fatalf("decision %s writes nothing", decision.Outcome)
+	}
+	next, _, err := Merge(stored, key, decision.Change, payloadNow)
+	if err != nil || next == nil {
+		t.Fatalf("Merge refused a %s decision: %+v, %v", decision.Outcome, next, err)
+	}
+	if next.Cluster == nil || next.Cluster.ObservedVia == "" {
+		t.Errorf("the merged file carries no observed_via: %+v", next.Cluster)
+	}
+	if !reflect.DeepEqual(next, want.file) {
+		t.Errorf("merged file differs:\n got %s\nwant %s", trustDump(next), trustDump(want.file))
+	}
+
+	_, _, err = Merge(stored, key, Change{Result: want.observed}, payloadNow)
 	var refusal *TrustRefusalError
-	switch decision.Outcome {
+	switch want.outcome {
 	case TrustConflictStands:
 		if !errors.Is(err, ErrIdentityConflict) {
 			t.Errorf("trust kept a conflict, and Merge said %v", err)
 		}
 	case TrustPinsRefused:
-		if !errors.As(err, &refusal) || refusal.IdentityChanged || !reflect.DeepEqual(refusal.Nodes, decision.PinsChanged) {
-			t.Errorf("trust refused pins for %v, and Merge said %v", decision.PinsChanged, err)
+		if !errors.As(err, &refusal) || refusal.IdentityChanged || !reflect.DeepEqual(refusal.Nodes, want.changed) {
+			t.Errorf("trust refused pins for %v, and Merge said %v", want.changed, err)
 		}
 	case TrustIdentityRefused:
 		if !errors.As(err, &refusal) || !refusal.IdentityChanged {
 			t.Errorf("trust refused the identity, and Merge said %v", err)
 		}
 	default:
-		t.Errorf("decision %s writes nothing", decision.Outcome)
+		if err != nil {
+			t.Errorf("trust accepted every pin as observed, and Merge said %v", err)
+		}
 	}
+}
+
+// trustDump formats p with its sections and nodes spelled out.
+func trustDump(p *Payload) string {
+	if p == nil {
+		return "<nil>"
+	}
+	out := fmt.Sprintf("cluster %+v marks %v", p.Cluster, p.Marks)
+	if p.Discovery != nil {
+		d := p.Discovery
+		out += fmt.Sprintf(" discovery {at %v next %v %s quorate %v}", d.DiscoveredAt, d.NextRefreshAfter, d.Outcome, d.Quorate)
+		for _, node := range d.Nodes {
+			out += fmt.Sprintf(" %+v", node)
+		}
+	}
+	return out
 }
 
 // trustCase is one row of the trust table.
@@ -258,7 +458,7 @@ type trustCase struct {
 	log     TrustLog
 	drop    bool
 	changed []string
-	// check inspects the merged file of a decision that writes.
+	// check inspects the merged file. Every decision writes.
 	check func(t *testing.T, next *Payload)
 }
 
@@ -294,6 +494,69 @@ func nodePins(p *Payload, name string) []string {
 	return nil
 }
 
+// trustNodeIn returns the node named name in p, and fails when there is none.
+func trustNodeIn(t *testing.T, p *Payload, name string) DiscoveredNode {
+	t.Helper()
+	for _, node := range p.Discovery.Nodes {
+		if node.Name == name {
+			return node
+		}
+	}
+	t.Fatalf("no node %s in %v", name, trustNodeNames(p))
+	return DiscoveredNode{}
+}
+
+// wantPinsAt checks one node's pins and confirmation in the merged file.
+func wantPinsAt(name string, confirmed time.Time, pins ...byte) func(t *testing.T, next *Payload) {
+	return func(t *testing.T, next *Payload) {
+		t.Helper()
+		node := trustNodeIn(t, next, name)
+		want := make([]string, 0, len(pins))
+		for _, b := range pins {
+			want = append(want, payloadPin(hex.EncodeToString([]byte{b})))
+		}
+		if !reflect.DeepEqual(node.Pins, want) || !node.ConfirmedAt.Equal(confirmed) {
+			t.Errorf("%s pins %v confirmed %v, want %v confirmed %v", name, node.Pins, node.ConfirmedAt, want, confirmed)
+		}
+	}
+}
+
+// wantTimes checks the merged section's two times.
+func wantTimes(discovered time.Time, next time.Duration) func(t *testing.T, p *Payload) {
+	return func(t *testing.T, p *Payload) {
+		t.Helper()
+		if !p.Discovery.DiscoveredAt.Equal(discovered) || !p.Discovery.NextRefreshAfter.Equal(discovered.Add(next)) {
+			t.Errorf("discovered %v next %v, want %v and %v later", p.Discovery.DiscoveredAt, p.Discovery.NextRefreshAfter,
+				discovered, next)
+		}
+	}
+}
+
+// all runs every check in order.
+func all(checks ...func(t *testing.T, next *Payload)) func(t *testing.T, next *Payload) {
+	return func(t *testing.T, next *Payload) {
+		t.Helper()
+		for _, check := range checks {
+			check(t, next)
+		}
+	}
+}
+
+// attemptOnly checks that the merged file is stored with only the section's
+// times moved to now and now plus MaxRefreshWait, and the conflict flag set
+// when conflict is true.
+func attemptOnly(stored func(Key) *Payload, verify, conflict bool) func(t *testing.T, next *Payload) {
+	return func(t *testing.T, next *Payload) {
+		t.Helper()
+		want := stored(trustKey(verify))
+		want.Cluster.IdentityConflict = want.Cluster.IdentityConflict || conflict
+		want.Discovery.DiscoveredAt, want.Discovery.NextRefreshAfter = payloadNow, payloadNow.Add(MaxRefreshWait)
+		if !reflect.DeepEqual(next, want) {
+			t.Errorf("the attempt changed more than the times:\n got %s\nwant %s", trustDump(next), trustDump(want))
+		}
+	}
+}
+
 func trustCases() []trustCase {
 	fresh := func(key Key) *Payload { return payloadFor(key, "pve2", "pve3") }
 	expired := func(key Key) *Payload {
@@ -306,17 +569,24 @@ func trustCases() []trustCase {
 		p.Cluster.IdentityConflict = true
 		return p
 	}
+	stamp := payloadNow.Add(-5 * time.Minute)
 	same := trustObservation(trustSame("pve2"), trustSame("pve3"))
 	newNode := trustObservation(trustSame("pve2"), trustSame("pve3"), trustNode("pve4", 0x44))
-	pinChange := trustObservation(trustNode("pve2", 0xa1, 0x55), trustSame("pve3"), trustNode("pve4", 0x44))
+	overlap := trustObservation(trustNode("pve2", 0xa1, 0x55), trustSame("pve3"), trustNode("pve4", 0x44))
+	shrink := trustObservation(trustNode("pve2", 0xa1), trustSame("pve3"))
+	grow := trustObservation(trustNode("pve2", 0x9e, 0xa1, 0x55), trustSame("pve3"))
+	disjoint := trustObservation(trustNode("pve2", 0x55, 0x56), trustSame("pve3"))
+	configured := trustObservation(trustNode("pve1", 0x11), trustNode("pve1b", 0x12), trustSame("pve2"))
 	identity := trustObservation(trustNode("pve2", 0x55), trustNode("pve5", 0x66))
 	identity.RootCA = trustPin(0xff)
 	keepsIdentity := func(t *testing.T, next *Payload) {
 		t.Helper()
-		if next.Cluster.RootCASHA256 != payloadPin("3c") || !next.Cluster.ObservedAt.Equal(payloadNow.Add(-5*time.Minute)) {
+		if next.Cluster.RootCASHA256 != payloadPin("3c") || !next.Cluster.ObservedAt.Equal(stamp) ||
+			next.Cluster.ObservedVia != mergeSeed {
 			t.Errorf("identity %+v, want the stored one with its first sighting", next.Cluster)
 		}
 	}
+	hourly := wantTimes(payloadNow, RefreshInterval)
 	return []trustCase{
 		{
 			name: "verify_ssl false, first use records the identity and pins", stored: func(Key) *Payload { return nil },
@@ -337,68 +607,84 @@ func trustCases() []trustCase {
 		{
 			name: "verify_ssl false, the same identity and pins confirm the nodes", stored: fresh, obs: same,
 			outcome: TrustConfirmed,
-			check: func(t *testing.T, next *Payload) {
-				t.Helper()
-				keepsIdentity(t, next)
-				for _, node := range next.Discovery.Nodes {
-					if !node.ConfirmedAt.Equal(payloadNow) {
-						t.Errorf("node %s confirmed at %v, want now", node.Name, node.ConfirmedAt)
-					}
-				}
-			},
+			check:   all(keepsIdentity, hourly, wantPinsAt("pve2", payloadNow, 0xa1, 0x9e), wantPinsAt("pve3", payloadNow, 0xa1, 0x9e)),
 		},
 		{
 			name: "verify_ssl false, a new node is added on first use", stored: fresh, obs: newNode,
-			outcome: TrustConfirmed,
-			check: func(t *testing.T, next *Payload) {
-				t.Helper()
-				wantNodes("pve2", "pve3", "pve4")(t, next)
-				if !reflect.DeepEqual(nodePins(next, "pve4"), []string{payloadPin("44")}) {
-					t.Errorf("pve4 pins %v", nodePins(next, "pve4"))
-				}
-			},
+			outcome: TrustConfirmed, check: all(wantNodes("pve2", "pve3", "pve4"), wantPinsAt("pve4", payloadNow, 0x44)),
 		},
 		{
 			name: "verify_ssl false, a node left out stops being known", stored: fresh,
 			obs: trustObservation(trustSame("pve3")), outcome: TrustConfirmed, check: wantNodes("pve3"),
 		},
 		{
-			name: "verify_ssl false, a changed pin set is refused", stored: fresh, obs: pinChange,
-			outcome: TrustPinsRefused, log: TrustLogWarn, changed: []string{"pve2"},
+			name:   "verify_ssl false, a partially overlapping pin set keeps the stored pins and confirms the node",
+			stored: fresh, obs: overlap, outcome: TrustPinsRefused, log: TrustLogWarn, changed: []string{"pve2"},
+			check: all(keepsIdentity, hourly, wantNodes("pve2", "pve3", "pve4"),
+				wantPinsAt("pve2", payloadNow, 0xa1, 0x9e), wantPinsAt("pve3", payloadNow, 0xa1, 0x9e),
+				wantPinsAt("pve4", payloadNow, 0x44)),
 		},
 		{
-			name: "verify_ssl false, a changed pin set is refused for a node past 24 hours", stored: expired,
-			obs: pinChange, outcome: TrustPinsRefused, log: TrustLogWarn, changed: []string{"pve2"},
+			name:   "verify_ssl false, a pin set that shrinks keeps the stored pins and confirms the node",
+			stored: fresh, obs: shrink, outcome: TrustPinsRefused, log: TrustLogWarn, changed: []string{"pve2"},
+			check: all(hourly, wantPinsAt("pve2", payloadNow, 0xa1, 0x9e)),
+		},
+		{
+			name: "verify_ssl false, a pin set that grows is accepted", stored: fresh, obs: grow, outcome: TrustConfirmed,
+			check: all(keepsIdentity, hourly, wantPinsAt("pve2", payloadNow, 0x9e, 0xa1, 0x55)),
+		},
+		{
+			name: "verify_ssl false, a pin set that grows is accepted for a node past 24 hours", stored: expired,
+			obs: grow, outcome: TrustConfirmed, check: wantPinsAt("pve2", payloadNow, 0x9e, 0xa1, 0x55),
+		},
+		{
+			name: "verify_ssl false, a disjoint pin set keeps the stored pins and confirmation", stored: fresh,
+			obs: disjoint, outcome: TrustPinsRefused, log: TrustLogWarn, changed: []string{"pve2"},
+			check: all(hourly, wantPinsAt("pve2", stamp, 0xa1, 0x9e), wantPinsAt("pve3", payloadNow, 0xa1, 0x9e)),
+		},
+		{
+			name: "verify_ssl false, a disjoint pin set past 24 hours stays known and unloaded", stored: expired,
+			obs: disjoint, outcome: TrustPinsRefused, log: TrustLogWarn, changed: []string{"pve2"},
+			check: func(t *testing.T, next *Payload) {
+				t.Helper()
+				wantPinsAt("pve2", payloadNow.Add(-48*time.Hour), 0xa1, 0x9e)(t, next)
+				state, _ := readState(next, trustKey(false), payloadNow)
+				if names := trustNodeNames(state.usable); !reflect.DeepEqual(names, []string{"pve3"}) {
+					t.Errorf("a reader loads %v, want pve3 alone", names)
+				}
+				if len(state.known) != 2 || state.known[0].Name != "pve2" {
+					t.Errorf("known %+v, want pve2 still known", state.known)
+				}
+			},
+		},
+		{
+			name: "verify_ssl false, an overlapping pin set past 24 hours confirms the node again", stored: expired,
+			obs: overlap, outcome: TrustPinsRefused, log: TrustLogWarn, changed: []string{"pve2"},
+			check: wantPinsAt("pve2", payloadNow, 0xa1, 0x9e),
 		},
 		{
 			name: "verify_ssl false, a node past 24 hours with the same pins is confirmed again", stored: expired,
-			obs: same, outcome: TrustConfirmed,
-			check: func(t *testing.T, next *Payload) {
-				t.Helper()
-				if !next.Discovery.Nodes[0].ConfirmedAt.Equal(payloadNow) {
-					t.Errorf("pve2 confirmed at %v", next.Discovery.Nodes[0].ConfirmedAt)
-				}
-			},
+			obs: same, outcome: TrustConfirmed, check: wantPinsAt("pve2", payloadNow, 0xa1, 0x9e),
+		},
+		{
+			name: "verify_ssl false, nodes that are configured endpoints are left out", stored: func(Key) *Payload { return nil },
+			obs: configured, outcome: TrustFirstUse, check: wantNodes("pve2"),
+		},
+		{
+			name: "verify_ssl true, nodes that are configured endpoints are left out", verify: true, stored: fresh,
+			obs: configured, outcome: TrustConfirmed, check: wantNodes("pve2"),
 		},
 		{
 			name: "verify_ssl false, a changed identity is recorded as a conflict", stored: fresh, obs: identity,
-			outcome: TrustIdentityRefused, log: TrustLogError, drop: true,
-			check: func(t *testing.T, next *Payload) {
-				t.Helper()
-				want := payloadFor(trustKey(false), "pve2", "pve3")
-				want.Cluster.IdentityConflict = true
-				if !reflect.DeepEqual(next, want) {
-					t.Errorf("the conflict changed more than the flag:\n got %+v\nwant %+v", next, want)
-				}
-			},
+			outcome: TrustIdentityRefused, log: TrustLogError, drop: true, check: attemptOnly(fresh, false, true),
 		},
 		{
 			name: "verify_ssl false, a recorded conflict refuses the stored identity too", stored: conflict, obs: same,
-			outcome: TrustConflictStands, log: TrustLogWarn, drop: true,
+			outcome: TrustConflictStands, log: TrustLogWarn, drop: true, check: attemptOnly(conflict, false, false),
 		},
 		{
 			name: "verify_ssl false, a recorded conflict refuses another identity", stored: conflict, obs: identity,
-			outcome: TrustConflictStands, log: TrustLogWarn, drop: true,
+			outcome: TrustConflictStands, log: TrustLogWarn, drop: true, check: attemptOnly(conflict, false, false),
 		},
 		{
 			name: "verify_ssl true, a changed identity replaces the nodes and pins", verify: true, stored: fresh,
@@ -406,29 +692,30 @@ func trustCases() []trustCase {
 			check: func(t *testing.T, next *Payload) {
 				t.Helper()
 				wantNodes("pve2", "pve5")(t, next)
-				if next.Cluster.RootCASHA256 != payloadPin("ff") || !next.Cluster.ObservedAt.Equal(payloadNow) {
+				if next.Cluster.RootCASHA256 != payloadPin("ff") || !next.Cluster.ObservedAt.Equal(payloadNow) ||
+					next.Cluster.ObservedVia != mergeSeed {
 					t.Errorf("identity %+v", next.Cluster)
 				}
-				if !reflect.DeepEqual(nodePins(next, "pve2"), []string{payloadPin("55")}) {
-					t.Errorf("pve2 pins %v", nodePins(next, "pve2"))
-				}
+				wantPinsAt("pve2", payloadNow, 0x55)(t, next)
 			},
 		},
 		{
 			name: "verify_ssl true, a changed pin set replaces the old one", verify: true, stored: expired,
-			obs: pinChange, outcome: TrustPinsReplaced, changed: []string{"pve2"},
-			check: func(t *testing.T, next *Payload) {
-				t.Helper()
-				keepsIdentity(t, next)
-				wantNodes("pve2", "pve3", "pve4")(t, next)
-				if !reflect.DeepEqual(nodePins(next, "pve2"), []string{payloadPin("a1"), payloadPin("55")}) {
-					t.Errorf("pve2 pins %v", nodePins(next, "pve2"))
-				}
-			},
+			obs: overlap, outcome: TrustPinsReplaced, changed: []string{"pve2"},
+			check: all(keepsIdentity, wantNodes("pve2", "pve3", "pve4"), wantPinsAt("pve2", payloadNow, 0xa1, 0x55)),
+		},
+		{
+			name: "verify_ssl true, a pin set that shrinks replaces the old one", verify: true, stored: fresh,
+			obs: shrink, outcome: TrustPinsReplaced, changed: []string{"pve2"}, check: wantPinsAt("pve2", payloadNow, 0xa1),
+		},
+		{
+			name: "verify_ssl true, a pin set that grows replaces the old one", verify: true, stored: fresh,
+			obs: grow, outcome: TrustPinsReplaced, changed: []string{"pve2"},
+			check: wantPinsAt("pve2", payloadNow, 0x9e, 0xa1, 0x55),
 		},
 		{
 			name: "verify_ssl true, a recorded conflict still refuses", verify: true, stored: conflict, obs: same,
-			outcome: TrustConflictStands, log: TrustLogWarn, drop: true,
+			outcome: TrustConflictStands, log: TrustLogWarn, drop: true, check: attemptOnly(conflict, true, false),
 		},
 	}
 }
@@ -450,17 +737,14 @@ func TestDecideTrustRules(t *testing.T) {
 					decision.Outcome, decision.Log, decision.DropDiscovered, decision.PinsChanged,
 					tc.outcome, tc.log, tc.drop, tc.changed)
 			}
-			if decision.ObservedRootCA != hex.EncodeToString(tc.obs.RootCA[:]) {
-				t.Errorf("observed root %q", decision.ObservedRootCA)
+			if decision.ObservedRootCA != hex.EncodeToString(tc.obs.RootCA[:]) || decision.Via != mergeSeed {
+				t.Errorf("observed root %q via %q", decision.ObservedRootCA, decision.Via)
 			}
 			if stored != nil && decision.StoredRootCA != payloadPin("3c") {
 				t.Errorf("stored root %q", decision.StoredRootCA)
 			}
-			if tc.check == nil {
-				if decision.Writes() {
-					t.Fatalf("a refused decision writes %+v", decision.Change)
-				}
-				return
+			if !decision.Writes() {
+				t.Fatalf("decision %s writes nothing", decision.Outcome)
 			}
 			next, _, err := Merge(stored, key, decision.Change, payloadNow)
 			if err != nil {
@@ -472,8 +756,9 @@ func TestDecideTrustRules(t *testing.T) {
 }
 
 // TestDecideTrustSchedulesTheNextRefresh checks that a discovery that found
-// nodes is due again in an hour and one that found none waits 24 hours, and
-// that a decision stamps the discovery and its nodes with the clock.
+// nodes is due again in an hour and one that found none waits 24 hours, that
+// the written section carries the observed outcome and quorum flag, and that
+// a decision stamps the discovery and its nodes with the clock.
 func TestDecideTrustSchedulesTheNextRefresh(t *testing.T) {
 	key := trustKey(false)
 	cases := map[DiscoveryOutcome]time.Duration{
@@ -481,29 +766,78 @@ func TestDecideTrustSchedulesTheNextRefresh(t *testing.T) {
 		OutcomeNoCandidates: 24 * time.Hour, OutcomeStandalone: 24 * time.Hour, OutcomePublicSuffix: 24 * time.Hour,
 	}
 	for outcome, wait := range cases {
-		t.Run(string(outcome), func(t *testing.T) {
-			obs := trustObservation()
-			if outcome.holdsNodes() {
-				obs = trustObservation(trustSame("pve2"))
+		for _, quorate := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s quorate %v", outcome, quorate), func(t *testing.T) {
+				obs := trustObservation()
+				if outcome.holdsNodes() {
+					obs = trustObservation(trustSame("pve2"))
+				}
+				obs.Outcome, obs.Quorate = outcome, quorate
+				decision, err := DecideTrust(Stored{}, key, obs, payloadNow)
+				if err != nil {
+					t.Fatal(err)
+				}
+				next, _, err := Merge(nil, key, decision.Change, payloadNow)
+				if err != nil {
+					t.Fatal(err)
+				}
+				section := next.Discovery
+				if section.Outcome != outcome || section.Quorate != quorate {
+					t.Errorf("written outcome %s quorate %v, want %s and %v", section.Outcome, section.Quorate, outcome, quorate)
+				}
+				if !section.DiscoveredAt.Equal(payloadNow) || !section.NextRefreshAfter.Equal(payloadNow.Add(wait)) {
+					t.Errorf("discovered %v, next refresh %v, want now and now+%v", section.DiscoveredAt, section.NextRefreshAfter, wait)
+				}
+				for _, node := range section.Nodes {
+					if !node.ConfirmedAt.Equal(payloadNow) {
+						t.Errorf("node confirmed at %v", node.ConfirmedAt)
+					}
+				}
+			})
+		}
+	}
+	if RefreshInterval != time.Hour || PinRefreshFloor != 10*time.Minute {
+		t.Errorf("RefreshInterval %v and PinRefreshFloor %v, want an hour and 10 minutes", RefreshInterval, PinRefreshFloor)
+	}
+}
+
+// TestDecideTrustRefusalsScheduleTheNextRefresh checks the times each refusal
+// writes. A refused identity and a standing conflict wait 24 hours, and a
+// refused pin change waits an hour, so none of them is due again at once.
+func TestDecideTrustRefusalsScheduleTheNextRefresh(t *testing.T) {
+	key := trustKey(false)
+	conflicted := payloadFor(key, "pve2")
+	conflicted.Cluster.IdentityConflict = true
+	other := trustObservation(trustSame("pve2"))
+	other.RootCA = trustPin(0xff)
+	refusals := map[string]struct {
+		stored  *Payload
+		obs     Observation
+		outcome TrustOutcome
+		wait    time.Duration
+	}{
+		"identity_refused": {payloadFor(key, "pve2"), other, TrustIdentityRefused, MaxRefreshWait},
+		"conflict_stands":  {conflicted, trustObservation(trustSame("pve2")), TrustConflictStands, MaxRefreshWait},
+		"pins_refused":     {payloadFor(key, "pve2"), trustObservation(trustNode("pve2", 0x55)), TrustPinsRefused, RefreshInterval},
+	}
+	for name, tc := range refusals {
+		t.Run(name, func(t *testing.T) {
+			decision, err := DecideTrust(trustView(tc.stored, key), key, tc.obs, payloadNow)
+			if err != nil || decision.Outcome != tc.outcome {
+				t.Fatalf("DecideTrust: %+v, %v", decision, err)
 			}
-			obs.Outcome = outcome
-			decision, err := DecideTrust(Stored{}, key, obs, payloadNow)
+			next, _, err := Merge(tc.stored, key, decision.Change, payloadNow)
 			if err != nil {
 				t.Fatal(err)
 			}
-			section := decision.Change.Result.Discovery
-			if !section.DiscoveredAt.Equal(payloadNow) || !section.NextRefreshAfter.Equal(payloadNow.Add(wait)) {
-				t.Errorf("discovered %v, next refresh %v, want now and now+%v", section.DiscoveredAt, section.NextRefreshAfter, wait)
+			wantTimes(payloadNow, tc.wait)(t, next)
+			if next.Discovery.Outcome != OutcomeOK {
+				t.Errorf("written outcome %s", next.Discovery.Outcome)
 			}
-			for _, node := range section.Nodes {
-				if !node.ConfirmedAt.Equal(payloadNow) {
-					t.Errorf("node confirmed at %v", node.ConfirmedAt)
-				}
+			if p, _, err := Validate(next, key, payloadNow); err != nil || RefreshDue(p, payloadNow.Add(time.Minute), false) {
+				t.Errorf("a refresh is due a minute after %s: %v", name, err)
 			}
 		})
-	}
-	if RefreshInterval != time.Hour {
-		t.Errorf("RefreshInterval is %v, want an hour", RefreshInterval)
 	}
 }
 
@@ -586,6 +920,14 @@ func TestDecideTrustRefusesWhatMergeCannotWrite(t *testing.T) {
 		"a port out of range":         {obs: with(func(o *Observation) { o.Nodes[0].Address = "pve2.dc1.example.com:70000" })},
 		"an address off the grammar":  {obs: with(func(o *Observation) { o.Nodes[0].Address = "pve2/x:8006" })},
 		"a zero clock":                {obs: trustObservation(trustSame("pve2")), zeroClock: true},
+		"a view read at another clock": {
+			stored: func() Stored {
+				view := trustView(payloadFor(key, "pve2"), key)
+				view.Now = payloadNow.Add(time.Minute)
+				return view
+			}(),
+			obs: trustObservation(trustSame("pve2")),
+		},
 		"a stored view of another key": {
 			stored: trustView(payloadFor(trustKey(true), "pve2"), trustKey(true)),
 			obs:    trustObservation(trustSame("pve2")),
@@ -609,26 +951,35 @@ func TestDecideTrustRefusesWhatMergeCannotWrite(t *testing.T) {
 	}
 }
 
-// TestDecideTrustLeavesOutNodesMergeLeavesOut shows that an ambiguous name and
-// an address the seed does not derive are left out, as Merge leaves them out,
-// so their pins are not compared and Merge reports the drop.
+// TestDecideTrustLeavesOutNodesMergeLeavesOut shows that an ambiguous name, an
+// address the seed does not derive, and a node whose derived address is a
+// configured endpoint are left out, as Merge leaves them out, so their pins
+// are not compared and Merge reports the drop.
 func TestDecideTrustLeavesOutNodesMergeLeavesOut(t *testing.T) {
-	key := trustKey(false)
-	stored := payloadFor(key, "pve2", "pve3")
-	obs := trustObservation(trustNode("pve2", 0x55), trustSame("pve3"), trustNode("localhost", 0x77))
-	obs.Nodes[0].Address = "pve2.attacker.example:8006"
-	decision, err := DecideTrust(trustView(stored, key), key, obs, payloadNow)
-	if err != nil || decision.Outcome != TrustConfirmed || len(decision.PinsChanged) != 0 {
-		t.Fatalf("DecideTrust: %+v, %v", decision, err)
-	}
-	next, drops, err := Merge(stored, key, decision.Change, payloadNow)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantNodes("pve3")(t, next)
-	want := []Drop{{Record: "node 0", Reason: DropNotDerived}, {Record: "node 2", Reason: DropAmbiguousName}}
-	if !reflect.DeepEqual(drops, want) {
-		t.Errorf("drops %v, want %v", drops, want)
+	for _, verify := range []bool{false, true} {
+		key := trustKey(verify)
+		stored := payloadFor(key, "pve2", "pve3")
+		obs := trustObservation(
+			trustNode("pve2", 0x55), trustSame("pve3"), trustNode("localhost", 0x77),
+			trustNode("pve1", 0x11), trustNode("Pve1B", 0x12),
+		)
+		obs.Nodes[0].Address = "pve2.attacker.example:8006"
+		decision, err := DecideTrust(trustView(stored, key), key, obs, payloadNow)
+		if err != nil || decision.Outcome != TrustConfirmed || len(decision.PinsChanged) != 0 {
+			t.Fatalf("verify_ssl %v: DecideTrust: %+v, %v", verify, decision, err)
+		}
+		next, drops, err := Merge(stored, key, decision.Change, payloadNow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantNodes("pve3")(t, next)
+		want := []Drop{
+			{Record: "node 0", Reason: DropNotDerived}, {Record: "node 2", Reason: DropAmbiguousName},
+			{Record: "node 3", Reason: DropConfiguredEndpoint}, {Record: "node 4", Reason: DropConfiguredEndpoint},
+		}
+		if !reflect.DeepEqual(drops, want) {
+			t.Errorf("verify_ssl %v: drops %v, want %v", verify, drops, want)
+		}
 	}
 }
 
@@ -659,30 +1010,41 @@ func TestTrustDecisionWrites(t *testing.T) {
 	if !(TrustDecision{Change: Change{Result: &DiscoveryResult{}}}).Writes() {
 		t.Error("a result does not write")
 	}
+	if !(TrustDecision{Change: Change{Attempt: &DiscoveryAttempt{At: payloadNow}}}).Writes() {
+		t.Error("an attempt does not write")
+	}
 	if (TrustDecision{Change: Change{Marks: map[string]DownMark{mergeSeed: {}}}}).Writes() {
 		t.Error("marks alone count as a trust write")
 	}
 }
 
 // trustUpdate decides obs through UpdatePayload at now, as the discovery
-// worker does, and returns the decision.
+// worker does, with the store's clock, and returns the decision.
 func trustUpdate(t *testing.T, s *Store, now time.Time, obs Observation) TrustDecision {
 	t.Helper()
 	var decision TrustDecision
 	result, err := s.UpdatePayload(context.Background(), now, func(stored Stored) (Change, error) {
 		var err error
-		decision, err = DecideTrust(stored, s.Key(), obs, now)
+		decision, err = DecideTrust(stored, s.Key(), obs, stored.Now)
 		return decision.Change, err
 	})
 	if err != nil || !result.Locked {
 		t.Fatalf("UpdatePayload: %+v, %v", result, err)
 	}
-	// A decision that records nothing still lets the merge write the stored
-	// file back as it was read, so only a recording decision must write.
-	if decision.Writes() && !result.Written {
+	if !decision.Writes() || !result.Written {
 		t.Fatalf("%s decision: nothing written", decision.Outcome)
 	}
 	return decision
+}
+
+// trustStoredFile reads the store's file as written, without validation.
+func trustStoredFile(t *testing.T, s *Store) *Payload {
+	t.Helper()
+	var p Payload
+	if err := s.Read(&p); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	return &p
 }
 
 // TestStoreTrustOnFirstUseLifecycle walks a verify_ssl false file through the
@@ -714,13 +1076,26 @@ func TestStoreTrustOnFirstUseLifecycle(t *testing.T) {
 	if got := trustNodeNames(read(later)); len(got) != 0 {
 		t.Fatalf("unconfirmed nodes loaded after 24 hours: %v", got)
 	}
-	before := readStoreFile(t, filepath.Join(dir, s.FileName()))
+	// pve2 comes back with pins that share none of its stored ones. It keeps
+	// its stored pins and its first confirmation, so it stays known and
+	// unloaded, while pve3 is confirmed and the refresh moves an hour on.
+	if !RefreshDue(read(later), later, false) {
+		t.Fatal("no refresh due 25 hours after the first discovery")
+	}
 	d := trustUpdate(t, s, later, trustObservation(trustNode("pve2", 0x55), trustSame("pve3")))
 	if d.Outcome != TrustPinsRefused || d.Log != TrustLogWarn || !reflect.DeepEqual(d.PinsChanged, []string{"pve2"}) {
 		t.Fatalf("pin change past 24 hours: %+v", d)
 	}
-	if after := readStoreFile(t, filepath.Join(dir, s.FileName())); string(after) != string(before) {
-		t.Fatal("a refused pin change rewrote the file")
+	if got := trustNodeNames(read(later)); !reflect.DeepEqual(got, []string{"pve3"}) {
+		t.Fatalf("nodes loaded after the refused pin change %v", got)
+	}
+	raw := trustStoredFile(t, s)
+	if pve2 := trustNodeIn(t, raw, "pve2"); !reflect.DeepEqual(pve2.Pins, []string{payloadPin("a1"), payloadPin("9e")}) ||
+		!pve2.ConfirmedAt.Equal(start) {
+		t.Fatalf("pve2 after the refused pin change %+v", pve2)
+	}
+	if p := read(later); RefreshDue(p, later.Add(59*time.Minute), false) || !RefreshDue(p, later.Add(time.Hour), false) {
+		t.Fatalf("refresh after the refused pin change %+v", p.Discovery)
 	}
 
 	// The same pins confirm both nodes again.
@@ -757,9 +1132,190 @@ func TestStoreTrustOnFirstUseLifecycle(t *testing.T) {
 	if !p.Cluster.IdentityConflict || p.Cluster.RootCASHA256 != payloadPin("3c") || len(p.Discovery.Nodes) != 0 {
 		t.Fatalf("after the conflict: %+v %+v", p.Cluster, p.Discovery)
 	}
+	if !p.Discovery.NextRefreshAfter.Equal(later.Add(MaxRefreshWait)) || RefreshDue(p, later.Add(48*time.Hour), true) {
+		t.Fatalf("refresh after the conflict %+v", p.Discovery)
+	}
 	for _, obs := range []Observation{other, trustObservation(trustSame("pve2"))} {
 		if d := trustUpdate(t, s, later.Add(time.Hour), obs); d.Outcome != TrustConflictStands || d.Log != TrustLogWarn {
 			t.Fatalf("after the conflict: %+v", d)
+		}
+	}
+	// A standing conflict moves only the section's times, and the stored
+	// nodes and pins stay for the operator to inspect.
+	raw = trustStoredFile(t, s)
+	if !raw.Discovery.DiscoveredAt.Equal(later.Add(time.Hour)) ||
+		!reflect.DeepEqual(trustNodeNames(raw), []string{"pve2", "pve3"}) ||
+		!reflect.DeepEqual(nodePins(raw, "pve3"), []string{payloadPin("33")}) {
+		t.Fatalf("the file after the standing conflict %s", trustDump(raw))
+	}
+}
+
+// TestStoreTrustAcceptsAPinSetThatGrows walks a verify_ssl false file whose
+// first discovery pinned pve2 by its /nodes fingerprint alone, because its
+// certificates/info read failed, through the full discoveries that follow.
+// The grown set is accepted, so discovery never wedges and the nodes keep
+// loading.
+func TestStoreTrustAcceptsAPinSetThatGrows(t *testing.T) {
+	s := openStoreFor(t, newStoreDir(t), KeyConfig{
+		Endpoints: []string{mergeSeed, trustSecond}, VerifySSL: false, User: storeTestUser,
+	})
+	if d := trustUpdate(t, s, payloadNow, trustObservation(trustNode("pve2", 0xa1), trustSame("pve3"))); d.Outcome != TrustFirstUse {
+		t.Fatalf("first discovery: %s", d.Outcome)
+	}
+	full := trustObservation(trustSame("pve2"), trustSame("pve3"))
+	for _, after := range []time.Duration{2 * time.Hour, 10 * time.Hour, 26 * time.Hour, 72 * time.Hour} {
+		now := payloadNow.Add(after)
+		d := trustUpdate(t, s, now, full)
+		if d.Outcome != TrustConfirmed || d.Log != TrustLogNone || len(d.PinsChanged) != 0 {
+			t.Fatalf("+%v: %+v", after, d)
+		}
+		p, _, err := s.ReadPayload(now, nil)
+		if err != nil || !reflect.DeepEqual(trustNodeNames(p), []string{"pve2", "pve3"}) ||
+			!reflect.DeepEqual(nodePins(p, "pve2"), []string{payloadPin("a1"), payloadPin("9e")}) {
+			t.Fatalf("+%v: %+v, %v", after, p, err)
+		}
+		if !p.Discovery.NextRefreshAfter.Equal(now.Add(RefreshInterval)) || RefreshDue(p, now, false) {
+			t.Fatalf("+%v: next refresh %v", after, p.Discovery.NextRefreshAfter)
+		}
+	}
+}
+
+// TestStoreTrustRefusalsMoveTheNextRefresh shows that a refused identity and a
+// standing conflict each record an attempt, so the stored refresh time leaves
+// the past, and that the attempt leaves every node and pin as stored.
+func TestStoreTrustRefusalsMoveTheNextRefresh(t *testing.T) {
+	s := openStoreFor(t, newStoreDir(t), KeyConfig{
+		Endpoints: []string{mergeSeed, trustSecond}, VerifySSL: false, User: storeTestUser,
+	})
+	trustUpdate(t, s, payloadNow, trustObservation(trustSame("pve2")))
+	before := trustStoredFile(t, s)
+	other := trustObservation(trustSame("pve2"))
+	other.RootCA = trustPin(0xff)
+	steps := []struct {
+		at      time.Time
+		obs     Observation
+		outcome TrustOutcome
+	}{
+		{payloadNow.Add(2 * time.Hour), other, TrustIdentityRefused},
+		{payloadNow.Add(3 * time.Hour), trustObservation(trustSame("pve2")), TrustConflictStands},
+	}
+	for _, step := range steps {
+		if d := trustUpdate(t, s, step.at, step.obs); d.Outcome != step.outcome {
+			t.Fatalf("%s: %+v", step.outcome, d)
+		}
+		raw := trustStoredFile(t, s)
+		if !raw.Discovery.DiscoveredAt.Equal(step.at) || !raw.Discovery.NextRefreshAfter.Equal(step.at.Add(MaxRefreshWait)) {
+			t.Errorf("%s: discovered %v next %v", step.outcome, raw.Discovery.DiscoveredAt, raw.Discovery.NextRefreshAfter)
+		}
+		if !reflect.DeepEqual(raw.Discovery.Nodes, before.Discovery.Nodes) || raw.Discovery.Outcome != before.Discovery.Outcome ||
+			raw.Cluster.RootCASHA256 != before.Cluster.RootCASHA256 || !raw.Cluster.IdentityConflict {
+			t.Errorf("%s changed more than the times: %s", step.outcome, trustDump(raw))
+		}
+	}
+}
+
+// TestDecideTrustTakesTheStoresClock shows that UpdatePayload hands build its
+// own clock, and that a decision taken at another clock is refused before it
+// reaches the merge, whose checks it would fail or pass at the wrong time.
+func TestDecideTrustTakesTheStoresClock(t *testing.T) {
+	s := openStoreFor(t, newStoreDir(t), KeyConfig{
+		Endpoints: []string{mergeSeed, trustSecond}, VerifySSL: false, User: storeTestUser,
+	})
+	at := payloadNow.Add(17 * time.Second)
+	var seen time.Time
+	if _, err := s.UpdatePayload(context.Background(), at, func(stored Stored) (Change, error) {
+		seen = stored.Now
+		return Change{}, nil
+	}); err != nil || !seen.Equal(at) {
+		t.Fatalf("build saw the clock %v, %v, want %v", seen, err, at)
+	}
+
+	key := trustKey(false)
+	view := trustView(payloadFor(key, "pve2"), key)
+	for _, skew := range []time.Duration{20 * time.Second, time.Minute, -time.Hour} {
+		decision, err := DecideTrust(view, key, trustObservation(trustSame("pve2")), payloadNow.Add(skew))
+		if !errors.Is(err, ErrInvalidChange) || decision.Writes() || decision.Outcome != "" {
+			t.Errorf("skew %v: %+v, %v, want ErrInvalidChange", skew, decision, err)
+		}
+	}
+	decision, err := DecideTrust(view, key, trustObservation(trustSame("pve2")), view.Now)
+	if err != nil || decision.Outcome != TrustConfirmed {
+		t.Fatalf("at the view's clock: %+v, %v", decision, err)
+	}
+}
+
+// TestStoreEmptyChangeKeepsTheTrustRecords shows what an empty change writes.
+// The identity, the discovery section, and the pins stay as stored, and the
+// merge still removes a mark that expired.
+func TestStoreEmptyChangeKeepsTheTrustRecords(t *testing.T) {
+	s := openStoreFor(t, newStoreDir(t), KeyConfig{
+		Endpoints: []string{mergeSeed, trustSecond}, VerifySSL: false, User: storeTestUser,
+	})
+	trustUpdate(t, s, payloadNow, trustObservation(trustSame("pve2")))
+	if _, err := s.UpdatePayload(context.Background(), payloadNow, func(Stored) (Change, error) {
+		return Change{Marks: map[string]DownMark{mergeSeed: {DownAt: payloadNow, Class: MarkDial}}}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := trustStoredFile(t, s)
+	later := payloadNow.Add(5 * time.Minute)
+	if res, err := s.UpdatePayload(context.Background(), later, func(Stored) (Change, error) { return Change{}, nil }); err != nil ||
+		!res.Written {
+		t.Fatalf("UpdatePayload: %+v, %v", res, err)
+	}
+	after := trustStoredFile(t, s)
+	if len(before.Marks) != 1 || len(after.Marks) != 0 {
+		t.Errorf("marks before %v after %v, want the expired mark removed", before.Marks, after.Marks)
+	}
+	if !reflect.DeepEqual(after.Cluster, before.Cluster) || !reflect.DeepEqual(after.Discovery, before.Discovery) {
+		t.Errorf("an empty change moved a trust record:\n got %s\nwant %s", trustDump(after), trustDump(before))
+	}
+}
+
+// TestRefreshDue covers each branch of the refresh predicate.
+func TestRefreshDue(t *testing.T) {
+	key := trustKey(false)
+	section := func(attempt, next time.Time) *Payload {
+		p := payloadFor(key, "pve2")
+		p.Discovery.DiscoveredAt, p.Discovery.NextRefreshAfter = attempt, next
+		return p
+	}
+	conflicted := func(p *Payload) *Payload {
+		p.Cluster.IdentityConflict = true
+		return p
+	}
+	identityOnly := &Payload{Key: key, Cluster: ptr(payloadCluster(payloadNow))}
+	ahead, _, err := Validate(section(payloadNow.Add(time.Hour), payloadNow.Add(2*time.Hour)), key, payloadNow)
+	if err != nil || ahead.Discovery != nil {
+		t.Fatalf("a section dated ahead: %+v, %v", ahead, err)
+	}
+	hourAgo, inAnHour := payloadNow.Add(-time.Hour), payloadNow.Add(time.Hour)
+	floor := payloadNow.Add(-PinRefreshFloor)
+	cases := map[string]struct {
+		p         *Payload
+		pinFailed bool
+		want      bool
+	}{
+		"no file":                                      {nil, false, true},
+		"no file after a pin failure":                  {nil, true, true},
+		"a conflict with the refresh passed":           {conflicted(section(hourAgo.Add(-time.Hour), hourAgo)), false, false},
+		"a conflict after a pin failure":               {conflicted(section(hourAgo, inAnHour)), true, false},
+		"a conflict with no section":                   {conflicted(identityOnly.clone()), true, false},
+		"an identity and no node list":                 {identityOnly, false, true},
+		"a section validation dropped for its time":    {ahead, false, true},
+		"a refresh not yet due":                        {section(payloadNow.Add(-time.Minute), inAnHour), false, false},
+		"a refresh due at this instant":                {section(hourAgo, payloadNow), false, true},
+		"a refresh past due":                           {section(hourAgo.Add(-time.Hour), hourAgo), false, true},
+		"a refresh time validation dropped":            {section(payloadNow.Add(-time.Minute), time.Time{}), false, true},
+		"a pin failure within the floor":               {section(payloadNow.Add(-5*time.Minute), inAnHour), true, false},
+		"a pin failure exactly at the floor":           {section(floor, inAnHour), true, false},
+		"a pin failure past the floor":                 {section(floor.Add(-time.Second), inAnHour), true, true},
+		"an old attempt with no pin failure":           {section(payloadNow.Add(-30*time.Minute), inAnHour), false, false},
+		"a pin failure never holds back a due refresh": {section(payloadNow.Add(-time.Minute), payloadNow.Add(-time.Second)), true, true},
+	}
+	for name, tc := range cases {
+		if got := RefreshDue(tc.p, payloadNow, tc.pinFailed); got != tc.want {
+			t.Errorf("%s: RefreshDue = %v, want %v", name, got, tc.want)
 		}
 	}
 }

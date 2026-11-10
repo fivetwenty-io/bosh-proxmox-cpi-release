@@ -694,3 +694,61 @@ func TestDropFormatsWithoutValues(t *testing.T) {
 		t.Errorf("String() = %q", got)
 	}
 }
+
+// TestValidateLeavesOutANodeThatIsAConfiguredEndpoint shows that a node whose
+// derived address is one of the key's endpoints, in any case, is dropped on
+// read and from a result, and stays a node the file knows. The seed's own node
+// is one such node, under a qualified seed and under a bare-name seed. Under an
+// IP seed a node keeps its bare name and is not a configured endpoint.
+func TestValidateLeavesOutANodeThatIsAConfiguredEndpoint(t *testing.T) {
+	key := payloadTestKey()
+	key.Endpoints = []string{"pve1.dc1.example.com:8006", "pve1b.dc1.example.com:8006"}
+	p := payloadFor(key, "pve1", "pve2", "PVE1B")
+	p.Discovery.Nodes[2].Address = "PVE1B.dc1.example.com"
+	state, drops, err := readStored(p, key, payloadNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Drop{{Record: "node 0", Reason: DropConfiguredEndpoint}, {Record: "node 2", Reason: DropConfiguredEndpoint}}
+	if got := trustNodeNames(state.usable); !reflect.DeepEqual(got, []string{"pve2"}) || !reflect.DeepEqual(drops, want) {
+		t.Errorf("read loads %v with drops %v, want pve2 and %v", got, drops, want)
+	}
+	if len(state.known) != 3 {
+		t.Errorf("known %d nodes, want 3", len(state.known))
+	}
+	if DropConfiguredEndpoint == DropNotConfigured {
+		t.Error("the two drop reasons share a value")
+	}
+
+	result := &DiscoveryResult{Cluster: payloadCluster(payloadNow), Discovery: *p.Discovery.clone()}
+	for i := range result.Discovery.Nodes {
+		result.Discovery.Nodes[i].ConfirmedAt = payloadNow
+	}
+	for _, verify := range []bool{true, false} {
+		key.VerifySSL = verify
+		next, drops, err := Merge(nil, key, Change{Result: result}, payloadNow)
+		if err != nil || !reflect.DeepEqual(trustNodeNames(next), []string{"pve2"}) || !reflect.DeepEqual(drops, want) {
+			t.Errorf("verify_ssl %v: Merge wrote %v with drops %v, %v", verify, trustNodeNames(next), drops, err)
+		}
+	}
+
+	seeds := map[string]struct {
+		seed    string
+		address string
+		reason  DropReason
+	}{
+		"a bare-name seed's own node": {"pve1:8006", "pve1", DropConfiguredEndpoint},
+		"an IP seed's node":           {"10.0.0.1:8006", "pve1", ""},
+	}
+	for name, tc := range seeds {
+		t.Run(name, func(t *testing.T) {
+			other := payloadTestKey()
+			other.Endpoints = []string{tc.seed, "pve1.dc1.example.com:8006"}
+			node := payloadNode("pve1", payloadNow)
+			node.Address = tc.address
+			if got := nodeUse(node, keyDerivation(other), payloadNow); got != tc.reason {
+				t.Errorf("nodeUse = %q, want %q", got, tc.reason)
+			}
+		})
+	}
+}

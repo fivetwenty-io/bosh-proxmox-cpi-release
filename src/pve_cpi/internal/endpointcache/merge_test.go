@@ -1138,3 +1138,192 @@ func TestStoreWritesTheLargestLegalFile(t *testing.T) {
 		t.Errorf("%d nodes and %d marks, want %d and %d", len(got.Discovery.Nodes), len(got.Marks), MaxNodes, len(endpoints)+MaxOtherMarks)
 	}
 }
+
+// TestMergeAcceptsAPinSetThatKeepsEveryStoredPin shows the verify_ssl false
+// pin rule for a known node. A result that keeps every stored pin, with or
+// without more, is accepted, and one that leaves out any stored pin is
+// refused for that node, whether the sets shrink, overlap, or share nothing.
+// Under verify_ssl true each of them replaces the stored set.
+func TestMergeAcceptsAPinSetThatKeepsEveryStoredPin(t *testing.T) {
+	cases := map[string]struct {
+		pins    []string
+		refused bool
+	}{
+		"the same pins":          {[]string{payloadPin("9e"), payloadPin("a1")}, false},
+		"a pin set that grows":   {[]string{payloadPin("a1"), payloadPin("9e"), payloadPin("55")}, false},
+		"a pin set that shrinks": {[]string{payloadPin("a1")}, true},
+		"a partial overlap":      {[]string{payloadPin("a1"), payloadPin("55")}, true},
+		"a disjoint pin set":     {[]string{payloadPin("55"), payloadPin("56")}, true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			for _, verify := range []bool{false, true} {
+				key := mergeKey()
+				key.VerifySSL = verify
+				stored := payloadFor(key, "pve2", "pve3")
+				result := mergeResult("pve2", "pve3")
+				result.Discovery.Nodes[0].Pins = tc.pins
+				next, _, err := Merge(stored, key, Change{Result: result}, payloadNow)
+				var refusal *TrustRefusalError
+				switch {
+				case tc.refused && !verify:
+					if !errors.As(err, &refusal) || !reflect.DeepEqual(refusal.Nodes, []string{"pve2"}) || next != nil {
+						t.Errorf("verify_ssl false: %+v, %v, want a pin refusal for pve2", next, err)
+					}
+				case err != nil:
+					t.Errorf("verify_ssl %v: %v", verify, err)
+				case len(next.Discovery.Nodes[0].Pins) != len(tc.pins):
+					t.Errorf("verify_ssl %v: pins %v, want %v", verify, next.Discovery.Nodes[0].Pins, tc.pins)
+				}
+			}
+		})
+	}
+}
+
+// TestMergeKeepsAKnownNodeWithItsStoredConfirmation shows that under
+// verify_ssl false a result that carries a known node with its stored pins and
+// its stored confirmation keeps that node in the file even when the
+// confirmation is past NodeTTL or ahead, so the node stays known while a reader
+// no longer loads it. Any other node past NodeTTL is dropped from the result.
+// The stored copy of such a node is reported as a read drop either way.
+func TestMergeKeepsAKnownNodeWithItsStoredConfirmation(t *testing.T) {
+	old := payloadNow.Add(-48 * time.Hour)
+	ahead := payloadNow.Add(time.Hour)
+	cases := map[string]struct {
+		verify    bool
+		stored    time.Time
+		confirmed time.Time
+		pins      []string
+		kept      bool
+	}{
+		"stored pins and confirmation past 24 hours": {stored: old, confirmed: old, kept: true},
+		"stored pins and a confirmation ahead":       {stored: ahead, confirmed: ahead, kept: true},
+		"stored pins and another old confirmation":   {stored: old, confirmed: old.Add(time.Hour)},
+		"grown pins and the stored confirmation": {
+			stored: old, confirmed: old, pins: []string{payloadPin("a1"), payloadPin("9e"), payloadPin("55")},
+		},
+		"under verify_ssl true": {verify: true, stored: old, confirmed: old},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			key := mergeKey()
+			key.VerifySSL = tc.verify
+			stored := payloadFor(key, "pve2", "pve3")
+			stored.Discovery.Nodes[0].ConfirmedAt = tc.stored
+			result := mergeResult("pve2", "pve3")
+			result.Discovery.Nodes[0].ConfirmedAt = tc.confirmed
+			if tc.pins != nil {
+				result.Discovery.Nodes[0].Pins = tc.pins
+			}
+			next, drops, err := Merge(stored, key, Change{Result: result}, payloadNow)
+			if err != nil {
+				t.Fatalf("Merge: %v", err)
+			}
+			names := trustNodeNames(next)
+			if tc.kept {
+				if !reflect.DeepEqual(names, []string{"pve2", "pve3"}) || len(drops) != 1 ||
+					!next.Discovery.Nodes[0].ConfirmedAt.Equal(tc.stored) {
+					t.Fatalf("nodes %v drops %v, want pve2 kept with its stored confirmation", names, drops)
+				}
+				state, _ := readState(next, key, payloadNow)
+				if got := trustNodeNames(state.usable); !reflect.DeepEqual(got, []string{"pve3"}) || len(state.known) != 2 {
+					t.Errorf("a reader loads %v and knows %d nodes, want pve3 loaded and both known", got, len(state.known))
+				}
+				return
+			}
+			if !reflect.DeepEqual(names, []string{"pve3"}) || len(drops) != 2 || drops[1].Record != "node 0" {
+				t.Errorf("nodes %v drops %v, want pve2 dropped", names, drops)
+			}
+		})
+	}
+	// A node the file does not know gets no such exemption.
+	result := mergeResult("pve4")
+	result.Discovery.Nodes[0].ConfirmedAt = old
+	next, drops, err := Merge(payloadFor(unverifiedKey(), "pve2"), unverifiedKey(), Change{Result: result}, payloadNow)
+	if err != nil || len(next.Discovery.Nodes) != 0 || !reflect.DeepEqual(drops, []Drop{{Record: "node 0", Reason: DropExpired}}) {
+		t.Errorf("an unknown node past 24 hours: %+v, %v, %v", next, drops, err)
+	}
+}
+
+// TestMergeRecordsAnAttempt shows that an attempt moves the stored discovery
+// section's two times and nothing else, while a conflict stands too, and that
+// the attempt's own rules refuse what they must.
+func TestMergeRecordsAnAttempt(t *testing.T) {
+	key := unverifiedKey()
+	stored := payloadFor(key, "pve2", "pve3")
+	stored.Discovery.Nodes[1].ConfirmedAt = payloadNow.Add(-48 * time.Hour)
+	stored.Discovery.Quorate = false
+	stored.Discovery.Outcome = OutcomeNoStatus
+	stored.Marks = map[string]DownMark{mergeSeed: {DownAt: payloadNow.Add(-10 * time.Second), Class: MarkDial}}
+	attempt := &DiscoveryAttempt{At: payloadNow, NextRefreshAfter: payloadNow.Add(MaxRefreshWait)}
+	moved := func(p *Payload) *Payload {
+		want := p.clone()
+		want.Discovery.DiscoveredAt, want.Discovery.NextRefreshAfter = payloadNow, payloadNow.Add(MaxRefreshWait)
+		return want
+	}
+
+	next, drops, err := Merge(stored, key, Change{Attempt: attempt}, payloadNow)
+	if err != nil || !reflect.DeepEqual(next, moved(stored)) {
+		t.Fatalf("Merge: %v\n got %s\nwant %s", err, trustDump(next), trustDump(moved(stored)))
+	}
+	if !reflect.DeepEqual(drops, []Drop{{Record: "node 1", Reason: DropExpired}}) {
+		t.Errorf("drops %v", drops)
+	}
+
+	// With a conflict, and over a stored conflict.
+	next, _, err = Merge(stored, key, Change{Conflict: true, Attempt: attempt}, payloadNow)
+	want := moved(stored)
+	want.Cluster.IdentityConflict = true
+	if err != nil || !reflect.DeepEqual(next, want) {
+		t.Errorf("with a conflict: %v\n got %s\nwant %s", err, trustDump(next), trustDump(want))
+	}
+	if again, _, err := Merge(next, key, Change{Attempt: attempt}, payloadNow); err != nil || !reflect.DeepEqual(again, want) {
+		t.Errorf("over a stored conflict: %+v, %v", again, err)
+	}
+
+	// A section dated ahead takes the attempt's time.
+	aheadFile := payloadFor(key, "pve2")
+	aheadFile.Discovery.DiscoveredAt = payloadNow.Add(time.Hour)
+	if next, _, err := Merge(aheadFile, key, Change{Attempt: attempt}, payloadNow); err != nil ||
+		!reflect.DeepEqual(next, moved(aheadFile)) {
+		t.Errorf("a section dated ahead: %+v, %v", next, err)
+	}
+
+	// A next refresh further ahead than MaxRefreshWait is dropped, so the
+	// refresh is due at once.
+	far := &DiscoveryAttempt{At: payloadNow, NextRefreshAfter: payloadNow.Add(MaxRefreshWait + time.Minute)}
+	next, drops, err = Merge(payloadFor(key, "pve2"), key, Change{Attempt: far}, payloadNow)
+	if err != nil || !next.Discovery.NextRefreshAfter.IsZero() || !next.Discovery.DiscoveredAt.Equal(payloadNow) ||
+		!reflect.DeepEqual(drops, []Drop{{Record: "next_refresh_after", Reason: DropFuture}}) {
+		t.Errorf("a far next refresh: %+v, %v, %v", next.Discovery, drops, err)
+	}
+
+	// With no stored section there is no refresh time to move.
+	identityOnly := &Payload{Key: key, Cluster: ptr(payloadCluster(payloadNow))}
+	if next, _, err := Merge(identityOnly, key, Change{Attempt: attempt}, payloadNow); err != nil ||
+		!reflect.DeepEqual(next, identityOnly) {
+		t.Errorf("an identity alone: %+v, %v", next, err)
+	}
+	if next, _, err := Merge(nil, key, Change{Attempt: attempt}, payloadNow); err != nil || next != nil {
+		t.Errorf("no file: %+v, %v", next, err)
+	}
+
+	refused := map[string]Change{
+		"with a result":     {Attempt: attempt, Result: mergeResult("pve2")},
+		"with a hint":       {Attempt: attempt, Hint: &ColdStartHint{Name: "pve2", ProbedAt: payloadNow}},
+		"with no time":      {Attempt: &DiscoveryAttempt{NextRefreshAfter: payloadNow.Add(time.Hour)}},
+		"with a time ahead": {Attempt: &DiscoveryAttempt{At: payloadNow.Add(FutureSkew + time.Second)}},
+	}
+	for name, change := range refused {
+		t.Run(name, func(t *testing.T) {
+			if next, _, err := Merge(stored, key, change, payloadNow); !errors.Is(err, ErrInvalidChange) || next != nil {
+				t.Errorf("Merge: %+v, %v, want ErrInvalidChange", next, err)
+			}
+		})
+	}
+	// A time within FutureSkew ahead is accepted as the writer's clock.
+	near := &DiscoveryAttempt{At: payloadNow.Add(FutureSkew), NextRefreshAfter: payloadNow.Add(time.Hour)}
+	if _, _, err := Merge(stored, key, Change{Attempt: near}, payloadNow); err != nil {
+		t.Errorf("an attempt within FutureSkew: %v", err)
+	}
+}
