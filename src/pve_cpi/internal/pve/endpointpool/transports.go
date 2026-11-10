@@ -98,6 +98,8 @@ var errPlaintextRefused = errors.New("owned transport refuses plain http to an e
 //   - errIneligible, a request the pool would not send to a discovered
 //     endpoint that already failed its pin, which that failure already
 //     counted against the endpoint.
+//   - errDropped, a request the pool would not send to a discovered endpoint
+//     that DropDiscovered took out, which blames nothing on the endpoint.
 //
 // Each of those refusals still carries the connect-phase tag, because no byte
 // of the request left the machine, so IsConnectPhase and provesNeverSent treat
@@ -107,7 +109,8 @@ func blamesEndpoint(err error) bool {
 		return false
 	}
 	return !errors.Is(err, ErrSendByPassed) && !errors.Is(err, errWrongAddress) &&
-		!errors.Is(err, errPlaintextRefused) && !errors.Is(err, errIneligible)
+		!errors.Is(err, errPlaintextRefused) && !errors.Is(err, errIneligible) &&
+		!errors.Is(err, errDropped)
 }
 
 // provesNeverSent reports whether err, the final error a request got from an

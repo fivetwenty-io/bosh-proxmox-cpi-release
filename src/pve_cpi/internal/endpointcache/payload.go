@@ -174,6 +174,15 @@ type DiscoverySection struct {
 	// LastFailure is why the last discovery ended without a result, or empty
 	// when the last discovery wrote one. A result clears it.
 	LastFailure DiscoveryFailure `json:"last_failure,omitempty"`
+	// PinFailedAt is when a discovered endpoint last failed its pin, in this
+	// process or another, since the last discovery that wrote a result. The
+	// mark writer sets it whenever it records a pin mark and keeps the newest
+	// time, so a pin failure outlives the two minutes its mark lasts. Only a
+	// result clears it, and an attempt leaves it. RefreshDue counts it as a
+	// pin failure while it is later than DiscoveredAt. It is zero when there
+	// is none, and then the field is left out of the file. It lives in the
+	// discovery section, so a file with no section cannot carry one.
+	PinFailedAt time.Time `json:"pin_failed_at,omitzero"`
 	// Quorate is whether /cluster/status reported quorum, which decides
 	// whether the online flags are trustworthy.
 	Quorate bool `json:"quorate"`

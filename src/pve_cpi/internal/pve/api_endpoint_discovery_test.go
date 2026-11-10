@@ -2,6 +2,7 @@ package pve
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1327,7 +1328,10 @@ func TestDiscoveryWorker_IdentityRefusalDropsThePoolsDiscoveredEndpoints(t *test
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if !errors.Is(err, endpointpool.ErrPinMismatch) || !endpointpool.IsConnectPhase(err) || endpointpool.IsMaybeSent(err) {
-		t.Fatalf("a request to a dropped endpoint should be refused unsent, got %v", err)
+	var certErr *tls.CertificateVerificationError
+	if errors.Is(err, endpointpool.ErrPinMismatch) || !errors.As(err, &certErr) ||
+		!endpointpool.IsConnectPhase(err) || endpointpool.IsMaybeSent(err) ||
+		!strings.Contains(err.Error(), "the cluster identity changed") {
+		t.Fatalf("a request to a dropped endpoint should be refused unsent with the drop's cause, got %v", err)
 	}
 }

@@ -90,6 +90,17 @@ type Change struct {
 	// mark replaces a stored mark for the same endpoint only when it is not
 	// older.
 	Marks map[string]DownMark
+	// PinFailedAt is the time a discovered endpoint failed its pin, which the
+	// writer that records a pin mark sets with it. It sets the stored discovery
+	// section's pin_failed_at to this time when that is later than the one
+	// stored, so the pin failure outlasts the mark, which a reader stops
+	// loading after two minutes. A change that carries a Result ignores it,
+	// because the result clears the stored time. So does a file with no
+	// discovery section, where a pin failure changes nothing because the
+	// refresh is due already, and one a reader hides for being dated ahead of
+	// the clock. A time further ahead of the clock than FutureSkew is ignored,
+	// because a reader would drop it.
+	PinFailedAt time.Time
 	// Pool lists endpoints the writer's pool holds beyond the key's endpoints
 	// and the file's nodes, so their marks survive pruning.
 	Pool []string
@@ -155,6 +166,12 @@ type Stored struct {
 	// leaves it out. The trust rules read this view, because a known node's
 	// pins still bind under verify_ssl false after the pool stops loading it.
 	Known []DiscoveredNode
+	// LastFailure is the last_failure of the stored discovery section as it is
+	// written, whatever the section's time. Usable leaves out a section a
+	// reader hides for being dated ahead of the clock, and this still holds
+	// the failure that section records. It is empty when the file has no
+	// discovery section or the section records none.
+	LastFailure DiscoveryFailure
 	// Now is the clock UpdatePayload was given, which the merge of the
 	// returned change uses and both views were read at. A decision made in
 	// build, such as DecideTrust, takes this time, so the decision and the
@@ -218,7 +235,11 @@ func readState(stored *Payload, key Key, now time.Time) (storedState, []Drop) {
 
 // view returns the build function's copy of the state, read at now.
 func (s storedState) view(now time.Time) Stored {
-	return Stored{Usable: s.usable.clone(), Known: cloneNodes(s.known), Now: now}
+	view := Stored{Usable: s.usable.clone(), Known: cloneNodes(s.known), Now: now}
+	if s.discovery != nil {
+		view.LastFailure = s.discovery.LastFailure
+	}
+	return view
 }
 
 // merge is Merge for a stored state that readStored returned at the same now.
@@ -267,6 +288,9 @@ func merge(state storedState, read []Drop, key Key, change Change, now time.Time
 		}
 	}
 	next.Marks = mergeMarks(next.Marks, change.Marks, now, &drops)
+	if change.Result == nil {
+		notePinFailure(next, change.PinFailedAt, now)
+	}
 	pruneMarks(next, change.Pool)
 	capMarks(next)
 	if err := trimMarksToSize(next); err != nil {
@@ -391,6 +415,9 @@ func applyResult(
 		}
 	}
 	*drops = append(*drops, found...)
+	// A result is a discovery that answered, so it clears the pin failure the
+	// stored section recorded, and the section it writes carries none.
+	section.PinFailedAt = time.Time{}
 	next.Cluster = &cluster
 	next.Discovery = section
 	next.ColdStart = nil
@@ -497,6 +524,27 @@ func mergeMarks(stored, incoming map[string]DownMark, now time.Time, drops *[]Dr
 		}
 	}
 	return out
+}
+
+// notePinFailure sets next's discovery section's pin_failed_at to failedAt
+// when that is later than the one stored. It records nothing when failedAt is
+// zero or further ahead of now than FutureSkew, when there is no section, and
+// when the section is dated ahead of now, which a reader hides and an attempt
+// leaves alone. A stored pin_failed_at that far ahead is one a reader drops,
+// so it does not hold a real failure back.
+func notePinFailure(next *Payload, failedAt, now time.Time) {
+	section := next.Discovery
+	if section == nil || failedAt.IsZero() || failedAt.After(now.Add(FutureSkew)) ||
+		section.DiscoveredAt.After(now.Add(FutureSkew)) {
+		return
+	}
+	stored := section.PinFailedAt
+	if stored.After(now.Add(FutureSkew)) {
+		stored = time.Time{}
+	}
+	if failedAt.After(stored) {
+		section.PinFailedAt = failedAt.UTC()
+	}
 }
 
 // pruneMarks removes the marks of endpoints that are no longer in the pool.
@@ -607,6 +655,17 @@ func payloadSize(p *Payload) (int, error) {
 	return len(data), nil
 }
 
+// sweepUnderLock sweeps the cache directory of the update that holds the key's
+// lock. A directory that Close has closed since the update began is reported
+// in the result, as a sweep failure is, and does not fail the update.
+func (s *Store) sweepUnderLock(now time.Time) SweepResult {
+	root := s.dir()
+	if root == nil {
+		return SweepResult{Err: fmt.Errorf("%s: store is closed", s.label())}
+	}
+	return Sweep(root, now, s.kind.lockName(s.key), s.name)
+}
+
 // ReadPayload reads the store's file and returns the payload a reader may use.
 // It validates the payload against the store's key and drops the hint when the
 // reader's az_map, whose node names are azNodes, does not name its node.
@@ -670,7 +729,7 @@ func (s *Store) UpdatePayload(
 	}
 	written, err := Update(ctx, s, func(current *Payload) (*Payload, error) {
 		result.Locked = true
-		result.Swept = Sweep(s.root, now, s.kind.lockName(s.key), s.name)
+		result.Swept = s.sweepUnderLock(now)
 		state, read := readState(current, s.key, now)
 		change, err := build(state.view(now))
 		if err != nil {

@@ -107,6 +107,14 @@ type StartAway struct {
 var errIneligible = fmt.Errorf("%w: it failed its pin earlier in this call, so the pool skips it until "+
 	"discovery refreshes", ErrPinMismatch)
 
+// errDropped is the cause when the pool refuses, before any dial, to send a
+// request to a discovered endpoint that DropDiscovered took out. Nothing
+// failed a pin, so it does not wrap ErrPinMismatch, and refuseDropped puts it
+// inside the same connect-phase tag and *tls.CertificateVerificationError as
+// errIneligible, so the walk and the SDK treat the two refusals alike.
+var errDropped = errors.New("discovery found that the cluster identity changed, so the pool stopped using its " +
+	"discovered endpoints")
+
 // sortDiscovered puts the discovered endpoints whose node a quorate
 // /cluster/status reported online ahead of the rest, each group in node-name
 // order. Endpoints with the same node name keep the order they came in.
@@ -203,21 +211,23 @@ func (p *Pool) StartedAway() (StartAway, bool) {
 //
 // A dropped endpoint is ineligible, as a discovered endpoint that failed its
 // pin is, so a walk that already read its order refuses the hop before any
-// dial. It is not demoted, marked, or logged, and it makes no refresh due,
-// because nothing failed and discovery itself asked for the drop. When the
-// active endpoint is discovered, the first configured endpoint in walk order
-// becomes active and the generation goes up, so a request in flight on the
-// discovered endpoint cannot make it active again. The idle connections of
-// every dropped endpoint are closed outside the pool's lock. A pool without
-// discovered endpoints, and a second call, change nothing and return zero. It
-// is safe to call concurrently with walks.
+// dial. The refusal names the drop and not a pin failure, because nothing
+// failed its pin, and an endpoint that had already failed its pin keeps its
+// pin refusal. A drop does not demote, mark, or log, and it makes no refresh
+// due, because nothing failed and discovery itself asked for the drop. When
+// the active endpoint is discovered, the first configured endpoint in walk
+// order becomes active and the generation goes up, so a request in flight on
+// the discovered endpoint cannot make it active again. The idle connections
+// of every dropped endpoint are closed outside the pool's lock. A pool
+// without discovered endpoints, and a second call, change nothing and return
+// zero. It is safe to call concurrently with walks.
 func (p *Pool) DropDiscovered() int {
 	now := p.now()
 	p.mu.Lock()
 	var dropped []*endpoint
 	for _, ep := range p.endpoints {
 		if ep.kind == KindDiscovered && !ep.ineligible {
-			ep.ineligible = true
+			ep.ineligible, ep.dropped = true, true
 			dropped = append(dropped, ep)
 		}
 	}
@@ -233,6 +243,19 @@ func (p *Pool) DropDiscovered() int {
 		ep.transports.closeIdle()
 	}
 	return len(dropped)
+}
+
+// refusalFor returns the error for a request the pool will not send to ep,
+// which is ineligible: the drop's refusal when DropDiscovered took ep out, and
+// the pin failure's otherwise.
+func (p *Pool) refusalFor(ep *endpoint) error {
+	p.mu.Lock()
+	dropped := ep.dropped
+	p.mu.Unlock()
+	if dropped {
+		return refuseDropped(ep.addr)
+	}
+	return refuseIneligible(ep.addr)
 }
 
 // ineligibleNow reports whether ep failed its pin in this process.
@@ -276,15 +299,23 @@ func refuseIneligible(addr string) error {
 	return &ConnectPhaseError{Phase: PhasePin, Endpoint: addr, Err: &tls.CertificateVerificationError{Err: errIneligible}}
 }
 
+// refuseDropped returns the error for a request the pool will not send to addr,
+// a discovered endpoint that DropDiscovered took out, before any dial. It has
+// the shape refuseIneligible gives, with errDropped as the cause.
+func refuseDropped(addr string) error {
+	return &ConnectPhaseError{Phase: PhasePin, Endpoint: addr, Err: &tls.CertificateVerificationError{Err: errDropped}}
+}
+
 // ineligibleHop is hop i's result when the walk will not send it to ep, a
-// discovered endpoint that failed its pin after the walk read its order. The
-// request was handed to no transport, so it is proven unsent, it hops as a
-// pin failure does, and it has no effect on ep, which the pin failure already
-// demoted and reported. It does not count toward the hop cap.
-func ineligibleHop(ep *endpoint) hopResult {
+// discovered endpoint that failed its pin or was dropped after the walk read
+// its order. The request was handed to no transport, so it is proven unsent,
+// it hops as a pin failure does, and it has no effect on ep, which the pin
+// failure already demoted and reported, or which the drop left alone. It does
+// not count toward the hop cap.
+func (p *Pool) ineligibleHop(ep *endpoint) hopResult {
 	return hopResult{
 		ep:  ep,
-		err: refuseIneligible(ep.addr),
+		err: p.refusalFor(ep),
 		oc:  outcome{action: actHop, sent: sentNever, unreachable: true, class: string(PhasePin)},
 	}
 }

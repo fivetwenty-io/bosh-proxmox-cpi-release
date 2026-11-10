@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -87,9 +88,15 @@ type StoreOptions struct {
 // the credential and the directory secret, so someone who can write the
 // directory but does not hold the current credential cannot forge a file, and
 // rotating the credential invalidates every file. A Store holds no key
-// material in a printable field. Read, Update, and TryLockDiscovery are safe
-// for concurrent use, and Close must not run alongside them.
+// material in a printable field. Every method is safe for concurrent use,
+// Close included. A call that starts after Close returns a closed-store error,
+// and a call already running when Close lands either finishes or fails with
+// the closed directory's error, never with a data race.
 type Store struct {
+	// rootMu guards root, which Close clears. A method takes one snapshot of
+	// the pointer through dir and uses it for the whole call. It is a pointer
+	// so that a copy of the struct shares the lock instead of copying it.
+	rootMu         *sync.RWMutex
 	root           *os.Root
 	key            Key
 	kind           fileKind
@@ -171,6 +178,7 @@ func openStoreOfKind(
 	policy.IntegrityKey = integrityKey
 	policy.Integrity = hmacIntegrity(macKey)
 	return &Store{
+		rootMu: new(sync.RWMutex),
 		root:   root,
 		key:    key,
 		kind:   kind,
@@ -205,10 +213,26 @@ func checkKeyInputs(cfg KeyConfig, credential string) error {
 // caller's Warn line. Every cache file written under the old secret is now
 // orphaned and costs one discovery to rebuild.
 func (s *Store) SecretReplaced() (path string, replaced bool) {
-	if s == nil || s.root == nil || !s.secretReplaced {
+	if s == nil || !s.secretReplaced {
 		return "", false
 	}
-	return secretPath(s.root), true
+	root := s.dir()
+	if root == nil {
+		return "", false
+	}
+	return secretPath(root), true
+}
+
+// dir returns the store's cache directory, or nil once Close has run. A caller
+// uses the one value it gets for the whole call, so a Close that lands in the
+// middle cannot swap the directory under it.
+func (s *Store) dir() *os.Root {
+	if s.rootMu == nil {
+		return s.root
+	}
+	s.rootMu.RLock()
+	defer s.rootMu.RUnlock()
+	return s.root
 }
 
 // hmacIntegrity returns the envelope integrity function for key: the lowercase
@@ -242,11 +266,15 @@ func (s *Store) texts() *texts {
 // from the merge function it hands to Update, where it holds that lock, which
 // is the cadence the endpoint cache's UpdatePayload sweeps at.
 func (s *Store) Sweep(now time.Time) SweepResult {
-	if s == nil || s.root == nil {
+	var root *os.Root
+	if s != nil {
+		root = s.dir()
+	}
+	if root == nil {
 		return SweepResult{Err: fmt.Errorf("%s: store is closed", s.label())}
 	}
 	keep := []string{s.kind.lockName(s.key), s.kind.discoverLockName(s.key), s.name}
-	return s.texts().sweepWith(s.root, now, keep, ownedByEffectiveUser, s.kind.prefix)
+	return s.texts().sweepWith(root, now, keep, ownedByEffectiveUser, s.kind.prefix)
 }
 
 // Key returns the store's key, which every payload it reads or writes must
@@ -260,14 +288,35 @@ func (s *Store) Key() Key {
 // FileName returns the name of the store's cache file in its directory.
 func (s *Store) FileName() string { return s.name }
 
-// Close closes the cache directory. It is safe to call more than once.
+// Close closes the cache directory. It is safe to call more than once, and
+// safe to call while another goroutine uses the store, as the Store comment
+// describes.
 func (s *Store) Close() error {
-	if s == nil || s.root == nil {
+	if s == nil {
 		return nil
 	}
-	err := s.root.Close()
+	if s.rootMu == nil {
+		return s.closeUnguarded()
+	}
+	s.rootMu.Lock()
+	root := s.root
 	s.root = nil
-	return err
+	s.rootMu.Unlock()
+	if root == nil {
+		return nil
+	}
+	return root.Close()
+}
+
+// closeUnguarded closes a store that was not built by OpenStore, which has no
+// lock to take and so cannot be shared between goroutines.
+func (s *Store) closeUnguarded() error {
+	root := s.root
+	s.root = nil
+	if root == nil {
+		return nil
+	}
+	return root.Close()
 }
 
 // Read reads the store's file and strictly decodes its payload into out, which
@@ -279,13 +328,17 @@ func (s *Store) Close() error {
 // with the wrong owner, mode, type, or link count, or a symlink, returns the
 // private-file refusal, and the caller runs without a cache.
 func (s *Store) Read(out any) error {
-	if s == nil || s.root == nil {
+	var root *os.Root
+	if s != nil {
+		root = s.dir()
+	}
+	if root == nil {
 		return fmt.Errorf("%s: store is closed", s.label())
 	}
 	if v := reflect.ValueOf(out); !v.IsValid() || v.Kind() != reflect.Pointer || v.IsNil() {
 		return fmt.Errorf("%s: read needs a non-nil pointer, got %T", s.label(), out)
 	}
-	env, err := s.policy.ReadEnvelope(s.root, s.name)
+	env, err := s.policy.ReadEnvelope(root, s.name)
 	if err != nil {
 		return err
 	}
@@ -345,7 +398,7 @@ func (s *Store) checkKey(payload json.RawMessage) error {
 // leaves the previous file or none, never a torn one. The caller logs these
 // errors, because the store logs only the skipped write.
 func Update[T any](ctx context.Context, s *Store, merge func(current *T) (*T, error)) (written bool, err error) {
-	if s == nil || s.root == nil {
+	if s == nil || s.dir() == nil {
 		return false, fmt.Errorf("%s: store is closed", s.label())
 	}
 	if merge == nil {
@@ -395,9 +448,13 @@ func Update[T any](ctx context.Context, s *Store, merge func(current *T) (*T, er
 
 // lock takes the key's lock within the store's bounded wait.
 func (s *Store) lock(ctx context.Context) (*privatefile.Lock, error) {
+	root := s.dir()
+	if root == nil {
+		return nil, fmt.Errorf("%s: store is closed", s.label())
+	}
 	waitCtx, cancel := context.WithTimeout(ctx, s.lockWait)
 	defer cancel()
-	lock, err := s.texts().waitHeldLock(waitCtx, s.root, s.kind.lockName(s.key))
+	lock, err := s.texts().waitHeldLock(waitCtx, root, s.kind.lockName(s.key))
 	if err != nil {
 		return nil, s.texts().lockWaitError(ctx, err, s.texts().lockBusy)
 	}
@@ -414,15 +471,23 @@ func (s *Store) lock(ctx context.Context) (*privatefile.Lock, error) {
 // or when ctx ends during the short retry of a lock file being created. The
 // caller closes a held lock when discovery ends.
 func (s *Store) TryLockDiscovery(ctx context.Context) (lock *privatefile.Lock, held bool, err error) {
-	if s == nil || s.root == nil {
+	var root *os.Root
+	if s != nil {
+		root = s.dir()
+	}
+	if root == nil {
 		return nil, false, fmt.Errorf("%s: store is closed", s.label())
 	}
-	return s.texts().tryHeldLock(ctx, s.root, s.kind.discoverLockName(s.key))
+	return s.texts().tryHeldLock(ctx, root, s.kind.discoverLockName(s.key))
 }
 
 // write marshals value, refuses it unless its key is the store's, and replaces
 // the file with it. The caller holds the key's lock.
 func (s *Store) write(value any) error {
+	root := s.dir()
+	if root == nil {
+		return fmt.Errorf("%s: store is closed", s.label())
+	}
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("%s: marshal payload: %w", s.label(), err)
@@ -430,5 +495,5 @@ func (s *Store) write(value any) error {
 	if err := s.checkKey(payload); err != nil {
 		return fmt.Errorf("%s: refusing to write a payload for another key: %w", s.label(), err)
 	}
-	return s.policy.WriteEnvelope(s.root, s.name, s.kind.version, json.RawMessage(payload), s.ops)
+	return s.policy.WriteEnvelope(root, s.name, s.kind.version, json.RawMessage(payload), s.ops)
 }

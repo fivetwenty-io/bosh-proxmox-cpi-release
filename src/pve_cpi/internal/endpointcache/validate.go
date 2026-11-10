@@ -106,8 +106,10 @@ func (d Drop) String() string { return d.Record + " dropped: " + string(d.Reason
 // mark is older than MarkTTL, ahead, or names something that is not an
 // endpoint or a class that is not enumerated, when observed_via names an
 // endpoint outside the key, and when the hint is older than HintTTL or ahead.
-// A discovery whose own time is ahead is dropped whole, and a next-refresh
-// time further ahead than MaxRefreshWait is dropped so the refresh is due now.
+// A discovery whose own time is ahead is dropped whole, a next-refresh time
+// further ahead than MaxRefreshWait is dropped so the refresh is due now, and
+// a pin_failed_at more than FutureSkew ahead is dropped so it counts for
+// nothing. Dropping the field, not the file, keeps the stored identity.
 // When the identity holds a conflict, the identity stays so the refusal stays
 // in force, and every node is dropped.
 //
@@ -277,6 +279,7 @@ func validateDiscovery(
 		NextRefreshAfter: d.NextRefreshAfter.UTC(),
 		Outcome:          d.Outcome,
 		LastFailure:      d.LastFailure,
+		PinFailedAt:      d.PinFailedAt.UTC(),
 		Quorate:          d.Quorate,
 		Nodes:            make([]DiscoveredNode, 0, len(d.Nodes)),
 	}
@@ -313,6 +316,10 @@ func validateDiscovery(
 	if d.NextRefreshAfter.After(now.Add(MaxRefreshWait + FutureSkew)) {
 		out.NextRefreshAfter = time.Time{}
 		drops = append(drops, Drop{Record: "next_refresh_after", Reason: DropFuture})
+	}
+	if d.PinFailedAt.After(now.Add(FutureSkew)) {
+		out.PinFailedAt = time.Time{}
+		drops = append(drops, Drop{Record: "pin_failed_at", Reason: DropFuture})
 	}
 	return out, known, drops, nil
 }

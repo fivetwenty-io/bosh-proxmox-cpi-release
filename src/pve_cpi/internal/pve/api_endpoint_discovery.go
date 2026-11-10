@@ -52,7 +52,13 @@ var errDiscoveryWorkerBound = errors.New("api endpoint discovery: the worker is 
 type DiscoveryWorkerConfig struct {
 	// Store is the open cache store of the key. The worker reads it, takes its
 	// discover lock, and writes through it. The caller keeps owning it and
-	// closes it after the exit drain.
+	// closes it after the exit drain. The drain cancels a worker that is still
+	// running and does not wait for it to return, so the store may be closed
+	// while a cancelled worker is still unwinding. That is safe. The store
+	// guards its directory against Close, a worker that finds its context
+	// cancelled returns before it touches the store, and one that meets the
+	// closed store after the cancel returns without a line, because the drain
+	// reports the cancelled worker.
 	Store *endpointcache.Store
 	// Mode is the configured discovery mode of the cluster config the store
 	// serves, from CPIConfig.DiscoveryModeValue, not the effective mode. It
@@ -76,7 +82,8 @@ type DiscoveryWorkerConfig struct {
 type DiscoveryPool interface {
 	// RefreshDue reports whether a discovered endpoint failed its pin in this
 	// process. A pin failure in another process reaches the worker through
-	// the pin mark in the cache file.
+	// the pin_failed_at time in the cache file's discovery section, which
+	// endpointcache.RefreshDue reads.
 	RefreshDue() bool
 	// DropDiscovered takes every discovered endpoint out of the pool for the
 	// rest of the call.
@@ -238,6 +245,11 @@ func (w *DiscoveryWorker) launch(via string, b DiscoveryBinding) {
 // the discover lock without waiting, checks again under it, because another
 // process may have finished a refresh in between, and then discovers.
 func (w *DiscoveryWorker) refresh(ctx context.Context, via string, b DiscoveryBinding) {
+	// A worker the drain cancelled before it started has nothing to do, and
+	// the caller may be closing the store.
+	if ctx.Err() != nil {
+		return
+	}
 	source, ok := keyEndpoint(w.store.Key(), via)
 	if !ok {
 		w.logger.LogAttrs(ctx, endpointcache.Level(w.mode),
@@ -245,7 +257,7 @@ func (w *DiscoveryWorker) refresh(ctx context.Context, via string, b DiscoveryBi
 			log.String("endpoint", via))
 		return
 	}
-	if _, due := w.due(ctx, b); !due {
+	if !w.due(ctx, b) {
 		return
 	}
 	lock, held, err := w.store.TryLockDiscovery(ctx)
@@ -267,19 +279,23 @@ func (w *DiscoveryWorker) refresh(ctx context.Context, via string, b DiscoveryBi
 			w.logger.LogAttrs(ctx, log.LevelDebug, "api endpoint discovery: release the discover lock", log.Err(err))
 		}
 	}()
-	stored, due := w.due(ctx, b)
-	if !due {
+	if !w.due(ctx, b) {
 		return
 	}
-	w.discover(ctx, source, b, stored)
+	w.discover(ctx, source, b, nil)
 }
 
 // due reads the stored file without a lock and reports whether a refresh is
-// due, with the payload it read, which is nil when the file is missing or
-// fails validation. A file it cannot read for another reason, such as a
-// failed ownership check, makes no refresh due, because the write would fail
-// the same way.
-func (w *DiscoveryWorker) due(ctx context.Context, b DiscoveryBinding) (*endpointcache.Payload, bool) {
+// due. A missing file, or one that fails validation, makes it due. A file it
+// cannot read for another reason, such as a failed ownership check, makes no
+// refresh due, because the write would fail the same way. A read that fails
+// after the context ended, such as one that meets a store the caller closed
+// behind a drain, says nothing, because the drain reports the cancelled
+// worker. A pin failure in another process counts through the file's
+// pin_failed_at, which endpointcache.RefreshDue reads, and through a pin mark
+// the reader still loads, which lives two minutes and so is always younger
+// than the attempt the refresh floor waits for.
+func (w *DiscoveryWorker) due(ctx context.Context, b DiscoveryBinding) bool {
 	now := w.now()
 	stored, _, err := w.store.ReadPayload(now, nil)
 	switch {
@@ -287,32 +303,30 @@ func (w *DiscoveryWorker) due(ctx context.Context, b DiscoveryBinding) (*endpoin
 	case errors.Is(err, fs.ErrNotExist), errors.Is(err, endpointcache.ErrFileInvalid):
 		stored = nil
 	default:
-		w.logger.LogAttrs(ctx, endpointcache.Level(w.mode),
-			"api endpoint discovery: could not read the cache file; skipping the refresh",
-			log.String("file", w.store.FileName()), log.Err(err))
-		return nil, false
+		if ctx.Err() == nil {
+			w.logger.LogAttrs(ctx, endpointcache.Level(w.mode),
+				"api endpoint discovery: could not read the cache file; skipping the refresh",
+				log.String("file", w.store.FileName()), log.Err(err))
+		}
+		return false
 	}
-	pinFailed := pinMarkedSince(stored) || b.Pool.RefreshDue()
-	if !endpointcache.RefreshDue(stored, now, pinFailed) {
+	if !endpointcache.RefreshDue(stored, now, pinMarked(stored) || b.Pool.RefreshDue()) {
 		w.logger.LogAttrs(ctx, log.LevelDebug, "api endpoint discovery: no refresh due",
 			log.String("file", w.store.FileName()))
-		return stored, false
+		return false
 	}
-	return stored, true
+	return true
 }
 
-// pinMarkedSince reports whether the file holds a pin mark written after its
-// last discovery attempt, which is how a pin failure in another process makes
-// a refresh due. Only a discovered endpoint is ever marked for its pin.
-func pinMarkedSince(p *endpointcache.Payload) bool {
+// pinMarked reports whether the file holds a pin mark a reader still loads,
+// which is how a pin failure in another process makes a refresh due while its
+// mark lives. Only a discovered endpoint is ever marked for its pin.
+func pinMarked(p *endpointcache.Payload) bool {
 	if p == nil {
 		return false
 	}
 	for _, mark := range p.Marks {
-		if mark.Class != endpointcache.MarkPin {
-			continue
-		}
-		if p.Discovery == nil || mark.DownAt.After(p.Discovery.DiscoveredAt) {
+		if mark.Class == endpointcache.MarkPin {
 			return true
 		}
 	}
@@ -334,18 +348,16 @@ func keyEndpoint(key endpointcache.Key, addr string) (string, bool) {
 	return "", false
 }
 
-// discover sends the reads, builds the result, and records it. stored is the
-// payload the due check read under the discover lock. Only a refresh changes
-// the stored discovery section, and this process holds the discover lock, so
-// its outcome, identity, and nodes are the ones the update sees.
-func (w *DiscoveryWorker) discover(
-	ctx context.Context, via string, b DiscoveryBinding, stored *endpointcache.Payload,
-) {
+// discover sends the reads, builds the result, and records it. The payload the
+// due check read is not used, because the log lines compare the view the
+// update itself reads under the file lock, which is the only view that cannot
+// change between the comparison and the write.
+func (w *DiscoveryWorker) discover(ctx context.Context, via string, b DiscoveryBinding, _ *endpointcache.Payload) {
 	key := w.store.Key()
 	requests := endpointpool.WithConfiguredOnly(ctx)
 	reads, err := ReadDiscovery(requests, b.Client)
 	if err != nil {
-		w.recordFailure(ctx, via, stored, err)
+		w.recordFailure(ctx, via, err)
 		return
 	}
 	result, err := BuildDiscoveryResult(requests, reads, DiscoveryInput{
@@ -354,7 +366,7 @@ func (w *DiscoveryWorker) discover(
 		Resolver:   w.resolver,
 	})
 	if err != nil {
-		w.recordFailure(ctx, via, stored, err)
+		w.recordFailure(ctx, via, err)
 		return
 	}
 	w.logBuildDrops(ctx, result.Dropped)
@@ -363,7 +375,7 @@ func (w *DiscoveryWorker) discover(
 		w.logDropped(ctx, err)
 		return
 	}
-	w.recordResult(ctx, b, stored, reads, result, obs)
+	w.recordResult(ctx, b, reads, result, obs)
 }
 
 // recordFailure handles a refresh that ended without a result. A refresh the
@@ -373,19 +385,16 @@ func (w *DiscoveryWorker) discover(
 // discoveryFailureWait, even on a file with no discovery yet, so a cluster
 // whose discovery keeps failing is asked once an hour and not on every call.
 // The stored outcome, nodes, and pins stay as they were. The line is Info when
-// the reason differs from the stored last_failure, which is the outcome
-// changing for these failures, and otherwise at the failure level.
-func (w *DiscoveryWorker) recordFailure(
-	ctx context.Context, via string, stored *endpointcache.Payload, cause error,
-) {
-	if ctx.Err() != nil {
-		return
-	}
-	// stored was read under the discover lock, and only a refresh, which
-	// holds that lock, writes last_failure, so it is the failure the update
-	// replaces.
-	failure, prior := discoveryFailure(cause), lastFailure(stored)
+// the reason differs from the last_failure the stored section records, which
+// is the outcome changing for these failures, and otherwise at the failure
+// level. The stored failure is the raw section's, as the update reads it under
+// the file lock, so a section a reader hides because the clock stepped back
+// still counts as the failure it records.
+func (w *DiscoveryWorker) recordFailure(ctx context.Context, via string, cause error) {
+	failure := discoveryFailure(cause)
+	var prior endpointcache.DiscoveryFailure
 	res, err := w.store.UpdatePayload(ctx, w.now(), func(view endpointcache.Stored) (endpointcache.Change, error) {
+		prior = view.LastFailure
 		at := view.Now.UTC()
 		return endpointcache.Change{Attempt: &endpointcache.DiscoveryAttempt{
 			At: at, NextRefreshAfter: at.Add(discoveryFailureWait), Failure: failure,
@@ -408,15 +417,6 @@ func (w *DiscoveryWorker) recordFailure(
 		fmt.Sprintf("api endpoint discovery: no result through %s, because %s; next attempt in %s",
 			via, discoveryFailureReason(cause), waitText(discoveryFailureWait)),
 		log.String("file", w.store.FileName()), log.String("failure", string(failure)), log.Err(cause))
-}
-
-// lastFailure returns the failure the payload's discovery section records, or
-// empty when there is none.
-func lastFailure(p *endpointcache.Payload) endpointcache.DiscoveryFailure {
-	if p == nil || p.Discovery == nil {
-		return ""
-	}
-	return p.Discovery.LastFailure
 }
 
 // discoveryFailure names the failure the cache records for a refresh that
@@ -457,16 +457,62 @@ func discoveryFailureReason(err error) string {
 	return "the discovery reads failed"
 }
 
+// discoverySummary is what the summary line compares, taken from the one view
+// the update reads under the file lock. before and after are the nodes a
+// reader would load from the file at the update's clock, before the write and
+// after it, so a node the file keeps but a reader hides never counts on either
+// side. outcome is the outcome of the section a reader would load before the
+// write, which is empty when there is none, and priorFailure is the stored
+// section's last_failure as written.
+type discoverySummary struct {
+	before, after []endpointcache.DiscoveredNode
+	outcome       endpointcache.DiscoveryOutcome
+	priorFailure  endpointcache.DiscoveryFailure
+}
+
+// summarize reads the summary's two node lists and the prior failure from view,
+// the stored file as the update sees it, and from d, the change the decision
+// builds on it.
+func summarize(view endpointcache.Stored, key endpointcache.Key, d endpointcache.TrustDecision) discoverySummary {
+	sum := discoverySummary{priorFailure: view.LastFailure}
+	if view.Usable != nil && view.Usable.Discovery != nil {
+		sum.before, sum.outcome = view.Usable.Discovery.Nodes, view.Usable.Discovery.Outcome
+	}
+	if d.Change.Result != nil {
+		sum.after = readerNodes(key, d.Change.Result, view.Now)
+	}
+	return sum
+}
+
+// readerNodes returns the nodes of result that a reader would load at now,
+// which are the ones that pass the checks a read applies. A node a
+// verify_ssl false refusal carries with its stored confirmation stays in the
+// file after 24 hours, and a reader hides it, so it is left out here.
+func readerNodes(
+	key endpointcache.Key, result *endpointcache.DiscoveryResult, now time.Time,
+) []endpointcache.DiscoveredNode {
+	cluster, section := result.Cluster, result.Discovery
+	usable, _, err := endpointcache.Validate(
+		&endpointcache.Payload{Key: key, Cluster: &cluster, Discovery: &section}, key, now)
+	if err != nil || usable == nil || usable.Discovery == nil {
+		// The merge applies these checks to the result before it writes it, so
+		// a result the decision built passes them. If one ever did not, the
+		// written list is the best account of what the file holds.
+		return section.Nodes
+	}
+	return usable.Discovery.Nodes
+}
+
 // recordResult applies the trust rules to obs inside the store's locked update
 // and logs what the decision and the write call for.
 func (w *DiscoveryWorker) recordResult(
-	ctx context.Context, b DiscoveryBinding, stored *endpointcache.Payload,
-	reads DiscoveryReads, result DiscoveryResult, obs endpointcache.Observation,
+	ctx context.Context, b DiscoveryBinding, reads DiscoveryReads, result DiscoveryResult, obs endpointcache.Observation,
 ) {
 	key := w.store.Key()
 	var (
 		decision endpointcache.TrustDecision
 		decided  bool
+		sum      discoverySummary
 	)
 	res, err := w.store.UpdatePayload(ctx, w.now(), func(view endpointcache.Stored) (endpointcache.Change, error) {
 		d, err := endpointcache.DecideTrust(view, key, obs, view.Now)
@@ -474,6 +520,7 @@ func (w *DiscoveryWorker) recordResult(
 			return endpointcache.Change{}, err
 		}
 		decision, decided = d, true
+		sum = summarize(view, key, d)
 		if w.beforeWrite != nil {
 			w.beforeWrite(ctx)
 		}
@@ -497,7 +544,7 @@ func (w *DiscoveryWorker) recordResult(
 	}
 	w.logDecision(ctx, decision, key.VerifySSL)
 	if res.Written && decision.Change.Result != nil {
-		w.logDiscovery(ctx, stored, decision, reads, result, key.Endpoints[0])
+		w.logDiscovery(ctx, sum, decision, reads, result, key.Endpoints[0])
 	}
 }
 
@@ -540,17 +587,14 @@ func (w *DiscoveryWorker) logDecision(ctx context.Context, d endpointcache.Trust
 // follows a failed refresh, which the stored last_failure records, changes
 // the outcome too, so the recovery is logged at Info as the failure was.
 // Otherwise a result with a status logs at Debug and every degraded one at the
-// failure level.
+// failure level. The node set and the count are the nodes a reader loads, from
+// sum, so a node the file only keeps never counts or changes the set.
 func (w *DiscoveryWorker) logDiscovery(
-	ctx context.Context, stored *endpointcache.Payload, d endpointcache.TrustDecision,
+	ctx context.Context, sum discoverySummary, d endpointcache.TrustDecision,
 	reads DiscoveryReads, result DiscoveryResult, seed string,
 ) {
 	written := d.Change.Result.Discovery
-	var before endpointcache.DiscoveryOutcome
-	if stored != nil && stored.Discovery != nil {
-		before = stored.Discovery.Outcome
-	}
-	changed := before != written.Outcome || lastFailure(stored) != ""
+	changed := sum.outcome != written.Outcome || sum.priorFailure != ""
 	attrs := []slog.Attr{log.String("file", w.store.FileName()), log.String("outcome", string(written.Outcome))}
 	switch written.Outcome {
 	case endpointcache.OutcomeOK, endpointcache.OutcomeNoStatus:
@@ -558,12 +602,12 @@ func (w *DiscoveryWorker) logDiscovery(
 		if written.Outcome == endpointcache.OutcomeNoStatus {
 			level = endpointcache.Level(w.mode)
 		}
-		if changed || d.StoredRootCA != d.ObservedRootCA || nodeSetChanged(stored, written.Nodes) {
+		if changed || d.StoredRootCA != d.ObservedRootCA || nodeSetChanged(sum.before, sum.after) {
 			level = log.LevelInfo
 		}
 		w.logger.LogAttrs(ctx, level,
 			fmt.Sprintf("api endpoint discovery: cached %d of %d nodes of cluster %s via %s (%s)",
-				len(written.Nodes), len(reads.Nodes), shortID(d.ObservedRootCA), d.Via, statusText(reads.Status)),
+				len(sum.after), len(reads.Nodes), shortID(d.ObservedRootCA), d.Via, statusText(reads.Status)),
 			attrs...)
 	default:
 		level := endpointcache.Level(w.mode)
@@ -608,24 +652,22 @@ func degradedText(
 		len(reads.Nodes), shortID(d.ObservedRootCA), d.Via)
 }
 
-// nodeSetChanged reports whether the written nodes differ, by name and
-// address, from the nodes the file held before.
-func nodeSetChanged(stored *endpointcache.Payload, written []endpointcache.DiscoveredNode) bool {
-	var before []endpointcache.DiscoveredNode
-	if stored != nil && stored.Discovery != nil {
-		before = stored.Discovery.Nodes
-	}
-	return !slices.Equal(nodeSet(before), nodeSet(written))
+// nodeSetChanged reports whether the nodes a reader loads after the write
+// differ, by name, from those it loaded before. A node's address is a function
+// of its name under the key's seed, which the file's key fixes, so the name
+// says everything the address would.
+func nodeSetChanged(before, after []endpointcache.DiscoveredNode) bool {
+	return !slices.Equal(cachedNodeNameSet(before), cachedNodeNameSet(after))
 }
 
-// nodeSet returns each node as its lowercase name and its address, sorted.
-func nodeSet(nodes []endpointcache.DiscoveredNode) []string {
-	set := make([]string, 0, len(nodes))
+// cachedNodeNameSet returns the lowercase names of nodes, sorted.
+func cachedNodeNameSet(nodes []endpointcache.DiscoveredNode) []string {
+	names := make([]string, 0, len(nodes))
 	for _, node := range nodes {
-		set = append(set, strings.ToLower(node.Name)+" "+net.JoinHostPort(node.Address, strconv.Itoa(node.Port)))
+		names = append(names, strings.ToLower(node.Name))
 	}
-	slices.Sort(set)
-	return set
+	slices.Sort(names)
+	return names
 }
 
 // statusText describes the cluster status a result was ordered by.

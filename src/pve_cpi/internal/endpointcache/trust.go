@@ -28,7 +28,9 @@ const PinRefreshFloor = 10 * time.Minute
 
 // RefreshDue reports whether a discovery refresh is due for p, the payload
 // ReadPayload returned, at now. pinFailed is whether a discovered endpoint
-// failed its pin in this or another process since the last discovery.
+// failed its pin in this process since the last discovery. A pin failure in
+// another process reaches RefreshDue through the section's pin_failed_at,
+// which counts while it is later than the section's discovered_at.
 //
 // It is false while the stored identity holds a conflict, because discovery
 // stops until the operator deletes the file. Otherwise it is true when the
@@ -36,7 +38,9 @@ const PinRefreshFloor = 10 * time.Minute
 // validation dropped for its time, and when next_refresh_after has passed,
 // which includes one that validation dropped for being too far ahead. A
 // section that holds only a failed attempt, with no nodes and no outcome,
-// waits for its next_refresh_after as any other section does. A pin
+// waits for its next_refresh_after as any other section does. A failed
+// attempt moves discovered_at past a pin_failed_at it left in place, so it
+// spends the pin failure and the refresh waits out the hour. A pin
 // failure makes a refresh due early only when the last attempt, which is the
 // section's discovered_at, is more than PinRefreshFloor old. It never holds
 // back a refresh that is already due, and it counts for nothing when the
@@ -52,6 +56,7 @@ func RefreshDue(p *Payload, now time.Time, pinFailed bool) bool {
 	if !now.Before(p.Discovery.NextRefreshAfter) {
 		return true
 	}
+	pinFailed = pinFailed || p.Discovery.PinFailedAt.After(p.Discovery.DiscoveredAt)
 	return pinFailed && len(p.Discovery.Nodes) > 0 && now.Sub(p.Discovery.DiscoveredAt) > PinRefreshFloor
 }
 

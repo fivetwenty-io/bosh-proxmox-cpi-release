@@ -213,7 +213,7 @@ func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCl
 		closeSendBody(req, body)
 		oc := unsent
 		oc.class = string(PhasePin)
-		return nil, oc, refuseIneligible(addr)
+		return nil, oc, p.refusalFor(ep)
 	}
 	o, err := p.routedTransportsAt(addr, (&url.URL{Host: target.urlHost}).Hostname())
 	if err != nil {
@@ -482,7 +482,7 @@ func (w *walker) try(i int, ep *endpoint, body io.ReadCloser) hopResult {
 	eligible, left := w.p.eligibleFrom(ep, w.order[i:])
 	if !eligible {
 		closeSendBody(w.req, body)
-		return ineligibleHop(ep)
+		return w.p.ineligibleHop(ep)
 	}
 	ctx := w.req.Context()
 	meter := newConnectMeter(w.bounds.now)

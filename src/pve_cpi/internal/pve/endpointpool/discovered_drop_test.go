@@ -2,10 +2,12 @@ package endpointpool
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -75,8 +77,13 @@ func TestDropDiscoveredTakesEveryDiscoveredEndpointOut(t *testing.T) {
 	}
 	resp, err = send(t, context.Background(), p, http.MethodGet, d2.Addr, "/version", "")
 	closeBody(resp)
-	if !errors.Is(err, errIneligible) || !IsConnectPhase(err) || IsMaybeSent(err) {
+	if !errors.Is(err, errDropped) || errors.Is(err, errIneligible) || errors.Is(err, ErrPinMismatch) ||
+		!IsConnectPhase(err) || IsMaybeSent(err) {
 		t.Fatalf("a routed request to a dropped endpoint should be refused unsent, got %v", err)
+	}
+	var certErr *tls.CertificateVerificationError
+	if !errors.As(err, &certErr) || !strings.Contains(err.Error(), "the cluster identity changed") {
+		t.Fatalf("the drop's refusal should be a certificate error that names the identity change, got %v", err)
 	}
 	if n := d1.Counts.Conns.Load(); n != conns {
 		t.Fatalf("the dropped endpoint got %d more connections", n-conns)

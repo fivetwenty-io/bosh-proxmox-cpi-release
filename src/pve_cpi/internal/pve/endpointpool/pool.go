@@ -106,7 +106,7 @@ type Config struct {
 }
 
 // endpoint is one endpoint of a pool. Everything but demoted, ineligible,
-// marked, and lastMarkAt is fixed at construction.
+// dropped, marked, and lastMarkAt is fixed at construction.
 type endpoint struct {
 	// addr is the canonical host:port, the key every comparison uses.
 	addr string
@@ -125,8 +125,12 @@ type endpoint struct {
 	// demoted is guarded by Pool.mu.
 	demoted bool
 	// ineligible says a discovered endpoint failed its pin in this process,
-	// so no request is sent to it again. It is guarded by Pool.mu.
+	// or that DropDiscovered took it out, so no request is sent to it again.
+	// It is guarded by Pool.mu.
 	ineligible bool
+	// dropped says DropDiscovered took the endpoint out, as opposed to a pin
+	// failure, so a refused request says so. It is guarded by Pool.mu.
+	dropped bool
 	// marked says the endpoint has had its mark for this process, which is
 	// its first connect-phase failure or its pin failure, and lastMarkAt is
 	// the time that last mark records. Both are guarded by Pool.mu.
