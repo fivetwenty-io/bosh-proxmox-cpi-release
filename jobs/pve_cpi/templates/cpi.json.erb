@@ -130,11 +130,13 @@
     config[json_key] = v unless v == 0
   end
 
-  # Emit password / api_token only when non-empty. The Go config validator
-  # rejects "both set" or "neither set" — this template never strips a value
-  # the operator supplied. If both p() calls return non-empty, both keys
-  # land in the JSON and Validate() will reject the result with a clear
-  # error at CPI start-up rather than silently picking one.
+  # Emit password / api_token only when non-empty. This template never strips
+  # a value the operator supplied. When both are non-empty, both keys land in
+  # the JSON and the CPI's ApplyDefaults keeps the api_token and clears the
+  # password, so a kit that renders a placeholder password beside a real token
+  # still loads. A config with neither fails Validate() at CPI start-up. The
+  # discovery check below applies the same rule: a non-empty pve.api_token
+  # means token auth, whatever pve.password holds.
   pve_password  = p("pve.password",  "")
   pve_api_token = p("pve.api_token", "")
   config["password"]  = pve_password  unless pve_password.to_s.empty?
@@ -702,6 +704,79 @@
   # then distinguishes "unset" (preserve the legacy verify_ssl-derived
   # default) from an explicit true/false override.
   if_p("pve.node_endpoints_discovery") { |v| config["node_endpoints_discovery"] = v }
+
+  # API endpoint discovery mode. It has no spec default, so if_p fires only when
+  # the operator sets it and an untouched manifest renders the same cpi.json as
+  # before. YAML 1.1 reads a bare on or off as a boolean, so the booleans map
+  # back to the mode names. Only the lowercase names auto, on, and off pass,
+  # and an empty string is refused, as the CPI's config refuses it. The raise
+  # texts match the config's messages. A non-empty pve.api_token means token
+  # auth even when pve.password is also set, because the CPI keeps the token and
+  # clears the password, so only a password with no token trips the check for
+  # on with verify_ssl false. A verify_ssl of exactly false counts as unverified;
+  # an absent value is the spec default, true.
+  if_p("pve.api_endpoint_discovery") do |v|
+    next if v.nil?
+    mode = case v
+           when true then "on"
+           when false then "off"
+           when String then v
+           else
+             echo = JSON.dump(v)
+             if echo.bytesize > 64
+               echo = echo.byteslice(0, 64)
+               echo = echo.byteslice(0, echo.bytesize - 1) until echo.valid_encoding?
+               echo += "..."
+             end
+             raise "api_endpoint_discovery: expected a string or a boolean, got #{echo}"
+           end
+    unless %w[auto on off].include?(mode)
+      raise "api_endpoint_discovery must be auto, on, or off, got #{mode.inspect}"
+    end
+    if mode == "on" && pve_api_token.to_s.empty? && !pve_password.to_s.empty? && p("pve.verify_ssl", true) == false
+      raise "api_endpoint_discovery \"on\" cannot be used with password auth while verify_ssl is false; " \
+            "use an API token (pve.api_token) or turn on verification (pve.verify_ssl: true)"
+    end
+    config["api_endpoint_discovery"] = mode
+  end
+
+  # Directory for the endpoint cache files. Omitted when unset or empty, so the
+  # CPI picks its default. The rules and the raise texts match the CPI's config
+  # validation: an absolute, clean path with no control characters and no
+  # surrounding whitespace, not the root directory, and neither equal to nor
+  # inside pve.storage_allocation_journal_dir, which the journal scans as its
+  # own tree. The comparison is textual, as the config's is.
+  if_p("pve.endpoint_cache_dir") do |dir|
+    next if dir.nil?
+    raise "pve.endpoint_cache_dir must be a string" unless dir.is_a?(String)
+    next if dir.empty?
+    raise "endpoint_cache_dir must not contain control characters" if dir.match?(/\p{Cc}/)
+    raise "endpoint_cache_dir must be an absolute path, got #{dir.inspect}" unless dir.start_with?("/")
+    if dir.match?(/\A[[:space:]]|[[:space:]]\z/)
+      raise "endpoint_cache_dir must not have leading or trailing whitespace, got #{dir.inspect}"
+    end
+    clean = File.expand_path(dir.squeeze("/"), "/")
+    if clean != dir
+      raise "endpoint_cache_dir must be a clean path, write #{clean.inspect} instead of #{dir.inspect}"
+    end
+    raise "endpoint_cache_dir must not be the root directory; choose a dedicated directory" if clean == "/"
+    journal = p("pve.storage_allocation_journal_dir", "")
+    if journal.is_a?(String) && !journal.empty?
+      if journal.match?(/\A[[:space:]]|[[:space:]]\z/)
+        raise "storage_allocation_journal_dir must not have leading or trailing whitespace " \
+              "when endpoint_cache_dir is set, got #{journal.inspect}"
+      end
+      if journal.start_with?("/")
+        journal_clean = File.expand_path(journal.squeeze("/"), "/")
+        prefix = journal_clean == "/" ? "/" : "#{journal_clean}/"
+        if clean == journal_clean || clean.start_with?(prefix)
+          raise "endpoint_cache_dir #{dir.inspect} must not equal or sit inside " \
+                "storage_allocation_journal_dir #{journal.inspect}; choose a directory outside the journal"
+        end
+      end
+    end
+    config["endpoint_cache_dir"] = dir
+  end
 
   # Emit the retry block only when the operator overrides at least one curve.
   # Each sub-policy and field is omit-when-zero so an untouched curve keeps the

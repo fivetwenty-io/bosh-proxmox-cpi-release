@@ -707,6 +707,137 @@ if [ "$SPEC_ENDPOINTS" != "ok" ]; then
   FAILED=$((FAILED+1))
 fi
 
+# --- Case 15: pve.api_endpoint_discovery and pve.endpoint_cache_dir ------------
+# Neither property has a spec default, so an untouched manifest renders neither
+# key. The mode accepts only the lowercase names and the two booleans that YAML
+# 1.1 makes of a bare on or off, and every refusal uses the CPI config's text.
+# The base manifest is password auth with verify_ssl true.
+echo "Case 15: pve.api_endpoint_discovery and pve.endpoint_cache_dir"
+assert_json_lacks_key "case15-unset" "$JSON_1" api_endpoint_discovery || FAILED=$((FAILED+1))
+assert_json_lacks_key "case15-unset" "$JSON_1" endpoint_cache_dir     || FAILED=$((FAILED+1))
+
+# A property set to nil is unset, as it is in a BOSH manifest.
+JSON_15N="$(render "$(props_with_pve '{"api_endpoint_discovery":null,"endpoint_cache_dir":null}')")"
+assert_json_lacks_key "case15-null" "$JSON_15N" api_endpoint_discovery || FAILED=$((FAILED+1))
+assert_json_lacks_key "case15-null" "$JSON_15N" endpoint_cache_dir     || FAILED=$((FAILED+1))
+
+# Each mode as a string, and the booleans mapped back to the mode names.
+for pair in 'auto:auto' 'on:on' 'off:off'; do
+  mode="${pair%%:*}"
+  JSON_15M="$(render "$(props_with_pve "{\"api_endpoint_discovery\":\"${mode}\"}")")"
+  assert_json_valid      "case15-${mode}" "$JSON_15M"                           || FAILED=$((FAILED+1))
+  assert_json_key_equals "case15-${mode}" "$JSON_15M" api_endpoint_discovery "$mode" || FAILED=$((FAILED+1))
+done
+JSON_15T="$(render "$(props_with_pve '{"api_endpoint_discovery":true}')")"
+assert_json_value "case15-true" "$JSON_15T" api_endpoint_discovery '"on"'
+JSON_15F="$(render "$(props_with_pve '{"api_endpoint_discovery":false}')")"
+assert_json_value "case15-false" "$JSON_15F" api_endpoint_discovery '"off"'
+
+# Anything else is refused with the config's message: wrong case, padding, the
+# string forms of the booleans, and an empty string.
+for bad in 'ON' 'On' ' on' 'on ' 'true' 'false' 'yes' 'enabled' ''; do
+  assert_pve_render_raises "case15-bad-[${bad}]" "{\"api_endpoint_discovery\":\"${bad}\"}" \
+    "api_endpoint_discovery must be auto, on, or off, got \"${bad}\""
+done
+
+# A value that is neither a string nor a boolean is refused, and the echo of it
+# is cut at 64 bytes.
+assert_pve_render_raises "case15-int" '{"api_endpoint_discovery":1}' \
+  "api_endpoint_discovery: expected a string or a boolean, got 1"
+assert_pve_render_raises "case15-list" '{"api_endpoint_discovery":["on"]}' \
+  'api_endpoint_discovery: expected a string or a boolean, got ["on"]'
+LONG_15="$(printf 'x%.0s' $(seq 1 100))"
+assert_pve_render_raises "case15-long" "{\"api_endpoint_discovery\":[\"${LONG_15}\"]}" \
+  "got [\"$(printf 'x%.0s' $(seq 1 62))..."
+
+# on with password auth and verify_ssl false is refused, whether it is written
+# as the string or as a bare boolean. The base manifest holds a password and no
+# token.
+PW_NOVERIFY_ERR='api_endpoint_discovery "on" cannot be used with password auth while verify_ssl is false; use an API token (pve.api_token) or turn on verification (pve.verify_ssl: true)'
+assert_pve_render_raises "case15-pw-noverify" '{"verify_ssl":false,"api_endpoint_discovery":"on"}' "$PW_NOVERIFY_ERR"
+assert_pve_render_raises "case15-pw-noverify-bool" '{"verify_ssl":false,"api_endpoint_discovery":true}' "$PW_NOVERIFY_ERR"
+
+# The other modes and the verified case still render under the same auth.
+for mode in auto off; do
+  JSON_15P="$(render "$(props_with_pve "{\"verify_ssl\":false,\"api_endpoint_discovery\":\"${mode}\"}")")"
+  assert_json_key_equals "case15-pw-noverify-${mode}" "$JSON_15P" api_endpoint_discovery "$mode" || FAILED=$((FAILED+1))
+done
+JSON_15V="$(render "$(props_with_pve '{"verify_ssl":true,"api_endpoint_discovery":"on"}')")"
+assert_json_key_equals "case15-pw-verify" "$JSON_15V" api_endpoint_discovery on || FAILED=$((FAILED+1))
+
+# A configured token wins over a password, as the CPI decides, so on renders
+# with verify_ssl false whether the password is a placeholder beside the token
+# or empty.
+JSON_15K="$(render "$(props_with_pve '{"api_token":"root@pam!cpi=abc-123","verify_ssl":false,"api_endpoint_discovery":"on"}')")"
+assert_json_valid      "case15-token-wins" "$JSON_15K"                          || FAILED=$((FAILED+1))
+assert_json_key_equals "case15-token-wins" "$JSON_15K" api_endpoint_discovery on || FAILED=$((FAILED+1))
+JSON_15K2="$(render "$(props_with_pve '{"password":"","api_token":"root@pam!cpi=abc-123","verify_ssl":false,"api_endpoint_discovery":true}')")"
+assert_json_key_equals "case15-token-only" "$JSON_15K2" api_endpoint_discovery on || FAILED=$((FAILED+1))
+
+# The cache directory renders as written when it passes, and an empty string
+# leaves it out.
+JSON_15D="$(render "$(props_with_pve '{"endpoint_cache_dir":"/var/vcap/store/pve_cpi/endpoint-cache"}')")"
+assert_json_key_equals "case15-dir" "$JSON_15D" endpoint_cache_dir /var/vcap/store/pve_cpi/endpoint-cache || FAILED=$((FAILED+1))
+JSON_15DE="$(render "$(props_with_pve '{"endpoint_cache_dir":""}')")"
+assert_json_valid     "case15-dir-empty" "$JSON_15DE"                    || FAILED=$((FAILED+1))
+assert_json_lacks_key "case15-dir-empty" "$JSON_15DE" endpoint_cache_dir || FAILED=$((FAILED+1))
+
+# Each refusal uses the config's text.
+assert_pve_render_raises "case15-dir-relative" '{"endpoint_cache_dir":"cache/dir"}' \
+  'endpoint_cache_dir must be an absolute path, got "cache/dir"'
+assert_pve_render_raises "case15-dir-leading-space" '{"endpoint_cache_dir":" /cache"}' \
+  'endpoint_cache_dir must be an absolute path, got " /cache"'
+assert_pve_render_raises "case15-dir-trailing-space" '{"endpoint_cache_dir":"/cache "}' \
+  'endpoint_cache_dir must not have leading or trailing whitespace, got "/cache "'
+assert_pve_render_raises "case15-dir-control" '{"endpoint_cache_dir":"/ca\u0009che"}' \
+  "endpoint_cache_dir must not contain control characters"
+assert_pve_render_raises "case15-dir-dotdot" '{"endpoint_cache_dir":"/a/../b"}' \
+  'endpoint_cache_dir must be a clean path, write "/b" instead of "/a/../b"'
+assert_pve_render_raises "case15-dir-trailing-slash" '{"endpoint_cache_dir":"/a/b/"}' \
+  'endpoint_cache_dir must be a clean path, write "/a/b" instead of "/a/b/"'
+assert_pve_render_raises "case15-dir-double-slash" '{"endpoint_cache_dir":"//a"}' \
+  'endpoint_cache_dir must be a clean path, write "/a" instead of "//a"'
+assert_pve_render_raises "case15-dir-root" '{"endpoint_cache_dir":"/"}' \
+  "endpoint_cache_dir must not be the root directory; choose a dedicated directory"
+assert_pve_render_raises "case15-dir-nonstring" '{"endpoint_cache_dir":5}' \
+  "pve.endpoint_cache_dir must be a string"
+
+# The cache directory may not equal or sit inside the journal directory, by
+# whole path elements, and a sibling or a parent of the journal is allowed.
+JOURNAL_ERR_TAIL='; choose a directory outside the journal'
+assert_pve_render_raises "case15-dir-equals-journal" \
+  '{"storage_allocation_journal_dir":"/var/j","endpoint_cache_dir":"/var/j"}' \
+  'endpoint_cache_dir "/var/j" must not equal or sit inside storage_allocation_journal_dir "/var/j"'"$JOURNAL_ERR_TAIL"
+assert_pve_render_raises "case15-dir-inside-journal" \
+  '{"storage_allocation_journal_dir":"/var/j","endpoint_cache_dir":"/var/j/cache"}' \
+  'endpoint_cache_dir "/var/j/cache" must not equal or sit inside storage_allocation_journal_dir "/var/j"'"$JOURNAL_ERR_TAIL"
+assert_pve_render_raises "case15-dir-inside-unclean-journal" \
+  '{"storage_allocation_journal_dir":"/var//j/","endpoint_cache_dir":"/var/j/cache"}' \
+  'must not equal or sit inside storage_allocation_journal_dir "/var//j/"'
+assert_pve_render_raises "case15-dir-inside-root-journal" \
+  '{"storage_allocation_journal_dir":"/","endpoint_cache_dir":"/cache"}' \
+  'must not equal or sit inside storage_allocation_journal_dir "/"'
+assert_pve_render_raises "case15-journal-whitespace" \
+  '{"storage_allocation_journal_dir":"/var/j ","endpoint_cache_dir":"/var/j/cache"}' \
+  'storage_allocation_journal_dir must not have leading or trailing whitespace when endpoint_cache_dir is set, got "/var/j "'
+for pair in '/var/j:/var/jx' '/var/j:/var/cache' '/var/j/sub:/var/j' '/var/j:/other/j/cache' 'relative/j:/var/j'; do
+  journal="${pair%%:*}"; dir="${pair#*:}"
+  JSON_15J="$(render "$(props_with_pve "{\"storage_allocation_journal_dir\":\"${journal}\",\"endpoint_cache_dir\":\"${dir}\"}")")"
+  assert_json_key_equals "case15-journal-ok-${journal}-${dir}" "$JSON_15J" endpoint_cache_dir "$dir" || FAILED=$((FAILED+1))
+done
+
+# Both properties are in the job spec with no default, and neither is on the
+# retired list that the removed-keys guard holds.
+SPEC_DISCOVERY="$(ruby -ryaml -e '
+  props = YAML.load_file(ARGV[0]).fetch("properties")
+  ok = %w[pve.api_endpoint_discovery pve.endpoint_cache_dir].all? { |k| props.key?(k) && !props[k].key?("default") }
+  print(ok ? "ok" : "bad")
+' "${REPO_ROOT}/jobs/pve_cpi/spec")"
+if [ "$SPEC_DISCOVERY" != "ok" ]; then
+  echo "FAIL [case15-spec]: a discovery property is missing from the job spec or carries a default" >&2
+  FAILED=$((FAILED+1))
+fi
+
 if [ "$FAILED" -ne 0 ]; then
   echo "RESULT: ${FAILED} assertion(s) FAILED" >&2
   exit 1
