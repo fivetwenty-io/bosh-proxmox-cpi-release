@@ -242,3 +242,69 @@ func TestMergeAttemptReplacesALaterStoredRefreshTime(t *testing.T) {
 		t.Errorf("next_refresh_after %v, want the attempt's %v", next.Discovery.NextRefreshAfter, want)
 	}
 }
+
+// A writer whose clock runs ahead can store a pin_failed_at that a reader on
+// the true clock drops. The next write clears it, so it cannot wake up later
+// as a failure that a failed attempt in between already answered.
+func TestMergeClearsAPinFailureAheadOfTheWritersClock(t *testing.T) {
+	key := mergeKey()
+	ahead := payloadNow.Add(time.Hour)
+	attemptAt := payloadNow.Add(11 * time.Minute)
+	attempt := &DiscoveryAttempt{
+		At: attemptAt, NextRefreshAfter: attemptAt.Add(RefreshInterval), Failure: FailureReadsFailed,
+	}
+	t.Run("an attempt clears it and no extra refresh follows", func(t *testing.T) {
+		next, _, err := Merge(pinFailedStored(ahead), key, Change{Attempt: attempt}, attemptAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !next.Discovery.PinFailedAt.IsZero() {
+			t.Fatalf("pin_failed_at %v survived the write", next.Discovery.PinFailedAt)
+		}
+		for _, off := range []time.Duration{30 * time.Minute, 61 * time.Minute} {
+			now := payloadNow.Add(off)
+			usable, _, err := Validate(next, key, now)
+			if err != nil || usable == nil || usable.Discovery == nil {
+				t.Fatalf("Validate at +%v: %+v, %v", off, usable, err)
+			}
+			if RefreshDue(usable, now, false) {
+				t.Errorf("a refresh is due at +%v although the attempt answered the failure", off)
+			}
+		}
+	})
+	t.Run("a change with only a mark clears it", func(t *testing.T) {
+		next := mustMerge(t, pinFailedStored(ahead), Change{
+			Marks: map[string]DownMark{mergeSeed: {DownAt: payloadNow, Class: MarkDial}},
+		})
+		if !next.Discovery.PinFailedAt.IsZero() {
+			t.Errorf("pin_failed_at %v survived the write", next.Discovery.PinFailedAt)
+		}
+	})
+	t.Run("a time inside the skew stays", func(t *testing.T) {
+		inside := payloadNow.Add(FutureSkew)
+		next := mustMerge(t, pinFailedStored(inside), Change{
+			Marks: map[string]DownMark{mergeSeed: {DownAt: payloadNow, Class: MarkDial}},
+		})
+		if !next.Discovery.PinFailedAt.Equal(inside) {
+			t.Errorf("pin_failed_at %v, want the stored %v", next.Discovery.PinFailedAt, inside)
+		}
+	})
+	t.Run("a section dated ahead is hidden and stays as it is", func(t *testing.T) {
+		stored := pinFailedStored(ahead)
+		stored.Discovery.DiscoveredAt = payloadNow.Add(30 * time.Minute)
+		stored.Discovery.NextRefreshAfter = payloadNow.Add(90 * time.Minute)
+		next := mustMerge(t, stored, Change{
+			Marks: map[string]DownMark{mergeSeed: {DownAt: payloadNow, Class: MarkDial}},
+		})
+		if !next.Discovery.PinFailedAt.Equal(ahead) {
+			t.Errorf("pin_failed_at %v, want the hidden section's %v", next.Discovery.PinFailedAt, ahead)
+		}
+	})
+	t.Run("a real failure is recorded in its place", func(t *testing.T) {
+		failed := payloadNow.Add(-time.Minute)
+		next := mustMerge(t, pinFailedStored(ahead), Change{PinFailedAt: failed})
+		if !next.Discovery.PinFailedAt.Equal(failed) {
+			t.Errorf("pin_failed_at %v, want %v", next.Discovery.PinFailedAt, failed)
+		}
+	})
+}

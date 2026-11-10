@@ -755,9 +755,8 @@ func TestDiscoveryWorker_StandingConflictRecordsAnAttemptAndLogsNothing(t *testi
 	e.clock.advance(endpointcache.RefreshInterval)
 	e.run()
 	e.clock.advance(3 * time.Hour)
-	stored := e.payload()
 	e.begin()
-	e.newWorker().discover(context.Background(), workerSeed, e.binding(), stored)
+	e.newWorker().discover(context.Background(), workerSeed, e.binding())
 	e.noLineAt(log.LevelInfo)
 	p := e.payload()
 	if !p.Cluster.IdentityConflict {
@@ -1264,11 +1263,7 @@ func TestDiscoveryWorker_ChecksAgainUnderTheDiscoverLock(t *testing.T) {
 	// process finishes its refresh at that moment.
 	b.Pool = &discPool{refreshDue: func() bool {
 		if first.CompareAndSwap(false, true) {
-			p, _, err := e.store.ReadPayload(e.clock.Now(), nil)
-			if err != nil {
-				t.Error(err)
-			}
-			other.discover(context.Background(), workerSeed, otherBinding, p)
+			other.discover(context.Background(), workerSeed, otherBinding)
 		}
 		return false
 	}}

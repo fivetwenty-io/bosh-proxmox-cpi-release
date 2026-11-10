@@ -75,10 +75,12 @@ func (e *workerEnv) startWorker(w *DiscoveryWorker, answer string) {
 }
 
 // A node refused under verify_ssl false keeps its stored confirmation, and a
-// reader hides it after 24 hours while the file keeps knowing it. The summary
-// of each hourly refresh is then a steady state at Debug, and it counts only
-// the nodes a reader loads.
-func TestDiscoveryWorker_HeldNodePastADayKeepsTheSummaryAtDebug(t *testing.T) {
+// reader hides it after 24 hours while the file keeps knowing it. The refresh
+// in which the last such node leaves the reader's view changes the node set
+// the pool loads, so its summary is Info, once. Every refresh before it and
+// after it is a steady state at Debug, and each counts only the nodes a reader
+// loads.
+func TestDiscoveryWorker_HeldNodesAgingOutLogTheLossOnceAtInfo(t *testing.T) {
 	t.Parallel()
 	e := newWorkerEnv(t, workerEnvOptions{})
 	e.run()
@@ -86,11 +88,14 @@ func TestDiscoveryWorker_HeldNodePastADayKeepsTheSummaryAtDebug(t *testing.T) {
 	for hour := 1; hour <= 27; hour++ {
 		e.clock.advance(endpointcache.RefreshInterval)
 		e.run()
-		line := e.wantLine("api endpoint discovery: cached", log.LevelDebug)
-		count := "cached 2 of 3 nodes"
-		if hour > 24 {
+		count, level := "cached 2 of 3 nodes", log.LevelDebug
+		if hour >= 25 {
 			count = "cached 0 of 3 nodes"
 		}
+		if hour == 25 {
+			level = log.LevelInfo
+		}
+		line := e.wantLine("api endpoint discovery: cached", level)
 		if !strings.Contains(line.Message, count) {
 			t.Fatalf("refresh %d logged %q, want %q", hour, line.Message, count)
 		}
@@ -247,24 +252,35 @@ func TestDiscoveryWorker_FirstAnswerDoesNotWaitForTheRefresh(t *testing.T) {
 }
 
 // The decision and a failed attempt use the clock the update was given. A
-// clock that moves a minute on every reading shows any other reading.
+// clock that moves a minute on every reading shows any other reading. The
+// update reads the clock last, so the time the attempt stores is the last
+// reading the clock gave, and its next refresh is one interval after it.
 func TestDiscoveryWorker_DecisionAndAttemptUseTheUpdatesClock(t *testing.T) {
 	t.Parallel()
-	steppingClock := func(base time.Time) func() time.Time {
+	// steppingClock returns the clock and a function that reports the last
+	// reading the clock gave.
+	steppingClock := func(base time.Time) (clock func() time.Time, last func() time.Time) {
 		var mu sync.Mutex
 		var readings int
-		return func() time.Time {
+		clock = func() time.Time {
 			mu.Lock()
 			defer mu.Unlock()
 			readings++
 			return base.Add(time.Duration(readings) * time.Minute)
 		}
+		last = func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			return base.Add(time.Duration(readings) * time.Minute)
+		}
+		return clock, last
 	}
 	t.Run("a result is written", func(t *testing.T) {
 		t.Parallel()
 		e := newWorkerEnv(t, workerEnvOptions{})
 		base := e.clock.Now()
-		e.startWorker(e.workerWithClock(steppingClock(base)), workerSeed)
+		clock, _ := steppingClock(base)
+		e.startWorker(e.workerWithClock(clock), workerSeed)
 		p, _, err := e.store.ReadPayload(base.Add(time.Hour), nil)
 		if err != nil || p == nil || p.Discovery == nil || len(p.Discovery.Nodes) != 2 {
 			t.Fatalf("the result was not written: %+v, %v; lines: %s", p, err, e.dump())
@@ -279,11 +295,18 @@ func TestDiscoveryWorker_DecisionAndAttemptUseTheUpdatesClock(t *testing.T) {
 			}
 		})
 		base := e.clock.Now()
-		e.startWorker(e.workerWithClock(steppingClock(base)), workerSeed)
+		clock, last := steppingClock(base)
+		e.startWorker(e.workerWithClock(clock), workerSeed)
 		p, _, err := e.store.ReadPayload(base.Add(time.Hour), nil)
 		if err != nil || p == nil || p.Discovery == nil ||
 			p.Discovery.LastFailure != endpointcache.FailureRootCAUnreadable {
 			t.Fatalf("the attempt was not recorded: %+v, %v; lines: %s", p, err, e.dump())
+		}
+		wantAt := last().UTC()
+		if !p.Discovery.DiscoveredAt.Equal(wantAt) ||
+			!p.Discovery.NextRefreshAfter.Equal(wantAt.Add(endpointcache.RefreshInterval)) {
+			t.Fatalf("the attempt stored %v and %v, want the update's clock %v and one interval after it",
+				p.Discovery.DiscoveredAt, p.Discovery.NextRefreshAfter, wantAt)
 		}
 	})
 }
@@ -565,4 +588,70 @@ func TestDiscoveryWorker_FailedRefreshLogsTheRecordsTheUpdateLeftOut(t *testing.
 	e.run()
 	e.wantLine("because the cluster root CA could not be read", log.LevelInfo)
 	e.wantLine("endpoint cache: records left out", log.LevelDebug)
+}
+
+// An answer that arrives before Bind is kept, and Bind alone starts its
+// refresh. No later answer is needed.
+func TestDiscoveryWorker_BindStartsTheRefreshOfAnEarlierAnswer(t *testing.T) {
+	t.Parallel()
+	e := newWorkerEnv(t, workerEnvOptions{})
+	w := e.newWorker()
+	w.FirstAnswer(workerSeed)
+	e.begin()
+	if err := w.Bind(e.binding()); err != nil {
+		t.Fatal(err)
+	}
+	e.drain()
+	if _, _, kinds := e.reqs.snapshot(); kinds["nodes"] != 1 {
+		t.Fatalf("Bind sent %v, want one refresh of the earlier answer", kinds)
+	}
+	if got := cachedNodeNames(e.payload()); len(got) != 2 {
+		t.Fatalf("the refresh cached %v, want two nodes", got)
+	}
+}
+
+// Node names are compared without regard to case, as the rest of the cache
+// treats them. A refresh that reports one name in another case holds the same
+// nodes, so its summary stays at Debug.
+func TestDiscoveryWorker_NodeNameCaseDoesNotChangeTheSet(t *testing.T) {
+	t.Parallel()
+	e := newWorkerEnv(t, workerEnvOptions{})
+	e.run()
+	e.cluster.set(func() { e.cluster.setNodes("pve1", []string{"pve1", "PVE2", "pve3"}) })
+	e.clock.advance(endpointcache.RefreshInterval)
+	e.run()
+	if got := cachedNodeNames(e.payload()); !slices.Contains(got, "PVE2") {
+		t.Fatalf("the refresh cached %v, want the node reported as PVE2", got)
+	}
+	e.wantLine("api endpoint discovery: cached", log.LevelDebug)
+}
+
+// readerNodes returns the nodes a reader would load, and when Validate refuses
+// the section outright, which the merge never writes, the nodes it lists.
+func TestReaderNodes(t *testing.T) {
+	t.Parallel()
+	e := newWorkerEnv(t, workerEnvOptions{})
+	e.run()
+	stored := e.payload()
+	key := e.store.Key()
+	at := e.clock.Now()
+	t.Run("a section that passes is filtered by the reader's checks", func(t *testing.T) {
+		t.Parallel()
+		section := *stored.Discovery
+		section.Nodes = slices.Clone(stored.Discovery.Nodes)
+		section.Nodes[0].ConfirmedAt = at.Add(-endpointcache.NodeTTL - time.Hour)
+		got := readerNodes(key, *stored.Cluster, section, at)
+		if len(got) != len(section.Nodes)-1 {
+			t.Fatalf("readerNodes kept %d of %d nodes, want the expired one left out", len(got), len(section.Nodes))
+		}
+	})
+	t.Run("a section Validate refuses counts as holding its nodes", func(t *testing.T) {
+		t.Parallel()
+		section := *stored.Discovery
+		section.Nodes = []endpointcache.DiscoveredNode{{Name: "not a node name!"}}
+		got := readerNodes(key, *stored.Cluster, section, at)
+		if len(got) != 1 || got[0].Name != "not a node name!" {
+			t.Fatalf("readerNodes returned %+v, want the section's own node", got)
+		}
+	})
 }

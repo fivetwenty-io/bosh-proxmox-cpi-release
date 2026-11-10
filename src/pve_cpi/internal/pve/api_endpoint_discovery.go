@@ -282,7 +282,7 @@ func (w *DiscoveryWorker) refresh(ctx context.Context, via string, b DiscoveryBi
 	if !w.due(ctx, b) {
 		return
 	}
-	w.discover(ctx, source, b, nil)
+	w.discover(ctx, source, b)
 }
 
 // due reads the stored file without a lock and reports whether a refresh is
@@ -348,11 +348,11 @@ func keyEndpoint(key endpointcache.Key, addr string) (string, bool) {
 	return "", false
 }
 
-// discover sends the reads, builds the result, and records it. The payload the
-// due check read is not used, because the log lines compare the view the
-// update itself reads under the file lock, which is the only view that cannot
-// change between the comparison and the write.
-func (w *DiscoveryWorker) discover(ctx context.Context, via string, b DiscoveryBinding, _ *endpointcache.Payload) {
+// discover sends the reads, builds the result, and records it. The log lines
+// compare the view the update itself reads under the file lock, which is the
+// only view that cannot change between the comparison and the write, so
+// discover takes nothing from the due check.
+func (w *DiscoveryWorker) discover(ctx context.Context, via string, b DiscoveryBinding) {
 	key := w.store.Key()
 	requests := endpointpool.WithConfiguredOnly(ctx)
 	reads, err := ReadDiscovery(requests, b.Client)
@@ -458,12 +458,15 @@ func discoveryFailureReason(err error) string {
 }
 
 // discoverySummary is what the summary line compares, taken from the one view
-// the update reads under the file lock. before and after are the nodes a
-// reader would load from the file at the update's clock, before the write and
-// after it, so a node the file keeps but a reader hides never counts on either
-// side. outcome is the outcome of the section a reader would load before the
-// write, which is empty when there is none, and priorFailure is the stored
-// section's last_failure as written.
+// the update reads under the file lock. before is the set of nodes the last
+// refresh left a reader with, which is the stored nodes a reader would load at
+// the stored section's own time, and after is the set a reader loads from the
+// result at the update's clock. Both leave out a node the file only keeps, so
+// a node never counts on a side where a reader hides it, and a node that ages
+// out between two refreshes shows as a change in the refresh that notices it.
+// outcome is the outcome of the section a reader would load before the write,
+// which is empty when there is none, and priorFailure is the stored section's
+// last_failure as written.
 type discoverySummary struct {
 	before, after []endpointcache.DiscoveredNode
 	outcome       endpointcache.DiscoveryOutcome
@@ -475,29 +478,33 @@ type discoverySummary struct {
 // builds on it.
 func summarize(view endpointcache.Stored, key endpointcache.Key, d endpointcache.TrustDecision) discoverySummary {
 	sum := discoverySummary{priorFailure: view.LastFailure}
-	if view.Usable != nil && view.Usable.Discovery != nil {
-		sum.before, sum.outcome = view.Usable.Discovery.Nodes, view.Usable.Discovery.Outcome
+	if stored := view.Usable; stored != nil && stored.Discovery != nil {
+		sum.outcome = stored.Discovery.Outcome
+		if stored.Cluster != nil {
+			section := *stored.Discovery
+			section.Nodes = view.Known
+			sum.before = readerNodes(key, *stored.Cluster, section, section.DiscoveredAt)
+		}
 	}
 	if d.Change.Result != nil {
-		sum.after = readerNodes(key, d.Change.Result, view.Now)
+		sum.after = readerNodes(key, d.Change.Result.Cluster, d.Change.Result.Discovery, view.Now)
 	}
 	return sum
 }
 
-// readerNodes returns the nodes of result that a reader would load at now,
-// which are the ones that pass the checks a read applies. A node a
-// verify_ssl false refusal carries with its stored confirmation stays in the
-// file after 24 hours, and a reader hides it, so it is left out here.
+// readerNodes returns the nodes of section that a reader would load at the
+// time at, which are the ones that pass the checks a read applies. A node that
+// a verify_ssl false refusal carries with its stored confirmation stays in the
+// file after 24 hours, and a reader hides it, so it is left out here. A
+// section that Validate refuses outright, which the merge never writes, counts
+// as holding the nodes it lists, because that is the best account of what the
+// file would hold.
 func readerNodes(
-	key endpointcache.Key, result *endpointcache.DiscoveryResult, now time.Time,
+	key endpointcache.Key, cluster endpointcache.ClusterIdentity, section endpointcache.DiscoverySection, at time.Time,
 ) []endpointcache.DiscoveredNode {
-	cluster, section := result.Cluster, result.Discovery
 	usable, _, err := endpointcache.Validate(
-		&endpointcache.Payload{Key: key, Cluster: &cluster, Discovery: &section}, key, now)
+		&endpointcache.Payload{Key: key, Cluster: &cluster, Discovery: &section}, key, at)
 	if err != nil || usable == nil || usable.Discovery == nil {
-		// The merge applies these checks to the result before it writes it, so
-		// a result the decision built passes them. If one ever did not, the
-		// written list is the best account of what the file holds.
 		return section.Nodes
 	}
 	return usable.Discovery.Nodes

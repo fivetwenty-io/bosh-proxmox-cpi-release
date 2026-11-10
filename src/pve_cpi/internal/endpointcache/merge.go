@@ -195,9 +195,13 @@ type Stored struct {
 // for its size. It replaces the node list only with change.Result, and a change
 // without one writes the stored discovery section back as it was read, so a
 // record a reader drops for its time or its address is hidden and never
-// erased. The exception is change.Attempt, which moves the section's two
-// times and nothing else, and records nothing for a section a reader hides for
-// its time. It keeps a stored hint that passes every other check even when the
+// erased. The exceptions are change.Attempt, which moves the section's two
+// times and nothing else and records nothing for a section a reader hides for
+// its time, and change.PinFailedAt, which sets the section's pin_failed_at
+// under the same rule for a hidden section. A write also clears a stored
+// pin_failed_at that is more than FutureSkew ahead of the writer's clock,
+// which a reader drops, so a writer whose clock ran ahead cannot leave a time
+// that wakes up later as a failure the next attempt already answered. It keeps a stored hint that passes every other check even when the
 // writer's own az_map does not name its node, because another entry that
 // shares the key may have written it, and it replaces the hint only with
 // change.Hint.
@@ -289,6 +293,7 @@ func merge(state storedState, read []Drop, key Key, change Change, now time.Time
 	}
 	next.Marks = mergeMarks(next.Marks, change.Marks, now, &drops)
 	if change.Result == nil {
+		clearAheadPinFailure(next, now)
 		notePinFailure(next, change.PinFailedAt, now)
 	}
 	pruneMarks(next, change.Pool)
@@ -526,23 +531,35 @@ func mergeMarks(stored, incoming map[string]DownMark, now time.Time, drops *[]Dr
 	return out
 }
 
+// clearAheadPinFailure clears next's discovery section's pin_failed_at when it
+// is further ahead of now than FutureSkew. A reader drops such a time, and
+// left in the file it would turn into a failure later than the section's own
+// time once the clock caught up, so a write removes it. A section dated ahead
+// of now is hidden from a reader and stays as it is. The read of the same
+// file already reported the drop, so the merge reports none of its own.
+func clearAheadPinFailure(next *Payload, now time.Time) {
+	section := next.Discovery
+	if section == nil || section.DiscoveredAt.After(now.Add(FutureSkew)) {
+		return
+	}
+	if section.PinFailedAt.After(now.Add(FutureSkew)) {
+		section.PinFailedAt = time.Time{}
+	}
+}
+
 // notePinFailure sets next's discovery section's pin_failed_at to failedAt
 // when that is later than the one stored. It records nothing when failedAt is
 // zero or further ahead of now than FutureSkew, when there is no section, and
 // when the section is dated ahead of now, which a reader hides and an attempt
-// leaves alone. A stored pin_failed_at that far ahead is one a reader drops,
-// so it does not hold a real failure back.
+// leaves alone. It runs after clearAheadPinFailure, so a stored time from a
+// fast clock never holds a real failure back.
 func notePinFailure(next *Payload, failedAt, now time.Time) {
 	section := next.Discovery
 	if section == nil || failedAt.IsZero() || failedAt.After(now.Add(FutureSkew)) ||
 		section.DiscoveredAt.After(now.Add(FutureSkew)) {
 		return
 	}
-	stored := section.PinFailedAt
-	if stored.After(now.Add(FutureSkew)) {
-		stored = time.Time{}
-	}
-	if failedAt.After(stored) {
+	if failedAt.After(section.PinFailedAt) {
 		section.PinFailedAt = failedAt.UTC()
 	}
 }
@@ -659,7 +676,8 @@ func payloadSize(p *Payload) (int, error) {
 // lock. A directory that Close has closed since the update began is reported
 // in the result, as a sweep failure is, and does not fail the update.
 func (s *Store) sweepUnderLock(now time.Time) SweepResult {
-	root := s.dir()
+	root, done := s.use()
+	defer done()
 	if root == nil {
 		return SweepResult{Err: fmt.Errorf("%s: store is closed", s.label())}
 	}
