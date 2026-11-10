@@ -86,8 +86,10 @@ func (p Policy) privateStat(path string, st *syscall.Stat_t, mode os.FileMode, d
 
 // fileModeOf converts a raw st_mode to the os.FileMode that os.Lstat reports
 // for it, so a descriptor checked before it becomes an *os.File is judged and
-// reported exactly as a named file is.
-func fileModeOf(raw uint32) os.FileMode {
+// reported exactly as a named file is. It is generic because st_mode is a
+// uint16 on darwin and a uint32 on linux.
+func fileModeOf[M ~uint16 | ~uint32](m M) os.FileMode {
+	raw := uint32(m)
 	mode := os.FileMode(raw & 0o777)
 	switch raw & syscall.S_IFMT {
 	case syscall.S_IFREG:
@@ -216,7 +218,7 @@ func (p Policy) checkOpened(path string, fd int, prior os.FileInfo) error {
 	if err := ignoringEINTR(func() error { return syscall.Fstat(fd, &st) }); err != nil {
 		return &os.PathError{Op: "fstat", Path: path, Err: err}
 	}
-	if err := p.privateStat(path, &st, fileModeOf(uint32(st.Mode)), false); err != nil {
+	if err := p.privateStat(path, &st, fileModeOf(st.Mode), false); err != nil {
 		return err
 	}
 	if prior != nil && !sameInode(prior, &st) {

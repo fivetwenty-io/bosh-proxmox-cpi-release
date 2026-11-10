@@ -573,7 +573,7 @@ func TestFileModeOfMatchesLstat(t *testing.T) {
 			t.Fatal(err)
 		}
 		st := info.Sys().(*syscall.Stat_t)
-		if got := fileModeOf(uint32(st.Mode)); got != info.Mode() {
+		if got := fileModeOf(st.Mode); got != info.Mode() {
 			t.Errorf("%s: fileModeOf = %v; os.Lstat says %v", name, got, info.Mode())
 		}
 	}
