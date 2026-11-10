@@ -110,6 +110,9 @@ func (r *pveHAReader) Profile(ctx context.Context) (*ha.Profile, error) {
 		return nil, err
 	}
 	deps := ha.DepsFromClient(r.client, r.cfg, r.logger)
+	// The doctor reports what the cluster says now, so it reads every fact
+	// live instead of from the profile cache.
+	deps.Slow = nil
 	deps.ProbeWhenOff = true
 	return ha.Resolve(ctx, deps)
 }

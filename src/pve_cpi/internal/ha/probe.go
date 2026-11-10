@@ -76,7 +76,8 @@ type Deps struct {
 
 // DepsFromClient builds Deps from a PVE client. A client that cannot read the
 // token's permissions leaves Permissions nil, which the profile treats as
-// unreadable privileges.
+// unreadable privileges. The slow-changing facts come from the profile cache,
+// and a caller that needs every fact read live sets Slow to nil.
 func DepsFromClient(c pve.Client, cfg *config.CPIConfig, logger *log.Logger) Deps {
 	d := Deps{Config: cfg, Log: logger}
 	if c == nil {
@@ -87,6 +88,11 @@ func DepsFromClient(c pve.Client, cfg *config.CPIConfig, logger *log.Logger) Dep
 	d.Storage = c.ClusterStorage()
 	if r, ok := c.(pve.TokenPermissionReader); ok {
 		d.Permissions = r
+	}
+	// The slow facts come from the profile cache when the entry can key one.
+	// An entry that cannot, such as one with no credential, probes every call.
+	if opts, ok := ProfileCacheOptionsFromConfig(cfg, logger); ok {
+		d = d.WithProfileCache(opts)
 	}
 	return d
 }
