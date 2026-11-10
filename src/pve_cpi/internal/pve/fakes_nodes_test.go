@@ -51,6 +51,10 @@ type fakeNodesService struct {
 	listQemuPendingFn func(ctx context.Context, node string, vmid string) (*nodes.ListQemuPendingResponse, error)
 	// listQemuSnapshotConfigFn serves one snapshot's configuration.
 	listQemuSnapshotConfigFn func(ctx context.Context, node, vmid, snapname string) (*nodes.ListQemuSnapshotConfigResponse, error)
+	// listNodesFn answers GET /nodes in place of the empty default.
+	listNodesFn func(ctx context.Context) (*nodes.ListNodesResponse, error)
+	// listCertificatesInfoFn answers GET /nodes/{node}/certificates/info.
+	listCertificatesInfoFn func(ctx context.Context, node string) (*nodes.ListCertificatesInfoResponse, error)
 }
 
 func (f *fakeNodesService) ListQemuSnapshotConfig(ctx context.Context, node, vmid, snapname string) (*nodes.ListQemuSnapshotConfigResponse, error) {
@@ -172,9 +176,22 @@ func (f *fakeNodesService) UpdateQemuFirewallOptions(ctx context.Context, node s
 	return f.updateQemuFirewallOptionsFn(ctx, node, vmid, params)
 }
 
-// ListNodes reports an empty node list; the standalone-membership
-// fallback then surfaces the original corosync answer unchanged.
-func (f *fakeNodesService) ListNodes(context.Context) (*nodes.ListNodesResponse, error) {
+// ListNodes delegates to listNodesFn when scripted. Otherwise it reports an
+// empty node list; the standalone-membership fallback then surfaces the
+// original corosync answer unchanged.
+func (f *fakeNodesService) ListNodes(ctx context.Context) (*nodes.ListNodesResponse, error) {
+	if f.listNodesFn != nil {
+		return f.listNodesFn(ctx)
+	}
 	empty := nodes.ListNodesResponse{}
 	return &empty, nil
+}
+
+// ListCertificatesInfo delegates to listCertificatesInfoFn, and panics when a
+// test has not wired it, like the other unscripted methods.
+func (f *fakeNodesService) ListCertificatesInfo(ctx context.Context, node string) (*nodes.ListCertificatesInfoResponse, error) {
+	if f.listCertificatesInfoFn != nil {
+		return f.listCertificatesInfoFn(ctx, node)
+	}
+	panic("fakeNodesService: ListCertificatesInfo not wired")
 }

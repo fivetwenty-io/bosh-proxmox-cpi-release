@@ -43,38 +43,59 @@ const clusterStampHexLen = 8
 // Every failure is retriable. The error names the nodes tried and the reason
 // each one failed, and never carries the certificate answer or PEM data.
 func ReadClusterStamp(ctx context.Context, c Client, preferred string) (string, error) {
+	digest, err := readClusterRoot(ctx, c, preferred, "ReadClusterStamp")
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(digest[:])[:clusterStampHexLen], nil
+}
+
+// ReadClusterRootDigest returns the full SHA-256 of the DER bytes of the
+// cluster's pve-root-ca.pem, the 32-byte value the endpoint cache stores as
+// the cluster's identity and the journal spells in its pve-root-ca-sha256
+// form. It is ReadClusterStamp without the truncation, and it tries nodes,
+// accepts roots, and fails exactly as ReadClusterStamp does, except that the
+// error names ReadClusterRootDigest.
+func ReadClusterRootDigest(ctx context.Context, c Client, preferred string) ([sha256.Size]byte, error) {
+	return readClusterRoot(ctx, c, preferred, "ReadClusterRootDigest")
+}
+
+// readClusterRoot is the read both ReadClusterStamp and ReadClusterRootDigest
+// make. op names the caller in its errors.
+func readClusterRoot(ctx context.Context, c Client, preferred, op string) ([sha256.Size]byte, error) {
+	var zero [sha256.Size]byte
 	if ctx == nil {
-		return "", cpierrors.Retriable("ReadClusterStamp: context is required")
+		return zero, cpierrors.Retriable("%s: context is required", op)
 	}
 	if c == nil || c.Nodes() == nil {
-		return "", cpierrors.Retriable("ReadClusterStamp: no PVE nodes service is available")
+		return zero, cpierrors.Retriable("%s: no PVE nodes service is available", op)
 	}
 	if err := ctx.Err(); err != nil {
-		return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "ReadClusterStamp: read canceled")
+		return zero, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, op+": read canceled")
 	}
 	bounded, cancel := context.WithTimeout(ctx, storageClusterIdentityTimeout)
 	defer cancel()
 
 	var failures []string
 	tried := map[string]bool{}
-	attempt := func(node string) (string, bool) {
+	attempt := func(node string) ([sha256.Size]byte, bool) {
 		tried[node] = true
-		stamp, err := readNodeClusterStamp(bounded, c.Nodes(), node)
+		digest, err := readNodeClusterRoot(bounded, c.Nodes(), node)
 		if err != nil {
 			failures = append(failures, fmt.Sprintf("node %q: %s", node, err.Error()))
-			return "", false
+			return zero, false
 		}
-		return stamp, true
+		return digest, true
 	}
 	if validStorageIdentityNode(preferred) {
-		if stamp, ok := attempt(preferred); ok {
-			return stamp, nil
+		if digest, ok := attempt(preferred); ok {
+			return digest, nil
 		}
 	}
 	members, err := ListClusterMemberNames(bounded, c)
 	if err != nil {
-		return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			"ReadClusterStamp: "+stampFailureSummary(failures, "and cluster member enumeration failed"))
+		return zero, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			op+": "+stampFailureSummary(failures, "and cluster member enumeration failed"))
 	}
 	offline := offlineClusterNodes(bounded, c, log.FromContext(ctx))
 	sorted := slices.Clone(members)
@@ -83,18 +104,18 @@ func ReadClusterStamp(ctx context.Context, c Client, preferred string) (string, 
 		if tried[node] || offline[node] || !validStorageIdentityNode(node) {
 			continue
 		}
-		if stamp, ok := attempt(node); ok {
-			return stamp, nil
+		if digest, ok := attempt(node); ok {
+			return digest, nil
 		}
 		if bounded.Err() != nil {
 			break
 		}
 	}
 	if err := bounded.Err(); err != nil {
-		return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			"ReadClusterStamp: "+stampFailureSummary(failures, "and the read deadline passed"))
+		return zero, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			op+": "+stampFailureSummary(failures, "and the read deadline passed"))
 	}
-	return "", cpierrors.Retriable("ReadClusterStamp: %s",
+	return zero, cpierrors.Retriable("%s: %s", op,
 		stampFailureSummary(failures, "and no other online cluster member was left to try"))
 }
 
@@ -107,20 +128,19 @@ func stampFailureSummary(failures []string, tail string) string {
 	return "the cluster root read failed on " + strings.Join(failures, "; ") + ", " + tail
 }
 
-// readNodeClusterStamp reads one node's certificates/info answer and derives
-// the stamp from it. The returned error text is one of the fixed reasons the
-// root parser produces, or a fixed transport reason, so it never echoes the
-// API answer.
-func readNodeClusterStamp(ctx context.Context, service StorageClusterCertificateService, node string) (string, error) {
+// readNodeClusterRoot reads one node's certificates/info answer and returns
+// the root digest from it. The returned error text is one of the fixed reasons
+// the root parser produces, or a fixed transport reason, so it never echoes
+// the API answer.
+func readNodeClusterRoot(
+	ctx context.Context, service StorageClusterCertificateService, node string,
+) ([sha256.Size]byte, error) {
+	var zero [sha256.Size]byte
 	response, err := service.ListCertificatesInfo(ctx, node)
 	if err != nil {
-		return "", errors.New("certificate observation failed")
+		return zero, errors.New("certificate observation failed")
 	}
-	digest, err := clusterStampDigest(response)
-	if err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(digest[:])[:clusterStampHexLen], nil
+	return clusterStampDigest(response)
 }
 
 // clusterStampDigest returns the SHA-256 of the cluster root's DER bytes, or
