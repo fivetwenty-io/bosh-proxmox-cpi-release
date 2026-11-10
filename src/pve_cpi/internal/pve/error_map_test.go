@@ -24,6 +24,7 @@ import (
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 )
 
 // ---------------------------------------------------------------------------
@@ -1736,5 +1737,61 @@ func TestWrapError_ConnectionDropRetriable(t *testing.T) {
 	got := pve.WrapError(sdkUploadEOFError(io.EOF))
 	if !cpiErrIsRetriable(t, got) {
 		t.Errorf("mid-request EOF must map to a retriable error, got: %v", got)
+	}
+}
+
+// sdkWrappedTetherConflict wraps the pool's refusal the way the SDK wraps a
+// transport error that is not a dial or DNS failure: in the HTTP client's
+// *url.Error, inside the retry loop's "request failed after N attempt(s)".
+func sdkWrappedTetherConflict(attempts int, refusal error) error {
+	urlErr := &url.Error{Op: "Post", URL: "https://pve1:8006/api2/json/nodes/n1/qemu", Err: refusal}
+	return fmt.Errorf("request failed after %d attempt(s): %w", attempts, urlErr)
+}
+
+// TestIsTransientTransport_TetherConflictIsNotTransient pins the classification
+// of the pool's conflicted-key refusal. The refusal sends nothing, so a retry
+// layer that treated it as transient would only repeat it through its whole
+// backoff, on every attempt of the SDK's forced retry.
+func TestIsTransientTransport_TetherConflictIsNotTransient(t *testing.T) {
+	t.Parallel()
+	refusal := fmt.Errorf("endpoint pool: refusing POST /nodes/n1/qemu: %w", endpointpool.ErrTetherConflict)
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"bare sentinel", endpointpool.ErrTetherConflict},
+		{"wrapped refusal", refusal},
+		{"wrapped twice", fmt.Errorf("create_vm: %w", refusal)},
+		{"in the SDK's url error after one attempt", sdkWrappedTetherConflict(1, refusal)},
+		{"in the SDK's url error after four attempts", sdkWrappedTetherConflict(4, refusal)},
+		{"in the SDK's url error around the bare sentinel", sdkWrappedTetherConflict(2, endpointpool.ErrTetherConflict)},
+		{"joined with a transient cause", errors.Join(refusal, io.EOF)},
+		{
+			"refusal text that carries a transient phrase",
+			fmt.Errorf("endpoint pool: refusing POST /nodes/n1/qemu/(code: 596): connection reset: %w",
+				endpointpool.ErrTetherConflict),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if !errors.Is(tc.err, endpointpool.ErrTetherConflict) {
+				t.Fatalf("precondition: %v should wrap ErrTetherConflict", tc.err)
+			}
+			if pve.IsTransientTransport(tc.err) {
+				t.Errorf("IsTransientTransport(%v) = true, want false", tc.err)
+			}
+		})
+	}
+}
+
+// TestIsTransientTransport_TransientSiblingStillTransient confirms the
+// conflict guard is narrow. A url error that wraps a real connection drop in
+// the same SDK shape stays transient.
+func TestIsTransientTransport_TransientSiblingStillTransient(t *testing.T) {
+	t.Parallel()
+	urlErr := &url.Error{Op: "Post", URL: "https://pve1:8006/api2/json/nodes/n1/qemu", Err: io.ErrUnexpectedEOF}
+	if !pve.IsTransientTransport(fmt.Errorf("request failed after 2 attempt(s): %w", urlErr)) {
+		t.Error("an unexpected EOF inside the SDK's wrapping must stay transient")
 	}
 }

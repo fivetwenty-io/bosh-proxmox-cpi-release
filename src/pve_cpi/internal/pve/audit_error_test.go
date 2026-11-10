@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
@@ -135,5 +136,85 @@ func TestPartialFleetErrorNamesFailedNodesWithUnchangedText(t *testing.T) {
 		if !errors.As(err, &enumeration) || len(enumeration.Nodes) == 0 {
 			t.Fatalf("partial fleet error does not carry its nodes: %v", err)
 		}
+	}
+}
+
+// A walk that reached no endpoint names every endpoint it tried, in the order
+// it tried them, so an operator sees which nodes were down and not only the
+// primary the SDK reports.
+func TestDescribeAuditErrorNamesEveryEndpointAWalkTried(t *testing.T) {
+	refused := errors.New("connection refused")
+	dial := func(endpoint string) endpointpool.EndpointFailure {
+		return walkFailure(endpoint, endpointpool.PhaseDial, refused)
+	}
+	verify := func(endpoint string) endpointpool.EndpointFailure {
+		return walkFailure(endpoint, endpointpool.PhaseTLSVerify, errors.New("x509: unknown authority"))
+	}
+	for _, tc := range []struct {
+		name     string
+		attempts []endpointpool.EndpointFailure
+		want     string
+	}{
+		{"one endpoint", []endpointpool.EndpointFailure{dial("pve1:8006")}, "connection to pve1:8006 failed"},
+		{
+			"three endpoints in the order tried",
+			[]endpointpool.EndpointFailure{dial("pve2:8006"), dial("pve1:8006"), dial("pve3:8006")},
+			"connection to pve2:8006, pve1:8006, pve3:8006 failed",
+		},
+		{
+			"an endpoint tried twice is named once",
+			[]endpointpool.EndpointFailure{dial("pve1:8006"), dial("pve2:8006"), dial("pve1:8006")},
+			"connection to pve1:8006, pve2:8006 failed",
+		},
+		{
+			"an IPv6 endpoint keeps its brackets",
+			[]endpointpool.EndpointFailure{dial("[fd00::1]:8006"), dial("pve2:8006")},
+			"connection to [fd00::1]:8006, pve2:8006 failed",
+		},
+		{
+			"every hop failed certificate verification",
+			[]endpointpool.EndpointFailure{verify("pve1:8006"), verify("pve2:8006")},
+			"connection to pve1:8006, pve2:8006 failed",
+		},
+		{
+			"a header deadline hop that reads as a context deadline",
+			[]endpointpool.EndpointFailure{
+				{Endpoint: "pve1:8006", Err: context.DeadlineExceeded},
+				dial("pve2:8006"),
+			},
+			"connection to pve1:8006, pve2:8006 failed",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			walk := endpointpool.NewEntryUnreachableError(tc.attempts)
+			for shape, err := range map[string]error{
+				"bare":                  walk,
+				"in the SDK's wrapping": sdkWrapTransportError(walk),
+				"under a CPI wrap":      cpierrors.Wrap(sdkWrapTransportError(walk), "list guests"),
+			} {
+				if got := DescribeAuditError(err); got != tc.want {
+					t.Errorf("%s: DescribeAuditError = %q, want %q", shape, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// A walk with no attempt to name falls back to the SDK's connection error, and
+// a walk's cause text never reaches the description.
+func TestDescribeAuditErrorWalkWithoutAttemptsFallsBack(t *testing.T) {
+	walk := endpointpool.NewEntryUnreachableError(nil)
+	if got := DescribeAuditError(walk); got != "unclassified error" {
+		t.Errorf("bare empty walk = %q, want %q", got, "unclassified error")
+	}
+	wrapped := &sdkerrors.ConnectionError{Host: "pve1", Port: 8006, Message: "failed", Cause: walk}
+	if got := DescribeAuditError(wrapped); got != "connection to pve1:8006 failed" {
+		t.Errorf("empty walk in a ConnectionError = %q, want the SDK's endpoint", got)
+	}
+	secret := endpointpool.NewEntryUnreachableError([]endpointpool.EndpointFailure{
+		walkFailure("pve1:8006", endpointpool.PhaseDial, errors.New("password=hunter2")),
+	})
+	if got := DescribeAuditError(sdkWrapTransportError(secret)); strings.Contains(got, "hunter2") {
+		t.Errorf("a hop's cause text reached the description: %q", got)
 	}
 }

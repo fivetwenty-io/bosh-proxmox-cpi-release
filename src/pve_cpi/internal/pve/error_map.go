@@ -14,6 +14,7 @@ import (
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 )
 
 // pvePushbackPhrases is the conservative set of lower-cased substrings that
@@ -528,9 +529,17 @@ const serverClosedIdleMessage = "http: server closed idle connection"
 // The condition is transient: a fresh pvedaemon worker replaces the dying
 // one within a second, so a short backoff and retry usually wins.
 //
+// A mutation the endpoint pool refused because its tether key is conflicted
+// (endpointpool.ErrTetherConflict) is never transient, however the SDK wrapped
+// it. Nothing was sent, and nothing a retry could change would let the next
+// attempt send, so a retry only repeats the refusal through its whole backoff.
+//
 // nil → false.
 func IsTransientTransport(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, endpointpool.ErrTetherConflict) {
 		return false
 	}
 	// Permanent 500-with-text shapes are excluded before the blanket 5xx rule

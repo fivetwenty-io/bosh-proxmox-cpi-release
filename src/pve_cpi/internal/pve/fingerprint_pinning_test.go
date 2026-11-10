@@ -7,6 +7,7 @@ package pve
 
 import (
 	"crypto/x509"
+	"strings"
 	"testing"
 
 	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
@@ -63,7 +64,7 @@ func TestAssertNoFingerprintPinningWithRouting(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			err := assertNoFingerprintPinningWithRouting(tc.opts, tc.routingPossible)
+			err := assertNoFingerprintPinningWithRouting(tc.opts, tc.routingPossible, false)
 			if tc.wantErr && err == nil {
 				t.Error("expected an error, got nil")
 			}
@@ -71,5 +72,61 @@ func TestAssertNoFingerprintPinningWithRouting(t *testing.T) {
 				t.Errorf("expected no error, got %v", err)
 			}
 		})
+	}
+}
+
+// The failover case has its own message. It names pve.endpoints, says that
+// fingerprint pinning cannot combine with endpoint failover, and does not
+// mention discovery or node routing, which are separate settings.
+func TestAssertNoFingerprintPinningWithFailoverMessage(t *testing.T) {
+	t.Parallel()
+	for name, opts := range map[string]sdkclient.Options{
+		"cached fingerprints":   {CachedFingerprints: map[string]bool{"aa:bb": true}},
+		"manual verification":   {ManualVerification: true},
+		"fingerprint callback":  {VerifyFingerprintCallback: func(*x509.Certificate) bool { return true }},
+		"manual verify handler": {ManualVerifyCallback: func(sdkclient.FingerprintVerificationRequest) bool { return true }},
+		"fingerprint cache":     {FingerprintCachePath: "/var/lib/pve-cpi/fingerprints.json"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			err := assertNoFingerprintPinningWithRouting(opts, true, true)
+			if err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			text := err.Error()
+			for _, want := range []string{
+				"pve.endpoints",
+				"fingerprint pinning cannot combine with endpoint failover",
+			} {
+				if !strings.Contains(text, want) {
+					t.Errorf("message %q does not contain %q", text, want)
+				}
+			}
+			for _, banned := range []string{"discovery", "node_endpoints", "upload"} {
+				if strings.Contains(text, banned) {
+					t.Errorf("message %q mentions %q", text, banned)
+				}
+			}
+		})
+	}
+}
+
+// Without failover the node-routing message is unchanged, and with no pinning
+// the failover flag changes nothing.
+func TestAssertNoFingerprintPinningRoutingMessageKeepsItsText(t *testing.T) {
+	t.Parallel()
+	pinned := sdkclient.Options{ManualVerification: true}
+	err := assertNoFingerprintPinningWithRouting(pinned, true, false)
+	if err == nil || !strings.Contains(err.Error(), "direct-to-node upload routing") {
+		t.Fatalf("node routing refusal = %v, want the direct-to-node message", err)
+	}
+	if strings.Contains(err.Error(), "endpoint failover") {
+		t.Errorf("node routing refusal mentions failover: %v", err)
+	}
+	if err := assertNoFingerprintPinningWithRouting(sdkclient.Options{}, true, true); err != nil {
+		t.Errorf("failover without pinning = %v, want nil", err)
+	}
+	if err := assertNoFingerprintPinningWithRouting(pinned, false, true); err != nil {
+		t.Errorf("pinning without routing possible = %v, want nil", err)
 	}
 }

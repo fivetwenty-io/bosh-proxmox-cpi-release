@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
@@ -151,6 +152,13 @@ func describeAuditErrorClass(err error) string {
 		}
 		return "could not list guests on node(s) " + strings.Join(enumeration.Nodes, ",")
 	}
+	// A walk that reached no endpoint names every endpoint it tried, because a
+	// description naming only the primary would mislead an operator about which
+	// nodes were down. This sits before the context checks, since a hop that
+	// ended on the header deadline can satisfy errors.Is(context.DeadlineExceeded).
+	if tried := triedEndpoints(err); len(tried) > 0 {
+		return fmt.Sprintf("connection to %s failed", strings.Join(tried, ", "))
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "context deadline exceeded"
 	}
@@ -172,6 +180,31 @@ func describeAuditErrorClass(err error) string {
 		return err.Error()
 	}
 	return "unclassified error"
+}
+
+// triedEndpoints returns the distinct endpoints a failed walk tried, in the
+// order it tried them, or nil when err does not carry an EntryUnreachableError.
+// Every name is a host:port the operator configured or discovery recorded, and
+// the caller's scrub and cap still apply to the rendered line.
+func triedEndpoints(err error) []string {
+	var walk *endpointpool.EntryUnreachableError
+	if !errors.As(err, &walk) {
+		return nil
+	}
+	endpoints := walk.Endpoints()
+	tried := make([]string, 0, len(endpoints))
+	seen := make(map[string]struct{}, len(endpoints))
+	for _, endpoint := range endpoints {
+		if endpoint == "" {
+			continue
+		}
+		if _, dup := seen[endpoint]; dup {
+			continue
+		}
+		seen[endpoint] = struct{}{}
+		tried = append(tried, endpoint)
+	}
+	return tried
 }
 
 // auditAPIErrorFields reads the status and message from every SDK API error

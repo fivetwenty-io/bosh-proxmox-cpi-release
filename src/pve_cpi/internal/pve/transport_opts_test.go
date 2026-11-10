@@ -182,3 +182,90 @@ func TestNewClient_TransportFieldsSet(t *testing.T) {
 		t.Fatal("expected non-nil client")
 	}
 }
+
+// A pool of more than one endpoint takes the 5-second dial and 10-second
+// handshake defaults for each value the operator left at 0.
+func TestPoolTimeoutDefaultsForMoreThanOneEndpoint(t *testing.T) {
+	t.Parallel()
+	cfg := minCfg()
+	cfg.Endpoints = []string{"pve.example.com:8006", "pve2.example.com:8006"}
+	before := buildTransportOpts(cfg)
+	got := applyPoolTimeoutDefaults(before, 2)
+	if got.DialTimeoutSec != 5 {
+		t.Errorf("DialTimeoutSec = %d, want 5", got.DialTimeoutSec)
+	}
+	if got.TLSHandshakeTimeoutSec != 10 {
+		t.Errorf("TLSHandshakeTimeoutSec = %d, want 10", got.TLSHandshakeTimeoutSec)
+	}
+	// Nothing else moves.
+	got.DialTimeoutSec, got.TLSHandshakeTimeoutSec = 0, 0
+	if got.Host != before.Host || got.Port != before.Port || got.Timeout != before.Timeout ||
+		got.MaxIdleConnsPerHost != before.MaxIdleConnsPerHost || got.IdleConnTimeoutSec != before.IdleConnTimeoutSec ||
+		got.TCPKeepAliveSec != before.TCPKeepAliveSec {
+		t.Errorf("applyPoolTimeoutDefaults changed more than the two timeouts: %+v vs %+v", got, before)
+	}
+}
+
+// An operator's value wins, for either timeout, and the other still defaults.
+func TestPoolTimeoutDefaultsKeepTheOperatorsValues(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name          string
+		dial, tls     int
+		wantD, wantTL int
+	}{
+		{"dial set", 30, 0, 30, 10},
+		{"handshake set", 0, 45, 5, 45},
+		{"both set", 2, 3, 2, 3},
+		{"both set above the defaults", 120, 60, 120, 60},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := minCfg()
+			cfg.PVEDialTimeoutSec = tc.dial
+			cfg.PVETLSHandshakeTimeoutSec = tc.tls
+			got := applyPoolTimeoutDefaults(buildTransportOpts(cfg), 3)
+			if got.DialTimeoutSec != tc.wantD || got.TLSHandshakeTimeoutSec != tc.wantTL {
+				t.Errorf("dial/handshake = %d/%d, want %d/%d",
+					got.DialTimeoutSec, got.TLSHandshakeTimeoutSec, tc.wantD, tc.wantTL)
+			}
+		})
+	}
+}
+
+// A pool of one endpoint keeps today's options, so a single-endpoint client
+// with discovery off builds the same Options as before the pool existed.
+func TestPoolTimeoutDefaultsLeaveAPoolOfOneAlone(t *testing.T) {
+	t.Parallel()
+	for _, size := range []int{0, 1} {
+		cfg := minCfg()
+		before := buildTransportOpts(cfg)
+		got := applyPoolTimeoutDefaults(before, size)
+		if got.DialTimeoutSec != 0 || got.TLSHandshakeTimeoutSec != 0 {
+			t.Errorf("pool of %d: dial/handshake = %d/%d, want 0/0", size, got.DialTimeoutSec, got.TLSHandshakeTimeoutSec)
+		}
+		if got.WrapTransport != nil {
+			t.Errorf("pool of %d: WrapTransport set", size)
+		}
+	}
+	cfg := minCfg()
+	cfg.PVEDialTimeoutSec = 7
+	if got := applyPoolTimeoutDefaults(buildTransportOpts(cfg), 1); got.DialTimeoutSec != 7 {
+		t.Errorf("pool of one changed the operator's dial timeout to %d", got.DialTimeoutSec)
+	}
+}
+
+// buildTransportOpts itself never reads the endpoint list, so a list changes
+// nothing it returns.
+func TestBuildTransportOptsIgnoresTheEndpointList(t *testing.T) {
+	t.Parallel()
+	plain := buildTransportOpts(minCfg())
+	cfg := minCfg()
+	cfg.Endpoints = []string{"pve.example.com:8006", "pve2.example.com:8006"}
+	listed := buildTransportOpts(cfg)
+	if plain.DialTimeoutSec != listed.DialTimeoutSec || plain.TLSHandshakeTimeoutSec != listed.TLSHandshakeTimeoutSec ||
+		plain.WrapTransport != nil || listed.WrapTransport != nil || plain.Host != listed.Host {
+		t.Errorf("buildTransportOpts reads the endpoint list: %+v vs %+v", plain, listed)
+	}
+}
