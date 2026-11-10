@@ -39,9 +39,12 @@ type Options struct {
 }
 
 // Refusal is the reason a layer gave no cache directory. Err carries the cause,
-// which is a *privatefile.UnsafePathError when the private checks refused the
-// directory, so a caller can tell an owner mismatch from a mode or file type
-// refusal with errors.As and errors.Is.
+// which unwraps to a *privatefile.UnsafePathError whenever the directory itself
+// was refused, whether by the private checks, by an unclean override path, or by
+// an owner without read, write, and search access, so a caller can tell an owner
+// mismatch from a mode or file type refusal with errors.As and errors.Is. A
+// directory that cannot be created, and a relative temporary directory, carry
+// the operating system error or a plain description instead.
 type Refusal struct {
 	Layer Layer
 	Path  string
@@ -94,52 +97,114 @@ var layers = []layer{
 
 // Resolve chooses the cache directory. It writes no log line, because its
 // caller decides the level for the layer chosen and for any refusal.
-func Resolve(opts Options) Choice {
-	for _, l := range layers {
+func Resolve(opts Options) Choice { return resolveWith(layers, opts) }
+
+// resolveWith runs the layers in order. Every layer but the last may decline,
+// and the last answers with whatever it returns, so the result always names a
+// layer. The list must not be empty.
+func resolveWith(list []layer, opts Options) Choice {
+	last := len(list) - 1
+	for _, l := range list[:last] {
 		if choice, applies := l(opts); applies {
 			return choice
 		}
 	}
-	// The temporary layer always applies, so this is unreachable with the
-	// layers above. Refuse rather than report a usable directory if a later
-	// edit empties the list.
-	return Choice{Err: &Refusal{Layer: LayerTemporary, Err: errors.New("no cache directory layer applies")}}
+	choice, _ := list[last](opts)
+	return choice
 }
 
+// unsafeDirectory is the cause of a refusal that this package raises for a
+// directory. It prints its own text and unwraps to the *privatefile.UnsafePathError
+// that classifies it, so a caller reads it the way it reads the shared checks.
+type unsafeDirectory struct {
+	unsafe *privatefile.UnsafePathError
+	text   string
+}
+
+func (e *unsafeDirectory) Error() string { return e.text }
+func (e *unsafeDirectory) Unwrap() error { return e.unsafe }
+
 // overrideLayer uses the directory the operator named and nothing else. It
-// opens the directory through the private checks and never creates it.
+// opens the directory through the private checks and never creates it. Config
+// validation already requires the value to be absolute and clean, so a path
+// that is not clean here means the validation was bypassed, and the layer
+// refuses it instead of opening a directory the operator did not name.
 func overrideLayer(opts Options) (Choice, bool) {
 	if opts.Override == "" {
 		return Choice{}, false
 	}
 	choice := Choice{Layer: LayerOverride, Path: opts.Override}
 	if filepath.Clean(opts.Override) != opts.Override {
-		choice.Err = &Refusal{Layer: LayerOverride, Path: opts.Override, Err: errors.New("directory path is not clean")}
+		// No inode was examined, so the owner is unknown.
+		choice.Err = &Refusal{Layer: LayerOverride, Path: opts.Override, Err: &unsafeDirectory{
+			unsafe: &privatefile.UnsafePathError{
+				Path: opts.Override, UID: -1, EUID: os.Geteuid(), WantDirectory: true, Cause: privatefile.ErrUnsafeFileType,
+			},
+			text: fmt.Sprintf("%v: %s is not a clean path", privatefile.ErrUnsafeFileType, opts.Override),
+		}}
 		return choice, true
 	}
 	return open(choice), true
 }
 
-// temporaryLayer uses pve_cpi-endpoint-cache.<euid> under os.TempDir(). It
-// creates only the last component, with os.Mkdir at mode 0700, so a missing
-// temporary directory is a refusal and never a tree of new directories. The
-// euid suffix keeps processes that run as different users apart.
+// temporaryLayer uses pve_cpi-endpoint-cache.<euid> under os.TempDir().
 func temporaryLayer(Options) (Choice, bool) {
-	path := filepath.Join(os.TempDir(), temporaryName+strconv.Itoa(os.Geteuid()))
+	return temporaryLayerIn(os.TempDir(), os.Mkdir)
+}
+
+// temporaryLayerIn creates only the last component, with mkdir at mode 0700, so
+// a missing temporary directory is a refusal and never a tree of new
+// directories. The euid suffix keeps processes that run as different users
+// apart. A relative temporary directory is refused before anything is created,
+// because it would put the cache under the working directory.
+func temporaryLayerIn(tempDir string, mkdir func(string, os.FileMode) error) (Choice, bool) {
+	path := filepath.Join(tempDir, temporaryName+strconv.Itoa(os.Geteuid()))
 	choice := Choice{Layer: LayerTemporary, Path: path}
+	if !filepath.IsAbs(tempDir) {
+		choice.Err = &Refusal{Layer: LayerTemporary, Path: path, Err: fmt.Errorf("temporary directory %q must be absolute", tempDir)}
+		return choice, true
+	}
 	// A directory that already exists, whoever owns it, answers EEXIST here and
-	// goes to the private checks. Another worker that wins the race to create it
-	// gets the same answer.
-	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+	// goes to the private checks untouched. Another worker that wins the race to
+	// create it gets the same answer.
+	err := mkdir(path, 0o700)
+	if err == nil {
+		err = secureCreated(path)
+	} else if errors.Is(err, os.ErrExist) {
+		err = nil
+	}
+	if err != nil {
 		choice.Err = &Refusal{Layer: LayerTemporary, Path: path, Err: err}
 		return choice, true
 	}
 	return open(choice), true
 }
 
+// secureCreated sets a directory this process just created to exactly 0700,
+// because the umask may have stripped owner bits from the requested mode. It
+// confirms first that the name still holds a directory owned by the effective
+// user, so a name swapped in after the creation is never changed. It is never
+// called for a directory that already existed.
+func secureCreated(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if err := directoryPolicy.PrivateInfo(path, info, true); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o700) // #nosec G302 -- a directory needs owner search; this is the private mode, not a widening
+}
+
 // open fills in the choice by opening its path through the private-directory
-// checks.
+// checks. A directory that passes them but lacks owner read, write, or search
+// access is refused with that reason, because the owner could not use it and the
+// operating system would only say permission denied.
 func open(choice Choice) Choice {
+	if err := requireOwnerAccess(choice.Path); err != nil {
+		choice.Err = &Refusal{Layer: choice.Layer, Path: choice.Path, Err: err}
+		return choice
+	}
 	root, err := directoryPolicy.OpenRoot(choice.Path)
 	if err != nil {
 		choice.Err = &Refusal{Layer: choice.Layer, Path: choice.Path, Err: err}
@@ -147,4 +212,27 @@ func open(choice Choice) Choice {
 	}
 	choice.Root = root
 	return choice
+}
+
+// requireOwnerAccess refuses an absolute path that names a private directory
+// without owner read, write, and search. Anything else, including a path the
+// private checks refuse, is left to OpenRoot to report.
+func requireOwnerAccess(path string) error {
+	if !filepath.IsAbs(path) {
+		return nil
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || directoryPolicy.PrivateInfo(path, info, true) != nil {
+		return nil
+	}
+	if info.Mode().Perm()&0o700 == 0o700 {
+		return nil
+	}
+	return &unsafeDirectory{
+		unsafe: &privatefile.UnsafePathError{
+			Path: path, UID: os.Geteuid(), EUID: os.Geteuid(), Mode: info.Mode(), WantDirectory: true, Cause: privatefile.ErrUnsafeMode,
+		},
+		text: fmt.Sprintf("%v: %s has mode %04o and its owner needs read, write, and search access",
+			privatefile.ErrUnsafeMode, path, info.Mode().Perm()),
+	}
 }
