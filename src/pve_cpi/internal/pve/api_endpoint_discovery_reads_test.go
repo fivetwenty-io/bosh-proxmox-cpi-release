@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -63,16 +64,27 @@ type discCluster struct {
 	statusErr   error
 	certFailure map[string]error
 	rootless    map[string]bool
+	// names are the cluster members the config nodes answer lists.
+	names []string
+	// membersErr fails the config nodes read.
+	membersErr error
+	// hang makes a node's certificates/info block until its context ends.
+	hang map[string]bool
+	// certDelay holds every certificates/info read that long, so reads overlap.
+	certDelay   time.Duration
+	inflight    int
+	maxInflight int
 }
 
 func newDiscCluster(t *testing.T) *discCluster {
 	t.Helper()
 	root, fingerprint, der := clusterIdentityRootFixture(t, 11, true)
 	d := &discCluster{t: t, root: root, rootFP: fingerprint, rootDER: der,
-		certFailure: map[string]error{}, rootless: map[string]bool{}}
+		certFailure: map[string]error{}, rootless: map[string]bool{}, hang: map[string]bool{}}
 	for _, name := range []string{"pve1", "pve2", "pve3"} {
 		d.nodeRows = append(d.nodeRows, d.nodeRow(name, true))
 	}
+	d.names = []string{"pve1", "pve2", "pve3"}
 	d.statusRows = []json.RawMessage{
 		jsonRow(t, map[string]any{"type": "cluster", "name": "lab", "quorate": 1, "nodes": 3}),
 		jsonRow(t, map[string]any{"type": "node", "name": "pve1", "online": 1, "local": 1}),
@@ -80,6 +92,39 @@ func newDiscCluster(t *testing.T) *discCluster {
 		jsonRow(t, map[string]any{"type": "node", "name": "pve3", "online": 0, "local": 0}),
 	}
 	return d
+}
+
+// setNodes replaces the cluster with the named members, each online in /nodes,
+// and a quorate status that answers from local. A name in offline is reported
+// offline by the status.
+func (d *discCluster) setNodes(local string, names []string, offline ...string) {
+	d.names = names
+	d.nodeRows = nil
+	d.statusRows = []json.RawMessage{
+		jsonRow(d.t, map[string]any{"type": "cluster", "name": "lab", "quorate": 1, "nodes": len(names)}),
+	}
+	for _, name := range names {
+		d.nodeRows = append(d.nodeRows, d.nodeRow(name, true))
+		d.statusRows = append(d.statusRows, jsonRow(d.t, map[string]any{
+			"type": "node", "name": name, "local": boolInt(name == local), "online": boolInt(!slices.Contains(offline, name)),
+		}))
+	}
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// certReads returns the nodes certificates/info was read for, sorted.
+func (d *discCluster) certReads() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	reads := slices.Clone(d.certCalls)
+	slices.Sort(reads)
+	return reads
 }
 
 func (d *discCluster) nodeRow(name string, withFingerprint bool) json.RawMessage {
@@ -103,10 +148,31 @@ func (d *discCluster) client() *discClient {
 				rows := sdknodes.ListNodesResponse(slices.Clone(d.nodeRows))
 				return &rows, nil
 			},
-			listCertificatesInfoFn: func(_ context.Context, node string) (*sdknodes.ListCertificatesInfoResponse, error) {
+			listCertificatesInfoFn: func(ctx context.Context, node string) (*sdknodes.ListCertificatesInfoResponse, error) {
+				d.mu.Lock()
+				d.certCalls = append(d.certCalls, node)
+				d.inflight++
+				d.maxInflight = max(d.maxInflight, d.inflight)
+				hang, delay := d.hang[node], d.certDelay
+				d.mu.Unlock()
+				defer func() {
+					d.mu.Lock()
+					d.inflight--
+					d.mu.Unlock()
+				}()
+				if hang {
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}
+				if delay > 0 {
+					select {
+					case <-time.After(delay):
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				}
 				d.mu.Lock()
 				defer d.mu.Unlock()
-				d.certCalls = append(d.certCalls, node)
 				if err := d.certFailure[node]; err != nil {
 					return nil, err
 				}
@@ -126,10 +192,12 @@ func (d *discCluster) client() *discClient {
 			listConfigNodesFn: func(context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
 				d.mu.Lock()
 				defer d.mu.Unlock()
-				rows := sdkcluster.ListConfigNodesResponse{
-					jsonRow(d.t, map[string]any{"name": "pve1"}),
-					jsonRow(d.t, map[string]any{"name": "pve2"}),
-					jsonRow(d.t, map[string]any{"name": "pve3"}),
+				if d.membersErr != nil {
+					return nil, d.membersErr
+				}
+				rows := sdkcluster.ListConfigNodesResponse{}
+				for _, name := range d.names {
+					rows = append(rows, jsonRow(d.t, map[string]any{"name": name}))
 				}
 				return &rows, nil
 			},
@@ -193,11 +261,151 @@ func TestReadDiscovery_FullRead(t *testing.T) {
 func TestReadDiscovery_RootComesFromTheNodeThatAnswered(t *testing.T) {
 	t.Parallel()
 	d := newDiscCluster(t)
+	// pve2 is local, and pve1 would come first in name order.
+	d.setNodes("pve2", []string{"pve1", "pve2", "pve3"})
+	reads, err := ReadDiscovery(lgCtx(), d.client())
+	if err != nil {
+		t.Fatalf("ReadDiscovery: %v", err)
+	}
+	if calls := d.certReads(); len(calls) == 0 {
+		t.Fatal("no certificate read")
+	}
+	if d.certCalls[0] != "pve2" {
+		t.Fatalf("first certificates/info call = %v, want the local node first", d.certCalls)
+	}
+	if len(reads.Nodes[1].CertPins) != 2 {
+		t.Fatalf("the local node's pins come from the root read: %v", reads.Nodes[1].CertPins)
+	}
+}
+
+func TestReadDiscovery_WithoutAStatusTheFirstOnlineNodeAnswersTheRoot(t *testing.T) {
+	t.Parallel()
+	d := newDiscCluster(t)
+	d.statusErr = &sdkerrors.APIError{HTTPCode: 403, Message: "Permission check failed (/, Sys.Audit)"}
+	fingerprint, _ := discFingerprint("node:pve1")
+	d.nodeRows[0] = jsonRow(t, map[string]any{"node": "pve1", "status": "offline", "ssl_fingerprint": fingerprint})
+	reads, err := ReadDiscovery(lgCtx(), d.client())
+	if err != nil {
+		t.Fatalf("ReadDiscovery: %v", err)
+	}
+	if reads.Status.Available {
+		t.Fatal("the status must be unavailable")
+	}
+	if d.certCalls[0] != "pve2" {
+		t.Fatalf("first certificates/info call = %v, want pve2, the first node /nodes lists as online", d.certCalls)
+	}
+	if len(d.certCalls) != 3 || slices.Contains(d.certCalls[1:], "pve2") || d.certCalls[0] == "pve1" {
+		t.Fatalf("calls = %v, want pve2 once, from the root read", d.certCalls)
+	}
+}
+
+func TestReadDiscovery_EachNodeIsReadOnceAndOnlyWhenItCanMakeTheResult(t *testing.T) {
+	t.Parallel()
+	d := newDiscCluster(t)
 	if _, err := ReadDiscovery(lgCtx(), d.client()); err != nil {
 		t.Fatalf("ReadDiscovery: %v", err)
 	}
-	if len(d.certCalls) == 0 || d.certCalls[0] != "pve1" {
-		t.Fatalf("first certificates/info call = %v, want the local node first", d.certCalls)
+	if got := d.certReads(); !slices.Equal(got, []string{"pve1", "pve2", "pve3"}) {
+		t.Fatalf("calls = %v, want each node once, the local one from the root read alone", got)
+	}
+
+	// Rows with a missing or unparseable fingerprint, a repeat of a name in
+	// another case, and a name the helper rejects are never read.
+	d = newDiscCluster(t)
+	d.nodeRows = append(d.nodeRows,
+		d.nodeRow("pve4", false),
+		jsonRow(t, map[string]any{"node": "pve5", "status": "online", "ssl_fingerprint": "AA:BB"}),
+		d.nodeRow("PVE2", true),
+		d.nodeRow("localhost", true))
+	if _, err := ReadDiscovery(lgCtx(), d.client()); err != nil {
+		t.Fatalf("ReadDiscovery: %v", err)
+	}
+	if got := d.certReads(); !slices.Equal(got, []string{"pve1", "pve2", "pve3"}) {
+		t.Fatalf("calls = %v, want only the nodes that can make the result", got)
+	}
+
+	// Without a status the only row is the seed's own node, and the root read
+	// is the one call.
+	d = newDiscCluster(t)
+	d.nodeRows = d.nodeRows[:1]
+	d.statusErr = errors.New("no status")
+	if _, err := ReadDiscovery(lgCtx(), d.client()); err != nil {
+		t.Fatalf("ReadDiscovery: %v", err)
+	}
+	if got := d.certReads(); !slices.Equal(got, []string{"pve1"}) {
+		t.Fatalf("calls = %v, want the root read alone", got)
+	}
+}
+
+func TestReadDiscovery_HungCertificateReadKeepsTheResult(t *testing.T) {
+	t.Parallel()
+	d := newDiscCluster(t)
+	d.hang["pve3"] = true
+	start := time.Now()
+	reads, err := readDiscovery(lgCtx(), d.client(), 30*time.Second, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("ReadDiscovery: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("one hung node took %v, want about its own 100ms timeout", elapsed)
+	}
+	if len(reads.Nodes[0].CertPins) != 2 || len(reads.Nodes[1].CertPins) != 2 || len(reads.Nodes[2].CertPins) != 0 {
+		t.Fatalf("cert pins = %v, %v, %v, want only the hung pve3 empty",
+			reads.Nodes[0].CertPins, reads.Nodes[1].CertPins, reads.Nodes[2].CertPins)
+	}
+	if reads.Nodes[2].Fingerprint == "" || reads.RootCA == ([sha256.Size]byte{}) {
+		t.Fatalf("the node keeps its /nodes fingerprint and the root stands: %+v", reads)
+	}
+}
+
+func TestReadDiscovery_OverallDeadlineCutsTheRemainingReads(t *testing.T) {
+	t.Parallel()
+	d := newDiscCluster(t)
+	d.setNodes("pve1", []string{"pve1", "pve2", "pve3", "pve4", "pve5", "pve6", "pve7"})
+	for _, name := range d.names[1:] {
+		d.hang[name] = true
+	}
+	start := time.Now()
+	reads, err := readDiscovery(lgCtx(), d.client(), 300*time.Millisecond, 30*time.Second)
+	if err != nil {
+		t.Fatalf("ReadDiscovery: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("the cut took %v, want about the 300ms deadline", elapsed)
+	}
+	if len(reads.Nodes) != 7 || len(reads.Nodes[0].CertPins) != 2 {
+		t.Fatalf("the root node keeps its pins and every row stands: %+v", reads.Nodes)
+	}
+	for _, node := range reads.Nodes[1:] {
+		if len(node.CertPins) != 0 || node.Fingerprint == "" {
+			t.Fatalf("node %+v, want its /nodes fingerprint alone", node)
+		}
+	}
+	if got := len(d.certReads()); got > 1+discoveryCertWorkers {
+		t.Fatalf("%d reads, want the root read and at most one per worker before the cut", got)
+	}
+}
+
+func TestReadDiscovery_CertificateReadsRunAtMostFourAtOnce(t *testing.T) {
+	t.Parallel()
+	d := newDiscCluster(t)
+	var names []string
+	for i := 0; i < 20; i++ {
+		names = append(names, fmt.Sprintf("pve%02d", i))
+	}
+	d.setNodes("pve00", names)
+	d.certDelay = 20 * time.Millisecond
+	if _, err := ReadDiscovery(lgCtx(), d.client()); err != nil {
+		t.Fatalf("ReadDiscovery: %v", err)
+	}
+	if d.maxInflight > 4 {
+		t.Fatalf("%d certificate reads ran at once, want at most 4", d.maxInflight)
+	}
+	if d.maxInflight < 2 {
+		t.Fatalf("%d certificate read at a time, want the reads to overlap", d.maxInflight)
+	}
+	if got := len(d.certReads()); got != 20 {
+		t.Fatalf("%d reads, want 20", got)
 	}
 }
 
@@ -260,6 +468,38 @@ func TestReadDiscovery_NodesFailureAndEmptyListGiveNoResult(t *testing.T) {
 	}
 	if len(d.certCalls) != 0 {
 		t.Fatalf("an empty /nodes must stop before certificates/info, got calls %v", d.certCalls)
+	}
+}
+
+func TestReadDiscovery_ErrorsCarryNoServerText(t *testing.T) {
+	t.Parallel()
+	const secret = "SECRET-BODY-TEXT token=abc"
+	d := newDiscCluster(t)
+	d.nodesErr = &sdkerrors.APIError{HTTPCode: 500, Message: secret}
+	_, err := ReadDiscovery(lgCtx(), d.client())
+	if !errors.Is(err, ErrDiscoveryNodes) {
+		t.Fatalf("err = %v, want ErrDiscoveryNodes", err)
+	}
+	if strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), "token") {
+		t.Fatalf("the error echoes the server's message: %v", err)
+	}
+	if want := ErrDiscoveryNodes.Error() + " (HTTP 500)"; err.Error() != want {
+		t.Fatalf("err = %q, want %q", err.Error(), want)
+	}
+
+	// The root read fails on every node, and the member list read fails with
+	// a message of its own.
+	d = newDiscCluster(t)
+	for _, name := range d.names {
+		d.certFailure[name] = errors.New(secret)
+	}
+	d.membersErr = &sdkerrors.APIError{HTTPCode: 500, Message: secret}
+	_, err = ReadDiscovery(lgCtx(), d.client())
+	if !errors.Is(err, ErrDiscoveryRoot) {
+		t.Fatalf("err = %v, want ErrDiscoveryRoot", err)
+	}
+	if strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), "pve1") {
+		t.Fatalf("the error echoes server text or a node name: %v", err)
 	}
 }
 
@@ -378,24 +618,58 @@ func TestReadDiscovery_AmbiguousNamesGetNoCertificateRead(t *testing.T) {
 	}
 }
 
-func TestReadDiscovery_CertificateReadsAreCapped(t *testing.T) {
+func TestReadDiscovery_CertificateReadsAreCappedInPreferenceOrder(t *testing.T) {
 	t.Parallel()
 	d := newDiscCluster(t)
-	d.nodeRows = nil
-	for i := 0; i < 200; i++ {
-		d.nodeRows = append(d.nodeRows, d.nodeRow(fmt.Sprintf("n%03d", i), true))
+	var names, offline []string
+	for i := 0; i < 100; i++ {
+		name := fmt.Sprintf("n%03d", i)
+		names = append(names, name)
+		if i < 40 {
+			offline = append(offline, name)
+		}
 	}
+	// n000 answers. The status reports n000 through n039 offline, so the 64
+	// reads go to n040 through n099 and then to n001 through n004.
+	d.setNodes("n000", names, offline...)
 	if _, err := ReadDiscovery(lgCtx(), d.client()); err != nil {
 		t.Fatalf("ReadDiscovery: %v", err)
 	}
-	perNode := 0
-	for _, name := range d.certCalls {
-		if strings.HasPrefix(name, "n") {
-			perNode++
-		}
+	want := slices.Clone(names[40:])
+	want = append(want, "n000", "n001", "n002", "n003", "n004")
+	slices.Sort(want)
+	got := d.certReads()
+	if len(got) != 65 {
+		t.Fatalf("%d certificate reads, want the root read and exactly 64 more", len(got))
 	}
-	if perNode != discoveryCertNodeLimit {
-		t.Fatalf("%d node certificate reads, want exactly %d", perNode, discoveryCertNodeLimit)
+	if !slices.Equal(got, want) {
+		t.Fatalf("reads = %v, want the online nodes first and then the lowest names", got)
+	}
+}
+
+func TestReadDiscovery_CertificateReadsFollowTheNodesStatusWithoutAStatus(t *testing.T) {
+	t.Parallel()
+	d := newDiscCluster(t)
+	d.nodeRows = nil
+	for i := 0; i < 70; i++ {
+		row := map[string]any{"node": fmt.Sprintf("n%03d", i), "status": "offline"}
+		if i >= 10 {
+			row["status"] = "online"
+		}
+		fingerprint, _ := discFingerprint(fmt.Sprintf("node:n%03d", i))
+		row["ssl_fingerprint"] = fingerprint
+		d.nodeRows = append(d.nodeRows, jsonRow(t, row))
+	}
+	d.statusErr = errors.New("no status")
+	if _, err := ReadDiscovery(lgCtx(), d.client()); err != nil {
+		t.Fatalf("ReadDiscovery: %v", err)
+	}
+	// The root read goes to n010, the first online row, and it counts as one
+	// of the 64, so 63 more reads reach n011 through n069 and then n000
+	// through n003.
+	got := d.certReads()
+	if len(got) != 64 || slices.Contains(got, "n004") || !slices.Contains(got, "n010") || !slices.Contains(got, "n003") {
+		t.Fatalf("reads = %v, want 64 with the online nodes first", got)
 	}
 }
 

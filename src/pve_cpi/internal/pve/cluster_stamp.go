@@ -43,7 +43,7 @@ const clusterStampHexLen = 8
 // Every failure is retriable. The error names the nodes tried and the reason
 // each one failed, and never carries the certificate answer or PEM data.
 func ReadClusterStamp(ctx context.Context, c Client, preferred string) (string, error) {
-	digest, err := readClusterRoot(ctx, c, preferred, "ReadClusterStamp")
+	digest, err := readClusterRoot(ctx, c, preferred, "ReadClusterStamp", nil)
 	if err != nil {
 		return "", err
 	}
@@ -57,12 +57,18 @@ func ReadClusterStamp(ctx context.Context, c Client, preferred string) (string, 
 // accepts roots, and fails exactly as ReadClusterStamp does, except that the
 // error names ReadClusterRootDigest.
 func ReadClusterRootDigest(ctx context.Context, c Client, preferred string) ([sha256.Size]byte, error) {
-	return readClusterRoot(ctx, c, preferred, "ReadClusterRootDigest")
+	return readClusterRoot(ctx, c, preferred, "ReadClusterRootDigest", nil)
 }
 
 // readClusterRoot is the read both ReadClusterStamp and ReadClusterRootDigest
-// make. op names the caller in its errors.
-func readClusterRoot(ctx context.Context, c Client, preferred, op string) ([sha256.Size]byte, error) {
+// make. op names the caller in its errors. answered, when not nil, receives
+// the node whose certificates/info answer produced the root, along with that
+// answer, so a caller that also wants the node's own certificates need not
+// ask again.
+func readClusterRoot(
+	ctx context.Context, c Client, preferred, op string,
+	answered func(node string, response *nodes.ListCertificatesInfoResponse),
+) ([sha256.Size]byte, error) {
 	var zero [sha256.Size]byte
 	if ctx == nil {
 		return zero, cpierrors.Retriable("%s: context is required", op)
@@ -80,10 +86,13 @@ func readClusterRoot(ctx context.Context, c Client, preferred, op string) ([sha2
 	tried := map[string]bool{}
 	attempt := func(node string) ([sha256.Size]byte, bool) {
 		tried[node] = true
-		digest, err := readNodeClusterRoot(bounded, c.Nodes(), node)
+		digest, response, err := readNodeClusterRoot(bounded, c.Nodes(), node)
 		if err != nil {
 			failures = append(failures, fmt.Sprintf("node %q: %s", node, err.Error()))
 			return zero, false
+		}
+		if answered != nil {
+			answered(node, response)
 		}
 		return digest, true
 	}
@@ -129,18 +138,22 @@ func stampFailureSummary(failures []string, tail string) string {
 }
 
 // readNodeClusterRoot reads one node's certificates/info answer and returns
-// the root digest from it. The returned error text is one of the fixed reasons
-// the root parser produces, or a fixed transport reason, so it never echoes
-// the API answer.
+// the root digest and the answer. The returned error text is one of the fixed
+// reasons the root parser produces, or a fixed transport reason, so it never
+// echoes the API answer.
 func readNodeClusterRoot(
 	ctx context.Context, service StorageClusterCertificateService, node string,
-) ([sha256.Size]byte, error) {
+) ([sha256.Size]byte, *nodes.ListCertificatesInfoResponse, error) {
 	var zero [sha256.Size]byte
 	response, err := service.ListCertificatesInfo(ctx, node)
 	if err != nil {
-		return zero, errors.New("certificate observation failed")
+		return zero, nil, errors.New("certificate observation failed")
 	}
-	return clusterStampDigest(response)
+	digest, err := clusterStampDigest(response)
+	if err != nil {
+		return zero, nil, err
+	}
+	return digest, response, nil
 }
 
 // clusterStampDigest returns the SHA-256 of the cluster root's DER bytes, or

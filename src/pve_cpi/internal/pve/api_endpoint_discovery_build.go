@@ -48,12 +48,17 @@ const (
 
 // Build failures. As with the read failures, each means no result.
 var (
-	// ErrDiscoveryInput means the caller gave the builder no resolver.
-	ErrDiscoveryInput = errors.New("discovery: a name resolver is required")
+	// ErrDiscoveryInput means the caller gave the builder no resolver, or a
+	// seed that is not a host:port with a host. The seed always carries a
+	// port, so one without is a caller bug and not a cluster to back off from.
+	ErrDiscoveryInput = errors.New("discovery: a name resolver and a seed of the form host:port are required")
 )
 
 // NameResolver reports whether a derived host name resolves, by returning nil
-// when it does. The builder bounds each call with a timeout.
+// when it does. A resolver should honor its context. The builder does not wait
+// past the timeout for one that ignores it, and counts the name as unresolved,
+// but that lookup goes on running in its goroutine and can outlive the
+// builder. The builder runs at most maxDiscoveredNodes lookups at once.
 type NameResolver func(ctx context.Context, host string) error
 
 // DropReason says why the builder left a node out of a result. It is an
@@ -81,8 +86,6 @@ const (
 	DropUnaddressable DropReason = "unaddressable"
 	// DropConfigured is a node whose address is a configured endpoint.
 	DropConfigured DropReason = "configured"
-	// DropDuplicateAddress is a node whose address an earlier node has.
-	DropDuplicateAddress DropReason = "duplicate_address"
 	// DropUnresolved is a node whose derived name did not resolve in time.
 	DropUnresolved DropReason = "unresolved"
 	// DropOverCap is a node past the 64-node limit.
@@ -105,8 +108,11 @@ type DiscoveredNode struct {
 	// Pins is the node's pin set. It starts with the /nodes fingerprint and
 	// follows with the node's own certificate fingerprints, without repeats.
 	Pins []endpointpool.Pin
-	// Online is the flag the order used. It is the /cluster/status flag for a
-	// quorate status and the /nodes status field otherwise.
+	// Online is the flag the order used. It is the /cluster/status online flag
+	// for a quorate status, and the /nodes status field when there is no
+	// status. It is false for every node when the status is not quorate,
+	// because a minority node reports the majority offline and those flags
+	// cannot be trusted.
 	Online bool
 }
 
@@ -142,14 +148,16 @@ type DiscoveryInput struct {
 // resolver the caller injected.
 //
 // A node name that breaks the pve-node format, or no nodes at all, or a zero
-// root, returns an error from this package's discovery errors and no result.
+// root, or no resolver, or a seed that is not host:port, returns an error from
+// this package's discovery errors and no result.
 // A name that passes the format but is ambiguous leaves only that node out.
 //
 // A standalone host, which is a status without a cluster row next to one
 // node, gets the standalone outcome. A seed that cannot derive names gets the
 // public_suffix outcome when its domain is a public suffix and no_candidates
 // when the seed is not a name, as for a seed whose last label is all digits.
-// Otherwise the builder leaves out the node that answered, a node with a
+// Otherwise the builder leaves out the node that answered, which without a
+// status is the only node /nodes lists, a node with a
 // missing or malformed ssl_fingerprint, a node whose address is a configured
 // endpoint or repeats, and a node whose derived name does not resolve within
 // the timeout. It resolves names in parallel, in batches that never exceed the
@@ -158,13 +166,17 @@ type DiscoveryInput struct {
 // The order puts the nodes a quorate status reports online first, in name
 // order, and the rest after them. A status that is not quorate has online
 // flags that cannot be trusted, since a minority node reports every majority
-// member offline, so those results keep every node in name order. Without a
-// status the order uses the /nodes status field.
+// member offline, so those results keep every node in name order and report
+// none of them online. Without a status the order uses the /nodes status
+// field.
 func BuildDiscoveryResult(ctx context.Context, reads DiscoveryReads, in DiscoveryInput) (DiscoveryResult, error) {
 	if ctx == nil {
 		return DiscoveryResult{}, errors.New("discovery: ctx must not be nil")
 	}
 	if in.Resolver == nil {
+		return DiscoveryResult{}, ErrDiscoveryInput
+	}
+	if host, _, err := net.SplitHostPort(in.Seed); err != nil || host == "" {
 		return DiscoveryResult{}, ErrDiscoveryInput
 	}
 	if len(reads.Nodes) == 0 {
@@ -221,7 +233,6 @@ func discoveryCandidates(
 ) []DiscoveredNode {
 	configured := normalizedEndpointSet(append([]string{in.Seed}, in.Configured...))
 	seenNames := map[string]bool{}
-	seenAddresses := map[string]bool{}
 	var candidates []DiscoveredNode
 	drop := func(name string, reason DropReason) {
 		result.Dropped = append(result.Dropped, DroppedNode{Name: name, Reason: reason})
@@ -237,7 +248,7 @@ func discoveryCandidates(
 			continue
 		}
 		seenNames[key] = true
-		if reads.Status.Local != "" && strings.EqualFold(reads.Status.Local, row.Name) {
+		if isSeedNode(reads.Status, len(reads.Nodes), row.Name) {
 			drop(row.Name, DropSeedNode)
 			continue
 		}
@@ -255,16 +266,10 @@ func discoveryCandidates(
 			drop(row.Name, reason)
 			continue
 		}
-		normalized := normalizedEndpoint(address)
-		switch {
-		case configured[normalized]:
+		if configured[normalizedEndpoint(address)] {
 			drop(row.Name, DropConfigured)
 			continue
-		case seenAddresses[normalized]:
-			drop(row.Name, DropDuplicateAddress)
-			continue
 		}
-		seenAddresses[normalized] = true
 		pins := []endpointpool.Pin{fingerprint}
 		for _, pin := range row.CertPins {
 			if !slices.Contains(pins, pin) {
@@ -275,28 +280,52 @@ func discoveryCandidates(
 			Name:    row.Name,
 			Address: address,
 			Pins:    pins,
-			Online:  nodeOnline(reads, row),
+			Online:  nodeOnline(reads.Status, row),
 		})
 	}
-	orderByOnline := !reads.Status.Available || reads.Status.Quorate
 	slices.SortStableFunc(candidates, func(a, b DiscoveredNode) int {
-		if orderByOnline && a.Online != b.Online {
-			if a.Online {
-				return -1
-			}
-			return 1
-		}
-		return strings.Compare(a.Name, b.Name)
+		return compareNodePreference(a.Online, b.Online, a.Name, b.Name)
 	})
 	return candidates
 }
 
-// nodeOnline returns the online flag the order uses for row.
-func nodeOnline(reads DiscoveryReads, row DiscoveryNodeRead) bool {
-	if reads.Status.Available && reads.Status.Quorate {
-		return reads.Status.Online[row.Name]
+// isSeedNode reports whether name is the node that answered the reads. A
+// status names it. Without a status, a /nodes list of exactly one row can only
+// be the node that answered.
+func isSeedNode(status DiscoveryStatus, rowCount int, name string) bool {
+	switch {
+	case status.Local != "":
+		return strings.EqualFold(status.Local, name)
+	case !status.Available:
+		return rowCount == 1
 	}
-	return row.Status == nodeStatusOnlineValue
+	return false
+}
+
+// nodeOnline returns the online flag the order uses for row. A quorate status
+// gives its own flag and no status gives the /nodes status field. A status
+// that is not quorate gives none, so every node reads offline and the order
+// falls back to names.
+func nodeOnline(status DiscoveryStatus, row DiscoveryNodeRead) bool {
+	switch {
+	case !status.Available:
+		return row.Status == nodeStatusOnlineValue
+	case status.Quorate:
+		return status.Online[row.Name]
+	}
+	return false
+}
+
+// compareNodePreference orders online nodes before the rest, and each group by
+// name.
+func compareNodePreference(aOnline, bOnline bool, aName, bName string) int {
+	if aOnline != bOnline {
+		if aOnline {
+			return -1
+		}
+		return 1
+	}
+	return strings.Compare(aName, bName)
 }
 
 // normalizedEndpoint returns the pool's comparison form of a host:port, or an
@@ -331,6 +360,10 @@ func resolveCandidates(
 	ctx context.Context, candidates []DiscoveredNode, resolver NameResolver, timeout time.Duration,
 	result *DiscoveryResult,
 ) error {
+	// slots bounds the lookups running at once. A lookup that ignores its
+	// context keeps its slot until it returns, so a name that cannot get one
+	// before its timeout counts as unresolved.
+	slots := make(chan struct{}, maxDiscoveredNodes)
 	next := 0
 	for next < len(candidates) && len(result.Nodes) < maxDiscoveredNodes {
 		batch := candidates[next:min(next+maxDiscoveredNodes-len(result.Nodes), len(candidates))]
@@ -339,7 +372,7 @@ func resolveCandidates(
 		var wg sync.WaitGroup
 		for i, candidate := range batch {
 			wg.Go(func() {
-				resolved[i] = resolvesWithin(ctx, resolver, candidate.Address, timeout)
+				resolved[i] = resolvesWithin(ctx, resolver, candidate.Address, timeout, slots)
 			})
 		}
 		wg.Wait()
@@ -361,15 +394,34 @@ func resolveCandidates(
 }
 
 // resolvesWithin reports whether resolver accepts the host of address within
-// timeout.
-func resolvesWithin(ctx context.Context, resolver NameResolver, address string, timeout time.Duration) bool {
+// timeout. The lookup runs in its own goroutine, so a resolver that ignores
+// its context cannot hold the caller past the timeout. Such a lookup is left
+// to finish on its own and keeps its slot until it does.
+func resolvesWithin(
+	ctx context.Context, resolver NameResolver, address string, timeout time.Duration, slots chan struct{},
+) bool {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return false
 	}
 	bounded, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return resolver(bounded, host) == nil && bounded.Err() == nil
+	select {
+	case slots <- struct{}{}:
+	case <-bounded.Done():
+		return false
+	}
+	done := make(chan error, 1)
+	go func() {
+		defer func() { <-slots }()
+		done <- resolver(bounded, host)
+	}()
+	select {
+	case err = <-done:
+		return err == nil && bounded.Err() == nil
+	case <-bounded.Done():
+		return false
+	}
 }
 
 // LookupHostResolver returns a NameResolver that asks r, or the default

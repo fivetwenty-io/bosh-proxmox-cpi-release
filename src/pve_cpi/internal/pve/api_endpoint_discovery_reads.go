@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -27,11 +28,13 @@ const (
 	// discoveryCertWorkers is the number of certificates/info reads that run
 	// at once.
 	discoveryCertWorkers = 4
+	// discoveryCertTimeout bounds one certificates/info read. A read also ends
+	// with the overall deadline, so it gets the smaller of the two.
+	discoveryCertTimeout = 5 * time.Second
 	// discoveryCertNodeLimit is the most nodes whose certificates/info is
-	// read. The result holds at most maxDiscoveredNodes nodes, so a longer
-	// /nodes list is no reason to make an unbounded number of calls. A node
-	// past the limit, in name order, is pinned by its /nodes fingerprint alone.
-	discoveryCertNodeLimit = 2 * maxDiscoveredNodes
+	// read, which is the most the result can hold. A node past the limit, in
+	// the order the builder prefers, is pinned by its /nodes fingerprint alone.
+	discoveryCertNodeLimit = maxDiscoveredNodes
 
 	nodeCertFilename      = "pve-ssl.pem"
 	proxyCertFilename     = "pveproxy-ssl.pem"
@@ -39,8 +42,9 @@ const (
 	nodeStatusOnlineValue = "online"
 )
 
-// Read failures. Each one means discovery writes no result. None of them
-// echoes a node name, an API answer, or certificate data.
+// Read failures. Each one means discovery writes no result. Their text is a
+// fixed reason, with the HTTP status code when the server gave one, and never
+// echoes an API answer, a node name, or certificate data.
 var (
 	// ErrDiscoveryNodes means GET /nodes failed or listed no nodes, so there
 	// is nothing to pin and nothing to trust.
@@ -53,6 +57,25 @@ var (
 	// result has no identity to record.
 	ErrDiscoveryRoot = errors.New("discovery: the cluster root CA could not be read")
 )
+
+// discoveryReadError reports a read failure as a fixed reason. Error returns
+// base's text and the HTTP status code, never the cause's text, so a server
+// message cannot reach a log or a payload. Unwrap keeps base and the cause
+// for errors.Is and errors.As.
+type discoveryReadError struct {
+	base  error
+	code  int
+	cause error
+}
+
+func (e *discoveryReadError) Error() string {
+	if e.code > 0 {
+		return fmt.Sprintf("%s (HTTP %d)", e.base.Error(), e.code)
+	}
+	return e.base.Error()
+}
+
+func (e *discoveryReadError) Unwrap() []error { return []error{e.base, e.cause} }
 
 // DiscoveryNodeRead is what the reads learned about one node.
 type DiscoveryNodeRead struct {
@@ -106,10 +129,17 @@ type DiscoveryReads struct {
 // pve-node format, or a root CA no node can answer returns an error from this
 // file's Err values, because without them nothing can be trusted and
 // discovery writes nothing. A failure of GET /cluster/status only clears
-// Status.Available, and a failure of one node's certificates/info only leaves
-// that node pinned by its /nodes fingerprint. Cancellation of ctx returns its
+// Status.Available. A certificates/info read that fails, or that outlasts its
+// own timeout or the overall deadline, only leaves that node pinned by its
+// /nodes fingerprint, and the result stands. Cancellation of ctx returns its
 // error.
 func ReadDiscovery(ctx context.Context, c Client) (DiscoveryReads, error) {
+	return readDiscovery(ctx, c, discoveryReadTimeout, discoveryCertTimeout)
+}
+
+// readDiscovery is ReadDiscovery with its two time bounds as arguments, so a
+// test can use short ones.
+func readDiscovery(ctx context.Context, c Client, overall, certTimeout time.Duration) (DiscoveryReads, error) {
 	if ctx == nil {
 		return DiscoveryReads{}, cpierrors.Cloud("ReadDiscovery: ctx must not be nil")
 	}
@@ -119,7 +149,7 @@ func ReadDiscovery(ctx context.Context, c Client) (DiscoveryReads, error) {
 	if err := ctx.Err(); err != nil {
 		return DiscoveryReads{}, fmt.Errorf("ReadDiscovery: read canceled: %w", err)
 	}
-	bounded, cancel := context.WithTimeout(ctx, discoveryReadTimeout)
+	bounded, cancel := context.WithTimeout(ctx, overall)
 	defer cancel()
 
 	rows, err := readDiscoveryNodes(bounded, c)
@@ -136,15 +166,48 @@ func ReadDiscovery(ctx context.Context, c Client) (DiscoveryReads, error) {
 	if err = bounded.Err(); err != nil {
 		return DiscoveryReads{}, fmt.Errorf("ReadDiscovery: read ended: %w", err)
 	}
-	reads.RootCA, err = ReadClusterRootDigest(bounded, c, reads.Status.Local)
-	if err != nil {
-		return DiscoveryReads{}, fmt.Errorf("%w: %w", ErrDiscoveryRoot, err)
+	// The node that answered is the best first try for the root. Without a
+	// status nothing marks it, so the first node /nodes lists as online stands
+	// in, which keeps an offline member from taking the first try.
+	preferred := reads.Status.Local
+	if !reads.Status.Available {
+		preferred = firstOnlineNode(rows)
 	}
-	readDiscoveryCertPins(bounded, c.Nodes(), reads.Nodes)
-	if err = bounded.Err(); err != nil {
+	var rootNode string
+	var rootAnswer *nodes.ListCertificatesInfoResponse
+	reads.RootCA, err = readClusterRoot(bounded, c, preferred, "ReadClusterRootDigest",
+		func(node string, response *nodes.ListCertificatesInfoResponse) { rootNode, rootAnswer = node, response })
+	if err != nil {
+		return DiscoveryReads{}, &discoveryReadError{base: ErrDiscoveryRoot, cause: err}
+	}
+	// The root read already holds that node's certificates, so it is not asked
+	// again.
+	if rootAnswer != nil {
+		for i := range rows {
+			if strings.EqualFold(rows[i].Name, rootNode) {
+				rows[i].CertPins = nodeCertificatePins(rootAnswer)
+				break
+			}
+		}
+	}
+	readDiscoveryCertPins(bounded, c.Nodes(), reads, rootNode, certTimeout)
+	// Only the caller's own context ends the run here. The overall deadline
+	// cutting the reads leaves the nodes it cut with their /nodes pin.
+	if err = ctx.Err(); err != nil {
 		return DiscoveryReads{}, fmt.Errorf("ReadDiscovery: read ended: %w", err)
 	}
 	return reads, nil
+}
+
+// firstOnlineNode returns the name of the first row whose /nodes status is
+// online and whose name is a valid node name, or empty when there is none.
+func firstOnlineNode(rows []DiscoveryNodeRead) string {
+	for _, row := range rows {
+		if row.Status == nodeStatusOnlineValue && endpointcache.ValidNodeName(row.Name) {
+			return row.Name
+		}
+	}
+	return ""
 }
 
 // readDiscoveryNodes reads GET /nodes through ListNodes and decodes the three
@@ -163,7 +226,8 @@ func readDiscoveryNodes(ctx context.Context, c Client) ([]DiscoveryNodeRead, err
 		}
 		return nil
 	}); err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrDiscoveryNodes, WrapError(err))
+		code, _ := apiHTTPCode(err)
+		return nil, &discoveryReadError{base: ErrDiscoveryNodes, code: code, cause: WrapError(err)}
 	}
 	if len(raws) == 0 {
 		return nil, ErrDiscoveryNodes
@@ -251,20 +315,53 @@ func readDiscoveryStatus(ctx context.Context, c Client) DiscoveryStatus {
 	return status
 }
 
-// readDiscoveryCertPins reads certificates/info for each node whose name the
-// helper accepts, in name order and up to discoveryCertNodeLimit nodes, and
-// stores the node's own certificate fingerprints in its row. A node whose read
-// fails keeps no CertPins. The caller checks ctx for cancellation afterward.
-func readDiscoveryCertPins(ctx context.Context, service StorageClusterCertificateService, rows []DiscoveryNodeRead) {
+// certReadOrder returns the indexes of the rows whose certificates/info can
+// matter, in the order the builder prefers them and at most
+// discoveryCertNodeLimit of them. It leaves out what the builder would drop
+// before it ever looked at a pin, which is a name the helper rejects, a repeat
+// of an earlier name, the seed's own node, and a row without a parseable
+// fingerprint.
+func certReadOrder(reads DiscoveryReads) []int {
+	seen := map[string]bool{}
 	var indexes []int
-	for i, row := range rows {
-		if endpointcache.ValidNodeName(row.Name) {
+	for i, row := range reads.Nodes {
+		key := strings.ToLower(row.Name)
+		if !endpointcache.ValidNodeName(row.Name) || seen[key] {
+			continue
+		}
+		seen[key] = true
+		if isSeedNode(reads.Status, len(reads.Nodes), row.Name) {
+			continue
+		}
+		if _, err := endpointpool.ParsePin(row.Fingerprint); err != nil {
+			continue
+		}
+		indexes = append(indexes, i)
+	}
+	slices.SortStableFunc(indexes, func(a, b int) int {
+		return compareNodePreference(
+			nodeOnline(reads.Status, reads.Nodes[a]), nodeOnline(reads.Status, reads.Nodes[b]),
+			reads.Nodes[a].Name, reads.Nodes[b].Name)
+	})
+	return indexes[:min(len(indexes), discoveryCertNodeLimit)]
+}
+
+// readDiscoveryCertPins reads certificates/info for the nodes certReadOrder
+// picks, except the node named answered, whose answer the root read already
+// holds, and stores each node's own certificate fingerprints in its row. At
+// most discoveryCertWorkers reads run at once, and each gets the smaller of
+// certTimeout and the time left on ctx. A node whose read fails or times out,
+// or that ctx ends before anyone reads, keeps no CertPins. The caller checks
+// its own context for cancellation afterward.
+func readDiscoveryCertPins(
+	ctx context.Context, service StorageClusterCertificateService, reads DiscoveryReads, answered string,
+	certTimeout time.Duration,
+) {
+	var indexes []int
+	for _, i := range certReadOrder(reads) {
+		if answered == "" || !strings.EqualFold(reads.Nodes[i].Name, answered) {
 			indexes = append(indexes, i)
 		}
-	}
-	slices.SortFunc(indexes, func(a, b int) int { return strings.Compare(rows[a].Name, rows[b].Name) })
-	if len(indexes) > discoveryCertNodeLimit {
-		indexes = indexes[:discoveryCertNodeLimit]
 	}
 	jobs := make(chan int)
 	var workers sync.WaitGroup
@@ -274,11 +371,13 @@ func readDiscoveryCertPins(ctx context.Context, service StorageClusterCertificat
 				if ctx.Err() != nil {
 					continue
 				}
-				response, err := service.ListCertificatesInfo(ctx, rows[i].Name)
+				readCtx, cancel := context.WithTimeout(ctx, certTimeout)
+				response, err := service.ListCertificatesInfo(readCtx, reads.Nodes[i].Name)
+				cancel()
 				if err != nil {
 					continue
 				}
-				rows[i].CertPins = nodeCertificatePins(response)
+				reads.Nodes[i].CertPins = nodeCertificatePins(response)
 			}
 		})
 	}

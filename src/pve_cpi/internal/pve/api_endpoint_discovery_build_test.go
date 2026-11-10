@@ -168,20 +168,30 @@ func TestBuildDiscoveryResult_SeedThatIsNotANameGetsNoCandidates(t *testing.T) {
 		Status: quorateStatus("pve1", "pve1", "pve2"),
 		RootCA: discRoot,
 	}
-	for _, seed := range []string{"10.1:8006", "pve1.123:8006", "pve1"} {
+	for _, seed := range []string{"10.1:8006", "pve1.123:8006"} {
 		result, err := BuildDiscoveryResult(context.Background(), reads, discInput(seed, acceptAll))
 		if err != nil {
 			t.Fatalf("seed %s: %v", seed, err)
 		}
-		if seed == "pve1" {
-			// A portless seed cannot be an endpoint the reads went through.
-			if result.Outcome != DiscoveryNoCandidates {
-				t.Fatalf("seed %s: outcome %q", seed, result.Outcome)
-			}
-			continue
-		}
 		if result.Outcome != DiscoveryNoCandidates || len(result.Nodes) != 0 {
 			t.Fatalf("seed %s: outcome %q with %d nodes, want no_candidates", seed, result.Outcome, len(result.Nodes))
+		}
+	}
+}
+
+func TestBuildDiscoveryResult_SeedWithoutAPortOrHostIsAnInputError(t *testing.T) {
+	t.Parallel()
+	reads := DiscoveryReads{
+		Nodes:  []DiscoveryNodeRead{discNode("pve1", "online"), discNode("pve2", "online")},
+		Status: quorateStatus("pve1", "pve1", "pve2"),
+		RootCA: discRoot,
+	}
+	// A seed always carries a port, so one without is a caller bug that must
+	// not be recorded as an outcome.
+	for _, seed := range []string{"pve1", "pve1.dc1.example.com", "", ":8006", "[2001:db8::10]", "pve1:8006:9"} {
+		result, err := BuildDiscoveryResult(context.Background(), reads, discInput(seed, acceptAll))
+		if !errors.Is(err, ErrDiscoveryInput) || result.Outcome != "" || len(result.Nodes) != 0 {
+			t.Fatalf("seed %q: result %+v err %v, want ErrDiscoveryInput and no result", seed, result, err)
 		}
 	}
 }
@@ -237,13 +247,15 @@ func TestBuildDiscoveryResult_QuorateOrdersOnlineFirstInNameOrder(t *testing.T) 
 
 func TestBuildDiscoveryResult_NonQuorateStatusKeepsNameOrder(t *testing.T) {
 	t.Parallel()
-	status := quorateStatus("pve1", "pve1")
+	// The lower name is the one reported offline, so online-first order and
+	// name order give different answers.
+	status := quorateStatus("pve1", "pve1", "pve3", "pve4")
 	status.Quorate = false
 	status.Online["pve2"] = false
-	status.Online["pve3"] = false
 	reads := DiscoveryReads{
 		Nodes: []DiscoveryNodeRead{
-			discNode("pve1", "online"), discNode("pve3", "offline"), discNode("pve2", "online"),
+			discNode("pve1", "online"), discNode("pve4", "online"), discNode("pve3", "online"),
+			discNode("pve2", "offline"),
 		},
 		Status: status,
 		RootCA: discRoot,
@@ -255,8 +267,54 @@ func TestBuildDiscoveryResult_NonQuorateStatusKeepsNameOrder(t *testing.T) {
 	if result.Outcome != DiscoveryOK || result.Quorate {
 		t.Fatalf("outcome %q quorate %v, want ok and not quorate", result.Outcome, result.Quorate)
 	}
-	if got, want := nodeNames(result.Nodes), []string{"pve2", "pve3"}; !slices.Equal(got, want) {
+	if got, want := nodeNames(result.Nodes), []string{"pve2", "pve3", "pve4"}; !slices.Equal(got, want) {
 		t.Fatalf("nodes = %v, want every node in name order", got)
+	}
+}
+
+func TestBuildDiscoveryResult_OnlineFlagIsTheFlagTheOrderUsed(t *testing.T) {
+	t.Parallel()
+	// Every source disagrees with the others. /cluster/status says pve2 is
+	// online and pve3 is not, and /nodes says the opposite.
+	nodes := []DiscoveryNodeRead{discNode("pve1", "online"), discNode("pve2", "offline"), discNode("pve3", "online")}
+	cases := map[string]struct {
+		status DiscoveryStatus
+		want   map[string]bool
+	}{
+		"quorate status gives its own flags": {
+			status: quorateStatus("pve1", "pve1", "pve2"),
+			want:   map[string]bool{"pve2": true, "pve3": false},
+		},
+		"no status gives the nodes status field": {
+			status: DiscoveryStatus{},
+			want:   map[string]bool{"pve2": false, "pve3": true},
+		},
+		"non-quorate status gives no node online": {
+			status: func() DiscoveryStatus {
+				status := quorateStatus("pve1", "pve1", "pve2")
+				status.Quorate = false
+				return status
+			}(),
+			want: map[string]bool{"pve2": false, "pve3": false},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			reads := DiscoveryReads{Nodes: nodes, Status: tc.status, RootCA: discRoot}
+			result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
+			if err != nil {
+				t.Fatalf("BuildDiscoveryResult: %v", err)
+			}
+			if len(result.Nodes) != len(tc.want) {
+				t.Fatalf("nodes = %v, want %d", nodeNames(result.Nodes), len(tc.want))
+			}
+			for _, node := range result.Nodes {
+				if node.Online != tc.want[node.Name] {
+					t.Fatalf("%s Online = %v, want %v", node.Name, node.Online, tc.want[node.Name])
+				}
+			}
+		})
 	}
 }
 
@@ -280,6 +338,41 @@ func TestBuildDiscoveryResult_StandaloneHost(t *testing.T) {
 	result, err = BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
 	if err != nil || result.Outcome != DiscoveryOK || len(result.Nodes) != 1 {
 		t.Fatalf("contradicting reads: outcome %q, %d nodes, err %v", result.Outcome, len(result.Nodes), err)
+	}
+}
+
+func TestBuildDiscoveryResult_StandaloneNeedsASuccessfulStatus(t *testing.T) {
+	t.Parallel()
+	// A failed status read next to one node says nothing about a cluster, so
+	// it must not be reported as a standalone host.
+	reads := DiscoveryReads{Nodes: []DiscoveryNodeRead{discNode("pve1", "online")}, RootCA: discRoot}
+	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
+	if err != nil || result.Outcome == DiscoveryStandalone || result.Outcome != DiscoveryNoCandidates {
+		t.Fatalf("outcome %q err %v, want no_candidates and not standalone", result.Outcome, err)
+	}
+}
+
+func TestBuildDiscoveryResult_LoneNodeWithoutStatusIsTheSeedsNode(t *testing.T) {
+	t.Parallel()
+	// With no status nothing names the node that answered, but a /nodes list
+	// of one row can only be that node, whatever form the seed takes.
+	reads := DiscoveryReads{Nodes: []DiscoveryNodeRead{discNode("pve1", "online")}, RootCA: discRoot}
+	for _, seed := range []string{"192.0.2.10:8006", "other.example.com:8006", "pve1.dc1.example.com:8006"} {
+		result, err := BuildDiscoveryResult(context.Background(), reads, discInput(seed, acceptAll))
+		if err != nil || result.Outcome != DiscoveryNoCandidates || len(result.Nodes) != 0 {
+			t.Fatalf("seed %s: outcome %q, %d nodes, err %v, want no_candidates", seed, result.Outcome, len(result.Nodes), err)
+		}
+		if seed != "pve1.dc1.example.com:8006" {
+			if got := droppedFor(result, "pve1"); got != DropSeedNode {
+				t.Fatalf("seed %s: pve1 dropped for %q, want the seed's own node", seed, got)
+			}
+		}
+	}
+	// Two rows leave the rule alone.
+	reads.Nodes = append(reads.Nodes, discNode("pve2", "online"))
+	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("192.0.2.10:8006", acceptAll))
+	if err != nil || result.Outcome != DiscoveryNoStatus || len(result.Nodes) != 2 {
+		t.Fatalf("two rows: outcome %q, %d nodes, err %v, want no_status with both", result.Outcome, len(result.Nodes), err)
 	}
 }
 
@@ -529,6 +622,83 @@ func TestBuildDiscoveryResult_ResolvesInParallelWithATimeoutPerName(t *testing.T
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("hanging lookups took %v, want one timeout round", elapsed)
+	}
+}
+
+func TestBuildDiscoveryResult_ResolverThatIgnoresItsContextIsStillBounded(t *testing.T) {
+	t.Parallel()
+	reads := DiscoveryReads{
+		Nodes: []DiscoveryNodeRead{
+			discNode("pve1", "online"), discNode("pve2", "online"), discNode("pve3", "online"),
+		},
+		Status: quorateStatus("pve1", "pve1", "pve2", "pve3"),
+		RootCA: discRoot,
+	}
+	// The resolver blocks until the test ends and never looks at its context.
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	var started atomic.Int32
+	resolver := func(context.Context, string) error {
+		started.Add(1)
+		<-block
+		return nil
+	}
+	in := discInput("pve1:8006", resolver)
+	in.ResolveTimeout = 100 * time.Millisecond
+	start := time.Now()
+	result, err := BuildDiscoveryResult(context.Background(), reads, in)
+	if err != nil || result.Outcome != DiscoveryNoCandidates || len(result.Nodes) != 0 {
+		t.Fatalf("outcome %q, %d nodes, err %v, want no_candidates", result.Outcome, len(result.Nodes), err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("the build took %v with a 100ms bound, so it waited for a resolver that ignores its context", elapsed)
+	}
+	if got := started.Load(); got != 2 {
+		t.Fatalf("%d lookups started, want one per peer", got)
+	}
+	for _, name := range []string{"pve2", "pve3"} {
+		if got := droppedFor(result, name); got != DropUnresolved {
+			t.Fatalf("%s dropped for %q, want unresolved", name, got)
+		}
+	}
+}
+
+func TestBuildDiscoveryResult_LookupsRunningAtOnceAreBounded(t *testing.T) {
+	t.Parallel()
+	const total = 130
+	var rows []DiscoveryNodeRead
+	var names []string
+	for i := 0; i < total; i++ {
+		name := fmt.Sprintf("pve%03d", i)
+		rows = append(rows, discNode(name, "online"))
+		names = append(names, name)
+	}
+	reads := DiscoveryReads{Nodes: rows, Status: quorateStatus("pve000", names...), RootCA: discRoot}
+	// Every lookup ignores its context and blocks, so each timed-out round
+	// leaves its lookups running while the next round starts.
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	var running, peak atomic.Int32
+	resolver := func(context.Context, string) error {
+		n := running.Add(1)
+		for {
+			old := peak.Load()
+			if n <= old || peak.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		<-block
+		running.Add(-1)
+		return nil
+	}
+	in := discInput("pve000:8006", resolver)
+	in.ResolveTimeout = 50 * time.Millisecond
+	result, err := BuildDiscoveryResult(context.Background(), reads, in)
+	if err != nil || result.Outcome != DiscoveryNoCandidates {
+		t.Fatalf("outcome %q err %v, want no_candidates", result.Outcome, err)
+	}
+	if got := peak.Load(); got != 64 {
+		t.Fatalf("%d lookups ran at once, want exactly the bound of 64 and no more", got)
 	}
 }
 
