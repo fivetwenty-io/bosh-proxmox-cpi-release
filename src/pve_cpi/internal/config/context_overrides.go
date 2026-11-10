@@ -819,10 +819,10 @@ func coerceOverrideString(v any) (string, error) {
 //
 // The job-level decoder echoes the raw JSON text of a value of the wrong
 // type. A json.RawMessage or json.Number is echoed the same way, trimmed and
-// bounded, and jsonrpc.Context keeps this key's raw text for that reason, so
-// a request reads identically to the job-level property. Any other value,
-// such as a number a caller decoded to a float64, can only be encoded again,
-// and the encoding drops the spelling it was written with.
+// bounded, and both readers of cpi-config properties, jsonrpc.Context and the
+// pve-cid cpi-config reader, keep this key's raw text for that reason, so
+// they read identically to the job-level property. Any other value can only
+// be encoded again.
 func coerceOverrideDiscoveryMode(v any) (DiscoveryMode, error) {
 	switch t := v.(type) {
 	case bool:

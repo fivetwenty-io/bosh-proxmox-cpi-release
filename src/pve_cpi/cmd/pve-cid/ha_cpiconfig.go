@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
@@ -18,6 +19,32 @@ type cpiConfigEntry struct {
 	Name       string         `json:"name"`
 	Type       string         `json:"type"`
 	Properties map[string]any `json:"properties"`
+}
+
+// UnmarshalJSON decodes an entry as plain struct decoding would, and then keeps
+// the discovery mode in its properties as the raw text it was written with
+// when it is not a string, a boolean, or null, as the request context does.
+// The override refusal repeats such a value, and the decoded form cannot give
+// back 5.0 or an object's spacing. Every other property keeps its decoded type.
+func (e *cpiConfigEntry) UnmarshalJSON(data []byte) error {
+	type plain cpiConfigEntry
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if len(decoded.Properties) > 0 {
+		var members struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		}
+		if err := json.Unmarshal(data, &members); err != nil {
+			return err
+		}
+		for key, raw := range members.Properties {
+			decoded.Properties[key] = jsonrpc.KeepRawDiscoveryMode(key, raw, decoded.Properties[key])
+		}
+	}
+	*e = cpiConfigEntry(decoded)
+	return nil
 }
 
 // haCPIType is the cpis entry type this CPI serves. An entry of any other type

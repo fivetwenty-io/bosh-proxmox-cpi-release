@@ -163,7 +163,7 @@ func (c *Context) UnmarshalJSON(data []byte) error {
 		if c.Extra == nil {
 			c.Extra = make(map[string]any, len(raw))
 		}
-		c.Extra[key] = keepRawDiscoveryMode(key, val, decoded)
+		c.Extra[key] = KeepRawDiscoveryMode(key, val, decoded)
 	}
 	return nil
 }
@@ -173,13 +173,15 @@ func (c *Context) UnmarshalJSON(data []byte) error {
 // once flattened.
 const discoveryModeKey = "api_endpoint_discovery"
 
-// keepRawDiscoveryMode returns the value to store in Extra for key. The
+// KeepRawDiscoveryMode returns the value to store in a property map for key,
+// which Context uses for Extra and the cpi-config reader uses for an entry's
+// properties. The
 // discovery mode refuses a value that is not a string or a boolean, and the
 // refusal repeats the value as it was written, which the decoded form cannot
 // give back for 5.0 or an object. So a value of that kind, at the top level or
 // inside the pve object, is kept as json.RawMessage. Every other value, and
 // every other key, is returned as decoded.
-func keepRawDiscoveryMode(key string, raw json.RawMessage, decoded any) any {
+func KeepRawDiscoveryMode(key string, raw json.RawMessage, decoded any) any {
 	switch key {
 	case "pve_" + discoveryModeKey:
 		return rawUnlessScalar(raw, decoded)
