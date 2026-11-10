@@ -170,7 +170,9 @@ type Stored struct {
 // for its size. It replaces the node list only with change.Result, and a change
 // without one writes the stored discovery section back as it was read, so a
 // record a reader drops for its time or its address is hidden and never
-// erased. It keeps a stored hint that passes every other check even when the
+// erased. The exception is change.Attempt, which moves the section's two
+// times and nothing else, and records nothing for a section a reader hides for
+// its time. It keeps a stored hint that passes every other check even when the
 // writer's own az_map does not name its node, because another entry that
 // shares the key may have written it, and it replaces the hint only with
 // change.Hint.
@@ -184,13 +186,12 @@ type Stored struct {
 // stored pins and its stored confirmation stays in the file even when that
 // confirmation is past NodeTTL or ahead of now, so the node stays known while
 // the pool no longer loads it. A node the file does not know is added on
-// first use. An attempt moves the stored section's two times and nothing
-// else. A change that breaks the change's own rules is refused with
-// ErrInvalidChange.
+// first use. The drops leave out a stored node the result carries as held,
+// because the file keeps it. A change that breaks the change's own rules is
+// refused with ErrInvalidChange.
 func Merge(stored *Payload, key Key, change Change, now time.Time) (*Payload, []Drop, error) {
 	state, drops := readState(stored, key, now)
-	next, found, err := merge(state, key, change, now)
-	return next, append(drops, found...), err
+	return merge(state, drops, key, change, now)
 }
 
 // readState reads stored as a writer does, treating a payload that fails
@@ -213,7 +214,9 @@ func (s storedState) view(now time.Time) Stored {
 }
 
 // merge is Merge for a stored state that readStored returned at the same now.
-func merge(state storedState, key Key, change Change, now time.Time) (*Payload, []Drop, error) {
+// read are the drops that read reported, and the returned drops are those plus
+// the merge's own, less the read drops of any stored node the result holds.
+func merge(state storedState, read []Drop, key Key, change Change, now time.Time) (*Payload, []Drop, error) {
 	stored := state.usable
 	next := stored.clone()
 	if next == nil {
@@ -228,37 +231,40 @@ func merge(state storedState, key Key, change Change, now time.Time) (*Payload, 
 	if change.Hint != nil {
 		hint, found, err := validateHint(*change.Hint, now)
 		if err != nil {
-			return nil, nil, fmt.Errorf("%w: cold_start name fails the pve-node format", ErrInvalidChange)
+			return nil, read, fmt.Errorf("%w: cold_start name fails the pve-node format", ErrInvalidChange)
 		}
 		if hint == nil {
-			return nil, nil, fmt.Errorf("%w: cold_start hint is %s", ErrInvalidChange, found[0].Reason)
+			return nil, read, fmt.Errorf("%w: cold_start hint is %s", ErrInvalidChange, found[0].Reason)
 		}
 		if change.Result != nil {
-			return nil, nil, fmt.Errorf("%w: change carries both a discovery result and a cold_start hint", ErrInvalidChange)
+			return nil, read, fmt.Errorf("%w: change carries both a discovery result and a cold_start hint", ErrInvalidChange)
 		}
 		next.ColdStart = hint
 	}
 	if change.Conflict {
 		if err := applyConflict(next, key, change); err != nil {
-			return nil, nil, err
+			return nil, read, err
 		}
 	}
 	if change.Attempt != nil {
 		if err := applyAttempt(next, change, now, &drops); err != nil {
-			return nil, nil, err
+			return nil, read, err
 		}
 	}
+	var held []string
 	if change.Result != nil {
-		if err := applyResult(next, state, key, change.Result, now, &drops); err != nil {
-			return nil, nil, err
+		var err error
+		if held, err = applyResult(next, state, key, change.Result, now, &drops); err != nil {
+			return nil, read, err
 		}
 	}
 	next.Marks = mergeMarks(next.Marks, change.Marks, now, &drops)
 	pruneMarks(next, change.Pool)
 	capMarks(next)
 	if err := trimMarksToSize(next); err != nil {
-		return nil, nil, err
+		return nil, read, err
 	}
+	drops = append(state.withoutHeld(read, held), drops...)
 	if stored == nil && next.empty() {
 		return nil, drops, nil
 	}
@@ -281,7 +287,12 @@ func applyConflict(next *Payload, key Key, change Change) error {
 
 // applyAttempt moves next's stored discovery section to change.Attempt's two
 // times. next.Discovery is the raw stored section, so every node, pin, and
-// confirmation, and the outcome, stay as stored.
+// confirmation, and the outcome, stay as stored. An attempt never makes a
+// section visible. It records nothing for a section a reader hides for its
+// time, because moving that section's time would show it, and nothing when
+// there is no section. It refuses an attempt whose next refresh is before the
+// attempt, and one dated more than FutureSkew before the stored discovery,
+// because a discovery cannot run before the one it follows.
 func applyAttempt(next *Payload, change Change, now time.Time, drops *[]Drop) error {
 	attempt := change.Attempt
 	switch {
@@ -293,9 +304,14 @@ func applyAttempt(next *Payload, change Change, now time.Time, drops *[]Drop) er
 		return fmt.Errorf("%w: discovery attempt carries no time", ErrInvalidChange)
 	case attempt.At.After(now.Add(FutureSkew)):
 		return fmt.Errorf("%w: discovery attempt time is in the future", ErrInvalidChange)
+	case attempt.NextRefreshAfter.Before(attempt.At):
+		return fmt.Errorf("%w: discovery attempt's next refresh is before the attempt", ErrInvalidChange)
 	}
-	if next.Discovery == nil {
+	if next.Discovery == nil || next.Discovery.DiscoveredAt.After(now.Add(FutureSkew)) {
 		return nil
+	}
+	if attempt.At.Before(next.Discovery.DiscoveredAt.Add(-FutureSkew)) {
+		return fmt.Errorf("%w: discovery attempt is before the stored discovery", ErrInvalidChange)
 	}
 	next.Discovery.DiscoveredAt = attempt.At.UTC()
 	next.Discovery.NextRefreshAfter = attempt.NextRefreshAfter.UTC()
@@ -308,44 +324,76 @@ func applyAttempt(next *Payload, change Change, now time.Time, drops *[]Drop) er
 
 // applyResult replaces next's identity and node list with result, after the
 // same checks a reader applies and the trust rules the stored state calls
-// for, and removes the stored hint.
+// for, and removes the stored hint. It returns the lowercase names of the
+// nodes the result carries as held, which are stored nodes a reader hides for
+// their time that the file keeps.
 func applyResult(
 	next *Payload, state storedState, key Key, result *DiscoveryResult, now time.Time, drops *[]Drop,
-) error {
+) (held []string, err error) {
 	if stored := state.usable; stored != nil && stored.Cluster != nil && stored.Cluster.IdentityConflict {
-		return ErrIdentityConflict
+		return nil, ErrIdentityConflict
 	}
 	if result.Cluster.IdentityConflict {
-		return fmt.Errorf("%w: a discovery result carries an identity conflict", ErrInvalidChange)
+		return nil, fmt.Errorf("%w: a discovery result carries an identity conflict", ErrInvalidChange)
 	}
 	cluster, found, err := validateCluster(result.Cluster, key)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidChange, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidChange, err)
 	}
 	if len(found) > 0 {
-		return fmt.Errorf("%w: cluster observed_via is not a configured endpoint", ErrInvalidChange)
+		return nil, fmt.Errorf("%w: cluster observed_via is not a configured endpoint", ErrInvalidChange)
 	}
-	var held func(DiscoveredNode) bool
+	var holds func(DiscoveredNode) bool
 	if !key.VerifySSL {
-		held = state.holds
+		holds = func(n DiscoveredNode) bool {
+			if !state.holds(n) {
+				return false
+			}
+			held = append(held, strings.ToLower(n.Name))
+			return true
+		}
 	}
-	section, _, found, err := validateDiscovery(&result.Discovery, keyDerivation(key), now, held)
+	section, _, found, err := validateDiscovery(&result.Discovery, keyDerivation(key), now, holds)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidChange, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidChange, err)
 	}
 	if section == nil {
-		return fmt.Errorf("%w: discovery time is in the future", ErrInvalidChange)
+		return nil, fmt.Errorf("%w: discovery time is in the future", ErrInvalidChange)
 	}
 	if !key.VerifySSL {
 		if err := trustOnFirstUse(state, cluster, section); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	*drops = append(*drops, found...)
 	next.Cluster = &cluster
 	next.Discovery = section
 	next.ColdStart = nil
-	return nil
+	return held, nil
+}
+
+// withoutHeld returns drops less the expired and future drops of the stored
+// nodes named in held, which are lowercase names. The drop says a reader hides
+// the stored node, and the node stays in the file, so a caller that logs the
+// drops would otherwise report a node dropped that the file still keeps.
+func (s storedState) withoutHeld(drops []Drop, held []string) []Drop {
+	if len(held) == 0 || s.discovery == nil {
+		return drops
+	}
+	records := make(map[string]struct{}, len(held))
+	for i, node := range s.discovery.Nodes {
+		if slices.Contains(held, strings.ToLower(node.Name)) {
+			records["node "+strconv.Itoa(i)] = struct{}{}
+		}
+	}
+	var kept []Drop
+	for _, drop := range drops {
+		if _, isHeld := records[drop.Record]; isHeld && (drop.Reason == DropExpired || drop.Reason == DropFuture) {
+			continue
+		}
+		kept = append(kept, drop)
+	}
+	return kept
 }
 
 // holds reports whether n is a node the stored file knows, carried with its
@@ -598,13 +646,13 @@ func (s *Store) UpdatePayload(
 	written, err := Update(ctx, s, func(current *Payload) (*Payload, error) {
 		result.Locked = true
 		result.Swept = Sweep(s.root, now, s.key.LockName(), s.key.FileName())
-		state, drops := readState(current, s.key, now)
-		result.Dropped = append(result.Dropped, drops...)
+		state, read := readState(current, s.key, now)
 		change, err := build(state.view(now))
 		if err != nil {
+			result.Dropped = append(result.Dropped, read...)
 			return nil, err
 		}
-		next, drops, err := merge(state, s.key, change, now)
+		next, drops, err := merge(state, read, s.key, change, now)
 		result.Dropped = append(result.Dropped, drops...)
 		return next, err
 	})

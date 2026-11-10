@@ -27,7 +27,10 @@ const (
 	NodeTTL = 24 * time.Hour
 	// FutureSkew is how far ahead of the reader's clock a record's timestamp
 	// may be before the record is dropped. A record further ahead is dropped,
-	// not clamped, so a forged or skewed time cannot make it last forever.
+	// not clamped, so a forged or skewed time does not become a valid one. A
+	// node that a merge holds keeps its stored time, so a node dated ahead that
+	// keeps answering stays in the file, hidden from readers until the clock
+	// reaches its time, with only its stored pins.
 	FutureSkew = 30 * time.Second
 	// MaxRefreshWait is the longest wait the next-refresh time may ask for. It
 	// is the 24-hour back-off for a result with no candidates.

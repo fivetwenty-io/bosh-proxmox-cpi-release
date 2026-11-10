@@ -37,7 +37,9 @@ const PinRefreshFloor = 10 * time.Minute
 // which includes one that validation dropped for being too far ahead. A pin
 // failure makes a refresh due early only when the last attempt, which is the
 // section's discovered_at, is more than PinRefreshFloor old. It never holds
-// back a refresh that is already due.
+// back a refresh that is already due, and it counts for nothing when the
+// section holds no nodes, because there is then no discovered endpoint to fail
+// a pin and the 24-hour wait of a discovery that found no candidates stands.
 func RefreshDue(p *Payload, now time.Time, pinFailed bool) bool {
 	if p != nil && p.Cluster != nil && p.Cluster.IdentityConflict {
 		return false
@@ -48,7 +50,7 @@ func RefreshDue(p *Payload, now time.Time, pinFailed bool) bool {
 	if !now.Before(p.Discovery.NextRefreshAfter) {
 		return true
 	}
-	return pinFailed && now.Sub(p.Discovery.DiscoveredAt) > PinRefreshFloor
+	return pinFailed && len(p.Discovery.Nodes) > 0 && now.Sub(p.Discovery.DiscoveredAt) > PinRefreshFloor
 }
 
 // ErrUnconfiguredSource means an observation did not come through one of the
@@ -106,8 +108,9 @@ const (
 	// identity and pins are recorded.
 	TrustFirstUse TrustOutcome = "first_use"
 	// TrustConfirmed means the identity matches the stored one and no known
-	// node's pins changed, or under verify_ssl false a known node's pins only
-	// grew, so it keeps its stored pins and adds the new ones. New nodes are
+	// node's pins changed. Under verify_ssl false a known node's pins may also
+	// have only grown, so it keeps its stored pins and adds the new ones, or
+	// only shrunk, so it keeps its stored pins and is confirmed. New nodes are
 	// added on first use, and a known node the observation leaves out stops
 	// being known.
 	TrustConfirmed TrustOutcome = "confirmed"
@@ -123,7 +126,8 @@ const (
 	// true, so the observation's pins replace the stored ones.
 	TrustPinsReplaced TrustOutcome = "pins_replaced"
 	// TrustPinsRefused means a known node's observed pins leave out a stored
-	// pin under verify_ssl false. That node keeps its stored pins. It is
+	// pin and add one it does not hold, under verify_ssl false. That node
+	// keeps its stored pins. It is
 	// confirmed now when the observed pins share one of the stored pins, and
 	// it keeps its stored confirmation when they share none, so it stops
 	// loading NodeTTL after that confirmation but stays known. The rest of the
@@ -149,6 +153,10 @@ const (
 	TrustLogWarn
 	// TrustLogError means the caller logs the decision at Error.
 	TrustLogError
+	// TrustLogDebug means the caller logs the decision at Debug. It is set
+	// when the only thing to report is a known node whose observed pins were a
+	// strict subset of its stored ones, which PinsShrunk names.
+	TrustLogDebug
 )
 
 // Level returns the slog level of l, and false for TrustLogNone.
@@ -158,6 +166,8 @@ func (l TrustLog) Level() (slog.Level, bool) {
 		return log.LevelWarn, true
 	case TrustLogError:
 		return log.LevelError, true
+	case TrustLogDebug:
+		return log.LevelDebug, true
 	}
 	return log.LevelDebug, false
 }
@@ -194,10 +204,19 @@ type TrustDecision struct {
 	// changes, in the observation's order. Under verify_ssl true it names
 	// every node whose set differs, and the new sets replace the old ones.
 	// Under verify_ssl false it names every node whose observed set leaves out
-	// a stored pin, and those nodes keep their stored pins, while a set that
-	// only grew is accepted and not named. It is empty when the identity
-	// changed, because the pins are then not compared.
+	// a stored pin and adds one that is not stored, and those nodes keep their
+	// stored pins, while a set that only grew or only shrank is not named. It
+	// is empty when the identity changed, because the pins are then not
+	// compared.
 	PinsChanged []string
+	// PinsShrunk names the known nodes whose observed pins are a strict subset
+	// of their stored pins, in the observation's order. It is set only under
+	// verify_ssl false. Each of those nodes keeps its stored pins and is
+	// confirmed now, because a shrink cannot come from a certificate change,
+	// which removes one pin and adds another, and it gains nothing when the
+	// stored pins are kept. The decision is not a refusal for them, and the
+	// caller logs them at Debug. It is empty when the identity changed.
+	PinsShrunk []string
 }
 
 // Writes reports whether the decision has something to record.
@@ -213,6 +232,8 @@ func (d TrustDecision) Writes() bool {
 // every node's confirmation, and an identity seen for the first time. A view
 // whose Now is set and differs from now is refused with ErrInvalidChange,
 // because the merge would check the decision's stamps against another clock.
+// A view whose Now is zero skips that check, so a caller passes only the view
+// UpdatePayload builds, never a Stored it assembled by hand.
 //
 // Only a configured endpoint writes trust. An observation that names no
 // endpoint, or one outside key.Endpoints, is refused with
@@ -237,15 +258,19 @@ func (d TrustDecision) Writes() bool {
 // including a node past NodeTTL that the pool no longer loads, and the rest of
 // the observation is written as observed. A node whose observed pins equal its
 // stored pins, or hold every stored pin and more, is confirmed now with the
-// observed pins. A node whose observed pins leave out a stored pin keeps its
-// stored pins and is named in PinsChanged. It is confirmed now when the two
-// sets share a pin, because the endpoint still reports a stored one, and it
-// keeps its stored confirmation when they share none, so it stops loading
-// NodeTTL after that confirmation but stays known. Any named node makes the
-// outcome pins_refused, logged at Warn, and the result still advances the
-// refresh by RefreshInterval. A node the file does not know is added on first
-// use, and a known node the observation leaves out is removed, so it stops
-// being known and is added on first use if it returns.
+// observed pins. A node whose observed pins are a strict subset of its stored
+// pins keeps its stored pins and is confirmed now, and PinsShrunk names it. A
+// shrink is not a refusal, because a certificate change removes one pin and
+// adds another, and keeping the stored pins gives nothing to the sender, so the
+// decision logs it at Debug. A node whose observed pins leave out a stored pin
+// and add another keeps its stored pins and is named in PinsChanged. It is
+// confirmed now when the two sets share a pin, because the endpoint still
+// reports a stored one, and it keeps its stored confirmation when they share
+// none, so it stops loading NodeTTL after that confirmation but stays known.
+// Any named node makes the outcome pins_refused, logged at Warn, and the result
+// still advances the refresh by RefreshInterval. A node the file does not know
+// is added on first use, and a known node the observation leaves out is
+// removed, so it stops being known and is added on first use if it returns.
 func DecideTrust(stored Stored, key Key, obs Observation, now time.Time) (TrustDecision, error) {
 	if now.IsZero() {
 		return TrustDecision{}, fmt.Errorf("%w: trust decision needs a clock", ErrInvalidChange)
@@ -265,8 +290,10 @@ func DecideTrust(stored Stored, key Key, obs Observation, now time.Time) (TrustD
 		prior = stored.Usable.Cluster
 	}
 	decision := TrustDecision{ObservedRootCA: cluster.RootCASHA256, Via: cluster.ObservedVia}
-	// A refusal for the identity records the attempt, so the refresh is not
-	// due again on every call while the refusal stands.
+	// A refusal for the identity records the attempt. The conflict is what
+	// stops the refresh, because RefreshDue is false while it stands. The
+	// attempt guards against a caller that runs discovery anyway, so that
+	// caller does not run it again on every call.
 	attempt := &DiscoveryAttempt{At: now.UTC(), NextRefreshAfter: now.UTC().Add(MaxRefreshWait)}
 	if prior != nil {
 		decision.StoredRootCA = prior.RootCASHA256
@@ -292,7 +319,7 @@ func DecideTrust(stored Stored, key Key, obs Observation, now time.Time) (TrustD
 		return decision, nil
 	}
 
-	decision.PinsChanged = applyPinRule(stored.Known, section, &built, key.VerifySSL)
+	decision.PinsChanged, decision.PinsShrunk = applyPinRule(stored.Known, section, &built, key.VerifySSL)
 	switch {
 	case len(decision.PinsChanged) > 0 && !key.VerifySSL:
 		decision.Outcome = TrustPinsRefused
@@ -303,6 +330,9 @@ func DecideTrust(stored Stored, key Key, obs Observation, now time.Time) (TrustD
 		decision.Outcome = TrustFirstUse
 	default:
 		decision.Outcome = TrustConfirmed
+	}
+	if decision.Log == TrustLogNone && len(decision.PinsShrunk) > 0 {
+		decision.Log = TrustLogDebug
 	}
 	if prior != nil {
 		// The identity is unchanged, and observed_at and observed_via record
@@ -407,17 +437,22 @@ func observedNode(node ObservedNode, at time.Time) (DiscoveredNode, error) {
 
 // applyPinRule compares each node of section, which holds the nodes Merge
 // writes, with the known node of the same name, compared without regard to
-// case, and returns the names of the known nodes whose pin sets change, in
-// section's order. A node known does not hold is new, not changed.
+// case. It returns the names of the known nodes whose pin sets change and the
+// names of those whose pin sets shrink, each in section's order. A node known
+// does not hold is new, not changed.
 //
 // Under verify_ssl true every set that differs is a change, and built keeps
 // the observed sets. Under verify_ssl false a set that holds every stored pin
-// is accepted as observed, and any other set is a change. built then carries
-// that node with its stored pins, confirmed now when the observed set shares
-// a stored pin and with its stored confirmation when it shares none. built is
-// the section the Result carries, and its nodes are in section's order with
-// the nodes Merge leaves out between them.
-func applyPinRule(known []DiscoveredNode, section *DiscoverySection, built *DiscoverySection, verify bool) []string {
+// is accepted as observed. A set that is a strict subset of the stored one is
+// a shrink, and built carries that node with its stored pins and confirmed
+// now. Any other set is a change, and built then carries that node with its
+// stored pins, confirmed now when the observed set shares a stored pin and
+// with its stored confirmation when it shares none. built is the section the
+// Result carries, and its nodes are in section's order with the nodes Merge
+// leaves out between them.
+func applyPinRule(
+	known []DiscoveredNode, section *DiscoverySection, built *DiscoverySection, verify bool,
+) (changed, shrunk []string) {
 	stored := make(map[string]DiscoveredNode, len(known))
 	for _, node := range known {
 		stored[strings.ToLower(node.Name)] = node
@@ -426,7 +461,6 @@ func applyPinRule(known []DiscoveredNode, section *DiscoverySection, built *Disc
 	for i, node := range built.Nodes {
 		index[strings.ToLower(node.Name)] = i
 	}
-	var changed []string
 	for _, node := range section.Nodes {
 		name := strings.ToLower(node.Name)
 		prior, ok := stored[name]
@@ -436,17 +470,22 @@ func applyPinRule(known []DiscoveredNode, section *DiscoverySection, built *Disc
 		if !verify && holdsPins(node.Pins, prior.Pins) {
 			continue
 		}
-		changed = append(changed, node.Name)
 		if verify {
+			changed = append(changed, node.Name)
 			continue
 		}
 		kept := &built.Nodes[index[name]]
 		kept.Pins = slices.Clone(prior.Pins)
+		if holdsPins(prior.Pins, node.Pins) {
+			shrunk = append(shrunk, node.Name)
+			continue
+		}
+		changed = append(changed, node.Name)
 		if !sharesPin(node.Pins, prior.Pins) {
 			kept.ConfirmedAt = prior.ConfirmedAt
 		}
 	}
-	return changed
+	return changed, shrunk
 }
 
 // sharesPin reports whether a and b hold at least one pin in common.

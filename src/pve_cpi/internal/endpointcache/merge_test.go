@@ -1221,9 +1221,9 @@ func TestMergeKeepsAKnownNodeWithItsStoredConfirmation(t *testing.T) {
 			}
 			names := trustNodeNames(next)
 			if tc.kept {
-				if !reflect.DeepEqual(names, []string{"pve2", "pve3"}) || len(drops) != 1 ||
+				if !reflect.DeepEqual(names, []string{"pve2", "pve3"}) || len(drops) != 0 ||
 					!next.Discovery.Nodes[0].ConfirmedAt.Equal(tc.stored) {
-					t.Fatalf("nodes %v drops %v, want pve2 kept with its stored confirmation", names, drops)
+					t.Fatalf("nodes %v drops %v, want pve2 kept with its stored confirmation and no drop", names, drops)
 				}
 				state, _ := readState(next, key, payloadNow)
 				if got := trustNodeNames(state.usable); !reflect.DeepEqual(got, []string{"pve3"}) || len(state.known) != 2 {
@@ -1281,12 +1281,24 @@ func TestMergeRecordsAnAttempt(t *testing.T) {
 		t.Errorf("over a stored conflict: %+v, %v", again, err)
 	}
 
-	// A section dated ahead takes the attempt's time.
+	// A section a reader hides for its time stays as stored, and the attempt
+	// records nothing, so it does not become visible.
 	aheadFile := payloadFor(key, "pve2")
 	aheadFile.Discovery.DiscoveredAt = payloadNow.Add(time.Hour)
 	if next, _, err := Merge(aheadFile, key, Change{Attempt: attempt}, payloadNow); err != nil ||
-		!reflect.DeepEqual(next, moved(aheadFile)) {
+		!reflect.DeepEqual(next, aheadFile) {
 		t.Errorf("a section dated ahead: %+v, %v", next, err)
+	}
+	if p, _, err := Validate(aheadFile, key, payloadNow); err != nil || p.Discovery != nil {
+		t.Fatalf("the section dated ahead is visible to a reader: %+v, %v", p, err)
+	}
+	// A section dated just inside FutureSkew is visible, and takes the
+	// attempt's time.
+	insideFile := payloadFor(key, "pve2")
+	insideFile.Discovery.DiscoveredAt = payloadNow.Add(FutureSkew)
+	if next, _, err := Merge(insideFile, key, Change{Attempt: attempt}, payloadNow); err != nil ||
+		!reflect.DeepEqual(next, moved(insideFile)) {
+		t.Errorf("a section dated inside FutureSkew: %+v, %v", next, err)
 	}
 
 	// A next refresh further ahead than MaxRefreshWait is dropped, so the
@@ -1309,10 +1321,22 @@ func TestMergeRecordsAnAttempt(t *testing.T) {
 	}
 
 	refused := map[string]Change{
-		"with a result":     {Attempt: attempt, Result: mergeResult("pve2")},
-		"with a hint":       {Attempt: attempt, Hint: &ColdStartHint{Name: "pve2", ProbedAt: payloadNow}},
-		"with no time":      {Attempt: &DiscoveryAttempt{NextRefreshAfter: payloadNow.Add(time.Hour)}},
-		"with a time ahead": {Attempt: &DiscoveryAttempt{At: payloadNow.Add(FutureSkew + time.Second)}},
+		"with a result": {Attempt: attempt, Result: mergeResult("pve2")},
+		"with a hint":   {Attempt: attempt, Hint: &ColdStartHint{Name: "pve2", ProbedAt: payloadNow}},
+		"with no time":  {Attempt: &DiscoveryAttempt{NextRefreshAfter: payloadNow.Add(time.Hour)}},
+		"with a time ahead": {Attempt: &DiscoveryAttempt{
+			At: payloadNow.Add(FutureSkew + time.Second), NextRefreshAfter: payloadNow.Add(time.Hour),
+		}},
+		"with no next refresh": {Attempt: &DiscoveryAttempt{At: payloadNow}},
+		"with a next refresh before the attempt": {Attempt: &DiscoveryAttempt{
+			At: payloadNow, NextRefreshAfter: payloadNow.Add(-time.Nanosecond),
+		}},
+		"with a time before the stored discovery": {Attempt: &DiscoveryAttempt{
+			At: stored.Discovery.DiscoveredAt.Add(-FutureSkew - time.Nanosecond), NextRefreshAfter: payloadNow.Add(time.Hour),
+		}},
+		"with a time a year back": {Attempt: &DiscoveryAttempt{
+			At: payloadNow.Add(-365 * 24 * time.Hour), NextRefreshAfter: payloadNow.Add(time.Hour),
+		}},
 	}
 	for name, change := range refused {
 		t.Run(name, func(t *testing.T) {
@@ -1325,5 +1349,19 @@ func TestMergeRecordsAnAttempt(t *testing.T) {
 	near := &DiscoveryAttempt{At: payloadNow.Add(FutureSkew), NextRefreshAfter: payloadNow.Add(time.Hour)}
 	if _, _, err := Merge(stored, key, Change{Attempt: near}, payloadNow); err != nil {
 		t.Errorf("an attempt within FutureSkew: %v", err)
+	}
+	// The limits themselves are accepted. A next refresh equal to the attempt
+	// is due at once, and an attempt FutureSkew before the stored discovery
+	// is the clock skew a visible section can carry.
+	edges := map[string]*DiscoveryAttempt{
+		"a next refresh equal to the attempt": {At: payloadNow, NextRefreshAfter: payloadNow},
+		"a time FutureSkew before the stored discovery": {
+			At: stored.Discovery.DiscoveredAt.Add(-FutureSkew), NextRefreshAfter: payloadNow.Add(time.Hour),
+		},
+	}
+	for name, edge := range edges {
+		if _, _, err := Merge(stored, key, Change{Attempt: edge}, payloadNow); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 }
