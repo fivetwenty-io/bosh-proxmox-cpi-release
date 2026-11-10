@@ -20,6 +20,11 @@ func TestValidateNodeNameAccepts(t *testing.T) {
 		"1a",
 		"a-1",
 		"localhost1",
+		"ip6-localhost1",
+		"ip6-loopback-2",
+		"my-ip6-localhost",
+		"ip6",
+		"localhost4",
 		"mylocalhost",
 		"local-host",
 		strings.Repeat("a", 63),
@@ -34,30 +39,32 @@ func TestValidateNodeNameAccepts(t *testing.T) {
 func TestValidateNodeNameRejectsBadFormat(t *testing.T) {
 	t.Parallel()
 	for name, input := range map[string]string{
-		"empty":             "",
-		"dot":               "pve1.example.com",
-		"leading dot":       ".pve1",
-		"trailing dot":      "pve1.",
-		"leading hyphen":    "-pve1",
-		"trailing hyphen":   "pve1-",
-		"only hyphen":       "-",
-		"64 characters":     strings.Repeat("a", 64),
-		"underscore":        "pve_1",
-		"space":             "pve 1",
-		"leading space":     " pve1",
-		"trailing newline":  "pve1\n",
-		"slash":             "pve1/..",
-		"colon":             "pve1:8006",
-		"at sign":           "user@pve1",
-		"non-ASCII letter":  "pvé",
-		"kelvin sign":       "K1",
-		"fullwidth digit":   "pve１",
-		"NUL":               "pve\x001",
-		"bracket":           "[::1]",
-		"percent":           "pve%31",
-		"query":             "pve1?x",
-		"long and dotted":   strings.Repeat("a", 70) + ".example.com",
-		"all hyphens inner": "--",
+		"empty":                             "",
+		"dot":                               "pve1.example.com",
+		"leading dot":                       ".pve1",
+		"trailing dot":                      "pve1.",
+		"leading hyphen":                    "-pve1",
+		"trailing hyphen":                   "pve1-",
+		"only hyphen":                       "-",
+		"64 characters":                     strings.Repeat("a", 64),
+		"underscore":                        "pve_1",
+		"space":                             "pve 1",
+		"leading space":                     " pve1",
+		"trailing newline":                  "pve1\n",
+		"slash":                             "pve1/..",
+		"colon":                             "pve1:8006",
+		"at sign":                           "user@pve1",
+		"non-ASCII letter":                  "pvé",
+		"kelvin sign":                       "K1",
+		"fullwidth digit":                   "pve１",
+		"NUL":                               "pve\x001",
+		"bracket":                           "[::1]",
+		"percent":                           "pve%31",
+		"query":                             "pve1?x",
+		"long and dotted":                   strings.Repeat("a", 70) + ".example.com",
+		"all hyphens inner":                 "--",
+		"long s lookalike of localhost":     "localho\u017f" + "t",
+		"long s lookalike of ip6-localhost": "ip6-localho\u017ft",
 	} {
 		err := ValidateNodeName(input)
 		if !errors.Is(err, ErrNodeNameFormat) {
@@ -88,6 +95,11 @@ func TestValidateNodeNameRefusesAmbiguousNames(t *testing.T) {
 		"LOCALHOST",
 		"LocalHost",
 		"localHOST",
+		"ip6-localhost",
+		"IP6-LOCALHOST",
+		"Ip6-LocalHost",
+		"ip6-loopback",
+		"IP6-Loopback",
 	} {
 		err := ValidateNodeName(name)
 		if !errors.Is(err, ErrNodeNameAmbiguous) {
@@ -133,10 +145,11 @@ func TestValidNodeName(t *testing.T) {
 	}
 }
 
-func TestNodeNameFormatMatchesStorageIdentityGrammar(t *testing.T) {
+func TestNodeNameFormatMatchesReferenceGrammar(t *testing.T) {
 	t.Parallel()
-	// The helper applies the grammar the storage identity code uses, plus the
-	// 63-character cap. Names within the cap must agree on the format tier.
+	// The helper applies PVE's pve-node grammar plus the 63-character cap. The
+	// check against the grammar the storage identity code applies lives in
+	// package pve, which can reach that unexported function.
 	for _, name := range []string{"a", "a-b", "-a", "a-", "a.b", "a_b", "1", "A9-z", ""} {
 		got := !errors.Is(ValidateNodeName(name), ErrNodeNameFormat)
 		want := referenceNodeFormat(name)

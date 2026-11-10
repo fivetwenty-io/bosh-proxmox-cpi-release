@@ -25,17 +25,31 @@ var (
 // letters, digits, and inner hyphens, at most MaxNodeNameLength characters,
 // and it is not a name a resolver could turn into an address. The refusals
 // are a name made only of digits, a name that starts with 0x or 0X and
-// continues only in hex digits (including 0x alone), and localhost in any
-// case. The grammar is the one validStorageIdentityNode applies, with the
-// length cap added.
+// continues only in hex digits (including 0x alone), and localhost,
+// ip6-localhost, and ip6-loopback in any case. The grammar is the one
+// validStorageIdentityNode applies, with the length cap added.
 func ValidateNodeName(name string) error {
 	if !nodeNameFormat(name) {
 		return ErrNodeNameFormat
 	}
-	if allDigits(name) || hexSpelling(name) || strings.EqualFold(name, "localhost") {
+	if allDigits(name) || hexSpelling(name) || loopbackAlias(name) {
 		return ErrNodeNameAmbiguous
 	}
 	return nil
+}
+
+// loopbackAliases are the names Debian's stock /etc/hosts maps to a loopback
+// address.
+var loopbackAliases = []string{"localhost", "ip6-localhost", "ip6-loopback"}
+
+// loopbackAlias reports whether name is one of loopbackAliases in any case.
+func loopbackAlias(name string) bool {
+	for _, alias := range loopbackAliases {
+		if strings.EqualFold(name, alias) {
+			return true
+		}
+	}
+	return false
 }
 
 // ValidNodeName reports whether ValidateNodeName accepts name.

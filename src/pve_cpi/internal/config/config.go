@@ -5154,8 +5154,9 @@ func validEndpointHost(host string) bool {
 // trailing dot, an IPv6 literal in its canonical spelling and without
 // brackets, and the port as a number, with a missing port read as the PVE API
 // default of 8006. ok is false when addr does not meet the endpoints list
-// grammar. The endpoint pool compares and keys endpoints with this function so
-// it agrees with validation and with SameEndpoint.
+// grammar, or when its host is empty once the trailing dot is gone, as in "."
+// and ".:8006". The endpoint pool compares and keys endpoints with this
+// function so it agrees with validation and with SameEndpoint.
 func NormalizeEndpoint(addr string) (host string, port int, ok bool) {
 	if endpointGrammarProblem("", addr) != "" || endpointExtraProblem("", addr) != "" {
 		return "", 0, false
@@ -5167,7 +5168,11 @@ func NormalizeEndpoint(addr string) (host string, port int, ok bool) {
 	if !hasPort {
 		p = defaultPVEAPIPort
 	}
-	return canonicalEndpointHost(h), p, true
+	host = canonicalEndpointHost(h)
+	if host == "" {
+		return "", 0, false
+	}
+	return host, p, true
 }
 
 // splitEndpoint splits a grammar-valid endpoint into its host and port. A
