@@ -31,6 +31,11 @@ const temporaryName = "pve_cpi-endpoint-cache."
 type Options struct {
 	// Override is the value of pve.endpoint_cache_dir, empty when it is unset.
 	Override string
+	// DisplayName is what the refusal texts call the cache the caller is
+	// choosing a directory for, such as HAProfileName. Empty means the endpoint
+	// cache, and a name that is not letters, digits, spaces, and hyphens reads
+	// as empty.
+	DisplayName string
 }
 
 // Refusal is the reason a layer gave no cache directory. Err carries the cause,
@@ -129,23 +134,24 @@ func overrideLayer(opts Options) (Choice, bool) {
 	if opts.Override == "" {
 		return Choice{}, false
 	}
+	t := textsFor(opts.DisplayName)
 	choice := Choice{Layer: LayerOverride, Path: opts.Override}
 	if filepath.Clean(opts.Override) != opts.Override {
 		// No inode was examined, so the owner is unknown.
 		choice.Err = &Refusal{Layer: LayerOverride, Path: opts.Override, Err: &unsafeDirectory{
 			unsafe: &privatefile.UnsafePathError{
-				Path: opts.Override, UID: -1, EUID: os.Geteuid(), WantDirectory: true, Cause: errCacheFileType,
+				Path: opts.Override, UID: -1, EUID: os.Geteuid(), WantDirectory: true, Cause: t.fileType,
 			},
-			text: fmt.Sprintf("%v: %s is not a clean path", errCacheFileType, opts.Override),
+			text: fmt.Sprintf("%v: %s is not a clean path", t.fileType, opts.Override),
 		}}
 		return choice, true
 	}
-	return open(choice), true
+	return t.open(choice), true
 }
 
 // temporaryLayer uses pve_cpi-endpoint-cache.<euid> under os.TempDir().
-func temporaryLayer(Options) (Choice, bool) {
-	return temporaryLayerIn(os.TempDir(), os.Mkdir)
+func temporaryLayer(opts Options) (Choice, bool) {
+	return textsFor(opts.DisplayName).temporaryLayerIn(os.TempDir(), os.Mkdir)
 }
 
 // temporaryLayerIn creates only the last component, with mkdir at mode 0700, so
@@ -153,7 +159,7 @@ func temporaryLayer(Options) (Choice, bool) {
 // directories. The euid suffix keeps processes that run as different users
 // apart. A relative temporary directory is refused before anything is created,
 // because it would put the cache under the working directory.
-func temporaryLayerIn(tempDir string, mkdir func(string, os.FileMode) error) (Choice, bool) {
+func (t *texts) temporaryLayerIn(tempDir string, mkdir func(string, os.FileMode) error) (Choice, bool) {
 	path := filepath.Join(tempDir, temporaryName+strconv.Itoa(os.Geteuid()))
 	choice := Choice{Layer: LayerTemporary, Path: path}
 	if !filepath.IsAbs(tempDir) {
@@ -165,7 +171,7 @@ func temporaryLayerIn(tempDir string, mkdir func(string, os.FileMode) error) (Ch
 	// create it gets the same answer.
 	err := mkdir(path, 0o700)
 	if err == nil {
-		err = secureCreated(path)
+		err = t.secureCreated(path)
 	} else if errors.Is(err, os.ErrExist) {
 		err = nil
 	}
@@ -173,7 +179,7 @@ func temporaryLayerIn(tempDir string, mkdir func(string, os.FileMode) error) (Ch
 		choice.Err = &Refusal{Layer: LayerTemporary, Path: path, Err: err}
 		return choice, true
 	}
-	return open(choice), true
+	return t.open(choice), true
 }
 
 // secureCreated sets a directory this process just created to exactly 0700,
@@ -181,12 +187,12 @@ func temporaryLayerIn(tempDir string, mkdir func(string, os.FileMode) error) (Ch
 // confirms first that the name still holds a directory owned by the effective
 // user, so a name swapped in after the creation is never changed. It is never
 // called for a directory that already existed.
-func secureCreated(path string) error {
+func (t *texts) secureCreated(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return err
 	}
-	if err := cachePrivatePolicy.PrivateInfo(path, info, true); err != nil {
+	if err := t.policy.PrivateInfo(path, info, true); err != nil {
 		return err
 	}
 	return os.Chmod(path, 0o700) // #nosec G302 -- a directory needs owner search; this is the private mode, not a widening
@@ -196,12 +202,12 @@ func secureCreated(path string) error {
 // checks. A directory that passes them but lacks owner read, write, or search
 // access is refused with that reason, because the owner could not use it and the
 // operating system would only say permission denied.
-func open(choice Choice) Choice {
-	if err := requireOwnerAccess(choice.Path); err != nil {
+func (t *texts) open(choice Choice) Choice {
+	if err := t.requireOwnerAccess(choice.Path); err != nil {
 		choice.Err = &Refusal{Layer: choice.Layer, Path: choice.Path, Err: err}
 		return choice
 	}
-	root, err := cachePrivatePolicy.OpenRoot(choice.Path)
+	root, err := t.policy.OpenRoot(choice.Path)
 	if err != nil {
 		choice.Err = &Refusal{Layer: choice.Layer, Path: choice.Path, Err: err}
 		return choice
@@ -213,30 +219,30 @@ func open(choice Choice) Choice {
 // requireOwnerAccess refuses an absolute path that names a private directory
 // without owner read, write, and search. Anything else, including a path the
 // private checks refuse, is left to OpenRoot to report.
-func requireOwnerAccess(path string) error {
+func (t *texts) requireOwnerAccess(path string) error {
 	if !filepath.IsAbs(path) {
 		return nil
 	}
 	info, err := os.Lstat(path)
-	if err != nil || !info.IsDir() || cachePrivatePolicy.PrivateInfo(path, info, true) != nil {
+	if err != nil || !info.IsDir() || t.policy.PrivateInfo(path, info, true) != nil {
 		return nil
 	}
-	return ownerAccess(path, info)
+	return t.ownerAccess(path, info)
 }
 
 // ownerAccess refuses a directory whose owner lacks read, write, or search
 // access, because the owner could not use it and the operating system would
 // only say permission denied.
-func ownerAccess(path string, info os.FileInfo) error {
+func (t *texts) ownerAccess(path string, info os.FileInfo) error {
 	if info.Mode().Perm()&0o700 == 0o700 {
 		return nil
 	}
 	return &unsafeDirectory{
 		unsafe: &privatefile.UnsafePathError{
-			Path: path, UID: os.Geteuid(), EUID: os.Geteuid(), Mode: info.Mode(), WantDirectory: true, Cause: errCacheMode,
+			Path: path, UID: os.Geteuid(), EUID: os.Geteuid(), Mode: info.Mode(), WantDirectory: true, Cause: t.mode,
 		},
 		text: fmt.Sprintf("%v: %s has mode %04o and its owner needs read, write, and search access",
-			errCacheMode, path, info.Mode().Perm()),
+			t.mode, path, info.Mode().Perm()),
 	}
 }
 
@@ -244,13 +250,13 @@ func ownerAccess(path string, info os.FileInfo) error {
 // open, reading it through r rather than by path, so a root opened some
 // other way meets the same refusals and a rename of the path cannot change
 // what is checked.
-func checkOpenedDirectory(r *os.Root) error {
+func (t *texts) checkOpenedDirectory(r *os.Root) error {
 	info, err := r.Stat(".")
 	if err != nil {
 		return err
 	}
-	if err := cachePrivatePolicy.PrivateInfo(r.Name(), info, true); err != nil {
+	if err := t.policy.PrivateInfo(r.Name(), info, true); err != nil {
 		return err
 	}
-	return ownerAccess(r.Name(), info)
+	return t.ownerAccess(r.Name(), info)
 }

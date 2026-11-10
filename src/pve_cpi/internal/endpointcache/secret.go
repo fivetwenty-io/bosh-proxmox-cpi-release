@@ -45,12 +45,12 @@ var ErrSecretBusy = errors.New("endpoint cache: directory secret lock is busy")
 // secretPolicy reads and writes the directory secret. Its size limit is the
 // exact secret length, so WriteFile refuses anything longer and ReadFile
 // refuses an oversized secret as errSecretLength.
-var secretPolicy = func() privatefile.Policy {
-	p := cachePrivatePolicy
-	p.Corrupt = errSecretLength
+func (t *texts) secretPolicy() privatefile.Policy {
+	p := t.policy
+	p.Corrupt = t.secretLength
 	p.MaxBytes = secretBytes
 	return p
-}()
+}
 
 // secretOps are the steps the secret is written with. They are the durable
 // ones, unlike the cache files'. A torn cache file is rebuilt by the next
@@ -103,23 +103,23 @@ const (
 // A secret with the wrong owner, mode, type, or link count is never replaced,
 // because someone else may control it. Its error names the secret's path, and
 // removing that file brings the cache back.
-func loadSecret(ctx context.Context, r *os.Root, wait time.Duration, ops privatefile.Ops) (
+func (t *texts) loadSecret(ctx context.Context, r *os.Root, wait time.Duration, ops privatefile.Ops) (
 	keyMaterial, secretOutcome, error,
 ) {
-	secret, err := readSecret(r)
+	secret, err := t.readSecret(r)
 	if err == nil || !replaceable(err) {
 		return secret, secretRead, err
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
-	lock, err := waitHeldLock(waitCtx, r, secretLockFile)
+	lock, err := t.waitHeldLock(waitCtx, r, secretLockFile)
 	if err != nil {
-		return nil, secretRead, lockWaitError(ctx, err, ErrSecretBusy)
+		return nil, secretRead, t.lockWaitError(ctx, err, t.secretBusy)
 	}
-	secret, outcome, err := writeSecretLocked(r, ops)
+	secret, outcome, err := t.writeSecretLocked(r, ops)
 	if closeErr := lock.Close(); closeErr != nil {
 		clear(secret)
-		return nil, secretRead, errors.Join(err, fmt.Errorf("%s: release directory secret lock: %w", cacheLabel, closeErr))
+		return nil, secretRead, errors.Join(err, fmt.Errorf("%s: release directory secret lock: %w", t.name, closeErr))
 	}
 	return secret, outcome, err
 }
@@ -127,8 +127,8 @@ func loadSecret(ctx context.Context, r *os.Root, wait time.Duration, ops private
 // writeSecretLocked reads the secret again under secret.lock, because another
 // process may have written it while this one waited, and writes a new one
 // when it is still missing or the wrong length.
-func writeSecretLocked(r *os.Root, ops privatefile.Ops) (keyMaterial, secretOutcome, error) {
-	secret, err := readSecret(r)
+func (t *texts) writeSecretLocked(r *os.Root, ops privatefile.Ops) (keyMaterial, secretOutcome, error) {
+	secret, err := t.readSecret(r)
 	if err == nil || !replaceable(err) {
 		return secret, secretRead, err
 	}
@@ -138,11 +138,11 @@ func writeSecretLocked(r *os.Root, ops privatefile.Ops) (keyMaterial, secretOutc
 	}
 	secret = make(keyMaterial, secretBytes)
 	if _, err := rand.Read(secret); err != nil {
-		return nil, secretRead, fmt.Errorf("%s: generate directory secret: %w", cacheLabel, err)
+		return nil, secretRead, fmt.Errorf("%s: generate directory secret: %w", t.name, err)
 	}
-	if err := secretPolicy.WriteFile(r, secretFile, secret, ops); err != nil {
+	if err := t.secretPolicy().WriteFile(r, secretFile, secret, ops); err != nil {
 		clear(secret)
-		return nil, secretRead, fmt.Errorf("%s: write directory secret %s: %w", cacheLabel, secretPath(r), err)
+		return nil, secretRead, fmt.Errorf("%s: write directory secret %s: %w", t.name, secretPath(r), err)
 	}
 	return secret, outcome, nil
 }
@@ -158,17 +158,17 @@ func replaceable(err error) bool {
 // a symlink, and a second link. An absent secret comes back as an error that
 // matches fs.ErrNotExist, and a secret of the wrong length as one that matches
 // errSecretLength. Every other error names the secret's path.
-func readSecret(r *os.Root) (keyMaterial, error) {
-	data, err := secretPolicy.ReadFile(r, secretFile, secretBytes)
+func (t *texts) readSecret(r *os.Root) (keyMaterial, error) {
+	data, err := t.secretPolicy().ReadFile(r, secretFile, secretBytes)
 	switch {
 	case err == nil && len(data) != secretBytes:
-		return nil, fmt.Errorf("%w: %d bytes, want %d", errSecretLength, len(data), secretBytes)
+		return nil, fmt.Errorf("%w: %d bytes, want %d", t.secretLength, len(data), secretBytes)
 	case err == nil:
 		return keyMaterial(data), nil
 	case replaceable(err):
 		return nil, err
 	}
-	return nil, fmt.Errorf("%s: refusing directory secret %s: %w", cacheLabel, secretPath(r), err)
+	return nil, fmt.Errorf("%s: refusing directory secret %s: %w", t.name, secretPath(r), err)
 }
 
 // secretPath is the secret's full path, which is not sensitive and tells an

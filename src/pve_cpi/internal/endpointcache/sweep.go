@@ -68,14 +68,15 @@ type SweepResult struct {
 // whatever their age. keep lists names it leaves alone whatever their age,
 // such as the lock the caller holds. It writes no log line.
 func Sweep(root *os.Root, now time.Time, keep ...string) SweepResult {
-	return sweepWith(root, now, keep, ownedByEffectiveUser)
+	return endpointTexts.sweepWith(root, now, keep, ownedByEffectiveUser)
 }
 
 // sweepWith is Sweep with the ownership test replaced, so a test can show
-// that a file another user owns stays.
-func sweepWith(root *os.Root, now time.Time, keep []string, owned func(fs.FileInfo) bool) SweepResult {
+// that a file another user owns stays, and with its error texts naming the
+// store that calls it.
+func (t *texts) sweepWith(root *os.Root, now time.Time, keep []string, owned func(fs.FileInfo) bool) SweepResult {
 	var result SweepResult
-	names, err := listNames(root)
+	names, err := t.listNames(root)
 	if err != nil {
 		result.Err = err
 		return result
@@ -89,7 +90,7 @@ func sweepWith(root *os.Root, now time.Time, keep []string, owned func(fs.FileIn
 		info, err := root.Lstat(name)
 		if err != nil {
 			if !errors.Is(err, fs.ErrNotExist) {
-				errs = append(errs, fmt.Errorf("%s: stat %s: %w", cacheLabel, name, err))
+				errs = append(errs, fmt.Errorf("%s: stat %s: %w", t.name, name, err))
 			}
 			return nil, false
 		}
@@ -117,7 +118,7 @@ func sweepWith(root *os.Root, now time.Time, keep []string, owned func(fs.FileIn
 		}
 		if err := root.Remove(name); err != nil {
 			if !errors.Is(err, fs.ErrNotExist) {
-				errs = append(errs, fmt.Errorf("%s: remove %s: %w", cacheLabel, name, err))
+				errs = append(errs, fmt.Errorf("%s: remove %s: %w", t.name, name, err))
 			}
 			continue
 		}
@@ -128,15 +129,15 @@ func sweepWith(root *os.Root, now time.Time, keep []string, owned func(fs.FileIn
 }
 
 // listNames returns the names in the directory root names, sorted.
-func listNames(root *os.Root) ([]string, error) {
+func (t *texts) listNames(root *os.Root) ([]string, error) {
 	dir, err := root.Open(".")
 	if err != nil {
-		return nil, fmt.Errorf("%s: open directory to sweep: %w", cacheLabel, err)
+		return nil, fmt.Errorf("%s: open directory to sweep: %w", t.name, err)
 	}
 	entries, readErr := dir.ReadDir(-1)
 	closeErr := dir.Close()
 	if err := errors.Join(readErr, closeErr); err != nil {
-		return nil, fmt.Errorf("%s: list directory to sweep: %w", cacheLabel, err)
+		return nil, fmt.Errorf("%s: list directory to sweep: %w", t.name, err)
 	}
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {

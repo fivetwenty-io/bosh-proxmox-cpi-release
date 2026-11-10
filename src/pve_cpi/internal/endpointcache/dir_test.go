@@ -292,7 +292,7 @@ func TestTemporaryLayerGoesOnToTheChecksWhenMkdirLosesTheRace(t *testing.T) {
 	}
 	t.Run("private winner", func(t *testing.T) {
 		parent := t.TempDir()
-		choice, applies := temporaryLayerIn(parent, lost(0o700))
+		choice, applies := endpointTexts.temporaryLayerIn(parent, lost(0o700))
 		t.Cleanup(func() { _ = choice.Close() })
 		if !applies {
 			t.Fatal("the temporary layer declined")
@@ -301,7 +301,7 @@ func TestTemporaryLayerGoesOnToTheChecksWhenMkdirLosesTheRace(t *testing.T) {
 	})
 	t.Run("loose winner is refused and left alone", func(t *testing.T) {
 		parent := t.TempDir()
-		choice, _ := temporaryLayerIn(parent, lost(0o750))
+		choice, _ := endpointTexts.temporaryLayerIn(parent, lost(0o750))
 		t.Cleanup(func() { _ = choice.Close() })
 		requireUnsafe(t, choice, privatefile.ErrUnsafeMode)
 		requireMode(t, temporaryPath(parent), 0o750)
@@ -311,7 +311,7 @@ func TestTemporaryLayerGoesOnToTheChecksWhenMkdirLosesTheRace(t *testing.T) {
 func TestTemporaryLayerNeverRepairsAnythingItDidNotCreate(t *testing.T) {
 	t.Run("missing after creation", func(t *testing.T) {
 		parent := t.TempDir()
-		choice, _ := temporaryLayerIn(parent, func(string, os.FileMode) error { return nil })
+		choice, _ := endpointTexts.temporaryLayerIn(parent, func(string, os.FileMode) error { return nil })
 		if choice.Usable() || !errors.Is(choice.Err, os.ErrNotExist) {
 			t.Fatalf("usable = %v, reason = %v, want a not-exist refusal", choice.Usable(), choice.Err)
 		}
@@ -323,7 +323,7 @@ func TestTemporaryLayerNeverRepairsAnythingItDidNotCreate(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(target, 0o700) })
-		choice, _ := temporaryLayerIn(parent, func(path string, _ os.FileMode) error { return os.Symlink(target, path) })
+		choice, _ := endpointTexts.temporaryLayerIn(parent, func(path string, _ os.FileMode) error { return os.Symlink(target, path) })
 		requireUnsafe(t, choice, privatefile.ErrUnsafeFileType)
 		requireMode(t, target, 0o500)
 	})

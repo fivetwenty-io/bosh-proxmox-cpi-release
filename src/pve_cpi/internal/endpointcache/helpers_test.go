@@ -167,7 +167,7 @@ func TestEndpointCacheChild(t *testing.T) {
 		if _, err := io.Copy(io.Discard, os.Stdin); err != nil {
 			t.Fatal(err)
 		}
-		secret, outcome, err := loadSecret(context.Background(), root, 30*time.Second, secretOps)
+		secret, outcome, err := endpointTexts.loadSecret(context.Background(), root, 30*time.Second, secretOps)
 		if err != nil {
 			t.Fatal(err)
 		}

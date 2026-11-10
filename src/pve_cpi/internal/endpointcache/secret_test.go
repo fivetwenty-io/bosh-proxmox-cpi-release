@@ -32,7 +32,7 @@ func openStoreRoot(t *testing.T, dir string) *os.Root {
 func TestLoadSecretCreatesThirtyTwoPrivateBytesOnce(t *testing.T) {
 	dir := newStoreDir(t)
 	root := openStoreRoot(t, dir)
-	first, outcome, err := loadSecret(context.Background(), root, time.Second, secretOps)
+	first, outcome, err := endpointTexts.loadSecret(context.Background(), root, time.Second, secretOps)
 	if err != nil || outcome != secretCreated {
 		t.Fatalf("first load: outcome %v, err %v", outcome, err)
 	}
@@ -46,7 +46,7 @@ func TestLoadSecretCreatesThirtyTwoPrivateBytesOnce(t *testing.T) {
 	if bytes.Equal(first, make([]byte, secretBytes)) {
 		t.Error("secret is all zero bytes")
 	}
-	second, outcome, err := loadSecret(context.Background(), root, time.Second, secretOps)
+	second, outcome, err := endpointTexts.loadSecret(context.Background(), root, time.Second, secretOps)
 	if err != nil || outcome != secretRead {
 		t.Fatalf("second load: outcome %v, err %v", outcome, err)
 	}
@@ -160,7 +160,7 @@ func raceSecret(t *testing.T, rounds int, prepare func(dir string)) []map[string
 		if got, want := storeDirNames(t, dirs[round]), []string{secretFile, secretLockFile}; !slices.Equal(got, want) {
 			t.Errorf("round %d: directory holds %v, want %v", round, got, want)
 		}
-		secret, again, err := loadSecret(context.Background(), openStoreRoot(t, dirs[round]), time.Second, secretOps)
+		secret, again, err := endpointTexts.loadSecret(context.Background(), openStoreRoot(t, dirs[round]), time.Second, secretOps)
 		if err != nil || again != secretRead {
 			t.Fatalf("round %d: reload outcome %v, err %v", round, again, err)
 		}
@@ -396,12 +396,12 @@ func TestSecretLockHeldByAnotherProcess(t *testing.T) {
 		t.Fatalf("child said %q, want locked", got)
 	}
 	root := openStoreRoot(t, dir)
-	if _, _, err := loadSecret(context.Background(), root, 100*time.Millisecond, secretOps); !errors.Is(err, ErrSecretBusy) {
+	if _, _, err := endpointTexts.loadSecret(context.Background(), root, 100*time.Millisecond, secretOps); !errors.Is(err, ErrSecretBusy) {
 		t.Fatalf("loadSecret under a held lock: %v, want ErrSecretBusy", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, err := loadSecret(ctx, root, time.Second, secretOps)
+	_, _, err := endpointTexts.loadSecret(ctx, root, time.Second, secretOps)
 	if !errors.Is(err, ErrLockWaitAbandoned) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("loadSecret with an ended context: %v, want ErrLockWaitAbandoned and context.Canceled", err)
 	}
@@ -411,14 +411,14 @@ func TestSecretLockHeldByAnotherProcess(t *testing.T) {
 	// A short secret waits for the same lock before it is replaced.
 	short := []byte("short")
 	writeStoreFile(t, filepath.Join(dir, secretFile), short, 0o600)
-	if _, _, err := loadSecret(context.Background(), root, 100*time.Millisecond, secretOps); !errors.Is(err, ErrSecretBusy) {
+	if _, _, err := endpointTexts.loadSecret(context.Background(), root, 100*time.Millisecond, secretOps); !errors.Is(err, ErrSecretBusy) {
 		t.Fatalf("loadSecret of a short secret under a held lock: %v, want ErrSecretBusy", err)
 	}
 	if !bytes.Equal(readStoreFile(t, filepath.Join(dir, secretFile)), short) {
 		t.Error("the short secret was replaced without the lock")
 	}
 	holder.finish(t)
-	if _, outcome, err := loadSecret(context.Background(), root, time.Second, secretOps); err != nil || outcome != secretReplaced {
+	if _, outcome, err := endpointTexts.loadSecret(context.Background(), root, time.Second, secretOps); err != nil || outcome != secretReplaced {
 		t.Fatalf("loadSecret after release: outcome %v, err %v", outcome, err)
 	}
 }
@@ -491,7 +491,7 @@ func TestSecretCreationFailureLeavesNoSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
-	secret, outcome, err := loadSecret(context.Background(), root, time.Second, secretOps)
+	secret, outcome, err := endpointTexts.loadSecret(context.Background(), root, time.Second, secretOps)
 	if err == nil || outcome != secretRead || secret != nil ||
 		!strings.Contains(err.Error(), "write directory secret "+filepath.Join(dir, secretFile)) {
 		t.Fatalf("loadSecret in a read-only directory: outcome %v, err %v", outcome, err)
@@ -507,7 +507,7 @@ func TestSecretCreationFailureLeavesNoSecret(t *testing.T) {
 	if err := os.Chmod(dir, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := loadSecret(context.Background(), root, time.Second, secretOps); err == nil {
+	if _, _, err := endpointTexts.loadSecret(context.Background(), root, time.Second, secretOps); err == nil {
 		t.Fatal("loadSecret replaced a short secret in a read-only directory")
 	}
 	if !bytes.Equal(readStoreFile(t, filepath.Join(dir, secretFile)), []byte("short")) {

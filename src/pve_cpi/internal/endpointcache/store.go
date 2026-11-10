@@ -73,6 +73,13 @@ type StoreOptions struct {
 	FilePrefix string
 	Label      string
 	Version    int
+	// DisplayName is what the store's messages call its file, its lock files,
+	// its directory secret, and its directory, such as HAProfileName. Empty
+	// means "endpoint cache", which keeps every message of the endpoint store
+	// as it has always read. The endpoint cache file keeps that name, so a
+	// DisplayName needs a FilePrefix to say anything else. It must be words of
+	// letters and digits at most 64 characters long.
+	DisplayName string
 }
 
 // Store reads and writes the cache file of one key in one cache directory.
@@ -94,10 +101,10 @@ type Store struct {
 	configuredMode config.DiscoveryMode
 	secretReplaced bool
 
-	// invalid, keyMismatch, and unsupported are the file's read failures. The
-	// endpoint cache file uses the package's own sentinels, and another kind of
-	// file uses ones that print its name and match them under errors.Is.
-	invalid, keyMismatch, unsupported error
+	// text names the store in its messages and holds the causes they print. The
+	// endpoint cache's are the package's own sentinels, and another kind of
+	// store's print its name and match them under errors.Is.
+	text *texts
 }
 
 // OpenStore opens the store for cfg on root, the cache directory that Resolve
@@ -120,7 +127,7 @@ type Store struct {
 // profile cache, and an invalid choice is refused with ErrInvalidFileKind.
 func OpenStore(ctx context.Context, root *os.Root, cfg KeyConfig, credential string, opts StoreOptions) (*Store, error) {
 	if root == nil {
-		return nil, fmt.Errorf("%s: no cache directory", cacheLabel)
+		return nil, fmt.Errorf("%s: no cache directory", textsFor(opts.DisplayName).name)
 	}
 	kind, err := kindFor(opts)
 	if err != nil {
@@ -138,10 +145,11 @@ func openStoreOfKind(
 	if err := checkKeyInputs(cfg, credential); err != nil {
 		return nil, errors.Join(err, root.Close())
 	}
-	if err := checkOpenedDirectory(root); err != nil {
+	text := textsFor(kind.name)
+	if err := text.checkOpenedDirectory(root); err != nil {
 		return nil, errors.Join(err, root.Close())
 	}
-	secret, outcome, err := loadSecret(ctx, root, secretLockWait, secretOps)
+	secret, outcome, err := text.loadSecret(ctx, root, secretLockWait, secretOps)
 	if err != nil {
 		return nil, errors.Join(err, root.Close())
 	}
@@ -154,22 +162,8 @@ func openStoreOfKind(
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
-	policy := cachePrivatePolicy
-	policy.Label = kind.name
-	if kind != endpointKind {
-		// The file's refusals read with its own name and still match the
-		// endpoint cache's causes under errors.Is.
-		policy.Ownership = privatefile.Sentinel(kind.name+": unsafe ownership", errCacheOwnership)
-		policy.Mode = privatefile.Sentinel(kind.name+": unsafe permissions", errCacheMode)
-		policy.FileType = privatefile.Sentinel(kind.name+": unsafe file type", errCacheFileType)
-	}
-	invalid, keyMismatch, unsupported := ErrFileInvalid, ErrKeyMismatch, ErrUnsupportedVersion
-	if kind != endpointKind {
-		invalid = privatefile.Sentinel(kind.name+": invalid file", ErrFileInvalid)
-		keyMismatch = privatefile.Sentinel(kind.name+": file key does not match", ErrKeyMismatch)
-		unsupported = privatefile.Sentinel(kind.name+": unsupported file version", ErrUnsupportedVersion)
-	}
-	policy.Corrupt = invalid
+	policy := text.policy
+	policy.Corrupt = text.invalid
 	policy.MaxBytes = maxFileBytes
 	policy.IntegrityKey = integrityKey
 	policy.Integrity = hmacIntegrity(macKey)
@@ -186,9 +180,7 @@ func openStoreOfKind(
 		logger:         logger,
 		configuredMode: opts.ConfiguredMode,
 		secretReplaced: outcome == secretReplaced,
-		invalid:        invalid,
-		keyMismatch:    keyMismatch,
-		unsupported:    unsupported,
+		text:           text,
 	}, nil
 }
 
@@ -228,11 +220,15 @@ func hmacIntegrity(key keyMaterial) func([]byte) string {
 }
 
 // label is what the store's messages call its file.
-func (s *Store) label() string {
-	if s == nil || s.kind.name == "" {
-		return cacheLabel
+func (s *Store) label() string { return s.texts().name }
+
+// texts returns the store's message texts, and the endpoint cache's for a nil
+// or zero store.
+func (s *Store) texts() *texts {
+	if s == nil || s.text == nil {
+		return endpointTexts
 	}
-	return s.kind.name
+	return s.text
 }
 
 // Sweep removes what the cache left behind in the store's directory, exactly
@@ -243,7 +239,7 @@ func (s *Store) Sweep(now time.Time) SweepResult {
 	if s == nil || s.root == nil {
 		return SweepResult{Err: fmt.Errorf("%s: store is closed", s.label())}
 	}
-	return Sweep(s.root, now, s.kind.lockName(s.key), s.name)
+	return s.texts().sweepWith(s.root, now, []string{s.kind.lockName(s.key), s.name}, ownedByEffectiveUser)
 }
 
 // Key returns the store's key, which every payload it reads or writes must
@@ -287,7 +283,7 @@ func (s *Store) Read(out any) error {
 		return err
 	}
 	if env.Version != s.kind.version {
-		return fmt.Errorf("%w: version %d", s.unsupported, env.Version)
+		return fmt.Errorf("%w: version %d", s.texts().unsupported, env.Version)
 	}
 	var payload json.RawMessage
 	if err := s.policy.DecodeEnvelope(env, s.kind.version, &payload); err != nil {
@@ -297,7 +293,7 @@ func (s *Store) Read(out any) error {
 		return err
 	}
 	if err := privatefile.StrictDecode(payload, out); err != nil {
-		return fmt.Errorf("%w: malformed payload: %w", s.invalid, err)
+		return fmt.Errorf("%w: malformed payload: %w", s.texts().invalid, err)
 	}
 	return nil
 }
@@ -309,10 +305,10 @@ func (s *Store) checkKey(payload json.RawMessage) error {
 		Key *Key `json:"key"`
 	}
 	if err := json.Unmarshal(payload, &head); err != nil {
-		return fmt.Errorf("%w: malformed payload: %w", s.invalid, err)
+		return fmt.Errorf("%w: malformed payload: %w", s.texts().invalid, err)
 	}
 	if head.Key == nil || !head.Key.Equal(s.key) {
-		return s.keyMismatch
+		return s.texts().keyMismatch
 	}
 	return nil
 }
@@ -394,9 +390,9 @@ func Update[T any](ctx context.Context, s *Store, merge func(current *T) (*T, er
 func (s *Store) lock(ctx context.Context) (*privatefile.Lock, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, s.lockWait)
 	defer cancel()
-	lock, err := waitHeldLock(waitCtx, s.root, s.kind.lockName(s.key))
+	lock, err := s.texts().waitHeldLock(waitCtx, s.root, s.kind.lockName(s.key))
 	if err != nil {
-		return nil, lockWaitError(ctx, err, errLockBusy)
+		return nil, s.texts().lockWaitError(ctx, err, s.texts().lockBusy)
 	}
 	return lock, nil
 }
@@ -414,7 +410,7 @@ func (s *Store) TryLockDiscovery(ctx context.Context) (lock *privatefile.Lock, h
 	if s == nil || s.root == nil {
 		return nil, false, fmt.Errorf("%s: store is closed", s.label())
 	}
-	return tryHeldLock(ctx, s.root, s.kind.discoverLockName(s.key))
+	return s.texts().tryHeldLock(ctx, s.root, s.kind.discoverLockName(s.key))
 }
 
 // write marshals value, refuses it unless its key is the store's, and replaces

@@ -16,6 +16,11 @@ type DirOptions struct {
 	// adds that field, takes it from this struct in Options and every caller
 	// gets it without a change.
 	JournalDir string
+
+	// DisplayName is what a refusal calls the cache the caller is choosing a
+	// directory for. Empty means the endpoint cache. OptionsFor leaves it empty,
+	// and Named sets it.
+	DisplayName string
 }
 
 // OptionsFor builds the directory options from the config. A nil config gives
@@ -29,7 +34,9 @@ func OptionsFor(cfg *config.CPIConfig) DirOptions {
 
 // Options returns the options Resolve takes. It is the one place that copies
 // the config's values into them.
-func (d DirOptions) Options() Options { return Options{Override: d.Override} }
+func (d DirOptions) Options() Options {
+	return Options{Override: d.Override, DisplayName: d.DisplayName}
+}
 
 // Resolve chooses the cache directory for d. See the package's Resolve.
 func (d DirOptions) Resolve() Choice { return Resolve(d.Options()) }
@@ -38,5 +45,11 @@ func (d DirOptions) Resolve() Choice { return Resolve(d.Options()) }
 // may fall back from a missing override reaches the layers after it.
 func (d DirOptions) WithoutOverride() DirOptions {
 	d.Override = ""
+	return d
+}
+
+// Named returns d with refusals calling the cache name, such as HAProfileName.
+func (d DirOptions) Named(name string) DirOptions {
+	d.DisplayName = name
 	return d
 }

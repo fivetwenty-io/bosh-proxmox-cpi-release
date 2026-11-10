@@ -211,12 +211,12 @@ func TestSweepLeavesFilesAnotherUserOwns(t *testing.T) {
 	sweepFile(t, dir, sweepKey, year)
 	sweepFile(t, dir, sweepTemp, year)
 	notOurs := func(fs.FileInfo) bool { return false }
-	result := sweepWith(root, sweepNow, nil, notOurs)
+	result := endpointTexts.sweepWith(root, sweepNow, nil, notOurs)
 	if result.Err != nil || len(result.Removed) != 0 {
 		t.Errorf("a file another user owns was swept: %+v", result)
 	}
 	ours := func(fs.FileInfo) bool { return true }
-	result = sweepWith(root, sweepNow, nil, ours)
+	result = endpointTexts.sweepWith(root, sweepNow, nil, ours)
 	if result.Err != nil || len(result.Removed) != 2 {
 		t.Errorf("owned files were kept: %+v", result)
 	}

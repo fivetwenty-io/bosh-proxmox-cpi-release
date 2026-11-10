@@ -36,11 +36,6 @@ var ErrInvalidFileKind = errors.New("endpoint cache: invalid file kind")
 // knows exactly these, so a file of any other kind would never be removed.
 var knownFilePrefixes = []string{HAProfilePrefix}
 
-// filePrefixNames says what to call the file of each known prefix in error and
-// log text, so a message about the HA profile file does not read as one about
-// the endpoint cache file.
-var filePrefixNames = map[string]string{HAProfilePrefix: "HA profile cache"}
-
 // fileLabelPattern is the shape of a file kind's HMAC label: lowercase words
 // of letters and digits, joined by single spaces or hyphens.
 var fileLabelPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:[ -][a-z0-9]+)*$`)
@@ -52,8 +47,8 @@ type fileKind struct {
 	// prefix starts the file's name and its lock names, and is empty for the
 	// endpoint cache file.
 	prefix string
-	// name is what error and log text calls the file: "endpoint cache" for the
-	// endpoint cache file, and "HA profile cache" for the profile file.
+	// name is what error and log text calls the file, from
+	// StoreOptions.DisplayName. It is "endpoint cache" when that is empty.
 	name string
 	// label starts the HKDF info of the file's HMAC key.
 	label string
@@ -74,7 +69,14 @@ func (k fileKind) discoverLockName(key Key) string { return k.prefix + key.Disco
 // the endpoint label, or a label with the endpoint's file name, would let two
 // kinds of file overwrite each other.
 func kindFor(opts StoreOptions) (fileKind, error) {
+	if !validDisplayName(opts.DisplayName) {
+		return fileKind{}, fmt.Errorf("%w: display name %q is not words of at most %d characters",
+			ErrInvalidFileKind, opts.DisplayName, maxDisplayName)
+	}
 	if opts.FilePrefix == "" && opts.Label == "" && opts.Version == 0 {
+		if opts.DisplayName != "" && opts.DisplayName != cacheLabel {
+			return fileKind{}, fmt.Errorf("%w: the endpoint cache file keeps the name %q", ErrInvalidFileKind, cacheLabel)
+		}
 		return endpointKind, nil
 	}
 	switch {
@@ -96,5 +98,9 @@ func kindFor(opts StoreOptions) (fileKind, error) {
 	if version == 0 {
 		version = defaultKindVersion
 	}
-	return fileKind{prefix: opts.FilePrefix, name: filePrefixNames[opts.FilePrefix], label: opts.Label, version: version}, nil
+	name := opts.DisplayName
+	if name == "" {
+		name = cacheLabel
+	}
+	return fileKind{prefix: opts.FilePrefix, name: name, label: opts.Label, version: version}, nil
 }

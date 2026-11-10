@@ -540,7 +540,7 @@ type lockHeldContext struct {
 }
 
 func (c lockHeldContext) Err() error {
-	lock, free, err := tryHeldLock(context.Background(), c.s.root, c.s.key.LockName())
+	lock, free, err := endpointTexts.tryHeldLock(context.Background(), c.s.root, c.s.key.LockName())
 	if err != nil {
 		c.t.Errorf("probe the lock: %v", err)
 		return nil
@@ -959,7 +959,7 @@ func TestHeldLockRetakesALockFileReplacedWhileHeld(t *testing.T) {
 			dir := newStoreDir(t)
 			root := openStoreRoot(t, dir)
 			takes := 0
-			lock, held, err := heldLock(root, name, tryLockThen(root, name, &takes, func(*privatefile.Lock) {
+			lock, held, err := endpointTexts.heldLock(root, name, tryLockThen(root, name, &takes, func(*privatefile.Lock) {
 				if takes == 1 {
 					tc.change(t, dir)
 				}
@@ -993,7 +993,7 @@ func TestHeldLockGivesUpOnALockFileThatKeepsChanging(t *testing.T) {
 	root := openStoreRoot(t, dir)
 	takes := 0
 	var taken []*privatefile.Lock
-	lock, held, err := heldLock(root, name, tryLockThen(root, name, &takes, func(l *privatefile.Lock) {
+	lock, held, err := endpointTexts.heldLock(root, name, tryLockThen(root, name, &takes, func(l *privatefile.Lock) {
 		taken = append(taken, l)
 		replaceLockFile(t, dir, name)
 	}))
@@ -1008,7 +1008,7 @@ func TestHeldLockGivesUpOnALockFileThatKeepsChanging(t *testing.T) {
 			t.Errorf("lock %d was not released: %v", i, err)
 		}
 	}
-	lock, held, err = heldLock(root, name, func() (*privatefile.Lock, bool, error) { return nil, false, nil })
+	lock, held, err = endpointTexts.heldLock(root, name, func() (*privatefile.Lock, bool, error) { return nil, false, nil })
 	if lock != nil || held || err != nil {
 		t.Fatalf("heldLock of a busy lock: %v, %v, %v", lock, held, err)
 	}

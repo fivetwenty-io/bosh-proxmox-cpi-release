@@ -286,6 +286,9 @@ func TestProfileCacheAnUnsafeDirectoryProbesEveryCall(t *testing.T) {
 				if !strings.Contains(text, tc.refusal) {
 					t.Errorf("refusal %q does not say %q", text, tc.refusal)
 				}
+				if !strings.Contains(text, "HA profile cache: "+tc.refusal) || strings.Contains(text, "endpoint cache") {
+					t.Errorf("refusal %q must name the HA profile cache and not the endpoint cache", text)
+				}
 			}
 		})
 	}
@@ -771,5 +774,32 @@ func TestProfileCacheOptionsCarryTheDirectoryOptionsFromTheConfig(t *testing.T) 
 	}
 	if opts.Dir.JournalDir != cfg.StorageAllocationJournalDir {
 		t.Errorf("the journal directory did not reach the cache: %+v", opts.Dir)
+	}
+}
+
+func TestProfileCacheSecretAndLockRefusalsNameTheHAProfileCache(t *testing.T) {
+	dir := cacheDir(t)
+	secret := filepath.Join(dir, "secret")
+	if err := os.WriteFile(secret, make([]byte, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(secret, 0o644); err != nil { // #nosec G302 -- the test opens the mode on purpose
+		t.Fatal(err)
+	}
+	cfg := cacheCfg(dir)
+	opts, _ := ha.ProfileCacheOptionsFromConfig(cfg, nil)
+	logger, logs := log.NewObservedLogger(slog.LevelDebug)
+	opts.Log = logger
+	opts.Now = newCacheClock().Now
+	w := three()
+	resolveWith(t, w.deps(cfg).WithProfileCache(opts))
+
+	refusals := debugErrors(logs, "cannot open the cache")
+	if len(refusals) != 1 {
+		t.Fatalf("logged %d open refusals, want 1", len(refusals))
+	}
+	if want := "HA profile cache: refusing directory secret " + secret + ": HA profile cache: unsafe permissions"; !strings.HasPrefix(refusals[0], want) ||
+		strings.Contains(refusals[0], "endpoint cache") {
+		t.Errorf("refusal %q, want it to start %q and not name the endpoint cache", refusals[0], want)
 	}
 }

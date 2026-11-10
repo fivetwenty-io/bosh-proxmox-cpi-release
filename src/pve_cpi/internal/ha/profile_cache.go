@@ -221,17 +221,18 @@ func (c *ProfileCache) Slow(ctx context.Context, nodes []NodeRef) (*SlowFacts, e
 // openStore opens the profile file's store, or returns nil after logging why
 // there is no cache for this call.
 func (c *ProfileCache) openStore(ctx context.Context, logger *log.Logger) *endpointcache.Store {
-	choice := c.opts.Dir.Resolve()
+	choice := c.opts.Dir.Named(endpointcache.HAProfileName).Resolve()
 	if !choice.Usable() {
 		logger.Debug("ha profile cache: no usable cache directory; probing",
 			log.String("layer", string(choice.Layer)), log.String("path", choice.Path), log.Err(choice.Err))
 		return nil
 	}
 	store, err := endpointcache.OpenStore(ctx, choice.Root, c.opts.Key, c.opts.Credential, endpointcache.StoreOptions{
-		Logger:     logger,
-		FilePrefix: endpointcache.HAProfilePrefix,
-		Label:      profileCacheLabel,
-		Version:    profileCacheVersion,
+		Logger:      logger,
+		FilePrefix:  endpointcache.HAProfilePrefix,
+		Label:       profileCacheLabel,
+		Version:     profileCacheVersion,
+		DisplayName: endpointcache.HAProfileName,
 	})
 	if err != nil {
 		logger.Debug("ha profile cache: cannot open the cache; probing",

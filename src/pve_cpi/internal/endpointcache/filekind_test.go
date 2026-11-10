@@ -18,7 +18,7 @@ import (
 
 // haProfileOptions is the option set the HA profile cache opens its store with.
 func haProfileOptions() StoreOptions {
-	return StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", Version: 1}
+	return StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", Version: 1, DisplayName: HAProfileName}
 }
 
 func TestKindForDefaultsToTheEndpointCacheFile(t *testing.T) {
@@ -35,7 +35,7 @@ func TestKindForDefaultsToTheEndpointCacheFile(t *testing.T) {
 }
 
 func TestKindForNamesTheFileAndDefaultsTheVersionToOne(t *testing.T) {
-	kind, err := kindFor(StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile"})
+	kind, err := kindFor(StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", DisplayName: HAProfileName})
 	if err != nil {
 		t.Fatalf("kindFor: %v", err)
 	}
@@ -53,12 +53,14 @@ func TestKindForNamesTheFileAndDefaultsTheVersionToOne(t *testing.T) {
 	}
 }
 
-func TestEveryKnownFilePrefixHasANameThatIsNotTheEndpointCaches(t *testing.T) {
-	for _, prefix := range knownFilePrefixes {
-		name := filePrefixNames[prefix]
-		if name == "" || name == cacheLabel {
-			t.Errorf("prefix %q is named %q, want a name of its own", prefix, name)
-		}
+func TestKindForDefaultsTheDisplayNameToTheEndpointCache(t *testing.T) {
+	kind, err := kindFor(StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile"})
+	if err != nil || kind.name != cacheLabel {
+		t.Fatalf("an empty display name gave %q, err %v, want %q", kind.name, err, cacheLabel)
+	}
+	kind, err = kindFor(StoreOptions{DisplayName: cacheLabel})
+	if err != nil || kind != endpointKind {
+		t.Fatalf("the endpoint name on the endpoint kind gave %+v, err %v", kind, err)
 	}
 }
 
@@ -84,6 +86,12 @@ func TestKindForValidatesTheOptions(t *testing.T) {
 		"label with a double space": {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve  ha"}, false},
 		"label too long":            {StoreOptions{FilePrefix: HAProfilePrefix, Label: long}, false},
 		"negative version":          {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", Version: -1}, false},
+		"display name only":         {StoreOptions{DisplayName: HAProfileName}, false},
+		"display name with a break": {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", DisplayName: "HA\nprofile"}, false},
+		"display name with a colon": {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", DisplayName: "HA: profile"}, false},
+		"display name too long": {
+			StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", DisplayName: strings.Repeat("a", maxDisplayName+1)}, false,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
