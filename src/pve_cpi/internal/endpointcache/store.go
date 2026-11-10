@@ -96,10 +96,10 @@ type StoreOptions struct {
 // which takes the directory for itself, so a Close between two steps fails the
 // later one with the closed-store error and nothing is half done.
 type Store struct {
-	// guard shares the directory between the store and its copies. root is
-	// read and cleared only under guard.mu, and Close clears it.
+	// guard holds the cache directory and shares it, and its closed state,
+	// between the store and its copies. A copy of a Store sees a Close on the
+	// original, and the directory closes once.
 	guard          *rootGuard
-	root           *os.Root
 	key            Key
 	kind           fileKind
 	name           string
@@ -185,8 +185,7 @@ func openStoreOfKind(
 	policy.IntegrityKey = integrityKey
 	policy.Integrity = hmacIntegrity(macKey)
 	return &Store{
-		guard:  new(rootGuard),
-		root:   root,
+		guard:  &rootGuard{root: root},
 		key:    key,
 		kind:   kind,
 		name:   kind.fileName(key),
@@ -231,12 +230,15 @@ func (s *Store) SecretReplaced() (path string, replaced bool) {
 	return secretPath(root), true
 }
 
-// rootGuard holds what a store's Close and its running steps agree on. A step
-// counts itself in uses while it holds the directory. A Close that lands while
-// any step holds it parks the directory in pending, and the last step to end
-// closes it, so no step ever finds its directory closed under it.
+// rootGuard holds the store's cache directory and what its Close and its
+// running steps agree on. root is read and cleared only under mu, and Close
+// clears it. A step counts itself in uses while it holds the directory. A Close
+// that lands while any step holds it parks the directory in pending, and the
+// last step to end closes it, so no step ever finds its directory closed under
+// it.
 type rootGuard struct {
 	mu      sync.Mutex
+	root    *os.Root
 	uses    int
 	pending *os.Root
 }
@@ -252,7 +254,7 @@ func (s *Store) use() (root *os.Root, done func()) {
 	}
 	g := s.guard
 	g.mu.Lock()
-	root = s.root
+	root = g.root
 	if root != nil {
 		g.uses++
 	}
@@ -352,8 +354,8 @@ func (s *Store) Close() error {
 	}
 	g := s.guard
 	g.mu.Lock()
-	root := s.root
-	s.root = nil
+	root := g.root
+	g.root = nil
 	if root != nil && g.uses > 0 {
 		g.pending, root = root, nil
 	}

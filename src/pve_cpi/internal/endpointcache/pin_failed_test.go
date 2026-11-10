@@ -289,6 +289,17 @@ func TestMergeClearsAPinFailureAheadOfTheWritersClock(t *testing.T) {
 			t.Errorf("pin_failed_at %v, want the stored %v", next.Discovery.PinFailedAt, inside)
 		}
 	})
+	t.Run("a section dated inside the skew is visible, so the clear reaches it", func(t *testing.T) {
+		stored := pinFailedStored(ahead)
+		stored.Discovery.DiscoveredAt = payloadNow.Add(10 * time.Second)
+		stored.Discovery.NextRefreshAfter = stored.Discovery.DiscoveredAt.Add(RefreshInterval)
+		next := mustMerge(t, stored, Change{
+			Marks: map[string]DownMark{mergeSeed: {DownAt: payloadNow, Class: MarkDial}},
+		})
+		if !next.Discovery.PinFailedAt.IsZero() {
+			t.Errorf("pin_failed_at %v survived in a section a reader still loads", next.Discovery.PinFailedAt)
+		}
+	})
 	t.Run("a section dated ahead is hidden and stays as it is", func(t *testing.T) {
 		stored := pinFailedStored(ahead)
 		stored.Discovery.DiscoveredAt = payloadNow.Add(30 * time.Minute)

@@ -48,7 +48,7 @@ func writeEnvelopeFile(t *testing.T, path string, env any) {
 // writer holding the credential would.
 func signedFile(t *testing.T, s *Store, payload any) {
 	t.Helper()
-	if err := s.policy.WriteEnvelope(s.root, s.name, fileVersion, payload, s.ops); err != nil {
+	if err := s.policy.WriteEnvelope(s.guard.root, s.name, fileVersion, payload, s.ops); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -254,7 +254,7 @@ func TestStoreRefusesAWrongKey(t *testing.T) {
 func TestStoreRefusesAnUnsupportedVersion(t *testing.T) {
 	dir := newStoreDir(t)
 	s := openTestStore(t, dir, storeTestCredential, StoreOptions{})
-	if err := s.policy.WriteEnvelope(s.root, s.name, fileVersion+1, storeTestPayload{Key: s.Key()}, s.ops); err != nil {
+	if err := s.policy.WriteEnvelope(s.guard.root, s.name, fileVersion+1, storeTestPayload{Key: s.Key()}, s.ops); err != nil {
 		t.Fatal(err)
 	}
 	var got storeTestPayload
@@ -540,7 +540,7 @@ type lockHeldContext struct {
 }
 
 func (c lockHeldContext) Err() error {
-	lock, free, err := endpointTexts.tryHeldLock(context.Background(), c.s.root, c.s.key.LockName())
+	lock, free, err := endpointTexts.tryHeldLock(context.Background(), c.s.guard.root, c.s.key.LockName())
 	if err != nil {
 		c.t.Errorf("probe the lock: %v", err)
 		return nil
@@ -828,7 +828,7 @@ func TestStoreRefusesAFileSignedForAnotherVersion(t *testing.T) {
 	}
 	other := s.policy
 	other.Integrity = hmacIntegrity(next)
-	if err := other.WriteEnvelope(s.root, s.name, fileVersion, storeTestPayload{Key: s.Key(), Note: "v2"}, s.ops); err != nil {
+	if err := other.WriteEnvelope(s.guard.root, s.name, fileVersion, storeTestPayload{Key: s.Key(), Note: "v2"}, s.ops); err != nil {
 		t.Fatal(err)
 	}
 	var got storeTestPayload

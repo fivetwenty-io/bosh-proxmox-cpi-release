@@ -201,10 +201,10 @@ type Stored struct {
 // under the same rule for a hidden section. A write also clears a stored
 // pin_failed_at that is more than FutureSkew ahead of the writer's clock,
 // which a reader drops, so a writer whose clock ran ahead cannot leave a time
-// that wakes up later as a failure the next attempt already answered. It keeps a stored hint that passes every other check even when the
-// writer's own az_map does not name its node, because another entry that
-// shares the key may have written it, and it replaces the hint only with
-// change.Hint.
+// that wakes up later as a failure the next attempt already answered. It keeps
+// a stored hint that passes every other check even when the writer's own
+// az_map does not name its node, because another entry that shares the key may
+// have written it, and it replaces the hint only with change.Hint.
 //
 // The merge refuses every result while the stored identity holds a conflict,
 // with ErrIdentityConflict. Under verify_ssl false it refuses, with a

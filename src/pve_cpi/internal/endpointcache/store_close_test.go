@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -286,7 +287,7 @@ func TestStoreWriteCutOffByCloseLeavesNoTemporaryFile(t *testing.T) {
 		dir := newStoreDir(t)
 		s := openTestStore(t, dir, "secret-a", StoreOptions{})
 		storePut(t, s, "old")
-		root := s.root
+		root := s.guard.root
 		inner := s.ops.Write
 		s.ops.Write = func(f *os.File, b []byte) (int, error) {
 			if err := s.Close(); err != nil {
@@ -367,42 +368,119 @@ func TestStoreCloseParksTheDirectoryForARunningStep(t *testing.T) {
 	}
 }
 
-// settle is how long a goroutine in the tests below waits so that the other
-// one has finished its access. The race detector orders accesses by what the
-// program synchronizes and not by the clock, so a fixed wait gives it a known
-// real-time order without handing it a synchronization edge. A wait that runs
-// short can only hide a race on that run, never report one that is not there.
-const settle = 50 * time.Millisecond
+// closedPollLimit bounds how long a test waits for a step in another goroutine
+// to see a Close that has already returned.
+const closedPollLimit = 10 * time.Second
 
-// Close and a step in another goroutine, in a fixed order with nothing the race
-// detector can see between them, are a race unless the store guards the
-// directory. Under -race an unguarded access fails these on every run.
+// readUntilClosed reads the store until a read returns the closed-store error,
+// and returns every other result it saw on the way. It polls without any
+// synchronization with the goroutine that closes the store, so the race
+// detector still sees the two as concurrent, and it ends because a Close that
+// has returned is seen by the next step. It stops at closedPollLimit.
+func readUntilClosed(s *Store) (before []error, closed bool) {
+	deadline := time.Now().Add(closedPollLimit)
+	for time.Now().Before(deadline) {
+		err := s.Read(new(Payload))
+		if err != nil && strings.Contains(err.Error(), "store is closed") {
+			return before, true
+		}
+		before = append(before, err)
+		runtime.Gosched()
+	}
+	return before, false
+}
+
+// Close and a step in another goroutine, with nothing the race detector can
+// see between them, are a race unless the store guards the directory. Under
+// -race an unguarded access fails these on every run. The order of the two is
+// not timed. The step polls until it sees the Close, and a step that began
+// before the Close must have read the file whole.
 func TestStoreCloseAndAStepInAnotherGoroutineAreNotARace(t *testing.T) {
+	type outcome struct {
+		before []error
+		closed bool
+	}
 	t.Run("Close first, then a step", func(t *testing.T) {
 		s, _ := seededStore(t)
 		gate := make(chan struct{})
-		done := make(chan error, 1)
+		done := make(chan outcome, 1)
 		go func() {
 			<-gate
-			time.Sleep(settle)
-			done <- s.Read(new(Payload))
+			before, closed := readUntilClosed(s)
+			done <- outcome{before, closed}
 		}()
 		close(gate)
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
-		wantClosed(t, "Read after the Close", <-done)
+		got := <-done
+		if !got.closed {
+			t.Fatalf("no Read saw the Close within %v", closedPollLimit)
+		}
+		for _, err := range got.before {
+			if err != nil {
+				t.Errorf("Read before the Close: %v", err)
+			}
+		}
+		wantClosed(t, "Read after the Close", s.Read(new(Payload)))
 	})
 	t.Run("a step first, then Close", func(t *testing.T) {
 		s, _ := seededStore(t)
-		done := make(chan error, 1)
-		go func() { done <- s.Read(new(Payload)) }()
-		time.Sleep(settle)
+		started := make(chan struct{})
+		done := make(chan outcome, 1)
+		go func() {
+			err := s.Read(new(Payload))
+			close(started)
+			before, closed := readUntilClosed(s)
+			done <- outcome{append([]error{err}, before...), closed}
+		}()
+		<-started
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if err := <-done; err != nil {
-			t.Errorf("Read before the Close: %v", err)
+		got := <-done
+		if !got.closed {
+			t.Fatalf("no Read saw the Close within %v", closedPollLimit)
+		}
+		for _, err := range got.before {
+			if err != nil {
+				t.Errorf("Read before the Close: %v", err)
+			}
+		}
+	})
+}
+
+// A copy of a Store shares the directory and its closed state with the
+// original, so a Close on either one closes both and the directory closes once.
+func TestStoreCopySharesTheDirectoryAndItsClosedState(t *testing.T) {
+	t.Run("Close on the original closes the copy", func(t *testing.T) {
+		s, _ := seededStore(t)
+		c := *s
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		wantClosed(t, "Read on the copy", c.Read(new(Payload)))
+		if root, done := c.use(); root != nil || c.guard.uses != 0 {
+			t.Errorf("use on the copy gave root %v and left %d steps running", root, c.guard.uses)
+		} else {
+			done()
+		}
+		if !c.closed() {
+			t.Error("the copy does not report that the store is closed")
+		}
+		if err := c.Close(); err != nil {
+			t.Errorf("Close on the copy after the original's: %v", err)
+		}
+	})
+	t.Run("Close on the copy closes the original", func(t *testing.T) {
+		s, _ := seededStore(t)
+		c := *s
+		if err := c.Close(); err != nil {
+			t.Fatal(err)
+		}
+		wantClosed(t, "Read on the original", s.Read(new(Payload)))
+		if err := s.Close(); err != nil {
+			t.Errorf("Close on the original after the copy's: %v", err)
 		}
 	})
 }
