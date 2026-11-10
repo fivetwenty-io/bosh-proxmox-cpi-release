@@ -117,7 +117,7 @@ The Mac workstation may reach PVE over Tailscale fine — but `bosh create-env` 
 
 See [pve-api-permissions.md](pve-api-permissions.md) for token creation and the minimum-privilege `bosh@pve` user setup.
 
-The ops file in `manifests/bosh/cpi.yml` wires both `pve_password` and `pve_api_token` into the CPI job. Both vars must exist in `vars.yml` so the BOSH var interpolator can resolve them, but only one should hold a real value; leave the other as an empty string. The CPI validates this XOR at startup (`one of password or api_token is required`; `password and api_token are mutually exclusive`).
+The ops file in `manifests/bosh/cpi.yml` wires both `pve_password` and `pve_api_token` into the CPI job. Both vars must exist in `vars.yml` so the BOSH var interpolator can resolve them. Put a real value in only one of them and leave the other as an empty string. If both hold a value, the CPI uses the API token and ignores the password. If both are empty, the CPI fails its configuration check with `one of password or api_token is required`.
 
 Password auth (default):
 

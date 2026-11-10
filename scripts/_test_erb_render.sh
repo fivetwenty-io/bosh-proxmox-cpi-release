@@ -115,6 +115,31 @@ erb = begin
 rescue ArgumentError
   ERB.new(template, nil, '-')
 end
+if (fixture = ENV['ERB_REFUSALS_FIXTURE'])
+  # Render once per fixture entry: layer the entry's config members onto the
+  # base pve map, and require the render to raise with exactly the entry's
+  # message. The members carry the same names as the pve.* properties.
+  base = Marshal.load(Marshal.dump($props))
+  cases = JSON.parse(File.read(fixture, encoding: 'UTF-8'))
+  failures = 0
+  cases.each do |c|
+    $props = Marshal.load(Marshal.dump(base))
+    c.fetch('config').each { |k, v| $props['pve'][k] = v }
+    got = begin
+      erb.result(binding)
+      nil
+    rescue RuntimeError => e
+      e.message.dup.force_encoding(Encoding::UTF_8)
+    end
+    next if got == c.fetch('message')
+    failures += 1
+    $stderr.puts "FAIL [case15-fixture: #{c.fetch('name')}]"
+    $stderr.puts "       expected: #{c.fetch('message').inspect}"
+    $stderr.puts "       got:      #{got.nil? ? 'a successful render' : got.inspect}"
+  end
+  puts "#{cases.length - failures} of #{cases.length} refusals matched"
+  exit(failures.zero? ? 0 : 1)
+end
 print erb.result(binding)
 RUBY
 }
@@ -598,6 +623,18 @@ props_with_pve() {
     print h.inspect
   ' "$1"
 }
+# props_with_pve_nil sets each key in a JSON array to nil in the base pve map,
+# which is how a lookup sees an optional property that a manifest left unset
+# and a BOSH renderer reports as nil. props_with_pve deletes the key instead.
+# An optional second argument is a JSON object of values to set first.
+props_with_pve_nil() {
+  printf '%s' "$(build_props 'secret-pw' '')" | ruby -rjson -e '
+    h = eval(STDIN.read)
+    JSON.parse(ARGV[1].to_s.empty? ? "{}" : ARGV[1]).each { |k, v| h["pve"][k] = v }
+    JSON.parse(ARGV[0]).each { |k| h["pve"][k] = nil }
+    print h.inspect
+  ' "$1" "${2:-}"
+}
 assert_pve_render_raises() {
   local label="$1"; local pve_json="$2"; shift 2
   local out rc=0
@@ -716,10 +753,24 @@ echo "Case 15: pve.api_endpoint_discovery and pve.endpoint_cache_dir"
 assert_json_lacks_key "case15-unset" "$JSON_1" api_endpoint_discovery || FAILED=$((FAILED+1))
 assert_json_lacks_key "case15-unset" "$JSON_1" endpoint_cache_dir     || FAILED=$((FAILED+1))
 
-# A property set to nil is unset, as it is in a BOSH manifest.
-JSON_15N="$(render "$(props_with_pve '{"api_endpoint_discovery":null,"endpoint_cache_dir":null}')")"
-assert_json_lacks_key "case15-null" "$JSON_15N" api_endpoint_discovery || FAILED=$((FAILED+1))
-assert_json_lacks_key "case15-null" "$JSON_15N" endpoint_cache_dir     || FAILED=$((FAILED+1))
+# A property that the lookup does not find is unset.
+JSON_15A="$(render "$(props_with_pve '{"api_endpoint_discovery":null,"endpoint_cache_dir":null}')")"
+assert_json_lacks_key "case15-absent" "$JSON_15A" api_endpoint_discovery || FAILED=$((FAILED+1))
+assert_json_lacks_key "case15-absent" "$JSON_15A" endpoint_cache_dir     || FAILED=$((FAILED+1))
+
+# A property that the lookup finds with a nil value is unset too, as it is in a
+# BOSH manifest. This reaches the nil guards inside the if_p blocks.
+JSON_15N="$(render "$(props_with_pve_nil '["api_endpoint_discovery","endpoint_cache_dir"]')")"
+assert_json_valid     "case15-nil" "$JSON_15N"                          || FAILED=$((FAILED+1))
+assert_json_lacks_key "case15-nil" "$JSON_15N" api_endpoint_discovery   || FAILED=$((FAILED+1))
+assert_json_lacks_key "case15-nil" "$JSON_15N" endpoint_cache_dir       || FAILED=$((FAILED+1))
+
+# A nil verify_ssl reads as verified, so on renders with a password. A nil
+# journal directory does not stop a cache directory from rendering.
+JSON_15NV="$(render "$(props_with_pve_nil '["verify_ssl"]' '{"api_endpoint_discovery":"on"}')")"
+assert_json_key_equals "case15-nil-verify" "$JSON_15NV" api_endpoint_discovery on || FAILED=$((FAILED+1))
+JSON_15NJ="$(render "$(props_with_pve_nil '["storage_allocation_journal_dir"]' '{"endpoint_cache_dir":"/var/cache/ep"}')")"
+assert_json_key_equals "case15-nil-journal" "$JSON_15NJ" endpoint_cache_dir /var/cache/ep || FAILED=$((FAILED+1))
 
 # Each mode as a string, and the booleans mapped back to the mode names.
 for pair in 'auto:auto' 'on:on' 'off:off'; do
@@ -824,6 +875,58 @@ for pair in '/var/j:/var/jx' '/var/j:/var/cache' '/var/j/sub:/var/j' '/var/j:/ot
   journal="${pair%%:*}"; dir="${pair#*:}"
   JSON_15J="$(render "$(props_with_pve "{\"storage_allocation_journal_dir\":\"${journal}\",\"endpoint_cache_dir\":\"${dir}\"}")")"
   assert_json_key_equals "case15-journal-ok-${journal}-${dir}" "$JSON_15J" endpoint_cache_dir "$dir" || FAILED=$((FAILED+1))
+done
+
+# A journal directory with leading whitespace is also not absolute, so the CPI
+# reports a second error after the whitespace one. The template raises the
+# first, which the fixture below cannot hold because it asserts the whole text.
+assert_pve_render_raises "case15-journal-leading-space" \
+  '{"storage_allocation_journal_dir":" /var/j","endpoint_cache_dir":"/var/cache/ep"}' \
+  'storage_allocation_journal_dir must not have leading or trailing whitespace when endpoint_cache_dir is set, got " /var/j"'
+
+# The CPI's config tests read the same fixture and assert that config.Load
+# refuses each entry with exactly this message, so a wording change on either
+# side fails a test until the other side matches. Each entry's members carry the
+# same names as the pve.* properties, and the template has to raise the message
+# in full, including the quoted values.
+REFUSALS_FIXTURE="${REPO_ROOT}/src/pve_cpi/internal/config/testdata/discovery_refusals.json"
+if [ ! -r "$REFUSALS_FIXTURE" ]; then
+  echo "FAIL [case15-refusals]: cannot read ${REFUSALS_FIXTURE}" >&2
+  FAILED=$((FAILED+1))
+elif ! REFUSALS_OUT="$(ERB_REFUSALS_FIXTURE="$REFUSALS_FIXTURE" render "$(build_props 'secret-pw' '')" 2>&1)"; then
+  printf '%s\n' "$REFUSALS_OUT" >&2
+  FAILED=$((FAILED+1))
+fi
+
+# The quoting helper in the template has to match Go's strconv.Quote, because
+# the CPI's messages use %q. The lambda is pulled out of the template and run
+# against the fixture that holds strconv.Quote's output for each class of
+# character: the named escapes, other controls, Unicode whitespace, format and
+# private-use characters, printable non-ASCII, hash sequences, and invalid
+# UTF-8. It runs under the C locale too, where Ruby's inspect escapes every
+# non-ASCII character.
+QUOTE_FIXTURE="${REPO_ROOT}/src/pve_cpi/internal/config/testdata/template_quote_cases.json"
+for locale in C en_US.UTF-8; do
+  if ! QUOTE_OUT="$(LC_ALL="$locale" LANG="$locale" ruby -rjson - "$ERB_PATH" "$QUOTE_FIXTURE" 2>&1 <<'RUBY'
+src = File.read(ARGV[0], encoding: 'UTF-8')
+found = src.match(/^  go_quote = lambda do \|str\|\n.*?^  end\n/m) or abort "go_quote lambda not found in the template"
+go_quote = eval(found[0].sub('go_quote = ', ''))
+cases = JSON.parse(File.read(ARGV[1], encoding: 'UTF-8'))
+failures = cases.reject do |c|
+  go_quote.call([c.fetch('hex')].pack('H*')) == c.fetch('quoted')
+end
+failures.each do |c|
+  got = go_quote.call([c.fetch('hex')].pack('H*'))
+  warn "FAIL [case15-quote: #{c.fetch('name')}] got #{got.dump} want #{c.fetch('quoted').dump}"
+end
+puts "#{cases.length - failures.length} of #{cases.length} quotes matched"
+exit(failures.empty? ? 0 : 1)
+RUBY
+)"; then
+    echo "FAIL [case15-quote-${locale}]: the template's quoting differs from strconv.Quote" >&2
+    printf '%s\n' "$QUOTE_OUT" >&2
+    FAILED=$((FAILED+1))
+  fi
 done
 
 # Both properties are in the job spec with no default, and neither is on the
