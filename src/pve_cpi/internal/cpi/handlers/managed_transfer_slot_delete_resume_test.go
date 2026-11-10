@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"reflect"
 	"runtime/debug"
@@ -553,7 +554,11 @@ func TestDeleteVMPassesOverALandedTransferOffTheVM(t *testing.T) {
 	}
 	// A copy of the second disk's parker keeps a record of the same disk,
 	// with its source on another VM, naming a volume the copy still holds.
-	copied := "a:90999/vm-90999-disk-0.raw"
+	// The copy takes a parker-band VMID that no guest holds. The parker the
+	// calls above created took a random VMID in the band, so a fixed VMID
+	// would overwrite that parker whenever the allocator picked it.
+	copyVMID := freeParkerBandVMID(t, s.client.state.configs)
+	copied := fmt.Sprintf("a:%d/vm-%d-disk-0.raw", copyVMID, copyVMID)
 	s.client.state.volumes[copied] = &nodes.GetStorageContentResponse{Size: 5 << 30, Format: "raw"}
 	entry, err := json.Marshal(map[string]any{"bosh_parked_disks": map[string]any{landed.token: map[string]any{
 		"disk_cid": landed.cid, "source_vm_cid": "778", "parked_at": "2026-10-01T00:00:00Z", "node": "n2", "volid": copied, "slot": "scsi0",
@@ -561,24 +566,38 @@ func TestDeleteVMPassesOverALandedTransferOffTheVM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.client.state.configs[90999] = map[string]any{
-		"name": "bosh-parker-90999", "tags": "bosh-cpi;bosh-parker;vm-prefix--bosh", "protection": "1", "digest": "1",
+	s.client.state.configs[copyVMID] = map[string]any{
+		"name": fmt.Sprintf("bosh-parker-%d", copyVMID), "tags": "bosh-cpi;bosh-parker;vm-prefix--bosh", "protection": "1", "digest": "1",
 		"description": "<!--BOSH:" + string(entry) + "-->", "scsi0": copied + ",size=5G",
 	}
 	if s.client.vmNodes == nil {
 		s.client.vmNodes = map[int]string{}
 	}
-	s.client.vmNodes[90999] = "n2"
+	s.client.vmNodes[copyVMID] = "n2"
 	bare, meta, err := decodeDiskCID(t.Context(), s.deps, "test", landed.cid)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := resolveDiskForOp(t.Context(), s.deps, "test", landed.cid, bare, meta); err == nil {
-		t.Fatal("the second disk still resolves with its serial on 90999 too")
+		t.Fatalf("the second disk still resolves with its serial on %d too", copyVMID)
 	}
 	if err := s.call(t, HandleDeleteVM, "777"); err != nil {
 		t.Fatalf("delete_vm refused over a landed transfer off 777: %v", err)
 	}
 	requireDeleteVMParkedTheDisk(t, s.deps, s.client, s.journal, s.vmID, s.cid)
 	s.requireSettled(t)
+}
+
+// freeParkerBandVMID returns the highest VMID in the parker band that no
+// config in configs holds, so a parker a test adds can't replace one that a
+// call under test created.
+func freeParkerBandVMID(t *testing.T, configs map[int]map[string]any) int {
+	t.Helper()
+	for vmid := pve.VMIDRangeParkerEnd; vmid >= pve.VMIDRangeParkerStart; vmid-- {
+		if _, taken := configs[vmid]; !taken {
+			return vmid
+		}
+	}
+	t.Fatalf("every VMID in the parker band [%d, %d] is taken", pve.VMIDRangeParkerStart, pve.VMIDRangeParkerEnd)
+	return 0
 }
