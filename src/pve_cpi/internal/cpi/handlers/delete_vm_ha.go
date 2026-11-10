@@ -55,12 +55,17 @@ func haHealthOptions(deps Deps) pve.NodeHealthOptions {
 	return pve.NodeHealthOptions{MaintenanceTags: deps.Config.MaintenanceNodeTagsValue()}
 }
 
-// haEpisodes returns the store of recovery episode first observations.
+// haEpisodes returns the store of recovery episode first observations. It sits
+// in the endpoint cache directory, which pve.endpoint_cache_dir overrides.
 func haEpisodes(deps Deps) *ha.EpisodeStore {
 	if deps.HAEpisodes != nil {
 		return deps.HAEpisodes
 	}
-	return &ha.EpisodeStore{}
+	store := &ha.EpisodeStore{}
+	if deps.Config != nil {
+		store.Override = deps.Config.EndpointCacheDir
+	}
+	return store
 }
 
 // readHADeleteState reads the normalized HA model for a delete. The delete may

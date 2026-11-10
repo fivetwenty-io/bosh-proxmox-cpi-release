@@ -42,12 +42,15 @@ func newHADeleteFixture(t *testing.T, scene *HADeleteScene, motionSec int) *haDe
 	t.Cleanup(restore)
 	clock := &haDeleteClock{t: time.Unix(1_800_000_000, 0)}
 	cache := filepath.Join(t.TempDir(), "cache")
+	if err := os.Mkdir(cache, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	logger, logs := log.NewObservedLogger(slog.LevelDebug)
 	deps := Deps{
 		Config:     &config.CPIConfig{HA: &config.HAConfig{MotionWaitSec: &motionSec}},
 		PVE:        newHASceneClient(scene),
 		Logger:     logger,
-		HAEpisodes: &ha.EpisodeStore{Dir: cache, Now: clock.now},
+		HAEpisodes: &ha.EpisodeStore{Override: cache, Now: clock.now},
 	}
 	return &haDeleteFixture{scene: scene, deps: deps, clock: clock, logs: logs, logger: logger, cache: cache}
 }
