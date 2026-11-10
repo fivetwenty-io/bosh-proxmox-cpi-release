@@ -388,7 +388,7 @@ func TestHandleDetachDisk_ConfigFetchError(t *testing.T) {
 		configErr: errors.New("network unreachable"),
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
-	_, err := h.Handle(context.Background(), detachArgs(t, "100", "local-lvm:vol"), jsonrpc.Context{})
+	_, err := h.Handle(settleTestCtx(), detachArgs(t, "100", "local-lvm:vol"), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when Config fetch fails")
 	}
@@ -734,7 +734,7 @@ func TestDetachDisk_OtherCloudErrorPropagates(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
-	_, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
+	_, err := h.Handle(settleTestCtx(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error from non-sentinel Cloud failure; got nil")
 	}

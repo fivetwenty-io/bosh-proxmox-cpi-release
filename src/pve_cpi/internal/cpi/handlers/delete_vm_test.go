@@ -10,15 +10,26 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
+
+// quickTaskPollCtx returns a context whose task polling waits a millisecond
+// between polls. Task polling re-polls a not-found answer for a freshly
+// returned task a few times, and a transient fault until the task's deadline,
+// sleeping the poll interval between polls. The sleep rides on the context, so
+// a test that uses this context stays parallel.
+func quickTaskPollCtx() context.Context {
+	return pve.WithTestBackoff(context.Background(), func(int) time.Duration { return time.Millisecond })
+}
 
 // notFoundAPIErr returns an SDK APIError that IsNotFound() returns true for.
 func notFoundAPIErr() error {
@@ -918,7 +929,7 @@ func TestDeleteVM_AwaitDestroyNotFoundIdempotent(t *testing.T) {
 	agentSvc := &mockAgentService{}
 
 	h := handlers.HandleDeleteVM(testDepsFoundVM(102, qemuSvc, nodesSvc, tasksSvc, agentSvc))
-	result, err := h.Handle(context.Background(), marshalArgs("102"), jsonrpc.Context{})
+	result, err := h.Handle(quickTaskPollCtx(), marshalArgs("102"), jsonrpc.Context{})
 
 	if err != nil {
 		t.Fatalf("NotFound on destroy await must be idempotent success, got: %v", err)

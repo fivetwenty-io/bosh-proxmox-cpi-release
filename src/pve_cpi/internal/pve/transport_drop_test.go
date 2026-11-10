@@ -188,6 +188,21 @@ func dropWireClient(t *testing.T, ca *pvetest.CA, servers ...*pvetest.Server) pv
 	return c
 }
 
+// postsToPools counts the POST /pools requests the servers read, by method and
+// path, so a request a later change adds to the clients, such as a login, is not
+// counted as the mutation under test.
+func postsToPools(servers ...*pvetest.Server) int {
+	n := 0
+	for _, s := range servers {
+		for _, r := range s.Seen() {
+			if r.Method == http.MethodPost && r.Path == pvetest.APIPrefix+"/pools" {
+				n++
+			}
+		}
+	}
+	return n
+}
+
 // TestMutationSplitsNeverSentFromMaybeSent drives one POST through a real
 // two-server pool for each way the first server can fail, and checks that the
 // pool hops exactly when the request provably never left the client. A refused
@@ -233,11 +248,11 @@ func TestMutationSplitsNeverSentFromMaybeSent(t *testing.T) {
 				if err != nil {
 					t.Fatalf("CreatePool: %v, want the POST to hop to the second server", err)
 				}
-				if got := second.Counts.Method(http.MethodPost); got != 1 {
-					t.Errorf("the second server read %d POSTs, want 1", got)
+				if got := postsToPools(second); got != 1 {
+					t.Errorf("the second server read %d POST /pools, want 1", got)
 				}
-				if got := pvetest.TotalMethod(http.MethodPost, first, second); got != 1 {
-					t.Errorf("%d POSTs reached any server, want exactly 1", got)
+				if got := postsToPools(first, second); got != 1 {
+					t.Errorf("%d POST /pools reached any server, want exactly 1", got)
 				}
 				return
 			}
@@ -250,11 +265,11 @@ func TestMutationSplitsNeverSentFromMaybeSent(t *testing.T) {
 			if !pve.IsTransientTransport(err) {
 				t.Errorf("the dropped connection is not transient, so no retry layer would replay it: %v", err)
 			}
-			if got := first.Counts.Method(http.MethodPost); got != 1 {
-				t.Errorf("the first server read %d POSTs, want 1", got)
+			if got := postsToPools(first); got != 1 {
+				t.Errorf("the first server read %d POST /pools, want 1", got)
 			}
-			if got := second.Counts.Method(http.MethodPost); got != 0 {
-				t.Errorf("the second server read %d POSTs, want 0", got)
+			if got := postsToPools(second); got != 0 {
+				t.Errorf("the second server read %d POST /pools, want 0", got)
 			}
 		})
 	}
@@ -284,7 +299,7 @@ func TestMutationWalkOfUnreachableServersIsConnectPhaseAndNotMaybeSent(t *testin
 	if !errors.As(err, &walk) || len(walk.Endpoints()) != 2 {
 		t.Errorf("error %v: want a walk that tried both endpoints", err)
 	}
-	if got := pvetest.TotalMethod(http.MethodPost, first, second); got != 0 {
-		t.Errorf("%d POSTs reached a server that resets every handshake", got)
+	if got := postsToPools(first, second); got != 0 {
+		t.Errorf("%d POST /pools reached a server that resets every handshake", got)
 	}
 }

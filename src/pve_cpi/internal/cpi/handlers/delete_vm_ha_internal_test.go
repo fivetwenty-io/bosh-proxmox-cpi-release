@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -54,6 +55,34 @@ func newHADeleteFixture(t *testing.T, scene *HADeleteScene, motionSec int) *haDe
 func (f *haDeleteFixture) gate(t *testing.T, node string) (*pve.HAServiceState, error) {
 	t.Helper()
 	return gateHADelete(t.Context(), f.deps, "delete_vm", 101, node, f.logger)
+}
+
+// gateOnSettleClock is gate with the settle waits on a fake clock, for the
+// tests that wait out a motion that ends after a few reads.
+func (f *haDeleteFixture) gateOnSettleClock(t *testing.T, node string) (*pve.HAServiceState, error) {
+	t.Helper()
+	return gateHADelete(settleClockCtx(t.Context()), f.deps, "delete_vm", 101, node, f.logger)
+}
+
+// settleClockCtx returns a context whose VM settle waits run on a fake clock
+// that moves only through sleep, so a wait with a thirty second budget costs no
+// real time. The fixture shortens the motion poll, but the settle wait polls on
+// its own two second curve.
+func settleClockCtx(parent context.Context) context.Context {
+	var mu sync.Mutex
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	return pve.WithVMSettleClockForTest(parent,
+		func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			return now
+		},
+		func(ctx context.Context, d time.Duration) error {
+			mu.Lock()
+			now = now.Add(d)
+			mu.Unlock()
+			return ctx.Err()
+		})
 }
 
 func (f *haDeleteFixture) logged(level slog.Level, message string) bool {
@@ -204,7 +233,7 @@ func TestGateHADeleteWaitsForMotionToSettle(t *testing.T) {
 				}
 			}
 			f := newHADeleteFixture(t, scene, 30)
-			st, err := f.gate(t, "pve-node1")
+			st, err := f.gateOnSettleClock(t, "pve-node1")
 			if err != nil {
 				t.Fatalf("gate: %v", err)
 			}
@@ -245,7 +274,7 @@ func TestGateHADeleteRefusesAVMThatMovedDuringTheWait(t *testing.T) {
 		}
 	}
 	f := newHADeleteFixture(t, scene, 30)
-	_, err := f.gate(t, "pve-node1")
+	_, err := f.gateOnSettleClock(t, "pve-node1")
 	requireHADeferral(t, err, "moved while the delete waited", `now "pve-node2"`)
 }
 
@@ -259,7 +288,7 @@ func TestGateHADeleteMotionWaitEndsWithTheContext(t *testing.T) {
 			cancel()
 		}
 	}
-	_, err := gateHADelete(ctx, f.deps, "delete_vm", 101, "pve-node1", f.logger)
+	_, err := gateHADelete(settleClockCtx(ctx), f.deps, "delete_vm", 101, "pve-node1", f.logger)
 	if err == nil {
 		t.Fatal("a cancelled wait must fail")
 	}

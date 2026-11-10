@@ -200,12 +200,14 @@ func raRuleFor(id string, sids ...string) Rule {
 	return Rule{ID: id, Type: RuleTypeResourceAffinity, Affinity: AffinityNegative, Resources: sids}
 }
 
-// A rule write held by the first server never reaches the second. With the
-// first server closed after the held write, the writer re-reads, finds the rule
-// missing, and sends again five times over. Every re-send is another HA
-// mutation of a different method and path, and every one of them goes to the
-// first server alone. The re-reads may reach the second server, and do.
-func TestRuleWriterHeldWritesNeverReachTheOtherServer(t *testing.T) {
+// A rule write held by the first server never reaches the second. The writer
+// makes five sends, which are the first write and four re-sends, and then ends
+// with a retriable error. With the first server closed after the first write,
+// the writer re-reads, finds the rule missing, and sends again. Every re-send
+// is another HA mutation of a different method and path, and every one of them
+// goes to the first server alone, so the first server reads only the first
+// write. The re-reads may reach the second server, and do.
+func TestRuleWriterFirstWriteAndFourResendsNeverReachTheOtherServer(t *testing.T) {
 	cases := []struct {
 		name string
 		// failures makes the first server answer each rule write the way the case says.

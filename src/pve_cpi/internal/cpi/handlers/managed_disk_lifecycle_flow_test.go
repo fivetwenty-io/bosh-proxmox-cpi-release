@@ -104,9 +104,14 @@ type lifecycleFlowPVE struct {
 	// with this status before its rename, so nothing moves.
 	moveTaskExit string
 	// moveTaskUnreadable makes the next move start a task that moves nothing
-	// and whose status every read fails to get, over a dropped connection.
+	// and whose status no read gets, over a dropped connection. The first read
+	// fails with the dropped connection. Task polling re-polls that fault until
+	// the task's deadline, which would be five minutes, so the second read
+	// fails with the poller's own window error, the error the real poller
+	// returns when its window runs out. Neither read shows how the task ended.
 	moveTaskUnreadable bool
 	unreadableTasks    map[string]bool
+	unreadablePolls    map[string]int
 	// loseMoveResponse makes every move pass PVE's request checks, record the
 	// task PVE would fork in lostMoves, and answer with a lost response. It
 	// models a lost response that ends the call, because the move's retry
@@ -227,6 +232,13 @@ type lifecycleFlowTasks struct {
 
 func (t lifecycleFlowTasks) Wait(ctx context.Context, node, upid string, opts *tasks.WaitOptions) (*tasks.Status, error) {
 	if t.c.unreadableTasks[upid] {
+		if t.c.unreadablePolls == nil {
+			t.c.unreadablePolls = map[string]int{}
+		}
+		t.c.unreadablePolls[upid]++
+		if t.c.unreadablePolls[upid] > 1 {
+			return nil, fmt.Errorf("task polling canceled: %w", context.DeadlineExceeded)
+		}
 		return nil, &sdkerrors.ConnectionError{Host: "n1", Port: 8006, Message: "connection reset by peer"}
 	}
 	if exit, failed := t.c.failedTasks[upid]; failed {

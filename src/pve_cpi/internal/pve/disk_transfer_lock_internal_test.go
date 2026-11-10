@@ -339,7 +339,10 @@ func TestTransferDiskToParker_ReleasedSourceAttachNeedsProof(t *testing.T) {
 		t.Parallel()
 		c := fixture()
 		c.unlistedVolumes = map[string]bool{foreign: true}
-		_, err := TransferDiskToParker(context.Background(), c, nil, "pve1", 700, foreign, transferTestCfg, pctx)
+		// The transfer reads the listing again on the transient backoff before it
+		// gives up, so the test backoff keeps those reads from costing seconds.
+		ctx := WithTestBackoff(context.Background(), func(int) time.Duration { return time.Millisecond })
+		_, err := TransferDiskToParker(ctx, c, nil, "pve1", 700, foreign, transferTestCfg, pctx)
 		if err == nil {
 			t.Fatal("a volume the storage doesn't list was attached")
 		}

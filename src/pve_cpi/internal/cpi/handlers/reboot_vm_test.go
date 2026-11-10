@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
@@ -777,10 +780,22 @@ func TestRebootVM_StartTransient_Retriable(t *testing.T) {
 // --------------------------------------------------------------------------
 
 // TestRebootVM_AwaitTransient_Retriable verifies that when AwaitTaskWithLogger
-// returns a transient error, the handler wraps it via WrapError and the
-// resulting cpierror is Retriable. Parameterised for each await site:
+// meets a transient poll fault, the handler wraps what comes back via
+// WrapError and the resulting cpierror is Retriable. It also verifies that the
+// error is the poll-timeout-unresolved shape and never a transient shape, so
+// no retry helper would re-submit the task's mutation. Parameterised for each
+// await site:
 //   - "reset_await": hard-reset path (QEMU.Reset → await).
 //   - "start_await": stopped-VM path (QEMU.Start → await).
+//
+// Task polling re-polls a transient fault at the poll interval until the
+// task's deadline, which the reboot handler leaves at five minutes. So the
+// mock answers the transient fault once and then the SDK's own poll-window
+// error, which is what the real poller returns when its window runs out. That
+// error maps to the same unresolved shape the deadline yields, and the test
+// finishes in milliseconds instead of waiting out the deadline. A one
+// millisecond test backoff on the context shortens the sleep between the two
+// polls, and it rides on the context, so the test stays parallel.
 func TestRebootVM_AwaitTransient_Retriable(t *testing.T) {
 	t.Parallel()
 
@@ -820,14 +835,19 @@ func TestRebootVM_AwaitTransient_Retriable(t *testing.T) {
 					return "UPID:node:start-await-transient", nil
 				},
 			}
+			var polls atomic.Int32
 			tasksSvc := &mockTasksService{
 				waitFn: func(_ context.Context, _, _ string, _ *tasks.WaitOptions) (*tasks.Status, error) {
-					return nil, transientTaskErr
+					if polls.Add(1) == 1 {
+						return nil, transientTaskErr
+					}
+					return nil, fmt.Errorf("task polling canceled: %w", context.DeadlineExceeded)
 				},
 			}
 
+			ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return time.Millisecond })
 			h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, tasksSvc, tc.mode))
-			_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
+			_, err := h.Handle(ctx, marshalArgs("101"), jsonrpc.Context{})
 
 			if err == nil {
 				t.Fatalf("%s: expected error from await transient failure, got nil", tc.name)
@@ -838,6 +858,15 @@ func TestRebootVM_AwaitTransient_Retriable(t *testing.T) {
 			}
 			if cpiErr.Type() != cpierrors.TypeRetriableCloud {
 				t.Errorf("%s: error type = %q; want %q (Retriable)", tc.name, cpiErr.Type(), cpierrors.TypeRetriableCloud)
+			}
+			if !pve.IsTaskPollUnresolved(err) {
+				t.Errorf("%s: error %v is not the poll-timeout-unresolved shape", tc.name, err)
+			}
+			if pve.IsTransientTransport(err) {
+				t.Errorf("%s: error %v reads as transient transport, so a retry helper would re-submit the task", tc.name, err)
+			}
+			if got := polls.Load(); got != 2 {
+				t.Errorf("%s: polled %d times; want 2 (the transient fault, then the poll window)", tc.name, got)
 			}
 		})
 	}

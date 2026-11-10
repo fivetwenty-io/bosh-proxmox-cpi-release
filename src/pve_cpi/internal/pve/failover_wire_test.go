@@ -2,10 +2,8 @@ package pve
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"slices"
 	"strconv"
@@ -15,6 +13,7 @@ import (
 	"time"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -101,37 +100,6 @@ func (l *tetherLab) clientFor(t *testing.T, cfg *config.CPIConfig) Client {
 		t.Fatalf("newClient: %v", err)
 	}
 	return c
-}
-
-// sdkStandIn returns an http.Client whose transport is the pool that
-// wireEndpoints installs for the servers, which is the pool newClient hands the
-// SDK.
-func (l *tetherLab) sdkStandIn(t *testing.T, servers ...*pvetest.Server) *http.Client {
-	t.Helper()
-	opts, wiring, err := wireEndpoints(l.config(servers...), log.NewNopLogger())
-	if err != nil {
-		t.Fatalf("wireEndpoints: %v", err)
-	}
-	base := &http.Transport{
-		TLSClientConfig:     &tls.Config{RootCAs: l.ca.Pool(), MinVersion: tls.VersionTLS12},
-		DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
-		TLSHandshakeTimeout: 10 * time.Second,
-		MaxIdleConnsPerHost: 2,
-	}
-	if opts.WrapTransport == nil {
-		t.Fatal("wireEndpoints installed no transport wrapper for a pool of two")
-	}
-	rt := opts.WrapTransport(base)
-	if rt == nil {
-		t.Fatalf("the pool did not build: %v", wiring.poolErr)
-	}
-	t.Cleanup(func() {
-		if closer, ok := rt.(interface{ CloseIdleConnections() }); ok {
-			closer.CloseIdleConnections()
-		}
-		base.CloseIdleConnections()
-	})
-	return &http.Client{Transport: rt}
 }
 
 // hijackAndClose reads nothing more, takes the connection, and closes it with
@@ -238,9 +206,9 @@ func moveActiveConcurrently(t *testing.T, c Client) {
 	}
 }
 
-// After a POST that may have reached A, every replay from the CPI's retry
-// helpers goes to A alone, with A closed and B healthy. The replay fails
-// without a walk, so B reads no request at all.
+// After a POST that may have reached A, every replay from each of the CPI's
+// three transient retry helpers goes to A alone, with A closed and B healthy.
+// The replay fails without a walk, so B reads no request at all.
 func TestTetherMaybeSentPostStaysOnItsServerThroughTheRetryHelpers(t *testing.T) {
 	const attempts = 4
 	layers := []struct {
@@ -252,6 +220,9 @@ func TestTetherMaybeSentPostStaysOnItsServerThroughTheRetryHelpers(t *testing.T)
 		}},
 		{"RetryOnTransientOrLock", func(ctx context.Context, op func() error) error {
 			return RetryOnTransientOrLock(ctx, nil, "tether.maybe_sent", attempts, op)
+		}},
+		{"RetryOnTransientOrUnplugBusy", func(ctx context.Context, op func() error) error {
+			return RetryOnTransientOrUnplugBusy(ctx, nil, "tether.maybe_sent", attempts, op)
 		}},
 	}
 	for _, layer := range layers {
@@ -291,133 +262,88 @@ func TestTetherMaybeSentPostStaysOnItsServerThroughTheRetryHelpers(t *testing.T)
 	}
 }
 
-// sdkTerminalTransportError mirrors the SDK's rule that a failed dial or DNS
-// lookup ends its retry loop.
-func sdkTerminalTransportError(err error) bool {
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
-		return true
-	}
-	var opErr *net.OpError
-	return errors.As(err, &opErr) && opErr.Op == "dial"
-}
-
-// sdkResendLoop stands in for the SDK's retry middleware on a request that
-// opted in to retrying a mutation. The SDK sets that option through
-// WithForceRetry, which lives in a package internal to the SDK module, so no
-// CPI code or test can set it. The loop copies what the middleware does. It
-// sends the same request on the same context, rewinds the body before each
-// resend, waits delay times the attempt number between sends, and stops at once
-// on a failed dial or DNS lookup or when no retries remain. afterAttempt runs
-// after each send with the 1-based attempt number.
-func sdkResendLoop(
-	hc *http.Client, req *http.Request, retries int, delay time.Duration, afterAttempt func(attempt int),
-) (attempts int, err error) {
-	for attempt := 0; ; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-req.Context().Done():
-				return attempts, req.Context().Err()
-			case <-time.After(delay * time.Duration(attempt)):
-			}
-			if req.GetBody != nil {
-				body, bodyErr := req.GetBody()
-				if bodyErr != nil {
-					return attempts, bodyErr
-				}
-				req.Body = body
-			}
-		}
-		attempts++
-		resp, doErr := hc.Do(req)
-		if afterAttempt != nil {
-			afterAttempt(attempts)
-		}
-		if doErr == nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-			return attempts, nil
-		}
-		if sdkTerminalTransportError(doErr) || attempt >= retries {
-			return attempts, doErr
-		}
-	}
-}
-
-// rawRequest builds a request for the API path at addr, with a form body for a
-// POST, the way the SDK builds one.
-func rawRequest(t *testing.T, ctx context.Context, method, addr, path string) *http.Request {
+// sdkOnlyClient builds a client over one server with no endpoint pool, so the
+// SDK's own retry middleware is the only layer between the caller and the
+// wire.
+func (l *tetherLab) sdkOnlyClient(t *testing.T, s *pvetest.Server) Client {
 	t.Helper()
-	var body io.Reader
-	if method == http.MethodPost {
-		body = strings.NewReader("poolid=" + tetherPoolID)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, "https://"+addr+pvetest.APIPrefix+path, body)
-	if err != nil {
-		t.Fatalf("new request: %v", err)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	}
-	return req
+	cfg := l.config(s)
+	cfg.Endpoints = nil
+	return l.clientFor(t, cfg)
 }
 
-// rawDo sends a request and drains its answer.
-func rawDo(hc *http.Client, req *http.Request) error {
-	resp, err := hc.Do(req)
-	if err != nil {
-		return err
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.Body.Close()
+// sdkRetryCtx makes the SDK's retry middleware willing to resend, with a short
+// delay between sends. A request that the middleware does not resend under this
+// context is one it would never resend.
+func sdkRetryCtx(ctx context.Context) context.Context {
+	return sdkclient.WithRetryDelay(sdkclient.WithRetries(ctx, 3), time.Millisecond)
 }
 
-// An SDK-level resend of a mutation that may have reached A is another
-// RoundTrip on the same context, so it meets A's tether. With A closed the
-// resend fails at the dial and the loop stops, and with A open every resend
-// reaches A. Either way B reads no request.
-func TestTetherMaybeSentPostStaysOnItsServerThroughTheSDKRetryLayer(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		closeAfter bool
-	}{
-		{"A closed after the first send", true},
-		{"A open for every send", false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+// The CPI cannot reach the SDK's forced retry, because the option that turns it
+// on lives in a package internal to the SDK module. So the SDK sends each
+// mutation exactly once, whatever the answer, and a tether never has to hold a
+// resend from that layer. A read through the same server is resent, which shows
+// that the retry middleware is live and that the single send of the mutation is
+// its rule for mutations.
+func TestSDKSendsAMutationOnceAfterAStatus(t *testing.T) {
+	for _, status := range []int{596, 502, 503, 504} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
 			l := newTetherLab(t)
-			a, b := l.hijacker(t), l.live(t, nil)
-			hc := l.sdkStandIn(t, a, b)
-			ctx, release := endpointpool.WithAffinityScope(t.Context())
-			defer release()
-			const retries = 3
+			routes := pvetest.NewRoutes()
+			routes.Fail(http.MethodPost, "/pools", status, "backend trouble")
+			routes.Fail(http.MethodGet, "/pools/", status, "backend trouble")
+			s := l.live(t, routes)
+			c := l.sdkOnlyClient(t, s)
+			ctx := sdkRetryCtx(t.Context())
 
-			req := rawRequest(t, ctx, http.MethodPost, a.Addr, "/pools")
-			attempts, err := sdkResendLoop(hc, req, retries, time.Millisecond, func(n int) {
-				if n == 1 && tc.closeAfter {
-					a.Close()
-				}
-			})
-
-			if tc.closeAfter {
-				if attempts != 2 {
-					t.Errorf("attempts = %d, want 2 (the resend fails at the dial)", attempts)
-				}
-				requireWalkOnlyTo(t, err, a.Addr)
-				if n := seenCount(a, http.MethodPost, "/pools"); n != 1 {
-					t.Errorf("A read %d POST /pools, want 1", n)
-				}
-			} else {
-				if attempts != retries+1 {
-					t.Errorf("attempts = %d, want %d", attempts, retries+1)
-				}
-				requireMaybeSent(t, "the last resend", err)
-				if n := seenCount(a, http.MethodPost, "/pools"); n != retries+1 {
-					t.Errorf("A read %d POST /pools, want %d", n, retries+1)
-				}
+			if _, _, err := c.Pools().GetPoolComment(ctx, "p1"); err == nil {
+				t.Fatal("the control read succeeded against a server that answers every request with a failure")
 			}
-			requireNoRequests(t, "B", b)
+			if n := seenCount(s, http.MethodGet, "/pools/p1"); n < 2 {
+				t.Fatalf("the control read was sent %d times, want the SDK to resend it", n)
+			}
+
+			if err := c.Pools().CreatePool(ctx, tetherPoolID, "once"); err == nil {
+				t.Fatalf("CreatePool succeeded against a server that answers %d", status)
+			}
+			if n := seenCount(s, http.MethodPost, "/pools"); n != 1 {
+				t.Errorf("the server read %d POST /pools, want the one send", n)
+			}
+			if got := mutationsSeen(s); len(got) != 1 {
+				t.Errorf("the server read %d mutations, want only the one send: %v", len(got), got)
+			}
 		})
+	}
+}
+
+// A connection that drops after the server read a mutation is not resent by the
+// SDK either. The control read on the same server is resent, so the retry
+// middleware is live.
+func TestSDKSendsAMutationOnceAfterADroppedConnection(t *testing.T) {
+	l := newTetherLab(t)
+	s := l.hijacker(t)
+	c := l.sdkOnlyClient(t, s)
+	ctx := sdkRetryCtx(t.Context())
+
+	if _, _, err := c.Pools().GetPoolComment(ctx, "p1"); err == nil {
+		t.Fatal("the control read succeeded against a server that drops every connection")
+	}
+	if n := seenCount(s, http.MethodGet, "/pools/p1"); n < 2 {
+		t.Fatalf("the control read was sent %d times, want the SDK to resend it", n)
+	}
+
+	err := c.Pools().CreatePool(ctx, tetherPoolID, "once")
+	if err == nil {
+		t.Fatal("CreatePool succeeded against a server that drops every connection")
+	}
+	if !IsTransientTransport(err) {
+		t.Errorf("the dropped connection is not transient, so no retry helper would replay it: %v", err)
+	}
+	if n := seenCount(s, http.MethodPost, "/pools"); n != 1 {
+		t.Errorf("the server read %d POST /pools, want the one send", n)
+	}
+	if got := mutationsSeen(s); len(got) != 1 {
+		t.Errorf("the server read %d mutations, want only the one send: %v", len(got), got)
 	}
 }
 
@@ -551,15 +477,31 @@ func TestTetherTwoPoolsNeverShareTethers(t *testing.T) {
 }
 
 // A GET on the path a tethered POST used still fails over, because the tether
-// binds mutations and nothing else.
+// binds mutations and nothing else. A answers the POST with a 500, so the POST
+// tethers to A and A stays the active endpoint. With A closed, the GET has to
+// dial A, fail in the connect phase, and hop to B on its own walk.
 func TestTetherGetOnTheSamePathStillFailsOver(t *testing.T) {
 	l := newTetherLab(t)
-	a, b := l.hijacker(t), l.live(t, nil)
+	aRoutes := pvetest.NewRoutes()
+	aRoutes.Fail(http.MethodPost, "/pools", http.StatusInternalServerError, "internal error")
+	aRoutes.JSON(http.MethodGet, "/pools/", http.StatusOK, tetherPoolBody)
+	a, b := l.live(t, aRoutes), l.live(t, nil)
 	c := l.client(t, a, b)
 	ctx, release := endpointpool.WithAffinityScope(t.Context())
 	defer release()
 
-	requireMaybeSent(t, "the POST", c.Pools().CreatePool(ctx, tetherPoolID, "held"))
+	if err := c.Pools().CreatePool(ctx, tetherPoolID, "held"); err == nil {
+		t.Fatal("the POST succeeded against a server that answers 500")
+	}
+	// A is the active endpoint: a read goes to A and not to B. Were A demoted,
+	// the GET below would go straight to B without dialing A.
+	if _, _, err := c.Pools().GetPoolComment(ctx, "p1"); err != nil {
+		t.Fatalf("the read before A closed: %v", err)
+	}
+	if seenCount(a, http.MethodGet, "/pools/p1") != 1 || seenCount(b, http.MethodGet, "/pools/p1") != 0 {
+		t.Fatalf("setup: the read went to A=%d B=%d, want A=1 B=0",
+			seenCount(a, http.MethodGet, "/pools/p1"), seenCount(b, http.MethodGet, "/pools/p1"))
+	}
 	a.Close()
 
 	lister, ok := c.Pools().(PoolCommentLister)
@@ -675,8 +617,10 @@ func TestTetherFamiliesKeepRePlannedWritesOnOneServer(t *testing.T) {
 			for _, step := range tc.follows {
 				requireWalkOnlyTo(t, step.send(ctx, c), a.Addr)
 			}
-			if got := mutationsSeen(a); len(got) != 1 {
-				t.Errorf("A read %d mutations, want only the first: %v", len(got), got)
+			// The one mutation A read is the family's first write.
+			wantFirst := strings.Replace(tc.first.name, " /", " "+pvetest.APIPrefix+"/", 1)
+			if got := mutationsSeen(a); len(got) != 1 || got[0] != wantFirst {
+				t.Errorf("A read mutations %v, want only the first write %q", got, wantFirst)
 			}
 			requireNoMutations(t, "B", b)
 
@@ -762,42 +706,15 @@ func TestTetherConflictIsNotReplayedByTheRetryHelpers(t *testing.T) {
 		if IsTransientTransport(err) {
 			t.Errorf("%s: the refusal reads as transient", name)
 		}
+		// The refusal on the wire carries no transient phrase of its own, so
+		// only the exclusion for ErrTetherConflict keeps a refusal that is
+		// joined with a transient cause from reading as transient.
+		if IsTransientTransport(errors.Join(err, io.EOF)) {
+			t.Errorf("%s: the refusal joined with a transient cause reads as transient", name)
+		}
 		if calls != 1 {
 			t.Errorf("%s: made %d attempts, want 1", name, calls)
 		}
-	}
-	for name, s := range map[string]*pvetest.Server{"A": a, "B": b} {
-		if got := seenCount(s, http.MethodPost, "/pools"); got != 1 {
-			t.Errorf("%s read %d POST /pools, want only the setup's 1", name, got)
-		}
-	}
-}
-
-// The SDK's forced retry resends a refused mutation through its whole backoff,
-// because the refusal is neither a dial nor a DNS failure. Every resend is
-// refused before dispatch, so nothing reaches either server.
-func TestTetherConflictSentNowhereThroughTheSDKRetryLayer(t *testing.T) {
-	l := newTetherLab(t)
-	a, b := l.live(t, conflictRoutes(true)), l.live(t, conflictRoutes(false))
-	hc := l.sdkStandIn(t, a, b)
-	release := buildTetherConflict(t, a, b,
-		func(ctx context.Context) error {
-			return rawDo(hc, rawRequest(t, ctx, http.MethodPost, a.Addr, "/pools"))
-		},
-		func() error {
-			return rawDo(hc, rawRequest(t, context.Background(), http.MethodGet, a.Addr, "/pools/p1"))
-		})
-	defer release()
-
-	const retries = 3
-	req := rawRequest(t, context.Background(), http.MethodPost, a.Addr, "/pools")
-	attempts, err := sdkResendLoop(hc, req, retries, time.Millisecond, nil)
-
-	if !errors.Is(err, endpointpool.ErrTetherConflict) {
-		t.Fatalf("error = %v, want ErrTetherConflict", err)
-	}
-	if attempts != retries+1 {
-		t.Errorf("the loop made %d attempts, want %d: a refusal is retried through the backoff", attempts, retries+1)
 	}
 	for name, s := range map[string]*pvetest.Server{"A": a, "B": b} {
 		if got := seenCount(s, http.MethodPost, "/pools"); got != 1 {

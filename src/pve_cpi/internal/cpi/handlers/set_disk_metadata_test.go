@@ -1085,7 +1085,9 @@ func TestSetDiskMetadata_UpdateTransient_Retriable(t *testing.T) {
 			clusterSvc: clusterSvc,
 		}
 		h := handlers.HandleSetDiskMetadata(makeDiskMetaDepsClient(client))
-		_, err := h.Handle(context.Background(), makeMetaArgs(t, cid, meta), jsonrpc.Context{})
+		// The handler waits out the VM settle protocol on a transient fault. A fake
+		// settle clock lets that wait run without real sleeps.
+		_, err := h.Handle(settleTestCtx(), makeMetaArgs(t, cid, meta), jsonrpc.Context{})
 		if err == nil {
 			t.Fatalf("%s: expected error from transient SDK failure, got nil", name)
 		}
