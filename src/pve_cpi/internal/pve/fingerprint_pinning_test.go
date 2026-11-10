@@ -16,10 +16,10 @@ import (
 func TestAssertNoFingerprintPinningWithRouting(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name            string
-		opts            sdkclient.Options
-		routingPossible bool
-		wantErr         bool
+		name        string
+		opts        sdkclient.Options
+		nodeRouting bool
+		wantErr     bool
 	}{
 		{"no pinning, routing possible", sdkclient.Options{}, true, false},
 		{"no pinning, routing impossible", sdkclient.Options{}, false, false},
@@ -64,7 +64,7 @@ func TestAssertNoFingerprintPinningWithRouting(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			err := assertNoFingerprintPinningWithRouting(tc.opts, tc.routingPossible, false)
+			err := assertNoFingerprintPinningWithRouting(tc.opts, tc.nodeRouting, false)
 			if tc.wantErr && err == nil {
 				t.Error("expected an error, got nil")
 			}
@@ -89,7 +89,7 @@ func TestAssertNoFingerprintPinningWithFailoverMessage(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			err := assertNoFingerprintPinningWithRouting(opts, true, true)
+			err := assertNoFingerprintPinningWithRouting(opts, false, true)
 			if err == nil {
 				t.Fatal("expected an error, got nil")
 			}
@@ -126,7 +126,46 @@ func TestAssertNoFingerprintPinningRoutingMessageKeepsItsText(t *testing.T) {
 	if err := assertNoFingerprintPinningWithRouting(sdkclient.Options{}, true, true); err != nil {
 		t.Errorf("failover without pinning = %v, want nil", err)
 	}
-	if err := assertNoFingerprintPinningWithRouting(pinned, false, true); err != nil {
+	if err := assertNoFingerprintPinningWithRouting(pinned, false, false); err != nil {
 		t.Errorf("pinning without routing possible = %v, want nil", err)
+	}
+}
+
+// When both causes apply, one error names both, so the operator sees the
+// failover cause and the node routing cause on the first failed start. Each
+// cause keeps the text it has alone.
+func TestAssertNoFingerprintPinningNamesBothCauses(t *testing.T) {
+	t.Parallel()
+	for name, opts := range map[string]sdkclient.Options{
+		"cached fingerprints":   {CachedFingerprints: map[string]bool{"aa:bb": true}},
+		"manual verification":   {ManualVerification: true},
+		"fingerprint callback":  {VerifyFingerprintCallback: func(*x509.Certificate) bool { return true }},
+		"manual verify handler": {ManualVerifyCallback: func(sdkclient.FingerprintVerificationRequest) bool { return true }},
+		"fingerprint cache":     {FingerprintCachePath: "/var/lib/pve-cpi/fingerprints.json"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			both := assertNoFingerprintPinningWithRouting(opts, true, true)
+			failover := assertNoFingerprintPinningWithRouting(opts, false, true)
+			node := assertNoFingerprintPinningWithRouting(opts, true, false)
+			if both == nil || failover == nil || node == nil {
+				t.Fatalf("refusals = %v, %v, %v, want all three", both, failover, node)
+			}
+			text := both.Error()
+			if !strings.HasPrefix(text, "pve client init: ") {
+				t.Errorf("combined message %q does not start with the init prefix", text)
+			}
+			for _, part := range []string{
+				strings.TrimPrefix(failover.Error(), "pve client init: "),
+				strings.TrimPrefix(node.Error(), "pve client init: "),
+			} {
+				if !strings.Contains(text, part) {
+					t.Errorf("combined message %q does not contain %q", text, part)
+				}
+			}
+			if strings.Index(text, "endpoint failover") > strings.Index(text, "direct-to-node upload routing") {
+				t.Errorf("combined message %q names node routing before failover", text)
+			}
+		})
 	}
 }

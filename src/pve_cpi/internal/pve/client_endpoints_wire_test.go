@@ -2,6 +2,7 @@ package pve
 
 import (
 	"context"
+	"encoding/pem"
 	"errors"
 	"net"
 	"net/http"
@@ -18,11 +19,14 @@ import (
 )
 
 // The tests in this file build clients through newClient with more than one
-// endpoint and send real requests to loopback servers. The tests that send a
-// mutation do not run in parallel and send it under their own affinity scope,
-// because every release of a call's scope clears the scopeless tethers of every
-// pool in the process (see endpointpool.WithAffinityScope), and the scope tests
-// in this package run in parallel.
+// endpoint and send real requests to loopback servers. Releasing a call's scope
+// clears the scopeless tethers of every pool in the process (see
+// endpointpool.WithAffinityScope), and the package-level tether set is per test
+// binary. The scope tests live in internal/pve/endpointpool, which is its own
+// binary, so the only scope this package releases is the one in the mutation
+// test below, and that test sends under its own scope and does not run in
+// parallel. Any new test here that sends a scopeless mutation through a pooled
+// client must not run in parallel with a test that releases a call scope.
 
 // wireEndpoint is one loopback endpoint of a test.
 type wireEndpoint struct {
@@ -31,6 +35,9 @@ type wireEndpoint struct {
 	hits atomic.Int64
 	// posts counts POST /pools requests.
 	posts atomic.Int64
+	// certPEM is the server certificate in PEM form, empty for an endpoint that
+	// is not a TLS server. A client that verifies takes it as its CA.
+	certPEM string
 }
 
 func (e *wireEndpoint) address() string { return net.JoinHostPort(e.host, strconv.Itoa(e.port)) }
@@ -65,7 +72,37 @@ func liveWireEndpoint(t *testing.T) *wireEndpoint {
 	if err != nil {
 		t.Fatalf("port of %q: %v", srv.URL, err)
 	}
+	e.certPEM = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}))
 	return e
+}
+
+// countingWireEndpoint returns an endpoint that accepts every connection,
+// counts it, and closes it at once, so a client fails its TLS handshake there.
+// The count in dials says how many times a client went to it.
+func countingWireEndpoint(t *testing.T) (e *wireEndpoint, dials *atomic.Int64) {
+	t.Helper()
+	var lc net.ListenConfig
+	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr, ok := l.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener address %v is not TCP", l.Addr())
+	}
+	dials = new(atomic.Int64)
+	t.Cleanup(func() { _ = l.Close() })
+	go func() {
+		for {
+			conn, acceptErr := l.Accept()
+			if acceptErr != nil {
+				return
+			}
+			dials.Add(1)
+			_ = conn.Close()
+		}
+	}()
+	return &wireEndpoint{host: "127.0.0.1", port: addr.Port}, dials
 }
 
 // deadWireEndpoint returns an endpoint whose port refuses connections.
@@ -123,6 +160,34 @@ func TestNewClientWithTwoEndpointsFailsOverAReadToTheSecond(t *testing.T) {
 	}
 }
 
+// After a read fails over, the next read goes straight to the endpoint that
+// answered, and the first endpoint sees no further connection.
+func TestNewClientWithTwoEndpointsSendsTheNextReadToTheNewActiveEndpoint(t *testing.T) {
+	t.Parallel()
+	down, dials := countingWireEndpoint(t)
+	live := liveWireEndpoint(t)
+	c, err := NewClientWithTracer(wireConfig(down, live), log.NewNopLogger(), nil)
+	if err != nil {
+		t.Fatalf("NewClientWithTracer: %v", err)
+	}
+	if _, _, err := c.Pools().GetPoolComment(context.Background(), "p1"); err != nil {
+		t.Fatalf("first read with the first endpoint failing: %v", err)
+	}
+	afterFirst := dials.Load()
+	if afterFirst == 0 {
+		t.Fatal("the first endpoint was never tried, so the first read did not exercise failover")
+	}
+	if _, _, err := c.Pools().GetPoolComment(context.Background(), "p1"); err != nil {
+		t.Fatalf("second read: %v", err)
+	}
+	if got := dials.Load(); got != afterFirst {
+		t.Errorf("first endpoint saw %d connections after the second read, want the %d from the first", got, afterFirst)
+	}
+	if live.hits.Load() != 2 {
+		t.Errorf("second endpoint served %d requests, want 2", live.hits.Load())
+	}
+}
+
 // A client with a list of one endpoint, and one with only pve.host, keep the
 // SDK's own transport, so a refused connection is an error and nothing fails
 // over.
@@ -141,8 +206,15 @@ func TestNewClientWithOneEndpointDoesNotFailOver(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewClientWithTracer: %v", err)
 			}
-			if _, _, err := c.Pools().GetPoolComment(context.Background(), "p1"); err == nil {
+			_, _, err = c.Pools().GetPoolComment(context.Background(), "p1")
+			if err == nil {
 				t.Fatal("GetPoolComment against a refused port = nil error, want the connection failure")
+			}
+			// A pool of one would also fail, but with the walk's error, so this
+			// tells a client with the SDK's own transport from one with a pool.
+			var walk *endpointpool.EntryUnreachableError
+			if errors.As(err, &walk) {
+				t.Errorf("error %v carries a walk, so the client has a pool and should have the SDK's transport", err)
 			}
 		})
 	}
@@ -278,5 +350,77 @@ func TestNewClientWithTwoEndpointsAndNodeEndpointsBuilds(t *testing.T) {
 	cfg.NodeEndpoints = map[string]string{"pve2": b.address()}
 	if _, err := NewClientWithTracer(cfg, log.NewNopLogger(), nil); err != nil {
 		t.Fatalf("NewClientWithTracer: %v", err)
+	}
+}
+
+// A refused entry in the list fails newClient with its index and never echoes
+// the entry.
+func TestNewClientRefusesAnInvalidListEntry(t *testing.T) {
+	t.Parallel()
+	a := liveWireEndpoint(t)
+	cfg := wireConfig(a)
+	cfg.Endpoints = []string{a.address(), "user@pve2.example.com"}
+	_, err := NewClientWithTracer(cfg, log.NewNopLogger(), nil)
+	if err == nil || !strings.Contains(err.Error(), "pve.endpoints[1] is not a host or host:port") {
+		t.Fatalf("NewClientWithTracer error = %v, want the invalid-entry refusal", err)
+	}
+	if strings.Contains(err.Error(), "user@") {
+		t.Errorf("the error echoes the entry: %v", err)
+	}
+}
+
+// A list entry the config layer never resolved fails newClient and says so,
+// and the client does not guess a port for it.
+func TestNewClientRefusesAnUnresolvedListEntry(t *testing.T) {
+	t.Parallel()
+	a := liveWireEndpoint(t)
+	cfg := wireConfig(a)
+	cfg.Endpoints = []string{a.address(), "pve2.example.com"}
+	_, err := NewClientWithTracer(cfg, log.NewNopLogger(), nil)
+	if err == nil || !strings.Contains(err.Error(), "the endpoint list was not resolved") {
+		t.Fatalf("NewClientWithTracer error = %v, want the unresolved-list refusal", err)
+	}
+}
+
+// With verify_ssl true and a custom CA, the pool verifies every endpoint
+// against that CA, so a read still fails over from a refused endpoint to a
+// live one whose certificate the CA vouches for.
+func TestNewClientWithVerifySSLAndACustomCAFailsOver(t *testing.T) {
+	t.Parallel()
+	dead, live := deadWireEndpoint(t), liveWireEndpoint(t)
+	cfg := wireConfig(dead, live)
+	verify := true
+	cfg.VerifySSL = &verify
+	cfg.PVECACertPEM = live.certPEM
+	c, err := NewClientWithTracer(cfg, log.NewNopLogger(), nil)
+	if err != nil {
+		t.Fatalf("NewClientWithTracer: %v", err)
+	}
+	comment, found, err := c.Pools().GetPoolComment(context.Background(), "p1")
+	if err != nil {
+		t.Fatalf("GetPoolComment with verification on and the first endpoint down: %v", err)
+	}
+	if !found || !strings.Contains(comment, live.address()) {
+		t.Errorf("comment = %q found = %v, want an answer from %s", comment, found, live.address())
+	}
+}
+
+// With verify_ssl true and no CA that vouches for the certificate, the pool
+// refuses the endpoint, so the read fails and the server never sees a request.
+func TestNewClientWithVerifySSLRefusesAnUntrustedEndpoint(t *testing.T) {
+	t.Parallel()
+	dead, live := deadWireEndpoint(t), liveWireEndpoint(t)
+	cfg := wireConfig(dead, live)
+	verify := true
+	cfg.VerifySSL = &verify
+	c, err := NewClientWithTracer(cfg, log.NewNopLogger(), nil)
+	if err != nil {
+		t.Fatalf("NewClientWithTracer: %v", err)
+	}
+	if _, _, err := c.Pools().GetPoolComment(context.Background(), "p1"); err == nil {
+		t.Fatal("GetPoolComment against an untrusted certificate = nil error")
+	}
+	if live.hits.Load() != 0 {
+		t.Errorf("untrusted endpoint served %d requests, want 0", live.hits.Load())
 	}
 }

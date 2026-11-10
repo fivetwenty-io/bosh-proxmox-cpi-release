@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -27,7 +26,6 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
-	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 )
 
 // PoolService manages PVE resource pool membership.
@@ -390,20 +388,31 @@ func buildTransportOpts(cfg *config.CPIConfig) sdkclient.Options {
 	}
 }
 
-// pinningWithFailoverMessage is the refusal for fingerprint pinning combined
-// with endpoint failover.
-const pinningWithFailoverMessage = "pve client init: TLS fingerprint pinning cannot combine with endpoint " +
+// pinningRefusalPrefix starts every refusal of fingerprint pinning.
+const pinningRefusalPrefix = "pve client init: "
+
+// pinningWithFailoverReason is why fingerprint pinning cannot combine with
+// endpoint failover.
+const pinningWithFailoverReason = "TLS fingerprint pinning cannot combine with endpoint " +
 	"failover (pve.endpoints lists more than one endpoint): the SDK's pin check is bound to pve.host, and the " +
 	"failover transport sends each request to other endpoints below that check, so pinning would be bypassed " +
 	"silently; list one endpoint in pve.endpoints or disable fingerprint pinning"
 
+// pinningWithNodeRoutingReason is why fingerprint pinning cannot combine with
+// direct-to-node upload routing.
+const pinningWithNodeRoutingReason = "TLS fingerprint pinning is incompatible with direct-to-node upload " +
+	"routing (pve.node_endpoints or pve.node_endpoints_discovery): the SDK rejects any per-request host " +
+	"override outright while pinning is enabled, which would turn every routed upload into a permanent " +
+	"failure instead of falling back to the proxied path; disable node routing or fingerprint pinning"
+
 // assertNoFingerprintPinningWithRouting fails fast when opts enables SDK TLS
 // fingerprint pinning (any of CachedFingerprints, ManualVerification,
 // VerifyFingerprintCallback, ManualVerifyCallback, FingerprintCachePath)
-// while routingPossible is true. routingPossible is true for direct-to-node
-// routing (pve.node_endpoints or pve.node_endpoints_discovery) and for endpoint
-// failover (more than one endpoint in pve.endpoints), and failover says which
-// of the two the caller found.
+// while the client can route a request away from pve.host. That happens for
+// direct-to-node routing (nodeRouting: pve.node_endpoints or
+// pve.node_endpoints_discovery) and for endpoint failover (failover: more than
+// one endpoint in pve.endpoints). When both apply, the error names both, so an
+// operator who fixes one does not meet the other on the next start.
 //
 // For node routing, the SDK's hostOverrideFromContext rejects any
 // per-request host-overridden request outright with ErrHostOverrideFingerprint
@@ -416,7 +425,7 @@ const pinningWithFailoverMessage = "pve client init: TLS fingerprint pinning can
 // For endpoint failover, the failover transport rewrites the request host below
 // that guard, and the SDK's pin check is bound to pve.host alone, so pinning
 // would be bypassed silently on every other endpoint. The refusal has its own
-// message, which names pve.endpoints.
+// reason, which names pve.endpoints.
 //
 // No current CPIConfig property sets any of these Options fields — this
 // guards the invariant documented at node_endpoints.go's UploadContext
@@ -425,10 +434,10 @@ const pinningWithFailoverMessage = "pve client init: TLS fingerprint pinning can
 // (a config-shaped, startup-time failure) rather than letting it surface
 // only as an opaque per-upload runtime error.
 //
-// nil-safe on opts's map/callback fields; always returns nil when
-// routingPossible is false.
-func assertNoFingerprintPinningWithRouting(opts sdkclient.Options, routingPossible, failover bool) error {
-	if !routingPossible {
+// nil-safe on opts's map/callback fields; always returns nil when neither
+// nodeRouting nor failover is true.
+func assertNoFingerprintPinningWithRouting(opts sdkclient.Options, nodeRouting, failover bool) error {
+	if !nodeRouting && !failover {
 		return nil
 	}
 	pinned := len(opts.CachedFingerprints) > 0 ||
@@ -439,13 +448,22 @@ func assertNoFingerprintPinningWithRouting(opts sdkclient.Options, routingPossib
 	if !pinned {
 		return nil
 	}
-	if failover {
-		return cpierrors.Cloud("%s", pinningWithFailoverMessage)
+	switch {
+	case failover && nodeRouting:
+		return cpierrors.Cloud("%s%s; in addition, %s", pinningRefusalPrefix, pinningWithFailoverReason,
+			pinningWithNodeRoutingReason)
+	case failover:
+		return cpierrors.Cloud("%s%s", pinningRefusalPrefix, pinningWithFailoverReason)
+	default:
+		return cpierrors.Cloud("%s%s", pinningRefusalPrefix, pinningWithNodeRoutingReason)
 	}
-	return cpierrors.Cloud("pve client init: TLS fingerprint pinning is incompatible with direct-to-node upload " +
-		"routing (pve.node_endpoints or pve.node_endpoints_discovery): the SDK rejects any per-request host " +
-		"override outright while pinning is enabled, which would turn every routed upload into a permanent " +
-		"failure instead of falling back to the proxied path; disable node routing or fingerprint pinning")
+}
+
+// assertPinningForPlan applies the pinning assertion to what cfg and plan say
+// about routing. It reads only the config, never a cache.
+func assertPinningForPlan(opts sdkclient.Options, cfg *config.CPIConfig, plan endpointPlan) error {
+	nodeRouting := len(cfg.NodeEndpoints) > 0 || cfg.NodeEndpointsDiscoveryAllowed()
+	return assertNoFingerprintPinningWithRouting(opts, nodeRouting, plan.failover())
 }
 
 // NewClientWithTracer constructs a Client from CPIConfig.
@@ -476,12 +494,10 @@ func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (
 		return nil, cpierrors.Cloud("pve client init: one of api_token or password is required")
 	}
 
-	opts := buildTransportOpts(cfg)
-	plan, planErr := planEndpoints(cfg, opts, noDiscoveredEndpoints{})
-	if planErr != nil {
-		return nil, planErr
+	opts, wiring, wireErr := wireEndpoints(cfg, logger)
+	if wireErr != nil {
+		return nil, wireErr
 	}
-	opts = applyPoolTimeoutDefaults(opts, len(plan.endpoints))
 
 	if hasToken {
 		opts.APIToken = cfg.APIToken
@@ -542,29 +558,13 @@ func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (
 		logger.Debug("pve client: custom CA cert pool in use")
 	}
 
-	routingPossible := len(cfg.NodeEndpoints) > 0 || cfg.NodeEndpointsDiscoveryAllowed() || plan.failover()
-	if assertErr := assertNoFingerprintPinningWithRouting(opts, routingPossible, plan.failover()); assertErr != nil {
+	if assertErr := assertPinningForPlan(opts, cfg, wiring.plan); assertErr != nil {
 		return nil, assertErr
 	}
 
-	// The SDK calls the wrapper once, with the transport it built, and offers no
-	// way to return an error from it. A pool that fails to build comes back as a
-	// nil round tripper, which makes NewClient fail, and the cause is read here.
-	var poolErr error
-	if plan.install() {
-		opts.WrapTransport = func(base *http.Transport) http.RoundTripper {
-			pool, err := endpointpool.New(endpointpool.Config{Base: base, Logger: logger, Endpoints: plan.endpoints})
-			if err != nil {
-				poolErr = err
-				return nil
-			}
-			return pool
-		}
-	}
-
 	raw, err := sdkclient.NewClient(opts)
-	if poolErr != nil {
-		return nil, cpierrors.Wrap(poolErr, "pve client init: build the endpoint pool")
+	if wiring.poolErr != nil {
+		return nil, cpierrors.Wrap(wiring.poolErr, "pve client init: build the endpoint pool")
 	}
 	if err != nil {
 		return nil, cpierrors.Wrap(err, "pve client init")

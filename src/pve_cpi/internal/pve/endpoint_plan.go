@@ -2,6 +2,7 @@ package pve
 
 import (
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 )
 
@@ -79,13 +81,14 @@ func (p endpointPlan) failover() bool {
 // port the SDK will put on every request, so the plan can refuse a config
 // whose first endpoint is somewhere else. Validation already makes the two
 // agree, and the check keeps a hand-built config from sending every request
-// down the routed-host path.
+// down the routed-host path. The config layer resolves every list entry to a
+// host and port, so an entry without a port means the list never went through
+// it, and the plan refuses to guess one.
 func planEndpoints(cfg *config.CPIConfig, opts sdkclient.Options, source discoveredEndpointSource) (endpointPlan, error) {
 	plan := endpointPlan{discovery: endpointDiscoveryOn(cfg)}
-	defaultPort := opts.Port
 	if len(cfg.Endpoints) == 0 {
 		plan.endpoints = []endpointpool.Endpoint{{
-			Address: net.JoinHostPort(strings.Trim(opts.Host, "[]"), strconv.Itoa(defaultPort)),
+			Address: net.JoinHostPort(strings.Trim(opts.Host, "[]"), strconv.Itoa(opts.Port)),
 			Kind:    endpointpool.KindConfigured,
 		}}
 	}
@@ -95,9 +98,8 @@ func planEndpoints(cfg *config.CPIConfig, opts sdkclient.Options, source discove
 			return endpointPlan{}, cpierrors.Cloud("pve client init: pve.endpoints[%d] is not a host or host:port", i)
 		}
 		if _, _, splitErr := net.SplitHostPort(entry); splitErr != nil {
-			// A hand-built config can leave an entry without a port. Load fills
-			// it with pve.port, and so does this.
-			port = defaultPort
+			return endpointPlan{}, cpierrors.Cloud("pve client init: the endpoint list was not resolved: "+
+				"pve.endpoints[%d] has no port; the config layer must give every entry its port before the client is built", i)
 		}
 		plan.endpoints = append(plan.endpoints, endpointpool.Endpoint{
 			Address: net.JoinHostPort(host, strconv.Itoa(port)),
@@ -144,4 +146,39 @@ func applyPoolTimeoutDefaults(opts sdkclient.Options, poolSize int) sdkclient.Op
 		opts.TLSHandshakeTimeoutSec = poolTLSHandshakeTimeoutSec
 	}
 	return opts
+}
+
+// endpointWiring is what newClient keeps from planning a client's endpoints.
+type endpointWiring struct {
+	plan endpointPlan
+	// poolErr is the error the transport wrapper met while building the pool.
+	// The SDK gives the wrapper no way to return one, so a pool that fails to
+	// build comes back as a nil round tripper, which makes sdkclient.NewClient
+	// fail, and newClient reads the cause here.
+	poolErr error
+}
+
+// wireEndpoints plans cfg's endpoints and returns the SDK options they decide.
+// Those are the transport options with the pool timeout defaults, and the
+// transport wrapper when the plan installs one. newClient adds the auth and
+// TLS settings to the result.
+func wireEndpoints(cfg *config.CPIConfig, logger *log.Logger) (sdkclient.Options, *endpointWiring, error) {
+	opts := buildTransportOpts(cfg)
+	plan, err := planEndpoints(cfg, opts, noDiscoveredEndpoints{})
+	if err != nil {
+		return sdkclient.Options{}, nil, err
+	}
+	opts = applyPoolTimeoutDefaults(opts, len(plan.endpoints))
+	wiring := &endpointWiring{plan: plan}
+	if plan.install() {
+		opts.WrapTransport = func(base *http.Transport) http.RoundTripper {
+			pool, poolErr := endpointpool.New(endpointpool.Config{Base: base, Logger: logger, Endpoints: plan.endpoints})
+			if poolErr != nil {
+				wiring.poolErr = poolErr
+				return nil
+			}
+			return pool
+		}
+	}
+	return opts, wiring, nil
 }

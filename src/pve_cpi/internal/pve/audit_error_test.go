@@ -176,14 +176,6 @@ func TestDescribeAuditErrorNamesEveryEndpointAWalkTried(t *testing.T) {
 			[]endpointpool.EndpointFailure{verify("pve1:8006"), verify("pve2:8006")},
 			"connection to pve1:8006, pve2:8006 failed",
 		},
-		{
-			"a header deadline hop that reads as a context deadline",
-			[]endpointpool.EndpointFailure{
-				{Endpoint: "pve1:8006", Err: context.DeadlineExceeded},
-				dial("pve2:8006"),
-			},
-			"connection to pve1:8006, pve2:8006 failed",
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			walk := endpointpool.NewEntryUnreachableError(tc.attempts)
@@ -217,4 +209,102 @@ func TestDescribeAuditErrorWalkWithoutAttemptsFallsBack(t *testing.T) {
 	if got := DescribeAuditError(sdkWrapTransportError(secret)); strings.Contains(got, "hunter2") {
 		t.Errorf("a hop's cause text reached the description: %q", got)
 	}
+}
+
+// The walk check sits after the context checks, as the connection checks do,
+// so a call that ended on its own context reads exactly as it did before the
+// pool existed, whether the walk is the only error or joined with the context
+// error the way disk_transfer.go joins its last error. A walk with a header
+// deadline hop satisfies errors.Is(context.DeadlineExceeded) and reads the same
+// way.
+func TestDescribeAuditErrorContextOutranksAWalk(t *testing.T) {
+	walk := endpointpool.NewEntryUnreachableError([]endpointpool.EndpointFailure{
+		walkFailure("pve1:8006", endpointpool.PhaseDial, errors.New("connection refused")),
+		walkFailure("pve2:8006", endpointpool.PhaseDial, errors.New("connection refused")),
+	})
+	headerDeadline := endpointpool.NewEntryUnreachableError([]endpointpool.EndpointFailure{
+		{Endpoint: "pve1:8006", Err: context.DeadlineExceeded},
+		walkFailure("pve2:8006", endpointpool.PhaseDial, errors.New("connection refused")),
+	})
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"joined with a deadline", errors.Join(sdkWrapTransportError(walk), context.DeadlineExceeded), "context deadline exceeded"},
+		{"joined with a cancellation", errors.Join(sdkWrapTransportError(walk), context.Canceled), "context canceled"},
+		{"joined with a deadline, walk first", errors.Join(walk, context.DeadlineExceeded), "context deadline exceeded"},
+		{"a header deadline hop", sdkWrapTransportError(headerDeadline), "context deadline exceeded"},
+		{"the walk alone", sdkWrapTransportError(walk), "connection to pve1:8006, pve2:8006 failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DescribeAuditError(tc.err); got != tc.want {
+				t.Errorf("DescribeAuditError = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A long walk never has a name cut in half and never loses the word that says
+// it failed. Endpoints are named in full while they fit under the cap, and the
+// line ends with a count of the rest.
+func TestDescribeAuditErrorBoundsALongWalkOnAnEndpointBoundary(t *testing.T) {
+	endpointAt := func(i int) string { return fmt.Sprintf("pve-node-%02d.lab.example.com:8006", i) }
+	walkOf := func(n int) error {
+		attempts := make([]endpointpool.EndpointFailure, 0, n)
+		for i := 1; i <= n; i++ {
+			attempts = append(attempts, walkFailure(endpointAt(i), endpointpool.PhaseDial, errors.New("connection refused")))
+		}
+		return sdkWrapTransportError(endpointpool.NewEntryUnreachableError(attempts))
+	}
+	t.Run("five names fit and are all named", func(t *testing.T) {
+		want := "connection to " + endpointAt(1) + ", " + endpointAt(2) + ", " + endpointAt(3) + ", " + endpointAt(4) +
+			", " + endpointAt(5) + " failed"
+		if got := DescribeAuditError(walkOf(5)); got != want {
+			t.Errorf("DescribeAuditError = %q, want %q", got, want)
+		}
+	})
+	t.Run("sixteen names end with a count", func(t *testing.T) {
+		got := DescribeAuditError(walkOf(16))
+		if len(got) > auditDescriptionLimit {
+			t.Errorf("description is %d bytes, want at most %d: %q", len(got), auditDescriptionLimit, got)
+		}
+		if !strings.HasPrefix(got, "connection to "+endpointAt(1)+", "+endpointAt(2)+", ") {
+			t.Errorf("description %q does not start with the first endpoints in order", got)
+		}
+		named := strings.Count(got, ".lab.example.com:8006")
+		if named == 0 || named >= 16 {
+			t.Fatalf("description %q names %d endpoints, want some but not all", got, named)
+		}
+		wantTail := fmt.Sprintf(" and %d more failed", 16-named)
+		if !strings.HasSuffix(got, wantTail) {
+			t.Errorf("description %q does not end with %q", got, wantTail)
+		}
+		for i := 1; i <= named; i++ {
+			if !strings.Contains(got, endpointAt(i)+",") && !strings.Contains(got, endpointAt(i)+" and") {
+				t.Errorf("description %q does not name %s in full", got, endpointAt(i))
+			}
+		}
+		// One more name would not have fit.
+		longer := strings.TrimSuffix(got, wantTail) + ", " + endpointAt(named+1) + fmt.Sprintf(" and %d more failed", 16-named-1)
+		if len(longer) <= auditDescriptionLimit {
+			t.Errorf("description %q left room for another name", got)
+		}
+	})
+	t.Run("a name too long for the cap gives only the count", func(t *testing.T) {
+		long := strings.Repeat("a", 190) + ".example.com:8006"
+		walk := endpointpool.NewEntryUnreachableError([]endpointpool.EndpointFailure{
+			walkFailure(long, endpointpool.PhaseDial, errors.New("connection refused")),
+			walkFailure("pve2:8006", endpointpool.PhaseDial, errors.New("connection refused")),
+		})
+		if got, want := DescribeAuditError(walk), "connection to 2 endpoints failed"; got != want {
+			t.Errorf("DescribeAuditError = %q, want %q", got, want)
+		}
+		single := endpointpool.NewEntryUnreachableError([]endpointpool.EndpointFailure{
+			walkFailure(long, endpointpool.PhaseDial, errors.New("connection refused")),
+		})
+		if got, want := DescribeAuditError(single), "connection to 1 endpoint failed"; got != want {
+			t.Errorf("DescribeAuditError = %q, want %q", got, want)
+		}
+	})
 }

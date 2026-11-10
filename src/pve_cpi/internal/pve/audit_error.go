@@ -152,18 +152,18 @@ func describeAuditErrorClass(err error) string {
 		}
 		return "could not list guests on node(s) " + strings.Join(enumeration.Nodes, ",")
 	}
-	// A walk that reached no endpoint names every endpoint it tried, because a
-	// description naming only the primary would mislead an operator about which
-	// nodes were down. This sits before the context checks, since a hop that
-	// ended on the header deadline can satisfy errors.Is(context.DeadlineExceeded).
-	if tried := triedEndpoints(err); len(tried) > 0 {
-		return fmt.Sprintf("connection to %s failed", strings.Join(tried, ", "))
-	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "context deadline exceeded"
 	}
 	if errors.Is(err, context.Canceled) {
 		return "context canceled"
+	}
+	// A walk that reached no endpoint names the endpoints it tried, because a
+	// description naming only the primary would mislead an operator about which
+	// nodes were down. It sits after the context checks, so a call that ended
+	// on its own deadline reads as it did before the pool existed.
+	if tried := triedEndpoints(err); len(tried) > 0 {
+		return describeWalk(tried)
 	}
 	var timeout *sdkerrors.TimeoutError
 	if errors.As(err, &timeout) {
@@ -205,6 +205,28 @@ func triedEndpoints(err error) []string {
 		tried = append(tried, endpoint)
 	}
 	return tried
+}
+
+// describeWalk renders the connection line for a walk that tried the given
+// endpoints. It names endpoints in order while the line fits under
+// auditDescriptionLimit and ends with a count of the rest, such as "and 3
+// more", so the cap never cuts a name in half and never drops the verb. Even
+// the first name may not fit, and then the line gives only the count.
+func describeWalk(tried []string) string {
+	for named := len(tried); named > 0; named-- {
+		line := "connection to " + strings.Join(tried[:named], ", ")
+		if rest := len(tried) - named; rest > 0 {
+			line += fmt.Sprintf(" and %d more", rest)
+		}
+		line += " failed"
+		if len(line) <= auditDescriptionLimit {
+			return line
+		}
+	}
+	if len(tried) == 1 {
+		return "connection to 1 endpoint failed"
+	}
+	return fmt.Sprintf("connection to %d endpoints failed", len(tried))
 }
 
 // auditAPIErrorFields reads the status and message from every SDK API error
