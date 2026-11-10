@@ -7,14 +7,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cloudinit"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
@@ -26,6 +29,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -486,5 +490,318 @@ func TestDispatchOne_WriteResponsePanic_EmitsCloudError(t *testing.T) {
 	}
 	if len(failSpan.Events) == 0 || !strings.Contains(failSpan.Events[0].Name, "exception") {
 		t.Errorf("write-failure span missing recorded error event: %+v", failSpan.Events)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Exit drain of the endpoint cache's background workers. These tests use the
+// process-wide registry, so none of them runs in parallel.
+// --------------------------------------------------------------------------
+
+// drainTestSlack is how far past its bound a drained run may end before a
+// test calls it late, generous for the race detector on a busy runner.
+const drainTestSlack = 2 * time.Second
+
+// drainInfoRequest is an `info` request, which answers from constants.
+const drainInfoRequest = `{"method":"info","arguments":[],"context":{"request_id":"drain-1"},"api_version":2}` + "\n"
+
+// drainTestWorker is a background worker the test controls. It ignores
+// cancellation until the test releases it, standing in for a cache write
+// stuck in a system call.
+type drainTestWorker struct {
+	ctx     chan context.Context
+	release chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+// newDrainTestWorker returns a worker that is released and awaited when the
+// test ends, so it never outlives the test.
+func newDrainTestWorker(t *testing.T) *drainTestWorker {
+	t.Helper()
+	w := &drainTestWorker{ctx: make(chan context.Context, 1), release: make(chan struct{}), done: make(chan struct{})}
+	t.Cleanup(func() {
+		w.finish()
+		select {
+		case <-w.done:
+		case <-time.After(10 * time.Second):
+			t.Error("drain test worker never returned")
+		}
+	})
+	return w
+}
+
+// start registers the worker with the process registry.
+func (w *drainTestWorker) start(name string) error {
+	return endpointcache.Go(name, func(ctx context.Context) {
+		defer close(w.done)
+		w.ctx <- ctx
+		<-w.release
+	})
+}
+
+// finish releases the worker.
+func (w *drainTestWorker) finish() { w.once.Do(func() { close(w.release) }) }
+
+// cancelled reports whether the worker started and its context has ended.
+func (w *drainTestWorker) cancelled(t *testing.T) bool {
+	t.Helper()
+	select {
+	case ctx := <-w.ctx:
+		w.ctx <- ctx
+		return ctx.Err() != nil
+	case <-time.After(10 * time.Second):
+		t.Fatal("drain test worker never started")
+		return false
+	}
+}
+
+// factoryStarting returns a client factory that starts background work with
+// start and then returns nilPVEClient, the way a client that begins a
+// discovery refresh hands back a usable client.
+func factoryStarting(t *testing.T, start func() error) func(*config.CPIConfig, *log.Logger, trace.Tracer) (pve.Client, error) {
+	t.Helper()
+	return func(*config.CPIConfig, *log.Logger, trace.Tracer) (pve.Client, error) {
+		if err := start(); err != nil {
+			t.Errorf("start background work: %v", err)
+		}
+		return nilPVEClient{}, nil
+	}
+}
+
+// drainRun runs one CPI call and reports its exit code, output, and duration.
+func drainRun(args []string, stdin string, opts runOptions) (code int, stdout, stderr string, took time.Duration) {
+	var out, errOut bytes.Buffer
+	start := time.Now()
+	code = runWithArgs(args, strings.NewReader(stdin), &out, &errOut, opts)
+	return code, out.String(), errOut.String(), time.Since(start)
+}
+
+// `info` starts no background worker and pays nothing for the drain, through
+// the production client factory and with a token-authenticated config that
+// leaves discovery on by default.
+func TestInfoStartsNoBackgroundWork(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.LogLevel = "debug"
+	cfgPath := writeStorageJournalConfig(t, cfg)
+
+	code, stdout, stderr, took := drainRun([]string{"--config", cfgPath}, drainInfoRequest, runOptions{})
+	if code != 0 {
+		t.Fatalf("info exit %d: %s", code, stderr)
+	}
+	if resp := parseResponse(t, stdout); resp.Error != nil {
+		t.Fatalf("info returned an error: %+v", resp.Error)
+	}
+	if strings.Contains(stderr, "background work") {
+		t.Fatalf("info logged background work: %s", stderr)
+	}
+	if took >= endpointcache.DrainWait {
+		t.Fatalf("info took %s, as long as the drain's bound", took)
+	}
+}
+
+// The drain stops at 3 seconds for a worker that ignores cancellation,
+// cancels it, and leaves the exit code and the response alone.
+func TestDrainStopsAtThreeSecondsAndKeepsExitCode(t *testing.T) {
+	cfgPath := writeOTelWiringConfigAtLevel(t, "debug", "")
+	worker := newDrainTestWorker(t)
+
+	code, stdout, stderr, took := drainRun([]string{"--config", cfgPath}, drainInfoRequest,
+		runOptions{ClientFactory: factoryStarting(t, func() error { return worker.start("discovery") })})
+	if code != 0 {
+		t.Fatalf("exit %d with a slow worker, want 0: %s", code, stderr)
+	}
+	if resp := parseResponse(t, stdout); resp.Error != nil {
+		t.Fatalf("info returned an error: %+v", resp.Error)
+	}
+	if took < endpointcache.DrainWait {
+		t.Fatalf("run ended after %s, before the %s drain bound", took, endpointcache.DrainWait)
+	}
+	if took > endpointcache.DrainWait+drainTestSlack {
+		t.Fatalf("run took %s, past the %s drain bound", took, endpointcache.DrainWait)
+	}
+	if !worker.cancelled(t) {
+		t.Fatal("the drain did not cancel the slow worker")
+	}
+	if !strings.Contains(stderr, "endpoint cache: cancelled background work still running at exit") ||
+		!strings.Contains(stderr, "discovery") {
+		t.Fatalf("stderr lacks the cancelled-work line naming the worker: %s", stderr)
+	}
+}
+
+// A slow worker never changes a failing call's exit code either.
+func TestSlowWorkerKeepsFailingExitCode(t *testing.T) {
+	cfgPath := writeOTelWiringConfigAtLevel(t, "debug", "")
+	failingWrite := func(opts runOptions) int {
+		code := runWithArgs([]string{"--config", cfgPath}, strings.NewReader(drainInfoRequest),
+			failingWriter{}, &bytes.Buffer{}, opts)
+		return code
+	}
+	baseline := failingWrite(runOptions{ClientFactory: nilTracerClientFactory, DrainWait: 50 * time.Millisecond})
+	if baseline != 1 {
+		t.Fatalf("baseline exit %d, want 1 from the failed response write", baseline)
+	}
+	worker := newDrainTestWorker(t)
+	slow := failingWrite(runOptions{
+		ClientFactory: factoryStarting(t, func() error { return worker.start("down mark") }),
+		DrainWait:     50 * time.Millisecond,
+	})
+	if slow != baseline {
+		t.Fatalf("slow worker changed the exit code from %d to %d", baseline, slow)
+	}
+	if !worker.cancelled(t) {
+		t.Fatal("the drain did not cancel the slow worker")
+	}
+}
+
+// failingWriter fails every write, so runCPI cannot write its response and
+// the call exits 1.
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("simulated stdout failure") }
+
+// A call that starts a short write and returns at once still waits for it, so
+// the write lands before the process exits.
+func TestDrainWaitsForWorkThatFinishesInTime(t *testing.T) {
+	cfgPath := writeOTelWiringConfigAtLevel(t, "debug", "")
+	var wrote atomic.Bool
+	start := func() error {
+		return endpointcache.Go("down mark", func(ctx context.Context) {
+			select {
+			case <-time.After(100 * time.Millisecond):
+				wrote.Store(true)
+			case <-ctx.Done():
+			}
+		})
+	}
+	code, _, stderr, took := drainRun([]string{"--config", cfgPath}, drainInfoRequest,
+		runOptions{ClientFactory: factoryStarting(t, start)})
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	if !wrote.Load() {
+		t.Fatal("the call exited before its background write finished")
+	}
+	if took > endpointcache.DrainWait {
+		t.Fatalf("run took %s; the drain should end when the work does", took)
+	}
+	if !strings.Contains(stderr, "endpoint cache: background work finished before exit") {
+		t.Fatalf("stderr lacks the finished-work line: %s", stderr)
+	}
+}
+
+// A panicking worker is reported at Error and leaves the exit code alone.
+func TestPanickingWorkerKeepsExitCode(t *testing.T) {
+	cfgPath := writeOTelWiringConfigAtLevel(t, "warn", "")
+	start := func() error {
+		return endpointcache.Go("discovery", func(context.Context) { panic("simulated worker defect") })
+	}
+	code, stdout, stderr, _ := drainRun([]string{"--config", cfgPath}, drainInfoRequest,
+		runOptions{ClientFactory: factoryStarting(t, start)})
+	if code != 0 {
+		t.Fatalf("exit %d after a worker panic, want 0: %s", code, stderr)
+	}
+	if resp := parseResponse(t, stdout); resp.Error != nil {
+		t.Fatalf("info returned an error: %+v", resp.Error)
+	}
+	if !strings.Contains(stderr, "endpoint cache: background worker panicked") ||
+		!strings.Contains(stderr, "simulated worker defect") {
+		t.Fatalf("stderr lacks the panic line: %s", stderr)
+	}
+}
+
+// A subcommand that builds a PVE client is drained too, within the same
+// bound, and a panic there reaches stderr although the subcommand logs
+// through a no-op logger.
+func TestSubcommandDrainsBackgroundWork(t *testing.T) {
+	cfgPath := writeStorageJournalConfig(t, minimalCfg())
+	const bound = 100 * time.Millisecond
+	worker := newDrainTestWorker(t)
+	start := func() error {
+		if err := worker.start("discovery"); err != nil {
+			return err
+		}
+		return endpointcache.Go("down mark", func(context.Context) { panic("simulated subcommand defect") })
+	}
+	failing := func(*config.CPIConfig, *log.Logger, trace.Tracer) (pve.Client, error) {
+		if err := start(); err != nil {
+			t.Errorf("start background work: %v", err)
+		}
+		return nil, errors.New("dial refused")
+	}
+	code, _, stderr, took := drainRun([]string{"stemcell-refs", "report", "--config", cfgPath}, "",
+		runOptions{ClientFactory: failing, DrainWait: bound})
+	if code != 1 {
+		t.Fatalf("exit %d, want 1 from the client failure: %s", code, stderr)
+	}
+	if took < bound || took > bound+drainTestSlack {
+		t.Fatalf("subcommand took %s, want about the %s bound", took, bound)
+	}
+	if !worker.cancelled(t) {
+		t.Fatal("the subcommand's drain did not cancel the slow worker")
+	}
+	if !strings.Contains(stderr, "simulated subcommand defect") {
+		t.Fatalf("stderr lacks the panic line: %s", stderr)
+	}
+}
+
+// A signal ends the drain's wait at once, and the cancelled-work line follows
+// the configured mode: Debug under auto, Warn under an explicit "on".
+func TestDrainBackgroundWorkSignalAndLevel(t *testing.T) {
+	cases := []struct {
+		mode config.DiscoveryMode
+		want slog.Level
+	}{
+		{mode: config.DiscoveryModeAuto, want: slog.LevelDebug},
+		{mode: config.DiscoveryModeOn, want: slog.LevelWarn},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			endpointcache.Open()
+			worker := newDrainTestWorker(t)
+			if err := worker.start("discovery"); err != nil {
+				t.Fatal(err)
+			}
+			signalled, cancel := context.WithCancel(context.Background())
+			cancel()
+			logger, observed := log.NewObservedLogger(slog.LevelDebug)
+
+			start := time.Now()
+			drainBackgroundWork(signalled, logger, tc.mode, time.Hour)
+			if took := time.Since(start); took > drainTestSlack {
+				t.Fatalf("drain after a signal took %s", took)
+			}
+			if !worker.cancelled(t) {
+				t.Fatal("the drain did not cancel the worker")
+			}
+			entries := observed.All()
+			if len(entries) != 1 || entries[0].Level != tc.want ||
+				entries[0].Message != "endpoint cache: cancelled background work still running at exit" {
+				t.Fatalf("entries = %+v, want one cancelled-work line at %s", entries, tc.want)
+			}
+		})
+	}
+}
+
+// A run's last drain never waits again for a worker the first drain gave up
+// on, so a stuck worker costs one bound, not two.
+func TestLastDrainWaitsForNothingAfterTheFirst(t *testing.T) {
+	endpointcache.Open()
+	worker := newDrainTestWorker(t)
+	if err := worker.start("discovery"); err != nil {
+		t.Fatal(err)
+	}
+	drainBackgroundWork(context.Background(), log.NewNopLogger(), config.DiscoveryModeAuto, 20*time.Millisecond)
+	if !worker.cancelled(t) {
+		t.Fatal("the first drain did not cancel the worker")
+	}
+	var stderr bytes.Buffer
+	start := time.Now()
+	drainRemainingBackgroundWork(&stderr, time.Hour)
+	if took := time.Since(start); took > drainTestSlack {
+		t.Fatalf("the last drain waited %s for a worker the first drain cancelled", took)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("the last drain wrote %q with no panic to report", stderr.String())
 	}
 }

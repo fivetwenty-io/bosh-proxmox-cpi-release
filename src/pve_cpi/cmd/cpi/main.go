@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/hooks"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -227,6 +229,12 @@ type runOptions struct {
 	// Zero selects defaultMaxLineBytes (64 MiB). Tests set a small value (e.g.
 	// 4 KiB) to keep oversized payloads manageable without mutating a package var.
 	MaxLineBytes int
+
+	// DrainWait overrides how long the exit drain waits for the endpoint
+	// cache's background workers before it cancels them. Zero selects
+	// endpointcache.DrainWait (3s). Tests set a short value so a deliberately
+	// stuck worker costs milliseconds rather than the full bound.
+	DrainWait time.Duration
 }
 
 // run is the thin os-wired entry point. It delegates to runWithArgs so the
@@ -246,7 +254,16 @@ func run() int {
 // Returning an int rather than calling os.Exit directly ensures that all
 // deferred calls (including signal.NotifyContext's cancel) fire before the
 // process exits.
+//
+// Every path opens the endpoint cache's worker registry and drains it before
+// returning, so a background cache write that a PVE client started finishes,
+// or is cancelled, before the process exits. The main path drains beside the
+// OTel flush, and the deferred drain below covers the subcommands and every
+// early return. It finds an already-drained registry on the main path and
+// returns at once, and a path that started no worker never waits.
 func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts runOptions) int {
+	endpointcache.Open()
+	defer drainRemainingBackgroundWork(stderr, opts.DrainWait)
 	if len(args) > 0 && args[0] == "storage-journal" {
 		return runStorageJournal(args[1:], stdout, stderr, opts)
 	}
@@ -329,6 +346,13 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// changes the process's exit code: every deadline is bounded, and an
 	// export failure must never fail a CPI action.
 	defer shutdownOTelSignals(cfg, logger, otelShutdown, logsShutdown, metricsShutdown)
+
+	// Deferred after the OTel flush so it runs first, which lets the drain's
+	// log lines, and any a worker logs while it finishes, reach the exporters.
+	// rootCtx ends the wait early on SIGINT or SIGTERM, so a signalled process
+	// cancels its background work and exits at once. The drain never touches
+	// the exit code.
+	defer drainBackgroundWork(rootCtx, logger, cfg.DiscoveryModeValue(), opts.DrainWait)
 
 	logger.Info("cpi: starting", log.String("release_version", releaseVersionLabel(cfg.ReleaseVersion)),
 		log.String("package_version", version.Version), log.String("build_date", version.BuildDate))
@@ -564,6 +588,70 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		return 1
 	}
 	return 0
+}
+
+// drainBackgroundWork waits for the endpoint cache's background workers, for
+// at most wait or endpointcache.DrainWait when wait is zero, cancels the ones
+// still running, and logs what the drain found on logger. mode is the
+// configured discovery mode, which raises the cancelled-work line from Debug
+// to Warn under an explicit "on", as endpointcache.Level decides.
+func drainBackgroundWork(ctx context.Context, logger *log.Logger, mode config.DiscoveryMode, wait time.Duration) {
+	logDrainResult(logger, mode, endpointcache.Drain(ctx, drainWait(wait)))
+}
+
+// drainRemainingBackgroundWork is runWithArgs's last drain. On the main path
+// it finds the registry already drained and returns at once. On the
+// subcommands, which log through a no-op logger, it is the only drain, and it
+// reports a panicked worker on stderr, the one finding a defect produces.
+func drainRemainingBackgroundWork(stderr io.Writer, wait time.Duration) {
+	result := endpointcache.Drain(context.Background(), drainWait(wait))
+	if len(result.Panics) == 0 {
+		return
+	}
+	logger, err := log.NewLogger("error", stderr)
+	if err != nil {
+		fmt.Fprintf(stderr, "cpi: background workers panicked (%d), and the logger failed: %s\n", len(result.Panics), err)
+		return
+	}
+	logDrainResult(logger, config.DiscoveryModeAuto, result)
+}
+
+// drainWait returns wait, or endpointcache.DrainWait when wait is zero or
+// less.
+func drainWait(wait time.Duration) time.Duration {
+	if wait <= 0 {
+		return endpointcache.DrainWait
+	}
+	return wait
+}
+
+// logDrainResult logs a drain's findings. A panicked worker is an Error with
+// its stack. Cancelled work is a Debug line, or a Warn under an explicit "on",
+// because the operator asked for a cache this call did not finish writing.
+// Work that finished in time is a Debug line, and a call that started no
+// worker logs nothing.
+func logDrainResult(logger *log.Logger, mode config.DiscoveryMode, result endpointcache.DrainResult) {
+	for _, p := range result.Panics {
+		logger.Error("endpoint cache: background worker panicked",
+			log.String("worker", p.Name),
+			log.Any("panic", p.Value),
+			log.String("stack", string(p.Stack)),
+		)
+	}
+	switch {
+	case len(result.Cancelled) > 0:
+		logger.LogAttrs(context.Background(), endpointcache.Level(mode),
+			"endpoint cache: cancelled background work still running at exit",
+			log.String("workers", strings.Join(result.Cancelled, ", ")),
+			log.Int("started", result.Started),
+			log.String("waited", result.Waited.Round(time.Millisecond).String()),
+		)
+	case result.Started > 0:
+		logger.Debug("endpoint cache: background work finished before exit",
+			log.Int("started", result.Started),
+			log.String("waited", result.Waited.Round(time.Millisecond).String()),
+		)
+	}
 }
 
 // errSignaled is returned by runCPI when the parent context is cancelled by a signal.
