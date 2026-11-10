@@ -61,7 +61,7 @@ func fwUploadAttempts(t *testing.T, n int) {
 	t.Cleanup(pve.SetStorageUploadRetryForTest(n))
 }
 
-// The routed fault the narrowing is about must really be a read fault that the
+// The routed fault the narrowing is about must be a read fault that the
 // wrapper marks as possibly sent. Without the marker the same fault is
 // fallback-eligible at the POST, so a test of the narrowing proves nothing
 // when the fault is some other shape.
@@ -214,9 +214,16 @@ func TestStemcellUploadMaybeSentStaysOnItsServer(t *testing.T) {
 	if got := fwCount(fwMutations(b), fwUploadPOST); got != 0 {
 		t.Errorf("the second server read %d uploads, want 0", got)
 	}
+	// The pre-retry sweep is deliberately outside the upload's tether family. Every
+	// entry hands the content delete to the node that owns the storage, so the
+	// entry it goes through changes neither which node deletes the file nor how
+	// the delete races the first upload's task, and the sweep still clears the
+	// partial file when the tethered entry is down. The uploads bullet in the
+	// spec gives that reasoning. So the sweep's delete may reach the second
+	// server and nothing else may.
 	for _, m := range fwMutations(b) {
 		if !strings.HasPrefix(m, "DELETE "+fwContentDir) {
-			t.Errorf("the second server read %q, want only the pre-retry sweep, which has its own key", m)
+			t.Errorf("the second server read %q, want at most the untethered sweep delete", m)
 		}
 	}
 	if errors.Is(err, endpointpool.ErrTetherConflict) {

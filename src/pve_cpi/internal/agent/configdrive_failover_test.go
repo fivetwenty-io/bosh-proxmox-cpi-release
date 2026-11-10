@@ -48,6 +48,11 @@ func cdfLab(t *testing.T) *pvetest.Leaf {
 	return pvetest.NewCA(t).NewLeaf(t, pvetest.LeafOptions{})
 }
 
+// cdfClosedAddr returns the address of a loopback port that refuses
+// connections. It binds a port, closes it, and hands out the address, so the
+// port is free again from then on. This file must stay serial, because a
+// parallel test could bind the port in that window. No test here calls
+// t.Parallel.
 func cdfClosedAddr(t *testing.T) string {
 	t.Helper()
 	var lc net.ListenConfig
@@ -86,10 +91,20 @@ func cdfClient(t *testing.T, addrs ...string) pve.Client {
 	return c
 }
 
+// cdfCallDeadline bounds every call a wire test makes, so that a regression in
+// the poll phase fails the test in seconds and does not wait for the task
+// deadline, which is hundreds of seconds.
+const cdfCallDeadline = 10 * time.Second
+
+// cdfCtx returns a call context with its own affinity scope released when the
+// test ends, a zero backoff, a one-millisecond SDK retry delay, and a deadline
+// of cdfCallDeadline.
 func cdfCtx(t *testing.T) context.Context {
 	t.Helper()
 	ctx, release := endpointpool.WithAffinityScope(context.Background())
 	t.Cleanup(release)
+	ctx, cancel := context.WithTimeout(ctx, cdfCallDeadline)
+	t.Cleanup(cancel)
 	ctx = pve.WithTestBackoff(ctx, func(int) time.Duration { return 0 })
 	return sdkclient.WithRetryDelay(ctx, time.Millisecond)
 }
@@ -316,6 +331,10 @@ func TestConfigDriveUploadMaybeSentStaysOnItsServer(t *testing.T) {
 	if got := cdfUploads(cdfMutations(b)); got != 0 {
 		t.Errorf("the second server read %d uploads, want 0", got)
 	}
+	// The pre-retry sweep is deliberately outside the upload's tether family, because
+	// every entry hands the content delete to the node that owns the storage, so
+	// its delete may reach the second server and nothing else may. The uploads
+	// bullet in the spec gives that reasoning.
 	cdfOnlyUploadAndSweep(t, "the second server", cdfMutations(b))
 	if errors.Is(err, endpointpool.ErrTetherConflict) {
 		t.Errorf("the failure is a tether conflict: %v", err)

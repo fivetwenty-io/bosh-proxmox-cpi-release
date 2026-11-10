@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -51,6 +52,12 @@ func (l *fwLab) live(t *testing.T, routes *pvetest.Routes) *pvetest.Server {
 }
 
 // fwClosedAddr returns the address of a loopback port that refuses connections.
+// It binds a port, closes it, and hands out the address, so the port is free
+// again from then on. The files that use it must stay serial, because a
+// parallel test could bind the port in that window. No test here calls
+// t.Parallel. The seam in pvetest that keeps a refused server's port bound
+// needs a dial hook that a client built by pve.NewClientWithTracer does not
+// expose, so these tests cannot use it.
 func fwClosedAddr(t *testing.T) string {
 	t.Helper()
 	var lc net.ListenConfig
@@ -93,13 +100,23 @@ func fwClient(t *testing.T, addrs ...string) pve.Client {
 	return c
 }
 
+// fwCallDeadline bounds every call a wire test makes. The tests finish in
+// milliseconds, so the bound only matters when a rule under test regresses and
+// a call would wait for its production deadline, which for a task poll is
+// hundreds of seconds. With the bound, that regression fails the test in
+// seconds with a deadline error.
+const fwCallDeadline = 10 * time.Second
+
 // fwCtx returns a call context the way the dispatcher builds one, with its own
 // affinity scope released when the test ends, plus a zero backoff for the
-// retry helpers and a one-millisecond base for the SDK's own retries.
+// retry helpers, a one-millisecond base for the SDK's own retries, and a
+// deadline of fwCallDeadline.
 func fwCtx(t *testing.T) context.Context {
 	t.Helper()
 	ctx, release := endpointpool.WithAffinityScope(context.Background())
 	t.Cleanup(release)
+	ctx, cancel := context.WithTimeout(ctx, fwCallDeadline)
+	t.Cleanup(cancel)
 	ctx = pve.WithTestBackoff(ctx, func(int) time.Duration { return 0 })
 	return sdkclient.WithRetryDelay(ctx, time.Millisecond)
 }
@@ -203,6 +220,27 @@ func fwPoolRoutes(status int) *pvetest.Routes {
 	return routes
 }
 
+// fwAssertDeleteRefusedAt checks that err is the sentinel delete's own
+// connection failure against the closed server a. A release that gave up
+// earlier, such as one whose claim read failed, would also return an error
+// and leave the other server without a mutation, but it would not carry the
+// refused delete.
+func fwAssertDeleteRefusedAt(t *testing.T, err error, a *pvetest.Server) {
+	t.Helper()
+	if errors.Is(err, pve.ErrLockClaimChanged) {
+		t.Errorf("the release failed on a changed claim, not on the delete: %v", err)
+	}
+	for _, want := range []string{
+		"DELETE request to \"/pools\"",
+		"connect phase dial failed for " + a.Addr,
+		"connection refused",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the release error lacks %q, so the delete was not what failed: %v", want, err)
+		}
+	}
+}
+
 // A sentinel create under /pools that may have landed on one server is followed
 // by the cleanup delete of releasePoisonedSentinel, which differs in method and
 // shares only the pools family with the create. With the first server gone and
@@ -228,6 +266,7 @@ func TestPoolSentinelCreateThenReleaseNeverReachesTheOtherServer(t *testing.T) {
 			if err == nil {
 				t.Fatal("the release succeeded with its server gone, so it was sent somewhere else")
 			}
+			fwAssertDeleteRefusedAt(t, err, a)
 			fwNoMutations(t, "the second server", b)
 			if got := fwCount(fwMutations(a), "DELETE /pools"); got != 0 {
 				t.Errorf("the closed server read %d deletes", got)
@@ -253,9 +292,11 @@ func TestPoolSentinelReleaseOfAnotherSentinelStaysOnTheCreateServer(t *testing.T
 		t.Fatalf("CreatePool: %v", err)
 	}
 	a.Close()
-	if err := svc.releasePoisonedSentinel(pve.WithExpectedLockClaim(ctx, fwClaim), "bosh-lock-another"); err == nil {
+	err := svc.releasePoisonedSentinel(pve.WithExpectedLockClaim(ctx, fwClaim), "bosh-lock-another")
+	if err == nil {
 		t.Fatal("the release of another sentinel succeeded with the family's server gone")
 	}
+	fwAssertDeleteRefusedAt(t, err, a)
 	fwNoMutations(t, "the second server", b)
 }
 
@@ -287,73 +328,103 @@ func TestPoolSentinelReleaseGoesToTheCreateServerAfterAReadMovedTheActiveEndpoin
 	}
 }
 
-// The storage-replica fan-out starts one create per member from goroutines that
-// share a call context. A read that fails over between two creates moves the
-// pool's active endpoint to the second server, and the second create is still
-// sent to the first, because the reservation names the server that took the
-// first. Both creates are answered with a 596, which fixes each tether without
-// moving it, and both replays go to the first server as well.
+// The storage-replica fan-out starts one template build per member from
+// goroutines that share a call context, and each build allocates a VMID with
+// reads and then creates the VM with a POST. The test drives
+// replicateStemcellToStorages with two members. The first worker's create reaches the first server and is
+// held open. The second worker's allocation read is then answered with a 503,
+// so it hops to the second server and moves the pool's active endpoint there.
+// The second worker's create is still sent to the first server, because the
+// reservation names the server that took the first. The first server answers
+// every create with a 596, which fixes each tether without moving it, so the
+// retry loop of the allocation replays each create, and every replay goes to
+// the first server as well. The second server reads no mutation.
 func TestStorageReplicaFanOutCreatesStayOnTheServerOfTheFirst(t *testing.T) {
 	const node = "pve1"
+	const createPath = "/nodes/" + node + "/qemu"
 	lab := newFWLab(t)
-	arrived := make(chan struct{}, 4)
+	arrived := make(chan struct{}, 16)
 	gate := make(chan struct{})
-	aRoutes := pvetest.NewRoutes()
-	aRoutes.HandleFunc(http.MethodPost, "/nodes/"+node+"/qemu", func(w http.ResponseWriter, r *http.Request) {
+	firstCreate := make(chan struct{})
+	var openGate, markFirstCreate sync.Once
+	t.Cleanup(func() { openGate.Do(func() { close(gate) }) })
+	var reads atomic.Int32
+	// The VMID allocation lists the cluster's nodes and each node's guests, so both
+	// servers name the one node and list no guests.
+	members := func() *pvetest.Routes {
+		routes := pvetest.NewRoutes()
+		routes.JSON(http.MethodGet, "/nodes", http.StatusOK, []map[string]string{{"node": node, "status": "online"}})
+		return routes
+	}
+	aRoutes := members()
+	aRoutes.HandleFunc(http.MethodPost, createPath, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
+		markFirstCreate.Do(func() { close(firstCreate) })
 		arrived <- struct{}{}
 		<-gate
 		w.WriteHeader(596)
 	})
-	aRoutes.Fail(http.MethodGet, "/cluster/resources", http.StatusServiceUnavailable, "busy")
-	a := lab.live(t, aRoutes)
-	b := lab.live(t, nil)
-	client := fwClient(t, a.Addr, b.Addr)
-	ctx := sdkclient.WithRetries(fwCtx(t), 0)
-
-	var wg sync.WaitGroup
-	attempts := make(chan error, 4)
-	replica := func(vmid int) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// The first attempt, then the replay the retry helper makes after the 596.
-			for range 2 {
-				_, err := client.QEMU().Create(ctx, node, map[string]any{"vmid": vmid})
-				attempts <- err
+	// The first allocation read is answered. Every later one waits for the first
+	// create to arrive and then fails with a 503, which sends the read to the
+	// second server.
+	aRoutes.HandleFunc(http.MethodGet, "/cluster/resources", func(w http.ResponseWriter, r *http.Request) {
+		if reads.Add(1) > 1 {
+			select {
+			case <-firstCreate:
+			case <-r.Context().Done():
+				return
 			}
-		}()
+			http.Error(w, `{"data":null,"message":"busy"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	})
+	a := lab.live(t, aRoutes)
+	b := lab.live(t, members())
+	deps := Deps{
+		PVE:    fwClient(t, a.Addr, b.Addr),
+		Config: &config.CPIConfig{StemcellReplicationConcurrency: 2},
+		Logger: log.NewNopLogger(),
 	}
-	awaitA := func(which string) {
-		t.Helper()
+	ctx := sdkclient.WithRetries(fwCtx(t), 0)
+	targets := []storageReplicaTarget{
+		{StorageID: "ns_2", Tag: pve.ReplicaStorageTagForStorage("ns_2")},
+		{StorageID: "ns_3", Tag: pve.ReplicaStorageTagForStorage("ns_3")},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		replicateStemcellToStorages(ctx, deps, node, "nfs", "stem.qcow2", "abcd1234ef00", targets, nil,
+			":heavy:nfs:import/stem.qcow2", "dir-a", pve.StemcellKindHeavy,
+			stemcellCloudProps{Name: "ubuntu-noble", Version: "1.585"}, "test")
+	}()
+	for _, which := range []string{"first", "second"} {
 		select {
 		case <-arrived:
-		case <-time.After(10 * time.Second):
-			t.Fatalf("the %s create never reached the first server (the second read %d POSTs)", which,
-				b.Counts.Method(http.MethodPost))
-		}
-	}
+		case <-time.After(5 * time.Second):
 
-	replica(101)
-	awaitA("first")
-	if _, err := client.Cluster().ListResources(ctx, nil); err != nil {
-		t.Fatalf("the read that moves the active endpoint failed: %v", err)
+			t.Fatalf("the %s create never reached the first server (the second read %d GETs and %d mutations)",
+				which, fwGets(b), len(fwMutations(b)))
+		}
 	}
 	if fwGets(b) == 0 {
-		t.Fatal("the read did not move to the second server, so the test did not exercise a moved endpoint")
+		t.Fatal("no read moved to the second server, so the test did not exercise a moved endpoint")
 	}
-	replica(102)
-	awaitA("second")
-	close(gate)
-	wg.Wait()
-	close(attempts)
-	for err := range attempts {
-		if err == nil {
-			t.Error("a create succeeded against a server that answered 596")
-		}
+	openGate.Do(func() { close(gate) })
+	select {
+	case <-done:
+	case <-time.After(fwCallDeadline):
+		t.Fatal("the fan-out did not finish after the first server answered its creates")
 	}
-	if got := fwCount(fwMutations(a), "POST /nodes/"+node+"/qemu"); got != 4 {
-		t.Errorf("the first server read %d creates, want 4", got)
+
+	// Each member makes the allocation loop's three attempts, and every attempt
+	// is a create answered with a 596.
+	const allocationAttempts = 3
+	if got, want := fwCount(fwMutations(a), "POST "+createPath), allocationAttempts*len(targets); got != want {
+		t.Errorf("the first server read %d creates, want %d (%d attempts for each of %d members)", got, want,
+			allocationAttempts, len(targets))
 	}
 	fwNoMutations(t, "the second server", b)
 }

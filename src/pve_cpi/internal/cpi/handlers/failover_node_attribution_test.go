@@ -17,8 +17,14 @@ import (
 // motion handlers address to another node, answer 595 on every pool server,
 // and check that the request never moves to a second server and that the entry
 // stays first for the next request.
+//
+// Each pool entry knows the node it serves, so the equality check of the
+// attribution rule runs. A 595 for a node that is none of the entries' own is
+// unattributable, and a 595 for an entry's own node is attributable.
 
 const (
+	fwFirstNode     = "pve01"
+	fwSecondNode    = "pve03"
 	fwDeadNode      = "pve-dead"
 	fw595Reason     = "hostname lookup failed - no route to host"
 	fwStatusProxy   = 595
@@ -34,6 +40,13 @@ func fwNodeRoutes(node string) *pvetest.Routes {
 	routes.Fail(http.MethodGet, "/nodes/"+node+"/", fwStatusProxy, fw595Reason)
 	routes.JSON(http.MethodGet, "/pools/", http.StatusOK, map[string]any{"comment": fwClaim, "members": []any{}})
 	return routes
+}
+
+// fwNameEntries gives the pool entries at the two servers' addresses the node
+// names fwFirstNode and fwSecondNode, for the clients built afterwards.
+func fwNameEntries(t *testing.T, a, b *pvetest.Server) {
+	t.Helper()
+	t.Cleanup(pve.SetEndpointNodesForTest(map[string]string{a.Addr: fwFirstNode, b.Addr: fwSecondNode}))
 }
 
 // fwAssertEntryStaysFirst checks that the pool's second server read nothing and
@@ -62,6 +75,7 @@ func TestDiskMotionConfigReadOfADeadNodeNeverMovesTheRequest(t *testing.T) {
 	lab := newFWLab(t)
 	a := lab.live(t, fwNodeRoutes(fwDeadNode))
 	b := lab.live(t, fwNodeRoutes(fwDeadNode))
+	fwNameEntries(t, a, b)
 	client := fwClient(t, a.Addr, b.Addr)
 	deps := Deps{PVE: client}
 
@@ -105,6 +119,7 @@ func TestDeadNodeDeleteReplicaListingOfADeadNodeNeverMovesTheRequest(t *testing.
 	}
 	lab := newFWLab(t)
 	a, b := lab.live(t, routes()), lab.live(t, routes())
+	fwNameEntries(t, a, b)
 	client := fwClient(t, a.Addr, b.Addr)
 	deps := Deps{PVE: client, RequestDirectorUUID: aaDirector}
 	storages := []pve.StorageInfo{{Name: "local-zfs", Type: pve.StorageTypeZFSPool, Content: "images"}}
@@ -132,6 +147,7 @@ func TestNodeAttributionAnEntryCausedStatusStillHopsAGet(t *testing.T) {
 	aRoutes.Fail(http.MethodGet, "/pools/", fwStatusProxy, fw595Reason)
 	a := lab.live(t, aRoutes)
 	b := lab.live(t, fwNodeRoutes(fwDeadNode))
+	fwNameEntries(t, a, b)
 	client := fwClient(t, a.Addr, b.Addr)
 
 	comment, found, err := client.Pools().GetPoolComment(fwCtx(t), "p1")
@@ -140,5 +156,25 @@ func TestNodeAttributionAnEntryCausedStatusStillHopsAGet(t *testing.T) {
 	}
 	if fwGets(b) != 1 {
 		t.Errorf("the second server read %d GETs, want the one hop", fwGets(b))
+	}
+}
+
+// A 595 for the node the entry itself serves is the entry's own trouble, so a
+// read hops to the next server. Together with the dead-node tests, which use a
+// node that is no entry's own, this shows the rule compares the path's node with
+// the entry's node and does not blame every entry that knows its node.
+func TestNodeAttributionA595ForTheEntrysOwnNodeStillHopsAGet(t *testing.T) {
+	lab := newFWLab(t)
+	a := lab.live(t, fwNodeRoutes(fwFirstNode))
+	b := lab.live(t, nil)
+	fwNameEntries(t, a, b)
+	client := fwClient(t, a.Addr, b.Addr)
+
+	_, err := client.Nodes().ListStorageContent(fwCtx(t), fwFirstNode, "local", nil)
+	if err != nil {
+		t.Fatalf("ListStorageContent: %v", err)
+	}
+	if fwGets(b) != 1 {
+		t.Errorf("the second server read %d GETs, want the one hop that a 595 for the entry's own node causes", fwGets(b))
 	}
 }

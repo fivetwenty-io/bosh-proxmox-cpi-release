@@ -101,9 +101,11 @@ func planEndpoints(cfg *config.CPIConfig, opts sdkclient.Options, source discove
 			return endpointPlan{}, cpierrors.Cloud("pve client init: the endpoint list was not resolved: "+
 				"pve.endpoints[%d] has no port; the config layer must give every entry its port before the client is built", i)
 		}
+		address := net.JoinHostPort(host, strconv.Itoa(port))
 		plan.endpoints = append(plan.endpoints, endpointpool.Endpoint{
-			Address: net.JoinHostPort(host, strconv.Itoa(port)),
+			Address: address,
 			Kind:    endpointpool.KindConfigured,
+			Node:    configuredEndpointNode(address),
 		})
 	}
 	plan.configured = len(plan.endpoints)
