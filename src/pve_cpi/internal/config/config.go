@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/hooks"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -5429,7 +5430,7 @@ func (c *CPIConfig) validateHostAgreesWithEndpoints(firstKey, portNote string, e
 type DiscoveryMode string
 
 // DiscoveryMode values. The empty mode means the property is unset, which
-// reads as DiscoveryModeAuto.
+// reads as DiscoveryModeAuto. A decoded empty string is refused instead.
 const (
 	// DiscoveryModeAuto discovers only when the effective list holds exactly
 	// one endpoint and the CPI authenticates with an API token.
@@ -5441,8 +5442,14 @@ const (
 	DiscoveryModeOff DiscoveryMode = "off"
 )
 
+// discoveryEchoLimit bounds how many bytes of an unusable JSON value the
+// decode error repeats.
+const discoveryEchoLimit = 64
+
 // UnmarshalJSON implements json.Unmarshaler. A JSON null leaves the mode
-// unchanged, as it does for the other optional properties.
+// unchanged, as it does for the other optional properties. An empty string is
+// refused, because the rendered template refuses it and an unset mode is
+// written by leaving the property out.
 func (m *DiscoveryMode) UnmarshalJSON(raw []byte) error {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "null" {
@@ -5450,6 +5457,9 @@ func (m *DiscoveryMode) UnmarshalJSON(raw []byte) error {
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
+		if s == "" {
+			return fmt.Errorf("api_endpoint_discovery must be auto, on, or off, got %q", s)
+		}
 		*m = DiscoveryMode(s)
 		return nil
 	}
@@ -5462,7 +5472,20 @@ func (m *DiscoveryMode) UnmarshalJSON(raw []byte) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("api_endpoint_discovery: expected a string or a boolean, got %s", trimmed)
+	return fmt.Errorf("api_endpoint_discovery: expected a string or a boolean, got %s", boundEcho(trimmed))
+}
+
+// boundEcho cuts s to discoveryEchoLimit bytes at a character boundary and
+// marks the cut with an ellipsis.
+func boundEcho(s string) string {
+	if len(s) <= discoveryEchoLimit {
+		return s
+	}
+	end := discoveryEchoLimit
+	for end > 0 && !utf8.RuneStart(s[end]) {
+		end--
+	}
+	return s[:end] + "..."
 }
 
 // valid reports whether the mode is one of the three values. The empty mode,
@@ -5484,11 +5507,13 @@ const (
 		"so endpoint discovery is off"
 	discoveryErrLooserTLS = "api_endpoint_discovery \"on\" cannot be used because this entry inherits the job's " +
 		"credentials and sets looser TLS than the job; give the entry its own credentials " +
-		"(pve.api_token, or pve.user with pve.password), or set pve.api_endpoint_discovery to auto or off"
+		"(pve.api_token, or pve.user with pve.password), make its TLS settings match the job's, " +
+		"or set pve.api_endpoint_discovery to auto or off"
 	discoveryErrPasswordNoVerify = "api_endpoint_discovery \"on\" cannot be used with password auth while " +
 		"verify_ssl is false; use an API token (pve.api_token) or turn on verification (pve.verify_ssl: true)"
 	discoveryReasonPassword = "api_endpoint_discovery is auto and the CPI logs in with a password, " +
-		"so endpoint discovery is off; set pve.api_endpoint_discovery to on to discover with a password"
+		"so endpoint discovery is off; use an API token (pve.api_token), or set pve.api_endpoint_discovery " +
+		"to on with pve.verify_ssl true to discover with a password"
 )
 
 // DiscoveryModeValue returns the configured discovery mode: the stored value,
@@ -5531,11 +5556,13 @@ func (c *CPIConfig) endpointCount() int {
 //
 // The rows resolve as follows.
 //   - A cpi-config entry that inherited the job's credentials under looser TLS
-//     resolves to off. When its mode is on, Validate has already rejected the
-//     config, so off is the fail-closed answer for a caller that skips it.
+//     resolves to off, with a reason only for auto, which includes the unset
+//     mode. When its mode is on, Validate has already rejected the config, so
+//     off is the fail-closed answer for a caller that skips it, and it is
+//     silent like the table says.
 //   - Off resolves to off, silently.
-//   - On with password auth and verify_ssl false resolves to off with the
-//     validation message as the reason, for the same reason.
+//   - On with password auth and verify_ssl false resolves to off, silently,
+//     for the same fail-closed reason.
 //   - Auto with more than one endpoint resolves to off, silently.
 //   - Auto with password auth resolves to off, with a reason.
 //   - Anything else resolves to on.
@@ -5554,14 +5581,17 @@ func EffectiveDiscoveryMode(cfg *CPIConfig) (DiscoveryMode, string) {
 			"so endpoint discovery is off", string(mode))
 	}
 	if cfg.inheritedCredsLooserTLS {
-		return DiscoveryModeOff, discoveryReasonLooserTLS
+		if mode == DiscoveryModeAuto {
+			return DiscoveryModeOff, discoveryReasonLooserTLS
+		}
+		return DiscoveryModeOff, ""
 	}
 	switch mode {
 	case DiscoveryModeOff:
 		return DiscoveryModeOff, ""
 	case DiscoveryModeOn:
 		if cfg.usesPasswordAuth() && !cfg.VerifySSLValue() {
-			return DiscoveryModeOff, discoveryErrPasswordNoVerify
+			return DiscoveryModeOff, ""
 		}
 		return DiscoveryModeOn, ""
 	default:
@@ -5580,9 +5610,12 @@ func EffectiveDiscoveryMode(cfg *CPIConfig) (DiscoveryMode, string) {
 //   - api_endpoint_discovery must be auto, on, or off after the boolean
 //     mapping, and on is rejected with password auth and verify_ssl false, and
 //     for an entry that inherited credentials under looser TLS.
-//   - endpoint_cache_dir must be an absolute, clean path, and it must not
-//     equal or sit inside storage_allocation_journal_dir, because the journal
-//     scans its own tree and has strict identity rules.
+//   - endpoint_cache_dir must be an absolute, clean path other than the root
+//     directory, and neither it nor storage_allocation_journal_dir may carry
+//     leading or trailing whitespace. It must not equal or sit inside
+//     storage_allocation_journal_dir, because the journal scans its own tree
+//     and has strict identity rules. A cache directory that contains the
+//     journal directory is allowed.
 func (c *CPIConfig) validateDiscovery(errs *[]string) {
 	c.validateDiscoveryMode(errs)
 	c.validateEndpointCacheDir(errs)
@@ -5625,16 +5658,34 @@ func (c *CPIConfig) validateEndpointCacheDir(errs *[]string) {
 		*errs = append(*errs, fmt.Sprintf("endpoint_cache_dir must be an absolute path, got %q", dir))
 		return
 	}
-	if clean := filepath.Clean(dir); clean != dir {
+	if dir != strings.TrimSpace(dir) {
+		*errs = append(*errs, fmt.Sprintf("endpoint_cache_dir must not have leading or trailing whitespace, got %q",
+			dir))
+		return
+	}
+	clean := filepath.Clean(dir)
+	if clean != dir {
 		*errs = append(*errs, fmt.Sprintf("endpoint_cache_dir must be a clean path, write %q instead of %q",
 			clean, dir))
 		return
 	}
-	journal := c.StorageAllocationJournalDir
-	if journal == "" || !filepath.IsAbs(journal) {
+	if clean == string(filepath.Separator) {
+		*errs = append(*errs, "endpoint_cache_dir must not be the root directory; choose a dedicated directory")
 		return
 	}
-	if pathIsWithin(filepath.Clean(journal), dir) {
+	journal := c.StorageAllocationJournalDir
+	if journal == "" {
+		return
+	}
+	if journal != strings.TrimSpace(journal) {
+		*errs = append(*errs, fmt.Sprintf("storage_allocation_journal_dir must not have leading or trailing "+
+			"whitespace when endpoint_cache_dir is set, got %q", journal))
+		return
+	}
+	if !filepath.IsAbs(journal) {
+		return
+	}
+	if pathIsWithin(filepath.Clean(journal), clean) {
 		*errs = append(*errs, fmt.Sprintf("endpoint_cache_dir %q must not equal or sit inside "+
 			"storage_allocation_journal_dir %q; choose a directory outside the journal", dir, journal))
 	}

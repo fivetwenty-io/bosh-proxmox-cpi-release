@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // discoveryBaseCfg returns a valid, defaulted config that authenticates with
@@ -64,7 +65,6 @@ func TestDiscoveryMode_DecodesStringsAndBooleans(t *testing.T) {
 		{"off string", `"off"`, DiscoveryModeOff},
 		{"true boolean is on", `true`, DiscoveryModeOn},
 		{"false boolean is off", `false`, DiscoveryModeOff},
-		{"empty string is unset", `""`, ""},
 		{"unknown string kept for validation", `"sometimes"`, "sometimes"},
 		{"wrong case kept for validation", `"ON"`, "ON"},
 		{"string true is not a boolean", `"true"`, "true"},
@@ -85,6 +85,22 @@ func TestDiscoveryMode_DecodesStringsAndBooleans(t *testing.T) {
 	}
 }
 
+func TestDiscoveryMode_EmptyStringIsRefused(t *testing.T) {
+	t.Parallel()
+	var m DiscoveryMode
+	err := json.Unmarshal([]byte(`""`), &m)
+	if err == nil {
+		t.Fatalf(`"" decoded as %q, want an error`, m)
+	}
+	if !strings.Contains(err.Error(), `api_endpoint_discovery must be auto, on, or off, got ""`) {
+		t.Errorf("error %q does not name the allowed values", err)
+	}
+	_, err = mustLoadDiscovery(t, discoveryLoadJSON(`, "api_endpoint_discovery": ""`))
+	if err == nil || !strings.Contains(err.Error(), "must be auto, on, or off") {
+		t.Errorf("Load error = %v, want the allowed values message", err)
+	}
+}
+
 func TestDiscoveryMode_NullLeavesTheModeUnchanged(t *testing.T) {
 	t.Parallel()
 	m := DiscoveryModeOn
@@ -100,6 +116,34 @@ func TestDiscoveryMode_NullLeavesTheModeUnchanged(t *testing.T) {
 	}
 	if cfg.APIEndpointDiscovery != "" {
 		t.Errorf("null mode loaded as %q, want unset", cfg.APIEndpointDiscovery)
+	}
+}
+
+func TestDiscoveryMode_DecodeErrorBoundsTheEchoedValue(t *testing.T) {
+	t.Parallel()
+	long := `{"mode":"` + strings.Repeat("x", 200) + `"}`
+	var m DiscoveryMode
+	err := json.Unmarshal([]byte(long), &m)
+	if err == nil {
+		t.Fatal("an object decoded as a mode")
+	}
+	if strings.Contains(err.Error(), strings.Repeat("x", 100)) {
+		t.Errorf("error echoes the whole value: %q", err)
+	}
+	if want := long[:discoveryEchoLimit] + "..."; !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q lacks the bounded value %q", err, want)
+	}
+	// A value at the limit is echoed whole, without an ellipsis.
+	exact := `[` + strings.Repeat("1", discoveryEchoLimit-2) + `]`
+	err = json.Unmarshal([]byte(exact), &m)
+	if err == nil || !strings.HasSuffix(err.Error(), exact) {
+		t.Errorf("error %v does not end with the whole value %q", err, exact)
+	}
+	// The cut never splits a multibyte character.
+	multi := `["` + strings.Repeat("é", 100) + `"]`
+	err = json.Unmarshal([]byte(multi), &m)
+	if err == nil || !utf8.ValidString(err.Error()) || !strings.HasSuffix(err.Error(), "...") {
+		t.Errorf("error %q is not a valid bounded string", err)
 	}
 }
 
@@ -219,7 +263,7 @@ func TestEffectiveDiscoveryMode(t *testing.T) {
 		name       string
 		build      func() *CPIConfig
 		want       DiscoveryMode
-		wantReason string // substring; empty means the row logs nothing
+		wantReason string // exact reason; empty means the row logs nothing
 	}{
 		{
 			name: "row 1: auto with credentials inherited under looser TLS is off",
@@ -229,7 +273,7 @@ func TestEffectiveDiscoveryMode(t *testing.T) {
 				return c
 			},
 			want:       DiscoveryModeOff,
-			wantReason: "inherits the job's credentials and sets looser TLS than the job",
+			wantReason: discoveryReasonLooserTLS,
 		},
 		{
 			name: "row 1: unset mode with credentials inherited under looser TLS is off",
@@ -240,29 +284,27 @@ func TestEffectiveDiscoveryMode(t *testing.T) {
 				return c
 			},
 			want:       DiscoveryModeOff,
-			wantReason: "looser TLS",
+			wantReason: discoveryReasonLooserTLS,
 		},
 		{
-			name: "row 1: on with credentials inherited under looser TLS is off for a caller that skipped validation",
+			name: "row 1: on with credentials inherited under looser TLS is off and silent for a caller that skipped validation",
 			build: func() *CPIConfig {
 				c := discoveryBaseCfg()
 				c.APIEndpointDiscovery = DiscoveryModeOn
 				c.inheritedCredsLooserTLS = true
 				return c
 			},
-			want:       DiscoveryModeOff,
-			wantReason: "looser TLS",
+			want: DiscoveryModeOff,
 		},
 		{
-			name: "row 1: off with credentials inherited under looser TLS keeps the looser TLS reason",
+			name: "row 1: off with credentials inherited under looser TLS is off and silent",
 			build: func() *CPIConfig {
 				c := discoveryBaseCfg()
 				c.APIEndpointDiscovery = DiscoveryModeOff
 				c.inheritedCredsLooserTLS = true
 				return c
 			},
-			want:       DiscoveryModeOff,
-			wantReason: "looser TLS",
+			want: DiscoveryModeOff,
 		},
 		{
 			name: "row 2: off is off and silent",
@@ -284,15 +326,14 @@ func TestEffectiveDiscoveryMode(t *testing.T) {
 			want: DiscoveryModeOff,
 		},
 		{
-			name: "row 3: on with a password and verify_ssl false is off, with the validation message",
+			name: "row 3: on with a password and verify_ssl false is off and silent",
 			build: func() *CPIConfig {
 				c := discoveryPasswordCfg()
 				c.APIEndpointDiscovery = DiscoveryModeOn
 				c.VerifySSL = discoveryBoolPtr(false)
 				return c
 			},
-			want:       DiscoveryModeOff,
-			wantReason: "cannot be used with password auth while verify_ssl is false",
+			want: DiscoveryModeOff,
 		},
 		{
 			name: "row 4: auto with several endpoints is off and silent",
@@ -330,13 +371,13 @@ func TestEffectiveDiscoveryMode(t *testing.T) {
 				return c
 			},
 			want:       DiscoveryModeOff,
-			wantReason: "api_endpoint_discovery is auto and the CPI logs in with a password",
+			wantReason: discoveryReasonPassword,
 		},
 		{
 			name:       "row 5: unset mode with a password is off, with a reason",
 			build:      discoveryPasswordCfg,
 			want:       DiscoveryModeOff,
-			wantReason: "set pve.api_endpoint_discovery to on to discover with a password",
+			wantReason: discoveryReasonPassword,
 		},
 		{
 			name: "row 5: auto with a password and verify_ssl false is off, with the password reason",
@@ -346,7 +387,7 @@ func TestEffectiveDiscoveryMode(t *testing.T) {
 				return c
 			},
 			want:       DiscoveryModeOff,
-			wantReason: "logs in with a password",
+			wantReason: discoveryReasonPassword,
 		},
 		{
 			name: "row 7: auto with one endpoint and a token is on",
@@ -428,7 +469,7 @@ func TestEffectiveDiscoveryMode(t *testing.T) {
 				return c
 			},
 			want:       DiscoveryModeOff,
-			wantReason: `api_endpoint_discovery "sometimes" is not auto, on, or off`,
+			wantReason: `api_endpoint_discovery "sometimes" is not auto, on, or off, so endpoint discovery is off`,
 		},
 	}
 	for _, tc := range cases {
@@ -438,16 +479,37 @@ func TestEffectiveDiscoveryMode(t *testing.T) {
 			if got != tc.want {
 				t.Errorf("mode = %q, want %q (reason %q)", got, tc.want, reason)
 			}
-			if tc.wantReason == "" {
-				if reason != "" {
-					t.Errorf("reason = %q, want none", reason)
-				}
-				return
-			}
-			if !strings.Contains(reason, tc.wantReason) {
-				t.Errorf("reason = %q, want it to contain %q", reason, tc.wantReason)
+			if reason != tc.wantReason {
+				t.Errorf("reason = %q, want %q", reason, tc.wantReason)
 			}
 		})
+	}
+}
+
+// TestDiscoveryReasonPassword_HintIsNeverAFailingAdvice checks that the hint
+// for row 5 does not tell the operator to set on by itself, because on with a
+// password fails validation while verify_ssl is false.
+func TestDiscoveryReasonPassword_HintIsNeverAFailingAdvice(t *testing.T) {
+	t.Parallel()
+	for _, want := range []string{"use an API token (pve.api_token)", "to on with pve.verify_ssl true"} {
+		if !strings.Contains(discoveryReasonPassword, want) {
+			t.Errorf("hint %q does not contain %q", discoveryReasonPassword, want)
+		}
+	}
+	// Following the second remedy must validate, starting from the verify_ssl
+	// false config that the hint was returned for.
+	c := discoveryPasswordCfg()
+	c.VerifySSL = discoveryBoolPtr(false)
+	if _, reason := EffectiveDiscoveryMode(c); reason != discoveryReasonPassword {
+		t.Fatalf("reason = %q, want the password hint", reason)
+	}
+	c.APIEndpointDiscovery = DiscoveryModeOn
+	c.VerifySSL = discoveryBoolPtr(true)
+	if msg := discoveryErrorOf(c); msg != "" {
+		t.Errorf("following the hint produced an error: %s", msg)
+	}
+	if got, reason := EffectiveDiscoveryMode(c); got != DiscoveryModeOn || reason != "" {
+		t.Errorf("following the hint resolved to %q with reason %q, want on and none", got, reason)
 	}
 }
 
@@ -490,7 +552,12 @@ func TestEffectiveDiscoveryMode_NeverAnswersAuto(t *testing.T) {
 				for _, count := range []int{0, 1, 2} {
 					for _, looser := range bools {
 						c := discoverySweepCfg(mode, password, verify, count, looser)
-						got, _ := EffectiveDiscoveryMode(c)
+						got, reason := EffectiveDiscoveryMode(c)
+						// Only an auto row logs, so a configured on or off never does.
+						if (mode == DiscoveryModeOn || mode == DiscoveryModeOff) && reason != "" {
+							t.Errorf("mode %q password %v verify %v endpoints %d looser %v logged %q",
+								mode, password, verify, count, looser, reason)
+						}
 						if got != DiscoveryModeOn && got != DiscoveryModeOff {
 							t.Errorf("mode %q password %v verify %v endpoints %d looser %v resolved to %q",
 								mode, password, verify, count, looser, got)
@@ -581,12 +648,14 @@ func TestValidateDiscoveryMode_OnWithInheritedCredentialsUnderLooserTLSIsRejecte
 	for _, want := range []string{
 		`api_endpoint_discovery "on" cannot be used because this entry inherits the job's credentials`,
 		"give the entry its own credentials",
+		"make its TLS settings match the job's",
+		"or set pve.api_endpoint_discovery to auto or off",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error %q does not contain %q", msg, want)
 		}
 	}
-	// auto and off are not errors; auto simply resolves to off.
+	// auto and off are not errors; auto resolves to off.
 	for _, mode := range []DiscoveryMode{"", DiscoveryModeAuto, DiscoveryModeOff} {
 		c := discoveryBaseCfg()
 		c.APIEndpointDiscovery = mode
@@ -643,6 +712,7 @@ func TestValidateEndpointCacheDir_Accepts(t *testing.T) {
 		{"parent of the journal", "/var/vcap/store", "/var/vcap/store/journal"},
 		{"unrelated tree", "/tmp/pve-cache", "/var/vcap/store/journal"},
 		{"journal that is not absolute is left to its own check", "/tmp/pve-cache", "journal"},
+		{"journal at a different root", "/var/vcap/store/cache", "/var/vcap/data/journal"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -674,6 +744,14 @@ func TestValidateEndpointCacheDir_RejectsBadPaths(t *testing.T) {
 		{"doubled slash", "/var//cache", "", `must be a clean path, write "/var/cache" instead of "/var//cache"`},
 		{"dot segment", "/var/./cache", "", `must be a clean path, write "/var/cache" instead of "/var/./cache"`},
 		{"parent segment", "/var/vcap/../cache", "", `must be a clean path, write "/var/cache" instead of "/var/vcap/../cache"`},
+		{"trailing space", "/var/cache ", "", `endpoint_cache_dir must not have leading or trailing whitespace, got "/var/cache "`},
+		{"trailing space after a separator", "/var/cache/ ", "", "endpoint_cache_dir must not have leading or trailing whitespace"},
+		{"root", "/", "", "endpoint_cache_dir must not be the root directory"},
+		{"root with a journal", "/", "/var/vcap/store/journal", "endpoint_cache_dir must not be the root directory"},
+		{"journal with a trailing space", "/var/j/cache", "/var/j ",
+			`storage_allocation_journal_dir must not have leading or trailing whitespace when endpoint_cache_dir is set, got "/var/j "`},
+		{"journal with a leading space", "/var/j/cache", " /var/j",
+			"storage_allocation_journal_dir must not have leading or trailing whitespace"},
 		{"newline", "/var/cache\n/x", "", "endpoint_cache_dir must not contain control characters"},
 		{"NUL byte", "/var/cache\x00", "", "endpoint_cache_dir must not contain control characters"},
 		{"equal to the journal", "/var/vcap/store/journal", "/var/vcap/store/journal",
@@ -701,16 +779,35 @@ func TestValidateEndpointCacheDir_RejectsBadPaths(t *testing.T) {
 	}
 }
 
-func TestValidateEndpointCacheDir_RootIsAllowedAndFlagsOnlyTheJournal(t *testing.T) {
+func TestValidateEndpointCacheDir_RootIsRefusedAndAJournalAtTheRootHoldsEveryPath(t *testing.T) {
 	t.Parallel()
 	c := discoveryBaseCfg()
 	c.EndpointCacheDir = "/"
-	if msg := discoveryErrorOf(c); strings.Contains(msg, "endpoint_cache_dir") {
-		t.Errorf("the root directory is absolute and clean, yet was rejected: %s", msg)
+	if msg := discoveryErrorOf(c); !strings.Contains(msg, "endpoint_cache_dir must not be the root directory") {
+		t.Errorf("the root directory was accepted as a cache directory: %q", msg)
 	}
+	c.EndpointCacheDir = "/var/cache/pve"
 	c.StorageAllocationJournalDir = "/"
 	if msg := discoveryErrorOf(c); !strings.Contains(msg, "must not equal or sit inside") {
 		t.Errorf("a journal at the root holds every path, yet %q was accepted: %s", c.EndpointCacheDir, msg)
+	}
+}
+
+func TestValidateEndpointCacheDir_JournalWhitespaceOnlyMattersWhenTheCacheDirIsSet(t *testing.T) {
+	t.Parallel()
+	c := discoveryBaseCfg()
+	c.StorageAllocationJournalDir = "/var/j "
+	if msg := discoveryErrorOf(c); strings.Contains(msg, "whitespace") {
+		t.Errorf("a journal path alone was refused for whitespace: %s", msg)
+	}
+	c.EndpointCacheDir = "/var/j/cache"
+	if msg := discoveryErrorOf(c); !strings.Contains(msg, "storage_allocation_journal_dir must not have leading or trailing whitespace") {
+		t.Errorf("the whitespace journal evaded the containment check: %q", msg)
+	}
+	// With the whitespace gone the same pair is caught as contained.
+	c.StorageAllocationJournalDir = "/var/j"
+	if msg := discoveryErrorOf(c); !strings.Contains(msg, "must not equal or sit inside") {
+		t.Errorf("the trimmed journal does not contain the cache directory: %q", msg)
 	}
 }
 
