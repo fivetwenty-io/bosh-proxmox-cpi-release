@@ -24,6 +24,27 @@ var ErrPinMismatch = errors.New("certificate refused for this discovered endpoin
 // callback without a server certificate.
 var errNoPeerCertificate = errors.New("the server presented no certificate")
 
+// notPinnedError is the cause, or the first of two causes, when a discovered
+// endpoint presented a leaf outside its node's pin set. The walk looks for it
+// to tell a certificate that is not pinned from one whose chain failed, so the
+// pin-mismatch line says which happened.
+type notPinnedError struct {
+	pin  Pin
+	pins int
+	host string
+}
+
+func (e *notPinnedError) Error() string {
+	return fmt.Sprintf("certificate sha256 %s is not one of the %d pinned for %s", e.pin, e.pins, e.host)
+}
+
+// isNotPinned reports whether err says a discovered endpoint's leaf was
+// outside its pin set.
+func isNotPinned(err error) bool {
+	var np *notPinnedError
+	return errors.As(err, &np)
+}
+
 // Pin is the SHA-256 digest of a leaf certificate's DER encoding.
 type Pin [sha256.Size]byte
 
@@ -141,8 +162,7 @@ func (v *verifier) verifyConnection(cs tls.ConnectionState) error {
 		if pinned {
 			return nil
 		}
-		return v.refuse(cs, fmt.Errorf("certificate sha256 %s is not one of the %d pinned for %s",
-			PinOf(leaf.Raw), len(v.pins), v.host))
+		return v.refuse(cs, &notPinnedError{pin: PinOf(leaf.Raw), pins: len(v.pins), host: v.host})
 	}
 	if err := v.verifyChain(cs); err != nil {
 		return v.refuse(cs, err)
@@ -154,8 +174,8 @@ func (v *verifier) verifyConnection(cs tls.ConnectionState) error {
 		if v.candidate {
 			return v.refuse(cs, err)
 		}
-		return v.refuse(cs, fmt.Errorf("certificate sha256 %s is not one of the %d pinned for %s, and %w",
-			PinOf(leaf.Raw), len(v.pins), v.host, err))
+		return v.refuse(cs, fmt.Errorf("%w, and %w",
+			&notPinnedError{pin: PinOf(leaf.Raw), pins: len(v.pins), host: v.host}, err))
 	}
 	if !v.candidate && v.refreshDue != nil {
 		v.refreshDue()

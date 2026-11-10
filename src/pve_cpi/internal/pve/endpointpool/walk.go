@@ -63,11 +63,15 @@ func (p *Pool) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // roundTrip is RoundTrip under the given bounds. It logs a send-by refusal
-// once, whichever path refused the request.
+// once, whichever path refused the request, and tells the first-answer hook
+// when a configured endpoint answered.
 func (p *Pool) roundTrip(req *http.Request, b bounds) (*http.Response, error) {
 	resp, oc, err := p.dispatch(req, b)
 	if oc.sendBy {
 		p.logSendBy(methodOf(req), req.URL.Path)
+	}
+	if err == nil {
+		p.noteAnswer(resp, oc)
 	}
 	return resp, err
 }
@@ -185,11 +189,15 @@ func (p *Pool) sendFollowing(req *http.Request, target tetherTarget, configuredO
 //
 // A configured-only request goes to a routed host only when that host is a
 // configured endpoint, so a credential never reaches an address the operator
-// did not list. A failure that blamesEndpoint counts against one of the pool's
-// endpoints demotes it, and nothing a routed request gets ever makes an
-// endpoint active. The error is marked with MaybeSentError unless its outcome
-// is sentNever, which takes a connect-phase failure of an idempotent request
-// or the login, or of a mutation that provesNeverSent clears.
+// did not list, and no request goes to a discovered endpoint that failed its
+// pin. A failure that blamesEndpoint counts against one of the pool's
+// endpoints demotes it and is recorded as a connect-phase failure, and nothing
+// a routed request gets ever makes an endpoint active. When the request's own
+// context ends during the dial, net/http returns the context's error, which
+// carries no tag, so a cancelled request records nothing. The error is marked
+// with MaybeSentError unless its outcome is sentNever, which takes a
+// connect-phase failure of an idempotent request or the login, or of a
+// mutation that provesNeverSent clears.
 func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCloser, configuredOnly bool,
 ) (*http.Response, outcome, error) {
 	addr := target.addr
@@ -198,6 +206,12 @@ func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCl
 		closeSendBody(req, body)
 		return nil, unsent, fmt.Errorf(
 			"endpoint pool: refusing a configured-only request to %s, which is not a configured endpoint", addr)
+	}
+	if ep != nil && p.ineligibleNow(ep) {
+		closeSendBody(req, body)
+		oc := unsent
+		oc.class = string(PhasePin)
+		return nil, oc, refuseIneligible(addr)
 	}
 	o, err := p.routedTransportsAt(addr, (&url.URL{Host: target.urlHost}).Hostname())
 	if err != nil {
@@ -228,6 +242,7 @@ func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCl
 		if oc.class == string(PhaseTLSVerify) && ep.kind == KindConfigured {
 			p.alertVerify(ep, err, false)
 		}
+		p.connectFailed(ep, Phase(oc.class), err)
 	}
 	if oc.defectAlert {
 		p.alertDefect(addr, err, oc.class, false)
@@ -451,8 +466,14 @@ func (w *walker) rememberStatusHop() {
 }
 
 // try makes hop i, to ep. body is the request body rebuilt for a hop after
-// the first, and nil for the first hop or a request without a body.
+// the first, and nil for the first hop or a request without a body. A
+// discovered endpoint that failed its pin after the walk read its order gets
+// nothing, and the hop is refused before any dial.
 func (w *walker) try(i int, ep *endpoint, body io.ReadCloser) hopResult {
+	if w.p.ineligibleNow(ep) {
+		closeSendBody(w.req, body)
+		return ineligibleHop(ep)
+	}
 	ctx := w.req.Context()
 	meter := newConnectMeter(w.bounds.now)
 	clone := w.req.Clone(connectContext(httptrace.WithClientTrace(ctx, meter.trace()), w.method, w.req.URL.Path))
@@ -631,13 +652,18 @@ func (w *walker) alert(h hopResult, hopping bool) {
 }
 
 // record applies a hop's demotion and keeps its failure for the failover
-// line.
+// line. A demotion for a connect-phase failure, which only a failure the
+// endpoint caused gets, also records the failure for the mark sink and, for a
+// pin failure, takes the endpoint out of later walks.
 func (w *walker) record(h hopResult) {
 	if h.oc.demote {
 		w.p.demote(h.ep)
 	}
 	if h.oc.demote || h.oc.unreachable {
 		w.p.walk.note(h.ep, noteOf(h.resp, h.err, h.oc.class))
+	}
+	if phase := Phase(h.oc.class); h.oc.demote && phase.Valid() {
+		w.p.connectFailed(h.ep, phase, h.err)
 	}
 }
 

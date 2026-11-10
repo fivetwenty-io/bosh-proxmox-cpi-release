@@ -25,6 +25,14 @@
 //     through the pool's own tagging dialer and speaks only HTTP/1.1, and a
 //     discovered endpoint's clones accept only a certificate its pin set, or
 //     under verify_ssl true its name, vouches for.
+//   - A walk tries the configured endpoints first, then the discovered ones
+//     with the nodes a quorate cluster status reported online first, and it
+//     moves an endpoint that is demoted or carries a down mark younger than
+//     two minutes to the end. A discovered endpoint that fails its pin is left
+//     out for the rest of the process. The pool reports down marks to a
+//     MarkSink and the first answer from a configured endpoint to a
+//     FirstAnswerHook, two interfaces the endpoint cache implements, so this
+//     package never imports the cache.
 //   - A pool's tether table ties each mutation that may have been sent to the
 //     endpoint it went to, by a tether key of its method and path, or of its
 //     family for the HA, replication, and pool writers. The first mutation

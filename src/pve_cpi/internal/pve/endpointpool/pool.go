@@ -57,6 +57,15 @@ type Endpoint struct {
 	// Pins is a discovered endpoint's pin set, which must not be empty. A
 	// configured endpoint carries no pins.
 	Pins []Pin
+	// Online says a quorate /cluster/status reported a discovered endpoint's
+	// node online, which puts it ahead of the discovered endpoints without
+	// that report. A configured endpoint keeps its configured place, so it
+	// must leave Online false.
+	Online bool
+	// DownMarkedAt is when a cache down mark for the endpoint was written, or
+	// zero when it carries none. A mark younger than two minutes moves the
+	// endpoint to the end of the walk, and an older one has no effect.
+	DownMarkedAt time.Time
 }
 
 // Config is what New needs to build a pool.
@@ -68,18 +77,31 @@ type Config struct {
 	// Logger receives the pool's log lines. A nil Logger discards them.
 	Logger *log.Logger
 	// Endpoints lists the configured and discovered endpoints. The configured
-	// endpoints keep their relative order and come first, and the discovered
-	// ones keep theirs after them. The first configured endpoint is the
-	// primary, whose host:port the SDK puts on every request.
+	// endpoints keep their relative order and come first. The discovered ones
+	// follow, those whose node a quorate /cluster/status reported online
+	// first, each group in node-name order, and endpoints with the same node
+	// name keep the order they were listed in. The first configured endpoint
+	// is the primary, whose host:port the SDK puts on every request.
 	Endpoints []Endpoint
+	// MarkSink receives a down mark for an endpoint's first connect-phase
+	// failure in this process, and for a discovered endpoint's pin failure.
+	// A nil MarkSink records no marks, which is the pool of a process without
+	// an endpoint cache.
+	MarkSink MarkSink
+	// FirstAnswer is told once, after the first request that a configured
+	// endpoint answers. A nil FirstAnswer is told nothing.
+	FirstAnswer FirstAnswerHook
 
 	// headerDeadline replaces the 60-second response-header deadline. Only
 	// the package's tests set it. Zero means the default.
 	headerDeadline time.Duration
+	// clock replaces time.Now for the age of down marks and the time a new
+	// mark records. Only the package's tests set it.
+	clock func() time.Time
 }
 
-// endpoint is one endpoint of a pool. Everything but demoted is fixed at
-// construction.
+// endpoint is one endpoint of a pool. Everything but demoted, ineligible, and
+// marked is fixed at construction.
 type endpoint struct {
 	// addr is the canonical host:port, the key every comparison uses.
 	addr string
@@ -92,8 +114,17 @@ type endpoint struct {
 	pins       int
 	rank       int
 	transports *ownedTransports
+	// markedAt is when the cache down mark the endpoint was loaded with was
+	// written, or zero.
+	markedAt time.Time
 	// demoted is guarded by Pool.mu.
 	demoted bool
+	// ineligible says a discovered endpoint failed its pin in this process,
+	// so no request is sent to it again. It is guarded by Pool.mu.
+	ineligible bool
+	// marked says the pool has handed the endpoint's first connect-phase
+	// failure to the mark sink.
+	marked atomic.Bool
 }
 
 // Pool holds the ordered endpoints of one cluster, the active endpoint with
@@ -109,9 +140,21 @@ type Pool struct {
 	byAddr    map[string]*endpoint
 
 	// refreshDue is set when a discovered endpoint was accepted on its name
-	// with a certificate outside its pin set, so the next discovery through a
-	// configured endpoint should record the new pin.
+	// with a certificate outside its pin set, or failed its pin, so the next
+	// discovery through a configured endpoint should record the new pin.
 	refreshDue atomic.Bool
+
+	// now is the clock for down marks.
+	now func() time.Time
+	// sink and firstAnswer are the cache's hooks, and either may be nil.
+	sink        MarkSink
+	firstAnswer FirstAnswerHook
+	// answered says a configured endpoint has answered a request, so
+	// firstAnswer has been told.
+	answered atomic.Bool
+	// startAway is set when a down mark made the pool start on an endpoint
+	// other than the first in preference order.
+	startAway *StartAway
 
 	mu sync.Mutex
 	// active is where the next walk starts.
@@ -131,7 +174,12 @@ type Pool struct {
 // New builds a pool. It refuses a base transport that checkBase refuses, an
 // empty endpoint list, a list without a configured endpoint, an address that
 // is not a valid host:port, an address listed twice, an unknown kind, a
-// configured endpoint with pins, and a discovered endpoint without them.
+// configured endpoint with pins or with Online set, and a discovered endpoint
+// without pins.
+//
+// The pool starts on the first endpoint of the walk order, so a process whose
+// first configured endpoint carries a down mark younger than two minutes
+// starts on the next endpoint without one, and StartedAway reports it.
 //
 // A pool of more than one endpoint gives each endpoint's idempotent clone the
 // 60-second response-header deadline. A pool of one endpoint keeps today's
@@ -150,13 +198,20 @@ func New(cfg Config) (*Pool, error) {
 		return nil, err
 	}
 
+	now := cfg.clock
+	if now == nil {
+		now = time.Now
+	}
 	p := &Pool{
-		logger:    logger,
-		base:      base,
-		verifySSL: base.TLSClientConfig == nil || !base.TLSClientConfig.InsecureSkipVerify,
-		endpoints: make([]*endpoint, 0, len(eps)),
-		byAddr:    make(map[string]*endpoint, len(eps)),
-		routed:    make(map[string]*ownedTransports),
+		logger:      logger,
+		base:        base,
+		verifySSL:   base.TLSClientConfig == nil || !base.TLSClientConfig.InsecureSkipVerify,
+		endpoints:   make([]*endpoint, 0, len(eps)),
+		byAddr:      make(map[string]*endpoint, len(eps)),
+		routed:      make(map[string]*ownedTransports),
+		now:         now,
+		sink:        cfg.MarkSink,
+		firstAnswer: cfg.FirstAnswer,
 	}
 	headerDeadline := time.Duration(0)
 	if len(eps) > 1 {
@@ -168,6 +223,7 @@ func New(cfg Config) (*Pool, error) {
 	for i, in := range eps {
 		ep := &endpoint{
 			addr: in.Address, urlHost: in.urlHost, kind: in.Kind, node: in.Node, pins: len(in.Pins), rank: i,
+			markedAt: in.DownMarkedAt,
 		}
 		spec := transportSpec{addr: in.Address, serverName: hostOf(in.urlHost), headerDeadline: headerDeadline}
 		if in.Kind == KindDiscovered {
@@ -183,7 +239,7 @@ func New(cfg Config) (*Pool, error) {
 		p.endpoints = append(p.endpoints, ep)
 		p.byAddr[ep.addr] = ep
 	}
-	p.active = p.endpoints[0]
+	p.startOnPreferred()
 	p.logger.Debug(p.describe())
 	return p, nil
 }
@@ -197,7 +253,7 @@ type orderedEndpoint struct {
 
 // orderEndpoints validates the endpoints, canonicalizes their addresses, and
 // returns the configured ones in their order followed by the discovered ones
-// in theirs.
+// in the order sortDiscovered gives.
 func orderEndpoints(in []Endpoint) ([]orderedEndpoint, error) {
 	if len(in) == 0 {
 		return nil, errors.New("endpoint pool: no endpoints")
@@ -223,6 +279,10 @@ func orderEndpoints(in []Endpoint) ([]orderedEndpoint, error) {
 				return nil, fmt.Errorf("endpoint pool: configured endpoint %s carries pins, and a configured "+
 					"endpoint follows the operator's TLS settings", addr)
 			}
+			if ep.Online {
+				return nil, fmt.Errorf("endpoint pool: configured endpoint %s is marked online, and a configured "+
+					"endpoint keeps its configured place", addr)
+			}
 			configured = append(configured, ep)
 		case KindDiscovered:
 			if len(ep.Pins) == 0 {
@@ -237,6 +297,7 @@ func orderEndpoints(in []Endpoint) ([]orderedEndpoint, error) {
 	if len(configured) == 0 {
 		return nil, errors.New("endpoint pool: no configured endpoint")
 	}
+	sortDiscovered(discovered)
 	return append(configured, discovered...), nil
 }
 
@@ -265,8 +326,9 @@ func (p *Pool) describe() string {
 func (p *Pool) Len() int { return len(p.endpoints) }
 
 // RefreshDue reports whether a discovered endpoint was accepted on its name
-// with a certificate outside its pin set in this process, so the next
-// discovery through a configured endpoint should run and record the new pin.
+// with a certificate outside its pin set in this process, or failed its pin,
+// so the next discovery through a configured endpoint should run and record
+// the new pin.
 func (p *Pool) RefreshDue() bool { return p.refreshDue.Load() }
 
 func (p *Pool) markRefreshDue() { p.refreshDue.Store(true) }
@@ -306,24 +368,26 @@ func (p *Pool) current() (*endpoint, uint64) {
 }
 
 // walkOrder returns the endpoints a walk tries, in order, and the current
-// generation. The endpoints that are not demoted come first in preference
-// order, and the demoted ones follow in theirs, so a demotion only reorders
-// and never removes an endpoint. The active endpoint leads unless it is
-// demoted. With configuredOnly, only the configured endpoints are returned,
-// which is the order for a ticket login and for a request with the
-// configured-only marker.
+// generation. The endpoints that are neither demoted nor carrying a down mark
+// younger than two minutes come first in preference order, and the rest
+// follow in theirs, so a demotion or a mark only reorders and never removes an
+// endpoint. The active endpoint leads unless it is demoted. A discovered
+// endpoint that failed its pin in this process is left out. With
+// configuredOnly, only the configured endpoints are returned, which is the
+// order for a ticket login and for a request with the configured-only marker.
 func (p *Pool) walkOrder(configuredOnly bool) ([]*endpoint, uint64) {
+	now := p.now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	order := make([]*endpoint, 0, len(p.endpoints))
 	var lead *endpoint
-	if !p.active.demoted && (!configuredOnly || p.active.kind == KindConfigured) {
+	if !p.active.demoted && eligibleLocked(p.active, configuredOnly) {
 		lead = p.active
 		order = append(order, lead)
 	}
-	for _, demoted := range []bool{false, true} {
+	for _, back := range []bool{false, true} {
 		for _, ep := range p.endpoints {
-			if ep == lead || ep.demoted != demoted || (configuredOnly && ep.kind != KindConfigured) {
+			if ep == lead || !eligibleLocked(ep, configuredOnly) || atBackLocked(ep, now) != back {
 				continue
 			}
 			order = append(order, ep)
@@ -351,13 +415,15 @@ func (p *Pool) demotedNow(ep *endpoint) bool {
 // generation gen. When gen is still current, ep becomes active, its demotion
 // is cleared, and the generation goes up if the active endpoint changed. A
 // stale success changes nothing, so a slow request that started on an
-// endpoint before a failover cannot make that endpoint active again. It
-// reports whether the success was applied and, when it moved the active
-// endpoint, the endpoint that was active before, which is nil otherwise.
+// endpoint before a failover cannot make that endpoint active again, and
+// neither does a success on a discovered endpoint that failed its pin while
+// the request was in flight. It reports whether the success was applied and,
+// when it moved the active endpoint, the endpoint that was active before,
+// which is nil otherwise.
 func (p *Pool) promote(ep *endpoint, gen uint64) (*endpoint, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if gen != p.generation {
+	if gen != p.generation || ep.ineligible {
 		return nil, false
 	}
 	ep.demoted = false
@@ -378,24 +444,14 @@ func (p *Pool) promote(ep *endpoint, gen uint64) (*endpoint, bool) {
 // endpoint did not change. A pool of one endpoint, or a stale generation,
 // leaves the active endpoint where it is.
 func (p *Pool) advance(from *endpoint, gen uint64) *endpoint {
+	now := p.now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	from.demoted = true
 	if p.active != from || gen != p.generation {
 		return nil
 	}
-	var next *endpoint
-	for _, demoted := range []bool{false, true} {
-		for _, ep := range p.endpoints {
-			if ep != from && ep.demoted == demoted {
-				next = ep
-				break
-			}
-		}
-		if next != nil {
-			break
-		}
-	}
+	next := preferredLocked(p.endpoints, now, from)
 	if next == nil {
 		return nil
 	}
