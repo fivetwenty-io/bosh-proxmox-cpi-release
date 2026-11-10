@@ -12,8 +12,8 @@ const (
 	MaxPinsPerNode = 3
 	// MaxOtherMarks is the most down marks a merge keeps for endpoints other
 	// than the configured ones, which are the discovered nodes and the pool's
-	// cold-start candidates. With every configured endpoint's mark beside
-	// them, the file stays under its size cap however large the pool grows.
+	// cold-start candidates. A merge also drops the oldest marks of any
+	// endpoint when the file would pass its size cap.
 	MaxOtherMarks = 64
 
 	// MarkTTL is how long a down mark counts. A mark that is this old or older

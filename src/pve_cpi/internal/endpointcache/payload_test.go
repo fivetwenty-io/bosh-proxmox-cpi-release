@@ -34,16 +34,15 @@ func payloadCluster(observed time.Time) ClusterIdentity {
 	}
 }
 
-// payloadDiscovery returns a valid discovery section of nodes, taken just
+// payloadDiscovery returns a valid discovery section with no nodes, taken just
 // before payloadNow.
-func payloadDiscovery(nodes ...DiscoveredNode) DiscoverySection {
+func payloadDiscovery() DiscoverySection {
 	at := payloadNow.Add(-5 * time.Minute)
 	return DiscoverySection{
 		DiscoveredAt:     at,
 		NextRefreshAfter: at.Add(time.Hour),
 		Outcome:          OutcomeOK,
 		Quorate:          true,
-		Nodes:            nodes,
 	}
 }
 

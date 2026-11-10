@@ -2,6 +2,7 @@ package endpointcache
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -132,7 +133,9 @@ type Stored struct {
 // old, and drops marks for endpoints the pool no longer holds, which are the
 // key's endpoints, the nodes of the merged file, and change.Pool. It keeps the
 // mark of every configured endpoint and at most MaxOtherMarks others, newest
-// first. It replaces the node list only with change.Result, and a change
+// first, and when the payload would still marshal past the file's size cap,
+// the oldest marks go next, configured endpoints' included, so no write fails
+// for its size. It replaces the node list only with change.Result, and a change
 // without one writes the stored discovery section back as it was read, so a
 // record a reader drops for its time or its address is hidden and never
 // erased. It keeps a stored hint that passes every other check even when the
@@ -211,6 +214,9 @@ func merge(state storedState, key Key, change Change, now time.Time) (*Payload, 
 	next.Marks = mergeMarks(next.Marks, change.Marks, now, &drops)
 	pruneMarks(next, change.Pool)
 	capMarks(next)
+	if err := trimMarksToSize(next); err != nil {
+		return nil, nil, err
+	}
 	if stored == nil && next.empty() {
 		return nil, drops, nil
 	}
@@ -373,15 +379,70 @@ func capMarks(p *Payload) {
 	if len(others) <= MaxOtherMarks {
 		return
 	}
-	slices.SortFunc(others, func(a, b string) int {
-		if order := p.Marks[b].DownAt.Compare(p.Marks[a].DownAt); order != 0 {
-			return order
-		}
-		return strings.Compare(a, b)
-	})
+	slices.SortFunc(others, markOrder(p.Marks))
 	for _, endpoint := range others[MaxOtherMarks:] {
 		delete(p.Marks, endpoint)
 	}
+}
+
+// markOrder sorts endpoints by the time of their mark, newest first. Two marks
+// with one time sort by endpoint name.
+func markOrder(marks map[string]DownMark) func(a, b string) int {
+	return func(a, b string) int {
+		if order := marks[b].DownAt.Compare(marks[a].DownAt); order != 0 {
+			return order
+		}
+		return strings.Compare(a, b)
+	}
+}
+
+// envelopeMargin is what the file's envelope adds to the marshaled payload,
+// rounded up. The envelope is {"version":1,"hmac_sha256":"<64 hex>","payload":
+// ...}, which is 105 bytes around the payload, and a test checks the margin
+// against a written file.
+const envelopeMargin = 128
+
+// trimMarksToSize drops marks, oldest first, until the file the payload
+// marshals into fits maxFileBytes, so a write never fails for its size. The
+// mark cap bounds the other marks, but the config allows 16 endpoints of up to
+// 253 characters each, and their place in the key and their marks alone can
+// outgrow the file. A configured endpoint's mark is dropped like any other,
+// and it comes back with the next failure. Marks are the only part the merge
+// can shed, and the bounds on nodes, pins, and the key keep the rest under the
+// limit. The size is the marshaled payload, which is the bytes the store
+// writes, plus envelopeMargin.
+func trimMarksToSize(p *Payload) error {
+	size, err := payloadSize(p)
+	if err != nil {
+		return err
+	}
+	if size+envelopeMargin <= maxFileBytes || len(p.Marks) == 0 {
+		return nil
+	}
+	oldestLast := make([]string, 0, len(p.Marks))
+	for endpoint := range p.Marks {
+		oldestLast = append(oldestLast, endpoint)
+	}
+	slices.SortFunc(oldestLast, markOrder(p.Marks))
+	for i := len(oldestLast) - 1; i >= 0 && size+envelopeMargin > maxFileBytes; i-- {
+		delete(p.Marks, oldestLast[i])
+		if size, err = payloadSize(p); err != nil {
+			return err
+		}
+	}
+	if len(p.Marks) == 0 {
+		p.Marks = nil
+	}
+	return nil
+}
+
+// payloadSize returns the length of p as the store marshals it.
+func payloadSize(p *Payload) (int, error) {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return 0, fmt.Errorf("%s: marshal payload: %w", cacheLabel, err)
+	}
+	return len(data), nil
 }
 
 // ReadPayload reads the store's file and returns the payload a reader may use.
