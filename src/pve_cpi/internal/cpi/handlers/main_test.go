@@ -1,6 +1,7 @@
 package handlers_test
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
@@ -19,7 +20,19 @@ import (
 //
 // It also turns off the allocation journal's fsyncs, which dominate the
 // journal-backed tests here. The journal's own tests keep them on.
+//
+// It also gives the test binary its own temporary directory, because a client
+// built from a token and one host chooses its endpoint cache under it.
 func TestMain(m *testing.M) {
+	tmp, err := os.MkdirTemp("", "handlers-tests-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "handlers tests: make a temporary directory: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Setenv("TMPDIR", tmp); err != nil {
+		fmt.Fprintf(os.Stderr, "handlers tests: set TMPDIR: %v\n", err)
+		os.Exit(1)
+	}
 	restore := handlers.SetTemplateCacheRecheckDelay(0)
 	restoreSync := aj.SetFileSyncForTest(false)
 	// The parker and anti-affinity locks pause after every create. The tests
@@ -33,5 +46,6 @@ func TestMain(m *testing.M) {
 	restoreGrace()
 	restoreSync()
 	restore()
+	_ = os.RemoveAll(tmp)
 	os.Exit(code)
 }

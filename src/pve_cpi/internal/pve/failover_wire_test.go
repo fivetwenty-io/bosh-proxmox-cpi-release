@@ -74,11 +74,12 @@ func (l *tetherLab) config(servers ...*pvetest.Server) *config.CPIConfig {
 	verify := true
 	host, port := servers[0].HostPort()
 	cfg := &config.CPIConfig{
-		Host:         host,
-		Port:         port,
-		APIToken:     "root@pam!test=tok-tether",
-		VerifySSL:    &verify,
-		PVECACertPEM: string(l.ca.CertPEM()),
+		Host:                 host,
+		Port:                 port,
+		APIToken:             "root@pam!test=tok-tether",
+		APIEndpointDiscovery: config.DiscoveryModeOff,
+		VerifySSL:            &verify,
+		PVECACertPEM:         string(l.ca.CertPEM()),
 	}
 	for _, s := range servers {
 		cfg.Endpoints = append(cfg.Endpoints, s.Addr)

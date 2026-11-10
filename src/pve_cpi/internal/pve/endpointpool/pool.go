@@ -350,6 +350,13 @@ func (p *Pool) describe() string {
 // Len returns the number of configured and discovered endpoints.
 func (p *Pool) Len() int { return len(p.endpoints) }
 
+// HeaderDeadline returns the response-header deadline the pool gives an
+// idempotent request, which is 60 seconds for a pool of more than one endpoint
+// and zero for a pool of one.
+func (p *Pool) HeaderDeadline() time.Duration {
+	return p.endpoints[0].transports.idempotent.ResponseHeaderTimeout
+}
+
 // RefreshDue reports whether a discovered endpoint was accepted on its name
 // with a certificate outside its pin set in this process, or failed its pin,
 // so the next discovery through a configured endpoint should run and record

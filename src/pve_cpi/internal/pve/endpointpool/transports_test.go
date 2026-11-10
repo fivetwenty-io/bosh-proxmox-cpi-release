@@ -557,6 +557,22 @@ func TestHeaderDeadlineDependsOnPoolSize(t *testing.T) {
 	}
 }
 
+// HeaderDeadline reports what the pool gave its idempotent clones, so the
+// client's tests can see the deadline without reaching into the pool.
+func TestHeaderDeadlineAccessor(t *testing.T) {
+	one := newPool(t, Config{Base: baseFor(nil, nil), Endpoints: []Endpoint{configured("pve1:8006")}})
+	if got := one.HeaderDeadline(); got != 0 {
+		t.Errorf("a pool of one endpoint: HeaderDeadline = %s, want 0", got)
+	}
+	two := newPool(t, Config{
+		Base:      baseFor(nil, nil),
+		Endpoints: []Endpoint{configured("pve1:8006"), discovered("pve2:8006", Pin{2})},
+	})
+	if got := two.HeaderDeadline(); got != defaultHeaderDeadline {
+		t.Errorf("a pool of two endpoints: HeaderDeadline = %s, want %s", got, defaultHeaderDeadline)
+	}
+}
+
 // A candidate's clones use the 5-second dial and 10-second handshake caps,
 // and a cap only ever shortens the base transport's own limit.
 func TestConnectCaps(t *testing.T) {

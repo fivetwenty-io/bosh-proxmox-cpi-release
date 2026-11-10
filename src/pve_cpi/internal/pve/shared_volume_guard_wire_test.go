@@ -66,10 +66,11 @@ func guardWireCfg(t *testing.T, s *guardWireStub) *config.CPIConfig {
 	t.Helper()
 	host, port := hostPort(t, s.server.URL)
 	return &config.CPIConfig{
-		Host:      host,
-		Port:      port,
-		APIToken:  "root@pam!test=tok-wire",
-		VerifySSL: boolPtr(false),
+		Host:                 host,
+		Port:                 port,
+		APIToken:             "root@pam!test=tok-wire",
+		APIEndpointDiscovery: config.DiscoveryModeOff,
+		VerifySSL:            boolPtr(false),
 	}
 }
 

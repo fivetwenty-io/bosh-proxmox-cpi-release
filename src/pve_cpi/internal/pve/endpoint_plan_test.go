@@ -136,7 +136,9 @@ func TestPlanEndpoints(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			cfg := &config.CPIConfig{Host: tc.host, Port: tc.port, Endpoints: tc.endpoints}
+			cfg := &config.CPIConfig{
+				Host: tc.host, Port: tc.port, Endpoints: tc.endpoints, APIEndpointDiscovery: config.DiscoveryModeOff,
+			}
 			opts := buildTransportOpts(cfg)
 			plan, err := planEndpoints(cfg, opts, tc.source)
 			if tc.wantErr != "" {
@@ -172,18 +174,62 @@ func TestPlanEndpoints(t *testing.T) {
 	}
 }
 
-// The empty source is the one newClient uses, and it must add nothing and
-// leave discovery off for every config.
+// The empty source is the one the plan starts from, and it must add nothing.
 func TestNoDiscoveredEndpointsAddsNothing(t *testing.T) {
 	t.Parallel()
 	if got := (noDiscoveredEndpoints{}).DiscoveredEndpoints(); len(got) != 0 {
 		t.Errorf("DiscoveredEndpoints = %v, want none", got)
 	}
 	var _ discoveredEndpointSource = noDiscoveredEndpoints{}
-	on := true
-	cfg := &config.CPIConfig{Host: "pve1.example.com", NodeEndpointsDiscovery: &on}
-	if endpointDiscoveryOn(cfg) || endpointDiscoveryOn(nil) {
-		t.Error("the effective endpoint discovery mode must be off")
+}
+
+// The config alone decides whether discovery is on for the plan, by the mode
+// table's rows that need no filesystem. A nil config and an unvalidated mode
+// stay off, because discovery must never start from a config nobody validated.
+func TestEndpointDiscoveryOnFollowsTheModeTable(t *testing.T) {
+	t.Parallel()
+	off := false
+	cases := []struct {
+		name string
+		cfg  *config.CPIConfig
+		want bool
+	}{
+		{"nil config", nil, false},
+		{"one endpoint, a token, auto", &config.CPIConfig{Host: "a", APIToken: "u@pve!t=s"}, true},
+		{"one endpoint, a password, auto", &config.CPIConfig{Host: "a", Password: "p"}, false},
+		{
+			"two endpoints, a token, auto",
+			&config.CPIConfig{Host: "a", APIToken: "u@pve!t=s", Endpoints: []string{"a:8006", "b:8006"}}, false,
+		},
+		{
+			"two endpoints, a token, on",
+			&config.CPIConfig{
+				Host: "a", APIToken: "u@pve!t=s", Endpoints: []string{"a:8006", "b:8006"},
+				APIEndpointDiscovery: config.DiscoveryModeOn,
+			}, true,
+		},
+		{
+			"a password, on, with verification",
+			&config.CPIConfig{Host: "a", Password: "p", APIEndpointDiscovery: config.DiscoveryModeOn}, true,
+		},
+		{
+			"a password, on, without verification",
+			&config.CPIConfig{
+				Host: "a", Password: "p", VerifySSL: &off, APIEndpointDiscovery: config.DiscoveryModeOn,
+			}, false,
+		},
+		{
+			"a token, off",
+			&config.CPIConfig{Host: "a", APIToken: "u@pve!t=s", APIEndpointDiscovery: config.DiscoveryModeOff}, false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := endpointDiscoveryOn(tc.cfg); got != tc.want {
+				t.Errorf("endpointDiscoveryOn = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -205,8 +251,32 @@ func TestEndpointPlanDiscoveryOn(t *testing.T) {
 	}
 }
 
-// wiringConfig is a token-auth config for wireEndpoints whose list holds
-// endpoints, all on the default port.
+// A cache directory found unusable turns the effective mode off, so the
+// wrapper follows the pool alone, while the pinning input stays what the
+// config said.
+func TestEndpointPlanUnusableCacheDirectory(t *testing.T) {
+	t.Parallel()
+	plan := endpointPlan{
+		endpoints:     []endpointpool.Endpoint{{Address: "pve1.example.com:8006", Kind: endpointpool.KindConfigured}},
+		configured:    1,
+		discovery:     true,
+		cacheUnusable: true,
+	}
+	if plan.install() {
+		t.Error("install() = true with discovery on and an unusable directory, want false")
+	}
+	if !plan.failover() {
+		t.Error("failover() = false, want true: the directory must not change the pinning input")
+	}
+	plan.endpoints = append(plan.endpoints, endpointpool.Endpoint{Address: "pve2.example.com:8006"})
+	if !plan.install() {
+		t.Error("install() = false with a pool of two, want true")
+	}
+}
+
+// wiringConfig is a config for wireEndpoints whose list holds endpoints, all
+// on the default port, with discovery off so the plan decides on the list
+// alone.
 func wiringConfig(dial, handshake int, endpoints ...string) *config.CPIConfig {
 	cfg := &config.CPIConfig{
 		Host:                      "pve1.example.com",
@@ -214,12 +284,13 @@ func wiringConfig(dial, handshake int, endpoints ...string) *config.CPIConfig {
 		Endpoints:                 endpoints,
 		PVEDialTimeoutSec:         dial,
 		PVETLSHandshakeTimeoutSec: handshake,
+		APIEndpointDiscovery:      config.DiscoveryModeOff,
 	}
 	return cfg
 }
 
-// wireEndpoints is the seam through which newClient decides the timeouts and
-// the transport wrapper. A client with one endpoint keeps the options
+// wireEndpoints and apply are the seam through which newClient decides the
+// timeouts and the transport wrapper. A client with one endpoint keeps the options
 // buildTransportOpts gave it and no wrapper, and a pool of more than one gets
 // the pool timeout defaults, for each value the operator left at 0, and the
 // wrapper.
@@ -250,10 +321,11 @@ func TestWireEndpoints(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			opts, wiring, err := wireEndpoints(wiringConfig(tc.dial, tc.handshake, tc.endpoints...), log.NewNopLogger())
+			opts, wiring, err := wireEndpoints(wiringConfig(tc.dial, tc.handshake, tc.endpoints...))
 			if err != nil {
 				t.Fatalf("wireEndpoints: %v", err)
 			}
+			opts = wiring.apply(opts, log.NewNopLogger(), nil)
 			if opts.DialTimeoutSec != tc.wantDial {
 				t.Errorf("DialTimeoutSec = %d, want %d", opts.DialTimeoutSec, tc.wantDial)
 			}
@@ -273,7 +345,7 @@ func TestWireEndpoints(t *testing.T) {
 // A plan error comes back before any option is built.
 func TestWireEndpointsReturnsThePlanError(t *testing.T) {
 	t.Parallel()
-	_, wiring, err := wireEndpoints(wiringConfig(0, 0, "pve2.example.com:8006", "pve1.example.com:8006"), log.NewNopLogger())
+	_, wiring, err := wireEndpoints(wiringConfig(0, 0, "pve2.example.com:8006", "pve1.example.com:8006"))
 	if err == nil || !strings.Contains(err.Error(), "is not pve.host with pve.port") {
 		t.Fatalf("wireEndpoints error = %v, want the first-endpoint refusal", err)
 	}

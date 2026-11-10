@@ -75,9 +75,10 @@ func TestAssertNoFingerprintPinningWithRouting(t *testing.T) {
 	}
 }
 
-// The failover case has its own message. It names pve.endpoints, says that
-// fingerprint pinning cannot combine with endpoint failover, and does not
-// mention discovery or node routing, which are separate settings.
+// The failover case has its own message. It names pve.endpoints and
+// pve.api_endpoint_discovery, says that fingerprint pinning cannot combine
+// with endpoint failover, and does not mention node routing, which is a
+// separate setting.
 func TestAssertNoFingerprintPinningWithFailoverMessage(t *testing.T) {
 	t.Parallel()
 	for name, opts := range map[string]sdkclient.Options{
@@ -96,13 +97,16 @@ func TestAssertNoFingerprintPinningWithFailoverMessage(t *testing.T) {
 			text := err.Error()
 			for _, want := range []string{
 				"pve.endpoints",
+				"pve.api_endpoint_discovery",
+				"or pve.api_endpoint_discovery is on",
+				"set pve.api_endpoint_discovery to off",
 				"fingerprint pinning cannot combine with endpoint failover",
 			} {
 				if !strings.Contains(text, want) {
 					t.Errorf("message %q does not contain %q", text, want)
 				}
 			}
-			for _, banned := range []string{"discovery", "node_endpoints", "upload"} {
+			for _, banned := range []string{"node_endpoints_discovery", "node_endpoints", "upload"} {
 				if strings.Contains(text, banned) {
 					t.Errorf("message %q mentions %q", text, banned)
 				}

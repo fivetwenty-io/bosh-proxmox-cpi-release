@@ -76,11 +76,12 @@ func stubCfg(t *testing.T, stub *pveStub, operatorID string) *config.CPIConfig {
 	f := func(b bool) *bool { return &b }
 	host, port := hostPort(t, stub.server.URL)
 	return &config.CPIConfig{
-		Host:       host,
-		Port:       port,
-		APIToken:   "root@pam!test=tok-wire",
-		VerifySSL:  f(false),
-		OperatorID: operatorID,
+		Host:                 host,
+		Port:                 port,
+		APIToken:             "root@pam!test=tok-wire",
+		APIEndpointDiscovery: config.DiscoveryModeOff,
+		VerifySSL:            f(false),
+		OperatorID:           operatorID,
 	}
 }
 

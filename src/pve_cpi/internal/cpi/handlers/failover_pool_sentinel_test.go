@@ -93,6 +93,9 @@ func fwClient(t *testing.T, addrs ...string) pve.Client {
 		Endpoints: addrs,
 		APIToken:  "root@pam!test=tok-failover",
 		VerifySSL: &verify,
+		// The wire tests count the requests their fakes see, so no discovery
+		// reads may join them.
+		APIEndpointDiscovery: config.DiscoveryModeOff,
 	}, log.NewNopLogger(), nil)
 	if err != nil {
 		t.Fatalf("NewClientWithTracer: %v", err)

@@ -43,11 +43,14 @@ func (l *wireLab) client(t *testing.T, servers ...*pvetest.Server) pve.Client {
 	verify := true
 	host, port := servers[0].HostPort()
 	cfg := &config.CPIConfig{
-		Host:         host,
-		Port:         port,
-		APIToken:     "root@pam!test=tok-ha-wire",
-		VerifySSL:    &verify,
-		PVECACertPEM: string(l.ca.CertPEM()),
+		Host:      host,
+		Port:      port,
+		APIToken:  "root@pam!test=tok-ha-wire",
+		VerifySSL: &verify,
+		// The wire tests count the requests their fakes see, so no discovery
+		// reads may join them.
+		APIEndpointDiscovery: config.DiscoveryModeOff,
+		PVECACertPEM:         string(l.ca.CertPEM()),
 	}
 	for _, s := range servers {
 		cfg.Endpoints = append(cfg.Endpoints, s.Addr)

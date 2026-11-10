@@ -3,8 +3,10 @@ package pve_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -65,10 +67,13 @@ func TestNextVNI_StringEncodedTagsAreStillExcluded(t *testing.T) {
 
 func TestNextVNI_UndecodableZoneRow_WarnsAndKeepsOtherZones(t *testing.T) {
 	t.Parallel()
+	// The warning is once per zone name per process, so each run uses a zone
+	// name of its own and a repeated run (go test -count=N) still sees it.
+	broken := fmt.Sprintf("broken-%d", time.Now().UnixNano())
 	c := newVNIClientWithZones(
 		nil,
 		[]json.RawMessage{
-			json.RawMessage(`{"zone":"broken","type":"evpn","vrf-vxlan":{"nested":true}}`),
+			json.RawMessage(`{"zone":"` + broken + `","type":"evpn","vrf-vxlan":{"nested":true}}`),
 			zoneRow("evpn1", 5001, 0),
 		},
 	)
@@ -86,11 +91,11 @@ func TestNextVNI_UndecodableZoneRow_WarnsAndKeepsOtherZones(t *testing.T) {
 		if e.Level != log.LevelWarn {
 			continue
 		}
-		if e.Attrs["zone"] == "broken" {
+		if e.Attrs["zone"] == broken {
 			warned = true
 		}
 	}
 	if !warned {
-		t.Errorf("expected a Warn naming zone %q, got %+v", "broken", obs.All())
+		t.Errorf("expected a Warn naming zone %q, got %+v", broken, obs.All())
 	}
 }

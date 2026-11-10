@@ -46,6 +46,10 @@ func Drain(ctx context.Context, wait time.Duration) DrainResult {
 // describes.
 func Open() { processRegistry.Open() }
 
+// AfterDrain registers fn to run once the process registry's current run has
+// been drained, as Registry.AfterDrain describes.
+func AfterDrain(fn func()) bool { return processRegistry.AfterDrain(fn) }
+
 // Registry tracks background workers, such as a discovery refresh, a down-mark
 // write, or a cold-start hint write, so the process can wait for them briefly
 // before it exits and cancel the ones that run too long. A Registry is open
@@ -78,6 +82,9 @@ type workerRun struct {
 	nextID  uint64
 	started int
 	panics  []WorkerPanic
+	// afterDrain holds the functions AfterDrain registered and no drain has
+	// run yet.
+	afterDrain []func()
 }
 
 // worker is a running worker as its run records it.
@@ -145,6 +152,33 @@ func (r *Registry) Open() {
 	if r.run.closed {
 		r.run = newWorkerRun()
 	}
+}
+
+// AfterDrain registers fn to run when the current run's drain ends, whether
+// the drain saw every worker return or gave up on the ones still running. It
+// is how a caller that cannot see the end of the call, such as a client
+// factory, releases something the workers share, like a cache store, once the
+// drain has waited for or cancelled them. fn runs once, on the goroutine of
+// the first drain of the run to finish, after the run's context is cancelled
+// and outside the registry's lock. Functions run in the order they were
+// registered, and a panic in one is recovered so the rest still run and the
+// drain still returns. The drain reports that panic, under the name "after
+// drain", with the worker panics.
+//
+// AfterDrain returns false, without keeping fn, when the run has already been
+// closed by a drain or fn is nil. The caller then does without whatever it
+// meant to release later, because no drain is left to run it.
+func (r *Registry) AfterDrain(fn func()) bool {
+	if fn == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.run.closed {
+		return false
+	}
+	r.run.afterDrain = append(r.run.afterDrain, fn)
+	return true
 }
 
 // Go starts fn on its own goroutine as a worker of the current run. name
@@ -243,7 +277,6 @@ func (r *Registry) Drain(ctx context.Context, wait time.Duration) DrainResult {
 	run.cancel()
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	result := DrainResult{Started: run.started, Waited: time.Since(start), Panics: run.panics}
 	run.panics = nil
 	result.CancelledLevel = Level(config.DiscoveryModeAuto)
@@ -252,7 +285,32 @@ func (r *Registry) Drain(ctx context.Context, wait time.Duration) DrainResult {
 		result.CancelledLevel = max(result.CancelledLevel, Level(w.mode))
 	}
 	slices.Sort(result.Cancelled)
+	release := run.afterDrain
+	run.afterDrain = nil
+	r.mu.Unlock()
+
+	for _, fn := range release {
+		if panicked := runRelease(fn); panicked != nil {
+			result.Panics = append(result.Panics, *panicked)
+		}
+	}
 	return result
+}
+
+// releaseName names an AfterDrain function in a WorkerPanic.
+const releaseName = "after drain"
+
+// runRelease runs one AfterDrain function and returns its panic, so a defect
+// in a release never skips the others, and the drain reports it with the
+// worker panics.
+func runRelease(fn func()) (panicked *WorkerPanic) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicked = &WorkerPanic{Name: releaseName, Value: recovered, Stack: debug.Stack()}
+		}
+	}()
+	fn()
+	return nil
 }
 
 // awaitIdle waits for idle to close, for at most limit, or until ctx or runCtx

@@ -394,9 +394,10 @@ const pinningRefusalPrefix = "pve client init: "
 // pinningWithFailoverReason is why fingerprint pinning cannot combine with
 // endpoint failover.
 const pinningWithFailoverReason = "TLS fingerprint pinning cannot combine with endpoint " +
-	"failover (pve.endpoints lists more than one endpoint): the SDK's pin check is bound to pve.host, and the " +
-	"failover transport sends each request to other endpoints below that check, so pinning would be bypassed " +
-	"silently; list one endpoint in pve.endpoints or disable fingerprint pinning"
+	"failover (pve.endpoints lists more than one endpoint, or pve.api_endpoint_discovery is on, which auto turns " +
+	"on for one endpoint with an API token): the SDK's pin check is bound to pve.host, and the failover " +
+	"transport sends each request to other endpoints below that check, so pinning would be bypassed silently; " +
+	"list one endpoint in pve.endpoints and set pve.api_endpoint_discovery to off, or disable fingerprint pinning"
 
 // pinningWithNodeRoutingReason is why fingerprint pinning cannot combine with
 // direct-to-node upload routing.
@@ -411,7 +412,7 @@ const pinningWithNodeRoutingReason = "TLS fingerprint pinning is incompatible wi
 // while the client can route a request away from pve.host. That happens for
 // direct-to-node routing (nodeRouting: pve.node_endpoints or
 // pve.node_endpoints_discovery) and for endpoint failover (failover: more than
-// one endpoint in pve.endpoints). When both apply, the error names both, so an
+// one endpoint in pve.endpoints, or pve.api_endpoint_discovery on). When both apply, the error names both, so an
 // operator who fixes one does not meet the other on the next start.
 //
 // For node routing, the SDK's hostOverrideFromContext rejects any
@@ -425,7 +426,7 @@ const pinningWithNodeRoutingReason = "TLS fingerprint pinning is incompatible wi
 // For endpoint failover, the failover transport rewrites the request host below
 // that guard, and the SDK's pin check is bound to pve.host alone, so pinning
 // would be bypassed silently on every other endpoint. The refusal has its own
-// reason, which names pve.endpoints.
+// reason, which names pve.endpoints and pve.api_endpoint_discovery.
 //
 // No current CPIConfig property sets any of these Options fields — this
 // guards the invariant documented at node_endpoints.go's UploadContext
@@ -494,7 +495,7 @@ func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (
 		return nil, cpierrors.Cloud("pve client init: one of api_token or password is required")
 	}
 
-	opts, wiring, wireErr := wireEndpoints(cfg, logger)
+	opts, wiring, wireErr := wireEndpoints(cfg)
 	if wireErr != nil {
 		return nil, wireErr
 	}
@@ -562,6 +563,17 @@ func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (
 		return nil, assertErr
 	}
 
+	// The cache is read after every check that needs the config alone, so a
+	// config that is refused above never touches the filesystem.
+	cache := openEndpointCache(cfg, &wiring.plan, logger)
+	built := false
+	defer func() {
+		if !built {
+			cache.release()
+		}
+	}()
+	opts = wiring.apply(opts, logger, cache)
+
 	raw, err := sdkclient.NewClient(opts)
 	if wiring.poolErr != nil {
 		return nil, cpierrors.Wrap(wiring.poolErr, "pve client init: build the endpoint pool")
@@ -577,6 +589,24 @@ func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (
 	// v3.2.10, so no vendor patch is required.
 	raw.SetHeader("User-Agent", buildUserAgent(cfg))
 
+	client := newSDKClient(raw, cfg, logger, tracer)
+	if cache != nil {
+		// The worker sends its reads through an untraced client, so the
+		// background refresh adds no spans to the call's trace.
+		reads := client
+		if tracer != nil {
+			reads = newSDKClient(raw, cfg, logger, nil)
+		}
+		cache.bind(reads, wiring.pool)
+	}
+	logStartedAway(wiring.pool, logger)
+	built = true
+	return client, nil
+}
+
+// newSDKClient assembles the services of a Client on raw. tracer == nil means
+// no tracing.
+func newSDKClient(raw sdkclient.Client, cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) *sdkClient {
 	qemuSvc := qemu.New(raw)
 	storageSvc := storage.New(raw)
 	tasksSvc := tasks.New(raw)
@@ -613,5 +643,5 @@ func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (
 		clusterSvc:        clusterSvc,
 		clusterStorageSvc: clusterStorageSvc,
 		poolsSvc:          poolsSvc,
-	}, nil
+	}
 }

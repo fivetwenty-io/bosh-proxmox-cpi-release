@@ -284,10 +284,11 @@ func newPoolStubClient(t *testing.T, mux *http.ServeMux) pve.Client {
 
 	host, port := hostPort(t, server.URL)
 	cfg := &config.CPIConfig{
-		Host:      host,
-		Port:      port,
-		APIToken:  "root@pam!test=tok-pool",
-		VerifySSL: boolPtr(false),
+		Host:                 host,
+		Port:                 port,
+		APIToken:             "root@pam!test=tok-pool",
+		APIEndpointDiscovery: config.DiscoveryModeOff,
+		VerifySSL:            boolPtr(false),
 	}
 	c, err := pve.NewClientWithTracer(cfg, log.NewNopLogger(), nil)
 	if err != nil {

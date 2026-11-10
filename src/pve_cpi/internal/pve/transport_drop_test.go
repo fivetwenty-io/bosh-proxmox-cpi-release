@@ -172,11 +172,12 @@ func dropWireClient(t *testing.T, ca *pvetest.CA, servers ...*pvetest.Server) pv
 	verify := true
 	host, port := servers[0].HostPort()
 	cfg := &config.CPIConfig{
-		Host:         host,
-		Port:         port,
-		APIToken:     "root@pam!test=tok-drop",
-		VerifySSL:    &verify,
-		PVECACertPEM: string(ca.CertPEM()),
+		Host:                 host,
+		Port:                 port,
+		APIToken:             "root@pam!test=tok-drop",
+		APIEndpointDiscovery: config.DiscoveryModeOff,
+		VerifySSL:            &verify,
+		PVECACertPEM:         string(ca.CertPEM()),
 	}
 	for _, s := range servers {
 		cfg.Endpoints = append(cfg.Endpoints, s.Addr)

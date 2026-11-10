@@ -127,7 +127,19 @@ func makeExecCmd(ctx context.Context, bin string, args ...string) *exec.Cmd {
 // process exits. The binary is built into os.MkdirTemp("", "bosh-proxmox-cpi-bin-*")
 // and reused across every test in this package (see buildOnce); t.TempDir is
 // not usable because its lifetime is bound to a single *testing.T.
+//
+// It also gives the test binary its own temporary directory, because a client
+// built from a token and one host chooses its endpoint cache under it.
 func TestMain(m *testing.M) {
+	tmp, err := os.MkdirTemp("", "c")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cpi tests: make a temporary directory: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Setenv("TMPDIR", tmp); err != nil {
+		fmt.Fprintf(os.Stderr, "cpi tests: set TMPDIR: %v\n", err)
+		os.Exit(1)
+	}
 	// The allocation journal's fsyncs dominate the journal-backed CLI tests;
 	// the journal's own tests keep them on.
 	restoreSync := aj.SetFileSyncForTest(false)
@@ -143,5 +155,6 @@ func TestMain(m *testing.M) {
 	if bin != "" {
 		_ = os.RemoveAll(filepath.Dir(bin))
 	}
+	_ = os.RemoveAll(tmp)
 	os.Exit(code)
 }

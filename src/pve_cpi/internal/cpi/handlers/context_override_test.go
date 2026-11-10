@@ -1229,6 +1229,9 @@ func TestWithRequestOverrides_SecondClusterNeverReceivesJobCredentials(t *testin
 		base.User, base.Realm = wireJobUser, wireJobRealm
 		base.Password, base.APIToken = "", wireJobToken
 		base.PVECACertPEM = clusterA.caPEM()
+		// The recording servers must see only the requests under test, so no
+		// discovery reads may join them.
+		base.APIEndpointDiscovery = config.DiscoveryModeOff
 
 		factory := func(cfg *config.CPIConfig, l *log.Logger) (pve.Client, error) {
 			return pve.NewClientWithTracer(cfg, l, nil)

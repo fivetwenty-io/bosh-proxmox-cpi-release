@@ -128,10 +128,11 @@ func deadWireEndpoint(t *testing.T) *wireEndpoint {
 func wireConfig(list ...*wireEndpoint) *config.CPIConfig {
 	verify := false
 	cfg := &config.CPIConfig{
-		Host:      list[0].host,
-		Port:      list[0].port,
-		APIToken:  "root@pam!test=tok-wire",
-		VerifySSL: &verify,
+		Host:                 list[0].host,
+		Port:                 list[0].port,
+		APIToken:             "root@pam!test=tok-wire",
+		APIEndpointDiscovery: config.DiscoveryModeOff,
+		VerifySSL:            &verify,
 	}
 	for _, e := range list {
 		cfg.Endpoints = append(cfg.Endpoints, e.address())

@@ -10,9 +10,17 @@ import (
 	"testing"
 )
 
+// provisionTemp returns a fresh directory with its symlinks resolved. The name
+// is short on purpose, because the journal's error text is cut at a fixed
+// length and the tests check the end of it.
 func provisionTemp(t *testing.T) string {
 	t.Helper()
-	p, err := filepath.EvalSymlinks(t.TempDir())
+	dir, err := os.MkdirTemp("", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	p, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
