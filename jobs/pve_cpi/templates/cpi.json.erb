@@ -726,7 +726,7 @@
         out << bs << named[ch]
       elsif cp < 0x20 || cp == 0x7f
         out << format("%sx%02x", bs, cp)
-      elsif ch.match?(/\A[\p{L}\p{M}\p{N}\p{P}\p{S} ]\z/)
+      elsif ch.match?(/\A[\p{L}\p{M}\p{N}\p{P}\p{S} ]\z/u)
         out << ch
       elsif cp < 0x10000
         out << format("%su%04x", bs, cp)
@@ -782,7 +782,7 @@
     next if dir.nil?
     raise "pve.endpoint_cache_dir must be a string" unless dir.is_a?(String)
     next if dir.empty?
-    raise "endpoint_cache_dir must not contain control characters" if dir.match?(/\p{Cc}/)
+    raise "endpoint_cache_dir must not contain control characters" if dir.match?(/\p{Cc}/u)
     raise "endpoint_cache_dir must be an absolute path, got #{go_quote.call(dir)}" unless dir.start_with?("/")
     if dir.match?(/\A[[:space:]]|[[:space:]]\z/)
       raise "endpoint_cache_dir must not have leading or trailing whitespace, got #{go_quote.call(dir)}"
