@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -50,7 +51,7 @@ func newHADeleteFixture(t *testing.T, scene *HADeleteScene, motionSec int) *haDe
 		Config:     &config.CPIConfig{HA: &config.HAConfig{MotionWaitSec: &motionSec}},
 		PVE:        newHASceneClient(scene),
 		Logger:     logger,
-		HAEpisodes: &ha.EpisodeStore{Override: cache, Now: clock.now},
+		HAEpisodes: &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: cache}, Now: clock.now},
 	}
 	return &haDeleteFixture{scene: scene, deps: deps, clock: clock, logs: logs, logger: logger, cache: cache}
 }
@@ -698,7 +699,7 @@ func TestHaMotionWaitDefaults(t *testing.T) {
 	if opts := haHealthOptions(Deps{}); len(opts.MaintenanceTags) != 0 {
 		t.Fatal("nil config has no maintenance tags")
 	}
-	if haEpisodes(Deps{}) == nil {
+	if haEpisodes(Deps{}, nil) == nil {
 		t.Fatal("the default episode store must not be nil")
 	}
 	if err := sleepOrDone(t.Context(), 0); err != nil {

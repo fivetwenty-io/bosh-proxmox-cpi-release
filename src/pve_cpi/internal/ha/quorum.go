@@ -31,19 +31,19 @@ type QDevice struct {
 	// Read is true when the QDevice endpoint answered. When it is false the
 	// profile cannot say whether a QDevice exists, so it counts none and gives
 	// no QDevice advice.
-	Read bool
+	Read bool `json:"read"`
 
 	// ReadErr says why the endpoint could not be read.
-	ReadErr string
+	ReadErr string `json:"read_err"`
 
 	// Configured is true when a QDevice is configured.
-	Configured bool
+	Configured bool `json:"configured"`
 
 	// Votes is the number of votes the QDevice carries when it is connected.
-	Votes int
+	Votes int `json:"votes"`
 
 	// Status is the connection state of a configured QDevice.
-	Status QDeviceStatus
+	Status QDeviceStatus `json:"status"`
 }
 
 // participatingVotes returns the QDevice's votes that count right now.

@@ -103,54 +103,58 @@ type NodeRef struct {
 	Online bool
 }
 
-// NodeSlowFacts holds the slow-changing facts of one node.
+// NodeSlowFacts holds the slow-changing facts of one node. The JSON tags are
+// the profile cache file's schema, so any change to them, or to the fields of
+// the types SlowFacts holds, bumps profileCacheVersion.
 type NodeSlowFacts struct {
 	// Probed is false when the node was offline and so was not asked.
-	Probed bool
+	Probed bool `json:"probed"`
 
 	// Version is the pve-manager version, such as 9.2.4, or empty when it could
 	// not be read. VersionErr says why.
-	Version    string
-	VersionErr string
+	Version    string `json:"version"`
+	VersionErr string `json:"version_err"`
 
 	// CPU is the node's CPU model and flags, and CPUErr says why they are
 	// unknown when the status could not be read.
-	CPU    CPUInfo
-	CPUErr string
+	CPU    CPUInfo `json:"cpu"`
+	CPUErr string  `json:"cpu_err"`
 }
 
 // SlowFacts are the cluster facts that change slowly: versions, CPU models,
 // the configured votes, the QDevice's configuration, the token's privileges,
 // and the storage definitions. A cache stores exactly this struct. It never
-// holds node health, watchdog answers, or the QDevice's connection status.
+// holds node health, watchdog answers, or the QDevice's connection status. The
+// JSON tags are the profile cache file's schema, so any change to them, or to
+// the fields of the types this struct holds, bumps profileCacheVersion.
 type SlowFacts struct {
 	// Nodes maps a node name to its version and CPU.
-	Nodes map[string]NodeSlowFacts
+	Nodes map[string]NodeSlowFacts `json:"nodes"`
 
 	// RulesSupported is true when GET /cluster/ha/rules answered.
-	RulesSupported bool
-	RulesErr       string
+	RulesSupported bool   `json:"rules_supported"`
+	RulesErr       string `json:"rules_err"`
 
 	// ConfigVotes maps a node name to its configured quorum_votes. It is nil
 	// when ConfigVotesErr is set.
-	ConfigVotes    map[string]int
-	ConfigVotesErr string
+	ConfigVotes    map[string]int `json:"config_votes"`
+	ConfigVotesErr string         `json:"config_votes_err"`
 
 	// QDevice is the QDevice's configuration. Its Status is the status at the
 	// time of the probe, and Resolve refreshes it when the facts are cached.
-	QDevice QDevice
+	QDevice QDevice `json:"qdevice"`
 
 	// SysConsole is true when the token holds Sys.Console on /. VMReplicate is
 	// true when it holds VM.Replicate on /vms with propagation. PermissionsErr
 	// says why either could not be read.
-	SysConsole     bool
-	VMReplicate    bool
-	PermissionsErr string
+	SysConsole     bool   `json:"sys_console"`
+	VMReplicate    bool   `json:"vm_replicate"`
+	PermissionsErr string `json:"permissions_err"`
 
 	// Storages holds the storage definitions, and StoragesErr says why they
 	// could not be read.
-	Storages    []pve.StorageInfo
-	StoragesErr string
+	Storages    []pve.StorageInfo `json:"storages"`
+	StoragesErr string            `json:"storages_err"`
 
 	// Cached is set by a cache when it returns stored facts, so that Resolve
 	// knows the QDevice status is stale. It is never stored.

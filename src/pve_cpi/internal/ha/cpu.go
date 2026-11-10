@@ -12,14 +12,14 @@ type CPUInfo struct {
 	// Known is true when the node's status was read and named a CPU model. A
 	// node whose status cannot be read has an unknown CPU, and no CPU migration
 	// domain includes it.
-	Known bool
+	Known bool `json:"known"`
 
 	// Model is the CPU model string.
-	Model string
+	Model string `json:"model"`
 
 	// Flags are the CPU flags PVE reports, sorted and without duplicates. They
 	// are empty when PVE reports none.
-	Flags []string
+	Flags []string `json:"flags"`
 }
 
 // CPUDomain is a set of nodes that report the same CPU model and the same

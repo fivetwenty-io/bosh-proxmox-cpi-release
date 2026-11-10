@@ -4,16 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 const cacheToken = "cpi@pve!ha=11111111-2222-3333-4444-555555555555"
@@ -184,6 +189,10 @@ func TestProfileCacheACorruptFileProbesAndIsRebuilt(t *testing.T) {
 
 func TestProfileCacheAMissingDirectoryProbesEveryCall(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "absent")
+	// The temporary layer is the episode record's fallback, and the profile
+	// cache has none, so nothing may appear there.
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
 	w := three()
 	d := cachedDeps(t, w, cacheCfg(missing), newCacheClock())
 	for i := 1; i <= 2; i++ {
@@ -195,29 +204,72 @@ func TestProfileCacheAMissingDirectoryProbesEveryCall(t *testing.T) {
 	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the override directory must never be created: %v", err)
 	}
+	if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
+		t.Errorf("a missing override must not fall back to the temporary layer: %v, %v", entries, err)
+	}
+}
+
+// debugErrors returns the err attribute of every Debug line of logs whose
+// message contains message.
+func debugErrors(logs *log.Observer, message string) []string {
+	var out []string
+	for _, e := range logs.All() {
+		if e.Level == slog.LevelDebug && strings.Contains(e.Message, message) {
+			out = append(out, fmt.Sprint(e.Attrs["error"]))
+		}
+	}
+	return out
+}
+
+// otherUsersPrivateDirectory returns a directory that another user owns and
+// that grants no access to anyone else, so only the owner check can refuse it.
+func otherUsersPrivateDirectory(t *testing.T) string {
+	t.Helper()
+	for _, candidate := range []string{"/private/var/root", "/var/root", "/root"} {
+		info, err := os.Lstat(candidate)
+		if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+			continue
+		}
+		if st, ok := info.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Geteuid() {
+			return candidate
+		}
+	}
+	t.Skip("no mode 0700 directory owned by another user to refuse")
+	return ""
 }
 
 func TestProfileCacheAnUnsafeDirectoryProbesEveryCall(t *testing.T) {
-	cases := map[string]func(t *testing.T) string{
-		"mode open to others": func(t *testing.T) string {
-			dir := cacheDir(t)
-			if err := os.Chmod(dir, 0o755); err != nil { // #nosec G302 -- the test makes the directory unsafe on purpose
-				t.Fatal(err)
-			}
-			return dir
+	cases := map[string]struct {
+		build func(t *testing.T) string
+		// refusal is the text of the refusal that must have fired, which tells
+		// the mode check from the owner check.
+		refusal string
+	}{
+		"mode open to others": {
+			build: func(t *testing.T) string {
+				dir := cacheDir(t)
+				if err := os.Chmod(dir, 0o755); err != nil { // #nosec G302 -- the test makes the directory unsafe on purpose
+					t.Fatal(err)
+				}
+				return dir
+			},
+			refusal: "unsafe permissions",
 		},
-		"owned by another user": func(t *testing.T) string {
-			if os.Geteuid() == 0 {
-				t.Skip("root owns every directory it can see")
-			}
-			return "/usr"
+		"owned by another user": {
+			build:   otherUsersPrivateDirectory,
+			refusal: "unsafe ownership",
 		},
 	}
-	for name, build := range cases {
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			dir := build(t)
+			dir := tc.build(t)
 			w := three()
-			d := cachedDeps(t, w, cacheCfg(dir), newCacheClock())
+			cfg := cacheCfg(dir)
+			opts, _ := ha.ProfileCacheOptionsFromConfig(cfg, nil)
+			logger, logs := log.NewObservedLogger(slog.LevelDebug)
+			opts.Log = logger
+			opts.Now = newCacheClock().Now
+			d := w.deps(cfg).WithProfileCache(opts)
 			resolveWith(t, d)
 			resolveWith(t, d)
 			if slowProbes(w) != 2 {
@@ -225,6 +277,15 @@ func TestProfileCacheAnUnsafeDirectoryProbesEveryCall(t *testing.T) {
 			}
 			if len(profileFiles(t, dir)) != 0 {
 				t.Errorf("an unsafe directory must stay unwritten")
+			}
+			refusals := debugErrors(logs, "no usable cache directory")
+			if len(refusals) != 2 {
+				t.Fatalf("logged %d refusals, want one per call", len(refusals))
+			}
+			for _, text := range refusals {
+				if !strings.Contains(text, tc.refusal) {
+					t.Errorf("refusal %q does not say %q", text, tc.refusal)
+				}
 			}
 		})
 	}
@@ -560,5 +621,155 @@ func TestProfileCacheKeepsANewerEntryAnotherProcessWroteWhileProbing(t *testing.
 	cached, err := reader.Slow(context.Background(), nodes)
 	if err != nil || !cached.Cached || cached.Nodes["pve1"].Version != "9.2.9" {
 		t.Errorf("the newer entry must stay: %+v, %v", cached, err)
+	}
+}
+
+func TestProfileCacheLogsAReplacedSecretOnceAtWarn(t *testing.T) {
+	dir := cacheDir(t)
+	secret := filepath.Join(dir, "secret")
+	if err := os.WriteFile(secret, []byte("short"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := cacheCfg(dir)
+	opts, _ := ha.ProfileCacheOptionsFromConfig(cfg, nil)
+	logger, logs := log.NewObservedLogger(slog.LevelDebug)
+	opts.Log = logger
+	opts.Now = newCacheClock().Now
+	w := three()
+	d := w.deps(cfg).WithProfileCache(opts)
+
+	warnings := func() []log.Entry {
+		var out []log.Entry
+		for _, e := range logs.All() {
+			if e.Level == slog.LevelWarn {
+				out = append(out, e)
+			}
+		}
+		return out
+	}
+	resolveWith(t, d)
+	got := warnings()
+	if len(got) != 1 || !strings.Contains(got[0].Message, "replaced the cache directory secret") ||
+		got[0].Attrs["path"] != secret {
+		t.Fatalf("warnings %+v, want one that names the replaced secret %s", got, secret)
+	}
+	resolveWith(t, d)
+	resolveWith(t, d)
+	if len(warnings()) != 1 {
+		t.Errorf("later calls logged more warnings: %+v", warnings())
+	}
+	if data, err := os.ReadFile(secret); err != nil || len(data) != 32 { // #nosec G304 -- the test reads its own secret
+		t.Errorf("the secret must now be 32 bytes: %d bytes, %v", len(data), err)
+	}
+	if slowProbes(w) != 1 {
+		t.Errorf("the profile must cache after the secret is replaced, got %d config reads", slowProbes(w))
+	}
+}
+
+func TestProfileCacheWriteSweepsOrphanedFiles(t *testing.T) {
+	dir := cacheDir(t)
+	clock := newCacheClock()
+	touch := func(name string, age time.Duration) {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		when := clock.Now().Add(-age)
+		if err := os.Chtimes(path, when, when); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const orphan = "ha-profile-pve1.dc1.example.com-0123456789abcdef.json"
+	const orphanLock = "ha-profile-pve1.dc1.example.com-0123456789abcdef.lock"
+	const recent = "ha-profile-pve1.dc1.example.com-fedcba9876543210.json"
+	const staleTemp = ".tmp-0123456789abcdef0123456789abcdef"
+	touch(orphan, 31*24*time.Hour)
+	touch(orphanLock, 31*24*time.Hour)
+	touch(recent, 29*24*time.Hour)
+	touch(staleTemp, 2*time.Hour)
+
+	w := three()
+	d := cachedDeps(t, w, cacheCfg(dir), clock)
+	resolveWith(t, d)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	have := map[string]bool{}
+	for _, e := range entries {
+		have[e.Name()] = true
+	}
+	for _, gone := range []string{orphan, orphanLock, staleTemp} {
+		if have[gone] {
+			t.Errorf("%s survived the write's sweep", gone)
+		}
+	}
+	if !have[recent] {
+		t.Errorf("the recent profile file %s was swept", recent)
+	}
+	files := profileFiles(t, dir)
+	if len(files) != 2 {
+		t.Errorf("profile files %v, want the new one and the recent one", files)
+	}
+	// A call that answers from the cache writes nothing and so sweeps nothing.
+	touch(orphan, 31*24*time.Hour)
+	resolveWith(t, d)
+	if _, err := os.Lstat(filepath.Join(dir, orphan)); err != nil {
+		t.Errorf("a call served from the cache must not sweep: %v", err)
+	}
+}
+
+func TestProfileCacheMessagesCallTheFileTheHAProfileCache(t *testing.T) {
+	dir := cacheDir(t)
+	cfg := cacheCfg(dir)
+	opts, _ := ha.ProfileCacheOptionsFromConfig(cfg, nil)
+	logger, logs := log.NewObservedLogger(slog.LevelDebug)
+	opts.Log = logger
+	opts.Now = newCacheClock().Now
+	w := three()
+	d := w.deps(cfg).WithProfileCache(opts)
+	resolveWith(t, d)
+	path := filepath.Join(dir, profileFiles(t, dir)[0])
+
+	if err := os.WriteFile(path, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolveWith(t, d)
+	if err := os.Chmod(path, 0o644); err != nil { // #nosec G302 -- the test opens the mode on purpose
+		t.Fatal(err)
+	}
+	resolveWith(t, d)
+
+	unusable := debugErrors(logs, "stored file not usable")
+	if len(unusable) != 2 {
+		t.Fatalf("logged %d unusable-file lines, want 2", len(unusable))
+	}
+	for i, want := range []string{"invalid file", "unsafe permissions"} {
+		if !strings.Contains(unusable[i], "HA profile cache") || strings.Contains(unusable[i], "endpoint cache") ||
+			!strings.Contains(unusable[i], want) {
+			t.Errorf("line %d err %q, want it to name the HA profile cache and say %q", i, unusable[i], want)
+		}
+	}
+	for _, e := range logs.All() {
+		if strings.Contains(e.Message, "endpoint cache") {
+			t.Errorf("message %q calls the profile file the endpoint cache", e.Message)
+		}
+	}
+}
+
+func TestProfileCacheOptionsCarryTheDirectoryOptionsFromTheConfig(t *testing.T) {
+	cfg := cacheCfg("/var/vcap/store/director/pve_cpi-endpoint-cache")
+	cfg.StorageAllocationJournalDir = "/var/vcap/store/director/pve_cpi-journal"
+	opts, ok := ha.ProfileCacheOptionsFromConfig(cfg, nil)
+	if !ok {
+		t.Fatal("the entry must key a cache")
+	}
+	if want := endpointcache.OptionsFor(cfg); opts.Dir != want {
+		t.Errorf("Dir = %+v, want what OptionsFor builds, %+v", opts.Dir, want)
+	}
+	if opts.Dir.JournalDir != cfg.StorageAllocationJournalDir {
+		t.Errorf("the journal directory did not reach the cache: %+v", opts.Dir)
 	}
 }

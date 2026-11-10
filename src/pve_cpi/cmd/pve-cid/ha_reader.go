@@ -109,12 +109,17 @@ func (r *pveHAReader) Profile(ctx context.Context) (*ha.Profile, error) {
 	if err := r.ready(); err != nil {
 		return nil, err
 	}
-	deps := ha.DepsFromClient(r.client, r.cfg, r.logger)
-	// The doctor reports what the cluster says now, so it reads every fact
-	// live instead of from the profile cache.
+	return ha.Resolve(ctx, doctorHADeps(r.client, r.cfg, r.logger))
+}
+
+// doctorHADeps builds the inputs of the doctor's profile. The doctor reports
+// what the cluster says now, so it reads every fact live instead of from the
+// profile cache, and it probes in mode off too.
+func doctorHADeps(client pve.Client, cfg *config.CPIConfig, logger *log.Logger) ha.Deps {
+	deps := ha.DepsFromClient(client, cfg, logger)
 	deps.Slow = nil
 	deps.ProbeWhenOff = true
-	return ha.Resolve(ctx, deps)
+	return deps
 }
 
 func (r *pveHAReader) Resources(ctx context.Context) ([]HAResourceRow, error) {

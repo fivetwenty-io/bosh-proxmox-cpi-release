@@ -93,6 +93,11 @@ type Store struct {
 	logger         *log.Logger
 	configuredMode config.DiscoveryMode
 	secretReplaced bool
+
+	// invalid, keyMismatch, and unsupported are the file's read failures. The
+	// endpoint cache file uses the package's own sentinels, and another kind of
+	// file uses ones that print its name and match them under errors.Is.
+	invalid, keyMismatch, unsupported error
 }
 
 // OpenStore opens the store for cfg on root, the cache directory that Resolve
@@ -125,13 +130,11 @@ func OpenStore(ctx context.Context, root *os.Root, cfg KeyConfig, credential str
 }
 
 // openStoreOfKind is OpenStore for a file kind that kindFor has already
-// accepted or that a test supplies.
+// accepted or that a test supplies. Its root is not nil, because OpenStore
+// checks that first and the test that calls it passes an opened directory.
 func openStoreOfKind(
 	ctx context.Context, root *os.Root, cfg KeyConfig, credential string, opts StoreOptions, kind fileKind,
 ) (*Store, error) {
-	if root == nil {
-		return nil, fmt.Errorf("%s: no cache directory", cacheLabel)
-	}
 	if err := checkKeyInputs(cfg, credential); err != nil {
 		return nil, errors.Join(err, root.Close())
 	}
@@ -152,7 +155,21 @@ func openStoreOfKind(
 		logger = log.NewNopLogger()
 	}
 	policy := cachePrivatePolicy
-	policy.Corrupt = ErrFileInvalid
+	policy.Label = kind.name
+	if kind != endpointKind {
+		// The file's refusals read with its own name and still match the
+		// endpoint cache's causes under errors.Is.
+		policy.Ownership = privatefile.Sentinel(kind.name+": unsafe ownership", errCacheOwnership)
+		policy.Mode = privatefile.Sentinel(kind.name+": unsafe permissions", errCacheMode)
+		policy.FileType = privatefile.Sentinel(kind.name+": unsafe file type", errCacheFileType)
+	}
+	invalid, keyMismatch, unsupported := ErrFileInvalid, ErrKeyMismatch, ErrUnsupportedVersion
+	if kind != endpointKind {
+		invalid = privatefile.Sentinel(kind.name+": invalid file", ErrFileInvalid)
+		keyMismatch = privatefile.Sentinel(kind.name+": file key does not match", ErrKeyMismatch)
+		unsupported = privatefile.Sentinel(kind.name+": unsupported file version", ErrUnsupportedVersion)
+	}
+	policy.Corrupt = invalid
 	policy.MaxBytes = maxFileBytes
 	policy.IntegrityKey = integrityKey
 	policy.Integrity = hmacIntegrity(macKey)
@@ -169,6 +186,9 @@ func openStoreOfKind(
 		logger:         logger,
 		configuredMode: opts.ConfiguredMode,
 		secretReplaced: outcome == secretReplaced,
+		invalid:        invalid,
+		keyMismatch:    keyMismatch,
+		unsupported:    unsupported,
 	}, nil
 }
 
@@ -207,6 +227,25 @@ func hmacIntegrity(key keyMaterial) func([]byte) string {
 	}
 }
 
+// label is what the store's messages call its file.
+func (s *Store) label() string {
+	if s == nil || s.kind.name == "" {
+		return cacheLabel
+	}
+	return s.kind.name
+}
+
+// Sweep removes what the cache left behind in the store's directory, exactly
+// as the package's Sweep does, and leaves the store's own file and lock alone.
+// A writer calls it from the merge function it hands to Update, where it holds
+// that lock, which is the cadence the endpoint cache's UpdatePayload sweeps at.
+func (s *Store) Sweep(now time.Time) SweepResult {
+	if s == nil || s.root == nil {
+		return SweepResult{Err: fmt.Errorf("%s: store is closed", s.label())}
+	}
+	return Sweep(s.root, now, s.kind.lockName(s.key), s.name)
+}
+
 // Key returns the store's key, which every payload it reads or writes must
 // hold.
 func (s *Store) Key() Key {
@@ -238,17 +277,17 @@ func (s *Store) Close() error {
 // private-file refusal, and the caller runs without a cache.
 func (s *Store) Read(out any) error {
 	if s == nil || s.root == nil {
-		return fmt.Errorf("%s: store is closed", cacheLabel)
+		return fmt.Errorf("%s: store is closed", s.label())
 	}
 	if v := reflect.ValueOf(out); !v.IsValid() || v.Kind() != reflect.Pointer || v.IsNil() {
-		return fmt.Errorf("%s: read needs a non-nil pointer, got %T", cacheLabel, out)
+		return fmt.Errorf("%s: read needs a non-nil pointer, got %T", s.label(), out)
 	}
 	env, err := s.policy.ReadEnvelope(s.root, s.name)
 	if err != nil {
 		return err
 	}
 	if env.Version != s.kind.version {
-		return fmt.Errorf("%w: version %d", ErrUnsupportedVersion, env.Version)
+		return fmt.Errorf("%w: version %d", s.unsupported, env.Version)
 	}
 	var payload json.RawMessage
 	if err := s.policy.DecodeEnvelope(env, s.kind.version, &payload); err != nil {
@@ -258,7 +297,7 @@ func (s *Store) Read(out any) error {
 		return err
 	}
 	if err := privatefile.StrictDecode(payload, out); err != nil {
-		return fmt.Errorf("%w: malformed payload: %w", ErrFileInvalid, err)
+		return fmt.Errorf("%w: malformed payload: %w", s.invalid, err)
 	}
 	return nil
 }
@@ -270,10 +309,10 @@ func (s *Store) checkKey(payload json.RawMessage) error {
 		Key *Key `json:"key"`
 	}
 	if err := json.Unmarshal(payload, &head); err != nil {
-		return fmt.Errorf("%w: malformed payload: %w", ErrFileInvalid, err)
+		return fmt.Errorf("%w: malformed payload: %w", s.invalid, err)
 	}
 	if head.Key == nil || !head.Key.Equal(s.key) {
-		return ErrKeyMismatch
+		return s.keyMismatch
 	}
 	return nil
 }
@@ -304,14 +343,14 @@ func (s *Store) checkKey(payload json.RawMessage) error {
 // errors, because the store logs only the skipped write.
 func Update[T any](ctx context.Context, s *Store, merge func(current *T) (*T, error)) (written bool, err error) {
 	if s == nil || s.root == nil {
-		return false, fmt.Errorf("%s: store is closed", cacheLabel)
+		return false, fmt.Errorf("%s: store is closed", s.label())
 	}
 	if merge == nil {
-		return false, fmt.Errorf("%s: update needs a merge function", cacheLabel)
+		return false, fmt.Errorf("%s: update needs a merge function", s.label())
 	}
 	lock, err := s.lock(ctx)
 	if errors.Is(err, errLockBusy) {
-		s.logger.LogAttrs(ctx, Level(s.configuredMode), "endpoint cache lock wait expired; skipping the cache write",
+		s.logger.LogAttrs(ctx, Level(s.configuredMode), s.label()+" lock wait expired; skipping the cache write",
 			log.String("file", s.name), log.String("wait", s.lockWait.String()))
 		return false, nil
 	}
@@ -320,12 +359,12 @@ func Update[T any](ctx context.Context, s *Store, merge func(current *T) (*T, er
 	}
 	defer func() {
 		if closeErr := lock.Close(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("%s: release cache file lock: %w", cacheLabel, closeErr))
+			err = errors.Join(err, fmt.Errorf("%s: release cache file lock: %w", s.label(), closeErr))
 		}
 	}()
 
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return false, fmt.Errorf("%s: update abandoned with the caller's context: %w", cacheLabel, ctxErr)
+		return false, fmt.Errorf("%s: update abandoned with the caller's context: %w", s.label(), ctxErr)
 	}
 
 	var current *T
@@ -343,7 +382,7 @@ func Update[T any](ctx context.Context, s *Store, merge func(current *T) (*T, er
 		return false, err
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return false, fmt.Errorf("%s: write abandoned with the caller's context: %w", cacheLabel, ctxErr)
+		return false, fmt.Errorf("%s: write abandoned with the caller's context: %w", s.label(), ctxErr)
 	}
 	if err := s.write(next); err != nil {
 		return false, err
@@ -373,7 +412,7 @@ func (s *Store) lock(ctx context.Context) (*privatefile.Lock, error) {
 // caller closes a held lock when discovery ends.
 func (s *Store) TryLockDiscovery(ctx context.Context) (lock *privatefile.Lock, held bool, err error) {
 	if s == nil || s.root == nil {
-		return nil, false, fmt.Errorf("%s: store is closed", cacheLabel)
+		return nil, false, fmt.Errorf("%s: store is closed", s.label())
 	}
 	return tryHeldLock(ctx, s.root, s.kind.discoverLockName(s.key))
 }
@@ -383,10 +422,10 @@ func (s *Store) TryLockDiscovery(ctx context.Context) (lock *privatefile.Lock, h
 func (s *Store) write(value any) error {
 	payload, err := json.Marshal(value)
 	if err != nil {
-		return fmt.Errorf("%s: marshal payload: %w", cacheLabel, err)
+		return fmt.Errorf("%s: marshal payload: %w", s.label(), err)
 	}
 	if err := s.checkKey(payload); err != nil {
-		return fmt.Errorf("%s: refusing to write a payload for another key: %w", cacheLabel, err)
+		return fmt.Errorf("%s: refusing to write a payload for another key: %w", s.label(), err)
 	}
 	return s.policy.WriteEnvelope(s.root, s.name, s.kind.version, json.RawMessage(payload), s.ops)
 }

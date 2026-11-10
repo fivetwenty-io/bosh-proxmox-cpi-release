@@ -27,16 +27,20 @@ import (
 // file-content-capable storages: Path for dir-style plugins, Server+Export
 // for nfs, Server+Export (populated from the "share" field) for cifs. They
 // are used only by BackingKey — nothing else in this struct depends on them.
+//
+// The JSON tags are the HA profile cache file's schema for the storage
+// definitions it holds, so a change to them or to the fields bumps that file's
+// version.
 type StorageInfo struct {
-	Name     string
-	Type     string
-	Shared   bool
-	Disabled bool
-	Nodes    []string
-	Path     string
-	Server   string
-	Export   string
-	Content  string
+	Name     string   `json:"name"`
+	Type     string   `json:"type"`
+	Shared   bool     `json:"shared"`
+	Disabled bool     `json:"disabled"`
+	Nodes    []string `json:"nodes"`
+	Path     string   `json:"path"`
+	Server   string   `json:"server"`
+	Export   string   `json:"export"`
+	Content  string   `json:"content"`
 	// IsMountpoint reports whether the storage carries PVE's is_mountpoint
 	// flag, which tells PVE to refuse to activate the storage when its path is
 	// not a mount point. Only the absence proof in ProveVolumeAbsent reads it,
@@ -45,7 +49,7 @@ type StorageInfo struct {
 	// array that a caller cannot tell from a genuinely empty storage. The
 	// flag's value may be a mount path rather than a boolean, and nothing here
 	// needs the path, so only whether it is set survives the decode.
-	IsMountpoint bool
+	IsMountpoint bool `json:"is_mountpoint"`
 }
 
 // IsShared classifies the storage as "shared" (cluster-visible) or "local"

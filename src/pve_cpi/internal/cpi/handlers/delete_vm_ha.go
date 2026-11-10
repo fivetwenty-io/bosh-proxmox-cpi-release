@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -56,16 +57,13 @@ func haHealthOptions(deps Deps) pve.NodeHealthOptions {
 }
 
 // haEpisodes returns the store of recovery episode first observations. It sits
-// in the endpoint cache directory, which pve.endpoint_cache_dir overrides.
-func haEpisodes(deps Deps) *ha.EpisodeStore {
+// in the endpoint cache directory, which pve.endpoint_cache_dir overrides. The
+// store logs through logger when the override directory is missing.
+func haEpisodes(deps Deps, logger *log.Logger) *ha.EpisodeStore {
 	if deps.HAEpisodes != nil {
 		return deps.HAEpisodes
 	}
-	store := &ha.EpisodeStore{}
-	if deps.Config != nil {
-		store.Override = deps.Config.EndpointCacheDir
-	}
-	return store
+	return &ha.EpisodeStore{Dir: endpointcache.OptionsFor(deps.Config), Log: logger}
 }
 
 // readHADeleteState reads the normalized HA model for a delete. The delete may
@@ -313,7 +311,7 @@ func logHADeleteState(logger *log.Logger, caller string, st *pve.HAServiceState,
 // completion needs and what the operator can do instead.
 func haRecoveryGraceError(deps Deps, caller string, st *pve.HAServiceState, reason string, logger *log.Logger) error {
 	window := haMotionWait(deps)
-	ep, recErr := haEpisodes(deps).Observe(st.SID, st.UID)
+	ep, recErr := haEpisodes(deps, logger).Observe(st.SID, st.UID)
 	if recErr != nil {
 		logger.Warn(caller+": the HA recovery episode record is unavailable, so the grace window starts again",
 			log.String("sid", st.SID), log.String("uid", st.UID), log.Err(recErr))

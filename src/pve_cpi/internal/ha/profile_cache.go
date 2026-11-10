@@ -27,16 +27,22 @@ const (
 	profileCacheLabel = "pve-cpi ha-profile"
 
 	// profileCacheVersion is the profile cache file's envelope schema version.
+	// The stored facts have explicit JSON tags on SlowFacts and the types it
+	// holds, and a golden test pins the field set, so any change to those tags
+	// or fields bumps this version.
 	profileCacheVersion = 1
 )
 
 // ProfileCacheOptions says where the profile cache lives and whose facts it
 // holds.
 type ProfileCacheOptions struct {
-	// Override is pve.endpoint_cache_dir, empty when it is unset. The cache
-	// follows the endpoint cache's directory, which is this directory when it
-	// is set and the per-user temporary directory otherwise.
-	Override string
+	// Dir says where to look for the cache directory, and comes from
+	// endpointcache.OptionsFor. The cache follows the endpoint cache's
+	// directory, which is pve.endpoint_cache_dir when it is set and the
+	// per-user temporary directory otherwise. A missing override directory
+	// gives no cache, because the override is the only directory the CPI uses
+	// when it is set.
+	Dir endpointcache.DirOptions
 
 	// Key names the cluster entry. It is the endpoint cache's key input, so one
 	// entry maps to one endpoint file and one profile file.
@@ -108,7 +114,7 @@ func ProfileCacheOptionsFromConfig(cfg *config.CPIConfig, logger *log.Logger) (P
 		return ProfileCacheOptions{}, false
 	}
 	return ProfileCacheOptions{
-		Override: cfg.EndpointCacheDir,
+		Dir: endpointcache.OptionsFor(cfg),
 		Key: endpointcache.KeyConfig{
 			Endpoints: endpoints,
 			VerifySSL: cfg.VerifySSLValue(),
@@ -215,7 +221,7 @@ func (c *ProfileCache) Slow(ctx context.Context, nodes []NodeRef) (*SlowFacts, e
 // openStore opens the profile file's store, or returns nil after logging why
 // there is no cache for this call.
 func (c *ProfileCache) openStore(ctx context.Context, logger *log.Logger) *endpointcache.Store {
-	choice := endpointcache.Resolve(endpointcache.Options{Override: c.opts.Override})
+	choice := c.opts.Dir.Resolve()
 	if !choice.Usable() {
 		logger.Debug("ha profile cache: no usable cache directory; probing",
 			log.String("layer", string(choice.Layer)), log.String("path", choice.Path), log.Err(choice.Err))
@@ -231,6 +237,12 @@ func (c *ProfileCache) openStore(ctx context.Context, logger *log.Logger) *endpo
 		logger.Debug("ha profile cache: cannot open the cache; probing",
 			log.String("path", choice.Path), log.Err(err))
 		return nil
+	}
+	if path, replaced := store.SecretReplaced(); replaced {
+		// OpenStore reports a replacement only to the call that made it, so this
+		// line appears once per replacement.
+		logger.Warn("ha profile cache: replaced the cache directory secret, which had the wrong length; "+
+			"every cache file written under the old one is rebuilt", log.String("path", path))
 	}
 	return store
 }
@@ -291,6 +303,13 @@ func (c *ProfileCache) write(
 	}
 	next := &profilePayload{Key: store.Key(), StoredAtMillis: started.UnixMilli(), Facts: storable(facts)}
 	_, err := endpointcache.Update(ctx, store, func(current *profilePayload) (*profilePayload, error) {
+		// The writer holds the key's lock here, and sweeps the directory at the
+		// cadence the endpoint cache does, so profile files that a credential
+		// rotation or an endpoint list change orphaned, and temporary files that
+		// a crash left, do not stay forever.
+		if swept := store.Sweep(c.now()); swept.Err != nil {
+			logger.Debug("ha profile cache: the sweep of the cache directory failed", log.Err(swept.Err))
+		}
 		if current != nil && current.StoredAtMillis > next.StoredAtMillis &&
 			c.staleReason(current, nodes) == "" {
 			return nil, nil

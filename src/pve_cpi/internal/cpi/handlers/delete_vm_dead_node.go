@@ -227,7 +227,7 @@ func (c *deadNodeCompletion) proveExpiredFence(ctx context.Context) (bool, error
 		return false, nil
 	}
 	c.source, c.uid = st.Node, st.UID
-	ep, recErr := haEpisodes(c.deps).Observe(st.SID, st.UID)
+	ep, recErr := haEpisodes(c.deps, c.logger).Observe(st.SID, st.UID)
 	if recErr != nil {
 		c.logger.Warn(deadNodeDelete+": the HA recovery episode record is unavailable, so the dead-node "+
 			"completion waits for the grace window again", log.String("sid", st.SID), log.Err(recErr))

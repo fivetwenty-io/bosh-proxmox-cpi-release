@@ -208,28 +208,17 @@ func caDigest(pem string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// deriveKeys builds the key for cfg and the HMAC key for its file at the
-// current file version. See deriveKeysAt.
-func deriveKeys(cfg KeyConfig, dirSecret keyMaterial, credential string) (Key, keyMaterial, error) {
-	return deriveKeysAt(cfg, dirSecret, credential, fileVersion)
-}
-
-// deriveKeysAt builds the key for cfg and the HMAC key for a file of the given
-// schema version from the directory secret, the user, and the credential,
-// which is the token secret or the password. Both derivations are HKDF-SHA256
-// over the length-prefixed user followed by the length-prefixed credential,
-// with the directory secret as the salt, so neither the identifier nor a file
-// can be used to test password guesses without the secret. The HMAC key's info
-// is the versioned label followed by the 32-byte key digest, so a schema bump
-// changes the key and a file moved from another key fails its HMAC.
-func deriveKeysAt(cfg KeyConfig, dirSecret keyMaterial, credential string, version int) (Key, keyMaterial, error) {
-	return deriveKeysFor(cfg, dirSecret, credential, fileKind{label: endpointLabel, version: version})
-}
-
-// deriveKeysFor is deriveKeysAt for a file of any kind. The credential
-// identifier and the key digest do not depend on the kind, so every kind of
-// file for one entry shares one key, while the HMAC key takes the kind's label
-// and schema version, so no kind's file verifies as another's.
+// deriveKeysFor builds the key for cfg and the HMAC key for a file of the given
+// kind from the directory secret, the user, and the credential, which is the
+// token secret or the password. Both derivations are HKDF-SHA256 over the
+// length-prefixed user followed by the length-prefixed credential, with the
+// directory secret as the salt, so neither the identifier nor a file can be
+// used to test password guesses without the secret. The HMAC key's info is the
+// kind's versioned label followed by the 32-byte key digest, so a schema bump
+// changes the key and a file moved from another key fails its HMAC. The
+// credential identifier and the key digest do not depend on the kind, so every
+// kind of file for one entry shares one key, while the HMAC key takes the
+// kind's label and schema version, so no kind's file verifies as another's.
 func deriveKeysFor(cfg KeyConfig, dirSecret keyMaterial, credential string, kind fileKind) (Key, keyMaterial, error) {
 	if len(dirSecret) != secretBytes {
 		return Key{}, nil, fmt.Errorf("%w: directory secret has the wrong length", ErrInvalidKey)

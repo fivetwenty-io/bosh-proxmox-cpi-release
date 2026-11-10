@@ -20,6 +20,12 @@ const (
 
 	// maxFileLabel bounds a file kind's HMAC label.
 	maxFileLabel = 64
+
+	// defaultKindVersion is the envelope schema version of a file kind that
+	// leaves StoreOptions.Version at zero. It is a literal 1 and does not follow
+	// fileVersion, so a later bump of the endpoint cache's schema never bumps
+	// another kind's by accident.
+	defaultKindVersion = 1
 )
 
 // ErrInvalidFileKind means StoreOptions asked for a kind of cache file this
@@ -29,6 +35,11 @@ var ErrInvalidFileKind = errors.New("endpoint cache: invalid file kind")
 // knownFilePrefixes lists the name prefixes a file kind may use. The sweep
 // knows exactly these, so a file of any other kind would never be removed.
 var knownFilePrefixes = []string{HAProfilePrefix}
+
+// filePrefixNames says what to call the file of each known prefix in error and
+// log text, so a message about the HA profile file does not read as one about
+// the endpoint cache file.
+var filePrefixNames = map[string]string{HAProfilePrefix: "HA profile cache"}
 
 // fileLabelPattern is the shape of a file kind's HMAC label: lowercase words
 // of letters and digits, joined by single spaces or hyphens.
@@ -41,6 +52,9 @@ type fileKind struct {
 	// prefix starts the file's name and its lock names, and is empty for the
 	// endpoint cache file.
 	prefix string
+	// name is what error and log text calls the file: "endpoint cache" for the
+	// endpoint cache file, and "HA profile cache" for the profile file.
+	name string
 	// label starts the HKDF info of the file's HMAC key.
 	label string
 	// version is the file's envelope schema version.
@@ -48,7 +62,7 @@ type fileKind struct {
 }
 
 // endpointKind is the kind of the endpoint cache file.
-var endpointKind = fileKind{label: endpointLabel, version: fileVersion}
+var endpointKind = fileKind{name: cacheLabel, label: endpointLabel, version: fileVersion}
 
 func (k fileKind) fileName(key Key) string         { return k.prefix + key.FileName() }
 func (k fileKind) lockName(key Key) string         { return k.prefix + key.LockName() }
@@ -80,7 +94,7 @@ func kindFor(opts StoreOptions) (fileKind, error) {
 	}
 	version := opts.Version
 	if version == 0 {
-		version = fileVersion
+		version = defaultKindVersion
 	}
-	return fileKind{prefix: opts.FilePrefix, label: opts.Label, version: version}, nil
+	return fileKind{prefix: opts.FilePrefix, name: filePrefixNames[opts.FilePrefix], label: opts.Label, version: version}, nil
 }

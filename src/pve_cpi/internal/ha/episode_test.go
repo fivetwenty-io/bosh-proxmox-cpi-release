@@ -3,14 +3,18 @@ package ha_test
 import (
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/privatefile"
 )
 
@@ -26,7 +30,7 @@ func newEpisodeStore(t *testing.T) (*ha.EpisodeStore, *episodeClock, string) {
 		t.Fatal(err)
 	}
 	clk := &episodeClock{t: time.Unix(1_800_000_000, 0)}
-	return &ha.EpisodeStore{Override: dir, Now: clk.now}, clk, dir
+	return &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: dir}, Now: clk.now}, clk, dir
 }
 
 func TestEpisodeStore_FirstObservationStartsTheClockAndIsRemembered(t *testing.T) {
@@ -235,19 +239,100 @@ func TestEpisodeStore_SymlinkedRecordIsNeverTrusted(t *testing.T) {
 	}
 }
 
-func TestEpisodeStore_MissingOverrideDirectoryStillAnswers(t *testing.T) {
-	t.Parallel()
-	missing := filepath.Join(t.TempDir(), "missing-parent", "cache")
-	store := &ha.EpisodeStore{Override: missing}
-	ep, err := store.Observe("vm:101", "uid-a")
-	if !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("want an error when the override directory is missing, got %v", err)
+// temporaryCacheDir points the temporary layer at a fresh directory and
+// returns the directory the layer will make inside it.
+func temporaryCacheDir(t *testing.T) string {
+	t.Helper()
+	tmp, err := os.MkdirTemp("", "ha-episode-")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if ep.Recorded || ep.Elapsed() != 0 {
-		t.Fatal("the clock starts now when nothing can be recorded")
+	t.Cleanup(func() { _ = os.RemoveAll(tmp) })
+	t.Setenv("TMPDIR", tmp)
+	return filepath.Join(tmp, "pve_cpi-endpoint-cache."+strconv.Itoa(os.Geteuid()))
+}
+
+func TestEpisodeStore_MissingOverrideDirectoryFallsBackToTheTemporaryLayer(t *testing.T) {
+	temporary := temporaryCacheDir(t)
+	missing := filepath.Join(t.TempDir(), "missing-parent", "cache")
+	logger, logs := log.NewObservedLogger(slog.LevelDebug)
+	clk := &episodeClock{t: time.Unix(1_800_000_000, 0)}
+	store := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: missing}, Log: logger, Now: clk.now}
+
+	first, err := store.Observe("vm:101", "uid-a")
+	if err != nil {
+		t.Fatalf("a missing override must not stop the record: %v", err)
+	}
+	if first.Recorded || first.Elapsed() != 0 {
+		t.Fatalf("first observation: recorded=%v elapsed=%s", first.Recorded, first.Elapsed())
+	}
+	clk.t = clk.t.Add(7 * time.Minute)
+	second, err := store.Observe("vm:101", "uid-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Recorded || second.Elapsed() != 7*time.Minute {
+		t.Fatalf("the clock must run across calls: recorded=%v elapsed=%s, want recorded and 7m", second.Recorded, second.Elapsed())
+	}
+
+	if _, err := os.Lstat(filepath.Join(temporary, ha.EpisodeFileName)); err != nil {
+		t.Errorf("the record must sit in the temporary layer: %v", err)
 	}
 	if _, statErr := os.Stat(missing); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Errorf("the override directory must never be created: %v", statErr)
+	}
+	warns := 0
+	for _, e := range logs.All() {
+		if e.Level != slog.LevelWarn {
+			continue
+		}
+		warns++
+		if !strings.Contains(e.Message, "pve.endpoint_cache_dir does not exist") || e.Attrs["path"] != missing {
+			t.Errorf("warning %+v does not name the missing override directory %s", e, missing)
+		}
+	}
+	if warns != 2 {
+		t.Errorf("logged %d warnings for two calls, want one per call", warns)
+	}
+}
+
+func TestEpisodeStore_AnOverrideThatFailsThePrivateChecksDoesNotFallBack(t *testing.T) {
+	temporary := temporaryCacheDir(t)
+	store, clk, dir := newEpisodeStore(t)
+	logger, logs := log.NewObservedLogger(slog.LevelDebug)
+	store.Log = logger
+	if err := os.Chmod(dir, 0o755); err != nil { //nolint:gosec // the test widens the mode on purpose
+		t.Fatal(err)
+	}
+	clk.t = clk.t.Add(time.Hour)
+	ep, err := store.Observe("vm:101", "uid-a")
+	if !errors.Is(err, privatefile.ErrUnsafeMode) {
+		t.Fatalf("want the mode refusal of the override, got %v", err)
+	}
+	if ep.Recorded {
+		t.Fatal("an unsafe override must not supply a record")
+	}
+	if _, statErr := os.Lstat(temporary); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("the temporary layer was used after the override was refused: %v", statErr)
+	}
+	for _, e := range logs.All() {
+		if e.Level == slog.LevelWarn {
+			t.Errorf("an existing override logged the missing-directory warning: %+v", e)
+		}
+	}
+}
+
+func TestEpisodeStore_AMissingOverrideWithNoUsableFallbackStillAnswers(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	// The temporary directory is relative, so the fallback is refused too.
+	t.Setenv("TMPDIR", "relative")
+	store := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: missing}}
+	ep, err := store.Observe("vm:101", "uid-a")
+	if err == nil {
+		t.Fatal("want an error when neither the override nor the fallback can hold the record")
+	}
+	if ep.Recorded || ep.Elapsed() != 0 {
+		t.Fatal("the clock starts now when nothing can be recorded")
 	}
 }
 
@@ -310,9 +395,6 @@ func TestEpisodeStore_WithoutAnOverrideUsesTheTemporaryLayer(t *testing.T) {
 	if err != nil || len(matches) != 1 {
 		t.Fatalf("the record must sit in $TMPDIR/pve_cpi-endpoint-cache.<euid>: %v, %v", matches, err)
 	}
-	if (&ha.EpisodeStore{}).Now != nil {
-		t.Fatal("zero store has no clock")
-	}
 }
 
 func TestEpisodeStore_SitsBesideTheProfileCache(t *testing.T) {
@@ -321,7 +403,7 @@ func TestEpisodeStore_SitsBesideTheProfileCache(t *testing.T) {
 	w := three()
 	d := cachedDeps(t, w, cacheCfg(dir), newCacheClock())
 	resolveWith(t, d)
-	store := &ha.EpisodeStore{Override: dir}
+	store := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: dir}}
 	if _, err := store.Observe("vm:101", "uid-a"); err != nil {
 		t.Fatal(err)
 	}

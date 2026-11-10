@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/privatefile"
 )
 
@@ -52,15 +53,27 @@ var episodePolicy = privatefile.Policy{
 //
 // The record is a private file in the endpoint cache directory, which
 // endpointcache.Resolve chooses and checks. A directory or file that is
-// missing, unsafe, or unreadable, and a record that does not verify, all read
-// as no record, so the clock starts at the current observation. That only
-// delays a handover, which is the safe direction. Concurrent writers may lose
-// each other's updates for the same reason: the loser's clock restarts, and
-// nothing else changes.
+// unsafe or unreadable, and a record that does not verify, all read as no
+// record, so the clock starts at the current observation. That only delays a
+// handover, which is the safe direction. Concurrent writers may lose each
+// other's updates for the same reason: the loser's clock restarts, and nothing
+// else changes.
+//
+// A pve.endpoint_cache_dir that does not exist is the one refusal that does
+// not end the search. A record that could never be written would keep the
+// clock at zero on every call and so remove the handover rather than delay it,
+// so the store falls back to the layers after the override, logs one Warn line
+// per call that names the missing directory, and records the episode there. An
+// override that exists but fails the private checks still gives no record.
 type EpisodeStore struct {
-	// Override is pve.endpoint_cache_dir, empty when it is unset. The record
-	// sits in the same directory as the endpoint cache and the HA profile cache.
-	Override string
+	// Dir says where to look for the cache directory, and comes from
+	// endpointcache.OptionsFor. The record sits in the same directory as the
+	// endpoint cache and the HA profile cache.
+	Dir endpointcache.DirOptions
+
+	// Log receives the Warn line for a missing override directory. Nil logs
+	// nothing.
+	Log *log.Logger
 
 	// Now is the clock. Nil means time.Now.
 	Now func() time.Time
@@ -99,11 +112,28 @@ type episodeEntry struct {
 	FirstSeen int64  `json:"first_seen"`
 }
 
-func (s *EpisodeStore) override() string {
+func (s *EpisodeStore) dir() endpointcache.DirOptions {
 	if s == nil {
-		return ""
+		return endpointcache.DirOptions{}
 	}
-	return s.Override
+	return s.Dir
+}
+
+// resolve chooses the directory of the record. A missing override directory,
+// and nothing else that refuses it, falls back to the layers after the
+// override with a Warn line.
+func (s *EpisodeStore) resolve() endpointcache.Choice {
+	dir := s.dir()
+	choice := dir.Resolve()
+	if choice.Usable() || choice.Layer != endpointcache.LayerOverride || !errors.Is(choice.Err, fs.ErrNotExist) {
+		return choice
+	}
+	if s != nil && s.Log != nil {
+		s.Log.Warn("ha episode: pve.endpoint_cache_dir does not exist, so the recovery episode record uses the "+
+			"temporary cache directory instead; create the directory so the record sits beside the other cache files",
+			log.String("path", choice.Path), log.Err(choice.Err))
+	}
+	return dir.WithoutOverride().Resolve()
 }
 
 func (s *EpisodeStore) now() time.Time {
@@ -124,7 +154,7 @@ func (s *EpisodeStore) Observe(sid, uid string) (Episode, error) {
 	if strings.TrimSpace(sid) == "" || strings.TrimSpace(uid) == "" {
 		return ep, errors.New("ha episode: the service ID and uid must not be empty")
 	}
-	choice := endpointcache.Resolve(endpointcache.Options{Override: s.override()})
+	choice := s.resolve()
 	if !choice.Usable() {
 		return ep, fmt.Errorf("ha episode: %w", choice.Err)
 	}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
@@ -223,7 +224,7 @@ func newDeadNodeDelete(t *testing.T) *deadNodeDeleteFixture {
 		{"storage": "backups", "type": "dir", "content": "backup"},
 	}}
 	f.scene.OnRead = f.crmRecovery
-	f.episodes = &ha.EpisodeStore{Override: episodeCacheDir(t), Now: func() time.Time { return time.Now().Add(-time.Hour) }}
+	f.episodes = &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: episodeCacheDir(t)}, Now: func() time.Time { return time.Now().Add(-time.Hour) }}
 	if _, err := f.episodes.Observe("vm:101", "uid-101"); err != nil {
 		t.Fatal(err)
 	}
@@ -639,7 +640,7 @@ func TestDeadNodeDelete_AccessSetWithoutALiveFreshNodeKeepsDeferring(t *testing.
 // the window runs, and writes nothing.
 func TestDeadNodeDelete_GraceWindowStillRunning(t *testing.T) {
 	f := newDeadNodeDelete(t)
-	f.deps.HAEpisodes = &ha.EpisodeStore{Override: episodeCacheDir(t)}
+	f.deps.HAEpisodes = &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: episodeCacheDir(t)}}
 	requireHARetriable(t, f.run(), "grace window remain")
 	f.requireNoWrites()
 }

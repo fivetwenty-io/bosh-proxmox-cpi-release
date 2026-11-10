@@ -11,6 +11,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/privatefile"
 )
 
 // haProfileOptions is the option set the HA profile cache opens its store with.
@@ -28,6 +31,34 @@ func TestKindForDefaultsToTheEndpointCacheFile(t *testing.T) {
 	}
 	if endpointKind.prefix != "" || endpointKind.label != "pve-cpi endpoint-cache" || endpointKind.version != 1 {
 		t.Errorf("endpoint kind %+v changed the label, prefix, or version", endpointKind)
+	}
+}
+
+func TestKindForNamesTheFileAndDefaultsTheVersionToOne(t *testing.T) {
+	kind, err := kindFor(StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile"})
+	if err != nil {
+		t.Fatalf("kindFor: %v", err)
+	}
+	if kind.version != 1 {
+		t.Errorf("an unset version gave %d, want the literal 1", kind.version)
+	}
+	if defaultKindVersion != 1 {
+		t.Errorf("defaultKindVersion = %d, want 1", defaultKindVersion)
+	}
+	if kind.name != "HA profile cache" {
+		t.Errorf("name %q, want HA profile cache", kind.name)
+	}
+	if endpointKind.name != "endpoint cache" {
+		t.Errorf("endpoint kind name %q, want endpoint cache", endpointKind.name)
+	}
+}
+
+func TestEveryKnownFilePrefixHasANameThatIsNotTheEndpointCaches(t *testing.T) {
+	for _, prefix := range knownFilePrefixes {
+		name := filePrefixNames[prefix]
+		if name == "" || name == cacheLabel {
+			t.Errorf("prefix %q is named %q, want a name of its own", prefix, name)
+		}
 	}
 }
 
@@ -160,6 +191,27 @@ func TestADifferentSchemaVersionIsADifferentHMACKey(t *testing.T) {
 	if err := v2.Read(&got); !errors.Is(err, ErrUnsupportedVersion) {
 		t.Fatalf("version 2 store reading a version 1 file: %v, want ErrUnsupportedVersion", err)
 	}
+
+	// Relabel the version 1 file as version 2 so the version check passes. The
+	// version 2 store must still refuse it, because its HMAC key differs, and
+	// it must refuse it on the checksum and not on the version.
+	path := filepath.Join(dir, v1.FileName())
+	original := readStoreFile(t, path)
+	relabeled := bytes.Replace(original, []byte(`"version":1`), []byte(`"version":2`), 1)
+	if bytes.Equal(relabeled, original) {
+		t.Fatalf("the file %s carries no version member to relabel", original)
+	}
+	writeStoreFile(t, path, relabeled, 0o600)
+	got = storeTestPayload{}
+	err := v2.Read(&got)
+	if !errors.Is(err, ErrFileInvalid) || errors.Is(err, ErrUnsupportedVersion) || got.Note != "" {
+		t.Fatalf("version 2 store reading a relabeled file: %+v, %v, want an HMAC failure and not a version one", got, err)
+	}
+	// The same bytes verify under the version 1 key once the label is restored.
+	writeStoreFile(t, path, original, 0o600)
+	if err := v1.Read(&got); err != nil || got.Note != "v1" {
+		t.Fatalf("version 1 store reading its own file: %+v, %v", got, err)
+	}
 }
 
 func TestAFileOfOneKindNeverVerifiesAsTheOther(t *testing.T) {
@@ -234,4 +286,145 @@ func sameNames(a, b []string) bool {
 	slices.Sort(x)
 	slices.Sort(y)
 	return strings.Join(x, "\x00") == strings.Join(y, "\x00")
+}
+
+func TestAnHAProfileStoreNamesItselfInItsMessages(t *testing.T) {
+	dir := newStoreDir(t)
+	s := openTestStore(t, dir, storeTestCredential, haProfileOptions())
+	storePut(t, s, "profile")
+	path := filepath.Join(dir, s.FileName())
+	const name = "HA profile cache"
+	mustName := func(what string, err error) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), name) || strings.Contains(err.Error(), "endpoint cache") {
+			t.Errorf("%s: %v, want a message that names the %s and not the endpoint cache", what, err, name)
+		}
+	}
+
+	var got storeTestPayload
+	writeStoreFile(t, path, []byte("not json"), 0o600)
+	err := s.Read(&got)
+	mustName("a damaged file", err)
+	if !errors.Is(err, ErrFileInvalid) {
+		t.Errorf("a damaged file: %v, want it to match ErrFileInvalid", err)
+	}
+
+	other := s.Key()
+	other.CredentialID = "0000000000000000"
+	if err := s.policy.WriteEnvelope(s.root, s.name, s.kind.version, storeTestPayload{Key: other}, s.ops); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Read(&got)
+	mustName("a file for another key", err)
+	if !errors.Is(err, ErrKeyMismatch) || !errors.Is(err, ErrFileInvalid) {
+		t.Errorf("a file for another key: %v, want ErrKeyMismatch", err)
+	}
+
+	if err := s.policy.WriteEnvelope(s.root, s.name, s.kind.version+1, storeTestPayload{Key: s.Key()}, s.ops); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Read(&got)
+	mustName("a newer version", err)
+	if !errors.Is(err, ErrUnsupportedVersion) {
+		t.Errorf("a newer version: %v, want ErrUnsupportedVersion", err)
+	}
+
+	storePut(t, s, "again")
+	if err := os.Chmod(path, 0o644); err != nil { // #nosec G302 -- the test opens the mode on purpose
+		t.Fatal(err)
+	}
+	err = s.Read(&got)
+	mustName("an open mode", err)
+	if !errors.Is(err, privatefile.ErrUnsafeMode) || !errors.Is(err, errCacheMode) {
+		t.Errorf("an open mode: %v, want the endpoint cache's mode refusal", err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	mustName("Read on a closed store", s.Read(&got))
+	_, err = Update(context.Background(), s, func(*storeTestPayload) (*storeTestPayload, error) { return nil, nil })
+	mustName("Update on a closed store", err)
+	_, _, err = s.TryLockDiscovery(context.Background())
+	mustName("TryLockDiscovery on a closed store", err)
+
+	endpoint := openTestStore(t, newStoreDir(t), storeTestCredential, StoreOptions{})
+	if err := endpoint.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := endpoint.Read(&got); err == nil || !strings.HasPrefix(err.Error(), "endpoint cache: ") {
+		t.Errorf("the endpoint cache's message %v changed", err)
+	}
+	var none *Store
+	if err := none.Read(&got); err == nil || !strings.HasPrefix(err.Error(), "endpoint cache: ") {
+		t.Errorf("a nil store's message %v, want the endpoint cache's label", err)
+	}
+}
+
+func TestAnHAProfileStoreLogsASkippedWriteAsTheHAProfileCache(t *testing.T) {
+	dir := newStoreDir(t)
+	logger, observed := log.NewObservedLogger(log.LevelDebug)
+	opts := haProfileOptions()
+	opts.Logger = logger
+	s := openTestStore(t, dir, storeTestCredential, opts)
+	s.lockWait = 150 * time.Millisecond
+	holder := startStoreChild(t, storeChildLock, dir, storeChildLockEnv+"="+s.kind.lockName(s.Key()))
+	if got := holder.line(t); got != "locked" {
+		t.Fatalf("child said %q, want locked", got)
+	}
+	written, err := Update(context.Background(), s, func(*storeTestPayload) (*storeTestPayload, error) {
+		return &storeTestPayload{Key: s.Key()}, nil
+	})
+	if err != nil || written {
+		t.Fatalf("Update under a held lock: written %v, err %v", written, err)
+	}
+	entries := observed.All()
+	if len(entries) != 1 || entries[0].Message != "HA profile cache lock wait expired; skipping the cache write" ||
+		entries[0].Attrs["file"] != s.FileName() {
+		t.Fatalf("logged %+v, want one skip line that names the HA profile cache", entries)
+	}
+	holder.finish(t)
+}
+
+func TestStoreSweepRemovesOrphansAndKeepsItsOwnFileAndLock(t *testing.T) {
+	dir := newStoreDir(t)
+	s := openTestStore(t, dir, storeTestCredential, haProfileOptions())
+	storePut(t, s, "profile")
+	lockName := s.kind.lockName(s.Key())
+	if got := storeDirNames(t, dir); !slices.Contains(got, lockName) || !slices.Contains(got, s.FileName()) {
+		t.Fatalf("directory holds %v, want the store's file %s and lock %s", got, s.FileName(), lockName)
+	}
+	age := func(name string, by time.Duration) {
+		t.Helper()
+		when := sweepNow.Add(-by)
+		if err := os.Chtimes(filepath.Join(dir, name), when, when); err != nil {
+			t.Fatal(err)
+		}
+	}
+	age(s.FileName(), 90*24*time.Hour)
+	age(lockName, 90*24*time.Hour)
+	const orphan = "ha-profile-" + sweepBase + ".json"
+	const fresh = "ha-profile-pve9.dc1.example.com-0123456789abcdef.json"
+	sweepFile(t, dir, orphan, 40*24*time.Hour)
+	sweepFile(t, dir, fresh, time.Hour)
+	sweepFile(t, dir, sweepTemp, 2*time.Hour)
+
+	result := s.Sweep(sweepNow)
+	if result.Err != nil {
+		t.Fatalf("Sweep: %v", result.Err)
+	}
+	if !sameNames(result.Removed, []string{orphan, sweepTemp}) {
+		t.Errorf("removed %v, want the aged orphan and the old temporary file", result.Removed)
+	}
+	want := []string{secretFile, secretLockFile, s.FileName(), lockName, fresh}
+	if got := storeDirNames(t, dir); !sameNames(got, want) {
+		t.Errorf("directory holds %v, want %v", got, want)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if result := s.Sweep(sweepNow); result.Err == nil || !strings.Contains(result.Err.Error(), "HA profile cache") {
+		t.Errorf("Sweep on a closed store: %v, want an error that names the HA profile cache", result.Err)
+	}
 }
