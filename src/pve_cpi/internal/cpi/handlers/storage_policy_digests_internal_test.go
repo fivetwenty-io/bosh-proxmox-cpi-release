@@ -154,7 +154,7 @@ const overrideCacheKeyWithoutAntiAffinity = "b9c9e9ebfd4ae8db857ac6b5dd452ca674d
 func TestRequestOverrideCacheKeyIsUnchangedWithoutAntiAffinity(t *testing.T) {
 	t.Parallel()
 
-	if got := requestOverrideCacheKey(nil, policyDigestConfig(nil)); got != overrideCacheKeyWithoutAntiAffinity {
+	if got := requestOverrideCacheKey(policyDigestConfig(nil)); got != overrideCacheKeyWithoutAntiAffinity {
 		t.Fatalf("a set that declares no anti_affinity now keys %q, want %q",
 			got, overrideCacheKeyWithoutAntiAffinity)
 	}
@@ -168,7 +168,7 @@ func TestRequestOverrideCacheKeyMovesWhenAntiAffinityIsDeclared(t *testing.T) {
 
 	band := 35
 	keys := map[string]string{
-		requestOverrideCacheKey(nil, policyDigestConfig(nil)): "no anti_affinity",
+		requestOverrideCacheKey(policyDigestConfig(nil)): "no anti_affinity",
 	}
 	declared := []struct {
 		name string
@@ -182,7 +182,7 @@ func TestRequestOverrideCacheKeyMovesWhenAntiAffinityIsDeclared(t *testing.T) {
 		}},
 	}
 	for _, testCase := range declared {
-		got := requestOverrideCacheKey(nil, policyDigestConfig(testCase.anti))
+		got := requestOverrideCacheKey(policyDigestConfig(testCase.anti))
 		if owner, taken := keys[got]; taken {
 			t.Fatalf("%s keys as %s does: %q", testCase.name, owner, got)
 		}

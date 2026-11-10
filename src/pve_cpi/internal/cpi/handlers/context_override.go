@@ -220,9 +220,7 @@ func (r *RequestOverrideRuntime) cachePutOrExisting(key string, bundle *override
 }
 
 // resolve returns the cached bundle for cfg's override identity, building
-// and caching one on first use. job is the job-level config that cfg was
-// derived from, which the identity compares the discovery mode against.
-// Concurrent resolve() calls for the SAME
+// and caching one on first use. Concurrent resolve() calls for the SAME
 // identity that race a cold cache single-flight onto ONE build (see
 // buildCall/M4): the first caller becomes the "leader" and performs the
 // build; every other concurrent caller for that identity blocks on the
@@ -258,7 +256,7 @@ func (r *RequestOverrideRuntime) cachePutOrExisting(key string, bundle *override
 //   - agent.NewAgent errors (e.g. cfg.AgentMode outside cloudinit/noagent) →
 //     wrapped and returned, nothing cached, same retry-on-next-call
 //     behavior as the client-factory failure above.
-func (r *RequestOverrideRuntime) resolve(ctx context.Context, job, cfg *config.CPIConfig) (*overrideBundle, error) {
+func (r *RequestOverrideRuntime) resolve(ctx context.Context, cfg *config.CPIConfig) (*overrideBundle, error) {
 	if r == nil {
 		return nil, fmt.Errorf("cpi: RequestOverrideRuntime.resolve called on nil receiver")
 	}
@@ -266,7 +264,7 @@ func (r *RequestOverrideRuntime) resolve(ctx context.Context, job, cfg *config.C
 		return nil, fmt.Errorf("cpi: RequestOverrideRuntime: ClientFactory is not configured")
 	}
 
-	key := requestOverrideCacheKey(job, cfg)
+	key := requestOverrideCacheKey(cfg)
 
 	bundle, call, isLeader := r.acquire(key)
 	if bundle != nil {
@@ -396,17 +394,13 @@ func (r *RequestOverrideRuntime) buildBundle(cfg *config.CPIConfig) (*overrideBu
 // today, but hashing costs nothing and keeps that true even if a future
 // caller logs cache diagnostics.
 //
-// The key depends on job, the job-level config cfg was derived from, and not
-// on cfg alone. The discovery mode is hashed only when it differs from the
-// job's resolved mode, so an entry that inherits or restates the job's mode
-// keys exactly as it did before the mode could be set per entry. The same cfg
-// can therefore key differently under two job configs, and two cfgs whose
-// modes differ can share a key when each matches its own job's mode. A key is
-// comparable only among requests that share one job config, which holds
-// because one RequestOverrideRuntime serves the one job config its process was
-// started with. A caller that shares a runtime across job configs must add the
-// job's mode to the key first.
-func requestOverrideCacheKey(job, cfg *config.CPIConfig) string {
+// The key is a function of cfg alone, so it does not depend on the job config
+// cfg was derived from. The same entry applied under two job configs therefore
+// keys alike exactly when the two effective configs are alike, and the
+// effective configs differ whenever a field the key reads differs, the
+// discovery mode included. The mode is hashed unless it resolves to auto, so a
+// config with an unset or auto mode keys as it did before the mode existed.
+func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 	h := sha256.New()
 	// hash.Hash.Write never returns an error, so the Fprintf results are discarded.
 	_, _ = fmt.Fprintf(h, "host=%s\x00port=%d\x00user=%s\x00realm=%s\x00node=%s\x00",
@@ -499,12 +493,12 @@ func requestOverrideCacheKey(job, cfg *config.CPIConfig) string {
 	if len(cfg.Endpoints) > 0 {
 		_, _ = fmt.Fprintf(h, "endpoints=%q\x00", cfg.Endpoints)
 	}
-	// The discovery mode is folded in as the entry resolves it, but only when
-	// it differs from the job's resolved mode. An entry that inherits the mode,
-	// or restates it, therefore adds nothing and keys exactly as it did before
-	// the mode could be set per entry. The resolved value is hashed, so unset
-	// and an explicit auto read as one, and true reads as on.
-	if mode := cfg.DiscoveryModeValue(); mode != job.DiscoveryModeValue() {
+	// The discovery mode is folded in as the config resolves it, except for
+	// auto, the default. Unset and an explicit auto both resolve to auto and add
+	// nothing, so they key exactly as a config did before the mode existed, and
+	// true reads as on. The key then depends on the config alone, whichever job
+	// config it was derived from.
+	if mode := cfg.DiscoveryModeValue(); mode != config.DiscoveryModeAuto {
 		_, _ = fmt.Fprintf(h, "api_endpoint_discovery=%s\x00", mode)
 	}
 	// An entry that inherits the job's credentials under looser TLS discovers
@@ -719,7 +713,7 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 		)
 	}
 
-	bundle, resolveErr := d.Overrides.resolve(ctx, d.Config, effCfg)
+	bundle, resolveErr := d.Overrides.resolve(ctx, effCfg)
 	if resolveErr != nil {
 		return Deps{}, cpierrors.Retriable(
 			"cpi: context override: build PVE connection for overridden host %q: %s",

@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"slices"
 	"testing"
@@ -79,7 +80,7 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		"set-a": {Names: []string{"nfs-a"}, Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}},
 	}
 	base.ApplyDefaults()
-	baseKey := requestOverrideCacheKey(base, base)
+	baseKey := requestOverrideCacheKey(base)
 
 	// One distinct override value per field. Values only need to differ from
 	// base and coerce cleanly; enum validity is enforced later by Validate(),
@@ -191,7 +192,7 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 
 	boundBase := *base
 	boundBase.EphemeralStorageSet = "set-a"
-	boundBaseKey := requestOverrideCacheKey(&boundBase, &boundBase)
+	boundBaseKey := requestOverrideCacheKey(&boundBase)
 
 	for _, field := range config.ContextOverrideFieldOrderForTest() {
 		val, ok := overrideValues[field]
@@ -217,7 +218,7 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 				field, applied, unknown)
 			continue
 		}
-		if key := requestOverrideCacheKey(fieldBase, eff); key == fieldBaseKey {
+		if key := requestOverrideCacheKey(eff); key == fieldBaseKey {
 			t.Errorf("overriding %q did not change requestOverrideCacheKey — two requests with different effective configs would share one cached bundle", field)
 		}
 	}
@@ -234,12 +235,12 @@ func TestRequestOverrideCacheKey_CACertSeparatesSameHost(t *testing.T) {
 	b.PVECACertPEM = selfSignedCAPEMForCacheKeyTest(t)
 	c := *a
 	c.PVECACertPEM = selfSignedCAPEMForCacheKeyTest(t)
-	keyA, keyB, keyC := requestOverrideCacheKey(nil, a), requestOverrideCacheKey(nil, &b), requestOverrideCacheKey(nil, &c)
+	keyA, keyB, keyC := requestOverrideCacheKey(a), requestOverrideCacheKey(&b), requestOverrideCacheKey(&c)
 	if keyA == keyB || keyB == keyC || keyA == keyC {
 		t.Error("configs that differ only in pve_ca_cert must key differently")
 	}
 	same := *a
-	if requestOverrideCacheKey(nil, &same) != keyA {
+	if requestOverrideCacheKey(&same) != keyA {
 		t.Error("the cache key must be deterministic")
 	}
 }
@@ -253,20 +254,20 @@ func TestRequestOverrideCacheKey_EndpointListSeparatesConfigs(t *testing.T) {
 	mk := func(list ...string) *config.CPIConfig {
 		return &config.CPIConfig{Host: "pve-a.example", Port: 8006, User: "cpi", Password: "pw-one", Endpoints: list}
 	}
-	none := requestOverrideCacheKey(nil, mk())
-	if empty := requestOverrideCacheKey(nil, &config.CPIConfig{
+	none := requestOverrideCacheKey(mk())
+	if empty := requestOverrideCacheKey(&config.CPIConfig{
 		Host: "pve-a.example", Port: 8006, User: "cpi", Password: "pw-one", Endpoints: []string{},
 	}); empty != none {
 		t.Error("an empty list must key like no list")
 	}
 	keys := map[string]string{
 		"no list":        none,
-		"one":            requestOverrideCacheKey(nil, mk("pve-a.example:8006")),
-		"two":            requestOverrideCacheKey(nil, mk("pve-a.example:8006", "pve-b.example:8006")),
-		"two, other":     requestOverrideCacheKey(nil, mk("pve-a.example:8006", "pve-c.example:8006")),
-		"two, reordered": requestOverrideCacheKey(nil, mk("pve-b.example:8006", "pve-a.example:8006")),
-		"joined":         requestOverrideCacheKey(nil, mk("pve-a.example:8006,pve-b.example:8006")),
-		"three": requestOverrideCacheKey(nil, mk("pve-a.example:8006", "pve-b.example:8006",
+		"one":            requestOverrideCacheKey(mk("pve-a.example:8006")),
+		"two":            requestOverrideCacheKey(mk("pve-a.example:8006", "pve-b.example:8006")),
+		"two, other":     requestOverrideCacheKey(mk("pve-a.example:8006", "pve-c.example:8006")),
+		"two, reordered": requestOverrideCacheKey(mk("pve-b.example:8006", "pve-a.example:8006")),
+		"joined":         requestOverrideCacheKey(mk("pve-a.example:8006,pve-b.example:8006")),
+		"three": requestOverrideCacheKey(mk("pve-a.example:8006", "pve-b.example:8006",
 			"pve-c.example:8006")),
 	}
 	seen := map[string]string{}
@@ -276,7 +277,7 @@ func TestRequestOverrideCacheKey_EndpointListSeparatesConfigs(t *testing.T) {
 		}
 		seen[key] = name
 	}
-	if requestOverrideCacheKey(nil, mk("pve-a.example:8006", "pve-b.example:8006")) != keys["two"] {
+	if requestOverrideCacheKey(mk("pve-a.example:8006", "pve-b.example:8006")) != keys["two"] {
 		t.Error("the cache key must be deterministic")
 	}
 }
@@ -293,11 +294,11 @@ func TestRequestOverrideCacheKey_NoListKeysAsBeforeTheListExisted(t *testing.T) 
 		Host: "pve-a.example", Port: 8006, User: "cpi", Realm: "pam", Node: "pve1", Password: "pw-one",
 		VMStorage: "local-lvm", DiskStorage: "local-lvm", NetworkBridge: "vmbr0",
 	}
-	if got := requestOverrideCacheKey(nil, cfg); got != golden {
+	if got := requestOverrideCacheKey(cfg); got != golden {
 		t.Errorf("key = %s, want %s", got, golden)
 	}
 	cfg.Endpoints = []string{}
-	if got := requestOverrideCacheKey(nil, cfg); got != golden {
+	if got := requestOverrideCacheKey(cfg); got != golden {
 		t.Errorf("key with an empty list = %s, want %s", got, golden)
 	}
 }
@@ -323,180 +324,198 @@ func discoveryEffectiveJob() *config.CPIConfig {
 	}
 }
 
-// TestRequestOverrideCacheKey_DiscoveryModeSeparatesConfigs asserts that two
-// configs whose discovery modes differ from the job's in different ways never
-// share a cached bundle, and that a mode equal to the job's, however it is
-// written, adds nothing to the key.
+// TestRequestOverrideCacheKey_DiscoveryModeSeparatesConfigs asserts that
+// configs with different resolved discovery modes never share a cached
+// bundle, and that an unset mode and an explicit auto, which resolve alike,
+// share one.
 func TestRequestOverrideCacheKey_DiscoveryModeSeparatesConfigs(t *testing.T) {
 	t.Parallel()
-	job := discoveryKeyConfig("")
 	keys := map[string]string{
-		"unset": requestOverrideCacheKey(job, discoveryKeyConfig("")),
-		"on":    requestOverrideCacheKey(job, discoveryKeyConfig(config.DiscoveryModeOn)),
-		"off":   requestOverrideCacheKey(job, discoveryKeyConfig(config.DiscoveryModeOff)),
+		"unset": requestOverrideCacheKey(discoveryKeyConfig("")),
+		"auto":  requestOverrideCacheKey(discoveryKeyConfig(config.DiscoveryModeAuto)),
+		"on":    requestOverrideCacheKey(discoveryKeyConfig(config.DiscoveryModeOn)),
+		"off":   requestOverrideCacheKey(discoveryKeyConfig(config.DiscoveryModeOff)),
+	}
+	if keys["unset"] != keys["auto"] {
+		t.Error("an explicit auto must share the unset bundle")
 	}
 	seen := map[string]string{}
-	for name, key := range keys {
-		if prev, dup := seen[key]; dup {
+	for _, name := range []string{"auto", "on", "off"} {
+		if prev, dup := seen[keys[name]]; dup {
 			t.Errorf("%q and %q share a cache key", prev, name)
 		}
-		seen[key] = name
+		seen[keys[name]] = name
 	}
-	if requestOverrideCacheKey(job, discoveryKeyConfig(config.DiscoveryModeOn)) != keys["on"] {
+	if requestOverrideCacheKey(discoveryKeyConfig(config.DiscoveryModeOn)) != keys["on"] {
 		t.Error("the cache key must be deterministic")
-	}
-	if got := requestOverrideCacheKey(job, discoveryKeyConfig(config.DiscoveryModeAuto)); got != keys["unset"] {
-		t.Error("an explicit auto under an unset job mode must share the unset bundle")
 	}
 	// The cache directory is process-level and never part of a bundle's identity.
 	withDir := discoveryKeyConfig(config.DiscoveryModeOn)
 	withDir.EndpointCacheDir = "/var/vcap/store/pve_cpi/endpoint-cache"
-	if requestOverrideCacheKey(job, withDir) != keys["on"] {
+	if requestOverrideCacheKey(withDir) != keys["on"] {
 		t.Error("the cache directory must not change the bundle key")
 	}
 }
 
-// TestRequestOverrideCacheKey_DiscoveryModeIsComparedWithTheJobs asserts the
-// rule from every side. A mode equal to the job's resolved mode adds nothing,
-// whether it is unset, written as auto, or inherited. A mode that differs
-// splits the bundle, whichever way the job's mode is written.
-func TestRequestOverrideCacheKey_DiscoveryModeIsComparedWithTheJobs(t *testing.T) {
+// TestRequestOverrideCacheKey_DiscoveryModeMatrix drives the mode matrix
+// through ApplyContextOverrides under every job mode. An entry that names a
+// mode shares the key of an entry that names none exactly when the two resolve
+// to the same mode, whichever way the job's mode is written, and the booleans
+// read as on and off.
+func TestRequestOverrideCacheKey_DiscoveryModeMatrix(t *testing.T) {
 	t.Parallel()
 	const (
 		auto = config.DiscoveryModeAuto
 		on   = config.DiscoveryModeOn
 		off  = config.DiscoveryModeOff
 	)
-	for _, tc := range []struct {
-		name     string
-		job, cfg config.DiscoveryMode
-		splits   bool
-	}{
-		{"unset beside an unset job", "", "", false},
-		{"auto beside an unset job", "", auto, false},
-		{"unset beside an auto job", auto, "", false},
-		{"auto beside an auto job", auto, auto, false},
-		{"on beside an on job", on, on, false},
-		{"off beside an auto job", auto, off, true},
-		{"on beside an auto job", auto, on, true},
-		{"on beside an unset job", "", on, true},
-		{"auto beside an on job", on, auto, true},
-		{"off beside an on job", on, off, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			job := discoveryKeyConfig(tc.job)
-			got := requestOverrideCacheKey(job, discoveryKeyConfig(tc.cfg))
-			own := requestOverrideCacheKey(job, discoveryKeyConfig(tc.job))
-			if tc.splits && got == own {
-				t.Errorf("a mode %q beside a job mode %q must split from the job's own bundle", tc.cfg, tc.job)
-			}
-			if !tc.splits && got != own {
-				t.Errorf("a mode %q beside a job mode %q must share the job's own bundle", tc.cfg, tc.job)
-			}
-		})
-	}
-
-	// Through ApplyContextOverrides, where the booleans and the inheritance
-	// happen, an explicit auto under a job-level auto shares the unset bundle
-	// and an explicit on under a job-level auto splits from it.
-	job := discoveryEffectiveJob()
-	job.APIEndpointDiscovery = auto
-	keyFor := func(extra map[string]any) string {
-		eff, _, _, err := config.ApplyContextOverrides(job, extra)
-		if err != nil {
-			t.Fatalf("ApplyContextOverrides(%v): %v", extra, err)
+	resolved := func(m config.DiscoveryMode) config.DiscoveryMode {
+		if m == "" {
+			return auto
 		}
-		return requestOverrideCacheKey(job, eff)
+		return m
 	}
-	unset := keyFor(map[string]any{"pve_vm_storage": "other"})
-	if got := keyFor(map[string]any{"pve_vm_storage": "other", "pve_api_endpoint_discovery": "auto"}); got != unset {
-		t.Error("an explicit auto under a job-level auto must share the unset bundle")
-	}
-	if got := keyFor(map[string]any{"pve_vm_storage": "other", "pve_api_endpoint_discovery": "on"}); got == unset {
-		t.Error("an explicit on under a job-level auto must split from the unset bundle")
-	}
-	if got := keyFor(map[string]any{"pve_vm_storage": "other", "pve_api_endpoint_discovery": true}); got == unset {
-		t.Error("a boolean true under a job-level auto reads as on and must split from the unset bundle")
+	for _, jobMode := range []config.DiscoveryMode{"", auto, on, off} {
+		for _, entryMode := range []any{"auto", "on", "off", true, false} {
+			t.Run(string(jobMode)+" job, entry "+fmt.Sprint(entryMode), func(t *testing.T) {
+				t.Parallel()
+				job := discoveryEffectiveJob()
+				job.APIEndpointDiscovery = jobMode
+				keyFor := func(extra map[string]any) (string, *config.CPIConfig) {
+					eff, _, _, err := config.ApplyContextOverrides(job, extra)
+					if err != nil {
+						t.Fatalf("ApplyContextOverrides(%v): %v", extra, err)
+					}
+					return requestOverrideCacheKey(eff), eff
+				}
+				unnamed, _ := keyFor(map[string]any{"pve_vm_storage": "other"})
+				named, eff := keyFor(map[string]any{"pve_vm_storage": "other", "pve_api_endpoint_discovery": entryMode})
+				want := map[any]config.DiscoveryMode{"auto": auto, "on": on, "off": off, true: on, false: off}[entryMode]
+				if got := eff.DiscoveryModeValue(); got != want {
+					t.Fatalf("entry mode %v resolved to %q, want %q", entryMode, got, want)
+				}
+				if same := named == unnamed; same != (want == resolved(jobMode)) {
+					t.Errorf("entry mode %v under job mode %q shares the unnamed key = %v, want %v",
+						entryMode, jobMode, same, want == resolved(jobMode))
+				}
+			})
+		}
 	}
 }
 
-// TestRequestOverrideCacheKey_DependsOnTheJobConfig asserts that the key is a
-// function of the job config as well as of the effective config. The same
-// effective config keys differently under a job config whose mode it matches
-// and under one whose mode it differs from, and it keys the same under two job
-// configs that it differs from alike, since the bundle is then the same.
-func TestRequestOverrideCacheKey_DependsOnTheJobConfig(t *testing.T) {
+// TestRequestOverrideCacheKey_BooleanModesKeyAsTheirNames asserts that a YAML
+// boolean for the discovery mode keys exactly as the word it reads as, so true
+// shares the bundle of on and false shares the bundle of off, under every job
+// mode.
+func TestRequestOverrideCacheKey_BooleanModesKeyAsTheirNames(t *testing.T) {
 	t.Parallel()
-	const (
-		auto = config.DiscoveryModeAuto
-		on   = config.DiscoveryModeOn
-		off  = config.DiscoveryModeOff
-	)
-	cfg := discoveryKeyConfig(on)
-	underAuto := requestOverrideCacheKey(discoveryKeyConfig(auto), cfg)
-	underOn := requestOverrideCacheKey(discoveryKeyConfig(on), cfg)
-	underOff := requestOverrideCacheKey(discoveryKeyConfig(off), cfg)
-	if underAuto == underOn {
-		t.Error("the same config keys alike under a job it matches and under an auto job it differs from")
-	}
-	if underOff == underOn {
-		t.Error("the same config keys alike under a job it matches and under an off job it differs from")
-	}
-	if underAuto != underOff {
-		t.Error("the same config keys differently under two job configs that it differs from in the same way")
+	jobModes := []config.DiscoveryMode{"", config.DiscoveryModeAuto, config.DiscoveryModeOn, config.DiscoveryModeOff}
+	for _, jobMode := range jobModes {
+		t.Run("job "+string(jobMode), func(t *testing.T) {
+			t.Parallel()
+			job := discoveryEffectiveJob()
+			job.APIEndpointDiscovery = jobMode
+			keyFor := func(mode any) string {
+				eff, _, _, err := config.ApplyContextOverrides(job,
+					map[string]any{"pve_vm_storage": "other", "pve_api_endpoint_discovery": mode})
+				if err != nil {
+					t.Fatalf("ApplyContextOverrides(%v): %v", mode, err)
+				}
+				return requestOverrideCacheKey(eff)
+			}
+			if keyFor(true) != keyFor("on") {
+				t.Error("a boolean true must key like on")
+			}
+			if keyFor(false) != keyFor("off") {
+				t.Error("a boolean false must key like off")
+			}
+			if keyFor("on") == keyFor("off") {
+				t.Error("on and off must key differently")
+			}
+		})
 	}
 }
 
 // TestRequestOverrideCacheKey_JobConfigsNeverShareAKeyForTheSameEntry applies
 // one entry under two job configs that differ in a single field the key reads
 // and requires the two keys to differ, so a key built under one job config is
-// never taken for the key of the same entry under another. The discovery mode
-// row names a mode that matches one job's and not the other's.
+// never taken for the key of the same entry under another. The job's
+// discovery mode is among the fields, and the entry names no mode, so it
+// inherits the job's. An entry that names a mode gets the same effective
+// config under any job config, and so the same key, which the last cases
+// assert.
 func TestRequestOverrideCacheKey_JobConfigsNeverShareAKeyForTheSameEntry(t *testing.T) {
 	t.Parallel()
 	ca := selfSignedCAPEMForCacheKeyTest(t)
 	verifyOff := false
+	inherit := map[string]any{"pve_vm_storage": "other"}
+	withMode := func(mode config.DiscoveryMode) func(*config.CPIConfig) {
+		return func(c *config.CPIConfig) { c.APIEndpointDiscovery = mode }
+	}
 	for name, tc := range map[string]struct {
-		vary  func(*config.CPIConfig)
-		entry map[string]any
+		vary func(*config.CPIConfig)
 	}{
-		"host":              {func(c *config.CPIConfig) { c.Host = "pve-b.example" }, map[string]any{"pve_vm_storage": "other"}},
-		"port":              {func(c *config.CPIConfig) { c.Port = 8007 }, map[string]any{"pve_vm_storage": "other"}},
-		"realm":             {func(c *config.CPIConfig) { c.Realm = "pam" }, map[string]any{"pve_vm_storage": "other"}},
-		"token":             {func(c *config.CPIConfig) { c.APIToken = "u@pve!cpi=another-token" }, map[string]any{"pve_vm_storage": "other"}},
-		"node":              {func(c *config.CPIConfig) { c.Node = "pve2" }, map[string]any{"pve_vm_storage": "other"}},
-		"certificate check": {func(c *config.CPIConfig) { c.VerifySSL = &verifyOff }, map[string]any{"pve_vm_storage": "other"}},
-		"CA":                {func(c *config.CPIConfig) { c.PVECACertPEM = ca }, map[string]any{"pve_vm_storage": "other"}},
-		"discovery mode named by the entry": {
-			func(c *config.CPIConfig) { c.APIEndpointDiscovery = config.DiscoveryModeOn },
-			map[string]any{"pve_api_endpoint_discovery": "on"},
-		},
-		"discovery mode restated as auto": {
-			func(c *config.CPIConfig) { c.APIEndpointDiscovery = config.DiscoveryModeOff },
-			map[string]any{"pve_api_endpoint_discovery": "auto"},
-		},
+		"host":              {func(c *config.CPIConfig) { c.Host = "pve-b.example" }},
+		"port":              {func(c *config.CPIConfig) { c.Port = 8007 }},
+		"realm":             {func(c *config.CPIConfig) { c.Realm = "pam" }},
+		"token":             {func(c *config.CPIConfig) { c.APIToken = "u@pve!cpi=another-token" }},
+		"node":              {func(c *config.CPIConfig) { c.Node = "pve2" }},
+		"certificate check": {func(c *config.CPIConfig) { c.VerifySSL = &verifyOff }},
+		"CA":                {func(c *config.CPIConfig) { c.PVECACertPEM = ca }},
+		"mode on":           {withMode(config.DiscoveryModeOn)},
+		"mode off":          {withMode(config.DiscoveryModeOff)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			jobA := discoveryEffectiveJob()
 			jobB := discoveryEffectiveJob()
 			tc.vary(jobB)
-			keyUnder := func(job *config.CPIConfig) string {
-				eff, _, _, err := config.ApplyContextOverrides(job, tc.entry)
+			keyUnder := func(job *config.CPIConfig, entry map[string]any) string {
+				eff, _, _, err := config.ApplyContextOverrides(job, entry)
 				if err != nil {
-					t.Fatalf("ApplyContextOverrides(%v): %v", tc.entry, err)
+					t.Fatalf("ApplyContextOverrides(%v): %v", entry, err)
 				}
-				return requestOverrideCacheKey(job, eff)
+				return requestOverrideCacheKey(eff)
 			}
-			first, again := keyUnder(jobA), keyUnder(jobA)
+			first, again := keyUnder(jobA, inherit), keyUnder(jobA, inherit)
 			if first != again {
 				t.Error("the key must be deterministic under one job config")
 			}
-			if first == keyUnder(jobB) {
+			if first == keyUnder(jobB, inherit) {
 				t.Errorf("the same entry keys alike under job configs that differ in the %s", name)
 			}
 		})
+	}
+
+	// The job modes against each other, in every pairing, for an entry that
+	// names no mode.
+	modes := []config.DiscoveryMode{"", config.DiscoveryModeOn, config.DiscoveryModeOff}
+	keyFor := func(mode config.DiscoveryMode, entry map[string]any) string {
+		job := discoveryEffectiveJob()
+		job.APIEndpointDiscovery = mode
+		eff, _, _, err := config.ApplyContextOverrides(job, entry)
+		if err != nil {
+			t.Fatalf("ApplyContextOverrides(%v): %v", entry, err)
+		}
+		return requestOverrideCacheKey(eff)
+	}
+	for i, a := range modes {
+		for _, b := range modes[i+1:] {
+			if keyFor(a, inherit) == keyFor(b, inherit) {
+				t.Errorf("job modes %q and %q share a key for the same entry", a, b)
+			}
+		}
+	}
+
+	// An entry that names the mode gets the same effective config under either
+	// job, so it keys alike.
+	named := map[string]any{"pve_vm_storage": "other", "pve_api_endpoint_discovery": "on"}
+	for _, a := range modes {
+		for _, b := range modes {
+			if keyFor(a, named) != keyFor(b, named) {
+				t.Errorf("an entry that names on keys differently under job modes %q and %q", a, b)
+			}
+		}
 	}
 }
 
@@ -504,8 +523,8 @@ func TestRequestOverrideCacheKey_JobConfigsNeverShareAKeyForTheSameEntry(t *test
 // a fixed config with no discovery mode to the value the key function produced
 // before the mode was folded in, so no warm cached client is dropped on
 // upgrade. It is the same fixed config and golden value as the endpoint list
-// test, because an unset mode and an empty list must both add nothing. A mode
-// that matches the job's adds nothing either.
+// test, because an unset mode, an explicit auto, and an empty list must all
+// add nothing.
 func TestRequestOverrideCacheKey_NoModeKeysAsBeforeTheModeExisted(t *testing.T) {
 	t.Parallel()
 	const golden = "e1b319f637957cfa0d54052d63706dd2951c0350482db1975f46542f0d2d84d3"
@@ -513,27 +532,18 @@ func TestRequestOverrideCacheKey_NoModeKeysAsBeforeTheModeExisted(t *testing.T) 
 		Host: "pve-a.example", Port: 8006, User: "cpi", Realm: "pam", Node: "pve1", Password: "pw-one",
 		VMStorage: "local-lvm", DiskStorage: "local-lvm", NetworkBridge: "vmbr0",
 	}
-	if got := requestOverrideCacheKey(nil, cfg); got != golden {
+	if got := requestOverrideCacheKey(cfg); got != golden {
 		t.Errorf("key = %s, want %s", got, golden)
 	}
 	cfg.APIEndpointDiscovery = config.DiscoveryModeAuto
-	if got := requestOverrideCacheKey(nil, cfg); got != golden {
+	if got := requestOverrideCacheKey(cfg); got != golden {
 		t.Errorf("key with an explicit auto = %s, want %s", got, golden)
 	}
-	cfg.APIEndpointDiscovery = config.DiscoveryModeOn
-	if got := requestOverrideCacheKey(nil, cfg); got == golden {
-		t.Error("an explicit on beside an unset job mode must key differently")
-	}
-	job := *cfg
-	if got := requestOverrideCacheKey(&job, cfg); got != golden {
-		t.Errorf("an on that matches the job's on keyed %s, want %s", got, golden)
-	}
-	cfgAuto := *cfg
-	cfgAuto.APIEndpointDiscovery = config.DiscoveryModeAuto
-	jobUnset := cfgAuto
-	jobUnset.APIEndpointDiscovery = ""
-	if requestOverrideCacheKey(&jobUnset, &cfgAuto) != requestOverrideCacheKey(&jobUnset, &jobUnset) {
-		t.Error("an explicit auto must key like an unset mode beside an unset job")
+	for _, mode := range []config.DiscoveryMode{config.DiscoveryModeOn, config.DiscoveryModeOff} {
+		cfg.APIEndpointDiscovery = mode
+		if got := requestOverrideCacheKey(cfg); got == golden {
+			t.Errorf("an explicit %s keyed as the config with no mode", mode)
+		}
 	}
 }
 
@@ -572,7 +582,7 @@ func TestRequestOverrideCacheKey_LooserTLSFlagSeparatesEntries(t *testing.T) {
 				t.Fatalf("flags = %v and %v, want the inheriting entry flagged and the other not",
 					effA.InheritedCredsLooserTLS(), effB.InheritedCredsLooserTLS())
 			}
-			if requestOverrideCacheKey(job, effA) == requestOverrideCacheKey(job, effB) {
+			if requestOverrideCacheKey(effA) == requestOverrideCacheKey(effB) {
 				t.Error("entries that differ only in the looser TLS flag must not share a bundle")
 			}
 			if mode, _ := config.EffectiveDiscoveryMode(effA); mode != config.DiscoveryModeOff {
