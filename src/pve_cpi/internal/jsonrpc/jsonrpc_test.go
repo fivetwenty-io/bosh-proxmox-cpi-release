@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -533,5 +534,56 @@ func TestContext_UnmarshalJSON_WrongScalarTypeStillFails(t *testing.T) {
 	var ctx Context
 	if err := json.Unmarshal([]byte(`{"request_id":7}`), &ctx); err == nil {
 		t.Fatal("want a decode error for a numeric request_id")
+	}
+}
+
+// TestContext_UnmarshalJSON_KeepsTheDiscoveryModeRawWhenItIsNotAScalar asserts
+// that a discovery mode which is neither a string, a boolean, nor null reaches
+// Extra as the text it was written with, at the top level and inside the pve
+// object, because the refusal repeats it. Usable values and other keys keep the
+// decoded types.
+func TestContext_UnmarshalJSON_KeepsTheDiscoveryModeRawWhenItIsNotAScalar(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		input string
+		key   string
+		want  any
+	}{
+		"flat float":     {`{"pve_api_endpoint_discovery": 5.0}`, "pve_api_endpoint_discovery", json.RawMessage(`5.0`)},
+		"flat exponent":  {`{"pve_api_endpoint_discovery":1e3}`, "pve_api_endpoint_discovery", json.RawMessage(`1e3`)},
+		"flat object":    {`{"pve_api_endpoint_discovery": { "a": 1 }}`, "pve_api_endpoint_discovery", json.RawMessage(`{ "a": 1 }`)},
+		"flat list":      {`{"pve_api_endpoint_discovery": [ "on" ]}`, "pve_api_endpoint_discovery", json.RawMessage(`[ "on" ]`)},
+		"flat string":    {`{"pve_api_endpoint_discovery": "on"}`, "pve_api_endpoint_discovery", "on"},
+		"flat boolean":   {`{"pve_api_endpoint_discovery": true}`, "pve_api_endpoint_discovery", true},
+		"flat null":      {`{"pve_api_endpoint_discovery": null}`, "pve_api_endpoint_discovery", nil},
+		"another number": {`{"pve_port": 8006.0}`, "pve_port", float64(8006)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var ctx Context
+			if err := json.Unmarshal([]byte(tc.input), &ctx); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			got, present := ctx.Extra[tc.key]
+			if !present || !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("Extra[%s] = %#v (present %v), want %#v", tc.key, got, present, tc.want)
+			}
+		})
+	}
+
+	var ctx Context
+	input := `{"pve": {"api_endpoint_discovery": 5.0, "vm_storage": "s", "port": 1.0}}`
+	if err := json.Unmarshal([]byte(input), &ctx); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	pve, ok := ctx.Extra["pve"].(map[string]any)
+	if !ok {
+		t.Fatalf("Extra[pve] = %#v, want a map", ctx.Extra["pve"])
+	}
+	if got := pve["api_endpoint_discovery"]; !reflect.DeepEqual(got, json.RawMessage(`5.0`)) {
+		t.Errorf("pve.api_endpoint_discovery = %#v, want the raw text 5.0", got)
+	}
+	if pve["vm_storage"] != "s" || pve["port"] != float64(1) {
+		t.Errorf("the other pve members = %#v, want them decoded as before", pve)
 	}
 }

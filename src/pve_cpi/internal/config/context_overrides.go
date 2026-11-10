@@ -2,7 +2,9 @@ package config
 
 import (
 	"bytes"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"maps"
 	"math"
@@ -814,6 +816,13 @@ func coerceOverrideString(v any) (string, error) {
 // other type are refused with the text the job-level property gives, so an
 // operator sees one message wherever the mistake is made. A null never gets
 // here, because ApplyContextOverrides treats it as an unnamed key.
+//
+// The job-level decoder echoes the raw JSON text of a value of the wrong
+// type. A json.RawMessage or json.Number is echoed the same way, trimmed and
+// bounded, and jsonrpc.Context keeps this key's raw text for that reason, so
+// a request reads identically to the job-level property. Any other value,
+// such as a number a caller decoded to a float64, can only be encoded again,
+// and the encoding drops the spelling it was written with.
 func coerceOverrideDiscoveryMode(v any) (DiscoveryMode, error) {
 	switch t := v.(type) {
 	case bool:
@@ -828,15 +837,29 @@ func coerceOverrideDiscoveryMode(v any) (DiscoveryMode, error) {
 		}
 		return mode, nil
 	default:
-		var echo bytes.Buffer
-		enc := json.NewEncoder(&echo)
-		enc.SetEscapeHTML(false)
-		if err := enc.Encode(v); err != nil {
-			return "", fmt.Errorf("api_endpoint_discovery: expected a string or a boolean, got %T", v)
-		}
 		return "", fmt.Errorf("api_endpoint_discovery: expected a string or a boolean, got %s",
-			boundEcho(strings.TrimSpace(echo.String())))
+			boundEcho(rawOverrideText(v)))
 	}
+}
+
+// rawOverrideText returns the JSON text of v for an error message. Raw JSON
+// and json.Number values keep their spelling. Anything else is encoded without
+// HTML escaping, and a value that cannot be encoded, such as a NaN or a
+// channel, falls back to its Go type.
+func rawOverrideText(v any) string {
+	switch t := v.(type) {
+	case json.RawMessage:
+		return strings.TrimSpace(string(t))
+	case json.Number:
+		return t.String()
+	}
+	var echo bytes.Buffer
+	enc := json.NewEncoder(&echo)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return fmt.Sprintf("a value of type %T", v)
+	}
+	return strings.TrimSpace(echo.String())
 }
 
 // coerceOverrideInt accepts a JSON number (decoded as float64 by
@@ -1171,34 +1194,37 @@ func resolveOverrideCredentials(base, eff *CPIConfig, extra map[string]any) erro
 		eff.Host, strings.Join(specNames, " and "), remedy)
 }
 
+// tlsOverrideKeys are the override keys that change how the client verifies
+// the server it talks to. markInheritedCredsLooserTLS looks only at an entry
+// that names one of them, so a new key that touches TLS has to join this list
+// and the comparison below, and a test fails until it does.
+var tlsOverrideKeys = []string{"pve_verify_ssl", "pve_ca_cert"}
+
 // markInheritedCredsLooserTLS records on eff whether the entry inherited the
-// job's credentials while setting looser TLS than the job. The two handlers
-// that can loosen TLS, pve_verify_ssl and pve_ca_cert, cannot decide this on
-// their own, because the answer depends on the entry's final endpoint list
-// and on which credential keys it named, and neither is settled until every
-// handler has run and resolveOverrideCredentials has finished. So this runs
-// right after it, and before eff.Validate(), which rejects the mode on for an
-// entry flagged here. EffectiveDiscoveryMode turns the other modes off.
+// job's credentials while setting looser TLS than the job. The handlers for
+// the tlsOverrideKeys cannot decide this on their own, because the answer
+// depends on the entry's final endpoint list and on which credential keys it
+// named, and neither is settled until every handler has run and
+// resolveOverrideCredentials has finished. So this runs right after it, and
+// before eff.Validate(), which rejects the mode on for an entry flagged here.
+// EffectiveDiscoveryMode turns the other modes off.
 //
 // An entry inherits the job's credentials exactly when the whole endpoint
 // list is the job's (see SameEndpointSet) and the entry named no credential
 // key, which is the test OverrideCredentialGroup applies. The TLS settings
 // are looser when the job verifies certificates and the entry either turns
 // verification off or verifies against a different CA than the job's. A job
-// that already skips verification has nothing left to loosen. The CA is
-// compared with surrounding whitespace removed, because a PEM bundle that
-// differs only there is the same trust root.
-//
-// The flag is only ever raised here, so a base that already carries it keeps
-// it in every effective config derived from it.
+// that already skips verification has nothing left to loosen. The CAs are
+// compared as sets of certificates (see sameCASet), because a bundle that
+// differs only in line endings, comments, order, or repeats is the same trust
+// root.
 func markInheritedCredsLooserTLS(base, eff *CPIConfig, extra map[string]any) {
-	if base.inheritedCredsLooserTLS {
-		eff.inheritedCredsLooserTLS = true
-		return
-	}
 	present := func(key string) bool {
 		_, ok := extra[key]
 		return ok
+	}
+	if !slices.ContainsFunc(tlsOverrideKeys, present) {
+		return
 	}
 	if !SameEndpointSet(base, eff) || len(overrideCredentialKeysSet(present)) > 0 {
 		return
@@ -1206,10 +1232,58 @@ func markInheritedCredsLooserTLS(base, eff *CPIConfig, extra map[string]any) {
 	if !base.VerifySSLValue() {
 		return
 	}
-	if !eff.VerifySSLValue() ||
-		strings.TrimSpace(eff.PVECACertPEM) != strings.TrimSpace(base.PVECACertPEM) {
+	if !eff.VerifySSLValue() || !sameCASet(base.PVECACertPEM, eff.PVECACertPEM) {
 		eff.inheritedCredsLooserTLS = true
 	}
+}
+
+// sameCASet reports whether two PEM bundles trust the same certificates. It
+// decodes every block on each side into DER and compares the two sets without
+// regard to order or repeats, so line endings, comment lines, and wrapping do
+// not count. A bundle with no text holds no certificates, which is the system
+// pool. A bundle that has text but fails to parse, whether from a block that
+// is not a certificate or from DER that is not one, never matches, so the
+// answer fails closed and the entry counts as looser. A bundle that trusts
+// fewer roots than the other also differs.
+func sameCASet(a, b string) bool {
+	setA, okA := caCertificateSet(a)
+	setB, okB := caCertificateSet(b)
+	if !okA || !okB || len(setA) != len(setB) {
+		return false
+	}
+	for der := range setA {
+		if _, found := setB[der]; !found {
+			return false
+		}
+	}
+	return true
+}
+
+// caCertificateSet returns the DER of every certificate in a PEM bundle, as
+// map keys. It reports false for text that holds no certificate, a block of
+// another type, or a block whose DER does not parse. Whitespace-only text is
+// an empty set.
+func caCertificateSet(bundle string) (map[string]struct{}, bool) {
+	set := map[string]struct{}{}
+	rest := []byte(bundle)
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			return nil, false
+		}
+		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+			return nil, false
+		}
+		set[string(block.Bytes)] = struct{}{}
+	}
+	if len(set) == 0 && strings.TrimSpace(bundle) != "" {
+		return nil, false
+	}
+	return set, true
 }
 
 // ApplyContextOverrides returns a per-request effective CPIConfig built by
@@ -1400,7 +1474,9 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 	}
 
 	if validateErr := eff.Validate(); validateErr != nil {
-		return nil, nil, nil, fmt.Errorf("config: effective override config failed validation: %w", validateErr)
+		return nil, nil, nil, fmt.Errorf(
+			"config: context entry for host %q: effective override config failed validation: %w",
+			eff.Host, validateErr)
 	}
 
 	return &eff, appliedKeys, unknownKeys, nil

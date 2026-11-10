@@ -220,7 +220,9 @@ func (r *RequestOverrideRuntime) cachePutOrExisting(key string, bundle *override
 }
 
 // resolve returns the cached bundle for cfg's override identity, building
-// and caching one on first use. Concurrent resolve() calls for the SAME
+// and caching one on first use. job is the job-level config that cfg was
+// derived from, which the identity compares the discovery mode against.
+// Concurrent resolve() calls for the SAME
 // identity that race a cold cache single-flight onto ONE build (see
 // buildCall/M4): the first caller becomes the "leader" and performs the
 // build; every other concurrent caller for that identity blocks on the
@@ -256,7 +258,7 @@ func (r *RequestOverrideRuntime) cachePutOrExisting(key string, bundle *override
 //   - agent.NewAgent errors (e.g. cfg.AgentMode outside cloudinit/noagent) →
 //     wrapped and returned, nothing cached, same retry-on-next-call
 //     behavior as the client-factory failure above.
-func (r *RequestOverrideRuntime) resolve(ctx context.Context, cfg *config.CPIConfig) (*overrideBundle, error) {
+func (r *RequestOverrideRuntime) resolve(ctx context.Context, job, cfg *config.CPIConfig) (*overrideBundle, error) {
 	if r == nil {
 		return nil, fmt.Errorf("cpi: RequestOverrideRuntime.resolve called on nil receiver")
 	}
@@ -264,7 +266,7 @@ func (r *RequestOverrideRuntime) resolve(ctx context.Context, cfg *config.CPICon
 		return nil, fmt.Errorf("cpi: RequestOverrideRuntime: ClientFactory is not configured")
 	}
 
-	key := requestOverrideCacheKey(cfg)
+	key := requestOverrideCacheKey(job, cfg)
 
 	bundle, call, isLeader := r.acquire(key)
 	if bundle != nil {
@@ -392,8 +394,9 @@ func (r *RequestOverrideRuntime) buildBundle(cfg *config.CPIConfig) (*overrideBu
 // ApplyContextOverrides allocated to get there. Password and APIToken are
 // hashed (sha256) rather than embedded verbatim — the key is never logged
 // today, but hashing costs nothing and keeps that true even if a future
-// caller logs cache diagnostics.
-func requestOverrideCacheKey(cfg *config.CPIConfig) string {
+// caller logs cache diagnostics. job is the job-level config, which the
+// discovery mode is compared against.
+func requestOverrideCacheKey(job, cfg *config.CPIConfig) string {
 	h := sha256.New()
 	// hash.Hash.Write never returns an error, so the Fprintf results are discarded.
 	_, _ = fmt.Fprintf(h, "host=%s\x00port=%d\x00user=%s\x00realm=%s\x00node=%s\x00",
@@ -486,13 +489,21 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 	if len(cfg.Endpoints) > 0 {
 		_, _ = fmt.Fprintf(h, "endpoints=%q\x00", cfg.Endpoints)
 	}
-	// The discovery mode is folded in as written. An unset mode adds nothing,
-	// so a config without one keys exactly as it did before the mode could be
-	// set per entry. Unset and an explicit auto read the same at run time, but
-	// the raw value is hashed, as with the ownership guard above, so the key
-	// of every existing bundle stays put.
-	if cfg.APIEndpointDiscovery != "" {
-		_, _ = fmt.Fprintf(h, "api_endpoint_discovery=%s\x00", cfg.APIEndpointDiscovery)
+	// The discovery mode is folded in as the entry resolves it, but only when
+	// it differs from the job's resolved mode. An entry that inherits the mode,
+	// or restates it, therefore adds nothing and keys exactly as it did before
+	// the mode could be set per entry. The resolved value is hashed, so unset
+	// and an explicit auto read as one, and true reads as on.
+	if mode := cfg.DiscoveryModeValue(); mode != job.DiscoveryModeValue() {
+		_, _ = fmt.Fprintf(h, "api_endpoint_discovery=%s\x00", mode)
+	}
+	// An entry that inherits the job's credentials under looser TLS discovers
+	// as off whatever its mode, while an entry that names the same TLS keys
+	// and its own credentials does not. Nothing else in the key tells them
+	// apart, so the flag joins it, and only when raised, which keeps the key
+	// of every other config as it was.
+	if cfg.InheritedCredsLooserTLS() {
+		_, _ = fmt.Fprintf(h, "inherited_creds_looser_tls=true\x00")
 	}
 	if cfg.PVECACertPEM != "" {
 		caHash := sha256.Sum256([]byte(cfg.PVECACertPEM))
@@ -698,7 +709,7 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 		)
 	}
 
-	bundle, resolveErr := d.Overrides.resolve(ctx, effCfg)
+	bundle, resolveErr := d.Overrides.resolve(ctx, d.Config, effCfg)
 	if resolveErr != nil {
 		return Deps{}, cpierrors.Retriable(
 			"cpi: context override: build PVE connection for overridden host %q: %s",

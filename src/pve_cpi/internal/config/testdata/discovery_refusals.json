@@ -23,6 +23,8 @@
   {"name":"mode c1 control","config":{"api_endpoint_discovery":"ab"},"message":"api_endpoint_discovery must be auto, on, or off, got \"a\\u0085b\""},
   {"name":"mode integer","config":{"api_endpoint_discovery":5},"message":"api_endpoint_discovery: expected a string or a boolean, got 5"},
   {"name":"mode float","config":{"api_endpoint_discovery":1.5},"message":"api_endpoint_discovery: expected a string or a boolean, got 1.5"},
+  {"name":"mode float with a trailing zero","config":{"api_endpoint_discovery":5.0},"message":"api_endpoint_discovery: expected a string or a boolean, got 5.0"},
+  {"name":"mode integer beyond a float","config":{"api_endpoint_discovery":12345678901234567890},"message":"api_endpoint_discovery: expected a string or a boolean, got 12345678901234567890"},
   {"name":"mode list","config":{"api_endpoint_discovery":["on"]},"message":"api_endpoint_discovery: expected a string or a boolean, got [\"on\"]"},
   {"name":"mode object","config":{"api_endpoint_discovery":{"a":1}},"message":"api_endpoint_discovery: expected a string or a boolean, got {\"a\":1}"},
   {"name":"mode long list","config":{"api_endpoint_discovery":["xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]},"message":"api_endpoint_discovery: expected a string or a boolean, got [\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."},

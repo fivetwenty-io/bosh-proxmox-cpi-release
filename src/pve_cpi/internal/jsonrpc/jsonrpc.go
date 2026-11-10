@@ -163,9 +163,50 @@ func (c *Context) UnmarshalJSON(data []byte) error {
 		if c.Extra == nil {
 			c.Extra = make(map[string]any, len(raw))
 		}
-		c.Extra[key] = decoded
+		c.Extra[key] = keepRawDiscoveryMode(key, val, decoded)
 	}
 	return nil
+}
+
+// discoveryModeKey is the name of the discovery mode property, which sits
+// under the pve object as written in a cpi-config and as pve_ plus this name
+// once flattened.
+const discoveryModeKey = "api_endpoint_discovery"
+
+// keepRawDiscoveryMode returns the value to store in Extra for key. The
+// discovery mode refuses a value that is not a string or a boolean, and the
+// refusal repeats the value as it was written, which the decoded form cannot
+// give back for 5.0 or an object. So a value of that kind, at the top level or
+// inside the pve object, is kept as json.RawMessage. Every other value, and
+// every other key, is returned as decoded.
+func keepRawDiscoveryMode(key string, raw json.RawMessage, decoded any) any {
+	switch key {
+	case "pve_" + discoveryModeKey:
+		return rawUnlessScalar(raw, decoded)
+	case "pve":
+		object, ok := decoded.(map[string]any)
+		if !ok {
+			return decoded
+		}
+		var members map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &members); err != nil {
+			return decoded
+		}
+		if member, named := members[discoveryModeKey]; named {
+			object[discoveryModeKey] = rawUnlessScalar(member, object[discoveryModeKey])
+		}
+	}
+	return decoded
+}
+
+// rawUnlessScalar returns raw when decoded is anything but null, a string, or
+// a boolean.
+func rawUnlessScalar(raw json.RawMessage, decoded any) any {
+	switch decoded.(type) {
+	case nil, string, bool:
+		return decoded
+	}
+	return raw
 }
 
 // -----------------------------------------------------------------------

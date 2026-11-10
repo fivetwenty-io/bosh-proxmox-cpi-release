@@ -79,7 +79,7 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		"set-a": {Names: []string{"nfs-a"}, Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}},
 	}
 	base.ApplyDefaults()
-	baseKey := requestOverrideCacheKey(base)
+	baseKey := requestOverrideCacheKey(base, base)
 
 	// One distinct override value per field. Values only need to differ from
 	// base and coerce cleanly; enum validity is enforced later by Validate(),
@@ -191,7 +191,7 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 
 	boundBase := *base
 	boundBase.EphemeralStorageSet = "set-a"
-	boundBaseKey := requestOverrideCacheKey(&boundBase)
+	boundBaseKey := requestOverrideCacheKey(&boundBase, &boundBase)
 
 	for _, field := range config.ContextOverrideFieldOrderForTest() {
 		val, ok := overrideValues[field]
@@ -217,7 +217,7 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 				field, applied, unknown)
 			continue
 		}
-		if key := requestOverrideCacheKey(eff); key == fieldBaseKey {
+		if key := requestOverrideCacheKey(fieldBase, eff); key == fieldBaseKey {
 			t.Errorf("overriding %q did not change requestOverrideCacheKey — two requests with different effective configs would share one cached bundle", field)
 		}
 	}
@@ -234,12 +234,12 @@ func TestRequestOverrideCacheKey_CACertSeparatesSameHost(t *testing.T) {
 	b.PVECACertPEM = selfSignedCAPEMForCacheKeyTest(t)
 	c := *a
 	c.PVECACertPEM = selfSignedCAPEMForCacheKeyTest(t)
-	keyA, keyB, keyC := requestOverrideCacheKey(a), requestOverrideCacheKey(&b), requestOverrideCacheKey(&c)
+	keyA, keyB, keyC := requestOverrideCacheKey(nil, a), requestOverrideCacheKey(nil, &b), requestOverrideCacheKey(nil, &c)
 	if keyA == keyB || keyB == keyC || keyA == keyC {
 		t.Error("configs that differ only in pve_ca_cert must key differently")
 	}
 	same := *a
-	if requestOverrideCacheKey(&same) != keyA {
+	if requestOverrideCacheKey(nil, &same) != keyA {
 		t.Error("the cache key must be deterministic")
 	}
 }
@@ -253,20 +253,20 @@ func TestRequestOverrideCacheKey_EndpointListSeparatesConfigs(t *testing.T) {
 	mk := func(list ...string) *config.CPIConfig {
 		return &config.CPIConfig{Host: "pve-a.example", Port: 8006, User: "cpi", Password: "pw-one", Endpoints: list}
 	}
-	none := requestOverrideCacheKey(mk())
-	if empty := requestOverrideCacheKey(&config.CPIConfig{
+	none := requestOverrideCacheKey(nil, mk())
+	if empty := requestOverrideCacheKey(nil, &config.CPIConfig{
 		Host: "pve-a.example", Port: 8006, User: "cpi", Password: "pw-one", Endpoints: []string{},
 	}); empty != none {
 		t.Error("an empty list must key like no list")
 	}
 	keys := map[string]string{
 		"no list":        none,
-		"one":            requestOverrideCacheKey(mk("pve-a.example:8006")),
-		"two":            requestOverrideCacheKey(mk("pve-a.example:8006", "pve-b.example:8006")),
-		"two, other":     requestOverrideCacheKey(mk("pve-a.example:8006", "pve-c.example:8006")),
-		"two, reordered": requestOverrideCacheKey(mk("pve-b.example:8006", "pve-a.example:8006")),
-		"joined":         requestOverrideCacheKey(mk("pve-a.example:8006,pve-b.example:8006")),
-		"three": requestOverrideCacheKey(mk("pve-a.example:8006", "pve-b.example:8006",
+		"one":            requestOverrideCacheKey(nil, mk("pve-a.example:8006")),
+		"two":            requestOverrideCacheKey(nil, mk("pve-a.example:8006", "pve-b.example:8006")),
+		"two, other":     requestOverrideCacheKey(nil, mk("pve-a.example:8006", "pve-c.example:8006")),
+		"two, reordered": requestOverrideCacheKey(nil, mk("pve-b.example:8006", "pve-a.example:8006")),
+		"joined":         requestOverrideCacheKey(nil, mk("pve-a.example:8006,pve-b.example:8006")),
+		"three": requestOverrideCacheKey(nil, mk("pve-a.example:8006", "pve-b.example:8006",
 			"pve-c.example:8006")),
 	}
 	seen := map[string]string{}
@@ -276,7 +276,7 @@ func TestRequestOverrideCacheKey_EndpointListSeparatesConfigs(t *testing.T) {
 		}
 		seen[key] = name
 	}
-	if requestOverrideCacheKey(mk("pve-a.example:8006", "pve-b.example:8006")) != keys["two"] {
+	if requestOverrideCacheKey(nil, mk("pve-a.example:8006", "pve-b.example:8006")) != keys["two"] {
 		t.Error("the cache key must be deterministic")
 	}
 }
@@ -293,31 +293,47 @@ func TestRequestOverrideCacheKey_NoListKeysAsBeforeTheListExisted(t *testing.T) 
 		Host: "pve-a.example", Port: 8006, User: "cpi", Realm: "pam", Node: "pve1", Password: "pw-one",
 		VMStorage: "local-lvm", DiskStorage: "local-lvm", NetworkBridge: "vmbr0",
 	}
-	if got := requestOverrideCacheKey(cfg); got != golden {
+	if got := requestOverrideCacheKey(nil, cfg); got != golden {
 		t.Errorf("key = %s, want %s", got, golden)
 	}
 	cfg.Endpoints = []string{}
-	if got := requestOverrideCacheKey(cfg); got != golden {
+	if got := requestOverrideCacheKey(nil, cfg); got != golden {
 		t.Errorf("key with an empty list = %s, want %s", got, golden)
 	}
 }
 
+// discoveryKeyConfig returns a config that differs from another only in its
+// discovery mode.
+func discoveryKeyConfig(mode config.DiscoveryMode) *config.CPIConfig {
+	return &config.CPIConfig{
+		Host: "pve-a.example", Port: 8006, User: "cpi", Password: "pw-one", APIEndpointDiscovery: mode,
+	}
+}
+
+// discoveryEffectiveJob returns a valid token-auth job config that verifies
+// TLS, for the tests that drive ApplyContextOverrides.
+func discoveryEffectiveJob() *config.CPIConfig {
+	verify := true
+	return &config.CPIConfig{
+		Host: "pve-a.example", Port: 8006, User: "u", Realm: "pve", APIToken: "u@pve!cpi=fake-token",
+		VMStorage: "s", DiskStorage: "s", NetworkBridge: "br", VerifySSL: &verify,
+		AgentMode: "cloudinit", VMDiskFormat: "qcow2", LogLevel: "info",
+		VMIDRangeStart: 100, VMIDRangeEnd: 5999, RebootMode: "soft", RebootTimeout: 60,
+		NetworkMode: "auto", SDNZoneType: "simple",
+	}
+}
+
 // TestRequestOverrideCacheKey_DiscoveryModeSeparatesConfigs asserts that two
-// configs that differ only in their discovery mode never share a cached
-// bundle, that an unset mode keys exactly as it did before the mode existed,
-// and that the mode is hashed as written.
+// configs whose discovery modes differ from the job's in different ways never
+// share a cached bundle, and that a mode equal to the job's, however it is
+// written, adds nothing to the key.
 func TestRequestOverrideCacheKey_DiscoveryModeSeparatesConfigs(t *testing.T) {
 	t.Parallel()
-	mk := func(mode config.DiscoveryMode) *config.CPIConfig {
-		return &config.CPIConfig{
-			Host: "pve-a.example", Port: 8006, User: "cpi", Password: "pw-one", APIEndpointDiscovery: mode,
-		}
-	}
+	job := discoveryKeyConfig("")
 	keys := map[string]string{
-		"unset": requestOverrideCacheKey(mk("")),
-		"auto":  requestOverrideCacheKey(mk(config.DiscoveryModeAuto)),
-		"on":    requestOverrideCacheKey(mk(config.DiscoveryModeOn)),
-		"off":   requestOverrideCacheKey(mk(config.DiscoveryModeOff)),
+		"unset": requestOverrideCacheKey(job, discoveryKeyConfig("")),
+		"on":    requestOverrideCacheKey(job, discoveryKeyConfig(config.DiscoveryModeOn)),
+		"off":   requestOverrideCacheKey(job, discoveryKeyConfig(config.DiscoveryModeOff)),
 	}
 	seen := map[string]string{}
 	for name, key := range keys {
@@ -326,14 +342,82 @@ func TestRequestOverrideCacheKey_DiscoveryModeSeparatesConfigs(t *testing.T) {
 		}
 		seen[key] = name
 	}
-	if requestOverrideCacheKey(mk(config.DiscoveryModeOn)) != keys["on"] {
+	if requestOverrideCacheKey(job, discoveryKeyConfig(config.DiscoveryModeOn)) != keys["on"] {
 		t.Error("the cache key must be deterministic")
 	}
+	if got := requestOverrideCacheKey(job, discoveryKeyConfig(config.DiscoveryModeAuto)); got != keys["unset"] {
+		t.Error("an explicit auto under an unset job mode must share the unset bundle")
+	}
 	// The cache directory is process-level and never part of a bundle's identity.
-	withDir := mk(config.DiscoveryModeOn)
+	withDir := discoveryKeyConfig(config.DiscoveryModeOn)
 	withDir.EndpointCacheDir = "/var/vcap/store/pve_cpi/endpoint-cache"
-	if requestOverrideCacheKey(withDir) != keys["on"] {
+	if requestOverrideCacheKey(job, withDir) != keys["on"] {
 		t.Error("the cache directory must not change the bundle key")
+	}
+}
+
+// TestRequestOverrideCacheKey_DiscoveryModeIsComparedWithTheJobs asserts the
+// rule from every side. A mode equal to the job's resolved mode adds nothing,
+// whether it is unset, written as auto, or inherited. A mode that differs
+// splits the bundle, whichever way the job's mode is written.
+func TestRequestOverrideCacheKey_DiscoveryModeIsComparedWithTheJobs(t *testing.T) {
+	t.Parallel()
+	const (
+		auto = config.DiscoveryModeAuto
+		on   = config.DiscoveryModeOn
+		off  = config.DiscoveryModeOff
+	)
+	for _, tc := range []struct {
+		name     string
+		job, cfg config.DiscoveryMode
+		splits   bool
+	}{
+		{"unset beside an unset job", "", "", false},
+		{"auto beside an unset job", "", auto, false},
+		{"unset beside an auto job", auto, "", false},
+		{"auto beside an auto job", auto, auto, false},
+		{"on beside an on job", on, on, false},
+		{"off beside an auto job", auto, off, true},
+		{"on beside an auto job", auto, on, true},
+		{"on beside an unset job", "", on, true},
+		{"auto beside an on job", on, auto, true},
+		{"off beside an on job", on, off, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			job := discoveryKeyConfig(tc.job)
+			got := requestOverrideCacheKey(job, discoveryKeyConfig(tc.cfg))
+			own := requestOverrideCacheKey(job, discoveryKeyConfig(tc.job))
+			if tc.splits && got == own {
+				t.Errorf("a mode %q beside a job mode %q must split from the job's own bundle", tc.cfg, tc.job)
+			}
+			if !tc.splits && got != own {
+				t.Errorf("a mode %q beside a job mode %q must share the job's own bundle", tc.cfg, tc.job)
+			}
+		})
+	}
+
+	// Through ApplyContextOverrides, where the booleans and the inheritance
+	// happen, an explicit auto under a job-level auto shares the unset bundle
+	// and an explicit on under a job-level auto splits from it.
+	job := discoveryEffectiveJob()
+	job.APIEndpointDiscovery = auto
+	keyFor := func(extra map[string]any) string {
+		eff, _, _, err := config.ApplyContextOverrides(job, extra)
+		if err != nil {
+			t.Fatalf("ApplyContextOverrides(%v): %v", extra, err)
+		}
+		return requestOverrideCacheKey(job, eff)
+	}
+	unset := keyFor(map[string]any{"pve_vm_storage": "other"})
+	if got := keyFor(map[string]any{"pve_vm_storage": "other", "pve_api_endpoint_discovery": "auto"}); got != unset {
+		t.Error("an explicit auto under a job-level auto must share the unset bundle")
+	}
+	if got := keyFor(map[string]any{"pve_vm_storage": "other", "pve_api_endpoint_discovery": "on"}); got == unset {
+		t.Error("an explicit on under a job-level auto must split from the unset bundle")
+	}
+	if got := keyFor(map[string]any{"pve_vm_storage": "other", "pve_api_endpoint_discovery": true}); got == unset {
+		t.Error("a boolean true under a job-level auto reads as on and must split from the unset bundle")
 	}
 }
 
@@ -341,7 +425,8 @@ func TestRequestOverrideCacheKey_DiscoveryModeSeparatesConfigs(t *testing.T) {
 // a fixed config with no discovery mode to the value the key function produced
 // before the mode was folded in, so no warm cached client is dropped on
 // upgrade. It is the same fixed config and golden value as the endpoint list
-// test, because an unset mode and an empty list must both add nothing.
+// test, because an unset mode and an empty list must both add nothing. A mode
+// that matches the job's adds nothing either.
 func TestRequestOverrideCacheKey_NoModeKeysAsBeforeTheModeExisted(t *testing.T) {
 	t.Parallel()
 	const golden = "e1b319f637957cfa0d54052d63706dd2951c0350482db1975f46542f0d2d84d3"
@@ -349,11 +434,74 @@ func TestRequestOverrideCacheKey_NoModeKeysAsBeforeTheModeExisted(t *testing.T) 
 		Host: "pve-a.example", Port: 8006, User: "cpi", Realm: "pam", Node: "pve1", Password: "pw-one",
 		VMStorage: "local-lvm", DiskStorage: "local-lvm", NetworkBridge: "vmbr0",
 	}
-	if got := requestOverrideCacheKey(cfg); got != golden {
+	if got := requestOverrideCacheKey(nil, cfg); got != golden {
 		t.Errorf("key = %s, want %s", got, golden)
 	}
 	cfg.APIEndpointDiscovery = config.DiscoveryModeAuto
-	if got := requestOverrideCacheKey(cfg); got == golden {
-		t.Error("an explicit auto must key differently from an unset mode")
+	if got := requestOverrideCacheKey(nil, cfg); got != golden {
+		t.Errorf("key with an explicit auto = %s, want %s", got, golden)
+	}
+	cfg.APIEndpointDiscovery = config.DiscoveryModeOn
+	if got := requestOverrideCacheKey(nil, cfg); got == golden {
+		t.Error("an explicit on beside an unset job mode must key differently")
+	}
+	job := *cfg
+	if got := requestOverrideCacheKey(&job, cfg); got != golden {
+		t.Errorf("an on that matches the job's on keyed %s, want %s", got, golden)
+	}
+	cfgAuto := *cfg
+	cfgAuto.APIEndpointDiscovery = config.DiscoveryModeAuto
+	jobUnset := cfgAuto
+	jobUnset.APIEndpointDiscovery = ""
+	if requestOverrideCacheKey(&jobUnset, &cfgAuto) != requestOverrideCacheKey(&jobUnset, &jobUnset) {
+		t.Error("an explicit auto must key like an unset mode beside an unset job")
+	}
+}
+
+// TestRequestOverrideCacheKey_LooserTLSFlagSeparatesEntries asserts that two
+// entries which name the same TLS keys, and differ only in whether they
+// inherited the job's credentials, never share a bundle. Entry A inherits the
+// token and so resolves its discovery to off. Entry B restates the token
+// itself and keeps the mode it would otherwise have. Whichever is built
+// first, the other must not reuse its client, and A must always resolve to off.
+func TestRequestOverrideCacheKey_LooserTLSFlagSeparatesEntries(t *testing.T) {
+	t.Parallel()
+	job := discoveryEffectiveJob()
+	build := func(extra map[string]any) *config.CPIConfig {
+		eff, _, _, err := config.ApplyContextOverrides(job, extra)
+		if err != nil {
+			t.Fatalf("ApplyContextOverrides(%v): %v", extra, err)
+		}
+		return eff
+	}
+	entryA := func() map[string]any { return map[string]any{"pve_verify_ssl": false} }
+	entryB := func() map[string]any {
+		return map[string]any{"pve_verify_ssl": false, "pve_api_token": job.APIToken, "pve_user": job.User}
+	}
+	for name, aFirst := range map[string]bool{"A then B": true, "B then A": false} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var effA, effB *config.CPIConfig
+			if aFirst {
+				effA = build(entryA())
+				effB = build(entryB())
+			} else {
+				effB = build(entryB())
+				effA = build(entryA())
+			}
+			if !effA.InheritedCredsLooserTLS() || effB.InheritedCredsLooserTLS() {
+				t.Fatalf("flags = %v and %v, want the inheriting entry flagged and the other not",
+					effA.InheritedCredsLooserTLS(), effB.InheritedCredsLooserTLS())
+			}
+			if requestOverrideCacheKey(job, effA) == requestOverrideCacheKey(job, effB) {
+				t.Error("entries that differ only in the looser TLS flag must not share a bundle")
+			}
+			if mode, _ := config.EffectiveDiscoveryMode(effA); mode != config.DiscoveryModeOff {
+				t.Errorf("the inheriting entry resolves to %q, want off", mode)
+			}
+			if mode, _ := config.EffectiveDiscoveryMode(effB); mode != config.DiscoveryModeOn {
+				t.Errorf("the entry with its own token resolves to %q, want on", mode)
+			}
+		})
 	}
 }
