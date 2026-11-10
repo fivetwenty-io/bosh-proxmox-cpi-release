@@ -111,12 +111,14 @@ func (c *Context) decodeDirectorMap(name string, raw json.RawMessage) map[string
 //     "stemcell" → the value is ignored and its name recorded in
 //     ClashingKeys, since only a cpi_config property of that name can cause
 //     it and failing the request would punish a harmless entry.
-//   - An extra key's raw value itself is malformed JSON → that single key is
-//     skipped from Extra rather than failing the whole Context decode; this
-//     can only happen if the outer json.Unmarshal already partially decoded
-//     the object into map[string]json.RawMessage, which by construction only
-//     contains syntactically valid JSON fragments, so this branch is
-//     defensive and not expected to be reachable in practice.
+//   - An extra key's value holds a number outside the range of a float64,
+//     such as 1e400 → wrapped decode error that names the property, and
+//     for a member of the pve object names it as pve.<member>. No key is
+//     dropped without a refusal, because a key that vanished would leave
+//     the request running against the job's cluster. The one exception is
+//     the discovery mode, flat or inside the pve object, which keeps the
+//     value as raw text so the override refusal can repeat it as written
+//     (see KeepRawDiscoveryMode).
 //
 // data may be nil or the literal "null"; both decode to a zero Context.
 func (c *Context) UnmarshalJSON(data []byte) error {
@@ -154,16 +156,14 @@ func (c *Context) UnmarshalJSON(data []byte) error {
 		if _, known := knownContextFields[key]; known {
 			continue
 		}
-		var decoded any
-		if err := json.Unmarshal(val, &decoded); err != nil {
-			// Defensive only — see doc comment. Skip rather than fail the
-			// whole Context decode over one unparsable extra key.
-			continue
+		decoded, err := decodeExtraValue(key, val)
+		if err != nil {
+			return fmt.Errorf("jsonrpc: decode context: %w", err)
 		}
 		if c.Extra == nil {
 			c.Extra = make(map[string]any, len(raw))
 		}
-		c.Extra[key] = KeepRawDiscoveryMode(key, val, decoded)
+		c.Extra[key] = decoded
 	}
 	return nil
 }
@@ -173,14 +173,85 @@ func (c *Context) UnmarshalJSON(data []byte) error {
 // once flattened.
 const discoveryModeKey = "api_endpoint_discovery"
 
+// decodeExtraValue decodes the value of one extra context key into the
+// generic shapes encoding/json gives, and keeps the discovery mode raw where
+// KeepRawDiscoveryMode says to. The raw text is valid JSON, so the only way
+// the decode can fail is a number outside the range of a float64, which
+// encoding/json refuses and leaves out of the value. That failure is returned
+// naming the key, except for the discovery mode, whose refusal reports the
+// value, so it is kept as raw text instead.
+func decodeExtraValue(key string, raw json.RawMessage) (any, error) {
+	var decoded any
+	err := json.Unmarshal(raw, &decoded)
+	if err == nil {
+		return KeepRawDiscoveryMode(key, raw, decoded), nil
+	}
+	switch key {
+	case "pve_" + discoveryModeKey:
+		return raw, nil
+	case "pve":
+		return decodePVEObjectWithOverflow(raw, err)
+	}
+	return nil, propertyError(key, err)
+}
+
+// decodePVEObjectWithOverflow decodes the pve object one member at a time
+// after decoding it whole failed with cause, so that one member out of range
+// is named and does not take the others with it. A pve value that is not an
+// object is reported under its own name. The discovery mode member keeps its
+// raw text, and the first other member that fails, in name order, is reported as
+// pve.<member>.
+func decodePVEObjectWithOverflow(raw json.RawMessage, cause error) (any, error) {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return nil, propertyError("pve", cause)
+	}
+	names := make([]string, 0, len(members))
+	for name := range members {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	object := make(map[string]any, len(members))
+	for _, name := range names {
+		member := members[name]
+		var value any
+		if err := json.Unmarshal(member, &value); err != nil {
+			if name != discoveryModeKey {
+				return nil, propertyError("pve."+name, err)
+			}
+			object[name] = member
+			continue
+		}
+		if name == discoveryModeKey {
+			value = rawUnlessScalar(member, value)
+		}
+		object[name] = value
+	}
+	return object, nil
+}
+
+// propertyError names the property whose value failed to decode. A number out
+// of range is reported without its digits, since the text can be any length.
+func propertyError(name string, err error) error {
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) {
+		return fmt.Errorf("property %q holds a number outside the range of a 64-bit float", name)
+	}
+	return fmt.Errorf("property %q: %w", name, err)
+}
+
 // KeepRawDiscoveryMode returns the value to store in a property map for key,
 // which Context uses for Extra and the cpi-config reader uses for an entry's
-// properties. The
-// discovery mode refuses a value that is not a string or a boolean, and the
-// refusal repeats the value as it was written, which the decoded form cannot
-// give back for 5.0 or an object. So a value of that kind, at the top level or
-// inside the pve object, is kept as json.RawMessage. Every other value, and
-// every other key, is returned as decoded.
+// properties. The discovery mode refuses a value that is not a string or a
+// boolean, and the refusal repeats the value as it was written, which the
+// decoded form cannot give back for 5.0 or an object. So a value of that kind,
+// at the top level or inside the pve object, is kept as json.RawMessage. Every
+// other value, and every other key, is returned as decoded.
+//
+// For the pve key it edits decoded in place, setting the discovery mode member
+// of the map it was given, and returns that same map. The caller must pass a
+// map it owns, such as one it has just decoded, and must not pass one that
+// other code reads.
 func KeepRawDiscoveryMode(key string, raw json.RawMessage, decoded any) any {
 	switch key {
 	case "pve_" + discoveryModeKey:

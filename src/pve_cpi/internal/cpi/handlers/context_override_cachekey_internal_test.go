@@ -421,6 +421,85 @@ func TestRequestOverrideCacheKey_DiscoveryModeIsComparedWithTheJobs(t *testing.T
 	}
 }
 
+// TestRequestOverrideCacheKey_DependsOnTheJobConfig asserts that the key is a
+// function of the job config as well as of the effective config. The same
+// effective config keys differently under a job config whose mode it matches
+// and under one whose mode it differs from, and it keys the same under two job
+// configs that it differs from alike, since the bundle is then the same.
+func TestRequestOverrideCacheKey_DependsOnTheJobConfig(t *testing.T) {
+	t.Parallel()
+	const (
+		auto = config.DiscoveryModeAuto
+		on   = config.DiscoveryModeOn
+		off  = config.DiscoveryModeOff
+	)
+	cfg := discoveryKeyConfig(on)
+	underAuto := requestOverrideCacheKey(discoveryKeyConfig(auto), cfg)
+	underOn := requestOverrideCacheKey(discoveryKeyConfig(on), cfg)
+	underOff := requestOverrideCacheKey(discoveryKeyConfig(off), cfg)
+	if underAuto == underOn {
+		t.Error("the same config keys alike under a job it matches and under an auto job it differs from")
+	}
+	if underOff == underOn {
+		t.Error("the same config keys alike under a job it matches and under an off job it differs from")
+	}
+	if underAuto != underOff {
+		t.Error("the same config keys differently under two job configs that it differs from in the same way")
+	}
+}
+
+// TestRequestOverrideCacheKey_JobConfigsNeverShareAKeyForTheSameEntry applies
+// one entry under two job configs that differ in a single field the key reads
+// and requires the two keys to differ, so a key built under one job config is
+// never taken for the key of the same entry under another. The discovery mode
+// row names a mode that matches one job's and not the other's.
+func TestRequestOverrideCacheKey_JobConfigsNeverShareAKeyForTheSameEntry(t *testing.T) {
+	t.Parallel()
+	ca := selfSignedCAPEMForCacheKeyTest(t)
+	verifyOff := false
+	for name, tc := range map[string]struct {
+		vary  func(*config.CPIConfig)
+		entry map[string]any
+	}{
+		"host":              {func(c *config.CPIConfig) { c.Host = "pve-b.example" }, map[string]any{"pve_vm_storage": "other"}},
+		"port":              {func(c *config.CPIConfig) { c.Port = 8007 }, map[string]any{"pve_vm_storage": "other"}},
+		"realm":             {func(c *config.CPIConfig) { c.Realm = "pam" }, map[string]any{"pve_vm_storage": "other"}},
+		"token":             {func(c *config.CPIConfig) { c.APIToken = "u@pve!cpi=another-token" }, map[string]any{"pve_vm_storage": "other"}},
+		"node":              {func(c *config.CPIConfig) { c.Node = "pve2" }, map[string]any{"pve_vm_storage": "other"}},
+		"certificate check": {func(c *config.CPIConfig) { c.VerifySSL = &verifyOff }, map[string]any{"pve_vm_storage": "other"}},
+		"CA":                {func(c *config.CPIConfig) { c.PVECACertPEM = ca }, map[string]any{"pve_vm_storage": "other"}},
+		"discovery mode named by the entry": {
+			func(c *config.CPIConfig) { c.APIEndpointDiscovery = config.DiscoveryModeOn },
+			map[string]any{"pve_api_endpoint_discovery": "on"},
+		},
+		"discovery mode restated as auto": {
+			func(c *config.CPIConfig) { c.APIEndpointDiscovery = config.DiscoveryModeOff },
+			map[string]any{"pve_api_endpoint_discovery": "auto"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			jobA := discoveryEffectiveJob()
+			jobB := discoveryEffectiveJob()
+			tc.vary(jobB)
+			keyUnder := func(job *config.CPIConfig) string {
+				eff, _, _, err := config.ApplyContextOverrides(job, tc.entry)
+				if err != nil {
+					t.Fatalf("ApplyContextOverrides(%v): %v", tc.entry, err)
+				}
+				return requestOverrideCacheKey(job, eff)
+			}
+			first, again := keyUnder(jobA), keyUnder(jobA)
+			if first != again {
+				t.Error("the key must be deterministic under one job config")
+			}
+			if first == keyUnder(jobB) {
+				t.Errorf("the same entry keys alike under job configs that differ in the %s", name)
+			}
+		})
+	}
+}
+
 // TestRequestOverrideCacheKey_NoModeKeysAsBeforeTheModeExisted pins the key of
 // a fixed config with no discovery mode to the value the key function produced
 // before the mode was folded in, so no warm cached client is dropped on

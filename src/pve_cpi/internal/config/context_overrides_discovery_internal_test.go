@@ -170,14 +170,30 @@ func rewrapPEM(t *testing.T, certPEM string, width int) string {
 	return strings.Join(out, "\n") + "\n"
 }
 
+// withPEMHeader writes the single certificate in certPEM with a header line,
+// the way x509.CertPool.AppendCertsFromPEM refuses to load.
+func withPEMHeader(t *testing.T, certPEM string) string {
+	t.Helper()
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		t.Fatal("no PEM block to add a header to")
+	}
+	block.Headers = map[string]string{"X-Note": "kept for the audit"}
+	return string(pem.EncodeToMemory(block))
+}
+
 // TestMarkInheritedCredsLooserTLS_ComparesCAsAsSetsOfCertificates asserts that
 // an entry which restates the job's CA in another spelling is not looser,
-// that one which trusts a different set is, and that a bundle which does not
-// parse fails closed.
+// that one which loads a different set of roots is, and that a bundle which
+// loads no roots fails closed. A block the client's pool skips, whether for
+// its headers, its type, or DER that does not parse, is skipped here too.
 func TestMarkInheritedCredsLooserTLS_ComparesCAsAsSetsOfCertificates(t *testing.T) {
 	t.Parallel()
 	one, two := discoveryTestCA(t), discoveryTestCA(t)
 	bundle := one + two
+	headed := withPEMHeader(t, two)
+	notACert := "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+	privateKey := strings.ReplaceAll(two, "CERTIFICATE", "PRIVATE KEY")
 	for _, tc := range []struct {
 		name   string
 		jobCA  string
@@ -203,11 +219,22 @@ func TestMarkInheritedCredsLooserTLS_ComparesCAsAsSetsOfCertificates(t *testing.
 		{"lower-cased text", one, strings.ToLower(one), true},
 		{"text that holds no certificate", one, "not a certificate\n", true},
 		{"a block of another type", one, strings.ReplaceAll(one, "CERTIFICATE", "PRIVATE KEY"), true},
-		{"a certificate beside a block of another type", one,
-			one + strings.ReplaceAll(two, "CERTIFICATE", "PRIVATE KEY"), true},
+		{"a certificate beside a block of another type in the entry", one, one + privateKey, false},
+		{"a certificate beside a block of another type in the job", one + privateKey, one, false},
+		{"a block of another type beside the second root", bundle, one + privateKey, true},
+		{"a certificate beside bytes that are not a certificate", one, one + notACert, false},
 		{"the same unparseable text on both sides", "not a certificate\n", "not a certificate\n", true},
-		{"a certificate block with bytes that are not a certificate", one,
-			"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", true},
+		{"the same block of another type on both sides", privateKey, privateKey, true},
+		{"a certificate block with bytes that are not a certificate", one, notACert, true},
+		{"the same bytes that are not a certificate on both sides", notACert, notACert, true},
+		{"whitespace in place of a CA on both sides", " \n", " \n", true},
+		{"a header-bearing block in the job's CA, the entry trusting both", one + headed, bundle, true},
+		{"a header-bearing block in the entry's CA, the job trusting both", bundle, one + headed, true},
+		{"a header-bearing block on both sides", one + headed, one + headed, false},
+		{"a header-bearing block beside the plain one", one + headed, one, false},
+		{"only a header-bearing block in the job's CA", headed, two, true},
+		{"only a header-bearing block in the entry's CA", two, headed, true},
+		{"a header-bearing block alone on both sides", headed, headed, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -221,6 +248,50 @@ func TestMarkInheritedCredsLooserTLS_ComparesCAsAsSetsOfCertificates(t *testing.
 			}
 			if got := sameCASet(tc.jobCA, tc.entry); got == tc.looser {
 				t.Errorf("sameCASet = %v, want %v", got, !tc.looser)
+			}
+		})
+	}
+}
+
+// TestApplyContextOverrides_AHeaderBearingBlockDoesNotHideAnExtraRoot drives
+// the case where the job's CA holds a block with headers, which the client
+// does not load. The entry then trusts a root the job does not, so the entry
+// has to count as looser and the mode on has to be refused, and an entry that
+// leaves the headed block out of its own CA has to count the same way.
+func TestApplyContextOverrides_AHeaderBearingBlockDoesNotHideAnExtraRoot(t *testing.T) {
+	t.Parallel()
+	one, two := discoveryTestCA(t), discoveryTestCA(t)
+	headed := withPEMHeader(t, two)
+	loaded := func(bundle string) *x509.CertPool {
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM([]byte(bundle))
+		return pool
+	}
+	for name, tc := range map[string]struct {
+		jobCA, entryCA string
+	}{
+		"the job's CA holds the headed block":   {one + headed, one + two},
+		"the entry's CA holds the headed block": {one + two, one + headed},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if loaded(tc.jobCA).Equal(loaded(tc.entryCA)) {
+				t.Fatal("the two bundles load the same roots, want different roots for this case")
+			}
+			base := discoveryOverrideBase()
+			base.PVECACertPEM = tc.jobCA
+			_, _, _, err := ApplyContextOverrides(base, map[string]any{
+				"pve_ca_cert": tc.entryCA, "pve_api_endpoint_discovery": "on",
+			})
+			if err == nil || !strings.Contains(err.Error(), "looser TLS than the job") {
+				t.Errorf("mode on beside a different set of roots: err = %v, want the looser TLS refusal", err)
+			}
+			eff, _, _, err := ApplyContextOverrides(base, map[string]any{"pve_ca_cert": tc.entryCA})
+			if err != nil {
+				t.Fatalf("ApplyContextOverrides: %v", err)
+			}
+			if !eff.InheritedCredsLooserTLS() {
+				t.Error("InheritedCredsLooserTLS = false, want true for an entry that loads other roots")
 			}
 		})
 	}
@@ -266,6 +337,7 @@ func TestApplyContextOverrides_DiscoveryModeWrongTypeEchoesTheRawText(t *testing
 		`5`, `5.0`, `1e3`, `-0.0`, `12345678901234567890`, `1.5`,
 		`{"a":1}`, `{ "b" : 2 , "a" : [ 1 , 2 ] }`, `[ "on" ]`, `["<&>"]`,
 		`[` + strings.Repeat("1", discoveryEchoLimit+10) + `]`,
+		`1e400`, `-1e400`, `1E+999`, strings.Repeat("9", 400), `[1e400]`, `{"a":1e400}`,
 	} {
 		t.Run(raw, func(t *testing.T) {
 			t.Parallel()
@@ -339,6 +411,33 @@ func TestApplyContextOverrides_LooserTLSRefusalNamesTheEntry(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q lacks %q", err, want)
 		}
+	}
+}
+
+// TestApplyContextOverrides_ValidationRefusalNamesTheEntrysHostNotTheJobs
+// asserts that when the entry sits on another host from the job, the refusal
+// names the entry's host and leaves the job's out. The entry has its own user
+// and password, turns verification off, and asks for the mode on, which
+// validation refuses for a password without verification.
+func TestApplyContextOverrides_ValidationRefusalNamesTheEntrysHostNotTheJobs(t *testing.T) {
+	t.Parallel()
+	base := discoveryOverrideBase()
+	_, _, _, err := ApplyContextOverrides(base, map[string]any{
+		"pve_host":                   "pve-b.example",
+		"pve_user":                   "root",
+		"pve_password":               "entry-password",
+		"pve_verify_ssl":             false,
+		"pve_api_endpoint_discovery": "on",
+	})
+	if err == nil {
+		t.Fatal("ApplyContextOverrides accepted mode on with a password and no verification")
+	}
+	const want = `context entry for host "pve-b.example": effective override config failed validation`
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q lacks %q", err, want)
+	}
+	if strings.Contains(err.Error(), base.Host) {
+		t.Errorf("error %q names the job's host %q", err, base.Host)
 	}
 }
 

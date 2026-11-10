@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"math"
 	"os"
 	"reflect"
 	"strings"
@@ -585,5 +586,115 @@ func TestContext_UnmarshalJSON_KeepsTheDiscoveryModeRawWhenItIsNotAScalar(t *tes
 	}
 	if pve["vm_storage"] != "s" || pve["port"] != float64(1) {
 		t.Errorf("the other pve members = %#v, want them decoded as before", pve)
+	}
+}
+
+// TestContext_UnmarshalJSON_KeepsTheDiscoveryModeRawWhenItOverflows asserts
+// that a discovery mode holding a number outside the range of a float64 is
+// kept as the text it was written with, flat and inside the pve object, and
+// that the other members of the pve object and the other keys still decode.
+// Plain decoding refuses such a number, which once took the whole key, and for
+// the pve object every member beside it, out of Extra without a word.
+func TestContext_UnmarshalJSON_KeepsTheDiscoveryModeRawWhenItOverflows(t *testing.T) {
+	t.Parallel()
+	huge := strings.Repeat("9", 400)
+	for name, raw := range map[string]string{
+		"exponent":          `1e400`,
+		"negative exponent": `-1e400`,
+		"long integer":      huge,
+		"inside a list":     `[ 1e400 ]`,
+		"inside an object":  `{ "a" : 1e400 }`,
+	} {
+		t.Run("flat "+name, func(t *testing.T) {
+			t.Parallel()
+			var ctx Context
+			input := `{"pve_host":"h","pve_api_endpoint_discovery":` + raw + `}`
+			if err := json.Unmarshal([]byte(input), &ctx); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if got := ctx.Extra["pve_api_endpoint_discovery"]; !reflect.DeepEqual(got, json.RawMessage(raw)) {
+				t.Errorf("Extra[pve_api_endpoint_discovery] = %#v, want the raw text %s", got, raw)
+			}
+			if ctx.Extra["pve_host"] != "h" {
+				t.Errorf("Extra[pve_host] = %#v, want h", ctx.Extra["pve_host"])
+			}
+		})
+		t.Run("nested "+name, func(t *testing.T) {
+			t.Parallel()
+			var ctx Context
+			input := `{"pve":{"host":"h","port":8006,"api_endpoint_discovery":` + raw + `,"vm_storage":"s"}}`
+			if err := json.Unmarshal([]byte(input), &ctx); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			want := map[string]any{
+				"host": "h", "port": float64(8006), "vm_storage": "s",
+				"api_endpoint_discovery": json.RawMessage(raw),
+			}
+			if got := ctx.Extra["pve"]; !reflect.DeepEqual(got, want) {
+				t.Errorf("Extra[pve] = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+// TestContext_UnmarshalJSON_RefusesAnOverflowingNumberInAnyOtherProperty
+// asserts that a number outside the range of a float64 in any property but the
+// discovery mode fails the decode with an error that names the property, and
+// for a member of the pve object names it as pve.<member>, where it once
+// dropped the key, or the whole pve object, without a refusal.
+func TestContext_UnmarshalJSON_RefusesAnOverflowingNumberInAnyOtherProperty(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		input string
+		named string
+	}{
+		"flat number":           {`{"pve_host":"h","pve_port":1e400}`, `property "pve_port"`},
+		"flat long integer":     {`{"pve_port":` + strings.Repeat("9", 400) + `}`, `property "pve_port"`},
+		"flat inside a list":    {`{"pve_ports":[1,1e400]}`, `property "pve_ports"`},
+		"flat inside an object": {`{"agent":{"mbus":{"n":-1e400}}}`, `property "agent"`},
+		"pve member":            {`{"pve":{"host":"h","port":1e400}}`, `property "pve.port"`},
+		"pve member in a list":  {`{"pve":{"host":"h","ports":[1e400]}}`, `property "pve.ports"`},
+		"pve member beside a discovery mode": {
+			`{"pve":{"api_endpoint_discovery":1e400,"port":1e400}}`, `property "pve.port"`},
+		"pve as a list":            {`{"pve":[1e400]}`, `property "pve"`},
+		"first pve member by name": {`{"pve":{"b":1e400,"a":1e400}}`, `property "pve.a"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var ctx Context
+			err := json.Unmarshal([]byte(tc.input), &ctx)
+			if err == nil {
+				t.Fatalf("Unmarshal accepted %s and left Extra = %#v", tc.input, ctx.Extra)
+			}
+			if !strings.Contains(err.Error(), tc.named) {
+				t.Errorf("error %q does not contain %q", err, tc.named)
+			}
+			if !strings.Contains(err.Error(), "jsonrpc: decode context") {
+				t.Errorf("error %q is not wrapped as a context decode error", err)
+			}
+			if !strings.Contains(err.Error(), "outside the range of a 64-bit float") || len(err.Error()) > 200 {
+				t.Errorf("error %q should say the number is out of range, without its digits", err)
+			}
+		})
+	}
+}
+
+// TestContext_UnmarshalJSON_NumbersAtTheEdgeOfTheFloatRangeStillDecode asserts that
+// numbers at the edge of the float64 range still decode as before, so only a
+// number beyond it is refused.
+func TestContext_UnmarshalJSON_NumbersAtTheEdgeOfTheFloatRangeStillDecode(t *testing.T) {
+	t.Parallel()
+	var ctx Context
+	input := `{"pve_big":1.7976931348623157e308,` +
+		`"pve":{"small":5e-324,"neg":-1.7976931348623157e308,"api_endpoint_discovery":"on"}}`
+	if err := json.Unmarshal([]byte(input), &ctx); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got := ctx.Extra["pve_big"]; got != math.MaxFloat64 {
+		t.Errorf("Extra[pve_big] = %#v, want MaxFloat64", got)
+	}
+	pve, _ := ctx.Extra["pve"].(map[string]any)
+	if pve["small"] != 5e-324 || pve["neg"] != -math.MaxFloat64 || pve["api_endpoint_discovery"] != "on" {
+		t.Errorf("Extra[pve] = %#v, want the values decoded as before", pve)
 	}
 }

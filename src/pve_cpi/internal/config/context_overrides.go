@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"maps"
 	"math"
@@ -1215,9 +1214,9 @@ var tlsOverrideKeys = []string{"pve_verify_ssl", "pve_ca_cert"}
 // are looser when the job verifies certificates and the entry either turns
 // verification off or verifies against a different CA than the job's. A job
 // that already skips verification has nothing left to loosen. The CAs are
-// compared as sets of certificates (see sameCASet), because a bundle that
-// differs only in line endings, comments, order, or repeats is the same trust
-// root.
+// compared as the sets of roots the client would load (see sameCASet), because
+// a bundle that differs only in line endings, comments, order, or repeats is
+// the same trust root.
 func markInheritedCredsLooserTLS(base, eff *CPIConfig, extra map[string]any) {
 	present := func(key string) bool {
 		_, ok := extra[key]
@@ -1237,53 +1236,26 @@ func markInheritedCredsLooserTLS(base, eff *CPIConfig, extra map[string]any) {
 	}
 }
 
-// sameCASet reports whether two PEM bundles trust the same certificates. It
-// decodes every block on each side into DER and compares the two sets without
-// regard to order or repeats, so line endings, comment lines, and wrapping do
-// not count. A bundle with no text holds no certificates, which is the system
-// pool. A bundle that has text but fails to parse, whether from a block that
-// is not a certificate or from DER that is not one, never matches, so the
-// answer fails closed and the entry counts as looser. A bundle that trusts
-// fewer roots than the other also differs.
+// sameCASet reports whether two PEM bundles load the same set of roots. Each
+// bundle is loaded the way the client loads the CA it is given, by
+// x509.CertPool.AppendCertsFromPEM, so a block with headers, a block of a type
+// other than CERTIFICATE, and a block whose DER does not parse are skipped
+// here exactly as they are there, and the two pools are then compared with
+// x509.CertPool.Equal, which ignores order, repeats, line endings, comment
+// lines, and wrapping. A bundle that loads no roots never matches anything,
+// so an entry whose CA the client could not use counts as looser. The one
+// exception is two empty strings, which both select the system pool and so
+// are the same CA.
 func sameCASet(a, b string) bool {
-	setA, okA := caCertificateSet(a)
-	setB, okB := caCertificateSet(b)
-	if !okA || !okB || len(setA) != len(setB) {
+	if a == "" && b == "" {
+		return true
+	}
+	poolA := x509.NewCertPool()
+	poolB := x509.NewCertPool()
+	if !poolA.AppendCertsFromPEM([]byte(a)) || !poolB.AppendCertsFromPEM([]byte(b)) {
 		return false
 	}
-	for der := range setA {
-		if _, found := setB[der]; !found {
-			return false
-		}
-	}
-	return true
-}
-
-// caCertificateSet returns the DER of every certificate in a PEM bundle, as
-// map keys. It reports false for text that holds no certificate, a block of
-// another type, or a block whose DER does not parse. Whitespace-only text is
-// an empty set.
-func caCertificateSet(bundle string) (map[string]struct{}, bool) {
-	set := map[string]struct{}{}
-	rest := []byte(bundle)
-	for {
-		var block *pem.Block
-		block, rest = pem.Decode(rest)
-		if block == nil {
-			break
-		}
-		if block.Type != "CERTIFICATE" {
-			return nil, false
-		}
-		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
-			return nil, false
-		}
-		set[string(block.Bytes)] = struct{}{}
-	}
-	if len(set) == 0 && strings.TrimSpace(bundle) != "" {
-		return nil, false
-	}
-	return set, true
+	return poolA.Equal(poolB)
 }
 
 // ApplyContextOverrides returns a per-request effective CPIConfig built by

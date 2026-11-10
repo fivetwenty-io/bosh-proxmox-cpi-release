@@ -85,3 +85,59 @@ func TestParseCPIConfig_OtherPropertiesDecodeAsBefore(t *testing.T) {
 		t.Error("an entry whose properties are a list was accepted")
 	}
 }
+
+// TestParseCPIConfig_MalformedEntriesReportWhatPlainDecodingReports asserts
+// that an entry which does not decode fails with the text and the field path
+// that plain struct decoding gives, because the operator fixing the file reads
+// it, and that no internal type name appears in it. The expected text comes
+// from decoding the same entries into a type of the same name and shape that
+// has no custom decoding.
+func TestParseCPIConfig_MalformedEntriesReportWhatPlainDecodingReports(t *testing.T) {
+	t.Parallel()
+	type cpiConfigEntry struct {
+		Name       string         `json:"name"`
+		Type       string         `json:"type"`
+		Properties map[string]any `json:"properties"`
+	}
+	big := strings.Repeat("9", 400)
+	for name, list := range map[string]string{
+		"a numeric name":                   `[{"name":5}]`,
+		"a numeric type":                   `[{"name":"a","type":5}]`,
+		"an entry that is a number":        `[5]`,
+		"an entry that is a string":        `["x"]`,
+		"an entry that is a list":          `[[1]]`,
+		"properties that are a string":     `[{"name":"a","properties":"str"}]`,
+		"properties that are a list":       `[{"name":"a","properties":[1]}]`,
+		"properties that are a number":     `[{"name":"a","properties":7}]`,
+		"a number out of range":            `[{"name":"a","properties":{"x":1e400}}]`,
+		"a long integer out of range":      `[{"name":"a","properties":{"x":` + big + `}}]`,
+		"a number out of range in pve":     `[{"name":"a","properties":{"pve":{"port":1e400}}}]`,
+		"a mode out of range, flat":        `[{"name":"a","properties":{"pve_api_endpoint_discovery":1e400}}]`,
+		"a mode out of range, nested":      `[{"name":"a","properties":{"pve":{"api_endpoint_discovery":1e400}}}]`,
+		"a second entry that is malformed": `[{"name":"a"},{"name":6}]`,
+	} {
+		for shape, document := range map[string]string{
+			"bare list":   list,
+			"cpis object": `{"cpis":` + list + `}`,
+		} {
+			t.Run(name+" in a "+shape, func(t *testing.T) {
+				t.Parallel()
+				var plain []cpiConfigEntry
+				plainErr := json.Unmarshal([]byte(list), &plain)
+				if plainErr == nil {
+					t.Fatalf("plain decoding accepted %s", list)
+				}
+				_, err := parseCPIConfig([]byte(document))
+				if err == nil {
+					t.Fatalf("parseCPIConfig accepted %s", document)
+				}
+				if !strings.HasSuffix(err.Error(), plainErr.Error()) {
+					t.Errorf("error\n  %q\ndoes not end with the text plain decoding gives\n  %q", err, plainErr)
+				}
+				if strings.Contains(err.Error(), "plain") {
+					t.Errorf("error %q names an internal type", err)
+				}
+			})
+		}
+	}
+}

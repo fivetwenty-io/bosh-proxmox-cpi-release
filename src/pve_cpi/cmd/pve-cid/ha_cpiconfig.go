@@ -21,30 +21,39 @@ type cpiConfigEntry struct {
 	Properties map[string]any `json:"properties"`
 }
 
-// UnmarshalJSON decodes an entry as plain struct decoding would, and then keeps
-// the discovery mode in its properties as the raw text it was written with
-// when it is not a string, a boolean, or null, as the request context does.
-// The override refusal repeats such a value, and the decoded form cannot give
-// back 5.0 or an object's spacing. Every other property keeps its decoded type.
-func (e *cpiConfigEntry) UnmarshalJSON(data []byte) error {
-	type plain cpiConfigEntry
-	var decoded plain
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
+// decodeEntryList decodes a JSON list of cpis entries. It decodes the list as
+// plain struct decoding does, so a malformed entry reports the text and the
+// field path that decoding gives, and then reads the same bytes a second time
+// to keep the discovery mode in each entry's properties as the raw text it was
+// written with, as the request context does. The override refusal repeats a
+// mode of the wrong type, and the decoded form cannot give back 5.0 or an
+// object's spacing. Every other property keeps its decoded type. The second
+// pass cannot fail where the first succeeded, since it reads less, and it
+// returns its error all the same.
+func decodeEntryList(data []byte) ([]cpiConfigEntry, error) {
+	var list []cpiConfigEntry
+	if err := json.Unmarshal(data, &list); err != nil {
+		return nil, err
 	}
-	if len(decoded.Properties) > 0 {
-		var members struct {
-			Properties map[string]json.RawMessage `json:"properties"`
+	var members []struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(data, &members); err != nil {
+		return nil, err
+	}
+	if len(members) != len(list) {
+		return nil, fmt.Errorf("the cpis list read as %d entries and then as %d", len(list), len(members))
+	}
+	for i := range list {
+		if len(members[i].Properties) != len(list[i].Properties) {
+			return nil, fmt.Errorf("the properties of cpis entry %d read as %d keys and then as %d",
+				i+1, len(list[i].Properties), len(members[i].Properties))
 		}
-		if err := json.Unmarshal(data, &members); err != nil {
-			return err
-		}
-		for key, raw := range members.Properties {
-			decoded.Properties[key] = jsonrpc.KeepRawDiscoveryMode(key, raw, decoded.Properties[key])
+		for key, raw := range members[i].Properties {
+			list[i].Properties[key] = jsonrpc.KeepRawDiscoveryMode(key, raw, list[i].Properties[key])
 		}
 	}
-	*e = cpiConfigEntry(decoded)
-	return nil
+	return list, nil
 }
 
 // haCPIType is the cpis entry type this CPI serves. An entry of any other type
@@ -101,8 +110,8 @@ func decodeCPIEntries(data []byte) ([]cpiConfigEntry, error) {
 		"for example with \"yq -o=json . cpi-config.yml\")"
 	trimmed := strings.TrimSpace(string(data))
 	if strings.HasPrefix(trimmed, "[") {
-		var list []cpiConfigEntry
-		if err := json.Unmarshal([]byte(trimmed), &list); err != nil {
+		list, err := decodeEntryList([]byte(trimmed))
+		if err != nil {
 			return nil, fmt.Errorf("%s: %w", notJSON, err)
 		}
 		return list, nil
@@ -122,8 +131,8 @@ func decodeCPIEntries(data []byte) ([]cpiConfigEntry, error) {
 		}
 		return nil, errors.New("the cpi-config file has no cpis entries")
 	}
-	var list []cpiConfigEntry
-	if err := json.Unmarshal(raw, &list); err != nil {
+	list, err := decodeEntryList(raw)
+	if err != nil {
 		return nil, fmt.Errorf("the cpis value of the cpi-config file is not a list of entries: %w", err)
 	}
 	return list, nil

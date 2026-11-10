@@ -394,8 +394,18 @@ func (r *RequestOverrideRuntime) buildBundle(cfg *config.CPIConfig) (*overrideBu
 // ApplyContextOverrides allocated to get there. Password and APIToken are
 // hashed (sha256) rather than embedded verbatim — the key is never logged
 // today, but hashing costs nothing and keeps that true even if a future
-// caller logs cache diagnostics. job is the job-level config, which the
-// discovery mode is compared against.
+// caller logs cache diagnostics.
+//
+// The key depends on job, the job-level config cfg was derived from, and not
+// on cfg alone. The discovery mode is hashed only when it differs from the
+// job's resolved mode, so an entry that inherits or restates the job's mode
+// keys exactly as it did before the mode could be set per entry. The same cfg
+// can therefore key differently under two job configs, and two cfgs whose
+// modes differ can share a key when each matches its own job's mode. A key is
+// comparable only among requests that share one job config, which holds
+// because one RequestOverrideRuntime serves the one job config its process was
+// started with. A caller that shares a runtime across job configs must add the
+// job's mode to the key first.
 func requestOverrideCacheKey(job, cfg *config.CPIConfig) string {
 	h := sha256.New()
 	// hash.Hash.Write never returns an error, so the Fprintf results are discarded.
