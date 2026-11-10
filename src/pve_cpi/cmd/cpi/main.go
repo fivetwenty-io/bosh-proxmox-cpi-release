@@ -23,7 +23,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
-	"strings"
 	"syscall"
 	"time"
 
@@ -607,57 +606,19 @@ func drainBackgroundWork(ctx context.Context, logger *log.Logger, wait time.Dura
 // still exits with the code the caller computed, because the signal is caught
 // here rather than left to kill the process.
 func drainRemainingBackgroundWork(stderr io.Writer, wait time.Duration) {
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	result := endpointcache.Drain(ctx, drainWait(wait))
-	if len(result.Panics) == 0 {
-		return
-	}
-	logger, err := log.NewLogger("error", stderr)
-	if err != nil {
-		fmt.Fprintf(stderr, "cpi: background workers panicked (%d), and the logger failed: %s\n", len(result.Panics), err)
-		return
-	}
-	logDrainResult(logger, result)
+	endpointcache.DrainAtExit("cpi", stderr, wait)
 }
 
 // drainWait returns wait, or endpointcache.DrainWait when wait is zero or
 // less.
 func drainWait(wait time.Duration) time.Duration {
-	if wait <= 0 {
-		return endpointcache.DrainWait
-	}
-	return wait
+	return endpointcache.DrainWaitFor(wait)
 }
 
-// logDrainResult logs a drain's findings. A panicked worker is an Error with
-// its stack. Cancelled work is logged at the level the drain reports, a Debug
-// line, or a Warn when a cancelled worker serves a cluster config with an
-// explicit "on", because the operator asked for a cache this call did not
-// finish writing. Work that finished in time is a Debug line, and a call that
-// started no worker logs nothing.
+// logDrainResult logs a drain's findings, as endpointcache.LogDrainResult
+// describes.
 func logDrainResult(logger *log.Logger, result endpointcache.DrainResult) {
-	for _, p := range result.Panics {
-		logger.Error("endpoint cache: background worker panicked",
-			log.String("worker", p.Name),
-			log.Any("panic", p.Value),
-			log.String("stack", string(p.Stack)),
-		)
-	}
-	switch {
-	case len(result.Cancelled) > 0:
-		logger.LogAttrs(context.Background(), result.CancelledLevel,
-			"endpoint cache: cancelled background work still running at exit",
-			log.String("workers", strings.Join(result.Cancelled, ", ")),
-			log.Int("started", result.Started),
-			log.String("waited", result.Waited.Round(time.Millisecond).String()),
-		)
-	case result.Started > 0:
-		logger.Debug("endpoint cache: background work finished before exit",
-			log.Int("started", result.Started),
-			log.String("waited", result.Waited.Round(time.Millisecond).String()),
-		)
-	}
+	endpointcache.LogDrainResult(logger, result)
 }
 
 // errSignaled is returned by runCPI when the parent context is cancelled by a signal.

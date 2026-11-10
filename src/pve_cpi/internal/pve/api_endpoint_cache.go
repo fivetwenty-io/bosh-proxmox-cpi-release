@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -20,6 +21,10 @@ import (
 
 // markWorkerName names a down-mark write in the drain's result.
 const markWorkerName = "down mark"
+
+// drainStartedText is why a call that began after the exit drain started runs
+// without the cache.
+const drainStartedText = "the exit drain has started, so the call runs without the cache"
 
 // cacheDirectoryChooser chooses the cache directory for a config. It returns
 // the choice and the notes the layers that declined it want logged at Debug
@@ -82,6 +87,19 @@ func openEndpointCache(cfg *config.CPIConfig, plan *endpointPlan, logger *log.Lo
 		logger.LogAttrs(ctx, level, "api endpoint discovery off: "+why)
 		return nil
 	}
+	// A call that starts after the exit drain began would leave a store that
+	// nothing closes. The drain is a state of the process and not a fault in
+	// the directory, so the line stays at Debug whatever the mode. The check
+	// comes before the directory is chosen or opened, so the call touches
+	// nothing.
+	drainRefused := func() *endpointCache {
+		plan.cacheUnusable = true
+		logger.LogAttrs(ctx, log.LevelDebug, "api endpoint discovery off: "+drainStartedText)
+		return nil
+	}
+	if endpointcache.Draining() {
+		return drainRefused()
+	}
 
 	choice, notes := chooseCacheDirectory(cfg)
 	for _, note := range notes {
@@ -98,7 +116,8 @@ func openEndpointCache(cfg *config.CPIConfig, plan *endpointPlan, logger *log.Lo
 			choice.Path, aliasErr))
 	case aliased:
 		_ = choice.Close()
-		return off(fmt.Sprintf("cache directory %s is the allocation journal directory or sits inside it", choice.Path))
+		return off(fmt.Sprintf("cache directory %s is the allocation journal directory, sits inside it, or "+
+			"contains it", choice.Path))
 	}
 	logger.LogAttrs(ctx, log.LevelDebug, "pve endpoints: cache directory "+choice.Path+", "+layerText(choice.Layer))
 
@@ -119,11 +138,9 @@ func openEndpointCache(cfg *config.CPIConfig, plan *endpointPlan, logger *log.Lo
 	// The release goes first, so every return below leaves the store closed
 	// by the drain or by the code that gave up on it.
 	if !endpointcache.AfterDrain(cache.release) {
+		// The drain began after the check above, while the store was opening.
 		cache.release()
-		plan.cacheUnusable = true
-		logger.LogAttrs(ctx, log.LevelDebug,
-			"api endpoint discovery off: the exit drain has started, so the call runs without the cache")
-		return nil
+		return drainRefused()
 	}
 	if path, replaced := store.SecretReplaced(); replaced {
 		logger.LogAttrs(ctx, log.LevelWarn, "endpoint cache: replaced the directory secret, which had the wrong "+
@@ -311,6 +328,19 @@ func (c *endpointCache) poolAddresses() []string {
 	return out
 }
 
+// dropDiscovered forgets the discovered endpoints, which the pool refused, so
+// the mark writes no longer name them as endpoints the pool holds. A mark for
+// one of them is then pruned like any other mark for an endpoint nobody holds.
+func (c *endpointCache) dropDiscovered() {
+	if c == nil {
+		return
+	}
+	c.discovered = nil
+	if c.sink != nil {
+		c.sink.pool = nil
+	}
+}
+
 // attach gives the pool the cache's mark sink and first-answer hook. A nil
 // cache gives it neither.
 func (c *endpointCache) attach(cfg *endpointpool.Config) {
@@ -351,16 +381,42 @@ func (c *endpointCache) bind(client Client, pool *endpointpool.Pool) {
 	}
 }
 
+// startedAwayLog remembers which starts away from the first endpoint this
+// process has said so about. A CPI call is one process, so saying each start
+// once per process is saying it once per call, whatever number of clients the
+// process builds for the same cluster.
+var startedAwayLog struct {
+	mu   sync.Mutex
+	said map[string]bool
+}
+
+// firstStartedAway reports whether this process has not yet said that it
+// started on start because first was marked down, and records that it has.
+func firstStartedAway(first, start string) bool {
+	startedAwayLog.mu.Lock()
+	defer startedAwayLog.mu.Unlock()
+	key := first + " -> " + start
+	if startedAwayLog.said[key] {
+		return false
+	}
+	if startedAwayLog.said == nil {
+		startedAwayLog.said = map[string]bool{}
+	}
+	startedAwayLog.said[key] = true
+	return true
+}
+
 // logStartedAway logs the Info line for a pool that started on an endpoint
 // other than the first one, because the first carried a down mark that is
 // still in effect. The pool reports a start away only while a mark is in
-// effect, so the line is rare and appears once per call.
+// effect, so the line is rare, and the process says it once however many
+// clients it builds.
 func logStartedAway(pool *endpointpool.Pool, logger *log.Logger) {
 	if pool == nil {
 		return
 	}
 	away, started := pool.StartedAway()
-	if !started {
+	if !started || !firstStartedAway(away.First, away.Start) {
 		return
 	}
 	age := max(cacheClock().Sub(away.MarkedAt), 0).Round(time.Second)
@@ -368,12 +424,20 @@ func logStartedAway(pool *endpointpool.Pool, logger *log.Logger) {
 		"pve endpoints: starting on %s because %s was marked down %s ago", away.Start, away.First, age))
 }
 
+// payloadUpdater is the part of the cache store a mark write uses, which lets a
+// test see whether a write reached the store at all.
+type payloadUpdater interface {
+	UpdatePayload(
+		ctx context.Context, now time.Time, build func(stored endpointcache.Stored) (endpointcache.Change, error),
+	) (endpointcache.UpdateResult, error)
+}
+
 // cacheMarkSink records the pool's down marks in the cache file. The pool
 // calls MarkDown on the failed request's goroutine and waits for it, so the
 // sink hands each write to a goroutine of the process registry and returns at
 // once. The exit drain then waits for the write or cancels it.
 type cacheMarkSink struct {
-	store  *endpointcache.Store
+	store  payloadUpdater
 	mode   config.DiscoveryMode
 	logger *log.Logger
 	now    func() time.Time
@@ -410,6 +474,8 @@ func (s *cacheMarkSink) MarkDown(m endpointpool.Mark) {
 // outlives the two minutes the mark lasts and a refresh stays due in other
 // processes until a discovery writes a result.
 func (s *cacheMarkSink) write(ctx context.Context, m endpointpool.Mark, class endpointcache.MarkClass) {
+	// A drain that gave up cancels the context, and the store would refuse the
+	// write anyway, so the write is not started.
 	if ctx.Err() != nil {
 		return
 	}
@@ -472,15 +538,19 @@ func cacheCredential(cfg *config.CPIConfig) (user, credential string) {
 	return user, cfg.Password
 }
 
-// cacheAliasesJournal reports whether the cache directory is the allocation
-// journal directory or sits inside its tree. The check resolves symlinks in
-// both paths and compares the results for equality and containment, and it
-// compares the directories themselves, and every ancestor of the cache
-// directory, with os.SameFile, so a link or a bind in the middle of either
-// path cannot hide the overlap. A cache directory that contains the journal
-// is allowed. An empty journal directory overlaps nothing. A path that cannot
-// be examined for any reason but being absent is an error, and the caller
-// treats the directory as unusable, because the check must fail closed.
+// cacheAliasesJournal reports whether the cache directory overlaps the
+// allocation journal directory, which is when the cache directory is the
+// journal directory, sits inside its tree, or contains it. The check resolves
+// symlinks in both paths, and it compares the directories themselves, and
+// every ancestor of each, with os.SameFile, so a link or a bind in the middle
+// of either path cannot hide the overlap in either direction. A journal
+// directory that does not exist yet has no identity to compare, so the check
+// asks whether its resolved path lies below the cache directory, which is the
+// only way it can overlap, because a cache directory cannot sit inside a
+// journal directory that is not there. An empty journal directory overlaps
+// nothing. A path that cannot be examined for any reason but being absent is
+// an error, and the caller treats the directory as unusable, because the
+// check must fail closed.
 func cacheAliasesJournal(cachePath, journal string) (bool, error) {
 	candidates := []string{journal}
 	if trimmed := strings.TrimSpace(journal); trimmed != journal {
@@ -503,26 +573,41 @@ func cacheAliasesJournal(cachePath, journal string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("resolve the cache directory: %w", err)
 	}
+	cacheInfo, err := os.Stat(cacheReal)
+	if err != nil {
+		return false, fmt.Errorf("examine the cache directory: %w", err)
+	}
 	for _, j := range journals {
 		journalReal, journalInfo, err := resolveDirectory(j)
 		if err != nil {
 			return false, fmt.Errorf("resolve the allocation journal directory: %w", err)
 		}
-		if pathWithin(journalReal, cacheReal) {
-			return true, nil
-		}
 		if journalInfo == nil {
+			if pathWithin(cacheReal, journalReal) {
+				return true, nil
+			}
 			continue
 		}
-		same, err := ancestorIs(cacheReal, journalInfo)
+		overlap, err := directoriesOverlap(cacheReal, cacheInfo, journalReal, journalInfo)
 		if err != nil {
 			return false, fmt.Errorf("compare the cache directory with the allocation journal directory: %w", err)
 		}
-		if same {
+		if overlap {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// directoriesOverlap reports whether one of two existing directories is the
+// other or lies below it, by file identity along the ancestors of each path.
+func directoriesOverlap(cachePath string, cacheInfo os.FileInfo, journalPath string, journalInfo os.FileInfo,
+) (bool, error) {
+	inside, err := ancestorIs(cachePath, journalInfo)
+	if err != nil || inside {
+		return inside, err
+	}
+	return ancestorIs(journalPath, cacheInfo)
 }
 
 // resolveDirectory returns the absolute path of dir with its symlinks

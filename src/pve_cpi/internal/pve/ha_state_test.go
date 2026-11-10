@@ -660,7 +660,10 @@ func TestSetHAState_ErrorClearedForTeardownWithUnreadablePower(t *testing.T) {
 	s := newHASim("error", "started", "running")
 	s.statusErr = errors.New("500 node pve2 is busy")
 	in := haStateIn(pve.HATargetStopped, pve.HACallerTeardown, true)
-	in.Budget = 40 * time.Millisecond
+	// The power state never becomes readable, so the call ends only when its
+	// budget does. The budget is long enough that a loaded machine still writes
+	// disabled and polls before it runs out.
+	in.Budget = time.Second
 	_, err := pve.SetHAState(haStateCtx(t), s.deps(), in)
 	// The teardown still requests disabled, and the wait for it then needs the
 	// power state, which stays unreadable, so the target is never requested.

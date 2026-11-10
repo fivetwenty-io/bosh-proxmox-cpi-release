@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -116,6 +117,65 @@ func TestDefaultLevelCallLogsNoNewLineUnlessAFailoverHappens(t *testing.T) {
 	lines := endpointLines(t, failed)
 	if len(lines) != 1 || !strings.HasPrefix(lines[0], "pve endpoint failover:") {
 		t.Errorf("a call that failed over logged %q, want the one failover line", lines)
+	}
+}
+
+// stderrLines returns the level and message of every line the call wrote to
+// stderr, in order. The time, the request id, and the other fields change from
+// call to call and are left out.
+func stderrLines(t *testing.T, stderr string) []string {
+	t.Helper()
+	var out []string
+	for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec struct {
+			Level string `json:"level"`
+			Msg   string `json:"msg"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("stderr line %q is not JSON: %v", line, err)
+		}
+		out = append(out, rec.Level+" "+rec.Msg)
+	}
+	return out
+}
+
+// The default log level shows a call with discovery on exactly what it shows
+// with discovery off, except for the one line the worker writes when its first
+// discovery finds nothing to cache. The second call, against the file the first
+// one left, shows nothing more than the baseline.
+func TestDefaultLevelStderrWithDiscoveryMatchesTheDiscoveryOffBaseline(t *testing.T) {
+	host, port, requests := vmServer(t)
+	token := `"pve_user":"root","pve_api_token":"root@pam!b=secret","pve_verify_ssl":false`
+	endpoint := fmt.Sprintf(`"pve_host":%q,"pve_port":%d,%s`, host, port, token)
+
+	baseline := stderrLines(t, hasVMStderr(t, endpoint+`,"pve_api_endpoint_discovery":"off"`))
+	cold := stderrLines(t, hasVMStderr(t, endpoint))
+	warm := stderrLines(t, hasVMStderr(t, endpoint))
+	if requests.Load() == 0 {
+		t.Fatal("the cluster saw no request, so the calls proved nothing")
+	}
+
+	const refresh = "INFO api endpoint discovery: no result through "
+	var extra, rest []string
+	for _, line := range cold {
+		if strings.HasPrefix(line, refresh) {
+			extra = append(extra, line)
+		} else {
+			rest = append(rest, line)
+		}
+	}
+	if len(extra) != 1 {
+		t.Errorf("the cold call wrote %d worker result lines %q, want the one for its first discovery",
+			len(extra), extra)
+	}
+	if !slices.Equal(rest, baseline) {
+		t.Errorf("the cold call wrote %q besides the worker's result, want the baseline %q", rest, baseline)
+	}
+	if !slices.Equal(warm, baseline) {
+		t.Errorf("the warm call wrote %q, want the baseline %q", warm, baseline)
 	}
 }
 

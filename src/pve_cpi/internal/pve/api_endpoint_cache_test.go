@@ -470,7 +470,7 @@ func TestOpenEndpointCacheMissingSiblingLineStaysDebugUnderOn(t *testing.T) {
 	}
 }
 
-func TestOpenEndpointCacheIgnoresAFileWrittenForAnotherKey(t *testing.T) {
+func TestOpenEndpointCacheKeepsTheFilesOfTwoCredentialsApart(t *testing.T) {
 	dir := newCacheDir(t)
 	cfg := cacheTestConfig(config.DiscoveryModeAuto, dir)
 	seedEndpointCache(t, cfg, cacheSeed{nodes: []cachedNode{{"pve2", true}}})
@@ -687,6 +687,14 @@ func TestCacheAliasesJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 	dirLikeFile := filepath.Join(file, "sub")
+	linkedNested := filepath.Join(root, "nested-link")
+	if err := os.Symlink(nestedJournal, linkedNested); err != nil {
+		t.Fatal(err)
+	}
+	linkedParent := filepath.Join(root, "parent-link")
+	if err := os.Symlink(parent, linkedParent); err != nil {
+		t.Fatal(err)
+	}
 
 	cases := []struct {
 		name    string
@@ -700,7 +708,19 @@ func TestCacheAliasesJournal(t *testing.T) {
 		{"inside the journal", inside, journal, true, false},
 		{"a sibling", sibling, journal, false, false},
 		{"a journal that does not exist yet", sibling, filepath.Join(root, "later"), false, false},
-		{"a cache that contains the journal", parent, nestedJournal, false, false},
+		{"a cache that contains the journal", parent, nestedJournal, true, false},
+		{"a cache that contains a journal that does not exist yet", parent, filepath.Join(parent, "later"), true,
+			false},
+		{"a cache that contains a journal below a missing directory", parent,
+			filepath.Join(parent, "missing", "deeper", "journal"), true, false},
+		{"a cache beside a journal that does not exist yet", sibling, filepath.Join(parent, "later"), false, false},
+		{"a cache that contains the journal through a symlink", parent, linkedNested, true, false},
+		{"a cache reached through a symlink that contains the journal", linkedParent, nestedJournal, true, false},
+		{"a symlinked ancestor above a containing cache", filepath.Join(linkedAncestor, "outer"),
+			filepath.Join(linkedAncestor, "outer", "journal"), true, false},
+		{"a symlinked ancestor on the journal of a containing cache", parent,
+			filepath.Join(linkedAncestor, "outer", "journal"), true, false},
+		{"the filesystem root as the cache", string(filepath.Separator), journal, true, false},
 		{"the journal reached through a symlink", journal, link, true, false},
 		{"the cache reached through a symlink", link, journal, true, false},
 		{"a cache inside a symlinked journal", inside, link, true, false},
@@ -780,17 +800,56 @@ func TestOpenEndpointCacheRefusesADirectoryThatAliasesTheJournal(t *testing.T) {
 		})
 	}
 
-	// A directory that contains the journal, and one beside it, stay usable.
+	// A directory that contains the journal is refused too, whether the journal
+	// is reached by its own path or through a symlinked ancestor of the cache.
+	contains := filepath.Join(root, "outer")
+	nested := filepath.Join(contains, "journal")
+	if err := os.MkdirAll(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		cache   string
+		journal string
+		mode    config.DiscoveryMode
+		level   slog.Level
+	}{
+		{"a cache that contains the journal under auto", contains, nested, config.DiscoveryModeAuto, slog.LevelDebug},
+		{"a cache that contains the journal under on", contains, nested, config.DiscoveryModeOn, slog.LevelWarn},
+		{"a cache reached through a symlinked ancestor that contains the journal", filepath.Join(ancestor, "outer"),
+			nested, config.DiscoveryModeOn, slog.LevelWarn},
+		{"a journal reached through a symlink below the cache", contains, filepath.Join(ancestor, "outer", "journal"),
+			config.DiscoveryModeOn, slog.LevelWarn},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := cacheTestConfig(tc.mode, tc.cache)
+			cfg.StorageAllocationJournalDir = tc.journal
+			before, err := readDirNames(tc.cache)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := openCacheFor(t, cfg)
+			if got.cache != nil {
+				t.Fatalf("a cache directory that contains the journal opened: %v", got.cache)
+			}
+			if !got.plan.cacheUnusable {
+				t.Error("the plan was not marked cache-unusable")
+			}
+			if lines := linesAt(got.obs.All(), tc.level, "allocation journal directory"); len(lines) != 1 {
+				t.Errorf("lines at %v = %v; all: %v", tc.level, lines, got.obs.All())
+			}
+			if after, err := readDirNames(tc.cache); err != nil || !slices.Equal(before, after) {
+				t.Errorf("the refused directory held %v and holds %v (err %v), want it untouched", before, after, err)
+			}
+		})
+	}
+
+	// A directory beside the journal stays usable.
 	beside := newCacheDir(t)
 	cfg := cacheTestConfig(config.DiscoveryModeAuto, beside)
 	cfg.StorageAllocationJournalDir = journal
-	if got := openCacheFor(t, cfg); got.cache == nil {
+	if got := openCacheFor(t, cfg); got.cache == nil || got.plan.cacheUnusable {
 		t.Errorf("a cache directory beside the journal was refused: %v", got.obs.All())
-	}
-	cfg = cacheTestConfig(config.DiscoveryModeAuto, root)
-	cfg.StorageAllocationJournalDir = journal
-	if got := openCacheFor(t, cfg); got.cache != nil && got.plan.cacheUnusable {
-		t.Errorf("a cache directory that contains the journal must not be refused as an alias")
 	}
 }
 

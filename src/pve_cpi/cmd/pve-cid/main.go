@@ -85,6 +85,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 )
 
 // cliVersion is pve-cid's own version string, independent of the cpi
@@ -106,7 +108,16 @@ func main() {
 // run dispatches to the requested subcommand. Accepting args/stdout/stderr as
 // parameters (rather than reading os.Args/os.Stdout/os.Stderr directly) makes
 // every code path testable in-process.
+//
+// Every subcommand that builds a PVE client can start background cache work, a
+// down mark written when a request fails over or a discovery refresh. So run
+// opens the endpoint cache's worker registry and drains it before it returns,
+// with the same bounded wait and signal rule as the cpi binary, and a mark
+// written just before the command ends survives the exit. A subcommand that
+// starts no worker never waits.
 func run(args []string, stdout, stderr io.Writer) int {
+	endpointcache.Open()
+	defer endpointcache.DrainAtExit("pve-cid", stderr, 0)
 	if len(args) == 0 {
 		printUsage(stderr)
 		return exitUsage

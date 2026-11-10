@@ -50,6 +50,10 @@ func Open() { processRegistry.Open() }
 // been drained, as Registry.AfterDrain describes.
 func AfterDrain(fn func()) bool { return processRegistry.AfterDrain(fn) }
 
+// Draining reports whether the process registry's current run has been closed
+// by a drain, as Registry.Draining describes.
+func Draining() bool { return processRegistry.Draining() }
+
 // Registry tracks background workers, such as a discovery refresh, a down-mark
 // write, or a cold-start hint write, so the process can wait for them briefly
 // before it exits and cancel the ones that run too long. A Registry is open
@@ -179,6 +183,18 @@ func (r *Registry) AfterDrain(fn func()) bool {
 	}
 	r.run.afterDrain = append(r.run.afterDrain, fn)
 	return true
+}
+
+// Draining reports whether a drain has closed the current run, so Go and
+// AfterDrain refuse from now on. A caller that is about to open something a
+// worker or a release would have to close checks it first, so a call that
+// started after the drain began touches nothing. The answer can change right
+// after it returns, so a caller that must not leak still handles the refusal
+// that Go and AfterDrain give.
+func (r *Registry) Draining() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.run.closed
 }
 
 // Go starts fn on its own goroutine as a worker of the current run. name

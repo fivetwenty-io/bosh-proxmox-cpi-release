@@ -269,6 +269,18 @@ func New(cfg Config) (*Pool, error) {
 	return p, nil
 }
 
+// CheckEndpoints reports why New would refuse endpoints for a reason that lies
+// in the list itself, which is an empty list, a list without a configured
+// endpoint, an address that is not a valid host:port, an address listed twice,
+// an unknown kind, a configured endpoint with pins or with Online set, and a
+// discovered endpoint without pins. It returns nil for a list New accepts, so
+// a caller can settle the endpoints before it sizes anything by their count.
+// It does not look at a base transport.
+func CheckEndpoints(endpoints []Endpoint) error {
+	_, err := orderEndpoints(endpoints)
+	return err
+}
+
 // orderedEndpoint is an endpoint that passed validation. Its Address is in
 // canonical form, and urlHost keeps the address as the caller wrote it.
 type orderedEndpoint struct {

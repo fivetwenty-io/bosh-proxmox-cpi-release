@@ -201,10 +201,18 @@ func wireEndpoints(cfg *config.CPIConfig) (sdkclient.Options, *endpointWiring, e
 // decides the pool's size. cache may be nil, and then the pool gets no mark
 // sink and no first-answer hook.
 //
-// A pool that refuses the cached endpoints is built again from the configured
-// endpoints alone, so a cache file can cost the client its discovered nodes
-// and never the client itself.
+// The endpoints are settled first. If the pool would refuse the cached
+// endpoints, the plan keeps the configured endpoints alone, before the timeouts
+// are sized from the plan, so a client that falls back to one endpoint keeps
+// the timeouts of a pool of one. A cache file can cost the client its
+// discovered nodes and never the client itself.
 func (w *endpointWiring) apply(opts sdkclient.Options, logger *log.Logger, cache *endpointCache) sdkclient.Options {
+	if w.plan.configured < len(w.plan.endpoints) {
+		if err := endpointpool.CheckEndpoints(w.plan.endpoints); err != nil {
+			cache.poolRefused(err)
+			w.dropDiscovered(cache)
+		}
+	}
 	opts = applyPoolTimeoutDefaults(opts, len(w.plan.endpoints))
 	if !w.plan.install() {
 		return opts
@@ -213,11 +221,6 @@ func (w *endpointWiring) apply(opts sdkclient.Options, logger *log.Logger, cache
 		cfg := endpointpool.Config{Base: base, Logger: logger, Endpoints: w.plan.endpoints}
 		cache.attach(&cfg)
 		pool, poolErr := endpointpool.New(cfg)
-		if poolErr != nil && w.plan.configured < len(w.plan.endpoints) {
-			cache.poolRefused(poolErr)
-			cfg.Endpoints = w.plan.endpoints[:w.plan.configured]
-			pool, poolErr = endpointpool.New(cfg)
-		}
 		if poolErr != nil {
 			w.poolErr = poolErr
 			return nil
@@ -226,4 +229,12 @@ func (w *endpointWiring) apply(opts sdkclient.Options, logger *log.Logger, cache
 		return pool
 	}
 	return opts
+}
+
+// dropDiscovered takes the discovered endpoints out of the plan, and out of the
+// cache's mark writes, so the pool is built from the configured endpoints
+// alone.
+func (w *endpointWiring) dropDiscovered(cache *endpointCache) {
+	w.plan.endpoints = w.plan.endpoints[:w.plan.configured]
+	cache.dropDiscovered()
 }
