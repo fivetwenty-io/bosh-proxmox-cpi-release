@@ -1,16 +1,22 @@
 package pve_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"testing"
 
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/pvetest"
 )
 
 // errServerClosedIdleText mirrors the message of net/http's unexported
@@ -155,5 +161,130 @@ func TestIsTransientTransport_LoginStatusChains(t *testing.T) {
 	wrapped := pve.WrapError(verdict)
 	if cpierrors.IsType(wrapped, cpierrors.TypeRetriableCloud) {
 		t.Errorf("WrapError(401 login chain) = retriable %v, want permanent", wrapped)
+	}
+}
+
+// dropWireClient builds a CPI client over the servers through the real
+// constructor, so its multi-endpoint pool wraps the SDK's transport. The first
+// server is the configured host, and the client verifies against ca.
+func dropWireClient(t *testing.T, ca *pvetest.CA, servers ...*pvetest.Server) pve.Client {
+	t.Helper()
+	verify := true
+	host, port := servers[0].HostPort()
+	cfg := &config.CPIConfig{
+		Host:         host,
+		Port:         port,
+		APIToken:     "root@pam!test=tok-drop",
+		VerifySSL:    &verify,
+		PVECACertPEM: string(ca.CertPEM()),
+	}
+	for _, s := range servers {
+		cfg.Endpoints = append(cfg.Endpoints, s.Addr)
+	}
+	c, err := pve.NewClientWithTracer(cfg, log.NewNopLogger(), nil)
+	if err != nil {
+		t.Fatalf("NewClientWithTracer: %v", err)
+	}
+	return c
+}
+
+// TestMutationSplitsNeverSentFromMaybeSent drives one POST through a real
+// two-server pool for each way the first server can fail, and checks that the
+// pool hops exactly when the request provably never left the client. A refused
+// dial and a handshake reset prove it, so the POST goes to the second server
+// and exactly one POST reaches any server. A connection dropped after the
+// server read the request does not prove it, so the POST stays with the first
+// server, the error does not read as connect-phase, and the second server reads
+// no POST. These tests run serially, because the closed server's port must not
+// be handed to a parallel test while the client dials it.
+func TestMutationSplitsNeverSentFromMaybeSent(t *testing.T) {
+	cases := []struct {
+		name string
+		// first starts the first server, which fails the POST in the way the case names.
+		first func(t *testing.T, ca *pvetest.CA, leaf *pvetest.Leaf) *pvetest.Server
+		// hops is whether the POST reaches the second server.
+		hops bool
+	}{
+		{"a refused dial hops", func(t *testing.T, _ *pvetest.CA, leaf *pvetest.Leaf) *pvetest.Server {
+			s := pvetest.NewLive(t, leaf, nil)
+			s.Close()
+			return s
+		}, true},
+		{"a handshake reset hops", func(t *testing.T, _ *pvetest.CA, _ *pvetest.Leaf) *pvetest.Server {
+			return pvetest.NewReset(t)
+		}, true},
+		{"a drop after the request does not hop", func(t *testing.T, _ *pvetest.CA, leaf *pvetest.Leaf) *pvetest.Server {
+			return pvetest.NewBodyThenHijack(t, leaf)
+		}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ca := pvetest.NewCA(t)
+			leaf := ca.NewLeaf(t, pvetest.LeafOptions{})
+			first := tc.first(t, ca, leaf)
+			second := pvetest.NewLive(t, leaf, nil)
+			c := dropWireClient(t, ca, first, second)
+			ctx, release := endpointpool.WithAffinityScope(context.Background())
+			defer release()
+
+			err := c.Pools().CreatePool(ctx, "split-pool", "split")
+
+			if tc.hops {
+				if err != nil {
+					t.Fatalf("CreatePool: %v, want the POST to hop to the second server", err)
+				}
+				if got := second.Counts.Method(http.MethodPost); got != 1 {
+					t.Errorf("the second server read %d POSTs, want 1", got)
+				}
+				if got := pvetest.TotalMethod(http.MethodPost, first, second); got != 1 {
+					t.Errorf("%d POSTs reached any server, want exactly 1", got)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("CreatePool succeeded, want the dropped connection to surface")
+			}
+			if endpointpool.IsConnectPhase(err) && !endpointpool.IsMaybeSent(err) {
+				t.Errorf("error %v proves the POST was never sent, but the server read it", err)
+			}
+			if !pve.IsTransientTransport(err) {
+				t.Errorf("the dropped connection is not transient, so no retry layer would replay it: %v", err)
+			}
+			if got := first.Counts.Method(http.MethodPost); got != 1 {
+				t.Errorf("the first server read %d POSTs, want 1", got)
+			}
+			if got := second.Counts.Method(http.MethodPost); got != 0 {
+				t.Errorf("the second server read %d POSTs, want 0", got)
+			}
+		})
+	}
+}
+
+// TestMutationWalkOfUnreachableServersIsConnectPhaseAndNotMaybeSent drives a
+// POST at two servers that both reset the handshake. Neither received a byte of
+// the request, so the walk's error is connect-phase and not marked maybe-sent,
+// and no POST reaches either server.
+func TestMutationWalkOfUnreachableServersIsConnectPhaseAndNotMaybeSent(t *testing.T) {
+	ca := pvetest.NewCA(t)
+	first, second := pvetest.NewReset(t), pvetest.NewReset(t)
+	c := dropWireClient(t, ca, first, second)
+	ctx, release := endpointpool.WithAffinityScope(context.Background())
+	defer release()
+
+	err := c.Pools().CreatePool(ctx, "split-pool", "split")
+
+	if err == nil {
+		t.Fatal("CreatePool succeeded against two servers that reset every handshake")
+	}
+	if !endpointpool.IsConnectPhase(err) || endpointpool.IsMaybeSent(err) {
+		t.Errorf("error %v: connect-phase = %v, maybe-sent = %v, want true and false",
+			err, endpointpool.IsConnectPhase(err), endpointpool.IsMaybeSent(err))
+	}
+	var walk *endpointpool.EntryUnreachableError
+	if !errors.As(err, &walk) || len(walk.Endpoints()) != 2 {
+		t.Errorf("error %v: want a walk that tried both endpoints", err)
+	}
+	if got := pvetest.TotalMethod(http.MethodPost, first, second); got != 0 {
+		t.Errorf("%d POSTs reached a server that resets every handshake", got)
 	}
 }

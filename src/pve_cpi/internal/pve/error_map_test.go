@@ -2,6 +2,8 @@ package pve_test
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -1782,6 +1784,119 @@ func TestIsTransientTransport_TetherConflictIsNotTransient(t *testing.T) {
 				t.Errorf("IsTransientTransport(%v) = true, want false", tc.err)
 			}
 		})
+	}
+}
+
+// permutations returns every ordering of items.
+func permutations[T any](items []T) [][]T {
+	if len(items) <= 1 {
+		return [][]T{append([]T(nil), items...)}
+	}
+	var out [][]T
+	for i := range items {
+		rest := make([]T, 0, len(items)-1)
+		rest = append(rest, items[:i]...)
+		rest = append(rest, items[i+1:]...)
+		for _, tail := range permutations(rest) {
+			out = append(out, append([]T{items[i]}, tail...))
+		}
+	}
+	return out
+}
+
+// walkHop is one failed hop of a walk, built from a cause and its phase.
+func walkHop(endpoint string, phase endpointpool.Phase, cause error) endpointpool.EndpointFailure {
+	return endpointpool.EndpointFailure{
+		Endpoint: endpoint,
+		Err:      &endpointpool.ConnectPhaseError{Phase: phase, Endpoint: endpoint, Err: cause},
+	}
+}
+
+// sdkShapedTransportError wraps a transport error the way the SDK does. The
+// HTTP client wraps it in a *url.Error. The SDK's retry loop turns a failed dial
+// or DNS lookup into a ConnectionError, and wraps anything else in "request
+// failed after N attempt(s)".
+func sdkShapedTransportError(cause error) error {
+	urlErr := &url.Error{Op: "Post", URL: "https://pve1:8006/api2/json/pools", Err: cause}
+	var (
+		dnsErr *net.DNSError
+		opErr  *net.OpError
+	)
+	if errors.As(urlErr, &dnsErr) || (errors.As(urlErr, &opErr) && opErr.Op == "dial") {
+		return &sdkerrors.ConnectionError{
+			Host: "pve1", Port: 8006, Message: "failed to establish a connection", Cause: urlErr,
+		}
+	}
+	return fmt.Errorf("request failed after 1 attempt(s): %w", urlErr)
+}
+
+// TestIsTransientTransport_EntryUnreachableUnwrapsToDialInAnyCauseOrder pins
+// that a walk's error reads as a dial failure to the SDK and to the CPI's
+// transient check whichever order its hops failed in. A hop that failed with a
+// read-class *net.OpError would otherwise be the first operation error
+// errors.As found in a joined chain, and the SDK would stop treating the walk
+// as a failed dial.
+func TestIsTransientTransport_EntryUnreachableUnwrapsToDialInAnyCauseOrder(t *testing.T) {
+	t.Parallel()
+	refused := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	reset := &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}
+	dns := &net.DNSError{Err: "no such host", Name: "pve3"}
+	verify := &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}
+	hops := []endpointpool.EndpointFailure{
+		walkHop("pve1:8006", endpointpool.PhaseDial, refused),
+		walkHop("pve2:8006", endpointpool.PhaseTLSHandshake, reset),
+		walkHop("pve3:8006", endpointpool.PhaseDNS, dns),
+		{Endpoint: "pve4:8006", Err: errors.New("response header timeout")},
+		walkHop("pve5:8006", endpointpool.PhaseTLSVerify, verify),
+		walkHop("pve6:8006", endpointpool.PhasePin, errors.New("fingerprint mismatch")),
+	}
+	orders := permutations(hops[:5])
+	orders = append(orders, permutations(hops[1:])...)
+	for _, order := range orders {
+		walk := endpointpool.NewEntryUnreachableError(order)
+		shaped := sdkShapedTransportError(walk)
+
+		var opErr *net.OpError
+		if !errors.As(shaped, &opErr) || opErr.Op != "dial" {
+			t.Fatalf("order %v: errors.As found %v, want the synthesized dial *net.OpError", walk.Endpoints(), opErr)
+		}
+		if !pve.IsTransientTransport(shaped) {
+			t.Fatalf("order %v: IsTransientTransport = false, want true for a walk with a retryable hop", walk.Endpoints())
+		}
+		var got *endpointpool.EntryUnreachableError
+		if !errors.As(shaped, &got) || len(got.Attempts) != len(order) {
+			t.Fatalf("order %v: the walk is not reachable through the SDK's wrapping", walk.Endpoints())
+		}
+	}
+}
+
+// TestIsTransientTransport_EntryUnreachableVerifyOnlyIsNotADial pins the one
+// walk that must not read as a dial failure. When every hop failed certificate
+// verification or the fingerprint pin, no order of the hops makes the SDK
+// retry, and the CPI does not call it transient.
+func TestIsTransientTransport_EntryUnreachableVerifyOnlyIsNotADial(t *testing.T) {
+	t.Parallel()
+	verify := &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}
+	hops := []endpointpool.EndpointFailure{
+		walkHop("pve1:8006", endpointpool.PhaseTLSVerify, verify),
+		walkHop("pve2:8006", endpointpool.PhasePin, errors.New("fingerprint mismatch")),
+		walkHop("pve3:8006", endpointpool.PhaseTLSVerify, verify),
+	}
+	for _, order := range permutations(hops) {
+		walk := endpointpool.NewEntryUnreachableError(order)
+		shaped := sdkShapedTransportError(walk)
+
+		var opErr *net.OpError
+		if errors.As(shaped, &opErr) {
+			t.Fatalf("order %v: errors.As found a *net.OpError %v in a verify-only walk", walk.Endpoints(), opErr)
+		}
+		if pve.IsTransientTransport(shaped) {
+			t.Fatalf("order %v: IsTransientTransport = true for a verify-only walk", walk.Endpoints())
+		}
+		var verifyErr *tls.CertificateVerificationError
+		if !errors.As(shaped, &verifyErr) {
+			t.Fatalf("order %v: the certificate error is not reachable", walk.Endpoints())
+		}
 	}
 }
 
