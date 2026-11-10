@@ -41,6 +41,21 @@ const (
 	DropAmbiguousName DropReason = "ambiguous_name"
 	// DropNotInAZMap means the reader's az_map does not name the hint's node.
 	DropNotInAZMap DropReason = "not_in_az_map"
+	// DropNotDerived means the node's stored address and port are not what
+	// the derivation under the key's seed gives for its name, or the seed
+	// derives no address at all.
+	DropNotDerived DropReason = "not_derived"
+	// DropPublicSuffix means the derivation now refuses the node's host, or
+	// the seed's domain, as a public suffix. A genuine file gets here only
+	// when an update to the public suffix list moves the line.
+	DropPublicSuffix DropReason = "public_suffix"
+	// DropIdentityConflict means the stored identity holds a refused identity
+	// change, so the reader loads none of the file's nodes until the operator
+	// deletes it.
+	DropIdentityConflict DropReason = "identity_conflict"
+	// DropNotConfigured means the record names an endpoint that is not one of
+	// the key's configured endpoints.
+	DropNotConfigured DropReason = "not_configured"
 	// DropInvalid means the record is malformed in a way that does not make
 	// the file unusable, such as a mark for something that is not an endpoint.
 	DropInvalid DropReason = "invalid"
@@ -62,67 +77,109 @@ type Drop struct {
 func (d Drop) String() string { return d.Record + " dropped: " + string(d.Reason) }
 
 // Validate checks a payload read from the store against key, the reader's own
-// key, at time now. It returns a copy that holds only what a reader may trust,
-// along with the records it dropped. It does not look at the reader's az_map,
-// because a writer keeps a hint that another entry sharing the key wrote. See
-// ForReader for that check.
+// key, at time now. It returns a copy that holds only what a reader may use
+// now, along with the records it dropped. It does not look at the reader's
+// az_map, because a writer keeps a hint that another entry sharing the key
+// wrote. See ForReader for that check.
 //
 // A payload is unusable, and Validate returns ErrPayloadInvalid, when its key
 // differs from key (ErrKeyMismatch), when a node name fails the pve-node
-// format, when a node's address does not pass the endpoint grammar or does not
-// begin with the node's name, when its port is out of range, when a pin is not
-// 32 bytes of hex or a node holds no pin or more than MaxPinsPerNode, when the
-// file holds more than MaxNodes nodes or two nodes with one name, when the
-// cluster identity is not 32 bytes of hex or a discovery lists nodes without
-// one, and when an outcome or a hint's name is not valid.
+// format, when a node's address does not pass the endpoint grammar, when its
+// port is out of range, when a pin is not 32 bytes of hex or a node holds no
+// pin or more than MaxPinsPerNode, when the file holds more than MaxNodes nodes
+// or two nodes with one name, when the cluster identity is not 32 bytes of hex
+// or a discovery lists nodes without one, when the outcome is one that holds
+// no nodes and the discovery lists some, and when an outcome, observed_via, or
+// a hint's name is not valid.
 //
 // A single record is dropped, and the rest of the file stands, when a node name
-// is all digits, a 0x hex spelling, or a loopback alias, when a node's
+// is all digits, a 0x hex spelling, or a loopback alias, when a node's address
+// and port are not what the key's seed derives for its name, when a node's
 // confirmation is more than NodeTTL old or more than FutureSkew ahead, when a
 // mark is older than MarkTTL, ahead, or names something that is not an
-// endpoint or a class that is not enumerated, and when the hint is older than
-// HintTTL or ahead. A discovery whose own time is ahead is dropped whole, and
-// a next-refresh time further ahead than MaxRefreshWait is dropped so the
-// refresh is due now.
+// endpoint or a class that is not enumerated, when observed_via names an
+// endpoint outside the key, and when the hint is older than HintTTL or ahead.
+// A discovery whose own time is ahead is dropped whole, and a next-refresh
+// time further ahead than MaxRefreshWait is dropped so the refresh is due now.
+// When the identity holds a conflict, the identity stays so the refusal stays
+// in force, and every node is dropped.
+//
+// A drop hides a record from use and never deletes it. A writer keeps what the
+// file knows, as readStored describes.
 func Validate(p *Payload, key Key, now time.Time) (*Payload, []Drop, error) {
+	state, drops, err := readStored(p, key, now)
+	if err != nil {
+		return nil, nil, err
+	}
+	return state.usable, drops, nil
+}
+
+// storedState is a stored payload as a writer reads it under the lock. usable
+// is what a reader may use now, as Validate returns it. discovery is the
+// stored discovery section as written, kept once the file passes the format
+// checks and before any drop, so a write that carries no new discovery puts it
+// back unchanged. known is every stored node that passes the format checks and
+// is not an ambiguous name, in its normalized spelling, whatever its
+// timestamps and whether its address still derives, because a node stays
+// known, and its pins bind under verify_ssl false, after the pool stops
+// loading it. The zero value is a missing file.
+type storedState struct {
+	usable    *Payload
+	discovery *DiscoverySection
+	known     []DiscoveredNode
+}
+
+// readStored is Validate with the stored discovery section and the known
+// nodes kept beside the usable payload.
+func readStored(p *Payload, key Key, now time.Time) (storedState, []Drop, error) {
 	if p == nil {
-		return nil, nil, fmt.Errorf("%w: no payload", ErrPayloadInvalid)
+		return storedState{}, nil, fmt.Errorf("%w: no payload", ErrPayloadInvalid)
 	}
 	if !p.Key.Equal(key) {
-		return nil, nil, ErrKeyMismatch
+		return storedState{}, nil, ErrKeyMismatch
 	}
 	out := &Payload{Key: key}
 	out.Key.Endpoints = slices.Clone(key.Endpoints)
+	state := storedState{usable: out}
 	var drops []Drop
 
 	if p.Cluster != nil {
-		cluster, err := validateCluster(*p.Cluster)
+		cluster, found, err := validateCluster(*p.Cluster, key)
 		if err != nil {
-			return nil, nil, err
+			return storedState{}, nil, err
 		}
+		drops = append(drops, found...)
 		out.Cluster = &cluster
 	}
 	if p.Discovery != nil {
-		section, found, err := validateDiscovery(p.Discovery, now)
+		section, known, found, err := validateDiscovery(p.Discovery, keyDerivation(key), now)
 		if err != nil {
-			return nil, nil, err
+			return storedState{}, nil, err
+		}
+		// A node needs the identity its pins were read under, whatever its
+		// times, because a writer keeps every known node.
+		if len(p.Discovery.Nodes) > 0 && out.Cluster == nil {
+			return storedState{}, nil, fmt.Errorf("%w: discovery lists nodes without a cluster identity", ErrPayloadInvalid)
 		}
 		drops = append(drops, found...)
-		if section != nil && len(section.Nodes) > 0 && out.Cluster == nil {
-			return nil, nil, fmt.Errorf("%w: discovery lists nodes without a cluster identity", ErrPayloadInvalid)
+		if section != nil && len(section.Nodes) > 0 && out.Cluster.IdentityConflict {
+			section.Nodes = []DiscoveredNode{}
+			drops = append(drops, Drop{Record: "nodes", Reason: DropIdentityConflict})
 		}
 		out.Discovery = section
+		state.discovery = p.Discovery.clone()
+		state.known = known
 	}
 	out.Marks, drops = validateMarks(p.Marks, now, drops)
 	if p.ColdStart != nil {
 		hint, found, err := validateHint(*p.ColdStart, now)
 		if err != nil {
-			return nil, nil, err
+			return storedState{}, nil, err
 		}
 		drops = append(drops, found...)
 		out.ColdStart = hint
 	}
-	return out, drops, nil
+	return state, drops, nil
 }
 
 // ForReader applies the one check that depends on the reader: a hint whose
@@ -139,20 +196,31 @@ func ForReader(p *Payload, azNodes []string) (*Payload, []Drop) {
 	return out, []Drop{{Record: "cold_start", Reason: DropNotInAZMap}}
 }
 
-// validateCluster checks the cluster identity.
-func validateCluster(c ClusterIdentity) (ClusterIdentity, error) {
+// validateCluster checks the cluster identity against key. An observed_via
+// that is not an endpoint makes the file unusable. One that names an endpoint
+// outside the key is dropped, and the identity stays, because dropping the
+// identity would reopen trust on first use. A kept observed_via is in the
+// key's spelling.
+func validateCluster(c ClusterIdentity, key Key) (ClusterIdentity, []Drop, error) {
 	root, ok := normalizeHex(c.RootCASHA256)
 	if !ok {
-		return ClusterIdentity{}, fmt.Errorf("%w: cluster root CA digest is not 32 bytes of hex", ErrPayloadInvalid)
+		return ClusterIdentity{}, nil, fmt.Errorf("%w: cluster root CA digest is not 32 bytes of hex", ErrPayloadInvalid)
 	}
 	c.RootCASHA256 = root
 	c.ObservedAt = c.ObservedAt.UTC()
+	var drops []Drop
 	if c.ObservedVia != "" {
-		if _, _, ok := config.NormalizeEndpoint(c.ObservedVia); !ok {
-			return ClusterIdentity{}, fmt.Errorf("%w: cluster observed_via is not an endpoint", ErrPayloadInvalid)
+		host, port, ok := config.NormalizeEndpoint(c.ObservedVia)
+		if !ok {
+			return ClusterIdentity{}, nil, fmt.Errorf("%w: cluster observed_via is not an endpoint", ErrPayloadInvalid)
+		}
+		c.ObservedVia = net.JoinHostPort(host, strconv.Itoa(port))
+		if !slices.Contains(key.Endpoints, c.ObservedVia) {
+			c.ObservedVia = ""
+			drops = append(drops, Drop{Record: "cluster observed_via", Reason: DropNotConfigured})
 		}
 	}
-	return c, nil
+	return c, drops, nil
 }
 
 // normalizeHex returns the lowercase spelling of s when it is 32 bytes of hex.
@@ -166,14 +234,23 @@ func normalizeHex(s string) (string, bool) {
 	return strings.ToLower(s), true
 }
 
-// validateDiscovery checks a discovery section. It returns a nil section, with
-// no error, when the section's own time is ahead of now.
-func validateDiscovery(d *DiscoverySection, now time.Time) (*DiscoverySection, []Drop, error) {
+// validateDiscovery checks a discovery section, deriving each node's address
+// through derive. It returns the nodes a reader may use in the section, and
+// beside it every node the section knows, as storedState describes. The
+// section is nil, with no error, when its own time is ahead of now, and the
+// known nodes are still returned.
+func validateDiscovery(
+	d *DiscoverySection, derive derivation, now time.Time,
+) (*DiscoverySection, []DiscoveredNode, []Drop, error) {
 	if !d.Outcome.Valid() {
-		return nil, nil, fmt.Errorf("%w: discovery outcome is not one of the enumerated values", ErrPayloadInvalid)
+		return nil, nil, nil, fmt.Errorf("%w: discovery outcome is not one of the enumerated values", ErrPayloadInvalid)
+	}
+	if len(d.Nodes) > 0 && !d.Outcome.holdsNodes() {
+		return nil, nil, nil, fmt.Errorf("%w: discovery lists nodes under an outcome that holds none", ErrPayloadInvalid)
 	}
 	if len(d.Nodes) > MaxNodes {
-		return nil, nil, fmt.Errorf("%w: discovery holds %d nodes, more than %d", ErrPayloadInvalid, len(d.Nodes), MaxNodes)
+		return nil, nil, nil, fmt.Errorf("%w: discovery holds %d nodes, more than %d",
+			ErrPayloadInvalid, len(d.Nodes), MaxNodes)
 	}
 	out := &DiscoverySection{
 		DiscoveredAt:     d.DiscoveredAt.UTC(),
@@ -183,18 +260,23 @@ func validateDiscovery(d *DiscoverySection, now time.Time) (*DiscoverySection, [
 		Nodes:            make([]DiscoveredNode, 0, len(d.Nodes)),
 	}
 	var drops []Drop
+	var known []DiscoveredNode
 	names := make(map[string]struct{}, len(d.Nodes))
 	for i, node := range d.Nodes {
 		record := "node " + strconv.Itoa(i)
-		kept, reason, err := validateNode(node, now)
+		kept, reason, err := validateNode(node)
 		if err != nil {
-			return nil, nil, fmt.Errorf("%w: %s: %w", ErrPayloadInvalid, record, err)
+			return nil, nil, nil, fmt.Errorf("%w: %s: %w", ErrPayloadInvalid, record, err)
 		}
 		lowered := strings.ToLower(node.Name)
 		if _, dup := names[lowered]; dup {
-			return nil, nil, fmt.Errorf("%w: %s repeats an earlier node name", ErrPayloadInvalid, record)
+			return nil, nil, nil, fmt.Errorf("%w: %s repeats an earlier node name", ErrPayloadInvalid, record)
 		}
 		names[lowered] = struct{}{}
+		if reason == "" {
+			known = append(known, kept)
+			reason = nodeUse(kept, derive, now)
+		}
 		if reason != "" {
 			drops = append(drops, Drop{Record: record, Reason: reason})
 			continue
@@ -202,18 +284,19 @@ func validateDiscovery(d *DiscoverySection, now time.Time) (*DiscoverySection, [
 		out.Nodes = append(out.Nodes, kept)
 	}
 	if d.DiscoveredAt.After(now.Add(FutureSkew)) {
-		return nil, append(drops, Drop{Record: "discovery", Reason: DropFuture}), nil
+		return nil, known, append(drops, Drop{Record: "discovery", Reason: DropFuture}), nil
 	}
 	if d.NextRefreshAfter.After(now.Add(MaxRefreshWait + FutureSkew)) {
 		out.NextRefreshAfter = time.Time{}
 		drops = append(drops, Drop{Record: "next_refresh_after", Reason: DropFuture})
 	}
-	return out, drops, nil
+	return out, known, drops, nil
 }
 
-// validateNode checks one node. A non-nil error makes the file unusable. A
-// non-empty reason drops this node alone.
-func validateNode(n DiscoveredNode, now time.Time) (DiscoveredNode, DropReason, error) {
+// validateNode checks one node's format and returns it in its normalized
+// spelling. A non-nil error makes the file unusable. A name a resolver could
+// misread drops this node alone, and it is not a node the file knows.
+func validateNode(n DiscoveredNode) (DiscoveredNode, DropReason, error) {
 	if err := ValidateNodeName(n.Name); err != nil {
 		if errors.Is(err, ErrNodeNameAmbiguous) {
 			return DiscoveredNode{}, DropAmbiguousName, nil
@@ -231,37 +314,81 @@ func validateNode(n DiscoveredNode, now time.Time) (DiscoveredNode, DropReason, 
 	if err != nil {
 		return DiscoveredNode{}, "", err
 	}
-	kept := DiscoveredNode{
+	return DiscoveredNode{
 		Name:        n.Name,
 		Address:     address,
 		Port:        n.Port,
 		Pins:        pins,
 		Online:      n.Online,
 		ConfirmedAt: n.ConfirmedAt.UTC(),
+	}, "", nil
+}
+
+// nodeUse reports why a node the file knows is not one a reader may use now,
+// or "" when it is. The node's address and port must be what derive gives for
+// its name, and its confirmation must be at most NodeTTL old and at most
+// FutureSkew ahead.
+func nodeUse(n DiscoveredNode, derive derivation, now time.Time) DropReason {
+	if reason := derive.check(n); reason != "" {
+		return reason
 	}
 	switch age := now.Sub(n.ConfirmedAt); {
 	case n.ConfirmedAt.After(now.Add(FutureSkew)):
-		return DiscoveredNode{}, DropFuture, nil
+		return DropFuture
 	case age > NodeTTL:
-		return DiscoveredNode{}, DropExpired, nil
+		return DropExpired
 	}
-	return kept, "", nil
+	return ""
 }
 
-// validateNodeAddress checks that the node's address passes the endpoint
-// grammar with the node's port, and that it is the node's name or begins with
-// the name and a dot, which is all the derivation produces. It returns the
-// address in its normalized spelling.
+// validateNodeAddress checks that the node's address is a host that passes
+// the endpoint grammar with the node's port. It returns the address in its
+// normalized spelling. Whether it is the address the seed derives is
+// nodeUse's check, because a failure there drops the node alone.
 func validateNodeAddress(n DiscoveredNode) (string, error) {
 	host, _, ok := config.NormalizeEndpoint(net.JoinHostPort(n.Address, strconv.Itoa(n.Port)))
 	if !ok || !strings.EqualFold(host, n.Address) {
 		return "", errors.New("address does not pass the endpoint grammar")
 	}
-	name := strings.ToLower(n.Name)
-	if host != name && !strings.HasPrefix(host, name+".") {
-		return "", errors.New("address does not begin with the node name")
-	}
 	return host, nil
+}
+
+// derivation is the address derivation under a key's seed, which is its first
+// endpoint. err is why NewDeriver refused the seed, and then no node derives.
+type derivation struct {
+	deriver *Deriver
+	err     error
+}
+
+// keyDerivation prepares the derivation for key's seed.
+func keyDerivation(key Key) derivation {
+	if len(key.Endpoints) == 0 {
+		return derivation{err: ErrSeedEndpoint}
+	}
+	d, err := NewDeriver(key.Endpoints[0])
+	return derivation{deriver: d, err: err}
+}
+
+// check reports why n's address and port are not what the derivation gives
+// for its name, or "" when they are. The host is compared without regard to
+// case, because a node keeps its own spelling.
+func (d derivation) check(n DiscoveredNode) DropReason {
+	err := d.err
+	var address string
+	if err == nil {
+		address, err = d.deriver.Address(n.Name)
+	}
+	switch {
+	case errors.Is(err, ErrPublicSuffix):
+		return DropPublicSuffix
+	case err != nil:
+		return DropNotDerived
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || !strings.EqualFold(host, n.Address) || port != strconv.Itoa(n.Port) {
+		return DropNotDerived
+	}
+	return ""
 }
 
 // validatePins checks a node's pin set and returns it in lowercase without

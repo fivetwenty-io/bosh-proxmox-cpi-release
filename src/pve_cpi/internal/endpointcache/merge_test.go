@@ -2,11 +2,16 @@ package endpointcache
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -226,12 +231,17 @@ func TestMergeRefusesAHintItCannotWrite(t *testing.T) {
 
 func TestMergeRefusesAResultItCannotWrite(t *testing.T) {
 	cases := map[string]func(r *DiscoveryResult){
-		"invalid node name": func(r *DiscoveryResult) { r.Discovery.Nodes[0].Name = "api.attacker.example" },
-		"bad pin":           func(r *DiscoveryResult) { r.Discovery.Nodes[0].Pins = []string{"abc"} },
-		"no pins":           func(r *DiscoveryResult) { r.Discovery.Nodes[0].Pins = nil },
-		"unknown outcome":   func(r *DiscoveryResult) { r.Discovery.Outcome = "failed" },
-		"no cluster digest": func(r *DiscoveryResult) { r.Cluster.RootCASHA256 = "" },
-		"future discovery":  func(r *DiscoveryResult) { r.Discovery.DiscoveredAt = payloadNow.Add(time.Hour) },
+		"invalid node name":              func(r *DiscoveryResult) { r.Discovery.Nodes[0].Name = "api.attacker.example" },
+		"bad pin":                        func(r *DiscoveryResult) { r.Discovery.Nodes[0].Pins = []string{"abc"} },
+		"no pins":                        func(r *DiscoveryResult) { r.Discovery.Nodes[0].Pins = nil },
+		"unknown outcome":                func(r *DiscoveryResult) { r.Discovery.Outcome = "failed" },
+		"no cluster digest":              func(r *DiscoveryResult) { r.Cluster.RootCASHA256 = "" },
+		"future discovery":               func(r *DiscoveryResult) { r.Discovery.DiscoveredAt = payloadNow.Add(time.Hour) },
+		"nodes under standalone":         func(r *DiscoveryResult) { r.Discovery.Outcome = OutcomeStandalone },
+		"nodes under no_candidates":      func(r *DiscoveryResult) { r.Discovery.Outcome = OutcomeNoCandidates },
+		"observed_via outside the key":   func(r *DiscoveryResult) { r.Cluster.ObservedVia = "evil.example:1" },
+		"observed_via not an endpoint":   func(r *DiscoveryResult) { r.Cluster.ObservedVia = ".:8006" },
+		"a conflict carried in a result": func(r *DiscoveryResult) { r.Cluster.IdentityConflict = true },
 		"too many nodes": func(r *DiscoveryResult) {
 			for range MaxNodes {
 				r.Discovery.Nodes = append(r.Discovery.Nodes, payloadNode("pve9", payloadNow))
@@ -272,16 +282,20 @@ func TestMergeKeepsAStoredIdentityConflict(t *testing.T) {
 	if next, _, err := Merge(stored, mergeKey(), Change{Result: mergeResult("pve3")}, payloadNow); !errors.Is(err, ErrIdentityConflict) || next != nil {
 		t.Errorf("a result cleared the conflict: %+v, %v", next, err)
 	}
+	// A result that keeps the flag, or that carries the stored identity and
+	// nodes unchanged, is refused too, so nothing replaces a conflicted file.
 	conflicted := mergeResult("pve3")
 	conflicted.Cluster.IdentityConflict = true
-	next, _, err := Merge(stored, mergeKey(), Change{Result: conflicted}, payloadNow)
-	if err != nil || !next.Cluster.IdentityConflict {
+	if next, _, err := Merge(stored, mergeKey(), Change{Result: conflicted}, payloadNow); !errors.Is(err, ErrIdentityConflict) || next != nil {
 		t.Errorf("a result that keeps the conflict: %+v, %v", next, err)
 	}
-	// Other changes pass over the flag untouched.
-	next = mustMerge(t, stored, Change{Marks: map[string]DownMark{mergeSeed: {DownAt: payloadNow, Class: MarkDial}}})
-	if !next.Cluster.IdentityConflict {
-		t.Error("a mark write cleared the conflict")
+	if next, _, err := Merge(stored, mergeKey(), Change{Result: mergeResult("pve2")}, payloadNow); !errors.Is(err, ErrIdentityConflict) || next != nil {
+		t.Errorf("a result with the stored nodes: %+v, %v", next, err)
+	}
+	// Other changes pass over the flag and the stored nodes untouched.
+	next := mustMerge(t, stored, Change{Marks: map[string]DownMark{mergeSeed: {DownAt: payloadNow, Class: MarkDial}}})
+	if !next.Cluster.IdentityConflict || !reflect.DeepEqual(next.Discovery, stored.Discovery) {
+		t.Errorf("a mark write changed the conflicted file: %+v", next)
 	}
 }
 
@@ -344,7 +358,7 @@ func TestMergeDoesNotChangeItsInputs(t *testing.T) {
 // storeWithNodes writes a discovery for names through UpdatePayload.
 func putResult(t *testing.T, s *Store, now time.Time, result *DiscoveryResult) UpdateResult {
 	t.Helper()
-	res, err := s.UpdatePayload(context.Background(), now, func(*Payload) (Change, error) {
+	res, err := s.UpdatePayload(context.Background(), now, func(Stored) (Change, error) {
 		return Change{Result: result}, nil
 	})
 	if err != nil || !res.Written {
@@ -470,7 +484,7 @@ func TestStoreRestoredOldFileLosesItsUnconfirmedNodes(t *testing.T) {
 func TestStoreHintSurvivesAWriterWhoseMapDoesNotNameIt(t *testing.T) {
 	dir := newStoreDir(t)
 	s := openTestStore(t, dir, storeTestCredential, StoreOptions{})
-	_, err := s.UpdatePayload(context.Background(), payloadNow, func(*Payload) (Change, error) {
+	_, err := s.UpdatePayload(context.Background(), payloadNow, func(Stored) (Change, error) {
 		return Change{Hint: &ColdStartHint{Name: "pve3", ProbedAt: payloadNow}}, nil
 	})
 	if err != nil {
@@ -479,9 +493,9 @@ func TestStoreHintSurvivesAWriterWhoseMapDoesNotNameIt(t *testing.T) {
 
 	// Another entry sharing the key writes a mark. Its az_map plays no part in the write.
 	later := payloadNow.Add(10 * time.Second)
-	res, err := s.UpdatePayload(context.Background(), later, func(stored *Payload) (Change, error) {
-		if stored == nil || stored.ColdStart == nil || stored.ColdStart.Name != "pve3" {
-			t.Errorf("build saw %+v, want the stored hint", stored)
+	res, err := s.UpdatePayload(context.Background(), later, func(stored Stored) (Change, error) {
+		if stored.Usable == nil || stored.Usable.ColdStart == nil || stored.Usable.ColdStart.Name != "pve3" {
+			t.Errorf("build saw %+v, want the stored hint", stored.Usable)
 		}
 		return Change{Marks: map[string]DownMark{s.Key().Endpoints[0]: {DownAt: later, Class: MarkDial}}}, nil
 	})
@@ -507,8 +521,8 @@ func TestStoreHintSurvivesAWriterWhoseMapDoesNotNameIt(t *testing.T) {
 func TestStoreUpdatePayloadHandsBuildTheValidatedPayload(t *testing.T) {
 	dir := newStoreDir(t)
 	s := openTestStore(t, dir, storeTestCredential, StoreOptions{})
-	_, err := s.UpdatePayload(context.Background(), payloadNow, func(stored *Payload) (Change, error) {
-		if stored != nil {
+	_, err := s.UpdatePayload(context.Background(), payloadNow, func(stored Stored) (Change, error) {
+		if stored.Usable != nil || stored.Known != nil {
 			t.Errorf("build saw %+v for a missing file", stored)
 		}
 		return Change{Result: mergeResult("pve2")}, nil
@@ -516,10 +530,14 @@ func TestStoreUpdatePayloadHandsBuildTheValidatedPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// An hour later the stored nodes are 1 hour old and the mark is gone.
-	_, err = s.UpdatePayload(context.Background(), payloadNow.Add(25*time.Hour), func(stored *Payload) (Change, error) {
-		if stored == nil || stored.Discovery == nil || len(stored.Discovery.Nodes) != 0 {
-			t.Errorf("build saw %+v, want the payload without its expired node", stored)
+	// 25 hours later the stored node is past its bound. The usable view leaves
+	// it out, and the known view still holds it with its pins.
+	_, err = s.UpdatePayload(context.Background(), payloadNow.Add(25*time.Hour), func(stored Stored) (Change, error) {
+		if stored.Usable == nil || stored.Usable.Discovery == nil || len(stored.Usable.Discovery.Nodes) != 0 {
+			t.Errorf("build saw %+v, want the payload without its expired node", stored.Usable)
+		}
+		if len(stored.Known) != 1 || stored.Known[0].Name != "pve2" || len(stored.Known[0].Pins) != 2 {
+			t.Errorf("build knew %+v, want pve2 and its pins", stored.Known)
 		}
 		return Change{}, nil
 	})
@@ -530,8 +548,8 @@ func TestStoreUpdatePayloadHandsBuildTheValidatedPayload(t *testing.T) {
 	p := payloadFor(s.Key(), "pve2")
 	p.Discovery.Nodes[0].Port = 0
 	signedFile(t, s, p)
-	res, err := s.UpdatePayload(context.Background(), payloadNow, func(stored *Payload) (Change, error) {
-		if stored != nil {
+	res, err := s.UpdatePayload(context.Background(), payloadNow, func(stored Stored) (Change, error) {
+		if stored.Usable != nil || stored.Known != nil {
 			t.Errorf("build saw %+v for an invalid file", stored)
 		}
 		return Change{Hint: &ColdStartHint{Name: "pve2", ProbedAt: payloadNow}}, nil
@@ -548,13 +566,13 @@ func TestStoreUpdatePayloadErrorsWriteNothing(t *testing.T) {
 	dir := newStoreDir(t)
 	s := openTestStore(t, dir, storeTestCredential, StoreOptions{})
 	boom := errors.New("trust refused")
-	res, err := s.UpdatePayload(context.Background(), payloadNow, func(*Payload) (Change, error) { return Change{}, boom })
+	res, err := s.UpdatePayload(context.Background(), payloadNow, func(Stored) (Change, error) { return Change{}, boom })
 	if !errors.Is(err, boom) || res.Written || !res.Locked {
 		t.Errorf("build error: %+v, %v", res, err)
 	}
 	bad := mergeResult("pve2")
 	bad.Discovery.Nodes[0].Name = "api.attacker.example"
-	res, err = s.UpdatePayload(context.Background(), payloadNow, func(*Payload) (Change, error) {
+	res, err = s.UpdatePayload(context.Background(), payloadNow, func(Stored) (Change, error) {
 		return Change{Result: bad}, nil
 	})
 	if !errors.Is(err, ErrInvalidChange) || res.Written {
@@ -567,7 +585,7 @@ func TestStoreUpdatePayloadErrorsWriteNothing(t *testing.T) {
 		t.Error("a nil build function was accepted")
 	}
 	// An empty change into a missing file writes nothing and still succeeds.
-	res, err = s.UpdatePayload(context.Background(), payloadNow, func(*Payload) (Change, error) { return Change{}, nil })
+	res, err = s.UpdatePayload(context.Background(), payloadNow, func(Stored) (Change, error) { return Change{}, nil })
 	if err != nil || res.Written || !res.Locked {
 		t.Errorf("empty change: %+v, %v", res, err)
 	}
@@ -582,7 +600,7 @@ func TestStoreUpdatePayloadRefusesAClosedStore(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.UpdatePayload(context.Background(), payloadNow, func(*Payload) (Change, error) { return Change{}, nil }); err == nil {
+	if _, err := s.UpdatePayload(context.Background(), payloadNow, func(Stored) (Change, error) { return Change{}, nil }); err == nil {
 		t.Error("UpdatePayload on a closed store succeeded")
 	}
 	if _, _, err := s.ReadPayload(payloadNow, nil); err == nil {
@@ -603,7 +621,7 @@ func TestStoreUpdatePayloadSkipsTheWriteWhileAnotherProcessHoldsTheLock(t *testi
 		t.Fatalf("child said %q, want locked", got)
 	}
 	called := false
-	res, err := s.UpdatePayload(context.Background(), payloadNow, func(*Payload) (Change, error) {
+	res, err := s.UpdatePayload(context.Background(), payloadNow, func(Stored) (Change, error) {
 		called = true
 		return Change{Result: mergeResult("pve2")}, nil
 	})
@@ -651,7 +669,7 @@ func TestStoreUpdatePayloadSerializesWriters(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := s.UpdatePayload(context.Background(), payloadNow, func(*Payload) (Change, error) {
+			_, err := s.UpdatePayload(context.Background(), payloadNow, func(Stored) (Change, error) {
 				return Change{Marks: map[string]DownMark{endpoint: {DownAt: payloadNow, Class: MarkDial}}, Pool: endpoints}, nil
 			})
 			if err != nil {
@@ -663,5 +681,460 @@ func TestStoreUpdatePayloadSerializesWriters(t *testing.T) {
 	got, _, err := s.ReadPayload(payloadNow, nil)
 	if err != nil || len(got.Marks) != len(endpoints) {
 		t.Errorf("marks %v, err %v, want every writer's mark", got, err)
+	}
+}
+
+// unverifiedKey is mergeKey under verify_ssl false.
+func unverifiedKey() Key {
+	key := mergeKey()
+	key.VerifySSL = false
+	return key
+}
+
+func TestMergeRefusesAResultAndAHintTogether(t *testing.T) {
+	both := Change{Result: mergeResult("pve3"), Hint: &ColdStartHint{Name: "pve3", ProbedAt: payloadNow}}
+	conflicted := payloadFor(unverifiedKey(), "pve2")
+	conflicted.Cluster.IdentityConflict = true
+	cases := map[string]struct {
+		stored *Payload
+		key    Key
+	}{
+		"no file":         {nil, mergeKey()},
+		"a file":          {payloadFor(mergeKey(), "pve2"), mergeKey()},
+		"a conflict file": {conflicted, unverifiedKey()},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			next, _, err := Merge(tc.stored, tc.key, both, payloadNow)
+			if !errors.Is(err, ErrInvalidChange) || next != nil {
+				t.Errorf("Merge: %+v, %v, want ErrInvalidChange and nothing to write", next, err)
+			}
+		})
+	}
+}
+
+func TestMergeRecordsAConflictAndNothingElse(t *testing.T) {
+	key := unverifiedKey()
+	stored := payloadFor(key, "pve2", "pve3")
+	stored.Discovery.Nodes[1].ConfirmedAt = payloadNow.Add(-48 * time.Hour)
+	stored.Marks = map[string]DownMark{mergeSeed: {DownAt: payloadNow.Add(-10 * time.Second), Class: MarkDial}}
+
+	next, drops, err := Merge(stored, key, Change{Conflict: true}, payloadNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := stored.clone()
+	want.Cluster.IdentityConflict = true
+	if !reflect.DeepEqual(next, want) {
+		t.Errorf("Merge changed more than the flag:\n got %+v\nwant %+v", next, want)
+	}
+	if !reflect.DeepEqual(drops, []Drop{{Record: "node 1", Reason: DropExpired}}) {
+		t.Errorf("drops %v", drops)
+	}
+	// The recorded conflict refuses every later result and hides the nodes.
+	if again, _, err := Merge(next, key, Change{Result: mergeResult("pve2")}, payloadNow); !errors.Is(err, ErrIdentityConflict) || again != nil {
+		t.Errorf("a result over the recorded conflict: %+v, %v", again, err)
+	}
+	if got, _ := validatedPayload(t, next); len(got.Discovery.Nodes) != 0 || !got.Cluster.IdentityConflict {
+		t.Errorf("a reader of the recorded conflict: %+v", got)
+	}
+
+	refused := map[string]struct {
+		stored *Payload
+		key    Key
+		change Change
+	}{
+		"with a result":     {stored, key, Change{Conflict: true, Result: mergeResult("pve2")}},
+		"under verify_ssl":  {payloadFor(mergeKey(), "pve2"), mergeKey(), Change{Conflict: true}},
+		"without a file":    {nil, key, Change{Conflict: true}},
+		"without identity":  {&Payload{Key: key, Marks: stored.Marks}, key, Change{Conflict: true}},
+		"over invalid file": {&Payload{Key: key, Discovery: &DiscoverySection{Outcome: "x"}}, key, Change{Conflict: true}},
+	}
+	for name, tc := range refused {
+		t.Run(name, func(t *testing.T) {
+			next, _, err := Merge(tc.stored, tc.key, tc.change, payloadNow)
+			if !errors.Is(err, ErrInvalidChange) || next != nil {
+				t.Errorf("Merge: %+v, %v, want ErrInvalidChange", next, err)
+			}
+		})
+	}
+}
+
+func TestMergeRefusesAnIdentityChangeUnderVerifySSLFalse(t *testing.T) {
+	key := unverifiedKey()
+	stored := payloadFor(key, "pve2")
+	changed := mergeResult("pve2")
+	changed.Cluster.RootCASHA256 = payloadPin("ff")
+	changed.Discovery.Nodes[0].Pins = []string{payloadPin("ee")}
+
+	next, _, err := Merge(stored, key, Change{Result: changed}, payloadNow)
+	var refusal *TrustRefusalError
+	if !errors.As(err, &refusal) || !refusal.IdentityChanged || len(refusal.Nodes) != 0 || next != nil {
+		t.Fatalf("Merge: %+v, %v, want an identity refusal and nothing to write", next, err)
+	}
+	if !errors.Is(err, ErrTrustRefused) || !errors.Is(err, ErrIdentityChanged) || errors.Is(err, ErrPinsChanged) ||
+		errors.Is(err, ErrInvalidChange) {
+		t.Errorf("%v matches the wrong sentinels", err)
+	}
+	if strings.Contains(err.Error(), payloadPin("ff")) || strings.Contains(err.Error(), "pve2") {
+		t.Errorf("error %v echoes a value", err)
+	}
+	// The caller records it as a conflict.
+	recorded, _, err := Merge(stored, key, Change{Conflict: refusal.IdentityChanged}, payloadNow)
+	if err != nil || !recorded.Cluster.IdentityConflict || recorded.Cluster.RootCASHA256 != payloadPin("3c") {
+		t.Errorf("recording the refusal: %+v, %v", recorded, err)
+	}
+
+	// An identity seen for the first time is recorded, with or without a file.
+	for name, first := range map[string]*Payload{
+		"no file":        nil,
+		"marks only":     {Key: key, Marks: map[string]DownMark{mergeSeed: {DownAt: payloadNow, Class: MarkDial}}},
+		"invalid stored": {Key: key, Cluster: &ClusterIdentity{RootCASHA256: "x"}},
+	} {
+		if next, _, err := Merge(first, key, Change{Result: changed}, payloadNow); err != nil || next.Cluster.RootCASHA256 != payloadPin("ff") {
+			t.Errorf("%s: first use: %+v, %v", name, next, err)
+		}
+	}
+	// Under verify_ssl true the changed identity replaces the stored one.
+	next, _, err = Merge(payloadFor(mergeKey(), "pve2"), mergeKey(), Change{Result: changed}, payloadNow)
+	if err != nil || next.Cluster.RootCASHA256 != payloadPin("ff") || next.Discovery.Nodes[0].Pins[0] != payloadPin("ee") {
+		t.Errorf("verify_ssl true: %+v, %v", next, err)
+	}
+}
+
+func TestMergeRefusesAPinChangeForAKnownNodeUnderVerifySSLFalse(t *testing.T) {
+	key := unverifiedKey()
+	known := map[string]func(p *Payload){
+		"a fresh node":           func(*Payload) {},
+		"a node past 24 hours":   func(p *Payload) { p.Discovery.Nodes[0].ConfirmedAt = payloadNow.Add(-48 * time.Hour) },
+		"a node confirmed ahead": func(p *Payload) { p.Discovery.Nodes[0].ConfirmedAt = payloadNow.Add(time.Hour) },
+		"a section dated ahead":  func(p *Payload) { p.Discovery.DiscoveredAt = payloadNow.Add(time.Hour) },
+		"a node that no longer derives": func(p *Payload) {
+			p.Discovery.Nodes[0].Address = "pve2.attacker.example"
+		},
+		"a name in another case": func(p *Payload) { p.Discovery.Nodes[0].Name = "PVE2" },
+	}
+	for name, mutate := range known {
+		t.Run(name, func(t *testing.T) {
+			stored := payloadFor(key, "pve2", "pve3")
+			mutate(stored)
+			result := mergeResult("pve4", "pve2", "pve3")
+			result.Discovery.Nodes[1].Pins = []string{payloadPin("a1"), payloadPin("ff")}
+			next, _, err := Merge(stored, key, Change{Result: result}, payloadNow)
+			var refusal *TrustRefusalError
+			if !errors.As(err, &refusal) || refusal.IdentityChanged || !reflect.DeepEqual(refusal.Nodes, []string{"pve2"}) || next != nil {
+				t.Fatalf("Merge: %+v, %v, want a pin refusal for pve2", next, err)
+			}
+			if !errors.Is(err, ErrTrustRefused) || !errors.Is(err, ErrPinsChanged) || errors.Is(err, ErrIdentityChanged) {
+				t.Errorf("%v matches the wrong sentinels", err)
+			}
+			if strings.Contains(err.Error(), "pve2") {
+				t.Errorf("error %v echoes a node name", err)
+			}
+		})
+	}
+
+	// The same pins in another order and case, a new node, and a known node
+	// the result leaves out are all accepted.
+	stored := payloadFor(key, "pve2", "pve3")
+	stored.Discovery.Nodes[0].ConfirmedAt = payloadNow.Add(-48 * time.Hour)
+	result := mergeResult("pve2", "pve5")
+	result.Discovery.Nodes[0].Pins = []string{strings.ToUpper(payloadPin("9e")), payloadPin("a1"), payloadPin("9E")}
+	result.Discovery.Nodes[1].Pins = []string{payloadPin("55")}
+	next, _, err := Merge(stored, key, Change{Result: result}, payloadNow)
+	if err != nil || len(next.Discovery.Nodes) != 2 || next.Discovery.Nodes[1].Pins[0] != payloadPin("55") {
+		t.Errorf("unchanged pins and a new node: %+v, %v", next, err)
+	}
+	// Under verify_ssl true a changed pin set replaces the old one.
+	verified := payloadFor(mergeKey(), "pve2")
+	changed := mergeResult("pve2")
+	changed.Discovery.Nodes[0].Pins = []string{payloadPin("ff")}
+	if next, _, err := Merge(verified, mergeKey(), Change{Result: changed}, payloadNow); err != nil ||
+		!reflect.DeepEqual(next.Discovery.Nodes[0].Pins, []string{payloadPin("ff")}) {
+		t.Errorf("verify_ssl true: %+v, %v", next, err)
+	}
+}
+
+func TestMergeDropsAResultNodeTheSeedDoesNotDerive(t *testing.T) {
+	result := mergeResult("pve2", "pve3")
+	result.Discovery.Nodes[1].Address = "pve3.attacker.example"
+	next, drops, err := Merge(nil, mergeKey(), Change{Result: result}, payloadNow)
+	if err != nil || len(next.Discovery.Nodes) != 1 || next.Discovery.Nodes[0].Name != "pve2" {
+		t.Fatalf("Merge: %+v, %v", next, err)
+	}
+	if !reflect.DeepEqual(drops, []Drop{{Record: "node 1", Reason: DropNotDerived}}) {
+		t.Errorf("drops %v", drops)
+	}
+}
+
+func TestMergeWritesTheStoredDiscoveryBackUnchanged(t *testing.T) {
+	for _, step := range []time.Duration{-2 * time.Minute, 25 * time.Hour} {
+		t.Run(step.String(), func(t *testing.T) {
+			stored := payloadFor(mergeKey(), "pve2", "pve3", "localhost")
+			stored.Discovery.Nodes[0].Address = "PVE2.dc1.example.com"
+			stored.Discovery.Nodes[1].Pins = []string{strings.ToUpper(payloadPin("ab"))}
+			stored.Discovery.Nodes[1].ConfirmedAt = payloadNow.Add(-25 * time.Hour)
+			stored.Discovery.Nodes[2].Address = "localhost"
+			stored.Discovery.NextRefreshAfter = payloadNow.Add(24 * time.Hour)
+			before, err := json.Marshal(stored.Discovery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			clock := payloadNow.Add(step)
+			next, drops, err := Merge(stored, mergeKey(), Change{
+				Marks: map[string]DownMark{
+					mergeSeed:                   {DownAt: clock, Class: MarkDial},
+					"pve2.dc1.example.com:8006": {DownAt: clock, Class: MarkPin},
+				},
+			}, clock)
+			if err != nil || len(drops) == 0 {
+				t.Fatalf("Merge: %v, drops %v", err, drops)
+			}
+			// The mark of a node written back in its stored spelling is kept.
+			if len(next.Marks) != 2 {
+				t.Errorf("marks %v, want the seed's and the node's", next.Marks)
+			}
+			after, err := json.Marshal(next.Discovery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(before) {
+				t.Errorf("a mark write changed the discovery section:\n got %s\nwant %s", after, before)
+			}
+		})
+	}
+}
+
+func TestMergeCapsTheMarksOfOtherEndpoints(t *testing.T) {
+	key := mergeKey()
+	key.Endpoints = []string{mergeSeed, "pve1b.dc1.example.com:8006"}
+	marks := map[string]DownMark{
+		mergeSeed:                    {DownAt: payloadNow.Add(-100 * time.Second), Class: MarkDial},
+		"pve1b.dc1.example.com:8006": {DownAt: payloadNow.Add(-100 * time.Second), Class: MarkDial},
+	}
+	pool := make([]string, 0, 70)
+	for i := range 70 {
+		endpoint := fmt.Sprintf("cand%02d.dc1.example.com:8006", i)
+		pool = append(pool, endpoint)
+		// The last seven share one time, and the endpoint that sorts first wins.
+		marks[endpoint] = DownMark{DownAt: payloadNow.Add(-time.Duration(min(i, 63)) * time.Second), Class: MarkDNS}
+	}
+	next, _, err := Merge(nil, key, Change{Marks: marks, Pool: pool}, payloadNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(next.Marks) != 2+MaxOtherMarks {
+		t.Fatalf("%d marks, want the two configured endpoints and %d others", len(next.Marks), MaxOtherMarks)
+	}
+	for _, endpoint := range key.Endpoints {
+		if _, ok := next.Marks[endpoint]; !ok {
+			t.Errorf("the oldest mark, for configured %s, was dropped", endpoint)
+		}
+	}
+	for i := range 70 {
+		endpoint := fmt.Sprintf("cand%02d.dc1.example.com:8006", i)
+		if _, ok := next.Marks[endpoint]; ok != (i < 64) {
+			t.Errorf("mark for %s kept %v", endpoint, ok)
+		}
+	}
+	// A merge under the cap keeps every mark.
+	small := map[string]DownMark{mergeSeed: marks[mergeSeed], "cand00.dc1.example.com:8006": marks["cand00.dc1.example.com:8006"]}
+	if next, _, err := Merge(nil, key, Change{Marks: small, Pool: pool}, payloadNow); err != nil || len(next.Marks) != 2 {
+		t.Errorf("under the cap: %+v, %v", next, err)
+	}
+}
+
+// openUnverifiedStore opens a store on dir for storeTestConfig under
+// verify_ssl false, and closes it when the test ends.
+func openUnverifiedStore(t *testing.T, dir string) *Store {
+	t.Helper()
+	cfg := storeTestConfig()
+	cfg.VerifySSL = false
+	return openStoreFor(t, dir, cfg)
+}
+
+// openStoreFor opens a store on dir for cfg, and closes it when the test
+// ends.
+func openStoreFor(t *testing.T, dir string, cfg KeyConfig) *Store {
+	t.Helper()
+	s, err := OpenStore(context.Background(), storeTestRoot(t, dir), cfg, storeTestCredential, StoreOptions{})
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return s
+}
+
+func TestStoreMarkWriteKeepsTheDiscoveryAfterTheClockMoves(t *testing.T) {
+	for _, step := range []time.Duration{-2 * time.Minute, 25 * time.Hour} {
+		t.Run(step.String(), func(t *testing.T) {
+			dir := newStoreDir(t)
+			s := openUnverifiedStore(t, dir)
+			planted := payloadFor(s.Key(), "pve2", "pve3")
+			planted.Cluster.ObservedVia = s.Key().Endpoints[0]
+			planted.Discovery.Nodes[1].ConfirmedAt = payloadNow.Add(-25 * time.Hour)
+			signedFile(t, s, planted)
+
+			// A mark write at the moved clock, which sees the discovery as
+			// ahead after the step back and every node as expired after 25
+			// hours.
+			clock := payloadNow.Add(step)
+			res, err := s.UpdatePayload(context.Background(), clock, func(stored Stored) (Change, error) {
+				if len(stored.Known) != 2 {
+					t.Errorf("build knew %+v, want both nodes", stored.Known)
+				}
+				return Change{Marks: map[string]DownMark{s.Key().Endpoints[0]: {DownAt: clock, Class: MarkDial}}}, nil
+			})
+			if err != nil || !res.Written {
+				t.Fatalf("mark write: %+v, %v", res, err)
+			}
+			var raw Payload
+			if err := s.Read(&raw); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(raw.Discovery, planted.Discovery) {
+				t.Errorf("the file's discovery changed:\n got %+v\nwant %+v", raw.Discovery, planted.Discovery)
+			}
+			got, _, err := s.ReadPayload(payloadNow, nil)
+			if err != nil || got.Discovery == nil || len(got.Discovery.Nodes) != 1 || got.Discovery.Nodes[0].Name != "pve2" {
+				t.Fatalf("a read at the sane clock: %+v, %v", got, err)
+			}
+
+			// A discovery that changes the expired node's pins is refused, and
+			// one that keeps them is accepted.
+			later := payloadNow.Add(max(step, 0))
+			changed := mergeResult("pve2", "pve3")
+			changed.Cluster.ObservedVia = s.Key().Endpoints[0]
+			changed.Discovery.DiscoveredAt = later
+			changed.Discovery.Nodes[1].Pins = []string{payloadPin("ff")}
+			for i := range changed.Discovery.Nodes {
+				changed.Discovery.Nodes[i].ConfirmedAt = later
+			}
+			res, err = s.UpdatePayload(context.Background(), later, func(Stored) (Change, error) {
+				return Change{Result: changed}, nil
+			})
+			if !errors.Is(err, ErrPinsChanged) || res.Written {
+				t.Fatalf("a pin change for the expired node: %+v, %v", res, err)
+			}
+			kept := changed
+			kept.Discovery.Nodes = append([]DiscoveredNode(nil), changed.Discovery.Nodes...)
+			kept.Discovery.Nodes[1].Pins = []string{payloadPin("9e"), payloadPin("a1")}
+			if res, err := s.UpdatePayload(context.Background(), later, func(Stored) (Change, error) {
+				return Change{Result: kept}, nil
+			}); err != nil || !res.Written {
+				t.Errorf("a discovery with the stored pins: %+v, %v", res, err)
+			}
+		})
+	}
+}
+
+func TestStoreSweepSparesTheWritersOwnKeyFile(t *testing.T) {
+	dir := newStoreDir(t)
+	s := openTestStore(t, dir, storeTestCredential, StoreOptions{})
+	putResult(t, s, payloadNow, mergeResult("pve2"))
+	old := payloadNow.Add(-31 * 24 * time.Hour)
+	other := "other.example.com-0123456789abcdef.json"
+	writeStoreFile(t, filepath.Join(dir, other), []byte("{}"), 0o600)
+	for _, name := range []string{s.FileName(), other} {
+		if err := os.Chtimes(filepath.Join(dir, name), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// build fails, so nothing is written and the key file stays only if the
+	// sweep spared it.
+	boom := errors.New("no change")
+	res, err := s.UpdatePayload(context.Background(), payloadNow, func(Stored) (Change, error) { return Change{}, boom })
+	if !errors.Is(err, boom) || res.Written {
+		t.Fatalf("UpdatePayload: %+v, %v", res, err)
+	}
+	if !reflect.DeepEqual(res.Swept.Removed, []string{other}) {
+		t.Errorf("swept %v, want only the other key's file", res.Swept.Removed)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, s.FileName())); err != nil {
+		t.Errorf("the writer's own key file is gone: %v", err)
+	}
+}
+
+func TestStoreWritesTheLargestLegalFile(t *testing.T) {
+	// Every derived host is 253 characters, the longest DNS allows, which is
+	// a node name of 63 characters under a 189-character registrable domain.
+	// Every endpoint, node, and extra cold-start candidate is marked, so the
+	// cap keeps 64 marks beside the configured ones. The key holds five
+	// configured endpoints of 253 characters, the most that fit beside the
+	// rest, because the key and its marks are the one part of the file whose
+	// size the cache does not bound.
+	const port = 65535
+	domain := strings.Repeat("d", 63) + "." + strings.Repeat("e", 63) + "." + strings.Repeat("f", 57) + ".com"
+	label := func(prefix string, i int) string {
+		name := fmt.Sprintf("%s%02d", prefix, i)
+		return name + strings.Repeat("x", MaxNodeNameLength-len(name))
+	}
+	endpoints := make([]string, 0, 5)
+	endpoints = append(endpoints, net.JoinHostPort("pve1."+domain, strconv.Itoa(port)))
+	for i := range 4 {
+		endpoints = append(endpoints, net.JoinHostPort(label("c", i)+"."+domain, strconv.Itoa(port)))
+	}
+	cfg := storeTestConfig()
+	cfg.Endpoints = endpoints
+	dir := newStoreDir(t)
+	s := openStoreFor(t, dir, cfg)
+
+	// Every time carries nanoseconds, which is its longest spelling.
+	at := payloadNow.Add(-123456789)
+	result := &DiscoveryResult{Cluster: payloadCluster(at), Discovery: payloadDiscovery()}
+	result.Cluster.ObservedVia = endpoints[0]
+	result.Discovery.DiscoveredAt = at
+	result.Discovery.NextRefreshAfter = at.Add(time.Hour)
+	result.Discovery.Outcome = OutcomeNoStatus
+	marks := make(map[string]DownMark)
+	pool := make([]string, 0, 8)
+	for _, endpoint := range endpoints {
+		marks[endpoint] = DownMark{DownAt: at, Class: MarkTLSHandshake}
+	}
+	for i := range MaxNodes {
+		name := label("n", i)
+		address, err := DeriveAddress(endpoints[0], name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		host, _, _ := net.SplitHostPort(address)
+		if len(host) != 253 {
+			t.Fatalf("derived host is %d characters, want 253", len(host))
+		}
+		result.Discovery.Nodes = append(result.Discovery.Nodes, DiscoveredNode{
+			Name: name, Address: host, Port: port, Online: false, ConfirmedAt: at,
+			Pins: []string{payloadPin(fmt.Sprintf("%02x", i)), payloadPin("a1"), payloadPin("9e")},
+		})
+		marks[address] = DownMark{DownAt: at, Class: MarkTLSHandshake}
+	}
+	for i := range 8 {
+		endpoint := net.JoinHostPort(label("z", i)+"."+domain, strconv.Itoa(port))
+		pool = append(pool, endpoint)
+		marks[endpoint] = DownMark{DownAt: at.Add(time.Nanosecond), Class: MarkTLSHandshake}
+	}
+
+	res, err := s.UpdatePayload(context.Background(), payloadNow, func(Stored) (Change, error) {
+		return Change{Result: result, Marks: marks, Pool: pool}, nil
+	})
+	if err != nil || !res.Written || len(res.Dropped) != 0 {
+		t.Fatalf("UpdatePayload: %+v, %v", res, err)
+	}
+	info, err := os.Stat(filepath.Join(dir, s.FileName()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() > 64*1024 {
+		t.Errorf("the file is %d bytes, more than 64 KiB", info.Size())
+	}
+	got, drops, err := s.ReadPayload(payloadNow, nil)
+	if err != nil || len(drops) != 0 {
+		t.Fatalf("ReadPayload: %v, drops %v", err, drops)
+	}
+	if len(got.Discovery.Nodes) != MaxNodes || len(got.Marks) != len(endpoints)+MaxOtherMarks {
+		t.Errorf("%d nodes and %d marks, want %d and %d", len(got.Discovery.Nodes), len(got.Marks), MaxNodes, len(endpoints)+MaxOtherMarks)
 	}
 }

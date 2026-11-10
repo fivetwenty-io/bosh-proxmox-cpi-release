@@ -158,3 +158,37 @@ func TestCloneSharesNothing(t *testing.T) {
 		t.Error("clone of a nil section is not nil")
 	}
 }
+
+func TestBoundsAreTheSpecsValues(t *testing.T) {
+	// Each bound is written out as the spec states it, so a changed constant
+	// fails here even when its own boundary test is built from the constant.
+	ints := []struct {
+		name      string
+		got, want int
+	}{
+		{"MaxNodes", MaxNodes, 64},
+		{"MaxPinsPerNode", MaxPinsPerNode, 3},
+		{"MaxOtherMarks", MaxOtherMarks, 64},
+		{"maxFileBytes", maxFileBytes, 64 * 1024},
+	}
+	for _, b := range ints {
+		if b.got != b.want {
+			t.Errorf("%s = %d, want %d", b.name, b.got, b.want)
+		}
+	}
+	durations := []struct {
+		name      string
+		got, want time.Duration
+	}{
+		{"MarkTTL", MarkTTL, 2 * time.Minute},
+		{"HintTTL", HintTTL, time.Hour},
+		{"NodeTTL", NodeTTL, 24 * time.Hour},
+		{"MaxRefreshWait", MaxRefreshWait, 24 * time.Hour},
+		{"FutureSkew", FutureSkew, 30 * time.Second},
+	}
+	for _, b := range durations {
+		if b.got != b.want {
+			t.Errorf("%s = %v, want %v", b.name, b.got, b.want)
+		}
+	}
+}

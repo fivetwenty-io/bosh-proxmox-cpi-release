@@ -10,6 +10,11 @@ const (
 	// MaxPinsPerNode is the most pins one node holds. The set is the /nodes
 	// fingerprint plus the pve-ssl.pem and pveproxy-ssl.pem fingerprints.
 	MaxPinsPerNode = 3
+	// MaxOtherMarks is the most down marks a merge keeps for endpoints other
+	// than the configured ones, which are the discovered nodes and the pool's
+	// cold-start candidates. With every configured endpoint's mark beside
+	// them, the file stays under its size cap however large the pool grows.
+	MaxOtherMarks = 64
 
 	// MarkTTL is how long a down mark counts. A mark that is this old or older
 	// is dropped.
@@ -58,6 +63,12 @@ func (o DiscoveryOutcome) Valid() bool {
 	return false
 }
 
+// holdsNodes reports whether a discovery that ended with o lists nodes. The
+// no_candidates, public_suffix, and standalone outcomes hold none.
+func (o DiscoveryOutcome) holdsNodes() bool {
+	return o == OutcomeOK || o == OutcomeNoStatus
+}
+
 // MarkClass says why an endpoint was marked down. It is an enumeration and
 // never holds raw error text.
 type MarkClass string
@@ -104,7 +115,8 @@ type ClusterIdentity struct {
 	// ObservedAt is when the identity was read. It is informational and gates
 	// nothing, so the future-timestamp rule does not apply to it.
 	ObservedAt time.Time `json:"observed_at"`
-	// ObservedVia is the configured endpoint that answered.
+	// ObservedVia is the configured endpoint that answered. It is empty or
+	// one of the key's endpoints.
 	ObservedVia string `json:"observed_via"`
 	// IdentityConflict is set when a changed identity was refused under
 	// verify_ssl false. It stays set until the operator deletes the file.
@@ -130,7 +142,8 @@ type DiscoverySection struct {
 type DiscoveredNode struct {
 	// Name is the node's name, which passes ValidateNodeName.
 	Name string `json:"name"`
-	// Address is the host derived from the name, with no port.
+	// Address is the host derived from the name under the key's seed, with
+	// no port.
 	Address string `json:"address"`
 	// Port is the seed's port.
 	Port int `json:"port"`
@@ -195,12 +208,22 @@ func (d *DiscoverySection) clone() *DiscoverySection {
 		return nil
 	}
 	out := *d
-	out.Nodes = make([]DiscoveredNode, len(d.Nodes))
-	for i, node := range d.Nodes {
-		node.Pins = append([]string(nil), node.Pins...)
-		out.Nodes[i] = node
-	}
+	out.Nodes = cloneNodes(d.Nodes)
 	return &out
+}
+
+// cloneNodes returns a deep copy of nodes. A nil list stays nil and an empty
+// one stays empty, so a section written back marshals as it was read.
+func cloneNodes(nodes []DiscoveredNode) []DiscoveredNode {
+	if nodes == nil {
+		return nil
+	}
+	out := make([]DiscoveredNode, len(nodes))
+	for i, node := range nodes {
+		node.Pins = append([]string(nil), node.Pins...)
+		out[i] = node
+	}
+	return out
 }
 
 // empty reports whether p holds nothing beyond its key.
