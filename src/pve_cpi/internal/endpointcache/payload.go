@@ -149,7 +149,9 @@ type DiscoveredNode struct {
 	Port int `json:"port"`
 	// Pins are the node's certificate fingerprints, each 32 bytes in hex.
 	Pins []string `json:"pins"`
-	// Online is whether a quorate /cluster/status reported the node online.
+	// Online is the flag discovery ordered the node by. It is the online flag of
+	// a quorate /cluster/status, the /nodes status field when the status could
+	// not be read, and false for every node under a non-quorate status.
 	Online bool `json:"online"`
 	// ConfirmedAt is when a discovery through a configured endpoint last
 	// saw the node.

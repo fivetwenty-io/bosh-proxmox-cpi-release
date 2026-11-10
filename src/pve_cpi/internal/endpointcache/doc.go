@@ -9,7 +9,12 @@
 // one that has the wrong length. It reads and writes the authenticated cache
 // files through the private file store, which checks an HMAC and the file's
 // key on every read and replaces a file atomically, under a lock, on every
-// write, and it takes the per-key discover lock. It chooses the cache directory,
+// write, and it takes the per-key discover lock. It defines the cache payload,
+// validates every record in it on read, merges a writer's change into the
+// stored file under the trust rules without erasing what a read only hid, and
+// sweeps old files whose names the cache makes. It owns the process-wide
+// registry of background workers and the exit drain that waits up to 3
+// seconds for them and then cancels the rest. It chooses the cache directory,
 // taking the directory the operator names when there is one and a per-user
 // directory under the temporary directory otherwise. It also supplies the log
 // level for the cache and discovery lines that the failure rules keep at Debug
