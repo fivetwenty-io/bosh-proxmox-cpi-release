@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type sample struct {
@@ -437,6 +439,155 @@ func TestOpenWithUsesTheSuppliedOpenat(t *testing.T) {
 	_ = f.Close()
 	if _, err := p.OpenWith(root, "r.json", os.O_RDONLY, func(int, string, int) (int, error) { return -1, syscall.EIO }); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("openat failure = %v; want EIO", err)
+	}
+}
+
+// TestOpenRefusesAFIFOSwappedInBeforeTheOpen puts a FIFO at the name between
+// the lstat and the open. A blocking open would wait for a writer forever, so
+// the refusal has to come back at once.
+func TestOpenRefusesAFIFOSwappedInBeforeTheOpen(t *testing.T) {
+	for name, existing := range map[string]bool{"absent at the lstat": false, "regular file at the lstat": true} {
+		t.Run(name, func(t *testing.T) {
+			p := plainPolicy(1 << 10)
+			root, dir := privateRoot(t, p)
+			if existing {
+				if err := p.WriteEnvelope(root, "r.json", 1, sample{Name: "a"}, NoSyncOps()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fifo := filepath.Join(dir, "r.json")
+			prev := openat
+			t.Cleanup(func() { openat = prev })
+			openat = func(fd int, name string, flags int) (int, error) {
+				if name == "r.json" {
+					if err := os.Remove(fifo); err != nil && !errors.Is(err, os.ErrNotExist) {
+						return -1, err
+					}
+					if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+						return -1, err
+					}
+				}
+				return prev(fd, name, flags)
+			}
+			done := make(chan error, 1)
+			go func() {
+				f, err := p.Open(root, "r.json", os.O_RDONLY)
+				if f != nil {
+					_ = f.Close()
+				}
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if !errors.Is(err, ErrUnsafeFileType) || !strings.Contains(err.Error(), "is not a regular file") {
+					t.Fatalf("Open of a FIFO = %v; want the file type refusal", err)
+				}
+			case <-time.After(time.Second):
+				// Open the FIFO for writing so the stuck reader returns and the
+				// test can end.
+				if w, err := os.OpenFile(fifo, os.O_WRONLY, 0); err == nil { // #nosec G304 -- the test's own FIFO
+					_ = w.Close()
+				}
+				t.Fatalf("Open of a FIFO swapped in before the open blocked for a writer, then returned %v", <-done)
+			}
+		})
+	}
+}
+
+// TestOpenRefusesASymlinkPlantedAtAnAbsentName plants a symlink to a valid
+// private file at a name the lstat found absent. Only O_NOFOLLOW stops the
+// open from following it, because no earlier lstat result can be compared.
+func TestOpenRefusesASymlinkPlantedAtAnAbsentName(t *testing.T) {
+	p := plainPolicy(1 << 10)
+	root, dir := privateRoot(t, p)
+	elsewhere, _ := privateRoot(t, p)
+	if err := p.WriteEnvelope(elsewhere, "target.json", 1, sample{Name: "planted"}, NoSyncOps()); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(elsewhere.Name(), "target.json")
+	prev := openat
+	t.Cleanup(func() { openat = prev })
+	openat = func(fd int, name string, flags int) (int, error) {
+		if name == "r.json" {
+			if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
+				return -1, err
+			}
+		}
+		return prev(fd, name, flags)
+	}
+	f, err := p.Open(root, "r.json", os.O_RDONLY)
+	if err == nil {
+		_ = f.Close()
+		t.Fatal("Open followed a symlink planted after the lstat")
+	}
+	if !errors.Is(err, syscall.ELOOP) {
+		t.Fatalf("Open of a planted symlink = %v; want ELOOP from O_NOFOLLOW", err)
+	}
+}
+
+// TestOpenReturnsABlockingFile shows that the O_NONBLOCK the open adds is
+// gone from the file the caller gets.
+func TestOpenReturnsABlockingFile(t *testing.T) {
+	p := plainPolicy(1 << 10)
+	root, _ := privateRoot(t, p)
+	f, err := p.Open(root, "r.json", os.O_RDWR|os.O_CREATE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	raw, err := f.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var flags int
+	var flagErr error
+	if err := raw.Control(func(fd uintptr) { flags, flagErr = unix.FcntlInt(fd, unix.F_GETFL, 0) }); err != nil || flagErr != nil {
+		t.Fatalf("F_GETFL: %v, %v", err, flagErr)
+	}
+	if flags&unix.O_NONBLOCK != 0 {
+		t.Fatal("Open returned a file with O_NONBLOCK still set")
+	}
+}
+
+func TestFileModeOfMatchesLstat(t *testing.T) {
+	p := plainPolicy(1 << 10)
+	root, dir := privateRoot(t, p)
+	if err := p.WriteEnvelope(root, "file", 1, sample{}, NoSyncOps()); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(dir, "fifo"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("file", filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(dir, "sub"), 0o700|os.ModeSticky|os.ModeSetgid); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"file", "fifo", "link", "sub"} {
+		info, err := os.Lstat(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		st := info.Sys().(*syscall.Stat_t)
+		if got := fileModeOf(uint32(st.Mode)); got != info.Mode() {
+			t.Errorf("%s: fileModeOf = %v; os.Lstat says %v", name, got, info.Mode())
+		}
+	}
+	cases := map[uint32]os.FileMode{
+		syscall.S_IFSOCK | 0o600:                  os.ModeSocket | 0o600,
+		syscall.S_IFCHR | 0o600:                   os.ModeDevice | os.ModeCharDevice | 0o600,
+		syscall.S_IFBLK | 0o600:                   os.ModeDevice | 0o600,
+		syscall.S_IFREG | syscall.S_ISUID | 0o700: os.ModeSetuid | 0o700,
+		0o600: os.ModeIrregular | 0o600,
+	}
+	for raw, want := range cases {
+		if got := fileModeOf(raw); got != want {
+			t.Errorf("fileModeOf(%#o) = %v; want %v", raw, got, want)
+		}
 	}
 }
 

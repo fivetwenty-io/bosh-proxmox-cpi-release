@@ -44,18 +44,24 @@ func (e *UnsafePathError) Unwrap() error { return e.Cause }
 // one expected, or that grants any group or other access, in that order of
 // precedence. path is only reported; every check reads info.
 func (p Policy) PrivateInfo(path string, info os.FileInfo, directory bool) error {
+	st, _ := info.Sys().(*syscall.Stat_t)
+	return p.privateStat(path, st, info.Mode(), directory)
+}
+
+// privateStat is PrivateInfo on a stat result and its file mode. st is nil
+// when the platform reported no ownership metadata.
+func (p Policy) privateStat(path string, st *syscall.Stat_t, mode os.FileMode, directory bool) error {
 	euid := os.Geteuid()
-	st, ok := info.Sys().(*syscall.Stat_t)
-	unsafe := &UnsafePathError{Path: path, UID: -1, EUID: euid, Mode: info.Mode(), WantDirectory: directory}
-	if ok {
+	unsafe := &UnsafePathError{Path: path, UID: -1, EUID: euid, Mode: mode, WantDirectory: directory}
+	if st != nil {
 		unsafe.UID = int(st.Uid)
 	}
 	switch {
-	case !ok || int64(st.Uid) != int64(euid):
+	case st == nil || int64(st.Uid) != int64(euid):
 		unsafe.Cause = p.ownership()
-	case info.IsDir() != directory || !directory && !info.Mode().IsRegular():
+	case mode.IsDir() != directory || !directory && !mode.IsRegular():
 		unsafe.Cause = p.fileType()
-	case info.Mode().Perm()&0o077 != 0:
+	case mode.Perm()&0o077 != 0:
 		unsafe.Cause = p.mode()
 	}
 	if unsafe.Cause != nil {
@@ -70,12 +76,46 @@ func (p Policy) PrivateInfo(path string, info os.FileInfo, directory bool) error
 	// recognised. An inode nothing links to cannot be reached by name by any
 	// new opener, so accepting it gives an attacker nothing, while nlink >= 2
 	// stays refused and that is what the message has always claimed to catch.
-	// Reading a doomed inode is handled where it belongs, by the SameFile
-	// check in OpenWith and the retry in the envelope read.
+	// Reading a doomed inode is handled where it belongs, by the inode
+	// comparison in OpenWith and the retry in the envelope read.
 	if !directory && st.Nlink > 1 {
 		return fmt.Errorf("%s: multiply linked file rejected", p.label())
 	}
 	return nil
+}
+
+// fileModeOf converts a raw st_mode to the os.FileMode that os.Lstat reports
+// for it, so a descriptor checked before it becomes an *os.File is judged and
+// reported exactly as a named file is.
+func fileModeOf(raw uint32) os.FileMode {
+	mode := os.FileMode(raw & 0o777)
+	switch raw & syscall.S_IFMT {
+	case syscall.S_IFREG:
+	case syscall.S_IFDIR:
+		mode |= os.ModeDir
+	case syscall.S_IFLNK:
+		mode |= os.ModeSymlink
+	case syscall.S_IFIFO:
+		mode |= os.ModeNamedPipe
+	case syscall.S_IFSOCK:
+		mode |= os.ModeSocket
+	case syscall.S_IFCHR:
+		mode |= os.ModeDevice | os.ModeCharDevice
+	case syscall.S_IFBLK:
+		mode |= os.ModeDevice
+	default:
+		mode |= os.ModeIrregular
+	}
+	if raw&syscall.S_ISUID != 0 {
+		mode |= os.ModeSetuid
+	}
+	if raw&syscall.S_ISGID != 0 {
+		mode |= os.ModeSetgid
+	}
+	if raw&syscall.S_ISVTX != 0 {
+		mode |= os.ModeSticky
+	}
+	return mode
 }
 
 // OpenRoot opens the absolute directory path as a root after PrivateInfo
@@ -125,6 +165,12 @@ var openat = func(fd int, name string, flags int) (int, error) { return unix.Ope
 
 // OpenWith is Open with the openat call supplied by the caller, so a test can
 // observe or replace it.
+//
+// The open adds O_NONBLOCK. Opening a FIFO for reading otherwise blocks until
+// a writer appears, and the file type check only runs once the open returns,
+// so a FIFO swapped in after the lstat could stall the caller for good. The
+// descriptor is checked first and becomes an *os.File only after the checks
+// pass and O_NONBLOCK is cleared, so the caller always gets a blocking file.
 func (p Policy) OpenWith(r *os.Root, name string, flags int, open func(int, string, int) (int, error)) (*os.File, error) {
 	if name == "" || filepath.Base(name) != name || name == "." || name == ".." {
 		return nil, fmt.Errorf("%s: private file name must be a basename", p.label())
@@ -142,27 +188,56 @@ func (p Policy) OpenWith(r *os.Root, name string, flags int, open func(int, stri
 		return nil, err
 	}
 	// Defer truncation until after the opened inode is validated.
-	fd, openErr := open(int(dir.Fd()), name, (flags&^os.O_TRUNC)|unix.O_NOFOLLOW|unix.O_CLOEXEC)
+	fd, openErr := open(int(dir.Fd()), name, (flags&^os.O_TRUNC)|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK)
 	closeErr := dir.Close()
 	if openErr != nil {
 		return nil, errors.Join(openErr, closeErr)
 	}
-	f := os.NewFile(uintptr(fd), name)
 	if closeErr != nil {
-		return nil, errors.Join(closeErr, f.Close())
+		return nil, errors.Join(closeErr, unix.Close(fd))
 	}
-	info, err := f.Stat()
-	if err == nil {
-		err = p.PrivateInfo(filepath.Join(r.Name(), name), info, false)
+	if err := p.checkOpened(filepath.Join(r.Name(), name), fd, prior); err != nil {
+		return nil, errors.Join(err, unix.Close(fd))
 	}
-	if err == nil && prior != nil && !os.SameFile(prior, info) {
-		err = fmt.Errorf("%w: private file changed during open", p.changed())
-	}
-	if err == nil && flags&os.O_TRUNC != 0 {
-		err = f.Truncate(0)
-	}
-	if err != nil {
-		return nil, errors.Join(err, f.Close())
+	f := os.NewFile(uintptr(fd), name)
+	if flags&os.O_TRUNC != 0 {
+		if err := f.Truncate(0); err != nil {
+			return nil, errors.Join(err, f.Close())
+		}
 	}
 	return f, nil
+}
+
+// checkOpened runs the private checks on the descriptor OpenWith opened,
+// confirms that it is the inode prior described when the name existed at the
+// lstat, and then clears O_NONBLOCK.
+func (p Policy) checkOpened(path string, fd int, prior os.FileInfo) error {
+	var st syscall.Stat_t
+	if err := ignoringEINTR(func() error { return syscall.Fstat(fd, &st) }); err != nil {
+		return &os.PathError{Op: "fstat", Path: path, Err: err}
+	}
+	if err := p.privateStat(path, &st, fileModeOf(uint32(st.Mode)), false); err != nil {
+		return err
+	}
+	if prior != nil && !sameInode(prior, &st) {
+		return fmt.Errorf("%w: private file changed during open", p.changed())
+	}
+	return unix.SetNonblock(fd, false)
+}
+
+// sameInode reports whether info and st describe one inode, which is the
+// comparison os.SameFile makes.
+func sameInode(info os.FileInfo, st *syscall.Stat_t) bool {
+	named, ok := info.Sys().(*syscall.Stat_t)
+	return ok && named.Dev == st.Dev && named.Ino == st.Ino
+}
+
+// ignoringEINTR repeats call while it fails with EINTR, as the os package
+// does around its own fstat.
+func ignoringEINTR(call func() error) error {
+	for {
+		if err := call(); !errors.Is(err, syscall.EINTR) {
+			return err
+		}
+	}
 }
