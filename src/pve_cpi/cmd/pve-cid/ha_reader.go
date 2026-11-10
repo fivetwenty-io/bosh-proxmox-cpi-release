@@ -91,6 +91,10 @@ type pveHAReader struct {
 	cfg      *config.CPIConfig
 	logger   *log.Logger
 	replicas replicaReader
+
+	// resolveProfile resolves the profile from the doctor's inputs. Nil means
+	// ha.Resolve. A test sets it to see the inputs Profile builds.
+	resolveProfile func(ctx context.Context, deps ha.Deps) (*ha.Profile, error)
 }
 
 // newPVEHAReader constructs a production HAReader backed by client.
@@ -109,7 +113,11 @@ func (r *pveHAReader) Profile(ctx context.Context) (*ha.Profile, error) {
 	if err := r.ready(); err != nil {
 		return nil, err
 	}
-	return ha.Resolve(ctx, doctorHADeps(r.client, r.cfg, r.logger))
+	resolve := r.resolveProfile
+	if resolve == nil {
+		resolve = ha.Resolve
+	}
+	return resolve(ctx, doctorHADeps(r.client, r.cfg, r.logger))
 }
 
 // doctorHADeps builds the inputs of the doctor's profile. The doctor reports

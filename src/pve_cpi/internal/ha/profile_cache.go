@@ -29,8 +29,9 @@ const (
 	// profileCacheVersion is the profile cache file's envelope schema version.
 	// The stored facts have explicit JSON tags on SlowFacts and the types it
 	// holds, and a golden test pins the field set, so any change to those tags
-	// or fields bumps this version.
-	profileCacheVersion = 1
+	// or fields bumps this version. Version 2 added the cluster's name to the
+	// payload.
+	profileCacheVersion = 2
 )
 
 // ProfileCacheOptions says where the profile cache lives and whose facts it
@@ -66,6 +67,13 @@ type ProfileCacheOptions struct {
 // profilePayload is the cache file's payload. Key is required by the store.
 type profilePayload struct {
 	Key endpointcache.Key `json:"key"`
+
+	// Cluster is the name GET /cluster/status gave the cluster whose facts
+	// these are. Two clusters can share endpoints, a credential, and node
+	// names, such as one cluster rebuilt under the same host names, so the key
+	// alone does not tell them apart. A read whose current cluster name
+	// differs is a miss.
+	Cluster string `json:"cluster"`
 
 	// StoredAtMillis is when the probe that produced Facts began, in
 	// milliseconds since the Unix epoch.
@@ -186,35 +194,41 @@ func (c *ProfileCache) ttl() time.Duration {
 }
 
 // Slow implements SlowSource. It returns the stored facts when they are fresh
-// and match the nodes asked about, marked Cached, and otherwise the live
-// source's facts, which it then stores when they are fully clean.
-func (c *ProfileCache) Slow(ctx context.Context, nodes []NodeRef) (*SlowFacts, error) {
+// and match the cluster name and the nodes asked about, marked Cached, and
+// otherwise the live source's facts, which it then stores when they are fully
+// clean. A call that cannot name the cluster has no way to tell whose facts a
+// file holds, so it neither reads nor writes the file.
+func (c *ProfileCache) Slow(ctx context.Context, cluster string, nodes []NodeRef) (*SlowFacts, error) {
 	if c == nil || c.live == nil {
-		return nil, errors.New("ha profile cache: no live source")
+		return nil, errors.New("HA profile cache: no live source")
 	}
 	logger := c.opts.Log
 	if logger == nil {
 		logger = log.FromContext(ctx)
 	}
+	if cluster == "" {
+		logger.Debug("HA profile cache: the cluster has no name to tell its facts apart by; probing")
+		return c.live.Slow(ctx, cluster, nodes)
+	}
 	store := c.openStore(ctx, logger)
 	if store == nil {
-		return c.live.Slow(ctx, nodes)
+		return c.live.Slow(ctx, cluster, nodes)
 	}
 	defer func() {
 		if err := store.Close(); err != nil {
-			logger.Debug("ha profile cache: close the cache directory", log.Err(err))
+			logger.Debug("HA profile cache: close the cache directory", log.Err(err))
 		}
 	}()
 
-	if facts, ok := c.read(store, nodes, logger); ok {
+	if facts, ok := c.read(store, cluster, nodes, logger); ok {
 		return facts, nil
 	}
 	started := c.now()
-	facts, err := c.live.Slow(ctx, nodes)
+	facts, err := c.live.Slow(ctx, cluster, nodes)
 	if err != nil || facts == nil {
 		return facts, err
 	}
-	c.write(ctx, store, facts, nodes, started, logger)
+	c.write(ctx, store, facts, cluster, nodes, started, logger)
 	return facts, nil
 }
 
@@ -223,7 +237,7 @@ func (c *ProfileCache) Slow(ctx context.Context, nodes []NodeRef) (*SlowFacts, e
 func (c *ProfileCache) openStore(ctx context.Context, logger *log.Logger) *endpointcache.Store {
 	choice := c.opts.Dir.Named(endpointcache.HAProfileName).Resolve()
 	if !choice.Usable() {
-		logger.Debug("ha profile cache: no usable cache directory; probing",
+		logger.Debug("HA profile cache: no usable cache directory; probing",
 			log.String("layer", string(choice.Layer)), log.String("path", choice.Path), log.Err(choice.Err))
 		return nil
 	}
@@ -235,32 +249,34 @@ func (c *ProfileCache) openStore(ctx context.Context, logger *log.Logger) *endpo
 		DisplayName: endpointcache.HAProfileName,
 	})
 	if err != nil {
-		logger.Debug("ha profile cache: cannot open the cache; probing",
+		logger.Debug("HA profile cache: cannot open the cache; probing",
 			log.String("path", choice.Path), log.Err(err))
 		return nil
 	}
 	if path, replaced := store.SecretReplaced(); replaced {
 		// OpenStore reports a replacement only to the call that made it, so this
 		// line appears once per replacement.
-		logger.Warn("ha profile cache: replaced the cache directory secret, which had the wrong length; "+
+		logger.Warn("HA profile cache: replaced the cache directory secret, which had the wrong length; "+
 			"every cache file written under the old one is rebuilt", log.String("path", path))
 	}
 	return store
 }
 
-// read returns the stored facts when the file holds a fresh, clean copy that
-// matches nodes.
-func (c *ProfileCache) read(store *endpointcache.Store, nodes []NodeRef, logger *log.Logger) (*SlowFacts, bool) {
+// read returns the stored facts when the file holds a fresh, clean copy for the
+// cluster called cluster that matches nodes.
+func (c *ProfileCache) read(
+	store *endpointcache.Store, cluster string, nodes []NodeRef, logger *log.Logger,
+) (*SlowFacts, bool) {
 	var stored profilePayload
 	if err := store.Read(&stored); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
-			logger.Debug("ha profile cache: stored file not usable; probing",
+			logger.Debug("HA profile cache: stored file not usable; probing",
 				log.String("file", store.FileName()), log.Err(err))
 		}
 		return nil, false
 	}
-	if reason := c.staleReason(&stored, nodes); reason != "" {
-		logger.Debug("ha profile cache: stored facts not used; probing",
+	if reason := c.staleReason(&stored, cluster, nodes); reason != "" {
+		logger.Debug("HA profile cache: stored facts not used; probing",
 			log.String("file", store.FileName()), log.String("reason", reason))
 		return nil, false
 	}
@@ -269,9 +285,12 @@ func (c *ProfileCache) read(store *endpointcache.Store, nodes []NodeRef, logger 
 	return &facts, true
 }
 
-// staleReason says why stored cannot answer for nodes, or returns "" when it
-// can.
-func (c *ProfileCache) staleReason(stored *profilePayload, nodes []NodeRef) string {
+// staleReason says why stored cannot answer for the cluster called cluster and
+// its nodes, or returns "" when it can.
+func (c *ProfileCache) staleReason(stored *profilePayload, cluster string, nodes []NodeRef) string {
+	if stored.Cluster != cluster {
+		return fmt.Sprintf("the stored facts belong to cluster %q, not %q", stored.Cluster, cluster)
+	}
 	age := c.now().Sub(time.UnixMilli(stored.StoredAtMillis))
 	switch {
 	case age < 0:
@@ -291,34 +310,38 @@ func (c *ProfileCache) staleReason(stored *profilePayload, nodes []NodeRef) stri
 // write stores facts when they are fully clean. A newer file that another
 // process wrote while this one probed is left alone.
 func (c *ProfileCache) write(
-	ctx context.Context, store *endpointcache.Store, facts *SlowFacts, nodes []NodeRef, started time.Time,
-	logger *log.Logger,
+	ctx context.Context, store *endpointcache.Store, facts *SlowFacts, cluster string, nodes []NodeRef,
+	started time.Time, logger *log.Logger,
 ) {
 	if reason := uncleanReason(facts); reason != "" {
-		logger.Debug("ha profile cache: facts not stored", log.String("reason", reason))
+		logger.Debug("HA profile cache: facts not stored", log.String("reason", reason))
 		return
 	}
 	if reason := nodeMismatch(facts, nodes); reason != "" {
-		logger.Debug("ha profile cache: facts not stored", log.String("reason", reason))
+		logger.Debug("HA profile cache: facts not stored", log.String("reason", reason))
 		return
 	}
-	next := &profilePayload{Key: store.Key(), StoredAtMillis: started.UnixMilli(), Facts: storable(facts)}
+	next := &profilePayload{Key: store.Key(), Cluster: cluster, StoredAtMillis: started.UnixMilli(), Facts: storable(facts)}
 	_, err := endpointcache.Update(ctx, store, func(current *profilePayload) (*profilePayload, error) {
 		// The writer holds the key's lock here, and sweeps the directory at the
 		// cadence the endpoint cache does, so profile files that a credential
 		// rotation or an endpoint list change orphaned, and temporary files that
-		// a crash left, do not stay forever.
+		// a crash left, do not stay forever. The sweep rides on a clean write, so
+		// a cluster that never produces clean facts, such as one on PVE 8, or a
+		// deployment with HA off, which never probes, never sweeps. The sweep
+		// removes only this kind's files and the stale temporary files, so it
+		// leaves the endpoint cache's files alone even for the same key.
 		if swept := store.Sweep(c.now()); swept.Err != nil {
-			logger.Debug("ha profile cache: the sweep of the cache directory failed", log.Err(swept.Err))
+			logger.Debug("HA profile cache: the sweep of the cache directory failed", log.Err(swept.Err))
 		}
 		if current != nil && current.StoredAtMillis > next.StoredAtMillis &&
-			c.staleReason(current, nodes) == "" {
+			c.staleReason(current, cluster, nodes) == "" {
 			return nil, nil
 		}
 		return next, nil
 	})
 	if err != nil {
-		logger.Debug("ha profile cache: cannot store the facts", log.String("file", store.FileName()), log.Err(err))
+		logger.Debug("HA profile cache: cannot store the facts", log.String("file", store.FileName()), log.Err(err))
 	}
 }
 

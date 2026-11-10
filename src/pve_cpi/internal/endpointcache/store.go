@@ -126,12 +126,15 @@ type Store struct {
 // Version select another kind of file in the same directory, such as the HA
 // profile cache, and an invalid choice is refused with ErrInvalidFileKind.
 func OpenStore(ctx context.Context, root *os.Root, cfg KeyConfig, credential string, opts StoreOptions) (*Store, error) {
-	if root == nil {
-		return nil, fmt.Errorf("%s: no cache directory", textsFor(opts.DisplayName).name)
-	}
 	kind, err := kindFor(opts)
 	if err != nil {
-		return nil, errors.Join(err, root.Close())
+		if root != nil {
+			err = errors.Join(err, root.Close())
+		}
+		return nil, err
+	}
+	if root == nil {
+		return nil, fmt.Errorf("%s: no cache directory", kind.name)
 	}
 	return openStoreOfKind(ctx, root, cfg, credential, opts, kind)
 }
@@ -231,15 +234,19 @@ func (s *Store) texts() *texts {
 	return s.text
 }
 
-// Sweep removes what the cache left behind in the store's directory, exactly
-// as the package's Sweep does, and leaves the store's own file and lock alone.
-// A writer calls it from the merge function it hands to Update, where it holds
-// that lock, which is the cadence the endpoint cache's UpdatePayload sweeps at.
+// Sweep removes what the cache left behind in the store's directory, as the
+// package's Sweep does, and leaves the store's own file and lock alone. A store
+// of another kind than the endpoint cache's removes only the files that carry
+// its own prefix, and the stale temporary files, so it never removes an
+// endpoint file or an endpoint lock, even for its own key. A writer calls it
+// from the merge function it hands to Update, where it holds that lock, which
+// is the cadence the endpoint cache's UpdatePayload sweeps at.
 func (s *Store) Sweep(now time.Time) SweepResult {
 	if s == nil || s.root == nil {
 		return SweepResult{Err: fmt.Errorf("%s: store is closed", s.label())}
 	}
-	return s.texts().sweepWith(s.root, now, []string{s.kind.lockName(s.key), s.name}, ownedByEffectiveUser)
+	keep := []string{s.kind.lockName(s.key), s.kind.discoverLockName(s.key), s.name}
+	return s.texts().sweepWith(s.root, now, keep, ownedByEffectiveUser, s.kind.prefix)
 }
 
 // Key returns the store's key, which every payload it reads or writes must

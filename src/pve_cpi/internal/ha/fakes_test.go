@@ -41,6 +41,7 @@ type world struct {
 	noClusterRow bool // standalone shape
 	notQuorate   bool
 	entry        string // defaults to the first node
+	clusterName  string // the cluster row's name, "lab" when empty
 
 	managerBody json.RawMessage // overrides the default manager status
 	managerErr  error
@@ -153,7 +154,11 @@ func (c *fakeCluster) ListStatus(_ context.Context) (*sdkcluster.ListStatusRespo
 		if w.notQuorate {
 			q = 0
 		}
-		rows = append(rows, mustJSON(map[string]any{"type": "cluster", "name": "lab", "nodes": len(w.nodes), "quorate": q}))
+		name := w.clusterName
+		if name == "" {
+			name = "lab"
+		}
+		rows = append(rows, mustJSON(map[string]any{"type": "cluster", "name": name, "nodes": len(w.nodes), "quorate": q}))
 	}
 	for _, n := range w.nodes {
 		online := 0

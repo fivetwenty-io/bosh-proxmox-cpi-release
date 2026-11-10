@@ -1062,12 +1062,13 @@ func TestNoFragileWarningInModeOff(t *testing.T) {
 // A cache wraps SlowSource and returns Cached facts. Resolve must read the
 // QDevice's connection status again, because the cache never holds it.
 type cachedSlow struct {
-	facts *ha.SlowFacts
-	seen  []ha.NodeRef
+	facts   *ha.SlowFacts
+	seen    []ha.NodeRef
+	cluster string
 }
 
-func (c *cachedSlow) Slow(_ context.Context, nodes []ha.NodeRef) (*ha.SlowFacts, error) {
-	c.seen = nodes
+func (c *cachedSlow) Slow(_ context.Context, cluster string, nodes []ha.NodeRef) (*ha.SlowFacts, error) {
+	c.seen, c.cluster = nodes, cluster
 	cp := *c.facts
 	cp.Cached = true
 	return &cp, nil
@@ -1113,6 +1114,9 @@ func TestCachedSlowFactsGetAFreshQDeviceStatus(t *testing.T) {
 	if len(src.seen) != 2 || src.seen[0].Name != "pve1" || !src.seen[0].Online {
 		t.Fatalf("the source must be told the members: %+v", src.seen)
 	}
+	if src.cluster != "lab" {
+		t.Fatalf("the source must be told the cluster's name from cluster status, got %q", src.cluster)
+	}
 	if p.Effective != ha.EffectiveFull {
 		t.Fatalf("effective=%s gaps=%v", p.Effective, p.Gaps)
 	}
@@ -1156,7 +1160,9 @@ func TestCachedFactsWithoutQDeviceDoNotReadItAgain(t *testing.T) {
 
 type failingSlow struct{ err error }
 
-func (f failingSlow) Slow(context.Context, []ha.NodeRef) (*ha.SlowFacts, error) { return nil, f.err }
+func (f failingSlow) Slow(context.Context, string, []ha.NodeRef) (*ha.SlowFacts, error) {
+	return nil, f.err
+}
 
 func TestSlowSourceFailureFailsClosed(t *testing.T) {
 	for name, src := range map[string]ha.SlowSource{

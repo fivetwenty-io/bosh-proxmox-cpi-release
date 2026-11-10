@@ -662,7 +662,9 @@ Each finding is either a problem or advice. The command exits with 0 when the re
   `headroom_short` and `headroom_unavailable`.
 
 - Leftovers and gaps
-  `birth_tag_stale`, `readd_tag`, `off_mode_resource`, `off_mode_rule`, `guests_not_enumerated`, and `unchecked`.
+  `birth_tag_stale`, `readd_tag`, `off_mode_resource`, `off_mode_rule`, `guests_not_enumerated`, `cache_directory`, and `unchecked`.
+
+  The `cache_directory` advice says that `pve.endpoint_cache_dir` does not exist, is not a directory, is a symbolic link, or has a mode that grants group or other access. The CPI refuses a directory that is not a directory, is a symbolic link, or has such a mode, and then keeps no recovery record, so the dead-node handover cannot start. A missing directory sends the record to the temporary directory, and creating it later moves the record and restarts a running grace window once.
 
 A `replicate` VM shows `replica_awaiting_sync` as advice while its job works but the pin has not yet widened. It shows `replica_not_recoverable` as a problem only when no usable job exists, the job is disabled, or the first sync is more than twice its schedule plus the clock-skew bound overdue. A schedule the doctor cannot measure, such as a weekday list, gets `replica_schedule_unjudged` and is never called stale or healthy.
 

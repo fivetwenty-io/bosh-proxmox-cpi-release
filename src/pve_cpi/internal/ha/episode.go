@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
@@ -20,6 +21,10 @@ import (
 const (
 	// EpisodeFileName is the name of the record in the cache directory.
 	EpisodeFileName = "ha-recovery-episodes.json"
+
+	// EpisodeName is what the record's directory refusals call it, so an
+	// operator reading one does not look at the endpoint cache's settings.
+	EpisodeName = "HA episode record"
 
 	// episodeRecordVersion is the version of the record's envelope.
 	episodeRecordVersion = 1
@@ -62,8 +67,9 @@ var episodePolicy = privatefile.Policy{
 // A pve.endpoint_cache_dir that does not exist is the one refusal that does
 // not end the search. A record that could never be written would keep the
 // clock at zero on every call and so remove the handover rather than delay it,
-// so the store falls back to the layers after the override, logs one Warn line
-// per call that names the missing directory, and records the episode there. An
+// so the store falls back to the layers after the override, logs a Warn line
+// that names the missing directory, and records the episode there. ForCall
+// makes that one line per call however many times the call observes. An
 // override that exists but fails the private checks still gives no record.
 type EpisodeStore struct {
 	// Dir says where to look for the cache directory, and comes from
@@ -77,6 +83,24 @@ type EpisodeStore struct {
 
 	// Now is the clock. Nil means time.Now.
 	Now func() time.Time
+
+	// warnOnce, when it is set, lets the missing-directory Warn through once.
+	// ForCall sets it.
+	warnOnce *sync.Once
+}
+
+// ForCall returns a copy of the store that logs the missing-directory Warn at
+// most once however many observations it serves. One CPI call can observe an
+// episode twice, such as the delete gate and the dead-node completion that
+// follows it, and the operator reads one line about the directory. The copy
+// shares nothing else with the store, and a call builds its own.
+func (s *EpisodeStore) ForCall() *EpisodeStore {
+	if s == nil {
+		return &EpisodeStore{warnOnce: new(sync.Once)}
+	}
+	call := *s
+	call.warnOnce = new(sync.Once)
+	return &call
 }
 
 // Episode is what the store answers for one observation.
@@ -116,24 +140,54 @@ func (s *EpisodeStore) dir() endpointcache.DirOptions {
 	if s == nil {
 		return endpointcache.DirOptions{}
 	}
-	return s.Dir
+	return s.Dir.Named(EpisodeName)
 }
 
 // resolve chooses the directory of the record. A missing override directory,
 // and nothing else that refuses it, falls back to the layers after the
-// override with a Warn line.
+// override with a Warn line, which says whether the fallback gave a directory.
 func (s *EpisodeStore) resolve() endpointcache.Choice {
 	dir := s.dir()
 	choice := dir.Resolve()
 	if choice.Usable() || choice.Layer != endpointcache.LayerOverride || !errors.Is(choice.Err, fs.ErrNotExist) {
 		return choice
 	}
-	if s != nil && s.Log != nil {
-		s.Log.Warn("ha episode: pve.endpoint_cache_dir does not exist, so the recovery episode record uses the "+
-			"temporary cache directory instead; create the directory so the record sits beside the other cache files",
-			log.String("path", choice.Path), log.Err(choice.Err))
+	fallback := dir.WithoutOverride().Resolve()
+	s.warnMissingOverride(choice, fallback)
+	return fallback
+}
+
+// warnMissingOverride logs the Warn line for a missing override directory. The
+// line promises the fallback only when the fallback gave a directory.
+func (s *EpisodeStore) warnMissingOverride(missing, fallback endpointcache.Choice) {
+	if s == nil || s.Log == nil {
+		return
 	}
-	return dir.WithoutOverride().Resolve()
+	warn := func() {
+		if fallback.Usable() {
+			s.Log.Warn("ha episode: pve.endpoint_cache_dir does not exist, so the recovery episode record uses the "+
+				"temporary cache directory instead; create the directory so the record sits beside the other cache files",
+				log.String("path", missing.Path), log.Err(missing.Err), log.String("fallback", fallback.Path))
+			return
+		}
+		s.Log.Warn("ha episode: pve.endpoint_cache_dir does not exist, and the temporary cache directory cannot be "+
+			"used either, so the recovery episode has no record; create the directory",
+			log.String("path", missing.Path), log.Err(missing.Err), log.String("fallback", fallback.Path),
+			log.String("fallback_error", fallbackError(fallback)))
+	}
+	if s.warnOnce != nil {
+		s.warnOnce.Do(warn)
+		return
+	}
+	warn()
+}
+
+// fallbackError is the text of the refusal that ended the fallback.
+func fallbackError(fallback endpointcache.Choice) string {
+	if fallback.Err == nil {
+		return ""
+	}
+	return fallback.Err.Error()
 }
 
 func (s *EpisodeStore) now() time.Time {

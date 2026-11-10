@@ -369,6 +369,10 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 func deleteLegacyVMClaimed(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCID) (any, error) {
 	vmid := cid.VMID
 	logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))
+	// The HA gate and the dead-node completion that follows it can both observe
+	// the recovery episode, so they share one store that warns about a missing
+	// cache directory once for the call.
+	deps.HAEpisodes = haEpisodes(deps, logger).ForCall()
 
 	// --- locate VM authoritatively ---
 	// The cluster scan's hit is authoritative (correct even after an HA

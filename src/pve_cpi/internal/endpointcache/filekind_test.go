@@ -42,6 +42,10 @@ func TestKindForNamesTheFileAndDefaultsTheVersionToOne(t *testing.T) {
 	if kind.version != 1 {
 		t.Errorf("an unset version gave %d, want the literal 1", kind.version)
 	}
+	// This pins the constant to the literal a stored file's envelope carries.
+	// It cannot tell a default that follows fileVersion from one that does not,
+	// because fileVersion is also 1 today, so a default that wrongly followed
+	// it would pass until the endpoint cache's schema version changes.
 	if defaultKindVersion != 1 {
 		t.Errorf("defaultKindVersion = %d, want 1", defaultKindVersion)
 	}
@@ -434,5 +438,82 @@ func TestStoreSweepRemovesOrphansAndKeepsItsOwnFileAndLock(t *testing.T) {
 	}
 	if result := s.Sweep(sweepNow); result.Err == nil || !strings.Contains(result.Err.Error(), "HA profile cache") {
 		t.Errorf("Sweep on a closed store: %v, want an error that names the HA profile cache", result.Err)
+	}
+}
+
+func TestStoreSweepOfAnotherKindNeverRemovesTheEndpointCachesFiles(t *testing.T) {
+	// Both stores hold the same key, so the endpoint cache's file, lock, and
+	// discover lock carry the same host and digest as the profile store's, and
+	// differ from them only by the missing prefix.
+	dir := newStoreDir(t)
+	profile := openTestStore(t, dir, storeTestCredential, haProfileOptions())
+	endpoint := openTestStore(t, dir, storeTestCredential, StoreOptions{})
+	if profile.FileName() == endpoint.FileName() || profile.Key().FileName() != endpoint.Key().FileName() {
+		t.Fatalf("the stores must share a key and differ in prefix: %s and %s", profile.FileName(), endpoint.FileName())
+	}
+	storePut(t, profile, "profile")
+	storePut(t, endpoint, "endpoint")
+	endpointDiscover := endpoint.kind.discoverLockName(endpoint.Key())
+	sweepFile(t, dir, endpointDiscover, time.Hour)
+
+	ancient := 90 * 24 * time.Hour
+	age := func(name string) {
+		t.Helper()
+		when := sweepNow.Add(-ancient)
+		if err := os.Chtimes(filepath.Join(dir, name), when, when); err != nil {
+			t.Fatal(err)
+		}
+	}
+	endpointNames := []string{endpoint.FileName(), endpoint.kind.lockName(endpoint.Key()), endpointDiscover}
+	for _, name := range append(slices.Clone(endpointNames), profile.FileName(), profile.kind.lockName(profile.Key())) {
+		age(name)
+	}
+	const profileOrphan = "ha-profile-" + sweepBase + ".json"
+	const profileOrphanLock = "ha-profile-" + sweepBase + ".lock"
+	const endpointOrphan = sweepBase + ".json"
+	for _, name := range []string{profileOrphan, profileOrphanLock, endpointOrphan} {
+		sweepFile(t, dir, name, ancient)
+	}
+	sweepFile(t, dir, sweepTemp, 2*time.Hour)
+
+	result := profile.Sweep(sweepNow)
+	if result.Err != nil {
+		t.Fatalf("Sweep: %v", result.Err)
+	}
+	if !sameNames(result.Removed, []string{profileOrphan, profileOrphanLock, sweepTemp}) {
+		t.Errorf("removed %v, want only the profile orphans and the old temporary file", result.Removed)
+	}
+	got := storeDirNames(t, dir)
+	for _, name := range append(slices.Clone(endpointNames), endpointOrphan, profile.FileName(), profile.kind.lockName(profile.Key())) {
+		if !slices.Contains(got, name) {
+			t.Errorf("the sweep of the profile cache removed %s, which is not a profile file; directory holds %v", name, got)
+		}
+	}
+}
+
+func TestTheNamesCallersPassAreValidDisplayNames(t *testing.T) {
+	// A name that fails validDisplayName reads as the endpoint cache's in a
+	// directory choice and is refused by OpenStore, so a typo in the constant
+	// would change the messages and the store's opening without a compile error.
+	if !validDisplayName(HAProfileName) {
+		t.Errorf("HAProfileName %q is not a valid display name", HAProfileName)
+	}
+	if textsFor(HAProfileName).name != HAProfileName {
+		t.Errorf("textsFor(HAProfileName) names the store %q", textsFor(HAProfileName).name)
+	}
+	if _, err := kindFor(haProfileOptions()); err != nil {
+		t.Errorf("the profile cache's own options are refused: %v", err)
+	}
+}
+
+func TestOpenStoreRefusesAnInvalidKindBeforeItLooksAtTheDirectory(t *testing.T) {
+	opts := haProfileOptions()
+	opts.DisplayName = "bad\nname"
+	if _, err := OpenStore(context.Background(), nil, storeTestConfig(), storeTestCredential, opts); !errors.Is(err, ErrInvalidFileKind) {
+		t.Errorf("a nil directory with an invalid name gave %v, want ErrInvalidFileKind", err)
+	}
+	_, err := OpenStore(context.Background(), nil, storeTestConfig(), storeTestCredential, haProfileOptions())
+	if err == nil || err.Error() != "HA profile cache: no cache directory" {
+		t.Errorf("a nil directory with a valid name gave %v, want the profile cache's own message", err)
 	}
 }

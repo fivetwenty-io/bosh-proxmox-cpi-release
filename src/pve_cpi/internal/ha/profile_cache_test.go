@@ -23,6 +23,9 @@ import (
 
 const cacheToken = "cpi@pve!ha=11111111-2222-3333-4444-555555555555"
 
+// cacheCluster is the name the fake cluster gives itself in its status rows.
+const cacheCluster = "lab"
+
 // cacheClock is the profile cache's clock in these tests.
 type cacheClock struct{ t time.Time }
 
@@ -234,7 +237,10 @@ func otherUsersPrivateDirectory(t *testing.T) string {
 			return candidate
 		}
 	}
-	t.Skip("no mode 0700 directory owned by another user to refuse")
+	// The candidates are the home directories of root, which a user other than
+	// root cannot reach. A runner that works as root owns all of them, and so
+	// has nothing to refuse, and the owner refusal then goes unchecked on it.
+	t.Skip("this runner has no mode 0700 directory owned by another user, such as root's home when it runs as an ordinary user")
 	return ""
 }
 
@@ -552,25 +558,27 @@ func TestDepsFromClientWiresTheCacheOnlyForAnEntryThatCanKeyOne(t *testing.T) {
 // failingLive is a live source that fails.
 type failingLive struct{ err error }
 
-func (f failingLive) Slow(context.Context, []ha.NodeRef) (*ha.SlowFacts, error) { return nil, f.err }
+func (f failingLive) Slow(context.Context, string, []ha.NodeRef) (*ha.SlowFacts, error) {
+	return nil, f.err
+}
 
 func TestProfileCachePassesALiveFailureThrough(t *testing.T) {
 	cfg := cacheCfg(cacheDir(t))
 	opts, _ := ha.ProfileCacheOptionsFromConfig(cfg, nil)
 	cache := ha.NewProfileCache(failingLive{err: errors.New("boom")}, opts)
-	if _, err := cache.Slow(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "boom") {
+	if _, err := cache.Slow(context.Background(), cacheCluster, nil); err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Errorf("Slow error = %v, want the live source's", err)
 	}
-	if _, err := ha.NewProfileCache(nil, opts).Slow(context.Background(), nil); err == nil {
+	if _, err := ha.NewProfileCache(nil, opts).Slow(context.Background(), cacheCluster, nil); err == nil {
 		t.Error("a cache with no live source must fail closed")
 	}
 }
 
 // funcLive is a live source made from a function.
-type funcLive func(context.Context, []ha.NodeRef) (*ha.SlowFacts, error)
+type funcLive func(context.Context, string, []ha.NodeRef) (*ha.SlowFacts, error)
 
-func (f funcLive) Slow(ctx context.Context, nodes []ha.NodeRef) (*ha.SlowFacts, error) {
-	return f(ctx, nodes)
+func (f funcLive) Slow(ctx context.Context, cluster string, nodes []ha.NodeRef) (*ha.SlowFacts, error) {
+	return f(ctx, cluster, nodes)
 }
 
 // cleanFacts builds fully clean slow facts for nodes.
@@ -600,28 +608,28 @@ func TestProfileCacheKeepsANewerEntryAnotherProcessWroteWhileProbing(t *testing.
 	opts.Now = clock.Now
 
 	// The other process stores facts a few seconds after this one began.
-	other := ha.NewProfileCache(funcLive(func(_ context.Context, n []ha.NodeRef) (*ha.SlowFacts, error) {
+	other := ha.NewProfileCache(funcLive(func(_ context.Context, _ string, n []ha.NodeRef) (*ha.SlowFacts, error) {
 		return cleanFacts(n, "9.2.9"), nil
 	}), opts)
 
-	mine := ha.NewProfileCache(funcLive(func(ctx context.Context, n []ha.NodeRef) (*ha.SlowFacts, error) {
+	mine := ha.NewProfileCache(funcLive(func(ctx context.Context, _ string, n []ha.NodeRef) (*ha.SlowFacts, error) {
 		clock.advance(5 * time.Second)
-		if _, err := other.Slow(ctx, n); err != nil {
+		if _, err := other.Slow(ctx, cacheCluster, n); err != nil {
 			t.Error(err)
 		}
 		return cleanFacts(n, "9.2.1"), nil
 	}), opts)
-	got, err := mine.Slow(context.Background(), nodes)
+	got, err := mine.Slow(context.Background(), cacheCluster, nodes)
 	if err != nil || got.Nodes["pve1"].Version != "9.2.1" {
 		t.Fatalf("this call must return its own probe: %+v, %v", got, err)
 	}
 
 	clock.advance(time.Second)
-	reader := ha.NewProfileCache(funcLive(func(context.Context, []ha.NodeRef) (*ha.SlowFacts, error) {
+	reader := ha.NewProfileCache(funcLive(func(context.Context, string, []ha.NodeRef) (*ha.SlowFacts, error) {
 		t.Error("the stored entry must answer")
 		return nil, errors.New("probed")
 	}), opts)
-	cached, err := reader.Slow(context.Background(), nodes)
+	cached, err := reader.Slow(context.Background(), cacheCluster, nodes)
 	if err != nil || !cached.Cached || cached.Nodes["pve1"].Version != "9.2.9" {
 		t.Errorf("the newer entry must stay: %+v, %v", cached, err)
 	}
@@ -801,5 +809,34 @@ func TestProfileCacheSecretAndLockRefusalsNameTheHAProfileCache(t *testing.T) {
 	if want := "HA profile cache: refusing directory secret " + secret + ": HA profile cache: unsafe permissions"; !strings.HasPrefix(refusals[0], want) ||
 		strings.Contains(refusals[0], "endpoint cache") {
 		t.Errorf("refusal %q, want it to start %q and not name the endpoint cache", refusals[0], want)
+	}
+}
+
+func TestProfileCacheKeepsClustersWithTheSameEndpointsAndNodeNamesApart(t *testing.T) {
+	// Both clusters are reached through the same endpoint with the same token
+	// and name their nodes pve1, pve2, and pve3, so the cache key is the same.
+	// Only the name in cluster status tells them apart.
+	dir := cacheDir(t)
+	cfg := cacheCfg(dir)
+	clock := newCacheClock()
+	lab := three()
+	prod := three()
+	prod.clusterName = "prod"
+
+	resolveWith(t, cachedDeps(t, lab, cfg, clock))
+	if slowProbes(lab) != 1 {
+		t.Fatalf("the first cluster must probe once, got %d", slowProbes(lab))
+	}
+	resolveWith(t, cachedDeps(t, prod, cfg, clock))
+	if slowProbes(prod) != 1 {
+		t.Fatalf("a second cluster at the same endpoints must probe and not read the first one's file, got %d", slowProbes(prod))
+	}
+	// Each deps value builds its own fake cluster, whose probe count starts at zero.
+	resolveWith(t, cachedDeps(t, prod, cfg, clock))
+	if slowProbes(prod) != 0 {
+		t.Errorf("the second cluster's own file must answer its next call, got %d probes", slowProbes(prod))
+	}
+	if files := profileFiles(t, dir); len(files) != 1 {
+		t.Errorf("both clusters share one key and so one file, got %v", files)
 	}
 }

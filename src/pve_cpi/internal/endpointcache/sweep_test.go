@@ -211,12 +211,12 @@ func TestSweepLeavesFilesAnotherUserOwns(t *testing.T) {
 	sweepFile(t, dir, sweepKey, year)
 	sweepFile(t, dir, sweepTemp, year)
 	notOurs := func(fs.FileInfo) bool { return false }
-	result := endpointTexts.sweepWith(root, sweepNow, nil, notOurs)
+	result := endpointTexts.sweepWith(root, sweepNow, nil, notOurs, "")
 	if result.Err != nil || len(result.Removed) != 0 {
 		t.Errorf("a file another user owns was swept: %+v", result)
 	}
 	ours := func(fs.FileInfo) bool { return true }
-	result = endpointTexts.sweepWith(root, sweepNow, nil, ours)
+	result = endpointTexts.sweepWith(root, sweepNow, nil, ours, "")
 	if result.Err != nil || len(result.Removed) != 2 {
 		t.Errorf("owned files were kept: %+v", result)
 	}
@@ -312,5 +312,24 @@ func TestSweepNamesMatchTheKeyFileNames(t *testing.T) {
 	}
 	if _, ok := lockKeyFile("secret.lock"); ok {
 		t.Error("secret.lock has a key file")
+	}
+}
+
+func TestSweepWithAPrefixLeavesEveryOtherKindAlone(t *testing.T) {
+	dir, root := sweepDir(t)
+	const year = 365 * 24 * time.Hour
+	const prefixed = HAProfilePrefix + sweepBase + ".json"
+	sweepFile(t, dir, sweepKey, year)
+	sweepFile(t, dir, prefixed, year)
+	sweepFile(t, dir, sweepTemp, year)
+	ours := func(fs.FileInfo) bool { return true }
+
+	result := endpointTexts.sweepWith(root, sweepNow, nil, ours, HAProfilePrefix)
+	if result.Err != nil || !sameNames(result.Removed, []string{prefixed, sweepTemp}) {
+		t.Errorf("a sweep limited to %s removed %+v, want the prefixed file and the temporary file", HAProfilePrefix, result)
+	}
+	result = endpointTexts.sweepWith(root, sweepNow, nil, ours, "")
+	if result.Err != nil || !sameNames(result.Removed, []string{sweepKey}) {
+		t.Errorf("a sweep with no prefix removed %+v, want the file that was left", result)
 	}
 }

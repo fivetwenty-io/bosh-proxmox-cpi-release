@@ -288,7 +288,7 @@ func (p *Profile) probe(ctx context.Context, deps Deps) {
 	if source == nil {
 		source = liveSlow{deps: deps}
 	}
-	slow, serr := source.Slow(ctx, cs.Nodes)
+	slow, serr := source.Slow(ctx, cs.Name, cs.Nodes)
 	if serr != nil || slow == nil {
 		msg := "slow facts unavailable"
 		if serr != nil {

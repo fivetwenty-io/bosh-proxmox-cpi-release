@@ -162,8 +162,11 @@ type SlowFacts struct {
 }
 
 // SlowSource supplies the slow-changing facts for the given cluster members.
+// cluster is the name that GET /cluster/status gives the cluster, which a
+// cache uses to keep one cluster's facts from answering for another. A source
+// that probes live ignores it.
 type SlowSource interface {
-	Slow(ctx context.Context, nodes []NodeRef) (*SlowFacts, error)
+	Slow(ctx context.Context, cluster string, nodes []NodeRef) (*SlowFacts, error)
 }
 
 // liveSlow probes the slow-changing facts on every call.
@@ -174,7 +177,7 @@ type liveSlow struct {
 // Slow implements SlowSource. A failed probe is recorded in the returned facts
 // and never returned as an error, so one unreadable source does not hide the
 // rest.
-func (l liveSlow) Slow(ctx context.Context, nodes []NodeRef) (*SlowFacts, error) {
+func (l liveSlow) Slow(ctx context.Context, _ string, nodes []NodeRef) (*SlowFacts, error) {
 	d := l.deps
 	f := &SlowFacts{Nodes: make(map[string]NodeSlowFacts, len(nodes))}
 	for _, n := range nodes {
@@ -422,8 +425,9 @@ func readStorages(ctx context.Context, api StorageAPI) ([]pve.StorageInfo, strin
 
 // clusterStatus is what the profile keeps from GET /cluster/status.
 type clusterStatus struct {
-	Clustered bool // a cluster or quorum row exists
-	Quorate   bool // the quorate flag of that row, as the entry node sees it
+	Clustered bool   // a cluster or quorum row exists
+	Name      string // the name of the cluster row, empty when the row has none
+	Quorate   bool   // the quorate flag of that row, as the entry node sees it
 	Entry     string
 	Nodes     []NodeRef
 }
@@ -469,6 +473,9 @@ func readClusterStatus(ctx context.Context, api ClusterAPI) (*clusterStatus, err
 		case "cluster", "quorum":
 			cs.Clustered = true
 			cs.Quorate = row.Quorate.Bool()
+			if row.Type == "cluster" && row.Name != "" {
+				cs.Name = row.Name
+			}
 		}
 	}
 	if !cs.Clustered {

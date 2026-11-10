@@ -68,13 +68,17 @@ type SweepResult struct {
 // whatever their age. keep lists names it leaves alone whatever their age,
 // such as the lock the caller holds. It writes no log line.
 func Sweep(root *os.Root, now time.Time, keep ...string) SweepResult {
-	return endpointTexts.sweepWith(root, now, keep, ownedByEffectiveUser)
+	return endpointTexts.sweepWith(root, now, keep, ownedByEffectiveUser, "")
 }
 
 // sweepWith is Sweep with the ownership test replaced, so a test can show
 // that a file another user owns stays, and with its error texts naming the
-// store that calls it.
-func (t *texts) sweepWith(root *os.Root, now time.Time, keep []string, owned func(fs.FileInfo) bool) SweepResult {
+// store that calls it. A non-empty prefix limits the sweep to key files and
+// lock files that start with it, plus temporary files, which carry no kind.
+// Another kind's names are then never candidates, even for the same key.
+func (t *texts) sweepWith(
+	root *os.Root, now time.Time, keep []string, owned func(fs.FileInfo) bool, prefix string,
+) SweepResult {
 	var result SweepResult
 	names, err := t.listNames(root)
 	if err != nil {
@@ -100,7 +104,7 @@ func (t *texts) sweepWith(root *os.Root, now time.Time, keep []string, owned fun
 
 	for _, name := range names {
 		maxAge, ok := sweepAge(name, keep)
-		if !ok {
+		if !ok || !inSweepScope(name, prefix) {
 			continue
 		}
 		info, ok := statted(name)
@@ -162,6 +166,14 @@ func sweepAge(name string, keep []string) (time.Duration, bool) {
 		return fileMaxAge, true
 	}
 	return 0, false
+}
+
+// inSweepScope reports whether a sweep limited to the file kind that starts its
+// names with prefix may remove name. The empty prefix limits nothing. A kind's
+// names are told apart by the prefix alone, so an endpoint file for a host
+// whose name itself begins with the prefix reads as that kind's.
+func inSweepScope(name, prefix string) bool {
+	return prefix == "" || strings.HasPrefix(name, prefix) || strings.HasPrefix(name, privatefile.TempPrefix)
 }
 
 // lockKeyFile returns the key file that belongs to the lock file or discover

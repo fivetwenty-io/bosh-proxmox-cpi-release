@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -22,12 +23,15 @@ type stubLive struct {
 	calls int
 }
 
-func (s *stubLive) Slow(_ context.Context, nodes []NodeRef) (*SlowFacts, error) {
+func (s *stubLive) Slow(_ context.Context, _ string, nodes []NodeRef) (*SlowFacts, error) {
 	s.calls++
 	return s.facts(nodes), nil
 }
 
 var cacheTestNow = time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+
+// cacheTestCluster is the cluster name the cache tests ask about.
+const cacheTestCluster = "lab"
 
 func internalNodes(names ...string) []NodeRef {
 	out := make([]NodeRef, 0, len(names))
@@ -85,7 +89,7 @@ func seedProfile(t *testing.T, c *ProfileCache, stored time.Time, facts SlowFact
 	}
 	defer func() { _ = store.Close() }()
 	written, err := endpointcache.Update(context.Background(), store, func(*profilePayload) (*profilePayload, error) {
-		return &profilePayload{Key: store.Key(), StoredAtMillis: stored.UnixMilli(), Facts: facts}, nil
+		return &profilePayload{Key: store.Key(), Cluster: cacheTestCluster, StoredAtMillis: stored.UnixMilli(), Facts: facts}, nil
 	})
 	if err != nil || !written {
 		t.Fatalf("seed the profile file: written %v, err %v", written, err)
@@ -150,7 +154,7 @@ func TestProfileCacheDoesNotStoreFactsWithAnyFault(t *testing.T) {
 			}}
 			c := internalCache(t, live)
 			for i := 1; i <= 2; i++ {
-				if _, err := c.Slow(context.Background(), nodes); err != nil {
+				if _, err := c.Slow(context.Background(), cacheTestCluster, nodes); err != nil {
 					t.Fatal(err)
 				}
 				if live.calls != i {
@@ -174,7 +178,7 @@ func TestProfileCacheDoesNotAnswerFromStoredFactsWithAnyFault(t *testing.T) {
 			fault(faulty)
 			seedProfile(t, c, cacheTestNow.Add(-time.Second), *faulty)
 
-			got, err := c.Slow(context.Background(), nodes)
+			got, err := c.Slow(context.Background(), cacheTestCluster, nodes)
 			if err != nil || live.calls != 1 || got.Cached {
 				t.Fatalf("a stored reading with a fault answered: live probes %d, cached %v, err %v", live.calls, got != nil && got.Cached, err)
 			}
@@ -194,13 +198,13 @@ func TestProfileCacheAFileWithADifferentNodeCountIsAMiss(t *testing.T) {
 	three := internalNodes("pve1", "pve2", "pve3")
 	two := internalNodes("pve1", "pve2")
 
-	if _, err := c.Slow(context.Background(), three); err != nil {
+	if _, err := c.Slow(context.Background(), cacheTestCluster, three); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Slow(context.Background(), three); err != nil || live.calls != 1 {
+	if _, err := c.Slow(context.Background(), cacheTestCluster, three); err != nil || live.calls != 1 {
 		t.Fatalf("the same three nodes must answer from the file, got %d probes, err %v", live.calls, err)
 	}
-	got, err := c.Slow(context.Background(), two)
+	got, err := c.Slow(context.Background(), cacheTestCluster, two)
 	if err != nil || live.calls != 2 || got.Cached || len(got.Nodes) != 2 {
 		t.Fatalf("a node that left must force a probe: %d probes, cached %v, nodes %v, err %v",
 			live.calls, got != nil && got.Cached, got.Nodes, err)
@@ -215,7 +219,7 @@ func TestProfileCacheDoesNotStoreFactsForOtherNodesThanAskedAbout(t *testing.T) 
 	c := internalCache(t, extra)
 	two := internalNodes("pve1", "pve2")
 	for i := 1; i <= 2; i++ {
-		if _, err := c.Slow(context.Background(), two); err != nil || extra.calls != i {
+		if _, err := c.Slow(context.Background(), cacheTestCluster, two); err != nil || extra.calls != i {
 			t.Fatalf("call %d: %d probes, err %v, want a probe each time", i, extra.calls, err)
 		}
 	}
@@ -289,7 +293,7 @@ func goldenFacts() SlowFacts {
 // goldenProfileFile is the stored payload's exact text. A change to it is a
 // change to the file's schema and bumps profileCacheVersion, together with this
 // test.
-const goldenProfileFile = `{"key":{"endpoints":null,"verify_ssl":false,"ca_sha256":"","credential_id":""},` +
+const goldenProfileFile = `{"key":{"endpoints":null,"verify_ssl":false,"ca_sha256":"","credential_id":""},"cluster":"lab",` +
 	`"stored_at_ms":1,"facts":{"nodes":{"pve1":{"probed":true,"version":"9.2.1","version_err":"v",` +
 	`"cpu":{"known":true,"model":"Xeon A","flags":["avx"]},"cpu_err":"c"}},"rules_supported":true,` +
 	`"rules_err":"r","config_votes":{"pve1":1},"config_votes_err":"cv","qdevice":{"read":true,"read_err":"qe",` +
@@ -299,10 +303,10 @@ const goldenProfileFile = `{"key":{"endpoints":null,"verify_ssl":false,"ca_sha25
 	`"storages_err":"se"}}`
 
 func TestTheStoredProfileHasAPinnedSchema(t *testing.T) {
-	if profileCacheVersion != 1 {
-		t.Fatalf("profileCacheVersion = %d, but this golden text is the version 1 schema; update both together", profileCacheVersion)
+	if profileCacheVersion != 2 {
+		t.Fatalf("profileCacheVersion = %d, but this golden text is the version 2 schema; update both together", profileCacheVersion)
 	}
-	got, err := json.Marshal(profilePayload{StoredAtMillis: 1, Facts: goldenFacts()})
+	got, err := json.Marshal(profilePayload{Cluster: "lab", StoredAtMillis: 1, Facts: goldenFacts()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,5 +358,193 @@ func TestEveryStoredFieldHasAnExplicitJSONTag(t *testing.T) {
 	walk(t, reflect.TypeOf(profilePayload{}), "profilePayload")
 	if !seen[reflect.TypeOf(pve.StorageInfo{})] || !seen[reflect.TypeOf(CPUInfo{})] || !seen[reflect.TypeOf(QDevice{})] {
 		t.Errorf("the walk missed a stored type, saw %d", len(seen))
+	}
+}
+
+// seedProfileFor is seedProfile for the cluster called cluster.
+func seedProfileFor(t *testing.T, c *ProfileCache, cluster string, stored time.Time, facts SlowFacts) {
+	t.Helper()
+	store := c.openStore(context.Background(), log.NewNopLogger())
+	if store == nil {
+		t.Fatal("the cache cannot open its store")
+	}
+	defer func() { _ = store.Close() }()
+	written, err := endpointcache.Update(context.Background(), store, func(*profilePayload) (*profilePayload, error) {
+		return &profilePayload{Key: store.Key(), Cluster: cluster, StoredAtMillis: stored.UnixMilli(), Facts: facts}, nil
+	})
+	if err != nil || !written {
+		t.Fatalf("seed the profile file: written %v, err %v", written, err)
+	}
+}
+
+func TestProfileCacheNeverServesAFileStoredForAnotherCluster(t *testing.T) {
+	// Two clusters can share endpoints, a credential, and node names, such as a
+	// cluster rebuilt under the same host names, so the file's key is the same
+	// for both and only the cluster's name tells them apart.
+	nodes := internalNodes("pve1", "pve2", "pve3")
+	live := &stubLive{facts: internalCleanFacts}
+	c := internalCache(t, live)
+
+	if _, err := c.Slow(context.Background(), "lab", nodes); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := c.Slow(context.Background(), "lab", nodes); err != nil || !got.Cached || live.calls != 1 {
+		t.Fatalf("the same cluster must be answered from the file: cached %v, probes %d, err %v",
+			got != nil && got.Cached, live.calls, err)
+	}
+
+	got, err := c.Slow(context.Background(), "prod", nodes)
+	if err != nil || got.Cached || live.calls != 2 {
+		t.Fatalf("another cluster at the same endpoints must probe: cached %v, probes %d, err %v",
+			got != nil && got.Cached, live.calls, err)
+	}
+	if stored := storedProfile(t, c); stored == nil || stored.Cluster != "prod" {
+		t.Errorf("the file must now belong to the cluster that probed, got %+v", stored)
+	}
+	if got, err := c.Slow(context.Background(), "lab", nodes); err != nil || got.Cached || live.calls != 3 {
+		t.Errorf("the first cluster must not read the second one's file: cached %v, probes %d, err %v",
+			got != nil && got.Cached, live.calls, err)
+	}
+}
+
+func TestProfileCacheDoesNotReadOrWriteWhenTheClusterHasNoName(t *testing.T) {
+	nodes := internalNodes("pve1", "pve2", "pve3")
+	live := &stubLive{facts: internalCleanFacts}
+	c := internalCache(t, live)
+
+	for i := 1; i <= 2; i++ {
+		if got, err := c.Slow(context.Background(), "", nodes); err != nil || got.Cached || live.calls != i {
+			t.Fatalf("call %d: an unnamed cluster must probe every time: cached %v, probes %d, err %v",
+				i, got != nil && got.Cached, live.calls, err)
+		}
+	}
+	if stored := storedProfile(t, c); stored != nil {
+		t.Errorf("facts of an unnamed cluster were stored: %+v", stored)
+	}
+
+	// A file that holds facts for a named cluster does not answer an unnamed one.
+	seedProfileFor(t, c, "lab", cacheTestNow.Add(-time.Second), *internalCleanFacts(nodes))
+	if got, err := c.Slow(context.Background(), "", nodes); err != nil || got.Cached {
+		t.Errorf("a stored file answered a call with no cluster name: cached %v, err %v", got != nil && got.Cached, err)
+	}
+	if stored := storedProfile(t, c); stored == nil || stored.Cluster != "lab" {
+		t.Errorf("the unnamed call must leave the named cluster's file alone, got %+v", stored)
+	}
+}
+
+func TestProfileCacheAFileWithNoClusterNameIsAMiss(t *testing.T) {
+	// A file from before the payload carried the name, or a damaged one, has an
+	// empty name, which never equals a real cluster's.
+	nodes := internalNodes("pve1", "pve2", "pve3")
+	live := &stubLive{facts: internalCleanFacts}
+	c := internalCache(t, live)
+	seedProfileFor(t, c, "", cacheTestNow.Add(-time.Second), *internalCleanFacts(nodes))
+
+	if got, err := c.Slow(context.Background(), "lab", nodes); err != nil || got.Cached || live.calls != 1 {
+		t.Fatalf("a file with no cluster name answered: cached %v, probes %d, err %v",
+			got != nil && got.Cached, live.calls, err)
+	}
+	if stored := storedProfile(t, c); stored == nil || stored.Cluster != "lab" {
+		t.Errorf("the probe must replace the unnamed file, got %+v", stored)
+	}
+}
+
+func TestProfileCacheReplacesANewerFileThatBelongsToAnotherCluster(t *testing.T) {
+	// A file that another process wrote while this one probed is kept only when
+	// it could answer this cluster's next call.
+	nodes := internalNodes("pve1", "pve2", "pve3")
+	now := cacheTestNow
+	var c *ProfileCache
+	live := &stubLive{}
+	live.facts = func(n []NodeRef) *SlowFacts {
+		now = now.Add(5 * time.Second)
+		seedProfileFor(t, c, "prod", now, *internalCleanFacts(n))
+		return internalCleanFacts(n)
+	}
+	c = internalCache(t, live)
+	c.opts.Now = func() time.Time { return now }
+
+	if _, err := c.Slow(context.Background(), "lab", nodes); err != nil {
+		t.Fatal(err)
+	}
+	if stored := storedProfile(t, c); stored == nil || stored.Cluster != "lab" {
+		t.Errorf("a newer file for another cluster must not be kept, got %+v", stored)
+	}
+}
+
+func TestEveryProfileCacheLogLineCallsItTheHAProfileCache(t *testing.T) {
+	nodes := internalNodes("pve1", "pve2", "pve3")
+	logger, logs := log.NewObservedLogger(slog.LevelDebug)
+	run := func(c *ProfileCache) {
+		t.Helper()
+		c.opts.Log = logger
+		for i := 0; i < 2; i++ {
+			if _, err := c.Slow(context.Background(), cacheTestCluster, nodes); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// A miss that stores, then a hit.
+	run(internalCache(t, &stubLive{facts: internalCleanFacts}))
+	// Facts that must not be stored.
+	run(internalCache(t, &stubLive{facts: func(n []NodeRef) *SlowFacts {
+		f := internalCleanFacts(n)
+		f.RulesErr = "501"
+		return f
+	}}))
+	// A cluster with no name.
+	c := internalCache(t, &stubLive{facts: internalCleanFacts})
+	c.opts.Log = logger
+	if _, err := c.Slow(context.Background(), "", nodes); err != nil {
+		t.Fatal(err)
+	}
+	// A directory the cache refuses.
+	unsafe := internalCache(t, &stubLive{facts: internalCleanFacts})
+	if err := os.Chmod(unsafe.opts.Dir.Override, 0o755); err != nil { //nolint:gosec // the test makes the mode unsafe on purpose
+		t.Fatal(err)
+	}
+	run(unsafe)
+	// A secret of the wrong length.
+	short := internalCache(t, &stubLive{facts: internalCleanFacts})
+	if err := os.WriteFile(filepath.Join(short.opts.Dir.Override, "secret"), []byte("short"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run(short)
+	// A key the store cannot open.
+	unopenable := internalCache(t, &stubLive{facts: internalCleanFacts})
+	unopenable.opts.Key.User = ""
+	run(unopenable)
+	// Stored facts that have expired.
+	expiring := internalCache(t, &stubLive{facts: internalCleanFacts})
+	clock := cacheTestNow
+	expiring.opts.Now = func() time.Time { return clock }
+	run(expiring)
+	clock = clock.Add(2 * ProfileCacheTTL)
+	run(expiring)
+	// A stored file that is damaged.
+	damaged := internalCache(t, &stubLive{facts: internalCleanFacts})
+	run(damaged)
+	files, err := filepath.Glob(filepath.Join(damaged.opts.Dir.Override, "ha-profile-*.json"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("want one profile file to damage, got %v, %v", files, err)
+	}
+	if err := os.WriteFile(files[0], []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run(damaged)
+
+	seen := 0
+	for _, e := range logs.All() {
+		if !strings.Contains(strings.ToLower(e.Message), "profile cache") {
+			continue
+		}
+		seen++
+		if !strings.HasPrefix(e.Message, "HA profile cache: ") {
+			t.Errorf("log line %q must start with the display name \"HA profile cache\"", e.Message)
+		}
+	}
+	if seen < 9 {
+		t.Errorf("the scenarios logged only %d profile cache lines, so the check proves little", seen)
 	}
 }

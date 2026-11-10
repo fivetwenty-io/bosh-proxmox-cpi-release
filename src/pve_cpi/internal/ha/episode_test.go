@@ -414,3 +414,129 @@ func TestEpisodeStore_SitsBesideTheProfileCache(t *testing.T) {
 		t.Errorf("the profile cache file must still be there: %v", profileFiles(t, dir))
 	}
 }
+
+// warnLines returns the Warn entries the observed logger holds.
+func warnLines(logs *log.Observer) []log.Entry {
+	var out []log.Entry
+	for _, e := range logs.All() {
+		if e.Level == slog.LevelWarn {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func TestEpisodeStore_DirectoryRefusalsNameTheEpisodeRecord(t *testing.T) {
+	t.Parallel()
+	notADirectory := filepath.Join(t.TempDir(), "afile")
+	if err := os.WriteFile(notADirectory, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wide := filepath.Join(t.TempDir(), "wide")
+	if err := os.Mkdir(wide, 0o755); err != nil { //nolint:gosec // the test makes the mode unsafe on purpose
+		t.Fatal(err)
+	}
+	if err := os.Chmod(wide, 0o755); err != nil { //nolint:gosec // the umask may have narrowed it
+		t.Fatal(err)
+	}
+	for name, override := range map[string]string{"a file": notADirectory, "a wide mode": wide, "a relative path": "relative/dir"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			store := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: override}}
+			_, err := store.Observe("vm:101", "uid-a")
+			if err == nil {
+				t.Fatal("want the directory refused")
+			}
+			if !strings.Contains(err.Error(), ha.EpisodeName+":") {
+				t.Errorf("the refusal %q must call the record %q", err, ha.EpisodeName)
+			}
+			if strings.Contains(err.Error(), "endpoint cache") {
+				t.Errorf("the refusal %q names the endpoint cache, which the record is not", err)
+			}
+		})
+	}
+}
+
+func TestEpisodeNameIsAValidDisplayName(t *testing.T) {
+	t.Parallel()
+	// A name the directory choice reads as invalid falls back to the endpoint
+	// cache's, so the refusal of an unusable directory proves the name took.
+	choice := endpointcache.DirOptions{Override: "relative/dir"}.Named(ha.EpisodeName).Resolve()
+	if choice.Usable() || !strings.Contains(choice.Err.Error(), ha.EpisodeName) {
+		t.Fatalf("the directory choice did not take the name %q: %v", ha.EpisodeName, choice.Err)
+	}
+}
+
+func TestEpisodeStore_TheWarnSaysWhenTheFallbackFailsToo(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	// The temporary directory is relative, so the fallback is refused too.
+	t.Setenv("TMPDIR", "relative")
+	logger, logs := log.NewObservedLogger(slog.LevelDebug)
+	store := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: missing}, Log: logger}
+	if _, err := store.Observe("vm:101", "uid-a"); err == nil {
+		t.Fatal("want an error when neither the override nor the fallback can hold the record")
+	}
+	warns := warnLines(logs)
+	if len(warns) != 1 {
+		t.Fatalf("logged %d warnings, want one", len(warns))
+	}
+	msg := warns[0].Message
+	if strings.Contains(msg, "instead") || !strings.Contains(msg, "cannot be used either") {
+		t.Errorf("the warning promises a fallback that failed: %q", msg)
+	}
+	if got, _ := warns[0].Attrs["fallback_error"].(string); got == "" {
+		t.Errorf("the warning must carry the fallback's refusal, got %+v", warns[0].Attrs)
+	}
+	if warns[0].Attrs["path"] != missing {
+		t.Errorf("the warning must name the missing directory %s, got %+v", missing, warns[0].Attrs)
+	}
+}
+
+func TestEpisodeStore_TheWarnNamesTheFallbackThatWorked(t *testing.T) {
+	temporary := temporaryCacheDir(t)
+	missing := filepath.Join(t.TempDir(), "missing")
+	logger, logs := log.NewObservedLogger(slog.LevelDebug)
+	store := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: missing}, Log: logger}
+	if _, err := store.Observe("vm:101", "uid-a"); err != nil {
+		t.Fatal(err)
+	}
+	warns := warnLines(logs)
+	if len(warns) != 1 || !strings.Contains(warns[0].Message, "uses the temporary cache directory instead") {
+		t.Fatalf("want one warning that names the fallback, got %+v", warns)
+	}
+	if warns[0].Attrs["fallback"] != temporary {
+		t.Errorf("the warning must name %s, got %+v", temporary, warns[0].Attrs)
+	}
+}
+
+func TestEpisodeStore_ForCallWarnsOnceHoweverManyTimesItObserves(t *testing.T) {
+	temporaryCacheDir(t)
+	missing := filepath.Join(t.TempDir(), "missing")
+	logger, logs := log.NewObservedLogger(slog.LevelDebug)
+	base := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: missing}, Log: logger}
+
+	call := base.ForCall()
+	for _, sid := range []string{"vm:101", "vm:101", "vm:102"} {
+		if _, err := call.Observe(sid, "uid-a"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if warns := warnLines(logs); len(warns) != 1 {
+		t.Errorf("a call's store logged %d warnings for three observations, want one", len(warns))
+	}
+
+	// The copy leaves the store it came from alone, and the next call warns again.
+	if _, err := base.Observe("vm:101", "uid-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base.ForCall().Observe("vm:101", "uid-a"); err != nil {
+		t.Fatal(err)
+	}
+	if warns := warnLines(logs); len(warns) != 3 {
+		t.Errorf("logged %d warnings, want one per call and one per observation of an ordinary store", len(warns))
+	}
+
+	if _, err := (*ha.EpisodeStore)(nil).ForCall().Observe("vm:101", "uid-a"); err != nil {
+		t.Errorf("a call's store made from a nil store must work: %v", err)
+	}
+}

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -890,4 +892,59 @@ func TestReportTextCoversEveryFinding(t *testing.T) {
 	if got := nodeLine(haNode{Name: "y", Online: true, Health: "online"}); got != "y online health=online placeable=no" {
 		t.Fatalf("node line = %q", got)
 	}
+}
+
+func TestCollectReportsACacheDirectoryTheCPICannotUse(t *testing.T) {
+	t.Parallel()
+	private := filepath.Join(t.TempDir(), "private")
+	wide := filepath.Join(t.TempDir(), "wide")
+	file := filepath.Join(t.TempDir(), "afile")
+	link := filepath.Join(t.TempDir(), "link")
+	for _, dir := range []string{private, wide} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(wide, 0o755); err != nil { //nolint:gosec // the test makes the mode unsafe on purpose
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(private, link); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(t.TempDir(), "absent")
+
+	cases := map[string]struct {
+		dir       string
+		fragments []string
+	}{
+		"mode wider than 0700": {wide, []string{"mode 0755", "chmod 0700", "dead-node handover cannot start"}},
+		"missing directory":    {missing, []string{"does not exist", "restarts any grace window"}},
+		"not a directory":      {file, []string{"not a directory"}},
+		"symbolic link":        {link, []string{"symbolic link"}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := haBaseFake()
+			cfg := haCfg("auto", "none")
+			cfg.EndpointCacheDir = tc.dir
+			r := runCollect(t, f, cfg)
+			want(t, r, haKindCacheDirectory, haSeverityAdvice, append([]string{tc.dir}, tc.fragments...)...)
+			if r.Problems() != 0 {
+				t.Errorf("advice about the cache directory must not fail the run: %+v", r.Findings)
+			}
+		})
+	}
+
+	t.Run("private directory and unset", func(t *testing.T) {
+		t.Parallel()
+		cfg := haCfg("auto", "none")
+		cfg.EndpointCacheDir = private
+		wantNone(t, runCollect(t, haBaseFake(), cfg), haKindCacheDirectory)
+		cfg.EndpointCacheDir = ""
+		wantNone(t, runCollect(t, haBaseFake(), cfg), haKindCacheDirectory)
+	})
 }

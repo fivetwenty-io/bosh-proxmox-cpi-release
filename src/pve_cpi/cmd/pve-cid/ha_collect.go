@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -188,6 +191,7 @@ func collectHA(ctx context.Context, r HAReader, cfg *config.CPIConfig, owner str
 	c.replicationFindings()
 	c.headroomFindings()
 	c.leftoverFindings()
+	c.cacheDirectoryFindings()
 	return c.rep
 }
 
@@ -1301,4 +1305,42 @@ func (c *haCollector) ownedResource(sid string) bool {
 	}
 	g, found := c.byVMID[vmid]
 	return found && g.owned
+}
+
+// cacheDirectoryFindings reports a pve.endpoint_cache_dir the CPI cannot use as
+// it stands. The directory holds the cache files and the HA recovery episode
+// record, and the CPI uses it only when it exists as a real directory that no
+// group or other user can reach. A directory with a wider mode is refused, which
+// leaves the record unwritten, so a recovery grace window never starts and the
+// dead-node handover never happens. A directory that does not exist sends the
+// record to the temporary directory until someone creates it, and creating it
+// later moves the record and restarts a running grace window once.
+func (c *haCollector) cacheDirectoryFindings() {
+	path := c.cfg.EndpointCacheDir
+	if path == "" {
+		return
+	}
+	info, err := os.Lstat(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		c.rep.advise(haKindCacheDirectory, path,
+			"pve.endpoint_cache_dir does not exist, so the HA recovery episode record sits in the temporary "+
+				"directory instead; create it with mode 0700, and note that doing so moves the record and "+
+				"restarts any grace window that is running")
+	case err != nil:
+		c.rep.advise(haKindCacheDirectory, path, "pve.endpoint_cache_dir could not be inspected: %v", err)
+	case info.Mode()&fs.ModeSymlink != 0:
+		c.rep.advise(haKindCacheDirectory, path,
+			"pve.endpoint_cache_dir is a symbolic link, which the CPI refuses, so it keeps no HA recovery record "+
+				"and the dead-node handover cannot start; point the setting at the directory itself")
+	case !info.IsDir():
+		c.rep.advise(haKindCacheDirectory, path,
+			"pve.endpoint_cache_dir is not a directory, so the CPI keeps no HA recovery record and the "+
+				"dead-node handover cannot start")
+	case info.Mode().Perm()&0o077 != 0:
+		c.rep.advise(haKindCacheDirectory, path,
+			"pve.endpoint_cache_dir has mode %04o and must grant no group or other access, so the CPI refuses it "+
+				"and keeps no HA recovery record, which means the dead-node handover cannot start; run chmod 0700 on it",
+			info.Mode().Perm())
+	}
 }
