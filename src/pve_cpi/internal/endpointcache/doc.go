@@ -9,7 +9,9 @@
 // one that has the wrong length. It reads and writes the authenticated cache
 // files through the private file store, which checks an HMAC and the file's
 // key on every read and replaces a file atomically, under a lock, on every
-// write, and it takes the per-key discover lock. It defines the cache payload,
+// write, and it takes the per-key discover lock. A store can also serve another
+// kind of file in the same directory, such as the HA profile cache, under its
+// own name prefix and HMAC label. It defines the cache payload,
 // validates every record in it on read, merges a writer's change into the
 // stored file under the trust rules without erasing what a read only hid, and
 // sweeps old files whose names the cache makes. It owns the process-wide

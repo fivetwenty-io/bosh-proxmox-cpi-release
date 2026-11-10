@@ -25,11 +25,24 @@ const (
 	fileMaxAge = 30 * 24 * time.Hour
 )
 
-// cacheFileName matches the names the cache makes for a key: the sanitized
-// host, a hyphen, 16 hex characters of the key digest, and one of the key
-// file, lock, and discover lock suffixes. It is the shape Key.FileName,
-// Key.LockName, and Key.DiscoverLockName produce.
-var cacheFileName = regexp.MustCompile(`^([a-z0-9][a-z0-9.-]{0,62}-[0-9a-f]{16})(\.json|\.lock|\.discover\.lock)$`)
+// cacheFileName matches the names the cache makes for a key: an optional
+// prefix of another kind of file, the sanitized host, a hyphen, 16 hex
+// characters of the key digest, and one of the key file, lock, and discover
+// lock suffixes. It is the shape Key.FileName, Key.LockName, and
+// Key.DiscoverLockName produce, with a known file prefix in front of it for a
+// file that is not the endpoint cache's.
+var cacheFileName = regexp.MustCompile(
+	`^((?:` + strings.Join(quotedPrefixes(), "|") + `)?[a-z0-9][a-z0-9.-]{0,62}-[0-9a-f]{16})` +
+		`(\.json|\.lock|\.discover\.lock)$`)
+
+// quotedPrefixes returns the known file prefixes as regular expression text.
+func quotedPrefixes() []string {
+	out := make([]string, 0, len(knownFilePrefixes))
+	for _, p := range knownFilePrefixes {
+		out = append(out, regexp.QuoteMeta(p))
+	}
+	return out
+}
 
 // SweepResult reports what a sweep did.
 type SweepResult struct {

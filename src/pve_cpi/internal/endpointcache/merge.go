@@ -645,7 +645,7 @@ func (s *Store) UpdatePayload(
 	}
 	written, err := Update(ctx, s, func(current *Payload) (*Payload, error) {
 		result.Locked = true
-		result.Swept = Sweep(s.root, now, s.key.LockName(), s.key.FileName())
+		result.Swept = Sweep(s.root, now, s.kind.lockName(s.key), s.name)
 		state, read := readState(current, s.key, now)
 		change, err := build(state.view(now))
 		if err != nil {

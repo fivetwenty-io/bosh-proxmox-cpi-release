@@ -60,6 +60,19 @@ type StoreOptions struct {
 	// DiscoveryModeOn the skipped-write line is a Warn, and under every other
 	// mode a Debug, as Level decides.
 	ConfiguredMode config.DiscoveryMode
+	// FilePrefix, Label, and Version select another kind of file that shares
+	// the directory, such as the HA profile cache. All three empty selects the
+	// endpoint cache file, with the same names, label, and version as before.
+	// FilePrefix must be one the sweep knows, such as HAProfilePrefix, and it
+	// starts the file's name and its lock names. Label starts the HKDF info of
+	// the file's HMAC key, so a file of one kind never verifies as another's,
+	// and it must be a lowercase label other than the endpoint cache's. Version
+	// is the envelope schema version, and zero means 1. A prefix needs a label
+	// and a label needs a prefix. The payload must carry the store's key in its
+	// "key" member, as the endpoint payload does.
+	FilePrefix string
+	Label      string
+	Version    int
 }
 
 // Store reads and writes the cache file of one key in one cache directory.
@@ -72,6 +85,7 @@ type StoreOptions struct {
 type Store struct {
 	root           *os.Root
 	key            Key
+	kind           fileKind
 	name           string
 	policy         privatefile.Policy
 	ops            privatefile.Ops
@@ -96,8 +110,25 @@ type Store struct {
 // token secret or password. Any error means the caller runs without a cache.
 // When the secret had the wrong length and this call replaced it,
 // SecretReplaced reports so, and the caller logs that once at Warn whatever
-// the mode. The caller closes the Store.
+// the mode. The caller closes the Store. StoreOptions.FilePrefix, Label, and
+// Version select another kind of file in the same directory, such as the HA
+// profile cache, and an invalid choice is refused with ErrInvalidFileKind.
 func OpenStore(ctx context.Context, root *os.Root, cfg KeyConfig, credential string, opts StoreOptions) (*Store, error) {
+	if root == nil {
+		return nil, fmt.Errorf("%s: no cache directory", cacheLabel)
+	}
+	kind, err := kindFor(opts)
+	if err != nil {
+		return nil, errors.Join(err, root.Close())
+	}
+	return openStoreOfKind(ctx, root, cfg, credential, opts, kind)
+}
+
+// openStoreOfKind is OpenStore for a file kind that kindFor has already
+// accepted or that a test supplies.
+func openStoreOfKind(
+	ctx context.Context, root *os.Root, cfg KeyConfig, credential string, opts StoreOptions, kind fileKind,
+) (*Store, error) {
 	if root == nil {
 		return nil, fmt.Errorf("%s: no cache directory", cacheLabel)
 	}
@@ -111,7 +142,7 @@ func OpenStore(ctx context.Context, root *os.Root, cfg KeyConfig, credential str
 	if err != nil {
 		return nil, errors.Join(err, root.Close())
 	}
-	key, macKey, err := deriveKeys(cfg, secret, credential)
+	key, macKey, err := deriveKeysFor(cfg, secret, credential, kind)
 	clear(secret)
 	if err != nil {
 		return nil, errors.Join(err, root.Close())
@@ -128,7 +159,8 @@ func OpenStore(ctx context.Context, root *os.Root, cfg KeyConfig, credential str
 	return &Store{
 		root:   root,
 		key:    key,
-		name:   key.FileName(),
+		kind:   kind,
+		name:   kind.fileName(key),
 		policy: policy,
 		// Cache writes skip fsync. The HMAC turns a file torn by a crash into
 		// "no cache", and the next discovery rebuilds it.
@@ -215,11 +247,11 @@ func (s *Store) Read(out any) error {
 	if err != nil {
 		return err
 	}
-	if env.Version != fileVersion {
+	if env.Version != s.kind.version {
 		return fmt.Errorf("%w: version %d", ErrUnsupportedVersion, env.Version)
 	}
 	var payload json.RawMessage
-	if err := s.policy.DecodeEnvelope(env, fileVersion, &payload); err != nil {
+	if err := s.policy.DecodeEnvelope(env, s.kind.version, &payload); err != nil {
 		return err
 	}
 	if err := s.checkKey(payload); err != nil {
@@ -323,7 +355,7 @@ func Update[T any](ctx context.Context, s *Store, merge func(current *T) (*T, er
 func (s *Store) lock(ctx context.Context) (*privatefile.Lock, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, s.lockWait)
 	defer cancel()
-	lock, err := waitHeldLock(waitCtx, s.root, s.key.LockName())
+	lock, err := waitHeldLock(waitCtx, s.root, s.kind.lockName(s.key))
 	if err != nil {
 		return nil, lockWaitError(ctx, err, errLockBusy)
 	}
@@ -343,7 +375,7 @@ func (s *Store) TryLockDiscovery(ctx context.Context) (lock *privatefile.Lock, h
 	if s == nil || s.root == nil {
 		return nil, false, fmt.Errorf("%s: store is closed", cacheLabel)
 	}
-	return tryHeldLock(ctx, s.root, s.key.DiscoverLockName())
+	return tryHeldLock(ctx, s.root, s.kind.discoverLockName(s.key))
 }
 
 // write marshals value, refuses it unless its key is the store's, and replaces
@@ -356,5 +388,5 @@ func (s *Store) write(value any) error {
 	if err := s.checkKey(payload); err != nil {
 		return fmt.Errorf("%s: refusing to write a payload for another key: %w", cacheLabel, err)
 	}
-	return s.policy.WriteEnvelope(s.root, s.name, fileVersion, json.RawMessage(payload), s.ops)
+	return s.policy.WriteEnvelope(s.root, s.name, s.kind.version, json.RawMessage(payload), s.ops)
 }

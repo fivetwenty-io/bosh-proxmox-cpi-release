@@ -22,12 +22,11 @@ const (
 	keyVersion = "pve-cpi endpoint-cache key v1"
 
 	// credentialIDLabel is the HKDF info string of the credential identifier,
-	// and hmacKeyLabelPrefix, followed by the file's schema version, starts the
-	// info string of the HMAC key. Distinct labels keep the published
-	// identifier and the secret HMAC key independent although both come from
-	// the same credential and salt.
-	credentialIDLabel  = "pve-cpi endpoint-cache id v1" // #nosec G101 -- HKDF info label, not a credential
-	hmacKeyLabelPrefix = "pve-cpi endpoint-cache v"
+	// and a file kind's label, followed by " v" and the file's schema version,
+	// starts the info string of its HMAC key. Distinct labels keep the
+	// published identifier and the secret HMAC keys independent although all of
+	// them come from the same credential and salt.
+	credentialIDLabel = "pve-cpi endpoint-cache id v1" // #nosec G101 -- HKDF info label, not a credential
 
 	// credentialIDBytes is the length of the credential identifier, which the
 	// key holds as 16 hex characters.
@@ -224,6 +223,14 @@ func deriveKeys(cfg KeyConfig, dirSecret keyMaterial, credential string) (Key, k
 // is the versioned label followed by the 32-byte key digest, so a schema bump
 // changes the key and a file moved from another key fails its HMAC.
 func deriveKeysAt(cfg KeyConfig, dirSecret keyMaterial, credential string, version int) (Key, keyMaterial, error) {
+	return deriveKeysFor(cfg, dirSecret, credential, fileKind{label: endpointLabel, version: version})
+}
+
+// deriveKeysFor is deriveKeysAt for a file of any kind. The credential
+// identifier and the key digest do not depend on the kind, so every kind of
+// file for one entry shares one key, while the HMAC key takes the kind's label
+// and schema version, so no kind's file verifies as another's.
+func deriveKeysFor(cfg KeyConfig, dirSecret keyMaterial, credential string, kind fileKind) (Key, keyMaterial, error) {
 	if len(dirSecret) != secretBytes {
 		return Key{}, nil, fmt.Errorf("%w: directory secret has the wrong length", ErrInvalidKey)
 	}
@@ -249,7 +256,7 @@ func deriveKeysAt(cfg KeyConfig, dirSecret keyMaterial, credential string, versi
 		CASHA256:     caDigest(cfg.CACert),
 		CredentialID: hex.EncodeToString(id),
 	}
-	mac, err := hkdf.Key(sha256.New, ikm, dirSecret, hmacKeyInfo(version, key.Digest()), hmacKeyBytes)
+	mac, err := hkdf.Key(sha256.New, ikm, dirSecret, hmacKeyInfo(kind.label, kind.version, key.Digest()), hmacKeyBytes)
 	if err != nil {
 		return Key{}, nil, fmt.Errorf("endpoint cache: derive file key: %w", err)
 	}
@@ -267,9 +274,10 @@ func credentialInput(user, credential string) []byte {
 	return append(ikm, credential...)
 }
 
-// hmacKeyInfo is the HKDF info of the HMAC key for a file of the given schema
-// version and key digest. The digest has a fixed length, so the label and the
-// digest cannot run together.
-func hmacKeyInfo(version int, digest [sha256.Size]byte) string {
-	return hmacKeyLabelPrefix + strconv.Itoa(version) + string(digest[:])
+// hmacKeyInfo is the HKDF info of the HMAC key for a file with the given label,
+// schema version, and key digest. The digest has a fixed length, so the label
+// and the digest cannot run together. The endpoint cache's label gives the
+// string "pve-cpi endpoint-cache v<version>" followed by the digest.
+func hmacKeyInfo(label string, version int, digest [sha256.Size]byte) string {
+	return label + " v" + strconv.Itoa(version) + string(digest[:])
 }
