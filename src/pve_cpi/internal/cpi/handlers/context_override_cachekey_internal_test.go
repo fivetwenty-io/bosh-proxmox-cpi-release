@@ -96,6 +96,7 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		"pve_require_disjoint_storage_sets":      false,
 		"pve_storage_status_max_age_seconds":     12,
 		"pve_ca_cert":                            selfSignedCAPEMForCacheKeyTest(t),
+		"pve_api_endpoint_discovery":             "on",
 		"pve_host":                               "pve-b.example",
 		"pve_port":                               float64(9999), // JSON numbers decode as float64
 		"pve_endpoints":                          []any{"pve-a.example", "pve-c.example"},
@@ -298,5 +299,61 @@ func TestRequestOverrideCacheKey_NoListKeysAsBeforeTheListExisted(t *testing.T) 
 	cfg.Endpoints = []string{}
 	if got := requestOverrideCacheKey(cfg); got != golden {
 		t.Errorf("key with an empty list = %s, want %s", got, golden)
+	}
+}
+
+// TestRequestOverrideCacheKey_DiscoveryModeSeparatesConfigs asserts that two
+// configs that differ only in their discovery mode never share a cached
+// bundle, that an unset mode keys exactly as it did before the mode existed,
+// and that the mode is hashed as written.
+func TestRequestOverrideCacheKey_DiscoveryModeSeparatesConfigs(t *testing.T) {
+	t.Parallel()
+	mk := func(mode config.DiscoveryMode) *config.CPIConfig {
+		return &config.CPIConfig{
+			Host: "pve-a.example", Port: 8006, User: "cpi", Password: "pw-one", APIEndpointDiscovery: mode,
+		}
+	}
+	keys := map[string]string{
+		"unset": requestOverrideCacheKey(mk("")),
+		"auto":  requestOverrideCacheKey(mk(config.DiscoveryModeAuto)),
+		"on":    requestOverrideCacheKey(mk(config.DiscoveryModeOn)),
+		"off":   requestOverrideCacheKey(mk(config.DiscoveryModeOff)),
+	}
+	seen := map[string]string{}
+	for name, key := range keys {
+		if prev, dup := seen[key]; dup {
+			t.Errorf("%q and %q share a cache key", prev, name)
+		}
+		seen[key] = name
+	}
+	if requestOverrideCacheKey(mk(config.DiscoveryModeOn)) != keys["on"] {
+		t.Error("the cache key must be deterministic")
+	}
+	// The cache directory is process-level and never part of a bundle's identity.
+	withDir := mk(config.DiscoveryModeOn)
+	withDir.EndpointCacheDir = "/var/vcap/store/pve_cpi/endpoint-cache"
+	if requestOverrideCacheKey(withDir) != keys["on"] {
+		t.Error("the cache directory must not change the bundle key")
+	}
+}
+
+// TestRequestOverrideCacheKey_NoModeKeysAsBeforeTheModeExisted pins the key of
+// a fixed config with no discovery mode to the value the key function produced
+// before the mode was folded in, so no warm cached client is dropped on
+// upgrade. It is the same fixed config and golden value as the endpoint list
+// test, because an unset mode and an empty list must both add nothing.
+func TestRequestOverrideCacheKey_NoModeKeysAsBeforeTheModeExisted(t *testing.T) {
+	t.Parallel()
+	const golden = "e1b319f637957cfa0d54052d63706dd2951c0350482db1975f46542f0d2d84d3"
+	cfg := &config.CPIConfig{
+		Host: "pve-a.example", Port: 8006, User: "cpi", Realm: "pam", Node: "pve1", Password: "pw-one",
+		VMStorage: "local-lvm", DiskStorage: "local-lvm", NetworkBridge: "vmbr0",
+	}
+	if got := requestOverrideCacheKey(cfg); got != golden {
+		t.Errorf("key = %s, want %s", got, golden)
+	}
+	cfg.APIEndpointDiscovery = config.DiscoveryModeAuto
+	if got := requestOverrideCacheKey(cfg); got == golden {
+		t.Error("an explicit auto must key differently from an unset mode")
 	}
 }

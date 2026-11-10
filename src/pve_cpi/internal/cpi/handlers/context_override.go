@@ -486,6 +486,14 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 	if len(cfg.Endpoints) > 0 {
 		_, _ = fmt.Fprintf(h, "endpoints=%q\x00", cfg.Endpoints)
 	}
+	// The discovery mode is folded in as written. An unset mode adds nothing,
+	// so a config without one keys exactly as it did before the mode could be
+	// set per entry. Unset and an explicit auto read the same at run time, but
+	// the raw value is hashed, as with the ownership guard above, so the key
+	// of every existing bundle stays put.
+	if cfg.APIEndpointDiscovery != "" {
+		_, _ = fmt.Fprintf(h, "api_endpoint_discovery=%s\x00", cfg.APIEndpointDiscovery)
+	}
 	if cfg.PVECACertPEM != "" {
 		caHash := sha256.Sum256([]byte(cfg.PVECACertPEM))
 		_, _ = fmt.Fprintf(h, "ca_cert_sha=%s\x00", hex.EncodeToString(caHash[:]))

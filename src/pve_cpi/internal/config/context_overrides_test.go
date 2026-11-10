@@ -1529,3 +1529,461 @@ func TestOverrideCredentialGroup_NilClaimsEntry(t *testing.T) {
 		}
 	}
 }
+
+// -----------------------------------------------------------------------
+// pve_api_endpoint_discovery
+// -----------------------------------------------------------------------
+
+const discoveryOverrideKey = "pve_api_endpoint_discovery"
+
+func TestContextOverrideFieldOrder_DiscoveryMode(t *testing.T) {
+	t.Parallel()
+	order := config.ContextOverrideFieldOrderForTest()
+	at := slices.Index(order, discoveryOverrideKey)
+	if at < 0 {
+		t.Fatalf("%s is missing from contextOverrideFieldOrder", discoveryOverrideKey)
+	}
+	if slices.Index(order[at+1:], discoveryOverrideKey) >= 0 {
+		t.Errorf("%s appears twice in contextOverrideFieldOrder", discoveryOverrideKey)
+	}
+	if ca := slices.Index(order, "pve_ca_cert"); at != ca+1 {
+		t.Errorf("%s sits at %d, want right after pve_ca_cert at %d", discoveryOverrideKey, at, ca)
+	}
+	if !slices.Contains(config.ContextOverrideFieldKeysForTest(), discoveryOverrideKey) {
+		t.Errorf("%s has no apply function", discoveryOverrideKey)
+	}
+	// The cache directory is process-level, so it must never be an override key.
+	for _, name := range []string{"pve_endpoint_cache_dir", "pve_endpoint_cache"} {
+		if slices.Contains(order, name) {
+			t.Errorf("%s must not be an override key", name)
+		}
+	}
+}
+
+func TestApplyContextOverrides_DiscoveryMode_AcceptsStringsAndBooleans(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		value any
+		want  config.DiscoveryMode
+	}{
+		"auto string":   {"auto", config.DiscoveryModeAuto},
+		"on string":     {"on", config.DiscoveryModeOn},
+		"off string":    {"off", config.DiscoveryModeOff},
+		"true boolean":  {true, config.DiscoveryModeOn},
+		"false boolean": {false, config.DiscoveryModeOff},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			base := validBaseCfg()
+			eff, applied, unknown, err := config.ApplyContextOverrides(base, map[string]any{discoveryOverrideKey: tc.value})
+			if err != nil {
+				t.Fatalf("ApplyContextOverrides: %v", err)
+			}
+			if eff.APIEndpointDiscovery != tc.want {
+				t.Errorf("mode = %q, want %q", eff.APIEndpointDiscovery, tc.want)
+			}
+			if !slices.Equal(applied, []string{discoveryOverrideKey}) || len(unknown) != 0 {
+				t.Errorf("applied = %v, unknown = %v, want only the mode applied", applied, unknown)
+			}
+			if base.APIEndpointDiscovery != "" {
+				t.Errorf("base mode = %q, want it untouched", base.APIEndpointDiscovery)
+			}
+			if eff.InheritedCredsLooserTLS() {
+				t.Error("a mode alone must not mark the entry as looser than the job")
+			}
+		})
+	}
+}
+
+func TestApplyContextOverrides_DiscoveryMode_NestedForm(t *testing.T) {
+	t.Parallel()
+	eff, applied, _, err := config.ApplyContextOverrides(validBaseCfg(),
+		map[string]any{"pve": map[string]any{"api_endpoint_discovery": false}})
+	if err != nil {
+		t.Fatalf("ApplyContextOverrides: %v", err)
+	}
+	if eff.APIEndpointDiscovery != config.DiscoveryModeOff || !slices.Contains(applied, discoveryOverrideKey) {
+		t.Errorf("mode = %q, applied = %v, want off from the nested pve map", eff.APIEndpointDiscovery, applied)
+	}
+}
+
+func TestApplyContextOverrides_DiscoveryMode_RefusesWhatTheJobPropertyRefuses(t *testing.T) {
+	t.Parallel()
+	for name, value := range map[string]any{
+		"empty string":   "",
+		"upper case":     "ON",
+		"padded":         " on",
+		"string true":    "true",
+		"string false":   "false",
+		"unknown word":   "sometimes",
+		"integer":        float64(1),
+		"list":           []any{"on"},
+		"object":         map[string]any{"mode": "on"},
+		"nested boolean": []any{true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			eff, _, _, err := config.ApplyContextOverrides(validBaseCfg(), map[string]any{discoveryOverrideKey: value})
+			if err == nil {
+				t.Fatalf("ApplyContextOverrides accepted %#v, got mode %q", value, eff.APIEndpointDiscovery)
+			}
+			if !strings.Contains(err.Error(), discoveryOverrideKey) || !strings.Contains(err.Error(), "api_endpoint_discovery") {
+				t.Errorf("error %q must name the override key and the property", err)
+			}
+		})
+	}
+}
+
+func TestApplyContextOverrides_DiscoveryMode_NullIsUnset(t *testing.T) {
+	t.Parallel()
+	base := validBaseCfg()
+	base.APIEndpointDiscovery = config.DiscoveryModeOff
+
+	t.Run("alone returns the job config", func(t *testing.T) {
+		t.Parallel()
+		eff, applied, unknown, err := config.ApplyContextOverrides(base, map[string]any{discoveryOverrideKey: nil})
+		if err != nil {
+			t.Fatalf("ApplyContextOverrides: %v", err)
+		}
+		if eff != base || applied != nil || unknown != nil {
+			t.Errorf("effective = %p (base %p), applied = %v, unknown = %v, want the job config untouched",
+				eff, base, applied, unknown)
+		}
+	})
+
+	t.Run("beside another key inherits the job's mode", func(t *testing.T) {
+		t.Parallel()
+		extra := map[string]any{discoveryOverrideKey: nil, "pve_vm_storage": "other"}
+		eff, applied, _, err := config.ApplyContextOverrides(base, extra)
+		if err != nil {
+			t.Fatalf("ApplyContextOverrides: %v", err)
+		}
+		if eff.APIEndpointDiscovery != config.DiscoveryModeOff || !slices.Equal(applied, []string{"pve_vm_storage"}) {
+			t.Errorf("mode = %q, applied = %v, want the job's off and only pve_vm_storage applied",
+				eff.APIEndpointDiscovery, applied)
+		}
+		if _, still := extra[discoveryOverrideKey]; !still {
+			t.Error("the caller's map lost its null")
+		}
+	})
+}
+
+func TestApplyContextOverrides_DiscoveryMode_InheritedWhenNotNamed(t *testing.T) {
+	t.Parallel()
+	for _, jobMode := range []config.DiscoveryMode{"", config.DiscoveryModeAuto, config.DiscoveryModeOn, config.DiscoveryModeOff} {
+		t.Run("job "+string(jobMode), func(t *testing.T) {
+			t.Parallel()
+			base := validBaseCfg()
+			base.APIEndpointDiscovery = jobMode
+			eff, applied, _, err := config.ApplyContextOverrides(base, map[string]any{"pve_vm_storage": "other"})
+			if err != nil {
+				t.Fatalf("ApplyContextOverrides: %v", err)
+			}
+			if eff.APIEndpointDiscovery != jobMode {
+				t.Errorf("mode = %q, want the job's %q", eff.APIEndpointDiscovery, jobMode)
+			}
+			if slices.Contains(applied, discoveryOverrideKey) {
+				t.Errorf("applied = %v, must not list a key the entry did not name", applied)
+			}
+		})
+	}
+
+	t.Run("an entry on another endpoint keeps the policy", func(t *testing.T) {
+		t.Parallel()
+		base := credTestTokenJob()
+		base.APIEndpointDiscovery = config.DiscoveryModeOff
+		eff, _, _, err := config.ApplyContextOverrides(base, map[string]any{
+			"pve_host": credTestEntryHost, "pve_api_token": credTestEntryToken, "pve_user": credTestEntryUser,
+		})
+		if err != nil {
+			t.Fatalf("ApplyContextOverrides: %v", err)
+		}
+		if eff.APIEndpointDiscovery != config.DiscoveryModeOff {
+			t.Errorf("mode = %q, want the job's off, because the mode is policy for the whole deployment",
+				eff.APIEndpointDiscovery)
+		}
+	})
+}
+
+func TestApplyContextOverrides_DiscoveryMode_EntryOverridesTheJob(t *testing.T) {
+	t.Parallel()
+	base := credTestTokenJob()
+	base.APIEndpointDiscovery = config.DiscoveryModeOff
+	eff, _, _, err := config.ApplyContextOverrides(base, map[string]any{discoveryOverrideKey: "on"})
+	if err != nil {
+		t.Fatalf("ApplyContextOverrides: %v", err)
+	}
+	if eff.APIEndpointDiscovery != config.DiscoveryModeOn || base.APIEndpointDiscovery != config.DiscoveryModeOff {
+		t.Errorf("effective mode = %q, base mode = %q, want on and off", eff.APIEndpointDiscovery, base.APIEndpointDiscovery)
+	}
+	if mode, _ := config.EffectiveDiscoveryMode(eff); mode != config.DiscoveryModeOn {
+		t.Errorf("EffectiveDiscoveryMode = %q, want on for a token entry that verifies TLS", mode)
+	}
+}
+
+func TestApplyContextOverrides_DiscoveryMode_OnWithPasswordAndNoVerificationFails(t *testing.T) {
+	t.Parallel()
+	// The entry names its own password and user, so the failure comes from the
+	// password rule alone and not from inherited credentials.
+	base := credTestPasswordJob()
+	_, _, _, err := config.ApplyContextOverrides(base, map[string]any{
+		discoveryOverrideKey: "on", "pve_verify_ssl": false,
+		"pve_user": credTestJobUser, "pve_password": credTestJobPassword,
+	})
+	if err == nil {
+		t.Fatal("expected a validation error for on with a password and verify_ssl false")
+	}
+	for _, want := range []string{"effective override config failed validation", "use an API token (pve.api_token)",
+		"turn on verification (pve.verify_ssl: true)"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q is missing %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "looser TLS") {
+		t.Errorf("error %q blames inherited credentials, but the entry named its own", err)
+	}
+	assertNoSecretInError(t, err)
+
+	t.Run("auto with the same entry is accepted", func(t *testing.T) {
+		t.Parallel()
+		eff, _, _, err := config.ApplyContextOverrides(base, map[string]any{
+			discoveryOverrideKey: "auto", "pve_verify_ssl": false,
+			"pve_user": credTestJobUser, "pve_password": credTestJobPassword,
+		})
+		if err != nil {
+			t.Fatalf("ApplyContextOverrides: %v", err)
+		}
+		if mode, _ := config.EffectiveDiscoveryMode(eff); mode != config.DiscoveryModeOff {
+			t.Errorf("EffectiveDiscoveryMode = %q, want off for a password entry", mode)
+		}
+	})
+}
+
+func TestApplyContextOverrides_DiscoveryMode_EndpointCacheDirIsNotAnOverride(t *testing.T) {
+	t.Parallel()
+	base := validBaseCfg()
+	base.EndpointCacheDir = "/var/vcap/store/pve_cpi/jobcache"
+
+	t.Run("flat key beside an applied key lands in unknown", func(t *testing.T) {
+		t.Parallel()
+		eff, applied, unknown, err := config.ApplyContextOverrides(base, map[string]any{
+			"pve_endpoint_cache_dir": "/tmp/entry-cache", "pve_vm_storage": "other",
+		})
+		if err != nil {
+			t.Fatalf("ApplyContextOverrides: %v", err)
+		}
+		if !slices.Equal(unknown, []string{"pve_endpoint_cache_dir"}) || !slices.Equal(applied, []string{"pve_vm_storage"}) {
+			t.Errorf("applied = %v, unknown = %v, want the cache directory reported unknown", applied, unknown)
+		}
+		if eff.EndpointCacheDir != base.EndpointCacheDir {
+			t.Errorf("EndpointCacheDir = %q, want the job's %q", eff.EndpointCacheDir, base.EndpointCacheDir)
+		}
+	})
+
+	t.Run("nested key reports under the flat name", func(t *testing.T) {
+		t.Parallel()
+		eff, applied, unknown, err := config.ApplyContextOverrides(base, map[string]any{
+			"pve": map[string]any{"endpoint_cache_dir": "/tmp/entry-cache", "vm_storage": "other"},
+		})
+		if err != nil {
+			t.Fatalf("ApplyContextOverrides: %v", err)
+		}
+		if !slices.Equal(unknown, []string{"pve_endpoint_cache_dir"}) || !slices.Equal(applied, []string{"pve_vm_storage"}) {
+			t.Errorf("applied = %v, unknown = %v, want the cache directory reported unknown", applied, unknown)
+		}
+		if eff.EndpointCacheDir != base.EndpointCacheDir {
+			t.Errorf("EndpointCacheDir = %q, want the job's %q", eff.EndpointCacheDir, base.EndpointCacheDir)
+		}
+	})
+
+	t.Run("alone returns the job config", func(t *testing.T) {
+		t.Parallel()
+		eff, applied, unknown, err := config.ApplyContextOverrides(base, map[string]any{"pve_endpoint_cache_dir": "/tmp/x"})
+		if err != nil {
+			t.Fatalf("ApplyContextOverrides: %v", err)
+		}
+		if eff != base || applied != nil || !slices.Equal(unknown, []string{"pve_endpoint_cache_dir"}) {
+			t.Errorf("effective = %p (base %p), applied = %v, unknown = %v", eff, base, applied, unknown)
+		}
+	})
+}
+
+// -----------------------------------------------------------------------
+// Looser TLS under inherited credentials
+// -----------------------------------------------------------------------
+
+// looserTLSCase drives one TLS override through ApplyContextOverrides on a
+// token job that verifies TLS with jobCA. It returns the effective config.
+type looserTLSCase struct {
+	name   string
+	extra  map[string]any
+	looser bool
+}
+
+func looserTLSJob(t *testing.T, jobCA string) *config.CPIConfig {
+	t.Helper()
+	base := credTestTokenJob()
+	base.VerifySSL = boolPtr(true)
+	base.PVECACertPEM = jobCA
+	return base
+}
+
+func TestApplyContextOverrides_LooserTLS_EachHandlerSetsTheFlag(t *testing.T) {
+	t.Parallel()
+	jobCA := selfSignedCAPEMForConfigTest(t)
+	otherCA := selfSignedCAPEMForConfigTest(t)
+	if jobCA == otherCA {
+		t.Fatal("test CAs must differ")
+	}
+	cases := []looserTLSCase{
+		{"verify_ssl false", map[string]any{"pve_verify_ssl": false}, true},
+		{"verify_ssl false as a string", map[string]any{"pve_verify_ssl": "false"}, true},
+		{"a different CA", map[string]any{"pve_ca_cert": otherCA}, true},
+		{"the system pool in place of the job's CA", map[string]any{"pve_ca_cert": ""}, true},
+		{"both loosened", map[string]any{"pve_verify_ssl": false, "pve_ca_cert": otherCA}, true},
+		{"verify_ssl true restated", map[string]any{"pve_verify_ssl": true}, false},
+		{"the job's CA restated", map[string]any{"pve_ca_cert": jobCA}, false},
+		{"the job's CA restated with surrounding whitespace", map[string]any{"pve_ca_cert": "\n" + jobCA + "\n"}, false},
+		{"neither TLS key", map[string]any{"pve_vm_storage": "other"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			base := looserTLSJob(t, jobCA)
+			eff, _, _, err := config.ApplyContextOverrides(base, tc.extra)
+			if err != nil {
+				t.Fatalf("ApplyContextOverrides without a mode: %v", err)
+			}
+			if got := eff.InheritedCredsLooserTLS(); got != tc.looser {
+				t.Errorf("InheritedCredsLooserTLS = %v, want %v", got, tc.looser)
+			}
+			if base.InheritedCredsLooserTLS() {
+				t.Error("the job config must never carry the flag")
+			}
+			mode, reason := config.EffectiveDiscoveryMode(eff)
+			if tc.looser && (mode != config.DiscoveryModeOff || reason == "") {
+				t.Errorf("EffectiveDiscoveryMode = %q, %q, want off with a reason for an unset mode", mode, reason)
+			}
+			if !tc.looser && mode != config.DiscoveryModeOn {
+				t.Errorf("EffectiveDiscoveryMode = %q, want on", mode)
+			}
+
+			assertExplicitModesWithTLS(t, base, tc)
+		})
+	}
+}
+
+// assertExplicitModesWithTLS applies each explicit mode beside the case's TLS
+// keys. Only on is refused, and only when the entry is looser than the job.
+func assertExplicitModesWithTLS(t *testing.T, base *config.CPIConfig, tc looserTLSCase) {
+	t.Helper()
+	for _, explicit := range []string{"on", "auto", "off"} {
+		extra := map[string]any{discoveryOverrideKey: explicit}
+		for k, v := range tc.extra {
+			extra[k] = v
+		}
+		eff, _, _, err := config.ApplyContextOverrides(base, extra)
+		if tc.looser && explicit == "on" {
+			if err == nil || !strings.Contains(err.Error(), "looser TLS than the job") ||
+				!strings.Contains(err.Error(), "effective override config failed validation") {
+				t.Errorf("mode %s: error = %v, want the looser TLS validation error", explicit, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("mode %s: unexpected error %v", explicit, err)
+			continue
+		}
+		if eff.APIEndpointDiscovery != config.DiscoveryMode(explicit) || eff.InheritedCredsLooserTLS() != tc.looser {
+			t.Errorf("mode %s: effective mode %q, flag %v, want that mode and flag %v",
+				explicit, eff.APIEndpointDiscovery, eff.InheritedCredsLooserTLS(), tc.looser)
+		}
+	}
+}
+
+func TestApplyContextOverrides_LooserTLS_InheritedOnIsRefused(t *testing.T) {
+	t.Parallel()
+	base := looserTLSJob(t, "")
+	base.APIEndpointDiscovery = config.DiscoveryModeOn
+	_, _, _, err := config.ApplyContextOverrides(base, map[string]any{"pve_verify_ssl": false})
+	if err == nil || !strings.Contains(err.Error(), "looser TLS than the job") {
+		t.Fatalf("error = %v, want the looser TLS refusal, because the entry runs the job's on", err)
+	}
+	assertNoSecretInError(t, err)
+}
+
+func TestApplyContextOverrides_LooserTLS_NotRaisedWhenCredentialsAreNotInherited(t *testing.T) {
+	t.Parallel()
+	jobCA := selfSignedCAPEMForConfigTest(t)
+	otherCA := selfSignedCAPEMForConfigTest(t)
+	own := map[string]any{"pve_user": credTestEntryUser, "pve_api_token": credTestEntryToken}
+	cases := map[string]map[string]any{
+		"the entry names its own token": {"pve_api_token": credTestEntryToken, "pve_verify_ssl": false},
+		"the entry names its own password and a different CA": {"pve_user": credTestEntryUser,
+			"pve_password": credTestEntryPassword, "pve_ca_cert": otherCA},
+		"the entry names a different CA and its own token": {"pve_api_token": credTestEntryToken, "pve_ca_cert": otherCA},
+		"the entry moves to another host": {"pve_host": credTestEntryHost, "pve_verify_ssl": false,
+			"pve_user": own["pve_user"], "pve_api_token": own["pve_api_token"]},
+		"the entry adds an endpoint and names its own credentials": {"pve_endpoints": []any{credTestJobHost, credTestEntryHost},
+			"pve_verify_ssl": false, "pve_user": own["pve_user"], "pve_api_token": own["pve_api_token"]},
+	}
+	for name, extra := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			withMode := map[string]any{discoveryOverrideKey: "on"}
+			for k, v := range extra {
+				withMode[k] = v
+			}
+			eff, _, _, err := config.ApplyContextOverrides(looserTLSJob(t, jobCA), withMode)
+			if err != nil {
+				t.Fatalf("on must be allowed when the entry has its own credentials: %v", err)
+			}
+			if eff.InheritedCredsLooserTLS() {
+				t.Error("InheritedCredsLooserTLS = true, want false for an entry with its own credentials")
+			}
+		})
+	}
+}
+
+func TestApplyContextOverrides_LooserTLS_AJobThatSkipsVerificationHasNothingToLoosen(t *testing.T) {
+	t.Parallel()
+	base := credTestTokenJob()
+	base.VerifySSL = boolPtr(false)
+	for name, extra := range map[string]map[string]any{
+		"verify_ssl false restated": {"pve_verify_ssl": false},
+		"verify_ssl true":           {"pve_verify_ssl": true},
+		"a CA beside no verify":     {"pve_verify_ssl": false, "pve_ca_cert": selfSignedCAPEMForConfigTest(t)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			withMode := map[string]any{discoveryOverrideKey: "on"}
+			for k, v := range extra {
+				withMode[k] = v
+			}
+			eff, _, _, err := config.ApplyContextOverrides(base, withMode)
+			if err != nil {
+				t.Fatalf("ApplyContextOverrides: %v", err)
+			}
+			if eff.InheritedCredsLooserTLS() {
+				t.Error("InheritedCredsLooserTLS = true, want false when the job already skips verification")
+			}
+		})
+	}
+}
+
+func TestApplyContextOverrides_LooserTLS_PasswordJobInheritsToo(t *testing.T) {
+	t.Parallel()
+	base := credTestPasswordJob()
+	eff, _, _, err := config.ApplyContextOverrides(base, map[string]any{"pve_verify_ssl": false})
+	if err != nil {
+		t.Fatalf("ApplyContextOverrides: %v", err)
+	}
+	if !eff.InheritedCredsLooserTLS() {
+		t.Error("InheritedCredsLooserTLS = false, want true for an entry that inherits the job's password")
+	}
+	if _, _, _, err := config.ApplyContextOverrides(base, map[string]any{
+		discoveryOverrideKey: "on", "pve_verify_ssl": false,
+	}); err == nil || !strings.Contains(err.Error(), "looser TLS than the job") {
+		t.Errorf("error = %v, want the looser TLS refusal", err)
+	}
+}

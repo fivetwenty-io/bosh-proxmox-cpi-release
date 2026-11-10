@@ -49,6 +49,10 @@ const contextOverridePrefix = "pve_"
 // settings rather than inherit them (see resetEndpointScopedPolicy and
 // validateSDNContext).
 //
+// pve_api_endpoint_discovery is in scope because the mode is policy an entry
+// may tighten or loosen for its own cluster. The cache directory beside it is
+// not, because one directory holds the files for every entry.
+//
 // Every other pve.* config knob (hooks, otel, disk-performance policy, retry
 // curves, etc.) is process-wide operating policy rather than a property of
 // which cluster a request targets, and is deliberately NOT in this list — it
@@ -70,6 +74,7 @@ var contextOverrideFieldOrder = []string{
 	"pve_network_bridge",
 	"pve_verify_ssl",
 	"pve_ca_cert",
+	"pve_api_endpoint_discovery",
 	"pve_vmid_range_start",
 	"pve_vmid_range_end",
 	"pve_disk_vmid_range_start",
@@ -286,6 +291,23 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 			return err
 		}
 		c.PVECACertPEM = s
+		return nil
+	},
+	// The discovery mode is policy for the whole deployment, so an entry that
+	// does not name it inherits the job's value through the copy. An entry that
+	// does name it takes exactly what pve.api_endpoint_discovery takes. A
+	// directory for the endpoint cache is deliberately not an override key,
+	// because one directory holds the files for every entry. An entry that
+	// carries pve_endpoint_cache_dir lands in the unknown-keys list.
+	// Whether the effective mode may be on for this entry is delegated to the
+	// eff.Validate() call at the end of ApplyContextOverrides, after
+	// markInheritedCredsLooserTLS has recorded what the entry did to TLS.
+	"pve_api_endpoint_discovery": func(c *CPIConfig, v any) error {
+		mode, err := coerceOverrideDiscoveryMode(v)
+		if err != nil {
+			return err
+		}
+		c.APIEndpointDiscovery = mode
 		return nil
 	},
 	"pve_vmid_range_start": func(c *CPIConfig, v any) error {
@@ -784,6 +806,39 @@ func coerceOverrideString(v any) (string, error) {
 	return s, nil
 }
 
+// coerceOverrideDiscoveryMode reads the value of pve_api_endpoint_discovery.
+// It accepts what pve.api_endpoint_discovery accepts, which is a string that
+// is exactly auto, on, or off, or a boolean, where true reads as on and false
+// as off. coerceOverrideString would reject the boolean, and YAML 1.1 reads
+// an unquoted on or off as one. The empty string, any other string, and any
+// other type are refused with the text the job-level property gives, so an
+// operator sees one message wherever the mistake is made. A null never gets
+// here, because ApplyContextOverrides treats it as an unnamed key.
+func coerceOverrideDiscoveryMode(v any) (DiscoveryMode, error) {
+	switch t := v.(type) {
+	case bool:
+		if t {
+			return DiscoveryModeOn, nil
+		}
+		return DiscoveryModeOff, nil
+	case string:
+		mode := DiscoveryMode(t)
+		if !mode.valid() {
+			return "", fmt.Errorf("api_endpoint_discovery must be auto, on, or off, got %q", t)
+		}
+		return mode, nil
+	default:
+		var echo bytes.Buffer
+		enc := json.NewEncoder(&echo)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(v); err != nil {
+			return "", fmt.Errorf("api_endpoint_discovery: expected a string or a boolean, got %T", v)
+		}
+		return "", fmt.Errorf("api_endpoint_discovery: expected a string or a boolean, got %s",
+			boundEcho(strings.TrimSpace(echo.String())))
+	}
+}
+
 // coerceOverrideInt accepts a JSON number (decoded as float64 by
 // encoding/json into `any`) or a numeric string ("8006"), matching the same
 // tolerance the BOSH director's own property rendering can produce depending
@@ -873,16 +928,26 @@ func flattenNestedContextOverrides(extra map[string]any) map[string]any {
 	return merged
 }
 
-// dropNullEndpointList returns extra without a pve_endpoints key whose value
-// is null, so an explicit null counts as unset, the same as leaving the key
-// out. The empty list [] stays, since it names a list with nothing in it.
-// extra is never modified, a copy is made when the key has to go.
-func dropNullEndpointList(extra map[string]any) map[string]any {
-	if v, named := extra["pve_endpoints"]; !named || v != nil {
-		return extra
+// nullMeansUnsetKeys are the override keys for which an explicit null counts
+// as unset, the same as leaving the key out. The endpoint list is one, because
+// a null list is the same as no list. The discovery mode is the other,
+// because a JSON null leaves pve.api_endpoint_discovery unset at job level.
+var nullMeansUnsetKeys = []string{"pve_endpoints", "pve_api_endpoint_discovery"}
+
+// dropNullUnsetKeys returns extra without the nullMeansUnsetKeys keys whose
+// value is null. The empty list [] stays, since it names a list with nothing
+// in it. extra is never modified, a copy is made when a key has to go.
+func dropNullUnsetKeys(extra map[string]any) map[string]any {
+	out := extra
+	for _, key := range nullMeansUnsetKeys {
+		if v, named := extra[key]; !named || v != nil {
+			continue
+		}
+		if len(out) == len(extra) {
+			out = maps.Clone(extra)
+		}
+		delete(out, key)
 	}
-	out := maps.Clone(extra)
-	delete(out, "pve_endpoints")
 	return out
 }
 
@@ -1106,6 +1171,47 @@ func resolveOverrideCredentials(base, eff *CPIConfig, extra map[string]any) erro
 		eff.Host, strings.Join(specNames, " and "), remedy)
 }
 
+// markInheritedCredsLooserTLS records on eff whether the entry inherited the
+// job's credentials while setting looser TLS than the job. The two handlers
+// that can loosen TLS, pve_verify_ssl and pve_ca_cert, cannot decide this on
+// their own, because the answer depends on the entry's final endpoint list
+// and on which credential keys it named, and neither is settled until every
+// handler has run and resolveOverrideCredentials has finished. So this runs
+// right after it, and before eff.Validate(), which rejects the mode on for an
+// entry flagged here. EffectiveDiscoveryMode turns the other modes off.
+//
+// An entry inherits the job's credentials exactly when the whole endpoint
+// list is the job's (see SameEndpointSet) and the entry named no credential
+// key, which is the test OverrideCredentialGroup applies. The TLS settings
+// are looser when the job verifies certificates and the entry either turns
+// verification off or verifies against a different CA than the job's. A job
+// that already skips verification has nothing left to loosen. The CA is
+// compared with surrounding whitespace removed, because a PEM bundle that
+// differs only there is the same trust root.
+//
+// The flag is only ever raised here, so a base that already carries it keeps
+// it in every effective config derived from it.
+func markInheritedCredsLooserTLS(base, eff *CPIConfig, extra map[string]any) {
+	if base.inheritedCredsLooserTLS {
+		eff.inheritedCredsLooserTLS = true
+		return
+	}
+	present := func(key string) bool {
+		_, ok := extra[key]
+		return ok
+	}
+	if !SameEndpointSet(base, eff) || len(overrideCredentialKeysSet(present)) > 0 {
+		return
+	}
+	if !base.VerifySSLValue() {
+		return
+	}
+	if !eff.VerifySSLValue() ||
+		strings.TrimSpace(eff.PVECACertPEM) != strings.TrimSpace(base.PVECACertPEM) {
+		eff.inheritedCredsLooserTLS = true
+	}
+}
+
 // ApplyContextOverrides returns a per-request effective CPIConfig built by
 // overriding select fields of base with the "pve_"-prefixed keys present in
 // extra (the jsonrpc.Context.Extra map decoded from one dispatched JSON-RPC
@@ -1203,7 +1309,7 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 	if len(extra) == 0 {
 		return base, nil, nil, nil
 	}
-	extra = dropNullEndpointList(flattenNestedContextOverrides(extra))
+	extra = dropNullUnsetKeys(flattenNestedContextOverrides(extra))
 	if err := checkRemovedContextKeys(extra); err != nil {
 		return nil, nil, nil, err
 	}
@@ -1249,6 +1355,7 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 		if credErr := resolveOverrideCredentials(base, &eff, extra); credErr != nil {
 			return nil, nil, nil, credErr
 		}
+		markInheritedCredsLooserTLS(base, &eff, extra)
 		resetEndpointScopedPolicy(base, &eff, extra)
 		reapplySDNVNIRangeDefaults(base, &eff, extra)
 	}
