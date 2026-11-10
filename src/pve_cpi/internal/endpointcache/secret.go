@@ -9,72 +9,54 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/privatefile"
 )
 
 const (
-	// cacheLabel prefixes the fixed error texts of the private-file helpers.
-	cacheLabel = "endpoint cache"
-
 	// secretFile holds the directory secret, and secretLockFile serializes its
-	// creation. The sweep never removes either.
+	// creation and replacement. The sweep never removes either.
 	secretFile     = "secret"
 	secretLockFile = "secret.lock"
 	// secretBytes is the exact length of the directory secret.
 	secretBytes = 32
 	// secretLockWait bounds how long a process waits for another process that
-	// is creating the secret. Creating it is one small write, so the wait runs
-	// out only on a badly stalled filesystem, and the process then runs
-	// without a cache rather than delaying the call.
+	// is creating or replacing the secret. Writing it is one small write, so
+	// the wait runs out only on a badly stalled filesystem, and the process
+	// then runs without a cache rather than delaying the call.
 	secretLockWait = time.Second
 
 	// redactedMarker is what every formatting of key material prints.
 	redactedMarker = "[redacted]"
 )
 
-// The unsafe path causes carry this package's wording and match the
-// privatefile causes under errors.Is.
-var (
-	errCacheOwnership = privatefile.Sentinel("endpoint cache: unsafe ownership", privatefile.ErrUnsafeOwnership)
-	errCacheMode      = privatefile.Sentinel("endpoint cache: unsafe permissions", privatefile.ErrUnsafeMode)
-	errCacheFileType  = privatefile.Sentinel("endpoint cache: unsafe file type", privatefile.ErrUnsafeFileType)
-)
-
-// ErrSecretInvalid means the directory secret exists but is not exactly 32
-// bytes long. The secret is never regenerated over a bad one, because a
-// replaced secret would silently orphan every file and hide the damage, so the
-// cache stays unusable until an operator removes the directory.
-var ErrSecretInvalid = privatefile.Sentinel("endpoint cache: invalid directory secret", privatefile.ErrCorrupt)
+// errSecretLength means the directory secret passed the private-file checks
+// but is not exactly 32 bytes long. loadSecret replaces such a secret, so the
+// error never leaves this package.
+var errSecretLength = privatefile.Sentinel("endpoint cache: directory secret has the wrong length",
+	privatefile.ErrCorrupt)
 
 // ErrSecretBusy means another process held secret.lock for longer than the
 // bounded wait. Nothing was created, and the caller runs without a cache.
 var ErrSecretBusy = errors.New("endpoint cache: directory secret lock is busy")
 
-// ErrLockWaitAbandoned means the caller's context ended while a cache lock
-// wait was running. The returned error also wraps the context's own error.
-var ErrLockWaitAbandoned = errors.New("endpoint cache: lock wait ended with the caller's context")
-
-// cachePrivatePolicy carries this package's label and unsafe path causes. It
-// opens directories and lock files, and the secret and cache file policies
-// extend it with their size limits and checks.
-var cachePrivatePolicy = privatefile.Policy{
-	Label:     cacheLabel,
-	Ownership: errCacheOwnership,
-	Mode:      errCacheMode,
-	FileType:  errCacheFileType,
-}
-
 // secretPolicy reads and writes the directory secret. Its size limit is the
 // exact secret length, so WriteFile refuses anything longer and ReadFile
-// refuses an oversized secret as ErrSecretInvalid.
+// refuses an oversized secret as errSecretLength.
 var secretPolicy = func() privatefile.Policy {
 	p := cachePrivatePolicy
-	p.Corrupt = ErrSecretInvalid
+	p.Corrupt = errSecretLength
 	p.MaxBytes = secretBytes
 	return p
 }()
+
+// secretOps are the steps the secret is written with. They are the durable
+// ones, unlike the cache files'. A torn cache file is rebuilt by the next
+// discovery, but every file name comes from the secret, so a crash right after
+// an unsynced rename would orphan every file each time it happened.
+var secretOps = privatefile.DefaultOps()
 
 // keyMaterial holds secret bytes: the directory secret or a key derived from
 // it. Every way fmt, slog, or a text encoder can print it prints "[redacted]",
@@ -96,92 +78,99 @@ func (keyMaterial) LogValue() slog.Value { return slog.StringValue(redactedMarke
 // MarshalText returns the redaction marker.
 func (keyMaterial) MarshalText() ([]byte, error) { return []byte(redactedMarker), nil }
 
-// loadSecret returns the directory secret of r, creating it when it is
-// missing. The first process that finds it missing creates it under an
-// exclusive lock on secret.lock, through the private temporary file and
-// rename, and every other process reads it. created reports whether this call
-// wrote it. A secret that exists but fails the private-file checks or the
-// length check is returned as an error and never replaced.
-func loadSecret(ctx context.Context, r *os.Root, wait time.Duration) (secret keyMaterial, created bool, err error) {
-	secret, err = readSecret(r)
-	if !errors.Is(err, fs.ErrNotExist) {
-		return secret, false, err
+// secretOutcome says what loadSecret did to the secret file.
+type secretOutcome int
+
+const (
+	// secretRead means the secret was already there and valid.
+	secretRead secretOutcome = iota
+	// secretCreated means the secret was missing and this call wrote it.
+	secretCreated
+	// secretReplaced means the secret had the wrong length and this call
+	// replaced it.
+	secretReplaced
+)
+
+// loadSecret returns the directory secret of r. When the secret is missing,
+// or passes the private-file checks with the wrong length, the first process
+// to see that takes an exclusive lock on secret.lock, reads the secret again,
+// and writes 32 new bytes through the private temporary file and rename with
+// ops, while every other process reads what it wrote. Replacing a short or
+// long secret orphans every cache file in the directory, which costs one
+// discovery, while refusing it would turn the cache off for good, and anyone
+// who can write the directory could already delete the secret instead.
+//
+// A secret with the wrong owner, mode, type, or link count is never replaced,
+// because someone else may control it. Its error names the secret's path, and
+// removing that file brings the cache back.
+func loadSecret(ctx context.Context, r *os.Root, wait time.Duration, ops privatefile.Ops) (
+	keyMaterial, secretOutcome, error,
+) {
+	secret, err := readSecret(r)
+	if err == nil || !replaceable(err) {
+		return secret, secretRead, err
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
-	lock, err := waitCreatedLock(waitCtx, r, secretLockFile)
+	lock, err := waitHeldLock(waitCtx, r, secretLockFile)
 	if err != nil {
-		return nil, false, lockWaitError(ctx, err, ErrSecretBusy)
+		return nil, secretRead, lockWaitError(ctx, err, ErrSecretBusy)
 	}
-	defer func() {
-		if closeErr := lock.Close(); closeErr != nil {
-			secret, created = nil, false
-			err = errors.Join(err, fmt.Errorf("endpoint cache: release directory secret lock: %w", closeErr))
-		}
-	}()
-	// Another process may have created the secret while this one waited.
-	secret, err = readSecret(r)
-	if !errors.Is(err, fs.ErrNotExist) {
-		return secret, false, err
+	secret, outcome, err := writeSecretLocked(r, ops)
+	if closeErr := lock.Close(); closeErr != nil {
+		clear(secret)
+		return nil, secretRead, errors.Join(err, fmt.Errorf("%s: release directory secret lock: %w", cacheLabel, closeErr))
+	}
+	return secret, outcome, err
+}
+
+// writeSecretLocked reads the secret again under secret.lock, because another
+// process may have written it while this one waited, and writes a new one
+// when it is still missing or the wrong length.
+func writeSecretLocked(r *os.Root, ops privatefile.Ops) (keyMaterial, secretOutcome, error) {
+	secret, err := readSecret(r)
+	if err == nil || !replaceable(err) {
+		return secret, secretRead, err
+	}
+	outcome := secretCreated
+	if errors.Is(err, errSecretLength) {
+		outcome = secretReplaced
 	}
 	secret = make(keyMaterial, secretBytes)
 	if _, err := rand.Read(secret); err != nil {
-		return nil, false, fmt.Errorf("endpoint cache: generate directory secret: %w", err)
+		return nil, secretRead, fmt.Errorf("%s: generate directory secret: %w", cacheLabel, err)
 	}
-	// The secret is written durably, unlike the cache files. A torn cache file
-	// is rebuilt by the next discovery, but a torn secret is never replaced, so
-	// a crash right after an unsynced rename would disable the cache for good.
-	if err := secretPolicy.WriteFile(r, secretFile, secret, privatefile.DefaultOps()); err != nil {
-		return nil, false, fmt.Errorf("endpoint cache: create directory secret: %w", err)
+	if err := secretPolicy.WriteFile(r, secretFile, secret, ops); err != nil {
+		clear(secret)
+		return nil, secretRead, fmt.Errorf("%s: write directory secret %s: %w", cacheLabel, secretPath(r), err)
 	}
-	return secret, true, nil
+	return secret, outcome, nil
+}
+
+// replaceable reports whether a readSecret error leaves the secret to be
+// written, because it is missing or its only fault is its length.
+func replaceable(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, errSecretLength)
 }
 
 // readSecret reads the directory secret through the private-file checks, which
 // refuse another owner, group or other access, a file that is not regular,
 // a symlink, and a second link. An absent secret comes back as an error that
-// matches fs.ErrNotExist.
+// matches fs.ErrNotExist, and a secret of the wrong length as one that matches
+// errSecretLength. Every other error names the secret's path.
 func readSecret(r *os.Root) (keyMaterial, error) {
 	data, err := secretPolicy.ReadFile(r, secretFile, secretBytes)
-	if err != nil {
+	switch {
+	case err == nil && len(data) != secretBytes:
+		return nil, fmt.Errorf("%w: %d bytes, want %d", errSecretLength, len(data), secretBytes)
+	case err == nil:
+		return keyMaterial(data), nil
+	case replaceable(err):
 		return nil, err
 	}
-	if len(data) != secretBytes {
-		return nil, fmt.Errorf("%w: %d bytes, want %d", ErrSecretInvalid, len(data), secretBytes)
-	}
-	return keyMaterial(data), nil
+	return nil, fmt.Errorf("%s: refusing directory secret %s: %w", cacheLabel, secretPath(r), err)
 }
 
-// waitCreatedLock waits for the lock file name, which whichever process first
-// needs it creates, so several processes can race to create it. macOS can fail
-// the loser's O_CREATE open with ENOENT while the winner's create is in
-// flight, and the file exists a moment later, so that error is retried a few
-// times within the same deadline. A directory that is really gone keeps
-// failing and the error is returned.
-func waitCreatedLock(ctx context.Context, r *os.Root, name string) (*privatefile.Lock, error) {
-	const createRaceRetries = 5
-	for attempt := 0; ; attempt++ {
-		lock, err := cachePrivatePolicy.WaitLock(ctx, r, name)
-		if !errors.Is(err, fs.ErrNotExist) || attempt == createRaceRetries {
-			return lock, err
-		}
-		if err := privatefile.Pause(ctx); err != nil {
-			return nil, err
-		}
-	}
-}
-
-// lockWaitError classifies an error from a bounded lock wait. A wait that ended
-// because the caller's own context ended reports ErrLockWaitAbandoned with the
-// context's error, a wait that ran out its own bound reports busy, and any
-// other error, such as an unsafe lock file, is returned as it is.
-func lockWaitError(parent context.Context, err, busy error) error {
-	waitEnded := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-	switch parentErr := parent.Err(); {
-	case waitEnded && parentErr != nil:
-		return fmt.Errorf("%w: %w", ErrLockWaitAbandoned, parentErr)
-	case waitEnded:
-		return busy
-	}
-	return err
-}
+// secretPath is the secret's full path, which is not sensitive and tells an
+// operator which file to remove.
+func secretPath(r *os.Root) string { return filepath.Join(r.Name(), secretFile) }

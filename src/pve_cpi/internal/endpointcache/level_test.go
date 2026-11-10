@@ -1,16 +1,22 @@
 package endpointcache
 
 import (
+	"log/slog"
 	"testing"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 func TestLevelFollowsTheConfiguredMode(t *testing.T) {
-	if got := Level(false); got != log.LevelDebug {
-		t.Errorf("Level under auto = %v, want Debug", got)
-	}
-	if got := Level(true); got != log.LevelWarn {
-		t.Errorf("Level under an explicit on = %v, want Warn", got)
+	for mode, want := range map[config.DiscoveryMode]slog.Level{
+		config.DiscoveryModeAuto: log.LevelDebug,
+		config.DiscoveryModeOff:  log.LevelDebug,
+		"":                       log.LevelDebug,
+		config.DiscoveryModeOn:   log.LevelWarn,
+	} {
+		if got := Level(mode); got != want {
+			t.Errorf("Level(%q) = %v, want %v", mode, got, want)
+		}
 	}
 }

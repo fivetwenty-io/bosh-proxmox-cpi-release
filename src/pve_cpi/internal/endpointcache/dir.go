@@ -27,11 +27,6 @@ const (
 // effective user ID is appended.
 const temporaryName = "pve_cpi-endpoint-cache."
 
-// directoryPolicy supplies the owner, mode, file type, and symlink checks for
-// the cache directory. It never reads or writes an envelope, so it names no
-// size limit or integrity function.
-var directoryPolicy = privatefile.Policy{Label: "endpoint cache"}
-
 // Options carries what the layers need to choose a directory.
 type Options struct {
 	// Override is the value of pve.endpoint_cache_dir, empty when it is unset.
@@ -61,7 +56,8 @@ func (r *Refusal) Unwrap() error { return r.Err }
 // which layer applied and the directory it named. Root is the opened private
 // directory, or nil when the layer refused it, in which case Err holds the
 // reason and there is no cache for this process. A caller that gets a nil Root
-// does not try another layer.
+// does not try another layer. A caller hands Root to OpenStore, which owns it
+// from then on, and closes the Store instead of the Choice.
 type Choice struct {
 	Layer Layer
 	Path  string
@@ -138,9 +134,9 @@ func overrideLayer(opts Options) (Choice, bool) {
 		// No inode was examined, so the owner is unknown.
 		choice.Err = &Refusal{Layer: LayerOverride, Path: opts.Override, Err: &unsafeDirectory{
 			unsafe: &privatefile.UnsafePathError{
-				Path: opts.Override, UID: -1, EUID: os.Geteuid(), WantDirectory: true, Cause: privatefile.ErrUnsafeFileType,
+				Path: opts.Override, UID: -1, EUID: os.Geteuid(), WantDirectory: true, Cause: errCacheFileType,
 			},
-			text: fmt.Sprintf("%v: %s is not a clean path", privatefile.ErrUnsafeFileType, opts.Override),
+			text: fmt.Sprintf("%v: %s is not a clean path", errCacheFileType, opts.Override),
 		}}
 		return choice, true
 	}
@@ -190,7 +186,7 @@ func secureCreated(path string) error {
 	if err != nil {
 		return err
 	}
-	if err := directoryPolicy.PrivateInfo(path, info, true); err != nil {
+	if err := cachePrivatePolicy.PrivateInfo(path, info, true); err != nil {
 		return err
 	}
 	return os.Chmod(path, 0o700) // #nosec G302 -- a directory needs owner search; this is the private mode, not a widening
@@ -205,7 +201,7 @@ func open(choice Choice) Choice {
 		choice.Err = &Refusal{Layer: choice.Layer, Path: choice.Path, Err: err}
 		return choice
 	}
-	root, err := directoryPolicy.OpenRoot(choice.Path)
+	root, err := cachePrivatePolicy.OpenRoot(choice.Path)
 	if err != nil {
 		choice.Err = &Refusal{Layer: choice.Layer, Path: choice.Path, Err: err}
 		return choice
@@ -222,17 +218,39 @@ func requireOwnerAccess(path string) error {
 		return nil
 	}
 	info, err := os.Lstat(path)
-	if err != nil || !info.IsDir() || directoryPolicy.PrivateInfo(path, info, true) != nil {
+	if err != nil || !info.IsDir() || cachePrivatePolicy.PrivateInfo(path, info, true) != nil {
 		return nil
 	}
+	return ownerAccess(path, info)
+}
+
+// ownerAccess refuses a directory whose owner lacks read, write, or search
+// access, because the owner could not use it and the operating system would
+// only say permission denied.
+func ownerAccess(path string, info os.FileInfo) error {
 	if info.Mode().Perm()&0o700 == 0o700 {
 		return nil
 	}
 	return &unsafeDirectory{
 		unsafe: &privatefile.UnsafePathError{
-			Path: path, UID: os.Geteuid(), EUID: os.Geteuid(), Mode: info.Mode(), WantDirectory: true, Cause: privatefile.ErrUnsafeMode,
+			Path: path, UID: os.Geteuid(), EUID: os.Geteuid(), Mode: info.Mode(), WantDirectory: true, Cause: errCacheMode,
 		},
 		text: fmt.Sprintf("%v: %s has mode %04o and its owner needs read, write, and search access",
-			privatefile.ErrUnsafeMode, path, info.Mode().Perm()),
+			errCacheMode, path, info.Mode().Perm()),
 	}
+}
+
+// checkOpenedDirectory applies the checks open makes to the directory r has
+// open, reading it through r rather than by path, so a root opened some
+// other way meets the same refusals and a rename of the path cannot change
+// what is checked.
+func checkOpenedDirectory(r *os.Root) error {
+	info, err := r.Stat(".")
+	if err != nil {
+		return err
+	}
+	if err := cachePrivatePolicy.PrivateInfo(r.Name(), info, true); err != nil {
+		return err
+	}
+	return ownerAccess(r.Name(), info)
 }

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/privatefile"
 )
@@ -88,7 +89,7 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 
 	// A second store on the same directory and credential reads the file.
-	other, err := OpenStore(context.Background(), dir, storeTestConfig(), storeTestCredential, StoreOptions{})
+	other, err := openStoreOn(t, dir, storeTestCredential, StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,7 +376,7 @@ func TestStoreRefusesAnUnsafeLockFile(t *testing.T) {
 // Without root it shows the refusal on a directory another user owns.
 func TestStoreRefusesAnotherOwner(t *testing.T) {
 	if os.Geteuid() != 0 {
-		_, err := OpenStore(context.Background(), "/", storeTestConfig(), storeTestCredential, StoreOptions{})
+		_, err := OpenStore(context.Background(), openSystemRoot(t), storeTestConfig(), storeTestCredential, StoreOptions{})
 		if !errors.Is(err, privatefile.ErrUnsafeOwnership) {
 			t.Fatalf("OpenStore on a directory another user owns: %v, want the ownership refusal", err)
 		}
@@ -425,16 +426,16 @@ func TestStoreRefusesAnOversizedFile(t *testing.T) {
 
 // TestStoreSkipsTheWriteWhileAnotherProcessHoldsTheLock holds the key's lock
 // in a child process. The write is skipped with a Debug line under auto and a
-// Warn line under an explicit "on", and goes through once the lock is free.
+// Warn line under a configured "on", and goes through once the lock is free.
 func TestStoreSkipsTheWriteWhileAnotherProcessHoldsTheLock(t *testing.T) {
 	for _, tc := range []struct {
-		explicitOn bool
-		level      string
-	}{{false, "DEBUG"}, {true, "WARN"}} {
+		mode  config.DiscoveryMode
+		level string
+	}{{config.DiscoveryModeAuto, "DEBUG"}, {config.DiscoveryModeOn, "WARN"}} {
 		t.Run(tc.level, func(t *testing.T) {
 			dir := newStoreDir(t)
 			logger, observed := log.NewObservedLogger(log.LevelDebug)
-			s := openTestStore(t, dir, storeTestCredential, StoreOptions{Logger: logger, ExplicitOn: tc.explicitOn})
+			s := openTestStore(t, dir, storeTestCredential, StoreOptions{Logger: logger, ConfiguredMode: tc.mode})
 			s.lockWait = 150 * time.Millisecond
 			holder := startStoreChild(t, storeChildLock, dir, storeChildLockEnv+"="+s.Key().LockName())
 			if got := holder.line(t); got != "locked" {
@@ -580,18 +581,17 @@ func TestFileNameDiffersAcrossDirectories(t *testing.T) {
 }
 
 func TestOpenStoreRefusals(t *testing.T) {
-	t.Run("relative directory", func(t *testing.T) {
-		if _, err := OpenStore(context.Background(), "cache", storeTestConfig(), storeTestCredential, StoreOptions{}); err == nil {
-			t.Fatal("OpenStore accepted a relative directory")
+	// requireClosed checks that OpenStore closed a root it refused, since the
+	// store owns the root from the call on.
+	requireClosed := func(t *testing.T, root *os.Root) {
+		t.Helper()
+		if _, err := root.Stat("."); err == nil {
+			t.Error("OpenStore left a refused root open")
 		}
-	})
-	t.Run("missing directory", func(t *testing.T) {
-		dir := filepath.Join(t.TempDir(), "absent")
-		if _, err := OpenStore(context.Background(), dir, storeTestConfig(), storeTestCredential, StoreOptions{}); !errors.Is(err, fs.ErrNotExist) {
-			t.Fatalf("OpenStore: %v, want fs.ErrNotExist", err)
-		}
-		if _, err := os.Lstat(dir); !errors.Is(err, fs.ErrNotExist) {
-			t.Error("OpenStore created the directory")
+	}
+	t.Run("no root", func(t *testing.T) {
+		if _, err := OpenStore(context.Background(), nil, storeTestConfig(), storeTestCredential, StoreOptions{}); err == nil {
+			t.Fatal("OpenStore accepted a nil root")
 		}
 	})
 	t.Run("open directory", func(t *testing.T) {
@@ -599,36 +599,327 @@ func TestOpenStoreRefusals(t *testing.T) {
 		if err := os.Chmod(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := OpenStore(context.Background(), dir, storeTestConfig(), storeTestCredential, StoreOptions{}); !errors.Is(err, privatefile.ErrUnsafeMode) {
-			t.Fatalf("OpenStore: %v, want the mode refusal", err)
-		}
-	})
-	t.Run("symlinked directory", func(t *testing.T) {
-		dir := newStoreDir(t)
-		link := filepath.Join(t.TempDir(), "link")
-		if err := os.Symlink(dir, link); err != nil {
+		root, err := os.OpenRoot(dir)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := OpenStore(context.Background(), link, storeTestConfig(), storeTestCredential, StoreOptions{}); err == nil {
-			t.Fatal("OpenStore accepted a symlinked directory")
+		_, err = OpenStore(context.Background(), root, storeTestConfig(), storeTestCredential, StoreOptions{})
+		if !errors.Is(err, privatefile.ErrUnsafeMode) || !errors.Is(err, errCacheMode) {
+			t.Fatalf("OpenStore: %v, want the mode refusal in the cache's wording", err)
 		}
+		requireClosed(t, root)
+		if got := storeDirNames(t, dir); len(got) != 0 {
+			t.Errorf("a refused directory gained %v", got)
+		}
+	})
+	t.Run("owner without write access", func(t *testing.T) {
+		dir := newStoreDir(t)
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		_, err = OpenStore(context.Background(), root, storeTestConfig(), storeTestCredential, StoreOptions{})
+		var unsafe *privatefile.UnsafePathError
+		if !errors.As(err, &unsafe) || !errors.Is(err, privatefile.ErrUnsafeMode) ||
+			!strings.Contains(err.Error(), "owner needs read, write, and search access") {
+			t.Fatalf("OpenStore: %v, want the owner access refusal", err)
+		}
+		requireClosed(t, root)
 	})
 	for name, tc := range map[string]struct {
 		cfg        KeyConfig
 		credential string
 	}{
 		"no credential":    {storeTestConfig(), ""},
-		"no endpoints":     {KeyConfig{}, storeTestCredential},
-		"endpoint no port": {KeyConfig{Endpoints: []string{"pve1.example.com"}}, storeTestCredential},
+		"no user":          {KeyConfig{Endpoints: storeTestConfig().Endpoints}, storeTestCredential},
+		"no endpoints":     {KeyConfig{User: storeTestUser}, storeTestCredential},
+		"endpoint no port": {KeyConfig{Endpoints: []string{"pve1.example.com"}, User: storeTestUser}, storeTestCredential},
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := newStoreDir(t)
-			if _, err := OpenStore(context.Background(), dir, tc.cfg, tc.credential, StoreOptions{}); !errors.Is(err, ErrInvalidKey) {
+			root := storeTestRoot(t, dir)
+			if _, err := OpenStore(context.Background(), root, tc.cfg, tc.credential, StoreOptions{}); !errors.Is(err, ErrInvalidKey) {
 				t.Fatalf("OpenStore: %v, want ErrInvalidKey", err)
 			}
+			requireClosed(t, root)
 			if got := storeDirNames(t, dir); len(got) != 0 {
 				t.Errorf("a refused key created %v", got)
 			}
 		})
+	}
+}
+
+// TestStoreKeepsItsDirectoryAfterARename renames the cache directory after
+// OpenStore and puts a new private directory at the old path. The store keeps
+// reading and writing the directory it opened.
+func TestStoreKeepsItsDirectoryAfterARename(t *testing.T) {
+	dir := newStoreDir(t)
+	s := openTestStore(t, dir, storeTestCredential, StoreOptions{})
+	storePut(t, s, "before")
+	moved := dir + ".moved"
+	if err := os.Rename(dir, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	storePut(t, s, "after")
+	if got := storeDirNames(t, dir); len(got) != 0 {
+		t.Fatalf("the new directory at the old path gained %v", got)
+	}
+	var got storeTestPayload
+	if err := s.Read(&got); err != nil || got.Note != "after" {
+		t.Fatalf("Read after the rename: %+v, %v", got, err)
+	}
+	reopened := openTestStore(t, moved, storeTestCredential, StoreOptions{})
+	if err := reopened.Read(&got); err != nil || got.Note != "after" {
+		t.Fatalf("Read in the moved directory: %+v, %v, want the write made after the rename", got, err)
+	}
+	if path, _ := s.SecretReplaced(); path != "" {
+		t.Errorf("SecretReplaced named %q for a secret that was created, not replaced", path)
+	}
+}
+
+// TestStoreRefusesAFileMovedFromAnotherKey moves a file between two keys that
+// share the credential and the directory. The HMAC key depends on the key
+// digest, so the moved file fails its HMAC before the key check runs, even
+// with its payload's key rewritten.
+func TestStoreRefusesAFileMovedFromAnotherKey(t *testing.T) {
+	dir := newStoreDir(t)
+	a := openTestStore(t, dir, storeTestCredential, StoreOptions{})
+	cfg := storeTestConfig()
+	cfg.Endpoints = []string{"pve9.elsewhere.example.com:8006"}
+	b, err := OpenStore(context.Background(), storeTestRoot(t, dir), cfg, storeTestCredential, StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	storePut(t, a, "from a")
+	moved := readStoreFile(t, filepath.Join(dir, a.FileName()))
+	writeStoreFile(t, filepath.Join(dir, b.FileName()), moved, 0o600)
+	var got storeTestPayload
+	if err := b.Read(&got); !errors.Is(err, ErrFileInvalid) || errors.Is(err, ErrKeyMismatch) {
+		t.Fatalf("Read of a moved file: %v, want the HMAC refusal", err)
+	}
+	env := readEnvelopeFile(t, filepath.Join(dir, b.FileName()))
+	var payload storeTestPayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	payload.Key = b.Key()
+	env.Payload, _ = json.Marshal(payload)
+	writeEnvelopeFile(t, filepath.Join(dir, b.FileName()), env)
+	if err := b.Read(&got); !errors.Is(err, ErrFileInvalid) || errors.Is(err, ErrKeyMismatch) {
+		t.Fatalf("Read of a moved file with its key rewritten: %v, want the HMAC refusal", err)
+	}
+}
+
+// TestStoreRefusesAFileSignedForAnotherVersion signs a file with the HMAC key
+// for the next schema version and labels it with the current one. The
+// version is part of the key's derivation, so the relabeled file fails.
+func TestStoreRefusesAFileSignedForAnotherVersion(t *testing.T) {
+	dir := newStoreDir(t)
+	s := openTestStore(t, dir, storeTestCredential, StoreOptions{})
+	secret := keyMaterial(readStoreFile(t, filepath.Join(dir, secretFile)))
+	key, current, err := deriveKeysAt(storeTestConfig(), secret, storeTestCredential, fileVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextKey, next, err := deriveKeysAt(storeTestConfig(), secret, storeTestCredential, fileVersion+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !nextKey.Equal(key) || bytes.Equal(next, current) {
+		t.Fatal("another version derived the same HMAC key, or a different file key")
+	}
+	other := s.policy
+	other.Integrity = hmacIntegrity(next)
+	if err := other.WriteEnvelope(s.root, s.name, fileVersion, storeTestPayload{Key: s.Key(), Note: "v2"}, s.ops); err != nil {
+		t.Fatal(err)
+	}
+	var got storeTestPayload
+	if err := s.Read(&got); !errors.Is(err, ErrFileInvalid) || got.Note != "" {
+		t.Fatalf("Read of a file signed for another version: %+v, %v, want ErrFileInvalid", got, err)
+	}
+}
+
+// TestLocksUpdateTheirTimes ages the key's lock file and its discover lock
+// file by 40 days, then takes each lock. Taking it brings the times to now, so
+// a lock in use never looks abandoned.
+func TestLocksUpdateTheirTimes(t *testing.T) {
+	dir := newStoreDir(t)
+	s := openTestStore(t, dir, storeTestCredential, StoreOptions{})
+	old := time.Now().Add(-40 * 24 * time.Hour)
+	age := func(name string) {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
+			writeStoreFile(t, path, nil, 0o600)
+		}
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	requireFresh := func(name string) {
+		t.Helper()
+		info, err := os.Lstat(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if since := time.Since(info.ModTime()); since > time.Minute {
+			t.Errorf("%s was modified %v ago after it was locked, want now", name, since)
+		}
+	}
+	age(s.Key().LockName())
+	storePut(t, s, "touch")
+	requireFresh(s.Key().LockName())
+
+	age(s.Key().DiscoverLockName())
+	lock, held, err := s.TryLockDiscovery(context.Background())
+	if err != nil || !held {
+		t.Fatalf("TryLockDiscovery: held %v, err %v", held, err)
+	}
+	requireFresh(s.Key().DiscoverLockName())
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestDiscoveryLockIsExclusiveAcrossProcesses holds the discover lock in a
+// child process. TryLockDiscovery reports it held elsewhere without waiting,
+// and takes it once the child lets go.
+func TestDiscoveryLockIsExclusiveAcrossProcesses(t *testing.T) {
+	dir := newStoreDir(t)
+	s := openTestStore(t, dir, storeTestCredential, StoreOptions{})
+	holder := startStoreChild(t, storeChildLock, dir, storeChildLockEnv+"="+s.Key().DiscoverLockName())
+	if got := holder.line(t); got != "locked" {
+		t.Fatalf("child said %q, want locked", got)
+	}
+	start := time.Now()
+	if lock, held, err := s.TryLockDiscovery(context.Background()); err != nil || held || lock != nil {
+		t.Fatalf("TryLockDiscovery under a held lock: %v, %v, %v", lock, held, err)
+	}
+	if waited := time.Since(start); waited > 500*time.Millisecond {
+		t.Errorf("TryLockDiscovery waited %v for a held lock", waited)
+	}
+	holder.finish(t)
+	lock, held, err := s.TryLockDiscovery(context.Background())
+	if err != nil || !held {
+		t.Fatalf("TryLockDiscovery after release: held %v, err %v", held, err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeStoreFile(t, filepath.Join(dir, s.Key().DiscoverLockName()), nil, 0o644)
+	if _, _, err := s.TryLockDiscovery(context.Background()); !errors.Is(err, privatefile.ErrUnsafeMode) {
+		t.Fatalf("TryLockDiscovery on an open lock file: %v, want the mode refusal", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.TryLockDiscovery(context.Background()); err == nil {
+		t.Error("TryLockDiscovery on a closed store succeeded")
+	}
+}
+
+// replaceLockFile removes the lock file and creates a new one at the name, the
+// way a sweep and a second process could while the lock is held.
+func replaceLockFile(t *testing.T, dir, name string) {
+	t.Helper()
+	if err := os.Remove(filepath.Join(dir, name)); err != nil {
+		t.Fatal(err)
+	}
+	writeStoreFile(t, filepath.Join(dir, name), nil, 0o600)
+}
+
+// tryLockThen takes the lock with TryLock and runs after on each lock it
+// holds, counting the takes.
+func tryLockThen(root *os.Root, name string, takes *int, after func(*privatefile.Lock)) func() (*privatefile.Lock, bool, error) {
+	return func() (*privatefile.Lock, bool, error) {
+		*takes++
+		lock, held, err := cachePrivatePolicy.TryLock(root, name)
+		if held {
+			after(lock)
+		}
+		return lock, held, err
+	}
+}
+
+// TestHeldLockRetakesALockFileReplacedWhileHeld removes or replaces the lock
+// file after the lock on it is taken. A lock on an inode the name no longer
+// reaches is never kept.
+func TestHeldLockRetakesALockFileReplacedWhileHeld(t *testing.T) {
+	const name = "k.lock"
+	for _, tc := range []struct {
+		name   string
+		change func(t *testing.T, dir string)
+	}{
+		{"replaced once", func(t *testing.T, dir string) { replaceLockFile(t, dir, name) }},
+		{"removed", func(t *testing.T, dir string) {
+			if err := os.Remove(filepath.Join(dir, name)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := newStoreDir(t)
+			root := openStoreRoot(t, dir)
+			takes := 0
+			lock, held, err := heldLock(root, name, tryLockThen(root, name, &takes, func(*privatefile.Lock) {
+				if takes == 1 {
+					tc.change(t, dir)
+				}
+			}))
+			if err != nil || !held || takes != 2 {
+				t.Fatalf("heldLock: held %v, err %v after %d takes, want the lock on the second", held, err, takes)
+			}
+			defer func() { _ = lock.Close() }()
+			locked, err := lock.File.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			named, err := os.Lstat(filepath.Join(dir, name))
+			if err != nil || !os.SameFile(locked, named) {
+				t.Fatalf("the kept lock is not on the file the name reaches: %v", err)
+			}
+			// The inode the name reaches is the one locked, so a second taker is refused.
+			if _, held, err := cachePrivatePolicy.TryLock(root, name); err != nil || held {
+				t.Fatalf("a second TryLock: held %v, err %v, want the lock busy", held, err)
+			}
+		})
+	}
+}
+
+// TestHeldLockGivesUpOnALockFileThatKeepsChanging replaces the lock file every
+// time the lock is taken. heldLock releases each lock and stops with
+// ErrLockReplaced once its retries run out.
+func TestHeldLockGivesUpOnALockFileThatKeepsChanging(t *testing.T) {
+	const name = "k.lock"
+	dir := newStoreDir(t)
+	root := openStoreRoot(t, dir)
+	takes := 0
+	var taken []*privatefile.Lock
+	lock, held, err := heldLock(root, name, tryLockThen(root, name, &takes, func(l *privatefile.Lock) {
+		taken = append(taken, l)
+		replaceLockFile(t, dir, name)
+	}))
+	if !errors.Is(err, ErrLockReplaced) || held || lock != nil || !strings.Contains(err.Error(), name) {
+		t.Fatalf("heldLock: %v, %v, %v, want ErrLockReplaced naming the file", lock, held, err)
+	}
+	if len(taken) != lockReplacedRetries+1 {
+		t.Errorf("took the lock %d times, want %d", len(taken), lockReplacedRetries+1)
+	}
+	for i, l := range taken {
+		if _, err := l.File.Stat(); !errors.Is(err, os.ErrClosed) {
+			t.Errorf("lock %d was not released: %v", i, err)
+		}
+	}
+	lock, held, err = heldLock(root, name, func() (*privatefile.Lock, bool, error) { return nil, false, nil })
+	if lock != nil || held || err != nil {
+		t.Fatalf("heldLock of a busy lock: %v, %v, %v", lock, held, err)
 	}
 }

@@ -18,11 +18,15 @@ import (
 // storeTestCredential stands in for a token secret or a password.
 const storeTestCredential = "token-secret-0123456789"
 
+// storeTestUser stands in for the API token ID the credential belongs to.
+const storeTestUser = "cpi@pve!cache"
+
 // storeTestConfig is a two-endpoint configuration with the system trust store.
 func storeTestConfig() KeyConfig {
 	return KeyConfig{
 		Endpoints: []string{"pve1.dc1.example.com:8006", "pve2.dc1.example.com:8006"},
 		VerifySSL: true,
+		User:      storeTestUser,
 	}
 }
 
@@ -43,11 +47,28 @@ func newStoreDir(t *testing.T) string {
 	return dir
 }
 
-// openStore opens a store on dir for storeTestConfig with credential, and closes it
-// when the test ends.
+// storeTestRoot opens dir the way the client does, through Resolve with dir
+// as the override, and returns the root for OpenStore, which owns it.
+func storeTestRoot(t *testing.T, dir string) *os.Root {
+	t.Helper()
+	choice := Resolve(Options{Override: dir})
+	if !choice.Usable() {
+		t.Fatalf("Resolve(%s): %v", dir, choice.Err)
+	}
+	return choice.Root
+}
+
+// openStoreOn opens a store on dir for storeTestConfig with credential.
+func openStoreOn(t *testing.T, dir, credential string, opts StoreOptions) (*Store, error) {
+	t.Helper()
+	return OpenStore(context.Background(), storeTestRoot(t, dir), storeTestConfig(), credential, opts)
+}
+
+// openTestStore opens a store on dir for storeTestConfig with credential, and
+// closes it when the test ends.
 func openTestStore(t *testing.T, dir, credential string, opts StoreOptions) *Store {
 	t.Helper()
-	s, err := OpenStore(context.Background(), dir, storeTestConfig(), credential, opts)
+	s, err := openStoreOn(t, dir, credential, opts)
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}
@@ -113,8 +134,9 @@ const (
 	storeChildLockEnv = "ENDPOINT_CACHE_LOCK"
 
 	// storeChildSecret waits for its standard input to close, so every racer starts
-	// together, then loads the directory secret and prints whether it created
-	// it, followed by the credential identifier derived from it.
+	// together, then loads the directory secret and prints whether it read,
+	// created, or replaced it, followed by the credential identifier derived
+	// from it.
 	storeChildSecret = "secret"
 	// storeChildLock takes the lock named in ENDPOINT_CACHE_LOCK, prints "locked",
 	// and holds it until its standard input closes.
@@ -145,7 +167,7 @@ func TestEndpointCacheChild(t *testing.T) {
 		if _, err := io.Copy(io.Discard, os.Stdin); err != nil {
 			t.Fatal(err)
 		}
-		secret, created, err := loadSecret(context.Background(), root, 30*time.Second)
+		secret, outcome, err := loadSecret(context.Background(), root, 30*time.Second, secretOps)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -153,11 +175,7 @@ func TestEndpointCacheChild(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		verb := "read"
-		if created {
-			verb = "created"
-		}
-		if _, err := fmt.Println(verb, key.CredentialID); err != nil {
+		if _, err := fmt.Println(secretOutcomeNames[outcome], key.CredentialID); err != nil {
 			t.Fatal(err)
 		}
 	case storeChildLock:
@@ -178,6 +196,9 @@ func TestEndpointCacheChild(t *testing.T) {
 		t.Fatalf("unknown child mode %q", mode)
 	}
 }
+
+// secretOutcomeNames are the words the secret child prints for each outcome.
+var secretOutcomeNames = map[secretOutcome]string{secretRead: "read", secretCreated: "created", secretReplaced: "replaced"}
 
 // child is a running child process.
 type storeChild struct {

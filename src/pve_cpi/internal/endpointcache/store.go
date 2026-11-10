@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/privatefile"
 )
@@ -54,9 +55,11 @@ var errLockBusy = errors.New("endpoint cache: cache file lock is busy")
 type StoreOptions struct {
 	// Logger receives the line for a skipped write. Nil discards it.
 	Logger *log.Logger
-	// ExplicitOn is whether the configured discovery mode is "on", which
-	// raises the skipped-write line from Debug to Warn.
-	ExplicitOn bool
+	// ConfiguredMode is the configured discovery mode, from
+	// CPIConfig.DiscoveryModeValue and not the effective mode. Under
+	// DiscoveryModeOn the skipped-write line is a Warn, and under every other
+	// mode a Debug, as Level decides.
+	ConfiguredMode config.DiscoveryMode
 }
 
 // Store reads and writes the cache file of one key in one cache directory.
@@ -64,37 +67,47 @@ type StoreOptions struct {
 // the credential and the directory secret, so someone who can write the
 // directory but does not hold the current credential cannot forge a file, and
 // rotating the credential invalidates every file. A Store holds no key
-// material in a printable field. Read and Update are safe for concurrent use,
-// and Close must not run alongside them.
+// material in a printable field. Read, Update, and TryLockDiscovery are safe
+// for concurrent use, and Close must not run alongside them.
 type Store struct {
-	root       *os.Root
-	key        Key
-	name       string
-	policy     privatefile.Policy
-	ops        privatefile.Ops
-	lockWait   time.Duration
-	logger     *log.Logger
-	explicitOn bool
+	root           *os.Root
+	key            Key
+	name           string
+	policy         privatefile.Policy
+	ops            privatefile.Ops
+	lockWait       time.Duration
+	logger         *log.Logger
+	configuredMode config.DiscoveryMode
+	secretReplaced bool
 }
 
-// OpenStore opens the cache directory dir, which must be absolute, a real
-// directory, owned by the effective user, and closed to group and other. It
-// reads the directory secret, creating it under secret.lock when it is
-// missing, and derives the key for cfg and the HMAC key for its file from the
-// credential, which is the entry's token secret or password. Any error means
-// the caller runs without a cache. The caller closes the Store.
-func OpenStore(ctx context.Context, dir string, cfg KeyConfig, credential string, opts StoreOptions) (*Store, error) {
-	if credential == "" {
-		return nil, fmt.Errorf("%w: no credential", ErrInvalidKey)
+// OpenStore opens the store for cfg on root, the cache directory that Resolve
+// chose and opened, which Choice.Root holds. The Store owns root from the call
+// on, whether OpenStore succeeds or fails: it closes root on every error and
+// in Close, and the caller neither uses nor closes root, or its Choice, again.
+// Because every file is reached through root, renaming or replacing the
+// directory's path afterwards cannot redirect the store.
+//
+// OpenStore checks the opened directory again through the same private checks
+// Resolve makes, so a root opened some other way meets the same refusals. It
+// reads the directory secret, writing a new one under secret.lock when it is
+// missing or has the wrong length, and derives the key for cfg and the HMAC
+// key for its file from cfg.User and the credential, which is the entry's
+// token secret or password. Any error means the caller runs without a cache.
+// When the secret had the wrong length and this call replaced it,
+// SecretReplaced reports so, and the caller logs that once at Warn whatever
+// the mode. The caller closes the Store.
+func OpenStore(ctx context.Context, root *os.Root, cfg KeyConfig, credential string, opts StoreOptions) (*Store, error) {
+	if root == nil {
+		return nil, fmt.Errorf("%s: no cache directory", cacheLabel)
 	}
-	if _, err := normalizeEndpoints(cfg.Endpoints); err != nil {
-		return nil, err
+	if err := checkKeyInputs(cfg, credential); err != nil {
+		return nil, errors.Join(err, root.Close())
 	}
-	root, err := cachePrivatePolicy.OpenRoot(dir)
-	if err != nil {
-		return nil, err
+	if err := checkOpenedDirectory(root); err != nil {
+		return nil, errors.Join(err, root.Close())
 	}
-	secret, _, err := loadSecret(ctx, root, secretLockWait)
+	secret, outcome, err := loadSecret(ctx, root, secretLockWait, secretOps)
 	if err != nil {
 		return nil, errors.Join(err, root.Close())
 	}
@@ -119,11 +132,36 @@ func OpenStore(ctx context.Context, dir string, cfg KeyConfig, credential string
 		policy: policy,
 		// Cache writes skip fsync. The HMAC turns a file torn by a crash into
 		// "no cache", and the next discovery rebuilds it.
-		ops:        privatefile.NoSyncOps(),
-		lockWait:   writeLockWait,
-		logger:     logger,
-		explicitOn: opts.ExplicitOn,
+		ops:            privatefile.NoSyncOps(),
+		lockWait:       writeLockWait,
+		logger:         logger,
+		configuredMode: opts.ConfiguredMode,
+		secretReplaced: outcome == secretReplaced,
 	}, nil
+}
+
+// checkKeyInputs refuses a config or credential that cannot form a key before
+// the directory is touched, so a refused key creates no secret.
+func checkKeyInputs(cfg KeyConfig, credential string) error {
+	switch {
+	case cfg.User == "":
+		return fmt.Errorf("%w: no user or token ID", ErrInvalidKey)
+	case credential == "":
+		return fmt.Errorf("%w: no credential", ErrInvalidKey)
+	}
+	_, err := normalizeEndpoints(cfg.Endpoints)
+	return err
+}
+
+// SecretReplaced reports whether OpenStore replaced a directory secret whose
+// only fault was its length, and returns the secret's full path for the
+// caller's Warn line. Every cache file written under the old secret is now
+// orphaned and costs one discovery to rebuild.
+func (s *Store) SecretReplaced() (path string, replaced bool) {
+	if s == nil || s.root == nil || !s.secretReplaced {
+		return "", false
+	}
+	return secretPath(s.root), true
 }
 
 // hmacIntegrity returns the envelope integrity function for key: the lowercase
@@ -210,8 +248,10 @@ func (s *Store) checkKey(payload json.RawMessage) error {
 
 // Update reads, merges, and writes the store's file under an exclusive lock on
 // the key's lock file. It waits at most one second for the lock. When the wait
-// runs out, it skips the write, logs at Debug, or at Warn under an explicit
-// "on", and returns false with no error, without calling merge.
+// runs out, it skips the write, logs at Debug, or at Warn under a configured
+// "on", and returns false with no error, without calling merge. A lock is kept
+// only while the lock file's name still reaches the locked inode, and taking
+// it updates the lock file's times, as heldLock describes.
 //
 // Under the lock, merge receives the current payload, or nil when the file is
 // absent or invalid, and returns the payload to write, or nil to write
@@ -220,8 +260,9 @@ func (s *Store) checkKey(payload json.RawMessage) error {
 // written reports whether the file was replaced.
 //
 // An error comes back when the caller's context ends during the wait, when
-// the lock file or the cache file fails the private-file checks, when merge
-// fails, or when the write fails. A failed write leaves the previous file or
+// the lock file or the cache file fails the private-file checks, when the lock
+// file keeps being replaced, which is ErrLockReplaced, when merge fails, or
+// when the write fails. A failed write leaves the previous file or
 // none, never a torn one. The caller logs these errors, because the store logs
 // only the skipped write.
 func Update[T any](ctx context.Context, s *Store, merge func(current *T) (*T, error)) (written bool, err error) {
@@ -233,7 +274,7 @@ func Update[T any](ctx context.Context, s *Store, merge func(current *T) (*T, er
 	}
 	lock, err := s.lock(ctx)
 	if errors.Is(err, errLockBusy) {
-		s.logger.LogAttrs(ctx, Level(s.explicitOn), "endpoint cache lock wait expired; skipping the cache write",
+		s.logger.LogAttrs(ctx, Level(s.configuredMode), "endpoint cache lock wait expired; skipping the cache write",
 			log.String("file", s.name), log.String("wait", s.lockWait.String()))
 		return false, nil
 	}
@@ -270,11 +311,27 @@ func Update[T any](ctx context.Context, s *Store, merge func(current *T) (*T, er
 func (s *Store) lock(ctx context.Context) (*privatefile.Lock, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, s.lockWait)
 	defer cancel()
-	lock, err := waitCreatedLock(waitCtx, s.root, s.key.LockName())
+	lock, err := waitHeldLock(waitCtx, s.root, s.key.LockName())
 	if err != nil {
 		return nil, lockWaitError(ctx, err, errLockBusy)
 	}
 	return lock, nil
+}
+
+// TryLockDiscovery takes the key's discover lock without waiting, so only one
+// process discovers for a key at a time. held is false, with no error, when
+// another process holds it, and the caller skips its discovery. As with the
+// write lock, a lock is kept only while the discover lock file's name still
+// reaches the locked inode, and taking it updates the file's times. An error
+// comes back when the store is closed, when the lock file fails the
+// private-file checks, when it keeps being replaced, which is ErrLockReplaced,
+// or when ctx ends during the short retry of a lock file being created. The
+// caller closes a held lock when discovery ends.
+func (s *Store) TryLockDiscovery(ctx context.Context) (lock *privatefile.Lock, held bool, err error) {
+	if s == nil || s.root == nil {
+		return nil, false, fmt.Errorf("%s: store is closed", cacheLabel)
+	}
+	return tryHeldLock(ctx, s.root, s.key.DiscoverLockName())
 }
 
 // write marshals value, refuses it unless its key is the store's, and replaces

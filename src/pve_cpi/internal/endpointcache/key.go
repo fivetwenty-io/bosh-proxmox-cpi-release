@@ -3,6 +3,7 @@ package endpointcache
 import (
 	"crypto/hkdf"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -20,11 +21,13 @@ const (
 	// written under the old form are never found under the new one.
 	keyVersion = "pve-cpi endpoint-cache key v1"
 
-	// credentialIDLabel and hmacKeyLabel are the HKDF info strings. Distinct
-	// labels keep the published identifier and the secret HMAC key independent
-	// although both come from the same credential and salt.
-	credentialIDLabel = "pve-cpi endpoint-cache id v1" // #nosec G101 -- HKDF info label, not a credential
-	hmacKeyLabel      = "pve-cpi endpoint-cache v1"
+	// credentialIDLabel is the HKDF info string of the credential identifier,
+	// and hmacKeyLabelPrefix, followed by the file's schema version, starts the
+	// info string of the HMAC key. Distinct labels keep the published
+	// identifier and the secret HMAC key independent although both come from
+	// the same credential and salt.
+	credentialIDLabel  = "pve-cpi endpoint-cache id v1" // #nosec G101 -- HKDF info label, not a credential
+	hmacKeyLabelPrefix = "pve-cpi endpoint-cache v"
 
 	// credentialIDBytes is the length of the credential identifier, which the
 	// key holds as 16 hex characters.
@@ -60,13 +63,21 @@ var ErrInvalidKey = errors.New("endpoint cache: invalid cache key input")
 type KeyConfig struct {
 	// Endpoints is the ordered endpoint list, each entry a host and an explicit
 	// port as the config layer resolves them. The order is the preference
-	// order and the first entry is the seed, so it is kept as given.
+	// order and the first entry is the seed, so it is kept as given. The
+	// caller passes the configured addresses of the client's endpoint plan,
+	// not cfg.Endpoints, because a config that sets only pve.host leaves
+	// cfg.Endpoints empty and is exactly the one-endpoint case that discovers.
 	Endpoints []string
 	// VerifySSL is the entry's effective verify_ssl.
 	VerifySSL bool
 	// CACert is the entry's CA certificate PEM, or empty when it verifies
 	// against the system trust store.
 	CACert string
+	// User is the user, such as cpi@pve, that the password belongs to, or the
+	// API token ID, such as cpi@pve!discovery, that the token secret belongs
+	// to. It goes into the credential identifier with the secret, so two users
+	// who share one password keep separate files, and it is never stored.
+	User string
 }
 
 // Key identifies one endpoint configuration and credential. Every cache file
@@ -81,9 +92,9 @@ type Key struct {
 	VerifySSL bool `json:"verify_ssl"`
 	// CASHA256 is the lowercase hex SHA-256 of the CA PEM, or SystemCA.
 	CASHA256 string `json:"ca_sha256"`
-	// CredentialID is 16 hex characters derived from the credential with the
-	// directory secret as the HKDF salt, so it reveals nothing that helps a
-	// password guess without the secret.
+	// CredentialID is 16 hex characters derived from the user and the
+	// credential with the directory secret as the HKDF salt, so it reveals
+	// nothing that helps a password guess without the secret.
 	CredentialID string `json:"credential_id"`
 }
 
@@ -198,14 +209,26 @@ func caDigest(pem string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// deriveKeys builds the key for cfg and the HMAC key for its file from the
-// directory secret and the credential, which is the token secret or the
-// password. Both derivations are HKDF-SHA256 with the directory secret as the
-// salt, so neither the identifier nor a file can be used to test password
-// guesses without the secret.
+// deriveKeys builds the key for cfg and the HMAC key for its file at the
+// current file version. See deriveKeysAt.
 func deriveKeys(cfg KeyConfig, dirSecret keyMaterial, credential string) (Key, keyMaterial, error) {
+	return deriveKeysAt(cfg, dirSecret, credential, fileVersion)
+}
+
+// deriveKeysAt builds the key for cfg and the HMAC key for a file of the given
+// schema version from the directory secret, the user, and the credential,
+// which is the token secret or the password. Both derivations are HKDF-SHA256
+// over the length-prefixed user followed by the length-prefixed credential,
+// with the directory secret as the salt, so neither the identifier nor a file
+// can be used to test password guesses without the secret. The HMAC key's info
+// is the versioned label followed by the 32-byte key digest, so a schema bump
+// changes the key and a file moved from another key fails its HMAC.
+func deriveKeysAt(cfg KeyConfig, dirSecret keyMaterial, credential string, version int) (Key, keyMaterial, error) {
 	if len(dirSecret) != secretBytes {
 		return Key{}, nil, fmt.Errorf("%w: directory secret has the wrong length", ErrInvalidKey)
+	}
+	if cfg.User == "" {
+		return Key{}, nil, fmt.Errorf("%w: no user or token ID", ErrInvalidKey)
 	}
 	if credential == "" {
 		return Key{}, nil, fmt.Errorf("%w: no credential", ErrInvalidKey)
@@ -214,13 +237,11 @@ func deriveKeys(cfg KeyConfig, dirSecret keyMaterial, credential string) (Key, k
 	if err != nil {
 		return Key{}, nil, err
 	}
-	id, err := hkdf.Key(sha256.New, []byte(credential), dirSecret, credentialIDLabel, credentialIDBytes)
+	ikm := credentialInput(cfg.User, credential)
+	defer clear(ikm)
+	id, err := hkdf.Key(sha256.New, ikm, dirSecret, credentialIDLabel, credentialIDBytes)
 	if err != nil {
 		return Key{}, nil, fmt.Errorf("endpoint cache: derive credential identifier: %w", err)
-	}
-	mac, err := hkdf.Key(sha256.New, []byte(credential), dirSecret, hmacKeyLabel, hmacKeyBytes)
-	if err != nil {
-		return Key{}, nil, fmt.Errorf("endpoint cache: derive file key: %w", err)
 	}
 	key := Key{
 		Endpoints:    endpoints,
@@ -228,5 +249,27 @@ func deriveKeys(cfg KeyConfig, dirSecret keyMaterial, credential string) (Key, k
 		CASHA256:     caDigest(cfg.CACert),
 		CredentialID: hex.EncodeToString(id),
 	}
+	mac, err := hkdf.Key(sha256.New, ikm, dirSecret, hmacKeyInfo(version, key.Digest()), hmacKeyBytes)
+	if err != nil {
+		return Key{}, nil, fmt.Errorf("endpoint cache: derive file key: %w", err)
+	}
 	return key, keyMaterial(mac), nil
+}
+
+// credentialInput is the HKDF input keying material: the user and the
+// credential, each preceded by its length as eight big-endian bytes, so no two
+// pairs share an input.
+func credentialInput(user, credential string) []byte {
+	ikm := make([]byte, 0, 16+len(user)+len(credential))
+	ikm = binary.BigEndian.AppendUint64(ikm, uint64(len(user)))
+	ikm = append(ikm, user...)
+	ikm = binary.BigEndian.AppendUint64(ikm, uint64(len(credential)))
+	return append(ikm, credential...)
+}
+
+// hmacKeyInfo is the HKDF info of the HMAC key for a file of the given schema
+// version and key digest. The digest has a fixed length, so the label and the
+// digest cannot run together.
+func hmacKeyInfo(version int, digest [sha256.Size]byte) string {
+	return hmacKeyLabelPrefix + strconv.Itoa(version) + string(digest[:])
 }
