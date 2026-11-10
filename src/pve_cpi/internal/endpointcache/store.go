@@ -259,12 +259,17 @@ func (s *Store) checkKey(payload json.RawMessage) error {
 // the file atomically through a temporary file and a rename, without fsync.
 // written reports whether the file was replaced.
 //
-// An error comes back when the caller's context ends during the wait, when
-// the lock file or the cache file fails the private-file checks, when the lock
-// file keeps being replaced, which is ErrLockReplaced, when merge fails, or
-// when the write fails. A failed write leaves the previous file or
-// none, never a torn one. The caller logs these errors, because the store logs
-// only the skipped write.
+// The caller's context is checked once the lock is held and again after merge
+// returns, so a caller whose context has ended, such as a worker the exit
+// drain cancelled, writes nothing. A check that finds the context ended
+// returns its error, wrapped.
+//
+// An error comes back when the caller's context ends, whether during the
+// wait, before merge, or after it, when the lock file or the cache file fails
+// the private-file checks, when the lock file keeps being replaced, which is
+// ErrLockReplaced, when merge fails, or when the write fails. A failed write
+// leaves the previous file or none, never a torn one. The caller logs these
+// errors, because the store logs only the skipped write.
 func Update[T any](ctx context.Context, s *Store, merge func(current *T) (*T, error)) (written bool, err error) {
 	if s == nil || s.root == nil {
 		return false, fmt.Errorf("%s: store is closed", cacheLabel)
@@ -287,6 +292,10 @@ func Update[T any](ctx context.Context, s *Store, merge func(current *T) (*T, er
 		}
 	}()
 
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, fmt.Errorf("%s: update abandoned with the caller's context: %w", cacheLabel, ctxErr)
+	}
+
 	var current *T
 	var stored T
 	switch readErr := s.Read(&stored); {
@@ -300,6 +309,9 @@ func Update[T any](ctx context.Context, s *Store, merge func(current *T) (*T, er
 	next, err := merge(current)
 	if err != nil || next == nil {
 		return false, err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, fmt.Errorf("%s: write abandoned with the caller's context: %w", cacheLabel, ctxErr)
 	}
 	if err := s.write(next); err != nil {
 		return false, err

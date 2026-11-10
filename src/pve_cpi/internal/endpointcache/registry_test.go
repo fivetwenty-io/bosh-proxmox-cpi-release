@@ -3,18 +3,47 @@ package endpointcache
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 )
 
 // drainSlack is how far past its bound a drain may return before a test
 // calls it late. It is generous because the race detector and a busy runner
 // slow every goroutine handoff.
 const drainSlack = 2 * time.Second
+
+// drainGuard is how long a test waits for a drain that should end for a
+// reason other than its bound before it fails by name. It keeps a broken rule
+// from showing up as a package timeout.
+const drainGuard = 5 * time.Second
+
+// guardedDrain runs drain on its own goroutine and fails the test, naming the
+// rule that what describes, if it does not return within drainGuard.
+func guardedDrain(t *testing.T, what string, drain func() DrainResult) DrainResult {
+	t.Helper()
+	done := make(chan DrainResult, 1)
+	go func() { done <- drain() }()
+	select {
+	case result := <-done:
+		return result
+	case <-time.After(drainGuard):
+		t.Fatalf("%s: Drain was still waiting after %s", what, drainGuard)
+		return DrainResult{}
+	}
+}
+
+// drainWithin is guardedDrain for r.Drain.
+func drainWithin(t *testing.T, what string, ctx context.Context, r *Registry, wait time.Duration) DrainResult {
+	t.Helper()
+	return guardedDrain(t, what, func() DrainResult { return r.Drain(ctx, wait) })
+}
 
 // stuckWorker is a worker that ignores cancellation until the test releases
 // it, standing in for a write blocked in a system call.
@@ -28,8 +57,15 @@ type stuckWorker struct {
 // releases it when the test ends so it never outlives the test.
 func startStuck(t *testing.T, r *Registry, name string) *stuckWorker {
 	t.Helper()
+	return startStuckMode(t, r, name, config.DiscoveryModeAuto)
+}
+
+// startStuckMode is startStuck for a worker whose cluster config has the
+// given discovery mode.
+func startStuckMode(t *testing.T, r *Registry, name string, mode config.DiscoveryMode) *stuckWorker {
+	t.Helper()
 	w := &stuckWorker{ctx: make(chan context.Context, 1), release: make(chan struct{}), done: make(chan struct{})}
-	err := r.Go(name, func(ctx context.Context) {
+	err := r.Go(name, mode, func(ctx context.Context) {
 		defer close(w.done)
 		w.ctx <- ctx
 		<-w.release
@@ -64,10 +100,12 @@ func (w *stuckWorker) finish() {
 	<-w.done
 }
 
-// timedDrain runs r.Drain and returns its result and how long it took.
-func timedDrain(ctx context.Context, r *Registry, wait time.Duration) (DrainResult, time.Duration) {
+// timedDrain runs r.Drain under the guard and returns its result and how long
+// it took.
+func timedDrain(t *testing.T, what string, ctx context.Context, r *Registry, wait time.Duration) (DrainResult, time.Duration) {
+	t.Helper()
 	start := time.Now()
-	result := r.Drain(ctx, wait)
+	result := drainWithin(t, what, ctx, r, wait)
 	return result, time.Since(start)
 }
 
@@ -83,7 +121,7 @@ func TestDrainWaitIsThreeSeconds(t *testing.T) {
 func TestDrainWithNoWorkersReturnsAtOnce(t *testing.T) {
 	t.Parallel()
 	r := NewRegistry()
-	result, took := timedDrain(context.Background(), r, time.Hour)
+	result, took := timedDrain(t, "a drain with no workers returns at once", context.Background(), r, time.Hour)
 	if took > drainSlack {
 		t.Fatalf("empty drain took %s", took)
 	}
@@ -99,7 +137,7 @@ func TestDrainWaitsForWorkThatFinishes(t *testing.T) {
 	r := NewRegistry()
 	var sawCancel atomic.Bool
 	release := make(chan struct{})
-	if err := r.Go("discovery", func(ctx context.Context) {
+	if err := r.Go("discovery", config.DiscoveryModeAuto, func(ctx context.Context) {
 		<-release
 		sawCancel.Store(ctx.Err() != nil)
 	}); err != nil {
@@ -107,7 +145,7 @@ func TestDrainWaitsForWorkThatFinishes(t *testing.T) {
 	}
 	time.AfterFunc(50*time.Millisecond, func() { close(release) })
 
-	result, took := timedDrain(context.Background(), r, time.Hour)
+	result, took := timedDrain(t, "a drain returns once its work finishes", context.Background(), r, time.Hour)
 	if took > drainSlack {
 		t.Fatalf("drain took %s for work that finished after 50ms", took)
 	}
@@ -128,7 +166,7 @@ func TestDrainStopsAtBoundAndCancels(t *testing.T) {
 	ctx := stuck.workerContext(t)
 
 	const bound = 150 * time.Millisecond
-	result, took := timedDrain(context.Background(), r, bound)
+	result, took := timedDrain(t, "a drain stops at its bound", context.Background(), r, bound)
 	if took < bound {
 		t.Fatalf("drain returned after %s, before its %s bound", took, bound)
 	}
@@ -151,13 +189,13 @@ func TestDrainCancelsCooperativeWorker(t *testing.T) {
 	t.Parallel()
 	r := NewRegistry()
 	got := make(chan error, 1)
-	if err := r.Go("discovery", func(ctx context.Context) {
+	if err := r.Go("discovery", config.DiscoveryModeAuto, func(ctx context.Context) {
 		<-ctx.Done()
 		got <- ctx.Err()
 	}); err != nil {
 		t.Fatal(err)
 	}
-	result := r.Drain(context.Background(), 20*time.Millisecond)
+	result := drainWithin(t, "a drain stops at its bound", context.Background(), r, 20*time.Millisecond)
 	if !slices.Equal(result.Cancelled, []string{"discovery"}) {
 		t.Fatalf("Cancelled = %v, want [discovery]", result.Cancelled)
 	}
@@ -191,7 +229,7 @@ func TestDrainEndsEarly(t *testing.T) {
 			r := NewRegistry()
 			stuck := startStuck(t, r, "discovery")
 			ctx := stuck.workerContext(t)
-			result, took := timedDrain(tc.ctx, r, tc.wait)
+			result, took := timedDrain(t, "a drain with "+tc.name+" cancels at once", tc.ctx, r, tc.wait)
 			if took > drainSlack {
 				t.Fatalf("drain took %s", took)
 			}
@@ -210,7 +248,7 @@ func TestDrainContextEndingDuringWait(t *testing.T) {
 	startStuck(t, r, "discovery")
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(50*time.Millisecond, cancel)
-	result, took := timedDrain(ctx, r, time.Hour)
+	result, took := timedDrain(t, "a drain ends when its context does", ctx, r, time.Hour)
 	if took > drainSlack {
 		t.Fatalf("drain took %s after its context ended", took)
 	}
@@ -226,7 +264,7 @@ func TestDrainNilContext(t *testing.T) {
 	startStuck(t, r, "discovery")
 	// A caller that holds no context passes a nil interface value.
 	var none context.Context
-	result, took := timedDrain(none, r, 50*time.Millisecond)
+	result, took := timedDrain(t, "a drain with a nil context waits for its bound", none, r, 50*time.Millisecond)
 	if took < 50*time.Millisecond || took > 50*time.Millisecond+drainSlack {
 		t.Fatalf("drain with a nil context took %s, want about 50ms", took)
 	}
@@ -249,16 +287,21 @@ func TestGoRefusedOnceDrainStarts(t *testing.T) {
 	waitClosed(t, r)
 	var ranRefused atomic.Bool
 	refused := func(context.Context) { ranRefused.Store(true) }
-	if err := r.Go("late mark", refused); !errors.Is(err, ErrRegistryClosed) {
+	if err := r.Go("late mark", config.DiscoveryModeAuto, refused); !errors.Is(err, ErrRegistryClosed) {
 		t.Fatalf("Go while the drain waited: %v, want ErrRegistryClosed", err)
 	}
 
 	stuck.finish()
-	result := <-drained
+	var result DrainResult
+	select {
+	case result = <-drained:
+	case <-time.After(drainGuard):
+		t.Fatalf("a drain returns once its last worker does: Drain was still waiting after %s", drainGuard)
+	}
 	if len(result.Cancelled) != 0 {
 		t.Fatalf("Cancelled = %v after every worker finished", result.Cancelled)
 	}
-	if err := r.Go("after drain", refused); !errors.Is(err, ErrRegistryClosed) {
+	if err := r.Go("after drain", config.DiscoveryModeAuto, refused); !errors.Is(err, ErrRegistryClosed) {
 		t.Fatalf("Go after the drain returned: %v, want ErrRegistryClosed", err)
 	}
 	if ranRefused.Load() {
@@ -267,10 +310,10 @@ func TestGoRefusedOnceDrainStarts(t *testing.T) {
 
 	r.Open()
 	ran := make(chan struct{})
-	if err := r.Go("next run", func(context.Context) { close(ran) }); err != nil {
+	if err := r.Go("next run", config.DiscoveryModeAuto, func(context.Context) { close(ran) }); err != nil {
 		t.Fatalf("Go after Open: %v", err)
 	}
-	r.Drain(context.Background(), time.Hour)
+	drainWithin(t, "a drain of the reopened run returns once its worker does", context.Background(), r, time.Hour)
 	select {
 	case <-ran:
 	default:
@@ -284,8 +327,8 @@ func TestSecondDrainWaitsForNothing(t *testing.T) {
 	t.Parallel()
 	r := NewRegistry()
 	startStuck(t, r, "discovery")
-	r.Drain(context.Background(), 20*time.Millisecond)
-	result, took := timedDrain(context.Background(), r, time.Hour)
+	drainWithin(t, "a drain stops at its bound", context.Background(), r, 20*time.Millisecond)
+	result, took := timedDrain(t, "a drain after a cancelled run waits for nothing", context.Background(), r, time.Hour)
 	if took > drainSlack {
 		t.Fatalf("second drain took %s", took)
 	}
@@ -308,8 +351,12 @@ func TestOverlappingDrainsShareBound(t *testing.T) {
 		r.Drain(context.Background(), bound)
 	}()
 	waitClosed(t, r)
-	r.Drain(context.Background(), time.Hour)
-	<-firstDone
+	drainWithin(t, "a drain shares the first drain's bound", context.Background(), r, time.Hour)
+	select {
+	case <-firstDone:
+	case <-time.After(drainGuard):
+		t.Fatalf("the first drain was still waiting after %s", drainGuard)
+	}
 	if took := time.Since(start); took > bound+drainSlack {
 		t.Fatalf("overlapping drains took %s, past the first drain's %s bound", took, bound)
 	}
@@ -325,7 +372,7 @@ func TestOverlappingDrainKeepsItsOwnShorterBound(t *testing.T) {
 	waitClosed(t, r)
 
 	const bound = 50 * time.Millisecond
-	result, took := timedDrain(context.Background(), r, bound)
+	result, took := timedDrain(t, "a drain keeps its own shorter bound", context.Background(), r, bound)
 	if took < bound || took > bound+drainSlack {
 		t.Fatalf("overlapping drain took %s, want about its own %s bound", took, bound)
 	}
@@ -340,13 +387,129 @@ func TestOverlappingDrainKeepsItsOwnShorterBound(t *testing.T) {
 	}
 }
 
+// A drain whose context ended gave up early, and a later drain of the run
+// waits for nothing, however long its own bound is. This is the last drain of
+// a signalled process, which must not wait out the bound the first drain
+// skipped.
+func TestDrainAfterEndedContextDrainWaitsForNothing(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+	startStuck(t, r, "discovery")
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	drainWithin(t, "a drain with an ended context cancels at once", ended, r, time.Hour)
+
+	result, took := timedDrain(t, "a drain after a drain whose context ended waits for nothing",
+		context.Background(), r, time.Hour)
+	if took > drainSlack {
+		t.Fatalf("later drain took %s after the first drain gave up", took)
+	}
+	if !slices.Equal(result.Cancelled, []string{"discovery"}) {
+		t.Fatalf("later drain Cancelled = %v, want the worker still listed", result.Cancelled)
+	}
+}
+
+// Once a drain gives up, a longer drain of the same run returns too, although
+// the worker still runs and its own bound has not passed.
+func TestShorterDrainEndsLongerDrain(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry()
+	startStuck(t, r, "discovery")
+	longDone := make(chan DrainResult, 1)
+	go func() { longDone <- r.Drain(context.Background(), time.Hour) }()
+	waitClosed(t, r)
+
+	const bound = 50 * time.Millisecond
+	drainWithin(t, "a drain stops at its bound", context.Background(), r, bound)
+	select {
+	case result := <-longDone:
+		if !slices.Equal(result.Cancelled, []string{"discovery"}) {
+			t.Fatalf("longer drain Cancelled = %v, want the worker", result.Cancelled)
+		}
+	case <-time.After(drainGuard):
+		t.Fatalf("a drain keeps waiting after another drain of its run gave up: still waiting after %s", drainGuard)
+	}
+}
+
+// The level of the cancelled-work line is the highest among the cancelled
+// workers, each judged by its own cluster config's mode, and a worker that
+// finished does not count.
+func TestCancelledLevelFollowsWorkerModes(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		modes []config.DiscoveryMode
+		done  []config.DiscoveryMode
+		want  slog.Level
+	}{
+		{name: "no worker", want: slog.LevelDebug},
+		{name: "one auto", modes: []config.DiscoveryMode{config.DiscoveryModeAuto}, want: slog.LevelDebug},
+		{name: "one unset", modes: []config.DiscoveryMode{""}, want: slog.LevelDebug},
+		{name: "one off", modes: []config.DiscoveryMode{config.DiscoveryModeOff}, want: slog.LevelDebug},
+		{name: "one on", modes: []config.DiscoveryMode{config.DiscoveryModeOn}, want: slog.LevelWarn},
+		{
+			name:  "auto beside on",
+			modes: []config.DiscoveryMode{config.DiscoveryModeAuto, config.DiscoveryModeOn},
+			want:  slog.LevelWarn,
+		},
+		{
+			name:  "on finished, auto cancelled",
+			modes: []config.DiscoveryMode{config.DiscoveryModeAuto},
+			done:  []config.DiscoveryMode{config.DiscoveryModeOn},
+			want:  slog.LevelDebug,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := NewRegistry()
+			for _, mode := range tc.modes {
+				startStuckMode(t, r, "discovery", mode)
+			}
+			finished := make(chan struct{}, len(tc.done))
+			for _, mode := range tc.done {
+				if err := r.Go("down mark", mode, func(context.Context) { finished <- struct{}{} }); err != nil {
+					t.Fatal(err)
+				}
+				<-finished
+			}
+			waitRunning(t, r, len(tc.modes))
+			result := drainWithin(t, "a drain stops at its bound", context.Background(), r, 20*time.Millisecond)
+			if result.CancelledLevel != tc.want {
+				t.Fatalf("CancelledLevel = %v, want %v for %d cancelled workers", result.CancelledLevel, tc.want, len(result.Cancelled))
+			}
+			if len(result.Cancelled) != len(tc.modes) {
+				t.Fatalf("Cancelled = %v, want %d workers", result.Cancelled, len(tc.modes))
+			}
+		})
+	}
+}
+
+// waitRunning waits until r's current run has exactly n workers running.
+func waitRunning(t *testing.T, r *Registry, n int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		r.mu.Lock()
+		running := len(r.run.workers)
+		r.mu.Unlock()
+		if running == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the run has %d workers running, want %d", running, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // waitClosed waits until a drain of r has started, which Go reports by
 // refusing a worker.
 func waitClosed(t *testing.T, r *Registry) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		err := r.Go("probe", func(context.Context) {})
+		err := r.Go("probe", config.DiscoveryModeAuto, func(context.Context) {})
 		if errors.Is(err, ErrRegistryClosed) {
 			return
 		}
@@ -366,9 +529,9 @@ func TestOpenStartsFreshRun(t *testing.T) {
 	t.Parallel()
 	r := NewRegistry()
 	startStuck(t, r, "discovery")
-	r.Drain(context.Background(), 10*time.Millisecond)
+	drainWithin(t, "a drain stops at its bound", context.Background(), r, 10*time.Millisecond)
 	r.Open()
-	result, took := timedDrain(context.Background(), r, time.Hour)
+	result, took := timedDrain(t, "a drain of a fresh run ignores the drained run's worker", context.Background(), r, time.Hour)
 	if took > drainSlack {
 		t.Fatalf("drain of the fresh run took %s", took)
 	}
@@ -384,7 +547,7 @@ func TestOpenOnOpenRegistryKeepsRun(t *testing.T) {
 	r := NewRegistry()
 	stuck := startStuck(t, r, "discovery")
 	r.Open()
-	result := r.Drain(context.Background(), 10*time.Millisecond)
+	result := drainWithin(t, "a drain stops at its bound", context.Background(), r, 10*time.Millisecond)
 	if !slices.Equal(result.Cancelled, []string{"discovery"}) {
 		t.Fatalf("Cancelled = %v, want the worker started before Open", result.Cancelled)
 	}
@@ -394,13 +557,13 @@ func TestOpenOnOpenRegistryKeepsRun(t *testing.T) {
 func TestGoRefusesBadArguments(t *testing.T) {
 	t.Parallel()
 	r := NewRegistry()
-	if err := r.Go("", func(context.Context) {}); err == nil {
+	if err := r.Go("", config.DiscoveryModeAuto, func(context.Context) {}); err == nil {
 		t.Error("Go accepted an empty name")
 	}
-	if err := r.Go("discovery", nil); err == nil {
+	if err := r.Go("discovery", config.DiscoveryModeAuto, nil); err == nil {
 		t.Error("Go accepted a nil function")
 	}
-	if result := r.Drain(context.Background(), time.Hour); result.Started != 0 {
+	if result := drainWithin(t, "a drain with no workers returns at once", context.Background(), r, time.Hour); result.Started != 0 {
 		t.Errorf("refused workers counted as started: %+v", result)
 	}
 }
@@ -410,14 +573,14 @@ func TestGoRefusesBadArguments(t *testing.T) {
 func TestWorkerPanicIsRecoveredAndReported(t *testing.T) {
 	t.Parallel()
 	r := NewRegistry()
-	if err := r.Go("discovery", func(context.Context) { panic("cache payload defect") }); err != nil {
+	if err := r.Go("discovery", config.DiscoveryModeAuto, func(context.Context) { panic("cache payload defect") }); err != nil {
 		t.Fatal(err)
 	}
 	var finished atomic.Bool
-	if err := r.Go("down mark", func(context.Context) { finished.Store(true) }); err != nil {
+	if err := r.Go("down mark", config.DiscoveryModeAuto, func(context.Context) { finished.Store(true) }); err != nil {
 		t.Fatal(err)
 	}
-	result := r.Drain(context.Background(), time.Hour)
+	result := drainWithin(t, "a drain returns once its workers finish", context.Background(), r, time.Hour)
 	if !finished.Load() {
 		t.Fatal("the other worker did not finish")
 	}
@@ -428,7 +591,7 @@ func TestWorkerPanicIsRecoveredAndReported(t *testing.T) {
 	if p.Name != "discovery" || p.Value != "cache payload defect" || len(p.Stack) == 0 {
 		t.Fatalf("panic record = %q %v with %d stack bytes", p.Name, p.Value, len(p.Stack))
 	}
-	if again := r.Drain(context.Background(), time.Hour); len(again.Panics) != 0 {
+	if again := drainWithin(t, "a second drain of a finished run returns at once", context.Background(), r, time.Hour); len(again.Panics) != 0 {
 		t.Fatalf("second drain reported the panic again: %+v", again.Panics)
 	}
 }
@@ -449,7 +612,7 @@ func TestConcurrentRegistrationAndDrain(t *testing.T) {
 			<-startGate
 			for i := range perGoroutine {
 				id := g*perGoroutine + i
-				err := r.Go("discovery", func(context.Context) {
+				err := r.Go("discovery", config.DiscoveryModeAuto, func(context.Context) {
 					if _, again := ranIDs.LoadOrStore(id, true); again {
 						t.Errorf("worker %d ran twice", id)
 					}
@@ -466,7 +629,7 @@ func TestConcurrentRegistrationAndDrain(t *testing.T) {
 	}
 	close(startGate)
 	time.Sleep(time.Millisecond)
-	result := r.Drain(context.Background(), 30*time.Second)
+	result := drainWithin(t, "a drain returns once the accepted workers finish", context.Background(), r, 30*time.Second)
 	wg.Wait()
 
 	if int64(result.Started) != accepted.Load() {
@@ -494,20 +657,25 @@ func TestConcurrentRegistrationAndDrain(t *testing.T) {
 func TestProcessRegistry(t *testing.T) {
 	Open()
 	ran := make(chan struct{})
-	if err := Go("discovery", func(context.Context) { close(ran) }); err != nil {
+	if err := Go("discovery", config.DiscoveryModeAuto, func(context.Context) { close(ran) }); err != nil {
 		t.Fatalf("Go: %v", err)
 	}
-	result := Drain(context.Background(), time.Hour)
+	result := guardedDrain(t, "a drain returns once its worker does", func() DrainResult {
+		return Drain(context.Background(), time.Hour)
+	})
 	<-ran
 	if result.Started != 1 {
 		t.Fatalf("Started = %d, want 1", result.Started)
 	}
-	if err := Go("late", func(context.Context) {}); !errors.Is(err, ErrRegistryClosed) {
+	if err := Go("late", config.DiscoveryModeAuto, func(context.Context) {}); !errors.Is(err, ErrRegistryClosed) {
 		t.Fatalf("Go after Drain: %v, want ErrRegistryClosed", err)
 	}
 	Open()
-	if result := Drain(context.Background(), time.Hour); result.Started != 0 {
-		t.Fatalf("reopened registry Started = %d, want 0", result.Started)
+	reopened := guardedDrain(t, "a drain of a reopened registry returns at once", func() DrainResult {
+		return Drain(context.Background(), time.Hour)
+	})
+	if reopened.Started != 0 {
+		t.Fatalf("reopened registry Started = %d, want 0", reopened.Started)
 	}
 }
 
@@ -518,23 +686,23 @@ func TestRegistryLeavesNoGoroutines(t *testing.T) {
 
 	r := NewRegistry()
 	for range 20 {
-		if err := r.Go("down mark", func(ctx context.Context) { <-ctx.Done() }); err != nil {
+		if err := r.Go("down mark", config.DiscoveryModeAuto, func(ctx context.Context) { <-ctx.Done() }); err != nil {
 			t.Fatal(err)
 		}
 	}
 	release := make(chan struct{})
 	for range 5 {
-		if err := r.Go("stuck", func(context.Context) { <-release }); err != nil {
+		if err := r.Go("stuck", config.DiscoveryModeAuto, func(context.Context) { <-release }); err != nil {
 			t.Fatal(err)
 		}
 	}
-	result := r.Drain(context.Background(), 20*time.Millisecond)
+	result := drainWithin(t, "a drain stops at its bound", context.Background(), r, 20*time.Millisecond)
 	if len(result.Cancelled) == 0 {
 		t.Fatal("no worker was still running at the bound")
 	}
 	close(release)
 	r.Open()
-	r.Drain(context.Background(), time.Hour)
+	drainWithin(t, "a drain of a fresh run returns at once", context.Background(), r, time.Hour)
 
 	deadline := time.Now().Add(10 * time.Second)
 	for runtime.NumGoroutine() > before {

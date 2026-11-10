@@ -495,6 +495,96 @@ func TestStoreUpdateReportsAnEndedContext(t *testing.T) {
 	holder.finish(t)
 }
 
+// A context that ends while merge runs writes nothing: Update returns the
+// context's error, and the file and the directory stay as they were.
+func TestStoreUpdateWritesNothingWhenContextEndsDuringMerge(t *testing.T) {
+	dir := newStoreDir(t)
+	s := openTestStore(t, dir, storeTestCredential, StoreOptions{})
+	storePut(t, s, "old")
+	before := storeDirNames(t, dir)
+	raw, err := os.ReadFile(filepath.Join(dir, s.FileName()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	written, err := Update(ctx, s, func(*storeTestPayload) (*storeTestPayload, error) {
+		cancel()
+		return &storeTestPayload{Key: s.Key(), Note: "late"}, nil
+	})
+	if written || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Update with a context that ended in merge: written %v, err %v, want canceled", written, err)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, s.FileName()))
+	if err != nil || !bytes.Equal(after, raw) {
+		t.Fatalf("the file changed after the context ended: %v", err)
+	}
+	if names := storeDirNames(t, dir); !slices.Equal(names, before) {
+		t.Fatalf("directory holds %v, want %v", names, before)
+	}
+	var got storeTestPayload
+	if err := s.Read(&got); err != nil || got.Note != "old" {
+		t.Fatalf("stored payload = %+v, %v; want the old note", got, err)
+	}
+}
+
+// lockHeldContext reports itself cancelled once the store's lock is held
+// elsewhere, so a test can end a context at the moment Update has just taken
+// the lock. The lock wait runs on a child context and never calls Err on this
+// one, so the first call is Update's own check after the lock is held.
+type lockHeldContext struct {
+	context.Context
+	t *testing.T
+	s *Store
+}
+
+func (c lockHeldContext) Err() error {
+	lock, free, err := tryHeldLock(context.Background(), c.s.root, c.s.key.LockName())
+	if err != nil {
+		c.t.Errorf("probe the lock: %v", err)
+		return nil
+	}
+	if free {
+		if err := lock.Close(); err != nil {
+			c.t.Errorf("release the probe lock: %v", err)
+		}
+		return nil
+	}
+	return context.Canceled
+}
+
+// A context that ends while Update holds the lock stops it before it reads
+// the file or calls merge, and nothing is written.
+func TestStoreUpdateStopsWhenContextEndsWhileLockHeld(t *testing.T) {
+	dir := newStoreDir(t)
+	s := openTestStore(t, dir, storeTestCredential, StoreOptions{})
+	storePut(t, s, "old")
+	raw, err := os.ReadFile(filepath.Join(dir, s.FileName()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	ctx := lockHeldContext{Context: context.Background(), t: t, s: s}
+	written, err := Update(ctx, s, func(*storeTestPayload) (*storeTestPayload, error) {
+		called = true
+		return &storeTestPayload{Key: s.Key(), Note: "late"}, nil
+	})
+	if written || called || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Update with a context that ended under the lock: written %v, merge called %v, err %v", written, called, err)
+	}
+	if errors.Is(err, ErrLockWaitAbandoned) {
+		t.Fatalf("the lock wait reported the ended context, so the check under the lock never ran: %v", err)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, s.FileName()))
+	if err != nil || !bytes.Equal(after, raw) {
+		t.Fatalf("the file changed after the context ended: %v", err)
+	}
+	// The lock was released, so the next update goes through.
+	storePut(t, s, "after")
+}
+
 func TestStoreUpdateMergeContract(t *testing.T) {
 	dir := newStoreDir(t)
 	s := openTestStore(t, dir, storeTestCredential, StoreOptions{})

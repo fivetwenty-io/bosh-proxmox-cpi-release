@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -495,12 +497,134 @@ func TestDispatchOne_WriteResponsePanic_EmitsCloudError(t *testing.T) {
 
 // --------------------------------------------------------------------------
 // Exit drain of the endpoint cache's background workers. These tests use the
-// process-wide registry, so none of them runs in parallel.
+// process-wide registry, so none of them runs in parallel, and neither may
+// any test that starts a worker through the registry or a client factory.
+// Every runWithArgs call opens and drains that one registry, so a parallel
+// test's drain can close the run while another test registers a worker, which
+// refuses the worker, or cancel it at the first test's bound. Tests that only
+// send `info` or inject a factory that starts nothing may stay parallel.
 // --------------------------------------------------------------------------
 
 // drainTestSlack is how far past its bound a drained run may end before a
 // test calls it late, generous for the race detector on a busy runner.
 const drainTestSlack = 2 * time.Second
+
+// drainTestGuard is how long a test waits for a drain that should end for a
+// reason other than its bound before it fails by name, so a broken rule never
+// shows up as a package timeout.
+const drainTestGuard = 5 * time.Second
+
+// finishesWithin runs fn on its own goroutine and fails the test, naming the
+// rule that what describes, if fn does not return within drainTestGuard.
+func finishesWithin(t *testing.T, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-time.After(drainTestGuard):
+		t.Fatalf("%s: still waiting after %s", what, drainTestGuard)
+	}
+}
+
+// holdSIGTERM keeps a handler registered for SIGTERM until the test ends, so a
+// signal that lands after runWithArgs removed its own handler, as it would
+// when a rule under test breaks, cannot kill the test binary.
+func holdSIGTERM(t *testing.T) {
+	t.Helper()
+	held := make(chan os.Signal, 1)
+	signal.Notify(held, syscall.SIGTERM)
+	t.Cleanup(func() { signal.Stop(held) })
+}
+
+// sendSIGTERM delivers SIGTERM to the test process.
+func sendSIGTERM(t *testing.T) {
+	t.Helper()
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("send SIGTERM: %v", err)
+	}
+}
+
+// waitDrainStarted waits until the process registry's drain has started,
+// which Go reports by refusing a worker.
+func waitDrainStarted(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err := endpointcache.Go("probe", config.DiscoveryModeAuto, func(context.Context) {})
+		if errors.Is(err, endpointcache.ErrRegistryClosed) {
+			return
+		}
+		if err != nil {
+			t.Fatalf("Go: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the exit drain never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// drainLine is a log line a test reads back, with the level it was logged at.
+type drainLine struct {
+	level   slog.Level
+	message string
+}
+
+// lineSpyHandler records every line the process logger fans out to it, with
+// its level, once LoggerProviderFactory returns it as the OTel logs handler.
+type lineSpyHandler struct {
+	mu    sync.Mutex
+	lines []drainLine
+}
+
+func (h *lineSpyHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *lineSpyHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.lines = append(h.lines, drainLine{level: r.Level, message: r.Message})
+	return nil
+}
+
+func (h *lineSpyHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *lineSpyHandler) WithGroup(string) slog.Handler      { return h }
+
+// levelOf returns the level of the first line with message, and whether there
+// is one.
+func (h *lineSpyHandler) levelOf(message string) (slog.Level, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, line := range h.lines {
+		if line.message == message {
+			return line.level, true
+		}
+	}
+	return 0, false
+}
+
+// factory returns a LoggerProviderFactory that hands the spy to the process
+// logger and calls onShutdown when the logs pipeline is flushed.
+func (h *lineSpyHandler) factory(onShutdown func()) func(context.Context, config.OTelConfig, *log.Logger) (slog.Handler, func(context.Context) error, error) {
+	return func(context.Context, config.OTelConfig, *log.Logger) (slog.Handler, func(context.Context) error, error) {
+		return h, func(context.Context) error {
+			onShutdown()
+			return nil
+		}, nil
+	}
+}
+
+var _ slog.Handler = (*lineSpyHandler)(nil)
+
+// The drain's log lines, as logDrainResult words them.
+const (
+	panicLine     = "endpoint cache: background worker panicked"
+	cancelledLine = "endpoint cache: cancelled background work still running at exit"
+	finishedLine  = "endpoint cache: background work finished before exit"
+)
 
 // drainInfoRequest is an `info` request, which answers from constants.
 const drainInfoRequest = `{"method":"info","arguments":[],"context":{"request_id":"drain-1"},"api_version":2}` + "\n"
@@ -531,9 +655,16 @@ func newDrainTestWorker(t *testing.T) *drainTestWorker {
 	return w
 }
 
-// start registers the worker with the process registry.
+// start registers the worker with the process registry, for a cluster config
+// with the auto discovery mode.
 func (w *drainTestWorker) start(name string) error {
-	return endpointcache.Go(name, func(ctx context.Context) {
+	return w.startWith(name, config.DiscoveryModeAuto)
+}
+
+// startWith registers the worker for a cluster config with the given
+// configured discovery mode.
+func (w *drainTestWorker) startWith(name string, mode config.DiscoveryMode) error {
+	return endpointcache.Go(name, mode, func(ctx context.Context) {
 		defer close(w.done)
 		w.ctx <- ctx
 		<-w.release
@@ -542,6 +673,13 @@ func (w *drainTestWorker) start(name string) error {
 
 // finish releases the worker.
 func (w *drainTestWorker) finish() { w.once.Do(func() { close(w.release) }) }
+
+// waitStarted waits until the worker runs, which means the call under test
+// has opened its run of the registry.
+func (w *drainTestWorker) waitStarted(t *testing.T) {
+	t.Helper()
+	w.cancelled(t)
+}
 
 // cancelled reports whether the worker started and its context has ended.
 func (w *drainTestWorker) cancelled(t *testing.T) bool {
@@ -600,25 +738,49 @@ func TestInfoStartsNoBackgroundWork(t *testing.T) {
 	}
 }
 
-// The drain stops at 3 seconds for a worker that ignores cancellation,
+// drainWait selects the 3 second default for a zero or negative wait and
+// keeps any other wait.
+func TestDrainWaitSelectsTheDefault(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		wait time.Duration
+		want time.Duration
+	}{
+		{name: "zero", wait: 0, want: endpointcache.DrainWait},
+		{name: "negative", wait: -1, want: endpointcache.DrainWait},
+		{name: "explicit", wait: 5 * time.Second, want: 5 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := drainWait(tc.wait); got != tc.want {
+				t.Fatalf("drainWait(%s) = %s, want %s", tc.wait, got, tc.want)
+			}
+		})
+	}
+}
+
+// The drain stops at its bound for a worker that ignores cancellation,
 // cancels it, and leaves the exit code and the response alone.
-func TestDrainStopsAtThreeSecondsAndKeepsExitCode(t *testing.T) {
+func TestDrainStopsAtItsBoundAndKeepsExitCode(t *testing.T) {
 	cfgPath := writeOTelWiringConfigAtLevel(t, "debug", "")
 	worker := newDrainTestWorker(t)
+	const bound = 200 * time.Millisecond
 
 	code, stdout, stderr, took := drainRun([]string{"--config", cfgPath}, drainInfoRequest,
-		runOptions{ClientFactory: factoryStarting(t, func() error { return worker.start("discovery") })})
+		runOptions{ClientFactory: factoryStarting(t, func() error { return worker.start("discovery") }), DrainWait: bound})
 	if code != 0 {
 		t.Fatalf("exit %d with a slow worker, want 0: %s", code, stderr)
 	}
 	if resp := parseResponse(t, stdout); resp.Error != nil {
 		t.Fatalf("info returned an error: %+v", resp.Error)
 	}
-	if took < endpointcache.DrainWait {
-		t.Fatalf("run ended after %s, before the %s drain bound", took, endpointcache.DrainWait)
+	if took < bound {
+		t.Fatalf("run ended after %s, before the %s drain bound", took, bound)
 	}
-	if took > endpointcache.DrainWait+drainTestSlack {
-		t.Fatalf("run took %s, past the %s drain bound", took, endpointcache.DrainWait)
+	if took > bound+drainTestSlack {
+		t.Fatalf("run took %s, past the %s drain bound", took, bound)
 	}
 	if !worker.cancelled(t) {
 		t.Fatal("the drain did not cancel the slow worker")
@@ -666,7 +828,7 @@ func TestDrainWaitsForWorkThatFinishesInTime(t *testing.T) {
 	cfgPath := writeOTelWiringConfigAtLevel(t, "debug", "")
 	var wrote atomic.Bool
 	start := func() error {
-		return endpointcache.Go("down mark", func(ctx context.Context) {
+		return endpointcache.Go("down mark", config.DiscoveryModeAuto, func(ctx context.Context) {
 			select {
 			case <-time.After(100 * time.Millisecond):
 				wrote.Store(true)
@@ -694,10 +856,11 @@ func TestDrainWaitsForWorkThatFinishesInTime(t *testing.T) {
 func TestPanickingWorkerKeepsExitCode(t *testing.T) {
 	cfgPath := writeOTelWiringConfigAtLevel(t, "warn", "")
 	start := func() error {
-		return endpointcache.Go("discovery", func(context.Context) { panic("simulated worker defect") })
+		return endpointcache.Go("discovery", config.DiscoveryModeAuto, func(context.Context) { panic("simulated worker defect") })
 	}
+	spy := &lineSpyHandler{}
 	code, stdout, stderr, _ := drainRun([]string{"--config", cfgPath}, drainInfoRequest,
-		runOptions{ClientFactory: factoryStarting(t, start)})
+		runOptions{ClientFactory: factoryStarting(t, start), LoggerProviderFactory: spy.factory(func() {})})
 	if code != 0 {
 		t.Fatalf("exit %d after a worker panic, want 0: %s", code, stderr)
 	}
@@ -707,6 +870,9 @@ func TestPanickingWorkerKeepsExitCode(t *testing.T) {
 	if !strings.Contains(stderr, "endpoint cache: background worker panicked") ||
 		!strings.Contains(stderr, "simulated worker defect") {
 		t.Fatalf("stderr lacks the panic line: %s", stderr)
+	}
+	if level, ok := spy.levelOf(panicLine); !ok || level != slog.LevelError {
+		t.Fatalf("panic line logged at %v (present %v), want Error", level, ok)
 	}
 }
 
@@ -721,7 +887,7 @@ func TestSubcommandDrainsBackgroundWork(t *testing.T) {
 		if err := worker.start("discovery"); err != nil {
 			return err
 		}
-		return endpointcache.Go("down mark", func(context.Context) { panic("simulated subcommand defect") })
+		return endpointcache.Go("down mark", config.DiscoveryModeAuto, func(context.Context) { panic("simulated subcommand defect") })
 	}
 	failing := func(*config.CPIConfig, *log.Logger, trace.Tracer) (pve.Client, error) {
 		if err := start(); err != nil {
@@ -746,7 +912,8 @@ func TestSubcommandDrainsBackgroundWork(t *testing.T) {
 }
 
 // A signal ends the drain's wait at once, and the cancelled-work line follows
-// the configured mode: Debug under auto, Warn under an explicit "on".
+// the configured mode of the cluster config that started the worker, Debug
+// under auto and Warn under an explicit "on".
 func TestDrainBackgroundWorkSignalAndLevel(t *testing.T) {
 	cases := []struct {
 		mode config.DiscoveryMode
@@ -759,7 +926,7 @@ func TestDrainBackgroundWorkSignalAndLevel(t *testing.T) {
 		t.Run(string(tc.mode), func(t *testing.T) {
 			endpointcache.Open()
 			worker := newDrainTestWorker(t)
-			if err := worker.start("discovery"); err != nil {
+			if err := worker.startWith("discovery", tc.mode); err != nil {
 				t.Fatal(err)
 			}
 			signalled, cancel := context.WithCancel(context.Background())
@@ -767,7 +934,9 @@ func TestDrainBackgroundWorkSignalAndLevel(t *testing.T) {
 			logger, observed := log.NewObservedLogger(slog.LevelDebug)
 
 			start := time.Now()
-			drainBackgroundWork(signalled, logger, tc.mode, time.Hour)
+			finishesWithin(t, "a drain with an ended context cancels at once", func() {
+				drainBackgroundWork(signalled, logger, time.Hour)
+			})
 			if took := time.Since(start); took > drainTestSlack {
 				t.Fatalf("drain after a signal took %s", took)
 			}
@@ -775,9 +944,38 @@ func TestDrainBackgroundWorkSignalAndLevel(t *testing.T) {
 				t.Fatal("the drain did not cancel the worker")
 			}
 			entries := observed.All()
-			if len(entries) != 1 || entries[0].Level != tc.want ||
-				entries[0].Message != "endpoint cache: cancelled background work still running at exit" {
+			if len(entries) != 1 || entries[0].Level != tc.want || entries[0].Message != cancelledLine {
 				t.Fatalf("entries = %+v, want one cancelled-work line at %s", entries, tc.want)
+			}
+		})
+	}
+}
+
+// A cancelled worker that serves a cluster config with an explicit "on" is
+// reported at Warn, although the job-level mode, which this config leaves
+// unset, reads as auto.
+func TestCancelledWorkerLevelFollowsItsOwnConfigMode(t *testing.T) {
+	cfgPath := writeOTelWiringConfigAtLevel(t, "debug", "")
+	for _, tc := range []struct {
+		mode config.DiscoveryMode
+		want slog.Level
+	}{
+		{mode: config.DiscoveryModeOn, want: slog.LevelWarn},
+		{mode: config.DiscoveryModeAuto, want: slog.LevelDebug},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			worker := newDrainTestWorker(t)
+			spy := &lineSpyHandler{}
+			code, _, stderr, _ := drainRun([]string{"--config", cfgPath}, drainInfoRequest, runOptions{
+				ClientFactory:         factoryStarting(t, func() error { return worker.startWith("discovery", tc.mode) }),
+				LoggerProviderFactory: spy.factory(func() {}),
+				DrainWait:             50 * time.Millisecond,
+			})
+			if code != 0 {
+				t.Fatalf("exit %d: %s", code, stderr)
+			}
+			if level, ok := spy.levelOf(cancelledLine); !ok || level != tc.want {
+				t.Fatalf("cancelled-work line at %v (present %v), want %v", level, ok, tc.want)
 			}
 		})
 	}
@@ -791,17 +989,173 @@ func TestLastDrainWaitsForNothingAfterTheFirst(t *testing.T) {
 	if err := worker.start("discovery"); err != nil {
 		t.Fatal(err)
 	}
-	drainBackgroundWork(context.Background(), log.NewNopLogger(), config.DiscoveryModeAuto, 20*time.Millisecond)
+	drainBackgroundWork(context.Background(), log.NewNopLogger(), 20*time.Millisecond)
 	if !worker.cancelled(t) {
 		t.Fatal("the first drain did not cancel the worker")
 	}
+	assertLastDrainWaitsForNothing(t)
+}
+
+// A drain that a signal ended early leaves nothing for the last drain to wait
+// for, so a signalled process does not wait out the bound the first drain
+// skipped.
+func TestLastDrainWaitsForNothingAfterASignalledDrain(t *testing.T) {
+	endpointcache.Open()
+	worker := newDrainTestWorker(t)
+	if err := worker.start("discovery"); err != nil {
+		t.Fatal(err)
+	}
+	signalled, cancel := context.WithCancel(context.Background())
+	cancel()
+	finishesWithin(t, "a drain with an ended context cancels at once", func() {
+		drainBackgroundWork(signalled, log.NewNopLogger(), time.Hour)
+	})
+	if !worker.cancelled(t) {
+		t.Fatal("the first drain did not cancel the worker")
+	}
+	assertLastDrainWaitsForNothing(t)
+}
+
+// assertLastDrainWaitsForNothing runs the last drain with a long bound and
+// fails unless it returns at once and writes nothing.
+func assertLastDrainWaitsForNothing(t *testing.T) {
+	t.Helper()
 	var stderr bytes.Buffer
 	start := time.Now()
-	drainRemainingBackgroundWork(&stderr, time.Hour)
+	finishesWithin(t, "the last drain waits for a worker an earlier drain cancelled", func() {
+		drainRemainingBackgroundWork(&stderr, time.Hour)
+	})
 	if took := time.Since(start); took > drainTestSlack {
 		t.Fatalf("the last drain waited %s for a worker the first drain cancelled", took)
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("the last drain wrote %q with no panic to report", stderr.String())
+	}
+}
+
+// A SIGTERM that arrives while the main path's drain waits ends the wait at
+// once, through the root context, and the process still exits with the code it
+// computed and the response it wrote. The last drain follows the first, and
+// it too returns at once.
+func TestSignalEndsTheMainDrainAndKeepsExitCode(t *testing.T) {
+	cfgPath := writeOTelWiringConfigAtLevel(t, "debug", "")
+	worker := newDrainTestWorker(t)
+	holdSIGTERM(t)
+
+	var stdout, stderr bytes.Buffer
+	codeCh := make(chan int, 1)
+	go func() {
+		codeCh <- runWithArgs([]string{"--config", cfgPath}, strings.NewReader(drainInfoRequest), &stdout, &stderr,
+			runOptions{ClientFactory: factoryStarting(t, func() error { return worker.start("discovery") }), DrainWait: time.Hour})
+	}()
+	t.Cleanup(func() {
+		worker.finish()
+		select {
+		case <-codeCh:
+		case <-time.After(10 * time.Second):
+			t.Error("runWithArgs never returned")
+		}
+	})
+	worker.waitStarted(t)
+	waitDrainStarted(t)
+	sendSIGTERM(t)
+	start := time.Now()
+	var code int
+	select {
+	case code = <-codeCh:
+		codeCh <- code
+	case <-time.After(drainTestGuard):
+		t.Fatalf("SIGTERM did not end the exit drain: runWithArgs was still waiting after %s", drainTestGuard)
+	}
+	if took := time.Since(start); took > drainTestSlack {
+		t.Fatalf("runWithArgs took %s to return after SIGTERM", took)
+	}
+	if code != 0 {
+		t.Fatalf("exit %d after a signal during the drain, want the computed 0: %s", code, stderr.String())
+	}
+	if resp := parseResponse(t, stdout.String()); resp.Error != nil {
+		t.Fatalf("info returned an error: %+v", resp.Error)
+	}
+	if !worker.cancelled(t) {
+		t.Fatal("the signal did not cancel the slow worker")
+	}
+}
+
+// A SIGTERM that arrives while a subcommand's drain waits ends the wait at
+// once, and the subcommand keeps the exit code it computed instead of dying by
+// signal.
+func TestSignalEndsASubcommandDrainAndKeepsExitCode(t *testing.T) {
+	cfgPath := writeStorageJournalConfig(t, minimalCfg())
+	worker := newDrainTestWorker(t)
+	holdSIGTERM(t)
+	//nolint:unparam // the client always fails so the subcommand exits with code 1
+	failing := func(*config.CPIConfig, *log.Logger, trace.Tracer) (pve.Client, error) {
+		if err := worker.start("discovery"); err != nil {
+			t.Errorf("start background work: %v", err)
+		}
+		return nil, errors.New("dial refused")
+	}
+
+	var stderr bytes.Buffer
+	codeCh := make(chan int, 1)
+	go func() {
+		codeCh <- runWithArgs([]string{"stemcell-refs", "report", "--config", cfgPath}, strings.NewReader(""),
+			&bytes.Buffer{}, &stderr, runOptions{ClientFactory: failing, DrainWait: time.Hour})
+	}()
+	t.Cleanup(func() {
+		worker.finish()
+		select {
+		case <-codeCh:
+		case <-time.After(10 * time.Second):
+			t.Error("runWithArgs never returned")
+		}
+	})
+	worker.waitStarted(t)
+	waitDrainStarted(t)
+	sendSIGTERM(t)
+	start := time.Now()
+	var code int
+	select {
+	case code = <-codeCh:
+		codeCh <- code
+	case <-time.After(drainTestGuard):
+		t.Fatalf("SIGTERM did not end the subcommand's drain: still waiting after %s", drainTestGuard)
+	}
+	if took := time.Since(start); took > drainTestSlack {
+		t.Fatalf("the subcommand took %s to return after SIGTERM", took)
+	}
+	if code != 1 {
+		t.Fatalf("exit %d after a signal during the subcommand's drain, want the computed 1: %s", code, stderr.String())
+	}
+	if !worker.cancelled(t) {
+		t.Fatal("the signal did not cancel the slow worker")
+	}
+}
+
+// The drain runs before the OTel flush, so the drain's own line, and any line
+// a finishing worker logs, reach the exporters before they shut down.
+func TestDrainRunsBeforeTheOTelFlush(t *testing.T) {
+	cfgPath := writeOTelWiringConfigAtLevel(t, "debug", "")
+	start := func() error {
+		return endpointcache.Go("down mark", config.DiscoveryModeAuto, func(context.Context) {})
+	}
+	spy := &lineSpyHandler{}
+	// The flush runs on runWithArgs's own goroutine, which drainRun waits for.
+	flushed, drainLogged := false, false
+	code, _, stderr, _ := drainRun([]string{"--config", cfgPath}, drainInfoRequest, runOptions{
+		ClientFactory: factoryStarting(t, start),
+		LoggerProviderFactory: spy.factory(func() {
+			flushed = true
+			_, drainLogged = spy.levelOf(finishedLine)
+		}),
+	})
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	if !flushed {
+		t.Fatal("the logs pipeline was never flushed")
+	}
+	if !drainLogged {
+		t.Fatal("the OTel flush ran before the drain logged its line")
 	}
 }

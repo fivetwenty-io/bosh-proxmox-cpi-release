@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"runtime/debug"
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 )
 
 // DrainWait bounds how long the exit drain waits for background workers
@@ -29,7 +32,9 @@ var processRegistry = NewRegistry()
 
 // Go starts fn as a background worker in the process registry, as
 // Registry.Go describes.
-func Go(name string, fn func(ctx context.Context)) error { return processRegistry.Go(name, fn) }
+func Go(name string, mode config.DiscoveryMode, fn func(ctx context.Context)) error {
+	return processRegistry.Go(name, mode, fn)
+}
 
 // Drain waits for the process registry's workers and cancels the rest, as
 // Registry.Drain describes.
@@ -57,24 +62,30 @@ type Registry struct {
 // drain. A worker belongs to the run it registered in, so a worker still
 // running after its run was drained cannot hold up or join a later run.
 type workerRun struct {
-	// ctx is every worker's context. The drain cancels it.
+	// ctx is every worker's context. A drain cancels it when it gives up, and
+	// a drain that finds it cancelled, or sees it cancelled while it waits,
+	// returns at once. So drains of one run never add up to more than one
+	// bound, and a later drain, such as the last one after a signal ended the
+	// first, never waits again.
 	ctx    context.Context
 	cancel context.CancelFunc
 	// closed is set when the first drain starts, and Go refuses workers
 	// from then on.
 	closed bool
-	// cancelled is set when the first drain returns. A later drain of the
-	// same run waits for nothing.
-	cancelled bool
-	// deadline is the first drain's bound, which every drain of the run
-	// shares, so overlapping drains never wait longer than one bound.
-	deadline time.Time
 	// idle is closed once the run is closed and has no running worker.
 	idle    chan struct{}
-	workers map[uint64]string
+	workers map[uint64]worker
 	nextID  uint64
 	started int
 	panics  []WorkerPanic
+}
+
+// worker is a running worker as its run records it.
+type worker struct {
+	name string
+	// mode is the configured discovery mode of the cluster config that
+	// started the worker, which decides the level of its cancellation.
+	mode config.DiscoveryMode
 }
 
 // WorkerPanic records a worker that panicked. The registry recovers the panic,
@@ -101,6 +112,11 @@ type DrainResult struct {
 	// sorted order. Each was cancelled and is expected to write nothing, and
 	// the drain did not wait for it to return.
 	Cancelled []string
+	// CancelledLevel is the level for the line that reports Cancelled: the
+	// highest Level among the cancelled workers, each judged by the
+	// configured mode of the cluster config that started it. It is Debug when
+	// no worker was cancelled.
+	CancelledLevel slog.Level
 	// Panics holds the workers that panicked and that no earlier drain
 	// reported.
 	Panics []WorkerPanic
@@ -114,7 +130,7 @@ func NewRegistry() *Registry {
 // newWorkerRun returns an open run with no workers.
 func newWorkerRun() *workerRun {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &workerRun{ctx: ctx, cancel: cancel, idle: make(chan struct{}), workers: map[uint64]string{}}
+	return &workerRun{ctx: ctx, cancel: cancel, idle: make(chan struct{}), workers: map[uint64]worker{}}
 }
 
 // Open starts a new run when the current one has been drained, so a process
@@ -133,11 +149,14 @@ func (r *Registry) Open() {
 
 // Go starts fn on its own goroutine as a worker of the current run. name
 // identifies the worker in the drain's result, for example "discovery" or
-// "down mark", and must not be empty.
+// "down mark", and must not be empty. mode is the configured discovery mode
+// of the cluster config the worker serves, from CPIConfig.DiscoveryModeValue
+// and not the effective mode, and it sets the level at which the drain
+// reports the worker if it has to cancel it.
 //
 // fn receives the run's context, which the drain cancels when its wait runs
-// out. fn must pass that context to every lock wait and request it makes, and
-// check it before it writes, so a cancelled worker writes nothing. A write
+// out. fn must pass that context to every lock wait and request it makes. A
+// write through Update after the cancel is refused by the store, and a write
 // already under way finishes through the temp-file-and-rename path or not at
 // all, so the cache never holds a torn file. A worker that ignores
 // cancellation does not hold up the drain, and the process exit ends it.
@@ -145,7 +164,7 @@ func (r *Registry) Open() {
 // A panic in fn is recovered and reported by the next drain. Go returns
 // ErrRegistryClosed, without running fn, once the run's drain has started.
 // It also refuses an empty name or a nil fn.
-func (r *Registry) Go(name string, fn func(ctx context.Context)) error {
+func (r *Registry) Go(name string, mode config.DiscoveryMode, fn func(ctx context.Context)) error {
 	switch {
 	case name == "":
 		return fmt.Errorf("%s: background worker needs a name", cacheLabel)
@@ -160,7 +179,7 @@ func (r *Registry) Go(name string, fn func(ctx context.Context)) error {
 	}
 	id := run.nextID
 	run.nextID++
-	run.workers[id] = name
+	run.workers[id] = worker{name: name, mode: mode}
 	run.started++
 	r.mu.Unlock()
 
@@ -191,17 +210,18 @@ func (r *Registry) work(run *workerRun, id uint64, name string, fn func(ctx cont
 
 // Drain closes the current run, waits for its workers to return, and then
 // cancels the run's context. The wait ends when every worker has returned,
-// when wait has passed since this drain started, when the run's first drain
-// reaches its own bound, or when ctx ends, whichever comes first, so a drain
-// never blocks past its bound, even for a worker that ignores cancellation. A drain with no running worker returns at
-// once. A nil ctx waits for wait alone, and a wait of zero or less cancels at
-// once.
+// when wait has passed since this drain started, when any other drain of the
+// run gives up, or when ctx ends, whichever comes first, so a drain never
+// blocks past its bound, even for a worker that ignores cancellation. A drain
+// with no running worker returns at once. A nil ctx waits for wait alone, and
+// a wait of zero or less cancels at once.
 //
-// The first drain closes the run, and Go refuses workers from then on. A
-// drain that overlaps it shares its bound, and a drain after it has returned
-// waits for nothing, so two drains of one run never add up to more than one
-// bound. A drain never changes anything about the call's result, and the
-// caller decides how to log what it reports.
+// The first drain closes the run, and Go refuses workers from then on. Once
+// any drain of the run gives up, every drain of the run returns, so a longer
+// drain never outlasts a shorter one that overlaps it, and a drain after the
+// run was cancelled waits for nothing. Two drains of one run therefore never
+// add up to more than one bound. A drain never changes anything about the
+// call's result, and the caller decides how to log what it reports.
 func (r *Registry) Drain(ctx context.Context, wait time.Duration) DrainResult {
 	start := time.Now()
 	if ctx == nil {
@@ -213,44 +233,39 @@ func (r *Registry) Drain(ctx context.Context, wait time.Duration) DrainResult {
 	run := r.run
 	if !run.closed {
 		run.closed = true
-		run.deadline = start.Add(wait)
 		if len(run.workers) == 0 {
 			close(run.idle)
 		}
 	}
-	deadline := run.deadline
-	if own := start.Add(wait); own.Before(deadline) {
-		deadline = own
-	}
-	if run.cancelled {
-		deadline = start
-	}
 	r.mu.Unlock()
 
-	awaitIdle(ctx, run.idle, time.Until(deadline))
+	awaitIdle(ctx, run.ctx, run.idle, wait)
 	run.cancel()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	run.cancelled = true
 	result := DrainResult{Started: run.started, Waited: time.Since(start), Panics: run.panics}
 	run.panics = nil
-	for _, name := range run.workers {
-		result.Cancelled = append(result.Cancelled, name)
+	result.CancelledLevel = Level(config.DiscoveryModeAuto)
+	for _, w := range run.workers {
+		result.Cancelled = append(result.Cancelled, w.name)
+		result.CancelledLevel = max(result.CancelledLevel, Level(w.mode))
 	}
 	slices.Sort(result.Cancelled)
 	return result
 }
 
-// awaitIdle waits for idle to close, for at most limit, or until ctx ends. It
-// starts no timer when idle is already closed or limit has passed.
-func awaitIdle(ctx context.Context, idle <-chan struct{}, limit time.Duration) {
+// awaitIdle waits for idle to close, for at most limit, or until ctx or runCtx
+// ends. runCtx is the run's context, which another drain cancels when it
+// gives up. It starts no timer when idle is already closed or limit has
+// passed.
+func awaitIdle(ctx, runCtx context.Context, idle <-chan struct{}, limit time.Duration) {
 	select {
 	case <-idle:
 		return
 	default:
 	}
-	if limit <= 0 || ctx.Err() != nil {
+	if limit <= 0 || ctx.Err() != nil || runCtx.Err() != nil {
 		return
 	}
 	timer := time.NewTimer(limit)
@@ -259,5 +274,6 @@ func awaitIdle(ctx context.Context, idle <-chan struct{}, limit time.Duration) {
 	case <-idle:
 	case <-timer.C:
 	case <-ctx.Done():
+	case <-runCtx.Done():
 	}
 }

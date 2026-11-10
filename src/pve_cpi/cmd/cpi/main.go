@@ -352,7 +352,7 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// rootCtx ends the wait early on SIGINT or SIGTERM, so a signalled process
 	// cancels its background work and exits at once. The drain never touches
 	// the exit code.
-	defer drainBackgroundWork(rootCtx, logger, cfg.DiscoveryModeValue(), opts.DrainWait)
+	defer drainBackgroundWork(rootCtx, logger, opts.DrainWait)
 
 	logger.Info("cpi: starting", log.String("release_version", releaseVersionLabel(cfg.ReleaseVersion)),
 		log.String("package_version", version.Version), log.String("build_date", version.BuildDate))
@@ -592,19 +592,24 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 
 // drainBackgroundWork waits for the endpoint cache's background workers, for
 // at most wait or endpointcache.DrainWait when wait is zero, cancels the ones
-// still running, and logs what the drain found on logger. mode is the
-// configured discovery mode, which raises the cancelled-work line from Debug
-// to Warn under an explicit "on", as endpointcache.Level decides.
-func drainBackgroundWork(ctx context.Context, logger *log.Logger, mode config.DiscoveryMode, wait time.Duration) {
-	logDrainResult(logger, mode, endpointcache.Drain(ctx, drainWait(wait)))
+// still running, and logs what the drain found on logger. The cancelled-work
+// line is at the level the drain reports, which is Warn when a cancelled
+// worker serves a cluster config with an explicit "on" and Debug otherwise.
+func drainBackgroundWork(ctx context.Context, logger *log.Logger, wait time.Duration) {
+	logDrainResult(logger, endpointcache.Drain(ctx, drainWait(wait)))
 }
 
 // drainRemainingBackgroundWork is runWithArgs's last drain. On the main path
 // it finds the registry already drained and returns at once. On the
 // subcommands, which log through a no-op logger, it is the only drain, and it
-// reports a panicked worker on stderr, the one finding a defect produces.
+// reports a panicked worker on stderr, the one finding a defect produces. A
+// SIGINT or SIGTERM during its wait ends the wait at once, and the process
+// still exits with the code the caller computed, because the signal is caught
+// here rather than left to kill the process.
 func drainRemainingBackgroundWork(stderr io.Writer, wait time.Duration) {
-	result := endpointcache.Drain(context.Background(), drainWait(wait))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	result := endpointcache.Drain(ctx, drainWait(wait))
 	if len(result.Panics) == 0 {
 		return
 	}
@@ -613,7 +618,7 @@ func drainRemainingBackgroundWork(stderr io.Writer, wait time.Duration) {
 		fmt.Fprintf(stderr, "cpi: background workers panicked (%d), and the logger failed: %s\n", len(result.Panics), err)
 		return
 	}
-	logDrainResult(logger, config.DiscoveryModeAuto, result)
+	logDrainResult(logger, result)
 }
 
 // drainWait returns wait, or endpointcache.DrainWait when wait is zero or
@@ -626,11 +631,12 @@ func drainWait(wait time.Duration) time.Duration {
 }
 
 // logDrainResult logs a drain's findings. A panicked worker is an Error with
-// its stack. Cancelled work is a Debug line, or a Warn under an explicit "on",
-// because the operator asked for a cache this call did not finish writing.
-// Work that finished in time is a Debug line, and a call that started no
-// worker logs nothing.
-func logDrainResult(logger *log.Logger, mode config.DiscoveryMode, result endpointcache.DrainResult) {
+// its stack. Cancelled work is logged at the level the drain reports, a Debug
+// line, or a Warn when a cancelled worker serves a cluster config with an
+// explicit "on", because the operator asked for a cache this call did not
+// finish writing. Work that finished in time is a Debug line, and a call that
+// started no worker logs nothing.
+func logDrainResult(logger *log.Logger, result endpointcache.DrainResult) {
 	for _, p := range result.Panics {
 		logger.Error("endpoint cache: background worker panicked",
 			log.String("worker", p.Name),
@@ -640,7 +646,7 @@ func logDrainResult(logger *log.Logger, mode config.DiscoveryMode, result endpoi
 	}
 	switch {
 	case len(result.Cancelled) > 0:
-		logger.LogAttrs(context.Background(), endpointcache.Level(mode),
+		logger.LogAttrs(context.Background(), result.CancelledLevel,
 			"endpoint cache: cancelled background work still running at exit",
 			log.String("workers", strings.Join(result.Cancelled, ", ")),
 			log.Int("started", result.Started),
