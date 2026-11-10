@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/pvetest"
 )
 
@@ -119,6 +120,10 @@ func mustCountLatePin(t *testing.T, l *lab, p *Pool, sink *markRecorder, err err
 		t.Fatalf("ineligible %v, refresh due %v, want both", p.ineligibleNow(dep), p.RefreshDue())
 	}
 	mustDemoted(t, p, d, true)
+	if note, ok := p.walk.noteFor(dep); !ok || note.class != string(PhasePin) ||
+		strings.Contains(note.text, ErrSendByPassed.Error()) {
+		t.Fatalf("failure note = %+v, %v, want the certificate refusal with class pin", note, ok)
+	}
 	wantMarks(t, sink.all(), want)
 	warns := l.entries(slog.LevelWarn, "pve endpoint "+d+": certificate is not one of the 1 pinned")
 	if len(warns) != 1 {
@@ -182,7 +187,7 @@ func TestALatePinFailureStillCounts(t *testing.T) {
 		p.pinFailureAfterSendBy(dep, &ConnectPhaseError{Phase: PhaseTLSHandshake, Endpoint: d.Addr,
 			Err: fmt.Errorf("%w: %w", ErrSendByPassed, ErrPinMismatch)})
 		p.pinFailureAfterSendBy(dep, &ConnectPhaseError{Phase: PhasePin, Endpoint: d.Addr, Err: ErrPinMismatch})
-		p.pinFailureAfterSendBy(nil, refuseIneligible(d.Addr))
+		p.pinFailureAfterSendBy(dep, refuseIneligible(d.Addr))
 		cep := endpointOf(t, p, c.Addr)
 		p.pinFailureAfterSendBy(cep, &ConnectPhaseError{Phase: PhasePin, Endpoint: c.Addr,
 			Err: fmt.Errorf("%w: %w", ErrSendByPassed, ErrPinMismatch)})
@@ -192,6 +197,196 @@ func TestALatePinFailureStillCounts(t *testing.T) {
 		}
 		mustDemoted(t, p, d.Addr, false)
 	})
+}
+
+// A late pin failure leaves the failure note a normal one leaves, so a later
+// failover line names the certificate refusal with the class pin instead of an
+// earlier failure it cannot name.
+func TestALatePinFailureLeavesTheSameFailoverLine(t *testing.T) {
+	lines := make(map[bool]log.Entry, 2)
+	for _, late := range []bool{false, true} {
+		l := newLab(t)
+		c := l.live(t, nil)
+		d := l.otherLeaf(t)
+		p := l.poolWith(t, nil, nil, nil, configured(c.Addr), node(d.Addr, "pve3", true, Pin{9}))
+		dep := endpointOf(t, p, d.Addr)
+		if _, ok := p.promote(dep, 0); !ok {
+			t.Fatal("the discovered endpoint should become active")
+		}
+		o, err := p.routedTransportsAt(d.Addr, "127.0.0.1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if late {
+			lateSendBy(o)
+		}
+		ctx := WithSendBy(context.Background(), time.Now().Add(time.Hour), http.MethodGet, "/version")
+		resp, err := send(t, ctx, p, http.MethodGet, d.Addr, "/version", "")
+		closeBody(resp)
+		if err == nil || !p.ineligibleNow(dep) {
+			t.Fatalf("late %v: the routed read should fail and make the endpoint ineligible, got %v", late, err)
+		}
+		resp, err = send(t, context.Background(), p, http.MethodGet, c.Addr, "/version", "")
+		mustStatus(t, resp, err, http.StatusOK)
+		found := l.entries(slog.LevelWarn, "pve endpoint failover: "+d.Addr+" unreachable")
+		if len(found) != 1 {
+			t.Fatalf("late %v: failover lines = %+v, want one", late, found)
+		}
+		lines[late] = found[0]
+	}
+	for late, e := range lines {
+		if class, _ := e.Attrs["class"].(string); class != string(PhasePin) {
+			t.Errorf("late %v: failover class = %q, want pin (line %q)", late, class, e.Message)
+		}
+		if !strings.Contains(e.Message, "certificate refused for this discovered endpoint") &&
+			!strings.Contains(e.Message, "failed to verify certificate") {
+			t.Errorf("late %v: the failover line should name the certificate refusal, got %q", late, e.Message)
+		}
+		if strings.Contains(e.Message, "an earlier failure in this call") {
+			t.Errorf("late %v: the failover line names no cause: %q", late, e.Message)
+		}
+	}
+}
+
+// The final hop is decided from the hops the walk made, not from the position
+// in the order. Two discovered entries turn ineligible during the first dial,
+// so the slow third discovered endpoint is the second hop made, with one
+// eligible entry after it, and it keeps its header deadline. The fourth
+// discovered endpoint then answers.
+func TestFinalHopCountsTheHopsMade(t *testing.T) {
+	l := newLab(t)
+	const a, d1, d2 = "pve6.example.invalid:8006", "pve1.example.invalid:8006", "pve2.example.invalid:8006"
+	routes := pvetest.NewRoutes()
+	routes.HandleFunc(http.MethodGet, "/version", func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"data":{"version":"9.0.2"}}`))
+	})
+	d3 := l.live(t, routes)
+	d4 := l.live(t, nil)
+	var p *Pool
+	l.refuseDial(a, func() {
+		for _, addr := range []string{d1, d2} {
+			dep := endpointOf(t, p, addr)
+			p.makeIneligible(dep, &ConnectPhaseError{Phase: PhasePin, Endpoint: dep.addr, Err: ErrPinMismatch})
+		}
+	})
+	p = newPool(t, Config{
+		Base: baseFor(l.ca, l.d), Logger: l.logger, headerDeadline: 100 * time.Millisecond,
+		Endpoints: []Endpoint{configured(a), node(d1, "pve1", true, Pin{1}), node(d2, "pve2", true, Pin{2}),
+			node(d3.Addr, "pve3", true, PinOf(l.leaf.DER)), node(d4.Addr, "pve4", true, PinOf(l.leaf.DER))},
+	})
+	order, _ := p.walkOrder(false)
+	wantOrder(t, order, a, d1, d2, d3.Addr, d4.Addr)
+	resp, err := send(t, context.Background(), p, http.MethodGet, a, "/version", "")
+	mustStatus(t, resp, err, http.StatusOK)
+	mustActive(t, p, d4.Addr)
+}
+
+// The refusal of a hop and the count of eligible entries its deadline is
+// decided from come from one lock acquisition, so the two never disagree about
+// the hop's own endpoint. While another goroutine fails and restores the
+// endpoint's pin, a reader that finds it eligible counts it, and one that finds
+// it ineligible does not. Run under -race this also checks that the flag is
+// only touched under Pool.mu.
+func TestEligibilityAndCountAreReadTogether(t *testing.T) {
+	l := newLab(t)
+	p := l.poolWith(t, nil, nil, nil, configured("c1:8006"),
+		node("d1:8006", "pve1", true, Pin{1}), node("d2:8006", "pve2", true, Pin{2}))
+	d1, d2 := endpointOf(t, p, "d1:8006"), endpointOf(t, p, "d2:8006")
+	order := []*endpoint{d1, d2}
+	stop := make(chan struct{})
+	var flipper sync.WaitGroup
+	flipper.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			p.mu.Lock()
+			d1.ineligible = !d1.ineligible
+			p.mu.Unlock()
+		}
+	})
+	var (
+		readers sync.WaitGroup
+		bad     atomic.Int64
+	)
+	for range 4 {
+		readers.Go(func() {
+			for range 20000 {
+				eligible, n := p.eligibleFrom(d1, order)
+				if eligible != (n == 2) {
+					bad.Add(1)
+				}
+			}
+		})
+	}
+	readers.Wait()
+	close(stop)
+	flipper.Wait()
+	if n := bad.Load(); n != 0 {
+		t.Fatalf("%d reads found the endpoint's eligibility and the count of eligible entries disagreeing", n)
+	}
+	if first, n := p.eligibleFrom(nil, nil); !first || n != 0 {
+		t.Fatalf("eligibleFrom(nil, nil) = %v, %d, want true, 0", first, n)
+	}
+}
+
+// A hop reads the refusal check and the count of eligible entries after it
+// together. While another goroutine fails and restores the hop endpoint's pin,
+// every hop that is not refused has a configured endpoint after it, so none of
+// them is the final hop and none may take the clone without the header
+// deadline.
+func TestAHopNeverLosesItsDeadlineToAPinFailureOfItsOwnEndpoint(t *testing.T) {
+	l := newLab(t)
+	const d, c = "d1.example.invalid:8006", "c1.example.invalid:8006"
+	l.refuseDial(d, nil)
+	p := l.poolWith(t, nil, nil, nil, configured(c), node(d, "pve1", true, Pin{1}))
+	dep, cep := endpointOf(t, p, d), endpointOf(t, p, c)
+	var plainDials atomic.Int64
+	plain := dep.transports.plain
+	dial := plain.DialTLSContext
+	plain.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		plainDials.Add(1)
+		return dial(ctx, network, addr)
+	}
+	stop := make(chan struct{})
+	var flipper sync.WaitGroup
+	flipper.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			p.mu.Lock()
+			dep.ineligible = !dep.ineligible
+			p.mu.Unlock()
+		}
+	})
+	var (
+		hops, refused int
+		req           = apiRequest(t, context.Background(), http.MethodGet, c, "/version", "")
+	)
+	for range 20000 {
+		w := p.newWalker(req, false, defaultBounds())
+		w.order = []*endpoint{dep, cep}
+		hop := w.try(0, dep, nil)
+		if errors.Is(hop.err, errIneligible) {
+			refused++
+		} else {
+			hops++
+		}
+	}
+	close(stop)
+	flipper.Wait()
+	if hops == 0 || refused == 0 {
+		t.Fatalf("hops %d, refused %d, want some of each so both outcomes are checked", hops, refused)
+	}
+	if n := plainDials.Load(); n != 0 {
+		t.Fatalf("%d hops with an eligible endpoint after them went out without the header deadline", n)
+	}
 }
 
 // closeWatch records whether a connection was closed.

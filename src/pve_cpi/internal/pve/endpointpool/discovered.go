@@ -205,15 +205,24 @@ func (p *Pool) ineligibleNow(ep *endpoint) bool {
 // eligibleAmong counts the endpoints in eps that have not failed their pin in
 // this process.
 func (p *Pool) eligibleAmong(eps []*endpoint) int {
+	_, n := p.eligibleFrom(nil, eps)
+	return n
+}
+
+// eligibleFrom reports whether ep, the endpoint a hop is about to go to, has
+// not failed its pin in this process, and counts the endpoints in eps, the
+// order from that hop on, that have not. A nil ep is eligible. Both answers
+// come from one acquisition of Pool.mu, so a pin failure of ep cannot fall
+// between the refusal and the count the hop's deadline is decided from.
+func (p *Pool) eligibleFrom(ep *endpoint, eps []*endpoint) (eligible bool, n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	n := 0
-	for _, ep := range eps {
-		if !ep.ineligible {
+	for _, e := range eps {
+		if !e.ineligible {
 			n++
 		}
 	}
-	return n
+	return ep == nil || !ep.ineligible, n
 }
 
 // refuseIneligible returns the error for a request the pool will not send to
@@ -266,10 +275,9 @@ func (p *Pool) connectFailed(ep *endpoint, phase Phase, err error) {
 // phase gets a mark, and dates it. Only the endpoint's first failure in this
 // process gets one, and an endpoint that already failed its pin gets none,
 // because makeIneligible sets marked with the pin mark, which must be the last
-// mark for the endpoint. The decision and the date
-// are made under Pool.mu, together with the pin mark's, so a mark that loses
-// the race to a pin mark is never sent, and one that wins it is dated before
-// the pin mark.
+// mark for the endpoint. The decision and the date are made under Pool.mu,
+// together with the pin mark's, so a mark that loses the race to a pin mark is
+// never sent, and one that wins it is dated before the pin mark.
 func (p *Pool) takeFirstMark(ep *endpoint, phase Phase) (Mark, bool) {
 	now := p.now()
 	p.mu.Lock()
@@ -329,12 +337,11 @@ func (p *Pool) makeIneligible(ep *endpoint, err error) (Mark, bool) {
 // its outcome demotes nothing. The certificate was still refused, so the
 // endpoint gets every effect of a pin failure: it becomes ineligible, a refresh
 // becomes due, the Warn line is logged, and a pin mark is written. The cause
-// the line and the mark see is the certificate refusal without the send-by
-// wrapping. Every other error, the pool's own ineligible refusal among them,
-// is left alone.
+// the line, the failure note, and the mark see is the certificate refusal
+// without the send-by wrapping. Every other error is left alone.
 func (p *Pool) pinFailureAfterSendBy(ep *endpoint, err error) {
 	if ep == nil || ep.kind != KindDiscovered || !errors.Is(err, ErrSendByPassed) ||
-		!errors.Is(err, ErrPinMismatch) || errors.Is(err, errIneligible) {
+		!errors.Is(err, ErrPinMismatch) {
 		return
 	}
 	cpe, ok := AsConnectPhase(err)
@@ -346,6 +353,7 @@ func (p *Pool) pinFailureAfterSendBy(ep *endpoint, err error) {
 	if errors.As(err, &refused) {
 		cause = &ConnectPhaseError{Phase: PhasePin, Endpoint: cpe.Endpoint, Err: refused}
 	}
+	p.walk.note(ep, noteOf(nil, cause, string(PhasePin)))
 	p.connectFailed(ep, PhasePin, cause)
 }
 

@@ -354,13 +354,82 @@ func TestGuardHookIgnoresACallThatReturns(t *testing.T) {
 	if len(sink.all()) != 1 || len(hook.all()) != 1 {
 		t.Fatalf("sink %+v, hook %v, want one call each", sink.all(), hook.all())
 	}
-	for _, e := range l.obs.All() {
-		if strings.Contains(e.Message, "panicked") {
-			t.Fatalf("a call that returns logged %q", e.Message)
+	mustLogNoPanic := func(when string) {
+		t.Helper()
+		for _, e := range l.obs.All() {
+			if strings.Contains(e.Message, "panicked") {
+				t.Fatalf("%s logged %q", when, e.Message)
+			}
 		}
 	}
-	quiet := l.poolWith(t, nil, nil, nil, configured("c1:8006"))
-	quiet.markDown(Mark{Endpoint: "c1:8006", Class: PhaseDial, At: time.Now()})
+	mustLogNoPanic("a call that returns")
+	c := l.live(t, nil)
+	quiet := l.poolWith(t, nil, nil, nil, configured(c.Addr))
+	quiet.markDown(Mark{Endpoint: c.Addr, Class: PhaseDial, At: time.Now()})
+	mustLogNoPanic("a mark with no sink")
+	mustOK(t, quiet, http.MethodGet, c.Addr, "/version", "")
+	mustLogNoPanic("a request answered with no hooks")
+}
+
+// credentialSink and credentialHook panic with a value that carries a PVE API
+// token, as a defect that formats a request header into its panic would.
+type credentialSink struct{}
+
+const panickingToken = "PVEAPIToken=root@pam!cpi=3c1f9a52-secret-value"
+
+func (credentialSink) MarkDown(Mark) { panic("sink defect with " + panickingToken) }
+
+type credentialHook struct{}
+
+func (credentialHook) FirstAnswer(string) { panic("hook defect with " + panickingToken) }
+
+// The panic value a guarded hook logs goes through the log scrubber, so a
+// credential in the value never reaches the log.
+func TestGuardHookScrubsThePanicValue(t *testing.T) {
+	l := newLab(t)
+	p := l.poolWith(t, credentialSink{}, credentialHook{}, nil, configured("c1:8006"))
+	p.markDown(Mark{Endpoint: "c1:8006", Class: PhaseDial, At: time.Now()})
+	p.tellFirstAnswer("c1:8006")
+	var seen int
+	for _, e := range l.obs.All() {
+		if !strings.Contains(e.Message, "panicked") {
+			continue
+		}
+		seen++
+		got, _ := e.Attrs["panic"].(string)
+		if got == "" || strings.Contains(got, "3c1f9a52-secret-value") || !strings.Contains(got, "PVEAPIToken") {
+			t.Errorf("%q logged the panic value %q, want it with the token value masked", e.Message, got)
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("panic lines = %d, want one for the sink and one for the hook", seen)
+	}
+}
+
+// Every mark the pool hands to the sink carries a time with no monotonic
+// reading, so a comparison of two marks for one endpoint is the wall-clock
+// comparison the cache's merge makes. A pool on the real clock would otherwise
+// order its own marks by a clock the merge never sees.
+func TestMarkTimesCarryNoMonotonicReading(t *testing.T) {
+	l := newLab(t)
+	sink := &markRecorder{}
+	p := l.poolWith(t, sink, nil, nil, configured("c1:8006"), node("d1:8006", "pve1", true, Pin{1}))
+	d1 := endpointOf(t, p, "d1:8006")
+	p.connectFailed(d1, PhaseDial, &ConnectPhaseError{Phase: PhaseDial, Endpoint: d1.addr,
+		Err: errors.New("connection refused")})
+	p.connectFailed(d1, PhasePin, &ConnectPhaseError{Phase: PhasePin, Endpoint: d1.addr, Err: ErrPinMismatch})
+	marks := sink.all()
+	if len(marks) != 2 {
+		t.Fatalf("marks = %+v, want a dial mark and a pin mark", marks)
+	}
+	for _, m := range marks {
+		if m.At != m.At.Round(0) {
+			t.Errorf("the %s mark's time %v keeps a monotonic reading", m.Class, m.At)
+		}
+	}
+	if !marks[1].At.After(marks[0].At) {
+		t.Errorf("the pin mark must be dated after the dial mark: %+v", marks)
+	}
 }
 
 // mustCertificateRefusal fails the test unless err is the pool's refusal of an
@@ -371,6 +440,9 @@ func mustCertificateRefusal(t *testing.T, err error) {
 	var cve *tls.CertificateVerificationError
 	if !errors.As(err, &cve) {
 		t.Fatalf("the refusal should be a certificate verification error, got %T: %v", err, err)
+	}
+	if cpe, ok := AsConnectPhase(err); !ok || cpe.Phase != PhasePin {
+		t.Fatalf("the refusal should carry the pin phase, got %+v, %v", cpe, ok)
 	}
 	if !errors.Is(err, errIneligible) || !errors.Is(err, ErrPinMismatch) || IsMaybeSent(err) {
 		t.Fatalf("the refusal should name the ineligible endpoint and stay unsent, got %v", err)

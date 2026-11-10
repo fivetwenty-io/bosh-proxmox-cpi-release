@@ -479,7 +479,8 @@ func (w *walker) rememberStatusHop() {
 // discovered endpoint that failed its pin after the walk read its order gets
 // nothing, and the hop is refused before any dial.
 func (w *walker) try(i int, ep *endpoint, body io.ReadCloser) hopResult {
-	if w.p.ineligibleNow(ep) {
+	eligible, left := w.p.eligibleFrom(ep, w.order[i:])
+	if !eligible {
 		closeSendBody(w.req, body)
 		return ineligibleHop(ep)
 	}
@@ -492,7 +493,7 @@ func (w *walker) try(i int, ep *endpoint, body io.ReadCloser) hopResult {
 		clone.Body = body
 	}
 	attr := attributable(w.req.URL.Path, ep)
-	withDeadline := w.wantsDeadline(i, attr)
+	withDeadline := w.deadlineFor(attr, left)
 	w.made++
 	resp, err := ep.transports.pick(withDeadline).RoundTrip(clone)
 	if err == nil && resp == nil {
@@ -522,17 +523,40 @@ func (w *walker) try(i int, ep *endpoint, body io.ReadCloser) hopResult {
 // endpoint gets it, and never on the walk's final hop, so the last try waits
 // for a slow answer as a request to a single host does today.
 func (w *walker) wantsDeadline(i int, attributable bool) bool {
-	return w.class == classIdempotent && attributable && !w.finalHop(i)
+	return w.deadlineFor(attributable, w.p.eligibleAmong(w.order[i:]))
 }
 
-// finalHop reports whether hop i, to w.order[i], is the walk's final hop. The
-// walk may still make one hop for each endpoint from w.order[i] on that is
-// still eligible, up to the hop cap, so hop i is final when it is the hop that
-// reaches the cap or when every endpoint after it in the order has failed its
-// pin since the walk read the order. Without such an endpoint this is exactly
-// finalHop(i, w.limit), because every earlier hop was made.
-func (w *walker) finalHop(i int) bool {
-	return finalHop(w.made, w.bounds.hopLimit(w.made+w.p.eligibleAmong(w.order[i:])))
+// deadlineFor is wantsDeadline for a hop with left eligible endpoints from its
+// own on, which try reads under the same lock as its refusal check.
+func (w *walker) deadlineFor(attributable bool, left int) bool {
+	return w.class == classIdempotent && attributable && !w.finalHop(left)
+}
+
+// finalHop reports whether the hop about to be made is the walk's final hop,
+// given left, the number of endpoints from the hop's own to the end of the
+// order that have not failed their pin. The walk may still make one hop for
+// each of them, up to the hop cap, so the hop is final when it is the hop that
+// reaches the cap or when every endpoint after it has failed its pin since the
+// walk read the order. A hop that was refused made no hop, so the hops made
+// stand in for the position in the order. Without such an endpoint this is
+// exactly finalHop(i, w.limit) for hop i, because every earlier hop was made.
+//
+// The decision is made when the hop starts, and net/http cannot change a
+// response-header deadline once a request is in flight. So a hop that is not
+// final when it starts keeps its deadline even if its last successor fails its
+// pin while it runs, as a hop that the budgets turn into the last one does. The
+// cost is that such a hop can fail on its deadline against a healthy endpoint
+// that is slower than the deadline, with the walk out of endpoints. The caller
+// then gets the unreachable error, and the next walk treats that endpoint as
+// final and waits for it. Sending the request again to the same endpoint
+// without a deadline would end the case, but it would break the rule that each
+// endpoint is tried once, and replacing the deadline with a timer of the
+// walk's own would change the mechanism that every idempotent hop uses, in
+// walks without discovered endpoints too. The case needs a pin failure of a
+// discovered endpoint, in another request, during a read that runs past the
+// deadline, so it is accepted.
+func (w *walker) finalHop(left int) bool {
+	return finalHop(w.made, w.bounds.hopLimit(w.made+left))
 }
 
 // errNoGetBodyResult stands in for the error when GetBody returns neither a
