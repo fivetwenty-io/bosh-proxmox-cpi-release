@@ -32,9 +32,11 @@ const PinRefreshFloor = 10 * time.Minute
 //
 // It is false while the stored identity holds a conflict, because discovery
 // stops until the operator deletes the file. Otherwise it is true when the
-// file holds no node list, which includes a nil p and a section that
+// file holds no discovery section, which includes a nil p and a section that
 // validation dropped for its time, and when next_refresh_after has passed,
-// which includes one that validation dropped for being too far ahead. A pin
+// which includes one that validation dropped for being too far ahead. A
+// section that holds only a failed attempt, with no nodes and no outcome,
+// waits for its next_refresh_after as any other section does. A pin
 // failure makes a refresh due early only when the last attempt, which is the
 // section's discovered_at, is more than PinRefreshFloor old. It never holds
 // back a refresh that is already due, and it counts for nothing when the

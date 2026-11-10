@@ -114,8 +114,11 @@ type Change struct {
 	// and changes nothing else, so every node, pin, confirmation, the outcome,
 	// and the identity stay as stored. It is accepted while a conflict stands
 	// and alongside Conflict. A change that carries it with a Result or a Hint
-	// is refused. When the file holds no discovery section, there is no
-	// refresh time to move, and the attempt records nothing.
+	// is refused. An attempt that carries a Failure also stores it as the
+	// section's last_failure. When the file holds no discovery section, an
+	// attempt with a Failure creates one that holds no nodes and no outcome,
+	// so a discovery that keeps failing waits for its next refresh, and an
+	// attempt without a Failure records nothing.
 	Attempt *DiscoveryAttempt
 }
 
@@ -130,6 +133,11 @@ type DiscoveryAttempt struct {
 	// ahead than MaxRefreshWait is dropped, as validation drops it on read, so
 	// the refresh is due at once.
 	NextRefreshAfter time.Time
+	// Failure is why the discovery ended before it had a result, or empty for
+	// an attempt the trust rules recorded in place of a result. A value
+	// outside the enumeration is refused. An empty Failure leaves the stored
+	// last_failure as it was.
+	Failure DiscoveryFailure
 }
 
 // Stored is the stored file as a writer's build function sees it under the
@@ -286,13 +294,16 @@ func applyConflict(next *Payload, key Key, change Change) error {
 }
 
 // applyAttempt moves next's stored discovery section to change.Attempt's two
-// times. next.Discovery is the raw stored section, so every node, pin, and
+// times, and stores the attempt's failure as its last_failure when it carries
+// one. next.Discovery is the raw stored section, so every node, pin, and
 // confirmation, and the outcome, stay as stored. An attempt never makes a
 // section visible. It records nothing for a section a reader hides for its
-// time, because moving that section's time would show it, and nothing when
-// there is no section. It refuses an attempt whose next refresh is before the
-// attempt, and one dated more than FutureSkew before the stored discovery,
-// because a discovery cannot run before the one it follows.
+// time, because moving that section's time would show it. When there is no
+// section, an attempt with a failure creates one with no nodes and no outcome,
+// and an attempt without one records nothing. It refuses a failure outside the
+// enumeration, an attempt whose next refresh is before the attempt, and one
+// dated more than FutureSkew before the stored discovery, because a discovery
+// cannot run before the one it follows.
 func applyAttempt(next *Payload, change Change, now time.Time, drops *[]Drop) error {
 	attempt := change.Attempt
 	switch {
@@ -306,15 +317,24 @@ func applyAttempt(next *Payload, change Change, now time.Time, drops *[]Drop) er
 		return fmt.Errorf("%w: discovery attempt time is in the future", ErrInvalidChange)
 	case attempt.NextRefreshAfter.Before(attempt.At):
 		return fmt.Errorf("%w: discovery attempt's next refresh is before the attempt", ErrInvalidChange)
+	case attempt.Failure != "" && !attempt.Failure.Valid():
+		return fmt.Errorf("%w: discovery attempt failure is not one of the enumerated values", ErrInvalidChange)
 	}
-	if next.Discovery == nil || next.Discovery.DiscoveredAt.After(now.Add(FutureSkew)) {
+	switch {
+	case next.Discovery == nil && attempt.Failure == "":
 		return nil
-	}
-	if attempt.At.Before(next.Discovery.DiscoveredAt.Add(-FutureSkew)) {
+	case next.Discovery == nil:
+		next.Discovery = &DiscoverySection{Nodes: []DiscoveredNode{}}
+	case next.Discovery.DiscoveredAt.After(now.Add(FutureSkew)):
+		return nil
+	case attempt.At.Before(next.Discovery.DiscoveredAt.Add(-FutureSkew)):
 		return fmt.Errorf("%w: discovery attempt is before the stored discovery", ErrInvalidChange)
 	}
 	next.Discovery.DiscoveredAt = attempt.At.UTC()
 	next.Discovery.NextRefreshAfter = attempt.NextRefreshAfter.UTC()
+	if attempt.Failure != "" {
+		next.Discovery.LastFailure = attempt.Failure
+	}
 	if attempt.NextRefreshAfter.After(now.Add(MaxRefreshWait + FutureSkew)) {
 		next.Discovery.NextRefreshAfter = time.Time{}
 		*drops = append(*drops, Drop{Record: "next_refresh_after", Reason: DropFuture})
@@ -335,6 +355,11 @@ func applyResult(
 	}
 	if result.Cluster.IdentityConflict {
 		return nil, fmt.Errorf("%w: a discovery result carries an identity conflict", ErrInvalidChange)
+	}
+	// A result is a discovery that did not fail, and writing it clears the
+	// stored last_failure, because the section it writes carries none.
+	if result.Discovery.LastFailure != "" {
+		return nil, fmt.Errorf("%w: a discovery result carries a last_failure", ErrInvalidChange)
 	}
 	cluster, found, err := validateCluster(result.Cluster, key)
 	if err != nil {

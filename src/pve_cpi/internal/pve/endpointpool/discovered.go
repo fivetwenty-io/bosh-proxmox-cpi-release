@@ -195,6 +195,46 @@ func (p *Pool) StartedAway() (StartAway, bool) {
 	return *p.startAway, true
 }
 
+// DropDiscovered takes every discovered endpoint out of every later walk and
+// routed request for the rest of the process, and it returns how many it took
+// out. Discovery calls it when the configured endpoints report a cluster
+// identity other than the one the discovered endpoints were pinned under, so
+// none of them may be used again in this call.
+//
+// A dropped endpoint is ineligible, as a discovered endpoint that failed its
+// pin is, so a walk that already read its order refuses the hop before any
+// dial. It is not demoted, marked, or logged, and it makes no refresh due,
+// because nothing failed and discovery itself asked for the drop. When the
+// active endpoint is discovered, the first configured endpoint in walk order
+// becomes active and the generation goes up, so a request in flight on the
+// discovered endpoint cannot make it active again. The idle connections of
+// every dropped endpoint are closed outside the pool's lock. A pool without
+// discovered endpoints, and a second call, change nothing and return zero. It
+// is safe to call concurrently with walks.
+func (p *Pool) DropDiscovered() int {
+	now := p.now()
+	p.mu.Lock()
+	var dropped []*endpoint
+	for _, ep := range p.endpoints {
+		if ep.kind == KindDiscovered && !ep.ineligible {
+			ep.ineligible = true
+			dropped = append(dropped, ep)
+		}
+	}
+	if p.active.kind == KindDiscovered {
+		// A configured endpoint is always eligible, so there is always one.
+		if next := preferredLocked(p.endpoints, now, nil); next != nil {
+			p.active = next
+			p.generation++
+		}
+	}
+	p.mu.Unlock()
+	for _, ep := range dropped {
+		ep.transports.closeIdle()
+	}
+	return len(dropped)
+}
+
 // ineligibleNow reports whether ep failed its pin in this process.
 func (p *Pool) ineligibleNow(ep *endpoint) bool {
 	p.mu.Lock()

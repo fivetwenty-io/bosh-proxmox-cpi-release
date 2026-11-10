@@ -245,7 +245,9 @@ func normalizeHex(s string) (string, bool) {
 // through derive. It returns the nodes a reader may use in the section, and
 // beside it every node the section knows, as storedState describes. The
 // section is nil, with no error, when its own time is ahead of now, and the
-// known nodes are still returned.
+// known nodes are still returned. A last_failure outside the enumeration makes
+// the file unusable, and so does an empty outcome unless the section carries a
+// last_failure, which is a section an attempt created.
 //
 // held is nil on read. A writer passes it to keep in the section a node that
 // would be dropped only for its confirmation time, which is a node held reports
@@ -255,7 +257,12 @@ func normalizeHex(s string) (string, bool) {
 func validateDiscovery(
 	d *DiscoverySection, derive derivation, now time.Time, held func(DiscoveredNode) bool,
 ) (*DiscoverySection, []DiscoveredNode, []Drop, error) {
-	if !d.Outcome.Valid() {
+	if d.LastFailure != "" && !d.LastFailure.Valid() {
+		return nil, nil, nil, fmt.Errorf("%w: discovery last_failure is not one of the enumerated values", ErrPayloadInvalid)
+	}
+	// A section an attempt created has no outcome, because no discovery wrote
+	// a result, and it carries the failure that ended the attempt.
+	if !d.Outcome.Valid() && (d.Outcome != "" || d.LastFailure == "") {
 		return nil, nil, nil, fmt.Errorf("%w: discovery outcome is not one of the enumerated values", ErrPayloadInvalid)
 	}
 	if len(d.Nodes) > 0 && !d.Outcome.holdsNodes() {
@@ -269,6 +276,7 @@ func validateDiscovery(
 		DiscoveredAt:     d.DiscoveredAt.UTC(),
 		NextRefreshAfter: d.NextRefreshAfter.UTC(),
 		Outcome:          d.Outcome,
+		LastFailure:      d.LastFailure,
 		Quorate:          d.Quorate,
 		Nodes:            make([]DiscoveredNode, 0, len(d.Nodes)),
 	}

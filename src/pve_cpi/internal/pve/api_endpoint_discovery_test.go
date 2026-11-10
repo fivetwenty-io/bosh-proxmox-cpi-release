@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -149,10 +152,9 @@ type workerEnv struct {
 	registry *endpointcache.Registry
 	clock    *discClock
 
-	pinFailed atomic.Bool
-	drops     atomic.Int32
-	seen      int
-	runReqs   int
+	pool    *discPool
+	seen    int
+	runReqs int
 }
 
 func newWorkerEnv(t *testing.T, opts workerEnvOptions) *workerEnv {
@@ -177,6 +179,7 @@ func newWorkerEnv(t *testing.T, opts workerEnvOptions) *workerEnv {
 		obs:      obs,
 		registry: endpointcache.NewRegistry(),
 		clock:    &discClock{now: time.Now().UTC().Truncate(time.Second)},
+		pool:     &discPool{},
 	}
 	e.store = e.openStore()
 	return e
@@ -216,11 +219,27 @@ func (e *workerEnv) newWorker() *DiscoveryWorker {
 }
 
 func (e *workerEnv) binding() DiscoveryBinding {
-	return DiscoveryBinding{
-		Client:         markedClient(e.cluster, e.reqs),
-		PinFailed:      e.pinFailed.Load,
-		DropDiscovered: func() { e.drops.Add(1) },
+	return DiscoveryBinding{Client: markedClient(e.cluster, e.reqs), Pool: e.pool}
+}
+
+// discPool stands in for the endpoint pool. It reports the pin failure the
+// test sets, or what refreshDue returns when that is set, and counts drops.
+type discPool struct {
+	pinFailed  atomic.Bool
+	drops      atomic.Int32
+	refreshDue func() bool
+}
+
+func (p *discPool) RefreshDue() bool {
+	if p.refreshDue != nil {
+		return p.refreshDue()
 	}
+	return p.pinFailed.Load()
+}
+
+func (p *discPool) DropDiscovered() int {
+	p.drops.Add(1)
+	return 0
 }
 
 // begin marks the start of a run, so lines and requests count from here.
@@ -418,7 +437,7 @@ func TestDiscoveryWorker_FirstRefreshCachesTheNodes(t *testing.T) {
 	}
 	e.wantLine("api endpoint discovery: cached 2 of 3 nodes of cluster "+p.Cluster.RootCASHA256[:8]+
 		" via "+workerSeed+" (quorate, 2 online)", log.LevelInfo)
-	if e.drops.Load() != 0 {
+	if e.pool.drops.Load() != 0 {
 		t.Fatal("a first use must not drop the discovered endpoints")
 	}
 }
@@ -471,7 +490,7 @@ func TestDiscoveryWorker_DueConditions(t *testing.T) {
 		t.Parallel()
 		e := newWorkerEnv(t, workerEnvOptions{})
 		e.run()
-		e.pinFailed.Store(true)
+		e.pool.pinFailed.Store(true)
 		e.clock.advance(endpointcache.PinRefreshFloor)
 		e.run()
 		if n := e.requests(); n != 0 {
@@ -545,7 +564,7 @@ func TestDiscoveryWorker_DueConditions(t *testing.T) {
 		if p := e.payload(); p.Cluster == nil || !p.Cluster.IdentityConflict {
 			t.Fatalf("identity %+v, want a recorded conflict", p.Cluster)
 		}
-		e.pinFailed.Store(true)
+		e.pool.pinFailed.Store(true)
 		e.clock.advance(2 * endpointcache.MaxRefreshWait)
 		e.run()
 		if n := e.requests(); n != 0 {
@@ -694,8 +713,8 @@ func TestDiscoveryWorker_IdentityChangeUnderVerifySSLTrueReplacesAndLogsError(t 
 		" through configured endpoint "+workerSeed+"; with verify_ssl true the cached nodes and pins are replaced",
 		log.LevelError)
 	e.wantLine("cached 2 of 3 nodes", log.LevelInfo)
-	if e.drops.Load() != 1 {
-		t.Fatalf("DropDiscovered called %d times, want once", e.drops.Load())
+	if e.pool.drops.Load() != 1 {
+		t.Fatalf("DropDiscovered called %d times, want once", e.pool.drops.Load())
 	}
 }
 
@@ -720,8 +739,8 @@ func TestDiscoveryWorker_IdentityChangeUnderVerifySSLFalseIsRefused(t *testing.T
 	if want := e.clock.Now().Add(endpointcache.MaxRefreshWait); !p.Discovery.NextRefreshAfter.Equal(want) {
 		t.Fatalf("next refresh %v, want the attempt's %v", p.Discovery.NextRefreshAfter, want)
 	}
-	if e.drops.Load() != 1 {
-		t.Fatalf("DropDiscovered called %d times, want once", e.drops.Load())
+	if e.pool.drops.Load() != 1 {
+		t.Fatalf("DropDiscovered called %d times, want once", e.pool.drops.Load())
 	}
 }
 
@@ -886,7 +905,7 @@ func TestDiscoveryWorker_BackOffHoldsForADay(t *testing.T) {
 			e.run()
 			// A pin failure does not cut the wait short, because there is
 			// no discovered node to fail one.
-			e.pinFailed.Store(true)
+			e.pool.pinFailed.Store(true)
 			for _, step := range []time.Duration{2 * time.Hour, 21*time.Hour + 59*time.Minute + 59*time.Second} {
 				e.clock.advance(step)
 				e.run()
@@ -905,57 +924,109 @@ func TestDiscoveryWorker_BackOffHoldsForADay(t *testing.T) {
 
 func TestDiscoveryWorker_ReadFailures(t *testing.T) {
 	t.Parallel()
-	rootless := func(e *workerEnv) {
+	rootless := func(e *workerEnv, gone bool) {
 		e.cluster.set(func() {
 			for _, name := range e.cluster.names {
-				e.cluster.rootless[name] = true
+				e.cluster.rootless[name] = gone
 			}
 		})
 	}
-	t.Run("an unreadable root CA on a fresh cache logs at Debug and writes nothing", func(t *testing.T) {
+	// failureOnly checks that p holds only the failed attempt e just made.
+	failureOnly := func(t *testing.T, e *workerEnv, p *endpointcache.Payload, failure endpointcache.DiscoveryFailure) {
+		t.Helper()
+		if p == nil || p.Discovery == nil || p.Cluster != nil {
+			t.Fatalf("payload %+v, want a discovery section and no identity", p)
+		}
+		d := p.Discovery
+		if d.LastFailure != failure || d.Outcome != "" || len(d.Nodes) != 0 || !d.DiscoveredAt.Equal(e.clock.Now()) ||
+			!d.NextRefreshAfter.Equal(e.clock.Now().Add(endpointcache.RefreshInterval)) {
+			t.Fatalf("discovery %+v, want only the %s attempt at %v", d, failure, e.clock.Now())
+		}
+	}
+	t.Run("an unreadable root CA on a fresh cache records the failure and waits an hour", func(t *testing.T) {
 		t.Parallel()
 		e := newWorkerEnv(t, workerEnvOptions{})
-		rootless(e)
+		rootless(e, true)
 		e.run()
-		e.wantLine("api endpoint discovery: no result through "+workerSeed+
-			", because the cluster root CA could not be read; next attempt in 1h", log.LevelDebug)
-		if e.payload() != nil {
-			t.Fatal("a refresh with no root CA wrote the file")
+		line := e.wantLine("api endpoint discovery: no result through "+workerSeed+
+			", because the cluster root CA could not be read; next attempt in 1h", log.LevelInfo)
+		if got := line.Attrs["failure"]; got != string(endpointcache.FailureRootCAUnreadable) {
+			t.Fatalf("failure attribute %v", got)
 		}
-	})
-	t.Run("an unreadable root CA on a fresh cache logs at Warn under on", func(t *testing.T) {
-		t.Parallel()
-		e := newWorkerEnv(t, workerEnvOptions{mode: config.DiscoveryModeOn})
-		rootless(e)
-		e.run()
-		e.wantLine("because the cluster root CA could not be read", log.LevelWarn)
-	})
-	t.Run("an unreadable root CA after a result logs at Info and keeps the nodes", func(t *testing.T) {
-		t.Parallel()
-		e := newWorkerEnv(t, workerEnvOptions{})
-		e.run()
-		before := e.payload()
-		rootless(e)
-		e.clock.advance(endpointcache.RefreshInterval)
-		e.run()
-		e.wantLine("because the cluster root CA could not be read; next attempt in 1h", log.LevelInfo)
-		p := e.payload()
-		if strings.Join(cachedNodeNames(p), ",") != strings.Join(cachedNodeNames(before), ",") ||
-			p.Cluster.RootCASHA256 != before.Cluster.RootCASHA256 || p.Discovery.Outcome != before.Discovery.Outcome {
-			t.Fatalf("a refresh with no root CA changed the result: %+v", p.Discovery)
-		}
-		if !p.Discovery.DiscoveredAt.Equal(e.clock.Now()) ||
-			!p.Discovery.NextRefreshAfter.Equal(e.clock.Now().Add(endpointcache.RefreshInterval)) {
-			t.Fatalf("discovery %+v, want the attempt recorded at %v", p.Discovery, e.clock.Now())
-		}
-		// The attempt holds the next refresh back.
+		failureOnly(t, e, e.payload(), endpointcache.FailureRootCAUnreadable)
+		// The attempt holds the next refresh back on a fresh cache too.
 		e.clock.advance(30 * time.Minute)
 		e.run()
 		if n := e.requests(); n != 0 {
 			t.Fatalf("a refresh inside the attempt's wait sent %d requests", n)
 		}
+		// The same failure an hour later logs at Debug.
+		e.clock.advance(30 * time.Minute)
+		e.run()
+		e.wantLine("because the cluster root CA could not be read", log.LevelDebug)
+		failureOnly(t, e, e.payload(), endpointcache.FailureRootCAUnreadable)
 	})
-	t.Run("a failed node list writes no result", func(t *testing.T) {
+	t.Run("the same failure logs at Warn under on", func(t *testing.T) {
+		t.Parallel()
+		e := newWorkerEnv(t, workerEnvOptions{mode: config.DiscoveryModeOn})
+		rootless(e, true)
+		e.run()
+		e.wantLine("because the cluster root CA could not be read", log.LevelInfo)
+		e.clock.advance(endpointcache.RefreshInterval)
+		e.run()
+		e.wantLine("because the cluster root CA could not be read", log.LevelWarn)
+	})
+	t.Run("an unreadable root CA after a result keeps the nodes, and the recovery logs at Info", func(t *testing.T) {
+		t.Parallel()
+		e := newWorkerEnv(t, workerEnvOptions{})
+		e.run()
+		before := e.payload()
+		rootless(e, true)
+		e.clock.advance(endpointcache.RefreshInterval)
+		e.run()
+		e.wantLine("because the cluster root CA could not be read; next attempt in 1h", log.LevelInfo)
+		p := e.payload()
+		if strings.Join(cachedNodeNames(p), ",") != strings.Join(cachedNodeNames(before), ",") ||
+			p.Cluster.RootCASHA256 != before.Cluster.RootCASHA256 || p.Discovery.Outcome != before.Discovery.Outcome ||
+			!reflect.DeepEqual(p.Discovery.Nodes, before.Discovery.Nodes) {
+			t.Fatalf("a refresh with no root CA changed the result: %+v", p.Discovery)
+		}
+		if p.Discovery.LastFailure != endpointcache.FailureRootCAUnreadable ||
+			!p.Discovery.DiscoveredAt.Equal(e.clock.Now()) ||
+			!p.Discovery.NextRefreshAfter.Equal(e.clock.Now().Add(endpointcache.RefreshInterval)) {
+			t.Fatalf("discovery %+v, want the attempt recorded at %v", p.Discovery, e.clock.Now())
+		}
+		e.clock.advance(30 * time.Minute)
+		e.run()
+		if n := e.requests(); n != 0 {
+			t.Fatalf("a refresh inside the attempt's wait sent %d requests", n)
+		}
+		// The root CA is readable again, and the same node list is cached
+		// at Info because the result follows a failure.
+		rootless(e, false)
+		e.clock.advance(30 * time.Minute)
+		e.run()
+		e.wantLine("api endpoint discovery: cached 2 of 3 nodes", log.LevelInfo)
+		if p := e.payload(); p.Discovery.LastFailure != "" {
+			t.Fatalf("a result left last_failure %q", p.Discovery.LastFailure)
+		}
+		// The next unchanged result is back at Debug.
+		e.clock.advance(endpointcache.RefreshInterval)
+		e.run()
+		e.wantLine("api endpoint discovery: cached 2 of 3 nodes", log.LevelDebug)
+	})
+	t.Run("a new reason logs at Info again", func(t *testing.T) {
+		t.Parallel()
+		e := newWorkerEnv(t, workerEnvOptions{})
+		rootless(e, true)
+		e.run()
+		e.cluster.set(func() { e.cluster.nodesErr = errors.New("HTTP 500") })
+		e.clock.advance(endpointcache.RefreshInterval)
+		e.run()
+		e.wantLine("because GET /nodes gave no usable node list", log.LevelInfo)
+		failureOnly(t, e, e.payload(), endpointcache.FailureNodesUnreadable)
+	})
+	t.Run("a failed node list keeps the cached nodes", func(t *testing.T) {
 		t.Parallel()
 		e := newWorkerEnv(t, workerEnvOptions{})
 		e.run()
@@ -963,11 +1034,20 @@ func TestDiscoveryWorker_ReadFailures(t *testing.T) {
 		e.clock.advance(endpointcache.RefreshInterval)
 		e.run()
 		e.wantLine("because GET /nodes gave no usable node list", log.LevelInfo)
-		if len(cachedNodeNames(e.payload())) != 2 {
-			t.Fatal("a failed node list dropped the cached nodes")
+		p := e.payload()
+		if len(cachedNodeNames(p)) != 2 || p.Discovery.LastFailure != endpointcache.FailureNodesUnreadable {
+			t.Fatalf("discovery %+v, want the two cached nodes and the nodes_unreadable failure", p.Discovery)
 		}
 	})
-	t.Run("an invalid node name writes no result", func(t *testing.T) {
+	t.Run("an empty node list records its own failure", func(t *testing.T) {
+		t.Parallel()
+		e := newWorkerEnv(t, workerEnvOptions{})
+		e.cluster.set(func() { e.cluster.nodeRows = nil })
+		e.run()
+		e.wantLine("because GET /nodes gave no usable node list", log.LevelInfo)
+		failureOnly(t, e, e.payload(), endpointcache.FailureNodesEmpty)
+	})
+	t.Run("an invalid node name records its own failure", func(t *testing.T) {
 		t.Parallel()
 		e := newWorkerEnv(t, workerEnvOptions{})
 		e.cluster.set(func() {
@@ -976,10 +1056,8 @@ func TestDiscoveryWorker_ReadFailures(t *testing.T) {
 			}))
 		})
 		e.run()
-		e.wantLine("because a node name from GET /nodes is not a valid pve-node label", log.LevelDebug)
-		if e.payload() != nil {
-			t.Fatal("a refresh with an invalid node name wrote the file")
-		}
+		e.wantLine("because a node name from GET /nodes is not a valid pve-node label", log.LevelInfo)
+		failureOnly(t, e, e.payload(), endpointcache.FailureNodeNameInvalid)
 	})
 }
 
@@ -1009,8 +1087,12 @@ func TestDiscoveryWorker_RefusesBadInput(t *testing.T) {
 		t.Fatalf("a worker without a store returned %v", err)
 	}
 	e := newWorkerEnv(t, workerEnvOptions{})
-	if err := e.newWorker().Bind(DiscoveryBinding{}); !errors.Is(err, errDiscoveryWorkerClient) {
+	if err := e.newWorker().Bind(DiscoveryBinding{Pool: e.pool}); !errors.Is(err, errDiscoveryWorkerClient) {
 		t.Fatalf("a binding without a client returned %v", err)
+	}
+	if err := e.newWorker().Bind(DiscoveryBinding{Client: markedClient(e.cluster, e.reqs)}); !errors.Is(err,
+		errDiscoveryWorkerPool) {
+		t.Fatalf("a binding without a pool returned %v", err)
 	}
 	var nilWorker *DiscoveryWorker
 	nilWorker.FirstAnswer(workerSeed)
@@ -1103,6 +1185,19 @@ func TestDiscoveryWorker_Helpers(t *testing.T) {
 	if statusText(DiscoveryStatus{Available: true}) != "not quorate" {
 		t.Error("statusText for a status without quorum")
 	}
+	for err, want := range map[error]endpointcache.DiscoveryFailure{
+		&discoveryReadError{base: ErrDiscoveryNodes, cause: errors.New("HTTP 500")}: endpointcache.FailureNodesUnreadable,
+		ErrDiscoveryNodes:    endpointcache.FailureNodesEmpty,
+		ErrDiscoveryNodeName: endpointcache.FailureNodeNameInvalid,
+		&discoveryReadError{base: ErrDiscoveryRoot, cause: errors.New("HTTP 403")}: endpointcache.FailureRootCAUnreadable,
+		fmt.Errorf("ReadDiscovery: read ended: %w", context.DeadlineExceeded):      endpointcache.FailureReadsTimedOut,
+		ErrDiscoveryInput:   endpointcache.FailureReadsFailed,
+		errors.New("other"): endpointcache.FailureReadsFailed,
+	} {
+		if got := discoveryFailure(err); got != want || !got.Valid() {
+			t.Errorf("discoveryFailure(%v) = %q, want %q", err, got, want)
+		}
+	}
 }
 
 // A refresh the drain cancels during its reads records no attempt and logs no
@@ -1166,7 +1261,7 @@ func TestDiscoveryWorker_ChecksAgainUnderTheDiscoverLock(t *testing.T) {
 	b := e.binding()
 	// The first due check asks for the pool's pin state, and the other
 	// process finishes its refresh at that moment.
-	b.PinFailed = func() bool {
+	b.Pool = &discPool{refreshDue: func() bool {
 		if first.CompareAndSwap(false, true) {
 			p, _, err := e.store.ReadPayload(e.clock.Now(), nil)
 			if err != nil {
@@ -1175,7 +1270,7 @@ func TestDiscoveryWorker_ChecksAgainUnderTheDiscoverLock(t *testing.T) {
 			other.discover(context.Background(), workerSeed, otherBinding, p)
 		}
 		return false
-	}
+	}}
 	w := e.newWorker()
 	if err := w.Bind(b); err != nil {
 		t.Fatal(err)
@@ -1186,4 +1281,53 @@ func TestDiscoveryWorker_ChecksAgainUnderTheDiscoverLock(t *testing.T) {
 		t.Fatalf("GET /nodes ran %d times in all, want the first run's and the other process's only", kinds["nodes"])
 	}
 	e.wantLine("api endpoint discovery: no refresh due", log.LevelDebug)
+}
+
+// The verify_ssl false identity refusal takes every discovered endpoint out of
+// the real pool the worker is bound to, so a request to one is refused before
+// any dial.
+func TestDiscoveryWorker_IdentityRefusalDropsThePoolsDiscoveredEndpoints(t *testing.T) {
+	t.Parallel()
+	e := newWorkerEnv(t, workerEnvOptions{})
+	e.run()
+	e.cluster.replaceRoot()
+	e.clock.advance(endpointcache.RefreshInterval)
+
+	// A loopback port nothing listens on, so a request the drop failed to
+	// refuse ends in a local dial refusal and never leaves the host.
+	discoveredAddr := "127.0.0.1:9"
+	pool, err := endpointpool.New(endpointpool.Config{
+		Base: &http.Transport{},
+		Endpoints: []endpointpool.Endpoint{
+			{Address: workerSeed, Kind: endpointpool.KindConfigured},
+			{Address: discoveredAddr, Kind: endpointpool.KindDiscovered, Node: "pve2", Pins: []endpointpool.Pin{{9}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.CloseIdleConnections)
+	e.begin()
+	w := e.newWorker()
+	if err := w.Bind(DiscoveryBinding{Client: markedClient(e.cluster, e.reqs), Pool: pool}); err != nil {
+		t.Fatal(err)
+	}
+	w.FirstAnswer(workerSeed)
+	e.drain()
+	e.wantLine("with verify_ssl false this is refused", log.LevelError)
+	if n := pool.DropDiscovered(); n != 0 {
+		t.Fatalf("the worker left %d discovered endpoints in the pool", n)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		"https://"+discoveredAddr+"/api2/json/version", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := pool.RoundTrip(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if !errors.Is(err, endpointpool.ErrPinMismatch) || !endpointpool.IsConnectPhase(err) || endpointpool.IsMaybeSent(err) {
+		t.Fatalf("a request to a dropped endpoint should be refused unsent, got %v", err)
+	}
 }

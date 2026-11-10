@@ -72,6 +72,40 @@ func (o DiscoveryOutcome) holdsNodes() bool {
 	return o == OutcomeOK || o == OutcomeNoStatus
 }
 
+// DiscoveryFailure says why the last discovery ended before it had a result.
+// It is an enumeration and never holds raw error text.
+type DiscoveryFailure string
+
+// Discovery failures.
+const (
+	// FailureNodesUnreadable means GET /nodes failed.
+	FailureNodesUnreadable DiscoveryFailure = "nodes_unreadable"
+	// FailureNodesEmpty means GET /nodes listed no nodes.
+	FailureNodesEmpty DiscoveryFailure = "nodes_empty"
+	// FailureNodeNameInvalid means GET /nodes listed a name that breaks the
+	// pve-node format.
+	FailureNodeNameInvalid DiscoveryFailure = "node_name_invalid"
+	// FailureRootCAUnreadable means no node answered the cluster root CA read.
+	FailureRootCAUnreadable DiscoveryFailure = "root_ca_unreadable"
+	// FailureReadsTimedOut means the discovery reads ran out of time between
+	// the node list and the root CA.
+	FailureReadsTimedOut DiscoveryFailure = "reads_timed_out"
+	// FailureReadsFailed means the discovery ended without a result for a
+	// reason none of the other failures names, such as a seed that cannot
+	// derive node names.
+	FailureReadsFailed DiscoveryFailure = "reads_failed"
+)
+
+// Valid reports whether f is one of the enumerated failures.
+func (f DiscoveryFailure) Valid() bool {
+	switch f {
+	case FailureNodesUnreadable, FailureNodesEmpty, FailureNodeNameInvalid, FailureRootCAUnreadable,
+		FailureReadsTimedOut, FailureReadsFailed:
+		return true
+	}
+	return false
+}
+
 // MarkClass says why an endpoint was marked down. It is an enumeration and
 // never holds raw error text.
 type MarkClass string
@@ -126,14 +160,20 @@ type ClusterIdentity struct {
 	IdentityConflict bool `json:"identity_conflict"`
 }
 
-// DiscoverySection is the last discovery's result.
+// DiscoverySection is the last discovery's result, and the last attempt when
+// a later discovery ended without one.
 type DiscoverySection struct {
 	// DiscoveredAt is when the discovery ran.
 	DiscoveredAt time.Time `json:"discovered_at"`
 	// NextRefreshAfter is the earliest time the next discovery is due.
 	NextRefreshAfter time.Time `json:"next_refresh_after"`
-	// Outcome says how the discovery ended.
+	// Outcome says how the last discovery that wrote a result ended. It is
+	// empty only in a section that an attempt created, which holds no nodes
+	// and carries LastFailure.
 	Outcome DiscoveryOutcome `json:"outcome"`
+	// LastFailure is why the last discovery ended without a result, or empty
+	// when the last discovery wrote one. A result clears it.
+	LastFailure DiscoveryFailure `json:"last_failure,omitempty"`
 	// Quorate is whether /cluster/status reported quorum, which decides
 	// whether the online flags are trustworthy.
 	Quorate bool `json:"quorate"`

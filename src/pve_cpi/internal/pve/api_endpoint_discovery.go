@@ -42,6 +42,9 @@ var errDiscoveryWorkerStore = errors.New("api endpoint discovery: the worker nee
 // errDiscoveryWorkerClient refuses a binding without a client.
 var errDiscoveryWorkerClient = errors.New("api endpoint discovery: the worker needs a client to send its reads")
 
+// errDiscoveryWorkerPool refuses a binding without a pool.
+var errDiscoveryWorkerPool = errors.New("api endpoint discovery: the worker needs the pool it is the first-answer hook of")
+
 // errDiscoveryWorkerBound refuses a second binding.
 var errDiscoveryWorkerBound = errors.New("api endpoint discovery: the worker is already bound to a client")
 
@@ -68,24 +71,34 @@ type DiscoveryWorkerConfig struct {
 	Now func() time.Time
 }
 
+// DiscoveryPool is what the worker needs from the endpoint pool it is the
+// first-answer hook of. *endpointpool.Pool implements it.
+type DiscoveryPool interface {
+	// RefreshDue reports whether a discovered endpoint failed its pin in this
+	// process. A pin failure in another process reaches the worker through
+	// the pin mark in the cache file.
+	RefreshDue() bool
+	// DropDiscovered takes every discovered endpoint out of the pool for the
+	// rest of the call.
+	DropDiscovered() int
+}
+
+// The endpoint pool is the worker's pool.
+var _ DiscoveryPool = (*endpointpool.Pool)(nil)
+
 // DiscoveryBinding is what the worker learns once the client and its pool
 // exist, which is after the pool was handed the worker as its first-answer
 // hook.
 type DiscoveryBinding struct {
-	// Client sends the discovery reads. Its requests go through the pool the
-	// worker is the first-answer hook of, so the configured-only marker the
-	// worker puts on every request keeps them on the configured endpoints.
+	// Client sends the discovery reads. Its requests go through Pool, so the
+	// configured-only marker the worker puts on every request keeps them on
+	// the configured endpoints.
 	Client Client
-	// PinFailed reports whether a discovered endpoint failed its pin in this
-	// process, which is the pool's RefreshDue. Nil reports false. A pin
-	// failure in another process reaches the worker through the pin mark in
-	// the cache file.
-	PinFailed func() bool
-	// DropDiscovered is called once when the trust rules say the pool must
-	// stop using every discovered endpoint for the rest of the call, because
-	// they belong to an identity the configured endpoints no longer report.
-	// Nil does nothing, which leaves the pool as it was built.
-	DropDiscovered func()
+	// Pool is the pool the worker is the first-answer hook of. The worker
+	// reads its pin failures to decide whether a refresh is due, and it drops
+	// the pool's discovered endpoints when the trust rules say they belong to
+	// an identity the configured endpoints no longer report.
+	Pool DiscoveryPool
 }
 
 // DiscoveryWorker refreshes the discovered node list of one cache key in the
@@ -102,8 +115,8 @@ type DiscoveryBinding struct {
 //
 // The client builds a worker with NewDiscoveryWorker, hands it to the pool as
 // endpointpool.Config.FirstAnswer, builds the client on that pool, and then
-// calls Bind. A first answer that arrives before Bind is kept, and Bind starts
-// its refresh.
+// calls Bind with the client and the pool. A first answer that arrives before
+// Bind is kept, and Bind starts its refresh.
 type DiscoveryWorker struct {
 	store    *endpointcache.Store
 	mode     config.DiscoveryMode
@@ -155,12 +168,15 @@ func NewDiscoveryWorker(cfg DiscoveryWorkerConfig) (*DiscoveryWorker, error) {
 	return w, nil
 }
 
-// Bind gives the worker the client and the pool's signals. It refuses a
-// binding without a client and a second binding. When a configured endpoint
-// already answered, Bind starts the refresh that answer asked for.
+// Bind gives the worker the client and the pool. It refuses a binding without
+// a client, one without a pool, and a second binding. When a configured
+// endpoint already answered, Bind starts the refresh that answer asked for.
 func (w *DiscoveryWorker) Bind(b DiscoveryBinding) error {
 	if b.Client == nil {
 		return errDiscoveryWorkerClient
+	}
+	if b.Pool == nil {
+		return errDiscoveryWorkerPool
 	}
 	w.mu.Lock()
 	if w.binding != nil {
@@ -276,7 +292,7 @@ func (w *DiscoveryWorker) due(ctx context.Context, b DiscoveryBinding) (*endpoin
 			log.String("file", w.store.FileName()), log.Err(err))
 		return nil, false
 	}
-	pinFailed := pinMarkedSince(stored) || (b.PinFailed != nil && b.PinFailed())
+	pinFailed := pinMarkedSince(stored) || b.Pool.RefreshDue()
 	if !endpointcache.RefreshDue(stored, now, pinFailed) {
 		w.logger.LogAttrs(ctx, log.LevelDebug, "api endpoint discovery: no refresh due",
 			log.String("file", w.store.FileName()))
@@ -352,20 +368,27 @@ func (w *DiscoveryWorker) discover(
 
 // recordFailure handles a refresh that ended without a result. A refresh the
 // drain cut off writes and logs nothing more, because the drain reports it.
-// Any other failure records an attempt, so the next refresh waits
-// discoveryFailureWait instead of running on every call, and logs one line.
-// The line is Info when the outcome changes and otherwise at the failure
-// level, as stalledOutcomeChanged decides.
+// Any other failure records an attempt that stores the failure's reason as
+// the section's last_failure and moves the next refresh out by
+// discoveryFailureWait, even on a file with no discovery yet, so a cluster
+// whose discovery keeps failing is asked once an hour and not on every call.
+// The stored outcome, nodes, and pins stay as they were. The line is Info when
+// the reason differs from the stored last_failure, which is the outcome
+// changing for these failures, and otherwise at the failure level.
 func (w *DiscoveryWorker) recordFailure(
 	ctx context.Context, via string, stored *endpointcache.Payload, cause error,
 ) {
 	if ctx.Err() != nil {
 		return
 	}
+	// stored was read under the discover lock, and only a refresh, which
+	// holds that lock, writes last_failure, so it is the failure the update
+	// replaces.
+	failure, prior := discoveryFailure(cause), lastFailure(stored)
 	res, err := w.store.UpdatePayload(ctx, w.now(), func(view endpointcache.Stored) (endpointcache.Change, error) {
 		at := view.Now.UTC()
 		return endpointcache.Change{Attempt: &endpointcache.DiscoveryAttempt{
-			At: at, NextRefreshAfter: at.Add(discoveryFailureWait),
+			At: at, NextRefreshAfter: at.Add(discoveryFailureWait), Failure: failure,
 		}}, nil
 	})
 	if err != nil {
@@ -378,25 +401,42 @@ func (w *DiscoveryWorker) recordFailure(
 		w.logUpdate(ctx, res)
 	}
 	level := endpointcache.Level(w.mode)
-	if stalledOutcomeChanged(stored) {
+	if failure != prior {
 		level = log.LevelInfo
 	}
 	w.logger.LogAttrs(ctx, level,
 		fmt.Sprintf("api endpoint discovery: no result through %s, because %s; next attempt in %s",
 			via, discoveryFailureReason(cause), waitText(discoveryFailureWait)),
-		log.String("file", w.store.FileName()), log.Err(cause))
+		log.String("file", w.store.FileName()), log.String("failure", string(failure)), log.Err(cause))
 }
 
-// stalledOutcomeChanged reports whether a refresh that wrote no result changes
-// the outcome the file records. The file's outcome enumeration has no value
-// for a refresh that read nothing, and an attempt leaves the stored outcome as
-// it was, so such a refresh has no outcome of its own to compare. The worker
-// therefore counts it as a change when the file records the outcome of an
-// earlier result, which this refresh did not repeat, and as no change when the
-// file records no discovery at all, so a cluster that has never been
-// discovered stays at the failure level.
-func stalledOutcomeChanged(stored *endpointcache.Payload) bool {
-	return stored != nil && stored.Discovery != nil && stored.Discovery.Outcome != ""
+// lastFailure returns the failure the payload's discovery section records, or
+// empty when there is none.
+func lastFailure(p *endpointcache.Payload) endpointcache.DiscoveryFailure {
+	if p == nil || p.Discovery == nil {
+		return ""
+	}
+	return p.Discovery.LastFailure
+}
+
+// discoveryFailure names the failure the cache records for a refresh that
+// ended with err before it had a result. A failed GET /nodes is told from one
+// that listed no nodes by the read error that wraps the failed request.
+func discoveryFailure(err error) endpointcache.DiscoveryFailure {
+	var readErr *discoveryReadError
+	switch {
+	case errors.Is(err, ErrDiscoveryNodeName):
+		return endpointcache.FailureNodeNameInvalid
+	case errors.Is(err, ErrDiscoveryNodes) && errors.As(err, &readErr):
+		return endpointcache.FailureNodesUnreadable
+	case errors.Is(err, ErrDiscoveryNodes):
+		return endpointcache.FailureNodesEmpty
+	case errors.Is(err, ErrDiscoveryRoot):
+		return endpointcache.FailureRootCAUnreadable
+	case errors.Is(err, context.DeadlineExceeded):
+		return endpointcache.FailureReadsTimedOut
+	}
+	return endpointcache.FailureReadsFailed
 }
 
 // discoveryFailureReason names the read that failed, in fixed text that never
@@ -439,8 +479,8 @@ func (w *DiscoveryWorker) recordResult(
 		}
 		return d.Change, nil
 	})
-	if decided && decision.DropDiscovered && b.DropDiscovered != nil {
-		b.DropDiscovered()
+	if decided && decision.DropDiscovered {
+		b.Pool.DropDiscovered()
 	}
 	if ctx.Err() != nil {
 		return
@@ -496,8 +536,11 @@ func (w *DiscoveryWorker) logDecision(ctx context.Context, d endpointcache.Trust
 
 // logDiscovery logs the line of a written result. A result that holds nodes
 // logs at Info when the node set, the identity, or the outcome changed, and a
-// degraded result logs at Info when the outcome changed. Otherwise a result
-// with a status logs at Debug and every degraded one at the failure level.
+// degraded result logs at Info when the outcome changed. A result that
+// follows a failed refresh, which the stored last_failure records, changes
+// the outcome too, so the recovery is logged at Info as the failure was.
+// Otherwise a result with a status logs at Debug and every degraded one at the
+// failure level.
 func (w *DiscoveryWorker) logDiscovery(
 	ctx context.Context, stored *endpointcache.Payload, d endpointcache.TrustDecision,
 	reads DiscoveryReads, result DiscoveryResult, seed string,
@@ -507,7 +550,7 @@ func (w *DiscoveryWorker) logDiscovery(
 	if stored != nil && stored.Discovery != nil {
 		before = stored.Discovery.Outcome
 	}
-	changed := before != written.Outcome
+	changed := before != written.Outcome || lastFailure(stored) != ""
 	attrs := []slog.Attr{log.String("file", w.store.FileName()), log.String("outcome", string(written.Outcome))}
 	switch written.Outcome {
 	case endpointcache.OutcomeOK, endpointcache.OutcomeNoStatus:
