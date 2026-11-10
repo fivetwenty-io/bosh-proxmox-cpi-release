@@ -134,9 +134,9 @@ func TestWalkOrderPutsOnlineDiscoveredNodesFirstByName(t *testing.T) {
 // A down mark younger than two minutes moves its endpoint to the end of the
 // walk, beside the demoted endpoints and in preference order. A mark exactly
 // two minutes old has expired, a mark up to 30 seconds in the future counts,
-// and one further ahead is ignored until the clock brings it within the
-// allowance. Marks age with the clock, and the active endpoint stays where it
-// is when a mark expires.
+// and one further ahead is dropped when the pool is built, so it stays
+// ignored after the clock passes its time. Marks age with the clock, and the
+// active endpoint stays where it is when a mark expires.
 func TestWalkOrderMovesMarkedEndpointsToTheEnd(t *testing.T) {
 	l := newLab(t)
 	clock := newFakeClock()
@@ -160,12 +160,13 @@ func TestWalkOrderMovesMarkedEndpointsToTheEnd(t *testing.T) {
 	order, _ = p.walkOrder(false)
 	wantOrder(t, order, "c2:8006", "c5:8006", "d2:8006", "c1:8006", "c3:8006", "c4:8006", "d1:8006")
 
-	// Two minutes later the marks on c1 and d1 have expired. The marks on c4
-	// and c5 are now 100 and 75 seconds old, so both are in effect, c5's
-	// because its time is no longer too far ahead.
+	// Two minutes later the marks on c1 and d1 have expired. The mark on c4
+	// is now 100 seconds old, so it is still in effect. The mark on c5 would
+	// be 75 seconds old, but it was dropped when the pool was built, so c5
+	// stays in its place.
 	clock.advance(2 * time.Minute)
 	order, _ = p.walkOrder(false)
-	wantOrder(t, order, "c2:8006", "c1:8006", "d1:8006", "d2:8006", "c3:8006", "c4:8006", "c5:8006")
+	wantOrder(t, order, "c2:8006", "c1:8006", "c5:8006", "d1:8006", "d2:8006", "c3:8006", "c4:8006")
 	mustActive(t, p, "c2:8006")
 }
 
@@ -287,6 +288,7 @@ func TestPinFailureMakesADiscoveredEndpointIneligible(t *testing.T) {
 	if !errors.Is(err, ErrPinMismatch) || !errors.Is(err, errIneligible) || !IsConnectPhase(err) || IsMaybeSent(err) {
 		t.Fatalf("a routed request to the ineligible endpoint should be refused unsent, got %v", err)
 	}
+	mustCertificateRefusal(t, err)
 	if n := d.Counts.Conns.Load(); n != conns {
 		t.Fatalf("the ineligible endpoint got %d more connections", n-conns)
 	}
@@ -725,10 +727,10 @@ func TestTetherToAnIneligibleEndpointIsRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.fix(h, dep.addr)
-	if !p.makeIneligible(dep, &ConnectPhaseError{Phase: PhasePin, Endpoint: dep.addr, Err: ErrPinMismatch}) {
+	if _, ok := p.makeIneligible(dep, &ConnectPhaseError{Phase: PhasePin, Endpoint: dep.addr, Err: ErrPinMismatch}); !ok {
 		t.Fatal("the endpoint should become ineligible")
 	}
-	if p.makeIneligible(dep, nil) {
+	if _, ok := p.makeIneligible(dep, nil); ok {
 		t.Fatal("an endpoint becomes ineligible once")
 	}
 
@@ -737,6 +739,7 @@ func TestTetherToAnIneligibleEndpointIsRefused(t *testing.T) {
 	if !errors.Is(err, errIneligible) || !IsConnectPhase(err) || IsMaybeSent(err) {
 		t.Fatalf("the tethered mutation should be refused unsent, got %v", err)
 	}
+	mustCertificateRefusal(t, err)
 	if n := d.Counts.Conns.Load() + c.Counts.Method(http.MethodPost); n != 0 {
 		t.Fatalf("the refused mutation reached a server (%d)", n)
 	}
@@ -791,7 +794,9 @@ func TestNewRefusesAnOnlineConfiguredEndpoint(t *testing.T) {
 	}
 }
 
-// markInEffect follows the two-minute lifetime and the 30-second allowance.
+// markInEffect follows the two-minute lifetime. A mark ahead of the clock,
+// which acceptedMark kept because it is at most 30 seconds ahead, is in
+// effect from the start.
 func TestMarkInEffect(t *testing.T) {
 	now := newFakeClock().now()
 	for name, c := range map[string]struct {
@@ -803,9 +808,7 @@ func TestMarkInEffect(t *testing.T) {
 		"one second short":     {now.Add(-markLifetime + time.Second), true},
 		"exactly two minutes":  {now.Add(-markLifetime), false},
 		"30 seconds ahead":     {now.Add(markFutureAllowance), true},
-		"31 seconds ahead":     {now.Add(markFutureAllowance + time.Second), false},
 		"an hour old":          {now.Add(-time.Hour), false},
-		"a day in the future":  {now.Add(24 * time.Hour), false},
 		"one nanosecond ahead": {now.Add(time.Nanosecond), true},
 	} {
 		if got := markInEffect(c.at, now); got != c.want {

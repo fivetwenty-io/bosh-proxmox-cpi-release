@@ -64,7 +64,9 @@ type Endpoint struct {
 	Online bool
 	// DownMarkedAt is when a cache down mark for the endpoint was written, or
 	// zero when it carries none. A mark younger than two minutes moves the
-	// endpoint to the end of the walk, and an older one has no effect.
+	// endpoint to the end of the walk, and an older one has no effect. A mark
+	// dated more than 30 seconds ahead of the pool's clock when the pool is
+	// built is dropped, and it never takes effect.
 	DownMarkedAt time.Time
 }
 
@@ -86,10 +88,13 @@ type Config struct {
 	// MarkSink receives a down mark for an endpoint's first connect-phase
 	// failure in this process, and for a discovered endpoint's pin failure.
 	// A nil MarkSink records no marks, which is the pool of a process without
-	// an endpoint cache.
+	// an endpoint cache. The pool calls it on the failed request's goroutine,
+	// so it hands the write to a goroutine of its own and returns promptly.
 	MarkSink MarkSink
 	// FirstAnswer is told once, after the first request that a configured
-	// endpoint answers. A nil FirstAnswer is told nothing.
+	// endpoint answers. A nil FirstAnswer is told nothing. The pool calls it
+	// on the answered request's goroutine, so it hands its work to a
+	// goroutine of its own and returns promptly.
 	FirstAnswer FirstAnswerHook
 
 	// headerDeadline replaces the 60-second response-header deadline. Only
@@ -100,8 +105,8 @@ type Config struct {
 	clock func() time.Time
 }
 
-// endpoint is one endpoint of a pool. Everything but demoted, ineligible, and
-// marked is fixed at construction.
+// endpoint is one endpoint of a pool. Everything but demoted, ineligible,
+// marked, and lastMarkAt is fixed at construction.
 type endpoint struct {
 	// addr is the canonical host:port, the key every comparison uses.
 	addr string
@@ -122,14 +127,23 @@ type endpoint struct {
 	// ineligible says a discovered endpoint failed its pin in this process,
 	// so no request is sent to it again. It is guarded by Pool.mu.
 	ineligible bool
-	// marked says the pool has handed the endpoint's first connect-phase
-	// failure to the mark sink.
-	marked atomic.Bool
+	// marked says the endpoint has had its mark for this process, which is
+	// its first connect-phase failure or its pin failure, and lastMarkAt is
+	// the time that last mark records. Both are guarded by Pool.mu.
+	marked     bool
+	lastMarkAt time.Time
 }
 
 // Pool holds the ordered endpoints of one cluster, the active endpoint with
 // its generation counter, the in-process demotions, and every transport it
 // owns. It is safe for concurrent use.
+//
+// The state a pool keeps once, which is the ineligible endpoints, each
+// endpoint's mark, the first answer, and the pin-mismatch and hook-panic
+// lines, lasts as long as the pool. It assumes one pool per CPI call, and
+// every CPI call is a new process, so "once per process" and "once per call"
+// say the same. A process that kept a pool across calls would carry that
+// state from one call into the next.
 type Pool struct {
 	logger    *log.Logger
 	base      *http.Transport
@@ -152,6 +166,10 @@ type Pool struct {
 	// answered says a configured endpoint has answered a request, so
 	// firstAnswer has been told.
 	answered atomic.Bool
+	// sinkPanicked and hookPanicked say the sink or the hook has panicked
+	// once already, so a later panic is logged at Debug.
+	sinkPanicked atomic.Bool
+	hookPanicked atomic.Bool
 	// startAway is set when a down mark made the pool start on an endpoint
 	// other than the first in preference order.
 	startAway *StartAway
@@ -179,7 +197,9 @@ type Pool struct {
 //
 // The pool starts on the first endpoint of the walk order, so a process whose
 // first configured endpoint carries a down mark younger than two minutes
-// starts on the next endpoint without one, and StartedAway reports it.
+// starts on the next endpoint without one, and StartedAway reports it. A down
+// mark dated more than 30 seconds ahead of the pool's clock is dropped here
+// and never takes effect.
 //
 // A pool of more than one endpoint gives each endpoint's idempotent clone the
 // 60-second response-header deadline. A pool of one endpoint keeps today's
@@ -202,6 +222,7 @@ func New(cfg Config) (*Pool, error) {
 	if now == nil {
 		now = time.Now
 	}
+	builtAt := now()
 	p := &Pool{
 		logger:      logger,
 		base:        base,
@@ -223,7 +244,7 @@ func New(cfg Config) (*Pool, error) {
 	for i, in := range eps {
 		ep := &endpoint{
 			addr: in.Address, urlHost: in.urlHost, kind: in.Kind, node: in.Node, pins: len(in.Pins), rank: i,
-			markedAt: in.DownMarkedAt,
+			markedAt: acceptedMark(in.DownMarkedAt, builtAt),
 		}
 		spec := transportSpec{addr: in.Address, serverName: hostOf(in.urlHost), headerDeadline: headerDeadline}
 		if in.Kind == KindDiscovered {
@@ -239,7 +260,7 @@ func New(cfg Config) (*Pool, error) {
 		p.endpoints = append(p.endpoints, ep)
 		p.byAddr[ep.addr] = ep
 	}
-	p.startOnPreferred()
+	p.startOnPreferred(builtAt)
 	p.logger.Debug(p.describe())
 	return p, nil
 }
@@ -328,7 +349,10 @@ func (p *Pool) Len() int { return len(p.endpoints) }
 // RefreshDue reports whether a discovered endpoint was accepted on its name
 // with a certificate outside its pin set in this process, or failed its pin,
 // so the next discovery through a configured endpoint should run and record
-// the new pin.
+// the new pin. The pool itself starts no discovery for it. The first-answer
+// hook is told once, so a refresh that becomes due after the first answer is
+// left to whoever reads RefreshDue, and otherwise to the next process, which
+// the pin mark makes refresh.
 func (p *Pool) RefreshDue() bool { return p.refreshDue.Load() }
 
 func (p *Pool) markRefreshDue() { p.refreshDue.Store(true) }

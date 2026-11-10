@@ -31,8 +31,9 @@ const (
 // builds the pool, so the pool size is fixed for the life of the client.
 type discoveredEndpointSource interface {
 	// DiscoveredEndpoints returns endpoints of kind endpointpool.KindDiscovered,
-	// each with its pin set, in preference order. It returns none when discovery
-	// has recorded nothing for this cluster.
+	// each with its pin set and its node's online flag, in any order. The pool
+	// orders them itself, the online nodes first and each group by node name.
+	// It returns none when discovery has recorded nothing for this cluster.
 	DiscoveredEndpoints() []endpointpool.Endpoint
 }
 

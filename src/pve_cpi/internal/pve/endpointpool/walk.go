@@ -194,7 +194,9 @@ func (p *Pool) sendFollowing(req *http.Request, target tetherTarget, configuredO
 // endpoints demotes it and is recorded as a connect-phase failure, and nothing
 // a routed request gets ever makes an endpoint active. When the request's own
 // context ends during the dial, net/http returns the context's error, which
-// carries no tag, so a cancelled request records nothing. The error is marked
+// carries no tag, so a cancelled request records nothing. A pin failure that
+// finished after the send-by bound still counts against its discovered
+// endpoint, while the request reports the send-by refusal. The error is marked
 // with MaybeSentError unless its outcome is sentNever, which takes a
 // connect-phase failure of an idempotent request or the login, or of a
 // mutation that provesNeverSent clears.
@@ -243,6 +245,8 @@ func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCl
 			p.alertVerify(ep, err, false)
 		}
 		p.connectFailed(ep, Phase(oc.class), err)
+	} else if oc.sendBy {
+		p.pinFailureAfterSendBy(ep, err)
 	}
 	if oc.defectAlert {
 		p.alertDefect(addr, err, oc.class, false)
@@ -296,8 +300,13 @@ type walker struct {
 	bounds         bounds
 	budget         *budget
 	order          []*endpoint
-	// limit is how many hops the walk may make at most.
+	// limit is how many hops the walk may make at most by the order it read.
+	// A walk with a limit of zero has nothing to try.
 	limit int
+	// made is how many hops the walk has handed to a transport. A hop
+	// refused because its endpoint failed its pin after the walk read its
+	// order is not counted, so it never uses up the hop cap.
+	made int
 	// gen is the generation the walk started under, and from the endpoint
 	// that was active then, or nil when the walk could not read both under
 	// one generation.
@@ -484,6 +493,7 @@ func (w *walker) try(i int, ep *endpoint, body io.ReadCloser) hopResult {
 	}
 	attr := attributable(w.req.URL.Path, ep)
 	withDeadline := w.wantsDeadline(i, attr)
+	w.made++
 	resp, err := ep.transports.pick(withDeadline).RoundTrip(clone)
 	if err == nil && resp == nil {
 		err = errNoResponse
@@ -512,7 +522,17 @@ func (w *walker) try(i int, ep *endpoint, body io.ReadCloser) hopResult {
 // endpoint gets it, and never on the walk's final hop, so the last try waits
 // for a slow answer as a request to a single host does today.
 func (w *walker) wantsDeadline(i int, attributable bool) bool {
-	return w.class == classIdempotent && attributable && !finalHop(i, w.limit)
+	return w.class == classIdempotent && attributable && !w.finalHop(i)
+}
+
+// finalHop reports whether hop i, to w.order[i], is the walk's final hop. The
+// walk may still make one hop for each endpoint from w.order[i] on that is
+// still eligible, up to the hop cap, so hop i is final when it is the hop that
+// reaches the cap or when every endpoint after it in the order has failed its
+// pin since the walk read the order. Without such an endpoint this is exactly
+// finalHop(i, w.limit), because every earlier hop was made.
+func (w *walker) finalHop(i int) bool {
+	return finalHop(w.made, w.bounds.hopLimit(w.made+w.p.eligibleAmong(w.order[i:])))
 }
 
 // errNoGetBodyResult stands in for the error when GetBody returns neither a
@@ -542,7 +562,7 @@ func (w *walker) nextBody() (io.ReadCloser, error) {
 // stopBefore reports why hop next may not start, or stopNone when it may.
 func (w *walker) stopBefore(next int) stopReason {
 	switch {
-	case next >= w.limit:
+	case next >= len(w.order) || w.made >= w.bounds.hops:
 		return stopExhausted
 	case !w.budget.allowsHop():
 		return stopBudget
@@ -654,7 +674,9 @@ func (w *walker) alert(h hopResult, hopping bool) {
 // record applies a hop's demotion and keeps its failure for the failover
 // line. A demotion for a connect-phase failure, which only a failure the
 // endpoint caused gets, also records the failure for the mark sink and, for a
-// pin failure, takes the endpoint out of later walks.
+// pin failure, takes the endpoint out of later walks. A send-by refusal
+// demotes nothing, but when it wraps a pin failure that finished after the
+// bound, that pin failure still counts.
 func (w *walker) record(h hopResult) {
 	if h.oc.demote {
 		w.p.demote(h.ep)
@@ -664,6 +686,8 @@ func (w *walker) record(h hopResult) {
 	}
 	if phase := Phase(h.oc.class); h.oc.demote && phase.Valid() {
 		w.p.connectFailed(h.ep, phase, h.err)
+	} else if h.oc.sendBy {
+		w.p.pinFailureAfterSendBy(h.ep, h.err)
 	}
 }
 

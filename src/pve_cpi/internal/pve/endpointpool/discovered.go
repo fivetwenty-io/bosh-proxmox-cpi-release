@@ -2,18 +2,23 @@ package endpointpool
 
 import (
 	"cmp"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // The limits on a cache down mark. A mark moves its endpoint to the end of the
-// walk until markLifetime after it was written. A mark written further than
-// markFutureAllowance in the future is ignored, because a forged or skewed
-// time must not make a mark last longer than its lifetime.
+// walk until markLifetime after it was written. A mark dated further than
+// markFutureAllowance ahead of the pool's clock when the pool is built is
+// dropped, and it never takes effect, even once the clock passes its time,
+// because a forged or skewed time must not make a mark last longer than its
+// lifetime.
 const (
 	markLifetime        = 2 * time.Minute
 	markFutureAllowance = 30 * time.Second
@@ -39,11 +44,19 @@ type Mark struct {
 // due. A failure the caller's own context caused, a refused send-by deadline,
 // and a refusal the pool makes itself are never reported.
 //
-// The pool calls MarkDown on the request's goroutine, outside every lock the
-// pool holds, and does not wait for the write. MarkDown must return without
-// waiting for it: the implementation owns the goroutine that writes the mark,
-// and it registers that goroutine with the process's worker registry, so the
-// exit drain covers it. MarkDown may call the pool's own methods.
+// The pool calls MarkDown synchronously, on the goroutine of the request that
+// failed and outside every lock the pool holds, and that request waits until
+// MarkDown returns. The pool starts no goroutine for the write. So each
+// implementation hands the write to a goroutine of its own, registers that
+// goroutine with the process's worker registry so the exit drain covers it,
+// and returns promptly. MarkDown may call the pool's own methods. When
+// MarkDown panics, the pool recovers, logs the panic, and carries on with the
+// request, so a defect in the sink costs the mark and never the request.
+//
+// Every mark the pool hands over for one endpoint is dated after the one
+// before it, and a pin mark is the last mark for its endpoint. A sink that
+// keeps the newest mark for each endpoint, as the cache's merge does,
+// therefore keeps the pin mark whatever order two writes finish in.
 type MarkSink interface {
 	MarkDown(m Mark)
 }
@@ -54,11 +67,19 @@ type MarkSink interface {
 // never for a 502, 503, or 595 to 599, which say the endpoint could not serve
 // the request.
 //
-// The pool calls FirstAnswer on the request's goroutine, outside every lock
-// the pool holds, before it returns the response. FirstAnswer must return
-// without waiting for any work it starts: the implementation owns that work's
-// goroutine and registers it with the process's worker registry. It may call
-// the pool's own methods.
+// The pool calls FirstAnswer synchronously, on the goroutine of the request
+// that got the answer and outside every lock the pool holds, and it returns
+// the response only after FirstAnswer returns. The pool starts no goroutine
+// for the hook. So each implementation hands the work it starts, such as
+// discovery, to a goroutine of its own, registers that goroutine with the
+// process's worker registry, and returns promptly. FirstAnswer may call the
+// pool's own methods. When FirstAnswer panics, the pool recovers, logs the
+// panic, and returns the response as if the hook had returned.
+//
+// The hook is told only once per pool, so a refresh that a pin failure makes
+// due after the first answer starts no discovery in this process. The pin
+// mark the pool writes for that failure is what makes the next process
+// refresh.
 type FirstAnswerHook interface {
 	// FirstAnswer is passed the canonical host:port of the configured
 	// endpoint that answered.
@@ -80,8 +101,9 @@ type StartAway struct {
 
 // errIneligible is the cause when the pool refuses, before any dial, to send a
 // request to a discovered endpoint that failed its pin earlier in the process.
-// It wraps ErrPinMismatch, so the refusal reads as a certificate failure, as
-// the pin failure that made the endpoint ineligible did.
+// It wraps ErrPinMismatch, and refuseIneligible puts it inside a
+// *tls.CertificateVerificationError, so the refusal reads as a certificate
+// failure, as the pin failure that made the endpoint ineligible did.
 var errIneligible = fmt.Errorf("%w: it failed its pin earlier in this call, so the pool skips it until "+
 	"discovery refreshes", ErrPinMismatch)
 
@@ -100,14 +122,24 @@ func sortDiscovered(eps []orderedEndpoint) {
 	})
 }
 
-// markInEffect reports whether a down mark written at at still moves its
-// endpoint to the end of the walk at now. A zero at is no mark.
-func markInEffect(at, now time.Time) bool {
-	if at.IsZero() {
-		return false
+// acceptedMark returns the down mark an endpoint is loaded with when the pool
+// is built at now. A mark dated more than markFutureAllowance ahead of now is
+// dropped rather than clamped, so the result is zero and the mark never takes
+// effect, even once the clock passes its time. Any other mark is kept as it
+// is.
+func acceptedMark(at, now time.Time) time.Time {
+	if at.After(now.Add(markFutureAllowance)) {
+		return time.Time{}
 	}
-	age := now.Sub(at)
-	return age < markLifetime && age >= -markFutureAllowance
+	return at
+}
+
+// markInEffect reports whether a down mark written at at still moves its
+// endpoint to the end of the walk at now. A zero at is no mark. A mark from
+// up to markFutureAllowance ahead, which acceptedMark kept, is in effect from
+// the start, and every mark expires markLifetime after its own time.
+func markInEffect(at, now time.Time) bool {
+	return !at.IsZero() && now.Sub(at) < markLifetime
 }
 
 // eligibleLocked reports whether a walk may try ep. A discovered endpoint that
@@ -139,12 +171,12 @@ func preferredLocked(eps []*endpoint, now time.Time, skip *endpoint) *endpoint {
 	return nil
 }
 
-// startOnPreferred makes the first endpoint in walk order active, which New
-// calls once, and records a start away from the first endpoint in preference
-// order. Nothing is demoted or ineligible yet, so only a mark moves the start,
-// and a configured endpoint is always eligible, so there is always one.
-func (p *Pool) startOnPreferred() {
-	now := p.now()
+// startOnPreferred makes the first endpoint in walk order at now active,
+// which New calls once, and records a start away from the first endpoint in
+// preference order. Nothing is demoted or ineligible yet, so only a mark moves
+// the start, and a configured endpoint is always eligible, so there is always
+// one.
+func (p *Pool) startOnPreferred(now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.active = preferredLocked(p.endpoints, now, nil)
@@ -170,19 +202,36 @@ func (p *Pool) ineligibleNow(ep *endpoint) bool {
 	return ep.ineligible
 }
 
+// eligibleAmong counts the endpoints in eps that have not failed their pin in
+// this process.
+func (p *Pool) eligibleAmong(eps []*endpoint) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, ep := range eps {
+		if !ep.ineligible {
+			n++
+		}
+	}
+	return n
+}
+
 // refuseIneligible returns the error for a request the pool will not send to
 // ep, a discovered endpoint that failed its pin, before any dial. It carries
 // the connect-phase tag with PhasePin, because nothing was sent and the
-// endpoint is out for a certificate failure.
+// endpoint is out for a certificate failure. The cause is a
+// *tls.CertificateVerificationError, which is the shape a real pin failure
+// reaches the SDK in, so the SDK stops at once instead of retrying a request
+// the pool will refuse again.
 func refuseIneligible(addr string) error {
-	return &ConnectPhaseError{Phase: PhasePin, Endpoint: addr, Err: errIneligible}
+	return &ConnectPhaseError{Phase: PhasePin, Endpoint: addr, Err: &tls.CertificateVerificationError{Err: errIneligible}}
 }
 
 // ineligibleHop is hop i's result when the walk will not send it to ep, a
 // discovered endpoint that failed its pin after the walk read its order. The
 // request was handed to no transport, so it is proven unsent, it hops as a
 // pin failure does, and it has no effect on ep, which the pin failure already
-// demoted and reported.
+// demoted and reported. It does not count toward the hop cap.
 func ineligibleHop(ep *endpoint) hopResult {
 	return hopResult{
 		ep:  ep,
@@ -194,35 +243,156 @@ func ineligibleHop(ep *endpoint) hopResult {
 // connectFailed applies what the pool records beyond a demotion when a
 // request to ep failed in the connect phase for a reason the endpoint caused,
 // in the given phase. A discovered endpoint that failed its pin becomes
-// ineligible for the rest of the process, makes a refresh due, and is logged
-// once at Warn. The first such failure of each endpoint is handed to the mark
-// sink, and so is a pin failure that follows a failure of another class. The
-// sink is called outside every lock the pool holds.
+// ineligible for the rest of the process, makes a refresh due, is logged once
+// at Warn, and gets a mark with the class pin. Any other failure gets a mark
+// when it is the endpoint's first in this process. The sink is called outside
+// every lock the pool holds.
 func (p *Pool) connectFailed(ep *endpoint, phase Phase, err error) {
-	first := ep.marked.CompareAndSwap(false, true)
-	pinOut := phase == PhasePin && ep.kind == KindDiscovered && p.makeIneligible(ep, err)
-	if (first || pinOut) && p.sink != nil {
-		p.sink.MarkDown(Mark{Endpoint: ep.addr, Class: phase, At: p.now()})
+	var (
+		m    Mark
+		send bool
+	)
+	if phase == PhasePin && ep.kind == KindDiscovered {
+		m, send = p.makeIneligible(ep, err)
+	} else {
+		m, send = p.takeFirstMark(ep, phase)
+	}
+	if send {
+		p.markDown(m)
 	}
 }
 
+// takeFirstMark decides whether a connect-phase failure of ep in the given
+// phase gets a mark, and dates it. Only the endpoint's first failure in this
+// process gets one, and an endpoint that already failed its pin gets none,
+// because makeIneligible sets marked with the pin mark, which must be the last
+// mark for the endpoint. The decision and the date
+// are made under Pool.mu, together with the pin mark's, so a mark that loses
+// the race to a pin mark is never sent, and one that wins it is dated before
+// the pin mark.
+func (p *Pool) takeFirstMark(ep *endpoint, phase Phase) (Mark, bool) {
+	now := p.now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if ep.marked {
+		return Mark{}, false
+	}
+	ep.marked = true
+	return Mark{Endpoint: ep.addr, Class: phase, At: stampMarkLocked(ep, now)}, true
+}
+
+// stampMarkLocked returns the time a new mark for ep records, which is now
+// unless an earlier mark for ep is dated at or after now. Then it is one
+// nanosecond after that mark, so every mark for one endpoint is dated after
+// the one before it, and the cache's merge, which keeps the newest mark,
+// keeps the last one whatever order the writes finish in. The time carries no
+// monotonic reading, so the comparison is the wall-clock one a written mark
+// keeps. Pool.mu must be held.
+func stampMarkLocked(ep *endpoint, now time.Time) time.Time {
+	at := now.Round(0)
+	if !ep.lastMarkAt.IsZero() && !at.After(ep.lastMarkAt) {
+		at = ep.lastMarkAt.Add(time.Nanosecond)
+	}
+	ep.lastMarkAt = at
+	return at
+}
+
 // makeIneligible takes a discovered endpoint that failed its pin out of every
-// later walk and reports whether this call did so. It also demotes the
-// endpoint, so a walk that read its order before this call still tries it
-// last, makes a refresh due, closes the endpoint's idle connections, and logs
-// the pin-mismatch line once.
-func (p *Pool) makeIneligible(ep *endpoint, err error) bool {
+// later walk, and it returns the endpoint's pin mark and true when this call
+// did so. A later call returns false, so the pin mark is sent once. It also
+// demotes the endpoint, makes a refresh due, closes the endpoint's idle
+// connections, and logs the pin-mismatch line once.
+//
+// The demotion keeps the rule that every endpoint the pool has blamed in this
+// process is demoted. A walk and a routed request demote a pin failure through
+// its outcome, but a pin failure that finished after the send-by bound has an
+// outcome that demotes nothing, so this demotion is its only one.
+func (p *Pool) makeIneligible(ep *endpoint, err error) (Mark, bool) {
+	now := p.now()
 	p.mu.Lock()
 	if ep.ineligible {
 		p.mu.Unlock()
-		return false
+		return Mark{}, false
 	}
-	ep.ineligible, ep.demoted = true, true
+	ep.ineligible, ep.demoted, ep.marked = true, true, true
+	m := Mark{Endpoint: ep.addr, Class: PhasePin, At: stampMarkLocked(ep, now)}
 	p.mu.Unlock()
 	p.markRefreshDue()
 	ep.transports.closeIdle()
 	p.logPinMismatch(ep, err)
-	return true
+	return m, true
+}
+
+// pinFailureAfterSendBy counts a discovered endpoint's pin failure that
+// finished after the request's send-by bound had passed. The dialer wraps such
+// a failure in ErrSendByPassed, so the request reports the send-by refusal and
+// its outcome demotes nothing. The certificate was still refused, so the
+// endpoint gets every effect of a pin failure: it becomes ineligible, a refresh
+// becomes due, the Warn line is logged, and a pin mark is written. The cause
+// the line and the mark see is the certificate refusal without the send-by
+// wrapping. Every other error, the pool's own ineligible refusal among them,
+// is left alone.
+func (p *Pool) pinFailureAfterSendBy(ep *endpoint, err error) {
+	if ep == nil || ep.kind != KindDiscovered || !errors.Is(err, ErrSendByPassed) ||
+		!errors.Is(err, ErrPinMismatch) || errors.Is(err, errIneligible) {
+		return
+	}
+	cpe, ok := AsConnectPhase(err)
+	if !ok || cpe.Phase != PhasePin {
+		return
+	}
+	cause := err
+	var refused *tls.CertificateVerificationError
+	if errors.As(err, &refused) {
+		cause = &ConnectPhaseError{Phase: PhasePin, Endpoint: cpe.Endpoint, Err: refused}
+	}
+	p.connectFailed(ep, PhasePin, cause)
+}
+
+// markDown hands m to the mark sink, when the pool has one, through
+// guardHook, so a panic in the sink costs the mark and never the request.
+func (p *Pool) markDown(m Mark) {
+	if p.sink == nil {
+		return
+	}
+	defer p.guardHook(&p.sinkPanicked, fmt.Sprintf("pve endpoint %s: the down-mark sink panicked, so the %s "+
+		"mark may not be recorded", m.Endpoint, m.Class), m.Endpoint, m.Class)
+	p.sink.MarkDown(m)
+}
+
+// tellFirstAnswer tells the first-answer hook that the configured endpoint
+// addr answered, through guardHook, so a panic in the hook never changes what
+// the request returns.
+func (p *Pool) tellFirstAnswer(addr string) {
+	defer p.guardHook(&p.hookPanicked, fmt.Sprintf("pve endpoint %s: the first-answer hook panicked, so "+
+		"discovery may not start in this call", addr), addr, "")
+	p.firstAnswer.FirstAnswer(addr)
+}
+
+// guardHook is deferred around a call into the mark sink or the first-answer
+// hook. It recovers a panic in the call and logs it with msg, the endpoint,
+// the class when there is one, and the scrubbed panic value, and then the
+// call returns normally. The first panic of each hook in the pool's life is
+// logged at Warn and every later one at Debug, so a defect that panics on
+// every call is reported once and every panic still leaves a line. A
+// runtime.Goexit is not a panic, so it carries on unwinding.
+func (p *Pool) guardHook(once *atomic.Bool, msg, endpoint string, class Phase) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	fields := []log.Field{
+		log.String("endpoint", endpoint),
+		log.String("panic", log.ScrubMessage(fmt.Sprint(r))),
+	}
+	if class != "" {
+		fields = append(fields, log.String("class", string(class)))
+	}
+	if once.CompareAndSwap(false, true) {
+		p.logger.Warn(msg, fields...)
+		return
+	}
+	p.logger.Debug(msg, fields...)
 }
 
 // logPinMismatch logs at Warn that a discovered endpoint failed its pin and is
@@ -263,7 +433,7 @@ func (p *Pool) noteAnswer(resp *http.Response, oc outcome) {
 		return
 	}
 	if p.answered.CompareAndSwap(false, true) {
-		p.firstAnswer.FirstAnswer(ep.addr)
+		p.tellFirstAnswer(ep.addr)
 	}
 }
 
