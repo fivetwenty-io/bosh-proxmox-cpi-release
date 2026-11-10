@@ -86,7 +86,7 @@ func profileFiles(t *testing.T, dir string) []string {
 	}
 	var out []string
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "ha-profile-") && strings.HasSuffix(e.Name(), ".json") {
+		if strings.HasPrefix(e.Name(), "ha_profile-") && strings.HasSuffix(e.Name(), ".json") {
 			out = append(out, e.Name())
 		}
 	}
@@ -105,8 +105,8 @@ func TestProfileCacheAFreshEntryAnswersWithoutProbing(t *testing.T) {
 		t.Fatalf("the first call must probe once, got %d config reads and %d storage reads", slowProbes(w), w.storage.calls)
 	}
 	files := profileFiles(t, dir)
-	if len(files) != 1 || !regexp.MustCompile(`^ha-profile-pve1\.dc1\.example\.com-[0-9a-f]{16}\.json$`).MatchString(files[0]) {
-		t.Fatalf("profile files %v, want one ha-profile-<host>-<digest>.json", files)
+	if len(files) != 1 || !regexp.MustCompile(`^ha_profile-pve1\.dc1\.example\.com-[0-9a-f]{16}\.json$`).MatchString(files[0]) {
+		t.Fatalf("profile files %v, want one ha_profile-<host>-<digest>.json", files)
 	}
 
 	clock.advance(59 * time.Second)
@@ -376,7 +376,7 @@ func TestProfileCacheDefaultsToTheEndpointCacheDirectory(t *testing.T) {
 	if slowProbes(w) != 1 {
 		t.Fatalf("the temporary layer must cache, got %d config reads", slowProbes(w))
 	}
-	matches, err := filepath.Glob(filepath.Join(tmp, "pve_cpi-endpoint-cache.*", "ha-profile-*.json"))
+	matches, err := filepath.Glob(filepath.Join(tmp, "pve_cpi-endpoint-cache.*", "ha_profile-*.json"))
 	if err != nil || len(matches) != 1 {
 		t.Errorf("the profile must sit in $TMPDIR/pve_cpi-endpoint-cache.<euid>: %v, %v", matches, err)
 	}
@@ -691,9 +691,9 @@ func TestProfileCacheWriteSweepsOrphanedFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	const orphan = "ha-profile-pve1.dc1.example.com-0123456789abcdef.json"
-	const orphanLock = "ha-profile-pve1.dc1.example.com-0123456789abcdef.lock"
-	const recent = "ha-profile-pve1.dc1.example.com-fedcba9876543210.json"
+	const orphan = "ha_profile-pve1.dc1.example.com-0123456789abcdef.json"
+	const orphanLock = "ha_profile-pve1.dc1.example.com-0123456789abcdef.lock"
+	const recent = "ha_profile-pve1.dc1.example.com-fedcba9876543210.json"
 	const staleTemp = ".tmp-0123456789abcdef0123456789abcdef"
 	touch(orphan, 31*24*time.Hour)
 	touch(orphanLock, 31*24*time.Hour)

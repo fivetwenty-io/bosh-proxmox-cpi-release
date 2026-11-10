@@ -14,9 +14,10 @@ const (
 	endpointLabel = "pve-cpi endpoint-cache"
 
 	// HAProfilePrefix is the file name prefix of the HA profile cache. The
-	// file is named ha-profile-<sanitized host>-<digest>.json, and its lock
-	// files carry the same prefix.
-	HAProfilePrefix = "ha-profile-"
+	// file is named ha_profile-<sanitized host>-<digest>.json, and its lock
+	// files carry the same prefix. The underscore is a character sanitizeHost
+	// never emits, so no endpoint file name can start with this prefix.
+	HAProfilePrefix = "ha_profile-"
 
 	// maxFileLabel bounds a file kind's HMAC label.
 	maxFileLabel = 64
@@ -35,6 +36,22 @@ var ErrInvalidFileKind = errors.New("endpoint cache: invalid file kind")
 // knownFilePrefixes lists the name prefixes a file kind may use. The sweep
 // knows exactly these, so a file of any other kind would never be removed.
 var knownFilePrefixes = []string{HAProfilePrefix}
+
+// filePrefixPattern is the shape of a file kind's name prefix, a lowercase
+// token that ends in a hyphen.
+var filePrefixPattern = regexp.MustCompile(`^[a-z0-9_]+(?:[.-][a-z0-9_]+)*-$`)
+
+// validFilePrefix reports whether prefix is a fixed lowercase token ending in
+// a hyphen that also holds a character sanitizeHost never emits. The second
+// condition keeps an endpoint file for any host from starting with the prefix.
+func validFilePrefix(prefix string) bool {
+	if !filePrefixPattern.MatchString(prefix) {
+		return false
+	}
+	return strings.IndexFunc(prefix, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '.' && r != '-'
+	}) >= 0
+}
 
 // fileLabelPattern is the shape of a file kind's HMAC label: lowercase words
 // of letters and digits, joined by single spaces or hyphens.
@@ -82,7 +99,7 @@ func kindFor(opts StoreOptions) (fileKind, error) {
 	switch {
 	case opts.FilePrefix == "":
 		return fileKind{}, fmt.Errorf("%w: a label or version needs a file prefix", ErrInvalidFileKind)
-	case !slices.Contains(knownFilePrefixes, opts.FilePrefix):
+	case !validFilePrefix(opts.FilePrefix) || !slices.Contains(knownFilePrefixes, opts.FilePrefix):
 		return fileKind{}, fmt.Errorf("%w: file prefix %q is not one the sweep knows", ErrInvalidFileKind, opts.FilePrefix)
 	case opts.Label == "":
 		return fileKind{}, fmt.Errorf("%w: a file prefix needs a label", ErrInvalidFileKind)

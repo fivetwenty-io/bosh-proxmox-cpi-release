@@ -81,8 +81,9 @@ func TestKindForValidatesTheOptions(t *testing.T) {
 		"version only":              {StoreOptions{Version: 2}, false},
 		"prefix only":               {StoreOptions{FilePrefix: HAProfilePrefix}, false},
 		"unknown prefix":            {StoreOptions{FilePrefix: "other-", Label: "pve-cpi other"}, false},
-		"prefix without hyphen":     {StoreOptions{FilePrefix: "ha-profile", Label: "pve-cpi ha-profile"}, false},
-		"uppercase prefix":          {StoreOptions{FilePrefix: "HA-PROFILE-", Label: "pve-cpi ha-profile"}, false},
+		"prefix without hyphen":     {StoreOptions{FilePrefix: "ha_profile", Label: "pve-cpi ha-profile"}, false},
+		"hyphen-only prefix":        {StoreOptions{FilePrefix: "ha-profile-", Label: "pve-cpi ha-profile"}, false},
+		"uppercase prefix":          {StoreOptions{FilePrefix: "HA_PROFILE-", Label: "pve-cpi ha-profile"}, false},
 		"endpoint label":            {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi endpoint-cache"}, false},
 		"endpoint label extended":   {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi endpoint-cache v1"}, false},
 		"uppercase label":           {StoreOptions{FilePrefix: HAProfilePrefix, Label: "Pve ha"}, false},
@@ -168,7 +169,7 @@ func TestAnHAProfileStoreUsesItsOwnNames(t *testing.T) {
 	if !ha.Key().Equal(endpoint.Key()) {
 		t.Error("the two kinds of file for one entry must share one key")
 	}
-	if !regexp.MustCompile(`^ha-profile-pve1\.dc1\.example\.com-[0-9a-f]{16}\.json$`).MatchString(ha.FileName()) {
+	if !regexp.MustCompile(`^ha_profile-pve1\.dc1\.example\.com-[0-9a-f]{16}\.json$`).MatchString(ha.FileName()) {
 		t.Errorf("HA profile file name %q has the wrong shape", ha.FileName())
 	}
 	if ha.FileName() != HAProfilePrefix+endpoint.FileName() {
@@ -255,12 +256,12 @@ func TestAFileOfOneKindNeverVerifiesAsTheOther(t *testing.T) {
 
 func TestSweepRemovesAnAgedHAProfileFileAndKeepsAFreshOne(t *testing.T) {
 	dir, root := sweepDir(t)
-	const base = "ha-profile-" + sweepBase
+	const base = "ha_profile-" + sweepBase
 	aged := 31 * 24 * time.Hour
 	sweepFile(t, dir, base+".json", aged)
 	sweepFile(t, dir, base+".lock", aged)
 	sweepFile(t, dir, base+".discover.lock", aged)
-	const freshBase = "ha-profile-pve9.dc1.example.com-0123456789abcdef"
+	const freshBase = "ha_profile-pve9.dc1.example.com-0123456789abcdef"
 	sweepFile(t, dir, freshBase+".json", 29*24*time.Hour)
 	sweepFile(t, dir, freshBase+".lock", aged)
 	result := runSweep(t, root)
@@ -285,7 +286,7 @@ func TestSweepNamesCoverAHAProfileFileWithALongHost(t *testing.T) {
 
 func TestSweepLeavesAnUpperCaseHAProfileNameAlone(t *testing.T) {
 	dir, root := sweepDir(t)
-	const name = "HA-PROFILE-" + sweepKey
+	const name = "HA_PROFILE-" + sweepKey
 	sweepFile(t, dir, name, 90*24*time.Hour)
 	if result := runSweep(t, root); len(result.Removed) != 0 {
 		t.Errorf("sweep removed %v, want no name the cache does not make", result.Removed)
@@ -415,8 +416,8 @@ func TestStoreSweepRemovesOrphansAndKeepsItsOwnFileAndLock(t *testing.T) {
 	}
 	age(s.FileName(), 90*24*time.Hour)
 	age(lockName, 90*24*time.Hour)
-	const orphan = "ha-profile-" + sweepBase + ".json"
-	const fresh = "ha-profile-pve9.dc1.example.com-0123456789abcdef.json"
+	const orphan = "ha_profile-" + sweepBase + ".json"
+	const fresh = "ha_profile-pve9.dc1.example.com-0123456789abcdef.json"
 	sweepFile(t, dir, orphan, 40*24*time.Hour)
 	sweepFile(t, dir, fresh, time.Hour)
 	sweepFile(t, dir, sweepTemp, 2*time.Hour)
@@ -468,8 +469,8 @@ func TestStoreSweepOfAnotherKindNeverRemovesTheEndpointCachesFiles(t *testing.T)
 	for _, name := range append(slices.Clone(endpointNames), profile.FileName(), profile.kind.lockName(profile.Key())) {
 		age(name)
 	}
-	const profileOrphan = "ha-profile-" + sweepBase + ".json"
-	const profileOrphanLock = "ha-profile-" + sweepBase + ".lock"
+	const profileOrphan = "ha_profile-" + sweepBase + ".json"
+	const profileOrphanLock = "ha_profile-" + sweepBase + ".lock"
 	const endpointOrphan = sweepBase + ".json"
 	for _, name := range []string{profileOrphan, profileOrphanLock, endpointOrphan} {
 		sweepFile(t, dir, name, ancient)
@@ -515,5 +516,45 @@ func TestOpenStoreRefusesAnInvalidKindBeforeItLooksAtTheDirectory(t *testing.T) 
 	_, err := OpenStore(context.Background(), nil, storeTestConfig(), storeTestCredential, haProfileOptions())
 	if err == nil || err.Error() != "HA profile cache: no cache directory" {
 		t.Errorf("a nil directory with a valid name gave %v, want the profile cache's own message", err)
+	}
+}
+
+func TestKnownFilePrefixesCannotCollideWithAnEndpointFile(t *testing.T) {
+	for _, p := range knownFilePrefixes {
+		if !validFilePrefix(p) {
+			t.Errorf("known prefix %q is not a lowercase token ending in a hyphen with a character sanitizeHost never emits", p)
+		}
+	}
+	if validFilePrefix("ha-profile-") {
+		t.Error("a prefix made only of characters sanitizeHost emits was accepted")
+	}
+}
+
+func TestAnEndpointForAHostLikeTheOldProfilePrefixStaysTheEndpointStoresOwn(t *testing.T) {
+	dir := newStoreDir(t)
+	cfg := KeyConfig{Endpoints: []string{"ha-profile-x.example.com:8006"}, VerifySSL: true, User: storeTestUser}
+	endpoint, err := OpenStore(context.Background(), storeTestRoot(t, dir), cfg, storeTestCredential, StoreOptions{})
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	t.Cleanup(func() { _ = endpoint.Close() })
+	profile := openTestStore(t, dir, storeTestCredential, haProfileOptions())
+	name := endpoint.FileName()
+	if !strings.HasPrefix(name, "ha-profile-x.example.com-") || strings.HasPrefix(name, HAProfilePrefix) {
+		t.Fatalf("endpoint file %q should start with the host and not the profile prefix", name)
+	}
+	storePut(t, endpoint, "endpoint")
+	when := sweepNow.Add(-90 * 24 * time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, name), when, when); err != nil {
+		t.Fatal(err)
+	}
+	if result := profile.Sweep(sweepNow); result.Err != nil || len(result.Removed) != 0 {
+		t.Errorf("profile sweep removed %v (err %v), want nothing", result.Removed, result.Err)
+	}
+	if !slices.Contains(storeDirNames(t, dir), name) {
+		t.Fatalf("the profile sweep removed the endpoint file %s", name)
+	}
+	if result := Sweep(storeTestRoot(t, dir), sweepNow); result.Err != nil || !slices.Contains(result.Removed, name) {
+		t.Errorf("endpoint sweep removed %v (err %v), want %s", result.Removed, result.Err, name)
 	}
 }

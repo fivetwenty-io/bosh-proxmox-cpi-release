@@ -525,7 +525,7 @@ func TestEveryProfileCacheLogLineCallsItTheHAProfileCache(t *testing.T) {
 	// A stored file that is damaged.
 	damaged := internalCache(t, &stubLive{facts: internalCleanFacts})
 	run(damaged)
-	files, err := filepath.Glob(filepath.Join(damaged.opts.Dir.Override, "ha-profile-*.json"))
+	files, err := filepath.Glob(filepath.Join(damaged.opts.Dir.Override, "ha_profile-*.json"))
 	if err != nil || len(files) != 1 {
 		t.Fatalf("want one profile file to damage, got %v, %v", files, err)
 	}

@@ -170,8 +170,8 @@ func sweepAge(name string, keep []string) (time.Duration, bool) {
 
 // inSweepScope reports whether a sweep limited to the file kind that starts its
 // names with prefix may remove name. The empty prefix limits nothing. A kind's
-// names are told apart by the prefix alone, so an endpoint file for a host
-// whose name itself begins with the prefix reads as that kind's.
+// names are told apart by the prefix alone. The prefix holds a character
+// sanitizeHost never emits, so no endpoint file for any host starts with it.
 func inSweepScope(name, prefix string) bool {
 	return prefix == "" || strings.HasPrefix(name, prefix) || strings.HasPrefix(name, privatefile.TempPrefix)
 }
