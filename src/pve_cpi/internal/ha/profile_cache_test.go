@@ -250,6 +250,8 @@ func TestProfileCacheAnUnsafeDirectoryProbesEveryCall(t *testing.T) {
 		// refusal is the text of the refusal that must have fired, which tells
 		// the mode check from the owner check.
 		refusal string
+		// unreadable marks a directory the test process can't list.
+		unreadable bool
 	}{
 		"mode open to others": {
 			build: func(t *testing.T) string {
@@ -262,8 +264,9 @@ func TestProfileCacheAnUnsafeDirectoryProbesEveryCall(t *testing.T) {
 			refusal: "unsafe permissions",
 		},
 		"owned by another user": {
-			build:   otherUsersPrivateDirectory,
-			refusal: "unsafe ownership",
+			build:      otherUsersPrivateDirectory,
+			refusal:    "unsafe ownership",
+			unreadable: true,
 		},
 	}
 	for name, tc := range cases {
@@ -281,7 +284,10 @@ func TestProfileCacheAnUnsafeDirectoryProbesEveryCall(t *testing.T) {
 			if slowProbes(w) != 2 {
 				t.Errorf("an unsafe directory must give no cache, got %d config reads", slowProbes(w))
 			}
-			if len(profileFiles(t, dir)) != 0 {
+			// Another user's private directory can't be listed, and a process
+			// that can't list it can't write a file there either, so only a
+			// directory the test can read is checked for files.
+			if !tc.unreadable && len(profileFiles(t, dir)) != 0 {
 				t.Errorf("an unsafe directory must stay unwritten")
 			}
 			refusals := debugErrors(logs, "no usable cache directory")
