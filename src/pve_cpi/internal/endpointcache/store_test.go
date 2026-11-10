@@ -254,7 +254,8 @@ func TestStoreRefusesAWrongKey(t *testing.T) {
 func TestStoreRefusesAnUnsupportedVersion(t *testing.T) {
 	dir := newStoreDir(t)
 	s := openTestStore(t, dir, storeTestCredential, StoreOptions{})
-	if err := s.policy.WriteEnvelope(s.guard.root, s.name, fileVersion+1, storeTestPayload{Key: s.Key()}, s.ops); err != nil {
+	if err := s.policy.WriteEnvelope(s.guard.root, s.name, fileVersion+1,
+		storeTestPayload{Key: s.Key()}, s.ops); err != nil {
 		t.Fatal(err)
 	}
 	var got storeTestPayload
@@ -828,7 +829,8 @@ func TestStoreRefusesAFileSignedForAnotherVersion(t *testing.T) {
 	}
 	other := s.policy
 	other.Integrity = hmacIntegrity(next)
-	if err := other.WriteEnvelope(s.guard.root, s.name, fileVersion, storeTestPayload{Key: s.Key(), Note: "v2"}, s.ops); err != nil {
+	if err := other.WriteEnvelope(s.guard.root, s.name, fileVersion,
+		storeTestPayload{Key: s.Key(), Note: "v2"}, s.ops); err != nil {
 		t.Fatal(err)
 	}
 	var got storeTestPayload

@@ -43,7 +43,8 @@ var errDiscoveryWorkerStore = errors.New("api endpoint discovery: the worker nee
 var errDiscoveryWorkerClient = errors.New("api endpoint discovery: the worker needs a client to send its reads")
 
 // errDiscoveryWorkerPool refuses a binding without a pool.
-var errDiscoveryWorkerPool = errors.New("api endpoint discovery: the worker needs the pool it is the first-answer hook of")
+var errDiscoveryWorkerPool = errors.New(
+	"api endpoint discovery: the worker needs the pool it is the first-answer hook of")
 
 // errDiscoveryWorkerBound refuses a second binding.
 var errDiscoveryWorkerBound = errors.New("api endpoint discovery: the worker is already bound to a client")
@@ -253,7 +254,8 @@ func (w *DiscoveryWorker) refresh(ctx context.Context, via string, b DiscoveryBi
 	source, ok := keyEndpoint(w.store.Key(), via)
 	if !ok {
 		w.logger.LogAttrs(ctx, endpointcache.Level(w.mode),
-			"api endpoint discovery: the answering endpoint is not one of the configured endpoints; skipping the refresh",
+			"api endpoint discovery: the answering endpoint is not one of the configured endpoints; "+
+				"skipping the refresh",
 			log.String("endpoint", via))
 		return
 	}
@@ -513,7 +515,8 @@ func readerNodes(
 // recordResult applies the trust rules to obs inside the store's locked update
 // and logs what the decision and the write call for.
 func (w *DiscoveryWorker) recordResult(
-	ctx context.Context, b DiscoveryBinding, reads DiscoveryReads, result DiscoveryResult, obs endpointcache.Observation,
+	ctx context.Context, b DiscoveryBinding, reads DiscoveryReads, result DiscoveryResult,
+	obs endpointcache.Observation,
 ) {
 	key := w.store.Key()
 	var (
@@ -623,7 +626,8 @@ func (w *DiscoveryWorker) logDiscovery(
 		}
 		why := degradedText(written.Outcome, result, reads, d, seed)
 		wait := waitText(written.NextRefreshAfter.Sub(written.DiscoveredAt))
-		w.logger.LogAttrs(ctx, level, fmt.Sprintf("api endpoint discovery: %s; next attempt in %s", why, wait), attrs...)
+		w.logger.LogAttrs(ctx, level,
+			fmt.Sprintf("api endpoint discovery: %s; next attempt in %s", why, wait), attrs...)
 	}
 }
 
@@ -734,7 +738,8 @@ func cacheOutcome(outcome DiscoveryOutcome) (endpointcache.DiscoveryOutcome, err
 	case DiscoveryPublicSuffix:
 		return endpointcache.OutcomePublicSuffix, nil
 	}
-	return "", fmt.Errorf("%w: discovery outcome %q has no cache value", endpointcache.ErrInvalidChange, string(outcome))
+	return "", fmt.Errorf("%w: discovery outcome %q has no cache value",
+		endpointcache.ErrInvalidChange, string(outcome))
 }
 
 // logBuildDrops logs one Debug line for each node the builder left out.

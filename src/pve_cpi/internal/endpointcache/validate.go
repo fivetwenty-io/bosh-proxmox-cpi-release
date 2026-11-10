@@ -260,7 +260,8 @@ func validateDiscovery(
 	d *DiscoverySection, derive derivation, now time.Time, held func(DiscoveredNode) bool,
 ) (*DiscoverySection, []DiscoveredNode, []Drop, error) {
 	if d.LastFailure != "" && !d.LastFailure.Valid() {
-		return nil, nil, nil, fmt.Errorf("%w: discovery last_failure is not one of the enumerated values", ErrPayloadInvalid)
+		return nil, nil, nil, fmt.Errorf(
+			"%w: discovery last_failure is not one of the enumerated values", ErrPayloadInvalid)
 	}
 	// A section an attempt created has no outcome, because no discovery wrote
 	// a result, and it carries the failure that ended the attempt.

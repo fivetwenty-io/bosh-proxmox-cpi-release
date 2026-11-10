@@ -26,9 +26,11 @@ func TestMergeRecordsThePinFailureInTheDiscoverySection(t *testing.T) {
 		change Change
 		want   time.Time
 	}{
-		{"a pin failure on a section that holds none", pinFailedStored(time.Time{}), Change{PinFailedAt: earlier}, earlier},
+		{"a pin failure on a section that holds none", pinFailedStored(time.Time{}),
+			Change{PinFailedAt: earlier}, earlier},
 		{"a later pin failure replaces the stored one", pinFailedStored(earlier), Change{PinFailedAt: later}, later},
-		{"an earlier pin failure never replaces the stored one", pinFailedStored(later), Change{PinFailedAt: earlier}, later},
+		{"an earlier pin failure never replaces the stored one", pinFailedStored(later),
+			Change{PinFailedAt: earlier}, later},
 		{"no pin failure leaves the stored one", pinFailedStored(earlier), Change{
 			Marks: map[string]DownMark{mergeSeed: {DownAt: payloadNow, Class: MarkDial}},
 		}, earlier},
@@ -41,9 +43,8 @@ func TestMergeRecordsThePinFailureInTheDiscoverySection(t *testing.T) {
 		{"a time inside the skew is kept", pinFailedStored(time.Time{}), Change{
 			PinFailedAt: payloadNow.Add(FutureSkew),
 		}, payloadNow.Add(FutureSkew)},
-		{"a stored time past the skew gives way to a real one", pinFailedStored(payloadNow.Add(10 * time.Minute)), Change{
-			PinFailedAt: earlier,
-		}, earlier},
+		{"a stored time past the skew gives way to a real one",
+			pinFailedStored(payloadNow.Add(10 * time.Minute)), Change{PinFailedAt: earlier}, earlier},
 		{"an attempt leaves the stored pin failure", pinFailedStored(earlier), Change{
 			Attempt: failedAttempt(FailureNodesUnreadable),
 		}, earlier},

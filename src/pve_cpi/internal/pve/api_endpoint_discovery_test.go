@@ -76,7 +76,9 @@ func markedClient(d *discCluster, reqs *discRequests) *discClient {
 		reqs.note(ctx, "nodes")
 		return nodesFn(ctx)
 	}
-	c.nodes.listCertificatesInfoFn = func(ctx context.Context, node string) (*sdknodes.ListCertificatesInfoResponse, error) {
+	c.nodes.listCertificatesInfoFn = func(
+		ctx context.Context, node string,
+	) (*sdknodes.ListCertificatesInfoResponse, error) {
 		reqs.note(ctx, "certificates")
 		return certFn(ctx, node)
 	}
@@ -514,11 +516,12 @@ func TestDiscoveryWorker_DueConditions(t *testing.T) {
 		}
 		other := e.openStore()
 		at := e.clock.Now()
-		if _, err := other.UpdatePayload(context.Background(), at, func(endpointcache.Stored) (endpointcache.Change, error) {
-			return endpointcache.Change{Marks: map[string]endpointcache.DownMark{
-				"pve2.dc1.example.com:8006": {DownAt: at, Class: endpointcache.MarkPin},
-			}}, nil
-		}); err != nil {
+		if _, err := other.UpdatePayload(context.Background(), at,
+			func(endpointcache.Stored) (endpointcache.Change, error) {
+				return endpointcache.Change{Marks: map[string]endpointcache.DownMark{
+					"pve2.dc1.example.com:8006": {DownAt: at, Class: endpointcache.MarkPin},
+				}}, nil
+			}); err != nil {
 			t.Fatalf("write the pin mark: %v", err)
 		}
 		e.run()
@@ -532,11 +535,12 @@ func TestDiscoveryWorker_DueConditions(t *testing.T) {
 		e.run()
 		e.clock.advance(endpointcache.PinRefreshFloor + time.Second)
 		at := e.clock.Now()
-		if _, err := e.store.UpdatePayload(context.Background(), at, func(endpointcache.Stored) (endpointcache.Change, error) {
-			return endpointcache.Change{Marks: map[string]endpointcache.DownMark{
-				"pve2.dc1.example.com:8006": {DownAt: at, Class: endpointcache.MarkDial},
-			}}, nil
-		}); err != nil {
+		if _, err := e.store.UpdatePayload(context.Background(), at,
+			func(endpointcache.Stored) (endpointcache.Change, error) {
+				return endpointcache.Change{Marks: map[string]endpointcache.DownMark{
+					"pve2.dc1.example.com:8006": {DownAt: at, Class: endpointcache.MarkDial},
+				}}, nil
+			}); err != nil {
 			t.Fatalf("write the dial mark: %v", err)
 		}
 		e.run()
@@ -1186,11 +1190,15 @@ func TestDiscoveryWorker_Helpers(t *testing.T) {
 		t.Error("statusText for a status without quorum")
 	}
 	for err, want := range map[error]endpointcache.DiscoveryFailure{
-		&discoveryReadError{base: ErrDiscoveryNodes, cause: errors.New("HTTP 500")}: endpointcache.FailureNodesUnreadable,
+		&discoveryReadError{
+			base: ErrDiscoveryNodes, cause: errors.New("HTTP 500"),
+		}: endpointcache.FailureNodesUnreadable,
 		ErrDiscoveryNodes:    endpointcache.FailureNodesEmpty,
 		ErrDiscoveryNodeName: endpointcache.FailureNodeNameInvalid,
-		&discoveryReadError{base: ErrDiscoveryRoot, cause: errors.New("HTTP 403")}: endpointcache.FailureRootCAUnreadable,
-		fmt.Errorf("ReadDiscovery: read ended: %w", context.DeadlineExceeded):      endpointcache.FailureReadsTimedOut,
+		&discoveryReadError{
+			base: ErrDiscoveryRoot, cause: errors.New("HTTP 403"),
+		}: endpointcache.FailureRootCAUnreadable,
+		fmt.Errorf("ReadDiscovery: read ended: %w", context.DeadlineExceeded): endpointcache.FailureReadsTimedOut,
 		ErrDiscoveryInput:   endpointcache.FailureReadsFailed,
 		errors.New("other"): endpointcache.FailureReadsFailed,
 	} {

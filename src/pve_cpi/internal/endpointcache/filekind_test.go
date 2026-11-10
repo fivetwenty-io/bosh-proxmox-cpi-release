@@ -324,7 +324,8 @@ func TestAnHAProfileStoreNamesItselfInItsMessages(t *testing.T) {
 
 	other := s.Key()
 	other.CredentialID = "0000000000000000"
-	if err := s.policy.WriteEnvelope(s.guard.root, s.name, s.kind.version, storeTestPayload{Key: other}, s.ops); err != nil {
+	if err := s.policy.WriteEnvelope(s.guard.root, s.name, s.kind.version,
+		storeTestPayload{Key: other}, s.ops); err != nil {
 		t.Fatal(err)
 	}
 	err = s.Read(&got)
@@ -333,7 +334,8 @@ func TestAnHAProfileStoreNamesItselfInItsMessages(t *testing.T) {
 		t.Errorf("a file for another key: %v, want ErrKeyMismatch", err)
 	}
 
-	if err := s.policy.WriteEnvelope(s.guard.root, s.name, s.kind.version+1, storeTestPayload{Key: s.Key()}, s.ops); err != nil {
+	if err := s.policy.WriteEnvelope(s.guard.root, s.name, s.kind.version+1,
+		storeTestPayload{Key: s.Key()}, s.ops); err != nil {
 		t.Fatal(err)
 	}
 	err = s.Read(&got)

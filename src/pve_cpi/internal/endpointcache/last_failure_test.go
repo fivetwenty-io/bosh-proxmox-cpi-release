@@ -102,8 +102,8 @@ func TestMergeAttemptStoresItsFailure(t *testing.T) {
 	// A section a reader hides for its time still records nothing.
 	aheadFile := payloadFor(key, "pve2")
 	aheadFile.Discovery.DiscoveredAt = payloadNow.Add(time.Hour)
-	if next, _, err := Merge(aheadFile, key, Change{Attempt: failedAttempt(FailureReadsFailed)}, payloadNow); err != nil ||
-		!reflect.DeepEqual(next, aheadFile) {
+	if next, _, err := Merge(aheadFile, key, Change{Attempt: failedAttempt(FailureReadsFailed)},
+		payloadNow); err != nil || !reflect.DeepEqual(next, aheadFile) {
 		t.Errorf("a section dated ahead: %s, %v", trustDump(next), err)
 	}
 
@@ -133,7 +133,8 @@ func TestMergeRefusesAnUnknownFailure(t *testing.T) {
 		}
 	}
 	// A failure beside a result in the same change is refused.
-	_, _, err := Merge(nil, key, Change{Attempt: failedAttempt(FailureNodesEmpty), Result: mergeResult("pve2")}, payloadNow)
+	_, _, err := Merge(nil, key, Change{Attempt: failedAttempt(FailureNodesEmpty), Result: mergeResult("pve2")},
+		payloadNow)
 	if !errors.Is(err, ErrInvalidChange) {
 		t.Errorf("a failure beside a result: %v, want ErrInvalidChange", err)
 	}

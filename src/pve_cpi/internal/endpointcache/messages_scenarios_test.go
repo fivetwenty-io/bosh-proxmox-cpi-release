@@ -159,11 +159,13 @@ func messageScenarios(t *testing.T, opts StoreOptions, name string) []string {
 	record("damaged file", s.Read(&got))
 	other := s.Key()
 	other.CredentialID = "0000000000000000"
-	if err := s.policy.WriteEnvelope(s.guard.root, s.name, s.kind.version, storeTestPayload{Key: other}, s.ops); err != nil {
+	if err := s.policy.WriteEnvelope(s.guard.root, s.name, s.kind.version,
+		storeTestPayload{Key: other}, s.ops); err != nil {
 		t.Fatal(err)
 	}
 	record("file for another key", s.Read(&got))
-	if err := s.policy.WriteEnvelope(s.guard.root, s.name, s.kind.version+1, storeTestPayload{Key: s.Key()}, s.ops); err != nil {
+	if err := s.policy.WriteEnvelope(s.guard.root, s.name, s.kind.version+1,
+		storeTestPayload{Key: s.Key()}, s.ops); err != nil {
 		t.Fatal(err)
 	}
 	record("newer file version", s.Read(&got))

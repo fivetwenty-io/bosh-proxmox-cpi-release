@@ -455,7 +455,8 @@ func TestDiscoveryWorker_PinFailureInAnotherProcess(t *testing.T) {
 			t.Fatal("the pin failure made no refresh due")
 		}
 		p := e.payload()
-		if p.Discovery.LastFailure != endpointcache.FailureRootCAUnreadable || !p.Discovery.PinFailedAt.Equal(failedAt) {
+		if p.Discovery.LastFailure != endpointcache.FailureRootCAUnreadable ||
+			!p.Discovery.PinFailedAt.Equal(failedAt) {
 			t.Fatalf("after the attempt: last_failure %q, pin_failed_at %v, want the failure and %v",
 				p.Discovery.LastFailure, p.Discovery.PinFailedAt, failedAt)
 		}
