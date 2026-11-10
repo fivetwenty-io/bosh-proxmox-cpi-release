@@ -4257,6 +4257,7 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	c.validateRanges(&errs)
 	c.validateNodeEndpoints(&errs)
 	c.validateEndpoints(&errs)
+	c.validateHostAlone(&errs)
 	c.validatePlacement(&errs)
 	c.validateHA(&errs)
 	c.validateStorage(&errs)
@@ -5038,9 +5039,10 @@ func (c *CPIConfig) validateNodeEndpoints(errs *[]string) {
 // node_endpoints values and the endpoints list: a hostname, an IPv4 literal,
 // or a bare IPv6 literal, each optionally followed by a port, where an IPv6
 // literal with a port is written [literal]:port. There is no scheme and no
-// path, and any port must parse in 1-65535. It returns "" when addr is
-// acceptable, and otherwise a message that starts with label, which names the
-// value being checked.
+// path, any port must parse in 1-65535, and the host must not be empty once a
+// trailing dot is removed. It returns "" when addr is acceptable, and
+// otherwise a message that starts with label, which names the value being
+// checked.
 func endpointGrammarProblem(label, addr string) string {
 	shown := redactEndpoint(addr)
 	if strings.TrimSpace(addr) == "" {
@@ -5084,6 +5086,14 @@ func endpointGrammarProblem(label, addr string) string {
 		// literal (the SDK brackets it when dialing); anything else here
 		// is a typo like "host:8006:8006".
 		return fmt.Sprintf("%s must be host, host:port, or a bare IPv6 literal, got %q", label, shown)
+	}
+	if splitErr != nil {
+		host = addr
+	}
+	if strings.TrimSuffix(host, ".") == "" {
+		// "." and ".:8006" pass every check above, but the trailing dot
+		// leaves no host, and the client refuses such a value at init.
+		return fmt.Sprintf("%s host must not be empty once the trailing dot is removed, got %q", label, shown)
 	}
 	return ""
 }
@@ -5339,6 +5349,26 @@ func (c *CPIConfig) validateEndpointsNoting(portNote string, errs *[]string) {
 	}
 	if c.Host != "" && firstKey != "" {
 		c.validateHostAgreesWithEndpoints(firstKey, portNote, errs)
+	}
+}
+
+// validateHostAlone refuses a pve.host that has no host once surrounding
+// space, any port, and a trailing dot are removed, as in "." and ".:8006",
+// when no endpoints list is set. With a list, validateEndpoints already
+// reports a bad first entry and a pve.host that does not match it. Any other
+// pve.host keeps passing, since it has never been held to the endpoint
+// grammar.
+func (c *CPIConfig) validateHostAlone(errs *[]string) {
+	if c.Host == "" || len(c.Endpoints) > 0 {
+		return
+	}
+	host := strings.TrimSpace(c.Host)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if strings.TrimSuffix(host, ".") == "" {
+		*errs = append(*errs, fmt.Sprintf(
+			"pve.host host must not be empty once the trailing dot is removed, got %q", redactEndpoint(c.Host)))
 	}
 }
 
