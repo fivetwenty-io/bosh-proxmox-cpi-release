@@ -68,6 +68,19 @@ type CPIConfig struct {
 	// stay opt-in by construction and need no gate.
 	NodeEndpointsDiscovery *bool `json:"node_endpoints_discovery,omitempty"`
 
+	// APIEndpointDiscovery is the configured API endpoint discovery mode
+	// (pve.api_endpoint_discovery): auto, on, or off. Empty means auto. It is
+	// only the starting point; EffectiveDiscoveryMode resolves what a client
+	// does. Validated only when set.
+	APIEndpointDiscovery DiscoveryMode `json:"api_endpoint_discovery,omitempty"`
+
+	// EndpointCacheDir is the directory that holds endpoint cache files
+	// (pve.endpoint_cache_dir). It wins over the default beside the journal
+	// and over the temporary directory. Process-level like
+	// StorageAllocationJournalDir, so a cpi-config entry cannot change it.
+	// Validated only when set.
+	EndpointCacheDir string `json:"endpoint_cache_dir,omitempty"`
+
 	// Named storage placement is opt-in; unused definitions do not activate it.
 	StorageSets                 map[string]StorageSet            `json:"storage_sets,omitempty"`
 	StorageCapacityDomains      map[string]StorageCapacityDomain `json:"storage_capacity_domains,omitempty"`
@@ -920,6 +933,17 @@ type CPIConfig struct {
 	// when no port was adopted.
 	listReadPort    int
 	listAdoptedPort int
+
+	// inheritedCredsLooserTLS records that a cpi-config entry inherited the
+	// job's credentials while setting looser TLS than the job: verify_ssl
+	// false against a verifying job, or a different CA. Credentials that ride
+	// looser TLS must never reach a discovered endpoint, so
+	// EffectiveDiscoveryMode resolves such an entry to off, and Validate
+	// rejects the entry when its mode is on. Unexported and untagged like
+	// parkedDefaultBandCollision, so it is neither decoded from nor emitted
+	// to cpi.json and survives the shallow copy ApplyContextOverrides makes.
+	// Only the override code sets it, on an effective config.
+	inheritedCredsLooserTLS bool
 
 	// parkerStartDefaulted and parkerEndDefaulted record, per bound, that
 	// ApplyDefaults rather than the operator put the value in the range field.
@@ -4258,6 +4282,7 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	c.validateNodeEndpoints(&errs)
 	c.validateEndpoints(&errs)
 	c.validateHostAlone(&errs)
+	c.validateDiscovery(&errs)
 	c.validatePlacement(&errs)
 	c.validateHA(&errs)
 	c.validateStorage(&errs)
@@ -5393,6 +5418,236 @@ func (c *CPIConfig) validateHostAgreesWithEndpoints(firstKey, portNote string, e
 	*errs = append(*errs, fmt.Sprintf(
 		"pve.host %q with port %d%s does not match the first entry of pve.endpoints (%s); %s",
 		redactEndpoint(c.Host), c.defaultEndpointPort(), portNote, firstKey, remedy))
+}
+
+// DiscoveryMode is the pve.api_endpoint_discovery value. It decodes a JSON
+// string as is and a JSON boolean as "on" or "off", because YAML 1.1, which
+// BOSH manifests and cpi-config entries are written in, reads an unquoted on
+// or off as a boolean. A hand-written cpi.json or a create-env manifest with a
+// bare boolean therefore still loads. Any other string decodes unchanged and
+// fails validation, so the operator sees the value they wrote.
+type DiscoveryMode string
+
+// DiscoveryMode values. The empty mode means the property is unset, which
+// reads as DiscoveryModeAuto.
+const (
+	// DiscoveryModeAuto discovers only when the effective list holds exactly
+	// one endpoint and the CPI authenticates with an API token.
+	DiscoveryModeAuto DiscoveryMode = "auto"
+	// DiscoveryModeOn discovers even when the list holds several endpoints,
+	// seeding from the first.
+	DiscoveryModeOn DiscoveryMode = "on"
+	// DiscoveryModeOff never discovers.
+	DiscoveryModeOff DiscoveryMode = "off"
+)
+
+// UnmarshalJSON implements json.Unmarshaler. A JSON null leaves the mode
+// unchanged, as it does for the other optional properties.
+func (m *DiscoveryMode) UnmarshalJSON(raw []byte) error {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "null" {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		*m = DiscoveryMode(s)
+		return nil
+	}
+	var b bool
+	if err := json.Unmarshal(raw, &b); err == nil {
+		if b {
+			*m = DiscoveryModeOn
+		} else {
+			*m = DiscoveryModeOff
+		}
+		return nil
+	}
+	return fmt.Errorf("api_endpoint_discovery: expected a string or a boolean, got %s", trimmed)
+}
+
+// valid reports whether the mode is one of the three values. The empty mode,
+// which stands for unset, is not valid here; callers resolve it to auto first.
+func (m DiscoveryMode) valid() bool {
+	switch m {
+	case DiscoveryModeAuto, DiscoveryModeOn, DiscoveryModeOff:
+		return true
+	default:
+		return false
+	}
+}
+
+// Reason texts for the discovery decisions that need only the config. The
+// resolver returns them as the log text for a row that turns discovery off,
+// and Validate reuses the two that are also configuration errors.
+const (
+	discoveryReasonLooserTLS = "this entry inherits the job's credentials and sets looser TLS than the job, " +
+		"so endpoint discovery is off"
+	discoveryErrLooserTLS = "api_endpoint_discovery \"on\" cannot be used because this entry inherits the job's " +
+		"credentials and sets looser TLS than the job; give the entry its own credentials " +
+		"(pve.api_token, or pve.user with pve.password), or set pve.api_endpoint_discovery to auto or off"
+	discoveryErrPasswordNoVerify = "api_endpoint_discovery \"on\" cannot be used with password auth while " +
+		"verify_ssl is false; use an API token (pve.api_token) or turn on verification (pve.verify_ssl: true)"
+	discoveryReasonPassword = "api_endpoint_discovery is auto and the CPI logs in with a password, " +
+		"so endpoint discovery is off; set pve.api_endpoint_discovery to on to discover with a password"
+)
+
+// DiscoveryModeValue returns the configured discovery mode: the stored value,
+// or auto when the property is unset. It does not validate the value.
+func (c *CPIConfig) DiscoveryModeValue() DiscoveryMode {
+	if c == nil || c.APIEndpointDiscovery == "" {
+		return DiscoveryModeAuto
+	}
+	return c.APIEndpointDiscovery
+}
+
+// InheritedCredsLooserTLS reports whether this config belongs to a cpi-config
+// entry that inherited the job's credentials while setting looser TLS than
+// the job. A nil receiver reports false.
+func (c *CPIConfig) InheritedCredsLooserTLS() bool {
+	return c != nil && c.inheritedCredsLooserTLS
+}
+
+// usesPasswordAuth reports whether the CPI logs in with a user and password.
+// An API token wins when both are present, as applyCredentialPrecedence
+// decides, and a config with neither fails validateAuth on its own.
+func (c *CPIConfig) usesPasswordAuth() bool {
+	return c.APIToken == "" && c.Password != ""
+}
+
+// endpointCount returns how many endpoints the client would be built with:
+// the list when one is set, and otherwise the single Host.
+func (c *CPIConfig) endpointCount() int {
+	if len(c.Endpoints) > 0 {
+		return len(c.Endpoints)
+	}
+	return 1
+}
+
+// EffectiveDiscoveryMode resolves the rows of the discovery mode table that
+// need only the config, in table order, and the first row that matches wins.
+// It returns DiscoveryModeOn or DiscoveryModeOff, never auto, plus the reason
+// text for the row that decided. A non-empty reason is what the caller logs,
+// at Debug, and an empty reason means the row logs nothing.
+//
+// The rows resolve as follows.
+//   - A cpi-config entry that inherited the job's credentials under looser TLS
+//     resolves to off. When its mode is on, Validate has already rejected the
+//     config, so off is the fail-closed answer for a caller that skips it.
+//   - Off resolves to off, silently.
+//   - On with password auth and verify_ssl false resolves to off with the
+//     validation message as the reason, for the same reason.
+//   - Auto with more than one endpoint resolves to off, silently.
+//   - Auto with password auth resolves to off, with a reason.
+//   - Anything else resolves to on.
+//
+// The row for an unusable cache directory needs a filesystem check, so the
+// caller that builds the client applies it whenever this function answers on.
+// A nil config, and a mode that is not auto, on, or off, resolve to off,
+// because discovery must never start from a config nobody validated.
+func EffectiveDiscoveryMode(cfg *CPIConfig) (DiscoveryMode, string) {
+	if cfg == nil {
+		return DiscoveryModeOff, ""
+	}
+	mode := cfg.DiscoveryModeValue()
+	if !mode.valid() {
+		return DiscoveryModeOff, fmt.Sprintf("api_endpoint_discovery %q is not auto, on, or off, "+
+			"so endpoint discovery is off", string(mode))
+	}
+	if cfg.inheritedCredsLooserTLS {
+		return DiscoveryModeOff, discoveryReasonLooserTLS
+	}
+	switch mode {
+	case DiscoveryModeOff:
+		return DiscoveryModeOff, ""
+	case DiscoveryModeOn:
+		if cfg.usesPasswordAuth() && !cfg.VerifySSLValue() {
+			return DiscoveryModeOff, discoveryErrPasswordNoVerify
+		}
+		return DiscoveryModeOn, ""
+	default:
+		if cfg.endpointCount() > 1 {
+			return DiscoveryModeOff, ""
+		}
+		if cfg.usesPasswordAuth() {
+			return DiscoveryModeOff, discoveryReasonPassword
+		}
+		return DiscoveryModeOn, ""
+	}
+}
+
+// validateDiscovery validates the optional discovery properties, each only
+// when it is set.
+//   - api_endpoint_discovery must be auto, on, or off after the boolean
+//     mapping, and on is rejected with password auth and verify_ssl false, and
+//     for an entry that inherited credentials under looser TLS.
+//   - endpoint_cache_dir must be an absolute, clean path, and it must not
+//     equal or sit inside storage_allocation_journal_dir, because the journal
+//     scans its own tree and has strict identity rules.
+func (c *CPIConfig) validateDiscovery(errs *[]string) {
+	c.validateDiscoveryMode(errs)
+	c.validateEndpointCacheDir(errs)
+}
+
+// validateDiscoveryMode appends the mode errors. See validateDiscovery.
+func (c *CPIConfig) validateDiscoveryMode(errs *[]string) {
+	if c.APIEndpointDiscovery == "" {
+		return
+	}
+	if !c.APIEndpointDiscovery.valid() {
+		*errs = append(*errs, fmt.Sprintf("api_endpoint_discovery must be auto, on, or off, got %q",
+			string(c.APIEndpointDiscovery)))
+		return
+	}
+	if c.APIEndpointDiscovery != DiscoveryModeOn {
+		return
+	}
+	if c.inheritedCredsLooserTLS {
+		*errs = append(*errs, discoveryErrLooserTLS)
+	}
+	if c.usesPasswordAuth() && !c.VerifySSLValue() {
+		*errs = append(*errs, discoveryErrPasswordNoVerify)
+	}
+}
+
+// validateEndpointCacheDir appends the cache directory errors. It compares
+// paths as text, because the config check must not touch the filesystem; the
+// caller that creates the directory resolves symlinks.
+func (c *CPIConfig) validateEndpointCacheDir(errs *[]string) {
+	dir := c.EndpointCacheDir
+	if dir == "" {
+		return
+	}
+	if strings.ContainsFunc(dir, unicode.IsControl) {
+		*errs = append(*errs, "endpoint_cache_dir must not contain control characters")
+		return
+	}
+	if !filepath.IsAbs(dir) {
+		*errs = append(*errs, fmt.Sprintf("endpoint_cache_dir must be an absolute path, got %q", dir))
+		return
+	}
+	if clean := filepath.Clean(dir); clean != dir {
+		*errs = append(*errs, fmt.Sprintf("endpoint_cache_dir must be a clean path, write %q instead of %q",
+			clean, dir))
+		return
+	}
+	journal := c.StorageAllocationJournalDir
+	if journal == "" || !filepath.IsAbs(journal) {
+		return
+	}
+	if pathIsWithin(filepath.Clean(journal), dir) {
+		*errs = append(*errs, fmt.Sprintf("endpoint_cache_dir %q must not equal or sit inside "+
+			"storage_allocation_journal_dir %q; choose a directory outside the journal", dir, journal))
+	}
+}
+
+// pathIsWithin reports whether the clean absolute path child equals root or
+// lies below it, comparing whole path elements so /a/bc is not inside /a/b.
+func pathIsWithin(root, child string) bool {
+	rel, err := filepath.Rel(root, child)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 // validatePlacement validates the optional Placement block. Skipped entirely
