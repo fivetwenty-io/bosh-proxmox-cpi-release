@@ -41,7 +41,7 @@ The `agent.mbus` value shown is the `bosh-deployment` default for create-env boo
 |---|---|---|
 | `pve.host` | Yes | PVE API hostname or IP reachable from the Director VM |
 | `pve.user` | Yes | PVE username, e.g. `root@pam` |
-| `pve.password` or `pve.api_token` | Yes (one of) | Mutually exclusive; prefer `api_token` |
+| `pve.password` or `pve.api_token` | Yes (one of) | When both are set, the token wins and the password is ignored; prefer `api_token` |
 | `pve.node` | Yes | Default PVE node name |
 | `pve.vm_storage` | Yes | Storage pool for VM root disks |
 | `pve.disk_storage` | Yes | Storage pool for persistent disks |

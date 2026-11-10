@@ -24,8 +24,8 @@ With just this manifest, `create_vm` attaches every NIC to the pre-existing `vmb
 |  `pve.host` | PVE host (IP or FQDN). Overridable per cpi-config entry as `pve_host`. | - | yes |
 |  `pve.port` | PVE API port. Overridable per cpi-config entry as `pve_port`. | `8006` | no |
 |  `pve.user` | PVE username (e.g. `root@pam` or `bosh@pve`). The key has no default, so the manifest must always include it. An API token already names its user, so the value may be `""` when `api_token` is set. Overridable per cpi-config entry as `pve_user`. | - | yes (the value may be `""` with `api_token`) |
-|  `pve.password` | PVE password. Mutually exclusive with `api_token`. Must be credhub-managed in production via `((pve_password))`. Overridable per cpi-config entry as `pve_password`. | `""` | one of password or api_token |
-|  `pve.api_token` | PVE API token (`<user>!<token-id>=<uuid>`). Mutually exclusive with `password`. Must be credhub-managed in production via `((pve_api_token))`. Overridable per cpi-config entry as `pve_api_token`. | `""` | one of password or api_token |
+|  `pve.password` | PVE password. When `api_token` is also set, the token wins and the password is ignored. Must be credhub-managed in production via `((pve_password))`. Overridable per cpi-config entry as `pve_password`. | `""` | one of password or api_token |
+|  `pve.api_token` | PVE API token (`<user>!<token-id>=<uuid>`). When `password` is also set, this token wins and the password is ignored. Must be credhub-managed in production via `((pve_api_token))`. Overridable per cpi-config entry as `pve_api_token`. | `""` | one of password or api_token |
 |  `pve.realm` | Authentication realm. Overridable per cpi-config entry as `pve_realm`. | `pam` | no |
 |  `pve.node` | Default node for placement and bridge operations. Overridable per cpi-config entry as `pve_node`. | - | no (but set it in practice, as described above) |
 |  `pve.vm_storage` | Storage pool for VM root disks. Overridable per cpi-config entry as `pve_vm_storage`. | - | yes |

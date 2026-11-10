@@ -105,7 +105,7 @@ The CPI exposes properties under the `pve.*` and `agent.*` namespaces. The most 
 | `pve.host` | PVE host (IP or FQDN) | **required** |
 | `pve.user` | PVE username (e.g. `bosh@pve`) | **required** |
 | `pve.api_token` | PVE API token, preferred over password in production | `""` |
-| `pve.password` | PVE password, mutually exclusive with `api_token` | `""` |
+| `pve.password` | PVE password, ignored when `api_token` is also set | `""` |
 | `pve.node` | Default PVE node for placement | **required** |
 | `pve.vm_storage` | Storage pool for VM root disks | **required** |
 | `pve.disk_storage` | Storage pool for persistent disks | **required** |
