@@ -417,7 +417,8 @@ func (p *Pool) Len() int { return len(p.endpoints) }
 
 // HeaderDeadline returns the response-header deadline the pool gives an
 // idempotent request, which is 60 seconds for a pool of more than one endpoint
-// and zero for a pool of one.
+// and zero for a pool of one. It exists for tests in other packages, which
+// check the deadline a built pool carries.
 func (p *Pool) HeaderDeadline() time.Duration {
 	return p.endpoints[0].transports.idempotent.ResponseHeaderTimeout
 }

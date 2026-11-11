@@ -43,7 +43,8 @@ const (
 // ProbeLimit is the time one candidate's probe may take, and so the least time
 // a request's context must have left for the cold start to run on it. A caller
 // that must keep the cold start available to a request checks its context
-// against this figure and not a copy of it.
+// against this figure and not a copy of it. The handler tests read it too, so
+// they hold the same figure the pool does.
 const ProbeLimit = probeLimit
 
 // ProbePath is the URL path of the membership probe, GET /cluster/status under

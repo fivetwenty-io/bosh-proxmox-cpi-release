@@ -20,7 +20,8 @@ func configuredEndpointNode(address string) string {
 
 // SetEndpointNodesForTest makes every client built afterwards give each
 // configured endpoint whose host:port is a key of nodes the matching node
-// name, and returns a restore function. The map is copied.
+// name, and returns a restore function. The map is copied. It exists for
+// tests in other packages, which cannot reach the package's test files.
 //
 //	defer pve.SetEndpointNodesForTest(map[string]string{"127.0.0.1:8006": "pve1"})()
 func SetEndpointNodesForTest(nodes map[string]string) func() {
