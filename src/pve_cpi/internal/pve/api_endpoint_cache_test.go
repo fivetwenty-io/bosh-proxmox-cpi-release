@@ -71,6 +71,12 @@ type cacheSeed struct {
 	marks map[string]endpointcache.DownMark
 	// outcome is the discovery outcome the file records, OK when empty.
 	outcome endpointcache.DiscoveryOutcome
+	// hint names a node the file records as a cold-start hint. A seed that
+	// sets it describes a file with no discovery section and no nodes.
+	hint string
+	// nodeAge is how long ago every node was last confirmed, five minutes when
+	// zero.
+	nodeAge time.Duration
 }
 
 // seedEndpointCache writes a cache file for cfg, the way an earlier process
@@ -103,6 +109,10 @@ func seedEndpointCache(t *testing.T, cfg *config.CPIConfig, seed cacheSeed) {
 	}()
 
 	now := time.Now().UTC().Truncate(time.Second)
+	if seed.hint != "" {
+		writeHintOnly(t, store, now, configuredAddresses(&plan), seed.hint)
+		return
+	}
 	outcome := seed.outcome
 	if outcome == "" {
 		outcome = endpointcache.OutcomeOK
@@ -119,9 +129,13 @@ func seedEndpointCache(t *testing.T, cfg *config.CPIConfig, seed cacheSeed) {
 		}
 		host, portText, _ := net.SplitHostPort(address)
 		port, _ := strconv.Atoi(portText)
+		confirmed := now.Add(-5 * time.Minute)
+		if seed.nodeAge != 0 {
+			confirmed = now.Add(-seed.nodeAge)
+		}
 		section.Nodes = append(section.Nodes, endpointcache.DiscoveredNode{
 			Name: n.name, Address: host, Port: port, Pins: []string{pinHex(byte(0xa0 + i)), pinHex(byte(0xb0 + i))},
-			Online: n.online, ConfirmedAt: now.Add(-5 * time.Minute),
+			Online: n.online, ConfirmedAt: confirmed,
 		})
 		pool = append(pool, address)
 	}
@@ -141,6 +155,19 @@ func seedEndpointCache(t *testing.T, cfg *config.CPIConfig, seed cacheSeed) {
 	})
 	if err != nil {
 		t.Fatalf("seed the cache: %v", err)
+	}
+}
+
+// writeHintOnly writes a file whose only content is a cold-start hint, the way
+// a first cold start leaves it.
+func writeHintOnly(t *testing.T, store *endpointcache.Store, now time.Time, pool []string, node string) {
+	t.Helper()
+	change := endpointcache.Change{Hint: &endpointcache.ColdStartHint{Name: node, ProbedAt: now}, Pool: pool}
+	_, err := store.UpdatePayload(context.Background(), now, func(endpointcache.Stored) (endpointcache.Change, error) {
+		return change, nil
+	})
+	if err != nil {
+		t.Fatalf("seed the hint: %v", err)
 	}
 }
 
