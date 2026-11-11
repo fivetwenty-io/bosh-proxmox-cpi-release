@@ -20,15 +20,17 @@ func nodesTestKey() endpointcache.Key {
 func TestStatusEndpointNodesPairsTheLocalNodeWithTheEndpointThatAnswered(t *testing.T) {
 	t.Parallel()
 	key := nodesTestKey()
-	answered := DiscoveryReads{Status: DiscoveryStatus{Available: true, Local: "pve1"}, StatusVia: workerSecondEndpoint}
-	if got, want := statusEndpointNodes(key, answered), map[string]string{workerSecondEndpoint: "pve1"}; !reflect.DeepEqual(
-		got, want) {
+	answered := DiscoveryReads{
+		Status: DiscoveryStatus{Available: true, Local: "pve1"}, StatusVia: workerSecondEndpoint,
+	}
+	want := map[string]string{workerSecondEndpoint: "pve1"}
+	if got := statusEndpointNodes(key, answered); !reflect.DeepEqual(got, want) {
 		t.Errorf("statusEndpointNodes = %v, want %v", got, want)
 	}
 	// The key's spelling wins over the pool's.
 	upper := answered
 	upper.StatusVia = "PVE9.dc1.example.com:8006"
-	if got := statusEndpointNodes(key, upper); !reflect.DeepEqual(got, map[string]string{workerSecondEndpoint: "pve1"}) {
+	if got := statusEndpointNodes(key, upper); !reflect.DeepEqual(got, want) {
 		t.Errorf("a differently spelled answering endpoint gave %v", got)
 	}
 	for name, reads := range map[string]DiscoveryReads{
@@ -38,9 +40,9 @@ func TestStatusEndpointNodesPairsTheLocalNodeWithTheEndpointThatAnswered(t *test
 		"answered elsewhere": {
 			Status: DiscoveryStatus{Available: true, Local: "pve1"}, StatusVia: "other.example.com:8006",
 		},
-		"a dotted name":    {Status: DiscoveryStatus{Available: true, Local: "pve1.example.com"}, StatusVia: workerSeed},
-		"a numeric name":   {Status: DiscoveryStatus{Available: true, Local: "1234"}, StatusVia: workerSeed},
-		"a name with a sp": {Status: DiscoveryStatus{Available: true, Local: "pve 1"}, StatusVia: workerSeed},
+		"a dotted name":  {Status: DiscoveryStatus{Available: true, Local: "pve1.example.com"}, StatusVia: workerSeed},
+		"a numeric name": {Status: DiscoveryStatus{Available: true, Local: "1234"}, StatusVia: workerSeed},
+		"a spaced name":  {Status: DiscoveryStatus{Available: true, Local: "pve 1"}, StatusVia: workerSeed},
 	} {
 		if got := statusEndpointNodes(key, reads); len(got) != 0 {
 			t.Errorf("%s: statusEndpointNodes = %v, want none", name, got)
