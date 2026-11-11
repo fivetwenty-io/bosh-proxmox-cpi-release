@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"reflect"
 	"slices"
 	"strconv"
@@ -794,11 +795,12 @@ var errProberPanicked = errors.New("the cold-start prober panicked")
 // cut reports a probe that reqCtx, the request's own context, ended before
 // the candidate answered. It is a probe whose prober returned an error other
 // than a panic after reqCtx ended, while the probe's own limit had not passed,
-// and whose transport recorded no response and no failure other than the end
-// of its context. Such a candidate never answered, so the pool counts it as
-// never probed rather than refused. A probe that got a response, or that
-// failed for any other reason, is never cut, so no candidate that answered is
-// probed again.
+// whose transport received no byte of a response, not even an informational
+// 1xx, and whose transport failed, if it failed, only after the probe's own
+// context ended. Such a candidate never answered, so the pool counts it as
+// never probed rather than refused. A probe that got any response byte, or
+// that failed while its context was alive, is never cut, so no candidate that
+// answered is probed again.
 func (p *Pool) probe(reqCtx context.Context, cs *coldStart, c *candidate, auth string) (cut bool, err error) {
 	ctx, cancel := context.WithTimeoutCause(connectContext(reqCtx, http.MethodGet, ProbePath), cs.limits.probe,
 		errProbeLimit)
@@ -875,12 +877,20 @@ type probeTransport struct {
 	auth string
 	ctx  context.Context
 
+	// firstByte says the first byte of a response, a 1xx block included,
+	// reached the transport.
+	firstByte atomic.Bool
+
 	mu     sync.Mutex
 	used   bool
 	sealed bool
 	resp   *http.Response
 	body   *probeBody
 	err    error
+	// errEnded says the probe's own context had ended when the transport
+	// returned err, so the failure is the request's or the probe limit's and
+	// not the candidate's.
+	errEnded bool
 }
 
 // newProbeTransport returns the probe transport for c, which sends the probe
@@ -917,7 +927,7 @@ func (t *probeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	defer t.mu.Unlock()
 	if err != nil {
 		cancel()
-		t.err = err
+		t.err, t.errEnded = err, t.ended()
 		return nil, err
 	}
 	if t.sealed {
@@ -932,10 +942,14 @@ func (t *probeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // bind returns the context the probe is sent under: reqCtx's values, the
-// probe's deadline, and an end when either reqCtx or the probe's own context
-// ends. The cancel function releases it.
+// probe's deadline, an end when either reqCtx or the probe's own context
+// ends, and a trace that records the first byte of a response, so a candidate
+// that sent anything, even a 1xx block the transport consumes, counts as
+// having answered. The cancel function releases it.
 func (t *probeTransport) bind(reqCtx context.Context) (context.Context, context.CancelFunc) {
-	ctx := connectContext(reqCtx, http.MethodGet, ProbePath)
+	ctx := httptrace.WithClientTrace(connectContext(reqCtx, http.MethodGet, ProbePath), &httptrace.ClientTrace{
+		GotFirstResponseByte: func() { t.firstByte.Store(true) },
+	})
 	var cancel context.CancelFunc
 	if deadline, ok := t.ctx.Deadline(); ok {
 		ctx, cancel = context.WithDeadline(ctx, deadline)
@@ -989,14 +1003,14 @@ func (t *probeTransport) check(req *http.Request) error {
 // whose body the prober closed before it returned, and the reason the
 // candidate is refused otherwise. It closes the response body the prober left
 // open. answered reports whether the candidate answered the probe in a way
-// that counts against it: with a response, or with a failure other than the
-// end of the probe's context, such as a refused dial or a failed TLS
-// verification.
+// that counts against it: with any byte of a response, or with a failure
+// while the probe's own context was alive, such as a refused dial, a failed
+// TLS verification, or a dial that ran out its own cap.
 func (t *probeTransport) seal() (answered bool, proof error) {
 	t.mu.Lock()
 	t.sealed = true
 	proof = t.proofLocked()
-	answered = t.resp != nil || (t.err != nil && !isContextEnd(t.err))
+	answered = t.firstByte.Load() || t.resp != nil || (t.err != nil && !t.errEnded)
 	body := t.body
 	t.mu.Unlock()
 	if body != nil {
@@ -1006,10 +1020,18 @@ func (t *probeTransport) seal() (answered bool, proof error) {
 	return answered, proof
 }
 
-// isContextEnd reports whether err is the end of a context, a cancellation or
-// a deadline, rather than a failure of the candidate.
-func isContextEnd(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+// ended reports whether the probe's own context has ended, counting a deadline
+// that has passed before its timer fired, so a failure the probe's deadline
+// caused is never read as the candidate's. Which error the transport returned
+// says nothing here, because a context cancelled with a cause hands the
+// transport that cause, and a dial that ran out its own cap returns an error
+// that matches context.DeadlineExceeded.
+func (t *probeTransport) ended() bool {
+	if t.ctx.Err() != nil {
+		return true
+	}
+	deadline, ok := t.ctx.Deadline()
+	return ok && !time.Now().Before(deadline)
 }
 
 // proofLocked returns nil when the probe holds a complete proof, and the

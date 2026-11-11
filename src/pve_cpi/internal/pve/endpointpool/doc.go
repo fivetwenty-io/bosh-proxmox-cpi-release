@@ -50,8 +50,8 @@
 //     through a Prober the caller supplies, and a candidate carries a request
 //     only after its certificate chains to the operator's CA, covers its name,
 //     and its probe proves its membership. A probe the request's own context
-//     cut before the candidate answered refuses nothing, and the next request
-//     that reaches the cold start probes that candidate.
+//     cut before the candidate sent any byte of a response refuses nothing,
+//     and the next request that reaches the cold start probes that candidate.
 //   - A pool's tether table ties each mutation that may have been sent to the
 //     endpoint it went to, by a tether key of its method and path, or of its
 //     family for the HA, replication, and pool writers. The first mutation

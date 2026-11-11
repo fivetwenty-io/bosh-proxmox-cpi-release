@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/pvetest"
@@ -162,4 +163,55 @@ func TestColdStartCandidateDialFailureOnlyDemotes(t *testing.T) {
 	})
 	resp, err := a.p.RoundTrip(a.read(t, context.Background()))
 	mustStatus(t, resp, err, http.StatusOK)
+}
+
+// A walking mutation that reclaims a hop onto a tether naming the accepted
+// candidate goes there only when the cold start itself could send it there.
+// A mutation with a ticket and a discovery mutation are refused before any
+// dial and proven unsent, so the candidate never gets the ticket cookie, the
+// CSRF token, or a request the operator meant only for configured endpoints.
+func TestColdStartReclaimRefusesWhatTheColdStartWouldNotSend(t *testing.T) {
+	cases := []struct {
+		name string
+		req  func(t *testing.T, a *acceptedLab) *http.Request
+		why  string
+	}{
+		{"a ticket", func(t *testing.T, a *acceptedLab) *http.Request {
+			req := apiRequest(t, context.Background(), http.MethodPost, a.seeds[0].Addr, fanOutRoute, "vmid=101")
+			req.Header.Set("Cookie", "PVEAuthCookie=ticket")
+			req.Header.Set("CSRFPreventionToken", "csrf")
+			return req
+		}, "and only a request with one API token and no ticket goes to a cold-start candidate"},
+		{"a discovery mutation", func(t *testing.T, a *acceptedLab) *http.Request {
+			return tokenRequest(t, WithConfiguredOnly(context.Background()), http.MethodPost, a.seeds[0].Addr,
+				fanOutRoute, "vmid=101")
+		}, "and a login or discovery request never goes to a cold-start candidate"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newAcceptedLab(t, nil)
+			cand := a.p.memberAt(a.c.Address)
+			req := tc.req(t, a)
+			var once sync.Once
+			refuse := func(s *pvetest.Refused) dialFunc {
+				return func(ctx context.Context, network, addr string) (net.Conn, error) {
+					once.Do(func() { injectTether(a.p, tetherKeyOf(req), targetOf(cand), false) })
+					return s.DialContext(ctx, network, addr)
+				}
+			}
+			a.l.d.set(a.seeds[1].Addr, refuse(a.seeds[1]))
+			a.l.d.set(a.seeds[0].Addr, refuse(a.seeds[0]))
+			resp, err := a.p.RoundTrip(req)
+			closeBody(resp)
+			if err == nil || !strings.Contains(err.Error(), tc.why) {
+				t.Fatalf("err = %v, want the refusal %q", err, tc.why)
+			}
+			if IsMaybeSent(err) {
+				t.Fatalf("err = %v, want it proven unsent", err)
+			}
+			if n := a.cand.Counts.Method(http.MethodPost); n != 0 {
+				t.Fatalf("candidate got %d POSTs, want none", n)
+			}
+		})
+	}
 }
