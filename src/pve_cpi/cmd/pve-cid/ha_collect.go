@@ -1374,8 +1374,9 @@ func (c *haCollector) overrideFindings(path string, dir endpointcache.DirOptions
 func (c *haCollector) missingOverride(path string, dir endpointcache.DirOptions) {
 	fallback := dir.WithoutOverride().Probe()
 	defer func() { _ = fallback.Close() }()
+	toBeCreated := fallback.Layer == endpointcache.LayerTemporary && errors.Is(fallback.Err, fs.ErrNotExist)
 	switch {
-	case fallback.Usable() || (fallback.Layer == endpointcache.LayerTemporary && errors.Is(fallback.Err, fs.ErrNotExist)):
+	case fallback.Usable() || toBeCreated:
 		c.rep.advise(haKindCacheDirectory, path,
 			"pve.endpoint_cache_dir does not exist, so the HA recovery episode record sits in %s instead; create "+
 				"it with mode 0700, and note that doing so moves the record and restarts any grace window that "+

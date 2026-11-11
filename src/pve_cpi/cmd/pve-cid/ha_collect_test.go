@@ -982,7 +982,7 @@ func TestCollectNamesTheLayerAMissingCacheOverrideFallsBackTo(t *testing.T) {
 		want(t, r, haKindCacheDirectory, haSeverityAdvice, missing, "does not exist", "beside the allocation journal")
 		for _, f := range r.Findings {
 			if f.Kind == haKindCacheDirectory && strings.Contains(f.Detail, "temporary") {
-				t.Errorf("the record is beside the journal, but the finding names the temporary directory: %s", f.Detail)
+				t.Errorf("the record is beside the journal, but the finding names the temporary one: %s", f.Detail)
 			}
 		}
 	})

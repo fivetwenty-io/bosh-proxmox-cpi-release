@@ -14,7 +14,8 @@ func TestProbeCreatesNothingAndReportsAnAbsentTemporaryDirectory(t *testing.T) {
 	defer func() { _ = choice.Close() }()
 
 	if choice.Usable() || choice.Layer != LayerTemporary || !errors.Is(choice.Err, os.ErrNotExist) {
-		t.Fatalf("probe = layer %q usable %v err %v, want the temporary layer absent", choice.Layer, choice.Usable(), choice.Err)
+		t.Fatalf("probe = layer %q usable %v err %v, want an absent temporary layer",
+			choice.Layer, choice.Usable(), choice.Err)
 	}
 	requireAbsent(t, temporaryPath(parent), "the probe must not create the temporary directory")
 }
@@ -50,7 +51,8 @@ func TestProbeRefusesTheJournalSiblingAsResolveDoes(t *testing.T) {
 	resolved := resolve(t, opts)
 
 	if probe.Usable() || probe.Layer != LayerJournal || probe.Path != sibling {
-		t.Fatalf("probe = layer %q path %q usable %v, want the refused sibling", probe.Layer, probe.Path, probe.Usable())
+		t.Fatalf("probe = layer %q path %q usable %v, want the refused sibling",
+			probe.Layer, probe.Path, probe.Usable())
 	}
 	if resolved.Layer != probe.Layer || resolved.Path != probe.Path || resolved.Usable() {
 		t.Fatalf("probe and resolve disagree: %q %q vs %q %q", probe.Layer, probe.Path, resolved.Layer, resolved.Path)
