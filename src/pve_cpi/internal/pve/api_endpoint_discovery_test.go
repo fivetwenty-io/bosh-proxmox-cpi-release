@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -1347,5 +1348,161 @@ func TestDiscoveryWorker_IdentityRefusalDropsThePoolsDiscoveredEndpoints(t *test
 		!endpointpool.IsConnectPhase(err) || endpointpool.IsMaybeSent(err) ||
 		!strings.Contains(err.Error(), "the cluster identity changed") {
 		t.Fatalf("a request to a dropped endpoint should be refused unsent with the drop's cause, got %v", err)
+	}
+}
+
+// recordStandingConflict runs two refreshes, the second against a cluster
+// whose root CA was replaced, which is how another process leaves a standing
+// identity conflict in the file. It then forgets the drops the second run made,
+// so a test counts only what the next worker does.
+func (e *workerEnv) recordStandingConflict() {
+	e.t.Helper()
+	e.run()
+	e.cluster.replaceRoot()
+	e.clock.advance(endpointcache.RefreshInterval)
+	e.run()
+	if p := e.payload(); p.Cluster == nil || !p.Cluster.IdentityConflict {
+		e.t.Fatalf("identity %+v, want a recorded conflict", p.Cluster)
+	}
+	e.pool.drops.Store(0)
+}
+
+// A conflict that another process recorded after this process loaded its
+// discovered endpoints has to drop them on this worker's first check, even
+// though no refresh is due while the conflict stands.
+func TestDiscoveryWorker_StandingConflictFromAnotherProcessDropsTheLoadedPool(t *testing.T) {
+	t.Parallel()
+	e := newWorkerEnv(t, workerEnvOptions{})
+	e.recordStandingConflict()
+	e.clock.advance(endpointcache.RefreshInterval)
+	e.run()
+	if n := e.pool.drops.Load(); n != 1 {
+		t.Fatalf("DropDiscovered called %d times, want once", n)
+	}
+	if n := e.requests(); n != 0 {
+		t.Fatalf("a standing conflict sent %d requests", n)
+	}
+	e.noLineAt(log.LevelWarn)
+	e.noLineAt(log.LevelError)
+}
+
+// The drop does not wait for the refresh time: the conflicting attempt left an
+// unexpired next_refresh_after in the file, and the worker still drops.
+func TestDiscoveryWorker_StandingConflictDropsBeforeTheNextRefreshTime(t *testing.T) {
+	t.Parallel()
+	e := newWorkerEnv(t, workerEnvOptions{})
+	e.recordStandingConflict()
+	if p := e.payload(); !p.Discovery.NextRefreshAfter.After(e.clock.Now()) {
+		t.Fatalf("next refresh %v is not after %v", p.Discovery.NextRefreshAfter, e.clock.Now())
+	}
+	e.run()
+	if n := e.pool.drops.Load(); n != 1 {
+		t.Fatalf("DropDiscovered called %d times, want once", n)
+	}
+	if n := e.requests(); n != 0 {
+		t.Fatalf("a standing conflict sent %d requests", n)
+	}
+}
+
+// A file with no conflict never drops the pool, whether a refresh is due or
+// not.
+func TestDiscoveryWorker_NoConflictDropsNothing(t *testing.T) {
+	t.Parallel()
+	e := newWorkerEnv(t, workerEnvOptions{})
+	e.run()
+	e.pool.drops.Store(0)
+	e.run()
+	if n := e.requests(); n != 0 {
+		t.Fatalf("a fresh file sent %d requests, want none", n)
+	}
+	e.clock.advance(endpointcache.RefreshInterval)
+	e.run()
+	if n := e.pool.drops.Load(); n != 0 {
+		t.Fatalf("DropDiscovered called %d times, want none", n)
+	}
+}
+
+// The conflict rule does not depend on which endpoint answered, so an answer
+// from an endpoint that is none of the key's still drops the pool's discovered
+// endpoints.
+func TestDiscoveryWorker_StandingConflictDropsWhenTheAnswerIsNotAConfiguredEndpoint(t *testing.T) {
+	t.Parallel()
+	e := newWorkerEnv(t, workerEnvOptions{})
+	e.recordStandingConflict()
+	e.begin()
+	w := e.newWorker()
+	if err := w.bind(e.binding()); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	w.FirstAnswer("other.example.com:8006")
+	e.drain()
+	e.wantLine("the answering endpoint is not one of the configured endpoints", log.LevelDebug)
+	if n := e.pool.drops.Load(); n != 1 {
+		t.Fatalf("DropDiscovered called %d times, want once", n)
+	}
+}
+
+// With the real pool, a standing conflict that another process recorded takes
+// the loaded discovered endpoint out before the worker sends a request, so a
+// request to it is refused unsent and nothing dials it.
+func TestDiscoveryWorker_StandingConflictRefusesTheLoadedPoolsDiscoveredEndpoint(t *testing.T) {
+	t.Parallel()
+	e := newWorkerEnv(t, workerEnvOptions{})
+	e.recordStandingConflict()
+	e.clock.advance(endpointcache.RefreshInterval)
+
+	var lc net.ListenConfig
+	listener, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	var dials atomic.Int32
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			dials.Add(1)
+			_ = conn.Close()
+		}
+	}()
+	discoveredAddr := listener.Addr().String()
+	pool, err := endpointpool.New(endpointpool.Config{
+		Base: &http.Transport{},
+		Endpoints: []endpointpool.Endpoint{
+			{Address: workerSeed, Kind: endpointpool.KindConfigured},
+			{Address: discoveredAddr, Kind: endpointpool.KindDiscovered, Node: "pve2", Pins: []endpointpool.Pin{{9}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.CloseIdleConnections)
+	e.begin()
+	w := e.newWorker()
+	if err := w.bind(DiscoveryBinding{Client: markedClient(e.cluster, e.reqs), Pool: pool}); err != nil {
+		t.Fatal(err)
+	}
+	w.FirstAnswer(workerSeed)
+	e.drain()
+	if n := e.requests(); n != 0 {
+		t.Fatalf("a standing conflict sent %d requests", n)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		"https://"+discoveredAddr+"/api2/json/version", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := pool.RoundTrip(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil || !endpointpool.IsConnectPhase(err) || endpointpool.IsMaybeSent(err) {
+		t.Fatalf("a request to a dropped endpoint should be refused unsent, got %v", err)
+	}
+	if n := dials.Load(); n != 0 {
+		t.Fatalf("the dropped endpoint was dialed %d times", n)
 	}
 }

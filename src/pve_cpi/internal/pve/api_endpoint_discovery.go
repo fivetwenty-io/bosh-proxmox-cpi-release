@@ -257,6 +257,9 @@ func (w *DiscoveryWorker) refresh(ctx context.Context, via string, b DiscoveryBi
 			"api endpoint discovery: the answering endpoint is not one of the configured endpoints; "+
 				"skipping the refresh",
 			log.String("endpoint", via))
+		// The conflict rule does not depend on which endpoint answered, so a
+		// pool that holds discovered endpoints still drops them.
+		w.dropOnConflict(b)
 		return
 	}
 	if !w.due(ctx, b) {
@@ -312,12 +315,39 @@ func (w *DiscoveryWorker) due(ctx context.Context, b DiscoveryBinding) bool {
 		}
 		return false
 	}
+	// The conflict is checked before the refresh rule, because no refresh is
+	// due while one stands, and the pool this process loaded before another
+	// process recorded it still holds discovered endpoints. DropDiscovered
+	// is idempotent, so the second check under the lock drops nothing more.
+	if standingConflict(stored) {
+		b.Pool.DropDiscovered()
+		return false
+	}
 	if !endpointcache.RefreshDue(stored, now, pinMarked(stored) || b.Pool.RefreshDue()) {
 		w.logger.LogAttrs(ctx, log.LevelDebug, "api endpoint discovery: no refresh due",
 			log.String("file", w.store.FileName()))
 		return false
 	}
 	return true
+}
+
+// dropOnConflict reads the stored file and takes the discovered endpoints out
+// of the pool when it holds a standing identity conflict. It is the check due
+// makes, for a refresh that ends before due runs. A file it cannot read says
+// nothing about a conflict, and the drain reports a read cut off by the end of
+// the call.
+func (w *DiscoveryWorker) dropOnConflict(b DiscoveryBinding) {
+	stored, _, err := w.store.ReadPayload(w.now(), nil)
+	if err == nil && standingConflict(stored) {
+		b.Pool.DropDiscovered()
+	}
+}
+
+// standingConflict reports whether the file records a cluster identity
+// conflict, which is how another process tells this one that the cluster the
+// pool's discovered endpoints came from is no longer the one it trusts.
+func standingConflict(p *endpointcache.Payload) bool {
+	return p != nil && p.Cluster != nil && p.Cluster.IdentityConflict
 }
 
 // pinMarked reports whether the file holds a pin mark a reader still loads,
