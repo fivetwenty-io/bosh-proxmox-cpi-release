@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -844,5 +845,43 @@ func TestProfileCacheKeepsClustersWithTheSameEndpointsAndNodeNamesApart(t *testi
 	}
 	if files := profileFiles(t, dir); len(files) != 1 {
 		t.Errorf("both clusters share one key and so one file, got %v", files)
+	}
+}
+
+// journalBesideCache makes a journal directory and the private endpoint-cache
+// directory beside it, and returns both.
+func journalBesideCache(t *testing.T) (journal, sibling string) {
+	t.Helper()
+	parent := t.TempDir()
+	journal = filepath.Join(parent, "allocations")
+	sibling = filepath.Join(parent, endpointcache.JournalSiblingName)
+	for _, dir := range []string{journal, sibling} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return journal, sibling
+}
+
+func TestProfileCacheWithoutAnOverrideLandsBesideTheJournal(t *testing.T) {
+	temporary := temporaryCacheDir(t)
+	journal, sibling := journalBesideCache(t)
+	cfg := cacheCfg("")
+	cfg.StorageAllocationJournalDir = journal
+	w := three()
+	d := cachedDeps(t, w, cfg, newCacheClock())
+	resolveWith(t, d)
+	resolveWith(t, d)
+	if slowProbes(w) != 1 {
+		t.Errorf("the second call must read the cache, got %d config reads", slowProbes(w))
+	}
+	if files := profileFiles(t, sibling); len(files) != 1 {
+		t.Errorf("the sibling holds %v, want one profile file", files)
+	}
+	if entries, err := os.ReadDir(journal); err != nil || len(entries) != 0 {
+		t.Errorf("the journal directory holds %v (%v), want nothing written", entries, err)
+	}
+	if _, err := os.Lstat(temporary); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the temporary layer was used although the sibling was usable: %v", err)
 	}
 }

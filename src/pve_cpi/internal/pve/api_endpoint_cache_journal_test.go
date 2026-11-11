@@ -91,7 +91,8 @@ func TestOpenEndpointCacheUsesTheSiblingBesideTheJournal(t *testing.T) {
 			}
 			got := openCacheFor(t, journalCacheConfig(mode, journal))
 			if got.cache == nil || got.plan.cacheUnusable {
-				t.Fatalf("cache %v, unusable %v, want an open cache beside the journal", got.cache, got.plan.cacheUnusable)
+				t.Fatalf("cache %v, unusable %v, want an open cache beside the journal",
+					got.cache, got.plan.cacheUnusable)
 			}
 			want := "pve endpoints: cache directory " + sibling + ", beside the allocation journal directory"
 			if lines := linesAt(got.obs.All(), slog.LevelDebug, want); len(lines) != 1 {
@@ -113,7 +114,8 @@ func TestOpenEndpointCacheMissingSiblingFallsThroughToTheTemporaryDirectoryAtDeb
 			journal, sibling := journalBeside(t)
 			got := openCacheFor(t, journalCacheConfig(mode, journal))
 			if got.cache == nil {
-				t.Fatalf("a missing sibling must fall through to a usable temporary directory; lines: %v", got.obs.All())
+				t.Fatalf("a missing sibling must fall through to a usable temporary directory; lines: %v",
+					got.obs.All())
 			}
 			if _, err := os.Lstat(sibling); !os.IsNotExist(err) {
 				t.Errorf("the sibling exists after the call: %v", err)

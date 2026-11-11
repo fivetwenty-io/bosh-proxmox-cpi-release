@@ -3,9 +3,12 @@ package endpointcache
 import (
 	"context"
 	"errors"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -161,7 +164,8 @@ func TestSiblingRefusalsGiveNoCacheAndDoNotFallThrough(t *testing.T) {
 			c.make(t, sibling)
 			choice := resolve(t, Options{JournalDir: journal})
 			if choice.Layer != LayerJournal || choice.Path != sibling {
-				t.Fatalf("choice = %s %s, want a refusal by the journal layer at %s", choice.Layer, choice.Path, sibling)
+				t.Fatalf("choice = %s %s, want a refusal by the journal layer at %s",
+					choice.Layer, choice.Path, sibling)
 			}
 			if c.cause != nil {
 				requireUnsafe(t, choice, c.cause)
@@ -236,10 +240,11 @@ func TestJournalLayerDeclinesWithoutAUsableJournalPath(t *testing.T) {
 		name    string
 		journal string
 		notes   int
+		reason  string
 	}{
-		{"unset", "", 0},
-		{"relative", "var/vcap/store/pve_cpi/allocations", 1},
-		{"filesystem root", "/", 1},
+		{"unset", "", 0, ""},
+		{"relative", "var/vcap/store/pve_cpi/allocations", 1, "not an absolute path below the root"},
+		{"filesystem root", "/", 1, "not an absolute path below the root"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			parent := temporaryParent(t)
@@ -248,16 +253,89 @@ func TestJournalLayerDeclinesWithoutAUsableJournalPath(t *testing.T) {
 				t.Fatalf("choice = %s %s, want the temporary layer", choice.Layer, choice.Path)
 			}
 			if len(choice.Notes) != tc.notes {
-				t.Errorf("notes = %q, want %d", choice.Notes, tc.notes)
+				t.Fatalf("notes = %q, want %d", choice.Notes, tc.notes)
+			}
+			if tc.notes == 1 && !strings.Contains(choice.Notes[0], tc.reason) {
+				t.Errorf("note %q lacks %q, so the layer declined for another reason", choice.Notes[0], tc.reason)
 			}
 		})
 	}
 }
 
-func TestJournalLayerWritesNoLogLine(t *testing.T) {
-	// The package has no logger to write to, so the reasons come back in the
-	// choice. A refused sibling carries its reason in Err and no note, which
-	// leaves the level to the caller.
+// A relative journal directory has no place to look beside, even when the
+// working directory holds a directory shaped like the sibling. The layer
+// declines it, so the working directory never becomes a cache.
+func TestJournalLayerDeclinesARelativeJournalEvenWhenTheSiblingExistsUnderTheWorkingDirectory(t *testing.T) {
+	parent := temporaryParent(t)
+	work := t.TempDir()
+	relativeSibling := filepath.Join("var", "vcap", "store", "pve_cpi", JournalSiblingName)
+	if err := os.MkdirAll(filepath.Join(work, relativeSibling), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(work)
+	choice := resolve(t, Options{JournalDir: filepath.Join("var", "vcap", "store", "pve_cpi", "allocations")})
+	if choice.Layer != LayerTemporary || choice.Path != temporaryPath(parent) || !choice.Usable() {
+		t.Fatalf("choice = %s %s usable %v (%v), want the temporary layer",
+			choice.Layer, choice.Path, choice.Usable(), choice.Err)
+	}
+	if len(choice.Notes) != 1 || !strings.Contains(choice.Notes[0], "not an absolute path below the root") {
+		t.Errorf("notes = %q, want one that says the journal is not absolute", choice.Notes)
+	}
+}
+
+// A stat error other than "does not exist" leaves the sibling's absence
+// unproven, so the layer refuses it and the temporary layer is never tried.
+// These cases need no permission bits, so they also run as root, and they ask
+// the layer itself, with no guard in front of it, so widening the check to
+// treat every stat error as an absent sibling fails here.
+func TestUnprovenAbsenceOfTheSiblingRefusesTheLayer(t *testing.T) {
+	cases := []struct {
+		name  string
+		build func(t *testing.T, base string)
+		cause syscall.Errno
+	}{
+		{"an ancestor that is a regular file", func(t *testing.T, base string) {
+			if err := os.WriteFile(base, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, syscall.ENOTDIR},
+		{"an ancestor that is a symlink loop", func(t *testing.T, base string) {
+			if err := os.Symlink(base, base); err != nil {
+				t.Fatal(err)
+			}
+		}, syscall.ELOOP},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			parent := temporaryParent(t)
+			base := filepath.Join(t.TempDir(), "ancestor")
+			c.build(t, base)
+			choice := resolve(t, Options{JournalDir: filepath.Join(base, "allocations")})
+			sibling := filepath.Join(base, JournalSiblingName)
+			if choice.Layer != LayerJournal || choice.Path != sibling {
+				t.Fatalf("choice = %s %s, want a refusal by the journal layer at %s",
+					choice.Layer, choice.Path, sibling)
+			}
+			if choice.Root != nil || choice.Usable() {
+				t.Error("the refused layer holds an opened directory")
+			}
+			if choice.Err == nil || !errors.Is(choice.Err, c.cause) {
+				t.Errorf("err = %v, want it to wrap %v", choice.Err, c.cause)
+			}
+			if errors.Is(choice.Err, os.ErrNotExist) {
+				t.Errorf("err = %v must not read as an absent directory", choice.Err)
+			}
+			if len(choice.Notes) != 0 {
+				t.Errorf("notes = %q, want none, because the layer did not decline", choice.Notes)
+			}
+			requireAbsent(t, temporaryPath(parent), "an unprovable sibling fell through to the temporary layer")
+		})
+	}
+}
+
+func TestJournalLayerCarriesARefusalInErrAndNoNote(t *testing.T) {
+	// A refused sibling carries its reason in Err and no note, which leaves the
+	// level of the log line to the caller.
 	temporaryParent(t)
 	journal, sibling := journalSibling(t)
 	makePrivateDirectory(t, sibling)
@@ -267,6 +345,23 @@ func TestJournalLayerWritesNoLogLine(t *testing.T) {
 	choice := resolve(t, Options{JournalDir: journal})
 	if choice.Err == nil || len(choice.Notes) != 0 {
 		t.Errorf("err = %v, notes = %q, want the refusal in Err and no notes", choice.Err, choice.Notes)
+	}
+}
+
+// The layer chooser writes no log line, because its caller sets the level. This
+// keeps a logging import out of dir.go, which would let a future call slip a
+// line in without a test noticing.
+func TestTheDirectoryChooserImportsNoLogger(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "dir.go", nil, parser.ImportsOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range file.Imports {
+		path := strings.Trim(spec.Path.Value, `"`)
+		if path == "log" || strings.HasPrefix(path, "log/") || strings.HasSuffix(path, "/internal/log") ||
+			strings.Contains(path, "zap") {
+			t.Errorf("dir.go imports the logging package %s", path)
+		}
 	}
 }
 
@@ -298,8 +393,8 @@ func TestResolveWithCollectsTheNotesOfDecliningLayers(t *testing.T) {
 		!strings.Contains(got.Notes[1], "two") {
 		t.Fatalf("choice = %+v, want the notes of the two layers that gave a reason", got)
 	}
-	applied := resolveWith([]layer{declining("one"), func(Options) (Choice, bool) { return Choice{Layer: "mid"}, true }, answer},
-		Options{})
+	middle := func(Options) (Choice, bool) { return Choice{Layer: "mid"}, true }
+	applied := resolveWith([]layer{declining("one"), middle, answer}, Options{})
 	if applied.Layer != "mid" || len(applied.Notes) != 1 {
 		t.Fatalf("choice = %+v, want the middle layer with one note", applied)
 	}

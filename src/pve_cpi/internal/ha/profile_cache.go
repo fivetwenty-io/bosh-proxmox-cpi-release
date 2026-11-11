@@ -39,10 +39,11 @@ const (
 type ProfileCacheOptions struct {
 	// Dir says where to look for the cache directory, and comes from
 	// endpointcache.OptionsFor. The cache follows the endpoint cache's
-	// directory, which is pve.endpoint_cache_dir when it is set and the
-	// per-user temporary directory otherwise. A missing override directory
-	// gives no cache, because the override is the only directory the CPI uses
-	// when it is set.
+	// directory. That is pve.endpoint_cache_dir when it is set. Otherwise it is
+	// the endpoint-cache directory beside the allocation journal directory
+	// when that already exists, and the per-user temporary directory when it
+	// does not. A missing override directory gives no cache, because the
+	// override is the only directory the CPI uses when it is set.
 	Dir endpointcache.DirOptions
 
 	// Key names the cluster entry. It is the endpoint cache's key input, so one

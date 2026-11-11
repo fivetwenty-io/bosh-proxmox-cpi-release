@@ -158,20 +158,24 @@ func (s *EpisodeStore) resolve() endpointcache.Choice {
 }
 
 // warnMissingOverride logs the Warn line for a missing override directory. The
-// line promises the fallback only when the fallback gave a directory.
+// line promises the fallback only when the fallback gave a directory, and it
+// names the layer that answered, because the fallback is the directory beside
+// the allocation journal when that exists and the temporary directory
+// otherwise.
 func (s *EpisodeStore) warnMissingOverride(missing, fallback endpointcache.Choice) {
 	if s == nil || s.Log == nil {
 		return
 	}
+	where := fallbackDescription(fallback.Layer)
 	warn := func() {
 		if fallback.Usable() {
-			s.Log.Warn("ha episode: pve.endpoint_cache_dir does not exist, so the recovery episode record uses the "+
-				"temporary cache directory instead; create the directory so the record sits beside the other cache files",
+			s.Log.Warn("ha episode: pve.endpoint_cache_dir does not exist, so the recovery episode record uses "+
+				where+" instead; create the directory so the record sits beside the other cache files",
 				log.String("path", missing.Path), log.Err(missing.Err), log.String("fallback", fallback.Path))
 			return
 		}
-		s.Log.Warn("ha episode: pve.endpoint_cache_dir does not exist, and the temporary cache directory cannot be "+
-			"used either, so the recovery episode has no record; create the directory",
+		s.Log.Warn("ha episode: pve.endpoint_cache_dir does not exist, and "+where+" cannot be used either, "+
+			"so the recovery episode has no record; create the directory",
 			log.String("path", missing.Path), log.Err(missing.Err), log.String("fallback", fallback.Path),
 			log.String("fallback_error", fallbackError(fallback)))
 	}
@@ -180,6 +184,19 @@ func (s *EpisodeStore) warnMissingOverride(missing, fallback endpointcache.Choic
 		return
 	}
 	warn()
+}
+
+// fallbackDescription says in words which directory a layer after the override
+// stands for.
+func fallbackDescription(layer endpointcache.Layer) string {
+	switch layer {
+	case endpointcache.LayerJournal:
+		return "the cache directory beside the allocation journal directory"
+	case endpointcache.LayerTemporary:
+		return "the temporary cache directory"
+	default:
+		return "the fallback cache directory"
+	}
 }
 
 // fallbackError is the text of the refusal that ended the fallback.

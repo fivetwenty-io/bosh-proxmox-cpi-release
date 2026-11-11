@@ -540,3 +540,58 @@ func TestEpisodeStore_ForCallWarnsOnceHoweverManyTimesItObserves(t *testing.T) {
 		t.Errorf("a call's store made from a nil store must work: %v", err)
 	}
 }
+
+func TestEpisodeStore_TheWarnNamesTheSiblingBesideTheJournalWhenThatIsTheFallback(t *testing.T) {
+	temporary := temporaryCacheDir(t)
+	journal, sibling := journalBesideCache(t)
+	missing := filepath.Join(t.TempDir(), "missing")
+	logger, logs := log.NewObservedLogger(slog.LevelDebug)
+	store := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: missing, JournalDir: journal}, Log: logger}
+	if _, err := store.Observe("vm:101", "uid-a"); err != nil {
+		t.Fatal(err)
+	}
+	warns := warnLines(logs)
+	if len(warns) != 1 {
+		t.Fatalf("logged %d warnings, want one", len(warns))
+	}
+	msg := warns[0].Message
+	if strings.Contains(msg, "temporary") || !strings.Contains(msg, "uses the cache directory beside the allocation "+
+		"journal directory instead") {
+		t.Errorf("the warning must name the directory beside the journal and not the temporary one: %q", msg)
+	}
+	if warns[0].Attrs["fallback"] != sibling {
+		t.Errorf("the warning must name %s, got %+v", sibling, warns[0].Attrs)
+	}
+	if _, err := os.Lstat(filepath.Join(sibling, ha.EpisodeFileName)); err != nil {
+		t.Errorf("the record must sit beside the journal: %v", err)
+	}
+	if _, err := os.Lstat(temporary); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the temporary layer was used although the sibling was usable: %v", err)
+	}
+}
+
+func TestEpisodeStore_TheWarnDoesNotBlameTheTemporaryDirectoryWhenTheSiblingIsRefused(t *testing.T) {
+	temporaryCacheDir(t)
+	journal, sibling := journalBesideCache(t)
+	if err := os.Chmod(sibling, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(t.TempDir(), "missing")
+	logger, logs := log.NewObservedLogger(slog.LevelDebug)
+	store := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: missing, JournalDir: journal}, Log: logger}
+	if _, err := store.Observe("vm:101", "uid-a"); err == nil {
+		t.Fatal("want an error when the directory beside the journal is refused")
+	}
+	warns := warnLines(logs)
+	if len(warns) != 1 {
+		t.Fatalf("logged %d warnings, want one", len(warns))
+	}
+	msg := warns[0].Message
+	if strings.Contains(msg, "temporary") || !strings.Contains(msg, "the cache directory beside the allocation "+
+		"journal directory cannot be used either") {
+		t.Errorf("the warning must blame the directory beside the journal and not the temporary one: %q", msg)
+	}
+	if warns[0].Attrs["fallback"] != sibling {
+		t.Errorf("the warning must name %s, got %+v", sibling, warns[0].Attrs)
+	}
+}

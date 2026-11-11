@@ -27,7 +27,8 @@ const (
 	LayerTemporary Layer = "temporary"
 )
 
-// JournalSiblingName is the base name of the cache directory beside the journal directory.
+// JournalSiblingName is the base name of the cache directory beside the
+// journal directory.
 const JournalSiblingName = "endpoint-cache"
 
 // temporaryName is the base name of the temporary layer's directory before the
@@ -88,8 +89,9 @@ func (r *Refusal) Unwrap() error { return r.Err }
 // does not try another layer. Notes holds one line for each layer that
 // declined before this one answered, such as the missing directory beside the
 // journal. The package writes no log line, so the caller logs them, at Debug,
-// because a layer that declines is working as designed. A caller hands Root to OpenStore, which owns it
-// from then on, and closes the Store instead of the Choice.
+// because a layer that declines is working as designed. A caller hands Root to
+// OpenStore, which owns it from then on, and closes the Store instead of the
+// Choice.
 type Choice struct {
 	Layer Layer
 	Path  string
@@ -112,9 +114,9 @@ func (c Choice) Close() error {
 // layer inspects the options and either declines, with applies false so the
 // next layer is considered, or answers with a Choice. A layer that declines for
 // a reason worth a log line puts it in the Err of the Choice it returns, and
-// resolveWith moves it into the Notes of the choice that answers. A layer that applies and
-// refuses its directory ends the search, because falling through to a looser
-// layer would hide a directory that someone else may control.
+// resolveWith moves it into the Notes of the choice that answers. A layer that
+// applies and refuses its directory ends the search, because falling through
+// to a looser layer would hide a directory that someone else may control.
 type layer func(opts Options) (choice Choice, applies bool)
 
 // layers lists the layers in the order they are considered. The first one that
@@ -204,12 +206,12 @@ func journalLayer(opts Options) (Choice, bool) {
 	}
 	journal := filepath.Clean(opts.JournalDir)
 	declined := func(path string, cause error) (Choice, bool) {
-		return Choice{Layer: LayerJournal, Path: path, Err: &Refusal{Layer: LayerJournal, Path: path, Err: cause}}, false
+		refusal := &Refusal{Layer: LayerJournal, Path: path, Err: cause}
+		return Choice{Layer: LayerJournal, Path: path, Err: refusal}, false
 	}
 	if !filepath.IsAbs(journal) || journal == string(filepath.Separator) {
-		return declined(opts.JournalDir, fmt.Errorf(
-			"the allocation journal directory %q is not an absolute path below the root, so it has no directory beside it",
-			opts.JournalDir))
+		return declined(opts.JournalDir, fmt.Errorf("the allocation journal directory %q is not an absolute path "+
+			"below the root, so it has no directory beside it", opts.JournalDir))
 	}
 	if filepath.Base(journal) == JournalSiblingName {
 		return declined(journal, fmt.Errorf(
