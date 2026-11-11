@@ -195,7 +195,8 @@ Cross-node disk migration (exercises pve.disk_migration end to end):
                        serve images content and must not be mounted by any
                        cluster other than pve-cpi, so nfs-images, which the
                        az2 cluster also mounts, is refused. When the storage
-                       is limited to some nodes, it must cover every lab node. The pass creates a disk pinned to
+                       is limited to some nodes, it must cover every lab
+                       node. The pass creates a disk pinned to
                        a node other than the VM's under a parker prefix of its
                        own, so the disk parks alone on a fresh parker. It tags
                        that parker bosh-disk-mover through pmx, the shape an

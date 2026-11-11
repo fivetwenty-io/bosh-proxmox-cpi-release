@@ -325,7 +325,8 @@ def config_overrides(
     With journal on, the disk comes from a one-member storage set added
     beside base_sets, the sets CPI_CONFIG already defines, so any other set
     binding in CPI_CONFIG still resolves. The journal lives in this run's
-    scratch directory under its own namespace.
+    scratch directory under its own namespace. A base set that already lists
+    the storage is refused, since the new set would overlap it.
     """
     overrides: dict[str, Any] = {
         "detached_disk_strategy": "parked",
@@ -341,6 +342,11 @@ def config_overrides(
         sets = copy.deepcopy(dict(base_sets or {}))
         if STORAGE_SET in sets:
             raise ValueError(f"CPI_CONFIG already defines a storage set named {STORAGE_SET!r}")
+        for set_name, definition in sets.items():
+            if storage in ((definition or {}).get("names") or []):
+                raise ValueError(
+                    f"CPI_CONFIG storage set {set_name!r} already lists {storage!r}; adding "
+                    "persistent_storage_set would overlap it and trip the disjoint storage sets check")
         sets[STORAGE_SET] = {"names": [storage], "strategy": {"name": "spread", "version": 1}}
         overrides.update(
             storage_sets=sets,

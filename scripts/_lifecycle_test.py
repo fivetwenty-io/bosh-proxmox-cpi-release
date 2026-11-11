@@ -1894,6 +1894,13 @@ class TestAdoptedMoverChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already defines"):
             mover.config_overrides(storage="nfs-11r", prefix=PREFIX, band=BAND, journal_dir="/w/journal",
                                    namespace=NAMESPACE, journal=True, base_sets={mover.STORAGE_SET: {}})
+        for set_name in ("ephemeral", "root", "iso"):
+            with self.subTest(set_name):
+                with self.assertRaisesRegex(ValueError, rf"{set_name!r} already lists 'nfs-11r'"):
+                    mover.config_overrides(
+                        storage="nfs-11r", prefix=PREFIX, band=BAND, journal_dir="/w/journal",
+                        namespace=NAMESPACE, journal=True,
+                        base_sets={"other": {"names": ["x"]}, set_name: {"names": ["y", "nfs-11r"]}})
 
     def test_lab_preflight_refuses_before_any_write(self) -> None:
         lab = MoverLab()
@@ -1909,6 +1916,16 @@ class TestAdoptedMoverChecks(unittest.TestCase):
         with self.assertRaisesRegex(mover.LabRefused, "mounted by another cluster"):
             mover.lab_preflight(shared_twice.read, shared_twice, "nfs-images", "pmx")
         self.assertEqual(urllib_verifier.reads + shared_twice.reads[1:], [])
+        self.assertEqual(urllib_verifier.reads, [])
+        guests_before = copy.deepcopy(lab.guests)
+        with unittest.mock.patch.object(mover.subprocess, "run") as pmx_run, \
+                unittest.mock.patch.object(mover.PmxWriter, "_run") as writer_run:
+            with self.assertRaises(mover.LabRefused):
+                mover.lab_preflight(shared_twice.read, shared_twice, "nfs-images", "pmx")
+            mover.lab_preflight(lab.read, lab, "nfs-11r", "pmx")
+        pmx_run.assert_not_called()
+        writer_run.assert_not_called()
+        self.assertEqual(lab.guests, guests_before)
         with self.assertRaisesRegex(mover.LabRefused, "local-lvm-data"):
             mover.lab_preflight(lab.read, MoverLab(storage=dict(NFS_ENTRY, storage="local-lvm-data", type="lvmthin")),
                                 "local-lvm-data", "pmx")
@@ -2237,6 +2254,19 @@ class TestAdoptedMoverCleanup(AdoptedMoverCase):
 
         p._remove_guests = broken
         with self.assertRaisesRegex(RuntimeError, "11r passed, and its cleanup left work behind: guest cleanup stopped"):
+            p.run()
+        self.assertEqual(self.workspaces(), [])
+
+    def test_an_interrupt_in_a_cleanup_phase_still_removes_the_workspace(self) -> None:
+        lab = MoverLab()
+        cpi = MoverCPI(lab)
+        p = self.make(lab, cpi)
+
+        def interrupted():
+            raise KeyboardInterrupt
+
+        p._remove_guests = interrupted
+        with self.assertRaises(KeyboardInterrupt):
             p.run()
         self.assertEqual(self.workspaces(), [])
 
