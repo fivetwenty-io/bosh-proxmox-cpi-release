@@ -682,6 +682,7 @@ func internalHTTPNew(opts *Options) (*pvehttp.Client, error) {
 		DialContext:                 opts.DialContext,
 		Proxy:                       opts.Proxy,
 		WrapTransport:               opts.WrapTransport,
+		CheckRedirect:               opts.CheckRedirect,
 		CacheConfig:                 opts.CacheConfig,
 		CookieName:                  opts.CookieName,
 		PVENewFormat:                opts.PVENewFormat,

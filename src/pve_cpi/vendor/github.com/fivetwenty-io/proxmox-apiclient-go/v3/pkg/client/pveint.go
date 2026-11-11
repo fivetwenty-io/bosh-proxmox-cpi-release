@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/safetext"
 )
 
 // intBitSize is the bit size passed to strconv integer routines: PVE integer
@@ -53,7 +55,7 @@ func (i *PVEInt) UnmarshalJSON(data []byte) error {
 
 		err := json.Unmarshal(data, &s)
 		if err != nil {
-			return fmt.Errorf("pve int: decode string: %w", err)
+			return fmt.Errorf("pve int: decode string: %w", safetext.Error(err))
 		}
 
 		*i = PVEInt(parseLooseInt(s))
@@ -76,7 +78,9 @@ func (i *PVEInt) UnmarshalJSON(data []byte) error {
 
 	err = json.Unmarshal(data, &f)
 	if err != nil {
-		return fmt.Errorf("pve int: unsupported JSON value %s: %w", string(data), err)
+		return fmt.Errorf(
+			"pve int: unsupported JSON value %s: %w", safetext.Quote(string(data)), safetext.Error(err),
+		)
 	}
 
 	*i = PVEInt(int64(f))

@@ -162,6 +162,42 @@ type Options struct {
 	// without the field.
 	WrapTransport func(base *http.Transport) http.RoundTripper
 
+	// CheckRedirect, when non-nil, decides what the client does with a redirect
+	// a server sends, exactly as http.Client.CheckRedirect does: req is the
+	// request the redirect would send, with req.Response holding the redirect
+	// response, and via holds the requests already sent, oldest first. Return
+	// nil to follow the redirect, http.ErrUseLastResponse to stop and surface
+	// the redirect response as an API error, or any other error to fail the
+	// request with it. Wrap an error in Permanent so the client does not
+	// attempt the request again.
+	//
+	// Nil (default) refuses every redirect: the request fails with a
+	// *RedirectError that matches ErrRedirectRefused, naming the target
+	// without credentials, and the client does not retry it. Go's own policy
+	// follows redirects and keeps the Authorization header when only the port
+	// or the scheme changes, which would send an API token to another listener
+	// on the host, in plain text for an http target. A function that returns
+	// nil for every request follows redirects without limit, which is not what
+	// Go's own policy does, because that one stops after ten. Use
+	// FollowSameOrigin to follow only redirects to the scheme, host, and port
+	// of the request, FollowRedirects to follow any redirect up to a limit, or
+	// count len(via) in a function of your own.
+	//
+	// With the default, the client's transport answers a redirect itself.
+	// It turns every 3xx response except 304 into the refusal and closes the
+	// response body before net/http reads the Location header, because
+	// net/http parses that header before it calls any policy and quotes it in
+	// the error when it is malformed. This transport sits above the one
+	// WrapTransport returns, so a wrapper sees the redirect response but
+	// cannot let it through. A 304 passes through, because it answers a
+	// conditional request and tells the caller to use the copy it holds, and
+	// the PVE API does not use conditional requests. Setting CheckRedirect
+	// removes the transport's refusal, and then net/http reads the header and
+	// your function decides. Every error the client returns still has the
+	// user information, query, and fragment removed from the URLs in it, and
+	// a Location header that cannot be parsed is never quoted.
+	CheckRedirect func(req *http.Request, via []*http.Request) error
+
 	// Caching
 	CacheConfig *CacheConfig // Cache configuration (nil = disabled)
 

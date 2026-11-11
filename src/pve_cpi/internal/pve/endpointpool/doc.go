@@ -60,7 +60,9 @@
 //     one follows it, and a call's tethers, along with the ones made without
 //     a scope, are dropped when the call ends.
 //
-// The package imports only the standard library and the CPI's logger in
-// internal/log. It must never import internal/pve, internal/endpointcache, or
-// the handlers, so that every one of those packages can import it.
+// The package imports the standard library, the CPI's logger in internal/log,
+// and the SDK's client package, which it uses only for the redirect sentinel
+// and the permanent marker a redirect refusal carries. It must never import
+// internal/pve, internal/endpointcache, or the handlers, so that every one of
+// those packages can import it.
 package endpointpool

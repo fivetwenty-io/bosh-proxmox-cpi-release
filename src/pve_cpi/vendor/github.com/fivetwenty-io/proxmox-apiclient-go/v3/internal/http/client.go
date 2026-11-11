@@ -22,6 +22,8 @@ import (
 
 	"crypto/x509"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/constants"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/redirect"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/safetext"
 	issl "github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/ssl"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/swaptransport"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/auth"
@@ -143,10 +145,7 @@ func NewClient(options *Options) (*Client, error) {
 		return nil, err
 	}
 
-	httpClient := &http.Client{
-		Transport: roundTripper,
-		Timeout:   options.Timeout,
-	}
+	httpClient := newHTTPClient(options, roundTripper)
 
 	authenticator := createAuthenticator(options, httpClient)
 
@@ -451,7 +450,7 @@ func createAuthenticator(options *Options, httpClient *http.Client) auth.Authent
 			// sentinel authenticator that always returns an error on Authenticate(). This keeps
 			// the public API unchanged (NewClient returns (*Client, error) — callers that pass
 			// a malformed token will discover the problem on first use or via Authenticate()).
-			return auth.NewInvalidAuthenticator(fmt.Errorf("invalid APIToken %q: %w", options.APIToken, err))
+			return auth.NewInvalidAuthenticator(fmt.Errorf("invalid APIToken: %w", err))
 		}
 
 		return auth.NewAPITokenAuthenticator(token, options.APITokenName)
@@ -605,7 +604,7 @@ func (c *Client) DoWithContext(ctx context.Context, method, path string, params 
 		closeErr := resp.Body.Close()
 		if closeErr != nil {
 			c.logWarn("failed to close response body", map[string]interface{}{
-				logFieldError: closeErr.Error(),
+				logFieldError: redirect.Scrub(closeErr).Error(),
 			})
 		}
 	}()
@@ -645,7 +644,7 @@ func (c *Client) DoBytesWithContext(ctx context.Context, method, path string, pa
 		closeErr := resp.Body.Close()
 		if closeErr != nil {
 			c.logWarn("failed to close response body", map[string]interface{}{
-				logFieldError: closeErr.Error(),
+				logFieldError: redirect.Scrub(closeErr).Error(),
 			})
 		}
 	}()
@@ -699,7 +698,7 @@ func (c *Client) UploadWithContext(ctx context.Context, path string, fields map[
 		closeErr := resp.Body.Close()
 		if closeErr != nil {
 			c.logWarn("failed to close response body", map[string]interface{}{
-				logFieldError: closeErr.Error(),
+				logFieldError: redirect.Scrub(closeErr).Error(),
 			})
 		}
 	}()
@@ -1116,22 +1115,19 @@ func (c *Client) logResponse(req *http.Request, resp *http.Response, bodyBytes [
 
 	fields := map[string]interface{}{
 		logFieldMethod: req.Method,
-		logFieldURL:    req.URL.String(),
+		logFieldURL:    redactedURL(req.URL, logs.config),
 		"status":       resp.StatusCode,
 		"duration":     int64(time.Since(start) / time.Millisecond),
 	}
 
 	if logs.config.LogResponseHeader {
-		fields["resp_headers"] = redact(resp.Header, logs.config.RedactHeaders)
+		fields["resp_headers"] = redactResponseHeaders(resp.Header, logs.config)
 	}
 
 	if logs.config.LogResponseBody && len(bodyBytes) > 0 {
-		limit := logs.config.MaxBodyBytes
-		if limit <= 0 || limit > len(bodyBytes) {
-			limit = len(bodyBytes)
+		for key, value := range bodyFields(bodyBytes, resp.Header.Get("Content-Type"), logs.config) {
+			fields[key] = value
 		}
-
-		fields["resp_body"] = string(bodyBytes[:limit])
 	}
 
 	if perr != nil {
@@ -1249,7 +1245,12 @@ func (c *Client) buildRequestWithContext(ctx context.Context, method, path strin
 func (c *Client) executeWithMiddleware(req *http.Request) (*http.Response, error) {
 	// Create the final handler that executes the actual request
 	finalHandler := func(r *http.Request) (*http.Response, error) {
-		return c.httpClient.Load().Do(r)
+		resp, err := c.httpClient.Load().Do(r)
+		if err != nil {
+			return nil, redirect.Scrub(err)
+		}
+
+		return resp, nil
 	}
 
 	// Build the middleware chain in reverse order
@@ -1293,17 +1294,13 @@ func (c *Client) parseResponse(resp *http.Response) (*Response, []byte, error) {
 		return &Response{
 			Data: string(body),
 			Code: resp.StatusCode,
-		}, body, fmt.Errorf("failed to unmarshal response body: %w", err)
+		}, body, fmt.Errorf("failed to unmarshal response body: %w", safetext.Error(err))
 	}
 
 	// Check for API-level errors
 	if result.Success == 0 && result.Message != "" {
-		return nil, body, &apierrors.APIError{
-			Message:  result.Message,
-			Code:     resp.StatusCode,
-			Errors:   result.Errors,
-			HTTPCode: resp.StatusCode,
-		}
+		//nolint:wrapcheck // the SDK's own error type, built from this reply
+		return nil, body, apierrors.NewEnvelopeError(resp.StatusCode, result.Message, result.Errors)
 	}
 
 	return &Response{
@@ -1630,7 +1627,7 @@ func (c *Client) renewTicketIfNeeded() {
 // logTicketRenewalFailure logs ticket renewal failures if logging is enabled.
 func (c *Client) logTicketRenewalFailure(err error) {
 	c.logWarn("automatic ticket renewal failed", map[string]interface{}{
-		"error": err.Error(),
+		"error": redirect.Scrub(err).Error(),
 	})
 }
 
@@ -1794,8 +1791,18 @@ func applyRetryJitter(delay time.Duration) time.Duration {
 // dial timeout. It is surfaced as a typed ConnectionError so callers can
 // distinguish it from an API error.
 func classifyTransportError(req *http.Request, doErr error, attempt, retries int, retryAllowed bool) error {
+	// A connection that cannot be established stays a typed ConnectionError
+	// even when a wrapper also marked it permanent, because the marker only
+	// stops the loop and the type is what callers match.
 	if isTerminalTransportError(doErr) {
 		return newConnectionError(req, doErr)
+	}
+
+	// An error marked permanent, by a redirect refusal or by a WrapTransport
+	// wrapper, is refused again on every retry, so the loop stops at once
+	// whatever the method and the retry count.
+	if IsPermanent(doErr) {
+		return fmt.Errorf("request failed after %d attempt(s), not retried: %w", attempt+1, doErr)
 	}
 
 	// A certificate the client refuses is refused again on every retry, so
@@ -2087,7 +2094,7 @@ func (c *Client) loggingMiddleware(req *http.Request, next Handler) (*http.Respo
 	resp, err := next(req)
 	duration := time.Since(start)
 
-	event := &Event{Method: req.Method, URL: req.URL.String(), Duration: duration, Err: err}
+	event := &Event{Method: req.Method, URL: redactedURL(req.URL, c.logging().config), Duration: duration, Err: err}
 	if resp != nil {
 		event.Status = resp.StatusCode
 	}

@@ -195,12 +195,14 @@ func TestScopeReleaseDropsPanicsAndRunsTheRest(t *testing.T) {
 }
 
 // The package sits below everything that uses it, so its production files
-// import only the standard library and the CPI's logger, and never
-// internal/pve, internal/endpointcache, or the handlers. Its tests may also
-// import the shared TLS test servers.
+// import only the standard library, the CPI's logger, and the SDK's client
+// package, which supplies the redirect sentinel and the permanent marker. They
+// never import internal/pve, internal/endpointcache, or the handlers. Its tests
+// may also import the shared TLS test servers.
 func TestPackageImportsStayBelowThePVEPackage(t *testing.T) {
 	const (
 		logPkg  = "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+		sdkPkg  = "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 		testPkg = "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/pvetest"
 	)
 	files, err := filepath.Glob("*.go")
@@ -220,7 +222,7 @@ func TestPackageImportsStayBelowThePVEPackage(t *testing.T) {
 				t.Fatalf("%s: bad import %s", name, imp.Path.Value)
 			}
 			first, _, _ := strings.Cut(path, "/")
-			if !strings.Contains(first, ".") || path == logPkg || (isTest && path == testPkg) {
+			if !strings.Contains(first, ".") || path == logPkg || path == sdkPkg || (isTest && path == testPkg) {
 				continue
 			}
 			t.Errorf("%s imports %s, which is outside the standard library and the allowed CPI packages", name, path)

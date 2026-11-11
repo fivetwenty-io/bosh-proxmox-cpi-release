@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -71,12 +72,13 @@ func WrapConfigReadError(err error) error {
 // fails the whole detach_disk with no retry, leaving the disk free-floating --
 // the state parking exists to avoid. So the default here is retriable, and only
 // the shapes that are provably a verdict about the request stay permanent: a
-// 4xx that is not 429 (a denied grant, a malformed request), and a not-found.
+// 4xx that is not 429 (a denied grant, a malformed request), a not-found, and a
+// refused redirect.
 func WrapMutationError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if IsNotFound(err) {
+	if IsNotFound(err) || IsRedirectRefused(err) {
 		return WrapError(err)
 	}
 	// pmxcfs "Configuration file ... does not exist" arrives as a 500 with prose,
@@ -167,10 +169,21 @@ func apiHTTPCode(err error) (int, bool) {
 //   - SDK ConnectionError or TimeoutError → retriable RetriableCloudError
 //   - mid-request connection drop (IsTransportConnectionDrop) → retriable
 //     RetriableCloudError
+//   - a refused redirect (IsRedirectRefused) → non-retriable CloudError, even
+//     when the SDK reports it inside a ConnectionError from the ticket login
 //   - everything else → non-retriable CloudError wrapping original message
 func WrapError(err error) error {
 	if err == nil {
 		return nil
+	}
+
+	// A refused redirect is checked before the ConnectionError branch, because
+	// the SDK reports a login that met a redirect as a ConnectionError, and the
+	// same refusal would come back on every retry.
+	if IsRedirectRefused(err) {
+		return cpierrors.WrapAs(err, cpierrors.TypeCloud,
+			"PVE answered with a redirect, which the CPI never follows; point pve.host or pve.endpoints at the "+
+				"PVE API itself and not at a proxy that redirects")
 	}
 
 	// SDK ConnectionError → retriable (transient network fault).
@@ -502,6 +515,19 @@ func IsTransportConnectionDrop(err error) bool {
 	return false
 }
 
+// IsRedirectRefused reports whether err is a request that a server answered
+// with a redirect the CPI refused to follow. The SDK's client refuses a
+// redirect answer in its transport, and the endpoint pool, or the wrapper a
+// client without the pool gets, refuses a request built to follow one. Both
+// refusals match sdkclient.ErrRedirectRefused, so one check covers either
+// layer, behind any wrapping the SDK adds, the ConnectionError of a ticket
+// login included. Nothing was sent to the redirect's target, and the server
+// answers every attempt with the same redirect, so the CPI treats the refusal
+// as a verdict and never retries it. nil → false.
+func IsRedirectRefused(err error) bool {
+	return err != nil && errors.Is(err, sdkclient.ErrRedirectRefused)
+}
+
 // serverClosedIdleMessage is the message of net/http's unexported
 // errServerClosedIdle sentinel. See IsTransportConnectionDrop for the
 // matching discipline.
@@ -540,12 +566,18 @@ const serverClosedIdleMessage = "http: server closed idle connection"
 // past for every later attempt too, so a retry only repeats the refusal
 // through its whole backoff.
 //
+// A refused redirect (IsRedirectRefused) is never transient either, including
+// one the SDK reports inside a ConnectionError from the ticket login. The
+// server answers every attempt with the same redirect, so a retry only repeats
+// the refusal.
+//
 // nil → false.
 func IsTransientTransport(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, endpointpool.ErrTetherConflict) || errors.Is(err, endpointpool.ErrSendByPassed) {
+	if errors.Is(err, endpointpool.ErrTetherConflict) || errors.Is(err, endpointpool.ErrSendByPassed) ||
+		IsRedirectRefused(err) {
 		return false
 	}
 	// Permanent 500-with-text shapes are excluded before the blanket 5xx rule

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/safetext"
 )
 
 // PVEBool is a boolean that tolerates the several JSON encodings the Proxmox VE
@@ -66,7 +68,7 @@ func (b *PVEBool) UnmarshalJSON(data []byte) error {
 
 		err := json.Unmarshal(data, &s)
 		if err != nil {
-			return fmt.Errorf("pve bool: decode string: %w", err)
+			return fmt.Errorf("pve bool: decode string: %w", safetext.Error(err))
 		}
 
 		*b = PVEBool(parseLooseBool(s))
@@ -79,7 +81,9 @@ func (b *PVEBool) UnmarshalJSON(data []byte) error {
 
 	err := json.Unmarshal(data, &n)
 	if err != nil {
-		return fmt.Errorf("pve bool: unsupported JSON value %s: %w", string(data), err)
+		return fmt.Errorf(
+			"pve bool: unsupported JSON value %s: %w", safetext.Quote(string(data)), safetext.Error(err),
+		)
 	}
 
 	*b = PVEBool(n != 0)

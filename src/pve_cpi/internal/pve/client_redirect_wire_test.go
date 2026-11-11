@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,7 +25,9 @@ import (
 // only the port or the scheme of the same host. These tests build the client
 // through newClient, point a node at another port of its own host, and prove
 // the token never reaches that listener, whether or not the client installs
-// the failover pool.
+// the failover pool. The SDK's transport refuses the redirect answer above the
+// pool and above the wrapper a client without the pool gets, so the request is
+// sent once, is not retried, and the CPI's own refusal never sees a follow-up.
 
 // redirectOtherPort is the port the redirect names.
 const redirectOtherPort = 8443
@@ -81,7 +84,10 @@ func redirectScenario(t *testing.T, mode config.DiscoveryMode, endpoints []strin
 	if tlsTarget {
 		scheme = "https"
 	}
-	location := scheme + "://" + otherAddr + pvetest.APIPrefix + "/version"
+	// The Location carries user information, a query, and a fragment, none
+	// of which may reach the error.
+	location := scheme + "://" + redirectUserInfo + "@" + otherAddr + pvetest.APIPrefix + "/version?ticket=" +
+		redirectQuerySecret + "#" + redirectFragment
 
 	// The node answers the two routes the test sends with a redirect.
 	routes := pvetest.NewRoutes()
@@ -139,13 +145,17 @@ func redirectScenario(t *testing.T, mode config.DiscoveryMode, endpoints []strin
 		t.Fatalf("newClient: %v", err)
 	}
 
-	ctx := sdkclient.WithRetryDelay(sdkclient.WithRetries(context.Background(), 1), time.Millisecond)
-	if _, _, err := c.Pools().GetPoolComment(ctx, "p1"); !errors.Is(err, endpointpool.ErrRedirectRefused) {
-		t.Errorf("GET: err = %v, want ErrRedirectRefused", err)
-	}
+	// The SDK may retry the GET three times, so one request on the node shows
+	// that the refusal stopped its retry loop.
+	ctx := sdkclient.WithRetryDelay(sdkclient.WithRetries(context.Background(), 3), time.Millisecond)
+	_, _, err = c.Pools().GetPoolComment(ctx, "p1")
+	mustBeTheSDKRefusal(t, "GET", err)
 	_, err = c.QEMU().Create(ctx, "pve9", map[string]interface{}{"vmid": coldWireVMID})
-	if !errors.Is(err, endpointpool.ErrRedirectRefused) {
-		t.Errorf("POST: err = %v, want ErrRedirectRefused", err)
+	mustBeTheSDKRefusal(t, "POST", err)
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		if n := redirectLegs(node, method); n != 1 {
+			t.Errorf("the node read %d %s requests on the redirecting route, want 1", n, method)
+		}
 	}
 	if n := lab.dials(otherAddr); n != 0 {
 		t.Errorf("the client dialed %s %d times, want none", otherAddr, n)
@@ -160,4 +170,59 @@ func redirectScenario(t *testing.T, mode config.DiscoveryMode, endpoints []strin
 		}
 	}
 	drainProcessRegistry(t)
+}
+
+// The parts of a redirect's Location that must not reach an error.
+const (
+	redirectUserInfo    = "intruder:hunter2"
+	redirectQuerySecret = "SECRET-TICKET-0451"
+	redirectFragment    = "fragment-0451"
+)
+
+// mustBeTheSDKRefusal checks that err is the SDK's refusal of a redirect
+// answer, marked permanent, that the CPI's own refusal did not fire because no
+// follow-up request was built, and that the error holds no secret.
+func mustBeTheSDKRefusal(t *testing.T, what string, err error) {
+	t.Helper()
+	if !errors.Is(err, sdkclient.ErrRedirectRefused) || !IsRedirectRefused(err) {
+		t.Errorf("%s: err = %v, want the SDK's ErrRedirectRefused", what, err)
+		return
+	}
+	if !sdkclient.IsPermanent(err) {
+		t.Errorf("%s: err = %v, want the permanent marker", what, err)
+	}
+	if errors.Is(err, endpointpool.ErrRedirectRefused) {
+		t.Errorf("%s: err = %v, want the SDK's transport to refuse before a follow-up reaches the CPI", what, err)
+	}
+	mustHoldNoRedirectSecret(t, what, err)
+}
+
+// mustHoldNoRedirectSecret checks that err names no part of the token or of
+// the Location that could carry a credential.
+func mustHoldNoRedirectSecret(t *testing.T, what string, err error) {
+	t.Helper()
+	text := err.Error()
+	_, tokenSecret, _ := strings.Cut(coldWireToken, "=")
+	for _, secret := range []string{tokenSecret, "hunter2", redirectUserInfo, redirectQuerySecret, redirectFragment,
+		"ticket="} {
+		if strings.Contains(text, secret) {
+			t.Errorf("%s: the error holds %q: %s", what, secret, text)
+		}
+	}
+}
+
+// redirectLegs counts the requests a node read on the two routes the redirect
+// tests send for method.
+func redirectLegs(node *pvetest.Server, method string) int {
+	path := pvetest.APIPrefix + "/pools/p1"
+	if method == http.MethodPost {
+		path = pvetest.APIPrefix + "/nodes/pve9/qemu"
+	}
+	n := 0
+	for _, r := range node.Seen() {
+		if r.Method == method && r.Path == path {
+			n++
+		}
+	}
+	return n
 }

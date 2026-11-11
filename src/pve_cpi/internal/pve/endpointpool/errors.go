@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net"
 	"strings"
+
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 )
 
 // ErrSendByPassed is returned when a request carries a send-by deadline that
@@ -21,12 +23,31 @@ var ErrTetherConflict = errors.New("mutation refused because its tether key is c
 // ErrRedirectRefused is returned for a request the HTTP client built to follow
 // a redirect. The request names an address no caller chose, and Go keeps the
 // Authorization header when a redirect changes only the port or the scheme, so
-// the pool refuses it before any tether claim or dial. Nothing was sent. The
-// SDK has no marker that stops its retry loop for an error like this one, so a
-// GET that meets a redirect is attempted again, and refused again, until the
-// SDK's retry count runs out. A mutation is not retried. Callers match it with
-// errors.Is, which sees it through the url.Error and the SDK's %w wrapping.
-var ErrRedirectRefused = errors.New("endpoint pool: refusing to follow a redirect")
+// the pool refuses it before any tether claim or dial. Nothing was sent.
+//
+// The error a refusal returns carries the SDK's permanent marker, so the SDK's
+// retry loop gives up after the one attempt, for a read and for a mutation.
+// errors.Is matches it against this sentinel and against the SDK's
+// sdkclient.ErrRedirectRefused, through the url.Error and the SDK's %w
+// wrapping. The SDK's own refusal, which its transport makes when a server
+// answers with a redirect and the client follows none, matches only the SDK's
+// sentinel. A caller that asks whether any layer refused a redirect matches
+// the SDK's sentinel, and a caller that asks whether the pool or the
+// RefuseRedirects wrapper refused one matches this one.
+var ErrRedirectRefused error = &redirectRefusedSentinel{}
+
+// redirectRefusedSentinel is the type of ErrRedirectRefused. Its Is method
+// makes errors.Is match the SDK's redirect sentinel as well, so one check
+// covers both layers, while the text stays the pool's own.
+type redirectRefusedSentinel struct{}
+
+func (*redirectRefusedSentinel) Error() string { return "endpoint pool: refusing to follow a redirect" }
+
+// Is reports whether target is the SDK's redirect sentinel. errors.Is compares
+// target with the sentinel itself before it calls Is.
+func (*redirectRefusedSentinel) Is(target error) bool {
+	return target == sdkclient.ErrRedirectRefused
+}
 
 // Phase names the connect-phase step that failed.
 type Phase string

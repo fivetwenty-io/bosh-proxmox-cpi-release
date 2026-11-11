@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/safetext"
 )
 
 // floatBitSize is the bit size passed to strconv float routines: PVE numeric
@@ -55,7 +57,7 @@ func (f *PVEFloat) UnmarshalJSON(data []byte) error {
 
 		err := json.Unmarshal(data, &s)
 		if err != nil {
-			return fmt.Errorf("pve float: decode string: %w", err)
+			return fmt.Errorf("pve float: decode string: %w", safetext.Error(err))
 		}
 
 		*f = PVEFloat(parseLooseFloat(s))
@@ -68,7 +70,9 @@ func (f *PVEFloat) UnmarshalJSON(data []byte) error {
 
 	err := json.Unmarshal(data, &n)
 	if err != nil {
-		return fmt.Errorf("pve float: unsupported JSON value %s: %w", string(data), err)
+		return fmt.Errorf(
+			"pve float: unsupported JSON value %s: %w", safetext.Quote(string(data)), safetext.Error(err),
+		)
 	}
 
 	*f = PVEFloat(n)

@@ -3,7 +3,6 @@ package http
 import (
 	"net/http"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/constants"
@@ -19,6 +18,20 @@ type Logger interface {
 }
 
 // LogConfig controls logging behavior and redaction.
+//
+// The url field of a log line and of a hook event holds the scheme, host, and
+// path of the request, without user information or a fragment. It also holds
+// the query when LogQueryParams is set, with the value of each parameter named
+// in RedactParams replaced, as the query field shows it. RedactHeaders and
+// RedactParams match without regard to case, and the credential headers and
+// parameters the SDK itself sends or receives, such as Authorization, Cookie,
+// Set-Cookie, ticket, and vncticket, are redacted whatever the lists say.
+//
+// LogResponseBody logs a body that parses as JSON with the value of each
+// secret member replaced, such as ticket, CSRFPreventionToken, password, and
+// the value of a newly created token. A body that does not parse is not
+// logged. Its length and content type are logged in its place. LogBody is
+// reserved: the client does not log request bodies.
 type LogConfig struct {
 	Enabled           bool
 	RedactHeaders     []string
@@ -35,8 +48,8 @@ type LogConfig struct {
 func defaultLogConfig() LogConfig {
 	return LogConfig{
 		Enabled:           true,
-		RedactHeaders:     []string{"authorization", "cookie", "csrfpreventiontoken"},
-		RedactParams:      []string{redactParamPassword, "token", "secret"},
+		RedactHeaders:     []string{headerAuthorization, headerCookie, headerCSRF},
+		RedactParams:      []string{redactParamPassword, redactParamToken, redactParamSecret},
 		LogRequestHeader:  false,
 		LogResponseHeader: false,
 		LogQueryParams:    true,
@@ -60,22 +73,14 @@ type Event struct {
 	Fields   map[string]interface{}
 }
 
-// redact returns a new map with sensitive keys redacted.
-func redact(in map[string][]string, redactKeys []string) map[string]interface{} {
+// redact returns a new map with sensitive keys redacted. A key matches a name
+// in redactKeys, or one in alwaysRedacted, without regard to case.
+func redact(in map[string][]string, redactKeys []string, alwaysRedacted ...string) map[string]interface{} {
+	names := newNameMatcher(redactKeys, alwaysRedacted)
 	out := make(map[string]interface{}, len(in))
+
 	for key, vals := range in {
-		lowerKey := strings.ToLower(key)
-		redacted := false
-
-		for _, rk := range redactKeys {
-			if lowerKey == rk {
-				redacted = true
-
-				break
-			}
-		}
-
-		if redacted {
+		if names.secret(key) {
 			out[key] = redactedValue
 		} else {
 			// copy values
@@ -187,7 +192,7 @@ func (c *Client) logRequest(req *http.Request, msg string, extra map[string]inte
 
 	fields := map[string]interface{}{
 		logFieldMethod: req.Method,
-		logFieldURL:    req.URL.String(),
+		logFieldURL:    redactedURL(req.URL, logs.config),
 	}
 
 	for k, v := range extra {
@@ -195,11 +200,11 @@ func (c *Client) logRequest(req *http.Request, msg string, extra map[string]inte
 	}
 
 	if logs.config.LogRequestHeader {
-		fields["headers"] = redact(req.Header, logs.config.RedactHeaders)
+		fields["headers"] = redact(req.Header, logs.config.RedactHeaders, alwaysRedactedHeaders()...)
 	}
 
 	if logs.config.LogQueryParams {
-		fields["query"] = redact(req.URL.Query(), logs.config.RedactParams)
+		fields["query"] = redact(req.URL.Query(), logs.config.RedactParams, alwaysRedactedParams()...)
 	}
 
 	logs.logger.Info(msg, fields)

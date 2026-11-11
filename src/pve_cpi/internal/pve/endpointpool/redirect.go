@@ -3,13 +3,22 @@ package endpointpool
 import (
 	"fmt"
 	"net/http"
+
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 )
 
 // refuseRedirect returns ErrRedirectRefused for a request the HTTP client
 // built to follow a redirect, and nil for every other request. Go sets
 // Request.Response only on those follow-ups, so a request a caller built never
 // carries it. The error names the host that sent the redirect and nothing else
-// from either request.
+// from either request, and it carries the SDK's permanent marker, because the
+// same follow-up is refused on every attempt and the SDK's retry loop must not
+// send the request again.
+//
+// The SDK's client refuses a redirect answer in a transport above the one
+// RefuseRedirects or the pool returns, unless the client sets a CheckRedirect
+// policy, so with the SDK's default this refusal never fires. It stays as the
+// refusal for a client whose policy follows redirects.
 func refuseRedirect(req *http.Request) error {
 	if req == nil || req.Response == nil {
 		return nil
@@ -18,7 +27,7 @@ func refuseRedirect(req *http.Request) error {
 	if prior := req.Response.Request; prior != nil && prior.URL != nil && prior.URL.Host != "" {
 		from = prior.URL.Host
 	}
-	return fmt.Errorf("%w from %s", ErrRedirectRefused, from)
+	return sdkclient.Permanent(fmt.Errorf("%w from %s", ErrRedirectRefused, from))
 }
 
 // redirectGuard is the round tripper RefuseRedirects returns.
@@ -27,8 +36,8 @@ type redirectGuard struct {
 }
 
 // RefuseRedirects wraps base so that a request the HTTP client built to follow
-// a redirect is refused with ErrRedirectRefused, and closes its body, before it
-// reaches base. It serves a client that has no endpoint pool, where the pool's
+// a redirect is refused with ErrRedirectRefused, marked permanent, and closes
+// its body, before it reaches base. It serves a client that has no endpoint pool, where the pool's
 // own refusal does not apply. Every other request goes to base unchanged. A nil
 // base is a caller defect and makes the returned round tripper nil, which the
 // SDK reports as an error from its constructor.

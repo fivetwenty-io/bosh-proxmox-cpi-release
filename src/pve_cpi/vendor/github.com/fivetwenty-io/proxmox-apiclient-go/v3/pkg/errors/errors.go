@@ -1,12 +1,16 @@
 package errors
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/constants"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/safetext"
 )
 
 // Sentinel errors for HTTP status classes. Use errors.Is to test wrapped APIErrors.
@@ -34,6 +38,27 @@ type APIError struct {
 
 	// sentinel is the wrapped sentinel for errors.Is matching.
 	sentinel error
+
+	// droppedErrors counts the entries of Errors that were cut because the
+	// server sent more than MaxErrorItems.
+	droppedErrors int
+}
+
+// NewEnvelopeError builds the APIError for a reply whose status says success
+// but whose envelope reports a failure. The message and the field errors are
+// text the server chose, so they get the same escaping and the same length cap
+// as the error ParseAPIError builds from a failure status.
+func NewEnvelopeError(statusCode int, message string, fieldErrors map[string]string) *APIError {
+	apiErr := &APIError{
+		Message:  message,
+		Code:     statusCode,
+		Errors:   fieldErrors,
+		HTTPCode: statusCode,
+		sentinel: sentinelFor(statusCode),
+	}
+	apiErr.escapeServerText()
+
+	return apiErr
 }
 
 // Unwrap returns the wrapped sentinel error, enabling errors.Is chains.
@@ -41,18 +66,63 @@ func (e *APIError) Unwrap() error {
 	return e.sentinel
 }
 
-// Error implements the error interface.
+// Error implements the error interface. It prints at most MaxErrorItems of the
+// field errors, in the order of their names, then how many more there were, and
+// it is never longer than MaxErrorTextBytes.
 func (e *APIError) Error() string {
+	more := e.droppedErrors
+
 	if len(e.Errors) > 0 {
-		errStrs := make([]string, 0, len(e.Errors))
-		for field, msg := range e.Errors {
-			errStrs = append(errStrs, fmt.Sprintf("%s: %s", field, msg))
+		fields := make([]string, 0, len(e.Errors))
+		for field := range e.Errors {
+			fields = append(fields, field)
 		}
 
-		return fmt.Sprintf("%s (code: %d, errors: %s)", e.Message, e.Code, strings.Join(errStrs, ", "))
+		sort.Strings(fields)
+
+		if len(fields) > MaxErrorItems {
+			more += len(fields) - MaxErrorItems
+			fields = fields[:MaxErrorItems]
+		}
+
+		errStrs := make([]string, 0, len(fields)+1)
+		for _, field := range fields {
+			errStrs = append(errStrs, fmt.Sprintf("%s: %s", field, e.Errors[field]))
+		}
+
+		if more > 0 {
+			errStrs = append(errStrs, moreMarker(more))
+		}
+
+		return capErrorText(fmt.Sprintf("%s (code: %d, errors: %s)", e.Message, e.Code, strings.Join(errStrs, ", ")))
 	}
 
-	return fmt.Sprintf("%s (code: %d)", e.Message, e.Code)
+	if more > 0 {
+		return capErrorText(fmt.Sprintf("%s (code: %d, errors: %s)", e.Message, e.Code, moreMarker(more)))
+	}
+
+	return capErrorText(fmt.Sprintf("%s (code: %d)", e.Message, e.Code))
+}
+
+// moreMarker names how many items an error left out.
+func moreMarker(count int) string {
+	return fmt.Sprintf("and %d more", count)
+}
+
+// capErrorText cuts text at MaxErrorTextBytes, on a character boundary, and ends
+// it with a marker when it cut. The wrapper types call it on the error they
+// build, so no error is longer than the cap by much.
+func capErrorText(text string) string {
+	if len(text) <= MaxErrorTextBytes {
+		return text
+	}
+
+	cut := MaxErrorTextBytes - len(truncationMarker)
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+
+	return text[:cut] + truncationMarker
 }
 
 // IsNotFound returns true if the error indicates a resource was not found.
@@ -80,7 +150,7 @@ type PermissionError struct {
 // Error implements the error interface.
 func (e *PermissionError) Error() string {
 	if e.What != "" {
-		return fmt.Sprintf("permission denied for %s: %s", e.What, e.APIError.Error())
+		return fmt.Sprintf("permission denied for %s: %s", safetext.Multiline(e.What), e.APIError.Error())
 	}
 
 	return "permission denied: " + e.APIError.Error()
@@ -96,7 +166,7 @@ type ParameterError struct {
 // Error implements the error interface.
 func (e *ParameterError) Error() string {
 	if e.Usage != "" {
-		return fmt.Sprintf("parameter error: %s (usage: %s)", e.APIError.Error(), e.Usage)
+		return fmt.Sprintf("parameter error: %s (usage: %s)", e.APIError.Error(), safetext.Multiline(e.Usage))
 	}
 
 	return "parameter error: " + e.APIError.Error()
@@ -114,7 +184,7 @@ type AuthenticationError struct {
 func (e *AuthenticationError) Error() string {
 	msg := "authentication failed"
 	if e.Realm != "" {
-		msg += " for realm " + e.Realm
+		msg += " for realm " + safetext.Multiline(e.Realm)
 	}
 
 	if e.TFA {
@@ -133,11 +203,53 @@ type TFARequiredError struct {
 	Ticket    string   `json:"ticket"`    // Partial ticket for TFA
 	Challenge string   `json:"challenge"` // TFA challenge (if any)
 	Types     []string `json:"types"`     // Available TFA types
+
+	// droppedTypes counts the types that were cut because the server sent more
+	// than MaxErrorItems.
+	droppedTypes int
 }
 
-// Error implements the error interface.
+// Error implements the error interface. It prints at most MaxErrorItems of the
+// types, in the order the server sent them, then how many more there were, and
+// it is never longer than MaxErrorTextBytes.
 func (e *TFARequiredError) Error() string {
-	return fmt.Sprintf("two-factor authentication required (available types: %s)", strings.Join(e.Types, ", "))
+	types := e.Types
+	more := e.droppedTypes
+
+	if len(types) > MaxErrorItems {
+		more += len(types) - MaxErrorItems
+		types = types[:MaxErrorItems]
+	}
+
+	listed := strings.Join(types, ", ")
+
+	if more > 0 {
+		if listed != "" {
+			listed += ", "
+		}
+
+		listed += moreMarker(more)
+	}
+
+	return capErrorText("two-factor authentication required (available types: " + listed + ")")
+}
+
+// escapeServerText escapes the text fields the server chose, as
+// APIError.escapeServerText does. It keeps the first MaxErrorItems types and
+// cuts each at MaxServerTextBytes. The ticket and the challenge are values the
+// caller sends back to finish the login, so they are escaped and not cut.
+func (e *TFARequiredError) escapeServerText() {
+	e.Ticket = safetext.Multiline(e.Ticket)
+	e.Challenge = safetext.Multiline(e.Challenge)
+
+	if len(e.Types) > MaxErrorItems {
+		e.droppedTypes += len(e.Types) - MaxErrorItems
+		e.Types = e.Types[:MaxErrorItems:MaxErrorItems]
+	}
+
+	for i, kind := range e.Types {
+		e.Types[i] = safetext.CappedMultiline(kind, MaxServerTextBytes)
+	}
 }
 
 // ConnectionError represents a connection-related error.
@@ -223,13 +335,75 @@ func ParseAPIError(statusCode int, body []byte) error {
 
 	apiErr.HTTPCode = statusCode
 	apiErr.sentinel = sentinelFor(statusCode)
+	apiErr.escapeServerText()
 
 	return dispatchByStatus(statusCode, body, apiErr)
 }
 
-// newGenericError builds an APIError for non-JSON or empty bodies.
+// MaxServerTextBytes is the most bytes of escaped text that an error keeps from
+// one server-chosen string. It bounds the message of a reply that is not JSON,
+// such as a proxy's error page, and the message, each field name, each field
+// message, and the file of a reply that is.
+const MaxServerTextBytes = 1024
+
+// MaxErrorItems is the most items an error keeps and prints from a list the
+// server sent, meaning the entries of the errors map and the TFA types. An error
+// that cut items says how many more there were.
+const MaxErrorItems = 32
+
+// MaxErrorTextBytes is the most bytes that the Error method of an API error or
+// a TFA error returns. It is above what MaxErrorItems items of ordinary size
+// need, and below the size at which a log line or a terminal is flooded.
+const MaxErrorTextBytes = 8192
+
+// truncationMarker ends an error text that was cut.
+const truncationMarker = "...(truncated)"
+
+// MaxGenericMessageBytes is the most bytes of a body that is not JSON that an
+// error message keeps. It is enough to show the title of a proxy's error page.
+const MaxGenericMessageBytes = MaxServerTextBytes
+
+// escapeServerText replaces, in every text field the server chose, each control
+// character other than newline and tab, each text direction override, and each
+// invalid byte with its escape sequence, so printing the error cannot rewrite
+// a terminal or hide text. Each field is also cut at MaxServerTextBytes of
+// escaped text, with a marker when it was cut. Newlines stay, because PVE
+// writes multi-line messages. A program that logs the error on one line should
+// quote it.
+func (e *APIError) escapeServerText() {
+	e.Message = safetext.CappedMultiline(e.Message, MaxServerTextBytes)
+	e.File = safetext.CappedMultiline(e.File, MaxServerTextBytes)
+
+	if e.Errors == nil {
+		return
+	}
+
+	fields := make([]string, 0, len(e.Errors))
+	for field := range e.Errors {
+		fields = append(fields, field)
+	}
+
+	// Map order is random, so the entries that are kept are the first by name.
+	sort.Strings(fields)
+
+	if len(fields) > MaxErrorItems {
+		e.droppedErrors += len(fields) - MaxErrorItems
+		fields = fields[:MaxErrorItems]
+	}
+
+	escaped := make(map[string]string, len(fields))
+	for _, field := range fields {
+		escaped[safetext.CappedMultiline(field, MaxServerTextBytes)] =
+			safetext.CappedMultiline(e.Errors[field], MaxServerTextBytes)
+	}
+
+	e.Errors = escaped
+}
+
+// newGenericError builds an APIError for non-JSON or empty bodies. The message
+// is the body cut at MaxGenericMessageBytes, and escaped.
 func newGenericError(statusCode int, body []byte) *APIError {
-	msg := strings.TrimSpace(string(body))
+	msg := strings.TrimSpace(safetext.CappedMultilineBytes(bytes.TrimSpace(body), MaxGenericMessageBytes))
 	if msg == "" {
 		msg = fmt.Sprintf("HTTP %d", statusCode)
 	}
@@ -261,6 +435,8 @@ func dispatchByStatus(statusCode int, body []byte, apiErr APIError) error {
 func dispatchUnauthorized(body []byte, apiErr APIError) error {
 	var tfaErr TFARequiredError
 	if json.Unmarshal(body, &tfaErr) == nil && tfaErr.Ticket != "" {
+		tfaErr.escapeServerText()
+
 		return &tfaErr
 	}
 

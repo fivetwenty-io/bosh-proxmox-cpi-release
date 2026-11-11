@@ -244,7 +244,13 @@ func (w *endpointWiring) apply(opts sdkclient.Options, logger *log.Logger, cache
 // refuseRedirectsWithoutPool gives a client the plan builds no pool for a
 // transport wrapper that refuses a redirect follow-up, so no client the CPI
 // builds follows a redirect, whether or not the pool is installed. A client
-// with a pool already refuses one inside the pool. The wrapper replaces the
+// with a pool already refuses one inside the pool. The SDK's client refuses a
+// redirect answer first, in a transport it installs above this wrapper and
+// above the pool, unless its options set a CheckRedirect policy, which the CPI
+// never does. Both refusals carry the SDK's permanent marker and match
+// sdkclient.ErrRedirectRefused, so either one ends the request after one
+// attempt. The CPI's refusal stays for a client whose policy follows
+// redirects, where it is the only one that fires. The wrapper replaces the
 // SDK's swappable transport, which only SetKeepAlive uses, and the CPI never
 // calls it. The SDK's Close still reaches the base transport's idle
 // connections.

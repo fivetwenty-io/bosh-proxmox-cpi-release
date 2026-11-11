@@ -319,8 +319,13 @@ func RetryOnTransientOrLockSleepBudget(maxAttempts int) time.Duration {
 // It's a verdict on a slot delete whose busy retries and revert have already
 // run, so sending the op again can't change it. The classifiers read
 // err.Error(), which carries the text of the PUT or the revert that failed, so
-// a busy or lock-timeout cause would otherwise read as a reason to retry.
+// a busy or lock-timeout cause would otherwise read as a reason to retry. A
+// refused redirect ends the loop too (IsRedirectRefused), because the server
+// answers every attempt with the same redirect.
 func stopsRetry(err error) bool {
+	if IsRedirectRefused(err) {
+		return true
+	}
 	_, pending := IsDriveDeletePending(err)
 	return pending
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/constants"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/redirect"
 	apierrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
@@ -275,7 +276,7 @@ func (ta *TicketAuthenticator) Logout() error {
 		req.Header.Set(key, value)
 	}
 
-	resp, err := ta.httpClient.Load().Do(req)
+	resp, err := ta.send(req)
 	if err != nil {
 		return fmt.Errorf("failed to send logout request: %w", err)
 	}
@@ -403,8 +404,20 @@ func (ta *TicketAuthenticator) createTFARequest(challenge *TFAChallenge, respons
 	return req, nil
 }
 
-func (ta *TicketAuthenticator) sendTFARequest(req *http.Request) (*http.Response, error) {
+// send sends req with the authenticator's HTTP client. A refused redirect comes
+// back with the target's user information, query, and fragment removed from the
+// message, because net/http puts the raw Location header there.
+func (ta *TicketAuthenticator) send(req *http.Request) (*http.Response, error) {
 	resp, err := ta.httpClient.Load().Do(req)
+	if err != nil {
+		return nil, redirect.Scrub(err) //nolint:wrapcheck // same error, message cleaned
+	}
+
+	return resp, nil
+}
+
+func (ta *TicketAuthenticator) sendTFARequest(req *http.Request) (*http.Response, error) {
+	resp, err := ta.send(req)
 	if err != nil {
 		return nil, &apierrors.ConnectionError{
 			Message: "TFA request failed",
@@ -531,7 +544,7 @@ func (ta *TicketAuthenticator) createLoginRequest(loginURL string, data url.Valu
 }
 
 func (ta *TicketAuthenticator) sendLoginRequest(req *http.Request) (*http.Response, error) {
-	resp, err := ta.httpClient.Load().Do(req)
+	resp, err := ta.send(req)
 	if err != nil {
 		return nil, &apierrors.ConnectionError{
 			Message: "login request failed",

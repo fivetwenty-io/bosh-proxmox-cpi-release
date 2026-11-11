@@ -31,8 +31,19 @@ const (
 	// Redaction sentinel.
 	redactedValue = "REDACTED"
 
+	// headerAuthorization is the lower-cased Authorization header name.
+	headerAuthorization = "authorization"
+
+	// headerCookie is the lower-cased Cookie header name.
+	headerCookie = "cookie"
+
+	// headerCSRF is the lower-cased CSRFPreventionToken header and parameter name.
+	headerCSRF = "csrfpreventiontoken"
+
 	// Redact param keys used in defaultLogConfig.
 	redactParamPassword = "password"
+	redactParamSecret   = "secret"
+	redactParamToken    = "token"
 )
 
 // SSLVerifyMode selects whether server certificates are verified.
@@ -121,6 +132,15 @@ type Options struct {
 	// covered. Opt-in; nil (default) leaves the transport configuration
 	// untouched.
 	WrapTransport func(base *http.Transport) http.RoundTripper
+
+	// CheckRedirect, when non-nil, decides what the HTTP client does with a
+	// redirect, exactly as http.Client.CheckRedirect does. Nil (default)
+	// refuses every redirect with a *RedirectError that matches
+	// ErrRedirectRefused and is never retried. The refusal is made by a
+	// transport above the one WrapTransport returns, before net/http reads
+	// the Location header, and it lets a 304 through. A non-nil value removes
+	// that transport.
+	CheckRedirect func(req *http.Request, via []*http.Request) error
 
 	// Caching configuration
 	CacheConfig *cache.Config
