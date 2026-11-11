@@ -118,6 +118,16 @@ type DiscoveryReads struct {
 	Status DiscoveryStatus
 	// RootCA is the SHA-256 of the cluster root CA's DER bytes.
 	RootCA [sha256.Size]byte
+	// RootVia is the configured endpoint, as host:port, that answered the read
+	// the root CA came from, which is the read the cluster identity rests on.
+	// It is empty when the client reports no answering endpoint, as a client
+	// without an endpoint pool does.
+	RootVia string
+	// AnsweredBy lists every configured endpoint, as host:port, that answered
+	// any read of this run, in the order each first answered. A walk can hop
+	// between configured endpoints during the run, so it may hold more than
+	// RootVia. It is empty when the client reports no answering endpoint.
+	AnsweredBy []string
 }
 
 // ReadDiscovery reads what discovery needs through c: the node list with each
@@ -151,6 +161,8 @@ func readDiscovery(ctx context.Context, c Client, overall, certTimeout time.Dura
 	}
 	bounded, cancel := context.WithTimeout(ctx, overall)
 	defer cancel()
+	run := &endpointpool.AnswerRecorder{}
+	bounded = endpointpool.WithAnswerRecorder(bounded, run)
 
 	rows, err := readDiscoveryNodes(bounded, c)
 	if err != nil {
@@ -173,10 +185,16 @@ func readDiscovery(ctx context.Context, c Client, overall, certTimeout time.Dura
 	if !reads.Status.Available {
 		preferred = firstOnlineNode(rows)
 	}
-	var rootNode string
+	var rootNode, rootVia string
 	var rootAnswer *nodes.ListCertificatesInfoResponse
-	reads.RootCA, err = readClusterRoot(bounded, c, preferred, "ReadClusterRootDigest",
-		func(node string, response *nodes.ListCertificatesInfoResponse) { rootNode, rootAnswer = node, response })
+	// The recorder's last answer, read in the callback that follows the
+	// attempt that produced the root, is the endpoint that answered that
+	// attempt, whichever endpoints answered the attempts before it.
+	rootRead := &endpointpool.AnswerRecorder{}
+	reads.RootCA, err = readClusterRoot(endpointpool.WithAnswerRecorder(bounded, rootRead), c, preferred,
+		"ReadClusterRootDigest", func(node string, response *nodes.ListCertificatesInfoResponse) {
+			rootNode, rootAnswer, rootVia = node, response, rootRead.Last()
+		})
 	if err != nil {
 		return DiscoveryReads{}, &discoveryReadError{base: ErrDiscoveryRoot, cause: err}
 	}
@@ -196,6 +214,7 @@ func readDiscovery(ctx context.Context, c Client, overall, certTimeout time.Dura
 	if err = ctx.Err(); err != nil {
 		return DiscoveryReads{}, fmt.Errorf("ReadDiscovery: read ended: %w", err)
 	}
+	reads.RootVia, reads.AnsweredBy = rootVia, run.Endpoints()
 	return reads, nil
 }
 

@@ -68,8 +68,9 @@ func (p *Pool) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // roundTrip is RoundTrip under the given bounds. It logs a send-by refusal
-// once, whichever path refused the request, and tells the first-answer hook
-// when a configured endpoint answered.
+// once, whichever path refused the request, tells the first-answer hook when
+// a configured endpoint answered, and tells the answer recorders on the
+// request's context which one did.
 func (p *Pool) roundTrip(req *http.Request, b bounds) (*http.Response, error) {
 	resp, oc, err := p.dispatch(req, b)
 	if oc.sendBy {
@@ -77,6 +78,7 @@ func (p *Pool) roundTrip(req *http.Request, b bounds) (*http.Response, error) {
 	}
 	if err == nil {
 		p.noteAnswer(resp, oc)
+		p.recordAnswer(req.Context(), resp, oc)
 	}
 	return resp, err
 }

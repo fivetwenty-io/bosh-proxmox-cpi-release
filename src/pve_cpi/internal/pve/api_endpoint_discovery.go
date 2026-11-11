@@ -372,12 +372,37 @@ func (w *DiscoveryWorker) discover(ctx context.Context, via string, b DiscoveryB
 		return
 	}
 	w.logBuildDrops(ctx, result.Dropped)
+	via = w.answeringEndpoint(ctx, via, reads)
 	obs, err := discoveryObservation(via, result)
 	if err != nil {
 		w.logDropped(ctx, err)
 		return
 	}
 	w.recordResult(ctx, b, reads, result, obs)
+}
+
+// answeringEndpoint returns the key's spelling of the configured endpoint that
+// answered the identity read, which is the evidence's source, and not the
+// endpoint whose answer began the refresh, because the reads walk the
+// configured endpoints and can hop when one goes down. A client that reports
+// no answering endpoint, or one that is none of the key's endpoints, leaves
+// triggered, the endpoint that began the refresh. A run whose reads were
+// answered by more than one configured endpoint is logged at Debug.
+func (w *DiscoveryWorker) answeringEndpoint(ctx context.Context, triggered string, reads DiscoveryReads) string {
+	via, ok := keyEndpoint(w.store.Key(), reads.RootVia)
+	if !ok {
+		return triggered
+	}
+	if len(reads.AnsweredBy) > 1 || (len(reads.AnsweredBy) == 1 && normalizedEndpoint(reads.AnsweredBy[0]) !=
+		normalizedEndpoint(via)) {
+		w.logger.LogAttrs(ctx, log.LevelDebug,
+			"api endpoint discovery: the reads were answered by more than one configured endpoint; the "+
+				"cluster identity came from "+via,
+			log.String("endpoint", via),
+			log.String("answered_by", strings.Join(reads.AnsweredBy, ",")),
+			log.String("triggered_by", triggered))
+	}
+	return via
 }
 
 // recordFailure handles a refresh that ended without a result. A refresh the

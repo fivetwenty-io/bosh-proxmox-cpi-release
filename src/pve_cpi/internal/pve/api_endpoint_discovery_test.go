@@ -134,7 +134,10 @@ func (c *discClock) advance(d time.Duration) {
 }
 
 type workerEnvOptions struct {
-	seed      string
+	seed string
+	// endpoints, when set, are the key's configured endpoints and replace
+	// seed.
+	endpoints []string
 	verifySSL bool
 	mode      config.DiscoveryMode
 }
@@ -155,7 +158,9 @@ type workerEnv struct {
 	registry *endpointcache.Registry
 	clock    *discClock
 
-	pool    *discPool
+	pool *discPool
+	// client, when set, replaces the cluster's client in the binding.
+	client  Client
 	seen    int
 	runReqs int
 }
@@ -165,6 +170,9 @@ func newWorkerEnv(t *testing.T, opts workerEnvOptions) *workerEnv {
 	if opts.seed == "" {
 		opts.seed = workerSeed
 	}
+	if len(opts.endpoints) == 0 {
+		opts.endpoints = []string{opts.seed}
+	}
 	dir := filepath.Join(t.TempDir(), "cache")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -173,7 +181,7 @@ func newWorkerEnv(t *testing.T, opts workerEnvOptions) *workerEnv {
 	e := &workerEnv{
 		t:        t,
 		dir:      dir,
-		key:      endpointcache.KeyConfig{Endpoints: []string{opts.seed}, VerifySSL: opts.verifySSL, User: workerUser},
+		key:      endpointcache.KeyConfig{Endpoints: opts.endpoints, VerifySSL: opts.verifySSL, User: workerUser},
 		mode:     opts.mode,
 		cluster:  newDiscCluster(t),
 		reqs:     &discRequests{},
@@ -222,6 +230,9 @@ func (e *workerEnv) newWorker() *DiscoveryWorker {
 }
 
 func (e *workerEnv) binding() DiscoveryBinding {
+	if e.client != nil {
+		return DiscoveryBinding{Client: e.client, Pool: e.pool}
+	}
 	return DiscoveryBinding{Client: markedClient(e.cluster, e.reqs), Pool: e.pool}
 }
 
