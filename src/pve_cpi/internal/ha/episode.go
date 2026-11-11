@@ -1,6 +1,7 @@
 package ha
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -25,6 +26,17 @@ import (
 const (
 	// EpisodeFileName is the name of the record in the cache directory.
 	EpisodeFileName = "ha-recovery-episodes.json"
+
+	// episodeLockName is the lock file that serializes the changes to the
+	// record across processes. The cache directory's sweep only removes names
+	// that carry a key digest, so it never removes this one.
+	episodeLockName = "ha-recovery-episodes.lock"
+
+	// episodeLockWait bounds how long an observation waits for another
+	// process's change to the record, as the endpoint cache bounds its writers.
+	// A change is one small read and write, so a wait that runs out means the
+	// holder is stuck, and the observation starts its clock now instead.
+	episodeLockWait = time.Second
 
 	// EpisodeName is what the record's directory refusals call it, so an
 	// operator reading one does not look at the endpoint cache's settings.
@@ -71,9 +83,17 @@ var episodePolicy = privatefile.Policy{
 // endpointcache.Resolve chooses and checks. A directory or file that is
 // unsafe or unreadable, and a record that does not verify, all read as no
 // record, so the clock starts at the current observation. That only delays a
-// handover, which is the safe direction. Concurrent writers may lose each
-// other's updates for the same reason: the loser's clock restarts, and nothing
-// else changes.
+// handover, which is the safe direction.
+//
+// Two calls can observe at once, such as two delete_vm calls for HA VMs on the
+// same fenced node, or calls for two clusters that share the directory. Each
+// change to the record is made under a lock file beside it, the same kind of
+// lock the endpoint cache takes on a key, and the record is read again under
+// that lock, so neither call drops the other's entry. An observation that
+// finds its episode already recorded needs no change, so it reads without the
+// lock, which the atomic replacement of the record makes safe. A lock that
+// stays busy past episodeLockWait gives the same answer as an unreadable
+// record: the clock starts at this observation, and the error says why.
 //
 // A pve.endpoint_cache_dir that does not exist is the one refusal that does
 // not end the search. A record that could never be written would keep the
@@ -108,6 +128,11 @@ type EpisodeStore struct {
 	// warnOnce, when it is set, lets the missing-directory Warn through once.
 	// ForCall sets it.
 	warnOnce *sync.Once
+
+	// beforeWrite, when it is set, runs under the lock just before the record
+	// is written. Only tests set it, to make another observation meet this one
+	// in the middle of its change.
+	beforeWrite func()
 }
 
 // ForCall returns a copy of the store that logs the missing-directory Warn at
@@ -283,6 +308,34 @@ func (s *EpisodeStore) Observe(sid, uid string) (Episode, error) {
 	root := choice.Root
 	defer func() { _ = root.Close() }()
 
+	key := s.key(sid)
+	if rec, err := readEpisodeRecord(root); err == nil {
+		if first, ok := recordedFirstSeen(rec, key, uid, now); ok {
+			ep.FirstSeen = first
+			ep.Recorded = true
+			return ep, nil
+		}
+	}
+
+	lock, err := endpointcache.LockFile(context.Background(), root, episodeLockName, EpisodeName, episodeLockWait)
+	if err != nil {
+		return ep, fmt.Errorf("ha episode: %w", err)
+	}
+	defer func() { _ = lock.Close() }()
+	// The wait may have taken a moment, and another process may have changed
+	// the record in it, so the observation is timed and read again under the
+	// lock.
+	now = s.now()
+	ep.FirstSeen, ep.Now = now, now
+	return s.observeLocked(root, key, ep)
+}
+
+// observeLocked reads the record, adds the episode ep names when the record
+// does not already hold it, prunes the record, and writes it, all under the
+// record's lock. ep carries the time of the observation in both FirstSeen and
+// Now.
+func (s *EpisodeStore) observeLocked(root *os.Root, key string, ep Episode) (Episode, error) {
+	now := ep.Now
 	rec, readErr := readEpisodeRecord(root)
 	if readErr != nil && !errors.Is(readErr, fs.ErrNotExist) {
 		// The record is unusable, so it is rewritten from this observation.
@@ -291,27 +344,25 @@ func (s *EpisodeStore) Observe(sid, uid string) (Episode, error) {
 	if rec.Episodes == nil {
 		rec.Episodes = map[string]episodeEntry{}
 	}
-	key := s.key(sid)
-	if entry, ok := rec.Episodes[key]; ok && entry.UID == uid && entry.FirstSeen > 0 {
-		// A first observation in the future is not one this clock made, so
-		// the episode starts again rather than trusting it.
-		if first := time.Unix(entry.FirstSeen, 0); !first.After(now) {
-			ep.FirstSeen = first
-			ep.Recorded = true
-			return ep, nil
-		}
+	if first, ok := recordedFirstSeen(rec, key, ep.UID, now); ok {
+		ep.FirstSeen = first
+		ep.Recorded = true
+		return ep, nil
 	}
 
-	rec.Episodes[key] = episodeEntry{UID: uid, FirstSeen: now.Unix()}
+	rec.Episodes[key] = episodeEntry{UID: ep.UID, FirstSeen: now.Unix()}
 	for name, entry := range rec.Episodes {
 		// An entry older than the retention is past any grace window. One first
-		// seen in the future is not one this clock made, and Observe never trusts
-		// it, so it is dropped here instead of waiting for its own service to be
-		// observed again.
+		// seen further in the future than the skew allows is not one this clock
+		// made, and Observe never trusts it, so it is dropped here instead of
+		// waiting for its own service to be observed again.
 		first := time.Unix(entry.FirstSeen, 0)
-		if first.After(now) || now.Sub(first) > episodeRetention {
+		if firstSeenAhead(first, now) || now.Sub(first) > episodeRetention {
 			delete(rec.Episodes, name)
 		}
+	}
+	if s.beforeWrite != nil {
+		s.beforeWrite()
 	}
 	writeErr := episodePolicy.WriteEnvelope(root, EpisodeFileName, episodeRecordVersion, rec, privatefile.NoSyncOps())
 	if writeErr != nil {
@@ -324,6 +375,33 @@ func (s *EpisodeStore) Observe(sid, uid string) (Episode, error) {
 		return ep, writeErr
 	}
 	return ep, nil
+}
+
+// recordedFirstSeen returns the first observation the record holds for key
+// with uid, when it holds one that can be trusted at now.
+func recordedFirstSeen(rec episodeRecord, key, uid string, now time.Time) (time.Time, bool) {
+	entry, ok := rec.Episodes[key]
+	if !ok || entry.UID != uid || entry.FirstSeen <= 0 {
+		return time.Time{}, false
+	}
+	// A first observation further in the future than the skew allows is not
+	// one this clock made, so the episode starts again rather than trusting
+	// it. One within the skew is trusted, and Elapsed reads zero until the
+	// clock reaches it, so the handover can only come later than it would
+	// have.
+	first := time.Unix(entry.FirstSeen, 0)
+	if firstSeenAhead(first, now) {
+		return time.Time{}, false
+	}
+	return first, true
+}
+
+// firstSeenAhead reports whether a first observation is further ahead of now
+// than endpointcache.FutureSkew. The record keeps whole seconds, and two
+// processes read the clock at slightly different moments, so an entry another
+// process has just written can sit a moment ahead of this one's clock.
+func firstSeenAhead(first, now time.Time) bool {
+	return first.After(now.Add(endpointcache.FutureSkew))
 }
 
 // readEpisodeRecord reads the record through the private-file checks. A missing

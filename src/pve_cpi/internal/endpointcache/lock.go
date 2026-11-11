@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -35,6 +36,26 @@ var ErrLockReplaced = errors.New("endpoint cache: lock file kept changing while 
 // ErrLockWaitAbandoned means the caller's context ended while a cache lock
 // wait was running. The returned error also wraps the context's own error.
 var ErrLockWaitAbandoned = errors.New("endpoint cache: lock wait ended with the caller's context")
+
+// LockFile takes the exclusive lock on the lock file name in r for a store
+// called label that keeps its own file in a cache directory, so processes that
+// read, change, and write that file take turns. It uses the same lock as the
+// endpoint cache's key files: the lock file is a private file that the first
+// caller creates, a lock on an inode the name no longer reaches is taken
+// again, and a kept lock has its times updated. The wait is bounded by wait
+// within ctx. A wait that runs out returns an error that names label and says
+// the lock is busy, and one that ctx ends returns ErrLockWaitAbandoned under
+// label's name. The caller closes the returned lock.
+func LockFile(ctx context.Context, r *os.Root, name, label string, wait time.Duration) (*privatefile.Lock, error) {
+	t := textsFor(label)
+	waitCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	lock, err := t.waitHeldLock(waitCtx, r, name)
+	if err != nil {
+		return nil, t.lockWaitError(ctx, err, fmt.Errorf("%w: %s", t.lockBusy, name))
+	}
+	return lock, nil
+}
 
 // waitHeldLock waits within ctx for the exclusive lock on name, then confirms
 // it with heldLock.

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -52,9 +53,10 @@ func TestEpisodeStore_FirstObservationStartsTheClockAndIsRemembered(t *testing.T
 	if fileInfo.Mode().Perm() != 0o600 {
 		t.Errorf("record mode = %04o, want 0600", fileInfo.Mode().Perm())
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil || len(entries) != 1 {
-		t.Errorf("the directory holds %v, %v, want only the record and no temporary file", entries, err)
+	names, err := readNames(dir)
+	if err != nil || len(names) != 2 || names[0] != "ha-recovery-episodes.json" ||
+		names[1] != "ha-recovery-episodes.lock" {
+		t.Errorf("the directory holds %v, %v, want only the record and its lock, and no temporary file", names, err)
 	}
 
 	clk.t = clk.t.Add(7 * time.Minute)
@@ -357,7 +359,8 @@ func TestEpisodeStore_FutureFirstObservationRestartsTheClock(t *testing.T) {
 		t.Fatal(err)
 	}
 	if ep.Recorded || ep.Elapsed() != 0 {
-		t.Fatalf("a first observation ahead of the clock must not count: recorded=%v elapsed=%s", ep.Recorded, ep.Elapsed())
+		t.Fatalf("a first observation ahead of the clock must not count: recorded=%v elapsed=%s",
+			ep.Recorded, ep.Elapsed())
 	}
 }
 
@@ -695,6 +698,128 @@ func TestEpisodeStore_AFutureEntryIsPrunedWhenAnotherServiceIsObserved(t *testin
 	}
 	if ep.Recorded {
 		t.Fatal("an entry first seen in the future must be pruned by the next write")
+	}
+}
+
+// Two observations that change the record at once must both land. The second
+// starts while the first is about to write, and it either waits for the lock
+// or, without one, writes first and has its entry dropped by the first's
+// write.
+func TestEpisodeStore_ConcurrentObservationsKeepEachOthersEpisodes(t *testing.T) {
+	t.Parallel()
+	store, _, _ := newEpisodeStore(t)
+	other := *store
+	done := make(chan error, 1)
+	var once sync.Once
+	ha.SetEpisodeBeforeWrite(store, func() {
+		once.Do(func() {
+			go func() {
+				_, err := other.Observe("vm:102", "uid-b")
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				done <- err
+			case <-time.After(200 * time.Millisecond):
+			}
+		})
+	})
+	if _, err := store.Observe("vm:101", "uid-a"); err != nil {
+		t.Fatalf("first observation: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("second observation: %v", err)
+	}
+
+	for _, ep := range []struct{ sid, uid string }{{"vm:101", "uid-a"}, {"vm:102", "uid-b"}} {
+		got, err := other.Observe(ep.sid, ep.uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.Recorded {
+			t.Errorf("%s: the episode was dropped by the observation that wrote at the same time", ep.sid)
+		}
+	}
+}
+
+// A lock that another process holds past the wait leaves a new episode
+// unrecorded with its clock starting now, and the error says the lock is busy.
+// An episode that is already recorded needs no change, so it still answers.
+func TestEpisodeStore_ABusyLockStartsTheClockNowAndRecordedEpisodesStillAnswer(t *testing.T) {
+	t.Parallel()
+	store, clk, dir := newEpisodeStore(t)
+	if _, err := store.Observe("vm:101", "uid-a"); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(dir, "ha-recovery-episodes.lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_RDWR, 0) //nolint:gosec // test-owned path
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lockFile.Close() })
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+
+	clk.t = clk.t.Add(time.Minute)
+	recorded, err := store.Observe("vm:101", "uid-a")
+	if err != nil || !recorded.Recorded || recorded.Elapsed() != time.Minute {
+		t.Fatalf("a recorded episode: recorded=%v elapsed=%s err=%v, want recorded, 1m, and no error",
+			recorded.Recorded, recorded.Elapsed(), err)
+	}
+	fresh, err := store.Observe("vm:102", "uid-b")
+	if err == nil || !strings.Contains(err.Error(), "busy") || !strings.Contains(err.Error(), ha.EpisodeName) {
+		t.Fatalf("want a busy lock error that names the record, got %v", err)
+	}
+	if fresh.Recorded || fresh.Elapsed() != 0 {
+		t.Fatalf("a new episode under a busy lock: recorded=%v elapsed=%s, want its clock starting now",
+			fresh.Recorded, fresh.Elapsed())
+	}
+}
+
+// Another process reads the clock a moment apart from this one, and the record
+// keeps whole seconds, so an entry a little ahead of this clock is kept and
+// trusted. One further ahead than endpointcache.FutureSkew is still pruned.
+func TestEpisodeStore_AnEntryWithinTheSkewIsKeptAndTrusted(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		ahead time.Duration
+		kept  bool
+	}{
+		{time.Second, true},
+		{endpointcache.FutureSkew, true},
+		{endpointcache.FutureSkew + time.Second, false},
+	} {
+		t.Run(tc.ahead.String(), func(t *testing.T) {
+			t.Parallel()
+			store, clk, _ := newEpisodeStore(t)
+			ahead := *store
+			ahead.Now = func() time.Time { return clk.t.Add(tc.ahead) }
+			if _, err := ahead.Observe("vm:101", "uid-a"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Observe("vm:102", "uid-b"); err != nil {
+				t.Fatal(err)
+			}
+			ep, err := ahead.Observe("vm:101", "uid-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ep.Recorded != tc.kept {
+				t.Fatalf("an entry %s ahead: kept=%v after another write, want %v", tc.ahead, ep.Recorded, tc.kept)
+			}
+			if !tc.kept {
+				return
+			}
+			again, err := store.Observe("vm:101", "uid-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !again.Recorded || again.Elapsed() != 0 || !again.FirstSeen.Equal(clk.t.Add(tc.ahead)) {
+				t.Fatalf("an entry %s ahead: recorded=%v elapsed=%s first=%s, want it trusted with no time elapsed",
+					tc.ahead, again.Recorded, again.Elapsed(), again.FirstSeen)
+			}
+		})
 	}
 }
 
