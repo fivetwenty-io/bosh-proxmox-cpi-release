@@ -13,12 +13,8 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 )
-
-// endpointCacheSiblingName is the directory beside the journal that the endpoint cache uses
-// when it exists. The runtime never creates it, so this command does. It must match
-// endpointcache.JournalSiblingName, which the runtime layer reads.
-const endpointCacheSiblingName = "endpoint-cache"
 
 // provisionDirectory is a seam so tests can see the path and owner each provisioning call receives.
 var provisionDirectory = allocationjournal.ProvisionDirectory
@@ -113,10 +109,10 @@ func runProvisionJournal(args []string, stdout, stderr io.Writer) int {
 // endpoint-cache, because the two names would collide. The comparison is exact on purpose. Production hosts
 // are case-sensitive Linux filesystems, and a journal named Endpoint-Cache is a different directory there.
 func endpointCacheSibling(journal string) (string, bool) {
-	if filepath.Base(journal) == endpointCacheSiblingName {
+	if filepath.Base(journal) == endpointcache.JournalSiblingName {
 		return "", false
 	}
-	return filepath.Join(filepath.Dir(journal), endpointCacheSiblingName), true
+	return filepath.Join(filepath.Dir(journal), endpointcache.JournalSiblingName), true
 }
 
 // provisionEndpointCacheSibling provisions the endpoint cache directory beside a journal directory that
