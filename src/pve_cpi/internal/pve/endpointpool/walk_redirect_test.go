@@ -87,7 +87,8 @@ func TestRedirectFollowUpIsRefused(t *testing.T) {
 func mustRefuseRedirect(t *testing.T, method string, status int, secure bool) {
 	t.Helper()
 	l := newLab(t)
-	targetURL, hits := "", func() int32 { return 0 }
+	var targetURL string
+	var hits func() int32
 	if secure {
 		other := l.live(t, nil)
 		targetURL, hits = other.URL, other.Counts.Requests.Load
