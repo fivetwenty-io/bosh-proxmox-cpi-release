@@ -2,9 +2,11 @@ package handlers
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -677,6 +679,133 @@ func TestSettleMigrationSettlesAPlannedLockStepFirst(t *testing.T) {
 	assertMigrationSettlementEvidence(t, c, before, record)
 	if lines := settleMigrationWarnings(c.logged.String()); len(lines) != 1 {
 		t.Fatalf("settle-migration logged %d settlement WARNs, want one", len(lines))
+	}
+}
+
+// stageCreateVMRecord gives the journal the VM record a create_vm leaves when
+// its persistent disk's attach fails after the disk's lifecycle changed
+// something: the record created VM 777 on n1, planned the handoff of the case's
+// disk, and requires reconciliation. VM 777 carries the record's allocation
+// marker and a bosh_disk_opt_overlays entry for the disk's serial, and
+// nothing else in its description: no drive with the serial, no disk
+// provenance, and no tags. It returns the VM record's ID.
+func (c *settleMigrationCase) stageCreateVMRecord(t *testing.T) string {
+	t.Helper()
+	disk := c.record(t)
+	plan, err := activeStorageAllocationPlan(disk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const agent = "vm-agent"
+	plan.AllocationKey = agent
+	intent := disk.Intent
+	if intent.Plan, err = json.Marshal(plan); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := c.journal.AcquireVM(c.ctx, agent, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vmID := handle.Record().ID
+	root, err := storageMutationIntent(handle, "vm."+managedVMCallCreate, aj.Target{Node: "n1", VMID: 777}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upid := "UPID:n1:00001234:00005678:6734ABCD:qmcreate:777:root@pam:"
+	if err := storageMutationSubmitted(handle, root, upid); err != nil {
+		t.Fatal(err)
+	}
+	if err := storageMutationObserved(handle, root, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte(c.cid))
+	handoff := fmt.Sprintf("%s%x", managedVMPersistentHandoffPrefix, digest)
+	if _, err := storageMutationIntent(handle, handoff, aj.Target{Node: "n1", VMID: 777}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// attachPersistent poisons the VM allocation this way. The error it
+	// returns is the Director's, and the state check below proves the save.
+	_ = storageAllocationUncertain(handle, "persistent disk attachment")
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	overlays, err := json.Marshal(map[string]map[string]string{disk.DiskToken: {"discard": "on"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	description, err := pve.RenderSentinel(strings.TrimSpace(moveMarker(t, vmID, agent)),
+		map[string]json.RawMessage{pve.DiskOptOverlaysSentinelKey: overlays})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.client.state.configs[777]["description"] = description
+	delete(c.client.state.configs[777], "tags")
+
+	vm, err := c.journal.Inspect(vmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned := 0
+	for _, step := range vm.Steps {
+		if step.Kind == handoff && step.State == aj.Planned && cleanupPersistentHandoffStep(step, vm) {
+			planned++
+		}
+	}
+	if vm.Kind != "vm" || vm.State != aj.ReconciliationRequired || planned != 1 {
+		t.Fatalf("VM record = %s %s with %d planned handoff steps, want a vm in reconciliation_required with one",
+			vm.Kind, vm.State, planned)
+	}
+	return vmID
+}
+
+// TestSettleMigrationPassesTheAuditBesideTheCreateVMRecord settles the
+// migrate step while the journal also holds the record of the create_vm whose
+// persistent attach ran the migration, as the incident's journal does. That
+// VM record requires reconciliation with its disk handoff planned, and its
+// live VM carries the record's marker and an overlay note for the disk's
+// serial. The journal-wide audit sees the VM record, raises no conflict and
+// no issue for it, and the settlement goes through without touching the VM or
+// its record.
+func TestSettleMigrationPassesTheAuditBesideTheCreateVMRecord(t *testing.T) {
+	c := newSettleMigrationCase(t, true)
+	vmID := c.stageCreateVMRecord(t)
+	vmBefore, err := c.journal.Inspect(vmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := maps.Clone(c.client.state.configs[777])
+
+	report, err := AuditStorageAllocations(c.ctx, c.deps, c.journal, c.nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := false
+	for _, evidence := range report.Evidence {
+		seen = seen || evidence.AllocationID == vmID && evidence.Kind == "vm" && evidence.Node == "n1" &&
+			evidence.VMID == 777
+	}
+	if !seen {
+		t.Fatalf("the audit never saw VM 777's marker for allocation %s: %+v", vmID, report.Evidence)
+	}
+	if err := storageAuditGateError(c.ctx, c.deps, "migration settlement", report, storageAuditGateAll); err != nil {
+		t.Fatalf("the audit gate refused beside the create_vm record: %s; conflicts %q, issues %q, VM-scan issues %q",
+			StorageAllocationDecisionFailure(err), report.Conflicts, report.Issues, report.VMScanIssues)
+	}
+
+	before := c.record(t)
+	mutations := c.mutations()
+	if _, err := c.settle(c.decision()); err != nil {
+		t.Fatalf("settle-migration beside the create_vm record = %s", StorageAllocationDecisionFailure(err))
+	}
+	if c.mutations() != mutations {
+		t.Fatalf("settle-migration changed PVE: %v, was %v", c.mutations(), mutations)
+	}
+	assertMigrationSettled(t, c, before, c.record(t))
+	if vmAfter, err := c.journal.Inspect(vmID); err != nil || !reflect.DeepEqual(vmAfter, vmBefore) {
+		t.Fatalf("settle-migration changed the create_vm record (%v)", err)
+	}
+	if !reflect.DeepEqual(c.client.state.configs[777], config) {
+		t.Fatalf("settle-migration changed VM 777: %v, was %v", c.client.state.configs[777], config)
 	}
 }
 
