@@ -2253,7 +2253,7 @@ The line is at Warn, and it appears once each time the active endpoint changes.
 
 **Diagnosis**
 
-The first endpoint could not serve the request, so the pool sent it to the next one and kept that one active for the rest of the call. Most often the endpoint failed before a connection existed. A read can also move on after a response-header timeout, a transport error, or a 502, 503, or 595 answer. The text in parentheses is the failure, and the `class` field names it, which is `dial`, `dns`, `tls_handshake`, `tls_verify`, `pin`, `header_deadline`, `transport`, or `status`. A node that is being upgraded or rebooted produces this line, and it is the pool doing its job.
+The first endpoint could not serve the request, so the pool sent it to the next one and kept that one active for the rest of the call. Most often the endpoint failed before a connection existed. A read can also move on after a response-header timeout, a transport error, or a 502, 503, or 595 answer. The text in parentheses is the failure, and the `class` field names it, which is `dial`, `dns`, `tls_handshake`, `tls_verify`, `pin`, `header_deadline`, `transport`, `status`, or `request`. A node that is being upgraded or rebooted produces this line, and it is the pool doing its job.
 
 **Fix**
 
@@ -2344,7 +2344,7 @@ We keep the log and report it as a bug.
 **Symptom**
 
 ```text
-no Proxmox endpoint answered (pve1:8006: dial tcp 192.0.2.11:8006: i/o timeout; pve2:8006: dial tcp 192.0.2.12:8006: connect: connection refused; pve3:8006: net/http: TLS handshake timeout)
+no Proxmox endpoint answered (pve1:8006: connect phase dial failed for pve1:8006: dial tcp 192.0.2.11:8006: i/o timeout; pve2:8006: connect phase dial failed for pve2:8006: dial tcp 192.0.2.12:8006: connect: connection refused; pve3:8006: connect phase tls_handshake failed for pve3:8006: net/http: TLS handshake timeout)
 ```
 
 This text arrives through the call's own error at Error level. A walk that has nothing to try says `no Proxmox endpoint was eligible to try`.
@@ -2457,7 +2457,7 @@ pve endpoint pve1:8006: the first-answer hook panicked, so discovery may not sta
 
 **Diagnosis**
 
-The first panic of each kind of hook in a call is at Warn, and later ones of that kind are at Debug. The pool recovered, so the request was not affected. The cost is a refused candidate, a down mark that was not written, or a discovery refresh that did not start.
+The first panic of each kind of hook in a pool's life, which is one CPI call, is at Warn, and later ones of that kind are at Debug. The pool recovered, so the request was not affected. The cost is a refused candidate, a down mark that was not written, or a discovery refresh that did not start.
 
 **Fix**
 

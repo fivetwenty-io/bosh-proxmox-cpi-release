@@ -35,7 +35,7 @@ The first hits any API call. The second is specific to `POST /access/ticket` —
 When you list more than one endpoint, a fourth shape appears. A walk over the list that reached no endpoint ends with one error that names each endpoint and its cause.
 
 ```
-no Proxmox endpoint answered (pve1:8006: dial timeout; pve2:8006: connection refused)
+no Proxmox endpoint answered (pve1:8006: connect phase dial failed for pve1:8006: dial tcp 192.0.2.11:8006: i/o timeout; pve2:8006: connect phase dial failed for pve2:8006: dial tcp 192.0.2.12:8006: connect: connection refused)
 ```
 
 The substring detector `pve.IsTransientTransport` covers all four (plus generic `*ConnectionError` and any 5xx). The fourth is recognized as a connection error, because the walk's error unwraps to a single dial error. It is the one error in the list that tells you about more than one node at a time.
@@ -185,7 +185,7 @@ pve: retrying after retryable fault op=create_disk reason=storage_lock attempt=3
 When the pool holds more than one endpoint, a retry can also follow a Warn line from the failover transport.
 
 ```
-pve endpoint failover: pve1:8006 unreachable (dial tcp: i/o timeout), request sent to pve2:8006, which stays active for this call
+pve endpoint failover: pve1:8006 unreachable (dial tcp 192.0.2.11:8006: i/o timeout), request sent to pve2:8006, which stays active for this call
 ```
 
 That line means one node was unreachable and the call moved to another. It is not a retry, and the call usually succeeds without one. [PVE Endpoint Failover and Discovery](endpoint-failover.md#log-lines) lists every failover line with its level.

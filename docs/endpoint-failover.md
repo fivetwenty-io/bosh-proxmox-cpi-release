@@ -44,7 +44,7 @@ We recommend API tokens for every deployment that uses failover. A token is a he
 
 ## How a call walks the list
 
-The CPI installs the failover transport whenever the pool holds more than one endpoint. A pool of one endpoint keeps the SDK's own transport, so it has no dial deadline and no header deadline, exactly as before.
+The CPI installs the failover transport when the pool holds more than one endpoint, and also when discovery is in effect, so the transport sees the first answered request even if the pool starts with one endpoint. A client with neither keeps the SDK's own transport, so it has no dial deadline and no header deadline, exactly as before.
 
 The transport sorts each request into one of four kinds before it does anything else.
 
@@ -140,7 +140,7 @@ The final hop of a walk is the fourth one or the hop to the last eligible endpoi
 When every hop of a walk fails in the connect phase or on the header deadline, the walk returns one error that lists each endpoint with its cause, in the order tried.
 
 ```
-no Proxmox endpoint answered (pve1:8006: dial timeout; pve2:8006: connection refused; pve3:8006: i/o timeout)
+no Proxmox endpoint answered (pve1:8006: connect phase dial failed for pve1:8006: dial tcp 192.0.2.11:8006: i/o timeout; pve2:8006: connect phase dial failed for pve2:8006: dial tcp 192.0.2.12:8006: connect: connection refused; pve3:8006: connect phase tls_handshake failed for pve3:8006: net/http: TLS handshake timeout)
 ```
 
 That error unwraps to a single dial error, so the SDK's own retry stops at once and the CPI's retry helpers treat it as a transient connection fault. The one exception is a walk in which every hop failed certificate verification. That walk surfaces the certificate errors, and the SDK reports them as it did before the pool existed, without retrying.
@@ -528,13 +528,13 @@ If an accepted candidate later fails TLS verification, the pool revokes it and l
 
 | Event | Level | Text | Frequency |
 |---|---|---|---|
-| Failover to a candidate | Warn | `pve endpoint failover: pve1:8006 unreachable (dial tcp: i/o timeout) and no cached nodes, request sent to pve2.dc1.example.com:8006 from placement.az_map after it proved membership` | Once per change of the active endpoint. |
+| Failover to a candidate | Warn | `pve endpoint failover: pve1:8006 unreachable (dial tcp 192.0.2.11:8006: i/o timeout) and no cached nodes, request sent to pve2.dc1.example.com:8006 from placement.az_map after it proved membership` | Once per change of the active endpoint. |
 | A configured endpoint takes over again | Warn | `pve endpoint failover: pve1:8006 is used again, so requests go to it again rather than to the cold-start candidate pve2.dc1.example.com:8006 from placement.az_map` | Once per change of the active endpoint. |
 | A candidate was refused | Debug under `auto`, Warn under `on` | `pve endpoint pve3.dc1.example.com:8006 from placement.az_map refused: certificate is not valid for that name` | Once per candidate per call. |
 | A candidate was revoked | Error | `pve endpoint pve2.dc1.example.com:8006: the cold-start candidate for node pve2 from placement.az_map failed TLS verification (x509: certificate signed by unknown authority); this can mean interception; the pool no longer sends to it` | Once per candidate per call. |
 | The cold start begins | Debug | `pve endpoints: no configured endpoint could connect, so this request tries the cold-start candidates from placement.az_map` | Once per run. |
 | No cold start for this call | Debug | `pve endpoints: no cold start from placement.az_map, because the cache holds usable discovered nodes or its last discovery found a standalone host` | Once per call that has `az_map` names and a cache that rules it out. |
-| Cold start barred for a request | Debug | `pve endpoints: no configured endpoint could connect, and DELETE /pools/... does not start the cold start from placement.az_map, because it carries a send-by deadline` | Once per request. |
+| Cold start barred for a request | Debug | `pve endpoints: no configured endpoint could connect, and DELETE /pools does not start the cold start from placement.az_map, because it carries a send-by deadline` | Once per request. |
 | A cold-start hint could not be recorded | The failure level | `endpoint cache: the cold-start hint could not be recorded` | Once per hint whose write fails. |
 
 ## VIP and IP seeds
@@ -614,7 +614,7 @@ The release that rolls back cleanly is 0.9.6, and a rollback to it meets these f
   The 0.9.6 job spec does not define `pve.endpoints`, `pve.api_endpoint_discovery`, or `pve.endpoint_cache_dir`, so its template never reads them.
 
 - Cache files stay behind
-  The 0.9.6 release never reads them. Files in the temporary directory disappear with the ephemeral disk, and the `endpoint-cache` directory beside a journal stays on the persistent disk, where 0.9.6 never looks at it. You can delete either one. If you upgrade again with the same credential, the files are still valid.
+  The 0.9.6 release never reads them. Files in the temporary directory disappear with the ephemeral disk, and the `endpoint-cache` directory beside a journal stays on the persistent disk, where 0.9.6 never looks at it. You can delete either one. If you upgrade again with the same credential, any files that remain are still valid, though the sweep that removes files unmodified for 30 days may already have taken some of them.
 
 ## Log lines
 
@@ -626,9 +626,9 @@ An upgraded deployment with one `pve.host` and a healthy node logs nothing new a
 |---|---|---|---|
 | Pool built | Debug | `pve endpoints: pool [pve1:8006 configured, pve2:8006 configured], starting on pve1:8006` | Once per call. The line lists each endpoint with its kind, and it ends `, with N cold-start candidates from placement.az_map` when the pool carries candidates. |
 | Started away from the first endpoint | Info | `pve endpoints: starting on pve2:8006 because pve1:8006 was marked down 40s ago` | Once per call, and only while a down mark is in effect. |
-| Failover | Warn | `pve endpoint failover: pve1:8006 unreachable (dial tcp: i/o timeout), request sent to pve2:8006, which stays active for this call` | Once per change of the active endpoint. An upload that only advances the endpoint for the next request reads `, next request goes to pve2:8006`. |
+| Failover | Warn | `pve endpoint failover: pve1:8006 unreachable (dial tcp 192.0.2.11:8006: i/o timeout), request sent to pve2:8006, which stays active for this call` | Once per change of the active endpoint. An upload that only advances the endpoint for the next request reads `, next request goes to pve2:8006`. |
 | Configured endpoint failed verification | Error | `pve endpoint pve2:8006: TLS verification failed (x509: certificate is valid for pve2, not pve2.lan); this can mean interception; trying the next endpoint` | Once per endpoint per call. The text ends `no other endpoint is tried for this request` when the request does not move on. |
-| Every endpoint failed | Error, through the call's own error | `no Proxmox endpoint answered (pve1:8006: dial timeout; pve2:8006: connection refused)` | Per failed call. |
+| Every endpoint failed | Error, through the call's own error | `no Proxmox endpoint answered (pve1:8006: connect phase dial failed for pve1:8006: dial tcp 192.0.2.11:8006: i/o timeout; pve2:8006: connect phase dial failed for pve2:8006: dial tcp 192.0.2.12:8006: connect: connection refused)` | Per failed call. |
 | Pool refused its own transport | Error | `pve endpoint pve2:8006: the pool refused to send through its transport (owned transport asked to dial another address: pve3:8006); this is a defect in the endpoint pool; trying the next endpoint` | Once per address for the life of the pool, and only after a defect, with `endpoint`, `class`, and `error` as fields. |
 | Mutation tethered | Debug | `pve endpoints: POST /nodes/n3/qemu/101/clone may have reached pve2:8006; retries stay on pve2:8006` | Once per tether. For a family, the text ends `ha mutations stay on pve2:8006` and names the family. |
 | Send-by refused | Debug | `pve endpoints: DELETE /pools not sent, send-by deadline passed` | Once per refusal, with `method` and `path` as fields. |

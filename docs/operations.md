@@ -1025,7 +1025,7 @@ Rolling back to 0.9.6 from the release that adds endpoint lists meets four facts
 
 3. Cache files stay behind.
 
-   The older release never reads them. Files in the temporary directory disappear with the ephemeral disk, and the `endpoint-cache` directory beside the allocation journal stays on the persistent disk where the older release never looks. We can delete either one. If we upgrade again with the same credential, the files are still valid.
+   The older release never reads them. Files in the temporary directory disappear with the ephemeral disk, and the `endpoint-cache` directory beside the allocation journal stays on the persistent disk where the older release never looks. We can delete either one. If we upgrade again with the same credential, any files that remain are still valid, though the sweep that removes files unmodified for 30 days may already have taken some of them.
 
 4. The guard on removed HA keys plays no part.
 
