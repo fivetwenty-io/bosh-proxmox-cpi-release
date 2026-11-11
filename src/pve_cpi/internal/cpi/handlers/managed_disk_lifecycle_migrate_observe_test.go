@@ -225,3 +225,84 @@ func TestObserveMigration_RefusesASerialOnTwoSlots(t *testing.T) {
 		t.Fatalf("observeMigration = %v, want the ambiguous identity refusal", err)
 	}
 }
+
+// deletion is the observation of the step that deleted the holder on n1.
+func (c *migratedHolderCase) deletion() managedDiskMutationObservation {
+	return managedDiskMutationObservation{node: "n1", vmid: migratedHolderVMID}
+}
+
+// deleteHolder removes the holder from every member.
+func (c *migratedHolderCase) deleteHolder() {
+	delete(c.client.state.configs, migratedHolderVMID)
+	delete(c.client.vmNodes, migratedHolderVMID)
+}
+
+// TestObserveHolderDeletion_AcceptsTheMissingConfigAnswer observes a deleted
+// holder whose recorded node answers the config read with PVE's real 500 for
+// a configuration file that is gone, and then with a plain 404. The probe of
+// every member finds the holder nowhere in both rows.
+func TestObserveHolderDeletion_AcceptsTheMissingConfigAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		answer error
+	}{
+		{"pmxcfs 500", errGuardSiteConfigGone},
+		{"404", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newMigratedHolderCase(t)
+			c.deleteHolder()
+			if tc.answer != nil {
+				c.answerOn("n1", tc.answer)
+			}
+			volumes, err := c.guard.observeHolderDeletion(c.ctx, c.deletion())
+			if err != nil {
+				t.Fatalf("observeHolderDeletion: %v", err)
+			}
+			if len(volumes) != 1 || volumes[0] != c.volume {
+				t.Fatalf("observed volumes = %v, want the recorded volume %s", volumes, c.volume)
+			}
+		})
+	}
+}
+
+// TestObserveHolderDeletion_RefusesAHolderThatIsNotProvenGone refuses when
+// the recorded node fails with a 500 that doesn't say the configuration file
+// is gone, when the recorded node answers empty but the probe finds the holder
+// on another member, and when the probe can't finish.
+func TestObserveHolderDeletion_RefusesAHolderThatIsNotProvenGone(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(c *migratedHolderCase)
+	}{
+		{"another 500", func(c *migratedHolderCase) {
+			c.deleteHolder()
+			c.answerOn("n1", errMigrateSourceTimeout)
+		}},
+		// The holder moved to n2 rather than being deleted.
+		{"probe hit on another node after a 404", func(*migratedHolderCase) {}},
+		{"probe hit on another node after a pmxcfs 500", func(c *migratedHolderCase) {
+			c.answerOn("n1", errGuardSiteConfigGone)
+		}},
+		{"probe error", func(c *migratedHolderCase) {
+			c.deleteHolder()
+			c.answerOn("n1", errGuardSiteConfigGone)
+			previous := c.client.onNodeConfigRead
+			c.client.onNodeConfigRead = func(node string, vmid int) error {
+				if node == "n2" && vmid == migratedHolderVMID {
+					return errMigrateSourceTimeout
+				}
+				return previous(node, vmid)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newMigratedHolderCase(t)
+			tc.setup(c)
+			if _, err := c.guard.observeHolderDeletion(c.ctx, c.deletion()); err == nil ||
+				!strings.Contains(err.Error(), "temporary holder deletion is not observed") {
+				t.Fatalf("observeHolderDeletion = %v, want the deletion refusal", err)
+			}
+		})
+	}
+}

@@ -932,8 +932,17 @@ func (g *managedDiskLifecycleGuard) observeHolderDeletion(ctx context.Context, o
 	m := g.lifecycle
 	volumes := make([]string, 1, 2)
 	volumes[0] = g.lifecycle.disk.volid
+	// PVE answers a config read for a VM that isn't on the addressed node with
+	// either a 404 or a 500 saying the configuration file does not exist. Both
+	// prove the recorded node empty. A holder that moved rather than being
+	// deleted still has a config on another member, so the probe of every
+	// member has to come back empty too.
 	cfg, err := m.deps.PVE.QEMU().Config(ctx, observation.node, observation.vmid)
-	if err == nil || !pve.IsNotFound(err) || cfg != nil {
+	if cfg != nil || err == nil || !configReadAnswered(err) {
+		return nil, fmt.Errorf("temporary holder deletion is not observed")
+	}
+	location, err := pve.FindVMByConfigProbe(ctx, m.deps.PVE, observation.vmid)
+	if err != nil || location.Found {
 		return nil, fmt.Errorf("temporary holder deletion is not observed")
 	}
 
