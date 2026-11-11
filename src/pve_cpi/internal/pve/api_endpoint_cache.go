@@ -208,7 +208,7 @@ func openEndpointCache(cfg *config.CPIConfig, plan *endpointPlan, logger *log.Lo
 		}
 	}
 
-	worker, err := NewDiscoveryWorker(DiscoveryWorkerConfig{Store: store, Mode: configured, Logger: logger})
+	worker, err := newDiscoveryWorker(DiscoveryWorkerConfig{Store: store, Mode: configured, Logger: logger})
 	if err != nil {
 		cache.release()
 		return off(fmt.Sprintf("the discovery worker could not be built: %v", err))
@@ -442,7 +442,7 @@ func (c *endpointCache) bind(client Client, pool *endpointpool.Pool) {
 			"api endpoint discovery: the client has no endpoint pool, so discovery does not run")
 		return
 	}
-	if err := c.worker.Bind(DiscoveryBinding{Client: client, Pool: pool}); err != nil {
+	if err := c.worker.bind(DiscoveryBinding{Client: client, Pool: pool}); err != nil {
 		c.logger.LogAttrs(context.Background(), log.LevelDebug, "api endpoint discovery: bind the worker",
 			log.Err(err))
 	}

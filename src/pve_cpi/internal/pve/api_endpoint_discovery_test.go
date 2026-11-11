@@ -211,12 +211,12 @@ func (e *workerEnv) openStore() *endpointcache.Store {
 
 func (e *workerEnv) newWorker() *DiscoveryWorker {
 	e.t.Helper()
-	w, err := NewDiscoveryWorker(DiscoveryWorkerConfig{
+	w, err := newDiscoveryWorker(DiscoveryWorkerConfig{
 		Store: e.store, Mode: e.mode, Logger: e.logger, Resolver: e.resolver.resolve,
 		Registry: e.registry, Now: e.clock.Now,
 	})
 	if err != nil {
-		e.t.Fatalf("NewDiscoveryWorker: %v", err)
+		e.t.Fatalf("newDiscoveryWorker: %v", err)
 	}
 	return w
 }
@@ -259,7 +259,7 @@ func (e *workerEnv) run(prepare ...func(*DiscoveryWorker)) {
 	for _, p := range prepare {
 		p(w)
 	}
-	if err := w.Bind(e.binding()); err != nil {
+	if err := w.bind(e.binding()); err != nil {
 		e.t.Fatalf("Bind: %v", err)
 	}
 	w.FirstAnswer(workerSeed)
@@ -678,7 +678,7 @@ func TestDiscoveryWorker_LogLevels(t *testing.T) {
 		e := newWorkerEnv(t, workerEnvOptions{seed: "pve1.lan:8006"})
 		e.begin()
 		w := e.newWorker()
-		if err := w.Bind(e.binding()); err != nil {
+		if err := w.bind(e.binding()); err != nil {
 			t.Fatal(err)
 		}
 		w.FirstAnswer("pve1.lan:8006")
@@ -1069,10 +1069,10 @@ func TestDiscoveryWorker_StartsOnceAndAfterBind(t *testing.T) {
 	t.Parallel()
 	e := newWorkerEnv(t, workerEnvOptions{})
 	w := e.newWorker()
-	// An answer before Bind is kept, and Bind starts its refresh.
+	// An answer before bind is kept, and bind starts its refresh.
 	w.FirstAnswer(workerSeed)
 	w.FirstAnswer(workerSeed)
-	if err := w.Bind(e.binding()); err != nil {
+	if err := w.bind(e.binding()); err != nil {
 		t.Fatal(err)
 	}
 	w.FirstAnswer(workerSeed)
@@ -1080,21 +1080,21 @@ func TestDiscoveryWorker_StartsOnceAndAfterBind(t *testing.T) {
 	if total, _, kinds := e.reqs.snapshot(); total == 0 || kinds["nodes"] != 1 {
 		t.Fatalf("the worker sent %v, want one refresh", kinds)
 	}
-	if err := w.Bind(e.binding()); !errors.Is(err, errDiscoveryWorkerBound) {
+	if err := w.bind(e.binding()); !errors.Is(err, errDiscoveryWorkerBound) {
 		t.Fatalf("a second Bind returned %v", err)
 	}
 }
 
 func TestDiscoveryWorker_RefusesBadInput(t *testing.T) {
 	t.Parallel()
-	if _, err := NewDiscoveryWorker(DiscoveryWorkerConfig{}); !errors.Is(err, errDiscoveryWorkerStore) {
+	if _, err := newDiscoveryWorker(DiscoveryWorkerConfig{}); !errors.Is(err, errDiscoveryWorkerStore) {
 		t.Fatalf("a worker without a store returned %v", err)
 	}
 	e := newWorkerEnv(t, workerEnvOptions{})
-	if err := e.newWorker().Bind(DiscoveryBinding{Pool: e.pool}); !errors.Is(err, errDiscoveryWorkerClient) {
+	if err := e.newWorker().bind(DiscoveryBinding{Pool: e.pool}); !errors.Is(err, errDiscoveryWorkerClient) {
 		t.Fatalf("a binding without a client returned %v", err)
 	}
-	if err := e.newWorker().Bind(DiscoveryBinding{Client: markedClient(e.cluster, e.reqs)}); !errors.Is(err,
+	if err := e.newWorker().bind(DiscoveryBinding{Client: markedClient(e.cluster, e.reqs)}); !errors.Is(err,
 		errDiscoveryWorkerPool) {
 		t.Fatalf("a binding without a pool returned %v", err)
 	}
@@ -1104,7 +1104,7 @@ func TestDiscoveryWorker_RefusesBadInput(t *testing.T) {
 	t.Run("an endpoint outside the key", func(t *testing.T) {
 		e.begin()
 		w := e.newWorker()
-		if err := w.Bind(e.binding()); err != nil {
+		if err := w.bind(e.binding()); err != nil {
 			t.Fatal(err)
 		}
 		w.FirstAnswer("pve9.dc1.example.com:8006")
@@ -1117,7 +1117,7 @@ func TestDiscoveryWorker_RefusesBadInput(t *testing.T) {
 	t.Run("a closed registry", func(t *testing.T) {
 		e.begin()
 		w := e.newWorker()
-		if err := w.Bind(e.binding()); err != nil {
+		if err := w.bind(e.binding()); err != nil {
 			t.Fatal(err)
 		}
 		e.registry.Drain(context.Background(), 0)
@@ -1276,7 +1276,7 @@ func TestDiscoveryWorker_ChecksAgainUnderTheDiscoverLock(t *testing.T) {
 		return false
 	}}
 	w := e.newWorker()
-	if err := w.Bind(b); err != nil {
+	if err := w.bind(b); err != nil {
 		t.Fatal(err)
 	}
 	w.FirstAnswer(workerSeed)
@@ -1313,7 +1313,7 @@ func TestDiscoveryWorker_IdentityRefusalDropsThePoolsDiscoveredEndpoints(t *test
 	t.Cleanup(pool.CloseIdleConnections)
 	e.begin()
 	w := e.newWorker()
-	if err := w.Bind(DiscoveryBinding{Client: markedClient(e.cluster, e.reqs), Pool: pool}); err != nil {
+	if err := w.bind(DiscoveryBinding{Client: markedClient(e.cluster, e.reqs), Pool: pool}); err != nil {
 		t.Fatal(err)
 	}
 	w.FirstAnswer(workerSeed)

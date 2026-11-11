@@ -186,7 +186,7 @@ type Stored struct {
 // missing. Merge returns a nil payload, and no error, when there is nothing to
 // write, which is a change that records nothing into a missing file.
 //
-// The merge keeps the newer mark per endpoint, drops marks that are MarkTTL
+// The merge keeps the newer mark per endpoint, drops marks that are markTTL
 // old, and drops marks for endpoints the pool no longer holds, which are the
 // key's endpoints, the nodes of the merged file, and change.Pool. It keeps the
 // mark of every configured endpoint and at most MaxOtherMarks others, newest
@@ -708,7 +708,7 @@ func (s *Store) ReadPayload(now time.Time, azNodes []string) (*Payload, []Drop, 
 	if err != nil {
 		return nil, nil, err
 	}
-	valid, found := ForReader(valid, azNodes)
+	valid, found := forReader(valid, azNodes)
 	return valid, append(drops, found...), nil
 }
 

@@ -1021,7 +1021,7 @@ func TestFirstAnswerHookHandsTheRefreshToAWorkerAndReturns(t *testing.T) {
 		return fmt.Errorf("the test refuses the read")
 	}
 	client := blockedReadsClient(block)
-	if err := got.cache.worker.Bind(DiscoveryBinding{Client: client, Pool: &discPool{}}); err != nil {
+	if err := got.cache.worker.bind(DiscoveryBinding{Client: client, Pool: &discPool{}}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 	returned := make(chan struct{})

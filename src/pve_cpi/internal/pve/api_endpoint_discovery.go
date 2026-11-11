@@ -121,10 +121,10 @@ type DiscoveryBinding struct {
 // inside the store's locked update with the store's clock, and logs the
 // discovery lines. A DiscoveryWorker is safe for concurrent use.
 //
-// The client builds a worker with NewDiscoveryWorker, hands it to the pool as
+// The client builds a worker with newDiscoveryWorker, hands it to the pool as
 // endpointpool.Config.FirstAnswer, builds the client on that pool, and then
-// calls Bind with the client and the pool. A first answer that arrives before
-// Bind is kept, and Bind starts its refresh.
+// calls bind with the client and the pool. A first answer that arrives before
+// bind is kept, and bind starts its refresh.
 type DiscoveryWorker struct {
 	store    *endpointcache.Store
 	mode     config.DiscoveryMode
@@ -147,9 +147,9 @@ type DiscoveryWorker struct {
 // The worker is the pool's first-answer hook.
 var _ endpointpool.FirstAnswerHook = (*DiscoveryWorker)(nil)
 
-// NewDiscoveryWorker returns a worker for the store's key. It refuses a nil
+// newDiscoveryWorker returns a worker for the store's key. It refuses a nil
 // store.
-func NewDiscoveryWorker(cfg DiscoveryWorkerConfig) (*DiscoveryWorker, error) {
+func newDiscoveryWorker(cfg DiscoveryWorkerConfig) (*DiscoveryWorker, error) {
 	if cfg.Store == nil {
 		return nil, errDiscoveryWorkerStore
 	}
@@ -165,7 +165,7 @@ func NewDiscoveryWorker(cfg DiscoveryWorkerConfig) (*DiscoveryWorker, error) {
 		w.logger = log.NewNopLogger()
 	}
 	if w.resolver == nil {
-		w.resolver = LookupHostResolver(nil)
+		w.resolver = lookupHostResolver(nil)
 	}
 	if cfg.Registry != nil {
 		w.start = cfg.Registry.Go
@@ -176,10 +176,10 @@ func NewDiscoveryWorker(cfg DiscoveryWorkerConfig) (*DiscoveryWorker, error) {
 	return w, nil
 }
 
-// Bind gives the worker the client and the pool. It refuses a binding without
+// bind gives the worker the client and the pool. It refuses a binding without
 // a client, one without a pool, and a second binding. When a configured
-// endpoint already answered, Bind starts the refresh that answer asked for.
-func (w *DiscoveryWorker) Bind(b DiscoveryBinding) error {
+// endpoint already answered, bind starts the refresh that answer asked for.
+func (w *DiscoveryWorker) bind(b DiscoveryBinding) error {
 	if b.Client == nil {
 		return errDiscoveryWorkerClient
 	}
@@ -207,7 +207,7 @@ func (w *DiscoveryWorker) Bind(b DiscoveryBinding) error {
 // FirstAnswer starts the refresh on its own goroutine and returns at once. The
 // pool calls it once, with the canonical host:port of the configured endpoint
 // that answered, and the worker starts at most one refresh whatever the number
-// of calls. Before Bind it only keeps the endpoint.
+// of calls. Before bind it only keeps the endpoint.
 func (w *DiscoveryWorker) FirstAnswer(endpoint string) {
 	if w == nil {
 		return
@@ -362,7 +362,7 @@ func (w *DiscoveryWorker) discover(ctx context.Context, via string, b DiscoveryB
 		w.recordFailure(ctx, via, err)
 		return
 	}
-	result, err := BuildDiscoveryResult(requests, reads, DiscoveryInput{
+	result, err := buildDiscoveryResult(requests, reads, DiscoveryInput{
 		Seed:       key.Endpoints[0],
 		Configured: key.Endpoints,
 		Resolver:   w.resolver,

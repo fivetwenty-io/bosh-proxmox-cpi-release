@@ -68,24 +68,24 @@ func StrictDecode(data []byte, out any) error {
 	return nil
 }
 
-// ReadRetries bounds how many times ReadEnvelope reopens a file whose inode
+// readRetries bounds how many times ReadEnvelope reopens a file whose inode
 // was replaced between the lstat and the fstat inside Open. A concurrent
 // atomic rename is exactly what WriteEnvelope is built to do, so a reader
 // losing that race is ordinary and deserves another look rather than a
 // reconciliation record. Writers hold the exclusive lock and are not exposed
 // this way. The bound keeps a genuinely unstable file from spinning: after
 // this many losses the Changed error is returned to the caller unchanged.
-const ReadRetries = 3
+const readRetries = 3
 
 // ReadFile opens name under the private-file rules and returns its bytes. A
 // file longer than limit is refused as corrupt, and a file replaced during the
-// open is reopened up to ReadRetries times before the Changed error comes back.
+// open is reopened up to readRetries times before the Changed error comes back.
 func (p Policy) ReadFile(r *os.Root, name string, limit int) ([]byte, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("%s: size limit not set", p.label())
 	}
 	f, err := p.Open(r, name, os.O_RDONLY)
-	for attempt := 0; attempt < ReadRetries && errors.Is(err, p.changed()); attempt++ {
+	for attempt := 0; attempt < readRetries && errors.Is(err, p.changed()); attempt++ {
 		f, err = p.Open(r, name, os.O_RDONLY)
 	}
 	if err != nil {

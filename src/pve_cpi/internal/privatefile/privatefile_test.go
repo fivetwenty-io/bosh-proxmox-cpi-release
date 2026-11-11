@@ -952,8 +952,8 @@ func TestReadRetriesAReplacedFileThenReturnsChanged(t *testing.T) {
 			if !errors.Is(err, tc.changed) || !strings.Contains(err.Error(), "private file changed during open") {
 				t.Fatalf("ReadEnvelope = %v; want the unchanged Changed error", err)
 			}
-			if opens != ReadRetries+1 {
-				t.Fatalf("opens = %d; want the first try plus %d retries", opens, ReadRetries)
+			if opens != readRetries+1 {
+				t.Fatalf("opens = %d; want the first try plus %d retries", opens, readRetries)
 			}
 
 			// A reader that loses the race once reads the new file.

@@ -84,7 +84,7 @@ func ptr[T any](v T) *T { return &v }
 
 func TestMergeDropsMarksThatExpired(t *testing.T) {
 	stored := &Payload{Key: mergeKey(), Marks: map[string]DownMark{
-		mergeSeed: {DownAt: payloadNow.Add(-MarkTTL - time.Second), Class: MarkDial},
+		mergeSeed: {DownAt: payloadNow.Add(-markTTL - time.Second), Class: MarkDial},
 	}}
 	// A change that holds something else keeps the file, and the stale mark is gone.
 	next := mustMerge(t, stored, Change{Hint: &ColdStartHint{Name: "pve2", ProbedAt: payloadNow}})

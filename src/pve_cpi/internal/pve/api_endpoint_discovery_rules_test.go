@@ -52,12 +52,12 @@ func waitFor(t *testing.T, ch <-chan struct{}, what string) {
 // from now.
 func (e *workerEnv) workerWithClock(now func() time.Time) *DiscoveryWorker {
 	e.t.Helper()
-	w, err := NewDiscoveryWorker(DiscoveryWorkerConfig{
+	w, err := newDiscoveryWorker(DiscoveryWorkerConfig{
 		Store: e.store, Mode: e.mode, Logger: e.logger, Resolver: e.resolver.resolve,
 		Registry: e.registry, Now: now,
 	})
 	if err != nil {
-		e.t.Fatalf("NewDiscoveryWorker: %v", err)
+		e.t.Fatalf("newDiscoveryWorker: %v", err)
 	}
 	return w
 }
@@ -67,7 +67,7 @@ func (e *workerEnv) workerWithClock(now func() time.Time) *DiscoveryWorker {
 func (e *workerEnv) startWorker(w *DiscoveryWorker, answer string) {
 	e.t.Helper()
 	e.begin()
-	if err := w.Bind(e.binding()); err != nil {
+	if err := w.bind(e.binding()); err != nil {
 		e.t.Fatalf("Bind: %v", err)
 	}
 	w.FirstAnswer(answer)
@@ -126,7 +126,7 @@ func TestDiscoveryWorker_StoreClosedAfterTheDrainIsNotARaceOrAWarn(t *testing.T)
 				fn(ctx)
 			})
 		}
-		if err := w.Bind(binding); err != nil {
+		if err := w.bind(binding); err != nil {
 			t.Fatal(err)
 		}
 		e.begin()
@@ -197,7 +197,7 @@ func TestDiscoveryWorker_HoldsTheDiscoverLockWhileTheReadsRun(t *testing.T) {
 	binding, entered := gatedBinding(e, gate)
 	e.begin()
 	w := e.newWorker()
-	if err := w.Bind(binding); err != nil {
+	if err := w.bind(binding); err != nil {
 		t.Fatal(err)
 	}
 	w.FirstAnswer(workerSeed)
@@ -233,7 +233,7 @@ func TestDiscoveryWorker_FirstAnswerDoesNotWaitForTheRefresh(t *testing.T) {
 	binding, entered := gatedBinding(e, gate)
 	e.begin()
 	w := e.newWorker()
-	if err := w.Bind(binding); err != nil {
+	if err := w.bind(binding); err != nil {
 		t.Fatal(err)
 	}
 	returned := make(chan struct{})
@@ -493,7 +493,7 @@ func TestDiscoveryWorker_ClockStepBackKeepsTheFailureLevelSteady(t *testing.T) {
 	}
 }
 
-// An answer after Bind starts one refresh, whatever the number of answers.
+// An answer after bind starts one refresh, whatever the number of answers.
 func TestDiscoveryWorker_StartsOneRefreshForManyAnswers(t *testing.T) {
 	t.Parallel()
 	e := newWorkerEnv(t, workerEnvOptions{})
@@ -504,7 +504,7 @@ func TestDiscoveryWorker_StartsOneRefreshForManyAnswers(t *testing.T) {
 	}
 	e.begin()
 	w := e.newWorker()
-	if err := w.Bind(e.binding()); err != nil {
+	if err := w.bind(e.binding()); err != nil {
 		t.Fatal(err)
 	}
 	for range 3 {
@@ -591,7 +591,7 @@ func TestDiscoveryWorker_FailedRefreshLogsTheRecordsTheUpdateLeftOut(t *testing.
 	e.wantLine("endpoint cache: records left out", log.LevelDebug)
 }
 
-// An answer that arrives before Bind is kept, and Bind alone starts its
+// An answer that arrives before bind is kept, and bind alone starts its
 // refresh. No later answer is needed.
 func TestDiscoveryWorker_BindStartsTheRefreshOfAnEarlierAnswer(t *testing.T) {
 	t.Parallel()
@@ -599,7 +599,7 @@ func TestDiscoveryWorker_BindStartsTheRefreshOfAnEarlierAnswer(t *testing.T) {
 	w := e.newWorker()
 	w.FirstAnswer(workerSeed)
 	e.begin()
-	if err := w.Bind(e.binding()); err != nil {
+	if err := w.bind(e.binding()); err != nil {
 		t.Fatal(err)
 	}
 	e.drain()

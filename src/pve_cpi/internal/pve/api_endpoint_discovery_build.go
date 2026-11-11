@@ -143,7 +143,7 @@ type DiscoveryInput struct {
 	ResolveTimeout time.Duration
 }
 
-// BuildDiscoveryResult turns the reads into a result. It makes no API call
+// buildDiscoveryResult turns the reads into a result. It makes no API call
 // and writes nothing, and its only effect outside the arguments is the
 // resolver the caller injected.
 //
@@ -169,7 +169,7 @@ type DiscoveryInput struct {
 // member offline, so those results keep every node in name order and report
 // none of them online. Without a status the order uses the /nodes status
 // field.
-func BuildDiscoveryResult(ctx context.Context, reads DiscoveryReads, in DiscoveryInput) (DiscoveryResult, error) {
+func buildDiscoveryResult(ctx context.Context, reads DiscoveryReads, in DiscoveryInput) (DiscoveryResult, error) {
 	if ctx == nil {
 		return DiscoveryResult{}, errors.New("discovery: ctx must not be nil")
 	}
@@ -424,9 +424,9 @@ func resolvesWithin(
 	}
 }
 
-// LookupHostResolver returns a NameResolver that asks r, or the default
+// lookupHostResolver returns a NameResolver that asks r, or the default
 // resolver when r is nil, and counts a name with no address as a failure.
-func LookupHostResolver(r *net.Resolver) NameResolver {
+func lookupHostResolver(r *net.Resolver) NameResolver {
 	if r == nil {
 		r = net.DefaultResolver
 	}

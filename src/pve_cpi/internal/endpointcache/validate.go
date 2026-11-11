@@ -86,7 +86,7 @@ func (d Drop) String() string { return d.Record + " dropped: " + string(d.Reason
 // key, at time now. It returns a copy that holds only what a reader may use
 // now, along with the records it dropped. It does not look at the reader's
 // az_map, because a writer keeps a hint that another entry sharing the key
-// wrote. See ForReader for that check.
+// wrote. See forReader for that check.
 //
 // A payload is unusable, and Validate returns ErrPayloadInvalid, when its key
 // differs from key (ErrKeyMismatch), when a node name fails the pve-node
@@ -103,9 +103,9 @@ func (d Drop) String() string { return d.Record + " dropped: " + string(d.Reason
 // and port are not what the key's seed derives for its name, when a node's
 // confirmation is more than NodeTTL old or more than FutureSkew ahead, when a
 // node's derived address is one of the key's configured endpoints, when a
-// mark is older than MarkTTL, ahead, or names something that is not an
+// mark is older than markTTL, ahead, or names something that is not an
 // endpoint or a class that is not enumerated, when observed_via names an
-// endpoint outside the key, and when the hint is older than HintTTL or ahead.
+// endpoint outside the key, and when the hint is older than hintTTL or ahead.
 // A discovery whose own time is ahead is dropped whole, a next-refresh time
 // further ahead than MaxRefreshWait is dropped so the refresh is due now, and
 // a pin_failed_at more than FutureSkew ahead is dropped so it counts for
@@ -192,12 +192,12 @@ func readStored(p *Payload, key Key, now time.Time) (storedState, []Drop, error)
 	return state, drops, nil
 }
 
-// ForReader applies the one check that depends on the reader: a hint whose
+// forReader applies the one check that depends on the reader: a hint whose
 // node the reader's az_map does not name is dropped and the rest of the file
 // stands, because two entries that reach one cluster share a key and can carry
 // different placement. azNodes are the node names of the reader's effective
 // az_map, compared exactly. p is not changed.
-func ForReader(p *Payload, azNodes []string) (*Payload, []Drop) {
+func forReader(p *Payload, azNodes []string) (*Payload, []Drop) {
 	if p == nil || p.ColdStart == nil || slices.Contains(azNodes, p.ColdStart.Name) {
 		return p, nil
 	}
@@ -467,7 +467,7 @@ func validatePins(pins []string) ([]string, error) {
 }
 
 // validateMarks keeps the marks that name an endpoint, carry an enumerated
-// class, are not ahead of now, and are younger than MarkTTL. Keys are
+// class, are not ahead of now, and are younger than markTTL. Keys are
 // normalized, and two spellings of one endpoint keep the newer mark.
 func validateMarks(marks map[string]DownMark, now time.Time, drops []Drop) (map[string]DownMark, []Drop) {
 	if len(marks) == 0 {
@@ -484,7 +484,7 @@ func validateMarks(marks map[string]DownMark, now time.Time, drops []Drop) (map[
 		case mark.DownAt.After(now.Add(FutureSkew)):
 			drops = append(drops, Drop{Record: "mark", Reason: DropFuture})
 			continue
-		case now.Sub(mark.DownAt) >= MarkTTL:
+		case now.Sub(mark.DownAt) >= markTTL:
 			drops = append(drops, Drop{Record: "mark", Reason: DropExpired})
 			continue
 		}
@@ -513,7 +513,7 @@ func normalizeMarkEndpoint(endpoint string) (string, bool) {
 
 // validateHint checks a cold-start hint. A name that fails the pve-node format
 // makes the file unusable, and a name a resolver could misread, a hint that is
-// ahead of now, and a hint that is HintTTL old or older drop the hint alone.
+// ahead of now, and a hint that is hintTTL old or older drop the hint alone.
 func validateHint(h ColdStartHint, now time.Time) (*ColdStartHint, []Drop, error) {
 	if err := ValidateNodeName(h.Name); err != nil {
 		if errors.Is(err, ErrNodeNameAmbiguous) {
@@ -524,7 +524,7 @@ func validateHint(h ColdStartHint, now time.Time) (*ColdStartHint, []Drop, error
 	switch {
 	case h.ProbedAt.After(now.Add(FutureSkew)):
 		return nil, []Drop{{Record: "cold_start", Reason: DropFuture}}, nil
-	case now.Sub(h.ProbedAt) >= HintTTL:
+	case now.Sub(h.ProbedAt) >= hintTTL:
 		return nil, []Drop{{Record: "cold_start", Reason: DropExpired}}, nil
 	}
 	return &ColdStartHint{Name: h.Name, ProbedAt: h.ProbedAt.UTC()}, nil, nil

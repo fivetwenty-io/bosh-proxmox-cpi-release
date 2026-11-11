@@ -259,7 +259,7 @@ func TestValidateDropsMarksThatAreOldAheadOrMalformed(t *testing.T) {
 	}{
 		{"just now", DownMark{DownAt: payloadNow, Class: MarkDial}, ""},
 		{"119 seconds old", DownMark{DownAt: payloadNow.Add(-119 * time.Second), Class: MarkDNS}, ""},
-		{"two minutes old", DownMark{DownAt: payloadNow.Add(-MarkTTL), Class: MarkDial}, DropExpired},
+		{"two minutes old", DownMark{DownAt: payloadNow.Add(-markTTL), Class: MarkDial}, DropExpired},
 		{"an hour old", DownMark{DownAt: payloadNow.Add(-time.Hour), Class: MarkPin}, DropExpired},
 		{"zero time", DownMark{Class: MarkDial}, DropExpired},
 		{"30 seconds ahead", DownMark{DownAt: payloadNow.Add(FutureSkew), Class: MarkTLSVerify}, ""},
@@ -318,7 +318,7 @@ func TestValidateBoundsTheHint(t *testing.T) {
 	}{
 		{"probed now", payloadNow, ""},
 		{"59 minutes old", payloadNow.Add(-59 * time.Minute), ""},
-		{"an hour old", payloadNow.Add(-HintTTL), DropExpired},
+		{"an hour old", payloadNow.Add(-hintTTL), DropExpired},
 		{"a day old", payloadNow.Add(-24 * time.Hour), DropExpired},
 		{"30 seconds ahead", payloadNow.Add(FutureSkew), ""},
 		{"31 seconds ahead", payloadNow.Add(31 * time.Second), DropFuture},
@@ -725,7 +725,7 @@ func TestForReaderDropsTheHintAloneWhenTheMapDoesNotNameIt(t *testing.T) {
 	p.ColdStart = &ColdStartHint{Name: "pve3", ProbedAt: payloadNow}
 	before := p.clone()
 
-	got, drops := ForReader(p, []string{"pve1", "pve2"})
+	got, drops := forReader(p, []string{"pve1", "pve2"})
 	if got.ColdStart != nil {
 		t.Error("the hint stayed although the map does not name its node")
 	}
@@ -736,28 +736,28 @@ func TestForReaderDropsTheHintAloneWhenTheMapDoesNotNameIt(t *testing.T) {
 		t.Errorf("drops %v", drops)
 	}
 	if !reflect.DeepEqual(p, before) {
-		t.Error("ForReader changed its input")
+		t.Error("forReader changed its input")
 	}
 
-	if got, drops := ForReader(p, []string{"pve1", "pve3"}); got.ColdStart == nil || len(drops) != 0 {
+	if got, drops := forReader(p, []string{"pve1", "pve3"}); got.ColdStart == nil || len(drops) != 0 {
 		t.Errorf("a hint the map names was dropped: %+v, %v", got, drops)
 	}
-	if got, _ := ForReader(p, nil); got.ColdStart != nil {
+	if got, _ := forReader(p, nil); got.ColdStart != nil {
 		t.Error("an empty map names no hint")
 	}
 	// The comparison is exact, so a hint matches only a node the map names in
 	// the same spelling.
 	lower := payloadFor(payloadTestKey(), "pve2")
 	lower.ColdStart = &ColdStartHint{Name: "pve2", ProbedAt: payloadNow}
-	if got, drops := ForReader(lower, []string{"PVE2"}); got.ColdStart != nil ||
+	if got, drops := forReader(lower, []string{"PVE2"}); got.ColdStart != nil ||
 		!reflect.DeepEqual(drops, []Drop{{Record: "cold_start", Reason: DropNotInAZMap}}) {
 		t.Errorf("a hint named pve2 under a map naming PVE2: %+v, %v", got.ColdStart, drops)
 	}
 	noHint := payloadFor(payloadTestKey(), "pve2")
-	if got, drops := ForReader(noHint, nil); got != noHint || len(drops) != 0 {
+	if got, drops := forReader(noHint, nil); got != noHint || len(drops) != 0 {
 		t.Errorf("a payload with no hint changed: %+v, %v", got, drops)
 	}
-	if got, drops := ForReader(nil, nil); got != nil || len(drops) != 0 {
+	if got, drops := forReader(nil, nil); got != nil || len(drops) != 0 {
 		t.Errorf("a nil payload: %+v, %v", got, drops)
 	}
 }

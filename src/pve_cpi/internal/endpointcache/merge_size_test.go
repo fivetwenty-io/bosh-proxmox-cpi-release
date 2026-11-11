@@ -56,7 +56,7 @@ func newLargestLegal(t *testing.T) largestLegal {
 	marks := make(map[string]DownMark)
 	var newestFirst []string
 	mark := func(endpoint string) {
-		// One second apart keeps every mark inside MarkTTL and gives each its own
+		// One second apart keeps every mark inside markTTL and gives each its own
 		// place in the order.
 		marks[endpoint] = DownMark{
 			DownAt: at.Add(-time.Duration(len(newestFirst)) * time.Second),

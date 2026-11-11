@@ -16,12 +16,12 @@ const (
 	// endpoint when the file would pass its size cap.
 	MaxOtherMarks = 64
 
-	// MarkTTL is how long a down mark counts. A mark that is this old or older
+	// markTTL is how long a down mark counts. A mark that is this old or older
 	// is dropped.
-	MarkTTL = 2 * time.Minute
-	// HintTTL is how long a cold-start hint counts, measured from its probe. A
+	markTTL = 2 * time.Minute
+	// hintTTL is how long a cold-start hint counts, measured from its probe. A
 	// hint that is this old or older is dropped.
-	HintTTL = time.Hour
+	hintTTL = time.Hour
 	// NodeTTL is how long a discovered node stays loaded without a discovery
 	// through a configured endpoint confirming it.
 	NodeTTL = 24 * time.Hour

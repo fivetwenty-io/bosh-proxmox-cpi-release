@@ -63,7 +63,7 @@ func payloadTestKey() Key {
 	return Key{
 		Endpoints:    []string{"pve1.dc1.example.com:8006"},
 		VerifySSL:    true,
-		CASHA256:     SystemCA,
+		CASHA256:     systemCA,
 		CredentialID: "1f6a09c2e4b7d385",
 	}
 }
@@ -186,8 +186,8 @@ func TestBoundsAreTheSpecsValues(t *testing.T) {
 		name      string
 		got, want time.Duration
 	}{
-		{"MarkTTL", MarkTTL, 2 * time.Minute},
-		{"HintTTL", HintTTL, time.Hour},
+		{"markTTL", markTTL, 2 * time.Minute},
+		{"hintTTL", hintTTL, time.Hour},
 		{"NodeTTL", NodeTTL, 24 * time.Hour},
 		{"MaxRefreshWait", MaxRefreshWait, 24 * time.Hour},
 		{"FutureSkew", FutureSkew, 30 * time.Second},

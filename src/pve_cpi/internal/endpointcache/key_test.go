@@ -184,8 +184,8 @@ func TestKeyNormalizesEndpointsAndKeepsTheirOrder(t *testing.T) {
 	if strings.Join(key.Endpoints, ",") != strings.Join(want, ",") {
 		t.Errorf("endpoints %v, want %v", key.Endpoints, want)
 	}
-	if key.CASHA256 != SystemCA {
-		t.Errorf("ca_sha256 %q, want %q with no CA", key.CASHA256, SystemCA)
+	if key.CASHA256 != systemCA {
+		t.Errorf("ca_sha256 %q, want %q with no CA", key.CASHA256, systemCA)
 	}
 	same, _ := mustDerive(t, KeyConfig{Endpoints: want, User: storeTestUser}, secret, storeTestCredential)
 	if !same.Equal(key) || same.Digest() != key.Digest() {
@@ -252,8 +252,8 @@ func TestKeyDigestCoversEveryField(t *testing.T) {
 }
 
 func TestKeyCanonicalIsUnambiguous(t *testing.T) {
-	a := Key{Endpoints: []string{"a:1", "b:2"}, CASHA256: SystemCA, CredentialID: "00"}
-	b := Key{Endpoints: []string{"a:1\"\n\"b:2"}, CASHA256: SystemCA, CredentialID: "00"}
+	a := Key{Endpoints: []string{"a:1", "b:2"}, CASHA256: systemCA, CredentialID: "00"}
+	b := Key{Endpoints: []string{"a:1\"\n\"b:2"}, CASHA256: systemCA, CredentialID: "00"}
 	c := Key{Endpoints: []string{"a:1"}, CASHA256: "b:2", CredentialID: "00"}
 	if a.Canonical() == b.Canonical() || a.Canonical() == c.Canonical() || b.Canonical() == c.Canonical() {
 		t.Error("two different keys share a canonical string")

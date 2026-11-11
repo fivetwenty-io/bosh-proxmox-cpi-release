@@ -88,9 +88,9 @@ func TestBuildDiscoveryResult_FullReadWithFQDNSeed(t *testing.T) {
 		Status: quorateStatus("pve1", "pve1", "pve2", "pve3"),
 		RootCA: discRoot,
 	}
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
+	result, err := buildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
 	if err != nil {
-		t.Fatalf("BuildDiscoveryResult: %v", err)
+		t.Fatalf("buildDiscoveryResult: %v", err)
 	}
 	if result.Outcome != DiscoveryOK || !result.Quorate || result.RootCA != discRoot {
 		t.Fatalf("result = %+v, want ok, quorate, with the root", result)
@@ -119,7 +119,7 @@ func TestBuildDiscoveryResult_BareAndIPSeedsDeriveBareNames(t *testing.T) {
 		RootCA: discRoot,
 	}
 	for _, seed := range []string{"pve1:8443", "192.0.2.10:8443", "[2001:db8::10]:8443"} {
-		result, err := BuildDiscoveryResult(context.Background(), reads, discInput(seed, acceptAll))
+		result, err := buildDiscoveryResult(context.Background(), reads, discInput(seed, acceptAll))
 		if err != nil {
 			t.Fatalf("seed %s: %v", seed, err)
 		}
@@ -138,7 +138,7 @@ func TestBuildDiscoveryResult_PublicSuffixSeedGetsNoNodes(t *testing.T) {
 	}
 	seeds := []string{"pve1.example.co.uk", "pve1.dyndns.org", "pve1.lan", "pve1.sch.uk"}
 	for _, seed := range seeds {
-		result, err := BuildDiscoveryResult(context.Background(), reads, discInput(seed+":8006", acceptAll))
+		result, err := buildDiscoveryResult(context.Background(), reads, discInput(seed+":8006", acceptAll))
 		if err != nil {
 			t.Fatalf("seed %s: %v", seed, err)
 		}
@@ -160,7 +160,7 @@ func TestBuildDiscoveryResult_PublicSuffixSeedGetsNoNodes(t *testing.T) {
 			t.Fatalf("seed %s: the identity must still be recorded", seed)
 		}
 	}
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("example.co.uk:8006", acceptAll))
+	result, err := buildDiscoveryResult(context.Background(), reads, discInput("example.co.uk:8006", acceptAll))
 	if err != nil || result.Outcome != DiscoveryPublicSuffix {
 		t.Fatalf("seed example.co.uk: outcome %q, err %v, want public_suffix", result.Outcome, err)
 	}
@@ -174,7 +174,7 @@ func TestBuildDiscoveryResult_SeedThatIsNotANameGetsNoCandidates(t *testing.T) {
 		RootCA: discRoot,
 	}
 	for _, seed := range []string{"10.1:8006", "pve1.123:8006"} {
-		result, err := BuildDiscoveryResult(context.Background(), reads, discInput(seed, acceptAll))
+		result, err := buildDiscoveryResult(context.Background(), reads, discInput(seed, acceptAll))
 		if err != nil {
 			t.Fatalf("seed %s: %v", seed, err)
 		}
@@ -194,7 +194,7 @@ func TestBuildDiscoveryResult_SeedWithoutAPortOrHostIsAnInputError(t *testing.T)
 	// A seed always carries a port, so one without is a caller bug that must
 	// not be recorded as an outcome.
 	for _, seed := range []string{"pve1", "pve1.dc1.example.com", "", ":8006", "[2001:db8::10]", "pve1:8006:9"} {
-		result, err := BuildDiscoveryResult(context.Background(), reads, discInput(seed, acceptAll))
+		result, err := buildDiscoveryResult(context.Background(), reads, discInput(seed, acceptAll))
 		if !errors.Is(err, ErrDiscoveryInput) || result.Outcome != "" || len(result.Nodes) != 0 {
 			t.Fatalf("seed %q: result %+v err %v, want ErrDiscoveryInput and no result", seed, result, err)
 		}
@@ -210,9 +210,9 @@ func TestBuildDiscoveryResult_NoStatusOrdersByNodesStatus(t *testing.T) {
 		},
 		RootCA: discRoot,
 	}
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
+	result, err := buildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
 	if err != nil {
-		t.Fatalf("BuildDiscoveryResult: %v", err)
+		t.Fatalf("buildDiscoveryResult: %v", err)
 	}
 	if result.Outcome != DiscoveryNoStatus || result.Quorate {
 		t.Fatalf("outcome %q quorate %v, want no_status and not quorate", result.Outcome, result.Quorate)
@@ -241,9 +241,9 @@ func TestBuildDiscoveryResult_QuorateOrdersOnlineFirstInNameOrder(t *testing.T) 
 		Status: status,
 		RootCA: discRoot,
 	}
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
+	result, err := buildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
 	if err != nil {
-		t.Fatalf("BuildDiscoveryResult: %v", err)
+		t.Fatalf("buildDiscoveryResult: %v", err)
 	}
 	if got, want := nodeNames(result.Nodes), []string{"pve3", "pve5", "pve2", "pve4"}; !slices.Equal(got, want) {
 		t.Fatalf("nodes = %v, want the online nodes first, in name order", got)
@@ -265,9 +265,9 @@ func TestBuildDiscoveryResult_NonQuorateStatusKeepsNameOrder(t *testing.T) {
 		Status: status,
 		RootCA: discRoot,
 	}
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
+	result, err := buildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
 	if err != nil {
-		t.Fatalf("BuildDiscoveryResult: %v", err)
+		t.Fatalf("buildDiscoveryResult: %v", err)
 	}
 	if result.Outcome != DiscoveryOK || result.Quorate {
 		t.Fatalf("outcome %q quorate %v, want ok and not quorate", result.Outcome, result.Quorate)
@@ -307,13 +307,13 @@ func TestBuildDiscoveryResult_OnlineFlagIsTheFlagTheOrderUsed(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			reads := DiscoveryReads{Nodes: nodes, Status: tc.status, RootCA: discRoot}
-			result, err := BuildDiscoveryResult(
+			result, err := buildDiscoveryResult(
 				context.Background(),
 				reads,
 				discInput("pve1.dc1.example.com:8006", acceptAll),
 			)
 			if err != nil {
-				t.Fatalf("BuildDiscoveryResult: %v", err)
+				t.Fatalf("buildDiscoveryResult: %v", err)
 			}
 			if len(result.Nodes) != len(tc.want) {
 				t.Fatalf("nodes = %v, want %d", nodeNames(result.Nodes), len(tc.want))
@@ -334,9 +334,9 @@ func TestBuildDiscoveryResult_StandaloneHost(t *testing.T) {
 		Status: DiscoveryStatus{Available: true, Local: "pve1", Online: map[string]bool{"pve1": true}},
 		RootCA: discRoot,
 	}
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
+	result, err := buildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
 	if err != nil {
-		t.Fatalf("BuildDiscoveryResult: %v", err)
+		t.Fatalf("buildDiscoveryResult: %v", err)
 	}
 	if result.Outcome != DiscoveryStandalone || len(result.Nodes) != 0 || result.RootCA != discRoot {
 		t.Fatalf("result = %+v, want standalone with no nodes and the identity", result)
@@ -344,7 +344,7 @@ func TestBuildDiscoveryResult_StandaloneHost(t *testing.T) {
 	// Several nodes in /nodes contradict a status with no cluster row, so the
 	// claim of a standalone host does not stand.
 	reads.Nodes = append(reads.Nodes, discNode("pve2", "online"))
-	result, err = BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
+	result, err = buildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
 	if err != nil || result.Outcome != DiscoveryOK || len(result.Nodes) != 1 {
 		t.Fatalf("contradicting reads: outcome %q, %d nodes, err %v", result.Outcome, len(result.Nodes), err)
 	}
@@ -355,7 +355,7 @@ func TestBuildDiscoveryResult_StandaloneNeedsASuccessfulStatus(t *testing.T) {
 	// A failed status read next to one node says nothing about a cluster, so
 	// it must not be reported as a standalone host.
 	reads := DiscoveryReads{Nodes: []DiscoveryNodeRead{discNode("pve1", "online")}, RootCA: discRoot}
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
+	result, err := buildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
 	if err != nil || result.Outcome == DiscoveryStandalone || result.Outcome != DiscoveryNoCandidates {
 		t.Fatalf("outcome %q err %v, want no_candidates and not standalone", result.Outcome, err)
 	}
@@ -367,7 +367,7 @@ func TestBuildDiscoveryResult_LoneNodeWithoutStatusIsTheSeedsNode(t *testing.T) 
 	// of one row can only be that node, whatever form the seed takes.
 	reads := DiscoveryReads{Nodes: []DiscoveryNodeRead{discNode("pve1", "online")}, RootCA: discRoot}
 	for _, seed := range []string{"192.0.2.10:8006", "other.example.com:8006", "pve1.dc1.example.com:8006"} {
-		result, err := BuildDiscoveryResult(context.Background(), reads, discInput(seed, acceptAll))
+		result, err := buildDiscoveryResult(context.Background(), reads, discInput(seed, acceptAll))
 		if err != nil || result.Outcome != DiscoveryNoCandidates || len(result.Nodes) != 0 {
 			t.Fatalf(
 				"seed %s: outcome %q, %d nodes, err %v, want no_candidates",
@@ -385,7 +385,7 @@ func TestBuildDiscoveryResult_LoneNodeWithoutStatusIsTheSeedsNode(t *testing.T) 
 	}
 	// Two rows leave the rule alone.
 	reads.Nodes = append(reads.Nodes, discNode("pve2", "online"))
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("192.0.2.10:8006", acceptAll))
+	result, err := buildDiscoveryResult(context.Background(), reads, discInput("192.0.2.10:8006", acceptAll))
 	if err != nil || result.Outcome != DiscoveryNoStatus || len(result.Nodes) != 2 {
 		t.Fatalf(
 			"two rows: outcome %q, %d nodes, err %v, want no_status with both",
@@ -403,7 +403,7 @@ func TestBuildDiscoveryResult_SingleNodeClusterHasNoCandidates(t *testing.T) {
 		Status: quorateStatus("pve1", "pve1"),
 		RootCA: discRoot,
 	}
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
+	result, err := buildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
 	if err != nil || result.Outcome != DiscoveryNoCandidates {
 		t.Fatalf("outcome %q err %v, want no_candidates", result.Outcome, err)
 	}
@@ -454,7 +454,7 @@ func TestBuildDiscoveryResult_NoResultFailures(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			result, err := BuildDiscoveryResult(
+			result, err := buildDiscoveryResult(
 				context.Background(),
 				tc.reads(),
 				discInput("pve1.dc1.example.com:8006", tc.resolver),
@@ -471,7 +471,7 @@ func TestBuildDiscoveryResult_NoResultFailures(t *testing.T) {
 		})
 	}
 	var noContext context.Context
-	if _, err := BuildDiscoveryResult(noContext, good, discInput("pve1.dc1.example.com:8006", acceptAll)); err == nil {
+	if _, err := buildDiscoveryResult(noContext, good, discInput("pve1.dc1.example.com:8006", acceptAll)); err == nil {
 		t.Fatal("a nil context must fail")
 	}
 }
@@ -486,9 +486,9 @@ func TestBuildDiscoveryResult_AmbiguousNameLeavesOnlyThatNodeOut(t *testing.T) {
 		Status: quorateStatus("pve1", "pve1", "pve2"),
 		RootCA: discRoot,
 	}
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
+	result, err := buildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
 	if err != nil {
-		t.Fatalf("BuildDiscoveryResult: %v", err)
+		t.Fatalf("buildDiscoveryResult: %v", err)
 	}
 	if got := nodeNames(result.Nodes); !slices.Equal(got, []string{"pve2"}) {
 		t.Fatalf("nodes = %v, want pve2 alone", got)
@@ -513,9 +513,9 @@ func TestBuildDiscoveryResult_FingerprintProblemsLeaveTheNodeOut(t *testing.T) {
 		Status: quorateStatus("pve1", "pve1", "pve5"),
 		RootCA: discRoot,
 	}
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
+	result, err := buildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
 	if err != nil {
-		t.Fatalf("BuildDiscoveryResult: %v", err)
+		t.Fatalf("buildDiscoveryResult: %v", err)
 	}
 	if got := nodeNames(result.Nodes); !slices.Equal(got, []string{"pve5"}) {
 		t.Fatalf("nodes = %v, want pve5 alone", got)
@@ -534,9 +534,9 @@ func TestBuildDiscoveryResult_NodeWithoutCertPinsKeepsItsNodesPin(t *testing.T) 
 		Status: quorateStatus("pve1", "pve1", "pve2"),
 		RootCA: discRoot,
 	}
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
+	result, err := buildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
 	if err != nil {
-		t.Fatalf("BuildDiscoveryResult: %v", err)
+		t.Fatalf("buildDiscoveryResult: %v", err)
 	}
 	if len(result.Nodes) != 1 || !slices.Equal(result.Nodes[0].Pins, []endpointpool.Pin{discNodePin("pve2")}) {
 		t.Fatalf("nodes = %+v, want pve2 pinned by its /nodes fingerprint alone", result.Nodes)
@@ -563,9 +563,9 @@ func TestBuildDiscoveryResult_ResolverFailuresLeaveNamesOut(t *testing.T) {
 		}
 		return nil
 	}
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", resolver))
+	result, err := buildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", resolver))
 	if err != nil {
-		t.Fatalf("BuildDiscoveryResult: %v", err)
+		t.Fatalf("buildDiscoveryResult: %v", err)
 	}
 	if got := nodeNames(result.Nodes); !slices.Equal(got, []string{"pve3"}) {
 		t.Fatalf("nodes = %v, want pve3 alone", got)
@@ -595,7 +595,7 @@ func TestBuildDiscoveryResult_AllNamesUnresolvedGivesNoCandidates(t *testing.T) 
 		RootCA: discRoot,
 	}
 	fail := func(context.Context, string) error { return errors.New("no such host") }
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1:8006", fail))
+	result, err := buildDiscoveryResult(context.Background(), reads, discInput("pve1:8006", fail))
 	if err != nil || result.Outcome != DiscoveryNoCandidates || len(result.Nodes) != 0 {
 		t.Fatalf("outcome %q, %d nodes, err %v, want no_candidates", result.Outcome, len(result.Nodes), err)
 	}
@@ -631,7 +631,7 @@ func TestBuildDiscoveryResult_ResolvesInParallelWithATimeoutPerName(t *testing.T
 	}
 	in := discInput("pve0.dc1.example.com:8006", resolver)
 	in.ResolveTimeout = 5 * time.Second
-	result, err := BuildDiscoveryResult(context.Background(), reads, in)
+	result, err := buildDiscoveryResult(context.Background(), reads, in)
 	if err != nil || len(result.Nodes) != peers {
 		t.Fatalf("%d nodes, err %v, want all %d resolved in parallel", len(result.Nodes), err, peers)
 	}
@@ -643,7 +643,7 @@ func TestBuildDiscoveryResult_ResolvesInParallelWithATimeoutPerName(t *testing.T
 	in = discInput("pve0.dc1.example.com:8006", hang)
 	in.ResolveTimeout = 30 * time.Millisecond
 	start := time.Now()
-	result, err = BuildDiscoveryResult(context.Background(), reads, in)
+	result, err = buildDiscoveryResult(context.Background(), reads, in)
 	if err != nil || result.Outcome != DiscoveryNoCandidates {
 		t.Fatalf("outcome %q err %v, want no_candidates after the timeouts", result.Outcome, err)
 	}
@@ -673,7 +673,7 @@ func TestBuildDiscoveryResult_ResolverThatIgnoresItsContextIsStillBounded(t *tes
 	in := discInput("pve1:8006", resolver)
 	in.ResolveTimeout = 100 * time.Millisecond
 	start := time.Now()
-	result, err := BuildDiscoveryResult(context.Background(), reads, in)
+	result, err := buildDiscoveryResult(context.Background(), reads, in)
 	if err != nil || result.Outcome != DiscoveryNoCandidates || len(result.Nodes) != 0 {
 		t.Fatalf("outcome %q, %d nodes, err %v, want no_candidates", result.Outcome, len(result.Nodes), err)
 	}
@@ -720,7 +720,7 @@ func TestBuildDiscoveryResult_LookupsRunningAtOnceAreBounded(t *testing.T) {
 	}
 	in := discInput("pve000:8006", resolver)
 	in.ResolveTimeout = 50 * time.Millisecond
-	result, err := BuildDiscoveryResult(context.Background(), reads, in)
+	result, err := buildDiscoveryResult(context.Background(), reads, in)
 	if err != nil || result.Outcome != DiscoveryNoCandidates {
 		t.Fatalf("outcome %q err %v, want no_candidates", result.Outcome, err)
 	}
@@ -748,7 +748,7 @@ func TestBuildDiscoveryResult_DefaultResolveTimeoutIsTwoSeconds(t *testing.T) {
 		budget = time.Until(deadline)
 		return nil
 	}
-	if _, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1:8006", resolver)); err != nil {
+	if _, err := buildDiscoveryResult(context.Background(), reads, discInput("pve1:8006", resolver)); err != nil {
 		t.Fatal(err)
 	}
 	if budget <= time.Second || budget > 2*time.Second {
@@ -768,7 +768,7 @@ func TestBuildDiscoveryResult_CanceledContextGivesNoResult(t *testing.T) {
 		cancel()
 		return errors.New("canceled")
 	}
-	result, err := BuildDiscoveryResult(ctx, reads, discInput("pve1:8006", resolver))
+	result, err := buildDiscoveryResult(ctx, reads, discInput("pve1:8006", resolver))
 	if !errors.Is(err, context.Canceled) || len(result.Nodes) != 0 || result.Outcome != "" {
 		t.Fatalf("result %+v err %v, want the cancellation and no result", result, err)
 	}
@@ -788,9 +788,9 @@ func TestBuildDiscoveryResult_ConfiguredEndpointsAndRepeatsLeftOut(t *testing.T)
 	// A second configured endpoint, written in another case and with a
 	// trailing dot, names pve2's address.
 	in.Configured = append(in.Configured, "PVE2.dc1.example.com.:8006", "not an endpoint")
-	result, err := BuildDiscoveryResult(context.Background(), reads, in)
+	result, err := buildDiscoveryResult(context.Background(), reads, in)
 	if err != nil {
-		t.Fatalf("BuildDiscoveryResult: %v", err)
+		t.Fatalf("buildDiscoveryResult: %v", err)
 	}
 	if got := nodeNames(result.Nodes); !slices.Equal(got, []string{"pve3", "pve4"}) {
 		t.Fatalf("nodes = %v, want pve3 and pve4", got)
@@ -814,13 +814,13 @@ func TestBuildDiscoveryResult_CapsTheListAtSixtyFourNodes(t *testing.T) {
 		names = append(names, name)
 	}
 	reads := DiscoveryReads{Nodes: rows, Status: quorateStatus("pve000", names...), RootCA: discRoot}
-	result, err := BuildDiscoveryResult(
+	result, err := buildDiscoveryResult(
 		context.Background(),
 		reads,
 		discInput("pve000.dc1.example.com:8006", acceptAll),
 	)
 	if err != nil {
-		t.Fatalf("BuildDiscoveryResult: %v", err)
+		t.Fatalf("buildDiscoveryResult: %v", err)
 	}
 	if len(result.Nodes) != maxDiscoveredNodes {
 		t.Fatalf("%d nodes, want %d", len(result.Nodes), maxDiscoveredNodes)
@@ -844,7 +844,7 @@ func TestBuildDiscoveryResult_CapsTheListAtSixtyFourNodes(t *testing.T) {
 		}
 		return nil
 	}
-	result, err = BuildDiscoveryResult(context.Background(), reads, discInput("pve000.dc1.example.com:8006", resolver))
+	result, err = buildDiscoveryResult(context.Background(), reads, discInput("pve000.dc1.example.com:8006", resolver))
 	if err != nil || len(result.Nodes) != maxDiscoveredNodes {
 		t.Fatalf("%d nodes, err %v, want a full list after three failures", len(result.Nodes), err)
 	}
@@ -858,13 +858,13 @@ func TestBuildDiscoveryResult_CapsTheListAtSixtyFourNodes(t *testing.T) {
 
 func TestLookupHostResolver(t *testing.T) {
 	t.Parallel()
-	if err := LookupHostResolver(nil)(context.Background(), "127.0.0.1"); err != nil {
+	if err := lookupHostResolver(nil)(context.Background(), "127.0.0.1"); err != nil {
 		t.Fatalf("an address literal must resolve: %v", err)
 	}
 	broken := &net.Resolver{PreferGo: true, Dial: func(context.Context, string, string) (net.Conn, error) {
 		return nil, errors.New("no resolver in tests")
 	}}
-	if err := LookupHostResolver(broken)(context.Background(), "pve2.dc1.invalid-test-zone"); err == nil {
+	if err := lookupHostResolver(broken)(context.Background(), "pve2.dc1.invalid-test-zone"); err == nil {
 		t.Fatal("a name the resolver cannot answer must fail")
 	}
 }

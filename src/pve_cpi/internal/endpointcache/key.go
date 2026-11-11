@@ -34,9 +34,9 @@ const (
 	// hmacKeyBytes is the length of the HMAC-SHA256 key.
 	hmacKeyBytes = sha256.Size
 
-	// SystemCA is the key's CA digest when the entry sets no CA certificate and
+	// systemCA is the key's CA digest when the entry sets no CA certificate and
 	// verifies against the system trust store.
-	SystemCA = "system"
+	systemCA = "system"
 
 	// fileDigestHex is how many hex characters of the key digest a file name
 	// carries.
@@ -89,7 +89,7 @@ type Key struct {
 	Endpoints []string `json:"endpoints"`
 	// VerifySSL is the entry's effective verify_ssl.
 	VerifySSL bool `json:"verify_ssl"`
-	// CASHA256 is the lowercase hex SHA-256 of the CA PEM, or SystemCA.
+	// CASHA256 is the lowercase hex SHA-256 of the CA PEM, or systemCA.
 	CASHA256 string `json:"ca_sha256"`
 	// CredentialID is 16 hex characters derived from the user and the
 	// credential with the directory secret as the HKDF salt, so it reveals
@@ -202,7 +202,7 @@ func normalizeEndpoints(endpoints []string) ([]string, error) {
 // caDigest returns the key's CA field for the CA PEM pem.
 func caDigest(pem string) string {
 	if pem == "" {
-		return SystemCA
+		return systemCA
 	}
 	sum := sha256.Sum256([]byte(pem))
 	return hex.EncodeToString(sum[:])
