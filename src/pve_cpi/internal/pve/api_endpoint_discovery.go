@@ -89,6 +89,10 @@ type DiscoveryPool interface {
 	// DropDiscovered takes every discovered endpoint out of the pool for the
 	// rest of the call.
 	DropDiscovered() int
+	// SetEndpointNode records the node a configured endpoint serves, so the
+	// pool attributes a node-scoped request to it from then on. It ignores an
+	// address that is no configured endpoint of the pool and an empty name.
+	SetEndpointNode(addr, node string)
 }
 
 // The endpoint pool is the worker's pool.
@@ -392,6 +396,7 @@ func (w *DiscoveryWorker) discover(ctx context.Context, via string, b DiscoveryB
 		w.recordFailure(ctx, via, err)
 		return
 	}
+	endpointNodes := w.learnEndpointNodes(ctx, b, reads)
 	result, err := buildDiscoveryResult(requests, reads, DiscoveryInput{
 		Seed:       key.Endpoints[0],
 		Configured: key.Endpoints,
@@ -408,6 +413,7 @@ func (w *DiscoveryWorker) discover(ctx context.Context, via string, b DiscoveryB
 		w.logDropped(ctx, err)
 		return
 	}
+	obs.EndpointNodes = endpointNodes
 	w.recordResult(ctx, b, reads, result, obs)
 }
 

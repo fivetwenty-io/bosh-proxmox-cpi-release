@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -243,6 +244,9 @@ type discPool struct {
 	pinFailed  atomic.Bool
 	drops      atomic.Int32
 	refreshDue func() bool
+
+	mu    sync.Mutex
+	nodes map[string]string
 }
 
 func (p *discPool) RefreshDue() bool {
@@ -255,6 +259,23 @@ func (p *discPool) RefreshDue() bool {
 func (p *discPool) DropDiscovered() int {
 	p.drops.Add(1)
 	return 0
+}
+
+// SetEndpointNode keeps the names the worker hands the pool.
+func (p *discPool) SetEndpointNode(addr, node string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.nodes == nil {
+		p.nodes = map[string]string{}
+	}
+	p.nodes[addr] = node
+}
+
+// learned returns a copy of the names the worker handed the pool.
+func (p *discPool) learned() map[string]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return maps.Clone(p.nodes)
 }
 
 // begin marks the start of a run, so lines and requests count from here.

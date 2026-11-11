@@ -123,6 +123,13 @@ type DiscoveryReads struct {
 	// It is empty when the client reports no answering endpoint, as a client
 	// without an endpoint pool does.
 	RootVia string
+	// StatusVia is the configured endpoint, as host:port, that answered the
+	// /cluster/status read, which is the endpoint whose node Status.Local
+	// names. A walk can hop between configured endpoints during the run, so
+	// it can differ from RootVia. It is empty when the status read failed and
+	// when the client reports no answering endpoint, and then no name is
+	// attributed to any endpoint.
+	StatusVia string
 	// AnsweredBy lists every configured endpoint, as host:port, that answered
 	// any read of this run, in the order each first answered. A walk can hop
 	// between configured endpoints during the run, so it may hold more than
@@ -174,7 +181,13 @@ func readDiscovery(ctx context.Context, c Client, overall, certTimeout time.Dura
 		}
 	}
 	reads := DiscoveryReads{Nodes: rows}
-	reads.Status = readDiscoveryStatus(bounded, c)
+	// The recorder's last answer is the endpoint that answered the status
+	// read, which is the one Local names the node of.
+	statusRead := &endpointpool.AnswerRecorder{}
+	reads.Status = readDiscoveryStatus(endpointpool.WithAnswerRecorder(bounded, statusRead), c)
+	if reads.Status.Available {
+		reads.StatusVia = statusRead.Last()
+	}
 	if err = bounded.Err(); err != nil {
 		return DiscoveryReads{}, fmt.Errorf("ReadDiscovery: read ended: %w", err)
 	}

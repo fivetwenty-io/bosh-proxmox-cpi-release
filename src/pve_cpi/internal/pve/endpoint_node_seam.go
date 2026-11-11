@@ -3,9 +3,12 @@ package pve
 import "sync/atomic"
 
 // endpointNodesOverride maps a configured endpoint's host:port to the name of
-// the Proxmox node it serves. It stands in for what discovery records once it
-// exists, so a wire test can build a pool whose entries know their node. It is
-// nil outside tests, and then no configured endpoint carries a node.
+// the Proxmox node it serves. It lets a wire test build a pool whose entries
+// know their node without running discovery and a cache. Production never sets
+// it: a configured endpoint gets its node from the cache file, which a
+// discovery refresh writes from /cluster/status, and from the refresh itself.
+// It is nil outside tests, and then only the cache names a configured
+// endpoint.
 var endpointNodesOverride atomic.Pointer[map[string]string]
 
 // configuredEndpointNode returns the node the override names for the

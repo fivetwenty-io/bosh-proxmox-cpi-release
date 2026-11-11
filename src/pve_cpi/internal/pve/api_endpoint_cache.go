@@ -321,6 +321,7 @@ func (c *endpointCache) load(plan *endpointPlan, p *endpointcache.Payload) {
 	for i := range plan.endpoints[:plan.configured] {
 		plan.endpoints[i].DownMarkedAt = markTime(p, plan.endpoints[i].Address)
 	}
+	nameConfiguredEndpoints(plan, p)
 	if p.Discovery == nil {
 		return
 	}
@@ -332,6 +333,24 @@ func (c *endpointCache) load(plan *endpointPlan, p *endpointcache.Payload) {
 		}
 		plan.endpoints = append(plan.endpoints, endpoint)
 		c.discovered = append(c.discovered, endpoint)
+	}
+}
+
+// nameConfiguredEndpoints gives each configured endpoint of plan the node name
+// an earlier discovery recorded for it, so the pool attributes a node-scoped
+// request to the right entry in a call that runs no discovery of its own. A
+// name already on the endpoint stays, which is the name a test gave it. A
+// payload that holds an identity conflict names nothing, because the
+// configured endpoints no longer report the cluster the names were read from.
+func nameConfiguredEndpoints(plan *endpointPlan, p *endpointcache.Payload) {
+	if p.Cluster == nil || p.Cluster.IdentityConflict {
+		return
+	}
+	for i := range plan.endpoints[:plan.configured] {
+		endpoint := &plan.endpoints[i]
+		if node := p.Cluster.EndpointNodes[normalizedEndpoint(endpoint.Address)]; endpoint.Node == "" && node != "" {
+			endpoint.Node = node
+		}
 	}
 }
 
