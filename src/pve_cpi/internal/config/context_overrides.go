@@ -549,6 +549,9 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 		// field with base, so writing through this one would leak an entry's
 		// az_map into every other cpi-config entry this process serves.
 		c.Placement = p
+		// Record that the entry wrote this block, so a cold start may use its
+		// az_map even when the entry's endpoint list differs from the job's.
+		c.placementNamedByEntry = true
 		// Give the overridden block the same weight defaults ApplyDefaults
 		// gives the job-level one; ApplyContextOverrides runs Validate but
 		// not ApplyDefaults, so without this an entry setting a partial
@@ -1369,6 +1372,9 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 	// an entry that sets none can be told apart from one that named the built-in
 	// band deliberately. reevaluateParkedDefaultAfterOverrides puts it back.
 	eff.clearDefaultedParkerBand()
+	// A base that is itself an effective config must not hand its ownership
+	// of the placement block to this one. Only the handler below raises it.
+	eff.placementNamedByEntry = false
 	var appliedKeys []string
 
 	for _, key := range contextOverrideFieldOrder {

@@ -946,6 +946,18 @@ type CPIConfig struct {
 	// Only the override code sets it, on an effective config.
 	inheritedCredsLooserTLS bool
 
+	// placementNamedByEntry records that a cpi-config entry named
+	// pve_placement itself, so its az_map was written for that entry's
+	// cluster. An entry that does not name it inherits the job's map, which
+	// may list another cluster's nodes, and ColdStartNodeNames uses an
+	// inherited map only when the entry's endpoint list is the job's.
+	// Unexported and untagged like inheritedCredsLooserTLS, so it is neither
+	// decoded from nor emitted to cpi.json. Only the pve_placement override
+	// handler raises it, and ApplyContextOverrides clears it before any
+	// handler runs, so an effective config never carries it forward from its
+	// base.
+	placementNamedByEntry bool
+
 	// parkerStartDefaulted and parkerEndDefaulted record, per bound, that
 	// ApplyDefaults rather than the operator put the value in the range field.
 	// Same unexported/untagged treatment as parkedDefaultBandCollision.
