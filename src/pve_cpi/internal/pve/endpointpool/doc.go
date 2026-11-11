@@ -30,13 +30,14 @@
 //     group in node-name order, and it moves an endpoint that is demoted or
 //     carries a down mark younger than two minutes to the end. A discovered
 //     endpoint that fails its pin is left out for the rest of the process,
-//     and DropDiscovered leaves every discovered endpoint out the same way
-//     when discovery finds that the cluster identity changed. The pool
-//     reports down marks to a MarkSink and the first answer from a
-//     configured endpoint to a FirstAnswerHook, two interfaces the endpoint
-//     cache implements, so this package never imports the cache. It calls
-//     both on the request's goroutine, so each implementation hands its work
-//     to a goroutine of its own and returns at once.
+//     and DropDiscovered leaves every discovered endpoint and every cold-start
+//     candidate out the same way when discovery finds that the cluster
+//     identity changed. The pool reports down marks to a MarkSink and the
+//     first answer from a configured endpoint to a FirstAnswerHook, two
+//     interfaces the endpoint cache implements, so this package never imports
+//     the cache. It calls both on the request's goroutine, so each
+//     implementation hands its work to a goroutine of its own and returns at
+//     once.
 //   - A pool may carry cold-start candidates, the nodes the entry's
 //     placement.az_map names, when Gate says the cache holds no usable
 //     discovered entry. A walk reaches them only after every configured

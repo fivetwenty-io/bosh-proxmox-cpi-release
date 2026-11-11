@@ -203,9 +203,9 @@ func (p *Pool) StartedAway() (StartAway, bool) {
 	return *p.startAway, true
 }
 
-// DropDiscovered takes every discovered endpoint out of every later walk and
-// routed request for the rest of the process, and it returns how many it took
-// out. Discovery calls it when the configured endpoints report a cluster
+// DropDiscovered takes every discovered endpoint and every cold-start
+// candidate out of every later walk and routed request for the rest of the
+// process, and it returns how many it took out. Discovery calls it when the configured endpoints report a cluster
 // identity other than the one the discovered endpoints were pinned under, so
 // none of them may be used again in this call.
 //
@@ -219,8 +219,18 @@ func (p *Pool) StartedAway() (StartAway, bool) {
 // order becomes active and the generation goes up, so a request in flight on
 // the discovered endpoint cannot make it active again. The idle connections
 // of every dropped endpoint are closed outside the pool's lock. A pool
-// without discovered endpoints, and a second call, change nothing and return
-// zero. It is safe to call concurrently with walks.
+// without discovered endpoints or candidates, and a second call, change
+// nothing and return zero. It is safe to call concurrently with walks.
+//
+// A cold-start candidate is a discovered entry for this purpose, because the
+// proof that it belongs to the cluster says nothing about the cluster the
+// configured endpoints report now. The drop covers the candidate the cold
+// start accepted, which a mutation may be tethered to, and every candidate no
+// probe has settled. It ends the cold start, so no candidate is probed
+// afterward and a probe that is still running accepts nothing. A mutation
+// tethered to a dropped candidate is refused before any dial and proven
+// unsent, and it goes nowhere else. A candidate that had already failed TLS
+// verification keeps its own refusal.
 func (p *Pool) DropDiscovered() int {
 	now := p.now()
 	p.mu.Lock()
@@ -231,7 +241,16 @@ func (p *Pool) DropDiscovered() int {
 			dropped = append(dropped, ep)
 		}
 	}
-	if p.active.kind == KindDiscovered {
+	if p.cold != nil {
+		for _, c := range p.cold.candidates {
+			if !c.ep.ineligible {
+				c.ep.ineligible, c.ep.dropped = true, true
+				dropped = append(dropped, c.ep)
+			}
+		}
+		p.cold.drop()
+	}
+	if p.active.kind == KindDiscovered || p.active.kind == kindCandidate {
 		// A configured endpoint is always eligible, so there is always one.
 		if next := preferredLocked(p.endpoints, now, nil); next != nil {
 			p.active = next
@@ -256,6 +275,13 @@ func (p *Pool) refusalFor(ep *endpoint) error {
 		return refuseDropped(ep.addr)
 	}
 	return refuseIneligible(ep.addr)
+}
+
+// droppedNow reports whether DropDiscovered took ep out.
+func (p *Pool) droppedNow(ep *endpoint) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return ep.dropped
 }
 
 // ineligibleNow reports whether ep failed its pin in this process.

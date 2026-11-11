@@ -237,6 +237,11 @@ type coldStart struct {
 	// its result, which is nil when no candidate was accepted.
 	over     bool
 	accepted *endpoint
+	// dropped says DropDiscovered ended the cold start because the cluster
+	// identity changed. From then on no candidate is probed, a probe that is
+	// still running accepts nothing, and the result of an earlier acceptance
+	// is refused by the endpoint itself, which the drop made ineligible.
+	dropped bool
 	// done is closed when the walk probing the candidates stops. A stop that
 	// passes the rest on replaces it, so the walks that reach the cold start
 	// later wait on the next run.
@@ -295,6 +300,8 @@ func (cs *coldStart) finish(accepted *endpoint, next int, handOn bool) bool {
 	defer cs.mu.Unlock()
 	cs.running, cs.next = false, next
 	switch {
+	case cs.dropped:
+		cs.over = true
 	case accepted != nil:
 		cs.accepted, cs.over = accepted, true
 	case !handOn || next >= len(cs.candidates):
@@ -305,6 +312,26 @@ func (cs *coldStart) finish(accepted *endpoint, next int, handOn bool) bool {
 		cs.done = make(chan struct{})
 	}
 	return cs.over
+}
+
+// drop ends the cold start for the process because discovery found that the
+// cluster identity changed. A walk that probes the candidates stops before its
+// next candidate and accepts nothing, even from a probe that already began,
+// and every walk that reaches the cold start later reads an empty result. The
+// candidate an earlier acceptance recorded stays recorded, so a tether to it
+// is still told apart from a routed host and refused. It is safe to call
+// while a walk probes.
+func (cs *coldStart) drop() {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.dropped, cs.over = true, true
+}
+
+// wasDropped reports whether DropDiscovered ended the cold start.
+func (cs *coldStart) wasDropped() bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.dropped
 }
 
 // acceptedEndpoint returns the candidate the cold start accepted, or nil.
@@ -688,7 +715,11 @@ func (w *walker) runColdStart(cs *coldStart, start int) (accepted *endpoint, sto
 	next, probed := start, 0
 	defer func() {
 		over := cs.finish(accepted, next, handsOn(stop))
-		if accepted == nil && stop != stopNone {
+		switch {
+		case accepted != nil || stop == stopNone:
+		case cs.wasDropped():
+			w.p.logColdStartDropped(probed, len(cs.candidates)-next)
+		default:
 			w.p.logColdStartStop(stop, probed, len(cs.candidates)-next, over)
 		}
 	}()
@@ -699,6 +730,9 @@ func (w *walker) runColdStart(cs *coldStart, start int) (accepted *endpoint, sto
 	)
 	auth := tokenAuthorization(w.req)
 	for next < len(cs.candidates) {
+		if cs.wasDropped() {
+			return nil, stopExhausted
+		}
 		if w.made >= w.bounds.hops {
 			return nil, stopExhausted
 		}
@@ -721,6 +755,9 @@ func (w *walker) runColdStart(cs *coldStart, start int) (accepted *endpoint, sto
 		next++
 		probed++
 		if err == nil {
+			if cs.wasDropped() {
+				return nil, stopExhausted
+			}
 			return c.ep, stopNone
 		}
 		w.made++
@@ -756,6 +793,19 @@ func (p *Pool) logColdStartStop(stop stopReason, probed, unprobed int, over bool
 	}
 	p.logger.Debug(msg,
 		log.String("reason", reason),
+		log.Int("probed", probed),
+		log.Int("unprobed", unprobed),
+	)
+}
+
+// logColdStartDropped logs, at Debug, that a run of the cold start accepted no
+// candidate because discovery found that the cluster identity changed, with
+// how many candidates the run probed and how many no walk had probed. None of
+// them is tried later in this call.
+func (p *Pool) logColdStartDropped(probed, unprobed int) {
+	p.logger.Debug("pve endpoints: the cold start from placement.az_map accepted no candidate in this request, "+
+		"because discovery found that the cluster identity changed, so no later request in this call tries one",
+		log.String("reason", "identity_changed"),
 		log.Int("probed", probed),
 		log.Int("unprobed", unprobed),
 	)
@@ -1133,13 +1183,16 @@ func revokedHop(ep *endpoint) hopResult {
 // the refusal otherwise. The tether keeps a mutation on the endpoint its key
 // went to, and every dial to the candidate is verified, so the mutation
 // follows it while the candidate has not failed TLS verification since it
-// proved membership. It never goes there when the candidate has, when it is a
+// proved membership. It never goes there when the candidate has, when
+// discovery dropped it because the cluster identity changed, when it is a
 // login or discovery request, or when it carries no API token or a ticket,
 // because a candidate gets only what the cold start would send it. A refused
 // request may go nowhere else, so it is refused before any dial.
 func (p *Pool) followCandidate(req *http.Request, ep *endpoint, configuredOnly bool) error {
 	var why string
 	switch {
+	case p.droppedNow(ep):
+		why = "which discovery dropped when the cluster identity changed, so the pool sends it nothing more"
 	case p.ineligibleNow(ep):
 		why = "which failed TLS verification after it proved membership, so the pool sends it nothing more"
 	case configuredOnly:

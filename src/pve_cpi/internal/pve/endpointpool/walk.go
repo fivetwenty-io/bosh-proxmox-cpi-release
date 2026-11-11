@@ -234,6 +234,10 @@ func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCl
 	if c := p.memberAt(addr); c != nil && c.kind == kindCandidate && p.ineligibleNow(c) {
 		closeSendBody(req, body)
 		oc := unsent
+		if p.droppedNow(c) {
+			oc.class = string(PhasePin)
+			return nil, oc, refuseDropped(addr)
+		}
 		oc.class = string(PhaseTLSVerify)
 		return nil, oc, refuseRevoked(addr)
 	}
@@ -544,7 +548,7 @@ func (w *walker) try(i int, ep *endpoint, body io.ReadCloser) hopResult {
 	eligible, left := w.p.eligibleFrom(ep, w.order[i:])
 	if !eligible {
 		closeSendBody(w.req, body)
-		if ep.kind == kindCandidate {
+		if ep.kind == kindCandidate && !w.p.droppedNow(ep) {
 			return revokedHop(ep)
 		}
 		return w.p.ineligibleHop(ep)
