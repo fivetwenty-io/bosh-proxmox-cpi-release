@@ -264,6 +264,12 @@ func TestMigrateMoverToNode_RestoresProtectionWhereTheMoverLanded(t *testing.T) 
 	if len(c.writes) != len(want) || c.writes[0] != want[0] || c.writes[1] != want[1] {
 		t.Fatalf("protection writes = %+v, want %+v", c.writes, want)
 	}
+	// The probe placed the mover on the target, so the restore never tried
+	// the source. A restore that falls back to trying the source first lands
+	// the same writes, so only the attempts tell the two apart.
+	if !slices.Equal(c.attempts, want) {
+		t.Fatalf("protection write attempts = %+v, want %+v with no restore attempt on the source", c.attempts, want)
+	}
 	if !ConfigFlag(c.configs[mmMoverVMID], paramProtection) {
 		t.Fatal("the mover's protection is off after the restore")
 	}
