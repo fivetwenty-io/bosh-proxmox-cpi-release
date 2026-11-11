@@ -216,9 +216,15 @@ func settleMigrationUnderHandle(
 	if err := settleableMigrationRecord(record, decision); err != nil {
 		return aj.Record{}, err
 	}
+	// The step the decision names is checked before anything is settled, so
+	// a mistyped --step-id or --task-upid refuses with the journal as it was.
+	// The check reads only the record.
+	if _, err := settleableMigrationStep(record, decision, source, vmid, nodes); err != nil {
+		return aj.Record{}, err
+	}
 	// A lock, protection, or move step an earlier request left planned is
-	// settled by readback first, the way every decision does. Those writes
-	// touch only the journal.
+	// settled by readback next, the way every decision does. Those writes
+	// touch only the journal and never the submitted migrate step.
 	gaps, err := settlePlannedLockSteps(ctx, deps, handle)
 	if err != nil {
 		return aj.Record{}, storageDecisionSourceError(err)
