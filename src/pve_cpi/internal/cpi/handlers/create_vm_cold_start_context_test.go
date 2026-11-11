@@ -25,9 +25,10 @@ type atCreate struct {
 // create_vm handler under the default configuration and records the context
 // that QEMU().Create receives. The endpoint pool starts its cold start for a
 // request only when the request carries no send-by deadline and its context
-// has at least endpointpool.ProbeLimit left, so a deadline from the VMID claim
-// window or the create's own bound that fell short would turn the cold start
-// off on every create_vm without any other test failing.
+// has at least endpointpool.ProbeLimit left. The POST runs on the create's own
+// bound, pve.operation_timeout.create_sec, and not inside the VMID claim
+// window, so this test guards that bound. A bound that fell short would turn
+// the cold start off on every create_vm without any other test failing.
 func TestCreateVMKeepsEnoughContextAtThePostForAColdStartProbe(t *testing.T) {
 	t.Parallel()
 	q := &vmMockQEMU{}
