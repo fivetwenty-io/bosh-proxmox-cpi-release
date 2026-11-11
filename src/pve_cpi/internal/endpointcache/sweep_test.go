@@ -452,18 +452,56 @@ func TestSweepKeepsAPayloadReplacedAfterTheStat(t *testing.T) {
 	}
 }
 
-// A payload replaced by another file that is as old as the first one still
-// fails the inode comparison, so the sweep leaves it for the next pass.
+// movedChangeTime runs change until the file's change time differs from before.
+// A filesystem stamps the change time from a clock that can stand still for a
+// few milliseconds, so a change made right after the stat could leave it equal.
+func movedChangeTime(t *testing.T, path string, before int64, change func()) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		change()
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after, ok := changeTime(info); ok && after != before {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("the change time of %s never moved", path)
+}
+
+// changeTimeOf returns the change time of the file at path.
+func changeTimeOf(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctime, ok := changeTime(info)
+	if !ok {
+		t.Fatalf("no change time for %s", path)
+	}
+	return ctime
+}
+
+// A payload replaced by another file that is as old as the first one is not
+// the file the sweep judged, so the sweep leaves it for the next pass. Linux
+// gives the replacement the device and inode numbers of the file it replaced,
+// so os.SameFile cannot tell them apart and only the change time can.
 func TestSweepKeepsAPayloadWhoseInodeChangedUnderTheLock(t *testing.T) {
 	dir, root := sweepDir(t)
 	const day = 24 * time.Hour
 	sweepFile(t, dir, sweepKey, 31*day)
 	sweepFile(t, dir, sweepLock, 31*day)
+	path := filepath.Join(dir, sweepKey)
+	before := changeTimeOf(t, path)
 	fired := onSweepLock(t, sweepKey, func() {
-		if err := os.Remove(filepath.Join(dir, sweepKey)); err != nil {
+		if err := os.Remove(path); err != nil {
 			t.Fatal(err)
 		}
-		sweepFile(t, dir, sweepKey, 32*day)
+		movedChangeTime(t, path, before, func() { sweepFile(t, dir, sweepKey, 32*day) })
 	})
 	result := endpointTexts.sweepWith(root, sweepNow, nil, ownedByEffectiveUser, "")
 	if !*fired {
@@ -472,8 +510,38 @@ func TestSweepKeepsAPayloadWhoseInodeChangedUnderTheLock(t *testing.T) {
 	if result.Err != nil || slices.Contains(result.Removed, sweepKey) {
 		t.Errorf("sweep removed a payload whose inode changed: %+v", result)
 	}
-	if _, err := os.Lstat(filepath.Join(dir, sweepKey)); err != nil {
+	if _, err := os.Lstat(path); err != nil {
 		t.Errorf("replacement payload is gone: %v", err)
+	}
+}
+
+// A payload that a writer changed in place and then gave its old times back is
+// the same inode with the same age, so only the change time shows the write.
+// It holds on every platform, whether or not the filesystem reuses inodes.
+func TestSweepKeepsAPayloadWhoseTimesWereSetBackInPlace(t *testing.T) {
+	dir, root := sweepDir(t)
+	const day = 24 * time.Hour
+	sweepFile(t, dir, sweepKey, 31*day)
+	sweepFile(t, dir, sweepLock, 31*day)
+	path := filepath.Join(dir, sweepKey)
+	before := changeTimeOf(t, path)
+	fired := onSweepLock(t, sweepKey, func() {
+		old := sweepNow.Add(-31 * day)
+		movedChangeTime(t, path, before, func() {
+			if err := os.Chtimes(path, old, old); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+	result := endpointTexts.sweepWith(root, sweepNow, nil, ownedByEffectiveUser, "")
+	if !*fired {
+		t.Fatal("the sweep never took the lock for the payload")
+	}
+	if result.Err != nil || slices.Contains(result.Removed, sweepKey) {
+		t.Errorf("sweep removed a payload that changed after the stat: %+v", result)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("payload is gone: %v", err)
 	}
 }
 
@@ -613,21 +681,18 @@ func TestSweepLeavesAWaiterOnTheOldInodeAsTheOnlyHolder(t *testing.T) {
 		err  error
 	}
 	done := make(chan outcome, 1)
-	var oldInode fs.FileInfo
+	var sweptInode *os.File
+	takes := 0
 	fired := onSweepLock(t, sweepLock, func() {
-		var err error
-		if oldInode, err = os.Lstat(filepath.Join(dir, sweepLock)); err != nil {
-			t.Fatal(err)
-		}
 		waiter, err := endpointTexts.policy.Open(root, sweepLock, os.O_RDWR)
 		if err != nil {
 			t.Fatal(err)
 		}
+		sweptInode = waiter
 		go func() {
-			first := true
 			lock, _, err := endpointTexts.heldLock(root, sweepLock, func() (*privatefile.Lock, bool, error) {
-				if first {
-					first = false
+				takes++
+				if takes == 1 {
 					// A blocking flock on the old inode, which the sweep holds.
 					if err := syscall.Flock(int(waiter.Fd()), syscall.LOCK_EX); err != nil {
 						return nil, false, err
@@ -666,8 +731,18 @@ func TestSweepLeavesAWaiterOnTheOldInodeAsTheOnlyHolder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the waiter's lock has no name: %v", err)
 	}
-	if !os.SameFile(held, named) || os.SameFile(held, oldInode) {
-		t.Errorf("waiter holds an inode the name does not reach, or still the swept one")
+	// The filesystem may give the new file the number of the swept inode once
+	// the waiter lets go of it, so the numbers prove nothing about which file
+	// the waiter holds. The retry does, because it only happens after the waiter
+	// found the swept inode gone from the name and closed its descriptor.
+	if !os.SameFile(held, named) {
+		t.Errorf("waiter holds an inode the name does not reach")
+	}
+	if takes != 2 {
+		t.Errorf("waiter took the lock %d times, want 2: one on the swept inode and one on its replacement", takes)
+	}
+	if _, err := sweptInode.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("waiter still holds the swept inode open: %v", err)
 	}
 	other, ok, err := endpointTexts.tryHeldLock(context.Background(), root, sweepLock)
 	if err != nil {

@@ -192,16 +192,23 @@ func (t *texts) removeUnderLock(
 	if err != nil {
 		return false, fmt.Errorf("%s: stat %s: %w", t.name, name, err)
 	}
-	expected := seen
 	if _, isLock := lockKeyFile(name); isLock {
 		// The lock being removed is the one the sweep holds, so the name must
 		// still reach the inode that was locked, or a waiter on an older inode
-		// and a holder of a newer one could both run.
-		if expected, err = lock.File.Stat(); err != nil {
-			return false, fmt.Errorf("%s: stat locked file %s: %w", t.name, name, err)
+		// and a holder of a newer one could both run. The descriptor keeps
+		// that inode alive, so no other file can take its number meanwhile and
+		// the comparison cannot be fooled.
+		locked, statErr := lock.File.Stat()
+		if statErr != nil {
+			return false, fmt.Errorf("%s: stat locked file %s: %w", t.name, name, statErr)
 		}
+		if !os.SameFile(locked, current) {
+			return false, nil
+		}
+	} else if !sameFileState(seen, current) {
+		return false, nil
 	}
-	if !os.SameFile(expected, current) || !current.Mode().IsRegular() {
+	if !current.Mode().IsRegular() {
 		return false, nil
 	}
 	modified := current.ModTime()
@@ -215,6 +222,28 @@ func (t *texts) removeUnderLock(
 		return false, nil
 	}
 	return t.removeName(root, name)
+}
+
+// sameFileState reports whether current is the file seen described, unchanged.
+// The sweep holds no descriptor on a payload between the stat that called it
+// stale and the check under the lock, so nothing keeps its inode alive. Once
+// the payload is unlinked a filesystem may hand its device and inode numbers
+// to the next file it creates, which Linux does at once, and os.SameFile then
+// calls a replacement the same file. Nlink cannot tell either, because the sweep has
+// a descriptor the sweep does not have to read it from. The change time can. Every
+// create, rename, write, chmod, and chtimes sets it to the clock, and no
+// caller can set it back, unlike the modification time that a replacement
+// restored from a backup may carry. A replacement has a later change time than
+// the file it took the name from, so equal numbers with equal change times are
+// the same, unchanged file. A stat with no change time reports false, which
+// leaves the file for the next sweep.
+func sameFileState(seen, current fs.FileInfo) bool {
+	if !os.SameFile(seen, current) {
+		return false
+	}
+	before, ok := changeTime(seen)
+	after, nowOK := changeTime(current)
+	return ok && nowOK && before == after
 }
 
 // removeName removes name and reports whether it did. A name that is gone
