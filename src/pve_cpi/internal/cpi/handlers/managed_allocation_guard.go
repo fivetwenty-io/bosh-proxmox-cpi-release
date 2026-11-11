@@ -39,8 +39,9 @@ type ManagedAllocationHooks struct {
 	// Failed persists uncertainty after either a service or After failure.
 	Failed func(context.Context, ManagedAllocationMutation, string, error) error
 	// Blocked, when set, gets the refusal from Before that locks the guard,
-	// so the guard's owner can say why. The call was not sent. It runs with
-	// the guard's lock held, so it must not call the guard.
+	// so the guard's owner can say why. The call was not sent. It runs once
+	// the guard's lock is released and the guard is already locked against
+	// further writes, so it may read the guard back.
 	Blocked func(context.Context, ManagedAllocationMutation, error)
 	// SettleProtectionWrites opts a guard into finishing a failed
 	// protection-only write without locking itself (see
@@ -115,7 +116,24 @@ func (g *ManagedAllocationGuard) Poison(err error) error {
 	}
 	return g.poisoned
 }
+
+// begin admits m. On success it returns with the guard's lock held, and
+// finish releases it. When Before's refusal locks the guard, the Blocked hook
+// runs after admit has released the lock, so a hook that calls back into the
+// guard cannot deadlock on it.
 func (g *ManagedAllocationGuard) begin(ctx context.Context, m ManagedAllocationMutation) (string, error) {
+	token, err, blocked := g.admit(ctx, m)
+	if blocked != nil && g.hooks.Blocked != nil {
+		g.hooks.Blocked(ctx, m, blocked)
+	}
+	return token, err
+}
+
+// admit runs Before for m under the guard's lock. It returns the intent token
+// with the lock still held, or an error with the lock released. When Before's
+// refusal is the one that locks the guard, the third result is that refusal,
+// for begin to hand to the Blocked hook.
+func (g *ManagedAllocationGuard) admit(ctx context.Context, m ManagedAllocationMutation) (string, error, error) {
 	g.mu.Lock()
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -127,7 +145,7 @@ func (g *ManagedAllocationGuard) begin(ctx context.Context, m ManagedAllocationM
 	if g.poisoned != nil {
 		err := g.poisoned
 		g.mu.Unlock()
-		return "", &managedMutationNotAttempted{err: err}
+		return "", &managedMutationNotAttempted{err: err}, nil
 	}
 	token, err := g.hooks.Before(ctx, m)
 	if err == nil && token == "" {
@@ -145,7 +163,7 @@ func (g *ManagedAllocationGuard) begin(ctx context.Context, m ManagedAllocationM
 		// uncertain, so the guard stays usable, the way a cut-off protection
 		// write leaves it.
 		g.mu.Unlock()
-		return "", &managedMutationNotAttempted{err: err}
+		return "", &managedMutationNotAttempted{err: err}, nil
 	}
 	if errors.Is(err, errManagedRestoreHolderAbsent) {
 		// A parker protection restore targets a node that answered that the
@@ -154,7 +172,7 @@ func (g *ManagedAllocationGuard) begin(ctx context.Context, m ManagedAllocationM
 		// stays usable. The refusal goes back unchanged, so a restore that
 		// tries more than one node moves on to the next one.
 		g.mu.Unlock()
-		return "", err
+		return "", err, nil
 	}
 	if errors.Is(err, errManagedRestoreChecksIncomplete) {
 		// The checks that admit a parker protection restore could not
@@ -164,17 +182,15 @@ func (g *ManagedAllocationGuard) begin(ctx context.Context, m ManagedAllocationM
 		// refusal goes back unchanged, so the restore can say it was not sent
 		// rather than that the operation was already uncertain.
 		g.mu.Unlock()
-		return "", err
+		return "", err, nil
 	}
 	if err != nil {
 		g.poisoned = cpierrors.Cloud("managed allocation blocked before %s.%s", m.Service, m.Method)
-		if g.hooks.Blocked != nil {
-			g.hooks.Blocked(ctx, m, err)
-		}
+		poisoned := g.poisoned
 		g.mu.Unlock()
-		return "", &managedMutationNotAttempted{err: g.poisoned}
+		return "", &managedMutationNotAttempted{err: poisoned}, err
 	}
-	return token, nil
+	return token, nil, nil
 }
 
 // managedMutationNotAttempted is the error begin returns when it refuses a
