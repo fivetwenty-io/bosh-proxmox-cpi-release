@@ -3103,11 +3103,11 @@ On releases before the fix, an `attach_disk` of a journal-managed disk on shared
 
 The cause is how the CPI checks that the mover left the source node. When a VM's config has moved away, PVE answers a read of it on the old node with an HTTP 500 that says `Configuration file 'nodes/<node>/qemu-server/<vmid>.conf' does not exist`. The older check accepted only a 404 as proof of absence, so it treated the 500 as a failure, marked the record as needing reconciliation, and then refused to restore the mover's protection. The disk is safe on the mover, and no data is lost.
 
-We recover in this order, with PVE reads and writes made by an operator who approves each write.
+We recover in this order, and an operator approves each write that we make to PVE.
 
 1. Check the live state without changing anything
 
-   On the node that holds the mover, `qm config <mover VMID>` shows the disk's `bpd-` serial on one slot, `protection` off, and no `lock:` line. On the node the task ran on, the same read answers that the configuration file does not exist. The task's status on that node is `stopped` with exit status `OK`. If any of this differs, we stop and look at the record before we go on. We also keep resurrection off for the instance and do not deploy until the last step.
+   On the node that holds the mover, `qm config <mover VMID>` shows the disk's `bpd-` serial on one slot, `protection` off, and no `lock:` line. On the node the task ran on, the same read answers that the configuration file does not exist. The task's status on that node is `stopped` with exit status `OK`. If any of this differs, we stop and look at the record before we go on. We also keep resurrection off for the instance, and we do not deploy until the last step.
 
 2. Put the mover's protection back
 
