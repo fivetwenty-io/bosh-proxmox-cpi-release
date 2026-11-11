@@ -40,9 +40,9 @@ Packages are grouped by role. Each is described in one sentence.
 
 - `internal/pve` — wraps `github.com/fivetwenty-io/proxmox-apiclient-go/v3`: VM, disk, network, and storage CRUD, task UPID polling, retry and backoff, pushback detection, the cluster pool lock, SDN apply, the foreign-disk guard, and SDK-error normalization.
 
-- `internal/pve/endpointpool` — the ordered set of API endpoints for one cluster and the transport that walks it. It owns the active endpoint, the in-process demotions, the tethers on mutations, the send-by deadline, and the cold-start candidates from `placement.az_map`.
+- `internal/pve/endpointpool` holds the ordered set of API endpoints for one cluster and the transport that walks it. It owns the active endpoint, the in-process demotions, the tethers on mutations, the send-by deadline, and the cold-start candidates from `placement.az_map`.
 
-- `internal/endpointcache` — the private cache directory and the files in it. It chooses the directory in layers, checks that the CPI's user owns it and that no one else can read it, and signs and verifies each file. The endpoint cache, the HA profile cache, and the HA recovery episode record all live there.
+- `internal/endpointcache` holds the private cache directory and the files in it. It chooses the directory in layers, checks that the CPI's user owns it and that no one else can read it, and signs and verifies each file. The endpoint cache, the HA profile cache, and the HA recovery episode record all live there.
 
 - `internal/pve/stemcell_fetch` — resolves and fetches a stemcell image from `https://`, `s3://`, `bosh+blobstore:`, or `oci://`, then extracts and uploads it. Per-node template replication lives in `internal/cpi/handlers` (`create_stemcell`), not here.
 

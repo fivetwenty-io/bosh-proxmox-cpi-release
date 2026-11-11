@@ -153,7 +153,7 @@ Five rules apply when an entry moves a request to another endpoint, meaning it c
 - The endpoint list does not carry over
   An entry on another endpoint gets no `endpoints` list unless it sets one itself, because the job's list names machines of the job's cluster. The entry's list is then just its own `host` and `port`.
 
-An entry's `endpoints` list names entry nodes for the API, meaning machines of that one cluster that can answer the same requests. It is never a node set for placement. The CPI chooses the node a VM lands on by its placement rules, including the entry's `placement` block and `az_map`, and the node it reached the API through only proxies the request. Listing a node in `endpoints` does not make it a candidate for VMs, and leaving a node out does not stop VMs from landing on it. [Configuration](configuration.md#api-endpoints) covers the list itself.
+An entry's `endpoints` list names the machines the CPI may use for API calls, all of them in that one cluster and all able to answer the same requests. It is never a node set for placement. The CPI chooses the node a VM lands on by its placement rules, including the entry's `placement` block and `az_map`, and the node it reached the API through only proxies the request. Listing a node in `endpoints` does not make it a candidate for VMs, and leaving a node out does not stop VMs from landing on it. [Configuration](configuration.md#api-endpoints) covers the list itself.
 
 Everything else is deliberately left at the job level.
 
