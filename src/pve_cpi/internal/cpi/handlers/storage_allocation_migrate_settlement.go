@@ -2,8 +2,11 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
+	"time"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -15,7 +18,56 @@ const (
 	migrateStepKindPrefix         = "lifecycle_"
 	migrateStepKindSuffix         = "_Nodes_CreateQemuMigrate"
 	maxMigrationStepIDLength      = 256
+	migrationSettlementScope      = "migration_settlement"
 )
+
+// MigrationSettlementEvidence is what settle-migration proved about the step
+// it settled. It is recorded in the record's verifications, so the evidence
+// outlives the process, and the CLI prints it. It verifies neither ownership
+// nor absence, so it never reconciles the record by itself.
+type MigrationSettlementEvidence struct {
+	Scope        string `json:"scope"`
+	AllocationID string `json:"allocation_id"`
+	DecisionID   string `json:"decision_id"`
+	StepID       string `json:"step_id"`
+	Kind         string `json:"kind"`
+	UPID         string `json:"upid"`
+	TaskStatus   string `json:"task_status"`
+	ExitStatus   string `json:"exit_status"`
+	SourceNode   string `json:"source_node"`
+	TargetNode   string `json:"target_node"`
+	VMID         int    `json:"vmid"`
+	Slot         string `json:"slot"`
+	Volume       string `json:"volume"`
+	Serial       string `json:"serial"`
+	ObservedAt   string `json:"observed_at"`
+}
+
+// MigrationSettlementEvidenceOf returns the settlement evidence that record
+// carries for step stepID. It returns an error unless the record's latest
+// settlement verification for that step names the record, and the step is
+// observed with the UPID, VM, and target node the evidence names.
+func MigrationSettlementEvidenceOf(record aj.Record, stepID string) (MigrationSettlementEvidence, error) {
+	step, found := recordStep(record, stepID)
+	if !found {
+		return MigrationSettlementEvidence{}, fmt.Errorf("allocation %s has no step %s", record.ID, stepID)
+	}
+	for i := len(record.Verifications) - 1; i >= 0; i-- {
+		var evidence MigrationSettlementEvidence
+		if json.Unmarshal([]byte(record.Verifications[i].EvidenceJSON), &evidence) != nil ||
+			evidence.Scope != migrationSettlementScope || evidence.StepID != stepID {
+			continue
+		}
+		if evidence.AllocationID != record.ID || step.State != aj.Observed || evidence.UPID != step.UPID ||
+			evidence.VMID != step.Target.VMID || evidence.TargetNode != step.Target.Node {
+			return MigrationSettlementEvidence{}, fmt.Errorf("the settlement evidence for step %s does not match "+
+				"the step allocation %s records", stepID, record.ID)
+		}
+		return evidence, nil
+	}
+	return MigrationSettlementEvidence{}, fmt.Errorf("allocation %s carries no settlement evidence for step %s",
+		record.ID, stepID)
+}
 
 // newDecisionDenyGuard wraps client in a guard that refuses every PVE
 // mutation, so an allocation decision can only read PVE. It returns the guard
@@ -49,7 +101,8 @@ func newDecisionDenyGuard(client pve.Client) (*ManagedAllocationGuard, error, er
 // step's target alone, the target holds no migrate lock, the disk's serial is
 // on exactly one slot there, whose backing is the step's and whose volume is
 // the one the step recorded, and that volume is in its storage's listing on
-// the target. Only then does it save the step observed. The record stays in
+// the target. Only then does it save the step observed, with a verification
+// that carries that evidence (MigrationSettlementEvidence). The record stays in
 // reconciliation_required with a reason that names the decision, and the
 // Director's next call on the disk resumes from it, because lifecycle
 // admission requires every step of the active attempt observed, not a
@@ -63,9 +116,11 @@ func SettleStorageAllocationMigration(
 	ctx context.Context, deps Deps, journal *aj.Journal, nodes []string, decision StorageAllocationDecision,
 ) (result aj.Record, retErr error) {
 	defer func() {
+		outcome := "settled"
 		if retErr != nil {
-			deps.recordStorageReconciliation(ctx, "rejected")
+			outcome = "rejected"
 		}
+		deps.recordStorageReconciliation(ctx, outcome)
 	}()
 	if ctx == nil || deps.PVE == nil {
 		return result, storageRefusal("a journal and bounded nonsecret decision reference are required")
@@ -198,11 +253,22 @@ func settleMigrationUnderHandle(
 	if guard.Err() != nil {
 		return aj.Record{}, denied
 	}
+	evidenceID, evidenceJSON, err := aj.VerificationEvidence(MigrationSettlementEvidence{
+		Scope: migrationSettlementScope, AllocationID: record.ID, DecisionID: decision.DecisionID, StepID: step.ID,
+		Kind: step.Kind, UPID: step.UPID, TaskStatus: task.Status, ExitStatus: task.ExitStatus, SourceNode: source,
+		TargetNode: step.Target.Node, VMID: vmid, Slot: slot, Volume: volume, Serial: record.DiskToken,
+		ObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return aj.Record{}, storageDecisionSourceError(err)
+	}
 	next := handle.Record()
 	if markStepObserved(&next, step.ID, []string{step.Target.IntendedVolume, volume}) == nil {
 		return aj.Record{}, storageRefusalf("allocation %s has no step %s in its open attempt", record.ID, step.ID)
 	}
 	next.Reason = "migration settled by decision " + decision.DecisionID
+	next.Verifications = append(next.Verifications,
+		aj.Verification{EvidenceID: evidenceID, EvidenceJSON: evidenceJSON, Complete: true})
 	if err := handle.Save(next); err != nil {
 		return aj.Record{}, refusedSettlementSave("migration", []aj.Step{step}, err)
 	}
@@ -267,7 +333,7 @@ func settleableMigrationStep(
 			step.ID)
 	}
 	if len(step.Charges) > 0 {
-		return aj.Step{}, storageRefusalf("settling a copy-local migration is not supported in 0.9.7; step %s "+
+		return aj.Step{}, storageRefusalf("settle-migration does not settle a copy-local migration; step %s "+
 			"carries a capacity charge on the target's storage", step.ID)
 	}
 	target := step.Target

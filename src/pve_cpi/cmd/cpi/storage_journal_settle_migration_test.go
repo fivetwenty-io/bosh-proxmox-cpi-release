@@ -2,9 +2,13 @@ package main
 
 import (
 	"bytes"
+	"maps"
 	"reflect"
 	"strings"
 	"testing"
+
+	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 )
 
 const settleMigrationTestUPID = "UPID:pve:0000A1B2:0001C3D4:6734ABCD:qmigrate:90144:root@pam:"
@@ -125,5 +129,74 @@ func TestStorageJournalUsageNamesSettleMigration(t *testing.T) {
 		if !strings.Contains(stderr.String(), want) {
 			t.Errorf("settle-migration help lacks %s: %s", want, stderr.String())
 		}
+	}
+}
+
+// settledMigrationRecord is a disk record whose migrate step the handler
+// settled: the step is observed, and the record carries the evidence the
+// handler appended for it.
+func settledMigrationRecord(t *testing.T) aj.Record {
+	t.Helper()
+	evidence := handlers.MigrationSettlementEvidence{
+		Scope: "migration_settlement", AllocationID: "alloc-1", DecisionID: "shield-settle",
+		StepID: "attempt-0-step-40", Kind: "lifecycle_attach_disk_Nodes_CreateQemuMigrate",
+		UPID: settleMigrationTestUPID, TaskStatus: "stopped", ExitStatus: "OK", SourceNode: "pve",
+		TargetNode: "pve2", VMID: 90144, Slot: "scsi2", Volume: "local-lvm:vm-90144-disk-1",
+		Serial: "pvd-serial", ObservedAt: "2026-11-11T00:00:00Z",
+	}
+	id, raw, err := aj.VerificationEvidence(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return aj.Record{
+		ID: "alloc-1", Kind: "disk", State: aj.ReconciliationRequired, CID: "pvd-disk", DiskToken: "pvd-serial",
+		Steps: []aj.Step{{
+			ID: "attempt-0-step-40", Kind: evidence.Kind, State: aj.Observed, UPID: settleMigrationTestUPID,
+			Target: aj.Target{Node: "pve2", VMID: 90144, IntendedVolume: evidence.Volume},
+		}},
+		Verifications: []aj.Verification{{EvidenceID: id, EvidenceJSON: raw, Complete: true}},
+	}
+}
+
+// TestSettleMigrationSummaryPrintsTheEvidence builds the settle-migration
+// output from a settled record. It names the step, the task and its outcome,
+// the VM, both nodes, the slot, the volume, and the disk's serial.
+func TestSettleMigrationSummaryPrintsTheEvidence(t *testing.T) {
+	summary, err := settleMigrationSummary(settledMigrationRecord(t), "attempt-0-step-40")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"allocation_id": "alloc-1", "state": "reconciliation_required", "cid": "pvd-disk",
+		"decision_id": "shield-settle", "step_id": "attempt-0-step-40", "upid": settleMigrationTestUPID,
+		"task_status": "stopped", "exit_status": "OK", "vmid": "90144", "source_node": "pve",
+		"target_node": "pve2", "slot": "scsi2", "volume": "local-lvm:vm-90144-disk-1", "serial": "pvd-serial",
+	}
+	if !maps.Equal(summary, want) {
+		t.Fatalf("settle-migration summary = %v, want %v", summary, want)
+	}
+}
+
+// TestSettleMigrationSummaryRefusesARecordWithoutItsEvidence refuses to
+// print a success the record cannot back: a record with no evidence for the
+// step, a step the record lacks, and evidence that names another target.
+func TestSettleMigrationSummaryRefusesARecordWithoutItsEvidence(t *testing.T) {
+	noEvidence := settledMigrationRecord(t)
+	noEvidence.Verifications = nil
+	otherTarget := settledMigrationRecord(t)
+	otherTarget.Steps[0].Target.Node = "pve3"
+	for name, tc := range map[string]struct {
+		record aj.Record
+		step   string
+	}{
+		"no evidence":  {noEvidence, "attempt-0-step-40"},
+		"another step": {settledMigrationRecord(t), "attempt-0-step-41"},
+		"other target": {otherTarget, "attempt-0-step-40"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if summary, err := settleMigrationSummary(tc.record, tc.step); err == nil {
+				t.Fatalf("settleMigrationSummary = %v, nil; want an error", summary)
+			}
+		})
 	}
 }

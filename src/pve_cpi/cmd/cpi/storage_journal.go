@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -169,6 +170,26 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 	}
 	return 0
 }
+
+// settleMigrationSummary is the output of a settle-migration that succeeded:
+// the record's identity and state, and the evidence the settlement recorded
+// for step stepID. It returns an error when the record carries no evidence
+// for the step that matches it, so the CLI never reports a settlement it
+// cannot show.
+func settleMigrationSummary(record aj.Record, stepID string) (map[string]string, error) {
+	evidence, err := handlers.MigrationSettlementEvidenceOf(record, stepID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{
+		"allocation_id": record.ID, "state": string(record.State), "cid": record.CID,
+		"decision_id": evidence.DecisionID, "step_id": evidence.StepID, "upid": evidence.UPID,
+		"task_status": evidence.TaskStatus, "exit_status": evidence.ExitStatus, "vmid": strconv.Itoa(evidence.VMID),
+		"source_node": evidence.SourceNode, "target_node": evidence.TargetNode, "slot": evidence.Slot,
+		"volume": evidence.Volume, "serial": evidence.Serial,
+	}, nil
+}
+
 func storageJournalNodes(ctx context.Context, client pve.Client) ([]string, error) {
 	if client.Nodes() == nil {
 		return nil, storageJournalFixedError("PVE node service unavailable")
@@ -231,7 +252,11 @@ func runStorageJournalRecovery(ctx context.Context, action string, cfg *config.C
 		}
 		summary := map[string]string{"allocation_id": record.ID, "state": string(record.State), "cid": record.CID}
 		if action == storageJournalActionSettleMigration {
-			summary["step_id"] = request.MigrationStepID
+			if summary, err = settleMigrationSummary(record, request.MigrationStepID); err != nil {
+				storageJournalFail(stderr, "migration settled but its evidence could not be read back "+
+					"(inspect the record before retrying)", err)
+				return 1
+			}
 		}
 		if err = json.NewEncoder(stdout).Encode(summary); err != nil {
 			storageJournalFail(stderr, "allocation decision output could not be written", err)

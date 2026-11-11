@@ -99,7 +99,7 @@ func (d Deps) recordStorageReconciliation(ctx context.Context, outcome string) {
 		return
 	}
 	switch outcome {
-	case "adopted", "cleaned", "rejected", "required":
+	case "adopted", "cleaned", "rejected", "required", "settled":
 	default:
 		return
 	}
