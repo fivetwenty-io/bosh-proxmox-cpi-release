@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,9 +18,14 @@ import (
 	inv "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/storageinventory"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 const settleMigrationKind = "lifecycle_attach_disk_Nodes_CreateQemuMigrate"
+
+// releaseNumber matches a dotted release number such as 1.2.3.
+var releaseNumber = regexp.MustCompile(`\b\d+\.\d+\.\d+\b`)
 
 // settleMigrationPVE is the flow fake with the migration task readback the
 // SDK client serves. It answers every task read with task and taskErr, records
@@ -241,9 +247,10 @@ func assertMigrationSettled(t *testing.T, c *settleMigrationCase, before, record
 		t.Fatalf("record = %s (%q), want reconciliation_required with the decision's reason",
 			record.State, record.Reason)
 	}
-	if len(record.Steps) != len(before.Steps) || len(record.Verifications) != len(before.Verifications) {
-		t.Fatalf("settle-migration added steps or verifications")
+	if len(record.Steps) != len(before.Steps) {
+		t.Fatalf("settle-migration added steps")
 	}
+	assertMigrationSettlementEvidence(t, c, before, record)
 	for i := range record.Steps {
 		got, was := record.Steps[i], before.Steps[i]
 		if got.ID != c.step.ID {
@@ -348,7 +355,7 @@ func TestSettleMigrationRefusesWithoutProof(t *testing.T) {
 				d.MigrationStepID = c.appendSubmittedStep(t, settleMigrationKind, c.step.Target, nil, upid).ID
 				d.MigrationTaskUPID = upid
 			}},
-		{name: "copy-local migration", want: "copy-local migration is not supported",
+		{name: "copy-local migration", want: "settle-migration does not settle a copy-local migration",
 			setup: func(t *testing.T, c *settleMigrationCase, d *StorageAllocationDecision) {
 				charge := inv.ChargeRecord{
 					Charge:      inv.Charge{ID: "migrate", Node: "n1", StorageID: "b", Bytes: 1 << 30},
@@ -480,6 +487,9 @@ func TestSettleMigrationRefusesWithoutProof(t *testing.T) {
 			if !strings.Contains(text, tc.want) {
 				t.Fatalf("settle-migration refusal = %q (%v), want it to name %q", text, err, tc.want)
 			}
+			if releaseNumber.MatchString(text) {
+				t.Fatalf("settle-migration refusal = %q, want no release number in it", text)
+			}
 			if !reflect.DeepEqual(c.record(t), before) {
 				t.Fatalf("the refusal changed the journal")
 			}
@@ -568,5 +578,89 @@ func TestSettleMigrationRefusesAfterTheGuardDeniedAWrite(t *testing.T) {
 	}
 	if !reflect.DeepEqual(c.record(t), before) || c.mutations() != mutations {
 		t.Fatal("settlement after a denied write changed the journal or PVE")
+	}
+}
+
+// assertMigrationSettlementEvidence checks that settle-migration appended one
+// verification to the record, which proves nothing about ownership or absence
+// and carries the settlement's evidence, and that the evidence reads back.
+func assertMigrationSettlementEvidence(t *testing.T, c *settleMigrationCase, before, record aj.Record) {
+	t.Helper()
+	n := len(before.Verifications)
+	if len(record.Verifications) != n+1 || !reflect.DeepEqual(record.Verifications[:n], before.Verifications) {
+		t.Fatalf("verifications = %+v, want the earlier ones and one more", record.Verifications)
+	}
+	v := record.Verifications[n]
+	if !v.Complete || v.OwnershipVerified || v.AbsenceVerified || v.VMAbsenceVerified ||
+		v.ArtifactDispositionVerified || v.EvidenceID == "" || v.EvidenceJSON == "" {
+		t.Fatalf("settlement verification = %+v, want complete evidence that verifies nothing else", v)
+	}
+	evidence, err := MigrationSettlementEvidenceOf(record, c.step.ID)
+	if err != nil {
+		t.Fatalf("MigrationSettlementEvidenceOf: %v", err)
+	}
+	want := MigrationSettlementEvidence{
+		Scope: migrationSettlementScope, AllocationID: c.id, DecisionID: "shield-settle", StepID: c.step.ID,
+		Kind: settleMigrationKind, UPID: c.step.UPID, TaskStatus: "stopped", ExitStatus: "OK", SourceNode: "n2",
+		TargetNode: "n1", VMID: c.mover, Slot: "scsi0", Volume: c.step.Target.IntendedVolume,
+		Serial: record.DiskToken, ObservedAt: evidence.ObservedAt,
+	}
+	if evidence.ObservedAt == "" || !reflect.DeepEqual(evidence, want) {
+		t.Fatalf("settlement evidence = %+v, want %+v", evidence, want)
+	}
+	if _, err := MigrationSettlementEvidenceOf(record, c.step.ID+"-other"); err == nil {
+		t.Fatal("MigrationSettlementEvidenceOf found evidence for a step the record never settled")
+	}
+	if _, err := MigrationSettlementEvidenceOf(before, c.step.ID); err == nil {
+		t.Fatal("MigrationSettlementEvidenceOf found evidence before the settlement")
+	}
+}
+
+// TestSettleMigrationRecordsItsOutcome counts a settlement as settled and a
+// refused one as rejected, among the storage reconciliation outcomes.
+func TestSettleMigrationRecordsItsOutcome(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Error(err)
+		}
+	}()
+	metrics, err := NewStoragePlacementMetrics(provider.Meter("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := newSettleMigrationCase(t, true)
+	refused.deps.StorageMetrics = metrics
+	decision := refused.decision()
+	decision.PreviousWriterFenced = false
+	if _, err := refused.settle(decision); err == nil {
+		t.Fatal("settle-migration settled without the fencing attestation")
+	}
+	settled := newSettleMigrationCase(t, true)
+	settled.deps.StorageMetrics = metrics
+	if _, err := settled.settle(settled.decision()); err != nil {
+		t.Fatalf("settle-migration = %s", StorageAllocationDecisionFailure(err))
+	}
+
+	var data metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &data); err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]int64{}
+	for _, scope := range data.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok || m.Name != "cpi.storage.reconciliations" {
+				continue
+			}
+			for _, point := range sum.DataPoints {
+				outcome, _ := point.Attributes.Value("storage.reconciliation.outcome")
+				counts[outcome.AsString()] += point.Value
+			}
+		}
+	}
+	if want := map[string]int64{"rejected": 1, "settled": 1}; !reflect.DeepEqual(counts, want) {
+		t.Fatalf("reconciliation outcomes = %v, want %v", counts, want)
 	}
 }

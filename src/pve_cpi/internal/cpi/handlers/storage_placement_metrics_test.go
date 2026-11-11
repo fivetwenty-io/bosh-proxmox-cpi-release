@@ -72,7 +72,7 @@ func TestStorageReconciliationMetricsRejectArbitraryOutcomes(t *testing.T) {
 		t.Fatal(err)
 	}
 	deps := Deps{StorageMetrics: metrics}
-	for _, outcome := range []string{"adopted", "cleaned", "required", "rejected", "secret-arbitrary-id"} {
+	for _, outcome := range []string{"adopted", "cleaned", "required", "rejected", "settled", "secret-arbitrary-id"} {
 		deps.recordStorageReconciliation(context.Background(), outcome)
 	}
 	var data metricdata.ResourceMetrics
@@ -84,7 +84,7 @@ func TestStorageReconciliationMetricsRejectArbitraryOutcomes(t *testing.T) {
 	}
 	m := data.ScopeMetrics[0].Metrics[0]
 	sum, ok := m.Data.(metricdata.Sum[int64])
-	if !ok || m.Name != "cpi.storage.reconciliations" || len(sum.DataPoints) != 4 {
+	if !ok || m.Name != "cpi.storage.reconciliations" || len(sum.DataPoints) != 5 {
 		t.Fatalf("unexpected outcomes: %+v", m)
 	}
 	for _, point := range sum.DataPoints {
