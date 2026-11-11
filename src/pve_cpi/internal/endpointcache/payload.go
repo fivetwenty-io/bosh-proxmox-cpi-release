@@ -158,6 +158,14 @@ type ClusterIdentity struct {
 	// IdentityConflict is set when a changed identity was refused under
 	// verify_ssl false. It stays set until the operator deletes the file.
 	IdentityConflict bool `json:"identity_conflict"`
+	// EndpointNodes maps a configured endpoint's host:port to the name of the
+	// node it serves, as /cluster/status reported it as local when that
+	// endpoint answered. Every key is one of the key's endpoints and every
+	// name passes ValidateNodeName. It holds names only, never an address, a
+	// pin, or a secret, and it is left out of the file when it is empty. It
+	// belongs to the identity, so a verify_ssl true identity change replaces
+	// it and a refused change under verify_ssl false leaves it as stored.
+	EndpointNodes map[string]string `json:"endpoint_nodes,omitempty"`
 }
 
 // DiscoverySection is the last discovery's result, and the last attempt when
@@ -238,6 +246,7 @@ func (p *Payload) clone() *Payload {
 	out.Key.Endpoints = append([]string(nil), p.Key.Endpoints...)
 	if p.Cluster != nil {
 		cluster := *p.Cluster
+		cluster.EndpointNodes = cloneEndpointNodes(p.Cluster.EndpointNodes)
 		out.Cluster = &cluster
 	}
 	if p.Discovery != nil {
@@ -254,6 +263,19 @@ func (p *Payload) clone() *Payload {
 		out.ColdStart = &hint
 	}
 	return &out
+}
+
+// cloneEndpointNodes returns a copy of nodes. A nil or empty map comes back
+// nil, which is how a file leaves the field out.
+func cloneEndpointNodes(nodes map[string]string) map[string]string {
+	if len(nodes) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(nodes))
+	for endpoint, node := range nodes {
+		out[endpoint] = node
+	}
+	return out
 }
 
 // clone returns a deep copy of d.

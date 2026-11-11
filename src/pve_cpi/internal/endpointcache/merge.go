@@ -206,6 +206,13 @@ type Stored struct {
 // az_map does not name its node, because another entry that shares the key may
 // have written it, and it replaces the hint only with change.Hint.
 //
+// A result's endpoint_nodes join the stored ones when the result carries the
+// stored identity, with the result's name winning for an endpoint both name,
+// and replace them when the identity changed under verify_ssl true. A key
+// outside the key's endpoints is dropped, and a name that fails the pve-node
+// format refuses the result. A refused identity change under verify_ssl false
+// and a standing conflict leave the stored names as they were.
+//
 // The merge refuses every result while the stored identity holds a conflict,
 // with ErrIdentityConflict. Under verify_ssl false it refuses, with a
 // *TrustRefusalError, a result whose root CA differs from the stored one and
@@ -398,6 +405,11 @@ func applyResult(
 	if len(found) > 0 {
 		return nil, fmt.Errorf("%w: cluster observed_via is not a configured endpoint", ErrInvalidChange)
 	}
+	cluster.EndpointNodes, found, err = validateEndpointNodes(result.Cluster.EndpointNodes, key)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidChange, err)
+	}
+	*drops = append(*drops, found...)
 	var holds func(DiscoveredNode) bool
 	if !key.VerifySSL {
 		holds = func(n DiscoveredNode) bool {
@@ -424,10 +436,33 @@ func applyResult(
 	// A result is a discovery that answered, so it clears the pin failure the
 	// stored section recorded, and the section it writes carries none.
 	section.PinFailedAt = time.Time{}
+	cluster.EndpointNodes = carryEndpointNodes(state.usable, cluster)
 	next.Cluster = &cluster
 	next.Discovery = section
 	next.ColdStart = nil
 	return held, nil
+}
+
+// carryEndpointNodes returns the endpoint names a written identity holds. The
+// result's names are for the endpoints that answered this discovery, so they
+// join the stored names of the same identity, and a name the result gives for
+// an endpoint replaces the stored one. A result for another identity, which
+// only verify_ssl true lets through, starts over, because the stored names
+// belong to a cluster the configured endpoints no longer report. Under
+// verify_ssl false that case never reaches here, because the trust rules
+// refuse it first.
+func carryEndpointNodes(stored *Payload, cluster ClusterIdentity) map[string]string {
+	if stored == nil || stored.Cluster == nil || stored.Cluster.RootCASHA256 != cluster.RootCASHA256 {
+		return cluster.EndpointNodes
+	}
+	out := cloneEndpointNodes(stored.Cluster.EndpointNodes)
+	for endpoint, node := range cluster.EndpointNodes {
+		if out == nil {
+			out = make(map[string]string, len(cluster.EndpointNodes))
+		}
+		out[endpoint] = node
+	}
+	return out
 }
 
 // withoutHeld returns drops less the expired and future drops of the stored

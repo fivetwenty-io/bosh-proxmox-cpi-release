@@ -90,6 +90,14 @@ type Observation struct {
 	Quorate bool
 	// Nodes are the discovered peers in the order the walk should try them.
 	Nodes []ObservedNode
+	// EndpointNodes maps a configured endpoint, as host:port, to the node
+	// name /cluster/status reported as local when that endpoint answered the
+	// status read. The worker records an entry only when it knows which
+	// configured endpoint answered, so an observation without one carries
+	// none. A key outside the key's endpoints is left out, and a name that
+	// fails the pve-node format refuses the observation. The merge adds the
+	// entries to the names the stored identity already holds.
+	EndpointNodes map[string]string
 }
 
 // ObservedNode is one peer an observation found.
@@ -377,6 +385,12 @@ func observedResult(
 	}, key)
 	if err != nil || len(found) > 0 {
 		return ClusterIdentity{}, DiscoverySection{}, nil, ErrUnconfiguredSource
+	}
+	// A key outside the key's endpoints is dropped here as Merge drops it, and
+	// a name Merge would refuse is refused now.
+	cluster.EndpointNodes, _, err = validateEndpointNodes(obs.EndpointNodes, key)
+	if err != nil {
+		return ClusterIdentity{}, DiscoverySection{}, nil, fmt.Errorf("%w: %w", ErrInvalidChange, err)
 	}
 
 	wait := RefreshInterval

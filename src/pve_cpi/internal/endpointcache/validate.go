@@ -95,8 +95,9 @@ func (d Drop) String() string { return d.Record + " dropped: " + string(d.Reason
 // pin or more than MaxPinsPerNode, when the file holds more than MaxNodes nodes
 // or two nodes with one name, when the cluster identity is not 32 bytes of hex
 // or a discovery lists nodes without one, when the outcome is one that holds
-// no nodes and the discovery lists some, and when an outcome, observed_via, or
-// a hint's name is not valid.
+// no nodes and the discovery lists some, when an outcome, observed_via, or
+// a hint's name is not valid, and when endpoint_nodes names something that is
+// not an endpoint or holds a name that fails the pve-node format.
 //
 // A single record is dropped, and the rest of the file stands, when a node name
 // is all digits, a 0x hex spelling, or a loopback alias, when a node's address
@@ -105,7 +106,9 @@ func (d Drop) String() string { return d.Record + " dropped: " + string(d.Reason
 // node's derived address is one of the key's configured endpoints, when a
 // mark is older than markTTL, ahead, or names something that is not an
 // endpoint or a class that is not enumerated, when observed_via names an
-// endpoint outside the key, and when the hint is older than hintTTL or ahead.
+// endpoint outside the key, when an endpoint_nodes key names an endpoint
+// outside the key or its name is one a resolver could misread, and when the
+// hint is older than hintTTL or ahead.
 // A discovery whose own time is ahead is dropped whole, a next-refresh time
 // further ahead than MaxRefreshWait is dropped so the refresh is due now, and
 // a pin_failed_at more than FutureSkew ahead is dropped so it counts for
@@ -158,6 +161,12 @@ func readStored(p *Payload, key Key, now time.Time) (storedState, []Drop, error)
 			return storedState{}, nil, err
 		}
 		drops = append(drops, found...)
+		nodes, found, err := validateEndpointNodes(p.Cluster.EndpointNodes, key)
+		if err != nil {
+			return storedState{}, nil, err
+		}
+		drops = append(drops, found...)
+		cluster.EndpointNodes = nodes
 		out.Cluster = &cluster
 	}
 	if p.Discovery != nil {
@@ -232,6 +241,50 @@ func validateCluster(c ClusterIdentity, key Key) (ClusterIdentity, []Drop, error
 		}
 	}
 	return c, drops, nil
+}
+
+// validateEndpointNodes checks the configured endpoints' node names against
+// key and returns them keyed by the host:port spelling the key uses. A key
+// that is not an endpoint, or a name that fails the pve-node format, makes the
+// file unusable. A key that names an endpoint outside the key is dropped alone
+// with the not-configured reason, and so is a name a resolver could misread
+// and a second spelling of an endpoint an earlier key already named, so the
+// rest of the file stands, the identity with it. The result is nil when no
+// entry is left.
+func validateEndpointNodes(nodes map[string]string, key Key) (map[string]string, []Drop, error) {
+	if len(nodes) == 0 {
+		return nil, nil, nil
+	}
+	configured := keyDerivation(key).configured
+	out := make(map[string]string, len(nodes))
+	var drops []Drop
+	for _, endpoint := range sortedKeys(nodes) {
+		normalized, ok := normalizeMarkEndpoint(endpoint)
+		if !ok {
+			return nil, nil, fmt.Errorf("%w: cluster endpoint_nodes names something that is not an endpoint",
+				ErrPayloadInvalid)
+		}
+		if err := ValidateNodeName(nodes[endpoint]); err != nil {
+			if errors.Is(err, ErrNodeNameAmbiguous) {
+				drops = append(drops, Drop{Record: "endpoint node", Reason: DropAmbiguousName})
+				continue
+			}
+			return nil, nil, fmt.Errorf("%w: cluster endpoint_nodes holds a name that fails the pve-node format",
+				ErrPayloadInvalid)
+		}
+		switch _, repeated := out[normalized]; {
+		case !slices.Contains(configured, normalized):
+			drops = append(drops, Drop{Record: "endpoint node", Reason: DropNotConfigured})
+		case repeated:
+			drops = append(drops, Drop{Record: "endpoint node", Reason: DropInvalid})
+		default:
+			out[normalized] = nodes[endpoint]
+		}
+	}
+	if len(out) == 0 {
+		return nil, drops, nil
+	}
+	return out, drops, nil
 }
 
 // normalizeHex returns the lowercase spelling of s when it is 32 bytes of hex.
@@ -532,7 +585,7 @@ func validateHint(h ColdStartHint, now time.Time) (*ColdStartHint, []Drop, error
 
 // sortedKeys returns the keys of marks in order, so the same input drops and
 // keeps the same records every time.
-func sortedKeys(marks map[string]DownMark) []string {
+func sortedKeys[V any](marks map[string]V) []string {
 	keys := make([]string, 0, len(marks))
 	for k := range marks {
 		keys = append(keys, k)
