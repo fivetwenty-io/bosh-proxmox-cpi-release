@@ -1155,14 +1155,11 @@ func TestCallsJudgedAsFindsACall(t *testing.T) {
 // JudgedAs names. The policy it was called on keeps the effective user.
 func TestJudgedAsNamesTheOwnerTheChecksWant(t *testing.T) {
 	dir := t.TempDir()
-	info, err := os.Lstat(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if info, err = os.Lstat(dir); err != nil {
+	info, err := os.Lstat(dir)
+	if err != nil {
 		t.Fatal(err)
 	}
 	p := Policy{Label: "judged"}
