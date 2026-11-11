@@ -167,7 +167,6 @@ func TestNewRefusesBadCandidates(t *testing.T) {
 		mutate func(*Config)
 		want   string
 	}{
-		{"no prober", func(c *Config) { c.Prober = nil }, "need a prober"},
 		{"verify_ssl false", func(c *Config) { c.Base = baseFor(nil, l.d) }, "verify_ssl true"},
 		{"no CA", func(c *Config) {
 			c.Base = &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
@@ -284,16 +283,21 @@ func TestColdStartSendsToTheAcceptedCandidate(t *testing.T) {
 	}
 	mustActive(t, p, c.Address)
 	lines := l.failovers()
-	if len(lines) != 1 || !strings.Contains(lines[0].Message, "a cold-start candidate for node pve2 from "+
-		"placement.az_map that proved its membership, which stays active for this call") {
-		t.Fatalf("failover lines = %v", lines)
+	head := "pve endpoint failover: " + seed.Addr + " unreachable ("
+	tail := ") and no cached nodes, request sent to pve2.example.com:8006 from placement.az_map after it proved " +
+		"membership"
+	if len(lines) != 1 || !strings.HasPrefix(lines[0].Message, head) || !strings.HasSuffix(lines[0].Message, tail) ||
+		lines[0].Attrs["node"] != "pve2" {
+		t.Fatalf("failover lines = %+v", lines)
 	}
 	wantMarks(t, sink.all(), map[string]Phase{seed.Addr: PhaseDial})
 
+	// The next read tries the seed first, because a walk reaches the accepted
+	// candidate only after every configured endpoint failed in that walk.
 	resp, err = p.RoundTrip(tokenRequest(t, context.Background(), http.MethodGet, seed.Addr, "/cluster/resources", ""))
 	mustStatus(t, resp, err, http.StatusOK)
-	if prober.calls.Load() != 1 || seed.Counts.Dials.Load() != 1 || cand.Counts.Requests.Load() != 3 {
-		t.Fatalf("probes %d, seed dials %d, candidate requests %d, want 1, 1, 3",
+	if prober.calls.Load() != 1 || seed.Counts.Dials.Load() != 2 || cand.Counts.Requests.Load() != 3 {
+		t.Fatalf("probes %d, seed dials %d, candidate requests %d, want 1, 2, 3",
 			prober.calls.Load(), seed.Counts.Dials.Load(), cand.Counts.Requests.Load())
 	}
 
@@ -311,27 +315,37 @@ func TestColdStartSendsToTheAcceptedCandidate(t *testing.T) {
 	}
 }
 
-// A fresh mutation whose seed proved it unsent goes to the accepted candidate,
-// its tether follows the candidate through the candidate's own clones, and the
-// next mutation with its key goes there too, never through a routed clone.
-func TestColdStartMutationTetherFollowsTheCandidate(t *testing.T) {
+// A fresh mutation whose seed proved it unsent goes to the accepted candidate
+// through the candidate's own clones, never through a routed clone. The next
+// mutation with its key would follow that tether, and a tethered request never
+// goes to a candidate, so it is refused before any dial.
+func TestColdStartMutationTetheredToTheCandidateIsRefused(t *testing.T) {
 	l := newLab(t)
 	seed := l.refused(t)
 	cand, c := l.candidate(t, "pve2.example.com", nil)
 	p := newPool(t, l.coldConfig(&fakeProber{}, []Candidate{c}, configured(seed.Addr)))
-	for range 2 {
-		resp, err := p.RoundTrip(tokenRequest(t, context.Background(), http.MethodPost, seed.Addr, fanOutRoute,
-			"vmid=101"))
-		mustStatus(t, resp, err, http.StatusOK)
-	}
-	if n := cand.Counts.Method(http.MethodPost); n != 2 {
-		t.Fatalf("candidate got %d POSTs, want 2", n)
-	}
+	resp, err := p.RoundTrip(tokenRequest(t, context.Background(), http.MethodPost, seed.Addr, fanOutRoute,
+		"vmid=101"))
+	mustStatus(t, resp, err, http.StatusOK)
 	p.mu.Lock()
 	routed := len(p.routed)
 	p.mu.Unlock()
 	if routed != 0 {
 		t.Fatalf("%d routed clones, want the mutation on the candidate's own", routed)
+	}
+	dials := seed.Counts.Dials.Load()
+	_, err = p.RoundTrip(tokenRequest(t, context.Background(), http.MethodPost, seed.Addr, fanOutRoute, "vmid=102"))
+	if err == nil || !strings.Contains(err.Error(), "a tethered request never goes to a cold-start candidate") {
+		t.Fatalf("err = %v, want the tethered refusal", err)
+	}
+	if IsMaybeSent(err) {
+		t.Fatalf("err = %v, want it proven unsent", err)
+	}
+	if n := cand.Counts.Method(http.MethodPost); n != 1 {
+		t.Fatalf("candidate got %d POSTs, want 1", n)
+	}
+	if n := seed.Counts.Dials.Load(); n != dials {
+		t.Fatalf("the refused mutation dialed the seed %d times", n-dials)
 	}
 }
 
@@ -359,6 +373,9 @@ func TestColdStartCountsAgainstTheHopCap(t *testing.T) {
 			mustUnreachable(t, err, want...)
 			if got := int(prober.calls.Load()); got != 4-seeds {
 				t.Fatalf("%d probes, want %d", got, 4-seeds)
+			}
+			if begun := coldBegun(p); begun != (seeds < 4) {
+				t.Fatalf("cold start begun = %v with %d seeds", begun, seeds)
 			}
 			if seeds < 4 && !strings.Contains(err.Error(), "cold-start candidate for node pve2 from placement.az_map") {
 				t.Fatalf("err = %v, want it to name the refused candidate", err)
@@ -402,6 +419,9 @@ func TestColdStartCountsAgainstTheBudgets(t *testing.T) {
 			}
 			if got := prober.calls.Load(); got != tc.probes {
 				t.Fatalf("%d probes, want %d", got, tc.probes)
+			}
+			if begun := coldBegun(p); begun != (tc.probes > 0) {
+				t.Fatalf("cold start begun = %v", begun)
 			}
 			if got := clock.now().Sub(start); got != tc.spent || got > 55*time.Second {
 				t.Fatalf("walk spent %v, want %v", got, tc.spent)
@@ -471,6 +491,11 @@ func TestColdStartNeverRunsForBarredRequests(t *testing.T) {
 			req.Header.Set("CSRFPreventionToken", "csrf")
 			return req
 		}},
+		{"two tokens", nil, func(t *testing.T, s *setup, _ *Pool) *http.Request {
+			req := tokenRequest(t, context.Background(), http.MethodGet, s.seeds[0], "/cluster/resources", "")
+			req.Header.Add("Authorization", coldToken)
+			return req
+		}},
 		{"bare token scheme", nil, func(t *testing.T, s *setup, _ *Pool) *http.Request {
 			req := apiRequest(t, context.Background(), http.MethodGet, s.seeds[0], "/cluster/resources", "")
 			req.Header.Set("Authorization", apiTokenScheme)
@@ -504,10 +529,7 @@ func TestColdStartNeverRunsForBarredRequests(t *testing.T) {
 			if n := cand.Counts.Conns.Load(); n != 0 {
 				t.Fatalf("the candidate got %d connections, want none", n)
 			}
-			p.cold.mu.Lock()
-			begun := p.cold.begun
-			p.cold.mu.Unlock()
-			if begun {
+			if coldBegun(p) {
 				t.Fatal("the cold start began")
 			}
 		})
@@ -646,8 +668,10 @@ func TestColdStartRefusedRunEndsTheColdStart(t *testing.T) {
 	if n := f.cand.Counts.Conns.Load(); n != 0 {
 		t.Fatalf("candidate got %d connections from a prober that never probed", n)
 	}
-	if n := len(f.l.entries(slog.LevelDebug, "pve endpoints: no cold-start candidate")); n != 1 {
-		t.Fatalf("%d end lines, want 1", n)
+	end := f.l.entries(slog.LevelDebug, "pve endpoints: the cold start from placement.az_map accepted no candidate")
+	if len(end) != 1 || !strings.HasSuffix(end[0].Message, "because every candidate was refused, so no later "+
+		"request in this call tries one") || end[0].Attrs["reason"] != "refused" {
+		t.Fatalf("end lines = %+v", end)
 	}
 }
 
@@ -794,19 +818,28 @@ func TestColdStartAcceptsOnlyAProvedProbe(t *testing.T) {
 }
 
 // The probe transport sends one GET of the probe path over https to its
-// candidate, and refuses anything else before any dial.
+// candidate, with the one API token the pool handed the prober and no ticket,
+// and refuses anything else before any dial.
 func TestProbeTransportRefusesOtherRequests(t *testing.T) {
 	l := newLab(t)
 	cand, c := l.candidate(t, "pve2.example.com", nil)
 	p := newPool(t, l.coldConfig(&fakeProber{}, []Candidate{c}, configured("10.0.0.1:8006")))
-	newReq := func(method, url string, body io.Reader) *http.Request {
+	newReq := func(method, url string, body io.Reader, header ...string) *http.Request {
 		req, err := http.NewRequestWithContext(context.Background(), method, url, body)
 		if err != nil {
 			t.Fatal(err)
 		}
+		req.Header.Set("Authorization", coldToken)
+		for i := 0; i+1 < len(header); i += 2 {
+			req.Header.Add(header[i], header[i+1])
+		}
 		return req
 	}
 	base := "https://" + c.Address
+	noAuth := newReq(http.MethodGet, base+ProbePath, nil)
+	noAuth.Header.Del("Authorization")
+	otherToken := newReq(http.MethodGet, base+ProbePath, nil)
+	otherToken.Header.Set("Authorization", coldToken+"x")
 	for _, tc := range []struct {
 		name string
 		req  *http.Request
@@ -817,40 +850,60 @@ func TestProbeTransportRefusesOtherRequests(t *testing.T) {
 		{"host", newReq(http.MethodGet, "https://pve3.example.com:8006"+ProbePath, nil)},
 		{"path", newReq(http.MethodGet, base+APIPrefix+"/cluster/resources", nil)},
 		{"no URL", &http.Request{Method: http.MethodGet}},
+		{"no Authorization", noAuth},
+		{"another token", otherToken},
+		{"a second Authorization", newReq(http.MethodGet, base+ProbePath, nil, "Authorization", coldToken)},
+		{"cookie", newReq(http.MethodGet, base+ProbePath, nil, "Cookie", "PVEAuthCookie=ticket")},
+		{"CSRF token", newReq(http.MethodGet, base+ProbePath, nil, "CSRFPreventionToken", "csrf")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rt := &probeTransport{c: p.cold.candidates[0]}
-			if _, err := rt.RoundTrip(tc.req); !errors.Is(err, errProbeRequest) {
+			rt := newProbeTransport(context.Background(), p.cold.candidates[0], coldToken)
+			_, err := rt.RoundTrip(tc.req)
+			if !errors.Is(err, errProbeRequest) {
 				t.Fatalf("err = %v, want the probe refusal", err)
 			}
-			if err := rt.proof(); !errors.Is(err, errNotProbed) {
-				t.Fatalf("proof = %v, want errNotProbed", err)
+			if msg := err.Error(); strings.Contains(msg, "secret") || strings.Contains(msg, "PVEAuthCookie") ||
+				strings.Contains(msg, "csrf") {
+				t.Fatalf("the refusal names a credential: %v", err)
+			}
+			if err := rt.seal(); !errors.Is(err, errNotProbed) {
+				t.Fatalf("seal = %v, want errNotProbed", err)
 			}
 		})
 	}
 	if n := cand.Counts.Conns.Load(); n != 0 {
 		t.Fatalf("a refused probe made %d connections", n)
 	}
-	rt := &probeTransport{c: p.cold.candidates[0]}
+	rt := newProbeTransport(context.Background(), p.cold.candidates[0], coldToken)
 	resp, err := rt.RoundTrip(newReq(http.MethodGet, base+ProbePath, nil))
 	mustStatus(t, resp, err, http.StatusOK)
 	if _, err := rt.RoundTrip(newReq(http.MethodGet, base+ProbePath, nil)); !errors.Is(err, errProbeReused) {
 		t.Fatalf("second probe err = %v, want errProbeReused", err)
 	}
-	if err := rt.proof(); err != nil {
-		t.Fatalf("proof = %v", err)
+	if err := rt.seal(); err != nil {
+		t.Fatalf("seal = %v", err)
+	}
+	if _, err := rt.RoundTrip(newReq(http.MethodGet, base+ProbePath, nil)); !errors.Is(err, errProbeSealed) {
+		t.Fatalf("probe after the seal err = %v, want errProbeSealed", err)
+	}
+	if n := cand.Counts.Requests.Load(); n != 1 {
+		t.Fatalf("candidate got %d requests, want the one probe", n)
 	}
 	if rt.c.probe.ResponseHeaderTimeout != probeHeaderDeadline {
 		t.Fatalf("probe header deadline = %v", rt.c.probe.ResponseHeaderTimeout)
 	}
-	if ep := rt.c.ep; ep.transports.plain.ResponseHeaderTimeout != 0 || ep.transports.idempotent != ep.transports.plain {
-		t.Fatal("the candidate's request clone carries a header deadline")
+	if ep := rt.c.ep; ep.transports.plain.ResponseHeaderTimeout != 0 ||
+		ep.transports.idempotent.ResponseHeaderTimeout != defaultHeaderDeadline {
+		t.Fatalf("candidate clones carry header deadlines %v and %v, want none and %v",
+			ep.transports.plain.ResponseHeaderTimeout, ep.transports.idempotent.ResponseHeaderTimeout,
+			defaultHeaderDeadline)
 	}
 }
 
 // An accepted candidate that later fails TLS verification gets no mark, is
-// logged at Error, and leaves every later walk. A walk that read its order
-// before that refuses the hop before any dial.
+// logged once at Error and at no other level, has its idle connections closed,
+// and leaves every later walk. A walk that took it before that refuses the hop
+// before any dial.
 func TestColdStartCandidateFailingVerificationLater(t *testing.T) {
 	l := newLab(t)
 	seed := l.refused(t)
@@ -861,12 +914,14 @@ func TestColdStartCandidateFailingVerificationLater(t *testing.T) {
 	p := newPool(t, cfg)
 	resp, err := p.RoundTrip(tokenRequest(t, context.Background(), http.MethodGet, seed.Addr, "/cluster/resources", ""))
 	mustStatus(t, resp, err, http.StatusOK)
+	accepted := p.memberAt(c.Address)
+	if accepted == nil || accepted.kind != kindCandidate {
+		t.Fatalf("memberAt = %v, want the accepted candidate", accepted)
+	}
 
 	early := p.newWalker(tokenRequest(t, context.Background(), http.MethodGet, seed.Addr, "/cluster/resources", ""),
 		false, defaultBounds())
-	if len(early.order) != 2 || early.order[0].addr != c.Address {
-		t.Fatalf("order after acceptance = %v, want the candidate first", early.order)
-	}
+	early.order, early.limit = []*endpoint{accepted, early.order[0]}, 2
 
 	bad := l.otherLeaf(t)
 	l.d.set(c.Address, func(ctx context.Context, network, _ string) (net.Conn, error) {
@@ -874,13 +929,24 @@ func TestColdStartCandidateFailingVerificationLater(t *testing.T) {
 	})
 	p.CloseIdleConnections()
 	_, err = p.RoundTrip(tokenRequest(t, context.Background(), http.MethodGet, seed.Addr, "/cluster/resources", ""))
-	mustUnreachable(t, err, c.Address, seed.Addr)
-	if lines := l.entries(slog.LevelError, "pve endpoint "+c.Address+": the cold-start candidate"); len(lines) != 1 {
+	mustUnreachable(t, err, seed.Addr, c.Address)
+	prefix := "pve endpoint " + c.Address + ": the cold-start candidate"
+	if lines := l.entries(slog.LevelError, prefix); len(lines) != 1 {
 		t.Fatalf("error lines = %v", lines)
 	}
+	for _, e := range l.obs.All() {
+		if e.Level != slog.LevelError && strings.HasPrefix(e.Message, prefix) &&
+			strings.Contains(e.Message, "failed TLS") {
+			t.Fatalf("the revocation was also logged at %v: %q", e.Level, e.Message)
+		}
+	}
 	wantMarks(t, sink.all(), map[string]Phase{seed.Addr: PhaseDial})
-	if order, _ := p.walkOrder(false); len(order) != 1 || order[0].addr != seed.Addr {
-		t.Fatalf("order after the failure = %v", order)
+
+	conns := bad.Counts.Conns.Load()
+	_, err = p.RoundTrip(tokenRequest(t, context.Background(), http.MethodGet, seed.Addr, "/cluster/resources", ""))
+	mustUnreachable(t, err, seed.Addr)
+	if n := bad.Counts.Conns.Load(); n != conns {
+		t.Fatal("a later walk dialed the revoked candidate")
 	}
 
 	requests := cand.Counts.Requests.Load() + bad.Counts.Requests.Load()
@@ -895,10 +961,15 @@ func TestColdStartCandidateFailingVerificationLater(t *testing.T) {
 	if ep := p.memberAt(c.Address); ep == nil {
 		t.Fatal("memberAt lost the revoked candidate, which a tether on it must still find")
 	}
+	if lines := l.entries(slog.LevelError, prefix); len(lines) != 1 {
+		t.Fatalf("error lines after the early walk = %v", lines)
+	}
 }
 
-// Candidates never count toward a configured endpoint's final hop, so a seed
-// behind an accepted candidate is still final and gets no header deadline.
+// A candidate counts toward a hop's final-hop decision only as that hop's own
+// endpoint. A seed with a candidate after it keeps the decision it would have
+// without one, and a candidate with an endpoint after it is not the final hop,
+// so it gets the header deadline.
 func TestColdStartCandidateLeavesTheFinalHop(t *testing.T) {
 	l := newLab(t)
 	seed, two := l.refused(t), l.refused(t)
@@ -908,25 +979,29 @@ func TestColdStartCandidateLeavesTheFinalHop(t *testing.T) {
 	mustStatus(t, resp, err, http.StatusOK)
 	w := p.newWalker(tokenRequest(t, context.Background(), http.MethodGet, seed.Addr, "/cluster/resources", ""),
 		false, defaultBounds())
-	if len(w.order) != 3 || w.order[0].kind != kindCandidate {
-		t.Fatalf("order = %v", w.order)
+	if len(w.order) != 2 || w.order[0].kind != KindConfigured || w.order[1].kind != KindConfigured {
+		t.Fatalf("order after acceptance = %v, want the seeds only", w.order)
 	}
-	w.made = 1
-	if !w.wantsDeadline(1, true) {
-		t.Fatal("the first seed behind the candidate lost its deadline")
-	}
-	w.made = 2
-	if w.wantsDeadline(2, true) {
-		t.Fatal("the last seed behind the candidate got a deadline")
-	}
-	w.order = []*endpoint{w.order[1], w.order[2], w.order[0]}
-	w.made = 0
-	if !w.wantsDeadline(0, true) {
-		t.Fatal("the first seed ahead of the candidate lost its deadline")
-	}
-	w.made = 1
-	if w.wantsDeadline(1, true) {
-		t.Fatal("the candidate after the last seed made the seed non-final")
+	s1, s2, cand := w.order[0], w.order[1], p.memberAt(c.Address)
+	for _, tc := range []struct {
+		name  string
+		order []*endpoint
+		made  int
+		want  bool
+	}{
+		{"seed behind a leading candidate", []*endpoint{cand, s1, s2}, 1, true},
+		{"last seed behind a leading candidate", []*endpoint{cand, s1, s2}, 2, false},
+		{"first seed ahead of the candidate", []*endpoint{s1, s2, cand}, 0, true},
+		{"last seed ahead of the candidate", []*endpoint{s1, s2, cand}, 1, false},
+		{"candidate ahead of a seed", []*endpoint{cand, s1}, 0, true},
+		{"candidate as the last hop", []*endpoint{s1, cand}, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w.order, w.made = tc.order, tc.made
+			if got := w.wantsDeadline(tc.made, true); got != tc.want {
+				t.Fatalf("wantsDeadline = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

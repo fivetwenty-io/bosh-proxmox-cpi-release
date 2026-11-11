@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,17 +100,19 @@ type Config struct {
 	FirstAnswer FirstAnswerHook
 	// Candidates are the cold-start candidates, the nodes the entry's
 	// placement.az_map names, which the caller builds only when Gate says the
-	// pool carries them. They come after every configured endpoint, they are
-	// not endpoints of the pool until a probe accepts one, and they count
-	// toward neither the pool's size nor its final hop. Only a walk in which
+	// pool carries them. They are never in a walk's order and count toward
+	// neither the pool's size nor its header deadlines. Only a walk in which
 	// every configured endpoint failed its dial, DNS lookup, or handshake
-	// reaches them, and the process probes them in one walk at most. A pool
-	// with candidates needs Prober, verify_ssl true with the operator's CA
-	// on Base, and no discovered endpoint.
+	// reaches them, through the cold start, and that holds for the candidate
+	// a probe accepted as well. The process runs one cold start, which
+	// probes each candidate once at most. A pool with candidates needs
+	// verify_ssl true with the operator's CA on Base and no discovered
+	// endpoint.
 	Candidates []Candidate
 	// Prober decides whether a candidate is a member of the entry's
-	// cluster. It is needed when Candidates is not empty and unused
-	// otherwise.
+	// cluster. A pool given candidates without a Prober, or with a typed nil
+	// one, carries no candidates and logs that at Warn. It is unused when
+	// Candidates is empty.
 	Prober Prober
 
 	// headerDeadline replaces the 60-second response-header deadline. Only
@@ -123,6 +124,13 @@ type Config struct {
 	// onColdStartWait is called by a walk just before it waits for another
 	// walk's cold start. Only the package's tests set it.
 	onColdStartWait func()
+	// probeLimit, candidateDialCap, and candidateHandshakeCap replace the
+	// cold start's 25-second probe limit and a candidate's 5-second dial
+	// and 10-second handshake caps. Only the package's tests set them. Zero
+	// means the default.
+	probeLimit            time.Duration
+	candidateDialCap      time.Duration
+	candidateHandshakeCap time.Duration
 }
 
 // endpoint is one endpoint of a pool. Everything but demoted, ineligible,
@@ -212,9 +220,6 @@ type Pool struct {
 	// routed holds the clones built on first use for a routed host that is
 	// not one of the pool's endpoints.
 	routed map[string]*ownedTransports
-	// coldAccepted is the candidate the cold start accepted, which walks try
-	// after the configured endpoints, or nil.
-	coldAccepted *endpoint
 
 	// walk is what the pool's walks remember for their log lines.
 	walk walkState
@@ -238,7 +243,9 @@ type Pool struct {
 // 60-second response-header deadline. A pool of one endpoint keeps today's
 // behavior, so its one clone has no header deadline. Cold-start candidates
 // count toward neither, so a pool of one configured endpoint and its
-// candidates keeps that one clone without a deadline.
+// candidates keeps that one clone without a deadline. A candidate's own
+// idempotent clone always carries the deadline, which a request uses only
+// when the candidate is not its walk's final hop.
 func New(cfg Config) (*Pool, error) {
 	if err := checkBase(cfg.Base); err != nil {
 		return nil, err
@@ -470,26 +477,23 @@ func (p *Pool) current() (*endpoint, uint64) {
 // configuredOnly, only the configured endpoints are returned, which is the
 // order for a ticket login and for a request with the configured-only marker.
 //
-// The candidate the cold start accepted follows the pool's endpoints within
-// its group, so no mark moves it ahead of a configured endpoint, and it leads
-// only when it is active. A configured-only walk never takes it, and a
-// candidate no probe accepted is never in any order.
+// No cold-start candidate is ever in an order, the one a probe accepted
+// included, even while it is active. A walk reaches that candidate only
+// through the cold start, after every configured endpoint failed in the
+// connect phase in that walk, as coldStartDue describes, and then only as its
+// last hop.
 func (p *Pool) walkOrder(configuredOnly bool) ([]*endpoint, uint64) {
 	now := p.now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	members := p.endpoints
-	if p.coldAccepted != nil {
-		members = append(slices.Clip(p.endpoints), p.coldAccepted)
-	}
-	order := make([]*endpoint, 0, len(members))
+	order := make([]*endpoint, 0, len(p.endpoints))
 	var lead *endpoint
-	if !p.active.demoted && eligibleLocked(p.active, configuredOnly) {
+	if p.active.kind != kindCandidate && !p.active.demoted && eligibleLocked(p.active, configuredOnly) {
 		lead = p.active
 		order = append(order, lead)
 	}
 	for _, back := range []bool{false, true} {
-		for _, ep := range members {
+		for _, ep := range p.endpoints {
 			if ep == lead || !eligibleLocked(ep, configuredOnly) || atBackLocked(ep, now) != back {
 				continue
 			}

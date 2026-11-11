@@ -48,7 +48,8 @@ const snapshotTries = 3
 //     When every configured endpoint failed its dial, DNS lookup, or
 //     handshake in the walk, and the pool carries cold-start candidates, a
 //     request that authenticates with an API token goes on to the cold
-//     start, as coldStartDue describes.
+//     start, as coldStartDue describes. That is the only way a walk reaches
+//     a candidate, the one the cold start accepted included.
 //
 // A walk clones the request for each hop with req.Clone, puts the endpoint's
 // address in the clone's URL.Host, leaves its Host empty, and rebuilds its
@@ -170,10 +171,16 @@ func (p *Pool) dispatchMutation(req *http.Request, h *tetherHold, addr string, r
 // outside the pool gets the routed path. A configured-only request whose
 // tether names an endpoint that is not configured is refused by the routed
 // path before any dial, so a credential never reaches an address the
-// operator did not list.
+// operator did not list. A tether that names the accepted cold-start
+// candidate is refused before any dial, because a tethered request never goes
+// to a candidate.
 func (p *Pool) sendFollowing(req *http.Request, target tetherTarget, configuredOnly bool, b bounds,
 ) (*http.Response, outcome, error) {
 	ep := p.memberAt(target.addr)
+	if ep != nil && ep.kind == kindCandidate {
+		closeRequestBody(req)
+		return nil, unsent, refuseTetheredCandidate(req, ep)
+	}
 	if ep == nil || (configuredOnly && ep.kind != KindConfigured) {
 		return p.sendRouted(req, target, nil, configuredOnly)
 	}
@@ -193,9 +200,12 @@ func (p *Pool) sendFollowing(req *http.Request, target tetherTarget, configuredO
 //
 // A configured-only request goes to a routed host only when that host is a
 // configured endpoint, so a credential never reaches an address the operator
-// did not list, and no request goes to a discovered endpoint that failed its
-// pin. A failure that blamesEndpoint counts against one of the pool's
-// endpoints demotes it and is recorded as a connect-phase failure, and nothing
+// did not list, no request goes to a discovered endpoint that failed its pin,
+// and none goes to a cold-start candidate that a probe accepted and that
+// failed TLS verification since. A candidate is no endpoint of the pool here,
+// so a routed host at its address otherwise uses the routed clones. A
+// failure that blamesEndpoint counts against one of the pool's endpoints
+// demotes it and is recorded as a connect-phase failure, and nothing
 // a routed request gets ever makes an endpoint active. When the request's own
 // context ends during the dial, net/http returns the context's error, which
 // carries no tag, so a cancelled request records nothing. A pin failure that
@@ -218,6 +228,12 @@ func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCl
 		oc := unsent
 		oc.class = string(PhasePin)
 		return nil, oc, p.refusalFor(ep)
+	}
+	if c := p.memberAt(addr); c != nil && c.kind == kindCandidate && p.ineligibleNow(c) {
+		closeSendBody(req, body)
+		oc := unsent
+		oc.class = string(PhaseTLSVerify)
+		return nil, oc, refuseRevoked(addr)
 	}
 	o, err := p.routedTransportsAt(addr, (&url.URL{Host: target.urlHost}).Hostname())
 	if err != nil {
@@ -471,7 +487,9 @@ func (w *walker) run() (*http.Response, outcome, error) {
 // never hops again: hop i goes to the tether's endpoint instead of the one the
 // walk order names, and a tether on a routed host outside the pool, or on an
 // endpoint a configured-only request may not reach, ends the walk through the
-// routed path.
+// routed path. A tether on the accepted cold-start candidate ends the walk
+// with a refusal before any dial, because a tethered request never goes to a
+// candidate.
 func (w *walker) reclaim(i int, body io.ReadCloser) *walkEnd {
 	if err := w.p.claim(w.hold, targetOf(w.order[i])); err != nil {
 		closeSendBody(w.req, body)
@@ -481,7 +499,12 @@ func (w *walker) reclaim(i int, body io.ReadCloser) *walkEnd {
 		return nil
 	}
 	w.tethered = true
-	if ep := w.p.memberAt(w.hold.target.addr); ep != nil && (!w.configuredOnly || ep.kind == KindConfigured) {
+	ep := w.p.memberAt(w.hold.target.addr)
+	if ep != nil && ep.kind == kindCandidate {
+		closeSendBody(w.req, body)
+		return &walkEnd{oc: unsent, err: refuseTetheredCandidate(w.req, ep)}
+	}
+	if ep != nil && (!w.configuredOnly || ep.kind == KindConfigured) {
 		w.order[i] = ep
 		return nil
 	}
@@ -504,7 +527,9 @@ func (w *walker) rememberStatusHop() {
 // discovered endpoint that failed its pin after the walk read its order gets
 // nothing, and the hop is refused before any dial, as does an accepted
 // cold-start candidate that has since failed TLS verification. A request to a
-// candidate never carries a response-header deadline.
+// candidate carries the response-header deadline when the candidate is not the
+// walk's final hop, as a request to any endpoint does. The cold start puts the
+// candidate last, so in practice its request waits as a final hop does.
 func (w *walker) try(i int, ep *endpoint, body io.ReadCloser) hopResult {
 	eligible, left := w.p.eligibleFrom(ep, w.order[i:])
 	if !eligible {
@@ -523,7 +548,7 @@ func (w *walker) try(i int, ep *endpoint, body io.ReadCloser) hopResult {
 		clone.Body = body
 	}
 	attr := attributable(w.req.URL.Path, ep)
-	withDeadline := ep.kind != kindCandidate && w.deadlineFor(attr, left)
+	withDeadline := w.deadlineFor(attr, left)
 	w.made++
 	resp, err := ep.transports.pick(withDeadline).RoundTrip(clone)
 	if err == nil && resp == nil {
@@ -564,7 +589,8 @@ func (w *walker) deadlineFor(attributable bool, left int) bool {
 
 // finalHop reports whether the hop about to be made is the walk's final hop,
 // given left, the number of endpoints from the hop's own to the end of the
-// order that have not failed their pin, not counting a cold-start candidate.
+// order that have not failed their pin, counting a cold-start candidate only
+// when it is the hop's own endpoint.
 // The walk may still make one hop for each of them, up to the hop cap, so the
 // hop is final when it is the hop that reaches the cap or when every endpoint
 // after it has failed its pin since the walk read the order. A hop that was
@@ -926,30 +952,49 @@ func (s *walkState) evictStatusHopsLocked(now time.Time) {
 
 // logFailover logs the change of the active endpoint from one endpoint to
 // another at Warn, naming the endpoint that lost it with its last failure. A
-// change to a cold-start candidate says that the candidate came from
-// placement.az_map and proved its membership.
+// change to a cold-start candidate says that no cached node was left and that
+// the candidate came from placement.az_map and proved its membership. A change
+// away from a candidate says that requests go to the endpoint again, because
+// a walk reaches the candidate only after every configured endpoint failed.
 // sent says the change came from a request that to answered, and otherwise it
 // came from an upload that advanced the active endpoint for the next request.
 func (p *Pool) logFailover(from, to *endpoint, sent bool) {
+	if from.kind == kindCandidate {
+		next := "requests go to it again"
+		if !sent {
+			next = "the next request goes to it"
+		}
+		p.logger.Warn("pve endpoint failover: "+to.addr+" is used again, so "+next+" rather than to the "+
+			"cold-start candidate "+from.addr+" from placement.az_map",
+			log.String("from", from.addr),
+			log.String("to", to.addr),
+			log.String("node", from.node),
+		)
+		return
+	}
 	n, ok := p.walk.noteFor(from)
 	if !ok {
 		n = failureNote{class: "unknown", text: "an earlier failure in this call"}
 	}
 	cause := log.ScrubMessage(n.text)
-	tail := "request sent to " + to.addr + ", which stays active for this call"
-	if to.kind == kindCandidate {
-		tail = "request sent to " + to.addr + ", a cold-start candidate for node " + to.node +
-			" from placement.az_map that proved its membership, which stays active for this call"
+	tail := ", request sent to " + to.addr + ", which stays active for this call"
+	switch {
+	case !sent:
+		tail = ", next request goes to " + to.addr
+	case to.kind == kindCandidate:
+		tail = " and no cached nodes, request sent to " + to.addr + " from placement.az_map after it proved " +
+			"membership"
 	}
-	if !sent {
-		tail = "next request goes to " + to.addr
-	}
-	p.logger.Warn("pve endpoint failover: "+from.addr+" unreachable ("+cause+"), "+tail,
+	fields := []log.Field{
 		log.String("from", from.addr),
 		log.String("to", to.addr),
 		log.String("class", n.class),
 		log.String("error", cause),
-	)
+	}
+	if to.kind == kindCandidate {
+		fields = append(fields, log.String("node", to.node))
+	}
+	p.logger.Warn("pve endpoint failover: "+from.addr+" unreachable ("+cause+")"+tail, fields...)
 }
 
 // alertVerify logs, once per endpoint for the life of the pool, that a
