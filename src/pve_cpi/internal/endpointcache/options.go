@@ -11,10 +11,8 @@ type DirOptions struct {
 	Override string
 
 	// JournalDir is pve.storage_allocation_journal_dir, empty when it is
-	// unset. Options has no journal field yet, so no layer reads this value
-	// today. It is carried here so that the layer beside the journal, which
-	// adds that field, takes it from this struct in Options and every caller
-	// gets it without a change.
+	// unset. Options carries it to the layer beside the journal, so every
+	// caller that builds its options with OptionsFor gets that layer.
 	JournalDir string
 
 	// DisplayName is what a refusal calls the cache the caller is choosing a
@@ -38,7 +36,7 @@ func OptionsFor(cfg *config.CPIConfig) DirOptions {
 // Options returns the options Resolve takes. It is the one place that copies
 // the config's values into them.
 func (d DirOptions) Options() Options {
-	return Options{Override: d.Override, DisplayName: d.DisplayName, Guard: d.Guard}
+	return Options(d)
 }
 
 // Resolve chooses the cache directory for d. See the package's Resolve.

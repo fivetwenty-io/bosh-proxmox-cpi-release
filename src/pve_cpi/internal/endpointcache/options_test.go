@@ -19,8 +19,8 @@ func TestOptionsForCarriesTheOverrideAndTheJournalDirectory(t *testing.T) {
 	if got.Override != cfg.EndpointCacheDir || got.JournalDir != cfg.StorageAllocationJournalDir {
 		t.Errorf("OptionsFor = %+v, want the override and the journal directory", got)
 	}
-	if opts := got.Options(); opts != (Options{Override: cfg.EndpointCacheDir}) {
-		t.Errorf("Options = %+v, want the override", opts)
+	if opts := got.Options(); opts != (Options{Override: cfg.EndpointCacheDir, JournalDir: cfg.StorageAllocationJournalDir}) {
+		t.Errorf("Options = %+v, want the override and the journal directory", opts)
 	}
 	if empty := OptionsFor(nil); empty != (DirOptions{}) {
 		t.Errorf("OptionsFor(nil) = %+v, want the zero options", empty)

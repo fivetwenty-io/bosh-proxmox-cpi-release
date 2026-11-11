@@ -41,7 +41,12 @@ type cacheDirectoryChooser func(cfg *config.CPIConfig) (endpointcache.Choice, []
 // allocation journal is refused before anything is created.
 var chooseCacheDirectory cacheDirectoryChooser = func(cfg *config.CPIConfig) (endpointcache.Choice, []string) {
 	guard := &journalGuard{journal: cfg.StorageAllocationJournalDir}
-	return endpointcache.OptionsFor(cfg).WithGuard(guard).Resolve(), nil
+	choice := endpointcache.OptionsFor(cfg).WithGuard(guard).Resolve()
+	notes := make([]string, 0, len(choice.Notes))
+	for _, note := range choice.Notes {
+		notes = append(notes, "pve endpoints: "+note)
+	}
+	return choice, notes
 }
 
 // journalGuard refuses a cache directory that overlaps the allocation journal
@@ -214,6 +219,8 @@ func layerText(layer endpointcache.Layer) string {
 	switch layer {
 	case endpointcache.LayerOverride:
 		return "from pve.endpoint_cache_dir"
+	case endpointcache.LayerJournal:
+		return "beside the allocation journal directory"
 	case endpointcache.LayerTemporary:
 		return "in the temporary directory"
 	default:

@@ -138,11 +138,11 @@ func TestATemporaryDirectoryThatOverlapsTheJournalIsRefusedBeforeItIsCreated(t *
 // A journal that cannot be examined cannot be compared with the temporary
 // directory, so the guard refuses the layer before it creates the directory.
 // The check has to fail closed here, because the check after the open would
-// refuse the directory only after the layer had left it behind.
+// refuse the directory only after the layer had left it behind. A journal that
+// is a symlink loop cannot be resolved, while the directory beside it can still
+// be searched, so the layer beside the journal declines and the temporary layer
+// meets the guard.
 func TestATemporaryDirectoryIsRefusedBeforeItIsCreatedWhenTheJournalCannotBeCompared(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root can search a directory of mode 000, so the journal can be compared")
-	}
 	for _, mode := range []config.DiscoveryMode{config.DiscoveryModeAuto, config.DiscoveryModeOn} {
 		level := endpointcache.Level(mode)
 		t.Run(string(mode), func(t *testing.T) {
@@ -151,19 +151,16 @@ func TestATemporaryDirectoryIsRefusedBeforeItIsCreatedWhenTheJournalCannotBeComp
 				t.Fatal(err)
 			}
 			tmp := filepath.Join(root, "tmp")
-			locked := filepath.Join(root, "locked")
-			for _, dir := range []string{tmp, filepath.Join(locked, "journal")} {
-				if err := os.MkdirAll(dir, 0o700); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if err := os.Chmod(locked, 0); err != nil {
+			if err := os.Mkdir(tmp, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+			loop := filepath.Join(root, "journal")
+			if err := os.Symlink(loop, loop); err != nil {
+				t.Fatal(err)
+			}
 			t.Setenv("TMPDIR", tmp)
 			cfg := cacheTestConfig(mode, "")
-			cfg.StorageAllocationJournalDir = filepath.Join(locked, "journal")
+			cfg.StorageAllocationJournalDir = loop
 
 			got := openCacheFor(t, cfg)
 			if got.cache != nil || !got.plan.cacheUnusable {

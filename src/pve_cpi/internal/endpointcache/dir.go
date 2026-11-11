@@ -18,10 +18,17 @@ const (
 	// pve.endpoint_cache_dir. It wins over every other layer, and the CPI never
 	// creates it.
 	LayerOverride Layer = "override"
+	// LayerJournal is the endpoint-cache directory beside the allocation
+	// journal directory. The CPI uses it only when it already exists, because
+	// provision-journal creates it, and never creates it at runtime.
+	LayerJournal Layer = "journal"
 	// LayerTemporary is pve_cpi-endpoint-cache.<euid> under the CPI's temporary
 	// directory. The CPI creates it at runtime, one component deep.
 	LayerTemporary Layer = "temporary"
 )
+
+// JournalSiblingName is the base name of the cache directory beside the journal directory.
+const JournalSiblingName = "endpoint-cache"
 
 // temporaryName is the base name of the temporary layer's directory before the
 // effective user ID is appended.
@@ -31,6 +38,9 @@ const temporaryName = "pve_cpi-endpoint-cache."
 type Options struct {
 	// Override is the value of pve.endpoint_cache_dir, empty when it is unset.
 	Override string
+	// JournalDir is the value of pve.storage_allocation_journal_dir, empty when
+	// it is unset. The journal layer looks for endpoint-cache beside it.
+	JournalDir string
 	// DisplayName is what the refusal texts call the cache the caller is
 	// choosing a directory for, such as HAProfileName. Empty means the endpoint
 	// cache, and a name that is not letters, digits, spaces, and hyphens reads
@@ -75,13 +85,17 @@ func (r *Refusal) Unwrap() error { return r.Err }
 // which layer applied and the directory it named. Root is the opened private
 // directory, or nil when the layer refused it, in which case Err holds the
 // reason and there is no cache for this process. A caller that gets a nil Root
-// does not try another layer. A caller hands Root to OpenStore, which owns it
+// does not try another layer. Notes holds one line for each layer that
+// declined before this one answered, such as the missing directory beside the
+// journal. The package writes no log line, so the caller logs them, at Debug,
+// because a layer that declines is working as designed. A caller hands Root to OpenStore, which owns it
 // from then on, and closes the Store instead of the Choice.
 type Choice struct {
 	Layer Layer
 	Path  string
 	Root  *os.Root
 	Err   *Refusal
+	Notes []string
 }
 
 // Usable reports whether the choice holds an opened, private directory.
@@ -96,17 +110,18 @@ func (c Choice) Close() error {
 }
 
 // layer inspects the options and either declines, with applies false so the
-// next layer is considered, or answers with a Choice. A layer that applies and
+// next layer is considered, or answers with a Choice. A layer that declines for
+// a reason worth a log line puts it in the Err of the Choice it returns, and
+// resolveWith moves it into the Notes of the choice that answers. A layer that applies and
 // refuses its directory ends the search, because falling through to a looser
 // layer would hide a directory that someone else may control.
 type layer func(opts Options) (choice Choice, applies bool)
 
 // layers lists the layers in the order they are considered. The first one that
-// applies wins. The layer beside the journal belongs between the override and
-// the temporary layer, and the temporary layer always applies, so it stays
-// last.
+// applies wins. The temporary layer always applies, so it stays last.
 var layers = []layer{
 	overrideLayer,
+	journalLayer,
 	temporaryLayer,
 }
 
@@ -116,15 +131,23 @@ func Resolve(opts Options) Choice { return resolveWith(layers, opts) }
 
 // resolveWith runs the layers in order. Every layer but the last may decline,
 // and the last answers with whatever it returns, so the result always names a
-// layer. The list must not be empty.
+// layer. The reasons that earlier layers gave for declining go into the
+// answer's Notes. The list must not be empty.
 func resolveWith(list []layer, opts Options) Choice {
+	var notes []string
 	last := len(list) - 1
 	for _, l := range list[:last] {
-		if choice, applies := l(opts); applies {
+		choice, applies := l(opts)
+		if applies {
+			choice.Notes = notes
 			return choice
+		}
+		if choice.Err != nil {
+			notes = append(notes, choice.Err.Error())
 		}
 	}
 	choice, _ := list[last](opts)
+	choice.Notes = notes
 	return choice
 }
 
@@ -158,6 +181,51 @@ func overrideLayer(opts Options) (Choice, bool) {
 			},
 			text: fmt.Sprintf("%v: %s is not a clean path", t.fileType, opts.Override),
 		}}
+		return choice, true
+	}
+	return t.open(choice), true
+}
+
+// journalLayer uses the endpoint-cache directory beside the journal directory,
+// never inside it. It applies only when the journal directory is set and the
+// directory exists. A missing directory declines with the reason in the Err of
+// the declined choice, so the temporary layer is next. The layer never creates
+// the directory, because under BPM a path outside every mounted volume lands in
+// the worker's private filesystem, and a runtime mkdir could appear to work and
+// lose the cache on every call. A directory that exists applies, and the
+// private checks decide whether it is usable. A refusal there ends the search,
+// because a sibling that someone else controls is the case the checks exist
+// for. A journal directory that is not absolute, or is the filesystem root, has
+// no sibling to look for, and a journal whose own base name is endpoint-cache
+// would collide with the sibling's name, so the layer declines for both.
+func journalLayer(opts Options) (Choice, bool) {
+	if opts.JournalDir == "" {
+		return Choice{}, false
+	}
+	journal := filepath.Clean(opts.JournalDir)
+	declined := func(path string, cause error) (Choice, bool) {
+		return Choice{Layer: LayerJournal, Path: path, Err: &Refusal{Layer: LayerJournal, Path: path, Err: cause}}, false
+	}
+	if !filepath.IsAbs(journal) || journal == string(filepath.Separator) {
+		return declined(opts.JournalDir, fmt.Errorf(
+			"the allocation journal directory %q is not an absolute path below the root, so it has no directory beside it",
+			opts.JournalDir))
+	}
+	if filepath.Base(journal) == JournalSiblingName {
+		return declined(journal, fmt.Errorf(
+			"the allocation journal directory %s is itself named %s, so the name beside it is not free",
+			journal, JournalSiblingName))
+	}
+	t := textsFor(opts.DisplayName)
+	choice := Choice{Layer: LayerJournal, Path: filepath.Join(filepath.Dir(journal), JournalSiblingName)}
+	if _, err := os.Lstat(choice.Path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return declined(choice.Path, fmt.Errorf("the directory beside the allocation journal is missing, "+
+				"so the next layer applies: %w", os.ErrNotExist))
+		}
+		// A directory that cannot be examined is not known to be absent, so the
+		// layer refuses it and no cache is better than a guess.
+		choice.Err = &Refusal{Layer: LayerJournal, Path: choice.Path, Err: err}
 		return choice, true
 	}
 	return t.open(choice), true
