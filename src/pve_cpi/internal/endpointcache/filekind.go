@@ -92,7 +92,8 @@ func kindFor(opts StoreOptions) (fileKind, error) {
 	}
 	if opts.FilePrefix == "" && opts.Label == "" && opts.Version == 0 {
 		if opts.DisplayName != "" && opts.DisplayName != cacheLabel {
-			return fileKind{}, fmt.Errorf("%w: the endpoint cache file keeps the name %q", ErrInvalidFileKind, cacheLabel)
+			return fileKind{}, fmt.Errorf("%w: the endpoint cache file keeps the name %q",
+				ErrInvalidFileKind, cacheLabel)
 		}
 		return endpointKind, nil
 	}
@@ -100,7 +101,8 @@ func kindFor(opts StoreOptions) (fileKind, error) {
 	case opts.FilePrefix == "":
 		return fileKind{}, fmt.Errorf("%w: a label or version needs a file prefix", ErrInvalidFileKind)
 	case !validFilePrefix(opts.FilePrefix) || !slices.Contains(knownFilePrefixes, opts.FilePrefix):
-		return fileKind{}, fmt.Errorf("%w: file prefix %q is not one the sweep knows", ErrInvalidFileKind, opts.FilePrefix)
+		return fileKind{}, fmt.Errorf("%w: file prefix %q is not one the sweep knows",
+			ErrInvalidFileKind, opts.FilePrefix)
 	case opts.Label == "":
 		return fileKind{}, fmt.Errorf("%w: a file prefix needs a label", ErrInvalidFileKind)
 	case len(opts.Label) > maxFileLabel || !fileLabelPattern.MatchString(opts.Label):

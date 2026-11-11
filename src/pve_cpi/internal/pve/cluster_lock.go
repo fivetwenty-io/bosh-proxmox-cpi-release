@@ -135,7 +135,8 @@ type lockStealNotSent struct {
 }
 
 func (e *lockStealNotSent) Error() string {
-	return fmt.Sprintf("lock %q: the expired holder's steal could not be sent before its send-by deadline: %v", e.pool, e.err)
+	return fmt.Sprintf("lock %q: the expired holder's steal could not be sent before its send-by deadline: %v",
+		e.pool, e.err)
 }
 
 func (e *lockStealNotSent) Unwrap() error { return e.err }

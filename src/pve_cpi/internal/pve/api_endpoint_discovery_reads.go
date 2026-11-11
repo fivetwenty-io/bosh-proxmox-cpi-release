@@ -432,7 +432,8 @@ func certificateEntryPin(fingerprint, pemText string) (endpointpool.Pin, bool) {
 		reported, hasReported = pin, true
 	}
 	if pemText != "" {
-		if block, _ := pem.Decode([]byte(pemText)); block != nil && block.Type == "CERTIFICATE" && len(block.Bytes) > 0 {
+		block, _ := pem.Decode([]byte(pemText))
+		if block != nil && block.Type == "CERTIFICATE" && len(block.Bytes) > 0 {
 			derived, hasDerived = endpointpool.PinOf(block.Bytes), true
 		}
 	}

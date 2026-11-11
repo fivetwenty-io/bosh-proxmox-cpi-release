@@ -1340,7 +1340,8 @@ func (c *haCollector) cacheDirectoryFindings() {
 	case info.Mode().Perm()&0o077 != 0:
 		c.rep.advise(haKindCacheDirectory, path,
 			"pve.endpoint_cache_dir has mode %04o and must grant no group or other access, so the CPI refuses it "+
-				"and keeps no HA recovery record, which means the dead-node handover cannot start; run chmod 0700 on it",
+				"and keeps no HA recovery record, which means the dead-node handover cannot start; "+
+				"run chmod 0700 on it",
 			info.Mode().Perm())
 	}
 }

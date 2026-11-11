@@ -256,7 +256,11 @@ func (t *texts) temporaryLayerGuarded(
 	path := filepath.Join(tempDir, temporaryName+strconv.Itoa(os.Geteuid()))
 	choice := Choice{Layer: LayerTemporary, Path: path}
 	if !filepath.IsAbs(tempDir) {
-		choice.Err = &Refusal{Layer: LayerTemporary, Path: path, Err: fmt.Errorf("temporary directory %q must be absolute", tempDir)}
+		choice.Err = &Refusal{
+			Layer: LayerTemporary,
+			Path:  path,
+			Err:   fmt.Errorf("temporary directory %q must be absolute", tempDir),
+		}
 		return choice, true
 	}
 	if guard != nil {
@@ -294,7 +298,7 @@ func (t *texts) secureCreated(path string) error {
 	if err := t.policy.PrivateInfo(path, info, true); err != nil {
 		return err
 	}
-	return os.Chmod(path, 0o700) // #nosec G302 -- a directory needs owner search; this is the private mode, not a widening
+	return os.Chmod(path, 0o700) // #nosec G302 -- a directory needs owner search; the private mode, not a widening
 }
 
 // open fills in the choice by opening its path through the private-directory

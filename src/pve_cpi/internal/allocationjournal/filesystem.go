@@ -149,7 +149,8 @@ func readEnvelope(r *os.Root, name string) (diskEnvelope, error) {
 // decodeEnvelope checks env against the expected version and its checksum and
 // strictly decodes the payload into out.
 func decodeEnvelope(env diskEnvelope, version int, out any) error {
-	return privateFiles.DecodeEnvelope(privatefile.Envelope{Version: env.Version, Integrity: env.SHA256, Payload: env.Payload}, version, out)
+	stored := privatefile.Envelope{Version: env.Version, Integrity: env.SHA256, Payload: env.Payload}
+	return privateFiles.DecodeEnvelope(stored, version, out)
 }
 
 func atomicJSON(r *os.Root, name string, value any, ops fileOps) error {

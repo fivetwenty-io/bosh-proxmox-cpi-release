@@ -109,7 +109,11 @@ func (p endpointPlan) failover() bool {
 // down the routed-host path. The config layer resolves every list entry to a
 // host and port, so an entry without a port means the list never went through
 // it, and the plan refuses to guess one.
-func planEndpoints(cfg *config.CPIConfig, opts sdkclient.Options, source discoveredEndpointSource) (endpointPlan, error) {
+func planEndpoints(
+	cfg *config.CPIConfig,
+	opts sdkclient.Options,
+	source discoveredEndpointSource,
+) (endpointPlan, error) {
 	plan := endpointPlan{discovery: endpointDiscoveryOn(cfg)}
 	if len(cfg.Endpoints) == 0 {
 		plan.endpoints = []endpointpool.Endpoint{{
@@ -124,7 +128,8 @@ func planEndpoints(cfg *config.CPIConfig, opts sdkclient.Options, source discove
 		}
 		if _, _, splitErr := net.SplitHostPort(entry); splitErr != nil {
 			return endpointPlan{}, cpierrors.Cloud("pve client init: the endpoint list was not resolved: "+
-				"pve.endpoints[%d] has no port; the config layer must give every entry its port before the client is built", i)
+				"pve.endpoints[%d] has no port; "+
+				"the config layer must give every entry its port before the client is built", i)
 		}
 		address := net.JoinHostPort(host, strconv.Itoa(port))
 		plan.endpoints = append(plan.endpoints, endpointpool.Endpoint{

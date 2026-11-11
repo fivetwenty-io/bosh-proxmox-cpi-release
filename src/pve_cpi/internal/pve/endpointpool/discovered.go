@@ -301,7 +301,11 @@ func (p *Pool) eligibleFrom(ep *endpoint, eps []*endpoint) (eligible bool, n int
 // reaches the SDK in, so the SDK stops at once instead of retrying a request
 // the pool will refuse again.
 func refuseIneligible(addr string) error {
-	return &ConnectPhaseError{Phase: PhasePin, Endpoint: addr, Err: &tls.CertificateVerificationError{Err: errIneligible}}
+	return &ConnectPhaseError{
+		Phase:    PhasePin,
+		Endpoint: addr,
+		Err:      &tls.CertificateVerificationError{Err: errIneligible},
+	}
 }
 
 // refuseDropped returns the error for a request the pool will not send to addr,

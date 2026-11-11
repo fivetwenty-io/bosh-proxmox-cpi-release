@@ -30,7 +30,8 @@ func (e *UnsafePathError) Error() string {
 	case errors.Is(e.Cause, ErrUnsafeOwnership):
 		return fmt.Sprintf("%v: %s is owned by uid %d, not effective uid %d", e.Cause, e.Path, e.UID, e.EUID)
 	case errors.Is(e.Cause, ErrUnsafeMode):
-		return fmt.Sprintf("%v: %s has mode %04o and must grant no group or other access", e.Cause, e.Path, e.Mode.Perm())
+		return fmt.Sprintf("%v: %s has mode %04o and must grant no group or other access",
+			e.Cause, e.Path, e.Mode.Perm())
 	case e.WantDirectory:
 		return fmt.Sprintf("%v: %s is not a directory", e.Cause, e.Path)
 	default:
@@ -157,7 +158,8 @@ func (p Policy) OpenRoot(path string) (*os.Root, error) {
 	opened, statErr := f.Stat()
 	closeErr := f.Close()
 	if statErr != nil || closeErr != nil || !os.SameFile(info, opened) {
-		return nil, errors.Join(fmt.Errorf("%s: directory changed while opening", p.label()), statErr, closeErr, r.Close())
+		changed := fmt.Errorf("%s: directory changed while opening", p.label())
+		return nil, errors.Join(changed, statErr, closeErr, r.Close())
 	}
 	return r, nil
 }
@@ -181,7 +183,12 @@ var openat = func(fd int, name string, flags int) (int, error) { return unix.Ope
 // so a FIFO swapped in after the lstat could stall the caller for good. The
 // descriptor is checked first and becomes an *os.File only after the checks
 // pass and O_NONBLOCK is cleared, so the caller always gets a blocking file.
-func (p Policy) OpenWith(r *os.Root, name string, flags int, open func(int, string, int) (int, error)) (*os.File, error) {
+func (p Policy) OpenWith(
+	r *os.Root,
+	name string,
+	flags int,
+	open func(int, string, int) (int, error),
+) (*os.File, error) {
 	if name == "" || filepath.Base(name) != name || name == "." || name == ".." {
 		return nil, fmt.Errorf("%s: private file name must be a basename", p.label())
 	}

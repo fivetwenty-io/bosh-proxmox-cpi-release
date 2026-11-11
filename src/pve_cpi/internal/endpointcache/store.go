@@ -145,7 +145,13 @@ type Store struct {
 // the mode. The caller closes the Store. StoreOptions.FilePrefix, Label, and
 // Version select another kind of file in the same directory, such as the HA
 // profile cache, and an invalid choice is refused with ErrInvalidFileKind.
-func OpenStore(ctx context.Context, root *os.Root, cfg KeyConfig, credential string, opts StoreOptions) (*Store, error) {
+func OpenStore(
+	ctx context.Context,
+	root *os.Root,
+	cfg KeyConfig,
+	credential string,
+	opts StoreOptions,
+) (*Store, error) {
 	kind, err := kindFor(opts)
 	if err != nil {
 		if root != nil {

@@ -322,7 +322,12 @@ func (c *ProfileCache) write(
 		logger.Debug("HA profile cache: facts not stored", log.String("reason", reason))
 		return
 	}
-	next := &profilePayload{Key: store.Key(), Cluster: cluster, StoredAtMillis: started.UnixMilli(), Facts: storable(facts)}
+	next := &profilePayload{
+		Key:            store.Key(),
+		Cluster:        cluster,
+		StoredAtMillis: started.UnixMilli(),
+		Facts:          storable(facts),
+	}
 	_, err := endpointcache.Update(ctx, store, func(current *profilePayload) (*profilePayload, error) {
 		// The writer holds the key's lock here, and sweeps the directory at the
 		// cadence the endpoint cache does, so profile files that a credential

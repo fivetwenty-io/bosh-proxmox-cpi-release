@@ -168,7 +168,8 @@ func readStored(p *Payload, key Key, now time.Time) (storedState, []Drop, error)
 		// A node needs the identity its pins were read under, whatever its
 		// times, because a writer keeps every known node.
 		if len(p.Discovery.Nodes) > 0 && out.Cluster == nil {
-			return storedState{}, nil, fmt.Errorf("%w: discovery lists nodes without a cluster identity", ErrPayloadInvalid)
+			return storedState{}, nil, fmt.Errorf("%w: discovery lists nodes without a cluster identity",
+				ErrPayloadInvalid)
 		}
 		drops = append(drops, found...)
 		if section != nil && len(section.Nodes) > 0 && out.Cluster.IdentityConflict {
@@ -213,7 +214,8 @@ func ForReader(p *Payload, azNodes []string) (*Payload, []Drop) {
 func validateCluster(c ClusterIdentity, key Key) (ClusterIdentity, []Drop, error) {
 	root, ok := normalizeHex(c.RootCASHA256)
 	if !ok {
-		return ClusterIdentity{}, nil, fmt.Errorf("%w: cluster root CA digest is not 32 bytes of hex", ErrPayloadInvalid)
+		return ClusterIdentity{}, nil, fmt.Errorf("%w: cluster root CA digest is not 32 bytes of hex",
+			ErrPayloadInvalid)
 	}
 	c.RootCASHA256 = root
 	c.ObservedAt = c.ObservedAt.UTC()
@@ -269,7 +271,8 @@ func validateDiscovery(
 		return nil, nil, nil, fmt.Errorf("%w: discovery outcome is not one of the enumerated values", ErrPayloadInvalid)
 	}
 	if len(d.Nodes) > 0 && !d.Outcome.holdsNodes() {
-		return nil, nil, nil, fmt.Errorf("%w: discovery lists nodes under an outcome that holds none", ErrPayloadInvalid)
+		return nil, nil, nil, fmt.Errorf("%w: discovery lists nodes under an outcome that holds none",
+			ErrPayloadInvalid)
 	}
 	if len(d.Nodes) > MaxNodes {
 		return nil, nil, nil, fmt.Errorf("%w: discovery holds %d nodes, more than %d",

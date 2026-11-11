@@ -71,7 +71,11 @@ func (t *texts) tryHeldLock(ctx context.Context, r *os.Root, name string) (*priv
 // more times before ErrLockReplaced. A kept lock also has its file's times
 // updated through the descriptor, so a lock in daily use never looks
 // abandoned to the sweep.
-func (t *texts) heldLock(r *os.Root, name string, take func() (*privatefile.Lock, bool, error)) (*privatefile.Lock, bool, error) {
+func (t *texts) heldLock(
+	r *os.Root,
+	name string,
+	take func() (*privatefile.Lock, bool, error),
+) (*privatefile.Lock, bool, error) {
 	for attempt := 0; ; attempt++ {
 		lock, held, err := take()
 		if err != nil || !held {

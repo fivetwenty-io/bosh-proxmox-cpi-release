@@ -270,7 +270,8 @@ func merge(state storedState, read []Drop, key Key, change Change, now time.Time
 			return nil, read, fmt.Errorf("%w: cold_start hint is %s", ErrInvalidChange, found[0].Reason)
 		}
 		if change.Result != nil {
-			return nil, read, fmt.Errorf("%w: change carries both a discovery result and a cold_start hint", ErrInvalidChange)
+			return nil, read, fmt.Errorf("%w: change carries both a discovery result and a cold_start hint",
+				ErrInvalidChange)
 		}
 		next.ColdStart = hint
 	}

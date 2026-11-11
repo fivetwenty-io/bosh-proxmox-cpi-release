@@ -127,7 +127,8 @@ func (p Policy) DecodeEnvelope(env Envelope, version int, out any) error {
 	if err := p.check(); err != nil {
 		return err
 	}
-	if env.Version != version || subtle.ConstantTimeCompare([]byte(env.Integrity), []byte(p.Integrity(env.Payload))) != 1 {
+	want := []byte(p.Integrity(env.Payload))
+	if env.Version != version || subtle.ConstantTimeCompare([]byte(env.Integrity), want) != 1 {
 		return fmt.Errorf("%w: envelope version/checksum", p.corrupt())
 	}
 	if err := StrictDecode(env.Payload, out); err != nil {
