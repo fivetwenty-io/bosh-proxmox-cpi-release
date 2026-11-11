@@ -45,6 +45,10 @@ const snapshotTries = 3
 //     configured-only marker walk the configured endpoints only, so a
 //     password never reaches a discovered address.
 //   - Every other request walks the whole pool from the active endpoint.
+//     When every configured endpoint failed its dial, DNS lookup, or
+//     handshake in the walk, and the pool carries cold-start candidates, a
+//     request that authenticates with an API token goes on to the cold
+//     start, as coldStartDue describes.
 //
 // A walk clones the request for each hop with req.Clone, puts the endpoint's
 // address in the clone's URL.Host, leaves its Host empty, and rebuilds its
@@ -169,7 +173,7 @@ func (p *Pool) dispatchMutation(req *http.Request, h *tetherHold, addr string, r
 // operator did not list.
 func (p *Pool) sendFollowing(req *http.Request, target tetherTarget, configuredOnly bool, b bounds,
 ) (*http.Response, outcome, error) {
-	ep := p.byAddr[target.addr]
+	ep := p.memberAt(target.addr)
 	if ep == nil || (configuredOnly && ep.kind != KindConfigured) {
 		return p.sendRouted(req, target, nil, configuredOnly)
 	}
@@ -326,6 +330,14 @@ type walker struct {
 	// tethered says the request goes only to the endpoint its key's tether
 	// names, so the walk never hops.
 	tethered bool
+	// coldFailed counts the configured endpoints the walk moved on from
+	// after a dial, DNS, or handshake failure. A walk tries each configured
+	// endpoint once at most, so the count reaches the number of configured
+	// endpoints only when every one of them failed that way. coldDone says
+	// the walk has been through the cold start, which it goes through once at
+	// most.
+	coldFailed int
+	coldDone   bool
 }
 
 // walkEnd is what a walk returns when it ends before a hop.
@@ -426,10 +438,23 @@ func (w *walker) run() (*http.Response, outcome, error) {
 		if w.tethered || (w.hold != nil && !w.p.release(w.hold)) {
 			return w.halt(h, stopTethered, i+1, nil)
 		}
-		if stop := w.stopBefore(i + 1); stop != stopNone {
+		w.noteColdStart(h)
+		stop := w.stopBefore(i + 1)
+		var err error
+		if stop == stopExhausted && w.coldStartDue(i+1) {
+			// The cold start applies h's effects before it probes, so the
+			// walk's failures keep the order the hops were made in.
+			if end := w.enterColdStart(h, i+1); end != nil {
+				return end.resp, end.oc, end.err
+			}
+			if body, err = w.nextBody(); err != nil {
+				return w.end(h, stopRebuild, i+1, err)
+			}
+			continue
+		}
+		if stop != stopNone {
 			return w.halt(h, stop, i+1, nil)
 		}
-		var err error
 		if body, err = w.nextBody(); err != nil {
 			return w.halt(h, stopRebuild, i+1, err)
 		}
@@ -456,7 +481,7 @@ func (w *walker) reclaim(i int, body io.ReadCloser) *walkEnd {
 		return nil
 	}
 	w.tethered = true
-	if ep := w.p.byAddr[w.hold.target.addr]; ep != nil && (!w.configuredOnly || ep.kind == KindConfigured) {
+	if ep := w.p.memberAt(w.hold.target.addr); ep != nil && (!w.configuredOnly || ep.kind == KindConfigured) {
 		w.order[i] = ep
 		return nil
 	}
@@ -477,11 +502,16 @@ func (w *walker) rememberStatusHop() {
 // try makes hop i, to ep. body is the request body rebuilt for a hop after
 // the first, and nil for the first hop or a request without a body. A
 // discovered endpoint that failed its pin after the walk read its order gets
-// nothing, and the hop is refused before any dial.
+// nothing, and the hop is refused before any dial, as does an accepted
+// cold-start candidate that has since failed TLS verification. A request to a
+// candidate never carries a response-header deadline.
 func (w *walker) try(i int, ep *endpoint, body io.ReadCloser) hopResult {
 	eligible, left := w.p.eligibleFrom(ep, w.order[i:])
 	if !eligible {
 		closeSendBody(w.req, body)
+		if ep.kind == kindCandidate {
+			return revokedHop(ep)
+		}
 		return w.p.ineligibleHop(ep)
 	}
 	ctx := w.req.Context()
@@ -493,7 +523,7 @@ func (w *walker) try(i int, ep *endpoint, body io.ReadCloser) hopResult {
 		clone.Body = body
 	}
 	attr := attributable(w.req.URL.Path, ep)
-	withDeadline := w.deadlineFor(attr, left)
+	withDeadline := ep.kind != kindCandidate && w.deadlineFor(attr, left)
 	w.made++
 	resp, err := ep.transports.pick(withDeadline).RoundTrip(clone)
 	if err == nil && resp == nil {
@@ -534,12 +564,13 @@ func (w *walker) deadlineFor(attributable bool, left int) bool {
 
 // finalHop reports whether the hop about to be made is the walk's final hop,
 // given left, the number of endpoints from the hop's own to the end of the
-// order that have not failed their pin. The walk may still make one hop for
-// each of them, up to the hop cap, so the hop is final when it is the hop that
-// reaches the cap or when every endpoint after it has failed its pin since the
-// walk read the order. A hop that was refused made no hop, so the hops made
-// stand in for the position in the order. Without such an endpoint this is
-// exactly finalHop(i, w.limit) for hop i, because every earlier hop was made.
+// order that have not failed their pin, not counting a cold-start candidate.
+// The walk may still make one hop for each of them, up to the hop cap, so the
+// hop is final when it is the hop that reaches the cap or when every endpoint
+// after it has failed its pin since the walk read the order. A hop that was
+// refused made no hop, so the hops made stand in for the position in the
+// order. Without such an endpoint this is exactly finalHop(i, w.limit) for
+// hop i, because every earlier hop was made.
 //
 // The decision is made when the hop starts, and net/http cannot change a
 // response-header deadline once a request is in flight. So a hop that is not
@@ -590,6 +621,16 @@ func (w *walker) stopBefore(next int) stopReason {
 		return stopExhausted
 	case !w.budget.allowsHop():
 		return stopBudget
+	default:
+		return w.requestStop()
+	}
+}
+
+// requestStop reports why the request itself lets no further hop start, which
+// is its context ending, its send-by deadline passing, or a body it cannot
+// rebuild, or stopNone when nothing in the request stops one.
+func (w *walker) requestStop() stopReason {
+	switch {
 	case w.req.Context().Err() != nil:
 		return stopCaller
 	case CheckSendBy(w.req.Context(), time.Now(), w.method, w.req.URL.Path) != nil:
@@ -665,13 +706,29 @@ func (w *walker) halt(h hopResult, stop stopReason, next int, rebuildErr error) 
 			w.p.logFailover(h.ep, to, false)
 		}
 	}
+	return w.end(h, stop, next, rebuildErr)
+}
+
+// end returns what the walk ends with after hop h, whose effects have been
+// applied, when stop says hop next may not start. It is the caller's context
+// error, the send-by refusal naming the endpoint hop next would have gone to,
+// the response a status hop moved away from, or the walk's failures, with
+// GetBody's error joined to them when it failed. A send-by refusal with no
+// hop next in the order, which the cold start can meet before a candidate,
+// names h's endpoint.
+func (w *walker) end(h hopResult, stop stopReason, next int, rebuildErr error) (*http.Response, outcome, error) {
+	oc := outcome{action: actReturn, sent: h.oc.sent, class: h.oc.class, addr: h.ep.addr}
 	switch stop {
 	case stopCaller:
 		oc.class = classCancelled
 		return nil, oc, w.req.Context().Err()
 	case stopSendBy:
 		oc.sendBy, oc.class = true, classSendBy
-		return nil, oc, &ConnectPhaseError{Phase: PhaseDial, Endpoint: w.order[next].addr, Err: ErrSendByPassed}
+		endpoint := h.ep.addr
+		if next < len(w.order) {
+			endpoint = w.order[next].addr
+		}
+		return nil, oc, &ConnectPhaseError{Phase: PhaseDial, Endpoint: endpoint, Err: ErrSendByPassed}
 	}
 	if w.held != nil {
 		oc.sent = sentAnswered
@@ -698,9 +755,10 @@ func (w *walker) alert(h hopResult, hopping bool) {
 // record applies a hop's demotion and keeps its failure for the failover
 // line. A demotion for a connect-phase failure, which only a failure the
 // endpoint caused gets, also records the failure for the mark sink and, for a
-// pin failure, takes the endpoint out of later walks. A send-by refusal
-// demotes nothing, but when it wraps a pin failure that finished after the
-// bound, that pin failure still counts.
+// pin failure, takes the endpoint out of later walks. An accepted cold-start
+// candidate gets no mark, and a verification failure takes it out instead. A
+// send-by refusal demotes nothing, but when it wraps a pin failure that
+// finished after the bound, that pin failure still counts.
 func (w *walker) record(h hopResult) {
 	if h.oc.demote {
 		w.p.demote(h.ep)
@@ -708,7 +766,9 @@ func (w *walker) record(h hopResult) {
 	if h.oc.demote || h.oc.unreachable {
 		w.p.walk.note(h.ep, noteOf(h.resp, h.err, h.oc.class))
 	}
-	if phase := Phase(h.oc.class); h.oc.demote && phase.Valid() {
+	if phase := Phase(h.oc.class); h.oc.demote && phase.Valid() && h.ep.kind == kindCandidate {
+		w.p.candidateFailed(h.ep, phase, h.err)
+	} else if h.oc.demote && phase.Valid() {
 		w.p.connectFailed(h.ep, phase, h.err)
 	} else if h.oc.sendBy {
 		w.p.pinFailureAfterSendBy(h.ep, h.err)
@@ -865,7 +925,9 @@ func (s *walkState) evictStatusHopsLocked(now time.Time) {
 }
 
 // logFailover logs the change of the active endpoint from one endpoint to
-// another at Warn, naming the endpoint that lost it with its last failure.
+// another at Warn, naming the endpoint that lost it with its last failure. A
+// change to a cold-start candidate says that the candidate came from
+// placement.az_map and proved its membership.
 // sent says the change came from a request that to answered, and otherwise it
 // came from an upload that advanced the active endpoint for the next request.
 func (p *Pool) logFailover(from, to *endpoint, sent bool) {
@@ -875,6 +937,10 @@ func (p *Pool) logFailover(from, to *endpoint, sent bool) {
 	}
 	cause := log.ScrubMessage(n.text)
 	tail := "request sent to " + to.addr + ", which stays active for this call"
+	if to.kind == kindCandidate {
+		tail = "request sent to " + to.addr + ", a cold-start candidate for node " + to.node +
+			" from placement.az_map that proved its membership, which stays active for this call"
+	}
 	if !sent {
 		tail = "next request goes to " + to.addr
 	}

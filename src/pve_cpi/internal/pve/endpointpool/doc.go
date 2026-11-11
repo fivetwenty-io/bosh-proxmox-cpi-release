@@ -37,6 +37,15 @@
 //     cache implements, so this package never imports the cache. It calls
 //     both on the request's goroutine, so each implementation hands its work
 //     to a goroutine of its own and returns at once.
+//   - A pool may carry cold-start candidates, the nodes the entry's
+//     placement.az_map names, when Gate says the cache holds no usable
+//     discovered entry. A walk reaches them only after every configured
+//     endpoint failed its dial, DNS lookup, or handshake, and never for the
+//     login, a configured-only or routed request, or a tethered mutation.
+//     The process probes them in one walk at most, through a Prober the
+//     caller supplies, and a candidate carries a request only after its
+//     certificate chains to the operator's CA, covers its name, and its probe
+//     proves its membership.
 //   - A pool's tether table ties each mutation that may have been sent to the
 //     endpoint it went to, by a tether key of its method and path, or of its
 //     family for the HA, replication, and pool writers. The first mutation

@@ -274,14 +274,17 @@ func (p *Pool) eligibleAmong(eps []*endpoint) int {
 
 // eligibleFrom reports whether ep, the endpoint a hop is about to go to, has
 // not failed its pin in this process, and counts the endpoints in eps, the
-// order from that hop on, that have not. A nil ep is eligible. Both answers
+// order from that hop on, that have not. An accepted cold-start candidate is
+// never counted, because candidates count toward neither the pool's size nor
+// its final hop, so the configured endpoints keep the deadlines they would
+// have without one. A nil ep is eligible. Both answers
 // come from one acquisition of Pool.mu, so a pin failure of ep cannot fall
 // between the refusal and the count the hop's deadline is decided from.
 func (p *Pool) eligibleFrom(ep *endpoint, eps []*endpoint) (eligible bool, n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, e := range eps {
-		if !e.ineligible {
+		if !e.ineligible && e.kind != kindCandidate {
 			n++
 		}
 	}

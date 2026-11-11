@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,13 +30,15 @@ const (
 	KindDiscovered
 )
 
-// String returns "configured" or "discovered".
+// String returns "configured", "discovered", or "candidate".
 func (k Kind) String() string {
 	switch k {
 	case KindConfigured:
 		return "configured"
 	case KindDiscovered:
 		return "discovered"
+	case kindCandidate:
+		return "candidate"
 	default:
 		return "kind(" + strconv.Itoa(int(k)) + ")"
 	}
@@ -96,6 +99,20 @@ type Config struct {
 	// on the answered request's goroutine, so it hands its work to a
 	// goroutine of its own and returns promptly.
 	FirstAnswer FirstAnswerHook
+	// Candidates are the cold-start candidates, the nodes the entry's
+	// placement.az_map names, which the caller builds only when Gate says the
+	// pool carries them. They come after every configured endpoint, they are
+	// not endpoints of the pool until a probe accepts one, and they count
+	// toward neither the pool's size nor its final hop. Only a walk in which
+	// every configured endpoint failed its dial, DNS lookup, or handshake
+	// reaches them, and the process probes them in one walk at most. A pool
+	// with candidates needs Prober, verify_ssl true with the operator's CA
+	// on Base, and no discovered endpoint.
+	Candidates []Candidate
+	// Prober decides whether a candidate is a member of the entry's
+	// cluster. It is needed when Candidates is not empty and unused
+	// otherwise.
+	Prober Prober
 
 	// headerDeadline replaces the 60-second response-header deadline. Only
 	// the package's tests set it. Zero means the default.
@@ -103,6 +120,9 @@ type Config struct {
 	// clock replaces time.Now for the age of down marks and the time a new
 	// mark records. Only the package's tests set it.
 	clock func() time.Time
+	// onColdStartWait is called by a walk just before it waits for another
+	// walk's cold start. Only the package's tests set it.
+	onColdStartWait func()
 }
 
 // endpoint is one endpoint of a pool. Everything but demoted, ineligible,
@@ -156,6 +176,12 @@ type Pool struct {
 	// endpoints is in preference order, the configured endpoints first.
 	endpoints []*endpoint
 	byAddr    map[string]*endpoint
+	// configured is the number of configured endpoints, which a walk must
+	// see fail in the connect phase before it reaches the cold start.
+	configured int
+	// cold is the pool's cold start, or nil when it carries no candidates.
+	// It is fixed at construction.
+	cold *coldStart
 
 	// refreshDue is set when a discovered endpoint was accepted on its name
 	// with a certificate outside its pin set, or failed its pin, so the next
@@ -186,6 +212,9 @@ type Pool struct {
 	// routed holds the clones built on first use for a routed host that is
 	// not one of the pool's endpoints.
 	routed map[string]*ownedTransports
+	// coldAccepted is the candidate the cold start accepted, which walks try
+	// after the configured endpoints, or nil.
+	coldAccepted *endpoint
 
 	// walk is what the pool's walks remember for their log lines.
 	walk walkState
@@ -196,8 +225,8 @@ type Pool struct {
 // New builds a pool. It refuses a base transport that checkBase refuses, an
 // empty endpoint list, a list without a configured endpoint, an address that
 // is not a valid host:port, an address listed twice, an unknown kind, a
-// configured endpoint with pins or with Online set, and a discovered endpoint
-// without pins.
+// configured endpoint with pins or with Online set, a discovered endpoint
+// without pins, and cold-start candidates that buildColdStart refuses.
 //
 // The pool starts on the first endpoint of the walk order, so a process whose
 // first configured endpoint carries a down mark younger than two minutes
@@ -207,7 +236,9 @@ type Pool struct {
 //
 // A pool of more than one endpoint gives each endpoint's idempotent clone the
 // 60-second response-header deadline. A pool of one endpoint keeps today's
-// behavior, so its one clone has no header deadline.
+// behavior, so its one clone has no header deadline. Cold-start candidates
+// count toward neither, so a pool of one configured endpoint and its
+// candidates keeps that one clone without a deadline.
 func New(cfg Config) (*Pool, error) {
 	if err := checkBase(cfg.Base); err != nil {
 		return nil, err
@@ -263,6 +294,12 @@ func New(cfg Config) (*Pool, error) {
 		}
 		p.endpoints = append(p.endpoints, ep)
 		p.byAddr[ep.addr] = ep
+		if ep.kind == KindConfigured {
+			p.configured++
+		}
+	}
+	if err := p.buildColdStart(cfg); err != nil {
+		return nil, err
 	}
 	p.startOnPreferred(builtAt)
 	p.logger.Debug(p.describe())
@@ -327,6 +364,9 @@ func orderEndpoints(in []Endpoint) ([]orderedEndpoint, error) {
 			}
 			ep.Pins = append([]Pin(nil), ep.Pins...)
 			discovered = append(discovered, ep)
+		case kindCandidate:
+			return nil, fmt.Errorf("endpoint pool: endpoint %s is a cold-start candidate, which Config.Candidates "+
+				"carries", addr)
 		default:
 			return nil, fmt.Errorf("endpoint pool: endpoint %s has unknown %s", addr, ep.Kind)
 		}
@@ -350,16 +390,22 @@ func (p *Pool) discoveredVerifier(ep Endpoint) (*verifier, error) {
 }
 
 // describe returns the pool-built line, which lists every endpoint in
-// preference order with its kind and names the endpoint the pool starts on.
+// preference order with its kind and names the endpoint the pool starts on. A
+// pool with cold-start candidates also says how many it carries.
 func (p *Pool) describe() string {
 	parts := make([]string, 0, len(p.endpoints))
 	for _, ep := range p.endpoints {
 		parts = append(parts, ep.addr+" "+ep.kind.String())
 	}
-	return fmt.Sprintf("pve endpoints: pool [%s], starting on %s", strings.Join(parts, ", "), p.active.addr)
+	line := fmt.Sprintf("pve endpoints: pool [%s], starting on %s", strings.Join(parts, ", "), p.active.addr)
+	if n := p.candidateCount(); n > 0 {
+		line += fmt.Sprintf(", with %d cold-start candidates from placement.az_map", n)
+	}
+	return line
 }
 
-// Len returns the number of configured and discovered endpoints.
+// Len returns the number of configured and discovered endpoints. Cold-start
+// candidates are not counted.
 func (p *Pool) Len() int { return len(p.endpoints) }
 
 // HeaderDeadline returns the response-header deadline the pool gives an
@@ -381,11 +427,12 @@ func (p *Pool) RefreshDue() bool { return p.refreshDue.Load() }
 func (p *Pool) markRefreshDue() { p.refreshDue.Store(true) }
 
 // CloseIdleConnections closes the idle connections of every transport the pool
-// owns, the routed ones included.
+// owns, the routed ones and the cold-start candidates' included.
 func (p *Pool) CloseIdleConnections() {
 	for _, ep := range p.endpoints {
 		ep.transports.closeIdle()
 	}
+	p.closeCandidates()
 	p.mu.Lock()
 	routed := make([]*ownedTransports, 0, len(p.routed))
 	for _, o := range p.routed {
@@ -422,18 +469,27 @@ func (p *Pool) current() (*endpoint, uint64) {
 // endpoint that failed its pin in this process is left out. With
 // configuredOnly, only the configured endpoints are returned, which is the
 // order for a ticket login and for a request with the configured-only marker.
+//
+// The candidate the cold start accepted follows the pool's endpoints within
+// its group, so no mark moves it ahead of a configured endpoint, and it leads
+// only when it is active. A configured-only walk never takes it, and a
+// candidate no probe accepted is never in any order.
 func (p *Pool) walkOrder(configuredOnly bool) ([]*endpoint, uint64) {
 	now := p.now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	order := make([]*endpoint, 0, len(p.endpoints))
+	members := p.endpoints
+	if p.coldAccepted != nil {
+		members = append(slices.Clip(p.endpoints), p.coldAccepted)
+	}
+	order := make([]*endpoint, 0, len(members))
 	var lead *endpoint
 	if !p.active.demoted && eligibleLocked(p.active, configuredOnly) {
 		lead = p.active
 		order = append(order, lead)
 	}
 	for _, back := range []bool{false, true} {
-		for _, ep := range p.endpoints {
+		for _, ep := range members {
 			if ep == lead || !eligibleLocked(ep, configuredOnly) || atBackLocked(ep, now) != back {
 				continue
 			}
