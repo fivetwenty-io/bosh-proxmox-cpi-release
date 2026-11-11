@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -491,21 +490,18 @@ func TestProvisionJournalNamesTheOwnerOnTheSiblingAsRoot(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("naming an owner requires root")
 	}
-	account, err := user.Lookup("nobody")
-	if err != nil {
-		account, err = user.LookupId("0")
+	// A fake account whose ids differ from root's, so an ignored owner leaves uid 0 and fails the test on any machine.
+	// Root can chown to ids that have no passwd entry, so the real chown still runs.
+	account := &user.User{Uid: "4242", Gid: "4343", Username: "bosh"}
+	savedLookup := lookupAccount
+	lookupAccount = func(name string) (*user.User, error) {
+		if name == account.Username {
+			return account, nil
+		}
+		return nil, user.UnknownUserError(name)
 	}
-	if err != nil {
-		t.Skip(err)
-	}
-	wantUID, err := strconv.Atoi(account.Uid)
-	if err != nil {
-		t.Skip(err)
-	}
-	wantGID, err := strconv.Atoi(account.Gid)
-	if err != nil {
-		t.Skip(err)
-	}
+	t.Cleanup(func() { lookupAccount = savedLookup })
+	wantUID, wantGID := 4242, 4343
 	base := provisionTemp(t)
 	journal := filepath.Join(base, "allocations")
 	var out, stderr bytes.Buffer
