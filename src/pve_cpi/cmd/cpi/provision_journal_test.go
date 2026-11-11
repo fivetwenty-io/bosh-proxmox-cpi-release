@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -323,8 +325,9 @@ func TestProvisionJournalWarnsAndExitsZeroWhenTheSiblingIsRefused(t *testing.T) 
 					t.Fatalf("success line missing: %q", out.String())
 				}
 				warning := stderr.String()
+				wantPrefix := "warning: endpoint cache directory " + sibling + " could not be provisioned: "
 				if strings.Count(warning, "\n") != 1 || !strings.HasSuffix(warning, "\n") ||
-					!strings.HasPrefix(warning, "warning: endpoint cache directory "+sibling+" could not be provisioned: ") {
+					!strings.HasPrefix(warning, wantPrefix) {
 					t.Fatalf("want one warning line naming %s, got %q", sibling, warning)
 				}
 				after, err := os.Lstat(sibling)
@@ -390,5 +393,179 @@ func TestProvisionJournalFailureStillExitsOneAndCreatesNoSibling(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(base, "durable", "endpoint-cache")); !os.IsNotExist(err) {
 		t.Fatalf("sibling exists after a journal failure: %v", err)
+	}
+}
+
+func TestEndpointCacheSibling(t *testing.T) {
+	for _, tc := range []struct {
+		journal string
+		want    string
+		ok      bool
+	}{
+		{"/a/allocations", "/a/endpoint-cache", true},
+		{"/a/endpoint-cache", "", false},
+		{"/endpoint-cache", "", false},
+		{"/a/endpoint-cache/x", "/a/endpoint-cache/endpoint-cache", true},
+		{"/a/endpoint-cache2", "/a/endpoint-cache", true},
+		{"/a/Endpoint-Cache", "/a/endpoint-cache", true},
+	} {
+		got, ok := endpointCacheSibling(tc.journal)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("endpointCacheSibling(%q) = %q, %v; want %q, %v", tc.journal, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+type provisionCall struct {
+	path     string
+	uid, gid int
+}
+
+// recordProvisionDirectory swaps the provisioning seam for a recorder that returns result for every call.
+func recordProvisionDirectory(t *testing.T, result error) *[]provisionCall {
+	t.Helper()
+	var calls []provisionCall
+	saved := provisionDirectory
+	provisionDirectory = func(path string, uid, gid int) error {
+		calls = append(calls, provisionCall{path, uid, gid})
+		return result
+	}
+	t.Cleanup(func() { provisionDirectory = saved })
+	return &calls
+}
+
+func TestProvisionEndpointCacheSiblingPassesThePathAndOwner(t *testing.T) {
+	calls := recordProvisionDirectory(t, nil)
+	var stderr bytes.Buffer
+	provisionEndpointCacheSibling("/x/allocations", 4242, 4343, &stderr)
+	if want := []provisionCall{{"/x/endpoint-cache", 4242, 4343}}; len(*calls) != 1 || (*calls)[0] != want[0] {
+		t.Fatalf("calls %v, want %v", *calls, want)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("unexpected output %q", stderr.String())
+	}
+	*calls = nil
+	provisionEndpointCacheSibling("/x/endpoint-cache", 4242, 4343, &stderr)
+	if len(*calls) != 0 {
+		t.Fatalf("a journal named like the cache was given a sibling: %v", *calls)
+	}
+}
+
+func TestProvisionEndpointCacheSiblingWarnsOnceWhenTheOwnerCannotBeSet(t *testing.T) {
+	recordProvisionDirectory(t, &os.PathError{Op: "chown", Path: "/x/endpoint-cache", Err: syscall.EPERM})
+	var stderr bytes.Buffer
+	provisionEndpointCacheSibling("/x/allocations", 4242, 4343, &stderr)
+	warning := stderr.String()
+	if strings.Count(warning, "\n") != 1 ||
+		!strings.HasPrefix(warning, "warning: endpoint cache directory /x/endpoint-cache could not be provisioned: ") {
+		t.Fatalf("want one warning line, got %q", warning)
+	}
+}
+
+func TestProvisionEndpointCacheSiblingWarningIsOneLineForAPathWithLineBreaks(t *testing.T) {
+	recordProvisionDirectory(t, errors.New("refused"))
+	var stderr bytes.Buffer
+	provisionEndpointCacheSibling("/x\ny\x1b[31m/allocations", 1, 1, &stderr)
+	warning := stderr.String()
+	if strings.Count(warning, "\n") != 1 || strings.ContainsRune(warning, 0x1b) {
+		t.Fatalf("want one clean warning line, got %q", warning)
+	}
+}
+
+func TestProvisionJournalGivesTheSiblingTheJournalOwner(t *testing.T) {
+	calls := recordProvisionDirectory(t, nil)
+	var out, stderr bytes.Buffer
+	if code := runProvisionJournal([]string{"--directory", "/x/allocations"}, &out, &stderr); code != 0 {
+		t.Fatalf("code %d: %s", code, stderr.String())
+	}
+	uid, gid := os.Geteuid(), os.Getegid()
+	want := []provisionCall{{"/x/allocations", uid, gid}, {"/x/endpoint-cache", uid, gid}}
+	if len(*calls) != 2 || (*calls)[0] != want[0] || (*calls)[1] != want[1] {
+		t.Fatalf("calls %v, want %v", *calls, want)
+	}
+}
+
+func TestProvisionJournalNamesTheOwnerOnTheSiblingAsRoot(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("naming an owner requires root")
+	}
+	account, err := user.LookupId("0")
+	if err != nil {
+		t.Skip(err)
+	}
+	base := provisionTemp(t)
+	journal := filepath.Join(base, "allocations")
+	var out, stderr bytes.Buffer
+	args := []string{"--directory", journal, "--owner", account.Username}
+	if code := runProvisionJournal(args, &out, &stderr); code != 0 || stderr.Len() != 0 {
+		t.Fatalf("code %d: %s", code, stderr.String())
+	}
+	requirePrivateOwnedDirectory(t, journal)
+	requirePrivateOwnedDirectory(t, filepath.Join(base, "endpoint-cache"))
+}
+
+func TestProvisionJournalWarnsWhenTheSiblingHasAnotherGroup(t *testing.T) {
+	groups, err := os.Getgroups()
+	if err != nil {
+		t.Skip(err)
+	}
+	other := -1
+	for _, g := range groups {
+		if g != os.Getegid() {
+			other = g
+			break
+		}
+	}
+	if other < 0 {
+		t.Skip("the user belongs to one group only")
+	}
+	base := provisionTemp(t)
+	sibling := filepath.Join(base, "endpoint-cache")
+	if err := os.Mkdir(sibling, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(sibling, -1, other); err != nil {
+		t.Skipf("cannot give the directory another group: %v", err)
+	}
+	var out, stderr bytes.Buffer
+	args := []string{"--directory", filepath.Join(base, "allocations")}
+	if code := runProvisionJournal(args, &out, &stderr); code != 0 {
+		t.Fatalf("code %d: %s", code, stderr.String())
+	}
+	if !strings.HasPrefix(stderr.String(), "warning: endpoint cache directory "+sibling+" could not be provisioned: ") {
+		t.Fatalf("want a warning, got %q", stderr.String())
+	}
+	info, err := os.Lstat(sibling)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); !ok || int(st.Gid) != other {
+		t.Fatalf("the sibling's group was changed")
+	}
+}
+
+func TestProvisionJournalCreatesTheSiblingWhateverTheDiscoveryModeSays(t *testing.T) {
+	for _, mode := range []string{"off", "on", "auto", ""} {
+		t.Run("discovery "+mode, func(t *testing.T) {
+			base := provisionTemp(t)
+			journal := filepath.Join(base, "allocations")
+			raw, err := json.Marshal(map[string]any{
+				"host":                           "never-connect.invalid",
+				"storage_allocation_journal_dir": journal,
+				"api_endpoint_discovery":         mode,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := filepath.Join(base, "cpi.json")
+			if err := os.WriteFile(cfg, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var out, stderr bytes.Buffer
+			if code := runProvisionJournal([]string{"--config", cfg}, &out, &stderr); code != 0 || stderr.Len() != 0 {
+				t.Fatalf("code %d: %s", code, stderr.String())
+			}
+			requirePrivateOwnedDirectory(t, filepath.Join(base, "endpoint-cache"))
+		})
 	}
 }
