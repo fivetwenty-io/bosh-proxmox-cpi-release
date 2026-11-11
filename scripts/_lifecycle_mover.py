@@ -19,8 +19,16 @@ The steps are these.
   tag     add the bosh-disk-mover tag to that parker through pmx
   attach  attach_disk to the VM in one attempt, keeping the CPI's log
   assert  one new qmigrate task for the mover and it ended OK, the disk on the
-          VM's node carrying its serial, the mover gone, no protection-restore
-          WARN in the CPI log, and a clean storage-journal audit --summary
+          VM's node carrying its serial, no protection-restore WARN in the CPI
+          log, and a clean storage-journal audit --summary. Under the journal
+          the mover stays on the VM's node, empty and protected, because the
+          journal deletes only holders its own request created, and the CPI
+          says so in exactly one WARN and no other mover WARN. Without the
+          journal the mover is destroyed.
+
+The shared storage must be one that only the pve-cpi cluster mounts. A storage
+another cluster also mounts would put this run's disk, and the journal's view
+of that storage, in front of a CPI that is not under test.
 
 Cleanup runs whether the pass passed or failed. It detaches and deletes the
 disk through the CPI, destroys through pmx only the guests this run created,
@@ -217,6 +225,32 @@ def protection_restore_warnings(stderr: str) -> list[str]:
 
 def kept_mover_warnings(stderr: str) -> list[str]:
     return warnings_matching(stderr, "kept the migration mover")
+
+
+# The one WARN a journal-managed attach logs when it adopts a mover that an
+# earlier request created and keeps it, because the journal deletes only the
+# holders its own request created (destroyOrKeepMover in attach_disk.go).
+ADOPTED_MOVER_KEPT = "kept the migration mover because an earlier request created it"
+
+
+def adopted_mover_warning_findings(stderr: str) -> list[str]:
+    """Every way the CPI's mover WARNs differ from one adopted-mover keep; [] when they match.
+
+    The log must carry the adopted-mover keep exactly once and no other WARN
+    that names the mover, so a keep because the protection restore was cut
+    off, or a restore that was refused, fails here as well as in the
+    protection-restore check.
+    """
+    findings = []
+    mover_warns = warnings_matching(stderr, "mover")
+    kept = [w for w in mover_warns if ADOPTED_MOVER_KEPT.lower() in w.lower()]
+    if len(kept) != 1:
+        findings.append(f"expected the WARN {ADOPTED_MOVER_KEPT!r} exactly once, found it {len(kept)} times"
+                        + (", verbatim: " + " | ".join(kept) if kept else ""))
+    others = [w for w in mover_warns if ADOPTED_MOVER_KEPT.lower() not in w.lower()]
+    if others:
+        findings.append("the CPI logged other mover warnings, verbatim: " + " | ".join(others))
+    return findings
 
 
 def new_qmigrate_tasks(before: list[dict[str, Any]], after: list[dict[str, Any]], vmid: int) -> list[dict[str, Any]]:
@@ -628,7 +662,9 @@ class AdoptedMoverPass:
             if f"serial={stable_id}" not in str(config.get(slot, "")):
                 failures.append(f"the VM's {slot} does not carry serial {stable_id}: {config.get(slot)!r}")
 
-        if self.mover in self.live_guests():
+        if self.journal_on:
+            failures.extend(self._kept_mover_failures())
+        elif self.mover in self.live_guests():
             kept = kept_mover_warnings(self.attach_log)
             failures.append(f"mover {self.mover} was not destroyed"
                             + (". The CPI warned, verbatim: " + " | ".join(kept) if kept else ""))
@@ -647,7 +683,25 @@ class AdoptedMoverPass:
 
         if failures:
             raise RuntimeError("11r failed:\n  - " + "\n  - ".join(failures))
-        self._say(f"11r=ok: one qmigrate OK, disk on {self.vm_node} with serial {stable_id}, mover destroyed")
+        fate = (f"mover kept on {self.vm_node}, empty and protected" if self.journal_on else "mover destroyed")
+        self._say(f"11r=ok: one qmigrate OK, disk on {self.vm_node} with serial {stable_id}, {fate}")
+
+    def _kept_mover_failures(self) -> list[str]:
+        """Under the journal, the adopted mover stays on the VM's node, empty and protected."""
+        failures = adopted_mover_warning_findings(self.attach_log)
+        node = self.live_guests().get(self.mover, "")
+        if node != self.vm_node:
+            where = f"is on {node}" if node else "is gone"
+            failures.append(f"mover {self.mover} {where}, and the journal should have kept it on {self.vm_node}")
+            return failures
+        config = self.verifier.qemu_config(self.mover, node)
+        slots = disk_slots(config)
+        if slots:
+            failures.append(f"mover {self.mover} should hold no disks, and it holds {slots}")
+        if str(config.get("protection", "0")).strip() not in ("1", "true", "True"):
+            failures.append(f"mover {self.mover} does not have protection back on "
+                            f"(protection={config.get('protection')!r})")
+        return failures
 
     # -- cleanup -------------------------------------------------------------
 

@@ -189,16 +189,21 @@ Cross-node disk migration (exercises pve.disk_migration end to end):
                        disk_storage.
     DISK_MIGRATION_SHARED_STORAGE  storage ID      (default: unset, 11r SKIPs)
                        Runs step 11r on this shared NFS storage, which must
-                       serve images content. The pass creates a disk pinned to
+                       serve images content and must not be mounted by any
+                       cluster other than pve-cpi. The pass creates a disk pinned to
                        a node other than the VM's under a parker prefix of its
                        own, so the disk parks alone on a fresh parker. It tags
                        that parker bosh-disk-mover through pmx, the shape an
                        interrupted migration leaves, and attaches the disk to
                        the VM in one attempt. It asserts one qmigrate task for
                        the mover that ended OK, the disk on the VM's node
-                       carrying its serial, the mover destroyed, no
-                       protection-restore WARN in the CPI log, and a clean
-                       storage-journal audit --summary. A failed attach is
+                       carrying its serial, no protection-restore WARN in
+                       the CPI log, and a clean storage-journal audit
+                       --summary. Under the journal it also asserts that the
+                       mover stays on the VM's node, empty and protected, and
+                       that the CPI logs the adopted-mover keep WARN exactly
+                       once and no other mover WARN; without the journal it
+                       asserts the mover was destroyed. A failed attach is
                        reported with the CPI's error text verbatim. The run
                        refuses to start unless PVE_VERIFY_TRANSPORT=pmx, the
                        cluster names itself pve-cpi, and every node is a
