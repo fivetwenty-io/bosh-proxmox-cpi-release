@@ -49,6 +49,24 @@ func (c *settleMigrationPVE) ObserveMigrationTaskSettlement(
 	return c.task, c.taskErr
 }
 
+// Pools serves the flow fake's pools with the sentinel readback the SDK
+// client serves, so settlement can settle a lock step a request planned.
+func (c *settleMigrationPVE) Pools() pve.PoolService {
+	return settleMigrationPools{managedDiskTestPools{state: c.state}}
+}
+
+// settleMigrationPools reads a sentinel the way PVE answers GET
+// /pools/{poolid}: the claim of a pool that exists, and Pool.pm's exact
+// missing-pool verdict for one that doesn't.
+type settleMigrationPools struct{ managedDiskTestPools }
+
+func (p settleMigrationPools) ReadPoolComment(_ context.Context, id string) (string, error) {
+	if comment, ok := p.state.pools[id]; ok {
+		return comment, nil
+	}
+	return "", &sdkerrors.APIError{HTTPCode: 500, Message: "pool '" + id + "' does not exist\n"}
+}
+
 // settleMigrationCase is the incident's record: the adopted mover's attach
 // sent a migration from n2 to n1 that landed, but n2 answered the guard's
 // readback of the mover's source config with a 500 that doesn't say the
@@ -180,6 +198,19 @@ func (c *settleMigrationCase) appendSubmittedStep(
 	}
 	step, _ := recordStep(handle.Record(), id)
 	return step
+}
+
+// appendPlannedLockStep records a lock step of the migrate step's operation
+// that the active attempt planned and never sent, the way a request that
+// stopped before its sentinel create leaves one. Its target is the lock
+// step's shape: the migrate step's node, storage, and volume, and no VM.
+// Settlement can settle it, because every sentinel it could have meant reads
+// back exactly.
+func (c *settleMigrationCase) appendPlannedLockStep(t *testing.T) aj.Step {
+	t.Helper()
+	target := c.step.Target
+	target.VMID = 0
+	return c.appendSubmittedStep(t, "lifecycle_attach_disk_Pool_CreatePool", target, nil, "")
 }
 
 // settleMigrationWarnings returns the WARN lines in which settle-migration
@@ -328,6 +359,16 @@ func TestSettleMigrationRefusesWithoutProof(t *testing.T) {
 		{name: "UPID of another step", want: "does not match the UPID",
 			setup: func(_ *testing.T, c *settleMigrationCase, d *StorageAllocationDecision) {
 				d.MigrationTaskUPID = strings.Replace(c.step.UPID, "0000A1B2", "0000FFFF", 1)
+			}},
+		{name: "settleable lock step and another step's UPID", want: "does not match the UPID",
+			setup: func(t *testing.T, c *settleMigrationCase, d *StorageAllocationDecision) {
+				c.appendPlannedLockStep(t)
+				d.MigrationTaskUPID = strings.Replace(c.step.UPID, "0000A1B2", "0000FFFF", 1)
+			}},
+		{name: "settleable lock step and an unknown step", want: "has no step attempt-0-step-999",
+			setup: func(t *testing.T, c *settleMigrationCase, d *StorageAllocationDecision) {
+				c.appendPlannedLockStep(t)
+				d.MigrationStepID = "attempt-0-step-999"
 			}},
 		{name: "not a migrate step", want: "is not a cross-node migration step",
 			setup: func(t *testing.T, c *settleMigrationCase, d *StorageAllocationDecision) {
@@ -500,6 +541,55 @@ func TestSettleMigrationRefusesWithoutProof(t *testing.T) {
 				t.Fatalf("a refusal logged a settlement: %v", lines)
 			}
 		})
+	}
+}
+
+// TestSettleMigrationSettlesAPlannedLockStepFirst settles a lock step that
+// the migration's request planned and never sent, by reading back every
+// sentinel it could have meant, and then settles the migrate step. Both end
+// observed, nothing else in the record changes, and nothing in PVE changes.
+func TestSettleMigrationSettlesAPlannedLockStepFirst(t *testing.T) {
+	c := newSettleMigrationCase(t, true)
+	lock := c.appendPlannedLockStep(t)
+	before := c.record(t)
+	mutations := c.mutations()
+
+	settled, err := c.settle(c.decision())
+	if err != nil {
+		t.Fatalf("settle-migration = %s", StorageAllocationDecisionFailure(err))
+	}
+	if c.mutations() != mutations {
+		t.Fatalf("settle-migration changed PVE: %v, was %v", c.mutations(), mutations)
+	}
+	record := c.record(t)
+	if !reflect.DeepEqual(record, settled) {
+		t.Fatalf("returned record differs from the journal's")
+	}
+	if record.State != aj.ReconciliationRequired || len(record.Steps) != len(before.Steps) {
+		t.Fatalf("record = %s with %d steps, want reconciliation_required with %d",
+			record.State, len(record.Steps), len(before.Steps))
+	}
+	for i := range record.Steps {
+		got, was := record.Steps[i], before.Steps[i]
+		switch got.ID {
+		case lock.ID:
+			if got.State != aj.Observed || !reflect.DeepEqual(got.VolIDs, []string{lock.Target.IntendedVolume}) {
+				t.Errorf("lock step = %s with %v, want observed with %s",
+					got.State, got.VolIDs, lock.Target.IntendedVolume)
+			}
+		case c.step.ID:
+			if got.State != aj.Observed || got.UPID != was.UPID {
+				t.Errorf("migrate step = %s (%s), want observed with UPID %s", got.State, got.UPID, was.UPID)
+			}
+		default:
+			if !reflect.DeepEqual(got, was) {
+				t.Errorf("step %s changed: %+v, was %+v", got.ID, got, was)
+			}
+		}
+	}
+	assertMigrationSettlementEvidence(t, c, before, record)
+	if lines := settleMigrationWarnings(c.logged.String()); len(lines) != 1 {
+		t.Fatalf("settle-migration logged %d settlement WARNs, want one", len(lines))
 	}
 }
 
