@@ -265,7 +265,7 @@ A cpi-config entry can set its own list as `endpoints`. The table shows what an 
 | `host` and `endpoints` | The two must agree, exactly as they must in the job config. |
 | The job's `host` and `port` and no `endpoints`, or none of the three keys | The job's list, and with it the job's credentials. |
 
-An entry's list names entry nodes for the API. It never names a node set for placement, so the nodes a VM can land on still come from the entry's `placement` block and the CPI's placement rules.
+An entry's list names the machines the CPI may use for API calls. It never chooses where a VM lands, so the nodes a VM can land on still come from the entry's `placement` block and the CPI's placement rules.
 
 ### Endpoint discovery
 
