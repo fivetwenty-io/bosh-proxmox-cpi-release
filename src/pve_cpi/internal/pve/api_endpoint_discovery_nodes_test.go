@@ -115,6 +115,7 @@ func TestDiscoveryWorker_RecordsTheLocalNodeAgainstTheEndpointThatAnsweredTheSta
 	f := newFailoverReads(t)
 	e.client = f.client(t, e, map[string]func(){"nodes": f.takeDown})
 	e.run()
+	f.mustStayDown(t)
 
 	want := map[string]string{workerSecondEndpoint: "pve1"}
 	p := e.payload()
@@ -146,6 +147,7 @@ func TestDiscoveryWorker_RecordsTheLocalNodeAgainstTheFirstEndpointWhenItAnswers
 	f.takeDown()
 	e.client = f.client(t, e, nil)
 	e.run()
+	f.mustStayDown(t)
 	want = map[string]string{workerSeed: "pve1", workerSecondEndpoint: "pve9"}
 	if p := e.payload(); p.Cluster == nil || !reflect.DeepEqual(p.Cluster.EndpointNodes, want) {
 		t.Fatalf("after a refresh through the second endpoint: cluster %+v, want endpoint_nodes %v", p.Cluster, want)
