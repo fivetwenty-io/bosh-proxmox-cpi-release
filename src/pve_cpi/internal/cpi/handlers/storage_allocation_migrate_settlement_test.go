@@ -213,6 +213,48 @@ func (c *settleMigrationCase) appendPlannedLockStep(t *testing.T) aj.Step {
 	return c.appendSubmittedStep(t, "lifecycle_attach_disk_Pool_CreatePool", target, nil, "")
 }
 
+// observeIncidentStep marks the incident's migrate step observed with the
+// volume it recorded, the way a settlement leaves it.
+func (c *settleMigrationCase) observeIncidentStep(t *testing.T) {
+	t.Helper()
+	handle, err := c.journal.Acquire(c.ctx, c.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := handle.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	record := handle.Record()
+	for i := range record.Steps {
+		if record.Steps[i].ID == c.step.ID {
+			record.Steps[i].State = aj.Observed
+			record.Steps[i].VolIDs = append(record.Steps[i].VolIDs, c.step.Target.IntendedVolume)
+		}
+	}
+	if err := handle.Save(record); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// attemptCompletion is the complete absence proof that closes an attempt or
+// admits the next one, with fresh evidence named for label.
+func (c *settleMigrationCase) attemptCompletion(t *testing.T, label string) aj.AttemptVerification {
+	t.Helper()
+	id, evidence, err := aj.VerificationEvidence(map[string]string{"attempt": label, "allocation_id": c.id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return aj.AttemptVerification{
+		Verification: aj.Verification{
+			EvidenceID: id, EvidenceJSON: evidence, Complete: true, AbsenceVerified: true,
+			ArtifactDispositionVerified: true,
+		},
+		OutcomesKnown: true,
+	}
+}
+
 // settleMigrationWarnings returns the WARN lines in which settle-migration
 // says it settled a migration step.
 func settleMigrationWarnings(logged string) []string {
@@ -417,6 +459,39 @@ func TestSettleMigrationRefusesWithoutProof(t *testing.T) {
 				upid := strings.Replace(c.step.UPID, "0000A1B2", "0000A1B3", 1)
 				step := c.appendSubmittedStep(t, settleMigrationKind, c.step.Target, []inv.ChargeRecord{charge}, upid)
 				d.MigrationStepID, d.MigrationTaskUPID = step.ID, upid
+			}},
+		{name: "external migrate step", want: "does not record the managed mover",
+			setup: func(t *testing.T, c *settleMigrationCase, d *StorageAllocationDecision) {
+				// The incident step is settled first, so the external step
+				// is the record's only unsettled one, and nothing but its
+				// target's External flag stands between it and a settlement.
+				c.observeIncidentStep(t)
+				target := c.step.Target
+				target.External = true
+				upid := strings.Replace(c.step.UPID, "0000A1B2", "0000A1B4", 1)
+				d.MigrationStepID = c.appendSubmittedStep(t, settleMigrationKind, target, nil, upid).ID
+				d.MigrationTaskUPID = upid
+				c.pve.task.UPID = upid
+			}},
+		{name: "active attempt closed", want: "is not in the allocation's open attempt",
+			setup: func(t *testing.T, c *settleMigrationCase, _ *StorageAllocationDecision) {
+				record := c.record(t)
+				completion := c.attemptCompletion(t, "closed")
+				record.Attempts[len(record.Attempts)-1].Completion = &completion
+				record.Verifications = append(record.Verifications, completion.Verification)
+				rewriteJournalRecord(t, c.deps, c.id, record)
+			}},
+		{name: "step from an earlier attempt", want: "is not in the allocation's open attempt",
+			setup: func(t *testing.T, c *settleMigrationCase, _ *StorageAllocationDecision) {
+				record := c.record(t)
+				completion, admission := c.attemptCompletion(t, "closed"), c.attemptCompletion(t, "admitted")
+				last := len(record.Attempts) - 1
+				record.Attempts[last].Completion = &completion
+				record.Attempts = append(record.Attempts, aj.Attempt{
+					Number: last + 1, Plan: record.Attempts[last].Plan, Admission: &admission,
+				})
+				record.Verifications = append(record.Verifications, completion.Verification, admission.Verification)
+				rewriteJournalRecord(t, c.deps, c.id, record)
 			}},
 		{name: "another unsettled step", want: "is planned",
 			setup: func(t *testing.T, c *settleMigrationCase, _ *StorageAllocationDecision) {
