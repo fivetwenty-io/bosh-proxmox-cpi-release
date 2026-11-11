@@ -121,7 +121,7 @@ An entry can set only the keys in a closed registry, and every key in it names s
 
 | Group | Keys | Why the key is per cluster |
 |---|---|---|
-| Endpoint and trust | `host`, `port`, `user`, `password`, `api_token`, `realm`, `ca_cert`, `verify_ssl` | Each cluster has its own address, identity, and trust root. |
+| Endpoint and trust | `host`, `port`, `endpoints`, `user`, `password`, `api_token`, `realm`, `ca_cert`, `verify_ssl` | Each cluster has its own address, identity, and trust root. The `endpoints` list names the machines of one cluster, as described below. |
 | Where VMs land | `node`, `vm_storage`, `disk_storage`, `stemcell_storage`, `iso_storage`, `network_bridge` | These names exist on one cluster only. |
 | Pools and template node | `vm_pool`, `stemcell_template_pool`, `stemcell_template_node` | A token scoped to one cluster's pool needs that cluster's pool name, and node names differ per cluster. |
 | Storage sets | `storage_sets`, `storage_capacity_domains`, `ephemeral_storage_set`, `persistent_storage_set`, `root_storage_set`, `storage_placement_namespace`, `require_disjoint_storage_sets`, `storage_status_max_age_seconds` | They bind to one cluster's storages and journal namespace. |
@@ -152,6 +152,8 @@ Five rules apply when an entry moves a request to another endpoint, meaning it c
 - The endpoint list does not carry over
   An entry on another endpoint gets no `endpoints` list unless it sets one itself, because the job's list names machines of the job's cluster. The entry's list is then just its own `host` and `port`.
 
+An entry's `endpoints` list names entry nodes for the API, meaning machines of that one cluster that can answer the same requests. It is never a node set for placement. The CPI chooses the node a VM lands on by its placement rules, including the entry's `placement` block and `az_map`, and the node it reached the API through only proxies the request. Listing a node in `endpoints` does not make it a candidate for VMs, and leaving a node out does not stop VMs from landing on it. [Configuration](configuration.md#api-endpoints) covers the list itself.
+
 Everything else is deliberately left at the job level.
 
 | Setting | Why an entry cannot set it |
@@ -174,7 +176,7 @@ Credentials travel with the whole ordered endpoint list. The group is `user`, `p
 
 > `config: context entry for host "pve-az2.example.com" changes pve.host but supplies no credentials; set pve.api_token, or pve.user and pve.password, and pve.ca_cert if that cluster uses a private CA`
 
-When the entry keeps the job's primary and changes only the list, the error says `pve.endpoints` where the first one says `pve.host`, and it leaves out the private CA advice, because the CA stays with the primary.
+When the entry keeps the job's host and changes only the port, the error says `pve.port` where the first one says `pve.host`. When the entry keeps the job's primary and changes only the list, it says `pve.endpoints`, and it leaves out the private CA advice, because the CA stays with the primary.
 
 > `config: context entry for host "pve-az1.example.com" changes pve.endpoints but supplies no credentials; set pve.api_token, or pve.user and pve.password`
 
@@ -443,7 +445,7 @@ Each AZ's network has to reach two things, the Director's NATS and the blobstore
   The Director sends the blobstore settings in each `create_vm` env, so the VM fetches job packages and compiled releases from whatever endpoint the Director names. Each AZ's network needs a route to it, and any name the settings use must resolve from that subnet.
 
 - The route to each PVE API
-  The CPI runs on the Director VM, so the Director needs a route to each entry's PVE API at `pve.host` and `pve.port`, which defaults to 8006.
+  The CPI runs on the Director VM, so the Director needs a route to each entry's PVE API. That means every address in the entry's `pve.endpoints` list, or `pve.host` and `pve.port` when the entry lists none, and the port defaults to 8006. The CPI tries the endpoints in order, so a missing route to one of them costs a connect timeout and not a failure while another endpoint is reachable, but a list is only as useful as the routes behind it.
 
 - The operator's route to the Director
   During `bosh create-env`, the machine running the command has to reach the Director VM on its mbus port, 6868.

@@ -75,10 +75,33 @@ This page collects every known limitation of the CPI in one place. Each entry is
 - Two entries on one cluster share a journal namespace and can share a parker band
   The CPI warns about these shapes and does not refuse them. It records the set of entry bindings that have admitted a create into the namespace, each one the VM prefix, parker prefix, and VMID bands of one entry. It warns once when a create brings a binding that is new to the set, and `storage-journal audit` lists every binding while comparing them with the job-level configuration only. When it lists parkers, it warns about parkers of another prefix inside its parker band, even when two entries share the band on purpose, because those look the same as the leftovers of a parker prefix change. A parker of another prefix whose `director--` tag names another Director gets a separate warning that never advises removing it. It also warns about parkers with its own director tag and prefix outside the band, and it refuses to attach, update, or delete a disk parked on one of those until the band covers it again. See [Two cpi-config entries on one cluster](troubleshooting.md#two-cpi-config-entries-on-one-cluster).
 
+## PVE API endpoints
+
+- A mutation that may have reached PVE is never retried on another endpoint
+  The CPI moves a request to the next endpoint only when it can prove the request was never sent, which means a failure to connect. A mutation that was sent and then lost its connection, or that got any answer at all, stays tied to the endpoint that took it, so the retry waits on that node and can fail while the node is down. We accept that, because a retry on another node could run a second copy of a create or a destroy. See [API Endpoints](configuration.md#api-endpoints).
+
+- A hung last endpoint waits as a single host does
+  An idempotent request gets a 60-second response-header deadline on every hop except the last, and a mutation or an upload gets none. When the last endpoint the CPI can try accepts the connection and then stops answering, the call waits for the 30-minute client timeout, as a call to one hung host does without a list. A list helps most when a node is down and least when a node is hung.
+
+- A walk is bounded
+  One request makes at most four hops, stops starting new hops after 30 seconds of connect attempts, and stops after 90 seconds in all. A list longer than four endpoints therefore does not guarantee that a live endpoint at the end of the list is reached in one call. The order of the list is the order the CPI tries, so we put the nodes we trust most first.
+
+- A task cannot be recovered when its own node dies
+  A task's status lives on the node that runs it, so no other endpoint can answer a poll for it until that node returns.
+
+- Failover stays inside one cluster
+  A cpi-config entry names one cluster or host, and its `endpoints` list names machines of that cluster. The CPI never fails over from one entry's cluster to another. See [Multi-Cluster Deployments](multi-cluster.md#what-an-entry-can-override).
+
+- Each process pays for a dead endpoint on its own
+  Without a usable endpoint cache, every CPI process walks the list in order, so a dead first endpoint costs each call up to its dial timeout (5 seconds when the list holds more than one endpoint and `pve.api_dial_timeout_sec` is `0`). Put a healthy node first when a node stays down for long.
+
+- The list does not route uploads
+  `pve.endpoints` controls which endpoints answer API calls. Direct-to-node uploads still follow `pve.node_endpoints` and `pve.node_endpoints_discovery`, and the list does not change where an upload goes. See [Configuration](configuration.md#api-endpoints).
+
 ## PVE HA
 
-- The cluster profile is probed on every call
-  The CPI reads quorum, the CRM master, node versions, and the token's privileges each time it needs the HA profile, and it keeps no cache. Every call that touches HA pays for those reads. See [HA and Resurrection](ha-and-resurrection.md#the-cluster-has-to-pass-the-profile-first).
+- The cluster profile is read live unless endpoint discovery is on
+  The CPI reads quorum, the CRM master, node versions, and the token's privileges each time it needs the HA profile. When the effective discovery mode is `on`, it keeps the slow-changing facts (node versions, CPU models, configured votes, the QDevice's configuration, the token's privileges, and storage definitions) in a cache file for 60 seconds. It never caches node health, watchdog answers, or the QDevice's connection status. With discovery off, or when the cache directory is unusable, every call that touches HA pays for the reads. See [HA and Resurrection](ha-and-resurrection.md#the-cluster-has-to-pass-the-profile-first).
 
 - A two-node cluster passes the profile only with a QDevice
   The survives-one check counts every vote a configured QDevice carries, connected or not, and it treats a QDevice answer that does not state a connection as one configured vote with an unknown status. A configured QDevice that is disconnected still lets a two-node cluster pass the profile. Only the check for a fragile node counts a QDevice's votes while it is connected, so a disconnected QDevice shows up as a `quorum_fragile` finding and triggers the watchdog check. We recommend three or more nodes. See [HA and Resurrection](ha-and-resurrection.md#quorum-votes-and-the-qdevice).

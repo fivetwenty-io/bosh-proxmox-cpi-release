@@ -102,7 +102,8 @@ The CPI exposes properties under the `pve.*` and `agent.*` namespaces. The most 
 
 | Property | Description | Default |
 |---|---|---|
-| `pve.host` | PVE host (IP or FQDN) | **required** |
+| `pve.host` | PVE host (IP or FQDN). Required unless `pve.endpoints` is set | **required** |
+| `pve.endpoints` | Ordered list of PVE API endpoints for the cluster. The CPI tries them in order when it cannot reach the first | `[]` |
 | `pve.user` | PVE username (e.g. `bosh@pve`) | **required** |
 | `pve.api_token` | PVE API token, preferred over password in production | `""` |
 | `pve.password` | PVE password, ignored when `api_token` is also set | `""` |

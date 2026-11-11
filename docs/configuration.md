@@ -4,7 +4,7 @@ The CPI reads configuration from a BOSH deployment manifest. The job template re
 
 ## Minimal Configuration
 
-Config validation requires these properties: `host`, one of `password` or `api_token`, `vm_storage`, and `disk_storage`, plus `user` whenever the CPI authenticates with `password` (`network_bridge` is also validated, but the job spec always renders its `vmbr0` default, so a manifest that omits it still passes). In practice, also set `node`, because it is where `create_stemcell` builds cache templates by default and where `create_vm` falls back when placement scoring is disabled or a call does not resolve a target node.
+Config validation requires these properties: `host` or `endpoints` (at least one of them), one of `password` or `api_token`, `vm_storage`, and `disk_storage`, plus `user` whenever the CPI authenticates with `password` (`network_bridge` is also validated, but the job spec always renders its `vmbr0` default, so a manifest that omits it still passes). In practice, also set `node`, because it is where `create_stemcell` builds cache templates by default and where `create_vm` falls back when placement scoring is disabled or a call does not resolve a target node.
 
 ```yaml
 properties:
@@ -21,8 +21,9 @@ With just this manifest, `create_vm` attaches every NIC to the pre-existing `vmb
 
 | Property | Description | Default | Required |
 |---|---|---|---|
-|  `pve.host` | PVE host (IP or FQDN). Overridable per cpi-config entry as `pve_host`. | - | yes |
-|  `pve.port` | PVE API port. Overridable per cpi-config entry as `pve_port`. | `8006` | no |
+|  `pve.host` | PVE host (IP or FQDN), which is the first endpoint the CPI dials. Required unless `pve.endpoints` is set, in which case it takes the first entry of that list. When both are set, `pve.host` and `pve.port` must name the same host and port as the first entry of `pve.endpoints`, or the CPI rejects the config. Manifests that set only `pve.host` keep working unchanged. See [API Endpoints](#api-endpoints). Overridable per cpi-config entry as `pve_host`. | - | yes, unless `pve.endpoints` is set |
+|  `pve.port` | PVE API port. It applies to `pve.host` and to every `pve.endpoints` entry that does not carry its own port. Overridable per cpi-config entry as `pve_port`. | `8006` | no |
+|  `pve.endpoints` | Optional ordered list of PVE API endpoints for this cluster. Each entry is a hostname, an IPv4 literal, or a bare IPv6 literal, optionally followed by a port, and an IPv6 literal with a port is written `[literal]:port`. An entry may not carry a scheme, a path, user info, or whitespace. A port runs from 1 to 65535, and an entry without one takes `pve.port`. The list holds at most 16 entries, and no two may be equal once the host is lowercased, a trailing dot is removed, and the port is filled in. The first entry is the preferred endpoint, and the CPI tries the others in order when it cannot reach it. Unset or empty leaves the single `pve.host` endpoint in place and renders the same `cpi.json` as before. The list names machines that answer the PVE API for this cluster. It never changes where a VM lands, and it never changes the direct-to-node upload routing that `pve.node_endpoints` and `pve.node_endpoints_discovery` control. See [API Endpoints](#api-endpoints). Overridable per cpi-config entry as `pve_endpoints`. | `[]` | no |
 |  `pve.user` | PVE username (e.g. `root@pam` or `bosh@pve`). The key has no default, so the manifest must always include it. An API token already names its user, so the value may be `""` when `api_token` is set. Overridable per cpi-config entry as `pve_user`. | - | yes (the value may be `""` with `api_token`) |
 |  `pve.password` | PVE password. When `api_token` is also set, the token wins and the password is ignored. Must be credhub-managed in production via `((pve_password))`. Overridable per cpi-config entry as `pve_password`. | `""` | one of password or api_token |
 |  `pve.api_token` | PVE API token (`<user>!<token-id>=<uuid>`). When `password` is also set, this token wins and the password is ignored. Must be credhub-managed in production via `((pve_api_token))`. Overridable per cpi-config entry as `pve_api_token`. | `""` | one of password or api_token |
@@ -226,6 +227,43 @@ A resolved pool name, whether from a call-level override, a `vm_type` profile, o
 ### Empty-pool reaping
 
 `pve.pool_reap_empty` (default `true`) lets `delete_vm` clean up a pool once it becomes empty, so the per-deployment pools the template default creates disappear with their deployments. Before destroying the VM, the CPI records its pool membership; after the destroy completes, the CPI checks whether that pool carries the `managed by bosh-proxmox-cpi` provenance comment and, if so, attempts to delete it. A pool that is still non-empty, already gone, or missing the provenance comment is left alone, and the static `pve.vm_pool` and `pve.stemcell_template_pool` are refused by name regardless of comment, because the reaper only ever removes per-deployment pools it created, and race conditions with another creator are tolerated silently. Only the primary `delete_vm` path reaps; the fast-path delete (`pve.fast_path_delete`) skips the reaper, so some empty pools persist until a later synchronous delete.
+
+## API Endpoints
+
+A cluster usually has several nodes that can answer the PVE API, and a single `pve.host` ties every call to one of them. When that node is down, every call fails until someone changes the manifest. We list more than one node in `pve.endpoints` so the CPI can keep working while one of them is away.
+
+```yaml
+properties:
+  pve:
+    port: 8006
+    endpoints:
+      - pve1.example.com
+      - pve2.example.com
+      - pve3.example.com:8443
+    api_token: root@pam!bosh=((pve_api_token))
+```
+
+The first entry plays the role `pve.host` plays today, and a manifest that sets both must make them agree. With `pve.host: pve1.example.com` and the list above, the config loads, because `pve1.example.com` on port 8006 matches the first entry. With `pve.host: pve1.example.com` and `pve.port: 9000`, it fails, because the first entry takes `pve.port` and so no longer matches. Two entries that differ only in case, a trailing dot, or an omitted default port count as the same endpoint, and the CPI rejects the repeat.
+
+The CPI sizes its timeouts when it builds the client, and the endpoint pool sets two defaults.
+
+| Setting | Default with one endpoint | Default with more than one endpoint |
+|---|---|---|
+| `pve.api_dial_timeout_sec` | `0`, which leaves the SDK default with no explicit dial timeout | 5 seconds |
+| `pve.api_tls_handshake_timeout_sec` | `0`, which leaves the SDK default | 10 seconds |
+
+Each default applies only when the property is `0`, so a value we set always wins. A pool of one endpoint keeps exactly the options it had before `pve.endpoints` existed. The short dial timeout matters because a dead node would otherwise cost each call the operating system's full connect timeout, which is two minutes on Linux, before the CPI moved to the next endpoint.
+
+A cpi-config entry can set its own list as `endpoints`. The table shows what an entry gets for each combination of connection keys, and [Multi-Cluster Deployments](multi-cluster.md#what-an-entry-can-override) covers the credential and CA rules that go with them.
+
+| The entry sets | What the entry gets |
+|---|---|
+| A `host` or `port` that differs from the job's, and no `endpoints` | A list of just that host and port. The job's list names machines of the job's cluster, so the entry never inherits it. |
+| `endpoints` only | The entry's host and port come from the first element. A bare element takes the entry's `port` when it names one and the job's `port` otherwise. |
+| `host` and `endpoints` | The two must agree, exactly as they must in the job config. |
+| The job's `host` and `port` and no `endpoints`, or none of the three keys | The job's list, and with it the job's credentials. |
+
+An entry's list names entry nodes for the API. It never names a node set for placement, so the nodes a VM can land on still come from the entry's `placement` block and the CPI's placement rules.
 
 ## Authentication
 
@@ -656,8 +694,8 @@ Fine-grained HTTP transport timeouts for the stemcell-fetch client and the PVE A
 | `pve.stemcell_fetch_tls_handshake_timeout_sec` | Integer | `0` (→ 15 s) | TLS handshake timeout for stemcell-fetch HTTPS requests. |
 | `pve.stemcell_fetch_response_header_timeout_sec` | Integer | `0` (→ 120 s) | Timeout waiting for response headers after a stemcell-fetch request is sent. Guards against slow-loris drips on the response-header phase; the body transfer is bounded by the 30-minute outer deadline. |
 | `pve.stemcell_fetch_idle_conn_timeout_sec` | Integer | `0` (→ 90 s) | How long an idle keep-alive stemcell-fetch connection stays in the pool before being closed. |
-| `pve.api_dial_timeout_sec` | Integer | `0` (SDK default) | TCP dial timeout for PVE API HTTP requests. `0` leaves the transport at the SDK default (no explicit dial timeout). |
-| `pve.api_tls_handshake_timeout_sec` | Integer | `0` (SDK default) | TLS handshake timeout for PVE API HTTPS requests. `0` leaves the transport at the SDK default. |
+| `pve.api_dial_timeout_sec` | Integer | `0` (SDK default) | TCP dial timeout for PVE API HTTP requests. `0` leaves the transport at the SDK default (no explicit dial timeout), except that a client whose endpoint pool holds more than one endpoint uses 5 seconds. See [API Endpoints](#api-endpoints). |
+| `pve.api_tls_handshake_timeout_sec` | Integer | `0` (SDK default) | TLS handshake timeout for PVE API HTTPS requests. `0` leaves the transport at the SDK default, except that a client whose endpoint pool holds more than one endpoint uses 10 seconds. See [API Endpoints](#api-endpoints). |
 | `pve.api_max_idle_conns_per_host` | Integer | `0` (SDK default) | Maximum idle (keep-alive) connections retained in the transport pool per PVE host. Higher values reduce connection-setup latency under burst load; lower values conserve file descriptors. |
 | `pve.api_idle_conn_timeout_sec` | Integer | `0` (→ 15 s) | How long an idle keep-alive PVE API connection remains in the pool before being closed. The 15 s default retires idle connections before pveproxy closes them server-side; set `90` for the previous SDK behavior. |
 | `pve.api_tcp_keepalive_sec` | Integer | `0` (Go default) | TCP keep-alive probe interval for PVE API connections, in seconds. A positive value enables periodic TCP keep-alive probes, which helps detect silently-dropped connections on stateful firewalls. |
