@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"sort"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
@@ -210,6 +211,26 @@ func storageMutationSubmitted(handle *allocationjournal.Handle, id, upid string)
 // true only after all resources represented by the step's charges are observed.
 func storageMutationObserved(handle *allocationjournal.Handle, id string, volumes []string, acquired bool) error {
 	record := handle.Record()
+	step := markStepObserved(&record, id, volumes)
+	if step == nil {
+		return fmt.Errorf("active mutation step not found")
+	}
+	if acquired {
+		for k := range step.Charges {
+			step.Charges[k].AcquiredBytes = step.Charges[k].PlannedBytes
+			step.Charges[k].OutstandingBytes = 0
+		}
+	}
+	if record.State != allocationjournal.VMDeletedRetained {
+		record.State = allocationjournal.Observed
+	}
+	return handle.Save(record)
+}
+
+// markStepObserved marks step id of record's active attempt observed and adds
+// each of volumes its VolIDs lacks. It leaves the record's own state alone and
+// returns the step it marked, or nil when the active attempt has no such step.
+func markStepObserved(record *allocationjournal.Record, id string, volumes []string) *allocationjournal.Step {
 	for i := range record.Steps {
 		if record.Steps[i].ID != id || record.Steps[i].Attempt != record.ActiveAttempt() {
 			continue
@@ -217,26 +238,13 @@ func storageMutationObserved(handle *allocationjournal.Handle, id string, volume
 		step := &record.Steps[i]
 		step.State = allocationjournal.Observed
 		for _, volume := range volumes {
-			found := false
-			for _, old := range step.VolIDs {
-				found = found || old == volume
-			}
-			if !found {
+			if !slices.Contains(step.VolIDs, volume) {
 				step.VolIDs = append(step.VolIDs, volume)
 			}
 		}
-		if acquired {
-			for k := range step.Charges {
-				step.Charges[k].AcquiredBytes = step.Charges[k].PlannedBytes
-				step.Charges[k].OutstandingBytes = 0
-			}
-		}
-		if record.State != allocationjournal.VMDeletedRetained {
-			record.State = allocationjournal.Observed
-		}
-		return handle.Save(record)
+		return step
 	}
-	return fmt.Errorf("active mutation step not found")
+	return nil
 }
 
 // storageAllocationUncertain deliberately does not chain an upstream retriable

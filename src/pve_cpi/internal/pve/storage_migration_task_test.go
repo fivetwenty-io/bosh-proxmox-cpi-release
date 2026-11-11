@@ -230,3 +230,26 @@ func TestObserveSettledMigrationTaskChecksTheReadersAnswer(t *testing.T) {
 		t.Fatal("a nil context was accepted")
 	}
 }
+
+// TestMigrationTaskSourceNamesTheSourceNodeAndVM reads the node a qmigrate
+// UPID ran on and the VM it migrated, and refuses any other task or shape.
+func TestMigrationTaskSourceNamesTheSourceNodeAndVM(t *testing.T) {
+	node, vmid, err := pve.MigrationTaskSource(migrationWireUPID)
+	if err != nil || node != "pve2" || vmid != 90144 {
+		t.Fatalf("MigrationTaskSource = %q, %d, %v; want pve2 and VM 90144", node, vmid, err)
+	}
+	for name, upid := range map[string]string{
+		"clone":          strings.Replace(migrationWireUPID, "qmigrate", "qmclone", 1),
+		"no VM":          strings.Replace(migrationWireUPID, ":90144:", "::", 1),
+		"zero VM":        strings.Replace(migrationWireUPID, ":90144:", ":0:", 1),
+		"padded VM":      strings.Replace(migrationWireUPID, ":90144:", ":090144:", 1),
+		"named VM":       strings.Replace(migrationWireUPID, ":90144:", ":vm90144:", 1),
+		"short":          "UPID:pve2:qmigrate:90144",
+		"empty":          "",
+		"trailing space": migrationWireUPID + " ",
+	} {
+		if node, vmid, err := pve.MigrationTaskSource(upid); err == nil {
+			t.Errorf("%s: MigrationTaskSource(%q) = %q, %d; want a refusal", name, upid, node, vmid)
+		}
+	}
+}
