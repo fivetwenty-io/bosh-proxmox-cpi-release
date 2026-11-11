@@ -22,9 +22,11 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/permanent"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/safetext"
 )
 
 // ErrRefused is matched by errors.Is on the error a client returns when a
@@ -44,12 +46,14 @@ type Error struct {
 	Status int
 
 	// From is the URL that was requested, without user information, query,
-	// or fragment. It is empty when it is not known.
+	// or fragment. It is empty when it is not known. A URL longer than
+	// MaxURLTextBytes is cut and ends with a truncation marker.
 	From string
 
 	// To is the URL the server asked for, without user information, query, or
 	// fragment. It is empty when the response had no Location header or the
-	// header could not be parsed.
+	// header could not be parsed. A URL longer than MaxURLTextBytes is cut and
+	// ends with a truncation marker, because the server chose its length.
 	To string
 
 	// unparsed is set when the server answered with a redirect whose Location
@@ -89,14 +93,14 @@ func (e *Error) Permanent() bool { return true }
 // every redirect with an *Error. The hop it names as From is the last request
 // sent, which is the one that received the redirect.
 func Refuse(req *http.Request, via []*http.Request) error {
-	refusal := &Error{To: Redact(req.URL)}
+	refusal := &Error{To: redactBounded(req.URL)}
 
 	if req.Response != nil {
 		refusal.Status = req.Response.StatusCode
 	}
 
 	if len(via) > 0 {
-		refusal.From = Redact(via[len(via)-1].URL)
+		refusal.From = redactBounded(via[len(via)-1].URL)
 	}
 
 	return refusal
@@ -111,6 +115,23 @@ func Redact(u *url.URL) string {
 	}
 
 	return (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}).String()
+}
+
+// MaxURLTextBytes is the most bytes of a URL that an error the package builds
+// keeps. A server chooses the target of a redirect, and percent-encoding can
+// triple the bytes of its path, so an error that named the whole URL could run
+// to megabytes.
+const MaxURLTextBytes = safetext.MaxServerTextBytes
+
+// redactBounded renders u as Redact does and cuts the text at MaxURLTextBytes.
+func redactBounded(u *url.URL) string {
+	return safetext.Capped(Redact(u), MaxURLTextBytes)
+}
+
+// redactRawBounded renders raw as RedactRaw does and cuts the text at
+// MaxURLTextBytes.
+func redactRawBounded(raw string) string {
+	return safetext.Capped(RedactRaw(raw), MaxURLTextBytes)
 }
 
 // RedactRaw does what Redact does for a URL held as text. Text that does not
@@ -290,11 +311,11 @@ func (e *FramingError) GoString() string {
 	return fmt.Sprintf("&redirect.FramingError{Kind:%q}", e.Kind)
 }
 
-// HeaderError describes a response whose header the transport could not read.
-// The transport quotes the whole raw header line in its own message, which can
-// hold a redirect target with credentials or a cookie, so the error names only
-// the requested URL. It is permanent, because the same server sends the same
-// bytes on every attempt.
+// HeaderError describes a response whose header or trailer the transport could
+// not read. The transport quotes the whole raw header line in its own message,
+// which can hold a redirect target with credentials or a cookie, so the error
+// names only the requested URL. It is permanent, because the same server sends
+// the same bytes on every attempt.
 type HeaderError struct {
 	// From is the URL that was requested, without user information, query,
 	// or fragment. It is empty when it is not known.
@@ -334,8 +355,17 @@ func (e *HeaderError) Permanent() bool { return true }
 // the retry behavior as it was. A followed redirect to a scheme the transport
 // cannot speak is marked permanent, because every attempt fails the same way.
 //
-// An error that is not a *url.Error is returned unchanged unless its own text
-// quotes a header. An error that needs no change comes back as the same value.
+// A *url.Error further down the chain, behind a wrapper's own %w or inside an
+// errors.Join, is cleaned the same way. Its text is replaced inside the text of
+// the error that holds it, and the result still unwraps to the error Scrub was
+// given.
+//
+// Every other cause keeps its type and its chain but has its text escaped and
+// cut at safetext.MaxErrorTextBytes, because a server can choose part of it,
+// such as a name in the certificate it presents or the reason phrase a proxy
+// gives. A URL in a *url.Error is cut at MaxURLTextBytes.
+//
+// An error that needs no change comes back as the same value.
 func Scrub(err error) error {
 	if err == nil {
 		return nil
@@ -346,7 +376,7 @@ func Scrub(err error) error {
 		return cleanCause(err, "")
 	}
 
-	from := RedactRaw(urlErr.URL)
+	from := redactRawBounded(urlErr.URL)
 	cause := cleanCause(urlErr.Err, from)
 
 	if from == urlErr.URL && sameCause(cause, urlErr.Err) {
@@ -366,8 +396,31 @@ func sameCause(first, second error) bool {
 	return sameError(first, second)
 }
 
+// ScrubRead cleans an error from reading the body of resp, as Scrub cleans an
+// error from Do. The body is read after Do returns, and a failure there can
+// quote bytes the server sent, such as a malformed trailer line or the debug
+// text of an HTTP/2 GOAWAY frame. The error names the URL of the request resp
+// answers, or "the server" when resp carries no request.
+func ScrubRead(err error, resp *http.Response) error {
+	if err == nil {
+		return nil
+	}
+
+	if urlErr, ok := err.(*url.Error); ok { //nolint:errorlint // only a bare *url.Error is rebuilt
+		return Scrub(urlErr)
+	}
+
+	var requested *url.URL
+	if resp != nil && resp.Request != nil {
+		requested = resp.Request.URL
+	}
+
+	return cleanCause(err, redactBounded(requested))
+}
+
 // cleanCause returns cause, or a replacement that names only the requested URL
-// from when the text of cause quotes a response header.
+// from when the text of cause quotes a response header, or cause with its text
+// escaped and cut.
 func cleanCause(cause error, from string) error {
 	if cause == nil {
 		return nil
@@ -377,31 +430,238 @@ func cleanCause(cause error, from string) error {
 		return Scrub(nested)
 	}
 
+	// A *url.Error deeper in the chain is cleaned first, so no later step can
+	// keep its query, and the classification below reads the cleaned text.
+	cause = scrubNested(cause)
+
 	// A certificate, context, or refusal error is never reclassified by its
 	// text. A server can choose text inside such an error, such as a name in
 	// the certificate it presents, and a match on that text would drop the
-	// types that stop the retry loop.
+	// types that stop the retry loop. Its text is still escaped and cut.
 	if isProtected(cause) {
-		return cause
+		return boundText(cause)
 	}
 
 	text := cause.Error()
 
+	// The markers below are phrases net/http and the transport write before
+	// any bytes they quote. A protocol error that quotes the server, such as
+	// the debug data of an HTTP/2 GOAWAY frame, can hold one of the phrases in
+	// the part the server chose, so only the text before that part is read.
+	own := text
+	if start, _ := framingCut(text); start >= 0 {
+		own = text[:start]
+	}
+
 	switch {
-	case strings.Contains(text, unparsedLocationMarker):
+	case strings.Contains(own, unparsedLocationMarker):
 		return &Error{From: from, unparsed: true}
-	case strings.Contains(text, malformedHeaderMarker):
+	case strings.Contains(own, malformedHeaderMarker):
 		return &HeaderError{From: from}
-	case strings.Contains(text, unsupportedSchemeMarker) && !permanent.Is(cause):
-		return permanent.Mark(cause) //nolint:wrapcheck // marks cause, so it is the same error
+	case strings.Contains(own, unsupportedSchemeMarker) && !permanent.Is(cause):
+		return permanent.Mark(boundText(cause)) //nolint:wrapcheck // marks cause, so it is the same error
 	}
 
 	kind, found := framingKind(text)
 	if found {
-		return &FramingError{Kind: kind, cause: cause}
+		return &FramingError{Kind: safetext.Capped(kind, safetext.MaxServerTextBytes), cause: cause}
 	}
 
-	return cause
+	return boundText(cause)
+}
+
+// boundText returns err, or when its text holds a control character, a text
+// direction override, or invalid UTF-8, or is longer than
+// safetext.MaxErrorTextBytes, an error with the same chain whose text has those
+// escaped and is cut.
+func boundText(err error) error {
+	return safetext.CappedError(err, safetext.MaxErrorTextBytes) //nolint:wrapcheck // same chain, text escaped
+}
+
+// maxChainLinks bounds how many links scrubNested visits, so an error whose
+// Unwrap builds a new link on every call cannot keep it walking.
+const maxChainLinks = 256
+
+// nestedError is an error whose text is the text of the error it wraps with
+// each *url.Error below the top cleaned. It unwraps to the error it was built
+// from, so errors.Is and a link-by-link walk see what they saw. errors.As sees
+// the same links too, except that a *url.Error it finds comes back cleaned.
+// Code that unwraps past this error and reads a nested *url.Error itself still
+// reaches the original, with its query, as it would have before.
+type nestedError struct {
+	text      string
+	cause     error
+	permanent bool
+}
+
+// Error returns the cleaned text.
+func (e *nestedError) Error() string { return e.text }
+
+// Unwrap returns the error whose text was cleaned.
+func (e *nestedError) Unwrap() error { return e.cause }
+
+// Permanent reports whether cleaning a nested *url.Error found a failure that
+// stops the retry loop, such as a header the transport could not read, as it
+// would have if the *url.Error had come back bare.
+func (e *nestedError) Permanent() bool { return e.permanent }
+
+// GoString keeps the %#v form to the cleaned text, because the default form
+// would print the wrapped error and with it the URL.
+func (e *nestedError) GoString() string { return "redirect.nestedError(" + strconv.Quote(e.text) + ")" }
+
+// As finds what errors.As finds in the wrapped error. When that is a
+// *url.Error, which a target of *url.Error or of an interface such as net.Error
+// can match, it hands back the copy Scrub makes, so errors.As never returns the
+// original with its query, user information, and fragment.
+func (e *nestedError) As(target any) bool {
+	if !errors.As(e.cause, target) {
+		return false
+	}
+
+	slot := reflect.ValueOf(target).Elem()
+
+	found, ok := slot.Interface().(*url.Error)
+	if !ok {
+		return true
+	}
+
+	scrubbed := reflect.ValueOf(Scrub(found))
+	if scrubbed.Type().AssignableTo(slot.Type()) {
+		slot.Set(scrubbed)
+	}
+
+	return true
+}
+
+// timeoutReporter is the Timeout half of net.Error.
+type timeoutReporter interface{ Timeout() bool }
+
+// temporaryReporter is the Temporary half of net.Error.
+type temporaryReporter interface{ Temporary() bool }
+
+// withNetMethods returns base, or base with a Timeout method, a Temporary
+// method, or both, as its cause has them. A *url.Error asks its direct cause,
+// so a timeout below the wrapper still reads as one, and errors.As for a
+// net.Error stops at the wrapper only when it would have stopped at the cause.
+func withNetMethods(base *nestedError) error {
+	timeout, hasTimeout := base.cause.(timeoutReporter)
+	temporary, hasTemporary := base.cause.(temporaryReporter)
+
+	switch {
+	case hasTimeout && hasTemporary:
+		return &nestedNetError{nestedError: base, timeout: timeout, temporary: temporary}
+	case hasTimeout:
+		return &nestedTimeoutError{nestedError: base, timeout: timeout}
+	case hasTemporary:
+		return &nestedTemporaryError{nestedError: base, temporary: temporary}
+	default:
+		return base
+	}
+}
+
+// nestedTimeoutError is a nestedError whose cause has a Timeout method and no
+// Temporary method.
+type nestedTimeoutError struct {
+	*nestedError
+
+	timeout timeoutReporter
+}
+
+// Timeout reports what the cause's Timeout method reports.
+func (e *nestedTimeoutError) Timeout() bool { return e.timeout.Timeout() }
+
+// nestedTemporaryError is a nestedError whose cause has a Temporary method and
+// no Timeout method.
+type nestedTemporaryError struct {
+	*nestedError
+
+	temporary temporaryReporter
+}
+
+// Temporary reports what the cause's Temporary method reports.
+func (e *nestedTemporaryError) Temporary() bool { return e.temporary.Temporary() }
+
+// nestedNetError is a nestedError whose cause has both methods, as a net.Error
+// does, so the wrapper is a net.Error too.
+type nestedNetError struct {
+	*nestedError
+
+	timeout   timeoutReporter
+	temporary temporaryReporter
+}
+
+// Timeout reports what the cause's Timeout method reports.
+func (e *nestedNetError) Timeout() bool { return e.timeout.Timeout() }
+
+// Temporary reports what the cause's Temporary method reports.
+func (e *nestedNetError) Temporary() bool { return e.temporary.Temporary() }
+
+// scrubNested returns err, or when a *url.Error below the top of its chain
+// needs cleaning, an error whose text has that *url.Error's text replaced by
+// the text Scrub gives it. A wrapper that printed only the URL has the URL
+// replaced by its redacted form. The walk follows Unwrap() error and Unwrap()
+// []error, and stops at each *url.Error, because Scrub cleans what is below
+// it.
+func scrubNested(err error) error {
+	text := err.Error()
+	cleaned := text
+	stopsRetry := false
+
+	walkNested(err, func(nested *url.Error) {
+		scrubbed := Scrub(nested)
+		if sameError(scrubbed, nested) {
+			return
+		}
+
+		stopsRetry = stopsRetry || permanent.Is(scrubbed)
+		cleaned = strings.ReplaceAll(cleaned, nested.Error(), scrubbed.Error())
+
+		redacted := redactRawBounded(nested.URL)
+		if nested.URL != "" && nested.URL != redacted {
+			cleaned = strings.ReplaceAll(cleaned, nested.URL, redacted)
+		}
+	})
+
+	if cleaned == text && !stopsRetry {
+		return err
+	}
+
+	return withNetMethods(&nestedError{text: cleaned, cause: err, permanent: stopsRetry})
+}
+
+// walkNested calls visit for each *url.Error in the chain of err below err
+// itself, without looking below a *url.Error it found.
+func walkNested(err error, visit func(*url.Error)) {
+	queue := childrenOf(err)
+
+	for seen := 0; len(queue) > 0 && seen < maxChainLinks; seen++ {
+		link := queue[0]
+		queue = queue[1:]
+
+		if link == nil {
+			continue
+		}
+
+		if nested, ok := link.(*url.Error); ok { //nolint:errorlint // the walk inspects each link itself
+			visit(nested)
+
+			continue
+		}
+
+		queue = append(queue, childrenOf(link)...)
+	}
+}
+
+// childrenOf returns the errors err wraps directly.
+func childrenOf(err error) []error {
+	switch typed := err.(type) { //nolint:errorlint // the walk inspects each link itself
+	case interface{ Unwrap() []error }:
+		return typed.Unwrap()
+	case interface{ Unwrap() error }:
+		return []error{typed.Unwrap()}
+	default:
+		return nil
+	}
 }
 
 // isProtected reports whether err is a TLS or x509 verification failure, a
@@ -436,20 +696,42 @@ func isProtected(err error) bool {
 // framingKind cuts text at the point where a known protocol error starts to
 // quote the server's bytes. It reports false when text holds no such error.
 func framingKind(text string) (string, bool) {
+	_, cut := framingCut(text)
+	if cut < 0 {
+		return "", false
+	}
+
+	return strings.TrimRight(text[:cut], " :;,"), true
+}
+
+// framingCut returns where the first known protocol error in text starts, and
+// where its kind ends and the server's bytes begin, or -1 for both when text
+// holds none. The marker that appears first in text wins, whatever its place
+// in the list, because the quoted bytes that follow it can hold another marker
+// phrase. A marker's except phrase is looked for only up to the end of the
+// marker itself, because the bytes after it are the server's and could
+// otherwise switch the marker off.
+func framingCut(text string) (int, int) {
+	first, cut := -1, -1
+
 	for _, marker := range framingMarkers() {
 		start := strings.Index(text, marker.text)
-		if start < 0 || (marker.except != "" && strings.Contains(text, marker.except)) {
+		if start < 0 || (first >= 0 && start >= first) {
 			continue
 		}
 
-		if marker.keep {
-			start += len(marker.text)
+		end := start + len(marker.text)
+		if marker.except != "" && strings.Contains(text[:end], marker.except) {
+			continue
 		}
 
-		return strings.TrimRight(text[:start], " :;,"), true
+		first, cut = start, start
+		if marker.keep {
+			cut = end
+		}
 	}
 
-	return "", false
+	return first, cut
 }
 
 // refusedStatus reports whether a response status is one Guard turns into a
@@ -510,7 +792,7 @@ func Unwrap(rt http.RoundTripper) http.RoundTripper {
 func (t *refusingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.next.RoundTrip(req)
 	if err != nil {
-		return resp, cleanCause(err, Redact(req.URL))
+		return resp, cleanCause(err, redactBounded(req.URL))
 	}
 
 	if resp == nil || !refusedStatus(resp.StatusCode) {
@@ -539,7 +821,7 @@ func (t *refusingTransport) CloseIdleConnections() {
 // as scheme, host, and path only. A Location header that does not parse, which
 // can hold user information, a query, and a fragment, is not quoted.
 func refusalFor(req *http.Request, resp *http.Response) *Error {
-	refusal := &Error{Status: resp.StatusCode, From: Redact(req.URL)}
+	refusal := &Error{Status: resp.StatusCode, From: redactBounded(req.URL)}
 
 	location := resp.Header.Get("Location")
 	if location == "" {
@@ -553,7 +835,7 @@ func refusalFor(req *http.Request, resp *http.Response) *Error {
 		return refusal
 	}
 
-	refusal.To = Redact(target)
+	refusal.To = redactBounded(target)
 
 	return refusal
 }

@@ -209,6 +209,24 @@ type TFARequiredError struct {
 	droppedTypes int
 }
 
+// NewTFARequiredError builds the error for a login reply that asks for a second
+// factor. The ticket, the challenge, and the types are text the server chose,
+// so all three are escaped as the error ParseAPIError builds from a 401 reply
+// escapes them. The types are also limited to MaxErrorItems entries and cut at
+// MaxServerTextBytes each. The ticket and the challenge are kept whole, because
+// the caller sends them back to finish the login. The types slice is copied, so
+// the caller's slice stays as it was.
+func NewTFARequiredError(ticket, challenge string, types []string) *TFARequiredError {
+	tfaErr := &TFARequiredError{
+		Ticket:    ticket,
+		Challenge: challenge,
+		Types:     append([]string(nil), types...),
+	}
+	tfaErr.escapeServerText()
+
+	return tfaErr
+}
+
 // Error implements the error interface. It prints at most MaxErrorItems of the
 // types, in the order the server sent them, then how many more there were, and
 // it is never longer than MaxErrorTextBytes.
@@ -344,7 +362,7 @@ func ParseAPIError(statusCode int, body []byte) error {
 // one server-chosen string. It bounds the message of a reply that is not JSON,
 // such as a proxy's error page, and the message, each field name, each field
 // message, and the file of a reply that is.
-const MaxServerTextBytes = 1024
+const MaxServerTextBytes = safetext.MaxServerTextBytes
 
 // MaxErrorItems is the most items an error keeps and prints from a list the
 // server sent, meaning the entries of the errors map and the TFA types. An error
@@ -354,7 +372,7 @@ const MaxErrorItems = 32
 // MaxErrorTextBytes is the most bytes that the Error method of an API error or
 // a TFA error returns. It is above what MaxErrorItems items of ordinary size
 // need, and below the size at which a log line or a terminal is flooded.
-const MaxErrorTextBytes = 8192
+const MaxErrorTextBytes = safetext.MaxErrorTextBytes
 
 // truncationMarker ends an error text that was cut.
 const truncationMarker = "...(truncated)"

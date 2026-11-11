@@ -651,9 +651,10 @@ func (c *Client) DoBytesWithContext(ctx context.Context, method, path string, pa
 
 	body, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
+		readErr = fmt.Errorf("failed to read response body: %w", redirect.ScrubRead(readErr, resp))
 		c.recordRequestComplete(prom, req, resp, nil, start, readErr)
 
-		return nil, fmt.Errorf("failed to read response body: %w", readErr)
+		return nil, readErr
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -1272,7 +1273,7 @@ func (c *Client) parseResponse(resp *http.Response) (*Response, []byte, error) {
 	// Read response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, nil, fmt.Errorf("failed to read response body: %w", redirect.ScrubRead(err, resp))
 	}
 
 	// Check for non-success status codes
@@ -1558,7 +1559,7 @@ func (c *Client) cachingMiddleware(req *http.Request, next Handler) (*http.Respo
 			// If we can't read body, return response without caching
 			resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
-			return resp, fmt.Errorf("failed to read response body: %w", err)
+			return resp, fmt.Errorf("failed to read response body: %w", redirect.ScrubRead(err, resp))
 		}
 
 		// Create cached response

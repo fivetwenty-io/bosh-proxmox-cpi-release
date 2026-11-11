@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/constants"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/redirect"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/safetext"
 	apierrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
@@ -56,7 +57,7 @@ func (rp *ResponseParser) Parse(resp *http.Response, target interface{}) error {
 	// Read response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read response body: %w", err)
+		return fmt.Errorf("failed to read response body: %w", redirect.ScrubRead(err, resp))
 	}
 
 	// Check for non-success status codes
@@ -384,7 +385,7 @@ func (sh *StreamHandler) Handle(resp *http.Response) error {
 		}
 
 		if err != nil {
-			return fmt.Errorf("stream read error: %w", err)
+			return fmt.Errorf("stream read error: %w", redirect.ScrubRead(err, resp))
 		}
 	}
 
