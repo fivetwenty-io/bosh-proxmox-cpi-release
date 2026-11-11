@@ -2,6 +2,7 @@ package endpointpool
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -89,17 +90,19 @@ func (l *lab) otherLeaf(t *testing.T) *pvetest.Server {
 	return pvetest.NewLive(t, l.ca.NewLeaf(t, pvetest.LeafOptions{DNSNames: []string{"pve3.other.example"}}), nil)
 }
 
-// lateSendBy wraps the TLS dials of o so a pin failure comes back as the
-// dialer reports one that finished after the send-by bound passed, with the
-// failure wrapped in ErrSendByPassed. The handshake and the pin check are the
-// real ones. Only the moment the dialer reads the clock is moved, because a
-// real bound passes in the instant between the handshake's end and that read.
+// lateSendBy wraps the TLS dials of o so a pin failure or a verification
+// failure comes back as the dialer reports one that finished after the
+// send-by bound passed, with the failure wrapped in ErrSendByPassed. The
+// handshake and the certificate checks are the real ones. Only the moment the
+// dialer reads the clock is moved, because a real bound passes in the instant
+// between the handshake's end and that read.
 func lateSendBy(o *ownedTransports) {
 	for _, tr := range []*http.Transport{o.plain, o.idempotent} {
 		dial := tr.DialTLSContext
 		tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			conn, err := dial(ctx, network, addr)
-			if cpe, ok := AsConnectPhase(err); ok && cpe.Phase == PhasePin && !errors.Is(err, ErrSendByPassed) {
+			cpe, ok := AsConnectPhase(err)
+			if ok && (cpe.Phase == PhasePin || cpe.Phase == PhaseTLSVerify) && !errors.Is(err, ErrSendByPassed) {
 				return nil, &ConnectPhaseError{Phase: cpe.Phase, Endpoint: cpe.Endpoint,
 					Err: fmt.Errorf("%w: %w", ErrSendByPassed, cpe.Err)}
 			}
@@ -181,21 +184,36 @@ func TestALatePinFailureStillCounts(t *testing.T) {
 		sink := &markRecorder{}
 		p := l.poolWith(t, sink, nil, nil, configured(c.Addr), node(d.Addr, "pve3", true, PinOf(l.leaf.DER)))
 		dep := endpointOf(t, p, d.Addr)
-		p.pinFailureAfterSendBy(dep, &ConnectPhaseError{Phase: PhaseDial, Endpoint: d.Addr,
+		p.certFailureAfterSendBy(dep, &ConnectPhaseError{Phase: PhaseDial, Endpoint: d.Addr,
 			Err: fmt.Errorf("%w: %w", ErrSendByPassed, errors.New("connection refused"))})
-		p.pinFailureAfterSendBy(dep, &ConnectPhaseError{Phase: PhasePin, Endpoint: d.Addr, Err: ErrSendByPassed})
-		p.pinFailureAfterSendBy(dep, &ConnectPhaseError{Phase: PhaseTLSHandshake, Endpoint: d.Addr,
+		p.certFailureAfterSendBy(dep, &ConnectPhaseError{Phase: PhasePin, Endpoint: d.Addr, Err: ErrSendByPassed})
+		p.certFailureAfterSendBy(dep, &ConnectPhaseError{Phase: PhaseTLSHandshake, Endpoint: d.Addr,
 			Err: fmt.Errorf("%w: %w", ErrSendByPassed, ErrPinMismatch)})
-		p.pinFailureAfterSendBy(dep, &ConnectPhaseError{Phase: PhasePin, Endpoint: d.Addr, Err: ErrPinMismatch})
-		p.pinFailureAfterSendBy(dep, refuseIneligible(d.Addr))
+		p.certFailureAfterSendBy(dep, &ConnectPhaseError{Phase: PhasePin, Endpoint: d.Addr, Err: ErrPinMismatch})
+		p.certFailureAfterSendBy(dep, refuseIneligible(d.Addr))
 		cep := endpointOf(t, p, c.Addr)
-		p.pinFailureAfterSendBy(cep, &ConnectPhaseError{Phase: PhasePin, Endpoint: c.Addr,
+		p.certFailureAfterSendBy(cep, &ConnectPhaseError{Phase: PhasePin, Endpoint: c.Addr,
 			Err: fmt.Errorf("%w: %w", ErrSendByPassed, ErrPinMismatch)})
+		refused := &tls.CertificateVerificationError{Err: errors.New("x509: certificate signed by unknown authority")}
+		p.certFailureAfterSendBy(cep, &ConnectPhaseError{Phase: PhaseTLSVerify, Endpoint: c.Addr, Err: ErrSendByPassed})
+		p.certFailureAfterSendBy(cep, &ConnectPhaseError{Phase: PhaseTLSVerify, Endpoint: c.Addr, Err: refused})
+		p.certFailureAfterSendBy(cep, &ConnectPhaseError{Phase: PhaseTLSHandshake, Endpoint: c.Addr,
+			Err: fmt.Errorf("%w: %w", ErrSendByPassed, refused)})
+		p.certFailureAfterSendBy(cep, &ConnectPhaseError{Phase: PhaseTLSVerify, Endpoint: c.Addr,
+			Err: fmt.Errorf("%w: %w", ErrSendByPassed, errWrongAddress)})
+		p.certFailureAfterSendBy(dep, &ConnectPhaseError{Phase: PhaseTLSVerify, Endpoint: d.Addr,
+			Err: fmt.Errorf("%w: %w", ErrSendByPassed, refused)})
+		p.certFailureAfterSendBy(nil, &ConnectPhaseError{Phase: PhaseTLSVerify, Endpoint: c.Addr,
+			Err: fmt.Errorf("%w: %w", ErrSendByPassed, refused)})
 		if p.ineligibleNow(dep) || p.ineligibleNow(cep) || p.RefreshDue() || len(sink.all()) != 0 {
-			t.Fatalf("only a late pin failure of a discovered endpoint counts: ineligible %v %v, refresh %v, marks %+v",
-				p.ineligibleNow(dep), p.ineligibleNow(cep), p.RefreshDue(), sink.all())
+			t.Fatalf("only a late certificate refusal in the endpoint's own refusal phase counts: ineligible %v %v, "+
+				"refresh %v, marks %+v", p.ineligibleNow(dep), p.ineligibleNow(cep), p.RefreshDue(), sink.all())
 		}
 		mustDemoted(t, p, d.Addr, false)
+		mustDemoted(t, p, c.Addr, false)
+		if lines := l.entries(slog.LevelError, "pve endpoint "); len(lines) != 0 {
+			t.Fatalf("error lines = %+v, want none", lines)
+		}
 	})
 }
 

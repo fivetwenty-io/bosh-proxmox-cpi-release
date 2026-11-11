@@ -419,8 +419,9 @@ func stampMarkLocked(ep *endpoint, now time.Time) time.Time {
 //
 // The demotion keeps the rule that every endpoint the pool has blamed in this
 // process is demoted. A walk and a routed request demote a pin failure through
-// its outcome, but a pin failure that finished after the send-by bound has an
-// outcome that demotes nothing, so this demotion is its only one.
+// its outcome, and certFailureAfterSendBy demotes one that finished after the
+// send-by bound, whose outcome demotes nothing. This demotion repeats theirs,
+// so the rule holds whichever path counts the failure.
 func (p *Pool) makeIneligible(ep *endpoint, err error) (Mark, bool) {
 	now := p.now()
 	p.mu.Lock()
@@ -435,32 +436,6 @@ func (p *Pool) makeIneligible(ep *endpoint, err error) (Mark, bool) {
 	ep.transports.closeIdle()
 	p.logPinMismatch(ep, err)
 	return m, true
-}
-
-// pinFailureAfterSendBy counts a discovered endpoint's pin failure that
-// finished after the request's send-by bound had passed. The dialer wraps such
-// a failure in ErrSendByPassed, so the request reports the send-by refusal and
-// its outcome demotes nothing. The certificate was still refused, so the
-// endpoint gets every effect of a pin failure: it becomes ineligible, a refresh
-// becomes due, the Warn line is logged, and a pin mark is written. The cause
-// the line, the failure note, and the mark see is the certificate refusal
-// without the send-by wrapping. Every other error is left alone.
-func (p *Pool) pinFailureAfterSendBy(ep *endpoint, err error) {
-	if ep == nil || ep.kind != KindDiscovered || !errors.Is(err, ErrSendByPassed) ||
-		!errors.Is(err, ErrPinMismatch) {
-		return
-	}
-	cpe, ok := AsConnectPhase(err)
-	if !ok || cpe.Phase != PhasePin {
-		return
-	}
-	cause := err
-	var refused *tls.CertificateVerificationError
-	if errors.As(err, &refused) {
-		cause = &ConnectPhaseError{Phase: PhasePin, Endpoint: cpe.Endpoint, Err: refused}
-	}
-	p.walk.note(ep, noteOf(nil, cause, string(PhasePin)))
-	p.connectFailed(ep, PhasePin, cause)
 }
 
 // markDown hands m to the mark sink, when the pool has one, through

@@ -423,7 +423,9 @@ func (d *connectDialer) handshakeContext(ctx context.Context) (context.Context, 
 // the setup failed, the request could not have been sent in time on any
 // endpoint, so the error also wraps ErrSendByPassed. blamesEndpoint is false
 // for such an error, so a deadline the caller set never demotes a healthy
-// endpoint or marks it down.
+// endpoint or marks it down. A pin or verification failure is the endpoint's
+// own whenever the bound passed, so certFailureAfterSendBy takes the wrapping
+// off and still counts it.
 func (d *connectDialer) fail(phase Phase, err error, bound time.Time) error {
 	if !bound.IsZero() && !time.Now().Before(bound) {
 		err = fmt.Errorf("%w: %w", ErrSendByPassed, err)

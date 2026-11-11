@@ -216,12 +216,12 @@ func (p *Pool) sendFollowing(req *http.Request, target tetherTarget, configuredO
 // demotes it and is recorded as a connect-phase failure, and nothing
 // a routed request gets ever makes an endpoint active. When the request's own
 // context ends during the dial, net/http returns the context's error, which
-// carries no tag, so a cancelled request records nothing. A pin failure that
-// finished after the send-by bound still counts against its discovered
-// endpoint, while the request reports the send-by refusal. The error is marked
-// with MaybeSentError unless its outcome is sentNever, which takes a
-// connect-phase failure of an idempotent request or the login, or of a
-// mutation that provesNeverSent clears.
+// carries no tag, so a cancelled request records nothing. A pin or
+// verification failure that finished after the send-by bound still counts
+// against its endpoint, while the request reports the send-by refusal. The
+// error is marked with MaybeSentError unless its outcome is sentNever, which
+// takes a connect-phase failure of an idempotent request or the login, or of
+// a mutation that provesNeverSent clears.
 func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCloser, configuredOnly bool,
 ) (*http.Response, outcome, error) {
 	addr := target.addr
@@ -278,7 +278,7 @@ func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCl
 		}
 		p.connectFailed(ep, Phase(oc.class), err)
 	} else if oc.sendBy {
-		p.pinFailureAfterSendBy(ep, err)
+		p.certFailureAfterSendBy(ep, err)
 	}
 	if oc.defectAlert {
 		p.alertDefect(addr, err, oc.class, false)
@@ -803,8 +803,9 @@ func (w *walker) alert(h hopResult, hopping bool) {
 // endpoint caused gets, also records the failure for the mark sink and, for a
 // pin failure, takes the endpoint out of later walks. An accepted cold-start
 // candidate gets no mark, and a verification failure takes it out instead. A
-// send-by refusal demotes nothing, but when it wraps a pin failure that
-// finished after the bound, that pin failure still counts.
+// send-by refusal demotes nothing, but when it wraps a pin or verification
+// failure that finished after the bound, that failure still counts, the
+// candidate's revocation included.
 func (w *walker) record(h hopResult) {
 	if h.oc.demote {
 		w.p.demote(h.ep)
@@ -817,7 +818,7 @@ func (w *walker) record(h hopResult) {
 	} else if h.oc.demote && phase.Valid() {
 		w.p.connectFailed(h.ep, phase, h.err)
 	} else if h.oc.sendBy {
-		w.p.pinFailureAfterSendBy(h.ep, h.err)
+		w.p.certFailureAfterSendBy(h.ep, h.err)
 	}
 }
 
