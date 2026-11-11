@@ -15,7 +15,21 @@ type Lock struct{ File *os.File }
 // when it is missing. held is false, with no error, when another holder has
 // the lock now.
 func (p Policy) TryLock(r *os.Root, name string) (*Lock, bool, error) {
-	f, err := p.Open(r, name, os.O_RDWR|os.O_CREATE)
+	return p.tryLock(r, name, os.O_RDWR|os.O_CREATE)
+}
+
+// TryLockExisting is TryLock for a file that must already exist. It never
+// creates the file, so a missing one fails with an error that matches
+// fs.ErrNotExist. The open goes through the same private-file checks as
+// TryLock, so a file that is unsafe to lock is refused here too.
+func (p Policy) TryLockExisting(r *os.Root, name string) (*Lock, bool, error) {
+	return p.tryLock(r, name, os.O_RDWR)
+}
+
+// tryLock opens name with flags and takes the exclusive lock on it without
+// waiting.
+func (p Policy) tryLock(r *os.Root, name string, flags int) (*Lock, bool, error) {
+	f, err := p.Open(r, name, flags)
 	if err != nil {
 		return nil, false, err
 	}

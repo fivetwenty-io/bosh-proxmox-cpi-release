@@ -717,6 +717,57 @@ func TestLockWait(t *testing.T) {
 	}
 }
 
+func TestTryLockExistingNeverCreatesTheFile(t *testing.T) {
+	p := plainPolicy(1 << 10)
+	root, dir := privateRoot(t, p)
+	if l, ok, err := p.TryLockExisting(root, "a.lock"); !errors.Is(err, os.ErrNotExist) || ok || l != nil {
+		t.Fatalf("TryLockExisting of a missing file = %v, %v, %v; want ErrNotExist", l, ok, err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "a.lock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("TryLockExisting created the file: %v", err)
+	}
+	if _, _, err := p.TryLockExisting(root, "../a.lock"); err == nil {
+		t.Error("TryLockExisting accepted a path outside the root")
+	}
+
+	made, ok, err := p.TryLock(root, "a.lock")
+	if err != nil || !ok {
+		t.Fatalf("TryLock = %v, %v", ok, err)
+	}
+	if second, ok, err := p.TryLockExisting(root, "a.lock"); err != nil || ok || second != nil {
+		t.Fatalf("TryLockExisting on a held lock = %v, %v, %v; want a refusal without an error", second, ok, err)
+	}
+	if err := made.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, ok, err := p.TryLockExisting(root, "a.lock")
+	if err != nil || !ok {
+		t.Fatalf("TryLockExisting after release = %v, %v", ok, err)
+	}
+	if third, ok, err := p.TryLock(root, "a.lock"); err != nil || ok || third != nil {
+		t.Errorf("TryLock beside an existing-file lock = %v, %v, %v; want a refusal", third, ok, err)
+	}
+	if err := again.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTryLockExistingRefusesAnUnsafeFile(t *testing.T) {
+	p := plainPolicy(1 << 10)
+	root, dir := privateRoot(t, p)
+	path := filepath.Join(dir, "a.lock")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l, ok, err := p.TryLockExisting(root, "a.lock")
+	if !errors.Is(err, ErrUnsafeMode) || ok || l != nil {
+		t.Fatalf("TryLockExisting of a group-readable file = %v, %v, %v; want ErrUnsafeMode", l, ok, err)
+	}
+}
+
 func TestNewIDDefaultsAndOverride(t *testing.T) {
 	p := plainPolicy(1 << 10)
 	a, err := p.newID()
