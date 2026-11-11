@@ -339,7 +339,7 @@ func migrateMoverToNode(
 		return inner
 	})
 	if migErr != nil {
-		restoreParkerProtectionLogged(ctx, c, logger, "disk migrate", mover.Node, mover.VMID, moverLockCheck)
+		restoreMoverProtectionAfterMigrate(ctx, c, logger, mover, spec.TargetNode)
 		return "", "", cpierrors.Wrap(WrapMutationError(migErr),
 			fmt.Sprintf("disk migrate: migrate mover vmid %d from node %s to node %s", mover.VMID, mover.Node, spec.TargetNode))
 	}
@@ -378,14 +378,90 @@ func migrateMoverToNode(
 				return "", "", cpierrors.WrapAs(awaitErr, cpierrors.TypeRetriableCloud,
 					fmt.Sprintf("disk migrate: the migrate task for mover vmid %d is still running server-side; the copy continues — retry the attach and it completes once the migration lands", mover.VMID))
 			}
-			// The task failed for real; the mover stayed on the source node.
-			restoreParkerProtectionLogged(ctx, c, logger, "disk migrate", mover.Node, mover.VMID, moverLockCheck)
+			// The task failed for real, so PVE normally left the mover on the
+			// source node. The restore still looks first.
+			restoreMoverProtectionAfterMigrate(ctx, c, logger, mover, spec.TargetNode)
 			return "", "", cpierrors.Wrap(awaitErr,
 				fmt.Sprintf("disk migrate: migrate task for mover vmid %d to node %s", mover.VMID, spec.TargetNode))
 		}
 	}
 
 	return convergeMigratedMover(ctx, c, logger, mover.VMID, spec, cfg, pctx)
+}
+
+// restoreMoverProtectionAfterMigrate puts protection back on a mover after its
+// migrate call or task failed, on the node whose config holds the mover. A
+// failed call can still have moved the mover, so the restore can't assume the
+// source node. When neither node is proven, it sends nothing and logs a WARN
+// that names both nodes and the command that puts protection back.
+func restoreMoverProtectionAfterMigrate(
+	ctx context.Context, c Client, logger *log.Logger, mover DiskHolder, targetNode string,
+) {
+	node, err := locateMoverAfterMigrate(ctx, c, logger, mover, targetNode)
+	if err == nil {
+		restoreParkerProtectionLogged(ctx, c, logger, "disk migrate", node, mover.VMID, moverLockCheck)
+		return
+	}
+	if logger == nil {
+		return
+	}
+	logger.Warn(fmt.Sprintf("disk migrate: protection restore on mover %d was not sent because the mover was not "+
+		"found on node %s or node %s after its migration failed, so protection may still be off; find the mover "+
+		"with qm config %d on each node, and if protection is off, %srun qm set %d --protection 1",
+		mover.VMID, mover.Node, targetNode, mover.VMID, moverLockCheck, mover.VMID),
+		log.Int("mover_vmid", mover.VMID),
+		log.String("source_node", mover.Node),
+		log.String("target_node", targetNode),
+		log.Err(err),
+	)
+}
+
+// locateMoverAfterMigrate returns the node whose config holds the mover after
+// a migrate call or task failed. It reads the config on the source node first,
+// and the mover is there when that read returns it. When the source node
+// answers that the config is gone, the probe of every member's config says
+// where the mover is. It returns an error when neither read places the mover.
+//
+// The reads run on a context that outlives the request, bounded by the restore
+// timeout, so a request that was cancelled still finds the mover and restores
+// its protection.
+func locateMoverAfterMigrate(
+	ctx context.Context, c Client, logger *log.Logger, mover DiskHolder, targetNode string,
+) (string, error) {
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), parkerRestoreTimeout(ctx))
+	defer cancel()
+	qemuSvc := c.QEMU()
+	if qemuSvc == nil {
+		return "", fmt.Errorf("qemu service not available")
+	}
+	var cfg map[string]any
+	gone := false
+	readErr := RetryOnTransient(readCtx, logger, "disk_migrate_locate", 0, func() error {
+		var inner error
+		cfg, inner = qemuSvc.Config(readCtx, mover.Node, mover.VMID)
+		// A config that is gone is an answer, not a fault to retry.
+		gone = parkerConfigGone(inner)
+		if gone {
+			return nil
+		}
+		return inner
+	})
+	switch {
+	case readErr != nil:
+		return "", fmt.Errorf("config read for mover vmid %d on node %s: %w", mover.VMID, mover.Node, readErr)
+	case !gone && cfg != nil:
+		return mover.Node, nil
+	case !gone:
+		return "", fmt.Errorf("config read for mover vmid %d on node %s returned no config", mover.VMID, mover.Node)
+	}
+	location, err := FindVMByConfigProbe(readCtx, c, mover.VMID)
+	if err != nil {
+		return "", fmt.Errorf("config probe for mover vmid %d: %w", mover.VMID, err)
+	}
+	if !location.Found || !location.FromConfig || location.Node == "" {
+		return "", fmt.Errorf("mover vmid %d has no config on any member, including node %s", mover.VMID, targetNode)
+	}
+	return location.Node, nil
 }
 
 // convergeMigratedMover finishes a migration whose task has completed (this
