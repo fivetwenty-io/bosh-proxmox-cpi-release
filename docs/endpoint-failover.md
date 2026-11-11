@@ -209,11 +209,364 @@ The default poll path now also re-polls on a transient fault at the poll interva
 
 ## Discovery
 
+A deployment that names one API host has nothing to fail over to. Discovery fixes that without a manifest change. The CPI asks the cluster which nodes it has, remembers the answer in a small cache file, and adds those nodes to the pool behind the endpoints you listed. This section covers the modes and their defaults, what discovery reads, which nodes it accepts, how it decides what to trust, and when it tries again. [The three cache layers](#the-three-cache-layers) says where the file lives.
+
+### The modes
+
+You choose the mode with `pve.api_endpoint_discovery`, and a `cpi_config` entry can set its own as `pve_api_endpoint_discovery`. The property controls the API endpoint pool only. It never changes the direct-to-node upload routing that `pve.node_endpoints` and `pve.node_endpoints_discovery` control, and setting `pve.node_endpoints_discovery` to `false` does not turn it off.
+
+| Value | What it does |
+|---|---|
+| Unset, which means `auto` | Discovers only when the effective endpoint list holds exactly one endpoint and the CPI authenticates with an API token. |
+| `auto` | The same as unset. |
+| `on` | Discovers even when the list holds several endpoints, and seeds from the first one. With password authentication it needs `pve.verify_ssl: true`, and the job fails to render without it. |
+| `off` | Never discovers. |
+
+Quote the value in a manifest, because YAML 1.1 reads a bare `on` or `off` as a boolean. The template accepts a boolean and renders `true` as `on` and `false` as `off`. An empty string and any other spelling fail the render.
+
+```yaml
+properties:
+  pve:
+    host: pve1.example.com
+    api_token: ((pve_api_token))
+    api_endpoint_discovery: "off"
+```
+
+The CPI turns the configured mode into an effective mode once per call, and the first rule that matches wins.
+
+- The mode is `off`
+  Nothing is discovered, and nothing is read from or written to the cache for discovery.
+
+- The entry inherits the job's credentials with looser TLS settings than the job
+  Discovery is off, with a Debug line under `auto`. Under `on` the job fails validation instead, because we will not send inherited credentials to hosts that a looser check accepted.
+
+- The mode is `auto` and the list holds more than one endpoint
+  Discovery is off and nothing is logged, because you already told the CPI where to go.
+
+- The mode is `auto` and the CPI logs in with a password
+  Discovery is off, with a Debug line. Every CPI call logs in afresh, and we did not want a default to start sending tickets to a new class of hosts. You can still choose `on` with a password when `verify_ssl` is true, and even then the password goes only to endpoints you listed.
+
+- The cache directory is unusable
+  Discovery is off, with a Debug line under `auto` and a Warn line under `on`. A directory counts as unusable when it fails the checks in [What the CPI requires of the directory](#what-the-cpi-requires-of-the-directory), and when the process has already started its exit drain, which is always a Debug line.
+
+- None of the above
+  Discovery is on.
+
+An existing deployment that sets one `pve.host` and an API token therefore discovers by default. We recommend turning it off, with `api_endpoint_discovery: "off"`, when `pve.host` is a VIP or a load balancer name. [VIP and IP seeds](#vip-and-ip-seeds) explains why.
+
+### What discovery adds to the pool
+
+Discovered nodes join the pool after the endpoints you listed, so the preference order is always yours first. A walk reaches them like any other endpoint, with the rules in [How a call walks the list](#how-a-call-walks-the-list), and a pool that holds a second endpoint at construction gets the dial, handshake, and header deadlines from [Timeouts the pool sets](#timeouts-the-pool-sets).
+
+Two things never go to a discovered node. The ticket login stays on the endpoints you listed, so a password never leaves them, and a discovered node only ever receives a token or a ticket. Discovery's own requests also walk the endpoints you listed and nothing else, so only an address you chose can change what the CPI trusts. A consequence is that a refresh cannot run while every endpoint you listed is down.
+
+### When a refresh runs
+
+A refresh is due in any of these cases.
+
+- The file holds no verified node list
+  This is the state after an upgrade, a wiped directory, or a file that failed validation.
+
+- The node list is older than one hour
+  A refresh that found nodes asks again an hour later.
+
+- A discovered endpoint failed its pin
+  The failure can come from this process or from another one, which reaches this process through a `pin_failed_at` time in the file. In either case the last attempt must be more than 10 minutes old, so a spoofed DNS answer cannot force a refresh on every call.
+
+No refresh is due while the stored identity holds a conflict, whatever the other cases say.
+
+The refresh runs in the background, after the first request that one of your listed endpoints answers. The `info` method dials nothing, so it never starts one. Only one process at a time refreshes a given cache file, because the worker takes a non-blocking lock and skips the refresh when another process holds it. Before the process exits, the CPI waits up to three seconds for a running refresh, a down-mark write, or a cold-start hint write, and a worker that is still running at that point is cancelled. A signal ends the wait at once. The `pve-cid` commands that build a client drain the same way. Most calls pay nothing, because the wait ends as soon as the workers finish.
+
+### What discovery reads
+
+| Read | Privilege | What we take from it | When it fails |
+|---|---|---|---|
+| `GET /nodes` | Any authenticated user | Node names, the `status` field, and `ssl_fingerprint` | Discovery writes no result, because without fingerprints we cannot trust any discovered address. |
+| `GET /cluster/status` | `Sys.Audit` on `/` | The `quorate` flag, each node's `online` flag, and which node is `local` | Discovery continues with the nodes in name order and records the outcome `no_status`. |
+| `GET /nodes/{node}/certificates/info` for each node | Any authenticated user | The SHA-256 fingerprints of that node's `pve-ssl.pem` and `pveproxy-ssl.pem`, and from one node the cluster root CA | A node whose read fails keeps its `/nodes` fingerprint as its only pin. When no node answers the root CA read, discovery writes no result. |
+
+The whole set of reads gets 30 seconds. The certificate reads run four at a time, each gets the smaller of five seconds and the time left, and they cover at most 64 nodes. [PVE API Permissions](pve-api-permissions.md#discovery-and-cold-start-reads) lists the same reads next to the other privileges.
+
+### Which nodes become endpoints
+
+Every node name from `/nodes` must be a valid PVE node name before we use it. That means one DNS label of letters, digits, and inner hyphens, at most 63 characters, with no dots. If any name fails, discovery rejects the whole result and writes nothing, because a forged name such as `api.attacker.example` would otherwise become an arbitrary address.
+
+A name that PVE allows but that a resolver could read as another address is left out on its own, and the rest of the result stands. These are a name made only of digits, a name that starts with `0x` and continues in hex digits, and `localhost`, `ip6-localhost`, and `ip6-loopback`, whatever the case.
+
+For each remaining node we derive one address with the seed's port. [VIP and IP seeds](#vip-and-ip-seeds) explains the derivation. The CPI then resolves each derived name, in parallel, with a two-second limit for each, and leaves out a node whose name does not resolve. It also leaves out these nodes.
+
+- The node that answered
+  The pool already holds it. When `/cluster/status` is missing, a `/nodes` list of one row can only be the node that answered.
+
+- A node whose address is one of your configured endpoints
+  It is already in the pool, so it can never sit there twice.
+
+- Nodes past the 64th
+  The file holds at most 64.
+
+Nodes that a quorate `/cluster/status` reports online come first, in name order, and the rest follow. When the status is not quorate, a minority node reports every majority member as offline, so we keep every node in name order. Without a status we use the `status` field from `/nodes`.
+
+### Trust rules for identity and pins
+
+Discovery stores two kinds of trust. The identity is the full SHA-256 of the cluster's root CA certificate, which tells the CPI that two answers come from one cluster. A pin set is the certificate fingerprints that one node is allowed to present. A node holds up to three pins, which are its `/nodes` fingerprint plus its `pve-ssl.pem` and `pveproxy-ssl.pem` fingerprints. We pin the set because the fingerprint that `/nodes` reports does not always match the certificate pveproxy serves, for example after an ACME renewal that has not restarted pveproxy.
+
+These rules decide who can change either one.
+
+- Only your configured endpoints write trust
+  A discovered node can never add a node, change a pin, or change the identity, so it cannot vouch for itself.
+
+- With `verify_ssl` true
+  The endpoint you listed was checked against your own CA, so what it reports is as trustworthy as `pve.host` is today. An identity change replaces the stored node list and pins, logs at Error, and drops every discovered endpoint and every cold-start candidate from the pool for the rest of the call. A changed pin set for a known node replaces the old one.
+
+- With `verify_ssl` false
+  Nothing about the endpoint was verified, so discovery is trust on first use, as in SSH's `known_hosts`. The first discovery records the identity and the pins. A later identity change is refused, the CPI drops every discovered endpoint and cold-start candidate, logs at Error, and stops discovering until you delete the cache file. A known node whose pins only grow keeps its stored pins and adds the new ones. A node whose pins only shrink keeps its stored pins, which a timed-out certificate read can cause, and is confirmed again at Debug. A node whose pins both leave out one and add one, or share none with the stored set, is refused and keeps its stored pins until you delete the file.
+
+- Discovered entries expire
+  A node that no discovery through a configured endpoint has confirmed in 24 hours is not loaded. A node removed with `pvecm delnode` and left running with its old certificate therefore drops out within a day, even if no refresh can run.
+
+The cache is never an input to the storage journal, which refuses a silent rebinding on its own.
+
+When the CPI connects to a discovered node, it decides before any request byte goes out, so the token never reaches an address that has not proved itself. With `verify_ssl` true, the certificate chain must verify against your CA, or the system pool when you set none, and then the leaf must be in the node's pin set or must pass a hostname check against the derived name. A leaf that passes only the hostname check is accepted for this process, and it makes a refresh due so the next discovery records the new pin. With `verify_ssl` false, the leaf must be in the pin set. A node whose certificate changes outside its pin set, for example after `pvecm updatecerts --force`, is skipped for the process until the next discovery repins it, with a Warn line and a `pin` down mark. The trade is stated plainly. Stock certificates often do not carry the derived name, so we accept a pin match without a hostname match, and the HMAC on the cache file is what stops someone without your credential from planting a pin.
+
+### When discovery tries again
+
+| Situation | When the next refresh is due |
+|---|---|
+| A result with nodes, which has the outcome `ok` or `no_status` | One hour later |
+| A result with no nodes, which has the outcome `no_candidates`, `public_suffix`, or `standalone` | 24 hours later |
+| A failure before any result | One hour after the attempt |
+| An identity change refused under `verify_ssl` false | 24 hours later, and never while the conflict stands |
+| A pin failure on a discovered endpoint | At once, when the last attempt is more than 10 minutes old |
+
+A refresh records its attempt in the file before its first read, with `reads_timed_out` as the reason and the next refresh an hour out. A refresh that the exit drain cancels therefore backs off as a failed one does, and a refresh that ends writes over that record. The failure reasons are `nodes_unreadable`, `nodes_empty`, `node_name_invalid`, `root_ca_unreadable`, `reads_timed_out`, and `reads_failed`, and the file never holds raw error text. A failed attempt leaves the stored nodes and pins as they were, so a cluster whose reads keep failing is asked once an hour and not on every call.
+
+When the clock steps back and leaves the stored discovery dated ahead of the clock, the CPI cannot record an attempt. If the section is no more than an hour ahead, the refresh waits until the clock reaches it. If it is further ahead, the refresh runs without a recorded attempt, and only a result replaces the section.
+
+### Discovery log lines
+
+The failure level in this table is Debug under `auto` and Warn under an explicit `on`. The CPI writes many more Debug lines than appear here, and they are the way to see why a refresh did nothing. Raise the log level when you need them.
+
+| Event | Level | Text | Frequency |
+|---|---|---|---|
+| Discovery succeeded | Info when the node set, the identity, or the outcome changed or the last refresh failed, otherwise Debug | `api endpoint discovery: cached 2 of 3 nodes of cluster 3c5e1b7d via pve1:8006 (quorate, 3 online)` | Once per written result. The closing clause reads `no cluster status` or `not quorate` when the status says so, and a result with no status is at the failure level. |
+| Discovery degraded | Info when the outcome changed or the last refresh failed, otherwise the failure level | `api endpoint discovery: 2 of 2 derived names did not resolve (pve2.dc1.example.com, pve3.dc1.example.com); next attempt in 24h` | Once per written result. |
+| Discovery failed before it had a result | Info when the reason differs from the stored one, otherwise the failure level | `api endpoint discovery: no result through pve1:8006, because GET /nodes gave no usable node list; next attempt in 1h` | Once per failed refresh. |
+| Discovery off | The failure level | `api endpoint discovery off: cache directory /var/vcap/data/director/tmp/pve_cpi-endpoint-cache.1000 (temporary layer): endpoint cache: unsafe ownership: /var/vcap/data/director/tmp/pve_cpi-endpoint-cache.1000 is owned by uid 0, not effective uid 1000` | Once per call. The text after `off:` also reads `cache directory <path> could not be opened`, `the discovery worker could not be built`, or `the cache file could not be read`, and the exit drain's refusal is Debug in both modes. |
+| Discovery off by configuration | Debug | `api_endpoint_discovery is auto and the CPI logs in with a password, so endpoint discovery is off; use an API token (pve.api_token), or set pve.api_endpoint_discovery to on with pve.verify_ssl true to discover with a password` | Once per call. |
+| Identity changed | Error | `endpoint cache: cluster identity changed from 3c5e1b7d to 91a0c4e2 through configured endpoint pve1:8006; with verify_ssl false this is refused, delete the cache file to accept it` | Once per refresh that detects the change. With `verify_ssl` true the text ends `the cached nodes and pins are replaced`. |
+| Identity conflict stands | Warn | `endpoint cache: the cached cluster identity differs from the one the configured endpoints report and was refused because verify_ssl is false, so no cached nodes are used; delete the cache file to accept the new identity` | Once per call while the refusal stands. |
+| Pin set changed for a known node | Warn | `endpoint cache: the pin set of known node pve2 changed through configured endpoint pve1:8006; with verify_ssl false the stored pins stay, delete the cache file to accept the new ones` | Once per refresh that sees it. |
+| Pin mismatch on a discovered endpoint | Warn | `pve endpoint pve3:8006: certificate is not one of the 2 pinned for node pve3; skipping it until discovery refreshes` | Once per endpoint per call. |
+| Discovered endpoint refused before its pins were checked | Warn | `pve endpoint pve3:8006: certificate refused (x509: certificate signed by unknown authority), so it was not checked against the 2 pinned for node pve3; skipping it until discovery refreshes` | Once per endpoint per call. |
+| Node left out of a result | Debug | `api endpoint discovery: left out node pve3, because its derived name did not resolve` | Once per node. |
+
+When the lines say `delete the cache file`, [The reset](#the-reset) explains what that removes and what recreates it.
+
 ## The three cache layers
+
+The CPI keeps three kinds of file in one cache directory. They are the endpoint cache that discovery writes, the HA profile cache, and the HA recovery episode record. This section is about the directory, and the first layer that applies chooses it.
+
+```mermaid
+flowchart TD
+  start["a call needs the cache directory"] --> override{"pve.endpoint_cache_dir set?"}
+  override -->|"yes"| useoverride["use that directory and nothing else"]
+  override -->|"no"| journal{"pve.storage_allocation_journal_dir set?"}
+  journal -->|"no"| temp
+  journal -->|"yes"| sibling{"endpoint-cache beside the journal exists?"}
+  sibling -->|"yes"| usesibling["use the directory beside the journal"]
+  sibling -->|"no"| temp["use pve_cpi-endpoint-cache.EUID under the temporary directory, and create it"]
+```
+
+| Layer | Directory | Who creates it | Survives a Director recreate |
+|---|---|---|---|
+| The override | The value of `pve.endpoint_cache_dir` | You, before the deploy | Yes, when you point it at persistent storage |
+| Beside the journal | `endpoint-cache` next to the allocation journal directory | `cpi provision-journal`, which pre-start runs | Yes, because it sits on the persistent disk |
+| The temporary directory | `pve_cpi-endpoint-cache.<euid>` under `$TMPDIR` | The CPI, at run time | No, because a Director's `/var/vcap/data` is the ephemeral disk |
+
+### The override
+
+When you set `pve.endpoint_cache_dir`, the CPI uses that directory and no other. The value must be an absolute, clean path, which means it has no `.` or `..` parts, no doubled or trailing slash, no control characters, and no leading or trailing whitespace. It cannot be the root directory. It is process-level, like the journal directory, so a `cpi_config` entry cannot change it.
+
+The CPI never creates this directory. Create it before the deploy with mode `0700`, owned by the user that runs the CPI, which is `vcap` on a Director. If it is missing or fails the checks below, the endpoint cache has no directory, discovery is off for the call, and the CPI does not fall through to another layer, because a directory that someone else controls is exactly the case the checks exist for. The HA recovery episode record has its own fallback, which [HA and Resurrection](ha-and-resurrection.md) describes.
+
+Under BPM, list the directory in `director.cpi_additional_volumes` with `writable: true`. BPM mounts those volumes but never creates them, and a path outside every mounted volume lands in the worker's private filesystem. The Director's own persistent directory, `/var/vcap/store/director`, needs neither step, because every worker already sees it writable.
+
+### Beside the journal
+
+When `pve.storage_allocation_journal_dir` is set and you set no override, the cache lives in a directory named `endpoint-cache` next to the journal directory, never inside it. For a journal at `/var/vcap/store/pve_cpi/allocations`, the cache is `/var/vcap/store/pve_cpi/endpoint-cache`. This layer gives a durable cache with no new property.
+
+The `cpi provision-journal` command, which the job's pre-start runs as root with `--owner vcap`, creates this directory with the same owner and mode as the journal. The CPI itself never creates it at run time. A missing directory falls through to the temporary layer, with a Debug line that names it, and a directory that exists but fails the checks gives no cache at all, with no fall through. One consequence is that an operator command run as root, such as `cpi storage-journal`, finds a directory owned by `vcap` and runs with no cache.
+
+The layer is skipped when the journal directory's own base name is `endpoint-cache`, because the two names would collide, and when the journal path is not absolute or is the root. Provisioning is gentle with an existing sibling. If it cannot provision the directory, for example because an operator made it by hand as root, the command prints one warning on standard error that names the directory and the reason, and its exit status stays what the journal's provisioning made it, so pre-start still succeeds and the Director starts. The CPI's checks then find the bad directory and use no cache.
+
+Under BPM, the workers must see the directory. List the journal's parent directory, such as `/var/vcap/store/pve_cpi`, in `director.cpi_additional_volumes` with `writable: true` and `mount_only: true`, which exposes the journal and the cache together, or list the two directories separately. If you list only the journal directory, the cache uses the temporary directory, which is safe and only loses durability. [Provisioning the storage allocation journal](storage-journal-provisioning.md) covers the commands.
+
+### The temporary directory
+
+Otherwise the cache is `pve_cpi-endpoint-cache.<euid>` under the CPI's temporary directory, where the suffix is the effective user ID of the process. On a Director that is `/var/vcap/data/director/tmp/pve_cpi-endpoint-cache.1000`, shared by every worker, where 1000 is the `vcap` user's ID on current stemcells. Under `bosh create-env` on macOS it sits under the operator's private per-user temporary directory, and on Linux, where `TMPDIR` is often unset, it sits under `/tmp`.
+
+The CPI creates this directory itself, one component deep, with mode `0700`, and it refuses a relative temporary directory. The suffix keeps processes that run as different users, such as an operator running a command as root, in separate directories. If another user created the name first, the owner check fails and the call runs without a cache.
+
+This layer has one honest limit. `/var/vcap/data` is the ephemeral disk, so a Director recreate or a stemcell update empties it, and the next call that reaches a configured endpoint rediscovers. The other two layers, and [the cold start](#the-cold-start), answer that limit.
+
+### What the CPI requires of the directory
+
+Whichever layer applies, the CPI opens the directory through the same private checks that the storage journal uses. It refuses the directory when any of these is true.
+
+- The owner is not the CPI's effective user
+  The checks compare the directory's owner with the user that runs the CPI, so a directory made by root for `vcap` is refused when `vcap` is not the owner.
+
+- The mode grants any group or other access
+  The directory must be `0700`. The owner also needs read, write, and search access.
+
+- The path is a symlink, or is not a directory
+  This applies to the final component, and the CPI opens the directory again after the check to catch a swap.
+
+- The directory equals the allocation journal directory, sits inside it, or contains it
+  The CPI resolves symlinks in both paths before it compares them, so a link in an ancestor can make an otherwise fine directory unusable.
+
+Files inside get the same treatment. Each must be a regular file owned by the CPI's user, with no group or other bits and a single link. A directory that fails any check gives no cache for the call. Discovery is off, with the Debug or Warn line from [Discovery log lines](#discovery-log-lines), and the call carries on. The `pve-cid ha` command checks every layer for these faults, judging as the CPI's user, and [Reading the cluster with `pve-cid ha`](operations.md#reading-the-cluster-with-pve-cid-ha) shows its advice.
+
+### What the directory holds
+
+Each cache key gets one file, named after a sanitized form of the first endpoint's host and 16 hex characters of the key digest, such as `pve1.dc1.example.com-5b0e6c2f4a1d9e07.json`, so you can tell which file belongs to which cluster. The key covers the ordered endpoint list, `verify_ssl`, the CA, and a credential identifier, so two entries that reach one cluster with different tokens keep separate files. Each file has a `.lock` file and a `.discover.lock` file beside it.
+
+A file holds the cluster identity, the discovered nodes with their pins and confirmation times, the outcome and times of the last discovery, down marks, and an optional cold-start hint. A down mark lasts two minutes and a hint lasts an hour. The file is plain JSON, and you can read it with `jq` as `vcap`. It never holds a raw error, a password, or a token.
+
+Three protections keep a file honest. The file carries an HMAC that is derived from your credential and a per-directory secret, so someone who can write the directory but does not hold the credential cannot forge one, and rotating the credential invalidates every file. The secret is 32 random bytes in a file named `secret` in the directory, which the first process that needs it creates, and a secret with the wrong length is replaced with one Warn line. Writers merge under a lock with a one-second wait, and a write that waits it out is skipped. A file is at most 64 KiB, and a writer also removes cache and lock files that nobody has modified for 30 days, along with abandoned temporary files, and it never removes `secret`, `secret.lock`, or a name the cache did not make.
+
+A file that fails validation is treated as missing and the next successful discovery overwrites it. A record dropped on read is hidden and never deleted.
+
+| Event | Level | Text | Frequency |
+|---|---|---|---|
+| Cache directory chosen | Debug | `pve endpoints: cache directory /var/vcap/store/pve_cpi/endpoint-cache, beside the allocation journal directory` | Once per call. The text after the comma is `from pve.endpoint_cache_dir`, `beside the allocation journal directory`, or `in the temporary directory`. |
+| A layer declined | Debug | `pve endpoints: cache directory /var/vcap/store/pve_cpi/endpoint-cache (journal layer): the directory beside the allocation journal is missing, so the next layer applies: file does not exist` | Once per layer that declines, in every mode. |
+| Directory secret replaced | Warn | `endpoint cache: replaced the directory secret, which had the wrong length; every cache file written under the old one is rebuilt` | Once per call that meets it. |
+| Cache file not usable | The failure level | `endpoint cache: the cache file is not usable and is ignored` | Once per call. |
+| Cache write skipped | The failure level | `endpoint cache lock wait expired; skipping the cache write` | Once per write that waits out the lock. |
+| Background worker panicked | Error | `endpoint cache: background worker panicked` | Once per panicked worker at exit. |
 
 ## The cold start
 
+Discovery needs one successful call to fill the cache. The cold start covers the case where it has not, which is a process that starts with no usable cache while the configured endpoint is down. That happens after a Director recreate with the temporary layer, after someone deletes the file, and on the first calls after an upgrade. In that case the CPI may try the nodes that your `placement.az_map` already names, under rules that keep the trust model of discovery intact.
+
+### When the cold start is possible
+
+A pool carries cold-start candidates only when all of these hold. A pool that misses one has none and behaves exactly as it would without them.
+
+- The effective discovery mode is `on`
+  An unusable cache directory, password authentication under `auto`, and an explicit `off` all rule it out.
+
+- `verify_ssl` is true and `pve.ca_cert` is set
+  A candidate must chain to your own trust anchor.
+
+- The CPI authenticates with an API token
+  A password never goes to a node you did not list, even under an explicit `on`.
+
+- The cache holds no usable discovered node
+  A file counts as holding none when it is missing, fails validation, holds only a cold-start hint, or holds only nodes older than 24 hours. A file with the outcome `no_candidates` or `public_suffix` holds none, so the cold start stays possible. A file with the outcome `standalone` turns it off, because a configured endpoint told us the host has no peers.
+
+- The entry has a non-empty `placement.az_map`, and owns it
+  A `cpi_config` entry uses its own `az_map` only when it names `pve_placement` itself or when its endpoint list equals the job's. Otherwise the cold start is off for that entry, because an inherited map may name another cluster's nodes.
+
+### How candidates are built
+
+The CPI flattens the `az_map` node lists in AZ-name order, and in your order within each AZ, and drops duplicates. A name must pass the same node-name check as a discovered node, so a value such as `pve2.example.com` never becomes an address, and it is dropped with a Debug line. Each surviving name becomes an address by the derivation in [VIP and IP seeds](#vip-and-ip-seeds), with the seed's port. A candidate whose address is one of your configured endpoints is dropped. The list keeps at most 64 candidates, and a node named in a cold-start hint moves to the front but is still probed.
+
+### Where candidates sit in a walk
+
+Candidates come after every configured endpoint, and a down mark never moves one ahead. A normal request reaches a candidate only after every configured endpoint has failed in the connect phase in the current walk, and the cold start begins at that moment and not before. These cases never reach a candidate.
+
+- A failure after a connection was made
+  A header-deadline expiry or any other failure after the connection was made is not a connect-phase failure.
+
+- A TLS verification failure on a configured endpoint
+  That failure can mean interception, so the walk does not reach for a candidate.
+
+- The login, discovery requests, routed requests, and requests tethered to a configured endpoint
+  Upload routing does not use a candidate either.
+
+A walk makes at most four hops in all, so with one configured endpoint it tries at most three candidates, and with four or more configured endpoints it never reaches one. Candidates do not count toward "more than one endpoint", so the configured endpoints keep the timeouts and the final hop they would have without candidates. A candidate's connection uses the 5-second dial and the 10-second handshake. A candidate costs at most 25 seconds before its request, and a walk that reaches the cold start and accepts no candidate ends within about 55 seconds. A request with a send-by deadline, or with less than 25 seconds left on its context, never starts it.
+
+### The probe
+
+A candidate must earn trust in every process before it carries a request. The handshake checks the leaf's chain against your CA and the leaf's name against the derived name, with no pin set, and a failure of either rejects the candidate before any request byte goes out. Only then does the token go out, with `GET /cluster/status` under a 10-second header deadline of its own.
+
+The CPI accepts the candidate only when the answer is a 2xx whose single `local` node is the `az_map` name the candidate came from, and whose node list includes every name in your `az_map`. A 403, any other status, a transport error, or a mismatch makes the candidate ineligible for the rest of the process. That is why the token needs `Sys.Audit` on `/` for the cold start, as [PVE API Permissions](pve-api-permissions.md#discovery-and-cold-start-reads) notes. A probe that the request's own cancellation ended is not counted against its candidate, and a later request probes it again.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as CPI process
+  participant F as Cache file
+  participant A as Node A, configured endpoint
+  participant B as Node B, from az_map
+  C->>F: read the key's file
+  F-->>C: no usable discovered nodes
+  C->>C: build candidates from az_map
+  C->>A: dial
+  A--xC: connect-phase failure
+  C->>B: TLS handshake, chain and derived name checked
+  C->>B: GET /cluster/status with the token
+  B-->>C: local is B, every az_map node present
+  C->>B: the original request
+  B-->>C: 200
+  C->>F: down mark for A and a cold-start hint for B, in the background
+```
+
+### What a success changes
+
+The request that triggered the walk goes to the accepted candidate, and the candidate stays active for the rest of the process. A later walk still reaches it only under the conditions above. It is a discovered entry in every other way, so it never runs discovery, never adds a node, and never changes an identity or a pin, and it never receives a password.
+
+The pool writes the down mark for the failed endpoint as usual, and it writes a `cold_start` section to the key's file. The section holds the candidate's node name and probe time and nothing else, because a reader derives the address and port from the name. It is an ordering hint. A later process tries that candidate first among the candidates, still only after the configured endpoints, and still probes it. The hint expires an hour after the probe, and the next discovery that writes a result removes it.
+
+If an accepted candidate later fails TLS verification, the pool revokes it and logs at Error, because that can mean interception. An identity change found by discovery also ends the cold start for the rest of the call.
+
+### Cold-start log lines
+
+| Event | Level | Text | Frequency |
+|---|---|---|---|
+| Failover to a candidate | Warn | `pve endpoint failover: pve1:8006 unreachable (dial tcp: i/o timeout) and no cached nodes, request sent to pve2.dc1.example.com:8006 from placement.az_map after it proved membership` | Once per change of the active endpoint. |
+| A configured endpoint takes over again | Warn | `pve endpoint failover: pve1:8006 is used again, so requests go to it again rather than to the cold-start candidate pve2.dc1.example.com:8006 from placement.az_map` | Once per change of the active endpoint. |
+| A candidate was refused | Debug under `auto`, Warn under `on` | `pve endpoint pve3.dc1.example.com:8006 from placement.az_map refused: certificate is not valid for that name` | Once per candidate per call. |
+| A candidate was revoked | Error | `pve endpoint pve2.dc1.example.com:8006: the cold-start candidate for node pve2 from placement.az_map failed TLS verification (x509: certificate signed by unknown authority); this can mean interception; the pool no longer sends to it` | Once per candidate per call. |
+| The cold start begins | Debug | `pve endpoints: no configured endpoint could connect, so this request tries the cold-start candidates from placement.az_map` | Once per run. |
+| No cold start for this call | Debug | `pve endpoints: no cold start from placement.az_map, because the cache holds usable discovered nodes or its last discovery found a standalone host` | Once per call that has `az_map` names and a cache that rules it out. |
+| Cold start barred for a request | Debug | `pve endpoints: no configured endpoint could connect, and DELETE /pools/... does not start the cold start from placement.az_map, because it carries a send-by deadline` | Once per request. |
+| A cold-start hint could not be recorded | The failure level | `endpoint cache: the cold-start hint could not be recorded` | Once per hint whose write fails. |
+
 ## VIP and IP seeds
+
+Discovery turns the first endpoint, which we call the seed, into addresses for the other nodes. The shape of the seed decides whether that works, and it is worth checking before you leave discovery on.
+
+### A seed with a fully qualified name
+
+When the seed holds a dot and is not an IP address, the address of each node is the node name followed by the seed's domain, which is everything after the seed's first label. A seed of `pve1.dc1.example.com` gives `pve2.dc1.example.com` for a node named `pve2`. Every derived address uses the seed's port.
+
+Before we derive anything, we check the domain against the public suffix list. A domain that is itself a public suffix gets no derived names, because anyone could register `pve2` there. The list treats an unlisted single-label domain such as `lan` or `internal` as a public suffix, so those are refused too, and the outcome is `public_suffix`. The check also runs on each derived host, so a wildcard rule such as `*.sch.uk` cannot turn a name under a registrable domain into a name under a suffix. A seed whose last label is all digits is not a name at all, and it gets no derived names. The list is frozen at the version vendored in the release.
+
+Stock node certificates carry the node name and the node name plus its own search domain, so a derived name matches a certificate only when the seed's domain equals that search domain. That is why a discovered node is accepted on its pin even when the name does not match, as [Trust rules for identity and pins](#trust-rules-for-identity-and-pins) describes.
+
+### A seed that is an IP address or a bare name
+
+When the seed is an IP literal or a bare name, the derived address is the bare node name. That resolves only through the Director's search domain, and on most Directors it resolves to nothing. The first refresh then finds that no derived name resolves, records the outcome `no_candidates`, logs one Info summary line, and does not refresh for 24 hours. The pool stays a single endpoint with today's timeouts, and nothing else changes. Because the file never holds a usable discovered node, the cold start stays possible in every process when you also set an `az_map`, a CA, and `verify_ssl: true`, and it changes nothing until the seed fails in the connect phase.
+
+We do not use the address that `/cluster/status` reports for a node. That address is the one corosync uses, which may not be where pveproxy listens.
+
+### A VIP or a load-balancer name
+
+A VIP or a load balancer is a seed with a name, so discovery derives names from the VIP's domain. There are three cases.
+
+- The derived names do not exist
+  This is the IP case above. Nothing resolves, and discovery sits idle for a day at a time.
+
+- The derived names happen to name your nodes
+  Discovery works, and the pins protect every request.
+
+- The derived names point at unrelated hosts
+  The pins reject them, and calls work as they do today through the VIP.
+
+None of these breaks a call, but none of them helps either, and the VIP may answer from a different node each time. A refresh leaves out the node that answered, so which node is missing from the cache can change from one refresh to the next. We recommend setting `api_endpoint_discovery: "off"` when `pve.host` is a VIP or a load balancer name. If you want failover, list the node names in `pve.endpoints` yourself, with the VIP first or last as you prefer.
 
 ## TLS and certificate checks
 
@@ -241,7 +594,7 @@ The same SDK release scrubs credentials and server-chosen values out of error te
 
 Failover keeps nothing on disk by itself. The active endpoint, the demotions, and the tethers all end with the call, so with an explicit list and discovery off there is nothing to reset.
 
-When an endpoint cache exists, it holds the down marks, and it can hold more than that. The cache is plain JSON, and deleting its files, or the whole directory, is the supported reset. The next call that reaches an endpoint writes a fresh file. If you are not sure where the cache lives, [The three cache layers](#the-three-cache-layers) explains how the CPI chooses its directory.
+When an endpoint cache exists, it holds the down marks, and it can hold more than that. The cache is plain JSON, and deleting its files is the supported reset. The next call that reaches an endpoint writes a fresh file. Deleting the whole directory also resets the cache, but the CPI creates only the temporary layer at run time. After that deletion, a directory beside the journal is recreated by the next pre-start, so until then the CPI uses the temporary layer, and a directory you named with `pve.endpoint_cache_dir` stays missing, so discovery is off until you create it again. If you are not sure where the cache lives, [The three cache layers](#the-three-cache-layers) explains how the CPI chooses its directory.
 
 Two things share that directory and are safe to lose. The first is the directory secret, which the CPI recreates, and every cache file written under the old one is rebuilt. The second is the HA recovery episode record. Losing it restarts the grace clock for a VM that is in HA recovery, which only delays the handover to BOSH. That record is written even when discovery is off, so the directory can exist on a deployment that discovers nothing.
 

@@ -122,6 +122,7 @@ An entry can set only the keys in a closed registry, and every key in it names s
 | Group | Keys | Why the key is per cluster |
 |---|---|---|
 | Endpoint and trust | `host`, `port`, `endpoints`, `user`, `password`, `api_token`, `realm`, `ca_cert`, `verify_ssl` | Each cluster has its own address, identity, and trust root. The `endpoints` list names the machines of one cluster, as described below. |
+| Endpoint discovery | `api_endpoint_discovery` | The entry can set its own `auto`, `on`, or `off` mode, written `pve_api_endpoint_discovery` in a `cpi_config` entry. It controls whether the CPI discovers the nodes of this entry's cluster and adds them to the failover pool. An entry that inherits the job's credentials but loosens its TLS settings cannot use `on`. [Endpoint Failover and Discovery](endpoint-failover.md#discovery) explains the modes. |
 | Where VMs land | `node`, `vm_storage`, `disk_storage`, `stemcell_storage`, `iso_storage`, `network_bridge` | These names exist on one cluster only. |
 | Pools and template node | `vm_pool`, `stemcell_template_pool`, `stemcell_template_node` | A token scoped to one cluster's pool needs that cluster's pool name, and node names differ per cluster. |
 | Storage sets | `storage_sets`, `storage_capacity_domains`, `ephemeral_storage_set`, `persistent_storage_set`, `root_storage_set`, `storage_placement_namespace`, `require_disjoint_storage_sets`, `storage_status_max_age_seconds` | They bind to one cluster's storages and journal namespace. |

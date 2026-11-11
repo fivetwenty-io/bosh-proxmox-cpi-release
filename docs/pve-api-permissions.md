@@ -29,7 +29,7 @@ Derived from the API endpoint inventory under `src/pve_cpi/internal/cpi/handlers
 
 | Privilege | ACL path | CPI methods (handler file) |
 |---|---|---|
-| `Sys.Audit` | `/` | All `info`, `has_vm`, `has_disk`, task polling, `GET /cluster/status` (also feeds VXLAN peer derivation for CPI-created zones), `/cluster/resources`, `/storage`, `/cluster/config/nodes`, `/nodes` (most handlers); HA-rule reads (`GET /cluster/ha/rules`, `/cluster/ha/resources`) when HA placement is enabled, and, with `pve.ha.mode` at `auto` or `managed`, the reads of a parker's HA resource and pin that every park, disk transfer, and parker sweep makes (without the grant, `auto` mode parks as if PVE HA managed no parker and logs a warning that names `Sys.Audit` on `/`, and `managed` mode fails the call with a non-retriable error that names it); `GET /cluster/firewall/options` — `create_vm.go`'s once-per-process datacenter firewall master-switch probe, triggered only when the VM being created requests `security_groups`, `pve.vm_firewall`, or `allowed_address_pairs` (see [Configuration — Firewall](configuration.md#firewall)); a probe failure (missing `Sys.Audit`, etc.) logs a warning and never fails `create_vm` |
+| `Sys.Audit` | `/` | All `info`, `has_vm`, `has_disk`, task polling, `GET /cluster/status` (also feeds VXLAN peer derivation for CPI-created zones), `/cluster/resources`, `/storage`, `/cluster/config/nodes`; HA-rule reads (`GET /cluster/ha/rules`, `/cluster/ha/resources`) when HA placement is enabled, and, with `pve.ha.mode` at `auto` or `managed`, the reads of a parker's HA resource and pin that every park, disk transfer, and parker sweep makes (without the grant, `auto` mode parks as if PVE HA managed no parker and logs a warning that names `Sys.Audit` on `/`, and `managed` mode fails the call with a non-retriable error that names it); `GET /cluster/firewall/options` — `create_vm.go`'s once-per-process datacenter firewall master-switch probe, triggered only when the VM being created requests `security_groups`, `pve.vm_firewall`, or `allowed_address_pairs` (see [Configuration — Firewall](configuration.md#firewall)); a probe failure (missing `Sys.Audit`, etc.) logs a warning and never fails `create_vm` |
 | `VM.Allocate` | `/vms` | `create_vm.go`, `delete_vm.go` (`POST /nodes/{n}/qemu`, `DELETE /nodes/{n}/qemu/{vmid}`) |
 | `VM.Audit` | `/vms` | `has_vm.go`, `get_disks.go`, `has_disk.go`, `reboot_vm.go` (`GET /nodes/{n}/qemu/{vmid}/status/current` power-state pre-check), every config-read path (`GET /nodes/{n}/qemu/{vmid}/config`) |
 | `VM.Clone` | `/vms` | `create_vm.go` (`POST /nodes/{n}/qemu/{vmid}/clone` — checked against the **source template's** VMID; the new VMID is covered by `VM.Allocate`), `create_stemcell.go` replica cloning |
@@ -107,6 +107,18 @@ Parkers have a pool of their own. `pve.parker_pool` names it as a template whose
 **Cluster identity read.** `create_vm` reads `GET /nodes/{node}/certificates/info` once per call to build the cluster stamp in a VM CID, and the VM handlers read it when a stamped CID's VM is absent or carries no `bosh-cluster--` tag. PVE allows that endpoint to any authenticated user, so it needs no grant beyond the ones above. When the read fails anyway, `create_vm` still succeeds with the stamp `00000000` and logs a warning, and the other handlers answer with a retriable error, except `delete_snapshot`, which logs a warning and answers success. The schema lists the endpoint's permission as `{"user": "all"}`.
 
 The four storage fields are defined in `src/pve_cpi/internal/config/config.go:25-48`. If your deployment uses fewer than four distinct pools (for example, `disk_storage = vm_storage`), grant ACLs only on the distinct pool names — duplicates are harmless but unnecessary.
+
+### Discovery and cold-start reads
+
+Endpoint discovery and the cold start make a few reads of their own, described in [Endpoint Failover and Discovery](endpoint-failover.md#discovery). The table lists each read with the privilege it needs.
+
+| Read | Privilege | Used by |
+|---|---|---|
+| `GET /nodes` | Any authenticated user. PVE returns only the nodes the caller may see, so a token with no `Sys.Audit` can see fewer nodes. | Discovery |
+| `GET /cluster/status` | `Sys.Audit` on `/` | Discovery, which continues without it and records the outcome `no_status`, and the cold-start probe, which rejects a candidate that answers 403 |
+| `GET /nodes/{node}/certificates/info` | Any authenticated user | Discovery, to read the certificate fingerprints and the cluster root CA |
+
+Discovery needs no privilege beyond what the other reads already ask for, and a deployment that turns it off makes none of these reads.
 
 ## 3. Minimum-privilege path (recommended)
 

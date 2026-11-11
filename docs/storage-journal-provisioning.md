@@ -21,3 +21,7 @@ To provision from a rendered CPI configuration, use the following command.
 ```
 
 Provisioning makes no PVE requests and does not enroll a namespace or claim cluster authority. [Enrollment](storage-journal-operations.md) requires an explicit historical audit, previous-writer fencing, and confirmation that previous remote tasks have settled. The normal CPI wrapper does not provision or require a journal for unrelated existing-CID operations.
+
+## The endpoint cache beside the journal
+
+The same command also provisions an `endpoint-cache` directory beside the journal directory, never inside it, with the same owner and mode. For a journal at `/var/vcap/store/pve_cpi/allocations`, the cache directory is `/var/vcap/store/pve_cpi/endpoint-cache`. The CPI never creates this directory at run time, and it refuses one that is not owned by the user that runs the CPI, has any group or other bits, or is a symlink. If provisioning cannot create or accept the directory, it prints one warning on standard error and still succeeds, so the Director starts and the CPI uses a cache in its temporary directory instead. Under BPM, list the journal's parent directory in `director.cpi_additional_volumes` with `writable: true` and `mount_only: true` so that the workers see both directories. [Endpoint Failover and Discovery](endpoint-failover.md#beside-the-journal) explains how the CPI chooses the cache directory.

@@ -414,3 +414,7 @@ Add `manifests/bosh/vars.yml`, `manifests/bosh/state.json`, `manifests/bosh/cred
 A set-managed create-env invocation needs an enrolled journal on the machine running the CPI. Choose a durable absolute path outside the temporary CPI installation and retain it with the create-env state. The Director's CPI has a separate execution environment, so configure its durable mount and authority as described in [journal provisioning](storage-journal-provisioning.md).
 
 Use [multi-storage placement](multi-storage-placement.md) for the storage-set properties. Preserve each namespace and its journal across upgrades, retries, and teardown reconciliation.
+
+## The endpoint cache during create-env
+
+A create-env CPI may discover the other nodes of its cluster and remember them in a small cache directory, as [Endpoint Failover and Discovery](endpoint-failover.md#the-three-cache-layers) describes. When you set neither `pve.endpoint_cache_dir` nor a journal directory, the cache lives in `pve_cpi-endpoint-cache.<euid>` under the operator's temporary directory, which is private to the operator and disappears when the temporary directory does. When the CPI has a durable journal directory, the cache sits in an `endpoint-cache` directory beside it, so it survives with the create-env state. Either way the directory must be owned by the user that runs the CPI and have mode `0700`, and the CPI refuses a directory that is a symlink, is owned by someone else, or grants group or other access. A refusal turns discovery off for that call and never stops the call.
