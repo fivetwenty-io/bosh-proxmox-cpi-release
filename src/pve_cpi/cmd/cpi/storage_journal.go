@@ -20,7 +20,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
-const storageJournalUsage = "usage: cpi storage-journal <audit-enrollment|initialize|audit|recover-authority|recover-index|resolve-missing-vm|adopt|finalize-cleanup|cleanup> --config PATH"
+const storageJournalUsage = "usage: cpi storage-journal <audit-enrollment|initialize|audit|recover-authority|recover-index|resolve-missing-vm|adopt|finalize-cleanup|settle-migration|cleanup> --config PATH"
 
 // This command runs explicitly, outside the JSON-RPC startup path. Directory
 // provisioning never enrolls an authority and ordinary CPI calls never invoke it.
@@ -43,7 +43,9 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 	recoveredTaskStep := fs.String("recovered-task-step", "", "exact unknown step whose task response was independently recovered")
 	recoveredTaskUPID := fs.String("recovered-task-upid", "", "independently recovered UPID, verified against the exact step and live PVE task")
 	indexFirst := fs.Bool("index-first-crash-confirmed", false, "attest independent evidence no allocation mutation was submitted; missing file alone is insufficient")
-	expectedCID := fs.String("expected-cid", "", "exact CID independently verified for adoption")
+	expectedCID := fs.String("expected-cid", "", "exact CID independently verified for adoption or migration settlement")
+	stepID := fs.String("step-id", "", "settle-migration only: exact ID of the submitted cross-node migration step to settle")
+	taskUPID := fs.String("task-upid", "", "settle-migration only: UPID of the step's qmigrate task, which must have stopped with exit status OK on the node it names")
 	decisionID := fs.String("decision-id", "", "nonsecret operator audit reference")
 	agentID := fs.String("agent-id", "", "exact BOSH agent identifier for a missing indexed generation")
 	allocationID := fs.String("allocation-id", "", "exact full allocation UUID")
@@ -60,10 +62,10 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 		fmt.Fprintln(stderr, storageJournalUsage)
 		return 2
 	}
-	request := storageJournalRequest{AgentID: *agentID, AllocationID: *allocationID, IndexFirstConfirmed: *indexFirst, ExpectedCID: *expectedCID, DecisionID: *decisionID, RemoteTasksSettled: *remoteTasksSettled, RecoveredTaskStep: *recoveredTaskStep, RecoveredTaskUPID: *recoveredTaskUPID, RecoveredTaskEvidencePath: *recoveredTaskEvidence, Summary: *textSummary}
+	request := storageJournalRequest{AgentID: *agentID, AllocationID: *allocationID, IndexFirstConfirmed: *indexFirst, ExpectedCID: *expectedCID, DecisionID: *decisionID, RemoteTasksSettled: *remoteTasksSettled, RecoveredTaskStep: *recoveredTaskStep, RecoveredTaskUPID: *recoveredTaskUPID, RecoveredTaskEvidencePath: *recoveredTaskEvidence, MigrationStepID: *stepID, MigrationTaskUPID: *taskUPID, Summary: *textSummary}
 	if !validStorageJournalFlags(action, fs, *configPath, *authority, *fenced, request) {
 		fmt.Fprintln(stderr, storageJournalUsage)
-		fmt.Fprintln(stderr, "config is required; mutations require authority-id and previous-writer-fenced; missing-generation recovery also requires agent-id, allocation-id and index-first-crash-confirmed; adoption/cleanup decisions require allocation-id and decision-id, and adoption requires expected-cid; initialize and recover-index require remote-tasks-settled; --summary applies only to audit and audit-enrollment")
+		fmt.Fprintln(stderr, "config is required; mutations require authority-id and previous-writer-fenced; missing-generation recovery also requires agent-id, allocation-id and index-first-crash-confirmed; adoption/cleanup decisions require allocation-id and decision-id, and adoption requires expected-cid; settle-migration requires allocation-id, decision-id, expected-cid, step-id, task-upid, previous-writer-fenced and remote-tasks-settled, and step-id and task-upid apply only to it; initialize and recover-index require remote-tasks-settled; --summary applies only to audit and audit-enrollment")
 		return 2
 	}
 	host := newStorageJournalHost(args)
@@ -117,7 +119,7 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 		storageJournalFail(stderr, "storage journal cluster identity unavailable", err)
 		return 1
 	}
-	if action == "audit" || action == "recover-authority" || action == "recover-index" || action == "resolve-missing-vm" || action == "adopt" || action == "finalize-cleanup" || action == "cleanup" {
+	if action == "audit" || action == "recover-authority" || action == "recover-index" || action == "resolve-missing-vm" || action == "adopt" || action == "finalize-cleanup" || action == storageJournalActionSettleMigration || action == "cleanup" {
 		return runStorageJournalRecovery(ctx, action, cfg, client, nodes, identity.ID(), *authority, *fenced, stdout, stderr, request, host)
 	}
 	report, err := handlers.AuditStorageAllocationEnrollment(ctx, handlers.Deps{Config: cfg, PVE: client, Logger: logger}, nodes)
@@ -210,21 +212,28 @@ func runStorageJournalRecovery(ctx context.Context, action string, cfg *config.C
 			code = 1
 		}
 	}()
-	if action == "adopt" || action == "finalize-cleanup" || action == "cleanup" {
+	if action == "adopt" || action == "finalize-cleanup" || action == storageJournalActionSettleMigration || action == "cleanup" {
 		if clusterID != enrolled.Enrollment.ClusterID {
 			fmt.Fprintln(stderr, "allocation decision requires verified cluster continuity")
 			return 1
 		}
 		applyDecision := handlers.ApplyStorageAllocationDecision
-		if action == "cleanup" {
+		switch action {
+		case "cleanup":
 			applyDecision = handlers.CleanupStorageAllocation
+		case storageJournalActionSettleMigration:
+			applyDecision = handlers.SettleStorageAllocationMigration
 		}
-		record, err := applyDecision(ctx, handlers.Deps{Config: cfg, PVE: client, Logger: log.NewNopLogger()}, journal, nodes, handlers.StorageAllocationDecision{Action: action, AllocationID: request.AllocationID, ExpectedCID: request.ExpectedCID, DecisionID: request.DecisionID, PreviousWriterFenced: fenced, RemoteTasksSettled: request.RemoteTasksSettled, RecoveredTaskStep: request.RecoveredTaskStep, RecoveredTaskUPID: request.RecoveredTaskUPID, RecoveredTaskEvidence: request.RecoveredTaskEvidence, AuthorityID: authority})
+		record, err := applyDecision(ctx, handlers.Deps{Config: cfg, PVE: client, Logger: log.NewNopLogger()}, journal, nodes, handlers.StorageAllocationDecision{Action: action, AllocationID: request.AllocationID, ExpectedCID: request.ExpectedCID, DecisionID: request.DecisionID, PreviousWriterFenced: fenced, RemoteTasksSettled: request.RemoteTasksSettled, RecoveredTaskStep: request.RecoveredTaskStep, RecoveredTaskUPID: request.RecoveredTaskUPID, RecoveredTaskEvidence: request.RecoveredTaskEvidence, MigrationStepID: request.MigrationStepID, MigrationTaskUPID: request.MigrationTaskUPID, AuthorityID: authority})
 		if err != nil {
 			fmt.Fprintf(stderr, "allocation decision refused (%s); inspect settled outcome, identity and audit evidence\n", handlers.StorageAllocationDecisionFailure(err))
 			return 1
 		}
-		if err = json.NewEncoder(stdout).Encode(map[string]string{"allocation_id": record.ID, "state": string(record.State), "cid": record.CID}); err != nil {
+		summary := map[string]string{"allocation_id": record.ID, "state": string(record.State), "cid": record.CID}
+		if action == storageJournalActionSettleMigration {
+			summary["step_id"] = request.MigrationStepID
+		}
+		if err = json.NewEncoder(stdout).Encode(summary); err != nil {
 			storageJournalFail(stderr, "allocation decision output could not be written", err)
 			return 1
 		}
@@ -304,6 +313,7 @@ type storageJournalRequest struct {
 	RecoveredTaskEvidencePath                      string
 	RecoveredTaskEvidence                          *handlers.StorageRecoveredTaskEvidence
 	RecoveredTaskStep, RecoveredTaskUPID           string
+	MigrationStepID, MigrationTaskUPID             string
 	IndexFirstConfirmed                            bool
 	RemoteTasksSettled                             bool
 	Summary                                        bool
@@ -547,10 +557,13 @@ func validStorageJournalFlags(action string, fs *flag.FlagSet, configPath, autho
 		return false
 	}
 	switch action {
-	case "adopt", "finalize-cleanup", "cleanup":
+	case "adopt", "finalize-cleanup", storageJournalActionSettleMigration, "cleanup":
 		if strings.TrimSpace(request.AllocationID) == "" || strings.TrimSpace(request.DecisionID) == "" {
 			return false
 		}
+	}
+	if !validStorageJournalMigrationFlags(action, fenced, request) {
+		return false
 	}
 	if action == "cleanup" && request.RemoteTasksSettled && (!fenced || strings.TrimSpace(authority) == "") {
 		return false
@@ -682,7 +695,7 @@ func storageJournalBudget(action string) time.Duration {
 	switch action {
 	case storageJournalActionCleanup:
 		return storageJournalCleanupBudget()
-	case "adopt", "finalize-cleanup":
+	case "adopt", "finalize-cleanup", storageJournalActionSettleMigration:
 		return storageJournalSettlingBudget()
 	}
 	return storageJournalBaseBudget
@@ -694,5 +707,28 @@ func storageJournalContext(action string) (context.Context, context.CancelFunc) 
 }
 
 func supportedStorageJournalAction(action string) bool {
-	return action == "audit-enrollment" || action == "initialize" || action == "audit" || action == "recover-authority" || action == "recover-index" || action == "resolve-missing-vm" || action == "adopt" || action == "finalize-cleanup" || action == "cleanup"
+	return action == "audit-enrollment" || action == "initialize" || action == "audit" || action == "recover-authority" || action == "recover-index" || action == "resolve-missing-vm" || action == "adopt" || action == "finalize-cleanup" || action == storageJournalActionSettleMigration || action == "cleanup"
+}
+
+// storageJournalActionSettleMigration names the action that marks a submitted
+// cross-node migration step observed once its finished task and the mover's
+// new home are read back.
+const storageJournalActionSettleMigration = "settle-migration"
+
+// validStorageJournalMigrationFlags checks the flags settle-migration takes.
+// It requires every one of them, including both attestations, because the
+// settlement is only as good as the operator's word that no earlier writer
+// and no remote task still acts on the disk. --step-id and --task-upid belong
+// to settle-migration alone, so any other action refuses them rather than
+// silently ignoring them. The bounds match the ones the handler and the
+// journal enforce, so a malformed value refuses before anything is read.
+func validStorageJournalMigrationFlags(action string, fenced bool, request storageJournalRequest) bool {
+	if action != storageJournalActionSettleMigration {
+		return request.MigrationStepID == "" && request.MigrationTaskUPID == ""
+	}
+	step, upid := request.MigrationStepID, request.MigrationTaskUPID
+	stepValid := step != "" && strings.TrimSpace(step) == step && len(step) <= 256 &&
+		!strings.ContainsAny(step, "\r\n\t\x00")
+	upidValid := upid != "" && len(upid) <= 1024 && !strings.ContainsAny(upid, "\r\n\t\x00 ")
+	return fenced && request.RemoteTasksSettled && strings.TrimSpace(request.ExpectedCID) != "" && stepValid && upidValid
 }
