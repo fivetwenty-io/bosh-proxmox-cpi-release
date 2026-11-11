@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1338,6 +1339,14 @@ func (c *haCollector) cacheFindingsAs(j cacheJudge) {
 	if path := c.cfg.EndpointCacheDir; path != "" && c.overrideFindings(path, dir, j) {
 		return
 	}
+	if c.cfg.EndpointCacheDir == "" {
+		if path, text, blocked := j.journalGap(dir); text != "" {
+			c.rep.advise(haKindCacheDirectory, path, "%s", text)
+			if blocked {
+				return
+			}
+		}
+	}
 	choice, caveat := j.probe(dir)
 	defer func() { _ = choice.Close() }()
 	switch {
@@ -1429,22 +1438,28 @@ func (j cacheJudge) probe(dir endpointcache.DirOptions) (endpointcache.Choice, s
 	if choice.Err != nil || judged == j.doctor {
 		return choice, caveat
 	}
-	if text := j.reachText(choice, judged); text != "" {
+	if text := j.reachText(cacheDirectoryName(choice.Layer), choice.Path, judged); text != "" {
 		return choice, text
 	}
 	return choice, caveat
 }
 
-// reachText says why the user judged cannot open the directory choice names,
-// because a directory above it grants that user no search access, or that the
-// doctor could not tell. It is empty when the user can reach the directory.
-func (j cacheJudge) reachText(choice endpointcache.Choice, judged int) string {
-	search := j.ancestors
-	if search == nil {
-		search = func(path string, uid int) (*searchBlock, error) { return ancestorBlock(path, uid, groupsOf) }
+// searchAbove asks which directory on the way to path the user judged cannot
+// search. The doctor opens the path with its own credentials, so the answer
+// comes from the permission bits and not from a test.
+func (j cacheJudge) searchAbove(path string, judged int) (*searchBlock, error) {
+	if j.ancestors != nil {
+		return j.ancestors(path, judged)
 	}
-	what := cacheDirectoryName(choice.Layer)
-	block, err := search(choice.Path, judged)
+	return ancestorBlock(path, judged, groupsOf)
+}
+
+// reachText says why the user judged cannot open the directory called what at
+// path, because a directory above it grants that user no search access, or
+// that the doctor could not tell. It is empty when the user can reach the
+// directory.
+func (j cacheJudge) reachText(what, path string, judged int) string {
+	block, err := j.searchAbove(path, judged)
 	switch {
 	case err != nil:
 		return fmt.Sprintf("%s was not checked for search access by uid %d, which the CPI runs as, because "+
@@ -1457,6 +1472,59 @@ func (j cacheJudge) reachText(choice endpointcache.Choice, judged int) string {
 			what, block.dir, judged, block.owner, block.mode, judged, block.dir)
 	}
 	return ""
+}
+
+// missingReach says what the CPI meets when it looks for the directory called
+// what at path, which does not exist as the doctor sees it. The CPI looks it up
+// as its own user, and a directory above it that user cannot search gives
+// permission denied, not a missing directory, so the CPI does not instead
+// move on, and the doctor must not say it does. The walk covers the
+// directories down to the first one that does not exist. The text is empty
+// when the user can search all of them, and blocked is true when a directory
+// definitely stops it. instead is what the CPI does with a missing directory.
+func (j cacheJudge) missingReach(what, path, instead string) (text string, blocked bool) {
+	if j.uid == j.doctor {
+		return "", false
+	}
+	block, err := j.searchAbove(path, j.uid)
+	switch {
+	case block != nil:
+		return fmt.Sprintf("%s does not exist as this check sees it, and it sits below %s, which uid %d cannot "+
+			"search because it is owned by uid %d with mode %04o, so the CPI, running as that user, gets permission "+
+			"denied looking for it and does not find it missing; it does not %s, keeps no HA recovery record, and "+
+			"the dead-node handover cannot start; give uid %d search access to %s",
+			what, block.dir, j.uid, block.owner, block.mode, instead, j.uid, block.dir), true
+	case err != nil:
+		return fmt.Sprintf("%s does not exist as this check sees it, and the check could not tell whether uid %d, "+
+			"which the CPI runs as, can search the directories above it (%v); if that user cannot, the CPI gets "+
+			"permission denied and does not find it missing, so it does not %s, keeps no HA recovery record, and "+
+			"the dead-node handover cannot start", what, j.uid, err, instead), false
+	}
+	return "", false
+}
+
+// journalGap reports the directory beside the allocation journal directory
+// when it does not exist as the doctor sees it and the CPI's user cannot get
+// there to see that, because the CPI would then be refused at that directory
+// and not move on to the temporary one. It returns the path of the directory
+// beside the journal and the text, which is empty when there is nothing to
+// say.
+func (j cacheJudge) journalGap(dir endpointcache.DirOptions) (path, text string, blocked bool) {
+	if dir.JournalDir == "" {
+		return "", "", false
+	}
+	journal := filepath.Clean(dir.JournalDir)
+	if !filepath.IsAbs(journal) || journal == string(filepath.Separator) ||
+		filepath.Base(journal) == endpointcache.JournalSiblingName {
+		return "", "", false
+	}
+	path = filepath.Join(filepath.Dir(journal), endpointcache.JournalSiblingName)
+	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+		return "", "", false
+	}
+	text, blocked = j.missingReach(cacheDirectoryName(endpointcache.LayerJournal), path,
+		"move on to the temporary cache directory")
+	return path, text, blocked
 }
 
 // judgeDirectory is the choice probe makes before it looks at the directories
@@ -1527,8 +1595,22 @@ func (c *haCollector) overrideFindings(path string, dir endpointcache.DirOptions
 // episode record then goes to the layer that answers after the override, which
 // the finding names, or nowhere when that layer is refused too. A temporary
 // layer the doctor cannot judge is named as where the record goes, because
-// the CPI creates its own.
+// the CPI creates its own. A directory above the override that the CPI's user
+// cannot search is reported instead, because the CPI is refused there and
+// falls back to nothing.
 func (c *haCollector) missingOverride(path string, dir endpointcache.DirOptions, j cacheJudge) {
+	if text, blocked := j.missingReach("pve.endpoint_cache_dir", path, "fall back to another directory"); text != "" {
+		c.rep.advise(haKindCacheDirectory, path, "%s", text)
+		if blocked {
+			return
+		}
+	}
+	if _, text, blocked := j.journalGap(dir); text != "" {
+		c.rep.advise(haKindCacheDirectory, path, "pve.endpoint_cache_dir does not exist, and %s", text)
+		if blocked {
+			return
+		}
+	}
 	fallback, caveat := j.probe(dir.WithoutOverride())
 	defer func() { _ = fallback.Close() }()
 	temporary := fallback.Layer == endpointcache.LayerTemporary

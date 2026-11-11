@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -21,58 +22,111 @@ type searchBlock struct {
 	mode         fs.FileMode
 }
 
-// ancestorBlock names the first directory above path that uid cannot search,
-// or returns nil when uid can search every one. The CPI opens the cache
-// directory with its own credentials, so it needs search access on each
-// directory above it, and the doctor opens the same path with its own. The
-// ancestors are the ones the path names and the ones it resolves to, because
-// a symbolic link in the path is followed with the access of the user who
-// opens it. groups tells which groups uid belongs to.
+// maxLinkHops is how many symbolic links the kernel follows while it resolves
+// one path before it gives up with ELOOP.
+const maxLinkHops = 40
+
+// ancestorBlock names the first directory the resolution of path searches that
+// uid cannot search, or returns nil when uid can search every one. The CPI
+// opens the cache directory with its own credentials, so it needs search
+// access on each directory its lookup passes through, and the doctor opens the
+// same path with its own. A directory that does not exist yet ends the walk,
+// as it ends the kernel's lookup. A definite block is returned even when
+// another directory could not be examined, because the CPI is refused at the
+// block either way, and an error is returned only when the walk found no block
+// and could not examine everything. groups tells which groups uid belongs to.
 func ancestorBlock(path string, uid int, groups func(uid int) ([]int, error)) (*searchBlock, error) {
-	return firstUnsearchable(ancestorDirs(path), uid, groups)
+	dirs, walkErr := searchedDirs(path)
+	block, err := firstUnsearchable(dirs, uid, groups)
+	switch {
+	case block != nil:
+		return block, nil
+	case err != nil:
+		return nil, err
+	}
+	return nil, walkErr
 }
 
-// ancestorDirs lists the directories above path, from the root down, as the
-// path spells them and as it resolves them, without repeats.
-func ancestorDirs(path string) []string {
-	parent := filepath.Dir(filepath.Clean(path))
-	dirs := prefixes(parent)
-	if resolved, err := filepath.EvalSymlinks(parent); err == nil {
-		seen := make(map[string]bool, len(dirs))
-		for _, d := range dirs {
-			seen[d] = true
+// searchedDirs lists, in the order the kernel meets them and without repeats,
+// the directories whose search permission the lookup of path needs. It
+// resolves the path one component at a time, so a symbolic link adds the
+// directories its target passes through, a chain of links adds those of every
+// hop, and the walk gives up after maxLinkHops links as the kernel does. A
+// component that does not exist ends the walk without an error, because the
+// lookup ends there too. The directories found before an error are returned
+// with it.
+func searchedDirs(path string) ([]string, error) {
+	var dirs []string
+	seen := map[string]bool{}
+	cur, hops := string(filepath.Separator), 0
+	pending := pathParts(path)
+	for len(pending) > 0 {
+		name := pending[0]
+		pending = pending[1:]
+		if name == ".." {
+			cur = filepath.Dir(cur)
+			continue
 		}
-		for _, d := range prefixes(resolved) {
-			if !seen[d] {
-				dirs = append(dirs, d)
+		if !seen[cur] {
+			seen[cur] = true
+			dirs = append(dirs, cur)
+		}
+		next := filepath.Join(cur, name)
+		info, err := os.Lstat(next)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return dirs, nil
+		case err != nil:
+			return dirs, err
+		case info.Mode()&fs.ModeSymlink != 0:
+			hops++
+			if hops > maxLinkHops {
+				return dirs, fmt.Errorf("%s: more than %d symbolic links on the way to %s", next, maxLinkHops, path)
 			}
+			target, err := os.Readlink(next)
+			if err != nil {
+				return dirs, err
+			}
+			if filepath.IsAbs(target) {
+				cur = string(filepath.Separator)
+			}
+			pending = append(pathParts(target), pending...)
+		case len(pending) > 0 && !info.IsDir():
+			return dirs, fmt.Errorf("%s: %w", next, syscall.ENOTDIR)
+		default:
+			cur = next
 		}
 	}
-	return dirs
+	return dirs, nil
 }
 
-// prefixes returns dir and each directory above it, from the root down.
-func prefixes(dir string) []string {
-	var out []string
-	for d := dir; ; d = filepath.Dir(d) {
-		out = append([]string{d}, out...)
-		if d == filepath.Dir(d) {
-			return out
+// pathParts splits path into the names a lookup meets, leaving out the empty
+// and current-directory parts.
+func pathParts(path string) []string {
+	var parts []string
+	for _, part := range strings.Split(path, string(filepath.Separator)) {
+		if part != "" && part != "." {
+			parts = append(parts, part)
 		}
 	}
+	return parts
 }
 
 // firstUnsearchable returns the first of dirs that uid cannot search. A
 // directory the doctor cannot examine, or one whose answer depends on a group
-// membership it cannot read, is returned as an error.
+// membership it cannot read, does not stop the walk, because a later directory
+// can still block uid outright. The first such error is returned when no
+// directory blocks.
 func firstUnsearchable(dirs []string, uid int, groups func(uid int) ([]int, error)) (*searchBlock, error) {
 	if uid == 0 {
 		return nil, nil
 	}
+	var cannotTell error
 	for _, dir := range dirs {
 		info, err := os.Stat(dir)
 		if err != nil {
-			return nil, err
+			cannotTell = firstError(cannotTell, err)
+			continue
 		}
 		st, ok := info.Sys().(*syscall.Stat_t)
 		if !info.IsDir() || !ok {
@@ -81,13 +135,22 @@ func firstUnsearchable(dirs []string, uid int, groups func(uid int) ([]int, erro
 		block := searchBlock{dir: dir, owner: int(st.Uid), group: int(st.Gid), mode: info.Mode().Perm()}
 		can, err := block.searchableBy(uid, groups)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", dir, err)
+			cannotTell = firstError(cannotTell, fmt.Errorf("%s: %w", dir, err))
+			continue
 		}
 		if !can {
 			return &block, nil
 		}
 	}
-	return nil, nil
+	return nil, cannotTell
+}
+
+// firstError returns first when it is set and next otherwise.
+func firstError(first, next error) error {
+	if first != nil {
+		return first
+	}
+	return next
 }
 
 // searchableBy applies the permission bits the way the kernel does. The owner
