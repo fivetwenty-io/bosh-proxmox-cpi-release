@@ -838,35 +838,10 @@ func (g *managedDiskLifecycleGuard) observeMigration(ctx context.Context, observ
 	m := g.lifecycle
 	volumes := make([]string, 1, 2)
 	volumes[0] = g.lifecycle.disk.volid
-	source, sourceErr := m.deps.PVE.QEMU().Config(ctx, observation.node, observation.vmid)
-	if sourceErr == nil || !pve.IsNotFound(sourceErr) || source != nil {
-		return nil, fmt.Errorf("migration source holder absence not observed")
-	}
-	target, err := m.deps.PVE.QEMU().Config(ctx, observation.targetNode, observation.vmid)
-	if err != nil || target == nil {
-		return nil, fmt.Errorf("migration target holder unavailable")
-	}
-	landed := ""
-	for field := range target {
-		if !isDiskOptionKey(field) {
-			continue
-		}
-		value, _ := pve.ConfigString(target, field)
-		token, found := pve.StableIDFromDriveOptStr(value)
-		if found && token == m.disk.stableID {
-			if landed != "" {
-				return nil, fmt.Errorf("migration target disk identity ambiguous")
-			}
-			landed = strings.Split(value, ",")[0]
-		}
-	}
-	storage, _, err := pve.ParseDiskCID(landed)
+	_, landed, err := observeMigratedHolder(ctx, m.deps, observation.vmid, observation.node, observation.targetNode,
+		m.disk.stableID, m.diskBacking())
 	if err != nil {
-		return nil, fmt.Errorf("migration target disk identity missing")
-	}
-	backing, err := managedDiskActualBacking(ctx, m.deps, storage)
-	if err != nil || backing != m.diskBacking() {
-		return nil, fmt.Errorf("migration target backing differs")
+		return nil, err
 	}
 	exists, err := managedVolumePresent(ctx, m.deps, observation.targetNode, landed)
 	if err != nil || !exists {
@@ -887,6 +862,70 @@ func (g *managedDiskLifecycleGuard) observeMigration(ctx context.Context, observ
 	}
 
 	return volumes, nil
+}
+
+// observeMigratedHolder proves that a finished migration moved holder vmid
+// from sourceNode to targetNode with the disk whose drive serial is stableID,
+// and returns the target slot that carries the serial and that slot's bare
+// volid. The guard's migration readback and the operator's settle action both
+// prove a move through it, so the two can't disagree about what a move is.
+//
+// The source counts as gone only when its config read answers that the
+// config doesn't exist. PVE answers a read on the node a VM migrated away
+// from with a 500 that says the configuration file does not exist, not with
+// a 404, so either answer counts and any other error refuses. The target is
+// then confirmed by probing every cluster member's config, never by the
+// /cluster/resources index, and the probe must place the holder on
+// targetNode alone. The target config must carry the serial on exactly one
+// slot whose storage has backing as its backing identity. A target config
+// that still holds PVE's migrate lock refuses with a retriable error, because
+// the migration hasn't let go of the holder yet.
+func observeMigratedHolder(
+	ctx context.Context, deps Deps, vmid int, sourceNode, targetNode, stableID, backing string,
+) (string, string, error) {
+	source, sourceErr := deps.PVE.QEMU().Config(ctx, sourceNode, vmid)
+	if source != nil || !configReadAnswered(sourceErr) {
+		return "", "", fmt.Errorf("migration source holder absence not observed")
+	}
+	location, err := pve.FindVMByConfigProbe(ctx, deps.PVE, vmid)
+	if err != nil {
+		return "", "", fmt.Errorf("migration target holder placement not observed: %w", err)
+	}
+	if !location.Found || !location.FromConfig || location.Node != targetNode {
+		return "", "", fmt.Errorf("migration target holder not found on node %s by the cluster's config probe", targetNode)
+	}
+	target, err := deps.PVE.QEMU().Config(ctx, targetNode, vmid)
+	if err != nil || target == nil {
+		return "", "", fmt.Errorf("migration target holder unavailable")
+	}
+	if lock, _ := pve.ConfigString(target, "lock"); lock == "migrate" {
+		return "", "", cpierrors.Retriable(
+			"migration target holder %d on node %s still holds the migrate lock; retry once PVE clears it", vmid, targetNode)
+	}
+	slot, landed := "", ""
+	for field := range target {
+		if !isDiskOptionKey(field) {
+			continue
+		}
+		value, _ := pve.ConfigString(target, field)
+		token, found := pve.StableIDFromDriveOptStr(value)
+		if found && token == stableID {
+			if landed != "" {
+				return "", "", fmt.Errorf("migration target disk identity ambiguous")
+			}
+			slot, landed = field, strings.Split(value, ",")[0]
+		}
+	}
+	storage, _, err := pve.ParseDiskCID(landed)
+	if err != nil {
+		return "", "", fmt.Errorf("migration target disk identity missing")
+	}
+	actual, err := managedDiskActualBacking(ctx, deps, storage)
+	if err != nil || actual != backing {
+		return "", "", fmt.Errorf("migration target backing differs")
+	}
+
+	return slot, landed, nil
 }
 
 func (g *managedDiskLifecycleGuard) observeHolderDeletion(ctx context.Context, observation managedDiskMutationObservation) ([]string, error) {
