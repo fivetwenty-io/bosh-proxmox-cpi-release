@@ -33,6 +33,10 @@ import (
 // inherits the job-level credentials and must name its own.
 const overrideTestEntryToken = "fake-entry@pve!cpi=FAKE-ENTRY-TOKEN-PLACEHOLDER"
 
+// overrideTestJob is the job-level config of a runtime whose test has no
+// base config of its own in scope.
+func overrideTestJob() *config.CPIConfig { return overrideTestBaseConfig() }
+
 // overrideTestBaseConfig returns a minimal, fully valid job-level CPIConfig
 // for WithRequestOverrides tests. agent_mode "noagent" keeps bundle
 // construction (RequestOverrideRuntime.resolve) free of ConfigDrive/
@@ -76,7 +80,7 @@ type fakeTransportClientFactory struct {
 	failHost string
 }
 
-func (f *fakeTransportClientFactory) Factory(cfg *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
+func (f *fakeTransportClientFactory) Factory(cfg, _ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, cfg.Host)
@@ -108,6 +112,7 @@ func TestWithRequestOverrides_NoExtra_UsesJobClientUnchanged(t *testing.T) {
 		PVE:    jobClient,
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -163,6 +168,7 @@ func TestWithRequestOverrides_DifferentHosts_GetDifferentClients(t *testing.T) {
 		PVE:    jobClient,
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -253,6 +259,7 @@ func TestWithRequestOverrides_MalformedOverride_NonRetriableCloudError(t *testin
 		PVE:    &mockPVEClient{},
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           overrideTestJob(),
 			ClientFactory: (&fakeTransportClientFactory{}).Factory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -281,6 +288,7 @@ func TestWithRequestOverrides_ClientBuildFailure_RetriableCloudError(t *testing.
 		PVE:    &mockPVEClient{},
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           overrideTestJob(),
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -318,6 +326,7 @@ func TestWithRequestOverrides_OnlyUnknownPVEKeys_HardError(t *testing.T) {
 		PVE:    jobClient,
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -361,6 +370,7 @@ func TestWithRequestOverrides_MixedKnownAndUnknownPVEKeys_WarnsAndApplies(t *tes
 		PVE:    jobClient,
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -406,6 +416,7 @@ func TestWithRequestOverrides_RejectTLSDowngradeOverrides_GenuineDowngrade_Rejec
 		PVE:    &mockPVEClient{},
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -451,6 +462,7 @@ func TestWithRequestOverrides_RejectTLSDowngradeOverrides_BaseAlreadyFalse_NotRe
 		PVE:    &mockPVEClient{},
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -484,6 +496,7 @@ func TestWithRequestOverrides_TLSDowngrade_KnobOff_WarnOnlyUnchanged(t *testing.
 		PVE:    &mockPVEClient{},
 		Logger: observedLogger,
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -532,7 +545,7 @@ type freshClientFactory struct {
 	calls []string // cfg.Host, one entry per invocation
 }
 
-func (f *freshClientFactory) Factory(cfg *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
+func (f *freshClientFactory) Factory(cfg, _ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, cfg.Host)
@@ -560,6 +573,7 @@ func TestWithRequestOverrides_BundleCache_EvictsLeastRecentlyUsed(t *testing.T) 
 		PVE:    &mockPVEClient{},
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:              base,
 			ClientFactory:    tracker.Factory,
 			Logger:           log.NewNopLogger(),
 			MaxCachedBundles: 2,
@@ -637,6 +651,7 @@ func TestWithRequestOverrides_BundleCache_DefaultCapApplied(t *testing.T) {
 		PVE:    &mockPVEClient{},
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 			// MaxCachedBundles intentionally left unset (0).
@@ -700,9 +715,9 @@ func TestWithRequestOverrides_Concurrent_SameIdentity_SingleBuild(t *testing.T) 
 	// could occur if the cache logic were broken.
 	release := make(chan struct{})
 	tracker := &fakeTransportClientFactory{}
-	blockingFactory := func(cfg *config.CPIConfig, logger *log.Logger) (pve.Client, error) {
+	blockingFactory := func(cfg, _ *config.CPIConfig, logger *log.Logger) (pve.Client, error) {
 		<-release
-		return tracker.Factory(cfg, logger)
+		return tracker.Factory(cfg, nil, logger)
 	}
 
 	deps := handlers.Deps{
@@ -710,6 +725,7 @@ func TestWithRequestOverrides_Concurrent_SameIdentity_SingleBuild(t *testing.T) 
 		PVE:    &mockPVEClient{},
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: blockingFactory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -777,6 +793,7 @@ func TestWithRequestOverrides_Concurrent_MixedIdentities(t *testing.T) {
 		PVE:    &mockPVEClient{},
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -870,6 +887,7 @@ func TestWithRequestOverrides_EntryPlacementAZMap_ResolvesEntryAZ(t *testing.T) 
 		PVE:    &mockPVEClient{},
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -938,6 +956,7 @@ func TestWithRequestOverrides_PlacementNoLongerUnsupported(t *testing.T) {
 		PVE:    &mockPVEClient{},
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -976,6 +995,7 @@ func TestWithRequestOverrides_EntryPlacementInvalid_FailsThatRequest(t *testing.
 		PVE:    &mockPVEClient{},
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -1025,6 +1045,7 @@ func TestWithRequestOverrides_NodeEndpointsFollowBaseHost(t *testing.T) {
 		PVE:    jobClient,
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 			BaseHost:      base.Host,
@@ -1086,6 +1107,7 @@ func TestWithRequestOverrides_NodeEndpoints_UnsetBasePortIsDefault(t *testing.T)
 		PVE:    &mockPVEClient{},
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: (&fakeTransportClientFactory{}).Factory,
 			Logger:        log.NewNopLogger(),
 			BaseHost:      base.Host,
@@ -1233,10 +1255,10 @@ func TestWithRequestOverrides_SecondClusterNeverReceivesJobCredentials(t *testin
 		// discovery reads may join them.
 		base.APIEndpointDiscovery = config.DiscoveryModeOff
 
-		factory := func(cfg *config.CPIConfig, l *log.Logger) (pve.Client, error) {
+		factory := func(cfg, _ *config.CPIConfig, l *log.Logger) (pve.Client, error) {
 			return pve.NewClientWithTracer(cfg, l, nil)
 		}
-		jobClient, err := factory(base, log.NewNopLogger())
+		jobClient, err := factory(base, base, log.NewNopLogger())
 		if err != nil {
 			t.Fatalf("build job client: %v", err)
 		}
@@ -1245,6 +1267,7 @@ func TestWithRequestOverrides_SecondClusterNeverReceivesJobCredentials(t *testin
 			PVE:    jobClient,
 			Logger: log.NewNopLogger(),
 			Overrides: &handlers.RequestOverrideRuntime{
+				Job:           base,
 				ClientFactory: factory,
 				Logger:        log.NewNopLogger(),
 				BaseHost:      base.Host,
@@ -1412,6 +1435,7 @@ func TestWithRequestOverrides_TLSDowngradeWarning_NamesCredentialGroup(t *testin
 				PVE:    &mockPVEClient{},
 				Logger: observedLogger,
 				Overrides: &handlers.RequestOverrideRuntime{
+					Job:           base,
 					ClientFactory: (&fakeTransportClientFactory{}).Factory,
 					Logger:        log.NewNopLogger(),
 				},
@@ -1464,6 +1488,7 @@ func TestWithRequestOverrides_IncompleteCredentialGroup_NonRetriable(t *testing.
 		PVE:    &mockPVEClient{},
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},
@@ -1569,6 +1594,7 @@ func TestWithRequestOverrides_CATrustWarnings(t *testing.T) {
 				PVE:    &mockPVEClient{},
 				Logger: observedLogger,
 				Overrides: &handlers.RequestOverrideRuntime{
+					Job:           base,
 					ClientFactory: (&fakeTransportClientFactory{}).Factory,
 					Logger:        log.NewNopLogger(),
 				},

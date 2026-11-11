@@ -475,13 +475,37 @@ func assertPinningForPlan(opts sdkclient.Options, cfg *config.CPIConfig, plan en
 // code (see tracing.go) with a child span started from tracer when tracer is
 // non-nil. A nil tracer yields raw, undecorated services with zero added
 // overhead.
+//
+// cfg is the job-level config. The client of a cpi-config entry is built with
+// NewEntryClientWithTracer, which also takes the job-level config the entry
+// was built from.
 func NewClientWithTracer(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (Client, error) {
 	return newClient(cfg, logger, tracer)
 }
 
-// newClient is the shared construction path for NewClientWithTracer.
-// tracer == nil means "no tracing".
+// NewEntryClientWithTracer constructs the Client of one cpi-config entry. cfg
+// is the entry's effective config and job is the job-level config it was built
+// from, which decides whether the entry owns the placement.az_map it carries
+// and so whether the entry may cold-start from the nodes the map names. A nil
+// job is refused, because a client that cannot tell whose map it holds must
+// not send the operator's token to a node the map names.
+func NewEntryClientWithTracer(cfg, job *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (Client, error) {
+	if job == nil {
+		return nil, cpierrors.Cloud("pve client init: the job-level config must not be nil")
+	}
+	return buildClient(cfg, job, logger, tracer)
+}
+
+// newClient builds the job-level client, which is its own job: its az_map is
+// the job's own, so config.ColdStartNodeNames gets the job for both arguments,
+// as it documents for the job-level block. tracer == nil means "no tracing".
 func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (Client, error) {
+	return buildClient(cfg, cfg, logger, tracer)
+}
+
+// buildClient is the shared construction path of every client. job is the
+// job-level config cfg was built from, or cfg itself for the job-level client.
+func buildClient(cfg, job *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (Client, error) {
 	if cfg == nil {
 		return nil, cpierrors.Cloud("pve client init: cfg must not be nil")
 	}
@@ -498,6 +522,9 @@ func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (
 	opts, wiring, wireErr := wireEndpoints(cfg)
 	if wireErr != nil {
 		return nil, wireErr
+	}
+	if dial := dialOverride(); dial != nil {
+		opts.DialContext = dial
 	}
 
 	if hasToken {
@@ -564,7 +591,10 @@ func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (
 	}
 
 	// The cache is read after every check that needs the config alone, so a
-	// config that is refused above never touches the filesystem.
+	// config that is refused above never touches the filesystem. The cold
+	// start's names are settled first, because the read keeps a cold-start
+	// hint only for a node they hold.
+	wiring.plan.coldStartNames = coldStartNames(cfg, job, logger)
 	cache := openEndpointCache(cfg, &wiring.plan, logger)
 	built := false
 	defer func() {

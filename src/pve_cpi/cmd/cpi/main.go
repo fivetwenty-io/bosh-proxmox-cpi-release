@@ -539,18 +539,23 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 
 	// Per-request pve_* context config overrides (BOSH cpi-config multi-CPI
 	// support — see internal/cpi/handlers/context_override.go). The
-	// ClientFactory closure reuses the exact clientFactory/clientTracer pair
-	// already resolved above for the job-level client, so an overridden
-	// request's PVE client is decorated identically (tracing on/off,
-	// injected test factory) to the job-level one — only cfg and logger vary
-	// per call.
+	// ClientFactory closure reuses the clientTracer already resolved above for
+	// the job-level client, so an overridden request's PVE client is
+	// decorated identically (tracing on/off) to the job-level one. It builds
+	// the entry's client with the job-level config as the job, which decides
+	// whether the entry owns the az_map it carries. An injected test factory
+	// builds no real client and gets the entry's config alone, as before.
 	overrideRuntime := &handlers.RequestOverrideRuntime{
-		ClientFactory: func(effCfg *config.CPIConfig, effLogger *log.Logger) (pve.Client, error) {
-			return clientFactory(effCfg, effLogger, clientTracer)
+		ClientFactory: func(effCfg, job *config.CPIConfig, effLogger *log.Logger) (pve.Client, error) {
+			if opts.ClientFactory != nil {
+				return opts.ClientFactory(effCfg, effLogger, clientTracer)
+			}
+			return pve.NewEntryClientWithTracer(effCfg, job, effLogger, clientTracer)
 		},
 		Logger:   logger,
 		BaseHost: cfg.Host,
 		BasePort: cfg.Port,
+		Job:      cfg,
 	}
 
 	storageMetrics, storageMetricsErr := handlers.NewStoragePlacementMetrics(meter)

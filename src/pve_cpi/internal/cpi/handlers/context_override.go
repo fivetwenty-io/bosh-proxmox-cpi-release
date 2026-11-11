@@ -56,12 +56,22 @@ const defaultMaxCachedBundles = 16
 // of what the request context carries, matching every test's existing
 // expectations and every pre-feature release's behavior.
 type RequestOverrideRuntime struct {
-	// ClientFactory builds a PVE client from one request's effective config.
-	// main.go supplies a closure over pve.NewClientWithTracer and the
-	// process's resolved tracer (nil when OTel tracing is disabled), so an
-	// overridden request's client is decorated identically to the job-level
-	// client built at startup.
-	ClientFactory func(cfg *config.CPIConfig, logger *log.Logger) (pve.Client, error)
+	// ClientFactory builds a PVE client from one request's effective config
+	// and the job-level config it was built from, which is Job. main.go
+	// supplies a closure over pve.NewEntryClientWithTracer and the process's
+	// resolved tracer (nil when OTel tracing is disabled), so an overridden
+	// request's client is decorated identically to the job-level client built
+	// at startup.
+	ClientFactory func(cfg, job *config.CPIConfig, logger *log.Logger) (pve.Client, error)
+
+	// Job is the job-level config every request's effective config is built
+	// from. The bundle build hands it to ClientFactory as the job, which
+	// decides whether an entry owns the placement.az_map it carries and so
+	// whether its client may cold-start from the nodes that map names. A nil
+	// Job refuses every override, the way a nil ClientFactory does, because a
+	// client that cannot tell whose map it holds must not send the operator's
+	// token to a node the map names.
+	Job *config.CPIConfig
 
 	// StorageInfoTTL mirrors main.go's job-level StorageInfoCache TTL. Zero
 	// (the default for a Deps literal that never sets Overrides.StorageInfoTTL
@@ -263,6 +273,9 @@ func (r *RequestOverrideRuntime) resolve(ctx context.Context, cfg *config.CPICon
 	if r.ClientFactory == nil {
 		return nil, fmt.Errorf("cpi: RequestOverrideRuntime: ClientFactory is not configured")
 	}
+	if r.Job == nil {
+		return nil, fmt.Errorf("cpi: RequestOverrideRuntime: Job is not configured")
+	}
 
 	key := requestOverrideCacheKey(cfg)
 
@@ -336,7 +349,7 @@ func (r *RequestOverrideRuntime) buildBundle(cfg *config.CPIConfig) (*overrideBu
 		logger = log.NewNopLogger()
 	}
 
-	client, err := r.ClientFactory(cfg, logger)
+	client, err := r.ClientFactory(cfg, r.Job, logger)
 	if err != nil {
 		return nil, fmt.Errorf("build PVE client: %w", err)
 	}

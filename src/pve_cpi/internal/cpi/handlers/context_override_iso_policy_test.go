@@ -39,9 +39,14 @@ func TestISOStoragePolicyOverrideAgentsAndOriginalChoicesAreIsolated(t *testing.
 	base.ApplyDefaults()
 	base.ISOStorage = "legacy-resolved"
 	capture := &isoPolicyTargetCapture{targets: map[string]string{}}
-	runtime := &handlers.RequestOverrideRuntime{Logger: log.NewNopLogger(), BaseHost: base.Host, ClientFactory: func(*config.CPIConfig, *log.Logger) (pve.Client, error) {
-		return &mockPVEClient{storageSvc: capture}, nil
-	}}
+	runtime := &handlers.RequestOverrideRuntime{
+		Job:      base,
+		Logger:   log.NewNopLogger(),
+		BaseHost: base.Host,
+		ClientFactory: func(*config.CPIConfig, *config.CPIConfig, *log.Logger) (pve.Client, error) {
+			return &mockPVEClient{storageSvc: capture}, nil
+		},
+	}
 	deps := handlers.Deps{Config: base, Logger: log.NewNopLogger(), Overrides: runtime}
 	var wg sync.WaitGroup
 	for _, choice := range []string{"fixed-a", "fixed-b"} {
@@ -86,7 +91,13 @@ func TestISOStoragePolicyOverrideEmptyReplacesPriorPin(t *testing.T) {
 	base := overrideTestBaseConfig()
 	base.ISOStorage = "pinned"
 	base.ApplyDefaults()
-	deps := handlers.Deps{Config: base, Logger: log.NewNopLogger(), Overrides: &handlers.RequestOverrideRuntime{Logger: log.NewNopLogger(), ClientFactory: func(*config.CPIConfig, *log.Logger) (pve.Client, error) { return &mockPVEClient{}, nil }}}
+	deps := handlers.Deps{Config: base, Logger: log.NewNopLogger(), Overrides: &handlers.RequestOverrideRuntime{
+		Job:    base,
+		Logger: log.NewNopLogger(),
+		ClientFactory: func(*config.CPIConfig, *config.CPIConfig, *log.Logger) (pve.Client, error) {
+			return &mockPVEClient{}, nil
+		},
+	}}
 	effective, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: map[string]any{"pve_iso_storage": ""}})
 	if err != nil {
 		t.Fatal(err)
@@ -131,9 +142,14 @@ func TestISOStorageOverrideResolvesOnFirstUseOnly(t *testing.T) {
 			base.ISOStorage = tc.iso
 			base.ApplyDefaults()
 			lookup := &isoLookupStorage{}
-			runtime := &handlers.RequestOverrideRuntime{Logger: log.NewNopLogger(), BaseHost: base.Host, ClientFactory: func(*config.CPIConfig, *log.Logger) (pve.Client, error) {
-				return &mockPVEClient{clusterStorageSvc: lookup}, nil
-			}}
+			runtime := &handlers.RequestOverrideRuntime{
+				Job:      base,
+				Logger:   log.NewNopLogger(),
+				BaseHost: base.Host,
+				ClientFactory: func(*config.CPIConfig, *config.CPIConfig, *log.Logger) (pve.Client, error) {
+					return &mockPVEClient{clusterStorageSvc: lookup}, nil
+				},
+			}
 			deps := handlers.Deps{Config: base, Logger: log.NewNopLogger(), Overrides: runtime}
 
 			effective, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": "cluster-b.example"}})
@@ -200,9 +216,14 @@ func TestISOStorageMemoIsPerCluster(t *testing.T) {
 		"cluster-a.example": {shared: 1, stype: "nfs"},
 		"cluster-b.example": {shared: 0, stype: "dir"},
 	}
-	runtime := &handlers.RequestOverrideRuntime{Logger: log.NewNopLogger(), BaseHost: base.Host, ClientFactory: func(cfg *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
-		return &mockPVEClient{clusterStorageSvc: storages[cfg.Host]}, nil
-	}}
+	runtime := &handlers.RequestOverrideRuntime{
+		Job:      base,
+		Logger:   log.NewNopLogger(),
+		BaseHost: base.Host,
+		ClientFactory: func(cfg, _ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
+			return &mockPVEClient{clusterStorageSvc: storages[cfg.Host]}, nil
+		},
+	}
 	jobStorage := &isoClusterStorage{shared: 1, stype: "nfs"}
 	jobISO := agent.NewISOStorageResolver(base, &mockPVEClient{clusterStorageSvc: jobStorage}, log.NewNopLogger())
 	deps := handlers.Deps{Config: base, Logger: log.NewNopLogger(), Overrides: runtime, ISO: jobISO}

@@ -69,6 +69,8 @@ type cacheSeed struct {
 	nodes []cachedNode
 	// marks are keyed by the address of the endpoint they name.
 	marks map[string]endpointcache.DownMark
+	// outcome is the discovery outcome the file records, OK when empty.
+	outcome endpointcache.DiscoveryOutcome
 }
 
 // seedEndpointCache writes a cache file for cfg, the way an earlier process
@@ -101,9 +103,13 @@ func seedEndpointCache(t *testing.T, cfg *config.CPIConfig, seed cacheSeed) {
 	}()
 
 	now := time.Now().UTC().Truncate(time.Second)
+	outcome := seed.outcome
+	if outcome == "" {
+		outcome = endpointcache.OutcomeOK
+	}
 	section := endpointcache.DiscoverySection{
 		DiscoveredAt: now.Add(-5 * time.Minute), NextRefreshAfter: now.Add(time.Hour),
-		Outcome: endpointcache.OutcomeOK, Quorate: true,
+		Outcome: outcome, Quorate: true,
 	}
 	pool := make([]string, 0, len(seed.nodes))
 	for i, n := range seed.nodes {
@@ -141,6 +147,13 @@ func seedEndpointCache(t *testing.T, cfg *config.CPIConfig, seed cacheSeed) {
 // readSeededCache reads the cache file of cfg back, as a later process would.
 func readSeededCache(t *testing.T, cfg *config.CPIConfig) *endpointcache.Payload {
 	t.Helper()
+	return readSeededCacheNamed(t, cfg, nil)
+}
+
+// readSeededCacheNamed reads the cache file of cfg as a reader whose az_map
+// names the given nodes, which is the only reader a cold-start hint is kept for.
+func readSeededCacheNamed(t *testing.T, cfg *config.CPIConfig, names []string) *endpointcache.Payload {
+	t.Helper()
 	_, wiring, err := wireEndpoints(cfg)
 	if err != nil {
 		t.Fatalf("wireEndpoints: %v", err)
@@ -164,7 +177,7 @@ func readSeededCache(t *testing.T, cfg *config.CPIConfig) *endpointcache.Payload
 			t.Error(err)
 		}
 	}()
-	payload, _, err := store.ReadPayload(time.Now(), nil)
+	payload, _, err := store.ReadPayload(time.Now(), names)
 	if err != nil {
 		t.Fatalf("ReadPayload: %v", err)
 	}

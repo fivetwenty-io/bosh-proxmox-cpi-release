@@ -94,6 +94,9 @@ type endpointCache struct {
 	// pruning.
 	discovered []endpointpool.Endpoint
 	sink       *cacheMarkSink
+	// cold is what the cold start from placement.az_map needs, which attach
+	// turns into the pool's candidates when endpointpool.Gate allows them.
+	cold coldStartInputs
 }
 
 // openEndpointCache resolves the effective discovery mode, chooses and opens
@@ -171,7 +174,12 @@ func openEndpointCache(cfg *config.CPIConfig, plan *endpointPlan, logger *log.Lo
 	if err != nil {
 		return off(fmt.Sprintf("cache directory %s could not be opened: %v", choice.Path, err))
 	}
-	cache := &endpointCache{store: store, mode: configured, logger: logger}
+	cache := &endpointCache{store: store, mode: configured, logger: logger, cold: coldStartInputs{
+		names:      plan.coldStartNames,
+		seed:       plan.endpoints[0].Address,
+		configured: configuredAddresses(plan),
+		userAgent:  buildUserAgent(cfg),
+	}}
 	// The release goes first, so every return below leaves the store closed
 	// by the drain or by the code that gave up on it.
 	if !endpointcache.AfterDrain(cache.release) {
@@ -184,13 +192,21 @@ func openEndpointCache(cfg *config.CPIConfig, plan *endpointPlan, logger *log.Lo
 			"length; every cache file written under the old one is rebuilt", log.String("path", path))
 	}
 
-	payload, ok := cache.read(cfg)
+	payload, ok := cache.read()
 	if !ok {
 		cache.release()
 		plan.cacheUnusable = true
 		return nil
 	}
 	cache.load(plan, payload)
+	if payload != nil {
+		if payload.ColdStart != nil {
+			cache.cold.hint = payload.ColdStart.Name
+		}
+		if payload.Discovery != nil {
+			cache.cold.outcome = string(payload.Discovery.Outcome)
+		}
+	}
 
 	worker, err := NewDiscoveryWorker(DiscoveryWorkerConfig{Store: store, Mode: configured, Logger: logger})
 	if err != nil {
@@ -244,10 +260,12 @@ func (c *endpointCache) release() {
 // be read for a reason that makes the directory unusable, after logging why,
 // and when the exit drain has closed the store, which logs the drain's line.
 // A file that is absent, or one that fails its integrity or key checks, is no
-// cache yet and gives a nil payload.
-func (c *endpointCache) read(cfg *config.CPIConfig) (*endpointcache.Payload, bool) {
+// cache yet and gives a nil payload. The read keeps a cold-start hint only
+// when it names a node the cold start may try, so a client with no cold start
+// keeps none.
+func (c *endpointCache) read() (*endpointcache.Payload, bool) {
 	ctx := context.Background()
-	payload, drops, err := c.store.ReadPayload(cacheClock(), azNodeNames(cfg))
+	payload, drops, err := c.store.ReadPayload(cacheClock(), c.cold.names)
 	switch {
 	case err == nil:
 	case errors.Is(err, fs.ErrNotExist):
@@ -387,14 +405,17 @@ func (c *endpointCache) dropDiscovered() {
 	}
 }
 
-// attach gives the pool the cache's mark sink and first-answer hook. A nil
-// cache gives it neither.
+// attach gives the pool the cache's mark sink and first-answer hook, and the
+// cold-start candidates and prober when the cold start applies. A nil cache
+// gives it none of them, so a call without a usable cache directory has no
+// cold start.
 func (c *endpointCache) attach(cfg *endpointpool.Config) {
 	if c == nil {
 		return
 	}
 	cfg.MarkSink = c.sink
 	cfg.FirstAnswer = c.worker
+	c.attachColdStart(cfg)
 }
 
 // poolRefused logs that the pool would not take the cached nodes, which leaves
@@ -550,19 +571,6 @@ func configuredAddresses(plan *endpointPlan) []string {
 		out[i] = ep.Address
 	}
 	return out
-}
-
-// azNodeNames lists the node names of the config's az_map, which decide
-// whether a cached cold-start hint belongs to this reader.
-func azNodeNames(cfg *config.CPIConfig) []string {
-	if cfg.Placement == nil {
-		return nil
-	}
-	var names []string
-	for _, nodes := range cfg.Placement.AZMap {
-		names = append(names, nodes...)
-	}
-	return names
 }
 
 // cacheCredential returns the identity the entry authenticates as and its

@@ -133,6 +133,7 @@ func TestWithRequestOverrides_RemovedKey_IsNonRetriable(t *testing.T) {
 		PVE:    &mockPVEClient{},
 		Logger: log.NewNopLogger(),
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},

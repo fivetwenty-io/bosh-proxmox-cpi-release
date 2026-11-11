@@ -71,6 +71,11 @@ type endpointPlan struct {
 	// then follows the pool alone, and the pinning assertion, which already
 	// ran on the config, is unchanged.
 	cacheUnusable bool
+	// coldStartNames are the placement.az_map names the cold start may try,
+	// which newClient sets from the entry and its job before the cache is
+	// read. They are empty when any config condition for the cold start
+	// fails, and the cache rules them out when its directory is unusable.
+	coldStartNames []string
 }
 
 // discoveryEffective reports whether the effective discovery mode is on once

@@ -30,6 +30,7 @@ func clusterScopeDeps(base *config.CPIConfig) (handlers.Deps, *log.Observer, *fa
 		PVE:    &mockPVEClient{},
 		Logger: observedLogger,
 		Overrides: &handlers.RequestOverrideRuntime{
+			Job:           base,
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 		},

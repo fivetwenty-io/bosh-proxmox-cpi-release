@@ -159,8 +159,11 @@ func TestDeleteStemcell_Heavy_ThroughRealOverride(t *testing.T) {
 			deps := handlers.Deps{
 				Config: base, PVE: jobClient, Logger: log.NewNopLogger(),
 				Overrides: &handlers.RequestOverrideRuntime{
-					ClientFactory: func(_ *config.CPIConfig, _ *log.Logger) (pve.Client, error) { return f.client, nil },
-					Logger:        log.NewNopLogger(),
+					Job: base,
+					ClientFactory: func(_, _ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
+						return f.client, nil
+					},
+					Logger: log.NewNopLogger(),
 				},
 			}
 			h := handlers.HandleDeleteStemcell(deps)
@@ -203,7 +206,11 @@ func TestWithRequestOverrides_RecordsWhetherAnOverrideApplied(t *testing.T) {
 			tracker := &fakeTransportClientFactory{}
 			deps := handlers.Deps{
 				Config: overrideTestBaseConfig(), PVE: &mockPVEClient{}, Logger: log.NewNopLogger(),
-				Overrides: &handlers.RequestOverrideRuntime{ClientFactory: tracker.Factory, Logger: log.NewNopLogger()},
+				Overrides: &handlers.RequestOverrideRuntime{
+					Job:           overrideTestJob(),
+					ClientFactory: tracker.Factory,
+					Logger:        log.NewNopLogger(),
+				},
 			}
 			got, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: tc.extra})
 			if err != nil {

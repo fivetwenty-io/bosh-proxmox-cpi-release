@@ -66,8 +66,11 @@ func TestHandleCreateVM_PublishesOverrideAnnotator_NotJobClient(t *testing.T) {
 	overrideClient := countingNotesDeps(vmid, &overrideWrites).PVE
 	deps.Config = overrideTestBaseConfig()
 	deps.Overrides = &handlers.RequestOverrideRuntime{
-		ClientFactory: func(*config.CPIConfig, *log.Logger) (pve.Client, error) { return overrideClient, nil },
-		Logger:        log.NewNopLogger(),
+		Job: deps.Config,
+		ClientFactory: func(*config.CPIConfig, *config.CPIConfig, *log.Logger) (pve.Client, error) {
+			return overrideClient, nil
+		},
+		Logger: log.NewNopLogger(),
 	}
 
 	annotateThroughCreateVM(t, deps, jsonrpc.Context{Extra: map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": "az2.example"}}, vmid)
