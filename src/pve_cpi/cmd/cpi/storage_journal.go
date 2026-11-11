@@ -63,10 +63,18 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 		fmt.Fprintln(stderr, storageJournalUsage)
 		return 2
 	}
+	if action == storageJournalActionSettleMigration {
+		if unused := settleMigrationUnusedFlags(fs); len(unused) > 0 {
+			fmt.Fprintln(stderr, "settle-migration does not take "+oxfordList(unused)+"; it takes only "+
+				oxfordList(settleMigrationFlags)+", so remove the others and rerun")
+			fmt.Fprintln(stderr, storageJournalUsage)
+			return 2
+		}
+	}
 	request := storageJournalRequest{AgentID: *agentID, AllocationID: *allocationID, IndexFirstConfirmed: *indexFirst, ExpectedCID: *expectedCID, DecisionID: *decisionID, RemoteTasksSettled: *remoteTasksSettled, RecoveredTaskStep: *recoveredTaskStep, RecoveredTaskUPID: *recoveredTaskUPID, RecoveredTaskEvidencePath: *recoveredTaskEvidence, MigrationStepID: *stepID, MigrationTaskUPID: *taskUPID, Summary: *textSummary}
 	if !validStorageJournalFlags(action, fs, *configPath, *authority, *fenced, request) {
 		fmt.Fprintln(stderr, storageJournalUsage)
-		fmt.Fprintln(stderr, "config is required; mutations require authority-id and previous-writer-fenced; missing-generation recovery also requires agent-id, allocation-id and index-first-crash-confirmed; adoption/cleanup decisions require allocation-id and decision-id, and adoption requires expected-cid; settle-migration requires allocation-id, decision-id, expected-cid, step-id, task-upid, previous-writer-fenced and remote-tasks-settled, and step-id and task-upid apply only to it; initialize and recover-index require remote-tasks-settled; --summary applies only to audit and audit-enrollment")
+		fmt.Fprintln(stderr, "config is required; mutations require authority-id and previous-writer-fenced; missing-generation recovery also requires agent-id, allocation-id and index-first-crash-confirmed; adoption/cleanup decisions require allocation-id and decision-id, and adoption requires expected-cid; settle-migration requires allocation-id, decision-id, expected-cid, step-id, task-upid, previous-writer-fenced and remote-tasks-settled, step-id and task-upid apply only to it, and it takes no other flag; initialize and recover-index require remote-tasks-settled; --summary applies only to audit and audit-enrollment")
 		return 2
 	}
 	host := newStorageJournalHost(args)
@@ -739,6 +747,28 @@ func supportedStorageJournalAction(action string) bool {
 // cross-node migration step observed once its finished task and the mover's
 // new home are read back.
 const storageJournalActionSettleMigration = "settle-migration"
+
+// settleMigrationFlags are the flags settle-migration takes, in the order
+// its refusal of any other flag lists them.
+var settleMigrationFlags = []string{
+	"--config", "--allocation-id", "--decision-id", "--expected-cid", "--step-id", "--task-upid",
+	"--previous-writer-fenced", "--remote-tasks-settled",
+}
+
+// settleMigrationUnusedFlags returns, in lexical order, every flag set on the
+// command line that settle-migration does not take. A flag counts as set even
+// with an empty or false value, because the settlement records nothing such a
+// flag would carry, and an operator who passed --authority-id must not
+// believe it was recorded.
+func settleMigrationUnusedFlags(fs *flag.FlagSet) []string {
+	var unused []string
+	fs.Visit(func(f *flag.Flag) {
+		if !slices.Contains(settleMigrationFlags, "--"+f.Name) {
+			unused = append(unused, "--"+f.Name)
+		}
+	})
+	return unused
+}
 
 // validStorageJournalMigrationFlags checks the flags settle-migration takes.
 // It requires every one of them, including both attestations, because the
