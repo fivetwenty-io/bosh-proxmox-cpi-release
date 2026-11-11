@@ -842,7 +842,8 @@ func TestDiscoveryWorker_StrictShrinkLogsAtDebug(t *testing.T) {
 }
 
 // A drain that cancels the worker after its decision and before its write
-// leaves the earlier file whole and no temporary file.
+// leaves the earlier result whole, with only the attempt the refresh recorded
+// before its reads, and no temporary file.
 func TestDiscoveryWorker_DrainCutsTheWriteOffWithoutATornFile(t *testing.T) {
 	t.Parallel()
 	e := newWorkerEnv(t, workerEnvOptions{})
@@ -874,8 +875,10 @@ func TestDiscoveryWorker_DrainCutsTheWriteOffWithoutATornFile(t *testing.T) {
 	}
 	after := e.payload()
 	if strings.Join(cachedNodeNames(after), ",") != strings.Join(cachedNodeNames(before), ",") ||
-		!after.Discovery.DiscoveredAt.Equal(before.Discovery.DiscoveredAt) {
-		t.Fatalf("the cancelled write changed the file: %+v", after.Discovery)
+		!reflect.DeepEqual(after.Discovery.Nodes, before.Discovery.Nodes) ||
+		!after.Discovery.DiscoveredAt.Equal(e.clock.Now()) ||
+		after.Discovery.LastFailure != endpointcache.FailureReadsTimedOut {
+		t.Fatalf("the cancelled write changed the file beyond its attempt: %+v", after.Discovery)
 	}
 	if temps := e.tempFiles(); len(temps) > 0 {
 		t.Fatalf("temporary files left behind: %v", temps)
@@ -896,9 +899,13 @@ func TestDiscoveryWorker_FailedWriteIsDroppedWithADebugLine(t *testing.T) {
 		t.Run(string(tc.mode), func(t *testing.T) {
 			t.Parallel()
 			e := newWorkerEnv(t, workerEnvOptions{mode: tc.mode})
-			// A directory in the file's place makes the rename fail.
+			// A directory in the file's place makes the rename fail. The
+			// file the attempt wrote before the reads goes first.
 			e.run(func(w *DiscoveryWorker) {
 				w.beforeWrite = func(context.Context) {
+					if err := os.Remove(e.filePath()); err != nil {
+						t.Error(err)
+					}
 					if err := os.Mkdir(e.filePath(), 0o700); err != nil {
 						t.Error(err)
 					}
@@ -927,10 +934,16 @@ func TestDiscoveryWorker_ExpiredLockWaitSkipsTheWrite(t *testing.T) {
 	}
 	e.run()
 	e.wantLine("endpoint cache lock wait expired; skipping the cache write", log.LevelDebug)
+	e.wantLine("api endpoint discovery: the attempt was not recorded; skipping the refresh", log.LevelDebug)
 	e.noLine("api endpoint discovery: cached")
 	e.noLine("the cache write failed")
 	if e.payload() != nil {
 		t.Fatal("a refresh whose lock wait expired wrote the file")
+	}
+	// A refresh that could not record its attempt sends no read, because a
+	// cancellation would leave nothing to hold the next one back.
+	if n := e.requests(); n != 0 {
+		t.Fatalf("a refresh with no recorded attempt sent %d requests", n)
 	}
 }
 
@@ -972,7 +985,8 @@ func TestDiscoveryWorker_UnrecordedAttemptPromisesNoWait(t *testing.T) {
 			tc.block(t, e)
 			e.begin()
 			w := e.newWorker()
-			w.recordFailure(context.Background(), workerSeed, fmt.Errorf("read: %w", ErrDiscoveryRoot))
+			cause := fmt.Errorf("read: %w", ErrDiscoveryRoot)
+			w.recordFailure(context.Background(), workerSeed, cause, discoveryStart{})
 			e.wantLine(tc.line, log.LevelDebug)
 			e.wantLine("api endpoint discovery: no result through "+workerSeed+", because the cluster root CA "+
 				"could not be read; the attempt was not recorded, so the next call tries again", log.LevelDebug)
@@ -1294,35 +1308,100 @@ func TestDiscoveryWorker_Helpers(t *testing.T) {
 	}
 }
 
-// A refresh the drain cancels during its reads records no attempt and logs no
-// failure line, because the drain reports the cancelled worker.
-func TestDiscoveryWorker_CancelledReadsWriteAndLogNothing(t *testing.T) {
+// A refresh the drain cancels during its reads has already recorded its
+// attempt, so it backs off the usual hour as a failed refresh does, and the
+// calls inside that hour start no reads. It logs no failure line, because the
+// drain reports the cancelled worker, and it leaves the stored outcome, nodes,
+// and pins as they were. That holds on a file with a result and on a cache
+// that has none yet.
+func TestDiscoveryWorker_CancelledRefreshBacksOffLikeAFailedOne(t *testing.T) {
 	t.Parallel()
-	e := newWorkerEnv(t, workerEnvOptions{})
-	e.run()
-	before := e.payload()
-	e.cluster.set(func() { e.cluster.hang["pve1"] = true })
-	e.clock.advance(endpointcache.RefreshInterval)
-	e.begin()
-	w := e.newWorker()
-	b := e.binding()
-	done := make(chan struct{})
-	if err := e.registry.Go(discoveryWorkerName, e.mode, func(ctx context.Context) {
-		defer close(done)
-		w.refresh(ctx, workerSeed, b)
-	}); err != nil {
-		t.Fatal(err)
+	for _, withResult := range []bool{true, false} {
+		t.Run(fmt.Sprintf("with a stored result %v", withResult), func(t *testing.T) {
+			t.Parallel()
+			e := newWorkerEnv(t, workerEnvOptions{})
+			var before *endpointcache.Payload
+			if withResult {
+				e.run()
+				before = e.payload()
+				e.clock.advance(endpointcache.RefreshInterval)
+			}
+			e.cluster.set(func() { e.cluster.hang["pve1"] = true })
+			e.begin()
+			w := e.newWorker()
+			b := e.binding()
+			done := make(chan struct{})
+			if err := e.registry.Go(discoveryWorkerName, e.mode, func(ctx context.Context) {
+				defer close(done)
+				w.refresh(ctx, workerSeed, b)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			res := e.registry.Drain(context.Background(), 50*time.Millisecond)
+			<-done
+			e.registry.Open()
+			if len(res.Cancelled) != 1 {
+				t.Fatalf("drain cancelled %v, want the discovery worker", res.Cancelled)
+			}
+			e.noLine("api endpoint discovery: no result")
+			e.noLine("the cache write failed")
+
+			p := e.payload()
+			if p == nil || p.Discovery == nil {
+				t.Fatalf("a cancelled refresh left no attempt: %+v", p)
+			}
+			d := p.Discovery
+			if d.LastFailure != endpointcache.FailureReadsTimedOut || !d.DiscoveredAt.Equal(e.clock.Now()) ||
+				!d.NextRefreshAfter.Equal(e.clock.Now().Add(endpointcache.RefreshInterval)) {
+				t.Fatalf("discovery %+v, want the reads_timed_out attempt at %v", d, e.clock.Now())
+			}
+			if withResult && (d.Outcome != before.Discovery.Outcome ||
+				!reflect.DeepEqual(d.Nodes, before.Discovery.Nodes) ||
+				p.Cluster.RootCASHA256 != before.Cluster.RootCASHA256) {
+				t.Fatalf("a cancelled refresh changed the result: %+v", d)
+			}
+			if !withResult && (d.Outcome != "" || len(d.Nodes) != 0 || p.Cluster != nil) {
+				t.Fatalf("payload %+v, want only the attempt", p)
+			}
+			if endpointcache.RefreshDue(p, e.clock.Now(), false) {
+				t.Fatal("a refresh is still due after a cancelled one")
+			}
+
+			e.clock.advance(endpointcache.RefreshInterval - time.Second)
+			e.run()
+			if n := e.requests(); n != 0 {
+				t.Fatalf("a call inside the hour after a cancelled refresh sent %d requests", n)
+			}
+		})
 	}
-	res := e.registry.Drain(context.Background(), 50*time.Millisecond)
-	<-done
-	e.registry.Open()
-	if len(res.Cancelled) != 1 {
-		t.Fatalf("drain cancelled %v, want the discovery worker", res.Cancelled)
-	}
-	e.noLine("api endpoint discovery: no result")
-	e.noLine("the cache write failed")
-	if p := e.payload(); !p.Discovery.DiscoveredAt.Equal(before.Discovery.DiscoveredAt) {
-		t.Fatalf("a cancelled refresh recorded an attempt: %+v", p.Discovery)
+}
+
+// An attempt that cannot be written before the reads skips the refresh, at
+// the failure level, so no read runs without a record that holds the next
+// refresh back.
+func TestDiscoveryWorker_UnwrittenAttemptSkipsTheReads(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		mode  config.DiscoveryMode
+		level slog.Level
+	}{
+		{config.DiscoveryModeAuto, log.LevelDebug},
+		{config.DiscoveryModeOn, log.LevelWarn},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			t.Parallel()
+			e := newWorkerEnv(t, workerEnvOptions{mode: tc.mode})
+			// A directory in the file's place makes the write fail.
+			if err := os.Mkdir(e.filePath(), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			e.begin()
+			if _, ok := e.newWorker().recordStart(context.Background()); ok {
+				t.Fatal("the reads may start although the attempt was not written")
+			}
+			e.wantLine("api endpoint discovery: the cache write failed before the reads; skipping the refresh",
+				tc.level)
+		})
 	}
 }
 

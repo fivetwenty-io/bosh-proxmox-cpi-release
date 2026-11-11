@@ -260,7 +260,8 @@ func (w *DiscoveryWorker) launch(via string, b DiscoveryBinding) {
 
 // refresh is one background refresh. It checks that the refresh is due, takes
 // the discover lock without waiting, checks again under it, because another
-// process may have finished a refresh in between, and then discovers.
+// process may have finished a refresh in between, and then discovers, which
+// records the attempt before any read.
 func (w *DiscoveryWorker) refresh(ctx context.Context, via string, b DiscoveryBinding) {
 	// A worker the drain cancelled before it started has nothing to do, and
 	// the caller may be closing the store.
@@ -424,16 +425,22 @@ func keyEndpoint(key endpointcache.Key, addr string) (string, bool) {
 	return "", false
 }
 
-// discover sends the reads, builds the result, and records it. The log lines
-// compare the view the update itself reads under the file lock, which is the
-// only view that cannot change between the comparison and the write, so
-// discover takes nothing from the due check.
+// discover records the attempt, sends the reads, builds the result, and
+// records it. The log lines compare the view the update itself reads under
+// the file lock, which is the only view that cannot change between the
+// comparison and the write, so discover takes nothing from the due check.
+// They compare it as it stood before the attempt was recorded, which
+// discoveryStart restores.
 func (w *DiscoveryWorker) discover(ctx context.Context, via string, b DiscoveryBinding) {
+	start, ok := w.recordStart(ctx)
+	if !ok {
+		return
+	}
 	key := w.store.Key()
 	requests := endpointpool.WithConfiguredOnly(ctx)
 	reads, err := ReadDiscovery(requests, b.Client)
 	if err != nil {
-		w.recordFailure(ctx, via, err)
+		w.recordFailure(ctx, via, err, start)
 		return
 	}
 	endpointNodes := w.learnEndpointNodes(ctx, b, reads)
@@ -443,7 +450,7 @@ func (w *DiscoveryWorker) discover(ctx context.Context, via string, b DiscoveryB
 		Resolver:   w.resolver,
 	})
 	if err != nil {
-		w.recordFailure(ctx, via, err)
+		w.recordFailure(ctx, via, err, start)
 		return
 	}
 	w.logBuildDrops(ctx, result.Dropped)
@@ -454,7 +461,89 @@ func (w *DiscoveryWorker) discover(ctx context.Context, via string, b DiscoveryB
 		return
 	}
 	obs.EndpointNodes = endpointNodes
-	w.recordResult(ctx, b, reads, result, obs)
+	w.recordResult(ctx, b, reads, result, obs, start)
+}
+
+// discoveryStart is the attempt a refresh records before its first read, and
+// the stored section's state that the attempt replaced. The attempt stores
+// reads_timed_out as the section's last_failure and moves the next refresh
+// out by discoveryFailureWait, as a failed refresh does, so a refresh the
+// drain cancels during its reads has already backed off, and the calls that
+// follow do not start it again until the hour has passed. The refresh's own
+// result or failure, when it gets one, writes over the attempt.
+type discoveryStart struct {
+	// at is the attempt's discovered_at, and zero when no attempt was
+	// recorded.
+	at time.Time
+	// section is the stored section a reader used before the attempt, or nil
+	// when there was none.
+	section *endpointcache.DiscoverySection
+	// lastFailure is the stored last_failure before the attempt, as written.
+	lastFailure endpointcache.DiscoveryFailure
+}
+
+// recordStart records the attempt under the key's lock and reports whether
+// the reads may start. When the attempt does not reach the file, because the
+// write failed or the lock wait ran out, the refresh is skipped, as due skips
+// one whose write would fail, because a refresh that runs unrecorded and is
+// then cancelled would start again on every call.
+func (w *DiscoveryWorker) recordStart(ctx context.Context) (discoveryStart, bool) {
+	var start discoveryStart
+	res, err := w.store.UpdatePayload(ctx, w.now(), func(view endpointcache.Stored) (endpointcache.Change, error) {
+		at := view.Now.UTC()
+		start = discoveryStart{at: at, lastFailure: view.LastFailure}
+		if view.Usable != nil && view.Usable.Discovery != nil {
+			section := *view.Usable.Discovery
+			start.section = &section
+		}
+		return endpointcache.Change{Attempt: &endpointcache.DiscoveryAttempt{
+			At: at, NextRefreshAfter: at.Add(discoveryFailureWait), Failure: endpointcache.FailureReadsTimedOut,
+		}}, nil
+	})
+	switch {
+	case err != nil && ctx.Err() != nil:
+		return discoveryStart{}, false
+	case err != nil:
+		w.logger.LogAttrs(ctx, endpointcache.Level(w.mode),
+			"api endpoint discovery: the cache write failed before the reads; skipping the refresh",
+			log.String("file", w.store.FileName()), log.Err(err))
+		if res.Locked {
+			w.logUpdate(ctx, res)
+		}
+		return discoveryStart{}, false
+	case !res.Locked:
+		w.logger.LogAttrs(ctx, log.LevelDebug,
+			"api endpoint discovery: the attempt was not recorded; skipping the refresh",
+			log.String("file", w.store.FileName()))
+		return discoveryStart{}, false
+	}
+	w.logUpdate(ctx, res)
+	return start, true
+}
+
+// priorView returns view as it stood before the attempt was recorded, when
+// the stored section is still that attempt, so the log lines compare the
+// refresh with the one before it and not with its own attempt. view is the
+// build function's copy, so changing it changes nothing stored. Any other
+// view is returned as it is.
+func (s discoveryStart) priorView(view endpointcache.Stored) endpointcache.Stored {
+	if s.at.IsZero() || view.Usable == nil || view.Usable.Discovery == nil ||
+		!view.Usable.Discovery.DiscoveredAt.Equal(s.at) || view.LastFailure != endpointcache.FailureReadsTimedOut {
+		return view
+	}
+	usable := *view.Usable
+	view.Usable = &usable
+	view.LastFailure = s.lastFailure
+	if s.section == nil {
+		usable.Discovery = nil
+		return view
+	}
+	section := *view.Usable.Discovery
+	section.DiscoveredAt = s.section.DiscoveredAt
+	section.NextRefreshAfter = s.section.NextRefreshAfter
+	section.LastFailure = s.section.LastFailure
+	usable.Discovery = &section
+	return view
 }
 
 // answeringEndpoint returns the key's spelling of the configured endpoint that
@@ -482,7 +571,8 @@ func (w *DiscoveryWorker) answeringEndpoint(ctx context.Context, triggered strin
 }
 
 // recordFailure handles a refresh that ended without a result. A refresh the
-// drain cut off writes and logs nothing more, because the drain reports it.
+// drain cut off writes and logs nothing more, because the drain reports it,
+// and the attempt that start recorded already holds the next refresh back.
 // Any other failure records an attempt that stores the failure's reason as
 // the section's last_failure and moves the next refresh out by
 // discoveryFailureWait, even on a file with no discovery yet, so a cluster
@@ -492,18 +582,19 @@ func (w *DiscoveryWorker) answeringEndpoint(ctx context.Context, triggered strin
 // is the outcome changing for these failures, and otherwise at the failure
 // level. The stored failure is the raw section's, as the update reads it under
 // the file lock, so a section a reader hides because the clock stepped back
-// still counts as the failure it records.
+// still counts as the failure it records, and it is the one before start's
+// attempt, which priorView restores.
 //
 // An attempt that never reached the file, because the write failed or the
 // lock wait ran out, promises no wait, since the next call asks again. Its
 // line is at the failure level, because the update read no stored section to
 // tell whether the outcome changed, and the store or logDropped has already
 // said why nothing was written.
-func (w *DiscoveryWorker) recordFailure(ctx context.Context, via string, cause error) {
+func (w *DiscoveryWorker) recordFailure(ctx context.Context, via string, cause error, start discoveryStart) {
 	failure := discoveryFailure(cause)
 	var prior endpointcache.DiscoveryFailure
 	res, err := w.store.UpdatePayload(ctx, w.now(), func(view endpointcache.Stored) (endpointcache.Change, error) {
-		prior = view.LastFailure
+		prior = start.priorView(view).LastFailure
 		at := view.Now.UTC()
 		return endpointcache.Change{Attempt: &endpointcache.DiscoveryAttempt{
 			At: at, NextRefreshAfter: at.Add(discoveryFailureWait), Failure: failure,
@@ -630,10 +721,11 @@ func readerNodes(
 }
 
 // recordResult applies the trust rules to obs inside the store's locked update
-// and logs what the decision and the write call for.
+// and logs what the decision and the write call for. The summary compares the
+// view as it stood before start's attempt.
 func (w *DiscoveryWorker) recordResult(
 	ctx context.Context, b DiscoveryBinding, reads DiscoveryReads, result DiscoveryResult,
-	obs endpointcache.Observation,
+	obs endpointcache.Observation, start discoveryStart,
 ) {
 	key := w.store.Key()
 	var (
@@ -647,7 +739,7 @@ func (w *DiscoveryWorker) recordResult(
 			return endpointcache.Change{}, err
 		}
 		decision, decided = d, true
-		sum = summarize(view, key, d)
+		sum = summarize(start.priorView(view), key, d)
 		if w.beforeWrite != nil {
 			w.beforeWrite(ctx)
 		}
