@@ -120,13 +120,24 @@ def lab_nodes(status: list[dict[str, Any]]) -> list[str]:
     return sorted(str(e.get("name", "")) for e in status if isinstance(e, dict) and e.get("type") == "node")
 
 
-def shared_storage_verdict(entry: "dict[str, Any] | None", storage: str) -> str:
+# Shared storages that another cluster also mounts. The pass writes images into
+# the parker band on its storage and binds a journal to it, so it must run on a
+# storage only the pve-cpi cluster mounts.
+FOREIGN_MOUNTED_STORAGES = frozenset({"nfs-images"})
+
+
+def shared_storage_verdict(entry: "dict[str, Any] | None", storage: str, nodes: "list[str] | None" = None) -> str:
     """Return "" when the storage can be a set member the journal manages, else the reason.
 
     A storage set member must be shared NFS with images content. That is the
     rule internal/storageinventory/collector.go applies, so a storage that
-    fails here would fail create_disk anyway, after the pass had started.
+    fails here would fail create_disk anyway, after the pass had started. The
+    storage must also be one only pve-cpi mounts, and when its nodes field
+    restricts it, that field must cover every lab node.
     """
+    if storage.strip().lower() in FOREIGN_MOUNTED_STORAGES:
+        return (f"storage {storage!r} is mounted by another cluster as well; "
+                "pick an NFS storage that only the pve-cpi cluster mounts")
     if entry is None:
         return f"storage {storage!r} is not in the cluster's storage index"
     if str(entry.get("type", "")).strip().lower() != "nfs":
@@ -136,6 +147,11 @@ def shared_storage_verdict(entry: "dict[str, Any] | None", storage: str) -> str:
         return f"storage {storage!r} does not serve images content (content={entry.get('content')!r})"
     if entry.get("disable") in (1, "1", True):
         return f"storage {storage!r} is disabled"
+    restricted = {n.strip() for n in str(entry.get("nodes", "") or "").split(",") if n.strip()}
+    if restricted and nodes:
+        missing = sorted(set(nodes) - restricted)
+        if missing:
+            return f"storage {storage!r} is limited to nodes {sorted(restricted)}, which leaves out {missing}"
     return ""
 
 
@@ -227,6 +243,21 @@ def kept_mover_warnings(stderr: str) -> list[str]:
     return warnings_matching(stderr, "kept the migration mover")
 
 
+# Every WARN that warnMoverLeft in attach_disk.go logs carries the mover_vmid
+# field and ends its message with this sentence, whatever the reason it gives.
+MOVER_LEFT_SUFFIX = "Nothing in the CPI removes it later"
+
+
+def mover_left_warnings(stderr: str) -> list[str]:
+    """The msg of every WARN record shaped like warnMoverLeft's, which says a mover was left behind."""
+    return [
+        str(r.get("msg", ""))
+        for r in log_lines(stderr)
+        if str(r.get("level", "")).upper().startswith("WARN")
+        and ("mover_vmid" in r or MOVER_LEFT_SUFFIX.lower() in str(r.get("msg", "")).lower())
+    ]
+
+
 # The one WARN a journal-managed attach logs when it adopts a mover that an
 # earlier request created and keeps it, because the journal deletes only the
 # holders its own request created (destroyOrKeepMover in attach_disk.go).
@@ -236,20 +267,21 @@ ADOPTED_MOVER_KEPT = "kept the migration mover because an earlier request create
 def adopted_mover_warning_findings(stderr: str) -> list[str]:
     """Every way the CPI's mover WARNs differ from one adopted-mover keep; [] when they match.
 
-    The log must carry the adopted-mover keep exactly once and no other WARN
-    that names the mover, so a keep because the protection restore was cut
-    off, or a restore that was refused, fails here as well as in the
-    protection-restore check.
+    The log must carry the adopted-mover keep exactly once and no other
+    warnMoverLeft WARN, so a keep because the protection restore was cut off,
+    or a destroy that failed, fails here. A cut-off or refused restore also
+    fails the protection-restore check. Other WARNs that merely mention a
+    mover, such as legacy provenance notes, are not mover-left warnings.
     """
     findings = []
-    mover_warns = warnings_matching(stderr, "mover")
+    mover_warns = mover_left_warnings(stderr)
     kept = [w for w in mover_warns if ADOPTED_MOVER_KEPT.lower() in w.lower()]
     if len(kept) != 1:
         findings.append(f"expected the WARN {ADOPTED_MOVER_KEPT!r} exactly once, found it {len(kept)} times"
                         + (", verbatim: " + " | ".join(kept) if kept else ""))
     others = [w for w in mover_warns if ADOPTED_MOVER_KEPT.lower() not in w.lower()]
     if others:
-        findings.append("the CPI logged other mover warnings, verbatim: " + " | ".join(others))
+        findings.append("the CPI logged other mover-left warnings, verbatim: " + " | ".join(others))
     return findings
 
 
@@ -283,14 +315,17 @@ def audit_summary_findings(exit_code: int, text: str) -> list[str]:
 
 def config_overrides(
     *, storage: str, prefix: str, band: tuple[int, int], journal_dir: str, namespace: str, journal: bool,
+    base_sets: "dict[str, Any] | None" = None,
 ) -> dict[str, Any]:
     """The keys the 11r config sets on top of CPI_CONFIG. None removes a key.
 
     The parker prefix is this run's own, so create_disk parks the disk alone
     on a fresh parker, and parker_pool is empty so no pool is made for it.
     disk_migration is removed so the attach runs under the on_attach default.
-    With journal on, the disk comes from a one-member storage set and the
-    journal lives in this run's scratch directory under its own namespace.
+    With journal on, the disk comes from a one-member storage set added
+    beside base_sets, the sets CPI_CONFIG already defines, so any other set
+    binding in CPI_CONFIG still resolves. The journal lives in this run's
+    scratch directory under its own namespace.
     """
     overrides: dict[str, Any] = {
         "detached_disk_strategy": "parked",
@@ -303,8 +338,12 @@ def config_overrides(
         "log_level": "info",
     }
     if journal:
+        sets = copy.deepcopy(dict(base_sets or {}))
+        if STORAGE_SET in sets:
+            raise ValueError(f"CPI_CONFIG already defines a storage set named {STORAGE_SET!r}")
+        sets[STORAGE_SET] = {"names": [storage], "strategy": {"name": "spread", "version": 1}}
         overrides.update(
-            storage_sets={STORAGE_SET: {"names": [storage], "strategy": {"name": "spread", "version": 1}}},
+            storage_sets=sets,
             persistent_storage_set=STORAGE_SET,
             storage_placement_namespace=namespace,
             storage_allocation_journal_dir=journal_dir,
@@ -322,17 +361,23 @@ def apply_overrides(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str
     return cfg
 
 
-def without_journal(cfg: dict[str, Any]) -> dict[str, Any]:
-    """cfg with the journal keys this pass added taken out again."""
+_JOURNAL_KEYS = ("storage_allocation_journal_dir", "storage_placement_namespace", "persistent_storage_set",
+                 "storage_sets")
+
+
+def without_journal(cfg: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
+    """cfg with the journal keys this pass set put back the way base had them.
+
+    Only what the pass added goes: a key base did not have is removed, and a
+    key base had gets base's value back, so the base storage sets and their
+    bindings stay exactly as CPI_CONFIG wrote them.
+    """
     out = copy.deepcopy(cfg)
-    for key in ("storage_allocation_journal_dir", "storage_placement_namespace", "persistent_storage_set"):
-        out.pop(key, None)
-    sets = dict(out.get("storage_sets") or {})
-    sets.pop(STORAGE_SET, None)
-    if sets:
-        out["storage_sets"] = sets
-    else:
-        out.pop("storage_sets", None)
+    for key in _JOURNAL_KEYS:
+        if key in base:
+            out[key] = copy.deepcopy(base[key])
+        else:
+            out.pop(key, None)
     return out
 
 
@@ -343,13 +388,13 @@ def lab_preflight(read: Callable[[str], Any], verifier: Any, storage: str, trans
     scripts/lifecycle calls it once more before step 1, so a run aimed at the
     wrong cluster stops before it creates anything at all.
     """
-    if transport != "pmx":
+    if transport != "pmx" or getattr(verifier, "_transport", None) != "pmx":
         raise LabRefused("11r reads PVE only through pmx; run with PVE_VERIFY_TRANSPORT=pmx")
     status = read("/cluster/status")
     reason = lab_guard_verdict(status)
     if reason:
         raise LabRefused(f"11r refuses to run: {reason}")
-    reason = shared_storage_verdict(verifier.storage_entry(storage), storage)
+    reason = shared_storage_verdict(verifier.storage_entry(storage), storage, lab_nodes(status))
     if reason:
         raise LabRefused(f"11r refuses to run: {reason}")
     return lab_nodes(status)
@@ -386,7 +431,11 @@ class PmxWriter:
         self._run("put", f"/nodes/{urllib.parse.quote(node)}/qemu/{int(vmid)}/config", data)
 
     def destroy(self, node: str, vmid: int) -> None:
-        """Destroy the guest and purge it from job configs, never touching unreferenced volumes."""
+        """Destroy the guest and purge it from job configs, never touching unreferenced volumes.
+
+        pmx api delete sends each --data pair as a query parameter, which is
+        where PVE reads DELETE options, as the verifier's urllib path does.
+        """
         self._check(node, vmid)
         self._run("delete", f"/nodes/{urllib.parse.quote(node)}/qemu/{int(vmid)}",
                   {"purge": "1", "destroy-unreferenced-disks": "0"})
@@ -543,9 +592,14 @@ class AdoptedMoverPass:
             failure = exc
             raise
         finally:
-            problems = self.cleanup()
+            try:
+                problems = self.cleanup()
+            except Exception as exc:  # noqa: BLE001 - cleanup never replaces the pass's own error
+                problems = [f"cleanup stopped: {exc}"]
             for problem in problems:
                 self._say(f"11r cleanup: {problem}")
+            if problems and failure is not None and hasattr(failure, "add_note"):
+                failure.add_note("11r cleanup also left work behind: " + "; ".join(problems))
             if problems and failure is None:
                 raise RuntimeError("11r passed, and its cleanup left work behind: " + "; ".join(problems))
 
@@ -575,11 +629,11 @@ class AdoptedMoverPass:
         journal_dir.mkdir(mode=0o700)
         overrides = config_overrides(
             storage=self.storage, prefix=self.prefix, band=self.band, journal_dir=str(journal_dir),
-            namespace=self.namespace, journal=self.journal_on,
+            namespace=self.namespace, journal=self.journal_on, base_sets=self.base_config.get("storage_sets"),
         )
         cfg = apply_overrides(self.base_config, overrides)
         self.config_path = self._write_config("cpi-11r.json", cfg)
-        self.plain_config_path = self._write_config("cpi-11r-plain.json", without_journal(cfg))
+        self.plain_config_path = self._write_config("cpi-11r-plain.json", without_journal(cfg, self.base_config))
         self._say(f"parker prefix {self.prefix}, namespace {self.namespace}, workspace {self.workspace}")
         if self.journal_on:
             code, out, err = self._journal(
@@ -638,7 +692,7 @@ class AdoptedMoverPass:
         self._say(f"attach_disk to VM {self.vm_cid} on {self.vm_node} (one attempt)")
         self._tasks_before = self.qmigrate_tasks()
         response, self.attach_log = self._send("attach_disk", [self.vm_cid, self.disk_cid], self.config_path)
-        error = response.get("error")
+        error = response.get("error") if isinstance(response, dict) else {"message": f"no response: {response!r}"}
         if error is not None:
             message = str(error.get("message", "")) if isinstance(error, dict) else json.dumps(error)
             raise RuntimeError("11r attach_disk failed. The CPI said, verbatim:\n" + message + self._evidence())
@@ -706,16 +760,34 @@ class AdoptedMoverPass:
     # -- cleanup -------------------------------------------------------------
 
     def cleanup(self) -> list[str]:
-        """Remove what this run made. Return what could not be removed."""
+        """Remove what this run made. Return what could not be removed.
+
+        Each phase runs on its own, so a failed read in one does not skip the
+        next, and the scratch workspace, which holds configs carrying the PVE
+        credentials, is removed last whatever happened before it.
+        """
         problems: list[str] = []
-        if self.disk_cid:
-            problems.extend(self._remove_disk())
-        problems.extend(self._remove_guests())
-        if self.workspace is not None:
-            shutil.rmtree(self.workspace, ignore_errors=True)
-            if self.workspace.exists():
-                problems.append(f"could not remove the scratch workspace {self.workspace}")
+        try:
+            if self.disk_cid:
+                try:
+                    problems.extend(self._remove_disk())
+                except Exception as exc:  # noqa: BLE001 - cleanup reports, it does not stop
+                    problems.append(f"disk cleanup stopped: {exc}")
+            try:
+                problems.extend(self._remove_guests())
+            except Exception as exc:  # noqa: BLE001
+                problems.append(f"guest cleanup stopped: {exc}")
+        finally:
+            problems.extend(self._remove_workspace())
         return problems
+
+    def _remove_workspace(self) -> list[str]:
+        if self.workspace is None:
+            return []
+        shutil.rmtree(self.workspace, ignore_errors=True)
+        if self.workspace.exists():
+            return [f"could not remove the scratch workspace {self.workspace}"]
+        return []
 
     def _remove_disk(self) -> list[str]:
         try:
@@ -736,7 +808,12 @@ class AdoptedMoverPass:
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"delete_disk under the {label} config failed, verbatim: {exc}")
                 continue
-            if not self.verifier.volume_exists(self.disk_cid):
+            try:
+                exists = self.verifier.volume_exists(self.disk_cid)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"delete_disk under the {label} config returned, and the volume check failed: {exc}")
+                continue
+            if not exists:
                 self.disk_cid = ""
                 return []
             errors.append(f"delete_disk under the {label} config returned, and the volume is still there")
@@ -795,7 +872,12 @@ class AdoptedMoverPass:
             except Exception as exc:  # noqa: BLE001
                 problems.append(f"could not destroy guest {vmid} on {node}: {exc}")
                 continue
-            if not self._gone(vmid):
+            try:
+                gone = self._gone(vmid)
+            except Exception as exc:  # noqa: BLE001
+                problems.append(f"could not confirm guest {vmid} is gone after its destroy: {exc}")
+                continue
+            if not gone:
                 problems.append(f"guest {vmid} is still listed after its destroy")
         return problems
 

@@ -181,19 +181,24 @@ Cross-node disk migration (exercises pve.disk_migration end to end):
                        is shared: the co-location conflict it drives only
                        arises on node-local storage.
     DISK_MIGRATION_JOURNAL  on | off               (default: on)
-                       Runs step 11r journal-managed: its config binds a
-                       one-member storage set and a storage allocation journal
-                       in a private scratch directory under a namespace of its
+                       Governs step 11r only. With on, 11r runs
+                       journal-managed: its config adds a one-member storage
+                       set beside the sets CPI_CONFIG defines, binds it as the
+                       persistent set, and points a storage allocation journal
+                       at a private scratch directory under a namespace of its
                        own, initialized with storage-journal initialize before
                        the first call. off runs 11r without the journal, as a
-                       control. Steps 11m-11q stay unmanaged either way,
-                       because a storage set member must be shared NFS with
-                       images content and those steps need node-local
-                       disk_storage.
+                       control. Steps 11m-11q are never journal-managed. A
+                       storage set member must be shared NFS with images
+                       content, so a journal-managed disk is always on shared
+                       storage, where the copy-local migration 11m-11q drive
+                       cannot happen.
     DISK_MIGRATION_SHARED_STORAGE  storage ID      (default: unset, 11r SKIPs)
                        Runs step 11r on this shared NFS storage, which must
                        serve images content and must not be mounted by any
-                       cluster other than pve-cpi. The pass creates a disk pinned to
+                       cluster other than pve-cpi, so nfs-images, which the
+                       az2 cluster also mounts, is refused. When the storage
+                       is limited to some nodes, it must cover every lab node. The pass creates a disk pinned to
                        a node other than the VM's under a parker prefix of its
                        own, so the disk parks alone on a fresh parker. It tags
                        that parker bosh-disk-mover through pmx, the shape an
@@ -1409,7 +1414,14 @@ def run_adopted_mover_pass(verifier: "_pve_verify.PVEVerifier", verify_cfg: dict
 
     def send(method: str, args: list[Any], config_path: str) -> tuple[dict[str, Any], str]:
         log: list[str] = []
-        return _send(method, args, config_path, stderr_out=log), "".join(log)
+        try:
+            response = _send(method, args, config_path, stderr_out=log)
+        except (RuntimeError, ValueError) as exc:
+            # A CPI that exits non-zero or answers nothing still wrote its log,
+            # and the pass reports that log and the cluster's evidence with the
+            # error, so the failure comes back as an error envelope.
+            response = {"result": None, "error": {"type": "HarnessError", "message": str(exc)}}
+        return response, "".join(log)
 
     def journal(action: str, config_path: str, *flags: str) -> tuple[int, str, str]:
         proc = subprocess.run(
