@@ -240,18 +240,39 @@ func TestColdStartProbeTheOwnerOutlivedStillRefuses(t *testing.T) {
 // A candidate that sent any byte of a response before the owner's
 // cancellation cut its probe has answered, so it is refused and never probed
 // again. That holds for an informational 1xx block, which the transport
-// consumes without returning it, as much as for a final header block.
+// consumes without returning it, as much as for a final header block, and for
+// the first bytes of a status line that never complete into either.
 func TestColdStartProbeCutAfterAResponseByteRefuses(t *testing.T) {
+	// send writes the candidate's partial answer and reports whether it took
+	// the connection over, in which case the handler has nothing left to hold.
 	cases := []struct {
 		name string
-		send func(w http.ResponseWriter)
+		send func(t *testing.T, w http.ResponseWriter) (hijacked bool)
 	}{
-		{"a 103 Early Hints block", func(w http.ResponseWriter) {
+		{"a 103 Early Hints block", func(_ *testing.T, w http.ResponseWriter) bool {
 			w.WriteHeader(http.StatusEarlyHints)
+			return false
 		}},
-		{"a final header block", func(w http.ResponseWriter) {
+		{"a final header block", func(_ *testing.T, w http.ResponseWriter) bool {
 			w.WriteHeader(http.StatusOK)
 			w.(http.Flusher).Flush()
+			return false
+		}},
+		{"part of a status line", func(t *testing.T, w http.ResponseWriter) bool {
+			conn, bw, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return false
+			}
+			_, _ = bw.WriteString("HTTP/1.1 2")
+			if err := bw.Flush(); err != nil {
+				t.Errorf("flush: %v", err)
+			}
+			go func() {
+				_, _ = io.Copy(io.Discard, conn)
+				_ = conn.Close()
+			}()
+			return true
 		}},
 	}
 	for _, tc := range cases {
@@ -263,8 +284,9 @@ func TestColdStartProbeCutAfterAResponseByteRefuses(t *testing.T) {
 			routes := pvetest.NewRoutes()
 			routes.HandleFunc(http.MethodGet, "/cluster/status", func(w http.ResponseWriter, r *http.Request) {
 				if hang.Swap(false) {
-					tc.send(w)
-					<-r.Context().Done()
+					if !tc.send(t, w) {
+						<-r.Context().Done()
+					}
 					return
 				}
 				w.WriteHeader(http.StatusOK)
