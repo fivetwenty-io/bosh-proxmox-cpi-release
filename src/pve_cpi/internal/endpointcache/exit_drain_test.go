@@ -146,6 +146,69 @@ func TestDrainAtExitReportsAPanickedWorkerOnStderr(t *testing.T) {
 	}
 }
 
+// exitStuckWorker registers a worker that runs until the drain cancels it.
+func exitStuckWorker(t *testing.T, name string, mode config.DiscoveryMode) {
+	t.Helper()
+	if err := Go(name, mode, func(ctx context.Context) { <-ctx.Done() }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A worker the drain cancels under an explicit on is one Warn line on stderr
+// that names the worker, because the operator asked for a cache the command
+// did not finish writing.
+func TestDrainAtExitWarnsOnceAboutACancelledWorkerUnderOn(t *testing.T) {
+	resetProcessRegistry(t)
+	exitStuckWorker(t, "stuck refresh", config.DiscoveryModeOn)
+	var stderr bytes.Buffer
+	DrainAtExit("tool", &stderr, 50*time.Millisecond)
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("stderr = %q, want exactly one line", stderr.String())
+	}
+	for _, want := range []string{
+		`"level":"WARN"`, "cancelled background work still running at exit", "stuck refresh",
+	} {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("line %q does not contain %q", lines[0], want)
+		}
+	}
+}
+
+// Under auto the cancellation is a Debug line, which a command that logs at
+// Warn does not write.
+func TestDrainAtExitWritesNothingAboutACancelledWorkerUnderAuto(t *testing.T) {
+	resetProcessRegistry(t)
+	exitStuckWorker(t, "stuck refresh", config.DiscoveryModeAuto)
+	var stderr bytes.Buffer
+	DrainAtExit("tool", &stderr, 50*time.Millisecond)
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want nothing", stderr.String())
+	}
+}
+
+// A worker cancelled under on and a worker that panicked each get their line,
+// the cancellation at Warn and the panic at Error.
+func TestDrainAtExitReportsAPanicAndACancellationTogether(t *testing.T) {
+	resetProcessRegistry(t)
+	panicking := func(context.Context) { panic("the write blew up") }
+	if err := Go("bad write", config.DiscoveryModeAuto, panicking); err != nil {
+		t.Fatal(err)
+	}
+	exitStuckWorker(t, "stuck refresh", config.DiscoveryModeOn)
+	var stderr bytes.Buffer
+	DrainAtExit("tool", &stderr, 100*time.Millisecond)
+	out := stderr.String()
+	for _, want := range []string{
+		`"level":"ERROR"`, "background worker panicked", "bad write", "the write blew up",
+		`"level":"WARN"`, "cancelled background work still running at exit", "stuck refresh",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stderr = %q, want it to contain %q", out, want)
+		}
+	}
+}
+
 // A SIGTERM during the wait ends it at once. The process still returns to its
 // caller, who computes the exit code, and the worker is cancelled.
 func TestDrainAtExitEndsOnASignal(t *testing.T) {

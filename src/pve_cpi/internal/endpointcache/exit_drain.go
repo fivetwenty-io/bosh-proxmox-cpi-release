@@ -32,20 +32,23 @@ func DrainWaitFor(wait time.Duration) time.Duration {
 // A SIGINT or SIGTERM during the wait ends the wait at once, and the command
 // still exits with the code its caller computed, because the signal is caught
 // here and not left to kill the process. command names the caller in the one
-// line the drain writes when its logger fails. The drain reports only a panicked
-// worker, on stderr, because that finding is a defect and the command has no
-// other logger to put it on. A command that started no worker never waits.
+// line the drain writes when its logger fails. The command has no other logger,
+// so the drain reports on stderr, through LogDrainResult at Warn. A panicked
+// worker is an Error line there, and a cancelled worker is a Warn line only
+// when it serves a cluster config with an explicit "on", because that is the
+// level its own config's mode gives. A normal exit writes nothing, and a
+// command that started no worker never waits.
 func DrainAtExit(command string, stderr io.Writer, wait time.Duration) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	result := Drain(ctx, DrainWaitFor(wait))
-	if len(result.Panics) == 0 {
+	if len(result.Panics) == 0 && len(result.Cancelled) == 0 {
 		return
 	}
-	logger, err := log.NewLogger("error", stderr)
+	logger, err := log.NewLogger("warn", stderr)
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "%s: background workers panicked (%d), and the logger failed: %s\n", command,
-			len(result.Panics), err)
+		_, _ = fmt.Fprintf(stderr, "%s: background workers panicked (%d) or were cancelled (%d), and the logger "+
+			"failed: %s\n", command, len(result.Panics), len(result.Cancelled), err)
 		return
 	}
 	LogDrainResult(logger, result)

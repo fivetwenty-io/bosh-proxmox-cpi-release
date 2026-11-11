@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -319,5 +320,51 @@ func TestRunEndsItsDrainOnSIGTERMAndKeepsTheExitCode(t *testing.T) {
 				t.Error("the signal did not cancel the slow worker")
 			}
 		})
+	}
+}
+
+// A worker the exit drain cancels under an explicit on is one Warn line on the
+// command's standard error, and the command keeps the exit code it computed. A
+// SIGTERM ends the wait at once, so the worker is still running when the drain
+// cancels it.
+func TestRunWarnsOnStderrAboutAWorkerTheExitDrainCancelledUnderOn(t *testing.T) {
+	endpointcache.Open()
+	t.Cleanup(endpointcache.Open)
+	held := make(chan os.Signal, 1)
+	signal.Notify(held, syscall.SIGTERM)
+	t.Cleanup(func() { signal.Stop(held) })
+	if err := endpointcache.Go("stuck refresh", config.DiscoveryModeOn, func(ctx context.Context) {
+		<-ctx.Done()
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr syncBuffer
+	codeCh := make(chan int, 1)
+	go func() { codeCh <- run([]string{"version"}, &stdout, &stderr) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for !endpointcache.Draining() {
+		if time.Now().After(deadline) {
+			t.Fatal("run never started its drain")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-codeCh:
+		if code != exitOK {
+			t.Errorf("exit %d, want %d: %s", code, exitOK, stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("SIGTERM did not end the exit drain")
+	}
+	for _, want := range []string{
+		`"level":"WARN"`, "cancelled background work still running at exit", "stuck refresh",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr = %q, want it to contain %q", stderr.String(), want)
+		}
 	}
 }
