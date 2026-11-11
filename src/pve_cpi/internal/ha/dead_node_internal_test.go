@@ -179,14 +179,14 @@ func TestDeletionDestinationsRefusesBadInput(t *testing.T) {
 		{"token naming another node", "a", deadNodeRules(otherToken), ok, ownedByUs, idx, "does not name dead node"},
 	}
 	for _, tc := range cases {
-		_, err := DeletionDestinations(context.Background(), tc.source, deadNodeMembers, tc.set, "vm:101", "bosh-na-101", tc.owned,
-			tc.place, tc.index)
+		_, err := DeletionDestinations(context.Background(), tc.source, deadNodeMembers, tc.set, "vm:101",
+			"bosh-na-101", tc.owned, tc.place, tc.index)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: got %v, want an error naming %q", tc.name, err, tc.want)
 		}
 	}
-	if _, err := DeletionDestinations(context.Background(), "a", deadNodeMembers, rules, "", "bosh-na-101", ownedByUs, ok,
-		idx); err == nil {
+	if _, err := DeletionDestinations(context.Background(), "a", deadNodeMembers, rules, "", "bosh-na-101",
+		ownedByUs, ok, idx); err == nil {
 		t.Error("an unnamed resource must be an error")
 	}
 }

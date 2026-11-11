@@ -118,7 +118,8 @@ func TestPlanEndpoints(t *testing.T) {
 			wantErr:   "the endpoint list was not resolved: pve.endpoints[1] has no port",
 		},
 		{
-			name: "a first entry without a port is refused even when it names the host", host: "pve1.example.com", port: 8443,
+			name: "a first entry without a port is refused even when it names the host",
+			host: "pve1.example.com", port: 8443,
 			endpoints: []string{"pve1.example.com", "pve2.example.com:8443"},
 			wantErr:   "the endpoint list was not resolved: pve.endpoints[0] has no port",
 		},

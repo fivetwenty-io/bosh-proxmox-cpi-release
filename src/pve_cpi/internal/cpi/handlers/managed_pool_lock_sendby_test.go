@@ -66,7 +66,10 @@ func (w *sendByWire) admit(ctx context.Context, method, route string) error {
 		}
 	}
 	refusal := endpointpool.CheckSendBy(ctx, at, method, path)
-	w.calls = append(w.calls, sendByWireCall{method: method, route: route, guarded: guarded, steal: steal, refused: refusal != nil})
+	w.calls = append(
+		w.calls,
+		sendByWireCall{method: method, route: route, guarded: guarded, steal: steal, refused: refusal != nil},
+	)
 	if refusal != nil {
 		return sdkSendByRefusal(method, path, refusal)
 	}
@@ -157,7 +160,12 @@ func (p sendByWirePools) ReadPoolComment(ctx context.Context, id string) (string
 // stealContext is the context a steal's delete carries: the claim it judged
 // expired and the send-by marker for DELETE /pools.
 func stealContext(ctx context.Context, claim string) context.Context {
-	return endpointpool.WithSendBy(pve.WithExpectedLockClaim(ctx, claim), time.Now().Add(2*time.Second), http.MethodDelete, "/pools")
+	return endpointpool.WithSendBy(
+		pve.WithExpectedLockClaim(ctx, claim),
+		time.Now().Add(2*time.Second),
+		http.MethodDelete,
+		"/pools",
+	)
 }
 
 // expiredClaim is a claim whose expiry passed a minute ago.
@@ -193,7 +201,8 @@ func TestGuardedStealDeleteSendByRefusalSettles(t *testing.T) {
 	if len(events.after) != 1 {
 		t.Fatalf("the refusal was not settled through After: %v", events.after)
 	}
-	if got, ok := events.after[0].(managedLockPoolRejection); !ok || got.poolID != lockGuardPool || got.method != "DeletePool" {
+	if got, ok := events.after[0].(managedLockPoolRejection); !ok || got.poolID != lockGuardPool ||
+		got.method != "DeletePool" {
 		t.Fatalf("After received %#v, want the refusal proof for the delete of %s", events.after[0], lockGuardPool)
 	}
 	if deletedByPVE(pools) || !pools.found {
@@ -202,7 +211,10 @@ func TestGuardedStealDeleteSendByRefusalSettles(t *testing.T) {
 	wire.assertMarkedReadsRan(t)
 
 	// The next mutation proceeds.
-	if err := guard.Client().Pools().DeletePool(pve.WithExpectedLockClaim(t.Context(), claim), lockGuardPool); err != nil {
+	if err := guard.Client().Pools().DeletePool(
+		pve.WithExpectedLockClaim(t.Context(), claim),
+		lockGuardPool,
+	); err != nil {
 		t.Fatalf("the guard refused the next delete: %v", err)
 	}
 	if pools.found || guard.Err() != nil {
@@ -298,8 +310,16 @@ func TestGuardedOperatorPoolSendByRefusalStaysUncertain(t *testing.T) {
 			events := &lockGuardEvents{}
 			guard := newLockGuardOver(t, storeClient{pools: sendByWirePools{PoolService: pools, wire: wire}}, events)
 			ctx := endpointpool.WithSendBy(t.Context(), deadline, http.MethodDelete, "/pools")
-			if err := guard.Client().Pools().DeletePool(ctx, "bosh-director"); err == nil || guard.Err() == nil || events.failed != 1 {
-				t.Fatalf("a refused operator pool delete was settled: err=%v guard=%v failed=%d", err, guard.Err(), events.failed)
+			if err := guard.Client().Pools().DeletePool(
+				ctx,
+				"bosh-director",
+			); err == nil || guard.Err() == nil || events.failed != 1 {
+				t.Fatalf(
+					"a refused operator pool delete was settled: err=%v guard=%v failed=%d",
+					err,
+					guard.Err(),
+					events.failed,
+				)
 			}
 			if len(events.after) != 0 {
 				t.Fatalf("a refused operator pool delete reached After: %v", events.after)
@@ -381,7 +401,10 @@ func TestManagedVMGuardJournalsNoStepForAPastSendByDelete(t *testing.T) {
 	claim := expiredClaim("other-director")
 	locks.pools[sentinel] = claim
 	wire := &sendByWire{}
-	m.deps.PVE = sendByVMClient{lockedVMClient: lockedVMClient{managedVMGuardFixture: fixture, locks: locks}, wire: wire}
+	m.deps.PVE = sendByVMClient{
+		lockedVMClient: lockedVMClient{managedVMGuardFixture: fixture, locks: locks},
+		wire:           wire,
+	}
 	m.guard = nil
 	if err := m.newGuard(); err != nil {
 		t.Fatal(err)
@@ -425,9 +448,21 @@ func TestGuardedAcquireStealsAfterASendByRefusal(t *testing.T) {
 	events := &lockGuardEvents{}
 	guard := newLockGuardOver(t, client, events)
 
-	handle, err := pve.AcquireClusterLock(withShortLockPoll(t.Context()), guard.Client().Pools(), "vm-90000", "unpark/90000@9-1", time.Minute, 5*time.Second)
+	handle, err := pve.AcquireClusterLock(
+		withShortLockPoll(t.Context()),
+		guard.Client().Pools(),
+		"vm-90000",
+		"unpark/90000@9-1",
+		time.Minute,
+		5*time.Second,
+	)
 	if err != nil || handle == nil {
-		t.Fatalf("the acquire did not steal after the refused delete: handle %v err %v (guard=%v)", handle, err, guard.Err())
+		t.Fatalf(
+			"the acquire did not steal after the refused delete: handle %v err %v (guard=%v)",
+			handle,
+			err,
+			guard.Err(),
+		)
 	}
 	if err := handle.Release(context.WithoutCancel(t.Context())); err != nil {
 		t.Fatalf("release: %v", err)
@@ -436,7 +471,12 @@ func TestGuardedAcquireStealsAfterASendByRefusal(t *testing.T) {
 		t.Fatalf("the refused steal poisoned the guard: %v", guard.Err())
 	}
 	if refused, sent := wire.refusedDeletes(); refused != 1 || sent != 1 {
-		t.Fatalf("want one refused and one sent steal delete, got refused=%d sent=%d: %+v", refused, sent, wire.recorded())
+		t.Fatalf(
+			"want one refused and one sent steal delete, got refused=%d sent=%d: %+v",
+			refused,
+			sent,
+			wire.recorded(),
+		)
 	}
 	wire.assertMarkedReadsRan(t)
 	locks.mu.Lock()
@@ -486,7 +526,9 @@ func TestManagedLifecycleSettlesASendByRefusedSteal(t *testing.T) {
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
 	locks.mu.Lock()
-	locks.pools[pve.ClusterLockPoolName(fmt.Sprintf("vm-%d", disk.parker))] = expiredClaim(fmt.Sprintf("transfer_out/%d@1-1", disk.parker))
+	locks.pools[pve.ClusterLockPoolName(
+		fmt.Sprintf("vm-%d", disk.parker),
+	)] = expiredClaim(fmt.Sprintf("transfer_out/%d@1-1", disk.parker))
 	locks.mu.Unlock()
 	wire := &sendByWire{late: func(n int) bool { return n == 0 }}
 	disk.deps.PVE = sendByFlowPVE{contendedFlowPVE: disk.deps.PVE.(contendedFlowPVE), wire: wire}
@@ -530,7 +572,9 @@ func TestManagedParkSettlesASendByRefusedSteal(t *testing.T) {
 	locks := newLockContention(t)
 	m, handle := contendedParkRequest(t, locks, nil)
 	parker := m.deps.Config.ParkedDiskVMIDRangeStartValue()
-	locks.pools[pve.ClusterLockPoolName(fmt.Sprintf("vm-%d", parker))] = expiredClaim(fmt.Sprintf("transfer_out/%d@1-1", parker))
+	locks.pools[pve.ClusterLockPoolName(
+		fmt.Sprintf("vm-%d", parker),
+	)] = expiredClaim(fmt.Sprintf("transfer_out/%d@1-1", parker))
 	wire := &sendByWire{late: func(n int) bool { return n == 0 }}
 	m.deps.PVE = sendByDiskPVE{contendedDiskPVE: m.deps.PVE.(contendedDiskPVE), wire: wire}
 
@@ -576,7 +620,10 @@ func TestManagedVMGuardSettlesASendByRefusedSteal(t *testing.T) {
 	locks := newLockContention(t)
 	locks.pools[pve.ClusterLockPoolName("aa-web")] = expiredClaim("other-director")
 	wire := &sendByWire{late: func(n int) bool { return n == 0 }}
-	m.deps.PVE = sendByVMClient{lockedVMClient: lockedVMClient{managedVMGuardFixture: fixture, locks: locks}, wire: wire}
+	m.deps.PVE = sendByVMClient{
+		lockedVMClient: lockedVMClient{managedVMGuardFixture: fixture, locks: locks},
+		wire:           wire,
+	}
 	m.guard = nil
 	if err := m.newGuard(); err != nil {
 		t.Fatal(err)

@@ -176,7 +176,12 @@ func TestWrongLeafFailsBeforeTheHandler(t *testing.T) {
 					t.Fatalf("want the neutral refusal text: %v", err)
 				}
 				if said := strings.Contains(err.Error(), "is not one of"); said != c.unpinned {
-					t.Fatalf("the refusal says the leaf is outside the pin set = %v, want %v: %v", said, c.unpinned, err)
+					t.Fatalf(
+						"the refusal says the leaf is outside the pin set = %v, want %v: %v",
+						said,
+						c.unpinned,
+						err,
+					)
 				}
 			}
 			if n := c.node.Counts.Requests.Load(); n != 0 {

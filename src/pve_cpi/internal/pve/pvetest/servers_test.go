@@ -67,7 +67,8 @@ func TestLive_ServesRoutesAndRecords(t *testing.T) {
 	if s.Kind != pvetest.KindLive {
 		t.Fatalf("Kind = %q", s.Kind)
 	}
-	if host, port := s.HostPort(); host != "127.0.0.1" || port == 0 || s.Addr != net.JoinHostPort(host, strconv.Itoa(port)) {
+	if host, port := s.HostPort(); host != "127.0.0.1" || port == 0 ||
+		s.Addr != net.JoinHostPort(host, strconv.Itoa(port)) {
 		t.Fatalf("HostPort = %q %d, Addr = %q", host, port, s.Addr)
 	}
 

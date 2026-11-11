@@ -27,7 +27,12 @@ func TestRoutes_Defaults(t *testing.T) {
 		code         int
 		body         string
 	}{
-		{http.MethodGet, pvetest.APIPrefix + "/version", 200, `{"data":{"release":"9.0","repoid":"pvetest","version":"9.0.2"}}`},
+		{
+			http.MethodGet,
+			pvetest.APIPrefix + "/version",
+			200,
+			`{"data":{"release":"9.0","repoid":"pvetest","version":"9.0.2"}}`,
+		},
 		{http.MethodGet, pvetest.APIPrefix + "/nodes", 200, `{"data":[]}`},
 		{http.MethodGet, pvetest.APIPrefix + "/cluster/resources", 200, `{"data":[]}`},
 		{http.MethodGet, pvetest.APIPrefix + "/nodes/pve1/qemu", 200, `{"data":[]}`},

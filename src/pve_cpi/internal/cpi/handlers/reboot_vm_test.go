@@ -863,7 +863,11 @@ func TestRebootVM_AwaitTransient_Retriable(t *testing.T) {
 				t.Errorf("%s: error %v is not the poll-timeout-unresolved shape", tc.name, err)
 			}
 			if pve.IsTransientTransport(err) {
-				t.Errorf("%s: error %v reads as transient transport, so a retry helper would re-submit the task", tc.name, err)
+				t.Errorf(
+					"%s: error %v reads as transient transport, so a retry helper would re-submit the task",
+					tc.name,
+					err,
+				)
 			}
 			if got := polls.Load(); got != 2 {
 				t.Errorf("%s: polled %d times; want 2 (the transient fault, then the poll window)", tc.name, got)

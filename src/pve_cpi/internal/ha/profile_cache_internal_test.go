@@ -89,7 +89,12 @@ func seedProfile(t *testing.T, c *ProfileCache, stored time.Time, facts SlowFact
 	}
 	defer func() { _ = store.Close() }()
 	written, err := endpointcache.Update(context.Background(), store, func(*profilePayload) (*profilePayload, error) {
-		return &profilePayload{Key: store.Key(), Cluster: cacheTestCluster, StoredAtMillis: stored.UnixMilli(), Facts: facts}, nil
+		return &profilePayload{
+			Key:            store.Key(),
+			Cluster:        cacheTestCluster,
+			StoredAtMillis: stored.UnixMilli(),
+			Facts:          facts,
+		}, nil
 	})
 	if err != nil || !written {
 		t.Fatalf("seed the profile file: written %v, err %v", written, err)
@@ -180,9 +185,17 @@ func TestProfileCacheDoesNotAnswerFromStoredFactsWithAnyFault(t *testing.T) {
 
 			got, err := c.Slow(context.Background(), cacheTestCluster, nodes)
 			if err != nil || live.calls != 1 || got.Cached {
-				t.Fatalf("a stored reading with a fault answered: live probes %d, cached %v, err %v", live.calls, got != nil && got.Cached, err)
+				t.Fatalf(
+					"a stored reading with a fault answered: live probes %d, cached %v, err %v",
+					live.calls,
+					got != nil && got.Cached,
+					err,
+				)
 			}
-			if stored := storedProfile(t, c); stored == nil || stored.Facts.RulesErr != "" || stored.Facts.ConfigVotes == nil {
+			if stored := storedProfile(
+				t,
+				c,
+			); stored == nil || stored.Facts.RulesErr != "" || stored.Facts.ConfigVotes == nil {
 				t.Errorf("the clean live reading must replace the faulty file, got %+v", stored)
 			}
 		})
@@ -215,7 +228,9 @@ func TestProfileCacheAFileWithADifferentNodeCountIsAMiss(t *testing.T) {
 }
 
 func TestProfileCacheDoesNotStoreFactsForOtherNodesThanAskedAbout(t *testing.T) {
-	extra := &stubLive{facts: func([]NodeRef) *SlowFacts { return internalCleanFacts(internalNodes("pve1", "pve2", "pve3")) }}
+	extra := &stubLive{
+		facts: func([]NodeRef) *SlowFacts { return internalCleanFacts(internalNodes("pve1", "pve2", "pve3")) },
+	}
 	c := internalCache(t, extra)
 	two := internalNodes("pve1", "pve2")
 	for i := 1; i <= 2; i++ {
@@ -275,7 +290,11 @@ func TestUncleanReasonNamesTheFirstFault(t *testing.T) {
 func goldenFacts() SlowFacts {
 	return SlowFacts{
 		Nodes: map[string]NodeSlowFacts{"pve1": {
-			Probed: true, Version: "9.2.1", VersionErr: "v", CPU: CPUInfo{Known: true, Model: "Xeon A", Flags: []string{"avx"}}, CPUErr: "c",
+			Probed: true, Version: "9.2.1", VersionErr: "v", CPU: CPUInfo{
+				Known: true,
+				Model: "Xeon A",
+				Flags: []string{"avx"},
+			}, CPUErr: "c",
 		}},
 		RulesSupported: true, RulesErr: "r",
 		ConfigVotes: map[string]int{"pve1": 1}, ConfigVotesErr: "cv",
@@ -293,7 +312,8 @@ func goldenFacts() SlowFacts {
 // goldenProfileFile is the stored payload's exact text. A change to it is a
 // change to the file's schema and bumps profileCacheVersion, together with this
 // test.
-const goldenProfileFile = `{"key":{"endpoints":null,"verify_ssl":false,"ca_sha256":"","credential_id":""},"cluster":"lab",` +
+const goldenProfileFile = `{"key":{"endpoints":null,"verify_ssl":false,"ca_sha256":"","credential_id":""},` +
+	`"cluster":"lab",` +
 	`"stored_at_ms":1,"facts":{"nodes":{"pve1":{"probed":true,"version":"9.2.1","version_err":"v",` +
 	`"cpu":{"known":true,"model":"Xeon A","flags":["avx"]},"cpu_err":"c"}},"rules_supported":true,` +
 	`"rules_err":"r","config_votes":{"pve1":1},"config_votes_err":"cv","qdevice":{"read":true,"read_err":"qe",` +
@@ -304,7 +324,10 @@ const goldenProfileFile = `{"key":{"endpoints":null,"verify_ssl":false,"ca_sha25
 
 func TestTheStoredProfileHasAPinnedSchema(t *testing.T) {
 	if profileCacheVersion != 2 {
-		t.Fatalf("profileCacheVersion = %d, but this golden text is the version 2 schema; update both together", profileCacheVersion)
+		t.Fatalf(
+			"profileCacheVersion = %d, but this golden text is the version 2 schema; update both together",
+			profileCacheVersion,
+		)
 	}
 	got, err := json.Marshal(profilePayload{Cluster: "lab", StoredAtMillis: 1, Facts: goldenFacts()})
 	if err != nil {
@@ -356,7 +379,9 @@ func TestEveryStoredFieldHasAnExplicitJSONTag(t *testing.T) {
 		}
 	}
 	walk(t, reflect.TypeOf(profilePayload{}), "profilePayload")
-	if !seen[reflect.TypeOf(pve.StorageInfo{})] || !seen[reflect.TypeOf(CPUInfo{})] || !seen[reflect.TypeOf(QDevice{})] {
+	if !seen[reflect.TypeOf(
+		pve.StorageInfo{},
+	)] || !seen[reflect.TypeOf(CPUInfo{})] || !seen[reflect.TypeOf(QDevice{})] {
 		t.Errorf("the walk missed a stored type, saw %d", len(seen))
 	}
 }
@@ -370,7 +395,12 @@ func seedProfileFor(t *testing.T, c *ProfileCache, cluster string, stored time.T
 	}
 	defer func() { _ = store.Close() }()
 	written, err := endpointcache.Update(context.Background(), store, func(*profilePayload) (*profilePayload, error) {
-		return &profilePayload{Key: store.Key(), Cluster: cluster, StoredAtMillis: stored.UnixMilli(), Facts: facts}, nil
+		return &profilePayload{
+			Key:            store.Key(),
+			Cluster:        cluster,
+			StoredAtMillis: stored.UnixMilli(),
+			Facts:          facts,
+		}, nil
 	})
 	if err != nil || !written {
 		t.Fatalf("seed the profile file: written %v, err %v", written, err)
@@ -501,7 +531,10 @@ func TestEveryProfileCacheLogLineCallsItTheHAProfileCache(t *testing.T) {
 	}
 	// A directory the cache refuses.
 	unsafe := internalCache(t, &stubLive{facts: internalCleanFacts})
-	if err := os.Chmod(unsafe.opts.Dir.Override, 0o755); err != nil { //nolint:gosec // the test makes the mode unsafe on purpose
+	if err := os.Chmod(
+		unsafe.opts.Dir.Override,
+		0o755,
+	); err != nil { //nolint:gosec // the test makes the mode unsafe on purpose
 		t.Fatal(err)
 	}
 	run(unsafe)

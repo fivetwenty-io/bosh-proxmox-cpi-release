@@ -54,7 +54,10 @@ func TestApplyContextOverrides_DiscoveryModeRefusalsMatchTheSharedFixture(t *tes
 		checked++
 		t.Run(tc.Name, func(t *testing.T) {
 			t.Parallel()
-			_, _, _, err := ApplyContextOverrides(discoveryOverrideBase(), requestExtra(t, `{"pve_api_endpoint_discovery":`+string(raw)+`}`))
+			_, _, _, err := ApplyContextOverrides(
+				discoveryOverrideBase(),
+				requestExtra(t, `{"pve_api_endpoint_discovery":`+string(raw)+`}`),
+			)
 			if err == nil {
 				t.Fatalf("ApplyContextOverrides accepted %s, want the refusal %q", raw, tc.Message)
 			}
@@ -373,11 +376,23 @@ func TestCoerceOverrideDiscoveryMode_EchoesAValueThatCannotBeEncoded(t *testing.
 		value any
 		want  string
 	}{
-		"NaN":              {math.NaN(), "api_endpoint_discovery: expected a string or a boolean, got a value of type float64"},
-		"infinity":         {math.Inf(1), "api_endpoint_discovery: expected a string or a boolean, got a value of type float64"},
-		"channel":          {make(chan int), "api_endpoint_discovery: expected a string or a boolean, got a value of type chan int"},
-		"a decoded float":  {float64(5), "api_endpoint_discovery: expected a string or a boolean, got 5"},
-		"raw text":         {json.RawMessage(" 5.0\n"), "api_endpoint_discovery: expected a string or a boolean, got 5.0"},
+		"NaN": {
+			math.NaN(),
+			"api_endpoint_discovery: expected a string or a boolean, got a value of type float64",
+		},
+		"infinity": {
+			math.Inf(1),
+			"api_endpoint_discovery: expected a string or a boolean, got a value of type float64",
+		},
+		"channel": {
+			make(chan int),
+			"api_endpoint_discovery: expected a string or a boolean, got a value of type chan int",
+		},
+		"a decoded float": {float64(5), "api_endpoint_discovery: expected a string or a boolean, got 5"},
+		"raw text": {
+			json.RawMessage(" 5.0\n"),
+			"api_endpoint_discovery: expected a string or a boolean, got 5.0",
+		},
 		"a json.Number":    {json.Number("1e3"), "api_endpoint_discovery: expected a string or a boolean, got 1e3"},
 		"an escaped value": {[]any{"<&>"}, `api_endpoint_discovery: expected a string or a boolean, got ["<&>"]`},
 	} {

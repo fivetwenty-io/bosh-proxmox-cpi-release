@@ -106,7 +106,9 @@ func (d *discCluster) setNodes(local string, names []string, offline ...string) 
 	for _, name := range names {
 		d.nodeRows = append(d.nodeRows, d.nodeRow(name, true))
 		d.statusRows = append(d.statusRows, jsonRow(d.t, map[string]any{
-			"type": "node", "name": name, "local": boolInt(name == local), "online": boolInt(!slices.Contains(offline, name)),
+			"type": "node", "name": name, "local": boolInt(
+				name == local,
+			), "online": boolInt(!slices.Contains(offline, name)),
 		}))
 	}
 }
@@ -148,7 +150,10 @@ func (d *discCluster) client() *discClient {
 				rows := sdknodes.ListNodesResponse(slices.Clone(d.nodeRows))
 				return &rows, nil
 			},
-			listCertificatesInfoFn: func(ctx context.Context, node string) (*sdknodes.ListCertificatesInfoResponse, error) {
+			listCertificatesInfoFn: func(
+				ctx context.Context,
+				node string,
+			) (*sdknodes.ListCertificatesInfoResponse, error) {
 				d.mu.Lock()
 				d.certCalls = append(d.certCalls, node)
 				d.inflight++
@@ -429,7 +434,9 @@ func TestReadDiscovery_StandaloneStatusHasNoClusterRow(t *testing.T) {
 	t.Parallel()
 	d := newDiscCluster(t)
 	d.nodeRows = d.nodeRows[:1]
-	d.statusRows = []json.RawMessage{jsonRow(t, map[string]any{"type": "node", "name": "pve1", "online": 1, "local": 1})}
+	d.statusRows = []json.RawMessage{
+		jsonRow(t, map[string]any{"type": "node", "name": "pve1", "online": 1, "local": 1}),
+	}
 	reads, err := ReadDiscovery(lgCtx(), d.client())
 	if err != nil {
 		t.Fatalf("ReadDiscovery: %v", err)
@@ -668,7 +675,8 @@ func TestReadDiscovery_CertificateReadsFollowTheNodesStatusWithoutAStatus(t *tes
 	// of the 64, so 63 more reads reach n011 through n069 and then n000
 	// through n003.
 	got := d.certReads()
-	if len(got) != 64 || slices.Contains(got, "n004") || !slices.Contains(got, "n010") || !slices.Contains(got, "n003") {
+	if len(got) != 64 || slices.Contains(got, "n004") || !slices.Contains(got, "n010") ||
+		!slices.Contains(got, "n003") {
 		t.Fatalf("reads = %v, want 64 with the online nodes first", got)
 	}
 }
@@ -700,7 +708,10 @@ func TestReadDiscovery_CancellationDuringCertificateReads(t *testing.T) {
 	client := d.client()
 	inner := client.nodes.listCertificatesInfoFn
 	var calls int
-	client.nodes.listCertificatesInfoFn = func(c context.Context, node string) (*sdknodes.ListCertificatesInfoResponse, error) {
+	client.nodes.listCertificatesInfoFn = func(
+		c context.Context,
+		node string,
+	) (*sdknodes.ListCertificatesInfoResponse, error) {
 		d.mu.Lock()
 		calls++
 		first := calls == 1
@@ -738,14 +749,20 @@ func TestNodeCertificatePins(t *testing.T) {
 			want: []endpointpool.Pin{derived},
 		},
 		"pem and fingerprint agree": {
-			rows: []json.RawMessage{row(map[string]any{"filename": "pve-ssl.pem", "pem": pemText, "fingerprint": fingerprint})},
+			rows: []json.RawMessage{
+				row(map[string]any{"filename": "pve-ssl.pem", "pem": pemText, "fingerprint": fingerprint}),
+			},
 			want: []endpointpool.Pin{derived},
 		},
 		"pem and fingerprint disagree": {
-			rows: []json.RawMessage{row(map[string]any{"filename": "pve-ssl.pem", "pem": pemText, "fingerprint": otherFP})},
+			rows: []json.RawMessage{
+				row(map[string]any{"filename": "pve-ssl.pem", "pem": pemText, "fingerprint": otherFP}),
+			},
 		},
 		"malformed fingerprint with a good pem": {
-			rows: []json.RawMessage{row(map[string]any{"filename": "pve-ssl.pem", "pem": pemText, "fingerprint": "AA:BB"})},
+			rows: []json.RawMessage{
+				row(map[string]any{"filename": "pve-ssl.pem", "pem": pemText, "fingerprint": "AA:BB"}),
+			},
 		},
 		"a repeat is kept once": {
 			rows: []json.RawMessage{
@@ -805,7 +822,8 @@ func TestReadClusterRootDigest(t *testing.T) {
 	d.certFailure["pve2"] = errors.New("reset")
 	d.certFailure["pve3"] = errors.New("reset")
 	_, err = ReadClusterRootDigest(lgCtx(), d.client(), "pve2")
-	if err == nil || !strings.Contains(err.Error(), "ReadClusterRootDigest") || strings.Contains(err.Error(), "ReadClusterStamp") {
+	if err == nil || !strings.Contains(err.Error(), "ReadClusterRootDigest") ||
+		strings.Contains(err.Error(), "ReadClusterStamp") {
 		t.Fatalf("err = %v, want a failure that names ReadClusterRootDigest", err)
 	}
 	if _, err = ReadClusterRootDigest(lgCtx(), nil, "pve2"); err == nil {

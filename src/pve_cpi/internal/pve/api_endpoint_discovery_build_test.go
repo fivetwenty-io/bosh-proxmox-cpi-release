@@ -146,7 +146,12 @@ func TestBuildDiscoveryResult_PublicSuffixSeedGetsNoNodes(t *testing.T) {
 		// only the seeds whose domain or derived hosts are suffixes fail.
 		wantSuffix := seed != "pve1.example.co.uk"
 		if wantSuffix && (result.Outcome != DiscoveryPublicSuffix || len(result.Nodes) != 0) {
-			t.Fatalf("seed %s: outcome %q with %d nodes, want public_suffix and none", seed, result.Outcome, len(result.Nodes))
+			t.Fatalf(
+				"seed %s: outcome %q with %d nodes, want public_suffix and none",
+				seed,
+				result.Outcome,
+				len(result.Nodes),
+			)
 		}
 		if !wantSuffix && result.Outcome != DiscoveryOK {
 			t.Fatalf("seed %s: outcome %q, want ok", seed, result.Outcome)
@@ -302,7 +307,11 @@ func TestBuildDiscoveryResult_OnlineFlagIsTheFlagTheOrderUsed(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			reads := DiscoveryReads{Nodes: nodes, Status: tc.status, RootCA: discRoot}
-			result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve1.dc1.example.com:8006", acceptAll))
+			result, err := BuildDiscoveryResult(
+				context.Background(),
+				reads,
+				discInput("pve1.dc1.example.com:8006", acceptAll),
+			)
 			if err != nil {
 				t.Fatalf("BuildDiscoveryResult: %v", err)
 			}
@@ -360,7 +369,13 @@ func TestBuildDiscoveryResult_LoneNodeWithoutStatusIsTheSeedsNode(t *testing.T) 
 	for _, seed := range []string{"192.0.2.10:8006", "other.example.com:8006", "pve1.dc1.example.com:8006"} {
 		result, err := BuildDiscoveryResult(context.Background(), reads, discInput(seed, acceptAll))
 		if err != nil || result.Outcome != DiscoveryNoCandidates || len(result.Nodes) != 0 {
-			t.Fatalf("seed %s: outcome %q, %d nodes, err %v, want no_candidates", seed, result.Outcome, len(result.Nodes), err)
+			t.Fatalf(
+				"seed %s: outcome %q, %d nodes, err %v, want no_candidates",
+				seed,
+				result.Outcome,
+				len(result.Nodes),
+				err,
+			)
 		}
 		if seed != "pve1.dc1.example.com:8006" {
 			if got := droppedFor(result, "pve1"); got != DropSeedNode {
@@ -372,7 +387,12 @@ func TestBuildDiscoveryResult_LoneNodeWithoutStatusIsTheSeedsNode(t *testing.T) 
 	reads.Nodes = append(reads.Nodes, discNode("pve2", "online"))
 	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("192.0.2.10:8006", acceptAll))
 	if err != nil || result.Outcome != DiscoveryNoStatus || len(result.Nodes) != 2 {
-		t.Fatalf("two rows: outcome %q, %d nodes, err %v, want no_status with both", result.Outcome, len(result.Nodes), err)
+		t.Fatalf(
+			"two rows: outcome %q, %d nodes, err %v, want no_status with both",
+			result.Outcome,
+			len(result.Nodes),
+			err,
+		)
 	}
 }
 
@@ -434,7 +454,11 @@ func TestBuildDiscoveryResult_NoResultFailures(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			result, err := BuildDiscoveryResult(context.Background(), tc.reads(), discInput("pve1.dc1.example.com:8006", tc.resolver))
+			result, err := BuildDiscoveryResult(
+				context.Background(),
+				tc.reads(),
+				discInput("pve1.dc1.example.com:8006", tc.resolver),
+			)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("err = %v, want %v", err, tc.want)
 			}
@@ -523,7 +547,10 @@ func TestBuildDiscoveryResult_ResolverFailuresLeaveNamesOut(t *testing.T) {
 	t.Parallel()
 	reads := DiscoveryReads{
 		Nodes: []DiscoveryNodeRead{
-			discNode("pve1", "online"), discNode("pve2", "online"), discNode("pve3", "online"), discNode("pve4", "online"),
+			discNode(
+				"pve1",
+				"online",
+			), discNode("pve2", "online"), discNode("pve3", "online"), discNode("pve4", "online"),
 		},
 		Status: quorateStatus("pve1", "pve1", "pve2", "pve3", "pve4"),
 		RootCA: discRoot,
@@ -787,7 +814,11 @@ func TestBuildDiscoveryResult_CapsTheListAtSixtyFourNodes(t *testing.T) {
 		names = append(names, name)
 	}
 	reads := DiscoveryReads{Nodes: rows, Status: quorateStatus("pve000", names...), RootCA: discRoot}
-	result, err := BuildDiscoveryResult(context.Background(), reads, discInput("pve000.dc1.example.com:8006", acceptAll))
+	result, err := BuildDiscoveryResult(
+		context.Background(),
+		reads,
+		discInput("pve000.dc1.example.com:8006", acceptAll),
+	)
 	if err != nil {
 		t.Fatalf("BuildDiscoveryResult: %v", err)
 	}

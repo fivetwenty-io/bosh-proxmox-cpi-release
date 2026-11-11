@@ -160,7 +160,12 @@ func raceSecret(t *testing.T, rounds int, prepare func(dir string)) []map[string
 		if got, want := storeDirNames(t, dirs[round]), []string{secretFile, secretLockFile}; !slices.Equal(got, want) {
 			t.Errorf("round %d: directory holds %v, want %v", round, got, want)
 		}
-		secret, again, err := endpointTexts.loadSecret(context.Background(), openStoreRoot(t, dirs[round]), time.Second, secretOps)
+		secret, again, err := endpointTexts.loadSecret(
+			context.Background(),
+			openStoreRoot(t, dirs[round]),
+			time.Second,
+			secretOps,
+		)
 		if err != nil || again != secretRead {
 			t.Fatalf("round %d: reload outcome %v, err %v", round, again, err)
 		}
@@ -259,8 +264,15 @@ func TestUnsafeSecretIsRefusedAndKept(t *testing.T) {
 			want:  privatefile.ErrUnsafeMode,
 		},
 		"group readable and short": {
-			setup: func(t *testing.T, dir string) { writeStoreFile(t, filepath.Join(dir, secretFile), good[:5], 0o640) },
-			want:  privatefile.ErrUnsafeMode,
+			setup: func(t *testing.T, dir string) {
+				writeStoreFile(
+					t,
+					filepath.Join(dir, secretFile),
+					good[:5],
+					0o640,
+				)
+			},
+			want: privatefile.ErrUnsafeMode,
 		},
 		"symlink to a valid secret": {
 			setup: func(t *testing.T, dir string) {
@@ -343,7 +355,13 @@ func TestUnsafeSecretIsRefusedAndKept(t *testing.T) {
 // user can meet in "/".
 func TestSecretWithAnotherOwnerIsRefused(t *testing.T) {
 	if os.Geteuid() != 0 {
-		_, err := OpenStore(context.Background(), openSystemRoot(t), storeTestConfig(), storeTestCredential, StoreOptions{})
+		_, err := OpenStore(
+			context.Background(),
+			openSystemRoot(t),
+			storeTestConfig(),
+			storeTestCredential,
+			StoreOptions{},
+		)
 		if !errors.Is(err, privatefile.ErrUnsafeOwnership) || !errors.Is(err, errCacheOwnership) {
 			t.Fatalf("OpenStore on a directory another user owns: %v, want the ownership refusal", err)
 		}
@@ -356,7 +374,8 @@ func TestSecretWithAnotherOwnerIsRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := openStoreOn(t, dir, storeTestCredential, StoreOptions{})
-	if !errors.Is(err, privatefile.ErrUnsafeOwnership) || !strings.Contains(err.Error(), filepath.Join(dir, secretFile)) {
+	if !errors.Is(err, privatefile.ErrUnsafeOwnership) ||
+		!strings.Contains(err.Error(), filepath.Join(dir, secretFile)) {
 		t.Fatalf("OpenStore: %v, want the ownership refusal naming the secret", err)
 	}
 	if !bytes.Equal(readStoreFile(t, filepath.Join(dir, secretFile)), good) {
@@ -367,7 +386,12 @@ func TestSecretWithAnotherOwnerIsRefused(t *testing.T) {
 	if err := os.Lchown(filepath.Join(dir, secretFile), 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openStoreOn(t, dir, storeTestCredential, StoreOptions{}); !errors.Is(err, privatefile.ErrUnsafeOwnership) {
+	if _, err := openStoreOn(
+		t,
+		dir,
+		storeTestCredential,
+		StoreOptions{},
+	); !errors.Is(err, privatefile.ErrUnsafeOwnership) {
 		t.Fatalf("OpenStore on a short secret with another owner: %v, want the ownership refusal", err)
 	}
 	if !bytes.Equal(readStoreFile(t, filepath.Join(dir, secretFile)), good[:7]) {
@@ -396,7 +420,12 @@ func TestSecretLockHeldByAnotherProcess(t *testing.T) {
 		t.Fatalf("child said %q, want locked", got)
 	}
 	root := openStoreRoot(t, dir)
-	if _, _, err := endpointTexts.loadSecret(context.Background(), root, 100*time.Millisecond, secretOps); !errors.Is(err, ErrSecretBusy) {
+	if _, _, err := endpointTexts.loadSecret(
+		context.Background(),
+		root,
+		100*time.Millisecond,
+		secretOps,
+	); !errors.Is(err, ErrSecretBusy) {
 		t.Fatalf("loadSecret under a held lock: %v, want ErrSecretBusy", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -411,14 +440,24 @@ func TestSecretLockHeldByAnotherProcess(t *testing.T) {
 	// A short secret waits for the same lock before it is replaced.
 	short := []byte("short")
 	writeStoreFile(t, filepath.Join(dir, secretFile), short, 0o600)
-	if _, _, err := endpointTexts.loadSecret(context.Background(), root, 100*time.Millisecond, secretOps); !errors.Is(err, ErrSecretBusy) {
+	if _, _, err := endpointTexts.loadSecret(
+		context.Background(),
+		root,
+		100*time.Millisecond,
+		secretOps,
+	); !errors.Is(err, ErrSecretBusy) {
 		t.Fatalf("loadSecret of a short secret under a held lock: %v, want ErrSecretBusy", err)
 	}
 	if !bytes.Equal(readStoreFile(t, filepath.Join(dir, secretFile)), short) {
 		t.Error("the short secret was replaced without the lock")
 	}
 	holder.finish(t)
-	if _, outcome, err := endpointTexts.loadSecret(context.Background(), root, time.Second, secretOps); err != nil || outcome != secretReplaced {
+	if _, outcome, err := endpointTexts.loadSecret(
+		context.Background(),
+		root,
+		time.Second,
+		secretOps,
+	); err != nil || outcome != secretReplaced {
 		t.Fatalf("loadSecret after release: outcome %v, err %v", outcome, err)
 	}
 }

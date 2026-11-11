@@ -72,7 +72,8 @@ func TestKeyedEnvelopeRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(raw, &fields); err != nil || len(fields) != 3 {
 		t.Fatalf("file fields = %v, %v; want version, hmac_sha256, payload", fields, err)
 	}
-	if !strings.HasPrefix(string(raw), `{"version":7,"hmac_sha256":"`) || !strings.HasSuffix(string(raw), `,"payload":{"name":"pve1","count":3}}`) {
+	if !strings.HasPrefix(string(raw), `{"version":7,"hmac_sha256":"`) ||
+		!strings.HasSuffix(string(raw), `,"payload":{"name":"pve1","count":3}}`) {
 		t.Fatalf("file = %s; want fields in version, hmac_sha256, payload order", raw)
 	}
 	env, err := p.ReadEnvelope(root, "entry.json")
@@ -119,16 +120,27 @@ func TestKeyedEnvelopeRejectsWrongKeyVersionAndTamper(t *testing.T) {
 		t.Fatalf("tampered payload = %v; want ErrCorrupt", err)
 	}
 	// A plain-checksum reader refuses the keyed key name as an unknown field.
-	if _, err := plain.ReadEnvelope(root, "entry.json"); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "malformed envelope") {
+	if _, err := plain.ReadEnvelope(
+		root,
+		"entry.json",
+	); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "malformed envelope") {
 		t.Fatalf("plain reader on keyed file = %v; want malformed envelope", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "unknown.json"), []byte(`{"version":1,"hmac_sha256":"","payload":{},"extra":1}`), 0o600); err != nil {
+	if err := os.WriteFile(
+		filepath.Join(dir, "unknown.json"),
+		[]byte(`{"version":1,"hmac_sha256":"","payload":{},"extra":1}`),
+		0o600,
+	); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := p.ReadEnvelope(root, "unknown.json"); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("unknown field = %v; want ErrCorrupt", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "trailing.json"), []byte(`{"version":1,"hmac_sha256":"","payload":{}} {}`), 0o600); err != nil {
+	if err := os.WriteFile(
+		filepath.Join(dir, "trailing.json"),
+		[]byte(`{"version":1,"hmac_sha256":"","payload":{}} {}`),
+		0o600,
+	); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := p.ReadEnvelope(root, "trailing.json"); !errors.Is(err, ErrCorrupt) {
@@ -137,8 +149,16 @@ func TestKeyedEnvelopeRejectsWrongKeyVersionAndTamper(t *testing.T) {
 	var out2 struct {
 		Name string `json:"name"`
 	}
-	good := Envelope{Version: 1, Integrity: p.Integrity([]byte(`{"name":"a","extra":1}`)), Payload: json.RawMessage(`{"name":"a","extra":1}`)}
-	if err := p.DecodeEnvelope(good, 1, &out2); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "malformed payload") {
+	good := Envelope{
+		Version:   1,
+		Integrity: p.Integrity([]byte(`{"name":"a","extra":1}`)),
+		Payload:   json.RawMessage(`{"name":"a","extra":1}`),
+	}
+	if err := p.DecodeEnvelope(
+		good,
+		1,
+		&out2,
+	); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "malformed payload") {
 		t.Fatalf("payload with an unknown field = %v; want malformed payload", err)
 	}
 }
@@ -163,7 +183,10 @@ func TestSizeParameterBoundsReadAndWrite(t *testing.T) {
 	if err := large.WriteEnvelope(root, "big.json", 1, big, NoSyncOps()); err != nil {
 		t.Fatalf("a record under the larger limit: %v", err)
 	}
-	if _, err := small.ReadEnvelope(root, "big.json"); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "oversized file") {
+	if _, err := small.ReadEnvelope(
+		root,
+		"big.json",
+	); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "oversized file") {
 		t.Fatalf("oversized read = %v; want ErrCorrupt oversized file", err)
 	}
 	if _, err := large.ReadEnvelope(root, "big.json"); err != nil {
@@ -238,7 +261,12 @@ func TestDurabilityFlagControlsSyncs(t *testing.T) {
 			t.Fatalf("durable=%v: %v", durable, err)
 		}
 		if fileSyncs != 1 || dirSyncs != 1 {
-			t.Errorf("durable=%v: the write called %d file syncs and %d directory syncs; want one each", durable, fileSyncs, dirSyncs)
+			t.Errorf(
+				"durable=%v: the write called %d file syncs and %d directory syncs; want one each",
+				durable,
+				fileSyncs,
+				dirSyncs,
+			)
 		}
 	}
 }
@@ -317,7 +345,8 @@ func TestPrivateChecksAndWording(t *testing.T) {
 	custom.Label = "cache"
 	custom.Mode = Sentinel("cache: unsafe permissions", ErrUnsafeMode)
 	_, err = custom.Open(root, "f", os.O_RDONLY)
-	if !errors.Is(err, ErrUnsafeMode) || !errors.Is(err, custom.Mode) || !strings.HasPrefix(err.Error(), "cache: unsafe permissions: ") {
+	if !errors.Is(err, ErrUnsafeMode) || !errors.Is(err, custom.Mode) ||
+		!strings.HasPrefix(err.Error(), "cache: unsafe permissions: ") {
 		t.Fatalf("custom wording = %v; want the caller's text matching both causes", err)
 	}
 
@@ -327,7 +356,11 @@ func TestPrivateChecksAndWording(t *testing.T) {
 	if err := os.Link(path, filepath.Join(dir, "second")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := custom.Open(root, "f", os.O_RDONLY); err == nil || err.Error() != "cache: multiply linked file rejected" {
+	if _, err := custom.Open(
+		root,
+		"f",
+		os.O_RDONLY,
+	); err == nil || err.Error() != "cache: multiply linked file rejected" {
 		t.Fatalf("linked file = %v", err)
 	}
 	if err := os.Symlink(path, filepath.Join(dir, "link")); err != nil {
@@ -337,7 +370,11 @@ func TestPrivateChecksAndWording(t *testing.T) {
 		t.Fatalf("symlink = %v; want ErrUnsafeFileType", err)
 	}
 	for _, name := range []string{"", ".", "..", "a/b", "../x"} {
-		if _, err := custom.Open(root, name, os.O_RDONLY); err == nil || err.Error() != "cache: private file name must be a basename" {
+		if _, err := custom.Open(
+			root,
+			name,
+			os.O_RDONLY,
+		); err == nil || err.Error() != "cache: private file name must be a basename" {
 			t.Errorf("name %q = %v", name, err)
 		}
 	}
@@ -403,12 +440,42 @@ func TestPrivateInfoPrecedenceAndText(t *testing.T) {
 		cause     error
 		contains  string
 	}{
-		{"another owner", stubInfo{os.ModeDir | 0o700, &syscall.Stat_t{Uid: other, Nlink: 1}}, true, ErrUnsafeOwnership, "is owned by uid"},
+		{
+			"another owner",
+			stubInfo{os.ModeDir | 0o700, &syscall.Stat_t{Uid: other, Nlink: 1}},
+			true,
+			ErrUnsafeOwnership,
+			"is owned by uid",
+		},
 		{"no metadata", stubInfo{os.ModeDir | 0o700, nil}, true, ErrUnsafeOwnership, "has no ownership metadata"},
-		{"open directory", stubInfo{os.ModeDir | 0o750, &syscall.Stat_t{Uid: own, Nlink: 1}}, true, ErrUnsafeMode, "has mode 0750"},
-		{"file for directory", stubInfo{0o600, &syscall.Stat_t{Uid: own, Nlink: 1}}, true, ErrUnsafeFileType, "is not a directory"},
-		{"directory for file", stubInfo{os.ModeDir | 0o700, &syscall.Stat_t{Uid: own, Nlink: 1}}, false, ErrUnsafeFileType, "is not a regular file"},
-		{"owner outranks type", stubInfo{os.ModeSocket | 0o777, &syscall.Stat_t{Uid: other, Nlink: 1}}, false, ErrUnsafeOwnership, "is owned by uid"},
+		{
+			"open directory",
+			stubInfo{os.ModeDir | 0o750, &syscall.Stat_t{Uid: own, Nlink: 1}},
+			true,
+			ErrUnsafeMode,
+			"has mode 0750",
+		},
+		{
+			"file for directory",
+			stubInfo{0o600, &syscall.Stat_t{Uid: own, Nlink: 1}},
+			true,
+			ErrUnsafeFileType,
+			"is not a directory",
+		},
+		{
+			"directory for file",
+			stubInfo{os.ModeDir | 0o700, &syscall.Stat_t{Uid: own, Nlink: 1}},
+			false,
+			ErrUnsafeFileType,
+			"is not a regular file",
+		},
+		{
+			"owner outranks type",
+			stubInfo{os.ModeSocket | 0o777, &syscall.Stat_t{Uid: other, Nlink: 1}},
+			false,
+			ErrUnsafeOwnership,
+			"is owned by uid",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -440,7 +507,12 @@ func TestOpenWithUsesTheSuppliedOpenat(t *testing.T) {
 		t.Fatalf("OpenWith = %v after %d calls", err, calls)
 	}
 	_ = f.Close()
-	if _, err := p.OpenWith(root, "r.json", os.O_RDONLY, func(int, string, int) (int, error) { return -1, syscall.EIO }); !errors.Is(err, syscall.EIO) {
+	if _, err := p.OpenWith(
+		root,
+		"r.json",
+		os.O_RDONLY,
+		func(int, string, int) (int, error) { return -1, syscall.EIO },
+	); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("openat failure = %v; want EIO", err)
 	}
 }
@@ -544,7 +616,9 @@ func TestOpenReturnsABlockingFile(t *testing.T) {
 	}
 	var flags int
 	var flagErr error
-	if err := raw.Control(func(fd uintptr) { flags, flagErr = unix.FcntlInt(fd, unix.F_GETFL, 0) }); err != nil || flagErr != nil {
+	if err := raw.Control(
+		func(fd uintptr) { flags, flagErr = unix.FcntlInt(fd, unix.F_GETFL, 0) },
+	); err != nil || flagErr != nil {
 		t.Fatalf("F_GETFL: %v, %v", err, flagErr)
 	}
 	if flags&unix.O_NONBLOCK != 0 {
@@ -708,13 +782,23 @@ func TestWriteFileAndReadFileRoundTripRawBytes(t *testing.T) {
 func TestWriteFileRefusals(t *testing.T) {
 	p := Policy{MaxBytes: 8}
 	root, dir := privateRoot(t, p)
-	if err := p.WriteFile(root, "big", []byte("123456789"), NoSyncOps()); err == nil || err.Error() != "private file: record exceeds size limit" {
+	if err := p.WriteFile(
+		root,
+		"big",
+		[]byte("123456789"),
+		NoSyncOps(),
+	); err == nil || err.Error() != "private file: record exceeds size limit" {
 		t.Fatalf("oversized WriteFile = %v; want the size error", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "big")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("oversized WriteFile left a file: %v", err)
 	}
-	if err := (Policy{}).WriteFile(root, "x", []byte("a"), NoSyncOps()); err == nil || !strings.Contains(err.Error(), "size limit not set") {
+	if err := (Policy{}).WriteFile(
+		root,
+		"x",
+		[]byte("a"),
+		NoSyncOps(),
+	); err == nil || !strings.Contains(err.Error(), "size limit not set") {
 		t.Fatalf("WriteFile with no size limit = %v", err)
 	}
 	if err := p.WriteFile(root, "../x", []byte("a"), NoSyncOps()); err == nil {
@@ -759,7 +843,11 @@ func TestReadFileRefusals(t *testing.T) {
 	if got, err := p.ReadFile(root, "s", 10); err != nil || string(got) != "0123456789" {
 		t.Fatalf("ReadFile at exactly the limit = %q, %v", got, err)
 	}
-	if _, err := p.ReadFile(root, "s", 9); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "oversized file") {
+	if _, err := p.ReadFile(
+		root,
+		"s",
+		9,
+	); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "oversized file") {
 		t.Fatalf("ReadFile over the limit = %v; want ErrCorrupt oversized file", err)
 	}
 	if _, err := p.ReadFile(root, "s", 0); err == nil || !strings.Contains(err.Error(), "size limit not set") {
@@ -788,7 +876,12 @@ func TestPrivateInfoJoinsAPlainCauseWithTheBase(t *testing.T) {
 	}{
 		{"ownership", stubInfo{0o600, &syscall.Stat_t{Uid: own + 1, Nlink: 1}}, ErrUnsafeOwnership, "is owned by uid"},
 		{"mode", stubInfo{0o640, &syscall.Stat_t{Uid: own, Nlink: 1}}, ErrUnsafeMode, "has mode 0640"},
-		{"file type", stubInfo{os.ModeDir | 0o700, &syscall.Stat_t{Uid: own, Nlink: 1}}, ErrUnsafeFileType, "is not a regular file"},
+		{
+			"file type",
+			stubInfo{os.ModeDir | 0o700, &syscall.Stat_t{Uid: own, Nlink: 1}},
+			ErrUnsafeFileType,
+			"is not a regular file",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -820,7 +913,10 @@ func TestReadRetriesAReplacedFileThenReturnsChanged(t *testing.T) {
 		changed error
 	}{
 		"default cause": {plainPolicy(1 << 10), ErrChanged},
-		"policy cause":  {Policy{MaxBytes: 1 << 10, IntegrityKey: "sha256", Integrity: SHA256Hex, Changed: changedErr}, changedErr},
+		"policy cause": {
+			Policy{MaxBytes: 1 << 10, IntegrityKey: "sha256", Integrity: SHA256Hex, Changed: changedErr},
+			changedErr,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			p := tc.policy
@@ -864,7 +960,12 @@ func TestReadRetriesAReplacedFileThenReturnsChanged(t *testing.T) {
 			opens, replaceFor = 0, 1
 			env, err := p.ReadEnvelope(root, "r.json")
 			if err != nil || env.Version != 1 || opens != 2 {
-				t.Fatalf("ReadEnvelope after one loss = %+v, %v after %d opens; want success on the second", env, err, opens)
+				t.Fatalf(
+					"ReadEnvelope after one loss = %+v, %v after %d opens; want success on the second",
+					env,
+					err,
+					opens,
+				)
 			}
 		})
 	}

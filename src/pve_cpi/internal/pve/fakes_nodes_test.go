@@ -189,7 +189,10 @@ func (f *fakeNodesService) ListNodes(ctx context.Context) (*nodes.ListNodesRespo
 
 // ListCertificatesInfo delegates to listCertificatesInfoFn, and panics when a
 // test has not wired it, like the other unscripted methods.
-func (f *fakeNodesService) ListCertificatesInfo(ctx context.Context, node string) (*nodes.ListCertificatesInfoResponse, error) {
+func (f *fakeNodesService) ListCertificatesInfo(
+	ctx context.Context,
+	node string,
+) (*nodes.ListCertificatesInfoResponse, error) {
 	if f.listCertificatesInfoFn != nil {
 		return f.listCertificatesInfoFn(ctx, node)
 	}

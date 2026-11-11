@@ -489,7 +489,11 @@ func TestNoMarkForFailuresOutsideTheConnectPhase(t *testing.T) {
 			for _, addr := range addrs {
 				l.d.set(addr, func(context.Context, string, string) (net.Conn, error) {
 					cancels[addr]()
-					return nil, &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+					return nil, &net.OpError{
+						Op:  "dial",
+						Net: "tcp",
+						Err: os.NewSyscallError("connect", syscall.ECONNREFUSED),
+					}
 				})
 			}
 			p := l.poolWith(t, sink, nil, nil, configured(addrs[0]), configured(addrs[1]),
@@ -727,7 +731,10 @@ func TestTetherToAnIneligibleEndpointIsRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.fix(h, dep.addr)
-	if _, ok := p.makeIneligible(dep, &ConnectPhaseError{Phase: PhasePin, Endpoint: dep.addr, Err: ErrPinMismatch}); !ok {
+	if _, ok := p.makeIneligible(
+		dep,
+		&ConnectPhaseError{Phase: PhasePin, Endpoint: dep.addr, Err: ErrPinMismatch},
+	); !ok {
 		t.Fatal("the endpoint should become ineligible")
 	}
 	if _, ok := p.makeIneligible(dep, nil); ok {

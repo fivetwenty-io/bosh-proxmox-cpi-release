@@ -623,7 +623,9 @@ func TestDeletionDestinationsCountsAVerifiedReplica(t *testing.T) {
 	}
 	widened := deadNodePin(true, map[string]int{"a": 0, "b": 0})
 	widened.Comment = "owner=us bosh-vols=local-zfs bosh-replica=b"
-	got, err := DeletionDestinations(context.Background(), "a", deadNodeMembers, deadNodeRules(widened), "vm:101", "bosh-na-101",
+	got, err := DeletionDestinations(context.Background(), "a", deadNodeMembers, deadNodeRules(
+		widened,
+	), "vm:101", "bosh-na-101",
 		ownedByUs, placeableExcept("a"), idx)
 	if err != nil {
 		t.Fatal(err)
@@ -633,7 +635,9 @@ func TestDeletionDestinationsCountsAVerifiedReplica(t *testing.T) {
 	}
 	configured := deadNodePin(true, map[string]int{"a": 0})
 	configured.Comment = "owner=us bosh-vols=local-zfs"
-	got, err = DeletionDestinations(context.Background(), "a", deadNodeMembers, deadNodeRules(configured), "vm:101", "bosh-na-101",
+	got, err = DeletionDestinations(context.Background(), "a", deadNodeMembers, deadNodeRules(
+		configured,
+	), "vm:101", "bosh-na-101",
 		ownedByUs, placeableExcept("a"), idx)
 	if err != nil || !got.PinnedToSource() || got.Replica != "" {
 		t.Fatalf("got %+v, %v; want the source alone before the first sync", got, err)
@@ -642,7 +646,9 @@ func TestDeletionDestinationsCountsAVerifiedReplica(t *testing.T) {
 	// CRM could recover from.
 	stray := deadNodePin(true, map[string]int{"a": 0})
 	stray.Comment = "owner=us bosh-vols=local-zfs bosh-replica=c"
-	got, err = DeletionDestinations(context.Background(), "a", deadNodeMembers, deadNodeRules(stray), "vm:101", "bosh-na-101",
+	got, err = DeletionDestinations(context.Background(), "a", deadNodeMembers, deadNodeRules(
+		stray,
+	), "vm:101", "bosh-na-101",
 		ownedByUs, placeableExcept("a"), idx)
 	if err != nil || !got.PinnedToSource() {
 		t.Fatalf("got %+v, %v; want the source alone", got, err)
@@ -650,7 +656,9 @@ func TestDeletionDestinationsCountsAVerifiedReplica(t *testing.T) {
 	// A token that names the dead node itself counts no replica.
 	self := deadNodePin(true, map[string]int{"a": 0, "b": 0})
 	self.Comment = "owner=us bosh-vols=local-zfs bosh-replica=a"
-	got, err = DeletionDestinations(context.Background(), "a", deadNodeMembers, deadNodeRules(self), "vm:101", "bosh-na-101",
+	got, err = DeletionDestinations(context.Background(), "a", deadNodeMembers, deadNodeRules(
+		self,
+	), "vm:101", "bosh-na-101",
 		ownedByUs, placeableExcept("a"), idx)
 	if err != nil || !got.PinnedToSource() || got.Replica != "" {
 		t.Fatalf("got %+v, %v; want the source alone for a token naming the dead node", got, err)
@@ -665,7 +673,9 @@ func TestDeletionDestinationsCountsAVerifiedReplica(t *testing.T) {
 	}
 	lvm := deadNodePin(true, map[string]int{"a": 0, "b": 0})
 	lvm.Comment = "owner=us bosh-vols=local-lvm,local-zfs bosh-replica=b"
-	got, err = DeletionDestinations(context.Background(), "a", deadNodeMembers, deadNodeRules(lvm), "vm:101", "bosh-na-101",
+	got, err = DeletionDestinations(context.Background(), "a", deadNodeMembers, deadNodeRules(
+		lvm,
+	), "vm:101", "bosh-na-101",
 		ownedByUs, placeableExcept("a"), mixed)
 	if err != nil || !got.PinnedToSource() || got.Replica != "" {
 		t.Fatalf("got %+v, %v; want the source alone with a non-ZFS node-local storage recorded", got, err)

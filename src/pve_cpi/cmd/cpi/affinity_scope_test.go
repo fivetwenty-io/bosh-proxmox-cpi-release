@@ -113,7 +113,8 @@ func TestStemcellRefsAdoptApplyKeepsOneAffinityScope(t *testing.T) {
 	rec := &scopeRecorder{}
 	client.onCall = rec.observe
 	code, stdout, stderr := runStemcellRefsTest(t, client, "adopt-owners", "--config", cfgPath,
-		"--director-uuid", cliLiveUUID, "--director-name", "bosh", "--deployment", "cf", "--deployment", "redis", "--apply")
+		"--director-uuid", cliLiveUUID, "--director-name", "bosh",
+		"--deployment", "cf", "--deployment", "redis", "--apply")
 	if code != 0 || client.writes == 0 {
 		t.Fatalf("exit %d writes %d stdout %q stderr %q", code, client.writes, stdout, stderr)
 	}
@@ -175,11 +176,21 @@ func TestStemcellRefsPruneApplyKeepsOneAffinityScope(t *testing.T) {
 	client := &refsCLIClient{pools: &refsCLIPools{}, guests: []refsCLIGuest{
 		{vmid: 101, name: "bosh-stemcell-a-1-aaaa1111", template: true,
 			tags: "bosh-stemcell-cache;bosh-stemcell-sha-aaaa1111;director--old-uuid;director--new-uuid",
-			desc: `{"name":"a","version":"1","sha8":"aaaa1111","kind":"heavy","director_refs":["old-uuid","new-uuid"]}`},
+			desc: `{"name":"a","version":"1","sha8":"aaaa1111","kind":"heavy",` +
+				`"director_refs":["old-uuid","new-uuid"]}`},
 	}}
 	rec := &scopeRecorder{}
 	client.onCall = rec.observe
-	code, stdout, stderr := runStemcellRefsTest(t, client, "prune", "--config", cfgPath, "--director", "old-uuid", "--apply")
+	code, stdout, stderr := runStemcellRefsTest(
+		t,
+		client,
+		"prune",
+		"--config",
+		cfgPath,
+		"--director",
+		"old-uuid",
+		"--apply",
+	)
 	if code != 0 || !strings.Contains(stdout, "applied") {
 		t.Fatalf("exit %d stdout %q stderr %q", code, stdout, stderr)
 	}

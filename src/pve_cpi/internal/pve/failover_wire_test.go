@@ -377,7 +377,8 @@ func TestTetherStatusReplaysStayOnTheSameServer(t *testing.T) {
 					if _, _, readErr := c.Pools().GetPoolComment(context.Background(), "p1"); readErr != nil {
 						t.Errorf("read after the status: %v", readErr)
 					}
-					if seenCount(a, http.MethodGet, "/pools/p1") != 1 || seenCount(b, http.MethodGet, "/pools/p1") != 0 {
+					if seenCount(a, http.MethodGet, "/pools/p1") != 1 ||
+						seenCount(b, http.MethodGet, "/pools/p1") != 0 {
 						t.Errorf("the read after the status went to A=%d B=%d, want A=1 B=0",
 							seenCount(a, http.MethodGet, "/pools/p1"), seenCount(b, http.MethodGet, "/pools/p1"))
 					}
@@ -408,7 +409,11 @@ func TestTetherStatusReplaysStayOnTheSameServer(t *testing.T) {
 				t.Fatalf("read after the replay: %v", readErr)
 			}
 			if got := seenCount(a, http.MethodGet, "/pools/p1"); got != aReads {
-				t.Errorf("A read %d GETs after the replay, want %d: the replay changed the active endpoint", got, aReads)
+				t.Errorf(
+					"A read %d GETs after the replay, want %d: the replay changed the active endpoint",
+					got,
+					aReads,
+				)
 			}
 			if got := seenCount(b, http.MethodGet, "/pools/p1"); got != 2 {
 				t.Errorf("B read %d GETs, want the concurrent read and the one after the replay", got)
@@ -555,7 +560,11 @@ func TestTetherFamiliesKeepRePlannedWritesOnOneServer(t *testing.T) {
 					return c.Cluster().DeleteHaRules(ctx, "r3")
 				}},
 				{"PUT /cluster/ha/resources/vm:100", func(ctx context.Context, c Client) error {
-					return c.Cluster().UpdateHaResources(ctx, "vm:100", &sdkcluster.UpdateHaResourcesParams{Comment: &comment})
+					return c.Cluster().UpdateHaResources(
+						ctx,
+						"vm:100",
+						&sdkcluster.UpdateHaResourcesParams{Comment: &comment},
+					)
 				}},
 				{"DELETE /cluster/ha/resources/vm:101", func(ctx context.Context, c Client) error {
 					return c.Cluster().DeleteHaResources(ctx, "vm:101", nil)
@@ -568,14 +577,22 @@ func TestTetherFamiliesKeepRePlannedWritesOnOneServer(t *testing.T) {
 		{
 			name: "replication",
 			first: familyStep{"PUT /cluster/replication/100-0", func(ctx context.Context, c Client) error {
-				return c.Cluster().UpdateReplication(ctx, "100-0", &sdkcluster.UpdateReplicationParams{Comment: &comment})
+				return c.Cluster().UpdateReplication(
+					ctx,
+					"100-0",
+					&sdkcluster.UpdateReplicationParams{Comment: &comment},
+				)
 			}},
 			follows: []familyStep{
 				{"DELETE /cluster/replication/100-0", func(ctx context.Context, c Client) error {
 					return c.Cluster().DeleteReplication(ctx, "100-0", nil)
 				}},
 				{"DELETE /cluster/replication/100-0 with force", func(ctx context.Context, c Client) error {
-					return c.Cluster().DeleteReplication(ctx, "100-0", &sdkcluster.DeleteReplicationParams{Force: &force})
+					return c.Cluster().DeleteReplication(
+						ctx,
+						"100-0",
+						&sdkcluster.DeleteReplicationParams{Force: &force},
+					)
 				}},
 				{"POST /cluster/replication", func(ctx context.Context, c Client) error {
 					return c.Cluster().CreateReplication(ctx,
@@ -600,7 +617,11 @@ func TestTetherFamiliesKeepRePlannedWritesOnOneServer(t *testing.T) {
 				}},
 			},
 			control: familyStep{"PUT /cluster/replication/100-0", func(ctx context.Context, c Client) error {
-				return c.Cluster().UpdateReplication(ctx, "100-0", &sdkcluster.UpdateReplicationParams{Comment: &comment})
+				return c.Cluster().UpdateReplication(
+					ctx,
+					"100-0",
+					&sdkcluster.UpdateReplicationParams{Comment: &comment},
+				)
 			}},
 		},
 	}

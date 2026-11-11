@@ -1766,7 +1766,10 @@ func TestIsTransientTransport_TetherConflictIsNotTransient(t *testing.T) {
 		{"wrapped twice", fmt.Errorf("create_vm: %w", refusal)},
 		{"in the SDK's url error after one attempt", sdkWrappedTetherConflict(1, refusal)},
 		{"in the SDK's url error after four attempts", sdkWrappedTetherConflict(4, refusal)},
-		{"in the SDK's url error around the bare sentinel", sdkWrappedTetherConflict(2, endpointpool.ErrTetherConflict)},
+		{
+			"in the SDK's url error around the bare sentinel",
+			sdkWrappedTetherConflict(2, endpointpool.ErrTetherConflict),
+		},
 		{"joined with a transient cause", errors.Join(refusal, io.EOF)},
 		{
 			"refusal text that carries a transient phrase",
@@ -1861,7 +1864,10 @@ func TestIsTransientTransport_EntryUnreachableUnwrapsToDialInAnyCauseOrder(t *te
 			t.Fatalf("order %v: errors.As found %v, want the synthesized dial *net.OpError", walk.Endpoints(), opErr)
 		}
 		if !pve.IsTransientTransport(shaped) {
-			t.Fatalf("order %v: IsTransientTransport = false, want true for a walk with a retryable hop", walk.Endpoints())
+			t.Fatalf(
+				"order %v: IsTransientTransport = false, want true for a walk with a retryable hop",
+				walk.Endpoints(),
+			)
 		}
 		var got *endpointpool.EntryUnreachableError
 		if !errors.As(shaped, &got) || len(got.Attempts) != len(order) {

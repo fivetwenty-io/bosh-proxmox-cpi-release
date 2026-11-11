@@ -82,11 +82,13 @@ func TestAssertNoFingerprintPinningWithRouting(t *testing.T) {
 func TestAssertNoFingerprintPinningWithFailoverMessage(t *testing.T) {
 	t.Parallel()
 	for name, opts := range map[string]sdkclient.Options{
-		"cached fingerprints":   {CachedFingerprints: map[string]bool{"aa:bb": true}},
-		"manual verification":   {ManualVerification: true},
-		"fingerprint callback":  {VerifyFingerprintCallback: func(*x509.Certificate) bool { return true }},
-		"manual verify handler": {ManualVerifyCallback: func(sdkclient.FingerprintVerificationRequest) bool { return true }},
-		"fingerprint cache":     {FingerprintCachePath: "/var/lib/pve-cpi/fingerprints.json"},
+		"cached fingerprints":  {CachedFingerprints: map[string]bool{"aa:bb": true}},
+		"manual verification":  {ManualVerification: true},
+		"fingerprint callback": {VerifyFingerprintCallback: func(*x509.Certificate) bool { return true }},
+		"manual verify handler": {
+			ManualVerifyCallback: func(sdkclient.FingerprintVerificationRequest) bool { return true },
+		},
+		"fingerprint cache": {FingerprintCachePath: "/var/lib/pve-cpi/fingerprints.json"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -141,11 +143,13 @@ func TestAssertNoFingerprintPinningRoutingMessageKeepsItsText(t *testing.T) {
 func TestAssertNoFingerprintPinningNamesBothCauses(t *testing.T) {
 	t.Parallel()
 	for name, opts := range map[string]sdkclient.Options{
-		"cached fingerprints":   {CachedFingerprints: map[string]bool{"aa:bb": true}},
-		"manual verification":   {ManualVerification: true},
-		"fingerprint callback":  {VerifyFingerprintCallback: func(*x509.Certificate) bool { return true }},
-		"manual verify handler": {ManualVerifyCallback: func(sdkclient.FingerprintVerificationRequest) bool { return true }},
-		"fingerprint cache":     {FingerprintCachePath: "/var/lib/pve-cpi/fingerprints.json"},
+		"cached fingerprints":  {CachedFingerprints: map[string]bool{"aa:bb": true}},
+		"manual verification":  {ManualVerification: true},
+		"fingerprint callback": {VerifyFingerprintCallback: func(*x509.Certificate) bool { return true }},
+		"manual verify handler": {
+			ManualVerifyCallback: func(sdkclient.FingerprintVerificationRequest) bool { return true },
+		},
+		"fingerprint cache": {FingerprintCachePath: "/var/lib/pve-cpi/fingerprints.json"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

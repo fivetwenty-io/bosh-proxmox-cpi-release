@@ -198,7 +198,11 @@ func TestEndpointCacheChild(t *testing.T) {
 }
 
 // secretOutcomeNames are the words the secret child prints for each outcome.
-var secretOutcomeNames = map[secretOutcome]string{secretRead: "read", secretCreated: "created", secretReplaced: "replaced"}
+var secretOutcomeNames = map[secretOutcome]string{
+	secretRead:     "read",
+	secretCreated:  "created",
+	secretReplaced: "replaced",
+}
 
 // child is a running child process.
 type storeChild struct {
@@ -211,7 +215,11 @@ type storeChild struct {
 // environment entries, and stops it when the test ends.
 func startStoreChild(t *testing.T, mode, dir string, extra ...string) *storeChild {
 	t.Helper()
-	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestEndpointCacheChild$") // #nosec G204 -- reruns this test binary
+	cmd := exec.CommandContext(
+		t.Context(),
+		os.Args[0],
+		"-test.run=^TestEndpointCacheChild$",
+	) // #nosec G204 -- reruns this test binary
 	cmd.Env = append(append(os.Environ(), storeChildEnv+"="+mode, storeChildDirEnv+"="+dir), extra...)
 	cmd.Stderr = os.Stderr
 	stdin, err := cmd.StdinPipe()

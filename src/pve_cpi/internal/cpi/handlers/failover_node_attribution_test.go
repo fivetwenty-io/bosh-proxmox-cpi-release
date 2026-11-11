@@ -175,6 +175,9 @@ func TestNodeAttributionA595ForTheEntrysOwnNodeStillHopsAGet(t *testing.T) {
 		t.Fatalf("ListStorageContent: %v", err)
 	}
 	if fwGets(b) != 1 {
-		t.Errorf("the second server read %d GETs, want the one hop that a 595 for the entry's own node causes", fwGets(b))
+		t.Errorf(
+			"the second server read %d GETs, want the one hop that a 595 for the entry's own node causes",
+			fwGets(b),
+		)
 	}
 }

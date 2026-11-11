@@ -82,10 +82,11 @@ func TestTheDoctorsProfileResolvesFromTheDoctorsInputs(t *testing.T) {
 
 	var got []ha.Deps
 	want := &ha.Profile{}
-	reader := &pveHAReader{client: client, cfg: cfg, resolveProfile: func(_ context.Context, deps ha.Deps) (*ha.Profile, error) {
+	resolve := func(_ context.Context, deps ha.Deps) (*ha.Profile, error) {
 		got = append(got, deps)
 		return want, nil
-	}}
+	}
+	reader := &pveHAReader{client: client, cfg: cfg, resolveProfile: resolve}
 	profile, err := reader.Profile(context.Background())
 	if err != nil || profile != want {
 		t.Fatalf("Profile = %v, %v, want the resolved profile", profile, err)

@@ -161,7 +161,11 @@ func TestSweepLeavesForeignFilesAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	sweepFile(t, dir, filepath.Join("old-0000000000000002.json", sweepTemp), year)
-	if err := os.Chtimes(filepath.Join(dir, "old-0000000000000002.json"), sweepNow.Add(-year), sweepNow.Add(-year)); err != nil {
+	if err := os.Chtimes(
+		filepath.Join(dir, "old-0000000000000002.json"),
+		sweepNow.Add(-year),
+		sweepNow.Add(-year),
+	); err != nil {
 		t.Fatal(err)
 	}
 	before := storeDirNames(t, dir)
@@ -326,7 +330,11 @@ func TestSweepWithAPrefixLeavesEveryOtherKindAlone(t *testing.T) {
 
 	result := endpointTexts.sweepWith(root, sweepNow, nil, ours, HAProfilePrefix)
 	if result.Err != nil || !sameNames(result.Removed, []string{prefixed, sweepTemp}) {
-		t.Errorf("a sweep limited to %s removed %+v, want the prefixed file and the temporary file", HAProfilePrefix, result)
+		t.Errorf(
+			"a sweep limited to %s removed %+v, want the prefixed file and the temporary file",
+			HAProfilePrefix,
+			result,
+		)
 	}
 	result = endpointTexts.sweepWith(root, sweepNow, nil, ours, "")
 	if result.Err != nil || !sameNames(result.Removed, []string{sweepKey}) {

@@ -28,7 +28,9 @@ func TestParseCPIConfig_DiscoveryModeRefusalEchoesTheRawText(t *testing.T) {
 				if jobErr == nil {
 					t.Fatalf("the job-level decoder accepted %s", raw)
 				}
-				entries, err := parseCPIConfig([]byte(`{"cpis":[{"name":"a","type":"pve","properties":` + properties + `}]}`))
+				entries, err := parseCPIConfig(
+					[]byte(`{"cpis":[{"name":"a","type":"pve","properties":` + properties + `}]}`),
+				)
 				if err != nil {
 					t.Fatalf("parseCPIConfig: %v", err)
 				}
@@ -72,7 +74,8 @@ func TestParseCPIConfig_OtherPropertiesDecodeAsBefore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseCPIConfig: %v", err)
 	}
-	if got, ok := entries[0].Properties["pve_api_endpoint_discovery"].(json.RawMessage); !ok || strings.TrimSpace(string(got)) != "5.0" {
+	if got, ok := entries[0].Properties["pve_api_endpoint_discovery"].(json.RawMessage); !ok ||
+		strings.TrimSpace(string(got)) != "5.0" {
 		t.Errorf("mode = %#v, want the raw text 5.0", entries[0].Properties["pve_api_endpoint_discovery"])
 	}
 

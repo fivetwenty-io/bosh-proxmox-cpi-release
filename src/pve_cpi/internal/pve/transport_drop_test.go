@@ -229,7 +229,11 @@ func TestMutationSplitsNeverSentFromMaybeSent(t *testing.T) {
 		{"a handshake reset hops", func(t *testing.T, _ *pvetest.CA, _ *pvetest.Leaf) *pvetest.Server {
 			return pvetest.NewReset(t)
 		}, true},
-		{"a drop after the request does not hop", func(t *testing.T, _ *pvetest.CA, leaf *pvetest.Leaf) *pvetest.Server {
+		{"a drop after the request does not hop", func(
+			t *testing.T,
+			_ *pvetest.CA,
+			leaf *pvetest.Leaf,
+		) *pvetest.Server {
 			return pvetest.NewBodyThenHijack(t, leaf)
 		}, false},
 	}

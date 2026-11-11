@@ -112,7 +112,13 @@ func TestPayloadOmitsEmptySections(t *testing.T) {
 }
 
 func TestEnumerationsAcceptOnlyTheirValues(t *testing.T) {
-	for _, o := range []DiscoveryOutcome{OutcomeOK, OutcomeNoStatus, OutcomeNoCandidates, OutcomeStandalone, OutcomePublicSuffix} {
+	for _, o := range []DiscoveryOutcome{
+		OutcomeOK,
+		OutcomeNoStatus,
+		OutcomeNoCandidates,
+		OutcomeStandalone,
+		OutcomePublicSuffix,
+	} {
 		if !o.Valid() {
 			t.Errorf("outcome %q is refused", o)
 		}
@@ -144,7 +150,8 @@ func TestCloneSharesNothing(t *testing.T) {
 	c.Discovery.Nodes[0].Pins[0] = "changed"
 	c.Marks["x"] = DownMark{}
 	c.ColdStart.Name = "changed"
-	if p.Key.Endpoints[0] == "changed" || p.Cluster.RootCASHA256 == "changed" || p.Discovery.Nodes[0].Pins[0] == "changed" ||
+	if p.Key.Endpoints[0] == "changed" || p.Cluster.RootCASHA256 == "changed" ||
+		p.Discovery.Nodes[0].Pins[0] == "changed" ||
 		len(p.Marks) != 1 || p.ColdStart.Name == "changed" {
 		t.Errorf("clone shares state with the original: %+v", p)
 	}

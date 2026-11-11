@@ -1446,7 +1446,11 @@ func TestAwaitTask_RoutedUploadHostFollowsSharedPollDecision(t *testing.T) {
 	}{
 		{"refused dial", dialRefused(), true},
 		{"unmarked read error", fmt.Errorf("failed to get task status: %w", read), true},
-		{"marked read error", &endpointpool.MaybeSentError{Err: fmt.Errorf("failed to get task status: %w", read)}, true},
+		{
+			"marked read error",
+			&endpointpool.MaybeSentError{Err: fmt.Errorf("failed to get task status: %w", read)},
+			true,
+		},
 		{"unmarked tls text", tlsText, true},
 		{"marked tls text", &endpointpool.MaybeSentError{Err: tlsText}, true},
 		{"marked refused dial", &endpointpool.MaybeSentError{Err: dialRefused()}, true},
@@ -1455,7 +1459,11 @@ func TestAwaitTask_RoutedUploadHostFollowsSharedPollDecision(t *testing.T) {
 		{"connect-phase tag", pinTag, true},
 		{"marked connect-phase tag", &endpointpool.MaybeSentError{Err: pinTag}, true},
 		{"5xx", sdkerrors.ParseAPIError(500, []byte(`{"errors":"internal error"}`)), false},
-		{"5xx quoting tls", sdkerrors.ParseAPIError(500, []byte(`{"message":"upstream said tls: handshake failure"}`)), false},
+		{
+			"5xx quoting tls",
+			sdkerrors.ParseAPIError(500, []byte(`{"message":"upstream said tls: handshake failure"}`)),
+			false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

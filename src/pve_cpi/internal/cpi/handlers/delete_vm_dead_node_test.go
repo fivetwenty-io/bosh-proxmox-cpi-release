@@ -224,7 +224,10 @@ func newDeadNodeDelete(t *testing.T) *deadNodeDeleteFixture {
 		{"storage": "backups", "type": "dir", "content": "backup"},
 	}}
 	f.scene.OnRead = f.crmRecovery
-	f.episodes = &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: episodeCacheDir(t)}, Now: func() time.Time { return time.Now().Add(-time.Hour) }}
+	f.episodes = &ha.EpisodeStore{
+		Dir: endpointcache.DirOptions{Override: episodeCacheDir(t)},
+		Now: func() time.Time { return time.Now().Add(-time.Hour) },
+	}
 	if _, err := f.episodes.Observe("vm:101", "uid-101"); err != nil {
 		t.Fatal(err)
 	}

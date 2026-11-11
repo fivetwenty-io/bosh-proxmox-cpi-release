@@ -123,7 +123,10 @@ func TestApplyContextOverrides_RefuseAnEmptyHost(t *testing.T) {
 			// map, and the merged config is validated again.
 			job := endpointsTokenJob()
 			job.NodeEndpoints = map[string]string{"pve2": addr}
-			_, _, _, err := config.ApplyContextOverrides(job, endpointsEntryWithToken(map[string]any{"pve_user": "ops@pam"}))
+			_, _, _, err := config.ApplyContextOverrides(
+				job,
+				endpointsEntryWithToken(map[string]any{"pve_user": "ops@pam"}),
+			)
 			if err == nil || !strings.Contains(err.Error(), `node_endpoints["pve2"] `+emptyHostWant) {
 				t.Errorf("inherited node_endpoints: err = %v, want the empty host refusal", err)
 			}

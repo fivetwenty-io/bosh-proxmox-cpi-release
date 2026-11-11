@@ -43,7 +43,11 @@ func TestSweepExpiredLockSentinel_SendByPassedLeavesTheSentinel(t *testing.T) {
 	deleted, err := sweepExpiredLockSentinel(context.Background(), wire, name, expired, clk, logger)
 	after := time.Now()
 	if deleted || err != nil {
-		t.Fatalf("sweepExpiredLockSentinel = (%v, %v), want (false, nil) for a delete refused by its send-by deadline", deleted, err)
+		t.Fatalf(
+			"sweepExpiredLockSentinel = (%v, %v), want (false, nil) for a delete refused by its send-by deadline",
+			deleted,
+			err,
+		)
 	}
 	deletes := wire.deletes()
 	if len(deletes) != 1 || !deletes[0].refused {
@@ -67,7 +71,10 @@ func TestSweepExpiredLockSentinel_OtherSkipsLogNothing(t *testing.T) {
 	start := time.Unix(10_000, 0)
 	name := ClusterLockPoolName(diskTransferLockName("expired"))
 	expired := encodeLockComment("crashed", start.Add(-time.Hour))
-	for label, stored := range map[string]string{"changed": encodeLockComment("other", start.Add(time.Hour)), "gone": ""} {
+	for label, stored := range map[string]string{
+		"changed": encodeLockComment("other", start.Add(time.Hour)),
+		"gone":    "",
+	} {
 		t.Run(label, func(t *testing.T) {
 			f := newFakeLockPools()
 			if stored != "" {
@@ -81,7 +88,11 @@ func TestSweepExpiredLockSentinel_OtherSkipsLogNothing(t *testing.T) {
 				t.Fatalf("sweepExpiredLockSentinel = (%v, %v), want (false, nil)", deleted, err)
 			}
 			if obs.Len() != 0 || len(wire.deletes()) != 0 {
-				t.Fatalf("a sentinel skipped before its delete logged or sent: logs %+v deletes %+v", obs.All(), wire.deletes())
+				t.Fatalf(
+					"a sentinel skipped before its delete logged or sent: logs %+v deletes %+v",
+					obs.All(),
+					wire.deletes(),
+				)
 			}
 		})
 	}
@@ -99,7 +110,14 @@ func TestSweepExpiredLockSentinel_RefusalWithoutLoggerIsQuiet(t *testing.T) {
 	f.pools[name] = expired
 	refusal := sdkSendByRefusal(http.MethodDelete, endpointpool.APIPrefix+"/pools", endpointpool.ErrSendByPassed)
 	f.deleteFn = func(string) error { return refusal }
-	deleted, err := sweepExpiredLockSentinel(context.Background(), f, name, expired, fixedClock(start, time.Second), nil)
+	deleted, err := sweepExpiredLockSentinel(
+		context.Background(),
+		f,
+		name,
+		expired,
+		fixedClock(start, time.Second),
+		nil,
+	)
 	if deleted || err != nil {
 		t.Fatalf("sweepExpiredLockSentinel = (%v, %v), want (false, nil)", deleted, err)
 	}
@@ -150,7 +168,10 @@ func TestSweepExpiredDiskTransferLocks_SendByRefusalIsNotAnError(t *testing.T) {
 	store := &listingLockPools{fakeLockPools: newFakeLockPools()}
 	store.pools[first] = expired
 	store.pools[second] = expired
-	clk := lockClock{now: func() time.Time { return now }, sleep: func(context.Context, time.Duration) error { return nil }}
+	clk := lockClock{
+		now:   func() time.Time { return now },
+		sleep: func(context.Context, time.Duration) error { return nil },
+	}
 	wire := &sendByWire{PoolService: store}
 	wire.now = func() time.Time {
 		if len(wire.deletes()) == 0 {

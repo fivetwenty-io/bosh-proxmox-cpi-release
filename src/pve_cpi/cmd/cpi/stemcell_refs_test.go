@@ -142,7 +142,11 @@ func (n refsCLINodes) UpdateQemuConfig(ctx context.Context, _, vmid string, p *n
 	return errors.New("unexpected config write")
 }
 
-func (n refsCLINodes) ListQemu(ctx context.Context, _ string, _ *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
+func (n refsCLINodes) ListQemu(
+	ctx context.Context,
+	_ string,
+	_ *nodes.ListQemuParams,
+) (*nodes.ListQemuResponse, error) {
 	n.c.saw(ctx)
 	n.c.mu.Lock()
 	defer n.c.mu.Unlock()

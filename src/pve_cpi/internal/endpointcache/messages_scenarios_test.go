@@ -170,7 +170,10 @@ func messageScenarios(t *testing.T, opts StoreOptions, name string) []string {
 	}
 	record("newer file version", s.Read(&got))
 	storePut(t, s, "again")
-	if err := os.Chmod(filepath.Join(dir, file), 0o644); err != nil { // #nosec G302 -- the test opens the mode on purpose
+	if err := os.Chmod(
+		filepath.Join(dir, file),
+		0o644,
+	); err != nil { // #nosec G302 -- the test opens the mode on purpose
 		t.Fatal(err)
 	}
 	record("file open mode", s.Read(&got))

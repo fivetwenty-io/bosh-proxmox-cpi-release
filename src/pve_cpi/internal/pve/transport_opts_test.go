@@ -243,7 +243,12 @@ func TestPoolTimeoutDefaultsLeaveAPoolOfOneAlone(t *testing.T) {
 		before := buildTransportOpts(cfg)
 		got := applyPoolTimeoutDefaults(before, size)
 		if got.DialTimeoutSec != 0 || got.TLSHandshakeTimeoutSec != 0 {
-			t.Errorf("pool of %d: dial/handshake = %d/%d, want 0/0", size, got.DialTimeoutSec, got.TLSHandshakeTimeoutSec)
+			t.Errorf(
+				"pool of %d: dial/handshake = %d/%d, want 0/0",
+				size,
+				got.DialTimeoutSec,
+				got.TLSHandshakeTimeoutSec,
+			)
 		}
 		if got.WrapTransport != nil {
 			t.Errorf("pool of %d: WrapTransport set", size)

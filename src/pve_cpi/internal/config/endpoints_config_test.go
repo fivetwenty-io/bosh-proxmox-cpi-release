@@ -420,7 +420,11 @@ func TestValidateEndpoints_ReportsEveryProblem(t *testing.T) {
 	if err == nil {
 		t.Fatal("invalid list accepted")
 	}
-	for _, want := range []string{"at most 16 are allowed", "endpoints[0] must be host or host:port without a scheme", "repeats endpoints[1]"} {
+	for _, want := range []string{
+		"at most 16 are allowed",
+		"endpoints[0] must be host or host:port without a scheme",
+		"repeats endpoints[1]",
+	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not contain %q", err.Error(), want)
 		}
@@ -447,7 +451,10 @@ func TestApplyDefaults_FillsEndpointPortsLikeLoad(t *testing.T) {
 		t.Errorf("Endpoints[1] = %q, want b.example.com:8006", byHand.Endpoints[1])
 	}
 
-	loaded, err := mustLoad(t, endpointsLoadJSON(`"endpoints": ["a.example.com:9000", "b.example.com", "b.example.com:9000"]`))
+	loaded, err := mustLoad(
+		t,
+		endpointsLoadJSON(`"endpoints": ["a.example.com:9000", "b.example.com", "b.example.com:9000"]`),
+	)
 	if err != nil {
 		t.Fatalf("Load rejected the list: %v", err)
 	}

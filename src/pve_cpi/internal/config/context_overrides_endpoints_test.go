@@ -525,7 +525,8 @@ func TestApplyContextOverrides_Endpoints_EntryCredentialsReplaceTheGroup(t *test
 		_, _, _, err := config.ApplyContextOverrides(endpointsTokenJob(), map[string]any{
 			"pve_endpoints": []any{epHostB, epHostA},
 		})
-		if err == nil || !strings.Contains(err.Error(), `for host "pve-b.example" changes pve.host but supplies no credentials`) {
+		if err == nil ||
+			!strings.Contains(err.Error(), `for host "pve-b.example" changes pve.host but supplies no credentials`) {
 			t.Fatalf("err = %v, want a pve.host credential error", err)
 		}
 	})
@@ -643,9 +644,24 @@ func TestSameEndpointSet(t *testing.T) {
 		{"an added element", mk("a", 8006, "a:8006"), mk("a", 8006, "a:8006", "b:8006"), false},
 		{"a dropped element", mk("a", 8006, "a:8006", "b:8006"), mk("a", 8006), false},
 		{"a different second element", mk("a", 8006, "a:8006", "b:8006"), mk("a", 8006, "a:8006", "c:8006"), false},
-		{"a reordered tail", mk("a", 8006, "a:8006", "b:8006", "c:8006"), mk("a", 8006, "a:8006", "c:8006", "b:8006"), false},
-		{"a different port on the second element", mk("a", 8006, "a:8006", "b:8006"), mk("a", 8006, "a:8006", "b:9000"), false},
-		{"a first element that is not the primary", mk("a", 8006, "b:8006", "a:8006"), mk("a", 8006, "b:8006", "a:8006"), false},
+		{
+			"a reordered tail",
+			mk("a", 8006, "a:8006", "b:8006", "c:8006"),
+			mk("a", 8006, "a:8006", "c:8006", "b:8006"),
+			false,
+		},
+		{
+			"a different port on the second element",
+			mk("a", 8006, "a:8006", "b:8006"),
+			mk("a", 8006, "a:8006", "b:9000"),
+			false,
+		},
+		{
+			"a first element that is not the primary",
+			mk("a", 8006, "b:8006", "a:8006"),
+			mk("a", 8006, "b:8006", "a:8006"),
+			false,
+		},
 		{"a malformed element", mk("a", 8006, "a:8006", "bad host"), mk("a", 8006, "a:8006", "bad host"), false},
 		{"a signed port", mk("a", 8006, "a:8006", "b:+80"), mk("a", 8006, "a:8006", "b:+80"), false},
 		{"a nil left side", nil, mk("a", 8006), false},
@@ -758,7 +774,11 @@ func TestApplyContextOverrides_Endpoints_BareElementsReadAtTheJobsPort(t *testin
 				t.Errorf("%s: entry = %q:%d %v, want %q:9000 %v", name, eff.Host, eff.Port, eff.Endpoints,
 					epHostA, wantList)
 			}
-			if got := config.OverrideCredentialGroup(job, eff, []string{"pve_endpoints"}); got != config.CredentialGroupInherited {
+			if got := config.OverrideCredentialGroup(
+				job,
+				eff,
+				[]string{"pve_endpoints"},
+			); got != config.CredentialGroupInherited {
 				t.Errorf("%s: group = %q, want inherited", name, got)
 			}
 		}
@@ -921,7 +941,11 @@ func TestCanonicalEndpointHost_FoldsASCIICaseOnly(t *testing.T) {
 		if eff.PVECACertPEM != "" {
 			t.Error("the job's CA must not follow a primary that is not the job's")
 		}
-		if got := config.OverrideCredentialGroup(job, eff, []string{"pve_host", "pve_api_token"}); got != config.CredentialGroupEntry {
+		if got := config.OverrideCredentialGroup(
+			job,
+			eff,
+			[]string{"pve_host", "pve_api_token"},
+		); got != config.CredentialGroupEntry {
 			t.Errorf("group = %q, want entry", got)
 		}
 	})

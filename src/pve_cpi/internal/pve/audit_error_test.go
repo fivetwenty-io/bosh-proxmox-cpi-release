@@ -231,9 +231,17 @@ func TestDescribeAuditErrorContextOutranksAWalk(t *testing.T) {
 		err  error
 		want string
 	}{
-		{"joined with a deadline", errors.Join(sdkWrapTransportError(walk), context.DeadlineExceeded), "context deadline exceeded"},
+		{
+			"joined with a deadline",
+			errors.Join(sdkWrapTransportError(walk), context.DeadlineExceeded),
+			"context deadline exceeded",
+		},
 		{"joined with a cancellation", errors.Join(sdkWrapTransportError(walk), context.Canceled), "context canceled"},
-		{"joined with a deadline, walk first", errors.Join(walk, context.DeadlineExceeded), "context deadline exceeded"},
+		{
+			"joined with a deadline, walk first",
+			errors.Join(walk, context.DeadlineExceeded),
+			"context deadline exceeded",
+		},
 		{"a header deadline hop", sdkWrapTransportError(headerDeadline), "context deadline exceeded"},
 		{"the walk alone", sdkWrapTransportError(walk), "connection to pve1:8006, pve2:8006 failed"},
 	} {
@@ -253,7 +261,10 @@ func TestDescribeAuditErrorBoundsALongWalkOnAnEndpointBoundary(t *testing.T) {
 	walkOf := func(n int) error {
 		attempts := make([]endpointpool.EndpointFailure, 0, n)
 		for i := 1; i <= n; i++ {
-			attempts = append(attempts, walkFailure(endpointAt(i), endpointpool.PhaseDial, errors.New("connection refused")))
+			attempts = append(
+				attempts,
+				walkFailure(endpointAt(i), endpointpool.PhaseDial, errors.New("connection refused")),
+			)
 		}
 		return sdkWrapTransportError(endpointpool.NewEntryUnreachableError(attempts))
 	}
@@ -286,7 +297,10 @@ func TestDescribeAuditErrorBoundsALongWalkOnAnEndpointBoundary(t *testing.T) {
 			}
 		}
 		// One more name would not have fit.
-		longer := strings.TrimSuffix(got, wantTail) + ", " + endpointAt(named+1) + fmt.Sprintf(" and %d more failed", 16-named-1)
+		longer := strings.TrimSuffix(
+			got,
+			wantTail,
+		) + ", " + endpointAt(named+1) + fmt.Sprintf(" and %d more failed", 16-named-1)
 		if len(longer) <= auditDescriptionLimit {
 			t.Errorf("description %q left room for another name", got)
 		}

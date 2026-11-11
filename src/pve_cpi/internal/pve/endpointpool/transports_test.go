@@ -767,7 +767,12 @@ func TestPoolRefusalsAreToldApartFromDialFailures(t *testing.T) {
 		{
 			name: "a send-by deadline that passed during the dial", endpoint: dropped.Addr,
 			req: func(t *testing.T) *http.Request {
-				ctx := WithSendBy(context.Background(), time.Now().Add(100*time.Millisecond), http.MethodPut, "/pools/x")
+				ctx := WithSendBy(
+					context.Background(),
+					time.Now().Add(100*time.Millisecond),
+					http.MethodPut,
+					"/pools/x",
+				)
 				return apiRequest(t, ctx, http.MethodPut, dropped.Addr, "/pools/x", "comment=x")
 			},
 			refusal: ErrSendByPassed,
@@ -815,7 +820,10 @@ func TestPoolRefusalsAreToldApartFromDialFailures(t *testing.T) {
 				t.Fatalf("blamesEndpoint = %v, want %v: %v", got, want, err)
 			}
 			for name, sentinel := range refusals {
-				if got, want := errors.Is(err, sentinel), c.refusal != nil && errors.Is(sentinel, c.refusal); got != want {
+				if got, want := errors.Is(
+					err,
+					sentinel,
+				), c.refusal != nil && errors.Is(sentinel, c.refusal); got != want {
 					t.Errorf("errors.Is(err, %s) = %v, want %v: %v", name, got, want, err)
 				}
 			}
@@ -845,7 +853,11 @@ func TestBlamesEndpoint(t *testing.T) {
 			t.Errorf("%s: a connect-phase failure should blame the endpoint", phase)
 		}
 		for _, refusal := range []error{ErrSendByPassed, errWrongAddress, errPlaintextRefused} {
-			refused := &ConnectPhaseError{Phase: phase, Endpoint: "pve1:8006", Err: fmt.Errorf("%w: %w", refusal, cause)}
+			refused := &ConnectPhaseError{
+				Phase:    phase,
+				Endpoint: "pve1:8006",
+				Err:      fmt.Errorf("%w: %w", refusal, cause),
+			}
 			if blamesEndpoint(refused) || blamesEndpoint(fmt.Errorf("post: %w", refused)) {
 				t.Errorf("%s: %v should not blame the endpoint", phase, refusal)
 			}

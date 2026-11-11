@@ -168,7 +168,9 @@ func TestDeleteVM_NotFoundWithConfigStillPresentIsRetriable(t *testing.T) {
 				deps.Config.FastPathDelete = &enabled
 			}
 
-			_, err := handlers.HandleDeleteVM(deps).Handle(quickTaskPollCtx(), marshalArgs(strconv.Itoa(vmid)), jsonrpc.Context{})
+			_, err := handlers.HandleDeleteVM(
+				deps,
+			).Handle(quickTaskPollCtx(), marshalArgs(strconv.Itoa(vmid)), jsonrpc.Context{})
 
 			requireAbsenceRetriable(t, err, "holds its config now")
 			if got := len(destroy.calls()); got != tc.wantDestroy {
@@ -240,7 +242,9 @@ func TestDeleteVM_MigrationDuringDeleteIsRetriable(t *testing.T) {
 			}
 			deps := twoMemberDeps(vmid, qemuSvc, nodesSvc, tasksSvc, tc.fastPath)
 
-			_, err := handlers.HandleDeleteVM(deps).Handle(quickTaskPollCtx(), marshalArgs(strconv.Itoa(vmid)), jsonrpc.Context{})
+			_, err := handlers.HandleDeleteVM(
+				deps,
+			).Handle(quickTaskPollCtx(), marshalArgs(strconv.Itoa(vmid)), jsonrpc.Context{})
 
 			requireAbsenceRetriable(t, err, "pve-node2")
 			for _, node := range destroy.calls() {

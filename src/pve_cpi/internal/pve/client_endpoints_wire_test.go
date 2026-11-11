@@ -252,7 +252,9 @@ func TestNewClientWithTwoEndpointsLogsInThroughTheSecond(t *testing.T) {
 	mux.HandleFunc("/api2/json/access/ticket", func(w http.ResponseWriter, _ *http.Request) {
 		logins.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":{"ticket":"PVE:root@pam:1","CSRFPreventionToken":"csrf","username":"root@pam"}}`))
+		_, _ = w.Write(
+			[]byte(`{"data":{"ticket":"PVE:root@pam:1","CSRFPreventionToken":"csrf","username":"root@pam"}}`),
+		)
 	})
 	mux.HandleFunc("/api2/json/pools/", func(w http.ResponseWriter, _ *http.Request) {
 		reads.Add(1)

@@ -143,9 +143,19 @@ func TestStoragePlanRunsUnderAnAffinityScope(t *testing.T) {
 	}
 	rec := &scopeRecorder{}
 	var stdout, stderr bytes.Buffer
-	code := runStoragePlanWithObserver([]string{"--request", path, "--config", "config.json", "--json"}, &stdout, &stderr,
+	code := runStoragePlanWithObserver([]string{
+		"--request",
+		path,
+		"--config",
+		"config.json",
+		"--json",
+	}, &stdout, &stderr,
 		func(string) (handlers.Deps, error) { return handlers.Deps{}, nil },
-		func(ctx context.Context, _ handlers.Deps, _ handlers.StoragePlanDiagnosticRequest) (*handlers.StoragePlanDiagnostic, error) {
+		func(
+			ctx context.Context,
+			_ handlers.Deps,
+			_ handlers.StoragePlanDiagnosticRequest,
+		) (*handlers.StoragePlanDiagnostic, error) {
 			rec.observe(ctx)
 			return &handlers.StoragePlanDiagnostic{}, nil
 		})

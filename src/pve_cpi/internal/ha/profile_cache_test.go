@@ -103,21 +103,32 @@ func TestProfileCacheAFreshEntryAnswersWithoutProbing(t *testing.T) {
 	first := resolveWith(t, d)
 	managerAfterFirst, statusAfterFirst := w.cluster.calls["manager"], w.cluster.calls["status"]
 	if slowProbes(w) != 1 || w.storage.calls != 1 {
-		t.Fatalf("the first call must probe once, got %d config reads and %d storage reads", slowProbes(w), w.storage.calls)
+		t.Fatalf(
+			"the first call must probe once, got %d config reads and %d storage reads",
+			slowProbes(w),
+			w.storage.calls,
+		)
 	}
 	files := profileFiles(t, dir)
-	if len(files) != 1 || !regexp.MustCompile(`^ha_profile-pve1\.dc1\.example\.com-[0-9a-f]{16}\.json$`).MatchString(files[0]) {
+	if len(files) != 1 ||
+		!regexp.MustCompile(`^ha_profile-pve1\.dc1\.example\.com-[0-9a-f]{16}\.json$`).MatchString(files[0]) {
 		t.Fatalf("profile files %v, want one ha_profile-<host>-<digest>.json", files)
 	}
 
 	clock.advance(59 * time.Second)
 	second := resolveWith(t, d)
 	if slowProbes(w) != 1 || w.storage.calls != 1 {
-		t.Errorf("a fresh entry must not probe again, got %d config reads and %d storage reads", slowProbes(w), w.storage.calls)
+		t.Errorf(
+			"a fresh entry must not probe again, got %d config reads and %d storage reads",
+			slowProbes(w),
+			w.storage.calls,
+		)
 	}
 	if !reflect.DeepEqual(second.Nodes, first.Nodes) || !reflect.DeepEqual(second.Quorum, first.Quorum) ||
-		!reflect.DeepEqual(second.CPUDomains, first.CPUDomains) || !reflect.DeepEqual(second.Storages, first.Storages) ||
-		second.Effective != first.Effective || second.MinVersion != first.MinVersion || second.SysConsole != first.SysConsole {
+		!reflect.DeepEqual(second.CPUDomains, first.CPUDomains) ||
+		!reflect.DeepEqual(second.Storages, first.Storages) ||
+		second.Effective != first.Effective || second.MinVersion != first.MinVersion ||
+		second.SysConsole != first.SysConsole {
 		t.Errorf("cached profile %+v differs from the live one %+v", second, first)
 	}
 	if w.cluster.calls["manager"] != 2*managerAfterFirst || w.cluster.calls["status"] != 2*statusAfterFirst {
@@ -202,7 +213,12 @@ func TestProfileCacheAMissingDirectoryProbesEveryCall(t *testing.T) {
 	for i := 1; i <= 2; i++ {
 		p := resolveWith(t, d)
 		if p.Effective != ha.EffectiveFull || slowProbes(w) != i {
-			t.Fatalf("call %d: effective %s after %d config reads, want a live probe each time", i, p.Effective, slowProbes(w))
+			t.Fatalf(
+				"call %d: effective %s after %d config reads, want a live probe each time",
+				i,
+				p.Effective,
+				slowProbes(w),
+			)
 		}
 	}
 	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
@@ -241,7 +257,10 @@ func otherUsersPrivateDirectory(t *testing.T) string {
 	// The candidates are the home directories of root, which a user other than
 	// root cannot reach. A runner that works as root owns all of them, and so
 	// has nothing to refuse, and the owner refusal then goes unchecked on it.
-	t.Skip("this runner has no mode 0700 directory owned by another user, such as root's home when it runs as an ordinary user")
+	t.Skip(
+		"this runner has no mode 0700 directory owned by another user, such as root's home when it runs as an " +
+			"ordinary user",
+	)
 	return ""
 }
 
@@ -257,7 +276,10 @@ func TestProfileCacheAnUnsafeDirectoryProbesEveryCall(t *testing.T) {
 		"mode open to others": {
 			build: func(t *testing.T) string {
 				dir := cacheDir(t)
-				if err := os.Chmod(dir, 0o755); err != nil { // #nosec G302 -- the test makes the directory unsafe on purpose
+				if err := os.Chmod(
+					dir,
+					0o755,
+				); err != nil { // #nosec G302 -- the test makes the directory unsafe on purpose
 					t.Fatal(err)
 				}
 				return dir
@@ -299,7 +321,8 @@ func TestProfileCacheAnUnsafeDirectoryProbesEveryCall(t *testing.T) {
 				if !strings.Contains(text, tc.refusal) {
 					t.Errorf("refusal %q does not say %q", text, tc.refusal)
 				}
-				if !strings.Contains(text, "HA profile cache: "+tc.refusal) || strings.Contains(text, "endpoint cache") {
+				if !strings.Contains(text, "HA profile cache: "+tc.refusal) ||
+					strings.Contains(text, "endpoint cache") {
 					t.Errorf("refusal %q must name the HA profile cache and not the endpoint cache", text)
 				}
 			}
@@ -466,7 +489,9 @@ func TestProfileCacheNeverHoldsTheQDeviceStatusOrNodeHealth(t *testing.T) {
 	if live.QDevice.Status != ha.QDeviceConnected {
 		t.Fatalf("live QDevice status = %s", live.QDevice.Status)
 	}
-	data, err := os.ReadFile(filepath.Join(dir, profileFiles(t, dir)[0])) // #nosec G304 -- the test reads the file it caused
+	data, err := os.ReadFile(
+		filepath.Join(dir, profileFiles(t, dir)[0]),
+	) // #nosec G304 -- the test reads the file it caused
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,7 +598,11 @@ func TestProfileCachePassesALiveFailureThrough(t *testing.T) {
 	cfg := cacheCfg(cacheDir(t))
 	opts, _ := ha.ProfileCacheOptionsFromConfig(cfg, nil)
 	cache := ha.NewProfileCache(failingLive{err: errors.New("boom")}, opts)
-	if _, err := cache.Slow(context.Background(), cacheCluster, nil); err == nil || !strings.Contains(err.Error(), "boom") {
+	if _, err := cache.Slow(
+		context.Background(),
+		cacheCluster,
+		nil,
+	); err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Errorf("Slow error = %v, want the live source's", err)
 	}
 	if _, err := ha.NewProfileCache(nil, opts).Slow(context.Background(), cacheCluster, nil); err == nil {
@@ -813,8 +842,8 @@ func TestProfileCacheSecretAndLockRefusalsNameTheHAProfileCache(t *testing.T) {
 	if len(refusals) != 1 {
 		t.Fatalf("logged %d open refusals, want 1", len(refusals))
 	}
-	if want := "HA profile cache: refusing directory secret " + secret + ": HA profile cache: unsafe permissions"; !strings.HasPrefix(refusals[0], want) ||
-		strings.Contains(refusals[0], "endpoint cache") {
+	want := "HA profile cache: refusing directory secret " + secret + ": HA profile cache: unsafe permissions"
+	if !strings.HasPrefix(refusals[0], want) || strings.Contains(refusals[0], "endpoint cache") {
 		t.Errorf("refusal %q, want it to start %q and not name the endpoint cache", refusals[0], want)
 	}
 }
@@ -836,7 +865,10 @@ func TestProfileCacheKeepsClustersWithTheSameEndpointsAndNodeNamesApart(t *testi
 	}
 	resolveWith(t, cachedDeps(t, prod, cfg, clock))
 	if slowProbes(prod) != 1 {
-		t.Fatalf("a second cluster at the same endpoints must probe and not read the first one's file, got %d", slowProbes(prod))
+		t.Fatalf(
+			"a second cluster at the same endpoints must probe and not read the first one's file, got %d",
+			slowProbes(prod),
+		)
 	}
 	// Each deps value builds its own fake cluster, whose probe count starts at zero.
 	resolveWith(t, cachedDeps(t, prod, cfg, clock))

@@ -567,7 +567,10 @@ func TestDeleteVMPassesOverALandedTransferOffTheVM(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.client.state.configs[copyVMID] = map[string]any{
-		"name": fmt.Sprintf("bosh-parker-%d", copyVMID), "tags": "bosh-cpi;bosh-parker;vm-prefix--bosh", "protection": "1", "digest": "1",
+		"name": fmt.Sprintf(
+			"bosh-parker-%d",
+			copyVMID,
+		), "tags": "bosh-cpi;bosh-parker;vm-prefix--bosh", "protection": "1", "digest": "1",
 		"description": "<!--BOSH:" + string(entry) + "-->", "scsi0": copied + ",size=5G",
 	}
 	if s.client.vmNodes == nil {

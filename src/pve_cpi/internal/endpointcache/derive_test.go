@@ -19,12 +19,27 @@ func TestDeriveAddress(t *testing.T) {
 		{"seed port written with a leading zero", "pve1.dc1.example.com:09006", "pve2", "pve2.dc1.example.com:9006"},
 		{"two-label seed under a registrable domain", "pve1.example.com:8006", "pve2", "pve2.example.com:8006"},
 		{"domain two labels deep", "pve1.dc1.example.com:8006", "pve9", "pve9.dc1.example.com:8006"},
-		{"seed under a registrable ICANN second-level domain", "pve1.example.co.uk:8006", "pve2", "pve2.example.co.uk:8006"},
+		{
+			"seed under a registrable ICANN second-level domain",
+			"pve1.example.co.uk:8006",
+			"pve2",
+			"pve2.example.co.uk:8006",
+		},
 		{"seed host is upper case", "PVE1.DC1.Example.COM:8006", "pve2", "pve2.dc1.example.com:8006"},
 		{"seed host carries a trailing dot", "pve1.dc1.example.com.:8006", "pve2", "pve2.dc1.example.com:8006"},
-		{"seed under a dynamic zone's customer label", "pve1.mylab.github.io:8006", "pve2", "pve2.mylab.github.io:8006"},
+		{
+			"seed under a dynamic zone's customer label",
+			"pve1.mylab.github.io:8006",
+			"pve2",
+			"pve2.mylab.github.io:8006",
+		},
 		{"seed under a wildcard rule's exception", "pve1.city.kawasaki.jp:8006", "pve2", "pve2.city.kawasaki.jp:8006"},
-		{"seed under a registrable domain beside a private suffix", "pve1.platform.sh:8006", "pve2", "pve2.platform.sh:8006"},
+		{
+			"seed under a registrable domain beside a private suffix",
+			"pve1.platform.sh:8006",
+			"pve2",
+			"pve2.platform.sh:8006",
+		},
 		{"seed under a wildcard rule on its registrable label", "pve1.www.ck:8006", "pve2", "pve2.www.ck:8006"},
 		{"node keeps its own spelling", "pve1.example.com:8006", "PVE-2", "PVE-2.example.com:8006"},
 		{"bare seed", "pve1:8006", "pve2", "pve2:8006"},
@@ -118,7 +133,14 @@ func TestDeriveAddressBareSeedsSkipThePublicSuffixCheck(t *testing.T) {
 	t.Parallel()
 	// A bare name has no domain to check, and an IP literal has none either, so
 	// neither can take the public_suffix outcome.
-	for _, seed := range []string{"lan:8006", "com:8006", "github:8006", "10.0.0.1:8006", "[::1]:8006", "[fd00::1]:8006"} {
+	for _, seed := range []string{
+		"lan:8006",
+		"com:8006",
+		"github:8006",
+		"10.0.0.1:8006",
+		"[::1]:8006",
+		"[fd00::1]:8006",
+	} {
 		if _, err := DeriveAddress(seed, "pve2"); err != nil {
 			t.Errorf("DeriveAddress(%q) error = %v", seed, err)
 		}
@@ -187,7 +209,11 @@ func TestDeriveAddressAcceptsALastLabelWithDigitsAndLetters(t *testing.T) {
 	t.Parallel()
 	// Only an all-digit last label is refused. A name such as pve1.example.com
 	// with digits inside its labels derives as usual.
-	for _, seed := range []string{"pve1.dc1.example.com:8006", "pve1.example.xn--p1ai:8006", "pve1.123.example.com:8006"} {
+	for _, seed := range []string{
+		"pve1.dc1.example.com:8006",
+		"pve1.example.xn--p1ai:8006",
+		"pve1.123.example.com:8006",
+	} {
 		if _, err := DeriveAddress(seed, "pve2"); err != nil {
 			t.Errorf("DeriveAddress(%q) error = %v", seed, err)
 		}

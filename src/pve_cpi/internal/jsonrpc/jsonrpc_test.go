@@ -550,10 +550,18 @@ func TestContext_UnmarshalJSON_KeepsTheDiscoveryModeRawWhenItIsNotAScalar(t *tes
 		key   string
 		want  any
 	}{
-		"flat float":     {`{"pve_api_endpoint_discovery": 5.0}`, "pve_api_endpoint_discovery", json.RawMessage(`5.0`)},
-		"flat exponent":  {`{"pve_api_endpoint_discovery":1e3}`, "pve_api_endpoint_discovery", json.RawMessage(`1e3`)},
-		"flat object":    {`{"pve_api_endpoint_discovery": { "a": 1 }}`, "pve_api_endpoint_discovery", json.RawMessage(`{ "a": 1 }`)},
-		"flat list":      {`{"pve_api_endpoint_discovery": [ "on" ]}`, "pve_api_endpoint_discovery", json.RawMessage(`[ "on" ]`)},
+		"flat float":    {`{"pve_api_endpoint_discovery": 5.0}`, "pve_api_endpoint_discovery", json.RawMessage(`5.0`)},
+		"flat exponent": {`{"pve_api_endpoint_discovery":1e3}`, "pve_api_endpoint_discovery", json.RawMessage(`1e3`)},
+		"flat object": {
+			`{"pve_api_endpoint_discovery": { "a": 1 }}`,
+			"pve_api_endpoint_discovery",
+			json.RawMessage(`{ "a": 1 }`),
+		},
+		"flat list": {
+			`{"pve_api_endpoint_discovery": [ "on" ]}`,
+			"pve_api_endpoint_discovery",
+			json.RawMessage(`[ "on" ]`),
+		},
 		"flat string":    {`{"pve_api_endpoint_discovery": "on"}`, "pve_api_endpoint_discovery", "on"},
 		"flat boolean":   {`{"pve_api_endpoint_discovery": true}`, "pve_api_endpoint_discovery", true},
 		"flat null":      {`{"pve_api_endpoint_discovery": null}`, "pve_api_endpoint_discovery", nil},

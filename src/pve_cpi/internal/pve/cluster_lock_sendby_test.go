@@ -115,7 +115,13 @@ func assertNoMarker(t *testing.T, w *sendByWire) {
 	t.Helper()
 	for _, call := range w.recorded() {
 		if call.guarded || call.steal || call.refused {
-			t.Fatalf("%s %s carried a send-by marker (refused=%v); calls %+v", call.method, call.route, call.refused, w.recorded())
+			t.Fatalf(
+				"%s %s carried a send-by marker (refused=%v); calls %+v",
+				call.method,
+				call.route,
+				call.refused,
+				w.recorded(),
+			)
 		}
 	}
 }
@@ -152,7 +158,11 @@ func TestSteal_SendByPassedAbandonsTheSteal(t *testing.T) {
 	after := time.Now()
 	var notSent *lockStealNotSent
 	if h != nil || !errors.As(err, &notSent) || !errors.Is(err, endpointpool.ErrSendByPassed) {
-		t.Fatalf("tryStealExpired = (%v, %v), want the refused steal for a delete refused by its send-by deadline", h, err)
+		t.Fatalf(
+			"tryStealExpired = (%v, %v), want the refused steal for a delete refused by its send-by deadline",
+			h,
+			err,
+		)
 	}
 	if errors.Is(err, ErrClusterLockStateUnknown) {
 		t.Fatalf("a refused steal delete left the holder unknown: %v", err)
@@ -191,7 +201,16 @@ func TestSteal_SendByMarksOnlyTheDelete(t *testing.T) {
 
 	ctx := context.Background()
 	before := time.Now()
-	h, err := acquireClusterLockWithClock(ctx, wire, "vm-90000", "S@h/2-b-1", 3*time.Minute, time.Minute, clk, WithCreateGrace())
+	h, err := acquireClusterLockWithClock(
+		ctx,
+		wire,
+		"vm-90000",
+		"S@h/2-b-1",
+		3*time.Minute,
+		time.Minute,
+		clk,
+		WithCreateGrace(),
+	)
 	after := time.Now()
 	if err != nil || h == nil {
 		t.Fatalf("steal under grace: handle %v, err %v", h, err)
@@ -286,7 +305,15 @@ func TestSteal_EverySendByRefusalEndsInATimeout(t *testing.T) {
 	clk := fixedClock(start, time.Second)
 	wire := &sendByWire{PoolService: f, now: func() time.Time { return time.Now().Add(time.Hour) }}
 
-	h, err := acquireClusterLockWithClock(context.Background(), wire, "vm-90000", "S@h/2-b-1", time.Minute, 5*time.Second, clk)
+	h, err := acquireClusterLockWithClock(
+		context.Background(),
+		wire,
+		"vm-90000",
+		"S@h/2-b-1",
+		time.Minute,
+		5*time.Second,
+		clk,
+	)
 	if h != nil {
 		t.Fatal("an acquire whose every steal delete was refused took the lock")
 	}
@@ -324,7 +351,16 @@ func TestNoWaitAcquire_CarriesNoMarker(t *testing.T) {
 		f.pools["bosh-lock-web"] = encodeLockComment("other-owner", time.Unix(100_000, 0))
 		clk := fixedClock(time.Unix(1000, 0), time.Second)
 		wire := &sendByWire{PoolService: f, now: func() time.Time { return clk.now().Add(time.Hour) }}
-		_, err := acquireClusterLockWithClock(context.Background(), wire, "web", "me", time.Minute, 30*time.Second, clk, WithoutWait())
+		_, err := acquireClusterLockWithClock(
+			context.Background(),
+			wire,
+			"web",
+			"me",
+			time.Minute,
+			30*time.Second,
+			clk,
+			WithoutWait(),
+		)
 		if !errors.Is(err, ErrClusterLockHeld) || !errors.Is(err, ErrClusterLockTimeout) {
 			t.Fatalf("want ErrClusterLockHeld joined with ErrClusterLockTimeout, got %v", err)
 		}
@@ -335,7 +371,16 @@ func TestNoWaitAcquire_CarriesNoMarker(t *testing.T) {
 		f.pools["bosh-lock-web"] = encodeLockComment("dead-owner", time.Unix(500, 0))
 		clk := fixedClock(time.Unix(1000, 0), time.Second)
 		wire := &sendByWire{PoolService: f, now: time.Now}
-		h, err := acquireClusterLockWithClock(context.Background(), wire, "web", "me", time.Minute, 30*time.Second, clk, WithoutWait())
+		h, err := acquireClusterLockWithClock(
+			context.Background(),
+			wire,
+			"web",
+			"me",
+			time.Minute,
+			30*time.Second,
+			clk,
+			WithoutWait(),
+		)
 		if err != nil || h == nil {
 			t.Fatalf("no-wait steal: handle %v, err %v", h, err)
 		}
@@ -351,7 +396,16 @@ func TestNoWaitAcquire_CarriesNoMarker(t *testing.T) {
 		f.pools["bosh-lock-web"] = dead
 		clk := fixedClock(time.Unix(1000, 0), time.Second)
 		wire := &sendByWire{PoolService: f, now: func() time.Time { return time.Now().Add(time.Hour) }}
-		h, err := acquireClusterLockWithClock(context.Background(), wire, "web", "me", time.Minute, 30*time.Second, clk, WithoutWait())
+		h, err := acquireClusterLockWithClock(
+			context.Background(),
+			wire,
+			"web",
+			"me",
+			time.Minute,
+			30*time.Second,
+			clk,
+			WithoutWait(),
+		)
 		if h != nil {
 			t.Fatal("a no-wait acquire whose steal was refused took the lock")
 		}
@@ -404,7 +458,12 @@ func TestWithLockStealSendBy_DeadlineIsInRealTime(t *testing.T) {
 			if err := endpointpool.CheckSendBy(ctx, time.Now(), http.MethodDelete, path); err != nil {
 				t.Fatalf("a transport on real time refused the steal at once: %v", err)
 			}
-			if err := endpointpool.CheckSendBy(ctx, time.Now().Add(left), http.MethodDelete, path); !errors.Is(err, endpointpool.ErrSendByPassed) {
+			if err := endpointpool.CheckSendBy(
+				ctx,
+				time.Now().Add(left),
+				http.MethodDelete,
+				path,
+			); !errors.Is(err, endpointpool.ErrSendByPassed) {
 				t.Fatalf("a transport on real time sent the steal after its budget: %v", err)
 			}
 		})
@@ -457,7 +516,15 @@ func TestAbandonAfterSteal_CarriesNoMarker(t *testing.T) {
 	wire := &sendByWire{PoolService: f, now: func() time.Time { return clk.now().Add(late) }}
 	wire.afterDelete = func() { late = time.Hour }
 
-	h, err := acquireClusterLockWithClock(context.Background(), wire, "vm-90000", "S@h/2-b-1", time.Minute, time.Minute, clk)
+	h, err := acquireClusterLockWithClock(
+		context.Background(),
+		wire,
+		"vm-90000",
+		"S@h/2-b-1",
+		time.Minute,
+		time.Minute,
+		clk,
+	)
 	if h != nil || !errors.Is(err, ErrClusterLockStateUnknown) {
 		t.Fatalf("want the unknown recreate to fail the acquire, got handle %v err %v", h, err)
 	}

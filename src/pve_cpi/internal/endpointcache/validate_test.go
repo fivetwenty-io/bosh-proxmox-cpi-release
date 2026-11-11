@@ -21,7 +21,9 @@ func validatedPayload(t *testing.T, p *Payload) (*Payload, []Drop) {
 
 func TestValidateAcceptsAWellFormedPayload(t *testing.T) {
 	p := payloadFor(payloadTestKey(), "pve2", "pve3")
-	p.Marks = map[string]DownMark{"pve1.dc1.example.com:8006": {DownAt: payloadNow.Add(-time.Minute), Class: MarkTLSHandshake}}
+	p.Marks = map[string]DownMark{
+		"pve1.dc1.example.com:8006": {DownAt: payloadNow.Add(-time.Minute), Class: MarkTLSHandshake},
+	}
 	p.ColdStart = &ColdStartHint{Name: "pve2", ProbedAt: payloadNow.Add(-10 * time.Minute)}
 	got, drops := validatedPayload(t, p)
 	if len(drops) != 0 {
@@ -62,7 +64,10 @@ func TestValidateRefusesANilPayloadAndAWrongKey(t *testing.T) {
 func TestValidateRefusesTheWholeFile(t *testing.T) {
 	tooMany := payloadFor(payloadTestKey())
 	for i := range MaxNodes + 1 {
-		tooMany.Discovery.Nodes = append(tooMany.Discovery.Nodes, payloadNode("n"+string(rune('a'+i%26))+string(rune('a'+i/26)), payloadNow))
+		tooMany.Discovery.Nodes = append(
+			tooMany.Discovery.Nodes,
+			payloadNode("n"+string(rune('a'+i%26))+string(rune('a'+i/26)), payloadNow),
+		)
 	}
 	cases := map[string]func(p *Payload){
 		"node name with dots": func(p *Payload) {
@@ -77,10 +82,12 @@ func TestValidateRefusesTheWholeFile(t *testing.T) {
 		"address with a space":            func(p *Payload) { p.Discovery.Nodes[0].Address = "pve2 .dc1.example.com" },
 		"address with a trailing dot":     func(p *Payload) { p.Discovery.Nodes[0].Address = "pve2.dc1.example.com." },
 		"empty address":                   func(p *Payload) { p.Discovery.Nodes[0].Address = "" },
-		"address with a port":             func(p *Payload) { p.Discovery.Nodes[0].Address = "pve2.dc1.example.com:8006" },
-		"port zero":                       func(p *Payload) { p.Discovery.Nodes[0].Port = 0 },
-		"port above range":                func(p *Payload) { p.Discovery.Nodes[0].Port = 65536 },
-		"no pins":                         func(p *Payload) { p.Discovery.Nodes[0].Pins = nil },
+		"address with a port": func(p *Payload) {
+			p.Discovery.Nodes[0].Address = "pve2.dc1.example.com:8006"
+		},
+		"port zero":        func(p *Payload) { p.Discovery.Nodes[0].Port = 0 },
+		"port above range": func(p *Payload) { p.Discovery.Nodes[0].Port = 65536 },
+		"no pins":          func(p *Payload) { p.Discovery.Nodes[0].Pins = nil },
 		"four pins": func(p *Payload) {
 			p.Discovery.Nodes[0].Pins = []string{payloadPin("01"), payloadPin("02"), payloadPin("03"), payloadPin("04")}
 		},
@@ -103,9 +110,14 @@ func TestValidateRefusesTheWholeFile(t *testing.T) {
 			p.Cluster = nil
 			p.Discovery.Nodes[0].ConfirmedAt = payloadNow.Add(-48 * time.Hour)
 		},
-		"hint name with dots": func(p *Payload) { p.ColdStart = &ColdStartHint{Name: "pve2.example.com", ProbedAt: payloadNow} },
-		"hint name empty":     func(p *Payload) { p.ColdStart = &ColdStartHint{ProbedAt: payloadNow} },
-		"more than 64 nodes":  func(p *Payload) { p.Discovery.Nodes = tooMany.Discovery.Nodes },
+		"hint name with dots": func(p *Payload) {
+			p.ColdStart = &ColdStartHint{
+				Name:     "pve2.example.com",
+				ProbedAt: payloadNow,
+			}
+		},
+		"hint name empty":    func(p *Payload) { p.ColdStart = &ColdStartHint{ProbedAt: payloadNow} },
+		"more than 64 nodes": func(p *Payload) { p.Discovery.Nodes = tooMany.Discovery.Nodes },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -131,7 +143,10 @@ func TestValidateErrorsNeverEchoTheFile(t *testing.T) {
 func TestValidateAcceptsExactlyMaxNodes(t *testing.T) {
 	p := payloadFor(payloadTestKey())
 	for i := range MaxNodes {
-		p.Discovery.Nodes = append(p.Discovery.Nodes, payloadNode("n"+string(rune('a'+i%26))+string(rune('a'+i/26)), payloadNow))
+		p.Discovery.Nodes = append(
+			p.Discovery.Nodes,
+			payloadNode("n"+string(rune('a'+i%26))+string(rune('a'+i/26)), payloadNow),
+		)
 	}
 	got, drops := validatedPayload(t, p)
 	if len(got.Discovery.Nodes) != MaxNodes || len(drops) != 0 {
@@ -145,7 +160,8 @@ func TestValidateAcceptsAnEmptyDiscovery(t *testing.T) {
 		p.Discovery.Outcome = outcome
 		p.Discovery.NextRefreshAfter = payloadNow.Add(MaxRefreshWait)
 		got, drops := validatedPayload(t, p)
-		if got.Discovery == nil || got.Discovery.Outcome != outcome || len(got.Discovery.Nodes) != 0 || len(drops) != 0 {
+		if got.Discovery == nil || got.Discovery.Outcome != outcome || len(got.Discovery.Nodes) != 0 ||
+			len(drops) != 0 {
 			t.Errorf("outcome %s: %+v, drops %v", outcome, got.Discovery, drops)
 		}
 		if !got.Discovery.NextRefreshAfter.Equal(p.Discovery.NextRefreshAfter) {
@@ -155,7 +171,15 @@ func TestValidateAcceptsAnEmptyDiscovery(t *testing.T) {
 }
 
 func TestValidateDropsAmbiguousNamesAlone(t *testing.T) {
-	for _, name := range []string{"123", "0x7f000001", "0X7F", "localhost", "LocalHost", "ip6-localhost", "ip6-loopback"} {
+	for _, name := range []string{
+		"123",
+		"0x7f000001",
+		"0X7F",
+		"localhost",
+		"LocalHost",
+		"ip6-localhost",
+		"ip6-loopback",
+	} {
 		t.Run(name, func(t *testing.T) {
 			p := payloadFor(payloadTestKey(), "pve2", "pve3")
 			p.Discovery.Nodes[1] = payloadNode(name, payloadNow)
@@ -412,7 +436,10 @@ func TestValidateLoadsNoNodeOfAConflictedIdentity(t *testing.T) {
 	for i := range p.Discovery.Nodes {
 		p.Discovery.Nodes[i].ConfirmedAt = payloadNow.Add(-48 * time.Hour)
 	}
-	if _, drops := validatedPayload(t, p); len(drops) != 2 || drops[0].Reason != DropExpired || drops[1].Reason != DropExpired {
+	if _, drops := validatedPayload(
+		t,
+		p,
+	); len(drops) != 2 || drops[0].Reason != DropExpired || drops[1].Reason != DropExpired {
 		t.Errorf("expired nodes of a conflicted identity: drops %v", drops)
 	}
 }
@@ -422,7 +449,11 @@ func TestValidateRefusesNodesUnderAnOutcomeThatHoldsNone(t *testing.T) {
 		t.Run(string(outcome), func(t *testing.T) {
 			p := payloadFor(payloadTestKey(), "pve2")
 			p.Discovery.Outcome = outcome
-			if _, _, err := Validate(p, p.Key, payloadNow); !errors.Is(err, ErrPayloadInvalid) || !errors.Is(err, ErrFileInvalid) {
+			if _, _, err := Validate(
+				p,
+				p.Key,
+				payloadNow,
+			); !errors.Is(err, ErrPayloadInvalid) || !errors.Is(err, ErrFileInvalid) {
 				t.Errorf("Validate: %v, want ErrPayloadInvalid", err)
 			}
 			// An expired node is still a node the outcome says does not exist.
@@ -448,7 +479,8 @@ func TestValidateNormalizesPinsAndAddresses(t *testing.T) {
 	p.Cluster.RootCASHA256 = strings.ToUpper(payloadPin("3c"))
 	got, _ := validatedPayload(t, p)
 	node := got.Discovery.Nodes[0]
-	if node.Address != "pve2.dc1.example.com" || !reflect.DeepEqual(node.Pins, []string{payloadPin("ab"), payloadPin("cd")}) {
+	if node.Address != "pve2.dc1.example.com" ||
+		!reflect.DeepEqual(node.Pins, []string{payloadPin("ab"), payloadPin("cd")}) {
 		t.Errorf("node %+v", node)
 	}
 	if got.Cluster.RootCASHA256 != payloadPin("3c") {
@@ -463,15 +495,50 @@ func TestValidateDropsANodeWhoseAddressTheSeedDoesNotDerive(t *testing.T) {
 		node   DiscoveredNode
 		reason DropReason
 	}{
-		{"foreign domain", "", DiscoveredNode{Name: "pve2", Address: "pve2.attacker.example", Port: 8006}, DropNotDerived},
+		{
+			"foreign domain",
+			"",
+			DiscoveredNode{Name: "pve2", Address: "pve2.attacker.example", Port: 8006},
+			DropNotDerived,
+		},
 		{"another host", "", DiscoveredNode{Name: "pve2", Address: "evil.example.com", Port: 8006}, DropNotDerived},
-		{"address that only starts with the name", "", DiscoveredNode{Name: "pve2", Address: "pve2evil.example.com", Port: 8006}, DropNotDerived},
-		{"sibling domain", "", DiscoveredNode{Name: "pve2", Address: "pve2.dc2.example.com", Port: 8006}, DropNotDerived},
-		{"bare name under a dotted seed", "", DiscoveredNode{Name: "pve2", Address: "pve2", Port: 8006}, DropNotDerived},
+		{
+			"address that only starts with the name",
+			"",
+			DiscoveredNode{Name: "pve2", Address: "pve2evil.example.com", Port: 8006},
+			DropNotDerived,
+		},
+		{
+			"sibling domain",
+			"",
+			DiscoveredNode{Name: "pve2", Address: "pve2.dc2.example.com", Port: 8006},
+			DropNotDerived,
+		},
+		{
+			"bare name under a dotted seed",
+			"",
+			DiscoveredNode{Name: "pve2", Address: "pve2", Port: 8006},
+			DropNotDerived,
+		},
 		{"IPv6 literal", "", DiscoveredNode{Name: "pve2", Address: "::1", Port: 8006}, DropNotDerived},
-		{"port other than the seed's", "", DiscoveredNode{Name: "pve2", Address: "pve2.dc1.example.com", Port: 22}, DropNotDerived},
-		{"host that is a public suffix", "pve1.amazonaws.com:8006", DiscoveredNode{Name: "s3", Address: "s3.amazonaws.com", Port: 8006}, DropPublicSuffix},
-		{"dotted name under a bare seed", "pve1:8006", DiscoveredNode{Name: "pve2", Address: "pve2.dc1.example.com", Port: 8006}, DropNotDerived},
+		{
+			"port other than the seed's",
+			"",
+			DiscoveredNode{Name: "pve2", Address: "pve2.dc1.example.com", Port: 22},
+			DropNotDerived,
+		},
+		{
+			"host that is a public suffix",
+			"pve1.amazonaws.com:8006",
+			DiscoveredNode{Name: "s3", Address: "s3.amazonaws.com", Port: 8006},
+			DropPublicSuffix,
+		},
+		{
+			"dotted name under a bare seed",
+			"pve1:8006",
+			DiscoveredNode{Name: "pve2", Address: "pve2.dc1.example.com", Port: 8006},
+			DropNotDerived,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -590,7 +657,12 @@ func TestValidateObservedViaNamesAConfiguredEndpoint(t *testing.T) {
 			p.Cluster.ObservedVia = tc.via
 			got, drops := validatedPayload(t, p)
 			if got.Cluster == nil || got.Cluster.ObservedVia != tc.want || len(got.Discovery.Nodes) != 1 {
-				t.Errorf("cluster %+v, nodes %+v, want observed_via %q and the rest kept", got.Cluster, got.Discovery.Nodes, tc.want)
+				t.Errorf(
+					"cluster %+v, nodes %+v, want observed_via %q and the rest kept",
+					got.Cluster,
+					got.Discovery.Nodes,
+					tc.want,
+				)
 			}
 			var want []Drop
 			if tc.drop {
@@ -633,7 +705,8 @@ func TestReadStoredKnowsEveryNodeThatPassesTheFormat(t *testing.T) {
 	// A section dated ahead is left out of use, and its nodes are still known.
 	p.Discovery.DiscoveredAt = payloadNow.Add(time.Hour)
 	state, _, err = readStored(p, p.Key, payloadNow)
-	if err != nil || state.usable.Discovery != nil || len(state.known) != 4 || !reflect.DeepEqual(state.discovery, p.Discovery) {
+	if err != nil || state.usable.Discovery != nil || len(state.known) != 4 ||
+		!reflect.DeepEqual(state.discovery, p.Discovery) {
 		t.Errorf("section ahead: %+v, %v", state, err)
 	}
 }
@@ -709,8 +782,13 @@ func TestValidateLeavesOutANodeThatIsAConfiguredEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Drop{{Record: "node 0", Reason: DropConfiguredEndpoint}, {Record: "node 2", Reason: DropConfiguredEndpoint}}
-	if got := trustNodeNames(state.usable); !reflect.DeepEqual(got, []string{"pve2"}) || !reflect.DeepEqual(drops, want) {
+	want := []Drop{
+		{Record: "node 0", Reason: DropConfiguredEndpoint},
+		{Record: "node 2", Reason: DropConfiguredEndpoint},
+	}
+	if got := trustNodeNames(
+		state.usable,
+	); !reflect.DeepEqual(got, []string{"pve2"}) || !reflect.DeepEqual(drops, want) {
 		t.Errorf("read loads %v with drops %v, want pve2 and %v", got, drops, want)
 	}
 	if len(state.known) != 3 {

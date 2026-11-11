@@ -13,20 +13,28 @@ import (
 // for an endpoint store. It was taken from the code before a store had a
 // display name, so a match shows that those messages are byte-identical.
 var endpointMessagesGolden = []string{
-	"directory open mode: cache directory <dir> (override layer): endpoint cache: unsafe permissions: <dir> has mode 0755 and must grant no group or other access",
-	"directory path not clean: cache directory <dir>/. (override layer): endpoint cache: unsafe file type: <dir>/. is not a clean path",
-	"directory without owner access: cache directory <dir> (override layer): endpoint cache: unsafe permissions: <dir> has mode 0500 and its owner needs read, write, and search access",
-	"opened directory open mode: endpoint cache: unsafe permissions: <dir> has mode 0755 and must grant no group or other access",
+	"directory open mode: cache directory <dir> (override layer): endpoint cache: unsafe permissions: <dir> has mode " +
+		"0755 and must grant no group or other access",
+	"directory path not clean: cache directory <dir>/. (override layer): endpoint cache: unsafe file type: <dir>/. " +
+		"is not a clean path",
+	"directory without owner access: cache directory <dir> (override layer): endpoint cache: unsafe permissions: " +
+		"<dir> has mode 0500 and its owner needs read, write, and search access",
+	"opened directory open mode: endpoint cache: unsafe permissions: <dir> has mode 0755 and must grant no group or " +
+		"other access",
 	"no directory: endpoint cache: no cache directory",
-	"secret open mode: endpoint cache: refusing directory secret <dir>/secret: endpoint cache: unsafe permissions: <dir>/secret has mode 0644 and must grant no group or other access",
+	"secret open mode: endpoint cache: refusing directory secret <dir>/secret: endpoint cache: unsafe permissions: " +
+		"<dir>/secret has mode 0644 and must grant no group or other access",
 	"secret lock busy: endpoint cache: directory secret lock is busy",
-	"lock file open mode: endpoint cache: unsafe permissions: <dir>/<lock> has mode 0644 and must grant no group or other access",
+	"lock file open mode: endpoint cache: unsafe permissions: <dir>/<lock> has mode 0644 and must grant no group or " +
+		"other access",
 	"skipped write: endpoint cache lock wait expired; skipping the cache write",
 	"lock wait abandoned: endpoint cache: lock wait ended with the caller's context: context deadline exceeded",
-	"damaged file: endpoint cache: invalid file: malformed envelope: invalid character 'o' in literal null (expecting 'u')",
+	"damaged file: endpoint cache: invalid file: malformed envelope: invalid character 'o' in literal null " +
+		"(expecting 'u')",
 	"file for another key: endpoint cache: file key does not match",
 	"newer file version: endpoint cache: unsupported file version: version 2",
-	"file open mode: endpoint cache: unsafe permissions: <dir>/<file> has mode 0644 and must grant no group or other access",
+	"file open mode: endpoint cache: unsafe permissions: <dir>/<file> has mode 0644 and must grant no group or other " +
+		"access",
 	"read on a closed store: endpoint cache: store is closed",
 	"update on a closed store: endpoint cache: store is closed",
 	"discovery lock on a closed store: endpoint cache: store is closed",
@@ -110,7 +118,10 @@ func TestAnHAProfileStoresCausesMatchTheEndpointCachesUnderErrorsIs(t *testing.T
 		{profile.ownership, errCacheOwnership}, {profile.mode, errCacheMode}, {profile.fileType, errCacheFileType},
 		{profile.lockReplaced, ErrLockReplaced}, {profile.lockAbandoned, ErrLockWaitAbandoned},
 		{profile.lockBusy, errLockBusy}, {profile.secretBusy, ErrSecretBusy}, {profile.secretLength, errSecretLength},
-		{profile.invalid, ErrFileInvalid}, {profile.keyMismatch, ErrKeyMismatch}, {profile.unsupported, ErrUnsupportedVersion},
+		{
+			profile.invalid,
+			ErrFileInvalid,
+		}, {profile.keyMismatch, ErrKeyMismatch}, {profile.unsupported, ErrUnsupportedVersion},
 	}
 	for _, p := range pairs {
 		if !errors.Is(p.own, p.endpoint) {

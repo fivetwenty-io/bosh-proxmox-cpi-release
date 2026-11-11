@@ -275,7 +275,9 @@ func TestPoolSentinelCreateThenReleaseNeverReachesTheOtherServer(t *testing.T) {
 				t.Errorf("the closed server read %d deletes", got)
 			}
 			if fwGets(b) == 0 {
-				t.Error("the claim read never failed over to the second server, so the test did not exercise a read hop")
+				t.Error(
+					"the claim read never failed over to the second server, so the test did not exercise a read hop",
+				)
 			}
 		})
 	}
@@ -322,7 +324,9 @@ func TestPoolSentinelReleaseGoesToTheCreateServerAfterAReadMovedTheActiveEndpoin
 	if err := svc.releasePoisonedSentinel(pve.WithExpectedLockClaim(ctx, fwClaim), fwSentinel); err != nil {
 		t.Fatalf("releasePoisonedSentinel: %v", err)
 	}
-	if got, want := fwMutations(a), []string{"POST /pools", "DELETE /pools"}; strings.Join(got, ",") != strings.Join(want, ",") {
+	if got, want := fwMutations(
+		a,
+	), []string{"POST /pools", "DELETE /pools"}; strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("the first server read %v, want %v", got, want)
 	}
 	fwNoMutations(t, "the second server", b)

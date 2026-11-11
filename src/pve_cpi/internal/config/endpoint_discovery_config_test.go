@@ -287,7 +287,8 @@ func TestEffectiveDiscoveryMode(t *testing.T) {
 			wantReason: discoveryReasonLooserTLS,
 		},
 		{
-			name: "row 1: on with credentials inherited under looser TLS is off and silent for a caller that skipped validation",
+			name: "row 1: on with credentials inherited under looser TLS is off and silent for a caller that skipped " +
+				"validation",
 			build: func() *CPIConfig {
 				c := discoveryBaseCfg()
 				c.APIEndpointDiscovery = DiscoveryModeOn
@@ -563,7 +564,8 @@ func TestEffectiveDiscoveryMode_NeverAnswersAuto(t *testing.T) {
 								mode, password, verify, count, looser, got)
 						}
 						if got == DiscoveryModeOn && discoveryErrorOf(c) != "" {
-							t.Errorf("mode %q password %v verify %v endpoints %d looser %v is invalid yet resolves to on",
+							t.Errorf("mode %q password %v verify %v endpoints %d looser %v is invalid yet resolves "+
+								"to on",
 								mode, password, verify, count, looser)
 						}
 					}
@@ -692,7 +694,10 @@ func TestInheritedCredsLooserTLS_IsPrivateAndSurvivesACopy(t *testing.T) {
 	if _, known := knownConfigFields["inherited_creds_looser_tls"]; known {
 		t.Error("the flag is a known config field")
 	}
-	loaded, err := mustLoadDiscovery(t, discoveryLoadJSON(`, "inheritedCredsLooserTLS": true, "inherited_creds_looser_tls": true`))
+	loaded, err := mustLoadDiscovery(
+		t,
+		discoveryLoadJSON(`, "inheritedCredsLooserTLS": true, "inherited_creds_looser_tls": true`),
+	)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -739,16 +744,37 @@ func TestValidateEndpointCacheDir_RejectsBadPaths(t *testing.T) {
 		{"dot relative", "./cache", "", `endpoint_cache_dir must be an absolute path, got "./cache"`},
 		{"blank", "   ", "", `endpoint_cache_dir must be an absolute path, got "   "`},
 		{"tilde", "~/cache", "", `endpoint_cache_dir must be an absolute path, got "~/cache"`},
-		{"trailing slash", "/var/cache/pve/", "", `must be a clean path, write "/var/cache/pve" instead of "/var/cache/pve/"`},
+		{
+			"trailing slash",
+			"/var/cache/pve/",
+			"",
+			`must be a clean path, write "/var/cache/pve" instead of "/var/cache/pve/"`,
+		},
 		{"doubled slash", "/var//cache", "", `must be a clean path, write "/var/cache" instead of "/var//cache"`},
 		{"dot segment", "/var/./cache", "", `must be a clean path, write "/var/cache" instead of "/var/./cache"`},
-		{"parent segment", "/var/vcap/../cache", "", `must be a clean path, write "/var/cache" instead of "/var/vcap/../cache"`},
-		{"trailing space", "/var/cache ", "", `endpoint_cache_dir must not have leading or trailing whitespace, got "/var/cache "`},
-		{"trailing space after a separator", "/var/cache/ ", "", "endpoint_cache_dir must not have leading or trailing whitespace"},
+		{
+			"parent segment",
+			"/var/vcap/../cache",
+			"",
+			`must be a clean path, write "/var/cache" instead of "/var/vcap/../cache"`,
+		},
+		{
+			"trailing space",
+			"/var/cache ",
+			"",
+			`endpoint_cache_dir must not have leading or trailing whitespace, got "/var/cache "`,
+		},
+		{
+			"trailing space after a separator",
+			"/var/cache/ ",
+			"",
+			"endpoint_cache_dir must not have leading or trailing whitespace",
+		},
 		{"root", "/", "", "endpoint_cache_dir must not be the root directory"},
 		{"root with a journal", "/", "/var/vcap/store/journal", "endpoint_cache_dir must not be the root directory"},
 		{"journal with a trailing space", "/var/j/cache", "/var/j ",
-			`storage_allocation_journal_dir must not have leading or trailing whitespace when endpoint_cache_dir is set, got "/var/j "`},
+			`storage_allocation_journal_dir must not have leading or trailing whitespace ` +
+				`when endpoint_cache_dir is set, got "/var/j "`},
 		{"journal with a leading space", "/var/j/cache", " /var/j",
 			"storage_allocation_journal_dir must not have leading or trailing whitespace"},
 		{"newline", "/var/cache\n/x", "", "endpoint_cache_dir must not contain control characters"},
@@ -811,7 +837,9 @@ func TestValidateEndpointCacheDir_JournalWhitespaceOnlyMattersWhenTheCacheDirIsS
 		t.Errorf("a journal path alone was refused for whitespace: %s", msg)
 	}
 	c.EndpointCacheDir = "/var/j/cache"
-	if msg := discoveryErrorOf(c); !strings.Contains(msg, "storage_allocation_journal_dir must not have leading or trailing whitespace") {
+	if msg := discoveryErrorOf(
+		c,
+	); !strings.Contains(msg, "storage_allocation_journal_dir must not have leading or trailing whitespace") {
 		t.Errorf("the whitespace journal evaded the containment check: %q", msg)
 	}
 	// With the whitespace gone the same pair is caught as contained.

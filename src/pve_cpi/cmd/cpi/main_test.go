@@ -608,7 +608,9 @@ func (h *lineSpyHandler) levelOf(message string) (slog.Level, bool) {
 
 // factory returns a LoggerProviderFactory that hands the spy to the process
 // logger and calls onShutdown when the logs pipeline is flushed.
-func (h *lineSpyHandler) factory(onShutdown func()) func(context.Context, config.OTelConfig, *log.Logger) (slog.Handler, func(context.Context) error, error) {
+func (h *lineSpyHandler) factory(
+	onShutdown func(),
+) func(context.Context, config.OTelConfig, *log.Logger) (slog.Handler, func(context.Context) error, error) {
 	return func(context.Context, config.OTelConfig, *log.Logger) (slog.Handler, func(context.Context) error, error) {
 		return h, func(context.Context) error {
 			onShutdown()
@@ -697,7 +699,10 @@ func (w *drainTestWorker) cancelled(t *testing.T) bool {
 // factoryStarting returns a client factory that starts background work with
 // start and then returns nilPVEClient, the way a client that begins a
 // discovery refresh hands back a usable client.
-func factoryStarting(t *testing.T, start func() error) func(*config.CPIConfig, *log.Logger, trace.Tracer) (pve.Client, error) {
+func factoryStarting(
+	t *testing.T,
+	start func() error,
+) func(*config.CPIConfig, *log.Logger, trace.Tracer) (pve.Client, error) {
 	t.Helper()
 	return func(*config.CPIConfig, *log.Logger, trace.Tracer) (pve.Client, error) {
 		if err := start(); err != nil {
@@ -769,7 +774,10 @@ func TestDrainStopsAtItsBoundAndKeepsExitCode(t *testing.T) {
 	const bound = 200 * time.Millisecond
 
 	code, stdout, stderr, took := drainRun([]string{"--config", cfgPath}, drainInfoRequest,
-		runOptions{ClientFactory: factoryStarting(t, func() error { return worker.start("discovery") }), DrainWait: bound})
+		runOptions{
+			ClientFactory: factoryStarting(t, func() error { return worker.start("discovery") }),
+			DrainWait:     bound,
+		})
 	if code != 0 {
 		t.Fatalf("exit %d with a slow worker, want 0: %s", code, stderr)
 	}
@@ -856,7 +864,11 @@ func TestDrainWaitsForWorkThatFinishesInTime(t *testing.T) {
 func TestPanickingWorkerKeepsExitCode(t *testing.T) {
 	cfgPath := writeOTelWiringConfigAtLevel(t, "warn", "")
 	start := func() error {
-		return endpointcache.Go("discovery", config.DiscoveryModeAuto, func(context.Context) { panic("simulated worker defect") })
+		return endpointcache.Go(
+			"discovery",
+			config.DiscoveryModeAuto,
+			func(context.Context) { panic("simulated worker defect") },
+		)
 	}
 	spy := &lineSpyHandler{}
 	code, stdout, stderr, _ := drainRun([]string{"--config", cfgPath}, drainInfoRequest,
@@ -887,7 +899,11 @@ func TestSubcommandDrainsBackgroundWork(t *testing.T) {
 		if err := worker.start("discovery"); err != nil {
 			return err
 		}
-		return endpointcache.Go("down mark", config.DiscoveryModeAuto, func(context.Context) { panic("simulated subcommand defect") })
+		return endpointcache.Go(
+			"down mark",
+			config.DiscoveryModeAuto,
+			func(context.Context) { panic("simulated subcommand defect") },
+		)
 	}
 	failing := func(*config.CPIConfig, *log.Logger, trace.Tracer) (pve.Client, error) {
 		if err := start(); err != nil {
@@ -967,7 +983,10 @@ func TestCancelledWorkerLevelFollowsItsOwnConfigMode(t *testing.T) {
 			worker := newDrainTestWorker(t)
 			spy := &lineSpyHandler{}
 			code, _, stderr, _ := drainRun([]string{"--config", cfgPath}, drainInfoRequest, runOptions{
-				ClientFactory:         factoryStarting(t, func() error { return worker.startWith("discovery", tc.mode) }),
+				ClientFactory: factoryStarting(
+					t,
+					func() error { return worker.startWith("discovery", tc.mode) },
+				),
 				LoggerProviderFactory: spy.factory(func() {}),
 				DrainWait:             50 * time.Millisecond,
 			})
@@ -1046,7 +1065,10 @@ func TestSignalEndsTheMainDrainAndKeepsExitCode(t *testing.T) {
 	codeCh := make(chan int, 1)
 	go func() {
 		codeCh <- runWithArgs([]string{"--config", cfgPath}, strings.NewReader(drainInfoRequest), &stdout, &stderr,
-			runOptions{ClientFactory: factoryStarting(t, func() error { return worker.start("discovery") }), DrainWait: time.Hour})
+			runOptions{
+				ClientFactory: factoryStarting(t, func() error { return worker.start("discovery") }),
+				DrainWait:     time.Hour,
+			})
 	}()
 	t.Cleanup(func() {
 		worker.finish()

@@ -323,7 +323,10 @@ func TestTemporaryLayerNeverRepairsAnythingItDidNotCreate(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(target, 0o700) })
-		choice, _ := endpointTexts.temporaryLayerIn(parent, func(path string, _ os.FileMode) error { return os.Symlink(target, path) })
+		choice, _ := endpointTexts.temporaryLayerIn(
+			parent,
+			func(path string, _ os.FileMode) error { return os.Symlink(target, path) },
+		)
 		requireUnsafe(t, choice, privatefile.ErrUnsafeFileType)
 		requireMode(t, target, 0o500)
 	})
@@ -478,7 +481,13 @@ func TestOverrideRefusesRelativeAndUncleanPaths(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			choice := resolve(t, Options{Override: override})
 			if choice.Usable() || choice.Err == nil || choice.Layer != LayerOverride {
-				t.Fatalf("override %q: usable %v, layer %s, reason %v", override, choice.Usable(), choice.Layer, choice.Err)
+				t.Fatalf(
+					"override %q: usable %v, layer %s, reason %v",
+					override,
+					choice.Usable(),
+					choice.Layer,
+					choice.Err,
+				)
 			}
 		})
 	}

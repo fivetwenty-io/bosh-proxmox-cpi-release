@@ -390,7 +390,13 @@ func TestRequestOverrideCacheKey_DiscoveryModeMatrix(t *testing.T) {
 				}
 				unnamed, _ := keyFor(map[string]any{"pve_vm_storage": "other"})
 				named, eff := keyFor(map[string]any{"pve_vm_storage": "other", "pve_api_endpoint_discovery": entryMode})
-				want := map[any]config.DiscoveryMode{"auto": auto, "on": on, "off": off, true: on, false: off}[entryMode]
+				want := map[any]config.DiscoveryMode{
+					"auto": auto,
+					"on":   on,
+					"off":  off,
+					true:   on,
+					false:  off,
+				}[entryMode]
 				if got := eff.DiscoveryModeValue(); got != want {
 					t.Fatalf("entry mode %v resolved to %q, want %q", entryMode, got, want)
 				}

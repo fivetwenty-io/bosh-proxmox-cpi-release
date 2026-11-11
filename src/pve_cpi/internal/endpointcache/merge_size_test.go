@@ -58,7 +58,10 @@ func newLargestLegal(t *testing.T) largestLegal {
 	mark := func(endpoint string) {
 		// One second apart keeps every mark inside MarkTTL and gives each its own
 		// place in the order.
-		marks[endpoint] = DownMark{DownAt: at.Add(-time.Duration(len(newestFirst)) * time.Second), Class: MarkTLSHandshake}
+		marks[endpoint] = DownMark{
+			DownAt: at.Add(-time.Duration(len(newestFirst)) * time.Second),
+			Class:  MarkTLSHandshake,
+		}
 		newestFirst = append(newestFirst, endpoint)
 	}
 	pool := make([]string, 0, 8)
@@ -92,7 +95,11 @@ func TestStoreWritesTheLargestConfigWithinTheSizeCap(t *testing.T) {
 	dir := newStoreDir(t)
 	s := openStoreFor(t, dir, big.cfg)
 
-	res, err := s.UpdatePayload(context.Background(), payloadNow, func(Stored) (Change, error) { return big.change, nil })
+	res, err := s.UpdatePayload(
+		context.Background(),
+		payloadNow,
+		func(Stored) (Change, error) { return big.change, nil },
+	)
 	if err != nil || !res.Written || len(res.Dropped) != 0 {
 		t.Fatalf("UpdatePayload: %+v, %v", res, err)
 	}
@@ -218,7 +225,11 @@ func TestEnvelopeMarginCoversTheEnvelope(t *testing.T) {
 	}
 	overhead := int(info.Size()) - len(payload)
 	if overhead > envelopeMargin || overhead < envelopeMargin-32 {
-		t.Errorf("the envelope adds %d bytes, want at most the margin %d and not far under it", overhead, envelopeMargin)
+		t.Errorf(
+			"the envelope adds %d bytes, want at most the margin %d and not far under it",
+			overhead,
+			envelopeMargin,
+		)
 	}
 }
 

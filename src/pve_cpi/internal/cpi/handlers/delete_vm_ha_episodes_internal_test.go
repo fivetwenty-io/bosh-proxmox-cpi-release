@@ -115,7 +115,11 @@ func TestRecoveryGraceWindowRunsOutAcrossCallsWithAMissingOverride(t *testing.T)
 		expiredWarn = expiredWarn || strings.Contains(e.Message, "grace window expired")
 	}
 	if !missingWarn || !expiredWarn {
-		t.Errorf("want the missing-directory warning and the expiry warning, got missing=%v expired=%v", missingWarn, expiredWarn)
+		t.Errorf(
+			"want the missing-directory warning and the expiry warning, got missing=%v expired=%v",
+			missingWarn,
+			expiredWarn,
+		)
 	}
 	if _, statErr := os.Stat(missing); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Errorf("the override directory must never be created: %v", statErr)

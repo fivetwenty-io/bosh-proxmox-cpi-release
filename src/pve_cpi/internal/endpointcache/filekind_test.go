@@ -18,7 +18,12 @@ import (
 
 // haProfileOptions is the option set the HA profile cache opens its store with.
 func haProfileOptions() StoreOptions {
-	return StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", Version: 1, DisplayName: HAProfileName}
+	return StoreOptions{
+		FilePrefix:  HAProfilePrefix,
+		Label:       "pve-cpi ha-profile",
+		Version:     1,
+		DisplayName: HAProfileName,
+	}
 }
 
 func TestKindForDefaultsToTheEndpointCacheFile(t *testing.T) {
@@ -35,7 +40,9 @@ func TestKindForDefaultsToTheEndpointCacheFile(t *testing.T) {
 }
 
 func TestKindForNamesTheFileAndDefaultsTheVersionToOne(t *testing.T) {
-	kind, err := kindFor(StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", DisplayName: HAProfileName})
+	kind, err := kindFor(
+		StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", DisplayName: HAProfileName},
+	)
 	if err != nil {
 		t.Fatalf("kindFor: %v", err)
 	}
@@ -74,28 +81,50 @@ func TestKindForValidatesTheOptions(t *testing.T) {
 		opts StoreOptions
 		ok   bool
 	}{
-		"ha profile":                {haProfileOptions(), true},
-		"ha profile version unset":  {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile"}, true},
-		"ha profile version 2":      {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", Version: 2}, true},
-		"label only":                {StoreOptions{Label: "pve-cpi ha-profile"}, false},
-		"version only":              {StoreOptions{Version: 2}, false},
-		"prefix only":               {StoreOptions{FilePrefix: HAProfilePrefix}, false},
-		"unknown prefix":            {StoreOptions{FilePrefix: "other-", Label: "pve-cpi other"}, false},
-		"prefix without hyphen":     {StoreOptions{FilePrefix: "ha_profile", Label: "pve-cpi ha-profile"}, false},
-		"hyphen-only prefix":        {StoreOptions{FilePrefix: "ha-profile-", Label: "pve-cpi ha-profile"}, false},
-		"uppercase prefix":          {StoreOptions{FilePrefix: "HA_PROFILE-", Label: "pve-cpi ha-profile"}, false},
-		"endpoint label":            {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi endpoint-cache"}, false},
-		"endpoint label extended":   {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi endpoint-cache v1"}, false},
+		"ha profile":               {haProfileOptions(), true},
+		"ha profile version unset": {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile"}, true},
+		"ha profile version 2": {
+			StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", Version: 2},
+			true,
+		},
+		"label only":            {StoreOptions{Label: "pve-cpi ha-profile"}, false},
+		"version only":          {StoreOptions{Version: 2}, false},
+		"prefix only":           {StoreOptions{FilePrefix: HAProfilePrefix}, false},
+		"unknown prefix":        {StoreOptions{FilePrefix: "other-", Label: "pve-cpi other"}, false},
+		"prefix without hyphen": {StoreOptions{FilePrefix: "ha_profile", Label: "pve-cpi ha-profile"}, false},
+		"hyphen-only prefix":    {StoreOptions{FilePrefix: "ha-profile-", Label: "pve-cpi ha-profile"}, false},
+		"uppercase prefix":      {StoreOptions{FilePrefix: "HA_PROFILE-", Label: "pve-cpi ha-profile"}, false},
+		"endpoint label": {
+			StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi endpoint-cache"},
+			false,
+		},
+		"endpoint label extended": {
+			StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi endpoint-cache v1"},
+			false,
+		},
 		"uppercase label":           {StoreOptions{FilePrefix: HAProfilePrefix, Label: "Pve ha"}, false},
 		"label with a control byte": {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve ha\n"}, false},
 		"label with a double space": {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve  ha"}, false},
 		"label too long":            {StoreOptions{FilePrefix: HAProfilePrefix, Label: long}, false},
-		"negative version":          {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", Version: -1}, false},
-		"display name only":         {StoreOptions{DisplayName: HAProfileName}, false},
-		"display name with a break": {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", DisplayName: "HA\nprofile"}, false},
-		"display name with a colon": {StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", DisplayName: "HA: profile"}, false},
+		"negative version": {
+			StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", Version: -1},
+			false,
+		},
+		"display name only": {StoreOptions{DisplayName: HAProfileName}, false},
+		"display name with a break": {
+			StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", DisplayName: "HA\nprofile"},
+			false,
+		},
+		"display name with a colon": {
+			StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", DisplayName: "HA: profile"},
+			false,
+		},
 		"display name too long": {
-			StoreOptions{FilePrefix: HAProfilePrefix, Label: "pve-cpi ha-profile", DisplayName: strings.Repeat("a", maxDisplayName+1)}, false,
+			StoreOptions{
+				FilePrefix:  HAProfilePrefix,
+				Label:       "pve-cpi ha-profile",
+				DisplayName: strings.Repeat("a", maxDisplayName+1),
+			}, false,
 		},
 	}
 	for name, tc := range cases {
@@ -139,7 +168,10 @@ func TestADefaultStoreAndAnExplicitEndpointStoreMakeIdenticalFiles(t *testing.T)
 	storePut(t, def, "same")
 	want := readStoreFile(t, filepath.Join(dir, def.FileName()))
 
-	explicit, err := openStoreOfKind(context.Background(), storeTestRoot(t, dir), storeTestConfig(), storeTestCredential,
+	explicit, err := openStoreOfKind(context.Background(), storeTestRoot(
+		t,
+		dir,
+	), storeTestConfig(), storeTestCredential,
 		StoreOptions{}, fileKind{label: "pve-cpi endpoint-cache", version: 1})
 	if err != nil {
 		t.Fatalf("openStoreOfKind: %v", err)
@@ -218,7 +250,11 @@ func TestADifferentSchemaVersionIsADifferentHMACKey(t *testing.T) {
 	got = storeTestPayload{}
 	err := v2.Read(&got)
 	if !errors.Is(err, ErrFileInvalid) || errors.Is(err, ErrUnsupportedVersion) || got.Note != "" {
-		t.Fatalf("version 2 store reading a relabeled file: %+v, %v, want an HMAC failure and not a version one", got, err)
+		t.Fatalf(
+			"version 2 store reading a relabeled file: %+v, %v, want an HMAC failure and not a version one",
+			got,
+			err,
+		)
 	}
 	// The same bytes verify under the version 1 key once the label is restored.
 	writeStoreFile(t, path, original, 0o600)
@@ -487,9 +523,18 @@ func TestStoreSweepOfAnotherKindNeverRemovesTheEndpointCachesFiles(t *testing.T)
 		t.Errorf("removed %v, want only the profile orphans and the old temporary file", result.Removed)
 	}
 	got := storeDirNames(t, dir)
-	for _, name := range append(slices.Clone(endpointNames), endpointOrphan, profile.FileName(), profile.kind.lockName(profile.Key())) {
+	for _, name := range append(
+		slices.Clone(endpointNames),
+		endpointOrphan,
+		profile.FileName(),
+		profile.kind.lockName(profile.Key()),
+	) {
 		if !slices.Contains(got, name) {
-			t.Errorf("the sweep of the profile cache removed %s, which is not a profile file; directory holds %v", name, got)
+			t.Errorf(
+				"the sweep of the profile cache removed %s, which is not a profile file; directory holds %v",
+				name,
+				got,
+			)
 		}
 	}
 }
@@ -512,7 +557,13 @@ func TestTheNamesCallersPassAreValidDisplayNames(t *testing.T) {
 func TestOpenStoreRefusesAnInvalidKindBeforeItLooksAtTheDirectory(t *testing.T) {
 	opts := haProfileOptions()
 	opts.DisplayName = "bad\nname"
-	if _, err := OpenStore(context.Background(), nil, storeTestConfig(), storeTestCredential, opts); !errors.Is(err, ErrInvalidFileKind) {
+	if _, err := OpenStore(
+		context.Background(),
+		nil,
+		storeTestConfig(),
+		storeTestCredential,
+		opts,
+	); !errors.Is(err, ErrInvalidFileKind) {
 		t.Errorf("a nil directory with an invalid name gave %v, want ErrInvalidFileKind", err)
 	}
 	_, err := OpenStore(context.Background(), nil, storeTestConfig(), storeTestCredential, haProfileOptions())
@@ -524,7 +575,10 @@ func TestOpenStoreRefusesAnInvalidKindBeforeItLooksAtTheDirectory(t *testing.T) 
 func TestKnownFilePrefixesCannotCollideWithAnEndpointFile(t *testing.T) {
 	for _, p := range knownFilePrefixes {
 		if !validFilePrefix(p) {
-			t.Errorf("known prefix %q is not a lowercase token ending in a hyphen with a character sanitizeHost never emits", p)
+			t.Errorf(
+				"known prefix %q is not a lowercase token ending in a hyphen with a character sanitizeHost never emits",
+				p,
+			)
 		}
 	}
 	if validFilePrefix("ha-profile-") {

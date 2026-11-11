@@ -152,7 +152,11 @@ func (c *closeAfterFirstWrite) CreateHaRules(ctx context.Context, p *sdkcluster.
 	return err
 }
 
-func (c *closeAfterFirstWrite) UpdateHaRules(ctx context.Context, rule string, p *sdkcluster.UpdateHaRulesParams) error {
+func (c *closeAfterFirstWrite) UpdateHaRules(
+	ctx context.Context,
+	rule string,
+	p *sdkcluster.UpdateHaRulesParams,
+) error {
 	err := c.RuleAPI.UpdateHaRules(ctx, rule, p)
 	c.afterWrite()
 	return err
@@ -259,7 +263,11 @@ func TestRuleWriterFirstWriteAndFourResendsNeverReachTheOtherServer(t *testing.T
 			_, err := w.Apply(ctx, "tether", plan)
 
 			if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
-				t.Fatalf("Apply error = %v, want a retriable cloud error after %d held writes", err, RuleWriterMaxAttempts)
+				t.Fatalf(
+					"Apply error = %v, want a retriable cloud error after %d held writes",
+					err,
+					RuleWriterMaxAttempts,
+				)
 			}
 			if got := int(api.sends.Load()); got != RuleWriterMaxAttempts {
 				t.Errorf("the writer sent %d rule writes, want %d", got, RuleWriterMaxAttempts)

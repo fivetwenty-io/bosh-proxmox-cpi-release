@@ -161,8 +161,12 @@ func TestEpisodeStore_UnusableRecordsReadAsLost(t *testing.T) {
 	t.Parallel()
 	payload := `{"episodes":{"vm:101":{"uid":"uid-a","first_seen":1}}}`
 	for name, body := range map[string][]byte{
-		"version":  []byte(`{"version":99,"sha256":"` + privatefile.SHA256Hex([]byte(payload)) + `","payload":` + payload + `}`),
-		"checksum": []byte(`{"version":1,"sha256":"` + privatefile.SHA256Hex([]byte("other")) + `","payload":` + payload + `}`),
+		"version": []byte(
+			`{"version":99,"sha256":"` + privatefile.SHA256Hex([]byte(payload)) + `","payload":` + payload + `}`,
+		),
+		"checksum": []byte(
+			`{"version":1,"sha256":"` + privatefile.SHA256Hex([]byte("other")) + `","payload":` + payload + `}`,
+		),
 		"unknown field": []byte(`{"version":1,"sha256":"` + privatefile.SHA256Hex([]byte(`{"episodes":{},"x":1}`)) +
 			`","payload":{"episodes":{},"x":1}}`),
 		"oversize":                 []byte(`{"version":1,"pad":"` + strings.Repeat("x", 1<<20) + `"}`),
@@ -272,7 +276,11 @@ func TestEpisodeStore_MissingOverrideDirectoryFallsBackToTheTemporaryLayer(t *te
 		t.Fatal(err)
 	}
 	if !second.Recorded || second.Elapsed() != 7*time.Minute {
-		t.Fatalf("the clock must run across calls: recorded=%v elapsed=%s, want recorded and 7m", second.Recorded, second.Elapsed())
+		t.Fatalf(
+			"the clock must run across calls: recorded=%v elapsed=%s, want recorded and 7m",
+			second.Recorded,
+			second.Elapsed(),
+		)
 	}
 
 	if _, err := os.Lstat(filepath.Join(temporary, ha.EpisodeFileName)); err != nil {
@@ -439,7 +447,11 @@ func TestEpisodeStore_DirectoryRefusalsNameTheEpisodeRecord(t *testing.T) {
 	if err := os.Chmod(wide, 0o755); err != nil { //nolint:gosec // the umask may have narrowed it
 		t.Fatal(err)
 	}
-	for name, override := range map[string]string{"a file": notADirectory, "a wide mode": wide, "a relative path": "relative/dir"} {
+	for name, override := range map[string]string{
+		"a file":          notADirectory,
+		"a wide mode":     wide,
+		"a relative path": "relative/dir",
+	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			store := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: override}}

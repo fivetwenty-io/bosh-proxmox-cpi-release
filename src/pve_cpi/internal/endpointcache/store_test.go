@@ -377,7 +377,13 @@ func TestStoreRefusesAnUnsafeLockFile(t *testing.T) {
 // Without root it shows the refusal on a directory another user owns.
 func TestStoreRefusesAnotherOwner(t *testing.T) {
 	if os.Geteuid() != 0 {
-		_, err := OpenStore(context.Background(), openSystemRoot(t), storeTestConfig(), storeTestCredential, StoreOptions{})
+		_, err := OpenStore(
+			context.Background(),
+			openSystemRoot(t),
+			storeTestConfig(),
+			storeTestCredential,
+			StoreOptions{},
+		)
 		if !errors.Is(err, privatefile.ErrUnsafeOwnership) {
 			t.Fatalf("OpenStore on a directory another user owns: %v, want the ownership refusal", err)
 		}
@@ -486,7 +492,11 @@ func TestStoreUpdateReportsAnEndedContext(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	written, err := Update(ctx, s, func(*storeTestPayload) (*storeTestPayload, error) { return &storeTestPayload{Key: s.Key()}, nil })
+	written, err := Update(
+		ctx,
+		s,
+		func(*storeTestPayload) (*storeTestPayload, error) { return &storeTestPayload{Key: s.Key()}, nil },
+	)
 	if !errors.Is(err, ErrLockWaitAbandoned) || !errors.Is(err, context.DeadlineExceeded) || written {
 		t.Fatalf("Update with an ended context: written %v, err %v, want ErrLockWaitAbandoned", written, err)
 	}
@@ -573,7 +583,12 @@ func TestStoreUpdateStopsWhenContextEndsWhileLockHeld(t *testing.T) {
 		return &storeTestPayload{Key: s.Key(), Note: "late"}, nil
 	})
 	if written || called || !errors.Is(err, context.Canceled) {
-		t.Fatalf("Update with a context that ended under the lock: written %v, merge called %v, err %v", written, called, err)
+		t.Fatalf(
+			"Update with a context that ended under the lock: written %v, merge called %v, err %v",
+			written,
+			called,
+			err,
+		)
 	}
 	if errors.Is(err, ErrLockWaitAbandoned) {
 		t.Fatalf("the lock wait reported the ended context, so the check under the lock never ran: %v", err)
@@ -602,11 +617,19 @@ func TestStoreUpdateMergeContract(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(dir, s.FileName())); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("merge returning nil left a file: %v", err)
 	}
-	if written, err := Update(context.Background(), s, merge(&storeTestPayload{Key: s.Key(), Note: "one"}, nil)); err != nil || !written {
+	if written, err := Update(
+		context.Background(),
+		s,
+		merge(&storeTestPayload{Key: s.Key(), Note: "one"}, nil),
+	); err != nil || !written {
 		t.Fatalf("first write: written %v, err %v", written, err)
 	}
 	failure := errors.New("merge failed")
-	if written, err := Update(context.Background(), s, merge(&storeTestPayload{Key: s.Key(), Note: "two"}, failure)); !errors.Is(err, failure) || written {
+	if written, err := Update(
+		context.Background(),
+		s,
+		merge(&storeTestPayload{Key: s.Key(), Note: "two"}, failure),
+	); !errors.Is(err, failure) || written {
 		t.Fatalf("failing merge: written %v, err %v", written, err)
 	}
 	if len(seen) != 3 || seen[0] != nil || seen[1] != nil || seen[2] == nil || seen[2].Note != "one" {
@@ -619,7 +642,11 @@ func TestStoreUpdateMergeContract(t *testing.T) {
 
 	path := filepath.Join(dir, s.FileName())
 	writeStoreFile(t, path, []byte("{torn"), 0o600)
-	if written, err := Update(context.Background(), s, merge(&storeTestPayload{Key: s.Key(), Note: "three"}, nil)); err != nil || !written {
+	if written, err := Update(
+		context.Background(),
+		s,
+		merge(&storeTestPayload{Key: s.Key(), Note: "three"}, nil),
+	); err != nil || !written {
 		t.Fatalf("write over a torn file: written %v, err %v", written, err)
 	}
 	if seen[3] != nil {
@@ -666,7 +693,8 @@ func TestFileNameDiffersAcrossDirectories(t *testing.T) {
 	if a.FileName() == b.FileName() || a.Key().CredentialID == b.Key().CredentialID {
 		t.Fatalf("two directories share the file name %s", a.FileName())
 	}
-	if !strings.HasPrefix(a.FileName(), "pve1.dc1.example.com-") || !strings.HasPrefix(b.FileName(), "pve1.dc1.example.com-") {
+	if !strings.HasPrefix(a.FileName(), "pve1.dc1.example.com-") ||
+		!strings.HasPrefix(b.FileName(), "pve1.dc1.example.com-") {
 		t.Errorf("file names %s and %s lost the host", a.FileName(), b.FileName())
 	}
 }
@@ -681,7 +709,13 @@ func TestOpenStoreRefusals(t *testing.T) {
 		}
 	}
 	t.Run("no root", func(t *testing.T) {
-		if _, err := OpenStore(context.Background(), nil, storeTestConfig(), storeTestCredential, StoreOptions{}); err == nil {
+		if _, err := OpenStore(
+			context.Background(),
+			nil,
+			storeTestConfig(),
+			storeTestCredential,
+			StoreOptions{},
+		); err == nil {
 			t.Fatal("OpenStore accepted a nil root")
 		}
 	})
@@ -725,15 +759,24 @@ func TestOpenStoreRefusals(t *testing.T) {
 		cfg        KeyConfig
 		credential string
 	}{
-		"no credential":    {storeTestConfig(), ""},
-		"no user":          {KeyConfig{Endpoints: storeTestConfig().Endpoints}, storeTestCredential},
-		"no endpoints":     {KeyConfig{User: storeTestUser}, storeTestCredential},
-		"endpoint no port": {KeyConfig{Endpoints: []string{"pve1.example.com"}, User: storeTestUser}, storeTestCredential},
+		"no credential": {storeTestConfig(), ""},
+		"no user":       {KeyConfig{Endpoints: storeTestConfig().Endpoints}, storeTestCredential},
+		"no endpoints":  {KeyConfig{User: storeTestUser}, storeTestCredential},
+		"endpoint no port": {
+			KeyConfig{Endpoints: []string{"pve1.example.com"}, User: storeTestUser},
+			storeTestCredential,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := newStoreDir(t)
 			root := storeTestRoot(t, dir)
-			if _, err := OpenStore(context.Background(), root, tc.cfg, tc.credential, StoreOptions{}); !errors.Is(err, ErrInvalidKey) {
+			if _, err := OpenStore(
+				context.Background(),
+				root,
+				tc.cfg,
+				tc.credential,
+				StoreOptions{},
+			); !errors.Is(err, ErrInvalidKey) {
 				t.Fatalf("OpenStore: %v, want ErrInvalidKey", err)
 			}
 			requireClosed(t, root)
@@ -930,7 +973,12 @@ func replaceLockFile(t *testing.T, dir, name string) {
 
 // tryLockThen takes the lock with TryLock and runs after on each lock it
 // holds, counting the takes.
-func tryLockThen(root *os.Root, name string, takes *int, after func(*privatefile.Lock)) func() (*privatefile.Lock, bool, error) {
+func tryLockThen(
+	root *os.Root,
+	name string,
+	takes *int,
+	after func(*privatefile.Lock),
+) func() (*privatefile.Lock, bool, error) {
 	return func() (*privatefile.Lock, bool, error) {
 		*takes++
 		lock, held, err := cachePrivatePolicy.TryLock(root, name)
@@ -961,11 +1009,12 @@ func TestHeldLockRetakesALockFileReplacedWhileHeld(t *testing.T) {
 			dir := newStoreDir(t)
 			root := openStoreRoot(t, dir)
 			takes := 0
-			lock, held, err := endpointTexts.heldLock(root, name, tryLockThen(root, name, &takes, func(*privatefile.Lock) {
+			take := tryLockThen(root, name, &takes, func(*privatefile.Lock) {
 				if takes == 1 {
 					tc.change(t, dir)
 				}
-			}))
+			})
+			lock, held, err := endpointTexts.heldLock(root, name, take)
 			if err != nil || !held || takes != 2 {
 				t.Fatalf("heldLock: held %v, err %v after %d takes, want the lock on the second", held, err, takes)
 			}
@@ -1010,7 +1059,11 @@ func TestHeldLockGivesUpOnALockFileThatKeepsChanging(t *testing.T) {
 			t.Errorf("lock %d was not released: %v", i, err)
 		}
 	}
-	lock, held, err = endpointTexts.heldLock(root, name, func() (*privatefile.Lock, bool, error) { return nil, false, nil })
+	lock, held, err = endpointTexts.heldLock(
+		root,
+		name,
+		func() (*privatefile.Lock, bool, error) { return nil, false, nil },
+	)
 	if lock != nil || held || err != nil {
 		t.Fatalf("heldLock of a busy lock: %v, %v, %v", lock, held, err)
 	}

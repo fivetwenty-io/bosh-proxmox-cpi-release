@@ -102,7 +102,13 @@ func (w *stuckWorker) finish() {
 
 // timedDrain runs r.Drain under the guard and returns its result and how long
 // it took.
-func timedDrain(t *testing.T, what string, ctx context.Context, r *Registry, wait time.Duration) (DrainResult, time.Duration) {
+func timedDrain(
+	t *testing.T,
+	what string,
+	ctx context.Context,
+	r *Registry,
+	wait time.Duration,
+) (DrainResult, time.Duration) {
 	t.Helper()
 	start := time.Now()
 	result := drainWithin(t, what, ctx, r, wait)
@@ -476,7 +482,12 @@ func TestCancelledLevelFollowsWorkerModes(t *testing.T) {
 			waitRunning(t, r, len(tc.modes))
 			result := drainWithin(t, "a drain stops at its bound", context.Background(), r, 20*time.Millisecond)
 			if result.CancelledLevel != tc.want {
-				t.Fatalf("CancelledLevel = %v, want %v for %d cancelled workers", result.CancelledLevel, tc.want, len(result.Cancelled))
+				t.Fatalf(
+					"CancelledLevel = %v, want %v for %d cancelled workers",
+					result.CancelledLevel,
+					tc.want,
+					len(result.Cancelled),
+				)
 			}
 			if len(result.Cancelled) != len(tc.modes) {
 				t.Fatalf("Cancelled = %v, want %d workers", result.Cancelled, len(tc.modes))
@@ -531,7 +542,13 @@ func TestOpenStartsFreshRun(t *testing.T) {
 	startStuck(t, r, "discovery")
 	drainWithin(t, "a drain stops at its bound", context.Background(), r, 10*time.Millisecond)
 	r.Open()
-	result, took := timedDrain(t, "a drain of a fresh run ignores the drained run's worker", context.Background(), r, time.Hour)
+	result, took := timedDrain(
+		t,
+		"a drain of a fresh run ignores the drained run's worker",
+		context.Background(),
+		r,
+		time.Hour,
+	)
 	if took > drainSlack {
 		t.Fatalf("drain of the fresh run took %s", took)
 	}
@@ -563,7 +580,13 @@ func TestGoRefusesBadArguments(t *testing.T) {
 	if err := r.Go("discovery", config.DiscoveryModeAuto, nil); err == nil {
 		t.Error("Go accepted a nil function")
 	}
-	if result := drainWithin(t, "a drain with no workers returns at once", context.Background(), r, time.Hour); result.Started != 0 {
+	if result := drainWithin(
+		t,
+		"a drain with no workers returns at once",
+		context.Background(),
+		r,
+		time.Hour,
+	); result.Started != 0 {
 		t.Errorf("refused workers counted as started: %+v", result)
 	}
 }
@@ -573,7 +596,11 @@ func TestGoRefusesBadArguments(t *testing.T) {
 func TestWorkerPanicIsRecoveredAndReported(t *testing.T) {
 	t.Parallel()
 	r := NewRegistry()
-	if err := r.Go("discovery", config.DiscoveryModeAuto, func(context.Context) { panic("cache payload defect") }); err != nil {
+	if err := r.Go(
+		"discovery",
+		config.DiscoveryModeAuto,
+		func(context.Context) { panic("cache payload defect") },
+	); err != nil {
 		t.Fatal(err)
 	}
 	var finished atomic.Bool
@@ -591,7 +618,13 @@ func TestWorkerPanicIsRecoveredAndReported(t *testing.T) {
 	if p.Name != "discovery" || p.Value != "cache payload defect" || len(p.Stack) == 0 {
 		t.Fatalf("panic record = %q %v with %d stack bytes", p.Name, p.Value, len(p.Stack))
 	}
-	if again := drainWithin(t, "a second drain of a finished run returns at once", context.Background(), r, time.Hour); len(again.Panics) != 0 {
+	if again := drainWithin(
+		t,
+		"a second drain of a finished run returns at once",
+		context.Background(),
+		r,
+		time.Hour,
+	); len(again.Panics) != 0 {
 		t.Fatalf("second drain reported the panic again: %+v", again.Panics)
 	}
 }
@@ -629,7 +662,13 @@ func TestConcurrentRegistrationAndDrain(t *testing.T) {
 	}
 	close(startGate)
 	time.Sleep(time.Millisecond)
-	result := drainWithin(t, "a drain returns once the accepted workers finish", context.Background(), r, 30*time.Second)
+	result := drainWithin(
+		t,
+		"a drain returns once the accepted workers finish",
+		context.Background(),
+		r,
+		30*time.Second,
+	)
 	wg.Wait()
 
 	if int64(result.Started) != accepted.Load() {

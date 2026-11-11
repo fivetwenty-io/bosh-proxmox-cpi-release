@@ -127,7 +127,11 @@ func TestUpdatePayloadReportsNoDropForAHeldNode(t *testing.T) {
 				Endpoints: []string{mergeSeed, trustSecond}, VerifySSL: false, User: storeTestUser,
 			})
 			seed := tc.stored(s.Key())
-			if _, err := Update(context.Background(), s, func(*Payload) (*Payload, error) { return seed, nil }); err != nil {
+			if _, err := Update(
+				context.Background(),
+				s,
+				func(*Payload) (*Payload, error) { return seed, nil },
+			); err != nil {
 				t.Fatal(err)
 			}
 			var decision TrustDecision
@@ -177,7 +181,12 @@ func TestMergeHoldsOnlyAnExpiredOrFutureNode(t *testing.T) {
 		move   func(n *DiscoveredNode)
 		reason DropReason
 	}{
-		{"an address the seed does not derive", "pve2", func(n *DiscoveredNode) { n.Address = "pve2.attacker.example" }, DropNotDerived},
+		{
+			"an address the seed does not derive",
+			"pve2",
+			func(n *DiscoveredNode) { n.Address = "pve2.attacker.example" },
+			DropNotDerived,
+		},
 		{"a port the seed does not derive", "pve2", func(n *DiscoveredNode) { n.Port = 8007 }, DropNotDerived},
 		{"a configured endpoint", "pve1b", func(*DiscoveredNode) {}, DropConfiguredEndpoint},
 	}

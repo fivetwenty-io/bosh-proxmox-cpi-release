@@ -44,7 +44,17 @@ func lengthPrefixed(parts ...string) []byte {
 	var out []byte
 	for _, part := range parts {
 		n := uint64(len(part))
-		out = append(out, byte(n>>56), byte(n>>48), byte(n>>40), byte(n>>32), byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
+		out = append(
+			out,
+			byte(n>>56),
+			byte(n>>48),
+			byte(n>>40),
+			byte(n>>32),
+			byte(n>>24),
+			byte(n>>16),
+			byte(n>>8),
+			byte(n),
+		)
 		out = append(out, part...)
 	}
 	return out
@@ -122,14 +132,38 @@ func TestDeriveKeysRefusesInputsThatCannotFormAKey(t *testing.T) {
 		secret     keyMaterial
 		credential string
 	}{
-		"no credential":       {storeTestConfig(), storeTestSecret(1), ""},
-		"no user":             {KeyConfig{Endpoints: storeTestConfig().Endpoints}, storeTestSecret(1), storeTestCredential},
-		"short secret":        {storeTestConfig(), storeTestSecret(1)[:31], storeTestCredential},
-		"no endpoints":        {KeyConfig{VerifySSL: true, User: storeTestUser}, storeTestSecret(1), storeTestCredential},
-		"endpoint no port":    {KeyConfig{Endpoints: []string{"pve1.example.com"}, User: storeTestUser}, storeTestSecret(1), storeTestCredential},
-		"endpoint bad host":   {KeyConfig{Endpoints: []string{"pve 1.example.com:8006"}, User: storeTestUser}, storeTestSecret(1), storeTestCredential},
-		"endpoint bad port":   {KeyConfig{Endpoints: []string{"pve1.example.com:http"}, User: storeTestUser}, storeTestSecret(1), storeTestCredential},
-		"second entry broken": {KeyConfig{Endpoints: []string{"pve1:8006", "pve2"}, User: storeTestUser}, storeTestSecret(1), storeTestCredential},
+		"no credential": {storeTestConfig(), storeTestSecret(1), ""},
+		"no user": {
+			KeyConfig{Endpoints: storeTestConfig().Endpoints},
+			storeTestSecret(1),
+			storeTestCredential,
+		},
+		"short secret": {storeTestConfig(), storeTestSecret(1)[:31], storeTestCredential},
+		"no endpoints": {
+			KeyConfig{VerifySSL: true, User: storeTestUser},
+			storeTestSecret(1),
+			storeTestCredential,
+		},
+		"endpoint no port": {
+			KeyConfig{Endpoints: []string{"pve1.example.com"}, User: storeTestUser},
+			storeTestSecret(1),
+			storeTestCredential,
+		},
+		"endpoint bad host": {
+			KeyConfig{Endpoints: []string{"pve 1.example.com:8006"}, User: storeTestUser},
+			storeTestSecret(1),
+			storeTestCredential,
+		},
+		"endpoint bad port": {
+			KeyConfig{Endpoints: []string{"pve1.example.com:http"}, User: storeTestUser},
+			storeTestSecret(1),
+			storeTestCredential,
+		},
+		"second entry broken": {
+			KeyConfig{Endpoints: []string{"pve1:8006", "pve2"}, User: storeTestUser},
+			storeTestSecret(1),
+			storeTestCredential,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -161,7 +195,11 @@ func TestKeyNormalizesEndpointsAndKeepsTheirOrder(t *testing.T) {
 
 func TestKeyDigestCoversEveryField(t *testing.T) {
 	secret := storeTestSecret(9)
-	base := KeyConfig{Endpoints: []string{"pve1.example.com:8006", "pve2.example.com:8006"}, VerifySSL: true, User: storeTestUser}
+	base := KeyConfig{
+		Endpoints: []string{"pve1.example.com:8006", "pve2.example.com:8006"},
+		VerifySSL: true,
+		User:      storeTestUser,
+	}
 	baseKey, _ := mustDerive(t, base, secret, storeTestCredential)
 	if !strings.HasPrefix(baseKey.Canonical(), "pve-cpi endpoint-cache key v1\n") {
 		t.Errorf("canonical key %q does not start with its version", baseKey.Canonical())
@@ -191,12 +229,22 @@ func TestKeyDigestCoversEveryField(t *testing.T) {
 	}
 	userCfg := base
 	userCfg.User = "someone-else@pve"
-	if userKey, _ := mustDerive(t, userCfg, secret, storeTestCredential); userKey.Equal(baseKey) || userKey.Digest() == baseKey.Digest() {
+	if userKey, _ := mustDerive(
+		t,
+		userCfg,
+		secret,
+		storeTestCredential,
+	); userKey.Equal(baseKey) || userKey.Digest() == baseKey.Digest() {
 		t.Error("a different user shares the key")
 	}
 
 	ca := "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
-	caKey, _ := mustDerive(t, KeyConfig{Endpoints: base.Endpoints, CACert: ca, User: storeTestUser}, secret, storeTestCredential)
+	caKey, _ := mustDerive(
+		t,
+		KeyConfig{Endpoints: base.Endpoints, CACert: ca, User: storeTestUser},
+		secret,
+		storeTestCredential,
+	)
 	sum := sha256.Sum256([]byte(ca))
 	if caKey.CASHA256 != hex.EncodeToString(sum[:]) {
 		t.Errorf("ca_sha256 %q is not the SHA-256 of the PEM", caKey.CASHA256)
@@ -231,7 +279,12 @@ func TestFileNamesCarryTheSanitizedHostAndDigest(t *testing.T) {
 		"[fd00::1]:8006", "[::]:8006", "under_score.example.com:8006", "10.0.0.5:8006",
 		strings.Repeat("a", 70) + ".example.com:8006",
 	} {
-		key, _ := mustDerive(t, KeyConfig{Endpoints: []string{endpoint}, User: storeTestUser}, storeTestSecret(3), storeTestCredential)
+		key, _ := mustDerive(
+			t,
+			KeyConfig{Endpoints: []string{endpoint}, User: storeTestUser},
+			storeTestSecret(3),
+			storeTestCredential,
+		)
 		if name := key.FileName(); !pattern.MatchString(name) {
 			t.Errorf("%s: file name %q does not match %v", endpoint, name, pattern)
 		}

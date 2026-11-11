@@ -493,7 +493,9 @@ func TestUploadPhaseFor(t *testing.T) {
 	if got := pve.UploadPhaseFor(""); got != pve.UploadPostPhase {
 		t.Errorf("no pending UPID = %v, want the post phase", got)
 	}
-	if got := pve.UploadPhaseFor("UPID:pve2:00001234:00000000:66aabbcc:imgcopy:local:root@pam:"); got != pve.UploadPollPhase {
+	if got := pve.UploadPhaseFor(
+		"UPID:pve2:00001234:00000000:66aabbcc:imgcopy:local:root@pam:",
+	); got != pve.UploadPollPhase {
 		t.Errorf("a pending UPID = %v, want the poll phase", got)
 	}
 }
@@ -513,7 +515,9 @@ func TestIsRoutedHandshakeFailure_MaybeSentArms(t *testing.T) {
 	if pve.IsRoutedHandshakeFailure(text) {
 		t.Error("a marked \"tls:\" text error must not be a handshake failure")
 	}
-	later := &endpointpool.MaybeSentError{Err: tls.RecordHeaderError{Msg: "oversized record received with length 20000"}}
+	later := &endpointpool.MaybeSentError{
+		Err: tls.RecordHeaderError{Msg: "oversized record received with length 20000"},
+	}
 	if pve.IsRoutedHandshakeFailure(later) {
 		t.Error("a marked record-header error from an established connection must not be a handshake failure")
 	}

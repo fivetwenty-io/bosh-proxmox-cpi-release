@@ -181,20 +181,38 @@ func trustObservations() []trustObserved {
 		{"the same nodes and pins", trustObservation(trustSame("pve2"), trustSame("pve3"))},
 		{"a new node", trustObservation(trustSame("pve2"), trustSame("pve3"), trustNode("pve4", 0x44))},
 		{"a node left out", trustObservation(trustSame("pve3"))},
-		{"the same pins reordered and repeated", trustObservation(trustNode("pve2", 0x9e, 0xa1, 0x9e), trustSame("pve3"))},
+		{
+			"the same pins reordered and repeated",
+			trustObservation(trustNode("pve2", 0x9e, 0xa1, 0x9e), trustSame("pve3")),
+		},
 		{"a partially overlapping pin set", trustObservation(trustNode("pve2", 0xa1, 0x55), trustSame("pve3"))},
 		{"an overlap with the shared pin last", trustObservation(trustNode("pve2", 0x55, 0xa1), trustSame("pve3"))},
-		{"an overlap with the other stored pin last", trustObservation(trustNode("pve2", 0x55, 0x9e), trustSame("pve3"))},
-		{"an overlap of three pins, shared pin first", trustObservation(trustNode("pve2", 0xa1, 0x55, 0x56), trustSame("pve3"))},
-		{"an overlap of three pins, shared pin second", trustObservation(trustNode("pve2", 0x55, 0xa1, 0x56), trustSame("pve3"))},
-		{"an overlap of three pins, shared pin third", trustObservation(trustNode("pve2", 0x55, 0x56, 0xa1), trustSame("pve3"))},
+		{
+			"an overlap with the other stored pin last",
+			trustObservation(trustNode("pve2", 0x55, 0x9e), trustSame("pve3")),
+		},
+		{
+			"an overlap of three pins, shared pin first",
+			trustObservation(trustNode("pve2", 0xa1, 0x55, 0x56), trustSame("pve3")),
+		},
+		{
+			"an overlap of three pins, shared pin second",
+			trustObservation(trustNode("pve2", 0x55, 0xa1, 0x56), trustSame("pve3")),
+		},
+		{
+			"an overlap of three pins, shared pin third",
+			trustObservation(trustNode("pve2", 0x55, 0x56, 0xa1), trustSame("pve3")),
+		},
 		// Against the stored node with one pin this set grows by two pins.
 		{"a pin set that only grows", trustObservation(trustNode("pve2", 0xa1, 0x9e, 0x55), trustSame("pve3"))},
 		{"a pin set that shrinks", trustObservation(trustNode("pve2", 0xa1), trustSame("pve3"))},
 		{"a disjoint pin set", trustObservation(trustNode("pve2", 0x55, 0x56), trustSame("pve3"))},
 		{"a disjoint pin set for the second node", trustObservation(trustSame("pve2"), trustNode("pve3", 0x55, 0x56))},
 		{"a disjoint pin set in another case", trustObservation(trustNode("PVE2", 0x55, 0x56), trustSame("pve3"))},
-		{"a disjoint pin set in another case for the second node", trustObservation(trustSame("pve2"), trustNode("PVE3", 0x55))},
+		{
+			"a disjoint pin set in another case for the second node",
+			trustObservation(trustSame("pve2"), trustNode("PVE3", 0x55)),
+		},
 		{"a shrink and a disjoint set together", trustObservation(trustNode("pve2", 0x9e), trustNode("pve3", 0x57))},
 		{"a changed identity", changed(trustSame("pve2"), trustSame("pve3"))},
 		{"a changed identity and pins", changed(trustNode("pve2", 0x55), trustSame("pve3"))},
@@ -207,7 +225,10 @@ func trustObservations() []trustObserved {
 		{"an ambiguous node", trustObservation(trustSame("pve2"), trustNode("0x7f000001", 0x55))},
 		{"a node the seed does not derive", notDerived},
 		{"the seed's own node", trustObservation(trustNode("pve1", 0x11), trustSame("pve2"), trustSame("pve3"))},
-		{"the second configured endpoint's node", trustObservation(trustSame("pve2"), trustNode("PVE1B", 0x12), trustSame("pve3"))},
+		{
+			"the second configured endpoint's node",
+			trustObservation(trustSame("pve2"), trustNode("PVE1B", 0x12), trustSame("pve3")),
+		},
 	}
 }
 
@@ -302,7 +323,9 @@ func expectTrust(t *testing.T, stored *Payload, key Key, obs Observation) trustE
 	}
 	section := func(nodes []DiscoveredNode) *DiscoverySection {
 		return &DiscoverySection{
-			DiscoveredAt: now, NextRefreshAfter: now.Add(wait), Outcome: obs.Outcome, Quorate: obs.Quorate, Nodes: nodes,
+			DiscoveredAt: now, NextRefreshAfter: now.Add(
+				wait,
+			), Outcome: obs.Outcome, Quorate: obs.Quorate, Nodes: nodes,
 		}
 	}
 	e := trustExpectation{via: via, observed: &DiscoveryResult{
@@ -371,7 +394,8 @@ func expectedNodes(key Key, obs Observation, now time.Time) []DiscoveredNode {
 			continue
 		}
 		derived, err := DeriveAddress(key.Endpoints[0], n.Name)
-		if err != nil || !strings.EqualFold(derived, n.Address) || slices.Contains(key.Endpoints, strings.ToLower(n.Address)) {
+		if err != nil || !strings.EqualFold(derived, n.Address) ||
+			slices.Contains(key.Endpoints, strings.ToLower(n.Address)) {
 			continue
 		}
 		nodeHost, nodePort, _ := net.SplitHostPort(n.Address)
@@ -383,7 +407,9 @@ func expectedNodes(key Key, obs Observation, now time.Time) []DiscoveredNode {
 			}
 		}
 		nodes = append(nodes, DiscoveredNode{
-			Name: n.Name, Address: strings.ToLower(nodeHost), Port: portNumber, Pins: pins, Online: n.Online, ConfirmedAt: now,
+			Name: n.Name, Address: strings.ToLower(
+				nodeHost,
+			), Port: portNumber, Pins: pins, Online: n.Online, ConfirmedAt: now,
 		})
 	}
 	return nodes
@@ -440,10 +466,12 @@ func checkAgreement(t *testing.T, stored *Payload, key Key, obs Observation, dec
 	t.Helper()
 	want := expectTrust(t, stored, key, obs)
 	if decision.Outcome != want.outcome || decision.Log != want.log || decision.DropDiscovered != want.drop ||
-		!reflect.DeepEqual(decision.PinsChanged, want.changed) || !reflect.DeepEqual(decision.PinsShrunk, want.shrunk) ||
-		decision.Via != want.via {
-		t.Fatalf("decision %s log %d drop %v changed %v shrunk %v via %q, want %s log %d drop %v changed %v shrunk %v via %q",
-			decision.Outcome, decision.Log, decision.DropDiscovered, decision.PinsChanged, decision.PinsShrunk, decision.Via,
+		!reflect.DeepEqual(decision.PinsChanged, want.changed) ||
+		!reflect.DeepEqual(decision.PinsShrunk, want.shrunk) || decision.Via != want.via {
+		t.Fatalf("decision %s log %d drop %v changed %v shrunk %v via %q, want %s log %d drop %v changed %v shrunk "+
+			"%v via %q",
+			decision.Outcome, decision.Log, decision.DropDiscovered, decision.PinsChanged, decision.PinsShrunk,
+			decision.Via,
 			want.outcome, want.log, want.drop, want.changed, want.shrunk, want.via)
 	}
 	if !decision.Writes() {
@@ -493,7 +521,13 @@ func trustDump(p *Payload) string {
 	out := fmt.Sprintf("cluster %+v marks %v", p.Cluster, p.Marks)
 	if p.Discovery != nil {
 		d := p.Discovery
-		out += fmt.Sprintf(" discovery {at %v next %v %s quorate %v}", d.DiscoveredAt, d.NextRefreshAfter, d.Outcome, d.Quorate)
+		out += fmt.Sprintf(
+			" discovery {at %v next %v %s quorate %v}",
+			d.DiscoveredAt,
+			d.NextRefreshAfter,
+			d.Outcome,
+			d.Quorate,
+		)
 		for _, node := range d.Nodes {
 			out += fmt.Sprintf(" %+v", node)
 		}
@@ -570,7 +604,14 @@ func wantPinsAt(name string, confirmed time.Time, pins ...byte) func(t *testing.
 			want = append(want, payloadPin(hex.EncodeToString([]byte{b})))
 		}
 		if !reflect.DeepEqual(node.Pins, want) || !node.ConfirmedAt.Equal(confirmed) {
-			t.Errorf("%s pins %v confirmed %v, want %v confirmed %v", name, node.Pins, node.ConfirmedAt, want, confirmed)
+			t.Errorf(
+				"%s pins %v confirmed %v, want %v confirmed %v",
+				name,
+				node.Pins,
+				node.ConfirmedAt,
+				want,
+				confirmed,
+			)
 		}
 	}
 }
@@ -580,8 +621,8 @@ func wantTimes(discovered time.Time, next time.Duration) func(t *testing.T, p *P
 	return func(t *testing.T, p *Payload) {
 		t.Helper()
 		if !p.Discovery.DiscoveredAt.Equal(discovered) || !p.Discovery.NextRefreshAfter.Equal(discovered.Add(next)) {
-			t.Errorf("discovered %v next %v, want %v and %v later", p.Discovery.DiscoveredAt, p.Discovery.NextRefreshAfter,
-				discovered, next)
+			t.Errorf("discovered %v next %v, want %v and %v later",
+				p.Discovery.DiscoveredAt, p.Discovery.NextRefreshAfter, discovered, next)
 		}
 	}
 }
@@ -643,8 +684,9 @@ func trustCases() []trustCase {
 	hourly := wantTimes(payloadNow, RefreshInterval)
 	return []trustCase{
 		{
-			name: "verify_ssl false, first use records the identity and pins", stored: func(Key) *Payload { return nil },
-			obs: same, outcome: TrustFirstUse,
+			name:   "verify_ssl false, first use records the identity and pins",
+			stored: func(Key) *Payload { return nil },
+			obs:    same, outcome: TrustFirstUse,
 			check: func(t *testing.T, next *Payload) {
 				t.Helper()
 				wantNodes("pve2", "pve3")(t, next)
@@ -656,16 +698,27 @@ func trustCases() []trustCase {
 		},
 		{
 			name: "verify_ssl true, first use records the identity and pins", verify: true,
-			stored: func(Key) *Payload { return nil }, obs: same, outcome: TrustFirstUse, check: wantNodes("pve2", "pve3"),
+			stored: func(Key) *Payload { return nil }, obs: same, outcome: TrustFirstUse, check: wantNodes(
+				"pve2",
+				"pve3",
+			),
 		},
 		{
 			name: "verify_ssl false, the same identity and pins confirm the nodes", stored: fresh, obs: same,
 			outcome: TrustConfirmed,
-			check:   all(keepsIdentity, hourly, wantPinsAt("pve2", payloadNow, 0xa1, 0x9e), wantPinsAt("pve3", payloadNow, 0xa1, 0x9e)),
+			check: all(
+				keepsIdentity,
+				hourly,
+				wantPinsAt("pve2", payloadNow, 0xa1, 0x9e),
+				wantPinsAt("pve3", payloadNow, 0xa1, 0x9e),
+			),
 		},
 		{
 			name: "verify_ssl false, a new node is added on first use", stored: fresh, obs: newNode,
-			outcome: TrustConfirmed, check: all(wantNodes("pve2", "pve3", "pve4"), wantPinsAt("pve4", payloadNow, 0x44)),
+			outcome: TrustConfirmed, check: all(
+				wantNodes("pve2", "pve3", "pve4"),
+				wantPinsAt("pve4", payloadNow, 0x44),
+			),
 		},
 		{
 			name: "verify_ssl false, a node left out stops being known", stored: fresh,
@@ -679,13 +732,20 @@ func trustCases() []trustCase {
 				wantPinsAt("pve4", payloadNow, 0x44)),
 		},
 		{
-			name:   "verify_ssl false, a pin set that shrinks keeps the stored pins and confirms the node without a refusal",
+			name: "verify_ssl false, a pin set that shrinks keeps the stored pins and confirms the node without a " +
+				"refusal",
 			stored: fresh, obs: shrink, outcome: TrustConfirmed, log: TrustLogDebug, shrunk: []string{"pve2"},
-			check: all(keepsIdentity, hourly, wantPinsAt("pve2", payloadNow, 0xa1, 0x9e), wantPinsAt("pve3", payloadNow, 0xa1, 0x9e)),
+			check: all(
+				keepsIdentity,
+				hourly,
+				wantPinsAt("pve2", payloadNow, 0xa1, 0x9e),
+				wantPinsAt("pve3", payloadNow, 0xa1, 0x9e),
+			),
 		},
 		{
-			name: "verify_ssl false, a pin set that shrinks for a node past 24 hours confirms it again", stored: expired,
-			obs: shrink, outcome: TrustConfirmed, log: TrustLogDebug, shrunk: []string{"pve2"},
+			name:   "verify_ssl false, a pin set that shrinks for a node past 24 hours confirms it again",
+			stored: expired,
+			obs:    shrink, outcome: TrustConfirmed, log: TrustLogDebug, shrunk: []string{"pve2"},
 			check: wantPinsAt("pve2", payloadNow, 0xa1, 0x9e),
 		},
 		{
@@ -695,13 +755,15 @@ func trustCases() []trustCase {
 			check: all(wantPinsAt("pve2", payloadNow, 0xa1, 0x9e), wantPinsAt("pve3", stamp, 0xa1, 0x9e)),
 		},
 		{
-			name: "verify_ssl false, an overlap with the shared pin last confirms the node and refuses the change", stored: fresh,
+			name:    "verify_ssl false, an overlap with the shared pin last confirms the node and refuses the change",
+			stored:  fresh,
 			obs:     trustObservation(trustNode("pve2", 0x55, 0x56, 0x9e), trustSame("pve3")),
 			outcome: TrustPinsRefused, log: TrustLogWarn, changed: []string{"pve2"},
 			check: wantPinsAt("pve2", payloadNow, 0xa1, 0x9e),
 		},
 		{
-			name: "verify_ssl false, a pin set that grows is accepted", stored: fresh, obs: grow, outcome: TrustConfirmed,
+			name:   "verify_ssl false, a pin set that grows is accepted",
+			stored: fresh, obs: grow, outcome: TrustConfirmed,
 			check: all(keepsIdentity, hourly, wantPinsAt("pve2", payloadNow, 0x9e, 0xa1, 0x55)),
 		},
 		{
@@ -738,8 +800,9 @@ func trustCases() []trustCase {
 			obs: same, outcome: TrustConfirmed, check: wantPinsAt("pve2", payloadNow, 0xa1, 0x9e),
 		},
 		{
-			name: "verify_ssl false, nodes that are configured endpoints are left out", stored: func(Key) *Payload { return nil },
-			obs: configured, outcome: TrustFirstUse, check: wantNodes("pve2"),
+			name:   "verify_ssl false, nodes that are configured endpoints are left out",
+			stored: func(Key) *Payload { return nil },
+			obs:    configured, outcome: TrustFirstUse, check: wantNodes("pve2"),
 		},
 		{
 			name: "verify_ssl true, nodes that are configured endpoints are left out", verify: true, stored: fresh,
@@ -777,7 +840,9 @@ func trustCases() []trustCase {
 		},
 		{
 			name: "verify_ssl true, a pin set that shrinks replaces the old one", verify: true, stored: fresh,
-			obs: shrink, outcome: TrustPinsReplaced, changed: []string{"pve2"}, check: wantPinsAt("pve2", payloadNow, 0xa1),
+			obs: shrink, outcome: TrustPinsReplaced, changed: []string{
+				"pve2",
+			}, check: wantPinsAt("pve2", payloadNow, 0xa1),
 		},
 		{
 			name: "verify_ssl true, a pin set that grows replaces the old one", verify: true, stored: fresh,
@@ -803,7 +868,8 @@ func TestDecideTrustRules(t *testing.T) {
 				t.Fatalf("DecideTrust: %v", err)
 			}
 			if decision.Outcome != tc.outcome || decision.Log != tc.log || decision.DropDiscovered != tc.drop ||
-				!reflect.DeepEqual(decision.PinsChanged, tc.changed) || !reflect.DeepEqual(decision.PinsShrunk, tc.shrunk) {
+				!reflect.DeepEqual(decision.PinsChanged, tc.changed) ||
+				!reflect.DeepEqual(decision.PinsShrunk, tc.shrunk) {
 				t.Fatalf("decision %s log %d drop %v changed %v shrunk %v, want %s log %d drop %v changed %v shrunk %v",
 					decision.Outcome, decision.Log, decision.DropDiscovered, decision.PinsChanged, decision.PinsShrunk,
 					tc.outcome, tc.log, tc.drop, tc.changed, tc.shrunk)
@@ -854,10 +920,21 @@ func TestDecideTrustSchedulesTheNextRefresh(t *testing.T) {
 				}
 				section := next.Discovery
 				if section.Outcome != outcome || section.Quorate != quorate {
-					t.Errorf("written outcome %s quorate %v, want %s and %v", section.Outcome, section.Quorate, outcome, quorate)
+					t.Errorf(
+						"written outcome %s quorate %v, want %s and %v",
+						section.Outcome,
+						section.Quorate,
+						outcome,
+						quorate,
+					)
 				}
 				if !section.DiscoveredAt.Equal(payloadNow) || !section.NextRefreshAfter.Equal(payloadNow.Add(wait)) {
-					t.Errorf("discovered %v, next refresh %v, want now and now+%v", section.DiscoveredAt, section.NextRefreshAfter, wait)
+					t.Errorf(
+						"discovered %v, next refresh %v, want now and now+%v",
+						section.DiscoveredAt,
+						section.NextRefreshAfter,
+						wait,
+					)
 				}
 				for _, node := range section.Nodes {
 					if !node.ConfirmedAt.Equal(payloadNow) {
@@ -868,7 +945,11 @@ func TestDecideTrustSchedulesTheNextRefresh(t *testing.T) {
 		}
 	}
 	if RefreshInterval != time.Hour || PinRefreshFloor != 10*time.Minute {
-		t.Errorf("RefreshInterval %v and PinRefreshFloor %v, want an hour and 10 minutes", RefreshInterval, PinRefreshFloor)
+		t.Errorf(
+			"RefreshInterval %v and PinRefreshFloor %v, want an hour and 10 minutes",
+			RefreshInterval,
+			PinRefreshFloor,
+		)
 	}
 }
 
@@ -889,7 +970,12 @@ func TestDecideTrustRefusalsScheduleTheNextRefresh(t *testing.T) {
 	}{
 		"identity_refused": {payloadFor(key, "pve2"), other, TrustIdentityRefused, MaxRefreshWait},
 		"conflict_stands":  {conflicted, trustObservation(trustSame("pve2")), TrustConflictStands, MaxRefreshWait},
-		"pins_refused":     {payloadFor(key, "pve2"), trustObservation(trustNode("pve2", 0x55)), TrustPinsRefused, RefreshInterval},
+		"pins_refused": {
+			payloadFor(key, "pve2"),
+			trustObservation(trustNode("pve2", 0x55)),
+			TrustPinsRefused,
+			RefreshInterval,
+		},
 	}
 	for name, tc := range refusals {
 		t.Run(name, func(t *testing.T) {
@@ -905,7 +991,11 @@ func TestDecideTrustRefusalsScheduleTheNextRefresh(t *testing.T) {
 			if next.Discovery.Outcome != OutcomeOK {
 				t.Errorf("written outcome %s", next.Discovery.Outcome)
 			}
-			if p, _, err := Validate(next, key, payloadNow); err != nil || RefreshDue(p, payloadNow.Add(time.Minute), false) {
+			if p, _, err := Validate(
+				next,
+				key,
+				payloadNow,
+			); err != nil || RefreshDue(p, payloadNow.Add(time.Minute), false) {
 				t.Errorf("a refresh is due a minute after %s: %v", name, err)
 			}
 		})
@@ -930,7 +1020,14 @@ func TestDecideTrustOnlyAConfiguredEndpointWritesTrust(t *testing.T) {
 				decision, err := DecideTrust(trustView(file.make(key), key), key, obs, payloadNow)
 				if !errors.Is(err, ErrUnconfiguredSource) || !errors.Is(err, ErrInvalidChange) || decision.Writes() ||
 					decision.Outcome != "" {
-					t.Errorf("verify_ssl %v, %s, via %q: %+v, %v, want ErrUnconfiguredSource", verify, file.name, via, decision, err)
+					t.Errorf(
+						"verify_ssl %v, %s, via %q: %+v, %v, want ErrUnconfiguredSource",
+						verify,
+						file.name,
+						via,
+						decision,
+						err,
+					)
 				}
 			}
 		}
@@ -974,23 +1071,29 @@ func TestDecideTrustRefusesWhatMergeCannotWrite(t *testing.T) {
 		obs       Observation
 		zeroClock bool
 	}{
-		"a zero identity":             {obs: with(func(o *Observation) { o.RootCA = [sha256.Size]byte{} })},
-		"a name that fails pve-node":  {obs: with(func(o *Observation) { o.Nodes[0].Name = "pve_2" })},
-		"a dotted name":               {obs: with(func(o *Observation) { o.Nodes[0].Name = "api.attacker.example" })},
-		"an unknown outcome":          {obs: with(func(o *Observation) { o.Outcome = "error" })},
-		"nodes under no_candidates":   {obs: with(func(o *Observation) { o.Outcome = OutcomeNoCandidates })},
-		"nodes under standalone":      {obs: with(func(o *Observation) { o.Outcome = OutcomeStandalone })},
-		"nodes under public_suffix":   {obs: with(func(o *Observation) { o.Outcome = OutcomePublicSuffix })},
-		"a repeated name":             {obs: with(func(o *Observation) { o.Nodes[1].Name = "PVE2" })},
-		"more than 64 nodes":          {obs: tooMany},
-		"a node without pins":         {obs: with(func(o *Observation) { o.Nodes[0].Pins = nil })},
-		"a zero pin":                  {obs: with(func(o *Observation) { o.Nodes[0].Pins[1] = [sha256.Size]byte{} })},
-		"four pins":                   {obs: with(func(o *Observation) { o.Nodes[0] = trustNode("pve2", 1, 2, 3, 4) })},
-		"an address without a port":   {obs: with(func(o *Observation) { o.Nodes[0].Address = "pve2.dc1.example.com" })},
-		"a port that is not a number": {obs: with(func(o *Observation) { o.Nodes[0].Address = "pve2.dc1.example.com:https" })},
-		"a port out of range":         {obs: with(func(o *Observation) { o.Nodes[0].Address = "pve2.dc1.example.com:70000" })},
-		"an address off the grammar":  {obs: with(func(o *Observation) { o.Nodes[0].Address = "pve2/x:8006" })},
-		"a zero clock":                {obs: trustObservation(trustSame("pve2")), zeroClock: true},
+		"a zero identity":            {obs: with(func(o *Observation) { o.RootCA = [sha256.Size]byte{} })},
+		"a name that fails pve-node": {obs: with(func(o *Observation) { o.Nodes[0].Name = "pve_2" })},
+		"a dotted name":              {obs: with(func(o *Observation) { o.Nodes[0].Name = "api.attacker.example" })},
+		"an unknown outcome":         {obs: with(func(o *Observation) { o.Outcome = "error" })},
+		"nodes under no_candidates":  {obs: with(func(o *Observation) { o.Outcome = OutcomeNoCandidates })},
+		"nodes under standalone":     {obs: with(func(o *Observation) { o.Outcome = OutcomeStandalone })},
+		"nodes under public_suffix":  {obs: with(func(o *Observation) { o.Outcome = OutcomePublicSuffix })},
+		"a repeated name":            {obs: with(func(o *Observation) { o.Nodes[1].Name = "PVE2" })},
+		"more than 64 nodes":         {obs: tooMany},
+		"a node without pins":        {obs: with(func(o *Observation) { o.Nodes[0].Pins = nil })},
+		"a zero pin":                 {obs: with(func(o *Observation) { o.Nodes[0].Pins[1] = [sha256.Size]byte{} })},
+		"four pins":                  {obs: with(func(o *Observation) { o.Nodes[0] = trustNode("pve2", 1, 2, 3, 4) })},
+		"an address without a port": {
+			obs: with(func(o *Observation) { o.Nodes[0].Address = "pve2.dc1.example.com" }),
+		},
+		"a port that is not a number": {
+			obs: with(func(o *Observation) { o.Nodes[0].Address = "pve2.dc1.example.com:https" }),
+		},
+		"a port out of range": {
+			obs: with(func(o *Observation) { o.Nodes[0].Address = "pve2.dc1.example.com:70000" }),
+		},
+		"an address off the grammar": {obs: with(func(o *Observation) { o.Nodes[0].Address = "pve2/x:8006" })},
+		"a zero clock":               {obs: trustObservation(trustSame("pve2")), zeroClock: true},
 		"a view read at another clock": {
 			stored: func() Stored {
 				view := trustView(payloadFor(key, "pve2"), key)
@@ -1135,7 +1238,12 @@ func TestStoreTrustOnFirstUseLifecycle(t *testing.T) {
 		return p
 	}
 	start := payloadNow
-	if d := trustUpdate(t, s, start, trustObservation(trustSame("pve2"), trustSame("pve3"))); d.Outcome != TrustFirstUse {
+	if d := trustUpdate(
+		t,
+		s,
+		start,
+		trustObservation(trustSame("pve2"), trustSame("pve3")),
+	); d.Outcome != TrustFirstUse {
 		t.Fatalf("first discovery: %s", d.Outcome)
 	}
 	if got := trustNodeNames(read(start)); !reflect.DeepEqual(got, []string{"pve2", "pve3"}) {
@@ -1162,16 +1270,27 @@ func TestStoreTrustOnFirstUseLifecycle(t *testing.T) {
 		t.Fatalf("nodes loaded after the refused pin change %v", got)
 	}
 	raw := trustStoredFile(t, s)
-	if pve2 := trustNodeIn(t, raw, "pve2"); !reflect.DeepEqual(pve2.Pins, []string{payloadPin("a1"), payloadPin("9e")}) ||
+	if pve2 := trustNodeIn(
+		t,
+		raw,
+		"pve2",
+	); !reflect.DeepEqual(pve2.Pins, []string{payloadPin("a1"), payloadPin("9e")}) ||
 		!pve2.ConfirmedAt.Equal(start) {
 		t.Fatalf("pve2 after the refused pin change %+v", pve2)
 	}
-	if p := read(later); RefreshDue(p, later.Add(59*time.Minute), false) || !RefreshDue(p, later.Add(time.Hour), false) {
+	if p := read(
+		later,
+	); RefreshDue(p, later.Add(59*time.Minute), false) || !RefreshDue(p, later.Add(time.Hour), false) {
 		t.Fatalf("refresh after the refused pin change %+v", p.Discovery)
 	}
 
 	// The same pins confirm both nodes again.
-	if d := trustUpdate(t, s, later, trustObservation(trustSame("pve2"), trustSame("pve3"))); d.Outcome != TrustConfirmed {
+	if d := trustUpdate(
+		t,
+		s,
+		later,
+		trustObservation(trustSame("pve2"), trustSame("pve3")),
+	); d.Outcome != TrustConfirmed {
 		t.Fatalf("reconfirmation: %s", d.Outcome)
 	}
 	if got := trustNodeNames(read(later)); !reflect.DeepEqual(got, []string{"pve2", "pve3"}) {
@@ -1208,7 +1327,12 @@ func TestStoreTrustOnFirstUseLifecycle(t *testing.T) {
 		t.Fatalf("refresh after the conflict %+v", p.Discovery)
 	}
 	for _, obs := range []Observation{other, trustObservation(trustSame("pve2"))} {
-		if d := trustUpdate(t, s, later.Add(time.Hour), obs); d.Outcome != TrustConflictStands || d.Log != TrustLogWarn {
+		if d := trustUpdate(
+			t,
+			s,
+			later.Add(time.Hour),
+			obs,
+		); d.Outcome != TrustConflictStands || d.Log != TrustLogWarn {
 			t.Fatalf("after the conflict: %+v", d)
 		}
 	}
@@ -1231,7 +1355,12 @@ func TestStoreTrustAcceptsAPinSetThatGrows(t *testing.T) {
 	s := openStoreFor(t, newStoreDir(t), KeyConfig{
 		Endpoints: []string{mergeSeed, trustSecond}, VerifySSL: false, User: storeTestUser,
 	})
-	if d := trustUpdate(t, s, payloadNow, trustObservation(trustNode("pve2", 0xa1), trustSame("pve3"))); d.Outcome != TrustFirstUse {
+	if d := trustUpdate(
+		t,
+		s,
+		payloadNow,
+		trustObservation(trustNode("pve2", 0xa1), trustSame("pve3")),
+	); d.Outcome != TrustFirstUse {
 		t.Fatalf("first discovery: %s", d.Outcome)
 	}
 	full := trustObservation(trustSame("pve2"), trustSame("pve3"))
@@ -1276,10 +1405,17 @@ func TestStoreTrustRefusalsMoveTheNextRefresh(t *testing.T) {
 			t.Fatalf("%s: %+v", step.outcome, d)
 		}
 		raw := trustStoredFile(t, s)
-		if !raw.Discovery.DiscoveredAt.Equal(step.at) || !raw.Discovery.NextRefreshAfter.Equal(step.at.Add(MaxRefreshWait)) {
-			t.Errorf("%s: discovered %v next %v", step.outcome, raw.Discovery.DiscoveredAt, raw.Discovery.NextRefreshAfter)
+		if !raw.Discovery.DiscoveredAt.Equal(step.at) ||
+			!raw.Discovery.NextRefreshAfter.Equal(step.at.Add(MaxRefreshWait)) {
+			t.Errorf(
+				"%s: discovered %v next %v",
+				step.outcome,
+				raw.Discovery.DiscoveredAt,
+				raw.Discovery.NextRefreshAfter,
+			)
 		}
-		if !reflect.DeepEqual(raw.Discovery.Nodes, before.Discovery.Nodes) || raw.Discovery.Outcome != before.Discovery.Outcome ||
+		if !reflect.DeepEqual(raw.Discovery.Nodes, before.Discovery.Nodes) ||
+			raw.Discovery.Outcome != before.Discovery.Outcome ||
 			raw.Cluster.RootCASHA256 != before.Cluster.RootCASHA256 || !raw.Cluster.IdentityConflict {
 			t.Errorf("%s changed more than the times: %s", step.outcome, trustDump(raw))
 		}
@@ -1323,7 +1459,12 @@ func TestDecideTrustTakesTheStoresClock(t *testing.T) {
 	// A view with no clock skips the check, which is why a caller passes only
 	// the view UpdatePayload builds.
 	view.Now = time.Time{}
-	if decision, err = DecideTrust(view, key, trustObservation(trustSame("pve2")), payloadNow.Add(time.Minute)); err != nil ||
+	if decision, err = DecideTrust(
+		view,
+		key,
+		trustObservation(trustSame("pve2")),
+		payloadNow.Add(time.Minute),
+	); err != nil ||
 		decision.Outcome != TrustConfirmed {
 		t.Fatalf("a view with no clock: %+v, %v", decision, err)
 	}
@@ -1344,7 +1485,11 @@ func TestStoreEmptyChangeKeepsTheTrustRecords(t *testing.T) {
 	}
 	before := trustStoredFile(t, s)
 	later := payloadNow.Add(5 * time.Minute)
-	if res, err := s.UpdatePayload(context.Background(), later, func(Stored) (Change, error) { return Change{}, nil }); err != nil ||
+	if res, err := s.UpdatePayload(
+		context.Background(),
+		later,
+		func(Stored) (Change, error) { return Change{}, nil },
+	); err != nil ||
 		!res.Written {
 		t.Fatalf("UpdatePayload: %+v, %v", res, err)
 	}
@@ -1392,31 +1537,63 @@ func TestRefreshDue(t *testing.T) {
 		want      bool
 	}
 	cases := map[string]refreshCase{
-		"no file":                                      {nil, false, true},
-		"no file after a pin failure":                  {nil, true, true},
-		"a conflict with the refresh passed":           {conflicted(section(hourAgo.Add(-time.Hour), hourAgo)), false, false},
-		"a conflict after a pin failure":               {conflicted(section(hourAgo, inAnHour)), true, false},
-		"a conflict with no section":                   {conflicted(identityOnly.clone()), true, false},
-		"an identity and no node list":                 {identityOnly, false, true},
-		"a section validation dropped for its time":    {ahead, false, true},
-		"a refresh not yet due":                        {section(payloadNow.Add(-time.Minute), inAnHour), false, false},
-		"a refresh due at this instant":                {section(hourAgo, payloadNow), false, true},
-		"a refresh past due":                           {section(hourAgo.Add(-time.Hour), hourAgo), false, true},
-		"a refresh time validation dropped":            {section(payloadNow.Add(-time.Minute), time.Time{}), false, true},
-		"a pin failure within the floor":               {section(payloadNow.Add(-5*time.Minute), inAnHour), true, false},
-		"a pin failure exactly at the floor":           {section(floor, inAnHour), true, false},
-		"a pin failure past the floor":                 {section(floor.Add(-time.Second), inAnHour), true, true},
-		"an old attempt with no pin failure":           {section(payloadNow.Add(-30*time.Minute), inAnHour), false, false},
-		"a pin failure never holds back a due refresh": {section(payloadNow.Add(-time.Minute), payloadNow.Add(-time.Second)), true, true},
+		"no file":                     {nil, false, true},
+		"no file after a pin failure": {nil, true, true},
+		"a conflict with the refresh passed": {
+			conflicted(section(hourAgo.Add(-time.Hour), hourAgo)),
+			false,
+			false,
+		},
+		"a conflict after a pin failure":            {conflicted(section(hourAgo, inAnHour)), true, false},
+		"a conflict with no section":                {conflicted(identityOnly.clone()), true, false},
+		"an identity and no node list":              {identityOnly, false, true},
+		"a section validation dropped for its time": {ahead, false, true},
+		"a refresh not yet due":                     {section(payloadNow.Add(-time.Minute), inAnHour), false, false},
+		"a refresh due at this instant":             {section(hourAgo, payloadNow), false, true},
+		"a refresh past due":                        {section(hourAgo.Add(-time.Hour), hourAgo), false, true},
+		"a refresh time validation dropped": {
+			section(payloadNow.Add(-time.Minute), time.Time{}),
+			false,
+			true,
+		},
+		"a pin failure within the floor": {
+			section(payloadNow.Add(-5*time.Minute), inAnHour),
+			true,
+			false,
+		},
+		"a pin failure exactly at the floor": {section(floor, inAnHour), true, false},
+		"a pin failure past the floor":       {section(floor.Add(-time.Second), inAnHour), true, true},
+		"an old attempt with no pin failure": {
+			section(payloadNow.Add(-30*time.Minute), inAnHour),
+			false,
+			false,
+		},
+		"a pin failure never holds back a due refresh": {
+			section(payloadNow.Add(-time.Minute), payloadNow.Add(-time.Second)),
+			true,
+			true,
+		},
 	}
 	for _, outcome := range []DiscoveryOutcome{OutcomeNoCandidates, OutcomeStandalone, OutcomePublicSuffix} {
 		prefix := string(outcome) + " "
 		cases[prefix+"an hour after the discovery"] = refreshCase{noNodes(outcome, hourAgo), false, false}
-		cases[prefix+"just before 24 hours"] = refreshCase{noNodes(outcome, payloadNow.Add(-MaxRefreshWait+time.Second)), false, false}
+		cases[prefix+"just before 24 hours"] = refreshCase{
+			noNodes(outcome, payloadNow.Add(-MaxRefreshWait+time.Second)),
+			false,
+			false,
+		}
 		cases[prefix+"after 24 hours"] = refreshCase{noNodes(outcome, payloadNow.Add(-MaxRefreshWait)), false, true}
-		cases[prefix+"a pin failure past the floor"] = refreshCase{noNodes(outcome, payloadNow.Add(-11*time.Minute)), true, false}
+		cases[prefix+"a pin failure past the floor"] = refreshCase{
+			noNodes(outcome, payloadNow.Add(-11*time.Minute)),
+			true,
+			false,
+		}
 		cases[prefix+"a pin failure an hour after the discovery"] = refreshCase{noNodes(outcome, hourAgo), true, false}
-		cases[prefix+"a pin failure after 24 hours"] = refreshCase{noNodes(outcome, payloadNow.Add(-MaxRefreshWait)), true, true}
+		cases[prefix+"a pin failure after 24 hours"] = refreshCase{
+			noNodes(outcome, payloadNow.Add(-MaxRefreshWait)),
+			true,
+			true,
+		}
 	}
 	for name, tc := range cases {
 		if got := RefreshDue(tc.p, payloadNow, tc.pinFailed); got != tc.want {

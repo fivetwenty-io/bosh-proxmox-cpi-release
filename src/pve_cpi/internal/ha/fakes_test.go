@@ -158,7 +158,10 @@ func (c *fakeCluster) ListStatus(_ context.Context) (*sdkcluster.ListStatusRespo
 		if name == "" {
 			name = "lab"
 		}
-		rows = append(rows, mustJSON(map[string]any{"type": "cluster", "name": name, "nodes": len(w.nodes), "quorate": q}))
+		rows = append(
+			rows,
+			mustJSON(map[string]any{"type": "cluster", "name": name, "nodes": len(w.nodes), "quorate": q}),
+		)
 	}
 	for _, n := range w.nodes {
 		online := 0
