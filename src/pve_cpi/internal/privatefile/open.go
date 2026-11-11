@@ -48,10 +48,18 @@ func (p Policy) PrivateInfo(path string, info os.FileInfo, directory bool) error
 	return p.privateStat(path, st, info.Mode(), directory)
 }
 
+// effectiveUID is the user that must own a private path.
+func (p Policy) effectiveUID() int {
+	if p.EUID != nil {
+		return p.EUID()
+	}
+	return os.Geteuid()
+}
+
 // privateStat is PrivateInfo on a stat result and its file mode. st is nil
 // when the platform reported no ownership metadata.
 func (p Policy) privateStat(path string, st *syscall.Stat_t, mode os.FileMode, directory bool) error {
-	euid := os.Geteuid()
+	euid := p.effectiveUID()
 	unsafe := &UnsafePathError{Path: path, UID: -1, EUID: euid, Mode: mode, WantDirectory: directory}
 	if st != nil {
 		unsafe.UID = int(st.Uid)

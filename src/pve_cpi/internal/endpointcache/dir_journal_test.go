@@ -195,6 +195,40 @@ func TestSiblingRefusesWrongOwner(t *testing.T) {
 	requireAbsent(t, temporaryPath(parent), "a refused sibling fell through to the temporary layer")
 }
 
+// Another user's directory cannot be made without root, so the policy's owner
+// is moved instead: the process's own sibling then belongs to someone else. The
+// sibling must be refused for its owner, with no fall-through, exactly as an
+// override directory is, because both reach the private checks through the same
+// policy. This runs for every user, so a sibling that skipped the owner check
+// fails here.
+func TestSiblingRefusesAnOwnerThatIsNotTheEffectiveUser(t *testing.T) {
+	for _, name := range []string{"", HAProfileName} {
+		t.Run("display name "+name, func(t *testing.T) {
+			parent := temporaryParent(t)
+			journal, sibling := journalSibling(t)
+			makePrivateDirectory(t, sibling)
+			override := privateDirectory(t)
+			// textsFor copies cachePrivatePolicy for a named cache and
+			// endpointTexts holds its own copy, so both move.
+			previousBase, previousTexts := cachePrivatePolicy.EUID, endpointTexts.policy.EUID
+			someoneElse := func() int { return os.Geteuid() + 1 }
+			cachePrivatePolicy.EUID, endpointTexts.policy.EUID = someoneElse, someoneElse
+			t.Cleanup(func() { cachePrivatePolicy.EUID, endpointTexts.policy.EUID = previousBase, previousTexts })
+
+			// The override layer shows the policy refuses the owner at all.
+			requireUnsafe(t, resolve(t, Options{Override: override, DisplayName: name}), privatefile.ErrUnsafeOwnership)
+
+			choice := resolve(t, Options{JournalDir: journal, DisplayName: name})
+			requireUnsafe(t, choice, privatefile.ErrUnsafeOwnership)
+			if choice.Layer != LayerJournal || choice.Path != sibling {
+				t.Fatalf("choice = %s %s, want a refusal by the journal layer at %s",
+					choice.Layer, choice.Path, sibling)
+			}
+			requireAbsent(t, temporaryPath(parent), "a refused sibling fell through to the temporary layer")
+		})
+	}
+}
+
 func TestSiblingUnderASymlinkedAncestorIsFoundThroughTheConfiguredPath(t *testing.T) {
 	temporaryParent(t)
 	target := t.TempDir()

@@ -84,6 +84,11 @@ type Policy struct {
 	// NewID returns a unique name fragment for a temporary file. Nil uses 128
 	// random bits in hex.
 	NewID func() (string, error)
+	// EUID returns the user ID that must own a private path. Nil uses the
+	// process's effective user ID, which is the only value production code
+	// sets. A test sets it to show that a caller's checks refuse a path that
+	// another user owns, which an ordinary user cannot create.
+	EUID func() int
 }
 
 var integrityKeyPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
