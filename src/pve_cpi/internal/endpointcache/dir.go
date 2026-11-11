@@ -40,7 +40,8 @@ type Options struct {
 	// Override is the value of pve.endpoint_cache_dir, empty when it is unset.
 	Override string
 	// JournalDir is the value of pve.storage_allocation_journal_dir, empty when
-	// it is unset. The journal layer looks for endpoint-cache beside it.
+	// it is unset. The journal layer looks for endpoint-cache beside it, and
+	// Resolve refuses any directory that overlaps it.
 	JournalDir string
 	// DisplayName is what the refusal texts call the cache the caller is
 	// choosing a directory for, such as HAProfileName. Empty means the endpoint
@@ -48,7 +49,8 @@ type Options struct {
 	// as empty.
 	DisplayName string
 	// Guard, when set, vets the path a layer is about to create. See PathGuard.
-	// It is a pointer, so Options stays comparable.
+	// Resolve asks its own journal check first, so a guard here adds to that
+	// check and never replaces it. It is a pointer, so Options stays comparable.
 	Guard PathGuard
 }
 
@@ -129,7 +131,21 @@ var layers = []layer{
 
 // Resolve chooses the cache directory. It writes no log line, because its
 // caller decides the level for the layer chosen and for any refusal.
-func Resolve(opts Options) Choice { return resolveWith(layers, opts) }
+//
+// When opts.JournalDir is set, Resolve also keeps the cache out of the
+// allocation journal directory for every caller. A directory that equals the
+// journal directory, sits inside its tree, or contains it is refused, with each
+// case judged after symlink resolution. The check runs twice. The layer that
+// creates its directory asks before it creates anything, so a refusal leaves
+// nothing behind, and the directory the answering layer opened is compared once
+// more, which also covers a directory no layer created. A refusal there closes
+// the directory, so the choice holds no handle to the journal's tree, and its
+// cause is ErrJournalOverlap, or an error that wraps the cause of a comparison
+// that failed, because the check fails closed.
+func Resolve(opts Options) Choice {
+	opts.Guard = guardJournal(opts.JournalDir, opts.Guard)
+	return refuseJournalOverlap(resolveWith(layers, opts), opts.JournalDir)
+}
 
 // resolveWith runs the layers in order. Every layer but the last may decline,
 // and the last answers with whatever it returns, so the result always names a

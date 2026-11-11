@@ -36,51 +36,6 @@ func temporaryCacheDir(parent string) string {
 	return filepath.Join(parent, "pve_cpi-endpoint-cache."+strconv.Itoa(os.Geteuid()))
 }
 
-// The directory beside the journal is not the journal and holds no journal, so
-// the alias check that guards every layer lets it through, whether the sibling
-// exists yet or not.
-func TestCacheAliasesJournalLetsTheSiblingPass(t *testing.T) {
-	journal, sibling := journalBeside(t)
-	aliased, err := cacheAliasesJournal(sibling, journal)
-	if err != nil || aliased {
-		t.Fatalf("a missing sibling: aliased %v, err %v, want neither", aliased, err)
-	}
-	if err := os.Mkdir(sibling, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	aliased, err = cacheAliasesJournal(sibling, journal)
-	if err != nil || aliased {
-		t.Fatalf("an existing sibling: aliased %v, err %v, want neither", aliased, err)
-	}
-	// A journal that is a symlink to a directory elsewhere, and a parent that is
-	// reached through a link, leave the sibling beside the link and still apart.
-	target := filepath.Join(t.TempDir(), "journal-target")
-	if err := os.Mkdir(target, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	link := filepath.Join(filepath.Dir(sibling), "journal-link")
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatal(err)
-	}
-	aliased, err = cacheAliasesJournal(sibling, link)
-	if err != nil || aliased {
-		t.Fatalf("a symlinked journal: aliased %v, err %v, want neither", aliased, err)
-	}
-	via := filepath.Join(t.TempDir(), "parent-link")
-	if err := os.Symlink(filepath.Dir(sibling), via); err != nil {
-		t.Fatal(err)
-	}
-	aliased, err = cacheAliasesJournal(filepath.Join(via, "endpoint-cache"), journal)
-	if err != nil || aliased {
-		t.Fatalf("a sibling reached through a link: aliased %v, err %v, want neither", aliased, err)
-	}
-	// The directory inside the journal is still refused, so the check is live.
-	inside := filepath.Join(journal, "endpoint-cache")
-	if aliased, err = cacheAliasesJournal(inside, journal); err != nil || !aliased {
-		t.Fatalf("a directory inside the journal: aliased %v, err %v, want aliased", aliased, err)
-	}
-}
-
 func TestOpenEndpointCacheUsesTheSiblingBesideTheJournal(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	for _, mode := range []config.DiscoveryMode{config.DiscoveryModeAuto, config.DiscoveryModeOn} {

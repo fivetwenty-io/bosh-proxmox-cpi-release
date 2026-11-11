@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"io/fs"
 	"net"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,42 +34,17 @@ const drainRefusalLine = "api endpoint discovery off: " + drainStartedText
 // which an explicit "on" must not turn into a Warn. Tests replace it.
 type cacheDirectoryChooser func(cfg *config.CPIConfig) (endpointcache.Choice, []string)
 
-// chooseCacheDirectory is the chooser the client uses. A layer that creates its
-// directory asks the journal guard first, so a directory that overlaps the
-// allocation journal is refused before anything is created.
+// chooseCacheDirectory is the chooser the client uses. endpointcache.Resolve
+// keeps the directory out of the allocation journal directory, before a layer
+// creates anything and again after the directory is open, so the chooser adds
+// nothing of its own.
 var chooseCacheDirectory cacheDirectoryChooser = func(cfg *config.CPIConfig) (endpointcache.Choice, []string) {
-	guard := &journalGuard{journal: cfg.StorageAllocationJournalDir}
-	choice := endpointcache.OptionsFor(cfg).WithGuard(guard).Resolve()
+	choice := endpointcache.OptionsFor(cfg).Resolve()
 	notes := make([]string, 0, len(choice.Notes))
 	for _, note := range choice.Notes {
 		notes = append(notes, "pve endpoints: "+note)
 	}
 	return choice, notes
-}
-
-// journalGuard refuses a cache directory that overlaps the allocation journal
-// directory. It is the endpointcache.PathGuard of the layers that create their
-// directory, so the check runs before the directory exists and a refused layer
-// leaves nothing behind. The check after the open stays as well, because it
-// covers a directory that a layer did not create and one that changed in
-// between.
-type journalGuard struct {
-	journal string
-}
-
-var _ endpointcache.PathGuard = (*journalGuard)(nil)
-
-// BeforeCreate returns an error when path overlaps the journal directory, or
-// when the two cannot be compared.
-func (g *journalGuard) BeforeCreate(path string) error {
-	aliased, err := cacheAliasesJournal(path, g.journal)
-	switch {
-	case err != nil:
-		return fmt.Errorf("the directory could not be compared with the allocation journal directory: %w", err)
-	case aliased:
-		return errors.New("the directory is the allocation journal directory, sits inside it, or contains it")
-	}
-	return nil
 }
 
 // cacheClock is the clock the cache read and the mark writes use.
@@ -150,17 +123,6 @@ func openEndpointCache(cfg *config.CPIConfig, plan *endpointPlan, logger *log.Lo
 	}
 	if !choice.Usable() {
 		return off(refusalText(choice))
-	}
-	aliased, aliasErr := cacheAliasesJournal(choice.Path, cfg.StorageAllocationJournalDir)
-	switch {
-	case aliasErr != nil:
-		_ = choice.Close()
-		return off(fmt.Sprintf("cache directory %s could not be compared with the allocation journal directory: %v",
-			choice.Path, aliasErr))
-	case aliased:
-		_ = choice.Close()
-		return off(fmt.Sprintf("cache directory %s is the allocation journal directory, sits inside it, or "+
-			"contains it", choice.Path))
 	}
 	logger.LogAttrs(ctx, log.LevelDebug, "pve endpoints: cache directory "+choice.Path+", "+layerText(choice.Layer))
 
@@ -623,160 +585,4 @@ func cacheCredential(cfg *config.CPIConfig) (user, credential string) {
 		user += "@" + realm
 	}
 	return user, cfg.Password
-}
-
-// cacheAliasesJournal reports whether the cache directory overlaps the
-// allocation journal directory, which is when the cache directory is the
-// journal directory, sits inside its tree, or contains it. The check resolves
-// symlinks in both paths, and it compares the directories themselves, and
-// every ancestor of each, with os.SameFile, so a link or a bind in the middle
-// of either path cannot hide the overlap in either direction. Either
-// directory may not exist yet, because the temporary layer asks before it
-// creates its directory. A directory that does not exist has no identity to
-// compare, so it is compared by its resolved path, which is the only way it can
-// overlap an existing directory from below, and a missing cache directory
-// contains nothing. An empty journal directory overlaps nothing. A path that
-// cannot be examined for any reason but being absent is an error, and the
-// caller treats the directory as unusable, because the check must fail closed.
-func cacheAliasesJournal(cachePath, journal string) (bool, error) {
-	candidates := []string{journal}
-	if trimmed := strings.TrimSpace(journal); trimmed != journal {
-		candidates = append(candidates, trimmed)
-	}
-	var journals []string
-	for _, c := range candidates {
-		if c != "" {
-			journals = append(journals, c)
-		}
-	}
-	if len(journals) == 0 {
-		return false, nil
-	}
-	cacheReal, cacheInfo, err := resolveDirectory(cachePath)
-	if err != nil {
-		return false, fmt.Errorf("resolve the cache directory: %w", err)
-	}
-	for _, j := range journals {
-		journalReal, journalInfo, err := resolveDirectory(j)
-		if err != nil {
-			return false, fmt.Errorf("resolve the allocation journal directory: %w", err)
-		}
-		overlap, err := directoriesOverlap(cacheReal, cacheInfo, journalReal, journalInfo)
-		if err != nil {
-			return false, fmt.Errorf("compare the cache directory with the allocation journal directory: %w", err)
-		}
-		if overlap {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// directoriesOverlap reports whether one of two resolved directories is the
-// other or lies below it. A nil info means the directory does not exist yet.
-// Existing directories are compared by file identity along the ancestors of
-// each path. A directory that is missing is compared by path against the other
-// one, and by the identity of its nearest existing ancestor when the other one
-// exists.
-func directoriesOverlap(cachePath string, cacheInfo os.FileInfo, journalPath string, journalInfo os.FileInfo,
-) (bool, error) {
-	switch {
-	case cacheInfo == nil && journalInfo == nil:
-		return pathWithin(journalPath, cachePath) || pathWithin(cachePath, journalPath), nil
-	case journalInfo == nil:
-		// The journal can only lie below the cache directory.
-		return pathWithin(cachePath, journalPath), nil
-	case cacheInfo == nil:
-		// A cache directory that is not there contains nothing, and it sits inside the
-		// journal when the directory it would be created in does.
-		existing, err := nearestExisting(cachePath)
-		if err != nil {
-			return false, err
-		}
-		return ancestorIs(existing, journalInfo)
-	}
-	inside, err := ancestorIs(cachePath, journalInfo)
-	if err != nil || inside {
-		return inside, err
-	}
-	return ancestorIs(journalPath, cacheInfo)
-}
-
-// nearestExisting returns dir, or the nearest ancestor of dir that exists.
-func nearestExisting(dir string) (string, error) {
-	for {
-		_, err := os.Stat(dir)
-		if err == nil {
-			return dir, nil
-		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			return "", err
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", err
-		}
-		dir = parent
-	}
-}
-
-// resolveDirectory returns the absolute path of dir with its symlinks
-// resolved, and its file info. A directory that does not exist yet is resolved
-// through its nearest existing ancestor, and its info is nil, because nothing
-// can be the same file as a directory that is not there. Any other failure is
-// returned.
-func resolveDirectory(dir string) (string, os.FileInfo, error) {
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		return "", nil, err
-	}
-	resolved, err := filepath.EvalSymlinks(abs)
-	if err == nil {
-		info, statErr := os.Stat(resolved)
-		if statErr != nil {
-			return "", nil, statErr
-		}
-		return resolved, info, nil
-	}
-	if !errors.Is(err, fs.ErrNotExist) {
-		return "", nil, err
-	}
-	parent := filepath.Dir(abs)
-	if parent == abs {
-		return "", nil, err
-	}
-	resolvedParent, _, parentErr := resolveDirectory(parent)
-	if parentErr != nil {
-		return "", nil, parentErr
-	}
-	return filepath.Join(resolvedParent, filepath.Base(abs)), nil, nil
-}
-
-// ancestorIs reports whether dir, or any directory above it, is the same file
-// as target.
-func ancestorIs(dir string, target os.FileInfo) (bool, error) {
-	for {
-		info, err := os.Stat(dir)
-		if err != nil {
-			return false, err
-		}
-		if os.SameFile(info, target) {
-			return true, nil
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return false, nil
-		}
-		dir = parent
-	}
-}
-
-// pathWithin reports whether the absolute path child equals root or lies below
-// it, comparing whole path elements so /a/bc is not inside /a/b.
-func pathWithin(root, child string) bool {
-	rel, err := filepath.Rel(root, child)
-	if err != nil {
-		return false
-	}
-	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }

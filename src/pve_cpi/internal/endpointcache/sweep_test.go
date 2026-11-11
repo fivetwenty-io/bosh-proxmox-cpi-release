@@ -26,6 +26,13 @@ const (
 	sweepLock     = sweepBase + ".lock"
 	sweepDiscover = sweepBase + ".discover.lock"
 	sweepTemp     = ".tmp-0123456789abcdef0123456789abcdef"
+	// sweepTempFresh and sweepTempEdge have the shape of the cache's own scratch
+	// files, so a sweep that leaves them is deciding on their age.
+	sweepTempFresh = ".tmp-fedcba9876543210fedcba9876543210"
+	sweepTempEdge  = ".tmp-00112233445566778899aabbccddeeff"
+	// journalScratch is the shape of an allocation journal scratch file, which
+	// starts with the same prefix but carries a UUID.
+	journalScratch = ".tmp-0f8fad5b-d9cb-469f-a165-70867728950e"
 )
 
 // sweepFile creates the file name in dir at mode 0600, aged by age before
@@ -63,14 +70,34 @@ func runSweep(t *testing.T, root *os.Root, keep ...string) SweepResult {
 func TestSweepRemovesTemporaryFilesOlderThanAnHour(t *testing.T) {
 	dir, root := sweepDir(t)
 	sweepFile(t, dir, sweepTemp, 61*time.Minute)
-	sweepFile(t, dir, ".tmp-fresh", 59*time.Minute)
-	sweepFile(t, dir, ".tmp-edge", time.Hour)
+	sweepFile(t, dir, sweepTempFresh, 59*time.Minute)
+	sweepFile(t, dir, sweepTempEdge, time.Hour)
 	result := runSweep(t, root)
 	if !reflect.DeepEqual(result.Removed, []string{sweepTemp}) {
 		t.Errorf("removed %v, want only the temporary file older than an hour", result.Removed)
 	}
-	if got := storeDirNames(t, dir); !reflect.DeepEqual(got, []string{".tmp-edge", ".tmp-fresh"}) {
+	if got := storeDirNames(t, dir); !reflect.DeepEqual(got, []string{sweepTempEdge, sweepTempFresh}) {
 		t.Errorf("left %v", got)
+	}
+}
+
+// A directory that someone else writes scratch files into, such as the
+// allocation journal's, keeps them whatever their age, because the sweep
+// removes only a file whose name the cache makes.
+func TestSweepLeavesAnotherStoresScratchFilesAlone(t *testing.T) {
+	dir, root := sweepDir(t)
+	const year = 365 * 24 * time.Hour
+	sweepFile(t, dir, journalScratch, year)
+	sweepFile(t, dir, ".tmp-allocation", year)
+	sweepFile(t, dir, ".tmp-", year)
+	sweepFile(t, dir, sweepTemp, 2*time.Hour)
+	result := runSweep(t, root)
+	if !reflect.DeepEqual(result.Removed, []string{sweepTemp}) {
+		t.Errorf("removed %v, want only the cache's own temporary file", result.Removed)
+	}
+	want := []string{".tmp-", journalScratch, ".tmp-allocation"}
+	if got := storeDirNames(t, dir); !reflect.DeepEqual(got, want) {
+		t.Errorf("left %v, want %v", got, want)
 	}
 }
 

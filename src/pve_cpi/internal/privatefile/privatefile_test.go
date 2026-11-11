@@ -1170,3 +1170,34 @@ func literalTypeName(expr ast.Expr) string {
 	}
 	return ""
 }
+
+// IsDefaultTempName accepts what WriteFile names a scratch file when the Policy
+// draws no IDs of its own, and nothing else that starts with the prefix.
+func TestIsDefaultTempName(t *testing.T) {
+	var p Policy
+	id, err := p.newID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{TempPrefix + id, true},
+		{".tmp-0123456789abcdef0123456789abcdef", true},
+		{".tmp-0123456789abcdef", false},
+		{".tmp-0123456789ABCDEF0123456789ABCDEF", false},
+		{".tmp-0123456789abcdef0123456789abcdef0", false},
+		{".tmp-0f8fad5b-d9cb-469f-a165-70867728950e", false},
+		{".tmp-allocation", false},
+		{".tmp-", false},
+		{"0123456789abcdef0123456789abcdef", false},
+		{"x.tmp-0123456789abcdef0123456789abcdef", false},
+		{".tmp-0123456789abcdef0123456789abcdef\n", false},
+	}
+	for _, tc := range cases {
+		if got := IsDefaultTempName(tc.name); got != tc.want {
+			t.Errorf("IsDefaultTempName(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

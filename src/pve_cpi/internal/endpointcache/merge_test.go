@@ -694,13 +694,14 @@ func TestStoreUpdatePayloadSweepsUnderTheLock(t *testing.T) {
 	dir := newStoreDir(t)
 	s := openTestStore(t, dir, storeTestCredential, StoreOptions{})
 	old := payloadNow.Add(-2 * time.Hour)
-	temp := filepath.Join(dir, ".tmp-0123456789abcdef")
+	temp := filepath.Join(dir, ".tmp-0123456789abcdef0123456789abcdef")
 	writeStoreFile(t, temp, []byte("x"), 0o600)
 	if err := os.Chtimes(temp, old, old); err != nil {
 		t.Fatal(err)
 	}
 	res := putResult(t, s, payloadNow, mergeResult("pve2"))
-	if !reflect.DeepEqual(res.Swept.Removed, []string{".tmp-0123456789abcdef"}) || res.Swept.Err != nil {
+	removed := []string{".tmp-0123456789abcdef0123456789abcdef"}
+	if !reflect.DeepEqual(res.Swept.Removed, removed) || res.Swept.Err != nil {
 		t.Errorf("swept %+v", res.Swept)
 	}
 	names := storeDirNames(t, dir)

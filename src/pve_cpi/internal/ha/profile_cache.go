@@ -43,7 +43,9 @@ type ProfileCacheOptions struct {
 	// the endpoint-cache directory beside the allocation journal directory
 	// when that already exists, and the per-user temporary directory when it
 	// does not. A missing override directory gives no cache, because the
-	// override is the only directory the CPI uses when it is set.
+	// override is the only directory the CPI uses when it is set. A directory
+	// that overlaps the allocation journal directory gives no cache either,
+	// because endpointcache.Resolve refuses it for every cache.
 	Dir endpointcache.DirOptions
 
 	// Key names the cluster entry. It is the endpoint cache's key input, so one

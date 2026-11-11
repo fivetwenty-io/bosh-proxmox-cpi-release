@@ -70,7 +70,10 @@ var episodePolicy = privatefile.Policy{
 // so the store falls back to the layers after the override, logs a Warn line
 // that names the missing directory, and records the episode there. ForCall
 // makes that one line per call however many times the call observes. An
-// override that exists but fails the private checks still gives no record.
+// override that exists but fails the private checks still gives no record, and
+// so does one that overlaps the allocation journal directory, which
+// endpointcache.Resolve refuses for every cache. That refusal does not fall
+// back, because the override exists.
 type EpisodeStore struct {
 	// Dir says where to look for the cache directory, and comes from
 	// endpointcache.OptionsFor. The record sits in the same directory as the

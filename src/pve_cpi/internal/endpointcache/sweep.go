@@ -55,15 +55,18 @@ type SweepResult struct {
 }
 
 // Sweep removes what the cache left behind in the directory root names. It
-// removes temporary files, which start with privatefile.TempPrefix, that
-// nobody has modified for an hour, and key files, lock files, and discover lock
-// files that nobody has modified for 30 days. A lock file's age is the newer of
+// removes temporary files, which have the names privatefile.WriteFile gives
+// them when it draws its own random ID, that nobody has modified for an hour,
+// and key files, lock files, and discover lock files that nobody has modified
+// for 30 days. A lock file's age is the newer of
 // its own modification time and its key file's, so a lock in daily use or
 // beside a fresh key file stays.
 //
 // It looks only at the directory's top level and never descends, and it
 // removes only names the cache itself makes, so a directory that aliases
-// another tree cannot lose that tree's files. It removes only regular files
+// another tree cannot lose that tree's files. That includes another store's
+// scratch files, such as the allocation journal's, which start with the same
+// ".tmp-" but carry an ID of another shape. It removes only regular files
 // that the effective user owns, and it never removes secret or secret.lock
 // whatever their age. keep lists names it leaves alone whatever their age,
 // such as the lock the caller holds. It writes no log line.
@@ -279,14 +282,15 @@ func (t *texts) listNames(root *os.Root) ([]string, error) {
 
 // sweepAge returns how old the cache file called name must be to be removed,
 // and false for a name the sweep never touches: the directory secret and its
-// lock, a name in keep, and any name the cache does not make.
+// lock, a name in keep, and any name the cache does not make, which includes a
+// ".tmp-" name whose ID is not the shape the cache's own writes draw.
 func sweepAge(name string, keep []string) (time.Duration, bool) {
 	switch {
 	case name == secretFile || name == secretLockFile:
 		return 0, false
 	case slices.Contains(keep, name):
 		return 0, false
-	case strings.HasPrefix(name, privatefile.TempPrefix):
+	case privatefile.IsDefaultTempName(name):
 		return tempMaxAge, true
 	case cacheFileName.MatchString(name):
 		return fileMaxAge, true

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 )
 
 // Envelope is the outer wrapper of a stored value: a schema version, the
@@ -157,6 +158,18 @@ func (p Policy) WriteEnvelope(r *os.Root, name string, version int, value any, o
 // TempPrefix starts the name of the temporary file WriteFile creates, so a
 // sweep can recognize the leftovers of a write that was cut short.
 const TempPrefix = ".tmp-"
+
+// defaultTempName matches the temporary names a Policy with no NewID makes:
+// TempPrefix and 128 random bits in lower-case hex.
+var defaultTempName = regexp.MustCompile(`^` + regexp.QuoteMeta(TempPrefix) + `[0-9a-f]{32}$`)
+
+// IsDefaultTempName reports whether name has the shape of a temporary file that
+// WriteFile makes for a Policy with no NewID. A Policy that draws its own IDs,
+// as the allocation journal's does, names its temporary files in a shape that
+// does not match, so a directory scan that removes leftovers for the stores of
+// the default shape cannot remove another store's scratch file because both
+// start with TempPrefix.
+func IsDefaultTempName(name string) bool { return defaultTempName.MatchString(name) }
 
 // WriteFile replaces name with data atomically: it writes a temporary file
 // opened with O_EXCL, syncs it, renames it over name, and syncs the
