@@ -188,7 +188,8 @@ func TestObserveMigration_RefusesWhenTheProbeDoesNotPlaceTheHolderOnTheTarget(t 
 		t.Run(tc.name, func(t *testing.T) {
 			c := newMigratedHolderCase(t)
 			tc.setup(c)
-			if _, err := c.guard.observeMigration(c.ctx, c.migration()); err == nil || !strings.Contains(err.Error(), tc.want) {
+			if _, err := c.guard.observeMigration(c.ctx, c.migration()); err == nil ||
+				!strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("observeMigration = %v, want a refusal containing %q", err, tc.want)
 			}
 		})
@@ -209,7 +210,8 @@ func TestObserveMigration_RefusesAHeldMigrateLockAsRetriable(t *testing.T) {
 	if !errors.As(err, &typed) || !typed.OkToRetry() {
 		t.Fatalf("observeMigratedHolder = %v, want a retriable error", err)
 	}
-	if _, err := c.guard.observeMigration(c.ctx, c.migration()); err == nil || !strings.Contains(err.Error(), "migrate lock") {
+	if _, err := c.guard.observeMigration(c.ctx, c.migration()); err == nil ||
+		!strings.Contains(err.Error(), "migrate lock") {
 		t.Fatalf("observeMigration = %v, want the migrate lock refusal", err)
 	}
 }
@@ -221,7 +223,8 @@ func TestObserveMigration_RefusesASerialOnTwoSlots(t *testing.T) {
 	c := newMigratedHolderCase(t)
 	c.answerOn("n1", errGuardSiteConfigGone)
 	c.client.state.configs[migratedHolderVMID]["scsi1"] = c.volume + ",serial=" + c.token + ",size=5G"
-	if _, err := c.guard.observeMigration(c.ctx, c.migration()); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+	if _, err := c.guard.observeMigration(c.ctx, c.migration()); err == nil ||
+		!strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("observeMigration = %v, want the ambiguous identity refusal", err)
 	}
 }
