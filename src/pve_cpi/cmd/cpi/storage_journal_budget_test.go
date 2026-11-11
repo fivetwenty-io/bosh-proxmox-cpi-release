@@ -58,14 +58,14 @@ func TestStorageJournalCleanupBudgetOutlastsTheParkerWait(t *testing.T) {
 	}
 }
 
-// TestStorageJournalSettlingBudgetsOutlastTheSettlersWait checks adopt and
-// finalize-cleanup the same way. Both settle the record's planned steps, so
-// the settler can wait out a whole holder on a parker's lock, and a wait that
-// starts once the base work has used its whole budget must still get its full
-// length, with the margin for the read, the release, and the completion
-// before the deadline.
+// TestStorageJournalSettlingBudgetsOutlastTheSettlersWait checks adopt,
+// finalize-cleanup, and settle-migration the same way. Each settles the
+// record's planned steps, so the settler can wait out a whole holder on a
+// parker's lock, and a wait that starts once the base work has used its whole
+// budget must still get its full length, with the margin for the read, the
+// release, and the completion before the deadline.
 func TestStorageJournalSettlingBudgetsOutlastTheSettlersWait(t *testing.T) {
-	for _, action := range []string{"adopt", "finalize-cleanup"} {
+	for _, action := range []string{"adopt", "finalize-cleanup", "settle-migration"} {
 		now := time.Now()
 		deadline := actionDeadline(t, action)
 		ttl := pve.ParkerProtectionLockTTLNow()
