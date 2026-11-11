@@ -40,6 +40,12 @@ const (
 	probeLimit          = candidateDialCap + candidateHandshakeCap + probeHeaderDeadline
 )
 
+// ProbeLimit is the time one candidate's probe may take, and so the least time
+// a request's context must have left for the cold start to run on it. A caller
+// that must keep the cold start available to a request checks its context
+// against this figure and not a copy of it.
+const ProbeLimit = probeLimit
+
 // ProbePath is the URL path of the membership probe, GET /cluster/status under
 // the API prefix. The probe transport refuses every other path.
 const ProbePath = APIPrefix + "/cluster/status"
