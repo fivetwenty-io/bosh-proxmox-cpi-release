@@ -917,3 +917,34 @@ func TestProfileCacheWithoutAnOverrideLandsBesideTheJournal(t *testing.T) {
 		t.Errorf("the temporary layer was used although the sibling was usable: %v", err)
 	}
 }
+
+// TestDepsFromClientKeepsNoProfileCacheWhereDiscoveryIsOff covers the promise
+// that an explicit endpoint list with discovery off creates no cache files.
+func TestDepsFromClientKeepsNoProfileCacheWhereDiscoveryIsOff(t *testing.T) {
+	dir := cacheDir(t)
+	off := cacheCfg(dir)
+	off.APIEndpointDiscovery = config.DiscoveryModeOff
+	list := cacheCfg(dir)
+	list.Endpoints = []string{"pve1.dc1.example.com", "pve2.dc1.example.com"}
+	password := cacheCfg(dir)
+	password.APIToken = ""
+	password.User = "cpi@pve"
+	password.Password = "secret"
+
+	for name, cfg := range map[string]*config.CPIConfig{
+		"discovery off":                     off,
+		"several endpoints with auto":       list,
+		"password authentication with auto": password,
+	} {
+		if d := ha.DepsFromClient(&depsClient{}, cfg, nil); d.Slow != nil {
+			t.Errorf("%s: the entry must probe every call and write no profile cache", name)
+		}
+	}
+
+	on := cacheCfg(dir)
+	on.APIEndpointDiscovery = config.DiscoveryModeOn
+	on.Endpoints = []string{"pve1.dc1.example.com", "pve2.dc1.example.com"}
+	if d := ha.DepsFromClient(&depsClient{}, on, nil); d.Slow == nil {
+		t.Error("an entry whose discovery is on keeps the profile cache")
+	}
+}

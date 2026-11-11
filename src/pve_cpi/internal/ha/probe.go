@@ -91,10 +91,21 @@ func DepsFromClient(c pve.Client, cfg *config.CPIConfig, logger *log.Logger) Dep
 	}
 	// The slow facts come from the profile cache when the entry can key one.
 	// An entry that cannot, such as one with no credential, probes every call.
-	if opts, ok := ProfileCacheOptionsFromConfig(cfg, logger); ok {
+	// An entry whose endpoint discovery resolves to off keeps no cache either,
+	// because that mode promises to write no cache files, and a cache only saves
+	// probes.
+	if opts, ok := ProfileCacheOptionsFromConfig(cfg, logger); ok && profileCacheAllowed(cfg) {
 		d = d.WithProfileCache(opts)
 	}
 	return d
+}
+
+// profileCacheAllowed reports whether the entry may write the HA profile cache.
+// The files an explicit endpoint list with discovery off promises not to
+// create include this one, so it follows the mode discovery resolves to.
+func profileCacheAllowed(cfg *config.CPIConfig) bool {
+	mode, _ := config.EffectiveDiscoveryMode(cfg)
+	return mode == config.DiscoveryModeOn
 }
 
 // NodeRef names a cluster node and whether cluster status reports it online.
