@@ -24,6 +24,8 @@ With just this manifest, `create_vm` attaches every NIC to the pre-existing `vmb
 |  `pve.host` | PVE host (IP or FQDN), which is the first endpoint the CPI dials. Required unless `pve.endpoints` is set, in which case it takes the first entry of that list. When both are set, `pve.host` and `pve.port` must name the same host and port as the first entry of `pve.endpoints`, or the CPI rejects the config. Manifests that set only `pve.host` keep working unchanged. See [API Endpoints](#api-endpoints). Overridable per cpi-config entry as `pve_host`. | - | yes, unless `pve.endpoints` is set |
 |  `pve.port` | PVE API port. It applies to `pve.host` and to every `pve.endpoints` entry that does not carry its own port. Overridable per cpi-config entry as `pve_port`. | `8006` | no |
 |  `pve.endpoints` | Optional ordered list of PVE API endpoints for this cluster. Each entry is a hostname, an IPv4 literal, or a bare IPv6 literal, optionally followed by a port, and an IPv6 literal with a port is written `[literal]:port`. An entry may not carry a scheme, a path, user info, or whitespace. A port runs from 1 to 65535, and an entry without one takes `pve.port`. The list holds at most 16 entries, and no two may be equal once the host is lowercased, a trailing dot is removed, and the port is filled in. The first entry is the preferred endpoint, and the CPI tries the others in order when it cannot reach it. Unset or empty leaves the single `pve.host` endpoint in place and renders the same `cpi.json` as before. The list names machines that answer the PVE API for this cluster. It never changes where a VM lands, and it never changes the direct-to-node upload routing that `pve.node_endpoints` and `pve.node_endpoints_discovery` control. See [API Endpoints](#api-endpoints). Overridable per cpi-config entry as `pve_endpoints`. | `[]` | no |
+|  `pve.api_endpoint_discovery` | Optional. Whether the CPI discovers more API endpoints for this cluster and adds them to the failover pool, seeding from the first endpoint. The value is `auto`, `on`, or `off`, all lowercase, and we quote it in a manifest (see [Endpoint discovery](#endpoint-discovery)). Unset means `auto`, which discovers only when the effective endpoint list holds exactly one endpoint and the CPI authenticates with an API token. `on` discovers even when the list holds several endpoints, and `off` never discovers. The template also accepts a YAML boolean and renders `true` as `on` and `false` as `off`, but an empty string and any other spelling fail the render. `on` with password auth (`pve.password` set and `pve.api_token` empty) and `pve.verify_ssl: false` fails the render and the config check, because a password must not go to discovered hosts without certificate verification. When both `pve.password` and `pve.api_token` are set, the CPI keeps the token, so this check treats the pair as token auth. This property controls the API endpoint pool only. It never changes the upload routing that `pve.node_endpoints` and `pve.node_endpoints_discovery` control, and setting `pve.node_endpoints_discovery` to `false` does not turn it off. Overridable per cpi-config entry as `pve_api_endpoint_discovery`. | unset (acts as `auto`) | no |
+|  `pve.endpoint_cache_dir` | Optional. A directory for the endpoint cache files. When it is unset or empty, the CPI uses the `endpoint-cache` directory beside `pve.storage_allocation_journal_dir` if that directory is set and the `endpoint-cache` directory exists, and otherwise a `pve_cpi-endpoint-cache.<euid>` directory under the temporary directory. A value here wins over both. The value must be an absolute, clean path, which means it has no `.` or `..` parts, no doubled slashes, and no trailing slash. It may not contain control characters, may not have leading or trailing whitespace, and may not be the root directory. It may not equal, sit inside, or contain `pve.storage_allocation_journal_dir`, because the journal scans its own tree. The CPI never creates this directory, so it must already exist, be owned by the CPI's user, and grant no group or other access. This setting is process-level, like the journal directory, so a cpi-config entry cannot change it, and an entry that carries `pve_endpoint_cache_dir` is rejected as an unknown key. | `""` | no |
 |  `pve.user` | PVE username (e.g. `root@pam` or `bosh@pve`). The key has no default, so the manifest must always include it. An API token already names its user, so the value may be `""` when `api_token` is set. Overridable per cpi-config entry as `pve_user`. | - | yes (the value may be `""` with `api_token`) |
 |  `pve.password` | PVE password. When `api_token` is also set, the token wins and the password is ignored. Must be credhub-managed in production via `((pve_password))`. Overridable per cpi-config entry as `pve_password`. | `""` | one of password or api_token |
 |  `pve.api_token` | PVE API token (`<user>!<token-id>=<uuid>`). When `password` is also set, this token wins and the password is ignored. Must be credhub-managed in production via `((pve_api_token))`. Overridable per cpi-config entry as `pve_api_token`. | `""` | one of password or api_token |
@@ -264,6 +266,49 @@ A cpi-config entry can set its own list as `endpoints`. The table shows what an 
 | The job's `host` and `port` and no `endpoints`, or none of the three keys | The job's list, and with it the job's credentials. |
 
 An entry's list names entry nodes for the API. It never names a node set for placement, so the nodes a VM can land on still come from the entry's `placement` block and the CPI's placement rules.
+
+### Endpoint discovery
+
+A list of endpoints only helps when someone writes it. Discovery lets the CPI learn the other nodes of the cluster by itself, so a deployment that sets only `pve.host` can still fail over. The CPI asks the first configured endpoint for the cluster's nodes, derives each node's address from the seed's domain, keeps the nodes whose names resolve, and stores the result in the endpoint cache. The next call reads the cache and starts with those nodes in its pool. [Endpoint Failover](endpoint-failover.md) explains how the pool uses them.
+
+`pve.api_endpoint_discovery` takes one of three values.
+
+- `auto`
+  This is the default when the property is unset. Discovery runs only when the effective endpoint list holds exactly one endpoint and the CPI authenticates with an API token. A list of several endpoints, or password auth, turns it off. The password case logs a Debug line that says so.
+
+- `on`
+  Discovery runs even when the list holds several endpoints, and it seeds from the first one. A failure that `auto` keeps at Debug is logged at Warn instead, because we asked for something we are not getting.
+
+- `off`
+  Discovery never runs, and the CPI uses only the endpoints we list.
+
+We quote the value in YAML, as in `api_endpoint_discovery: "on"`. YAML 1.1, which BOSH manifests and cpi-config entries are written in, reads a bare `on` or `off` as a boolean. The template and the CPI both accept a boolean and map `true` to `on` and `false` to `off`, so a bare value still works. Quoting keeps the manifest saying what we meant, and it keeps tools that rewrite YAML from changing it. An empty string, a capitalized value such as `On`, and any other spelling fail the render with `api_endpoint_discovery must be auto, on, or off`.
+
+```yaml
+properties:
+  pve:
+    host: pve1.example.com
+    api_token: root@pam!bosh=((pve_api_token))
+    api_endpoint_discovery: "auto"
+    endpoint_cache_dir: /var/vcap/store/pve_cpi/endpoint-cache
+```
+
+Three conditions limit discovery whatever we set. The first two are checked when the config loads, and the third when the cache directory is opened.
+
+- Password auth with `pve.verify_ssl: false` and the value `on`
+  The render fails and the config check fails, because a password must not reach a discovered host that nobody verified. We use an API token or set `pve.verify_ssl: true`.
+
+- A cpi-config entry that inherits the job's credentials and sets looser TLS than the job
+  With `on`, the config check fails with a message that tells us to give the entry its own credentials or to match the job's TLS settings. With `auto` or an unset mode, discovery is off for that entry and the CPI logs the reason at Debug.
+
+- A cache directory the CPI cannot use
+  Discovery is off for that call and the CPI logs the reason, at Debug under `auto` and at Warn under `on`. [Troubleshooting](troubleshooting.md#discovery-is-off-for-this-call) lists each reason.
+
+The cold start from `placement.az_map` runs when the effective mode is on, which includes the ordinary `auto` case of one endpoint and an API token. It also needs `pve.verify_ssl: true` and `pve.ca_cert`, as [Endpoint Failover](endpoint-failover.md) explains.
+
+A cpi-config entry sets its own mode as `pve_api_endpoint_discovery`. An entry that does not name it inherits the job's value, and an entry that names it takes exactly what the job property takes, including the boolean form. A JSON `null` counts as unset. Because the entry's key lives in the cpi-config, we keep it out of entries when we might roll back to 0.9.6, as [Rolling back below endpoint lists](operations.md#rolling-back-below-endpoint-lists) explains.
+
+The cache directory is process-level. `pve.endpoint_cache_dir` takes the first place, the `endpoint-cache` directory beside the allocation journal takes the second, and a per-user directory under the temporary directory takes the third. The CPI creates only the third. The `provision-journal` step in the job's pre-start script creates the second beside the journal directory, and we create the first ourselves with owner `vcap` and mode `0700`. A layer that does not exist sends the CPI to the next one, and a layer that exists but is unsafe ends the search with no cache. [Operations](operations.md#resetting-the-endpoint-cache) says how to reset the files in it.
 
 ## Authentication
 

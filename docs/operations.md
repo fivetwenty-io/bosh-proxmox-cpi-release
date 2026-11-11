@@ -601,6 +601,64 @@ See [PVE Storage Locking](pve-storage-locking.md) for full lock mechanics.
 
 ---
 
+### Resetting the endpoint cache
+
+We reset the cache when a finding tells us to, such as a cluster identity change that the CPI refused under `verify_ssl: false`, or when a node's certificate changed and the stored pins no longer fit. The files are plain JSON that we can read as `vcap`, and a file holds no secret. A reset costs one rediscovery and nothing else, so it is safe to do on a live Director.
+
+First we find the directory. The CPI chooses it in three layers, and the first layer that applies wins.
+
+1. The value of `pve.endpoint_cache_dir`, when we set it.
+
+2. The `endpoint-cache` directory beside `pve.storage_allocation_journal_dir`. With the documented journal path `/var/vcap/store/pve_cpi/allocations`, that is `/var/vcap/store/pve_cpi/endpoint-cache`. The job's pre-start script creates it, and the CPI never creates it at run time.
+
+3. The `pve_cpi-endpoint-cache.<uid>` directory under the temporary directory, which the CPI creates itself.
+
+A Debug line at the start of a call names the choice, in the form `pve endpoints: cache directory <path>, beside the allocation journal directory`. We set `pve.log_level: debug` to see it, and `pve-cid ha` judges the same layers without creating anything.
+
+The directory holds these files, and the first three kinds belong to the endpoint cache.
+
+- `<host>-<16 hex characters>.json`
+  The cache for one cluster. The name carries the first configured endpoint's host and a digest of the endpoint list, the TLS settings, the CA, and the credential. It holds the discovered nodes and their pins, the cluster identity, the down marks, and the cold-start hint.
+
+- `<host>-<16 hex characters>.lock` and `<host>-<16 hex characters>.discover.lock`
+  The lock files that serialize writes and discovery for that cluster.
+
+- `ha_profile-<host>-<16 hex characters>.json` and its lock files
+  The HA profile cache, which holds slow-changing facts for 60 seconds and has nothing to do with endpoints.
+
+- `ha-recovery-episodes.json` and `ha-recovery-episodes.lock`
+  The HA recovery episode record, which the CPI writes even when discovery is off.
+
+- `secret` and `secret.lock`
+  The directory secret that signs the files. It never goes into a support bundle or a ticket.
+
+To reset only the endpoint cache, we remove the files whose names start with the cluster's host and end in `.json`, `.lock`, or `.discover.lock`, and we leave the rest alone. To reset everything, we remove every file in the directory but not the directory itself.
+
+```bash
+# Run as root on the Director, with the directory from the Debug line or pve.endpoint_cache_dir.
+dir=/var/vcap/store/pve_cpi/endpoint-cache
+ls -l "$dir"
+rm -f "$dir"/pve1.example.com-*.json "$dir"/pve1.example.com-*.lock "$dir"/pve1.example.com-*.discover.lock
+```
+
+We delete the files and keep the directory. The CPI uses the first two layers only when the directory exists, and it does not create either one. A Director that loses its `endpoint-cache` directory falls through to the temporary layer for every call, and the cache stays out of the place we chose until the next pre-start script runs and creates the directory again. Deleting the temporary directory is harmless, because the CPI creates it on the next call.
+
+What the CPI does next depends on what we removed.
+
+- The endpoint cache file
+  The next call starts with the configured endpoints and no discovered nodes, down marks, or cold-start hint. When discovery is on, the first answer from a configured endpoint finds no file, so the CPI discovers in the background and writes a fresh file before the process exits, waiting up to 3 seconds for the write. The calls after that start with the discovered nodes. Under `verify_ssl: false` the first discovery is trust on first use again, so we reset only when we trust the network path to the seed.
+
+- The directory secret
+  The CPI creates a new one on the next call, and every cache file written under the old secret fails verification and is rebuilt. The log shows `endpoint cache: replaced the directory secret, which had the wrong length` only when a secret exists with the wrong length, and not after a plain removal.
+
+- The HA recovery episode record
+  A VM that is in HA recovery restarts its grace window. That delays the handover to BOSH and breaks nothing else.
+
+- A file the CPI cannot read or verify
+  The CPI ignores it, logs `endpoint cache: the cache file is not usable and is ignored` at Debug under `auto` and at Warn under `on`, and replaces it on the next write. We do not need to delete it by hand.
+
+The CPI also removes cache files that nobody has touched for 30 days when it writes, so a changed endpoint list or CA leaves nothing behind for long.
+
 ## PVE HA
 
 This section is for operators who set `pve.ha.mode` to `auto` or `managed`, and for anyone who finds HA objects on a cluster after switching back to `off`. [HA and Resurrection](ha-and-resurrection.md) explains the model, and [Configuration, HA](configuration.md#ha) lists the properties. The commands below run on a PVE node as root unless they say otherwise.

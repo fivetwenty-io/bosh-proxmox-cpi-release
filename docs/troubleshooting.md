@@ -2239,7 +2239,7 @@ If these appear frequently, raise `MAX_WORKERS` in `/etc/default/pvedaemon` and 
 
 ## Endpoint failover
 
-These entries cover the Warn and Error lines the endpoint pool writes. The CPI logs at `info` by default, and every CPI call is a new process, so "once per call" means once per process. A line that says a level depends on discovery is at Debug under `auto` and Warn under `on`. [Endpoint Failover](endpoint-failover.md) explains the walk, the tethers, and the properties.
+These entries cover the Warn and Error lines that the endpoint pool, the discovery worker, and the endpoint cache write. The CPI logs at `info` by default, and every CPI call is a new process, so "once per call" means once per process. A line that says a level depends on discovery is at Debug under `auto` and Warn under `on`. [Endpoint Failover](endpoint-failover.md) explains the walk, the tethers, and the properties.
 
 ### The log says an endpoint is unreachable and requests moved on
 
@@ -2494,6 +2494,274 @@ The CPI keeps the endpoint cache, the HA profile cache, and the HA recovery epis
 **Fix**
 
 We apply the step the finding names and run `pve-cid ha` again. See [Reading the cluster with `pve-cid ha`](operations.md#reading-the-cluster-with-pve-cid-ha).
+
+### Discovery is off for this call
+
+**Symptom**
+
+```text
+api endpoint discovery off: cache directory /var/vcap/data/director/tmp/pve_cpi-endpoint-cache.1000 (temporary layer): endpoint cache: unsafe ownership: /var/vcap/data/director/tmp/pve_cpi-endpoint-cache.1000 is owned by uid 0, not effective uid 1000
+```
+
+The text after `off:` can also be `cache directory <path> could not be opened: <error>`, `the discovery worker could not be built: <error>`, or `the cache file could not be read: <error>`, and the last one carries the cache file name in its `file` field. The line is at Warn under `pve.api_endpoint_discovery: on` and at Debug under `auto`. It appears once per call.
+
+**Diagnosis**
+
+The CPI could not use its cache directory or its cache file, so the call ran without discovery and without the cache. The call itself is not affected, because the configured endpoints still work. The example shows the usual cause, which is a directory owned by another user. A CPI command run once as root, such as a hand-run call over SSH, can leave a root-owned directory in the temporary layer. The other causes are a group or other permission bit on the directory, a symbolic link where the directory should be, and a file that the CPI's user cannot read.
+
+One variant stays at Debug whatever the mode, and it reads `api endpoint discovery off: the exit drain has started, so the call runs without the cache`. The process was already exiting, so nothing is wrong. Two more Debug lines say why `auto` turned discovery off before any directory was opened. They read `api_endpoint_discovery is auto and the CPI logs in with a password, so endpoint discovery is off` and `this entry inherits the job's credentials and sets looser TLS than the job, so endpoint discovery is off`.
+
+**Fix**
+
+We run `pve-cid ha`, which judges every layer as the CPI's user and names the directory, its owner, and its mode, and then we apply the step it names. See [The HA doctor reports a cache directory problem](#the-ha-doctor-reports-a-cache-directory-problem). For a directory in the temporary layer owned by another user, we remove it and the CPI creates its own. For the other two layers we give the directory to the CPI's user with mode `0700`.
+
+### The cache file is not usable
+
+**Symptom**
+
+```text
+endpoint cache: the cache file is not usable and is ignored
+```
+
+The line carries `file` and `err` fields. It is at Warn under `on` and at Debug under `auto`, once per call.
+
+**Diagnosis**
+
+The file failed validation. It may be damaged, written by a different release, signed under another directory secret or credential, or too large, since a cache file holds at most 64 KiB and 64 nodes. The CPI ignored it and ran with the configured endpoints. The next successful write replaces it. A new credential makes every old file unusable on purpose, and the CPI writes a new file under a new name for a changed endpoint list.
+
+**Fix**
+
+Nothing, in most cases. When the line recurs on every call, we reset the cache as [Resetting the endpoint cache](operations.md#resetting-the-endpoint-cache) describes.
+
+### The directory secret was replaced
+
+**Symptom**
+
+```text
+endpoint cache: replaced the directory secret, which had the wrong length; every cache file written under the old one is rebuilt
+```
+
+The line is always at Warn, and it carries the secret's path in a `path` field.
+
+**Diagnosis**
+
+The directory's `secret` file existed but did not hold a secret of the right length, perhaps because a disk filled or someone edited it. The CPI wrote a new secret, so every file signed under the old one fails verification and is rebuilt on the next write. Nothing else is lost. A secret that is simply missing is created without this line.
+
+**Fix**
+
+We check that the disk has room and that nobody edits files in the cache directory by hand. The secret must never be copied into a ticket.
+
+### A discovery result holds no nodes
+
+**Symptom**
+
+```text
+api endpoint discovery: 2 of 2 derived names did not resolve (pve2.dc1.example.com, pve3.dc1.example.com); next attempt in 24h
+```
+
+The line carries `file` and `outcome` fields. It is at Info the first time the outcome changes or when the last refresh failed, and after that it is at Debug under `auto` and Warn under `on`. The same family has these texts.
+
+- `pve1:8006 is a standalone host with no peers`
+  The `outcome` is `standalone`.
+
+- `the domain of pve1.lan is a public suffix, so no node names are derived under it`
+  The `outcome` is `public_suffix`.
+
+- `no node of the 3 that cluster 3c5e1b7d lists via pve1:8006 is a usable candidate`
+  The `outcome` is `no_candidates`.
+
+A result that found nodes but had no cluster status reads `api endpoint discovery: cached 2 of 3 nodes of cluster 3c5e1b7d via pve1:8006 (no cluster status)`. That line is at Debug under `auto` and Warn under `on`, unless the nodes or the identity changed.
+
+**Diagnosis**
+
+Discovery reached the cluster but cannot use what it found, so the pool keeps only the configured endpoints. The CPI derives each node's address from the seed's domain, so `pve1.dc1.example.com` yields `pve2.dc1.example.com`, and it keeps a node only when that name resolves. A seed that is an IP literal or sits in a public suffix has no domain to derive from. A standalone host has no peers to find. The next attempt comes in 24 hours when the result holds no nodes, and in an hour when it holds nodes.
+
+**Fix**
+
+For names that did not resolve, we add DNS records for the node names under the seed's domain, or we list the nodes in `pve.endpoints` ourselves. For a seed that is an IP or a public suffix, we set `pve.host` to a name inside the cluster's own domain, or we list the endpoints. A standalone host needs nothing.
+
+### Discovery failed before it had a result
+
+**Symptom**
+
+```text
+api endpoint discovery: no result through pve1:8006, because GET /nodes gave no usable node list; next attempt in 1h
+```
+
+The line carries `file`, `failure`, and `err` fields. It is at Info when the failure differs from the one stored, and otherwise at Debug under `auto` and Warn under `on`. The reason after "because" is one of these, and the `failure` field holds the matching value.
+
+| Reason | `failure` |
+|---|---|
+| `GET /nodes gave no usable node list` | `nodes_unreadable` when the request failed, and `nodes_empty` when it listed no nodes |
+| `a node name from GET /nodes is not a valid pve-node label` | `node_name_invalid` |
+| `the cluster root CA could not be read` | `root_ca_unreadable` |
+| `the discovery reads ran out of time` | `reads_timed_out` |
+| `the seed endpoint cannot derive node names` or `the discovery reads failed` | `reads_failed` |
+
+**Diagnosis**
+
+The refresh started but a read failed, so the CPI recorded the failure and set the next attempt an hour out. The pool is unaffected. The cause is often a token without `Sys.Audit` on `/`, a slow or partitioned node, or a seed that answered the first request and then went away.
+
+**Fix**
+
+We read the `err` field, check the token's privileges against [PVE API Permissions](pve-api-permissions.md), and check the route to the seed. The CPI tries again on its own.
+
+### A discovery refresh was skipped
+
+**Symptom**
+
+Each of these lines starts `api endpoint discovery:`, carries the fields named, and is at Debug under `auto` and Warn under `on`.
+
+```text
+api endpoint discovery: could not take the discover lock; skipping the refresh
+api endpoint discovery: could not read the cache file; skipping the refresh
+api endpoint discovery: the cache write failed before the reads; skipping the refresh
+api endpoint discovery: the answering endpoint is not one of the configured endpoints; skipping the refresh
+```
+
+The first carries `err`. The second carries `file` and `err`. The third carries `file` and `err`. The fourth carries `endpoint`.
+
+**Diagnosis**
+
+The first three mean the cache directory misbehaved at the moment the refresh began, because a lock could not be taken, the file could not be read, or the attempt could not be written. The `err` field says which operation failed, and an ownership or permission error points to the same causes as [Discovery is off for this call](#discovery-is-off-for-this-call). The fourth appears only after a defect in the CPI, because the endpoint that answered should always be one of the configured ones. We keep the log and report it as a bug.
+
+**Fix**
+
+For the first three we apply the fix of the directory entry above. When another CPI process holds the lock, the line is at Debug under both modes and means nothing.
+
+### The stored discovery is dated ahead of the clock
+
+**Symptom**
+
+```text
+api endpoint discovery: the stored discovery is dated ahead of the clock, so no attempt can be recorded; skipping the refresh until the clock reaches it
+```
+
+The line carries `file` and `ahead` fields. A variant reads `the stored discovery is dated more than 1h ahead of the clock, so the refresh runs without a recorded attempt`. Both are at Debug under `auto` and Warn under `on`.
+
+**Diagnosis**
+
+The stored discovery carries a time later than the Director's clock, which means the clock stepped back after the file was written. The CPI refuses to record an attempt against a future time. For a section dated ahead by more than 30 seconds and no more than an hour and 30 seconds, the refresh waits until the clock catches up. Beyond that, the refresh runs without recording its attempt, so it can run on every call until the clock is right.
+
+**Fix**
+
+We check the Director's time source. After the clock is correct the lines stop. To clear a section that is far in the future, we reset the cache.
+
+### A discovery failure was not recorded
+
+**Symptom**
+
+```text
+api endpoint discovery: no result through pve1:8006, because the cluster root CA could not be read; the failure was not recorded, so the attempt recorded before the reads stands, with reads_timed_out as its reason, and the next attempt is 1h after this refresh began
+```
+
+The line carries `file`, `failure`, and `err` fields, and `stored_failure` and `next_refresh_after` when an attempt stands. Other endings are `the attempt was not recorded, so the next call tries again` and `the failure was not recorded, because the stored discovery is dated ahead of the clock, so ...`. A related line begins `the reads answered, but the stored discovery is dated ahead of the clock, so no attempt can replace the reads_timed_out stored before the reads, which is not what happened`. All of them are at Debug under `auto` and Warn under `on`.
+
+**Diagnosis**
+
+A refresh failed, and then writing the failure failed too, because the cache write errored, the file lock wait ran out, or the clock puts the stored section in the future. The CPI recorded an attempt before the reads, with `reads_timed_out` as its reason, and that record stands, so the stored reason is not what happened. The next attempt is an hour after the refresh began, or the next call when no attempt was recorded.
+
+**Fix**
+
+We read the `err` field and treat the cause as in [Discovery is off for this call](#discovery-is-off-for-this-call) or [The stored discovery is dated ahead of the clock](#the-stored-discovery-is-dated-ahead-of-the-clock).
+
+### The cache could not be written
+
+**Symptom**
+
+```text
+api endpoint discovery: the cache write failed; the discovery result is dropped
+endpoint cache lock wait expired; skipping the cache write
+endpoint cache: the down mark could not be recorded
+endpoint cache: the cold-start hint could not be recorded
+```
+
+The first line carries `file` and `err`. The second carries `file` and `wait`, and it has no colon after `endpoint cache`. The third carries `endpoint` and `err`. The fourth carries `node` and `err`. Each is at Debug under `auto` and Warn under `on`.
+
+**Diagnosis**
+
+The CPI had something to remember and could not write it. The first line means a discovery result was lost, so the next call discovers again. The second means another process held the cache file's lock for longer than the write may wait, which is one second, and the write was skipped. The third and fourth mean a down mark or a cold-start hint was lost, so another process may try a dead node first. None of them affects the call, because the cache only speeds up later calls. A lock wait that expires now and then is normal during a deploy burst, since many CPI processes share one file.
+
+**Fix**
+
+We act only when the line repeats on every call. Then we check the disk space and the directory's owner and mode with `pve-cid ha`, and we reset the cache if a stale lock holder is suspected.
+
+### The pool refused the cached nodes
+
+**Symptom**
+
+```text
+api endpoint discovery: the pool refused the cached nodes, so it starts from the configured endpoints
+```
+
+The line carries an `err` field. It is at Debug under `auto` and Warn under `on`.
+
+**Diagnosis**
+
+The cache held nodes, but the endpoint pool rejected them when it was built, for a reason the `err` field gives. The CPI dropped the cached nodes and started from the configured endpoints, so the call works. The next refresh replaces the cache.
+
+**Fix**
+
+We read the `err` field. When the line recurs after a refresh, we reset the cache.
+
+### The cluster identity changed
+
+**Symptom**
+
+```text
+endpoint cache: cluster identity changed from 3c5e1b7d to 91a0c4e2 through configured endpoint pve1:8006; with verify_ssl false this is refused, delete the cache file to accept it
+```
+
+The line is at Error, and it carries `file` and `outcome` fields. With `verify_ssl` true the text ends `with verify_ssl true the cached nodes and pins are replaced`. While a refused change stays in place, later calls log this Warn.
+
+```text
+endpoint cache: the cached cluster identity differs from the one the configured endpoints report and was refused because verify_ssl is false, so no cached nodes are used; delete the cache file to accept the new identity
+```
+
+**Diagnosis**
+
+The two eight-character values are the stored and the observed identity of the cluster, taken from its root CA. The configured endpoints now answer for a cluster with a different root CA than the one the cache recorded. That happens legitimately when the cluster was rebuilt or its CA was replaced, and it can happen when something sits between the CPI and the cluster. With `verify_ssl` true the CPI trusts the verified chain, so it replaces the cached nodes and pins and logs the Error once per refresh that sees the change. With `verify_ssl` false the CPI cannot tell the two cases apart, so it keeps the old file, uses no cached nodes, and stops discovering until we decide.
+
+**Fix**
+
+We confirm whether the cluster's root CA was really replaced, for instance because we rebuilt the cluster or re-issued its CA. If it was, we delete the cache file as [Resetting the endpoint cache](operations.md#resetting-the-endpoint-cache) describes, and the next call records the new identity. If it did not, we treat it as a possible interception and look at the path between the Director and the cluster.
+
+### A known node's pins changed
+
+**Symptom**
+
+```text
+endpoint cache: the pin set of known node pve2 changed through configured endpoint pve1:8006; with verify_ssl false the stored pins stay, delete the cache file to accept the new ones
+```
+
+The line is at Warn, and it carries `file` and `outcome` fields. It appears under `verify_ssl: false`. Several nodes read `known nodes pve2, pve3`.
+
+**Diagnosis**
+
+A node's certificate fingerprints in the new discovery differ from the stored ones. A certificate renewal does that. With `verify_ssl` false the CPI keeps the stored pins, because it cannot verify the new ones, so a discovered endpoint for that node fails its pin check and the pool skips it. The call is not affected while a configured endpoint works.
+
+**Fix**
+
+If we renewed the node's certificate, we delete the cache file as above. If we did not, we treat it as a possible interception.
+
+### Background cache work failed or ran out of time at exit
+
+**Symptom**
+
+```text
+endpoint cache: background worker panicked
+endpoint cache: cancelled background work still running at exit
+```
+
+The first line is at Error and carries `worker`, `panic`, and `stack` fields. The second carries `workers`, `started`, and `waited`, and it is at Warn only when a cancelled worker served a config with an explicit `on`, and otherwise at Debug.
+
+**Diagnosis**
+
+The CPI waits up to 3 seconds at exit for the discovery refresh and the cache writes to finish. A panic is a defect, and the worker's stack is in the line. A cancelled worker means a write was still running when the wait ended, so that result may not have been saved. The call was not affected, and the next call discovers again.
+
+**Fix**
+
+For a panic we keep the log and report it as a bug. For a cancelled worker we do nothing unless it recurs, which suggests a slow disk or a slow cluster.
 
 ## Cluster not quorate
 
