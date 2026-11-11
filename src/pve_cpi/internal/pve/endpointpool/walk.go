@@ -988,7 +988,7 @@ func (p *Pool) logFailover(from, to *endpoint, sent bool) {
 			"cold-start candidate "+from.addr+" from placement.az_map",
 			log.String("from", from.addr),
 			log.String("to", to.addr),
-			log.String("node", from.node),
+			log.String("node", from.nodeName()),
 		)
 		return
 	}
@@ -1012,7 +1012,7 @@ func (p *Pool) logFailover(from, to *endpoint, sent bool) {
 		log.String("error", cause),
 	}
 	if to.kind == kindCandidate {
-		fields = append(fields, log.String("node", to.node))
+		fields = append(fields, log.String("node", to.nodeName()))
 	}
 	p.logger.Warn("pve endpoint failover: "+from.addr+" unreachable ("+cause+")"+tail, fields...)
 }

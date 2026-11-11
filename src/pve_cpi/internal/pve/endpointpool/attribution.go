@@ -39,9 +39,10 @@ func routeNode(route string) (node string, scoped bool) {
 // 595 answer for it, can be blamed on the entry endpoint ep itself. That is so
 // when the route is not node-scoped, such as /cluster/resources or
 // /access/ticket, or when its node segment names ep's own node. The pool knows
-// an endpoint's node only when discovery recorded it, so without that only the
-// routes with no node segment count. The comparison is exact, which never
-// blames an entry for a node it may not be.
+// an endpoint's node only when discovery recorded it, which covers a name the
+// cache gave the endpoint at construction and one SetEndpointNode learned
+// since, so without that only the routes with no node segment count. The
+// comparison is exact, which never blames an entry for a node it may not be.
 func attributable(path string, ep *endpoint) bool {
 	route, ok := apiRoute(path)
 	if !ok {
@@ -51,7 +52,8 @@ func attributable(path string, ep *endpoint) bool {
 	if !scoped {
 		return true
 	}
-	return node != "" && ep.node != "" && node == ep.node
+	own := ep.nodeName()
+	return node != "" && own != "" && node == own
 }
 
 // isLogin reports whether req is the ticket login, POST /access/ticket under

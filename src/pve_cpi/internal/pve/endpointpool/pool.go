@@ -54,7 +54,8 @@ type Endpoint struct {
 	// Node is the name of the Proxmox node the endpoint serves, when it is
 	// known, and empty otherwise. Discovery records it for every discovered
 	// endpoint, and for a configured endpoint that /cluster/status reported as
-	// local.
+	// local. A configured endpoint whose name is learned after the pool is
+	// built gets it from SetEndpointNode.
 	Node string
 	// Pins is a discovered endpoint's pin set, which must not be empty. A
 	// configured endpoint carries no pins.
@@ -141,9 +142,13 @@ type endpoint struct {
 	// urlHost is the host:port as the caller wrote it. The walk puts it in a
 	// request's URL.Host, so the Host header and SNI keep the spelling the SDK
 	// sends today, and the clones send its host as SNI.
-	urlHost    string
-	kind       Kind
+	urlHost string
+	kind    Kind
+	// node is the name the endpoint was built with. learned is a name that
+	// SetEndpointNode recorded later and takes its place, so a reader goes
+	// through nodeName.
 	node       string
+	learned    atomic.Pointer[string]
 	pins       int
 	rank       int
 	transports *ownedTransports
