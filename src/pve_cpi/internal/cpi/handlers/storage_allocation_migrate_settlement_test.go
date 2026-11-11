@@ -746,8 +746,9 @@ func (c *settleMigrationCase) stageCreateVMRecord(t *testing.T) string {
 		t.Fatal(err)
 	}
 	planned := 0
-	for _, step := range vm.Steps {
-		if step.Kind == handoff && step.State == aj.Planned && cleanupPersistentHandoffStep(step, vm) {
+	for i := range vm.Steps {
+		step := &vm.Steps[i]
+		if step.Kind == handoff && step.State == aj.Planned && cleanupPersistentHandoffStep(*step, vm) {
 			planned++
 		}
 	}
