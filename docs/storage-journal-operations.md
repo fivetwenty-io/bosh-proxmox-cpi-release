@@ -120,6 +120,156 @@ A planned configuration write on the VM that holds a disk is the other exception
 
 Cleanup finalization does not delete resources. It requires settled mutations and a complete audit proving that the allocation's resources and provenance are absent. A remaining root volume, ISO, renamed disk, or uncertain task prevents finalization. Keep tombstones and verification history; age does not authorize purging them.
 
+A submitted cross-node migration step is a separate case, because it carries a task that PVE already ran. `adopt` and `finalize-cleanup` refuse it, and [Settle a submitted migration](#settle-a-submitted-migration) describes the action that settles it.
+
+## Settle a submitted migration
+
+A cross-node attach of a journal-managed disk moves the disk to the VM's node through a migration mover, which is a parker VM that holds only that disk. The CPI records the migration as a step whose kind is `lifecycle_<operation>_Nodes_CreateQemuMigrate`. When PVE finishes the migration but the CPI cannot confirm where the mover landed, the step stays `submitted` and the disk's record stays in `reconciliation_required`. The next attach then refuses the disk until the step is settled. `settle-migration` reads the finished migration back from PVE and, when the readback proves the move, marks the step observed. It writes only the journal and never sends a write to PVE.
+
+### When to use it
+
+We use it when an audit shows all of the following.
+
+- A disk record in `reconciliation_required`
+
+  The record carries the exact CID that we pass to the command.
+
+- A `CreateQemuMigrate` step that is `submitted`
+
+  The step belongs to the record's open attempt and records the UPID of its task.
+
+- A `qmigrate` task that finished with exit status `OK`
+
+  We confirm this ourselves on the node the UPID names, as the next section shows.
+
+When the task failed, is still running, or cannot be found, we do not settle the step. We find out where the mover is first, and we reconcile the record by another route.
+
+### Find the step and the task
+
+The JSON form of the audit carries every record's steps. This command lists each disk record in `reconciliation_required` along with its submitted migration steps, giving the allocation UUID, the CID, the step ID, and the task UPID of each.
+
+```sh
+sudo -u vcap /var/vcap/packages/pve_cpi/bin/cpi storage-journal audit --config /var/vcap/jobs/pve_cpi/config/cpi.json \
+  | jq -r '.audit.records[] | select(.kind == "disk" and .state == "reconciliation_required") | . as $r
+      | $r.steps[] | select(.state == "submitted" and (.kind | endswith("_Nodes_CreateQemuMigrate")))
+      | "\($r.id) \($r.cid) \(.id) \(.upid)"'
+```
+
+The second field of the UPID is the node the migration ran on, which is the node the mover left. The step's target node is the node the mover moved to. We read the task on the node the UPID names and confirm that it has stopped with exit status `OK`.
+
+```sh
+pvesh get /nodes/<source node>/tasks/<UPID>/status
+```
+
+The status must show `status: stopped`, `exitstatus: OK`, the type `qmigrate`, and the mover's VMID as the task's `id`.
+
+### Attestations
+
+The command requires `--previous-writer-fenced` and `--remote-tasks-settled`, and it refuses to run without both. The first asserts that no Director task and no CPI process is still working on the disk. The second asserts that every request the stopped process sent to PVE has finished. We check both the way [Choose the command for the record](troubleshooting.md#choose-the-command-for-the-record) describes, and we keep what we checked under the decision reference.
+
+### Run it
+
+```sh
+cpi storage-journal settle-migration \
+  --config /path/to/cpi.json \
+  --allocation-id ALLOCATION_UUID \
+  --expected-cid EXACT_RECORDED_CID \
+  --step-id STEP_ID \
+  --task-upid UPID \
+  --decision-id incident-1234-migration \
+  --previous-writer-fenced \
+  --remote-tasks-settled
+```
+
+Every flag is required. `--step-id` and `--task-upid` belong to this action alone, and the other actions refuse them. On a Director we run the command as `vcap`, with the full path shown under [Inspect retained allocations](#inspect-retained-allocations).
+
+### What it checks
+
+The command checks everything below before it saves anything, and any failed check leaves the journal as it was.
+
+- The record
+
+  It must be a disk record in `reconciliation_required` with the exact CID, in this namespace, and the cluster must still be the one the journal enrolled. Planned lock steps are settled first, the same way `adopt` settles them.
+
+- The step
+
+  It must belong to the record's open attempt, have a kind that ends in `_Nodes_CreateQemuMigrate`, be `submitted`, and carry the UPID passed in `--task-upid`. The UPID must name the step's mover VMID and a node other than the step's target.
+
+- The rest of the record
+
+  Every other step of the open attempt must already be observed, and the audit must report no conflicts and no issues.
+
+- The task
+
+  It must be `stopped` with exit status `OK`, its type must be `qmigrate`, and its `id` must be the mover's VMID. The API identity needs `Sys.Audit` on the node the UPID names. The command does not require idle nodes, so a busy cluster does not block it.
+
+- The mover
+
+  The source node must have no config for the mover, which PVE reports either as a 404 or as a 500 that says the configuration file does not exist. A read of the config on every cluster member must place the mover on the target node and nowhere else. The target's config must carry no `lock: migrate`. The disk's `bpd-` serial must sit on exactly one slot, and that slot must hold the volume the step recorded, on the backing the step recorded. That volume must also appear in its storage's content listing on the target.
+
+### What it refuses
+
+A refused run prints the reason and exits 1.
+
+```text
+allocation decision refused (<class>: <reason>); inspect settled outcome, identity and audit evidence
+```
+
+Besides the failed checks above, the command refuses a few cases on purpose.
+
+- A copy-local migration
+
+  A step that carries a capacity charge on the target's storage copied the disk to the target's own storage. The command refuses it with `settle-migration does not settle a copy-local migration`, because a settlement must also prove that the source volume is gone, and this action does not.
+
+- A target that still holds `lock: migrate`
+
+  The refusal is retriable. We wait until the lock clears and run the command again.
+
+- A mutation of any kind
+
+  The command runs behind a guard that denies every write to PVE, so nothing it reads can change PVE.
+
+### The success output
+
+On success the command prints one JSON object with the keys below, and it saves the same evidence in the record as a verification.
+
+| Key | Meaning |
+|---|---|
+| `allocation_id`, `cid` | The record that was settled |
+| `state` | The record's state, which stays `reconciliation_required` |
+| `decision_id` | The decision reference passed in |
+| `step_id`, `upid` | The step and its task |
+| `task_status`, `exit_status` | What the task read back as, which are `stopped` and `OK` |
+| `vmid` | The mover's VMID |
+| `source_node`, `target_node` | The node the mover left and the node it reached |
+| `slot`, `volume`, `serial` | Where the disk sits on the mover |
+
+```json
+{"allocation_id":"65a2e32a-0ec7-4dd8-bfc3-8ba70f2dfcf3","cid":"pvz-H4sIAAAAAAAC_zTM","decision_id":"incident-1234-migration","exit_status":"OK","serial":"bpd-7f79e23516fb4a74","slot":"scsi0","source_node":"pve02","state":"reconciliation_required","step_id":"attempt-0-step-40","target_node":"pve01","task_status":"stopped","upid":"UPID:pve02:0000A1B2:0001C3D4:6734ABCD:qmigrate:90144:root@pam:","vmid":"90144","volume":"nfs-images:90144/vm-90144-disk-0.qcow2"}
+```
+
+The step is now `observed` and the record's reason reads `migration settled by decision <decision-id>`. The record stays in `reconciliation_required` with every step observed, and the Director's next call on the disk admits it and carries on. We do not need `adopt` first, although `adopt` still accepts the record if we want it to say `adopted` before the deploy. If the record cannot show the evidence after the save, the command exits 1 with `migration settled but its evidence could not be read back (inspect the record before retrying)`, and we inspect the record before we run anything again.
+
+### After a settlement
+
+We take three steps once the command succeeds.
+
+1. Check the mover's protection
+
+   The command never changes the mover's protection. The attach turned protection off before it migrated the mover, and the failed readback kept the CPI from putting it back. On the target node, we run `qm config <mover VMID>`, and when it shows no `protection: 1` line, we run `qm set <mover VMID> --protection 1`. The mover may be the disk's only holder, so we do this first.
+
+2. Run the audit again
+
+   The summary should show no conflicts, and the record's steps should all be observed. A parker entry that still names the old node appears as an `observed move:` line, which is expected. The next attach corrects the entry's node.
+
+3. Retry the deploy
+
+   When the VM lands on the mover's node, the attach moves the disk over on that node and destroys the mover with its entry. When the VM lands on another node, the attach migrates the disk again, and the corrected migration check passes.
+
+### An adopted mover
+
+A mover that an earlier request created, which the journal calls an adopted mover, is not destroyed by a later attach, because that request's journal cannot prove the destroy is safe. The attach keeps the mover empty and protected, and it logs the warning `kept the migration mover because an earlier request created it, so this request's journal can't delete it`. Settlement does not change that. Once the deploy has gone through and the disk is on its VM, we remove the empty mover by hand as [A cross-node attach left its migration mover behind](troubleshooting.md#a-cross-node-attach-left-its-migration-mover-behind) describes.
+
 ## Delete an allocation through its retained authority
 
 We use `cleanup` when we intend to remove an allocation's resources. This command performs physical deletion, so we select the full allocation UUID from the audit and record the reason in a nonsecret decision reference.
