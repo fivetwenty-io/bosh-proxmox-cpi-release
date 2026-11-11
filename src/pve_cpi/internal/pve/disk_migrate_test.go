@@ -170,7 +170,7 @@ func (t *mmTasks) GetStatus(_ context.Context, _, upid string) (*sdktasks.Status
 type mmCluster struct{ sdkcluster.Service }
 
 func (mmCluster) ListConfigNodes(context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
-	resp := sdkcluster.ListConfigNodesResponse{}
+	resp := make(sdkcluster.ListConfigNodesResponse, 0, 2)
 	for _, node := range []string{mmSource, mmTarget} {
 		raw, _ := json.Marshal(map[string]any{"name": node})
 		resp = append(resp, raw)

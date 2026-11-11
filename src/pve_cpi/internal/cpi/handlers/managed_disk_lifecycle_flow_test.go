@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
@@ -21,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 type lifecycleFlowPVE struct {
@@ -167,6 +170,42 @@ type lifecycleFlowPVE struct {
 	destroyed []string
 	// certificateErr fails every certificate read of the nodes it names.
 	certificateErr map[string]error
+	// pmxcfsConfigMissing makes a config read or write addressed to a node
+	// the VM isn't on fail the way real PVE fails it, with an HTTP 500 that
+	// says the configuration file does not exist, instead of a 404.
+	pmxcfsConfigMissing bool
+	// protectionWrites records every protection write the fake applied, with
+	// the node it was sent to, in order.
+	protectionWrites []lifecycleProtectionWrite
+}
+
+// lifecycleProtectionWrite is one protection write the flow fake applied.
+type lifecycleProtectionWrite struct {
+	node string
+	vmid int
+	on   bool
+}
+
+// lifecycleConfigMissingAnswer is real PVE's answer to a config read or write of a VM
+// whose configuration file isn't on the addressed node, such as the source
+// node after a migration: an HTTP 500 that names the file. It goes through the
+// SDK's own error parsing, so the text is escaped and capped the way the CPI
+// sees it from a cluster.
+func lifecycleConfigMissingAnswer(node string, vmid int) error {
+	message := fmt.Sprintf("Configuration file 'nodes/%s/qemu-server/%d.conf' does not exist\n", node, vmid)
+	body, _ := json.Marshal(map[string]any{"data": nil, "message": message})
+	return sdkerrors.ParseAPIError(500, body)
+}
+
+// lifecycleFlowConfigMissingModes are the two answers the flow fake can give a
+// config read of a VM that isn't on the addressed node. A row that runs a
+// migration runs once with each.
+var lifecycleFlowConfigMissingModes = []struct {
+	name   string
+	pmxcfs bool
+}{
+	{"404", false},
+	{"pmxcfs 500", true},
 }
 
 // lostMove is a move task PVE forked for a POST whose response was lost.
@@ -580,6 +619,9 @@ func (n lifecycleFlowNodes) UpdateQemuConfig(ctx context.Context, node, vmidText
 	if n.c.beforeConfigWrite != nil {
 		n.c.beforeConfigWrite(vmid)
 	}
+	if _, exists := n.c.state.configs[vmid]; n.c.pmxcfsConfigMissing && (!exists || n.c.vmNode(vmid) != node) {
+		return lifecycleConfigMissingAnswer(node, vmid)
+	}
 	cfg := n.c.state.configs[vmid]
 	if p.Digest != nil && *p.Digest != cfg["digest"] {
 		return fmt.Errorf("config generation conflict")
@@ -608,6 +650,10 @@ func (n lifecycleFlowNodes) UpdateQemuConfig(ctx context.Context, node, vmidText
 	fake := newIDFakeClient(n.c.state.configs)
 	if err := (&idFakeNodes{c: fake}).UpdateQemuConfig(ctx, node, vmidText, p); err != nil {
 		return err
+	}
+	if p.Protection != nil {
+		n.c.protectionWrites = append(n.c.protectionWrites,
+			lifecycleProtectionWrite{node: node, vmid: vmid, on: *p.Protection})
 	}
 	if p.Tags != nil {
 		// A tag write lands the way PVE applies it, so a row can see the
@@ -1017,6 +1063,9 @@ func (q lifecycleFlowQEMU) Config(ctx context.Context, node string, vmid int) (m
 		}
 	}
 	if _, exists := q.c.state.configs[vmid]; !exists || q.c.vmNode(vmid) != node {
+		if q.c.pmxcfsConfigMissing {
+			return nil, lifecycleConfigMissingAnswer(node, vmid)
+		}
 		return nil, sdkerrors.ParseAPIError(404, []byte(`{"message":"VM not found"}`))
 	}
 	return q.managedDiskTestQEMU.Config(ctx, node, vmid)
@@ -1114,9 +1163,16 @@ func (n lifecycleFlowNodes) CreateQemuMigrate(_ context.Context, node, vmidText 
 		}
 	}
 	n.c.migrations++
-	raw := json.RawMessage(`"UPID:n1:migrate"`)
+	raw := json.RawMessage(strconv.Quote(lifecycleFlowMigrateUPID(node, id)))
 	return &raw, nil
 }
+
+// lifecycleFlowMigrateUPID is the UPID of the migrate task the flow fake starts
+// for vmid on node, in PVE's nine-field shape.
+func lifecycleFlowMigrateUPID(node string, vmid int) string {
+	return fmt.Sprintf("UPID:%s:0000A1B2:0001C3D4:6734ABCD:qmigrate:%d:root@pam:", node, vmid)
+}
+
 func (n lifecycleFlowNodes) DeleteQemu(_ context.Context, node, vmidText string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
 	id, _ := strconv.Atoi(vmidText)
 	if n.c.vmNode(id) != node {
@@ -1137,7 +1193,14 @@ func (n lifecycleFlowNodes) DeleteQemu(_ context.Context, node, vmidText string,
 // a vm-123 volume on shared storage reaches the other node by config edit and
 // never needs a migration (see the pin row below).
 func TestManagedDiskSharedMigrationAfterSetRemoval(t *testing.T) {
+	for _, mode := range lifecycleFlowConfigMissingModes {
+		t.Run(mode.name, func(t *testing.T) { testSharedMigrationAfterSetRemoval(t, mode.pmxcfs) })
+	}
+}
+
+func testSharedMigrationAfterSetRemoval(t *testing.T, pmxcfs bool) {
 	deps, client, journal, id, cid := lifecycleFlowFixture(t)
+	client.pmxcfsConfigMissing = pmxcfs
 	deps.Config.DiskMigration = "on_attach"
 	parkRenameCycle(t, context.Background(), deps, client, cid)
 	if client.vmNodes == nil {
@@ -1155,8 +1218,8 @@ func TestManagedDiskSharedMigrationAfterSetRemoval(t *testing.T) {
 	if client.migrations != 1 || record.State != aj.ReadyToReturn {
 		t.Fatalf("migration incomplete: count=%d record=%+v", client.migrations, record)
 	}
-	for _, step := range record.Steps {
-		if strings.Contains(step.Kind, "CreateQemuMigrate") && len(step.Charges) != 0 {
+	for i := range record.Steps {
+		if step := &record.Steps[i]; strings.Contains(step.Kind, "CreateQemuMigrate") && len(step.Charges) != 0 {
 			t.Fatal("shared metadata migration charged destination bytes")
 		}
 	}
@@ -1290,7 +1353,14 @@ func (s lifecycleFlowStorage) Exists(ctx context.Context, node, pool, volume str
 }
 
 func TestManagedDiskLocalMigrationChargesDestinationAfterSetRemoval(t *testing.T) {
+	for _, mode := range lifecycleFlowConfigMissingModes {
+		t.Run(mode.name, func(t *testing.T) { testLocalMigrationChargesDestination(t, mode.pmxcfs) })
+	}
+}
+
+func testLocalMigrationChargesDestination(t *testing.T, pmxcfs bool) {
 	deps, client, journal, id, cid := lifecycleFlowFixture(t)
+	client.pmxcfsConfigMissing = pmxcfs
 	birth, _, err := decodeDiskCID(context.Background(), deps, "test", cid)
 	if err != nil {
 		t.Fatal(err)
@@ -1361,4 +1431,160 @@ func TestManagedDiskLocalMigrationChargesDestinationAfterSetRemoval(t *testing.T
 func (c lifecycleFlowCluster) ListHaResources(context.Context, *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
 	rows := cluster.ListHaResourcesResponse{}
 	return &rows, nil
+}
+
+// TestManagedDiskAdoptedMoverCrossNodeOnSharedStorage attaches a
+// journal-managed disk on shared storage that sits on a mover an earlier
+// request left on n2, to VM 777 on n1. The mover holds that disk and nothing
+// else. The fake answers a config read of a VM that left the addressed node
+// the way real PVE does, with a 500 that says the file does not exist, so the
+// guard sees the source node's real answer after the migration. The attach
+// migrates the mover once, observes the migrate step with its task's UPID,
+// puts the mover's protection back on the node the mover is now on, and lands
+// the disk on VM 777 with its serial. An earlier request created the mover,
+// so the attach keeps it, empty, and logs that once. The test runs through
+// attach_disk and through the pre-attach create_vm makes of a persistent disk.
+func TestManagedDiskAdoptedMoverCrossNodeOnSharedStorage(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		attach func(t *testing.T, ctx context.Context, deps Deps, cid string) error
+	}{
+		{"attach_disk", func(t *testing.T, ctx context.Context, deps Deps, cid string) error {
+			_, err := HandleAttachDisk(deps).Handle(ctx,
+				[]json.RawMessage{planJSON(t, "777"), planJSON(t, cid)}, jsonrpc.Context{})
+			return err
+		}},
+		{"create_vm", func(t *testing.T, ctx context.Context, deps Deps, cid string) error {
+			bare, meta, err := decodeDiskCID(ctx, deps, "create_vm", cid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rd, err := resolveDiskForOp(ctx, deps, "create_vm", cid, bare, meta)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = attachManagedPersistentDisk(ctx, deps, "777", "n1", 777, rd)
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testAdoptedMoverCrossNode(t, tc.attach)
+		})
+	}
+}
+
+func testAdoptedMoverCrossNode(
+	t *testing.T, attach func(t *testing.T, ctx context.Context, deps Deps, cid string) error,
+) {
+	deps, client, journal, id, cid := lifecycleFlowFixture(t)
+	client.pmxcfsConfigMissing = true
+	deps.Config.DiskMigration = "on_attach"
+	logged := &bytes.Buffer{}
+	logger, err := log.NewLogger("debug", logged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps.Logger = logger
+	ctx := pve.WithTestBackoff(t.Context(), func(int) time.Duration { return 0 })
+	parkRenameCycle(t, ctx, deps, client, cid)
+	record, err := journal.Inspect(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mover := 0
+	for vmid := range client.state.configs {
+		if vmid != 777 && len(parkerSlotsCarrying(client, vmid, record.DiskToken)) == 1 {
+			mover = vmid
+		}
+	}
+	if mover == 0 || lifecycleConfigHasAnyVolume(client.state.configs[777]) {
+		t.Fatalf("the rename cycle did not leave the disk parked alone: configs=%v", client.state.configs)
+	}
+	tags, _ := pve.ConfigString(client.state.configs[mover], "tags")
+	client.state.configs[mover]["tags"] = tags + ";" + pve.DiskMoverTag
+	if client.vmNodes == nil {
+		client.vmNodes = map[int]string{}
+	}
+	client.vmNodes[mover] = "n2"
+	migrations := client.migrations
+	client.protectionWrites = nil
+
+	attachErr := attach(t, ctx, deps, cid)
+	logMoverLines(t, logged)
+	if attachErr != nil {
+		t.Fatalf("attach from the adopted mover: %s", log.ScrubMessage(attachErr.Error()))
+	}
+	if n := client.migrations - migrations; n != 1 {
+		t.Fatalf("the attach sent %d migrations, want exactly one of mover %d", n, mover)
+	}
+	record, err = journal.Inspect(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertReturnedRecord(t, "adopted mover attach", record)
+	migrated := 0
+	for i := range record.Steps {
+		step := &record.Steps[i]
+		if step.Kind != "lifecycle_attach_disk_Nodes_CreateQemuMigrate" {
+			continue
+		}
+		migrated++
+		if want := lifecycleFlowMigrateUPID("n2", mover); step.UPID != want {
+			t.Errorf("migrate step UPID = %q, want %q", step.UPID, want)
+		}
+		if step.Target.Node != "n1" || step.Target.VMID != mover {
+			t.Errorf("migrate step target = %+v, want mover %d to n1", step.Target, mover)
+		}
+	}
+	if migrated != 1 {
+		t.Fatalf("the record holds %d migrate steps, want one", migrated)
+	}
+
+	// An earlier request created the mover, so this request's journal can't
+	// delete it. The attach keeps it on n1, the node the migration moved it
+	// to, and says so once.
+	if _, kept := client.state.configs[mover]; !kept {
+		t.Fatalf("mover %d was destroyed, want it kept because an earlier request created it", mover)
+	}
+	if node := client.vmNode(mover); node != "n1" {
+		t.Errorf("mover %d is on %s after the attach, want n1", mover, node)
+	}
+	// In this mode the fake refuses a config write sent to a node the VM
+	// isn't on, so every recorded write reached the mover where it was. The
+	// last one has to put protection back on n1, where the migration left it.
+	var last *lifecycleProtectionWrite
+	for i := range client.protectionWrites {
+		if client.protectionWrites[i].vmid == mover {
+			last = &client.protectionWrites[i]
+		}
+	}
+	if last == nil || !last.on || last.node != "n1" {
+		t.Errorf("the last protection write to mover %d is %+v, want protection on at n1", mover, last)
+	}
+	if !pve.ConfigFlag(client.state.configs[mover], "protection") {
+		t.Errorf("mover %d protection is off after the attach", mover)
+	}
+	keptWarnings := 0
+	for _, line := range strings.Split(logged.String(), "\n") {
+		if !strings.Contains(line, `"level":"WARN"`) {
+			continue
+		}
+		if strings.Contains(line, "kept the migration mover because an earlier request created it") {
+			keptWarnings++
+		}
+		if strings.Contains(line, "protection restore") || strings.Contains(line, "restore protection") {
+			t.Errorf("the attach warned about a protection restore: %s", log.ScrubMessage(line))
+		}
+	}
+	if keptWarnings != 1 {
+		t.Errorf("the attach logged %d warnings that it kept the mover, want one", keptWarnings)
+	}
+
+	slots := parkerSlotsCarrying(client, 777, record.DiskToken)
+	if len(slots) != 1 {
+		t.Fatalf("VM 777 carries the disk's serial on %v, want exactly one slot", slots)
+	}
+	if lifecycleConfigHasAnyVolume(client.state.configs[mover]) {
+		t.Errorf("mover %d still holds a disk: %v", mover, client.state.configs[mover])
+	}
 }

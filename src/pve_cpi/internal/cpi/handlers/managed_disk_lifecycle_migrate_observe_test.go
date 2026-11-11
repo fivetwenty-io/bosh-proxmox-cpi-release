@@ -64,10 +64,11 @@ func newMigratedHolderCase(t *testing.T) *migratedHolderCase {
 	}
 }
 
-// answerOn makes every config read of the holder on node fail with err.
-func (c *migratedHolderCase) answerOn(node string, err error) {
+// answerOnSource makes every config read of the holder on n1, the node the
+// migration or deletion started from, fail with err.
+func (c *migratedHolderCase) answerOnSource(err error) {
 	c.client.onNodeConfigRead = func(read string, vmid int) error {
-		if read == node && vmid == migratedHolderVMID {
+		if read == "n1" && vmid == migratedHolderVMID {
 			return err
 		}
 		return nil
@@ -102,7 +103,7 @@ func TestObserveMigration_AcceptsTheSourceNodesMissingConfigAnswer(t *testing.T)
 		t.Run(tc.name, func(t *testing.T) {
 			c := newMigratedHolderCase(t)
 			if tc.answer != nil {
-				c.answerOn("n1", tc.answer)
+				c.answerOnSource(tc.answer)
 			}
 			slot, landed, err := c.observeHolder()
 			if err != nil || slot != "scsi0" || landed != c.volume {
@@ -131,7 +132,7 @@ func TestObserveMigration_RefusesASourceThatIsNotProvenEmpty(t *testing.T) {
 		setup func(c *migratedHolderCase)
 	}{
 		{"config still on the source", func(c *migratedHolderCase) { c.client.vmNodes[migratedHolderVMID] = "n1" }},
-		{"another 500", func(c *migratedHolderCase) { c.answerOn("n1", errMigrateSourceTimeout) }},
+		{"another 500", func(c *migratedHolderCase) { c.answerOnSource(errMigrateSourceTimeout) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newMigratedHolderCase(t)
@@ -175,7 +176,7 @@ func TestObserveMigration_RefusesWhenTheProbeDoesNotPlaceTheHolderOnTheTarget(t 
 			delete(c.client.vmNodes, migratedHolderVMID)
 		}, "not found on node n2"},
 		{"probe error", func(c *migratedHolderCase) {
-			c.answerOn("n1", errGuardSiteConfigGone)
+			c.answerOnSource(errGuardSiteConfigGone)
 			previous := c.client.onNodeConfigRead
 			c.client.onNodeConfigRead = func(node string, vmid int) error {
 				if node == "n2" && vmid == migratedHolderVMID {
@@ -200,7 +201,7 @@ func TestObserveMigration_RefusesWhenTheProbeDoesNotPlaceTheHolderOnTheTarget(t 
 // config that still carries PVE's migrate lock, with a retriable error.
 func TestObserveMigration_RefusesAHeldMigrateLockAsRetriable(t *testing.T) {
 	c := newMigratedHolderCase(t)
-	c.answerOn("n1", errGuardSiteConfigGone)
+	c.answerOnSource(errGuardSiteConfigGone)
 	c.client.state.configs[migratedHolderVMID]["lock"] = "migrate"
 	_, _, err := c.observeHolder()
 	if err == nil || !strings.Contains(err.Error(), "migrate lock") {
@@ -221,7 +222,7 @@ func TestObserveMigration_RefusesAHeldMigrateLockAsRetriable(t *testing.T) {
 // ambiguous.
 func TestObserveMigration_RefusesASerialOnTwoSlots(t *testing.T) {
 	c := newMigratedHolderCase(t)
-	c.answerOn("n1", errGuardSiteConfigGone)
+	c.answerOnSource(errGuardSiteConfigGone)
 	c.client.state.configs[migratedHolderVMID]["scsi1"] = c.volume + ",serial=" + c.token + ",size=5G"
 	if _, err := c.guard.observeMigration(c.ctx, c.migration()); err == nil ||
 		!strings.Contains(err.Error(), "ambiguous") {
@@ -256,7 +257,7 @@ func TestObserveHolderDeletion_AcceptsTheMissingConfigAnswer(t *testing.T) {
 			c := newMigratedHolderCase(t)
 			c.deleteHolder()
 			if tc.answer != nil {
-				c.answerOn("n1", tc.answer)
+				c.answerOnSource(tc.answer)
 			}
 			volumes, err := c.guard.observeHolderDeletion(c.ctx, c.deletion())
 			if err != nil {
@@ -280,16 +281,16 @@ func TestObserveHolderDeletion_RefusesAHolderThatIsNotProvenGone(t *testing.T) {
 	}{
 		{"another 500", func(c *migratedHolderCase) {
 			c.deleteHolder()
-			c.answerOn("n1", errMigrateSourceTimeout)
+			c.answerOnSource(errMigrateSourceTimeout)
 		}},
 		// The holder moved to n2 rather than being deleted.
 		{"probe hit on another node after a 404", func(*migratedHolderCase) {}},
 		{"probe hit on another node after a pmxcfs 500", func(c *migratedHolderCase) {
-			c.answerOn("n1", errGuardSiteConfigGone)
+			c.answerOnSource(errGuardSiteConfigGone)
 		}},
 		{"probe error", func(c *migratedHolderCase) {
 			c.deleteHolder()
-			c.answerOn("n1", errGuardSiteConfigGone)
+			c.answerOnSource(errGuardSiteConfigGone)
 			previous := c.client.onNodeConfigRead
 			c.client.onNodeConfigRead = func(node string, vmid int) error {
 				if node == "n2" && vmid == migratedHolderVMID {
