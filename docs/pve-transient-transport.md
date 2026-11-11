@@ -1,6 +1,6 @@
 # PVE Transient Transport Faults
 
-This document covers how the CPI absorbs pvedaemon worker recycling, pveproxy backend stalls, HTTP 429 pushback, and the auth-ticket EOF that follows. [PVE Storage Locking](pve-storage-locking.md) covers the per-storage lockfile class.
+This document covers how the CPI absorbs pvedaemon worker recycling, pveproxy backend stalls, HTTP 429 pushback, and the auth-ticket EOF that follows. [PVE Storage Locking](pve-storage-locking.md) covers the per-storage lockfile class, and [PVE Endpoint Failover](endpoint-failover.md) covers how the CPI moves between the nodes you list in `pve.endpoints`, which changes how several of these faults play out.
 
 ## What PVE does
 
@@ -16,7 +16,7 @@ The shape pveproxy returns to the client depends on where the worker died:
 
 ## How the failure surfaces
 
-Three distinct error strings show up in CPI logs:
+Three distinct error strings show up in CPI logs when the pool holds one endpoint:
 
 ```
 API request failed: HTTP 596 (code: 596)
@@ -32,7 +32,13 @@ operation get-config timed out after 30s
 
 The first hits any API call. The second is specific to `POST /access/ticket` — the SDK's first call on a new connection requiring a fresh ticket. The third is the SDK's `TimeoutError` wrapper.
 
-The substring detector `pve.IsTransientTransport` covers all three (plus generic `*ConnectionError` and any 5xx).
+When you list more than one endpoint, a fourth shape appears. A walk over the list that reached no endpoint ends with one error that names each endpoint and its cause.
+
+```
+no Proxmox endpoint answered (pve1:8006: dial timeout; pve2:8006: connection refused)
+```
+
+The substring detector `pve.IsTransientTransport` covers all four (plus generic `*ConnectionError` and any 5xx). The fourth is recognized as a connection error, because the walk's error unwraps to a single dial error. It is the one error in the list that tells you about more than one node at a time.
 
 ## When the CPI hits it
 
@@ -61,7 +67,7 @@ The CPI absorbs the recycle window with a predicate, exponential backoff, and a 
 
 Implementation lives in `internal/pve/retry.go`:
 
-- `pve.IsTransientTransport(err)` — predicate over `sdkerrors.ErrServer`, `*ConnectionError`, `*TimeoutError`, `net.Error.Timeout()`, and the substrings `"failed to parse login response"`, `"auto-login failed"`, `"(code: 596)"`, `"http 596"`.
+- `pve.IsTransientTransport(err)` returns false at once for `ErrTetherConflict`, `ErrSendByPassed`, and a refused redirect. Otherwise it is a predicate over `sdkerrors.ErrServer`, `*ConnectionError`, `*TimeoutError`, `net.Error.Timeout()`, and the substrings `"failed to parse login response"`, `"auto-login failed"`, `"(code: 596)"`, `"http 596"`.
 
 - `pve.TransientBackoff(attempt)` — 1s × 1.5^n, ±30% jitter, cap 15s.
 
@@ -123,6 +129,49 @@ flowchart TD
 | `create_stemcell` upload, `agent/configdrive` upload/delete | `RetryOnTransientOrLock` | Streaming uploads need file reopen inside the callback; pattern already in place. |
 | `attach_disk`, `detach_disk` | `RetryOnTransient` (no lock) | Pure config PUT, no storage lock, but worker cycle still applies. |
 
+## How failover and the send-by deadline change the retry
+
+The endpoint pool sits below both retry layers. A CPI helper calls the SDK, the SDK's retry middleware calls the HTTP client, and the failover transport sits under that. So a request that the CPI retries is not always sent to the same node twice. What happens depends on whether the request is a read or a mutation.
+
+### Reads move on
+
+A read, which here includes the ticket login, moves to the next endpoint on any transport error, on a header deadline, and once on a 502, 503, or 595 that the entry node caused. The retry that follows therefore usually finds a live node, and the transient backoff you see in the log is often the only trace of a node that was down. A 596 is the exception. It means pveproxy's own connection to the worker broke after the request may have reached it, so the transport returns the response, demotes the entry endpoint, and lets the CPI's retry decide.
+
+### Mutations stay put
+
+A mutation that may have reached a node is tethered to that node, and every retry of it, from the SDK or from a CPI helper, goes back to the same node and nowhere else. This is deliberate. The helpers in this page replay a write after a dropped connection, and sending the replay to another node would run the write twice. So when `RetryOnTransient` retries a `create_vm` that died with a 596 or an EOF, the retry still goes to the node that may have the first copy. The transient backoff then rides out a worker recycle on that node exactly as it did before. If that node is down, the retry fails in the connect phase within a few seconds, which proves nothing was sent, and the retry waits out its backoff and tries again.
+
+A mutation that fails while the connection is still being made is the one case that moves. Go writes no request byte before it has a connection, so nothing could have reached any node, and the walk tries the next endpoint, unless another request with the same key holds the tether.
+
+### Errors the retry helpers never repeat
+
+Three refusals look like transport faults but cannot change on a second attempt, so `IsTransientTransport` returns false for each one.
+
+- `ErrSendByPassed`
+  The request carried a send-by deadline that had already passed, and the transport sent no byte. The cluster lock puts that deadline on its sentinel delete. The deadline is past for every later attempt as well, so a retry would only repeat the refusal through its whole backoff. This holds even when the bound passed while the dial was in flight, which the SDK reports as a connection error.
+
+- `ErrTetherConflict`
+  A mutation was refused because its tether key may have reached two endpoints in one call, or two calls tethered the same key to different endpoints. Nothing a retry could change would let it send.
+
+- A refused redirect
+  The SDK, v3.13.1 and later, refuses every HTTP redirect from the Proxmox API, and the CPI's pool refuses one too, before any dial. A server that redirects answers every retry the same way, so the request is attempted once. The CPI reports it to the Director as an error that is not retriable, because a retriable one would spend the Director's `max_vm_create_tries` on the same answer.
+
+The send-by refusal is not an error for the code that asked for it. A steal of an expired cluster lock treats it as an abandoned steal and waits one poll. The expired-lock sweep leaves the sentinel for the next sweep. See [PVE Endpoint Failover](endpoint-failover.md#the-cluster-locks-send-by-deadline) for why the lock needs the deadline.
+
+### Task polls keep going
+
+The default task poll used to return on the first transient fault, which a retry helper above it could then answer by submitting the whole mutation again. The poll now re-polls a transient fault at the poll interval until the task's deadline, and at the deadline it returns the poll-timeout error that never licenses a resubmit. This matters most when the task's own node is down. Every entry node answers 595 for that path, and the transport returns it because it is about another node. The call now waits for the task's whole deadline before it fails, which is slower, and it no longer risks starting a second copy of a task that may still be running.
+
+### The worst case with several endpoints
+
+A walk that reaches no endpoint costs at most about 45 seconds, since each hop is limited to the 5-second dial and the 10-second TLS handshake, and the walk starts no new hop after 30 seconds of connecting. The walk's error looks like a dial error, so the SDK does not retry it and the CPI helper keeps its eight attempts. The worst case with every endpoint refusing connections is therefore about eight walks plus the backoff, which comes to roughly seven minutes. One host that silently drops packets used to cost about 17 minutes. A whole-pool outage of a minute or two, such as a switch reboot, is still ridden out by the helper's curve, which is why the helpers keep retrying.
+
+Endpoints that accept TLS and then never answer cost more. A hop can wait up to 60 seconds for response headers on top of the connect time, so a walk can last about 165 seconds. A walk whose final hop meets a hung endpoint waits for the 30-minute client timeout, exactly as a single hung host does. These deadlines apply only when the pool holds more than one endpoint. With one endpoint the CPI sets no dial deadline and no header deadline unless you set `pve.api_dial_timeout_sec` or `pve.api_tls_handshake_timeout_sec` yourself.
+
+### Credentials and server text in these errors
+
+Errors in these retry lines pass through the SDK's scrubbing before the CPI sees them. A URL in an error keeps only its scheme, host, and path, so a ticket in a query string never reaches `cpi.log`. Control characters in a value the server chose are escaped, a single server-chosen value is cut at 1 KiB, and the whole text of a cause is cut at 8 KiB. If an `error=` field in a retry line looks shorter than the original error, that is why.
+
 ## Diagnosing
 
 In `/var/vcap/sys/log/cpi/cpi.log` on the director, retries from `RetryOnTransient` or `RetryOnTransientOrLock` appear as:
@@ -132,6 +181,14 @@ pve: retrying after retryable fault op=create_vm reason=transient_transport atte
 pve: retrying after retryable fault op=create_disk reason=pushback attempt=2 max_attempts=10 backoff_ms=7312 error="..."
 pve: retrying after retryable fault op=create_disk reason=storage_lock attempt=3 max_attempts=10 backoff_ms=4218 error="..."
 ```
+
+When the pool holds more than one endpoint, a retry can also follow a Warn line from the failover transport.
+
+```
+pve endpoint failover: pve1:8006 unreachable (dial tcp: i/o timeout), request sent to pve2:8006, which stays active for this call
+```
+
+That line means one node was unreachable and the call moved to another. It is not a retry, and the call usually succeeds without one. [PVE Endpoint Failover](endpoint-failover.md#log-lines) lists every failover line with its level.
 
 The `reason` field identifies which predicate fired. Watch the mix during a deploy:
 
@@ -169,7 +226,9 @@ The CPI's retry absorbs typical recycle windows. If retries routinely climb past
 
 4. **Tune pushback backoff.** `pve.retry.pushback.base_ms` and `pve.retry.pushback.cap_ms` adjust how aggressively the CPI backs off under HTTP 429. Higher values reduce retry storms; lower values recover faster when pushback is short-lived.
 
-5. **Throttle the director.** Lower `director.workers` or per-instance-group `max_in_flight`. Cheapest if you cannot edit the PVE node, and also helps with storage-lock contention.
+5. **List more than one endpoint.** Set `pve.endpoints` to every node you want the CPI to use. A call then moves to another node when one is unreachable, and a read can leave a node whose pveproxy stopped answering. See [PVE Endpoint Failover](endpoint-failover.md). It does not remove worker recycling, since a write that may have reached a recycling node stays tethered to it.
+
+6. **Throttle the director.** Lower `director.workers` or per-instance-group `max_in_flight`. Cheapest if you cannot edit the PVE node, and also helps with storage-lock contention.
 
 See [PVE Host Tuning](pve-host-tuning.md) for full sizing guidance, verification, and the related storage-side knobs.
 
@@ -180,6 +239,10 @@ See [PVE Host Tuning](pve-host-tuning.md) for full sizing guidance, verification
 - `internal/pve/error_map.go` — `IsTransientTransport`, `IsPVEPushback`, `IsStorageLockTimeout` predicates.
 
 - `internal/pve/pushback_seam.go` — `ConfigurePushbackBackoff` and `pushbackDefaults` process-wide seam.
+
+- `internal/pve/endpointpool/` holds the failover transport, its outcome table, the tethers, and the send-by check (`ErrSendByPassed`, `ErrTetherConflict`, `EntryUnreachableError`).
+
+- `internal/pve/endpoint_plan.go` decides when the pool is installed and sets the 5-second dial and 10-second handshake defaults for a pool of more than one endpoint.
 
 - `internal/cpi/handlers/inflight.go` — `nodeInflightRegistry` per-node semaphore.
 
