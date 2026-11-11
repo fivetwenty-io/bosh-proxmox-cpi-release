@@ -493,6 +493,12 @@ func (w *DiscoveryWorker) answeringEndpoint(ctx context.Context, triggered strin
 // level. The stored failure is the raw section's, as the update reads it under
 // the file lock, so a section a reader hides because the clock stepped back
 // still counts as the failure it records.
+//
+// An attempt that never reached the file, because the write failed or the
+// lock wait ran out, promises no wait, since the next call asks again. Its
+// line is at the failure level, because the update read no stored section to
+// tell whether the outcome changed, and the store or logDropped has already
+// said why nothing was written.
 func (w *DiscoveryWorker) recordFailure(ctx context.Context, via string, cause error) {
 	failure := discoveryFailure(cause)
 	var prior endpointcache.DiscoveryFailure
@@ -503,14 +509,24 @@ func (w *DiscoveryWorker) recordFailure(ctx context.Context, via string, cause e
 			At: at, NextRefreshAfter: at.Add(discoveryFailureWait), Failure: failure,
 		}}, nil
 	})
+	if err != nil && ctx.Err() != nil {
+		return
+	}
 	if err != nil {
-		if ctx.Err() != nil {
-			return
-		}
 		w.logDropped(ctx, err)
 	}
 	if res.Locked {
 		w.logUpdate(ctx, res)
+	}
+	attrs := []slog.Attr{
+		log.String("file", w.store.FileName()), log.String("failure", string(failure)), log.Err(cause),
+	}
+	if err != nil || !res.Locked {
+		w.logger.LogAttrs(ctx, endpointcache.Level(w.mode),
+			fmt.Sprintf("api endpoint discovery: no result through %s, because %s; the attempt was not recorded, "+
+				"so the next call tries again", via, discoveryFailureReason(cause)),
+			attrs...)
+		return
 	}
 	level := endpointcache.Level(w.mode)
 	if failure != prior {
@@ -519,7 +535,7 @@ func (w *DiscoveryWorker) recordFailure(ctx context.Context, via string, cause e
 	w.logger.LogAttrs(ctx, level,
 		fmt.Sprintf("api endpoint discovery: no result through %s, because %s; next attempt in %s",
 			via, discoveryFailureReason(cause), waitText(discoveryFailureWait)),
-		log.String("file", w.store.FileName()), log.String("failure", string(failure)), log.Err(cause))
+		attrs...)
 }
 
 // discoveryFailure names the failure the cache records for a refresh that

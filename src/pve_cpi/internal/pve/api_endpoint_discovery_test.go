@@ -934,6 +934,54 @@ func TestDiscoveryWorker_ExpiredLockWaitSkipsTheWrite(t *testing.T) {
 	}
 }
 
+// A failed refresh whose attempt never reaches the file promises no wait,
+// because the next call asks again, and logs its failure at the failure level
+// and never at Info, because no stored section was read to tell whether the
+// outcome changed. The store's own line reports a write that failed or a lock
+// wait that ran out.
+func TestDiscoveryWorker_UnrecordedAttemptPromisesNoWait(t *testing.T) {
+	t.Parallel()
+	holdKeyLock := func(t *testing.T, e *workerEnv) {
+		t.Helper()
+		path := filepath.Join(e.dir, e.store.Key().LockName())
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) // #nosec G304 -- test-owned temp path
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		block func(t *testing.T, e *workerEnv)
+		line  string
+	}{
+		{"the write fails", func(t *testing.T, e *workerEnv) {
+			// A directory in the file's place makes the write fail.
+			if err := os.Mkdir(e.filePath(), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, "api endpoint discovery: the cache write failed"},
+		{"the lock wait runs out", holdKeyLock, "endpoint cache lock wait expired; skipping the cache write"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e := newWorkerEnv(t, workerEnvOptions{})
+			tc.block(t, e)
+			e.begin()
+			w := e.newWorker()
+			w.recordFailure(context.Background(), workerSeed, fmt.Errorf("read: %w", ErrDiscoveryRoot))
+			e.wantLine(tc.line, log.LevelDebug)
+			e.wantLine("api endpoint discovery: no result through "+workerSeed+", because the cluster root CA "+
+				"could not be read; the attempt was not recorded, so the next call tries again", log.LevelDebug)
+			e.noLine("next attempt in")
+			e.noLineAt(log.LevelInfo)
+		})
+	}
+}
+
 func TestDiscoveryWorker_BackOffHoldsForADay(t *testing.T) {
 	t.Parallel()
 	for name, setup := range map[string]func(e *workerEnv){
