@@ -824,6 +824,13 @@ assert_json_valid      "case15-token-wins" "$JSON_15K"                          
 assert_json_key_equals "case15-token-wins" "$JSON_15K" api_endpoint_discovery on || FAILED=$((FAILED+1))
 JSON_15K2="$(render "$(props_with_pve '{"password":"","api_token":"root@pam!cpi=abc-123","verify_ssl":false,"api_endpoint_discovery":true}')")"
 assert_json_key_equals "case15-token-only" "$JSON_15K2" api_endpoint_discovery on || FAILED=$((FAILED+1))
+# The header form of a real token is a token, as the CPI reads it, so on renders
+# with verify_ssl false beside a password. A value that is only the prefix is no
+# token, and the fixture case "mode on with a token that is only the header
+# prefix and no verification" asserts the refusal.
+JSON_15K3="$(render "$(props_with_pve '{"api_token":"PVEAPIToken=root@pam!cpi=abc-123","verify_ssl":false,"api_endpoint_discovery":"on"}')")"
+assert_json_valid      "case15-prefixed-token" "$JSON_15K3"                          || FAILED=$((FAILED+1))
+assert_json_key_equals "case15-prefixed-token" "$JSON_15K3" api_endpoint_discovery on || FAILED=$((FAILED+1))
 
 # The cache directory renders as written when it passes, and an empty string
 # leaves it out.

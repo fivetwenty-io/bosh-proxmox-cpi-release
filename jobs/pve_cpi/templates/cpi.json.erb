@@ -136,9 +136,13 @@
   # password, so a kit that renders a placeholder password beside a real token
   # still loads. A config with neither fails Validate() at CPI start-up. The
   # discovery check below applies the same rule: a non-empty pve.api_token
-  # means token auth, whatever pve.password holds.
+  # means token auth, whatever pve.password holds. The CPI first removes one
+  # leading "PVEAPIToken=" from the token, as ApplyDefaults does, so a value
+  # that is only that prefix is no token. pve_has_token applies that step to
+  # the emptiness test alone, and the token itself is emitted as written.
   pve_password  = p("pve.password",  "")
   pve_api_token = p("pve.api_token", "")
+  pve_has_token = !pve_api_token.to_s.sub(/\APVEAPIToken=/, "").empty?
   config["password"]  = pve_password  unless pve_password.to_s.empty?
   config["api_token"] = pve_api_token unless pve_api_token.to_s.empty?
 
@@ -742,8 +746,9 @@
   # before. YAML 1.1 reads a bare on or off as a boolean, so the booleans map
   # back to the mode names. Only the lowercase names auto, on, and off pass,
   # and an empty string is refused, as the CPI's config refuses it. The raise
-  # texts match the config's messages. A non-empty pve.api_token means token
-  # auth even when pve.password is also set, because the CPI keeps the token and
+  # texts match the config's messages. A pve.api_token that still holds
+  # something after the PVEAPIToken= prefix is removed means token auth even
+  # when pve.password is also set, because the CPI keeps the token and
   # clears the password, so only a password with no token trips the check for
   # on with verify_ssl false. A verify_ssl of exactly false counts as unverified;
   # an absent value is the spec default, true.
@@ -765,7 +770,7 @@
     unless %w[auto on off].include?(mode)
       raise "api_endpoint_discovery must be auto, on, or off, got #{go_quote.call(mode)}"
     end
-    if mode == "on" && pve_api_token.to_s.empty? && !pve_password.to_s.empty? && p("pve.verify_ssl", true) == false
+    if mode == "on" && !pve_has_token && !pve_password.to_s.empty? && p("pve.verify_ssl", true) == false
       raise "api_endpoint_discovery \"on\" cannot be used with password auth while verify_ssl is false; " \
             "use an API token (pve.api_token) or turn on verification (pve.verify_ssl: true)"
     end
