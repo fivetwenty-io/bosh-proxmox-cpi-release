@@ -1132,8 +1132,10 @@ func TestStoreSweepSparesTheWritersOwnKeyFile(t *testing.T) {
 	putResult(t, s, payloadNow, mergeResult("pve2"))
 	old := payloadNow.Add(-31 * 24 * time.Hour)
 	other := "other.example.com-0123456789abcdef.json"
+	otherLock := "other.example.com-0123456789abcdef.lock"
 	writeStoreFile(t, filepath.Join(dir, other), []byte("{}"), 0o600)
-	for _, name := range []string{s.FileName(), other} {
+	writeStoreFile(t, filepath.Join(dir, otherLock), []byte("x"), 0o600)
+	for _, name := range []string{s.FileName(), other, otherLock} {
 		if err := os.Chtimes(filepath.Join(dir, name), old, old); err != nil {
 			t.Fatal(err)
 		}
@@ -1149,8 +1151,8 @@ func TestStoreSweepSparesTheWritersOwnKeyFile(t *testing.T) {
 	if !errors.Is(err, boom) || res.Written {
 		t.Fatalf("UpdatePayload: %+v, %v", res, err)
 	}
-	if !reflect.DeepEqual(res.Swept.Removed, []string{other}) {
-		t.Errorf("swept %v, want only the other key's file", res.Swept.Removed)
+	if !reflect.DeepEqual(res.Swept.Removed, []string{other, otherLock}) {
+		t.Errorf("swept %v, want only the other key's file and lock", res.Swept.Removed)
 	}
 	if _, err := os.Lstat(filepath.Join(dir, s.FileName())); err != nil {
 		t.Errorf("the writer's own key file is gone: %v", err)

@@ -67,6 +67,11 @@ type SweepResult struct {
 // that the effective user owns, and it never removes secret or secret.lock
 // whatever their age. keep lists names it leaves alone whatever their age,
 // such as the lock the caller holds. It writes no log line.
+//
+// It removes a key file, lock file, or discover lock file only while it holds
+// that key's lock, taken without waiting, and skips the file when the lock is
+// busy or, for a key file, does not exist. Under the lock it checks the age
+// again and, for a lock file, that the name still reaches the locked inode.
 func Sweep(root *os.Root, now time.Time, keep ...string) SweepResult {
 	return endpointTexts.sweepWith(root, now, keep, ownedByEffectiveUser, "")
 }
@@ -120,16 +125,108 @@ func (t *texts) sweepWith(
 		if now.Sub(modified) <= maxAge {
 			continue
 		}
-		if err := root.Remove(name); err != nil {
-			if !errors.Is(err, fs.ErrNotExist) {
-				errs = append(errs, fmt.Errorf("%s: remove %s: %w", t.name, name, err))
-			}
-			continue
+		removed, err := t.removeStale(root, name, info, maxAge, now)
+		if err != nil {
+			errs = append(errs, err)
 		}
-		result.Removed = append(result.Removed, name)
+		if removed {
+			result.Removed = append(result.Removed, name)
+		}
 	}
 	result.Err = errors.Join(errs...)
 	return result
+}
+
+// afterSweepLock runs once the sweep holds a victim's lock and before it
+// rechecks what it is about to remove. It is nil outside tests, which use it
+// to play the writer that changes the file in that instant.
+var afterSweepLock func(name string)
+
+// removeStale removes the file called name, which the sweep saw as seen and
+// found older than maxAge, and reports whether it removed it. A temporary file
+// is removed as it is, because its name is unique and nobody reuses it. Any
+// other file belongs to a key whose lock this process does not hold, so the
+// sweep takes that lock first, without waiting, and skips the file when
+// another process holds it or when the lock file does not exist. It then looks
+// again under the lock, and removes the file only when it is the file the sweep
+// saw, or for a lock the file that was locked, and is still older than maxAge.
+// A writer that got in between the stat and the lock has then either changed
+// the file, which the recheck sees, or still holds the lock, which the try
+// refuses.
+func (t *texts) removeStale(
+	root *os.Root, name string, seen fs.FileInfo, maxAge time.Duration, now time.Time,
+) (bool, error) {
+	if strings.HasPrefix(name, privatefile.TempPrefix) {
+		return t.removeName(root, name)
+	}
+	lockName := name
+	if _, isLock := lockKeyFile(name); !isLock {
+		lockName = strings.TrimSuffix(name, fileSuffix) + lockSuffix
+	}
+	lock, held, err := t.policy.TryLockExisting(root, lockName)
+	if errors.Is(err, fs.ErrNotExist) || err == nil && !held {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("%s: lock %s to sweep %s: %w", t.name, lockName, name, err)
+	}
+	if afterSweepLock != nil {
+		afterSweepLock(name)
+	}
+	removed, err := t.removeUnderLock(root, name, lock, seen, maxAge, now)
+	if closeErr := lock.Close(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("%s: release lock %s: %w", t.name, lockName, closeErr))
+	}
+	return removed, err
+}
+
+// removeUnderLock is the part of removeStale that runs while the sweep holds
+// the lock on the file's key.
+func (t *texts) removeUnderLock(
+	root *os.Root, name string, lock *privatefile.Lock, seen fs.FileInfo, maxAge time.Duration, now time.Time,
+) (bool, error) {
+	current, err := root.Lstat(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("%s: stat %s: %w", t.name, name, err)
+	}
+	expected := seen
+	if _, isLock := lockKeyFile(name); isLock {
+		// The lock being removed is the one the sweep holds, so the name must
+		// still reach the inode that was locked, or a waiter on an older inode
+		// and a holder of a newer one could both run.
+		if expected, err = lock.File.Stat(); err != nil {
+			return false, fmt.Errorf("%s: stat locked file %s: %w", t.name, name, err)
+		}
+	}
+	if !os.SameFile(expected, current) || !current.Mode().IsRegular() {
+		return false, nil
+	}
+	modified := current.ModTime()
+	if base, isLock := lockKeyFile(name); isLock {
+		if keyInfo, err := root.Lstat(base); err == nil && keyInfo.Mode().IsRegular() &&
+			keyInfo.ModTime().After(modified) {
+			modified = keyInfo.ModTime()
+		}
+	}
+	if now.Sub(modified) <= maxAge {
+		return false, nil
+	}
+	return t.removeName(root, name)
+}
+
+// removeName removes name and reports whether it did. A name that is gone
+// already is not a failure and not a removal.
+func (t *texts) removeName(root *os.Root, name string) (bool, error) {
+	if err := root.Remove(name); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("%s: remove %s: %w", t.name, name, err)
+	}
+	return true, nil
 }
 
 // listNames returns the names in the directory root names, sorted.

@@ -314,9 +314,11 @@ func TestSweepNamesCoverAHAProfileFileWithALongHost(t *testing.T) {
 	host := strings.Repeat("a", maxNameHost)
 	name := HAProfilePrefix + host + "-0123456789abcdef.json"
 	dir, root := sweepDir(t)
+	lock := strings.TrimSuffix(name, ".json") + ".lock"
 	sweepFile(t, dir, name, 31*24*time.Hour)
-	if result := runSweep(t, root); !sameNames(result.Removed, []string{name}) {
-		t.Errorf("removed %v, want %s", result.Removed, name)
+	sweepFile(t, dir, lock, 31*24*time.Hour)
+	if result := runSweep(t, root); !sameNames(result.Removed, []string{name, lock}) {
+		t.Errorf("removed %v, want %s and %s", result.Removed, name, lock)
 	}
 }
 
@@ -456,7 +458,9 @@ func TestStoreSweepRemovesOrphansAndKeepsItsOwnFileAndLock(t *testing.T) {
 	age(lockName, 90*24*time.Hour)
 	const orphan = "ha_profile-" + sweepBase + ".json"
 	const fresh = "ha_profile-pve9.dc1.example.com-0123456789abcdef.json"
+	const orphanLock = "ha_profile-" + sweepBase + ".lock"
 	sweepFile(t, dir, orphan, 40*24*time.Hour)
+	sweepFile(t, dir, orphanLock, 40*24*time.Hour)
 	sweepFile(t, dir, fresh, time.Hour)
 	sweepFile(t, dir, sweepTemp, 2*time.Hour)
 
@@ -464,8 +468,8 @@ func TestStoreSweepRemovesOrphansAndKeepsItsOwnFileAndLock(t *testing.T) {
 	if result.Err != nil {
 		t.Fatalf("Sweep: %v", result.Err)
 	}
-	if !sameNames(result.Removed, []string{orphan, sweepTemp}) {
-		t.Errorf("removed %v, want the aged orphan and the old temporary file", result.Removed)
+	if !sameNames(result.Removed, []string{orphan, orphanLock, sweepTemp}) {
+		t.Errorf("removed %v, want the aged orphan, its lock, and the old temporary file", result.Removed)
 	}
 	want := []string{secretFile, secretLockFile, s.FileName(), lockName, fresh}
 	if got := storeDirNames(t, dir); !sameNames(got, want) {
