@@ -494,7 +494,7 @@ func TestDiscoveryWorker_ClockStepBackKeepsTheFailureLevelSteady(t *testing.T) {
 		}
 		e.wantLine("the stored discovery is dated more than 1h ahead of the clock, so the refresh runs "+
 			"without a recorded attempt", log.LevelDebug)
-		e.wantLine("because the cluster root CA could not be read; the attempt was not recorded, because the "+
+		e.wantLine("because the cluster root CA could not be read; the failure was not recorded, because the "+
 			"stored discovery is dated ahead of the clock, so the next call tries again", log.LevelDebug)
 		e.noLine("next attempt in")
 	}
@@ -710,4 +710,124 @@ func TestReaderNodes(t *testing.T) {
 			t.Fatalf("readerNodes returned %+v, want the section's own node", got)
 		}
 	})
+}
+
+// steppingBack returns a client for e's cluster whose first GET /nodes read
+// steps the test clock back by d, which is a clock that steps back while a
+// refresh's reads run.
+func steppingBack(e *workerEnv, d time.Duration) Client {
+	client := markedClient(e.cluster, e.reqs)
+	inner := client.nodes.listNodesFn
+	var once sync.Once
+	client.nodes.listNodesFn = func(ctx context.Context) (*sdknodes.ListNodesResponse, error) {
+		once.Do(func() { e.clock.advance(-d) })
+		return inner(ctx)
+	}
+	return client
+}
+
+// A clock that steps back by more than the skew while the reads run hides the
+// section that the attempt before the reads wrote, so the failure cannot be
+// recorded. The attempt before the reads then stands with reads_timed_out as
+// its reason, and the next call skips the refresh until the clock reaches it.
+// The line says that, and does not promise a retry on the next call.
+func TestDiscoveryWorker_ClockStepBackDuringTheReadsNamesTheAttemptThatStands(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		mode  config.DiscoveryMode
+		level slog.Level
+	}{
+		{config.DiscoveryModeAuto, log.LevelDebug},
+		{config.DiscoveryModeOn, log.LevelWarn},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			t.Parallel()
+			e := newWorkerEnv(t, workerEnvOptions{mode: tc.mode})
+			e.run()
+			e.cluster.set(func() {
+				for _, name := range e.cluster.names {
+					e.cluster.rootless[name] = true
+				}
+			})
+			e.clock.advance(endpointcache.RefreshInterval)
+			startedAt := e.clock.Now()
+			e.client = steppingBack(e, 10*time.Minute)
+			e.run()
+			next := startedAt.Add(discoveryFailureWait).Format(time.RFC3339)
+			line := e.wantLine("api endpoint discovery: no result through "+workerSeed+", because the cluster "+
+				"root CA could not be read; the failure was not recorded, because the stored discovery is dated "+
+				"ahead of the clock, so the attempt recorded before the reads stands, with reads_timed_out as its "+
+				"reason, and the next refresh is no earlier than "+next, tc.level)
+			if got := line.Attrs["next_refresh_after"]; got != next {
+				t.Errorf("next_refresh_after = %v, want %s", got, next)
+			}
+			if got := line.Attrs["stored_failure"]; got != string(endpointcache.FailureReadsTimedOut) {
+				t.Errorf("stored_failure = %v, want reads_timed_out", got)
+			}
+			e.noLine("the next call tries again")
+			e.noLine("next attempt in")
+
+			// What the line says is what the next call does.
+			e.client = nil
+			e.run()
+			if n := e.requests(); n != 0 {
+				t.Fatalf("the next call sent %d requests, so the line's promise of a wait was untrue", n)
+			}
+			e.wantLine("skipping the refresh until the clock reaches it", tc.level)
+			e.clock.advance(10*time.Minute - endpointcache.FutureSkew)
+			if got := e.payload().Discovery.LastFailure; got != endpointcache.FailureReadsTimedOut {
+				t.Fatalf("last_failure = %q, want the attempt before the reads to stand", got)
+			}
+		})
+	}
+}
+
+// A refused identity restores the last_failure from before the refresh, and a
+// clock that stepped back during the reads hides the section so the restore
+// cannot land. The reads_timed_out then stays although the reads answered, and
+// the refresh says so at the failure level.
+func TestDiscoveryWorker_ClockStepBackKeepsTheStartAttemptAndSaysSo(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		mode  config.DiscoveryMode
+		level slog.Level
+	}{
+		{config.DiscoveryModeAuto, log.LevelDebug},
+		{config.DiscoveryModeOn, log.LevelWarn},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			t.Parallel()
+			e := newWorkerEnv(t, workerEnvOptions{mode: tc.mode})
+			e.run()
+			e.cluster.replaceRoot()
+			e.clock.advance(endpointcache.RefreshInterval)
+			startedAt := e.clock.Now()
+			e.client = steppingBack(e, 10*time.Minute)
+			e.run()
+			next := startedAt.Add(discoveryFailureWait).Format(time.RFC3339)
+			line := e.wantLine("api endpoint discovery: the reads answered, but the stored discovery is dated "+
+				"ahead of the clock, so no attempt can replace the reads_timed_out stored before the reads, which "+
+				"is not what happened; the attempt recorded before the reads stands, with reads_timed_out as its "+
+				"reason, and the next refresh is no earlier than "+next, tc.level)
+			if got := line.Attrs["next_refresh_after"]; got != next {
+				t.Errorf("next_refresh_after = %v, want %s", got, next)
+			}
+			e.clock.advance(10*time.Minute - endpointcache.FutureSkew)
+			if got := e.payload().Discovery.LastFailure; got != endpointcache.FailureReadsTimedOut {
+				t.Fatalf("last_failure = %q, want the attempt before the reads to stand", got)
+			}
+		})
+	}
+}
+
+// A refused identity on a clock that holds still restores the failure, so the
+// line about a kept attempt is for the hidden section alone.
+func TestDiscoveryWorker_RefusedIdentityOnASteadyClockLogsNoKeptAttempt(t *testing.T) {
+	t.Parallel()
+	e := newWorkerEnv(t, workerEnvOptions{})
+	e.run()
+	e.cluster.replaceRoot()
+	e.clock.advance(endpointcache.RefreshInterval)
+	e.run()
+	e.noLine("the reads answered, but the stored discovery is dated ahead of the clock")
 }

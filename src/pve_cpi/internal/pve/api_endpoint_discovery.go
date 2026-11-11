@@ -613,6 +613,50 @@ func (s discoveryStart) restore(view endpointcache.Stored, attempt *endpointcach
 	return &restored
 }
 
+// hiddenOutcome says what follows from a stored discovery section that sits
+// ahead of the clock by ahead, when a write could not record its attempt, and
+// returns the attributes that go with the text. The next call tries again when
+// the section is further ahead than maxHiddenWait, because runHidden lets the
+// reads run then. Otherwise it skips the refresh until the clock reaches the
+// section, and when the section is still the attempt s recorded, that attempt
+// stands with reads_timed_out as its reason, and the next refresh is no
+// earlier than that attempt's next_refresh_after.
+func (s discoveryStart) hiddenOutcome(ahead time.Duration, stands bool) (string, []slog.Attr) {
+	switch {
+	case ahead > maxHiddenWait:
+		return "the next call tries again", nil
+	case stands:
+		next := s.at.Add(discoveryFailureWait).Format(time.RFC3339)
+		return fmt.Sprintf("the attempt recorded before the reads stands, with %s as its reason, and the "+
+				"next refresh is no earlier than %s", endpointcache.FailureReadsTimedOut, next),
+			[]slog.Attr{
+				log.String("stored_failure", string(endpointcache.FailureReadsTimedOut)),
+				log.String("next_refresh_after", next),
+			}
+	}
+	return "the next call skips the refresh until the clock reaches it", nil
+}
+
+// restoreBlocked reports whether restore would put the last_failure from
+// before s back, and the merge cannot record it, because the stored section is
+// dated ahead of the clock. The reads_timed_out that s stored then stays.
+func (s discoveryStart) restoreBlocked(view endpointcache.Stored, attempt *endpointcache.DiscoveryAttempt) bool {
+	return attempt != nil && attempt.Failure == "" && s.stands(view) && view.AttemptHidden()
+}
+
+// logKeptAttempt says that the reads answered and the reads_timed_out that
+// s stored before them stays, because the stored section is dated ahead of the
+// clock by ahead and the merge records nothing on it. It is logged at the
+// failure level, because the stored reason is not what happened.
+func (w *DiscoveryWorker) logKeptAttempt(ctx context.Context, ahead time.Duration, s discoveryStart) {
+	text, extra := s.hiddenOutcome(ahead, true)
+	w.logger.LogAttrs(ctx, endpointcache.Level(w.mode),
+		fmt.Sprintf("api endpoint discovery: the reads answered, but the stored discovery is dated ahead of the "+
+			"clock, so no attempt can replace the %s stored before the reads, which is not what happened; %s",
+			endpointcache.FailureReadsTimedOut, text),
+		append([]slog.Attr{log.String("file", w.store.FileName())}, extra...)...)
+}
+
 // answeringEndpoint returns the key's spelling of the configured endpoint that
 // answered the identity read, which is the evidence's source, and not the
 // endpoint whose answer began the refresh, because the reads walk the
@@ -660,14 +704,19 @@ func (w *DiscoveryWorker) answeringEndpoint(ctx context.Context, triggered strin
 // the start, with reads_timed_out as the stored reason, and the line says so.
 // Without one, the line promises no wait, since the next call asks again. A
 // failure that the merge could not record, because the stored section is
-// dated ahead of the clock, promises no wait either.
+// dated ahead of the clock, says what the next call does with that section,
+// as hiddenOutcome describes, and names the attempt that stands only when the
+// section is still the one start recorded.
 func (w *DiscoveryWorker) recordFailure(ctx context.Context, via string, cause error, start discoveryStart) {
 	failure := discoveryFailure(cause)
 	var prior endpointcache.DiscoveryFailure
-	var hidden bool
+	var hidden, stands bool
+	var ahead time.Duration
 	res, err := w.store.UpdatePayload(ctx, w.now(), func(view endpointcache.Stored) (endpointcache.Change, error) {
 		prior = start.priorView(view).LastFailure
 		hidden = view.AttemptHidden()
+		stands = start.stands(view)
+		ahead = view.DiscoveredAt.Sub(view.Now)
 		at := view.Now.UTC()
 		return endpointcache.Change{Attempt: &endpointcache.DiscoveryAttempt{
 			At: at, NextRefreshAfter: at.Add(discoveryFailureWait), Failure: failure,
@@ -704,10 +753,11 @@ func (w *DiscoveryWorker) recordFailure(ctx context.Context, via string, cause e
 			attrs...)
 		return
 	case hidden:
+		text, extra := start.hiddenOutcome(ahead, stands)
 		w.logger.LogAttrs(ctx, endpointcache.Level(w.mode),
-			fmt.Sprintf("api endpoint discovery: no result through %s, because %s; the attempt was not recorded, "+
-				"because the stored discovery is dated ahead of the clock, so the next call tries again", via, reason),
-			attrs...)
+			fmt.Sprintf("api endpoint discovery: no result through %s, because %s; the failure was not recorded, "+
+				"because the stored discovery is dated ahead of the clock, so %s", via, reason, text),
+			append(attrs, extra...)...)
 		return
 	}
 	level := endpointcache.Level(w.mode)
@@ -825,6 +875,10 @@ func (w *DiscoveryWorker) recordResult(
 		decision endpointcache.TrustDecision
 		decided  bool
 		sum      discoverySummary
+		// kept is set when the start's attempt cannot be replaced, because the
+		// stored section is dated ahead of the clock, and ahead is how far.
+		kept  bool
+		ahead time.Duration
 	)
 	res, err := w.store.UpdatePayload(ctx, w.now(), func(view endpointcache.Stored) (endpointcache.Change, error) {
 		d, err := endpointcache.DecideTrust(view, key, obs, view.Now)
@@ -838,6 +892,8 @@ func (w *DiscoveryWorker) recordResult(
 		}
 		change := d.Change
 		if change.Result == nil {
+			kept = start.restoreBlocked(view, change.Attempt)
+			ahead = view.DiscoveredAt.Sub(view.Now)
 			change.Attempt = start.restore(view, change.Attempt)
 		}
 		return change, nil
@@ -859,6 +915,9 @@ func (w *DiscoveryWorker) recordResult(
 		return
 	}
 	w.logDecision(ctx, decision, key.VerifySSL)
+	if kept {
+		w.logKeptAttempt(ctx, ahead, start)
+	}
 	if res.Written && decision.Change.Result != nil {
 		w.logDiscovery(ctx, sum, decision, reads, result, key.Endpoints[0])
 	}
