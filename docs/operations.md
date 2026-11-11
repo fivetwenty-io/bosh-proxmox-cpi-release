@@ -603,7 +603,7 @@ See [PVE Storage Locking](pve-storage-locking.md) for full lock mechanics.
 
 ### Resetting the endpoint cache
 
-We reset the cache when a finding tells us to, such as a cluster identity change that the CPI refused under `verify_ssl: false`, or when a node's certificate changed and the stored pins no longer fit. The files are plain JSON that we can read as `vcap`, and a file holds no secret. A reset costs one rediscovery and nothing else, so it is safe to do on a live Director.
+We reset the cache when a finding tells us to, such as a cluster identity change that the CPI refused under `verify_ssl: false`, or when a node's certificate changed and the stored pins no longer fit. The files are plain JSON that we can read as `vcap`. The cache files hold no credential, although the directory secret that signs them does. A reset costs one rediscovery and nothing else, so it is safe to do on a live Director.
 
 First we find the directory. The CPI chooses it in three layers, and the first layer that applies wins.
 
@@ -615,7 +615,7 @@ First we find the directory. The CPI chooses it in three layers, and the first l
 
 A Debug line at the start of a call names the choice, in the form `pve endpoints: cache directory <path>, beside the allocation journal directory`. We set `pve.log_level: debug` to see it, and `pve-cid ha` judges the same layers without creating anything.
 
-The directory holds these files, and the first three kinds belong to the endpoint cache.
+The directory holds these files, and the first two kinds belong to the endpoint cache.
 
 - `<host>-<16 hex characters>.json`
   The cache for one cluster. The name carries the first configured endpoint's host and a digest of the endpoint list, the TLS settings, the CA, and the credential. It holds the discovered nodes and their pins, the cluster identity, the down marks, and the cold-start hint.
@@ -649,13 +649,13 @@ What the CPI does next depends on what we removed.
   The next call starts with the configured endpoints and no discovered nodes, down marks, or cold-start hint. When discovery is on, the first configured endpoint to answer finds no file, so the CPI discovers in the background and writes a fresh file before the process exits, waiting up to 3 seconds for the write. The calls after that start with the discovered nodes. Under `verify_ssl: false` the first discovery is trust on first use again, so we reset only when we trust the network path to the seed.
 
 - The directory secret
-  The CPI creates a new one on the next call, and every cache file written under the old secret fails verification and is rebuilt. The log shows `endpoint cache: replaced the directory secret, which had the wrong length` only when a secret exists with the wrong length, and not after a plain removal.
+  The CPI creates a new one on the next call. A cache file's name depends on the secret, so the endpoint cache starts a new file under a new name, and the old file ages out after 30 days. The HA recovery episode record keeps its name, fails verification, and starts empty. The log shows `endpoint cache: replaced the directory secret, which had the wrong length` only when a secret exists with the wrong length, and not after a plain removal.
 
 - The HA recovery episode record
   A VM that is in HA recovery restarts its grace window. That delays the handover to BOSH and breaks nothing else.
 
-- A file the CPI cannot read or verify
-  The CPI ignores it, logs `endpoint cache: the cache file is not usable and is ignored` at Debug under `auto` and at Warn under `on`, and replaces it on the next write. We do not need to delete it by hand.
+- A file that is damaged, too large, or written by another release
+  The CPI ignores it, logs `endpoint cache: the cache file is not usable and is ignored` at Debug under `auto` and at Warn under `on`, and replaces it on the next write. We do not need to delete it by hand. A file with the wrong owner, a group or other permission bit, or a symbolic link in its place is different. The CPI runs that call without discovery and does not replace the file, so we remove it by hand.
 
 The CPI also removes cache files that nobody has touched for 30 days when it writes, so a changed endpoint list or CA leaves nothing behind for long.
 
@@ -722,7 +722,7 @@ Each finding is either a problem or advice. The command exits with 0 when the re
 - Leftovers and gaps
   `birth_tag_stale`, `readd_tag`, `off_mode_resource`, `off_mode_rule`, `guests_not_enumerated`, `cache_directory`, and `unchecked`.
 
-  The `cache_directory` advice covers the directory that holds the endpoint cache, the HA profile cache, and the HA recovery episode record. The CPI chooses it in layers, which are `pve.endpoint_cache_dir`, then `endpoint-cache` beside the allocation journal directory, then a per-user directory under the temporary directory that the CPI creates. The doctor asks the same question for each layer without creating anything, and it judges as the CPI's user, which it reads from the owner of the allocation journal directory, searching every directory the CPI would pass through. It reports an override that does not exist, is a symbolic link, is not a directory, or grants group or other access, and any layer that another user owns or that sits below a directory the CPI's user cannot search. It also says when it could not judge a layer. A refusal from a layer that applies leaves the CPI with no recovery record, so a grace window never starts and the dead-node handover cannot begin. A missing override sends the record to the next layer that works, and creating it later moves the record and restarts a running grace window once. [Troubleshooting](troubleshooting.md#the-ha-doctor-reports-a-cache-directory-problem) lists each refusal and its fix.
+  The `cache_directory` advice covers the directory that holds the endpoint cache, the HA profile cache, and the HA recovery episode record. The CPI chooses it in layers, which are `pve.endpoint_cache_dir`, then `endpoint-cache` beside the allocation journal directory, then a per-user directory under the temporary directory that the CPI creates. The doctor asks the same question for each layer without creating anything, and it judges as the CPI's user, which it reads from the owner of the allocation journal directory, searching every directory the CPI would pass through. It reports an override that does not exist, is a symbolic link, is not a directory, or grants group or other access, and any layer that another user owns or that sits below a directory the CPI's user cannot search. It also says when it could not judge a layer. A refusal from a layer that applies leaves the CPI with no recovery record, so a grace window never starts and the dead-node handover cannot begin. A missing override sends the record to the next layer that works, and creating it later moves the record and restarts a running grace window once. The endpoint cache and the HA profile cache do not fall back this way. With a missing override they run that call without a cache, and discovery is off for it. [Troubleshooting](troubleshooting.md#the-ha-doctor-reports-a-cache-directory-problem) lists each refusal and its fix.
 
 A `replicate` VM shows `replica_awaiting_sync` as advice while its job works but the pin has not yet widened. It shows `replica_not_recoverable` as a problem only when no usable job exists, the job is disabled, or the first sync is more than twice its schedule plus the clock-skew bound overdue. A schedule the doctor cannot measure, such as a weekday list, gets `replica_schedule_unjudged` and is never called stale or healthy.
 
@@ -999,7 +999,7 @@ Setting `bare` before the first upgrade to a stamping release skips steps 2 thro
 
 ### Cycling PVE nodes during a rolling upgrade
 
-When a cluster has more than one API endpoint for the CPI to try, we no longer repoint `pve.host` away from a node before we cycle it. An endpoint list in `pve.endpoints`, or the nodes that discovery adds to a single-host deployment that authenticates with an API token, gives the CPI somewhere else to go. A call that finds its first endpoint down walks to the next one, and every later request in that call starts on the endpoint that answered. With the default 5-second dial timeout and 10-second handshake timeout, a dead first endpoint costs a call a few seconds and not a failed deploy. [Endpoint Failover](endpoint-failover.md) covers how the CPI chooses an endpoint, and [Configuration](configuration.md) covers the properties.
+When a cluster has more than one API endpoint for the CPI to try, we no longer repoint `pve.host` away from a node before we cycle it. An endpoint list in `pve.endpoints`, or the nodes that discovery adds to a single-host deployment that authenticates with an API token, gives the CPI somewhere else to go. A call that finds its first endpoint down walks to the next one, and every later request in that call starts on the endpoint that answered. With the default 5-second dial timeout and 10-second handshake timeout, a dead first endpoint costs a call at most 15 seconds and not a failed deploy. [Endpoint Failover](endpoint-failover.md) covers how the CPI chooses an endpoint, and [Configuration](configuration.md) covers the properties.
 
 Two limits are worth knowing before we start the first node.
 
@@ -1013,7 +1013,7 @@ We still cycle one node at a time, and we wait for the cluster to be quorate bef
 
 ### Rolling back below endpoint lists
 
-Rolling back from 0.10.0 to 0.9.6 or earlier meets four facts, and we deal with the first two before we start.
+Rolling back to 0.9.6 from the release that adds endpoint lists meets four facts, and we deal with the first two before we start.
 
 1. A manifest without `pve.host` does not render on the older release.
 

@@ -2246,25 +2246,25 @@ These entries cover the Warn and Error lines that the endpoint pool, the discove
 **Symptom**
 
 ```text
-pve endpoint failover: pve1:8006 unreachable (dial tcp: i/o timeout), request sent to pve2:8006, which stays active for this call
+pve endpoint failover: pve1:8006 unreachable (dial tcp 192.0.2.11:8006: i/o timeout), request sent to pve2:8006, which stays active for this call
 ```
 
 The line is at Warn, and it appears once each time the active endpoint changes.
 
 **Diagnosis**
 
-The first endpoint failed before a connection existed, so the pool sent the request to the next one and kept that one active for the rest of the call. The text in parentheses is the failure, and the `class` field names the phase, which is `dial`, `dns`, `tls_handshake`, `tls_verify`, or `pin`. A node that is being upgraded or rebooted produces this line, and it is the pool doing its job.
+The first endpoint could not serve the request, so the pool sent it to the next one and kept that one active for the rest of the call. Most often the endpoint failed before a connection existed. A read can also move on after a response-header timeout, a transport error, or a 502, 503, or 595 answer. The text in parentheses is the failure, and the `class` field names it, which is `dial`, `dns`, `tls_handshake`, `tls_verify`, `pin`, `header_deadline`, `transport`, or `status`. A node that is being upgraded or rebooted produces this line, and it is the pool doing its job.
 
 **Fix**
 
-We do nothing when the node is down on purpose. Otherwise, we check the node's `pveproxy` and the route and firewall from the Director to its port 8006. A node that stays marked down is tried last by other processes for two minutes after the mark was written, and then first again.
+We do nothing when the node is down on purpose. Otherwise, we check the node's `pveproxy` and the route and firewall from the Director to its port 8006. A node that stays marked down is tried last by other processes for two minutes after the mark was written, and then goes back to its usual place in the order.
 
 ### A failover names a cold-start candidate
 
 **Symptom**
 
 ```text
-pve endpoint failover: pve1:8006 unreachable (dial tcp: i/o timeout) and no cached nodes, request sent to pve2.dc1.example.com:8006 from placement.az_map after it proved membership
+pve endpoint failover: pve1:8006 unreachable (dial tcp 192.0.2.11:8006: i/o timeout) and no cached nodes, request sent to pve2.dc1.example.com:8006 from placement.az_map after it proved membership
 ```
 
 **Diagnosis**
@@ -2344,14 +2344,14 @@ We keep the log and report it as a bug.
 **Symptom**
 
 ```text
-no Proxmox endpoint answered (pve1:8006: dial timeout; pve2:8006: connection refused; pve3:8006: certificate pin mismatch)
+no Proxmox endpoint answered (pve1:8006: dial tcp 192.0.2.11:8006: i/o timeout; pve2:8006: dial tcp 192.0.2.12:8006: connect: connection refused; pve3:8006: net/http: TLS handshake timeout)
 ```
 
 This text arrives through the call's own error at Error level. A walk that has nothing to try says `no Proxmox endpoint was eligible to try`.
 
 **Diagnosis**
 
-Every hop of the walk failed in the connect phase or on the response-header deadline, and the error lists each endpoint with its cause. The error unwraps to a dial error, so the CPI's retry helpers treat it as a transient connection fault and try again. When every hop failed certificate verification, it unwraps to the certificate error instead, and the SDK stops at once. A walk where every endpoint refuses connections ends in about 45 seconds, and one that includes endpoints that accept TLS and never answer can take up to about 165 seconds.
+Every hop of the walk failed in the connect phase or on the response-header deadline, and the error lists each endpoint with its cause. The error unwraps to a dial error, so the CPI's retry helpers treat it as a transient connection fault and try again. When every hop failed certificate verification, it unwraps to the certificate error instead, and the SDK stops at once. A refused connection fails at once. A walk where every endpoint drops connection attempts or stalls the handshake ends in at most about 45 seconds, because each hop spends at most 15 seconds connecting and the walk starts no new hop after 30 seconds of connecting. A walk that includes endpoints that accept TLS and never answer can take up to about 165 seconds, because a hop can wait 60 seconds for response headers and the walk starts no new hop after 90 seconds. The last hop of a walk has no header deadline, so a walk whose last endpoint accepts TLS and never answers waits for the 30-minute client timeout.
 
 **Fix**
 
@@ -2369,7 +2369,7 @@ The line is at Error and appears once per endpoint per call. When no other endpo
 
 **Diagnosis**
 
-The operator's trust settings vouched for this endpoint, and its certificate did not verify. The common causes are a name that the certificate does not cover, a certificate renewed under a different CA, and a host that is not the node we think it is. Because the walk moves on, the deploy can keep running, which is why the line is an Error. It can also mean someone is intercepting the connection.
+The operator's trust settings vouched for this endpoint, and its certificate did not verify. The common causes are a name that the certificate does not cover, a certificate renewed under a different CA, and a host that is not the node we think it is. The walk moves on, so the deploy can keep running. The line is still an Error, because the failure can mean someone is intercepting the connection.
 
 **Fix**
 
@@ -2457,7 +2457,7 @@ pve endpoint pve1:8006: the first-answer hook panicked, so discovery may not sta
 
 **Diagnosis**
 
-The first panic in the life of the process is at Warn, and later ones are at Debug. The pool recovered, so the request was not affected. The cost is a refused candidate, a down mark that was not written, or a discovery refresh that did not start.
+The first panic of each kind of hook in a call is at Warn, and later ones of that kind are at Debug. The pool recovered, so the request was not affected. The cost is a refused candidate, a down mark that was not written, or a discovery refresh that did not start.
 
 **Fix**
 
@@ -2474,7 +2474,7 @@ We keep the log and report it as a bug.
 The CPI keeps the endpoint cache, the HA profile cache, and the HA recovery episode record in one cache directory. It chooses the directory in layers. The first is `pve.endpoint_cache_dir`, the next is `endpoint-cache` beside the allocation journal directory when that exists, and the last is `pve_cpi-endpoint-cache.<uid>` under the CPI's temporary directory, which the CPI creates itself. The doctor asks the same question for every layer without creating anything. It judges as the CPI's user, which it reads from the owner of the allocation journal directory, and it checks every directory the CPI would search on the way. A refusal from a layer that applies ends the search. The CPI then keeps no HA recovery record, a grace window never starts, and the dead-node handover cannot begin. The advice means one of these.
 
 - The override does not exist.
-  The record goes to the next layer that works, and creating the override later moves the record and restarts a running grace window once. When no layer works, the finding says the CPI keeps no record.
+  The record goes to the next layer that works, the CPI logs a Warn line that begins `ha episode: pve.endpoint_cache_dir does not exist`, and creating the override later moves the record and restarts a running grace window once. When no layer works, the finding says the CPI keeps no record. The endpoint cache and the HA profile cache do not fall back, so with a missing override they run without a cache and discovery is off for the call.
 
 - The override is a symbolic link, is not a directory, or grants group or other access.
   The CPI refuses it. We point the setting at the directory itself, or run `chmod 0700` on it.
@@ -2507,9 +2507,9 @@ The text after `off:` can also be `cache directory <path> could not be opened: <
 
 **Diagnosis**
 
-The CPI could not use its cache directory or its cache file, so the call ran without discovery and without the cache. The call itself is not affected, because the configured endpoints still work. The example shows the usual cause, which is a directory owned by another user. A CPI command run once as root, such as a hand-run call over SSH, can leave a root-owned directory in the temporary layer. The other causes are a group or other permission bit on the directory, a symbolic link where the directory should be, and a file that the CPI's user cannot read.
+The CPI could not use its cache directory or its cache file, so the call ran without discovery and without the cache. The call itself is not affected, because the configured endpoints still work. The example shows the usual cause, which is a directory owned by another user. The directory's name carries the user ID, so a directory that another user owns usually means someone created or restored it by hand, for example by extracting a backup as root. The other causes are a group or other permission bit on the directory, a symbolic link where the directory should be, and a file that the CPI's user cannot read.
 
-One variant stays at Debug whatever the mode, and it reads `api endpoint discovery off: the exit drain has started, so the call runs without the cache`. The process was already exiting, so nothing is wrong. Two more Debug lines say why `auto` turned discovery off before any directory was opened. They read `api_endpoint_discovery is auto and the CPI logs in with a password, so endpoint discovery is off` and `this entry inherits the job's credentials and sets looser TLS than the job, so endpoint discovery is off`.
+One variant stays at Debug whatever the mode, and it reads `api endpoint discovery off: the exit drain has started, so the call runs without the cache`. The process was already exiting, so nothing is wrong. Two more Debug lines say why `auto` turned discovery off before any directory was opened. The first begins `api_endpoint_discovery is auto and the CPI logs in with a password, so endpoint discovery is off`, and it goes on to say how to turn discovery on. The second reads `this entry inherits the job's credentials and sets looser TLS than the job, so endpoint discovery is off`.
 
 **Fix**
 
@@ -2527,7 +2527,7 @@ The line carries `file` and `err` fields. It is at Warn under `on` and at Debug 
 
 **Diagnosis**
 
-The file failed validation. It may be damaged, written by a different release, signed under another directory secret or credential, or too large, since a cache file holds at most 64 KiB and 64 nodes. The CPI ignored it and ran with the configured endpoints. The next successful write replaces it. A new credential makes every old file unusable on purpose, and the CPI writes a new file under a new name for a changed endpoint list.
+The file failed validation. It may be damaged, edited by hand, written by a different release, or too large, since a cache file holds at most 64 KiB and 64 nodes. The CPI ignored it and ran with the configured endpoints. The next successful write replaces it. A changed credential, endpoint list, TLS setting, or CA gives a different file name, so the old file is never read and does not cause this line. A file with the wrong owner, a group or other permission bit, or a symbolic link in its place is not this case. It turns discovery off for the call, as [Discovery is off for this call](#discovery-is-off-for-this-call) describes.
 
 **Fix**
 
@@ -2545,7 +2545,7 @@ The line is always at Warn, and it carries the secret's path in a `path` field.
 
 **Diagnosis**
 
-The directory's `secret` file existed but did not hold a secret of the right length, perhaps because a disk filled or someone edited it. The CPI wrote a new secret, so every file signed under the old one fails verification and is rebuilt on the next write. Nothing else is lost. A secret that is simply missing is created without this line.
+The directory's `secret` file existed but did not hold a secret of the right length, perhaps because a disk filled or someone edited it. The CPI wrote a new secret. A cache file's name depends on the secret, so the endpoint cache starts a new file under a new name and the old one ages out after 30 days, and the HA recovery episode record fails verification and starts empty. Nothing else is lost. A secret that is simply missing is created without this line.
 
 **Fix**
 
@@ -2570,7 +2570,7 @@ The line carries `file` and `outcome` fields. It is at Info the first time the o
 - `no node of the 3 that cluster 3c5e1b7d lists via pve1:8006 is a usable candidate`
   The `outcome` is `no_candidates`.
 
-A result that found nodes but had no cluster status reads `api endpoint discovery: cached 2 of 3 nodes of cluster 3c5e1b7d via pve1:8006 (no cluster status)`. That line is at Debug under `auto` and Warn under `on`, unless the nodes or the identity changed.
+A result that found nodes but had no cluster status reads `api endpoint discovery: cached 2 of 3 nodes of cluster 3c5e1b7d via pve1:8006 (no cluster status)`. That line is at Debug under `auto` and Warn under `on`, unless the nodes, the identity, or the outcome changed, or the last refresh failed, and then it is at Info.
 
 **Diagnosis**
 
@@ -2676,7 +2676,7 @@ endpoint cache: the down mark could not be recorded
 endpoint cache: the cold-start hint could not be recorded
 ```
 
-The first line carries `file` and `err`. The second carries `file` and `wait`, and it has no colon after `endpoint cache`. The third carries `endpoint` and `err`. The fourth carries `node` and `err`. Each is at Debug under `auto` and Warn under `on`.
+The first line carries `file` and `err`. The second carries `file` and `wait`, and it has no colon after `endpoint cache`. For the HA profile cache it begins `HA profile cache lock wait expired` instead. The third carries `endpoint` and `err`. The fourth carries `node` and `err`. Each is at Debug under `auto` and Warn under `on`.
 
 **Diagnosis**
 
