@@ -53,7 +53,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     container:
       # Digest-pinned golang:1.27 (self-hosted runner has no build tools on the host)
-      image: golang:1.27@sha256:2920bb124f1a2e12a1d39f0cab756ae0068441ee1da7655dec7f5e374944095b
+      image: golang:1.27@sha256:08bcb99a38f85a265f9a93d1d3323e2440eec333380f3ea26ee0dec9264bb41c
       # The container filesystem is fresh on every job, so the Go module and
       # build caches would start cold. These are host paths rather than the
       # Actions cache service: on a persistent self-hosted runner, restoring a
@@ -141,7 +141,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     container:
       # Same digest-pinned image as the check job; the runner host has no git.
-      image: golang:1.27@sha256:2920bb124f1a2e12a1d39f0cab756ae0068441ee1da7655dec7f5e374944095b
+      image: golang:1.27@sha256:08bcb99a38f85a265f9a93d1d3323e2440eec333380f3ea26ee0dec9264bb41c
 
     steps:
       - name: Checkout the commit graph
