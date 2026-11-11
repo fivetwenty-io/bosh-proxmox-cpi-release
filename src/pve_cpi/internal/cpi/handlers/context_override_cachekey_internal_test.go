@@ -705,11 +705,43 @@ func TestRequestOverrideCacheKey_PlacementOwnershipKeysAsBeforeWhenItDecidesNoth
 			}
 		})
 	}
-	t.Run("an entry that names nothing", func(t *testing.T) {
-		t.Parallel()
-		eff := entry(map[string]any{"pve_vm_storage": "other"})
-		if eff.PlacementNamedByEntry() {
-			t.Fatal("the entry names no placement, so the flag must be down")
-		}
-	})
+	// Neither entry has a CA, so the hash is deterministic. The pinned keys
+	// are what a build before the ownership flag produced for the same
+	// configs, so a key line written for either entry fails here.
+	for name, tc := range map[string]struct {
+		extra map[string]any
+		named bool
+		key   string
+	}{
+		"an entry that names nothing": {
+			extra: map[string]any{"pve_vm_storage": "other"},
+			key:   "1c85a5a21eb7d78b8335699731a4dba3d3baa3c7d822d35c90ab71da1711b5b2",
+		},
+		"a named entry the cold start cannot use": {
+			extra: map[string]any{
+				"pve_host": "pve-b.example", "pve_api_token": "u@pve!cpi=own", "pve_placement": placement,
+			},
+			named: true,
+			key:   "3478059b2c7311e485584361be8c78039cdbacd1cf5c2113bc305c86610ca863",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			noCAJob := discoveryEffectiveJob()
+			noCAJob.Placement = &config.PlacementConfig{AZMap: map[string][]string{"az1": {"pve1"}}}
+			eff, _, _, err := config.ApplyContextOverrides(noCAJob, tc.extra)
+			if err != nil {
+				t.Fatalf("ApplyContextOverrides(%v): %v", tc.extra, err)
+			}
+			if eff.PlacementNamedByEntry() != tc.named {
+				t.Fatalf("PlacementNamedByEntry = %v, want %v", eff.PlacementNamedByEntry(), tc.named)
+			}
+			if got := config.ColdStartNodeNames(eff, noCAJob); got != nil {
+				t.Fatalf("cold-start names = %v, want none, or the case proves nothing", got)
+			}
+			if got := requestOverrideCacheKey(eff); got != tc.key {
+				t.Errorf("key = %s, want %s", got, tc.key)
+			}
+		})
+	}
 }
