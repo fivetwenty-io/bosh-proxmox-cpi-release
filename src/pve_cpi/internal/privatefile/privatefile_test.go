@@ -919,6 +919,7 @@ func TestEUIDHookSetsTheRequiredOwner(t *testing.T) {
 
 func TestEUIDHookIsNeverSetByProductionCode(t *testing.T) {
 	var offenders []string
+	seen := map[string]bool{}
 	err := filepath.WalkDir(filepath.Join("..", ".."), func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -936,6 +937,7 @@ func TestEUIDHookIsNeverSetByProductionCode(t *testing.T) {
 		if err != nil {
 			return err
 		}
+		seen[filepath.ToSlash(path)] = true
 		if setsEUIDHook(file) {
 			offenders = append(offenders, path)
 		}
@@ -944,6 +946,13 @@ func TestEUIDHookIsNeverSetByProductionCode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The walk must reach the whole module, so a move of this package can't
+	// shrink it to a tree that holds none of the production callers.
+	for _, want := range []string{"../../cmd/cpi/main.go", "../../internal/privatefile/privatefile.go"} {
+		if !seen[want] {
+			t.Fatalf("the walk from ../.. did not reach %s; it parsed %d files", want, len(seen))
+		}
+	}
 	if len(offenders) > 0 {
 		t.Errorf("non-test sources set the Policy.EUID test hook: %v", offenders)
 	}
@@ -951,13 +960,16 @@ func TestEUIDHookIsNeverSetByProductionCode(t *testing.T) {
 
 // setsEUIDHook reports whether the file names an EUID field in a composite
 // literal other than an UnsafePathError, which reports an EUID and has no
-// hook, or assigns to a selector named EUID.
+// hook, builds a Policy positionally, which could fill the EUID slot, or
+// assigns to a selector named EUID.
 func setsEUIDHook(file *ast.File) bool {
 	found := false
 	ast.Inspect(file, func(n ast.Node) bool {
 		switch node := n.(type) {
 		case *ast.CompositeLit:
-			if literalTypeName(node.Type) != "UnsafePathError" && literalNamesEUID(node) {
+			name := literalTypeName(node.Type)
+			keyed := name != "UnsafePathError" && literalNamesEUID(node)
+			if keyed || name == "Policy" && literalIsPositional(node) {
 				found = true
 			}
 		case *ast.AssignStmt:
@@ -979,6 +991,17 @@ func literalNamesEUID(lit *ast.CompositeLit) bool {
 			if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "EUID" {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// literalIsPositional reports whether a composite literal has an element
+// without a key.
+func literalIsPositional(lit *ast.CompositeLit) bool {
+	for _, elt := range lit.Elts {
+		if _, ok := elt.(*ast.KeyValueExpr); !ok {
+			return true
 		}
 	}
 	return false
