@@ -49,10 +49,14 @@ func (p Policy) PrivateInfo(path string, info os.FileInfo, directory bool) error
 	return p.privateStat(path, st, info.Mode(), directory)
 }
 
-// effectiveUID is the user that must own a private path.
+// effectiveUID is the user that must own a private path. The test hook comes
+// first, then the user JudgedAs names, and then the effective user.
 func (p Policy) effectiveUID() int {
 	if p.EUID != nil {
 		return p.EUID()
+	}
+	if p.judged {
+		return p.judgedUID
 	}
 	return os.Geteuid()
 }

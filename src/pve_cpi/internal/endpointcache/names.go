@@ -50,6 +50,11 @@ type texts struct {
 	// policy checks the directory, the lock files, and, with its limits
 	// extended, the secret and the cache file.
 	policy privatefile.Policy
+
+	// judged and judgedUID name the user a probe judges as, which the policy
+	// also carries. Options.texts sets them.
+	judged    bool
+	judgedUID int
 }
 
 // endpointTexts are the endpoint cache's texts.

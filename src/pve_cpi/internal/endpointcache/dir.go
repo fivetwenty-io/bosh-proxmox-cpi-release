@@ -52,6 +52,39 @@ type Options struct {
 	// Resolve asks its own journal check first, so a guard here adds to that
 	// check and never replaces it. It is a pointer, so Options stays comparable.
 	Guard PathGuard
+
+	// judge, when set, names the user the private checks require as the owner
+	// in place of the effective user. Only ProbeAs sets it.
+	judge judgement
+}
+
+// judgement names the user a probe judges a directory as.
+type judgement struct {
+	set bool
+	uid int
+}
+
+// texts returns the texts of the store opts names, with the private checks
+// judging as the user opts.judge names when it is set.
+func (opts Options) texts() *texts {
+	t := textsFor(opts.DisplayName)
+	if !opts.judge.set {
+		return t
+	}
+	judged := *t
+	judged.policy = t.policy.JudgedAs(opts.judge.uid)
+	judged.judgedUID = opts.judge.uid
+	judged.judged = true
+	return &judged
+}
+
+// ownerUID is the user the private checks of t require as the owner: the user
+// a probe judges as, or else the effective user.
+func (t *texts) ownerUID() int {
+	if t.judged {
+		return t.judgedUID
+	}
+	return os.Geteuid()
 }
 
 // PathGuard rules out a path before a layer creates it. A caller sets one to
@@ -189,13 +222,13 @@ func overrideLayer(opts Options) (Choice, bool) {
 	if opts.Override == "" {
 		return Choice{}, false
 	}
-	t := textsFor(opts.DisplayName)
+	t := opts.texts()
 	choice := Choice{Layer: LayerOverride, Path: opts.Override}
 	if filepath.Clean(opts.Override) != opts.Override {
 		// No inode was examined, so the owner is unknown.
 		choice.Err = &Refusal{Layer: LayerOverride, Path: opts.Override, Err: &unsafeDirectory{
 			unsafe: &privatefile.UnsafePathError{
-				Path: opts.Override, UID: -1, EUID: os.Geteuid(), WantDirectory: true, Cause: t.fileType,
+				Path: opts.Override, UID: -1, EUID: t.ownerUID(), WantDirectory: true, Cause: t.fileType,
 			},
 			text: fmt.Sprintf("%v: %s is not a clean path", t.fileType, opts.Override),
 		}}
@@ -234,7 +267,7 @@ func journalLayer(opts Options) (Choice, bool) {
 			"the allocation journal directory %s is itself named %s, so the name beside it is not free",
 			journal, JournalSiblingName))
 	}
-	t := textsFor(opts.DisplayName)
+	t := opts.texts()
 	choice := Choice{Layer: LayerJournal, Path: filepath.Join(filepath.Dir(journal), JournalSiblingName)}
 	if _, err := os.Lstat(choice.Path); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -251,7 +284,7 @@ func journalLayer(opts Options) (Choice, bool) {
 
 // temporaryLayer uses pve_cpi-endpoint-cache.<euid> under os.TempDir().
 func temporaryLayer(opts Options) (Choice, bool) {
-	return textsFor(opts.DisplayName).temporaryLayerGuarded(os.TempDir(), os.Mkdir, opts.Guard)
+	return opts.texts().temporaryLayerGuarded(os.TempDir(), os.Mkdir, opts.Guard)
 }
 
 // temporaryLayerIn creates only the last component, with mkdir at mode 0700, so
@@ -269,7 +302,7 @@ func (t *texts) temporaryLayerIn(tempDir string, mkdir func(string, os.FileMode)
 func (t *texts) temporaryLayerGuarded(
 	tempDir string, mkdir func(string, os.FileMode) error, guard PathGuard,
 ) (Choice, bool) {
-	path := filepath.Join(tempDir, temporaryName+strconv.Itoa(os.Geteuid()))
+	path := filepath.Join(tempDir, temporaryName+strconv.Itoa(t.ownerUID()))
 	choice := Choice{Layer: LayerTemporary, Path: path}
 	if !filepath.IsAbs(tempDir) {
 		choice.Err = &Refusal{
@@ -358,7 +391,7 @@ func (t *texts) ownerAccess(path string, info os.FileInfo) error {
 	}
 	return &unsafeDirectory{
 		unsafe: &privatefile.UnsafePathError{
-			Path: path, UID: os.Geteuid(), EUID: os.Geteuid(), Mode: info.Mode(), WantDirectory: true, Cause: t.mode,
+			Path: path, UID: t.ownerUID(), EUID: t.ownerUID(), Mode: info.Mode(), WantDirectory: true, Cause: t.mode,
 		},
 		text: fmt.Sprintf("%v: %s has mode %04o and its owner needs read, write, and search access",
 			t.mode, path, info.Mode().Perm()),
@@ -392,7 +425,7 @@ var probeLayers = []layer{
 // does not exist yet is refused with a cause that matches os.ErrNotExist,
 // which a caller reads as "the CPI creates it on first use".
 func probeTemporaryLayer(opts Options) (Choice, bool) {
-	return textsFor(opts.DisplayName).temporaryLayerGuarded(os.TempDir(), probeMkdir, opts.Guard)
+	return opts.texts().temporaryLayerGuarded(os.TempDir(), probeMkdir, opts.Guard)
 }
 
 // probeMkdir stands in for mkdir. It answers as mkdir would for a name that
@@ -415,4 +448,19 @@ func probeMkdir(path string, _ os.FileMode) error {
 func Probe(opts Options) Choice {
 	opts.Guard = guardJournal(opts.JournalDir, opts.Guard)
 	return refuseJournalOverlap(resolveWith(probeLayers, opts), opts.JournalDir)
+}
+
+// ProbeAs is Probe judged as uid. The private checks require uid as the owner
+// of the directory in place of the effective user, and the temporary layer
+// looks for the directory that uid's processes use under this process's
+// temporary directory. It answers what a CPI running as uid would decide for
+// the override and the directory beside the journal, so a diagnostic that runs
+// as root does not report a directory the CPI's own user owns as refused. Like
+// Probe it never creates anything. The CPI never calls it, because a choice
+// judged as another user is not one the CPI may use, and a guard test fails
+// when a non-test source outside the diagnostic calls it. The caller closes a
+// usable choice.
+func ProbeAs(opts Options, uid int) Choice {
+	opts.judge = judgement{set: true, uid: uid}
+	return Probe(opts)
 }

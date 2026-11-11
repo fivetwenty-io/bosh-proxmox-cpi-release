@@ -91,6 +91,24 @@ type Policy struct {
 	// cannot create. A test in this package fails when a non-test source
 	// sets it.
 	EUID func() int
+
+	// judged and judgedUID are set by JudgedAs, and name the user a private
+	// path must belong to in place of the effective user.
+	judged    bool
+	judgedUID int
+}
+
+// JudgedAs returns p with uid in place of the effective user as the owner that
+// a private path must have. It answers what the checks would decide for a
+// process running as uid, so a diagnostic that runs as root can judge a
+// directory the way the CPI's own user would. It never loosens the checks of a
+// process that uses the policy it was given, because it returns a copy, and a
+// test in this package fails when a non-test source other than the cache
+// directory's probe calls it.
+func (p Policy) JudgedAs(uid int) Policy {
+	p.judged = true
+	p.judgedUID = uid
+	return p
 }
 
 var integrityKeyPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)

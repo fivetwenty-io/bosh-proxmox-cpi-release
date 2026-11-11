@@ -1070,7 +1070,7 @@ func TestEUIDHookSetsTheRequiredOwner(t *testing.T) {
 }
 
 func TestEUIDHookIsNeverSetByProductionCode(t *testing.T) {
-	var offenders []string
+	var offenders, judges []string
 	seen := map[string]bool{}
 	err := filepath.WalkDir(filepath.Join("..", ".."), func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -1093,6 +1093,9 @@ func TestEUIDHookIsNeverSetByProductionCode(t *testing.T) {
 		if setsEUIDHook(file) {
 			offenders = append(offenders, path)
 		}
+		if filepath.ToSlash(path) != judgedAsCaller && callsJudgedAs(file) {
+			judges = append(judges, path)
+		}
 		return nil
 	})
 	if err != nil {
@@ -1107,6 +1110,73 @@ func TestEUIDHookIsNeverSetByProductionCode(t *testing.T) {
 	}
 	if len(offenders) > 0 {
 		t.Errorf("non-test sources set the Policy.EUID test hook: %v", offenders)
+	}
+	if len(judges) > 0 {
+		t.Errorf("non-test sources other than %s call Policy.JudgedAs: %v", judgedAsCaller, judges)
+	}
+}
+
+// judgedAsCaller is the one non-test source that may call Policy.JudgedAs. It
+// holds the cache directory's probe, which judges a directory as the CPI's
+// user for a diagnostic and never opens a directory for the CPI's own use.
+const judgedAsCaller = "../../internal/endpointcache/dir.go"
+
+// callsJudgedAs reports whether the file calls a method named JudgedAs.
+func callsJudgedAs(file *ast.File) bool {
+	found := false
+	ast.Inspect(file, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "JudgedAs" {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+func TestCallsJudgedAsFindsACall(t *testing.T) {
+	for src, want := range map[string]bool{
+		"package p\nfunc f(p Policy) { _ = p.JudgedAs(0) }": true,
+		"package p\nfunc f(p Policy) { _ = p.Label }":       false,
+	} {
+		file, err := parser.ParseFile(token.NewFileSet(), "src.go", src, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := callsJudgedAs(file); got != want {
+			t.Errorf("callsJudgedAs(%q) = %v, want %v", src, got, want)
+		}
+	}
+}
+
+// A policy judged as another user refuses a path the effective user owns, and
+// accepts it when judged as that user, so the owner the checks want is the one
+// JudgedAs names. The policy it was called on keeps the effective user.
+func TestJudgedAsNamesTheOwnerTheChecksWant(t *testing.T) {
+	dir := t.TempDir()
+	info, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if info, err = os.Lstat(dir); err != nil {
+		t.Fatal(err)
+	}
+	p := Policy{Label: "judged"}
+	other := p.JudgedAs(os.Geteuid() + 1)
+	var unsafe *UnsafePathError
+	if err := other.PrivateInfo(dir, info, true); !errors.As(err, &unsafe) ||
+		!errors.Is(err, ErrUnsafeOwnership) || unsafe.EUID != os.Geteuid()+1 {
+		t.Fatalf("judged as another user: %v, want an ownership refusal that names that user", err)
+	}
+	if err := p.JudgedAs(os.Geteuid()).PrivateInfo(dir, info, true); err != nil {
+		t.Fatalf("judged as the owner: %v", err)
+	}
+	if err := p.PrivateInfo(dir, info, true); err != nil {
+		t.Fatalf("the policy JudgedAs was called on must keep the effective user: %v", err)
 	}
 }
 

@@ -1053,11 +1053,191 @@ func TestCacheOwnerNoteSaysWhoRanTheCheck(t *testing.T) {
 	owner := &endpointcache.Refusal{Layer: endpointcache.LayerOverride, Path: "/x", Err: &privatefile.UnsafePathError{
 		Path: "/x", UID: 1234, EUID: 0, Cause: privatefile.ErrUnsafeOwnership, WantDirectory: true,
 	}}
-	if got := cacheOwnerNote(owner); !strings.Contains(got, "uid 0") || !strings.Contains(got, "CPI's user") {
+	unknown := cacheJudge{uid: 0, doctor: 0}
+	if got := unknown.ownerNote(owner); !strings.Contains(got, "uid 0") || !strings.Contains(got, "CPI's user") {
 		t.Errorf("owner note = %q", got)
 	}
+	known := cacheJudge{uid: 1000, known: true, doctor: 0}
+	if got := known.ownerNote(owner); !strings.Contains(got, "uid 1000") ||
+		!strings.Contains(got, "owns the allocation journal directory") {
+		t.Errorf("owner note with the CPI's user known = %q", got)
+	}
 	mode := &endpointcache.Refusal{Err: &privatefile.UnsafePathError{Cause: privatefile.ErrUnsafeMode}}
-	if got := cacheOwnerNote(mode); got != "" {
+	if got := known.ownerNote(mode); got != "" {
 		t.Errorf("a mode refusal needs no owner note, got %q", got)
+	}
+}
+
+// cacheFindingsAs runs the cache directory checks for cfg with the doctor
+// running as doctor.
+func cacheFindingsAs(cfg *config.CPIConfig, doctor int) *haReport {
+	c := &haCollector{cfg: cfg, euid: doctor, rep: &haReport{Findings: []haFinding{}}}
+	c.cacheDirectoryFindings()
+	return c.rep
+}
+
+// otherDoctor is a user the test process is not, standing in for the doctor
+// running as root while the files belong to the CPI's user, which here is the
+// test's own user.
+func otherDoctor(t *testing.T) int {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("the test needs to run as a user other than root, so root can stand in for the doctor")
+	}
+	return 0
+}
+
+// The doctor usually runs as root, and the private checks require the user
+// that runs them as the owner. It judges as the owner of the allocation
+// journal directory, which is the CPI's user, so a healthy directory that user
+// owns gives no finding, and a real refusal is still reported.
+func TestCollectJudgesTheCacheDirectoryAsTheCPIsUser(t *testing.T) {
+	doctor := otherDoctor(t)
+	t.Setenv("TMPDIR", t.TempDir())
+
+	t.Run("private journal sibling owned by the CPI's user", func(t *testing.T) {
+		journal, _ := journalCacheLayout(t, 0o700)
+		makeDir(t, journal)
+		cfg := haCfg("auto", "none")
+		cfg.StorageAllocationJournalDir = journal
+		wantNone(t, cacheFindingsAs(cfg, doctor), haKindCacheDirectory)
+	})
+
+	t.Run("private override owned by the CPI's user", func(t *testing.T) {
+		journal, _ := journalCacheLayout(t, 0)
+		makeDir(t, journal)
+		override := filepath.Join(t.TempDir(), "cache")
+		makeDir(t, override)
+		cfg := haCfg("auto", "none")
+		cfg.StorageAllocationJournalDir = journal
+		cfg.EndpointCacheDir = override
+		wantNone(t, cacheFindingsAs(cfg, doctor), haKindCacheDirectory)
+	})
+
+	t.Run("journal sibling with a wide mode", func(t *testing.T) {
+		journal, sibling := journalCacheLayout(t, 0o755)
+		makeDir(t, journal)
+		cfg := haCfg("auto", "none")
+		cfg.StorageAllocationJournalDir = journal
+		want(t, cacheFindingsAs(cfg, doctor), haKindCacheDirectory, haSeverityAdvice, sibling, "mode 0755",
+			"dead-node handover cannot start")
+	})
+}
+
+// The temporary directory's name carries the user it belongs to, and it sits
+// under the CPI's own temporary directory, so a doctor that is not the CPI's
+// user says nothing about it. One that is the CPI's user still reports it.
+func TestCollectLeavesTheTemporaryDirectoryToTheCPIsUser(t *testing.T) {
+	doctor := otherDoctor(t)
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	for _, uid := range []int{doctor, os.Geteuid()} {
+		path := filepath.Join(tmp, "pve_cpi-endpoint-cache."+itoa(uid))
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o755); err != nil { //nolint:gosec // the test makes the directory unsafe
+			t.Fatal(err)
+		}
+	}
+	journal, _ := journalCacheLayout(t, 0)
+	makeDir(t, journal)
+	withJournal := haCfg("auto", "none")
+	withJournal.StorageAllocationJournalDir = journal
+
+	wantNone(t, cacheFindingsAs(withJournal, doctor), haKindCacheDirectory)
+	wantNone(t, cacheFindingsAs(haCfg("auto", "none"), doctor), haKindCacheDirectory)
+	want(t, cacheFindingsAs(withJournal, os.Geteuid()), haKindCacheDirectory, haSeverityAdvice,
+		"pve_cpi-endpoint-cache."+itoa(os.Geteuid()), "mode 0755")
+}
+
+// With no journal to name the CPI's user, a directory that fails only because
+// another user owns it is judged again as its owner. It passes, so the finding
+// says the CPI uses it only when it runs as that owner, and does not call it
+// refused.
+func TestCollectJudgesAnOverrideAsItsOwnerWhenTheCPIsUserIsUnknown(t *testing.T) {
+	doctor := otherDoctor(t)
+	t.Setenv("TMPDIR", t.TempDir())
+	override := filepath.Join(t.TempDir(), "cache")
+	makeDir(t, override)
+	cfg := haCfg("auto", "none")
+	cfg.EndpointCacheDir = override
+	r := cacheFindingsAs(cfg, doctor)
+	owner := "uid " + itoa(os.Geteuid())
+	want(t, r, haKindCacheDirectory, haSeverityAdvice, override, "owned by "+owner, "ran as uid 0",
+		"confirm "+owner+" is the CPI's user")
+	if got := findings(r, haKindCacheDirectory)[0].Detail; strings.Contains(got, "refused") {
+		t.Errorf("a directory that passes for its owner must not read as refused: %q", got)
+	}
+
+	wide := filepath.Join(t.TempDir(), "cache")
+	makeDir(t, wide)
+	if err := os.Chmod(wide, 0o750); err != nil { //nolint:gosec // the test makes the directory unsafe
+		t.Fatal(err)
+	}
+	cfg.EndpointCacheDir = wide
+	want(t, cacheFindingsAs(cfg, doctor), haKindCacheDirectory, haSeverityAdvice, wide, "mode 0750")
+}
+
+// A missing override falls back to the layers after it, and the fallback is
+// judged the same way. A sibling beside a journal that does not exist yet
+// leaves the CPI's user unknown, so it is judged as its owner, and a temporary
+// directory a root doctor cannot judge is named as where the record goes.
+func TestCollectJudgesTheFallbackOfAMissingOverrideAsTheCPIsUser(t *testing.T) {
+	doctor := otherDoctor(t)
+	t.Setenv("TMPDIR", t.TempDir())
+	missing := filepath.Join(t.TempDir(), "absent")
+
+	t.Run("sibling of a journal that does not exist yet", func(t *testing.T) {
+		journal, sibling := journalCacheLayout(t, 0o700)
+		cfg := haCfg("auto", "none")
+		cfg.EndpointCacheDir = missing
+		cfg.StorageAllocationJournalDir = journal
+		r := cacheFindingsAs(cfg, doctor)
+		want(t, r, haKindCacheDirectory, haSeverityAdvice, missing, "beside the allocation journal",
+			"owned by uid "+itoa(os.Geteuid()), "ran as uid 0")
+		if got := findings(r, haKindCacheDirectory)[0].Detail; strings.Contains(got, "cannot be used") {
+			t.Errorf("a sibling that passes for its owner must not read as unusable: %q", got)
+		}
+		if _, err := os.Lstat(sibling); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("temporary directory", func(t *testing.T) {
+		cfg := haCfg("auto", "none")
+		cfg.EndpointCacheDir = missing
+		want(t, cacheFindingsAs(cfg, doctor), haKindCacheDirectory, haSeverityAdvice, missing,
+			"sits in the temporary cache directory")
+	})
+}
+
+// A directory the doctor cannot read while it judges for another user is not
+// reported as refused. The finding says the check could not judge it.
+func TestCollectSaysWhenItCouldNotReadADirectoryForTheCPIsUser(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	parent := t.TempDir()
+	journal := filepath.Join(parent, "journal")
+	makeDir(t, journal)
+	if err := os.Chmod(parent, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) }) //nolint:gosec // restores the test's own directory
+	if _, err := os.Lstat(journal); err == nil {
+		t.Skip("this user can search a directory with no permissions")
+	}
+	cfg := haCfg("auto", "none")
+	cfg.StorageAllocationJournalDir = journal
+	c := &haCollector{cfg: cfg, euid: os.Geteuid() + 1, rep: &haReport{Findings: []haFinding{}}}
+	c.cacheFindingsAs(cacheJudge{uid: os.Geteuid(), known: true, doctor: os.Geteuid() + 1})
+	want(t, c.rep, haKindCacheDirectory, haSeverityAdvice, "could not be read by this check",
+		"uid "+itoa(os.Geteuid()+1), "uid "+itoa(os.Geteuid()))
+}
+
+// makeDir creates a private directory.
+func makeDir(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
 	}
 }

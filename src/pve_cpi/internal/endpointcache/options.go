@@ -36,7 +36,7 @@ func OptionsFor(cfg *config.CPIConfig) DirOptions {
 // Options returns the options Resolve takes. It is the one place that copies
 // the config's values into them.
 func (d DirOptions) Options() Options {
-	return Options(d)
+	return Options{Override: d.Override, JournalDir: d.JournalDir, DisplayName: d.DisplayName, Guard: d.Guard}
 }
 
 // Resolve chooses the cache directory for d. See the package's Resolve.
@@ -45,6 +45,10 @@ func (d DirOptions) Resolve() Choice { return Resolve(d.Options()) }
 // Probe chooses the cache directory for d without creating anything. See the
 // package's Probe.
 func (d DirOptions) Probe() Choice { return Probe(d.Options()) }
+
+// ProbeAs chooses the cache directory for d as a process running as uid would,
+// without creating anything. See the package's ProbeAs.
+func (d DirOptions) ProbeAs(uid int) Choice { return ProbeAs(d.Options(), uid) }
 
 // WithoutOverride returns d with pve.endpoint_cache_dir unset, so a caller that
 // may fall back from a missing override reaches the layers after it.
