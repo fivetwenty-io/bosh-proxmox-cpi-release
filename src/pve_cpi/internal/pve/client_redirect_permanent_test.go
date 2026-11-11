@@ -227,22 +227,7 @@ func TestTheSDKRedirectRefusalStopsTheCPIRetryLoop(t *testing.T) {
 				if calls != 1 {
 					t.Errorf("the retry loop ran the request %d times, want once", calls)
 				}
-				if !errors.Is(err, sdkclient.ErrRedirectRefused) || !IsRedirectRefused(err) {
-					t.Fatalf("err = %v, want the SDK's ErrRedirectRefused", err)
-				}
-				if errors.Is(err, endpointpool.ErrRedirectRefused) {
-					t.Errorf("err = %v, want the SDK's transport to refuse before a follow-up exists", err)
-				}
-				if IsTransientTransport(err) {
-					t.Errorf("err = %v reads as transient", err)
-				}
-				var cpiErr *cpierrors.Error
-				if wrapped := WrapError(err); !errors.As(wrapped, &cpiErr) || cpiErr.OkToRetry() {
-					t.Errorf("WrapError(%v) = %v, want a permanent CPI error", err, wrapped)
-				}
-				if wrapped := WrapMutationError(err); !errors.As(wrapped, &cpiErr) || cpiErr.OkToRetry() {
-					t.Errorf("WrapMutationError(%v) = %v, want a permanent CPI error", err, wrapped)
-				}
+				mustBeAPermanentSDKRefusal(t, err)
 				route, legs := http.MethodGet, redirectLegs(rig.node, http.MethodGet)
 				if login {
 					route, legs = "ticket POST", ticketPosts(rig.node)
@@ -264,6 +249,29 @@ func TestTheSDKRedirectRefusalStopsTheCPIRetryLoop(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// mustBeAPermanentSDKRefusal checks that err is the SDK's refusal and not the
+// CPI's, that it does not read as transient, and that both of the CPI's error
+// mappings make it a CPI error the Director does not retry.
+func mustBeAPermanentSDKRefusal(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, sdkclient.ErrRedirectRefused) || !IsRedirectRefused(err) {
+		t.Fatalf("err = %v, want the SDK's ErrRedirectRefused", err)
+	}
+	if errors.Is(err, endpointpool.ErrRedirectRefused) {
+		t.Errorf("err = %v, want the SDK's transport to refuse before a follow-up exists", err)
+	}
+	if IsTransientTransport(err) {
+		t.Errorf("err = %v reads as transient", err)
+	}
+	var cpiErr *cpierrors.Error
+	if wrapped := WrapError(err); !errors.As(wrapped, &cpiErr) || cpiErr.OkToRetry() {
+		t.Errorf("WrapError(%v) = %v, want a permanent CPI error", err, wrapped)
+	}
+	if wrapped := WrapMutationError(err); !errors.As(wrapped, &cpiErr) || cpiErr.OkToRetry() {
+		t.Errorf("WrapMutationError(%v) = %v, want a permanent CPI error", err, wrapped)
 	}
 }
 
