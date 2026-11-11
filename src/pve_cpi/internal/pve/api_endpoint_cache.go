@@ -94,6 +94,9 @@ type endpointCache struct {
 	// pruning.
 	discovered []endpointpool.Endpoint
 	sink       *cacheMarkSink
+	// identity is the cluster identity the cache loaded the pool under and
+	// the once-per-call conflict line, which the worker shares.
+	identity *clusterIdentityWatch
 	// cold is what the cold start from placement.az_map needs, which attach
 	// turns into the pool's candidates when endpointpool.Gate allows them.
 	cold coldStartInputs
@@ -198,6 +201,7 @@ func openEndpointCache(cfg *config.CPIConfig, plan *endpointPlan, logger *log.Lo
 		plan.cacheUnusable = true
 		return nil
 	}
+	cache.identity = newClusterIdentityWatch(logger, store.FileName(), payload)
 	cache.load(plan, payload)
 	if payload != nil {
 		if payload.ColdStart != nil {
@@ -208,7 +212,9 @@ func openEndpointCache(cfg *config.CPIConfig, plan *endpointPlan, logger *log.Lo
 		}
 	}
 
-	worker, err := newDiscoveryWorker(DiscoveryWorkerConfig{Store: store, Mode: configured, Logger: logger})
+	worker, err := newDiscoveryWorker(DiscoveryWorkerConfig{
+		Store: store, Mode: configured, Logger: logger, Identity: cache.identity,
+	})
 	if err != nil {
 		cache.release()
 		return off(fmt.Sprintf("the discovery worker could not be built: %v", err))
@@ -301,6 +307,15 @@ func (c *endpointCache) read() (*endpointcache.Payload, bool) {
 	return payload, true
 }
 
+// watch returns the cache's identity watch, making one that holds no identity
+// for a cache that was not opened through openEndpointCache.
+func (c *endpointCache) watch() *clusterIdentityWatch {
+	if c.identity == nil {
+		c.identity = newClusterIdentityWatch(c.logger, c.store.FileName(), nil)
+	}
+	return c.identity
+}
+
 // load adds the payload's usable nodes to plan as discovered endpoints and its
 // marks to the endpoints they name. A node whose address is a configured
 // endpoint, a repeat of an earlier node, or whose pins do not parse is left
@@ -311,12 +326,8 @@ func (c *endpointCache) load(plan *endpointPlan, p *endpointcache.Payload) {
 	if p == nil {
 		return
 	}
-	ctx := context.Background()
-	if p.Cluster != nil && p.Cluster.IdentityConflict {
-		c.logger.LogAttrs(ctx, log.LevelWarn,
-			"endpoint cache: the cached cluster identity differs from the one the configured endpoints report and "+
-				"was refused because verify_ssl is false, so no cached nodes are used; delete the cache file to "+
-				"accept the new identity", log.String("file", c.store.FileName()))
+	if standingConflict(p) {
+		c.watch().warnConflict()
 	}
 	for i := range plan.endpoints[:plan.configured] {
 		plan.endpoints[i].DownMarkedAt = markTime(p, plan.endpoints[i].Address)

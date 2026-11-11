@@ -76,6 +76,11 @@ type DiscoveryWorkerConfig struct {
 	Registry *endpointcache.Registry
 	// Now is the worker's clock, which stamps the refresh. Nil uses time.Now.
 	Now func() time.Time
+	// Identity is the cluster identity the pool was loaded under and the
+	// once-per-call conflict line, shared with the cache that loaded the
+	// pool. Nil gives the worker a watch that holds no identity, so it
+	// compares nothing against the file and says a conflict once itself.
+	Identity *clusterIdentityWatch
 }
 
 // DiscoveryPool is what the worker needs from the endpoint pool it is the
@@ -136,6 +141,9 @@ type DiscoveryWorker struct {
 	resolver NameResolver
 	start    func(name string, mode config.DiscoveryMode, fn func(ctx context.Context)) error
 	now      func() time.Time
+	// identity is the identity the pool was loaded under, which the worker
+	// compares with the file before it checks whether a refresh is due.
+	identity *clusterIdentityWatch
 
 	mu      sync.Mutex
 	binding *DiscoveryBinding
@@ -164,9 +172,13 @@ func newDiscoveryWorker(cfg DiscoveryWorkerConfig) (*DiscoveryWorker, error) {
 		resolver: cfg.Resolver,
 		start:    endpointcache.Go,
 		now:      cfg.Now,
+		identity: cfg.Identity,
 	}
 	if w.logger == nil {
 		w.logger = log.NewNopLogger()
+	}
+	if w.identity == nil {
+		w.identity = newClusterIdentityWatch(w.logger, cfg.Store.FileName(), nil)
 	}
 	if w.resolver == nil {
 		w.resolver = lookupHostResolver(nil)
@@ -261,9 +273,9 @@ func (w *DiscoveryWorker) refresh(ctx context.Context, via string, b DiscoveryBi
 			"api endpoint discovery: the answering endpoint is not one of the configured endpoints; "+
 				"skipping the refresh",
 			log.String("endpoint", via))
-		// The conflict rule does not depend on which endpoint answered, so a
+		// The identity rules do not depend on which endpoint answered, so a
 		// pool that holds discovered endpoints still drops them.
-		w.dropOnConflict(b)
+		w.dropOnStoredIdentity(b)
 		return
 	}
 	if !w.due(ctx, b) {
@@ -319,12 +331,12 @@ func (w *DiscoveryWorker) due(ctx context.Context, b DiscoveryBinding) bool {
 		}
 		return false
 	}
-	// The conflict is checked before the refresh rule, because no refresh is
-	// due while one stands, and the pool this process loaded before another
-	// process recorded it still holds discovered endpoints. DropDiscovered
-	// is idempotent, so the second check under the lock drops nothing more.
-	if standingConflict(stored) {
-		b.Pool.DropDiscovered()
+	// The stored identity is checked before the refresh rule, because no
+	// refresh is due while a conflict stands, and a fresh file that another
+	// process replaced makes none due either, while the pool this process
+	// loaded before that still holds discovered endpoints. DropDiscovered is
+	// idempotent, so the second check under the lock drops nothing more.
+	if w.reconcileIdentity(stored, b) {
 		return false
 	}
 	if !endpointcache.RefreshDue(stored, now, pinMarked(stored) || b.Pool.RefreshDue()) {
@@ -335,16 +347,44 @@ func (w *DiscoveryWorker) due(ctx context.Context, b DiscoveryBinding) bool {
 	return true
 }
 
-// dropOnConflict reads the stored file and takes the discovered endpoints out
-// of the pool when it holds a standing identity conflict. It is the check due
+// dropOnStoredIdentity reads the stored file and takes the discovered
+// endpoints out of the pool when it holds a standing identity conflict or an
+// identity other than the one the pool was loaded under. It is the check due
 // makes, for a refresh that ends before due runs. A file it cannot read says
-// nothing about a conflict, and the drain reports a read cut off by the end of
-// the call.
-func (w *DiscoveryWorker) dropOnConflict(b DiscoveryBinding) {
+// nothing about the identity, and the drain reports a read cut off by the end
+// of the call.
+func (w *DiscoveryWorker) dropOnStoredIdentity(b DiscoveryBinding) {
 	stored, _, err := w.store.ReadPayload(w.now(), nil)
-	if err == nil && standingConflict(stored) {
-		b.Pool.DropDiscovered()
+	if err == nil {
+		w.reconcileIdentity(stored, b)
 	}
+}
+
+// reconcileIdentity compares the stored file with the identity the pool was
+// loaded under, and takes the pool's discovered endpoints and cold-start
+// candidates out when the file no longer matches it. A standing conflict is
+// how another process tells this one that the cluster the endpoints came from
+// is no longer the one it trusts, and it is said once per call at Warn. An
+// identity that another process replaced under verify_ssl true is the same
+// news, and the process that replaced it already logged it at Error. It
+// reports whether a conflict stands, which is the case in which no refresh
+// is due.
+func (w *DiscoveryWorker) reconcileIdentity(stored *endpointcache.Payload, b DiscoveryBinding) bool {
+	if standingConflict(stored) {
+		w.identity.warnConflict()
+		b.Pool.DropDiscovered()
+		return true
+	}
+	if stored == nil || stored.Cluster == nil {
+		return false
+	}
+	root := stored.Cluster.RootCASHA256
+	if from, replaced := w.identity.replacedBy(root); replaced {
+		b.Pool.DropDiscovered()
+		w.identity.logReplaced(from, root)
+		w.identity.accept(root)
+	}
+	return false
 }
 
 // standingConflict reports whether the file records a cluster identity
@@ -597,8 +637,8 @@ func (w *DiscoveryWorker) recordResult(
 		}
 		return d.Change, nil
 	})
-	if decided && decision.DropDiscovered {
-		b.Pool.DropDiscovered()
+	if decided {
+		w.settleIdentity(b, decision, err == nil)
 	}
 	if ctx.Err() != nil {
 		return
@@ -619,12 +659,34 @@ func (w *DiscoveryWorker) recordResult(
 	}
 }
 
-// logDecision logs the trust decision's own lines. The conflict line of a
-// standing conflict comes from the code that reads the file, once per call, so
-// the worker adds nothing for it.
+// settleIdentity drops the pool's discovered endpoints when the decision says
+// to, and also when the identity the decision accepted is not the one the pool
+// was loaded under, which is the case when another process replaced the
+// identity between the worker's last check and its locked update. The update
+// then sees the other process's identity as stored and decides nothing
+// changed. An identity the decision refused is not accepted, so the pool keeps
+// the identity it was loaded under. written is whether the update succeeded,
+// because the file holds an identity the pool matches only then.
+func (w *DiscoveryWorker) settleIdentity(b DiscoveryBinding, d endpointcache.TrustDecision, written bool) {
+	accepted := d.Outcome != endpointcache.TrustIdentityRefused && d.Outcome != endpointcache.TrustConflictStands
+	if d.DropDiscovered {
+		b.Pool.DropDiscovered()
+	} else if from, replaced := w.identity.replacedBy(d.ObservedRootCA); replaced && accepted {
+		b.Pool.DropDiscovered()
+		w.identity.logReplaced(from, d.ObservedRootCA)
+	}
+	if accepted && written {
+		w.identity.accept(d.ObservedRootCA)
+	}
+}
+
+// logDecision logs the trust decision's own lines. The line of a standing
+// conflict is the watch's, which says it once per call whichever path finds
+// the conflict first.
 func (w *DiscoveryWorker) logDecision(ctx context.Context, d endpointcache.TrustDecision, verifySSL bool) {
 	switch d.Outcome {
 	case endpointcache.TrustConflictStands:
+		w.identity.warnConflict()
 		return
 	case endpointcache.TrustIdentityRefused, endpointcache.TrustIdentityReplaced:
 		what := "with verify_ssl true the cached nodes and pins are replaced"

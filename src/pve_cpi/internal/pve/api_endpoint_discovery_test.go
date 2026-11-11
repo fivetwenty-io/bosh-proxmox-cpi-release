@@ -782,9 +782,10 @@ func TestDiscoveryWorker_IdentityChangeUnderVerifySSLFalseIsRefused(t *testing.T
 	}
 }
 
-// A refresh that meets a standing conflict records its attempt and logs no
-// conflict line, because the code that reads the file logs that.
-func TestDiscoveryWorker_StandingConflictRecordsAnAttemptAndLogsNothing(t *testing.T) {
+// A refresh that meets a standing conflict records its attempt and says the
+// conflict once, at Warn, because it may be the first code of the call to find
+// it.
+func TestDiscoveryWorker_StandingConflictRecordsAnAttemptAndWarnsOnce(t *testing.T) {
 	t.Parallel()
 	e := newWorkerEnv(t, workerEnvOptions{})
 	e.run()
@@ -794,7 +795,11 @@ func TestDiscoveryWorker_StandingConflictRecordsAnAttemptAndLogsNothing(t *testi
 	e.clock.advance(3 * time.Hour)
 	e.begin()
 	e.newWorker().discover(context.Background(), workerSeed, e.binding())
-	e.noLineAt(log.LevelInfo)
+	e.noLineAt(log.LevelError)
+	e.wantLine("the cached cluster identity differs", log.LevelWarn)
+	if n := countAt(e.lines(), log.LevelWarn); n != 1 {
+		t.Fatalf("%d Warn lines, want the conflict once: %s", n, e.dump())
+	}
 	p := e.payload()
 	if !p.Cluster.IdentityConflict {
 		t.Fatal("the conflict was lost")
@@ -1403,8 +1408,11 @@ func TestDiscoveryWorker_StandingConflictFromAnotherProcessDropsTheLoadedPool(t 
 	if n := e.requests(); n != 0 {
 		t.Fatalf("a standing conflict sent %d requests", n)
 	}
-	e.noLineAt(log.LevelWarn)
 	e.noLineAt(log.LevelError)
+	e.wantLine("the cached cluster identity differs", log.LevelWarn)
+	if n := countAt(e.lines(), log.LevelWarn); n != 1 {
+		t.Fatalf("%d Warn lines, want the conflict once: %s", n, e.dump())
+	}
 }
 
 // The drop does not wait for the refresh time: the conflicting attempt left an
