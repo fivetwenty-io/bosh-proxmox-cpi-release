@@ -290,18 +290,34 @@ func (c *sdkClient) ObserveMigrationTaskSettlement(ctx context.Context, upid str
 	return observeSettledMigrationTask(ctx, c.auditReader, upid)
 }
 
-// validMigrationTaskIdentity checks that upid has PVE's own UPID shape, is a
-// qmigrate task, and names vmid as the VM it migrates.
-func validMigrationTaskIdentity(upid string, vmid int) error {
+// MigrationTaskSource returns the node a qmigrate UPID ran on, which is the
+// migration's source, and the VM it migrated. It refuses a UPID without PVE's
+// own nine-field shape, a task of any other type, and a VM field that isn't a
+// positive VMID written the way PVE writes one.
+func MigrationTaskSource(upid string) (string, int, error) {
 	match := cleanupTaskUPIDPattern.FindStringSubmatch(upid)
 	if len(upid) > 1024 || len(match) != 2 || len(match[1]) > 255 {
-		return fmt.Errorf("migration task identity is malformed")
+		return "", 0, fmt.Errorf("migration task identity is malformed")
 	}
 	parts := strings.Split(upid, ":")
 	if parts[5] != migrationTaskType {
-		return fmt.Errorf("task %s is not a %s task", upid, migrationTaskType)
+		return "", 0, fmt.Errorf("task %s is not a %s task", upid, migrationTaskType)
 	}
-	if vmid <= 0 || parts[6] != strconv.Itoa(vmid) {
+	vmid, err := strconv.Atoi(parts[6])
+	if err != nil || vmid <= 0 || strconv.Itoa(vmid) != parts[6] {
+		return "", 0, fmt.Errorf("migration task %s does not name a VM", upid)
+	}
+	return match[1], vmid, nil
+}
+
+// validMigrationTaskIdentity checks that upid has PVE's own UPID shape, is a
+// qmigrate task, and names vmid as the VM it migrates.
+func validMigrationTaskIdentity(upid string, vmid int) error {
+	_, named, err := MigrationTaskSource(upid)
+	if err != nil {
+		return err
+	}
+	if vmid <= 0 || named != vmid {
 		return fmt.Errorf("migration task %s does not name VM %d", upid, vmid)
 	}
 	return nil

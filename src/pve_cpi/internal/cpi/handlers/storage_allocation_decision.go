@@ -28,7 +28,11 @@ type StorageAllocationDecision struct {
 	RecoveredTaskEvidence *StorageRecoveredTaskEvidence `json:"recovered_task_evidence,omitempty"`
 	RecoveredTaskStep     string                        `json:"recovered_task_step,omitempty"`
 	RecoveredTaskUPID     string                        `json:"recovered_task_upid,omitempty"`
-	DecisionID            string                        `json:"decision_id"`
+	// MigrationStepID and MigrationTaskUPID name the submitted migration step
+	// that settle-migration settles and the UPID of its qmigrate task.
+	MigrationStepID   string `json:"migration_step_id,omitempty"`
+	MigrationTaskUPID string `json:"migration_task_upid,omitempty"`
+	DecisionID        string `json:"decision_id"`
 }
 
 // ApplyStorageAllocationDecision observes PVE without changing it. Cleanup is
@@ -51,12 +55,7 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 	if decision.Action != decisionActionAdopt && decision.Action != "finalize-cleanup" {
 		return result, storageRefusal("unsupported allocation decision")
 	}
-	denied := storageRefusal("allocation decisions cannot mutate PVE")
-	guard, err := NewManagedAllocationGuard(deps.PVE, ManagedAllocationHooks{
-		Before: func(context.Context, ManagedAllocationMutation) (string, error) { return "", denied },
-		After:  func(context.Context, ManagedAllocationMutation, string, any) error { return denied },
-		Failed: func(context.Context, ManagedAllocationMutation, string, error) error { return denied },
-	})
+	guard, denied, err := newDecisionDenyGuard(deps.PVE)
 	if err != nil {
 		return result, storageDecisionSourceError(err)
 	}
