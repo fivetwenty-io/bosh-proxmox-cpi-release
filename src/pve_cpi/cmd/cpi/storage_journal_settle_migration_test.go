@@ -92,8 +92,8 @@ func TestStorageJournalSettleMigrationNamesTheHandlersRefusal(t *testing.T) {
 	_, id := journalFixtureVM(t, f)
 	before := journalFixtureSnapshot(t, f.directory)
 	code, out := f.run("settle-migration", settleMigrationArgs(id)...)
-	want := "allocation decision refused (identity_or_audit_evidence: settle-migration requires a disk record in " +
-		"reconciliation_required with the exact CID"
+	want := "allocation decision refused (identity_or_audit_evidence: settle-migration settles only a disk " +
+		"record; allocation " + id + " is a vm record"
 	if code != 1 || !strings.Contains(out, want) {
 		t.Fatalf("settle-migration of a VM record = %d %q, want the handler's reason", code, out)
 	}
