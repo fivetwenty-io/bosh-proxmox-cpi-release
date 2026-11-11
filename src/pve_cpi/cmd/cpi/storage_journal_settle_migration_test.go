@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"maps"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -60,9 +61,6 @@ func TestStorageJournalSettleMigrationRequiresEveryFlag(t *testing.T) {
 	cases["long step"] = append(withoutFlag(full, "--step-id"), "--step-id", strings.Repeat("s", 257))
 	cases["UPID with a space"] = append(withoutFlag(full, "--task-upid"), "--task-upid", settleMigrationTestUPID+" x")
 	cases["long UPID"] = append(withoutFlag(full, "--task-upid"), "--task-upid", strings.Repeat("U", 1025))
-	cases["summary"] = append(append([]string(nil), full...), "--summary")
-	cases["recovered task step"] = append(append([]string(nil), full...), "--recovered-task-step", "attempt-0-step-40")
-	cases["recovered task UPID"] = append(append([]string(nil), full...), "--recovered-task-upid", settleMigrationTestUPID)
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {
 			code, out := f.run("settle-migration", args...)
@@ -83,6 +81,59 @@ func TestStorageJournalSettleMigrationRequiresEveryFlag(t *testing.T) {
 		t.Fatal("a flag refusal changed the journal")
 	}
 }
+
+// TestStorageJournalSettleMigrationRefusesFlagsItDoesNotUse refuses a
+// settle-migration command line that sets any flag the settlement does not
+// read, even with an empty or false value, names that flag, and lists the
+// flags the action takes, before the CLI reads its configuration or the
+// journal. An operator who adds --authority-id must not believe it was
+// recorded.
+func TestStorageJournalSettleMigrationRefusesFlagsItDoesNotUse(t *testing.T) {
+	f := newStorageJournalFixture(t)
+	_, id := journalFixtureVM(t, f)
+	before := journalFixtureSnapshot(t, f.directory)
+	full := settleMigrationArgs(id)
+	evidence := filepath.Join(t.TempDir(), "receipt.json")
+	for _, tc := range []struct {
+		name string
+		args []string
+		flag string
+	}{
+		{"authority", []string{"--authority-id", "operator"}, "--authority-id"},
+		{"empty authority", []string{"--authority-id="}, "--authority-id"},
+		{"agent", []string{"--agent-id", "agent-1"}, "--agent-id"},
+		{"index-first attestation", []string{"--index-first-crash-confirmed"}, "--index-first-crash-confirmed"},
+		{"false index-first attestation", []string{"--index-first-crash-confirmed=false"},
+			"--index-first-crash-confirmed"},
+		{"summary", []string{"--summary"}, "--summary"},
+		{"recovered task step", []string{"--recovered-task-step", "attempt-0-step-40"}, "--recovered-task-step"},
+		{"recovered task UPID", []string{"--recovered-task-upid", settleMigrationTestUPID}, "--recovered-task-upid"},
+		{"recovered task evidence", []string{"--recovered-task-evidence", evidence}, "--recovered-task-evidence"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append(append([]string(nil), full...), tc.args...)
+			code, out := f.run("settle-migration", args...)
+			want := "settle-migration does not take " + tc.flag + "; it takes only " + settleMigrationFlagList
+			if code != 2 || !strings.Contains(out, want) {
+				t.Fatalf("settle-migration %v = %d %q, want exit 2 and %q", tc.args, code, out, want)
+			}
+		})
+	}
+	code, out := f.run("settle-migration",
+		append(append([]string(nil), full...), "--agent-id", "a", "--authority-id", "o")...)
+	if want := "settle-migration does not take --agent-id and --authority-id; "; code != 2 ||
+		!strings.Contains(out, want) {
+		t.Fatalf("settle-migration with two unused flags = %d %q, want both named", code, out)
+	}
+	if !reflect.DeepEqual(before, journalFixtureSnapshot(t, f.directory)) {
+		t.Fatal("a flag refusal changed the journal")
+	}
+}
+
+// settleMigrationFlagList is the list of flags settle-migration takes, as
+// its refusal of any other flag prints it.
+const settleMigrationFlagList = "--config, --allocation-id, --decision-id, --expected-cid, --step-id, " +
+	"--task-upid, --previous-writer-fenced, and --remote-tasks-settled"
 
 // TestStorageJournalSettleMigrationNamesTheHandlersRefusal runs a complete
 // settle-migration command against a VM record, which the handler refuses,
