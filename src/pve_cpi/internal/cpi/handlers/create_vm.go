@@ -1253,6 +1253,12 @@ func isTransientStartError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// A refused redirect is never a reason to move to another node, and the
+	// text checks below would read the "auto-login failed" a ticket login
+	// that met a redirect carries as transient.
+	if pve.IsRedirectRefused(err) {
+		return false
+	}
 	// Check the SDK error chain first (raw transport error, not string-wrapped).
 	if pve.IsTransientTransport(err) {
 		return true
