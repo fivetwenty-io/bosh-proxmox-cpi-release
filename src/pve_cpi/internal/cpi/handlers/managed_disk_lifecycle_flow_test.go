@@ -1457,9 +1457,22 @@ func TestManagedDiskAdoptedMoverCrossNodeOnSharedStorage(t *testing.T) {
 	}
 }
 
-func testAdoptedMoverCrossNode(
-	t *testing.T, attach func(t *testing.T, ctx context.Context, deps Deps, cid string) error,
-) {
+// adoptedMoverCase is the flow fixture's journal-managed disk parked alone on
+// a mover that an earlier request left on n2, with the fake answering a config
+// read of a VM that left the addressed node the way real PVE does.
+type adoptedMoverCase struct {
+	ctx     context.Context
+	deps    Deps
+	client  *lifecycleFlowPVE
+	journal *aj.Journal
+	id      string
+	cid     string
+	mover   int
+	logged  *bytes.Buffer
+}
+
+func newAdoptedMoverCase(t *testing.T) *adoptedMoverCase {
+	t.Helper()
 	deps, client, journal, id, cid := lifecycleFlowFixture(t)
 	client.pmxcfsConfigMissing = true
 	deps.Config.DiskMigration = "on_attach"
@@ -1490,18 +1503,46 @@ func testAdoptedMoverCrossNode(
 		client.vmNodes = map[int]string{}
 	}
 	client.vmNodes[mover] = "n2"
-	migrations := client.migrations
 	client.protectionWrites = nil
+	return &adoptedMoverCase{
+		ctx: ctx, deps: deps, client: client, journal: journal, id: id, cid: cid, mover: mover, logged: logged,
+	}
+}
+
+// reconciliationWarnings returns the WARN lines in which the guard says why a
+// lifecycle mutation requires reconciliation.
+func reconciliationWarnings(logged string) []string {
+	var lines []string
+	for _, line := range strings.Split(logged, "\n") {
+		if strings.Contains(line, `"level":"WARN"`) &&
+			strings.Contains(line, "requires reconciliation because the guard could not settle its outcome") {
+			lines = append(lines, log.ScrubMessage(line))
+		}
+	}
+	return lines
+}
+
+func testAdoptedMoverCrossNode(
+	t *testing.T, attach func(t *testing.T, ctx context.Context, deps Deps, cid string) error,
+) {
+	c := newAdoptedMoverCase(t)
+	ctx, deps, client, journal, id, cid, mover, logged := c.ctx, c.deps, c.client, c.journal, c.id, c.cid, c.mover,
+		c.logged
+	migrations := client.migrations
 
 	attachErr := attach(t, ctx, deps, cid)
 	logMoverLines(t, logged)
 	if attachErr != nil {
-		t.Fatalf("attach from the adopted mover: %s", log.ScrubMessage(attachErr.Error()))
+		t.Fatalf("attach from the adopted mover: %s; the guard's reasons: %v",
+			log.ScrubMessage(attachErr.Error()), reconciliationWarnings(logged.String()))
+	}
+	if lines := reconciliationWarnings(logged.String()); len(lines) != 0 {
+		t.Errorf("the attach warned that a mutation requires reconciliation: %v", lines)
 	}
 	if n := client.migrations - migrations; n != 1 {
 		t.Fatalf("the attach sent %d migrations, want exactly one of mover %d", n, mover)
 	}
-	record, err = journal.Inspect(id)
+	record, err := journal.Inspect(id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1570,5 +1611,41 @@ func testAdoptedMoverCrossNode(
 	}
 	if lifecycleConfigHasAnyVolume(client.state.configs[mover]) {
 		t.Errorf("mover %d still holds a disk: %v", mover, client.state.configs[mover])
+	}
+}
+
+// TestManagedDiskAdoptedMoverUnobservedMigrationWarnsWithTheReason runs the
+// adopted mover's attach with a source node that stops answering config reads
+// for the mover once the migration has moved it, with a 500 that doesn't say
+// the config is gone. The guard can't observe the migration, so the attach
+// requires reconciliation, and the guard's WARN carries the reason, the call,
+// and the allocation.
+func TestManagedDiskAdoptedMoverUnobservedMigrationWarnsWithTheReason(t *testing.T) {
+	c := newAdoptedMoverCase(t)
+	c.client.onNodeConfigRead = func(node string, vmid int) error {
+		if node == "n2" && vmid == c.mover && c.client.vmNode(c.mover) == "n1" {
+			return &sdkerrors.APIError{HTTPCode: 500, Message: "got timeout"}
+		}
+		return nil
+	}
+	_, attachErr := HandleAttachDisk(c.deps).Handle(c.ctx,
+		[]json.RawMessage{planJSON(t, "777"), planJSON(t, c.cid)}, jsonrpc.Context{})
+	if attachErr == nil || !strings.Contains(attachErr.Error(), "requires reconciliation") {
+		t.Fatalf("attach_disk = %v, want the reconciliation error", attachErr)
+	}
+	lines := reconciliationWarnings(c.logged.String())
+	found := false
+	for _, line := range lines {
+		if strings.Contains(line, "migration source holder absence not observed") {
+			found = true
+			for _, want := range []string{`"call":"Nodes.CreateQemuMigrate"`, `"allocation_id":"` + c.id + `"`} {
+				if !strings.Contains(line, want) {
+					t.Errorf("the guard's WARN lacks %s: %s", want, line)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no reconciliation WARN carries the observation's reason; the WARNs were %v", lines)
 	}
 }

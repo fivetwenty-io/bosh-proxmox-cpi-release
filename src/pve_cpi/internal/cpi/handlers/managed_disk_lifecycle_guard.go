@@ -7,6 +7,7 @@ import (
 	"fmt"
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	inv "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/storageinventory"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -67,9 +68,40 @@ type managedDiskLifecycleGuard struct {
 func newManagedDiskLifecycleGuard(m *managedDiskLifecycle) (*ManagedAllocationGuard, error) {
 	state := &managedDiskLifecycleGuard{lifecycle: m, observations: map[string]managedDiskMutationObservation{}, created: map[int]bool{}}
 	m.holders = state
-	return NewManagedAllocationGuard(m.deps.PVE, ManagedAllocationHooks{Before: state.before, After: state.after, Failed: func(_ context.Context, call ManagedAllocationMutation, _ string, _ error) error {
-		return m.session.Uncertain(call.Service + "." + call.Method)
-	}, SettleProtectionWrites: true, SettleFailedWrite: state.settleFailedWrite})
+	return NewManagedAllocationGuard(m.deps.PVE, ManagedAllocationHooks{
+		Before: state.before, After: state.after,
+		Failed: func(ctx context.Context, call ManagedAllocationMutation, step string, err error) error {
+			m.warnMutationUncertain(ctx, call, step, err)
+			return m.session.Uncertain(call.Service + "." + call.Method)
+		},
+		SettleProtectionWrites: true, SettleFailedWrite: state.settleFailedWrite,
+	})
+}
+
+// warnMutationUncertain logs why the guard could not settle a lifecycle
+// mutation, either because the call failed or because the readback after it
+// did not observe the change. The error the request returns says only that the
+// allocation requires reconciliation, so this WARN is where an operator finds
+// the reason. log.Err scrubs the error text.
+func (m *managedDiskLifecycle) warnMutationUncertain(
+	ctx context.Context, call ManagedAllocationMutation, step string, err error,
+) {
+	if err == nil {
+		return
+	}
+	fields := []log.Field{
+		log.String("call", call.Service+"."+call.Method),
+		log.String("step_id", step),
+		log.Err(err),
+	}
+	if m.session != nil {
+		fields = append(fields, log.String("operation", m.session.operation))
+	}
+	if m.disk.allocation != nil {
+		fields = append(fields, log.String("allocation_id", m.disk.allocation.record.ID))
+	}
+	m.deps.Log(ctx).Warn("managed disk lifecycle mutation requires reconciliation because the guard could not "+
+		"settle its outcome", fields...)
 }
 func lifecycleMutationFields(params any) (map[string]any, error) {
 	encoded, err := json.Marshal(params)
