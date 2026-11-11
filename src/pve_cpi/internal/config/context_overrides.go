@@ -1375,6 +1375,7 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 	// A base that is itself an effective config must not hand its ownership
 	// of the placement block to this one. Only the handler below raises it.
 	eff.placementNamedByEntry = false
+	eff.entryEffective = true
 	var appliedKeys []string
 
 	for _, key := range contextOverrideFieldOrder {

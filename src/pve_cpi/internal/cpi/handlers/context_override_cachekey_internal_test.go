@@ -594,3 +594,122 @@ func TestRequestOverrideCacheKey_LooserTLSFlagSeparatesEntries(t *testing.T) {
 		})
 	}
 }
+
+// TestRequestOverrideCacheKey_PlacementOwnershipSeparatesEntries asserts that
+// two entries which differ only in whether they name pve_placement never share
+// a bundle. Entry A restates the job's map under its own host, CA, and token,
+// so its cold-start candidates are the map's nodes. Entry B names the same
+// host, CA, and token and inherits the map, so it gets none. Whichever builds
+// first, the other must not reuse its client.
+func TestRequestOverrideCacheKey_PlacementOwnershipSeparatesEntries(t *testing.T) {
+	t.Parallel()
+	ca := selfSignedCAPEMForCacheKeyTest(t)
+	job := discoveryEffectiveJob()
+	job.PVECACertPEM = ca
+	job.Placement = &config.PlacementConfig{AZMap: map[string][]string{"az1": {"pve1", "pve2"}}}
+	build := func(withMap bool) *config.CPIConfig {
+		extra := map[string]any{"pve_host": "pve-b.example", "pve_ca_cert": ca, "pve_api_token": "u@pve!cpi=own"}
+		if withMap {
+			extra["pve_placement"] = map[string]any{"az_map": map[string]any{"az1": []any{"pve1", "pve2"}}}
+		}
+		eff, _, _, err := config.ApplyContextOverrides(job, extra)
+		if err != nil {
+			t.Fatalf("ApplyContextOverrides(%v): %v", extra, err)
+		}
+		return eff
+	}
+	for name, aFirst := range map[string]bool{"A then B": true, "B then A": false} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var effA, effB *config.CPIConfig
+			if aFirst {
+				effA = build(true)
+				effB = build(false)
+			} else {
+				effB = build(false)
+				effA = build(true)
+			}
+			if !effA.PlacementNamedByEntry() || effB.PlacementNamedByEntry() {
+				t.Fatalf("flags = %v and %v, want the entry naming its placement flagged and the other not",
+					effA.PlacementNamedByEntry(), effB.PlacementNamedByEntry())
+			}
+			if got := config.ColdStartNodeNames(effA, job); !slices.Equal(got, []string{"pve1", "pve2"}) {
+				t.Errorf("entry A cold-start names = %v, want [pve1 pve2]", got)
+			}
+			if got := config.ColdStartNodeNames(effB, job); got != nil {
+				t.Errorf("entry B cold-start names = %v, want none", got)
+			}
+			if requestOverrideCacheKey(effA) == requestOverrideCacheKey(effB) {
+				t.Error("entries that differ only in placement ownership must not share a bundle")
+			}
+		})
+	}
+}
+
+// TestRequestOverrideCacheKey_PlacementOwnershipKeysAsBeforeWhenItDecidesNothing
+// asserts that the ownership flag adds nothing to the key unless the entry
+// names pve_placement and every other cold-start condition holds, so no warm
+// bundle is dropped for a config the flag cannot affect.
+func TestRequestOverrideCacheKey_PlacementOwnershipKeysAsBeforeWhenItDecidesNothing(t *testing.T) {
+	t.Parallel()
+	ca := selfSignedCAPEMForCacheKeyTest(t)
+	job := discoveryEffectiveJob()
+	job.PVECACertPEM = ca
+	placement := map[string]any{"az_map": map[string]any{"az1": []any{"pve1"}}}
+	job.Placement = &config.PlacementConfig{AZMap: map[string][]string{"az1": {"pve1"}}}
+	entry := func(extra map[string]any) *config.CPIConfig {
+		eff, _, _, err := config.ApplyContextOverrides(job, extra)
+		if err != nil {
+			t.Fatalf("ApplyContextOverrides(%v): %v", extra, err)
+		}
+		return eff
+	}
+	// The same effective config with the flag down is the key a config had
+	// before the flag existed, because only an entry's handler raises it.
+	for name, extra := range map[string]map[string]any{
+		"discovery off": {
+			"pve_host": "pve-b.example", "pve_ca_cert": ca, "pve_api_token": "u@pve!cpi=own",
+			"pve_api_endpoint_discovery": "off", "pve_placement": placement,
+		},
+		"password auth": {
+			"pve_host": "pve-b.example", "pve_ca_cert": ca, "pve_user": "root", "pve_password": "pw",
+			"pve_placement": placement,
+		},
+		"two endpoints under auto": {
+			"pve_host": "pve-b.example", "pve_ca_cert": ca, "pve_api_token": "u@pve!cpi=own",
+			"pve_endpoints": []any{"pve-b.example", "pve-c.example"}, "pve_placement": placement,
+		},
+		"no ca": {
+			"pve_host": "pve-b.example", "pve_api_token": "u@pve!cpi=own", "pve_placement": placement,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			eff := entry(extra)
+			if !eff.PlacementNamedByEntry() {
+				t.Fatal("the entry names pve_placement, so the flag must be up")
+			}
+			if got := config.ColdStartNodeNames(eff, job); got != nil {
+				t.Fatalf("cold-start names = %v, want none, or the case proves nothing", got)
+			}
+			without := make(map[string]any, len(extra))
+			for k, v := range extra {
+				if k != "pve_placement" {
+					without[k] = v
+				}
+			}
+			// With the map left out the entry inherits an identical one, so
+			// every field the key reads is equal and only the flag differs.
+			if requestOverrideCacheKey(eff) != requestOverrideCacheKey(entry(without)) {
+				t.Error("the flag changed the key although the cold start cannot apply")
+			}
+		})
+	}
+	t.Run("an entry that names nothing", func(t *testing.T) {
+		t.Parallel()
+		eff := entry(map[string]any{"pve_vm_storage": "other"})
+		if eff.PlacementNamedByEntry() {
+			t.Fatal("the entry names no placement, so the flag must be down")
+		}
+	})
+}

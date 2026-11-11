@@ -22,16 +22,25 @@ import (
 //   - The config authenticates with an API token. A password turns the cold
 //     start off even when the mode is explicitly on.
 //   - placement.az_map names at least one node.
-//   - The map belongs to cfg. That is true for the job-level block, which is
-//     the job itself, for an entry that named pve_placement itself, and for
-//     an entry whose endpoint list is the job's (see SameEndpointSet). An
-//     entry that inherits the job's map under another list gets none, because
-//     an az_map names the nodes of one cluster.
+//   - The map belongs to cfg. That is true for an entry that named
+//     pve_placement itself, for the job-level block, and for an entry whose
+//     endpoint list is the job's (see SameEndpointSet). An entry that
+//     inherits the job's map under another list gets none, because an
+//     az_map names the nodes of one cluster.
 //
 // cfg is the effective config of the job or of one cpi-config entry, and job
-// is the job-level config the entry was built from. The job-level block
-// passes the same pointer for both, and a copy of the job does not count as
-// the job. A nil job leaves only an entry that named its own placement.
+// is the job-level config the entry was built from, which the caller must
+// pass as the job and never as the entry. The job-level block passes the job
+// for both, and the same pointer counts as the job only when it is not itself
+// an entry's effective config. An entry passed for both owns its map only if
+// it named pve_placement, so repeating an entry never grants it an inherited
+// map. A copy of the job does not count as the job and passes only through
+// SameEndpointSet. A nil job leaves only an entry that named its own
+// placement.
+//
+// The caller must also apply the unusable-cache-directory condition before it
+// uses the names, as the pool install does for the discovery mode, because
+// an unusable cache directory rules the cold start out.
 //
 // The names come in AZ-name order and then the operator's order within each
 // AZ, without duplicates or empty names. They are not checked against the
@@ -79,7 +88,17 @@ func coldStartConfigAllows(cfg *CPIConfig) bool {
 }
 
 // ownsColdStartMap reports whether cfg's az_map names nodes of cfg's own
-// cluster. See ColdStartNodeNames for the three ways it can.
+// cluster. See ColdStartNodeNames for the ways it can. An entry that is
+// passed as its own job owns an inherited map no more than it does under the
+// real job, because the job-level block is the one config here that was not
+// built from another, and a caller with no job to hand over cannot grant an
+// entry the job's ownership by repeating the entry.
 func ownsColdStartMap(cfg, job *CPIConfig) bool {
-	return cfg == job || cfg.placementNamedByEntry || SameEndpointSet(cfg, job)
+	if cfg.placementNamedByEntry {
+		return true
+	}
+	if cfg == job {
+		return !cfg.entryEffective
+	}
+	return SameEndpointSet(cfg, job)
 }

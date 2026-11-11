@@ -175,21 +175,21 @@ func TestColdStartNodeNames_EntryInheritingTheJobEndpointListUsesTheJobMap(t *te
 // endpoint list differs from the job's, whatever else it names.
 func TestColdStartNodeNames_EntryInheritingAMapUnderAnotherListGetsNone(t *testing.T) {
 	t.Parallel()
-	ownCredentials := map[string]any{"pve_api_token": "u@pve!cpi=other-token"}
+	ownToken := "u@pve!cpi=other-token"
 	cases := []struct {
 		name    string
 		context func(ca string) map[string]any
 	}{
 		{"another host with its own CA and token", func(ca string) map[string]any {
-			return map[string]any{"pve_host": "pve-b.example", "pve_ca_cert": ca, "pve_api_token": ownCredentials["pve_api_token"]}
+			return map[string]any{"pve_host": "pve-b.example", "pve_ca_cert": ca, "pve_api_token": ownToken}
 		}},
 		{"another port with its own CA and token", func(ca string) map[string]any {
-			return map[string]any{"pve_port": 8007, "pve_ca_cert": ca, "pve_api_token": ownCredentials["pve_api_token"]}
+			return map[string]any{"pve_port": 8007, "pve_ca_cert": ca, "pve_api_token": ownToken}
 		}},
 		{"the job's host plus an endpoint the job never named", func(ca string) map[string]any {
 			return map[string]any{
 				"pve_endpoints": []any{"pve-a.example", "pve-b.example"}, "pve_api_endpoint_discovery": "on",
-				"pve_ca_cert": ca, "pve_api_token": ownCredentials["pve_api_token"],
+				"pve_ca_cert": ca, "pve_api_token": ownToken,
 			}
 		}},
 	}
@@ -235,6 +235,75 @@ func TestColdStartNodeNames_EntryNamingItsPlacementUsesItsOwnMap(t *testing.T) {
 	}
 }
 
+// TestColdStartNodeNames_EntryPassedAsItsOwnJobGainsNothing asserts that
+// passing one config for both arguments grants ownership only to the
+// job-level block. An entry that inherits the job's map under another list
+// gets none, so a caller that has no job to hand over cannot turn an
+// inherited map into the entry's own by repeating the entry.
+func TestColdStartNodeNames_EntryPassedAsItsOwnJobGainsNothing(t *testing.T) {
+	t.Parallel()
+	job := coldStartJob(t)
+	all := []string{"pve1", "pve2", "pve3", "pve4"}
+	wantNames(t, ColdStartNodeNames(job, job), all...)
+
+	entry := coldStartEntry(t, job, map[string]any{
+		"pve_host": "pve-b.example", "pve_ca_cert": job.PVECACertPEM, "pve_api_token": "u@pve!cpi=other-token",
+	})
+	if entry.Placement == nil || len(entry.Placement.AZMap) == 0 || entry.placementNamedByEntry {
+		t.Fatal("the entry must inherit the job's map without naming it, or the case proves nothing")
+	}
+	wantNames(t, ColdStartNodeNames(entry, job))
+	wantNames(t, ColdStartNodeNames(entry, entry))
+
+	// An entry on the job's own list keeps the job's map under the real job,
+	// and gets none when it is passed in the job's place, because nothing then
+	// proves it is the job's list.
+	sameList := coldStartEntry(t, job, map[string]any{"pve_vm_storage": "other"})
+	wantNames(t, ColdStartNodeNames(sameList, job), all...)
+	wantNames(t, ColdStartNodeNames(sameList, sameList))
+
+	// An entry that names its placement owns its map under any job argument.
+	named := coldStartEntry(t, job, map[string]any{
+		"pve_host": "pve-b.example", "pve_ca_cert": job.PVECACertPEM, "pve_api_token": "u@pve!cpi=other-token",
+		"pve_placement": map[string]any{"az_map": map[string]any{"east": []any{"e1"}}},
+	})
+	wantNames(t, ColdStartNodeNames(named, named), "e1")
+
+	// The job-level block owns its map through its endpoint list, whether it
+	// writes the list out or leaves the primary alone.
+	listed := coldStartJob(t)
+	listed.Endpoints = []string{"pve-a.example", "pve-c.example"}
+	listed.APIEndpointDiscovery = DiscoveryModeOn
+	if err := listed.Validate(); err != nil {
+		t.Fatalf("the listed job does not validate: %v", err)
+	}
+	wantNames(t, ColdStartNodeNames(listed, listed), all...)
+}
+
+// TestColdStartNodeNames_EntryRestatingTheJobMapUnderItsOwnHostOwnsIt asserts
+// that an entry which writes pve_placement owns the map even when the value
+// equals the job's, because the entry names the key itself. An entry that
+// leaves the key out on the same host gets none, so the two differ.
+func TestColdStartNodeNames_EntryRestatingTheJobMapUnderItsOwnHostOwnsIt(t *testing.T) {
+	t.Parallel()
+	job := coldStartJob(t)
+	restated := map[string]any{"az_map": map[string]any{
+		"az1": []any{"pve1", "pve2"},
+		"az2": []any{"pve3", "pve4"},
+	}}
+	own := map[string]any{
+		"pve_host": "pve-b.example", "pve_ca_cert": job.PVECACertPEM, "pve_api_token": "u@pve!cpi=other-token",
+	}
+	withMap := map[string]any{"pve_placement": restated}
+	for k, v := range own {
+		withMap[k] = v
+	}
+	named := coldStartEntry(t, job, withMap)
+	inherited := coldStartEntry(t, job, own)
+	wantNames(t, ColdStartNodeNames(named, job), "pve1", "pve2", "pve3", "pve4")
+	wantNames(t, ColdStartNodeNames(inherited, job))
+}
+
 // TestColdStartNodeNames_EntryNamingItsPlacementStillMeetsEveryOtherCondition
 // asserts that naming pve_placement settles ownership only, and that the
 // entry's own credential, CA, TLS, and mode settings still decide the rest.
@@ -248,11 +317,14 @@ func TestColdStartNodeNames_EntryNamingItsPlacementStillMeetsEveryOtherCondition
 	}{
 		{"complete entry", func(ca string) map[string]any {
 			return map[string]any{
-				"pve_host": "pve-b.example", "pve_ca_cert": ca, "pve_api_token": "u@pve!cpi=t", "pve_placement": placement,
+				"pve_host": "pve-b.example", "pve_ca_cert": ca, "pve_api_token": "u@pve!cpi=t",
+				"pve_placement": placement,
 			}
 		}, []string{"e1"}},
 		{"new host drops the job's CA", func(string) map[string]any {
-			return map[string]any{"pve_host": "pve-b.example", "pve_api_token": "u@pve!cpi=t", "pve_placement": placement}
+			return map[string]any{
+				"pve_host": "pve-b.example", "pve_api_token": "u@pve!cpi=t", "pve_placement": placement,
+			}
 		}, nil},
 		{"new host with a password", func(ca string) map[string]any {
 			return map[string]any{
@@ -405,6 +477,10 @@ func TestApplyContextOverrides_PlacementOwnershipFlag(t *testing.T) {
 	unnamed := coldStartEntry(t, job, map[string]any{"pve_vm_storage": "other"})
 	if unnamed.placementNamedByEntry {
 		t.Error("the flag rose for an entry that did not name pve_placement")
+	}
+	if job.entryEffective || !named.entryEffective || !unnamed.entryEffective {
+		t.Errorf("entryEffective = job %v, named %v, unnamed %v, want false, true, true",
+			job.entryEffective, named.entryEffective, unnamed.entryEffective)
 	}
 
 	// An effective config used as a base must not pass its ownership on to an

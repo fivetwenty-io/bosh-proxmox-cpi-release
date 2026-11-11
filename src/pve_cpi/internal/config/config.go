@@ -958,6 +958,15 @@ type CPIConfig struct {
 	// base.
 	placementNamedByEntry bool
 
+	// entryEffective records that this config is the effective config of a
+	// cpi-config entry, built by ApplyContextOverrides, and not the job-level
+	// block. ColdStartNodeNames uses it to refuse an entry that is passed in
+	// the job's place, because the job-level block owns its inherited map
+	// and an entry does not. Unexported and untagged like
+	// inheritedCredsLooserTLS, so it is neither decoded from nor emitted to
+	// cpi.json, and a loaded job never carries it.
+	entryEffective bool
+
 	// parkerStartDefaulted and parkerEndDefaulted record, per bound, that
 	// ApplyDefaults rather than the operator put the value in the range field.
 	// Same unexported/untagged treatment as parkedDefaultBandCollision.
@@ -5542,6 +5551,13 @@ func (c *CPIConfig) DiscoveryModeValue() DiscoveryMode {
 // the job. A nil receiver reports false.
 func (c *CPIConfig) InheritedCredsLooserTLS() bool {
 	return c != nil && c.inheritedCredsLooserTLS
+}
+
+// PlacementNamedByEntry reports whether this config belongs to a cpi-config
+// entry that named pve_placement itself, which makes its az_map the entry's
+// own for ColdStartNodeNames. A nil receiver reports false.
+func (c *CPIConfig) PlacementNamedByEntry() bool {
+	return c != nil && c.placementNamedByEntry
 }
 
 // usesPasswordAuth reports whether the CPI logs in with a user and password.

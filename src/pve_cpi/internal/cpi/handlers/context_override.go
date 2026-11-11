@@ -509,6 +509,17 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 	if cfg.InheritedCredsLooserTLS() {
 		_, _ = fmt.Fprintf(h, "inherited_creds_looser_tls=true\x00")
 	}
+	// An entry that names pve_placement owns its az_map for the cold start,
+	// while an entry that inherits the job's map owns it only on the job's
+	// endpoint list. Two entries that restate and inherit the same map under
+	// one host differ in the cold-start candidates their bundle carries, and
+	// nothing else in the key tells them apart. The flag joins the key only
+	// when it decides something, which is when the entry names its placement
+	// and every other cold-start condition holds, so every other config keys
+	// as it did before.
+	if cfg.PlacementNamedByEntry() && len(config.ColdStartNodeNames(cfg, nil)) > 0 {
+		_, _ = fmt.Fprintf(h, "placement_named_by_entry=true\x00")
+	}
 	if cfg.PVECACertPEM != "" {
 		caHash := sha256.Sum256([]byte(cfg.PVECACertPEM))
 		_, _ = fmt.Fprintf(h, "ca_cert_sha=%s\x00", hex.EncodeToString(caHash[:]))
