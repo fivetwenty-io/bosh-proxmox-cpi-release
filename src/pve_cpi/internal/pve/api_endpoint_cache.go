@@ -271,7 +271,7 @@ func (c *endpointCache) read() (*endpointcache.Payload, bool) {
 	case errors.Is(err, fs.ErrNotExist):
 		return nil, true
 	case errors.Is(err, endpointcache.ErrFileInvalid):
-		c.logger.LogAttrs(ctx, log.LevelDebug,
+		c.logger.LogAttrs(ctx, endpointcache.Level(c.mode),
 			"endpoint cache: the cache file is not usable and is ignored", log.String("file", c.store.FileName()),
 			log.Err(err))
 		return nil, true
@@ -288,6 +288,9 @@ func (c *endpointCache) read() (*endpointcache.Payload, bool) {
 		return nil, false
 	}
 	if len(drops) > 0 {
+		// A record the validation left out is routine, such as an expired
+		// node or mark, the seed's own node, or the nodes a stored identity
+		// conflict already warned about, so these stay at Debug in every mode.
 		texts := make([]string, len(drops))
 		for i, d := range drops {
 			texts[i] = d.String()

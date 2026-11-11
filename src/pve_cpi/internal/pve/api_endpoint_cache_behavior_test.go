@@ -553,9 +553,10 @@ func TestACacheFileThatCannotBeReadMakesTheDirectoryUnusable(t *testing.T) {
 }
 
 // A cache file this process cannot use is the same as no file. It gives no
-// nodes, it keeps the mode on, and it logs nothing above Debug, even under an
-// explicit on, because a file from another release is what a downgrade leaves.
-func TestACacheFileTheStoreRejectsIsIgnoredAtDebug(t *testing.T) {
+// nodes and it keeps the mode on. It is logged once at the mode's level, which
+// is Debug under auto and Warn under an explicit on, because the operator asked
+// for a cache this call cannot read, and nothing above that level.
+func TestACacheFileTheStoreRejectsIsIgnoredAtTheModesLevel(t *testing.T) {
 	mutations := map[string]func(t *testing.T, path string){
 		"garbage": func(t *testing.T, path string) {
 			if err := os.WriteFile(path, []byte("this is not a cache file"), 0o600); err != nil {
@@ -582,7 +583,10 @@ func TestACacheFileTheStoreRejectsIsIgnoredAtDebug(t *testing.T) {
 		},
 	}
 	for name, mutate := range mutations {
-		for _, mode := range []config.DiscoveryMode{config.DiscoveryModeAuto, config.DiscoveryModeOn} {
+		for mode, level := range map[config.DiscoveryMode]slog.Level{
+			config.DiscoveryModeAuto: slog.LevelDebug,
+			config.DiscoveryModeOn:   slog.LevelWarn,
+		} {
 			t.Run(name+" under "+string(mode), func(t *testing.T) {
 				cfg := cacheTestConfig(mode, newCacheDir(t))
 				seedEndpointCache(t, cfg, cacheSeed{nodes: []cachedNode{{"pve2", true}}})
@@ -596,12 +600,12 @@ func TestACacheFileTheStoreRejectsIsIgnoredAtDebug(t *testing.T) {
 				if len(got.plan.endpoints) != 1 {
 					t.Errorf("endpoints = %+v, want the configured endpoint alone", got.plan.endpoints)
 				}
-				if e, bad := anyLineAbove(got.obs.All(), slog.LevelDebug); bad {
-					t.Errorf("a file the store rejects logged %q at %v", e.Message, e.Level)
+				if e, bad := anyLineAbove(got.obs.All(), level); bad {
+					t.Errorf("a file the store rejects logged %q at %v, above %v", e.Message, e.Level, level)
 				}
 				const ignored = "the cache file is not usable and is ignored"
-				if lines := linesAt(got.obs.All(), slog.LevelDebug, ignored); len(lines) != 1 {
-					t.Errorf("ignored-file lines = %v, want one Debug line; all: %v", lines, got.obs.All())
+				if lines := linesAt(got.obs.All(), level, ignored); len(lines) != 1 {
+					t.Errorf("ignored-file lines = %v, want one %v line; all: %v", lines, level, got.obs.All())
 				}
 				if !got.plan.discoveryEffective() {
 					t.Error("discovery is no longer effective after an ignored file")
