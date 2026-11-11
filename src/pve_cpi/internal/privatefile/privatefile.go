@@ -84,10 +84,12 @@ type Policy struct {
 	// NewID returns a unique name fragment for a temporary file. Nil uses 128
 	// random bits in hex.
 	NewID func() (string, error)
-	// EUID returns the user ID that must own a private path. Nil uses the
-	// process's effective user ID, which is the only value production code
-	// sets. A test sets it to show that a caller's checks refuse a path that
-	// another user owns, which an ordinary user cannot create.
+	// EUID returns the user ID that must own a private path in PrivateInfo,
+	// OpenRoot, and the file opens. Nil uses os.Geteuid(), which every
+	// production policy leaves it. Only tests set it, to show that a caller's
+	// checks refuse a path that another user owns, which an ordinary user
+	// cannot create. A test in this package fails when a non-test source
+	// sets it.
 	EUID func() int
 }
 

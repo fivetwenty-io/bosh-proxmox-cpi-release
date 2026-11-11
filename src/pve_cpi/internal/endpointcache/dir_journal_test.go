@@ -447,7 +447,9 @@ func TestHAProfileFileLandsBesideTheJournal(t *testing.T) {
 	if choice.Layer != LayerJournal || !choice.Usable() || choice.Path != sibling {
 		t.Fatalf("choice = %s %s: %v, want the sibling", choice.Layer, choice.Path, choice.Err)
 	}
-	store, err := OpenStore(context.Background(), choice.Root, storeTestConfig(), storeTestCredential, haProfileOptions())
+	store, err := OpenStore(
+		context.Background(), choice.Root, storeTestConfig(), storeTestCredential, haProfileOptions(),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -7,6 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"os"
 	"path/filepath"
@@ -865,4 +868,130 @@ func TestReadRetriesAReplacedFileThenReturnsChanged(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEUIDHookSetsTheRequiredOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private.json")
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	own := os.Geteuid()
+	custom := errors.New("custom ownership cause")
+	cases := []struct {
+		name   string
+		euid   func() int
+		want   error
+		wantID int
+		custom bool
+	}{
+		{"nil hook uses the process's user", nil, nil, own, false},
+		{"hook naming the file's owner", func() int { return own }, nil, own, false},
+		{"hook naming another user", func() int { return own + 1 }, ErrUnsafeOwnership, own + 1, false},
+		{"hook naming another user with a custom cause", func() int { return own + 1 }, custom, own + 1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := Policy{EUID: tc.euid}
+			if tc.custom {
+				p.Ownership = custom
+			}
+			err := p.PrivateInfo(path, info, false)
+			if tc.want == nil {
+				if err != nil {
+					t.Fatalf("PrivateInfo = %v; want accepted", err)
+				}
+				return
+			}
+			var unsafe *UnsafePathError
+			if !errors.Is(err, tc.want) || !errors.As(err, &unsafe) {
+				t.Fatalf("PrivateInfo = %v; want %v", err, tc.want)
+			}
+			if unsafe.EUID != tc.wantID || unsafe.UID != own {
+				t.Errorf("EUID/UID = %d/%d; want %d/%d", unsafe.EUID, unsafe.UID, tc.wantID, own)
+			}
+		})
+	}
+}
+
+func TestEUIDHookIsNeverSetByProductionCode(t *testing.T) {
+	var offenders []string
+	err := filepath.WalkDir(filepath.Join("..", ".."), func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			return err
+		}
+		if setsEUIDHook(file) {
+			offenders = append(offenders, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(offenders) > 0 {
+		t.Errorf("non-test sources set the Policy.EUID test hook: %v", offenders)
+	}
+}
+
+// setsEUIDHook reports whether the file names an EUID field in a composite
+// literal other than an UnsafePathError, which reports an EUID and has no
+// hook, or assigns to a selector named EUID.
+func setsEUIDHook(file *ast.File) bool {
+	found := false
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.CompositeLit:
+			if literalTypeName(node.Type) != "UnsafePathError" && literalNamesEUID(node) {
+				found = true
+			}
+		case *ast.AssignStmt:
+			for _, lhs := range node.Lhs {
+				if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "EUID" {
+					found = true
+				}
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// literalNamesEUID reports whether a composite literal keys an element EUID.
+func literalNamesEUID(lit *ast.CompositeLit) bool {
+	for _, elt := range lit.Elts {
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "EUID" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// literalTypeName is the name of a composite literal's type without its
+// package qualifier, or empty for an anonymous or elided type.
+func literalTypeName(expr ast.Expr) string {
+	switch typed := expr.(type) {
+	case *ast.Ident:
+		return typed.Name
+	case *ast.SelectorExpr:
+		return typed.Sel.Name
+	}
+	return ""
 }
