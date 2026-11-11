@@ -534,12 +534,18 @@ const serverClosedIdleMessage = "http: server closed idle connection"
 // it. Nothing was sent, and nothing a retry could change would let the next
 // attempt send, so a retry only repeats the refusal through its whole backoff.
 //
+// A request the pool refused for its send-by deadline (endpointpool.ErrSendByPassed)
+// is never transient either, including one whose bound passed while the dial
+// was in flight, which the SDK reports as a ConnectionError. The deadline is
+// past for every later attempt too, so a retry only repeats the refusal
+// through its whole backoff.
+//
 // nil → false.
 func IsTransientTransport(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, endpointpool.ErrTetherConflict) {
+	if errors.Is(err, endpointpool.ErrTetherConflict) || errors.Is(err, endpointpool.ErrSendByPassed) {
 		return false
 	}
 	// Permanent 500-with-text shapes are excluded before the blanket 5xx rule
