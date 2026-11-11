@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"slices"
 	"strings"
@@ -468,9 +469,11 @@ func TestDiscoveryWorker_PinFailureInAnotherProcess(t *testing.T) {
 	})
 }
 
-// A clock that steps back hides the stored section from a reader, so every
-// call is due. A failure that repeats is still the same failure, and its line
-// stays at the steady level.
+// A clock that steps back more than an attempt's wait hides the stored
+// section from a reader, and the section is too far ahead to hold the refresh
+// back, so every call is due. A failure that repeats is still the same
+// failure, and its line stays at the steady level and promises no wait,
+// because the merge cannot record an attempt on a hidden section.
 func TestDiscoveryWorker_ClockStepBackKeepsTheFailureLevelSteady(t *testing.T) {
 	t.Parallel()
 	e := newWorkerEnv(t, workerEnvOptions{})
@@ -483,13 +486,65 @@ func TestDiscoveryWorker_ClockStepBackKeepsTheFailureLevelSteady(t *testing.T) {
 	e.clock.advance(endpointcache.RefreshInterval)
 	e.run()
 	e.wantLine("because the cluster root CA could not be read", log.LevelInfo)
-	e.clock.advance(-10 * time.Minute)
+	e.clock.advance(-2 * time.Hour)
 	for call := 1; call <= 3; call++ {
 		e.run()
 		if e.requests() == 0 {
 			t.Fatalf("call %d sent no request, so the stepped-back clock did not hide the section", call)
 		}
-		e.wantLine("because the cluster root CA could not be read", log.LevelDebug)
+		e.wantLine("the stored discovery is dated more than 1h ahead of the clock, so the refresh runs "+
+			"without a recorded attempt", log.LevelDebug)
+		e.wantLine("because the cluster root CA could not be read; the attempt was not recorded, because the "+
+			"stored discovery is dated ahead of the clock, so the next call tries again", log.LevelDebug)
+		e.noLine("next attempt in")
+	}
+}
+
+// A clock that steps back by less than an attempt's wait hides the stored
+// section, and the merge cannot record an attempt on it, so a refresh would
+// run unrecorded, and one the drain cancels would start again on every call.
+// The hidden section stands for the refresh that wrote it and holds the next
+// one back until the clock reaches it, which is no longer than a recorded
+// attempt would.
+func TestDiscoveryWorker_SectionAheadOfTheClockHoldsTheRefreshBack(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		mode  config.DiscoveryMode
+		level slog.Level
+	}{
+		{config.DiscoveryModeAuto, log.LevelDebug},
+		{config.DiscoveryModeOn, log.LevelWarn},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			t.Parallel()
+			e := newWorkerEnv(t, workerEnvOptions{mode: tc.mode})
+			e.run()
+			e.clock.advance(endpointcache.RefreshInterval)
+			e.run()
+			written := e.payload().Discovery.DiscoveredAt
+			e.clock.advance(-10 * time.Minute)
+			if !endpointcache.RefreshDue(e.payload(), e.clock.Now(), false) {
+				t.Fatal("a reader still sees the section, so the test does not hide it")
+			}
+			for call := 1; call <= 3; call++ {
+				e.run()
+				if n := e.requests(); n != 0 {
+					t.Fatalf("call %d sent %d requests while the stored section is ahead of the clock", call, n)
+				}
+				e.wantLine("the stored discovery is dated ahead of the clock, so no attempt can be recorded; "+
+					"skipping the refresh until the clock reaches it", tc.level)
+			}
+			e.begin()
+			if _, ok := e.newWorker().recordStart(context.Background()); ok {
+				t.Fatal("the reads may start although no attempt could be recorded")
+			}
+			// Once the clock reaches the section, a reader sees it again and its
+			// own next refresh time decides.
+			e.clock.advance(10*time.Minute - endpointcache.FutureSkew)
+			if got := e.payload(); got == nil || got.Discovery == nil || !got.Discovery.DiscoveredAt.Equal(written) {
+				t.Fatalf("payload %+v, want the section written at %v", got, written)
+			}
+		})
 	}
 }
 

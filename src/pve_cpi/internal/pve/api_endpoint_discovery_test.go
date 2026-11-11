@@ -782,6 +782,65 @@ func TestDiscoveryWorker_IdentityChangeUnderVerifySSLFalseIsRefused(t *testing.T
 	}
 }
 
+// A refused identity and a standing conflict record an attempt in place of a
+// result, and their reads all answered, so the reads_timed_out that the
+// attempt before the reads stored must not stay behind as if they had timed
+// out. The last_failure from before the refresh comes back.
+func TestDiscoveryWorker_RefusedIdentityKeepsTheFailureFromBeforeTheRefresh(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		prior endpointcache.DiscoveryFailure
+	}{
+		{"no failure before", ""},
+		{"a failure before", endpointcache.FailureRootCAUnreadable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e := newWorkerEnv(t, workerEnvOptions{})
+			e.run()
+			if tc.prior != "" {
+				setRootless := func(rootless bool) {
+					e.cluster.set(func() {
+						for _, name := range e.cluster.names {
+							e.cluster.rootless[name] = rootless
+						}
+					})
+				}
+				setRootless(true)
+				e.clock.advance(endpointcache.RefreshInterval)
+				e.run()
+				setRootless(false)
+			}
+			if got := e.payload().Discovery.LastFailure; got != tc.prior {
+				t.Fatalf("last_failure before the refused refresh = %q, want %q", got, tc.prior)
+			}
+			e.cluster.replaceRoot()
+			e.clock.advance(endpointcache.RefreshInterval)
+			e.run()
+			e.wantLine("with verify_ssl false this is refused", log.LevelError)
+			p := e.payload()
+			if !p.Cluster.IdentityConflict {
+				t.Fatalf("identity %+v, want a recorded conflict", p.Cluster)
+			}
+			if p.Discovery.LastFailure != tc.prior {
+				t.Fatalf("last_failure after a refused identity = %q, want %q", p.Discovery.LastFailure, tc.prior)
+			}
+
+			// A refresh that meets the standing conflict keeps it too.
+			e.clock.advance(3 * time.Hour)
+			e.begin()
+			e.newWorker().discover(context.Background(), workerSeed, e.binding())
+			e.wantLine("the cached cluster identity differs", log.LevelWarn)
+			p = e.payload()
+			if p.Discovery.LastFailure != tc.prior || !p.Discovery.DiscoveredAt.Equal(e.clock.Now()) {
+				t.Fatalf("discovery after a standing conflict %+v, want last_failure %q at %v",
+					p.Discovery, tc.prior, e.clock.Now())
+			}
+		})
+	}
+}
+
 // A refresh that meets a standing conflict records its attempt and says the
 // conflict once, at Warn, because it may be the first code of the call to find
 // it.
@@ -991,6 +1050,61 @@ func TestDiscoveryWorker_UnrecordedAttemptPromisesNoWait(t *testing.T) {
 			e.wantLine("api endpoint discovery: no result through "+workerSeed+", because the cluster root CA "+
 				"could not be read; the attempt was not recorded, so the next call tries again", log.LevelDebug)
 			e.noLine("next attempt in")
+			e.noLineAt(log.LevelInfo)
+		})
+	}
+}
+
+// A failure whose own write does not land follows the attempt that the
+// refresh recorded before its reads, and that attempt still holds the next
+// refresh back with reads_timed_out as its reason, so the line says that and
+// promises no retry on the next call.
+func TestDiscoveryWorker_UnrecordedFailureNamesTheAttemptThatStands(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		block func(t *testing.T, e *workerEnv)
+	}{
+		{"the write fails", func(t *testing.T, e *workerEnv) {
+			// A directory in the file's place makes the write fail.
+			if err := os.Remove(e.filePath()); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(e.filePath(), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"the lock wait runs out", func(t *testing.T, e *workerEnv) {
+			path := filepath.Join(e.dir, e.store.Key().LockName())
+			f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) // #nosec G304 -- test-owned temp path
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = f.Close() })
+			if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e := newWorkerEnv(t, workerEnvOptions{})
+			e.begin()
+			w := e.newWorker()
+			start, ok := w.recordStart(context.Background())
+			if !ok {
+				t.Fatal("the attempt before the reads was not recorded")
+			}
+			tc.block(t, e)
+			w.recordFailure(context.Background(), workerSeed, fmt.Errorf("read: %w", ErrDiscoveryRoot), start)
+			line := e.wantLine("api endpoint discovery: no result through "+workerSeed+", because the cluster "+
+				"root CA could not be read; the failure was not recorded, so the attempt recorded before the "+
+				"reads stands, with reads_timed_out as its reason, and the next attempt is 1h after this refresh "+
+				"began", log.LevelDebug)
+			if got := line.Attrs["stored_failure"]; got != string(endpointcache.FailureReadsTimedOut) {
+				t.Errorf("stored_failure = %v, want reads_timed_out", got)
+			}
+			e.noLine("the next call tries again")
 			e.noLineAt(log.LevelInfo)
 		})
 	}

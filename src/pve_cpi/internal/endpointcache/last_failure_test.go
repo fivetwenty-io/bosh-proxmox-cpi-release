@@ -258,3 +258,64 @@ func TestStoreRecordsAFailedAttemptOnAMissingFile(t *testing.T) {
 		t.Errorf("the file still carries last_failure after a result: %s", data)
 	}
 }
+
+// An attempt that clears the failure removes the stored last_failure from a
+// section with an outcome, and leaves the failure of a section that exists
+// only to hold one. It is refused beside a failure of its own.
+func TestMergeAttemptClearsTheFailure(t *testing.T) {
+	key := mergeKey()
+	later := payloadNow.Add(time.Minute)
+	clearing := &DiscoveryAttempt{At: later, NextRefreshAfter: later.Add(MaxRefreshWait), ClearFailure: true}
+
+	stored := payloadFor(key, "pve2", "pve3")
+	stored.Discovery.Outcome = OutcomeNoStatus
+	stored.Discovery.LastFailure = FailureReadsTimedOut
+	cleared, _, err := Merge(stored, key, Change{Attempt: clearing}, later)
+	want := stored.clone()
+	want.Discovery.DiscoveredAt, want.Discovery.NextRefreshAfter = later, later.Add(MaxRefreshWait)
+	want.Discovery.LastFailure = ""
+	if err != nil || !reflect.DeepEqual(cleared, want) {
+		t.Fatalf("over a result: %v\n got %s\nwant %s", err, trustDump(cleared), trustDump(want))
+	}
+
+	failureOnly := &Payload{Key: key, Discovery: failureSection(FailureReadsTimedOut)}
+	kept, _, err := Merge(failureOnly, key, Change{Attempt: clearing}, later)
+	if err != nil || kept.Discovery.LastFailure != FailureReadsTimedOut {
+		t.Fatalf("a section with no outcome: %+v, %v", kept.Discovery, err)
+	}
+
+	both := *clearing
+	both.Failure = FailureNodesEmpty
+	if _, _, err := Merge(stored, key, Change{Attempt: &both}, later); !errors.Is(err, ErrInvalidChange) {
+		t.Fatalf("an attempt that stores and clears a failure: %v, want ErrInvalidChange", err)
+	}
+}
+
+// The view says when an attempt records nothing, which is when the stored
+// section is dated more than FutureSkew ahead of the view's clock.
+func TestStoredAttemptHidden(t *testing.T) {
+	section := payloadNow.Add(time.Hour)
+	for _, tc := range []struct {
+		name string
+		view Stored
+		want bool
+	}{
+		{"no section", Stored{Now: payloadNow}, false},
+		{"section in the past", Stored{Now: payloadNow, DiscoveredAt: payloadNow.Add(-time.Hour)}, false},
+		{"section within the skew", Stored{Now: payloadNow, DiscoveredAt: payloadNow.Add(FutureSkew)}, false},
+		{"section ahead", Stored{Now: payloadNow, DiscoveredAt: section}, true},
+		{"no clock", Stored{DiscoveredAt: section}, false},
+	} {
+		if got := tc.view.AttemptHidden(); got != tc.want {
+			t.Errorf("%s: AttemptHidden = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	key := mergeKey()
+	stored := payloadFor(key, "pve2")
+	stored.Discovery.DiscoveredAt = section
+	stored.Discovery.NextRefreshAfter = section.Add(RefreshInterval)
+	state, _ := readState(stored, key, payloadNow)
+	if view := state.view(payloadNow); !view.AttemptHidden() || !view.DiscoveredAt.Equal(section) {
+		t.Fatalf("view of a section ahead of the clock: hidden %v at %v", view.AttemptHidden(), view.DiscoveredAt)
+	}
+}

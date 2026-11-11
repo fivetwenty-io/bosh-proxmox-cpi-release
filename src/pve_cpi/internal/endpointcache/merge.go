@@ -126,10 +126,11 @@ type Change struct {
 	// and the identity stay as stored. It is accepted while a conflict stands
 	// and alongside Conflict. A change that carries it with a Result or a Hint
 	// is refused. An attempt that carries a Failure also stores it as the
-	// section's last_failure. When the file holds no discovery section, an
-	// attempt with a Failure creates one that holds no nodes and no outcome,
-	// so a discovery that keeps failing waits for its next refresh, and an
-	// attempt without a Failure records nothing.
+	// section's last_failure, and one that sets ClearFailure removes it.
+	// When the file holds no discovery section, an attempt with a Failure
+	// creates one that holds no nodes and no outcome, so a discovery that
+	// keeps failing waits for its next refresh, and an attempt without a
+	// Failure records nothing.
 	Attempt *DiscoveryAttempt
 }
 
@@ -147,8 +148,15 @@ type DiscoveryAttempt struct {
 	// Failure is why the discovery ended before it had a result, or empty for
 	// an attempt the trust rules recorded in place of a result. A value
 	// outside the enumeration is refused. An empty Failure leaves the stored
-	// last_failure as it was.
+	// last_failure as it was, unless ClearFailure is set.
 	Failure DiscoveryFailure
+	// ClearFailure removes the stored last_failure. A discovery whose reads
+	// answered but which records no result, such as one the trust rules
+	// refuse, sets it to put back a section that held no failure before the
+	// discovery's own attempt replaced it. It is refused beside a Failure, and
+	// it leaves the failure of a section that has no outcome, because such a
+	// section exists only to hold one.
+	ClearFailure bool
 }
 
 // Stored is the stored file as a writer's build function sees it under the
@@ -172,6 +180,10 @@ type Stored struct {
 	// the failure that section records. It is empty when the file has no
 	// discovery section or the section records none.
 	LastFailure DiscoveryFailure
+	// DiscoveredAt is the discovered_at of the stored discovery section as it
+	// is written, whatever the section's time, and zero when the file has no
+	// discovery section. AttemptHidden reads it.
+	DiscoveredAt time.Time
 	// Now is the clock UpdatePayload was given, which the merge of the
 	// returned change uses and both views were read at. A decision made in
 	// build, such as DecideTrust, takes this time, so the decision and the
@@ -249,8 +261,24 @@ func (s storedState) view(now time.Time) Stored {
 	view := Stored{Usable: s.usable.clone(), Known: cloneNodes(s.known), Now: now}
 	if s.discovery != nil {
 		view.LastFailure = s.discovery.LastFailure
+		view.DiscoveredAt = s.discovery.DiscoveredAt
 	}
 	return view
+}
+
+// AttemptHidden reports whether an Attempt at the view's clock records
+// nothing, because the stored discovery section is dated more than FutureSkew
+// ahead of that clock. A reader hides such a section, and moving its time
+// would show it, so the merge leaves it as it is, and only a result replaces
+// it. A view with no section, or with no clock, hides nothing.
+func (s Stored) AttemptHidden() bool {
+	return !s.Now.IsZero() && sectionAhead(s.DiscoveredAt, s.Now)
+}
+
+// sectionAhead reports whether a discovery section dated at is more than
+// FutureSkew ahead of now, which is when a reader hides it.
+func sectionAhead(at, now time.Time) bool {
+	return at.After(now.Add(FutureSkew))
 }
 
 // merge is Merge for a stored state that readStored returned at the same now.
@@ -332,15 +360,17 @@ func applyConflict(next *Payload, key Key, change Change) error {
 
 // applyAttempt moves next's stored discovery section to change.Attempt's two
 // times, and stores the attempt's failure as its last_failure when it carries
-// one. next.Discovery is the raw stored section, so every node, pin, and
-// confirmation, and the outcome, stay as stored. An attempt never makes a
-// section visible. It records nothing for a section a reader hides for its
-// time, because moving that section's time would show it. When there is no
-// section, an attempt with a failure creates one with no nodes and no outcome,
-// and an attempt without one records nothing. It refuses a failure outside the
-// enumeration, an attempt whose next refresh is before the attempt, and one
-// dated more than FutureSkew before the stored discovery, because a discovery
-// cannot run before the one it follows.
+// one, or removes the stored one when the attempt clears it. next.Discovery is
+// the raw stored section, so every node, pin, and confirmation, and the
+// outcome, stay as stored. An attempt never makes a section visible. It
+// records nothing for a section a reader hides for its time, because moving
+// that section's time would show it. When there is no section, an attempt
+// with a failure creates one with no nodes and no outcome, and an attempt
+// without one records nothing. It refuses a failure outside the enumeration,
+// an attempt that both stores and clears a failure, an attempt whose next
+// refresh is before the attempt, and one dated more than FutureSkew before
+// the stored discovery, because a discovery cannot run before the one it
+// follows.
 func applyAttempt(next *Payload, change Change, now time.Time, drops *[]Drop) error {
 	attempt := change.Attempt
 	switch {
@@ -356,21 +386,26 @@ func applyAttempt(next *Payload, change Change, now time.Time, drops *[]Drop) er
 		return fmt.Errorf("%w: discovery attempt's next refresh is before the attempt", ErrInvalidChange)
 	case attempt.Failure != "" && !attempt.Failure.Valid():
 		return fmt.Errorf("%w: discovery attempt failure is not one of the enumerated values", ErrInvalidChange)
+	case attempt.Failure != "" && attempt.ClearFailure:
+		return fmt.Errorf("%w: discovery attempt both stores and clears a failure", ErrInvalidChange)
 	}
 	switch {
 	case next.Discovery == nil && attempt.Failure == "":
 		return nil
 	case next.Discovery == nil:
 		next.Discovery = &DiscoverySection{Nodes: []DiscoveredNode{}}
-	case next.Discovery.DiscoveredAt.After(now.Add(FutureSkew)):
+	case sectionAhead(next.Discovery.DiscoveredAt, now):
 		return nil
 	case attempt.At.Before(next.Discovery.DiscoveredAt.Add(-FutureSkew)):
 		return fmt.Errorf("%w: discovery attempt is before the stored discovery", ErrInvalidChange)
 	}
 	next.Discovery.DiscoveredAt = attempt.At.UTC()
 	next.Discovery.NextRefreshAfter = attempt.NextRefreshAfter.UTC()
-	if attempt.Failure != "" {
+	switch {
+	case attempt.Failure != "":
 		next.Discovery.LastFailure = attempt.Failure
+	case attempt.ClearFailure && next.Discovery.Outcome != "":
+		next.Discovery.LastFailure = ""
 	}
 	if attempt.NextRefreshAfter.After(now.Add(MaxRefreshWait + FutureSkew)) {
 		next.Discovery.NextRefreshAfter = time.Time{}

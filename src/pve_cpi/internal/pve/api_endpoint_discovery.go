@@ -480,17 +480,40 @@ type discoveryStart struct {
 	section *endpointcache.DiscoverySection
 	// lastFailure is the stored last_failure before the attempt, as written.
 	lastFailure endpointcache.DiscoveryFailure
+	// ahead is how far the stored section was dated ahead of the clock when
+	// the attempt recorded nothing because a reader hides that section, and
+	// zero otherwise.
+	ahead time.Duration
 }
+
+// maxHiddenWait is the furthest ahead of the clock a hidden discovery section
+// may be dated and still hold the refresh back. It is the wait the attempt
+// the section stands in for would have set, with the allowance a reader gives
+// a time ahead of its clock, so a skewed section never holds discovery back
+// longer than a recorded attempt does.
+const maxHiddenWait = discoveryFailureWait + endpointcache.FutureSkew
 
 // recordStart records the attempt under the key's lock and reports whether
 // the reads may start. When the attempt does not reach the file, because the
 // write failed or the lock wait ran out, the refresh is skipped, as due skips
 // one whose write would fail, because a refresh that runs unrecorded and is
 // then cancelled would start again on every call.
+//
+// A stored section that a reader hides for being dated ahead of the clock
+// takes no attempt, because the merge never moves that section's time. Such a
+// section was written by a refresh, so while it is dated no more than
+// maxHiddenWait ahead it holds the refresh back until the clock reaches it,
+// which is no longer than a recorded attempt would. One dated further ahead is
+// a skewed time that must not stall discovery, so the reads run without a
+// recorded attempt, because only a result replaces that section.
 func (w *DiscoveryWorker) recordStart(ctx context.Context) (discoveryStart, bool) {
 	var start discoveryStart
 	res, err := w.store.UpdatePayload(ctx, w.now(), func(view endpointcache.Stored) (endpointcache.Change, error) {
 		at := view.Now.UTC()
+		if view.AttemptHidden() {
+			start = discoveryStart{ahead: view.DiscoveredAt.Sub(view.Now)}
+			return endpointcache.Change{}, nil
+		}
 		start = discoveryStart{at: at, lastFailure: view.LastFailure}
 		if view.Usable != nil && view.Usable.Discovery != nil {
 			section := *view.Usable.Discovery
@@ -518,7 +541,30 @@ func (w *DiscoveryWorker) recordStart(ctx context.Context) (discoveryStart, bool
 		return discoveryStart{}, false
 	}
 	w.logUpdate(ctx, res)
+	if start.ahead > 0 {
+		return start, w.runHidden(ctx, start.ahead)
+	}
 	return start, true
+}
+
+// runHidden logs a refresh whose attempt recorded nothing because the stored
+// section is dated ahead of the clock by ahead, and reports whether its reads
+// may run, which they may only when the section is dated too far ahead to
+// hold the refresh back.
+func (w *DiscoveryWorker) runHidden(ctx context.Context, ahead time.Duration) bool {
+	attrs := []slog.Attr{log.String("file", w.store.FileName()), log.String("ahead", ahead.String())}
+	if ahead <= maxHiddenWait {
+		w.logger.LogAttrs(ctx, endpointcache.Level(w.mode),
+			"api endpoint discovery: the stored discovery is dated ahead of the clock, so no attempt can be "+
+				"recorded; skipping the refresh until the clock reaches it",
+			attrs...)
+		return false
+	}
+	w.logger.LogAttrs(ctx, endpointcache.Level(w.mode),
+		"api endpoint discovery: the stored discovery is dated more than "+waitText(discoveryFailureWait)+
+			" ahead of the clock, so the refresh runs without a recorded attempt",
+		attrs...)
+	return true
 }
 
 // priorView returns view as it stood before the attempt was recorded, when
@@ -527,8 +573,7 @@ func (w *DiscoveryWorker) recordStart(ctx context.Context) (discoveryStart, bool
 // build function's copy, so changing it changes nothing stored. Any other
 // view is returned as it is.
 func (s discoveryStart) priorView(view endpointcache.Stored) endpointcache.Stored {
-	if s.at.IsZero() || view.Usable == nil || view.Usable.Discovery == nil ||
-		!view.Usable.Discovery.DiscoveredAt.Equal(s.at) || view.LastFailure != endpointcache.FailureReadsTimedOut {
+	if !s.stands(view) || view.Usable == nil || view.Usable.Discovery == nil {
 		return view
 	}
 	usable := *view.Usable
@@ -544,6 +589,28 @@ func (s discoveryStart) priorView(view endpointcache.Stored) endpointcache.Store
 	section.LastFailure = s.section.LastFailure
 	usable.Discovery = &section
 	return view
+}
+
+// stands reports whether the stored section in view is still the attempt that
+// s recorded, which no other process has written over since.
+func (s discoveryStart) stands(view endpointcache.Stored) bool {
+	return !s.at.IsZero() && view.DiscoveredAt.Equal(s.at) && view.LastFailure == endpointcache.FailureReadsTimedOut
+}
+
+// restore returns the attempt d records in place of a result with the stored
+// last_failure put back as it was before s, when the stored section is still
+// s's attempt. The refresh's reads answered, so the reads_timed_out that s
+// stored is not what happened, and the attempt d records carries no failure
+// of its own. Any other attempt is returned as it is.
+func (s discoveryStart) restore(view endpointcache.Stored, attempt *endpointcache.DiscoveryAttempt,
+) *endpointcache.DiscoveryAttempt {
+	if attempt == nil || attempt.Failure != "" || !s.stands(view) {
+		return attempt
+	}
+	restored := *attempt
+	restored.Failure = s.lastFailure
+	restored.ClearFailure = s.lastFailure == ""
+	return &restored
 }
 
 // answeringEndpoint returns the key's spelling of the configured endpoint that
@@ -585,16 +652,22 @@ func (w *DiscoveryWorker) answeringEndpoint(ctx context.Context, triggered strin
 // still counts as the failure it records, and it is the one before start's
 // attempt, which priorView restores.
 //
-// An attempt that never reached the file, because the write failed or the
-// lock wait ran out, promises no wait, since the next call asks again. Its
-// line is at the failure level, because the update read no stored section to
-// tell whether the outcome changed, and the store or logDropped has already
-// said why nothing was written.
+// A failure that never reached the file, because the write failed or the
+// lock wait ran out, is logged at the failure level, because the update read
+// no stored section to tell whether the outcome changed, and the store or
+// logDropped has already said why nothing was written. When start recorded an
+// attempt, that attempt still holds the next refresh back for an hour from
+// the start, with reads_timed_out as the stored reason, and the line says so.
+// Without one, the line promises no wait, since the next call asks again. A
+// failure that the merge could not record, because the stored section is
+// dated ahead of the clock, promises no wait either.
 func (w *DiscoveryWorker) recordFailure(ctx context.Context, via string, cause error, start discoveryStart) {
 	failure := discoveryFailure(cause)
 	var prior endpointcache.DiscoveryFailure
+	var hidden bool
 	res, err := w.store.UpdatePayload(ctx, w.now(), func(view endpointcache.Stored) (endpointcache.Change, error) {
 		prior = start.priorView(view).LastFailure
+		hidden = view.AttemptHidden()
 		at := view.Now.UTC()
 		return endpointcache.Change{Attempt: &endpointcache.DiscoveryAttempt{
 			At: at, NextRefreshAfter: at.Add(discoveryFailureWait), Failure: failure,
@@ -612,10 +685,28 @@ func (w *DiscoveryWorker) recordFailure(ctx context.Context, via string, cause e
 	attrs := []slog.Attr{
 		log.String("file", w.store.FileName()), log.String("failure", string(failure)), log.Err(cause),
 	}
-	if err != nil || !res.Locked {
+	reason := discoveryFailureReason(cause)
+	switch {
+	case (err != nil || !res.Locked) && !start.at.IsZero():
+		attrs = append(attrs, log.String("stored_failure", string(endpointcache.FailureReadsTimedOut)),
+			log.String("next_refresh_after", start.at.Add(discoveryFailureWait).Format(time.RFC3339)))
+		w.logger.LogAttrs(ctx, endpointcache.Level(w.mode),
+			fmt.Sprintf("api endpoint discovery: no result through %s, because %s; the failure was not recorded, "+
+				"so the attempt recorded before the reads stands, with %s as its reason, and the next attempt is "+
+				"%s after this refresh began", via, reason, endpointcache.FailureReadsTimedOut,
+				waitText(discoveryFailureWait)),
+			attrs...)
+		return
+	case err != nil || !res.Locked:
 		w.logger.LogAttrs(ctx, endpointcache.Level(w.mode),
 			fmt.Sprintf("api endpoint discovery: no result through %s, because %s; the attempt was not recorded, "+
-				"so the next call tries again", via, discoveryFailureReason(cause)),
+				"so the next call tries again", via, reason),
+			attrs...)
+		return
+	case hidden:
+		w.logger.LogAttrs(ctx, endpointcache.Level(w.mode),
+			fmt.Sprintf("api endpoint discovery: no result through %s, because %s; the attempt was not recorded, "+
+				"because the stored discovery is dated ahead of the clock, so the next call tries again", via, reason),
 			attrs...)
 		return
 	}
@@ -625,7 +716,7 @@ func (w *DiscoveryWorker) recordFailure(ctx context.Context, via string, cause e
 	}
 	w.logger.LogAttrs(ctx, level,
 		fmt.Sprintf("api endpoint discovery: no result through %s, because %s; next attempt in %s",
-			via, discoveryFailureReason(cause), waitText(discoveryFailureWait)),
+			via, reason, waitText(discoveryFailureWait)),
 		attrs...)
 }
 
@@ -722,7 +813,9 @@ func readerNodes(
 
 // recordResult applies the trust rules to obs inside the store's locked update
 // and logs what the decision and the write call for. The summary compares the
-// view as it stood before start's attempt.
+// view as it stood before start's attempt. A decision that records an attempt
+// in place of a result, such as a refused identity, puts back the
+// last_failure from before start's attempt, because the reads answered.
 func (w *DiscoveryWorker) recordResult(
 	ctx context.Context, b DiscoveryBinding, reads DiscoveryReads, result DiscoveryResult,
 	obs endpointcache.Observation, start discoveryStart,
@@ -743,7 +836,11 @@ func (w *DiscoveryWorker) recordResult(
 		if w.beforeWrite != nil {
 			w.beforeWrite(ctx)
 		}
-		return d.Change, nil
+		change := d.Change
+		if change.Result == nil {
+			change.Attempt = start.restore(view, change.Attempt)
+		}
+		return change, nil
 	})
 	if decided {
 		w.settleIdentity(b, decision, err == nil)
