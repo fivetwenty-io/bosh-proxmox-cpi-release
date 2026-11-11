@@ -18,6 +18,16 @@ var ErrSendByPassed = errors.New("send-by deadline passed before the request cou
 // is not transient, so no retry helper replays the mutation.
 var ErrTetherConflict = errors.New("mutation refused because its tether key is conflicted on two endpoints")
 
+// ErrRedirectRefused is returned for a request the HTTP client built to follow
+// a redirect. The request names an address no caller chose, and Go keeps the
+// Authorization header when a redirect changes only the port or the scheme, so
+// the pool refuses it before any tether claim or dial. Nothing was sent. The
+// SDK has no marker that stops its retry loop for an error like this one, so a
+// GET that meets a redirect is attempted again, and refused again, until the
+// SDK's retry count runs out. A mutation is not retried. Callers match it with
+// errors.Is, which sees it through the url.Error and the SDK's %w wrapping.
+var ErrRedirectRefused = errors.New("endpoint pool: refusing to follow a redirect")
+
 // Phase names the connect-phase step that failed.
 type Phase string
 

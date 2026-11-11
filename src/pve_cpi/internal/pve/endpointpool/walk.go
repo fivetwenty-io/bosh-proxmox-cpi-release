@@ -103,6 +103,10 @@ func (p *Pool) dispatch(req *http.Request, b bounds) (*http.Response, outcome, e
 		closeRequestBody(req)
 		return nil, unsent, errNoURL
 	}
+	if err := refuseRedirect(req); err != nil {
+		closeRequestBody(req)
+		return nil, unsent, err
+	}
 	method := methodOf(req)
 	addr, addrErr := urlAddress(req.URL)
 	if err := CheckSendBy(req.Context(), time.Now(), method, req.URL.Path); err != nil {

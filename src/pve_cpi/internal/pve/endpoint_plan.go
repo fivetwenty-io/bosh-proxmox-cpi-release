@@ -241,6 +241,22 @@ func (w *endpointWiring) apply(opts sdkclient.Options, logger *log.Logger, cache
 	return opts
 }
 
+// refuseRedirectsWithoutPool gives a client the plan builds no pool for a
+// transport wrapper that refuses a redirect follow-up, so no client the CPI
+// builds follows a redirect, whether or not the pool is installed. A client
+// with a pool already refuses one inside the pool. The wrapper replaces the
+// SDK's swappable transport, which only SetKeepAlive uses, and the CPI never
+// calls it. The SDK's Close still reaches the base transport's idle
+// connections.
+func refuseRedirectsWithoutPool(opts sdkclient.Options) sdkclient.Options {
+	if opts.WrapTransport == nil {
+		opts.WrapTransport = func(base *http.Transport) http.RoundTripper {
+			return endpointpool.RefuseRedirects(base)
+		}
+	}
+	return opts
+}
+
 // dropDiscovered takes the discovered endpoints out of the plan, and out of the
 // cache's mark writes, so the pool is built from the configured endpoints
 // alone.

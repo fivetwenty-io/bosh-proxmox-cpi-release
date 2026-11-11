@@ -603,6 +603,7 @@ func buildClient(cfg, job *config.CPIConfig, logger *log.Logger, tracer trace.Tr
 		}
 	}()
 	opts = wiring.apply(opts, logger, cache)
+	opts = refuseRedirectsWithoutPool(opts)
 
 	raw, err := sdkclient.NewClient(opts)
 	if wiring.poolErr != nil {
