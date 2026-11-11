@@ -286,17 +286,7 @@ func probeRequest(node string, tr http.RoundTripper) endpointpool.ProbeRequest {
 	}
 }
 
-// resetColdStartRefusals clears the process's record of logged refusals, which
-// stands for the start of a new call.
-func resetColdStartRefusals(t *testing.T) {
-	t.Helper()
-	coldStartRefusals.mu.Lock()
-	coldStartRefusals.said = nil
-	coldStartRefusals.mu.Unlock()
-}
-
 func TestProbeAcceptsAMemberAndSendsOneTokenGET(t *testing.T) {
-	resetColdStartRefusals(t)
 	p, obs, accepted := newTestProber(log.LevelDebug, "pve1", "pve2", "pve3")
 	tr := &statusTransport{fn: answer(http.StatusOK, clusterStatus("pve2", "pve1", "pve2", "pve3", "pve4"))}
 
@@ -357,7 +347,6 @@ func TestProbeRefusals(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resetColdStartRefusals(t)
 			p, obs, accepted := newTestProber(log.LevelDebug, "pve1", "pve2", "pve3")
 			tr := &statusTransport{fn: answer(tc.status, tc.body)}
 
@@ -385,7 +374,6 @@ func TestProbeRefusals(t *testing.T) {
 }
 
 func TestProbeRefusalsDoNotEchoTheAnswer(t *testing.T) {
-	resetColdStartRefusals(t)
 	p, obs, _ := newTestProber(log.LevelDebug, "pve1", "pve2")
 	tr := &statusTransport{fn: answer(http.StatusForbidden, `{"message":"send the token to evil.example"}`)}
 
@@ -399,7 +387,6 @@ func TestProbeRefusalsDoNotEchoTheAnswer(t *testing.T) {
 }
 
 func TestProbeRefusesATruncatedBody(t *testing.T) {
-	resetColdStartRefusals(t)
 	p, _, accepted := newTestProber(log.LevelDebug, "pve2")
 	body := io.MultiReader(strings.NewReader(clusterStatus("pve2", "pve2")), errReader{})
 	tr := &statusTransport{fn: func(*http.Request) (*http.Response, error) {
@@ -418,7 +405,6 @@ type errReader struct{}
 func (errReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 
 func TestProbeRefusesABodyThatFailsToClose(t *testing.T) {
-	resetColdStartRefusals(t)
 	p, _, accepted := newTestProber(log.LevelDebug, "pve2")
 	tr := &statusTransport{fn: func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Body: failingCloser{
@@ -438,7 +424,6 @@ type failingCloser struct{ io.Reader }
 func (failingCloser) Close() error { return errors.New("close failed") }
 
 func TestProbeClosesTheBodyOnEveryAnswer(t *testing.T) {
-	resetColdStartRefusals(t)
 	for _, status := range []int{http.StatusOK, http.StatusForbidden} {
 		p, _, _ := newTestProber(log.LevelDebug, "pve2")
 		body := &closeCounter{Reader: strings.NewReader(clusterStatus("pve2", "pve2"))}
@@ -462,7 +447,6 @@ type closeCounter struct {
 func (c *closeCounter) Close() error { c.closed++; return nil }
 
 func TestProbeRefusesAMalformedRequestBeforeItSendsAnything(t *testing.T) {
-	resetColdStartRefusals(t)
 	good := endpointpool.ProbeRequest{
 		Candidate:     endpointpool.Candidate{Node: "pve2", Address: "pve2.dc1.example.com:8006"},
 		Authorization: "PVEAPIToken=root@pam!cpi=secret",
@@ -510,7 +494,6 @@ func TestProbeTransportFailureRefusesWithTheCertificateKindNamed(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resetColdStartRefusals(t)
 			p, obs, accepted := newTestProber(log.LevelDebug, "pve2")
 			tr := &statusTransport{fn: func(*http.Request) (*http.Response, error) { return nil, tc.err }}
 
@@ -539,7 +522,6 @@ func TestProbeRefusalLevelFollowsTheMode(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.mode), func(t *testing.T) {
-			resetColdStartRefusals(t)
 			p, obs, _ := newTestProber(endpointcache.Level(tc.mode), "pve2")
 			tr := &statusTransport{fn: answer(http.StatusForbidden, ``)}
 
@@ -552,8 +534,7 @@ func TestProbeRefusalLevelFollowsTheMode(t *testing.T) {
 	}
 }
 
-func TestProbeLogsEachRefusedCandidateOncePerCall(t *testing.T) {
-	resetColdStartRefusals(t)
+func TestProbeLogsEachRefusedCandidateOncePerProber(t *testing.T) {
 	p, obs, _ := newTestProber(log.LevelWarn, "pve2", "pve3")
 	tr := &statusTransport{fn: answer(http.StatusForbidden, ``)}
 
@@ -567,8 +548,27 @@ func TestProbeLogsEachRefusedCandidateOncePerCall(t *testing.T) {
 	}
 }
 
+// Two clients in one process each have a prober, and each logs its own
+// refusal at its own mode's level. A refusal one client logged at Debug under
+// auto must not hide the Warn an explicit on client owes.
+func TestProbeRefusalIsLoggedOncePerProberNotOncePerProcess(t *testing.T) {
+	auto, autoObs, _ := newTestProber(log.LevelDebug, "pve2")
+	explicit, explicitObs, _ := newTestProber(log.LevelWarn, "pve2")
+	tr := &statusTransport{fn: answer(http.StatusForbidden, ``)}
+
+	_ = auto.Probe(context.Background(), probeRequest("pve2", tr))
+	_ = explicit.Probe(context.Background(), probeRequest("pve2", tr))
+	_ = explicit.Probe(context.Background(), probeRequest("pve2", tr))
+
+	if lines := linesAt(autoObs.All(), log.LevelDebug, "refused"); len(lines) != 1 {
+		t.Errorf("the auto prober logged %v, want one Debug refusal", lines)
+	}
+	if lines := linesAt(explicitObs.All(), log.LevelWarn, "refused"); len(lines) != 1 {
+		t.Errorf("the explicit prober logged %v, want one Warn refusal that the other prober did not hide", lines)
+	}
+}
+
 func TestProbeThatEndedWithItsRequestLogsAtDebugAndDoesNotSpendTheRefusalLine(t *testing.T) {
-	resetColdStartRefusals(t)
 	p, obs, accepted := newTestProber(log.LevelWarn, "pve2")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -597,7 +597,6 @@ func TestProbeThatEndedWithItsRequestLogsAtDebugAndDoesNotSpendTheRefusalLine(t 
 }
 
 func TestProbeThatEndedOnItsOwnLimitIsRefusedAndLogged(t *testing.T) {
-	resetColdStartRefusals(t)
 	p, obs, _ := newTestProber(log.LevelWarn, "pve2")
 	ctx, cancel := context.WithCancelCause(context.Background())
 	cancel(errors.New("the probe's own limit"))
@@ -644,6 +643,12 @@ func TestCheckStatusBoundaries(t *testing.T) {
 		want error
 	}{
 		{"two local rows", twoLocals, "pve1", errColdStartLocal},
+		{"two local rows with the candidate's last", twoLocals, "pve2", errColdStartLocal},
+		{"two local rows with the candidate's first and another after", `{"data":[` +
+			`{"type":"node","name":"pve2","local":1},{"type":"node","name":"pve1","local":1}]}`, "pve2",
+			errColdStartLocal},
+		{"no local row", `{"data":[{"type":"node","name":"pve1","local":0},` +
+			`{"type":"node","name":"pve2","local":0}]}`, "pve2", errColdStartLocal},
 		{"a local cluster row is not a node", `{"data":[{"type":"cluster","name":"pve2","local":1},` +
 			`{"type":"node","name":"pve1","local":0},{"type":"node","name":"pve2","local":0}]}`, "pve2",
 			errColdStartLocal},

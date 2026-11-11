@@ -25,7 +25,7 @@ import (
 // directory, a dead seed, and loopback servers that stand for the nodes an
 // az_map names. A dial function routes each derived name to its server, so the
 // client dials names such as pve2.dc1.example.com without a resolver. They
-// drain the process registry and the refusal record, so none runs in parallel,
+// drain the process registry, so none runs in parallel,
 // and none sleeps: the dead seed refuses at once, and every wait is on the
 // client's own answer.
 
@@ -52,8 +52,7 @@ type coldLab struct {
 func newColdLab(t *testing.T) *coldLab {
 	t.Helper()
 	l := &coldLab{t: t, ca: pvetest.NewCA(t), targets: map[string]string{}, dialed: map[string]int{}}
-	t.Cleanup(SetClientDialForTest(l.dial))
-	resetColdStartRefusals(t)
+	setClientDialForTest(t, l.dial)
 	return l
 }
 
@@ -75,6 +74,18 @@ func (l *coldLab) dials(addr string) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.dialed[addr]
+}
+
+// dialedAddresses lists every address the client tried to dial, sorted.
+func (l *coldLab) dialedAddresses() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]string, 0, len(l.dialed))
+	for addr := range l.dialed {
+		out = append(out, addr)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // coldNodeOptions changes how a node answers.
@@ -190,7 +201,6 @@ func (l *coldLab) config(t *testing.T) *config.CPIConfig {
 // process builds a client the way a new CPI process would.
 func (l *coldLab) process(t *testing.T, cfg *config.CPIConfig) (Client, *log.Observer) {
 	t.Helper()
-	resetColdStartRefusals(t)
 	logger, obs := log.NewObservedLogger(log.LevelDebug)
 	c, err := newClient(cfg, logger, nil)
 	if err != nil {
@@ -494,6 +504,81 @@ func TestColdStartStaysOffWhenAConditionFails(t *testing.T) {
 			drainProcessRegistry(t)
 		})
 	}
+}
+
+// A single value the node-name helper refuses must leave out that value and
+// nothing else. The cluster's node list is held to the names that passed, so a
+// typo in the map cannot turn the cold start off for the whole cluster.
+func TestColdStartOfAMapWithOneInvalidNameStillReachesAnAcceptedCandidate(t *testing.T) {
+	const refused = "bad.name.example"
+	lab := newColdLab(t)
+	cfg := lab.config(t)
+	cfg.Placement = &config.PlacementConfig{AZMap: map[string][]string{
+		"az1": {"pve1", "pve2", "pve3", refused},
+	}}
+	pve2 := lab.node("pve2."+coldWireDomain, coldNodeOptions{})
+	c, obs := lab.process(t, cfg)
+
+	mustCreate(t, c, pve2)
+
+	want := []string{"GET /cluster/status", "POST /nodes/pve9/qemu"}
+	if got := pve2.requests(); !slices.Equal(got, want) {
+		t.Fatalf("pve2 read %v, want the probe and the create", got)
+	}
+	named := false
+	for _, e := range obs.All() {
+		if e.Level == log.LevelDebug && e.Attrs["node"] == refused &&
+			strings.Contains(e.Message, "not a usable node name") {
+			named = true
+		}
+	}
+	if !named {
+		t.Errorf("no Debug line names the refused value %q: %v", refused, obs.All())
+	}
+	for _, e := range obs.All() {
+		if e.Level == log.LevelWarn && strings.Contains(e.Message, "refused") {
+			t.Errorf("the probe refused a member because of the invalid name: %q", e.Message)
+		}
+	}
+	for _, addr := range lab.dialedAddresses() {
+		if strings.Contains(addr, "bad") {
+			t.Errorf("the client dialed %s, derived from a refused name", addr)
+		}
+	}
+	drainProcessRegistry(t)
+}
+
+// A map whose names all fail the helper leaves the cold start nothing to try,
+// so the client dials no address but its own seed.
+func TestColdStartOfAMapWithOnlyInvalidNamesDialsOnlyTheSeed(t *testing.T) {
+	lab := newColdLab(t)
+	cfg := lab.config(t)
+	cfg.Placement = &config.PlacementConfig{AZMap: map[string][]string{
+		"az1": {"pve2.dc1.example.com", "123", "bad.name.example"},
+	}}
+	lab.node("pve2."+coldWireDomain, coldNodeOptions{})
+	lab.node("pve3."+coldWireDomain, coldNodeOptions{})
+	c, obs := lab.process(t, cfg)
+
+	_, err := createVM(c)
+
+	mustFailToConnect(t, err)
+	seed := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+	for _, addr := range lab.dialedAddresses() {
+		if addr != seed {
+			t.Errorf("the client dialed %s, want only the seed %s", addr, seed)
+		}
+	}
+	refused := 0
+	for _, e := range obs.All() {
+		if e.Level == log.LevelDebug && strings.Contains(e.Message, "not a usable node name") {
+			refused++
+		}
+	}
+	if refused != 3 {
+		t.Errorf("Debug lines naming a refused value = %d, want 3", refused)
+	}
+	drainProcessRegistry(t)
 }
 
 func TestColdStartStaysOnForAnOutcomeThatLeavesNoNode(t *testing.T) {

@@ -1,15 +1,20 @@
 package pve
 
 import (
+	"context"
+	"errors"
 	"io/fs"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
@@ -134,6 +139,14 @@ func TestDiscoveryLogLinesNameTheProperty(t *testing.T) {
 	if len(entries) < 2 {
 		t.Fatalf("only %d lines were logged", len(entries))
 	}
+	assertLinesNameTheProperty(t, entries)
+}
+
+// assertLinesNameTheProperty checks that every line that names the property
+// uses its one name, and that no line at Info or above talks about discovery
+// without naming it.
+func assertLinesNameTheProperty(t *testing.T, entries []log.Entry) {
+	t.Helper()
 	for _, e := range entries {
 		for _, token := range discoveryNameToken.FindAllString(e.Message, -1) {
 			if token != "api_endpoint_discovery" {
@@ -146,4 +159,76 @@ func TestDiscoveryLogLinesNameTheProperty(t *testing.T) {
 			t.Errorf("line %q talks about discovery without the property's name", e.Message)
 		}
 	}
+}
+
+// TestColdStartLogLinesNameTheProperty runs the cold start's own paths, which
+// are a walk that refuses one candidate and accepts the next, a map that holds
+// a value the node-name helper refuses, a seed that derives no address, a gate
+// that turns the cold start off, and a hint that cannot be written, under each
+// mode, and checks every line it logs the way the mode and directory lines are
+// checked.
+func TestColdStartLogLinesNameTheProperty(t *testing.T) {
+	entries := make([]log.Entry, 0, 64)
+	for _, mode := range []config.DiscoveryMode{config.DiscoveryModeAuto, config.DiscoveryModeOn} {
+		lab := newColdLab(t)
+		cfg := lab.config(t)
+		cfg.APIEndpointDiscovery = mode
+		cfg.Placement = &config.PlacementConfig{AZMap: map[string][]string{
+			"az1": {"pve1", "pve2", "pve3", "bad.name.example"},
+		}}
+		lab.node("pve2."+coldWireDomain, coldNodeOptions{status: http.StatusForbidden})
+		good := lab.node("pve3."+coldWireDomain, coldNodeOptions{})
+		c, obs := lab.process(t, cfg)
+		mustCreate(t, c, good)
+		drainProcessRegistry(t)
+		entries = append(entries, obs.All()...)
+
+		// A cache that holds a usable discovered node turns the cold start off.
+		gated := lab.config(t)
+		gated.APIEndpointDiscovery = mode
+		seedEndpointCache(t, gated, cacheSeed{nodes: []cachedNode{{name: "pve4", online: true}}})
+		_, gatedObs := lab.process(t, gated)
+		drainProcessRegistry(t)
+		entries = append(entries, gatedObs.All()...)
+
+		// A seed whose derivation the helper refuses yields no candidates.
+		bare := lab.config(t)
+		bare.APIEndpointDiscovery = mode
+		bare.Host = "pve1.com"
+		_, bareObs := lab.process(t, bare)
+		drainProcessRegistry(t)
+		entries = append(entries, bareObs.All()...)
+
+		// A hint the store cannot write, and a hint the registry refuses.
+		logger, hintObs := log.NewObservedLogger(log.LevelDebug)
+		failing := &endpointCache{mode: mode, logger: logger, sink: &cacheMarkSink{
+			store: &fakeUpdater{err: errors.New("the disk is full")}, mode: mode, logger: logger, now: time.Now,
+			start: endpointcache.Go,
+		}}
+		failing.writeHint(context.Background(), "pve3", time.Now())
+		endpointcache.Drain(context.Background(), time.Second)
+		failing.recordColdStart("pve3")
+		endpointcache.Open()
+		entries = append(entries, hintObs.All()...)
+	}
+
+	for _, want := range []string{
+		"leaves out a node whose name is not a usable node name",
+		"from placement.az_map refused",
+		"no cold start from placement.az_map",
+		"the cold start from placement.az_map has no candidates",
+		"the cold-start hint could not be recorded",
+		"the cold-start hint is not recorded",
+	} {
+		found := false
+		for _, e := range entries {
+			if strings.Contains(e.Message, want) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no cold-start line contains %q, so the scan is not reaching it", want)
+		}
+	}
+	assertLinesNameTheProperty(t, entries)
 }

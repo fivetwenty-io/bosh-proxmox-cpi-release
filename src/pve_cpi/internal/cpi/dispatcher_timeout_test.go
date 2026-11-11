@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
@@ -273,5 +274,68 @@ func TestDispatcher_MethodTimeout_KeepsDefiniteAnswer(t *testing.T) {
 	}
 	if !strings.Contains(resp.Error.Message, "requires reconciliation") {
 		t.Errorf("message %q should be the handler's own answer", resp.Error.Message)
+	}
+}
+
+// deadlineProbe records the time a handler's context has left.
+type deadlineProbe struct {
+	hasDeadline bool
+	left        time.Duration
+}
+
+func (p *deadlineProbe) Handle(ctx context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		p.hasDeadline, p.left = true, time.Until(deadline)
+	}
+	return map[string]string{"ok": "yes"}, nil
+}
+
+// TestDispatcher_MutatingHandlersKeepEnoughContextForAColdStartProbe pins the
+// context a create_vm handler runs under. The endpoint pool starts its cold
+// start only when the request's context has at least one probe limit left,
+// which is 25 seconds, so a default envelope that left a mutating call less
+// would silently turn the cold start off in production. With the envelope off
+// the context carries no deadline, and with the defaults on every mutating
+// class leaves far more than a probe limit.
+func TestDispatcher_MutatingHandlersKeepEnoughContextForAColdStartProbe(t *testing.T) {
+	t.Parallel()
+	const probeLimit = 25 * time.Second
+	var cfg *config.CPIConfig
+	resolver := cpi.NewMethodTimeoutResolver(
+		time.Duration(cfg.OperationTimeoutCreateSec())*time.Second,
+		time.Duration(cfg.OperationTimeoutDeleteSec())*time.Second,
+		time.Duration(cfg.OperationTimeoutQuerySec())*time.Second,
+		time.Duration(cfg.OperationTimeoutDefaultSec())*time.Second,
+	)
+	for _, method := range []string{"create_vm", "create_disk", "attach_disk", "delete_vm", "set_vm_metadata"} {
+		t.Run(method+" with the default envelope", func(t *testing.T) {
+			t.Parallel()
+			probe := &deadlineProbe{}
+			d := cpi.NewDispatcherWithOptions(nopLogger(), cpi.WithMethodTimeouts(resolver))
+			mustRegister(t, d, method, probe)
+
+			if resp := d.Handle(context.Background(), req(method)); resp.Error != nil {
+				t.Fatalf("handle: %s", resp.Error.Message)
+			}
+
+			if !probe.hasDeadline || probe.left < 10*probeLimit {
+				t.Errorf("context left = %v (deadline %t), want far more than %v",
+					probe.left, probe.hasDeadline, probeLimit)
+			}
+		})
+		t.Run(method+" with no envelope", func(t *testing.T) {
+			t.Parallel()
+			probe := &deadlineProbe{}
+			d := cpi.NewDispatcher(nopLogger())
+			mustRegister(t, d, method, probe)
+
+			if resp := d.Handle(context.Background(), req(method)); resp.Error != nil {
+				t.Fatalf("handle: %s", resp.Error.Message)
+			}
+
+			if probe.hasDeadline {
+				t.Errorf("context carries a deadline of %v, want none", probe.left)
+			}
+		})
 	}
 }

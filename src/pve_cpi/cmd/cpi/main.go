@@ -242,6 +242,28 @@ func run() int {
 	return runWithArgs(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, runOptions{})
 }
 
+// newEntryClient builds the client of a cpi-config entry. A test replaces it
+// to see the arguments the production factory passes.
+var newEntryClient = pve.NewEntryClientWithTracer
+
+// entryClientFactory returns the factory that builds the client of a request
+// whose cpi-config entry overrides pve_* properties. The production factory
+// hands the entry's effective config and the job-level config to
+// newEntryClient, and the job decides whether the entry owns the az_map it
+// carries, so the two must stay distinct. An injected test factory builds no
+// real client and gets the entry's config alone.
+func entryClientFactory(
+	injected func(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (pve.Client, error),
+	tracer trace.Tracer,
+) func(effCfg, job *config.CPIConfig, effLogger *log.Logger) (pve.Client, error) {
+	return func(effCfg, job *config.CPIConfig, effLogger *log.Logger) (pve.Client, error) {
+		if injected != nil {
+			return injected(effCfg, effLogger, tracer)
+		}
+		return newEntryClient(effCfg, job, effLogger, tracer)
+	}
+}
+
 // runWithArgs contains the full startup and event loop. Accepting args, stdin,
 // stdout, stderr, and opts as parameters makes every flag-parse, config-load,
 // and client-init path testable without spawning a subprocess or manipulating
@@ -546,16 +568,11 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// whether the entry owns the az_map it carries. An injected test factory
 	// builds no real client and gets the entry's config alone, as before.
 	overrideRuntime := &handlers.RequestOverrideRuntime{
-		ClientFactory: func(effCfg, job *config.CPIConfig, effLogger *log.Logger) (pve.Client, error) {
-			if opts.ClientFactory != nil {
-				return opts.ClientFactory(effCfg, effLogger, clientTracer)
-			}
-			return pve.NewEntryClientWithTracer(effCfg, job, effLogger, clientTracer)
-		},
-		Logger:   logger,
-		BaseHost: cfg.Host,
-		BasePort: cfg.Port,
-		Job:      cfg,
+		ClientFactory: entryClientFactory(opts.ClientFactory, clientTracer),
+		Logger:        logger,
+		BaseHost:      cfg.Host,
+		BasePort:      cfg.Port,
+		Job:           cfg,
 	}
 
 	storageMetrics, storageMetricsErr := handlers.NewStoragePlacementMetrics(meter)

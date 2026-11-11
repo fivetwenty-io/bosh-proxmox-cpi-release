@@ -192,30 +192,6 @@ func (c *endpointCache) writeHint(ctx context.Context, node string, at time.Time
 	}
 }
 
-// coldStartRefusals remembers which candidates this process has logged a
-// refusal for. A CPI call is one process, so logging each refusal once per
-// process logs it once per call, however many clients probe the node.
-var coldStartRefusals struct {
-	mu   sync.Mutex
-	said map[string]bool
-}
-
-// firstColdStartRefusal reports whether this process has not yet logged a
-// refusal of the candidate, and records that it has.
-func firstColdStartRefusal(c endpointpool.Candidate) bool {
-	coldStartRefusals.mu.Lock()
-	defer coldStartRefusals.mu.Unlock()
-	key := c.Address + " " + c.Node
-	if coldStartRefusals.said[key] {
-		return false
-	}
-	if coldStartRefusals.said == nil {
-		coldStartRefusals.said = map[string]bool{}
-	}
-	coldStartRefusals.said[key] = true
-	return true
-}
-
 // coldStartProber proves a cold-start candidate's membership with GET
 // /cluster/status. It accepts a candidate only on a 2xx whose one local node
 // is the candidate's az_map name and whose node rows hold every name in names.
@@ -230,6 +206,30 @@ type coldStartProber struct {
 	// accepted is told the node of a candidate whose probe proved
 	// membership, before Probe returns.
 	accepted func(node string)
+
+	// mu guards said, the candidates this prober has logged a refusal for.
+	// A pool runs one cold start per process and probes each candidate to an
+	// answer at most once, so the prober of a client logs each refusal once
+	// per call. Another client in the process has its own prober and its own
+	// line, at its own mode's level.
+	mu   sync.Mutex
+	said map[string]bool
+}
+
+// firstRefusal reports whether this prober has not yet logged a refusal of
+// the candidate, and records that it has.
+func (p *coldStartProber) firstRefusal(c endpointpool.Candidate) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := c.Address + " " + c.Node
+	if p.said[key] {
+		return false
+	}
+	if p.said == nil {
+		p.said = map[string]bool{}
+	}
+	p.said[key] = true
+	return true
 }
 
 var _ endpointpool.Prober = (*coldStartProber)(nil)
@@ -254,7 +254,7 @@ func (p *coldStartProber) Probe(ctx context.Context, req endpointpool.ProbeReque
 			log.String("endpoint", req.Candidate.Address), log.String("node", req.Candidate.Node))
 		return err
 	}
-	if firstColdStartRefusal(req.Candidate) {
+	if p.firstRefusal(req.Candidate) {
 		p.logger.LogAttrs(context.Background(), p.level, "pve endpoint "+req.Candidate.Address+
 			" from placement.az_map refused: "+reason,
 			log.String("endpoint", req.Candidate.Address), log.String("node", req.Candidate.Node))
