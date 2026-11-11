@@ -892,7 +892,8 @@ func observeMigratedHolder(
 		return "", "", fmt.Errorf("migration target holder placement not observed: %w", err)
 	}
 	if !location.Found || !location.FromConfig || location.Node != targetNode {
-		return "", "", fmt.Errorf("migration target holder not found on node %s by the cluster's config probe", targetNode)
+		return "", "", fmt.Errorf(
+			"migration target holder not found on node %s by the cluster's config probe", targetNode)
 	}
 	target, err := deps.PVE.QEMU().Config(ctx, targetNode, vmid)
 	if err != nil || target == nil {
@@ -900,7 +901,8 @@ func observeMigratedHolder(
 	}
 	if lock, _ := pve.ConfigString(target, "lock"); lock == "migrate" {
 		return "", "", cpierrors.Retriable(
-			"migration target holder %d on node %s still holds the migrate lock; retry once PVE clears it", vmid, targetNode)
+			"migration target holder %d on node %s still holds the migrate lock; retry once PVE clears it",
+			vmid, targetNode)
 	}
 	slot, landed := "", ""
 	for field := range target {
