@@ -143,6 +143,15 @@ func (g *ManagedAllocationGuard) begin(ctx context.Context, m ManagedAllocationM
 		g.mu.Unlock()
 		return "", &managedMutationNotAttempted{err: err}
 	}
+	if errors.Is(err, errManagedRestoreHolderAbsent) {
+		// A parker protection restore targets a node that answered that the
+		// VM's config isn't there. Nothing was sent or recorded, and PVE
+		// would refuse the write there with the same answer, so the guard
+		// stays usable. The refusal goes back unchanged, so a restore that
+		// tries more than one node moves on to the next one.
+		g.mu.Unlock()
+		return "", err
+	}
 	if errors.Is(err, errManagedRestoreChecksIncomplete) {
 		// The checks that admit a parker protection restore could not
 		// finish, and Before recorded the restore as a planned step instead

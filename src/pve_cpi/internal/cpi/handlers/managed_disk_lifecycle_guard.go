@@ -290,14 +290,18 @@ func (g *managedDiskLifecycleGuard) readHolderState(ctx context.Context, call Ma
 	return nil
 }
 
-// readHolderConfig reads the configuration of the VM a mutation targets. As in
-// observeContinuity, a protection restore whose read returns an error ends in
-// restoreChecksIncomplete, any other mutation whose read returns an error ends
-// in admissionReadFailed, and a read that returns nothing still locks the
-// guard.
+// readHolderConfig reads the configuration of the VM a mutation targets. A
+// protection restore whose node answers that the VM's config isn't there ends
+// in managedRestoreHolderAbsent, and one whose read returns any other error
+// ends in restoreChecksIncomplete, as in observeContinuity. Any other mutation
+// whose read returns an error ends in admissionReadFailed, and a read that
+// returns nothing still locks the guard.
 func (g *managedDiskLifecycleGuard) readHolderConfig(ctx context.Context, call ManagedAllocationMutation, node, storage string, vmid int) (map[string]any, error) {
 	config, err := g.lifecycle.deps.PVE.QEMU().Config(ctx, node, vmid)
 	if err != nil && isProtectionRestore(call) {
+		if configReadAnswered(err) {
+			return nil, &managedRestoreHolderAbsent{node: node, vmid: vmid, err: err}
+		}
 		return nil, g.restoreChecksIncomplete(call, node, storage, "parker configuration")
 	}
 	if configReadAnswered(err) {
@@ -1399,6 +1403,40 @@ func (e *managedRestoreChecksIncomplete) Error() string {
 
 func (e *managedRestoreChecksIncomplete) Unwrap() []error {
 	return []error{errManagedRestoreChecksIncomplete, pve.ErrMutationChecksIncomplete}
+}
+
+// errManagedRestoreHolderAbsent marks a parker protection restore that before
+// did not admit because the node it targets answered that the VM's config
+// isn't there. Nothing is recorded for it, so begin hands the refusal back
+// unchanged and leaves the guard usable.
+var errManagedRestoreHolderAbsent = errors.New("parker protection restore targets a node without the VM's config")
+
+// managedRestoreHolderAbsent is the refusal before gives a parker protection
+// restore whose node answered the config read with PVE's answer that the VM's
+// config isn't there, a 404 or the 500 that says the configuration file does
+// not exist. PVE refuses the write itself on that node with the same answer,
+// so the write would change nothing there and is not sent. It records no
+// planned step either, because a step for a node that doesn't hold the VM
+// would only send the next call to read the parker back where it isn't.
+//
+// The refusal carries PVE's answer, so a restore that tries more than one
+// node reads it the way it reads PVE's refusal of the write and moves on to
+// the next node. It matches errManagedRestoreHolderAbsent too, and on purpose
+// it matches neither pve.ErrMutationChecksIncomplete nor
+// pve.ErrMutationNotAttempted, because the node did answer.
+type managedRestoreHolderAbsent struct {
+	node string
+	vmid int
+	err  error
+}
+
+func (e *managedRestoreHolderAbsent) Error() string {
+	return fmt.Sprintf("parker protection restore not sent because node %s holds no config for VM %d: %s",
+		e.node, e.vmid, e.err.Error())
+}
+
+func (e *managedRestoreHolderAbsent) Unwrap() []error {
+	return []error{errManagedRestoreHolderAbsent, e.err}
 }
 
 // restoreChecksIncomplete ends the admission of a parker protection restore

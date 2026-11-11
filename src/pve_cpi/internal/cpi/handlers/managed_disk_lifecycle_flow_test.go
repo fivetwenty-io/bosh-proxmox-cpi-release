@@ -178,6 +178,9 @@ type lifecycleFlowPVE struct {
 	destroyed []string
 	// certificateErr fails every certificate read of the nodes it names.
 	certificateErr map[string]error
+	// onCertificateRead, when set, runs before every certificate read, and
+	// an error it returns fails the read.
+	onCertificateRead func(node string) error
 	// pmxcfsConfigMissing makes a config read or write addressed to a node
 	// the VM isn't on fail the way real PVE fails it, with an HTTP 500 that
 	// says the configuration file does not exist, instead of a 404.
@@ -381,6 +384,11 @@ func (n lifecycleFlowNodes) ListQemuSnapshotConfig(_ context.Context, _, vmidTex
 }
 
 func (n lifecycleFlowNodes) ListCertificatesInfo(_ context.Context, node string) (*nodes.ListCertificatesInfoResponse, error) {
+	if n.c.onCertificateRead != nil {
+		if err := n.c.onCertificateRead(node); err != nil {
+			return nil, err
+		}
+	}
 	if err := n.c.certificateErr[node]; err != nil {
 		return nil, err
 	}
