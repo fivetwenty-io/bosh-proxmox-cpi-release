@@ -72,9 +72,17 @@ properties:
     description: |
       Optional. A directory for the endpoint cache files. When it is unset or
       empty (the default), the CPI places the cache in the endpoint-cache
-      directory beside pve.storage_allocation_journal_dir if that is set, and
-      otherwise in a pve_cpi-endpoint-cache.<euid> directory under the
-      temporary directory. A value here wins over both of those places. The
+      directory beside pve.storage_allocation_journal_dir when that is set and
+      the endpoint-cache directory already exists, which cpi provision-journal
+      creates and the CPI never creates while it runs. When the journal
+      directory is unset, or the directory beside it is missing, the CPI uses a
+      pve_cpi-endpoint-cache.<euid> directory under the temporary directory
+      instead, and it creates that one at mode 0700. An existing directory
+      beside the journal that is not private to the CPI's user ends the search
+      with no cache. A value here wins over both of those places. The CPI never
+      creates it, and it uses no cache when the directory is missing, is a
+      symbolic link, is owned by another user, or grants any access to a group
+      or others. The
       value must be an absolute path, and it must be clean, which means it has
       no `.` or `..` parts, no doubled slashes, and no trailing slash. It may
       not contain control characters or have leading or trailing whitespace,
@@ -1193,7 +1201,10 @@ properties:
       as API endpoints when no configured endpoint can be reached. It runs only
       when the effective discovery mode is on, the CPI authenticates with an
       API token, pve.verify_ssl is true, pve.ca_cert is set, and no usable
-      cached endpoint list exists.
+      cached endpoint list exists. A node is used only after its certificate
+      chains to pve.ca_cert and matches its name, and after its /cluster/status
+      answer shows it as the local member of a cluster that lists every node in
+      this map. The API token goes to the node only after those checks pass.
       Example: {us-east-1a: [pve01, pve02], us-east-1b: [pve03]}
     default: {}
   pve.placement.anti_affinity.enabled:
@@ -2404,7 +2415,10 @@ properties:
       must supply a durable local path. This process-level setting cannot be
       redirected by request context. Runtime validation checks access and locking.
       When pve.endpoint_cache_dir is unset, this directory also places the
-      endpoint cache, in an endpoint-cache directory beside it. The cache
+      endpoint cache, in an endpoint-cache directory beside it that
+      cpi provision-journal creates. The CPI uses that directory only when it
+      exists. A journal directory that is itself named endpoint-cache has no
+      such neighbor. The cache
       directory may not equal, sit inside, or contain this directory.
 
   pve.require_disjoint_storage_sets:
