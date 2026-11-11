@@ -14,8 +14,10 @@ import (
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/privatefile"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
@@ -1307,26 +1309,43 @@ func (c *haCollector) ownedResource(sid string) bool {
 	return found && g.owned
 }
 
-// cacheDirectoryFindings reports a pve.endpoint_cache_dir the CPI cannot use as
-// it stands. The directory holds the cache files and the HA recovery episode
-// record, and the CPI uses it only when it exists as a real directory that no
-// group or other user can reach. A directory with a wider mode is refused, which
-// leaves the record unwritten, so a recovery grace window never starts and the
-// dead-node handover never happens. A directory that does not exist sends the
-// record to the temporary directory until someone creates it, and creating it
-// later moves the record and restarts a running grace window once.
+// cacheDirectoryFindings reports a cache directory the CPI cannot use as it
+// stands. The directory holds the cache files and the HA recovery episode
+// record, and the CPI chooses it in layers. The first is pve.endpoint_cache_dir,
+// the next is the endpoint-cache directory beside the allocation journal when
+// that exists, and the last is a directory under the temporary directory that
+// the CPI creates. A layer that applies and fails the private checks ends the
+// search, which leaves the record unwritten, so a recovery grace window never
+// starts and the dead-node handover never happens. The doctor asks the same
+// question the episode store asks, for every layer, without creating anything.
+// A pve.endpoint_cache_dir that does not exist is the one refusal that falls
+// through to the layers after it, and creating it later moves the record and
+// restarts a running grace window once.
 func (c *haCollector) cacheDirectoryFindings() {
-	path := c.cfg.EndpointCacheDir
-	if path == "" {
+	dir := endpointcache.OptionsFor(c.cfg).Named(ha.EpisodeName)
+	if path := c.cfg.EndpointCacheDir; path != "" && c.overrideFindings(path, dir) {
 		return
 	}
+	choice := dir.Probe()
+	defer func() { _ = choice.Close() }()
+	if choice.Usable() || choice.Err == nil {
+		return
+	}
+	if choice.Layer == endpointcache.LayerTemporary && errors.Is(choice.Err, fs.ErrNotExist) {
+		// The CPI creates this directory on first use, so nothing is wrong yet.
+		return
+	}
+	c.rep.advise(haKindCacheDirectory, choice.Path, "%s%s",
+		cacheRefusalText(choice), cacheOwnerNote(choice.Err))
+}
+
+// overrideFindings reports what is wrong with pve.endpoint_cache_dir itself,
+// and returns true when it reported something.
+func (c *haCollector) overrideFindings(path string, dir endpointcache.DirOptions) bool {
 	info, err := os.Lstat(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		c.rep.advise(haKindCacheDirectory, path,
-			"pve.endpoint_cache_dir does not exist, so the HA recovery episode record sits in the temporary "+
-				"directory instead; create it with mode 0700, and note that doing so moves the record and "+
-				"restarts any grace window that is running")
+		c.missingOverride(path, dir)
 	case err != nil:
 		c.rep.advise(haKindCacheDirectory, path, "pve.endpoint_cache_dir could not be inspected: %v", err)
 	case info.Mode()&fs.ModeSymlink != 0:
@@ -1343,5 +1362,51 @@ func (c *haCollector) cacheDirectoryFindings() {
 				"and keeps no HA recovery record, which means the dead-node handover cannot start; "+
 				"run chmod 0700 on it",
 			info.Mode().Perm())
+	default:
+		return false
 	}
+	return true
+}
+
+// missingOverride reports a pve.endpoint_cache_dir that does not exist. The
+// episode record then goes to the layer that answers after the override, which
+// the finding names, or nowhere when that layer is refused too.
+func (c *haCollector) missingOverride(path string, dir endpointcache.DirOptions) {
+	fallback := dir.WithoutOverride().Probe()
+	defer func() { _ = fallback.Close() }()
+	switch {
+	case fallback.Usable() || (fallback.Layer == endpointcache.LayerTemporary && errors.Is(fallback.Err, fs.ErrNotExist)):
+		c.rep.advise(haKindCacheDirectory, path,
+			"pve.endpoint_cache_dir does not exist, so the HA recovery episode record sits in %s instead; create "+
+				"it with mode 0700, and note that doing so moves the record and restarts any grace window that "+
+				"is running", ha.FallbackDescription(fallback.Layer))
+	case fallback.Err != nil:
+		c.rep.advise(haKindCacheDirectory, path,
+			"pve.endpoint_cache_dir does not exist, and %s cannot be used either (%v), so the CPI keeps no HA "+
+				"recovery record and the dead-node handover cannot start; create pve.endpoint_cache_dir with "+
+				"mode 0700", ha.FallbackDescription(fallback.Layer), fallback.Err.Err)
+	}
+}
+
+// cacheRefusalText says in words which directory a refused layer named and why
+// it was refused.
+func cacheRefusalText(choice endpointcache.Choice) string {
+	what := ha.FallbackDescription(choice.Layer)
+	if choice.Layer == endpointcache.LayerOverride {
+		what = "pve.endpoint_cache_dir"
+	}
+	return fmt.Sprintf("%s is refused (%v), so the CPI keeps no HA recovery record and the dead-node handover "+
+		"cannot start", what, choice.Err.Err)
+}
+
+// cacheOwnerNote adds what an owner mismatch means to the operator. The doctor
+// may run as another user than the CPI, and the CPI refuses a directory it
+// does not own, so the doctor can report only the owner it sees.
+func cacheOwnerNote(refusal *endpointcache.Refusal) string {
+	var unsafe *privatefile.UnsafePathError
+	if !errors.As(refusal, &unsafe) || !errors.Is(unsafe.Cause, privatefile.ErrUnsafeOwnership) {
+		return ""
+	}
+	return fmt.Sprintf("; the CPI runs as the user that owns the directory, and this check ran as uid %d, "+
+		"so confirm the owner is the CPI's user", unsafe.EUID)
 }

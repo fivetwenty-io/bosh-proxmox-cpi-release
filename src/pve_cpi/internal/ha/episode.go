@@ -169,7 +169,7 @@ func (s *EpisodeStore) warnMissingOverride(missing, fallback endpointcache.Choic
 	if s == nil || s.Log == nil {
 		return
 	}
-	where := fallbackDescription(fallback.Layer)
+	where := FallbackDescription(fallback.Layer)
 	warn := func() {
 		if fallback.Usable() {
 			s.Log.Warn("ha episode: pve.endpoint_cache_dir does not exist, so the recovery episode record uses "+
@@ -189,9 +189,9 @@ func (s *EpisodeStore) warnMissingOverride(missing, fallback endpointcache.Choic
 	warn()
 }
 
-// fallbackDescription says in words which directory a layer after the override
+// FallbackDescription says in words which directory a layer after the override
 // stands for.
-func fallbackDescription(layer endpointcache.Layer) string {
+func FallbackDescription(layer endpointcache.Layer) string {
 	switch layer {
 	case endpointcache.LayerJournal:
 		return "the cache directory beside the allocation journal directory"

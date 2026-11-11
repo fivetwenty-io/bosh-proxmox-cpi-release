@@ -379,3 +379,40 @@ func (t *texts) checkOpenedDirectory(r *os.Root) error {
 	}
 	return t.ownerAccess(r.Name(), info)
 }
+
+// probeLayers are the layers Probe considers. They are the layers Resolve
+// considers, except that the temporary layer never creates its directory.
+var probeLayers = []layer{
+	overrideLayer,
+	journalLayer,
+	probeTemporaryLayer,
+}
+
+// probeTemporaryLayer is temporaryLayer without the mkdir. A directory that
+// does not exist yet is refused with a cause that matches os.ErrNotExist,
+// which a caller reads as "the CPI creates it on first use".
+func probeTemporaryLayer(opts Options) (Choice, bool) {
+	return textsFor(opts.DisplayName).temporaryLayerGuarded(os.TempDir(), probeMkdir, opts.Guard)
+}
+
+// probeMkdir stands in for mkdir. It answers as mkdir would for a name that
+// exists, and with a not-exist cause for one that does not, so nothing is
+// created.
+func probeMkdir(path string, _ os.FileMode) error {
+	if _, err := os.Lstat(path); err == nil {
+		return os.ErrExist
+	}
+	return fmt.Errorf("the directory %s does not exist yet, and the CPI creates it on first use: %w",
+		path, os.ErrNotExist)
+}
+
+// Probe chooses the cache directory the way Resolve does, and answers the same
+// layer and refusal for every directory that exists. It differs in one way. It
+// never creates the temporary layer's directory, so a diagnostic that runs it
+// leaves nothing behind, and a temporary directory that is absent comes back
+// as a refusal whose cause matches os.ErrNotExist. The caller closes a usable
+// choice.
+func Probe(opts Options) Choice {
+	opts.Guard = guardJournal(opts.JournalDir, opts.Guard)
+	return refuseJournalOverlap(resolveWith(probeLayers, opts), opts.JournalDir)
+}

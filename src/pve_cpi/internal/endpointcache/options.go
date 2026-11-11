@@ -42,6 +42,10 @@ func (d DirOptions) Options() Options {
 // Resolve chooses the cache directory for d. See the package's Resolve.
 func (d DirOptions) Resolve() Choice { return Resolve(d.Options()) }
 
+// Probe chooses the cache directory for d without creating anything. See the
+// package's Probe.
+func (d DirOptions) Probe() Choice { return Probe(d.Options()) }
+
 // WithoutOverride returns d with pve.endpoint_cache_dir unset, so a caller that
 // may fall back from a missing override reaches the layers after it.
 func (d DirOptions) WithoutOverride() DirOptions {

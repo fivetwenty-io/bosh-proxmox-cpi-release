@@ -11,7 +11,9 @@ import (
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/privatefile"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
@@ -947,4 +949,115 @@ func TestCollectReportsACacheDirectoryTheCPICannotUse(t *testing.T) {
 		cfg.EndpointCacheDir = ""
 		wantNone(t, runCollect(t, haBaseFake(), cfg), haKindCacheDirectory)
 	})
+}
+
+// journalCacheLayout makes a journal directory path and, when sibling is not
+// empty, the endpoint-cache directory beside it with that mode.
+func journalCacheLayout(t *testing.T, sibling os.FileMode) (journal, siblingPath string) {
+	t.Helper()
+	base := t.TempDir()
+	journal = filepath.Join(base, "journal")
+	siblingPath = filepath.Join(base, "endpoint-cache")
+	if sibling != 0 {
+		if err := os.Mkdir(siblingPath, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(siblingPath, sibling); err != nil { //nolint:gosec // the mode is the test's input
+			t.Fatal(err)
+		}
+	}
+	return journal, siblingPath
+}
+
+func TestCollectNamesTheLayerAMissingCacheOverrideFallsBackTo(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	missing := filepath.Join(t.TempDir(), "absent")
+
+	t.Run("directory beside the journal", func(t *testing.T) {
+		journal, _ := journalCacheLayout(t, 0o700)
+		cfg := haCfg("auto", "none")
+		cfg.EndpointCacheDir = missing
+		cfg.StorageAllocationJournalDir = journal
+		r := runCollect(t, haBaseFake(), cfg)
+		want(t, r, haKindCacheDirectory, haSeverityAdvice, missing, "does not exist", "beside the allocation journal")
+		for _, f := range r.Findings {
+			if f.Kind == haKindCacheDirectory && strings.Contains(f.Detail, "temporary") {
+				t.Errorf("the record is beside the journal, but the finding names the temporary directory: %s", f.Detail)
+			}
+		}
+	})
+
+	t.Run("temporary directory", func(t *testing.T) {
+		journal, _ := journalCacheLayout(t, 0)
+		cfg := haCfg("auto", "none")
+		cfg.EndpointCacheDir = missing
+		cfg.StorageAllocationJournalDir = journal
+		r := runCollect(t, haBaseFake(), cfg)
+		want(t, r, haKindCacheDirectory, haSeverityAdvice, missing, "does not exist", "temporary cache directory")
+	})
+
+	t.Run("refused fallback", func(t *testing.T) {
+		journal, _ := journalCacheLayout(t, 0o755)
+		cfg := haCfg("auto", "none")
+		cfg.EndpointCacheDir = missing
+		cfg.StorageAllocationJournalDir = journal
+		r := runCollect(t, haBaseFake(), cfg)
+		want(t, r, haKindCacheDirectory, haSeverityAdvice, missing, "cannot be used either", "mode 0755",
+			"dead-node handover cannot start")
+	})
+}
+
+func TestCollectReportsARefusedDefaultCacheDirectory(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+
+	t.Run("journal sibling with a wide mode and no override", func(t *testing.T) {
+		journal, sibling := journalCacheLayout(t, 0o755)
+		cfg := haCfg("auto", "none")
+		cfg.StorageAllocationJournalDir = journal
+		r := runCollect(t, haBaseFake(), cfg)
+		want(t, r, haKindCacheDirectory, haSeverityAdvice, sibling, "beside the allocation journal", "mode 0755",
+			"dead-node handover cannot start")
+	})
+
+	t.Run("private journal sibling and absent temporary directory", func(t *testing.T) {
+		journal, _ := journalCacheLayout(t, 0o700)
+		cfg := haCfg("auto", "none")
+		cfg.StorageAllocationJournalDir = journal
+		wantNone(t, runCollect(t, haBaseFake(), cfg), haKindCacheDirectory)
+	})
+
+	t.Run("nothing is created for an absent temporary directory", func(t *testing.T) {
+		tmp := t.TempDir()
+		t.Setenv("TMPDIR", tmp)
+		wantNone(t, runCollect(t, haBaseFake(), haCfg("auto", "none")), haKindCacheDirectory)
+		if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
+			t.Fatalf("the doctor left %v (%v) in the temporary directory", entries, err)
+		}
+	})
+
+	t.Run("override that passes the mode check but overlaps the journal", func(t *testing.T) {
+		journal, _ := journalCacheLayout(t, 0)
+		if err := os.Mkdir(journal, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		cfg := haCfg("auto", "none")
+		cfg.EndpointCacheDir = journal
+		cfg.StorageAllocationJournalDir = journal
+		r := runCollect(t, haBaseFake(), cfg)
+		want(t, r, haKindCacheDirectory, haSeverityAdvice, journal, "refused")
+	})
+}
+
+func TestCacheOwnerNoteSaysWhoRanTheCheck(t *testing.T) {
+	t.Parallel()
+	owner := &endpointcache.Refusal{Layer: endpointcache.LayerOverride, Path: "/x", Err: &privatefile.UnsafePathError{
+		Path: "/x", UID: 1234, EUID: 0, Cause: privatefile.ErrUnsafeOwnership, WantDirectory: true,
+	}}
+	if got := cacheOwnerNote(owner); !strings.Contains(got, "uid 0") || !strings.Contains(got, "CPI's user") {
+		t.Errorf("owner note = %q", got)
+	}
+	mode := &endpointcache.Refusal{Err: &privatefile.UnsafePathError{Cause: privatefile.ErrUnsafeMode}}
+	if got := cacheOwnerNote(mode); got != "" {
+		t.Errorf("a mode refusal needs no owner note, got %q", got)
+	}
 }
