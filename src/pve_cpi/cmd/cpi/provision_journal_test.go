@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -489,7 +491,18 @@ func TestProvisionJournalNamesTheOwnerOnTheSiblingAsRoot(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("naming an owner requires root")
 	}
-	account, err := user.LookupId("0")
+	account, err := user.Lookup("nobody")
+	if err != nil {
+		account, err = user.LookupId("0")
+	}
+	if err != nil {
+		t.Skip(err)
+	}
+	wantUID, err := strconv.Atoi(account.Uid)
+	if err != nil {
+		t.Skip(err)
+	}
+	wantGID, err := strconv.Atoi(account.Gid)
 	if err != nil {
 		t.Skip(err)
 	}
@@ -500,8 +513,155 @@ func TestProvisionJournalNamesTheOwnerOnTheSiblingAsRoot(t *testing.T) {
 	if code := runProvisionJournal(args, &out, &stderr); code != 0 || stderr.Len() != 0 {
 		t.Fatalf("code %d: %s", code, stderr.String())
 	}
-	requirePrivateOwnedDirectory(t, journal)
-	requirePrivateOwnedDirectory(t, filepath.Join(base, "endpoint-cache"))
+	for _, path := range []string{journal, filepath.Join(base, "endpoint-cache")} {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st, ok := info.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != wantUID || int(st.Gid) != wantGID {
+			t.Fatalf("%s is not owned by %s", path, account.Username)
+		}
+	}
+}
+
+// fakeRoot makes the command see root with the given accounts, so the --owner path runs for every user.
+func fakeRoot(t *testing.T, accounts map[string]*user.User) {
+	t.Helper()
+	savedIDs, savedLookup := processIDs, lookupAccount
+	processIDs = func() (int, int) { return 0, 0 }
+	lookupAccount = func(name string) (*user.User, error) {
+		if account, ok := accounts[name]; ok {
+			return account, nil
+		}
+		return nil, user.UnknownUserError(name)
+	}
+	t.Cleanup(func() { processIDs, lookupAccount = savedIDs, savedLookup })
+}
+
+func TestProvisionJournalGivesBothDirectoriesTheNamedOwnerWithoutBeingRoot(t *testing.T) {
+	fakeRoot(t, map[string]*user.User{"bosh": {Uid: "4242", Gid: "4343", Username: "bosh"}})
+	calls := recordProvisionDirectory(t, nil)
+	var out, stderr bytes.Buffer
+	args := []string{"--directory", "/x/allocations", "--owner", "bosh"}
+	if code := runProvisionJournal(args, &out, &stderr); code != 0 || stderr.Len() != 0 {
+		t.Fatalf("code %d: %s", code, stderr.String())
+	}
+	want := []provisionCall{{"/x/allocations", 4242, 4343}, {"/x/endpoint-cache", 4242, 4343}}
+	if len(*calls) != 2 || (*calls)[0] != want[0] || (*calls)[1] != want[1] {
+		t.Fatalf("calls %v, want %v", *calls, want)
+	}
+}
+
+func TestProvisionJournalWithoutOwnerUsesTheProcessIDsForBothDirectories(t *testing.T) {
+	fakeRoot(t, nil)
+	processIDs = func() (int, int) { return 1001, 1002 }
+	calls := recordProvisionDirectory(t, nil)
+	var out, stderr bytes.Buffer
+	if code := runProvisionJournal([]string{"--directory", "/x/allocations"}, &out, &stderr); code != 0 {
+		t.Fatalf("code %d: %s", code, stderr.String())
+	}
+	want := []provisionCall{{"/x/allocations", 1001, 1002}, {"/x/endpoint-cache", 1001, 1002}}
+	if len(*calls) != 2 || (*calls)[0] != want[0] || (*calls)[1] != want[1] {
+		t.Fatalf("calls %v, want %v", *calls, want)
+	}
+}
+
+func TestProvisionJournalOwnerFailuresStopBeforeAnyProvisioning(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		ids      func() (int, int)
+		accounts map[string]*user.User
+		want     string
+	}{
+		{"not root", func() (int, int) { return 1000, 1000 }, nil, "--owner requires root"},
+		{"unknown account", func() (int, int) { return 0, 0 }, nil, "runtime owner lookup failed"},
+		{"bad uid", func() (int, int) { return 0, 0 },
+			map[string]*user.User{"bosh": {Uid: "x", Gid: "1"}}, "invalid runtime UID"},
+		{"bad gid", func() (int, int) { return 0, 0 },
+			map[string]*user.User{"bosh": {Uid: "1", Gid: "x"}}, "invalid runtime GID"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeRoot(t, tc.accounts)
+			processIDs = tc.ids
+			calls := recordProvisionDirectory(t, nil)
+			var out, stderr bytes.Buffer
+			args := []string{"--directory", "/x/allocations", "--owner", "bosh"}
+			if code := runProvisionJournal(args, &out, &stderr); code != 1 {
+				t.Fatalf("code %d: %s", code, stderr.String())
+			}
+			if len(*calls) != 0 || !strings.Contains(stderr.String(), tc.want) {
+				t.Fatalf("calls %v, stderr %q, want %q", *calls, stderr.String(), tc.want)
+			}
+		})
+	}
+}
+
+// ownerRecordingFake returns a provisioning fake that behaves like the real one for ownership. It creates a
+// missing directory with the requested owner, accepts an existing one that has that owner, and refuses an
+// existing one that has another owner without changing it.
+func ownerRecordingFake(t *testing.T, existing map[string]provisionCall) map[string]provisionCall {
+	t.Helper()
+	saved := provisionDirectory
+	provisionDirectory = func(path string, uid, gid int) error {
+		if have, ok := existing[path]; ok {
+			if have.uid != uid || have.gid != gid {
+				return fmt.Errorf("%s is owned by %d:%d, want %d:%d", path, have.uid, have.gid, uid, gid)
+			}
+			return nil
+		}
+		existing[path] = provisionCall{path, uid, gid}
+		return nil
+	}
+	t.Cleanup(func() { provisionDirectory = saved })
+	return existing
+}
+
+func TestProvisionJournalWarnsWhenTheSiblingHasAnotherOwnerOnEveryMachine(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		uid, gid int
+	}{
+		{"another group", 1001, 9999},
+		{"another user", 9999, 1002},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeRoot(t, nil)
+			processIDs = func() (int, int) { return 1001, 1002 }
+			owners := ownerRecordingFake(t, map[string]provisionCall{
+				"/x/endpoint-cache": {"/x/endpoint-cache", tc.uid, tc.gid},
+			})
+			var out, stderr bytes.Buffer
+			if code := runProvisionJournal([]string{"--directory", "/x/allocations"}, &out, &stderr); code != 0 {
+				t.Fatalf("code %d: %s", code, stderr.String())
+			}
+			wantPrefix := "warning: endpoint cache directory /x/endpoint-cache could not be provisioned: "
+			if !strings.HasPrefix(stderr.String(), wantPrefix) || strings.Count(stderr.String(), "\n") != 1 {
+				t.Fatalf("want one warning line, got %q", stderr.String())
+			}
+			if got := owners["/x/endpoint-cache"]; got.uid != tc.uid || got.gid != tc.gid {
+				t.Fatalf("the sibling's owner was changed to %v", got)
+			}
+			if got := owners["/x/allocations"]; got.uid != 1001 || got.gid != 1002 {
+				t.Fatalf("the journal owner is %v", got)
+			}
+		})
+	}
+}
+
+func TestProvisionJournalJournalFailureIsOneLineForAPathWithLineBreaks(t *testing.T) {
+	calls := recordProvisionDirectory(t, errors.New("refused"))
+	var out, stderr bytes.Buffer
+	if code := runProvisionJournal([]string{"--directory", "/x\ny/allocations"}, &out, &stderr); code != 1 {
+		t.Fatalf("code %d: %s", code, stderr.String())
+	}
+	if len(*calls) != 1 || out.Len() != 0 {
+		t.Fatalf("calls %v, stdout %q", *calls, out.String())
+	}
+	line := stderr.String()
+	if strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") ||
+		!strings.HasPrefix(line, "journal directory /x y/allocations could not be provisioned: ") {
+		t.Fatalf("want one flattened line, got %q", line)
+	}
 }
 
 func TestProvisionJournalWarnsWhenTheSiblingHasAnotherGroup(t *testing.T) {
@@ -515,6 +675,9 @@ func TestProvisionJournalWarnsWhenTheSiblingHasAnotherGroup(t *testing.T) {
 			other = g
 			break
 		}
+	}
+	if other < 0 && os.Geteuid() == 0 {
+		other = 4242
 	}
 	if other < 0 {
 		t.Skip("the user belongs to one group only")

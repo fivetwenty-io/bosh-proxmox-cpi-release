@@ -23,6 +23,12 @@ const endpointCacheSiblingName = "endpoint-cache"
 // provisionDirectory is a seam so tests can see the path and owner each provisioning call receives.
 var provisionDirectory = allocationjournal.ProvisionDirectory
 
+// processIDs and lookupAccount are seams so tests can run the root-only owner path as an ordinary user.
+var (
+	processIDs    = func() (uid, gid int) { return os.Geteuid(), os.Getegid() }
+	lookupAccount = user.Lookup
+)
+
 // runProvisionJournal is an explicit local command, dispatched before logging,
 // telemetry, credential validation, PVE client construction, or CPI requests.
 func runProvisionJournal(args []string, stdout, stderr io.Writer) int {
@@ -69,13 +75,13 @@ func runProvisionJournal(args []string, stdout, stderr io.Writer) int {
 			return 0
 		}
 	}
-	uid, gid := os.Geteuid(), os.Getegid()
+	uid, gid := processIDs()
 	if *owner != "" {
 		if uid != 0 {
 			fmt.Fprintln(stderr, "journal provisioning: --owner requires root")
 			return 1
 		}
-		account, err := user.Lookup(*owner)
+		account, err := lookupAccount(*owner)
 		if err != nil {
 			storageJournalFail(stderr, "journal provisioning: runtime owner lookup failed", err)
 			return 1
