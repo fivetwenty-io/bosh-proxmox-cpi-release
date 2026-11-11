@@ -238,3 +238,105 @@ func ObserveStorageCleanupAllocationTasks(ctx context.Context, client Client, no
 	}
 	return ObserveStorageCleanupTasks(context.WithValue(ctx, cleanupFailedAllocationTasksKey{}, allowed), client, nodes, upids)
 }
+
+// MigrationTaskSettlementReader reads the status of one recorded migration
+// task for the storage-journal settle-migration action. It never writes to
+// PVE and proves nothing about where the migrated VM or its disks are.
+type MigrationTaskSettlementReader interface {
+	ObserveMigrationTaskSettlement(context.Context, string) (StorageSettledTask, error)
+}
+
+// migrationTaskType is the PVE task type of a qm migrate run.
+const migrationTaskType = "qmigrate"
+
+// ObserveSettledMigrationTask proves that upid is a qmigrate task of VM vmid
+// that PVE reports stopped with exit status exactly "OK". The status comes
+// from the node the UPID names, which is the migration's source, after the
+// token's Sys.Audit there is proven, because PVE shows another user's task
+// only to a caller holding it. Unlike ObserveStorageCleanupTasks it does not
+// require the cluster's active task lists to be empty, so it can run against
+// a live cluster. It checks the reader's answer itself, so whatever client
+// supplies the read, a running, failed, or foreign task refuses.
+func ObserveSettledMigrationTask(
+	ctx context.Context, client Client, upid string, vmid int,
+) (StorageSettledTask, error) {
+	if ctx == nil {
+		return StorageSettledTask{}, fmt.Errorf("migration task observation requires context")
+	}
+	if err := validMigrationTaskIdentity(upid, vmid); err != nil {
+		return StorageSettledTask{}, err
+	}
+	reader, ok := client.(MigrationTaskSettlementReader)
+	if !ok {
+		return StorageSettledTask{}, fmt.Errorf("migration task observation unavailable")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	task, err := reader.ObserveMigrationTaskSettlement(ctx, upid)
+	if err != nil {
+		return StorageSettledTask{}, err
+	}
+	if task.UPID != upid || task.Node != nodeFromUPID(upid) || task.Status != taskStatusStopped ||
+		task.ExitStatus != "OK" {
+		return StorageSettledTask{}, migrationTaskUnsettled(upid)
+	}
+	return task, nil
+}
+
+func (c *sdkClient) ObserveMigrationTaskSettlement(ctx context.Context, upid string) (StorageSettledTask, error) {
+	if c == nil {
+		return StorageSettledTask{}, fmt.Errorf("migration task observation client unavailable")
+	}
+	return observeSettledMigrationTask(ctx, c.auditReader, upid)
+}
+
+// validMigrationTaskIdentity checks that upid has PVE's own UPID shape, is a
+// qmigrate task, and names vmid as the VM it migrates.
+func validMigrationTaskIdentity(upid string, vmid int) error {
+	match := cleanupTaskUPIDPattern.FindStringSubmatch(upid)
+	if len(upid) > 1024 || len(match) != 2 || len(match[1]) > 255 {
+		return fmt.Errorf("migration task identity is malformed")
+	}
+	parts := strings.Split(upid, ":")
+	if parts[5] != migrationTaskType {
+		return fmt.Errorf("task %s is not a %s task", upid, migrationTaskType)
+	}
+	if vmid <= 0 || parts[6] != strconv.Itoa(vmid) {
+		return fmt.Errorf("migration task %s does not name VM %d", upid, vmid)
+	}
+	return nil
+}
+
+// migrationTaskUnsettled is the refusal for a migration task whose status
+// read did not show it stopped with exit status OK. The read's own error and
+// the task's exit text stay out of it, because both can carry backend text.
+func migrationTaskUnsettled(upid string) error {
+	return fmt.Errorf("migration task %s is not proven stopped with exit status OK on node %s; a running task, a failed "+
+		"or warning exit, and an unreadable status all refuse, so read the task's status on that node before retrying",
+		upid, nodeFromUPID(upid))
+}
+
+func observeSettledMigrationTask(
+	ctx context.Context, reader auditPermissionGetter, upid string,
+) (StorageSettledTask, error) {
+	if ctx == nil || reader == nil {
+		return StorageSettledTask{}, fmt.Errorf("migration task observation inputs unavailable")
+	}
+	if !cleanupTaskUPIDPattern.MatchString(upid) {
+		return StorageSettledTask{}, fmt.Errorf("migration task identity is malformed")
+	}
+	node := nodeFromUPID(upid)
+	permissions, err := auditPermissionsAt(ctx, reader, "/nodes/"+node)
+	if err != nil {
+		return StorageSettledTask{}, fmt.Errorf("migration task visibility on node %s unavailable", node)
+	}
+	if _, ok := permissions["Sys.Audit"]; !ok {
+		return StorageSettledTask{}, fmt.Errorf(
+			"settling a migration requires Sys.Audit on node %s, where its task ran", node)
+	}
+	task, err := observeSettledStorageTask(ctx, reader, upid)
+	if err != nil || task.ExitStatus != "OK" {
+		return StorageSettledTask{}, migrationTaskUnsettled(upid)
+	}
+	return task, nil
+}
