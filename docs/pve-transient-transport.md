@@ -1,6 +1,6 @@
 # PVE Transient Transport Faults
 
-This document covers how the CPI absorbs pvedaemon worker recycling, pveproxy backend stalls, HTTP 429 pushback, and the auth-ticket EOF that follows. [PVE Storage Locking](pve-storage-locking.md) covers the per-storage lockfile class, and [PVE Endpoint Failover](endpoint-failover.md) covers how the CPI moves between the nodes you list in `pve.endpoints`, which changes how several of these faults play out.
+This document covers how the CPI absorbs pvedaemon worker recycling, pveproxy backend stalls, HTTP 429 pushback, and the auth-ticket EOF that follows. [PVE Storage Locking](pve-storage-locking.md) covers the per-storage lockfile class, and [PVE Endpoint Failover and Discovery](endpoint-failover.md) covers how the CPI moves between the nodes you list in `pve.endpoints`, which changes how several of these faults play out.
 
 ## What PVE does
 
@@ -67,7 +67,7 @@ The CPI absorbs the recycle window with a predicate, exponential backoff, and a 
 
 Implementation lives in `internal/pve/retry.go`:
 
-- `pve.IsTransientTransport(err)` returns false at once for `ErrTetherConflict`, `ErrSendByPassed`, and a refused redirect. Otherwise it is a predicate over `sdkerrors.ErrServer`, `*ConnectionError`, `*TimeoutError`, `net.Error.Timeout()`, and the substrings `"failed to parse login response"`, `"auto-login failed"`, `"(code: 596)"`, `"http 596"`.
+- `pve.IsTransientTransport(err)`, which lives in `internal/pve/error_map.go`, returns false at once for `ErrTetherConflict`, `ErrSendByPassed`, and a refused redirect. Otherwise it is a predicate over `sdkerrors.ErrServer`, `*ConnectionError`, `*TimeoutError`, `net.Error.Timeout()`, and the substrings `"failed to parse login response"`, `"auto-login failed"`, `"(code: 596)"`, `"http 596"`.
 
 - `pve.TransientBackoff(attempt)` — 1s × 1.5^n, ±30% jitter, cap 15s.
 
@@ -156,7 +156,7 @@ Three refusals look like transport faults but cannot change on a second attempt,
 - A refused redirect
   The SDK, v3.13.1 and later, refuses every HTTP redirect from the Proxmox API, and the CPI's pool refuses one too, before any dial. A server that redirects answers every retry the same way, so the request is attempted once. The CPI reports it to the Director as an error that is not retriable, because a retriable one would spend the Director's `max_vm_create_tries` on the same answer.
 
-The send-by refusal is not an error for the code that asked for it. A steal of an expired cluster lock treats it as an abandoned steal and waits one poll. The expired-lock sweep leaves the sentinel for the next sweep. See [PVE Endpoint Failover](endpoint-failover.md#the-cluster-locks-send-by-deadline) for why the lock needs the deadline.
+The send-by refusal is not an error for the code that asked for it. A steal of an expired cluster lock treats it as an abandoned steal and waits one poll. The expired-lock sweep leaves the sentinel for the next sweep. See [PVE Endpoint Failover and Discovery](endpoint-failover.md#the-cluster-locks-send-by-deadline) for why the lock needs the deadline.
 
 ### Task polls keep going
 
@@ -188,7 +188,7 @@ When the pool holds more than one endpoint, a retry can also follow a Warn line 
 pve endpoint failover: pve1:8006 unreachable (dial tcp: i/o timeout), request sent to pve2:8006, which stays active for this call
 ```
 
-That line means one node was unreachable and the call moved to another. It is not a retry, and the call usually succeeds without one. [PVE Endpoint Failover](endpoint-failover.md#log-lines) lists every failover line with its level.
+That line means one node was unreachable and the call moved to another. It is not a retry, and the call usually succeeds without one. [PVE Endpoint Failover and Discovery](endpoint-failover.md#log-lines) lists every failover line with its level.
 
 The `reason` field identifies which predicate fired. Watch the mix during a deploy:
 
@@ -226,7 +226,7 @@ The CPI's retry absorbs typical recycle windows. If retries routinely climb past
 
 4. **Tune pushback backoff.** `pve.retry.pushback.base_ms` and `pve.retry.pushback.cap_ms` adjust how aggressively the CPI backs off under HTTP 429. Higher values reduce retry storms; lower values recover faster when pushback is short-lived.
 
-5. **List more than one endpoint.** Set `pve.endpoints` to every node you want the CPI to use. A call then moves to another node when one is unreachable, and a read can leave a node whose pveproxy stopped answering. See [PVE Endpoint Failover](endpoint-failover.md). Listing endpoints does not remove worker recycling, since a write that may have reached a recycling node stays tethered to it.
+5. **List more than one endpoint.** Set `pve.endpoints` to every node you want the CPI to use. A call then moves to another node when one is unreachable, and a read can leave a node whose pveproxy stopped answering. See [PVE Endpoint Failover and Discovery](endpoint-failover.md). Listing endpoints does not remove worker recycling, since a write that may have reached a recycling node stays tethered to it.
 
 6. **Throttle the director.** Lower `director.workers` or per-instance-group `max_in_flight`. Cheapest if you cannot edit the PVE node, and also helps with storage-lock contention.
 

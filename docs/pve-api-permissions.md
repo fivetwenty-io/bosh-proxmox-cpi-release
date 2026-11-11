@@ -110,11 +110,11 @@ The four storage fields are defined in `src/pve_cpi/internal/config/config.go:25
 
 ### Discovery and cold-start reads
 
-Endpoint discovery and the cold start make a few reads of their own, described in [Endpoint Failover and Discovery](endpoint-failover.md#discovery). The table lists each read with the privilege it needs.
+Endpoint discovery and the cold start make a few reads of their own, described in [PVE Endpoint Failover and Discovery](endpoint-failover.md#discovery). The table lists each read with the privilege it needs.
 
 | Read | Privilege | Used by |
 |---|---|---|
-| `GET /nodes` | Any authenticated user. PVE returns only the nodes the caller may see, so a token with no `Sys.Audit` can see fewer nodes. | Discovery |
+| `GET /nodes` | Any authenticated user. PVE lists every node to every caller, and leaves out the usage figures (uptime, CPU, memory, and disk) for a node where the caller lacks `Sys.Audit`. Discovery uses only the node name, the status, and the certificate fingerprint, which are always present. | Discovery, and the handlers that look a VM up across the cluster |
 | `GET /cluster/status` | `Sys.Audit` on `/` | Discovery, which continues without it and records the outcome `no_status`, and the cold-start probe, which rejects a candidate that answers 403 |
 | `GET /nodes/{node}/certificates/info` | Any authenticated user | Discovery, to read the certificate fingerprints and the cluster root CA |
 

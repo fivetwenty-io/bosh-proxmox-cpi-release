@@ -80,7 +80,7 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 - [PVE Transient Transport Faults](pve-transient-transport.md): How pvedaemon worker recycling produces HTTP 596 and auth-ticket EOFs under burst load, and how the CPI absorbs them.
 
-- [Endpoint Failover and Discovery](endpoint-failover.md): How the CPI fails over between PVE API endpoints, discovers cluster nodes into a private cache, chooses the cache directory, and falls back to the nodes in `placement.az_map` when the cache is empty.
+- [PVE Endpoint Failover and Discovery](endpoint-failover.md): How the CPI fails over between PVE API endpoints, discovers cluster nodes into a private cache, chooses the cache directory, and falls back to the nodes in `placement.az_map` when the cache is empty.
 
 - [PVE Host Tuning](pve-host-tuning.md): Operator-side knobs (`pvedaemon` / `pveproxy` worker counts, storage layout) for sustained concurrent CPI workloads.
 
