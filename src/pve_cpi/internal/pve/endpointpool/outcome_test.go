@@ -81,14 +81,14 @@ func TestClassifyErrors(t *testing.T) {
 			outcome{action: actReturn, sent: sentNever, class: classCancelled},
 		},
 		{
-			"caller gave up on a mutation before a connection, with the dial's tag but no proof",
+			"caller gave up on a mutation before a connection, with the dial's tag but no replay proof",
 			attempt{class: classMutation, err: dial, callerDone: true},
-			outcome{action: actReturn, sent: sentMaybe, class: classCancelled},
+			outcome{action: actReturn, sent: sentNever, class: classCancelled},
 		},
 		{
 			"caller gave up on a mutation before a connection, without the tag",
 			attempt{class: classMutation, err: context.Canceled, callerDone: true},
-			outcome{action: actReturn, sent: sentMaybe, class: classCancelled},
+			outcome{action: actReturn, sent: sentNever, class: classCancelled},
 		},
 		{
 			"caller gave up on a read before a connection, with the dial's tag",
@@ -98,7 +98,7 @@ func TestClassifyErrors(t *testing.T) {
 		{
 			"caller gave up on a read before a connection, without the tag",
 			attempt{class: classIdempotent, err: context.Canceled, callerDone: true},
-			outcome{action: actReturn, sent: sentMaybe, class: classCancelled},
+			outcome{action: actReturn, sent: sentNever, class: classCancelled},
 		},
 		{
 			"caller gave up on a read after the connection",

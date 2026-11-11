@@ -55,16 +55,21 @@ const (
 // follows: sentNever releases the request's hold on its reservation, and every
 // other state fixes the tether on the endpoint.
 //
-// sentNever rests on the only two proofs that no byte left the machine. One
+// sentNever rests on the only three proofs that no byte left the machine. One
 // is a failure that carries the connect-phase tag, which for a mutation also
 // needs provesNeverSent, because Go may have replayed a request it counts as
-// replayable after an earlier attempt was written. A caller cancellation
-// before a connection is a proof only when it carries the tag. The other is a
-// refused send-by deadline, which carries the tag too, under the same
-// provesNeverSent rule for a mutation. Nothing else is a proof. An untagged
-// error before a connection leaves a mutation sentMaybe, even though httptrace
-// saw no connection, because the walk does not trust a trace to prove that
-// nothing was sent.
+// replayable after an earlier attempt was written. Another is a refused
+// send-by deadline, which carries the tag too, under the same provesNeverSent
+// rule for a mutation. The third is a caller cancellation before a
+// connection, which Go returns as the context's own error with no tag. The
+// owned clones speak only HTTP/1.1, where Go calls GotConn before it writes
+// any byte of a request and never calls it once the caller has given up on
+// the dial, and the connect meter keeps GotConn across Go's own retries of
+// the hop. So a hop whose caller ended its context and whose GotConn never
+// ran wrote nothing, on this attempt or on any attempt Go replayed. Nothing
+// else is a proof. An untagged error before a connection that the caller did
+// not cause leaves a mutation sentMaybe, because nothing names the request
+// itself as its cause.
 //
 // Two cases send nothing at all, so they need no proof. A request the pool
 // refuses before it hands the request to any transport is sentNever, and a
@@ -73,7 +78,7 @@ const (
 type sentState int
 
 const (
-	// sentNever means one of the two proofs holds, so no byte of the request
+	// sentNever means one of the three proofs holds, so no byte of the request
 	// left the machine.
 	sentNever sentState = iota + 1
 	// sentMaybe means the request may have reached the endpoint.
@@ -183,9 +188,9 @@ func classify(a attempt) outcome {
 //     here as in the connect-phase row.
 //   - A caller whose context ended gets the error back with no hop. When the
 //     hop never got a connection, which is the cancellation row, it has no
-//     effect. Go returns the context's own error in place of the dial's when
-//     the caller gives up during a dial, so the connection, not the tag,
-//     decides the row, and only the tag proves the request unsent. After a
+//     effect and is sentNever. Go returns the context's own error in place of
+//     the dial's when the caller gives up during a dial, so the connection,
+//     not the tag, decides the row and proves the request unsent. After a
 //     connection a mutation may have been sent, so it demotes the endpoint as
 //     any transport error after the connection does. A read the caller gave up
 //     on has no effect, because the caller's own deadline says nothing about
@@ -214,7 +219,7 @@ func classifyError(a attempt) outcome {
 	case errors.Is(a.err, ErrSendByPassed):
 		return outcome{action: actReturn, sent: sent, sendBy: true, class: classSendBy}
 	case a.callerDone && !a.gotConn:
-		return outcome{action: actReturn, sent: sent, class: classCancelled}
+		return outcome{action: actReturn, sent: sentNever, class: classCancelled}
 	case a.callerDone:
 		return outcome{action: actReturn, sent: sentMaybe, demote: a.class == classMutation, class: classCancelled}
 	case tagged:

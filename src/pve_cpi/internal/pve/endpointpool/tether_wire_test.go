@@ -260,6 +260,64 @@ func TestTetherUploadReleasesItsReservation(t *testing.T) {
 	}
 }
 
+// A POST whose caller gives up while the entry's dial hangs never got a
+// connection, so it sent nothing and releases its reservation. Its retry with
+// the same key, on a context the caller cannot cancel, walks the pool from A,
+// which now refuses, to B.
+func TestTetherCallerCancelBeforeAConnectionReleasesTheKey(t *testing.T) {
+	l := newLab(t)
+	a := l.dropped(t)
+	b := l.live(t, nil)
+	p := l.pool(t, 0, configured(a.Addr), configured(b.Addr))
+	scope, release := WithAffinityScope(context.Background())
+	defer release()
+
+	ctx, cancel := context.WithTimeout(scope, 100*time.Millisecond)
+	defer cancel()
+	_, err := send(t, ctx, p, http.MethodPost, a.Addr, "/nodes/pve1/qemu", "vmid=101")
+	if !errors.Is(err, context.DeadlineExceeded) || IsMaybeSent(err) {
+		t.Fatalf("first POST: %v, want the caller's deadline and no maybe-sent mark", err)
+	}
+	if n := a.Counts.Requests.Load(); n != 0 {
+		t.Fatalf("A read %d requests, want 0", n)
+	}
+	l.refuseDial(a.Addr, nil)
+
+	resp, err := send(t, context.WithoutCancel(ctx), p, http.MethodPost, a.Addr, "/nodes/pve1/qemu", "vmid=101")
+	mustStatus(t, resp, err, http.StatusOK)
+	if n := b.Counts.Method(http.MethodPost); n != 1 {
+		t.Fatalf("B got %d POSTs, want 1", n)
+	}
+	mustDemoted(t, p, a.Addr, true)
+}
+
+// A routed POST whose caller gives up while the direct host's dial hangs
+// releases its reservation the same way, so the proxied fallback walks the
+// pool in place of going back to the direct host.
+func TestTetherRoutedCallerCancelBeforeAConnectionLetsTheFallbackWalk(t *testing.T) {
+	l := newLab(t)
+	a := l.live(t, nil)
+	r := l.dropped(t)
+	p := l.pool(t, 0, configured(a.Addr))
+	scope, release := WithAffinityScope(context.Background())
+	defer release()
+	const route = "/nodes/pve3/storage/local/upload"
+
+	ctx, cancel := context.WithTimeout(scope, 100*time.Millisecond)
+	defer cancel()
+	_, err := send(t, ctx, p, http.MethodPost, r.Addr, route, "data")
+	if !errors.Is(err, context.DeadlineExceeded) || IsMaybeSent(err) {
+		t.Fatalf("direct upload: %v, want the caller's deadline and no maybe-sent mark", err)
+	}
+	l.refuseDial(r.Addr, nil)
+
+	resp, err := send(t, context.WithoutCancel(ctx), p, http.MethodPost, a.Addr, route, "data")
+	mustStatus(t, resp, err, http.StatusOK)
+	if n := a.Counts.Method(http.MethodPost); n != 1 {
+		t.Fatalf("A got %d POSTs, want 1", n)
+	}
+}
+
 // A routed upload that may have reached its direct host tethers the key to
 // that host, so the proxied retry, which names the primary, goes back to the
 // direct host and to no pool endpoint.

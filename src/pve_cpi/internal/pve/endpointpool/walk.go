@@ -216,12 +216,14 @@ func (p *Pool) sendFollowing(req *http.Request, target tetherTarget, configuredO
 // demotes it and is recorded as a connect-phase failure, and nothing
 // a routed request gets ever makes an endpoint active. When the request's own
 // context ends during the dial, net/http returns the context's error, which
-// carries no tag, so a cancelled request records nothing. A pin or
-// verification failure that finished after the send-by bound still counts
-// against its endpoint, while the request reports the send-by refusal. The
-// error is marked with MaybeSentError unless its outcome is sentNever, which
-// takes a connect-phase failure of an idempotent request or the login, or of
-// a mutation that provesNeverSent clears.
+// carries no tag, so a cancelled request records nothing, and a connect meter
+// on the clone shows whether it ever got a connection. A pin or verification
+// failure that finished after the send-by bound still counts against its
+// endpoint, while the request reports the send-by refusal. The error is
+// marked with MaybeSentError unless its outcome is sentNever, which takes a
+// connect-phase failure of an idempotent request or the login, or of a
+// mutation that provesNeverSent clears, or a caller cancellation before a
+// connection.
 func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCloser, configuredOnly bool,
 ) (*http.Response, outcome, error) {
 	addr := target.addr
@@ -252,7 +254,9 @@ func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCl
 		closeSendBody(req, body)
 		return nil, unsent, err
 	}
-	clone := req.Clone(connectContext(req.Context(), methodOf(req), req.URL.Path))
+	ctx := req.Context()
+	meter := newConnectMeter(time.Now)
+	clone := req.Clone(connectContext(httptrace.WithClientTrace(ctx, meter.trace()), methodOf(req), req.URL.Path))
 	if target.urlHost != req.URL.Host {
 		clone.URL.Host = target.urlHost
 		clone.Host = ""
@@ -264,7 +268,8 @@ func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCl
 	if err == nil && resp == nil {
 		err = errNoResponse
 	}
-	oc := routedOutcome(classOf(req), clone, err)
+	_, gotConn := meter.result()
+	oc := routedOutcome(classOf(req), clone, err, ctx.Err() != nil && !gotConn)
 	oc.addr = addr
 	if err == nil {
 		resp.Request = req
@@ -290,19 +295,28 @@ func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCl
 }
 
 // routedOutcome is the outcome of a routed request of the given class, which
-// sent clone and got err. A routed request never hops and never promotes, so
-// the outcome only says what was sent, whether a send-by deadline refused it,
-// and whether the pool refused it for a defect. It is sentNever only on a
-// connect-phase failure, which for a mutation also needs provesNeverSent. A
-// refused send-by carries the tag and follows the same rule, so a mutation Go
-// may have replayed is maybe sent.
-func routedOutcome(class reqClass, clone *http.Request, err error) outcome {
+// sent clone and got err. cancelledUnsent says the request's own context had
+// ended and the clone never got a connection. A routed request never hops and
+// never promotes, so the outcome only says what was sent, whether a send-by
+// deadline refused it, and whether the pool refused it for a defect. It is
+// sentNever on a connect-phase failure, which for a mutation also needs
+// provesNeverSent, and on a caller cancellation before a connection, which
+// sentState explains. A refused send-by carries the tag and follows the
+// connect-phase rule, so a mutation Go may have replayed is maybe sent.
+func routedOutcome(class reqClass, clone *http.Request, err error, cancelledUnsent bool) outcome {
 	if err == nil {
 		return outcome{action: actReturn, sent: sentAnswered}
 	}
 	oc := outcome{action: actReturn, sent: sentMaybe, class: classTransport}
 	cpe, tagged := AsConnectPhase(err)
+	cancelled := cancelledUnsent && !errors.Is(err, ErrSendByPassed)
+	if cancelled {
+		oc.sent = sentNever
+	}
 	if !tagged {
+		if cancelled {
+			oc.class = classCancelled
+		}
 		return oc
 	}
 	oc.class = string(cpe.Phase)
