@@ -646,7 +646,7 @@ We delete the files and keep the directory. The CPI uses the first two layers on
 What the CPI does next depends on what we removed.
 
 - The endpoint cache file
-  The next call starts with the configured endpoints and no discovered nodes, down marks, or cold-start hint. When discovery is on, the first answer from a configured endpoint finds no file, so the CPI discovers in the background and writes a fresh file before the process exits, waiting up to 3 seconds for the write. The calls after that start with the discovered nodes. Under `verify_ssl: false` the first discovery is trust on first use again, so we reset only when we trust the network path to the seed.
+  The next call starts with the configured endpoints and no discovered nodes, down marks, or cold-start hint. When discovery is on, the first configured endpoint to answer finds no file, so the CPI discovers in the background and writes a fresh file before the process exits, waiting up to 3 seconds for the write. The calls after that start with the discovered nodes. Under `verify_ssl: false` the first discovery is trust on first use again, so we reset only when we trust the network path to the seed.
 
 - The directory secret
   The CPI creates a new one on the next call, and every cache file written under the old secret fails verification and is rebuilt. The log shows `endpoint cache: replaced the directory secret, which had the wrong length` only when a secret exists with the wrong length, and not after a plain removal.
@@ -1027,7 +1027,7 @@ Rolling back from 0.10.0 to 0.9.6 or earlier meets four facts, and we deal with 
 
    The older release never reads them. Files in the temporary directory disappear with the ephemeral disk, and the `endpoint-cache` directory beside the allocation journal stays on the persistent disk where the older release never looks. We can delete either one. If we upgrade again with the same credential, the files are still valid.
 
-4. The removed HA keys guard plays no part.
+4. The guard on removed HA keys plays no part.
 
    The template refuses removed `pve.ha` keys, and none of the endpoint properties is on that list, so this work adds nothing to that check on a rollback.
 

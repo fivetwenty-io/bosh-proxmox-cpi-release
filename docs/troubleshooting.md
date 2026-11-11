@@ -2257,7 +2257,7 @@ The first endpoint failed before a connection existed, so the pool sent the requ
 
 **Fix**
 
-Nothing, when the node is down on purpose. Otherwise we check the node's `pveproxy` and the route and firewall from the Director to its port 8006. A node that stays marked down is tried last by other processes for two minutes after the mark was written, and then first again.
+We do nothing when the node is down on purpose. Otherwise, we check the node's `pveproxy` and the route and firewall from the Director to its port 8006. A node that stays marked down is tried last by other processes for two minutes after the mark was written, and then first again.
 
 ### A failover names a cold-start candidate
 
@@ -2313,7 +2313,7 @@ We make sure the node names in `placement.az_map` are the PVE node names, and th
 pve endpoint pve2.dc1.example.com:8006: the cold-start candidate for node pve2 from placement.az_map failed TLS verification (x509: certificate signed by unknown authority); this can mean interception; the pool no longer sends to it
 ```
 
-The line is at Error, once per candidate per call.
+The line is at Error and appears once per candidate per call.
 
 **Diagnosis**
 
@@ -2365,7 +2365,7 @@ We read the cause beside each endpoint. Timeouts and refusals point to the netwo
 pve endpoint pve2:8006: TLS verification failed (x509: certificate is valid for pve2, not pve2.lan); this can mean interception; trying the next endpoint
 ```
 
-The line is at Error, once per endpoint per call. When no other endpoint is tried, it ends `no other endpoint is tried for this request`.
+The line is at Error and appears once per endpoint per call. When no other endpoint is tried, it ends `no other endpoint is tried for this request`.
 
 **Diagnosis**
 
@@ -2385,7 +2385,7 @@ pve endpoint pve2:8006: the pool refused to send through its transport (owned tr
 
 **Diagnosis**
 
-This is an Error that appears once per address for the life of the process. Only a defect in the pool routes a request that way. The request still moves on, or the line ends `no other endpoint is tried for this request`.
+This line is an Error, and it appears once per address for the life of the process. Only a defect in the pool routes a request that way. The request still moves on, or the line ends `no other endpoint is tried for this request`.
 
 **Fix**
 
@@ -2405,7 +2405,7 @@ or
 pve endpoint pve3:8006: certificate refused (x509: certificate signed by unknown authority), so it was not checked against the 2 pinned for node pve3; skipping it until discovery refreshes
 ```
 
-Both lines are at Warn, once per endpoint per call.
+Both lines are at Warn and appear once per endpoint per call.
 
 **Diagnosis**
 
@@ -2531,7 +2531,7 @@ The file failed validation. It may be damaged, written by a different release, s
 
 **Fix**
 
-Nothing, in most cases. When the line recurs on every call, we reset the cache as [Resetting the endpoint cache](operations.md#resetting-the-endpoint-cache) describes.
+In most cases we do nothing. When the line recurs on every call, we reset the cache as [Resetting the endpoint cache](operations.md#resetting-the-endpoint-cache) describes.
 
 ### The directory secret was replaced
 
@@ -2619,11 +2619,11 @@ api endpoint discovery: the cache write failed before the reads; skipping the re
 api endpoint discovery: the answering endpoint is not one of the configured endpoints; skipping the refresh
 ```
 
-The first carries `err`. The second carries `file` and `err`. The third carries `file` and `err`. The fourth carries `endpoint`.
+The first line carries `err`, the second and third carry `file` and `err`, and the fourth carries `endpoint`.
 
 **Diagnosis**
 
-The first three mean the cache directory misbehaved at the moment the refresh began, because a lock could not be taken, the file could not be read, or the attempt could not be written. The `err` field says which operation failed, and an ownership or permission error points to the same causes as [Discovery is off for this call](#discovery-is-off-for-this-call). The fourth appears only after a defect in the CPI, because the endpoint that answered should always be one of the configured ones. We keep the log and report it as a bug.
+The first three mean the cache directory misbehaved when the refresh began, because a lock could not be taken, the file could not be read, or the attempt could not be written. The `err` field says which operation failed, and an ownership or permission error points to the same causes as [Discovery is off for this call](#discovery-is-off-for-this-call). The fourth appears only after a defect in the CPI, because the endpoint that answered should always be one of the configured ones. We keep the log and report it as a bug.
 
 **Fix**
 
@@ -2734,7 +2734,7 @@ We confirm whether the cluster's root CA was really replaced, for instance becau
 endpoint cache: the pin set of known node pve2 changed through configured endpoint pve1:8006; with verify_ssl false the stored pins stay, delete the cache file to accept the new ones
 ```
 
-The line is at Warn, and it carries `file` and `outcome` fields. It appears under `verify_ssl: false`. Several nodes read `known nodes pve2, pve3`.
+The line is at Warn and carries `file` and `outcome` fields. It appears only under `verify_ssl: false`. When several nodes changed, the text reads `known nodes pve2, pve3`.
 
 **Diagnosis**
 
