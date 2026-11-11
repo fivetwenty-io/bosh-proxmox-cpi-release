@@ -21,7 +21,9 @@ Run:
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import copy
 import importlib.machinery
 import importlib.util
 import io
@@ -310,7 +312,8 @@ LIFECYCLE_ENV = (
     "CPI_CONFIG", "STEMCELL_PATH", "CPI_BIN", "CPI_CONTEXT_FILE", "FOREIGN_VM_TEST", "FOREIGN_CONTEXT_FILE",
     "TRACE", "NETWORK_TEST_MODE", "SNAPSHOT_DETACH_MODE", "PARKED_DISK_TEST", "DISK_MIGRATION_TEST",
     "STORAGE_SET_REPLICAS_TEST", "MULTI_STORAGE_PLACEMENT_TEST", "PARKER_RANGE_START", "PARKER_RANGE_END",
-    "PARKER_PREFIX", "PARKER_POOL", "NETWORK_DNS", "VM_EPHEMERAL_MIB",
+    "PARKER_PREFIX", "PARKER_POOL", "NETWORK_DNS", "VM_EPHEMERAL_MIB", "DISK_MIGRATION_JOURNAL",
+    "DISK_MIGRATION_SHARED_STORAGE", "PVE_VERIFY_TRANSPORT",
 )
 
 
@@ -1468,6 +1471,618 @@ class TestSurvivingMutants(ForeignPassCase):
         with self.assertRaisesRegex(RuntimeError, "not the .*lifecycle-handmade-4321.* this run made"):
             handmade._remove_handmade()
         self.assertEqual(self.az2.destroyed, [])
+
+
+# ---------------------------------------------------------------------------
+# Step 11r, the adopted mover on shared storage
+# ---------------------------------------------------------------------------
+
+import _lifecycle_mover as mover  # noqa: E402
+
+LAB_STATUS = [
+    {"type": "cluster", "name": "pve-cpi", "nodes": 3, "quorate": 1},
+    {"type": "node", "name": "lab-pve-cpi-0", "online": 1},
+    {"type": "node", "name": "lab-pve-cpi-1", "online": 1},
+    {"type": "node", "name": "lab-pve-cpi-2", "online": 1},
+]
+NFS_ENTRY = {"storage": "nfs-images", "type": "nfs", "content": "images,iso", "shared": 1}
+BAND = (90000, 90999)
+VM_VMID = 4321
+MOVER_VMID = 90500
+STABLE_ID = "abc123def456"
+PREFIX = "l11r-0badcafe"
+NAMESPACE = "lifecycle-11r-" + "0" * 32
+FIXED_TOKENS = {4: PREFIX[len("l11r-"):], 16: "0" * 32}
+CLEAN_AUDIT = (
+    "audit: complete=true vm_scan_complete=true generation_index_healthy=true cluster_continuity=true records=2\n"
+    "charging: none\n"
+    "observed move: vm-90500-disk-0 lab-pve-cpi-0 -> lab-pve-cpi-1\n"
+)
+UNFIXED_ERROR = (
+    "attach disk: observe migration of mover 90500: GET /nodes/lab-pve-cpi-0/qemu/90500/config: "
+    "500 Configuration file 'nodes/lab-pve-cpi-0/qemu-server/90500.conf' does not exist"
+)
+KEPT_WARN = "kept the migration mover because an earlier request created it, so this request's journal can't delete it"
+RESTORE_WARN = "protection restore on parker 90500 failed"
+
+
+def _pvd(volid: str, stable_id: str) -> str:
+    payload = json.dumps({"v": volid, "m": {"id": stable_id}}).encode()
+    return "pvd-" + base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _warn(msg: str) -> str:
+    return json.dumps({"time": "2026-11-11T00:00:00Z", "level": "WARN", "msg": msg})
+
+
+class MoverLab:
+    """A three-node pve-cpi cluster, its tasks and volumes, and the verifier reads over it."""
+
+    _as_list = staticmethod(_pve_verify.PVEVerifier._as_list)
+
+    def __init__(self, status: list | None = None, storage: dict | None = NFS_ENTRY) -> None:
+        self.status = copy.deepcopy(LAB_STATUS if status is None else status)
+        self.storage = storage
+        self.guests: dict[str, dict[int, dict]] = {"lab-pve-cpi-0": {}, "lab-pve-cpi-1": {}, "lab-pve-cpi-2": {}}
+        self.guests["lab-pve-cpi-1"][VM_VMID] = {"name": "vm-4321", "scsi0": "local-lvm-data:vm-4321-disk-0"}
+        self.guests["lab-pve-cpi-0"][100] = {"name": "keep-100", "tags": "bosh-parker"}
+        self.guests["lab-pve-cpi-2"][101] = {"name": "keep-101", "template": 1}
+        # Another deployment's parker in the band, with a disk of its own.
+        self.guests["lab-pve-cpi-0"][90010] = {
+            "name": "other-parker-90010", "tags": "bosh-parker;vm-prefix--other",
+            "scsi0": "nfs-images:90010/vm-90010-disk-0.qcow2,serial=zzz",
+        }
+        self.tasks: dict[str, list[dict]] = {n: [] for n in self.guests}
+        self.volumes: set[str] = set()
+        self.reads: list[str] = []
+
+    def read(self, path: str):
+        self.reads.append(path)
+        if path == "/cluster/status":
+            return copy.deepcopy(self.status)
+        parts = path.split("?", 1)[0].strip("/").split("/")
+        if len(parts) == 3 and parts[0] == "nodes" and parts[2] == "qemu":
+            return [{"vmid": vmid, "status": "running"} for vmid in self.guests.get(parts[1], {})]
+        if len(parts) == 3 and parts[0] == "nodes" and parts[2] == "tasks":
+            return copy.deepcopy(self.tasks.get(parts[1], []))
+        raise AssertionError(f"unexpected read {path}")
+
+    def storage_entry(self, storage: str):
+        return self.storage if self.storage and self.storage.get("storage") == storage else None
+
+    def qemu_config(self, vmid, node=None):
+        config = self.guests.get(node, {}).get(int(vmid))
+        if config is None:
+            raise _pve_verify.PVEVerifyError(f"{vmid} is not on {node}")
+        return copy.deepcopy(config)
+
+    def volume_exists(self, disk_cid: str) -> bool:
+        return _pve_verify._bare_disk_cid(disk_cid) in self.volumes
+
+    def node_of(self, vmid: int) -> str:
+        for node, guests in self.guests.items():
+            if vmid in guests:
+                return node
+        return ""
+
+
+class MoverWriter(mover.PmxWriter):
+    """The real PmxWriter guards, with pmx replaced by edits to the fake lab."""
+
+    def __init__(self, lab: MoverLab) -> None:
+        with unittest.mock.patch.dict(os.environ, {"PVE_VERIFY_TRANSPORT": "pmx"}):
+            super().__init__({"host": "10.254.0.10", "api_token": "root@pam!cpi=s3cret", "verify_ssl": False},
+                             environ={})
+        self.lab = lab
+        self.writes: list[tuple[str, str, dict]] = []
+
+    def _run(self, verb: str, path: str, data: dict) -> None:
+        self.writes.append((verb, path, dict(data)))
+        _, _, node, _, vmid, *rest = path.split("/")
+        guests = self.lab.guests[node]
+        if verb == "put":
+            guests[int(vmid)].update(data)
+        elif verb == "delete":
+            del guests[int(vmid)]
+
+
+class MoverCPI:
+    """Answers the requests 11r makes the way the CPI does, for one attach outcome.
+
+    outcome is fixed (the attach migrates the mover, moves the disk to the VM,
+    and destroys the mover), unfixed (the migration lands, and the CPI fails the
+    attach on PVE's 500 for the old node), or kept (the attach works and the CPI
+    keeps the mover, warning that it did).
+    """
+
+    def __init__(self, lab: MoverLab, outcome: str = "fixed", log: str = "", audit: tuple[int, str] = (0, CLEAN_AUDIT),
+                 delete_fails: bool = False, park_on: int = MOVER_VMID) -> None:
+        self.lab = lab
+        self.outcome = outcome
+        self.log = log
+        self.audit = audit
+        self.delete_fails = delete_fails
+        self.park_on = park_on
+        self.requests: list[tuple[str, list, str]] = []
+        self.journal_calls: list[tuple] = []
+        self.configs: dict[str, dict] = {}
+        self.volid = f"nfs-images:{MOVER_VMID}/vm-{MOVER_VMID}-disk-0.qcow2"
+        self.cid = _pvd(self.volid, STABLE_ID)
+
+    def _note(self, method: str, args: list, config_path: str) -> None:
+        self.requests.append((method, args, config_path))
+        self.configs[config_path] = json.loads(Path(config_path).read_text(encoding="utf-8"))
+
+    def call(self, method: str, args: list, config_path: str):
+        self._note(method, args, config_path)
+        cfg = self.configs[config_path]
+        if method == "create_disk":
+            node = args[1]["node"]
+            parker = self.lab.guests[node].setdefault(self.park_on, {
+                "name": f"{cfg['parker_prefix']}-parker-{self.park_on}",
+                "tags": f"bosh-parker;vm-prefix--{cfg['parker_prefix']}", "protection": 1,
+            })
+            parker["scsi0"] = f"{self.volid},serial={STABLE_ID}"
+            self.lab.volumes.add(self.volid)
+            return self.cid
+        if method == "detach_disk":
+            vm = self.lab.guests["lab-pve-cpi-1"][VM_VMID]
+            vm.pop("scsi1")
+            self.lab.guests["lab-pve-cpi-1"][90501] = {
+                "name": f"{cfg['parker_prefix']}-parker-90501", "protection": 1,
+                "tags": f"bosh-parker;vm-prefix--{cfg['parker_prefix']}",
+                "scsi0": f"nfs-images:90501/vm-90501-disk-0.qcow2,serial={STABLE_ID}",
+            }
+            self.lab.volumes = {"nfs-images:90501/vm-90501-disk-0.qcow2"}
+            self.volid = "nfs-images:90501/vm-90501-disk-0.qcow2"
+            return None
+        if method == "delete_disk":
+            if self.delete_fails:
+                raise RuntimeError("delete_disk: storage reconciliation holds the disk's record")
+            for guests in self.lab.guests.values():
+                for config in guests.values():
+                    for key in [k for k, v in config.items() if f"serial={STABLE_ID}" in str(v)]:
+                        del config[key]
+            self.lab.volumes.clear()
+            return None
+        raise AssertionError(f"unexpected call {method}")
+
+    def send(self, method: str, args: list, config_path: str):
+        self._note(method, args, config_path)
+        assert method == "attach_disk", method
+        source = self.lab.node_of(MOVER_VMID)
+        holder = self.lab.guests[source].pop(MOVER_VMID)
+        self.lab.tasks[source].append({"upid": f"UPID:{source}:qmigrate:{MOVER_VMID}", "type": "qmigrate",
+                                       "id": str(MOVER_VMID), "status": "OK"})
+        if self.outcome == "unfixed":
+            self.lab.guests["lab-pve-cpi-1"][MOVER_VMID] = holder
+            return {"result": None, "error": {"type": "Bosh::Clouds::CloudError", "message": UNFIXED_ERROR,
+                                              "ok_to_retry": False}}, self.log
+        disk = holder.pop("scsi0")
+        self.lab.guests["lab-pve-cpi-1"][VM_VMID]["scsi1"] = disk
+        if self.outcome == "kept":
+            self.lab.guests["lab-pve-cpi-1"][MOVER_VMID] = holder
+            return {"result": None, "error": None}, self.log + _warn(KEPT_WARN) + "\n"
+        return {"result": None, "error": None}, self.log
+
+    def journal(self, action: str, config_path: str, *flags: str):
+        self.journal_calls.append((action, config_path, flags))
+        if action == "initialize":
+            return 0, json.dumps({"cluster_id": "pve-cpi-cluster"}), ""
+        if action == "audit":
+            return self.audit[0], self.audit[1], ""
+        raise AssertionError(f"unexpected journal action {action}")
+
+
+class AdoptedMoverCase(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+        self.said: list[str] = []
+        self.steps: list[str] = []
+
+    def make(self, lab: MoverLab, cpi: MoverCPI, *, writer: MoverWriter | None = None, journal_on: bool = True,
+             transport: str = "pmx") -> mover.AdoptedMoverPass:
+        self.lab, self.cpi = lab, cpi
+        self.writer = writer or MoverWriter(lab)
+        return mover.AdoptedMoverPass(
+            verifier=lab, read=lab.read, writer=self.writer, send=cpi.send, call=cpi.call, journal=cpi.journal,
+            base_config={"host": "10.254.0.10", "api_token": "root@pam!cpi=s3cret", "disk_storage": "local-lvm-data",
+                         "disk_migration": "on_attach", "storage_sets": {"keep": {"names": ["x"]}}},
+            transport=transport, vm_cid=str(VM_VMID), storage="nfs-images", band=BAND, journal_on=journal_on,
+            disk_size_mib=1024, step=self.steps.append, say=self.said.append,
+            token_source=lambda n: FIXED_TOKENS[n], workspace_root=self.root, sleep=lambda _s: None,
+            gone_attempts=2,
+        )
+
+    def workspaces(self) -> list[str]:
+        return sorted(os.listdir(self.root))
+
+    def assert_bystanders_untouched(self) -> None:
+        touched = {int(path.split("/")[4]) for _verb, path, _data in self.writer.writes}
+        self.assertTrue(touched <= {MOVER_VMID, 90501}, touched)
+        self.assertIn(100, self.lab.guests["lab-pve-cpi-0"])
+        self.assertIn(101, self.lab.guests["lab-pve-cpi-2"])
+        self.assertEqual(self.lab.guests["lab-pve-cpi-0"][90010]["tags"], "bosh-parker;vm-prefix--other")
+        self.assertIn("scsi0", self.lab.guests["lab-pve-cpi-0"][90010])
+
+
+class TestAdoptedMoverChecks(unittest.TestCase):
+    def test_lab_guard_accepts_the_pve_cpi_lab(self) -> None:
+        self.assertEqual(mover.lab_guard_verdict(LAB_STATUS), "")
+        self.assertEqual(mover.lab_nodes(LAB_STATUS), ["lab-pve-cpi-0", "lab-pve-cpi-1", "lab-pve-cpi-2"])
+
+    def test_lab_guard_refuses_every_other_cluster(self) -> None:
+        az2 = [{"type": "cluster", "name": "pve-cpi-az2"}, {"type": "node", "name": "lab-pve-cpi-az2-0", "online": 1},
+               {"type": "node", "name": "lab-pve-cpi-az2-1", "online": 1}]
+        foreign_node = copy.deepcopy(LAB_STATUS) + [{"type": "node", "name": "pve-prod-1", "online": 1}]
+        offline = copy.deepcopy(LAB_STATUS)
+        offline[2]["online"] = 0
+        cases = {
+            "az2": az2,
+            "standalone": [{"type": "node", "name": "lab-pve-cpi-0", "online": 1}],
+            "one node": LAB_STATUS[:2],
+            "foreign node": foreign_node,
+            "offline": offline,
+            "not a list": {"data": LAB_STATUS},
+            "two clusters": LAB_STATUS + [{"type": "cluster", "name": "pve-cpi"}],
+        }
+        for label, status in cases.items():
+            with self.subTest(label):
+                self.assertNotEqual(mover.lab_guard_verdict(status), "")
+
+    def test_shared_storage_verdict(self) -> None:
+        self.assertEqual(mover.shared_storage_verdict(NFS_ENTRY, "nfs-images"), "")
+        for label, entry in {
+            "missing": None,
+            "lvm": dict(NFS_ENTRY, type="lvmthin"),
+            "no images": dict(NFS_ENTRY, content="iso,backup"),
+            "disabled": dict(NFS_ENTRY, disable=1),
+        }.items():
+            with self.subTest(label):
+                self.assertNotEqual(mover.shared_storage_verdict(entry, "nfs-images"), "")
+
+    def test_with_mover_tag_keeps_every_tag_and_adds_one_once(self) -> None:
+        self.assertEqual(mover.with_mover_tag({"tags": "bosh-parker;vm-prefix--l11r-ab"}),
+                         "bosh-parker;vm-prefix--l11r-ab;bosh-disk-mover")
+        self.assertEqual(mover.with_mover_tag({"tags": "bosh-parker,BOSH-DISK-MOVER"}), "bosh-parker;BOSH-DISK-MOVER")
+        self.assertEqual(mover.with_mover_tag({}), "bosh-disk-mover")
+
+    def test_run_owned_verdict_refuses_what_the_run_did_not_create(self) -> None:
+        ours = {"name": f"{PREFIX}-parker-90500", "tags": f"bosh-parker;vm-prefix--{PREFIX}"}
+        kwargs = {"prefix": PREFIX, "preexisting": {90400}, "band": BAND}
+        self.assertEqual(mover.run_owned_verdict(90500, ours, **kwargs), "")
+        self.assertEqual(mover.run_owned_verdict(90500, {"name": f"{PREFIX}-parker-90500", "tags": "bosh-disk-mover"},
+                                                 **kwargs), "")
+        for label, (vmid, config) in {
+            "kept 100": (100, ours),
+            "kept 101": (101, ours),
+            "preexisting": (90400, ours),
+            "outside the band": (91000, ours),
+            "template": (90500, dict(ours, template=1)),
+            "other prefix": (90500, {"name": "x", "tags": "bosh-parker;vm-prefix--l11r-ffffffff"}),
+            "default prefix": (90500, {"name": "bosh-parker-90500", "tags": "bosh-parker"}),
+            "no parker tag": (90500, {"name": f"{PREFIX}-parker-90500", "tags": f"vm-prefix--{PREFIX}"}),
+        }.items():
+            with self.subTest(label):
+                self.assertNotEqual(mover.run_owned_verdict(vmid, config, **kwargs), "")
+
+    def test_warning_detectors_read_only_warn_records(self) -> None:
+        stderr = "\n".join([
+            _warn("Protection restore on parker 90500 failed"),
+            json.dumps({"level": "INFO", "msg": "protection restore on parker 90500 done"}),
+            "protection restore not json",
+            json.dumps({"level": "WARN", "msg": KEPT_WARN}),
+            "{broken",
+        ])
+        self.assertEqual(mover.protection_restore_warnings(stderr), ["Protection restore on parker 90500 failed"])
+        self.assertEqual(mover.kept_mover_warnings(stderr), [KEPT_WARN])
+        self.assertEqual(mover.protection_restore_warnings(""), [])
+
+    def test_new_qmigrate_tasks_counts_only_new_tasks_for_the_mover(self) -> None:
+        old = {"upid": "UPID:a", "type": "qmigrate", "id": "90500", "status": "OK"}
+        new = {"upid": "UPID:b", "type": "qmigrate", "id": "90500", "status": "OK"}
+        other_vm = {"upid": "UPID:c", "type": "qmigrate", "id": "90501", "status": "OK"}
+        other_type = {"upid": "UPID:d", "type": "qmstart", "id": "90500", "status": "OK"}
+        self.assertEqual(mover.new_qmigrate_tasks([old], [old, new, other_vm, other_type], 90500), [new])
+
+    def test_audit_summary_findings(self) -> None:
+        self.assertEqual(mover.audit_summary_findings(0, CLEAN_AUDIT), [])
+        self.assertEqual(mover.audit_summary_findings(0, CLEAN_AUDIT + "skipped disabled storages: nfs-old\n"), [])
+        record = CLEAN_AUDIT + "record: 7f3a reconciliation\n"
+        self.assertEqual(mover.audit_summary_findings(1, record),
+                         ["storage-journal audit exited 1", "record: 7f3a reconciliation"])
+        charging = CLEAN_AUDIT.replace("charging: none", "charging: 1 GiB on nfs-images")
+        self.assertEqual(mover.audit_summary_findings(0, charging), ["charging: 1 GiB on nfs-images"])
+        partial = CLEAN_AUDIT.replace("vm_scan_complete=true", "vm_scan_complete=false")
+        self.assertEqual(len(mover.audit_summary_findings(1, partial)), 2)
+        self.assertIn("storage-journal audit printed no audit header", mover.audit_summary_findings(0, ""))
+        for prefix in ("generation index:", "entry binding finding:", "conflict:", "vm-scan issue:", "issue:",
+                       "runbook:", "evidence:", "planned step:"):
+            with self.subTest(prefix):
+                self.assertEqual(mover.audit_summary_findings(0, CLEAN_AUDIT + prefix + " x\n"), [prefix + " x"])
+
+    def test_config_overrides_with_and_without_the_journal(self) -> None:
+        base = {"host": "h", "disk_migration": "on_attach", "storage_sets": {"keep": {"names": ["x"]}}}
+        on = mover.apply_overrides(base, mover.config_overrides(
+            storage="nfs-images", prefix=PREFIX, band=BAND, journal_dir="/w/journal", namespace=NAMESPACE,
+            journal=True))
+        self.assertNotIn("disk_migration", on)
+        self.assertEqual(on["parker_prefix"], PREFIX)
+        self.assertEqual(on["parker_pool"], "")
+        self.assertEqual(on["detached_disk_strategy"], "parked")
+        self.assertEqual(on["disk_storage"], "nfs-images")
+        self.assertEqual(on["persistent_storage_set"], mover.STORAGE_SET)
+        self.assertEqual(on["storage_sets"], {mover.STORAGE_SET: {"names": ["nfs-images"],
+                                                                  "strategy": {"name": "spread", "version": 1}}})
+        self.assertEqual(on["storage_allocation_journal_dir"], "/w/journal")
+        self.assertEqual(on["storage_placement_namespace"], NAMESPACE)
+        self.assertEqual(base["disk_migration"], "on_attach")
+        off = mover.apply_overrides(base, mover.config_overrides(
+            storage="nfs-images", prefix=PREFIX, band=BAND, journal_dir="/w/journal", namespace=NAMESPACE,
+            journal=False))
+        for key in ("storage_allocation_journal_dir", "storage_placement_namespace", "persistent_storage_set"):
+            self.assertNotIn(key, off)
+        self.assertEqual(off["storage_sets"], {"keep": {"names": ["x"]}})
+        plain = mover.without_journal(on)
+        for key in ("storage_allocation_journal_dir", "storage_placement_namespace", "persistent_storage_set",
+                    "storage_sets"):
+            self.assertNotIn(key, plain)
+        self.assertEqual(plain["parker_prefix"], PREFIX)
+
+    def test_lab_preflight_refuses_before_any_write(self) -> None:
+        lab = MoverLab()
+        self.assertEqual(mover.lab_preflight(lab.read, lab, "nfs-images", "pmx"),
+                         ["lab-pve-cpi-0", "lab-pve-cpi-1", "lab-pve-cpi-2"])
+        with self.assertRaisesRegex(mover.LabRefused, "PVE_VERIFY_TRANSPORT=pmx"):
+            mover.lab_preflight(lab.read, lab, "nfs-images", "urllib")
+        with self.assertRaisesRegex(mover.LabRefused, "local-lvm-data"):
+            mover.lab_preflight(lab.read, MoverLab(storage=dict(NFS_ENTRY, storage="local-lvm-data", type="lvmthin")),
+                                "local-lvm-data", "pmx")
+        az2 = MoverLab(status=[{"type": "cluster", "name": "pve-cpi-az2"},
+                              {"type": "node", "name": "lab-pve-cpi-az2-0", "online": 1},
+                              {"type": "node", "name": "lab-pve-cpi-az2-1", "online": 1}])
+        with self.assertRaisesRegex(mover.LabRefused, "pve-cpi-az2"):
+            mover.lab_preflight(az2.read, az2, "nfs-images", "pmx")
+
+
+class TestPmxWriter(unittest.TestCase):
+    def setUp(self) -> None:
+        self.runs: list[tuple[list, dict]] = []
+
+        def runner(argv, env, **kwargs):
+            config = json.loads(Path(argv[argv.index("--config") + 1]).read_text(encoding="utf-8"))
+            self.runs.append((argv, env, config))
+            return types.SimpleNamespace(returncode=self.exit_code, stdout=b"", stderr=b"server said secret things")
+
+        self.exit_code = 0
+        environ = {"PATH": "/usr/bin", "PMX_CONTEXT": "prod", "PMX_CONFIG": "/etc/pmx.json",
+                   "PVE_VERIFY_PMX_BIN": "/opt/pmx"}
+        with unittest.mock.patch.dict(os.environ, {"PVE_VERIFY_TRANSPORT": "pmx"}):
+            self.writer = mover.PmxWriter(
+                {"host": "10.254.0.10", "api_token": "root@pam!cpi=s3cret", "verify_ssl": False},
+                runner=runner, environ=environ)
+
+    def test_refuses_guests_the_run_did_not_claim(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "did not create"):
+            self.writer.set_config("lab-pve-cpi-0", 90500, {"tags": "x"})
+        for vmid in (100, 101):
+            with self.subTest(vmid):
+                with self.assertRaisesRegex(RuntimeError, "lab keeps"):
+                    self.writer.claim(vmid)
+        self.writer.claim(90500)
+        with self.assertRaisesRegex(RuntimeError, "not a lab-pve-cpi-N node"):
+            self.writer.destroy("lab-pve-cpi-az2-0", 90500)
+        self.assertEqual(self.runs, [])
+
+    def test_writes_go_through_pmx_with_the_secret_in_the_environment(self) -> None:
+        self.writer.claim(90500)
+        self.writer.set_config("lab-pve-cpi-0", 90500, {"tags": "bosh-parker;bosh-disk-mover"})
+        self.writer.destroy("lab-pve-cpi-1", 90500)
+        (put_argv, put_env, put_cfg), (del_argv, _del_env, _del_cfg) = self.runs
+        self.assertEqual(put_argv[0], "/opt/pmx")
+        self.assertEqual(put_argv[put_argv.index("api"):],
+                         ["api", "put", "/nodes/lab-pve-cpi-0/qemu/90500/config",
+                          "--data", "tags=bosh-parker;bosh-disk-mover"])
+        self.assertEqual(del_argv[del_argv.index("api"):],
+                         ["api", "delete", "/nodes/lab-pve-cpi-1/qemu/90500",
+                          "--data", "purge=1", "--data", "destroy-unreferenced-disks=0"])
+        self.assertNotIn("--async", del_argv)
+        self.assertFalse(any("s3cret" in arg for arg in put_argv + del_argv))
+        self.assertEqual(put_env["PVE_VERIFY_PMX_SECRET"], "s3cret")
+        self.assertFalse(any(k.startswith("PMX_") for k in put_env))
+        context = put_cfg["contexts"]["cpi-verifier"]
+        self.assertEqual(context["host"], "10.254.0.10")
+        self.assertEqual(context["auth"], {"type": "token", "username": "root@pam", "token-id": "cpi",
+                                           "secret": "${PVE_VERIFY_PMX_SECRET}"})
+        self.assertNotIn("s3cret", json.dumps(put_cfg))
+
+    def test_a_failed_write_raises_without_pmx_stderr(self) -> None:
+        self.exit_code = 3
+        self.writer.claim(90500)
+        with self.assertRaises(RuntimeError) as caught:
+            self.writer.set_config("lab-pve-cpi-0", 90500, {"protection": "0"})
+        self.assertIn("exit 3", str(caught.exception))
+        self.assertNotIn("secret things", str(caught.exception))
+
+
+class TestAdoptedMoverPass(AdoptedMoverCase):
+    def test_fixed_build_passes_and_cleans_up(self) -> None:
+        lab = MoverLab()
+        cpi = MoverCPI(lab, "fixed")
+        self.make(lab, cpi).run()
+        self.assertTrue(self.steps[0].startswith("11r. adopted mover"))
+        self.assertTrue(any(s.startswith("11r=ok") for s in self.said), self.said)
+        self.assertEqual([r[0] for r in cpi.requests], ["create_disk", "attach_disk", "detach_disk", "delete_disk"])
+        self.assertEqual(cpi.requests[0][1], [1024, {"node": "lab-pve-cpi-0"}])
+        create_cfg = cpi.configs[cpi.requests[0][2]]
+        self.assertEqual(create_cfg["parker_prefix"], PREFIX)
+        self.assertEqual(create_cfg["storage_placement_namespace"], NAMESPACE)
+        self.assertNotIn("disk_migration", create_cfg)
+        self.assertEqual([c[0] for c in cpi.journal_calls], ["initialize", "audit"])
+        self.assertEqual(cpi.journal_calls[0][2],
+                         ("--authority-id", NAMESPACE, "--previous-writer-fenced", "--remote-tasks-settled"))
+        self.assertEqual(cpi.journal_calls[1][2], ("--summary",))
+        tag_writes = [w for w in self.writer.writes if w[0] == "put" and "tags" in w[2]]
+        self.assertEqual(tag_writes, [("put", f"/nodes/lab-pve-cpi-0/qemu/{MOVER_VMID}/config",
+                                       {"tags": f"bosh-parker;vm-prefix--{PREFIX};bosh-disk-mover"})])
+        # The parker detach_disk made is destroyed; the mover was already gone.
+        self.assertIn(("delete", "/nodes/lab-pve-cpi-1/qemu/90501", {"purge": "1", "destroy-unreferenced-disks": "0"}),
+                      self.writer.writes)
+        self.assertNotIn(90501, lab.guests["lab-pve-cpi-1"])
+        self.assertEqual(lab.volumes, set())
+        self.assertEqual(self.workspaces(), [])
+        self.assert_bystanders_untouched()
+
+    def test_unfixed_build_reports_the_cpi_error_verbatim_and_still_cleans_up(self) -> None:
+        lab = MoverLab()
+        cpi = MoverCPI(lab, "unfixed")
+        with self.assertRaises(RuntimeError) as caught:
+            self.make(lab, cpi).run()
+        text = str(caught.exception)
+        self.assertIn("The CPI said, verbatim:\n" + UNFIXED_ERROR, text)
+        self.assertIn('"status": "OK"', text)
+        self.assertEqual([r[0] for r in cpi.requests], ["create_disk", "attach_disk", "delete_disk"])
+        self.assertEqual([c[0] for c in cpi.journal_calls], ["initialize"])
+        # The disk is deleted, and then the empty mover is destroyed on the node it migrated to.
+        self.assertIn(("put", f"/nodes/lab-pve-cpi-1/qemu/{MOVER_VMID}/config", {"protection": "0"}),
+                      self.writer.writes)
+        self.assertIn(("delete", f"/nodes/lab-pve-cpi-1/qemu/{MOVER_VMID}",
+                       {"purge": "1", "destroy-unreferenced-disks": "0"}), self.writer.writes)
+        self.assertEqual(lab.node_of(MOVER_VMID), "")
+        self.assertEqual(self.workspaces(), [])
+        self.assert_bystanders_untouched()
+
+    def test_kept_mover_fails_and_names_the_warning(self) -> None:
+        lab = MoverLab()
+        cpi = MoverCPI(lab, "kept")
+        with self.assertRaises(RuntimeError) as caught:
+            self.make(lab, cpi).run()
+        self.assertIn(f"mover {MOVER_VMID} was not destroyed. The CPI warned, verbatim: {KEPT_WARN}",
+                      str(caught.exception))
+        self.assertEqual(lab.node_of(MOVER_VMID), "")
+        self.assertEqual(self.workspaces(), [])
+        self.assert_bystanders_untouched()
+
+    def test_protection_restore_warning_fails_the_pass(self) -> None:
+        lab = MoverLab()
+        cpi = MoverCPI(lab, "fixed", log=_warn(RESTORE_WARN) + "\n")
+        with self.assertRaisesRegex(RuntimeError, "protection-restore warnings, verbatim: " + RESTORE_WARN):
+            self.make(lab, cpi).run()
+        self.assertEqual(self.workspaces(), [])
+
+    def test_unclean_audit_fails_the_pass(self) -> None:
+        lab = MoverLab()
+        cpi = MoverCPI(lab, "fixed", audit=(1, CLEAN_AUDIT + "record: 7f3a reconciliation\n"))
+        with self.assertRaisesRegex(RuntimeError, "audit --summary is not clean: .*record: 7f3a reconciliation"):
+            self.make(lab, cpi).run()
+        self.assertEqual(self.workspaces(), [])
+
+    def test_a_second_qmigrate_task_fails_the_pass(self) -> None:
+        lab = MoverLab()
+        cpi = MoverCPI(lab, "fixed")
+        original = cpi.send
+
+        def send_twice(method, args, config_path):
+            out = original(method, args, config_path)
+            lab.tasks["lab-pve-cpi-1"].append({"upid": "UPID:again", "type": "qmigrate", "id": str(MOVER_VMID),
+                                               "status": "OK"})
+            return out
+
+        cpi.send = send_twice
+        with self.assertRaisesRegex(RuntimeError, "expected one qmigrate task .* found 2"):
+            self.make(lab, cpi).run()
+
+    def test_journal_off_runs_unmanaged(self) -> None:
+        lab = MoverLab()
+        cpi = MoverCPI(lab, "fixed")
+        self.make(lab, cpi, journal_on=False).run()
+        self.assertEqual(cpi.journal_calls, [])
+        for cfg in cpi.configs.values():
+            self.assertNotIn("storage_allocation_journal_dir", cfg)
+            self.assertEqual(cfg["storage_sets"], {"keep": {"names": ["x"]}})
+        self.assertEqual(self.workspaces(), [])
+
+    def test_refuses_the_wrong_cluster_or_transport_before_any_write(self) -> None:
+        az2 = MoverLab(status=[{"type": "cluster", "name": "pve-cpi-az2"},
+                              {"type": "node", "name": "lab-pve-cpi-az2-0", "online": 1},
+                              {"type": "node", "name": "lab-pve-cpi-az2-1", "online": 1}])
+        for label, lab, transport in (("az2", az2, "pmx"), ("urllib", MoverLab(), "urllib")):
+            with self.subTest(label):
+                cpi = MoverCPI(lab)
+                with self.assertRaises(mover.LabRefused):
+                    self.make(lab, cpi, transport=transport).run()
+                self.assertEqual(cpi.requests, [])
+                self.assertEqual(cpi.journal_calls, [])
+                self.assertEqual(self.writer.writes, [])
+                self.assertEqual(self.workspaces(), [])
+
+    def test_refuses_to_tag_a_holder_the_run_did_not_create(self) -> None:
+        lab = MoverLab()
+        # A CPI that parked the disk on another deployment's existing parker.
+        cpi = MoverCPI(lab, park_on=90010)
+        with self.assertRaisesRegex(RuntimeError, "did not create"):
+            self.make(lab, cpi).run()
+        self.assertEqual([r[0] for r in cpi.requests], ["create_disk", "delete_disk"])
+        self.assertEqual(self.writer.writes, [])
+        self.assertEqual(lab.guests["lab-pve-cpi-0"][90010]["tags"], "bosh-parker;vm-prefix--other")
+        self.assertEqual(self.workspaces(), [])
+
+    def test_undeletable_disk_is_left_on_an_ordinary_parker(self) -> None:
+        lab = MoverLab()
+        cpi = MoverCPI(lab, "unfixed", delete_fails=True)
+        with self.assertRaisesRegex(RuntimeError, "The CPI said, verbatim"):
+            self.make(lab, cpi).run()
+        self.assertEqual([r[0] for r in cpi.requests], ["create_disk", "attach_disk", "delete_disk", "delete_disk"])
+        self.assertEqual(lab.guests["lab-pve-cpi-1"][MOVER_VMID]["tags"], f"bosh-parker;vm-prefix--{PREFIX}")
+        self.assertIn("scsi0", lab.guests["lab-pve-cpi-1"][MOVER_VMID])
+        self.assertFalse(any(w[0] == "delete" for w in self.writer.writes))
+        self.assertTrue(any("left on VM 90500" in s for s in self.said), self.said)
+        self.assertTrue(any("left guest 90500" in s for s in self.said), self.said)
+        self.assertEqual(self.workspaces(), [])
+        self.assert_bystanders_untouched()
+
+    def test_cleanup_problems_fail_a_pass_that_otherwise_passed(self) -> None:
+        lab = MoverLab()
+        cpi = MoverCPI(lab, "fixed")
+        writer = MoverWriter(lab)
+        original = writer._run
+
+        def no_destroy(verb, path, data):
+            if verb == "delete":
+                raise RuntimeError("pmx delete failed (exit 1)")
+            original(verb, path, data)
+
+        writer._run = no_destroy
+        with self.assertRaisesRegex(RuntimeError, "11r passed, and its cleanup left work behind"):
+            self.make(lab, cpi, writer=writer).run()
+
+
+class TestLifecycleAdoptedMoverWiring(LifecycleScriptCase):
+    def test_shared_storage_without_pmx_stops_at_load(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            self.load(DISK_MIGRATION_SHARED_STORAGE="nfs-images")
+        self.assertIn("PVE_VERIFY_TRANSPORT=pmx", str(caught.exception.code))
+
+    def test_bad_journal_value_stops_at_load(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            self.load(DISK_MIGRATION_JOURNAL="maybe")
+        self.assertIn("DISK_MIGRATION_JOURNAL", str(caught.exception.code))
+
+    def test_defaults_and_opt_out_load(self) -> None:
+        lifecycle = self.load()
+        self.assertEqual(lifecycle.DISK_MIGRATION_JOURNAL, "on")
+        self.assertEqual(lifecycle.DISK_MIGRATION_SHARED_STORAGE, "")
+        lifecycle = self.load(DISK_MIGRATION_SHARED_STORAGE="nfs-images", DISK_MIGRATION_TEST="off")
+        self.assertEqual(lifecycle.DISK_MIGRATION_SHARED_STORAGE, "nfs-images")
+
+    def test_11r_skips_without_a_shared_storage(self) -> None:
+        lifecycle = self.load()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            lifecycle.run_adopted_mover_pass(None, {})
+        self.assertIn("11r. SKIPPED", out.getvalue())
 
 
 if __name__ == "__main__":

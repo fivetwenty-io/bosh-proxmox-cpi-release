@@ -30,6 +30,9 @@ Sequence (mirrors the BOSH-CPI Director call order):
                                  on single-node clusters and on shared
                                  disk_storage, where the cross-node case this
                                  pass drives cannot arise)
+   11r. adopted mover pass      (only when DISK_MIGRATION_TEST != off and
+                                 DISK_MIGRATION_SHARED_STORAGE names a shared
+                                 NFS storage; the pve-cpi lab only)
    12.  delete_disk
    12a. has_disk                (post-delete assertion, expect false)
    13.  reboot_vm               (soft graceful reboot, default config)
@@ -177,6 +180,37 @@ Cross-node disk migration (exercises pve.disk_migration end to end):
                        has fewer than two online nodes, or when disk_storage
                        is shared: the co-location conflict it drives only
                        arises on node-local storage.
+    DISK_MIGRATION_JOURNAL  on | off               (default: on)
+                       Runs step 11r journal-managed: its config binds a
+                       one-member storage set and a storage allocation journal
+                       in a private scratch directory under a namespace of its
+                       own, initialized with storage-journal initialize before
+                       the first call. off runs 11r without the journal, as a
+                       control. Steps 11m-11q stay unmanaged either way,
+                       because a storage set member must be shared NFS with
+                       images content and those steps need node-local
+                       disk_storage.
+    DISK_MIGRATION_SHARED_STORAGE  storage ID      (default: unset, 11r SKIPs)
+                       Runs step 11r on this shared NFS storage, which must
+                       serve images content. The pass creates a disk pinned to
+                       a node other than the VM's under a parker prefix of its
+                       own, so the disk parks alone on a fresh parker. It tags
+                       that parker bosh-disk-mover through pmx, the shape an
+                       interrupted migration leaves, and attaches the disk to
+                       the VM in one attempt. It asserts one qmigrate task for
+                       the mover that ended OK, the disk on the VM's node
+                       carrying its serial, the mover destroyed, no
+                       protection-restore WARN in the CPI log, and a clean
+                       storage-journal audit --summary. A failed attach is
+                       reported with the CPI's error text verbatim. The run
+                       refuses to start unless PVE_VERIFY_TRANSPORT=pmx, the
+                       cluster names itself pve-cpi, and every node is a
+                       lab-pve-cpi-N node. Every PVE read and write the pass
+                       makes goes through pmx or the CPI binary, and it writes
+                       only to guests it created in the same run. Its cleanup
+                       runs whether it passed or not: it detaches and deletes
+                       the disk through the CPI, destroys its own parkers and
+                       mover through pmx, and removes its scratch directory.
 
 The pass leaves its parker VM behind, which is the design working as intended:
 a parker is durable infrastructure that outlives any one disk, and the CPI has
@@ -204,6 +238,7 @@ from typing import Any
 # Import the sibling out-of-band PVE verifier (scripts/_pve_verify.py).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _lifecycle_foreign  # noqa: E402
+import _lifecycle_mover  # noqa: E402
 import _pve_verify  # noqa: E402
 import _vmcid  # noqa: E402
 from _storage_placement_verify import PlacementVerification  # noqa: E402
@@ -289,6 +324,18 @@ if PARKED_DISK_TEST not in ("on", "off"):
 DISK_MIGRATION_TEST = env("DISK_MIGRATION_TEST", "on").strip().lower()
 if DISK_MIGRATION_TEST not in ("on", "off"):
     sys.exit(f"DISK_MIGRATION_TEST must be on|off, got {DISK_MIGRATION_TEST!r}")
+
+# Step 11r, the adopted mover on shared storage. It is opt-in through the
+# storage it runs on, and it reads PVE only through pmx, so a run that asks for
+# it with the urllib transport stops here rather than after building a VM.
+DISK_MIGRATION_JOURNAL = env("DISK_MIGRATION_JOURNAL", "on").strip().lower()
+if DISK_MIGRATION_JOURNAL not in ("on", "off"):
+    sys.exit(f"DISK_MIGRATION_JOURNAL must be on|off, got {DISK_MIGRATION_JOURNAL!r}")
+DISK_MIGRATION_SHARED_STORAGE = env("DISK_MIGRATION_SHARED_STORAGE", "").strip()
+PVE_VERIFY_TRANSPORT = env("PVE_VERIFY_TRANSPORT", "urllib").strip()
+if DISK_MIGRATION_TEST == "on" and DISK_MIGRATION_SHARED_STORAGE and PVE_VERIFY_TRANSPORT != "pmx":
+    sys.exit("DISK_MIGRATION_SHARED_STORAGE runs step 11r, which reads PVE only through pmx; "
+             "set PVE_VERIFY_TRANSPORT=pmx")
 
 # Storage-set cache replicas (pve.stemcell_replicate_storage_set). The pass is
 # opt-in and off by default, because it asserts one cache template per member
@@ -612,13 +659,15 @@ class RetriableCPIError(RuntimeError):
 
 
 def _send(
-    method: str, args: list[Any], config_path: str = "", context: "dict[str, Any] | None" = None
+    method: str, args: list[Any], config_path: str = "", context: "dict[str, Any] | None" = None,
+    stderr_out: "list[str] | None" = None,
 ) -> dict[str, Any]:
     """Send one request to the CPI binary and return its parsed response envelope.
 
     context is the extra request context for this call. None means the
     harness's own (CPI_CONTEXT_FILE, or nothing), and a dict, even an empty
-    one, replaces it, which is how a call reaches the other cluster.
+    one, replaces it, which is how a call reaches the other cluster. When
+    stderr_out is a list, the CPI's stderr, which is its log, is appended to it.
     """
     req_id = f"{time.time_ns()}-{random.randint(0, 1 << 32)}"
     req = _lifecycle_foreign.build_request(
@@ -633,6 +682,8 @@ def _send(
         capture_output=True,
         text=True,
     )
+    if stderr_out is not None:
+        stderr_out.append(proc.stderr or "")
 
     if proc.returncode != 0:
         stderr_snippet = (proc.stderr or "").strip()[-1000:]
@@ -1311,7 +1362,76 @@ def write_migration_config(mode: str) -> str:
     )
 
 
-def run_disk_migration_pass(verifier: "_pve_verify.PVEVerifier") -> None:
+def run_disk_migration_pass(verifier: "_pve_verify.PVEVerifier", verify_cfg: dict[str, Any]) -> None:
+    """Run steps 11m-11q on node-local disk_storage, then step 11r on shared storage.
+
+    Both need at least two online nodes. 11m-11q SKIP on shared disk_storage,
+    where the copy-local conflict they drive cannot arise, and 11r SKIPs
+    unless DISK_MIGRATION_SHARED_STORAGE names the shared storage it runs on.
+    """
+    nodes = verifier.cluster_nodes()
+    if len(nodes) < 2:
+        step(
+            "11m. SKIPPED: the disk-migration pass needs at least 2 online "
+            f"nodes; this cluster has {len(nodes)}"
+        )
+        return
+    disk_storage = str(_base_cfg.get("disk_storage", "") or "")
+    if disk_storage and verifier.storage_is_shared(disk_storage):
+        step(
+            f"11m. SKIPPED: disk_storage {disk_storage!r} is shared; the "
+            "cross-node co-location conflict this pass drives cannot arise"
+        )
+    else:
+        if DISK_MIGRATION_JOURNAL == "on":
+            print(
+                f"note: steps 11m-11q run without the journal, because disk_storage {disk_storage!r} is "
+                "node-local and a storage set member must be shared NFS with images content; "
+                "step 11r carries the journal-managed migration"
+            )
+        run_local_disk_migration_steps(verifier, nodes)
+    run_adopted_mover_pass(verifier, verify_cfg)
+
+
+def run_adopted_mover_pass(verifier: "_pve_verify.PVEVerifier", verify_cfg: dict[str, Any]) -> None:
+    """Step 11r: attach a disk whose holder is tagged as a migration mover on another node.
+
+    See scripts/_lifecycle_mover.py for the steps, the checks, and the cleanup.
+    """
+    if not DISK_MIGRATION_SHARED_STORAGE:
+        step("11r. SKIPPED: set DISK_MIGRATION_SHARED_STORAGE to the shared NFS storage it runs on")
+        return
+
+    def send(method: str, args: list[Any], config_path: str) -> tuple[dict[str, Any], str]:
+        log: list[str] = []
+        return _send(method, args, config_path, stderr_out=log), "".join(log)
+
+    def journal(action: str, config_path: str, *flags: str) -> tuple[int, str, str]:
+        proc = subprocess.run(
+            [CPI_BIN, "storage-journal", action, "--config", config_path, *flags],
+            capture_output=True, text=True, timeout=1800, check=False,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+    _lifecycle_mover.AdoptedMoverPass(
+        verifier=verifier,
+        read=verifier._get,
+        writer=_lifecycle_mover.PmxWriter(verify_cfg),
+        send=send,
+        call=lambda method, args, config_path: call(method, args, config_path=config_path),
+        journal=journal,
+        base_config=_base_cfg,
+        transport=PVE_VERIFY_TRANSPORT,
+        vm_cid=state["vm_cid"],
+        storage=DISK_MIGRATION_SHARED_STORAGE,
+        band=(PARKER_RANGE_START, PARKER_RANGE_END),
+        journal_on=DISK_MIGRATION_JOURNAL == "on",
+        disk_size_mib=DISK_SIZE_MIB,
+        step=step,
+    ).run()
+
+
+def run_local_disk_migration_steps(verifier: "_pve_verify.PVEVerifier", nodes: list[str]) -> None:
     """Drive pve.disk_migration end to end against a multi-node cluster.
 
     The shape under test is the one the Director produces: a stable-ID disk
@@ -1333,28 +1453,11 @@ def run_disk_migration_pass(verifier: "_pve_verify.PVEVerifier") -> None:
       11p  detach_disk: the migrated disk parks on the VM's node
       11q  delete_disk: unparks and frees the migrated volume
 
-    SKIPs (exit stays 0) when the cluster has fewer than two online nodes or
-    when disk_storage is shared — the co-location conflict this pass drives
-    only arises on node-local storage. Every claim is checked against the
-    cluster, mirroring run_parked_disk_pass.
+    run_disk_migration_pass calls it only on a cluster with two online nodes
+    and node-local disk_storage, the only place the co-location conflict this
+    pass drives arises. Every claim is checked against the cluster, mirroring
+    run_parked_disk_pass.
     """
-    nodes = verifier.cluster_nodes()
-    if len(nodes) < 2:
-        step(
-            "11m. SKIPPED: the disk-migration pass needs at least 2 online "
-            f"nodes; this cluster has {len(nodes)}"
-        )
-        return
-    with open(CPI_CONFIG) as f:
-        base_cfg = json.load(f)
-    disk_storage = str(base_cfg.get("disk_storage", "") or "")
-    if disk_storage and verifier.storage_is_shared(disk_storage):
-        step(
-            f"11m. SKIPPED: disk_storage {disk_storage!r} is shared; the "
-            "cross-node co-location conflict this pass drives cannot arise"
-        )
-        return
-
     vm_cid = state["vm_cid"]
 
     def node_of(vmid: "int | str") -> str:
@@ -1598,11 +1701,18 @@ def main() -> int:
     try:
         # Out-of-band PVE verifier (same host+auth as the CPI binary). A run
         # that cannot reach PVE to verify must not be able to report success.
-        verifier = _pve_verify.PVEVerifier(_verify_base_cfg)
+        verify_cfg = _verify_base_cfg
         if DEFAULT_CONTEXT:
             # A context file can point the run at another cluster, and the
             # out-of-band checks must read the cluster the CPI is writing to.
-            verifier = _pve_verify.PVEVerifier(_lifecycle_foreign.verifier_config(_verify_base_cfg, DEFAULT_CONTEXT))
+            verify_cfg = _lifecycle_foreign.verifier_config(_verify_base_cfg, DEFAULT_CONTEXT)
+        verifier = _pve_verify.PVEVerifier(verify_cfg)
+        if DISK_MIGRATION_TEST == "on" and DISK_MIGRATION_SHARED_STORAGE:
+            # Step 11r runs only on the pve-cpi lab. Checking here as well as
+            # in the pass stops a run aimed elsewhere before it creates anything.
+            _lifecycle_mover.lab_preflight(
+                verifier._get, verifier, DISK_MIGRATION_SHARED_STORAGE, PVE_VERIFY_TRANSPORT
+            )
         foreign_verifier = None
         if FOREIGN_VM_TEST == "on":
             # Built before anything is created, so a context that cannot reach
@@ -1912,11 +2022,11 @@ def main() -> int:
         if PARKED_DISK_TEST == "on":
             parker_vmid = run_parked_disk_pass(verifier)
 
-        # Steps 11m-11q: cross-node disk migration, on its own fresh disk so
-        # the main disk's state is untouched. SKIPs itself on clusters where
-        # the cross-node case cannot arise.
+        # Steps 11m-11r: cross-node disk migration, each on its own fresh disk
+        # so the main disk's state is untouched. Each SKIPs itself on clusters
+        # where its cross-node case cannot arise.
         if DISK_MIGRATION_TEST == "on":
-            run_disk_migration_pass(verifier)
+            run_disk_migration_pass(verifier, verify_cfg)
 
         # delete_disk runs against whichever config the disk's state requires:
         # after the parked pass the disk is on a parker, and only a call that
