@@ -38,6 +38,10 @@ type ManagedAllocationHooks struct {
 	After func(context.Context, ManagedAllocationMutation, string, any) error
 	// Failed persists uncertainty after either a service or After failure.
 	Failed func(context.Context, ManagedAllocationMutation, string, error) error
+	// Blocked, when set, gets the refusal from Before that locks the guard,
+	// so the guard's owner can say why. The call was not sent. It runs with
+	// the guard's lock held, so it must not call the guard.
+	Blocked func(context.Context, ManagedAllocationMutation, error)
 	// SettleProtectionWrites opts a guard into finishing a failed
 	// protection-only write without locking itself (see
 	// classifyProtectionWriteFailure). A write PVE refused is passed to After
@@ -161,6 +165,9 @@ func (g *ManagedAllocationGuard) begin(ctx context.Context, m ManagedAllocationM
 	}
 	if err != nil {
 		g.poisoned = cpierrors.Cloud("managed allocation blocked before %s.%s", m.Service, m.Method)
+		if g.hooks.Blocked != nil {
+			g.hooks.Blocked(ctx, m, err)
+		}
 		g.mu.Unlock()
 		return "", &managedMutationNotAttempted{err: g.poisoned}
 	}

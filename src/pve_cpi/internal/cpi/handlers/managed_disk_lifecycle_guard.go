@@ -78,6 +78,7 @@ func newManagedDiskLifecycleGuard(m *managedDiskLifecycle) (*ManagedAllocationGu
 			m.warnMutationUncertain(ctx, call, step, err)
 			return m.session.Uncertain(call.Service + "." + call.Method)
 		},
+		Blocked:                m.warnMutationBlocked,
 		SettleProtectionWrites: true, SettleFailedWrite: state.settleFailedWrite,
 	})
 }
@@ -93,19 +94,39 @@ func (m *managedDiskLifecycle) warnMutationUncertain(
 	if err == nil {
 		return
 	}
-	fields := []log.Field{
-		log.String("call", call.Service+"."+call.Method),
-		log.String("step_id", step),
-		log.Err(err),
+	m.deps.Log(ctx).Warn("managed disk lifecycle mutation requires reconciliation because the guard could not "+
+		"settle its outcome", m.mutationWarningFields(call, []log.Field{log.String("step_id", step)}, err)...)
+}
+
+// warnMutationBlocked logs why the guard's checks before a lifecycle mutation
+// refused it in a way that locks the guard. The mutation was not sent, and no
+// step was recorded for it, so the WARN carries no step. Like the WARN for an
+// outcome the guard could not settle, it is where an operator finds the
+// reason, and log.Err scrubs the error text.
+func (m *managedDiskLifecycle) warnMutationBlocked(ctx context.Context, call ManagedAllocationMutation, err error) {
+	if err == nil {
+		return
 	}
+	m.deps.Log(ctx).Warn("managed disk lifecycle mutation requires reconciliation because the guard's checks "+
+		"before it refused it", m.mutationWarningFields(call, nil, err)...)
+}
+
+// mutationWarningFields are the fields of a lifecycle mutation WARN: the call,
+// the extra fields, the scrubbed error, the operation, and the allocation.
+func (m *managedDiskLifecycle) mutationWarningFields(
+	call ManagedAllocationMutation, extra []log.Field, err error,
+) []log.Field {
+	fields := make([]log.Field, 0, 4+len(extra))
+	fields = append(fields, log.String("call", call.Service+"."+call.Method))
+	fields = append(fields, extra...)
+	fields = append(fields, log.Err(err))
 	if m.session != nil {
 		fields = append(fields, log.String("operation", m.session.operation))
 	}
 	if m.disk.allocation != nil {
 		fields = append(fields, log.String("allocation_id", m.disk.allocation.record.ID))
 	}
-	m.deps.Log(ctx).Warn("managed disk lifecycle mutation requires reconciliation because the guard could not "+
-		"settle its outcome", fields...)
+	return fields
 }
 func lifecycleMutationFields(params any) (map[string]any, error) {
 	encoded, err := json.Marshal(params)

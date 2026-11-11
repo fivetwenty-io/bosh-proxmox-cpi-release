@@ -1187,8 +1187,10 @@ func (c lifecycleFlowCluster) ListResources(context.Context, *cluster.ListResour
 }
 func (n lifecycleFlowNodes) CreateQemuMigrate(_ context.Context, node, vmidText string, p *nodes.CreateQemuMigrateParams) (*nodes.CreateQemuMigrateResponse, error) {
 	id, _ := strconv.Atoi(vmidText)
-	if n.c.vmNode(id) != node {
-		return nil, fmt.Errorf("migration source node changed")
+	if _, exists := n.c.state.configs[id]; !exists || n.c.vmNode(id) != node {
+		// PVE loads the VM's config on the node the call names, and answers
+		// a node without it the way it answers a config read there.
+		return nil, lifecycleConfigMissingAnswer(node, id)
 	}
 	if n.c.vmNodes == nil {
 		n.c.vmNodes = map[int]string{}
@@ -1204,6 +1206,12 @@ func (n lifecycleFlowNodes) CreateQemuMigrate(_ context.Context, node, vmidText 
 	return &raw, nil
 }
 
+// lifecycleFlowDestroyUPID is the UPID of the destroy task the flow fake starts
+// for vmid on node, in PVE's nine-field shape.
+func lifecycleFlowDestroyUPID(node string, vmid int) string {
+	return fmt.Sprintf("UPID:%s:0000A1B3:0001C3D5:6734ABCE:qmdestroy:%d:root@pam:", node, vmid)
+}
+
 // lifecycleFlowMigrateUPID is the UPID of the migrate task the flow fake starts
 // for vmid on node, in PVE's nine-field shape.
 func lifecycleFlowMigrateUPID(node string, vmid int) string {
@@ -1212,15 +1220,17 @@ func lifecycleFlowMigrateUPID(node string, vmid int) string {
 
 func (n lifecycleFlowNodes) DeleteQemu(_ context.Context, node, vmidText string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
 	id, _ := strconv.Atoi(vmidText)
-	if n.c.vmNode(id) != node {
-		return nil, fmt.Errorf("delete node changed")
+	if _, exists := n.c.state.configs[id]; !exists || n.c.vmNode(id) != node {
+		// PVE loads the VM's config on the node the call names, and answers
+		// a node without it the way it answers a config read there.
+		return nil, lifecycleConfigMissingAnswer(node, id)
 	}
 	if lifecycleConfigHasAnyVolume(n.c.state.configs[id]) {
 		return nil, fmt.Errorf("mover not empty")
 	}
 	delete(n.c.state.configs, id)
 	delete(n.c.vmNodes, id)
-	raw := json.RawMessage(`"UPID:n2:destroy"`)
+	raw := json.RawMessage(strconv.Quote(lifecycleFlowDestroyUPID(node, id)))
 	return &raw, nil
 }
 
