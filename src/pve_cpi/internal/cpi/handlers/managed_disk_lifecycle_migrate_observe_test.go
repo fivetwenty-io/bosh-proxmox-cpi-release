@@ -1,13 +1,16 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
@@ -306,6 +309,163 @@ func TestObserveHolderDeletion_RefusesAHolderThatIsNotProvenGone(t *testing.T) {
 			if _, err := c.guard.observeHolderDeletion(c.ctx, c.deletion()); err == nil ||
 				!strings.Contains(err.Error(), "temporary holder deletion is not observed") {
 				t.Fatalf("observeHolderDeletion = %v, want the deletion refusal", err)
+			}
+		})
+	}
+}
+
+// holderDestroyUPID is the UPID of a qmdestroy task for vmid on node, in PVE's
+// nine-field shape.
+func holderDestroyUPID(node string, vmid int) string {
+	return "UPID:" + node + ":0000A1B2:0001C3D4:6734ABCD:qmdestroy:" + strconv.Itoa(vmid) + ":root@pam:"
+}
+
+// withOfflineMember makes the cluster n1, n2, and n3, reports n3 offline,
+// records the deletion's task, and sends the guard's log to the buffer it
+// returns.
+func (c *migratedHolderCase) withOfflineMember(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	c.client.members = []string{"n1", "n2", "n3"}
+	c.client.offlineNodes = map[string]bool{"n3": true}
+	logged := &bytes.Buffer{}
+	logger, err := log.NewLogger("debug", logged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.guard.lifecycle.deps.Logger = logger
+	return logged
+}
+
+// offlineDeletion is the observation of the step that deleted the holder on
+// n1, with the qmdestroy task the guard awaited.
+func (c *migratedHolderCase) offlineDeletion() managedDiskMutationObservation {
+	observation := c.deletion()
+	observation.upid = holderDestroyUPID("n1", migratedHolderVMID)
+	return observation
+}
+
+// TestObserveHolderDeletion_AcceptsAnOfflineMemberWithNoHit observes a deleted
+// holder on a cluster with an offline member. The recorded node answers that
+// the config is gone, every member that answers the probe agrees, and the
+// deletion task reads back stopped with exit status OK on the recorded node,
+// so the step observes the volume and a WARN names the offline member.
+func TestObserveHolderDeletion_AcceptsAnOfflineMemberWithNoHit(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		answer error
+	}{
+		{"pmxcfs 500", errGuardSiteConfigGone},
+		{"404", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newMigratedHolderCase(t)
+			logged := c.withOfflineMember(t)
+			c.deleteHolder()
+			if tc.answer != nil {
+				c.answerOnSource(tc.answer)
+			}
+			volumes, err := c.guard.observeHolderDeletion(c.ctx, c.offlineDeletion())
+			if err != nil {
+				t.Fatalf("observeHolderDeletion: %v", err)
+			}
+			if len(volumes) != 1 || volumes[0] != c.volume {
+				t.Fatalf("observed volumes = %v, want the recorded volume %s", volumes, c.volume)
+			}
+			out := logged.String()
+			if !strings.Contains(out, "while the cluster reports some members offline") ||
+				!strings.Contains(out, `"offline_nodes":"n3"`) ||
+				!strings.Contains(out, holderDestroyUPID("n1", migratedHolderVMID)) {
+				t.Fatalf("log = %s, want a WARN naming offline n3 and the deletion task", out)
+			}
+		})
+	}
+}
+
+// TestObserveHolderDeletion_RefusesAnOfflineMemberUnlessEveryProofHolds keeps
+// refusing a deletion on a cluster with an offline member when the probe finds
+// the holder elsewhere, the member enumeration fails, the recorded node is
+// the offline one, another member's probe fails, the deletion task isn't the
+// holder's qmdestroy on the recorded node, the task doesn't read back stopped
+// with exit status OK, or the second probe finds the holder.
+func TestObserveHolderDeletion_RefusesAnOfflineMemberUnlessEveryProofHolds(t *testing.T) {
+	upid := holderDestroyUPID("n1", migratedHolderVMID)
+	for _, tc := range []struct {
+		name  string
+		setup func(c *migratedHolderCase, o *managedDiskMutationObservation)
+		want  string
+	}{
+		// The holder moved to n2 rather than being deleted.
+		{"hit on another member", func(c *migratedHolderCase, _ *managedDiskMutationObservation) {
+			c.answerOnSource(errGuardSiteConfigGone)
+		}, "found holder 90144 on node n2"},
+		{"enumeration failure", func(c *migratedHolderCase, _ *managedDiskMutationObservation) {
+			c.deleteHolder()
+			c.client.memberListErr = &sdkerrors.ConnectionError{Host: "n1", Port: 8006, Message: "connection refused"}
+		}, "could not prove holder 90144 absent"},
+		{"the recorded node offline", func(c *migratedHolderCase, _ *managedDiskMutationObservation) {
+			c.deleteHolder()
+			c.client.offlineNodes = map[string]bool{"n1": true}
+		}, "reports node n1, which answered for holder 90144, offline"},
+		{"probe error beside the offline member", func(c *migratedHolderCase, _ *managedDiskMutationObservation) {
+			c.deleteHolder()
+			c.answerOnSource(errGuardSiteConfigGone)
+			previous := c.client.onNodeConfigRead
+			c.client.onNodeConfigRead = func(node string, vmid int) error {
+				if node == "n2" && vmid == migratedHolderVMID {
+					return errMigrateSourceTimeout
+				}
+				return previous(node, vmid)
+			}
+		}, "could not prove holder 90144 absent"},
+		{"no task", func(c *migratedHolderCase, o *managedDiskMutationObservation) {
+			c.deleteHolder()
+			o.upid = ""
+		}, "is not a UPID"},
+		{"task on another node", func(c *migratedHolderCase, o *managedDiskMutationObservation) {
+			c.deleteHolder()
+			o.upid = holderDestroyUPID("n2", migratedHolderVMID)
+		}, "is not a qmdestroy task of VM 90144 on node n1"},
+		{"task of another VM", func(c *migratedHolderCase, o *managedDiskMutationObservation) {
+			c.deleteHolder()
+			o.upid = holderDestroyUPID("n1", migratedHolderVMID+1)
+		}, "is not a qmdestroy task of VM 90144 on node n1"},
+		{"task of another type", func(c *migratedHolderCase, o *managedDiskMutationObservation) {
+			c.deleteHolder()
+			o.upid = lifecycleFlowMigrateUPID("n1", migratedHolderVMID)
+		}, "is not a qmdestroy task of VM 90144 on node n1"},
+		{"task ended with warnings", func(c *migratedHolderCase, _ *managedDiskMutationObservation) {
+			c.deleteHolder()
+			c.client.failedTasks = map[string]string{upid: "WARNINGS: 1"}
+		}, "reports status"},
+		{"task failed", func(c *migratedHolderCase, _ *managedDiskMutationObservation) {
+			c.deleteHolder()
+			c.client.failedTasks = map[string]string{upid: "command failed"}
+		}, "reports status"},
+		{"task unreadable", func(c *migratedHolderCase, _ *managedDiskMutationObservation) {
+			c.deleteHolder()
+			c.client.unreadableTasks = map[string]bool{upid: true}
+		}, "read task"},
+		{"second probe hit", func(c *migratedHolderCase, _ *managedDiskMutationObservation) {
+			holder := c.client.state.configs[migratedHolderVMID]
+			c.deleteHolder()
+			c.client.onTaskStatus = func(string) {
+				c.client.state.configs[migratedHolderVMID] = holder
+				c.client.vmNodes[migratedHolderVMID] = "n2"
+			}
+		}, "found holder 90144 on node n2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newMigratedHolderCase(t)
+			logged := c.withOfflineMember(t)
+			observation := c.offlineDeletion()
+			tc.setup(c, &observation)
+			_, err := c.guard.observeHolderDeletion(c.ctx, observation)
+			if err == nil || !strings.Contains(err.Error(), "temporary holder deletion is not observed") ||
+				!strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("observeHolderDeletion = %v, want the deletion refusal containing %q", err, tc.want)
+			}
+			if strings.Contains(logged.String(), "while the cluster reports some members offline") {
+				t.Fatalf("log = %s, want no acceptance WARN on a refusal", logged.String())
 			}
 		})
 	}

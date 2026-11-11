@@ -52,6 +52,14 @@ type lifecycleFlowPVE struct {
 	onVolumeDeleted func()
 	// offlineNodes are the cluster members ListStatus reports offline.
 	offlineNodes map[string]bool
+	// members are the cluster members the membership reads name, n1 and n2
+	// when nil. memberListErr fails the corosync member list with a transport
+	// fault, which leaves membership unknown.
+	members       []string
+	memberListErr error
+	// onTaskStatus, when set, runs before every task status read, so a row
+	// can change the cluster between the read and what follows it.
+	onTaskStatus func(upid string)
 	// vmSnapshots, when set, answers ListSnapshots per VM instead of
 	// snapshots, which every VM shares.
 	vmSnapshots map[int][]map[string]any
@@ -283,6 +291,24 @@ func (t lifecycleFlowTasks) Wait(ctx context.Context, node, upid string, opts *t
 		}
 	}
 	return t.diskSizingTasks.Wait(ctx, node, upid, opts)
+}
+
+// GetStatus reads one task's status the way PVE's task status endpoint
+// answers it: an unreadable task fails the read, a task failedTasks names
+// reports stopped with that exit status, and every other task reports stopped
+// with exit status OK.
+func (t lifecycleFlowTasks) GetStatus(_ context.Context, _, upid string) (*tasks.Status, error) {
+	if t.c.onTaskStatus != nil {
+		t.c.onTaskStatus(upid)
+	}
+	if t.c.unreadableTasks[upid] {
+		return nil, &sdkerrors.ConnectionError{Host: "n1", Port: 8006, Message: "connection reset by peer"}
+	}
+	if exit, failed := t.c.failedTasks[upid]; failed {
+		return &tasks.Status{Status: "stopped", ExitStatus: exit, UpID: upid,
+			Warned: strings.HasPrefix(exit, "WARNINGS")}, nil
+	}
+	return &tasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
 }
 
 func (c *lifecycleFlowPVE) Nodes() nodes.Service {
@@ -1080,8 +1106,21 @@ func (n lifecycleFlowNodes) ListQemuPending(ctx context.Context, node, vmid stri
 	return PendingFromConfigRead(ctx, read, node, vmid)
 }
 func (n lifecycleFlowNodes) ListNodes(context.Context) (*nodes.ListNodesResponse, error) {
-	rows := nodes.ListNodesResponse{json.RawMessage(`{"node":"n1","status":"online"}`), json.RawMessage(`{"node":"n2","status":"online"}`)}
+	members := n.c.memberNames()
+	rows := make(nodes.ListNodesResponse, 0, len(members))
+	for _, node := range members {
+		rows = append(rows, json.RawMessage(fmt.Sprintf(`{"node":%q,"status":"online"}`, node)))
+	}
 	return &rows, nil
+}
+
+// memberNames is the fake cluster's membership, n1 and n2 unless members
+// names others.
+func (c *lifecycleFlowPVE) memberNames() []string {
+	if c.members != nil {
+		return c.members
+	}
+	return []string{"n1", "n2"}
 }
 
 // fixtureGuestTags is the tags value the flow fake serves in its scan rows:
@@ -1106,13 +1145,19 @@ type lifecycleFlowCluster struct {
 }
 
 func (c lifecycleFlowCluster) ListConfigNodes(context.Context) (*cluster.ListConfigNodesResponse, error) {
-	r := cluster.ListConfigNodesResponse{json.RawMessage(`{"name":"n1"}`), json.RawMessage(`{"name":"n2"}`)}
+	if c.c.memberListErr != nil {
+		return nil, c.c.memberListErr
+	}
+	r := cluster.ListConfigNodesResponse{}
+	for _, node := range c.c.memberNames() {
+		r = append(r, json.RawMessage(fmt.Sprintf(`{"name":%q}`, node)))
+	}
 	return &r, nil
 }
 func (c lifecycleFlowCluster) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
 	r := make(cluster.ListStatusResponse, 0, 3)
 	r = append(r, json.RawMessage(`{"type":"cluster","quorate":1}`))
-	for _, node := range []string{"n1", "n2"} {
+	for _, node := range c.c.memberNames() {
 		online := 1
 		if c.c.offlineNodes[node] {
 			online = 0

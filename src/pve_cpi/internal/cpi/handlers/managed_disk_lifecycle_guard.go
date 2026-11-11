@@ -15,6 +15,7 @@ import (
 	"maps"
 	"math"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -49,6 +50,9 @@ type managedDiskMutationObservation struct {
 	// caller's digest and only removes notes from the description the guard
 	// read, the way pve.RemoveDescriptionNotes builds it.
 	notesRemoval bool
+	// upid is the task of an asynchronous mutation, set once AwaitTask has
+	// seen the task finish without failing.
+	upid string
 }
 
 type managedDiskLifecycleGuard struct {
@@ -461,6 +465,7 @@ func (g *managedDiskLifecycleGuard) after(ctx context.Context, call ManagedAlloc
 			}
 			return fmt.Errorf("managed lifecycle task outcome requires reconciliation")
 		}
+		observation.upid = upid
 	}
 	volumes, err := g.observeResult(ctx, call, observation, result)
 	if err != nil {
@@ -962,25 +967,108 @@ func observeMigratedHolder(
 	return slot, landed, nil
 }
 
-func (g *managedDiskLifecycleGuard) observeHolderDeletion(ctx context.Context, observation managedDiskMutationObservation) ([]string, error) {
+// observeHolderDeletion proves that the DeleteQemu the guard sent removed the
+// holder. PVE answers a config read for a VM that isn't on the addressed node
+// with either a 404 or a 500 saying the configuration file does not exist.
+// Both prove the recorded node empty. A holder that moved rather than being
+// deleted still has a config on another member, so the probe of every member
+// has to find it nowhere too.
+//
+// A member the quorate cluster reports offline can't answer the probe, so the
+// probe refuses and names it even when every member that answered says the
+// config is gone. That refusal alone doesn't block the observation, because
+// the deletion task proves the deletion on the node that held the holder, and
+// a VMID's config exists on one member at a time. The deletion counts as
+// observed when the task reads back as the holder's qmdestroy task on the
+// recorded node, stopped with exit status OK, the recorded node isn't among the
+// offline members, and a second probe again finds no hit and refuses for
+// offline members alone. A WARN then names those members. A hit anywhere, any
+// other probe error, and a member enumeration that fails still refuse.
+func (g *managedDiskLifecycleGuard) observeHolderDeletion(
+	ctx context.Context, observation managedDiskMutationObservation,
+) ([]string, error) {
 	m := g.lifecycle
 	volumes := make([]string, 1, 2)
 	volumes[0] = g.lifecycle.disk.volid
-	// PVE answers a config read for a VM that isn't on the addressed node with
-	// either a 404 or a 500 saying the configuration file does not exist. Both
-	// prove the recorded node empty. A holder that moved rather than being
-	// deleted still has a config on another member, so the probe of every
-	// member has to come back empty too.
 	cfg, err := m.deps.PVE.QEMU().Config(ctx, observation.node, observation.vmid)
 	if cfg != nil || err == nil || !configReadAnswered(err) {
-		return nil, fmt.Errorf("temporary holder deletion is not observed")
+		return nil, holderDeletionUnobserved("node %s did not answer that holder %d's config is gone",
+			observation.node, observation.vmid)
 	}
-	location, err := pve.FindVMByConfigProbe(ctx, m.deps.PVE, observation.vmid)
-	if err != nil || location.Found {
-		return nil, fmt.Errorf("temporary holder deletion is not observed")
+	offline, err := g.probeDeletedHolder(ctx, observation)
+	if err != nil {
+		return nil, err
 	}
-
+	if len(offline) == 0 {
+		return volumes, nil
+	}
+	if err := g.holderDeletionTaskSettled(ctx, observation); err != nil {
+		return nil, err
+	}
+	again, err := g.probeDeletedHolder(ctx, observation)
+	if err != nil {
+		return nil, err
+	}
+	for _, node := range again {
+		if !slices.Contains(offline, node) {
+			offline = append(offline, node)
+		}
+	}
+	m.deps.Log(ctx).Warn("observed the temporary holder's deletion from its task and the members that answered, "+
+		"while the cluster reports some members offline",
+		log.Int("vmid", observation.vmid),
+		log.String("node", observation.node),
+		log.String("offline_nodes", strings.Join(offline, ",")),
+		log.String("upid", observation.upid))
 	return volumes, nil
+}
+
+// holderDeletionUnobserved is the refusal of a holder deletion the guard could
+// not prove, with the reason it could not.
+func holderDeletionUnobserved(format string, args ...any) error {
+	return fmt.Errorf("temporary holder deletion is not observed: "+format, args...)
+}
+
+// probeDeletedHolder probes every member's config for the holder a DeleteQemu
+// removed. It returns no members and no error when the probe proves the holder
+// absent, and the members the cluster reports offline when the probe's only
+// reason to refuse is those members. A hit, any other probe error, and an
+// offline recorded node refuse.
+func (g *managedDiskLifecycleGuard) probeDeletedHolder(
+	ctx context.Context, observation managedDiskMutationObservation,
+) ([]string, error) {
+	location, err := pve.FindVMByConfigProbe(ctx, g.lifecycle.deps.PVE, observation.vmid)
+	if location.Found {
+		return nil, holderDeletionUnobserved("the config probe found holder %d on node %s",
+			observation.vmid, location.Node)
+	}
+	if err == nil {
+		return nil, nil
+	}
+	offline, ok := pve.ConfigProbeOfflineMembers(err, observation.vmid)
+	if !ok {
+		return nil, holderDeletionUnobserved("the config probe could not prove holder %d absent: %w",
+			observation.vmid, err)
+	}
+	if slices.Contains(offline, observation.node) {
+		return nil, holderDeletionUnobserved("the cluster reports node %s, which answered for holder %d, offline",
+			observation.node, observation.vmid)
+	}
+	return offline, nil
+}
+
+// holderDeletionTaskSettled reads the holder deletion's task back and returns
+// an error unless it is the holder's qmdestroy task on the recorded node and
+// PVE reports it stopped with exit status OK. AwaitTask also accepts a task
+// that ended with warnings, so the read back is stricter than the await.
+func (g *managedDiskLifecycleGuard) holderDeletionTaskSettled(
+	ctx context.Context, observation managedDiskMutationObservation,
+) error {
+	if err := pve.ConfirmGuestTaskOK(ctx, g.lifecycle.deps.PVE, observation.node, observation.upid, "qmdestroy",
+		observation.vmid); err != nil {
+		return holderDeletionUnobserved("the deletion task does not prove holder %d gone: %w", observation.vmid, err)
+	}
+	return nil
 }
 
 func (g *managedDiskLifecycleGuard) observeConfigResult(ctx context.Context, call ManagedAllocationMutation, observation managedDiskMutationObservation, result any) ([]string, error) {
