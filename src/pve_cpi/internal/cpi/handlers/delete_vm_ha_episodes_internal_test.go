@@ -125,3 +125,38 @@ func TestRecoveryGraceWindowRunsOutAcrossCallsWithAMissingOverride(t *testing.T)
 		t.Errorf("the override directory must never be created: %v", statErr)
 	}
 }
+
+// TestHAEpisodesOfTwoClustersDoNotShareAnEntry shows two cluster entries that
+// share one cache directory and each hold a VM 105 in recovery. Each delete
+// retry builds its own store, and neither entry may start the other's clock
+// again.
+func TestHAEpisodesOfTwoClustersDoNotShareAnEntry(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "cache")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	clusterA := Deps{Config: &config.CPIConfig{EndpointCacheDir: dir, Host: "pve-a.example", Port: 8006}}
+	clusterB := Deps{Config: &config.CPIConfig{EndpointCacheDir: dir, Host: "pve-b.example", Port: 8006}}
+	if haEpisodes(clusterA, nil).Scope == "" || haEpisodes(clusterA, nil).Scope == haEpisodes(clusterB, nil).Scope {
+		t.Fatal("the store must carry a scope that tells the two entries apart")
+	}
+
+	start := time.Now().Add(-20 * time.Minute)
+	clusterA.HAEpisodes = nil
+	earlier := haEpisodes(clusterA, nil)
+	earlier.Now = func() time.Time { return start }
+	if _, err := earlier.Observe("vm:105", "uid-a"); err != nil {
+		t.Fatal(err)
+	}
+	// The other cluster observes the same service ID with its own uid.
+	if ep, err := haEpisodes(clusterB, nil).Observe("vm:105", "uid-b"); err != nil || ep.Recorded {
+		t.Fatalf("the other cluster's first observation: recorded=%v err=%v", ep.Recorded, err)
+	}
+	ep, err := haEpisodes(clusterA, nil).Observe("vm:105", "uid-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ep.Recorded || ep.Elapsed() < 19*time.Minute {
+		t.Fatalf("the first cluster's window must keep running: recorded=%v elapsed=%s", ep.Recorded, ep.Elapsed())
+	}
+}

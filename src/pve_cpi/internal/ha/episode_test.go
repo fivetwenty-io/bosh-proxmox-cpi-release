@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -605,5 +606,120 @@ func TestEpisodeStore_TheWarnDoesNotBlameTheTemporaryDirectoryWhenTheSiblingIsRe
 	}
 	if warns[0].Attrs["fallback"] != sibling {
 		t.Errorf("the warning must name %s, got %+v", sibling, warns[0].Attrs)
+	}
+}
+
+func TestEpisodeStore_ClustersWithTheSameServiceIDKeepTheirOwnClocks(t *testing.T) {
+	t.Parallel()
+	store, clk, _ := newEpisodeStore(t)
+	first := *store
+	first.Scope = "cluster-a"
+	second := *store
+	second.Scope = "cluster-b"
+
+	if _, err := first.Observe("vm:105", "uid-a"); err != nil {
+		t.Fatal(err)
+	}
+	clk.t = clk.t.Add(2 * time.Minute)
+	if ep, err := second.Observe("vm:105", "uid-b"); err != nil || ep.Recorded {
+		t.Fatalf("the other cluster's first observation: recorded=%v err=%v", ep.Recorded, err)
+	}
+	clk.t = clk.t.Add(3 * time.Minute)
+	ep, err := first.Observe("vm:105", "uid-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ep.Recorded || ep.Elapsed() != 5*time.Minute {
+		t.Fatalf("the first cluster's clock must run on undisturbed: recorded=%v elapsed=%s", ep.Recorded, ep.Elapsed())
+	}
+	ep, err = second.Observe("vm:105", "uid-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ep.Recorded || ep.Elapsed() != 3*time.Minute {
+		t.Fatalf("the second cluster's clock: recorded=%v elapsed=%s, want 3m", ep.Recorded, ep.Elapsed())
+	}
+}
+
+// TestEpisodeStore_ARecordFromBeforeScopingIsIgnoredAndSafe covers an upgrade.
+// An earlier release keyed the entry by the bare service ID, and the entry may
+// belong to any cluster, so a scoped store does not read it. The episode then
+// starts its clock once more, which only delays a handover, and the unscoped
+// entry stays in the file until it ages out.
+func TestEpisodeStore_ARecordFromBeforeScopingIsIgnoredAndSafe(t *testing.T) {
+	t.Parallel()
+	store, clk, dir := newEpisodeStore(t)
+	legacy := *store
+	if _, err := legacy.Observe("vm:105", "uid-a"); err != nil {
+		t.Fatal(err)
+	}
+	clk.t = clk.t.Add(20 * time.Minute)
+
+	scoped := *store
+	scoped.Scope = "cluster-a"
+	ep, err := scoped.Observe("vm:105", "uid-a")
+	if err != nil {
+		t.Fatalf("a scoped store must read a file with unscoped entries: %v", err)
+	}
+	if ep.Recorded || ep.Elapsed() != 0 {
+		t.Fatalf("the unscoped entry must not answer for a cluster: recorded=%v elapsed=%s", ep.Recorded, ep.Elapsed())
+	}
+	clk.t = clk.t.Add(time.Minute)
+	if ep, err = scoped.Observe("vm:105", "uid-a"); err != nil || !ep.Recorded || ep.Elapsed() != time.Minute {
+		t.Fatalf("the scoped entry must persist: %+v, %v", ep, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, ha.EpisodeFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"vm:105@cluster-a"`) || !strings.Contains(string(raw), `"vm:105"`) {
+		t.Errorf("the record should hold the scoped entry and the aging unscoped one: %s", raw)
+	}
+}
+
+func TestEpisodeStore_AFutureEntryIsPrunedWhenAnotherServiceIsObserved(t *testing.T) {
+	t.Parallel()
+	store, clk, _ := newEpisodeStore(t)
+	future := *store
+	future.Now = func() time.Time { return clk.t.Add(48 * time.Hour) }
+	if _, err := future.Observe("vm:101", "uid-a"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Observe("vm:102", "uid-z"); err != nil {
+		t.Fatal(err)
+	}
+	ep, err := future.Observe("vm:101", "uid-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ep.Recorded {
+		t.Fatal("an entry first seen in the future must be pruned by the next write")
+	}
+}
+
+func TestEpisodeScope(t *testing.T) {
+	t.Parallel()
+	cfg := func(hosts ...string) *config.CPIConfig { return &config.CPIConfig{Endpoints: hosts} }
+
+	a := ha.EpisodeScope(cfg("pve1.example:8006", "pve2.example:8006"))
+	if len(a) != 16 || strings.Contains(a, "pve") {
+		t.Fatalf("scope = %q, want 16 hex characters that hold no host name", a)
+	}
+	if got := ha.EpisodeScope(cfg("pve2.example:8006", "pve1.example:8006")); got != a {
+		t.Errorf("the order of the list must not change the scope: %q vs %q", got, a)
+	}
+	if got := ha.EpisodeScope(cfg("pve1.example", "pve2.example")); got != a {
+		t.Errorf("a missing port means 8006: %q vs %q", got, a)
+	}
+	if got := ha.EpisodeScope(cfg("pve9.example:8006")); got == a {
+		t.Error("different endpoints must give different scopes")
+	}
+	hostOnly := ha.EpisodeScope(&config.CPIConfig{Host: "pve1.example", Port: 8006})
+	if hostOnly == "" || hostOnly != ha.EpisodeScope(cfg("pve1.example:8006")) {
+		t.Errorf("a host and port is the one-entry list: %q", hostOnly)
+	}
+	if ha.EpisodeScope(nil) != "" || ha.EpisodeScope(&config.CPIConfig{}) != "" {
+		t.Error("an entry with no endpoint has no scope")
 	}
 }

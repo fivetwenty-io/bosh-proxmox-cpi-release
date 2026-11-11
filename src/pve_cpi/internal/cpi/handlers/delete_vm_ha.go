@@ -63,7 +63,11 @@ func haEpisodes(deps Deps, logger *log.Logger) *ha.EpisodeStore {
 	if deps.HAEpisodes != nil {
 		return deps.HAEpisodes
 	}
-	return &ha.EpisodeStore{Dir: endpointcache.OptionsFor(deps.Config), Log: logger}
+	return &ha.EpisodeStore{
+		Dir:   endpointcache.OptionsFor(deps.Config),
+		Scope: ha.EpisodeScope(deps.Config),
+		Log:   logger,
+	}
 }
 
 // readHADeleteState reads the normalized HA model for a delete. The delete may

@@ -1,14 +1,18 @@
 package ha
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/privatefile"
@@ -37,6 +41,10 @@ const (
 	// CPI first saw it. A recovery that has lasted longer than this is long
 	// past any grace window, so pruning it changes no decision.
 	episodeRetention = 7 * 24 * time.Hour
+
+	// episodeScopeHex is how many hex characters of the endpoint digest name a
+	// cluster entry in the record.
+	episodeScopeHex = 16
 )
 
 // episodePolicy reads and writes the record through the private-file helpers.
@@ -53,8 +61,11 @@ var episodePolicy = privatefile.Policy{
 // EpisodeStore records when the CPI first observed each HA recovery episode.
 // The CRM gives a service a new uid on every state change, so the pair of the
 // service ID and its uid while it is in recovery names one episode. The store
-// keeps one entry per service ID, and a uid that differs from the recorded one
-// replaces the entry, which starts the episode's clock again.
+// keeps one entry per service ID and cluster scope, and a uid that differs from
+// the recorded one replaces the entry, which starts the episode's clock again.
+// An entry that an earlier release wrote under the bare service ID is never
+// read by a scoped store, so it ages out of the record, and the episode it
+// described starts its clock again once, which only delays a handover.
 //
 // The record is a private file in the endpoint cache directory, which
 // endpointcache.Resolve chooses and checks. A directory or file that is
@@ -79,6 +90,13 @@ type EpisodeStore struct {
 	// endpointcache.OptionsFor. The record sits in the same directory as the
 	// endpoint cache and the HA profile cache.
 	Dir endpointcache.DirOptions
+
+	// Scope names the cluster entry whose episodes the store records, such as
+	// EpisodeScope gives. The record is one file in a directory that every
+	// cluster entry of the process shares, and two clusters can both hold a
+	// service with the same ID, so each entry is keyed by the service ID with
+	// the scope. An empty scope keys by the service ID alone.
+	Scope string
 
 	// Log receives the Warn line for a missing override directory. Nil logs
 	// nothing.
@@ -137,6 +155,36 @@ type episodeRecord struct {
 type episodeEntry struct {
 	UID       string `json:"uid"`
 	FirstSeen int64  `json:"first_seen"`
+}
+
+// EpisodeScope names the cluster entry cfg describes for the episode record. It
+// is a short digest of the entry's configured endpoints, in a fixed order and
+// with explicit ports, so it holds no host name or credential. Two entries that
+// reach the same cluster through the same endpoints share a scope, which is
+// right because they see the same CRM, and two clusters have different
+// endpoints. Discovery never changes the configured list, so a cluster that
+// grows does not change its scope. An entry with no usable endpoint has an
+// empty scope.
+func EpisodeScope(cfg *config.CPIConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	endpoints, ok := cacheEndpoints(cfg)
+	if !ok || len(endpoints) == 0 {
+		return ""
+	}
+	sorted := append([]string(nil), endpoints...)
+	sort.Strings(sorted)
+	sum := sha256.Sum256([]byte(strings.Join(sorted, "\n")))
+	return hex.EncodeToString(sum[:])[:episodeScopeHex]
+}
+
+// key is the record's key for sid in this store's scope.
+func (s *EpisodeStore) key(sid string) string {
+	if s == nil || s.Scope == "" {
+		return sid
+	}
+	return sid + "@" + s.Scope
 }
 
 func (s *EpisodeStore) dir() endpointcache.DirOptions {
@@ -243,7 +291,8 @@ func (s *EpisodeStore) Observe(sid, uid string) (Episode, error) {
 	if rec.Episodes == nil {
 		rec.Episodes = map[string]episodeEntry{}
 	}
-	if entry, ok := rec.Episodes[sid]; ok && entry.UID == uid && entry.FirstSeen > 0 {
+	key := s.key(sid)
+	if entry, ok := rec.Episodes[key]; ok && entry.UID == uid && entry.FirstSeen > 0 {
 		// A first observation in the future is not one this clock made, so
 		// the episode starts again rather than trusting it.
 		if first := time.Unix(entry.FirstSeen, 0); !first.After(now) {
@@ -253,10 +302,15 @@ func (s *EpisodeStore) Observe(sid, uid string) (Episode, error) {
 		}
 	}
 
-	rec.Episodes[sid] = episodeEntry{UID: uid, FirstSeen: now.Unix()}
-	for key, entry := range rec.Episodes {
-		if now.Sub(time.Unix(entry.FirstSeen, 0)) > episodeRetention {
-			delete(rec.Episodes, key)
+	rec.Episodes[key] = episodeEntry{UID: uid, FirstSeen: now.Unix()}
+	for name, entry := range rec.Episodes {
+		// An entry older than the retention is past any grace window. One first
+		// seen in the future is not one this clock made, and Observe never trusts
+		// it, so it is dropped here instead of waiting for its own service to be
+		// observed again.
+		first := time.Unix(entry.FirstSeen, 0)
+		if first.After(now) || now.Sub(first) > episodeRetention {
+			delete(rec.Episodes, name)
 		}
 	}
 	writeErr := episodePolicy.WriteEnvelope(root, EpisodeFileName, episodeRecordVersion, rec, privatefile.NoSyncOps())
