@@ -326,7 +326,7 @@ These rules decide who can change either one.
 
 The cache is never an input to the storage journal, which refuses a silent rebinding on its own.
 
-When the CPI connects to a discovered node, it decides before any request byte goes out, so the token never reaches an address that has not proved itself. With `verify_ssl` true, the certificate chain must verify against your CA, or the system pool when you set none, and then the leaf must be in the node's pin set or must pass a hostname check against the derived name. A leaf that passes only the hostname check is accepted for this process, and it makes a refresh due so the next discovery records the new pin. With `verify_ssl` false, the leaf must be in the pin set. A node whose certificate changes outside its pin set, for example after `pvecm updatecerts --force`, is skipped for the process until the next discovery repins it, with a Warn line and a `pin` down mark. The trade is stated plainly. Stock certificates often do not carry the derived name, so we accept a pin match without a hostname match, and the HMAC on the cache file is what stops someone without your credential from planting a pin.
+When the CPI connects to a discovered node, it decides before any request byte goes out, so the token never reaches an address that has not proved itself. With `verify_ssl` true, the certificate chain must verify against your CA, or the system pool when you set none, and then the leaf must be in the node's pin set or must pass a hostname check against the derived name. A leaf that passes only the hostname check is accepted for this process, and it makes a refresh due so the next discovery records the new pin. With `verify_ssl` false, the leaf must be in the pin set. A node whose certificate changes outside its pin set, for example after `pvecm updatecerts --force`, is skipped for the process until the next discovery repins it, with a Warn line and a `pin` down mark. Stock certificates often do not carry the derived name, so we accept a pin match without a hostname match, and the HMAC on the cache file is what stops someone without your credential from planting a pin.
 
 ### When discovery tries again
 
@@ -407,7 +407,7 @@ Otherwise the cache is `pve_cpi-endpoint-cache.<euid>` under the CPI's temporary
 
 The CPI creates this directory itself, one component deep, with mode `0700`, and it refuses a relative temporary directory. The suffix keeps processes that run as different users, such as an operator running a command as root, in separate directories. If another user created the name first, the owner check fails and the call runs without a cache.
 
-This layer has one honest limit. `/var/vcap/data` is the ephemeral disk, so a Director recreate or a stemcell update empties it, and the next call that reaches a configured endpoint rediscovers. The other two layers, and [the cold start](#the-cold-start), answer that limit.
+This layer has one limit. `/var/vcap/data` is the ephemeral disk, so a Director recreate or a stemcell update empties it, and the next call that reaches a configured endpoint rediscovers. The other two layers, and [the cold start](#the-cold-start), answer that limit.
 
 ### What the CPI requires of the directory
 
@@ -516,7 +516,7 @@ sequenceDiagram
 
 ### What a success changes
 
-The request that triggered the walk goes to the accepted candidate, and the candidate stays active for the rest of the process. A later walk still reaches it only under the conditions above. It is a discovered entry in every other way, so it never runs discovery, never adds a node, and never changes an identity or a pin, and it never receives a password.
+The request that triggered the walk goes to the accepted candidate, and the candidate stays active for the rest of the process. A later walk still reaches it only under the conditions above. It is a discovered entry in every other way, so it never runs discovery, adds a node, or changes an identity or a pin, and it never receives a password.
 
 The pool writes the down mark for the failed endpoint as usual, and it writes a `cold_start` section to the key's file. The section holds the candidate's node name and probe time and nothing else, because a reader derives the address and port from the name. It is an ordering hint. A later process tries that candidate first among the candidates, still only after the configured endpoints, and still probes it. The hint expires an hour after the probe, and the next discovery that writes a result removes it.
 
@@ -549,7 +549,7 @@ Stock node certificates carry the node name and the node name plus its own searc
 
 ### A seed that is an IP address or a bare name
 
-When the seed is an IP literal or a bare name, the derived address is the bare node name. That resolves only through the Director's search domain, and on most Directors it resolves to nothing. The first refresh then finds that no derived name resolves, records the outcome `no_candidates`, logs one Info summary line, and does not refresh for 24 hours. The pool stays a single endpoint with today's timeouts, and nothing else changes. Because the file never holds a usable discovered node, the cold start stays possible in every process when you also set an `az_map`, a CA, and `verify_ssl: true`, and it changes nothing until the seed fails in the connect phase.
+When the seed is an IP literal or a bare name, the derived address is the bare node name. That resolves only through the Director's search domain, and on most Directors it resolves to nothing. The first refresh then finds that no derived name resolves, records the outcome `no_candidates`, logs one Info summary line, and does not refresh for 24 hours. The pool stays a single endpoint with today's timeouts, and nothing else changes. The file never holds a usable discovered node, so the cold start stays possible in every process when you also set an `az_map`, a CA, and `verify_ssl: true`. It changes nothing until the seed fails in the connect phase.
 
 We do not use the address that `/cluster/status` reports for a node. That address is the one corosync uses, which may not be where pveproxy listens.
 

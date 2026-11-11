@@ -226,7 +226,7 @@ The CPI's retry absorbs typical recycle windows. If retries routinely climb past
 
 4. **Tune pushback backoff.** `pve.retry.pushback.base_ms` and `pve.retry.pushback.cap_ms` adjust how aggressively the CPI backs off under HTTP 429. Higher values reduce retry storms; lower values recover faster when pushback is short-lived.
 
-5. **List more than one endpoint.** Set `pve.endpoints` to every node you want the CPI to use. A call then moves to another node when one is unreachable, and a read can leave a node whose pveproxy stopped answering. See [PVE Endpoint Failover](endpoint-failover.md). It does not remove worker recycling, since a write that may have reached a recycling node stays tethered to it.
+5. **List more than one endpoint.** Set `pve.endpoints` to every node you want the CPI to use. A call then moves to another node when one is unreachable, and a read can leave a node whose pveproxy stopped answering. See [PVE Endpoint Failover](endpoint-failover.md). Listing endpoints does not remove worker recycling, since a write that may have reached a recycling node stays tethered to it.
 
 6. **Throttle the director.** Lower `director.workers` or per-instance-group `max_in_flight`. Cheapest if you cannot edit the PVE node, and also helps with storage-lock contention.
 
