@@ -8,11 +8,16 @@ import (
 	"io"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strconv"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 )
+
+// endpointCacheSiblingName is the directory beside the journal that the endpoint cache uses
+// when it exists. The runtime never creates it, so this command does.
+const endpointCacheSiblingName = "endpoint-cache"
 
 // runProvisionJournal is an explicit local command, dispatched before logging,
 // telemetry, credential validation, PVE client construction, or CPI requests.
@@ -86,9 +91,26 @@ func runProvisionJournal(args []string, stdout, stderr io.Writer) int {
 		storageJournalFail(stderr, "journal directory "+path+" could not be provisioned", err)
 		return 1
 	}
+	provisionEndpointCacheSibling(path, uid, gid, stderr)
 	if _, err := fmt.Fprintln(stdout, "Journal directory provisioned; authority enrollment is unchanged."); err != nil {
 		storageJournalFail(stderr, "provision-journal output could not be written", err)
 		return 1
 	}
 	return 0
+}
+
+// provisionEndpointCacheSibling provisions the endpoint cache directory beside a journal directory that
+// was just provisioned, with the same owner. Only a journal failure may fail the command, because pre-start
+// runs it under set -e and a sibling made by hand with another owner or mode must not keep the Director from
+// starting. A sibling failure therefore writes one warning line and leaves the exit status alone, and the
+// runtime's private checks then give no cache for that directory. A journal whose own base name is
+// endpoint-cache gets no sibling, because the two names would collide.
+func provisionEndpointCacheSibling(journal string, uid, gid int, stderr io.Writer) {
+	if filepath.Base(journal) == endpointCacheSiblingName {
+		return
+	}
+	sibling := filepath.Join(filepath.Dir(journal), endpointCacheSiblingName)
+	if err := allocationjournal.ProvisionDirectory(sibling, uid, gid); err != nil {
+		storageJournalFail(stderr, "warning: endpoint cache directory "+sibling+" could not be provisioned", err)
+	}
 }

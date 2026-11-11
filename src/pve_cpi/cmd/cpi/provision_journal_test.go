@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -196,5 +197,198 @@ func TestJobWrappersResolveTheRealJobDirectory(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// requirePrivateOwnedDirectory fails unless path is a real directory with mode 0700 and the current user as
+// owner, which is the owner the tests request because only root may name another.
+func requirePrivateOwnedDirectory(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0o700 || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("%s is %v, want a directory with mode 0700", path, info.Mode())
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(st.Uid) != os.Geteuid() || int(st.Gid) != os.Getegid() {
+		t.Fatalf("%s has the wrong owner", path)
+	}
+}
+
+func writeProvisionConfig(t *testing.T, dir string, journal string) string {
+	t.Helper()
+	body := map[string]any{"host": "never-connect.invalid"}
+	if journal != "" {
+		body["storage_allocation_journal_dir"] = journal
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(dir, "cpi.json")
+	if err := os.WriteFile(cfg, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func TestProvisionJournalCreatesTheEndpointCacheBesideTheJournal(t *testing.T) {
+	for _, mode := range []string{"config", "directory"} {
+		t.Run(mode, func(t *testing.T) {
+			base := provisionTemp(t)
+			journal := filepath.Join(base, "durable", "allocations")
+			sibling := filepath.Join(base, "durable", "endpoint-cache")
+			args := []string{"--directory", journal}
+			if mode == "config" {
+				args = []string{"--config", writeProvisionConfig(t, base, journal)}
+			}
+			for run := 1; run <= 2; run++ {
+				var out, stderr bytes.Buffer
+				if code := runProvisionJournal(args, &out, &stderr); code != 0 || stderr.Len() != 0 {
+					t.Fatalf("run %d: code %d: %s", run, code, stderr.String())
+				}
+				requirePrivateOwnedDirectory(t, journal)
+				requirePrivateOwnedDirectory(t, sibling)
+				if entries, err := os.ReadDir(journal); err != nil || len(entries) != 0 {
+					t.Fatalf("run %d: journal holds %v, %v", run, entries, err)
+				}
+			}
+		})
+	}
+}
+
+func TestProvisionJournalSiblingSurvivesAnExistingJournalFromAnOlderRelease(t *testing.T) {
+	base := provisionTemp(t)
+	journal := filepath.Join(base, "allocations")
+	if err := os.Mkdir(journal, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var out, stderr bytes.Buffer
+	if code := runProvisionJournal([]string{"--directory", journal}, &out, &stderr); code != 0 || stderr.Len() != 0 {
+		t.Fatalf("code %d: %s", code, stderr.String())
+	}
+	requirePrivateOwnedDirectory(t, filepath.Join(base, "endpoint-cache"))
+}
+
+func TestProvisionJournalWarnsAndExitsZeroWhenTheSiblingIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, sibling, base string)
+	}{
+		{"wrong mode", func(t *testing.T, sibling, _ string) {
+			if err := os.Mkdir(sibling, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(sibling, 0o750); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"symlink", func(t *testing.T, sibling, base string) {
+			target := filepath.Join(base, "elsewhere")
+			if err := os.Mkdir(target, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, sibling); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"regular file", func(t *testing.T, sibling, _ string) {
+			if err := os.WriteFile(sibling, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		for _, mode := range []string{"config", "directory"} {
+			t.Run(tc.name+" with "+mode, func(t *testing.T) {
+				base := provisionTemp(t)
+				journal := filepath.Join(base, "allocations")
+				sibling := filepath.Join(base, "endpoint-cache")
+				tc.setup(t, sibling, base)
+				before, err := os.Lstat(sibling)
+				if err != nil {
+					t.Fatal(err)
+				}
+				args := []string{"--directory", journal}
+				if mode == "config" {
+					args = []string{"--config", writeProvisionConfig(t, base, journal)}
+				}
+				var out, stderr bytes.Buffer
+				if code := runProvisionJournal(args, &out, &stderr); code != 0 {
+					t.Fatalf("code %d: %s", code, stderr.String())
+				}
+				requirePrivateOwnedDirectory(t, journal)
+				if !strings.HasPrefix(out.String(), "Journal directory provisioned") {
+					t.Fatalf("success line missing: %q", out.String())
+				}
+				warning := stderr.String()
+				if strings.Count(warning, "\n") != 1 || !strings.HasSuffix(warning, "\n") ||
+					!strings.HasPrefix(warning, "warning: endpoint cache directory "+sibling+" could not be provisioned: ") {
+					t.Fatalf("want one warning line naming %s, got %q", sibling, warning)
+				}
+				after, err := os.Lstat(sibling)
+				if err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() {
+					t.Fatalf("sibling was changed: %v %v", after, err)
+				}
+			})
+		}
+	}
+}
+
+func TestProvisionJournalCreatesNoSiblingWithoutAJournal(t *testing.T) {
+	base := provisionTemp(t)
+	cfg := writeProvisionConfig(t, base, "")
+	var out, stderr bytes.Buffer
+	if code := runProvisionJournal([]string{"--config", cfg}, &out, &stderr); code != 0 {
+		t.Fatal(stderr.String())
+	}
+	if out.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("output %q %q", out.String(), stderr.String())
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("directory holds %v, %v", entries, err)
+	}
+}
+
+func TestProvisionJournalNamedLikeTheCacheGetsNoSibling(t *testing.T) {
+	base := provisionTemp(t)
+	journal := filepath.Join(base, "durable", "endpoint-cache")
+	var out, stderr bytes.Buffer
+	if code := runProvisionJournal([]string{"--directory", journal}, &out, &stderr); code != 0 || stderr.Len() != 0 {
+		t.Fatalf("code %d: %s", code, stderr.String())
+	}
+	requirePrivateOwnedDirectory(t, journal)
+	entries, err := os.ReadDir(filepath.Join(base, "durable"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("durable holds %v, %v", entries, err)
+	}
+	if entries, err := os.ReadDir(journal); err != nil || len(entries) != 0 {
+		t.Fatalf("journal holds %v, %v", entries, err)
+	}
+}
+
+func TestProvisionJournalFailureStillExitsOneAndCreatesNoSibling(t *testing.T) {
+	base := provisionTemp(t)
+	journal := filepath.Join(base, "durable", "allocations")
+	if err := os.MkdirAll(journal, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(journal, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	var out, stderr bytes.Buffer
+	if code := runProvisionJournal([]string{"--directory", journal}, &out, &stderr); code != 1 {
+		t.Fatalf("code %d: %s", code, stderr.String())
+	}
+	if out.Len() != 0 || !strings.Contains(stderr.String(), "journal directory "+journal+" could not be provisioned") {
+		t.Fatalf("output %q %q", out.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "endpoint cache") {
+		t.Fatalf("sibling reported after a journal failure: %q", stderr.String())
+	}
+	if _, err := os.Lstat(filepath.Join(base, "durable", "endpoint-cache")); !os.IsNotExist(err) {
+		t.Fatalf("sibling exists after a journal failure: %v", err)
 	}
 }
