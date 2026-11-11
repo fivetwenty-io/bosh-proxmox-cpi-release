@@ -36,6 +36,20 @@ type Options struct {
 	// cache, and a name that is not letters, digits, spaces, and hyphens reads
 	// as empty.
 	DisplayName string
+	// Guard, when set, vets the path a layer is about to create. See PathGuard.
+	// It is a pointer, so Options stays comparable.
+	Guard PathGuard
+}
+
+// PathGuard rules out a path before a layer creates it. A caller sets one to
+// keep a layer from leaving a directory behind that it cannot use, such as one
+// that overlaps the allocation journal. BeforeCreate is called with the path
+// the layer is about to create, before the layer creates anything, and an error
+// refuses the layer with that error as the cause. It is called again, with the
+// same path, when the directory already exists, so it must not assume the path
+// is missing. Implementations are pointers, which keeps Options comparable.
+type PathGuard interface {
+	BeforeCreate(path string) error
 }
 
 // Refusal is the reason a layer gave no cache directory. Err carries the cause,
@@ -151,7 +165,7 @@ func overrideLayer(opts Options) (Choice, bool) {
 
 // temporaryLayer uses pve_cpi-endpoint-cache.<euid> under os.TempDir().
 func temporaryLayer(opts Options) (Choice, bool) {
-	return textsFor(opts.DisplayName).temporaryLayerIn(os.TempDir(), os.Mkdir)
+	return textsFor(opts.DisplayName).temporaryLayerGuarded(os.TempDir(), os.Mkdir, opts.Guard)
 }
 
 // temporaryLayerIn creates only the last component, with mkdir at mode 0700, so
@@ -160,11 +174,26 @@ func temporaryLayer(opts Options) (Choice, bool) {
 // apart. A relative temporary directory is refused before anything is created,
 // because it would put the cache under the working directory.
 func (t *texts) temporaryLayerIn(tempDir string, mkdir func(string, os.FileMode) error) (Choice, bool) {
+	return t.temporaryLayerGuarded(tempDir, mkdir, nil)
+}
+
+// temporaryLayerGuarded is temporaryLayerIn with a guard. When guard is not
+// nil it runs after the temporary directory is known to be absolute and before
+// anything is created, and an error from it refuses the layer.
+func (t *texts) temporaryLayerGuarded(
+	tempDir string, mkdir func(string, os.FileMode) error, guard PathGuard,
+) (Choice, bool) {
 	path := filepath.Join(tempDir, temporaryName+strconv.Itoa(os.Geteuid()))
 	choice := Choice{Layer: LayerTemporary, Path: path}
 	if !filepath.IsAbs(tempDir) {
 		choice.Err = &Refusal{Layer: LayerTemporary, Path: path, Err: fmt.Errorf("temporary directory %q must be absolute", tempDir)}
 		return choice, true
+	}
+	if guard != nil {
+		if err := guard.BeforeCreate(path); err != nil {
+			choice.Err = &Refusal{Layer: LayerTemporary, Path: path, Err: err}
+			return choice, true
+		}
 	}
 	// A directory that already exists, whoever owns it, answers EEXIST here and
 	// goes to the private checks untouched. Another worker that wins the race to

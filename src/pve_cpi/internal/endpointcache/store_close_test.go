@@ -54,6 +54,10 @@ func wantClosed(t *testing.T, step string, err error) {
 	t.Helper()
 	if err == nil || !strings.Contains(err.Error(), "store is closed") {
 		t.Errorf("%s returned %v, want the closed-store error", step, err)
+		return
+	}
+	if !errors.Is(err, ErrStoreClosed) {
+		t.Errorf("%s returned %v, want an error that matches ErrStoreClosed", step, err)
 	}
 }
 

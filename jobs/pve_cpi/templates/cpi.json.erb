@@ -775,9 +775,9 @@
   # Directory for the endpoint cache files. Omitted when unset or empty, so the
   # CPI picks its default. The rules and the raise texts match the CPI's config
   # validation: an absolute, clean path with no control characters and no
-  # surrounding whitespace, not the root directory, and neither equal to nor
-  # inside pve.storage_allocation_journal_dir, which the journal scans as its
-  # own tree. The comparison is textual, as the config's is.
+  # surrounding whitespace, not the root directory, and neither equal to,
+  # inside, nor containing pve.storage_allocation_journal_dir, which the journal
+  # scans as its own tree. The comparison is textual, as the config's is.
   if_p("pve.endpoint_cache_dir") do |dir|
     next if dir.nil?
     raise "pve.endpoint_cache_dir must be a string" unless dir.is_a?(String)
@@ -801,9 +801,11 @@
       if journal.start_with?("/")
         journal_clean = File.expand_path(journal.squeeze("/"), "/")
         prefix = journal_clean == "/" ? "/" : "#{journal_clean}/"
-        if clean == journal_clean || clean.start_with?(prefix)
-          raise "endpoint_cache_dir #{go_quote.call(dir)} must not equal or sit inside " \
-                "storage_allocation_journal_dir #{go_quote.call(journal)}; choose a directory outside the journal"
+        cache_prefix = clean == "/" ? "/" : "#{clean}/"
+        if clean == journal_clean || clean.start_with?(prefix) || journal_clean.start_with?(cache_prefix)
+          raise "endpoint_cache_dir #{go_quote.call(dir)} must not equal, sit inside, or contain " \
+                "storage_allocation_journal_dir #{go_quote.call(journal)}; " \
+                "choose a directory that does not overlap the journal"
         end
       end
     end

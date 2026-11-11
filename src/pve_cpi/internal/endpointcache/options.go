@@ -21,6 +21,9 @@ type DirOptions struct {
 	// directory for. Empty means the endpoint cache. OptionsFor leaves it empty,
 	// and Named sets it.
 	DisplayName string
+
+	// Guard is Options.Guard. OptionsFor leaves it nil, and WithGuard sets it.
+	Guard PathGuard
 }
 
 // OptionsFor builds the directory options from the config. A nil config gives
@@ -35,7 +38,7 @@ func OptionsFor(cfg *config.CPIConfig) DirOptions {
 // Options returns the options Resolve takes. It is the one place that copies
 // the config's values into them.
 func (d DirOptions) Options() Options {
-	return Options{Override: d.Override, DisplayName: d.DisplayName}
+	return Options{Override: d.Override, DisplayName: d.DisplayName, Guard: d.Guard}
 }
 
 // Resolve chooses the cache directory for d. See the package's Resolve.
@@ -51,5 +54,12 @@ func (d DirOptions) WithoutOverride() DirOptions {
 // Named returns d with refusals calling the cache name, such as HAProfileName.
 func (d DirOptions) Named(name string) DirOptions {
 	d.DisplayName = name
+	return d
+}
+
+// WithGuard returns d with guard vetting the path of every layer that creates
+// a directory, before it creates it.
+func (d DirOptions) WithGuard(guard PathGuard) DirOptions {
+	d.Guard = guard
 	return d
 }

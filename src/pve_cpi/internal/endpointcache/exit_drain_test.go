@@ -63,6 +63,43 @@ func TestDrainAtExitWaitsForWorkThatFinishesInTime(t *testing.T) {
 	}
 }
 
+// Every command passes DrainAtExit no wait of its own, so the drain applies the
+// default. A worker that needs a fraction of the default bound finishes first,
+// whether the wait is zero or negative. A drain that took the zero as its wait
+// would cancel the worker at once.
+func TestDrainAtExitAppliesTheDefaultBoundToAZeroOrNegativeWait(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wait time.Duration
+	}{
+		{"zero", 0},
+		{"negative", -time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetProcessRegistry(t)
+			var done atomic.Bool
+			if err := Go("slow write", config.DiscoveryModeAuto, func(ctx context.Context) {
+				select {
+				case <-time.After(300 * time.Millisecond):
+					done.Store(true)
+				case <-ctx.Done():
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var stderr bytes.Buffer
+			DrainAtExit("tool", &stderr, tc.wait)
+			if !done.Load() {
+				t.Errorf("a drain with a wait of %s cancelled a write that needed 300ms, want the default bound of %s",
+					tc.wait, DrainWait)
+			}
+			if stderr.Len() != 0 {
+				t.Errorf("a clean drain wrote %q to stderr", stderr.String())
+			}
+		})
+	}
+}
+
 func TestDrainAtExitCancelsWorkThatRunsPastTheBound(t *testing.T) {
 	resetProcessRegistry(t)
 	cancelled := make(chan struct{})

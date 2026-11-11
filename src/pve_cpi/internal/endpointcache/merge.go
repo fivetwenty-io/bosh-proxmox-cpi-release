@@ -679,7 +679,7 @@ func (s *Store) sweepUnderLock(now time.Time) SweepResult {
 	root, done := s.use()
 	defer done()
 	if root == nil {
-		return SweepResult{Err: fmt.Errorf("%s: store is closed", s.label())}
+		return SweepResult{Err: fmt.Errorf("%s: %w", s.label(), ErrStoreClosed)}
 	}
 	return Sweep(root, now, s.kind.lockName(s.key), s.name)
 }
@@ -697,7 +697,7 @@ func (s *Store) sweepUnderLock(now time.Time) SweepResult {
 // records that were left out and the file stood.
 func (s *Store) ReadPayload(now time.Time, azNodes []string) (*Payload, []Drop, error) {
 	if s == nil {
-		return nil, nil, fmt.Errorf("%s: store is closed", cacheLabel)
+		return nil, nil, fmt.Errorf("%s: %w", cacheLabel, ErrStoreClosed)
 	}
 	var stored Payload
 	if err := s.Read(&stored); err != nil {

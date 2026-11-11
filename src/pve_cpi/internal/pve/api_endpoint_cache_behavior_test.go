@@ -311,7 +311,7 @@ func TestACallWhoseStoreOpensAfterTheDrainBeganGivesTheStoreBack(t *testing.T) {
 			if err != nil {
 				t.Fatalf("wireEndpoints: %v", err)
 			}
-			logger, _ := log.NewObservedLogger(log.LevelDebug)
+			logger, observed := log.NewObservedLogger(log.LevelDebug)
 			drained := false
 			trigger := &drainOnLine{
 				next: logger.Handler(),
@@ -330,6 +330,72 @@ func TestACallWhoseStoreOpensAfterTheDrainBeganGivesTheStoreBack(t *testing.T) {
 				t.Errorf("cache = %v, cacheUnusable = %v, want no cache", cache, wiring.plan.cacheUnusable)
 			}
 			if got := descriptorsOnto(t, cfg.EndpointCacheDir); got != 0 {
+				t.Errorf("%d descriptors of the cache directory stay open, want the store given back", got)
+			}
+			// The late refusal says so at Debug, whatever the mode, because the drain
+			// is a state of the process and not a fault in the directory.
+			if lines := linesAt(observed.All(), slog.LevelDebug, drainStartedText); len(lines) != 1 {
+				t.Errorf("drain lines = %v, want one Debug line; all: %v", lines, observed.All())
+			}
+			if e, bad := anyLineAbove(observed.All(), slog.LevelDebug); bad {
+				t.Errorf("line %q is at %v, want nothing above Debug", e.Message, e.Level)
+			}
+		})
+	}
+}
+
+// A drain that begins after the store registered its release and before the
+// first read closes the store under the read. The call reports the drain, at
+// Debug whatever the mode, and gives the store back. It does not blame the
+// directory by saying the cache file could not be read.
+func TestADrainBetweenTheOpenAndTheFirstReadIsReportedAsTheDrain(t *testing.T) {
+	for _, mode := range []config.DiscoveryMode{config.DiscoveryModeAuto, config.DiscoveryModeOn} {
+		t.Run(string(mode), func(t *testing.T) {
+			dir := newCacheDir(t)
+			// A secret of the wrong length makes the open log a Warn after it
+			// registered the release and before the read, which is the window.
+			if err := os.WriteFile(filepath.Join(dir, "secret"), []byte("too short"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg := cacheTestConfig(mode, dir)
+			_, wiring, err := wireEndpoints(cfg)
+			if err != nil {
+				t.Fatalf("wireEndpoints: %v", err)
+			}
+			logger, observed := log.NewObservedLogger(log.LevelDebug)
+			drained := false
+			trigger := &drainOnLine{
+				next: logger.Handler(),
+				text: "replaced the directory secret",
+				fn: func() {
+					drained = true
+					endpointcache.Drain(context.Background(), time.Second)
+				},
+			}
+			t.Cleanup(endpointcache.Open)
+			cache := openEndpointCache(cfg, &wiring.plan, &log.Logger{Logger: slog.New(trigger)})
+			if !drained {
+				t.Fatal("the drain never began")
+			}
+			if cache != nil || !wiring.plan.cacheUnusable {
+				t.Errorf("cache = %v, cacheUnusable = %v, want no cache", cache, wiring.plan.cacheUnusable)
+			}
+			if lines := linesAt(observed.All(), slog.LevelDebug, drainStartedText); len(lines) != 1 {
+				t.Errorf("drain lines = %v, want one Debug line; all: %v", lines, observed.All())
+			}
+			for _, text := range []string{"could not be read", "store is closed"} {
+				for _, e := range observed.All() {
+					if strings.Contains(e.Message, text) {
+						t.Errorf("line %q at %v blames the directory for the drain", e.Message, e.Level)
+					}
+				}
+			}
+			for _, e := range observed.All() {
+				if e.Level > slog.LevelDebug && !strings.Contains(e.Message, "replaced the directory secret") {
+					t.Errorf("line %q is at %v, want only the secret's Warn above Debug", e.Message, e.Level)
+				}
+			}
+			if got := descriptorsOnto(t, dir); got != 0 {
 				t.Errorf("%d descriptors of the cache directory stay open, want the store given back", got)
 			}
 		})

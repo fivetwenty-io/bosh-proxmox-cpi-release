@@ -661,7 +661,14 @@ func TestOpenEndpointCacheStoreClosesAfterTheDrain(t *testing.T) {
 }
 
 func TestCacheAliasesJournal(t *testing.T) {
-	root := t.TempDir()
+	// The test directory is resolved first, so no symlink sits in any path
+	// below unless a case puts it there. macOS keeps its temporary directory
+	// behind a symlink and Linux does not, and the cases must mean the same on
+	// both.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	mk := func(parts ...string) string {
 		dir := filepath.Join(append([]string{root}, parts...)...)
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -720,6 +727,36 @@ func TestCacheAliasesJournal(t *testing.T) {
 			filepath.Join(linkedAncestor, "outer", "journal"), true, false},
 		{"a symlinked ancestor on the journal of a containing cache", parent,
 			filepath.Join(linkedAncestor, "outer", "journal"), true, false},
+		{"a journal that does not exist yet below a symlink to the cache", parent, filepath.Join(linkedParent, "later"),
+			true, false},
+		{"a journal below missing directories under a symlink to the cache", parent,
+			filepath.Join(linkedParent, "missing", "deeper", "journal"), true, false},
+		{"a journal that does not exist yet below a symlink to another directory", sibling,
+			filepath.Join(linkedParent, "later"), false, false},
+		{"a journal that does not exist yet below a symlinked ancestor of the cache", journal,
+			filepath.Join(linkedAncestor, "journal", "later"), true, false},
+		{"a journal that does not exist yet beside a cache under a symlinked ancestor", inside,
+			filepath.Join(linkedAncestor, "journal", "later"), false, false},
+		{"a journal that does not exist yet below a symlinked ancestor of a sibling", sibling,
+			filepath.Join(linkedAncestor, "outer", "later"), false, false},
+		{"a cache that does not exist yet beside the journal", filepath.Join(root, "new-cache"), journal, false, false},
+		{"a cache that does not exist yet inside the journal", filepath.Join(journal, "new-cache"), journal, true,
+			false},
+		{"a cache below missing directories inside the journal", filepath.Join(journal, "a", "b", "new-cache"), journal,
+			true, false},
+		{"a cache that does not exist yet inside the journal through a symlink", filepath.Join(link, "new-cache"),
+			journal, true, false},
+		{"a cache that does not exist yet inside a symlinked ancestor of the journal",
+			filepath.Join(linkedAncestor, "journal", "new-cache"), journal, true, false},
+		{"a cache that does not exist yet beside a journal that does not exist yet", filepath.Join(root, "m1"),
+			filepath.Join(root, "m2"), false, false},
+		{"a cache that does not exist yet and a journal below it", filepath.Join(root, "m1"),
+			filepath.Join(root, "m1", "journal"), true, false},
+		{"a cache that does not exist yet below a journal that does not exist yet", filepath.Join(root, "m1", "cache"),
+			filepath.Join(root, "m1"), true, false},
+		{"a cache that does not exist yet reached through a symlink to a journal that does not exist yet",
+			filepath.Join(linkedParent, "m1", "cache"), filepath.Join(parent, "m1"), true, false},
+		{"a cache that cannot be examined", dirLikeFile, journal, false, true},
 		{"the filesystem root as the cache", string(filepath.Separator), journal, true, false},
 		{"the journal reached through a symlink", journal, link, true, false},
 		{"the cache reached through a symlink", link, journal, true, false},

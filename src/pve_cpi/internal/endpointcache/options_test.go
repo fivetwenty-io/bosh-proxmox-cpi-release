@@ -1,6 +1,7 @@
 package endpointcache
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -90,5 +91,114 @@ func TestDirOptionsNamedCarriesTheDisplayNameIntoTheRefusalText(t *testing.T) {
 	}
 	if without := named.WithoutOverride(); without.DisplayName != HAProfileName {
 		t.Errorf("WithoutOverride dropped the name: %+v", without)
+	}
+}
+
+// recordingGuard is a PathGuard that records the paths it was asked about and
+// answers with err.
+type recordingGuard struct {
+	err   error
+	paths []string
+}
+
+func (g *recordingGuard) BeforeCreate(path string) error {
+	g.paths = append(g.paths, path)
+	return g.err
+}
+
+func TestDirOptionsWithGuardCarriesTheGuardIntoTheLayerOptions(t *testing.T) {
+	guard := &recordingGuard{}
+	plain := DirOptions{Override: "/cache"}
+	guarded := plain.WithGuard(guard)
+	if guarded.Options().Guard != PathGuard(guard) {
+		t.Errorf("Options().Guard = %v, want the guard WithGuard set", guarded.Options().Guard)
+	}
+	if plain.Guard != nil || plain.Options().Guard != nil {
+		t.Error("WithGuard changed the receiver")
+	}
+	if guarded.Override != "/cache" {
+		t.Errorf("WithGuard = %+v, want the other options kept", guarded)
+	}
+}
+
+// A guard that refuses the temporary layer's path stops the layer before it
+// creates anything, and its error is the refusal's cause.
+func TestTemporaryLayerGuardRefusesBeforeAnythingIsCreated(t *testing.T) {
+	parent := t.TempDir()
+	cause := errors.New("the guard says no")
+	guard := &recordingGuard{err: cause}
+	created := false
+	choice, applies := endpointTexts.temporaryLayerGuarded(parent, func(string, os.FileMode) error {
+		created = true
+		return nil
+	}, guard)
+	if !applies || choice.Usable() || choice.Layer != LayerTemporary {
+		t.Fatalf("applies = %v, usable = %v, layer = %s, want a refusal by the temporary layer", applies,
+			choice.Usable(), choice.Layer)
+	}
+	if !errors.Is(choice.Err, cause) {
+		t.Errorf("refusal = %v, want the guard's error as its cause", choice.Err)
+	}
+	if want := temporaryPath(parent); len(guard.paths) != 1 || guard.paths[0] != want || choice.Path != want {
+		t.Errorf("guard saw %v and the choice names %q, want the one path %q", guard.paths, choice.Path, want)
+	}
+	if created {
+		t.Error("the layer called mkdir after the guard refused")
+	}
+	requireAbsent(t, temporaryPath(parent), "the layer created its directory after the guard refused")
+}
+
+// A guard that accepts leaves the layer to create and open its directory, and
+// it is asked again when the directory already exists.
+func TestTemporaryLayerGuardAcceptsAndTheLayerCreatesTheDirectory(t *testing.T) {
+	parent := t.TempDir()
+	guard := &recordingGuard{}
+	for range 2 {
+		choice, _ := endpointTexts.temporaryLayerGuarded(parent, os.Mkdir, guard)
+		requireWritable(t, choice)
+		_ = choice.Close()
+	}
+	if want := temporaryPath(parent); len(guard.paths) != 2 || guard.paths[0] != want || guard.paths[1] != want {
+		t.Errorf("guard saw %v, want %q twice, once for the new directory and once for the existing one", guard.paths,
+			want)
+	}
+}
+
+// A relative temporary directory is refused before the guard is asked, so the
+// guard never sees a path that depends on the working directory.
+func TestTemporaryLayerGuardIsNotAskedAboutARelativeTemporaryDirectory(t *testing.T) {
+	guard := &recordingGuard{}
+	choice, _ := endpointTexts.temporaryLayerGuarded("relative", os.Mkdir, guard)
+	if choice.Usable() || choice.Err == nil {
+		t.Fatalf("a relative temporary directory gave %+v, want a refusal", choice)
+	}
+	if len(guard.paths) != 0 {
+		t.Errorf("guard saw %v, want it left out for a relative temporary directory", guard.paths)
+	}
+}
+
+// Resolve passes the options' guard to the temporary layer, and the override
+// layer, which creates nothing, never asks it.
+func TestResolveAsksTheGuardOnlyForALayerThatCreatesItsDirectory(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	cause := errors.New("the guard says no")
+	guard := &recordingGuard{err: cause}
+	choice := Resolve(Options{Guard: guard})
+	if choice.Usable() || !errors.Is(choice.Err, cause) || choice.Layer != LayerTemporary {
+		t.Fatalf("Resolve with a refusing guard = %+v, want the guard's refusal from the temporary layer", choice)
+	}
+	if len(guard.paths) != 1 {
+		t.Errorf("guard saw %v, want the temporary layer's path once", guard.paths)
+	}
+
+	override := privateDirectory(t)
+	guard.paths = nil
+	choice = Resolve(Options{Override: override, Guard: guard})
+	t.Cleanup(func() { _ = choice.Close() })
+	if !choice.Usable() || choice.Layer != LayerOverride {
+		t.Fatalf("Resolve with an override = %+v, want the override layer's directory", choice)
+	}
+	if len(guard.paths) != 0 {
+		t.Errorf("guard saw %v, want the override layer to leave it alone", guard.paths)
 	}
 }

@@ -39,6 +39,12 @@ const (
 // treats the file as missing, and the next successful write replaces it.
 var ErrFileInvalid = privatefile.Sentinel("endpoint cache: invalid file", privatefile.ErrCorrupt)
 
+// ErrStoreClosed means a call reached a store whose directory has been closed,
+// which is what an exit drain does to every store while it releases them. A
+// caller that sees it knows the process is ending and the directory is not at
+// fault.
+var ErrStoreClosed = errors.New("store is closed")
+
 // ErrKeyMismatch means a cache file's HMAC is valid but its payload names a
 // different key, such as another endpoint list that shares the credential and
 // the file name. It matches ErrFileInvalid.
@@ -326,7 +332,7 @@ func (s *Store) Sweep(now time.Time) SweepResult {
 	root, done := s.use()
 	defer done()
 	if root == nil {
-		return SweepResult{Err: fmt.Errorf("%s: store is closed", s.label())}
+		return SweepResult{Err: fmt.Errorf("%s: %w", s.label(), ErrStoreClosed)}
 	}
 	keep := []string{s.kind.lockName(s.key), s.kind.discoverLockName(s.key), s.name}
 	return s.texts().sweepWith(root, now, keep, ownedByEffectiveUser, s.kind.prefix)
@@ -378,7 +384,7 @@ func (s *Store) Read(out any) error {
 	root, done := s.use()
 	defer done()
 	if root == nil {
-		return fmt.Errorf("%s: store is closed", s.label())
+		return fmt.Errorf("%s: %w", s.label(), ErrStoreClosed)
 	}
 	if v := reflect.ValueOf(out); !v.IsValid() || v.Kind() != reflect.Pointer || v.IsNil() {
 		return fmt.Errorf("%s: read needs a non-nil pointer, got %T", s.label(), out)
@@ -449,7 +455,7 @@ func (s *Store) checkKey(payload json.RawMessage) error {
 // closed-store error, and a write that began before it finishes.
 func Update[T any](ctx context.Context, s *Store, merge func(current *T) (*T, error)) (written bool, err error) {
 	if s.closed() {
-		return false, fmt.Errorf("%s: store is closed", s.label())
+		return false, fmt.Errorf("%s: %w", s.label(), ErrStoreClosed)
 	}
 	if merge == nil {
 		return false, fmt.Errorf("%s: update needs a merge function", s.label())
@@ -501,7 +507,7 @@ func (s *Store) lock(ctx context.Context) (*privatefile.Lock, error) {
 	root, done := s.use()
 	defer done()
 	if root == nil {
-		return nil, fmt.Errorf("%s: store is closed", s.label())
+		return nil, fmt.Errorf("%s: %w", s.label(), ErrStoreClosed)
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, s.lockWait)
 	defer cancel()
@@ -525,7 +531,7 @@ func (s *Store) TryLockDiscovery(ctx context.Context) (lock *privatefile.Lock, h
 	root, done := s.use()
 	defer done()
 	if root == nil {
-		return nil, false, fmt.Errorf("%s: store is closed", s.label())
+		return nil, false, fmt.Errorf("%s: %w", s.label(), ErrStoreClosed)
 	}
 	return s.texts().tryHeldLock(ctx, root, s.kind.discoverLockName(s.key))
 }
@@ -539,7 +545,7 @@ func (s *Store) write(value any) error {
 	root, done := s.use()
 	defer done()
 	if root == nil {
-		return fmt.Errorf("%s: store is closed", s.label())
+		return fmt.Errorf("%s: %w", s.label(), ErrStoreClosed)
 	}
 	payload, err := json.Marshal(value)
 	if err != nil {

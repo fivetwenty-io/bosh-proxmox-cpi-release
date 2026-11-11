@@ -709,7 +709,6 @@ func TestValidateEndpointCacheDir_Accepts(t *testing.T) {
 		{"beside the journal", "/var/vcap/store/pve_cpi/endpoint-cache", "/var/vcap/store/pve_cpi/journal"},
 		{"sibling sharing a name prefix", "/var/vcap/store/journal-cache", "/var/vcap/store/journal"},
 		{"journal sharing a name prefix", "/var/vcap/store/journal/x", "/var/vcap/store/jour"},
-		{"parent of the journal", "/var/vcap/store", "/var/vcap/store/journal"},
 		{"unrelated tree", "/tmp/pve-cache", "/var/vcap/store/journal"},
 		{"journal that is not absolute is left to its own check", "/tmp/pve-cache", "journal"},
 		{"journal at a different root", "/var/vcap/store/cache", "/var/vcap/data/journal"},
@@ -755,15 +754,26 @@ func TestValidateEndpointCacheDir_RejectsBadPaths(t *testing.T) {
 		{"newline", "/var/cache\n/x", "", "endpoint_cache_dir must not contain control characters"},
 		{"NUL byte", "/var/cache\x00", "", "endpoint_cache_dir must not contain control characters"},
 		{"equal to the journal", "/var/vcap/store/journal", "/var/vcap/store/journal",
-			`endpoint_cache_dir "/var/vcap/store/journal" must not equal or sit inside storage_allocation_journal_dir`},
+			`endpoint_cache_dir "/var/vcap/store/journal" must not equal, sit inside, or contain ` +
+				`storage_allocation_journal_dir`},
 		{"inside the journal", "/var/vcap/store/journal/endpoint-cache", "/var/vcap/store/journal",
-			"must not equal or sit inside storage_allocation_journal_dir"},
+			"must not equal, sit inside, or contain storage_allocation_journal_dir"},
 		{"deep inside the journal", "/var/vcap/store/journal/a/b/c", "/var/vcap/store/journal",
-			"must not equal or sit inside storage_allocation_journal_dir"},
+			"must not equal, sit inside, or contain storage_allocation_journal_dir"},
 		{"equal to an unclean journal path", "/var/vcap/store/journal", "/var/vcap/store/journal/",
-			"must not equal or sit inside storage_allocation_journal_dir"},
+			"must not equal, sit inside, or contain storage_allocation_journal_dir"},
 		{"inside an unclean journal path", "/var/vcap/store/journal/c", "/var/vcap/store//journal/../journal",
-			"must not equal or sit inside storage_allocation_journal_dir"},
+			"must not equal, sit inside, or contain storage_allocation_journal_dir"},
+		{"parent of the journal", "/var/vcap/store", "/var/vcap/store/journal",
+			`endpoint_cache_dir "/var/vcap/store" must not equal, sit inside, or contain ` +
+				`storage_allocation_journal_dir "/var/vcap/store/journal"; ` +
+				`choose a directory that does not overlap the journal`},
+		{"grandparent of the journal", "/var", "/var/vcap/store/journal",
+			"must not equal, sit inside, or contain storage_allocation_journal_dir"},
+		{"parent of an unclean journal path", "/var/vcap", "/var/vcap//store/journal/",
+			"must not equal, sit inside, or contain storage_allocation_journal_dir"},
+		{"parent of a journal written with a parent element", "/var/vcap/store", "/var/vcap/store/x/../journal",
+			"must not equal, sit inside, or contain storage_allocation_journal_dir"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -788,7 +798,7 @@ func TestValidateEndpointCacheDir_RootIsRefusedAndAJournalAtTheRootHoldsEveryPat
 	}
 	c.EndpointCacheDir = "/var/cache/pve"
 	c.StorageAllocationJournalDir = "/"
-	if msg := discoveryErrorOf(c); !strings.Contains(msg, "must not equal or sit inside") {
+	if msg := discoveryErrorOf(c); !strings.Contains(msg, "must not equal, sit inside, or contain") {
 		t.Errorf("a journal at the root holds every path, yet %q was accepted: %s", c.EndpointCacheDir, msg)
 	}
 }
@@ -806,7 +816,7 @@ func TestValidateEndpointCacheDir_JournalWhitespaceOnlyMattersWhenTheCacheDirIsS
 	}
 	// With the whitespace gone the same pair is caught as contained.
 	c.StorageAllocationJournalDir = "/var/j"
-	if msg := discoveryErrorOf(c); !strings.Contains(msg, "must not equal or sit inside") {
+	if msg := discoveryErrorOf(c); !strings.Contains(msg, "must not equal, sit inside, or contain") {
 		t.Errorf("the trimmed journal does not contain the cache directory: %q", msg)
 	}
 }
@@ -843,7 +853,8 @@ func TestLoad_RejectsABadCacheDirectory(t *testing.T) {
 	_, err = mustLoadDiscovery(t, discoveryLoadJSON(`,
 		"storage_allocation_journal_dir": "/var/vcap/store/journal",
 		"endpoint_cache_dir": "/var/vcap/store/journal/cache"`))
-	if err == nil || !strings.Contains(err.Error(), "must not equal or sit inside storage_allocation_journal_dir") {
+	const journalMessage = "must not equal, sit inside, or contain storage_allocation_journal_dir"
+	if err == nil || !strings.Contains(err.Error(), journalMessage) {
 		t.Errorf("Load error = %v, want the journal message", err)
 	}
 }

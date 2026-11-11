@@ -853,25 +853,34 @@ assert_pve_render_raises "case15-dir-root" '{"endpoint_cache_dir":"/"}' \
 assert_pve_render_raises "case15-dir-nonstring" '{"endpoint_cache_dir":5}' \
   "pve.endpoint_cache_dir must be a string"
 
-# The cache directory may not equal or sit inside the journal directory, by
-# whole path elements, and a sibling or a parent of the journal is allowed.
-JOURNAL_ERR_TAIL='; choose a directory outside the journal'
+# The cache directory may not equal, sit inside, or contain the journal
+# directory, by whole path elements, and a sibling of the journal is allowed.
+JOURNAL_ERR_TAIL='; choose a directory that does not overlap the journal'
 assert_pve_render_raises "case15-dir-equals-journal" \
   '{"storage_allocation_journal_dir":"/var/j","endpoint_cache_dir":"/var/j"}' \
-  'endpoint_cache_dir "/var/j" must not equal or sit inside storage_allocation_journal_dir "/var/j"'"$JOURNAL_ERR_TAIL"
+  'endpoint_cache_dir "/var/j" must not equal, sit inside, or contain storage_allocation_journal_dir "/var/j"'"$JOURNAL_ERR_TAIL"
 assert_pve_render_raises "case15-dir-inside-journal" \
   '{"storage_allocation_journal_dir":"/var/j","endpoint_cache_dir":"/var/j/cache"}' \
-  'endpoint_cache_dir "/var/j/cache" must not equal or sit inside storage_allocation_journal_dir "/var/j"'"$JOURNAL_ERR_TAIL"
+  'endpoint_cache_dir "/var/j/cache" must not equal, sit inside, or contain storage_allocation_journal_dir "/var/j"'"$JOURNAL_ERR_TAIL"
 assert_pve_render_raises "case15-dir-inside-unclean-journal" \
   '{"storage_allocation_journal_dir":"/var//j/","endpoint_cache_dir":"/var/j/cache"}' \
-  'must not equal or sit inside storage_allocation_journal_dir "/var//j/"'
+  'must not equal, sit inside, or contain storage_allocation_journal_dir "/var//j/"'
 assert_pve_render_raises "case15-dir-inside-root-journal" \
   '{"storage_allocation_journal_dir":"/","endpoint_cache_dir":"/cache"}' \
-  'must not equal or sit inside storage_allocation_journal_dir "/"'
+  'must not equal, sit inside, or contain storage_allocation_journal_dir "/"'
+assert_pve_render_raises "case15-dir-holds-journal" \
+  '{"storage_allocation_journal_dir":"/var/j/store","endpoint_cache_dir":"/var/j"}' \
+  'endpoint_cache_dir "/var/j" must not equal, sit inside, or contain storage_allocation_journal_dir "/var/j/store"'"$JOURNAL_ERR_TAIL"
+assert_pve_render_raises "case15-dir-holds-unclean-journal" \
+  '{"storage_allocation_journal_dir":"/var//j/store/","endpoint_cache_dir":"/var/j"}' \
+  'must not equal, sit inside, or contain storage_allocation_journal_dir "/var//j/store/"'
+assert_pve_render_raises "case15-dir-holds-journal-deep" \
+  '{"storage_allocation_journal_dir":"/var/vcap/store/journal","endpoint_cache_dir":"/var"}' \
+  'endpoint_cache_dir "/var" must not equal, sit inside, or contain storage_allocation_journal_dir "/var/vcap/store/journal"'"$JOURNAL_ERR_TAIL"
 assert_pve_render_raises "case15-journal-whitespace" \
   '{"storage_allocation_journal_dir":"/var/j ","endpoint_cache_dir":"/var/j/cache"}' \
   'storage_allocation_journal_dir must not have leading or trailing whitespace when endpoint_cache_dir is set, got "/var/j "'
-for pair in '/var/j:/var/jx' '/var/j:/var/cache' '/var/j/sub:/var/j' '/var/j:/other/j/cache' 'relative/j:/var/j'; do
+for pair in '/var/j:/var/jx' '/var/j:/var/cache' '/var/jx/sub:/var/j' '/var/j:/other/j/cache' 'relative/j:/var/j'; do
   journal="${pair%%:*}"; dir="${pair#*:}"
   JSON_15J="$(render "$(props_with_pve "{\"storage_allocation_journal_dir\":\"${journal}\",\"endpoint_cache_dir\":\"${dir}\"}")")"
   assert_json_key_equals "case15-journal-ok-${journal}-${dir}" "$JSON_15J" endpoint_cache_dir "$dir" || FAILED=$((FAILED+1))

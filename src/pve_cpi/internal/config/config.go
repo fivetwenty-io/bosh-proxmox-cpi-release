@@ -5612,10 +5612,10 @@ func EffectiveDiscoveryMode(cfg *CPIConfig) (DiscoveryMode, string) {
 //     for an entry that inherited credentials under looser TLS.
 //   - endpoint_cache_dir must be an absolute, clean path other than the root
 //     directory, and neither it nor storage_allocation_journal_dir may carry
-//     leading or trailing whitespace. It must not equal or sit inside
-//     storage_allocation_journal_dir, because the journal scans its own tree
-//     and has strict identity rules. A cache directory that contains the
-//     journal directory is allowed.
+//     leading or trailing whitespace. It must not equal, sit inside, or
+//     contain storage_allocation_journal_dir, because the journal scans its
+//     own tree and has strict identity rules, and a cache directory that
+//     holds the journal puts the journal in the cache's tree.
 func (c *CPIConfig) validateDiscovery(errs *[]string) {
 	c.validateDiscoveryMode(errs)
 	c.validateEndpointCacheDir(errs)
@@ -5685,9 +5685,10 @@ func (c *CPIConfig) validateEndpointCacheDir(errs *[]string) {
 	if !filepath.IsAbs(journal) {
 		return
 	}
-	if pathIsWithin(filepath.Clean(journal), clean) {
-		*errs = append(*errs, fmt.Sprintf("endpoint_cache_dir %q must not equal or sit inside "+
-			"storage_allocation_journal_dir %q; choose a directory outside the journal", dir, journal))
+	journalClean := filepath.Clean(journal)
+	if pathIsWithin(journalClean, clean) || pathIsWithin(clean, journalClean) {
+		*errs = append(*errs, fmt.Sprintf("endpoint_cache_dir %q must not equal, sit inside, or contain "+
+			"storage_allocation_journal_dir %q; choose a directory that does not overlap the journal", dir, journal))
 	}
 }
 

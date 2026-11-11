@@ -78,10 +78,10 @@ properties:
       value must be an absolute path, and it must be clean, which means it has
       no `.` or `..` parts, no doubled slashes, and no trailing slash. It may
       not contain control characters or have leading or trailing whitespace,
-      and it may not be the root directory. It may not equal or sit inside
-      pve.storage_allocation_journal_dir either, because the journal scans its
-      own tree. This setting is process-level, like the journal directory, so
-      a cpi-config entry cannot change it.
+      and it may not be the root directory. It may not equal, sit inside, or
+      contain pve.storage_allocation_journal_dir either, because the journal
+      scans its own tree. This setting is process-level, like the journal
+      directory, so a cpi-config entry cannot change it.
   pve.user:
     description: |
       PVE username. Required with password. An API token already names its
@@ -2405,7 +2405,7 @@ properties:
       redirected by request context. Runtime validation checks access and locking.
       When pve.endpoint_cache_dir is unset, this directory also places the
       endpoint cache, in an endpoint-cache directory beside it. The cache
-      directory may not equal or sit inside this directory.
+      directory may not equal, sit inside, or contain this directory.
 
   pve.require_disjoint_storage_sets:
     description: |

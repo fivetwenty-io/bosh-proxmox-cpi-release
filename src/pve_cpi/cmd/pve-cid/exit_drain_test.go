@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -179,46 +180,144 @@ func TestRunDrainsTheEndpointCacheBeforeItReturns(t *testing.T) {
 	}
 }
 
-// A SIGTERM that arrives while the exit drain waits ends the wait, and the
-// command still returns the exit code it computed.
-func TestRunEndsItsDrainOnSIGTERMAndKeepsTheExitCode(t *testing.T) {
+// finishedIfNotCancelled starts a worker that records a write 300 milliseconds
+// after it starts, unless its context ends first, and returns a flag that says
+// whether the write happened. The 300 milliseconds are well short of the
+// drain's default bound and long enough that a drain with no wait cancels the
+// worker first.
+func finishedIfNotCancelled(t *testing.T) *atomic.Bool {
+	t.Helper()
+	var wrote atomic.Bool
+	if err := endpointcache.Go("slow write", config.DiscoveryModeAuto, func(ctx context.Context) {
+		select {
+		case <-time.After(300 * time.Millisecond):
+			wrote.Store(true)
+		case <-ctx.Done():
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return &wrote
+}
+
+// pve-cid passes the drain no wait of its own, so the drain applies its default
+// bound. A worker that needs a fraction of that bound finishes before run
+// returns, whichever command ran.
+func TestRunWaitsForABackgroundWriteWithTheDefaultBound(t *testing.T) {
 	endpointcache.Open()
 	t.Cleanup(endpointcache.Open)
-	held := make(chan os.Signal, 1)
-	signal.Notify(held, syscall.SIGTERM)
-	t.Cleanup(func() { signal.Stop(held) })
-	cancelled := make(chan struct{})
+	wrote := finishedIfNotCancelled(t)
+
+	var stdout, stderr syncBuffer
+	if code := run([]string{"version"}, &stdout, &stderr); code != exitOK {
+		t.Fatalf("exit %d, want %d: %s", code, exitOK, stderr.String())
+	}
+	if !wrote.Load() {
+		t.Error("run returned before the background write finished, or cancelled it")
+	}
+}
+
+// A worker that never returns is let go once the default bound runs out. The
+// command returns after about three seconds, well short of anything a stuck
+// write could make an operator wait for, and the worker's context is ended.
+func TestRunLetsGoOfAWorkerThatNeverReturnsAfterTheDefaultBound(t *testing.T) {
+	endpointcache.Open()
+	t.Cleanup(endpointcache.Open)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	ended := make(chan struct{})
 	if err := endpointcache.Go("stuck write", config.DiscoveryModeAuto, func(ctx context.Context) {
 		<-ctx.Done()
-		close(cancelled)
+		close(ended)
+		<-release
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	var stdout, stderr syncBuffer
+	start := time.Now()
 	codeCh := make(chan int, 1)
 	go func() { codeCh <- run([]string{"version"}, &stdout, &stderr) }()
-	deadline := time.Now().Add(10 * time.Second)
-	for !endpointcache.Draining() {
-		if time.Now().After(deadline) {
-			t.Fatal("run never started its drain")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
+	var took time.Duration
 	select {
 	case code := <-codeCh:
+		took = time.Since(start)
 		if code != exitOK {
-			t.Errorf("exit %d after a signal during the drain, want %d: %s", code, exitOK, stderr.String())
+			t.Errorf("exit %d, want %d: %s", code, exitOK, stderr.String())
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("SIGTERM did not end the exit drain")
+	case <-time.After(6 * time.Second):
+		t.Fatal("run was still waiting for a stuck worker after 6s, twice the default bound")
+	}
+	if took < 2*time.Second {
+		t.Errorf("run returned after %s, want it to wait for the default bound of %s first", took,
+			endpointcache.DrainWait)
 	}
 	select {
-	case <-cancelled:
+	case <-ended:
 	case <-time.After(5 * time.Second):
-		t.Error("the signal did not cancel the slow worker")
+		t.Error("the stuck worker's context was not ended when the drain gave up")
+	}
+}
+
+// A SIGTERM that arrives while the exit drain waits ends the wait at once, and
+// the command still returns the exit code it computed. The signal arrives with
+// most of the default bound left, so a drain that ignores it returns about
+// three seconds later and fails the deadline.
+func TestRunEndsItsDrainOnSIGTERMAndKeepsTheExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want int
+	}{
+		{"version", []string{"version"}, exitOK},
+		{"unknown subcommand", []string{"no-such-subcommand"}, exitUsage},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			endpointcache.Open()
+			t.Cleanup(endpointcache.Open)
+			held := make(chan os.Signal, 1)
+			signal.Notify(held, syscall.SIGTERM)
+			t.Cleanup(func() { signal.Stop(held) })
+			cancelled := make(chan struct{})
+			if err := endpointcache.Go("stuck write", config.DiscoveryModeAuto, func(ctx context.Context) {
+				<-ctx.Done()
+				close(cancelled)
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			var stdout, stderr syncBuffer
+			codeCh := make(chan int, 1)
+			go func() { codeCh <- run(tc.args, &stdout, &stderr) }()
+			deadline := time.Now().Add(10 * time.Second)
+			for !endpointcache.Draining() {
+				if time.Now().After(deadline) {
+					t.Fatal("run never started its drain")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			sent := time.Now()
+			if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case code := <-codeCh:
+				if code != tc.want {
+					t.Errorf("exit %d after a signal during the drain, want %d: %s", code, tc.want, stderr.String())
+				}
+				if took := time.Since(sent); took > 1500*time.Millisecond {
+					t.Errorf("run returned %s after the signal, want it at once and well under the %s bound", took,
+						endpointcache.DrainWait)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("SIGTERM did not end the exit drain")
+			}
+			select {
+			case <-cancelled:
+			case <-time.After(5 * time.Second):
+				t.Error("the signal did not cancel the slow worker")
+			}
+		})
 	}
 }
