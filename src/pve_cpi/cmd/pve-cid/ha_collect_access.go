@@ -63,13 +63,18 @@ func searchedDirs(path string) ([]string, error) {
 	for len(pending) > 0 {
 		name := pending[0]
 		pending = pending[1:]
-		if name == ".." {
-			cur = filepath.Dir(cur)
-			continue
-		}
+		// The kernel needs search access on the current directory for every
+		// name, "." and ".." included, before it acts on the name.
 		if !seen[cur] {
 			seen[cur] = true
 			dirs = append(dirs, cur)
+		}
+		switch name {
+		case ".":
+			continue
+		case "..":
+			cur = filepath.Dir(cur)
+			continue
 		}
 		next := filepath.Join(cur, name)
 		info, err := os.Lstat(next)
@@ -101,11 +106,12 @@ func searchedDirs(path string) ([]string, error) {
 }
 
 // pathParts splits path into the names a lookup meets, leaving out the empty
-// and current-directory parts.
+// parts. The current-directory and parent-directory names stay, because the
+// directory they are looked up in needs search access too.
 func pathParts(path string) []string {
 	var parts []string
 	for _, part := range strings.Split(path, string(filepath.Separator)) {
-		if part != "" && part != "." {
+		if part != "" {
 			parts = append(parts, part)
 		}
 	}

@@ -238,7 +238,7 @@ func TestSearchedDirsFollowALinkInThePath(t *testing.T) {
 // included, and the directory the first link sits in.
 func TestSearchedDirsFollowAChainOfLinks(t *testing.T) {
 	base := realTemp(t)
-	for _, d := range []string{"a", "b", "c/d"} {
+	for _, d := range []string{"a", "b", "c/d", "c/x"} {
 		if err := os.MkdirAll(filepath.Join(base, d), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -246,7 +246,9 @@ func TestSearchedDirsFollowAChainOfLinks(t *testing.T) {
 	if err := os.Symlink("../b/l2", filepath.Join(base, "a", "l1")); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(filepath.Join(base, "c", "x", "..", "d"), filepath.Join(base, "b", "l2")); err != nil {
+	// The target is a raw string, because filepath.Join would clean the parent
+	// reference out of it.
+	if err := os.Symlink(base+"/c/x/../d", filepath.Join(base, "b", "l2")); err != nil {
 		t.Fatal(err)
 	}
 	dirs, err := searchedDirs(filepath.Join(base, "a", "l1", "cache"))
@@ -254,7 +256,40 @@ func TestSearchedDirsFollowAChainOfLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantDirs(t, dirs, base, filepath.Join(base, "a"), filepath.Join(base, "b"), filepath.Join(base, "c"),
-		filepath.Join(base, "c", "d"))
+		filepath.Join(base, "c", "x"), filepath.Join(base, "c", "d"))
+}
+
+// A parent reference after a descent is looked up in the directory it leaves,
+// so the kernel needs search access there even though the path climbs straight
+// back out, in a link's target and in a path as spelled alike.
+func TestSearchedDirsRecordTheDirectoryAParentReferenceLeaves(t *testing.T) {
+	base := realTemp(t)
+	for _, d := range []string{"a/sub", "b"} {
+		if err := os.MkdirAll(filepath.Join(base, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("sub/../../b", filepath.Join(base, "a", "l")); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(base, "a", "sub")
+	for name, path := range map[string]string{
+		"in a link target":               filepath.Join(base, "a", "l", "cache"),
+		"in the spelled path":            base + "/a/sub/../../b/cache",
+		"after a current-directory step": base + "/a/sub/./../../b/cache",
+	} {
+		dirs, err := searchedDirs(path)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		found := false
+		for _, d := range dirs {
+			found = found || d == sub
+		}
+		if !found {
+			t.Errorf("%s: directories %v lack %s", name, dirs, sub)
+		}
+	}
 }
 
 // The kernel follows at most 40 links in one lookup, and the walk stops at the
@@ -359,6 +394,9 @@ func TestAncestorBlockNamesABlockAboveALoop(t *testing.T) {
 	base := realTemp(t)
 	blocker := filepath.Join(base, "blocker")
 	makeDir(t, blocker)
+	if err := os.Chmod(blocker, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Symlink(filepath.Join(blocker, "loop"), filepath.Join(blocker, "loop")); err != nil {
 		t.Fatal(err)
 	}
@@ -387,6 +425,9 @@ func TestCollectReportsAMissingDirectoryTheCPIsUserCannotLookFor(t *testing.T) {
 	base := realTemp(t)
 	closed := filepath.Join(base, "closed")
 	makeDir(t, closed)
+	if err := os.Chmod(closed, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	doctor := os.Geteuid()
 	cpi := doctor + 1
 	nobody := func(int) ([]int, error) { return nil, nil }
@@ -507,6 +548,11 @@ func realTemp(t *testing.T) string {
 	t.Helper()
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
+		t.Fatal(err)
+	}
+	// The mode comes from the host's umask unless the test sets it, and the
+	// tests judge this directory as one that every user can search.
+	if err := os.Chmod(dir, 0o755); err != nil { //nolint:gosec // the mode is the test's input
 		t.Fatal(err)
 	}
 	return dir
