@@ -1344,7 +1344,7 @@ func (c *haCollector) cacheFindingsAs(j cacheJudge) {
 	case choice.Layer == endpointcache.LayerTemporary && !j.checksTemporary():
 		// The directory the CPI's user would have is not one the doctor can
 		// see, so nothing is said about it.
-	case choice.Layer == endpointcache.LayerTemporary && errors.Is(choice.Err, fs.ErrNotExist):
+	case choice.Layer == endpointcache.LayerTemporary && missingDirectory(choice):
 		// The CPI creates this directory on first use, so nothing is wrong yet.
 	case caveat != "":
 		c.rep.advise(haKindCacheDirectory, choice.Path, "%s", caveat)
@@ -1352,6 +1352,14 @@ func (c *haCollector) cacheFindingsAs(j cacheJudge) {
 	default:
 		c.rep.advise(haKindCacheDirectory, choice.Path, "%s%s", cacheRefusalText(choice), j.ownerNote(choice.Err))
 	}
+}
+
+// missingDirectory reports whether choice names a directory that does not exist,
+// which the CPI creates on first use. A choice that was not refused names one
+// that exists. The check must not hand a nil *Refusal to errors.Is, which would
+// call its Unwrap method.
+func missingDirectory(choice endpointcache.Choice) bool {
+	return choice.Err != nil && errors.Is(choice.Err, fs.ErrNotExist)
 }
 
 // cacheJudge says whose decision the doctor's cache directory checks stand
@@ -1368,6 +1376,10 @@ type cacheJudge struct {
 	known bool
 	// doctor is the doctor's own effective user.
 	doctor int
+	// ancestors, when set, replaces the search of the directories above the
+	// cache directory, so a test can name one the doctor itself can still
+	// reach.
+	ancestors func(path string, uid int) (*searchBlock, error)
 }
 
 // cacheJudge returns the judge for this run. The owner of the allocation
@@ -1408,33 +1420,78 @@ func (j cacheJudge) checksTemporary() bool {
 // because another user owns it, the directory is judged again as its owner,
 // and when it passes, the caveat says the CPI uses it only when it runs as
 // that owner. When the doctor could not read a directory it judged for
-// another user, the caveat says so. The caller closes the choice.
+// another user, the caveat says so. A directory the doctor reaches as itself
+// but the judged user cannot, because a directory above it grants that user no
+// search access, is a caveat too, since the CPI gets permission denied there.
+// The caller closes the choice.
 func (j cacheJudge) probe(dir endpointcache.DirOptions) (endpointcache.Choice, string) {
+	choice, caveat, judged := j.judgeDirectory(dir)
+	if choice.Err != nil || judged == j.doctor {
+		return choice, caveat
+	}
+	if text := j.reachText(choice, judged); text != "" {
+		return choice, text
+	}
+	return choice, caveat
+}
+
+// reachText says why the user judged cannot open the directory choice names,
+// because a directory above it grants that user no search access, or that the
+// doctor could not tell. It is empty when the user can reach the directory.
+func (j cacheJudge) reachText(choice endpointcache.Choice, judged int) string {
+	search := j.ancestors
+	if search == nil {
+		search = func(path string, uid int) (*searchBlock, error) { return ancestorBlock(path, uid, groupsOf) }
+	}
+	what := cacheDirectoryName(choice.Layer)
+	block, err := search(choice.Path, judged)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("%s was not checked for search access by uid %d, which the CPI runs as, because "+
+			"the directories above it could not be tested (%v); the CPI cannot open it unless that user can "+
+			"search every directory above it", what, judged, err)
+	case block != nil:
+		return fmt.Sprintf("%s sits below %s, which uid %d cannot search because it is owned by uid %d with "+
+			"mode %04o, so the CPI, running as that user, gets permission denied opening it, keeps no HA recovery "+
+			"record, and the dead-node handover cannot start; give uid %d search access to %s",
+			what, block.dir, judged, block.owner, block.mode, judged, block.dir)
+	}
+	return ""
+}
+
+// judgeDirectory is the choice probe makes before it looks at the directories
+// above it, with the user it judged as.
+func (j cacheJudge) judgeDirectory(dir endpointcache.DirOptions) (endpointcache.Choice, string, int) {
 	choice := dir.ProbeAs(j.uid)
 	if choice.Err == nil {
-		return choice, ""
+		return choice, "", j.uid
 	}
 	what := cacheDirectoryName(choice.Layer)
 	if errors.Is(choice.Err, fs.ErrPermission) && j.uid != j.doctor {
-		return choice, fmt.Sprintf("%s could not be read by this check, which ran as uid %d, so it was not judged "+
+		unread := fmt.Sprintf("%s could not be read by this check, which ran as uid %d, so it was not judged "+
 			"as the CPI's user, uid %d, would judge it; run the check as root or as that user", what, j.doctor, j.uid)
+		return choice, unread, j.uid
 	}
 	var unsafe *privatefile.UnsafePathError
 	if j.known || !errors.As(choice.Err, &unsafe) || !errors.Is(unsafe.Cause, privatefile.ErrUnsafeOwnership) ||
-		unsafe.UID < 0 {
-		return choice, ""
+		unsafe.UID < 0 || choice.Layer == endpointcache.LayerTemporary {
+		// The temporary directory's name carries the user it belongs to, so one
+		// that another user owns is never the CPI's directory, and judging it
+		// again as its owner would look for a different directory.
+		return choice, "", j.uid
 	}
 	owner := unsafe.UID
 	again := dir.ProbeAs(owner)
 	if again.Err != nil {
 		_ = choice.Close()
-		return again, ""
+		return again, "", owner
 	}
 	_ = choice.Close()
-	return again, fmt.Sprintf("%s is owned by uid %d, and this check ran as uid %d with no allocation journal "+
+	note := fmt.Sprintf("%s is owned by uid %d, and this check ran as uid %d with no allocation journal "+
 		"directory to show which user the CPI runs as; the directory passes every other check, so the CPI keeps "+
 		"its HA recovery record there when it runs as uid %d and keeps none when it runs as another user, and the "+
 		"dead-node handover then cannot start; confirm uid %d is the CPI's user", what, owner, j.doctor, owner, owner)
+	return again, note, owner
 }
 
 // overrideFindings reports what is wrong with pve.endpoint_cache_dir itself,
@@ -1475,7 +1532,7 @@ func (c *haCollector) missingOverride(path string, dir endpointcache.DirOptions,
 	fallback, caveat := j.probe(dir.WithoutOverride())
 	defer func() { _ = fallback.Close() }()
 	temporary := fallback.Layer == endpointcache.LayerTemporary
-	toBeCreated := temporary && (!j.checksTemporary() || errors.Is(fallback.Err, fs.ErrNotExist))
+	toBeCreated := temporary && (!j.checksTemporary() || missingDirectory(fallback))
 	switch {
 	case caveat != "" && !toBeCreated:
 		c.rep.advise(haKindCacheDirectory, path,
@@ -1517,6 +1574,10 @@ func (j cacheJudge) ownerNote(refusal *endpointcache.Refusal) string {
 	var unsafe *privatefile.UnsafePathError
 	if !errors.As(refusal, &unsafe) || !errors.Is(unsafe.Cause, privatefile.ErrUnsafeOwnership) {
 		return ""
+	}
+	if refusal.Layer == endpointcache.LayerTemporary {
+		return fmt.Sprintf("; the name of this directory carries uid %d, which the CPI runs as when it uses it, "+
+			"and another user owns it, so remove it and the CPI creates its own on first use", j.uid)
 	}
 	if j.known {
 		return fmt.Sprintf("; the CPI runs as uid %d, which owns the allocation journal directory, so give this "+
