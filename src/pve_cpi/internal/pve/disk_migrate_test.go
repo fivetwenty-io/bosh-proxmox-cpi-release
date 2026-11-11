@@ -366,6 +366,7 @@ func TestMigrateMoverToNode_WarnsWhenTheMoverIsOnNeitherNode(t *testing.T) {
 	for _, want := range []string{
 		"protection restore on mover 90000 did not succeed on node(s) " + mmSource + ", " + mmTarget,
 		"qm set 90000 --protection 1",
+		"the config probe of every member found no config for mover vmid 90000",
 	} {
 		if !strings.Contains(lines[0], want) {
 			t.Errorf("the warning lacks %q: %s", want, lines[0])
