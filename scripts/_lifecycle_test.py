@@ -1502,7 +1502,15 @@ UNFIXED_ERROR = (
     "attach disk: observe migration of mover 90500: GET /nodes/lab-pve-cpi-0/qemu/90500/config: "
     "500 Configuration file 'nodes/lab-pve-cpi-0/qemu-server/90500.conf' does not exist"
 )
-KEPT_WARN = "kept the migration mover because an earlier request created it, so this request's journal can't delete it"
+_MOVER_LEFT_TAIL = (
+    ". Nothing in the CPI removes it later, so once this call has gone through and the mover holds no disks, "
+    "run qm set 90500 --protection 0 and then qm destroy 90500 on node lab-pve-cpi-1"
+)
+KEPT_WARN = ("attach_disk: kept the migration mover because an earlier request created it, so this request's "
+             "journal can't delete it" + _MOVER_LEFT_TAIL)
+CUT_OFF_WARN = ("attach_disk: kept the migration mover because its protection restore was cut off, and the mover is "
+                "where that restore gets checked and settled" + _MOVER_LEFT_TAIL)
+OTHER_MOVER_WARN = "disk migrate: could not finalize legacy mover provenance"
 RESTORE_WARN = "protection restore on parker 90500 failed"
 
 
@@ -1589,16 +1597,23 @@ class MoverWriter(mover.PmxWriter):
 class MoverCPI:
     """Answers the requests 11r makes the way the CPI does, for one attach outcome.
 
-    outcome is fixed (the attach migrates the mover, moves the disk to the VM,
-    and destroys the mover), unfixed (the migration lands, and the CPI fails the
-    attach on PVE's 500 for the old node), or kept (the attach works and the CPI
-    keeps the mover, warning that it did).
+    outcome is fixed, unfixed, or destroyed. fixed is the 0.9.7 answer: the
+    attach migrates the mover and moves the disk to the VM, and then, under
+    the journal, it keeps the adopted mover protected and logs kept_warns, or
+    without the journal it destroys the mover. unfixed lands the migration and
+    then fails the attach on PVE's 500 for the old node. destroyed destroys
+    the mover even under the journal. kept_protection and mover_extra shape
+    the kept mover, for the checks that must fail on it.
     """
 
     def __init__(self, lab: MoverLab, outcome: str = "fixed", log: str = "", audit: tuple[int, str] = (0, CLEAN_AUDIT),
-                 delete_fails: bool = False, park_on: int = MOVER_VMID) -> None:
+                 delete_fails: bool = False, park_on: int = MOVER_VMID, kept_warns: "list[str] | None" = None,
+                 kept_protection: int = 1, mover_extra: "dict | None" = None) -> None:
         self.lab = lab
         self.outcome = outcome
+        self.kept_warns = [KEPT_WARN] if kept_warns is None else kept_warns
+        self.kept_protection = kept_protection
+        self.mover_extra = mover_extra or {}
         self.log = log
         self.audit = audit
         self.delete_fails = delete_fails
@@ -1660,9 +1675,11 @@ class MoverCPI:
                                               "ok_to_retry": False}}, self.log
         disk = holder.pop("scsi0")
         self.lab.guests["lab-pve-cpi-1"][VM_VMID]["scsi1"] = disk
-        if self.outcome == "kept":
+        journal_managed = "storage_allocation_journal_dir" in self.configs[config_path]
+        if self.outcome == "fixed" and journal_managed:
+            holder.update(self.mover_extra, protection=self.kept_protection)
             self.lab.guests["lab-pve-cpi-1"][MOVER_VMID] = holder
-            return {"result": None, "error": None}, self.log + _warn(KEPT_WARN) + "\n"
+            return {"result": None, "error": None}, self.log + "".join(_warn(w) + "\n" for w in self.kept_warns)
         return {"result": None, "error": None}, self.log
 
     def journal(self, action: str, config_path: str, *flags: str):
@@ -1779,6 +1796,17 @@ class TestAdoptedMoverChecks(unittest.TestCase):
         self.assertEqual(mover.protection_restore_warnings(stderr), ["Protection restore on parker 90500 failed"])
         self.assertEqual(mover.kept_mover_warnings(stderr), [KEPT_WARN])
         self.assertEqual(mover.protection_restore_warnings(""), [])
+
+    def test_adopted_mover_warning_findings(self) -> None:
+        self.assertEqual(mover.adopted_mover_warning_findings(_warn(KEPT_WARN) + "\n" + _warn("unrelated")), [])
+        info_only = json.dumps({"level": "INFO", "msg": KEPT_WARN})
+        self.assertEqual(len(mover.adopted_mover_warning_findings(info_only)), 1)
+        self.assertEqual(len(mover.adopted_mover_warning_findings("")), 1)
+        twice = mover.adopted_mover_warning_findings(_warn(KEPT_WARN) + "\n" + _warn(KEPT_WARN))
+        self.assertEqual(len(twice), 1)
+        self.assertIn("found it 2 times", twice[0])
+        cut_off = mover.adopted_mover_warning_findings(_warn(KEPT_WARN) + "\n" + _warn(CUT_OFF_WARN))
+        self.assertEqual(cut_off, ["the CPI logged other mover warnings, verbatim: " + CUT_OFF_WARN])
 
     def test_new_qmigrate_tasks_counts_only_new_tasks_for_the_mover(self) -> None:
         old = {"upid": "UPID:a", "type": "qmigrate", "id": "90500", "status": "OK"}
@@ -1927,9 +1955,15 @@ class TestAdoptedMoverPass(AdoptedMoverCase):
         tag_writes = [w for w in self.writer.writes if w[0] == "put" and "tags" in w[2]]
         self.assertEqual(tag_writes, [("put", f"/nodes/lab-pve-cpi-0/qemu/{MOVER_VMID}/config",
                                        {"tags": f"bosh-parker;vm-prefix--{PREFIX};bosh-disk-mover"})])
-        # The parker detach_disk made is destroyed; the mover was already gone.
-        self.assertIn(("delete", "/nodes/lab-pve-cpi-1/qemu/90501", {"purge": "1", "destroy-unreferenced-disks": "0"}),
-                      self.writer.writes)
+        self.assertTrue(any("mover kept on lab-pve-cpi-1, empty and protected" in s for s in self.said), self.said)
+        # Cleanup destroys the kept mover, protection off first, and the parker detach_disk made.
+        self.assertEqual([w for w in self.writer.writes if w[0] == "delete" or "protection" in w[2]], [
+            ("put", f"/nodes/lab-pve-cpi-1/qemu/{MOVER_VMID}/config", {"protection": "0"}),
+            ("delete", f"/nodes/lab-pve-cpi-1/qemu/{MOVER_VMID}", {"purge": "1", "destroy-unreferenced-disks": "0"}),
+            ("put", "/nodes/lab-pve-cpi-1/qemu/90501/config", {"protection": "0"}),
+            ("delete", "/nodes/lab-pve-cpi-1/qemu/90501", {"purge": "1", "destroy-unreferenced-disks": "0"}),
+        ])
+        self.assertEqual(lab.node_of(MOVER_VMID), "")
         self.assertNotIn(90501, lab.guests["lab-pve-cpi-1"])
         self.assertEqual(lab.volumes, set())
         self.assertEqual(self.workspaces(), [])
@@ -1954,16 +1988,50 @@ class TestAdoptedMoverPass(AdoptedMoverCase):
         self.assertEqual(self.workspaces(), [])
         self.assert_bystanders_untouched()
 
-    def test_kept_mover_fails_and_names_the_warning(self) -> None:
+    def assert_kept_mover_check_fails(self, cpi_kwargs: dict, *expected: str) -> str:
         lab = MoverLab()
-        cpi = MoverCPI(lab, "kept")
+        cpi = MoverCPI(lab, **cpi_kwargs)
         with self.assertRaises(RuntimeError) as caught:
             self.make(lab, cpi).run()
-        self.assertIn(f"mover {MOVER_VMID} was not destroyed. The CPI warned, verbatim: {KEPT_WARN}",
-                      str(caught.exception))
-        self.assertEqual(lab.node_of(MOVER_VMID), "")
+        text = str(caught.exception)
+        self.assertTrue(text.startswith("11r failed:"), text)
+        for want in expected:
+            self.assertIn(want, text)
         self.assertEqual(self.workspaces(), [])
         self.assert_bystanders_untouched()
+        return text
+
+    def test_a_mover_destroyed_under_the_journal_fails(self) -> None:
+        self.assert_kept_mover_check_fails(
+            {"outcome": "destroyed"},
+            f"mover {MOVER_VMID} is gone, and the journal should have kept it on lab-pve-cpi-1",
+            "found it 0 times")
+
+    def test_a_kept_mover_that_still_holds_a_disk_fails(self) -> None:
+        text = self.assert_kept_mover_check_fails(
+            {"mover_extra": {"unused0": "nfs-images:90500/vm-90500-disk-1.qcow2"}},
+            f"mover {MOVER_VMID} should hold no disks, and it holds {{'unused0': 'nfs-images:90500/vm-90500-disk-1.qcow2'}}")
+        self.assertNotIn("found it", text)
+        self.assertTrue(any("left guest 90500" in s for s in self.said), self.said)
+
+    def test_a_kept_mover_without_protection_fails(self) -> None:
+        self.assert_kept_mover_check_fails(
+            {"kept_protection": 0}, f"mover {MOVER_VMID} does not have protection back on (protection=0)")
+
+    def test_the_kept_warning_twice_fails(self) -> None:
+        self.assert_kept_mover_check_fails({"kept_warns": [KEPT_WARN, KEPT_WARN]}, "exactly once, found it 2 times")
+
+    def test_a_cut_off_restore_in_place_of_the_kept_warning_fails(self) -> None:
+        self.assert_kept_mover_check_fails(
+            {"kept_warns": [CUT_OFF_WARN]}, "found it 0 times",
+            "the CPI logged other mover warnings, verbatim: " + CUT_OFF_WARN,
+            "the CPI logged protection-restore warnings, verbatim: " + CUT_OFF_WARN)
+
+    def test_another_mover_warning_fails(self) -> None:
+        text = self.assert_kept_mover_check_fails(
+            {"kept_warns": [KEPT_WARN, OTHER_MOVER_WARN]},
+            "the CPI logged other mover warnings, verbatim: " + OTHER_MOVER_WARN)
+        self.assertNotIn("found it", text)
 
     def test_protection_restore_warning_fails_the_pass(self) -> None:
         lab = MoverLab()
@@ -1998,6 +2066,7 @@ class TestAdoptedMoverPass(AdoptedMoverCase):
         lab = MoverLab()
         cpi = MoverCPI(lab, "fixed")
         self.make(lab, cpi, journal_on=False).run()
+        self.assertTrue(any("mover destroyed" in s for s in self.said), self.said)
         self.assertEqual(cpi.journal_calls, [])
         for cfg in cpi.configs.values():
             self.assertNotIn("storage_allocation_journal_dir", cfg)
