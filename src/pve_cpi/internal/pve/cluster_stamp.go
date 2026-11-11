@@ -12,6 +12,7 @@ import (
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -40,8 +41,12 @@ const clusterStampHexLen = 8
 // root must still get a stamp. A reported fingerprint must still agree with
 // the PEM, and a malformed or ambiguous answer is still rejected.
 //
-// Every failure is retriable. The error names the nodes tried and the reason
-// each one failed, and never carries the certificate answer or PEM data.
+// A failure is retriable unless a node answered the read with a redirect the
+// CPI refused. Such a server answers every retry the same way, so the error
+// is then a permanent CloudError that keeps sdkclient.ErrRedirectRefused in
+// its chain, which IsRedirectRefused and the dispatcher both find. The error
+// names the nodes tried and the reason each one failed, and never carries the
+// certificate answer, the redirect's target, or PEM data.
 func ReadClusterStamp(ctx context.Context, c Client, preferred string) (string, error) {
 	digest, err := readClusterRoot(ctx, c, preferred, "ReadClusterStamp", nil)
 	if err != nil {
@@ -83,11 +88,22 @@ func readClusterRoot(
 	defer cancel()
 
 	var failures []string
+	refused := false
+	fail := func(cause error, msg string) error {
+		if refused {
+			return cpierrors.WrapAs(withRedirectRefusal(cause), cpierrors.TypeCloud, msg)
+		}
+		if cause == nil {
+			return cpierrors.Retriable("%s", msg)
+		}
+		return cpierrors.WrapAs(cause, cpierrors.TypeRetriableCloud, msg)
+	}
 	tried := map[string]bool{}
 	attempt := func(node string) ([sha256.Size]byte, bool) {
 		tried[node] = true
 		digest, response, err := readNodeClusterRoot(bounded, c.Nodes(), node)
 		if err != nil {
+			refused = refused || IsRedirectRefused(err)
 			failures = append(failures, fmt.Sprintf("node %q: %s", node, err.Error()))
 			return zero, false
 		}
@@ -103,8 +119,7 @@ func readClusterRoot(
 	}
 	members, err := ListClusterMemberNames(bounded, c)
 	if err != nil {
-		return zero, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			op+": "+stampFailureSummary(failures, "and cluster member enumeration failed"))
+		return zero, fail(err, op+": "+stampFailureSummary(failures, "and cluster member enumeration failed"))
 	}
 	offline := offlineClusterNodes(bounded, c, log.FromContext(ctx))
 	sorted := slices.Clone(members)
@@ -121,11 +136,33 @@ func readClusterRoot(
 		}
 	}
 	if err := bounded.Err(); err != nil {
-		return zero, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			op+": "+stampFailureSummary(failures, "and the read deadline passed"))
+		return zero, fail(err, op+": "+stampFailureSummary(failures, "and the read deadline passed"))
 	}
-	return zero, cpierrors.Retriable("%s: %s", op,
-		stampFailureSummary(failures, "and no other online cluster member was left to try"))
+	return zero, fail(nil, op+": "+stampFailureSummary(failures, "and no other online cluster member was left to try"))
+}
+
+// redirectRefusalChain carries a cluster root read's failure, when it has
+// one, together with sdkclient.ErrRedirectRefused, so errors.Is finds the
+// refusal a node's read met even when another failure ended the read. Its
+// text is the failure's alone, since the node failures already name the
+// refusal.
+type redirectRefusalChain struct {
+	cause error
+}
+
+// withRedirectRefusal returns cause with the refusal joined to its chain, or
+// the refusal alone when cause is nil.
+func withRedirectRefusal(cause error) error {
+	if cause == nil {
+		return sdkclient.ErrRedirectRefused
+	}
+	return &redirectRefusalChain{cause: cause}
+}
+
+func (e *redirectRefusalChain) Error() string { return e.cause.Error() }
+
+func (e *redirectRefusalChain) Unwrap() []error {
+	return []error{e.cause, sdkclient.ErrRedirectRefused}
 }
 
 // stampFailureSummary renders the per-node failures for a ReadClusterStamp
@@ -140,13 +177,19 @@ func stampFailureSummary(failures []string, tail string) string {
 // readNodeClusterRoot reads one node's certificates/info answer and returns
 // the root digest and the answer. The returned error text is one of the fixed
 // reasons the root parser produces, or a fixed transport reason, so it never
-// echoes the API answer.
+// echoes the API answer. A read the CPI refused because the node answered
+// with a redirect keeps sdkclient.ErrRedirectRefused in its chain, whose text
+// names no part of the answer, so the caller can tell that the read will fail
+// the same way on every retry.
 func readNodeClusterRoot(
 	ctx context.Context, service StorageClusterCertificateService, node string,
 ) ([sha256.Size]byte, *nodes.ListCertificatesInfoResponse, error) {
 	var zero [sha256.Size]byte
 	response, err := service.ListCertificatesInfo(ctx, node)
 	if err != nil {
+		if IsRedirectRefused(err) {
+			return zero, nil, fmt.Errorf("certificate observation failed: %w", sdkclient.ErrRedirectRefused)
+		}
 		return zero, nil, errors.New("certificate observation failed")
 	}
 	digest, err := clusterStampDigest(response)
