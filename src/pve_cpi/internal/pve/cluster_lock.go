@@ -95,12 +95,16 @@ const lockSentinelDeletePath = "/pools"
 // steal-shaped sentinel delete, the steal's own and the expired-lock sweep's.
 // Both rest on one timing argument. The delete must start writing within
 // clusterLockStealBudget of the moment its last re-read was sent, so the
-// deadline is started plus the budget. A delete that the failover transport
-// cannot start writing by then is refused with endpointpool.ErrSendByPassed,
-// and no byte of it leaves the machine. The deadline bounds when the delete
-// starts writing, not when PVE commits it. The network, PVE's processing, and
-// any wait on PVE's cluster-wide user.cfg lock come after it, and the round
-// trip in clusterLockDefaultGrace has to absorb them.
+// deadline is started plus the budget. The failover transport checks the
+// deadline immediately before it hands the delete to a connection, on every
+// hop and on a reused connection as on a new one, and it bounds connection
+// setup by it. A delete that fails either check is refused with
+// endpointpool.ErrSendByPassed, and no byte of it leaves the machine. The
+// deadline bounds when the delete is handed to a connection, not when PVE
+// commits it, and it does not guard the write itself. A stall between the last
+// check and the write, and the network, PVE's processing, and any wait on
+// PVE's cluster-wide user.cfg lock, come after it, and the round trip in
+// clusterLockDefaultGrace has to absorb them.
 //
 // started is a reading of clk, which tests can replace, while the transport
 // compares the deadline with its own time.Now. So the deadline is expressed

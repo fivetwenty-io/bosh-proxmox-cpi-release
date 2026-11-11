@@ -1059,8 +1059,21 @@ func (p *Pool) alertDefect(addr string, err error, class string, hopping bool) {
 // logSendBy logs, at Debug, a request refused because its send-by deadline
 // passed. It is called once per refusal.
 func (p *Pool) logSendBy(method, path string) {
+	LogSendByRefusal(p.logger, method, path)
+}
+
+// LogSendByRefusal logs, at Debug, a request refused because its send-by
+// deadline passed, with the line and fields the pool writes for its own
+// refusals. A caller that refuses a request itself, before it reaches any
+// pool, calls it once for that refusal, and a refusal that came back from a
+// pool is not logged again, because the pool has logged it. A nil logger
+// discards the line.
+func LogSendByRefusal(logger *log.Logger, method, path string) {
+	if logger == nil {
+		return
+	}
 	route := apiRelative(path)
-	p.logger.Debug("pve endpoints: "+method+" "+route+" not sent, send-by deadline passed",
+	logger.Debug("pve endpoints: "+method+" "+route+" not sent, send-by deadline passed",
 		log.String("method", method),
 		log.String("path", route),
 	)

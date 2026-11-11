@@ -3,8 +3,11 @@ package endpointpool
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 func TestSendByMatchesOnlyItsMethodAndPath(t *testing.T) {
@@ -144,4 +147,20 @@ func TestSendByMatchesTheSDKPrefixedPath(t *testing.T) {
 	if _, ok := SendBy(prefixed, "DELETE", "/pools"); !ok {
 		t.Error("a prefixed marker should match the API-relative path")
 	}
+}
+
+// A caller that refuses a request itself writes the line the pool writes, from
+// the SDK-prefixed path the request would have gone to, and a nil logger
+// writes nothing and does not panic.
+func TestLogSendByRefusalWritesThePoolsLine(t *testing.T) {
+	logger, obs := log.NewObservedLogger(log.LevelDebug)
+	LogSendByRefusal(logger, "DELETE", APIPrefix+"/pools")
+	LogSendByRefusal(nil, "DELETE", APIPrefix+"/pools")
+
+	lines := obs.All()
+	if len(lines) != 1 || lines[0].Level != slog.LevelDebug ||
+		lines[0].Message != "pve endpoints: DELETE /pools not sent, send-by deadline passed" {
+		t.Fatalf("lines = %+v, want the pool's one Debug line", lines)
+	}
+	mustAttrs(t, lines[0], map[string]string{"method": "DELETE", "path": "/pools"})
 }

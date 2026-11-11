@@ -9,6 +9,7 @@ import (
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 )
@@ -196,6 +197,11 @@ func expectedLockClaimRefusal(ctx context.Context, poolID string, claim managedL
 // API-relative, because no endpoint was chosen for a request never sent.
 // Pools other than lock sentinels are not checked here, so a marker that
 // reached one meets the transport and fails closed in finish.
+//
+// The refusal never reaches the pool, which writes the "not sent, send-by
+// deadline passed" Debug line for the refusals it makes, so this function
+// writes that line itself, once, through the call's logger. A refusal that
+// comes back from the transport was logged by the pool and is not logged here.
 func lockDeletePastSendBy(ctx context.Context, poolID string) error {
 	if !isManagedLockPool(poolID) {
 		return nil
@@ -205,6 +211,7 @@ func lockDeletePastSendBy(ctx context.Context, poolID string) error {
 	if refusal == nil {
 		return nil
 	}
+	endpointpool.LogSendByRefusal(log.FromContext(ctx), http.MethodDelete, path)
 	return fmt.Errorf("pools.DeletePools: request failed after 1 attempt(s): %w", &url.Error{
 		Op:  "Delete",
 		URL: path + "?" + url.Values{"poolid": {poolID}}.Encode(),

@@ -38,10 +38,15 @@ func (m *sendByMarker) matches(method, path string) bool {
 }
 
 // WithSendBy returns a context that carries a send-by deadline for the request
-// with the given method and URL path. The deadline bounds the moment the
-// request's bytes are written. The failover transport checks it before every
-// hop, uses it to bound connection setup, and refuses to send with
-// ErrSendByPassed once it has passed.
+// with the given method and URL path. The failover transport checks the
+// deadline immediately before it hands the request to a connection, on every
+// hop and for a request that reuses a connection as for one that dials, and it
+// uses the deadline to bound connection setup. A request that fails either
+// check is refused with ErrSendByPassed and sends no byte. The deadline does not
+// guard the write itself, so a stall between the last check and the write, such
+// as a paused process, can send the request late. A caller that needs the
+// request to start writing by a time sets the deadline earlier than that time
+// by a margin that absorbs such a stall.
 //
 // The marker names the one request it guards, so a read on the same context,
 // such as a readback after the guarded call, ignores it. The path is the
