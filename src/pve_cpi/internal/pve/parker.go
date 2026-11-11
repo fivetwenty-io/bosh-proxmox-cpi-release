@@ -3523,9 +3523,24 @@ func setParkerProtection(ctx context.Context, c Client, logger *log.Logger, node
 	// storage-lock curve sleep past two minutes, and on the pushback curve past
 	// four, either of which outlives the lock TTL guarding the window this write
 	// opens and closes.
-	return RetryOnTransientOrLock(ctx, logger, "parker_set_protection", parkerWindowMaxAttempts, func() error {
-		return nodesSvc.UpdateQemuConfig(ctx, node, vmidStr, &sdknodes.UpdateQemuConfigParams{
+	//
+	// PVE answers a write on a node that doesn't hold the parker's config with
+	// a 500 that the retry loop reads as a transient fault. That answer is a
+	// verdict, so the write isn't sent again. It goes back unchanged, and a
+	// restore that tries more than one node moves on to the next one at once.
+	var gone error
+	err := RetryOnTransientOrLock(ctx, logger, "parker_set_protection", parkerWindowMaxAttempts, func() error {
+		writeErr := nodesSvc.UpdateQemuConfig(ctx, node, vmidStr, &sdknodes.UpdateQemuConfigParams{
 			Protection: &value,
 		})
+		if parkerConfigGone(writeErr) {
+			gone = writeErr
+			return nil
+		}
+		return writeErr
 	})
+	if gone != nil {
+		return gone
+	}
+	return err
 }

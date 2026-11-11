@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,6 +54,9 @@ type mmClient struct {
 	waitErr   error
 	readErr   map[string]error
 	writes    []mmProtectionWrite
+	// attempts records every protection write the fake received, in order,
+	// whether it applied or PVE refused it.
+	attempts []mmProtectionWrite
 }
 
 func newMMClient() *mmClient {
@@ -124,6 +128,9 @@ func (n *mmNodes) UpdateQemuConfig(
 	n.c.mu.Lock()
 	defer n.c.mu.Unlock()
 	vmid, _ := strconv.Atoi(vmidStr)
+	if params.Protection != nil {
+		n.c.attempts = append(n.c.attempts, mmProtectionWrite{node: node, on: *params.Protection})
+	}
 	cfg, ok := n.c.configs[vmid]
 	if !ok || n.c.nodes[vmid] != node {
 		return mmConfigMissing(node, vmid)
@@ -303,6 +310,15 @@ func TestMigrateMoverToNode_FallsBackWhenNoReadPlacesTheMover(t *testing.T) {
 			if len(c.writes) != len(want) || c.writes[0] != want[0] || c.writes[1] != want[1] {
 				t.Fatalf("protection writes = %+v, want %+v", c.writes, want)
 			}
+			// A write that answers config-missing is PVE's verdict, so the
+			// restore sends it once and moves on without a retry.
+			attempts := []mmProtectionWrite{{node: mmSource, on: false}, {node: mmSource, on: true}}
+			if tc.want.node == mmTarget {
+				attempts = append(attempts, tc.want)
+			}
+			if !slices.Equal(c.attempts, attempts) {
+				t.Fatalf("protection write attempts = %+v, want %+v", c.attempts, attempts)
+			}
 			if !ConfigFlag(c.configs[mmMoverVMID], paramProtection) {
 				t.Fatal("the mover's protection is off after the restore")
 			}
@@ -331,6 +347,11 @@ func TestMigrateMoverToNode_WarnsWhenTheMoverIsOnNeitherNode(t *testing.T) {
 	// landed.
 	if len(c.writes) != 1 || c.writes[0].on {
 		t.Fatalf("protection writes = %+v, want only the write that cleared it", c.writes)
+	}
+	// Each restore write answers config-missing once and isn't retried.
+	attempts := []mmProtectionWrite{{node: mmSource, on: false}, {node: mmSource, on: true}, {node: mmTarget, on: true}}
+	if !slices.Equal(c.attempts, attempts) {
+		t.Fatalf("protection write attempts = %+v, want %+v", c.attempts, attempts)
 	}
 	lines := mmWarnings(logged)
 	if len(lines) != 1 {
