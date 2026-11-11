@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
+
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -569,6 +571,11 @@ func (d *Dispatcher) recordDuration(ctx context.Context, method, outcome string,
 	}
 }
 
+// redirectRefusedMessage heads the error dispatchError sends when a handler
+// labelled a refused redirect retriable.
+const redirectRefusedMessage = "PVE answered with a redirect, which the CPI never follows, " +
+	"so a retry would meet the same answer"
+
 // dispatchError converts any error returned by a handler to a *jsonrpc.Response.
 // *cpierrors.Error values keep their type through wireErrorBody's translation;
 // plain errors become CloudError. method is the JSON-RPC method the error came
@@ -579,9 +586,20 @@ func (d *Dispatcher) recordDuration(ctx context.Context, method, outcome string,
 // task/event records: an error embedding a presigned or userinfo-bearing URL
 // (a failed stemcell fetch, for example) must not reach that sink verbatim.
 // This mirrors what endRootSpanErr already does for the trace exporter.
+//
+// A refused redirect is never retriable on the wire, whatever a handler
+// labelled it. Many handler paths mark a PVE failure retriable because it is
+// usually a dropped connection, but a server that answered with a redirect
+// answers every retry the same way, and for create_vm the Director would spend
+// its max_vm_create_tries on it. The SDK and the CPI's endpoint pool both mark
+// their refusals with sdkclient.ErrRedirectRefused, which this package can
+// match without importing internal/pve.
 func (d *Dispatcher) dispatchError(method string, err error) *jsonrpc.Response {
 	var cpiErr *cpierrors.Error
 	if errors.As(err, &cpiErr) {
+		if cpiErr.OkToRetry() && errors.Is(err, sdkclient.ErrRedirectRefused) {
+			cpiErr = cpierrors.WrapAs(err, cpierrors.TypeCloud, redirectRefusedMessage)
+		}
 		return &jsonrpc.Response{
 			Result: nil,
 			Error:  wireErrorBody(method, cpiErr),
