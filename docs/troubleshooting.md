@@ -2237,6 +2237,264 @@ Both errors indicate a `pvedaemon` worker was recycled mid-request. The CPI retr
 
 If these appear frequently, raise `MAX_WORKERS` in `/etc/default/pvedaemon` and `/etc/default/pveproxy`. See [PVE Transient Transport](pve-transient-transport.md) and [PVE Host Tuning](pve-host-tuning.md).
 
+## Endpoint failover
+
+These entries cover the Warn and Error lines the endpoint pool writes. The CPI logs at `info` by default, and every CPI call is a new process, so "once per call" means once per process. A line that says a level depends on discovery is at Debug under `auto` and Warn under `on`. [Endpoint Failover](endpoint-failover.md) explains the walk, the tethers, and the properties.
+
+### The log says an endpoint is unreachable and requests moved on
+
+**Symptom**
+
+```text
+pve endpoint failover: pve1:8006 unreachable (dial tcp: i/o timeout), request sent to pve2:8006, which stays active for this call
+```
+
+The line is at Warn, and it appears once each time the active endpoint changes.
+
+**Diagnosis**
+
+The first endpoint failed before a connection existed, so the pool sent the request to the next one and kept that one active for the rest of the call. The text in parentheses is the failure, and the `class` field names the phase, which is `dial`, `dns`, `tls_handshake`, `tls_verify`, or `pin`. A node that is being upgraded or rebooted produces this line, and it is the pool doing its job.
+
+**Fix**
+
+Nothing, when the node is down on purpose. Otherwise we check the node's `pveproxy` and the route and firewall from the Director to its port 8006. A node that stays marked down is tried last by other processes for two minutes after the mark was written, and then first again.
+
+### A failover names a cold-start candidate
+
+**Symptom**
+
+```text
+pve endpoint failover: pve1:8006 unreachable (dial tcp: i/o timeout) and no cached nodes, request sent to pve2.dc1.example.com:8006 from placement.az_map after it proved membership
+```
+
+**Diagnosis**
+
+Every configured endpoint failed in the connect phase and the cache held no usable node, so the CPI derived node addresses from the node names in `placement.az_map` and tried them. The candidate answered a membership probe, so it is a node of this cluster. Only a request that carries the API token goes to a candidate, and the pool requires `verify_ssl` true with `pve.ca_cert` as the trust anchor.
+
+**Fix**
+
+We bring the configured endpoints back. When the line recurs while they are healthy, we check the network path from the Director to them.
+
+### A configured endpoint is used again
+
+**Symptom**
+
+```text
+pve endpoint failover: pve1:8006 is used again, so requests go to it again rather than to the cold-start candidate pve2.dc1.example.com:8006 from placement.az_map
+```
+
+**Diagnosis**
+
+A configured endpoint answered after a candidate had been active. The pool prefers a configured endpoint, so no action is needed.
+
+### A cold-start candidate is refused
+
+**Symptom**
+
+```text
+pve endpoint pve3.dc1.example.com:8006 from placement.az_map refused: certificate is not valid for that name
+```
+
+The line is at Warn under `pve.api_endpoint_discovery: on` and at Debug under `auto`. It appears once per candidate per call.
+
+**Diagnosis**
+
+The candidate did not prove it belongs to this cluster, for example because its certificate does not chain to `pve.ca_cert` or does not carry the derived name. The text after "refused:" gives the reason.
+
+**Fix**
+
+We make sure the node names in `placement.az_map` are the PVE node names, and that each node's certificate chains to `pve.ca_cert` and covers the derived address.
+
+### A cold-start candidate fails TLS verification
+
+**Symptom**
+
+```text
+pve endpoint pve2.dc1.example.com:8006: the cold-start candidate for node pve2 from placement.az_map failed TLS verification (x509: certificate signed by unknown authority); this can mean interception; the pool no longer sends to it
+```
+
+The line is at Error, once per candidate per call.
+
+**Diagnosis**
+
+The candidate's address answered, but its certificate did not verify against the operator's CA. The pool stops sending to that address for the rest of the call. Either the node's certificate is not issued by `pve.ca_cert`, or something sits between the CPI and the node.
+
+**Fix**
+
+We compare the certificate the address presents with the one the node serves, using `openssl s_client -connect <address>` from the Director. When they differ unexpectedly, we treat it as interception and find what answers on that address.
+
+### Cold-start candidates came without a prober
+
+**Symptom**
+
+```text
+pve endpoints: 3 cold-start candidates from placement.az_map came without a prober, so the pool carries none
+```
+
+**Diagnosis**
+
+This line is at Warn and appears once per pool build. Only a defect in the CPI produces it, so the pool runs without a cold start.
+
+**Fix**
+
+We keep the log and report it as a bug.
+
+### No Proxmox endpoint answered
+
+**Symptom**
+
+```text
+no Proxmox endpoint answered (pve1:8006: dial timeout; pve2:8006: connection refused; pve3:8006: certificate pin mismatch)
+```
+
+This text arrives through the call's own error at Error level. A walk that has nothing to try says `no Proxmox endpoint was eligible to try`.
+
+**Diagnosis**
+
+Every hop of the walk failed in the connect phase or on the response-header deadline, and the error lists each endpoint with its cause. The error unwraps to a dial error, so the CPI's retry helpers treat it as a transient connection fault and try again. When every hop failed certificate verification, it unwraps to the certificate error instead, and the SDK stops at once. A walk where every endpoint refuses connections ends in about 45 seconds, and one that includes endpoints that accept TLS and never answer can take up to about 165 seconds.
+
+**Fix**
+
+We read the cause beside each endpoint. Timeouts and refusals point to the network, the firewall, or `pveproxy` on those nodes. A certificate cause points to the entries below. When all nodes are down, the cluster itself needs attention first.
+
+### A configured endpoint failed TLS verification
+
+**Symptom**
+
+```text
+pve endpoint pve2:8006: TLS verification failed (x509: certificate is valid for pve2, not pve2.lan); this can mean interception; trying the next endpoint
+```
+
+The line is at Error, once per endpoint per call. When no other endpoint is tried, it ends `no other endpoint is tried for this request`.
+
+**Diagnosis**
+
+The operator's trust settings vouched for this endpoint, and its certificate did not verify. The common causes are a name that the certificate does not cover, a certificate renewed under a different CA, and a host that is not the node we think it is. Because the walk moves on, the deploy can keep running, which is why the line is an Error. It can also mean someone is intercepting the connection.
+
+**Fix**
+
+We compare the presented certificate with the node's own with `openssl s_client -connect <endpoint>`. After a legitimate renewal, we update `pve.ca_cert`. When the certificates differ and no one changed them, we treat it as interception.
+
+### The pool refused to send through its own transport
+
+**Symptom**
+
+```text
+pve endpoint pve2:8006: the pool refused to send through its transport (owned transport asked to dial another address: pve3:8006); this is a defect in the endpoint pool; trying the next endpoint
+```
+
+**Diagnosis**
+
+This is an Error that appears once per address for the life of the process. Only a defect in the pool routes a request that way. The request still moves on, or the line ends `no other endpoint is tried for this request`.
+
+**Fix**
+
+We keep the log and report it as a bug.
+
+### A discovered endpoint failed its certificate pin
+
+**Symptom**
+
+```text
+pve endpoint pve3:8006: certificate is not one of the 2 pinned for node pve3; skipping it until discovery refreshes
+```
+
+or
+
+```text
+pve endpoint pve3:8006: certificate refused (x509: certificate signed by unknown authority), so it was not checked against the 2 pinned for node pve3; skipping it until discovery refreshes
+```
+
+Both lines are at Warn, once per endpoint per call.
+
+**Diagnosis**
+
+A node that discovery added presented a certificate the CPI did not expect. The first line means the certificate is not one of the pinned ones. The second means the chain failed before the pins were checked. The pool skips that node for the rest of the process and asks for a refresh of the cached nodes. A node whose certificate was legitimately renewed produces the first line until the refresh runs.
+
+**Fix**
+
+After a renewal, we wait for the refresh, which the CPI cannot repeat within ten minutes. When the certificate was not renewed, we treat it as interception.
+
+### A mutation is refused because two endpoints may have received it
+
+**Symptom**
+
+```text
+pve endpoints: POST /nodes/n3/qemu may have reached both pve1:8006 and pve2:8006; refusing further mutations with this key for this call
+```
+
+or
+
+```text
+pve endpoints: POST /nodes/n3/qemu is tethered to both pve1:8006 and pve2:8006 by different calls; refusing further mutations with this key that see both
+```
+
+Both lines are at Error. For a tether family, the text names the family, such as `refusing further ha mutations for this call`.
+
+**Diagnosis**
+
+The first line says one mutation may have reached two endpoints. Only a defect in the pool can cause it. The second says that two calls in the same process tethered one key to different endpoints, and the pool refuses a request that sees both. The refused request returns an error that the retry helpers do not treat as transient.
+
+**Fix**
+
+We check the cluster for a duplicate of the operation named in the line, such as two VMs or two disks, and clean up what is wrong. We keep the log and report the defect.
+
+### A hook panicked inside the pool
+
+**Symptom**
+
+```text
+pve endpoint pve2.dc1.example.com:8006: the cold-start prober panicked, so the candidate is refused
+```
+
+```text
+pve endpoint pve1:8006: the down-mark sink panicked, so the dial mark may not be recorded
+```
+
+```text
+pve endpoint pve1:8006: the first-answer hook panicked, so discovery may not start in this call
+```
+
+**Diagnosis**
+
+The first panic in the life of the process is at Warn, and later ones are at Debug. The pool recovered, so the request was not affected. The cost is a refused candidate, a down mark that was not written, or a discovery refresh that did not start.
+
+**Fix**
+
+We keep the log and report it as a bug.
+
+### The HA doctor reports a cache directory problem
+
+**Symptom**
+
+`pve-cid ha` prints advice of the kind `cache_directory`.
+
+**Diagnosis**
+
+The CPI keeps the endpoint cache, the HA profile cache, and the HA recovery episode record in one cache directory. It chooses the directory in layers. The first is `pve.endpoint_cache_dir`, the next is `endpoint-cache` beside the allocation journal directory when that exists, and the last is `pve_cpi-endpoint-cache.<uid>` under the CPI's temporary directory, which the CPI creates itself. The doctor asks the same question for every layer without creating anything. It judges as the CPI's user, which it reads from the owner of the allocation journal directory, and it checks every directory the CPI would search on the way. A refusal from a layer that applies ends the search. The CPI then keeps no HA recovery record, a grace window never starts, and the dead-node handover cannot begin. The advice means one of these.
+
+- The override does not exist.
+  The record goes to the next layer that works, and creating the override later moves the record and restarts a running grace window once. When no layer works, the finding says the CPI keeps no record.
+
+- The override is a symbolic link, is not a directory, or grants group or other access.
+  The CPI refuses it. We point the setting at the directory itself, or run `chmod 0700` on it.
+
+- A layer is owned by a user other than the CPI's.
+  The private checks require the CPI's user as the owner, with no exception for root. We give the directory to that user. For the temporary layer, we remove the directory and the CPI creates its own.
+
+- A directory above the cache directory grants the CPI's user no search access.
+  The finding names that directory, its owner, and its mode, and the CPI gets permission denied there. For a missing journal-side directory, the CPI does not move on to the temporary one either. We give the user search access to the named directory.
+
+- The doctor could not judge a layer.
+  It ran as a user that cannot read the directory, or it could not test the directories above it. The finding says so, and we run the check as root or as the CPI's user.
+
+- The CPI's user is unknown.
+  With no allocation journal directory to name that user, the doctor judges as its own user and says the CPI uses the directory only when it runs as the owner.
+
+**Fix**
+
+We apply the step the finding names and run `pve-cid ha` again. See [Reading the cluster with `pve-cid ha`](operations.md#reading-the-cluster-with-pve-cid-ha).
+
 ## Cluster not quorate
 
 **Symptom**

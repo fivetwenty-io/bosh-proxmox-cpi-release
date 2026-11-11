@@ -25,6 +25,7 @@ This is the operator-facing record of the design decisions behind the pre-releas
 | D15 | Per-member stemcell cache | Replica template on every root set member by default, swept with the primary |
 | D16 | VM ownership guard | One ownership predicate runs before every call that acts on a VM, and a VM another Director owns is refused |
 | D17 | Stamped VM CIDs | `create_vm` returns `<vmid>-<cluster>-<token>`, so a CID that names another cluster, or a VM that gave up its VMID, is never answered as this cluster's VM |
+| D18 | Endpoint failover | An ordered pool of API endpoints per cluster, a walk that moves only on proof that nothing was sent, tethers that keep a possibly sent mutation on its endpoint, and a send-by deadline for the cluster lock |
 
 ---
 
@@ -365,6 +366,20 @@ A bare CID, and a CID with the stamp `00000000`, keep the answer an absent VM al
 **Why `vm_cid_format: bare` exists.** A release that can't parse a stamped CID can't act on any VM or snapshot that one names. `pve.vm_cid_format: bare` makes `create_vm` and `snapshot_disk` return bare CIDs again, and the CPI still writes both tags, so an operator who wants to keep a downgrade path open can set it before upgrading. It's a job-level property. A `cpi_config` entry that sets `pve_vm_cid_format` doesn't change the CID form. The key fails the request when it's the entry's only `pve_` key, and it's ignored with a warning when the entry sets supported keys too, because a release either can or can't read stamped CIDs, and one entry that returned bare CIDs while another stamped them would only hide which CIDs a downgrade can still read.
 
 **Operator-visible consequences.** A VM created before the upgrade keeps its bare CID and the answers it always got, because the CPI never rewrites a CID it has returned. It's protected only after a `bosh recreate` gives it a stamped one. `pve.cluster_stamp_aliases` can be set per `cpi_config` entry as `pve_cluster_stamp_aliases`, and an entry that points at another endpoint drops the job's list unless it names its own, because the job's aliases describe the job cluster's history. The `lb_register` hook names a stamped VM's HAProxy server `vm-<vmid>-<cluster>` rather than `vm-<vmid>`, so two clusters that reuse a VMID behind one backend get two servers. A CID with the stamp `00000000` adds its token, as `vm-<vmid>-00000000-<token>`, because that stamp names no cluster. Downgrading to a release that reads only bare CIDs takes a recreate first, and [Operations](operations.md#downgrading-below-stamped-cids) lists the steps. [Known Limitations](limitations.md#vm-ownership) records what a stamp can't protect.
+
+## D18: Endpoint failover, move on proof and tether the rest
+
+**Context.** During a rolling PVE upgrade, a CPI that pointed at one node's hostname lost its API for several minutes while the cluster stayed healthy. The operator could have repointed `pve.host` before each node was cycled, but that needs a manifest change and a Director redeploy per node, and it is easy to forget.
+
+**Options we weighed.** A virtual IP on the nodes works, but it is infrastructure the operator has to run, and stock node certificates do not carry the virtual IP's name. A load balancer in front of the nodes has the same certificate problem and can make a 502 or 503 ambiguous. A dial-only hook in the client cannot see status codes, and failover inside the retry helper reaches only the call sites that use the helper. We kept a virtual IP or load balancer as a valid `pve.host`, and we built the failover into the transport.
+
+**Chosen: an endpoint pool that moves on proof.** A cluster entry takes an ordered list of endpoints in `pve.endpoints`, and discovery can add the cluster's other nodes. The pool starts each request on the endpoint that last answered and walks to the next one only when the failure proves that no byte was sent, which means the dial, the name lookup, or the TLS handshake failed. Reads and the ticket login also move after a reset or a quiet node, because repeating them costs nothing. A walk stops after four hops or when its 30-second connect budget or 90-second total budget is spent.
+
+**Tethers keep a mutation on its endpoint.** A create, a clone, or a destroy that may have reached a node is tethered to that node for the rest of its call. The CPI replays some mutations on purpose after a dropped connection, and if a replay reached a second node while the first was still running the work, a harmless replay would become a duplicate. No status code releases a tether, because a status is the proxy's word and not proof from our own transport. HA, replication, and pool writes share one tether per family, since their writers change the method or path when they re-plan.
+
+**The cluster lock gets a send-by deadline.** The lock's mutual exclusion depends on a stealer's delete arriving soon after its last read. A failover hop can add up to 15 seconds of connect time, so the steal sets a deadline, and the pool refuses to send the delete once it has passed.
+
+**Operator-visible consequences.** With two or more endpoints the CPI uses a 5-second dial timeout and a 10-second handshake timeout when we leave them at 0, and idempotent requests carry a 60-second response-header deadline except on a walk's last hop. A configured endpoint that fails certificate verification is logged at Error as possible interception, and the walk moves on. A pool of one endpoint behaves as it did before. Rolling back to 0.9.6 needs `pve.host` kept beside `pve.endpoints`, as [Operations](operations.md#rolling-back-below-endpoint-lists) describes.
 
 ## Out of scope
 

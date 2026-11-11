@@ -40,6 +40,10 @@ Packages are grouped by role. Each is described in one sentence.
 
 - `internal/pve` — wraps `github.com/fivetwenty-io/proxmox-apiclient-go/v3`: VM, disk, network, and storage CRUD, task UPID polling, retry and backoff, pushback detection, the cluster pool lock, SDN apply, the foreign-disk guard, and SDK-error normalization.
 
+- `internal/pve/endpointpool` — the ordered set of API endpoints for one cluster and the transport that walks it. It owns the active endpoint, the in-process demotions, the tethers on mutations, the send-by deadline, and the cold-start candidates from `placement.az_map`.
+
+- `internal/endpointcache` — the private cache directory and the files in it. It chooses the directory in layers, checks that the CPI's user owns it and that no one else can read it, and signs and verifies each file. The endpoint cache, the HA profile cache, and the HA recovery episode record all live there.
+
 - `internal/pve/stemcell_fetch` — resolves and fetches a stemcell image from `https://`, `s3://`, `bosh+blobstore:`, or `oci://`, then extracts and uploads it. Per-node template replication lives in `internal/cpi/handlers` (`create_stemcell`), not here.
 
 ### Bootstrap and side channels
@@ -191,6 +195,39 @@ Destroying a VM needs no membership cleanup: PVE removes a destroyed VM's pool m
 ### Agent mode selection
 
 Three agent modes exist: `cloudinit` (the default), `noagent`, and `auto`. The `auto` mode always selects configdrive bootstrap — it is equivalent to `cloudinit` for all stemcells. The factory resolves `auto` per call rather than once at startup. The `internal/configdrive` package builds the ISO 9660 image the cloudinit path delivers; see [ConfigDrive](configdrive.md).
+
+### Endpoint pool, failover walk, and tethers
+
+A cluster entry can name more than one API endpoint, through `pve.endpoints`, through the nodes that discovery adds, or through the cold-start candidates that `placement.az_map` supplies. The PVE client hands every HTTP request to `internal/pve/endpointpool`, which installs itself as the transport of the one HTTP client the SDK builds. Because the login goes through the same client, every byte the CPI sends passes through the pool. A pool of one endpoint leaves the transport as it was.
+
+The pool keeps one active endpoint, and a request starts there. When the request fails before a connection exists, the pool tries the next endpoint, which is a walk. A walk ends when a request gets an answer, after four hops, or when every eligible endpoint has been tried. Before it starts each hop after the first, it also checks two budgets. It starts no new hop once it has spent 30 seconds in connect attempts, or once 90 seconds have passed since the walk began.
+
+```mermaid
+flowchart TD
+    A[Request arrives at the pool] --> B{Past its send-by deadline?}
+    B -- yes --> X[Refuse with ErrSendByPassed, send nothing]
+    B -- no --> C{Mutation with a tether?}
+    C -- yes --> T[Send only to the tethered endpoint, never walk]
+    C -- no --> D[Start at the active endpoint]
+    D --> E{Connect phase failed?}
+    E -- yes --> F[Demote the endpoint, try the next one]
+    F --> G{Hop cap or budget spent?}
+    G -- no --> E
+    G -- yes --> H[Return an error that lists each endpoint]
+    E -- no --> I{Request sent and not answered?}
+    I -- no, answered --> J[Return the response, keep this endpoint active]
+    I -- yes --> K{Read, ticket login, or mutation?}
+    K -- read or login --> F
+    K -- mutation --> L[Fix a tether on this endpoint, return the error]
+```
+
+The picture rests on one proof. Every endpoint gets its own clones of the HTTP transport, and each clone tags a failure that happens while it is dialing, resolving a name, or doing the TLS handshake. Go writes no request byte before it has a connection, so a tagged failure proves that nothing was sent. Only then can any request move to another node. Any other failure, such as a reset or a status code, leaves a mutation maybe sent, and a status code never counts as proof, whatever it says.
+
+Tethers carry that rule across retries. A mutation that may have reached an endpoint is tethered to it for the rest of its call, so a replay from the SDK or from the CPI's own retry helpers goes back to that endpoint and never to a second node that could run it twice. A tether is keyed by the method and path, except that every mutation under `/cluster/ha`, `/cluster/replication`, and `/pools` shares a key per family, because the writers in those areas re-plan after an unknown outcome and can change the method or the path. Reads and the ticket login are never tethered, and they hop freely.
+
+Two more mechanisms bound the cost. Idempotent requests that are not on a walk's final hop carry a 60-second response-header deadline, so a node that accepts a connection and then goes quiet moves the walk along without holding it for the 30-minute client timeout. The cluster lock's steal puts a send-by deadline on its pool delete, and the pool refuses to hand that request to a connection once the deadline has passed, because a late delete could break the lock's mutual exclusion. [Endpoint Failover](endpoint-failover.md) covers the behavior from the operator's side, and [Troubleshooting](troubleshooting.md#endpoint-failover) lists the log lines.
+
+The choice of cache directory is separate. [HA and Resurrection](ha-and-resurrection.md#the-profile-cache-and-when-it-is-off) explains which files the HA code puts in it and when the discovery mode keeps them out.
 
 ### Retry, pushback, and in-flight limiting
 

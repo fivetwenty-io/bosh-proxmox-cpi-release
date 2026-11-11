@@ -52,7 +52,7 @@ sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json
 To view without credentials:
 
 ```bash
-sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json \
+sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json 
   | jq 'del(.password, .api_token)'
 ```
 
@@ -360,15 +360,15 @@ On a shared cluster where PBS also backs up hand-provisioned VMs alongside CPI-m
 BOSH_TOKEN='PVEAPIToken=bosh@pve!bosh-cpi=<secret>'
 PVE_HOST='<pve>:8006'
 
-curl -sk -o /dev/null -w "cluster/status: %{http_code}\n" \
+curl -sk -o /dev/null -w "cluster/status: %{http_code}\n" 
   -H "Authorization: $BOSH_TOKEN" https://$PVE_HOST/api2/json/cluster/status
 
-curl -sk -o /dev/null -w "cluster/resources: %{http_code}\n" \
-  -H "Authorization: $BOSH_TOKEN" \
+curl -sk -o /dev/null -w "cluster/resources: %{http_code}\n" 
+  -H "Authorization: $BOSH_TOKEN" 
   "https://$PVE_HOST/api2/json/cluster/resources?type=vm"
 
 for s in <vm_storage> <disk_storage> <stemcell_storage> <iso_storage>; do
-  curl -sk -o /dev/null -w "storage/$s: %{http_code}\n" \
+  curl -sk -o /dev/null -w "storage/$s: %{http_code}\n" 
     -H "Authorization: $BOSH_TOKEN" https://$PVE_HOST/api2/json/storage/$s
 done
 ```
@@ -419,7 +419,7 @@ pvesh get /storage/<iso_storage> | jq '.data.type'
 **`stemcell_storage` must be file-based and shared (multi-node clusters):**
 
 ```bash
-pvesh get /storage/<stemcell_storage> \
+pvesh get /storage/<stemcell_storage> 
   | jq '{type:.data.type, shared:.data.shared, content:.data.content}'
 # type: dir/nfs/cifs/glusterfs/cephfs
 # shared: 1 on multi-node clusters
@@ -444,7 +444,7 @@ bosh -d <deployment> instances --ps
 bosh -d <deployment> cloud-check
 
 # PVE side — all BOSH VMs running
-pvesh get /cluster/resources --type vm \
+pvesh get /cluster/resources --type vm 
   | jq '.[] | select(.tags != null and (.tags | contains("director--"))) | {vmid:.vmid, name:.name, status:.status}'
 ```
 
@@ -484,7 +484,7 @@ Run `cloud-check` after any failed deploy or partial cleanup before attempting a
 
 ```bash
 # BOSH VMs carry director--, deployment--, instance-group--, job--, and index-- tags
-pvesh get /cluster/resources --type vm \
+pvesh get /cluster/resources --type vm 
   | jq '.[] | select(.tags != null) | {vmid:.vmid, name:.name, tags:.tags}'
 
 # Persistent-disk volumes use synthetic VMIDs 9000–29999
@@ -586,7 +586,7 @@ pvesh get /nodes/<node>/tasks | jq '[.[] | select(.status=="running")]'
 Step 2 — confirm the file has no flock holder:
 
 ```bash
-flock -n /var/lock/pve-manager/pve-storage-<name> echo "free" \
+flock -n /var/lock/pve-manager/pve-storage-<name> echo "free" 
   || echo "locked by PID $(lsof /var/lock/pve-manager/pve-storage-<name> 2>/dev/null | awk 'NR>1{print $2}')"
 # Proceed only if "free" is printed.
 ```
@@ -664,7 +664,7 @@ Each finding is either a problem or advice. The command exits with 0 when the re
 - Leftovers and gaps
   `birth_tag_stale`, `readd_tag`, `off_mode_resource`, `off_mode_rule`, `guests_not_enumerated`, `cache_directory`, and `unchecked`.
 
-  The `cache_directory` advice says that `pve.endpoint_cache_dir` does not exist, is not a directory, is a symbolic link, or has a mode that grants group or other access. The CPI refuses a directory that is not a directory, is a symbolic link, or has such a mode, and then keeps no recovery record, so the dead-node handover cannot start. A missing directory sends the record to the temporary directory, and creating it later moves the record and restarts a running grace window once.
+  The `cache_directory` advice covers the directory that holds the endpoint cache, the HA profile cache, and the HA recovery episode record. The CPI chooses it in layers, which are `pve.endpoint_cache_dir`, then `endpoint-cache` beside the allocation journal directory, then a per-user directory under the temporary directory that the CPI creates. The doctor asks the same question for each layer without creating anything, and it judges as the CPI's user, which it reads from the owner of the allocation journal directory, searching every directory the CPI would pass through. It reports an override that does not exist, is a symbolic link, is not a directory, or grants group or other access, and any layer that another user owns or that sits below a directory the CPI's user cannot search. It also says when it could not judge a layer. A refusal from a layer that applies leaves the CPI with no recovery record, so a grace window never starts and the dead-node handover cannot begin. A missing override sends the record to the next layer that works, and creating it later moves the record and restarts a running grace window once. [Troubleshooting](troubleshooting.md#the-ha-doctor-reports-a-cache-directory-problem) lists each refusal and its fix.
 
 A `replicate` VM shows `replica_awaiting_sync` as advice while its job works but the pin has not yet widened. It shows `replica_not_recoverable` as a problem only when no usable job exists, the job is disabled, or the first sync is more than twice its schedule plus the clock-skew bound overdue. A schedule the doctor cannot measure, such as a weekday list, gets `replica_schedule_unjudged` and is never called stale or healthy.
 
@@ -845,17 +845,17 @@ The tag uses the CPI's usual tag alphabet, so the version's dot becomes a dash, 
 
 ```bash
 # Every VM still on a given stemcell
-pvesh get /cluster/resources --type vm \
-  | jq -r --arg want stemcell--bosh-openstack-kvm-ubuntu-noble-1-585 \
+pvesh get /cluster/resources --type vm 
+  | jq -r --arg want stemcell--bosh-openstack-kvm-ubuntu-noble-1-585 
       '.[] | select(.tags != null) | select(.tags | gsub(","; ";") | split(";") | index($want)) | "\(.vmid) \(.name)"'
 
 # Group the whole cluster by stemcell, to see what a bump has left behind
-pvesh get /cluster/resources --type vm \
-  | jq -r '.[] | select(.tags != null) | .tags | gsub(","; ";") | split(";")[] | select(startswith("stemcell--"))' \
+pvesh get /cluster/resources --type vm 
+  | jq -r '.[] | select(.tags != null) | .tags | gsub(","; ";") | split(";")[] | select(startswith("stemcell--"))' 
   | sort | uniq -c
 
 # The exact version, CID, kind, and sha8 for one VM
-pvesh get /nodes/<node>/qemu/<vmid>/config --output-format json \
+pvesh get /nodes/<node>/qemu/<vmid>/config --output-format json 
   | jq -r '.description' | grep -o '<!--BOSH:.*-->' | sed 's/<!--BOSH://; s/-->//' | jq '.bosh_stemcell'
 ```
 
@@ -877,8 +877,8 @@ The `bosh-owner--`, `bosh-cid--`, `bosh-cluster--`, and `stemcell--` prefixes be
 
 ```bash
 # Every VM a given Director created
-pvesh get /cluster/resources --type vm \
-  | jq -r --arg want bosh-owner--<director_uuid> \
+pvesh get /cluster/resources --type vm 
+  | jq -r --arg want bosh-owner--<director_uuid> 
       '.[] | select(.tags != null) | select(.tags | gsub(","; ";") | split(";") | index($want)) | "\(.vmid) \(.name)"'
 ```
 
@@ -891,13 +891,13 @@ A VM this release creates gets a CID such as `101-0a1b2c3d-4e5f6a7b`. The middle
 ```bash
 # Decode a CID, then find the VM that carries its token
 pve-cid decode 101-0a1b2c3d-4e5f6a7b
-pvesh get /cluster/resources --type vm \
-  | jq -r --arg want bosh-cid--4e5f6a7b \
+pvesh get /cluster/resources --type vm 
+  | jq -r --arg want bosh-cid--4e5f6a7b 
       '.[] | select(.tags != null) | select(.tags | gsub(","; ";") | split(";") | index($want)) | "\(.vmid) \(.node) \(.name)"'
 
 # This cluster's own stamp, read on any of its nodes
-pvesh get /nodes/$(hostname)/certificates/info --output-format json \
-  | jq -r '.[] | select(.filename == "pve-root-ca.pem") | .fingerprint' \
+pvesh get /nodes/$(hostname)/certificates/info --output-format json 
+  | jq -r '.[] | select(.filename == "pve-root-ca.pem") | .fingerprint' 
   | tr -d ':' | tr 'A-F' 'a-f' | cut -c1-8
 ```
 
@@ -938,6 +938,42 @@ An alias can stay as long as any CID created before the rotation is still in a D
 7. Roll back the CPI release.
 
 Setting `bare` before the first upgrade to a stamping release skips steps 2 through 6, because no stamped CID ever exists.
+
+### Cycling PVE nodes during a rolling upgrade
+
+When a cluster has more than one API endpoint for the CPI to try, we no longer repoint `pve.host` away from a node before we cycle it. An endpoint list in `pve.endpoints`, or the nodes that discovery adds to a single-host deployment that authenticates with an API token, gives the CPI somewhere else to go. A call that finds its first endpoint down walks to the next one, and every later request in that call starts on the endpoint that answered. With the default 5-second dial timeout and 10-second handshake timeout, a dead first endpoint costs a call a few seconds and not a failed deploy. [Endpoint Failover](endpoint-failover.md) covers how the CPI chooses an endpoint, and [Configuration](configuration.md) covers the properties.
+
+Two limits are worth knowing before we start the first node.
+
+- A mutation that may already have reached a node stays on that node.
+  If the node goes away while a clone, a disk create, or a destroy is in flight, the CPI does not replay it on another node, because the first node might still be running it. Any retry within that call stays on the same node, so the call fails or waits as it did before, and the Director's retry starts a new call that can use whichever endpoint answers. Reads and the ticket login do move.
+
+- A pool with one endpoint behaves as it always did.
+  A deployment that sets only `pve.host`, with discovery off or without an API token, has nowhere to go. We list at least two nodes in `pve.endpoints`, or we leave discovery on, before we rely on this.
+
+We still cycle one node at a time, and we wait for the cluster to be quorate before we start the next one.
+
+### Rolling back below endpoint lists
+
+Rolling back from 0.10.0 to 0.9.6 or earlier meets four facts, and we deal with the first two before we start.
+
+1. A manifest without `pve.host` does not render on the older release.
+
+   The older template reads `pve.host` with no default, so a manifest that relies on `pve.endpoints` alone fails at deploy time. We keep `pve.host` set beside `pve.endpoints`, and the two must name the same host and port as the first list entry. Doing that from the first upgrade means the rollback needs no manifest change.
+
+2. A `cpi_config` entry that names the new keys breaks on the older release.
+
+   The older release does not know `pve_endpoints` or `pve_api_endpoint_discovery`. It rejects every call routed through such an entry with "context carries ... which the pve_cpi job spec does not define", and that takes the whole availability zone down. We keep those keys out of `cpi_config` entries until the new release has settled, or we remove them from the cpi config before we roll back. The job-level properties are harmless, because the older job spec does not define them and its template never reads them.
+
+3. Cache files stay behind.
+
+   The older release never reads them. Files in the temporary directory disappear with the ephemeral disk, and the `endpoint-cache` directory beside the allocation journal stays on the persistent disk where the older release never looks. We can delete either one. If we upgrade again with the same credential, the files are still valid.
+
+4. The removed HA keys guard plays no part.
+
+   The template refuses removed `pve.ha` keys, and none of the endpoint properties is on that list, so this work adds nothing to that check on a rollback.
+
+The stamped-CID steps in [Downgrading below stamped CIDs](#downgrading-below-stamped-cids) are separate, and they apply when the older release is 0.9.3 or earlier.
 
 ### `bosh clean-up` is safe across directors
 
@@ -1234,18 +1270,18 @@ RELEASE_TGZ="$(pwd)/releases/bosh-proxmox-cpi/bosh-proxmox-cpi-1.2.3.tgz"
 For `bosh create-env`:
 
 ```bash
-bosh create-env manifests/bosh/bosh.yml \
-  --state manifests/bosh/state.json \
-  --vars-file manifests/bosh/vars.yml \
-  --var pve_cpi_release_path="$RELEASE_TGZ" \
+bosh create-env manifests/bosh/bosh.yml 
+  --state manifests/bosh/state.json 
+  --vars-file manifests/bosh/vars.yml 
+  --var pve_cpi_release_path="$RELEASE_TGZ" 
   ...
 ```
 
 For `bosh int` (manifest interpolation only):
 
 ```bash
-bosh int manifests/bosh/bosh.yml \
-  --vars-file manifests/bosh/vars.yml \
+bosh int manifests/bosh/bosh.yml 
+  --vars-file manifests/bosh/vars.yml 
   --var pve_cpi_release_path="$RELEASE_TGZ"
 ```
 
@@ -1280,15 +1316,15 @@ bosh task <id> --debug > task-<id>-debug.log 2>&1
 2. Director log from the failure window — on the Director VM:
 
 ```bash
-sudo grep -A5 -B5 "error\|ERROR" /var/vcap/sys/log/director/director.log \
+sudo grep -A5 -B5 "error\|ERROR" /var/vcap/sys/log/director/director.log 
   > director-extract.log
 ```
 
 3. PVE daemon logs from the failure window — on the PVE host:
 
 ```bash
-journalctl -u pvedaemon -u pveproxy \
-  --since "YYYY-MM-DD HH:MM" --until "YYYY-MM-DD HH:MM" \
+journalctl -u pvedaemon -u pveproxy 
+  --since "YYYY-MM-DD HH:MM" --until "YYYY-MM-DD HH:MM" 
   > pve-daemon.log
 ```
 
@@ -1301,8 +1337,8 @@ pvesh get /nodes/<node>/tasks/<upid>/log > pve-task-<upid>.log
 5. Rendered CPI config with credentials redacted:
 
 ```bash
-sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json \
-  | jq 'del(.password, .api_token)' \
+sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json 
+  | jq 'del(.password, .api_token)' 
   > cpi-config-redacted.json
 ```
 
@@ -1684,17 +1720,17 @@ Write failures are non-fatal — the CPI logs a warning and completes the RPC no
 
 ```bash
 # Method latency summary (requires jq)
-jq -r '[.method, (.duration_ms | tostring)] | join("\t")' \
-  /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl \
-  | sort | awk '{sum[$1]+=$2; n[$1]++} END{for(m in sum) printf "%-30s avg=%.1f ms  calls=%d\n", m, sum[m]/n[m], n[m]}' \
+jq -r '[.method, (.duration_ms | tostring)] | join("\t")' 
+  /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl 
+  | sort | awk '{sum[$1]+=$2; n[$1]++} END{for(m in sum) printf "%-30s avg=%.1f ms  calls=%d\n", m, sum[m]/n[m], n[m]}' 
   | sort -k1
 
 # All errors in the last 100 calls
-tail -100 /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl \
+tail -100 /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl 
   | jq 'select(.outcome == "error")'
 
 # p99 latency for create_vm
-grep '"method":"create_vm"' /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl \
+grep '"method":"create_vm"' /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl 
   | jq -r '.duration_ms' | sort -n | awk 'END{print NR"th percentile:", $0}'
 ```
 
