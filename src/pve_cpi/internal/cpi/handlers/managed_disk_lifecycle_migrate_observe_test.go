@@ -78,6 +78,20 @@ func (c *migratedHolderCase) answerOnSource(err error) {
 	}
 }
 
+// answerOnSourceOnce makes only the next config read of the holder on n1 fail
+// with err. Every read after it, such as the config probe's, answers the way
+// the cluster's state says.
+func (c *migratedHolderCase) answerOnSourceOnce(err error) {
+	answered := false
+	c.client.onNodeConfigRead = func(read string, vmid int) error {
+		if read == "n1" && vmid == migratedHolderVMID && !answered {
+			answered = true
+			return err
+		}
+		return nil
+	}
+}
+
 func (c *migratedHolderCase) migration() managedDiskMutationObservation {
 	return managedDiskMutationObservation{node: "n1", targetNode: "n2", vmid: migratedHolderVMID}
 }
@@ -285,6 +299,13 @@ func TestObserveHolderDeletion_RefusesAHolderThatIsNotProvenGone(t *testing.T) {
 		{"another 500", func(c *migratedHolderCase) {
 			c.deleteHolder()
 			c.answerOnSource(errMigrateSourceTimeout)
+		}},
+		// Only the recorded node's own read fails, so the probe that follows
+		// proves the holder absent everywhere. The read's failure alone has
+		// to refuse.
+		{"another 500 on the recorded node's read alone", func(c *migratedHolderCase) {
+			c.deleteHolder()
+			c.answerOnSourceOnce(errMigrateSourceTimeout)
 		}},
 		// The holder moved to n2 rather than being deleted.
 		{"probe hit on another node after a 404", func(*migratedHolderCase) {}},
