@@ -94,6 +94,16 @@ func TestDirOptionsNamedCarriesTheDisplayNameIntoTheRefusalText(t *testing.T) {
 	}
 }
 
+// Options and DirOptions are comparable, as the PathGuard comment promises.
+// A map key needs a comparable type, so a field that is not comparable, such as
+// a slice, a map, or a function, stops this file from compiling. A guard that
+// is a struct holding a slice would still make a comparison panic when it runs,
+// which is why the comment asks for a pointer.
+var (
+	_ = map[Options]struct{}{}
+	_ = map[DirOptions]struct{}{}
+)
+
 // recordingGuard is a PathGuard that records the paths it was asked about and
 // answers with err.
 type recordingGuard struct {

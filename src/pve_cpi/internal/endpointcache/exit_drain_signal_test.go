@@ -46,9 +46,22 @@ func TestDrainAtExitGivesTheSignalsBackWhenItReturns(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	// cmd.Wait runs exactly once. Once the test has started it, in the goroutine
+	// below, the cleanup kills the child and receives that one result, so a child
+	// that ignored the SIGTERM ends within the test and no second Wait races the
+	// first. A test that failed before it started the goroutine waits here.
+	var (
+		waited chan error
+		reaped bool
+	)
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		switch {
+		case waited == nil:
+			_ = cmd.Wait()
+		case !reaped:
+			t.Logf("the child ended with %v", <-waited)
+		}
 	})
 	line, err := bufio.NewReader(stdout).ReadString('\n')
 	if err != nil || !strings.HasPrefix(line, "drained") {
@@ -57,10 +70,11 @@ func TestDrainAtExitGivesTheSignalsBackWhenItReturns(t *testing.T) {
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
-	waited := make(chan error, 1)
+	waited = make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
 	select {
 	case err := <-waited:
+		reaped = true
 		var exit *exec.ExitError
 		if !errors.As(err, &exit) || !exit.Sys().(syscall.WaitStatus).Signaled() {
 			t.Errorf("the child ended with %v, want it killed by the SIGTERM", err)

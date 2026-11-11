@@ -135,6 +135,52 @@ func TestATemporaryDirectoryThatOverlapsTheJournalIsRefusedBeforeItIsCreated(t *
 	}
 }
 
+// A journal that cannot be examined cannot be compared with the temporary
+// directory, so the guard refuses the layer before it creates the directory.
+// The check has to fail closed here, because the check after the open would
+// refuse the directory only after the layer had left it behind.
+func TestATemporaryDirectoryIsRefusedBeforeItIsCreatedWhenTheJournalCannotBeCompared(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can search a directory of mode 000, so the journal can be compared")
+	}
+	for _, mode := range []config.DiscoveryMode{config.DiscoveryModeAuto, config.DiscoveryModeOn} {
+		level := endpointcache.Level(mode)
+		t.Run(string(mode), func(t *testing.T) {
+			root, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			tmp := filepath.Join(root, "tmp")
+			locked := filepath.Join(root, "locked")
+			for _, dir := range []string{tmp, filepath.Join(locked, "journal")} {
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Chmod(locked, 0); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+			t.Setenv("TMPDIR", tmp)
+			cfg := cacheTestConfig(mode, "")
+			cfg.StorageAllocationJournalDir = filepath.Join(locked, "journal")
+
+			got := openCacheFor(t, cfg)
+			if got.cache != nil || !got.plan.cacheUnusable {
+				t.Fatalf("cache %v and unusable %v, want no cache and an unusable directory", got.cache,
+					got.plan.cacheUnusable)
+			}
+			if lines := linesAt(got.obs.All(), level, "could not be compared"); len(lines) != 1 {
+				t.Errorf("lines at %v = %v; all: %v", level, lines, got.obs.All())
+			}
+			if names, err := readDirNames(tmp); err != nil || len(names) != 0 {
+				t.Errorf("the temporary directory holds %v (err %v), want the refused layer to have created nothing",
+					names, err)
+			}
+		})
+	}
+}
+
 // A journal that does not overlap the temporary directory leaves the layer to
 // create it, so the guard refuses nothing it should allow.
 func TestATemporaryDirectoryBesideTheJournalIsCreatedAndUsed(t *testing.T) {
