@@ -158,10 +158,22 @@ func TestManagedAttachKeepsAMoverAnEarlierRequestCreated(t *testing.T) {
 // mover after the disk lands, exactly as it did before movers an earlier
 // request created were kept. The attach succeeds, the record holds no planned
 // or uncertain step, and the journal shows the mover's create and its delete
-// on the same VMID.
+// on the same VMID. It runs with the fake answering a config read of a VM
+// that left the addressed node with a 404, and then with the 500 real PVE
+// sends, which says the configuration file does not exist.
 func TestManagedAttachDestroysTheMoverItCreated(t *testing.T) {
 	t.Parallel()
+	for _, mode := range lifecycleFlowConfigMissingModes {
+		t.Run(mode.name, func(t *testing.T) {
+			t.Parallel()
+			testAttachDestroysTheMoverItCreated(t, mode.pmxcfs)
+		})
+	}
+}
+
+func testAttachDestroysTheMoverItCreated(t *testing.T, pmxcfs bool) {
 	deps, client, journal, id, cid := lifecycleFlowFixture(t)
+	client.pmxcfsConfigMissing = pmxcfs
 	deps.Config.DiskMigration = "on_attach"
 	ctx := pve.WithTestBackoff(t.Context(), func(int) time.Duration { return 0 })
 	// The park, attach, park cycle names the volume for the parker, which is
