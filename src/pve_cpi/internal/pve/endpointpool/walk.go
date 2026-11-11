@@ -172,14 +172,16 @@ func (p *Pool) dispatchMutation(req *http.Request, h *tetherHold, addr string, r
 // tether names an endpoint that is not configured is refused by the routed
 // path before any dial, so a credential never reaches an address the
 // operator did not list. A tether that names the accepted cold-start
-// candidate is refused before any dial, because a tethered request never goes
-// to a candidate.
+// candidate gets a walk of the candidate alone when followCandidate allows
+// it, and is refused before any dial otherwise.
 func (p *Pool) sendFollowing(req *http.Request, target tetherTarget, configuredOnly bool, b bounds,
 ) (*http.Response, outcome, error) {
 	ep := p.memberAt(target.addr)
 	if ep != nil && ep.kind == kindCandidate {
-		closeRequestBody(req)
-		return nil, unsent, refuseTetheredCandidate(req, ep)
+		if err := p.followCandidate(req, ep, configuredOnly); err != nil {
+			closeRequestBody(req)
+			return nil, unsent, err
+		}
 	}
 	if ep == nil || (configuredOnly && ep.kind != KindConfigured) {
 		return p.sendRouted(req, target, nil, configuredOnly)
@@ -393,6 +395,10 @@ const (
 	// follows its key's tether, or another request still holds or has fixed
 	// the reservation it released.
 	stopTethered
+	// stopShort means the cold start's run stopped before a candidate because
+	// the request's context left it less than one probe may take. The
+	// candidates it did not probe pass to the next walk.
+	stopShort
 )
 
 // newWalker reads the active endpoint, the walk order, and the generation for
@@ -487,9 +493,9 @@ func (w *walker) run() (*http.Response, outcome, error) {
 // never hops again: hop i goes to the tether's endpoint instead of the one the
 // walk order names, and a tether on a routed host outside the pool, or on an
 // endpoint a configured-only request may not reach, ends the walk through the
-// routed path. A tether on the accepted cold-start candidate ends the walk
-// with a refusal before any dial, because a tethered request never goes to a
-// candidate.
+// routed path. A tether on the accepted cold-start candidate sends hop i to
+// the candidate when followCandidate allows it, and ends the walk with a
+// refusal before any dial otherwise.
 func (w *walker) reclaim(i int, body io.ReadCloser) *walkEnd {
 	if err := w.p.claim(w.hold, targetOf(w.order[i])); err != nil {
 		closeSendBody(w.req, body)
@@ -501,8 +507,12 @@ func (w *walker) reclaim(i int, body io.ReadCloser) *walkEnd {
 	w.tethered = true
 	ep := w.p.memberAt(w.hold.target.addr)
 	if ep != nil && ep.kind == kindCandidate {
-		closeSendBody(w.req, body)
-		return &walkEnd{oc: unsent, err: refuseTetheredCandidate(w.req, ep)}
+		if err := w.p.followCandidate(w.req, ep, w.configuredOnly); err != nil {
+			closeSendBody(w.req, body)
+			return &walkEnd{oc: unsent, err: err}
+		}
+		w.order[i] = ep
+		return nil
 	}
 	if ep != nil && (!w.configuredOnly || ep.kind == KindConfigured) {
 		w.order[i] = ep

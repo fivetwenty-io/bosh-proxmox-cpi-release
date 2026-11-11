@@ -317,9 +317,9 @@ func TestColdStartSendsToTheAcceptedCandidate(t *testing.T) {
 
 // A fresh mutation whose seed proved it unsent goes to the accepted candidate
 // through the candidate's own clones, never through a routed clone. The next
-// mutation with its key would follow that tether, and a tethered request never
-// goes to a candidate, so it is refused before any dial.
-func TestColdStartMutationTetheredToTheCandidateIsRefused(t *testing.T) {
+// mutation with its key follows that tether to the candidate, also through its
+// own clones, and never dials the seed.
+func TestColdStartMutationFollowsItsTetherToTheCandidate(t *testing.T) {
 	l := newLab(t)
 	seed := l.refused(t)
 	cand, c := l.candidate(t, "pve2.example.com", nil)
@@ -334,18 +334,20 @@ func TestColdStartMutationTetheredToTheCandidateIsRefused(t *testing.T) {
 		t.Fatalf("%d routed clones, want the mutation on the candidate's own", routed)
 	}
 	dials := seed.Counts.Dials.Load()
-	_, err = p.RoundTrip(tokenRequest(t, context.Background(), http.MethodPost, seed.Addr, fanOutRoute, "vmid=102"))
-	if err == nil || !strings.Contains(err.Error(), "a tethered request never goes to a cold-start candidate") {
-		t.Fatalf("err = %v, want the tethered refusal", err)
-	}
-	if IsMaybeSent(err) {
-		t.Fatalf("err = %v, want it proven unsent", err)
-	}
-	if n := cand.Counts.Method(http.MethodPost); n != 1 {
-		t.Fatalf("candidate got %d POSTs, want 1", n)
+	resp, err = p.RoundTrip(tokenRequest(t, context.Background(), http.MethodPost, seed.Addr, fanOutRoute,
+		"vmid=102"))
+	mustStatus(t, resp, err, http.StatusOK)
+	if n := cand.Counts.Method(http.MethodPost); n != 2 {
+		t.Fatalf("candidate got %d POSTs, want 2", n)
 	}
 	if n := seed.Counts.Dials.Load(); n != dials {
-		t.Fatalf("the refused mutation dialed the seed %d times", n-dials)
+		t.Fatalf("the tethered mutation dialed the seed %d times", n-dials)
+	}
+	p.mu.Lock()
+	routed = len(p.routed)
+	p.mu.Unlock()
+	if routed != 0 {
+		t.Fatalf("%d routed clones, want the tethered mutation on the candidate's own", routed)
 	}
 }
 
@@ -866,7 +868,7 @@ func TestProbeTransportRefusesOtherRequests(t *testing.T) {
 				strings.Contains(msg, "csrf") {
 				t.Fatalf("the refusal names a credential: %v", err)
 			}
-			if err := rt.seal(); !errors.Is(err, errNotProbed) {
+			if answered, err := rt.seal(); answered || !errors.Is(err, errNotProbed) {
 				t.Fatalf("seal = %v, want errNotProbed", err)
 			}
 		})
@@ -880,7 +882,7 @@ func TestProbeTransportRefusesOtherRequests(t *testing.T) {
 	if _, err := rt.RoundTrip(newReq(http.MethodGet, base+ProbePath, nil)); !errors.Is(err, errProbeReused) {
 		t.Fatalf("second probe err = %v, want errProbeReused", err)
 	}
-	if err := rt.seal(); err != nil {
+	if answered, err := rt.seal(); !answered || err != nil {
 		t.Fatalf("seal = %v", err)
 	}
 	if _, err := rt.RoundTrip(newReq(http.MethodGet, base+ProbePath, nil)); !errors.Is(err, errProbeSealed) {

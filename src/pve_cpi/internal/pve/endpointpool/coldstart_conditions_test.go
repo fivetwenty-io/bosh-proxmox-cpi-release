@@ -238,7 +238,8 @@ type twoCandidates struct {
 	probed map[string]int
 }
 
-func newTwoCandidates(t *testing.T, block func(ctx context.Context) error, mutate func(*Config)) *twoCandidates {
+func newTwoCandidates(t *testing.T, block func(ctx context.Context, req ProbeRequest) error, mutate func(*Config),
+) *twoCandidates {
 	t.Helper()
 	l := newLab(t)
 	f := &twoCandidates{l: l, seed: l.refused(t), probed: make(map[string]int)}
@@ -251,7 +252,7 @@ func newTwoCandidates(t *testing.T, block func(ctx context.Context) error, mutat
 		f.probed[req.Candidate.Node]++
 		f.mu.Unlock()
 		if req.Candidate.Node == "pve2" && block != nil {
-			return block(ctx)
+			return block(ctx, req)
 		}
 		return probeStatus(ctx, req)
 	}}
@@ -272,20 +273,25 @@ func (f *twoCandidates) mustProbed(t *testing.T, pve2, pve3 int) {
 	}
 }
 
-// A walk that probes the candidates and is cancelled passes the candidates it
-// never probed to the walk waiting for it, which goes on where it stopped: the
-// refused candidate is not probed again, no second cold start begins, and the
-// end line says why the run stopped and how many candidates it left.
+// A walk that probes the candidates and is cancelled after a candidate
+// answered and was refused passes the candidates it never probed to the walk
+// waiting for it, which goes on where it stopped: the refused candidate is not
+// probed again, no second cold start begins, and the end line says why the run
+// stopped and how many candidates it left.
 func TestColdStartOwnerCancelledHandsOnTheRest(t *testing.T) {
-	entered := make(chan struct{})
+	entered, release := make(chan struct{}), make(chan struct{})
 	waiting := make(chan struct{}, 4)
-	f := newTwoCandidates(t, func(ctx context.Context) error {
-		close(entered)
-		<-ctx.Done()
-		return ctx.Err()
-	}, func(cfg *Config) { cfg.onColdStartWait = func() { waiting <- struct{}{} } })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	f := newTwoCandidates(t, func(pctx context.Context, req ProbeRequest) error {
+		close(entered)
+		<-release
+		if err := probeStatus(pctx, req); err != nil {
+			return err
+		}
+		cancel()
+		return errors.New("pve2 is not a member")
+	}, func(cfg *Config) { cfg.onColdStartWait = func() { waiting <- struct{}{} } })
 	owner, waiter := make(chan walkResult, 1), make(chan walkResult, 1)
 	walk := func(ctx context.Context, out chan<- walkResult) {
 		req := tokenRequest(t, ctx, http.MethodGet, f.seed.Addr, "/cluster/resources", "")
@@ -304,7 +310,7 @@ func TestColdStartOwnerCancelledHandsOnTheRest(t *testing.T) {
 	<-entered
 	walk(context.Background(), waiter)
 	<-waiting
-	cancel()
+	close(release)
 	if r := <-owner; !errors.Is(r.err, context.Canceled) {
 		t.Fatalf("owner err = %v, want context.Canceled", r.err)
 	}
@@ -325,8 +331,8 @@ func TestColdStartOwnerCancelledHandsOnTheRest(t *testing.T) {
 	if n := f.c3.Counts.Requests.Load(); n != 3 {
 		t.Fatalf("pve3 got %d requests, want the probe and two reads", n)
 	}
-	if n := f.c2.Counts.Requests.Load(); n != 0 {
-		t.Fatalf("pve2 got %d requests", n)
+	if n := f.c2.Counts.Requests.Load(); n != 1 {
+		t.Fatalf("pve2 got %d requests, want its one probe", n)
 	}
 }
 
@@ -487,8 +493,9 @@ func TestColdStartCancelledMutationAfterAProvedProbeLeavesNoTether(t *testing.T)
 }
 
 // A mutation whose key gains a tether on the accepted candidate while its seed
-// dial runs is refused before the candidate hop.
-func TestColdStartReclaimRefusesATetherOnTheCandidate(t *testing.T) {
+// dial runs follows that tether: its next hop goes to the candidate through
+// the candidate's own clones.
+func TestColdStartReclaimFollowsATetherOnTheCandidate(t *testing.T) {
 	a := newAcceptedLab(t, nil)
 	cand := a.p.memberAt(a.c.Address)
 	req := tokenRequest(t, context.Background(), http.MethodPost, a.seeds[0].Addr, fanOutRoute, "vmid=101")
@@ -500,18 +507,19 @@ func TestColdStartReclaimRefusesATetherOnTheCandidate(t *testing.T) {
 		}
 	}
 	a.l.d.set(a.seeds[1].Addr, refuse(a.seeds[1]))
-	_, err := a.p.RoundTrip(req)
-	if err == nil || !strings.Contains(err.Error(), "a tethered request never goes to a cold-start candidate") {
-		t.Fatalf("err = %v, want the tethered refusal", err)
+	resp, err := a.p.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("err = %v, want the candidate's answer", err)
 	}
-	if n := a.cand.Counts.Method(http.MethodPost); n != 0 {
-		t.Fatalf("candidate got %d POSTs", n)
+	closeBody(resp)
+	if n := a.cand.Counts.Method(http.MethodPost); n != 1 {
+		t.Fatalf("candidate got %d POSTs, want 1", n)
 	}
 	a.p.mu.Lock()
 	routed := len(a.p.routed)
 	a.p.mu.Unlock()
 	if routed != 0 {
-		t.Fatal("the refused mutation built a routed clone")
+		t.Fatal("the tethered mutation built a routed clone")
 	}
 }
 

@@ -137,8 +137,10 @@ type ProbeRequest struct {
 // the answer proves membership, which is a 2xx whose local node is
 // req.Candidate.Node and whose node list holds every valid name in the entry's
 // az_map. It reads and closes the response body before it returns. Any error
-// refuses the candidate for the rest of the process. ctx ends when the request
-// that began the cold start ends, and after 25 seconds at most.
+// refuses the candidate for the rest of the process, except an error after
+// the request's own context ended before the candidate answered, which leaves
+// the candidate to the next request that reaches the cold start. ctx ends when
+// the request that probes ends, and after 25 seconds at most.
 //
 // The pool accepts a candidate only on a complete proof: Probe returned nil,
 // the probe it sent through req.Transport got a 2xx before Probe returned, and
@@ -197,10 +199,12 @@ type coldLimits struct {
 // coldStart is the cold start of one pool. A process runs one cold start. One
 // walk at a time probes its candidates, and every other walk that reaches it
 // meanwhile waits for that walk. When the walk that probes them stops because
-// its own request was cancelled or its send-by deadline passed, the
-// candidates it never probed pass to the next walk that reaches the cold
-// start, which goes on where it stopped. Every other stop, and an accepted
-// candidate, ends the cold start for the process.
+// its own request was cancelled, its send-by deadline passed, or its context
+// left less than one probe may take, the candidates it never probed pass to
+// the next walk that reaches the cold start, which goes on where it stopped.
+// A candidate whose probe that request's own context cut before it answered
+// counts as never probed. Every other stop, and an accepted candidate, ends
+// the cold start for the process.
 type coldStart struct {
 	prober     Prober
 	candidates []*candidate
@@ -217,8 +221,9 @@ type coldStart struct {
 	begun bool
 	// running says a walk is probing candidates now.
 	running bool
-	// next is the first candidate no walk has probed. A candidate before it
-	// was refused, so no candidate is probed twice.
+	// next is the first candidate no walk has probed to an answer. A
+	// candidate before it was refused, so no candidate that answered is
+	// probed twice.
 	next int
 	// over says the cold start has ended for the process, with accepted as
 	// its result, which is nil when no candidate was accepted.
@@ -514,7 +519,9 @@ func (w *walker) noteColdStart(h hopResult) {
 // candidate stays behind the same conditions as the cold start. That needs a
 // pool that carries candidates and a walk that has not reached the cold start
 // yet, that walks the whole pool, and that follows no tether, so the login, a
-// discovery request, and a tethered mutation never do. The run loop already
+// discovery request, and a mutation tethered to a configured endpoint never
+// do. A mutation tethered to the accepted candidate goes there through
+// sendFollowing or reclaim, under followCandidate, and never through here. The run loop already
 // halts a tethered walk before it asks, and the check here keeps the rule if
 // that order changes. Every configured endpoint must have failed in the
 // connect phase in this walk, by opensColdStart, and the hop cap and both
@@ -561,8 +568,8 @@ func (w *walker) enterColdStart(h hopResult, next int) *walkEnd {
 // probing waits for it within its own budgets and then asks again, so it
 // takes over the candidates that walk passed on, if any. A walk that gets
 // here after the cold start ended reads its result. Either way a walk sends
-// only to the candidate a probe accepted, no candidate is probed twice, and no
-// second cold start begins.
+// only to the candidate a probe accepted, no candidate that answered is probed
+// twice, and no second cold start begins.
 func (w *walker) coldStart() (*endpoint, stopReason) {
 	w.coldDone = true
 	cs := w.p.cold
@@ -659,16 +666,20 @@ func (w *walker) awaitColdStart(cs *coldStart, done <-chan struct{}) stopReason 
 // runColdStart probes the candidates in order from start, as the one walk
 // probing them, and returns the first one accepted, or nil with the reason it
 // stopped. Before each candidate it checks the hop cap, both budgets, the
-// caller's context, and the send-by deadline. A probe's whole time counts as
-// connect time. A refused candidate uses a hop and joins the walk's failures,
-// and an accepted one uses the hop its request goes out on. The run is
-// recorded as stopped however it returns, so a walk waiting for it never waits
-// past its own budget. When it stops for the caller's context or the send-by
-// deadline, the candidates it did not probe pass to the next walk.
+// caller's context, the send-by deadline, and that the caller's context leaves
+// at least the probe limit, so the request's own deadline never cuts a probe
+// it starts. A probe's whole time counts as connect time. A refused candidate
+// uses a hop and joins the walk's failures, and an accepted one uses the hop
+// its request goes out on. A probe the request's own context cut before the
+// candidate answered refuses nothing: the candidate counts as never probed,
+// uses no hop, and joins no failures. The run is recorded as stopped however
+// it returns, so a walk waiting for it never waits past its own budget. When
+// it stops for the caller's context, its send-by deadline, or a context too
+// short for a probe, the candidates it did not probe pass to the next walk.
 func (w *walker) runColdStart(cs *coldStart, start int) (accepted *endpoint, stop stopReason) {
 	next, probed := start, 0
 	defer func() {
-		over := cs.finish(accepted, next, stop == stopCaller || stop == stopSendBy)
+		over := cs.finish(accepted, next, handsOn(stop))
 		if accepted == nil && stop != stopNone {
 			w.p.logColdStartStop(stop, probed, len(cs.candidates)-next, over)
 		}
@@ -689,12 +700,18 @@ func (w *walker) runColdStart(cs *coldStart, start int) (accepted *endpoint, sto
 		if s := w.requestStop(); s != stopNone {
 			return nil, s
 		}
+		if ok, _ := w.mayRunColdStart(cs.limits.probe); !ok {
+			return nil, stopShort
+		}
 		c := cs.candidates[next]
+		begin := w.bounds.now()
+		cut, err := w.p.probe(w.req.Context(), cs, c, auth)
+		w.budget.spend(w.bounds.now().Sub(begin))
+		if cut {
+			return nil, stopCaller
+		}
 		next++
 		probed++
-		begin := w.bounds.now()
-		err := w.p.probe(w.req.Context(), cs, c, auth)
-		w.budget.spend(w.bounds.now().Sub(begin))
 		if err == nil {
 			return c.ep, stopNone
 		}
@@ -702,6 +719,14 @@ func (w *walker) runColdStart(cs *coldStart, start int) (accepted *endpoint, sto
 		w.fails.add(c.ep.addr, refusedCandidate(c.ep, err), true)
 	}
 	return nil, stopExhausted
+}
+
+// handsOn reports whether a run of the cold start that stopped for stop passes
+// the candidates it did not probe to the next walk. Only a stop that is the
+// request's own does: its context ended or left too little for a probe, or its
+// send-by deadline passed.
+func handsOn(stop stopReason) bool {
+	return stop == stopCaller || stop == stopSendBy || stop == stopShort
 }
 
 // logColdStartStop logs, at Debug, that a run of the cold start accepted no
@@ -736,6 +761,8 @@ func coldStopReason(stop stopReason, unprobed int) (string, string) {
 		return "cancelled", "the request's context ended"
 	case stop == stopSendBy:
 		return "send_by", "the request's send-by deadline passed"
+	case stop == stopShort:
+		return "short", "the request's context had less than the time one probe may take left"
 	case stop == stopBudget:
 		return "budget", "the walk's time budget ran out"
 	case unprobed > 0:
@@ -762,21 +789,32 @@ var errProberPanicked = errors.New("the cold-start prober panicked")
 // nil and the probe transport, sealed the moment the prober returned, holds a
 // complete proof. A panic in the prober, or any proof that is missing or
 // incomplete, refuses the candidate. The probe's response body is closed and
-// the probe clone's idle connections are closed once the prober returns,
-// because a candidate is probed once.
-func (p *Pool) probe(ctx context.Context, cs *coldStart, c *candidate, auth string) error {
-	ctx, cancel := context.WithTimeout(connectContext(ctx, http.MethodGet, ProbePath), cs.limits.probe)
+// the probe clone's idle connections are closed once the prober returns.
+//
+// cut reports a probe that reqCtx, the request's own context, ended before
+// the candidate answered. It is a probe whose prober returned an error other
+// than a panic after reqCtx ended, while the probe's own limit had not passed,
+// and whose transport recorded no response and no failure other than the end
+// of its context. Such a candidate never answered, so the pool counts it as
+// never probed rather than refused. A probe that got a response, or that
+// failed for any other reason, is never cut, so no candidate that answered is
+// probed again.
+func (p *Pool) probe(reqCtx context.Context, cs *coldStart, c *candidate, auth string) (cut bool, err error) {
+	ctx, cancel := context.WithTimeoutCause(connectContext(reqCtx, http.MethodGet, ProbePath), cs.limits.probe,
+		errProbeLimit)
 	defer cancel()
 	rt := newProbeTransport(ctx, c, auth)
-	err := p.callProber(ctx, cs, c, ProbeRequest{
+	err = p.callProber(ctx, cs, c, ProbeRequest{
 		Candidate:     Candidate{Node: c.ep.node, Address: c.ep.urlHost},
 		Authorization: auth,
 		Transport:     rt,
 	})
-	proof := rt.seal()
+	answered, proof := rt.seal()
 	c.probe.CloseIdleConnections()
 	if err != nil {
-		return err
+		cut = !answered && reqCtx.Err() != nil && !errors.Is(err, errProberPanicked) &&
+			!errors.Is(context.Cause(ctx), errProbeLimit)
+		return cut, err
 	}
 	if proof != nil {
 		cause := log.ScrubMessage(proof.Error())
@@ -786,10 +824,15 @@ func (p *Pool) probe(ctx context.Context, cs *coldStart, c *candidate, auth stri
 			log.String("node", c.ep.node),
 			log.String("error", cause),
 		)
-		return proof
+		return false, proof
 	}
-	return nil
+	return false, nil
 }
+
+// errProbeLimit is the cause of a probe's context ending when the probe limit
+// passed, which tells that end apart from the end of the request's own
+// context.
+var errProbeLimit = errors.New("the probe limit passed")
 
 // callProber calls the prober and returns its answer, or errProberPanicked
 // when it panicked. Only the prober's call runs under the recovery, so the
@@ -945,18 +988,28 @@ func (t *probeTransport) check(req *http.Request) error {
 // a probe that was sent, got a 2xx answer before the prober returned, and
 // whose body the prober closed before it returned, and the reason the
 // candidate is refused otherwise. It closes the response body the prober left
-// open.
-func (t *probeTransport) seal() error {
+// open. answered reports whether the candidate answered the probe in a way
+// that counts against it: with a response, or with a failure other than the
+// end of the probe's context, such as a refused dial or a failed TLS
+// verification.
+func (t *probeTransport) seal() (answered bool, proof error) {
 	t.mu.Lock()
 	t.sealed = true
-	proof := t.proofLocked()
+	proof = t.proofLocked()
+	answered = t.resp != nil || (t.err != nil && !isContextEnd(t.err))
 	body := t.body
 	t.mu.Unlock()
 	if body != nil {
 		_ = body.rc.Close()
 		body.cancel()
 	}
-	return proof
+	return answered, proof
+}
+
+// isContextEnd reports whether err is the end of a context, a cancellation or
+// a deadline, rather than a failure of the candidate.
+func isContextEnd(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // proofLocked returns nil when the probe holds a complete proof, and the
@@ -1046,14 +1099,29 @@ func revokedHop(ep *endpoint) hopResult {
 	}
 }
 
-// refuseTetheredCandidate returns the error for a mutation whose key's tether
-// names ep, the accepted cold-start candidate. A tethered request never goes
-// to a candidate, and it may go nowhere else, so it is refused before any
-// dial.
-func refuseTetheredCandidate(req *http.Request, ep *endpoint) error {
+// followCandidate returns nil when req, a mutation whose key's tether names
+// ep, the accepted cold-start candidate, may follow that tether to it, and
+// the refusal otherwise. The tether keeps a mutation on the endpoint its key
+// went to, and every dial to the candidate is verified, so the mutation
+// follows it while the candidate has not failed TLS verification since it
+// proved membership. It never goes there when the candidate has, when it is a
+// login or discovery request, or when it carries no API token or a ticket,
+// because a candidate gets only what the cold start would send it. A refused
+// request may go nowhere else, so it is refused before any dial.
+func (p *Pool) followCandidate(req *http.Request, ep *endpoint, configuredOnly bool) error {
+	var why string
+	switch {
+	case p.ineligibleNow(ep):
+		why = "which failed TLS verification after it proved membership, so the pool sends it nothing more"
+	case configuredOnly:
+		why = "and a login or discovery request never goes to a cold-start candidate"
+	case tokenAuthorization(req) == "":
+		why = "and only a request with one API token and no ticket goes to a cold-start candidate"
+	default:
+		return nil
+	}
 	return fmt.Errorf("endpoint pool: refusing %s %s, whose tether key is tethered to the cold-start candidate %s "+
-		"for node %s, and a tethered request never goes to a cold-start candidate",
-		methodOf(req), apiRelative(req.URL.Path), ep.addr, ep.node)
+		"for node %s, %s", methodOf(req), apiRelative(req.URL.Path), ep.addr, ep.node, why)
 }
 
 // candidateFailed applies what the pool records beyond a demotion, which the
