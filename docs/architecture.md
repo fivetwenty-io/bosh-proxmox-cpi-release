@@ -198,7 +198,7 @@ Three agent modes exist: `cloudinit` (the default), `noagent`, and `auto`. The `
 
 ### Endpoint pool, failover walk, and tethers
 
-A cluster entry can name more than one API endpoint, through `pve.endpoints`, through the nodes that discovery adds, or through the cold-start candidates that `placement.az_map` supplies. The PVE client hands every HTTP request to `internal/pve/endpointpool`, which installs itself as the transport of the one HTTP client the SDK builds. Because the login goes through the same client, every byte the CPI sends passes through the pool. A pool of one endpoint leaves the transport as it was.
+A cluster entry can name more than one API endpoint, through `pve.endpoints`, through the nodes that discovery adds, or through the cold-start candidates that `placement.az_map` supplies. The PVE client hands every HTTP request to `internal/pve/endpointpool`, which installs itself as the transport of the one HTTP client the SDK builds. Because the login goes through the same client, every byte the CPI sends passes through the pool. A client whose pool holds one endpoint, and whose discovery mode is off, keeps the SDK's own transport.
 
 The pool keeps one active endpoint, and a request starts there. When the request fails before a connection exists, the pool tries the next endpoint, which is a walk. A walk ends when a request gets an answer, after four hops, or when every eligible endpoint has been tried. Before it starts each hop after the first, it also checks two budgets. It starts no new hop once it has spent 30 seconds in connect attempts, or once 90 seconds have passed since the walk began.
 

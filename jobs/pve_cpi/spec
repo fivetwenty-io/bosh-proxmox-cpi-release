@@ -1204,7 +1204,9 @@ properties:
       cached endpoint list exists. A node is used only after its certificate
       chains to pve.ca_cert and matches its name, and after its /cluster/status
       answer shows it as the local member of a cluster that lists every node in
-      this map. The API token goes to the node only after those checks pass.
+      this map. The membership probe itself carries the API token, so a node
+      sees the token only after its certificate chains and matches, and the CPI
+      sends it no other request until the answer passes these checks.
       Example: {us-east-1a: [pve01, pve02], us-east-1b: [pve03]}
     default: {}
   pve.placement.anti_affinity.enabled:
