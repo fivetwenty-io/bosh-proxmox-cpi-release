@@ -336,7 +336,7 @@ For `:heavy:` it would be a trap. Point two entries' `stemcell_storage` at one s
 
 To prevent that, we keep the file. When a `delete_stemcell` request comes through a cpi-config entry and the stemcell's storage is shared, the CPI destroys the cache template, leaves the qcow2 in place, and logs a warning that names the volume and the `pvesm free` command. The Director normally deletes every entry's row in one task, so on shared storage a `:heavy:` file is kept on every multi-cluster delete, including the last one. We trade a leaked file for a lost one, because a leaked file can be removed later while a lost one needs a re-upload.
 
-Every entry in cpi_config, including the one for the job's own cluster, must carry its own `pve` block with at least `host`. The CPI recognizes a cpi-config request by the `pve` properties the entry sends, so an entry with empty properties looks the same as a Director with no cpi_config and still deletes the file.
+Every entry in cpi_config, including the one for the job's own cluster, must carry its own `pve` block, though an entry that leaves out `host` inherits the host of the job. The CPI recognizes a cpi-config request by the `pve` properties the entry sends, so an entry with empty properties looks the same as a Director with no cpi_config and still deletes the file.
 
 A request with no cpi-config overrides, which is every single-cluster install, deletes the file as before, and so does a request whose storage is node-local or whose shared flag cannot be read.
 

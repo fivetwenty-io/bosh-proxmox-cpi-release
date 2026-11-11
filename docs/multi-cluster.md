@@ -12,7 +12,7 @@ Every multi-AZ doc teaches the same order, and we follow it here too.
    An AZ in the cloud config names a `cpi_config` entry with `cpi:`. Every operation BOSH performs for an instance in that AZ goes through that entry.
 
 2. The entry
-   The entry's `pve` block carries that cluster's endpoint, credentials, CA, storages, bridge or SDN settings, pools, and VMID bands. Every entry, including the one for the job's own cluster, carries its own `pve` block with at least `host`.
+   The entry's `pve` block carries that cluster's endpoint, credentials, CA, storages, bridge or SDN settings, pools, and VMID bands. Every entry, including the one for the job's own cluster, carries its own `pve` block. An entry that leaves out `host` inherits the host of the job, so an entry for the job's own cluster may set only the keys that differ.
 
 3. The cluster or host
    The entry points at exactly one PVE cluster or one standalone PVE host, and everything the CPI does for that AZ happens there.
@@ -80,7 +80,7 @@ cpis:
       parked_disk_vmid_range_end: 90999
 ```
 
-Each entry names its own `host`, and the first entry does so even though its cluster is the same one the job-level configuration points at. A request with no `pve_*` context keys resolves to the job-level configuration unchanged, so an entry that carries no `host` is indistinguishable from a Director with no cpi-config at all.
+Each entry in this example names its own `host`, and the first entry does so even though its cluster is the same one the job-level configuration points at. A request with no `pve_*` context keys resolves to the job-level configuration unchanged, so an entry that carries no `pve` keys at all is indistinguishable from a Director with no cpi-config. An entry may leave `host` out and inherit the host of the job.
 
 The example is a trimmed illustration. The credential variable names in it match the shipped `manifests/cpi-config.yml`, where each entry carries a whole credential group of its own, which is either an API token or a user with a password. We never complete one entry's group with another entry's user, password, or token.
 

@@ -48,7 +48,7 @@ This page collects every known limitation of the CPI in one place. Each entry is
 ## Storage and stemcells
 
 - `:heavy:` files on a shared export are kept, not deleted, under cpi-config
-  Reference counts are scoped to one cpi-config entry, so `delete_stemcell` keeps the qcow2 when the request came through an entry and the storage is shared, and `pve-cid stemcells --orphans` reports the leftover file for removal with `pvesm free`. Every entry, including the one for the job's cluster, must set `pve.host`, because an entry with empty properties looks like a Director with no cpi_config and still deletes the file. See [Light Stemcells](light-stemcells.md#heavy-and-a-cross-cluster-shared-export-do-not-mix).
+  Reference counts are scoped to one cpi-config entry, so `delete_stemcell` keeps the qcow2 when the request came through an entry and the storage is shared, and `pve-cid stemcells --orphans` reports the leftover file for removal with `pvesm free`. An entry does not have to set `pve.host`, because one that sets other override keys inherits the host of the job. Every entry, including the one for the job's cluster, must set at least one `pve` override, because an entry with empty properties looks like a Director with no cpi_config and still deletes the file. See [Light Stemcells](light-stemcells.md#heavy-and-a-cross-cluster-shared-export-do-not-mix).
 
 - Fast-path delete skips the pool reaper
   With `pve.fast_path_delete: true`, a resource pool emptied by the fast path is reaped only by a later synchronous-path delete or by hand, even when `pve.pool_reap_empty` is on. See [Operations Runbook](operations.md#known-limitation-fast-path-delete-skips-the-pool-reaper).
