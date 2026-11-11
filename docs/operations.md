@@ -52,7 +52,7 @@ sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json
 To view without credentials:
 
 ```bash
-sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json 
+sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json \
   | jq 'del(.password, .api_token)'
 ```
 
@@ -360,15 +360,15 @@ On a shared cluster where PBS also backs up hand-provisioned VMs alongside CPI-m
 BOSH_TOKEN='PVEAPIToken=bosh@pve!bosh-cpi=<secret>'
 PVE_HOST='<pve>:8006'
 
-curl -sk -o /dev/null -w "cluster/status: %{http_code}\n" 
+curl -sk -o /dev/null -w "cluster/status: %{http_code}\n" \
   -H "Authorization: $BOSH_TOKEN" https://$PVE_HOST/api2/json/cluster/status
 
-curl -sk -o /dev/null -w "cluster/resources: %{http_code}\n" 
-  -H "Authorization: $BOSH_TOKEN" 
+curl -sk -o /dev/null -w "cluster/resources: %{http_code}\n" \
+  -H "Authorization: $BOSH_TOKEN" \
   "https://$PVE_HOST/api2/json/cluster/resources?type=vm"
 
 for s in <vm_storage> <disk_storage> <stemcell_storage> <iso_storage>; do
-  curl -sk -o /dev/null -w "storage/$s: %{http_code}\n" 
+  curl -sk -o /dev/null -w "storage/$s: %{http_code}\n" \
     -H "Authorization: $BOSH_TOKEN" https://$PVE_HOST/api2/json/storage/$s
 done
 ```
@@ -419,7 +419,7 @@ pvesh get /storage/<iso_storage> | jq '.data.type'
 **`stemcell_storage` must be file-based and shared (multi-node clusters):**
 
 ```bash
-pvesh get /storage/<stemcell_storage> 
+pvesh get /storage/<stemcell_storage> \
   | jq '{type:.data.type, shared:.data.shared, content:.data.content}'
 # type: dir/nfs/cifs/glusterfs/cephfs
 # shared: 1 on multi-node clusters
@@ -444,7 +444,7 @@ bosh -d <deployment> instances --ps
 bosh -d <deployment> cloud-check
 
 # PVE side — all BOSH VMs running
-pvesh get /cluster/resources --type vm 
+pvesh get /cluster/resources --type vm \
   | jq '.[] | select(.tags != null and (.tags | contains("director--"))) | {vmid:.vmid, name:.name, status:.status}'
 ```
 
@@ -484,7 +484,7 @@ Run `cloud-check` after any failed deploy or partial cleanup before attempting a
 
 ```bash
 # BOSH VMs carry director--, deployment--, instance-group--, job--, and index-- tags
-pvesh get /cluster/resources --type vm 
+pvesh get /cluster/resources --type vm \
   | jq '.[] | select(.tags != null) | {vmid:.vmid, name:.name, tags:.tags}'
 
 # Persistent-disk volumes use synthetic VMIDs 9000–29999
@@ -586,7 +586,7 @@ pvesh get /nodes/<node>/tasks | jq '[.[] | select(.status=="running")]'
 Step 2 — confirm the file has no flock holder:
 
 ```bash
-flock -n /var/lock/pve-manager/pve-storage-<name> echo "free" 
+flock -n /var/lock/pve-manager/pve-storage-<name> echo "free" \
   || echo "locked by PID $(lsof /var/lock/pve-manager/pve-storage-<name> 2>/dev/null | awk 'NR>1{print $2}')"
 # Proceed only if "free" is printed.
 ```
@@ -903,17 +903,17 @@ The tag uses the CPI's usual tag alphabet, so the version's dot becomes a dash, 
 
 ```bash
 # Every VM still on a given stemcell
-pvesh get /cluster/resources --type vm 
-  | jq -r --arg want stemcell--bosh-openstack-kvm-ubuntu-noble-1-585 
+pvesh get /cluster/resources --type vm \
+  | jq -r --arg want stemcell--bosh-openstack-kvm-ubuntu-noble-1-585 \
       '.[] | select(.tags != null) | select(.tags | gsub(","; ";") | split(";") | index($want)) | "\(.vmid) \(.name)"'
 
 # Group the whole cluster by stemcell, to see what a bump has left behind
-pvesh get /cluster/resources --type vm 
-  | jq -r '.[] | select(.tags != null) | .tags | gsub(","; ";") | split(";")[] | select(startswith("stemcell--"))' 
+pvesh get /cluster/resources --type vm \
+  | jq -r '.[] | select(.tags != null) | .tags | gsub(","; ";") | split(";")[] | select(startswith("stemcell--"))' \
   | sort | uniq -c
 
 # The exact version, CID, kind, and sha8 for one VM
-pvesh get /nodes/<node>/qemu/<vmid>/config --output-format json 
+pvesh get /nodes/<node>/qemu/<vmid>/config --output-format json \
   | jq -r '.description' | grep -o '<!--BOSH:.*-->' | sed 's/<!--BOSH://; s/-->//' | jq '.bosh_stemcell'
 ```
 
@@ -935,8 +935,8 @@ The `bosh-owner--`, `bosh-cid--`, `bosh-cluster--`, and `stemcell--` prefixes be
 
 ```bash
 # Every VM a given Director created
-pvesh get /cluster/resources --type vm 
-  | jq -r --arg want bosh-owner--<director_uuid> 
+pvesh get /cluster/resources --type vm \
+  | jq -r --arg want bosh-owner--<director_uuid> \
       '.[] | select(.tags != null) | select(.tags | gsub(","; ";") | split(";") | index($want)) | "\(.vmid) \(.name)"'
 ```
 
@@ -949,13 +949,13 @@ A VM this release creates gets a CID such as `101-0a1b2c3d-4e5f6a7b`. The middle
 ```bash
 # Decode a CID, then find the VM that carries its token
 pve-cid decode 101-0a1b2c3d-4e5f6a7b
-pvesh get /cluster/resources --type vm 
-  | jq -r --arg want bosh-cid--4e5f6a7b 
+pvesh get /cluster/resources --type vm \
+  | jq -r --arg want bosh-cid--4e5f6a7b \
       '.[] | select(.tags != null) | select(.tags | gsub(","; ";") | split(";") | index($want)) | "\(.vmid) \(.node) \(.name)"'
 
 # This cluster's own stamp, read on any of its nodes
-pvesh get /nodes/$(hostname)/certificates/info --output-format json 
-  | jq -r '.[] | select(.filename == "pve-root-ca.pem") | .fingerprint' 
+pvesh get /nodes/$(hostname)/certificates/info --output-format json \
+  | jq -r '.[] | select(.filename == "pve-root-ca.pem") | .fingerprint' \
   | tr -d ':' | tr 'A-F' 'a-f' | cut -c1-8
 ```
 
@@ -1328,18 +1328,18 @@ RELEASE_TGZ="$(pwd)/releases/bosh-proxmox-cpi/bosh-proxmox-cpi-1.2.3.tgz"
 For `bosh create-env`:
 
 ```bash
-bosh create-env manifests/bosh/bosh.yml 
-  --state manifests/bosh/state.json 
-  --vars-file manifests/bosh/vars.yml 
-  --var pve_cpi_release_path="$RELEASE_TGZ" 
+bosh create-env manifests/bosh/bosh.yml \
+  --state manifests/bosh/state.json \
+  --vars-file manifests/bosh/vars.yml \
+  --var pve_cpi_release_path="$RELEASE_TGZ" \
   ...
 ```
 
 For `bosh int` (manifest interpolation only):
 
 ```bash
-bosh int manifests/bosh/bosh.yml 
-  --vars-file manifests/bosh/vars.yml 
+bosh int manifests/bosh/bosh.yml \
+  --vars-file manifests/bosh/vars.yml \
   --var pve_cpi_release_path="$RELEASE_TGZ"
 ```
 
@@ -1374,15 +1374,15 @@ bosh task <id> --debug > task-<id>-debug.log 2>&1
 2. Director log from the failure window — on the Director VM:
 
 ```bash
-sudo grep -A5 -B5 "error\|ERROR" /var/vcap/sys/log/director/director.log 
+sudo grep -A5 -B5 "error\|ERROR" /var/vcap/sys/log/director/director.log \
   > director-extract.log
 ```
 
 3. PVE daemon logs from the failure window — on the PVE host:
 
 ```bash
-journalctl -u pvedaemon -u pveproxy 
-  --since "YYYY-MM-DD HH:MM" --until "YYYY-MM-DD HH:MM" 
+journalctl -u pvedaemon -u pveproxy \
+  --since "YYYY-MM-DD HH:MM" --until "YYYY-MM-DD HH:MM" \
   > pve-daemon.log
 ```
 
@@ -1395,8 +1395,8 @@ pvesh get /nodes/<node>/tasks/<upid>/log > pve-task-<upid>.log
 5. Rendered CPI config with credentials redacted:
 
 ```bash
-sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json 
-  | jq 'del(.password, .api_token)' 
+sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json \
+  | jq 'del(.password, .api_token)' \
   > cpi-config-redacted.json
 ```
 
@@ -1778,17 +1778,17 @@ Write failures are non-fatal — the CPI logs a warning and completes the RPC no
 
 ```bash
 # Method latency summary (requires jq)
-jq -r '[.method, (.duration_ms | tostring)] | join("\t")' 
-  /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl 
-  | sort | awk '{sum[$1]+=$2; n[$1]++} END{for(m in sum) printf "%-30s avg=%.1f ms  calls=%d\n", m, sum[m]/n[m], n[m]}' 
+jq -r '[.method, (.duration_ms | tostring)] | join("\t")' \
+  /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl \
+  | sort | awk '{sum[$1]+=$2; n[$1]++} END{for(m in sum) printf "%-30s avg=%.1f ms  calls=%d\n", m, sum[m]/n[m], n[m]}' \
   | sort -k1
 
 # All errors in the last 100 calls
-tail -100 /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl 
+tail -100 /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl \
   | jq 'select(.outcome == "error")'
 
 # p99 latency for create_vm
-grep '"method":"create_vm"' /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl 
+grep '"method":"create_vm"' /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl \
   | jq -r '.duration_ms' | sort -n | awk 'END{print NR"th percentile:", $0}'
 ```
 
