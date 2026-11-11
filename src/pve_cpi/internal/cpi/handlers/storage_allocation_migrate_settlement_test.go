@@ -348,9 +348,21 @@ func TestSettleMigrationRefusesWithoutProof(t *testing.T) {
 			}},
 		{name: "no expected CID", want: "--expected-cid",
 			setup: func(_ *testing.T, _ *settleMigrationCase, d *StorageAllocationDecision) { d.ExpectedCID = "" }},
-		{name: "other CID", want: "with the exact CID",
+		{name: "other CID", want: "records a CID that differs from --expected-cid",
 			setup: func(_ *testing.T, _ *settleMigrationCase, d *StorageAllocationDecision) {
 				d.ExpectedCID = "pvd-other"
+			}},
+		{name: "CID with a trailing space", want: "records a CID that differs from --expected-cid",
+			setup: func(_ *testing.T, c *settleMigrationCase, d *StorageAllocationDecision) {
+				d.ExpectedCID = c.cid + " "
+			}},
+		{name: "step already settled", want: "is already observed with the task --task-upid names; there is nothing " +
+			"to settle",
+			setup: func(t *testing.T, c *settleMigrationCase, d *StorageAllocationDecision) {
+				if _, err := c.settle(*d); err != nil {
+					t.Fatalf("the first settle-migration = %s", StorageAllocationDecisionFailure(err))
+				}
+				c.logged.Reset()
 			}},
 		{name: "malformed UPID", want: "malformed",
 			setup: func(_ *testing.T, _ *settleMigrationCase, d *StorageAllocationDecision) {

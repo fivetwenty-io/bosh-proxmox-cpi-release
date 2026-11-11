@@ -298,12 +298,23 @@ func settleMigrationUnderHandle(
 }
 
 // settleableMigrationRecord refuses a record that isn't a disk in
-// reconciliation_required with the decision's exact CID.
+// reconciliation_required with the decision's exact CID. Each refusal names
+// the one condition that failed. The CID refusal echoes neither CID, and it
+// says the comparison is exact, because a CID copied with a stray space
+// differs too.
 func settleableMigrationRecord(record aj.Record, decision StorageAllocationDecision) error {
-	if record.Kind != allocationKindDisk || record.State != aj.ReconciliationRequired ||
-		record.CID == "" || record.CID != decision.ExpectedCID {
-		return storageRefusalf("settle-migration requires a disk record in %s with the exact CID; allocation %s "+
-			"is a %s record in state %s", aj.ReconciliationRequired, record.ID, record.Kind, record.State)
+	switch {
+	case record.Kind != allocationKindDisk:
+		return storageRefusalf("settle-migration settles only a disk record; allocation %s is a %s record",
+			record.ID, record.Kind)
+	case record.State != aj.ReconciliationRequired:
+		return storageRefusalf("settle-migration settles only a disk record in %s; allocation %s is in state %s",
+			aj.ReconciliationRequired, record.ID, record.State)
+	case record.CID == "":
+		return storageRefusalf("allocation %s records no CID to compare with --expected-cid", record.ID)
+	case record.CID != decision.ExpectedCID:
+		return storageRefusalf("allocation %s records a CID that differs from --expected-cid, which must match "+
+			"it exactly, with no surrounding spaces", record.ID)
 	}
 	return nil
 }
@@ -329,6 +340,12 @@ func settleableMigrationStep(
 	n := len(record.Attempts)
 	if step.Attempt != record.ActiveAttempt() || n == 0 || record.Attempts[n-1].Completion != nil {
 		return aj.Step{}, storageRefusalf("step %s is not in the allocation's open attempt", step.ID)
+	}
+	if step.State == aj.Observed && step.UPID == decision.MigrationTaskUPID {
+		// A rerun after a settlement whose output was lost lands here, as
+		// does a migration the guard observed itself.
+		return aj.Step{}, storageRefusalf("step %s (%s) is already observed with the task --task-upid names; "+
+			"there is nothing to settle", step.ID, step.Kind)
 	}
 	if step.State != aj.Submitted {
 		return aj.Step{}, storageRefusalf("step %s (%s) is %s, not submitted; settle-migration settles only a "+
