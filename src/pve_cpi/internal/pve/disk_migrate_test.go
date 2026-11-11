@@ -39,19 +39,20 @@ type mmProtectionWrite struct {
 // read or write addressed to a node the VM isn't on fails with the 500 that
 // says the configuration file does not exist, and the cluster serves both
 // members to the config probe. migrateFn decides what the migrate call does to
-// the fake's state and what it returns, waitErr is the migrate task's outcome,
-// and readErr fails every config read addressed to a node.
+// the fake's state and what it returns, and waitErr is the migrate task's
+// outcome. readErr fails every config read addressed to a node until a
+// protection-on write lands there, which models a node that stops answering
+// reads and is answering again by the time the restore reads back.
 type mmClient struct {
 	parkerLockClient
 
-	mu            sync.Mutex
-	configs       map[int]map[string]any
-	nodes         map[int]string
-	migrateFn     func(c *mmClient) (*sdknodes.CreateQemuMigrateResponse, error)
-	waitErr       error
-	readErr       map[string]error
-	writes        []mmProtectionWrite
-	writeAttempts int
+	mu        sync.Mutex
+	configs   map[int]map[string]any
+	nodes     map[int]string
+	migrateFn func(c *mmClient) (*sdknodes.CreateQemuMigrateResponse, error)
+	waitErr   error
+	readErr   map[string]error
+	writes    []mmProtectionWrite
 }
 
 func newMMClient() *mmClient {
@@ -122,7 +123,6 @@ func (n *mmNodes) UpdateQemuConfig(
 ) error {
 	n.c.mu.Lock()
 	defer n.c.mu.Unlock()
-	n.c.writeAttempts++
 	vmid, _ := strconv.Atoi(vmidStr)
 	cfg, ok := n.c.configs[vmid]
 	if !ok || n.c.nodes[vmid] != node {
@@ -131,6 +131,9 @@ func (n *mmNodes) UpdateQemuConfig(
 	if params.Protection != nil {
 		cfg[paramProtection] = *params.Protection
 		n.c.writes = append(n.c.writes, mmProtectionWrite{node: node, on: *params.Protection})
+		if *params.Protection {
+			delete(n.c.readErr, node)
+		}
 	}
 	return nil
 }
@@ -262,24 +265,32 @@ func TestMigrateMoverToNode_RestoresProtectionWhereTheMoverLanded(t *testing.T) 
 	}
 }
 
-// TestMigrateMoverToNode_WarnsWhenTheMoverIsOnNeitherNode fails the migrate
-// call and leaves the mover's config on no member, or leaves the source node
-// unable to answer the config read. The restore sends nothing, because no
-// node is proven to hold the mover, and the WARN names both nodes and the
-// command that puts protection back.
-func TestMigrateMoverToNode_WarnsWhenTheMoverIsOnNeitherNode(t *testing.T) {
+// mmReadTimeout is a 500 that doesn't say the config is gone.
+var mmReadTimeout = &sdkerrors.APIError{HTTPCode: 500, Message: "got timeout"}
+
+// TestMigrateMoverToNode_FallsBackWhenNoReadPlacesTheMover fails the migrate
+// call in ways that leave no config read able to place the mover. The restore
+// then tries the source node, moves on to the target only when the source
+// answers that the config is missing, and stops at the first write whose
+// readback shows protection on.
+func TestMigrateMoverToNode_FallsBackWhenNoReadPlacesTheMover(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		migrate func(c *mmClient) (*sdknodes.CreateQemuMigrateResponse, error)
+		want    mmProtectionWrite
 	}{
-		{"config on no member", func(c *mmClient) (*sdknodes.CreateQemuMigrateResponse, error) {
-			c.moveTo("")
-			return nil, errors.New("migration response lost")
-		}},
+		// The mover stayed on the source, which can't answer the locate read.
 		{"source read fails", func(c *mmClient) (*sdknodes.CreateQemuMigrateResponse, error) {
-			c.readErr = map[string]error{mmSource: &sdkerrors.APIError{HTTPCode: 500, Message: "got timeout"}}
+			c.readErr = map[string]error{mmSource: mmReadTimeout}
 			return nil, errors.New("migration response lost")
-		}},
+		}, mmProtectionWrite{node: mmSource, on: true}},
+		// The mover reached the target, which can't answer the probe, so the
+		// source write answers config-missing and the target write succeeds.
+		{"source answers config-missing", func(c *mmClient) (*sdknodes.CreateQemuMigrateResponse, error) {
+			c.moveTo(mmTarget)
+			c.readErr = map[string]error{mmTarget: mmReadTimeout}
+			return nil, errors.New("migration response lost")
+		}, mmProtectionWrite{node: mmTarget, on: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newMMClient()
@@ -288,25 +299,50 @@ func TestMigrateMoverToNode_WarnsWhenTheMoverIsOnNeitherNode(t *testing.T) {
 			if migErr == nil || !strings.Contains(migErr.Error(), "migrate mover vmid") {
 				t.Fatalf("migrateMoverToNode = %v, want the failed migrate call", migErr)
 			}
-			// The protection-off write before the migration is the only write.
-			if c.writeAttempts != 1 || len(c.writes) != 1 || c.writes[0].on {
-				t.Fatalf("protection writes = %+v after %d attempts, want only the write that cleared it",
-					c.writes, c.writeAttempts)
+			want := []mmProtectionWrite{{node: mmSource, on: false}, tc.want}
+			if len(c.writes) != len(want) || c.writes[0] != want[0] || c.writes[1] != want[1] {
+				t.Fatalf("protection writes = %+v, want %+v", c.writes, want)
 			}
-			lines := mmWarnings(logged)
-			if len(lines) != 1 {
-				t.Fatalf("logged %d protection warnings, want one: %s", len(lines), logged)
+			if !ConfigFlag(c.configs[mmMoverVMID], paramProtection) {
+				t.Fatal("the mover's protection is off after the restore")
 			}
-			for _, want := range []string{
-				"protection restore on mover 90000 was not sent",
-				"node " + mmSource + " or node " + mmTarget,
-				"qm set 90000 --protection 1",
-			} {
-				if !strings.Contains(lines[0], want) {
-					t.Errorf("the warning lacks %q: %s", want, lines[0])
-				}
+			if lines := mmWarnings(logged); len(lines) != 0 {
+				t.Fatalf("the restore warned: %v", lines)
 			}
 		})
+	}
+}
+
+// TestMigrateMoverToNode_WarnsWhenTheMoverIsOnNeitherNode fails the migrate
+// call and leaves the mover's config on no member. Both restore writes answer
+// that the config is missing, so nothing lands, and the WARN names the nodes
+// the restore tried and the command that puts protection back.
+func TestMigrateMoverToNode_WarnsWhenTheMoverIsOnNeitherNode(t *testing.T) {
+	c := newMMClient()
+	c.migrateFn = func(c *mmClient) (*sdknodes.CreateQemuMigrateResponse, error) {
+		c.moveTo("")
+		return nil, errors.New("migration response lost")
+	}
+	logged, migErr := mmMigrate(t, c)
+	if migErr == nil || !strings.Contains(migErr.Error(), "migrate mover vmid") {
+		t.Fatalf("migrateMoverToNode = %v, want the failed migrate call", migErr)
+	}
+	// The protection-off write before the migration is the only one that
+	// landed.
+	if len(c.writes) != 1 || c.writes[0].on {
+		t.Fatalf("protection writes = %+v, want only the write that cleared it", c.writes)
+	}
+	lines := mmWarnings(logged)
+	if len(lines) != 1 {
+		t.Fatalf("logged %d protection warnings, want one: %s", len(lines), logged)
+	}
+	for _, want := range []string{
+		"protection restore on mover 90000 did not succeed on node(s) " + mmSource + ", " + mmTarget,
+		"qm set 90000 --protection 1",
+	} {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("the warning lacks %q: %s", want, lines[0])
+		}
 	}
 }
 

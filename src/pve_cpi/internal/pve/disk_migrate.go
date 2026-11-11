@@ -392,28 +392,85 @@ func migrateMoverToNode(
 // restoreMoverProtectionAfterMigrate puts protection back on a mover after its
 // migrate call or task failed, on the node whose config holds the mover. A
 // failed call can still have moved the mover, so the restore can't assume the
-// source node. When neither node is proven, it sends nothing and logs a WARN
-// that names both nodes and the command that puts protection back.
+// source node.
+//
+// When neither node is proven, the restore tries the source node and then the
+// target node. PVE refuses a write on a node the mover isn't on, with an
+// answer that says the config is missing, so a write on the wrong node changes
+// nothing. The restore moves on to the target only after that answer, and it
+// stops at the first write whose readback shows protection on. When no node
+// succeeds, it logs one WARN that names the nodes it tried and the command
+// that puts protection back.
 func restoreMoverProtectionAfterMigrate(
 	ctx context.Context, c Client, logger *log.Logger, mover DiskHolder, targetNode string,
 ) {
-	node, err := locateMoverAfterMigrate(ctx, c, logger, mover, targetNode)
-	if err == nil {
+	node, locateErr := locateMoverAfterMigrate(ctx, c, logger, mover, targetNode)
+	if locateErr == nil {
 		restoreParkerProtectionLogged(ctx, c, logger, "disk migrate", node, mover.VMID, moverLockCheck)
 		return
+	}
+	tried := make([]string, 0, 2)
+	ending := ""
+	var lastErr error
+	for _, candidate := range []string{mover.Node, targetNode} {
+		tried = append(tried, candidate)
+		timedOut, protErr := putParkerProtectionBack(ctx, c, logger, candidate, mover.VMID)
+		if protErr == nil {
+			lastErr = moverProtectionReadsBack(ctx, c, logger, candidate, mover.VMID)
+			if lastErr == nil {
+				return
+			}
+			break
+		}
+		lastErr = protErr
+		if !parkerConfigGone(protErr) {
+			ending = protectionRestoreEnding(protErr, timedOut, parkerRestoreTimeout(ctx))
+			break
+		}
 	}
 	if logger == nil {
 		return
 	}
-	logger.Warn(fmt.Sprintf("disk migrate: protection restore on mover %d was not sent because the mover was not "+
-		"found on node %s or node %s after its migration failed, so protection may still be off; find the mover "+
-		"with qm config %d on each node, and if protection is off, %srun qm set %d --protection 1",
-		mover.VMID, mover.Node, targetNode, mover.VMID, moverLockCheck, mover.VMID),
+	detail := ""
+	if ending != "" {
+		detail = fmt.Sprintf("; the restore on node %s %s", tried[len(tried)-1], ending)
+	}
+	logger.Warn(fmt.Sprintf("disk migrate: protection restore on mover %d did not succeed on node(s) %s after its "+
+		"migration failed, and no config read placed the mover%s; find the mover with qm config %d on each node, "+
+		"and if protection is off, %srun qm set %d --protection 1",
+		mover.VMID, strings.Join(tried, ", "), detail, mover.VMID, moverLockCheck, mover.VMID),
 		log.Int("mover_vmid", mover.VMID),
 		log.String("source_node", mover.Node),
 		log.String("target_node", targetNode),
-		log.Err(err),
+		log.String("tried_nodes", strings.Join(tried, ",")),
+		log.String("locate_error", log.ScrubMessage(locateErr.Error())),
+		log.Err(lastErr),
 	)
+}
+
+// moverProtectionReadsBack reads the mover's config on node after a restore
+// and returns an error unless it shows protection on. Like the restore, the
+// read outlives the request, bounded by the restore timeout.
+func moverProtectionReadsBack(ctx context.Context, c Client, logger *log.Logger, node string, vmid int) error {
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), parkerRestoreTimeout(ctx))
+	defer cancel()
+	qemuSvc := c.QEMU()
+	if qemuSvc == nil {
+		return fmt.Errorf("qemu service not available")
+	}
+	var cfg map[string]any
+	err := RetryOnTransient(readCtx, logger, "disk_migrate_protection_readback", 0, func() error {
+		var inner error
+		cfg, inner = qemuSvc.Config(readCtx, node, vmid)
+		return inner
+	})
+	if err != nil {
+		return fmt.Errorf("read back mover vmid %d on node %s after the protection restore: %w", vmid, node, err)
+	}
+	if !ConfigFlag(cfg, paramProtection) {
+		return fmt.Errorf("mover vmid %d on node %s reads back with protection off after the restore", vmid, node)
+	}
+	return nil
 }
 
 // locateMoverAfterMigrate returns the node whose config holds the mover after
