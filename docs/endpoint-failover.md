@@ -628,21 +628,21 @@ When an endpoint cache exists, it holds the down marks, and it can hold more tha
 
 Two things share that directory and are safe to lose. The first is the directory secret, which the CPI recreates, and every cache file written under the old one is rebuilt. The second is the HA recovery episode record. Losing it restarts the grace clock for a VM that is in HA recovery, which only delays the handover to BOSH. That record is written even when discovery is off, so the directory can exist on a deployment that discovers nothing.
 
-## Rolling back to 0.9.6
+## Rolling back to 0.9.7
 
-The release that rolls back cleanly is 0.9.6, and a rollback to it meets these facts.
+The release that rolls back cleanly is 0.9.7, and a rollback to it meets these facts.
 
 - A manifest without `pve.host` does not render
-  The 0.9.6 template reads `pve.host` with no default, so a manifest that relies on `pve.endpoints` alone fails at deploy time. Keep `pve.host` set alongside `pve.endpoints` until the new release has settled. The agreement rule allows that.
+  The 0.9.7 template reads `pve.host` with no default, so a manifest that relies on `pve.endpoints` alone fails at deploy time. Keep `pve.host` set alongside `pve.endpoints` until the new release has settled. The agreement rule allows that.
 
 - New keys in a `cpi_config` entry break that entry
-  The 0.9.6 release does not know `pve_endpoints` or `pve_api_endpoint_discovery`, so it rejects every call routed through that entry with `context carries ... which the pve_cpi job spec does not define; check the spelling`. That takes the whole AZ down. Keep the new keys out of `cpi_config` entries until the release has settled, or remove them from the CPI config before you roll back.
+  The 0.9.7 release does not know `pve_endpoints` or `pve_api_endpoint_discovery`, so it rejects every call routed through that entry with `context carries ... which the pve_cpi job spec does not define; check the spelling`. That takes the whole AZ down. Keep the new keys out of `cpi_config` entries until the release has settled, or remove them from the CPI config before you roll back.
 
 - Job-level properties are harmless
-  The 0.9.6 job spec does not define `pve.endpoints`, `pve.api_endpoint_discovery`, or `pve.endpoint_cache_dir`, so its template never reads them.
+  The 0.9.7 job spec does not define `pve.endpoints`, `pve.api_endpoint_discovery`, or `pve.endpoint_cache_dir`, so its template never reads them.
 
 - Cache files stay behind
-  The 0.9.6 release never reads them. Files in the temporary directory disappear with the ephemeral disk, and the `endpoint-cache` directory beside a journal stays on the persistent disk, where 0.9.6 never looks at it. You can delete either one. If you upgrade again with the same credential, any files that remain are still valid, though the sweep that removes files unmodified for 30 days may already have taken some of them.
+  The 0.9.7 release never reads them. Files in the temporary directory disappear with the ephemeral disk, and the `endpoint-cache` directory beside a journal stays on the persistent disk, where 0.9.7 never looks at it. You can delete either one. If you upgrade again with the same credential, any files that remain are still valid, though the sweep that removes files unmodified for 30 days may already have taken some of them.
 
 ## Log lines
 

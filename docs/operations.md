@@ -1013,7 +1013,7 @@ We still cycle one node at a time, and we wait for the cluster to be quorate bef
 
 ### Rolling back below endpoint lists
 
-Rolling back to 0.9.6 from the release that adds endpoint lists meets four facts, and we deal with the first two before we start.
+Rolling back to 0.9.7 from the release that adds endpoint lists meets four facts, and we deal with the first two before we start.
 
 1. A manifest without `pve.host` does not render on the older release.
 
