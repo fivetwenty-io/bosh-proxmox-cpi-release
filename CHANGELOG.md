@@ -32,6 +32,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - The CPI is now built with Go 1.27.4, which fixes GO-2026-6859 in `net/http`. govulncheck reported it against the Go 1.27.3 standard library. The `golang-1.27` package now carries `go1.27.4.linux-amd64.tar.gz`, and CI runs in the matching `golang:1.27` image.
 
+- `golang.org/x/net` moves from v0.61.0 to v0.62.0 to fix CVE-2026-78661, a denial of service in its HTML parser. The CPI's own code doesn't change.
+
 ## [0.9.6] - 2026-11-11
 
 ### Changed
