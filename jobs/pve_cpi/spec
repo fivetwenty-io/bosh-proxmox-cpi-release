@@ -111,6 +111,8 @@ properties:
       contain pve.storage_allocation_journal_dir either, because the journal
       scans its own tree. This setting is process-level, like the journal
       directory, so a cpi-config entry cannot change it.
+
+      Do not set pve.storage_allocation_journal_dir only to give the cache a durable home. Setting the journal directory turns on the allocation journal, so it also needs pve.storage_placement_namespace and an enrolled namespace, and without them create_vm and delete_vm refuse. Set this property instead for a durable cache without a journal.
   pve.user:
     description: |
       PVE username. Required with password. An API token already names its
@@ -2434,6 +2436,8 @@ properties:
       Stable nonblank allocation authority required for set-enabled allocation.
       Keep it unchanged across process restarts and API endpoint alias changes.
 
+      Setting it turns on the allocation journal, so it also needs pve.storage_allocation_journal_dir and an enrollment of the namespace. The job refuses to render a namespace without a journal directory, and the CPI refuses to load one, because the directory is process-level and no cpi-config entry can supply it.
+
   pve.storage_allocation_journal_dir:
     description: |
       Absolute durable directory required for set-enabled allocation. Use
@@ -2452,6 +2456,8 @@ properties:
       gets the directory created beside it. A journal directory that is
       itself named endpoint-cache has no such neighbor. The cache directory
       may not equal, sit inside, or contain this directory.
+
+      Setting it turns on the allocation journal, so it also needs pve.storage_placement_namespace, from the job or from a cpi-config entry, and an enrollment of that namespace. Without them create_vm and delete_vm refuse. Use pve.endpoint_cache_dir for a durable endpoint cache without a journal.
 
   pve.require_disjoint_storage_sets:
     description: |
