@@ -1,6 +1,7 @@
 package endpointcache
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -172,8 +173,8 @@ func TestMountOfTellsABindMountFromItsSource(t *testing.T) {
 	}
 	dir := t.TempDir()
 	// #nosec G204 -- the test binary runs itself with a fixed test name
-	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestMountOfTellsABindMountFromItsSource$", "-test.count=1",
-		"-test.v")
+	cmd := exec.CommandContext(context.WithoutCancel(t.Context()), os.Args[0],
+		"-test.run=^TestMountOfTellsABindMountFromItsSource$", "-test.count=1", "-test.v")
 	cmd.Env = append(os.Environ(), bindMountDirEnv+"="+dir)
 	attr := &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
 	if os.Geteuid() != 0 {

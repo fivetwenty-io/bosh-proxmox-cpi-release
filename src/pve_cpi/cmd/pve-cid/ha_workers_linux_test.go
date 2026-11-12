@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,7 +68,7 @@ func TestBPMWorkerViewSeesTheWorkersMounts(t *testing.T) {
 	}
 
 	// #nosec G204 -- the test binary runs itself with a fixed test name
-	cmd := exec.CommandContext(t.Context(), os.Args[0],
+	cmd := exec.CommandContext(context.WithoutCancel(t.Context()), os.Args[0],
 		"-test.run=^TestBPMWorkerViewSeesTheWorkersMounts$", "-test.count=1")
 	cmd.Env = append(os.Environ(), workerDirEnv+"="+dir)
 	attr := &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
