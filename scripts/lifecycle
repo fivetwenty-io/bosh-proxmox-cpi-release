@@ -1706,11 +1706,12 @@ def main() -> int:
     try:
         # Out-of-band PVE verifier (same host+auth as the CPI binary). A run
         # that cannot reach PVE to verify must not be able to report success.
-        verifier = _pve_verify.PVEVerifier.from_config_file(CPI_CONFIG)
+        verify_cfg = _base_cfg
         if DEFAULT_CONTEXT:
             # A context file can point the run at another cluster, and the
             # out-of-band checks must read the cluster the CPI is writing to.
-            verifier = _pve_verify.PVEVerifier(_lifecycle_foreign.verifier_config(_base_cfg, DEFAULT_CONTEXT))
+            verify_cfg = _lifecycle_foreign.verifier_config(_base_cfg, DEFAULT_CONTEXT)
+        verifier = _pve_verify.PVEVerifier(verify_cfg)
         if DISK_MIGRATION_TEST == "on" and DISK_MIGRATION_SHARED_STORAGE:
             # Step 11r runs only on the pve-cpi lab. Checking here as well as
             # in the pass stops a run aimed elsewhere before it creates anything.
