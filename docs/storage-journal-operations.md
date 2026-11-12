@@ -181,7 +181,13 @@ cpi storage-journal settle-migration \
   --remote-tasks-settled
 ```
 
-Every flag is required. `--step-id` and `--task-upid` belong to this action alone, and the other actions refuse them. On a Director we run the command as `vcap`, with the full path shown under [Inspect retained allocations](#inspect-retained-allocations).
+Every flag is required. The command takes exactly `--config`, `--allocation-id`, `--decision-id`, `--expected-cid`, `--step-id`, `--task-upid`, `--previous-writer-fenced`, and `--remote-tasks-settled`. `--step-id` and `--task-upid` belong to this action alone, and the other actions refuse them. In the other direction, the command refuses every other storage-journal flag, such as `--authority-id`, `--agent-id`, `--summary`, or the `--recovered-task-*` flags, even when its value is empty or false, so no one believes it recorded something it did not. The refusal exits 2 and names the flags, as in the following example.
+
+```text
+settle-migration does not take --agent-id; it takes only --config, --allocation-id, --decision-id, --expected-cid, --step-id, --task-upid, --previous-writer-fenced, and --remote-tasks-settled, so remove the others and rerun
+```
+
+We remove the extra flags and run the command again. On a Director we run the command as `vcap`, with the full path shown under [Inspect retained allocations](#inspect-retained-allocations).
 
 ### What it checks
 
@@ -209,7 +215,7 @@ The command checks everything below before it saves anything, and any failed che
 
 ### What it refuses
 
-A refused run prints the reason and exits 1.
+A refused run prints the reason and exits 1, except for an unused flag, which exits 2 as described above.
 
 ```text
 allocation decision refused (<class>: <reason>); inspect settled outcome, identity and audit evidence
@@ -221,6 +227,18 @@ Besides the failed checks above, the command refuses a few cases on purpose.
 
   A step that carries a capacity charge on the target's storage copied the disk to the target's own storage. The command refuses it with `settle-migration does not settle a copy-local migration`, because a settlement must also prove that the source volume is gone, and this action does not.
 
+- A step that is already observed with that UPID
+
+  The command refuses it with a message that there is nothing to settle. This is what a rerun after a settlement whose output was lost sees, so we inspect the record instead.
+
+- A step that is not in the record's open attempt
+
+  A step from an earlier attempt is refused, and so is any step of an attempt that has already completed.
+
+- A step whose target is external
+
+  A step must record a managed mover, node, volume, and backing for the command to observe. A step that targets an external VM does not, so the command refuses it.
+
 - A target that still holds `lock: migrate`
 
   The refusal is retriable. We wait until the lock clears and run the command again.
@@ -231,7 +249,7 @@ Besides the failed checks above, the command refuses a few cases on purpose.
 
 ### The success output
 
-On success the command prints one JSON object with the keys below, and it saves the same evidence in the record as a verification.
+On success the command prints one JSON object with the keys below, and it saves the same evidence, with the time of the observation, in the record as a verification. That verification proves neither ownership nor absence, so it never reconciles the record by itself.
 
 | Key | Meaning |
 |---|---|
