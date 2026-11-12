@@ -165,6 +165,9 @@ type haCollector struct {
 	// euid is the doctor's own effective user, which the cache directory
 	// checks compare with the CPI's user.
 	euid int
+	// workers, when set, replaces systemWorkers, so a test can say where the
+	// Director runs its workers.
+	workers func() workerLayout
 }
 
 // collectHA reads the cluster r reaches and builds the doctor's report. cfg is
@@ -1371,29 +1374,27 @@ func (c *haCollector) cacheFindingsAs(j cacheJudge) {
 	}
 }
 
-// mountCaveat is what every finding that says the CPI creates a directory adds,
-// because the CPI may run in a BPM mount namespace that this check cannot see.
-// anchor names the directory whose mount the parent must share. Under BPM each
-// volume is a bind mount with its own mount ID, even when every volume sits on
-// one disk, so sharing the host's mount is not enough there.
-func mountCaveat(anchor string) string {
-	return "this check sees the host's mounts, and under BPM each volume the worker sees, such as " +
-		"/var/vcap/store/director or an entry in director.cpi_additional_volumes, is a mount of its own even " +
-		"when it sits on the same disk, so there the CPI creates it only when its parent directory sits inside " +
-		"the same volume as " + anchor
-}
-
 // siblingCreation reports a missing directory beside the allocation journal,
 // with what the CPI does about it. choice is the doctor's probe of the layers
 // with no override.
 func (c *haCollector) siblingCreation(choice endpointcache.Choice, j cacheJudge) {
 	if choice.Layer == endpointcache.LayerJournal && createdOnFirstUse(choice) {
+		journal := filepath.Clean(c.cfg.StorageAllocationJournalDir)
+		reason, caveat := j.workerSide(filepath.Dir(choice.Path), journal, "the allocation journal directory")
+		if reason != "" {
+			c.rep.advise(haKindCacheDirectory, choice.Path,
+				"%s does not exist, and the CPI does not create it because %s, so the cache and the HA recovery "+
+					"episode record use %s instead; list the journal's parent directory in "+
+					"director.cpi_additional_volumes with writable: true and mount_only: true, so the workers see "+
+					"the journal and the cache on one mount%s", cacheDirectoryName(endpointcache.LayerJournal),
+				reason, ha.FallbackDescription(endpointcache.LayerTemporary), j.judgedAsNote())
+			return
+		}
 		c.rep.advise(haKindCacheDirectory, choice.Path,
 			"%s does not exist, and the CPI creates it with mode 0700 on first use, because its parent "+
 				"directory belongs to uid %d, which the CPI runs as, and sits on the same mount as the allocation "+
-				"journal directory; %s; cpi provision-journal also creates it%s",
-			cacheDirectoryName(endpointcache.LayerJournal), j.uid, mountCaveat("the allocation journal directory"),
-			j.judgedAsNote())
+				"journal directory%s; cpi provision-journal also creates it%s",
+			cacheDirectoryName(endpointcache.LayerJournal), j.uid, caveatClause(caveat), j.judgedAsNote())
 		return
 	}
 	for _, declined := range choice.Declined {
@@ -1445,13 +1446,15 @@ type cacheJudge struct {
 	// bpmStore, when set, replaces defaultBPMStore, so a test can lay out
 	// BPM volumes under its own directory.
 	bpmStore string
+	// workers says where the Director runs the workers that run the CPI.
+	workers workerLayout
 }
 
 // cacheJudge returns the judge for this run. The owner of the allocation
 // journal directory is the CPI's user when the config names a journal that
 // exists, and the doctor's own user stands in for it otherwise.
 func (c *haCollector) cacheJudge() cacheJudge {
-	j := cacheJudge{uid: c.euid, doctor: c.euid}
+	j := cacheJudge{uid: c.euid, doctor: c.euid, workers: c.workerLayout()}
 	journal := c.cfg.StorageAllocationJournalDir
 	if journal == "" {
 		return j
@@ -1491,68 +1494,41 @@ func (j cacheJudge) judgedAsNote() string {
 }
 
 // overrideCreation says what the CPI does with a pve.endpoint_cache_dir that
-// does not exist. creates is true when it creates the directory. Otherwise
-// reason says why it does not, or is empty when the check cannot tell, which is
-// when no journal directory names the CPI's user and the doctor cannot see the
-// CPI's temporary directory, whose mount decides it. A parent that the host
-// puts on the journal's mount but that BPM mounts as another volume is a
-// reason too, because the CPI on a Director runs under BPM.
-func (j cacheJudge) overrideCreation(dir endpointcache.DirOptions) (creates bool, reason string) {
+// does not exist. creates is true when it creates the directory, and caveat is
+// then what the finding adds about the workers' mounts. Otherwise reason says
+// why it does not, or is empty when the check cannot tell, which is when no
+// journal directory names the CPI's user and the doctor cannot see the CPI's
+// temporary directory, whose mount decides it. A parent that the host puts on
+// the journal's mount but that a BPM worker sees on another is a reason too,
+// when the doctor knows the workers run under BPM. When it cannot tell, the
+// caveat says what happens under BPM.
+func (j cacheJudge) overrideCreation(dir endpointcache.DirOptions) (creates bool, reason, caveat string) {
 	if dir.JournalDir == "" && !j.checksTemporary() {
-		return false, ""
+		return false, "", ""
 	}
 	choice := dir.ProbeAs(j.uid)
 	defer func() { _ = choice.Close() }()
 	if createdOnFirstUse(choice) {
+		anchor, what := "", "the CPI's temporary directory"
 		if dir.JournalDir != "" {
-			split := j.bpmVolumeSplit(filepath.Dir(dir.Override), filepath.Clean(dir.JournalDir))
-			if split != "" {
-				return false, split
-			}
+			anchor, what = filepath.Clean(dir.JournalDir), "the allocation journal directory"
 		}
-		return true, ""
+		reason, caveat := j.workerSide(filepath.Dir(dir.Override), anchor, what)
+		return reason == "", reason, caveat
 	}
 	var notCreated *endpointcache.NotCreatedError
 	if choice.Err != nil && errors.As(choice.Err, &notCreated) {
-		return false, notCreated.Reason.Error()
+		return false, notCreated.Reason.Error(), ""
 	}
-	return false, ""
+	return false, "", ""
 }
 
-// defaultBPMStore is the directory below which BPM mounts the Director's own
-// persistent directory and each store volume as a mount of its own.
-const defaultBPMStore = "/var/vcap/store"
-
-// bpmVolumeSplit returns why a CPI under BPM does not create a directory in
-// parent although the host's mounts say it would, or an empty string when
-// nothing shows that. BPM mounts each volume below /var/vcap/store as its own
-// bind mount and never mounts /var/vcap/store itself, so a parent outside the
-// directory just below the store that holds the anchor sits on another mount
-// inside the worker, even when this host puts both on one disk.
-func (j cacheJudge) bpmVolumeSplit(parent, anchor string) string {
-	store := j.bpmStore
-	if store == "" {
-		store = defaultBPMStore
-	}
-	volume := storeVolume(store, anchor)
-	if volume == "" || storeVolume(store, parent) == volume {
+// caveatClause joins a non-empty caveat onto a finding as a clause of its own.
+func caveatClause(caveat string) string {
+	if caveat == "" {
 		return ""
 	}
-	return fmt.Sprintf("its parent directory %s is outside %s, which holds the allocation journal directory, and "+
-		"BPM mounts each volume below %s, such as %s/director or an entry in director.cpi_additional_volumes, "+
-		"as a mount of its own, so inside a BPM worker the two are on different mounts although this host shows "+
-		"one", parent, volume, store, store)
-}
-
-// storeVolume returns the directory just below store that holds path, or an
-// empty string when path is store itself or lies outside it.
-func storeVolume(store, path string) string {
-	rel, err := filepath.Rel(store, path)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return ""
-	}
-	first, _, _ := strings.Cut(rel, string(filepath.Separator))
-	return filepath.Join(store, first)
+	return "; " + caveat
 }
 
 // probe chooses the cache directory for dir as the CPI's user would, as far
@@ -1737,25 +1713,30 @@ func (c *haCollector) missingOverride(path string, dir endpointcache.DirOptions,
 			return
 		}
 	}
-	creates, reason := j.overrideCreation(dir)
+	creates, reason, caveat := j.overrideCreation(dir)
 	if creates {
-		anchor, volume := "the allocation journal directory", "the allocation journal directory"
+		anchor := "the allocation journal directory"
 		if dir.JournalDir == "" {
 			// The doctor judged against its own temporary directory, which
 			// stands for the CPI's only when the two name the same place.
 			anchor = fmt.Sprintf("this check's temporary directory, %s, which answers for the CPI only when "+
 				"the CPI's TMPDIR names the same directory", os.TempDir())
-			volume = "the CPI's temporary directory"
 		}
 		c.rep.advise(haKindCacheDirectory, path,
 			"pve.endpoint_cache_dir does not exist, and the CPI creates it with mode 0700 on first use, because "+
-				"its parent directory belongs to uid %d, which the CPI runs as, and sits on the same mount as %s; "+
-				"%s; the HA recovery episode record then sits in it, so a grace window that is running restarts "+
-				"once%s", j.uid, anchor, mountCaveat(volume), j.judgedAsNote())
+				"its parent directory belongs to uid %d, which the CPI runs as, and sits on the same mount as %s%s; "+
+				"the HA recovery episode record then sits in it, so a grace window that is running restarts "+
+				"once%s", j.uid, anchor, caveatClause(caveat), j.judgedAsNote())
 		return
 	}
 	missing := "pve.endpoint_cache_dir does not exist"
 	switch {
+	case reason != "" && dir.JournalDir == "":
+		// The doctor judged against its own temporary directory, whose owner
+		// and mount stand for the CPI's only when the two name the same place.
+		missing += fmt.Sprintf(", and the CPI does not create it because %s%s; this check used its own "+
+			"temporary directory, %s, which answers for the CPI only when the CPI's TMPDIR names the same "+
+			"directory,", reason, j.judgedAsNote(), os.TempDir())
 	case reason != "":
 		missing += ", and the CPI does not create it because " + reason + j.judgedAsNote() + ","
 	default:

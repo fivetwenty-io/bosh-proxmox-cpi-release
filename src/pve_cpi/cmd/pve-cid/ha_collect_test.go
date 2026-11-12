@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1077,9 +1078,28 @@ func TestCacheOwnerNoteSaysWhoRanTheCheck(t *testing.T) {
 // cacheFindingsAs runs the cache directory checks for cfg with the doctor
 // running as doctor.
 func cacheFindingsAs(cfg *config.CPIConfig, doctor int) *haReport {
-	c := &haCollector{cfg: cfg, euid: doctor, rep: &haReport{Findings: []haFinding{}}}
+	c := &haCollector{cfg: cfg, euid: doctor, rep: &haReport{Findings: []haFinding{}}, workers: unknownWorkers}
 	c.cacheDirectoryFindings()
 	return c.rep
+}
+
+// unknownWorkers is a host with no Director job to say where its workers run.
+func unknownWorkers() workerLayout { return workerLayout{} }
+
+// judgeWorkers returns a collector for cfg and its judge, with the Director's
+// workers laid out as layout and BPM's store at store.
+func judgeWorkers(cfg *config.CPIConfig, doctor int, store string, layout workerLayout) (*haCollector, cacheJudge) {
+	c := &haCollector{cfg: cfg, euid: doctor, rep: &haReport{Findings: []haFinding{}},
+		workers: func() workerLayout { return layout }}
+	j := c.cacheJudge()
+	j.bpmStore = store
+	return c, j
+}
+
+// fakeWorker is a look inside a BPM worker that always finds found, or fails
+// with err.
+func fakeWorker(found workerMount, err error) func(string, string) (workerMount, error) {
+	return func(string, string) (workerMount, error) { return found, err }
 }
 
 // otherDoctor is a user the test process is not, standing in for the doctor
@@ -1240,58 +1260,148 @@ func TestCollectSaysWhetherTheCPICreatesAMissingDirectory(t *testing.T) {
 			"it would be made by uid "+itoa(os.Geteuid()+1))
 	})
 
-	t.Run("override in another BPM volume is not created", func(t *testing.T) {
-		store := t.TempDir()
+	// storeLayout lays out a store with the journal in pve_cpi and the
+	// Director's own directory beside it, as a Director does on one disk.
+	storeLayout := func(t *testing.T) (store, journal string) {
+		store = t.TempDir()
 		for _, dir := range []string{"pve_cpi", "director"} {
 			makeDir(t, filepath.Join(store, dir))
 		}
-		journal := filepath.Join(store, "pve_cpi", "allocations")
+		journal = filepath.Join(store, "pve_cpi", "allocations")
 		makeDir(t, journal)
-		override := filepath.Join(store, "director", "pve-cache")
+		return store, journal
+	}
+	overrideCfg := func(journal, override string) *config.CPIConfig {
 		cfg := haCfg("auto", "none")
 		cfg.StorageAllocationJournalDir = journal
 		cfg.EndpointCacheDir = override
-		c := &haCollector{cfg: cfg, euid: doctor, rep: &haReport{Findings: []haFinding{}}}
-		j := c.cacheJudge()
-		j.bpmStore = store
-		c.cacheFindingsAs(j)
-		want(t, c.rep, haKindCacheDirectory, haSeverityAdvice, override,
-			"does not create it because its parent directory "+filepath.Join(store, "director")+" is outside "+
-				filepath.Join(store, "pve_cpi"), "a mount of its own", "although this host shows one")
-		for _, f := range findings(c.rep, haKindCacheDirectory) {
+		return cfg
+	}
+	notCreated := func(t *testing.T, r *haReport, override string, fragments ...string) {
+		t.Helper()
+		want(t, r, haKindCacheDirectory, haSeverityAdvice, append([]string{override}, fragments...)...)
+		for _, f := range findings(r, haKindCacheDirectory) {
 			if strings.Contains(f.Detail, "creates it with mode 0700") {
-				t.Errorf("the finding says the CPI creates a directory BPM puts on another mount: %+v", f)
+				t.Errorf("the finding says the CPI creates a directory its workers see on another mount: %+v", f)
 			}
 		}
 		if _, err := os.Lstat(override); !os.IsNotExist(err) {
 			t.Errorf("the doctor created the directory: %v", err)
 		}
+	}
+
+	t.Run("override in another BPM volume is not created", func(t *testing.T) {
+		store, journal := storeLayout(t)
+		override := filepath.Join(store, "director", "pve-cache")
+		c, j := judgeWorkers(overrideCfg(journal, override), doctor, store, workerLayout{mode: workersUnderBPM})
+		c.cacheFindingsAs(j)
+		notCreated(t, c.rep, override, "does not create it because the Director runs its workers under BPM, and "+
+			"its parent directory "+filepath.Join(store, "director")+" is outside "+filepath.Join(store, "pve_cpi"),
+			"a mount of its own", "although this host shows one")
 
 		inside := filepath.Join(store, "pve_cpi", "pve-cache")
-		cfg.EndpointCacheDir = inside
-		c = &haCollector{cfg: cfg, euid: doctor, rep: &haReport{Findings: []haFinding{}}}
-		j = c.cacheJudge()
-		j.bpmStore = store
+		c, j = judgeWorkers(overrideCfg(journal, inside), doctor, store, workerLayout{mode: workersUnderBPM})
 		c.cacheFindingsAs(j)
 		want(t, c.rep, haKindCacheDirectory, haSeverityAdvice, inside, "creates it with mode 0700 on first use",
+			"the Director runs its workers under BPM",
 			"inside the same volume as the allocation journal directory")
 	})
-}
 
-func TestStoreVolumeNamesTheDirectoryJustBelowTheStore(t *testing.T) {
-	t.Parallel()
-	cases := map[string]string{
-		"/var/vcap/store/director/pve-cache": "/var/vcap/store/director",
-		"/var/vcap/store/pve_cpi":            "/var/vcap/store/pve_cpi",
-		"/var/vcap/store":                    "",
-		"/var/vcap/storefront/x":             "",
-		"/var/vcap/data/director/tmp":        "",
-	}
-	for path, want := range cases {
-		if got := storeVolume("/var/vcap/store", path); got != want {
-			t.Errorf("storeVolume(%s) = %q, want %q", path, got, want)
+	// Outside BPM the workers see the host's mounts, so the volume rule does
+	// not apply and nothing about BPM is said.
+	t.Run("override beside the journal's volume is created when the workers run outside BPM", func(t *testing.T) {
+		store, journal := storeLayout(t)
+		override := filepath.Join(store, "director", "pve-cache")
+		c, j := judgeWorkers(overrideCfg(journal, override), doctor, store, workerLayout{mode: workersOnHost})
+		c.cacheFindingsAs(j)
+		want(t, c.rep, haKindCacheDirectory, haSeverityAdvice, override, "creates it with mode 0700 on first use",
+			"same mount as the allocation journal directory; the HA recovery episode record")
+		if got := findings(c.rep, haKindCacheDirectory)[0].Detail; strings.Contains(got, "BPM") {
+			t.Errorf("with the workers outside BPM the finding must not talk about BPM: %q", got)
 		}
-	}
+	})
+
+	// When the doctor cannot tell where the workers run, it says what happens
+	// in both cases.
+	t.Run("override in another BPM volume is described for both cases when the workers are unknown",
+		func(t *testing.T) {
+			store, journal := storeLayout(t)
+			override := filepath.Join(store, "director", "pve-cache")
+			c, j := judgeWorkers(overrideCfg(journal, override), doctor, store, workerLayout{})
+			c.cacheFindingsAs(j)
+			want(t, c.rep, haKindCacheDirectory, haSeverityAdvice, override,
+				"creates it with mode 0700 on first use", "cannot tell whether the Director runs its workers "+
+					"under BPM", "director.use_bpm_for_workers is true", "if it does, the CPI does not create it, "+
+					"because its parent directory "+filepath.Join(store, "director")+" is outside",
+				"create it with mode 0700 for the CPI's user")
+		})
+
+	// A look inside a running worker decides over the volume rule, so an
+	// operator who lists the whole store as a volume gets the creation, and a
+	// worker that cannot see the parent at all is named.
+	t.Run("a look inside a running BPM worker decides", func(t *testing.T) {
+		store, journal := storeLayout(t)
+		override := filepath.Join(store, "director", "pve-cache")
+		cfg := overrideCfg(journal, override)
+
+		c, j := judgeWorkers(cfg, doctor, store, workerLayout{mode: workersUnderBPM,
+			inWorker: fakeWorker(workerSameMount, nil)})
+		c.cacheFindingsAs(j)
+		want(t, c.rep, haKindCacheDirectory, haSeverityAdvice, override, "creates it with mode 0700 on first use",
+			"same mount as the allocation journal directory; the HA recovery episode record")
+
+		c, j = judgeWorkers(cfg, doctor, store, workerLayout{mode: workersUnderBPM,
+			inWorker: fakeWorker(workerOtherMount, nil)})
+		c.cacheFindingsAs(j)
+		notCreated(t, c.rep, override, "inside a running worker its parent directory "+
+			filepath.Join(store, "director")+" is not on the same mount as the allocation journal directory "+journal)
+
+		c, j = judgeWorkers(cfg, doctor, store, workerLayout{mode: workersUnderBPM,
+			inWorker: fakeWorker(workerNoParent, nil)})
+		c.cacheFindingsAs(j)
+		notCreated(t, c.rep, override, "inside a running worker its parent directory "+
+			filepath.Join(store, "director")+" does not exist, because no volume the worker sees holds it")
+
+		// A worker that cannot be looked into leaves the volume rule.
+		c, j = judgeWorkers(cfg, doctor, store, workerLayout{mode: workersUnderBPM,
+			inWorker: fakeWorker(0, errors.New("permission denied"))})
+		c.cacheFindingsAs(j)
+		notCreated(t, c.rep, override, "is outside "+filepath.Join(store, "pve_cpi"))
+	})
+
+	// A journal directly below the store is a volume of its own under BPM, so
+	// the directory beside it, in the store itself, is not created there.
+	t.Run("directory beside a journal that is its own BPM volume is not created", func(t *testing.T) {
+		store := t.TempDir()
+		journal := filepath.Join(store, "allocations")
+		makeDir(t, journal)
+		sibling := filepath.Join(store, "endpoint-cache")
+		cfg := haCfg("auto", "none")
+		cfg.StorageAllocationJournalDir = journal
+		c, j := judgeWorkers(cfg, doctor, store, workerLayout{mode: workersUnderBPM})
+		c.cacheFindingsAs(j)
+		var found bool
+		for _, f := range findings(c.rep, haKindCacheDirectory) {
+			if f.Subject != sibling {
+				continue
+			}
+			found = true
+			for _, frag := range []string{"does not create it because the Director runs its workers under BPM",
+				"temporary cache directory instead", "mount_only: true"} {
+				if !strings.Contains(f.Detail, frag) {
+					t.Errorf("%+v, want it to mention %q", f, frag)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("no finding for %s: %+v", sibling, c.rep.Findings)
+		}
+
+		c, j = judgeWorkers(cfg, doctor, store, workerLayout{mode: workersUnderBPM,
+			inWorker: fakeWorker(workerSameMount, nil)})
+		c.cacheFindingsAs(j)
+		want(t, c.rep, haKindCacheDirectory, haSeverityAdvice, sibling, "creates it with mode 0700 on first use")
+	})
 }
 
 // With no journal to name the CPI's user, a directory that fails only because
