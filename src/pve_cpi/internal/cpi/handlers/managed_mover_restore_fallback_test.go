@@ -92,5 +92,12 @@ func TestManagedDiskMoverRestoreFallsBackToTheTargetUnderTheGuard(t *testing.T) 
 		if strings.Contains(line, `"level":"WARN"`) && strings.Contains(line, "protection restore on mover") {
 			t.Errorf("the restore warned that it did not succeed: %s", log.ScrubMessage(line))
 		}
+		// The source's answer that the config is gone is not a blocked
+		// mutation, so the guard must hand it to neither the Blocked hook nor
+		// the reconciliation WARN. Both WARNs say the allocation requires
+		// reconciliation, and this one is for a disk that is fine.
+		if strings.Contains(line, `"level":"WARN"`) && strings.Contains(line, "requires reconciliation") {
+			t.Errorf("the restore's fallback to the target logged a reconciliation WARN: %s", log.ScrubMessage(line))
+		}
 	}
 }
