@@ -216,7 +216,10 @@ func TestStoragePlacementDecodePreservesOmittedLegacyFields(t *testing.T) {
 
 func TestStoragePlacementContextIsolationAndReplacement(t *testing.T) {
 	t.Parallel()
-	base := decodeStoragePlacement(t, `{"storage_sets":{"e":`+placementSetJSON+`},"storage_capacity_domains":{"old":{"members":["nfs-e"]}},"ephemeral_storage_set":"e","storage_placement_namespace":"old","require_disjoint_storage_sets":false}`)
+	base := decodeStoragePlacement(t, `{"storage_sets":{"e":`+placementSetJSON+`},`+
+		`"storage_capacity_domains":{"old":{"members":["nfs-e"]}},"ephemeral_storage_set":"e",`+
+		`"storage_placement_namespace":"old","storage_allocation_journal_dir":"/var/vcap/store/pve_cpi/allocations",`+
+		`"require_disjoint_storage_sets":false}`)
 	var wg sync.WaitGroup
 	for _, name := range []string{"cluster-a", "cluster-b"} {
 		wg.Add(1)

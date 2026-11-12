@@ -4318,6 +4318,7 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	if err := c.ValidateStoragePlacement(); err != nil {
 		errs = append(errs, err.Error())
 	}
+	c.validateStorageJournalPair(&errs)
 	c.validateDiskPerformance(&errs)
 	c.validateVMPool(&errs)
 	c.validateStemcellTemplatePool(&errs)

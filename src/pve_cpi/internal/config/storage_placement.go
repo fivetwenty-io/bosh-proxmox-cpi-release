@@ -322,6 +322,33 @@ func (c *CPIConfig) ValidateStoragePlacementAllocation() error {
 	return nil
 }
 
+// StorageJournalPairError is the text config load and the job template give
+// a namespace that is set without a journal directory.
+const StorageJournalPairError = "pve.storage_placement_namespace is set but " +
+	"pve.storage_allocation_journal_dir is not, and the allocation journal needs both, so every create_vm " +
+	"and delete_vm would refuse; set pve.storage_allocation_journal_dir as " +
+	"docs/storage-journal-provisioning.md describes and enroll the namespace as " +
+	"docs/storage-journal-operations.md#enroll-a-new-namespace describes, or remove the namespace"
+
+// validateStorageJournalPair rejects a namespace that is set without a journal
+// directory, and checks nothing when the namespace is unset. Every
+// journal-managed gate treats either property as a journal in use, so
+// create_vm and delete_vm refuse on such a configuration and it can never
+// create or delete a VM. Nothing can supply the missing directory later,
+// because it is process-level and a cpi-config entry may not set it (see
+// validateStoragePlacementContext), and a context inherits the job's value.
+// The reverse half is accepted, because an entry can supply
+// pve_storage_placement_namespace for a directory the job sets. Validate runs
+// on the job's configuration and again on each entry's effective one, so an
+// entry that adds a namespace to a job without a journal directory is refused
+// as well.
+func (c *CPIConfig) validateStorageJournalPair(errs *[]string) {
+	if strings.TrimSpace(c.StoragePlacementNamespace) == "" || strings.TrimSpace(c.StorageAllocationJournalDir) != "" {
+		return
+	}
+	*errs = append(*errs, StorageJournalPairError)
+}
+
 // validateStemcellReplicaSet checks the preconditions of per-member stemcell
 // cache replicas, but only when the operator set the property explicitly to
 // true. Left unset the property is a request to replicate where replication

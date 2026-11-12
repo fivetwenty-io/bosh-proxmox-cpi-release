@@ -957,6 +957,35 @@ if [ "$SPEC_DISCOVERY" != "ok" ]; then
   FAILED=$((FAILED+1))
 fi
 
+echo "Case 16: storage placement namespace without a journal directory"
+# A namespace needs the journal directory, which only the job can set, so the
+# render refuses a namespace without one, with the CPI's own text. A journal
+# directory without a namespace renders, because a cpi-config entry can supply
+# the namespace, and so do both together. A malformed namespace is left to the
+# CPI's decoder.
+PAIR_ERR='pve.storage_placement_namespace is set but pve.storage_allocation_journal_dir is not, and the allocation journal needs both, so every create_vm and delete_vm would refuse; set pve.storage_allocation_journal_dir as docs/storage-journal-provisioning.md describes and enroll the namespace as docs/storage-journal-operations.md#enroll-a-new-namespace describes, or remove the namespace'
+assert_pve_render_raises "case16-namespace-only" '{"storage_placement_namespace":"director"}' "$PAIR_ERR"
+assert_pve_render_raises "case16-namespace-blank-journal" \
+  '{"storage_placement_namespace":"director","storage_allocation_journal_dir":"  "}' "$PAIR_ERR"
+JSON_16NJ="$(render "$(props_with_pve_nil '["storage_allocation_journal_dir"]' '{"storage_placement_namespace":"director"}')" 2>&1)" && {
+  echo "FAIL [case16-nil-journal]: a namespace with a nil journal directory rendered" >&2
+  FAILED=$((FAILED+1))
+}
+if ! printf '%s' "$JSON_16NJ" | grep -qF -- "$PAIR_ERR"; then
+  echo "FAIL [case16-nil-journal]: the error does not carry the pair text: ${JSON_16NJ}" >&2
+  FAILED=$((FAILED+1))
+fi
+JSON_16B="$(render "$(props_with_pve '{"storage_placement_namespace":"director","storage_allocation_journal_dir":"/var/vcap/store/pve_cpi/allocations"}')")"
+assert_json_key_equals "case16-both" "$JSON_16B" storage_placement_namespace director || FAILED=$((FAILED+1))
+assert_json_key_equals "case16-both" "$JSON_16B" storage_allocation_journal_dir /var/vcap/store/pve_cpi/allocations \
+  || FAILED=$((FAILED+1))
+JSON_16D="$(render "$(props_with_pve '{"storage_allocation_journal_dir":"/var/vcap/store/pve_cpi/allocations"}')")"
+assert_json_key_equals "case16-journal-only" "$JSON_16D" storage_allocation_journal_dir \
+  /var/vcap/store/pve_cpi/allocations || FAILED=$((FAILED+1))
+assert_json_lacks_key "case16-journal-only" "$JSON_16D" storage_placement_namespace || FAILED=$((FAILED+1))
+JSON_16M="$(render "$(props_with_pve '{"storage_placement_namespace":7}')")"
+assert_json_key_equals "case16-malformed-namespace" "$JSON_16M" storage_placement_namespace 7 || FAILED=$((FAILED+1))
+
 if [ "$FAILED" -ne 0 ]; then
   echo "RESULT: ${FAILED} assertion(s) FAILED" >&2
   exit 1

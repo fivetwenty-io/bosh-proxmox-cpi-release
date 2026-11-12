@@ -94,6 +94,12 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 	}
 	cfg, err := config.LoadFile(*configPath)
 	if err != nil {
+		// The pair text is fixed and carries no configuration value, so it
+		// is the one validation failure the CLI names.
+		if strings.Contains(err.Error(), config.StorageJournalPairError) {
+			fmt.Fprintln(stderr, "storage journal configuration incomplete: "+config.StorageJournalPairError)
+			return 1
+		}
 		fmt.Fprintln(stderr, "configuration invalid; check it with the CPI's startup validation")
 		return 1
 	}

@@ -101,7 +101,8 @@ func TestStorageJournalConfigFailuresPrintNoValues(t *testing.T) {
 	out.Reset()
 	stderr.Reset()
 	code = runStorageJournal([]string{"audit", "--config", path}, &out, &stderr, runOptions{})
-	if code != 1 || stderr.String() != "storage journal configuration incomplete: storage_allocation_journal_dir must be an absolute durable directory for set-enabled allocation\n" {
+	want := "storage journal configuration incomplete: " + config.StorageJournalPairError + "\n"
+	if code != 1 || stderr.String() != want {
 		t.Fatalf("config without a journal directory reported as %d %q", code, stderr.String())
 	}
 }

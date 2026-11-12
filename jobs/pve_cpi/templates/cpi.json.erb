@@ -960,6 +960,24 @@
     if_p("pve.#{key}") { |value| config[key] = value }
   end
 
+  # A namespace set without a journal directory can never create or delete a
+  # VM, because every journal-managed call refuses it, and nothing can supply
+  # the directory later, because it is process-level and a cpi-config entry
+  # may not set it. The reverse half renders, because an entry can supply the
+  # namespace. The check runs only when the namespace is a nonblank string and
+  # leaves a malformed value to the CPI's decoder. The text matches the CPI's
+  # config validation.
+  journal_namespace = config["storage_placement_namespace"]
+  journal_directory = config["storage_allocation_journal_dir"]
+  if journal_namespace.is_a?(String) && !journal_namespace.strip.empty? &&
+     (journal_directory.nil? || (journal_directory.is_a?(String) && journal_directory.strip.empty?))
+    raise "pve.storage_placement_namespace is set but pve.storage_allocation_journal_dir is not, " \
+          "and the allocation journal needs both, so every create_vm and delete_vm would refuse; set " \
+          "pve.storage_allocation_journal_dir as docs/storage-journal-provisioning.md describes and " \
+          "enroll the namespace as docs/storage-journal-operations.md#enroll-a-new-namespace " \
+          "describes, or remove the namespace"
+  end
+
   # Emit security_groups only when the operator supplies a non-empty list. When
   # absent or empty (the default []), the key is omitted so the Go config
   # zero-value (nil slice) is preserved and no global firewall groups are applied.
