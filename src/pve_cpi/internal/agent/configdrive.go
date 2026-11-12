@@ -219,7 +219,7 @@ func (a *ConfigDrive) Configure(ctx context.Context, node string, vmid int, cfg 
 	// runs the pinned route has already carried the POST that made the
 	// retry necessary, and reading that node's own task list gives
 	// read-your-write consistency for the imgdel it queues.
-	if existed, rmErr := a.removeISOIfExists(ctx, node, filename); rmErr != nil {
+	if existed, rmErr := a.removeISOIfExists(ctx, node, filename, true); rmErr != nil {
 		return cpierrors.Wrap(rmErr, fmt.Sprintf("agent configure vm %d: pre-delete stale configdrive iso", vmid))
 	} else if existed {
 		a.logger.Warn("configdrive: removed stale orphan iso before upload",
@@ -372,7 +372,7 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 			// retryable fault into a permanent 409. Only a permanently-failing
 			// sweep proceeds best-effort, leaving the upload to surface the truth.
 			if sweepNeeded {
-				if _, rmErr := a.removeISOIfExists(pinnedCtx, node, filename); rmErr != nil {
+				if _, rmErr := a.removeISOIfExists(pinnedCtx, node, filename, false); rmErr != nil {
 					if pve.IsRetryableOrLockFault(rmErr) {
 						return rmErr
 					}
@@ -468,10 +468,13 @@ func (a *ConfigDrive) attachISO(ctx context.Context, node string, vmid int, file
 }
 
 // removeISOIfExists deletes the configdrive ISO at `filename` and reports
-// whether an orphan was proven present (by content listing) and removed. Callers (Configure's pre-delete
-// path) use the existed flag to log a warning when a stale orphan was
-// found. 404 is treated as "did not exist" (returns false, nil); other
-// errors propagate.
+// whether an orphan was proven present and removed. Callers (Configure's
+// pre-delete path) use the existed flag to log a warning when a stale orphan
+// was found. File-backed storage never answers a DELETE of a missing file
+// with 404, so the delete result alone cannot prove presence. With probe set,
+// a content listing filtered to ISOs decides whether the flag can be true;
+// without it the flag is always false and no listing is read. Errors from
+// the delete propagate.
 //
 // The delete is awaited via the returned imgdel UPID before this function
 // returns. PVE's DELETE on a storage volume queues an imgdel task under the
@@ -480,7 +483,7 @@ func (a *ConfigDrive) attachISO(ctx context.Context, node string, vmid int, file
 // proceed to upload the replacement ISO and Start the VM *before* the queued
 // imgdel ran, then PVE would fire imgdel during qmstart and remove the just-
 // uploaded ISO — causing qmstart to fail with "volume … does not exist".
-func (a *ConfigDrive) removeISOIfExists(ctx context.Context, node, filename string) (bool, error) {
+func (a *ConfigDrive) removeISOIfExists(ctx context.Context, node, filename string, probe bool) (bool, error) {
 	volume := fmt.Sprintf("%s:iso/%s", a.storageName(ctx), filename)
 	if a.managedAllocationBytes > 0 {
 		exists, err := pve.ObserveStorageVolumePresence(ctx, a.pveSvc, node, volume)
@@ -492,19 +495,13 @@ func (a *ConfigDrive) removeISOIfExists(ctx context.Context, node, filename stri
 		}
 		return false, nil
 	}
-	// File-backed storage answers a DELETE on a missing volume with success
-	// rather than 404, so the delete result alone cannot prove an orphan was
-	// there. Read the unfiltered content listing first; the delete itself
-	// still runs unconditionally. When the listing cannot be read, the
-	// delete proceeds and the result reports that nothing was proven.
-	proven, probeErr := pve.ObserveStorageVolumePresence(ctx, a.pveSvc, node, volume)
-	if probeErr != nil {
-		a.logger.Debug("configdrive: orphan iso presence check failed; deleting without proof",
-			log.String("node", node),
-			log.String("volume", volume),
-			log.String("error", probeErr.Error()),
-		)
-		proven = false
+	// The listing only decides whether to log the orphan warning, never
+	// whether to delete, so one ISO-filtered read stands in for the absence
+	// proof the journal uses. When the listing cannot be read, the delete
+	// still runs and the result reports that nothing was proven.
+	proven := false
+	if probe {
+		proven = a.isoListed(ctx, node, volume)
 	}
 	existed, upid, err := a.pveSvc.Storage().DeleteVolumeIfExistsAsync(ctx, node, a.storageName(ctx), volume)
 	if err != nil {
@@ -517,6 +514,31 @@ func (a *ConfigDrive) removeISOIfExists(ctx context.Context, node, filename stri
 		}
 	}
 	return existed, nil
+}
+
+// isoListed reads one content listing, filtered to ISOs, on the upload node and
+// reports whether it names the volume. A failed read or a malformed item
+// counts as not listed, and the read is logged at Debug.
+func (a *ConfigDrive) isoListed(ctx context.Context, node, volume string) bool {
+	content := "iso"
+	listing, err := a.pveSvc.Nodes().ListStorageContent(ctx, node, a.storageName(ctx),
+		&sdknodes.ListStorageContentParams{Content: &content})
+	if err != nil || listing == nil {
+		a.logger.Debug("configdrive: orphan iso presence check failed; deleting without proof",
+			log.String("node", node),
+			log.String("volume", volume),
+		)
+		return false
+	}
+	for _, raw := range *listing {
+		var item struct {
+			Volid string `json:"volid"`
+		}
+		if json.Unmarshal(raw, &item) == nil && item.Volid == volume {
+			return true
+		}
+	}
+	return false
 }
 
 // removeISOFromStorage issues a DELETE for the configdrive ISO volume and

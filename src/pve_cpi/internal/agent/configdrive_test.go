@@ -98,11 +98,19 @@ type fakeNodesSvc struct {
 	// listContentFn backs ListStorageContent; nil reports the listing as
 	// unavailable, which leaves the orphan-ISO sweep without proof.
 	listContentFn func(node, storage string) (*sdknodes.ListStorageContentResponse, error)
+	// listContentCalls records every listing's node, storage, and params.
+	listContentCalls []listContentCall
+}
+
+type listContentCall struct {
+	node, storage string
+	params        *sdknodes.ListStorageContentParams
 }
 
 func (f *fakeNodesSvc) ListStorageContent(
-	_ context.Context, node, storage string, _ *sdknodes.ListStorageContentParams,
+	_ context.Context, node, storage string, params *sdknodes.ListStorageContentParams,
 ) (*sdknodes.ListStorageContentResponse, error) {
+	f.listContentCalls = append(f.listContentCalls, listContentCall{node: node, storage: storage, params: params})
 	if f.listContentFn != nil {
 		return f.listContentFn(node, storage)
 	}
@@ -726,7 +734,8 @@ func TestConfigDrive_Configure_RetriesUploadOnConnectionDrop(t *testing.T) {
 			return "", nil
 		},
 	}
-	a := newISOAgent(storageSvc, nil)
+	nodesSvc := &fakeNodesSvc{}
+	a := newISOAgent(storageSvc, nodesSvc)
 
 	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
 	if err := a.Configure(ctx, "pve1", 200, baseISOConfig()); err != nil {
@@ -739,6 +748,10 @@ func TestConfigDrive_Configure_RetriesUploadOnConnectionDrop(t *testing.T) {
 	// pre-retry sweep guarding against a committed-but-unacked first POST.
 	if got := len(storageSvc.deleteVolumeIfExistsCalls); got != 2 {
 		t.Errorf("DeleteVolumeIfExists calls = %d, want 2 (pre-upload and pre-retry)", got)
+	}
+	// Only the pre-upload sweep reads a listing; the retry sweep has no use for one.
+	if got := len(nodesSvc.listContentCalls); got != 1 {
+		t.Errorf("content listings = %d, want 1 (pre-upload only)", got)
 	}
 }
 

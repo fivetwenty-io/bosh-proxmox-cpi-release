@@ -65,7 +65,7 @@ func TestManagedISOCollisionNeverDeletes(t *testing.T) {
 			n := &managedISONodes{listing: &listing, err: tc.listErr}
 			a := NewConfigDrive(managedISOListingClient{managedISOClient: managedISOClient{s: s}, n: n, visibilityErr: tc.visibilityErr}, "iso", nil, log.NewNopLogger())
 			a.managedAllocationBytes = configdrive.AllocationBytes()
-			_, err := a.removeISOIfExists(t.Context(), "node", "allocation.iso")
+			_, err := a.removeISOIfExists(t.Context(), "node", "allocation.iso", true)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("error=%v", err)
 			}
