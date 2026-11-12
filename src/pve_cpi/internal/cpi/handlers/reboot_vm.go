@@ -47,7 +47,9 @@ import (
 //     call is sent, makes the reboot wait and resolve the VM once more. A
 //     second failure of that kind is returned as a retriable error.
 //  4. If state == "stopped": issue qemu.Start; await UPID; return nil.
-//  5. If mode == "hard": call rebootVMHardReset() directly.
+//  5. If mode == "hard": call rebootVMHardReset() directly. A reset request
+//     that may have reached PVE is never sent again; it returns a retriable
+//     error that says the outcome is unknown.
 //  6. If mode == "soft": POST /status/reboot with configured timeout.
 //     - 404 on reboot call → VMNotFound (no fallback).
 //     - A reboot-call error PVE answered, or one that proves the request was
@@ -55,8 +57,11 @@ import (
 //     - A reboot task that resolved with a failure verdict → log warn +
 //     fallback to rebootVMHardReset().
 //     - Any outcome the CPI cannot know, such as a reboot call that may have
-//     been written, an unreadable UPID, or a task poll that ended unresolved
-//     → retriable error, no hard reset.
+//     been written, an unreadable UPID, a task poll that ended without an
+//     exit status, or a lock timeout that shows another task held the VM's
+//     lock → retriable error, no hard reset. The Director does not retry
+//     reboot_vm, so the error tells the operator to check the VM and run the
+//     operation again.
 //     - Empty UPID (synchronous) → success without await.
 //
 // Config knobs: reboot_mode ("soft"|"hard", default "soft"),
@@ -237,18 +242,37 @@ func rebootOnce(ctx context.Context, deps Deps, logger *log.Logger, vmCID string
 // Failure modes:
 //   - Reset returns 404 or config missing → VMNotFound when the VM is proven
 //     gone, a retriable error when it moved (see rebootCallFailure).
-//   - Reset returns transient error → retried by RetryOnTransient.
-//   - Reset returns other non-transient error → CloudError via WrapError.
+//   - Reset returns a transient error that PVE answered, such as a config
+//     lock, or one that proves the request was never sent
+//     (pve.IsMutationRefusedOrUnsent) → retried by RetryOnTransient.
+//   - Reset returns any other error, such as a transport fault after the
+//     request may have been written → retriable error that says the outcome
+//     is unknown, and the reset is never sent again, because a reset that
+//     landed and was sent twice power-cycles the guest twice.
+//   - Reset returns another answer from PVE that is not transient →
+//     CloudError via WrapError.
 //   - AwaitTaskWithLogger returns task failure → wrapped CloudError.
 //   - Empty UPID → success (synchronous reset, no task to await).
 func rebootVMHardReset(ctx context.Context, deps Deps, logger *log.Logger, node string, vmid int, vmCID string) (any, error) {
 	logger.Debug("reboot_vm: issuing hard reset")
 	var upid string
+	var maybeSentErr error
 	resetErr := pve.RetryOnTransient(ctx, logger, "reboot_vm.hard_reset", 0, func() error {
 		var inner error
 		upid, inner = deps.PVE.QEMU().Reset(ctx, node, vmid)
+		if resetMayHaveLanded(inner) {
+			maybeSentErr = inner
+			return errResetMayHaveLanded
+		}
 		return inner
 	})
+	if maybeSentErr != nil {
+		logger.Warn("reboot_vm: the hard reset request may have reached PVE and its outcome is unknown, so it is "+
+			"not sent again", log.String("node", node), log.Err(maybeSentErr))
+		return nil, cpierrors.WrapAs(maybeSentErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+			"reboot_vm: the hard reset request for VM %s on node %s may have reached PVE, so its outcome is "+
+				"unknown and the CPI did not send it again; %s", vmCID, node, rebootUnknownOutcomeAdvice))
+	}
 	if resetErr != nil {
 		return nil, rebootCallFailure(ctx, deps, "reset", vmCID, vmid, node, resetErr)
 	}
@@ -259,6 +283,20 @@ func rebootVMHardReset(ctx context.Context, deps Deps, logger *log.Logger, node 
 	}
 	logger.Info("reboot_vm: VM hard-reset completed")
 	return nil, nil
+}
+
+// errResetMayHaveLanded stops the hard reset's retry loop after an attempt
+// that may have reached PVE. It is not transient, so RetryOnTransient returns
+// it at once, and rebootVMHardReset reports the attempt's own error instead.
+var errResetMayHaveLanded = errors.New("reboot_vm: stop after a reset that may have reached PVE")
+
+// resetMayHaveLanded reports whether err, from one hard reset request, leaves
+// open that PVE acted on the request. A config-missing answer and a config
+// lock are PVE's own refusals, and pve.IsMutationRefusedOrUnsent covers every
+// other answer and every request that was never sent. Anything else may have
+// landed, so the reset must not be sent a second time.
+func resetMayHaveLanded(err error) bool {
+	return err != nil && !isConfigMissing(err) && !pve.IsVMConfigLocked(err) && !pve.IsMutationRefusedOrUnsent(err)
 }
 
 // VM power states as reported by the qemu status endpoints.
@@ -342,6 +380,27 @@ func rebootVMHandleStopped(ctx context.Context, deps Deps, logger *log.Logger, n
 	return nil, nil
 }
 
+// rebootUnknownOutcomeAdvice ends every reboot_vm error whose outcome the CPI
+// cannot know. The Director retries only create_vm on its own, so nothing
+// sends reboot_vm again, and the text tells the operator what to do instead.
+const rebootUnknownOutcomeAdvice = "the reboot_vm call failed, so check whether the VM rebooted, and run the " +
+	"operation again if it did not"
+
+// rebootLockHeldError is the unknown-outcome error for a graceful reboot that
+// PVE answered, or whose task ended, with a lock timeout ("can't lock file
+// ... got timeout"). Another task, such as an earlier reboot that is still
+// shutting the guest down, held the VM's config lock, so a hard reset would
+// wait on that lock and could power-cycle a guest that the earlier task has
+// just started again. what names the request or the task, for the error text.
+func rebootLockHeldError(logger *log.Logger, err error, what, vmCID, node string) error {
+	logger.Warn("reboot_vm: another task held the VM's lock during the graceful reboot, so its outcome is unknown "+
+		"and the VM is not hard-reset", log.String("node", node), log.Err(err))
+	return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+		"reboot_vm: %s of VM %s on node %s timed out waiting for the VM's lock, which another task held, so "+
+			"the outcome is unknown and the CPI did not hard-reset the VM; %s",
+		what, vmCID, node, rebootUnknownOutcomeAdvice))
+}
+
 // rebootVMSoftWithFallback issues a graceful ACPI reboot via
 // POST /nodes/{node}/qemu/{vmCID}/status/reboot with the configured timeout.
 // It falls back to rebootVMHardReset only when it knows the graceful reboot
@@ -353,6 +412,10 @@ func rebootVMHandleStopped(ctx context.Context, deps Deps, logger *log.Logger, n
 //   - 404, config missing, or a config lock on the reboot call → no fallback
 //     (see rebootCallFailure): VMNotFound when the VM is proven gone, a
 //     retriable error otherwise.
+//   - a lock timeout on the reboot call or in the reboot task's exit status
+//     (pve.IsStorageLockTimeout) → retriable error, no fallback, because
+//     another task, such as an earlier reboot, held the VM's lock and may
+//     still be running.
 //   - other reboot-call error that PVE answered, or that proves the request
 //     was never sent (pve.IsMutationRefusedOrUnsent) → log warn +
 //     rebootVMHardReset() fallback.
@@ -362,9 +425,13 @@ func rebootVMHandleStopped(ctx context.Context, deps Deps, logger *log.Logger, n
 //     fallback, because PVE may have started the reboot task.
 //   - await ends with the task's own failure verdict (pve.IsTaskExitVerdict)
 //     → log warn + rebootVMHardReset() fallback.
-//   - any other await error, such as an unresolved poll → retriable error
-//     that names the task, no fallback.
+//   - any other await error, such as an unresolved poll, a poll 404, or a
+//     poll fault → retriable error that names the task, no fallback.
 //   - empty UPID → success without await.
+//
+// Every retriable error here fails the call. The Director does not retry
+// reboot_vm on its own, so the error says the outcome is unknown and tells
+// the operator to check the VM and run the operation again.
 func rebootVMSoftWithFallback(ctx context.Context, deps Deps, logger *log.Logger, node string, vmid int, vmCID string, timeout int) (any, error) {
 	t := int64(timeout)
 	resp, rebootErr := deps.PVE.Nodes().CreateQemuStatusReboot(
@@ -375,13 +442,16 @@ func rebootVMSoftWithFallback(ctx context.Context, deps Deps, logger *log.Logger
 		if isConfigMissing(rebootErr) || pve.IsVMConfigLocked(rebootErr) {
 			return nil, rebootCallFailure(ctx, deps, "reboot", vmCID, vmid, node, rebootErr)
 		}
+		if pve.IsStorageLockTimeout(rebootErr) {
+			return nil, rebootLockHeldError(logger, rebootErr, "the graceful reboot request", vmCID, node)
+		}
 		if !pve.IsMutationRefusedOrUnsent(rebootErr) {
 			logger.Warn("reboot_vm: the graceful reboot request may have reached PVE and its outcome is unknown, "+
 				"so the VM is not hard-reset", log.String("node", node), log.Err(rebootErr))
 			return nil, cpierrors.WrapAs(rebootErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
-				"reboot_vm: the graceful reboot request for VM %s on node %s may have reached PVE, and its outcome "+
-					"is unknown, so the CPI did not hard-reset the VM; the retry decides what to do next",
-				vmCID, node))
+				"reboot_vm: the graceful reboot request for VM %s on node %s may have reached PVE, so its outcome "+
+					"is unknown and the CPI did not hard-reset the VM; %s",
+				vmCID, node, rebootUnknownOutcomeAdvice))
 		}
 		logger.Warn("reboot_vm: graceful reboot call failed, falling back to hard reset", log.Err(rebootErr))
 		return rebootAfterSend(rebootVMHardReset(ctx, deps, logger, node, vmid, vmCID))
@@ -397,8 +467,8 @@ func rebootVMSoftWithFallback(ctx context.Context, deps Deps, logger *log.Logger
 			"outcome is unknown and the VM is not hard-reset", log.String("node", node), log.Err(upidErr))
 		return nil, cpierrors.WrapAs(upidErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
 			"reboot_vm: PVE accepted the graceful reboot of VM %s on node %s, but its task ID could not be read, "+
-				"so the outcome is unknown and the CPI did not hard-reset the VM; the retry decides what to do next",
-			vmCID, node))
+				"so the outcome is unknown and the CPI did not hard-reset the VM; %s",
+			vmCID, node, rebootUnknownOutcomeAdvice))
 	}
 
 	if upid != "" {
@@ -408,8 +478,11 @@ func rebootVMSoftWithFallback(ctx context.Context, deps Deps, logger *log.Logger
 					log.String("upid", upid), log.Err(awaitErr))
 				return nil, cpierrors.WrapAs(awaitErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
 					"reboot_vm: the outcome of the graceful reboot task %s of VM %s is unknown, because polling ended "+
-						"before it reported an exit status, so the CPI did not hard-reset the VM; the retry decides "+
-						"what to do next", upid, vmCID))
+						"before it reported an exit status, so the CPI did not hard-reset the VM; %s",
+					upid, vmCID, rebootUnknownOutcomeAdvice))
+			}
+			if pve.IsStorageLockTimeout(awaitErr) {
+				return nil, rebootLockHeldError(logger, awaitErr, "the graceful reboot task "+upid, vmCID, node)
 			}
 			logger.Warn("reboot_vm: graceful reboot task failed, falling back to hard reset", log.Err(awaitErr))
 			return rebootAfterSend(rebootVMHardReset(ctx, deps, logger, node, vmid, vmCID))

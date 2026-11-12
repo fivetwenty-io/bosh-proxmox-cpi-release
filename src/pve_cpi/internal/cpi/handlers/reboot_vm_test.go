@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -647,8 +649,9 @@ func TestHandleRebootVM_SoftEmptyUPID(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// m. Hard reset retries on transient error: Reset fails once with HTTP 596
-//    (transient), then succeeds; overall result is success after retry.
+// m. Hard reset retries on transient error: Reset fails once because the
+//    dial to PVE failed, so the request was never sent, then succeeds;
+//    overall result is success after retry.
 // --------------------------------------------------------------------------
 
 func TestHandleRebootVM_HardReset_RetriesOnTransient(t *testing.T) {
@@ -663,8 +666,13 @@ func TestHandleRebootVM_HardReset_RetriesOnTransient(t *testing.T) {
 		resetFn: func(_ context.Context, _ string, _ int) (string, error) {
 			resetAttempts++
 			if resetAttempts == 1 {
-				// First attempt: transient error (pvedaemon worker recycle).
-				return "", errors.New("reset failed (code: 596)")
+				// First attempt: the dial failed, so nothing reached PVE.
+				return "", &sdkerrors.ConnectionError{
+					Host: "pve.test.local", Port: 8006, Message: "failed to establish a connection",
+					Cause: &url.Error{Op: "Post", URL: "https://pve.test.local:8006/api2/json", Err: &net.OpError{
+						Op: "dial", Net: "tcp", Err: errors.New("connection refused"),
+					}},
+				}
 			}
 			// Second attempt: success.
 			return "UPID:node:reset-ok", nil
@@ -689,7 +697,7 @@ func TestHandleRebootVM_HardReset_RetriesOnTransient(t *testing.T) {
 		t.Errorf("expected nil result, got %v", result)
 	}
 	if resetAttempts < 2 {
-		t.Errorf("expected at least 2 reset attempts (1 transient + 1 success), got %d", resetAttempts)
+		t.Errorf("expected at least 2 reset attempts (1 unsent + 1 success), got %d", resetAttempts)
 	}
 }
 

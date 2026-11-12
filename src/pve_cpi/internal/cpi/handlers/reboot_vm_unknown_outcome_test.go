@@ -59,12 +59,14 @@ func softRebootOutcome(
 		},
 	}
 	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "soft"))
-	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
+	_, err := h.Handle(fastRetryCtx(context.Background()), marshalArgs("101"), jsonrpc.Context{})
 	return resets.Load(), err
 }
 
 // requireUnknownOutcome checks that err is a retriable error that says the
-// outcome is unknown and contains every string in want.
+// outcome is unknown, tells the operator to run the operation again, and
+// contains every string in want. The Director does not retry reboot_vm, so
+// the error must not leave that step to it.
 func requireUnknownOutcome(t *testing.T, err error, want ...string) {
 	t.Helper()
 	if err == nil {
@@ -79,7 +81,7 @@ func requireUnknownOutcome(t *testing.T, err error, want ...string) {
 			cpierrors.TypeRetriableCloud)
 	}
 	msg := err.Error()
-	for _, w := range append([]string{"is unknown", "did not hard-reset"}, want...) {
+	for _, w := range append([]string{"is unknown", "did not hard-reset", "run the operation again"}, want...) {
 		if !strings.Contains(msg, w) {
 			t.Errorf("error %q does not contain %q", msg, w)
 		}
@@ -87,9 +89,11 @@ func requireUnknownOutcome(t *testing.T, err error, want ...string) {
 }
 
 // TestHandleRebootVM_UnresolvedRebootPoll_NoHardReset checks that a graceful
-// reboot whose task poll ends unresolved is never followed by a hard reset,
-// because the reboot may already have finished or may still be running. The
-// handler returns a retriable error that names the task.
+// reboot whose task poll ends without an exit status is never followed by a
+// hard reset, because the reboot may already have finished or may still be
+// running. That covers a poll that ran out of time, a poll 404 that outlasts
+// the registration retries, a poll 403, and a poll fault that ends the poll.
+// The handler returns a retriable error that names the task.
 func TestHandleRebootVM_UnresolvedRebootPoll_NoHardReset(t *testing.T) {
 	t.Parallel()
 
@@ -100,6 +104,16 @@ func TestHandleRebootVM_UnresolvedRebootPoll_NoHardReset(t *testing.T) {
 		},
 		"poll window ran out": func(string) (*tasks.Status, error) {
 			return nil, fmt.Errorf("task polling canceled: %w", context.DeadlineExceeded)
+		},
+		"poll 404": func(string) (*tasks.Status, error) {
+			return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "no such task"}
+		},
+		"poll 403": func(string) (*tasks.Status, error) {
+			return nil, &sdkerrors.APIError{HTTPCode: 403, Message: "Permission check failed"}
+		},
+		"poll fault": func(string) (*tasks.Status, error) {
+			return nil, fmt.Errorf("failed to get task status: %w",
+				errors.New("tls: failed to verify certificate: x509: certificate signed by unknown authority"))
 		},
 	}
 	for name, waitFn := range cases {
@@ -131,6 +145,24 @@ func TestHandleRebootVM_FailedRebootTask_HardResets(t *testing.T) {
 	}
 }
 
+// TestHandleRebootVM_RebootTaskLockTimeout_NoHardReset checks that a reboot
+// task that failed because it timed out waiting for the VM's lock gives no
+// hard reset. Another task held the lock, such as an earlier reboot that is
+// still shutting the guest down, so a reset could power-cycle the guest twice.
+func TestHandleRebootVM_RebootTaskLockTimeout_NoHardReset(t *testing.T) {
+	t.Parallel()
+
+	const upid = "UPID:pve-node1:0002DA00:24345A8D:6AF5ABD5:qmreboot:101:root@pam::"
+	resets, err := softRebootOutcome(t, rebootRawUPID(upid), nil, func(string) (*tasks.Status, error) {
+		return &tasks.Status{Status: "stopped",
+			ExitStatus: "can't lock file '/var/lock/qemu-server/lock-101.conf' - got timeout"}, nil
+	})
+	if resets != 0 {
+		t.Errorf("hard reset sent %d times after a lock timeout; want 0", resets)
+	}
+	requireUnknownOutcome(t, err, upid, "lock, which another task held")
+}
+
 // TestHandleRebootVM_RebootCallOutcome checks the reboot call's own error. An
 // error that may have reached PVE gives no hard reset and a retriable error,
 // and an error that PVE answered, or that proves nothing was sent, still
@@ -144,6 +176,7 @@ func TestHandleRebootVM_RebootCallOutcome(t *testing.T) {
 		name      string
 		err       error
 		wantReset bool
+		want      string
 	}{
 		{
 			name: "maybe sent after the connection",
@@ -160,6 +193,17 @@ func TestHandleRebootVM_RebootCallOutcome(t *testing.T) {
 		{
 			name: "relay 596 after the request may have reached the node",
 			err:  &sdkerrors.APIError{HTTPCode: 596, Message: "broken pipe"},
+		},
+		{
+			name: "answered lock timeout",
+			err: &sdkerrors.APIError{HTTPCode: 500,
+				Message: "can't lock file '/var/lock/qemu-server/lock-101.conf' - got timeout"},
+			want: "lock, which another task held",
+		},
+		{
+			name:      "dial failed without the pool, never sent",
+			err:       dial,
+			wantReset: true,
 		},
 		{
 			name:      "answered refusal",
@@ -187,7 +231,11 @@ func TestHandleRebootVM_RebootCallOutcome(t *testing.T) {
 				if resets != 0 {
 					t.Errorf("hard reset sent %d times; want 0", resets)
 				}
-				requireUnknownOutcome(t, err, "may have reached PVE")
+				want := tc.want
+				if want == "" {
+					want = "may have reached PVE"
+				}
+				requireUnknownOutcome(t, err, want)
 				return
 			}
 			if err != nil {
@@ -212,4 +260,51 @@ func TestHandleRebootVM_UnreadableRebootUPID_NoHardReset(t *testing.T) {
 		t.Errorf("hard reset sent %d times after an unreadable UPID; want 0", resets)
 	}
 	requireUnknownOutcome(t, err, "task ID could not be read")
+}
+
+// TestHandleRebootVM_HardResetMaybeSent_NotResent checks that a hard reset
+// whose request may have reached PVE is never sent a second time, because a
+// reset that landed and was sent again power-cycles the guest twice. The
+// handler returns a retriable error that says the outcome is unknown.
+func TestHandleRebootVM_HardResetMaybeSent_NotResent(t *testing.T) {
+	t.Parallel()
+
+	read := &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}
+	cases := map[string]error{
+		"maybe sent after the connection": &endpointpool.MaybeSentError{Err: fmt.Errorf("Post: %w", read)},
+		"relay 596":                       &sdkerrors.APIError{HTTPCode: 596, Message: "broken pipe"},
+		"sdk timeout":                     &sdkerrors.TimeoutError{Operation: "POST", Duration: "30s"},
+	}
+	for name, resetErr := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var resets atomic.Int32
+			qemuSvc := &mockQEMUService{
+				statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+					return map[string]any{"status": "running"}, nil
+				},
+				resetFn: func(_ context.Context, _ string, _ int) (string, error) {
+					resets.Add(1)
+					return "", resetErr
+				},
+			}
+			h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "hard"))
+			_, err := h.Handle(fastRetryCtx(context.Background()), marshalArgs("101"), jsonrpc.Context{})
+			if n := resets.Load(); n != 1 {
+				t.Errorf("hard reset sent %d times; want 1", n)
+			}
+			if err == nil {
+				t.Fatal("expected a retriable error for an unknown reset outcome, got nil")
+			}
+			var cpiErr *cpierrors.Error
+			if !errors.As(err, &cpiErr) || cpiErr.Type() != cpierrors.TypeRetriableCloud {
+				t.Errorf("error %T %v; want a %q error", err, err, cpierrors.TypeRetriableCloud)
+			}
+			for _, w := range []string{"is unknown", "did not send it again", "run the operation again"} {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("error %q does not contain %q", err.Error(), w)
+				}
+			}
+		})
+	}
 }

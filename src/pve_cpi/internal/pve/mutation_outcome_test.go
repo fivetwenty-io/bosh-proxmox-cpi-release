@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	sdktasks "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
@@ -27,6 +29,16 @@ func TestIsMutationRefusedOrUnsent(t *testing.T) {
 	read := &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}
 	dnsErr := &net.DNSError{Err: "no such host", Name: "pve1"}
 	connectPhase := &endpointpool.ConnectPhaseError{Phase: endpointpool.PhaseDial, Endpoint: "pve1:8006", Err: dial}
+	// sdkConn is the shape the SDK returns for a request whose transport
+	// failed: a ConnectionError around the url.Error that net/http built.
+	sdkConn := func(cause error) error {
+		return &sdkerrors.ConnectionError{Host: "pve1", Port: 8006, Message: "failed to establish a connection",
+			Cause: &url.Error{Op: "Post", URL: "https://pve1:8006/api2/json/nodes/pve1/qemu/101/status/reboot",
+				Err: cause}}
+	}
+	unreachable := endpointpool.NewEntryUnreachableError([]endpointpool.EndpointFailure{
+		{Endpoint: "pve1:8006", Err: connectPhase},
+	})
 
 	cases := []struct {
 		name string
@@ -48,6 +60,10 @@ func TestIsMutationRefusedOrUnsent(t *testing.T) {
 		{name: "plain error", err: errors.New("something broke"), want: false},
 		{name: "deadline", err: fmt.Errorf("Post: %w", context.DeadlineExceeded), want: false},
 		{name: "cancelled", err: context.Canceled, want: false},
+		{name: "sdk connection error around a dial", err: sdkConn(dial), want: true},
+		{name: "sdk connection error around an unreachable pool", err: sdkConn(unreachable), want: true},
+		{name: "sdk connection error around a maybe sent connect phase",
+			err: sdkConn(&endpointpool.MaybeSentError{Err: connectPhase}), want: false},
 		{name: "sdk connection error", err: &sdkerrors.ConnectionError{Host: "pve1", Port: 8006, Message: "EOF"},
 			want: false},
 	}
@@ -93,6 +109,25 @@ func TestAwaitTaskWithLogger_LevelFollowsOutcome(t *testing.T) {
 			wantLevel: slog.LevelWarn,
 			wantMsg:   "pve: task outcome unknown",
 		},
+		{
+			name:      "poll 404",
+			waitErr:   &sdkerrors.APIError{HTTPCode: 404, Message: "no such task"},
+			wantLevel: slog.LevelWarn,
+			wantMsg:   "pve: task outcome unknown",
+		},
+		{
+			name:      "poll 403",
+			waitErr:   &sdkerrors.APIError{HTTPCode: 403, Message: "Permission check failed"},
+			wantLevel: slog.LevelWarn,
+			wantMsg:   "pve: task outcome unknown",
+		},
+		{
+			name: "poll fault",
+			waitErr: fmt.Errorf("failed to get task status: %w",
+				errors.New("tls: failed to verify certificate: x509: certificate signed by unknown authority")),
+			wantLevel: slog.LevelWarn,
+			wantMsg:   "pve: task outcome unknown",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -103,8 +138,8 @@ func TestAwaitTaskWithLogger_LevelFollowsOutcome(t *testing.T) {
 				},
 			}
 			obsLogger, obs := log.NewObservedLogger(log.LevelDebug)
-			err := pve.AwaitTaskWithLogger(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc",
-				obsLogger)
+			ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+			err := pve.AwaitTaskWithLogger(ctx, newMockClient(svc), "node1", "UPID:node1:abc", obsLogger)
 			if err == nil {
 				t.Fatal("expected an await error")
 			}
