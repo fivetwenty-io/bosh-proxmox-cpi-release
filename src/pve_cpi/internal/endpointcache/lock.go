@@ -8,8 +8,6 @@ import (
 	"os"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/privatefile"
 )
 
@@ -141,7 +139,7 @@ func (t *texts) lockNamesInode(r *os.Root, name string, lock *privatefile.Lock) 
 // through its open descriptor, so the times land on the locked inode whatever
 // the name holds by then.
 func (t *texts) touchLock(lock *privatefile.Lock) error {
-	if err := unix.Futimes(int(lock.File.Fd()), nil); err != nil {
+	if err := setTimesNow(int(lock.File.Fd())); err != nil {
 		return fmt.Errorf("%s: update lock file times: %w", t.name, err)
 	}
 	return nil
