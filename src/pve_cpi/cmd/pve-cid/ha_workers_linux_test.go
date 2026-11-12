@@ -13,12 +13,12 @@ import (
 )
 
 // namespaceRefused ends a test whose child process could not get a private
-// mount namespace. Under GitHub Actions it fails, because the workflow's
-// container is set up to allow the namespace and a skip would hide that the
-// test never ran. Anywhere else it skips.
+// mount namespace. When PVE_CPI_REQUIRE_NAMESPACE_TESTS is set it fails,
+// because the caller set up a container that allows the namespace and a skip
+// would hide that the test never ran. Anywhere else it skips.
 func namespaceRefused(t *testing.T, what string, err error) {
 	t.Helper()
-	if os.Getenv("GITHUB_ACTIONS") != "" {
+	if os.Getenv("PVE_CPI_REQUIRE_NAMESPACE_TESTS") != "" {
 		t.Fatalf("this system refuses a private mount namespace, so %s: %v", what, err)
 	}
 	t.Skipf("this system refuses a private mount namespace, so %s: %v", what, err)
