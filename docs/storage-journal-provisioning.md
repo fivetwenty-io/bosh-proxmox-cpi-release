@@ -1,6 +1,6 @@
 # Provisioning the storage allocation journal
 
-Set-based allocation needs a private directory on durable storage. Set `pve.storage_allocation_journal_dir` to its absolute path. The CPI never chooses a temporary fallback or moves a journal when the path changes.
+Set-based allocation needs a private directory on durable storage and an enrolled namespace. Set `pve.storage_allocation_journal_dir` to the directory's absolute path and `pve.storage_placement_namespace` to a stable name. The CPI never chooses a temporary fallback or moves a journal when the path changes.
 
 On the Director, the `pve_cpi` job's pre-start runs the local provisioning command for the `vcap` execution user. For example, `/var/vcap/store/pve_cpi/allocations` keeps the journal on the Director's persistent disk. The command creates missing directories with mode `0700`. An existing journal directory must already belong to `vcap` and its primary group, with mode `0700`. The command rejects symlinks and unsafe paths without changing their permissions or ownership.
 
@@ -20,7 +20,9 @@ To provision from a rendered CPI configuration, use the following command.
 /path/to/cpi provision-journal --config /path/to/cpi.json
 ```
 
-Provisioning makes no PVE requests and does not enroll a namespace or claim cluster authority. [Enrollment](storage-journal-operations.md) requires an explicit historical audit, previous-writer fencing, and confirmation that previous remote tasks have settled. The normal CPI wrapper does not provision or require a journal for unrelated existing-CID operations.
+Provisioning makes no PVE requests and does not enroll a namespace or claim cluster authority. [Enrollment](storage-journal-operations.md) requires an explicit historical audit, previous-writer fencing, and confirmation that previous remote tasks have settled. The normal CPI wrapper does not provision a journal.
+
+Once `pve.storage_allocation_journal_dir` or `pve.storage_placement_namespace` is set, the CPI treats the journal as in use. Before `create_vm` and `delete_vm` touch a VM, they read the journal, even for a VM the journal never recorded, because the directory may hold records that the legacy paths would orphan or allocate a second time. They never fall back to those paths. Calls that only look up an existing CID, such as `has_vm` and `has_disk`, still answer while the namespace is missing or not enrolled, because without an enrolled namespace there are no records for them to read. A journal is usable only when both properties are set and the namespace is enrolled. Until then, `create_vm` and `delete_vm` refuse with an error that names the missing property, the missing directory, or the namespace that is not enrolled, and `delete_vm` also logs that cause at Warn. Enroll the namespace once the Director runs with both properties set, and before any deploy creates or deletes a VM. The CPI does not reject a journal directory without a namespace when it loads its configuration. That is because a cpi-config entry can supply `pve_storage_placement_namespace` for its own cluster while the installed job supplies only the directory, as [Multi-Cluster](multi-cluster.md#storage-set-authorities-across-clusters) describes.
 
 ## The endpoint cache beside the journal
 
