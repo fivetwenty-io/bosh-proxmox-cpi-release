@@ -516,22 +516,75 @@ func acquireClusterLockWithClock(
 			return nil, cpierrors.WrapAs(errors.Join(ErrClusterLockHeld, ErrClusterLockTimeout), cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("AcquireClusterLock: lock %q is held by another process, and this acquire does not wait", pool))
 		}
-		now := clk.now()
-		if !now.Before(deadline) {
-			cause := createErr
-			switch {
-			case notSent != nil:
-				cause = notSent
-			case cause == nil:
-				cause = errors.New("sentinel displaced after create")
-			}
-			return nil, timedOut(cause)
+		cause := createErr
+		switch {
+		case notSent != nil:
+			cause = notSent
+		case cause == nil:
+			cause = errors.New("sentinel displaced after create")
 		}
-		if sleepErr := clk.sleep(ctx, clusterLockPollWait(ctx, now, deadline)); sleepErr != nil {
-			return nil, cpierrors.WrapAs(errors.Join(sleepErr, ErrClusterLockInterrupted), cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("AcquireClusterLock: interrupted waiting for lock %q", pool))
+		if err := awaitNextPoll(ctx, pools, pool, owner, deadline, clk, cause, timedOut); err != nil {
+			return nil, err
 		}
 	}
+}
+
+// awaitNextPoll sleeps a waiting acquire until its next poll should try the
+// create. After each sleep it reads the sentinel, and while another owner's
+// live claim stands it sleeps again without a create (see heldByAnother). It
+// returns nil when the next poll should run, the timeout once the deadline
+// passes, or the interruption when ctx ends. cause is the reason a timeout
+// carries, and it becomes errClusterLockStillHeld once a read has found the
+// sentinel still held.
+func awaitNextPoll(
+	ctx context.Context, pools PoolService, pool, owner string, deadline time.Time, clk lockClock,
+	cause error, timedOut func(error) error,
+) error {
+	for {
+		now := clk.now()
+		if !now.Before(deadline) {
+			return timedOut(cause)
+		}
+		if sleepErr := clk.sleep(ctx, clusterLockPollWait(ctx, now, deadline)); sleepErr != nil {
+			return cpierrors.WrapAs(errors.Join(sleepErr, ErrClusterLockInterrupted), cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("AcquireClusterLock: interrupted waiting for lock %q", pool))
+		}
+		if !heldByAnother(ctx, pools, pool, owner, deadline, clk) {
+			return nil
+		}
+		cause = errClusterLockStillHeld
+	}
+}
+
+// errClusterLockStillHeld is the cause a wait that runs out carries when its
+// last poll found the sentinel held by another owner's live claim, so the
+// poll did not try the create.
+var errClusterLockStillHeld = errors.New("sentinel still held by another owner's live claim")
+
+// heldByAnother reports whether a waiting acquire's next poll can skip its
+// create, because a read shows another owner's live claim on the sentinel.
+// PVE refuses a create of an existing pool under its cluster-wide user.cfg
+// lock, so every refused create still takes that lock. Many waiters polling
+// one held lock would otherwise take it about once a second each, slowing
+// every pool and user change on the cluster, the holder's own release among
+// them.
+// The read takes no lock. It decides only to skip a create, never to take or
+// steal the lock, so any other answer sends the poll down its usual path. A
+// read that fails or finds no sentinel, a claim that has expired or carries
+// no expiry, and our own claim all return false.
+func heldByAnother(
+	ctx context.Context, pools PoolService, pool, owner string, deadline time.Time, clk lockClock,
+) bool {
+	comment, found, err := readLockClaim(ctx, pools, pool, deadline, clk)
+	if err != nil || !found {
+		return false
+	}
+	exp, ok := decodeLockExpiry(comment)
+	if !ok || !clk.now().Before(exp) {
+		return false
+	}
+	holder, ok := decodeLockOwner(comment)
+	return ok && holder != owner
 }
 
 // clusterLockReleaseTimeout bounds a release or an abandon of a sentinel the
