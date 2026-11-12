@@ -35,6 +35,35 @@ const (
 	narrowDefaultPoll   = 2 * time.Second
 )
 
+// narrowUnwindTimeout is the least time each step of the barrier's unwind
+// gets, which is the revert of the pin and the request that puts back the
+// resource's state. The unwind runs after the mutation, and the mutation can
+// spend nearly all of the request's time, as an attach does when it waits for
+// a parker's lock until just before the request's deadline. An unwind on what
+// is left of that time would leave the VM ignored, where PVE HA won't recover
+// it, until a later call finished the barrier.
+const narrowUnwindTimeout = 30 * time.Second
+
+// unwindContext returns the context one step of the barrier's unwind runs on,
+// plus the cancel the caller must defer. Under a request deadline the step
+// keeps the request's values, is free of its cancellation, and gets the
+// longer of narrowUnwindTimeout and the time the request still has, so it
+// never gets less time than it had before. A request with no deadline that is
+// still live keeps its own context, because the step has always had unbounded
+// time there. One that a stop signal has already ended gets
+// narrowUnwindTimeout, so the state still goes back.
+func unwindContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline, bounded := ctx.Deadline()
+	if !bounded && ctx.Err() == nil {
+		return context.WithCancel(ctx)
+	}
+	budget := narrowUnwindTimeout
+	if bounded {
+		budget = max(budget, time.Until(deadline))
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), budget)
+}
+
 // ResourceAPI is the part of the cluster API the barrier uses on the VM's HA
 // resource. The SDK's cluster service satisfies it.
 type ResourceAPI interface {
@@ -388,11 +417,14 @@ func (b *barrier) errored(ctx context.Context, st *pve.HAServiceState) (pve.VMLo
 // failed write is logged, because the narrower pin it leaves only
 // over-confines the VM, and the restore that follows must still run. It
 // returns an error that names the running task when one is still running,
-// and nil otherwise.
+// and nil otherwise. It runs on a context of its own (unwindContext), because
+// the mutation that failed may have spent the request's time.
 func (b *barrier) revertPin(ctx context.Context, node string) error {
 	if b.in.Unchanged == nil || b.in.WritePin == nil || node == "" {
 		return nil
 	}
+	ctx, cancel := unwindContext(ctx)
+	defer cancel()
 	if b.in.Moving == nil {
 		b.deps.Logger.Warn("ha narrow: whether a task for the VM is still running cannot be told; the narrower "+
 			"pin stays", log.Int("vmid", b.in.VMID), log.String("sid", b.sid))
@@ -502,7 +534,9 @@ func (b *barrier) drain(ctx context.Context, requestTime int64, node string) (pv
 				"within %s: %s", b.in.VMID, b.in.Budget, why))
 		}
 		if err := b.deps.Sleep(ctx, b.in.PollInterval); err != nil {
-			return pve.VMLocation{}, err
+			// The request ended during the drain. Nothing has changed the VM
+			// or its pin yet, so its old state is safe to put back.
+			return pve.VMLocation{}, b.restoreAfter(ctx, err)
 		}
 	}
 }
@@ -559,11 +593,15 @@ func (b *barrier) request(ctx context.Context, state string, mark bool) error {
 
 // finish puts back the state the resource had before the barrier and drops
 // the token. A resource an operator left ignored was never touched, so it
-// needs no write.
+// needs no write. The request runs on a context of its own (unwindContext),
+// so a mutation that spent the request's time, or a request that a stop
+// signal ended, still gets the VM back under PVE HA.
 func (b *barrier) finish(ctx context.Context) error {
 	if !b.marked && b.restore == haStateIgnored {
 		return nil
 	}
+	ctx, cancel := unwindContext(ctx)
+	defer cancel()
 	return b.request(ctx, b.restore, false)
 }
 
