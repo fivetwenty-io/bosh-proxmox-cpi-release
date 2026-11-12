@@ -2882,7 +2882,7 @@ These properties control how the CPI behaves when it encounters the failure clas
 
 | Property | Default | Effect |
 |---|---|---|
-| `pve.reboot_timeout` | `60s` | How long the CPI waits for a soft-reboot to complete |
+| `pve.reboot_timeout` | `60s` | How long PVE waits for the guest to shut down during a soft reboot |
 | `pve.reboot_mode` | `soft` | `soft` uses ACPI shutdown; `hard` forces power off |
 | `pve.allow_disk_ops_with_snapshots` | `false` | When `true`, bypasses the snapshot guard on attach, detach, and resize |
 | `pve.require_snapshot_check_pass` | `false` | When `false`, the CPI proceeds (with a warning) if the snapshot-check API call fails; when `true`, any API failure on the snapshot check is a hard error |

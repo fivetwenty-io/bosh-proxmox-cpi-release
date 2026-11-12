@@ -678,8 +678,9 @@ properties:
       reboot_mode is "hard". The CPI polls the reboot task for this many
       seconds plus 60, and for at least 300 seconds. With
       operation_timeout enabled, keep operation_timeout.default_sec well
-      above that poll time, or the call fails with an unknown outcome
-      instead of falling back to a hard reset.
+      above reboot_timeout plus a minute, because the call also needs time
+      to read PVE's verdict and send the hard reset. Otherwise the call
+      fails with an unknown outcome instead of falling back to a hard reset.
     default: 60
   pve.vmid_range_start:
     description: |
@@ -2329,7 +2330,9 @@ properties:
       Deadline in seconds for every other mutating method (reboot_vm,
       attach/detach/resize/snapshot_disk, set_*_metadata, update_disk). Zero
       (default) applies the built-in 600 s. Honored only when
-      operation_timeout.enabled is true.
+      operation_timeout.enabled is true. reboot_vm needs a value well above
+      pve.reboot_timeout plus a minute, or a guest that does not shut down
+      ends with an unknown outcome and no hard reset.
     default: 0
 
   pve.fetch_credential_defaults:
