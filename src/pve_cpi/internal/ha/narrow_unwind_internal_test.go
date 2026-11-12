@@ -129,8 +129,8 @@ type unwindValueKey struct{}
 
 // TestUnwindContext pins the context each unwind step gets: free of the
 // request's cancellation and carrying its values, with the longer of the
-// unwind's own bound and the time the request still has, and the request's
-// own context when it has no deadline and is still live.
+// unwind's own bound and the time the request still has, and no deadline when
+// the request has none and is still live.
 func TestUnwindContext(t *testing.T) {
 	t.Parallel()
 	base := context.WithValue(context.Background(), unwindValueKey{}, "request")
@@ -158,13 +158,19 @@ func TestUnwindContext(t *testing.T) {
 			t.Fatalf("the unwind context has %v left, want about %v", left, wantLeft)
 		}
 	}
-	t.Run("a live request without a deadline keeps its own context", func(t *testing.T) {
+	t.Run("a live request without a deadline gives no deadline", func(t *testing.T) {
 		t.Parallel()
 		check(t, base, 0)
 	})
 	t.Run("a stopped request without a deadline gets the unwind's bound", func(t *testing.T) {
 		t.Parallel()
 		ctx, cancel := context.WithCancel(base)
+		cancel()
+		check(t, ctx, narrowUnwindTimeout)
+	})
+	t.Run("a stopped request with time left gets the unwind's bound", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(base, time.Hour)
 		cancel()
 		check(t, ctx, narrowUnwindTimeout)
 	})
@@ -180,4 +186,119 @@ func TestUnwindContext(t *testing.T) {
 		defer cancel()
 		check(t, ctx, time.Hour)
 	})
+	t.Run("a stop signal during a step leaves it the window", func(t *testing.T) {
+		t.Parallel()
+		const window = 300 * time.Millisecond
+		withDeadline := func() (context.Context, context.CancelFunc) { return context.WithTimeout(base, time.Hour) }
+		withoutDeadline := func() (context.Context, context.CancelFunc) { return context.WithCancel(base) }
+		for name, request := range map[string]func() (context.Context, context.CancelFunc){
+			"with a deadline": withDeadline, "without a deadline": withoutDeadline,
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				ctx, stopRequest := request()
+				defer stopRequest()
+				step, cancel := unwindContextWithin(ctx, window)
+				defer cancel()
+				stopRequest()
+				signalled := time.Now()
+				select {
+				case <-step.Done():
+				case <-time.After(30 * time.Second):
+					t.Fatal("the step outlived its window after the request ended")
+				}
+				if spent := time.Since(signalled); spent < window {
+					t.Fatalf("the step ended %v after the request did, want at least the %v window", spent, window)
+				}
+				if !errors.Is(step.Err(), context.Canceled) {
+					t.Fatalf("the step ended with %v, want it cancelled when its window ran out", step.Err())
+				}
+			})
+		}
+	})
+	t.Run("the caller's cancel ends a step without waiting for the window", func(t *testing.T) {
+		t.Parallel()
+		ctx, stopRequest := context.WithCancel(base)
+		step, cancel := unwindContextWithin(ctx, time.Hour)
+		stopRequest()
+		cancel()
+		select {
+		case <-step.Done():
+		case <-time.After(30 * time.Second):
+			t.Fatal("the step's cancel did not end it")
+		}
+	})
+}
+
+// stopDuringRestore stands in for a stop signal that arrives while the
+// barrier's unwind sends the request that puts back the resource's state.
+type stopDuringRestore struct {
+	endedRequestResources
+	stop func()
+}
+
+func (s stopDuringRestore) UpdateHaResources(ctx context.Context, sid string,
+	p *sdkcluster.UpdateHaResourcesParams,
+) error {
+	if p.State != nil && *p.State != haStateIgnored {
+		s.stop()
+	}
+	return s.endedRequestResources.UpdateHaResources(ctx, sid, p)
+}
+
+// TestNarrowUnwindOutlivesAStopSignal is a request with no deadline, the
+// default when operation_timeout is off, whose mutation fails for its own
+// reason. A stop signal then ends the request while the unwind runs, either
+// during the pin revert or during the request that puts back the state. Both
+// steps must still go through, so the VM ends back in started under its old
+// pin with its comment as it was.
+func TestNarrowUnwindOutlivesAStopSignal(t *testing.T) {
+	t.Parallel()
+	for _, during := range []string{"the pin revert", "the state restore"} {
+		t.Run(during, func(t *testing.T) {
+			t.Parallel()
+			r := &barrierRig{state: "started", settleOn: []string{"a"},
+				states: []*pve.HAServiceState{crm("started", 100, 90, 95), dropped("a", 110, 120, 125)}}
+			ctx, stop := context.WithCancel(context.Background())
+			defer stop()
+			deps := r.deps()
+			deps.Resources = endedRequestResources{rig: r}
+			if during == "the state restore" {
+				deps.Resources = stopDuringRestore{endedRequestResources: endedRequestResources{rig: r}, stop: stop}
+			}
+			mutateErr := errors.New("the config write failed")
+			deps.Mutate = func(_ context.Context, m pve.VMConfigMutation) (pve.VMLocation, error) {
+				r.events = append(r.events, "mutate:"+m.Node)
+				return pve.VMLocation{}, mutateErr
+			}
+			in := r.input(&pinAB, &pinA)
+			writePin := in.WritePin
+			in.WritePin = func(ctx context.Context, pin *Rule) error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				return writePin(ctx, pin)
+			}
+			in.Moving = func(ctx context.Context, _ string) (bool, error) {
+				if during == "the pin revert" {
+					stop()
+				}
+				return false, ctx.Err()
+			}
+			in.Unchanged = func(ctx context.Context, _ string) (bool, error) { return true, ctx.Err() }
+
+			_, err := NarrowActive(ctx, deps, in)
+			if !errors.Is(err, mutateErr) {
+				t.Fatalf("err = %v, want the mutation's own failure", err)
+			}
+			want := []string{"request:ignored", "pin:a", "mutate:a", "pin:" + pinAB.NodesParam(), "request:started"}
+			if !slices.Equal(r.events, want) {
+				t.Fatalf("events %v, want %v", r.events, want)
+			}
+			if r.state != "started" || r.currentComment() != "owner" {
+				t.Fatalf("the resource is %s with comment %q, want it back to started with its comment",
+					r.state, r.currentComment())
+			}
+		})
+	}
 }

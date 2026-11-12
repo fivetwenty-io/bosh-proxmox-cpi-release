@@ -41,27 +41,65 @@ const (
 // spend nearly all of the request's time, as an attach does when it waits for
 // a parker's lock until just before the request's deadline. An unwind on what
 // is left of that time would leave the VM ignored, where PVE HA won't recover
-// it, until a later call finished the barrier.
+// it, until a later call finished the barrier. It is also the time a step
+// still gets once a stop signal ends the request, so the state goes back
+// before the process exits.
 const narrowUnwindTimeout = 30 * time.Second
 
 // unwindContext returns the context one step of the barrier's unwind runs on,
-// plus the cancel the caller must defer. Under a request deadline the step
-// keeps the request's values, is free of its cancellation, and gets the
-// longer of narrowUnwindTimeout and the time the request still has, so it
-// never gets less time than it had before. A request with no deadline that is
-// still live keeps its own context, because the step has always had unbounded
-// time there. One that a stop signal has already ended gets
-// narrowUnwindTimeout, so the state still goes back.
+// plus the cancel the caller must defer. The step keeps the request's values
+// and is free of its cancellation, so a stop signal never cuts it off at once.
+// Instead, the step gets narrowUnwindTimeout from the moment the request ends,
+// whether the request had a deadline or not. That matches how the process
+// stops, because main lets the request in flight finish before it exits, and
+// every other detached restore has a short fixed bound too. While the request
+// is live, a step under a deadline gets the longer of narrowUnwindTimeout and
+// the time the request still has, so it never gets less time than it had
+// before, and a step with no deadline keeps the unbounded time it has always
+// had there.
 func unwindContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	deadline, bounded := ctx.Deadline()
-	if !bounded && ctx.Err() == nil {
-		return context.WithCancel(ctx)
+	return unwindContextWithin(ctx, narrowUnwindTimeout)
+}
+
+// unwindContextWithin is unwindContext with the window a step gets after the
+// request ends as a parameter, so tests can use a short one.
+func unwindContextWithin(ctx context.Context, window time.Duration) (context.Context, context.CancelFunc) {
+	detached := context.WithoutCancel(ctx)
+	if ctx.Err() != nil {
+		return context.WithTimeout(detached, window)
 	}
-	budget := narrowUnwindTimeout
-	if bounded {
-		budget = max(budget, time.Until(deadline))
+	var (
+		step   context.Context
+		cancel context.CancelFunc
+	)
+	if deadline, bounded := ctx.Deadline(); bounded {
+		step, cancel = context.WithDeadline(detached, later(deadline, time.Now().Add(window)))
+	} else {
+		step, cancel = context.WithCancel(detached)
 	}
-	return context.WithTimeout(context.WithoutCancel(ctx), budget)
+	// The callback runs only once the request ends, and it returns when the
+	// window runs out or the caller's deferred cancel ends the step.
+	stop := context.AfterFunc(ctx, func() {
+		timer := time.NewTimer(window)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			cancel()
+		case <-step.Done():
+		}
+	})
+	return step, func() {
+		stop()
+		cancel()
+	}
+}
+
+// later returns the later of a and b.
+func later(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 // ResourceAPI is the part of the cluster API the barrier uses on the VM's HA
