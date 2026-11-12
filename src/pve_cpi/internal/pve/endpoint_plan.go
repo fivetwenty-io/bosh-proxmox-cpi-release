@@ -218,8 +218,8 @@ func wireEndpoints(cfg *config.CPIConfig) (sdkclient.Options, *endpointWiring, e
 // The endpoints are settled first. If the pool would refuse the cached
 // endpoints, the plan keeps the configured endpoints alone, before the timeouts
 // are sized from the plan, so a client that falls back to one endpoint with
-// discovery effectively off keeps the timeouts of a pool of one. A cache file can cost the client its
-// discovered nodes and never the client itself.
+// discovery effectively off keeps the timeouts of a pool of one. A cache file
+// can cost the client its discovered nodes and never the client itself.
 func (w *endpointWiring) apply(opts sdkclient.Options, logger *log.Logger, cache *endpointCache) sdkclient.Options {
 	if w.plan.configured < len(w.plan.endpoints) {
 		if err := endpointpool.CheckEndpoints(w.plan.endpoints); err != nil {

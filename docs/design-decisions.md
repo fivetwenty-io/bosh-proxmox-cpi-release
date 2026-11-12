@@ -379,7 +379,7 @@ A bare CID, and a CID with the stamp `00000000`, keep the answer an absent VM al
 
 **The cluster lock gets a send-by deadline.** The lock's mutual exclusion depends on a stealer's delete arriving soon after its last read. A failover hop can add up to 15 seconds of connect time, so the steal sets a deadline, and the pool refuses to send the delete once it has passed.
 
-**Operator-visible consequences.** With two or more endpoints, or with one endpoint while discovery is effectively on, the CPI uses a 5-second dial timeout and a 10-second handshake timeout when we leave them at 0, and idempotent requests carry a 60-second response-header deadline except on a walk's last hop. A configured endpoint that fails certificate verification is logged at Error as possible interception, and the walk moves on. A pool of one endpoint with discovery effectively off behaves as it did before. Rolling back to 0.9.7 needs `pve.host` kept beside `pve.endpoints`, as [Operations](operations.md#rolling-back-below-endpoint-lists) describes.
+**Operator-visible consequences.** With two or more endpoints, or with one endpoint while discovery is effectively on, the CPI uses a 5-second dial timeout and a 10-second handshake timeout when we leave them at 0. Idempotent requests carry a 60-second response-header deadline except on a walk's last hop, but only when the pool holds two or more endpoints. A configured endpoint that fails certificate verification is logged at Error as possible interception, and the walk moves on. A pool of one endpoint with discovery effectively off behaves as it did before. Rolling back to 0.9.7 needs `pve.host` kept beside `pve.endpoints`, as [Operations](operations.md#rolling-back-below-endpoint-lists) describes.
 
 ## Out of scope
 

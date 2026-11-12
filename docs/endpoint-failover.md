@@ -44,7 +44,7 @@ We recommend API tokens for every deployment that uses failover. A token is a he
 
 ## How a call walks the list
 
-The CPI installs the failover transport when the pool holds more than one endpoint, and also when discovery is in effect, so the transport sees the first answered request even if the pool starts with one endpoint. A client with neither keeps the SDK's own transport, so it has no dial deadline and no header deadline, exactly as before. A pool of one endpoint with discovery effectively on gets the transport and also the dial and handshake defaults.
+The CPI installs the failover transport when the pool holds more than one endpoint, and also when discovery is in effect, so the transport sees the first answered request even if the pool starts with one endpoint. A client with neither keeps the SDK's own transport, so it has no dial deadline and no header deadline, exactly as before.
 
 The transport sorts each request into one of four kinds before it does anything else.
 
@@ -149,7 +149,7 @@ That error unwraps to a single dial error, so the SDK's own retry stops at once 
 
 When you left `pve.api_dial_timeout_sec` and `pve.api_tls_handshake_timeout_sec` at 0, the CPI uses 5 seconds for the dial and 10 seconds for the TLS handshake in two cases. The first is a pool that holds more than one endpoint at construction. The second is a pool that holds one endpoint while discovery is effectively on, which is the case for a name seed with no cache yet, because that pool is meant to grow and a seed that is down would otherwise hold each attempt for the operating system's full connect timeout. A pool of one endpoint with discovery effectively off keeps the SDK's own transport settings. A value you set yourself always wins.
 
-The same pools give a read a response-header deadline of 60 seconds. Go starts that timer after the request is fully written, so it measures how long the node takes to start answering. It catches a node whose pveproxy accepts the connection and then stops responding, which used to hold a request for the 30-minute client timeout. The deadline applies only to a read that the entry node would be blamed for and that is not on the walk's final hop. A mutation never gets one, because a synchronous mutation or an upload can run for a long time legitimately.
+A pool of more than one endpoint also gives a read a response-header deadline of 60 seconds, and a pool of one endpoint gets no header deadline. Go starts that timer after the request is fully written, so it measures how long the node takes to start answering. It catches a node whose pveproxy accepts the connection and then stops responding, which used to hold a request for the 30-minute client timeout. The deadline applies only to a read that the entry node would be blamed for and that is not on the walk's final hop. A mutation never gets one, because a synchronous mutation or an upload can run for a long time legitimately.
 
 A healthy pveproxy answers a dial in milliseconds and a read well inside a minute, so we do not expect these values to matter on a healthy cluster.
 

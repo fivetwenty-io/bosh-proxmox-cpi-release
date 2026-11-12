@@ -969,3 +969,41 @@ func readDirNames(dir string) ([]string, error) {
 	}
 	return names, nil
 }
+
+// A lone endpoint whose cache directory is unusable has discovery effectively
+// off for the call, so it keeps the SDK's own timeouts. An explicit value
+// still wins, and so does the lone endpoint under mode off.
+func TestApplyGivesALoneEndpointNoPoolTimeoutsWhenTheCacheIsUnusableOrDiscoveryIsOff(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-parent", "missing")
+	for _, tc := range []struct {
+		name         string
+		mode         config.DiscoveryMode
+		dir          string
+		dial, shake  int
+		wantD, wantH int
+	}{
+		{"unusable directory", config.DiscoveryModeAuto, missing, 0, 0, 0, 0},
+		{"unusable directory with explicit values", config.DiscoveryModeAuto, missing, 3, 4, 3, 4},
+		{"mode off", config.DiscoveryModeOff, newCacheDir(t), 0, 0, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := cacheTestConfig(tc.mode, tc.dir)
+			opts, wiring, err := wireEndpoints(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts.APIToken = cfg.APIToken
+			opts.DialTimeoutSec, opts.TLSHandshakeTimeoutSec = tc.dial, tc.shake
+			cache := openEndpointCache(cfg, &wiring.plan, log.NewNopLogger())
+			t.Cleanup(cache.release)
+			if tc.dir == missing && !wiring.plan.cacheUnusable {
+				t.Fatal("the directory was usable, want an unusable one")
+			}
+			opts = wiring.apply(opts, log.NewNopLogger(), cache)
+			if opts.DialTimeoutSec != tc.wantD || opts.TLSHandshakeTimeoutSec != tc.wantH {
+				t.Errorf("dial %d and handshake %d, want %d and %d", opts.DialTimeoutSec,
+					opts.TLSHandshakeTimeoutSec, tc.wantD, tc.wantH)
+			}
+		})
+	}
+}
