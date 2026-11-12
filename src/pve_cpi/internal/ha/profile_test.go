@@ -1265,8 +1265,52 @@ func TestIdleCRMThatNamesItsOldMasterIsNotAGap(t *testing.T) {
 	if !p.HAStateReadable() || p.Health.HA != pve.HAViewIdle {
 		t.Fatalf("an idle CRM must read as idle: view=%s readable=%v", p.Health.HA, p.HAStateReadable())
 	}
-	if !strings.Contains(p.Advice, "HA stack idle, no resources configured yet") {
+	// The resources were removed, so "yet" would be wrong here.
+	if !strings.Contains(p.Advice, "HA stack idle, no resources configured") || strings.Contains(p.Advice, "yet") {
 		t.Fatalf("advice = %q", p.Advice)
+	}
+	// No node runs the master of an idle CRM, so the old master_node is not
+	// reported as one.
+	if p.CRMMaster != "" || !strings.Contains(p.LogLine(), " crm=idle ") {
+		t.Fatalf("master=%q line=%q", p.CRMMaster, p.LogLine())
+	}
+}
+
+// An idle CRM writes nothing, so the profile cannot tell an idle stack from a
+// dead one by its manager status. Both idle cases reach full only when
+// pve-ha-crm runs on the entry node, and a stopped or unreadable service keeps
+// a gap, so auto mode never registers resources that no CRM would process.
+func TestIdleCRMNeedsARunningCRMService(t *testing.T) {
+	cases := map[string]struct {
+		setup func(w *world)
+		want  string
+	}{
+		"stopped after the last resource was removed": {
+			setup: func(w *world) { w.crmStamp = now - 1908*3600; w.crmService = "dead" },
+			want:  `pve-ha-crm on pve1 is not running (state "dead")`,
+		},
+		"stopped on a cluster that never had a resource": {
+			setup: func(w *world) { w.managerBody = noMasterBody(); w.crmService = "dead" },
+			want:  `pve-ha-crm on pve1 is not running (state "dead")`,
+		},
+		"unreadable": {
+			setup: func(w *world) { w.crmStamp = now - 1908*3600; w.crmServiceErr = errors.New("403 forbidden") },
+			want:  "the state of pve-ha-crm on pve1 is unreadable: 403 forbidden",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			w := three()
+			w.noResources = true
+			tc.setup(w)
+			p := resolve(t, w, cfgMode(config.HAModeAuto))
+			if p.Effective != ha.EffectiveObserveOnly || !strings.Contains(p.Reason, tc.want) {
+				t.Fatalf("effective=%s reason=%q; want observe-only naming %q", p.Effective, p.Reason, tc.want)
+			}
+			if strings.Contains(p.Advice, "idle") || strings.Contains(p.LogLine(), "crm=idle") {
+				t.Fatalf("a dead CRM must not read as idle: advice=%q line=%q", p.Advice, p.LogLine())
+			}
+		})
 	}
 }
 

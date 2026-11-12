@@ -118,7 +118,9 @@ type Profile struct {
 	RulesSupported bool
 	DLBSupported   bool
 
-	// CRMMaster is the node that runs the CRM master, empty when none does.
+	// CRMMaster is the node that runs the CRM master, empty when none does. An
+	// idle CRM's manager status still names the node that ran its last round,
+	// and the profile leaves that node out, because no node runs the master.
 	CRMMaster string
 
 	// Health is the merged node health report, nil when it could not be built.
@@ -154,7 +156,7 @@ type Profile struct {
 	partial bool
 
 	// crmNote is advice recorded when the CRM is idle because no HA resource
-	// exists yet. finish folds it into Advice.
+	// exists. finish folds it into Advice, and String prints crm=idle.
 	crmNote string
 
 	// CPUDomains groups the nodes by CPU model and flags. UnknownCPUNodes lists
@@ -288,7 +290,7 @@ func (p *Profile) probe(ctx context.Context, deps Deps) {
 	}
 	master, merr := readCRMMaster(ctx, deps.Cluster)
 	p.CRMMaster = master
-	p.checkCRM(ctx, deps.Cluster, merr)
+	p.checkCRM(ctx, deps, merr)
 
 	source := deps.Slow
 	if source == nil {
@@ -311,28 +313,50 @@ func (p *Profile) probe(ctx context.Context, deps Deps) {
 	p.Replication, p.ReplicationErr = readReplication(ctx, deps.Cluster)
 }
 
-// checkCRM records a gap unless a fresh CRM master exists. The one exception
-// is a quorate cluster whose HA resource list was read and is empty. PVE's CRM
-// stays idle and holds no manager lock until the first resource exists, so
-// registering that first resource is what starts it, and a gap there would
-// keep the profile from ever reaching full. A CRM that went idle after the
-// last resource was removed still names its old master, and node health
-// reports it idle. A resource list that cannot be read, or that is not empty,
-// keeps the gap so the check fails closed.
-func (p *Profile) checkCRM(ctx context.Context, api ClusterAPI, masterErr error) {
+// checkCRM records a gap unless a fresh CRM master exists or the HA stack is
+// idle. PVE's CRM stays idle and holds no manager lock while the cluster has
+// no HA resource, so registering the first resource is what starts it, and a
+// gap there would keep the profile from ever reaching full. A quorate cluster
+// whose manager status names no master and whose resource list was read and
+// is empty has never left that state. A CRM that went idle after the last
+// resource was removed still names its old master, and node health reports it
+// idle. A resource list that cannot be read, or that is not empty, keeps the
+// gap so the check fails closed.
+//
+// An idle CRM writes nothing, so its manager status cannot tell an idle stack
+// from a dead one. Either idle case therefore also needs pve-ha-crm to run on
+// the entry node, because a profile that reached full on a dead stack would
+// register resources that no CRM ever processes.
+func (p *Profile) checkCRM(ctx context.Context, deps Deps, masterErr error) {
+	note := ""
 	switch {
 	case masterErr != nil:
 		p.addGap("HA manager status unreadable: " + masterErr.Error())
 	case p.Health == nil:
 		p.addGap("node health unreadable: " + p.HealthErr)
-	case p.CRMMaster == "" && p.crmIdle(ctx, api):
-		p.crmNote = "HA stack idle, no resources configured yet"
 	case p.Health.HA == pve.HAViewIdle:
-		p.crmNote = "HA stack idle, no resources configured yet"
+		p.CRMMaster = ""
+		note = "HA stack idle, no resources configured"
+	case p.CRMMaster == "" && p.crmIdle(ctx, deps.Cluster):
+		note = "HA stack idle, no resources configured yet"
 	case p.Health.HA != pve.HAViewManagerStatus:
 		p.addGap(fmt.Sprintf("no CRM master with a fresh status (HA view %s: %s)", p.Health.HA, p.Health.HAReason))
 	case p.CRMMaster == "":
 		p.addGap("manager status names no CRM master")
+	}
+	if note == "" {
+		return
+	}
+	state, err := readCRMServiceState(ctx, deps.Nodes, p.EntryNode)
+	switch {
+	case err != nil:
+		p.addGap(fmt.Sprintf("the HA stack is idle, and the state of %s on %s is unreadable: %v",
+			crmServiceName, p.EntryNode, err))
+	case state != serviceRunning:
+		p.addGap(fmt.Sprintf("the HA stack is idle, and %s on %s is not running (state %q)",
+			crmServiceName, p.EntryNode, state))
+	default:
+		p.crmNote = note
 	}
 }
 
@@ -614,8 +638,11 @@ func (p *Profile) LogLine() string {
 		version = "unknown"
 	}
 	crm := "none"
-	if p.CRMMaster != "" {
+	switch {
+	case p.CRMMaster != "":
 		crm = "master@" + p.CRMMaster
+	case p.crmNote != "":
+		crm = "idle"
 	}
 	votes, survives := "unknown", "unknown"
 	if p.Quorum.Known {

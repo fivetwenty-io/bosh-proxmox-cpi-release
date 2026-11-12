@@ -37,6 +37,7 @@ type NodesAPI interface {
 	pve.NodeHealthNodes
 	ListVersion(ctx context.Context, node string) (*sdknodes.ListVersionResponse, error)
 	ListStatus(ctx context.Context, node string) (*sdknodes.ListStatusResponse, error)
+	ListServicesState(ctx context.Context, node string, service string) (*sdknodes.ListServicesStateResponse, error)
 }
 
 // StorageAPI is the subset of the PVE storage API the profile reads. It is
@@ -494,6 +495,34 @@ func readClusterStatus(ctx context.Context, api ClusterAPI) (*clusterStatus, err
 	}
 	sort.Slice(cs.Nodes, func(i, j int) bool { return cs.Nodes[i].Name < cs.Nodes[j].Name })
 	return cs, nil
+}
+
+// crmServiceName is the systemd unit of PVE's cluster resource manager, and
+// serviceRunning is the state PVE reports for a unit whose process runs.
+const (
+	crmServiceName = "pve-ha-crm"
+	serviceRunning = "running"
+)
+
+// readCRMServiceState returns the state that PVE reports for pve-ha-crm on
+// node, such as running or dead.
+func readCRMServiceState(ctx context.Context, nodes NodesAPI, node string) (string, error) {
+	if nodes == nil {
+		return "", fmt.Errorf("no nodes client")
+	}
+	var resp *sdknodes.ListServicesStateResponse
+	err := pve.RetryOnTransient(ctx, nil, "ha_profile_crm_service", 0, func() error {
+		var inner error
+		resp, inner = nodes.ListServicesState(ctx, node, crmServiceName)
+		return inner
+	})
+	if err != nil {
+		return "", err
+	}
+	if resp == nil {
+		return "", fmt.Errorf("no body")
+	}
+	return resp.State, nil
 }
 
 // readCRMMaster returns the name of the CRM master from manager status, or ""

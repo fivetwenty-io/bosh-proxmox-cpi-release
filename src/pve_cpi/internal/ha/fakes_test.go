@@ -59,6 +59,8 @@ type world struct {
 	replication     []json.RawMessage
 	noResources     bool // the cluster has no HA resources, so the CRM is idle
 	resourcesErr    error
+	crmService      string // pve-ha-crm's state on every node, "running" when empty
+	crmServiceErr   error
 	storageBody     []json.RawMessage
 	storageErr      error
 
@@ -214,9 +216,51 @@ func (c *fakeCluster) ListHaStatusManagerStatus(_ context.Context) (*sdkcluster.
 	return &body, nil
 }
 
+// ListHaStatusCurrent answers the way PVE builds status/current on the entry
+// node: the quorum row, the master row of the default manager status, whose
+// state is idle when its timestamp is more than 30 seconds old and no resource
+// is configured, and the service row of the one resource. The lrm rows are
+// left out, because node health reads them only when manager status is empty.
+// An overridden manager status gets the quorum row alone.
 func (c *fakeCluster) ListHaStatusCurrent(_ context.Context) (*sdkcluster.ListHaStatusCurrentResponse, error) {
 	c.hit("current")
-	resp := sdkcluster.ListHaStatusCurrentResponse{}
+	w := c.w
+	entry := w.entry
+	if entry == "" && len(w.nodes) > 0 {
+		entry = w.nodes[0].name
+	}
+	quorate := 1
+	if w.notQuorate {
+		quorate = 0
+	}
+	resp := sdkcluster.ListHaStatusCurrentResponse{
+		mustJSON(map[string]any{"id": "quorum", "type": "quorum", "node": entry, "quorate": quorate}),
+	}
+	if w.managerBody != nil {
+		return &resp, nil
+	}
+	stamp := w.crmStamp
+	if stamp == 0 {
+		stamp = now
+	}
+	master := w.master
+	if master == "" && len(w.nodes) > 0 {
+		master = w.nodes[0].name
+	}
+	state := "active"
+	if now-stamp > 30 || now-stamp < -2 {
+		state = "old timestamp - dead?"
+		if w.noResources {
+			state = "idle"
+		}
+	}
+	resp = append(resp, mustJSON(map[string]any{
+		"id": "master", "type": "master", "node": master, "timestamp": stamp,
+		"status": master + " (" + state + ", Mon Aug 24 16:37:54 2026)",
+	}))
+	if !w.noResources {
+		resp = append(resp, mustJSON(map[string]any{"id": "service:vm:100", "type": "service", "sid": "vm:100"}))
+	}
 	return &resp, nil
 }
 
@@ -331,6 +375,20 @@ func (n *fakeNodes) ListTime(_ context.Context, _ string) (*sdknodes.ListTimeRes
 		return nil, err
 	}
 	return &resp, nil
+}
+
+func (n *fakeNodes) ListServicesState(
+	_ context.Context, node, service string,
+) (*sdknodes.ListServicesStateResponse, error) {
+	n.hit("service:" + node + ":" + service)
+	if n.w.crmServiceErr != nil {
+		return nil, n.w.crmServiceErr
+	}
+	state := n.w.crmService
+	if state == "" {
+		state = "running"
+	}
+	return &sdknodes.ListServicesStateResponse{Service: service, Name: service, State: state}, nil
 }
 
 func (n *fakeNodes) ListVersion(_ context.Context, node string) (*sdknodes.ListVersionResponse, error) {
