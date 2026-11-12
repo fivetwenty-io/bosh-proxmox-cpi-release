@@ -675,7 +675,11 @@ properties:
     description: |
       Seconds the soft reboot waits for graceful ACPI shutdown before
       falling back to a hard reset. Range 1-3600. Ignored when
-      reboot_mode is "hard".
+      reboot_mode is "hard". The CPI polls the reboot task for this many
+      seconds plus 60, and for at least 300 seconds. With
+      operation_timeout enabled, keep operation_timeout.default_sec well
+      above that poll time, or the call fails with an unknown outcome
+      instead of falling back to a hard reset.
     default: 60
   pve.vmid_range_start:
     description: |
