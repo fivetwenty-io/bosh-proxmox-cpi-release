@@ -2616,9 +2616,9 @@ func ParkerProtectionLockTTLNow() time.Duration { return parkerProtectionLockTTL
 // ParkerLockSweepWait is the wait for the lock that the deferred-teardown
 // sweep sets through WithParkerLockWaitAtMost. Every other caller waits one
 // whole TTL, which is the default (parkerLockTimeoutsFrom). The sweep runs as
-// housekeeping inside another request, so it gives up on a busy parker after
-// this long rather than hold up the request that runs it, and its next run
-// tries again. On timeout the acquire fails retriably with
+// housekeeping inside another request, so it gives up on a busy parker, or on
+// a busy disk's transfer lock, after this long rather than hold up the
+// request that runs it for minutes, and its next run tries again. On timeout the acquire fails retriably with
 // ErrClusterLockTimeout, because a live holder was inside the window
 // throughout; see withParkerProtectionLock.
 const ParkerLockSweepWait = 15 * time.Second
@@ -2662,13 +2662,32 @@ func WithParkerLockWait(ctx context.Context, d time.Duration) context.Context {
 }
 
 // WithParkerLockWaitAtMost returns a context whose protection-window lock
-// acquires wait no longer than d. A wait ctx already sets that is shorter than
-// d is kept, and a non-positive d leaves ctx as it is.
+// acquires wait no longer than d. It also caps at d the wait for the per-disk
+// transfer lock that a stable-ID transfer takes before the parker's lock (see
+// diskTransferLockTimeouts), so a caller that gives up on a busy parker early
+// gives up on a busy disk just as early. A wait ctx already sets that is
+// shorter than d is kept, and a non-positive d leaves ctx as it is.
 func WithParkerLockWaitAtMost(ctx context.Context, d time.Duration) context.Context {
-	if _, wait := parkerLockTimeoutsFrom(ctx); d <= 0 || wait <= d {
+	if d <= 0 {
+		return ctx
+	}
+	if ceiling, ok := parkerLockWaitCeiling(ctx); !ok || d < ceiling {
+		ctx = context.WithValue(ctx, parkerLockWaitCeilingKey{}, d)
+	}
+	if _, wait := parkerLockTimeoutsFrom(ctx); wait <= d {
 		return ctx
 	}
 	return WithParkerLockWait(ctx, d)
+}
+
+// parkerLockWaitCeilingKey carries the cap WithParkerLockWaitAtMost set.
+type parkerLockWaitCeilingKey struct{}
+
+// parkerLockWaitCeiling returns the cap WithParkerLockWaitAtMost set on ctx,
+// and whether it set one.
+func parkerLockWaitCeiling(ctx context.Context) (time.Duration, bool) {
+	d, ok := ctx.Value(parkerLockWaitCeilingKey{}).(time.Duration)
+	return d, ok && d > 0
 }
 
 // WithParkerLockTTLForTest returns a context whose protection-window lock

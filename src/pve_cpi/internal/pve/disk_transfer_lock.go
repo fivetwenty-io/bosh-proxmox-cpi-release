@@ -52,11 +52,19 @@ func DiskTransferLockPoolName(stableID string) string {
 // disk waits out a holder that keeps the lock for as long as its claim allows,
 // and a crashed holder's claim expires and is stolen inside the wait. A waiter
 // is therefore bounded by the TTL plus the grace, and the acquire itself also
-// stops waiting before the request's deadline (clusterLockDeadline).
+// stops waiting before the request's deadline (clusterLockDeadline). The one
+// exception is a caller that capped its lock waits through
+// WithParkerLockWaitAtMost, which is the deferred-teardown sweep. It waits no
+// longer than that cap for the disk's lock either, and only its wait shrinks,
+// so a claim it does take still lasts the full TTL.
 func diskTransferLockTimeouts(ctx context.Context) (time.Duration, time.Duration) {
 	parkerTTL, parkerWait := parkerLockTimeoutsFrom(ctx)
 	ttl := parkerTTL + parkerWait
-	return ttl, ttl + clusterLockGrace()
+	wait := ttl + clusterLockGrace()
+	if ceiling, ok := parkerLockWaitCeiling(ctx); ok {
+		wait = min(wait, ceiling)
+	}
+	return ttl, wait
 }
 
 // diskTransferLockOptions are the options a per-disk transfer lock acquire with

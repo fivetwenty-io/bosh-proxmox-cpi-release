@@ -614,12 +614,43 @@ func TestWithDiskTransferLock_WaitsOutAHolderPastTheParkerWait(t *testing.T) {
 	}
 }
 
+// TestWithDiskTransferLock_SweepCapGivesUpEarly pins that a transfer run
+// under the sweep's cap gives up on a busy disk after the cap, as it does on a
+// busy parker, rather than wait out the disk lock's whole TTL. Another holder
+// keeps the disk's lock and never leaves. The acquire must fail with the
+// retriable lock timeout after about ParkerLockSweepWait, and the work under
+// the lock must never run.
+func TestWithDiskTransferLock_SweepCapGivesUpEarly(t *testing.T) {
+	t.Parallel()
+	key := ClusterLockPoolName(diskTransferLockName(transferStableID))
+	pools := newFakeLockPools()
+	clk := &fakeLockClock{base: time.Now()}
+	pools.pools[key] = encodeLockComment("holder", clk.base.Add(time.Hour))
+	ctx := WithParkerLockWaitAtMost(withTestParkerLockClock(context.Background(), clk.clock()), ParkerLockSweepWait)
+	ran := false
+	err := withDiskTransferLock(ctx, &parkerLockClient{pools: pools}, nil, transferStableID, "sweep",
+		func(context.Context) error {
+			ran = true
+			return nil
+		})
+	if !errors.Is(err, ErrClusterLockTimeout) {
+		t.Fatalf("err = %v, want the cluster lock timeout", err)
+	}
+	if ran {
+		t.Fatal("the work under the disk lock ran although the lock was never taken")
+	}
+	waited := time.Duration(clk.offset.Load())
+	if waited < ParkerLockSweepWait || waited > ParkerLockSweepWait+5*time.Second {
+		t.Fatalf("the sweep waited %s for the disk's lock, want about %s", waited, ParkerLockSweepWait)
+	}
+}
+
 // TestDiskTransferLockTimeouts_CoverTheParkerWait pins the disk lock's TTL
 // against the caller's effective parker wait. The TTL is the parker TTL plus
 // that wait, whether it is the default whole TTL, the sweep's shorter one, or
 // a test's from WithParkerLockWait, so the parker acquire inside the disk lock is never
 // shortened by the disk claim. A waiter is bounded by the TTL plus the create
-// grace.
+// grace, except under the sweep's cap, where it waits no longer than the cap.
 func TestDiskTransferLockTimeouts_CoverTheParkerWait(t *testing.T) {
 	t.Parallel()
 	parkerTTL := parkerProtectionLockTTLNow()
@@ -627,10 +658,17 @@ func TestDiskTransferLockTimeouts_CoverTheParkerWait(t *testing.T) {
 		name     string
 		ctx      context.Context
 		wantWait time.Duration
+		// capped is the disk lock's own wait when the caller capped it, and
+		// zero when the wait is the TTL plus the grace.
+		capped time.Duration
 	}{
-		{"default wait of a whole parker TTL", context.Background(), parkerTTL},
-		{"sweep wait", WithParkerLockWaitAtMost(context.Background(), ParkerLockSweepWait), ParkerLockSweepWait},
-		{"wait of an hour", WithParkerLockWait(context.Background(), time.Hour), time.Hour},
+		{"default wait of a whole parker TTL", context.Background(), parkerTTL, 0},
+		{"sweep wait", WithParkerLockWaitAtMost(context.Background(), ParkerLockSweepWait), ParkerLockSweepWait,
+			ParkerLockSweepWait},
+		{"sweep cap over a shorter test wait",
+			WithParkerLockWaitAtMost(WithParkerLockWait(context.Background(), 5*time.Second), ParkerLockSweepWait),
+			5 * time.Second, ParkerLockSweepWait},
+		{"wait of an hour", WithParkerLockWait(context.Background(), time.Hour), time.Hour, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -639,8 +677,12 @@ func TestDiskTransferLockTimeouts_CoverTheParkerWait(t *testing.T) {
 			if want := parkerTTL + tc.wantWait; ttl != want {
 				t.Fatalf("ttl = %s, want the parker TTL plus the caller's parker wait, %s", ttl, want)
 			}
-			if wait != ttl+clusterLockGrace() {
-				t.Fatalf("wait = %s, want the TTL plus the create grace, %s", wait, ttl+clusterLockGrace())
+			want := ttl + clusterLockGrace()
+			if tc.capped > 0 {
+				want = tc.capped
+			}
+			if wait != want {
+				t.Fatalf("wait = %s, want %s", wait, want)
 			}
 		})
 	}
