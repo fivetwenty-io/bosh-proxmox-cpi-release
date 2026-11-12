@@ -2276,9 +2276,12 @@ func Load(r io.Reader) (*CPIConfig, error) {
 
 	// Collect strict unknown-key errors here (needs raw bytes) alongside the
 	// standard Validate pass. Both accumulate into the same error list so the
-	// operator sees all violations in one shot.
+	// operator sees all violations in one shot. The journal pair check runs
+	// here too, so it applies to the job's own configuration and not to the
+	// effective configuration of a cpi-config entry.
 	var strictErrs []string
 	cfg.validateStrictUnknownKeys(raw, &strictErrs)
+	cfg.validateStorageJournalPair(&strictErrs)
 	warnFastPathDeleteNonRootIdentity(&cfg, os.Stderr)
 	warnParkedDefaultBandCollision(&cfg, os.Stderr)
 	if err := cfg.ValidateWithLogger(nil); err != nil {
@@ -4318,7 +4321,6 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	if err := c.ValidateStoragePlacement(); err != nil {
 		errs = append(errs, err.Error())
 	}
-	c.validateStorageJournalPair(&errs)
 	c.validateDiskPerformance(&errs)
 	c.validateVMPool(&errs)
 	c.validateStemcellTemplatePool(&errs)

@@ -338,10 +338,15 @@ const StorageJournalPairError = "pve.storage_placement_namespace is set but " +
 // because it is process-level and a cpi-config entry may not set it (see
 // validateStoragePlacementContext), and a context inherits the job's value.
 // The reverse half is accepted, because an entry can supply
-// pve_storage_placement_namespace for a directory the job sets. Validate runs
-// on the job's configuration and again on each entry's effective one, so an
-// entry that adds a namespace to a job without a journal directory is refused
-// as well.
+// pve_storage_placement_namespace for a directory the job sets.
+//
+// Load runs this check on the job's configuration only, and Validate does not,
+// so ApplyContextOverrides never applies it to an entry's effective
+// configuration. An entry that adds a namespace to a job without a journal
+// directory still applies. Its create_vm, delete_vm, and journal-managed disk
+// calls refuse at the journal gates, which name the entry, and its other calls
+// answer, because with no journal directory there are no records for them to
+// protect.
 func (c *CPIConfig) validateStorageJournalPair(errs *[]string) {
 	if strings.TrimSpace(c.StoragePlacementNamespace) == "" || strings.TrimSpace(c.StorageAllocationJournalDir) != "" {
 		return

@@ -73,9 +73,6 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		ParkedDiskVMIDRangeEnd:   90999,
 		VMDiskFormat:             "qcow2",
 		AgentMBus:                "nats://mbus-a",
-		// An entry's namespace needs the job's journal directory, which no
-		// entry can set, so the base carries one for the namespace row.
-		StorageAllocationJournalDir: "/var/vcap/store/pve_cpi/allocations",
 	}
 	// ApplyContextOverrides re-validates the effective config, so the base
 	// must be a fully-defaulted, valid config first.
