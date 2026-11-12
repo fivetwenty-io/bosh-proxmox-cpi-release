@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -56,7 +57,9 @@ func TestAMissingOverrideIsCreatedOnTheJournalsMount(t *testing.T) {
 	journal, _ := journalSibling(t)
 	makePrivateDirectory(t, journal)
 	override := filepath.Join(filepath.Dir(journal), "cache")
-	setUmask(t, 0o077)
+	// mkdir at 0700 under this mask leaves 0500, so only the chmod after the
+	// creation gives the owner the write access the checks require.
+	setUmask(t, 0o277)
 	choice := resolve(t, Options{Override: override, JournalDir: journal})
 	if choice.Layer != LayerOverride || choice.Path != override || !choice.Created {
 		t.Fatalf("choice = %s %s created %v, want the created override", choice.Layer, choice.Path, choice.Created)
@@ -66,6 +69,9 @@ func TestAMissingOverrideIsCreatedOnTheJournalsMount(t *testing.T) {
 }
 
 func TestAMissingOverrideWithNoJournalIsCreatedOnTheTemporaryDirectorysMount(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("with no journal, root never creates the override")
+	}
 	parent := temporaryParent(t)
 	base := filepath.Join(parent, "operator")
 	makePrivateDirectory(t, base)
@@ -83,6 +89,7 @@ func TestAMissingSiblingIsCreatedBesideTheJournal(t *testing.T) {
 	parent := temporaryParent(t)
 	journal, sibling := journalSibling(t)
 	makePrivateDirectory(t, journal)
+	setUmask(t, 0o277)
 	choice := resolve(t, Options{JournalDir: journal})
 	if choice.Layer != LayerJournal || choice.Path != sibling || !choice.Created {
 		t.Fatalf("choice = %s %s created %v err %v, want the created sibling", choice.Layer, choice.Path,
@@ -135,7 +142,11 @@ func TestAnOverrideWhoseParentIsOnAnotherMountIsNotCreated(t *testing.T) {
 	requireNotCreated(t, choice.Err, override, "might not persist")
 
 	noJournal := resolve(t, Options{Override: override, hooks: twoMounts(os.TempDir())})
-	requireNotCreated(t, noJournal.Err, override, "the temporary directory")
+	reason := "the temporary directory"
+	if os.Geteuid() == 0 {
+		reason = "it would be made by root"
+	}
+	requireNotCreated(t, noJournal.Err, override, reason)
 }
 
 func TestAMissingDirectoryIsNotCreatedWhenItsParentIsUnsuitable(t *testing.T) {
@@ -146,6 +157,9 @@ func TestAMissingDirectoryIsNotCreatedWhenItsParentIsUnsuitable(t *testing.T) {
 		judge  *judgement
 		reason string
 		root   bool
+		// noJournal leaves the journal unset, so the anchor names no user
+		// and the parent's own owner is what the case tests.
+		noJournal bool
 	}{
 		"missing parent": {
 			layout: func(_ *testing.T, base string) string { return filepath.Join(base, "absent") },
@@ -169,8 +183,9 @@ func TestAMissingDirectoryIsNotCreatedWhenItsParentIsUnsuitable(t *testing.T) {
 				makePrivateDirectory(t, dir)
 				return dir
 			},
-			judge:  &judgement{set: true, uid: other},
-			reason: "and the CPI runs as uid " + strconv.Itoa(other),
+			judge:     &judgement{set: true, uid: other},
+			reason:    "and the CPI runs as uid " + strconv.Itoa(other),
+			noJournal: true,
 		},
 		"group-writable parent": {
 			layout: func(t *testing.T, base string) string {
@@ -221,6 +236,9 @@ func TestAMissingDirectoryIsNotCreatedWhenItsParentIsUnsuitable(t *testing.T) {
 			parent := tc.layout(t, base)
 			override := filepath.Join(parent, "cache")
 			opts := Options{Override: override, JournalDir: journal}
+			if tc.noJournal {
+				opts.JournalDir = ""
+			}
 			if tc.judge != nil {
 				opts.judge = *tc.judge
 			}
@@ -344,7 +362,7 @@ func TestProbeReportsWhetherAMissingDirectoryWouldBeCreated(t *testing.T) {
 
 	other := os.Geteuid() + 1
 	judged := ProbeAs(Options{Override: override, JournalDir: journal}, other)
-	requireNotCreated(t, judged.Err, override, "the CPI runs as uid "+strconv.Itoa(other))
+	requireNotCreated(t, judged.Err, override, "it would be made by uid "+strconv.Itoa(other))
 	if errors.Is(judged.Err, ErrCreatedOnFirstUse) {
 		t.Errorf("a declined probe matches ErrCreatedOnFirstUse: %v", judged.Err)
 	}
@@ -369,7 +387,7 @@ func TestMountOfTellsMountsApart(t *testing.T) {
 	makePrivateDirectory(t, child)
 	a, err := mountOf(base, true)
 	if err != nil {
-		t.Skipf("the mount of %s could not be read: %v", base, err)
+		skipOffLinux(t, "the mount of %s could not be read: %v", base, err)
 	}
 	b, err := mountOf(child, false)
 	if err != nil || a != b {
@@ -377,10 +395,208 @@ func TestMountOfTellsMountsApart(t *testing.T) {
 	}
 	dev, err := mountOf("/dev", true)
 	if err != nil {
-		t.Skipf("the mount of /dev could not be read: %v", err)
+		skipOffLinux(t, "the mount of /dev could not be read: %v", err)
 	}
 	root, err := mountOf("/", true)
 	if err != nil || dev == root {
 		t.Fatalf("mountOf(/dev) = %+v, mountOf(/) = %+v (%v), want two mounts", dev, root, err)
+	}
+}
+
+// skipOffLinux skips the test with the message, except on Linux, where it
+// fails instead. There the CPI needs statx mount IDs to create anything, so a
+// kernel or a seccomp profile that withholds them must not pass unseen.
+func skipOffLinux(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if runtime.GOOS == "linux" {
+		t.Fatalf(format, args...)
+	}
+	t.Skipf(format, args...)
+}
+
+// asAnotherOwner returns a judgement as a user that does not own journal. When
+// the test runs as root it gives journal to another user and judges as root,
+// which is the operator's sudo the rule exists for. Otherwise it judges as root
+// while the test's own user owns journal.
+func asAnotherOwner(t *testing.T, journal string) judgement {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		if err := os.Chown(journal, 54321, 54321); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return judgement{set: true, uid: 0}
+}
+
+// A process that is not the journal directory's owner, such as an operator's
+// sudo of a CPI command, creates neither directory, so it never leaves one
+// that the CPI's own user would refuse. The override still matches
+// fs.ErrNotExist, so the HA recovery episode record falls back from it.
+func TestOnlyTheJournalsOwnerCreatesAMissingDirectory(t *testing.T) {
+	parent := temporaryParent(t)
+	journal, sibling := journalSibling(t)
+	makePrivateDirectory(t, journal)
+	judge := asAnotherOwner(t, journal)
+
+	choice := resolve(t, Options{JournalDir: journal, judge: judge})
+	if choice.Layer != LayerTemporary || filepath.Dir(choice.Path) != parent || len(choice.Declined) != 1 {
+		t.Fatalf("choice = %s %s declined %v, want the temporary layer after the sibling", choice.Layer,
+			choice.Path, choice.Declined)
+	}
+	requireNotCreated(t, choice.Declined[0], sibling, "the user the CPI runs as, and it would be made by uid 0")
+
+	override := filepath.Join(filepath.Dir(journal), "cache")
+	refused := resolve(t, Options{Override: override, JournalDir: journal, judge: judge})
+	requireNotCreated(t, refused.Err, override, "it would be made by uid 0")
+}
+
+// With no journal nothing names the CPI's user, so root creates no override.
+func TestRootCreatesNoOverrideWithoutAJournal(t *testing.T) {
+	parent := temporaryParent(t)
+	base := filepath.Join(parent, "operator")
+	makePrivateDirectory(t, base)
+	override := filepath.Join(base, "cache")
+	choice := resolve(t, Options{Override: override, judge: judgement{set: true, uid: 0}})
+	requireNotCreated(t, choice.Err, override, "it would be made by root")
+}
+
+// A directory this call made that the private checks then refuse, as on a
+// filesystem that forces its own mode, is removed, so the layer declines as it
+// did for a missing directory instead of refusing it on every later call. A
+// directory that cannot be removed is refused.
+func TestACreatedDirectoryThatFailsTheChecksIsRemoved(t *testing.T) {
+	parent := temporaryParent(t)
+	journal, sibling := journalSibling(t)
+	makePrivateDirectory(t, journal)
+	forced := func(fill bool) *creationHooks {
+		return &creationHooks{mkdir: func(path string, perm os.FileMode) error {
+			if err := os.Mkdir(path, perm); err != nil {
+				return err
+			}
+			if fill {
+				if err := os.WriteFile(filepath.Join(path, "held"), nil, 0o600); err != nil {
+					return err
+				}
+			}
+			return os.Chmod(path, 0o750) // #nosec G302 -- the test fakes a filesystem that forces the mode
+		}}
+	}
+	choice := resolve(t, Options{JournalDir: journal, hooks: forced(false)})
+	if choice.Layer != LayerTemporary || choice.Path != temporaryPath(parent) || len(choice.Declined) != 1 {
+		t.Fatalf("choice = %s %s declined %v, want the temporary layer after the sibling", choice.Layer,
+			choice.Path, choice.Declined)
+	}
+	requireNotCreated(t, choice.Declined[0], sibling, "so it removed it again")
+
+	kept := resolve(t, Options{JournalDir: journal, hooks: forced(true)})
+	if kept.Layer != LayerJournal || kept.Usable() || kept.Err == nil ||
+		!strings.Contains(kept.Err.Error(), "removing the directory this call created failed") {
+		t.Fatalf("choice = %s usable %v err %v, want the sibling refused", kept.Layer, kept.Usable(), kept.Err)
+	}
+}
+
+// Resolving the parent can pass through a directory that holds a symbolic
+// link. That directory is checked too, because whoever may write in it can
+// point the link somewhere else between the checks and the mkdir.
+func TestADirectoryHoldingALinkAboveTheParentIsChecked(t *testing.T) {
+	temporaryParent(t)
+	base := t.TempDir()
+	journal := filepath.Join(base, "allocations")
+	makePrivateDirectory(t, journal)
+	target := filepath.Join(base, "real")
+	makePrivateDirectory(t, target)
+	makePrivateDirectory(t, filepath.Join(target, "mine"))
+	open := filepath.Join(base, "open")
+	makePrivateDirectory(t, open)
+	if err := os.Symlink(target, filepath.Join(open, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(open, 0o777); err != nil { // #nosec G302 -- the test opens the mode on purpose
+		t.Fatal(err)
+	}
+	override := filepath.Join(open, "link", "mine", "cache")
+	choice := resolve(t, Options{Override: override, JournalDir: journal})
+	requireNotCreated(t, choice.Err, override, filepath.Base(base)+"/open above it has mode 0777")
+
+	// The same link held in a private directory is followed and accepted.
+	if err := os.Chmod(open, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := trustedAncestors(filepath.Join(open, "link", "mine"), os.Geteuid()); err != nil {
+		t.Errorf("a link in a private directory was refused: %v", err)
+	}
+}
+
+// A sticky directory above the parent may let others write, as /tmp does,
+// because no one but the owner can replace what it holds. A directory above
+// the parent that a third user owns is refused.
+func TestTheOwnersAndModesAboveTheParent(t *testing.T) {
+	base := t.TempDir()
+	sticky := filepath.Join(base, "sticky")
+	makePrivateDirectory(t, sticky)
+	if err := os.Chmod(sticky, 0o1777|os.ModeSticky); err != nil { // #nosec G302 -- the mode is the subject
+		t.Fatal(err)
+	}
+	mine := filepath.Join(sticky, "mine")
+	makePrivateDirectory(t, mine)
+	if err := trustedAncestors(mine, os.Geteuid()); err != nil {
+		t.Errorf("a sticky world-writable directory above the parent was refused: %v", err)
+	}
+
+	theirs := filepath.Join(base, "theirs")
+	makePrivateDirectory(t, theirs)
+	inside := filepath.Join(theirs, "inside")
+	makePrivateDirectory(t, inside)
+	third, judged := os.Geteuid(), os.Geteuid()+1
+	if os.Geteuid() == 0 {
+		third, judged = 54321, 4242
+		if err := os.Chown(theirs, third, third); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := trustedAncestors(inside, judged)
+	if err == nil || !strings.Contains(err.Error(), "owned by uid "+strconv.Itoa(third)) {
+		t.Errorf("trustedAncestors = %v, want the directory owned by uid %d refused", err, third)
+	}
+}
+
+// A directory the CPI makes takes the process's group even under a parent
+// that would hand it another one, so cpi provision-journal accepts it.
+func TestACreatedDirectoryTakesTheProcesssGroup(t *testing.T) {
+	temporaryParent(t)
+	groups, err := os.Getgroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := -1
+	for _, g := range groups {
+		if g != os.Getegid() {
+			other = g
+			break
+		}
+	}
+	if other < 0 {
+		t.Skip("the test user belongs to no group but its own, so the parent cannot take another")
+	}
+	journal, sibling := journalSibling(t)
+	makePrivateDirectory(t, journal)
+	dir := filepath.Dir(journal)
+	if err := os.Chown(dir, -1, other); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700|os.ModeSetgid); err != nil {
+		t.Fatal(err)
+	}
+	choice := resolve(t, Options{JournalDir: journal})
+	requireWritable(t, choice)
+	info, err := os.Lstat(sibling)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gid := info.Sys().(*syscall.Stat_t).Gid; int(gid) != os.Getegid() {
+		t.Errorf("the created directory has gid %d, want the process's %d", gid, os.Getegid())
+	}
+	if info.Mode()&os.ModeSetgid != 0 {
+		t.Errorf("the created directory kept the setgid bit: %v", info.Mode())
 	}
 }

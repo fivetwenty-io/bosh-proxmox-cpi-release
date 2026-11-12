@@ -95,14 +95,15 @@ var episodePolicy = privatefile.Policy{
 // stays busy past episodeLockWait gives the same answer as an unreadable
 // record: the clock starts at this observation, and the error says why.
 //
-// A pve.endpoint_cache_dir that does not exist, and that endpointcache.Resolve
-// declines to create, is the one refusal that does not end the search. A record that could never be written would keep the
-// clock at zero on every call and so remove the handover rather than delay it,
-// so the store falls back to the layers after the override, logs a Warn line
+// A pve.endpoint_cache_dir that does not exist, and that
+// endpointcache.Resolve declines to create, is the one refusal that does not
+// end the search. A record that could never be written would keep the clock
+// at zero on every call and so remove the handover rather than delay it, so
+// the store falls back to the layers after the override, logs a Warn line
 // that names the missing directory, and records the episode there. ForCall
 // makes that one line per call however many times the call observes. An
-// override that exists but fails the private checks still gives no record, and
-// so does one that overlaps the allocation journal directory, which
+// override that exists but fails the private checks still gives no record,
+// and so does one that overlaps the allocation journal directory, which
 // endpointcache.Resolve refuses for every cache. That refusal does not fall
 // back, because the override exists.
 type EpisodeStore struct {
