@@ -1,6 +1,9 @@
 package pve
 
 import (
+	"errors"
+	"strings"
+
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/endpointpool"
 )
 
@@ -18,16 +21,57 @@ import (
 // installed. The SDK sends a mutation once and never retries it on its own, so
 // that dial failure is the request's only attempt.
 //
-// An error the endpoint pool marked with endpointpool.MaybeSentError never
-// counts, whatever it wraps, and neither does any other transport fault, a
-// timeout, a cancelled context, or a gateway or relay status such as 596.
-// Those leave the outcome unknown. nil reports false.
+// A ticket login that failed around the request counts too, whatever the
+// login's own error was (see isTicketLoginFailure). The SDK logs in before it
+// sends the request, so a failed login means the request was never sent, and
+// the forced login after a 401 means PVE refused the request. The login's
+// error can carry a MaybeSentError from the login request, which says nothing
+// about the mutation, so this check comes before that one.
+//
+// Otherwise an error the endpoint pool marked with endpointpool.MaybeSentError
+// never counts, whatever it wraps, and neither does any other transport
+// fault, a timeout, a cancelled context, or a gateway or relay status such as
+// 596. Those leave the outcome unknown. nil reports false.
 func IsMutationRefusedOrUnsent(err error) bool {
-	if err == nil || endpointpool.IsMaybeSent(err) {
+	if err == nil {
+		return false
+	}
+	if isTicketLoginFailure(err) {
+		return true
+	}
+	if endpointpool.IsMaybeSent(err) {
 		return false
 	}
 	if _, answered := AnsweredStatus(err); answered {
 		return true
 	}
 	return endpointpool.IsConnectPhase(err) || IsDirectDialFailure(err)
+}
+
+// ticketLoginFailurePrefixes are the texts the SDK puts in front of a ticket
+// login error that ends a request. "auto-login failed: " wraps the login the
+// SDK runs before it sends a request without a valid ticket.
+// "failed to refresh authentication: " wraps the forced login after PVE
+// answered the request with a 401, and the SDK returns it without sending the
+// request again.
+var ticketLoginFailurePrefixes = []string{"auto-login failed: ", "failed to refresh authentication: "}
+
+// isTicketLoginFailure reports whether some error in err's chain starts with
+// one of ticketLoginFailurePrefixes, which only the SDK's own wrapping of a
+// failed ticket login does. The SDK has no typed marker for these errors, so
+// the text is the only sign of them. It follows single wrapping only and
+// stops at a joined error, whose text starts with its first part's text,
+// because another of its parts could be a request that was sent.
+func isTicketLoginFailure(err error) bool {
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if _, joined := e.(interface{ Unwrap() []error }); joined {
+			return false
+		}
+		for _, prefix := range ticketLoginFailurePrefixes {
+			if strings.HasPrefix(e.Error(), prefix) {
+				return true
+			}
+		}
+	}
+	return false
 }

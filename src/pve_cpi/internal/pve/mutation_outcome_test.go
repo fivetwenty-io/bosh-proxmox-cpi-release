@@ -39,6 +39,31 @@ func TestIsMutationRefusedOrUnsent(t *testing.T) {
 	unreachable := endpointpool.NewEntryUnreachableError([]endpointpool.EndpointFailure{
 		{Endpoint: "pve1:8006", Err: connectPhase},
 	})
+	// The TLS phases wrap an error that is no dial error, so only the pool's
+	// connect-phase tag proves that nothing was sent. A walk whose every hop
+	// failed verification unwraps to those errors rather than to a dial error.
+	tlsHandshake := &endpointpool.ConnectPhaseError{Phase: endpointpool.PhaseTLSHandshake, Endpoint: "pve1:8006",
+		Err: errors.New("tls: handshake failure")}
+	tlsVerify := func(endpoint string) error {
+		return &endpointpool.ConnectPhaseError{Phase: endpointpool.PhaseTLSVerify, Endpoint: endpoint,
+			Err: errors.New("tls: failed to verify certificate: x509: certificate signed by unknown authority")}
+	}
+	unreachableTLS := endpointpool.NewEntryUnreachableError([]endpointpool.EndpointFailure{
+		{Endpoint: "pve1:8006", Err: tlsVerify("pve1:8006")},
+		{Endpoint: "pve2:8006", Err: tlsVerify("pve2:8006")},
+	})
+	// loginFailed is the SDK's shape for a ticket login that failed before
+	// the request was sent. The login request's own error may say that the
+	// login reached PVE, which says nothing about the mutation.
+	loginFailed := func(cause error) error {
+		return fmt.Errorf("failed to execute QEMU operation: %w", fmt.Errorf("auto-login failed: %w", cause))
+	}
+	// refreshFailed is the SDK's shape for the forced login after PVE
+	// answered the request with a 401, which the SDK does not send again.
+	refreshFailed := func(cause error) error {
+		return fmt.Errorf("failed to execute QEMU operation: %w", fmt.Errorf("failed to refresh authentication: %w",
+			fmt.Errorf("forced re-authentication failed: %w", cause)))
+	}
 
 	cases := []struct {
 		name string
@@ -66,6 +91,18 @@ func TestIsMutationRefusedOrUnsent(t *testing.T) {
 			err: sdkConn(&endpointpool.MaybeSentError{Err: connectPhase}), want: false},
 		{name: "sdk connection error", err: &sdkerrors.ConnectionError{Host: "pve1", Port: 8006, Message: "EOF"},
 			want: false},
+		{name: "connect phase tls handshake", err: fmt.Errorf("Post: %w", tlsHandshake), want: true},
+		{name: "connect phase tls verify", err: fmt.Errorf("Post: %w", tlsVerify("pve1:8006")), want: true},
+		{name: "sdk connection error around an unreachable pool whose every hop failed verification",
+			err: sdkConn(unreachableTLS), want: true},
+		{name: "ticket login failed on a maybe sent login",
+			err: loginFailed(&endpointpool.MaybeSentError{Err: fmt.Errorf("Post: %w", read)}), want: true},
+		{name: "ticket login timed out", err: loginFailed(&sdkerrors.TimeoutError{Operation: "POST", Duration: "30s"}),
+			want: true},
+		{name: "ticket login after a 401 failed", err: refreshFailed(fmt.Errorf("Post: %w", read)), want: true},
+		{name: "ticket login failure joined with a maybe sent request",
+			err: errors.Join(fmt.Errorf("auto-login failed: %w", read),
+				&endpointpool.MaybeSentError{Err: fmt.Errorf("Post: %w", read)}), want: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
