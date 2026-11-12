@@ -8,8 +8,10 @@ package handlers
 // parker. The deferred-teardown sweep is the one caller that gives up early.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -112,6 +114,53 @@ func TestSweepPreservation_GivesUpOnABusyParkerAfterTheSweepWait(t *testing.T) {
 	if waited < pve.ParkerLockSweepWait || waited >= ttl/2 {
 		t.Fatalf("the sweep waited %v for the parker's lock, want about %v and far below its TTL of %v",
 			waited, pve.ParkerLockSweepWait, ttl)
+	}
+	if destroys := recorder.guestDestroys(); len(destroys) != 0 {
+		t.Fatalf("the sweep destroyed VM 777 %d times without keeping its ephemeral disk", len(destroys))
+	}
+	if slot, _ := client.state.configs[777]["scsi2"].(string); !strings.HasPrefix(slot, volume+",") {
+		t.Fatalf("777's scsi2 is %q, want the ephemeral volume still on it", slot)
+	}
+	tags, _ := pve.ConfigString(client.state.configs[777], jsonKeyTags)
+	if !tagsContain(tags, tagDeletingVM) {
+		t.Fatalf("777 lost its queue tag: %q", tags)
+	}
+}
+
+// TestSweepPreservation_GivesUpOnABusyDiskTransferLock is the sweep keeping a
+// queued legacy VM's ephemeral disk whose source CID, and so its stable ID, a
+// cut-short retention already recorded. The transfer to a parker takes that
+// disk's transfer lock before any parker lock, and another request holds the
+// disk's lock and never leaves, while every parker is free. The transfer runs
+// on the sweep's context, so it must give up after pve.ParkerLockSweepWait
+// rather than the disk lock's own wait of more than a parker TTL, and the VM
+// must stay queued with its disk and without a destroy.
+func TestSweepPreservation_GivesUpOnABusyDiskTransferLock(t *testing.T) {
+	const volume = "a:vm-777-ephemeral-0"
+	deps, client, recorder, _ := legacyRetainVolumeFixture(t, volume, "scsi2")
+	client.state.configs[777]["tags"] = ownershipTag + ";" + tagRetainEphemeral + ";" + tagDeletingVM
+	cid, err := pve.EncodeDiskCID(volume, &pve.DiskCIDMeta{ID: idTestToken})
+	if err != nil {
+		t.Fatalf("encode the ephemeral volume's CID: %v", err)
+	}
+	pve.UpdateAttachedDiskCID(context.Background(), deps.PVE, nil, deps.Config.Node, 777, volume, cid)
+	if pve.GetAttachedDiskCIDs(pve.DescriptionFromConfig(client.state.configs[777]))[volume] != cid {
+		t.Fatal("the fixture did not record the ephemeral volume's CID")
+	}
+	pools, clk, ctx := HeldParkerLock(0)
+	sentinel := pve.DiskTransferLockPoolName(idTestToken)
+	pools.pools[sentinel] = fmt.Sprintf("owner=transfer_in/%s@1-1 exp=%d", idTestToken, clk.Now().Add(time.Hour).Unix())
+	deps.PVE = sentinelHeldPVE{Client: deps.PVE, held: pools}
+
+	sweepDeferredTeardowns(ctx, deps, deps.Logger)
+
+	waited, ttl := clk.Elapsed(), pve.ParkerProtectionLockTTLNow()
+	if waited < pve.ParkerLockSweepWait || waited >= ttl/2 {
+		t.Fatalf("the sweep waited %v for the disk's transfer lock, want about %v and far below the parker TTL of %v",
+			waited, pve.ParkerLockSweepWait, ttl)
+	}
+	if _, held, _ := pools.GetPoolComment(context.Background(), sentinel); !held {
+		t.Fatal("the sweep took over the disk's transfer lock from its live holder")
 	}
 	if destroys := recorder.guestDestroys(); len(destroys) != 0 {
 		t.Fatalf("the sweep destroyed VM 777 %d times without keeping its ephemeral disk", len(destroys))
