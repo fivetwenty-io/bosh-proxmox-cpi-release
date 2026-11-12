@@ -67,7 +67,8 @@ func TestBPMWorkerViewSeesTheWorkersMounts(t *testing.T) {
 	}
 
 	// #nosec G204 -- the test binary runs itself with a fixed test name
-	cmd := exec.Command(os.Args[0], "-test.run=^TestBPMWorkerViewSeesTheWorkersMounts$", "-test.count=1")
+	cmd := exec.CommandContext(t.Context(), os.Args[0],
+		"-test.run=^TestBPMWorkerViewSeesTheWorkersMounts$", "-test.count=1")
 	cmd.Env = append(os.Environ(), workerDirEnv+"="+dir)
 	attr := &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
 	if os.Geteuid() != 0 {

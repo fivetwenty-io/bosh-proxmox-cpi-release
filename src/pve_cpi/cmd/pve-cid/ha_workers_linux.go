@@ -36,7 +36,7 @@ func bpmWorkerView(run string) func(parent, anchor string) (workerMount, error) 
 		if err != nil || pid <= 0 {
 			continue
 		}
-		proc := filepath.Join("/proc", strconv.Itoa(pid))
+		proc := "/proc/" + strconv.Itoa(pid)
 		if ns, err := os.Readlink(filepath.Join(proc, "ns", "mnt")); err != nil || ns == self {
 			continue
 		}

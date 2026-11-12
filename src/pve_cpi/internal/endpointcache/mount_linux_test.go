@@ -146,7 +146,7 @@ func TestStatxErrorNamesTheLikelyCause(t *testing.T) {
 			t.Errorf("statxError(%v) = %v, want it to match the error and name %q", errno, err, want)
 		}
 	}
-	if err := statxError(unix.ENOENT); err != unix.ENOENT {
+	if err := statxError(unix.ENOENT); !errors.Is(err, unix.ENOENT) || errors.Unwrap(err) != nil {
 		t.Errorf("statxError(ENOENT) = %v, want the error unchanged", err)
 	}
 }
@@ -172,7 +172,7 @@ func TestMountOfTellsABindMountFromItsSource(t *testing.T) {
 	}
 	dir := t.TempDir()
 	// #nosec G204 -- the test binary runs itself with a fixed test name
-	cmd := exec.Command(os.Args[0], "-test.run=^TestMountOfTellsABindMountFromItsSource$", "-test.count=1",
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestMountOfTellsABindMountFromItsSource$", "-test.count=1",
 		"-test.v")
 	cmd.Env = append(os.Environ(), bindMountDirEnv+"="+dir)
 	attr := &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
