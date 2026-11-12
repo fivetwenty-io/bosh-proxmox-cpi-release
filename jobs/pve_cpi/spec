@@ -83,10 +83,10 @@ properties:
       wins over both of those places. When this directory is missing, the CPI
       creates it under the same rule, and otherwise it uses no cache. It also
       uses no cache when the directory is a symbolic link, is owned by another
-      user, or grants any access to a group or others. The rule lets the CPI
-      create a missing directory, only the last part of the path and at mode
-      0700, when its parent directory exists, is not a symbolic link, belongs
-      to the CPI's user, and grants no write access to a group or others. Every
+      user, or grants any access to a group or others. Under the rule, the CPI
+      creates only the last part of a missing path, at mode 0700, and only
+      when the parent directory exists, is not a symbolic link, belongs to the
+      CPI's user, and grants no write access to a group or others. Every
       directory above the parent must belong to root or the CPI's user and
       grant no write access to a group or others unless it is sticky. The
       parent must also sit on the same mount as a directory that already
