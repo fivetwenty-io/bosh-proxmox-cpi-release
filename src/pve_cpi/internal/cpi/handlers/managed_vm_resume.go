@@ -239,6 +239,12 @@ func resumeExistingManagedVM(ctx context.Context, deps Deps, args []json.RawMess
 	if parsed == nil {
 		return nil, false, storageRefusal("existing allocation lookup requires parsed VM arguments")
 	}
+	// A journal that is half configured or not enrolled is refused before the
+	// node listing and never sent to the legacy create (see
+	// storageJournalConfigError).
+	if err := storageJournalReadinessError(deps.Config); err != nil {
+		return nil, false, err
+	}
 	nodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
 		return nil, false, err

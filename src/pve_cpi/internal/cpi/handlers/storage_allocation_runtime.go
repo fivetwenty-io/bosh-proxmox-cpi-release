@@ -20,9 +20,16 @@ import (
 // openStorageAllocationJournal verifies cluster continuity without creating or
 // enrolling an authority. Historical provenance is audited by admission/recovery
 // before allocating an identity; opening alone never authorizes a PVE mutation.
+//
+// A configuration that names only half of the journal, and a journal whose
+// namespace was never enrolled, are refused before the cluster's identity is
+// read, with text that names the cause (see storageJournalConfigError).
 func openStorageAllocationJournal(ctx context.Context, deps Deps, nodes []string) (*allocationjournal.Journal, error) {
 	if deps.Config == nil || deps.PVE == nil {
 		return nil, cpierrors.Cloud("storage allocation requires configuration and PVE client")
+	}
+	if err := storageJournalReadinessError(deps.Config); err != nil {
+		return nil, err
 	}
 	if err := deps.Config.ValidateStoragePlacementAllocation(); err != nil {
 		return nil, err

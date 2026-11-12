@@ -376,6 +376,12 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 	if deps.Config == nil || deps.Config.StoragePlacementNamespace == "" && deps.Config.StorageAllocationJournalDir == "" {
 		return false, nil
 	}
+	// A journal that is half configured or not enrolled may still hold records
+	// under another namespace, so it is refused here and never sent to the
+	// legacy delete.
+	if err := storageJournalReadinessError(deps.Config); err != nil {
+		return true, err
+	}
 	clusterNodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
 		return true, err

@@ -308,7 +308,7 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		// that node, and the journal's check runs again on the destination.
 		handled, managedErr := deleteManagedVMIfRecorded(ctx, deps, vmcid.PathOf(vmid), vmid)
 		if managedDeleteAnswers(handled, managedErr) {
-			return nil, managedDeleteVMError(managedErr)
+			return nil, managedDeleteVMError(deps.Log(ctx).With(log.String("vm_cid", vmCID)), managedErr)
 		}
 
 		return deleteLegacyVM(ctx, deps, vmCID, cid)
@@ -333,7 +333,18 @@ func managedDeleteAnswers(handled bool, err error) bool {
 // says what refused it. Anything else, such as a journal write that failed or
 // a PVE answer no classifier recognized, keeps the generic evidence line, so
 // its backend text never reaches the Director.
-func managedDeleteVMError(err error) error {
+//
+// Every failure is logged at Warn first, with its text scrubbed the way every
+// logged error is, so the cause behind the generic line is never lost. A
+// journal that is half configured or not enrolled is refused with a typed
+// error (see storageJournalConfigError), so the Director reads that cause too.
+func managedDeleteVMError(logger *log.Logger, err error) error {
+	if err == nil {
+		return nil
+	}
+	if logger != nil {
+		logger.Warn("delete_vm: the journal-managed delete failed", log.Err(err))
+	}
 	var typed *cpierrors.Error
 	var refusal *storageRefusalError
 	if errors.As(err, &typed) || errors.As(err, &refusal) {

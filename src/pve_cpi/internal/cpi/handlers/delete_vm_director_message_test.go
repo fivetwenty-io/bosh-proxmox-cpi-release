@@ -111,7 +111,7 @@ func TestManagedDeleteVMFailuresReachTheDirector(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			d := cpi.NewDispatcherWithOptions(log.NewNopLogger(), cpi.WithTransientClassifier(pve.IsTransientTransport))
 			failing := cpi.HandlerFunc(func(context.Context, []json.RawMessage, jsonrpc.Context) (any, error) {
-				return nil, managedDeleteVMError(tc.err)
+				return nil, managedDeleteVMError(log.NewNopLogger(), tc.err)
 			})
 			if err := d.Register("delete_vm", failing); err != nil {
 				t.Fatal(err)
@@ -122,7 +122,7 @@ func TestManagedDeleteVMFailuresReachTheDirector(t *testing.T) {
 			}
 		})
 	}
-	if managedDeleteVMError(nil) != nil {
+	if managedDeleteVMError(log.NewNopLogger(), nil) != nil {
 		t.Fatal("a delete that succeeded reported an error")
 	}
 }

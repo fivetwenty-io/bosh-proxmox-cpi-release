@@ -65,6 +65,9 @@ func createManagedDisk(ctx context.Context, deps Deps, args []json.RawMessage, s
 		}
 		retErr = cpierrors.Cloud("create_disk: managed allocation failed; inspect the allocation journal and PVE read permissions")
 	}()
+	if err := storageJournalConfigError(deps.Config); err != nil {
+		return nil, err
+	}
 	if err := deps.Config.ValidateStoragePlacementAllocation(); err != nil {
 		return nil, err
 	}

@@ -140,7 +140,7 @@ func deleteAfterDeadNodeMove(ctx context.Context, deps Deps, vmCID string, cid v
 	done := withDeadNodeCompletionDone(ctx)
 	handled, err := deleteManagedVMIfRecorded(done, deps, vmcid.PathOf(cid.VMID), cid.VMID)
 	if handled || err != nil {
-		return nil, managedDeleteVMError(err)
+		return nil, managedDeleteVMError(deps.Log(ctx).With(log.String("vm_cid", vmCID)), err)
 	}
 	return deleteLegacyVMClaimed(done, deps, vmCID, cid)
 }
