@@ -54,6 +54,12 @@ jobs:
     container:
       # Digest-pinned golang:1.27 (self-hosted runner has no build tools on the host)
       image: golang:1.27@sha256:08bcb99a38f85a265f9a93d1d3323e2440eec333380f3ea26ee0dec9264bb41c
+      # Two cache tests make a private mount namespace, as BPM gives a worker,
+      # and Docker's default seccomp profile and capabilities refuse one. The
+      # tests fail rather than skip under Actions, so this job must allow it.
+      # The job runs only code from this repository, because the fork guard
+      # above keeps untrusted pull requests off this runner.
+      options: --cap-add SYS_ADMIN --security-opt seccomp=unconfined
       # The container filesystem is fresh on every job, so the Go module and
       # build caches would start cold. These are host paths rather than the
       # Actions cache service: on a persistent self-hosted runner, restoring a

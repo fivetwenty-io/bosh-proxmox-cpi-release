@@ -107,6 +107,13 @@ const bpmVolumes = "each volume a BPM worker sees, such as /var/vcap/store/direc
 const bpmVersions = "which v283.0.0 through v283.1.1 do by default and later versions do only when " +
 	"director.use_bpm_for_workers is true"
 
+// bpmStatx is the caveat a finding that says the CPI creates a directory adds
+// when the workers run under BPM. The doctor's own statx call runs outside the
+// worker's seccomp profile, so it cannot see that a BPM before v1.4.21 refuses
+// the call the CPI makes to compare mounts, which makes the CPI decline.
+const bpmStatx = "the Director runs its workers under BPM, and before BPM v1.4.21 the seccomp profile refuses the " +
+	"statx call the CPI uses to compare mounts, so on an older BPM the CPI does not create it"
+
 // workerSide judges, from the side of the workers that run the CPI, a missing
 // directory whose parent this host puts on the same mount as anchor, which
 // what names. It returns a non-empty reason when the CPI does not create the
@@ -133,7 +140,7 @@ func (j cacheJudge) workerSide(parent, anchor, what string) (reason, caveat stri
 					"directory %s is not on the same mount as %s %s, although this host shows one", parent, what,
 					anchor), ""
 			default:
-				return "", ""
+				return "", bpmStatx
 			}
 		}
 		if split := j.bpmVolumeSplit(parent, anchor); split != "" {
@@ -141,7 +148,7 @@ func (j cacheJudge) workerSide(parent, anchor, what string) (reason, caveat stri
 		}
 		return "", "this check sees the host's mounts, and the Director runs its workers under BPM, where " +
 			bpmVolumes + ", so the CPI creates it only when its parent directory sits inside the same volume as " +
-			what
+			what + "; " + bpmStatx
 	}
 	unknown := "this check sees the host's mounts and cannot tell whether the Director runs its workers under " +
 		"BPM, " + bpmVersions

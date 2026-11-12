@@ -100,7 +100,8 @@ properties:
       call, and the mount check is what keeps the CPI from making one there.
       Each BPM volume, including /var/vcap/store/director, is a mount of its
       own, so the parent must sit inside the volume that holds the journal
-      directory. On Linux the mount check needs statx mount IDs, which kernels
+      directory, or the temporary directory when no journal directory is set.
+      On Linux the mount check needs statx mount IDs, which kernels
       from 5.8 report and BPM's seccomp profile allows from v1.4.21. The
       value must be an absolute path, and it must be clean, which means it has
       no `.` or `..` parts, no doubled slashes, and no trailing slash. It may

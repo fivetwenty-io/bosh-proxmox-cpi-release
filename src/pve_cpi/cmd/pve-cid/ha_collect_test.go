@@ -1353,7 +1353,9 @@ func TestCollectSaysWhetherTheCPICreatesAMissingDirectory(t *testing.T) {
 			inWorker: fakeWorker(workerSameMount, nil)})
 		c.cacheFindingsAs(j)
 		want(t, c.rep, haKindCacheDirectory, haSeverityAdvice, override, "creates it with mode 0700 on first use",
-			"same mount as the allocation journal directory; the HA recovery episode record")
+			"same mount as the allocation journal directory; the Director runs its workers under BPM, and before "+
+				"BPM v1.4.21 the seccomp profile refuses the statx call", "so on an older BPM the CPI does not "+
+				"create it; the HA recovery episode record")
 
 		c, j = judgeWorkers(cfg, doctor, store, workerLayout{mode: workersUnderBPM,
 			inWorker: fakeWorker(workerOtherMount, nil)})
