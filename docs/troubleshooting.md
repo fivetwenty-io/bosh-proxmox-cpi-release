@@ -2527,6 +2527,57 @@ qm set <vmid> --protection 0
 qm destroy <vmid>
 ```
 
+### A cross-node attach fails with "migration source holder absence not observed"
+
+On releases before the fix, an `attach_disk` of a journal-managed disk on shared storage could fail even though PVE migrated the disk's mover to the VM's node. This also happens in the disk attach inside `create_vm`. The Director shows `requires reconciliation at lifecycle attach_disk Nodes.CreateQemuMigrate`, and the disk's record sits in `reconciliation_required` with a `CreateQemuMigrate` step that is still `submitted`. The `qmigrate` task for the mover finished with exit status `OK`, the mover now holds the disk on the target node, and its protection is off. The check that failed is `migration source holder absence not observed`. Those releases do not log that reason, so we recognize the failure by the signs above. Releases with the fix log it in a warning that begins `managed disk lifecycle mutation requires reconciliation`.
+
+The cause is how the CPI checks that the mover left the source node. When a VM's config has moved away, PVE answers a read of it on the old node with an HTTP 500 that says `Configuration file 'nodes/<node>/qemu-server/<vmid>.conf' does not exist`. The older check accepted only a 404 as proof of absence, so it treated the 500 as a failure, marked the record as needing reconciliation, and then refused to restore the mover's protection. The disk is safe on the mover, and no data is lost.
+
+We recover in this order, with PVE reads and writes made by an operator who approves each write.
+
+1. Check the live state without changing anything
+
+   On the node that holds the mover, `qm config <mover VMID>` shows the disk's `bpd-` serial on one slot, `protection` off, and no `lock:` line. On the node the task ran on, the same read answers that the configuration file does not exist. The task's status on that node is `stopped` with exit status `OK`. If any of this differs, we stop and look at the record before we go on. We also keep resurrection off for the instance and do not deploy until the last step.
+
+2. Put the mover's protection back
+
+   We run `qm set <mover VMID> --protection 1` on the node that holds the mover and read the config back. The mover is the disk's only holder, so we do this before anything else.
+
+3. Upgrade the CPI to a release with the fix
+
+   We make sure no CPI request is in flight first. The journal on the persistent disk is preserved.
+
+4. Run the audit
+
+   `storage-journal audit --summary` should report no conflicts. A parker entry that names the old node appears as an `observed move:` line. If anything else shows up, we stop.
+
+5. Settle the migration step
+
+   We run [Settle a submitted migration](storage-journal-operations.md#settle-a-submitted-migration) with the allocation UUID, CID, step ID, and UPID from the audit. The record stays in `reconciliation_required`, and the step becomes observed.
+
+6. Clean up any VM that the failed `create_vm` left behind
+
+   When the attach ran inside `create_vm`, the new VM's record may also need reconciliation, and the VM may still exist. We repeat the read-only checks on that VM, which must hold no drive with the disk's serial and no entry for it. This command destroys the VM, so we run it only with the operator's approval, and the VM must be the one the failed create left behind.
+
+   ```sh
+   cpi storage-journal cleanup \
+     --config /path/to/cpi.json \
+     --authority-id operator-writer --previous-writer-fenced \
+     --remote-tasks-settled \
+     --allocation-id VM_ALLOCATION_UUID \
+     --decision-id incident-1234-vm-cleanup
+   ```
+
+7. Run the audit again
+
+   Every step of the disk record should be observed, and the VM record should be gone from the list that needs an operator.
+
+8. Redeploy with resurrection still off
+
+   When the new VM lands on the mover's node, the attach destroys the mover. When it lands on another node, the corrected migration runs. We check that the disk is on the VM with its serial and run a last audit before we turn resurrection back on.
+
+Afterward, the mover may still exist, because an attach keeps a mover that an earlier request created. We remove it only when it is empty, as [A cross-node attach left its migration mover behind](#a-cross-node-attach-left-its-migration-mover-behind) describes. We do not destroy unreferenced disks. Running `qm destroy` with `--destroy-unreferenced-disks` on a mover can free the disk's volume along with the mover, so we read `qm pending <mover VMID>` first and leave the mover alone if it shows any disk line.
+
 ### A crash-abandoned allocation keeps charging capacity
 
 Every set-managed create charges the bytes that its in-flight siblings have already claimed, so an allocation left behind in an in-flight state goes on charging its bytes against every later create in the namespace. Nothing ages a record out of those states on its own. A CPI killed between writing its record and running its first step leaves a `planned` record, and that record keeps its claim until an operator resolves it.
