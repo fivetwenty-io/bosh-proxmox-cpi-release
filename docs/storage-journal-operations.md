@@ -227,7 +227,7 @@ Besides the failed checks above, the command refuses a few cases on purpose.
 
 - A mutation of any kind
 
-  The command runs behind a guard that denies every write to PVE, so nothing it reads can change PVE.
+  The command runs behind a guard that denies every write to PVE, so it only reads from PVE and never changes anything there.
 
 ### The success output
 
