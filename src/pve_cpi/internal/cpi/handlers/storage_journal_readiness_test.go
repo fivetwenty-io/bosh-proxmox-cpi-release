@@ -188,8 +188,8 @@ func TestStorageJournalReadinessErrors(t *testing.T) {
 			"delete VMs and disks; set pve.storage_placement_namespace in the job or " +
 			"pve_storage_placement_namespace in the cpi-config entry, and enroll it as " +
 			"docs/storage-journal-operations.md#enroll-a-new-namespace describes"},
-		{"namespace only", "director", "", "pve_storage_placement_namespace is set by the cpi-config entry, " +
-			"but the job sets no pve.storage_allocation_journal_dir, which only the job can set, and the " +
+		{"namespace only", "director", "", "pve_storage_placement_namespace \"director\" is set by the " +
+			"cpi-config entry, but the job sets no pve.storage_allocation_journal_dir, which only the job can set, and the " +
 			"allocation journal needs both and an enrolled namespace before the CPI can create or delete VMs " +
 			"and disks; set pve.storage_allocation_journal_dir in the job, provision it as " +
 			"docs/storage-journal-provisioning.md describes, and enroll the namespace as " +

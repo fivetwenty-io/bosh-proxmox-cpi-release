@@ -46,7 +46,7 @@ func storageJournalReadinessError(cfg *config.CPIConfig) error {
 // pve_storage_placement_namespace to a job with no journal directory still
 // applies, and its calls that answer from PVE alone keep working. That entry
 // is the only way a namespace without a directory reaches this function at
-// run time, so its text names the entry and the job. They cannot reject a
+// run time, so its text names the entry's namespace and the job. They cannot reject a
 // journal directory without a namespace either, because a cpi-config entry
 // may supply the namespace while the installed job supplies only the
 // process-level journal directory, so that text names both places the
@@ -75,12 +75,12 @@ func storageJournalConfigError(cfg *config.CPIConfig) error {
 			"in the cpi-config entry, and enroll it as %s describes", storageJournalEnrollmentDoc)
 	}
 	if !hasDirectory {
-		return cpierrors.Cloud("pve_storage_placement_namespace is set by the cpi-config entry, but the job sets "+
-			"no pve.storage_allocation_journal_dir, which only the job can set, and the allocation journal needs "+
+		return cpierrors.Cloud("pve_storage_placement_namespace %q is set by the cpi-config entry, but the job "+
+			"sets no pve.storage_allocation_journal_dir, which only the job can set, and the allocation journal needs "+
 			"both and an enrolled namespace before the CPI can create or delete VMs and disks; set "+
 			"pve.storage_allocation_journal_dir in the job, provision it as %s describes, and enroll the "+
 			"namespace as %s describes, or remove pve_storage_placement_namespace from the cpi-config entry",
-			storageJournalProvisioningDoc, storageJournalEnrollmentDoc)
+			cfg.StoragePlacementNamespace, storageJournalProvisioningDoc, storageJournalEnrollmentDoc)
 	}
 	if !filepath.IsAbs(directory) {
 		return cpierrors.Cloud("pve.storage_placement_namespace is set but pve.storage_allocation_journal_dir "+

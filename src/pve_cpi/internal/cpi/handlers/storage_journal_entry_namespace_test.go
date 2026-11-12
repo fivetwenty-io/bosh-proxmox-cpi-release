@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"sync/atomic"
@@ -19,7 +20,7 @@ import (
 
 // entryNamespaceRefusal is the start of the text the journal gates give a
 // cpi-config entry that sets a namespace over a job with no journal directory.
-const entryNamespaceRefusal = "pve_storage_placement_namespace is set by the cpi-config entry, but the job " +
+const entryNamespaceRefusal = "pve_storage_placement_namespace \"east\" is set by the cpi-config entry, but the job " +
 	"sets no pve.storage_allocation_journal_dir, which only the job can set"
 
 // throughNamespaceEntry routes every call on deps through a cpi-config entry
@@ -123,6 +124,30 @@ func TestNamespaceEntryWithoutJobJournalDirectory(t *testing.T) {
 		}
 		if !strings.Contains(description, "deployment: cf") {
 			t.Fatalf("set_vm_metadata wrote description %q, want the deployment", description)
+		}
+		assertEntryApplied(t, built)
+	})
+
+	t.Run("set_vm_metadata read failure is retriable", func(t *testing.T) {
+		var writes atomic.Int32
+		qemuSvc := &mockQEMUService{
+			configFn: func(context.Context, string, int) (map[string]any, error) {
+				return nil, errors.New("500 internal server error")
+			},
+		}
+		nodesSvc := &mockNodesService{
+			updateQemuConfigFn: func(context.Context, string, string, *nodes.UpdateQemuConfigParams) error {
+				writes.Add(1)
+				return nil
+			},
+		}
+		deps, reqCtx, built := throughNamespaceEntry(t,
+			testDepsFoundVM(101, qemuSvc, nodesSvc, nil, &mockAgentService{}), "entry-set-vm-metadata-read")
+		args := marshalArgs("101", map[string]any{"deployment": "cf", "job": "router"})
+		_, err := handlers.HandleSetVMMetadata(deps).Handle(context.Background(), args, reqCtx)
+		requireHARetriable(t, err, "read VM 101 config")
+		if writes.Load() != 0 {
+			t.Fatal("set_vm_metadata wrote after a failed config read")
 		}
 		assertEntryApplied(t, built)
 	})

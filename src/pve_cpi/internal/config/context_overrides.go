@@ -1351,6 +1351,11 @@ func sameCASet(a, b string) bool {
 // PVE's reserved floor (100), port=0, and an explicit empty-string override
 // that clears a required field (host/user/vm_storage/disk_storage/
 // network_bridge) or both auth credentials (password AND api_token) at once.
+//
+// The journal pair check is the one startup invariant this call leaves out,
+// because an entry may add a namespace over a job without a journal
+// directory, and the journal gates refuse that entry's create and delete
+// calls instead (see validateStorageJournalPair).
 func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CPIConfig, applied []string, unknown []string, err error) {
 	if base == nil {
 		return nil, nil, nil, fmt.Errorf("config: ApplyContextOverrides: base must not be nil")
