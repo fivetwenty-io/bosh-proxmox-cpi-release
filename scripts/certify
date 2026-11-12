@@ -1625,7 +1625,7 @@ class Certify:
             self.cleanup_refs()
             ok, _ = self.runner.step(
                 "director:teardown-existing", [BOSH_SCRIPT, "teardown"],
-                timeout=CREATE_ENV_TIMEOUT_S,
+                timeout=CREATE_ENV_TIMEOUT_S, env=self._teardown_env(),
             )
             if not ok:
                 return False

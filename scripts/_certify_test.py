@@ -343,6 +343,9 @@ class GuardedStepsTest(_SyntheticRoot):
         c.cfg = {}
         c.ccfg = {"deployment_name": "certification", "cpi_id": ""}
         c.deployed = True
+        c.director_side = None
+        c.old_cpi_path = None
+        c.new_cpi_path = None
         c.director_up = True
         c._director_identity = lambda: {"vm_cid": "3808", "disk_cids": []}
         c._backup_state = lambda _tag: None
@@ -459,6 +462,25 @@ class TeardownCpiTest(_SyntheticRoot):
         c = self._certify("new")
         c.new_cpi_path = None
         self.assertIsNone(c._teardown_env())
+
+    def test_teardown_existing_hands_the_old_tarball_to_delete_env(self) -> None:
+        c = self._certify("new")
+        c.director_side = None
+        c.args = argparse.Namespace(force=True)
+        c.rep = _Rep()
+        c.dry_run = False
+        c._director_identity = lambda: {"vm_cid": "4001", "disk_cids": []}
+        c._guard_step = lambda *_a, **_k: True
+        c.cleanup_refs = lambda: True
+        envs = {}
+
+        def step(name, argv, **kw):
+            envs[name] = kw.get("env")
+            return False, []
+
+        c.runner = types.SimpleNamespace(step=step, base_env={"PVE_CPI_RELEASE_PATH": self.NEW})
+        self.assertFalse(c.deploy_old())
+        self.assertEqual(envs["director:teardown-existing"], {"PVE_CPI_RELEASE_PATH": self.OLD})
 
     def test_teardown_hands_the_tarball_to_delete_env(self) -> None:
         c = self._certify("new")
