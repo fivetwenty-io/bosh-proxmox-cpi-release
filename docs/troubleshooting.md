@@ -2471,10 +2471,16 @@ We keep the log and report it as a bug.
 
 **Diagnosis**
 
-The CPI keeps the endpoint cache, the HA profile cache, and the HA recovery episode record in one cache directory. It chooses the directory in layers. The first is `pve.endpoint_cache_dir`, the next is `endpoint-cache` beside the allocation journal directory when that exists, and the last is `pve_cpi-endpoint-cache.<uid>` under the CPI's temporary directory, which the CPI creates itself. The doctor asks the same question for every layer without creating anything. It judges as the CPI's user, which it reads from the owner of the allocation journal directory, and it checks every directory the CPI would search on the way. A refusal from a layer that applies ends the search. The CPI then keeps no HA recovery record, a grace window never starts, and the dead-node handover cannot begin. The advice means one of these.
+The CPI keeps the endpoint cache, the HA profile cache, and the HA recovery episode record in one cache directory. It chooses the directory in layers. The first is `pve.endpoint_cache_dir`, the next is `endpoint-cache` beside the allocation journal directory when that exists or the CPI can create it, and the last is `pve_cpi-endpoint-cache.<uid>` under the CPI's temporary directory, which the CPI creates itself. The doctor asks the same question for every layer without creating anything. It judges as the CPI's user, which it reads from the owner of the allocation journal directory, and it checks every directory the CPI would search on the way. A refusal from a layer that applies ends the search. The CPI then keeps no HA recovery record, a grace window never starts, and the dead-node handover cannot begin. The advice means one of these.
 
-- The override does not exist.
-  The record goes to the next layer that works, the CPI logs a Warn line that begins `ha episode: pve.endpoint_cache_dir does not exist`, and creating the override later moves the record and restarts a running grace window once. When no layer works, the finding says the CPI keeps no record. The endpoint cache and the HA profile cache do not fall back, so with a missing override they run without a cache and discovery is off for the call.
+- A missing directory that the CPI creates on first use.
+  The CPI creates a missing override, or a missing directory beside the journal, when [the creation rule](endpoint-failover.md#when-the-cpi-creates-a-missing-directory) allows it, and the finding says so. The doctor sees the host's mounts, so under BPM the answer holds only when the parent directory is mounted into the worker, as it is when `director.cpi_additional_volumes` lists that directory or one above it. A missing override that the CPI creates also moves the record, which restarts a running grace window once.
+
+- A missing directory beside the journal that the CPI does not create.
+  The finding names the reason, such as a parent directory that another user owns or that sits on another mount than the journal, and the cache and the record use the temporary directory instead. We run `cpi provision-journal`, or we create the directory with mode `0700` for the CPI's user.
+
+- The override does not exist, and the CPI does not create it.
+  The finding names the reason. The record goes to the next layer that works, the CPI logs a Warn line that begins `ha episode: pve.endpoint_cache_dir does not exist`, and creating the override later moves the record and restarts a running grace window once. When no layer works, the finding says the CPI keeps no record. The endpoint cache and the HA profile cache do not fall back, so with a missing override they run without a cache and discovery is off for the call.
 
 - The override is a symbolic link, is not a directory, or grants group or other access.
   The CPI refuses it. We point the setting at the directory itself, or run `chmod 0700` on it.

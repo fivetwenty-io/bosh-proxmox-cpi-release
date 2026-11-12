@@ -198,7 +198,7 @@ The record is `ha-recovery-episodes.json` in the same cache directory as the end
 
 Two deletes for VMs on the same fenced node can observe at once, so every change to the record happens under the lock file `ha-recovery-episodes.lock` beside it. An observation that finds its episode already recorded reads without the lock. One that waits more than a second for the lock gives the same answer as an unreadable record, which is that the clock starts at this observation.
 
-When `pve.endpoint_cache_dir` does not exist, the CPI logs a Warn line that names it and records the episode in the next directory that works. When no directory works, the record is not kept, so the grace window never starts and the dead-node handover cannot begin. `pve-cid ha` checks the directory for this, as [Reading the cluster with `pve-cid ha`](operations.md#reading-the-cluster-with-pve-cid-ha) describes.
+When `pve.endpoint_cache_dir` does not exist and the CPI does not create it, the CPI logs a Warn line that names it and the reason, and it records the episode in the next directory that works. When no directory works, the record is not kept, so the grace window never starts and the dead-node handover cannot begin. `pve-cid ha` checks the directory for this, as [Reading the cluster with `pve-cid ha`](operations.md#reading-the-cluster-with-pve-cid-ha) describes.
 
 ### When the grace window expires on a dead node
 

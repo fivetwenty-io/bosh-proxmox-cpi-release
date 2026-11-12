@@ -381,15 +381,15 @@ flowchart TD
 
 | Layer | Directory | Who creates it | Survives a Director recreate |
 |---|---|---|---|
-| The override | The value of `pve.endpoint_cache_dir` | You, before the deploy | Yes, when you point it at persistent storage |
-| Beside the journal | `endpoint-cache` next to the allocation journal directory | `cpi provision-journal`, which pre-start runs | Yes, because it sits on the persistent disk |
+| The override | The value of `pve.endpoint_cache_dir` | You, before the deploy, or the CPI when [the creation rule](#when-the-cpi-creates-a-missing-directory) allows it | Yes, when you point it at persistent storage |
+| Beside the journal | `endpoint-cache` next to the allocation journal directory | `cpi provision-journal`, which pre-start runs, or the CPI when [the creation rule](#when-the-cpi-creates-a-missing-directory) allows it | Yes, because it sits on the persistent disk |
 | The temporary directory | `pve_cpi-endpoint-cache.<euid>` under `$TMPDIR` | The CPI, at run time | No, because a Director's `/var/vcap/data` is the ephemeral disk |
 
 ### The override
 
 When you set `pve.endpoint_cache_dir`, the CPI uses that directory and no other. The value must be an absolute, clean path, which means it has no `.` or `..` parts, no doubled or trailing slash, no control characters, and no leading or trailing whitespace. It cannot be the root directory. It is process-level, like the journal directory, so a `cpi_config` entry cannot change it.
 
-The CPI never creates this directory. Create it before the deploy with mode `0700`, owned by the user that runs the CPI, which is `vcap` on a Director. If it is missing or fails the checks below, the endpoint cache has no directory, discovery is off for the call, and the CPI does not fall through to another layer, because a directory that someone else controls is exactly the case the checks exist for. A missing directory therefore leaves the endpoint cache without a home until you create it again, and the CPI never recreates it. The HA recovery episode record is the one exception. When the override directory does not exist, and only then, the record falls back to the layers after the override, which are the directory beside the journal when it exists and the temporary directory otherwise, and the CPI logs one Warn line that says so. A directory that exists but fails the checks gets no such fallback. [HA and Resurrection](ha-and-resurrection.md) describes the record.
+Create this directory before the deploy with mode `0700`, owned by the user that runs the CPI, which is `vcap` on a Director. When it is missing, the CPI creates it if [the creation rule](#when-the-cpi-creates-a-missing-directory) allows it, using the journal directory as the mount the parent must share, or the temporary directory when no journal directory is set. If the CPI does not create it, or the directory fails the checks below, the endpoint cache has no directory, discovery is off for the call, and the CPI does not fall through to another layer, because a directory that someone else controls is exactly the case the checks exist for. A missing directory that the CPI does not create therefore leaves the endpoint cache without a home until you create it again. The HA recovery episode record is the one exception. When the override directory does not exist and the CPI does not create it, and only then, the record falls back to the layers after the override, which are the directory beside the journal and the temporary directory, and the CPI logs one Warn line that says so and why the CPI did not create it. A directory that exists but fails the checks gets no such fallback. [HA and Resurrection](ha-and-resurrection.md) describes the record.
 
 Under BPM, list the directory in `director.cpi_additional_volumes` with `writable: true`. BPM mounts those volumes but never creates them, and a path outside every mounted volume lands in the worker's private filesystem. The Director's own persistent directory, `/var/vcap/store/director`, needs neither step, because every worker already sees it writable.
 
@@ -397,11 +397,28 @@ Under BPM, list the directory in `director.cpi_additional_volumes` with `writabl
 
 When `pve.storage_allocation_journal_dir` is set and you set no override, the cache lives in a directory named `endpoint-cache` next to the journal directory, never inside it. For a journal at `/var/vcap/store/pve_cpi/allocations`, the cache is `/var/vcap/store/pve_cpi/endpoint-cache`. This layer gives a durable cache with no new property.
 
-The `cpi provision-journal` command, which the job's pre-start runs as root with `--owner vcap`, creates this directory with the same owner and mode as the journal. The CPI itself never creates it at run time. A missing directory falls through to the temporary layer, with a Debug line that names it, so until the next pre-start creates the directory the cache lives only in the temporary layer. A directory that exists but fails the checks gives no cache at all, with no fall through. One consequence is that an operator command run as root, such as `cpi storage-journal`, finds a directory owned by `vcap` and runs with no cache.
+The `cpi provision-journal` command, which the job's pre-start runs as root with `--owner vcap`, creates this directory with the same owner and mode as the journal. When the directory is missing at run time, the CPI creates it if [the creation rule](#when-the-cpi-creates-a-missing-directory) allows it, using the journal directory as the mount the parent must share. Otherwise the call falls through to the temporary layer, with a Debug line that names the directory and the reason the CPI did not create it, so until the next pre-start creates the directory the cache lives only in the temporary layer. A directory that exists but fails the checks gives no cache at all, with no fall through. One consequence is that an operator command run as root, such as `cpi storage-journal`, finds a directory owned by `vcap` and runs with no cache.
 
 The layer is skipped when the journal directory's own base name is `endpoint-cache`, because the two names would collide, and when the journal path is not absolute or is the root. Provisioning is gentle with an existing sibling. If it cannot provision the directory, for example because an operator made it by hand as root, the command prints one warning on standard error that names the directory and the reason, and its exit status stays what the journal's provisioning made it, so pre-start still succeeds and the Director starts. The CPI's checks then find the bad directory and use no cache.
 
 Under BPM, the workers must see the directory. List the journal's parent directory, such as `/var/vcap/store/pve_cpi`, in `director.cpi_additional_volumes` with `writable: true` and `mount_only: true`, which exposes the journal and the cache together, or list the two directories separately. If you list only the journal directory, the cache uses the temporary directory, which is safe and only loses durability. [Provisioning the storage allocation journal](storage-journal-provisioning.md) covers the commands.
+
+### When the CPI creates a missing directory
+
+The CPI creates a missing override or a missing directory beside the journal only when it can show that the new directory persists as long as the directory it would otherwise use. It creates only the last part of the path, with mode `0700`, and it does so only when all of these hold.
+
+- The parent directory is safe
+  The parent exists, is a directory and not a symbolic link, belongs to the CPI's user, and grants no write access to a group or others. Every directory above it belongs to root or the CPI's user, and it grants no write access to a group or others unless it is sticky, which is the rule `cpi provision-journal` applies above the journal.
+
+- The parent sits on the same mount as a directory that persists
+  For the directory beside the journal, that is the journal directory. For the override, it is the journal directory when one is set, and the temporary directory otherwise, because the record would fall back there anyway. On Linux the CPI compares the mount as well as the device, because a bind mount keeps the device of the filesystem it comes from.
+
+- The guards accept the path
+  The check that keeps the cache out of the allocation journal, and every check that applied before, run before the CPI creates anything.
+
+The mount rule matters under BPM. A directory made outside every mounted volume lands in the worker's private filesystem and vanishes on the next call, so the CPI declines to create one there and behaves as it did when the directory was missing. A journal directory that BPM mounts on its own is a mount of its own, so its parent is on another mount and the CPI never creates the directory beside it. Listing the journal's parent directory in `director.cpi_additional_volumes` puts both on one mount.
+
+When another worker creates the directory first, the CPI goes on to the usual checks. When the CPI declines, the reason is part of the refusal, so the Debug and Warn lines and `pve-cid ha` can name it. `pve-cid ha` also says whether the CPI would create a missing directory, judging as the owner of the journal directory. It sees the host's mounts and not the worker's, so under BPM its answer holds only when the parent directory is mounted into the worker.
 
 ### The temporary directory
 

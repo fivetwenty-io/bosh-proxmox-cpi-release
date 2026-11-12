@@ -72,17 +72,28 @@ properties:
     description: |
       Optional. A directory for the endpoint cache files. When it is unset or
       empty (the default), the CPI places the cache in the endpoint-cache
-      directory beside pve.storage_allocation_journal_dir when that is set and
-      the endpoint-cache directory already exists, which cpi provision-journal
-      creates and the CPI never creates while it runs. When the journal
-      directory is unset, or the directory beside it is missing, the CPI uses a
-      pve_cpi-endpoint-cache.<euid> directory under the temporary directory
-      instead, and it creates that one at mode 0700. An existing directory
-      beside the journal that is not private to the CPI's user ends the search
-      with no cache. A value here wins over both of those places. The CPI never
-      creates it, and it uses no cache when the directory is missing, is a
-      symbolic link, is owned by another user, or grants any access to a group
-      or others. The
+      directory beside pve.storage_allocation_journal_dir when that is set.
+      cpi provision-journal creates that directory, and the CPI also creates it
+      while it runs when it is missing and the rule below allows it. When the
+      journal directory is unset, or the directory beside it is missing and the
+      CPI does not create it, the CPI uses a pve_cpi-endpoint-cache.<euid>
+      directory under the temporary directory instead, and it creates that one
+      at mode 0700. An existing directory beside the journal that is not
+      private to the CPI's user ends the search with no cache. A value here
+      wins over both of those places. When this directory is missing, the CPI
+      creates it under the same rule, and otherwise it uses no cache. It also
+      uses no cache when the directory is a symbolic link, is owned by another
+      user, or grants any access to a group or others. The rule lets the CPI
+      create a missing directory, only the last part of the path and at mode
+      0700, when its parent directory exists, is not a symbolic link, belongs
+      to the CPI's user, and grants no write access to a group or others. Every
+      directory above the parent must belong to root or the CPI's user and
+      grant no write access to a group or others unless it is sticky. The
+      parent must also sit on the same mount as a directory that already
+      persists, which is the journal directory, or the temporary directory
+      for this value when no journal directory is set. Under BPM, a directory
+      outside every mounted volume would vanish after the call, and the mount
+      check is what keeps the CPI from making one there. The
       value must be an absolute path, and it must be clean, which means it has
       no `.` or `..` parts, no doubled slashes, and no trailing slash. It may
       not contain control characters or have leading or trailing whitespace,
@@ -2418,9 +2429,14 @@ properties:
       redirected by request context. Runtime validation checks access and locking.
       When pve.endpoint_cache_dir is unset, this directory also places the
       endpoint cache, in an endpoint-cache directory beside it that
-      cpi provision-journal creates. The CPI uses that directory only when it
-      exists. A journal directory that is itself named endpoint-cache has no
-      such neighbor. The cache
+      cpi provision-journal creates. When that directory is missing, the CPI
+      creates it at mode 0700 only when the journal's parent directory belongs
+      to the CPI's user, grants no write access to a group or others, and sits
+      on the same mount as this directory, and otherwise the cache uses the
+      temporary directory. A journal directory that is a mount point of its
+      own, such as one BPM mounts alone, therefore never gets the directory
+      created beside it. A journal directory that is itself named
+      endpoint-cache has no such neighbor. The cache
       directory may not equal, sit inside, or contain this directory.
 
   pve.require_disjoint_storage_sets:
