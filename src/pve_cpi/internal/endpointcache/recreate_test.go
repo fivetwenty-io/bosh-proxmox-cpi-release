@@ -236,7 +236,9 @@ func TestAMissingDirectoryIsNotCreatedWhenItsParentIsUnsuitable(t *testing.T) {
 			journal := filepath.Join(base, "allocations")
 			makePrivateDirectory(t, journal)
 			parent := tc.layout(t, base)
-			override := filepath.Join(parent, "cache")
+			// The name is unique, so a parent outside the test's directory,
+			// such as the root directory, cannot already hold it.
+			override := filepath.Join(parent, "endpoint-cache-"+filepath.Base(filepath.Dir(base)))
 			choice := resolve(t, Options{Override: override, JournalDir: journal})
 			if choice.Layer != LayerOverride || choice.Usable() {
 				t.Fatalf("choice = %s usable %v, want a refusal by the override", choice.Layer, choice.Usable())

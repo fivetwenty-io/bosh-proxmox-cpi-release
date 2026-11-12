@@ -155,6 +155,13 @@ func TestFirstUnsearchableAppliesTheKernelsRule(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "above")
 	makeDir(t, dir)
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) }) //nolint:gosec // restores the test's own directory
+	// Root searches anything, so when the test runs as root the directory goes
+	// to another owner for the owner's cases to mean something.
+	if os.Geteuid() == 0 {
+		if err := os.Chown(dir, 54321, 54321); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var st syscall.Stat_t
 	if err := syscall.Stat(dir, &st); err != nil {
 		t.Fatal(err)

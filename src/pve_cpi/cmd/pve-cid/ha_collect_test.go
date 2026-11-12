@@ -898,7 +898,9 @@ func TestReportTextCoversEveryFinding(t *testing.T) {
 }
 
 func TestCollectReportsACacheDirectoryTheCPICannotUse(t *testing.T) {
-	t.Parallel()
+	// With no journal, whether the CPI creates a missing override depends on
+	// the temporary directory's owner, so the check gets one this user owns.
+	t.Setenv("TMPDIR", t.TempDir())
 	private := filepath.Join(t.TempDir(), "private")
 	wide := filepath.Join(t.TempDir(), "wide")
 	file := filepath.Join(t.TempDir(), "afile")
@@ -937,6 +939,9 @@ func TestCollectReportsACacheDirectoryTheCPICannotUse(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
+			if os.Geteuid() == 0 && (tc.dir == missing || tc.dir == creatable) {
+				t.Skip("run as root with no journal, the check cannot tell whether the CPI creates a missing directory")
+			}
 			f := haBaseFake()
 			cfg := haCfg("auto", "none")
 			cfg.EndpointCacheDir = tc.dir

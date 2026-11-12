@@ -308,8 +308,14 @@ func TestEpisodeStore_MissingOverrideDirectoryFallsBackToTheTemporaryLayer(t *te
 		if !strings.Contains(e.Message, "pve.endpoint_cache_dir does not exist") || e.Attrs["path"] != missing {
 			t.Errorf("warning %+v does not name the missing override directory %s", e, missing)
 		}
-		if why, _ := e.Attrs["error"].(string); !strings.Contains(why, "does not create it because its parent "+
-			"directory") || !strings.Contains(why, "does not exist") {
+		// Run as root with no journal, the CPI declines before it looks at the
+		// parent, because a directory root made could be one its user refuses.
+		reason := "does not create it because its parent directory"
+		if os.Geteuid() == 0 {
+			reason = "does not create it because it would be made by root"
+		}
+		why, _ := e.Attrs["error"].(string)
+		if !strings.Contains(why, reason) || !strings.Contains(why, "does not exist") {
 			t.Errorf("warning %+v does not say why the CPI did not create the override", e)
 		}
 	}
