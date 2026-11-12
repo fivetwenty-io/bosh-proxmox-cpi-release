@@ -111,8 +111,9 @@ func countAt(entries []log.Entry, level slog.Level) int {
 }
 
 // A pool that refuses the cached nodes falls back to the configured endpoints,
-// and the pool of one it builds keeps the timeouts a pool of one has always had.
-func TestFallbackPoolKeepsTheTimeoutsOfAPoolOfOne(t *testing.T) {
+// and the pool of one it builds keeps the dial and handshake defaults, because
+// discovery is still effectively on and the pool is meant to grow.
+func TestFallbackPoolKeepsTheDiscoveryTimeoutDefaults(t *testing.T) {
 	for _, tc := range []struct {
 		mode  config.DiscoveryMode
 		level slog.Level
@@ -140,8 +141,8 @@ func TestFallbackPoolKeepsTheTimeoutsOfAPoolOfOne(t *testing.T) {
 			})
 
 			opts = wiring.apply(opts, logger, cache)
-			if opts.DialTimeoutSec != 0 || opts.TLSHandshakeTimeoutSec != 0 {
-				t.Errorf("dial %ds and handshake %ds, want today's settings for a pool of one",
+			if opts.DialTimeoutSec != 5 || opts.TLSHandshakeTimeoutSec != 10 {
+				t.Errorf("dial %ds and handshake %ds, want 5 and 10 with discovery on",
 					opts.DialTimeoutSec, opts.TLSHandshakeTimeoutSec)
 			}
 			if _, err := sdkclient.NewClient(opts); err != nil || wiring.poolErr != nil {

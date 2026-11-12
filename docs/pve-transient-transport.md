@@ -242,7 +242,7 @@ See [PVE Host Tuning](pve-host-tuning.md) for full sizing guidance, verification
 
 - `internal/pve/endpointpool/` holds the failover transport, its outcome table, the tethers, and the send-by check (`ErrSendByPassed`, `ErrTetherConflict`, `EntryUnreachableError`).
 
-- `internal/pve/endpoint_plan.go` decides when the pool is installed and sets the 5-second dial and 10-second handshake defaults for a pool of more than one endpoint.
+- `internal/pve/endpoint_plan.go` decides when the pool is installed and sets the 5-second dial and 10-second handshake defaults for a pool of more than one endpoint and for a pool of one endpoint while discovery is effectively on.
 
 - `internal/cpi/handlers/inflight.go` — `nodeInflightRegistry` per-node semaphore.
 

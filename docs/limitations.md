@@ -93,7 +93,7 @@ This page collects every known limitation of the CPI in one place. Each entry is
   A cpi-config entry names one cluster or host, and its `endpoints` list names machines of that cluster. The CPI never fails over from one entry's cluster to another. See [Multi-Cluster Deployments](multi-cluster.md#what-an-entry-can-override).
 
 - Each process pays for a dead endpoint on its own
-  Without a usable endpoint cache, every CPI process walks the list in order, so a dead first endpoint costs each call up to its dial timeout (5 seconds when the list holds more than one endpoint and `pve.api_dial_timeout_sec` is `0`). Put a healthy node first when a node stays down for long.
+  Without a usable endpoint cache, every CPI process walks the list in order, so a dead first endpoint costs each call up to its dial timeout (5 seconds when the list holds more than one endpoint, or discovery is effectively on, and `pve.api_dial_timeout_sec` is `0`). Put a healthy node first when a node stays down for long.
 
 - The list does not route uploads
   `pve.endpoints` controls which endpoints answer API calls. Direct-to-node uploads still follow `pve.node_endpoints` and `pve.node_endpoints_discovery`, and the list does not change where an upload goes. See [Configuration](configuration.md#api-endpoints).

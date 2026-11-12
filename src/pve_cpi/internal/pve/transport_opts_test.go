@@ -190,7 +190,7 @@ func TestPoolTimeoutDefaultsForMoreThanOneEndpoint(t *testing.T) {
 	cfg := minCfg()
 	cfg.Endpoints = []string{"pve.example.com:8006", "pve2.example.com:8006"}
 	before := buildTransportOpts(cfg)
-	got := applyPoolTimeoutDefaults(before, 2)
+	got := applyPoolTimeoutDefaults(before, 2, false)
 	if got.DialTimeoutSec != 5 {
 		t.Errorf("DialTimeoutSec = %d, want 5", got.DialTimeoutSec)
 	}
@@ -225,7 +225,7 @@ func TestPoolTimeoutDefaultsKeepTheOperatorsValues(t *testing.T) {
 			cfg := minCfg()
 			cfg.PVEDialTimeoutSec = tc.dial
 			cfg.PVETLSHandshakeTimeoutSec = tc.tls
-			got := applyPoolTimeoutDefaults(buildTransportOpts(cfg), 3)
+			got := applyPoolTimeoutDefaults(buildTransportOpts(cfg), 3, false)
 			if got.DialTimeoutSec != tc.wantD || got.TLSHandshakeTimeoutSec != tc.wantTL {
 				t.Errorf("dial/handshake = %d/%d, want %d/%d",
 					got.DialTimeoutSec, got.TLSHandshakeTimeoutSec, tc.wantD, tc.wantTL)
@@ -241,7 +241,7 @@ func TestPoolTimeoutDefaultsLeaveAPoolOfOneAlone(t *testing.T) {
 	for _, size := range []int{0, 1} {
 		cfg := minCfg()
 		before := buildTransportOpts(cfg)
-		got := applyPoolTimeoutDefaults(before, size)
+		got := applyPoolTimeoutDefaults(before, size, false)
 		if got.DialTimeoutSec != 0 || got.TLSHandshakeTimeoutSec != 0 {
 			t.Errorf(
 				"pool of %d: dial/handshake = %d/%d, want 0/0",
@@ -256,8 +256,61 @@ func TestPoolTimeoutDefaultsLeaveAPoolOfOneAlone(t *testing.T) {
 	}
 	cfg := minCfg()
 	cfg.PVEDialTimeoutSec = 7
-	if got := applyPoolTimeoutDefaults(buildTransportOpts(cfg), 1); got.DialTimeoutSec != 7 {
+	if got := applyPoolTimeoutDefaults(buildTransportOpts(cfg), 1, false); got.DialTimeoutSec != 7 {
 		t.Errorf("pool of one changed the operator's dial timeout to %d", got.DialTimeoutSec)
+	}
+}
+
+// A lone endpoint, which is the name seed before discovery has answered, takes
+// the defaults when discovery is effectively on, because the pool is meant to
+// grow. An empty pool counts the same way.
+func TestPoolTimeoutDefaultsForALoneSeedWithDiscoveryOn(t *testing.T) {
+	t.Parallel()
+	for _, size := range []int{0, 1} {
+		got := applyPoolTimeoutDefaults(buildTransportOpts(minCfg()), size, true)
+		if got.DialTimeoutSec != 5 || got.TLSHandshakeTimeoutSec != 10 {
+			t.Errorf("pool of %d: dial/handshake = %d/%d, want 5/10",
+				size, got.DialTimeoutSec, got.TLSHandshakeTimeoutSec)
+		}
+	}
+}
+
+// An operator's values win for a lone endpoint whether discovery is on or off.
+func TestPoolTimeoutDefaultsKeepTheOperatorsValuesForALoneEndpoint(t *testing.T) {
+	t.Parallel()
+	for _, discovery := range []bool{false, true} {
+		cfg := minCfg()
+		cfg.PVEDialTimeoutSec = 7
+		cfg.PVETLSHandshakeTimeoutSec = 3
+		got := applyPoolTimeoutDefaults(buildTransportOpts(cfg), 1, discovery)
+		if got.DialTimeoutSec != 7 || got.TLSHandshakeTimeoutSec != 3 {
+			t.Errorf("discovery %v: dial/handshake = %d/%d, want 7/3",
+				discovery, got.DialTimeoutSec, got.TLSHandshakeTimeoutSec)
+		}
+		cfg.PVETLSHandshakeTimeoutSec = 0
+		got = applyPoolTimeoutDefaults(buildTransportOpts(cfg), 1, discovery)
+		wantTLS := 0
+		if discovery {
+			wantTLS = 10
+		}
+		if got.DialTimeoutSec != 7 || got.TLSHandshakeTimeoutSec != wantTLS {
+			t.Errorf("discovery %v: dial/handshake = %d/%d, want 7/%d",
+				discovery, got.DialTimeoutSec, got.TLSHandshakeTimeoutSec, wantTLS)
+		}
+	}
+}
+
+// Pools of two or more take the defaults whatever discovery says.
+func TestPoolTimeoutDefaultsForLargerPoolsIgnoreDiscovery(t *testing.T) {
+	t.Parallel()
+	for _, size := range []int{2, 3} {
+		for _, discovery := range []bool{false, true} {
+			got := applyPoolTimeoutDefaults(buildTransportOpts(minCfg()), size, discovery)
+			if got.DialTimeoutSec != 5 || got.TLSHandshakeTimeoutSec != 10 {
+				t.Errorf("pool of %d, discovery %v: dial/handshake = %d/%d, want 5/10",
+					size, discovery, got.DialTimeoutSec, got.TLSHandshakeTimeoutSec)
+			}
+		}
 	}
 }
 

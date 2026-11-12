@@ -162,13 +162,17 @@ func checkPrimaryEndpoint(first string, opts sdkclient.Options) error {
 		"set pve.host to the first endpoint, or drop pve.host", first)
 }
 
-// applyPoolTimeoutDefaults gives a client whose pool holds more than one
-// endpoint a 5-second dial timeout and a 10-second TLS handshake timeout, for
-// each one the operator left at 0. An operator's value wins, and a pool of one
-// endpoint keeps exactly the options it was given. buildTransportOpts stays
-// untouched, so its byte-identical test keeps its meaning.
-func applyPoolTimeoutDefaults(opts sdkclient.Options, poolSize int) sdkclient.Options {
-	if poolSize <= 1 {
+// applyPoolTimeoutDefaults gives a client whose pool is meant to hold more than
+// one endpoint a 5-second dial timeout and a 10-second TLS handshake timeout,
+// for each one the operator left at 0. A pool is meant to hold more than one
+// endpoint when it already does, or when discovery is effectively on, because
+// then a lone name seed grows once discovery answers and must not wait on the
+// kernel's connect timeout before that happens. An operator's value wins, and a
+// pool of one endpoint with discovery effectively off keeps exactly the options
+// it was given. buildTransportOpts stays untouched, so its byte-identical test
+// keeps its meaning.
+func applyPoolTimeoutDefaults(opts sdkclient.Options, poolSize int, discovery bool) sdkclient.Options {
+	if poolSize <= 1 && !discovery {
 		return opts
 	}
 	if opts.DialTimeoutSec == 0 {
@@ -213,8 +217,8 @@ func wireEndpoints(cfg *config.CPIConfig) (sdkclient.Options, *endpointWiring, e
 //
 // The endpoints are settled first. If the pool would refuse the cached
 // endpoints, the plan keeps the configured endpoints alone, before the timeouts
-// are sized from the plan, so a client that falls back to one endpoint keeps
-// the timeouts of a pool of one. A cache file can cost the client its
+// are sized from the plan, so a client that falls back to one endpoint with
+// discovery effectively off keeps the timeouts of a pool of one. A cache file can cost the client its
 // discovered nodes and never the client itself.
 func (w *endpointWiring) apply(opts sdkclient.Options, logger *log.Logger, cache *endpointCache) sdkclient.Options {
 	if w.plan.configured < len(w.plan.endpoints) {
@@ -223,7 +227,7 @@ func (w *endpointWiring) apply(opts sdkclient.Options, logger *log.Logger, cache
 			w.dropDiscovered(cache)
 		}
 	}
-	opts = applyPoolTimeoutDefaults(opts, len(w.plan.endpoints))
+	opts = applyPoolTimeoutDefaults(opts, len(w.plan.endpoints), w.plan.discoveryEffective())
 	if !w.plan.install() {
 		return opts
 	}

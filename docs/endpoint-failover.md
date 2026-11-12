@@ -34,7 +34,7 @@ A few rules apply when we validate the list.
 - A host is required
   The job fails to render with `pve.host or pve.endpoints is required` when neither is set.
 
-An existing manifest that sets only `pve.host` needs no change. It renders the same `cpi.json` as before, the CPI builds a pool of one endpoint, and it behaves as it always has.
+An existing manifest that sets only `pve.host` needs no change. It renders the same `cpi.json` as before, the CPI builds a pool of one endpoint, and with discovery effectively off it behaves as it always has. With discovery effectively on, that one endpoint still gets the dial and handshake defaults described in [Timeouts](#timeouts-the-pool-sets).
 
 The list never changes how direct-to-node uploads are routed. `pve.node_endpoints` and `pve.node_endpoints_discovery` keep controlling that, and the CPI does not copy `pve.node_endpoints` values into the failover list. Some deployments list link0 addresses there that pveproxy may not listen on, and we did not want a failover to land on one of them.
 
@@ -44,7 +44,7 @@ We recommend API tokens for every deployment that uses failover. A token is a he
 
 ## How a call walks the list
 
-The CPI installs the failover transport when the pool holds more than one endpoint, and also when discovery is in effect, so the transport sees the first answered request even if the pool starts with one endpoint. A client with neither keeps the SDK's own transport, so it has no dial deadline and no header deadline, exactly as before.
+The CPI installs the failover transport when the pool holds more than one endpoint, and also when discovery is in effect, so the transport sees the first answered request even if the pool starts with one endpoint. A client with neither keeps the SDK's own transport, so it has no dial deadline and no header deadline, exactly as before. A pool of one endpoint with discovery effectively on gets the transport and also the dial and handshake defaults.
 
 The transport sorts each request into one of four kinds before it does anything else.
 
@@ -147,7 +147,7 @@ That error unwraps to a single dial error, so the SDK's own retry stops at once 
 
 ### Timeouts the pool sets
 
-When the pool holds more than one endpoint at construction and you left `pve.api_dial_timeout_sec` and `pve.api_tls_handshake_timeout_sec` at 0, the CPI uses 5 seconds for the dial and 10 seconds for the TLS handshake. A value you set yourself always wins.
+When you left `pve.api_dial_timeout_sec` and `pve.api_tls_handshake_timeout_sec` at 0, the CPI uses 5 seconds for the dial and 10 seconds for the TLS handshake in two cases. The first is a pool that holds more than one endpoint at construction. The second is a pool that holds one endpoint while discovery is effectively on, which is the case for a name seed with no cache yet, because that pool is meant to grow and a seed that is down would otherwise hold each attempt for the operating system's full connect timeout. A pool of one endpoint with discovery effectively off keeps the SDK's own transport settings. A value you set yourself always wins.
 
 The same pools give a read a response-header deadline of 60 seconds. Go starts that timer after the request is fully written, so it measures how long the node takes to start answering. It catches a node whose pveproxy accepts the connection and then stops responding, which used to hold a request for the 30-minute client timeout. The deadline applies only to a read that the entry node would be blamed for and that is not on the walk's final hop. A mutation never gets one, because a synchronous mutation or an upload can run for a long time legitimately.
 
@@ -361,6 +361,7 @@ The failure level in this table is Debug under `auto` and Warn under an explicit
 | Pin mismatch on a discovered endpoint | Warn | `pve endpoint pve3:8006: certificate is not one of the 2 pinned for node pve3; skipping it until discovery refreshes` | Once per endpoint per call. |
 | Discovered endpoint refused before its pins were checked | Warn | `pve endpoint pve3:8006: certificate refused (x509: certificate signed by unknown authority), so it was not checked against the 2 pinned for node pve3; skipping it until discovery refreshes` | Once per endpoint per call. |
 | Node left out of a result | Debug | `api endpoint discovery: left out node pve3, because its derived name did not resolve` | Once per node. |
+| Records left out when the cache file is read | Debug | `endpoint cache: node 2 dropped: expired` | Once per read that leaves records out. The text joins every record with `; `, each as the record's name followed by `dropped:` and the reason. |
 
 When the lines say `delete the cache file`, [The reset](#the-reset) explains what that removes and what recreates it.
 
@@ -554,6 +555,7 @@ If an accepted candidate later fails TLS verification, the pool revokes it and l
 | A candidate was revoked | Error | `pve endpoint pve2.dc1.example.com:8006: the cold-start candidate for node pve2 from placement.az_map failed TLS verification (x509: certificate signed by unknown authority); this can mean interception; the pool no longer sends to it` | Once per candidate per call. |
 | The cold start begins | Debug | `pve endpoints: no configured endpoint could connect, so this request tries the cold-start candidates from placement.az_map` | Once per run. |
 | No cold start for this call | Debug | `pve endpoints: no cold start from placement.az_map, because the cache holds usable discovered nodes or its last discovery found a standalone host` | Once per call that has `az_map` names and a cache that rules it out. |
+| A candidate is a configured endpoint or a duplicate | Debug | `pve endpoints: the cold start from placement.az_map leaves out a node whose address is a configured endpoint or another node's` | Once per node left out. |
 | Cold start barred for a request | Debug | `pve endpoints: no configured endpoint could connect, and DELETE /pools does not start the cold start from placement.az_map, because it carries a send-by deadline` | Once per request. |
 | A cold-start hint could not be recorded | The failure level | `endpoint cache: the cold-start hint could not be recorded` | Once per hint whose write fails. |
 

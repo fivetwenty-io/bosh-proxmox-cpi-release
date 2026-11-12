@@ -590,14 +590,14 @@ func TestPoolBuiltFromAFileWithANodeStartsWithThePoolTimeouts(t *testing.T) {
 	}
 }
 
-func TestPoolBuiltFromAnEmptyDirectoryKeepsTheSingleEndpointSettings(t *testing.T) {
+func TestPoolBuiltFromAnEmptyDirectoryGetsTheDialDefaultsButNoHeaderDeadline(t *testing.T) {
 	cfg := cacheTestConfig(config.DiscoveryModeAuto, newCacheDir(t))
 	wiring, opts, cache := buildCachePool(t, cfg)
 	if cache == nil || wiring.pool == nil || wiring.pool.Len() != 1 {
 		t.Fatalf("cache %v, pool %v, want a cache and a pool of one", cache, wiring.pool)
 	}
-	if opts.DialTimeoutSec != 0 || opts.TLSHandshakeTimeoutSec != 0 || wiring.pool.HeaderDeadline() != 0 {
-		t.Errorf("dial %d, handshake %d, header %s, want today's settings for a pool of one",
+	if opts.DialTimeoutSec != 5 || opts.TLSHandshakeTimeoutSec != 10 || wiring.pool.HeaderDeadline() != 0 {
+		t.Errorf("dial %d, handshake %d, header %s, want 5, 10, and no header deadline for a lone seed",
 			opts.DialTimeoutSec, opts.TLSHandshakeTimeoutSec, wiring.pool.HeaderDeadline())
 	}
 }

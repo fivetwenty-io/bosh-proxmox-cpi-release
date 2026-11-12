@@ -39,9 +39,10 @@ properties:
       default) leaves the single pve.host endpoint in place and renders the
       same cpi.json as before. When the CPI's endpoint pool holds more than one
       endpoint at construction, which counts the entries of this list and any
-      endpoints discovered for the cluster but not cold-start candidates, and
-      pve.api_dial_timeout_sec or pve.api_tls_handshake_timeout_sec is 0, the
-      CPI uses 5 seconds and 10 seconds for them. This list controls which
+      endpoints discovered for the cluster but not cold-start candidates, or
+      when discovery is effectively on, and pve.api_dial_timeout_sec or
+      pve.api_tls_handshake_timeout_sec is 0, the CPI uses 5 seconds and 10
+      seconds for them. This list controls which
       endpoints the PVE API client uses; it never changes the direct-to-node
       upload routing that pve.node_endpoints and pve.node_endpoints_discovery
       control, and the CPI does not copy pve.node_endpoints values into it.
@@ -1018,10 +1019,11 @@ properties:
     description: |
       Optional. Bounds the TCP dial step of every PVE API HTTP request.
       0 (default) leaves the transport at the SDK default (no explicit dial
-      timeout) when the endpoint pool holds only one endpoint. When the pool
-      holds more than one endpoint at construction, whether from pve.endpoints
-      or from endpoints discovered for the cluster, and not counting cold-start
-      candidates, 0 means 5 seconds, so a node that drops packets
+      timeout) when the endpoint pool holds only one endpoint and discovery is
+      effectively off. When the pool holds more than one endpoint at
+      construction, whether from pve.endpoints or from endpoints discovered for
+      the cluster, and not counting cold-start candidates, or when discovery is
+      effectively on, 0 means 5 seconds, so a node that drops packets
       fails over quickly instead of holding each dial until the operating
       system gives up. When set, the TCP dial is cancelled if it has not
       completed within this many seconds. Useful on high-latency or flaky
@@ -1031,10 +1033,11 @@ properties:
     description: |
       Optional. Bounds the TLS handshake step of every PVE API HTTPS request.
       0 (default) leaves the transport at the SDK default (no explicit handshake
-      timeout) when the endpoint pool holds only one endpoint. When the pool
-      holds more than one endpoint at construction, whether from pve.endpoints
-      or from endpoints discovered for the cluster, and not counting cold-start
-      candidates, 0 means 10 seconds. When set, the handshake is
+      timeout) when the endpoint pool holds only one endpoint and discovery is
+      effectively off. When the pool holds more than one endpoint at
+      construction, whether from pve.endpoints or from endpoints discovered for
+      the cluster, and not counting cold-start candidates, or when discovery is
+      effectively on, 0 means 10 seconds. When set, the handshake is
       cancelled if it has not completed within this many seconds. Must be >= 0.
     default: 0
   pve.api_max_idle_conns_per_host:
