@@ -665,7 +665,7 @@ func AwaitTaskWithLogger(
 	err := AwaitTask(ctx, c, node, upid, opts...)
 	if err != nil {
 		if logger != nil {
-			logger.Error("pve: task failed", log.String("upid", upid), log.Err(err))
+			logTaskAwaitError(logger, upid, err)
 		}
 		return err
 	}
@@ -673,4 +673,19 @@ func AwaitTaskWithLogger(
 		logger.Debug("pve: task completed OK", log.String("upid", upid))
 	}
 	return nil
+}
+
+// logTaskAwaitError logs an await error at the level its meaning earns. Only a
+// task that resolved and reported a failing exit status (IsTaskExitVerdict) is
+// a failed task, logged at Error. Every other await error, such as a poll that
+// ended unresolved at its deadline or a poll fault, leaves the task's outcome
+// unknown, and the task may have succeeded or may still be running, so it is
+// logged at Warn with text that says so.
+func logTaskAwaitError(logger *log.Logger, upid string, err error) {
+	if IsTaskExitVerdict(err) {
+		logger.Error("pve: task failed", log.String("upid", upid), log.Err(err))
+		return
+	}
+	logger.Warn("pve: task outcome unknown, because polling ended before the task reported an exit status; "+
+		"this is not a task failure", log.String("upid", upid), log.Err(err))
 }
