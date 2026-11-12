@@ -41,12 +41,16 @@ func storageJournalReadinessError(cfg *config.CPIConfig) error {
 // than falling back, and this text is the refusal.
 //
 // Config load and the job template reject a namespace without a journal
-// directory, because no cpi-config entry can supply the directory, so that
-// half reaches this function only from a configuration built in code. They
-// cannot reject a journal directory without a namespace, because a cpi-config
-// entry may supply pve_storage_placement_namespace while the installed job
-// supplies only the process-level journal directory. That half is the one an
-// operator meets here, and its text names both places the namespace is set.
+// directory in the job, because no cpi-config entry can supply the directory.
+// They do not check an entry's effective configuration, so an entry that adds
+// pve_storage_placement_namespace to a job with no journal directory still
+// applies, and its calls that answer from PVE alone keep working. That entry
+// is the only way a namespace without a directory reaches this function at
+// run time, so its text names the entry and the job. They cannot reject a
+// journal directory without a namespace either, because a cpi-config entry
+// may supply the namespace while the installed job supplies only the
+// process-level journal directory, so that text names both places the
+// namespace is set.
 //
 // The errors are typed CloudErrors, so the Director reads this text and not
 // the generic evidence line. They carry only property names, the configured
@@ -70,7 +74,15 @@ func storageJournalConfigError(cfg *config.CPIConfig) error {
 			"and disks; set pve.storage_placement_namespace in the job or pve_storage_placement_namespace "+
 			"in the cpi-config entry, and enroll it as %s describes", storageJournalEnrollmentDoc)
 	}
-	if !hasDirectory || !filepath.IsAbs(directory) {
+	if !hasDirectory {
+		return cpierrors.Cloud("pve_storage_placement_namespace is set by the cpi-config entry, but the job sets "+
+			"no pve.storage_allocation_journal_dir, which only the job can set, and the allocation journal needs "+
+			"both and an enrolled namespace before the CPI can create or delete VMs and disks; set "+
+			"pve.storage_allocation_journal_dir in the job, provision it as %s describes, and enroll the "+
+			"namespace as %s describes, or remove pve_storage_placement_namespace from the cpi-config entry",
+			storageJournalProvisioningDoc, storageJournalEnrollmentDoc)
+	}
+	if !filepath.IsAbs(directory) {
 		return cpierrors.Cloud("pve.storage_placement_namespace is set but pve.storage_allocation_journal_dir "+
 			"is not an absolute directory, and the allocation journal needs both and an enrolled namespace "+
 			"before the CPI can create or delete VMs and disks; set pve.storage_allocation_journal_dir, "+
@@ -90,10 +102,11 @@ func storageJournalConfigError(cfg *config.CPIConfig) error {
 // A directory that pre-start provisioned on the host but that a BPM worker
 // was never given looks the same from inside the worker as a directory that
 // was never provisioned, so the missing-directory text names both causes and
-// both remedies. When other namespaces are enrolled in the same directory, the
-// namespace was most likely changed, and enrolling the new one would start a
-// fresh authority and leave the old records behind, so the text says to set
-// the namespace back first.
+// both remedies. Other namespaces enrolled in the same directory are normal
+// when each cpi-config entry has its own namespace, but they also appear when
+// the namespace was changed, and then enrolling the new one would start a
+// fresh authority and leave the old records behind. The text counts them and
+// says to set the namespace back if it replaced one of them.
 func storageJournalEnrollmentError(cfg *config.CPIConfig) error {
 	if cfg == nil {
 		return nil
@@ -114,9 +127,9 @@ func storageJournalEnrollmentError(cfg *config.CPIConfig) error {
 	others, otherErr := aj.OtherEnrollmentsRecorded(directory, namespace)
 	if otherErr == nil && others > 0 {
 		return cpierrors.Cloud("namespace %q is not enrolled in the allocation journal at %s, which holds %d "+
-			"other enrolled namespace(s); if the storage placement namespace was changed, set it back rather "+
-			"than enrolling a new one, and otherwise enroll it with 'cpi storage-journal audit-enrollment' and "+
-			"then 'cpi storage-journal initialize' as %s describes",
+			"other enrolled namespace(s), such as other cpi-config entries' namespaces; if this namespace "+
+			"replaced one of them, set it back rather than enrolling a new one, and otherwise enroll it with "+
+			"'cpi storage-journal audit-enrollment' and then 'cpi storage-journal initialize' as %s describes",
 			namespace, directory, others, storageJournalEnrollmentDoc)
 	}
 	return cpierrors.Cloud("namespace %q is not enrolled in the allocation journal at %s; enroll it with "+

@@ -48,8 +48,8 @@ func journalSetupCases() []journalSetupCase {
 			configure: func(_ *testing.T, cfg *config.CPIConfig) { cfg.StoragePlacementNamespace = "never-enrolled" },
 			want: []string{
 				`namespace "never-enrolled" is not enrolled in the allocation journal at `,
-				"which holds 1 other enrolled namespace(s); if the storage placement namespace was changed, " +
-					"set it back rather than enrolling a new one",
+				"which holds 1 other enrolled namespace(s), such as other cpi-config entries' namespaces; if " +
+					"this namespace replaced one of them, set it back rather than enrolling a new one",
 				"'cpi storage-journal audit-enrollment' and then 'cpi storage-journal initialize'",
 				storageJournalEnrollmentDoc,
 			},
@@ -188,7 +188,14 @@ func TestStorageJournalReadinessErrors(t *testing.T) {
 			"delete VMs and disks; set pve.storage_placement_namespace in the job or " +
 			"pve_storage_placement_namespace in the cpi-config entry, and enroll it as " +
 			"docs/storage-journal-operations.md#enroll-a-new-namespace describes"},
-		{"namespace only", "director", "", "pve.storage_placement_namespace is set but " +
+		{"namespace only", "director", "", "pve_storage_placement_namespace is set by the cpi-config entry, " +
+			"but the job sets no pve.storage_allocation_journal_dir, which only the job can set, and the " +
+			"allocation journal needs both and an enrolled namespace before the CPI can create or delete VMs " +
+			"and disks; set pve.storage_allocation_journal_dir in the job, provision it as " +
+			"docs/storage-journal-provisioning.md describes, and enroll the namespace as " +
+			"docs/storage-journal-operations.md#enroll-a-new-namespace describes, or remove " +
+			"pve_storage_placement_namespace from the cpi-config entry"},
+		{"relative journal directory", "director", "allocations", "pve.storage_placement_namespace is set but " +
 			"pve.storage_allocation_journal_dir is not an absolute directory, and the allocation journal needs " +
 			"both and an enrolled namespace before the CPI can create or delete VMs and disks; set " +
 			"pve.storage_allocation_journal_dir, provision it as docs/storage-journal-provisioning.md " +
@@ -224,9 +231,9 @@ func TestStorageJournalReadinessErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	want = `namespace "never-enrolled" is not enrolled in the allocation journal at ` + directory +
-		", which holds 1 other enrolled namespace(s); if the storage placement namespace was changed, set it " +
-		"back rather than enrolling a new one, and otherwise enroll it with 'cpi storage-journal " +
-		"audit-enrollment' and then 'cpi storage-journal initialize' as " +
+		", which holds 1 other enrolled namespace(s), such as other cpi-config entries' namespaces; if this " +
+		"namespace replaced one of them, set it back rather than enrolling a new one, and otherwise enroll it " +
+		"with 'cpi storage-journal audit-enrollment' and then 'cpi storage-journal initialize' as " +
 		"docs/storage-journal-operations.md#enroll-a-new-namespace describes"
 	if err := storageJournalEnrollmentError(cfg); !cpierrors.IsType(err, cpierrors.TypeCloud) || err.Error() != want {
 		t.Fatalf("not enrolled beside another namespace: error = %v, want %q", err, want)

@@ -169,6 +169,7 @@ type diskSiblingNodes struct {
 }
 
 func (n diskSiblingNodes) ListNodes(context.Context) (*nodes.ListNodesResponse, error) {
+	n.client.record("list", "cluster")
 	response := nodes.ListNodesResponse{}
 	for _, name := range n.client.clusterNodes {
 		raw, err := json.Marshal(map[string]any{"node": name, "status": "online"})

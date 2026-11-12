@@ -18,18 +18,23 @@ import (
 // TestCreateDiskNamesTheJournalSetupCause runs a set-managed create_disk with a
 // journal directory and no namespace, and then with a namespace that was never
 // enrolled. Each refuses with the typed setup text in place of the generic
-// managed-allocation line, and neither creates a volume.
+// managed-allocation line, and neither creates a volume. The configuration
+// check runs before the node listing, so the first case refuses without
+// listing the cluster's nodes, while enrollment is checked only when the
+// journal opens after that listing.
 func TestCreateDiskNamesTheJournalSetupCause(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		configure func(cfg *config.CPIConfig)
 		want      []string
+		listed    bool
 	}{
 		{"journal directory without a namespace", func(cfg *config.CPIConfig) { cfg.StoragePlacementNamespace = "" },
-			[]string{"pve.storage_allocation_journal_dir is set but no namespace is", storageJournalEnrollmentDoc}},
+			[]string{"pve.storage_allocation_journal_dir is set but no namespace is", storageJournalEnrollmentDoc},
+			false},
 		{"namespace never enrolled", func(*config.CPIConfig) {},
 			[]string{`namespace "namespace" is not enrolled in the allocation journal at `,
-				storageJournalEnrollmentDoc}},
+				storageJournalEnrollmentDoc}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			deps, selection, resolver, client, _ := managedDiskSiblingFixture(t, "spread")
@@ -46,6 +51,9 @@ func TestCreateDiskNamesTheJournalSetupCause(t *testing.T) {
 			}
 			if len(client.state.volumes) != 0 {
 				t.Fatalf("create_disk created volumes: %v", client.state.volumes)
+			}
+			if listed := client.firstCall("list") >= 0; listed != tc.listed {
+				t.Fatalf("create_disk listed the cluster's nodes: %t, want %t", listed, tc.listed)
 			}
 		})
 	}
