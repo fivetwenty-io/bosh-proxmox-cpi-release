@@ -45,12 +45,12 @@ func DiskTransferLockPoolName(stableID string) string {
 // disks detaching into one parker could then fail with nothing wrong. So the
 // TTL has to cover the full parker wait, and the disk claim never shortens it.
 //
-// On the shipped curves an unmanaged caller gets about 250s, which is the
-// parker TTL of about 235s plus the 15s default wait. A managed caller gets
-// about 470s, which is the parker TTL plus a managed wait of about one parker
-// TTL. The longer figure is also how long a crashed holder blocks every other
-// transfer of the disk, and we accept that bound because a waiter steals a
-// claim as soon as it expires.
+// On the shipped curves a caller on the default wait gets about 250s, which is
+// the parker TTL of about 235s plus the 15s default wait. A caller that waits a
+// whole parker TTL, which is every attach_disk, detach_disk, and delete_disk and
+// every journal-managed operation, gets about 470s. The longer figure is also
+// how long a crashed holder blocks every other transfer of the disk, and we
+// accept that bound because a waiter steals a claim as soon as it expires.
 //
 // The wait is the whole TTL plus the create grace, so a second transfer of the
 // disk waits out a holder that keeps the lock for as long as its claim allows,

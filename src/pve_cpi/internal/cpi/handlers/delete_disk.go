@@ -382,9 +382,11 @@ func HandleDeleteDisk(deps Deps) Handler {
 		if lifecycleErr != nil {
 			return nil, lifecycleErr
 		}
+		// Every call waits out a whole parker window, whether or not the disk
+		// has a journal record, because every disk on a parker shares its lock.
+		ctx = managedLockWaitContext(ctx)
 		if lifecycle != nil {
 			rd = lifecycle.disk
-			ctx = managedLockWaitContext(ctx)
 			defer func() { operationErr = lifecycle.finish(ctx, operationErr, true) }()
 		}
 		// A parked disk whose source VM still carries its allocation entry

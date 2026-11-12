@@ -263,7 +263,13 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 }
 
 // managedLockWaitContext lets a journal-managed operation wait out a whole
-// parker window that another request holds. The default wait is 15 seconds,
+// parker window that another request holds. Every attach_disk, detach_disk, and
+// delete_disk applies it as well, whether or not the disk has a journal record,
+// because every disk on one parker shares that parker's lock, and a clean-up
+// that deletes many orphans on one parker at once queues them all behind it.
+// A call for a disk without a journal record holds no other lock while it
+// waits, except a transfer's per-disk lock, whose TTL follows this wait, so the
+// longer wait can't hold up anything else. The default wait is 15 seconds,
 // while a holder's window may run for most of the lock's TTL, which is 235
 // seconds on the shipped retry curves and longer when pve.retry lengthens
 // them. The window ends early enough before the claim's recorded expiry to
