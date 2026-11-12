@@ -151,15 +151,10 @@ func TestAnOverrideWhoseParentIsOnAnotherMountIsNotCreated(t *testing.T) {
 
 func TestAMissingDirectoryIsNotCreatedWhenItsParentIsUnsuitable(t *testing.T) {
 	temporaryParent(t)
-	other := os.Geteuid() + 1
 	cases := map[string]struct {
 		layout func(t *testing.T, base string) string
-		judge  *judgement
 		reason string
 		root   bool
-		// noJournal leaves the journal unset, so the anchor names no user
-		// and the parent's own owner is what the case tests.
-		noJournal bool
 	}{
 		"missing parent": {
 			layout: func(_ *testing.T, base string) string { return filepath.Join(base, "absent") },
@@ -178,14 +173,21 @@ func TestAMissingDirectoryIsNotCreatedWhenItsParentIsUnsuitable(t *testing.T) {
 			reason: "is a symbolic link",
 		},
 		"parent owned by another user": {
+			// The journal's owner is the CPI's user, so only the parent's
+			// owner differs. Root gives the parent away, and any other user
+			// uses the root directory, which root owns.
 			layout: func(t *testing.T, base string) string {
+				if os.Geteuid() != 0 {
+					return string(filepath.Separator)
+				}
 				dir := filepath.Join(base, "theirs")
 				makePrivateDirectory(t, dir)
+				if err := os.Chown(dir, 54321, 54321); err != nil {
+					t.Fatal(err)
+				}
 				return dir
 			},
-			judge:     &judgement{set: true, uid: other},
-			reason:    "and the CPI runs as uid " + strconv.Itoa(other),
-			noJournal: true,
+			reason: "and the CPI runs as uid " + strconv.Itoa(os.Geteuid()),
 		},
 		"group-writable parent": {
 			layout: func(t *testing.T, base string) string {
@@ -235,14 +237,7 @@ func TestAMissingDirectoryIsNotCreatedWhenItsParentIsUnsuitable(t *testing.T) {
 			makePrivateDirectory(t, journal)
 			parent := tc.layout(t, base)
 			override := filepath.Join(parent, "cache")
-			opts := Options{Override: override, JournalDir: journal}
-			if tc.noJournal {
-				opts.JournalDir = ""
-			}
-			if tc.judge != nil {
-				opts.judge = *tc.judge
-			}
-			choice := resolve(t, opts)
+			choice := resolve(t, Options{Override: override, JournalDir: journal})
 			if choice.Layer != LayerOverride || choice.Usable() {
 				t.Fatalf("choice = %s usable %v, want a refusal by the override", choice.Layer, choice.Usable())
 			}
@@ -458,6 +453,42 @@ func TestRootCreatesNoOverrideWithoutAJournal(t *testing.T) {
 	override := filepath.Join(base, "cache")
 	choice := resolve(t, Options{Override: override, judge: judgement{set: true, uid: 0}})
 	requireNotCreated(t, choice.Err, override, "it would be made by root")
+}
+
+// With no journal, the temporary directory's owner names the CPI's user, so a
+// process that runs as anyone else, such as an operator's sudo -u, creates no
+// override the CPI's own calls would then refuse.
+func TestOnlyTheTemporaryDirectorysOwnerCreatesAnOverrideWithoutAJournal(t *testing.T) {
+	parent := temporaryParent(t)
+	base := filepath.Join(parent, "operator")
+	makePrivateDirectory(t, base)
+	override := filepath.Join(base, "cache")
+	owner := os.Geteuid()
+	if owner == 0 {
+		// A temporary directory root owns names no user, so give it to one.
+		owner = 54321
+		if err := os.Chown(parent, owner, owner); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other := owner + 1
+	choice := resolve(t, Options{Override: override, judge: judgement{set: true, uid: other}})
+	requireNotCreated(t, choice.Err, override, "the temporary directory "+parent+" belongs to uid "+
+		strconv.Itoa(owner)+", the user the CPI runs as, and it would be made by uid "+strconv.Itoa(other))
+}
+
+// A temporary directory that belongs to root, such as /tmp, names no user, so
+// with no journal no process creates the override.
+func TestATemporaryDirectoryOwnedByRootNamesNoUser(t *testing.T) {
+	rootOwned := "/tmp"
+	if info, err := os.Stat(rootOwned); err != nil || info.Sys().(*syscall.Stat_t).Uid != 0 {
+		t.Skipf("%s is not a directory that belongs to root here (%v)", rootOwned, err)
+	}
+	t.Setenv("TMPDIR", rootOwned)
+	override := filepath.Join(t.TempDir(), "cache")
+	choice := resolve(t, Options{Override: override, judge: judgement{set: true, uid: 54321}})
+	requireNotCreated(t, choice.Err, override, "the temporary directory /tmp belongs to root, so with no "+
+		"allocation journal directory nothing names the user the CPI runs as")
 }
 
 // A directory this call made that the private checks then refuse, as on a

@@ -87,9 +87,13 @@ type anchor struct {
 	path string
 	// what says in words which directory the anchor is.
 	what string
-	// namesUser is true when the anchor's owner is the user the CPI runs as,
-	// which holds for the journal directory, because pre-start provisions it
-	// for that user. Only that user may then create the directory.
+	// namesUser is true when the anchor's owner is the user the CPI runs as
+	// whoever that owner is, which holds for the journal directory, because
+	// pre-start provisions it for that user. Otherwise the anchor is the
+	// temporary directory, whose owner names that user only when it is not
+	// root, as the Director's /var/vcap/data/director/tmp belongs to vcap and
+	// /tmp belongs to root. Only the user the anchor names may create the
+	// directory.
 	namesUser bool
 }
 
@@ -105,6 +109,8 @@ func journalAnchor(journal string) anchor {
 // because the layers after the override end there, so a directory on its
 // mount is as durable as the one the HA recovery episode record would fall
 // back to, and the operator's directory is not created anywhere less durable.
+// The temporary directory's owner then names the CPI's user, unless it is
+// root.
 func overrideAnchor(opts Options) anchor {
 	if opts.JournalDir != "" {
 		return journalAnchor(filepath.Clean(opts.JournalDir))
@@ -122,11 +128,11 @@ func overrideAnchor(opts Options) anchor {
 //
 // The CPI creates only the last component, at mode 0700, and only when every
 // one of these holds. The process runs as the user the CPI runs as, which is
-// the owner of the journal directory when the anchor is the journal, and any
-// user but root when no journal names one. Otherwise a run as root, such as an
-// operator's sudo, would leave a directory owned by root that every later call
-// of the CPI refuses, where before it would have left the directory missing
-// and the record would have fallen back. The parent exists, is not a symbolic
+// the owner of the journal directory when the anchor is the journal, and the
+// owner of the temporary directory when no journal is set and that owner is
+// not root. Otherwise a run as another user, such as an operator's sudo, would
+// leave a directory that every later call of the CPI refuses, where before it
+// would have left the directory missing and the record would have fallen back. The parent exists, is not a symbolic
 // link, belongs to the CPI's user, grants its owner write and search access,
 // and grants no group or other write access. Every directory that resolving
 // the parent looks a name up in belongs to root or to the CPI's user and
@@ -190,18 +196,17 @@ func (t *texts) createMissing(opts Options, choice Choice, a anchor, create bool
 
 // creatorIsTheCPIsUser returns nil when the user this process runs as, or the
 // user a probe judges as, is the user the CPI runs as, and otherwise a reason
-// that names both. With the journal as the anchor that user is the journal
-// directory's owner. With no journal nothing names the user, so root is the
-// one user refused, because the CPI does not run as root, and a directory root
-// made would belong to root and be refused by every call of the CPI.
+// that names both. That user is the anchor's owner. With the journal as the
+// anchor, that holds whoever owns it. With the temporary directory as the
+// anchor, it holds only when the owner is not root, because the CPI does not
+// run as root, so a temporary directory such as /tmp names no user, and root
+// is refused whatever the anchor, because a directory root made would belong
+// to root and be refused by every call of the CPI.
 func (t *texts) creatorIsTheCPIsUser(a anchor) error {
 	uid := t.ownerUID()
-	if !a.namesUser {
-		if uid == 0 {
-			return errors.New("it would be made by root, and with no allocation journal directory to name the " +
-				"user the CPI runs as, a directory owned by root could be one the CPI refuses on every later call")
-		}
-		return nil
+	if !a.namesUser && uid == 0 {
+		return errors.New("it would be made by root, and with no allocation journal directory to name the " +
+			"user the CPI runs as, a directory owned by root could be one the CPI refuses on every later call")
 	}
 	info, err := os.Stat(a.path)
 	if err != nil {
@@ -211,6 +216,11 @@ func (t *texts) creatorIsTheCPIsUser(a anchor) error {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return fmt.Errorf("%s %s has no ownership metadata to name the user the CPI runs as", a.what, a.path)
+	}
+	if !a.namesUser && st.Uid == 0 {
+		return fmt.Errorf("%s %s belongs to root, so with no allocation journal directory nothing names the "+
+			"user the CPI runs as, and a directory that uid %d made could be one the CPI refuses on every later "+
+			"call", a.what, a.path, uid)
 	}
 	if int64(st.Uid) != int64(uid) {
 		return fmt.Errorf("%s %s belongs to uid %d, the user the CPI runs as, and it would be made by uid %d, "+
