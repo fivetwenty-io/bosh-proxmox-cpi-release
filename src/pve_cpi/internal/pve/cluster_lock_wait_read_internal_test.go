@@ -69,3 +69,40 @@ func TestAcquireClusterLock_WaitStillStealsAnExpiredClaim(t *testing.T) {
 		t.Fatalf("stole after %s, want soon after the claim expired at 10s", elapsed)
 	}
 }
+
+// TestAcquireClusterLock_WaitStillTriesItsOwnClaim pins that the read before
+// a poll skips the create only for another owner's claim. Partway through the
+// wait the sentinel comes to carry the waiter's own live claim, which is what
+// a create of ours leaves when PVE answered it as a duplicate and the read
+// after it missed the claim. The next poll must still send the create, whose
+// refusal leads the acquire to confirm the claim as its own, rather than read
+// the claim as a holder and wait out its own sentinel.
+func TestAcquireClusterLock_WaitStillTriesItsOwnClaim(t *testing.T) {
+	t.Parallel()
+	const ownFrom = 3 * time.Second
+	pools := newFakeLockPools()
+	clk := &fakeLockClock{base: time.Now()}
+	key := ClusterLockPoolName("vm-90000")
+	pools.pools[key] = encodeLockComment("holder", clk.base.Add(time.Hour))
+	ours := encodeLockComment("waiter", clk.base.Add(time.Hour))
+	clk.onSleep = func(elapsed time.Duration) {
+		if elapsed < ownFrom {
+			return
+		}
+		pools.mu.Lock()
+		pools.pools[key] = ours
+		pools.mu.Unlock()
+	}
+	h, err := acquireClusterLockWithClock(context.Background(), pools, "vm-90000", "waiter", time.Minute,
+		30*time.Second, clk.clock())
+	if err != nil || h == nil {
+		t.Fatalf("handle=%v err=%v, want the waiter to confirm its own claim", h, err)
+	}
+	if elapsed := time.Duration(clk.offset.Load()); elapsed > ownFrom+5*time.Second {
+		t.Fatalf("confirmed its own claim after %s, want soon after it appeared at %s", elapsed, ownFrom)
+	}
+	if pools.createN != 2 {
+		t.Fatalf("the waiter sent %d creates, want 2, one on arrival and one once its own claim stood; calls %v",
+			pools.createN, pools.calls)
+	}
+}

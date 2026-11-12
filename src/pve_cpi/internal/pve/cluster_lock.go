@@ -571,7 +571,15 @@ var errClusterLockStillHeld = errors.New("sentinel still held by another owner's
 // The read takes no lock. It decides only to skip a create, never to take or
 // steal the lock, so any other answer sends the poll down its usual path. A
 // read that fails or finds no sentinel, a claim that has expired or carries
-// no expiry, and our own claim all return false.
+// no expiry, and our own claim all return false. Our own claim is a create of
+// ours that PVE answered as a duplicate, and only the create path confirms it
+// (tryStealExpired), so skipping that path would wait out our own sentinel.
+//
+// The acquire is shared by every cluster lock, so the read runs for the VMID
+// claims, the HA rules and anti-affinity locks, and the per-disk transfer
+// locks as well as the parker locks. It changes no outcome for any of them,
+// because a create it skips is one PVE would refuse and the steal check after
+// it would leave alone.
 func heldByAnother(
 	ctx context.Context, pools PoolService, pool, owner string, deadline time.Time, clk lockClock,
 ) bool {
