@@ -743,8 +743,8 @@ func crmIdleReason(
 // or a standalone host, needs its own, because it has no other copy that could
 // be newer. Only membership that proves a single node earns that rule: cluster
 // status must list exactly one node, that node must be the entry node, and the
-// last round must know no other node. An empty or missing membership proves
-// nothing, so it fails closed.
+// last round must know the entry node and no other node. An empty or missing
+// membership proves nothing, so it fails closed.
 func idleLRMGap(view *clusterView, entry string, mgr *managerView, now int64) string {
 	fresh := func(name string) bool {
 		lrm, ok := mgr.lrm[name]
