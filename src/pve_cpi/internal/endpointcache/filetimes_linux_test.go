@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -17,6 +18,12 @@ const noProcEnv = "ENDPOINTCACHE_NO_PROC"
 
 // noProcChecked is what the child logs once the touch has run.
 const noProcChecked = "the lock was touched without /proc"
+
+// noProcMountDenied is what the child logs when the kernel refuses its mounts.
+const noProcMountDenied = "the child's mounts were refused"
+
+// noProcTimeout bounds the child so a hung one cannot hold the test run.
+const noProcTimeout = 30 * time.Second
 
 // The lock's times are set through the open descriptor, so they must not depend
 // on /proc/self resolving. The child gets a mount namespace of its own, and a
@@ -28,7 +35,9 @@ func TestTouchLockWorksWithoutProc(t *testing.T) {
 		return
 	}
 	// #nosec G204 -- the test binary runs itself with a fixed test name
-	cmd := exec.CommandContext(context.WithoutCancel(t.Context()), os.Args[0],
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), noProcTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0],
 		"-test.run=^TestTouchLockWorksWithoutProc$", "-test.count=1", "-test.v")
 	cmd.Env = append(os.Environ(), noProcEnv+"=1")
 	attr := &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
@@ -45,6 +54,8 @@ func TestTouchLockWorksWithoutProc(t *testing.T) {
 		namespaceRefused(t, "/proc cannot be hidden here", err)
 	case err != nil:
 		t.Fatalf("the child that touches a lock without /proc failed: %v\n%s", err, out)
+	case strings.Contains(string(out), noProcMountDenied):
+		namespaceRefused(t, "the child cannot hide /proc", errors.New(strings.TrimSpace(string(out))))
 	case !strings.Contains(string(out), noProcChecked):
 		t.Fatalf("the child that touches a lock without /proc did not run the check:\n%s", out)
 	}
@@ -53,10 +64,12 @@ func TestTouchLockWorksWithoutProc(t *testing.T) {
 // checkTouchWithoutProc runs in the child's own mount namespace.
 func checkTouchWithoutProc(t *testing.T) {
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
-		t.Fatalf("making the child's mounts private: %v", err)
+		t.Logf("%s: making the mounts private: %v", noProcMountDenied, err)
+		return
 	}
 	if err := unix.Mount("tmpfs", "/proc", "tmpfs", 0, ""); err != nil {
-		t.Fatalf("hiding /proc: %v", err)
+		t.Logf("%s: hiding /proc: %v", noProcMountDenied, err)
+		return
 	}
 	if _, err := os.Stat("/proc/self"); err == nil {
 		t.Fatal("/proc/self still resolves")

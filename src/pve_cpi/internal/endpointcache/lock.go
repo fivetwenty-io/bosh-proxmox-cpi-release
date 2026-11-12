@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/privatefile"
@@ -139,7 +140,9 @@ func (t *texts) lockNamesInode(r *os.Root, name string, lock *privatefile.Lock) 
 // through its open descriptor, so the times land on the locked inode whatever
 // the name holds by then.
 func (t *texts) touchLock(lock *privatefile.Lock) error {
-	if err := setTimesNow(int(lock.File.Fd())); err != nil {
+	err := setTimesNow(int(lock.File.Fd()))
+	runtime.KeepAlive(lock.File)
+	if err != nil {
 		return fmt.Errorf("%s: update lock file times: %w", t.name, err)
 	}
 	return nil
