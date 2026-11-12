@@ -781,6 +781,8 @@ func idleLRMGap(view *clusterView, entry string, mgr *managerView, now int64) st
 		return "cluster status does not list the entry node, so no LRM can show the copy is current"
 	case lastRoundKnowsOtherNode(mgr, entry):
 		return "the last round knew a node that cluster status does not list, so no LRM can show the copy is current"
+	case !lastRoundKnowsEntry(mgr, entry):
+		return "the last round does not list the entry node, so no LRM can show the copy is current"
 	case !fresh(entry):
 		return stopped(entry)
 	default:
@@ -791,6 +793,14 @@ func idleLRMGap(view *clusterView, entry string, mgr *managerView, now int64) st
 // listsNode reports whether cluster status lists name as a node.
 func listsNode(view *clusterView, name string) bool {
 	_, ok := view.nodes[name]
+	return ok
+}
+
+// lastRoundKnowsEntry reports whether the manager's last round named entry in
+// its node_status map. A last round with no node_status proves nothing about
+// membership.
+func lastRoundKnowsEntry(mgr *managerView, entry string) bool {
+	_, ok := mgr.nodeStatus[entry]
 	return ok
 }
 

@@ -1215,6 +1215,20 @@ func TestNodeHealth_IdleNeedsFreshLRMsFromTheRestOfTheCluster(t *testing.T) {
 			},
 			want: "the last round knew a node that cluster status does not list",
 		},
+		"one node in cluster status while only the last round's node_status names three": {
+			setup: func(c *nhCluster) {
+				c.rows = []json.RawMessage{nhClusterRow(1), nhNode("pve1", 1, true, "")}
+				c.manager = nhIdleManagerLRM(nil, map[string]int64{"pve1": 2})
+			},
+			want: "the last round knew a node that cluster status does not list",
+		},
+		"one node in cluster status while the last round has a null node_status": {
+			setup: func(c *nhCluster) {
+				c.rows = []json.RawMessage{nhClusterRow(1), nhNode("pve1", 1, true, "")}
+				c.manager = nhIdleManagerLRM(map[string]any{"node_status": nil}, map[string]int64{"pve1": 2})
+			},
+			want: "the last round does not list the entry node",
+		},
 		"one node in cluster status that is not the entry node": {
 			setup: func(c *nhCluster) {
 				c.rows = []json.RawMessage{nhClusterRow(1), nhNode("pve2", 1, false, "")}
