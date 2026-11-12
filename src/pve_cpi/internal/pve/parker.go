@@ -2617,10 +2617,10 @@ func ParkerProtectionLockTTLNow() time.Duration { return parkerProtectionLockTTL
 // sweep sets through WithParkerLockWaitAtMost. Every other caller waits one
 // whole TTL, which is the default (parkerLockTimeoutsFrom). The sweep runs as
 // housekeeping inside another request, so it gives up on a busy parker, or on
-// a busy disk's transfer lock, after this long rather than hold up the
-// request that runs it for minutes, and its next run tries again. On timeout the acquire fails retriably with
-// ErrClusterLockTimeout, because a live holder was inside the window
-// throughout; see withParkerProtectionLock.
+// a busy disk's transfer lock, after this long rather than hold up the request
+// that runs it for minutes, and its next run tries again. On timeout the
+// acquire fails retriably with ErrClusterLockTimeout, because a live holder
+// was inside the window throughout; see withParkerProtectionLock.
 const ParkerLockSweepWait = 15 * time.Second
 
 // parkerLockReleaseTimeout bounds the deferred sentinel-pool delete.
