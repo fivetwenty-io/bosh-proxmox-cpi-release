@@ -59,6 +59,14 @@ const (
 	clusterRowTypeCluster = "cluster"
 )
 
+// Row types and the master's idle state in GET /cluster/ha/status/current. The
+// quorum row uses clusterRowTypeQuorum.
+const (
+	haStatusRowMaster  = "master"
+	haStatusRowService = "service"
+	haStatusIdle       = "idle"
+)
+
 // NodeHealthState is the helper's overall reading of one node.
 type NodeHealthState string
 
@@ -122,8 +130,12 @@ const (
 	// round. NodeHealth reads the view as idle only when the entry node is
 	// quorate, the resource list was read and is empty, and that last round
 	// held no service and no disarm request, which are the conditions PVE's
-	// CRM checks before it goes idle. No HA source is trusted, and the report
-	// rests on cluster status alone, as it does when HA is not configured.
+	// CRM checks before it goes idle. Status/current must also report the
+	// entry node quorate, the master idle, and no service, and the LRMs must
+	// show that the entry node's copy of the cluster state is current, as
+	// crmIdleReason describes. Cluster status classifies the nodes, as it does
+	// when HA is not configured, except that a node the idle CRM's last round
+	// put in maintenance stays in maintenance.
 	HAViewIdle HAView = "idle"
 
 	// HAViewStale means the CRM timestamp is older than NodeHealthCRMMaxAge or
@@ -302,15 +314,17 @@ type clusterView struct {
 }
 
 // managerView is what NodeHealth keeps from GET /cluster/ha/status/manager_status.
-// services counts the CRM's service_status entries, and disarmed is true when
-// the CRM recorded a disarm request. Only the idle check reads them.
+// services counts the CRM's service_status entries, servicesUnreadable is true
+// when service_status does not parse, and disarmed is true when the CRM
+// recorded a disarm request. Only the idle check reads them.
 type managerView struct {
-	nodeStatus map[string]string
-	lrm        map[string]lrmWire
-	crmStamp   int64
-	quorumNode string
-	services   int
-	disarmed   bool
+	nodeStatus         map[string]string
+	lrm                map[string]lrmWire
+	crmStamp           int64
+	quorumNode         string
+	services           int
+	servicesUnreadable bool
+	disarmed           bool
 }
 
 // lrmWire is the wire shape of one lrm_status entry.
@@ -392,7 +406,7 @@ func NodeHealth(
 	var ha haInputs
 	switch {
 	case mgr != nil && !mgr.empty():
-		ha = resolveManagerView(ctx, clusterAPI, nodesAPI, report, mgr)
+		ha = resolveManagerView(ctx, clusterAPI, nodesAPI, report, view, mgr)
 	default:
 		reason := "manager status is empty"
 		if mgrErr != nil {
@@ -548,9 +562,11 @@ func readManagerView(ctx context.Context, clusterAPI NodeHealthCluster) (*manage
 	if jsonErr := decodeHAMap(crm.LRMStatus, &view.lrm); jsonErr != nil {
 		return nil, fmt.Errorf("lrm_status: %w", jsonErr)
 	}
+	// Only the idle check reads service_status, so a body that does not parse
+	// blocks the idle verdict instead of failing the whole manager view.
 	var services map[string]json.RawMessage
 	if jsonErr := decodeHAMap(crm.ServiceStatus, &services); jsonErr != nil {
-		return nil, fmt.Errorf("service_status: %w", jsonErr)
+		view.servicesUnreadable = true
 	}
 	view.services = len(services)
 	if len(crm.Timestamp) > 0 && string(crm.Timestamp) != "null" {
@@ -599,6 +615,7 @@ func resolveManagerView(
 	clusterAPI NodeHealthCluster,
 	nodesAPI NodeHealthNodes,
 	report *NodeHealthReport,
+	view *clusterView,
 	mgr *managerView,
 ) haInputs {
 	if report.EntryNode == "" {
@@ -629,14 +646,17 @@ func resolveManagerView(
 		return haInputs{}
 	}
 	if !timestampFresh(now, mgr.crmStamp, NodeHealthCRMMaxAge) {
-		age := "CRM timestamp is " + describeAge(now, mgr.crmStamp) + " on the entry node's clock"
-		idle, gap := crmIdleReason(ctx, clusterAPI, mgr, now)
+		idle, gap := crmIdleReason(ctx, clusterAPI, report.EntryNode, view, mgr, now)
 		if idle {
 			report.HA = HAViewIdle
-			report.HAReason = "the CRM is idle because the cluster has no HA resources; its last round held " +
-				"no service, and its " + age
-			return haInputs{}
+			report.HAReason = "the CRM is idle because the cluster has no HA resources and its last round held " +
+				"no service and no disarm request; its timestamp is " + describeAge(now, mgr.crmStamp) +
+				" on the entry node's clock"
+			// The idle CRM's last round still says which nodes are in HA
+			// maintenance, because a change to node maintenance wakes the CRM.
+			return haInputs{nodeStatus: mgr.nodeStatus}
 		}
+		age := "CRM timestamp is " + describeAge(now, mgr.crmStamp) + " on the entry node's clock"
 		report.HA = HAViewStale
 		report.HAReason = age
 		if gap != "" {
@@ -657,17 +677,37 @@ func resolveManagerView(
 // service state is empty, and no disarm request is pending, and it becomes
 // active again as soon as a resource is configured. NodeHealth has already
 // checked quorum. Here the last round must have held no service and no disarm
-// request, its timestamp must not lie in the future, and the resource list
-// must be read and be empty. When the CRM is not idle, the second result says
-// why, or is empty when only the timestamp's direction decided it.
-func crmIdleReason(ctx context.Context, clusterAPI NodeHealthCluster, mgr *managerView, now int64) (bool, string) {
+// request, and its timestamp must not lie in the future.
+//
+// Three more checks make the verdict rest on positive evidence rather than on
+// an absence. The LRMs must show that the entry node's copy of the cluster
+// state is current, as idleLRMGap describes. The resource list must be read
+// and be empty. Status/current, which PVE builds on the entry node from the
+// same manager status and resource config, must report the entry node
+// quorate, the master idle with the same timestamp, and no service, so an
+// answer that carries no data fails closed. When the CRM is not idle, the
+// second result says why, or is empty when only the timestamp's direction
+// decided it.
+func crmIdleReason(
+	ctx context.Context,
+	clusterAPI NodeHealthCluster,
+	entry string,
+	view *clusterView,
+	mgr *managerView,
+	now int64,
+) (bool, string) {
 	switch {
 	case mgr.crmStamp > now:
 		return false, ""
+	case mgr.servicesUnreadable:
+		return false, "its last round's service state does not parse"
 	case mgr.services > 0:
 		return false, "its last round still held services"
 	case mgr.disarmed:
 		return false, "its last round held a disarm request"
+	}
+	if gap := idleLRMGap(view, entry, mgr, now); gap != "" {
+		return false, gap
 	}
 	var resp *sdkcluster.ListHaResourcesResponse
 	err := RetryOnTransient(ctx, nil, "node_health_ha_resources", 0, func() error {
@@ -683,7 +723,113 @@ func crmIdleReason(ctx context.Context, clusterAPI NodeHealthCluster, mgr *manag
 	case len(*resp) > 0:
 		return false, "the cluster has HA resources"
 	}
+	if gap := idleStatusCurrentGap(ctx, clusterAPI, entry, mgr.crmStamp); gap != "" {
+		return false, gap
+	}
 	return true, ""
+}
+
+// idleLRMGap returns why the LRM timestamps do not prove that the entry node's
+// copy of the cluster state is current, or "" when they do. Every LRM keeps
+// writing its status while the CRM is idle, so on a live cluster each online
+// node's entry is fresh. A node that has just rejoined can be quorate before
+// its copy has caught up, and that copy can show an idle CRM that the rest of
+// the cluster has woken since. Its copies of the other nodes' LRM entries are
+// then old, so a fresh entry from another node shows the copy holds recent
+// writes from the rest of the cluster. Every node that cluster status lists
+// online and the last round knows must have a fresh entry, which also catches
+// a dead LRM. A cluster that lists more than one node needs a fresh entry from
+// a node other than the entry node, and a single node, either a one-node
+// cluster or a standalone host, needs its own, because it has no other copy
+// that could be newer.
+func idleLRMGap(view *clusterView, entry string, mgr *managerView, now int64) string {
+	fresh := func(name string) bool {
+		lrm, ok := mgr.lrm[name]
+		return ok && lrm.Timestamp.Int() > 0 && timestampFresh(now, lrm.Timestamp.Int(), NodeHealthLRMMaxAge)
+	}
+	names := make([]string, 0, len(view.nodes))
+	for name := range view.nodes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	freshPeer := false
+	for _, name := range names {
+		if _, listed := mgr.lrm[name]; !listed || !view.nodes[name].Online {
+			continue
+		}
+		if !fresh(name) {
+			return "the LRM on " + name + " has no fresh timestamp"
+		}
+		if name != entry {
+			freshPeer = true
+		}
+	}
+	switch {
+	case freshPeer:
+		return ""
+	case len(view.nodes) > 1:
+		return "no LRM on a node other than the entry node has a fresh timestamp"
+	case !fresh(entry):
+		return "the entry node's LRM has no fresh timestamp"
+	default:
+		return ""
+	}
+}
+
+// idleStatusCurrentGap reads GET /cluster/ha/status/current and returns why it
+// does not confirm an idle CRM, or "" when it does. PVE builds the answer on
+// the entry node from one read of the manager status and the resource config.
+// It must hold exactly one quorum row, for the entry node and quorate, exactly
+// one master row whose state is idle and whose timestamp is the one the
+// manager status carried, and no service row. PVE labels the master idle only
+// when the entry node is quorate, the manager status is old, and no resource
+// is configured, and it lists every configured resource as a service row.
+func idleStatusCurrentGap(ctx context.Context, clusterAPI NodeHealthCluster, entry string, crmStamp int64) string {
+	var resp *sdkcluster.ListHaStatusCurrentResponse
+	err := RetryOnTransient(ctx, nil, "node_health_ha_status_current", 0, func() error {
+		var inner error
+		resp, inner = clusterAPI.ListHaStatusCurrent(ctx)
+		return inner
+	})
+	if err != nil {
+		return "status/current is unreadable: " + err.Error()
+	}
+	var quorumRows, masterRows, serviceRows int
+	quorate, masterIdle := false, false
+	if resp != nil {
+		for _, raw := range *resp {
+			var row struct {
+				Type      string            `json:"type"`
+				Node      string            `json:"node"`
+				Status    string            `json:"status"`
+				Quorate   sdkclient.PVEBool `json:"quorate"`
+				Timestamp sdkclient.PVEInt  `json:"timestamp"`
+			}
+			if jsonErr := json.Unmarshal(raw, &row); jsonErr != nil {
+				return "a status/current row does not parse"
+			}
+			switch row.Type {
+			case clusterRowTypeQuorum:
+				quorumRows++
+				quorate = row.Node == entry && row.Quorate.Bool()
+			case haStatusRowMaster:
+				masterRows++
+				masterIdle = statusTextState(row.Status) == haStatusIdle && row.Timestamp.Int() == crmStamp
+			case haStatusRowService:
+				serviceRows++
+			}
+		}
+	}
+	switch {
+	case quorumRows != 1 || !quorate:
+		return "status/current does not report the entry node quorate"
+	case masterRows != 1 || !masterIdle:
+		return "status/current does not report the CRM master idle"
+	case serviceRows > 0:
+		return "status/current lists HA services"
+	default:
+		return ""
+	}
 }
 
 // timestampFresh reports whether a timestamp is at most maxAge behind now and
@@ -769,15 +915,7 @@ func resolveTextFallback(
 // such as "pve1 (active, Wed Nov  6 12:00:00 2026)". It is only a fallback and
 // never decides anything about a watchdog.
 func parseLRMText(status string) lrmTextState {
-	lower := strings.ToLower(status)
-	open := strings.Index(lower, "(")
-	if open < 0 {
-		return lrmTextOK
-	}
-	inner := lower[open+1:]
-	if end := strings.IndexAny(inner, ",)"); end >= 0 {
-		inner = inner[:end]
-	}
+	inner := statusTextState(status)
 	switch {
 	case strings.Contains(inner, "maintenance"):
 		return lrmTextMaintenance
@@ -787,6 +925,22 @@ func parseLRMText(status string) lrmTextState {
 	default:
 		return lrmTextOK
 	}
+}
+
+// statusTextState returns the lower-case state in the parentheses of a
+// status/current text, such as "idle" in "pve1 (idle, Mon Aug 24 16:37:54
+// 2026)", or "" when the text has no parentheses.
+func statusTextState(status string) string {
+	lower := strings.ToLower(status)
+	open := strings.Index(lower, "(")
+	if open < 0 {
+		return ""
+	}
+	inner := lower[open+1:]
+	if end := strings.IndexAny(inner, ",)"); end >= 0 {
+		inner = inner[:end]
+	}
+	return strings.TrimSpace(inner)
 }
 
 // tagMatch reports whether the node's tag list holds any operator tag.
@@ -874,6 +1028,8 @@ func classifyNode(
 	switch haView {
 	case HAViewManagerStatus:
 		classifyWithManagerStatus(&e, ha)
+	case HAViewIdle:
+		classifyWithIdleRound(&e, ha.nodeStatus[name])
 	case HAViewLRMText:
 		state, listed := ha.text[name]
 		classifyWithLRMText(&e, state, listed)
@@ -896,6 +1052,23 @@ func classifyFromClusterStatus(e *NodeHealthEntry) {
 	e.Health = NodeHealthOnline
 	e.Placeable = true
 	e.Reason = "online in cluster status"
+}
+
+// classifyWithIdleRound answers for an online node when the CRM is idle. The
+// idle CRM's last round is not a live view, so cluster status classifies the
+// node, but HA maintenance from that round still holds. PVE wakes the CRM for
+// any change to node maintenance, so a node it left in maintenance before it
+// went idle is still in maintenance. The other node states of that round, such
+// as fence or unknown, are ignored, and CRMState stays empty.
+func classifyWithIdleRound(e *NodeHealthEntry, crmState string) {
+	if crmState != crmNodeMaintenance {
+		classifyFromClusterStatus(e)
+		return
+	}
+	e.ProxyTarget = true
+	e.Maintenance = true
+	e.Health = NodeHealthMaintenance
+	e.Reason = "the idle CRM's last round reports maintenance"
 }
 
 // classifyWithLRMText applies the text fallback to a node that cluster status

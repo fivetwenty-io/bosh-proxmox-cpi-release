@@ -748,6 +748,7 @@ func haIdleCluster() *haCluster {
 			nhClusterRow(1), nhNode("pve1", 1, true, ""), nhNode("pve2", 1, false, ""), nhNode("pve3", 1, false, ""),
 		},
 		manager: nhIdleManager(nil),
+		current: nhIdleCurrent(),
 	}}
 }
 

@@ -189,6 +189,16 @@ func TestGateHADeleteStateTable(t *testing.T) {
 				s.Requested["vm:200"] = "started"
 				s.CRMAge = 1908 * 3600
 			}},
+		{name: "idle CRM seen through a copy whose other LRMs are old",
+			wantErr: []string{"HA state is unknown", "the LRM on pve-node2 has no fresh timestamp"},
+			setup: func(s *HADeleteScene) {
+				// A node that has just rejoined can serve an old copy of the
+				// cluster state that shows an idle CRM.
+				s.Place(101, "pve-node1")
+				s.CRMAge = 1908 * 3600
+				s.LRMAge["pve-node2"] = 1800
+				s.LRMAge["pve-node3"] = 1800
+			}},
 		{name: "old CRM timestamp whose last round still holds a service",
 			wantErr: []string{"HA state is unknown", "its last round still held services"},
 			setup: func(s *HADeleteScene) {

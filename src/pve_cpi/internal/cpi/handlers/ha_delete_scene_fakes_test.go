@@ -357,6 +357,48 @@ func (s *HADeleteScene) managerBody() *cluster.ListHaStatusManagerStatusResponse
 	return &body
 }
 
+// currentRows answers GET /cluster/ha/status/current the way PVE builds it on
+// the entry node: the quorum row, the master row, whose state is idle when its
+// timestamp is more than 30 seconds old and no resource is configured, and a
+// service row for every service and resource. The lrm rows are left out,
+// because NodeHealth reads them only when manager status is empty, and a scene
+// with no CRM answers with no rows at all.
+func (s *HADeleteScene) currentRows() *cluster.ListHaStatusCurrentResponse {
+	if s.NoCRM {
+		return AbsenceNoHAStatus()
+	}
+	row := func(v map[string]any) json.RawMessage {
+		raw, _ := json.Marshal(v)
+		return raw
+	}
+	state := "active"
+	if s.CRMAge > 30 || s.CRMAge < -2 {
+		state = "old timestamp - dead?"
+		if len(s.Requested) == 0 {
+			state = "idle"
+		}
+	}
+	master := s.Members[0]
+	rows := cluster.ListHaStatusCurrentResponse{
+		row(map[string]any{"id": "quorum", "type": "quorum", "node": s.Members[0], "status": "OK", "quorate": 1}),
+		row(map[string]any{
+			"id": "master", "type": "master", "node": master, "timestamp": s.Now - s.CRMAge,
+			"status": master + " (" + state + ", Mon Aug 24 16:37:54 2026)",
+		}),
+	}
+	sids := map[string]struct{}{}
+	for sid := range s.Services {
+		sids[sid] = struct{}{}
+	}
+	for sid := range s.Requested {
+		sids[sid] = struct{}{}
+	}
+	for sid := range sids {
+		rows = append(rows, row(map[string]any{"id": "service:" + sid, "type": "service", "sid": sid}))
+	}
+	return &rows
+}
+
 func (s *HADeleteScene) resourceRows() *cluster.ListHaResourcesResponse {
 	rows := make(cluster.ListHaResourcesResponse, 0, len(s.Requested))
 	for sid, state := range s.Requested {
@@ -433,7 +475,9 @@ func (c *HASceneCluster) ListHaStatusManagerStatus(context.Context) (*cluster.Li
 }
 
 func (c *HASceneCluster) ListHaStatusCurrent(context.Context) (*cluster.ListHaStatusCurrentResponse, error) {
-	return AbsenceNoHAStatus(), nil
+	c.Scene.mu.Lock()
+	defer c.Scene.mu.Unlock()
+	return c.Scene.currentRows(), nil
 }
 
 func (c *HASceneCluster) ListHaResources(

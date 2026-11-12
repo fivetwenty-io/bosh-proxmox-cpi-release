@@ -459,10 +459,38 @@ func TestHandleRebootVM_UnknownHAViewByMode(t *testing.T) {
 			m := config.HAChoice(mode)
 			r.deps.Config.HA = &config.HAConfig{Mode: &m}
 
-			requireHARetriable(t, r.run(settleTestCtx()), "HA disposition")
+			requireHARetriable(t, r.run(settleTestCtx()),
+				"HA disposition unknown", "the HA view is stale", "the cluster has HA resources")
 			if len(r.rebootNodes) != 0 || len(r.resetNodes) != 0 {
 				t.Fatalf("no reboot or reset may be sent on an unknown HA view, got %v %v", r.rebootNodes, r.resetNodes)
 			}
+		})
+	}
+}
+
+// TestHandleRebootVM_IdleCRMRebootsByMode reboots a VM that is not in HA on a
+// cluster whose CRM went idle weeks ago because the cluster has no HA
+// resources. The idle CRM is a known view in which no VM is HA-managed, so
+// auto and managed mode reboot the VM directly instead of deferring.
+func TestHandleRebootVM_IdleCRMRebootsByMode(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			scene := handlers.NewHADeleteScene()
+			scene.Place(101, "pve-node1")
+			scene.Do(func(s *handlers.HADeleteScene) { s.CRMAge = 1908 * 3600 })
+			r := newHAReboot(t, scene, "soft")
+			m := config.HAChoice(mode)
+			r.deps.Config.HA = &config.HAConfig{Mode: &m}
+
+			if err := r.run(settleTestCtx()); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(r.rebootNodes) != 1 || r.rebootNodes[0] != "pve-node1" {
+				t.Fatalf("soft reboot nodes = %v, want [pve-node1]", r.rebootNodes)
+			}
+			noHAWrites(t, scene.EventsSnapshot())
 		})
 	}
 }
