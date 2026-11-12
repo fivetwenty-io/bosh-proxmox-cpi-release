@@ -1,10 +1,16 @@
 package endpointcache
 
 import (
+	"errors"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // mountEntry is one line of /proc/self/mountinfo.
@@ -112,4 +118,117 @@ func covered(entries []mountEntry, i int) bool {
 		}
 	}
 	return false
+}
+
+// A refused statx names the seccomp profile that refuses it, so an operator on
+// an old BPM can match the decline to its cause, and still matches the error.
+func TestStatxErrorNamesTheLikelyCause(t *testing.T) {
+	t.Parallel()
+	cases := map[error]string{
+		unix.EPERM:  "such as the one BPM applies before v1.4.21",
+		unix.ENOSYS: "a kernel before 4.11",
+	}
+	for errno, want := range cases {
+		err := statxError(errno)
+		if !errors.Is(err, errno) || !strings.Contains(err.Error(), want) {
+			t.Errorf("statxError(%v) = %v, want it to match the error and name %q", errno, err, want)
+		}
+	}
+	if err := statxError(unix.ENOENT); err != unix.ENOENT {
+		t.Errorf("statxError(ENOENT) = %v, want the error unchanged", err)
+	}
+}
+
+// bindMountDirEnv names the directory the child process of
+// TestMountOfTellsABindMountFromItsSource works in.
+const bindMountDirEnv = "ENDPOINTCACHE_BIND_MOUNT_DIR"
+
+// bindMountChecked is what the child logs once every check has run, so the
+// parent knows the child did not pass by doing nothing.
+const bindMountChecked = "the bind mount was checked"
+
+// A bind mount of a subdirectory keeps the device of the filesystem it comes
+// from, as each volume BPM mounts into a worker does, so only the mount ID
+// tells it from its source. The test makes one in a child process with a mount
+// namespace of its own, and a user namespace too when it does not run as root,
+// so nothing outside the test sees the mount. It skips only when this system
+// refuses the child its namespaces.
+func TestMountOfTellsABindMountFromItsSource(t *testing.T) {
+	if dir := os.Getenv(bindMountDirEnv); dir != "" {
+		checkBindMount(t, dir)
+		return
+	}
+	dir := t.TempDir()
+	// #nosec G204 -- the test binary runs itself with a fixed test name
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMountOfTellsABindMountFromItsSource$", "-test.count=1",
+		"-test.v")
+	cmd.Env = append(os.Environ(), bindMountDirEnv+"="+dir)
+	attr := &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
+	if os.Geteuid() != 0 {
+		attr.Cloneflags |= syscall.CLONE_NEWUSER
+		attr.UidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Geteuid(), Size: 1}}
+		attr.GidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getegid(), Size: 1}}
+	}
+	cmd.SysProcAttr = attr
+	out, err := cmd.CombinedOutput()
+	var exited *exec.ExitError
+	switch {
+	case err != nil && !errors.As(err, &exited):
+		t.Skipf("this system refuses a private mount namespace, so no bind mount can be made here: %v", err)
+	case err != nil:
+		t.Fatalf("the child that checks the bind mount failed: %v\n%s", err, out)
+	case !strings.Contains(string(out), bindMountChecked):
+		t.Fatalf("the child that checks the bind mount did not run the check:\n%s", out)
+	}
+}
+
+// checkBindMount runs in the child's own mount namespace. It bind-mounts a
+// subdirectory of dir onto another directory, as BPM mounts a volume into a
+// worker, and checks that the mount keys and the same-mount rule tell the two
+// apart although the device is the same.
+func checkBindMount(t *testing.T, dir string) {
+	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+		t.Fatalf("making the child's mounts private: %v", err)
+	}
+	disk := filepath.Join(dir, "disk")
+	volume := filepath.Join(disk, "volume")
+	inside := filepath.Join(dir, "worker", "volume")
+	for _, path := range []string{filepath.Join(volume, "journal"), inside} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := unix.Mount(volume, inside, "", unix.MS_BIND, ""); err != nil {
+		t.Fatalf("bind-mounting %s onto %s: %v", volume, inside, err)
+	}
+	key := func(path string) mountKey {
+		t.Helper()
+		k, err := mountOf(path, true)
+		if err != nil {
+			t.Fatalf("mountOf(%s): %v", path, err)
+		}
+		return k
+	}
+	source, bound := key(volume), key(inside)
+	if source != key(disk) {
+		t.Errorf("mountOf(%s) = %+v, want the key of %s, %+v", volume, source, disk, key(disk))
+	}
+	if bound == source {
+		t.Fatalf("the bind mount %s and its source %s have the same key %+v", inside, volume, bound)
+	}
+	if bound.dev != source.dev {
+		t.Logf("the bind mount reports device %d and its source %d, so the mount ID was not the only difference",
+			bound.dev, source.dev)
+	}
+	if key(filepath.Join(inside, "journal")) != bound {
+		t.Errorf("a directory inside the bind mount has a key other than the mount's")
+	}
+	journal := anchor{path: filepath.Join(inside, "journal"), what: "the allocation journal directory"}
+	if err := sameMount(inside, journal, systemHooks); err != nil {
+		t.Errorf("a parent inside the bind mount was refused: %v", err)
+	}
+	if err := sameMount(dir, journal, systemHooks); err == nil {
+		t.Errorf("a parent outside the bind mount, on the same device, was accepted")
+	}
+	t.Log(bindMountChecked)
 }
