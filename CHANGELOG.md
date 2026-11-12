@@ -12,6 +12,22 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-11-11
+
+### Added
+
+- `storage-journal settle-migration` is a new action that settles one submitted cross-node migration step of a disk record. We use it when an audit shows a disk record in `reconciliation_required` whose `CreateQemuMigrate` step is `submitted` and whose `qmigrate` task finished with exit status `OK`. The action takes `--config`, `--allocation-id`, `--decision-id`, `--expected-cid`, `--step-id`, `--task-upid`, `--previous-writer-fenced`, and `--remote-tasks-settled`, and all of them are required. It refuses every other storage-journal flag, even with an empty or false value, names the flags it refused, and exits 2. It reads the task on the node its UPID names, then proves the move with the same check an attach makes. The source node must hold no config for the mover, a read of every cluster member must place the mover on the target alone, the target must carry no migration lock, the disk's serial must sit on exactly one slot with the recorded volume and backing, and the volume must appear in the target's content listing. It writes only the journal. It refuses a copy-local migration, a step whose target is external, a step outside the record's open attempt, a step that is already observed, a record in any other state, a record with another unsettled step, a UPID that differs from the step's, and any failed check, and a refusal leaves the journal as it was. On success it marks the step observed, leaves the record in `reconciliation_required` with every step observed, records a verification that carries the task and mover evidence, which proves neither ownership nor absence, and prints that evidence as one JSON object. The Director's next call on the disk then admits the record. The action does not change the mover's protection, so we check it afterward. See [Settle a submitted migration](docs/storage-journal-operations.md#settle-a-submitted-migration).
+
+### Fixed
+
+- A cross-node migration of a journal-managed disk's mover that succeeded on a real cluster no longer leaves the disk's record in `reconciliation_required`. After the migration, the CPI checks that the source node no longer holds the mover's config. PVE answers a read of a config that has left a node with an HTTP 500 that says the configuration file does not exist, and the check accepted only a 404, so the check failed on every successful migration, the record needed reconciliation, and the mover's protection was not restored. The check now accepts either answer from the source, and then confirms by reading the config on every cluster member that the mover is on the target node and nowhere else. It still refuses when the source fails with any other error, when the mover is found on the source or on no node, when the target config still carries `lock: migrate`, and when a serial sits on more than one slot.
+
+- The check after a guarded holder deletion accepts the same missing-config answer, and then requires that no cluster member holds the VM. When an offline member keeps that read from finishing, the CPI accepts the deletion only under four conditions. The recorded node must answer that the config is gone, and the delete task must read back on that node as stopped with exit status `OK` and no warnings. A second read must find no reachable member holding the VM, and the offline members must be the only thing left unproven. In that case the CPI logs a warning that names the offline members and the task. The CPI still refuses the deletion when any member holds the VM, when any other error occurs, and when the enumeration fails.
+
+- After a cross-node mover migration that fails or reports an error, the CPI now restores the mover's protection on the node where the mover actually is, which it finds by reading the mover's config on the source node and, when the source no longer has it, on every member. When no read places the mover, the CPI tries the source and then the target. It stops at the first node where the write succeeds and a readback shows protection on, and when neither node succeeds it logs one warning that names both nodes and the `qm set <vmid> --protection 1` command. A journal-managed restore that reaches a node with no config for the VM moves on to the next node without recording a planned step, and a protection write that meets a missing config is sent once rather than retried.
+
+- When the journal-managed lifecycle guard cannot settle the outcome of a mutation, or when its own checks before a mutation refuse it, the CPI now logs a warning that says the mutation requires reconciliation and gives the reason, the call, the operation, and the allocation. The warning for an outcome the guard could not settle also names the step, and the warning for a refusal before the mutation does not, because the CPI sent nothing and recorded no step. Before this fix, the Director saw only `requires reconciliation at lifecycle attach_disk Nodes.CreateQemuMigrate`, and the reason was lost.
+
 ## [0.9.6] - 2026-11-11
 
 ### Changed
@@ -910,7 +926,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.6...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.7...HEAD
+[0.9.7]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.3...v0.9.4
