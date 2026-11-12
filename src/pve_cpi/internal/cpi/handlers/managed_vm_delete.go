@@ -378,7 +378,9 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 	}
 	// A journal that is half configured or not enrolled may still hold records
 	// under another namespace, so it is refused here and never sent to the
-	// legacy delete.
+	// legacy delete. It is refused before the node listing, so the Director
+	// reads the setup cause and not a listing failure, and
+	// openStorageAllocationJournal runs the same check again on purpose.
 	if err := storageJournalReadinessError(deps.Config); err != nil {
 		return true, err
 	}

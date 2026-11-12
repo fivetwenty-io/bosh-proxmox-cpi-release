@@ -304,6 +304,13 @@ func setVMMetadataRMW(
 		// VM that moved from a VM that is gone; the caller maps it.
 		return metadataWrite{}, cfgErr
 	} else {
+		// Either half of the journal counts as a journal in use here, as it
+		// does at every other gate, so a half-configured journal is never
+		// treated as the legacy case. Both classes write nothing, so the
+		// choice changes only whether the Director retries. For a
+		// half-configured journal the non-retriable class matches the
+		// create_vm and delete_vm refusals of the same configuration, which a
+		// retry cannot clear either.
 		if deps.Config != nil && (deps.Config.StoragePlacementNamespace != "" || deps.Config.StorageAllocationJournalDir != "") {
 			return metadataWrite{}, cpierrors.WrapAs(cfgErr, cpierrors.TypeCloud,
 				"set_vm_metadata: cannot verify existing allocation provenance")

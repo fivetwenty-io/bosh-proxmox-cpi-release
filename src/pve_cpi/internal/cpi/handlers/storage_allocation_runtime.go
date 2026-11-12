@@ -23,15 +23,16 @@ import (
 //
 // A configuration that names only half of the journal, and a journal whose
 // namespace was never enrolled, are refused before the cluster's identity is
-// read, with text that names the cause (see storageJournalConfigError).
+// read, with text that names the cause (see storageJournalConfigError). The
+// readiness check refuses every configuration that
+// ValidateStoragePlacementAllocation refuses, so that check is not repeated
+// here. Gates that run the readiness check before listing nodes reach this
+// one again on purpose, because every other caller relies on it alone.
 func openStorageAllocationJournal(ctx context.Context, deps Deps, nodes []string) (*allocationjournal.Journal, error) {
 	if deps.Config == nil || deps.PVE == nil {
 		return nil, cpierrors.Cloud("storage allocation requires configuration and PVE client")
 	}
 	if err := storageJournalReadinessError(deps.Config); err != nil {
-		return nil, err
-	}
-	if err := deps.Config.ValidateStoragePlacementAllocation(); err != nil {
 		return nil, err
 	}
 	identity, err := pve.ObserveStorageClusterIdentity(ctx, deps.PVE.Nodes(), nodes)

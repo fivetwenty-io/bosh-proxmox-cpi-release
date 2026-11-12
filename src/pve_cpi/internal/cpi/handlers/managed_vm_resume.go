@@ -241,7 +241,8 @@ func resumeExistingManagedVM(ctx context.Context, deps Deps, args []json.RawMess
 	}
 	// A journal that is half configured or not enrolled is refused before the
 	// node listing and never sent to the legacy create (see
-	// storageJournalConfigError).
+	// storageJournalConfigError). openStorageAllocationJournal runs the same
+	// check again on purpose, because its other callers rely on it alone.
 	if err := storageJournalReadinessError(deps.Config); err != nil {
 		return nil, false, err
 	}

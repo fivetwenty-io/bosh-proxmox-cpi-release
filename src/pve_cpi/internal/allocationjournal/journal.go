@@ -2,6 +2,7 @@ package allocationjournal
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -186,6 +187,56 @@ func EnrollmentRecorded(directory, namespace string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// OtherEnrollmentsRecorded counts the namespaces other than namespace whose
+// enrollment file is present under directory. Like EnrollmentRecorded it
+// claims presence only. It reads the directory's entry names and checks each
+// namespace directory for the enrollment file, never the content of either.
+// A namespace directory is named by a hash of its namespace, so the count
+// cannot say which namespaces those are. The error return is "could not
+// tell".
+func OtherEnrollmentsRecorded(directory, namespace string) (int, error) {
+	if err := validateNamespace(namespace); err != nil {
+		return 0, err
+	}
+	if !filepath.IsAbs(directory) {
+		return 0, fmt.Errorf("journal: directory must be absolute")
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return 0, err
+	}
+	own := pathKey(namespace)
+	count := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == own || !entry.IsDir() || !namespaceDirectoryName(name) {
+			continue
+		}
+		if _, err := os.Lstat(filepath.Join(directory, name, authorityFile)); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return 0, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+// namespaceDirectoryName reports whether name has the shape pathKey gives a
+// namespace directory, which is 64 lowercase hexadecimal digits.
+func namespaceDirectoryName(name string) bool {
+	if len(name) != sha256.Size*2 {
+		return false
+	}
+	for _, r := range name {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // InspectEnrollment reads existing enrollment without initialization or locks.

@@ -239,10 +239,17 @@ func fastPathDeleteVM(
 // other CID goes on to the managed delete, which closes its record. A present
 // VM gets refuseVerdict's answers, which are VMNotFound for a token mismatch
 // and a non-retriable refusal for a foreign VM. A failed read is retriable.
+//
+// A journal that is half configured or not enrolled is refused first, before
+// any PVE read, because the managed delete would refuse it anyway and a read
+// failure or ownership answer here would hide the setup cause.
 func refuseStampedManagedDelete(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCID) error {
 	if !cid.Stamped() || deps.Config == nil ||
 		deps.Config.StoragePlacementNamespace == "" && deps.Config.StorageAllocationJournalDir == "" {
 		return nil
+	}
+	if err := storageJournalReadinessError(deps.Config); err != nil {
+		return err
 	}
 	logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", cid.VMID))
 	loc, err := findVMAuthoritative(ctx, deps, cid.VMID)
@@ -334,21 +341,27 @@ func managedDeleteAnswers(handled bool, err error) bool {
 // a PVE answer no classifier recognized, keeps the generic evidence line, so
 // its backend text never reaches the Director.
 //
-// Every failure is logged at Warn first, with its text scrubbed the way every
-// logged error is, so the cause behind the generic line is never lost. A
+// A failure that is replaced by the generic line is logged at Warn first,
+// with its text scrubbed the way every logged error is, so the cause behind
+// the generic line is never lost. A failure that keeps its own text is logged
+// at Debug only, because the dispatcher already logs the text the Director
+// reads, and an HA deferral is already logged at Warn where it is decided. A
 // journal that is half configured or not enrolled is refused with a typed
-// error (see storageJournalConfigError), so the Director reads that cause too.
+// error (see storageJournalConfigError), so the Director reads that cause.
 func managedDeleteVMError(logger *log.Logger, err error) error {
 	if err == nil {
 		return nil
 	}
-	if logger != nil {
-		logger.Warn("delete_vm: the journal-managed delete failed", log.Err(err))
-	}
 	var typed *cpierrors.Error
 	var refusal *storageRefusalError
 	if errors.As(err, &typed) || errors.As(err, &refusal) {
+		if logger != nil {
+			logger.Debug("delete_vm: the journal-managed delete failed", log.Err(err))
+		}
 		return err
+	}
+	if logger != nil {
+		logger.Warn("delete_vm: the journal-managed delete failed", log.Err(err))
 	}
 	return storageDecisionSourceError(err)
 }

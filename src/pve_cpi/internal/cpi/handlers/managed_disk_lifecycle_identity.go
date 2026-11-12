@@ -46,6 +46,16 @@ func resolveManagedDiskIdentity(ctx context.Context, deps Deps, op string, rd re
 		id = markerID
 		locator = pve.AllocationNamespaceLocator(namespace)
 	}
+	// A journal that is half configured or not enrolled cannot settle this
+	// disk's identity, and the audit text below would hide why, so the setup
+	// cause is returned first. An enrolled namespace passes on to the checks
+	// that follow unchanged.
+	if deps.Config != nil &&
+		(deps.Config.StoragePlacementNamespace != "" || deps.Config.StorageAllocationJournalDir != "") {
+		if err := storageJournalReadinessError(deps.Config); err != nil {
+			return resolvedDisk{}, err
+		}
+	}
 	if deps.Config == nil || deps.Config.StoragePlacementNamespace == "" || locator != pve.AllocationNamespaceLocator(deps.Config.StoragePlacementNamespace) {
 		return resolvedDisk{}, cpierrors.Cloud("managed disk namespace differs from configured authority; audit required")
 	}

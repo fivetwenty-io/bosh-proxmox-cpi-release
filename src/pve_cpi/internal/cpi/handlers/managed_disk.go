@@ -65,10 +65,10 @@ func createManagedDisk(ctx context.Context, deps Deps, args []json.RawMessage, s
 		}
 		retErr = cpierrors.Cloud("create_disk: managed allocation failed; inspect the allocation journal and PVE read permissions")
 	}()
+	// storageJournalConfigError refuses every configuration that
+	// ValidateStoragePlacementAllocation refuses, with text that names the
+	// cause. Enrollment is checked when the journal opens below.
 	if err := storageJournalConfigError(deps.Config); err != nil {
-		return nil, err
-	}
-	if err := deps.Config.ValidateStoragePlacementAllocation(); err != nil {
 		return nil, err
 	}
 	// The journal opens and admission runs above planning so the plan can see
