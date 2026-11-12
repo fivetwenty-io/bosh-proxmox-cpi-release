@@ -95,6 +95,18 @@ type fakeNodesSvc struct {
 	sdknodes.Service  // embed nil — panics on unexpected calls
 	updateConfigFn    func(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error
 	updateConfigCalls []updateConfigCall
+	// listContentFn backs ListStorageContent; nil reports the listing as
+	// unavailable, which leaves the orphan-ISO sweep without proof.
+	listContentFn func(node, storage string) (*sdknodes.ListStorageContentResponse, error)
+}
+
+func (f *fakeNodesSvc) ListStorageContent(
+	_ context.Context, node, storage string, _ *sdknodes.ListStorageContentParams,
+) (*sdknodes.ListStorageContentResponse, error) {
+	if f.listContentFn != nil {
+		return f.listContentFn(node, storage)
+	}
+	return nil, errors.New("content listing unavailable")
 }
 
 type updateConfigCall struct {

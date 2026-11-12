@@ -468,7 +468,7 @@ func (a *ConfigDrive) attachISO(ctx context.Context, node string, vmid int, file
 }
 
 // removeISOIfExists deletes the configdrive ISO at `filename` and reports
-// whether anything was actually removed. Callers (Configure's pre-delete
+// whether an orphan was proven present (by content listing) and removed. Callers (Configure's pre-delete
 // path) use the existed flag to log a warning when a stale orphan was
 // found. 404 is treated as "did not exist" (returns false, nil); other
 // errors propagate.
@@ -492,10 +492,25 @@ func (a *ConfigDrive) removeISOIfExists(ctx context.Context, node, filename stri
 		}
 		return false, nil
 	}
+	// File-backed storage answers a DELETE on a missing volume with success
+	// rather than 404, so the delete result alone cannot prove an orphan was
+	// there. Read the unfiltered content listing first; the delete itself
+	// still runs unconditionally. When the listing cannot be read, the
+	// delete proceeds and the result reports that nothing was proven.
+	proven, probeErr := pve.ObserveStorageVolumePresence(ctx, a.pveSvc, node, volume)
+	if probeErr != nil {
+		a.logger.Debug("configdrive: orphan iso presence check failed; deleting without proof",
+			log.String("node", node),
+			log.String("volume", volume),
+			log.String("error", probeErr.Error()),
+		)
+		proven = false
+	}
 	existed, upid, err := a.pveSvc.Storage().DeleteVolumeIfExistsAsync(ctx, node, a.storageName(ctx), volume)
 	if err != nil {
 		return false, pve.WrapError(err)
 	}
+	existed = existed && proven
 	if upid != "" {
 		if werr := pve.AwaitTaskWithLogger(ctx, a.pveSvc, node, upid, a.logger); werr != nil {
 			return existed, pve.WrapError(werr)
