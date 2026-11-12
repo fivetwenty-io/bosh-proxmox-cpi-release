@@ -12,6 +12,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// namespaceRefused ends a test whose child process could not get a private
+// mount namespace. Under GitHub Actions it fails, because the workflow's
+// container is set up to allow the namespace and a skip would hide that the
+// test never ran. Anywhere else it skips.
+func namespaceRefused(t *testing.T, what string, err error) {
+	t.Helper()
+	if os.Getenv("GITHUB_ACTIONS") != "" {
+		t.Fatalf("this system refuses a private mount namespace, so %s: %v", what, err)
+	}
+	t.Skipf("this system refuses a private mount namespace, so %s: %v", what, err)
+}
+
 // workerDirEnv names the directory the stand-in worker of
 // TestBPMWorkerViewSeesTheWorkersMounts works in.
 const workerDirEnv = "PVE_CID_TEST_WORKER_DIR"
@@ -74,7 +86,7 @@ func TestBPMWorkerViewSeesTheWorkersMounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := cmd.Start(); err != nil {
-		t.Skipf("this system refuses a private mount namespace, so no stand-in worker can run here: %v", err)
+		namespaceRefused(t, "no stand-in worker can run here", err)
 	}
 	t.Cleanup(func() {
 		_ = stdin.Close()

@@ -13,6 +13,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// namespaceRefused ends a test whose child process could not get a private
+// mount namespace. Under GitHub Actions it fails, because the workflow's
+// container is set up to allow the namespace and a skip would hide that the
+// test never ran. Anywhere else it skips.
+func namespaceRefused(t *testing.T, what string, err error) {
+	t.Helper()
+	if os.Getenv("GITHUB_ACTIONS") != "" {
+		t.Fatalf("this system refuses a private mount namespace, so %s: %v", what, err)
+	}
+	t.Skipf("this system refuses a private mount namespace, so %s: %v", what, err)
+}
+
 // mountEntry is one line of /proc/self/mountinfo.
 type mountEntry struct {
 	id    string
@@ -174,7 +186,7 @@ func TestMountOfTellsABindMountFromItsSource(t *testing.T) {
 	var exited *exec.ExitError
 	switch {
 	case err != nil && !errors.As(err, &exited):
-		t.Skipf("this system refuses a private mount namespace, so no bind mount can be made here: %v", err)
+		namespaceRefused(t, "no bind mount can be made here", err)
 	case err != nil:
 		t.Fatalf("the child that checks the bind mount failed: %v\n%s", err, out)
 	case !strings.Contains(string(out), bindMountChecked):

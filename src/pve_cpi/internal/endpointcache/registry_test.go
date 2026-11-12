@@ -190,14 +190,29 @@ func TestDrainStopsAtBoundAndCancels(t *testing.T) {
 	}
 }
 
-// A worker that honors its context returns once the drain cancels it.
+// A worker that honors its context returns once the drain cancels it. The
+// drain must still list that worker, so the test holds the drain right after
+// its cancel until the worker has returned and then gives the worker's removal
+// time to run. The removal needs the registry's lock, which the drain holds
+// there, so it cannot finish first. A drain that cancelled before it took the
+// lock would lose the worker from the list every time.
 func TestDrainCancelsCooperativeWorker(t *testing.T) {
 	t.Parallel()
 	r := NewRegistry()
+	returned := make(chan struct{})
 	got := make(chan error, 1)
+	r.afterCancel = func() {
+		select {
+		case <-returned:
+		case <-time.After(10 * time.Second):
+			t.Error("cooperative worker never saw the cancellation")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if err := r.Go("discovery", config.DiscoveryModeAuto, func(ctx context.Context) {
 		<-ctx.Done()
 		got <- ctx.Err()
+		close(returned)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -205,13 +220,8 @@ func TestDrainCancelsCooperativeWorker(t *testing.T) {
 	if !slices.Equal(result.Cancelled, []string{"discovery"}) {
 		t.Fatalf("Cancelled = %v, want [discovery]", result.Cancelled)
 	}
-	select {
-	case err := <-got:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("worker context error = %v, want canceled", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("cooperative worker never saw the cancellation")
+	if err := <-got; !errors.Is(err, context.Canceled) {
+		t.Fatalf("worker context error = %v, want canceled", err)
 	}
 }
 

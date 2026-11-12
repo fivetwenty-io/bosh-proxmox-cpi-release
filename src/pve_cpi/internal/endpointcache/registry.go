@@ -64,6 +64,10 @@ func Draining() bool { return processRegistry.Draining() }
 type Registry struct {
 	mu  sync.Mutex
 	run *workerRun
+
+	// afterCancel is nil in production. A test sets it to run code right after
+	// a drain cancels the run, so it can hold the drain at that point.
+	afterCancel func()
 }
 
 // workerRun is the state of one run of a Registry, from Open to the end of its
@@ -86,6 +90,9 @@ type workerRun struct {
 	nextID  uint64
 	started int
 	panics  []WorkerPanic
+	// reported holds the workers a drain already named in Cancelled, so a
+	// later drain of the same run names only the ones it has not.
+	reported map[uint64]bool
 	// afterDrain holds the functions AfterDrain registered and no drain has
 	// run yet.
 	afterDrain []func()
@@ -123,14 +130,33 @@ type DrainResult struct {
 	// sorted order. Each was cancelled and is expected to write nothing, and
 	// the drain did not wait for it to return.
 	Cancelled []string
-	// CancelledLevel is the level for the line that reports Cancelled: the
-	// highest Level among the cancelled workers, each judged by the
+	// Reported names the workers in Cancelled that an earlier drain of the
+	// same run already named, in sorted order. A caller that logs Cancelled
+	// leaves these out, so the same worker is never logged twice.
+	Reported []string
+	// CancelledLevel is the level for the line that reports the cancelled
+	// workers Reported does not name: the highest Level among them, each judged by the
 	// configured mode of the cluster config that started it. It is Debug when
 	// no worker was cancelled.
 	CancelledLevel slog.Level
 	// Panics holds the workers that panicked and that no earlier drain
 	// reported.
 	Panics []WorkerPanic
+}
+
+// Unreported returns the cancelled workers that no earlier drain of the run
+// named, in sorted order.
+func (d DrainResult) Unreported() []string {
+	var names []string
+	skip := slices.Clone(d.Reported)
+	for _, name := range d.Cancelled {
+		if i := slices.Index(skip, name); i >= 0 {
+			skip = slices.Delete(skip, i, i+1)
+			continue
+		}
+		names = append(names, name)
+	}
+	return names
 }
 
 // NewRegistry returns an open Registry with no workers.
@@ -295,14 +321,26 @@ func (r *Registry) Drain(ctx context.Context, wait time.Duration) DrainResult {
 	// it sees the cancel cannot remove itself before the drain lists it.
 	r.mu.Lock()
 	run.cancel()
+	if r.afterCancel != nil {
+		r.afterCancel()
+	}
 	result := DrainResult{Started: run.started, Waited: time.Since(start), Panics: run.panics}
 	run.panics = nil
 	result.CancelledLevel = Level(config.DiscoveryModeAuto)
-	for _, w := range run.workers {
+	for id, w := range run.workers {
 		result.Cancelled = append(result.Cancelled, w.name)
+		if run.reported[id] {
+			result.Reported = append(result.Reported, w.name)
+			continue
+		}
+		if run.reported == nil {
+			run.reported = make(map[uint64]bool)
+		}
+		run.reported[id] = true
 		result.CancelledLevel = max(result.CancelledLevel, Level(w.mode))
 	}
 	slices.Sort(result.Cancelled)
+	slices.Sort(result.Reported)
 	release := run.afterDrain
 	run.afterDrain = nil
 	r.mu.Unlock()

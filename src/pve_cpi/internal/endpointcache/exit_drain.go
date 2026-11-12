@@ -42,13 +42,13 @@ func DrainAtExit(command string, stderr io.Writer, wait time.Duration) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	result := Drain(ctx, DrainWaitFor(wait))
-	if len(result.Panics) == 0 && len(result.Cancelled) == 0 {
+	if len(result.Panics) == 0 && len(result.Unreported()) == 0 {
 		return
 	}
 	logger, err := log.NewLogger("warn", stderr)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "%s: background workers panicked (%d) or were cancelled (%d), and the logger "+
-			"failed: %s\n", command, len(result.Panics), len(result.Cancelled), err)
+			"failed: %s\n", command, len(result.Panics), len(result.Unreported()), err)
 		return
 	}
 	LogDrainResult(logger, result)
@@ -68,11 +68,14 @@ func LogDrainResult(logger *log.Logger, result DrainResult) {
 			log.String("stack", string(p.Stack)),
 		)
 	}
+	cancelled := result.Unreported()
 	switch {
-	case len(result.Cancelled) > 0:
+	case len(result.Cancelled) > 0 && len(cancelled) == 0:
+		// An earlier drain of this run already reported these workers.
+	case len(cancelled) > 0:
 		logger.LogAttrs(context.Background(), result.CancelledLevel,
 			"endpoint cache: cancelled background work still running at exit",
-			log.String("workers", strings.Join(result.Cancelled, ", ")),
+			log.String("workers", strings.Join(cancelled, ", ")),
 			log.Int("started", result.Started),
 			log.String("waited", result.Waited.Round(time.Millisecond).String()),
 		)

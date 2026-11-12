@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -172,6 +173,27 @@ func TestDrainAtExitWarnsOnceAboutACancelledWorkerUnderOn(t *testing.T) {
 		if !strings.Contains(lines[0], want) {
 			t.Errorf("line %q does not contain %q", lines[0], want)
 		}
+	}
+}
+
+// A worker stuck past the bound is reported by the drain that cancelled it and
+// by no later drain of the run, so the last drain at exit adds nothing to the
+// line the first one wrote.
+func TestDrainAtExitDoesNotRepeatAWorkerAnEarlierDrainReported(t *testing.T) {
+	resetProcessRegistry(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	if err := Go("stuck refresh", config.DiscoveryModeOn, func(context.Context) { <-release }); err != nil {
+		t.Fatal(err)
+	}
+	first := Drain(context.Background(), 20*time.Millisecond)
+	if got := first.Unreported(); !slices.Equal(got, []string{"stuck refresh"}) {
+		t.Fatalf("first drain Unreported = %v, want the stuck worker", got)
+	}
+	var stderr bytes.Buffer
+	DrainAtExit("tool", &stderr, 20*time.Millisecond)
+	if stderr.Len() != 0 {
+		t.Fatalf("the last drain wrote %q, want nothing", stderr.String())
 	}
 }
 
