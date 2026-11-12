@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-12
+
 ### Fixed
 
 - A `bosh clean-up --all` could fail most of its `delete_disk` calls with `cluster lock acquire timed out` when many orphaned disks sat on one parker. The Director sends those deletes in parallel, and every disk on a parker shares that parker's lock, so the deletes queue behind one another. A journal-managed disk waited the lock's full TTL, which is about 235 seconds on the shipped retry settings, but a disk without a journal record waited only 15 seconds, so only the first one or two deletes finished, and a second clean-up was needed for the rest. The same short wait applied to every other call that takes a parker's lock for a disk without a journal record, which includes `attach_disk`, `detach_disk`, the park in `create_disk`, the disk attach in `create_vm`, the disk preservation in `delete_vm`, and the finish of an interrupted transfer in `resize_disk`, `snapshot_disk`, `update_disk`, and `set_disk_metadata`. Every one of those calls now waits the full TTL, whether or not its disk has a journal record. The call's own time limit, less the 15 seconds the CPI keeps for finishing the call, still ends the wait early. The sweep of unfinished teardowns that runs at the start of `create_vm` and `delete_vm` is the one exception. It still waits only 15 seconds for a busy parker, and it now also waits only 15 seconds for the transfer lock of a stable-ID disk it moves, where it used to wait about 250 seconds. One busy parker or disk therefore costs the call that runs the sweep seconds rather than minutes, and the next sweep tries it again. A sweep that meets several of them can still take up to its own budget, which is four minutes or half of the call's remaining time, whichever is shorter. Because a transfer's per-disk lock has to outlast its wait for the parker's lock, a stable-ID disk's transfer into a parker, or the finish of an interrupted one, now keeps that per-disk lock for up to about 470 seconds rather than 250. A request waiting for any of the CPI's cluster locks also no longer asks PVE to create the lock's pool while another request holds it, and it now only reads the pool until the holder leaves. That covers the parker locks, the VMID claims and locks, the HA rules and anti-affinity locks, and a disk's transfer lock. Each refused create took PVE's cluster-wide lock on its user configuration, so a long queue of waiters slowed every pool and user change on the cluster. [A parker lock wait runs out](docs/troubleshooting.md#a-parker-lock-wait-runs-out) now covers parallel clean-up deletes, how the queue on the lock behaves, what the Director does after a call fails, and why a large clean-up during a deploy can fail that deploy's attaches.
@@ -1077,7 +1079,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.7...v0.10.0
 [0.9.7]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.5...v0.9.6
