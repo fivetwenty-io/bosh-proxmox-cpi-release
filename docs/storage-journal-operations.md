@@ -176,7 +176,7 @@ cpi storage-journal settle-migration \
   --expected-cid EXACT_RECORDED_CID \
   --step-id STEP_ID \
   --task-upid UPID \
-  --decision-id incident-1234-migration \
+  --decision-id settle-migration-1 \
   --previous-writer-fenced \
   --remote-tasks-settled
 ```
@@ -263,7 +263,7 @@ On success the command prints one JSON object with the keys below, and it saves 
 | `slot`, `volume`, `serial` | Where the disk sits on the mover |
 
 ```json
-{"allocation_id":"65a2e32a-0ec7-4dd8-bfc3-8ba70f2dfcf3","cid":"pvz-H4sIAAAAAAAC_zTM","decision_id":"incident-1234-migration","exit_status":"OK","serial":"bpd-7f79e23516fb4a74","slot":"scsi0","source_node":"pve02","state":"reconciliation_required","step_id":"attempt-0-step-40","target_node":"pve01","task_status":"stopped","upid":"UPID:pve02:0000A1B2:0001C3D4:6734ABCD:qmigrate:90144:root@pam:","vmid":"90144","volume":"nfs-images:90144/vm-90144-disk-0.qcow2"}
+{"allocation_id":"0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0","cid":"pvz-H4sIAAAAAAAC_zTM","decision_id":"settle-migration-1","exit_status":"OK","serial":"bpd-0123456789abcdef","slot":"scsi0","source_node":"pve02","state":"reconciliation_required","step_id":"attempt-0-step-12","target_node":"pve01","task_status":"stopped","upid":"UPID:pve02:0000A1B2:0001C3D4:6734ABCD:qmigrate:90123:root@pam:","vmid":"90123","volume":"nfs-images:90123/vm-90123-disk-0.qcow2"}
 ```
 
 The step is now `observed` and the record's reason reads `migration settled by decision <decision-id>`. The record stays in `reconciliation_required` with every step observed, and the Director's next call on the disk admits it and carries on. We do not need `adopt` first, although `adopt` still accepts the record if we want it to say `adopted` before the deploy. If the record cannot show the evidence after the save, the command exits 1 with `migration settled but its evidence could not be read back (inspect the record before retrying)`, and we inspect the record before we run anything again.
