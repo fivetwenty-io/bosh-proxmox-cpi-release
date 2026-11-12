@@ -928,7 +928,8 @@ func TestCollectReportsACacheDirectoryTheCPICannotUse(t *testing.T) {
 		"missing directory": {missing, []string{"does not exist", "does not create it because its parent directory",
 			"restarts any grace window"}},
 		"missing directory the CPI creates": {creatable, []string{"creates it with mode 0700 on first use",
-			"same mount as the CPI's temporary directory", "director.cpi_additional_volumes"}},
+			"same mount as this check's temporary directory", "only when the CPI's TMPDIR names the same directory",
+			"director.cpi_additional_volumes"}},
 		"not a directory": {file, []string{"not a directory"}},
 		"symbolic link":   {link, []string{"symbolic link"}},
 	}
@@ -1156,7 +1157,8 @@ func TestCollectLeavesTheTemporaryDirectoryToTheCPIsUser(t *testing.T) {
 	withJournal.StorageAllocationJournalDir = journal
 
 	r := cacheFindingsAs(withJournal, doctor)
-	want(t, r, haKindCacheDirectory, haSeverityAdvice, sibling, "does not create it because", "temporary cache directory")
+	want(t, r, haKindCacheDirectory, haSeverityAdvice, sibling, "does not create it because",
+		"temporary cache directory")
 	for _, f := range findings(r, haKindCacheDirectory) {
 		if strings.Contains(f.Subject, "pve_cpi-endpoint-cache.") || strings.Contains(f.Detail, "mode 0755") {
 			t.Errorf("a doctor that is not the CPI's user judged the temporary directory: %+v", f)
@@ -1221,7 +1223,7 @@ func TestCollectSaysWhetherTheCPICreatesAMissingDirectory(t *testing.T) {
 		}
 	})
 
-	t.Run("override owned by another user's parent is not created", func(t *testing.T) {
+	t.Run("override judged as a user that does not own the journal is not created", func(t *testing.T) {
 		journal, _ := journalCacheLayout(t, 0o700)
 		makeDir(t, journal)
 		override := filepath.Join(filepath.Dir(journal), "override")
@@ -1234,9 +1236,62 @@ func TestCollectSaysWhetherTheCPICreatesAMissingDirectory(t *testing.T) {
 		j.ancestors = func(string, int) (*searchBlock, error) { return nil, nil }
 		c.cacheFindingsAs(j)
 		want(t, c.rep, haKindCacheDirectory, haSeverityAdvice, override,
-			"does not create it because its parent directory", "is owned by "+cpiUser,
-			"the CPI runs as uid "+itoa(os.Geteuid()+1))
+			"does not create it because the allocation journal directory", "belongs to "+cpiUser,
+			"it would be made by uid "+itoa(os.Geteuid()+1))
 	})
+
+	t.Run("override in another BPM volume is not created", func(t *testing.T) {
+		store := t.TempDir()
+		for _, dir := range []string{"pve_cpi", "director"} {
+			makeDir(t, filepath.Join(store, dir))
+		}
+		journal := filepath.Join(store, "pve_cpi", "allocations")
+		makeDir(t, journal)
+		override := filepath.Join(store, "director", "pve-cache")
+		cfg := haCfg("auto", "none")
+		cfg.StorageAllocationJournalDir = journal
+		cfg.EndpointCacheDir = override
+		c := &haCollector{cfg: cfg, euid: doctor, rep: &haReport{Findings: []haFinding{}}}
+		j := c.cacheJudge()
+		j.bpmStore = store
+		c.cacheFindingsAs(j)
+		want(t, c.rep, haKindCacheDirectory, haSeverityAdvice, override,
+			"does not create it because its parent directory "+filepath.Join(store, "director")+" is outside "+
+				filepath.Join(store, "pve_cpi"), "a mount of its own", "although this host shows one")
+		for _, f := range findings(c.rep, haKindCacheDirectory) {
+			if strings.Contains(f.Detail, "creates it with mode 0700") {
+				t.Errorf("the finding says the CPI creates a directory BPM puts on another mount: %+v", f)
+			}
+		}
+		if _, err := os.Lstat(override); !os.IsNotExist(err) {
+			t.Errorf("the doctor created the directory: %v", err)
+		}
+
+		inside := filepath.Join(store, "pve_cpi", "pve-cache")
+		cfg.EndpointCacheDir = inside
+		c = &haCollector{cfg: cfg, euid: doctor, rep: &haReport{Findings: []haFinding{}}}
+		j = c.cacheJudge()
+		j.bpmStore = store
+		c.cacheFindingsAs(j)
+		want(t, c.rep, haKindCacheDirectory, haSeverityAdvice, inside, "creates it with mode 0700 on first use",
+			"inside the same volume as the allocation journal directory")
+	})
+}
+
+func TestStoreVolumeNamesTheDirectoryJustBelowTheStore(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"/var/vcap/store/director/pve-cache": "/var/vcap/store/director",
+		"/var/vcap/store/pve_cpi":            "/var/vcap/store/pve_cpi",
+		"/var/vcap/store":                    "",
+		"/var/vcap/storefront/x":             "",
+		"/var/vcap/data/director/tmp":        "",
+	}
+	for path, want := range cases {
+		if got := storeVolume("/var/vcap/store", path); got != want {
+			t.Errorf("storeVolume(%s) = %q, want %q", path, got, want)
+		}
+	}
 }
 
 // With no journal to name the CPI's user, a directory that fails only because
