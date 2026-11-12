@@ -58,7 +58,7 @@ The effective state is `full`, `observe-only`, or `off`. In `observe-only` the C
 
 - **Quorum**
 
-  The entry node must be quorate, and the cluster resource manager must have a master with a fresh timestamp.
+  The entry node must be quorate, and the cluster resource manager must have a master with a fresh timestamp. A cluster with no HA resources passes with an idle manager, because PVE's manager goes idle and stops refreshing its timestamp when it has nothing to manage.
 
 - **Survival of one failure**
 
@@ -175,7 +175,9 @@ Double recovery happens when PVE HA starts the VM on a new node while the resurr
 
 ### When `delete_vm` defers
 
-The CPI reads one normalized view of the VM's HA state, built from the cluster resource manager's service state and the resource's configured request. It trusts that view only when it is fresh and comes from one quorate entry node. A stale, partial, or mixed view means the state is unknown, and an unknown state defers in every mode. A decision that acts on a live node also needs the node's local resource manager timestamp to be fresh. The table shows what `delete_vm` does for each raw state.
+The CPI reads one normalized view of the VM's HA state, built from the cluster resource manager's service state and the resource's configured request. It trusts that view only when it is fresh and comes from one quorate entry node. A stale, partial, or mixed view means the state is unknown, and an unknown state defers in every mode. A decision that acts on a live node also needs the node's local resource manager timestamp to be fresh.
+
+An old manager timestamp is not always a stale view. PVE's cluster resource manager goes idle after the cluster has had no HA resources for a while, and an idle manager stops writing its status, so its timestamp keeps the time of its last round for as long as the cluster stays without HA. PVE's own `ha-manager status` reports that manager as idle. The CPI reads the same state as idle when the entry node is quorate, the cluster lists no HA resources, and the manager's last round held no service and no disarm request. Those are the conditions PVE checks before its manager goes idle. No VM is HA-managed on such a cluster, so `delete_vm` proceeds as it does on a cluster without HA. When a resource appears after that read, the CPI treats it as one the manager has not processed yet and waits for motion. An old timestamp on a cluster that still lists any HA resource, or whose last round held a service, is a stale view, and the delete defers. The table shows what `delete_vm` does for each raw state.
 
 | Raw state | Node | `delete_vm` does |
 |---|---|---|
