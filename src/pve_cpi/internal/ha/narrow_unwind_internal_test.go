@@ -200,8 +200,8 @@ func TestUnwindContext(t *testing.T) {
 				defer stopRequest()
 				step, cancel := unwindContextWithin(ctx, window)
 				defer cancel()
-				stopRequest()
 				signalled := time.Now()
+				stopRequest()
 				select {
 				case <-step.Done():
 				case <-time.After(30 * time.Second):
