@@ -1440,7 +1440,8 @@ func TestDiscoveryWorker_CancelledRefreshBacksOffLikeAFailedOne(t *testing.T) {
 				before = e.payload()
 				e.clock.advance(endpointcache.RefreshInterval)
 			}
-			e.cluster.set(func() { e.cluster.hang["pve1"] = true })
+			hung := make(chan struct{}, 1)
+			e.cluster.set(func() { e.cluster.hang["pve1"] = true; e.cluster.hung = hung })
 			e.begin()
 			w := e.newWorker()
 			b := e.binding()
@@ -1450,6 +1451,13 @@ func TestDiscoveryWorker_CancelledRefreshBacksOffLikeAFailedOne(t *testing.T) {
 				w.refresh(ctx, workerSeed, b)
 			}); err != nil {
 				t.Fatal(err)
+			}
+			// The refresh records its attempt before it starts the reads, so
+			// a blocked read means the attempt is already written.
+			select {
+			case <-hung:
+			case <-time.After(30 * time.Second):
+				t.Fatal("the refresh never reached its blocked read")
 			}
 			res := e.registry.Drain(context.Background(), 50*time.Millisecond)
 			<-done

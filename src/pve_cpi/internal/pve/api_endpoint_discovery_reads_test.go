@@ -70,6 +70,9 @@ type discCluster struct {
 	membersErr error
 	// hang makes a node's certificates/info block until its context ends.
 	hang map[string]bool
+	// hung, when set, receives one value each time a hanging read starts, so a
+	// test can wait until a read is blocked instead of sleeping.
+	hung chan struct{}
 	// certDelay holds every certificates/info read that long, so reads overlap.
 	certDelay   time.Duration
 	inflight    int
@@ -158,7 +161,7 @@ func (d *discCluster) client() *discClient {
 				d.certCalls = append(d.certCalls, node)
 				d.inflight++
 				d.maxInflight = max(d.maxInflight, d.inflight)
-				hang, delay := d.hang[node], d.certDelay
+				hang, delay, hung := d.hang[node], d.certDelay, d.hung
 				d.mu.Unlock()
 				defer func() {
 					d.mu.Lock()
@@ -166,6 +169,12 @@ func (d *discCluster) client() *discClient {
 					d.mu.Unlock()
 				}()
 				if hang {
+					if hung != nil {
+						select {
+						case hung <- struct{}{}:
+						default:
+						}
+					}
 					<-ctx.Done()
 					return nil, ctx.Err()
 				}
