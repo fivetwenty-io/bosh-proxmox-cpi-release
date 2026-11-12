@@ -566,9 +566,9 @@ func (f *fakeLockClock) clock() lockClock {
 
 // TestWithDiskTransferLock_WaitsOutAHolderPastTheParkerWait pins the per-disk
 // lock's wait against the parker lock's. A holder that keeps the disk lock for
-// longer than the parker lock's 15s wait is still waited out, because the disk
-// lock's wait covers its whole TTL, and that TTL covers a parker window that
-// waited its whole wait before it ran.
+// longer than the parker lock's whole wait is still waited out, because the
+// disk lock's wait covers its whole TTL, and that TTL covers a parker window
+// that waited its whole wait before it ran.
 func TestWithDiskTransferLock_WaitsOutAHolderPastTheParkerWait(t *testing.T) {
 	t.Parallel()
 	parkerTTL, parkerWait := parkerLockTimeoutsFrom(context.Background())
@@ -581,7 +581,7 @@ func TestWithDiskTransferLock_WaitsOutAHolderPastTheParkerWait(t *testing.T) {
 	pools := newFakeLockPools()
 	clk := &fakeLockClock{base: time.Now()}
 	pools.pools[key] = encodeLockComment("holder", clk.base.Add(10*time.Minute))
-	const holdFor = parkerProtectionLockTimeout + 5*time.Second
+	holdFor := parkerWait + 5*time.Second
 	clk.onSleep = func(elapsed time.Duration) {
 		if elapsed >= holdFor {
 			pools.mu.Lock()
@@ -616,8 +616,8 @@ func TestWithDiskTransferLock_WaitsOutAHolderPastTheParkerWait(t *testing.T) {
 
 // TestDiskTransferLockTimeouts_CoverTheParkerWait pins the disk lock's TTL
 // against the caller's effective parker wait. The TTL is the parker TTL plus
-// that wait, whether it is the default or a managed one from
-// WithParkerLockWait, so the parker acquire inside the disk lock is never
+// that wait, whether it is the default whole TTL, the sweep's shorter one, or
+// a test's from WithParkerLockWait, so the parker acquire inside the disk lock is never
 // shortened by the disk claim. A waiter is bounded by the TTL plus the create
 // grace.
 func TestDiskTransferLockTimeouts_CoverTheParkerWait(t *testing.T) {
@@ -628,9 +628,9 @@ func TestDiskTransferLockTimeouts_CoverTheParkerWait(t *testing.T) {
 		ctx      context.Context
 		wantWait time.Duration
 	}{
-		{"default wait", context.Background(), parkerProtectionLockTimeout},
-		{"managed wait of a whole parker TTL", WithParkerLockWait(context.Background(), parkerTTL), parkerTTL},
-		{"managed wait of an hour", WithParkerLockWait(context.Background(), time.Hour), time.Hour},
+		{"default wait of a whole parker TTL", context.Background(), parkerTTL},
+		{"sweep wait", WithParkerLockWaitAtMost(context.Background(), ParkerLockSweepWait), ParkerLockSweepWait},
+		{"wait of an hour", WithParkerLockWait(context.Background(), time.Hour), time.Hour},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

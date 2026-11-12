@@ -265,7 +265,7 @@ func TestCleanupFencingRefusalNamesStepAndMissingFlags(t *testing.T) {
 		deps, _, journal, cid, parker := createVMDiskFixture(t, locks, true)
 		locks.reset()
 		plantHeldParkerLock(locks, parker)
-		ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
+		ctx := shortenParkerLockWait(t.Context(), testParkerLockWait)
 		failPersistentHandoff(t, func(slot string, err error) (string, error) {
 			if err != nil {
 				return slot, errors.New(err.Error())

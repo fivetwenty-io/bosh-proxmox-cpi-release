@@ -256,7 +256,12 @@ func stragglerOwned(ctx context.Context, deps Deps, vmid int, loc pve.VMLocation
 }
 
 // sweepContext bounds the sweep by its budget and by half of what remains of
-// the request's deadline.
+// the request's deadline. It also caps every parker lock wait inside the sweep
+// at pve.ParkerLockSweepWait rather than the whole TTL every other caller
+// waits. The sweep is housekeeping that runs ahead of another request's own
+// work, so a busy parker should cost that request seconds, not minutes. A VM
+// whose retained ephemeral disk the sweep could not move stays queued, and the
+// next sweep tries it again.
 func sweepContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	budget := time.Duration(deferredTeardownSweepBudgetNs.Load())
 	if dl, ok := ctx.Deadline(); ok {
@@ -264,7 +269,7 @@ func sweepContext(ctx context.Context) (context.Context, context.CancelFunc) {
 			budget = half
 		}
 	}
-	return context.WithTimeout(ctx, budget)
+	return context.WithTimeout(pve.WithParkerLockWaitAtMost(ctx, pve.ParkerLockSweepWait), budget)
 }
 
 // sweepDeferredTeardowns drains the queue of VMs a disposal could not finish:

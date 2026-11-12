@@ -2613,22 +2613,27 @@ func parkerProtectionLockTTLNow() time.Duration {
 // curves lengthen it.
 func ParkerProtectionLockTTLNow() time.Duration { return parkerProtectionLockTTLNow() }
 
-// parkerProtectionLockTimeout bounds the wait for the lock. On timeout the
-// acquire fails retriably with ErrClusterLockTimeout, because a live holder was
-// inside the window throughout; see withParkerProtectionLock. A caller that
-// would rather wait out a whole holder sets a longer wait with
-// WithParkerLockWait.
-const parkerProtectionLockTimeout = 15 * time.Second
+// ParkerLockSweepWait is the wait for the lock that the deferred-teardown
+// sweep sets through WithParkerLockWaitAtMost. Every other caller waits one
+// whole TTL, which is the default (parkerLockTimeoutsFrom). The sweep runs as
+// housekeeping inside another request, so it gives up on a busy parker after
+// this long rather than hold up the request that runs it, and its next run
+// tries again. On timeout the acquire fails retriably with
+// ErrClusterLockTimeout, because a live holder was inside the window
+// throughout; see withParkerProtectionLock.
+const ParkerLockSweepWait = 15 * time.Second
 
 // parkerLockReleaseTimeout bounds the deferred sentinel-pool delete.
 const parkerLockReleaseTimeout = clusterLockReleaseTimeout
 
 // parkerLockTimeoutsKey carries an override for the protection-window lock's
-// TTL and acquire timeout. The production values are tuned for a real cluster
-// -- a 15s wait and parkerProtectionLockTTLNow. Production code overrides only
-// the wait, and only through WithParkerLockWait. Tests shorten both through
-// withTestParkerLockTimeouts, since a test that exercises the contended paths
-// would otherwise have to spend them in wall-clock time.
+// TTL and acquire timeout. The production values are tuned for a real cluster,
+// and both are parkerProtectionLockTTLNow. Production code overrides only the
+// wait, and only to shorten it for the deferred-teardown sweep
+// (WithParkerLockWaitAtMost). Tests shorten both through
+// withTestParkerLockTimeouts or WithParkerLockWait, since a test that
+// exercises the contended paths would otherwise have to spend them in
+// wall-clock time.
 type parkerLockTimeoutsKey struct{}
 
 type parkerLockTimeouts struct {
@@ -2643,15 +2648,27 @@ func withTestParkerLockTimeouts(ctx context.Context, ttl, timeout time.Duration)
 }
 
 // WithParkerLockWait returns a context whose protection-window lock acquires
-// wait up to d for a live holder instead of parkerProtectionLockTimeout. The
-// TTL is unchanged, so a holder's claim lasts exactly as long as before. A
-// non-positive d leaves ctx as it is.
+// wait up to d for a live holder instead of one whole TTL. The TTL is
+// unchanged, so a holder's claim lasts exactly as long as before. A
+// non-positive d leaves ctx as it is. Production code shortens the wait only
+// through WithParkerLockWaitAtMost, and tests use this to spend less time on a
+// holder that never leaves.
 func WithParkerLockWait(ctx context.Context, d time.Duration) context.Context {
 	if d <= 0 {
 		return ctx
 	}
 	ttl, _ := parkerLockTimeoutsFrom(ctx)
 	return context.WithValue(ctx, parkerLockTimeoutsKey{}, parkerLockTimeouts{ttl: ttl, timeout: d})
+}
+
+// WithParkerLockWaitAtMost returns a context whose protection-window lock
+// acquires wait no longer than d. A wait ctx already sets that is shorter than
+// d is kept, and a non-positive d leaves ctx as it is.
+func WithParkerLockWaitAtMost(ctx context.Context, d time.Duration) context.Context {
+	if _, wait := parkerLockTimeoutsFrom(ctx); d <= 0 || wait <= d {
+		return ctx
+	}
+	return WithParkerLockWait(ctx, d)
 }
 
 // WithParkerLockTTLForTest returns a context whose protection-window lock
@@ -2703,12 +2720,28 @@ func parkerLockClockFrom(ctx context.Context) lockClock {
 
 // parkerLockTimeoutsFrom returns the override installed by
 // withTestParkerLockTimeouts or WithParkerLockWait, or else the TTL under the
-// retry curves configured now and the production wait.
+// retry curves configured now as both the TTL and the wait.
+//
+// The wait is one whole TTL because every disk on a parker shares the
+// parker's lock, so requests for different disks queue on it, and a bosh
+// clean-up --all that deletes many orphans on one parker queues them all at
+// once. A holder's window may run for most of the TTL, and a claim that
+// outlives its TTL is stolen, so a whole TTL is the shortest wait that
+// outlasts any single holder, live or crashed. A shorter wait fails a Director
+// call even though nothing went wrong. Every caller waits the same, because
+// the acquire has no queue. A caller with a shorter wait would lose the lock
+// to the longer waiters at nearly every hand-off and time out while they work
+// through their queue. The acquire still stops before the request's
+// deadline, or before the end of the VMID claim window it runs in
+// (clusterLockDeadline), so the wait never runs past the time its caller has.
+// A queue of several holders can still outlast the wait, and the acquire then
+// fails retriably with ErrClusterLockTimeout.
 func parkerLockTimeoutsFrom(ctx context.Context) (time.Duration, time.Duration) {
 	if o, ok := ctx.Value(parkerLockTimeoutsKey{}).(parkerLockTimeouts); ok && o.ttl > 0 && o.timeout > 0 {
 		return o.ttl, o.timeout
 	}
-	return parkerProtectionLockTTLNow(), parkerProtectionLockTimeout
+	ttl := parkerProtectionLockTTLNow()
+	return ttl, ttl
 }
 
 // parkerProvenanceRemoveTimeout bounds the detached provenance removal that runs

@@ -211,7 +211,7 @@ func TestCutOffRestoreWaitsOutAnotherRequestsParkerLock(t *testing.T) {
 			}
 			c.setProtection(false)
 			plantHeldParkerLock(locks, c.parker)
-			ctx := shortenManagedLockWait(c.ctx, testManagedLockWait)
+			ctx := shortenParkerLockWait(c.ctx, testParkerLockWait)
 
 			_, err := HandleAttachDisk(c.deps).Handle(ctx, c.attachArgs, jsonrpc.Context{})
 			if err == nil {
@@ -300,7 +300,7 @@ func TestCutOffRestoreRefusesRetriablyWhenTheParkerLockCannotBeTaken(t *testing.
 			locks, reads := c.watchParkerLock(t)
 			c.setProtection(false)
 			tc.fail(locks, c.parker)
-			ctx := shortenManagedLockWait(c.ctx, testManagedLockWait)
+			ctx := shortenParkerLockWait(c.ctx, testParkerLockWait)
 
 			_, err := HandleAttachDisk(c.deps).Handle(ctx, c.attachArgs, jsonrpc.Context{})
 			if err == nil {
@@ -532,7 +532,7 @@ func TestCompletionWaitsOutAnotherRequestsParkerLock(t *testing.T) {
 			}
 		},
 	}
-	ctx := shortenManagedLockWait(c.ctx, testManagedLockWait)
+	ctx := shortenParkerLockWait(c.ctx, testParkerLockWait)
 
 	_, err := HandleAttachDisk(c.deps).Handle(ctx, c.attachArgs, jsonrpc.Context{})
 	if err == nil {
@@ -604,7 +604,7 @@ func TestAbsentDiskFinalizationWaitsOutAnotherRequestsParkerLock(t *testing.T) {
 	locks, _ := c.watchParkerLock(t)
 	c.setProtection(false)
 	plantHeldParkerLock(locks, c.parker)
-	ctx := shortenManagedLockWait(c.ctx, testManagedLockWait)
+	ctx := shortenParkerLockWait(c.ctx, testParkerLockWait)
 	_, err = HandleDeleteDisk(c.deps).Handle(ctx, deleteArgs, jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("the rerun delete_disk succeeded while another request held the parker's lock")

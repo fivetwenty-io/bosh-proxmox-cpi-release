@@ -73,7 +73,7 @@ func TestCreateVMDiskNonCleanTimeoutVMCleanupPath(t *testing.T) {
 	deps, client, journal, cid, parker := createVMDiskFixture(t, locks, true)
 	locks.reset()
 	plantHeldParkerLock(locks, parker)
-	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
+	ctx := shortenParkerLockWait(t.Context(), testParkerLockWait)
 	// The wrapper drops the returned-disk marker, so the VM allocation sees
 	// the uncertain outcome a pre-wait disk mutation would give it.
 	failPersistentHandoff(t, func(slot string, err error) (string, error) {

@@ -168,7 +168,8 @@ func newRetentionCase(t *testing.T, existingParker bool) *retentionCase {
 	if existingParker {
 		plantRetentionParker(client, retentionExistingParker)
 	}
-	c.ctx = pve.WithTestBackoff(shortenManagedLockWait(t.Context(), testManagedLockWait), func(int) time.Duration { return 0 })
+	c.ctx = pve.WithTestBackoff(shortenParkerLockWait(t.Context(), testParkerLockWait),
+		func(int) time.Duration { return 0 })
 	c.dispatcher = cpi.NewDispatcher(log.NewNopLogger())
 	if err := c.dispatcher.Register("delete_vm", HandleDeleteVM(deps)); err != nil {
 		t.Fatal(err)

@@ -168,7 +168,7 @@ func TestDetachTailThenParkerLockTimeoutStaysClean(t *testing.T) {
 	parker := s.requireSingleHolder(t, true)
 	plantHeldParkerLock(locks, parker)
 
-	err := deleteDiskAt(t, shortenManagedLockWait(context.Background(), testManagedLockWait), s.deps, s.cid)
+	err := deleteDiskAt(t, shortenParkerLockWait(context.Background(), testParkerLockWait), s.deps, s.cid)
 	requireRetriable(t, err, "delete_disk that times out on the parker lock after the tail")
 	if !errors.Is(err, pve.ErrClusterLockTimeout) {
 		t.Fatalf("err = %v, want the parker lock timeout", err)

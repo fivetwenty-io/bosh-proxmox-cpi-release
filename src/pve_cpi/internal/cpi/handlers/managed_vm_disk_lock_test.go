@@ -177,7 +177,7 @@ func createVMDiskLockTimeout(t *testing.T, overrides bool) (Deps, *createVMDiskC
 	deps, client, journal, cid, parker := createVMDiskFixture(t, locks, overrides)
 	locks.reset()
 	plantHeldParkerLock(locks, parker)
-	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
+	ctx := shortenParkerLockWait(t.Context(), testParkerLockWait)
 	args := createVMArgs(t, cid)
 
 	_, err := createVM(ctx, deps, args)

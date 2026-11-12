@@ -59,7 +59,6 @@ func attachExistingDiskToManagedVM(ctx context.Context, deps Deps, handle *aj.Ha
 	lifecycle.guard = guard
 	local := deps
 	local.PVE = wrapManagedDiskClient(guard, lifecycle)
-	ctx = managedLockWaitContext(ctx)
 	defer func() {
 		if operationErr != nil && lifecycle.cleanLockTimeout(operationErr) {
 			// The parker lock wait ran out before this attach changed the

@@ -480,7 +480,8 @@ func TestGuardedAcquireNeverSharesAWindowWithAStealer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle, err := pve.AcquireClusterLock(withShortLockPoll(t.Context()), guard.Client().Pools(), "vm-90000", "unpark/90000@9-1", time.Minute, testManagedLockWait)
+	handle, err := pve.AcquireClusterLock(withShortLockPoll(t.Context()), guard.Client().Pools(), "vm-90000",
+		"unpark/90000@9-1", time.Minute, testParkerLockWait)
 	if handle != nil {
 		t.Fatal("the waiter took a lock handle while the stealer holds the sentinel, so both are inside one window")
 	}

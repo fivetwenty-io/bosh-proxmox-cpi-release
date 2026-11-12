@@ -98,7 +98,7 @@ func (q endingReadQEMU) Config(ctx context.Context, node string, vmid int) (map[
 }
 
 // TestCreateVMRollbackOutlivesTheRequestDeadline is the lock-timeout rollback
-// with operation_timeout on. The managed lock wait gives up, and the request's
+// with operation_timeout on. The parker lock wait gives up, and the request's
 // deadline arrives just as the rollback's VM disposal begins. The disposal
 // must still run to its end, so the generation closes, the VM is destroyed,
 // both disks return to the parker, and the Director gets the retriable lock

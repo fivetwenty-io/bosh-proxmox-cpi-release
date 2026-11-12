@@ -262,48 +262,6 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 	return result
 }
 
-// managedLockWaitContext lets a journal-managed operation wait out a whole
-// parker window that another request holds. Every attach_disk, detach_disk, and
-// delete_disk applies it as well, whether or not the disk has a journal record,
-// because every disk on one parker shares that parker's lock, and a clean-up
-// that deletes many orphans on one parker at once queues them all behind it.
-// A call for a disk without a journal record holds no other lock while it
-// waits, except a transfer's per-disk lock, whose TTL follows this wait, so the
-// longer wait can't hold up anything else. The default wait is 15 seconds,
-// while a holder's window may run for most of the lock's TTL, which is 235
-// seconds on the shipped retry curves and longer when pve.retry lengthens
-// them. The window ends early enough before the claim's recorded expiry to
-// leave time for the sweep, the protection restore, and the release. A waiter
-// that gives up early fails its Director task even though nothing went wrong.
-// Waiting a full TTL is the shortest wait that outlasts any single holder,
-// live or crashed, because a claim that outlives its TTL is stolen. A queue of
-// several holders can still outlast it, and that timeout is settled cleanly by
-// cleanLockTimeout.
-//
-// The per-disk transfer lock's TTL is the parker TTL plus this wait, so a parker
-// acquire inside the disk lock keeps the whole wait instead of running on a
-// shorter disk claim. That makes the disk claim about 470s on the shipped curves.
-//
-// The wait is the lock's TTL under the retry curves configured now, from
-// pve.ParkerProtectionLockTTLNow, unless the context carries a shorter one under
-// managedLockWaitKey, which only tests set. The wait is a context value, and it
-// must never become a context deadline. failConfirmingReads in the tests tells
-// the acquire's confirming reads from the reads on its way out only by whether
-// their context has a deadline, so a request context that gained one would
-// make every confirming read answer, and the tests that drive the unknown lock
-// state would no longer reach it.
-func managedLockWaitContext(ctx context.Context) context.Context {
-	wait := pve.ParkerProtectionLockTTLNow()
-	if d, ok := ctx.Value(managedLockWaitKey{}).(time.Duration); ok && d > 0 {
-		wait = d
-	}
-	return pve.WithParkerLockWait(ctx, wait)
-}
-
-// managedLockWaitKey carries a test's shorter managed lock wait on the request
-// context. Only tests set it, so production always waits the lock's TTL.
-type managedLockWaitKey struct{}
-
 // diskReturnedAfterLockTimeout marks a disk operation that failed only because
 // a cluster lock wait ran out, after which finish returned the disk's
 // allocation unchanged. A caller that holds its own allocation around the disk

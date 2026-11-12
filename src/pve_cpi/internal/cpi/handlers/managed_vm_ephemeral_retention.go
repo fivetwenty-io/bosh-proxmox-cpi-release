@@ -55,7 +55,6 @@ func retainManagedEphemeralForVMDelete(ctx context.Context, deps Deps, handle *a
 	lifecycle.guard = guard
 	local := deps
 	local.PVE = wrapManagedDiskClient(guard, lifecycle)
-	ctx = managedLockWaitContext(ctx)
 	// check is set once the serial is on the drive. A lock wait that runs out
 	// after that and changed nothing a resume can't accept hands the record
 	// back observed with the retriable timeout, as finish does for a disk.

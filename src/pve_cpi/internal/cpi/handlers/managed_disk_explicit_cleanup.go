@@ -92,7 +92,6 @@ func cleanupManagedDiskAllocation(ctx context.Context, deps Deps, journal *aj.Jo
 	copied.FastPathDelete = &disabled
 	local.Config = &copied
 	local.PVE = wrapManagedDiskClient(guard, lifecycle)
-	ctx = managedLockWaitContext(ctx)
 	defer func() {
 		// A parker lock wait that failed before this cleanup changed the
 		// disk, judged by the same rules attach_disk uses, leaves the record

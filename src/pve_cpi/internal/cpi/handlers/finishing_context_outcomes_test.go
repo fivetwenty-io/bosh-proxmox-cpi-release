@@ -135,7 +135,7 @@ func TestCreateVMLastAttemptCompletionFailureIsNotRetriable(t *testing.T) {
 	}}
 	d := cpi.NewDispatcherWithOptions(log.NewNopLogger())
 	handler := cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
-		return createVM(shortenManagedLockWait(ctx, testManagedLockWait), deps, args)
+		return createVM(shortenParkerLockWait(ctx, testParkerLockWait), deps, args)
 	})
 	if err := d.Register("create_vm", handler); err != nil {
 		t.Fatal(err)

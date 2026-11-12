@@ -150,9 +150,6 @@ func managedVMPreservationCandidates(ctx context.Context, deps Deps, node string
 }
 
 func detachManagedPersistentForVMDeleteOne(ctx context.Context, deps Deps, node string, vmid int, disk resolvedDisk, handle *aj.Handle) (operationErr error) {
-	// Both preservations below take the parker lock through a guarded client,
-	// so both get the managed wait, the legacy one included.
-	ctx = managedLockWaitContext(ctx)
 	if disk.allocation == nil {
 		return preserveLegacyDiskForVMDelete(ctx, deps, node, vmid, disk, handle)
 	}

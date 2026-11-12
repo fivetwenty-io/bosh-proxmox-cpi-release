@@ -301,7 +301,7 @@ type protectionResult struct {
 // the lock once for all of steps, so the journal lock its caller holds waits
 // on each parker at most once. The lock is named for the VMID alone, so it is
 // the same lock on whichever node the parker is found. It waits for the lock
-// as long as a journal-managed disk operation does (managedLockWaitContext),
+// as long as every other parker lock caller does, one whole TTL of the lock,
 // and when the lock stays held, or can't be taken, every step stays planned
 // with a gap that says so and gives no qm set command.
 //
@@ -332,7 +332,7 @@ func readParkerProtection(ctx context.Context, deps Deps, record aj.Record, vmid
 	}
 	readings := map[string]nodeReading{}
 	logger := deps.Log(ctx)
-	lockErr := pve.RunUnderParkerLock(managedLockWaitContext(ctx), client, logger, vmid, settleProtectionLockPurpose,
+	lockErr := pve.RunUnderParkerLock(ctx, client, logger, vmid, settleProtectionLockPurpose,
 		func(lockedCtx context.Context) error {
 			check := pve.ParkerLockCheck(vmid, pve.ParkerLockUnserialized(lockedCtx))
 			for i := range steps {

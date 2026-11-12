@@ -139,11 +139,11 @@ func requireRecordRestored(t *testing.T, before, after aj.Record) {
 }
 
 // contendedCleanup runs a plain explicit cleanup of the parked disk's record
-// on ctx while another request holds the parker's lock past the managed wait.
+// on ctx while another request holds the parker's lock past the parker lock wait.
 func contendedCleanup(t *testing.T, ctx context.Context, disk *parkedFlowDisk, locks *lockContention) (time.Duration, error) {
 	t.Helper()
 	plantHeldParkerLock(locks, disk.parker)
-	ctx = shortenManagedLockWait(ctx, testManagedLockWait)
+	ctx = shortenParkerLockWait(ctx, testParkerLockWait)
 	decision := StorageAllocationDecision{Action: "cleanup", AllocationID: disk.id, DecisionID: "contended-cleanup"}
 	started := time.Now()
 	_, err := CleanupStorageAllocation(ctx, attestedCleanupDeps(disk.deps), disk.journal, []string{"n1"}, decision)
@@ -194,10 +194,10 @@ func TestExplicitCleanupLockTimeoutLeavesTheRecord(t *testing.T) {
 				t.Fatalf("want the retriable lock timeout, got %v (%s)", err, StorageAllocationDecisionFailure(err))
 			}
 			if elapsed >= 10*time.Second {
-				t.Fatalf("the wait took %s, so the managed wait was not applied", elapsed)
+				t.Fatalf("the wait took %s, so the shortened wait was not applied", elapsed)
 			}
-			if elapsed < testManagedLockWait {
-				t.Fatalf("the timeout came after %s, before the %s wait ran out", elapsed, testManagedLockWait)
+			if elapsed < testParkerLockWait {
+				t.Fatalf("the timeout came after %s, before the %s wait ran out", elapsed, testParkerLockWait)
 			}
 			after := disk.record(t)
 			if after.State != before.State || after.Reason != before.Reason || after.CID != before.CID {

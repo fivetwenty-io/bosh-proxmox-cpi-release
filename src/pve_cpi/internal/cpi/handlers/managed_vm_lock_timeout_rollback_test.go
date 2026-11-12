@@ -212,7 +212,7 @@ func (c rollbackFlowCluster) ListSdnVnets(context.Context, *cluster.ListSdnVnets
 // persistent disks. The first is free and attaches without a parker. The
 // second sits on the parker, whose lock another request holds.
 type rollbackFlow struct {
-	// ctx carries the short managed lock wait every create_vm in the flow uses.
+	// ctx carries the short parker lock wait every create_vm in the flow uses.
 	ctx    context.Context
 	parked *parkedFlowDisk
 	free   lifecycleFlowDisk
@@ -246,7 +246,7 @@ func newRollbackFlow(t *testing.T) *rollbackFlow {
 	args := []json.RawMessage{json.RawMessage(fmt.Sprintf("%q", rollbackFlowAgent)), json.RawMessage(`":heavy:a:import/stemcell.qcow2"`), json.RawMessage(`{"cpu":1,"ram":1024,"root_disk_size":1024}`), json.RawMessage(`{}`), disks, json.RawMessage(`{}`)}
 	locks.reset()
 	plantHeldParkerLock(locks, parked.parker)
-	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
+	ctx := shortenParkerLockWait(t.Context(), testParkerLockWait)
 	return &rollbackFlow{ctx: ctx, parked: parked, free: free, locks: locks, vms: vms, args: args}
 }
 
@@ -319,7 +319,7 @@ func (f *rollbackFlow) created(t *testing.T) []int {
 
 // TestCreateVMLockTimeoutRollsBackTheAttempt drives the real create_vm
 // handler into a persistent disk whose parker lock another request holds past
-// the managed wait. The first disk is already attached when the second one
+// the parker lock wait. The first disk is already attached when the second one
 // times out. The other request finishes its window as the rollback starts, so
 // the rollback preserves the first disk to the parker, destroys the VM, closes
 // the generation, and only then hands the Director the retriable timeout. The
@@ -588,7 +588,7 @@ func TestCreateVMResumeRefusesAHalfDisposedGeneration(t *testing.T) {
 
 // TestCreateVMRollbackPreservationTimeoutIsUncertain drives the real
 // create_vm handler into a persistent disk whose parker lock another request
-// holds past the managed wait. create_vm rolls the attempt back, on the last
+// holds past the parker lock wait. create_vm rolls the attempt back, on the last
 // attempt and with a fallback attempt left alike, and the holder never leaves,
 // so preserving the disk that had already attached waits out the same parker
 // lock and times out. By then the disposal has recorded its admission, so the

@@ -53,6 +53,11 @@ type attachQEMUService struct {
 	// configErrAfterAttach, when set, fails every Config call made after
 	// AttachDisk ran, which is a VM that was deleted under the attach.
 	configErrAfterAttach error
+	// configFn, when set, answers every Config call by VMID and takes
+	// precedence over the staged and single-shape modes above. It lets a test
+	// describe each VM's config as a function of what has happened so far
+	// instead of counting calls.
+	configFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
 
 	// DetachDisk control — records calls and may inject error.
 	detachCalls []string
@@ -70,8 +75,11 @@ func (m *attachQEMUService) AttachDisk(_ context.Context, _ string, _ int, volid
 	return m.attachReturnDiskID, m.attachErr
 }
 
-func (m *attachQEMUService) Config(_ context.Context, _ string, _ int) (map[string]any, error) {
+func (m *attachQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	m.configCalls++
+	if m.configFn != nil {
+		return m.configFn(ctx, node, vmid)
+	}
 	if m.configErrAfterAttach != nil && m.configCallsAtAttach > 0 {
 		return nil, m.configErrAfterAttach
 	}

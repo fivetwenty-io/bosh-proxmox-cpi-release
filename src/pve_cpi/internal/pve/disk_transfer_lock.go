@@ -29,36 +29,30 @@ func DiskTransferLockPoolName(stableID string) string {
 
 // diskTransferLockTimeouts returns the TTL and the acquire wait of a per-disk
 // transfer lock under ctx. The TTL is the parker protection-window lock's TTL
-// plus that lock's default wait (parkerProtectionLockTimeout), because the
-// disk lock is taken first and must still be held when a parker window that
-// waited for the parker lock runs to the end of its own claim. A test that
-// shortens the parker lock through withTestParkerLockTimeouts shortens this
-// one too.
+// plus the caller's own wait for that lock, because the disk lock is taken
+// first and must still be held when a parker window that waited for the
+// parker lock runs to the end of its own claim. A test that shortens the
+// parker lock through withTestParkerLockTimeouts shortens this one too.
 //
-// The wait added to the TTL is the caller's own effective parker wait, the
-// default wait or the longer one a managed caller asks for
-// (WithParkerLockWait). A parker window inside this lock runs on what is left
-// of the disk claim, and its lock acquire stops clusterLockContextMargin
-// before the end of that window. A TTL that added only the default wait would
-// leave a managed caller, which managedLockWaitContext promises a parker wait
-// of about one parker TTL, with about 80s of real wait, and several managed
-// disks detaching into one parker could then fail with nothing wrong. So the
-// TTL has to cover the full parker wait, and the disk claim never shortens it.
+// A parker window inside this lock runs on what is left of the disk claim, and
+// its lock acquire stops clusterLockContextMargin before the end of that
+// window. A TTL that added less than the caller's parker wait would cut that
+// wait short, so several disks transferring into one parker could fail with
+// nothing wrong. So the TTL covers the full parker wait, and the disk claim
+// never shortens it.
 //
-// On the shipped curves a caller on the default wait gets about 250s, which is
-// the parker TTL of about 235s plus the 15s default wait. A caller that waits a
-// whole parker TTL, which is every attach_disk, detach_disk, and delete_disk and
-// every journal-managed operation, gets about 470s. The longer figure is also
-// how long a crashed holder blocks every other transfer of the disk, and we
-// accept that bound because a waiter steals a claim as soon as it expires.
+// On the shipped curves every transfer waits a whole parker TTL of about 235s
+// for the parker lock, so its disk claim lasts about 470s. The deferred-teardown
+// sweep is the one caller with a shorter parker wait (ParkerLockSweepWait), so
+// a transfer the sweep runs gets about 250s. The longer figure is also how long
+// a crashed holder blocks every other transfer of the disk, and we accept that
+// bound because a waiter steals a claim as soon as it expires.
 //
 // The wait is the whole TTL plus the create grace, so a second transfer of the
 // disk waits out a holder that keeps the lock for as long as its claim allows,
 // and a crashed holder's claim expires and is stolen inside the wait. A waiter
 // is therefore bounded by the TTL plus the grace, and the acquire itself also
-// stops waiting before the request's deadline (clusterLockDeadline), which is
-// the bound the journal lock's wait has too (managedLockWaitContext in the
-// handlers).
+// stops waiting before the request's deadline (clusterLockDeadline).
 func diskTransferLockTimeouts(ctx context.Context) (time.Duration, time.Duration) {
 	parkerTTL, parkerWait := parkerLockTimeoutsFrom(ctx)
 	ttl := parkerTTL + parkerWait

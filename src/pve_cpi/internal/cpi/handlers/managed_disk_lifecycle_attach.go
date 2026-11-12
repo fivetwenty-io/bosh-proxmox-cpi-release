@@ -19,7 +19,6 @@ func attachManagedPersistentDisk(ctx context.Context, deps Deps, vmCID, node str
 	if lifecycle == nil {
 		return "", fmt.Errorf("managed persistent attachment did not acquire allocation ownership")
 	}
-	ctx = managedLockWaitContext(ctx)
 	defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
 	current := lifecycle.disk
 	plan, err := guardAndUnparkBeforeAttach(ctx, local, "create_vm.attach_disk", &current, node, vmid)

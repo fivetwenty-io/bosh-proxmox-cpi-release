@@ -53,7 +53,6 @@ func managedSourceTransferRecords(ctx context.Context, deps Deps, vmid int) ([]p
 // must then read back on its parker with no transfer in flight. Anything else
 // refuses the destroy and leaves the VM in place.
 func preserveManagedTransferForVMDelete(ctx context.Context, deps Deps, vmid int, record pve.SourceTransferRecord) (operationErr error) {
-	ctx = managedLockWaitContext(ctx)
 	refuse := func(reason string) error {
 		return cpierrors.Cloud(
 			"delete_vm: refusing to destroy VM %d because parker vmid %d keeps a record of disk %s moving off it and %s, so nothing was destroyed; read the disk's allocation %s with storage-journal audit, and rerun delete_vm once the disk is on a parker",
