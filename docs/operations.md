@@ -609,7 +609,7 @@ First we find the directory. The CPI chooses it in three layers, and the first l
 
 1. The value of `pve.endpoint_cache_dir`, when we set it.
 
-2. The `endpoint-cache` directory beside `pve.storage_allocation_journal_dir`. With the documented journal path `/var/vcap/store/pve_cpi/allocations`, that is `/var/vcap/store/pve_cpi/endpoint-cache`. The job's pre-start script creates it, and the CPI creates it again at run time when its parent belongs to the CPI's user and sits on the journal's mount.
+2. The `endpoint-cache` directory beside `pve.storage_allocation_journal_dir`. With the documented journal path `/var/vcap/store/pve_cpi/allocations`, that is `/var/vcap/store/pve_cpi/endpoint-cache`. The job's pre-start script creates it, and the CPI creates it again at run time when the process runs as the journal directory's owner and the parent belongs to that user and sits on the journal's mount.
 
 3. The `pve_cpi-endpoint-cache.<uid>` directory under the temporary directory, which the CPI creates itself.
 
