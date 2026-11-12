@@ -104,6 +104,12 @@ func (c *migratedHolderCase) observeHolder() (string, string, error) {
 // configuration file is gone.
 var errMigrateSourceTimeout = &sdkerrors.APIError{HTTPCode: 500, Message: "got timeout"}
 
+// errMigrateCredentialLeak is a 500 whose message embeds URL credentials, to
+// show that a refusal carries error text only after scrubbing.
+var errMigrateCredentialLeak = &sdkerrors.APIError{
+	HTTPCode: 500, Message: "dial https://admin:hunter2@pve.example/api2 failed",
+}
+
 // TestObserveMigration_AcceptsTheSourceNodesMissingConfigAnswer observes a
 // finished migration whose source node answers the config read with PVE's
 // real 500 for a configuration file that is gone, and then with a plain 404.
@@ -142,21 +148,34 @@ func TestObserveMigration_AcceptsTheSourceNodesMissingConfigAnswer(t *testing.T)
 
 // TestObserveMigration_RefusesASourceThatIsNotProvenEmpty refuses when the
 // source node still answers with the holder's config, and when it fails with
-// a 500 that doesn't say the configuration file is gone.
+// a 500 that doesn't say the configuration file is gone. Each refusal names
+// the source and the target node and says what the source answered, and the
+// error text it carries is scrubbed.
 func TestObserveMigration_RefusesASourceThatIsNotProvenEmpty(t *testing.T) {
+	const prefix = "migration source holder absence not observed on node n1 (migrating to node n2) because "
 	for _, tc := range []struct {
 		name  string
 		setup func(c *migratedHolderCase)
+		want  string
+		deny  string
 	}{
-		{"config still on the source", func(c *migratedHolderCase) { c.client.vmNodes[migratedHolderVMID] = "n1" }},
-		{"another 500", func(c *migratedHolderCase) { c.answerOnSource(errMigrateSourceTimeout) }},
+		{"config still on the source", func(c *migratedHolderCase) { c.client.vmNodes[migratedHolderVMID] = "n1" },
+			prefix + "the source node answered with the holder's config", ""},
+		{"another 500", func(c *migratedHolderCase) { c.answerOnSource(errMigrateSourceTimeout) },
+			prefix + "the source node's config read returned another error: got timeout", ""},
+		{"error text carrying a credential", func(c *migratedHolderCase) {
+			c.answerOnSource(errMigrateCredentialLeak)
+		}, prefix + "the source node's config read returned another error: dial ", "hunter2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newMigratedHolderCase(t)
 			tc.setup(c)
-			if _, err := c.guard.observeMigration(c.ctx, c.migration()); err == nil ||
-				!strings.Contains(err.Error(), "migration source holder absence not observed") {
-				t.Fatalf("observeMigration = %v, want the source absence refusal", err)
+			_, err := c.guard.observeMigration(c.ctx, c.migration())
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("observeMigration = %v, want a refusal containing %q", err, tc.want)
+			}
+			if tc.deny != "" && strings.Contains(err.Error(), tc.deny) {
+				t.Fatalf("observeMigration = %v, want %q scrubbed out", err, tc.deny)
 			}
 		})
 	}
@@ -187,11 +206,13 @@ func TestObserveMigration_RefusesWhenTheProbeDoesNotPlaceTheHolderOnTheTarget(t 
 				}
 				return nil
 			}
-		}, "not found on node n2"},
+		}, "not found on node n2 by the cluster's config probe (migrating from node n1; the probe found the " +
+			"holder on node n1)"},
 		{"nowhere", func(c *migratedHolderCase) {
 			delete(c.client.state.configs, migratedHolderVMID)
 			delete(c.client.vmNodes, migratedHolderVMID)
-		}, "not found on node n2"},
+		}, "not found on node n2 by the cluster's config probe (migrating from node n1; the probe found the " +
+			"holder on no node)"},
 		{"probe error", func(c *migratedHolderCase) {
 			c.answerOnSource(errGuardSiteConfigGone)
 			previous := c.client.onNodeConfigRead
@@ -201,7 +222,7 @@ func TestObserveMigration_RefusesWhenTheProbeDoesNotPlaceTheHolderOnTheTarget(t 
 				}
 				return previous(node, vmid)
 			}
-		}, "placement not observed"},
+		}, "placement not observed for the move from node n1 to node n2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newMigratedHolderCase(t)
@@ -214,6 +235,39 @@ func TestObserveMigration_RefusesWhenTheProbeDoesNotPlaceTheHolderOnTheTarget(t 
 	}
 }
 
+// TestObserveMigration_RefusesATargetConfigThatCannotBeRead refuses a
+// migration whose probe placed the holder on the target when the guard's own
+// read of the target's config then fails. The refusal names both nodes, says
+// the read failed, scrubs the error text it carries, and is not retriable.
+func TestObserveMigration_RefusesATargetConfigThatCannotBeRead(t *testing.T) {
+	c := newMigratedHolderCase(t)
+	c.answerOnSource(errGuardSiteConfigGone)
+	previous := c.client.onNodeConfigRead
+	targetReads := 0
+	c.client.onNodeConfigRead = func(node string, vmid int) error {
+		if node == "n2" && vmid == migratedHolderVMID {
+			targetReads++
+			if targetReads > 1 {
+				return errMigrateCredentialLeak
+			}
+		}
+		return previous(node, vmid)
+	}
+	_, _, err := c.observeHolder()
+	const want = "migration target holder unavailable on node n2 (migrating from node n1) because the config " +
+		"read failed: "
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("observeMigratedHolder = %v, want a refusal containing %q", err, want)
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Fatalf("observeMigratedHolder = %v, want the credential scrubbed out", err)
+	}
+	var typed *cpierrors.Error
+	if errors.As(err, &typed) && typed.OkToRetry() {
+		t.Fatalf("observeMigratedHolder = %v, want the refusal's class unchanged, not retriable", err)
+	}
+}
+
 // TestObserveMigration_RefusesAHeldMigrateLockAsRetriable refuses a target
 // config that still carries PVE's migrate lock, with a retriable error.
 func TestObserveMigration_RefusesAHeldMigrateLockAsRetriable(t *testing.T) {
@@ -221,8 +275,9 @@ func TestObserveMigration_RefusesAHeldMigrateLockAsRetriable(t *testing.T) {
 	c.answerOnSource(errGuardSiteConfigGone)
 	c.client.state.configs[migratedHolderVMID]["lock"] = "migrate"
 	_, _, err := c.observeHolder()
-	if err == nil || !strings.Contains(err.Error(), "migrate lock") {
-		t.Fatalf("observeMigratedHolder = %v, want the migrate lock refusal", err)
+	if err == nil || !strings.Contains(err.Error(), "migrate lock") ||
+		!strings.Contains(err.Error(), "after the move from node n1") {
+		t.Fatalf("observeMigratedHolder = %v, want the migrate lock refusal naming the source node", err)
 	}
 	var typed *cpierrors.Error
 	if !errors.As(err, &typed) || !typed.OkToRetry() {

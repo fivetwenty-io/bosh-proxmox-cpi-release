@@ -947,24 +947,27 @@ func observeMigratedHolder(
 ) (string, string, error) {
 	source, sourceErr := deps.PVE.QEMU().Config(ctx, sourceNode, vmid)
 	if source != nil || !configReadAnswered(sourceErr) {
-		return "", "", fmt.Errorf("migration source holder absence not observed")
+		return "", "", migrationSourceNotEmpty(sourceNode, targetNode, source, sourceErr)
 	}
 	location, err := pve.FindVMByConfigProbe(ctx, deps.PVE, vmid)
 	if err != nil {
-		return "", "", fmt.Errorf("migration target holder placement not observed: %w", err)
+		return "", "", fmt.Errorf(
+			"migration target holder placement not observed for the move from node %s to node %s: %w",
+			sourceNode, targetNode, err)
 	}
 	if !location.Found || !location.FromConfig || location.Node != targetNode {
 		return "", "", fmt.Errorf(
-			"migration target holder not found on node %s by the cluster's config probe", targetNode)
+			"migration target holder not found on node %s by the cluster's config probe (migrating from node %s; %s)",
+			targetNode, sourceNode, configProbeFinding(location))
 	}
 	target, err := deps.PVE.QEMU().Config(ctx, targetNode, vmid)
 	if err != nil || target == nil {
-		return "", "", fmt.Errorf("migration target holder unavailable")
+		return "", "", migrationTargetUnavailable(sourceNode, targetNode, err)
 	}
 	if lock, _ := pve.ConfigString(target, "lock"); lock == "migrate" {
 		return "", "", cpierrors.Retriable(
-			"migration target holder %d on node %s still holds the migrate lock; retry once PVE clears it",
-			vmid, targetNode)
+			"migration target holder %d on node %s still holds the migrate lock after the move from node %s; "+
+				"retry once PVE clears it", vmid, targetNode, sourceNode)
 	}
 	slot, landed := "", ""
 	for field := range target {
@@ -990,6 +993,51 @@ func observeMigratedHolder(
 	}
 
 	return slot, landed, nil
+}
+
+// migrationSourceNotEmpty is the refusal for a migration whose source node
+// did not answer that the holder's config is gone. It names both nodes and
+// says what the source answered before any colon, so a caller that keeps only
+// the clause before the first colon still has them. The error text of a read
+// that failed follows the colon, scrubbed.
+func migrationSourceNotEmpty(sourceNode, targetNode string, source map[string]any, sourceErr error) error {
+	const refusal = "migration source holder absence not observed on node %s (migrating to node %s) because "
+	switch {
+	case source != nil:
+		return fmt.Errorf(refusal+"the source node answered with the holder's config", sourceNode, targetNode)
+	case sourceErr == nil:
+		return fmt.Errorf(refusal+"the source node's config read answered with neither a config nor an error",
+			sourceNode, targetNode)
+	default:
+		return fmt.Errorf(refusal+"the source node's config read returned another error: %s", sourceNode, targetNode,
+			log.ScrubMessage(sourceErr.Error()))
+	}
+}
+
+// migrationTargetUnavailable is the refusal for a migration whose target
+// node's config read failed or came back empty after the probe placed the
+// holder there. It names both nodes and the kind of failure before any colon.
+// The error text of a failed read follows the colon, scrubbed.
+func migrationTargetUnavailable(sourceNode, targetNode string, readErr error) error {
+	const refusal = "migration target holder unavailable on node %s (migrating from node %s) because the config read "
+	if readErr == nil {
+		return fmt.Errorf(refusal+"answered with no config", targetNode, sourceNode)
+	}
+	return fmt.Errorf(refusal+"failed: %s", targetNode, sourceNode, log.ScrubMessage(readErr.Error()))
+}
+
+// configProbeFinding says where a cluster-wide config probe placed a holder,
+// in fixed text that carries only a node name.
+func configProbeFinding(location pve.VMLocation) string {
+	switch {
+	case !location.Found:
+		return "the probe found the holder on no node"
+	case !location.FromConfig:
+		return fmt.Sprintf("the probe placed the holder on node %s from the cluster index, not from its config",
+			location.Node)
+	default:
+		return fmt.Sprintf("the probe found the holder on node %s", location.Node)
+	}
 }
 
 // observeHolderDeletion proves that the DeleteQemu the guard sent removed the
