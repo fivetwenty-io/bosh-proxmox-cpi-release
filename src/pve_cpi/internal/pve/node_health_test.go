@@ -845,6 +845,13 @@ func nhIdleManager(extra map[string]any) json.RawMessage {
 	return nhIdleManagerLRM(extra, map[string]int64{"pve1": 2, "pve2": 2, "pve3": 2})
 }
 
+// nhOneNodeRound makes nhIdleManagerLRM's last round know only pve1, as on a
+// one-node cluster or a standalone host.
+var nhOneNodeRound = map[string]any{
+	"master_node": "pve1",
+	"node_status": map[string]string{"pve1": "online"},
+}
+
 // nhIdleCRMStamp is the idle CRM's last round on the entry node's clock.
 const nhIdleCRMStamp = nhNow - 1908*3600
 
@@ -1116,7 +1123,8 @@ func TestNodeHealth_IdleNeedsStatusCurrentToConfirmIt(t *testing.T) {
 // Its copies of the other nodes' LRM entries are old then, so the idle verdict
 // needs every online node's LRM to be fresh and at least one fresh entry from
 // a node other than the entry node. A single node, which has no other copy
-// that could be newer, needs its own entry to be fresh.
+// that could be newer, needs its own entry to be fresh, and only membership
+// that proves a single node earns that rule.
 func TestNodeHealth_IdleNeedsFreshLRMsFromTheRestOfTheCluster(t *testing.T) {
 	t.Parallel()
 	const old = 1800
@@ -1167,28 +1175,52 @@ func TestNodeHealth_IdleNeedsFreshLRMsFromTheRestOfTheCluster(t *testing.T) {
 		"a one-node cluster with a fresh LRM": {
 			setup: func(c *nhCluster) {
 				c.rows = []json.RawMessage{nhClusterRow(1), nhNode("pve1", 1, true, "")}
-				c.manager = nhIdleManagerLRM(nil, map[string]int64{"pve1": 2})
+				c.manager = nhIdleManagerLRM(nhOneNodeRound, map[string]int64{"pve1": 2})
 			},
 		},
 		"a one-node cluster with an old LRM": {
 			setup: func(c *nhCluster) {
 				c.rows = []json.RawMessage{nhClusterRow(1), nhNode("pve1", 1, true, "")}
-				c.manager = nhIdleManagerLRM(nil, map[string]int64{"pve1": old})
+				c.manager = nhIdleManagerLRM(nhOneNodeRound, map[string]int64{"pve1": old})
 			},
-			want: "the LRM on pve1 has no fresh timestamp",
+			want: "the LRM on pve1 has no fresh timestamp; start pve-ha-lrm on pve1 if it is stopped",
 		},
 		"a one-node cluster with no LRM entry": {
 			setup: func(c *nhCluster) {
 				c.rows = []json.RawMessage{nhClusterRow(1), nhNode("pve1", 1, true, "")}
-				c.manager = nhIdleManagerLRM(nil, map[string]int64{})
+				c.manager = nhIdleManagerLRM(nhOneNodeRound, map[string]int64{})
 			},
-			want: "the entry node's LRM has no fresh timestamp",
+			want: "the LRM on pve1 has no fresh timestamp; start pve-ha-lrm on pve1 if it is stopped",
 		},
 		"a standalone host with a fresh LRM": {
 			setup: func(c *nhCluster) {
 				c.rows = []json.RawMessage{nhNode("pve1", 1, true, "")}
-				c.manager = nhIdleManagerLRM(nil, map[string]int64{"pve1": 2})
+				c.manager = nhIdleManagerLRM(nhOneNodeRound, map[string]int64{"pve1": 2})
 			},
+		},
+		"an empty cluster status on a cluster of three": {
+			setup: func(c *nhCluster) { c.rows = nil },
+			want:  "cluster status lists no node, so no LRM can show the copy is current",
+		},
+		"one node in cluster status while the last round knew three": {
+			setup: func(c *nhCluster) {
+				c.rows = []json.RawMessage{nhClusterRow(1), nhNode("pve1", 1, true, "")}
+			},
+			want: "the last round knew a node that cluster status does not list",
+		},
+		"one node in cluster status while the last round's LRMs name another": {
+			setup: func(c *nhCluster) {
+				c.rows = []json.RawMessage{nhClusterRow(1), nhNode("pve1", 1, true, "")}
+				c.manager = nhIdleManagerLRM(nhOneNodeRound, map[string]int64{"pve1": 2, "pve2": 2})
+			},
+			want: "the last round knew a node that cluster status does not list",
+		},
+		"one node in cluster status that is not the entry node": {
+			setup: func(c *nhCluster) {
+				c.rows = []json.RawMessage{nhClusterRow(1), nhNode("pve2", 1, false, "")}
+				c.manager = nhIdleManagerLRM(nhOneNodeRound, map[string]int64{"pve1": 2})
+			},
+			want: "cluster status does not list the entry node",
 		},
 	}
 	for name, tc := range cases {

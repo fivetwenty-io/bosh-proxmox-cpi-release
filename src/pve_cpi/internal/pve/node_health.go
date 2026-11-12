@@ -739,13 +739,19 @@ func crmIdleReason(
 // writes from the rest of the cluster. Every node that cluster status lists
 // online and the last round knows must have a fresh entry, which also catches
 // a dead LRM. A cluster that lists more than one node needs a fresh entry from
-// a node other than the entry node, and a single node, either a one-node
-// cluster or a standalone host, needs its own, because it has no other copy
-// that could be newer.
+// a node other than the entry node. A single node, either a one-node cluster
+// or a standalone host, needs its own, because it has no other copy that could
+// be newer. Only membership that proves a single node earns that rule: cluster
+// status must list exactly one node, that node must be the entry node, and the
+// last round must know no other node. An empty or missing membership proves
+// nothing, so it fails closed.
 func idleLRMGap(view *clusterView, entry string, mgr *managerView, now int64) string {
 	fresh := func(name string) bool {
 		lrm, ok := mgr.lrm[name]
 		return ok && lrm.Timestamp.Int() > 0 && timestampFresh(now, lrm.Timestamp.Int(), NodeHealthLRMMaxAge)
+	}
+	stopped := func(name string) string {
+		return "the LRM on " + name + " has no fresh timestamp; start pve-ha-lrm on " + name + " if it is stopped"
 	}
 	names := make([]string, 0, len(view.nodes))
 	for name := range view.nodes {
@@ -758,7 +764,7 @@ func idleLRMGap(view *clusterView, entry string, mgr *managerView, now int64) st
 			continue
 		}
 		if !fresh(name) {
-			return "the LRM on " + name + " has no fresh timestamp"
+			return stopped(name)
 		}
 		if name != entry {
 			freshPeer = true
@@ -769,11 +775,39 @@ func idleLRMGap(view *clusterView, entry string, mgr *managerView, now int64) st
 		return ""
 	case len(view.nodes) > 1:
 		return "no LRM on a node other than the entry node has a fresh timestamp"
+	case len(view.nodes) == 0:
+		return "cluster status lists no node, so no LRM can show the copy is current"
+	case !listsNode(view, entry):
+		return "cluster status does not list the entry node, so no LRM can show the copy is current"
+	case lastRoundKnowsOtherNode(mgr, entry):
+		return "the last round knew a node that cluster status does not list, so no LRM can show the copy is current"
 	case !fresh(entry):
-		return "the entry node's LRM has no fresh timestamp"
+		return stopped(entry)
 	default:
 		return ""
 	}
+}
+
+// listsNode reports whether cluster status lists name as a node.
+func listsNode(view *clusterView, name string) bool {
+	_, ok := view.nodes[name]
+	return ok
+}
+
+// lastRoundKnowsOtherNode reports whether the manager's last round named a
+// node other than entry in its node_status or lrm_status map.
+func lastRoundKnowsOtherNode(mgr *managerView, entry string) bool {
+	for name := range mgr.nodeStatus {
+		if name != entry {
+			return true
+		}
+	}
+	for name := range mgr.lrm {
+		if name != entry {
+			return true
+		}
+	}
+	return false
 }
 
 // idleStatusCurrentGap reads GET /cluster/ha/status/current and returns why it
