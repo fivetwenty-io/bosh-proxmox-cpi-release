@@ -20,6 +20,16 @@ func journalCacheConfig(mode config.DiscoveryMode, journal string) *config.CPICo
 	return cfg
 }
 
+// keepTheSiblingUncreated lets the group write in the directory that holds the
+// journal, so the CPI declines to create the endpoint-cache directory there and
+// the layer after it applies.
+func keepTheSiblingUncreated(t *testing.T, sibling string) {
+	t.Helper()
+	if err := os.Chmod(filepath.Dir(sibling), 0o770); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // journalBeside makes a journal directory and returns it with the path of the
 // endpoint-cache directory beside it, which it does not create.
 func journalBeside(t *testing.T) (journal, sibling string) {
@@ -67,6 +77,7 @@ func TestOpenEndpointCacheMissingSiblingFallsThroughToTheTemporaryDirectoryAtDeb
 			tmp := t.TempDir()
 			t.Setenv("TMPDIR", tmp)
 			journal, sibling := journalBeside(t)
+			keepTheSiblingUncreated(t, sibling)
 			got := openCacheFor(t, journalCacheConfig(mode, journal))
 			if got.cache == nil {
 				t.Fatalf("a missing sibling must fall through to a usable temporary directory; lines: %v",
@@ -79,11 +90,46 @@ func TestOpenEndpointCacheMissingSiblingFallsThroughToTheTemporaryDirectoryAtDeb
 				t.Errorf("the temporary directory was not used: %v", err)
 			}
 			if lines := linesAt(got.obs.All(), slog.LevelDebug, sibling); len(lines) != 1 ||
-				!strings.Contains(lines[0], "pve endpoints: cache directory "+sibling+" (journal layer)") {
-				t.Errorf("want one Debug line that names the missing sibling; got %v", lines)
+				!strings.Contains(lines[0], "pve endpoints: cache directory "+sibling+" (journal layer)") ||
+				!strings.Contains(lines[0], "does not create it because its parent directory") {
+				t.Errorf("want one Debug line that names the missing sibling and why it was not created; got %v",
+					lines)
 			}
 			if e, bad := anyLineAbove(got.obs.All(), slog.LevelDebug); bad {
 				t.Errorf("logged %q at %v, want the missing sibling at Debug only", e.Message, e.Level)
+			}
+		})
+	}
+}
+
+// A missing sibling whose parent belongs to the CPI's user and shares the
+// journal's mount is created at mode 0700 and holds the cache, and the Debug
+// line says it was created.
+func TestOpenEndpointCacheCreatesAMissingSiblingBesideTheJournal(t *testing.T) {
+	for _, mode := range []config.DiscoveryMode{config.DiscoveryModeAuto, config.DiscoveryModeOn} {
+		t.Run(string(mode), func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("TMPDIR", tmp)
+			journal, sibling := journalBeside(t)
+			got := openCacheFor(t, journalCacheConfig(mode, journal))
+			if got.cache == nil || got.plan.cacheUnusable {
+				t.Fatalf("cache %v, unusable %v, want an open cache in the created sibling; lines: %v",
+					got.cache, got.plan.cacheUnusable, got.obs.All())
+			}
+			info, err := os.Lstat(sibling)
+			if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+				t.Fatalf("the sibling is %v (err %v), want a directory with mode 0700", info, err)
+			}
+			if _, err := os.Lstat(temporaryCacheDir(tmp)); !os.IsNotExist(err) {
+				t.Errorf("the temporary directory was created: %v", err)
+			}
+			want := "pve endpoints: cache directory " + sibling + ", beside the allocation journal directory, " +
+				"created by this call"
+			if lines := linesAt(got.obs.All(), slog.LevelDebug, want); len(lines) != 1 {
+				t.Errorf("want one Debug line that says the sibling was created; lines: %v", got.obs.All())
+			}
+			if e, bad := anyLineAbove(got.obs.All(), slog.LevelDebug); bad {
+				t.Errorf("logged %q at %v", e.Message, e.Level)
 			}
 		})
 	}

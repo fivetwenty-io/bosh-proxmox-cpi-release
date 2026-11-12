@@ -445,10 +445,12 @@ func TestOverrideRefusesAFile(t *testing.T) {
 	requireUnsafe(t, resolve(t, Options{Override: file}), privatefile.ErrUnsafeFileType)
 }
 
-func TestOverrideIsNeverCreated(t *testing.T) {
+// An override that the CPI declines to create is a not-exist refusal of the
+// override layer, and the search ends there as it always has.
+func TestADeclinedOverrideIsNotCreatedAndDoesNotFallThrough(t *testing.T) {
 	parent := temporaryParent(t)
 	missing := filepath.Join(t.TempDir(), "absent")
-	choice := resolve(t, Options{Override: missing})
+	choice := resolve(t, Options{Override: missing, hooks: declineCreation})
 	if choice.Usable() || !errors.Is(choice.Err, os.ErrNotExist) {
 		t.Fatalf("usable = %v, reason = %v, want a not-exist refusal", choice.Usable(), choice.Err)
 	}

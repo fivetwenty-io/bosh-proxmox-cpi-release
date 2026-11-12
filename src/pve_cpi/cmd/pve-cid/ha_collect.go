@@ -1318,17 +1318,20 @@ func (c *haCollector) ownedResource(sid string) bool {
 // cacheDirectoryFindings reports a cache directory the CPI cannot use as it
 // stands. The directory holds the cache files and the HA recovery episode
 // record, and the CPI chooses it in layers. The first is pve.endpoint_cache_dir,
-// the next is the endpoint-cache directory beside the allocation journal when
-// that exists, and the last is a directory under the temporary directory that
-// the CPI creates. A layer that applies and fails the private checks ends the
-// search, which leaves the record unwritten, so a recovery grace window never
-// starts and the dead-node handover never happens. The doctor asks the same
-// question the episode store asks, for every layer, without creating anything,
-// and it asks it for the CPI's user, as cacheJudge describes, because the
-// private checks require the user that runs them as the owner. A
-// pve.endpoint_cache_dir that does not exist is the one refusal that falls
-// through to the layers after it, and creating it later moves the record and
-// restarts a running grace window once.
+// the next is the endpoint-cache directory beside the allocation journal, and
+// the last is a directory under the temporary directory that the CPI creates.
+// The CPI also creates a missing directory of the first two layers when its
+// parent belongs to the CPI's user and shares a mount with a directory that
+// persists, and the doctor says whether it would and, when it would not, why. A
+// layer that applies and fails the private checks ends the search, which
+// leaves the record unwritten, so a recovery grace window never starts and the
+// dead-node handover never happens. The doctor asks the same question the
+// episode store asks, for every layer, without creating anything, and it asks
+// it for the CPI's user, as cacheJudge describes, because the private checks
+// require the user that runs them as the owner. A pve.endpoint_cache_dir that
+// does not exist and that the CPI does not create is the one refusal that
+// falls through to the layers after it, and creating it later moves the record
+// and restarts a running grace window once.
 func (c *haCollector) cacheDirectoryFindings() {
 	c.cacheFindingsAs(c.cacheJudge())
 }
@@ -1349,7 +1352,12 @@ func (c *haCollector) cacheFindingsAs(j cacheJudge) {
 	}
 	choice, caveat := j.probe(dir)
 	defer func() { _ = choice.Close() }()
+	if c.cfg.EndpointCacheDir == "" {
+		c.siblingCreation(choice, j)
+	}
 	switch {
+	case choice.Layer == endpointcache.LayerJournal && createdOnFirstUse(choice):
+		// siblingCreation said that the CPI creates it.
 	case choice.Layer == endpointcache.LayerTemporary && !j.checksTemporary():
 		// The directory the CPI's user would have is not one the doctor can
 		// see, so nothing is said about it.
@@ -1361,6 +1369,76 @@ func (c *haCollector) cacheFindingsAs(j cacheJudge) {
 	default:
 		c.rep.advise(haKindCacheDirectory, choice.Path, "%s%s", cacheRefusalText(choice), j.ownerNote(choice.Err))
 	}
+}
+
+// mountCaveat is what every finding that says the CPI creates a directory adds,
+// because the CPI may run in a BPM mount namespace that this check cannot see.
+const mountCaveat = "this check sees the host's mounts, and under BPM the CPI creates it only when that parent " +
+	"directory is mounted into the worker, as it is when director.cpi_additional_volumes lists it or a " +
+	"directory above it"
+
+// siblingCreation reports a missing directory beside the allocation journal,
+// with what the CPI does about it. choice is the doctor's probe of the layers
+// with no override.
+func (c *haCollector) siblingCreation(choice endpointcache.Choice, j cacheJudge) {
+	if choice.Layer == endpointcache.LayerJournal && createdOnFirstUse(choice) {
+		c.rep.advise(haKindCacheDirectory, choice.Path,
+			"%s does not exist, and the CPI creates it with mode 0700 on first use, because its parent "+
+				"directory belongs to uid %d, which the CPI runs as, and sits on the same mount as the allocation "+
+				"journal directory; %s; cpi provision-journal also creates it%s",
+			cacheDirectoryName(endpointcache.LayerJournal), j.uid, mountCaveat, j.judgedAsNote())
+		return
+	}
+	for _, declined := range choice.Declined {
+		var notCreated *endpointcache.NotCreatedError
+		if declined.Layer != endpointcache.LayerJournal || !errors.As(declined, &notCreated) {
+			continue
+		}
+		c.rep.advise(haKindCacheDirectory, declined.Path,
+			"%s does not exist, and the CPI does not create it because %v, so the cache and the HA recovery "+
+				"episode record use %s instead; run cpi provision-journal, or create it with mode 0700 for the "+
+				"CPI's user%s", cacheDirectoryName(endpointcache.LayerJournal), notCreated.Reason,
+			ha.FallbackDescription(choice.Layer), j.judgedAsNote())
+	}
+}
+
+// judgedAsNote is what a finding about creating a directory adds when no
+// allocation journal directory names the CPI's user, because the doctor then
+// judged as its own user.
+func (j cacheJudge) judgedAsNote() string {
+	if j.known {
+		return ""
+	}
+	return fmt.Sprintf("; this check judged as its own user, uid %d, because no allocation journal directory "+
+		"names the CPI's user", j.doctor)
+}
+
+// createdOnFirstUse reports whether choice is the probe's refusal of a missing
+// directory that the CPI creates the first time it chooses it. The check must
+// not hand a nil *Refusal to errors.Is, which would call its Unwrap method.
+func createdOnFirstUse(choice endpointcache.Choice) bool {
+	return choice.Err != nil && errors.Is(choice.Err, endpointcache.ErrCreatedOnFirstUse)
+}
+
+// overrideCreation says what the CPI does with a pve.endpoint_cache_dir that
+// does not exist. creates is true when it creates the directory. Otherwise
+// reason says why it does not, or is empty when the check cannot tell, which is
+// when no journal directory names the CPI's user and the doctor cannot see the
+// CPI's temporary directory, whose mount decides it.
+func (j cacheJudge) overrideCreation(dir endpointcache.DirOptions) (creates bool, reason string) {
+	if dir.JournalDir == "" && !j.checksTemporary() {
+		return false, ""
+	}
+	choice := dir.ProbeAs(j.uid)
+	defer func() { _ = choice.Close() }()
+	if createdOnFirstUse(choice) {
+		return true, ""
+	}
+	var notCreated *endpointcache.NotCreatedError
+	if choice.Err != nil && errors.As(choice.Err, &notCreated) {
+		return false, notCreated.Reason.Error()
+	}
+	return false, ""
 }
 
 // missingDirectory reports whether choice names a directory that does not exist,
@@ -1605,8 +1683,29 @@ func (c *haCollector) missingOverride(path string, dir endpointcache.DirOptions,
 			return
 		}
 	}
+	creates, reason := j.overrideCreation(dir)
+	if creates {
+		anchor := "the allocation journal directory"
+		if dir.JournalDir == "" {
+			anchor = "the CPI's temporary directory"
+		}
+		c.rep.advise(haKindCacheDirectory, path,
+			"pve.endpoint_cache_dir does not exist, and the CPI creates it with mode 0700 on first use, because "+
+				"its parent directory belongs to uid %d, which the CPI runs as, and sits on the same mount as %s; "+
+				"%s; the HA recovery episode record then sits in it, so a grace window that is running restarts "+
+				"once%s", j.uid, anchor, mountCaveat, j.judgedAsNote())
+		return
+	}
+	missing := "pve.endpoint_cache_dir does not exist"
+	switch {
+	case reason != "":
+		missing += ", and the CPI does not create it because " + reason + j.judgedAsNote() + ","
+	default:
+		missing += ", and this check cannot tell whether the CPI creates it, because with no allocation journal " +
+			"directory that depends on the CPI's temporary directory, which this check does not see,"
+	}
 	if _, text, blocked := j.journalGap(dir); text != "" {
-		c.rep.advise(haKindCacheDirectory, path, "pve.endpoint_cache_dir does not exist, and %s", text)
+		c.rep.advise(haKindCacheDirectory, path, "%s and %s", missing, text)
 		if blocked {
 			return
 		}
@@ -1614,22 +1713,23 @@ func (c *haCollector) missingOverride(path string, dir endpointcache.DirOptions,
 	fallback, caveat := j.probe(dir.WithoutOverride())
 	defer func() { _ = fallback.Close() }()
 	temporary := fallback.Layer == endpointcache.LayerTemporary
-	toBeCreated := temporary && (!j.checksTemporary() || missingDirectory(fallback))
+	toBeCreated := temporary && (!j.checksTemporary() || missingDirectory(fallback)) ||
+		fallback.Layer == endpointcache.LayerJournal && createdOnFirstUse(fallback)
 	switch {
 	case caveat != "" && !toBeCreated:
 		c.rep.advise(haKindCacheDirectory, path,
-			"pve.endpoint_cache_dir does not exist, so the HA recovery episode record goes to %s instead, and %s",
-			ha.FallbackDescription(fallback.Layer), caveat)
+			"%s so the HA recovery episode record goes to %s instead, and %s",
+			missing, ha.FallbackDescription(fallback.Layer), caveat)
 	case fallback.Usable() || toBeCreated:
 		c.rep.advise(haKindCacheDirectory, path,
-			"pve.endpoint_cache_dir does not exist, so the HA recovery episode record sits in %s instead; create "+
-				"it with mode 0700, and note that doing so moves the record and restarts any grace window that "+
-				"is running", ha.FallbackDescription(fallback.Layer))
+			"%s so the HA recovery episode record sits in %s instead; create it with mode 0700, and note that "+
+				"doing so moves the record and restarts any grace window that is running",
+			missing, ha.FallbackDescription(fallback.Layer))
 	case fallback.Err != nil:
 		c.rep.advise(haKindCacheDirectory, path,
-			"pve.endpoint_cache_dir does not exist, and %s cannot be used either (%v), so the CPI keeps no HA "+
-				"recovery record and the dead-node handover cannot start; create pve.endpoint_cache_dir with "+
-				"mode 0700", ha.FallbackDescription(fallback.Layer), fallback.Err.Err)
+			"%s and %s cannot be used either (%v), so the CPI keeps no HA recovery record and the dead-node "+
+				"handover cannot start; create pve.endpoint_cache_dir with mode 0700",
+			missing, ha.FallbackDescription(fallback.Layer), fallback.Err.Err)
 	}
 }
 

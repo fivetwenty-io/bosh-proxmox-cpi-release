@@ -124,7 +124,11 @@ func openEndpointCache(cfg *config.CPIConfig, plan *endpointPlan, logger *log.Lo
 	if !choice.Usable() {
 		return off(refusalText(choice))
 	}
-	logger.LogAttrs(ctx, log.LevelDebug, "pve endpoints: cache directory "+choice.Path+", "+layerText(choice.Layer))
+	chosen := "pve endpoints: cache directory " + choice.Path + ", " + layerText(choice.Layer)
+	if choice.Created {
+		chosen += ", created by this call"
+	}
+	logger.LogAttrs(ctx, log.LevelDebug, chosen)
 
 	user, credential := cacheCredential(cfg)
 	key := endpointcache.KeyConfig{

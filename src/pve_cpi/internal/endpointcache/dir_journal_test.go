@@ -90,19 +90,27 @@ func TestMissingSiblingFallsThroughToTheTemporaryLayerWithANote(t *testing.T) {
 	parent := temporaryParent(t)
 	journal, sibling := journalSibling(t)
 	makePrivateDirectory(t, journal)
-	choice := resolve(t, Options{JournalDir: journal})
+	choice := resolve(t, Options{JournalDir: journal, hooks: declineCreation})
 	if choice.Layer != LayerTemporary || choice.Path != temporaryPath(parent) || !choice.Usable() {
 		t.Fatalf("choice = %s %s usable %v, want the temporary layer", choice.Layer, choice.Path, choice.Usable())
 	}
 	if len(choice.Notes) != 1 {
 		t.Fatalf("notes = %q, want one", choice.Notes)
 	}
-	for _, want := range []string{sibling, "journal layer", "missing", "next layer"} {
+	for _, want := range []string{sibling, "journal layer", "missing", "next layer", "does not create it because",
+		declineText} {
 		if !strings.Contains(choice.Notes[0], want) {
 			t.Errorf("note %q lacks %q", choice.Notes[0], want)
 		}
 	}
 	requireAbsent(t, sibling, "the layer created the sibling at runtime")
+	if len(choice.Declined) != 1 || choice.Declined[0].Layer != LayerJournal {
+		t.Fatalf("declined = %+v, want the journal layer's refusal", choice.Declined)
+	}
+	var notCreated *NotCreatedError
+	if !errors.As(choice.Declined[0], &notCreated) || notCreated.Path != sibling {
+		t.Errorf("declined cause %v, want a NotCreatedError for %s", choice.Declined[0].Err, sibling)
+	}
 }
 
 func TestMissingSiblingAndJournalFallThroughWithoutCreatingEither(t *testing.T) {

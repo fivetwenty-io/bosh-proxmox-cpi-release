@@ -916,16 +916,21 @@ func TestCollectReportsACacheDirectoryTheCPICannotUse(t *testing.T) {
 	if err := os.Symlink(private, link); err != nil {
 		t.Fatal(err)
 	}
-	missing := filepath.Join(t.TempDir(), "absent")
+	// The parent is missing too, so the CPI does not create the directory.
+	missing := filepath.Join(t.TempDir(), "no-parent", "absent")
+	creatable := filepath.Join(t.TempDir(), "absent")
 
 	cases := map[string]struct {
 		dir       string
 		fragments []string
 	}{
 		"mode wider than 0700": {wide, []string{"mode 0755", "chmod 0700", "dead-node handover cannot start"}},
-		"missing directory":    {missing, []string{"does not exist", "restarts any grace window"}},
-		"not a directory":      {file, []string{"not a directory"}},
-		"symbolic link":        {link, []string{"symbolic link"}},
+		"missing directory": {missing, []string{"does not exist", "does not create it because its parent directory",
+			"restarts any grace window"}},
+		"missing directory the CPI creates": {creatable, []string{"creates it with mode 0700 on first use",
+			"same mount as the CPI's temporary directory", "director.cpi_additional_volumes"}},
+		"not a directory": {file, []string{"not a directory"}},
+		"symbolic link":   {link, []string{"symbolic link"}},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1140,15 +1145,98 @@ func TestCollectLeavesTheTemporaryDirectoryToTheCPIsUser(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	journal, _ := journalCacheLayout(t, 0)
+	journal, sibling := journalCacheLayout(t, 0)
 	makeDir(t, journal)
+	// The group may write beside the journal, so the CPI does not create the
+	// directory there and the temporary layer applies.
+	if err := os.Chmod(filepath.Dir(journal), 0o770); err != nil {
+		t.Fatal(err)
+	}
 	withJournal := haCfg("auto", "none")
 	withJournal.StorageAllocationJournalDir = journal
 
-	wantNone(t, cacheFindingsAs(withJournal, doctor), haKindCacheDirectory)
+	r := cacheFindingsAs(withJournal, doctor)
+	want(t, r, haKindCacheDirectory, haSeverityAdvice, sibling, "does not create it because", "temporary cache directory")
+	for _, f := range findings(r, haKindCacheDirectory) {
+		if strings.Contains(f.Subject, "pve_cpi-endpoint-cache.") || strings.Contains(f.Detail, "mode 0755") {
+			t.Errorf("a doctor that is not the CPI's user judged the temporary directory: %+v", f)
+		}
+	}
 	wantNone(t, cacheFindingsAs(haCfg("auto", "none"), doctor), haKindCacheDirectory)
-	want(t, cacheFindingsAs(withJournal, os.Geteuid()), haKindCacheDirectory, haSeverityAdvice,
+	want(t, cacheFindingsAs(haCfg("auto", "none"), os.Geteuid()), haKindCacheDirectory, haSeverityAdvice,
 		"pve_cpi-endpoint-cache."+itoa(os.Geteuid()), "mode 0755")
+}
+
+// A missing directory the CPI would create on first use is reported as such,
+// judged as the owner of the journal directory, and one it would not create
+// names the reason, so the operator knows what the next call does.
+func TestCollectSaysWhetherTheCPICreatesAMissingDirectory(t *testing.T) {
+	doctor := otherDoctor(t)
+	t.Setenv("TMPDIR", t.TempDir())
+	cpiUser := "uid " + itoa(os.Geteuid())
+
+	t.Run("directory beside the journal is created", func(t *testing.T) {
+		journal, sibling := journalCacheLayout(t, 0)
+		makeDir(t, journal)
+		cfg := haCfg("auto", "none")
+		cfg.StorageAllocationJournalDir = journal
+		r := cacheFindingsAs(cfg, doctor)
+		want(t, r, haKindCacheDirectory, haSeverityAdvice, sibling, "creates it with mode 0700 on first use",
+			cpiUser, "same mount as the allocation journal directory", "director.cpi_additional_volumes")
+		if n := len(findings(r, haKindCacheDirectory)); n != 1 {
+			t.Errorf("%d findings, want one: %+v", n, r.Findings)
+		}
+		if _, err := os.Lstat(sibling); !os.IsNotExist(err) {
+			t.Errorf("the doctor created the directory: %v", err)
+		}
+	})
+
+	t.Run("directory beside the journal is not created", func(t *testing.T) {
+		journal, sibling := journalCacheLayout(t, 0)
+		makeDir(t, journal)
+		if err := os.Chmod(filepath.Dir(journal), 0o770); err != nil {
+			t.Fatal(err)
+		}
+		cfg := haCfg("auto", "none")
+		cfg.StorageAllocationJournalDir = journal
+		want(t, cacheFindingsAs(cfg, doctor), haKindCacheDirectory, haSeverityAdvice, sibling,
+			"does not create it because its parent directory", "mode 0770", "cpi provision-journal")
+	})
+
+	t.Run("override is created", func(t *testing.T) {
+		journal, _ := journalCacheLayout(t, 0o700)
+		makeDir(t, journal)
+		override := filepath.Join(filepath.Dir(journal), "override")
+		cfg := haCfg("auto", "none")
+		cfg.StorageAllocationJournalDir = journal
+		cfg.EndpointCacheDir = override
+		r := cacheFindingsAs(cfg, doctor)
+		want(t, r, haKindCacheDirectory, haSeverityAdvice, override, "creates it with mode 0700 on first use",
+			cpiUser, "same mount as the allocation journal directory", "restarts once")
+		if got := findings(r, haKindCacheDirectory)[0].Detail; strings.Contains(got, "judged as its own user") {
+			t.Errorf("the journal names the CPI's user, so the finding must not say otherwise: %q", got)
+		}
+		if _, err := os.Lstat(override); !os.IsNotExist(err) {
+			t.Errorf("the doctor created the directory: %v", err)
+		}
+	})
+
+	t.Run("override owned by another user's parent is not created", func(t *testing.T) {
+		journal, _ := journalCacheLayout(t, 0o700)
+		makeDir(t, journal)
+		override := filepath.Join(filepath.Dir(journal), "override")
+		cfg := haCfg("auto", "none")
+		cfg.StorageAllocationJournalDir = journal
+		cfg.EndpointCacheDir = override
+		c := &haCollector{cfg: cfg, euid: doctor, rep: &haReport{Findings: []haFinding{}}}
+		j := c.cacheJudge()
+		j.uid = os.Geteuid() + 1
+		j.ancestors = func(string, int) (*searchBlock, error) { return nil, nil }
+		c.cacheFindingsAs(j)
+		want(t, c.rep, haKindCacheDirectory, haSeverityAdvice, override,
+			"does not create it because its parent directory", "is owned by "+cpiUser,
+			"the CPI runs as uid "+itoa(os.Geteuid()+1))
+	})
 }
 
 // With no journal to name the CPI's user, a directory that fails only because

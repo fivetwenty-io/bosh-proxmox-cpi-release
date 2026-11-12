@@ -41,7 +41,8 @@ func TestDirOptionsResolveChoosesLikeResolve(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	missing := filepath.Join(t.TempDir(), "absent")
+	// The parent is missing too, so the CPI does not create the override.
+	missing := filepath.Join(t.TempDir(), "no-parent", "absent")
 	refused := OptionsFor(&config.CPIConfig{EndpointCacheDir: missing}).Resolve()
 	if refused.Usable() || refused.Layer != LayerOverride {
 		t.Fatalf("a missing override resolved to %+v, want a refusal by the override layer", refused)

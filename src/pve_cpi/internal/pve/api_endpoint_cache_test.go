@@ -422,7 +422,9 @@ func TestOpenEndpointCachePasswordUnderAutoCreatesNoFile(t *testing.T) {
 }
 
 func TestOpenEndpointCacheUnusableDirectoryLevels(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "missing")
+	// The parent of the missing directory is missing too, so the CPI does not
+	// create it.
+	missing := filepath.Join(t.TempDir(), "no-parent", "missing")
 	loose := filepath.Join(t.TempDir(), "loose")
 	if err := os.Mkdir(loose, 0o755); err != nil {
 		t.Fatal(err)

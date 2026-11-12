@@ -299,7 +299,9 @@ func TestResolveChecksTheJournalBeforeTheTemporaryLayerCreatesItsDirectory(t *te
 	}
 	t.Setenv("TMPDIR", filepath.Join(alias, "journal", "tmp"))
 	guard := &recordingGuard{}
-	choice := Resolve(Options{JournalDir: journal, Guard: guard})
+	// The directory beside the journal is not created, so the temporary layer
+	// answers.
+	choice := Resolve(Options{JournalDir: journal, Guard: guard, hooks: declineCreation})
 	if choice.Usable() {
 		_ = choice.Close()
 		t.Fatal("the temporary directory inside the journal is usable")
@@ -320,7 +322,7 @@ func TestResolveChecksTheJournalBeforeTheTemporaryLayerCreatesItsDirectory(t *te
 		t.Fatal(err)
 	}
 	t.Setenv("TMPDIR", other)
-	choice = Resolve(Options{JournalDir: journal, Guard: guard})
+	choice = Resolve(Options{JournalDir: journal, Guard: guard, hooks: declineCreation})
 	defer func() { _ = choice.Close() }()
 	if !choice.Usable() || len(guard.paths) != 1 {
 		t.Errorf("usable %v, guard paths %v, want a usable directory the caller's guard was asked about once",

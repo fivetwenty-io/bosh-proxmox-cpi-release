@@ -95,8 +95,8 @@ var episodePolicy = privatefile.Policy{
 // stays busy past episodeLockWait gives the same answer as an unreadable
 // record: the clock starts at this observation, and the error says why.
 //
-// A pve.endpoint_cache_dir that does not exist is the one refusal that does
-// not end the search. A record that could never be written would keep the
+// A pve.endpoint_cache_dir that does not exist, and that endpointcache.Resolve
+// declines to create, is the one refusal that does not end the search. A record that could never be written would keep the
 // clock at zero on every call and so remove the handover rather than delay it,
 // so the store falls back to the layers after the override, logs a Warn line
 // that names the missing directory, and records the episode there. ForCall
@@ -236,8 +236,9 @@ func (s *EpisodeStore) resolve() endpointcache.Choice {
 // warnMissingOverride logs the Warn line for a missing override directory. The
 // line promises the fallback only when the fallback gave a directory, and it
 // names the layer that answered, because the fallback is the directory beside
-// the allocation journal when that exists and the temporary directory
-// otherwise.
+// the allocation journal when that exists or is created and the temporary
+// directory otherwise. The error attribute carries the reason Resolve declined
+// to create the override.
 func (s *EpisodeStore) warnMissingOverride(missing, fallback endpointcache.Choice) {
 	if s == nil || s.Log == nil {
 		return

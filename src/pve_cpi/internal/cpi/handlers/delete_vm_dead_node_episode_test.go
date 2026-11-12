@@ -26,7 +26,8 @@ func TestDeadNodeDelete_AMissingCacheDirectoryIsWarnedAboutOncePerCall(t *testin
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(tmp) })
 	t.Setenv("TMPDIR", tmp)
-	missing := filepath.Join(t.TempDir(), "absent")
+	// The parent is missing too, so the CPI does not create the override.
+	missing := filepath.Join(t.TempDir(), "no-parent", "absent")
 	logger, logs := log.NewObservedLogger(slog.LevelDebug)
 
 	// An earlier retry, an hour ago, started the episode's window in the
@@ -56,6 +57,6 @@ func TestDeadNodeDelete_AMissingCacheDirectoryIsWarnedAboutOncePerCall(t *testin
 		t.Errorf("the call logged %d missing-directory warnings, want one", warned)
 	}
 	if _, err := os.Stat(missing); !os.IsNotExist(err) {
-		t.Errorf("the override directory must never be created: %v", err)
+		t.Errorf("an override the CPI declines to create must stay missing: %v", err)
 	}
 }

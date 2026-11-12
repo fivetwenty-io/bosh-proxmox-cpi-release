@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,9 +83,18 @@ func TestATemporaryDirectoryThatOverlapsTheJournalIsRefusedBeforeItIsCreated(t *
 		}
 		return dir
 	}
+	// shared lets the group write in root, so the CPI does not create the
+	// directory beside a journal there and the temporary layer meets the guard.
+	shared := func(t *testing.T, root string) {
+		t.Helper()
+		if err := os.Chmod(root, 0o770); err != nil {
+			t.Fatal(err)
+		}
+	}
 	layouts := []layout{
 		{"the temporary directory is inside the journal", func(t *testing.T, root string) (string, string) {
 			journal := mkdir(t, filepath.Join(root, "journal"))
+			shared(t, root)
 			return mkdir(t, filepath.Join(journal, "tmp")), journal
 		}, func(tmp, _ string) string { return tmp }},
 		{"the temporary directory is a symlink into the journal", func(t *testing.T, root string) (string, string) {
@@ -94,6 +104,7 @@ func TestATemporaryDirectoryThatOverlapsTheJournalIsRefusedBeforeItIsCreated(t *
 			if err := os.Symlink(journal, link); err != nil {
 				t.Fatal(err)
 			}
+			shared(t, root)
 			return filepath.Join(link, "tmp"), journal
 		}, func(_, journal string) string { return filepath.Join(journal, "tmp") }},
 		{"the journal is the layer's own directory and is missing", func(t *testing.T, root string) (string, string) {
@@ -123,7 +134,8 @@ func TestATemporaryDirectoryThatOverlapsTheJournalIsRefusedBeforeItIsCreated(t *
 					t.Fatalf("cache %v and unusable %v, want no cache and an unusable directory", got.cache,
 						got.plan.cacheUnusable)
 				}
-				if lines := linesAt(got.obs.All(), level, "allocation journal directory"); len(lines) != 1 {
+				lines := linesAt(got.obs.All(), level, "(temporary layer)")
+				if len(lines) != 1 || !strings.Contains(lines[0], "allocation journal directory") {
 					t.Errorf("lines at %v = %v; all: %v", level, lines, got.obs.All())
 				}
 				if names, err := readDirNames(l.left(tmp, journal)); err != nil || len(names) != 0 {
@@ -184,6 +196,11 @@ func TestATemporaryDirectoryBesideTheJournalIsCreatedAndUsed(t *testing.T) {
 	tmp := privateTempRoot(t)
 	journal := filepath.Join(filepath.Dir(tmp), "journal")
 	if err := os.Mkdir(journal, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The group may write beside the journal, so the CPI does not create the
+	// directory there and the temporary layer applies.
+	if err := os.Chmod(filepath.Dir(journal), 0o770); err != nil {
 		t.Fatal(err)
 	}
 	cfg := cacheTestConfig(config.DiscoveryModeOn, "")

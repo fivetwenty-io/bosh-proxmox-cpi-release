@@ -41,9 +41,10 @@ type ProfileCacheOptions struct {
 	// endpointcache.OptionsFor. The cache follows the endpoint cache's
 	// directory. That is pve.endpoint_cache_dir when it is set. Otherwise it is
 	// the endpoint-cache directory beside the allocation journal directory
-	// when that already exists, and the per-user temporary directory when it
-	// does not. A missing override directory gives no cache, because the
-	// override is the only directory the CPI uses when it is set. A directory
+	// when that exists or endpointcache.Resolve creates it, and the per-user
+	// temporary directory when it does neither. A missing override directory
+	// that Resolve does not create gives no cache, because the override is the
+	// only directory the CPI uses when it is set. A directory
 	// that overlaps the allocation journal directory gives no cache either,
 	// because endpointcache.Resolve refuses it for every cache.
 	Dir endpointcache.DirOptions

@@ -259,6 +259,13 @@ func temporaryCacheDir(t *testing.T) string {
 	return filepath.Join(tmp, "pve_cpi-endpoint-cache."+strconv.Itoa(os.Geteuid()))
 }
 
+// unrecreatableOverride returns an override path the CPI does not create,
+// because its parent does not exist, so the record falls back from it.
+func unrecreatableOverride(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "missing-parent", "missing")
+}
+
 func TestEpisodeStore_MissingOverrideDirectoryFallsBackToTheTemporaryLayer(t *testing.T) {
 	temporary := temporaryCacheDir(t)
 	missing := filepath.Join(t.TempDir(), "missing-parent", "cache")
@@ -301,9 +308,49 @@ func TestEpisodeStore_MissingOverrideDirectoryFallsBackToTheTemporaryLayer(t *te
 		if !strings.Contains(e.Message, "pve.endpoint_cache_dir does not exist") || e.Attrs["path"] != missing {
 			t.Errorf("warning %+v does not name the missing override directory %s", e, missing)
 		}
+		if why, _ := e.Attrs["error"].(string); !strings.Contains(why, "does not create it because its parent "+
+			"directory") || !strings.Contains(why, "does not exist") {
+			t.Errorf("warning %+v does not say why the CPI did not create the override", e)
+		}
 	}
 	if warns != 2 {
 		t.Errorf("logged %d warnings for two calls, want one per call", warns)
+	}
+}
+
+// A missing override whose parent belongs to the CPI's user and sits on the
+// journal directory's mount is created, so the record sits in it, nothing
+// falls back, and no warning is logged.
+func TestEpisodeStore_AMissingOverrideTheCPICanCreateHoldsTheRecord(t *testing.T) {
+	temporary := temporaryCacheDir(t)
+	parent := t.TempDir()
+	journal := filepath.Join(parent, "allocations")
+	if err := os.Mkdir(journal, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	override := filepath.Join(parent, "cache")
+	logger, logs := log.NewObservedLogger(slog.LevelDebug)
+	clk := &episodeClock{t: time.Unix(1_800_000_000, 0)}
+	store := &ha.EpisodeStore{
+		Dir: endpointcache.DirOptions{Override: override, JournalDir: journal}, Log: logger, Now: clk.now,
+	}
+	if _, err := store.Observe("vm:101", "uid-a"); err != nil {
+		t.Fatal(err)
+	}
+	clk.t = clk.t.Add(5 * time.Minute)
+	second, err := store.Observe("vm:101", "uid-a")
+	if err != nil || !second.Recorded || second.Elapsed() != 5*time.Minute {
+		t.Fatalf("second observation recorded=%v elapsed=%s err=%v, want the clock to run", second.Recorded,
+			second.Elapsed(), err)
+	}
+	if _, err := os.Lstat(filepath.Join(override, ha.EpisodeFileName)); err != nil {
+		t.Errorf("the record must sit in the created override: %v", err)
+	}
+	if _, err := os.Lstat(temporary); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the temporary layer was used although the override was created: %v", err)
+	}
+	if warns := warnLines(logs); len(warns) != 0 {
+		t.Errorf("a created override logged %+v, want no warning", warns)
 	}
 }
 
@@ -334,7 +381,7 @@ func TestEpisodeStore_AnOverrideThatFailsThePrivateChecksDoesNotFallBack(t *test
 }
 
 func TestEpisodeStore_AMissingOverrideWithNoUsableFallbackStillAnswers(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "missing")
+	missing := unrecreatableOverride(t)
 	// The temporary directory is relative, so the fallback is refused too.
 	t.Setenv("TMPDIR", "relative")
 	store := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: missing}}
@@ -484,7 +531,7 @@ func TestEpisodeNameIsAValidDisplayName(t *testing.T) {
 }
 
 func TestEpisodeStore_TheWarnSaysWhenTheFallbackFailsToo(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "missing")
+	missing := unrecreatableOverride(t)
 	// The temporary directory is relative, so the fallback is refused too.
 	t.Setenv("TMPDIR", "relative")
 	logger, logs := log.NewObservedLogger(slog.LevelDebug)
@@ -510,7 +557,7 @@ func TestEpisodeStore_TheWarnSaysWhenTheFallbackFailsToo(t *testing.T) {
 
 func TestEpisodeStore_TheWarnNamesTheFallbackThatWorked(t *testing.T) {
 	temporary := temporaryCacheDir(t)
-	missing := filepath.Join(t.TempDir(), "missing")
+	missing := unrecreatableOverride(t)
 	logger, logs := log.NewObservedLogger(slog.LevelDebug)
 	store := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: missing}, Log: logger}
 	if _, err := store.Observe("vm:101", "uid-a"); err != nil {
@@ -527,7 +574,7 @@ func TestEpisodeStore_TheWarnNamesTheFallbackThatWorked(t *testing.T) {
 
 func TestEpisodeStore_ForCallWarnsOnceHoweverManyTimesItObserves(t *testing.T) {
 	temporaryCacheDir(t)
-	missing := filepath.Join(t.TempDir(), "missing")
+	missing := unrecreatableOverride(t)
 	logger, logs := log.NewObservedLogger(slog.LevelDebug)
 	base := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: missing}, Log: logger}
 
@@ -560,7 +607,7 @@ func TestEpisodeStore_ForCallWarnsOnceHoweverManyTimesItObserves(t *testing.T) {
 func TestEpisodeStore_TheWarnNamesTheSiblingBesideTheJournalWhenThatIsTheFallback(t *testing.T) {
 	temporary := temporaryCacheDir(t)
 	journal, sibling := journalBesideCache(t)
-	missing := filepath.Join(t.TempDir(), "missing")
+	missing := unrecreatableOverride(t)
 	logger, logs := log.NewObservedLogger(slog.LevelDebug)
 	store := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: missing, JournalDir: journal}, Log: logger}
 	if _, err := store.Observe("vm:101", "uid-a"); err != nil {
@@ -592,7 +639,7 @@ func TestEpisodeStore_TheWarnDoesNotBlameTheTemporaryDirectoryWhenTheSiblingIsRe
 	if err := os.Chmod(sibling, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	missing := filepath.Join(t.TempDir(), "missing")
+	missing := unrecreatableOverride(t)
 	logger, logs := log.NewObservedLogger(slog.LevelDebug)
 	store := &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: missing, JournalDir: journal}, Log: logger}
 	if _, err := store.Observe("vm:101", "uid-a"); err == nil {

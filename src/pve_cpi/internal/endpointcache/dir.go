@@ -3,6 +3,7 @@ package endpointcache
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,12 +16,14 @@ type Layer string
 
 const (
 	// LayerOverride is the directory the operator named with
-	// pve.endpoint_cache_dir. It wins over every other layer, and the CPI never
-	// creates it.
+	// pve.endpoint_cache_dir. It wins over every other layer. The CPI creates
+	// it at run time only when it is missing and createMissing shows that a new
+	// directory there persists.
 	LayerOverride Layer = "override"
 	// LayerJournal is the endpoint-cache directory beside the allocation
-	// journal directory. The CPI uses it only when it already exists, because
-	// provision-journal creates it, and never creates it at runtime.
+	// journal directory, which provision-journal creates. The CPI creates it at
+	// run time only when it is missing and createMissing shows that a new
+	// directory there persists, and otherwise the next layer applies.
 	LayerJournal Layer = "journal"
 	// LayerTemporary is pve_cpi-endpoint-cache.<euid> under the CPI's temporary
 	// directory. The CPI creates it at runtime, one component deep.
@@ -56,6 +59,10 @@ type Options struct {
 	// judge, when set, names the user the private checks require as the owner
 	// in place of the effective user. Only ProbeAs sets it.
 	judge judgement
+	// hooks, when set, replaces the system calls that create a missing
+	// directory. Only tests set it. It is a pointer, so Options stays
+	// comparable.
+	hooks *creationHooks
 }
 
 // judgement names the user a probe judges a directory as.
@@ -123,16 +130,20 @@ func (r *Refusal) Unwrap() error { return r.Err }
 // reason and there is no cache for this process. A caller that gets a nil Root
 // does not try another layer. Notes holds one line for each layer that
 // declined before this one answered, such as the missing directory beside the
-// journal. The package writes no log line, so the caller logs them, at Debug,
-// because a layer that declines is working as designed. A caller hands Root to
-// OpenStore, which owns it from then on, and closes the Store instead of the
+// journal, and Declined holds the same refusals, so a caller can read their
+// causes. The package writes no log line, so the caller logs them, at Debug,
+// because a layer that declines is working as designed. Created is true when
+// this call created the directory because it was missing. A caller hands Root
+// to OpenStore, which owns it from then on, and closes the Store instead of the
 // Choice.
 type Choice struct {
-	Layer Layer
-	Path  string
-	Root  *os.Root
-	Err   *Refusal
-	Notes []string
+	Layer    Layer
+	Path     string
+	Root     *os.Root
+	Err      *Refusal
+	Notes    []string
+	Declined []*Refusal
+	Created  bool
 }
 
 // Usable reports whether the choice holds an opened, private directory.
@@ -162,6 +173,14 @@ var layers = []layer{
 	temporaryLayer,
 }
 
+// overrideLayer is the override layer that creates a missing directory when
+// createMissing allows it.
+func overrideLayer(opts Options) (Choice, bool) { return overrideLayerFor(opts, true) }
+
+// journalLayer is the layer beside the journal that creates a missing
+// directory when createMissing allows it.
+func journalLayer(opts Options) (Choice, bool) { return journalLayerFor(opts, true) }
+
 // Resolve chooses the cache directory. It writes no log line, because its
 // caller decides the level for the layer chosen and for any refusal.
 //
@@ -186,19 +205,21 @@ func Resolve(opts Options) Choice {
 // answer's Notes. The list must not be empty.
 func resolveWith(list []layer, opts Options) Choice {
 	var notes []string
+	var declined []*Refusal
 	last := len(list) - 1
 	for _, l := range list[:last] {
 		choice, applies := l(opts)
 		if applies {
-			choice.Notes = notes
+			choice.Notes, choice.Declined = notes, declined
 			return choice
 		}
 		if choice.Err != nil {
 			notes = append(notes, choice.Err.Error())
+			declined = append(declined, choice.Err)
 		}
 	}
 	choice, _ := list[last](opts)
-	choice.Notes = notes
+	choice.Notes, choice.Declined = notes, declined
 	return choice
 }
 
@@ -213,12 +234,17 @@ type unsafeDirectory struct {
 func (e *unsafeDirectory) Error() string { return e.text }
 func (e *unsafeDirectory) Unwrap() error { return e.unsafe }
 
-// overrideLayer uses the directory the operator named and nothing else. It
-// opens the directory through the private checks and never creates it. Config
-// validation already requires the value to be absolute and clean, so a path
-// that is not clean here means the validation was bypassed, and the layer
-// refuses it instead of opening a directory the operator did not name.
-func overrideLayer(opts Options) (Choice, bool) {
+// overrideLayerFor uses the directory the operator named and nothing else. It
+// opens the directory through the private checks. A directory that does not
+// exist is created, when create is true, only as createMissing allows, with
+// overrideAnchor as the anchor. When createMissing declines, the layer refuses
+// with a NotCreatedError, which matches fs.ErrNotExist as the missing
+// directory always has, so the HA recovery episode record still falls back
+// from it. Config validation already requires the value to be absolute and
+// clean, so a path that is not clean here means the validation was bypassed,
+// and the layer refuses it instead of opening a directory the operator did not
+// name.
+func overrideLayerFor(opts Options, create bool) (Choice, bool) {
 	if opts.Override == "" {
 		return Choice{}, false
 	}
@@ -234,22 +260,37 @@ func overrideLayer(opts Options) (Choice, bool) {
 		}}
 		return choice, true
 	}
+	// A relative override never reaches createMissing, because config
+	// validation refuses one, and OpenRoot refuses it below as it always has.
+	if _, err := os.Lstat(opts.Override); filepath.IsAbs(opts.Override) && errors.Is(err, fs.ErrNotExist) {
+		made, declined := t.createMissing(opts, choice, overrideAnchor(opts), create)
+		if declined == nil {
+			return made, true
+		}
+		notCreated := &NotCreatedError{Path: opts.Override, Reason: declined}
+		choice.Err = &Refusal{Layer: LayerOverride, Path: opts.Override, Err: notCreated}
+		return choice, true
+	}
 	return t.open(choice), true
 }
 
-// journalLayer uses the endpoint-cache directory beside the journal directory,
-// never inside it. It applies only when the journal directory is set and the
-// directory exists. A missing directory declines with the reason in the Err of
-// the declined choice, so the temporary layer is next. The layer never creates
-// the directory, because under BPM a path outside every mounted volume lands in
-// the worker's private filesystem, and a runtime mkdir could appear to work and
-// lose the cache on every call. A directory that exists applies, and the
-// private checks decide whether it is usable. A refusal there ends the search,
-// because a sibling that someone else controls is the case the checks exist
-// for. A journal directory that is not absolute, or is the filesystem root, has
-// no sibling to look for, and a journal whose own base name is endpoint-cache
-// would collide with the sibling's name, so the layer declines for both.
-func journalLayer(opts Options) (Choice, bool) {
+// journalLayerFor uses the endpoint-cache directory beside the journal
+// directory, never inside it. It applies only when the journal directory is
+// set and the directory exists or createMissing allows creating it, with the
+// journal directory as the anchor. Under BPM a path outside every mounted
+// volume lands in the worker's private filesystem, where a run-time mkdir
+// would appear to work and lose the cache on every call. The anchor rules that
+// out, because a journal directory that BPM mounts by itself sits on a
+// different mount from its parent. A missing directory that createMissing
+// declines, or that create is false for, declines the layer with the reason in
+// the Err of the declined choice, so the temporary layer is next. A directory
+// that exists applies, and the private checks decide whether it is usable. A
+// refusal there ends the search, because a sibling that someone else controls
+// is the case the checks exist for. A journal directory that is not absolute,
+// or is the filesystem root, has no sibling to look for, and a journal whose
+// own base name is endpoint-cache would collide with the sibling's name, so
+// the layer declines for both.
+func journalLayerFor(opts Options, create bool) (Choice, bool) {
 	if opts.JournalDir == "" {
 		return Choice{}, false
 	}
@@ -271,8 +312,12 @@ func journalLayer(opts Options) (Choice, bool) {
 	choice := Choice{Layer: LayerJournal, Path: filepath.Join(filepath.Dir(journal), JournalSiblingName)}
 	if _, err := os.Lstat(choice.Path); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			made, reason := t.createMissing(opts, choice, journalAnchor(journal), create)
+			if reason == nil {
+				return made, true
+			}
 			return declined(choice.Path, fmt.Errorf("the directory beside the allocation journal is missing, "+
-				"so the next layer applies: %w", os.ErrNotExist))
+				"so the next layer applies: %w", &NotCreatedError{Path: choice.Path, Reason: reason}))
 		}
 		// A directory that cannot be examined is not known to be absent, so the
 		// layer refuses it and no cache is better than a guess.
@@ -414,12 +459,22 @@ func (t *texts) checkOpenedDirectory(r *os.Root) error {
 }
 
 // probeLayers are the layers Probe considers. They are the layers Resolve
-// considers, except that the temporary layer never creates its directory.
+// considers, except that none of them creates its directory.
 var probeLayers = []layer{
-	overrideLayer,
-	journalLayer,
+	probeOverrideLayer,
+	probeJournalLayer,
 	probeTemporaryLayer,
 }
+
+// probeOverrideLayer is the override layer without the mkdir. A missing
+// directory the CPI would create is refused with a cause that matches
+// ErrCreatedOnFirstUse and os.ErrNotExist.
+func probeOverrideLayer(opts Options) (Choice, bool) { return overrideLayerFor(opts, false) }
+
+// probeJournalLayer is the layer beside the journal without the mkdir. A
+// missing directory the CPI would create applies with a refusal whose cause
+// matches ErrCreatedOnFirstUse and os.ErrNotExist.
+func probeJournalLayer(opts Options) (Choice, bool) { return journalLayerFor(opts, false) }
 
 // probeTemporaryLayer is temporaryLayer without the mkdir. A directory that
 // does not exist yet is refused with a cause that matches os.ErrNotExist,
@@ -429,22 +484,23 @@ func probeTemporaryLayer(opts Options) (Choice, bool) {
 }
 
 // probeMkdir stands in for mkdir. It answers as mkdir would for a name that
-// exists, and with a not-exist cause for one that does not, so nothing is
-// created.
+// exists, and with a cause that matches os.ErrNotExist and
+// ErrCreatedOnFirstUse for one that does not, so nothing is created.
 func probeMkdir(path string, _ os.FileMode) error {
 	if _, err := os.Lstat(path); err == nil {
 		return os.ErrExist
 	}
-	return fmt.Errorf("the directory %s does not exist yet, and the CPI creates it on first use: %w",
-		path, os.ErrNotExist)
+	return &firstUse{path: path}
 }
 
 // Probe chooses the cache directory the way Resolve does, and answers the same
 // layer and refusal for every directory that exists. It differs in one way. It
-// never creates the temporary layer's directory, so a diagnostic that runs it
-// leaves nothing behind, and a temporary directory that is absent comes back
-// as a refusal whose cause matches os.ErrNotExist. The caller closes a usable
-// choice.
+// never creates a directory, so a diagnostic that runs it leaves nothing
+// behind. A missing directory that Resolve would create comes back as a
+// refusal of the layer that would create it, whose cause matches
+// ErrCreatedOnFirstUse and os.ErrNotExist, and a missing directory that
+// Resolve would not create comes back exactly as Resolve gives it. The caller
+// closes a usable choice.
 func Probe(opts Options) Choice {
 	opts.Guard = guardJournal(opts.JournalDir, opts.Guard)
 	return refuseJournalOverlap(resolveWith(probeLayers, opts), opts.JournalDir)
@@ -454,8 +510,9 @@ func Probe(opts Options) Choice {
 // of the directory in place of the effective user, and the temporary layer
 // looks for the directory that uid's processes use under this process's
 // temporary directory. It answers what a CPI running as uid would decide for
-// the override and the directory beside the journal, so a diagnostic that runs
-// as root does not report a directory the CPI's own user owns as refused. Like
+// the override and the directory beside the journal, including whether it
+// would create one that is missing, so a diagnostic that runs as root does not
+// report a directory the CPI's own user owns as refused. Like
 // Probe it never creates anything. The CPI never calls it, because a choice
 // judged as another user is not one the CPI may use, and a guard test fails
 // when a non-test source outside the diagnostic calls it. The caller closes a

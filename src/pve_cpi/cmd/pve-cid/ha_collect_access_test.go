@@ -40,7 +40,7 @@ func TestCollectReportsATemporaryDirectoryAnotherUserOwns(t *testing.T) {
 
 	t.Run("missing override", func(t *testing.T) {
 		cfg := haCfg("auto", "none")
-		cfg.EndpointCacheDir = filepath.Join(t.TempDir(), "absent")
+		cfg.EndpointCacheDir = filepath.Join(t.TempDir(), "no-parent", "absent")
 		r := cacheFindingsAs(cfg, doctor)
 		want(t, r, haKindCacheDirectory, haSeverityAdvice, cfg.EndpointCacheDir, "does not exist",
 			"cannot be used either", "dead-node handover cannot start")
@@ -56,7 +56,7 @@ func TestCollectReportsATemporaryDirectoryAnotherUserOwns(t *testing.T) {
 
 	t.Run("a missing override that falls through to a directory that passes", func(t *testing.T) {
 		cfg := haCfg("auto", "none")
-		cfg.EndpointCacheDir = filepath.Join(t.TempDir(), "absent")
+		cfg.EndpointCacheDir = filepath.Join(t.TempDir(), "no-parent", "absent")
 		want(t, cacheFindingsAs(cfg, os.Geteuid()), haKindCacheDirectory, haSeverityAdvice, cfg.EndpointCacheDir,
 			"sits in the temporary cache directory")
 	})
@@ -74,7 +74,8 @@ func TestCollectReportsADirectoryTheCPIsUserCannotReach(t *testing.T) {
 	makeDir(t, journal)
 	override := filepath.Join(t.TempDir(), "cache")
 	makeDir(t, override)
-	missing := filepath.Join(t.TempDir(), "absent")
+	// The parent is missing too, so the CPI does not create the override.
+	missing := filepath.Join(t.TempDir(), "no-parent", "absent")
 	cpiUser := os.Geteuid()
 
 	collect := func(t *testing.T, cfg *config.CPIConfig, search func(string, int) (*searchBlock, error)) *haReport {
@@ -518,7 +519,15 @@ func TestCollectReportsAMissingDirectoryTheCPIsUserCannotLookFor(t *testing.T) {
 	t.Run("journal sibling the CPI's user can look for", func(t *testing.T) {
 		cfg := haCfg("auto", "none")
 		cfg.StorageAllocationJournalDir = filepath.Join(base, "journal")
-		wantNone(t, collect(cfg, walk), haKindCacheDirectory)
+		sibling := filepath.Join(base, "endpoint-cache")
+		r := collect(cfg, walk)
+		want(t, r, haKindCacheDirectory, haSeverityAdvice, sibling, "does not create it because",
+			"temporary cache directory")
+		for _, f := range findings(r, haKindCacheDirectory) {
+			if strings.Contains(f.Detail, "permission denied") {
+				t.Errorf("the CPI's user can look for the directory, so nothing is denied: %+v", f)
+			}
+		}
 	})
 }
 

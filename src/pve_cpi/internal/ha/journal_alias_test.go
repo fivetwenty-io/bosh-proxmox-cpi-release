@@ -231,6 +231,16 @@ func TestEpisodeStoreDoesNotFallBackFromAnOverrideThatOverlapsTheJournal(t *test
 	}
 }
 
+// keepTheSiblingUncreated lets a group write in the journal's parent, so the
+// CPI declines to create the directory beside the journal, or an override
+// there, and the temporary layer is reached.
+func keepTheSiblingUncreated(t *testing.T, l aliasLayout) {
+	t.Helper()
+	if err := os.Chmod(l.state, 0o770); err != nil { //nolint:gosec // the test opens the mode on purpose
+		t.Fatal(err)
+	}
+}
+
 func readNames(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -248,6 +258,7 @@ func readNames(dir string) ([]string, error) {
 // journal through an ancestor symlink must end with nothing created there.
 func TestProfileCacheCreatesNothingInTheJournalForATemporaryDirectoryInsideIt(t *testing.T) {
 	l := newAliasLayout(t)
+	keepTheSiblingUncreated(t, l)
 	t.Setenv("TMPDIR", filepath.Join(l.alias, "journal", "tmp"))
 	before := snapshot(t, l.journal)
 	cfg := cacheCfg("")
@@ -265,6 +276,7 @@ func TestProfileCacheCreatesNothingInTheJournalForATemporaryDirectoryInsideIt(t 
 
 func TestEpisodeStoreCreatesNothingInTheJournalForATemporaryDirectoryInsideIt(t *testing.T) {
 	l := newAliasLayout(t)
+	keepTheSiblingUncreated(t, l)
 	t.Setenv("TMPDIR", filepath.Join(l.alias, "journal", "tmp"))
 	before := snapshot(t, l.journal)
 

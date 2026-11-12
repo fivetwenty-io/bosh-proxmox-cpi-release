@@ -203,7 +203,8 @@ func TestProfileCacheACorruptFileProbesAndIsRebuilt(t *testing.T) {
 }
 
 func TestProfileCacheAMissingDirectoryProbesEveryCall(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "absent")
+	// The parent is missing too, so the CPI does not create the override.
+	missing := filepath.Join(t.TempDir(), "no-parent", "absent")
 	// The temporary layer is the episode record's fallback, and the profile
 	// cache has none, so nothing may appear there.
 	tmp := t.TempDir()

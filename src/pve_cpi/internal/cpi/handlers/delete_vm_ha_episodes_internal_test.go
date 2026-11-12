@@ -78,7 +78,9 @@ func TestHAEpisodesStoreCarriesTheLoggerAndTheJournalDirectory(t *testing.T) {
 // window only expires if the record outlives the call.
 func TestRecoveryGraceWindowRunsOutAcrossCallsWithAMissingOverride(t *testing.T) {
 	temporary := temporaryEpisodeDir(t)
-	missing := filepath.Join(t.TempDir(), "absent")
+	// The parent is missing too, so the CPI does not create the override and the
+	// record falls back to the temporary layer.
+	missing := filepath.Join(t.TempDir(), "no-parent", "absent")
 	motionSec := 600
 	deps := Deps{Config: &config.CPIConfig{
 		EndpointCacheDir: missing,
