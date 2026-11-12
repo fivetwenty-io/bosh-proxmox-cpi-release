@@ -55,6 +55,12 @@ type HADeleteScene struct {
 	// NoLocal leaves the local flag off every /cluster/status row, the shape
 	// of a cluster status that does not mark the node that answered.
 	NoLocal bool
+	// EmptyResources answers GET /cluster/ha/resources with no rows, the list
+	// the SDK returns for a 200 that carries no data, whatever Requested holds.
+	EmptyResources bool
+	// EmptyCurrent answers GET /cluster/ha/status/current with no rows, the
+	// list the SDK returns for a 200 that carries no data.
+	EmptyCurrent bool
 	// Services are the CRM's service_status entries by SID.
 	Services map[string]HASceneService
 	// Requested are the HA resources by SID and their requested state.
@@ -364,7 +370,7 @@ func (s *HADeleteScene) managerBody() *cluster.ListHaStatusManagerStatusResponse
 // because NodeHealth reads them only when manager status is empty, and a scene
 // with no CRM answers with no rows at all.
 func (s *HADeleteScene) currentRows() *cluster.ListHaStatusCurrentResponse {
-	if s.NoCRM {
+	if s.NoCRM || s.EmptyCurrent {
 		return AbsenceNoHAStatus()
 	}
 	row := func(v map[string]any) json.RawMessage {
@@ -401,6 +407,9 @@ func (s *HADeleteScene) currentRows() *cluster.ListHaStatusCurrentResponse {
 
 func (s *HADeleteScene) resourceRows() *cluster.ListHaResourcesResponse {
 	rows := make(cluster.ListHaResourcesResponse, 0, len(s.Requested))
+	if s.EmptyResources {
+		return &rows
+	}
 	for sid, state := range s.Requested {
 		raw, _ := json.Marshal(map[string]any{"sid": sid, "type": "vm", "state": state})
 		rows = append(rows, raw)

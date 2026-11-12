@@ -199,6 +199,24 @@ func TestGateHADeleteStateTable(t *testing.T) {
 				s.LRMAge["pve-node2"] = 1800
 				s.LRMAge["pve-node3"] = 1800
 			}},
+		{name: "idle-looking CRM whose resource list answers with no data",
+			wantErr: []string{"HA state is unknown", "status/current does not report the CRM master idle"},
+			setup: func(s *HADeleteScene) {
+				// The resource list comes back empty, but status/current, which
+				// PVE builds from the resource config, still lists vm:101 and
+				// does not call the master idle.
+				s.Place(101, "pve-node1")
+				s.Requested["vm:101"] = "started"
+				s.EmptyResources = true
+				s.CRMAge = 1908 * 3600
+			}},
+		{name: "idle-looking CRM whose status/current answers with no data",
+			wantErr: []string{"HA state is unknown", "status/current does not report the entry node quorate"},
+			setup: func(s *HADeleteScene) {
+				s.Place(101, "pve-node1")
+				s.EmptyCurrent = true
+				s.CRMAge = 1908 * 3600
+			}},
 		{name: "old CRM timestamp whose last round still holds a service",
 			wantErr: []string{"HA state is unknown", "its last round still held services"},
 			setup: func(s *HADeleteScene) {
