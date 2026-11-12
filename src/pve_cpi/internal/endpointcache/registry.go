@@ -290,9 +290,11 @@ func (r *Registry) Drain(ctx context.Context, wait time.Duration) DrainResult {
 	r.mu.Unlock()
 
 	awaitIdle(ctx, run.ctx, run.idle, wait)
-	run.cancel()
 
+	// The cancel happens under the lock, so a worker that returns as soon as
+	// it sees the cancel cannot remove itself before the drain lists it.
 	r.mu.Lock()
+	run.cancel()
 	result := DrainResult{Started: run.started, Waited: time.Since(start), Panics: run.panics}
 	run.panics = nil
 	result.CancelledLevel = Level(config.DiscoveryModeAuto)
