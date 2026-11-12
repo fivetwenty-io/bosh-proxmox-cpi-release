@@ -32,6 +32,13 @@ func TestConfigure_OrphanISOWarnOnlyWhenListed(t *testing.T) {
 		{name: "listing fails", listing: func() (*sdknodes.ListStorageContentResponse, error) {
 			return nil, errors.New("500 no format")
 		}},
+		{name: "other iso listed, not ours", listing: func() (*sdknodes.ListStorageContentResponse, error) {
+			l := sdknodes.ListStorageContentResponse{
+				json.RawMessage(`{"volid":"local:iso/other.iso"}`),
+				json.RawMessage(`{}`),
+			}
+			return &l, nil
+		}},
 		{name: "malformed item", listing: func() (*sdknodes.ListStorageContentResponse, error) {
 			l := sdknodes.ListStorageContentResponse{json.RawMessage(`[1]`)}
 			return &l, nil
@@ -58,7 +65,8 @@ func TestConfigure_OrphanISOWarnOnlyWhenListed(t *testing.T) {
 			if got.node != "pve1" || got.storage != "local" {
 				t.Fatalf("listing on %s/%s, want pve1/local", got.node, got.storage)
 			}
-			if got.params == nil || got.params.Content == nil || *got.params.Content != "iso" || got.params.Vmid != nil {
+			if got.params == nil || got.params.Content == nil || *got.params.Content != "iso" ||
+				got.params.Vmid != nil {
 				t.Fatalf("listing params = %+v, want content=iso only", got.params)
 			}
 			warned := false

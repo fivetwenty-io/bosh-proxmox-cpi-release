@@ -518,7 +518,7 @@ func (a *ConfigDrive) removeISOIfExists(ctx context.Context, node, filename stri
 
 // isoListed reads one content listing, filtered to ISOs, on the upload node and
 // reports whether it names the volume. A failed read or a malformed item
-// counts as not listed, and the read is logged at Debug.
+// counts as not listed, and a failed read is logged at Debug.
 func (a *ConfigDrive) isoListed(ctx context.Context, node, volume string) bool {
 	content := "iso"
 	listing, err := a.pveSvc.Nodes().ListStorageContent(ctx, node, a.storageName(ctx),
