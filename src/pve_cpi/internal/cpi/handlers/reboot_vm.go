@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 
@@ -291,12 +292,14 @@ func rebootVMHardReset(ctx context.Context, deps Deps, logger *log.Logger, node 
 var errResetMayHaveLanded = errors.New("reboot_vm: stop after a reset that may have reached PVE")
 
 // resetMayHaveLanded reports whether err, from one hard reset request, leaves
-// open that PVE acted on the request. A config-missing answer and a config
-// lock are PVE's own refusals, and pve.IsMutationRefusedOrUnsent covers every
-// other answer and every request that was never sent. Anything else may have
-// landed, so the reset must not be sent a second time.
+// open that PVE acted on the request. pve.IsMutationRefusedOrUnsent covers
+// every answer from PVE, including a 404, a config-missing 500, and a config
+// lock, and every request that was never sent. Anything else may have landed,
+// so the reset must not be sent a second time. That includes an error whose
+// text alone says the config is missing or locked, because without PVE's
+// status nothing proves that PVE gave that answer to this request.
 func resetMayHaveLanded(err error) bool {
-	return err != nil && !isConfigMissing(err) && !pve.IsVMConfigLocked(err) && !pve.IsMutationRefusedOrUnsent(err)
+	return err != nil && !pve.IsMutationRefusedOrUnsent(err)
 }
 
 // VM power states as reported by the qemu status endpoints.
@@ -429,6 +432,9 @@ func rebootLockHeldError(logger *log.Logger, err error, what, vmCID, node string
 //     poll fault → retriable error that names the task, no fallback.
 //   - empty UPID → success without await.
 //
+// The reboot task is polled for rebootTaskMaxWait(timeout), so the poll
+// outlives PVE's own wait for the guest and reads its verdict.
+//
 // Every retriable error here fails the call. The Director does not retry
 // reboot_vm on its own, so the error says the outcome is unknown and tells
 // the operator to check the VM and run the operation again.
@@ -472,7 +478,9 @@ func rebootVMSoftWithFallback(ctx context.Context, deps Deps, logger *log.Logger
 	}
 
 	if upid != "" {
-		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, logger); awaitErr != nil {
+		awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, logger,
+			pve.WithMaxWait(rebootTaskMaxWait(timeout)))
+		if awaitErr != nil {
 			if !pve.IsTaskExitVerdict(awaitErr) {
 				logger.Warn("reboot_vm: the graceful reboot task's outcome is unknown, so the VM is not hard-reset",
 					log.String("upid", upid), log.Err(awaitErr))
@@ -491,6 +499,22 @@ func rebootVMSoftWithFallback(ctx context.Context, deps Deps, logger *log.Logger
 
 	logger.Info("reboot_vm: graceful reboot completed")
 	return nil, nil
+}
+
+// rebootTaskWaitMargin is how much longer than pve.reboot_timeout the CPI
+// polls the graceful reboot task. PVE's reboot task waits up to the timeout
+// for the guest to shut down, so the poll must outlive that wait to read the
+// task's verdict. A minute covers the VM lock the task takes first, the rest
+// of the task, and the gap between two polls.
+const rebootTaskWaitMargin = time.Minute
+
+// rebootTaskMaxWait returns how long the CPI polls a graceful reboot task
+// whose guest shutdown timeout is timeout seconds. It is the timeout plus
+// rebootTaskWaitMargin, and never less than pve.DefaultTaskMaxWait. A poll
+// that ended before PVE wrote the verdict for a guest that would not shut
+// down would leave the outcome unknown, and the VM would not be hard-reset.
+func rebootTaskMaxWait(timeout int) time.Duration {
+	return max(time.Duration(timeout)*time.Second+rebootTaskWaitMargin, pve.DefaultTaskMaxWait)
 }
 
 // isConfigMissing reports whether err says the node holds no config for the VM,

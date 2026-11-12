@@ -707,8 +707,9 @@ func TestHandleRebootVM_HardReset_RetriesOnTransient(t *testing.T) {
 
 // TestRebootVM_StatusTransient_Retriable verifies that when Status returns a
 // transient 5xx error on every attempt, RetryOnTransient exhausts retries and
-// the handler returns a Retriable cpierror so the BOSH director re-issues the
-// call rather than treating it as a permanent failure.
+// the handler returns a Retriable cpierror rather than a permanent failure.
+// The error is retriable, but the Director doesn't retry reboot_vm on its
+// own, so an operator runs the operation again.
 func TestRebootVM_StatusTransient_Retriable(t *testing.T) {
 	t.Parallel()
 

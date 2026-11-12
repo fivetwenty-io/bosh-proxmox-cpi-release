@@ -29,6 +29,11 @@ type taskStatusGetter interface {
 
 var _ taskStatusGetter = sdktasks.Service(nil)
 
+// DefaultTaskMaxWait is how long AwaitTask polls a task when no WithMaxWait
+// option sets another limit. A caller that sizes its own wait from a PVE
+// timeout uses it as the floor, so a short timeout never shortens the poll.
+const DefaultTaskMaxWait = defaultMaxWaitSeconds * time.Second
+
 // StemcellMaxWait is the task timeout for stemcell upload + create_vm
 // import-from operations, which may include qcow2->raw format conversion
 // on LVM/ZFS storages.

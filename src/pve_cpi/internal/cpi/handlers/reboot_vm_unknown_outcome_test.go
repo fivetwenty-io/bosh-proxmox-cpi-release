@@ -130,18 +130,81 @@ func TestHandleRebootVM_UnresolvedRebootPoll_NoHardReset(t *testing.T) {
 
 // TestHandleRebootVM_FailedRebootTask_HardResets checks that a reboot task
 // that resolved with a failing exit status still falls back to a hard reset.
+// PVE ends the task of a guest that didn't shut down in time with "VM
+// quit/powerdown failed - got timeout", which is no lock timeout, so the
+// guest that ignores ACPI, the fallback's main case, is still reset.
 func TestHandleRebootVM_FailedRebootTask_HardResets(t *testing.T) {
 	t.Parallel()
 
-	resets, err := softRebootOutcome(t, rebootRawUPID("UPID:pve-node1:reboot"), nil,
-		func(string) (*tasks.Status, error) {
-			return &tasks.Status{Status: "stopped", ExitStatus: "VM quit/powerdown failed"}, nil
+	for _, exit := range []string{"VM quit/powerdown failed", "VM quit/powerdown failed - got timeout"} {
+		t.Run(exit, func(t *testing.T) {
+			t.Parallel()
+			resets, err := softRebootOutcome(t, rebootRawUPID("UPID:pve-node1:reboot"), nil,
+				func(string) (*tasks.Status, error) {
+					return &tasks.Status{Status: "stopped", ExitStatus: exit}, nil
+				})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if resets != 1 {
+				t.Errorf("hard reset sent %d times after a failed reboot task; want 1", resets)
+			}
 		})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
 	}
-	if resets != 1 {
-		t.Errorf("hard reset sent %d times after a failed reboot task; want 1", resets)
+}
+
+// TestHandleRebootVM_RebootTaskPollOutlivesTimeout checks that the CPI polls
+// the graceful reboot task for pve.reboot_timeout plus a minute, and never
+// for less than the default five minutes. PVE's reboot task waits up to the
+// timeout for the guest, so a shorter poll would end before PVE's verdict on
+// a guest that didn't shut down, and that guest would never be hard-reset.
+func TestHandleRebootVM_RebootTaskPollOutlivesTimeout(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		timeout     int
+		wantSeconds int
+	}{
+		{timeout: 60, wantSeconds: 300},
+		{timeout: 600, wantSeconds: 660},
+		{timeout: 3600, wantSeconds: 3660},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("reboot_timeout %d", tc.timeout), func(t *testing.T) {
+			t.Parallel()
+			var gotSeconds atomic.Int64
+			gotSeconds.Store(-1)
+			qemuSvc := &mockQEMUService{
+				statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+					return map[string]any{"status": "running"}, nil
+				},
+			}
+			nodesSvc := &mockNodesService{
+				createQemuStatusRebootFn: func(
+					_ context.Context, _, _ string, _ *nodes.CreateQemuStatusRebootParams,
+				) (*nodes.CreateQemuStatusRebootResponse, error) {
+					return rebootRawUPID("UPID:pve-node1:reboot"), nil
+				},
+			}
+			tasksSvc := &mockTasksService{
+				waitFn: func(_ context.Context, _, _ string, opts *tasks.WaitOptions) (*tasks.Status, error) {
+					if opts != nil {
+						gotSeconds.Store(int64(opts.TimeoutSeconds))
+					}
+					return &tasks.Status{ExitStatus: "OK"}, nil
+				},
+			}
+			deps := testDepsRebootCluster(qemuSvc, nodesSvc, tasksSvc, "soft", tc.timeout,
+				defaultClusterSvc(101, "pve-node1"))
+			_, err := handlers.HandleRebootVM(deps).Handle(fastRetryCtx(context.Background()), marshalArgs("101"),
+				jsonrpc.Context{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := gotSeconds.Load(); got != int64(tc.wantSeconds) {
+				t.Errorf("reboot task polled for %d seconds; want %d", got, tc.wantSeconds)
+			}
+		})
 	}
 }
 
@@ -220,6 +283,16 @@ func TestHandleRebootVM_RebootCallOutcome(t *testing.T) {
 			err: fmt.Errorf("Post: %w", &endpointpool.ConnectPhaseError{
 				Phase: endpointpool.PhaseDial, Endpoint: "pve1:8006", Err: dial,
 			}),
+			wantReset: true,
+		},
+		{
+			name:      "ticket login failed before the send",
+			err:       ticketLoginFailed(),
+			wantReset: true,
+		},
+		{
+			name:      "ticket login after a 401 failed",
+			err:       ticketRefreshFailed(),
 			wantReset: true,
 		},
 	}
@@ -304,6 +377,65 @@ func TestHandleRebootVM_HardResetMaybeSent_NotResent(t *testing.T) {
 				if !strings.Contains(err.Error(), w) {
 					t.Errorf("error %q does not contain %q", err.Error(), w)
 				}
+			}
+		})
+	}
+}
+
+// ticketLoginFailed is the SDK's error for a request whose ticket login
+// failed before the request was sent. The login request itself may have
+// reached PVE, which says nothing about the request that was never sent.
+func ticketLoginFailed() error {
+	read := &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}
+	return fmt.Errorf("failed to execute QEMU operation: %w", fmt.Errorf("auto-login failed: %w",
+		&endpointpool.MaybeSentError{Err: fmt.Errorf("Post: %w", read)}))
+}
+
+// ticketRefreshFailed is the SDK's error for a request that PVE answered with
+// a 401 and whose forced login then timed out, so the SDK never sent the
+// request again.
+func ticketRefreshFailed() error {
+	return fmt.Errorf("failed to execute QEMU operation: %w", fmt.Errorf("failed to refresh authentication: %w",
+		fmt.Errorf("forced re-authentication failed: %w", &sdkerrors.TimeoutError{Operation: "POST", Duration: "30s"})))
+}
+
+// TestHandleRebootVM_HardResetRefusedOrUnsent_Resent checks that a hard reset
+// that PVE refused, or that was never sent, is sent again and succeeds. That
+// covers an answered config lock, another answered 500, and a ticket login
+// that failed before the send or after PVE answered with a 401.
+func TestHandleRebootVM_HardResetRefusedOrUnsent_Resent(t *testing.T) {
+	t.Parallel()
+
+	// NewEnvelopeError builds the answer as the SDK does, with the status
+	// sentinel that marks a 5xx as transient.
+	cases := map[string]error{
+		"answered config lock":            sdkerrors.NewEnvelopeError(500, "VM is locked (backup)", nil),
+		"answered 500":                    sdkerrors.NewEnvelopeError(500, "VM 101 qmp command failed", nil),
+		"ticket login failed":             ticketLoginFailed(),
+		"ticket login after a 401 failed": ticketRefreshFailed(),
+	}
+	for name, firstErr := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var resets atomic.Int32
+			qemuSvc := &mockQEMUService{
+				statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+					return map[string]any{"status": "running"}, nil
+				},
+				resetFn: func(_ context.Context, _ string, _ int) (string, error) {
+					if resets.Add(1) == 1 {
+						return "", firstErr
+					}
+					return "", nil
+				},
+			}
+			h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "hard"))
+			_, err := h.Handle(fastRetryCtx(context.Background()), marshalArgs("101"), jsonrpc.Context{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if n := resets.Load(); n != 2 {
+				t.Errorf("hard reset sent %d times; want 2", n)
 			}
 		})
 	}
