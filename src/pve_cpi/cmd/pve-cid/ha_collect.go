@@ -1402,43 +1402,11 @@ func (c *haCollector) siblingCreation(choice endpointcache.Choice, j cacheJudge)
 	}
 }
 
-// judgedAsNote is what a finding about creating a directory adds when no
-// allocation journal directory names the CPI's user, because the doctor then
-// judged as its own user.
-func (j cacheJudge) judgedAsNote() string {
-	if j.known {
-		return ""
-	}
-	return fmt.Sprintf("; this check judged as its own user, uid %d, because no allocation journal directory "+
-		"names the CPI's user", j.doctor)
-}
-
 // createdOnFirstUse reports whether choice is the probe's refusal of a missing
 // directory that the CPI creates the first time it chooses it. The check must
 // not hand a nil *Refusal to errors.Is, which would call its Unwrap method.
 func createdOnFirstUse(choice endpointcache.Choice) bool {
 	return choice.Err != nil && errors.Is(choice.Err, endpointcache.ErrCreatedOnFirstUse)
-}
-
-// overrideCreation says what the CPI does with a pve.endpoint_cache_dir that
-// does not exist. creates is true when it creates the directory. Otherwise
-// reason says why it does not, or is empty when the check cannot tell, which is
-// when no journal directory names the CPI's user and the doctor cannot see the
-// CPI's temporary directory, whose mount decides it.
-func (j cacheJudge) overrideCreation(dir endpointcache.DirOptions) (creates bool, reason string) {
-	if dir.JournalDir == "" && !j.checksTemporary() {
-		return false, ""
-	}
-	choice := dir.ProbeAs(j.uid)
-	defer func() { _ = choice.Close() }()
-	if createdOnFirstUse(choice) {
-		return true, ""
-	}
-	var notCreated *endpointcache.NotCreatedError
-	if choice.Err != nil && errors.As(choice.Err, &notCreated) {
-		return false, notCreated.Reason.Error()
-	}
-	return false, ""
 }
 
 // missingDirectory reports whether choice names a directory that does not exist,
@@ -1499,6 +1467,38 @@ func (j cacheJudge) checksTemporary() bool {
 		return j.uid == j.doctor
 	}
 	return j.doctor != 0
+}
+
+// judgedAsNote is what a finding about creating a directory adds when no
+// allocation journal directory names the CPI's user, because the doctor then
+// judged as its own user.
+func (j cacheJudge) judgedAsNote() string {
+	if j.known {
+		return ""
+	}
+	return fmt.Sprintf("; this check judged as its own user, uid %d, because no allocation journal directory "+
+		"names the CPI's user", j.doctor)
+}
+
+// overrideCreation says what the CPI does with a pve.endpoint_cache_dir that
+// does not exist. creates is true when it creates the directory. Otherwise
+// reason says why it does not, or is empty when the check cannot tell, which is
+// when no journal directory names the CPI's user and the doctor cannot see the
+// CPI's temporary directory, whose mount decides it.
+func (j cacheJudge) overrideCreation(dir endpointcache.DirOptions) (creates bool, reason string) {
+	if dir.JournalDir == "" && !j.checksTemporary() {
+		return false, ""
+	}
+	choice := dir.ProbeAs(j.uid)
+	defer func() { _ = choice.Close() }()
+	if createdOnFirstUse(choice) {
+		return true, ""
+	}
+	var notCreated *endpointcache.NotCreatedError
+	if choice.Err != nil && errors.As(choice.Err, &notCreated) {
+		return false, notCreated.Reason.Error()
+	}
+	return false, ""
 }
 
 // probe chooses the cache directory for dir as the CPI's user would, as far
