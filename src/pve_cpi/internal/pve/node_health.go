@@ -115,8 +115,19 @@ const (
 	// LRM view, so the report rests on cluster status alone.
 	HAViewNotConfigured HAView = "not_configured"
 
+	// HAViewIdle means the CRM timestamp is older than NodeHealthCRMMaxAge
+	// because the CRM is idle, as PVE's own status reports it. PVE's CRM gives
+	// up its lock and stops writing manager status once the cluster has had no
+	// HA resource for a while, so the timestamp keeps the time of its last
+	// round. NodeHealth reads the view as idle only when the entry node is
+	// quorate, the resource list was read and is empty, and that last round
+	// held no service and no disarm request, which are the conditions PVE's
+	// CRM checks before it goes idle. No HA source is trusted, and the report
+	// rests on cluster status alone, as it does when HA is not configured.
+	HAViewIdle HAView = "idle"
+
 	// HAViewStale means the CRM timestamp is older than NodeHealthCRMMaxAge or
-	// lies in the future, so no HA source was trusted.
+	// lies in the future, and the CRM is not idle, so no HA source was trusted.
 	HAViewStale HAView = "stale"
 
 	// HAViewUnreadable means an HA source failed to answer, or the entry node's
@@ -133,11 +144,15 @@ const (
 )
 
 // NodeHealthCluster is the subset of the PVE cluster API that NodeHealth reads.
-// It is satisfied by the sdk cluster service.
+// It is satisfied by the sdk cluster service. NodeHealth reads the HA resource
+// list only when the CRM timestamp is old, to tell an idle CRM from a stale one.
 type NodeHealthCluster interface {
 	ListStatus(ctx context.Context) (*sdkcluster.ListStatusResponse, error)
 	ListHaStatusManagerStatus(ctx context.Context) (*sdkcluster.ListHaStatusManagerStatusResponse, error)
 	ListHaStatusCurrent(ctx context.Context) (*sdkcluster.ListHaStatusCurrentResponse, error)
+	ListHaResources(
+		ctx context.Context, params *sdkcluster.ListHaResourcesParams,
+	) (*sdkcluster.ListHaResourcesResponse, error)
 }
 
 // NodeHealthNodes is the subset of the PVE nodes API that NodeHealth reads. It
@@ -287,11 +302,15 @@ type clusterView struct {
 }
 
 // managerView is what NodeHealth keeps from GET /cluster/ha/status/manager_status.
+// services counts the CRM's service_status entries, and disarmed is true when
+// the CRM recorded a disarm request. Only the idle check reads them.
 type managerView struct {
 	nodeStatus map[string]string
 	lrm        map[string]lrmWire
 	crmStamp   int64
 	quorumNode string
+	services   int
+	disarmed   bool
 }
 
 // lrmWire is the wire shape of one lrm_status entry.
@@ -373,7 +392,7 @@ func NodeHealth(
 	var ha haInputs
 	switch {
 	case mgr != nil && !mgr.empty():
-		ha = resolveManagerView(ctx, nodesAPI, report, mgr)
+		ha = resolveManagerView(ctx, clusterAPI, nodesAPI, report, mgr)
 	default:
 		reason := "manager status is empty"
 		if mgrErr != nil {
@@ -481,11 +500,16 @@ func readManagerView(ctx context.Context, clusterAPI NodeHealthCluster) (*manage
 		return &managerView{}, nil
 	}
 
-	var top struct {
-		ManagerStatus json.RawMessage `json:"manager_status"`
-		LRMStatus     json.RawMessage `json:"lrm_status"`
+	type crmFields struct {
 		NodeStatus    json.RawMessage `json:"node_status"`
+		LRMStatus     json.RawMessage `json:"lrm_status"`
+		ServiceStatus json.RawMessage `json:"service_status"`
+		Disarm        json.RawMessage `json:"disarm"`
 		Timestamp     json.RawMessage `json:"timestamp"`
+	}
+	var top struct {
+		crmFields
+		ManagerStatus json.RawMessage `json:"manager_status"`
 		Quorum        struct {
 			Node string `json:"node"`
 		} `json:"quorum"`
@@ -494,17 +518,9 @@ func readManagerView(ctx context.Context, clusterAPI NodeHealthCluster) (*manage
 		return nil, jsonErr
 	}
 
-	crm := struct {
-		NodeStatus json.RawMessage `json:"node_status"`
-		LRMStatus  json.RawMessage `json:"lrm_status"`
-		Timestamp  json.RawMessage `json:"timestamp"`
-	}{NodeStatus: top.NodeStatus, LRMStatus: top.LRMStatus, Timestamp: top.Timestamp}
+	crm := top.crmFields
 	if isJSONObject(top.ManagerStatus) {
-		var nested struct {
-			NodeStatus json.RawMessage `json:"node_status"`
-			LRMStatus  json.RawMessage `json:"lrm_status"`
-			Timestamp  json.RawMessage `json:"timestamp"`
-		}
+		var nested crmFields
 		if jsonErr := json.Unmarshal(top.ManagerStatus, &nested); jsonErr != nil {
 			return nil, jsonErr
 		}
@@ -514,18 +530,29 @@ func readManagerView(ctx context.Context, clusterAPI NodeHealthCluster) (*manage
 		if len(nested.LRMStatus) > 0 && len(crm.LRMStatus) == 0 {
 			crm.LRMStatus = nested.LRMStatus
 		}
+		if len(nested.ServiceStatus) > 0 {
+			crm.ServiceStatus = nested.ServiceStatus
+		}
+		if len(nested.Disarm) > 0 {
+			crm.Disarm = nested.Disarm
+		}
 		if len(nested.Timestamp) > 0 {
 			crm.Timestamp = nested.Timestamp
 		}
 	}
 
-	view := &managerView{quorumNode: top.Quorum.Node}
+	view := &managerView{quorumNode: top.Quorum.Node, disarmed: jsonPresent(crm.Disarm)}
 	if jsonErr := decodeHAMap(crm.NodeStatus, &view.nodeStatus); jsonErr != nil {
 		return nil, fmt.Errorf("node_status: %w", jsonErr)
 	}
 	if jsonErr := decodeHAMap(crm.LRMStatus, &view.lrm); jsonErr != nil {
 		return nil, fmt.Errorf("lrm_status: %w", jsonErr)
 	}
+	var services map[string]json.RawMessage
+	if jsonErr := decodeHAMap(crm.ServiceStatus, &services); jsonErr != nil {
+		return nil, fmt.Errorf("service_status: %w", jsonErr)
+	}
+	view.services = len(services)
 	if len(crm.Timestamp) > 0 && string(crm.Timestamp) != "null" {
 		var ts sdkclient.PVEInt
 		if jsonErr := json.Unmarshal(crm.Timestamp, &ts); jsonErr != nil {
@@ -540,10 +567,10 @@ func readManagerView(ctx context.Context, clusterAPI NodeHealthCluster) (*manage
 // leaves dst empty; any other shape is an error, because a manager status that
 // cannot be read must not pass for one that is empty.
 func decodeHAMap(raw json.RawMessage, dst any) error {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" || trimmed == "null" {
+	if !jsonPresent(raw) {
 		return nil
 	}
+	trimmed := strings.TrimSpace(string(raw))
 	if !strings.HasPrefix(trimmed, "{") {
 		return fmt.Errorf("want an object, got %.20s", trimmed)
 	}
@@ -555,11 +582,21 @@ func isJSONObject(raw json.RawMessage) bool {
 	return strings.HasPrefix(trimmed, "{")
 }
 
+// jsonPresent reports whether an optional JSON field carries a value, which
+// means it is neither missing nor null.
+func jsonPresent(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	return trimmed != "" && trimmed != "null"
+}
+
 // resolveManagerView decides whether a non-empty manager status is trustworthy
 // and records the verdict on the report. It returns the inputs to classify
-// with, which are empty when the view is not trusted.
+// with, which are empty when the view is not trusted. A CRM timestamp that is
+// too old is either an idle CRM or a stale one, and crmIdleReason tells them
+// apart.
 func resolveManagerView(
 	ctx context.Context,
+	clusterAPI NodeHealthCluster,
 	nodesAPI NodeHealthNodes,
 	report *NodeHealthReport,
 	mgr *managerView,
@@ -592,13 +629,61 @@ func resolveManagerView(
 		return haInputs{}
 	}
 	if !timestampFresh(now, mgr.crmStamp, NodeHealthCRMMaxAge) {
+		age := "CRM timestamp is " + describeAge(now, mgr.crmStamp) + " on the entry node's clock"
+		idle, gap := crmIdleReason(ctx, clusterAPI, mgr, now)
+		if idle {
+			report.HA = HAViewIdle
+			report.HAReason = "the CRM is idle because the cluster has no HA resources; its last round held " +
+				"no service, and its " + age
+			return haInputs{}
+		}
 		report.HA = HAViewStale
-		report.HAReason = "CRM timestamp is " + describeAge(now, mgr.crmStamp) + " on the entry node's clock"
+		report.HAReason = age
+		if gap != "" {
+			report.HAReason += ", and the CRM is not idle because " + gap
+		}
 		return haInputs{}
 	}
 
 	report.HA = HAViewManagerStatus
 	return haInputs{nodeStatus: mgr.nodeStatus, lrm: mgr.lrm, entryTime: now}
+}
+
+// crmIdleReason reports whether an old CRM timestamp belongs to an idle CRM.
+// PVE's CRM goes idle, gives up its lock, and stops writing manager status
+// after many rounds with no HA resource, so on such a cluster the timestamp
+// ages without limit and says nothing about the cluster's health. The CRM
+// goes idle only when the cluster is quorate, no resource is configured, its
+// service state is empty, and no disarm request is pending, and it becomes
+// active again as soon as a resource is configured. NodeHealth has already
+// checked quorum. Here the last round must have held no service and no disarm
+// request, its timestamp must not lie in the future, and the resource list
+// must be read and be empty. When the CRM is not idle, the second result says
+// why, or is empty when only the timestamp's direction decided it.
+func crmIdleReason(ctx context.Context, clusterAPI NodeHealthCluster, mgr *managerView, now int64) (bool, string) {
+	switch {
+	case mgr.crmStamp > now:
+		return false, ""
+	case mgr.services > 0:
+		return false, "its last round still held services"
+	case mgr.disarmed:
+		return false, "its last round held a disarm request"
+	}
+	var resp *sdkcluster.ListHaResourcesResponse
+	err := RetryOnTransient(ctx, nil, "node_health_ha_resources", 0, func() error {
+		var inner error
+		resp, inner = clusterAPI.ListHaResources(ctx, nil)
+		return inner
+	})
+	switch {
+	case err != nil:
+		return false, "the HA resources are unreadable: " + err.Error()
+	case resp == nil:
+		return false, "the HA resources answered with no body"
+	case len(*resp) > 0:
+		return false, "the cluster has HA resources"
+	}
+	return true, ""
 }
 
 // timestampFresh reports whether a timestamp is at most maxAge behind now and

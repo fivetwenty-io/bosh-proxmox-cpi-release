@@ -739,3 +739,96 @@ func TestHAServiceState_CarriesTheClockAndRoundStamps(t *testing.T) {
 		t.Fatalf("a node without an LRM entry carries a stamp: %+v", st)
 	}
 }
+
+// haIdleCluster is a quorate cluster whose CRM went idle weeks ago: no HA
+// resource, an empty last round, and the VM on pve2 not HA-managed.
+func haIdleCluster() *haCluster {
+	return &haCluster{nhCluster: &nhCluster{
+		rows: []json.RawMessage{
+			nhClusterRow(1), nhNode("pve1", 1, true, ""), nhNode("pve2", 1, false, ""), nhNode("pve3", 1, false, ""),
+		},
+		manager: nhIdleManager(nil),
+	}}
+}
+
+// A VM on a cluster whose CRM is idle is not HA-managed, and its state is
+// known, so a live or a recovery decision proceeds. This is the delete that a
+// stale reading of the idle CRM deferred without end.
+func TestHAServiceState_IdleCRMIsKnownAndNotManaged(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []pve.HADecisionKind{pve.HADecisionLive, pve.HADecisionRecovery} {
+		st, _ := haRead(t, haIdleCluster(), kind)
+		if !st.Known || st.Managed() || st.CRMPresent || st.CRMStamp != 0 || st.Node != "pve2" {
+			t.Fatalf("kind %d: want a known, unmanaged state on pve2 with no CRM view: %+v", kind, st)
+		}
+		haWant(t, st, pve.HAProceed)
+	}
+}
+
+// A resource configured after the health read found the CRM idle is one the
+// CRM has not processed yet, so the decision waits for motion rather than
+// proceeding.
+func TestHAServiceState_ResourceAddedWhileTheCRMIsIdleWaits(t *testing.T) {
+	t.Parallel()
+	c := haIdleCluster()
+	n := &nhNodes{now: nhNow}
+	report, err := pve.NodeHealth(t.Context(), c, n, pve.NodeHealthOptions{})
+	if err != nil || report.HA != pve.HAViewIdle {
+		t.Fatalf("NodeHealth: HA = %v, err = %v; want idle", report, err)
+	}
+	c.resources = []json.RawMessage{haResource("vm:100", "started")}
+	st, err := pve.ReadHAServiceState(t.Context(), c, n,
+		pve.HAServiceStateInput{VMID: 100, VMNode: "pve2", Kind: pve.HADecisionLive, Health: report})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Known || !st.Configured || st.InCRM {
+		t.Fatalf("want a configured service the CRM has not processed: %+v", st)
+	}
+	haWant(t, st, pve.HAWaitForMotion)
+}
+
+// The model reads manager status again. A service or a disarm request there
+// means the CRM was not idle after all, so the state is unknown.
+func TestHAServiceState_IdleReportWithABusyManagerStatusIsUnknown(t *testing.T) {
+	t.Parallel()
+	cases := map[string]map[string]any{
+		"a service":        {"service_status": map[string]any{"vm:100": haSvc("started", "pve2", "u-1")}},
+		"a disarm request": {"disarm": map[string]any{"mode": "freeze", "state": "disarmed"}},
+	}
+	for name, extra := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			c := haIdleCluster()
+			n := &nhNodes{now: nhNow}
+			report, err := pve.NodeHealth(t.Context(), c, n, pve.NodeHealthOptions{})
+			if err != nil || report.HA != pve.HAViewIdle {
+				t.Fatalf("NodeHealth: HA = %v, err = %v; want idle", report, err)
+			}
+			c.manager = nhIdleManager(extra)
+			st, err := pve.ReadHAServiceState(t.Context(), c, n,
+				pve.HAServiceStateInput{VMID: 100, VMNode: "pve2", Kind: pve.HADecisionRecovery, Health: report})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st.Known || !strings.Contains(st.Reason, "found the CRM idle") {
+				t.Fatalf("want an unknown state that names the idle report: %+v", st)
+			}
+			haWant(t, st, pve.HAUnknown)
+		})
+	}
+}
+
+// An old CRM timestamp on a cluster that still has an HA resource is stale, so
+// a VM that is not HA-managed there stays unknown, as before.
+func TestHAServiceState_OldCRMWithAnotherResourceIsUnknown(t *testing.T) {
+	t.Parallel()
+	c := haIdleCluster()
+	c.resources = []json.RawMessage{haResource("vm:200", "started")}
+	st, _ := haRead(t, c, pve.HADecisionRecovery)
+	if st.Known || !strings.Contains(st.Reason, "the HA view is stale") ||
+		!strings.Contains(st.Reason, "the cluster has HA resources") {
+		t.Fatalf("want an unknown state from a stale view: %+v", st)
+	}
+	haWant(t, st, pve.HAUnknown)
+}

@@ -176,6 +176,26 @@ func TestGateHADeleteStateTable(t *testing.T) {
 				s.Manage(101, "pve-node1", "started", "started")
 				s.CRMAge = 600
 			}},
+		{name: "not HA-managed on a cluster whose CRM went idle", setup: func(s *HADeleteScene) {
+			// PVE's CRM stops writing manager status once the cluster has no HA
+			// resource, so its timestamp keeps the time of its last round.
+			s.Place(101, "pve-node1")
+			s.CRMAge = 1908 * 3600
+		}},
+		{name: "old CRM timestamp on a cluster with another HA resource",
+			wantErr: []string{"HA state is unknown", "CRM timestamp is 1908h0m0s old", "the cluster has HA resources"},
+			setup: func(s *HADeleteScene) {
+				s.Place(101, "pve-node1")
+				s.Requested["vm:200"] = "started"
+				s.CRMAge = 1908 * 3600
+			}},
+		{name: "old CRM timestamp whose last round still holds a service",
+			wantErr: []string{"HA state is unknown", "its last round still held services"},
+			setup: func(s *HADeleteScene) {
+				s.Place(101, "pve-node1")
+				s.Services["vm:200"] = HASceneService{State: "started", Node: "pve-node2", UID: "uid-200"}
+				s.CRMAge = 1908 * 3600
+			}},
 		{name: "stale LRM timestamp", wantErr: []string{"HA state is unknown", "no usable state"},
 			setup: func(s *HADeleteScene) {
 				s.Manage(101, "pve-node1", "started", "started")

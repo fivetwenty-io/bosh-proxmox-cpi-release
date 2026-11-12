@@ -20,6 +20,9 @@ type ClusterClient interface {
 	ListResources(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error)
 	ListHaStatusCurrent(ctx context.Context) (*cluster.ListHaStatusCurrentResponse, error)
 	ListHaStatusManagerStatus(ctx context.Context) (*cluster.ListHaStatusManagerStatusResponse, error)
+	ListHaResources(
+		ctx context.Context, params *cluster.ListHaResourcesParams,
+	) (*cluster.ListHaResourcesResponse, error)
 }
 
 // NodesClient is the subset of the PVE nodes API used by GatherNodeFacts.

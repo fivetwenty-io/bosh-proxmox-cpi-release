@@ -418,11 +418,15 @@ func TestHandleRebootVM_UnreadableTokenPermissionsDefer(t *testing.T) {
 }
 
 // staleHAViewScene is VM 101 on node1, not HA-managed, in a cluster whose CRM
-// timestamp is an hour old, so the HA view cannot be proven.
+// timestamp is an hour old, so the HA view cannot be proven. The cluster still
+// lists another HA resource, so the old timestamp cannot be an idle CRM.
 func staleHAViewScene() *handlers.HADeleteScene {
 	scene := handlers.NewHADeleteScene()
 	scene.Place(101, "pve-node1")
-	scene.Do(func(s *handlers.HADeleteScene) { s.CRMAge = 3600 })
+	scene.Do(func(s *handlers.HADeleteScene) {
+		s.Requested["vm:200"] = "started"
+		s.CRMAge = 3600
+	})
 	return scene
 }
 

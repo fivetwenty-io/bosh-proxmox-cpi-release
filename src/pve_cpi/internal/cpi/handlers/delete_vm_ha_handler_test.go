@@ -165,6 +165,30 @@ func TestHandleDeleteVM_HAStatesThatDeferWriteNothing(t *testing.T) {
 	}
 }
 
+// TestHandleDeleteVM_UnmanagedVMOnAnIdleCRMDestroys deletes a VM that is not
+// HA-managed on a cluster whose CRM went idle weeks ago. PVE's CRM stops
+// writing manager status once the cluster has no HA resource, so its
+// timestamp is old on a healthy cluster, and the delete proceeds to the
+// destroy instead of deferring on every retry.
+func TestHandleDeleteVM_UnmanagedVMOnAnIdleCRMDestroys(t *testing.T) {
+	t.Parallel()
+	scene := handlers.NewHADeleteScene()
+	scene.Place(101, "pve-node1")
+	scene.CRMAge = 1908 * 3600
+	d := newLegacyHADelete(t, scene, "pve-node1", dlbEnabledConfig())
+
+	if err := d.run(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	events := scene.EventsSnapshot()
+	if eventIndex(events, "DeleteQemu") == -1 {
+		t.Fatalf("the VM must be destroyed; events: %v", events)
+	}
+	if at := eventIndex(events, "UpdateHaResources:"); at != -1 {
+		t.Fatalf("a VM that is not HA-managed takes no HA write; events: %v", events)
+	}
+}
+
 // TestHandleDeleteVM_IgnoredHAResourceStopsDirectlyThenPurges stops a VM
 // whose HA resource is ignored directly, because the CRM no longer acts on
 // it, and then destroys it with purge, which removes the resource.

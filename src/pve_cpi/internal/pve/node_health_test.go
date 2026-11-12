@@ -26,6 +26,12 @@ type nhCluster struct {
 	current    []json.RawMessage
 	currentErr error
 
+	// resources answers GET /cluster/ha/resources, and resourcesErr fails it.
+	// NodeHealth reads it only to tell an idle CRM from a stale one.
+	resources     []json.RawMessage
+	resourcesErr  error
+	resourceCalls int
+
 	managerCalls int
 	currentCalls int
 }
@@ -53,6 +59,17 @@ func (c *nhCluster) ListHaStatusCurrent(_ context.Context) (*sdkcluster.ListHaSt
 		return nil, c.currentErr
 	}
 	resp := sdkcluster.ListHaStatusCurrentResponse(c.current)
+	return &resp, nil
+}
+
+func (c *nhCluster) ListHaResources(
+	_ context.Context, _ *sdkcluster.ListHaResourcesParams,
+) (*sdkcluster.ListHaResourcesResponse, error) {
+	c.resourceCalls++
+	if c.resourcesErr != nil {
+		return nil, c.resourcesErr
+	}
+	resp := sdkcluster.ListHaResourcesResponse(c.resources)
 	return &resp, nil
 }
 
@@ -112,9 +129,11 @@ func nhManager(crmTS int64, nodeStatus map[string]string, lrm map[string]map[str
 	return raw
 }
 
-// nhHealthy is a three-node cluster, entry pve1, with a fresh CRM and LRMs.
+// nhHealthy is a three-node cluster, entry pve1, with a fresh CRM and LRMs and
+// one HA resource, so the CRM is active and an old timestamp means it is stale.
 func nhHealthy() *nhCluster {
 	return &nhCluster{
+		resources: []json.RawMessage{haResource("vm:900", "started")},
 		rows: []json.RawMessage{
 			nhClusterRow(1), nhNode("pve1", 1, true, ""), nhNode("pve2", 1, false, ""), nhNode("pve3", 1, false, ""),
 		},
@@ -814,5 +833,133 @@ func TestNodeHealth_TextFallbackHonorsOperatorTagAndDownNodes(t *testing.T) {
 	}
 	if e := nhEntry(t, r, "pve1"); !e.Placeable {
 		t.Errorf("a node with no lrm entry stays on cluster status: %+v", e)
+	}
+}
+
+// nhIdleManager is the manager status of a cluster whose CRM went idle long
+// ago: the CRM's last round is weeks old on the entry node's clock and holds no
+// service, and each LRM, which keeps writing, waits for the agent lock. It is
+// the shape PVE 9 shows once the last HA resource is gone.
+func nhIdleManager(extra map[string]any) json.RawMessage {
+	crm := map[string]any{
+		"master_node":    "pve2",
+		"node_status":    map[string]string{"pve1": "online", "pve2": "fence", "pve3": "online"},
+		"service_status": map[string]any{},
+		"timestamp":      nhNow - 1908*3600,
+	}
+	for k, v := range extra {
+		crm[k] = v
+	}
+	idle := func() map[string]any { return nhLRM("active", "wait_for_agent_lock", nhNow-2) }
+	raw, _ := json.Marshal(map[string]any{
+		"manager_status": crm,
+		"lrm_status":     map[string]any{"pve1": idle(), "pve2": idle(), "pve3": idle()},
+		"quorum":         map[string]any{"node": "pve1", "quorate": "1"},
+	})
+	return raw
+}
+
+// An idle CRM stops writing manager status, so its timestamp ages without
+// limit on a healthy cluster. With no HA resource, an empty last round, and no
+// disarm request, the view is idle and cluster status classifies the nodes, as
+// it does when HA is not configured. The idle CRM's node_status is ignored.
+func TestNodeHealth_IdleCRMWithNoResources(t *testing.T) {
+	t.Parallel()
+	c := nhHealthy()
+	c.resources = nil
+	c.manager = nhIdleManager(nil)
+	r, _ := nhRun(t, c, pve.NodeHealthOptions{})
+	if r.HA != pve.HAViewIdle {
+		t.Fatalf("HA = %q (%s); want idle", r.HA, r.HAReason)
+	}
+	for _, want := range []string{"idle", "no HA resources", "1908h0m0s old"} {
+		if !strings.Contains(r.HAReason, want) {
+			t.Errorf("HAReason %q does not name %q", r.HAReason, want)
+		}
+	}
+	if c.resourceCalls != 1 {
+		t.Errorf("the idle check reads the resource list once; got %d reads", c.resourceCalls)
+	}
+	for _, name := range []string{"pve1", "pve2", "pve3"} {
+		e := nhEntry(t, r, name)
+		if !e.ProxyTarget || !e.Placeable || e.DeadOrFenced || e.CRMState != "" || e.Watchdog != pve.WatchdogUnknown {
+			t.Errorf("node %s: the idle CRM's last round leaked into the answer: %+v", name, e)
+		}
+	}
+}
+
+// Every condition PVE's CRM checks before it goes idle must hold, so an old
+// timestamp that fails any of them stays stale and says why.
+func TestNodeHealth_OldCRMThatIsNotIdleStaysStale(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		setup func(c *nhCluster)
+		want  string
+	}{
+		"a configured resource": {
+			setup: func(c *nhCluster) { c.resources = []json.RawMessage{haResource("vm:900", "started")} },
+			want:  "the cluster has HA resources",
+		},
+		"an ignored resource": {
+			setup: func(c *nhCluster) { c.resources = []json.RawMessage{haResource("vm:900", "ignored")} },
+			want:  "the cluster has HA resources",
+		},
+		"a service in the last round": {
+			setup: func(c *nhCluster) {
+				c.manager = nhIdleManager(map[string]any{
+					"service_status": map[string]any{"vm:900": haSvc("started", "pve2", "u-9")},
+				})
+			},
+			want: "its last round still held services",
+		},
+		"a disarm request": {
+			setup: func(c *nhCluster) {
+				disarm := map[string]any{"mode": "freeze", "state": "disarmed"}
+				c.manager = nhIdleManager(map[string]any{"disarm": disarm})
+			},
+			want: "its last round held a disarm request",
+		},
+		"an unreadable resource list": {
+			setup: func(c *nhCluster) { c.resourcesErr = errors.New("403 permission denied") },
+			want:  "the HA resources are unreadable",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			c := nhHealthy()
+			c.resources = nil
+			c.manager = nhIdleManager(nil)
+			tc.setup(c)
+			r, _ := nhRun(t, c, pve.NodeHealthOptions{})
+			if r.HA != pve.HAViewStale {
+				t.Fatalf("HA = %q (%s); want stale", r.HA, r.HAReason)
+			}
+			if !strings.Contains(r.HAReason, "CRM timestamp is 1908h0m0s old") ||
+				!strings.Contains(r.HAReason, tc.want) {
+				t.Errorf("HAReason %q does not name the age and %q", r.HAReason, tc.want)
+			}
+		})
+	}
+}
+
+// A CRM timestamp from the entry node's future is a clock problem, never an
+// idle CRM, and a fresh timestamp needs no resource read at all.
+func TestNodeHealth_IdleCheckOnlyForAnOldTimestamp(t *testing.T) {
+	t.Parallel()
+	c := nhHealthy()
+	c.resources = nil
+	c.manager = nhManager(nhNow+600, map[string]string{"pve1": "online"}, nil)
+	r, _ := nhRun(t, c, pve.NodeHealthOptions{})
+	if r.HA != pve.HAViewStale || c.resourceCalls != 0 {
+		t.Fatalf("a future timestamp: HA = %q (%s), resource reads %d; want stale and none",
+			r.HA, r.HAReason, c.resourceCalls)
+	}
+
+	c = nhHealthy()
+	c.resources = nil
+	r, _ = nhRun(t, c, pve.NodeHealthOptions{})
+	if r.HA != pve.HAViewManagerStatus || c.resourceCalls != 0 {
+		t.Fatalf("a fresh timestamp: HA = %q, resource reads %d; want manager_status and none", r.HA, c.resourceCalls)
 	}
 }

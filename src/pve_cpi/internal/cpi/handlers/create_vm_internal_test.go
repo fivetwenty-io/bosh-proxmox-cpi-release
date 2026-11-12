@@ -876,6 +876,13 @@ func (c *placementInternalTestCluster) ListHaStatusManagerStatus(_ context.Conte
 	return &empty, nil
 }
 
+func (c *placementInternalTestCluster) ListHaResources(
+	_ context.Context, _ *sdkcluster.ListHaResourcesParams,
+) (*sdkcluster.ListHaResourcesResponse, error) {
+	empty := sdkcluster.ListHaResourcesResponse{}
+	return &empty, nil
+}
+
 var _ placement.ClusterClient = (*placementInternalTestCluster)(nil)
 
 // placementInternalTestPVE wraps the test cluster + nodes clients.
@@ -1257,6 +1264,13 @@ func (c *rawNodeCluster) ListHaStatusCurrent(_ context.Context) (*sdkcluster.Lis
 }
 func (c *rawNodeCluster) ListHaStatusManagerStatus(_ context.Context) (*sdkcluster.ListHaStatusManagerStatusResponse, error) {
 	empty := sdkcluster.ListHaStatusManagerStatusResponse{}
+	return &empty, nil
+}
+
+func (c *rawNodeCluster) ListHaResources(
+	_ context.Context, _ *sdkcluster.ListHaResourcesParams,
+) (*sdkcluster.ListHaResourcesResponse, error) {
+	empty := sdkcluster.ListHaResourcesResponse{}
 	return &empty, nil
 }
 

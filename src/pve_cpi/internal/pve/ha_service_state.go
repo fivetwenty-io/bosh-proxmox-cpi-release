@@ -243,10 +243,10 @@ func orUnset(v, fallback string) string {
 }
 
 // HAServiceStateCluster is the subset of the PVE cluster API that
-// ReadHAServiceState reads. It is satisfied by the sdk cluster service.
+// ReadHAServiceState reads. It is satisfied by the sdk cluster service. The
+// resource list comes from NodeHealthCluster.
 type HAServiceStateCluster interface {
 	NodeHealthCluster
-	ListHaResources(ctx context.Context, params *sdkcluster.ListHaResourcesParams) (*sdkcluster.ListHaResourcesResponse, error)
 	GetHaResources(ctx context.Context, sid string) (*sdkcluster.GetHaResourcesResponse, error)
 }
 
@@ -273,6 +273,33 @@ type HAServiceStateInput struct {
 
 // HAServiceSID returns the HA service ID of a VM.
 func HAServiceSID(vmid int) string { return "vm:" + strconv.Itoa(vmid) }
+
+// haViewReadable reports whether a health report's HA view is one that
+// ReadHAServiceState can build a state from.
+func haViewReadable(view HAView) bool {
+	switch view {
+	case HAViewManagerStatus, HAViewNotConfigured, HAViewIdle:
+		return true
+	default:
+		return false
+	}
+}
+
+// idleManagerConflict returns why a manager status contradicts a health report
+// that found the CRM idle, or "" when there is no conflict. A service or a
+// disarm request in the manager status means the CRM was not idle after all.
+func idleManagerConflict(view HAView, mgr *haManagerView) string {
+	switch {
+	case view != HAViewIdle:
+		return ""
+	case len(mgr.services) > 0:
+		return "manager status holds services although the health report found the CRM idle"
+	case mgr.disarmed:
+		return "manager status holds a disarm request although the health report found the CRM idle"
+	default:
+		return ""
+	}
+}
 
 // ReadHAServiceState builds the normalized HA model for one VM. Every source
 // failing to answer, every missing field, and every stale timestamp that the
@@ -328,7 +355,7 @@ func ReadHAServiceState(
 		return unknown("the entry node does not report the cluster quorate")
 	case health.EntryNode == "":
 		return unknown("no source names the entry node")
-	case health.HA != HAViewManagerStatus && health.HA != HAViewNotConfigured:
+	case !haViewReadable(health.HA):
 		return unknown("the HA view is %s: %s", health.HA, health.HAReason)
 	}
 
@@ -341,8 +368,17 @@ func ReadHAServiceState(
 			mgr.quorumNode, health.EntryNode)
 	}
 
+	// An idle CRM leaves its last round in manager status. The model reads it
+	// the way it reads a cluster without HA, because the CRM holds no service,
+	// and a resource configured since then reads as one the CRM has not
+	// processed yet.
+	if reason := idleManagerConflict(health.HA, mgr); reason != "" {
+		return unknown("%s", reason)
+	}
 	var entryTime int64
 	switch {
+	case health.HA == HAViewIdle:
+		// The idle CRM's last round is not a live view, so CRMPresent stays false.
 	case mgr.empty() && health.HA == HAViewManagerStatus:
 		return unknown("manager status is empty although the health report trusted one")
 	case !mgr.empty() && health.HA != HAViewManagerStatus:
@@ -539,6 +575,7 @@ type haManagerView struct {
 	lrm        map[string]lrmWire
 	services   map[string]json.RawMessage
 	quorumNode string
+	disarmed   bool
 }
 
 // empty reports whether manager status carries no CRM or LRM view at all.
@@ -569,6 +606,7 @@ func readHAManagerStatus(ctx context.Context, clusterAPI NodeHealthCluster) (*ha
 		NodeStatus    json.RawMessage `json:"node_status"`
 		LRMStatus     json.RawMessage `json:"lrm_status"`
 		ServiceStatus json.RawMessage `json:"service_status"`
+		Disarm        json.RawMessage `json:"disarm"`
 		Timestamp     json.RawMessage `json:"timestamp"`
 	}
 	var top struct {
@@ -596,12 +634,15 @@ func readHAManagerStatus(ctx context.Context, clusterAPI NodeHealthCluster) (*ha
 		if len(nested.ServiceStatus) > 0 {
 			crm.ServiceStatus = nested.ServiceStatus
 		}
+		if len(nested.Disarm) > 0 {
+			crm.Disarm = nested.Disarm
+		}
 		if len(nested.Timestamp) > 0 {
 			crm.Timestamp = nested.Timestamp
 		}
 	}
 
-	view := &haManagerView{quorumNode: top.Quorum.Node}
+	view := &haManagerView{quorumNode: top.Quorum.Node, disarmed: jsonPresent(crm.Disarm)}
 	if jsonErr := decodeHAMap(crm.NodeStatus, &view.nodeStatus); jsonErr != nil {
 		return nil, fmt.Errorf("node_status: %w", jsonErr)
 	}

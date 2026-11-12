@@ -181,13 +181,19 @@ func (p *Profile) PrerequisiteError() error {
 }
 
 // HAStateReadable reports whether the HA manager status gave a trustworthy
-// answer. When it did not, placement in auto and managed mode falls back to the
-// nodes that cluster status reports online.
+// answer. An idle CRM on a cluster with no HA resource is one, because it holds
+// no state to read. When it did not, placement in auto and managed mode falls
+// back to the nodes that cluster status reports online.
 func (p *Profile) HAStateReadable() bool {
 	if p == nil || p.Health == nil {
 		return false
 	}
-	return p.Health.HA == pve.HAViewManagerStatus || p.Health.HA == pve.HAViewNotConfigured
+	switch p.Health.HA {
+	case pve.HAViewManagerStatus, pve.HAViewNotConfigured, pve.HAViewIdle:
+		return true
+	default:
+		return false
+	}
 }
 
 // OnlineNodes returns the names of the nodes cluster status reports online.
@@ -309,8 +315,10 @@ func (p *Profile) probe(ctx context.Context, deps Deps) {
 // is a quorate cluster whose HA resource list was read and is empty. PVE's CRM
 // stays idle and holds no manager lock until the first resource exists, so
 // registering that first resource is what starts it, and a gap there would
-// keep the profile from ever reaching full. A resource list that cannot be
-// read, or that is not empty, keeps the gap so the check fails closed.
+// keep the profile from ever reaching full. A CRM that went idle after the
+// last resource was removed still names its old master, and node health
+// reports it idle. A resource list that cannot be read, or that is not empty,
+// keeps the gap so the check fails closed.
 func (p *Profile) checkCRM(ctx context.Context, api ClusterAPI, masterErr error) {
 	switch {
 	case masterErr != nil:
@@ -318,6 +326,8 @@ func (p *Profile) checkCRM(ctx context.Context, api ClusterAPI, masterErr error)
 	case p.Health == nil:
 		p.addGap("node health unreadable: " + p.HealthErr)
 	case p.CRMMaster == "" && p.crmIdle(ctx, api):
+		p.crmNote = "HA stack idle, no resources configured yet"
+	case p.Health.HA == pve.HAViewIdle:
 		p.crmNote = "HA stack idle, no resources configured yet"
 	case p.Health.HA != pve.HAViewManagerStatus:
 		p.addGap(fmt.Sprintf("no CRM master with a fresh status (HA view %s: %s)", p.Health.HA, p.Health.HAReason))

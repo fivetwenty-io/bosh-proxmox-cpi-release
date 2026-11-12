@@ -55,6 +55,13 @@ func (s *stubCluster) ListHaStatusManagerStatus(_ context.Context) (*cluster.Lis
 	return &empty, nil
 }
 
+func (s *stubCluster) ListHaResources(
+	_ context.Context, _ *cluster.ListHaResourcesParams,
+) (*cluster.ListHaResourcesResponse, error) {
+	empty := cluster.ListHaResourcesResponse{}
+	return &empty, nil
+}
+
 type stubNodes struct {
 	storageFn func(ctx context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error)
 	now       int64

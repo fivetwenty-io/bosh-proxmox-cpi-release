@@ -11,6 +11,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 func resolve(t *testing.T, w *world, cfg *config.CPIConfig) *ha.Profile {
@@ -1247,6 +1248,39 @@ func TestIdleCRMWithUnreadableResourcesKeepsTheGap(t *testing.T) {
 	p := resolve(t, w, cfgMode(config.HAModeAuto))
 	if p.Effective != ha.EffectiveObserveOnly || !strings.Contains(p.Reason, "no CRM master") {
 		t.Fatalf("effective=%s reason=%q", p.Effective, p.Reason)
+	}
+}
+
+// A CRM that went idle after the last resource was removed still names its old
+// master, and its timestamp is weeks old. With no resource left, that is the
+// idle stack PVE reports, not a missing master, so the profile stays full.
+func TestIdleCRMThatNamesItsOldMasterIsNotAGap(t *testing.T) {
+	w := three()
+	w.crmStamp = now - 1908*3600
+	w.noResources = true
+	p := resolve(t, w, cfgMode(config.HAModeAuto))
+	if p.Effective != ha.EffectiveFull || len(p.Gaps) != 0 {
+		t.Fatalf("effective=%s gaps=%v", p.Effective, p.Gaps)
+	}
+	if !p.HAStateReadable() || p.Health.HA != pve.HAViewIdle {
+		t.Fatalf("an idle CRM must read as idle: view=%s readable=%v", p.Health.HA, p.HAStateReadable())
+	}
+	if !strings.Contains(p.Advice, "HA stack idle, no resources configured yet") {
+		t.Fatalf("advice = %q", p.Advice)
+	}
+}
+
+// The same old timestamp with a resource configured is a stale CRM, which
+// keeps the gap.
+func TestOldCRMWithResourcesKeepsTheGap(t *testing.T) {
+	w := three()
+	w.crmStamp = now - 1908*3600
+	p := resolve(t, w, cfgMode(config.HAModeAuto))
+	if p.Effective != ha.EffectiveObserveOnly || !strings.Contains(p.Reason, "HA view stale") {
+		t.Fatalf("effective=%s reason=%q", p.Effective, p.Reason)
+	}
+	if p.HAStateReadable() || strings.Contains(p.Advice, "idle") {
+		t.Fatalf("a stale CRM must not read as idle: readable=%v advice=%q", p.HAStateReadable(), p.Advice)
 	}
 }
 
