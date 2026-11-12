@@ -2489,7 +2489,7 @@ The CPI keeps the endpoint cache, the HA profile cache, and the HA recovery epis
   It ran as a user that cannot read the directory, or it could not test the directories above it. The finding says so, and we run the check as root or as the CPI's user.
 
 - The CPI's user is unknown.
-  With no allocation journal directory to name that user, the doctor judges as its own user and says the CPI uses the directory only when it runs as the owner.
+  With no allocation journal directory to name that user, the doctor judges as its own user. When another user owns a directory that passes every other check, it says the CPI keeps its record there only when it runs as that owner.
 
 **Fix**
 
