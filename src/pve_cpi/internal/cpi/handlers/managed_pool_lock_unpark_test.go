@@ -479,9 +479,9 @@ func resolveFlowDisk(t *testing.T, disk *parkedFlowDisk) resolvedDisk {
 
 // assertCleanDiskTimeout checks what a caller holding its own allocation
 // relies on after a disk operation waited out a parker lock. The error carries
-// the returned-disk marker and the retriable timeout, the wait was the managed
-// one rather than the 15-second default, the timeout came only after that wait
-// ran out, and the disk's record is returned.
+// the returned-disk marker and the retriable timeout, the wait was the one the
+// test set rather than the full parker lock wait, the timeout came only after
+// that wait ran out, and the disk's record is returned.
 func assertCleanDiskTimeout(t *testing.T, disk *parkedFlowDisk, err error, elapsed, wait time.Duration) {
 	t.Helper()
 	if !isDiskReturnedAfterLockTimeout(err) || !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
@@ -496,9 +496,10 @@ func assertCleanDiskTimeout(t *testing.T, disk *parkedFlowDisk, err error, elaps
 	assertReturnedRecord(t, "timed-out", disk.record(t))
 }
 
-// TestCreateVMPreAttachUsesTheManagedWait covers create_vm's disk_cids
-// pre-attach, which unparks through the same parker lock as attach_disk.
-func TestCreateVMPreAttachUsesTheManagedWait(t *testing.T) {
+// TestCreateVMPreAttachTimesOutAfterTheParkerLockWait covers create_vm's
+// disk_cids pre-attach, which unparks through the same parker lock as
+// attach_disk.
+func TestCreateVMPreAttachTimesOutAfterTheParkerLockWait(t *testing.T) {
 	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
@@ -532,10 +533,10 @@ func TestCreateVMPreAttachOverlayBeforeTimeoutReturnsTheDisk(t *testing.T) {
 	assertOverlayNoteObserved(t, disk, disk.record(t))
 }
 
-// TestDeleteVMPreservationUsesTheManagedWait covers delete_vm's
+// TestDeleteVMPreservationTimesOutAfterTheParkerLockWait covers delete_vm's
 // preserve_disk, which parks the disk through the same parker lock as
 // detach_disk.
-func TestDeleteVMPreservationUsesTheManagedWait(t *testing.T) {
+func TestDeleteVMPreservationTimesOutAfterTheParkerLockWait(t *testing.T) {
 	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
@@ -741,12 +742,13 @@ func legacyPreservationFixture(t *testing.T, locks *lockContention) (Deps, *life
 	return deps, client, handle, parker, cid
 }
 
-// TestDeleteVMLegacyPreservationUsesTheManagedWait covers delete_vm's legacy
-// branch, which preserves a stable-ID disk that no allocation owns. It takes
-// the same parker lock, so it gets the same parker lock wait. A wait that runs out
-// before the preservation touched the disk leaves the VM allocation settled,
-// and delete_vm's cleanup rule does not mark it uncertain.
-func TestDeleteVMLegacyPreservationUsesTheManagedWait(t *testing.T) {
+// TestDeleteVMLegacyPreservationTimesOutAfterTheParkerLockWait covers
+// delete_vm's legacy branch, which preserves a stable-ID disk that no
+// allocation owns. It takes the same parker lock, so it gets the same parker
+// lock wait. A wait that runs out before the preservation touched the disk
+// leaves the VM allocation settled, and delete_vm's cleanup rule does not mark
+// it uncertain.
+func TestDeleteVMLegacyPreservationTimesOutAfterTheParkerLockWait(t *testing.T) {
 	t.Parallel()
 	locks := newLockContention(t)
 	deps, client, handle, parker, _ := legacyPreservationFixture(t, locks)
