@@ -28,6 +28,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - When the journal-managed lifecycle guard cannot settle the outcome of a mutation, or when its own checks before a mutation refuse it, the CPI now logs a warning that says the mutation requires reconciliation and gives the reason, the call, the operation, and the allocation. The warning for an outcome the guard could not settle also names the step, and the warning for a refusal before the mutation does not, because the CPI sent nothing and recorded no step. Before this fix, the Director saw only `requires reconciliation at lifecycle attach_disk Nodes.CreateQemuMigrate`, and the reason was lost.
 
+### Security
+
+- The CPI is now built with Go 1.27.4, which fixes GO-2026-6859 in `net/http`. govulncheck reported it against the Go 1.27.3 standard library. The `golang-1.27` package now carries `go1.27.4.linux-amd64.tar.gz`, and CI runs in the matching `golang:1.27` image.
+
 ## [0.9.6] - 2026-11-11
 
 ### Changed
