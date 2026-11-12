@@ -64,6 +64,12 @@ var ticketLoginFailurePrefixes = []string{"auto-login failed: ", "failed to refr
 // because another of its parts could be a request that was sent.
 func isTicketLoginFailure(err error) bool {
 	for e := err; e != nil; e = errors.Unwrap(e) {
+		// A MaybeSentError repeats its wrapped error's text, so its text says
+		// nothing about a login, and the request may have been sent.
+		//nolint:errorlint // this link only; errors.As would also see a MaybeSentError further down the chain
+		if _, maybeSent := e.(*endpointpool.MaybeSentError); maybeSent {
+			return false
+		}
 		if _, joined := e.(interface{ Unwrap() []error }); joined {
 			return false
 		}

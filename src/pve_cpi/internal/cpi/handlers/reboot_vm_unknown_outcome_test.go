@@ -347,6 +347,10 @@ func TestHandleRebootVM_HardResetMaybeSent_NotResent(t *testing.T) {
 		"maybe sent after the connection": &endpointpool.MaybeSentError{Err: fmt.Errorf("Post: %w", read)},
 		"relay 596":                       &sdkerrors.APIError{HTTPCode: 596, Message: "broken pipe"},
 		"sdk timeout":                     &sdkerrors.TimeoutError{Operation: "POST", Duration: "30s"},
+		// Text alone, without PVE's status, does not prove that PVE refused this reset.
+		"text-only lock": errors.New("VM 101 is locked (backup)"),
+		"text-only config missing": errors.New(
+			"Configuration file 'nodes/pve-node1/qemu-server/101.conf' does not exist"),
 	}
 	for name, resetErr := range cases {
 		t.Run(name, func(t *testing.T) {
