@@ -219,7 +219,8 @@ func TestHandleRebootVM_SoftFallbackOnTaskFail(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// c. Soft fallback on reboot-call error: status running; CreateQemuStatusReboot errors; reset called.
+// c. Soft fallback on reboot-call error: status running; PVE answers the
+//    reboot call with a refusal; reset called.
 // --------------------------------------------------------------------------
 
 func TestHandleRebootVM_SoftFallbackOnRebootCallError(t *testing.T) {
@@ -238,7 +239,7 @@ func TestHandleRebootVM_SoftFallbackOnRebootCallError(t *testing.T) {
 	}
 	nodesSvc := &mockNodesService{
 		createQemuStatusRebootFn: func(_ context.Context, _, _ string, _ *nodes.CreateQemuStatusRebootParams) (*nodes.CreateQemuStatusRebootResponse, error) {
-			return nil, errors.New("pve: acpi not available")
+			return nil, &sdkerrors.APIError{HTTPCode: 500, Message: "acpi not available"}
 		},
 	}
 	tasksSvc := &mockTasksService{}

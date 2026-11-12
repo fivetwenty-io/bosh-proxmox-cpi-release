@@ -282,7 +282,7 @@ flowchart TD
 
 **Notes:** Reboots the VM using the strategy set by `pve.reboot_mode` (default `soft`).
 
-- **soft** (default): sends a graceful ACPI reboot via the PVE API and waits up to `pve.reboot_timeout` seconds (default 60) for the guest to respond. If the guest does not shut down in time, or the reboot call fails for any reason other than a 404, the CPI falls back to a hard reset. A 404 response raises `Bosh::Clouds::VMNotFound` (non-retriable — the VM is gone, so no hard-reset fallback is attempted).
+- **soft** (default): sends a graceful ACPI reboot via the PVE API and waits up to `pve.reboot_timeout` seconds (default 60) for the guest to respond. If the guest does not shut down in time, or PVE refuses the reboot call for any reason other than a 404, the CPI falls back to a hard reset. A 404 response raises `Bosh::Clouds::VMNotFound` (non-retriable — the VM is gone, so no hard-reset fallback is attempted). When the CPI can't tell whether the graceful reboot took effect, it doesn't hard-reset the VM. That happens when the reboot task's poll ends before the task reports an exit status, when the reboot call may have reached PVE before its connection failed, or when PVE accepts the call but its task ID can't be read. The CPI then returns a retriable error that says the outcome is unknown, and names the task when it has one, so the Director's retry decides what happens next.
 - **hard**: issues an immediate hard reset (power cycle) with no grace period. This was the only behavior before the `reboot_mode` option was introduced.
 
 If the VM is stopped when `reboot_vm` is called, the CPI starts it so the VM ends up running, matching the BOSH expectation. The BOSH wire contract is unchanged: `reboot_vm` accepts only `vm_cid`.

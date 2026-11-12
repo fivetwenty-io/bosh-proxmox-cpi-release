@@ -388,7 +388,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** `delete_vm` should never wait on a guest to voluntarily shut itself down — a wedged or unresponsive guest would hang the delete indefinitely — while `reboot_vm` should still try a graceful path first, bounded by a timeout, so a healthy guest gets a clean reboot.
 
-**CPI behavior.** `delete_vm` always issues a hard `QEMU().Stop`, never a guest-shutdown request. `reboot_vm`'s default `soft` mode issues a graceful ACPI reboot bounded by `pve.reboot_timeout` (default 60 s), falling back to a hard reset on timeout or error; `hard` mode issues the reset immediately.
+**CPI behavior.** `delete_vm` always issues a hard `QEMU().Stop`, never a guest-shutdown request. `reboot_vm`'s default `soft` mode issues a graceful ACPI reboot bounded by `pve.reboot_timeout` (default 60 s), falling back to a hard reset when the guest doesn't respond in time or PVE refuses the reboot, and returning a retriable error with no reset when the reboot's outcome is unknown; `hard` mode issues the reset immediately.
 
 **Status.** Meets.
 

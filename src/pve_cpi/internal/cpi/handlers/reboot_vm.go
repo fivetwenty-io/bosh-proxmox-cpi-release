@@ -50,8 +50,13 @@ import (
 //  5. If mode == "hard": call rebootVMHardReset() directly.
 //  6. If mode == "soft": POST /status/reboot with configured timeout.
 //     - 404 on reboot call → VMNotFound (no fallback).
-//     - Other reboot-call error → log warn + fallback to rebootVMHardReset().
-//     - Reboot UPID await failure → log warn + fallback to rebootVMHardReset().
+//     - A reboot-call error PVE answered, or one that proves the request was
+//     never sent → log warn + fallback to rebootVMHardReset().
+//     - A reboot task that resolved with a failure verdict → log warn +
+//     fallback to rebootVMHardReset().
+//     - Any outcome the CPI cannot know, such as a reboot call that may have
+//     been written, an unreadable UPID, or a task poll that ended unresolved
+//     → retriable error, no hard reset.
 //     - Empty UPID (synchronous) → success without await.
 //
 // Config knobs: reboot_mode ("soft"|"hard", default "soft"),
@@ -339,16 +344,26 @@ func rebootVMHandleStopped(ctx context.Context, deps Deps, logger *log.Logger, n
 
 // rebootVMSoftWithFallback issues a graceful ACPI reboot via
 // POST /nodes/{node}/qemu/{vmCID}/status/reboot with the configured timeout.
-// On any failure other than 404, falls back to rebootVMHardReset.
+// It falls back to rebootVMHardReset only when it knows the graceful reboot
+// did not take effect, because a hard reset of a guest whose reboot finished,
+// or is still running, power-cycles it a second time.
 //
 // Inputs: ctx, deps, logger, node, vmid, vmCID, timeout — all validated by the caller.
 // Failure modes:
 //   - 404, config missing, or a config lock on the reboot call → no fallback
 //     (see rebootCallFailure): VMNotFound when the VM is proven gone, a
 //     retriable error otherwise.
-//   - other reboot-call error → log warn + rebootVMHardReset() fallback.
-//   - UPIDFromRaw parse error → log warn + rebootVMHardReset() fallback.
-//   - await task failure → log warn + rebootVMHardReset() fallback.
+//   - other reboot-call error that PVE answered, or that proves the request
+//     was never sent (pve.IsMutationRefusedOrUnsent) → log warn +
+//     rebootVMHardReset() fallback.
+//   - any other reboot-call error, such as a transport fault after the
+//     request may have been written → retriable error, no fallback.
+//   - UPIDFromRaw parse error on an accepted request → retriable error, no
+//     fallback, because PVE may have started the reboot task.
+//   - await ends with the task's own failure verdict (pve.IsTaskExitVerdict)
+//     → log warn + rebootVMHardReset() fallback.
+//   - any other await error, such as an unresolved poll → retriable error
+//     that names the task, no fallback.
 //   - empty UPID → success without await.
 func rebootVMSoftWithFallback(ctx context.Context, deps Deps, logger *log.Logger, node string, vmid int, vmCID string, timeout int) (any, error) {
 	t := int64(timeout)
@@ -360,6 +375,14 @@ func rebootVMSoftWithFallback(ctx context.Context, deps Deps, logger *log.Logger
 		if isConfigMissing(rebootErr) || pve.IsVMConfigLocked(rebootErr) {
 			return nil, rebootCallFailure(ctx, deps, "reboot", vmCID, vmid, node, rebootErr)
 		}
+		if !pve.IsMutationRefusedOrUnsent(rebootErr) {
+			logger.Warn("reboot_vm: the graceful reboot request may have reached PVE and its outcome is unknown, "+
+				"so the VM is not hard-reset", log.String("node", node), log.Err(rebootErr))
+			return nil, cpierrors.WrapAs(rebootErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+				"reboot_vm: the graceful reboot request for VM %s on node %s may have reached PVE, and its outcome "+
+					"is unknown, so the CPI did not hard-reset the VM; the retry decides what to do next",
+				vmCID, node))
+		}
 		logger.Warn("reboot_vm: graceful reboot call failed, falling back to hard reset", log.Err(rebootErr))
 		return rebootAfterSend(rebootVMHardReset(ctx, deps, logger, node, vmid, vmCID))
 	}
@@ -370,12 +393,24 @@ func rebootVMSoftWithFallback(ctx context.Context, deps Deps, logger *log.Logger
 	}
 	upid, upidErr := pve.UPIDFromRaw(rawMsg)
 	if upidErr != nil {
-		logger.Warn("reboot_vm: could not parse UPID from reboot response, falling back to hard reset", log.Err(upidErr))
-		return rebootAfterSend(rebootVMHardReset(ctx, deps, logger, node, vmid, vmCID))
+		logger.Warn("reboot_vm: PVE accepted the graceful reboot, but its task ID could not be read, so the "+
+			"outcome is unknown and the VM is not hard-reset", log.String("node", node), log.Err(upidErr))
+		return nil, cpierrors.WrapAs(upidErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+			"reboot_vm: PVE accepted the graceful reboot of VM %s on node %s, but its task ID could not be read, "+
+				"so the outcome is unknown and the CPI did not hard-reset the VM; the retry decides what to do next",
+			vmCID, node))
 	}
 
 	if upid != "" {
 		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, logger); awaitErr != nil {
+			if !pve.IsTaskExitVerdict(awaitErr) {
+				logger.Warn("reboot_vm: the graceful reboot task's outcome is unknown, so the VM is not hard-reset",
+					log.String("upid", upid), log.Err(awaitErr))
+				return nil, cpierrors.WrapAs(awaitErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+					"reboot_vm: the outcome of the graceful reboot task %s of VM %s is unknown, because polling ended "+
+						"before it reported an exit status, so the CPI did not hard-reset the VM; the retry decides "+
+						"what to do next", upid, vmCID))
+			}
 			logger.Warn("reboot_vm: graceful reboot task failed, falling back to hard reset", log.Err(awaitErr))
 			return rebootAfterSend(rebootVMHardReset(ctx, deps, logger, node, vmid, vmCID))
 		}
