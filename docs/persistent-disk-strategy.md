@@ -318,7 +318,7 @@ is tagged, so on a CPI-managed cluster that fallback never fires.
 
 ### Parker teardown procedure
 
-The CPI never auto-destroys parker VMs. To remove a parker manually:
+The CPI destroys one kind of parker on its own. When `pve.ha.mode` is `auto` or `managed` and a parker that PVE HA manages holds nothing, the next parker sweep on its node destroys it together with its HA resource. A parker that PVE HA does not manage is never destroyed automatically, and it stays in place when its last disk leaves. To remove such a parker manually:
 
 1. Run `scripts/disk-audit` and confirm that parker's row shows `0` under both
    `DISKS` and `UNUSED`, and that the audit emitted no `unusedN` warning naming

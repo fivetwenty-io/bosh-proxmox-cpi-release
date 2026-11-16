@@ -293,7 +293,7 @@ With shared storage, PVE HA moves a VM by live migration or by stealing its conf
 
 A cluster whose every volume lives on NFS, such as one backed by a NetApp array, resolves to shared for every VM, so it never reaches the local-disk policies and `local_policy` can stay at `none`. The one volume such a cluster can still get wrong is the config-drive ISO, so `pve.iso_storage` should point at the same shared storage. [ConfigDrive](configdrive.md#migration-and-ha-interaction) explains why.
 
-Parker VMs, which hold persistent disks for stopped instances, are registered as `stopped` HA resources when every disk they hold sits on shared storage that at least two placeable nodes reach. Their config then follows a failover of their node, and because a parker never runs, there is no second writer. A park never puts a disk into a registered parker unless the disk's storage reaches every node of that parker's access set.
+Parker VMs, which hold persistent disks for stopped instances, are registered as `stopped` HA resources when every disk they hold sits on shared storage that at least two placeable nodes reach. Their config then follows a failover of their node, and because a parker never runs, there is no second writer. A park never puts a disk into a registered parker unless the disk's storage reaches every node of that parker's access set. When the last disk leaves a registered parker, the next parker sweep on its node destroys the parker and its HA resource, once it has proved that the parker is empty, stopped, free of snapshots, and still this Director's. A later park of a disk on node-local storage therefore creates a new parker that PVE HA does not manage, and the empty registered one is gone.
 
 ### Local storage
 
