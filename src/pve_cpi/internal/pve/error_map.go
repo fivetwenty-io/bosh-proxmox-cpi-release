@@ -246,6 +246,16 @@ func WrapError(err error) error {
 				"server fault")
 	}
 
+	// PVE refuses a volume a replicated VM cannot take, by reassignment or by a
+	// config edit, with a 500 body that holds for as long as the VM has a
+	// replication job. The generic 5xx branch below would retry it.
+	if IsMoveReplicationRefusal(err) || IsReplicatedVolumeAddRefusal(err) {
+		return cpierrors.WrapAs(err, cpierrors.TypeCloud,
+			"PVE refuses this volume on a replicated VM, because the VM has a replication job and the volume's "+
+				"storage cannot replicate; only a ZFS pool replicates, and only shared storage is exempt; this is "+
+				"permanent while the job exists, not a transient server fault")
+	}
+
 	// SDK API status classification: 404 vs 5xx vs 429 vs other 4xx. Resolved
 	// through apiHTTPCode, not a bare errors.As against *APIError, because the
 	// SDK returns 400 as *ParameterError, 401 as *AuthenticationError, and 403
@@ -584,8 +594,10 @@ func IsTransientTransport(err error) bool {
 	// below: PVE answers a request-shaped rejection with a 500 body rather than
 	// a 4xx, so "is a 5xx" alone cannot distinguish a cycling worker from a
 	// verdict that will never change. See IsVolumeFormatUnknown,
-	// IsStorageVolumeMissing, and IsMoveReplicationRefusal.
-	if IsVolumeFormatUnknown(err) || IsStorageVolumeMissing(err) || IsMoveReplicationRefusal(err) {
+	// IsStorageVolumeMissing, IsMoveReplicationRefusal, and
+	// IsReplicatedVolumeAddRefusal.
+	if IsVolumeFormatUnknown(err) || IsStorageVolumeMissing(err) || IsMoveReplicationRefusal(err) ||
+		IsReplicatedVolumeAddRefusal(err) {
 		return false
 	}
 	if errors.Is(err, sdkerrors.ErrServer) {
@@ -1037,6 +1049,27 @@ func IsVolumeFormatUnknown(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "volume_size_info") && strings.Contains(msg, "no format")
+}
+
+// replicatedVolumeAddRefusalText is the message qemu-server's update_vm dies
+// with when a config edit adds a volume to a VM that has a replication job
+// and the volume is on node-local storage that cannot replicate.
+const replicatedVolumeAddRefusalText = "cannot add non-replicatable volume to a replicated VM"
+
+// IsReplicatedVolumeAddRefusal reports whether err is PVE's refusal to add a
+// volume to a replicated VM by a config edit. update_vm makes the check in
+// the request, before it changes or forks anything, for every drive it is
+// given: a VM that has a replication job of any state takes a volume only when
+// the volume's storage can replicate, which only a ZFS pool can, or when the
+// storage is shared, or when the drive sets replicate=0. The refusal holds for
+// as long as the job exists, so it is permanent and never retried.
+//
+// nil → false.
+func IsReplicatedVolumeAddRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), replicatedVolumeAddRefusalText)
 }
 
 // storageVolumeMissingPattern matches the API's own refusal to use a volume
