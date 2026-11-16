@@ -427,7 +427,8 @@ func lifecycleValidateConfigMutation(before map[string]any, fields map[string]an
 // requestRefusedMove reports whether result is a move that PVE refused in the
 // request, before any task forked, for a stale digest or because the target
 // VM is replicated and the volume's storage cannot replicate. Nothing moved
-// either way, and settleRefusedMove proves it by reading both VMs back.
+// either way, and settleRefusedMove proves it by reading both VMs back. A task
+// that exits with either refusal is settled the same way in After.
 func requestRefusedMove(result any) bool {
 	switch result.(type) {
 	case managedMoveDigestRefusal, managedMoveReplicationRefusal:
@@ -492,6 +493,12 @@ func (g *managedDiskLifecycleGuard) after(ctx context.Context, call ManagedAlloc
 			if key == "Nodes.CreateQemuMoveDisk" && pve.IsMoveDigestRefusal(err) {
 				// The move task checked both digests under the configuration
 				// locks and refused before its rename, so nothing moved.
+				return g.settleRefusedMove(ctx, step, observation)
+			}
+			if key == "Nodes.CreateQemuMoveDisk" && pve.IsMoveReplicationRefusalTaskExit(err) {
+				// The move task found the receiving VM replicated when it
+				// checked again under the configuration locks, and it refused
+				// before its rename, so nothing moved.
 				return g.settleRefusedMove(ctx, step, observation)
 			}
 			if observation.ontoParker && pve.IsMoveSnapshotRefusalTaskExit(err) {

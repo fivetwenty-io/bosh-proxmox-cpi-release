@@ -450,3 +450,25 @@ func TestManagedAttachRetiresTheJobOfAVMOutOfHA(t *testing.T) {
 	}
 }
 
+// TestManagedAttachSettlesAMoveTaskThatMeetsAJobSetUpAfterTheRequest has
+// PVE accept the reassignment and the task exit with the replication
+// refusal, because a job was set up between the request and the task's own
+// check under the configuration locks. Nothing moved, so the move step
+// settles, the attach takes the config edit, and the record does not ask for
+// reconciliation.
+func TestManagedAttachSettlesAMoveTaskThatMeetsAJobSetUpAfterTheRequest(t *testing.T) {
+	deps, client, jr, id, cid := lifecycleFlowFixture(t)
+	deps.Config.DetachedDiskStrategy = "parked"
+	deps.Logger = log.NewNopLogger()
+	deps.Agent = legacyDestroyAgent{}
+	volume, parker := parkReplicatedFixture(t, deps, client, cid)
+	client.replicatedVMs = nil
+	client.moveTaskExit = "Cannot move disk to a replicated VM. Storage does not support replication!"
+	if err := digestAttach(t, deps, cid); err != nil {
+		t.Fatalf("attach after the task's replication refusal: %v", err)
+	}
+	if client.moveCalls != 1 {
+		t.Fatalf("%d move POSTs; the refused task is not sent again", client.moveCalls)
+	}
+	assertAttachedByConfigEdit(t, client, jr, id, volume, parker)
+}

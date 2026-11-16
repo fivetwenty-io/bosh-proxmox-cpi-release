@@ -128,3 +128,30 @@ func TestTransferDiskFromParker_ReplicationRefusalIsPermanent(t *testing.T) {
 		})
 	}
 }
+
+// TestMoveReplicationRefusalTaskExitNamesOnlyTheWholeStatus checks the task
+// form of the refusal. The move task checks the receiving VM's jobs again
+// under the configuration locks, so a job set up after the request makes the
+// task exit with PVE's sentence, and only that whole status proves the task
+// moved nothing.
+func TestMoveReplicationRefusalTaskExitNamesOnlyTheWholeStatus(t *testing.T) {
+	const upid = "UPID:n1:000573BE:03504636:6AA1786A:qmmove:90000-scsi0>777-scsi1:root@pam:"
+	sentence := strings.TrimSuffix(replicationRefusalText, "\n")
+	exit := classifyTaskExit(upid, sentence, false)
+	if !IsMoveReplicationRefusalTaskExit(exit) || !IsMoveReplicationRefusal(exit) {
+		t.Fatalf("the task's whole status is not the replication refusal: %v", exit)
+	}
+	for name, status := range map[string]string{
+		"prefixed status": "VM 777: " + sentence,
+		"longer status":   sentence + " (job 777-0)",
+		"other failure":   "storage migration failed: unable to rename volume",
+	} {
+		if err := classifyTaskExit(upid, status, false); IsMoveReplicationRefusalTaskExit(err) {
+			t.Errorf("%s: accepted: %v", name, err)
+		}
+	}
+	answered := sdkerrors.ParseAPIError(500, []byte(fmt.Sprintf(`{"message":%q}`, replicationRefusalText)))
+	if IsMoveReplicationRefusalTaskExit(answered) {
+		t.Errorf("the request's answer reads as a task exit: %v", answered)
+	}
+}

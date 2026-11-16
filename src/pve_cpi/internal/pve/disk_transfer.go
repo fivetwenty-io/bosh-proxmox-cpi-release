@@ -104,10 +104,13 @@ func stopOnMoveSnapshotRefusal(err error) error {
 // a VM that has a replication job when the volume's storage cannot replicate
 // ("Cannot move disk to a replicated VM. Storage does not support
 // replication!"). PVE makes that check in the request, before it forks the
-// move task, and it matches any job of the target guest, a disabled one
-// included, so the refusal holds for as long as the job exists. Only a ZFS
-// pool replicates, so a volume on NFS, Ceph, LVM, or a directory storage gets
-// it. Callers detect it with errors.Is.
+// move task, and the task makes it again under both configuration locks
+// before its rename, so a job set up between the two makes the task exit with
+// the same sentence. Either way nothing moved. The check matches any job of
+// the target guest, a disabled one and one marked for removal included, so
+// the refusal holds for as long as the job exists. Only a ZFS pool
+// replicates, so a volume on NFS, Ceph, LVM, or a directory storage gets it.
+// Callers detect it with errors.Is.
 var ErrMoveDiskReplicationRefused = errors.New("move_disk refused: the target VM is replicated and the disk's storage " +
 	"does not support replication")
 
@@ -116,16 +119,34 @@ var ErrMoveDiskReplicationRefused = errors.New("move_disk refused: the target VM
 // cannot replicate.
 const moveReplicationRefusalText = "Cannot move disk to a replicated VM"
 
+// moveReplicationRefusalSentence is the whole message of that check, the
+// exit status of a move task whose own check refused.
+const moveReplicationRefusalSentence = moveReplicationRefusalText + ". Storage does not support replication!"
+
 // IsMoveReplicationRefusal reports whether err is PVE's refusal to reassign a
-// volume into a replicated VM. PVE sends its own sentence, and the check that
-// dies with it runs before the task is forked, so the text alone proves the
-// request moved nothing, even when the client reads the answer without an
-// HTTP status.
+// volume into a replicated VM, as the answer to the request or as the exit
+// status of the move task. PVE sends its own sentence, and both checks that
+// die with it run before the rename, so the text alone proves the move moved
+// nothing, even when the client reads the answer without an HTTP status. The
+// lifecycle guard settles a task's exit only on the whole sentence (see
+// IsMoveReplicationRefusalTaskExit).
 func IsMoveReplicationRefusal(err error) bool {
 	if err == nil {
 		return false
 	}
 	return errors.Is(err, ErrMoveDiskReplicationRefused) || strings.Contains(err.Error(), moveReplicationRefusalText)
+}
+
+// IsMoveReplicationRefusalTaskExit reports whether err is a finished move
+// task whose exit status is PVE's replication refusal and nothing else. The
+// task checks the receiving VM's jobs again under both configuration locks
+// before its rename, and PVE keeps a worker's die message as the task's exit
+// status, so the exit proves that the task moved nothing. A longer status
+// that contains the sentence doesn't count, and neither does a poll fault or
+// a task whose status is unknown.
+func IsMoveReplicationRefusalTaskExit(err error) bool {
+	return err != nil &&
+		strings.Contains(err.Error(), fmt.Sprintf("failed: exit status %q", moveReplicationRefusalSentence))
 }
 
 // stopOnMoveReplicationRefusal ends the move's retry loop on PVE's refusal to
@@ -528,7 +549,9 @@ func moveDiskToVMPinned(
 				disk, srcVMID, targetVMID, targetSlot, ErrMoveDiskSnapshotRefused, moveErr.Error())
 		}
 		// The job that makes PVE refuse stays until someone removes it, so
-		// the refusal is permanent for this move and never retriable.
+		// the refusal is permanent for this move, whether the request or the
+		// task's own check made it. The attach decides whether a retry could
+		// pass, for a job that is on its way out.
 		if IsMoveReplicationRefusal(moveErr) {
 			return cpierrors.WrapAs(fmt.Errorf("%w: %s", ErrMoveDiskReplicationRefused, strings.TrimSpace(moveErr.Error())),
 				cpierrors.TypeCloud, fmt.Sprintf("move_disk %s of vm %d to vm %d slot %s", disk, srcVMID, targetVMID, targetSlot))

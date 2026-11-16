@@ -702,6 +702,9 @@ func (t *managedNodesService) CreateQemuMoveDisk(ctx context.Context, node, vmid
 		// receiving VM has a replication job and the volume's storage cannot
 		// replicate. Nothing moved, so the step settles by readback in either
 		// direction, and the attach's config-edit fallback stays admissible.
+		// The task checks again under the configuration locks, and a job set
+		// up after the request makes it exit with the same sentence; the
+		// guard's After settles that exit the same way.
 		return nil, t.guard.settleRefused(ctx, m, token, managedMoveReplicationRefusal{}, err)
 	}
 	err = t.guard.finish(ctx, m, token, resp, err)
