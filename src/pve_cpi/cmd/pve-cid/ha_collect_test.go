@@ -843,6 +843,12 @@ func TestCollectHeadroomShortAndUnavailable(t *testing.T) {
 		t.Fatalf("headroom findings = %+v, want one per failing node", got)
 	}
 
+	for _, line := range findings(r, haKindHeadroomShort) {
+		if strings.Contains(line.Detail, "is online") && !strings.Contains(line.Detail, "out of maintenance") {
+			t.Errorf("headroom detail %q calls the surviving nodes offline", line.Detail)
+		}
+	}
+
 	g := haBaseFake()
 	g.memoryErr = errFake
 	r = runCollect(t, g, haCfg("auto", "none"))
@@ -1752,4 +1758,38 @@ func TestCollectReportsTheVolumeOfAGoneVM(t *testing.T) {
 	m.volumes["n2/local-zfs"] = map[string]bool{"local-zfs:vm-559-ephemeral-0": true}
 	m.excluded = []string{"n3"}
 	wantNone(t, runCollect(t, m, haCfg("auto", "replicate")), haKindReplicaGoneVM)
+}
+
+func TestCollectAntiAffinityOffJudgesNoGroup(t *testing.T) {
+	t.Parallel()
+	group := "bosh-aa-0123456789ab"
+	f := haBaseFake()
+	f.guests = []pve.GuestRef{
+		{VMID: 200, Node: "n1", Tags: "bosh-cpi;" + group},
+		{VMID: 201, Node: "n2", Tags: "bosh-cpi;" + group},
+	}
+	f.memory[200], f.memory[201] = haGiB, haGiB
+	f.resources = []HAResourceRow{{SID: "vm:200", State: "started"}, {SID: "vm:201", State: "started"}}
+	f.rules = []ha.Rule{{ID: group, Type: "resource-affinity", Affinity: "negative", Comment: haMarker, Resources: []string{"vm:200"}}}
+
+	// The same cluster is short under anti-affinity on.
+	want(t, runCollect(t, f, haCfg("auto", "none")), haKindAntiAffinityShort, haSeverityProblem, group, "vm:201")
+
+	// pve.ha.anti_affinity off, or scheduler-soft anti-affinity disabled, means
+	// the CPI writes no rule, so no group is short of one.
+	off := haCfgWith("auto", "none", `,"anti_affinity":"off"`, `,"placement":{"anti_affinity":{"enabled":true}}`)
+	wantNone(t, runCollect(t, f, off), haKindAntiAffinityShort, haKindAntiAffinitySkipped, haKindAntiAffinitySplit)
+	wantNone(t, runCollect(t, f, haCfgWith("auto", "none", "", "")), haKindAntiAffinityShort)
+}
+
+func TestCollectReplicaWithoutPinIsNotAwaitingWidening(t *testing.T) {
+	t.Parallel()
+	f := replicaFake()
+	f.rules = nil
+	wantNone(t, runCollect(t, f, haCfg("auto", "replicate")), haKindReplicaAwaiting)
+
+	// The same VM with a pin that names no replica is awaiting the widening.
+	g := replicaFake()
+	g.rules = []ha.Rule{pinRule(101, haMarker, "n1", "n2")}
+	want(t, runCollect(t, g, haCfg("auto", "replicate")), haKindReplicaAwaiting, haSeverityAdvice, "vm:101")
 }

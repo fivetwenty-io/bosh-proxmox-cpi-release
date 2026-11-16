@@ -135,7 +135,7 @@ func (s HeadroomShortfall) Line() string {
 	mem := mibCeil(s.MemBytes)
 	if s.LargestFreeNode == "" {
 		return fmt.Sprintf("ha: headroom estimate short after losing %s: VM %d (%d MiB) fits on no surviving node "+
-			"in its pin, and none of those nodes is online", s.FailedNode, s.VMID, mem)
+			"in its pin, because the pin names no other node that is online and out of maintenance", s.FailedNode, s.VMID, mem)
 	}
 	return fmt.Sprintf("ha: headroom estimate short after losing %s: VM %d (%d MiB) fits on no surviving node "+
 		"in its pin, largest free %d MiB on %s", s.FailedNode, s.VMID, mem, s.LargestFreeBytes/bytesPerMiB,

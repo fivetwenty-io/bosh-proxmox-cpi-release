@@ -149,8 +149,15 @@ func (f *fakeHA) Journal(context.Context, []string) (JournalView, error) {
 
 // haCfg builds a valid CPI config with the given HA mode and local policy.
 func haCfg(mode, policy string) *config.CPIConfig {
+	return haCfgWith(mode, policy, "", `,"placement":{"anti_affinity":{"enabled":true}}`)
+}
+
+// haCfgWith builds the same config with haExtra spliced into the ha block and
+// extra spliced into the top level, each a fragment of JSON members that starts
+// with a comma.
+func haCfgWith(mode, policy, haExtra, extra string) *config.CPIConfig {
 	text := `{"host":"pve.test.local","user":"root@pam","api_token":"test-token","vm_storage":"local-lvm",` +
-		`"disk_storage":"local-lvm","network_bridge":"vmbr0","ha":{"mode":"` + mode + `","local_policy":"` + policy + `"}}`
+		`"disk_storage":"local-lvm","network_bridge":"vmbr0","ha":{"mode":"` + mode + `","local_policy":"` + policy + `"` + haExtra + `}` + extra + `}`
 	cfg, err := config.Load(strings.NewReader(text))
 	if err != nil {
 		panic(err)

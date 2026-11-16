@@ -573,7 +573,7 @@ func (c *haCollector) ruleFindings() {
 // antiAffinityFindings reports each anti-affinity group that overflowed its
 // cluster, and each group with a member its rule does not name.
 func (c *haCollector) antiAffinityFindings() {
-	if !c.guestsOK || !c.rulesOK {
+	if !c.guestsOK || !c.rulesOK || !c.antiAffinityWrites() {
 		return
 	}
 	groups := map[string][]*haGuest{}
@@ -595,6 +595,14 @@ func (c *haCollector) antiAffinityFindings() {
 	for _, tag := range tags {
 		c.checkGroup(tag, groups[tag], c.groupRules(tag))
 	}
+}
+
+// antiAffinityWrites reports whether the CPI writes anti-affinity rules at all.
+// create_vm writes a group rule only when pve.ha.anti_affinity is not off and
+// scheduler-soft anti-affinity is enabled, so a cluster set up otherwise has no
+// rule to judge a group against.
+func (c *haCollector) antiAffinityWrites() bool {
+	return c.cfg.HAAntiAffinityValue() != config.HARuleOff && c.cfg.AntiAffinityEnabled()
 }
 
 // groupRules returns the rules that carry a group's name: the rule itself and
@@ -1221,7 +1229,7 @@ func (c *haCollector) notRecoverable(g *haGuest, pin *ha.Rule, rec *aj.Record) {
 	changed, haveChange := c.volumeChange(pin, rec)
 	const widens = "; the pin widens to the partner on the next reboot_vm or set_vm_metadata call once a sync is verified"
 	switch {
-	case !st.LastSync.IsZero() && (!haveChange || st.LastSync.After(changed.Add(aj.ReplicaClockSkewTolerance))):
+	case pin != nil && !st.LastSync.IsZero() && (!haveChange || st.LastSync.After(changed.Add(aj.ReplicaClockSkewTolerance))):
 		c.awaiting[id] = true
 		c.rep.advise(haKindReplicaAwaiting, g.sid,
 			"replicate VM %d: job %s synced at %s, but the pin does not yet name the partner as holding a replica%s",
@@ -1230,6 +1238,10 @@ func (c *haCollector) notRecoverable(g *haGuest, pin *ha.Rule, rec *aj.Record) {
 		c.rep.problem(haKindReplicaNotRecover, g.sid,
 			"replicate VM %d is configured to replicate but job %s has not completed a sync that started after the volume change at %s, "+
 				"more than twice its schedule since", id, job.ID, changed.UTC().Format(time.RFC3339))
+	case pin == nil:
+		// With no pin there is nothing for a later call to widen, so the VM is
+		// not awaiting a widening. The local-volume and HA findings speak for it.
+		return
 	default:
 		c.awaiting[id] = true
 		what := "has not completed its first sync"

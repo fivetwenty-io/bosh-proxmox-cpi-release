@@ -145,7 +145,7 @@ func TestEstimateHeadroom_MaintenanceNodeIsNotATarget(t *testing.T) {
 	if got.Shortfalls[0].LargestFreeNode != "" {
 		t.Errorf("largest free node = %q, want none", got.Shortfalls[0].LargestFreeNode)
 	}
-	if line := got.Lines()[0]; !strings.Contains(line, "none of those nodes is online") {
+	if line := got.Lines()[0]; !strings.Contains(line, "the pin names no other node that is online and out of maintenance") {
 		t.Errorf("line = %q, want the no-survivor wording", line)
 	}
 }
