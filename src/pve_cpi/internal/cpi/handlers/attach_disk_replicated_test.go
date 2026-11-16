@@ -240,21 +240,21 @@ func TestAttachPreflightRefusesReplicatedReassign(t *testing.T) {
 	parker := pve.DiskHolder{Found: true, IsParker: true, VMID: 90000, Node: "pve01"}
 	h := &attachHA{profile: profile, vmid: 100,
 		disk: resolvedDisk{diskCID: "d", volid: "nfs2:90000/vm-90000-disk-0.qcow2", stableID: "s"}}
-	err := h.refuseReplicatedReassign(parker)
+	err := h.refuseReplicatedAttach(context.Background(), parker)
 	if err == nil || !strings.Contains(err.Error(), "the replication job 100-0") {
 		t.Fatalf("err %v; want the refusal naming the job", err)
 	}
 	h.disk.volid = "nfs2:700/vm-700-disk-0.qcow2"
-	if err := h.refuseReplicatedReassign(parker); err != nil {
+	if err := h.refuseReplicatedAttach(context.Background(), parker); err != nil {
 		t.Fatalf("birth-named disk refused: %v", err)
 	}
 	h.disk.volid = "nfs2:90000/vm-90000-disk-0.qcow2"
 	profile.ReplicationErr = "read failed"
-	if err := h.refuseReplicatedReassign(parker); err != nil {
+	if err := h.refuseReplicatedAttach(context.Background(), parker); err != nil {
 		t.Fatalf("an unread job list refused: %v", err)
 	}
 	profile.ReplicationErr = ""
-	if err := h.refuseReplicatedReassign(pve.DiskHolder{}); err != nil {
+	if err := h.refuseReplicatedAttach(context.Background(), pve.DiskHolder{}); err != nil {
 		t.Fatalf("a free-floating disk refused: %v", err)
 	}
 }

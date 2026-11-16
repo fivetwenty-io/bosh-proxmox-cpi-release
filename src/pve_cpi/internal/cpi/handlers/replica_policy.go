@@ -545,6 +545,11 @@ type replicaRetire struct {
 	online  func(context.Context, string) (bool, error)
 	destroy bool
 	now     func() time.Time
+
+	// retiredJob and retiredOther name, once run returns nil, the job it
+	// removed and the node that held its copy. Both are empty when the VM had
+	// no job of this Director.
+	retiredJob, retiredOther string
 }
 
 // run retires every job of the VM that carries this Director's marker. A job
@@ -619,6 +624,7 @@ func (r *replicaRetire) run(ctx context.Context) error {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("%s: retire replication job %s of VM %d", r.caller, owned.ID, r.vmid))
 	}
+	r.retiredJob, r.retiredOther = owned.ID, other
 	if r.handle != nil && other != "" {
 		if err := r.handle.ReleaseReplicaCopy(aj.ReplicaCopySuperseded, other, owned.ID); err != nil {
 			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
@@ -633,6 +639,53 @@ func (r *replicaRetire) run(ctx context.Context) error {
 	}
 	logger.Info(r.caller+": retired the VM's replication job", log.String("job", owned.ID))
 	return nil
+}
+
+// retiredReplica is a replication job a call retired without the VM's
+// journal record, which the record learns of afterwards.
+type retiredReplica struct {
+	// job is the ID of the job removed, empty when the VM had none left.
+	job string
+	// other is the node that held the job's copy.
+	other string
+}
+
+// recordLeftReplica records, in the VM's journal record, the retirement of
+// the replication job that the VM's removal from HA made under a disk's
+// lifecycle. The VM's record is never acquired while a disk's record is
+// held, because create_vm and delete_vm hold the VM's record while they
+// acquire a disk's, and the other order could deadlock against them. So the
+// record learns of the retirement once the disk's lifecycle has ended, and
+// until then it may still name a job that is gone, which overcharges the
+// partner's capacity and leaves a failover plan the audit refuses on the live
+// job list. A record that is already retired, or a VM with no record, needs
+// nothing. A failure is logged, because the job is gone and delete_vm's
+// retirement marks the record when it finds no job.
+func recordLeftReplica(ctx context.Context, deps Deps, logger *log.Logger, vmCID string, vmid int,
+	left *retiredReplica,
+) {
+	if left == nil {
+		return
+	}
+	err := withVMReplicaRecord(ctx, deps, vmCID, func(handle *aj.Handle) error {
+		if handle == nil || handle.Record().Replication == nil {
+			return nil
+		}
+		if !handle.Record().Replication.Retired {
+			if err := handle.RetireReplicationJob(); err != nil {
+				return err
+			}
+		}
+		if left.job == "" || left.other == "" {
+			return nil
+		}
+		return handle.ReleaseReplicaCopy(aj.ReplicaCopySuperseded, left.other, left.job)
+	})
+	if err != nil {
+		logger.Warn(attachHAOp+": the VM's journal record could not record the retirement of its replication job "+
+			"after it left HA; delete_vm records it", log.Int(metadataKeyVMID, vmid), log.String("job", left.job),
+			log.Err(err))
+	}
 }
 
 // replication returns the replication of the VM's journal record, nil when
@@ -714,6 +767,16 @@ func setUpCreatedReplica(
 	ctx context.Context, deps Deps, logger *log.Logger, node string, vmid int, d *ha.VMDecision,
 	profile *ha.Profile, handle *aj.Handle,
 ) error {
+	return setUpReplica(ctx, deps, logger, "create_vm", node, vmid, d, profile, handle)
+}
+
+// setUpReplica is setUpCreatedReplica for the call op, which names it in
+// errors and logs. attach_disk sets up again, through it, the job its replica
+// rebuild removed (see attachReplicaRebuild).
+func setUpReplica(
+	ctx context.Context, deps Deps, logger *log.Logger, op, node string, vmid int, d *ha.VMDecision,
+	profile *ha.Profile, handle *aj.Handle,
+) error {
 	if d == nil || d.Policy != ha.PolicyReplicate || d.Partner == "" {
 		return nil
 	}
@@ -722,19 +785,19 @@ func setUpCreatedReplica(
 	degrade := func(what string, err error) error {
 		switch {
 		case !replicaRefusalProven(err):
-			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "create_vm: "+what)
+			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, op+": "+what)
 		case managed:
 			return err
 		}
-		logger.Warn("create_vm: "+what+"; the VM runs under PVE HA pinned to its node without a replica",
+		logger.Warn(op+": "+what+"; the VM runs under PVE HA pinned to its node without a replica",
 			log.Err(err))
 		return nil
 	}
 	if profile == nil {
-		return degrade("the HA profile is not known", cpierrors.Retriable("create_vm: the HA profile of VM %d "+
-			"is not known, so its replication job cannot be set up", vmid))
+		return degrade("the HA profile is not known", cpierrors.Retriable("%s: the HA profile of VM %d "+
+			"is not known, so its replication job cannot be set up", op, vmid))
 	}
-	if err := mutateVMTags(ctx, deps, node, vmid, "create_vm: tag the VM as replicated", logger,
+	if err := mutateVMTags(ctx, deps, node, vmid, op+": tag the VM as replicated", logger,
 		func(tags []string) []string {
 			if slices.Contains(tags, haReplicaTag) {
 				return tags
@@ -746,19 +809,19 @@ func setUpCreatedReplica(
 	volids, gaps, err := replicaVolumesOn(ctx, deps, profile, node, vmid)
 	if err != nil {
 		return degrade("the VM's volumes could not be read", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			"create_vm: read the replicated volumes"))
+			op+": read the replicated volumes"))
 	}
 	switch {
 	case len(gaps) > 0:
-		return degrade("the VM holds node-local volumes replication does not copy", cpierrors.Cloud("create_vm: "+
+		return degrade("the VM holds node-local volumes replication does not copy", cpierrors.Cloud(op+": "+
 			"VM %d holds node-local volumes its replication job would not copy: %s", vmid, strings.Join(gaps, "; ")))
 	case len(volids) == 0:
-		return degrade("the VM holds no volume on node-local ZFS storage", cpierrors.Cloud("create_vm: VM %d "+
+		return degrade("the VM holds no volume on node-local ZFS storage", cpierrors.Cloud(op+": VM %d "+
 			"holds no volume for its replication job to copy", vmid))
 	}
 	changedAt := time.Now()
 	api := replicationAPIFor(deps)
-	job, err := ensureCreatedReplicaJob(ctx, deps, api, vmid, node, d.Partner, volids, changedAt, handle)
+	job, err := ensureCreatedReplicaJob(ctx, deps, api, op, vmid, node, d.Partner, volids, changedAt, handle)
 	if err != nil {
 		return degrade("the replication job could not be created", err)
 	}
@@ -767,7 +830,7 @@ func setUpCreatedReplica(
 	case err != nil:
 		return degrade("the pin could not be read to record the job's start", err)
 	case pin == nil || source != node:
-		return degrade("the VM's pin is not the source-only pin", cpierrors.Cloud("create_vm: the pin of VM %d "+
+		return degrade("the VM's pin is not the source-only pin", cpierrors.Cloud(op+": the pin of VM %d "+
 			"does not name node %s alone", vmid, node))
 	case partner == "":
 		if _, recorded := ha.ReplicaChanged(pin.Comment); !recorded {
@@ -776,16 +839,16 @@ func setUpCreatedReplica(
 			if err := writeReplicaPin(ctx, deps, profile, logger, vmid, pin, &stamped); err != nil {
 				// A later call that touches the VM records the time on a pin
 				// that has none, so the job stands.
-				logger.Warn("create_vm: the pin could not record the job's start; the next call that touches the "+
+				logger.Warn(op+": the pin could not record the job's start; the next call that touches the "+
 					"VM records it", log.Err(err))
 			}
 		}
 	}
 	if err := api.ScheduleNow(ctx, node, job); err != nil {
-		logger.Info("create_vm: the request to run the replication job now failed; its schedule runs it",
+		logger.Info(op+": the request to run the replication job now failed; its schedule runs it",
 			log.String("job", job), log.Err(err))
 	}
-	logger.Info("create_vm: the VM's replication job is configured; the pin names the source alone until a call "+
+	logger.Info(op+": the VM's replication job is configured; the pin names the source alone until a call "+
 		"that touches the VM sees a verified sync", log.String("job", job))
 	return nil
 }
@@ -808,26 +871,26 @@ func replicaRefusalProven(err error) bool {
 // over. The journal records the job's generation before the create and
 // confirms it after.
 func ensureCreatedReplicaJob(
-	ctx context.Context, deps Deps, api ha.ReplicationAPI, vmid int, node, partner string, volids []string,
+	ctx context.Context, deps Deps, api ha.ReplicationAPI, op string, vmid int, node, partner string, volids []string,
 	changedAt time.Time, handle *aj.Handle,
 ) (string, error) {
 	owner := deps.RequestDirectorUUID
 	if owner == "" {
-		return "", cpierrors.Cloud("create_vm: the request carries no director_uuid to mark the replication job "+
-			"of VM %d with", vmid)
+		return "", cpierrors.Cloud("%s: the request carries no director_uuid to mark the replication job "+
+			"of VM %d with", op, vmid)
 	}
 	jobs, err := api.ListJobs(ctx)
 	if err != nil {
 		return "", cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("create_vm: list the replication jobs before VM %d gets one", vmid))
+			fmt.Sprintf("%s: list the replication jobs before VM %d gets one", op, vmid))
 	}
 	owned, foreign, err := guestReplicaJobs(jobs, vmid, owner)
 	if err != nil {
-		return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "create_vm: set up the replication job")
+		return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, op+": set up the replication job")
 	}
 	if len(foreign) > 0 {
-		return "", cpierrors.Cloud("create_vm: VM %d already has replication job %s, which does not carry this "+
-			"Director's marker", vmid, foreign[0].ID)
+		return "", cpierrors.Cloud("%s: VM %d already has replication job %s, which does not carry this "+
+			"Director's marker", op, vmid, foreign[0].ID)
 	}
 	id := ha.ReplicaJobID(vmid, ha.NextJobNum(jobs, vmid))
 	if owned != nil {
@@ -836,7 +899,7 @@ func ensureCreatedReplicaJob(
 	gen, err := prepareCreatedReplicaJob(handle, owner, id, vmid, node, partner, volids, changedAt)
 	if err != nil {
 		return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("create_vm: record replication job %s in the journal", id))
+			fmt.Sprintf("%s: record replication job %s in the journal", op, id))
 	}
 	if gen == 0 {
 		gen = 1
@@ -852,7 +915,7 @@ func ensureCreatedReplicaJob(
 			RateMbps: float64(deps.Config.HAReplicationRateMbpsValue()), Comment: renderReplicaJobMarker(owner, gen),
 		}
 		if cerr := api.CreateJob(ctx, spec); cerr != nil {
-			if err := settleFailedReplicaCreate(ctx, api, handle, id, owner, gen, cerr); err != nil {
+			if err := settleFailedReplicaCreate(ctx, api, op, handle, id, owner, gen, cerr); err != nil {
 				return "", err
 			}
 		}
@@ -860,7 +923,7 @@ func ensureCreatedReplicaJob(
 	if handle != nil {
 		if err := handle.ConfirmReplicationJob(gen); err != nil {
 			return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("create_vm: confirm replication job %s in the journal", id))
+				fmt.Sprintf("%s: confirm replication job %s in the journal", op, id))
 		}
 	}
 	return id, nil
@@ -904,22 +967,23 @@ func prepareCreatedReplicaJob(
 // the pending generation from the journal; any other answer keeps it, so a
 // retry writes the same marker, and returns a retriable error.
 func settleFailedReplicaCreate(
-	ctx context.Context, api ha.ReplicationAPI, handle *aj.Handle, id, owner string, gen uint64, createErr error,
+	ctx context.Context, api ha.ReplicationAPI, op string, handle *aj.Handle, id, owner string, gen uint64,
+	createErr error,
 ) error {
 	jobs, err := api.ListJobs(ctx)
 	if err != nil {
 		return cpierrors.WrapAs(pve.WrapError(createErr), cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("create_vm: create replication job %s (and the re-read of the jobs failed: %v)", id, err))
+			fmt.Sprintf("%s: create replication job %s (and the re-read of the jobs failed: %v)", op, id, err))
 	}
 	guest, _, _ := strings.Cut(id, "-")
 	vmid, convErr := strconv.Atoi(guest)
 	if convErr != nil {
-		return cpierrors.Cloud("create_vm: replication job ID %q names no guest", id)
+		return cpierrors.Cloud("%s: replication job ID %q names no guest", op, id)
 	}
 	mine, err := ha.GuestJobs(jobs, vmid)
 	if err != nil {
 		return cpierrors.WrapAs(pve.WrapError(createErr), cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("create_vm: create replication job %s (and the re-read of the jobs is unusable: %v)", id, err))
+			fmt.Sprintf("%s: create replication job %s (and the re-read of the jobs is unusable: %v)", op, id, err))
 	}
 	for _, j := range mine {
 		if j.ID != id {
@@ -928,21 +992,21 @@ func settleFailedReplicaCreate(
 		if m, ok := parseReplicaJobMarker(j.Comment); ok && m.Owner == markerValue(owner) && m.Generation == gen {
 			return nil
 		}
-		return cpierrors.Cloud("create_vm: replication job %s exists after the create failed and does not carry "+
-			"this Director's marker: %v", id, createErr)
+		return cpierrors.Cloud("%s: replication job %s exists after the create failed and does not carry "+
+			"this Director's marker: %v", op, id, createErr)
 	}
 	wrapped := pve.WrapError(createErr)
 	if cpierrors.IsType(wrapped, cpierrors.TypeRetriableCloud) {
 		return cpierrors.WrapAs(wrapped, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("create_vm: create replication job %s", id))
+			fmt.Sprintf("%s: create replication job %s", op, id))
 	}
 	if handle != nil {
 		if err := handle.AbandonReplicationJob(gen); err != nil {
 			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("create_vm: drop the refused replication job %s from the journal", id))
+				fmt.Sprintf("%s: drop the refused replication job %s from the journal", op, id))
 		}
 	}
-	return cpierrors.Wrap(wrapped, fmt.Sprintf("create_vm: PVE refused replication job %s", id))
+	return cpierrors.Wrap(wrapped, fmt.Sprintf("%s: PVE refused replication job %s", op, id))
 }
 
 // reconcileTouchedVMHA runs the HA catch-up a touch call owes a located VM.
@@ -996,7 +1060,7 @@ func reconcileVMReplica(ctx context.Context, deps Deps, op, vmCID string, vmid i
 	api := replicationAPIFor(deps)
 	switch loc.Node {
 	case source:
-		if partner != "" {
+		if finishPendingReplicaRebuild(ctx, deps, logger, op, vmCID, vmid, pin) || partner != "" {
 			return nil
 		}
 		profile, err := resolveHAProfile(ctx, deps)

@@ -126,6 +126,22 @@ func HandleAttachDisk(deps Deps) Handler {
 		if err := finishPendingHAReaddForCID(ctx, deps, "attach_disk", vmCID); err != nil {
 			return nil, err
 		}
+		// A disk that can enter a replicated VM only by a reassignment PVE
+		// refuses while the VM has its job gets a replica rebuild, which
+		// removes the job here and sets it up again after the attach. Both
+		// steps hold the VM's journal record, so they run outside the disk's
+		// lifecycle: the rebuild's defer is registered before the lifecycle's
+		// and so runs after it.
+		rebuild, err := prepareAttachReplicaRebuild(ctx, deps, vmCID, rd)
+		if err != nil {
+			return nil, err
+		}
+		if rebuild != nil {
+			ctx = withReplicaRebuild(ctx)
+		}
+		var haAttach *attachHA
+		outer := deps
+		defer func() { operationErr = finishAttachReplica(ctx, outer, vmCID, rebuild, haAttach, operationErr) }()
 		deps, lifecycle, lifecycleErr := managedDiskOperation(ctx, deps, rd, "attach_disk")
 		if lifecycleErr != nil {
 			return nil, lifecycleErr
@@ -140,7 +156,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		// before, removes the VM from HA first, or runs inside the narrowing
 		// barrier, so PVE HA never moves the VM to a node the new disk does not
 		// reach.
-		haAttach, err := decideAttachHA(ctx, deps, vmCID, rd)
+		haAttach, err = decideAttachHA(ctx, deps, vmCID, rd)
 		if err != nil {
 			return nil, err
 		}
@@ -463,7 +479,7 @@ func attachDiskConfigPut(
 		reresolve: attachReresolve(deps, op, rd.volid, homeNode, nil),
 	})
 	if err != nil {
-		return "", "", attachWriteFailure(ctx, deps, op, vmCID, vmid, node, diskCID, "AttachDisk", err)
+		return "", "", attachWriteFailure(ctx, deps, op, vmCID, vmid, node, diskCID, rd.volid, "AttachDisk", err)
 	}
 
 	// Confirm attachment (resolve diskID) and derive device path.
@@ -488,11 +504,13 @@ func attachDiskConfigPut(
 
 // attachWriteFailure maps the failure of the attach's config change to the
 // handler's answer. The target's refusal and a pending drive delete come back
-// as the slot choice classed them, a typed error is the protocol's own answer
-// and comes back unchanged, a not-found answer goes through the absence proof,
-// and anything else is wrapped with the call that failed.
+// as the slot choice classed them, PVE's refusal of a node-local volume on a
+// replicated VM is a permanent Cloud error that names the remedy whatever
+// wrapped it, a typed error is the protocol's own answer and comes back
+// unchanged, a not-found answer goes through the absence proof, and anything
+// else is wrapped with the call that failed.
 func attachWriteFailure(
-	ctx context.Context, deps Deps, op, vmCID string, vmid int, node, diskCID, call string, err error,
+	ctx context.Context, deps Deps, op, vmCID string, vmid int, node, diskCID, volid, call string, err error,
 ) error {
 	var refusal attachTargetRefusal
 	if errors.As(err, &refusal) {
@@ -500,6 +518,10 @@ func attachWriteFailure(
 	}
 	if _, pending := pve.IsDriveDeletePending(err); pending {
 		return err
+	}
+	if pve.IsReplicatedVolumeAddRefusal(err) {
+		storage, _, _ := strings.Cut(volid, ":")
+		return cpierrors.WrapAs(err, cpierrors.TypeCloud, replicatedLocalAddText(op, diskCID, vmCID, "", storage))
 	}
 	var typed *cpierrors.Error
 	if errors.As(err, &typed) {

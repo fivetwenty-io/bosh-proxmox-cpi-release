@@ -176,6 +176,29 @@ func replicaRefusalVerdict(
 	return nil
 }
 
+// replicatedLocalAddText is the refusal of a disk on node-local storage that
+// cannot replicate, which a VM that has a replication job never takes. PVE's
+// move_disk refuses the reassignment, and update_vm refuses the config edit
+// ("cannot add non-replicatable volume to a replicated VM"), for as long as
+// the job exists. jobs names the VM's jobs, and is empty when only PVE's
+// answer proves one exists. storage names the disk's storage.
+func replicatedLocalAddText(op, diskCID, vmCID, jobs, storage string) string {
+	if jobs == "" {
+		jobs = "a replication job"
+	}
+	return fmt.Sprintf("%s: disk %s cannot enter VM %s: the VM has %s, and PVE refuses a volume on node-local "+
+		"storage %s that cannot replicate on a replicated VM, by reassignment and by a config edit, because only "+
+		"a ZFS pool replicates. Keep the persistent disks of a VM under pve.ha.local_policy replicate on shared "+
+		"storage or on a ZFS pool its replica partner also has, or remove the VM's replication job if it is not "+
+		"this Director's", op, diskCID, vmCID, jobs, storage)
+}
+
+// replicatedLocalAddRefusal is replicatedLocalAddText as a permanent Cloud
+// error.
+func replicatedLocalAddRefusal(op, diskCID, vmCID, jobs string, info pve.StorageInfo) error {
+	return cpierrors.Cloud("%s", replicatedLocalAddText(op, diskCID, vmCID, jobs, info.Name))
+}
+
 // profileReplicaJobs returns the IDs of the replication jobs the profile read
 // for guest, and false when the profile could not read them.
 func profileReplicaJobs(profile *ha.Profile, guest int) ([]string, bool) {

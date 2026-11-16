@@ -66,6 +66,15 @@ type attachHA struct {
 	// replicaChanged is when the attach changed a replicate VM's volume set,
 	// zero for any other VM.
 	replicaChanged time.Time
+
+	// replicaTagged is true when the VM carries the replicate tag, so a
+	// removal from HA retires the VM's replication job too.
+	replicaTagged bool
+
+	// leftReplica is the replication job the removal from HA retired, nil
+	// when it retired none. The journal records it after the disk's lifecycle
+	// ends (see recordLeftReplica).
+	leftReplica *retiredReplica
 }
 
 // decideAttachHA makes the attach-time HA decision for attaching the disk rd
@@ -179,6 +188,7 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 	h := &attachHA{
 		deps: deps, logger: logger, vmCID: vmCID, disk: rd, vmid: vmid, sid: sid, node: loc.Node,
 		profile: profile, decision: d, oldPin: oldPin, narrow: ha.NarrowDepsFor(deps.PVE, logger, haMotionWait(deps)),
+		replicaTagged: configHasReplicaTag(cfg),
 	}
 	// A transient refusal and a placeable shortfall come before the failure,
 	// because in managed mode a refusal for a reason that may pass is also a
@@ -276,6 +286,7 @@ func pendingAttachLeave(ctx context.Context, deps Deps, vmCID string, vmid int, 
 	return &attachHA{
 		deps: deps, logger: logger, vmCID: vmCID, disk: rd, vmid: vmid, sid: haResourceSid(vmid), node: loc.Node,
 		action: attachHALeave, oldPin: pin, narrow: ha.NarrowDepsFor(deps.PVE, logger, haMotionWait(deps)),
+		replicaTagged: hasReplicaTag(loc.Tags),
 	}, nil
 }
 
@@ -446,6 +457,9 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 			if err != nil {
 				return err
 			}
+		}
+		if err := h.retireLeftReplica(ctx, loc.Node); err != nil {
+			return err
 		}
 		// The pin goes last, so a removal that stops part way leaves the pin,
 		// and the next attach finds it and finishes (see pendingAttachLeave).
@@ -792,18 +806,25 @@ func (h *attachHA) preflight(ctx context.Context) error {
 	if holder.Found && !holder.IsParker && holder.VMID != h.vmid {
 		return foreignHolderError(ctx, h.deps, op, rd.diskCID, h.vmid, holder)
 	}
-	return h.refuseReplicatedReassign(holder)
+	return h.refuseReplicatedAttach(ctx, holder)
 }
 
-// refuseReplicatedReassign is the replicated-VM refusal of the attach guard
+// refuseReplicatedAttach is the replicated-VM refusal of the attach guard
 // (see replicatedTargetRoute), made from the jobs and storages the HA profile
 // read, so it costs no API call. A refusal here keeps the VM in HA with its
 // pin, where the same refusal after a leave would have taken the VM out of HA
-// for an attach that can never land. Facts the profile lacks skip it, and the
-// attach's own check then runs.
-func (h *attachHA) refuseReplicatedReassign(holder pve.DiskHolder) error {
+// for an attach that can never land. A stable-ID disk on a parker gets the
+// verdict of the reassignment, and any other disk that is not in the VM yet
+// is refused when its storage is node-local and cannot replicate, because PVE
+// refuses that volume on a replicated VM by any route. Facts the profile
+// lacks skip it, and the attach's own check then runs. So does an attach
+// whose replica rebuild retired the VM's job after the profile was read, and
+// a removal from HA of a replicate VM, which retires the VM's job before the
+// attach (see retireLeftReplica).
+func (h *attachHA) refuseReplicatedAttach(ctx context.Context, holder pve.DiskHolder) error {
 	rd := h.disk
-	if !holder.Found || !holder.IsParker || rd.stableID == "" {
+	if replicaRebuildInFlight(ctx) || h.action == attachHALeave && h.replicaTagged ||
+		holder.Found && holder.VMID == h.vmid {
 		return nil
 	}
 	jobs, ok := profileReplicaJobs(h.profile, h.vmid)
@@ -815,8 +836,48 @@ func (h *attachHA) refuseReplicatedReassign(holder pve.DiskHolder) error {
 	if !ok {
 		return nil
 	}
-	_, err := replicaReassignVerdict(attachHAOp, rd, holder, info, h.vmid, describeReplicaJobs(jobs))
-	return err
+	if holder.Found && holder.IsParker && rd.stableID != "" {
+		_, err := replicaReassignVerdict(attachHAOp, rd, holder, info, h.vmid, describeReplicaJobs(jobs))
+		return err
+	}
+	if info.IsShared() || storageCanReplicate(info) {
+		return nil
+	}
+	return replicatedLocalAddRefusal(attachHAOp, rd.diskCID, h.vmCID, describeReplicaJobs(jobs), info)
+}
+
+// retireLeftReplica retires the replication job of a replicate VM that has
+// just left HA, and removes the VM's replicate tag. Nothing registers a VM in
+// HA again after a removal, so the VM has no HA failover for the replica to
+// serve, and a job that stayed would keep copying the VM to the partner, keep
+// a copy of its volumes there, bind its live migration to the job's target,
+// and make PVE refuse every later volume whose storage cannot replicate. The
+// job goes with cleanup and is never forced, so a partner that cannot clean
+// up makes the attach retriable, and the next attach finds the pin the
+// removal left and runs this again (see pendingAttachLeave). The VM's journal
+// record is not held under the disk's lifecycle, so the retirement reaches
+// the record after the lifecycle ends (see recordLeftReplica). A VM without
+// the replicate tag has no job of the policy, and nothing is read.
+func (h *attachHA) retireLeftReplica(ctx context.Context, node string) error {
+	if !h.replicaTagged {
+		return nil
+	}
+	profile, profileErr := h.profile, error(nil)
+	if profile == nil {
+		profile, profileErr = resolveHAProfile(ctx, h.deps)
+	}
+	r := &replicaRetire{
+		deps: h.deps, logger: h.logger, api: replicationAPIFor(h.deps), caller: attachHAOp, vmid: h.vmid,
+		node: node, online: replicaNodeOnline(profile, profileErr),
+	}
+	if err := r.run(ctx); err != nil {
+		return err
+	}
+	h.leftReplica = &retiredReplica{job: r.retiredJob, other: r.retiredOther}
+	return mutateVMTags(ctx, h.deps, node, h.vmid, attachHAOp+": remove the replicate tag", h.logger,
+		func(tags []string) []string {
+			return slices.DeleteFunc(slices.Clone(tags), func(t string) bool { return t == haReplicaTag })
+		})
 }
 
 // attachUnchanged answers the barrier's Unchanged after an attach that

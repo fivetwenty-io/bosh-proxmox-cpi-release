@@ -33,6 +33,14 @@ const ReplicaPartnerKey = "bosh-replica"
 // keep that time, and a sync only counts once it started clearly after it.
 const ReplicaChangedKey = "bosh-replica-changed"
 
+// ReplicaRebuildKey is the key of the comment token on a replicate VM's
+// source-only pin that names the partner of a replication job the CPI
+// removed so that a disk could enter the VM by reassignment, which PVE
+// refuses while the VM has a job. The token stays until the job is set up
+// again, so a call that stopped in between leaves the partner where the next
+// call that touches the VM finds it.
+const ReplicaRebuildKey = "bosh-replica-rebuild"
+
 // ReplicaJobType is the only replication job type PVE offers.
 const ReplicaJobType = "local"
 
@@ -79,6 +87,18 @@ func ReplicaPartner(comment string) (string, bool) {
 // WithReplicaChanged returns comment with its volume-change token set to at.
 func WithReplicaChanged(comment string, at time.Time) string {
 	return withCommentToken(comment, ReplicaChangedKey, strconv.FormatInt(at.Unix(), 10))
+}
+
+// WithReplicaRebuild returns comment with its rebuild token naming partner,
+// or with the token removed when partner is empty.
+func WithReplicaRebuild(comment, partner string) string {
+	return withCommentToken(comment, ReplicaRebuildKey, strings.TrimSpace(partner))
+}
+
+// ReplicaRebuild returns the partner a pin's comment names for a replication
+// job the CPI removed and has not set up again.
+func ReplicaRebuild(comment string) (string, bool) {
+	return commentToken(comment, ReplicaRebuildKey)
 }
 
 // ReplicaChanged returns the volume-change time a pin's comment records. A
