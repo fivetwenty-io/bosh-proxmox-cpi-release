@@ -897,11 +897,21 @@ func scoreAndPickWithRanked(pass []placement.NodeFacts, weights placement.Weight
 
 // logFilterRejections emits a Debug entry for each rejection. A bridge rejection
 // or a headroom refusal is an operator-actionable problem, so it logs at Warn instead.
+// A node dropped because it is offline or in maintenance logs at Info, so the
+// log shows why placement avoided it.
 func logFilterRejections(logger *log.Logger, rejections map[string]string, az string) {
 	for n, reason := range rejections {
 		if strings.HasPrefix(reason, "missing bridge ") || strings.HasPrefix(reason, "network lookup failed: ") ||
 			isHeadroomRejectionReason(reason) {
 			logger.Warn("create_vm: placement: node filtered",
+				log.String("node", n),
+				log.String("reason", reason),
+				log.String("az", az),
+			)
+			continue
+		}
+		if reason == "node in maintenance" || reason == "node offline" {
+			logger.Info("create_vm: placement: node filtered",
 				log.String("node", n),
 				log.String("reason", reason),
 				log.String("az", az),

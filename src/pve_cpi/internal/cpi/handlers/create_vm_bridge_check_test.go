@@ -525,6 +525,26 @@ func TestLogFilterRejections_BridgeReasonsAreWarn(t *testing.T) {
 	}
 }
 
+func TestLogFilterRejections_MaintenanceAndOfflineAreInfo(t *testing.T) {
+	t.Parallel()
+	logger, obs := log.NewObservedLogger(log.LevelDebug)
+	logFilterRejections(logger, map[string]string{
+		"pve1": "node in maintenance",
+		"pve2": "node offline",
+		"pve3": "insufficient CPU",
+	}, "z")
+	levels := map[string]slog.Level{}
+	for _, e := range obs.All() {
+		levels[e.Attrs["node"].(string)] = e.Level
+	}
+	if levels["pve1"] != log.LevelInfo || levels["pve2"] != log.LevelInfo {
+		t.Errorf("maintenance and offline rejections must log at Info, got %v", levels)
+	}
+	if levels["pve3"] != log.LevelDebug {
+		t.Errorf("other rejections stay at Debug, got %v", levels["pve3"])
+	}
+}
+
 func TestSharedBridgeChecker_FilterAndGuardListNodeOnce(t *testing.T) {
 	t.Parallel()
 	deps, client, _ := bridgeDeps(t, []map[string]any{onlineNode("pve1")}, map[string][]string{"pve1": {"vmbr0"}}, "enforce", nil)
