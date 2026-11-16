@@ -424,6 +424,18 @@ func lifecycleValidateConfigMutation(before map[string]any, fields map[string]an
 	return nil
 }
 
+// requestRefusedMove reports whether result is a move that PVE refused in the
+// request, before any task forked, for a stale digest or because the target
+// VM is replicated and the volume's storage cannot replicate. Nothing moved
+// either way, and settleRefusedMove proves it by reading both VMs back.
+func requestRefusedMove(result any) bool {
+	switch result.(type) {
+	case managedMoveDigestRefusal, managedMoveReplicationRefusal:
+		return true
+	}
+	return false
+}
+
 func (g *managedDiskLifecycleGuard) after(ctx context.Context, call ManagedAllocationMutation, step string, result any) error {
 	m := g.lifecycle
 	observation, ok := g.observations[step]
@@ -444,7 +456,7 @@ func (g *managedDiskLifecycleGuard) after(ctx context.Context, call ManagedAlloc
 		delete(g.observations, step)
 		return nil
 	}
-	if _, refused := result.(managedMoveDigestRefusal); refused {
+	if requestRefusedMove(result) {
 		if key != "Nodes.CreateQemuMoveDisk" {
 			return fmt.Errorf("move refusal names another mutation")
 		}
@@ -452,12 +464,6 @@ func (g *managedDiskLifecycleGuard) after(ctx context.Context, call ManagedAlloc
 	}
 	if _, refused := result.(managedMoveSnapshotRefusal); refused {
 		return g.settleSnapshotRefusedMove(ctx, key, step, observation)
-	}
-	if _, refused := result.(managedMoveReplicationRefusal); refused {
-		if key != "Nodes.CreateQemuMoveDisk" {
-			return fmt.Errorf("move refusal names another mutation")
-		}
-		return g.settleRefusedMove(ctx, step, observation)
 	}
 	async := key == "QEMU.Create" || key == "QEMU.ResizeDisk" || key == "QEMU.Snapshot" || key == "QEMU.DeleteSnapshot" || key == "Nodes.CreateQemuMoveDisk" || key == "Nodes.CreateQemuMigrate" || key == "Nodes.DeleteQemu" || strings.HasSuffix(call.Method, "Async")
 	if key == "Storage.DeleteVolumeIfExistsAsync" {
