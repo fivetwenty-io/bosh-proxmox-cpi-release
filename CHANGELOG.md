@@ -16,6 +16,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - `delete_vm` no longer defers forever on a VM whose HA resource an earlier CPI registered without a requested state. The 0.9 releases registered HA resources that way, and PVE then leaves the `state` field out when it answers for the resource. PVE's HA manager reads a missing state as `started`, which is also the default in its API schema, but the CPI read it as unknown and deferred every `delete_vm` with `carries no requested state`. That blocked the delete, the recreate, and the scale-down of every VM that such a release put in HA. The CPI now reads a missing or empty state as `started` wherever it reads an HA resource, so the delete stops the VM through PVE HA and removes it exactly as it does for an explicit `started`. A state that PVE does not define, a state field that is not a string, or a failed read of the resource still leaves the HA state unknown, and the delete still defers on it.
 
+- `pve-cid ha` no longer says that the CPI will not edit an unmarked anti-affinity rule from an older CPI, because it does. When the CPI next creates a VM in that instance group, it moves this Director's members out of the old rule and into its own marked rule, and it leaves other Directors' members in place. It deletes the old rule once fewer than two members would remain. The `rule_unmarked` finding now says so, and for an unmarked node-affinity pin it says only that an older CPI wrote the pin.
+
 ## [0.10.1] - 2026-11-12
 
 ### Fixed

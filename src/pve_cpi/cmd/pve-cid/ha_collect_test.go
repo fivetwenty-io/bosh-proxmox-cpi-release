@@ -207,6 +207,38 @@ func TestCollectRuleProblems(t *testing.T) {
 		t.Fatalf("rule findings = %+v", got)
 	}
 	want(t, r, haKindRuleUnmarked, haSeverityProblem, "bosh-na-777", "older CPI")
+	for _, f := range findings(r, haKindRuleUnmarked) {
+		if strings.Contains(f.Detail, "will not edit") || strings.Contains(f.Detail, "moves this Director's members") {
+			t.Fatalf("an unmarked pin's finding must not describe the anti-affinity migration: %+v", f)
+		}
+	}
+}
+
+// TestCollectUnmarkedAntiAffinityRuleNamesTheMigration reports an unmarked
+// anti-affinity rule with what create_vm does to it, which is to move this
+// Director's members out and leave every other Director's members in place.
+func TestCollectUnmarkedAntiAffinityRuleNamesTheMigration(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	f.rules = []ha.Rule{{ID: "bosh-aa-web", Type: ha.RuleTypeResourceAffinity, Affinity: ha.AffinityNegative,
+		Resources: []string{"vm:100", "vm:101"}}}
+	r := runCollect(t, f, haCfg("auto", "none"))
+	want(t, r, haKindRuleUnmarked, haSeverityProblem, "bosh-aa-web", "older CPI")
+	got := findings(r, haKindRuleUnmarked)
+	if len(got) != 1 {
+		t.Fatalf("unmarked findings = %+v", got)
+	}
+	for _, part := range []string{
+		"next creates a VM in the group", "moves this Director's members", "leaves other Directors' members in place",
+		"fewer than two members",
+	} {
+		if !strings.Contains(got[0].Detail, part) {
+			t.Errorf("detail %q does not say %q", got[0].Detail, part)
+		}
+	}
+	if strings.Contains(got[0].Detail, "will not edit") {
+		t.Errorf("detail %q still claims the CPI will not edit the rule", got[0].Detail)
+	}
 }
 
 func TestCollectRulesUnreadable(t *testing.T) {

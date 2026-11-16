@@ -516,6 +516,23 @@ func cpiRuleName(id string) bool {
 	return strings.HasPrefix(id, haPinRulePrefix) || strings.HasPrefix(id, haGroupRulePrefix)
 }
 
+// unmarkedRuleDetail says what the CPI does with a rule that carries a CPI
+// name but no ownership marker. For an anti-affinity rule it describes the
+// migration create_vm runs. That migration moves this Director's members that
+// the hashed rules now hold out of the old rule, and it leaves every other
+// member in place, so other Directors' members keep the old rule's spread. It
+// deletes the rule once fewer than two members would remain, because such a
+// rule spreads nothing.
+func unmarkedRuleDetail(id string) string {
+	if strings.HasPrefix(id, haGroupRulePrefix) {
+		return "the anti-affinity rule has a CPI name but no ownership marker, so an older CPI wrote it. When this " +
+			"CPI next creates a VM in the group, it moves this Director's members that its own marked rules hold out " +
+			"of this rule and leaves other Directors' members in place, and it deletes the rule once fewer than two " +
+			"members would remain"
+	}
+	return "the rule has a CPI name but no ownership marker, so an older CPI wrote it"
+}
+
 // ruleFindings reports CPI rules that PVE disabled or marked conflicting, and
 // the unmarked rules an older CPI left.
 func (c *haCollector) ruleFindings() {
@@ -529,8 +546,7 @@ func (c *haCollector) ruleFindings() {
 			continue
 		}
 		if !marked {
-			c.rep.problem(haKindRuleUnmarked, r.ID,
-				"the rule has a CPI name but no ownership marker, so it comes from an older CPI that the current one will not edit")
+			c.rep.problem(haKindRuleUnmarked, r.ID, "%s", unmarkedRuleDetail(r.ID))
 		}
 		if r.Disabled {
 			c.rep.problem(haKindRuleProblem, r.ID, "PVE has this rule disabled, so it constrains nothing")
