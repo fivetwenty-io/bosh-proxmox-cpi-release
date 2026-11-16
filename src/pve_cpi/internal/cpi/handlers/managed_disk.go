@@ -258,13 +258,21 @@ func managedDiskSize(sizeMB int) (uint64, int, error) {
 	return bytes, int(bytes / (1 << 30)), nil
 }
 
+// managedDiskHintNode returns the node the hinted VM lives on now. It reads
+// the offline-tolerant guest listing, so a node the quorate cluster reports
+// offline is left out instead of stalling every hint read through the
+// listing's retries and then failing create_disk. A VM found on a listed node
+// settles the answer, because a VMID names one guest. When the VM is on no
+// listed node and a node was left out, the VM may be on that node, where no
+// disk can be created for it, so the call fails retriable and names the
+// node. Only a scan that left nothing out can say the VM does not exist.
 func managedDiskHintNode(ctx context.Context, deps Deps, hint string) (string, error) {
 	parsedHint, err := vmcid.Parse(hint)
 	if err != nil {
 		return "", cpierrors.Cloud("create_disk: vm_cid hint must identify an existing VM")
 	}
 	vmid := parsedHint.VMID
-	guests, err := pve.ListGuestsAuthoritative(ctx, deps.PVE, deps.Log(ctx))
+	guests, offline, err := pve.ListGuestsAuthoritativeTolerant(ctx, deps.PVE, deps.Log(ctx))
 	if err != nil {
 		return "", cpierrors.Cloud("create_disk: current hinted VM location observation failed")
 	}
@@ -276,6 +284,11 @@ func managedDiskHintNode(ctx context.Context, deps Deps, hint string) (string, e
 			}
 			node = guest.Node
 		}
+	}
+	if node == "" && len(offline) > 0 {
+		return "", cpierrors.Retriable(
+			"create_disk: hinted VM is not on any online node, and the cluster reports %s offline; no allocation submitted",
+			strings.Join(offline, ", "))
 	}
 	if node == "" {
 		return "", cpierrors.Cloud("create_disk: hinted VM does not exist")

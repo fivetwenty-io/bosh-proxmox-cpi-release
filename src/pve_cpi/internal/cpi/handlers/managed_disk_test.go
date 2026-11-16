@@ -49,6 +49,10 @@ type managedDiskTestState struct {
 	parkErr       error
 	existsErr     error
 	guestErr      error
+	// downNode, when set, is a second member the quorate cluster reports
+	// offline. Its listing answers 595, and downLists counts the attempts.
+	downNode  string
+	downLists int
 }
 type managedDiskTestStorage struct {
 	storage.Service
@@ -180,12 +184,18 @@ func (c managedDiskTestCluster) ListResources(context.Context, *cluster.ListReso
 	}
 	return &r, nil
 }
-func (managedDiskTestCluster) ListConfigNodes(context.Context) (*cluster.ListConfigNodesResponse, error) {
+func (c managedDiskTestCluster) ListConfigNodes(context.Context) (*cluster.ListConfigNodesResponse, error) {
 	r := cluster.ListConfigNodesResponse{json.RawMessage(`{"name":"n1"}`)}
+	if c.state != nil && c.state.downNode != "" {
+		r = append(r, json.RawMessage(`{"name":"`+c.state.downNode+`"}`))
+	}
 	return &r, nil
 }
-func (managedDiskTestCluster) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
+func (c managedDiskTestCluster) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
 	r := cluster.ListStatusResponse{json.RawMessage(`{"type":"cluster","quorate":1}`), json.RawMessage(`{"type":"node","name":"n1","online":1,"local":1}`)}
+	if c.state != nil && c.state.downNode != "" {
+		r = append(r, json.RawMessage(`{"type":"node","name":"`+c.state.downNode+`","online":0}`))
+	}
 	return &r, nil
 }
 
@@ -207,7 +217,11 @@ func (managedDiskTestDefinitions) ListStorage(context.Context, *clusterstorage.L
 	}
 	return &r, nil
 }
-func (n managedDiskTestNodes) ListQemu(context.Context, string, *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
+func (n managedDiskTestNodes) ListQemu(_ context.Context, node string, _ *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
+	if n.state.downNode != "" && node == n.state.downNode {
+		n.state.downLists++
+		return nil, pveerrors.ParseAPIError(595, []byte(`{"message":"no route to host","code":595}`))
+	}
 	if n.state.guestErr != nil {
 		return nil, n.state.guestErr
 	}
