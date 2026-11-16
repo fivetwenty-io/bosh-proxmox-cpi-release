@@ -380,36 +380,138 @@ func TestHAServiceState_LRMFreshnessDependsOnTheDecision(t *testing.T) {
 	haWant(t, st, pve.HAUnknown)
 }
 
+// A resource that a CPI registered without a state carries none, and PVE
+// omits the field from both the list and the resource read. PVE HA reads such
+// a resource as started, so the model does too, and a delete then handles it
+// the way it handles an explicit started request. Only a read that fails or a
+// value PVE does not define leaves the state unknown.
 func TestHAServiceState_ListWithoutStateFallsBackToTheResource(t *testing.T) {
 	t.Parallel()
 	for name, tc := range map[string]struct {
+		row        json.RawMessage
 		perSid     map[string]string
 		perSidErr  error
 		wantKnown  bool
 		wantReq    string
 		wantReason string
 	}{
-		"resource supplies the state":  {perSid: map[string]string{"vm:100": "started"}, wantKnown: true, wantReq: "started"},
-		"enabled maps to started":      {perSid: map[string]string{"vm:100": "enabled"}, wantKnown: true, wantReq: "started"},
-		"resource read fails":          {perSidErr: errors.New("500 boom"), wantReason: "no requested state"},
-		"resource has no state either": {wantReason: "no requested state"},
+		"explicit started in the list": {row: haResource("vm:100", "started"), wantKnown: true, wantReq: "started"},
+		"resource supplies the state": {
+			row: haResource("vm:100", ""), perSid: map[string]string{"vm:100": "started"},
+			wantKnown: true, wantReq: "started",
+		},
+		"enabled maps to started": {
+			row: haResource("vm:100", ""), perSid: map[string]string{"vm:100": "enabled"},
+			wantKnown: true, wantReq: "started",
+		},
+		"resource supplies stopped": {
+			row: haResource("vm:100", ""), perSid: map[string]string{"vm:100": "stopped"},
+			wantKnown: true, wantReq: "stopped",
+		},
+		"resource supplies ignored": {
+			row: haResource("vm:100", ""), perSid: map[string]string{"vm:100": "ignored"},
+			wantKnown: true, wantReq: "ignored",
+		},
+		"no state field anywhere reads as started": {row: haResource("vm:100", ""), wantKnown: true, wantReq: "started"},
+		"empty state anywhere reads as started": {
+			row: json.RawMessage(`{"sid":"vm:100","type":"vm","state":""}`), perSid: map[string]string{"vm:100": ""},
+			wantKnown: true, wantReq: "started",
+		},
+		"blank state reads as started": {
+			row: json.RawMessage(`{"sid":"vm:100","type":"vm","state":"  "}`), wantKnown: true, wantReq: "started",
+		},
+		"null state reads as started": {
+			row: json.RawMessage(`{"sid":"vm:100","type":"vm","state":null}`), wantKnown: true, wantReq: "started",
+		},
+		"resource read fails": {
+			row: haResource("vm:100", ""), perSidErr: errors.New("500 boom"),
+			wantReason: "lists no requested state, and the read of the resource failed",
+		},
+		"resource supplies a state PVE does not define": {
+			row: haResource("vm:100", ""), perSid: map[string]string{"vm:100": "running"},
+			wantReason: `requests "running", which is not a state PVE HA defines`,
+		},
+		"list carries a state PVE does not define": {
+			row: haResource("vm:100", "bogus"), wantReason: `requests "bogus", which is not a state PVE HA defines`,
+		},
+		"list carries a state that is not a string": {
+			row: json.RawMessage(`{"sid":"vm:100","type":"vm","state":{"x":1}}`), wantReason: "does not parse",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			c := newHAScene("started").cluster()
-			c.resources = []json.RawMessage{haResource("vm:100", "")}
+			c.resources = []json.RawMessage{haResource("vm:200", "started"), tc.row}
 			c.perSid, c.perSidErr = tc.perSid, tc.perSidErr
 			st, _ := haRead(t, c, pve.HADecisionLive)
-			if st.Known != tc.wantKnown || st.Requested != tc.wantReq {
+			if st.Known != tc.wantKnown || (tc.wantKnown && st.Requested != tc.wantReq) {
 				t.Fatalf("known=%v requested=%q reason=%q", st.Known, st.Requested, st.Reason)
 			}
 			if !tc.wantKnown {
 				haWant(t, st, pve.HAUnknown)
 				if !strings.Contains(st.Reason, tc.wantReason) {
-					t.Errorf("reason = %q", st.Reason)
+					t.Errorf("reason = %q; want it to contain %q", st.Reason, tc.wantReason)
 				}
+				return
+			}
+			if !st.Configured {
+				t.Errorf("the resource must read as configured: %+v", st)
 			}
 		})
+	}
+}
+
+// A resource with no requested state is not one the CRM has yet to process
+// differently from an explicit started request. Both read the same in every
+// disposition the model gives.
+func TestHAServiceState_MissingRequestDispositionMatchesStarted(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{"started", "stopped", "request_stop", "migrate", "error"} {
+		for _, noCRM := range []bool{false, true} {
+			explicit := newHAScene(raw)
+			explicit.noCRM = noCRM
+			missing := newHAScene(raw)
+			missing.noCRM = noCRM
+			missing.requests = ""
+			mc := missing.cluster()
+			mc.resources = append(mc.resources, haResource("vm:100", ""))
+
+			want, _ := haRead(t, explicit.cluster(), pve.HADecisionLive)
+			got, _ := haRead(t, mc, pve.HADecisionLive)
+			wantDisp, _ := want.Disposition()
+			gotDisp, _ := got.Disposition()
+			if !got.Known || gotDisp != wantDisp || got.Requested != want.Requested || got.Configured != want.Configured {
+				t.Errorf("raw=%q noCRM=%v: missing request reads %q/%q (%s), explicit started reads %q/%q",
+					raw, noCRM, gotDisp, got.Requested, got.Reason, wantDisp, want.Requested)
+			}
+		}
+	}
+}
+
+func TestHARequestedState(t *testing.T) {
+	t.Parallel()
+	ptr := func(s string) *string { return &s }
+	for _, tc := range []struct {
+		in    *string
+		want  string
+		valid bool
+	}{
+		{nil, "started", true},
+		{ptr(""), "started", true},
+		{ptr(" \t"), "started", true},
+		{ptr("started"), "started", true},
+		{ptr("enabled"), "started", true},
+		{ptr(" stopped "), "stopped", true},
+		{ptr("disabled"), "disabled", true},
+		{ptr("ignored"), "ignored", true},
+		{ptr("running"), "running", false},
+		{ptr("Started"), "Started", false},
+	} {
+		got := pve.HARequestedState(tc.in)
+		if got != tc.want || pve.HARequestedStateValid(got) != tc.valid {
+			t.Errorf("HARequestedState(%v) = %q valid=%v; want %q valid=%v",
+				tc.in, got, pve.HARequestedStateValid(got), tc.want, tc.valid)
+		}
 	}
 }
 
@@ -426,8 +528,15 @@ func TestHAServiceState_FieldsThatMakeTheModelUnknown(t *testing.T) {
 		"missing node":            {scene: func(s *haScene) { s.svcNode = "" }},
 		"cluster not quorate":     {scene: func(s *haScene) { s.rows[0] = nhClusterRow(0) }},
 		"service node not listed": {scene: func(s *haScene) { s.svcNode = "pve9" }},
-		"missing request": {cluster: func(c *haCluster) {
+		"missing request and unreadable resource": {cluster: func(c *haCluster) {
 			c.resources = []json.RawMessage{haResource("vm:100", "")}
+			c.perSidErr = errors.New("500 boom")
+		}},
+		"request PVE does not define": {cluster: func(c *haCluster) {
+			c.resources = []json.RawMessage{haResource("vm:100", "running")}
+		}},
+		"request that is not a string": {cluster: func(c *haCluster) {
+			c.resources = []json.RawMessage{json.RawMessage(`{"sid":"vm:100","type":"vm","state":1}`)}
 		}},
 		"unreadable resource row": {cluster: func(c *haCluster) {
 			c.resources = append(c.resources, json.RawMessage(`"not an object"`))

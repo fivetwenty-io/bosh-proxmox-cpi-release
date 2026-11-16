@@ -21,8 +21,8 @@ import (
 )
 
 // HAResourceRow is the part of a GET /cluster/ha/resources row the doctor
-// reads. State is the requested state, such as started, stopped, disabled, or
-// ignored.
+// reads. State is the requested state as PVE HA reads it, such as started,
+// stopped, disabled, or ignored, and a resource with no state reads as started.
 type HAResourceRow struct {
 	SID     string
 	State   string
@@ -144,9 +144,9 @@ func (r *pveHAReader) Resources(ctx context.Context) ([]HAResourceRow, error) {
 	out := make([]HAResourceRow, 0, len(*resp))
 	for _, raw := range *resp {
 		var row struct {
-			SID     string `json:"sid"`
-			State   string `json:"state"`
-			Comment string `json:"comment"`
+			SID     string  `json:"sid"`
+			State   *string `json:"state"`
+			Comment string  `json:"comment"`
 		}
 		if err := json.Unmarshal(raw, &row); err != nil {
 			return nil, fmt.Errorf("HA resource row unreadable: %w", err)
@@ -154,7 +154,9 @@ func (r *pveHAReader) Resources(ctx context.Context) ([]HAResourceRow, error) {
 		if row.SID == "" {
 			return nil, errors.New("HA resource row has no sid")
 		}
-		out = append(out, HAResourceRow{SID: row.SID, State: row.State, Comment: row.Comment})
+		// A resource registered without a state carries none, and PVE HA
+		// reads it as started, so the row does too.
+		out = append(out, HAResourceRow{SID: row.SID, State: pve.HARequestedState(row.State), Comment: row.Comment})
 	}
 	return out, nil
 }

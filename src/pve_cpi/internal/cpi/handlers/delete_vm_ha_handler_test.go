@@ -165,6 +165,77 @@ func TestHandleDeleteVM_HAStatesThatDeferWriteNothing(t *testing.T) {
 	}
 }
 
+// TestHandleDeleteVM_HAResourceWithoutAStateStopsLikeStarted deletes a VM
+// whose HA resource an older CPI registered without a state. PVE omits the
+// state from the resource list and the resource read, and its CRM reads the
+// resource as started, so the delete stops the VM through PVE HA and destroys
+// it exactly as it does for an explicit started request. A state that PVE
+// does not define, or one that is not a string, still leaves the HA state
+// unknown, and the delete defers without writing anything.
+func TestHandleDeleteVM_HAResourceWithoutAStateStopsLikeStarted(t *testing.T) {
+	t.Parallel()
+	run := func(t *testing.T, wire *string) (*legacyHADelete, error) {
+		t.Helper()
+		scene := handlers.NewHADeleteScene()
+		scene.Manage(101, "pve-node1", "started", "started")
+		if wire != nil {
+			scene.StateWire["vm:101"] = *wire
+		}
+		d := newLegacyHADelete(t, scene, "pve-node1", dlbEnabledConfig())
+		err := d.run()
+		return d, err
+	}
+	explicit, err := run(t, nil)
+	if err != nil {
+		t.Fatalf("explicit started: unexpected error: %v", err)
+	}
+	want := explicit.scene.EventsSnapshot()
+	stop, destroy := eventIndex(want, "UpdateHaResources:vm:101=stopped"), eventIndex(want, "DeleteQemu")
+	if stop == -1 || destroy == -1 || stop > destroy {
+		t.Fatalf("explicit started must stop through PVE HA before the destroy; events: %v", want)
+	}
+
+	for name, wire := range map[string]string{
+		"no state field":     "",
+		"empty state":        `""`,
+		"explicit started":   `"started"`,
+		"old name enabled":   `"enabled"`,
+		"blank state":        `"  "`,
+		"state that is null": "null",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			d, err := run(t, &wire)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := d.scene.EventsSnapshot(); strings.Join(got, "|") != strings.Join(want, "|") {
+				t.Fatalf("the delete must match explicit started\n got: %v\nwant: %v", got, want)
+			}
+			if !d.purged {
+				t.Fatal("the destroy must purge, which removes the HA resource")
+			}
+		})
+	}
+
+	for name, tc := range map[string]struct {
+		wire string
+		want []string
+	}{
+		"state PVE does not define":  {wire: `"running"`, want: []string{"HA state is unknown", `requests "running"`}},
+		"state that is not a string": {wire: `1`, want: []string{"HA state is unknown", "does not parse"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			d, err := run(t, &tc.wire)
+			requireHARetriable(t, err, tc.want...)
+			if events := d.scene.EventsSnapshot(); len(events) != 0 {
+				t.Fatalf("a deferred delete must write nothing; events: %v", events)
+			}
+		})
+	}
+}
+
 // TestHandleDeleteVM_UnmanagedVMOnAnIdleCRMDestroys deletes a VM that is not
 // HA-managed on a cluster whose CRM went idle weeks ago. PVE's CRM stops
 // writing manager status once the cluster has no HA resource, so its

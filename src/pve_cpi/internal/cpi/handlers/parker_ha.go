@@ -798,12 +798,14 @@ func resourceComment(res *cluster.GetHaResourcesResponse) string {
 	return *res.Comment
 }
 
-// resourceState returns the requested state of an HA resource read, or "".
+// resourceState returns the requested state of an HA resource read the way
+// PVE HA reads it, so a resource that carries no state reads as started. It
+// returns "" only when there is no read.
 func resourceState(res *cluster.GetHaResourcesResponse) string {
-	if res == nil || res.State == nil {
+	if res == nil {
 		return ""
 	}
-	return strings.TrimSpace(*res.State)
+	return pve.HARequestedState(res.State)
 }
 
 // orUnsetState names an empty power state.

@@ -546,7 +546,7 @@ func (c *deadNodeCompletion) requestStopped(ctx context.Context) error {
 // resourceRequestsStopped reports whether res requests stopped and carries the
 // dead-node token naming source.
 func resourceRequestsStopped(res *cluster.GetHaResourcesResponse, source string) bool {
-	if res == nil || res.State == nil || *res.State != haRequestStopped || res.Comment == nil {
+	if res == nil || pve.HARequestedState(res.State) != haRequestStopped || res.Comment == nil {
 		return false
 	}
 	got, ok := ha.DeadNodeSource(*res.Comment)

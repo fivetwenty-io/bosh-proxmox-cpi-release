@@ -65,6 +65,12 @@ type HADeleteScene struct {
 	Services map[string]HASceneService
 	// Requested are the HA resources by SID and their requested state.
 	Requested map[string]string
+	// StateWire overrides, by SID, how the resource list and the resource
+	// read carry a resource's requested state, until the CPI writes a state.
+	// An empty value omits the field, which is how PVE answers for a resource
+	// registered without a state, and any other value is the field's raw
+	// JSON, so a test can serve an empty, undefined, or non-string state.
+	StateWire map[string]string
 	// Comments are the HA resources' comments by SID; a resource without one
 	// has none.
 	Comments map[string]string
@@ -141,6 +147,7 @@ func NewHADeleteScene() *HADeleteScene {
 		CRMAge:       5,
 		Services:     map[string]HASceneService{},
 		Requested:    map[string]string{},
+		StateWire:    map[string]string{},
 		Comments:     map[string]string{},
 		Power:        map[int]string{},
 		IndexNode:    map[int]string{},
@@ -411,7 +418,14 @@ func (s *HADeleteScene) resourceRows() *cluster.ListHaResourcesResponse {
 		return &rows
 	}
 	for sid, state := range s.Requested {
-		raw, _ := json.Marshal(map[string]any{"sid": sid, "type": "vm", "state": state})
+		row := map[string]any{"sid": sid, "type": "vm", "state": state}
+		if wire, ok := s.StateWire[sid]; ok {
+			delete(row, "state")
+			if wire != "" {
+				row["state"] = json.RawMessage(wire)
+			}
+		}
+		raw, _ := json.Marshal(row)
 		rows = append(rows, raw)
 	}
 	return &rows
@@ -505,6 +519,16 @@ func (c *HASceneCluster) GetHaResources(_ context.Context, sid string) (*cluster
 		return nil, errors.New("no such resource '" + sid + "' (HTTP500)")
 	}
 	resp := &cluster.GetHaResourcesResponse{Sid: sid, State: &state}
+	if wire, ok := c.Scene.StateWire[sid]; ok {
+		resp.State = nil
+		if wire != "" {
+			var v string
+			if err := json.Unmarshal([]byte(wire), &v); err != nil {
+				return nil, fmt.Errorf("cluster.GetHaResources: unmarshal data: %w", err)
+			}
+			resp.State = &v
+		}
+	}
 	if comment, ok := c.Scene.Comments[sid]; ok {
 		resp.Comment = &comment
 	}
@@ -521,6 +545,9 @@ func (c *HASceneCluster) UpdateHaResources(_ context.Context, sid string, params
 	c.Scene.record("UpdateHaResources:" + sid + "=" + state)
 	if _, ok := c.Scene.Requested[sid]; !ok {
 		return errors.New("no such resource '" + sid + "' (HTTP500)")
+	}
+	if state != "" {
+		delete(c.Scene.StateWire, sid)
 	}
 	if params != nil && params.Comment != nil {
 		if c.Scene.Comments == nil {
@@ -560,6 +587,7 @@ func (c *HASceneCluster) DeleteHaResources(_ context.Context, sid string, _ *clu
 		return &sdkerrors.APIError{HTTPCode: 500, Message: "resource '" + sid + "' is used in a rule"}
 	}
 	delete(c.Scene.Requested, sid)
+	delete(c.Scene.StateWire, sid)
 	delete(c.Scene.Services, sid)
 	delete(c.Scene.Comments, sid)
 	c.Scene.pruneRules(sid)

@@ -262,12 +262,8 @@ func (s *Stager) stagedBlocker(got *sdkcluster.GetHaResourcesResponse) string {
 	switch {
 	case got.Comment == nil || !s.Owned(*got.Comment):
 		return "does not carry this Director's ownership marker"
-	case got.State == nil || *got.State != haStateIgnored:
-		state := "no state"
-		if got.State != nil {
-			state = *got.State
-		}
-		return "requests " + state + " rather than ignored"
+	case pve.HARequestedState(got.State) != haStateIgnored:
+		return "requests " + pve.HARequestedState(got.State) + " rather than ignored"
 	}
 	return ""
 }
@@ -449,7 +445,7 @@ func (s *Stager) Activate(ctx context.Context, d *VMDecision, node string) (stri
 	started := haStateStarted
 	if err := s.Resources.UpdateHaResources(ctx, d.SID, &sdkcluster.UpdateHaResourcesParams{State: &started}); err != nil {
 		got, readErr := s.Resources.GetHaResources(ctx, d.SID)
-		if readErr != nil || got == nil || got.State == nil || *got.State != haStateStarted {
+		if readErr != nil || got == nil || pve.HARequestedState(got.State) != haStateStarted {
 			return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("ha activate: request started for %s", d.SID))
 		}
@@ -552,7 +548,7 @@ func LeaveHA(
 			return pve.VMLocation{}, cpierrors.Retriable("ha leave: %s does not carry this Director's ownership "+
 				"marker, so the CPI leaves it in place", sid)
 		}
-		if got.State != nil && *got.State == haStateError {
+		if pve.HARequestedState(got.State) == haStateError {
 			return pve.VMLocation{}, cpierrors.Retriable("ha leave: %s is in the error state; the operator must "+
 				"clear it", sid)
 		}
@@ -600,7 +596,7 @@ func drainRemoved(
 // barrier again, which finishes it and puts back the state the token names.
 func NarrowPending(state, comment *string) bool {
 	_, marked := narrowMarkOf(comment)
-	return marked && state != nil && *state == haStateIgnored
+	return marked && pve.HARequestedState(state) == haStateIgnored
 }
 
 // isResourceNotFound reports whether err says the HA resource does not exist.

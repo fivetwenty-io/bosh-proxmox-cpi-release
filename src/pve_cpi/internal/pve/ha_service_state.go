@@ -38,7 +38,41 @@ const (
 	haRequestedIgnored = "ignored"
 	haRequestedEnabled = "enabled"
 	haRequestedStarted = "started"
+	haRequestedStopped = "stopped"
 )
+
+// haRequestedStates lists every request HARequestedState can return for a
+// state PVE accepts. The old name enabled is absent because it reads as
+// started.
+var haRequestedStates = map[string]struct{}{
+	haRequestedStarted: {}, haRequestedStopped: {}, haStateDisabled: {}, haRequestedIgnored: {},
+}
+
+// HARequestedState returns the requested state of an HA resource the way PVE
+// HA reads it. A resource registered without a state carries none in its
+// configuration, and PVE omits the field when it answers for it. The CRM reads
+// such a resource as started, which is also the schema's default, and it
+// reads the old name enabled as started too, so both read as started here. A
+// nil or blank state therefore means started, never an unknown request. The
+// value is otherwise returned as PVE sent it, trimmed, so a caller can still
+// tell a value PVE does not define with HARequestedStateValid.
+func HARequestedState(state *string) string {
+	if state == nil {
+		return haRequestedStarted
+	}
+	requested := strings.TrimSpace(*state)
+	if requested == "" || requested == haRequestedEnabled {
+		return haRequestedStarted
+	}
+	return requested
+}
+
+// HARequestedStateValid reports whether a value from HARequestedState is a
+// request PVE HA defines.
+func HARequestedStateValid(requested string) bool {
+	_, ok := haRequestedStates[requested]
+	return ok
+}
 
 // haServiceRawStates lists every raw CRM state that HAServiceState accepts.
 var haServiceRawStates = map[string]struct{}{
@@ -487,6 +521,12 @@ func (s *HAServiceState) readService(mgr *haManagerView) (node, reason string) {
 // returns a reason when the list is unreadable or the entry for the VM is
 // unusable. A list that cannot be attributed row by row is unusable, because
 // the row it cannot read might be this VM's.
+//
+// A row that carries no state is a resource registered without one, which PVE
+// HA reads as started. The list does not promise to carry every stored field,
+// so the resource itself is read before the request is taken as started, and
+// a failed read of it leaves the state unknown. A state PVE does not define,
+// or one that is not a string, is unknown too.
 func (s *HAServiceState) readConfigured(ctx context.Context, clusterAPI HAServiceStateCluster) string {
 	var resp *sdkcluster.ListHaResourcesResponse
 	err := RetryOnTransient(ctx, nil, "ha_service_state_resources", 0, func() error {
@@ -503,8 +543,8 @@ func (s *HAServiceState) readConfigured(ctx context.Context, clusterAPI HAServic
 	found := false
 	for _, raw := range *resp {
 		var row struct {
-			SID   string `json:"sid"`
-			State string `json:"state"`
+			SID   string  `json:"sid"`
+			State *string `json:"state"`
 		}
 		if jsonErr := json.Unmarshal(raw, &row); jsonErr != nil {
 			return fmt.Sprintf("an HA resource row does not parse: %v", jsonErr)
@@ -512,16 +552,15 @@ func (s *HAServiceState) readConfigured(ctx context.Context, clusterAPI HAServic
 		if row.SID != s.SID || found {
 			continue
 		}
-		requested := strings.TrimSpace(row.State)
-		if requested == haRequestedEnabled {
-			requested = haRequestedStarted
+		requested := HARequestedState(row.State)
+		if row.State == nil || strings.TrimSpace(*row.State) == "" {
+			var reason string
+			if requested, reason = readConfiguredStateOf(ctx, clusterAPI, s.SID); reason != "" {
+				return reason
+			}
 		}
-		if requested == "" {
-			// The list does not guarantee a state, so ask for the resource itself.
-			requested = readConfiguredStateOf(ctx, clusterAPI, s.SID)
-		}
-		if requested == "" {
-			return fmt.Sprintf("the HA resource %s carries no requested state", s.SID)
+		if !HARequestedStateValid(requested) {
+			return fmt.Sprintf("the HA resource %s requests %q, which is not a state PVE HA defines", s.SID, requested)
 		}
 		found = true
 		s.Configured = true
@@ -531,23 +570,29 @@ func (s *HAServiceState) readConfigured(ctx context.Context, clusterAPI HAServic
 }
 
 // readConfiguredStateOf reads the requested state of one HA resource from
-// GET /cluster/ha/resources/{sid}. It returns "" when the read fails or the
-// resource still carries no state, which leaves the caller's state unknown.
-func readConfiguredStateOf(ctx context.Context, clusterAPI HAServiceStateCluster, sid string) string {
+// GET /cluster/ha/resources/{sid}, for a list row that carried none. A
+// resource that carries no state here either is one PVE HA reads as started.
+// It returns a reason, which leaves the caller's state unknown, when the read
+// fails, answers with no body, or answers for another resource.
+func readConfiguredStateOf(ctx context.Context, clusterAPI HAServiceStateCluster, sid string) (string, string) {
 	var resp *sdkcluster.GetHaResourcesResponse
 	err := RetryOnTransient(ctx, nil, "ha_service_state_resource", 0, func() error {
 		var inner error
 		resp, inner = clusterAPI.GetHaResources(ctx, sid)
 		return inner
 	})
-	if err != nil || resp == nil || resp.State == nil {
-		return ""
+	switch {
+	case err != nil:
+		return "", fmt.Sprintf("the HA resource %s lists no requested state, and the read of the resource "+
+			"failed: %v", sid, err)
+	case resp == nil:
+		return "", fmt.Sprintf("the HA resource %s lists no requested state, and the read of the resource "+
+			"answered with no body", sid)
+	case resp.Sid != "" && resp.Sid != sid:
+		return "", fmt.Sprintf("the HA resource %s lists no requested state, and the read of the resource "+
+			"answered for %s", sid, resp.Sid)
 	}
-	requested := strings.TrimSpace(*resp.State)
-	if requested == haRequestedEnabled {
-		requested = haRequestedStarted
-	}
-	return requested
+	return HARequestedState(resp.State), ""
 }
 
 // readEntryTime reads the entry node's clock in Unix seconds.

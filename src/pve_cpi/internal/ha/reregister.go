@@ -380,10 +380,7 @@ func (r *readd) run(ctx context.Context) (ReregisterResult, error) {
 	if err != nil {
 		return ReregisterResult{}, err
 	}
-	requested := ""
-	if res.State != nil {
-		requested = *res.State
-	}
+	requested := pve.HARequestedState(res.State)
 	switch {
 	case st.Raw == haStateError:
 		return r.removeAndRegister(ctx, intent, res, st)

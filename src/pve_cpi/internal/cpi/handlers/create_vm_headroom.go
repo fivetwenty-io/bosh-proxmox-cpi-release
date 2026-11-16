@@ -18,6 +18,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // headroomDecisionVMID stands in for the VM's ID while the eligibility decision
@@ -544,8 +545,8 @@ func recoveredServiceIDs(resp *sdkcluster.ListHaResourcesResponse) (map[string]b
 	out := make(map[string]bool, len(*resp))
 	for i, raw := range *resp {
 		var row struct {
-			SID   string `json:"sid"`
-			State string `json:"state"`
+			SID   string  `json:"sid"`
+			State *string `json:"state"`
 		}
 		if err := json.Unmarshal(raw, &row); err != nil {
 			return nil, fmt.Errorf("HA resource row %d does not parse: %w", i, err)
@@ -553,7 +554,7 @@ func recoveredServiceIDs(resp *sdkcluster.ListHaResourcesResponse) (map[string]b
 		if strings.TrimSpace(row.SID) == "" {
 			return nil, fmt.Errorf("HA resource row %d names no service ID", i)
 		}
-		if strings.EqualFold(strings.TrimSpace(row.State), haResourceStateIgnored) {
+		if strings.EqualFold(pve.HARequestedState(row.State), haResourceStateIgnored) {
 			continue
 		}
 		out[row.SID] = true

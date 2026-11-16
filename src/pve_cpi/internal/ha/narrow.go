@@ -260,10 +260,7 @@ func NarrowActive(ctx context.Context, deps NarrowDeps, in NarrowInput) (pve.VML
 			fmt.Sprintf("ha narrow: read the HA resource of VM %d", in.VMID))
 	}
 	b.comment = stripNarrowMark(res.Comment)
-	current := haStateStarted
-	if res.State != nil && *res.State != "" {
-		current = *res.State
-	}
+	current := pve.HARequestedState(res.State)
 	// An ignored resource that carries the barrier's token is what a crash
 	// inside an earlier barrier leaves, so the barrier finishes it whether or
 	// not this change narrows, and puts back the state the token names. A token
@@ -619,7 +616,7 @@ func (b *barrier) request(ctx context.Context, state string, mark bool) error {
 		return nil
 	}
 	got, readErr := b.deps.Resources.GetHaResources(ctx, b.sid)
-	if readErr == nil && got != nil && got.State != nil && *got.State == state {
+	if readErr == nil && got != nil && pve.HARequestedState(got.State) == state {
 		if _, has := narrowMarkOf(got.Comment); has == mark {
 			b.marked = mark
 			return nil
