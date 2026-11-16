@@ -3,6 +3,7 @@ package spreadclaim
 import (
 	"context"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -288,7 +289,8 @@ func TestConcurrentPicksSpreadEvenly(t *testing.T) {
 
 // TestReleaseOfAnUnrecordedClaimDoesNotWait pins that a claim whose pick could
 // not take the record's lock gives up at once, without a second wait on the
-// same stuck lock.
+// same stuck lock. The move and the bind that follow skip the record too, so
+// the create pays for one wait in all.
 func TestReleaseOfAnUnrecordedClaimDoesNotWait(t *testing.T) {
 	t.Parallel()
 	s := testStore(t, nil)
@@ -304,18 +306,81 @@ func TestReleaseOfAnUnrecordedClaimDoesNotWait(t *testing.T) {
 	}
 	defer func() { _ = held.Close() }()
 	c := mustClaim(t, s, "g", time.Now().Add(time.Hour))
+	start := time.Now()
 	if _, err := c.Pick(context.Background(), leastClaimed("pve1")); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("pick err = %v; want the busy lock", err)
 	}
-	if err := c.Bind(context.Background(), 101); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("bind of an unrecorded claim = %v; want it to try the busy lock again", err)
+	if err := c.Move(context.Background(), "pve2"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("move after the lock wait ran out = %v; want the record reported unavailable", err)
 	}
-	start := time.Now()
+	if err := c.Bind(context.Background(), 101); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("bind after the lock wait ran out = %v; want the record reported unavailable", err)
+	}
 	if err := c.Release(context.Background()); err != nil {
 		t.Fatalf("release = %v; want nothing to remove", err)
 	}
-	if waited := time.Since(start); waited >= s.LockWait {
-		t.Fatalf("release waited %v for a lock it had nothing to change under", waited)
+	// The pick waits once. The move, the bind, and the release must not wait
+	// again, so the four together take less than two waits.
+	if waited := time.Since(start); waited >= 2*s.LockWait {
+		t.Fatalf("pick, move, bind, and release took %v; want one wait of %v in all", waited, s.LockWait)
+	}
+	if c.Node() != "" || c.Holds("pve2") {
+		t.Fatalf("node %q after the release; want none", c.Node())
+	}
+}
+
+// TestARecordedClaimStopsWaitingButIsStillReleased pins that a claim whose
+// pick was recorded stops using the record once a later turn's lock wait
+// runs out, and that its release still removes it from the record, which
+// would otherwise count it until it expires.
+func TestARecordedClaimStopsWaitingButIsStillReleased(t *testing.T) {
+	t.Parallel()
+	s := testStore(t, nil)
+	s.LockWait = 200 * time.Millisecond
+	exp := time.Now().Add(time.Hour)
+	c := mustClaim(t, s, "g", exp)
+	if _, err := c.Pick(context.Background(), leastClaimed("pve1")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(s.Dir.Override)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	held, err := endpointcache.LockFile(context.Background(), root, LockFileName, Name, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Move(context.Background(), "pve2"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("move under the busy lock = %v; want the record reported unavailable", err)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The lock is free again, so a bind that tried the record would land.
+	// It must not try, because the create already paid for one wait.
+	if err := c.Bind(context.Background(), 101); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("bind after a lock wait ran out = %v; want it not to try the record again", err)
+	}
+	var seen map[string]int
+	sibling := func() map[string]int {
+		seen = nil
+		if _, err := mustClaim(t, s, "g", exp).Pick(context.Background(), func(counts map[string]int) string {
+			seen = counts
+			return ""
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return seen
+	}
+	if got := sibling(); !maps.Equal(got, map[string]int{"pve1": 1}) {
+		t.Fatalf("counts before the release = %v; want the claim the pick recorded", got)
+	}
+	if err := c.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := sibling(); len(got) != 0 {
+		t.Fatalf("counts after the release = %v; want the recorded claim removed", got)
 	}
 }
 

@@ -170,6 +170,11 @@ type Claim struct {
 	// as the last write left it. A claim whose write failed is not current,
 	// so the next Move or Bind writes it again.
 	current bool
+	// unavailable is the error of a turn that could not use the record at
+	// all, such as a lock wait that ran out, or nil. Once it is set, Pick,
+	// Move, and Bind no longer try the record, so a stuck lock costs the
+	// create one wait instead of one for every call.
+	unavailable error
 }
 
 // NewClaim returns an unrecorded claim for a create in group that ends at
@@ -228,7 +233,7 @@ func (c *Claim) PickExcept(ctx context.Context, tagged func(vmid int) bool,
 	}
 	var node string
 	counted := false
-	wrote, err := c.store.withRecord(ctx, func(rec *record, now time.Time) bool {
+	wrote, err := c.turn(ctx, func(rec *record, now time.Time) bool {
 		counted = true
 		node = choose(c.counts(rec, now, tagged))
 		if node == "" {
@@ -252,7 +257,9 @@ func (c *Claim) PickExcept(ctx context.Context, tagged func(vmid int) bool,
 // node after an attempt failed on the one it picked. A claim moved to another
 // node names no VMID until Bind names the VM of the new attempt, and one moved
 // to the node it already claims keeps its VMID. Every Move writes the claim,
-// so a Move retries a write that failed before.
+// so a Move retries a write that failed before. A claim whose earlier turn
+// could not use the record at all only notes the node, and the error matches
+// ErrUnavailable.
 func (c *Claim) Move(ctx context.Context, node string) error {
 	if c == nil || node == "" {
 		return nil
@@ -262,7 +269,7 @@ func (c *Claim) Move(ctx context.Context, node string) error {
 	}
 	c.node = node
 	vmid := c.vmid
-	wrote, err := c.store.withRecord(ctx, func(rec *record, _ time.Time) bool {
+	wrote, err := c.turn(ctx, func(rec *record, _ time.Time) bool {
 		c.put(rec, node, vmid)
 		return true
 	})
@@ -274,14 +281,15 @@ func (c *Claim) Move(ctx context.Context, node string) error {
 // Bind names vmid as the VM this claim's create allocated on the node it
 // holds. It writes the claim whenever the record does not hold it on that node
 // with vmid, so a claim whose earlier write failed, or whose entry a rewrite
-// of the record lost, is recorded now.
+// of the record lost, is recorded now. Like Move, it leaves the record alone
+// once an earlier turn of the claim could not use it.
 func (c *Claim) Bind(ctx context.Context, vmid int) error {
 	if c == nil || c.node == "" || vmid <= 0 {
 		return nil
 	}
 	c.vmid = vmid
 	same := false
-	wrote, err := c.store.withRecord(ctx, func(rec *record, _ time.Time) bool {
+	wrote, err := c.turn(ctx, func(rec *record, _ time.Time) bool {
 		if e, ok := rec.Claims[c.id]; ok && e.Node == c.node && e.VMID == vmid {
 			same = true
 			return false
@@ -304,7 +312,9 @@ func (c *Claim) VMID() int {
 
 // Release removes this claim from the record. A claim that holds no node, or
 // that no write ever recorded, touches nothing, so calling it again is free
-// and a record whose lock is stuck costs no second wait.
+// and a record whose lock is stuck costs no second wait. A claim that a write
+// did record is removed even after a later turn could not use the record,
+// because the record would otherwise count it until it expires.
 func (c *Claim) Release(ctx context.Context) error {
 	if c == nil || c.node == "" {
 		return nil
@@ -322,6 +332,24 @@ func (c *Claim) Release(ctx context.Context) error {
 		return true
 	})
 	return err
+}
+
+// turn runs change in one turn with the record, as withRecord does, unless an
+// earlier turn of this claim could not use the record at all. A turn that
+// cannot use the record is remembered, and every later turn of the claim
+// returns at once with an error that matches ErrUnavailable. A turn whose
+// write failed after the lock was taken is not remembered, so the next one
+// writes again.
+func (c *Claim) turn(ctx context.Context, change func(rec *record, now time.Time) bool) (bool, error) {
+	if c.unavailable != nil {
+		return false, fmt.Errorf("spread claim: %w: an earlier turn of this create could not use it, so it is "+
+			"not tried again", ErrUnavailable)
+	}
+	wrote, err := c.store.withRecord(ctx, change)
+	if errors.Is(err, ErrUnavailable) {
+		c.unavailable = err
+	}
+	return wrote, err
 }
 
 // counts returns the live claims of the group per node in the store's scope,
