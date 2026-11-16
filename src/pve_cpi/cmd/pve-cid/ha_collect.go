@@ -31,6 +31,10 @@ import (
 const (
 	// haOwnershipTag marks a VM the CPI created.
 	haOwnershipTag = "bosh-cpi"
+
+	// haOwnerTagPrefix opens the tag that names the Director that created a
+	// VM, as create_vm stamps it.
+	haOwnerTagPrefix = "bosh-owner--"
 	// haManagedTag marks a VM the CPI registered with PVE HA.
 	haManagedTag = "bosh-ha-managed"
 	// haReplicaTag marks a VM that the replicate local policy set up a
@@ -174,6 +178,10 @@ type haCollector struct {
 	journalOK     bool
 	memoryErr     error
 
+	// scope says which VMs this run judges under the cluster's local policy.
+	// It is nil for a run that reads one effective config.
+	scope *haEntryScope
+
 	// euid is the doctor's own effective user, which the cache directory
 	// checks compare with the CPI's user.
 	euid int
@@ -186,8 +194,17 @@ type haCollector struct {
 // the effective CPI config for the cluster, owner is the requesting Director's
 // UUID when the run has one, and now is the clock every age is measured on.
 func collectHA(ctx context.Context, r HAReader, cfg *config.CPIConfig, owner string, now time.Time) *haReport {
+	return collectHAScoped(ctx, r, cfg, owner, now, nil)
+}
+
+// collectHAScoped is collectHA for a run that judges one cpi-config entry among
+// several. scope narrows the VMs the local policy is judged on to the ones the
+// entry can own.
+func collectHAScoped(ctx context.Context, r HAReader, cfg *config.CPIConfig, owner string, now time.Time,
+	scope *haEntryScope,
+) *haReport {
 	c := &haCollector{
-		ctx: ctx, r: r, cfg: cfg, owner: owner, now: now, euid: os.Geteuid(),
+		ctx: ctx, r: r, cfg: cfg, owner: owner, now: now, euid: os.Geteuid(), scope: scope,
 		rep:    &haReport{Mode: cfg.HAModeValue(), Nodes: []haNode{}, CPUDomains: []haDomain{}, Findings: []haFinding{}},
 		byVMID: map[int]*haGuest{}, jobStatus: map[string]ha.ReplicaSyncStatus{}, awaiting: map[int]bool{},
 	}
@@ -738,7 +755,7 @@ func (c *haCollector) protectionFindings() {
 	}
 	policy := c.cfg.HALocalPolicyValue()
 	for _, g := range c.guests {
-		if !g.owned || g.ref.Template || g.cfg == nil {
+		if !g.owned || g.ref.Template || g.cfg == nil || !c.judgesVM(g) {
 			continue
 		}
 		local := c.localVolumes(g)
@@ -751,6 +768,15 @@ func (c *haCollector) protectionFindings() {
 			}
 			detail := fmt.Sprintf("VM %d on %s holds node-local volumes (%s) and runs without HA; pve.ha.local_policy is %s",
 				g.ref.VMID, g.ref.Node, strings.Join(local, ", "), policy)
+			if c.scope.ambiguous() {
+				if c.scope.Leader {
+					c.rep.advise(haKindLocalUnprotected, g.sid,
+						"VM %d on %s holds node-local volumes (%s) and runs without HA; the cpi-config entries %s share its cluster and VM ID band "+
+							"and set pve.ha.local_policy to %s, so the doctor cannot tell which entry owns it",
+						g.ref.VMID, g.ref.Node, strings.Join(local, ", "), c.scope.peerList(), c.scope.policyList())
+				}
+				continue
+			}
 			if policy == config.HALocalPolicyNone {
 				c.rep.advise(haKindLocalUnprotected, g.sid, "%s", detail)
 			} else {
@@ -1595,6 +1621,51 @@ func (c *haCollector) guestLeftovers() {
 				"VM %d on %s carries %s but has no HA resource", g.ref.VMID, g.ref.Node, haManagedTag)
 		}
 	}
+}
+
+// ownerTagFor renders the owner tag create_vm stamps for a Director UUID: the
+// UUID with every byte outside letters, digits, and hyphens replaced by a
+// hyphen, trimmed of hyphens at both ends, and lowercased.
+func ownerTagFor(directorUUID string) string {
+	b := []byte(strings.ToLower(directorUUID))
+	for i, ch := range b {
+		if ch < 'a' || ch > 'z' {
+			if ch < '0' || ch > '9' {
+				if ch != '-' {
+					b[i] = '-'
+				}
+			}
+		}
+	}
+	s := strings.Trim(string(b), "-")
+	if s == "" {
+		return ""
+	}
+	return haOwnerTagPrefix + s
+}
+
+// judgesVM reports whether the local policy of this run applies to g. A VM
+// whose owner tag names another Director belongs to that Director's policy,
+// and under a cpi-config entry a VM outside the entry's VM ID band cannot have
+// been created through it.
+func (c *haCollector) judgesVM(g *haGuest) bool {
+	if c.owner != "" {
+		mine := ownerTagFor(c.owner)
+		other := false
+		for t := range g.tags {
+			if strings.HasPrefix(t, haOwnerTagPrefix) {
+				if t == mine {
+					other = false
+					break
+				}
+				other = true
+			}
+		}
+		if other {
+			return false
+		}
+	}
+	return c.scope == nil || c.scope.Band.Contains(g.ref.VMID)
 }
 
 // ownedResource reports whether sid names a VM the CPI created.

@@ -1793,3 +1793,63 @@ func TestCollectReplicaWithoutPinIsNotAwaitingWidening(t *testing.T) {
 	g.rules = []ha.Rule{pinRule(101, haMarker, "n1", "n2")}
 	want(t, runCollect(t, g, haCfg("auto", "replicate")), haKindReplicaAwaiting, haSeverityAdvice, "vm:101")
 }
+
+func TestCollectLocalPolicyJudgesOnlyTheOwningDirector(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	localVM(f, "n1", "bosh-cpi;bosh-owner--bbbbbbbb-0000")
+	none := collectHA(context.Background(), f, haCfg("auto", "hold"), "", haNow)
+	want(t, none, haKindLocalUnprotected, haSeverityProblem, "vm:101", "local_policy is hold")
+
+	// A run for another Director leaves the VM to the Director that owns it.
+	other := collectHA(context.Background(), f, haCfg("auto", "hold"), "aaaaaaaa-0000", haNow)
+	wantNone(t, other, haKindLocalUnprotected)
+	mine := collectHA(context.Background(), f, haCfg("auto", "hold"), "BBBBBBBB-0000", haNow)
+	want(t, mine, haKindLocalUnprotected, haSeverityProblem, "vm:101", "local_policy is hold")
+}
+
+func TestCollectLocalPolicyIsJudgedUnderTheOwningEntry(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	localVM(f, "n1", "bosh-cpi")
+	run := func(scope *haEntryScope, policy string) *haReport {
+		return collectHAScoped(context.Background(), f, haCfg("auto", policy), "", haNow, scope)
+	}
+
+	// An entry whose VM band does not hold the VM says nothing about it.
+	wantNone(t, run(&haEntryScope{Band: pve.VMIDBand{Start: 200, End: 299}, Policy: "hold", Leader: true}, "hold"),
+		haKindLocalUnprotected)
+	want(t, run(&haEntryScope{Band: pve.VMIDBand{Start: 100, End: 199}, Policy: "hold", Leader: true}, "hold"),
+		haKindLocalUnprotected, haSeverityProblem, "vm:101", "local_policy is hold")
+
+	// Two entries on one band with different policies cannot say who owns the
+	// VM, so the first reports it once without naming either policy as its own.
+	band := pve.VMIDBand{Start: 100, End: 199}
+	first := run(&haEntryScope{Band: band, Policy: "replicate", Peers: []string{"az2-none"}, PeerPolicies: []string{"none"}, Leader: true}, "replicate")
+	want(t, first, haKindLocalUnprotected, haSeverityAdvice, "vm:101", "az2-none", "none or replicate", "cannot tell which entry owns it")
+	second := run(&haEntryScope{Band: band, Policy: "none", Peers: []string{"az2"}, PeerPolicies: []string{"replicate"}}, "none")
+	wantNone(t, second, haKindLocalUnprotected)
+}
+
+func TestEntryScopesGroupEntriesByClusterAndBand(t *testing.T) {
+	t.Parallel()
+	base := haCfg("auto", "none")
+	entries := []cpiConfigEntry{
+		{Name: "az2", Type: "pve", Properties: map[string]any{"pve_ha": map[string]any{"local_policy": "replicate"}}},
+		{Name: "az2-none", Type: "pve", Properties: map[string]any{"pve_ha": map[string]any{"local_policy": "none"}}},
+		{Name: "far", Type: "pve", Properties: map[string]any{"pve_vmid_range_start": 5000, "pve_vmid_range_end": 5999}},
+	}
+	got := entryScopes(entries, base)
+	if got[0] == nil || got[1] == nil || got[2] == nil {
+		t.Fatalf("scopes = %+v, want one for each entry", got)
+	}
+	if !got[0].Leader || got[1].Leader || !got[2].Leader {
+		t.Errorf("leaders = %v %v %v, want true false true", got[0].Leader, got[1].Leader, got[2].Leader)
+	}
+	if len(got[0].Peers) != 1 || got[0].Peers[0] != "az2-none" || !got[0].ambiguous() {
+		t.Errorf("first scope = %+v, want az2-none as an ambiguous peer", got[0])
+	}
+	if len(got[2].Peers) != 0 || got[2].ambiguous() {
+		t.Errorf("far scope = %+v, want no peers", got[2])
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -187,8 +188,9 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 	}
 	multi := &haMultiReport{Clusters: []*haReport{}, SharedExports: []haSharedFinding{}}
 	layouts := make([]pve.ClusterVMIDLayout, 0, len(entries))
+	scopes := entryScopes(entries, base)
 	for i := range entries {
-		report, layout := checkCPIConfigEntry(ctx, &entries[i], base, logger, deps)
+		report, layout := checkCPIConfigEntry(ctx, &entries[i], base, logger, deps, scopes[i])
 		multi.Clusters = append(multi.Clusters, report)
 		layouts = append(layouts, layout)
 	}
@@ -234,7 +236,7 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 // unchecked with the reason, and the report carries the same reason as a
 // finding.
 func checkCPIConfigEntry(ctx context.Context, entry *cpiConfigEntry, base *config.CPIConfig, logger *log.Logger,
-	deps haDeps,
+	deps haDeps, scope *haEntryScope,
 ) (*haReport, pve.ClusterVMIDLayout) {
 	layout := pve.ClusterVMIDLayout{Name: entry.Name}
 	fail := func(mode, reason string) (*haReport, pve.ClusterVMIDLayout) {
@@ -264,10 +266,100 @@ func checkCPIConfigEntry(ctx context.Context, entry *cpiConfigEntry, base *confi
 		return fail(eff.HAModeValue(), fmt.Sprintf("the datacenter next-id range could not be read: %s", err))
 	}
 	layout.Storages, layout.NextID = storages, next
-	report := collectHA(ctx, reader, eff, "", deps.now())
+	report := collectHAScoped(ctx, reader, eff, "", deps.now(), scope)
 	report.Cluster = entry.Name
 	for _, key := range unknown {
 		report.advise(haKindAdvice, key, "the entry's property %q is not one the CPI reads, so it was ignored", key)
 	}
 	return report, layout
+}
+
+// haEntryScope says which VMs one cpi-config entry judges under its local
+// policy. A VM carries no mark of the entry that created it, so the entry's VM
+// ID band is the only boundary the CPI itself draws. Entries that share a
+// cluster and a band cannot be told apart, and a VM in that band is judged once,
+// by the first of them, without naming a policy as if it were known.
+type haEntryScope struct {
+	// Band is the entry's VM ID band.
+	Band pve.VMIDBand
+	// Peers names the other entries on the same cluster and band, and
+	// PeerPolicies holds the local policy of each, in the same order.
+	Peers        []string
+	PeerPolicies []string
+	// Policy is this entry's own local policy.
+	Policy string
+	// Leader is true for the first entry of its group.
+	Leader bool
+}
+
+// ambiguous reports whether the entries that share the band disagree on the
+// local policy, which is the only case where the owner changes the verdict.
+func (s *haEntryScope) ambiguous() bool {
+	if s == nil {
+		return false
+	}
+	for _, p := range s.PeerPolicies {
+		if p != s.Policy {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *haEntryScope) peerList() string {
+	return strings.Join(s.Peers, ", ")
+}
+
+func (s *haEntryScope) policyList() string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range append([]string{s.Policy}, s.PeerPolicies...) {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	sort.Strings(out)
+	return strings.Join(out, " or ")
+}
+
+// entryScopes works out the scope of every entry. An entry whose properties do
+// not apply gets nil and is reported as unchecked by its own run.
+func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntryScope {
+	type facts struct {
+		key    string
+		name   string
+		policy string
+		band   pve.VMIDBand
+	}
+	all := make([]*facts, len(entries))
+	for i := range entries {
+		eff, _, _, err := config.ApplyContextOverrides(base, entries[i].Properties)
+		if err != nil {
+			continue
+		}
+		band := pve.VMIDBandsFromConfig(eff).VM
+		all[i] = &facts{
+			key: eff.Host + "|" + band.String(), name: entries[i].Name, policy: eff.HALocalPolicyValue(), band: band,
+		}
+	}
+	out := make([]*haEntryScope, len(entries))
+	for i, f := range all {
+		if f == nil {
+			continue
+		}
+		sc := &haEntryScope{Band: f.band, Policy: f.policy, Leader: true}
+		for j, o := range all {
+			if o == nil || j == i || o.key != f.key {
+				continue
+			}
+			sc.Peers = append(sc.Peers, o.name)
+			sc.PeerPolicies = append(sc.PeerPolicies, o.policy)
+			if j < i {
+				sc.Leader = false
+			}
+		}
+		out[i] = sc
+	}
+	return out
 }
