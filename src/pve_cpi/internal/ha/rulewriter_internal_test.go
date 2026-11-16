@@ -239,6 +239,85 @@ func TestApplyStopsWaitingWhenTheContextEnds(t *testing.T) {
 	}
 }
 
+// TestApplyDoesNotStartAWaitThatOutrunsTheDeadline pins that a backoff the
+// request's deadline leaves no room for is not slept. The Apply returns at
+// once with a retriable error, so the Director drives the call again instead
+// of the create sleeping into its deadline and failing with a bare one.
+func TestApplyDoesNotStartAWaitThatOutrunsTheDeadline(t *testing.T) {
+	refusal := errors.New("500 Internal Server Error: cannot use unmanaged resource(s) vm:2")
+	api := &fakeRuleAPI{faults: map[int]ruleFault{0: {err: refusal}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	slept := 0
+	w := &RuleWriter{API: api, Sleep: func(context.Context, time.Duration) error {
+		slept++
+		return nil
+	}}
+	_, err := w.Apply(ctx, "t", ensure(ourAA("aa", "vm:1", "vm:2")))
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want a retriable deadline error", err)
+	}
+	if slept != 0 || len(api.writes) != 1 {
+		t.Fatalf("slept %d writes %v, want no wait and no resend", slept, api.writes)
+	}
+}
+
+// TestApplyWrapsAnEndedWaitAsRetriable pins that a wait the request ends, or
+// that a lock which could not be taken again ends, fails the Apply with a
+// retriable error that keeps the cause.
+func TestApplyWrapsAnEndedWaitAsRetriable(t *testing.T) {
+	api := &fakeRuleAPI{faults: map[int]ruleFault{0: {err: errors.New("i/o timeout")}}}
+	lost := errors.New("the rules lock could not be taken again")
+	w := &RuleWriter{API: api, Backoff: func(context.Context, time.Duration, bool) error { return lost }}
+	_, err := w.Apply(context.Background(), "t", ensure(ourAA("aa", "vm:1", "vm:2")))
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !errors.Is(err, lost) {
+		t.Fatalf("err = %v, want a retriable error that wraps the cause", err)
+	}
+}
+
+// TestApplyTellsBackoffWhetherItHasWritten pins the idle flag. A wait before
+// the first write may release the rules lock, and the Apply then takes its
+// baseline from the next read. A wait after a write keeps the lock, because a
+// repair may have to revert that write against the baseline.
+func TestApplyTellsBackoffWhetherItHasWritten(t *testing.T) {
+	refusal := errors.New("500 Internal Server Error: cannot use unmanaged resource(s) vm:3")
+	both := func(set *RuleSet) ([]RuleOp, error) {
+		for _, want := range []Rule{ourAA("a", "vm:1", "vm:2"), ourAA("b", "vm:3", "vm:4")} {
+			if set.Find(want.ID) == nil {
+				return []RuleOp{{Kind: OpCreate, Rule: want}}, nil
+			}
+		}
+		return nil, nil
+	}
+
+	var idles []bool
+	backoff := func(_ context.Context, _ time.Duration, idle bool) error {
+		idles = append(idles, idle)
+		return nil
+	}
+	api := &fakeRuleAPI{faults: map[int]ruleFault{0: {err: refusal}}}
+	w := &RuleWriter{API: api, Backoff: backoff}
+	if _, err := w.Apply(context.Background(), "t", both); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(idles, []bool{true}) {
+		t.Fatalf("idle flags %v, want one idle wait before the first write", idles)
+	}
+
+	idles = nil
+	api = &fakeRuleAPI{faults: map[int]ruleFault{1: {err: refusal}}}
+	w.API = api
+	if _, err := w.Apply(context.Background(), "t", both); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(idles, []bool{false}) {
+		t.Fatalf("idle flags %v, want one wait that keeps the lock after rule a landed", idles)
+	}
+	if !slices.Equal(api.writes, []string{"create:a", "create:b", "create:b"}) {
+		t.Fatalf("writes %v", api.writes)
+	}
+}
+
 func TestApplyRefusesAnInfeasibleWriteBeforeSending(t *testing.T) {
 	api := &fakeRuleAPI{}
 	w, _ := newTestWriter(api, []string{"a", "b"})

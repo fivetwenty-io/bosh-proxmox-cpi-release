@@ -210,7 +210,7 @@ func writeMergedPinRule(
 	}
 
 	var planned *ha.Rule
-	err := withHARulesLock(ctx, deps, vmid, logger, func() error {
+	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		writer := newHARuleWriterFor(deps, profile, logger, req.Decision)
 		res, err := writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			cur := set.Find(ruleName)
@@ -351,7 +351,7 @@ func deleteNodeAffinityRule(
 	ctx context.Context, deps Deps, vmid int, logger *log.Logger, keep func(cur *ha.Rule) error,
 ) error {
 	ruleName := naRuleNameFor(vmid)
-	err := withHARulesLock(ctx, deps, vmid, logger, func() error {
+	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		writer := newHARuleWriter(deps, nil, logger)
 		foreign := false
 		_, err := writer.Apply(ctx, "node-affinity cleanup", func(set *ha.RuleSet) ([]ha.RuleOp, error) {

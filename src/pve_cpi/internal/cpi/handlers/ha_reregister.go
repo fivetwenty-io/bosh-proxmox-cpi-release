@@ -390,7 +390,7 @@ func (w *readdWiring) leaveRules(ctx context.Context) error {
 func leaveOwnedHARules(ctx context.Context, deps Deps, vmid int, owner string, logger *log.Logger) error {
 	sid := haResourceSid(vmid)
 	pinID := naRuleNameFor(vmid)
-	return withHARulesLock(ctx, deps, vmid, logger, func() error {
+	return withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		writer := newHARuleWriter(deps, nil, logger)
 		_, err := writer.Apply(ctx, "ha readd rule leave", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			var ops []ha.RuleOp
@@ -496,7 +496,7 @@ func (w *readdWiring) withoutHA(ctx context.Context, _ *ha.VMDecision, rec ha.Re
 func enableOwnedGroupRules(ctx context.Context, deps Deps, ident haIdentity, vmid int, logger *log.Logger) error {
 	sid := haResourceSid(vmid)
 	base := ident.ruleName()
-	return withHARulesLock(ctx, deps, vmid, logger, func() error {
+	return withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		writer := newHARuleWriter(deps, nil, logger)
 		_, err := writer.Apply(ctx, "anti-affinity enable", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			var ops []ha.RuleOp

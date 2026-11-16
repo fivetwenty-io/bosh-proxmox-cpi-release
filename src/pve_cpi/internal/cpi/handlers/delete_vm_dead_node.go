@@ -575,7 +575,7 @@ func resourceRequestsStopped(res *cluster.GetHaResourcesResponse, source string)
 // let the CRM recover the VM onto any node.
 func (c *deadNodeCompletion) narrowRules(ctx context.Context) ([]string, error) {
 	var dests []string
-	err := withHARulesLock(ctx, c.deps, c.vmid, c.logger, func() error {
+	err := withHARulesLock(ctx, c.deps, c.vmid, c.logger, func(ctx context.Context) error {
 		report, st, gap, err := c.readFenceEvidence(ctx)
 		if err != nil {
 			return c.deferWrap(err, "read the HA view again before the rule edits")

@@ -111,8 +111,14 @@ type RuleWriter struct {
 	Logger  *log.Logger
 	// Sleep waits between conflicts, and between held writes that did not
 	// land. nil sleeps on the context.
-	Sleep  func(ctx context.Context, d time.Duration) error
-	Repair RepairDeps
+	Sleep func(ctx context.Context, d time.Duration) error
+	// Backoff, when set, takes each wait over from Sleep. idle is true while
+	// the Apply has written nothing yet, so a caller that holds the rules lock
+	// may release it for the wait and take it again, and the Apply then plans
+	// from a fresh read as if it had just started. With idle false the Apply
+	// has writes a repair may have to revert, so the lock must stay held.
+	Backoff func(ctx context.Context, d time.Duration, idle bool) error
+	Repair  RepairDeps
 }
 
 // ApplyResult is what one Apply did.
@@ -129,8 +135,10 @@ type ApplyResult struct {
 // RuleWriterMaxAttempts times. A held error, which may hide a write that
 // landed, re-reads and compares the whole rule with what was meant. A match
 // counts as landed, and a mismatch backs off the same way and goes round
-// again, which plans and checks feasibility against a fresh read. After the last write it verifies every CPI-owned rule
-// and repairs a disabled confinement pin.
+// again, which plans and checks feasibility against a fresh read. A wait that
+// the request's deadline leaves no room for ends the Apply with a retriable
+// error. After the last write it verifies every CPI-owned rule and repairs a
+// disabled confinement pin.
 func (w *RuleWriter) Apply(ctx context.Context, label string, plan Planner) (*ApplyResult, error) {
 	if w.Lock != nil {
 		release, err := w.Lock(ctx)
@@ -180,8 +188,11 @@ func (w *RuleWriter) Apply(ctx context.Context, label string, plan Planner) (*Ap
 			}
 			w.logger().Info("HA rule write hit a digest conflict; backing off",
 				log.String("rule", op.Rule.ID), log.Int("attempt", conflicts), log.String("op", label))
-			if err := w.sleep(ctx, ruleBackoff(conflicts)); err != nil {
+			if err := w.wait(ctx, label, ruleBackoff(conflicts), len(res.Wrote) == 0); err != nil {
 				return res, err
+			}
+			if len(res.Wrote) == 0 {
+				before = nil
 			}
 			continue
 		case writeRejected:
@@ -209,9 +220,14 @@ func (w *RuleWriter) Apply(ctx context.Context, label string, plan Planner) (*Ap
 		// for a reason that clears with time, such as a member whose HA
 		// resource a concurrent create has not finished staging or has just
 		// rolled back. Planning again at once would spend every attempt in a
-		// few milliseconds, so wait the way a conflict does first.
-		if err := w.sleep(ctx, ruleBackoff(misses)); err != nil {
+		// few milliseconds, so wait the way a conflict does first. A wait
+		// before the first write may release the rules lock, so the next round
+		// takes its baseline from the read it makes.
+		if err := w.wait(ctx, label, ruleBackoff(misses), len(res.Wrote) == 0); err != nil {
 			return res, err
+		}
+		if len(res.Wrote) == 0 {
+			before = nil
 		}
 	}
 	if len(res.Wrote) == 0 {
@@ -253,10 +269,41 @@ func (w *RuleWriter) logger() *log.Logger {
 	return w.Logger
 }
 
+// wait pays the backoff d before the writer's next attempt, through Backoff
+// when it is set and Sleep otherwise. idle says whether the Apply has written
+// nothing yet (see Backoff). A wait that would run past the request's deadline
+// is not started, because the attempt after it could not finish, and the error
+// is retriable so the Director drives the call again. A wait that ends early,
+// because the request was cancelled or the lock could not be taken again,
+// returns a retriable error too.
+func (w *RuleWriter) wait(ctx context.Context, label string, d time.Duration, idle bool) error {
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= d {
+		return cpierrors.WrapAs(context.DeadlineExceeded, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: the request's deadline leaves no time to wait %v and write the HA rules again", label, d))
+	}
+	var err error
+	if w.Backoff != nil {
+		err = w.Backoff(ctx, d, idle)
+	} else {
+		err = w.sleep(ctx, d)
+	}
+	if err != nil {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: stopped waiting to write the HA rules again", label))
+	}
+	return nil
+}
+
 func (w *RuleWriter) sleep(ctx context.Context, d time.Duration) error {
 	if w.Sleep != nil {
 		return w.Sleep(ctx, d)
 	}
+	return SleepContext(ctx, d)
+}
+
+// SleepContext waits d, or until ctx ends, whichever comes first, and returns
+// ctx's error when ctx ended first.
+func SleepContext(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
@@ -267,9 +314,11 @@ func (w *RuleWriter) sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// ruleBackoff is the wait before conflict attempt n: exponential from
+// ruleBackoff is the wait before attempt n+1: exponential from
 // ruleBackoffBase, capped at ruleBackoffMax, plus up to half again of jitter so
-// two writers that collided do not collide again.
+// two writers that collided do not collide again. Apply waits only for n from
+// 1 to RuleWriterMaxAttempts-1, so its longest wait is 2 s plus up to 1 s of
+// jitter, and the cap only guards a larger attempt count.
 func ruleBackoff(n int) time.Duration {
 	d := ruleBackoffBase << max(n-1, 0)
 	if d <= 0 || d > ruleBackoffMax {
@@ -638,7 +687,7 @@ func (w *RuleWriter) writeOnce(ctx context.Context, op RuleOp) error {
 			if attempt >= RuleWriterMaxAttempts {
 				return sendErr
 			}
-			if err := w.sleep(ctx, ruleBackoff(attempt)); err != nil {
+			if err := w.wait(ctx, "revert", ruleBackoff(attempt), false); err != nil {
 				return err
 			}
 			continue

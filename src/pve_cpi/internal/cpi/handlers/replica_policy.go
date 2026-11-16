@@ -136,7 +136,7 @@ func writeReplicaPin(
 	ctx context.Context, deps Deps, profile *ha.Profile, logger *log.Logger, vmid int, expect, pin *ha.Rule,
 ) error {
 	owner := deps.RequestDirectorUUID
-	err := withHARulesLock(ctx, deps, vmid, logger, func() error {
+	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		writer := newHARuleWriterFor(deps, profile, logger, nil)
 		_, err := writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			cur := set.Find(pin.ID)

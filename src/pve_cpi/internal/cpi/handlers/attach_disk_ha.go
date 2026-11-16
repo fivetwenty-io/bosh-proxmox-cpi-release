@@ -1131,7 +1131,7 @@ func (h *attachHA) writePin(ctx context.Context, pin *ha.Rule) error {
 // decision d.
 func (h *attachHA) writePinFor(ctx context.Context, d *ha.VMDecision, pin *ha.Rule) error {
 	owner := h.deps.RequestDirectorUUID
-	err := withHARulesLock(ctx, h.deps, h.vmid, h.logger, func() error {
+	err := withHARulesLock(ctx, h.deps, h.vmid, h.logger, func(ctx context.Context) error {
 		writer := newHARuleWriterFor(h.deps, h.profile, h.logger, d)
 		_, err := writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			cur := set.Find(pin.ID)

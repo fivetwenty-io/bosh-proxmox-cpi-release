@@ -67,6 +67,13 @@ type aaClusterStub struct {
 	// onRuleWrite, when set, runs after every rule write that lands, so a
 	// test can check an invariant on each state the rules pass through.
 	onRuleWrite func(rule string)
+	// strictCreate makes a create of a rule that exists fail the way PVE
+	// refuses it, instead of replacing the rule. Writers that race on a new
+	// rule then settle it the way they do against PVE.
+	strictCreate bool
+	// purgeFromRules makes a purging resource delete take the sid out of
+	// every rule, and change the digest, the way PVE's purge does.
+	purgeFromRules bool
 }
 
 func (s *aaClusterStub) record(ev string) {
@@ -193,8 +200,21 @@ func (s *aaClusterStub) landed(rule string) {
 	}
 }
 
-func (s *aaClusterStub) DeleteHaResources(_ context.Context, sid string, _ *cluster.DeleteHaResourcesParams) error {
+func (s *aaClusterStub) DeleteHaResources(_ context.Context, sid string, p *cluster.DeleteHaResourcesParams) error {
 	delete(s.resources, sid)
+	if !s.purgeFromRules || p == nil || p.Purge == nil || !*p.Purge {
+		return nil
+	}
+	changed := false
+	for name, csv := range s.rules {
+		if rest := dropSidFromCSV(csv, sid); rest != csv {
+			s.rules[name] = rest
+			changed = true
+		}
+	}
+	if changed {
+		s.digest++
+	}
 	return nil
 }
 
@@ -251,6 +271,9 @@ func (s *aaClusterStub) CreateHaRules(_ context.Context, p *cluster.CreateHaRule
 	s.createRuleCalls++
 	if s.failCreateRule {
 		return fmt.Errorf("create rule failed")
+	}
+	if _, ok := s.rules[p.Rule]; ok && s.strictCreate {
+		return fmt.Errorf("500 Internal Server Error: rule '%s' already defined", p.Rule)
 	}
 	if err := s.refuseUnmanaged(p.Resources); err != nil {
 		return err

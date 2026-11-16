@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -68,17 +69,123 @@ func placeableNodeCount(p *ha.Profile) int {
 
 // withHARulesLock runs fn under the cluster-scoped rules lock when the cluster
 // lock is enabled. A lock that cannot be taken is returned as the retriable
-// error acquireAntiAffinityLock builds, and fn does not run.
-func withHARulesLock(ctx context.Context, deps Deps, vmid int, logger *log.Logger, fn func() error) error {
+// error acquireAntiAffinityLock builds, and fn does not run. fn gets a context
+// that carries the hold, and the rule writers built from it wait through the
+// hold (see rulesLockHold), so fn must use that context for its writes.
+func withHARulesLock(
+	ctx context.Context, deps Deps, vmid int, logger *log.Logger, fn func(ctx context.Context) error,
+) error {
 	if !deps.Config.ClusterLockEnabled() {
-		return fn()
+		return fn(ctx)
 	}
 	handle, err := acquireAntiAffinityLock(ctx, deps, haRulesLockKey, vmid)
 	if err != nil {
 		return err
 	}
-	defer releaseAntiAffinityLock(ctx, handle, haRulesLockKey, logger)
-	return fn()
+	hold := &rulesLockHold{deps: deps, vmid: vmid, logger: logger, handle: handle, heldWait: rulesLockHeldWaitBudget}
+	defer hold.release(ctx)
+	return fn(context.WithValue(ctx, rulesLockHoldKey{}, hold))
+}
+
+// rulesLockHeldWaitBudget bounds the time one hold of the rules lock spends in
+// the rule writer's backoff while it keeps the lock. Every CPI rule write in
+// the cluster queues behind this lock, and the lock's claim budgets about
+// twenty seconds for the read-modify-write at its shortest, so a holder that
+// slept through a run of refusals would push the creates queued behind it
+// toward their cluster_lock_timeout_sec wait and spend the claim. Past the
+// budget the writer tries again without waiting.
+const rulesLockHeldWaitBudget = 2 * time.Second
+
+// rulesLockHoldKey is the context key of the rulesLockHold that a
+// withHARulesLock call hands to fn.
+type rulesLockHoldKey struct{}
+
+// rulesLockHold is one withHARulesLock call's hold of the rules lock. The rule
+// writers built by newHARuleWriterFor pay their backoff through it. A writer
+// that may yield, which is the anti-affinity ensure before it has written
+// anything, releases the lock for the wait and takes it again, so a create that
+// waits for a sibling's resource does not hold up every other rule write in
+// the cluster. Every other wait keeps the lock and is cut to what remains of
+// rulesLockHeldWaitBudget. A hold is used by one request's goroutine only.
+type rulesLockHold struct {
+	deps   Deps
+	vmid   int
+	logger *log.Logger
+	// handle is the lock while it is held, and nil once a wait released it
+	// and could not take it again.
+	handle *pve.ClusterLockHandle
+	// yield lets an idle writer's wait release the lock.
+	yield bool
+	// heldWait is what remains of rulesLockHeldWaitBudget for this hold.
+	heldWait time.Duration
+}
+
+// rulesLockHoldFrom returns the hold ctx carries, or nil when the caller holds
+// no rules lock.
+func rulesLockHoldFrom(ctx context.Context) *rulesLockHold {
+	hold, _ := ctx.Value(rulesLockHoldKey{}).(*rulesLockHold)
+	return hold
+}
+
+// allowYield sets whether an idle writer's wait may release the lock. It is
+// safe on a nil hold.
+func (h *rulesLockHold) allowYield(on bool) {
+	if h != nil {
+		h.yield = on
+	}
+}
+
+// wait pays the backoff d. With yield on and an idle writer it releases the
+// lock, sleeps, and takes the lock again with a fresh claim, which also renews
+// the hold's budget. A lock that cannot be taken again ends the wait with the
+// acquire's retriable error, and the writer stops. Otherwise it sleeps with the
+// lock held for no longer than the budget that remains.
+func (h *rulesLockHold) wait(
+	ctx context.Context, d time.Duration, idle bool, sleep func(context.Context, time.Duration) error,
+) error {
+	if !h.yield || !idle || h.handle == nil {
+		d = min(d, h.heldWait)
+		if d <= 0 {
+			return nil
+		}
+		h.heldWait -= d
+		return sleep(ctx, d)
+	}
+	releaseAntiAffinityLock(ctx, h.handle, haRulesLockKey, h.logger)
+	h.handle = nil
+	if err := sleep(ctx, d); err != nil {
+		return err
+	}
+	handle, err := acquireAntiAffinityLock(ctx, h.deps, haRulesLockKey, h.vmid)
+	if err != nil {
+		return err
+	}
+	h.handle, h.heldWait = handle, rulesLockHeldWaitBudget
+	return nil
+}
+
+// release gives the lock up when the hold still has it.
+func (h *rulesLockHold) release(ctx context.Context) {
+	if h.handle != nil {
+		releaseAntiAffinityLock(ctx, h.handle, haRulesLockKey, h.logger)
+		h.handle = nil
+	}
+}
+
+// haRuleBackoff returns the wait the request's rule writers pay between
+// attempts. Under a rules lock it goes through the hold, and without one it
+// sleeps, on deps.HARuleSleep when a test set it.
+func haRuleBackoff(deps Deps) func(ctx context.Context, d time.Duration, idle bool) error {
+	sleep := deps.HARuleSleep
+	if sleep == nil {
+		sleep = ha.SleepContext
+	}
+	return func(ctx context.Context, d time.Duration, idle bool) error {
+		if hold := rulesLockHoldFrom(ctx); hold != nil {
+			return hold.wait(ctx, d, idle, sleep)
+		}
+		return sleep(ctx, d)
+	}
 }
 
 // newHARuleWriter builds the rule writer for one request. The caller holds the
@@ -104,7 +211,7 @@ func newHARuleWriterFor(deps Deps, profile *ha.Profile, logger *log.Logger, deci
 		ClusterNodes: profileNodeNames(profile),
 		Managed:      deps.Config.HAModeValue() == config.HAModeManaged,
 		Logger:       logger,
-		Sleep:        deps.HARuleSleep,
+		Backoff:      haRuleBackoff(deps),
 		Repair: ha.RepairDeps{
 			RemoveResource: func(ctx context.Context, sid string) error {
 				return removeOwnedHaResource(ctx, svc, sid, owner)
