@@ -110,6 +110,13 @@ type NodeConstraint struct {
 	// outside its own pin was moved there outside the CPI, so the decision
 	// defers with a retriable error and writes nothing, rather than take the
 	// VM out of HA for a state that a migration back or a wider pin ends.
+	//
+	// The replicate policy is the one exception. Its pin names the source
+	// alone until a sync is verified, so a pin that names only the VM's node
+	// says where the VM runs and nothing about where its replica lives, and
+	// it does not bound the replica's partner. A pin that names more nodes
+	// names the partner it keeps, and it bounds the partner like any other
+	// constraint.
 	Pin bool
 }
 
@@ -951,7 +958,10 @@ func (e *eligibility) decideReplicate(
 		}
 	}
 	if len(sharedVols) > 0 {
-		sa, err := e.narrow(storageIndex{infos: e.infos}, sharedVols)
+		// The candidates carry the constraints already, so the shared
+		// volumes' access set narrows them without the constraints a second
+		// time, which would put the source-only pin back.
+		sa, err := pve.VolumeAccessSet(context.Background(), storageIndex{infos: e.infos}, e.members, sharedVols)
 		if err != nil {
 			gap(false, err.Error())
 		} else {
@@ -1011,10 +1021,15 @@ func (e *eligibility) decideReplicate(
 
 // replicaCandidates returns the nodes a replica may live on before the volumes
 // narrow them: every node the constraints and the CPU domain allow, restricted
-// to the strict AZ.
+// to the strict AZ. The VM's own pin bounds them only when it names more than
+// the VM's node, because the source-only pin the replicate policy writes says
+// nothing about where the replica lives (see NodeConstraint.Pin).
 func (e *eligibility) replicaCandidates(domain []string) []string {
 	out := append([]string{}, e.members...)
 	for _, c := range e.in.Constraints {
+		if c.Pin && sourceOnlyPin(c.Nodes, e.d.Node) {
+			continue
+		}
 		out = intersect(out, c.Nodes)
 	}
 	if domain != nil {
@@ -1025,6 +1040,12 @@ func (e *eligibility) replicaCandidates(domain []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// sourceOnlyPin reports whether a pin's nodes name node alone, which is the
+// shape of a replicate VM's pin before a sync is verified.
+func sourceOnlyPin(nodes []string, node string) bool {
+	return len(nodes) == 1 && nodes[0] == node
 }
 
 // zfsGaps lists why a node-local volume cannot be replicated.

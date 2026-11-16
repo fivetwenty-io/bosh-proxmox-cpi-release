@@ -838,6 +838,69 @@ func TestDecideVMReplicate(t *testing.T) {
 	})
 }
 
+// TestDecideVMReplicateSourceOnlyPin covers a replicate VM that runs under HA
+// with the pin the replicate policy writes. The source-only pin says where
+// the VM runs and nothing about its replica, so the decision keeps the job's
+// target as the partner, while a widened pin and any other constraint still
+// bound the partner.
+func TestDecideVMReplicateSourceOnlyPin(t *testing.T) {
+	zfs := vols("tank:vm-101-disk-0", "nfs:100/vm-101-data")
+	pin := func(nodes ...string) NodeConstraint {
+		return NodeConstraint{Name: "the VM's pin ha-na-101", Nodes: nodes, Pin: true}
+	}
+	t.Run("the source-only pin keeps the job's target as the partner", func(t *testing.T) {
+		for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
+			p := eligProfile(mode, "pve1", "pve2", "pve3")
+			p.Replication = []ReplicationJob{{ID: "101-0", Guest: 101, Source: "pve1", Target: "pve3"}}
+			in := baseInput(replicateCfg(mode), zfs...)
+			in.HAManaged = true
+			in.Constraints = []NodeConstraint{pin("pve1")}
+			d := mustDecide(t, p, in)
+			if !d.Registers() || d.Policy != PolicyReplicate || d.Partner != "pve3" ||
+				!reflect.DeepEqual(d.Hard, []string{"pve1"}) {
+				t.Fatalf("%s: decision = %+v", mode, d)
+			}
+		}
+	})
+	t.Run("the source-only pin with no job picks a partner as create_vm does", func(t *testing.T) {
+		p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+		in := baseInput(replicateCfg(config.HAModeAuto), zfs...)
+		in.HAManaged = true
+		in.Constraints = []NodeConstraint{pin("pve1")}
+		if d := mustDecide(t, p, in); !d.Registers() || d.Partner != "pve2" {
+			t.Fatalf("decision = %+v", d)
+		}
+	})
+	t.Run("a widened pin bounds the partner", func(t *testing.T) {
+		p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+		in := baseInput(replicateCfg(config.HAModeAuto), zfs...)
+		in.HAManaged = true
+		in.Constraints = []NodeConstraint{pin("pve1", "pve3")}
+		if d := mustDecide(t, p, in); !d.Registers() || d.Partner != "pve3" {
+			t.Fatalf("decision = %+v", d)
+		}
+	})
+	t.Run("another constraint still bounds the partner", func(t *testing.T) {
+		p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+		in := baseInput(replicateCfg(config.HAModeAuto), zfs...)
+		in.HAManaged = true
+		in.Constraints = []NodeConstraint{pin("pve1"), {Name: "PCI passthrough", Nodes: []string{"pve1"}}}
+		if d := mustDecide(t, p, in); d.Outcome != OutcomeSkip || !strings.Contains(d.Reason, "no placeable partner") {
+			t.Fatalf("decision = %+v", d)
+		}
+	})
+	t.Run("a VM outside its source-only pin still defers", func(t *testing.T) {
+		p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+		in := baseInput(replicateCfg(config.HAModeAuto), zfs...)
+		in.HAManaged = true
+		in.Constraints = []NodeConstraint{pin("pve2")}
+		d := mustDecide(t, p, in)
+		if d.Registers() || !d.Transient {
+			t.Fatalf("decision = %+v", d)
+		}
+	})
+}
+
 func TestDecideVMReplicatePrerequisites(t *testing.T) {
 	cfg := replicateCfg
 	t.Run("a non-ZFS local volume gives no HA in auto and an error in managed", func(t *testing.T) {
