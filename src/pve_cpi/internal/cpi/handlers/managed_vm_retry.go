@@ -12,11 +12,12 @@ import (
 
 func beginManagedVMRetry(ctx context.Context, deps Deps, parsed *createVMParsedArgs, selection *StoragePlacementSelection, handle *aj.Handle, next *managedVMPlan, proof aj.Verification) (*managedVMAllocation, error) {
 	parsed.storagePlan = next.plan
-	// A retry reached from the journal resume runs before create_vm settles
-	// the cluster stamp and token, so it settles them here. Without them the
-	// replacement VM would carry neither tag and get a bare CID whatever
-	// vm_cid_format says. The closed attempt's VM never reached the Director,
-	// so the replacement takes a fresh token.
+	// create_vm settles the cluster stamp and token before the journal
+	// resume, so a retry it reaches through the resume has them, and the
+	// closed attempt's VM never reached the Director, so that token is a
+	// fresh one. A caller that reaches the retry without them settles them
+	// here, because without them the replacement VM would carry neither tag
+	// and get a bare CID whatever vm_cid_format says.
 	if parsed.clusterStamp == "" || parsed.cidToken == "" {
 		if err := resolveCreateStamp(ctx, deps, parsed, deps.Log(ctx)); err != nil {
 			return nil, err

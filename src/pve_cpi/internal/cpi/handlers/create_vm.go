@@ -631,8 +631,8 @@ func createVM(
 	// pool layers are not readable by the CPI's identity, naming the grant to
 	// fix instead of surfacing an opaque permission error mid-create. It runs
 	// after the last purely local validation and before the first PVE call
-	// (the managed-VM resume lookup), so a malformed request never pays for a
-	// probe and no API call runs ahead of the check.
+	// (the sweep of deferred teardowns), so a malformed request never pays for
+	// a probe and no API call runs ahead of the check.
 	if poolErr := ensurePoolAccess(ctx, deps); poolErr != nil {
 		logger.Error("pools preflight failed", log.Err(poolErr))
 		return nil, poolErr
@@ -643,6 +643,23 @@ func createVM(
 	// has aged past any create still running. Best-effort and bounded.
 	sweepDeferredTeardowns(ctx, deps, logger)
 
+	// The cluster stamp and token are settled once, ahead of placement and of
+	// the journal resume, because every candidate shape carries the same
+	// stamp tags and the spread claim below is scoped by the stamp.
+	if err := resolveCreateStamp(ctx, deps, parsed, logger); err != nil {
+		return nil, err
+	}
+	// A create that places an instance group's VM claims its node, so its
+	// siblings that place while it clones count it. The claim is held until
+	// the create returns, and the deferred release covers every exit. A
+	// create whose storage plan ranks the nodes claims through that ranking,
+	// and a set-managed create moves the claim to the node its allocation
+	// settles on and names its VMID there. The claim opens before the
+	// journal resume, so a set-managed create that BOSH retries after its
+	// first attempt closed ranks through it and holds it as well.
+	parsed.spread = newSpreadClaims(deps, parsed, spreadClaimExpiry(ctx, deps), logger)
+	defer parsed.spread.release(ctx)
+
 	if existing, found, resumeErr := resumeExistingManagedVM(ctx, deps, args, parsed); found || resumeErr != nil {
 		return existing, resumeErr
 	}
@@ -650,24 +667,11 @@ func createVM(
 	// Placement may build the VM's shape once per candidate node, so the
 	// missing-owner warning is logged here, once for the whole call.
 	warnMissingOwnerTag(deps, logger)
-	// The cluster stamp and token are settled once, ahead of placement, for
-	// the same reason.
-	if err := resolveCreateStamp(ctx, deps, parsed, logger); err != nil {
-		return nil, err
-	}
 
 	selection, err := ResolveStoragePlacementSelectors(deps.Config, "create_vm", parsed.cloudPropsMap, parsed.cloudProps.EphemeralDiskSizeMB > 0)
 	if err != nil {
 		return nil, cpierrors.Cloud("create_vm: %s", err.Error())
 	}
-	// A create that places an instance group's VM claims its node, so its
-	// siblings that place while it clones count it. The claim is held until
-	// the create returns, and the deferred release covers every exit. A
-	// create whose storage plan ranks the nodes claims through that ranking,
-	// and a set-managed create moves the claim to the node its allocation
-	// settles on and names its VMID there.
-	parsed.spread = newSpreadClaims(deps, parsed, spreadClaimExpiry(ctx, deps), logger)
-	defer parsed.spread.release(ctx)
 	if selection.SetManaged {
 		return createManagedVM(ctx, deps, args, parsed, selection)
 	}
