@@ -54,7 +54,7 @@ func enumFailureCtx() context.Context {
 // 1-match masks multi-attach).
 func TestFindVMsHostingDisk_EnumerationFailure_Retriable(t *testing.T) {
 	t.Parallel()
-	_, err := findVMsHostingDisk(enumFailureCtx(), enumFailureDeps(), "pvd-test-disk")
+	_, _, err := findVMsHostingDisk(enumFailureCtx(), enumFailureDeps(), "pvd-test-disk")
 	if err == nil {
 		t.Fatal("a failed enumeration must fail the holder scan, not report zero holders")
 	}

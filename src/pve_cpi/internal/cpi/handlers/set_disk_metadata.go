@@ -126,18 +126,39 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 		}
 
 		// --- scan VMs for disk ---
-		matches, err := findVMsHostingDisk(ctx, deps, bareDiskCID)
+		matches, offline, err := findVMsHostingDisk(ctx, deps, bareDiskCID)
 		if err != nil {
 			return nil, err
 		}
 
 		switch len(matches) {
 		case 0:
+			if len(offline) > 0 {
+				// The scan could not read the guests on a node the cluster
+				// reports offline, and the disk may be attached to one of
+				// them. Answering "not attached" would drop the metadata
+				// with no error, and no write can reach a VM on that node
+				// anyway, so we fail retriable and let the Director send the
+				// call again once the node is back.
+				return nil, cpierrors.Retriable(
+					"set_disk_metadata: disk %q is not attached to a VM on any online node, and the cluster reports %s offline, so it may be attached to a VM there; metadata not persisted",
+					diskCID, strings.Join(offline, ", "),
+				)
+			}
 			deps.Log(ctx).Warn("set_disk_metadata: disk not attached; metadata not persisted",
 				log.String("disk_cid", diskCID))
 			return nil, nil
 
 		case 1:
+			if len(offline) > 0 {
+				// A disk is attached to one VM at a time, so the holder
+				// found on an online node settles where the metadata goes.
+				// The ambiguity check below that the scan also gives can't
+				// cover the offline nodes, and we say so.
+				deps.Log(ctx).Warn("set_disk_metadata: writing to the holder found on an online node; the ambiguity check did not cover nodes the cluster reports offline",
+					log.String("disk_cid", diskCID), log.Int("vmid", matches[0].vmid),
+					log.String("node", matches[0].node), log.String("offline_nodes", strings.Join(offline, ",")))
+			}
 			// Wrap both persistMetadata and applyCustomTagsToVM under a single
 			// per-VMID cluster lock. This prevents a concurrent set_vm_metadata
 			// (or another set_disk_metadata) from interleaving its own Config
@@ -268,6 +289,14 @@ func coerceTagMap(v any) map[string]string {
 // description, which is where the provenance record for every disk it holds
 // lives.
 //
+// The enumeration is the offline-tolerant one. A node the quorate cluster
+// reports offline is left out of the scan, and its name comes back in the
+// second return value, instead of stalling the call through the listing's
+// retries and then failing it. A holder found on a listed node settles the
+// answer, because a disk is attached to one VM at a time. An answer with no
+// holder proves nothing while a node was left out, so the handler turns that
+// case into a retriable error rather than the "not attached" warning.
+//
 // Transport errors from the enumeration propagate as wrapped retriable
 // errors.
 // Per-VM Config errors are skipped only when they are not-found (the VM was
@@ -277,16 +306,17 @@ func coerceTagMap(v any) map[string]string {
 // false 1-match (masked multi-attach) -- while a denied VM.Audit grant stays
 // permanent and names itself. The scan never short-circuits on the first match:
 // visiting every VM is what makes ambiguity detection possible.
-func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attachedVM, error) {
+func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attachedVM, []string, error) {
 	// The candidate list comes from authoritative per-node listings
-	// (ListGuestsAuthoritative), not the /cluster/resources index: the index
-	// lags by minutes, so a young holder would be invisible to it, producing
-	// the silent 0-match (metadata loss) or masked multi-attach the contract
-	// above forbids. The enumeration classifies its own failures (retriable
-	// for a partial fleet), preserving the retriable-propagation contract.
-	guests, listErr := pve.ListGuestsAuthoritative(ctx, deps.PVE, deps.Log(ctx))
+	// (ListGuestsAuthoritativeTolerant), not the /cluster/resources index: the
+	// index lags by minutes, so a young holder would be invisible to it,
+	// producing the silent 0-match (metadata loss) or masked multi-attach the
+	// contract above forbids. The enumeration classifies its own failures
+	// (retriable for a partial fleet), preserving the retriable-propagation
+	// contract.
+	guests, offline, listErr := pve.ListGuestsAuthoritativeTolerant(ctx, deps.PVE, deps.Log(ctx))
 	if listErr != nil {
-		return nil, cpierrors.Wrap(listErr, "set_disk_metadata: enumerate cluster guests")
+		return nil, nil, cpierrors.Wrap(listErr, "set_disk_metadata: enumerate cluster guests")
 	}
 
 	var matches []attachedVM
@@ -315,7 +345,7 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 				// VM deleted concurrently or config gone: cannot host the disk.
 				continue
 			}
-			return nil, cpierrors.Wrap(pve.WrapConfigReadError(cfgErr),
+			return nil, nil, cpierrors.Wrap(pve.WrapConfigReadError(cfgErr),
 				fmt.Sprintf("set_disk_metadata: Config error for vm %d on node %s", vmid, vmNode))
 		}
 
@@ -338,7 +368,7 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 		}
 	}
 
-	return matches, nil
+	return matches, offline, nil
 }
 
 // persistMetadata reads the current VM description, merges the disk metadata into

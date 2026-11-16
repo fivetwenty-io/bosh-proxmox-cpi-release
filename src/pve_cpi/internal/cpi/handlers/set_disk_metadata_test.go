@@ -110,6 +110,10 @@ type diskMetaNodesMock struct {
 	// configRead serves the pending read. diskMetaClientMock.Nodes wires it to
 	// the client's QEMU().Config.
 	configRead configReadFn
+	// failNodes makes ListQemu on a named node fail with the given error, and
+	// listCalls counts ListQemu calls per node.
+	failNodes map[string]error
+	listCalls map[string]int
 }
 
 // ListQemuPending serves the pending read from the client's config read.
@@ -121,6 +125,13 @@ func (m *diskMetaNodesMock) ListQemuPending(
 
 // ListQemu serves the node's guests from the cluster fixture (empty when unwired).
 func (m *diskMetaNodesMock) ListQemu(ctx context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	if m.listCalls == nil {
+		m.listCalls = map[string]int{}
+	}
+	m.listCalls[node]++
+	if err, ok := m.failNodes[node]; ok {
+		return nil, err
+	}
 	out := sdknodes.ListQemuResponse{}
 	if m.listQemuSrc == nil {
 		return &out, nil
@@ -246,6 +257,8 @@ type diskMetaClusterSvc struct {
 	listFn                func(ctx context.Context, params *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error)
 	listErr               error
 	resp                  *sdkclusterapi.ListResourcesResponse
+	// statusFn, when set, serves ListStatus in place of the all-online answer.
+	statusFn func() (*sdkclusterapi.ListStatusResponse, error)
 }
 
 func (m *diskMetaClusterSvc) ListResources(ctx context.Context, params *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
@@ -1716,8 +1729,12 @@ func TestHandleSetDiskMetadata_TagsPathPreservesForeignSentinelKeys(t *testing.T
 	}
 }
 
-// ListStatus reports every node of the index fixture, and testNode, online.
+// ListStatus reports every node of the index fixture, and testNode, online,
+// unless statusFn scripts another answer.
 func (m *diskMetaClusterSvc) ListStatus(ctx context.Context) (*sdkclusterapi.ListStatusResponse, error) {
+	if m.statusFn != nil {
+		return m.statusFn()
+	}
 	rows, err := m.ListResources(ctx, nil)
 	if err != nil {
 		return nil, err
