@@ -18,6 +18,7 @@ import (
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
@@ -32,9 +33,6 @@ const (
 	// haOwnershipTag marks a VM the CPI created.
 	haOwnershipTag = "bosh-cpi"
 
-	// haOwnerTagPrefix opens the tag that names the Director that created a
-	// VM, as create_vm stamps it.
-	haOwnerTagPrefix = "bosh-owner--"
 	// haManagedTag marks a VM the CPI registered with PVE HA.
 	haManagedTag = "bosh-ha-managed"
 	// haReplicaTag marks a VM that the replicate local policy set up a
@@ -1623,37 +1621,16 @@ func (c *haCollector) guestLeftovers() {
 	}
 }
 
-// ownerTagFor renders the owner tag create_vm stamps for a Director UUID: the
-// UUID with every byte outside letters, digits, and hyphens replaced by a
-// hyphen, trimmed of hyphens at both ends, and lowercased.
-func ownerTagFor(directorUUID string) string {
-	b := []byte(strings.ToLower(directorUUID))
-	for i, ch := range b {
-		if ch < 'a' || ch > 'z' {
-			if ch < '0' || ch > '9' {
-				if ch != '-' {
-					b[i] = '-'
-				}
-			}
-		}
-	}
-	s := strings.Trim(string(b), "-")
-	if s == "" {
-		return ""
-	}
-	return haOwnerTagPrefix + s
-}
-
 // judgesVM reports whether the local policy of this run applies to g. A VM
 // whose owner tag names another Director belongs to that Director's policy,
 // and under a cpi-config entry a VM outside the entry's VM ID band cannot have
 // been created through it.
 func (c *haCollector) judgesVM(g *haGuest) bool {
 	if c.owner != "" {
-		mine := ownerTagFor(c.owner)
+		mine := handlers.OwnerTagFor(c.owner)
 		other := false
 		for t := range g.tags {
-			if strings.HasPrefix(t, haOwnerTagPrefix) {
+			if strings.HasPrefix(t, handlers.OwnerTagPrefix) {
 				if t == mine {
 					other = false
 					break

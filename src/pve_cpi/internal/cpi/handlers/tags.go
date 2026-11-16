@@ -87,6 +87,15 @@ func ownerTagFor(directorUUID string) string {
 	return ownerTagPrefix + s
 }
 
+// OwnerTagPrefix is ownerTagPrefix for callers outside this package.
+const OwnerTagPrefix = ownerTagPrefix
+
+// OwnerTagFor is ownerTagFor for callers outside this package, so a reader of
+// the owner tag renders it exactly as create_vm stamps it.
+func OwnerTagFor(directorUUID string) string {
+	return ownerTagFor(directorUUID)
+}
+
 // hasOwnerTag reports whether entries already carry an owner tag of any value.
 // The prefix comparison ignores case, the same way hasCPIOwnedPrefix does.
 func hasOwnerTag(entries []string) bool {
