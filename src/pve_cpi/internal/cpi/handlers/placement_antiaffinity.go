@@ -907,43 +907,9 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logg
 		writer := newHARuleWriter(deps, nil, logger)
 		comments := map[string]string{}
 		res, err := writer.Apply(ctx, "anti-affinity cleanup", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
-			var ops []ha.RuleOp
-			for i := range set.Rules {
-				r := &set.Rules[i]
-				if !strings.HasPrefix(r.ID, haRuleNamePrefix) || r.Type != "" && r.Type != haRuleType {
-					continue
-				}
-				if haOwnershipOf(r.Comment, owner) == haOwnedByOther || !r.HasResource(sid) {
-					continue
-				}
-				rest := make([]string, 0, len(r.Resources))
-				for _, s := range r.Resources {
-					if s != sid {
-						rest = append(rest, s)
-					}
-				}
-				if len(rest) < 2 {
-					// Empty or now single-member: the rule no longer spreads anything.
-					ops = append(ops, ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: r.ID}})
-					comments[r.ID] = r.Comment
-					continue
-				}
-				next := r.Clone()
-				next.Resources, next.Errors = rest, nil
-				ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: next})
-			}
-			return ops, nil
+			return planAntiAffinityRemoval(set, sid, owner, comments), nil
 		})
-		if res != nil {
-			for _, op := range res.Wrote {
-				if c, ok := comments[op.Rule.ID]; ok && op.Kind == ha.OpDelete {
-					if deleted == nil {
-						deleted = map[string]string{}
-					}
-					deleted[op.Rule.ID] = c
-				}
-			}
-		}
+		deleted = writtenRuleDeletes(res, comments)
 		return err
 	})
 	if err != nil {
@@ -960,6 +926,58 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logg
 		}
 	}
 	return err
+}
+
+// planAntiAffinityRemoval plans the writes that take sid out of every
+// bosh-aa-* rule that this Director or an older CPI owns. A rule left with
+// fewer than two members is deleted, and comments records the comment of each
+// rule a delete is planned for, which the delete itself does not keep.
+func planAntiAffinityRemoval(set *ha.RuleSet, sid, owner string, comments map[string]string) []ha.RuleOp {
+	var ops []ha.RuleOp
+	for i := range set.Rules {
+		r := &set.Rules[i]
+		if !strings.HasPrefix(r.ID, haRuleNamePrefix) || r.Type != "" && r.Type != haRuleType {
+			continue
+		}
+		if haOwnershipOf(r.Comment, owner) == haOwnedByOther || !r.HasResource(sid) {
+			continue
+		}
+		rest := make([]string, 0, len(r.Resources))
+		for _, s := range r.Resources {
+			if s != sid {
+				rest = append(rest, s)
+			}
+		}
+		if len(rest) < 2 {
+			// Empty or now single-member: the rule no longer spreads anything.
+			ops = append(ops, ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: r.ID}})
+			comments[r.ID] = r.Comment
+			continue
+		}
+		next := r.Clone()
+		next.Resources, next.Errors = rest, nil
+		ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: next})
+	}
+	return ops
+}
+
+// writtenRuleDeletes returns the comment of each rule whose planned delete
+// res reports as written, keyed by the rule ID. It returns nil when none was.
+func writtenRuleDeletes(res *ha.ApplyResult, comments map[string]string) map[string]string {
+	if res == nil {
+		return nil
+	}
+	var deleted map[string]string
+	for i := range res.Wrote {
+		op := &res.Wrote[i]
+		if c, ok := comments[op.Rule.ID]; ok && op.Kind == ha.OpDelete {
+			if deleted == nil {
+				deleted = map[string]string{}
+			}
+			deleted[op.Rule.ID] = c
+		}
+	}
+	return deleted
 }
 
 // deletedGroupRules returns the groups whose rules a removal deleted, from the

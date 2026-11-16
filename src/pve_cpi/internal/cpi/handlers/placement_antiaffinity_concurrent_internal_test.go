@@ -143,7 +143,7 @@ func newAAFleet() *aaFleet {
 			vmids = append(vmids, v)
 		}
 		sort.Ints(vmids)
-		resp := cluster.ListResourcesResponse{}
+		resp := make(cluster.ListResourcesResponse, 0, len(vmids))
 		for _, v := range vmids {
 			resp = append(resp, aaQEMU(v, aaTag))
 		}
