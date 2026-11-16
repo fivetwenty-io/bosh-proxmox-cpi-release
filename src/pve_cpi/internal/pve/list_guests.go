@@ -14,6 +14,7 @@ package pve
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 
@@ -63,7 +64,7 @@ func (g GuestRef) SplitTags() []string {
 // config. Advisory or presence-driven callers that can safely act on a
 // reduced fleet use ListGuestsAuthoritativeTolerant instead.
 func ListGuestsAuthoritative(ctx context.Context, c Client, logger *log.Logger) ([]GuestRef, error) {
-	guests, _, err := listGuestsAuthoritative(ctx, c, logger, nil)
+	guests, _, err := listGuestsAuthoritative(ctx, c, logger, nil, nil)
 	return guests, err
 }
 
@@ -82,6 +83,16 @@ func ListGuestsAuthoritative(ctx context.Context, c Client, logger *log.Logger) 
 // member is reported offline, the tolerance is withheld and the strict
 // fail-loud rule applies unreduced.
 //
+// A member can also go offline during the fan-out. A rebooting node stops
+// answering its API before corosync drops it from membership, so the status
+// read before the fan-out still reports it online, and its listing then fails
+// on every attempt the retry budget allows. To keep that window from stalling
+// the call, each failed attempt on a member reads /cluster/status again, and a
+// member the quorate cluster now reports offline is excluded on the spot, the
+// same way as one reported offline before the fan-out. A member the cluster
+// still reports online keeps the full retry budget, because a brief blip on
+// it is what the retries exist for.
+//
 // Only advisory or presence-driven callers belong here: the VMID allocator's
 // union leg, the IP-conflict probes, the anti-affinity live set (which must
 // gate its drops on an empty excluded list), and the orphan-template prune
@@ -95,13 +106,39 @@ func ListGuestsAuthoritativeTolerant(ctx context.Context, c Client, logger *log.
 	if c == nil || c.Nodes() == nil {
 		return nil, nil, cpierrors.Cloud("ListGuestsAuthoritative: nodes service unavailable")
 	}
-	return listGuestsAuthoritative(ctx, c, logger, offlineClusterNodes(ctx, c, logger))
+	// One status attempt per failed listing attempt: the listing's own retry
+	// loop already paces the reads, and a status read with its own retries
+	// here would multiply the stall this check exists to cut short.
+	wentOffline := func(node string) bool {
+		return readOfflineClusterNodes(ctx, c, logger, 1)[node]
+	}
+	return listGuestsAuthoritative(ctx, c, logger, offlineClusterNodes(ctx, c, logger), wentOffline)
+}
+
+// memberWentOfflineError ends a member's listing retries because the quorate
+// cluster began reporting the member offline between attempts. It keeps the
+// failed attempt's error for the log, but it neither unwraps to that error nor
+// repeats its text, because the retry classifiers read both, and a transient
+// cause would otherwise keep the loop going.
+type memberWentOfflineError struct {
+	node  string
+	cause error
+}
+
+func (e *memberWentOfflineError) Error() string {
+	return "cluster reports member " + e.node + " offline"
 }
 
 // listGuestsAuthoritative is the shared fan-out. offline is the set of
 // members to exclude (nil for the strict form); excluded reports the names
-// actually skipped, in membership order.
-func listGuestsAuthoritative(ctx context.Context, c Client, logger *log.Logger, offline map[string]bool) ([]GuestRef, []string, error) {
+// actually skipped, in membership order. wentOffline, when it isn't nil, is
+// asked after each failed listing attempt whether the cluster now reports
+// that member offline, and a yes excludes the member instead of retrying it.
+// The strict form passes nil, so an absence proof still rides out an outage
+// through the whole retry budget.
+func listGuestsAuthoritative(
+	ctx context.Context, c Client, logger *log.Logger, offline map[string]bool, wentOffline func(string) bool,
+) ([]GuestRef, []string, error) {
 	if ctx == nil {
 		return nil, nil, cpierrors.Cloud("ListGuestsAuthoritative: ctx must not be nil")
 	}
@@ -142,8 +179,16 @@ func listGuestsAuthoritative(ctx context.Context, c Client, logger *log.Logger, 
 			}
 			continue
 		}
-		listedAny = true
-		nodeGuests, listErr := listNodeGuests(ctx, c, logger, node)
+		nodeGuests, listErr := listNodeGuests(ctx, c, logger, node, wentOffline)
+		var offlineErr *memberWentOfflineError
+		if errors.As(listErr, &offlineErr) {
+			excluded = append(excluded, node)
+			if logger != nil {
+				logger.Warn("ListGuestsAuthoritative: excluding member the cluster began reporting offline during its listing",
+					log.String("node", node), log.Err(offlineErr.cause))
+			}
+			continue
+		}
 		if listErr != nil {
 			failedNodes = append(failedNodes, node)
 			failedErrs = append(failedErrs, listErr)
@@ -153,6 +198,7 @@ func listGuestsAuthoritative(ctx context.Context, c Client, logger *log.Logger, 
 			}
 			continue
 		}
+		listedAny = true
 		guests = append(guests, nodeGuests...)
 	}
 	if len(failedNodes) > 0 {
@@ -179,6 +225,12 @@ func listGuestsAuthoritative(ctx context.Context, c Client, logger *log.Logger, 
 // only ever relax the enumeration on the quorate cluster's own authority,
 // never on a guess.
 func offlineClusterNodes(ctx context.Context, c Client, logger *log.Logger) map[string]bool {
+	return readOfflineClusterNodes(ctx, c, logger, 0)
+}
+
+// readOfflineClusterNodes is offlineClusterNodes with the status read's
+// attempt budget given; maxAttempts <= 0 takes RetryOnTransient's default.
+func readOfflineClusterNodes(ctx context.Context, c Client, logger *log.Logger, maxAttempts int) map[string]bool {
 	if c.Cluster() == nil {
 		return nil
 	}
@@ -192,7 +244,7 @@ func offlineClusterNodes(ctx context.Context, c Client, logger *log.Logger) map[
 	// still degrades to "treat every member as online" rather than
 	// propagating an error.
 	var resp *cluster.ListStatusResponse
-	err := RetryOnTransient(ctx, logger, "offline_cluster_nodes", 0, func() error {
+	err := RetryOnTransient(ctx, logger, "offline_cluster_nodes", maxAttempts, func() error {
 		var inner error
 		resp, inner = c.Cluster().ListStatus(ctx)
 		return inner
@@ -242,12 +294,18 @@ func offlineClusterNodes(ctx context.Context, c Client, logger *log.Logger) map[
 // listNodeGuests lists one node's QEMU guests through RetryOnTransient and
 // decodes them into GuestRefs. Malformed elements are skipped, not fatal
 // (matches ResolveTemplateVMIDForNode), logged so schema drift leaves a
-// trail.
-func listNodeGuests(ctx context.Context, c Client, logger *log.Logger, node string) ([]GuestRef, error) {
+// trail. When wentOffline is set and reports the node offline after a failed
+// attempt, the retries stop with a *memberWentOfflineError.
+func listNodeGuests(
+	ctx context.Context, c Client, logger *log.Logger, node string, wentOffline func(string) bool,
+) ([]GuestRef, error) {
 	var raws []json.RawMessage
 	listErr := RetryOnTransient(ctx, logger, "list_guests_node", 0, func() error {
 		resp, inner := c.Nodes().ListQemu(ctx, node, nil)
 		if inner != nil {
+			if wentOffline != nil && wentOffline(node) {
+				return &memberWentOfflineError{node: node, cause: inner}
+			}
 			return inner
 		}
 		raws = nil
