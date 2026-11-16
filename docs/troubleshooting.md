@@ -575,6 +575,23 @@ When a VM has no index row and a cluster member is offline, the CPI cannot prove
 
 We have two ways out. We can bring the member back, and the next retry reads the member directly and settles the question. If the member will never return, we remove it from the cluster with `pvecm delnode <member>`, which drops it from the cluster member list, and then we retry the call. We close the open record afterwards through the retained-authority delete described in [Audit and recover storage allocations](storage-journal-operations.md#delete-an-allocation-through-its-retained-authority).
 
+### set_disk_metadata or create_disk fails because a node is offline
+
+**Symptom**
+
+```text
+set_disk_metadata: disk "pvd-..." is not attached to a VM on any online node, and the cluster reports pve3 offline, so it may be attached to a VM there; metadata not persisted
+create_disk: hinted VM is not on any online node, and the cluster reports pve3 offline; no allocation submitted
+```
+
+**Diagnosis**
+
+Both calls look for their target on the nodes the cluster reports online, and they leave out a node that is down. When the target turns up on an online node, the call goes ahead and the down node doesn't matter. These errors mean the target wasn't on any online node, so it is most likely on the node the error names. The CPI can't read or change a VM on a node that is down, and it won't guess that the target is gone, so it fails the call with a retriable error and changes nothing.
+
+**Fix**
+
+We bring the node back, and the Director's next attempt finds the target there. When the VM is under PVE HA, HA recovers it onto another node, and the next attempt finds it there instead. If the node will never return and the VM isn't under HA, BOSH resurrection or `bosh cck` recreates the VM on another node, and the calls that follow find it there. A node that we remove for good with `pvecm delnode <node>` drops out of the scan entirely.
+
 ## VM ownership refusals
 
 ### A call refuses a VM this Director does not own

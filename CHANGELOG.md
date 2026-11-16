@@ -12,6 +12,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Fixed
+
+- A cluster node that is down no longer stalls `set_disk_metadata` or `create_disk`, or makes them fail, when the disk or VM they act on lives on another node. Both calls looked for their target in every node's own guest list and treated a node that couldn't answer as a reason to retry and then fail. During a node reboot, a tags-only deploy's `set_disk_metadata` spent about 30 seconds retrying the rebooting node's list, and an outage longer than the retry budget would have failed it. `create_disk` with a `vm_cid` read the VM's node the same way at each planning and recheck step, and it failed with an error the Director doesn't retry. Both calls now leave out a node that the quorate cluster reports offline. When the target is on an online node, the call goes ahead as before. In that case `set_disk_metadata` also logs a warning that its check for a disk attached to two VMs didn't cover the offline node. When the target isn't on any online node and a node was left out, the target may be on that node. The call then fails with a retriable error that names the node and changes nothing. `set_disk_metadata` no longer reports the disk as detached in that case, and `create_disk` no longer reports the VM as gone. Every call that reads the offline-tolerant guest list now stops retrying a node as soon as the cluster reports it offline. That includes the disk lookup that `attach_disk`, `detach_disk`, `resize_disk`, and the other disk calls run, along with the guest scans in `create_vm`. It also covers a node that stops answering a moment before it leaves the cluster. A node that the cluster still reports online keeps the full retry budget, and the calls that must prove nothing else holds a disk or a route still wait out every node. [Troubleshooting](docs/troubleshooting.md#set_disk_metadata-or-create_disk-fails-because-a-node-is-offline) covers the new error.
+
 ## [0.10.3] - 2026-11-17
 
 ### Fixed
