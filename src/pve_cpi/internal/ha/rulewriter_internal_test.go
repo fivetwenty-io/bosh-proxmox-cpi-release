@@ -182,6 +182,63 @@ func TestApplyGivesUpOnHeldWritesThatNeverLand(t *testing.T) {
 	}
 }
 
+// TestApplyBacksOffBetweenHeldWrites pins the wait a held write that did not
+// land pays before the writer plans again. The refusal PVE gives for a member
+// whose HA resource is not staged yet is a 500, which reads as held, so
+// without the wait five attempts spend themselves in milliseconds.
+func TestApplyBacksOffBetweenHeldWrites(t *testing.T) {
+	refusal := errors.New("500 Internal Server Error: cannot use unmanaged resource(s) vm:2")
+	faults := map[int]ruleFault{}
+	for i := range RuleWriterMaxAttempts {
+		faults[i] = ruleFault{err: refusal}
+	}
+	api := &fakeRuleAPI{faults: faults}
+	var waits []time.Duration
+	w := &RuleWriter{API: api, Sleep: func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return nil
+	}}
+	_, err := w.Apply(context.Background(), "t", ensure(ourAA("aa", "vm:1", "vm:2")))
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("err = %v, want retriable", err)
+	}
+	if len(waits) != RuleWriterMaxAttempts-1 {
+		t.Fatalf("waits %v, want one before each of the %d later attempts", waits, RuleWriterMaxAttempts-1)
+	}
+	for i, d := range waits {
+		lo := min(ruleBackoffBase<<i, ruleBackoffMax)
+		if d < lo || d > lo+lo/2 {
+			t.Errorf("wait %d = %v, want within [%v, %v]", i+1, d, lo, lo+lo/2)
+		}
+	}
+
+	// A held write that lands on a later attempt waits only before that one.
+	api = &fakeRuleAPI{faults: map[int]ruleFault{0: {err: refusal}}}
+	waits = nil
+	w.API = api
+	if _, err := w.Apply(context.Background(), "t", ensure(ourAA("aa", "vm:1", "vm:2"))); err != nil {
+		t.Fatal(err)
+	}
+	if len(waits) != 1 || !slices.Equal(api.writes, []string{"create:aa", "create:aa"}) {
+		t.Fatalf("waits %v writes %v", waits, api.writes)
+	}
+}
+
+// TestApplyStopsWaitingWhenTheContextEnds pins that the wait between held
+// writes ends with the request.
+func TestApplyStopsWaitingWhenTheContextEnds(t *testing.T) {
+	api := &fakeRuleAPI{faults: map[int]ruleFault{0: {err: errors.New("i/o timeout")}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w := &RuleWriter{API: api}
+	if _, err := w.Apply(ctx, "t", ensure(ourAA("aa", "vm:1", "vm:2"))); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if len(api.writes) != 1 {
+		t.Fatalf("writes %v, want the one held write and no resend", api.writes)
+	}
+}
+
 func TestApplyRefusesAnInfeasibleWriteBeforeSending(t *testing.T) {
 	api := &fakeRuleAPI{}
 	w, _ := newTestWriter(api, []string{"a", "b"})

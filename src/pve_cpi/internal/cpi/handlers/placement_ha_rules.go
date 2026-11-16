@@ -104,6 +104,7 @@ func newHARuleWriterFor(deps Deps, profile *ha.Profile, logger *log.Logger, deci
 		ClusterNodes: profileNodeNames(profile),
 		Managed:      deps.Config.HAModeValue() == config.HAModeManaged,
 		Logger:       logger,
+		Sleep:        deps.HARuleSleep,
 		Repair: ha.RepairDeps{
 			RemoveResource: func(ctx context.Context, sid string) error {
 				return removeOwnedHaResource(ctx, svc, sid, owner)

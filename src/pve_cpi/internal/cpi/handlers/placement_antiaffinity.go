@@ -211,12 +211,18 @@ func ensureAntiAffinityMembershipLocked(
 		return "", fmt.Errorf("anti-affinity: scan group members: %w", scanErr)
 	}
 
-	// 2. Plan and write the group's rules.
+	// 2. Plan and write the group's rules. Every round reads the HA
+	// resources again, because a sibling's create may stage its resource, or
+	// roll it back, between two of this writer's attempts.
+	svc := deps.PVE.Cluster()
 	planner := &aaPlanner{
 		ident: ident, sid: sid, scan: scan, logger: logger,
 		nodes:     len(profileNodeNames(profile)),
 		placeable: placeableNodeCount(profile),
 		split:     deps.Config.HAAntiAffinityOverflowValue() == config.HAOverflowSplit,
+		managed: func() (map[string]struct{}, error) {
+			return listHAResourceSids(ctx, svc)
+		},
 	}
 	writer := newHARuleWriterFor(deps, profile, logger, d)
 	res, err := writer.Apply(ctx, "anti-affinity", planner.plan)
@@ -251,6 +257,15 @@ func ensureAntiAffinityMembershipLocked(
 // rule only while that rule has fewer members than placeable nodes, so a node in
 // maintenance never makes the CPI rewrite a rule, and a replacement member waits
 // until it can be placed apart. Existing members keep their rule.
+//
+// A scanned sibling joins a rule only once it is an HA resource. PVE refuses
+// a rule that names a resource it does not manage, and the Director creates an
+// instance group's VMs in parallel, so a sibling whose create has tagged its
+// guest but not yet staged its resource would make every write of this create
+// fail. Such a sibling is left out, and its own create adds it under the same
+// rules lock once its resource is staged. Each create stages its resource
+// before it takes the lock, so whichever create writes last sees every earlier
+// sibling as managed and the group converges.
 type aaPlanner struct {
 	ident     haIdentity
 	sid       string
@@ -259,10 +274,17 @@ type aaPlanner struct {
 	nodes     int
 	placeable int
 	split     bool
+	// managed lists the sids PVE manages as HA resources. It is read on
+	// every plan. Nil treats every scanned member as managed.
+	managed func() (map[string]struct{}, error)
 
 	// placedIn is the rule this VM is in after the last plan, or "".
 	placedIn string
 	logged   bool
+	// managedNow is the last plan's read of managed, or nil.
+	managedNow map[string]struct{}
+	// deferred holds the siblings already logged as left out for now.
+	deferred map[string]bool
 }
 
 // aaChunkName names a group's n-th rule, the first being the bare name.
@@ -291,6 +313,13 @@ func aaChunkIndex(base, id string) (int, bool) {
 
 func (p *aaPlanner) plan(set *ha.RuleSet) ([]ha.RuleOp, error) {
 	p.placedIn = ""
+	if p.managed != nil {
+		managed, err := p.managed()
+		if err != nil {
+			return nil, fmt.Errorf("anti-affinity: list HA resources: %w", err)
+		}
+		p.managedNow = managed
+	}
 	existing, maxIndex, err := p.existingChunks(set)
 	if err != nil {
 		return nil, err
@@ -416,10 +445,16 @@ func (p *aaPlanner) keptMembers(existing map[int]*ha.Rule, maxIndex int) (map[in
 // assignPending places this VM and every scanned member not yet in a rule into
 // the first rule with room, opening a new rule in split mode (or when the group
 // has none), and returns the new highest index. A rule has room while it holds
-// fewer members than the configured nodes and the placeable nodes.
+// fewer members than the configured nodes and the placeable nodes. A scanned
+// member that is not an HA resource yet waits for its own create to add it.
+// This VM is always pending, because create_vm stages its resource first.
 func (p *aaPlanner) assignPending(desired map[int][]string, assigned map[string]bool, maxIndex int) int {
 	pending := map[string]struct{}{p.sid: {}}
 	for s := range p.scan.members {
+		if s != p.sid && !assigned[s] && !p.isManaged(s) {
+			p.logDeferred(s)
+			continue
+		}
 		pending[s] = struct{}{}
 	}
 	room := p.nodes
@@ -492,6 +527,55 @@ func (p *aaPlanner) chunkOps(set *ha.RuleSet, existing map[int]*ha.Rule, desired
 		return nil
 	}
 	return append(pins, ops...)
+}
+
+// isManaged reports whether the last plan's read lists sid as an HA resource.
+// Without a read every member counts as managed.
+func (p *aaPlanner) isManaged(sid string) bool {
+	if p.managedNow == nil {
+		return true
+	}
+	_, ok := p.managedNow[sid]
+	return ok
+}
+
+// logDeferred says once per sibling that it stays out of the rule until its
+// own create adds it.
+func (p *aaPlanner) logDeferred(sid string) {
+	if p.deferred[sid] {
+		return
+	}
+	if p.deferred == nil {
+		p.deferred = map[string]bool{}
+	}
+	p.deferred[sid] = true
+	p.logger.Info("anti-affinity: sibling is not an HA resource yet, so its own create adds it to the rule",
+		log.String("sid", sid), log.String("rule", p.ident.ruleName()), log.String("joining", p.sid))
+}
+
+// listHAResourceSids returns the sids of every HA resource PVE manages. A
+// resource staged as ignored is managed too, and PVE accepts it in a rule.
+func listHAResourceSids(ctx context.Context, svc cluster.Service) (map[string]struct{}, error) {
+	rows, err := svc.ListHaResources(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]struct{}{}
+	if rows == nil {
+		return out, nil
+	}
+	for _, raw := range *rows {
+		var row struct {
+			SID string `json:"sid"`
+		}
+		if err := json.Unmarshal(raw, &row); err != nil {
+			return nil, fmt.Errorf("decode an HA resource row: %w", err)
+		}
+		if row.SID != "" {
+			out[row.SID] = struct{}{}
+		}
+	}
+	return out, nil
 }
 
 // logOverflow says once per plan why a member stays out of every rule: in

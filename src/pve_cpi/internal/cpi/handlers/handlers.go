@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/agent"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -119,6 +120,12 @@ type Deps struct {
 	// rather than through a package variable, so parallel tests cannot race
 	// on it.
 	Replication ha.ReplicationAPI
+	// HARuleSleep is the wait the HA rule writers pay between a digest
+	// conflict or a held write that did not land and the next attempt. Nil
+	// (production and every existing test literal) sleeps on the context;
+	// tests that drive held writes set a recorder here rather than through a
+	// package variable, so parallel tests cannot race on it.
+	HARuleSleep func(ctx context.Context, d time.Duration) error
 }
 
 // EffectiveISOStorage returns the pool config-drive ISOs live on for this

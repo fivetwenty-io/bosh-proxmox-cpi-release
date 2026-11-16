@@ -110,7 +110,7 @@ func TestEnsureAntiAffinity_LockOffVerifyOff_NoPoolCalls(t *testing.T) {
 	events := []string{}
 	stub := newAAStub()
 	stub.events = &events
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	pools := newAALockPools(&events)
 
 	cfg := aaLockConfig("off", false, 0)
@@ -135,7 +135,7 @@ func TestEnsureAntiAffinity_LockPool_AcquireBeforeReadReleaseAfter(t *testing.T)
 	events := []string{}
 	stub := newAAStub()
 	stub.events = &events
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	pools := newAALockPools(&events)
 
 	cfg := aaLockConfig("pool", false, 30)
@@ -174,7 +174,7 @@ func TestEnsureAntiAffinity_LockPool_TakesTheGrace(t *testing.T) {
 	events := []string{}
 	stub := newAAStub()
 	stub.events = &events
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	pools := newAALockPools(&events)
 	started := time.Now()
 	if err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(aaLockConfig("pool", false, 30), stub, pools), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
@@ -228,7 +228,7 @@ func TestEnsureAntiAffinity_LockPool_HeldExpiredSteals(t *testing.T) {
 	events := []string{}
 	stub := newAAStub()
 	stub.events = &events
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	pools := newAALockPools(&events)
 	// Held by a dead owner: expiry of 1 (epoch) is always in the past.
 	pools.pools[aaLock] = encodeAALockComment("dead", 1)
@@ -257,7 +257,7 @@ func TestEnsureAntiAffinity_LockPool_ReleaseOnRMWError(t *testing.T) {
 	stub := newAAStub()
 	stub.events = &events
 	stub.failListRules = true // RMW fails at the ListHaRules step
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	pools := newAALockPools(&events)
 
 	cfg := aaLockConfig("pool", false, 30)
@@ -280,7 +280,7 @@ func TestEnsureAntiAffinity_LockPool_ReleaseOnRMWError(t *testing.T) {
 
 func TestEnsureAntiAffinity_VerifyOn_MemberPresentOK(t *testing.T) {
 	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	cfg := aaLockConfig("off", true, 0)
 	pools := newAALockPools(nil)
 	if err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
@@ -290,7 +290,7 @@ func TestEnsureAntiAffinity_VerifyOn_MemberPresentOK(t *testing.T) {
 
 func TestEnsureAntiAffinity_VerifyOn_MemberAbsentRetriable(t *testing.T) {
 	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	// A concurrent writer drops the new member after this create's writes, so
 	// the read-after-write verify (the fourth read: plan, plan again, the
 	// writer's own check, and the verify) sees it absent.

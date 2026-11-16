@@ -56,7 +56,7 @@ func aaMembershipConfig(mode string, verify bool, timeoutSec int) *config.CPICon
 func TestApplyAntiAffinityMembership_RetriableLockLost_Propagates(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	events := []string{}
 	lockPools := newAALockPools(&events)
 	// A non-duplicate create failure (transport/pmxcfs fault) is classified
@@ -81,7 +81,7 @@ func TestApplyAntiAffinityMembership_RetriableLockLost_Propagates(t *testing.T) 
 func TestApplyAntiAffinityMembership_RetriableVerify_Propagates(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	stub.dropOnRead(4, "vm:101") // concurrent drop after the writes → verify sees member absent
 
 	cfg := aaMembershipConfig("off", true, 0) // verify on, lock off
@@ -101,7 +101,7 @@ func TestApplyAntiAffinityMembership_RetriableVerify_Propagates(t *testing.T) {
 func TestApplyAntiAffinityMembership_GenericFail_Swallowed(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	stub.failListRules = true // generic HA blip, non-retriable
 
 	cfg := aaMembershipConfig("off", false, 0)

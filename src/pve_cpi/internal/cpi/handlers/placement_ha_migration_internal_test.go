@@ -31,7 +31,7 @@ func TestMigrationDeletesOldRuleWhenOneForeignMemberRemains(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
 	stub.seedRuleWithComment("bosh-aa-web", "vm:100,vm:101,vm:200", aaLegacyRuleComment)
-	stub.listResourcesFn = aaResourcesFn(
+	stub.tagged(
 		aaQEMU(100, legacyTags(aaDirector)),
 		aaQEMU(101, legacyTags(aaDirector)),
 		aaQEMU(200, legacyTags(aaOtherDirector)),
@@ -56,7 +56,7 @@ func TestMigrationAbortsWhenOldRuleChangesBetweenReads(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
 	stub.seedRuleWithComment("bosh-aa-web", "vm:100,vm:101,vm:200,vm:201", aaLegacyRuleComment)
-	stub.listResourcesFn = aaResourcesFn(
+	stub.tagged(
 		aaQEMU(100, legacyTags(aaDirector)),
 		aaQEMU(101, legacyTags(aaDirector)),
 		aaQEMU(200, legacyTags(aaOtherDirector)),
@@ -87,7 +87,7 @@ func TestMigrationAbortsWhenOldRuleChangesBetweenReads(t *testing.T) {
 
 	// The next create of the group sees a stable rule and migrates it.
 	stub.beforeListRules = nil
-	stub.listResourcesFn = aaResourcesFn(
+	stub.tagged(
 		aaQEMU(100, legacyTags(aaDirector)),
 		aaQEMU(101, legacyTags(aaDirector)),
 		aaQEMU(102, aaTag),
@@ -108,7 +108,7 @@ func TestMigrationHoldsTheOlderCPIsLockKey(t *testing.T) {
 	stub := newAAStub()
 	stub.events = &events
 	stub.seedRuleWithComment("bosh-aa-web", "vm:100,vm:101,vm:200,vm:201", aaLegacyRuleComment)
-	stub.listResourcesFn = aaResourcesFn(
+	stub.tagged(
 		aaQEMU(100, legacyTags(aaDirector)),
 		aaQEMU(101, legacyTags(aaDirector)),
 		aaQEMU(200, legacyTags(aaOtherDirector)),
@@ -153,7 +153,7 @@ func TestMigrationDefersWhenTheOlderCPIsLockIsUnavailable(t *testing.T) {
 	stub := newAAStub()
 	stub.events = &events
 	stub.seedRuleWithComment("bosh-aa-web", "vm:100,vm:101,vm:200,vm:201", aaLegacyRuleComment)
-	stub.listResourcesFn = aaResourcesFn(
+	stub.tagged(
 		aaQEMU(100, legacyTags(aaDirector)),
 		aaQEMU(101, legacyTags(aaDirector)),
 		aaQEMU(200, legacyTags(aaOtherDirector)),
@@ -274,8 +274,10 @@ func (c *haProbeCluster) ListHaStatusCurrent(context.Context) (*cluster.ListHaSt
 	return nil, fmt.Errorf("not wired")
 }
 
-func (c *haProbeCluster) ListHaResources(context.Context, *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
-	return nil, fmt.Errorf("not wired")
+// ListHaResources answers from the stub, because the anti-affinity planner
+// reads which siblings are HA resources on every plan.
+func (c *haProbeCluster) ListHaResources(ctx context.Context, p *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
+	return c.aaClusterStub.ListHaResources(ctx, p)
 }
 
 func (c *haProbeCluster) ListConfigQdevice(context.Context) (*cluster.ListConfigQdeviceResponse, error) {
@@ -350,7 +352,7 @@ func haProbeDeps(stub *aaClusterStub, nodesSvc *haProbeNodes) Deps {
 func TestHAProfileResolvedOnceThroughTheProbeForBothWriters(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	nodesSvc := &haProbeNodes{version: "9.2.4"}
 	deps := withRequestHAProfile(haProbeDeps(stub, nodesSvc))
 

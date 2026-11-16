@@ -175,7 +175,7 @@ func TestEnsureAntiAffinityRefusesBelowPVE9(t *testing.T) {
 func TestEnsureAntiAffinityWritesHashedRuleWithMarkers(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestEnsureAntiAffinityTwoDirectorsOneClusterKeepSeparateRules(t *testing.T)
 	t.Parallel()
 	stub := newAAStub()
 	other := haIdentity{Owner: aaOtherDirector, Deployment: aaDeployment, Group: "web"}
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag), aaQEMU(200, other.ruleName()))
+	stub.tagged(aaQEMU(100, aaTag), aaQEMU(200, other.ruleName()))
 	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("director one: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestEnsureAntiAffinityTwoDirectorsOneClusterKeepSeparateRules(t *testing.T)
 func TestEnsureAntiAffinityLeavesForeignRuleUnderOurName(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	stub.seedRuleWithComment(aaRule, "vm:100,vm:300",
 		haIdentity{Owner: aaOtherDirector, Deployment: aaDeployment, Group: "web"}.marker())
 	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 101, log.NewNopLogger()); err == nil {
@@ -240,7 +240,7 @@ func TestEnsureAntiAffinityMigratesOnlyOwnMembersOutOfOldRule(t *testing.T) {
 	// An old CPI's rule holds two members from this Director and two from
 	// another Director that also has a group named web.
 	stub.seedRuleWithComment("bosh-aa-web", "vm:100,vm:101,vm:200,vm:201", "BOSH anti-affinity for instance group web")
-	stub.listResourcesFn = aaResourcesFn(
+	stub.tagged(
 		aaQEMU(100, legacyTags(aaDirector)),
 		aaQEMU(101, legacyTags(aaDirector)),
 		aaQEMU(200, legacyTags(aaOtherDirector)),
@@ -264,7 +264,7 @@ func TestEnsureAntiAffinityDeletesOldRuleOnlyWhenEmpty(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
 	stub.seedRuleWithComment("bosh-aa-web", "vm:100,vm:101", "BOSH anti-affinity for instance group web")
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, legacyTags(aaDirector)), aaQEMU(101, legacyTags(aaDirector)))
+	stub.tagged(aaQEMU(100, legacyTags(aaDirector)), aaQEMU(101, legacyTags(aaDirector)))
 	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 102, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestEnsureAntiAffinityDoesNotClaimGuestsWithoutOwnerEvidence(t *testing.T) 
 			t.Parallel()
 			stub := newAAStub()
 			stub.seedRuleWithComment("bosh-aa-web", "vm:100,vm:101", "BOSH anti-affinity for instance group web")
-			stub.listResourcesFn = aaResourcesFn(aaQEMU(100, tags), aaQEMU(101, tags))
+			stub.tagged(aaQEMU(100, tags), aaQEMU(101, tags))
 			if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 102, log.NewNopLogger()); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -309,7 +309,7 @@ func TestEnsureAntiAffinityLeavesMarkedLegacyNamedRuleAlone(t *testing.T) {
 	stub := newAAStub()
 	stub.seedRuleWithComment("bosh-aa-web", "vm:100,vm:101",
 		haIdentity{Owner: aaOtherDirector, Deployment: aaDeployment, Group: "web"}.marker())
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, legacyTags(aaDirector)), aaQEMU(101, legacyTags(aaDirector)))
+	stub.tagged(aaQEMU(100, legacyTags(aaDirector)), aaQEMU(101, legacyTags(aaDirector)))
 	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 102, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

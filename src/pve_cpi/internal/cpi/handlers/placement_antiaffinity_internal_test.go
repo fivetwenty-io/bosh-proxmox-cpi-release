@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -51,6 +52,21 @@ type aaClusterStub struct {
 	beforeListRules func(call int)
 	// getResErr, when non-nil, makes GetHaResources fail with it.
 	getResErr error
+	// listHaResErr, when non-nil, makes ListHaResources fail with it.
+	listHaResErr error
+	// listHaResCalls counts ListHaResources calls, and afterListHaResources,
+	// when set, runs after each one has built its answer, with its 1-based
+	// number, so a test can change a resource between a plan's read and the
+	// write it sends, the way a sibling's rollback would.
+	listHaResCalls       int
+	afterListHaResources func(call int)
+	// enforceManaged makes a rule write that names a sid missing from
+	// resources fail the way PVE refuses it, with a 500 the writer reads as
+	// held.
+	enforceManaged bool
+	// onRuleWrite, when set, runs after every rule write that lands, so a
+	// test can check an invariant on each state the rules pass through.
+	onRuleWrite func(rule string)
 }
 
 func (s *aaClusterStub) record(ev string) {
@@ -128,6 +144,55 @@ func (s *aaClusterStub) GetHaResources(_ context.Context, sid string) (*cluster.
 	return resp, nil
 }
 
+func (s *aaClusterStub) ListHaResources(_ context.Context, _ *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
+	s.record("list-ha-resources")
+	if s.listHaResErr != nil {
+		return nil, s.listHaResErr
+	}
+	s.listHaResCalls++
+	out := cluster.ListHaResourcesResponse{}
+	for sid, ok := range s.resources {
+		if !ok {
+			continue
+		}
+		raw, _ := json.Marshal(map[string]any{"sid": sid, "state": "started"})
+		out = append(out, raw)
+	}
+	if s.afterListHaResources != nil {
+		s.afterListHaResources(s.listHaResCalls)
+	}
+	return &out, nil
+}
+
+// unmanaged returns the sids in csv that are not HA resources, when the stub
+// enforces PVE's refusal.
+func (s *aaClusterStub) unmanaged(csv string) []string {
+	if !s.enforceManaged {
+		return nil
+	}
+	var out []string
+	for _, sid := range strings.Split(csv, ",") {
+		if sid != "" && !s.resources[sid] {
+			out = append(out, sid)
+		}
+	}
+	return out
+}
+
+func (s *aaClusterStub) refuseUnmanaged(csv string) error {
+	if bad := s.unmanaged(csv); len(bad) > 0 {
+		return fmt.Errorf("500 Internal Server Error: cannot use unmanaged resource(s) %s",
+			strings.Join(bad, ", "))
+	}
+	return nil
+}
+
+func (s *aaClusterStub) landed(rule string) {
+	if s.onRuleWrite != nil {
+		s.onRuleWrite(rule)
+	}
+}
+
 func (s *aaClusterStub) DeleteHaResources(_ context.Context, sid string, _ *cluster.DeleteHaResourcesParams) error {
 	delete(s.resources, sid)
 	return nil
@@ -187,6 +252,9 @@ func (s *aaClusterStub) CreateHaRules(_ context.Context, p *cluster.CreateHaRule
 	if s.failCreateRule {
 		return fmt.Errorf("create rule failed")
 	}
+	if err := s.refuseUnmanaged(p.Resources); err != nil {
+		return err
+	}
 	s.rules[p.Rule] = p.Resources
 	if p.Comment != nil {
 		s.ruleComments[p.Rule] = *p.Comment
@@ -201,6 +269,7 @@ func (s *aaClusterStub) CreateHaRules(_ context.Context, p *cluster.CreateHaRule
 		s.ruleStrict[p.Rule] = *p.Strict
 	}
 	s.digest++
+	s.landed(p.Rule)
 	return nil
 }
 
@@ -217,6 +286,11 @@ func (s *aaClusterStub) UpdateHaRules(_ context.Context, rule string, p *cluster
 		return errors.New("detected modified configuration - file changed by other user")
 	}
 	if p.Resources != nil {
+		if err := s.refuseUnmanaged(*p.Resources); err != nil {
+			return err
+		}
+	}
+	if p.Resources != nil {
 		s.rules[rule] = *p.Resources
 	}
 	if p.Comment != nil {
@@ -229,6 +303,7 @@ func (s *aaClusterStub) UpdateHaRules(_ context.Context, rule string, p *cluster
 		s.ruleStrict[rule] = *p.Strict
 	}
 	s.digest++
+	s.landed(rule)
 	return nil
 }
 
@@ -263,6 +338,22 @@ func aaQEMU(vmid int, tags string) json.RawMessage {
 	return raw
 }
 
+// tagged lists entries as the cluster's guests and stages every one of them
+// as an HA resource, the state a sibling is in once its own create has
+// registered it. A test that needs a sibling mid-create, tagged but not yet
+// managed, sets listResourcesFn directly instead.
+func (s *aaClusterStub) tagged(entries ...json.RawMessage) {
+	s.listResourcesFn = aaResourcesFn(entries...)
+	for _, raw := range entries {
+		var row struct {
+			VMID int `json:"vmid"`
+		}
+		if json.Unmarshal(raw, &row) == nil && row.VMID > 0 {
+			s.resources[haResourceSid(row.VMID)] = true
+		}
+	}
+}
+
 func aaResourcesFn(entries ...json.RawMessage) func() *cluster.ListResourcesResponse {
 	resp := cluster.ListResourcesResponse(entries)
 	return func() *cluster.ListResourcesResponse { return &resp }
@@ -281,6 +372,9 @@ func aaDeps(stub *aaClusterStub) Deps {
 		},
 		Agent:  &icAgentStub{},
 		Logger: log.NewNopLogger(),
+		// Held rule writes wait between attempts; the tests here count
+		// attempts, not time.
+		HARuleSleep: func(context.Context, time.Duration) error { return nil },
 	}
 }
 
@@ -291,7 +385,7 @@ func aaDeps(stub *aaClusterStub) Deps {
 func TestEnsureAntiAffinity_CreatesRuleWithTwoMembers(t *testing.T) {
 	stub := newAAStub()
 	// One existing same-group member already on the cluster.
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag+";index--0"))
+	stub.tagged(aaQEMU(100, aaTag+";index--0"))
 
 	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -320,7 +414,7 @@ func TestEnsureAntiAffinity_SingleMemberNoRule(t *testing.T) {
 func TestEnsureAntiAffinity_IdempotentNoRecreate(t *testing.T) {
 	stub := newAAStub()
 	stub.seedRule(aaRule, "vm:100,vm:101")
-	stub.listResourcesFn = aaResourcesFn(
+	stub.tagged(
 		aaQEMU(100, aaTag),
 		aaQEMU(101, aaTag),
 	)
@@ -337,7 +431,7 @@ func TestEnsureAntiAffinity_AppendUpdatesRuleInPlace(t *testing.T) {
 	stub := newAAStub()
 	stub.seedRule(aaRule, "vm:100,vm:101")
 	// A third member now exists; ensuring the newcomer must grow the rule.
-	stub.listResourcesFn = aaResourcesFn(
+	stub.tagged(
 		aaQEMU(100, aaTag),
 		aaQEMU(101, aaTag),
 	)
@@ -365,7 +459,7 @@ func TestEnsureAntiAffinity_StaleScanNeverShrinksRule(t *testing.T) {
 	stub := newAAStub()
 	stub.seedRule(aaRule, "vm:100,vm:200")
 	// The scan sees vm:100 tagged; vm:200 is a live guest with no tag yet.
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag), aaQEMU(200, ""))
+	stub.tagged(aaQEMU(100, aaTag), aaQEMU(200, ""))
 
 	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -384,7 +478,7 @@ func TestEnsureAntiAffinity_DeadRuleMemberDropped(t *testing.T) {
 	stub := newAAStub()
 	stub.seedRule(aaRule, "vm:100,vm:999")
 	// vm:999 appears in no node's listing: its guest is gone.
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 
 	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -412,7 +506,7 @@ func TestEnsureAntiAffinity_OfflineExcludedMemberKept(t *testing.T) {
 		return &resp, nil
 	}
 	// vm:1042 lives on the offline pve2, so the tolerant scan cannot see it.
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 
 	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -436,7 +530,7 @@ func TestEnsureAntiAffinity_EmptyGroupNoOp(t *testing.T) {
 func TestEnsureAntiAffinity_ListRulesFailureReturnsError(t *testing.T) {
 	stub := newAAStub()
 	stub.failListRules = true
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 101, log.NewNopLogger())
 	if err == nil {
 		t.Fatal("expected error when ListHaRules fails (caller logs it best-effort)")

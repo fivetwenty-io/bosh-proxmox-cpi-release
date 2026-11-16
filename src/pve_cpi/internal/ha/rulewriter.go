@@ -109,7 +109,8 @@ type RuleWriter struct {
 	// In auto the writer logs it.
 	Managed bool
 	Logger  *log.Logger
-	// Sleep waits between conflicts. nil sleeps on the context.
+	// Sleep waits between conflicts, and between held writes that did not
+	// land. nil sleeps on the context.
 	Sleep  func(ctx context.Context, d time.Duration) error
 	Repair RepairDeps
 }
@@ -126,9 +127,9 @@ type ApplyResult struct {
 // rules, plans, checks the candidate set, and sends the first planned write.
 // A digest conflict backs off with jitter and retries, up to
 // RuleWriterMaxAttempts times. A held error, which may hide a write that
-// landed, re-reads and compares the whole rule with what was meant: a match
-// counts as landed, and a mismatch goes round again, which checks feasibility
-// against the fresh read. After the last write it verifies every CPI-owned rule
+// landed, re-reads and compares the whole rule with what was meant. A match
+// counts as landed, and a mismatch backs off the same way and goes round
+// again, which plans and checks feasibility against a fresh read. After the last write it verifies every CPI-owned rule
 // and repairs a disabled confinement pin.
 func (w *RuleWriter) Apply(ctx context.Context, label string, plan Planner) (*ApplyResult, error) {
 	if w.Lock != nil {
@@ -203,6 +204,14 @@ func (w *RuleWriter) Apply(ctx context.Context, label string, plan Planner) (*Ap
 		if misses >= RuleWriterMaxAttempts {
 			return res, cpierrors.WrapAs(sendErr, cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("%s: rule %q write did not land after %d held attempts", label, op.Rule.ID, misses))
+		}
+		// A held write that did not land usually means the cluster refused it
+		// for a reason that clears with time, such as a member whose HA
+		// resource a concurrent create has not finished staging or has just
+		// rolled back. Planning again at once would spend every attempt in a
+		// few milliseconds, so wait the way a conflict does first.
+		if err := w.sleep(ctx, ruleBackoff(misses)); err != nil {
+			return res, err
 		}
 	}
 	if len(res.Wrote) == 0 {

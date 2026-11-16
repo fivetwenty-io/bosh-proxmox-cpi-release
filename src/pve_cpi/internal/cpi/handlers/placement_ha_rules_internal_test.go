@@ -33,7 +33,7 @@ func TestAntiAffinityOverflowSkipWritesNoRule(t *testing.T) {
 	for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
 		t.Run(mode, func(t *testing.T) {
 			stub := newAAStub()
-			stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag), aaQEMU(101, aaTag))
+			stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag))
 			deps := aaModeDeps(stub, mode, "", "pve1", "pve2")
 			if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 102,
 				log.NewNopLogger()); err != nil {
@@ -47,7 +47,7 @@ func TestAntiAffinityOverflowSkipWritesNoRule(t *testing.T) {
 			// written for the member that would make it too large.
 			stub = newAAStub()
 			stub.seedRule(aaRule, "vm:100,vm:101")
-			stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag), aaQEMU(101, aaTag))
+			stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag))
 			deps = aaModeDeps(stub, mode, config.HAOverflowSkip, "pve1", "pve2")
 			if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 102,
 				log.NewNopLogger()); err != nil {
@@ -65,7 +65,7 @@ func TestAntiAffinityOverflowSplitWritesRulesThatFit(t *testing.T) {
 	for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
 		t.Run(mode, func(t *testing.T) {
 			stub := newAAStub()
-			stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag), aaQEMU(101, aaTag), aaQEMU(102, aaTag))
+			stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag), aaQEMU(102, aaTag))
 			deps := aaModeDeps(stub, mode, config.HAOverflowSplit, "pve1", "pve2")
 			if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 103,
 				log.NewNopLogger()); err != nil {
@@ -91,7 +91,7 @@ func TestAntiAffinityPlaceableCapAndMaintenance(t *testing.T) {
 	// Two placeable nodes: a third member waits for its rule.
 	stub := newAAStub()
 	stub.seedRule(aaRule, "vm:100,vm:101")
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag), aaQEMU(101, aaTag))
+	stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag))
 	deps := aaDeps(stub)
 	deps.HAProfile = profile
 	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 102,
@@ -106,7 +106,7 @@ func TestAntiAffinityPlaceableCapAndMaintenance(t *testing.T) {
 	// every member.
 	stub = newAAStub()
 	stub.seedRule(aaRule, "vm:100,vm:101,vm:102")
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag), aaQEMU(101, aaTag), aaQEMU(102, aaTag))
+	stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag), aaQEMU(102, aaTag))
 	deps = aaDeps(stub)
 	deps.HAProfile = profile
 	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 102,
@@ -125,7 +125,7 @@ func TestAntiAffinityFlattensMemberPinPriorities(t *testing.T) {
 	stub.seedRuleWithComment(pin, "vm:100", haIdentity{Owner: aaDirector}.marker())
 	stub.ruleTypes[pin] = ha.RuleTypeNodeAffinity
 	stub.ruleNodes[pin] = "pve1:2,pve2:1,pve3"
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	stub.tagged(aaQEMU(100, aaTag))
 	deps := aaDeps(stub)
 	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
 	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 101,
@@ -347,7 +347,7 @@ func TestAntiAffinityWithoutADirectorFailsOnlyInManagedMode(t *testing.T) {
 		wantErr bool
 	}{{config.HAModeAuto, false}, {config.HAModeManaged, true}} {
 		stub := newAAStub()
-		stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+		stub.tagged(aaQEMU(100, aaTag))
 		cfg := aaMembershipConfig("off", false, 0)
 		cfg.HA.Mode = haChoiceOf(tc.mode)
 		deps := aaDepsLock(cfg, stub, newAALockPools(nil))
@@ -546,7 +546,7 @@ func TestManagedCreateVMMigratesALegacyRule(t *testing.T) {
 	stub := newAAStub()
 	legacyComment := "BOSH anti-affinity for instance group web"
 	stub.seedRuleWithComment("bosh-aa-web", "vm:100,vm:103", legacyComment)
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, legacyTags(aaDirector)), aaQEMU(103, legacyTags(aaDirector)))
+	stub.tagged(aaQEMU(100, legacyTags(aaDirector)), aaQEMU(103, legacyTags(aaDirector)))
 	m.deps.PVE = legacyRuleManagedClient{managedVMGuardFixture: fixture,
 		cluster: &legacyRuleManagedCluster{aaClusterStub: stub, created: map[string]*cluster.CreateHaResourcesParams{}}}
 	m.deps.Config = aaMembershipConfig("off", false, 1)
