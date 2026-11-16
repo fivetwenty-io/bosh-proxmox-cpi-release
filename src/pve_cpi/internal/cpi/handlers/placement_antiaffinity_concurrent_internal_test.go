@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"math/rand/v2"
@@ -499,6 +500,53 @@ func TestLeaveOwnedHARules_UnlockedLeaveHealsAfterItsDelete(t *testing.T) {
 	}
 	if got := stub.rules[aaRule]; got != "vm:101,vm:102" {
 		t.Fatalf("rule = %q; want the other member and the sibling, without the VM that left", got)
+	}
+}
+
+// TestLeaveOwnedHARules_AFailedHealDoesNotFailTheLeave pins that a leave
+// whose heal fails still reports success once the VM is out of its rules, so
+// the re-add sends its removal again instead of failing the call. The heal
+// fails because the HA resources can no longer be listed once the leave's
+// delete lands, and the failure is logged instead.
+func TestLeaveOwnedHARules_AFailedHealDoesNotFailTheLeave(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	stub.enforceManaged = true
+	stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag))
+	stub.seedRule(aaRule, "vm:100,vm:101")
+	deleted := false
+	racing := &aaRaceDelete{aaClusterStub: stub, before: func(rule string) {
+		if rule == aaRule {
+			deleted = true
+			stub.listHaResErr = errors.New("500 Internal Server Error: cfs lock timeout")
+		}
+	}}
+	deps := aaDeps(stub)
+	deps.PVE = &icPVEClient{
+		clusterSvc: racing,
+		nodesSvc: &icNodesService{listFn: func(ctx context.Context, p *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return stub.ListResources(ctx, p)
+		}},
+	}
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+	logger, observed := log.NewObservedLogger(log.LevelDebug)
+	if err := leaveOwnedHARules(context.Background(), deps, 100, aaDirector, logger); err != nil {
+		t.Fatalf("leave = %v; want success, because the VM left its rules and only the heal failed", err)
+	}
+	if !deleted {
+		t.Fatal("the leave deleted no rule, so no heal ran")
+	}
+	if _, ok := stub.rules[aaRule]; ok {
+		t.Fatalf("rule = %q; want it deleted by the leave", stub.rules[aaRule])
+	}
+	warned := false
+	for _, e := range observed.All() {
+		if e.Level == log.LevelWarn && strings.Contains(e.Message, "could not be written again after this VM left") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatal("the failed heal was not logged")
 	}
 }
 

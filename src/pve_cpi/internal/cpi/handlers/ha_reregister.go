@@ -390,7 +390,9 @@ func (w *readdWiring) leaveRules(ctx context.Context) error {
 // leaveOwnedHARules is leaveRules for vmid. Without the rules lock, a leave
 // that deleted an anti-affinity rule writes the group's rules again
 // afterwards, with the VM kept out, as a removal does, because the resource
-// stays managed and would otherwise join again.
+// stays managed and would otherwise join again. The VM has left its rules by
+// then, so a heal that fails is only logged, as every other heal is, and the
+// removal it makes way for goes ahead. Only the leave's own error is returned.
 func leaveOwnedHARules(ctx context.Context, deps Deps, vmid int, owner string, logger *log.Logger) error {
 	sid := haResourceSid(vmid)
 	pinID := naRuleNameFor(vmid)
@@ -422,7 +424,12 @@ func leaveOwnedHARules(ctx context.Context, deps Deps, vmid int, owner string, l
 		deleted = writtenRuleDeletes(res, comments)
 		return err
 	})
-	return errors.Join(err, healAfterUnlockedDeletes(ctx, deps, deleted, owner, sid, logger))
+	if healErr := healAfterUnlockedDeletes(ctx, deps, deleted, owner, sid, logger); healErr != nil {
+		logger.Warn("ha readd: the group's rules could not be written again after this VM left them; a sibling "+
+			"that joined a deleted rule meanwhile may be out of every rule until the next create or delete of "+
+			"the group", log.String("sid", sid), log.Err(healErr))
+	}
+	return err
 }
 
 // confine writes the staged VM's anti-affinity membership, when the record's
