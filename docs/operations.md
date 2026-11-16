@@ -632,6 +632,9 @@ The directory holds these files, and the first two kinds belong to the endpoint 
 - `ha-recovery-deferrals.json` and `ha-recovery-deferrals.lock`
   The HA recovery deferral record, which holds the last time a `delete_vm` deferred each HA-managed VM for fence or recovery, so a later delete can let a VM that PVE HA restarted settle.
 
+- `spread-claims.json` and `spread-claims.lock`
+  The spread claim record. While a `create_vm` with `pve.placement.anti_affinity.enabled` builds its VM, it holds a claim here on the node it picked, so a sibling that scores the nodes at the same moment counts it. The create gives its claim up once the VM carries the member tag, and a claim that a crash leaves behind lapses at its create's deadline. Removing the file costs only the spread of the creates that are running.
+
 - `secret` and `secret.lock`
   The directory secret that signs the files. It never goes into a support bundle or a ticket.
 

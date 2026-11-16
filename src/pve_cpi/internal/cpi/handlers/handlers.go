@@ -11,6 +11,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	stemcellfetch "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/stemcell_fetch"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/spreadclaim"
 	inv "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/storageinventory"
 )
 
@@ -126,6 +127,12 @@ type Deps struct {
 	// tests that drive held writes set a recorder here rather than through a
 	// package variable, so parallel tests cannot race on it.
 	HARuleSleep func(ctx context.Context, d time.Duration) error
+	// SpreadClaims returns the record in which concurrent creates of an
+	// instance group claim the nodes they pick, so the soft spread counts the
+	// siblings whose create is still running. main wires
+	// EndpointCacheSpreadClaims. Nil (every existing test literal) turns the
+	// claims off, and the spread counts only the members already tagged.
+	SpreadClaims func(cfg *config.CPIConfig, logger *log.Logger) *spreadclaim.Store
 }
 
 // EffectiveISOStorage returns the pool config-drive ISOs live on for this

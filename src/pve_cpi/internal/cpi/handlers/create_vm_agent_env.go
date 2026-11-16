@@ -280,6 +280,10 @@ func antiAffinityGroupTag(deps Deps, env map[string]any) string {
 type scorerGroup struct {
 	tag    string
 	legacy []string
+	// claims is the create's claim on the node it picks, through which the
+	// scorer also counts the members whose create is still running. Nil
+	// counts only the tagged members.
+	claims *spreadClaims
 }
 
 // enabled reports whether the scorer has any way to recognize a member, which

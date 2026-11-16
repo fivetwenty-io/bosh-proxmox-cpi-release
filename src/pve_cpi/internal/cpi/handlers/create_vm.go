@@ -368,7 +368,11 @@ type createVMParsedArgs struct {
 	storageRuntime   *managedVMAllocation
 	storagePlan      *StorageAllocationPlan
 	storageSelection *StoragePlacementSelection
-	agentID          string
+	// spread is the create's claim on the node placement picks for its
+	// instance group (see spreadClaims). Nil when the create does not score
+	// nodes with the anti-affinity axis.
+	spread  *spreadClaims
+	agentID string
 	// stemcellCID is the original path-identity CID as received
 	// (":light:<storage>:import/<file>" or ":heavy:<storage>:import/<file>").
 	stemcellCID string
@@ -696,6 +700,15 @@ func createVM(
 	ctx, releaseClaims := bindCreateVMIDClaims(ctx, createVMIDClaimBudget(deps), logger)
 	defer func() { retErr = releaseClaims(retErr) }()
 
+	// A create that scores nodes for an instance group claims the node it
+	// picks, so its siblings that score while it clones count it. The claim is
+	// given up once the clone carries the member tag, and the deferred release
+	// covers a create that returns before then.
+	if parsed.storagePlan == nil {
+		parsed.spread = newSpreadClaims(deps, parsed, spreadClaimExpiry(ctx, deps), logger)
+		defer parsed.spread.release(ctx)
+	}
+
 	if fallbackMax > 0 && parsed.storagePlan == nil {
 		return createVMWithFallback(ctx, deps, logger, parsed, fallbackMax, &retErr)
 	}
@@ -741,6 +754,7 @@ func createVM(
 	//    non-conflict error (PVE accepted the POST but the task itself failed).
 	// -----------------------------------------------------------------------
 	vmid, err := allocateVM(ctx, deps, logger, parsed, shape)
+	parsed.spread.release(ctx)
 	if err != nil {
 		return nil, cpierrors.Wrap(err, "create_vm: allocate+create VM")
 	}
@@ -1317,7 +1331,12 @@ func buildAndStartVMAttempt(
 	nodeShape := *shape
 	nodeShape.node = candidateNode
 
+	// An alternate's attempt moves the create's claim to the alternate first,
+	// and every attempt gives the claim up once its clone carries the member
+	// tag or the allocation failed.
+	parsed.spread.move(ctx, candidateNode)
 	vmid, err := allocateVMForFallback(ctx, deps, logger, parsed, &nodeShape)
+	parsed.spread.release(ctx)
 	if err != nil {
 		return vmAttempt{allocErr: cpierrors.Wrap(err, "create_vm: allocate+create VM")}
 	}

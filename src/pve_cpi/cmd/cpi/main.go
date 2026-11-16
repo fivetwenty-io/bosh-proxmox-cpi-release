@@ -593,6 +593,9 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		// Rendered once at startup, so every audit-gated refusal can end
 		// with the exact audit command for this host.
 		StorageAuditCommand: storageAuditCommand(*configPath, cfg.StorageAllocationJournalDir),
+		// Concurrent creates of an instance group claim their nodes in the
+		// cache directory, so the soft spread counts the creates in flight.
+		SpreadClaims: handlers.EndpointCacheSpreadClaims,
 	})
 
 	maxLine := opts.MaxLineBytes

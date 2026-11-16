@@ -1,0 +1,213 @@
+package handlers_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"maps"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/spreadclaim"
+)
+
+// spreadEnv is the env of a member of the web instance group.
+func spreadEnv() map[string]any {
+	return map[string]any{
+		"bosh": map[string]any{
+			"group":  "director-d-web",
+			"groups": []any{"director", "d", "web", "director-d", "director-d-web"},
+		},
+	}
+}
+
+func spreadArgs() []json.RawMessage {
+	return mkArgs("spread-agent", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{},
+		spreadEnv(),
+	)
+}
+
+// spreadRecord is a claim record in a new directory that only this user can
+// open, with a probe that reads the web group's live claims.
+type spreadRecord struct {
+	store *spreadclaim.Store
+	key   string
+}
+
+func newSpreadRecord(t *testing.T, deps *handlers.Deps) *spreadRecord {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "cache")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := &spreadclaim.Store{Dir: endpointcache.DirOptions{Override: dir}, Scope: "lab"}
+	deps.SpreadClaims = func(*config.CPIConfig, *log.Logger) *spreadclaim.Store { return store }
+	return &spreadRecord{store: store, key: handlers.SpreadClaimKey(*deps, spreadEnv())}
+}
+
+// counts returns the live claims per node. It records nothing itself.
+func (r *spreadRecord) counts() (map[string]int, error) {
+	c, err := r.store.NewClaim(r.key, time.Now().Add(time.Hour))
+	if err != nil {
+		return nil, err
+	}
+	var seen map[string]int
+	_, err = c.Pick(context.Background(), func(m map[string]int) string {
+		seen = maps.Clone(m)
+		return ""
+	})
+	return seen, err
+}
+
+// claimsSeen records the claims the record held each time PVE was asked to
+// create the VM.
+type claimsSeen struct {
+	mu   sync.Mutex
+	seen []map[string]int
+	errs []error
+}
+
+func (c *claimsSeen) observe(r *spreadRecord) {
+	m, err := r.counts()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.seen = append(c.seen, m)
+	if err != nil {
+		c.errs = append(c.errs, err)
+	}
+}
+
+func spreadAntiAffinityOn(c *config.CPIConfig) {
+	on := true
+	if c.Placement == nil {
+		c.Placement = &config.PlacementConfig{}
+	}
+	c.Placement.AntiAffinity = &config.AntiAffinityConfig{Enabled: &on}
+}
+
+func assertNoClaims(t *testing.T, r *spreadRecord) {
+	t.Helper()
+	got, err := r.counts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("claims after the create returned = %v; want none", got)
+	}
+}
+
+// TestCreateVM_SpreadClaimHeldWhileTheCloneRunsAndReleasedAfter checks that a
+// create holds the claim on the node it picked while PVE builds the VM, which
+// is when a sibling could otherwise miss it, and gives it up once the VM is
+// built and carries the member tag.
+func TestCreateVM_SpreadClaimHeldWhileTheCloneRunsAndReleasedAfter(t *testing.T) {
+	t.Parallel()
+	var (
+		rec  *spreadRecord
+		seen claimsSeen
+	)
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
+			seen.observe(rec)
+			return "UPID:" + node + ":create:ok", nil
+		},
+		startFn: func(_ context.Context, node string, _ int) (string, error) {
+			seen.observe(rec)
+			return "UPID:" + node + ":start:ok", nil
+		},
+	}
+	deps := buildVMDepsPlacement(q, &vmMockNodes{}, listStatusTwoNodes(), emptyListResources, &vmMockAgent{},
+		spreadAntiAffinityOn)
+	rec = newSpreadRecord(t, &deps)
+
+	if _, err := handlers.HandleCreateVM(deps).Handle(context.Background(), spreadArgs(), mkCtx("spread-single")); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := errors.Join(seen.errs...); err != nil {
+		t.Fatal(err)
+	}
+	// The build sees the claim on pve1, and the start sees none, because the
+	// built VM carries the member tag by then.
+	want := []map[string]int{{"pve1": 1}, {}}
+	if len(seen.seen) != len(want) || !maps.Equal(seen.seen[0], want[0]) || len(seen.seen[1]) != 0 {
+		t.Fatalf("claims at the build and the start = %v; want %v", seen.seen, want)
+	}
+	assertNoClaims(t, rec)
+}
+
+// TestCreateVM_SpreadClaimReleasedWhenTheCreateFails checks that a create
+// whose build fails leaves no claim behind.
+func TestCreateVM_SpreadClaimReleasedWhenTheCreateFails(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{
+		createFn: func(context.Context, string, map[string]any) (string, error) {
+			return "", cloneSourceMissingErr()
+		},
+	}
+	deps := buildVMDepsPlacement(q, &vmMockNodes{}, listStatusTwoNodes(), emptyListResources, &vmMockAgent{},
+		spreadAntiAffinityOn)
+	rec := newSpreadRecord(t, &deps)
+
+	if _, err := handlers.HandleCreateVM(deps).Handle(context.Background(), spreadArgs(), mkCtx("spread-fail")); err == nil {
+		t.Fatal("the create must fail")
+	}
+	assertNoClaims(t, rec)
+}
+
+// TestCreateVM_Fallback_SpreadClaimMovesToTheAlternate checks that a create
+// that falls back to an alternate holds its claim there while the alternate's
+// VM is built, and holds nothing once it returns.
+func TestCreateVM_Fallback_SpreadClaimMovesToTheAlternate(t *testing.T) {
+	t.Parallel()
+	var (
+		rec   *spreadRecord
+		seen  claimsSeen
+		calls int
+	)
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
+			seen.observe(rec)
+			calls++
+			if calls == 1 {
+				return "", transientConnErr("pvedaemon worker recycled")
+			}
+			return "UPID:" + node + ":create:ok", nil
+		},
+		startFn: func(_ context.Context, node string, _ int) (string, error) {
+			seen.observe(rec)
+			return "UPID:" + node + ":start:ok", nil
+		},
+	}
+	deps := buildFallbackDeps(q, &vmMockNodes{}, &vmMockAgent{}, 2)
+	spreadAntiAffinityOn(deps.Config)
+	rec = newSpreadRecord(t, &deps)
+
+	if _, err := handlers.HandleCreateVM(deps).Handle(context.Background(), spreadArgs(), mkCtx("spread-fallback")); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := errors.Join(seen.errs...); err != nil {
+		t.Fatal(err)
+	}
+	// The failed build on pve1 sees the claim there, the alternate's build
+	// sees it on pve2, and the alternate's start sees none.
+	want := []map[string]int{{"pve1": 1}, {"pve2": 1}, {}}
+	if len(seen.seen) != len(want) {
+		t.Fatalf("claims per build = %v; want %v", seen.seen, want)
+	}
+	for i := range want {
+		if len(seen.seen[i]) != len(want[i]) || !maps.Equal(seen.seen[i], want[i]) {
+			t.Fatalf("claims per build = %v; want %v", seen.seen, want)
+		}
+	}
+	assertNoClaims(t, rec)
+}

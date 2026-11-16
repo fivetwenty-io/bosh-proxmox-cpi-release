@@ -32,6 +32,7 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 	// computed when anti-affinity is enabled; otherwise the scorer ignores group
 	// membership and behavior is identical to Tier 1.
 	group := antiAffinityScorerGroup(deps, parsed.env)
+	group.claims = parsed.spread
 
 	node, _, err := resolveTargetNodeWithBridges(ctx, deps, cp, group, parsed.diskCIDs, nil, parsed.cloudPropsMap, 0,
 		placementBridgePlan(ctx, deps, parsed))
@@ -57,6 +58,7 @@ func resolveVMShapeWithAlternates(
 ) (shape *createVMShape, alternates []string, err error) {
 	cp := parsed.cloudProps
 	group := antiAffinityScorerGroup(deps, parsed.env)
+	group.claims = parsed.spread
 
 	winner, alts, nodeErr := resolveTargetNodeWithBridges(
 		ctx, deps, cp, group, parsed.diskCIDs, nil, parsed.cloudPropsMap, fallbackMax,
@@ -361,7 +363,7 @@ func resolveTargetNodeWithBridges(
 			azRecords = append(azRecords, newAZRejectionRecord("", nil, rejections, inCluster))
 			mergeRejections(legacyRejections, rejections)
 			logFilterRejections(logger, rejections, "")
-			if chosen, ranked := scoreAndPickWithRanked(pass, weights, logger, ""); chosen != "" {
+			if chosen, ranked := group.claims.scoreAndPick(ctx, pass, weights, logger, ""); chosen != "" {
 				warnUtilChosenFB(chosen)
 				headroom.warnChosen(logger, facts, chosen)
 				alts := buildAlternates(chosen, ranked, fallbackMax)
@@ -387,7 +389,7 @@ func resolveTargetNodeWithBridges(
 				azRecords = append(azRecords, newAZRejectionRecord(az, candidateSet, rejections, inCluster))
 				mergeRejections(legacyRejections, rejections)
 				logFilterRejections(logger, rejections, az)
-				if chosen, ranked := scoreAndPickWithRanked(pass, weights, logger, az); chosen != "" {
+				if chosen, ranked := group.claims.scoreAndPick(ctx, pass, weights, logger, az); chosen != "" {
 					warnUtilChosenFB(chosen)
 					headroom.warnChosen(logger, facts, chosen)
 					alts := buildAlternates(chosen, ranked, fallbackMax)

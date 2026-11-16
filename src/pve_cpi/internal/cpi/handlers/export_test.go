@@ -56,3 +56,10 @@ const (
 func HAOwnerMarkerForTest(owner string) string {
 	return haIdentity{Owner: owner}.marker()
 }
+
+// SpreadClaimKey re-exports the group name the create of a VM with env claims
+// its node under, for handlers_test package tests that read the claim record.
+// Test-only.
+func SpreadClaimKey(deps Deps, env map[string]any) string {
+	return antiAffinityScorerGroup(deps, env).claimKey()
+}
