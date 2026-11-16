@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
@@ -339,6 +340,7 @@ func (s *aaClusterStub) DeleteHaRules(_ context.Context, rule string) error {
 	delete(s.ruleNodes, rule)
 	delete(s.ruleStrict, rule)
 	s.digest++
+	s.landed(rule)
 	return nil
 }
 
@@ -590,8 +592,10 @@ func TestPruneGroupAntiAffinityRules_DeletesOnlyOurRulesWithOneMember(t *testing
 	// A purged resource drops out of its rules, so the group's rule and chunks
 	// may hold one member. The prune deletes those of ours, and keeps a rule
 	// that still spreads two VMs, another Director's rule, an unmarked rule,
-	// and a rule of another group.
+	// and a rule of another group. The rules lock is on, so the prune writes
+	// nothing after its deletes, and the fixture needs no guests.
 	stub := newAAStub()
+	deps := aaDepsLock(aaLockConfig("pool", false, 30), stub, newAALockPools(nil))
 	stub.seedRule(aaRule, "vm:100")
 	stub.seedRule(aaRule+"-2", "vm:102,vm:103")
 	stub.seedRule(aaRule+"-3", "vm:104")
@@ -600,7 +604,7 @@ func TestPruneGroupAntiAffinityRules_DeletesOnlyOurRulesWithOneMember(t *testing
 	stub.seedRuleWithComment(aaRule+"-5", "vm:106", "")
 	other := aaIdent("api").ruleName()
 	stub.seedRuleWithComment(other, "vm:107", aaIdent("api").marker())
-	if err := pruneGroupAntiAffinityRules(context.Background(), aaDeps(stub), aaIdent("web"), 100,
+	if err := pruneGroupAntiAffinityRules(context.Background(), deps, aaIdent("web"), 100,
 		log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -614,7 +618,7 @@ func TestPruneGroupAntiAffinityRules_DeletesOnlyOurRulesWithOneMember(t *testing
 			t.Errorf("rule %s was deleted", kept)
 		}
 	}
-	if err := pruneGroupAntiAffinityRules(context.Background(), aaDeps(stub), haIdentity{}, 100,
+	if err := pruneGroupAntiAffinityRules(context.Background(), deps, haIdentity{}, 100,
 		log.NewNopLogger()); err != nil {
 		t.Fatalf("an identity with no group prunes nothing: %v", err)
 	}
@@ -734,4 +738,25 @@ func (s *aaClusterStub) ListStatus(context.Context) (*cluster.ListStatusResponse
 	}
 	empty := cluster.ListStatusResponse{}
 	return &empty, nil
+}
+
+// TestAAPlanner_WouldDropUnseenSkipsTheExcludedMember pins that a removal does
+// not scan again for the member it removes. The plan drops that member
+// whatever the scan says, so its guest being missing from the scan is no
+// reason to scan again.
+func TestAAPlanner_WouldDropUnseenSkipsTheExcludedMember(t *testing.T) {
+	t.Parallel()
+	existing := map[int]*ha.Rule{1: {ID: aaRule, Resources: []string{"vm:100", "vm:101", "vm:102"}}}
+	scan := &groupScan{
+		live:         map[string]struct{}{"vm:101": {}, "vm:102": {}},
+		liveComplete: true,
+	}
+	p := &aaPlanner{ident: aaIdent("web"), scan: scan, exclude: "vm:100"}
+	if p.wouldDropUnseen(existing) {
+		t.Fatal("the removal of vm:100 would scan again for vm:100's missing guest")
+	}
+	p.exclude = ""
+	if !p.wouldDropUnseen(existing) {
+		t.Fatal("a create would drop vm:100, whose guest the scan missed, without scanning again")
+	}
 }

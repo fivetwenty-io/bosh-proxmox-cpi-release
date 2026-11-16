@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"sort"
@@ -127,10 +128,12 @@ func ensureAntiAffinityMembership(ctx context.Context, deps Deps, ident haIdenti
 // cluster-scoped rules lock, which the writer's backoff may release before its
 // first write lands. With the default off there is no lock. Either way the rule
 // writer changes members with a PUT that carries the read's digest, so a write
-// planned from a stale read is refused and planned again. A create never
-// deletes a rule that holds two members or more. Without the lock a delete_vm
-// can, because PVE takes no digest on a delete, and removeAntiAffinityMembership
-// writes the group's rules again after such a delete.
+// planned from a stale read is refused and planned again. PVE takes no digest
+// on a delete, though, so without the lock a delete planned from a stale read
+// can take out a member that joined after it. Every writer that deletes one of
+// a group's rules without the lock therefore writes the group's rules again
+// afterwards (see healAfterUnlockedDeletes), and so does this create when its
+// own plan deleted a rule the group no longer needed.
 func ensureAntiAffinityMembershipFor(
 	ctx context.Context, deps Deps, ident haIdentity, vmid int, d *ha.VMDecision, logger *log.Logger,
 ) (string, error) {
@@ -147,11 +150,22 @@ func ensureAntiAffinityMembershipFor(
 	}
 
 	var placedIn string
+	deleted := false
 	err = withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		var lockedErr error
-		placedIn, lockedErr = ensureAntiAffinityMembershipLocked(ctx, deps, profile, ident, vmid, "", d, logger)
+		placedIn, deleted, lockedErr = ensureAntiAffinityMembershipLocked(ctx, deps, profile, ident, vmid, d, logger)
 		return lockedErr
 	})
+	if deleted && !deps.Config.ClusterLockEnabled() {
+		// This VM's own place is already written and checked, so a heal that
+		// fails costs only a sibling that joined the deleted rule meanwhile,
+		// and the create goes on.
+		if healErr := healAntiAffinityGroup(ctx, deps, ident, haResourceSid(vmid), "", logger); healErr != nil {
+			logger.Warn("anti-affinity: the group's rules could not be written again after this create deleted "+
+				"one of them; a sibling that joined that rule meanwhile may be out of every rule until the next "+
+				"create or delete of the group", log.String("rule", ident.ruleName()), log.Err(healErr))
+		}
+	}
 	return placedIn, err
 }
 
@@ -202,28 +216,58 @@ func acquireAntiAffinityLock(ctx context.Context, deps Deps, key string, vmid in
 // the rules lock when enabled and after the PVE 9 gate has passed. It plans the
 // group's rules from the scan and a fresh read, lets the rule writer apply the
 // plan, and returns the rule the VM was placed in. It then moves this
-// Director's members out of the group's unmarked rule from an older CPI.
-// exclude, when set, is the sid of a member whose VM delete_vm is removing,
-// which the plan keeps out of every rule.
+// Director's members out of the group's unmarked rule from an older CPI. It
+// also reports whether its writes deleted one of the group's rules, which it
+// does when a rule is left with fewer than two members, even when a later step
+// fails.
 func ensureAntiAffinityMembershipLocked(
-	ctx context.Context, deps Deps, profile *ha.Profile, ident haIdentity, vmid int, exclude string,
+	ctx context.Context, deps Deps, profile *ha.Profile, ident haIdentity, vmid int,
 	d *ha.VMDecision, logger *log.Logger,
-) (string, error) {
+) (placedIn string, deleted bool, err error) {
 	sid := haResourceSid(vmid)
 
 	// 1. Compute the full member set: existing same-group guests + this VM.
 	scan, scanErr := collectGroupMemberSids(ctx, deps, ident)
 	if scanErr != nil {
 		// Without the member set we cannot safely write the rule. Warn and stop.
-		return "", fmt.Errorf("anti-affinity: scan group members: %w", scanErr)
+		return "", false, fmt.Errorf("anti-affinity: scan group members: %w", scanErr)
 	}
 
 	// 2. Plan and write the group's rules. Every round reads the HA
 	// resources again, because a sibling's create may stage its resource, or
 	// roll it back, between two of this writer's attempts.
+	planner := newGroupPlanner(ctx, deps, profile, ident, scan, logger)
+	planner.sid = sid
+	writer, res, err := applyGroupPlan(ctx, deps, profile, planner, d, logger)
+	deleted = wroteGroupDelete(res, ident)
+	if err != nil {
+		return "", deleted, err
+	}
+	if planner.placedIn != "" && len(res.Wrote) > 0 {
+		if err := verifyAntiAffinityMember(ctx, deps, planner.placedIn, sid, logger); err != nil {
+			return "", deleted, err
+		}
+	}
+
+	// 3. The unmarked rule from an older CPI gives up the members of ours that
+	// the hashed rules now hold. A member the overflow or the placeable cap left
+	// out keeps the old rule's protection.
+	if err := migrateLegacyAntiAffinityRule(ctx, deps, writer, ident,
+		heldByChunks(res.Set, ident, planner.scan.legacy), vmid, logger); err != nil {
+		return "", deleted, err
+	}
+	return planner.placedIn, deleted, nil
+}
+
+// newGroupPlanner returns a planner of ident's group rules over scan that
+// reads the HA resources and, when it needs to, scans the group again on every
+// plan. The caller sets sid, or heal, before the plan runs.
+func newGroupPlanner(
+	ctx context.Context, deps Deps, profile *ha.Profile, ident haIdentity, scan *groupScan, logger *log.Logger,
+) *aaPlanner {
 	svc := deps.PVE.Cluster()
-	planner := &aaPlanner{
-		ident: ident, sid: sid, exclude: exclude, scan: scan, logger: logger,
+	return &aaPlanner{
+		ident: ident, scan: scan, logger: logger,
 		nodes:     len(profileNodeNames(profile)),
 		placeable: placeableNodeCount(profile),
 		split:     deps.Config.HAAntiAffinityOverflowValue() == config.HAOverflowSplit,
@@ -234,33 +278,40 @@ func ensureAntiAffinityMembershipLocked(
 			return collectGroupMemberSids(ctx, deps, ident)
 		},
 	}
-	// Until this Apply writes, nothing under the lock depends on the read it
-	// started from, so its backoff may release the rules lock and take it
-	// again. A create that waits for a sibling's resource then holds up no
-	// other rule write in the cluster. The migration below keeps the lock,
-	// because it nests the older CPI's lock inside this one.
+}
+
+// applyGroupPlan lets a rule writer apply planner's plan, and returns the
+// writer for any follow-up write. Until this Apply writes, nothing under the
+// lock depends on the read it started from, so its backoff may release the
+// rules lock and take it again. A create that waits for a sibling's resource
+// then holds up no other rule write in the cluster. The legacy migration that
+// follows an ensure keeps the lock, because it nests the older CPI's lock
+// inside this one.
+func applyGroupPlan(
+	ctx context.Context, deps Deps, profile *ha.Profile, planner *aaPlanner, d *ha.VMDecision, logger *log.Logger,
+) (*ha.RuleWriter, *ha.ApplyResult, error) {
 	writer := newHARuleWriterFor(deps, profile, logger, d)
 	hold := rulesLockHoldFrom(ctx)
 	hold.allowYield(true)
 	res, err := writer.Apply(ctx, "anti-affinity", planner.plan)
 	hold.allowYield(false)
-	if err != nil {
-		return "", err
+	return writer, res, err
+}
+
+// wroteGroupDelete reports whether res lists a landed delete of one of
+// ident's group rules.
+func wroteGroupDelete(res *ha.ApplyResult, ident haIdentity) bool {
+	if res == nil {
+		return false
 	}
-	if planner.placedIn != "" && len(res.Wrote) > 0 {
-		if err := verifyAntiAffinityMember(ctx, deps, planner.placedIn, sid, logger); err != nil {
-			return "", err
+	base := ident.ruleName()
+	for i := range res.Wrote {
+		op := &res.Wrote[i]
+		if _, ok := aaChunkIndex(base, op.Rule.ID); ok && op.Kind == ha.OpDelete {
+			return true
 		}
 	}
-
-	// 3. The unmarked rule from an older CPI gives up the members of ours that
-	// the hashed rules now hold. A member the overflow or the placeable cap left
-	// out keeps the old rule's protection.
-	if err := migrateLegacyAntiAffinityRule(ctx, deps, writer, ident,
-		heldByChunks(res.Set, ident, planner.scan.legacy), vmid, logger); err != nil {
-		return "", err
-	}
-	return planner.placedIn, nil
+	return false
 }
 
 // aaPlanner plans a group's negative rules from the member scan and a read of
@@ -294,7 +345,14 @@ func ensureAntiAffinityMembershipLocked(
 // already added by a sibling that saw it as managed.
 type aaPlanner struct {
 	ident haIdentity
-	sid   string
+	// sid is the member the plan is for, or "". A create's own member always
+	// joins, because its create staged its resource first.
+	sid string
+	// heal plans the group's rules again after a delete, for no create of its
+	// own. sid then joins only while it is an HA resource, like every scanned
+	// member, so a member that another removal purges while the heal runs
+	// drops out of the plan on the next read of the resources.
+	heal bool
 	// exclude is the sid of a member that delete_vm is removing, or "". The
 	// plan drops it from the rules and never adds it.
 	exclude   string
@@ -385,11 +443,11 @@ func (p *aaPlanner) skipOversized(assigned map[string]bool) bool {
 		return false
 	}
 	total := len(assigned)
-	if !assigned[p.sid] {
+	if p.sid != "" && p.sid != p.exclude && !assigned[p.sid] {
 		total++
 	}
 	for s := range p.scan.members {
-		if s != p.sid && !assigned[s] {
+		if s != p.sid && s != p.exclude && !assigned[s] {
 			total++
 		}
 	}
@@ -452,13 +510,17 @@ func (p *aaPlanner) existingChunks(set *ha.RuleSet) (map[int]*ha.Rule, int, erro
 }
 
 // wouldDropUnseen reports whether keptMembers would drop a member of an
-// existing rule because the scan saw no live guest for it.
+// existing rule because the scan saw no live guest for it. The excluded
+// member goes whatever the scan says, so it never calls for a rescan.
 func (p *aaPlanner) wouldDropUnseen(existing map[int]*ha.Rule) bool {
 	if !p.scan.liveComplete {
 		return false
 	}
 	for _, r := range existing {
 		for _, s := range r.Resources {
+			if s == p.exclude {
+				continue
+			}
 			if _, ok := p.scan.live[s]; !ok {
 				return true
 			}
@@ -509,14 +571,22 @@ func (p *aaPlanner) keptMembers(existing map[int]*ha.Rule, maxIndex int) (map[in
 // has none), and returns the new highest index. A rule has room while it holds
 // fewer members than the configured nodes and the placeable nodes. A scanned
 // member that is not an HA resource yet waits for its own create to add it.
-// This VM is always pending, because create_vm stages its resource first.
+// This VM is always pending, because create_vm stages its resource first,
+// except in a heal, where it joins only while it is managed.
 func (p *aaPlanner) assignPending(desired map[int][]string, assigned map[string]bool, maxIndex int) int {
-	pending := map[string]struct{}{p.sid: {}}
-	for s := range p.scan.members {
+	pending := map[string]struct{}{}
+	candidates := maps.Clone(p.scan.members)
+	if p.sid != "" {
+		if candidates == nil {
+			candidates = map[string]struct{}{}
+		}
+		candidates[p.sid] = struct{}{}
+	}
+	for s := range candidates {
 		if s == p.exclude {
 			continue
 		}
-		if s != p.sid && !assigned[s] && !p.isManaged(s) {
+		if (p.heal || s != p.sid) && !assigned[s] && !p.isManaged(s) {
 			p.logDeferred(s)
 			continue
 		}
@@ -893,7 +963,7 @@ func verifyAntiAffinityMember(ctx context.Context, deps Deps, ruleName, sid stri
 // sibling's create has since grown would take the sibling out with the rule.
 // The rules lock rules that out. Without it, a removal that deleted one of
 // this Director's group rules writes the group's rules again once the purge is
-// done, from a fresh scan of the group, so a sibling that joined the rule
+// done (see healAfterUnlockedDeletes), so a sibling that joined the rule
 // between the read and the delete gets its place back.
 func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logger *log.Logger) error {
 	svc := deps.PVE.Cluster()
@@ -917,15 +987,7 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logg
 	}
 
 	deregisterHaResource(ctx, svc, sid, owner, logger)
-	if !deps.Config.ClusterLockEnabled() {
-		for _, ident := range deletedGroupRules(deleted, owner) {
-			if healErr := healAntiAffinityGroup(ctx, deps, ident, sid, logger); healErr != nil {
-				err = errors.Join(err, fmt.Errorf("anti-affinity: write the rules of group %s again after "+
-					"removing %s: %w", ident.ruleName(), sid, healErr))
-			}
-		}
-	}
-	return err
+	return errors.Join(err, healAfterUnlockedDeletes(ctx, deps, deleted, owner, sid, logger))
 }
 
 // planAntiAffinityRemoval plans the writes that take sid out of every
@@ -1010,41 +1072,69 @@ func deletedGroupRules(deleted map[string]string, owner string) []haIdentity {
 	return out
 }
 
-// healAntiAffinityGroup writes the rules of ident's group again after a
-// removal without the rules lock deleted one of them. It plans as the create
-// of the group's lowest surviving HA member would, with removed kept out, so
-// every managed member the fresh scan finds is placed in a rule again. A group
-// with no surviving managed member has nothing to spread.
-func healAntiAffinityGroup(ctx context.Context, deps Deps, ident haIdentity, removed string, logger *log.Logger) error {
-	scan, err := collectGroupMemberSids(ctx, deps, ident)
-	if err != nil {
-		return fmt.Errorf("scan group members: %w", err)
-	}
-	managed, err := listHAResourceSids(ctx, deps.PVE.Cluster())
-	if err != nil {
-		return fmt.Errorf("list HA resources: %w", err)
-	}
-	survivor := 0
-	for s := range scan.members {
-		if s == removed {
-			continue
-		}
-		if _, ok := managed[s]; !ok {
-			continue
-		}
-		if v, ok := vmidFromSid(s); ok && (survivor == 0 || v < survivor) {
-			survivor = v
-		}
-	}
-	if survivor == 0 {
+// healAfterUnlockedDeletes writes the rules of every group again whose rule a
+// writer deleted without the rules lock. deleted maps each deleted rule's ID
+// to the comment it carried, and removed is the sid of the VM that leaves its
+// rules, which the heal keeps out. PVE takes no digest on a rule delete, so a
+// delete planned from a read that a sibling's create has since grown takes the
+// sibling out with the rule. The heal plans from a read taken after the
+// delete, which puts every managed member back. With the rules lock on, no
+// writer can change a rule between another's read and its delete, so there is
+// nothing to heal.
+func healAfterUnlockedDeletes(
+	ctx context.Context, deps Deps, deleted map[string]string, owner, removed string, logger *log.Logger,
+) error {
+	if len(deleted) == 0 || deps.Config.ClusterLockEnabled() {
 		return nil
 	}
+	var err error
+	for _, ident := range deletedGroupRules(deleted, owner) {
+		if healErr := healAntiAffinityGroup(ctx, deps, ident, "", removed, logger); healErr != nil {
+			err = errors.Join(err, fmt.Errorf("anti-affinity: write the rules of group %s again after a "+
+				"delete: %w", ident.ruleName(), healErr))
+		}
+	}
+	return err
+}
+
+// aaHealRounds bounds the plans a heal makes when its own writes delete one
+// of the group's rules again, which a heal answers with another heal.
+const aaHealRounds = 4
+
+// healAntiAffinityGroup writes the rules of ident's group again after a
+// delete without the rules lock. It plans for no create of its own: every
+// managed member the scan finds joins a rule, and the member set is read again
+// on every plan, so a member that another removal purges meanwhile drops out
+// instead of making every write fail. self is the sid of a create that
+// deleted one of its group's rules, which joins on the same terms, or "", and
+// removed is the sid of a VM that leaves the group, which stays out. It skips
+// the membership check and the legacy migration, because it places no member
+// of its own. A heal whose own writes deleted a rule heals again, at most
+// aaHealRounds times.
+func healAntiAffinityGroup(
+	ctx context.Context, deps Deps, ident haIdentity, self, removed string, logger *log.Logger,
+) error {
 	profile, err := haRuleWriteProfile(ctx, deps)
 	if err != nil {
 		return err
 	}
-	_, err = ensureAntiAffinityMembershipLocked(ctx, deps, profile, ident, survivor, removed, nil, logger)
-	return err
+	for range aaHealRounds {
+		scan, err := collectGroupMemberSids(ctx, deps, ident)
+		if err != nil {
+			return fmt.Errorf("scan group members: %w", err)
+		}
+		planner := newGroupPlanner(ctx, deps, profile, ident, scan, logger)
+		planner.sid, planner.heal, planner.exclude = self, true, removed
+		_, res, err := applyGroupPlan(ctx, deps, profile, planner, nil, logger)
+		if err != nil {
+			return err
+		}
+		if !wroteGroupDelete(res, ident) {
+			return nil
+		}
+	}
+	return cpierrors.Retriable("anti-affinity: the rules of group %s lost a rule to a delete in each of %d heals",
+		ident.ruleName(), aaHealRounds)
 }
 
 // pruneGroupAntiAffinityRules deletes every anti-affinity rule of ident's
@@ -1054,16 +1144,20 @@ func healAntiAffinityGroup(ctx context.Context, deps Deps, ident haIdentity, rem
 // rule rather than removing it. The group's rules are its hashed rule and that
 // rule's chunks. A rule another Director owns, or one with no marker, is left
 // alone. It runs under the HA rules lock and reports the writer's error.
+// Without the lock, a prune that deleted a rule writes the group's rules again
+// afterwards, with the VM kept out, as a removal does.
 func pruneGroupAntiAffinityRules(ctx context.Context, deps Deps, ident haIdentity, vmid int, logger *log.Logger) error {
 	if !ident.valid() {
 		return nil
 	}
 	base := ident.ruleName()
+	var deleted map[string]string
 	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		// No profile: a deletion only shrinks rules, as in
 		// removeAntiAffinityMembership.
 		writer := newHARuleWriter(deps, nil, logger)
-		_, err := writer.Apply(ctx, "anti-affinity prune", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+		comments := map[string]string{}
+		res, err := writer.Apply(ctx, "anti-affinity prune", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			var ops []ha.RuleOp
 			for i := range set.Rules {
 				r := &set.Rules[i]
@@ -1074,15 +1168,17 @@ func pruneGroupAntiAffinityRules(ctx context.Context, deps Deps, ident haIdentit
 					continue
 				}
 				ops = append(ops, ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: r.ID}})
+				comments[r.ID] = r.Comment
 			}
 			return ops, nil
 		})
+		deleted = writtenRuleDeletes(res, comments)
 		return err
 	})
 	if err != nil {
-		return fmt.Errorf("anti-affinity: prune the rules of group %s: %w", base, err)
+		err = fmt.Errorf("anti-affinity: prune the rules of group %s: %w", base, err)
 	}
-	return nil
+	return errors.Join(err, healAfterUnlockedDeletes(ctx, deps, deleted, ident.Owner, haResourceSid(vmid), logger))
 }
 
 // deregisterHaResource purges the VM's HA resource, which also removes it from

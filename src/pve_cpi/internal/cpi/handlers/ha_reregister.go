@@ -387,12 +387,18 @@ func (w *readdWiring) leaveRules(ctx context.Context) error {
 	return leaveOwnedHARules(ctx, w.deps, w.vmid, w.owner, w.logger)
 }
 
+// leaveOwnedHARules is leaveRules for vmid. Without the rules lock, a leave
+// that deleted an anti-affinity rule writes the group's rules again
+// afterwards, with the VM kept out, as a removal does, because the resource
+// stays managed and would otherwise join again.
 func leaveOwnedHARules(ctx context.Context, deps Deps, vmid int, owner string, logger *log.Logger) error {
 	sid := haResourceSid(vmid)
 	pinID := naRuleNameFor(vmid)
-	return withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
+	var deleted map[string]string
+	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		writer := newHARuleWriter(deps, nil, logger)
-		_, err := writer.Apply(ctx, "ha readd rule leave", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+		comments := map[string]string{}
+		res, err := writer.Apply(ctx, "ha readd rule leave", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			var ops []ha.RuleOp
 			for i := range set.Rules {
 				r := &set.Rules[i]
@@ -404,6 +410,7 @@ func leaveOwnedHARules(ctx context.Context, deps Deps, vmid int, owner string, l
 				case r.ID == pinID, len(rest) == 0,
 					r.Type == ha.RuleTypeResourceAffinity && len(rest) < 2:
 					ops = append(ops, ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: r.ID}})
+					comments[r.ID] = r.Comment
 				default:
 					next := r.Clone()
 					next.Resources, next.Errors = rest, nil
@@ -412,8 +419,10 @@ func leaveOwnedHARules(ctx context.Context, deps Deps, vmid int, owner string, l
 			}
 			return ops, nil
 		})
+		deleted = writtenRuleDeletes(res, comments)
 		return err
 	})
+	return errors.Join(err, healAfterUnlockedDeletes(ctx, deps, deleted, owner, sid, logger))
 }
 
 // confine writes the staged VM's anti-affinity membership, when the record's

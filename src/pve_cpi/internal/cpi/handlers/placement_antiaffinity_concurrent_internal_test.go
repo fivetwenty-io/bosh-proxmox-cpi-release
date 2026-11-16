@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"slices"
 	"sort"
@@ -204,13 +205,50 @@ func (f *aaFleet) remove(vmid int) func(step func()) error {
 	}
 }
 
+// unstage is a create that runs without HA after all: it purges its HA
+// resource, which takes the VM out of its rule, and prunes the group's rules
+// that the purge left with one member. The guest stays, untouched.
+func (f *aaFleet) unstage(vmid int) func(step func()) error {
+	sid := haResourceSid(vmid)
+	f.gone[sid] = true
+	return func(step func()) error {
+		deps := f.deps(step)
+		purge := true
+		if err := deps.PVE.Cluster().DeleteHaResources(context.Background(), sid,
+			&cluster.DeleteHaResourcesParams{Purge: &purge}); err != nil {
+			return err
+		}
+		return pruneGroupAntiAffinityRules(context.Background(), deps, aaIdent("web"), vmid, log.NewNopLogger())
+	}
+}
+
 // watch fails the run when a write leaves the rule without the marker, or
-// drops a member that no delete removed.
-func (f *aaFleet) watch(t *testing.T, run string) {
+// drops a member that no delete removed. A delete of the rule while it held
+// two members that no delete removed is a gap the deleter's heal must close,
+// so those members are owed a rule until a later write puts them back. The
+// returned check, run once the workers finish, fails the run for any member
+// still owed.
+func (f *aaFleet) watch(t *testing.T, run string) (check func()) {
 	t.Helper()
 	var prev []string
+	owed := map[string]bool{}
 	f.stub.onRuleWrite = func(rule string) {
 		if rule != aaRule {
+			return
+		}
+		if _, ok := f.stub.rules[aaRule]; !ok {
+			var live []string
+			for _, m := range prev {
+				if m != "" && !f.gone[m] {
+					live = append(live, m)
+				}
+			}
+			if len(live) >= 2 {
+				for _, m := range live {
+					owed[m] = true
+				}
+			}
+			prev = nil
 			return
 		}
 		if got := f.stub.ruleComments[aaRule]; got != aaIdent("web").marker() {
@@ -222,7 +260,16 @@ func (f *aaFleet) watch(t *testing.T, run string) {
 				t.Errorf("%s: a write dropped %s from the rule (%v -> %v)", run, m, prev, cur)
 			}
 		}
+		for _, m := range cur {
+			delete(owed, m)
+		}
 		prev = cur
+	}
+	return func() {
+		t.Helper()
+		if len(owed) > 0 {
+			t.Errorf("%s: a delete took %v out of the rule and no write put them back", run, slices.Sorted(maps.Keys(owed)))
+		}
 	}
 }
 
@@ -243,7 +290,7 @@ func TestEnsureAntiAffinity_UnlockedConcurrentCreatesConverge(t *testing.T) {
 		for seed := range uint64(aaConcurrentSeeds) {
 			run := fmt.Sprintf("%d creates, seed %d", len(vmids), seed)
 			f := newAAFleet()
-			f.watch(t, run)
+			check := f.watch(t, run)
 			workers := make([]func(step func()) error, 0, len(vmids))
 			for _, v := range vmids {
 				workers = append(workers, f.create(v))
@@ -253,6 +300,7 @@ func TestEnsureAntiAffinity_UnlockedConcurrentCreatesConverge(t *testing.T) {
 					t.Fatalf("%s: create of %d failed, which rolls back a built VM: %v", run, vmids[i], err)
 				}
 			}
+			check()
 			if got := f.stub.rules[aaRule]; got != strings.Join(want, ",") {
 				t.Fatalf("%s: rule = %q; want every sibling", run, got)
 			}
@@ -274,19 +322,183 @@ func TestEnsureAntiAffinity_UnlockedDeleteAlongsideCreates(t *testing.T) {
 		f.member(100)
 		f.member(101)
 		f.stub.seedRule(aaRule, "vm:100,vm:101")
-		f.watch(t, run)
+		check := f.watch(t, run)
 		errs := runAATurns(seed, []func(step func()) error{f.create(102), f.remove(100), f.create(103)})
 		for i, err := range errs {
 			if err != nil {
 				t.Fatalf("%s: worker %d failed: %v", run, i, err)
 			}
 		}
+		check()
 		if got := f.stub.rules[aaRule]; got != "vm:101,vm:102,vm:103" {
 			t.Fatalf("%s: rule = %q; want the deleted member gone and both siblings in", run, got)
 		}
 		if f.stub.resources["vm:100"] {
 			t.Fatalf("%s: the deleted member's HA resource is still there", run)
 		}
+	}
+}
+
+// TestEnsureAntiAffinity_UnlockedPruneAlongsideCreate runs a create that falls
+// back to running without HA, which purges its resource and prunes the
+// group's rules, while a sibling is created, with the rules lock off. The
+// prune can read the rule after the purge left it with one member and delete
+// it after the sibling's write put two members in it, because PVE takes no
+// digest on a delete. The prune then writes the group's rules again, so the
+// rule must end with the remaining member and the new sibling.
+func TestEnsureAntiAffinity_UnlockedPruneAlongsideCreate(t *testing.T) {
+	t.Parallel()
+	for seed := range uint64(aaConcurrentSeeds) {
+		run := fmt.Sprintf("seed %d", seed)
+		f := newAAFleet()
+		f.member(100)
+		f.member(101)
+		f.stub.seedRule(aaRule, "vm:100,vm:101")
+		check := f.watch(t, run)
+		for i, err := range runAATurns(seed, []func(step func()) error{f.unstage(100), f.create(102)}) {
+			if err != nil {
+				t.Fatalf("%s: worker %d failed: %v", run, i, err)
+			}
+		}
+		check()
+		if got := f.stub.rules[aaRule]; got != "vm:101,vm:102" {
+			t.Fatalf("%s: rule = %q; want the remaining member and the new sibling", run, got)
+		}
+	}
+}
+
+// TestEnsureAntiAffinity_UnlockedTwoDeletesAlongsideCreates runs delete_vm's
+// cleanup of two members while two siblings are created, with the rules lock
+// off. The heal after one removal's delete can run while the other removal
+// purges a member the heal read as managed, so the heal must read the
+// managed members again on every plan rather than insist on one of them.
+// Whatever the order, the rule must end with the remaining member and both
+// new siblings.
+func TestEnsureAntiAffinity_UnlockedTwoDeletesAlongsideCreates(t *testing.T) {
+	t.Parallel()
+	for seed := range uint64(aaConcurrentSeeds) {
+		run := fmt.Sprintf("seed %d", seed)
+		f := newAAFleet()
+		f.member(100)
+		f.member(101)
+		f.member(102)
+		f.stub.seedRule(aaRule, "vm:100,vm:101,vm:102")
+		check := f.watch(t, run)
+		errs := runAATurns(seed, []func(step func()) error{f.remove(100), f.remove(101), f.create(103),
+			f.create(104)})
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("%s: worker %d failed: %v", run, i, err)
+			}
+		}
+		check()
+		if got := f.stub.rules[aaRule]; got != "vm:102,vm:103,vm:104" {
+			t.Fatalf("%s: rule = %q; want the remaining member and both new siblings", run, got)
+		}
+	}
+}
+
+// aaRaceDelete runs before each rule delete lands, as a sibling's write that
+// lands between the deleter's read and its delete would.
+type aaRaceDelete struct {
+	*aaClusterStub
+	before func(rule string)
+}
+
+func (r *aaRaceDelete) DeleteHaRules(ctx context.Context, rule string) error {
+	r.before(rule)
+	return r.aaClusterStub.DeleteHaRules(ctx, rule)
+}
+
+// TestEnsureAntiAffinity_UnlockedCreateHealsAfterItsOwnDelete pins that a
+// create whose plan deletes one of its group's rules writes the group's rules
+// again, with the rules lock off. Its rule held only a member whose guest is
+// gone, so the plan deletes it, and two siblings write themselves into it
+// between the create's read and its delete. The rule must end with all three.
+func TestEnsureAntiAffinity_UnlockedCreateHealsAfterItsOwnDelete(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	stub.enforceManaged = true
+	tagged := []int{101}
+	stub.listResourcesFn = func() *cluster.ListResourcesResponse {
+		resp := make(cluster.ListResourcesResponse, 0, len(tagged))
+		for _, v := range tagged {
+			resp = append(resp, aaQEMU(v, aaTag))
+		}
+		return &resp
+	}
+	stub.resources["vm:101"] = true
+	stub.seedRule(aaRule, "vm:100")
+	raced := false
+	racing := &aaRaceDelete{aaClusterStub: stub, before: func(rule string) {
+		if rule != aaRule || raced {
+			return
+		}
+		raced = true
+		tagged = append(tagged, 102, 103)
+		stub.resources["vm:102"], stub.resources["vm:103"] = true, true
+		stub.rules[aaRule] = "vm:102,vm:103"
+		stub.digest++
+	}}
+	deps := aaDeps(stub)
+	deps.PVE = &icPVEClient{
+		clusterSvc: racing,
+		nodesSvc: &icNodesService{listFn: func(ctx context.Context, p *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return stub.ListResources(ctx, p)
+		}},
+	}
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 101,
+		log.NewNopLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if !raced {
+		t.Fatal("the create deleted no rule, so the race never ran")
+	}
+	if got := stub.rules[aaRule]; got != "vm:101,vm:102,vm:103" {
+		t.Fatalf("rule = %q; want this create and both siblings", got)
+	}
+}
+
+// TestLeaveOwnedHARules_UnlockedLeaveHealsAfterItsDelete pins that a re-add's
+// leave of its rules writes the group's rules again after it deleted one, with
+// the rules lock off. The leave reads the rule with one member besides the VM
+// and deletes it, and a sibling writes itself into the rule between that read
+// and the delete. The VM keeps its resource, so the heal keeps it out, and the
+// rule must end with the other member and the sibling.
+func TestLeaveOwnedHARules_UnlockedLeaveHealsAfterItsDelete(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	stub.enforceManaged = true
+	stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag), aaQEMU(102, aaTag))
+	stub.resources["vm:100"], stub.resources["vm:101"] = true, true
+	stub.seedRule(aaRule, "vm:100,vm:101")
+	raced := false
+	racing := &aaRaceDelete{aaClusterStub: stub, before: func(rule string) {
+		if rule != aaRule || raced {
+			return
+		}
+		raced = true
+		stub.resources["vm:102"] = true
+		stub.rules[aaRule] = "vm:100,vm:101,vm:102"
+		stub.digest++
+	}}
+	deps := aaDeps(stub)
+	deps.PVE = &icPVEClient{
+		clusterSvc: racing,
+		nodesSvc: &icNodesService{listFn: func(ctx context.Context, p *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return stub.ListResources(ctx, p)
+		}},
+	}
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+	if err := leaveOwnedHARules(context.Background(), deps, 100, aaDirector, log.NewNopLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if !raced {
+		t.Fatal("the leave deleted no rule, so the race never ran")
+	}
+	if got := stub.rules[aaRule]; got != "vm:101,vm:102" {
+		t.Fatalf("rule = %q; want the other member and the sibling, without the VM that left", got)
 	}
 }
 

@@ -67,12 +67,18 @@ func describeSteps(steps []aaStep) string {
 }
 
 // watchAARule fails the test when a write leaves the group's rule without the
-// marker or without a member an earlier write gave it.
+// marker or without a member an earlier write gave it, or deletes it. Only
+// creates run here, and no create deletes a rule that has two members.
 func watchAARule(t *testing.T, stub *aaClusterStub, order string) {
 	t.Helper()
 	var prev []string
 	stub.onRuleWrite = func(rule string) {
 		if rule != aaRule {
+			return
+		}
+		if _, ok := stub.rules[aaRule]; !ok {
+			t.Errorf("%s: the rule was deleted (it held %v)", order, prev)
+			prev = nil
 			return
 		}
 		if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker() {
