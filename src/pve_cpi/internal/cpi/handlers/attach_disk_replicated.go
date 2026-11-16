@@ -54,8 +54,9 @@ func replicaReassignVerdict(
 		"up the replica, so the disk enters the VM before the job exists"
 	if !info.IsShared() {
 		return false, cpierrors.Cloud("%s: disk %s cannot enter VM %d: %s, and PVE refuses a node-local volume that "+
-			"cannot replicate on a replicated VM by a config edit too. %s, or keep persistent disks on shared "+
-			"storage or on a ZFS pool", op, rd.diskCID, targetVMID, why, remedy)
+			"cannot replicate in a config edit too, unless the drive is excluded from replication, which the CPI "+
+			"does not do, because the replica would then not cover the disk. %s, or keep persistent disks on "+
+			"shared storage or on a ZFS pool", op, rd.diskCID, targetVMID, why, remedy)
 	}
 	embedded, named := pve.EmbeddedDiskVMID(rd.volid)
 	if (named && embedded == holder.VMID) || pve.TagsMarkDiskMover(holder.Tags) {
@@ -88,24 +89,51 @@ func replicaJobIDs(jobs []ha.ReplicaJobState) []string {
 }
 
 // diskStorageInfo returns the storage definition of volid from the backend
-// resolver, and false when the resolver does not know the storage's type.
-func diskStorageInfo(ctx context.Context, deps Deps, volid string) (pve.StorageInfo, bool) {
+// resolver, and false when the resolver does not know the storage's type. A
+// lookup that fails returns its error, which is retriable when the storage
+// index could not be read, so a caller never takes a failed read for a
+// storage of unknown type.
+func diskStorageInfo(ctx context.Context, deps Deps, volid string) (pve.StorageInfo, bool, error) {
 	storage, _, err := pve.ParseDiskCID(volid)
 	if err != nil {
-		return pve.StorageInfo{}, false
+		return pve.StorageInfo{}, false, nil
 	}
 	backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
 	if err != nil {
-		return pve.StorageInfo{}, false
+		return pve.StorageInfo{}, false, err
 	}
 	info, ok := pve.BackendStorageInfo(backend)
 	if !ok || info.Type == "" {
-		return pve.StorageInfo{}, false
+		return pve.StorageInfo{}, false, nil
 	}
 	if info.Name == "" {
 		info.Name = storage
 	}
-	return info, true
+	return info, true, nil
+}
+
+// replicaJobsLeaving reports whether every job of jobs is marked for removal,
+// which PVE's runner carries out on its next run. PVE still refuses a volume
+// that cannot replicate while such a job is listed, and the refusal passes
+// once the runner has removed it, so a refusal that rests on it alone is
+// retriable.
+func replicaJobsLeaving(jobs []ha.ReplicaJobState) bool {
+	if len(jobs) == 0 {
+		return false
+	}
+	for _, j := range jobs {
+		if j.RemoveJob == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// errReplicaJobsLeaving is the retriable refusal of a disk that cannot enter
+// targetVMID while the VM's jobs, all marked for removal, are still listed.
+func errReplicaJobsLeaving(op, diskCID string, targetVMID int, jobs string) error {
+	return cpierrors.Retriable("%s: disk %s cannot enter VM %d while %s, which PVE has marked for removal, is "+
+		"still configured; the attach goes on once pvesr has removed it", op, diskCID, targetVMID, jobs)
 }
 
 // replicatedTargetRoute checks, before a reassignment from holder into
@@ -114,11 +142,17 @@ func diskStorageInfo(ctx context.Context, deps Deps, volid string) (pve.StorageI
 // the VM's replication jobs only for a disk whose storage is known not to
 // replicate. A storage the resolver cannot classify, or a job list that
 // cannot be read, keeps the reassignment, and PVE's own refusal then reaches
-// the fallback in attachDiskViaTransfer, which reaches the same answer.
+// the fallback in attachDiskViaTransfer, which reaches the same answer. A
+// storage lookup that fails is retriable, and so is a VM whose only jobs are
+// marked for removal.
 func replicatedTargetRoute(
 	ctx context.Context, deps Deps, op string, rd resolvedDisk, holder pve.DiskHolder, targetVMID int,
 ) (bool, error) {
-	info, known := diskStorageInfo(ctx, deps, rd.volid)
+	info, known, err := diskStorageInfo(ctx, deps, rd.volid)
+	if err != nil {
+		return false, retriableUnlessPermanent(err, fmt.Sprintf("%s: classify the storage of disk %s before it "+
+			"enters VM %d", op, rd.diskCID, targetVMID))
+	}
 	if !known || storageCanReplicate(info) {
 		return false, nil
 	}
@@ -133,7 +167,11 @@ func replicatedTargetRoute(
 			log.Int(metadataKeyVMID, targetVMID), log.String("disk_cid", rd.diskCID), log.Err(err))
 		return false, nil
 	}
-	configEdit, err := replicaReassignVerdict(op, rd, holder, info, targetVMID, describeReplicaJobs(replicaJobIDs(jobs)))
+	described := describeReplicaJobs(replicaJobIDs(jobs))
+	configEdit, err := replicaReassignVerdict(op, rd, holder, info, targetVMID, described)
+	if err != nil && replicaJobsLeaving(jobs) {
+		return false, errReplicaJobsLeaving(op, rd.diskCID, targetVMID, described)
+	}
 	if configEdit {
 		deps.Log(ctx).Warn(op+": the VM is replicated and the disk's storage cannot replicate, so PVE refuses the "+
 			"reassignment; using the config-edit attach, which keeps the volume's name (named for neither the "+
@@ -145,22 +183,31 @@ func replicatedTargetRoute(
 }
 
 // replicaRefusalVerdict answers PVE's refusal to reassign the disk into a
-// replicated VM, which proves that the VM has a job and that the disk's
+// replicated VM, which proves that the VM had a job and that the disk's
 // storage cannot replicate. It returns nil when the config-edit attach may
 // take the disk, and the permanent refusal otherwise. A storage the resolver
 // cannot classify counts as shared only when its backend is not node-local.
+// A storage lookup that fails is retriable. So is a refusal that a retry
+// would not meet, because the VM's jobs are gone since or are all marked for
+// removal, and a refusal whose job list cannot be read to tell.
 func replicaRefusalVerdict(
 	ctx context.Context, deps Deps, op string, rd resolvedDisk, volid string, holder pve.DiskHolder, targetVMID int,
 	refusal error,
 ) error {
 	rd.volid = volid
 	storage, _, _ := pve.ParseDiskCID(volid)
-	info, known := diskStorageInfo(ctx, deps, volid)
+	unclassified := func(err error) error {
+		return retriableUnlessPermanent(err, fmt.Sprintf("%s: PVE refused to move disk %s into replicated VM %d "+
+			"(%v), and the disk's storage could not be classified", op, rd.diskCID, targetVMID, refusal))
+	}
+	info, known, err := diskStorageInfo(ctx, deps, volid)
+	if err != nil {
+		return unclassified(err)
+	}
 	if !known {
 		local, err := diskBackendIsLocal(ctx, deps, op, volid)
 		if err != nil {
-			return cpierrors.Wrap(refusal, fmt.Sprintf("%s: PVE refused to move disk %s into replicated VM %d, and "+
-				"the disk's storage could not be classified: %v", op, rd.diskCID, targetVMID, err))
+			return unclassified(err)
 		}
 		info = pve.StorageInfo{Name: storage, Shared: !local}
 	}
@@ -169,26 +216,46 @@ func replicaRefusalVerdict(
 		// PVE's answer outranks the storage index, which may be stale.
 		info.Type = ""
 	}
-	_, err := replicaReassignVerdict(op, rd, holder, info, targetVMID, "a replication job")
-	if err != nil {
-		return cpierrors.Wrap(refusal, err.Error())
+	_, verdict := replicaReassignVerdict(op, rd, holder, info, targetVMID, "a replication job")
+	if verdict == nil {
+		return nil
 	}
-	return nil
+	all, err := replicationAPIFor(deps).ListJobs(ctx)
+	var jobs []ha.ReplicaJobState
+	if err == nil {
+		jobs, err = ha.GuestJobs(all, targetVMID)
+	}
+	switch {
+	case err != nil:
+		return cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, fmt.Sprintf("%s: PVE refused "+
+			"to move disk %s into replicated VM %d (%v), and the VM's replication jobs could not be read to tell "+
+			"whether the refusal still holds", op, rd.diskCID, targetVMID, refusal))
+	case len(jobs) == 0:
+		return cpierrors.Retriable("%s: PVE refused to move disk %s into VM %d for a replication job (%v), and the "+
+			"VM has no replication job now; the retry moves it", op, rd.diskCID, targetVMID, refusal)
+	case replicaJobsLeaving(jobs):
+		return errReplicaJobsLeaving(op, rd.diskCID, targetVMID, describeReplicaJobs(replicaJobIDs(jobs)))
+	}
+	return cpierrors.Wrap(refusal, verdict.Error())
 }
 
 // replicatedLocalAddText is the refusal of a disk on node-local storage that
-// cannot replicate, which a VM that has a replication job never takes. PVE's
-// move_disk refuses the reassignment, and update_vm refuses the config edit
-// ("cannot add non-replicatable volume to a replicated VM"), for as long as
-// the job exists. jobs names the VM's jobs, and is empty when only PVE's
-// answer proves one exists. storage names the disk's storage.
+// cannot replicate, which the CPI does not attach to a VM that has a
+// replication job. PVE's move_disk refuses the reassignment, and update_vm
+// refuses the config edit ("cannot add non-replicatable volume to a
+// replicated VM"), for as long as the job exists, unless the drive is marked
+// replicate=0. The CPI never sets that flag, because the replica would then
+// not cover the disk, and a failover would start the VM without it. jobs
+// names the VM's jobs, and is empty when only PVE's answer proves one exists.
+// storage names the disk's storage.
 func replicatedLocalAddText(op, diskCID, vmCID, jobs, storage string) string {
 	if jobs == "" {
 		jobs = "a replication job"
 	}
-	return fmt.Sprintf("%s: disk %s cannot enter VM %s: the VM has %s, and PVE refuses a volume on node-local "+
-		"storage %s that cannot replicate on a replicated VM, by reassignment and by a config edit, because only "+
-		"a ZFS pool replicates. Keep the persistent disks of a VM under pve.ha.local_policy replicate on shared "+
+	return fmt.Sprintf("%s: disk %s cannot enter VM %s: the VM has %s, and the disk is on node-local storage %s, "+
+		"which cannot replicate, because only a ZFS pool replicates. PVE refuses to move such a volume into a "+
+		"replicated VM, and refuses it in a config edit unless the drive is excluded from replication, which the "+
+		"CPI does not do, because the replica would then not cover the disk. Keep the persistent disks of a VM under pve.ha.local_policy replicate on shared "+
 		"storage or on a ZFS pool its replica partner also has, or remove the VM's replication job if it is not "+
 		"this Director's", op, diskCID, vmCID, jobs, storage)
 }

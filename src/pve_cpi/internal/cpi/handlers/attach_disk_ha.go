@@ -811,39 +811,71 @@ func (h *attachHA) preflight(ctx context.Context) error {
 
 // refuseReplicatedAttach is the replicated-VM refusal of the attach guard
 // (see replicatedTargetRoute), made from the jobs and storages the HA profile
-// read, so it costs no API call. A refusal here keeps the VM in HA with its
-// pin, where the same refusal after a leave would have taken the VM out of HA
-// for an attach that can never land. A stable-ID disk on a parker gets the
-// verdict of the reassignment, and any other disk that is not in the VM yet
-// is refused when its storage is node-local and cannot replicate, because PVE
-// refuses that volume on a replicated VM by any route. Facts the profile
-// lacks skip it, and the attach's own check then runs. So does an attach
-// whose replica rebuild retired the VM's job after the profile was read, and
-// a removal from HA of a replicate VM, which retires the VM's job before the
-// attach (see retireLeftReplica).
+// read, so it costs no API call in the common case. A refusal here keeps the
+// VM in HA with its pin, where the same refusal after a leave would have
+// taken the VM out of HA for an attach that can never land. A stable-ID disk
+// on a parker gets the verdict of the reassignment, and any other disk that
+// is not in the VM yet is refused when its storage is node-local and cannot
+// replicate, because PVE refuses that volume on a replicated VM, and the CPI
+// does not exclude it from replication. Facts the profile lacks skip it, and
+// the attach's own check then runs. So does an attach whose replica rebuild
+// retired the VM's job after the profile was read. A removal from HA of a
+// replicate VM retires the VM's own job before the attach (see
+// retireLeftReplica), so for it the refusal counts only the jobs that do not
+// carry this Director's marker, which the removal leaves, and it reads the
+// job list for them, because the profile's jobs carry no marker. A list that
+// cannot be read is retriable, and the VM stays in HA.
 func (h *attachHA) refuseReplicatedAttach(ctx context.Context, holder pve.DiskHolder) error {
 	rd := h.disk
-	if replicaRebuildInFlight(ctx) || h.action == attachHALeave && h.replicaTagged ||
-		holder.Found && holder.VMID == h.vmid {
+	if replicaRebuildInFlight(ctx) || holder.Found && holder.VMID == h.vmid {
 		return nil
 	}
-	jobs, ok := profileReplicaJobs(h.profile, h.vmid)
-	if !ok || len(jobs) == 0 {
+	profileJobs, ok := profileReplicaJobs(h.profile, h.vmid)
+	if !ok || len(profileJobs) == 0 {
 		return nil
 	}
 	storage, _, _ := strings.Cut(rd.volid, ":")
 	info, ok := profileStorage(h.profile, storage)
-	if !ok {
+	if !ok || storageCanReplicate(info) {
 		return nil
 	}
-	if holder.Found && holder.IsParker && rd.stableID != "" {
+	parked := holder.Found && holder.IsParker && rd.stableID != ""
+	if !parked && info.IsShared() {
+		return nil
+	}
+	jobs := profileJobs
+	if h.action == attachHALeave && h.replicaTagged {
+		foreign, err := h.foreignReplicaJobs(ctx)
+		if err != nil {
+			return err
+		}
+		if len(foreign) == 0 {
+			return nil
+		}
+		jobs = foreign
+	}
+	if parked {
 		_, err := replicaReassignVerdict(attachHAOp, rd, holder, info, h.vmid, describeReplicaJobs(jobs))
 		return err
 	}
-	if info.IsShared() || storageCanReplicate(info) {
-		return nil
-	}
 	return replicatedLocalAddRefusal(attachHAOp, rd.diskCID, h.vmCID, describeReplicaJobs(jobs), info)
+}
+
+// foreignReplicaJobs returns the IDs of the VM's replication jobs that do not
+// carry this Director's marker, read from the job list. A read that fails is
+// retriable.
+func (h *attachHA) foreignReplicaJobs(ctx context.Context) ([]string, error) {
+	all, err := replicationAPIFor(h.deps).ListJobs(ctx)
+	if err != nil {
+		return nil, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: list the replication jobs of VM %d before it leaves HA", attachHAOp, h.vmid))
+	}
+	_, foreign, err := guestReplicaJobs(all, h.vmid, h.deps.RequestDirectorUUID)
+	if err != nil {
+		return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: read the replication jobs of VM %d before it leaves HA", attachHAOp, h.vmid))
+	}
+	return replicaJobIDs(foreign), nil
 }
 
 // retireLeftReplica retires the replication job of a replicate VM that has

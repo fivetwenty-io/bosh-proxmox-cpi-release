@@ -621,8 +621,17 @@ func (r *replicaRetire) run(ctx context.Context) error {
 	}
 	out, err := ha.RetireReplicaJob(ctx, r.api, in)
 	if err != nil {
-		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("%s: retire replication job %s of VM %d", r.caller, owned.ID, r.vmid))
+		msg := fmt.Sprintf("%s: retire replication job %s of VM %d", r.caller, owned.ID, r.vmid)
+		if errors.Is(err, ha.ErrReplicaRetireIncomplete) && other != "" {
+			// Only an operator can tell a partner that is down for a while
+			// from one that is gone, so the CPI never forces this removal,
+			// and the error says how to drop the job when the node is gone.
+			msg += fmt.Sprintf(". The retry goes on once the removal can clean up the copy on node %s. If that "+
+				"node will not come back, drop the job without its cleanup with 'pvesr delete %s --force 1' on "+
+				"node %s; the copy on %s then stays there until it is removed by hand", other, owned.ID, r.node,
+				other)
+		}
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, msg)
 	}
 	r.retiredJob, r.retiredOther = owned.ID, other
 	if r.handle != nil && other != "" {
@@ -868,8 +877,14 @@ func replicaRefusalProven(err error) bool {
 // an earlier attempt of the same create made, and returns its ID. A job of
 // the guest that this Director does not own is a refusal, because the VM
 // cannot have two jobs to one partner and the CPI may not take the other one
-// over. The journal records the job's generation before the create and
-// confirms it after.
+// over. A job of this Director that PVE has marked for removal is not kept,
+// because pvesr deletes it on its next run, and the call returns a retriable
+// error until it is gone. The journal records the job's generation before
+// the create and confirms it after. A job that is kept while the journal
+// moves to a new generation, as after a retirement the journal recorded and
+// PVE never carried out, gets that generation written into its marker and
+// read back before the journal confirms it, so the marker and the record
+// never disagree.
 func ensureCreatedReplicaJob(
 	ctx context.Context, deps Deps, api ha.ReplicationAPI, op string, vmid int, node, partner string, volids []string,
 	changedAt time.Time, handle *aj.Handle,
@@ -891,6 +906,10 @@ func ensureCreatedReplicaJob(
 	if len(foreign) > 0 {
 		return "", cpierrors.Cloud("%s: VM %d already has replication job %s, which does not carry this "+
 			"Director's marker", op, vmid, foreign[0].ID)
+	}
+	if owned != nil && owned.RemoveJob != "" {
+		return "", cpierrors.Retriable("%s: replication job %s of VM %d is marked for removal, and pvesr has not "+
+			"removed it yet; the job is set up again once it is gone", op, owned.ID, vmid)
 	}
 	id := ha.ReplicaJobID(vmid, ha.NextJobNum(jobs, vmid))
 	if owned != nil {
@@ -919,6 +938,10 @@ func ensureCreatedReplicaJob(
 				return "", err
 			}
 		}
+	} else if handle != nil {
+		if err := markKeptReplicaJob(ctx, api, op, *owned, vmid, owner, gen); err != nil {
+			return "", err
+		}
 	}
 	if handle != nil {
 		if err := handle.ConfirmReplicationJob(gen); err != nil {
@@ -927,6 +950,41 @@ func ensureCreatedReplicaJob(
 		}
 	}
 	return id, nil
+}
+
+// markKeptReplicaJob writes generation gen into the marker of job, a job of
+// this Director that the setup keeps, when the marker carries another one,
+// and reads the job back to prove the write. The journal confirms gen only
+// after this, so the widening's check that the marker carries the record's
+// generation holds (see journalEvidence). Every failure is retriable, and the
+// journal keeps gen pending, so the retry writes the same marker.
+func markKeptReplicaJob(
+	ctx context.Context, api ha.ReplicationAPI, op string, job ha.ReplicaJobState, vmid int, owner string, gen uint64,
+) error {
+	if m, ok := parseReplicaJobMarker(job.Comment); ok && m.Generation == gen {
+		return nil
+	}
+	if err := api.SetComment(ctx, job.ID, renderReplicaJobMarker(owner, gen)); err != nil {
+		return cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: write generation %d into the marker of replication job %s", op, gen, job.ID))
+	}
+	jobs, err := api.ListJobs(ctx)
+	if err != nil {
+		return cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: read replication job %s back after its marker write", op, job.ID))
+	}
+	owned, _, err := guestReplicaJobs(jobs, vmid, owner)
+	if err != nil {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, op+": read the replication job back")
+	}
+	if owned == nil || owned.ID != job.ID {
+		return cpierrors.Retriable("%s: replication job %s is not listed after its marker write", op, job.ID)
+	}
+	if m, ok := parseReplicaJobMarker(owned.Comment); !ok || m.Generation != gen {
+		return cpierrors.Retriable("%s: replication job %s does not carry generation %d after its marker write", op,
+			job.ID, gen)
+	}
+	return nil
 }
 
 // prepareCreatedReplicaJob records the job in the VM's journal record and
@@ -1032,7 +1090,9 @@ func reconcileTouchedVMHA(ctx context.Context, deps Deps, op, vmCID string, vmid
 // partner's and the next sync rolls it back. The barrier's change asks the
 // job for a sync from the new source. A VM on its source with the
 // source-only pin gets one check of its replica, and the pin widens when a
-// sync is verified. A pin that cannot be read, a profile that cannot be
+// sync is verified. A VM with the replicate tag that left HA under an earlier
+// release, and kept its job, has the job retired (see retireStrandedReplica).
+// A pin that cannot be read, a profile that cannot be
 // resolved for a narrowing, and a narrowing that cannot finish return a
 // retriable error, so the Director retries the call; a widening that cannot
 // finish, the profile it needs included, is logged.
@@ -1055,6 +1115,13 @@ func reconcileVMReplica(ctx context.Context, deps Deps, op, vmCID string, vmid i
 			fmt.Sprintf("%s: read the pin of replicated VM %d to reconcile it with where the VM runs", op, vmid))
 	}
 	if pin == nil {
+		// A VM that left HA under an earlier release kept its job and its
+		// replicate tag, and has no pin. The job copies the VM to a partner
+		// it can never fail over to, so it is retired here.
+		if err := retireStrandedReplica(ctx, deps, logger, op, vmCID, vmid, loc); err != nil {
+			logger.Warn(op+": the VM is out of HA and keeps the replicate tag, and its replication job could not "+
+				"be retired; a later call that touches the VM tries again", log.Err(err))
+		}
 		return nil
 	}
 	api := replicationAPIFor(deps)

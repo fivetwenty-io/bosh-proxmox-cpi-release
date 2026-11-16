@@ -17,16 +17,22 @@ import (
 )
 
 // taggedIndexStub is the attach stub whose cluster index lists VM 100 with
-// the tags tags returns, so a VM location carries them.
+// the tags tags returns, so a VM location carries them, on node, or on pve01
+// when node is empty.
 type taggedIndexStub struct {
 	*attachHAStub
 	tags func() string
+	node string
 }
 
 func (s taggedIndexStub) ListResources(context.Context, *cluster.ListResourcesParams) (
 	*cluster.ListResourcesResponse, error,
 ) {
-	raw, _ := json.Marshal(map[string]any{"type": "qemu", "vmid": 100, "node": "pve01", "id": "qemu/100",
+	node := s.node
+	if node == "" {
+		node = "pve01"
+	}
+	raw, _ := json.Marshal(map[string]any{"type": "qemu", "vmid": 100, "node": node, "id": "qemu/100",
 		"tags": s.tags()})
 	return &cluster.ListResourcesResponse{raw}, nil
 }
@@ -288,7 +294,10 @@ func TestAttachPreflightRefusesANodeLocalDiskOnAReplicatedVM(t *testing.T) {
 	profile.Storages = append(profile.Storages,
 		pve.StorageInfo{Name: "local-zfs", Type: pve.StorageTypeZFSPool, Content: "images"})
 	profile.Replication = []ha.ReplicationJob{{ID: "100-0", Guest: 100, Source: "pve01", Target: "pve02"}}
+	repl := newFakeReplica()
+	repl.addJob("100-0", "pve01", "pve02", renderReplicaJobMarker(aaDirector, 1))
 	h := &attachHA{profile: profile, vmid: 100, vmCID: "100", action: attachHAGuarded,
+		deps: Deps{RequestDirectorUUID: aaDirector, Replication: repl},
 		disk: resolvedDisk{diskCID: "d", volid: testPinStorage + ":vm-100-disk-1"}}
 	err := h.refuseReplicatedAttach(context.Background(), pve.DiskHolder{})
 	if !cpierrors.IsType(err, cpierrors.TypeCloud) || !strings.Contains(err.Error(), testPinStorage) ||
@@ -308,6 +317,18 @@ func TestAttachPreflightRefusesANodeLocalDiskOnAReplicatedVM(t *testing.T) {
 	if err := h.refuseReplicatedAttach(context.Background(), pve.DiskHolder{}); err != nil {
 		t.Fatalf("the leave of a tagged VM retires its job first, so nothing is refused: %v", err)
 	}
+	repl.addJob("100-1", "pve01", "pve03", "operator job")
+	err = h.refuseReplicatedAttach(context.Background(), pve.DiskHolder{})
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) || !strings.Contains(err.Error(), "the replication job 100-1") ||
+		strings.Contains(err.Error(), "100-0") {
+		t.Fatalf("err %v; the leave keeps a job without this Director's marker, so the VM is refused in HA", err)
+	}
+	repl.listErr = errors.New("connection reset")
+	if err := h.refuseReplicatedAttach(context.Background(), pve.DiskHolder{}); !cpierrors.IsType(err,
+		cpierrors.TypeRetriableCloud) {
+		t.Fatalf("err %v; a job list that cannot be read keeps the VM in HA and is retriable", err)
+	}
+	repl.listErr = nil
 	h.action, h.replicaTagged = attachHAGuarded, false
 	if err := h.refuseReplicatedAttach(withReplicaRebuild(context.Background()), pve.DiskHolder{}); err != nil {
 		t.Fatalf("an attach whose rebuild removed the job is refused from stale facts: %v", err)

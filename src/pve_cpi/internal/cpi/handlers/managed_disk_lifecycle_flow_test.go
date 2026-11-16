@@ -8,6 +8,7 @@ import (
 	"fmt"
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -116,6 +117,13 @@ type lifecycleFlowPVE struct {
 	// with PVE's answer for a volume whose storage cannot replicate, the
 	// check at Qemu.pm:5139, before any task forks.
 	replicatedVMs map[int]bool
+	// replication, when set, decides that refusal from its live job list
+	// instead, the way PVE's reassign check does: a move into a VM that has
+	// any job, one marked for removal included, refuses unless the source
+	// volume's storage is a ZFS pool, which zfsStorages names. A job removed
+	// from the list unblocks the next move.
+	replication *fakeReplica
+	zfsStorages map[string]bool
 	// replicationAnswers counts the move POSTs refused that way.
 	replicationAnswers int
 	// moveTaskExit, when set, makes the next move start a task that exits
@@ -251,6 +259,25 @@ func moveSnapshotRefusal() error {
 // replication job when the volume's storage cannot replicate, as an HTTP 500.
 func moveReplicationRefusal() error {
 	return sdkerrors.ParseAPIError(500, []byte(`{"message":"Cannot move disk to a replicated VM. Storage does not support replication!\n"}`))
+}
+
+// moveRefusedForReplication reports whether PVE's reassign check refuses the
+// move of the source VM's drive disk into targetID because the target is
+// replicated (see replicatedVMs and replication).
+func (c *lifecycleFlowPVE) moveRefusedForReplication(sourceID, targetID int, disk string) bool {
+	if c.replication == nil {
+		return c.replicatedVMs[targetID]
+	}
+	jobs, err := ha.GuestJobs(c.replication.jobs, targetID)
+	if err != nil {
+		return true
+	}
+	if len(jobs) == 0 {
+		return false
+	}
+	value, _ := pve.ConfigString(c.state.configs[sourceID], disk)
+	storage, _, _ := strings.Cut(value, ":")
+	return !c.zfsStorages[storage]
 }
 
 // moveDigestMismatch reports which side of a move no longer matches the digest
@@ -785,7 +812,7 @@ func (n lifecycleFlowNodes) CreateQemuMoveDisk(_ context.Context, _ string, sour
 		n.c.snapshotAnswers++
 		return nil, moveSnapshotRefusal()
 	}
-	if n.c.replicatedVMs[targetID] {
+	if n.c.moveRefusedForReplication(sourceID, targetID, p.Disk) {
 		n.c.replicationAnswers++
 		return nil, moveReplicationRefusal()
 	}

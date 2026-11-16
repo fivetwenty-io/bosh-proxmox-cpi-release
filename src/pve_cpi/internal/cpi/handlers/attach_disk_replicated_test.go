@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
@@ -214,7 +216,9 @@ func TestReplicaReassignVerdict(t *testing.T) {
 // over a storage index that calls the storage a ZFS pool, and that the
 // verdict wraps the refusal for a parker-named volume.
 func TestReplicaRefusalVerdictOutranksStaleIndex(t *testing.T) {
-	deps := Deps{Config: &config.CPIConfig{Node: "n1"}, Logger: log.NewNopLogger()}
+	repl := newFakeReplica()
+	repl.addJob("710-0", "n1", "n2", "operator job")
+	deps := Deps{Config: &config.CPIConfig{Node: "n1"}, Logger: log.NewNopLogger(), Replication: repl}
 	deps.Resolver = infoResolver{base: backendResolverOrDefault(deps),
 		info: pve.StorageInfo{Type: pve.StorageTypeZFSPool, Shared: true}}
 	parker := pve.DiskHolder{Found: true, IsParker: true, VMID: 90000, Node: "n1"}
@@ -222,7 +226,7 @@ func TestReplicaRefusalVerdictOutranksStaleIndex(t *testing.T) {
 	rd := resolvedDisk{diskCID: "d", stableID: "s"}
 	err := replicaRefusalVerdict(context.Background(), deps, "attach_disk", rd, "nfs:90000/vm-90000-disk-0.qcow2",
 		parker, 710, refusal)
-	if err == nil || !errors.Is(err, refusal) {
+	if err == nil || !errors.Is(err, refusal) || cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("err %v; the parker-named volume is refused with PVE's answer kept", err)
 	}
 	if err := replicaRefusalVerdict(context.Background(), deps, "attach_disk", rd, "nfs:700/vm-700-disk-0.qcow2",
@@ -230,6 +234,41 @@ func TestReplicaRefusalVerdictOutranksStaleIndex(t *testing.T) {
 		t.Fatalf("birth-named volume refused: %v", err)
 	}
 }
+
+// TestReplicaRefusalVerdictRetriesARefusalThatPasses checks that a refusal a
+// retry would not meet, because the VM's job is marked for removal or gone
+// since, is retriable, and so is one whose jobs cannot be read to tell, and
+// one whose storage cannot be classified for a failed lookup.
+func TestReplicaRefusalVerdictRetriesARefusalThatPasses(t *testing.T) {
+	parker := pve.DiskHolder{Found: true, IsParker: true, VMID: 90000, Node: "n1"}
+	rd := resolvedDisk{diskCID: "d", stableID: "s"}
+	cases := map[string]func(repl *fakeReplica, deps *Deps){
+		"job marked for removal": func(repl *fakeReplica, _ *Deps) { repl.jobs[0].RemoveJob = "full" },
+		"job gone since":         func(repl *fakeReplica, _ *Deps) { repl.jobs = nil },
+		"job list unreadable":    func(repl *fakeReplica, _ *Deps) { repl.listErr = errors.New("connection reset") },
+		"storage lookup failed": func(_ *fakeReplica, deps *Deps) {
+			deps.Resolver = failingResolver{err: cpierrors.Retriable("storage index: connection reset")}
+		},
+	}
+	for name, mutate := range cases {
+		repl := newFakeReplica()
+		repl.addJob("710-0", "n1", "n2", "operator job")
+		deps := Deps{Config: &config.CPIConfig{Node: "n1"}, Logger: log.NewNopLogger(), Replication: repl}
+		deps.Resolver = infoResolver{base: backendResolverOrDefault(deps),
+			info: pve.StorageInfo{Type: pve.StorageTypeNFS, Shared: true}}
+		mutate(repl, &deps)
+		err := replicaRefusalVerdict(context.Background(), deps, "attach_disk", rd,
+			"nfs:90000/vm-90000-disk-0.qcow2", parker, 710, pve.ErrMoveDiskReplicationRefused)
+		if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+			t.Fatalf("%s: err %v, want a retriable error", name, err)
+		}
+	}
+}
+
+// failingResolver is a backend resolver whose every lookup fails with err.
+type failingResolver struct{ err error }
+
+func (f failingResolver) Resolve(context.Context, string) (pve.Backend, error) { return nil, f.err }
 
 // TestAttachPreflightRefusesReplicatedReassign checks that the HA preflight
 // refuses, from profile facts alone, an attach PVE would refuse, so the VM
@@ -296,3 +335,118 @@ func TestAttachToAReplicateVMWithSourceOnlyPinIsGuarded(t *testing.T) {
 		t.Fatalf("new pin %v drops the source", h.newPin.NodeNames())
 	}
 }
+
+// TestManagedAttachOfAParkerNamedDiskWaitsForALeavingJob is the attach of a
+// disk a parker holds under its own name into a VM whose only job is marked
+// for removal. PVE refuses the reassignment while the job is configured, and
+// the refusal is retriable because pvesr removes the job on its next run. Once
+// the job is gone, the same attach lands by reassignment.
+func TestManagedAttachOfAParkerNamedDiskWaitsForALeavingJob(t *testing.T) {
+	deps, client, jr, id, cid := lifecycleFlowFixture(t)
+	deps.Config.DetachedDiskStrategy = "parked"
+	deps.Logger = log.NewNopLogger()
+	deps.Agent = legacyDestroyAgent{}
+	_, serial, _ := strings.Cut(client.state.configs[777]["scsi1"].(string), "serial=")
+	serial, _, _ = strings.Cut(serial, ",")
+	for step, call := range []func(*testing.T, Deps, string) error{digestDetach, digestAttach, digestDetach} {
+		if err := call(t, deps, cid); err != nil {
+			t.Fatalf("step %d: %v", step, err)
+		}
+	}
+	parker, parked := diskHolderBySerial(t, client, serial)
+	if parker == 777 || !fakeVolumeOwnedBy(parked, parker) {
+		t.Fatalf("VM %d holds %s, want a parker under its own name", parker, parked)
+	}
+	deps.Resolver = infoResolver{base: backendResolverOrDefault(deps),
+		info: pve.StorageInfo{Type: pve.StorageTypeNFS, Shared: true, Content: "images"}}
+	repl := newFakeReplica()
+	repl.addJob("777-0", "n1", "n2", "operator job")
+	repl.jobs[0].RemoveJob = "full"
+	deps.Replication, client.replication = repl, repl
+	client.moveCalls = 0
+	err := digestAttach(t, deps, cid)
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !strings.Contains(err.Error(), "777-0") {
+		t.Fatalf("err %v; a refusal from a job on its way out is retriable", err)
+	}
+	if holder, _ := diskHolderBySerial(t, client, serial); holder != parker || len(client.destroyed) != 0 {
+		t.Fatalf("VM %d holds the disk, destroyed %v; the refused attach leaves it on parker %d", holder,
+			client.destroyed, parker)
+	}
+	repl.jobs = nil
+	if err := digestAttach(t, deps, cid); err != nil {
+		t.Fatalf("attach once the job is gone: %v", err)
+	}
+	if holder, volume := diskHolderBySerial(t, client, serial); holder != 777 ||
+		!strings.Contains(volume, "vm-777-") {
+		t.Fatalf("VM %d holds %s, want VM 777 under its own name", holder, volume)
+	}
+	record, err := jr.Inspect(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State == aj.ReconciliationRequired {
+		t.Fatalf("the retried attach left the record asking for reconciliation: %q", record.Reason)
+	}
+}
+
+// TestManagedAttachRetiresTheJobOfAVMOutOfHA is the attach of a disk a parker
+// holds under its own name into a VM that left HA under a release that kept
+// its replicate tag and this Director's job. The attach retires the job with
+// cleanup and removes the tag before the disk enters, so the reassignment
+// lands rather than meeting PVE's refusal.
+func TestManagedAttachRetiresTheJobOfAVMOutOfHA(t *testing.T) {
+	deps, client, jr, id, cid := lifecycleFlowFixture(t)
+	deps.Config.DetachedDiskStrategy = "parked"
+	deps.Logger = log.NewNopLogger()
+	deps.Agent = legacyDestroyAgent{}
+	_, serial, _ := strings.Cut(client.state.configs[777]["scsi1"].(string), "serial=")
+	serial, _, _ = strings.Cut(serial, ",")
+	for step, call := range []func(*testing.T, Deps, string) error{digestDetach, digestAttach, digestDetach} {
+		if err := call(t, deps, cid); err != nil {
+			t.Fatalf("step %d: %v", step, err)
+		}
+	}
+	parker, parked := diskHolderBySerial(t, client, serial)
+	if parker == 777 || !fakeVolumeOwnedBy(parked, parker) {
+		t.Fatalf("VM %d holds %s, want a parker under its own name", parker, parked)
+	}
+	deps.Config.HA = &config.HAConfig{Mode: haChoiceOf(config.HAModeAuto),
+		LocalPolicy: haChoiceOf(config.HALocalPolicyReplicate)}
+	profile := stagingProfile(config.HAModeAuto)
+	profile.Nodes = []ha.NodeFacts{{Name: "n1", Online: true, Version: "9.2.4"},
+		{Name: "n2", Online: true, Version: "9.2.4"}}
+	deps.HAProfile = func(context.Context) (*ha.Profile, error) { return profile, nil }
+	deps.Resolver = infoResolver{base: backendResolverOrDefault(deps),
+		info: pve.StorageInfo{Type: pve.StorageTypeNFS, Shared: true, Content: "images"}}
+	client.state.configs[777]["tags"] = "bosh-cpi;" + haReplicaTag
+	repl := newFakeReplica()
+	repl.source = "n1"
+	repl.removeOnSchedule = true
+	repl.addJob("777-0", "n1", "n2", renderReplicaJobMarker(aaDirector, 1))
+	deps.Replication, client.replication = repl, repl
+	client.moveCalls = 0
+	_, err := HandleAttachDisk(deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, "777"), planJSON(t, cid)},
+		jsonrpc.Context{DirectorUUID: aaDirector})
+	if err != nil {
+		t.Fatalf("attach into the VM out of HA: %v", err)
+	}
+	if !repl.called("delete:777-0:force=false") || repl.called("delete:777-0:force=true") || len(repl.jobs) != 0 {
+		t.Fatalf("calls %v jobs %v; the job goes with cleanup and is never forced", repl.calls, repl.jobs)
+	}
+	if tags, _ := pve.ConfigString(client.state.configs[777], "tags"); hasReplicaTag(tags) {
+		t.Fatalf("tags %q keep the replicate tag", tags)
+	}
+	if holder, volume := diskHolderBySerial(t, client, serial); holder != 777 ||
+		!strings.Contains(volume, "vm-777-") || client.replicationAnswers != 0 {
+		t.Fatalf("VM %d holds %s after %d refusals, want VM 777 under its own name by reassignment", holder,
+			volume, client.replicationAnswers)
+	}
+	record, err := jr.Inspect(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State == aj.ReconciliationRequired {
+		t.Fatalf("the attach left the record asking for reconciliation: %q", record.Reason)
+	}
+}
+
