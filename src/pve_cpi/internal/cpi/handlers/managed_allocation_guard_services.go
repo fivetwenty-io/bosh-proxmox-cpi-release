@@ -676,6 +676,34 @@ func (t *managedStorageService) DeleteVolume(ctx context.Context, node, storageN
 	return err
 }
 
+// moveRequestRefusalProof names the refusal that PVE answered a move request
+// with, before any task, or returns nil when err is no such refusal. Nothing
+// moved after any of them, so the step settles by readback and the guard
+// stays usable.
+//
+// A digest refusal means a configuration changed after its digest was read.
+// A snapshot refusal means a snapshot or another drive key still names the
+// volume, and a move onto a parker settles by readback while any other move
+// keeps the guard's failure path. A replication refusal means the receiving
+// VM has a replication job and the volume's storage cannot replicate, so the
+// step settles in either direction and the attach's config-edit fallback
+// stays admissible. The task checks the replication again under the
+// configuration locks, and a job set up after the request makes it exit with
+// the same sentence, which the guard's After settles the same way.
+func moveRequestRefusalProof(ctx context.Context, err error) any {
+	switch {
+	case err == nil || ctx.Err() != nil:
+		return nil
+	case pve.IsMoveDigestRefusal(err):
+		return managedMoveDigestRefusal{}
+	case pve.IsMoveSnapshotRefusalAnswer(err):
+		return managedMoveSnapshotRefusal{}
+	case pve.IsMoveReplicationRefusal(err):
+		return managedMoveReplicationRefusal{}
+	}
+	return nil
+}
+
 func (t *managedNodesService) CreateQemuMoveDisk(ctx context.Context, node, vmid string, params *nodes.CreateQemuMoveDiskParams) (resp *nodes.CreateQemuMoveDiskResponse, err error) {
 	m := ManagedAllocationMutation{Service: managedServiceNodes, Method: "CreateQemuMoveDisk", Args: map[string]any{resourceTypeNode: node, metadataKeyVMID: vmid, managedArgumentParams: params}}
 	token, err := t.guard.begin(ctx, m)
@@ -684,28 +712,8 @@ func (t *managedNodesService) CreateQemuMoveDisk(ctx context.Context, node, vmid
 	}
 	defer t.guard.end(ctx, m, token)
 	resp, err = t.Service.CreateQemuMoveDisk(ctx, node, vmid, params)
-	if err != nil && ctx.Err() == nil && pve.IsMoveDigestRefusal(err) {
-		// PVE refused the move in the request, before any task, because a
-		// configuration changed after its digest was read. Nothing moved, so
-		// the step settles by readback and the guard stays usable.
-		return nil, t.guard.settleRefused(ctx, m, token, managedMoveDigestRefusal{}, err)
-	}
-	if err != nil && ctx.Err() == nil && pve.IsMoveSnapshotRefusalAnswer(err) {
-		// PVE refused the move in the request, before any task, because a
-		// snapshot or another drive key still names the volume. Nothing
-		// moved, so a move onto a parker settles by readback and the guard
-		// stays usable. Any other move keeps the guard's failure path.
-		return nil, t.guard.settleRefused(ctx, m, token, managedMoveSnapshotRefusal{}, err)
-	}
-	if err != nil && ctx.Err() == nil && pve.IsMoveReplicationRefusal(err) {
-		// PVE refused the move in the request, before any task, because the
-		// receiving VM has a replication job and the volume's storage cannot
-		// replicate. Nothing moved, so the step settles by readback in either
-		// direction, and the attach's config-edit fallback stays admissible.
-		// The task checks again under the configuration locks, and a job set
-		// up after the request makes it exit with the same sentence; the
-		// guard's After settles that exit the same way.
-		return nil, t.guard.settleRefused(ctx, m, token, managedMoveReplicationRefusal{}, err)
+	if proof := moveRequestRefusalProof(ctx, err); proof != nil {
+		return nil, t.guard.settleRefused(ctx, m, token, proof, err)
 	}
 	err = t.guard.finish(ctx, m, token, resp, err)
 	return

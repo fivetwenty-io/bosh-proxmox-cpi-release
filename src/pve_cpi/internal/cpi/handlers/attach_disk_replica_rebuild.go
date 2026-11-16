@@ -147,41 +147,15 @@ func prepareAttachReplicaRebuild(
 		if pinPartner == "" || pinPartner != loc.Node {
 			return nil, nil
 		}
-		// PVE HA failed the VM over to its partner, and no call has narrowed
-		// the pin to the node it runs on now. The touch calls' reconcile does
-		// that, and the rebuild then runs from the new source.
-		if err := reconcileVMReplica(ctx, deps, op, vmCID, vmid, loc, logger); err != nil {
-			return nil, err
-		}
-		pin, source, _, err = readOwnedReplicaPin(ctx, deps, vmid)
+		pin, err = narrowReplicaPinAfterFailover(ctx, deps, logger, vmCID, vmid, loc)
 		if err != nil {
-			return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("%s: read the pin of replicated VM %d after its failover", op, vmid))
-		}
-		if pin == nil || source != loc.Node {
-			return nil, cpierrors.Retriable("%s: VM %d runs on node %s after a failover, and its pin does not name "+
-				"that node as its source yet; the attach waits until the pin is reconciled", op, vmid, loc.Node)
+			return nil, err
 		}
 		pending, rebuilding = ha.ReplicaRebuild(pin.Comment)
 	}
-	jobs, err := replicationAPIFor(deps).ListJobs(ctx)
-	if err != nil {
-		return nil, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("%s: list the replication jobs of VM %d", op, vmid))
-	}
-	owned, foreign, err := guestReplicaJobs(jobs, vmid, deps.RequestDirectorUUID)
-	if err != nil {
-		return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, op+": read the VM's replication jobs")
-	}
-	if len(foreign) > 0 {
-		return nil, nil
-	}
-	partner := pending
-	if !rebuilding && owned != nil {
-		partner = replicaOtherNode(*owned, loc.Node)
-	}
-	if partner == "" {
-		return nil, nil
+	owned, partner, err := replicaRebuildJob(ctx, deps, vmid, loc.Node, pending, rebuilding)
+	if err != nil || partner == "" {
+		return nil, err
 	}
 	rb := &attachReplicaRebuild{vmCID: vmCID, vmid: vmid, partner: partner}
 	switch {
@@ -216,6 +190,59 @@ func prepareAttachReplicaRebuild(
 	// needs no rebuild now. The finish keeps the job, writes its marker for the
 	// journal's generation, and removes the token.
 	return rb, nil
+}
+
+// replicaRebuildJob reads the replication jobs of the VM vmid on node and
+// returns this Director's job, if it has one, and the partner the rebuild
+// sets the job up toward. That partner is the one the token names while a
+// rebuild is under way, and otherwise the job's other node. A VM with any job
+// of another Director, or with no partner to name, returns no partner, and
+// the attach's own checks answer it. A read that fails is retriable.
+func replicaRebuildJob(
+	ctx context.Context, deps Deps, vmid int, node, pending string, rebuilding bool,
+) (*ha.ReplicaJobState, string, error) {
+	const op = replicaRebuildOp
+	jobs, err := replicationAPIFor(deps).ListJobs(ctx)
+	if err != nil {
+		return nil, "", cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: list the replication jobs of VM %d", op, vmid))
+	}
+	owned, foreign, err := guestReplicaJobs(jobs, vmid, deps.RequestDirectorUUID)
+	if err != nil {
+		return nil, "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, op+": read the VM's replication jobs")
+	}
+	if len(foreign) > 0 {
+		return nil, "", nil
+	}
+	if !rebuilding && owned != nil {
+		return owned, replicaOtherNode(*owned, node), nil
+	}
+	return owned, pending, nil
+}
+
+// narrowReplicaPinAfterFailover handles a VM that PVE HA failed over to its
+// pin's partner when no call has narrowed the pin to the node the VM runs on
+// now. The touch calls' reconcile narrows it, and the rebuild then runs from
+// the new source. It returns the pin as it reads after the reconcile. A pin
+// that still does not name the VM's node as its source is retriable, because
+// the attach waits until the pin is reconciled.
+func narrowReplicaPinAfterFailover(
+	ctx context.Context, deps Deps, logger *log.Logger, vmCID string, vmid int, loc pve.VMLocation,
+) (*ha.Rule, error) {
+	const op = replicaRebuildOp
+	if err := reconcileVMReplica(ctx, deps, op, vmCID, vmid, loc, logger); err != nil {
+		return nil, err
+	}
+	pin, source, _, err := readOwnedReplicaPin(ctx, deps, vmid)
+	if err != nil {
+		return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: read the pin of replicated VM %d after its failover", op, vmid))
+	}
+	if pin == nil || source != loc.Node {
+		return nil, cpierrors.Retriable("%s: VM %d runs on node %s after a failover, and its pin does not name "+
+			"that node as its source yet; the attach waits until the pin is reconciled", op, vmid, loc.Node)
+	}
+	return pin, nil
 }
 
 // replicaRebuildCandidate reports, from what the attach resolved, whether the

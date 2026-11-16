@@ -437,6 +437,27 @@ func requestRefusedMove(result any) bool {
 	return false
 }
 
+// settleFailedTask answers a lifecycle task that failed. A move task that
+// refused before its rename moved nothing, so its step settles by readback.
+// Every other failure requires reconciliation.
+func (g *managedDiskLifecycleGuard) settleFailedTask(
+	ctx context.Context, key, step string, observation managedDiskMutationObservation, err error,
+) error {
+	if key == "Nodes.CreateQemuMoveDisk" && (pve.IsMoveDigestRefusal(err) || pve.IsMoveReplicationRefusalTaskExit(err)) {
+		// The move task checked both digests under the configuration locks,
+		// or found the receiving VM replicated when it checked again under
+		// them, and it refused before its rename, so nothing moved.
+		return g.settleRefusedMove(ctx, step, observation)
+	}
+	if observation.ontoParker && pve.IsMoveSnapshotRefusalTaskExit(err) {
+		// The move task found the volume still in use when it checked again
+		// under the configuration locks, and it refused before its rename,
+		// so nothing moved onto the parker.
+		return g.settleSnapshotRefusedMove(ctx, key, step, observation)
+	}
+	return fmt.Errorf("managed lifecycle task outcome requires reconciliation")
+}
+
 func (g *managedDiskLifecycleGuard) after(ctx context.Context, call ManagedAllocationMutation, step string, result any) error {
 	m := g.lifecycle
 	observation, ok := g.observations[step]
@@ -490,24 +511,7 @@ func (g *managedDiskLifecycleGuard) after(ctx context.Context, call ManagedAlloc
 			return err
 		}
 		if err := pve.AwaitTask(ctx, m.deps.PVE, observation.node, upid); err != nil {
-			if key == "Nodes.CreateQemuMoveDisk" && pve.IsMoveDigestRefusal(err) {
-				// The move task checked both digests under the configuration
-				// locks and refused before its rename, so nothing moved.
-				return g.settleRefusedMove(ctx, step, observation)
-			}
-			if key == "Nodes.CreateQemuMoveDisk" && pve.IsMoveReplicationRefusalTaskExit(err) {
-				// The move task found the receiving VM replicated when it
-				// checked again under the configuration locks, and it refused
-				// before its rename, so nothing moved.
-				return g.settleRefusedMove(ctx, step, observation)
-			}
-			if observation.ontoParker && pve.IsMoveSnapshotRefusalTaskExit(err) {
-				// The move task found the volume still in use when it checked
-				// again under the configuration locks, and it refused before
-				// its rename, so nothing moved onto the parker.
-				return g.settleSnapshotRefusedMove(ctx, key, step, observation)
-			}
-			return fmt.Errorf("managed lifecycle task outcome requires reconciliation")
+			return g.settleFailedTask(ctx, key, step, observation, err)
 		}
 		observation.upid = upid
 	}

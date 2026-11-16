@@ -162,7 +162,7 @@ func TestPrepareAttachReplicaRebuild_RefusedAttachKeepsTheJob(t *testing.T) {
 	r := newRebuildRig()
 	r.setPin("pve01,pve02", func(c string) string { return ha.WithReplicaPartner(c, "pve02") })
 	pin := r.pinComment()
-	r.deps.PVE.(*attachRunClient).lrClient.qemu.snapshots = []map[string]any{
+	r.deps.PVE.(*attachRunClient).qemu.snapshots = []map[string]any{
 		{"name": "before-upgrade"}, {"name": "current"},
 	}
 	rb, err := prepareAttachReplicaRebuild(crhCtx(), r.deps, "100", parkedNFSDisk())
