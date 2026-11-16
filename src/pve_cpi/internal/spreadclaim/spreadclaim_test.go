@@ -197,7 +197,7 @@ func TestPickWithoutTheRecordStillChooses(t *testing.T) {
 		}
 		return "pve1"
 	})
-	if err == nil || !called || node != "pve1" {
+	if !errors.Is(err, ErrUnavailable) || !called || node != "pve1" {
 		t.Fatalf("node %q err %v called %v; want the pick to run and the busy lock reported", node, err, called)
 	}
 }
@@ -209,7 +209,7 @@ func TestPickRewritesADamagedRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	node, err := mustClaim(t, s, "g", time.Now().Add(time.Hour)).Pick(context.Background(), leastClaimed("pve1"))
-	if node != "pve1" || err == nil {
+	if node != "pve1" || !errors.Is(err, ErrRewritten) || errors.Is(err, ErrUnavailable) {
 		t.Fatalf("node %q err %v; want the pick and the damaged read reported", node, err)
 	}
 	var seen map[string]int
@@ -283,5 +283,174 @@ func TestConcurrentPicksSpreadEvenly(t *testing.T) {
 		if picks[n] != creates/3 {
 			t.Fatalf("picks = %v; want %d on every node", picks, creates/3)
 		}
+	}
+}
+
+// TestReleaseOfAnUnrecordedClaimDoesNotWait pins that a claim whose pick could
+// not take the record's lock gives up at once, without a second wait on the
+// same stuck lock.
+func TestReleaseOfAnUnrecordedClaimDoesNotWait(t *testing.T) {
+	t.Parallel()
+	s := testStore(t, nil)
+	s.LockWait = 200 * time.Millisecond
+	root, err := os.OpenRoot(s.Dir.Override)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	held, err := endpointcache.LockFile(context.Background(), root, LockFileName, Name, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Close() }()
+	c := mustClaim(t, s, "g", time.Now().Add(time.Hour))
+	if _, err := c.Pick(context.Background(), leastClaimed("pve1")); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("pick err = %v; want the busy lock", err)
+	}
+	if err := c.Bind(context.Background(), 101); err != nil {
+		t.Fatalf("bind of an unrecorded claim = %v; want nothing to do", err)
+	}
+	start := time.Now()
+	if err := c.Release(context.Background()); err != nil {
+		t.Fatalf("release = %v; want nothing to remove", err)
+	}
+	if waited := time.Since(start); waited >= s.LockWait {
+		t.Fatalf("release waited %v for a lock it had nothing to change under", waited)
+	}
+}
+
+// TestPickReportsAFailedWriteAfterCounting pins that a write that fails after
+// the record was read is told apart from a record that could not be used.
+func TestPickReportsAFailedWriteAfterCounting(t *testing.T) {
+	t.Parallel()
+	s := testStore(t, nil)
+	// A directory in the record's place fails both the read and the rename
+	// that writes the record, while the lock works.
+	if err := os.Mkdir(filepath.Join(s.Dir.Override, FileName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	c := mustClaim(t, s, "g", time.Now().Add(time.Hour))
+	node, err := c.Pick(context.Background(), func(map[string]int) string {
+		called = true
+		return "pve2"
+	})
+	if node != "pve2" || !called {
+		t.Fatalf("node %q called %v; want the pick made under the lock", node, called)
+	}
+	if !errors.Is(err, ErrNotRecorded) || errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v; want the failed write reported, and not an unavailable record", err)
+	}
+	start := time.Now()
+	if err := c.Release(context.Background()); err != nil || time.Since(start) > time.Second {
+		t.Fatalf("release = %v; want nothing to remove for a claim no write recorded", err)
+	}
+}
+
+// TestPickExceptLeavesOutTaggedVMIDs pins that a claim whose VM the caller
+// already counts from its member tag counts once, and that a claim without a
+// VMID still counts.
+func TestPickExceptLeavesOutTaggedVMIDs(t *testing.T) {
+	t.Parallel()
+	s := testStore(t, nil)
+	exp := time.Now().Add(time.Hour)
+	bound := mustClaim(t, s, "g", exp)
+	if err := bound.Move(context.Background(), "pve1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bound.Bind(context.Background(), 101); err != nil {
+		t.Fatal(err)
+	}
+	if err := mustClaim(t, s, "g", exp).Move(context.Background(), "pve1"); err != nil {
+		t.Fatal(err)
+	}
+	var seen map[string]int
+	if _, err := mustClaim(t, s, "g", exp).PickExcept(context.Background(),
+		func(vmid int) bool { return vmid == 101 },
+		func(counts map[string]int) string { seen = counts; return "" }); err != nil {
+		t.Fatal(err)
+	}
+	if seen["pve1"] != 1 {
+		t.Fatalf("counts = %v; want only the claim whose VM is not tagged yet", seen)
+	}
+	// A move to another attempt's node forgets the old VMID.
+	if err := bound.Move(context.Background(), "pve2"); err != nil {
+		t.Fatal(err)
+	}
+	if bound.VMID() != 0 {
+		t.Fatalf("vmid = %d after a move; want none until the next bind", bound.VMID())
+	}
+}
+
+// TestClaimsOfGoneProcessesDoNotCount pins the liveness check on a host with
+// a boot identity: a claim from a process of this boot that has ended, or from
+// an earlier boot, stops counting, while one whose process runs, one from
+// another PID namespace, and one without a PID all keep counting.
+func TestClaimsOfGoneProcessesDoNotCount(t *testing.T) {
+	t.Parallel()
+	exp := time.Now().Add(time.Hour)
+	dir := endpointcache.DirOptions{Override: privateDir(t)}
+	alive := func(pid int) bool { return pid != 11 }
+	maker := func(pid int, boot string) *Store {
+		return &Store{Dir: dir, Scope: "s", Process: func() (int, string) { return pid, boot }, Alive: alive}
+	}
+	// The earlier boot's claim is written first, because a writer of a later
+	// boot prunes it, as it should.
+	for _, tc := range []struct {
+		node string
+		pid  int
+		boot string
+	}{
+		{"earlier-boot", 12, "b0/ns1"},
+		{"running", 10, "b1/ns1"},
+		{"ended", 11, "b1/ns1"},
+		{"other-namespace", 13, "b1/ns2"},
+		{"no-pid", 0, "b1/ns1"},
+		{"no-boot", 14, ""},
+	} {
+		if err := mustClaim(t, maker(tc.pid, tc.boot), "g", exp).Move(context.Background(), tc.node); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reader := maker(99, "b1/ns1")
+	var seen map[string]int
+	if _, err := mustClaim(t, reader, "g", exp).Pick(context.Background(), func(c map[string]int) string {
+		seen = c
+		return ""
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for node, want := range map[string]int{"running": 1, "ended": 0, "earlier-boot": 0, "other-namespace": 1,
+		"no-pid": 1, "no-boot": 1} {
+		if seen[node] != want {
+			t.Errorf("claims on %s = %d; want %d (counts %v)", node, seen[node], want, seen)
+		}
+	}
+	// A reader without a boot identity knows nothing about any process.
+	blindDir := endpointcache.DirOptions{Override: privateDir(t)}
+	writer := &Store{Dir: blindDir, Scope: "s", Process: func() (int, string) { return 11, "b1/ns1" },
+		Alive: func(int) bool { return true }}
+	if err := mustClaim(t, writer, "g", exp).Move(context.Background(), "ended"); err != nil {
+		t.Fatal(err)
+	}
+	blind := &Store{Dir: blindDir, Scope: "s", Process: func() (int, string) { return 98, "" },
+		Alive: func(int) bool { return false }}
+	if _, err := mustClaim(t, blind, "g", exp).Pick(context.Background(), func(c map[string]int) string {
+		seen = c
+		return ""
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if seen["ended"] != 1 {
+		t.Fatalf("counts = %v; want the claim counted by a reader without a boot identity", seen)
+	}
+}
+
+// TestProcessAliveSeesThisProcess pins the operating system check on this
+// process, which runs.
+func TestProcessAliveSeesThisProcess(t *testing.T) {
+	t.Parallel()
+	if !processAlive(os.Getpid()) {
+		t.Fatal("this process reads as gone")
 	}
 }

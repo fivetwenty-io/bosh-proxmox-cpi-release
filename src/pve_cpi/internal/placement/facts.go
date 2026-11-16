@@ -56,6 +56,7 @@ type clusterStatusItem struct {
 type NodeResource struct {
 	Type   string             `json:"type"`
 	Node   string             `json:"node"`
+	VMID   sdkclient.PVEInt   `json:"vmid"`
 	Name   string             `json:"name"`   // VM name; used for group tag matching
 	Tags   string             `json:"tags"`   // space-separated PVE tags
 	Maxmem sdkclient.PVEInt   `json:"maxmem"` // configured guest memory or total node memory
@@ -164,7 +165,7 @@ func GatherNodeFacts(
 
 	// Phase 2: node compute counters, guest count, group tags, and committed
 	// memory from ListResources (non-fatal).
-	guestCounts, sameGroupCounts, committedMem, nodeResources := gatherResourceFacts(ctx, clusterClient, logger, opts)
+	guestCounts, sameGroup, committedMem, nodeResources := gatherResourceFacts(ctx, clusterClient, logger, opts)
 
 	// Phase 3: per-node storage query (non-fatal per node).
 	storageAvail, storageTotal := gatherStorageFacts(ctx, nodesClient, logger, nodeItems, opts.StorageName)
@@ -206,7 +207,8 @@ func GatherNodeFacts(
 			CPUUsed:           cpuUsed,
 			MaxCPU:            item.Maxcpu.Int(),
 			GuestCount:        guestCounts[nodeName],
-			SameGroupCount:    sameGroupCounts[nodeName],
+			SameGroupCount:    len(sameGroup[nodeName]),
+			SameGroupVMIDs:    sameGroup[nodeName],
 		})
 	}
 
@@ -239,7 +241,8 @@ func gatherNodeHealth(
 }
 
 // gatherResourceFacts reads node compute counters and tallies QEMU guest
-// count, same-group count, and committed memory from one resource observation.
+// count, the same-group members' VMIDs, and committed memory from one resource
+// observation.
 // Errors are non-fatal. On failure all maps are empty; nodes retain any
 // available status counters and have no observed guest reservations.
 //
@@ -255,9 +258,9 @@ func gatherResourceFacts(
 	clusterClient ClusterClient,
 	logger *log.Logger,
 	opts GatherOptions,
-) (guestCounts map[string]int, sameGroupCounts map[string]int, committedMem map[string]int64, nodeResources map[string]NodeResource) {
+) (guestCounts map[string]int, sameGroup map[string][]int, committedMem map[string]int64, nodeResources map[string]NodeResource) {
 	guestCounts = make(map[string]int)
-	sameGroupCounts = make(map[string]int)
+	sameGroup = make(map[string][]int)
 	committedMem = make(map[string]int64)
 	nodeResources = make(map[string]NodeResource)
 
@@ -265,10 +268,10 @@ func gatherResourceFacts(
 	if resErr != nil {
 		logger.Warn("placement: ListResources failed — GuestCount=0 for all nodes",
 			log.Err(resErr))
-		return guestCounts, sameGroupCounts, committedMem, nodeResources
+		return guestCounts, sameGroup, committedMem, nodeResources
 	}
 	if resResp == nil {
-		return guestCounts, sameGroupCounts, committedMem, nodeResources
+		return guestCounts, sameGroup, committedMem, nodeResources
 	}
 	for _, raw := range *resResp {
 		var ri clusterResourceItem
@@ -287,11 +290,11 @@ func gatherResourceFacts(
 		}
 		guestCounts[ri.Node]++
 		if inGroup(ri.Tags, opts) {
-			sameGroupCounts[ri.Node]++
+			sameGroup[ri.Node] = append(sameGroup[ri.Node], int(ri.VMID.Int()))
 		}
 		committedMem[ri.Node] += ri.Maxmem.Int()
 	}
-	return guestCounts, sameGroupCounts, committedMem, nodeResources
+	return guestCounts, sameGroup, committedMem, nodeResources
 }
 
 // gatherStorageFacts queries per-node storage availability for storageName.

@@ -51,18 +51,25 @@ func newSpreadRecord(t *testing.T, deps *handlers.Deps) *spreadRecord {
 		t.Fatal(err)
 	}
 	store := &spreadclaim.Store{Dir: endpointcache.DirOptions{Override: dir}, Scope: "lab"}
-	deps.SpreadClaims = func(*config.CPIConfig, *log.Logger) *spreadclaim.Store { return store }
+	deps.SpreadClaims = func(*config.CPIConfig, string, *log.Logger) *spreadclaim.Store { return store }
 	return &spreadRecord{store: store, key: handlers.SpreadClaimKey(*deps, spreadEnv())}
 }
 
 // counts returns the live claims per node. It records nothing itself.
 func (r *spreadRecord) counts() (map[string]int, error) {
+	return r.countsWithTagged(nil)
+}
+
+// countsWithTagged returns the live claims per node that a sibling counts
+// when its facts already count the VMIDs that tagged reports from their
+// member tag.
+func (r *spreadRecord) countsWithTagged(tagged func(vmid int) bool) (map[string]int, error) {
 	c, err := r.store.NewClaim(r.key, time.Now().Add(time.Hour))
 	if err != nil {
 		return nil, err
 	}
 	var seen map[string]int
-	_, err = c.Pick(context.Background(), func(m map[string]int) string {
+	_, err = c.PickExcept(context.Background(), tagged, func(m map[string]int) string {
 		seen = maps.Clone(m)
 		return ""
 	})
@@ -78,7 +85,13 @@ type claimsSeen struct {
 }
 
 func (c *claimsSeen) observe(r *spreadRecord) {
-	m, err := r.counts()
+	c.observeTagged(r, nil)
+}
+
+// observeTagged is observe for a sibling whose facts count the VMIDs that
+// tagged reports.
+func (c *claimsSeen) observeTagged(r *spreadRecord, tagged func(vmid int) bool) {
+	m, err := r.countsWithTagged(tagged)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.seen = append(c.seen, m)
@@ -106,23 +119,26 @@ func assertNoClaims(t *testing.T, r *spreadRecord) {
 	}
 }
 
-// TestCreateVM_SpreadClaimHeldWhileTheCloneRunsAndReleasedAfter checks that a
-// create holds the claim on the node it picked while PVE builds the VM, which
-// is when a sibling could otherwise miss it, and gives it up once the VM is
-// built and carries the member tag.
-func TestCreateVM_SpreadClaimHeldWhileTheCloneRunsAndReleasedAfter(t *testing.T) {
+// TestCreateVM_SpreadClaimHeldUntilTheCreateReturns checks that a create
+// holds the claim on the node it picked until create_vm returns, so a sibling
+// that read the member tags before the tag landed still counts it. Once the
+// create has allocated its VM, the claim names the VMID, and a sibling whose
+// facts already count that VM from its tag leaves the claim out.
+func TestCreateVM_SpreadClaimHeldUntilTheCreateReturns(t *testing.T) {
 	t.Parallel()
 	var (
-		rec  *spreadRecord
-		seen claimsSeen
+		rec    *spreadRecord
+		seen   claimsSeen
+		tagged claimsSeen
 	)
 	q := &vmMockQEMU{
 		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
 			seen.observe(rec)
 			return "UPID:" + node + ":create:ok", nil
 		},
-		startFn: func(_ context.Context, node string, _ int) (string, error) {
+		startFn: func(_ context.Context, node string, vmid int) (string, error) {
 			seen.observe(rec)
+			tagged.observeTagged(rec, func(v int) bool { return v == vmid })
 			return "UPID:" + node + ":start:ok", nil
 		},
 	}
@@ -133,14 +149,54 @@ func TestCreateVM_SpreadClaimHeldWhileTheCloneRunsAndReleasedAfter(t *testing.T)
 	if _, err := handlers.HandleCreateVM(deps).Handle(context.Background(), spreadArgs(), mkCtx("spread-single")); err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	if err := errors.Join(append(seen.errs, tagged.errs...)...); err != nil {
+		t.Fatal(err)
+	}
+	// The build and the start both see the claim on pve1.
+	want := map[string]int{"pve1": 1}
+	if len(seen.seen) != 2 || !maps.Equal(seen.seen[0], want) || !maps.Equal(seen.seen[1], want) {
+		t.Fatalf("claims at the build and the start = %v; want %v at both", seen.seen, want)
+	}
+	// A sibling that counts the new VM from its tag leaves the claim out.
+	if len(tagged.seen) != 1 || len(tagged.seen[0]) != 0 {
+		t.Fatalf("claims a sibling that counts the tagged VM sees = %v; want none", tagged.seen)
+	}
+	assertNoClaims(t, rec)
+}
+
+// TestCreateVM_SpreadClaimForAPinnedCreate checks that a create that
+// target_node pins claims its node while PVE builds the VM, so the siblings
+// that score meanwhile count it.
+func TestCreateVM_SpreadClaimForAPinnedCreate(t *testing.T) {
+	t.Parallel()
+	var (
+		rec  *spreadRecord
+		seen claimsSeen
+	)
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
+			seen.observe(rec)
+			return "UPID:" + node + ":create:ok", nil
+		},
+	}
+	deps := buildVMDepsPlacement(q, &vmMockNodes{}, listStatusTwoNodes(), emptyListResources, &vmMockAgent{},
+		spreadAntiAffinityOn)
+	rec = newSpreadRecord(t, &deps)
+	args := mkArgs("spread-agent", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512, "target_node": "pve2"},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{},
+		spreadEnv(),
+	)
+
+	if _, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx("spread-pinned")); err != nil {
+		t.Fatalf("create: %v", err)
+	}
 	if err := errors.Join(seen.errs...); err != nil {
 		t.Fatal(err)
 	}
-	// The build sees the claim on pve1, and the start sees none, because the
-	// built VM carries the member tag by then.
-	want := []map[string]int{{"pve1": 1}, {}}
-	if len(seen.seen) != len(want) || !maps.Equal(seen.seen[0], want[0]) || len(seen.seen[1]) != 0 {
-		t.Fatalf("claims at the build and the start = %v; want %v", seen.seen, want)
+	if want := map[string]int{"pve2": 1}; len(seen.seen) != 1 || !maps.Equal(seen.seen[0], want) {
+		t.Fatalf("claims at the build = %v; want %v", seen.seen, want)
 	}
 	assertNoClaims(t, rec)
 }
@@ -165,8 +221,8 @@ func TestCreateVM_SpreadClaimReleasedWhenTheCreateFails(t *testing.T) {
 }
 
 // TestCreateVM_Fallback_SpreadClaimMovesToTheAlternate checks that a create
-// that falls back to an alternate holds its claim there while the alternate's
-// VM is built, and holds nothing once it returns.
+// that falls back to an alternate holds its claim there until create_vm
+// returns, and holds nothing after.
 func TestCreateVM_Fallback_SpreadClaimMovesToTheAlternate(t *testing.T) {
 	t.Parallel()
 	var (
@@ -198,9 +254,9 @@ func TestCreateVM_Fallback_SpreadClaimMovesToTheAlternate(t *testing.T) {
 	if err := errors.Join(seen.errs...); err != nil {
 		t.Fatal(err)
 	}
-	// The failed build on pve1 sees the claim there, the alternate's build
-	// sees it on pve2, and the alternate's start sees none.
-	want := []map[string]int{{"pve1": 1}, {"pve2": 1}, {}}
+	// The failed build on pve1 sees the claim there, and the alternate's
+	// build and start see it on pve2.
+	want := []map[string]int{{"pve1": 1}, {"pve2": 1}, {"pve2": 1}}
 	if len(seen.seen) != len(want) {
 		t.Fatalf("claims per build = %v; want %v", seen.seen, want)
 	}

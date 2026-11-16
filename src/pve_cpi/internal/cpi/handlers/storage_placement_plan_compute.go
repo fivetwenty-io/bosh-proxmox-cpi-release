@@ -142,6 +142,7 @@ func rankStorageComputeGroups(ctx context.Context, deps Deps, parsed *createVMPa
 	cfg := deps.Config
 	var err error
 	var groups []StoragePlanNodeGroup
+	var passes []azPass
 	for _, az := range azs {
 		if err = ctx.Err(); err != nil {
 			return nil, planError(StoragePlanObservation, "%v", err)
@@ -175,13 +176,37 @@ func rankStorageComputeGroups(ctx context.Context, deps Deps, parsed *createVMPa
 				eligible = append(eligible, fact)
 			}
 		}
-		_, nodes := scoreAndPickWithRanked(eligible, weights, deps.Log(ctx), az)
-		if len(nodes) > 0 {
-			haNodes := storageComputeHANodes(deps, parsed, az, nodes, facts)
-			groups = append(groups, StoragePlanNodeGroup{AZ: az, Nodes: nodes, HANodes: haNodes})
+		passes = append(passes, azPass{az: az, eligible: eligible})
+	}
+	rank := func(counts map[string]int) string {
+		groups = groups[:0]
+		for _, p := range passes {
+			_, nodes := scoreAndPickWithRanked(withClaimCounts(p.eligible, counts, deps.Log(ctx)), weights, deps.Log(ctx), p.az)
+			if len(nodes) > 0 {
+				haNodes := storageComputeHANodes(deps, parsed, p.az, nodes, facts)
+				groups = append(groups, StoragePlanNodeGroup{AZ: p.az, Nodes: nodes, HANodes: haNodes})
+			}
 		}
+		if len(groups) == 0 {
+			return ""
+		}
+		return groups[0].Nodes[0]
+	}
+	// The ranking counts the claims of the group's creates in flight, and
+	// claims the top-ranked node for now. The create moves the claim to the
+	// node its plan settles on.
+	if s := parsed.spread; s != nil {
+		s.pick(ctx, facts, rank)
+	} else {
+		rank(nil)
 	}
 	return groups, nil
+}
+
+// azPass is one AZ's nodes that pass the compute, PCI, and network checks.
+type azPass struct {
+	az       string
+	eligible []placement.NodeFacts
 }
 
 func storageComputeHANodes(deps Deps, parsed *createVMParsedArgs, az string, nodes []string, facts []placement.NodeFacts) []string {

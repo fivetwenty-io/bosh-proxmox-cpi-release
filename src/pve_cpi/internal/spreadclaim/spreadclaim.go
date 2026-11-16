@@ -7,8 +7,15 @@
 // Director creates a group's VMs in parallel, so creates that score at the same
 // time see none of each other and can all pick the same node. Each create
 // therefore claims the node it picks in this record, and every create counts
-// the live claims of its group on top of the tagged members. A create gives up
-// its claim once its clone is configured and the tag carries the count.
+// the live claims of its group on top of the tagged members. A create keeps
+// its claim until it returns, because a sibling can read the tags before the
+// create's tag lands and the claims after. Once the create has allocated its
+// VM, the claim names the VMID, and a sibling that already counts that VMID
+// from its tag leaves the claim out, so the member counts once.
+//
+// A claim whose create crashed lapses at that create's deadline. On a host
+// that reports its boot identity, as Linux does, a claim also stops counting
+// as soon as the process that made it is gone.
 //
 // All of a Director's CPI processes run on one host, and a group's tag names
 // its Director, so a record in the CPI's cache directory reaches every create
@@ -86,7 +93,29 @@ type entry struct {
 	Group   string `json:"group"`
 	Node    string `json:"node"`
 	Expires int64  `json:"expires_unix"`
+	// VMID is the VM the create allocated, or 0 before it has one.
+	VMID int `json:"vmid,omitempty"`
+	// PID and Boot name the process that made the claim. Boot is the host's
+	// boot identity, which is empty where the host does not report one.
+	PID  int    `json:"pid,omitempty"`
+	Boot string `json:"boot,omitempty"`
 }
+
+// Errors that Pick, Move, Bind, and Release return, which errors.Is matches.
+var (
+	// ErrUnavailable means the record could not be used at all, because its
+	// directory is unusable or another create's turn did not end in time.
+	// Nothing was counted or recorded.
+	ErrUnavailable = errors.New("the spread claim record is not available")
+
+	// ErrRewritten means the record could not be read, so it was rewritten
+	// from an empty one. The claims it held are lost.
+	ErrRewritten = errors.New("the spread claim record could not be read and was rewritten")
+
+	// ErrNotRecorded means the claims were read but the write of this claim
+	// failed, so siblings do not see it.
+	ErrNotRecorded = errors.New("the spread claim was not recorded")
+)
 
 // Store is the record of one cluster entry's claims. The zero value uses the
 // default cache directory, an empty scope, and the system clock.
@@ -111,6 +140,14 @@ type Store struct {
 	// LockWait overrides DefaultLockWait. Zero means DefaultLockWait.
 	LockWait time.Duration
 
+	// Process names the running process for the claims it makes. Nil means
+	// this process and the host's boot identity.
+	Process func() (pid int, boot string)
+
+	// Alive reports whether a process of this host and boot still runs. Nil
+	// asks the operating system.
+	Alive func(pid int) bool
+
 	// warnOnce lets the missing-directory Warn through once per store.
 	warnOnce sync.Once
 }
@@ -123,6 +160,10 @@ type Claim struct {
 	group   string
 	expires time.Time
 	node    string
+	vmid    int
+	// recorded is true while the record may hold this claim, so a Release
+	// that has nothing to remove never waits for the record.
+	recorded bool
 }
 
 // NewClaim returns an unrecorded claim for a create in group that ends at
@@ -156,62 +197,119 @@ func (c *Claim) Node() string {
 // far or none, so the create picks as it would without the record. The error
 // says why for the caller to log, and the node is still returned.
 func (c *Claim) Pick(ctx context.Context, choose func(counts map[string]int) string) (string, error) {
+	return c.PickExcept(ctx, nil, choose)
+}
+
+// PickExcept is Pick, except that a claim whose VMID tagged reports leaves the
+// counts. The caller passes the VMIDs it already counts from their member tag,
+// so a sibling whose VM carries the tag counts once. A nil tagged counts every
+// live claim.
+//
+// The error matches ErrUnavailable when choose ran without the record's
+// claims, ErrRewritten when the record was damaged and rewritten, and
+// ErrNotRecorded when choose saw the claims but this claim's write failed.
+func (c *Claim) PickExcept(ctx context.Context, tagged func(vmid int) bool,
+	choose func(counts map[string]int) string) (string, error) {
 	if c == nil {
 		return choose(nil), nil
 	}
 	var node string
-	err := c.store.withRecord(ctx, func(rec *record, now time.Time) bool {
-		node = choose(c.counts(rec, now))
+	counted := false
+	wrote, err := c.store.withRecord(ctx, func(rec *record, now time.Time) bool {
+		counted = true
+		node = choose(c.counts(rec, now, tagged))
 		if node == "" {
 			return false
 		}
-		c.put(rec, node)
+		c.put(rec, node, 0)
 		return true
 	})
-	if err != nil && node == "" {
+	if !counted {
 		node = choose(nil)
 	}
 	if node != "" {
-		c.node = node
+		c.node, c.vmid = node, 0
+		c.recorded = c.recorded || wrote
 	}
 	return node, err
 }
 
 // Move records this claim on node, as a create does when it tries another
-// node after an attempt failed on the one it picked.
+// node after an attempt failed on the one it picked. The claim names no VMID
+// until Bind names the VM of the new attempt.
 func (c *Claim) Move(ctx context.Context, node string) error {
 	if c == nil || node == "" {
 		return nil
 	}
-	c.node = node
-	return c.store.withRecord(ctx, func(rec *record, _ time.Time) bool {
-		c.put(rec, node)
+	c.node, c.vmid = node, 0
+	wrote, err := c.store.withRecord(ctx, func(rec *record, _ time.Time) bool {
+		c.put(rec, node, 0)
 		return true
 	})
+	c.recorded = c.recorded || wrote
+	return err
 }
 
-// Release removes this claim from the record. A claim that holds no node
-// touches nothing, so calling it again is free.
+// Bind names vmid as the VM this claim's create allocated on the node it
+// holds. A claim that was never recorded touches nothing.
+func (c *Claim) Bind(ctx context.Context, vmid int) error {
+	if c == nil || c.node == "" || vmid <= 0 {
+		return nil
+	}
+	c.vmid = vmid
+	if !c.recorded {
+		return nil
+	}
+	_, err := c.store.withRecord(ctx, func(rec *record, _ time.Time) bool {
+		e, ok := rec.Claims[c.id]
+		if !ok || e.VMID == vmid {
+			return false
+		}
+		c.put(rec, c.node, vmid)
+		return true
+	})
+	return err
+}
+
+// VMID returns the VMID Bind named, or 0.
+func (c *Claim) VMID() int {
+	if c == nil {
+		return 0
+	}
+	return c.vmid
+}
+
+// Release removes this claim from the record. A claim that holds no node, or
+// that no write ever recorded, touches nothing, so calling it again is free
+// and a record whose lock is stuck costs no second wait.
 func (c *Claim) Release(ctx context.Context) error {
 	if c == nil || c.node == "" {
 		return nil
 	}
-	c.node = ""
-	return c.store.withRecord(ctx, func(rec *record, _ time.Time) bool {
+	c.node, c.vmid = "", 0
+	if !c.recorded {
+		return nil
+	}
+	c.recorded = false
+	_, err := c.store.withRecord(ctx, func(rec *record, _ time.Time) bool {
 		if _, ok := rec.Claims[c.id]; !ok {
 			return false
 		}
 		delete(rec.Claims, c.id)
 		return true
 	})
+	return err
 }
 
 // counts returns the live claims of the group per node in the store's scope,
-// leaving this claim out.
-func (c *Claim) counts(rec *record, now time.Time) map[string]int {
+// leaving out this claim and every claim whose VMID tagged reports.
+func (c *Claim) counts(rec *record, now time.Time, tagged func(vmid int) bool) map[string]int {
 	out := map[string]int{}
 	for id, e := range rec.Claims {
-		if id == c.id || e.Scope != c.store.Scope || e.Group != c.group || !live(e, now) {
+		if id == c.id || e.Scope != c.store.Scope || e.Group != c.group || !c.store.counts(e, now) {
+			continue
+		}
+		if e.VMID > 0 && tagged != nil && tagged(e.VMID) {
 			continue
 		}
 		out[e.Node]++
@@ -219,14 +317,55 @@ func (c *Claim) counts(rec *record, now time.Time) map[string]int {
 	return out
 }
 
-func (c *Claim) put(rec *record, node string) {
-	rec.Claims[c.id] = entry{Scope: c.store.Scope, Group: c.group, Node: node, Expires: c.expires.Unix()}
+func (c *Claim) put(rec *record, node string, vmid int) {
+	pid, boot := c.store.process()
+	rec.Claims[c.id] = entry{Scope: c.store.Scope, Group: c.group, Node: node, Expires: c.expires.Unix(),
+		VMID: vmid, PID: pid, Boot: boot}
 }
 
-// live reports whether a claim still counts at now.
+// counts reports whether a claim still counts at now. It must be live, and
+// the process that made it must not be known to be gone.
+func (s *Store) counts(e entry, now time.Time) bool {
+	return live(e, now) && !s.gone(e)
+}
+
+// live reports whether a claim is within its lifetime at now.
 func live(e entry, now time.Time) bool {
 	exp := time.Unix(e.Expires, 0)
 	return e.Node != "" && exp.After(now) && !exp.After(now.Add(MaxClaimLifetime+endpointcache.FutureSkew))
+}
+
+// gone reports whether the process that made e is known to have ended. That
+// is so when e was made in an earlier boot of this host, or in this boot and
+// PID namespace by a process that no longer runs. Without a boot identity on
+// either side, or from another PID namespace, nothing is known, and the claim
+// lapses at its expiry.
+func (s *Store) gone(e entry) bool {
+	if e.PID <= 0 || e.Boot == "" {
+		return false
+	}
+	_, boot := s.process()
+	if boot == "" {
+		return false
+	}
+	if e.Boot == boot {
+		return !s.alive(e.PID)
+	}
+	return bootID(e.Boot) != bootID(boot)
+}
+
+func (s *Store) process() (int, string) {
+	if s.Process != nil {
+		return s.Process()
+	}
+	return os.Getpid(), hostBootIdentity()
+}
+
+func (s *Store) alive(pid int) bool {
+	if s.Alive != nil {
+		return s.Alive(pid)
+	}
+	return processAlive(pid)
 }
 
 func (s *Store) now() time.Time {
@@ -244,20 +383,22 @@ func (s *Store) lockWait() time.Duration {
 }
 
 // withRecord runs change on the record under its lock and writes the record
-// when change reports a change. Claims that no longer count are pruned on
-// every write. A record that cannot be read is rewritten from an empty one,
-// and the read's error is returned with any write error.
-func (s *Store) withRecord(ctx context.Context, change func(rec *record, now time.Time) bool) error {
+// when change reports a change, and it reports whether that write landed.
+// Claims that no longer count are pruned on every write. A record that cannot
+// be read is rewritten from an empty one, and the read's error is returned
+// with any write error. change never runs when the error matches
+// ErrUnavailable.
+func (s *Store) withRecord(ctx context.Context, change func(rec *record, now time.Time) bool) (bool, error) {
 	choice := s.resolve()
 	if !choice.Usable() {
-		return fmt.Errorf("spread claim: %w", choice.Err)
+		return false, fmt.Errorf("spread claim: %w: %w", ErrUnavailable, choice.Err)
 	}
 	root := choice.Root
 	defer func() { _ = root.Close() }()
 
 	lock, err := endpointcache.LockFile(ctx, root, LockFileName, Name, s.lockWait())
 	if err != nil {
-		return fmt.Errorf("spread claim: %w", err)
+		return false, fmt.Errorf("spread claim: %w: %w", ErrUnavailable, err)
 	}
 	defer func() { _ = lock.Close() }()
 
@@ -266,6 +407,8 @@ func (s *Store) withRecord(ctx context.Context, change func(rec *record, now tim
 		rec = record{}
 		if errors.Is(readErr, fs.ErrNotExist) {
 			readErr = nil
+		} else {
+			readErr = fmt.Errorf("%w: %w", ErrRewritten, readErr)
 		}
 	}
 	if rec.Claims == nil {
@@ -273,21 +416,21 @@ func (s *Store) withRecord(ctx context.Context, change func(rec *record, now tim
 	}
 	now := s.now()
 	if !change(&rec, now) {
-		return readErr
+		return false, readErr
 	}
-	prune(&rec, now)
+	s.prune(&rec, now)
 	writeErr := policy.WriteEnvelope(root, FileName, recordVersion, rec, privatefile.NoSyncOps())
 	if writeErr != nil {
-		writeErr = fmt.Errorf("spread claim: write %s: %w", FileName, writeErr)
+		writeErr = fmt.Errorf("spread claim: %w: write %s: %w", ErrNotRecorded, FileName, writeErr)
 	}
-	return errors.Join(readErr, writeErr)
+	return writeErr == nil, errors.Join(readErr, writeErr)
 }
 
 // prune drops the claims that no longer count, and then the claims that
 // expire first while the record holds more than maxClaims.
-func prune(rec *record, now time.Time) {
+func (s *Store) prune(rec *record, now time.Time) {
 	for id, e := range rec.Claims {
-		if !live(e, now) {
+		if !s.counts(e, now) {
 			delete(rec.Claims, id)
 		}
 	}

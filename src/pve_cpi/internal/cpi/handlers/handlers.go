@@ -129,10 +129,12 @@ type Deps struct {
 	HARuleSleep func(ctx context.Context, d time.Duration) error
 	// SpreadClaims returns the record in which concurrent creates of an
 	// instance group claim the nodes they pick, so the soft spread counts the
-	// siblings whose create is still running. main wires
-	// EndpointCacheSpreadClaims. Nil (every existing test literal) turns the
-	// claims off, and the spread counts only the members already tagged.
-	SpreadClaims func(cfg *config.CPIConfig, logger *log.Logger) *spreadclaim.Store
+	// siblings whose create is still running. clusterStamp is the create's
+	// cluster stamp, which names the cluster the claims count in. main wires
+	// EndpointCacheSpreadClaims. Nil (every existing test literal), or a nil
+	// store, turns the claims off, and the spread counts only the members
+	// already tagged.
+	SpreadClaims func(cfg *config.CPIConfig, clusterStamp string, logger *log.Logger) *spreadclaim.Store
 }
 
 // EffectiveISOStorage returns the pool config-drive ISOs live on for this

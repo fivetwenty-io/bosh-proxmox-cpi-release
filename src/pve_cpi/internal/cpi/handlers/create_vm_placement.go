@@ -39,6 +39,9 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 	if err != nil {
 		return nil, err
 	}
+	// A scored pick already claimed node. A pin, or a fallback past the
+	// scoring, claims it here.
+	parsed.spread.hold(ctx, node)
 	return buildVMShapeForNode(ctx, deps, parsed, node)
 }
 
@@ -66,6 +69,7 @@ func resolveVMShapeWithAlternates(
 	if nodeErr != nil {
 		return nil, nil, nodeErr
 	}
+	parsed.spread.hold(ctx, winner)
 
 	s, err := buildVMShapeForNode(ctx, deps, parsed, winner)
 	if err != nil {

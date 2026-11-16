@@ -140,6 +140,11 @@ type NodeFacts struct {
 	// SameGroupCount is the number of VMs on this node belonging to the same
 	// BOSH instance group as the VM being placed. Used by the anti-affinity axis.
 	SameGroupCount int
+
+	// SameGroupVMIDs lists the VMIDs that SameGroupCount counts from their
+	// member tag, in the order cluster/resources listed them. A VMID PVE left
+	// out reads as 0.
+	SameGroupVMIDs []int
 }
 
 // Request describes placement requirements for a single VM create operation.

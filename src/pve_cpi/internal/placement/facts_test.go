@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -451,6 +452,39 @@ func TestGatherNodeFacts_SameGroupCount(t *testing.T) {
 	}
 	if facts[0].SameGroupCount != 2 {
 		t.Errorf("SameGroupCount = %d; want 2", facts[0].SameGroupCount)
+	}
+}
+
+// TestGatherNodeFacts_SameGroupVMIDs checks that the facts name the VMIDs of
+// the members they count, which is how a create's spread leaves out the claim
+// of a sibling whose tag already counts.
+func TestGatherNodeFacts_SameGroupVMIDs(t *testing.T) {
+	t.Parallel()
+	resp := cluster.ListStatusResponse{statusNode("pve1", 8, 8*gib, 4*gib, 1, 0)}
+	member := func(vmid int, name, tags string) json.RawMessage {
+		raw, _ := json.Marshal(map[string]any{"type": "qemu", "node": "pve1", "vmid": vmid, "name": name, "tags": tags})
+		return raw
+	}
+	resResp := cluster.ListResourcesResponse{
+		member(101, "web-0", "deployment--cf;job--web;index--0"),
+		member(102, "db-0", "deployment--cf;job--db;index--0"),
+		member(103, "web-1", "deployment--cf;job--web;index--1"),
+	}
+	cl := &stubCluster{statusResp: &resp, resResp: &resResp}
+
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, &stubNodes{}, nopLogger(),
+		placement.GatherOptions{GroupTag: "job--web"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(facts) != 1 {
+		t.Fatalf("expected 1 fact")
+	}
+	if got := facts[0].SameGroupVMIDs; !slices.Equal(got, []int{101, 103}) {
+		t.Errorf("SameGroupVMIDs = %v; want [101 103]", got)
+	}
+	if facts[0].SameGroupCount != len(facts[0].SameGroupVMIDs) {
+		t.Errorf("SameGroupCount = %d; want one per member VMID", facts[0].SameGroupCount)
 	}
 }
 

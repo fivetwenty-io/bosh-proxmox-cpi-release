@@ -2,17 +2,24 @@ package handlers
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/spreadclaim"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // spreadClaimStore returns a claim record in a new directory that only this
@@ -36,7 +43,7 @@ func spreadDeps(store *spreadclaim.Store) Deps {
 		})
 	deps.RequestDirectorUUID = aaDirector
 	if store != nil {
-		deps.SpreadClaims = func(*config.CPIConfig, *log.Logger) *spreadclaim.Store { return store }
+		deps.SpreadClaims = func(*config.CPIConfig, string, *log.Logger) *spreadclaim.Store { return store }
 	}
 	return deps
 }
@@ -49,14 +56,21 @@ func spreadParsed() *createVMParsedArgs {
 // resolveVMShape does, through the create's claim.
 func placeSibling(t *testing.T, deps Deps, claims *spreadClaims) string {
 	t.Helper()
-	group := antiAffinityScorerGroup(deps, aaEnvForWebGroup())
-	group.claims = claims
-	node, _, err := resolveTargetNodeWithBridges(context.Background(), deps, createVMCloudProps{}, group, nil, nil,
-		nil, 0, bridgePlan{})
+	node, err := trySibling(deps, claims)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return node
+}
+
+// trySibling is placeSibling for a goroutine, which must not stop the test
+// itself, so it returns the error instead.
+func trySibling(deps Deps, claims *spreadClaims) (string, error) {
+	group := antiAffinityScorerGroup(deps, aaEnvForWebGroup())
+	group.claims = claims
+	node, _, err := resolveTargetNodeWithBridges(context.Background(), deps, createVMCloudProps{}, group, nil, nil,
+		nil, 0, bridgePlan{})
+	return node, err
 }
 
 func mustSpreadClaims(t *testing.T, deps Deps) *spreadClaims {
@@ -93,33 +107,38 @@ func TestSpreadClaims_ParallelSiblingsPickDistinctNodes(t *testing.T) {
 		wg    sync.WaitGroup
 		mu    sync.Mutex
 		picks []string
+		errs  []error
 	)
 	start := make(chan struct{})
 	for _, c := range claims {
 		wg.Go(func() {
 			<-start
-			node := placeSibling(t, deps, c)
+			node, err := trySibling(deps, c)
 			mu.Lock()
 			defer mu.Unlock()
 			picks = append(picks, node)
+			errs = append(errs, err)
 		})
 	}
 	close(start)
 	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		t.Fatal(err)
+	}
 	slices.Sort(picks)
 	if want := []string{"pve1", "pve2", "pve3"}; !slices.Equal(picks, want) {
 		t.Fatalf("picks = %v; want one sibling on each node %v", picks, want)
 	}
 	for _, c := range claims {
 		if c.claim.Node() == "" {
-			t.Error("every create must hold the node it picked until its clone carries the tag")
+			t.Error("every create must hold the node it picked until create_vm returns")
 		}
 	}
 }
 
 // TestSpreadClaims_ReleasedClaimNoLongerCounts gives a claim up the way a
-// create does once its clone carries the member tag. The tag then carries the
-// count, so the claim must not count twice.
+// create does when create_vm returns. The member tag carries the count from
+// then on, so the claim must not count twice.
 func TestSpreadClaims_ReleasedClaimNoLongerCounts(t *testing.T) {
 	t.Parallel()
 	deps := spreadDeps(spreadClaimStore(t))
@@ -155,8 +174,10 @@ func TestSpreadClaims_MoveCountsOnTheAlternate(t *testing.T) {
 }
 
 // TestNewSpreadClaims_OnlyForACreateThatSpreads checks that a claim exists only
-// when placement scores nodes with the anti-affinity axis, so every other
-// create places exactly as before.
+// when placement spreads the instance group with the anti-affinity axis, so
+// every other create places exactly as before. A create that target_node pins
+// spreads nothing itself, but it claims its node so the siblings that score
+// while it clones count it.
 func TestNewSpreadClaims_OnlyForACreateThatSpreads(t *testing.T) {
 	t.Parallel()
 	store := spreadClaimStore(t)
@@ -185,7 +206,7 @@ func TestNewSpreadClaims_OnlyForACreateThatSpreads(t *testing.T) {
 			p := spreadParsed()
 			p.cloudProps.TargetNode = "pve2"
 			return p
-		}, false},
+		}, true},
 		{"no instance group", func() Deps { return spreadDeps(store) }, func() *createVMParsedArgs {
 			return &createVMParsedArgs{env: map[string]any{}}
 		}, false},
@@ -225,5 +246,224 @@ func TestSpreadClaimExpiry_FollowsTheCreateDeadline(t *testing.T) {
 	got := spreadClaimExpiry(context.Background(), spreadDeps(nil))
 	if budget := createVMIDClaimBudget(spreadDeps(nil)); got.Before(before.Add(budget)) {
 		t.Errorf("expiry = %v; want the create budget %v from now", got, budget)
+	}
+}
+
+// spreadFacts is three online nodes with room for any test VM.
+func spreadFacts() []placement.NodeFacts {
+	const gib = int64(1) << 30
+	out := make([]placement.NodeFacts, 0, 3)
+	for _, n := range []string{"pve1", "pve2", "pve3"} {
+		out = append(out, placement.NodeFacts{Node: n, Online: true, MaxCPU: 8, FreeMemBytes: 8 * gib,
+			TotalMemBytes: 8 * gib})
+	}
+	return out
+}
+
+// claimCounts returns the claims a create counts against facts, without
+// recording one itself.
+func claimCounts(t *testing.T, deps Deps, facts []placement.NodeFacts) map[string]int {
+	t.Helper()
+	var seen map[string]int
+	mustSpreadClaims(t, deps).pick(context.Background(), facts, func(m map[string]int) string {
+		seen = maps.Clone(m)
+		return ""
+	})
+	return seen
+}
+
+// TestSpreadClaims_TaggedSiblingCountsOnce checks that a sibling whose VM
+// already carries the member tag counts once. Its claim names its VMID, and a
+// create whose facts count that VMID from the tag leaves the claim out.
+func TestSpreadClaims_TaggedSiblingCountsOnce(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	deps := spreadDeps(spreadClaimStore(t))
+	a := mustSpreadClaims(t, deps)
+	a.move(ctx, "pve1")
+	a.bind(ctx, 101)
+	if got := a.claim.VMID(); got != 101 {
+		t.Fatalf("claim VMID = %d; want 101", got)
+	}
+
+	untagged := spreadFacts()
+	if got := claimCounts(t, deps, untagged); !maps.Equal(got, map[string]int{"pve1": 1}) {
+		t.Errorf("claims before the tag lands = %v; want the sibling's claim on pve1", got)
+	}
+	tagged := spreadFacts()
+	tagged[0].SameGroupCount, tagged[0].SameGroupVMIDs = 1, []int{101}
+	if got := claimCounts(t, deps, tagged); len(got) != 0 {
+		t.Errorf("claims once the tag counts VM 101 = %v; want none, so the sibling counts once", got)
+	}
+	other := spreadFacts()
+	other[0].SameGroupCount, other[0].SameGroupVMIDs = 1, []int{205}
+	if got := claimCounts(t, deps, other); !maps.Equal(got, map[string]int{"pve1": 1}) {
+		t.Errorf("claims when the tag counts another VM = %v; want the sibling's claim on pve1", got)
+	}
+}
+
+// TestSpreadClaims_PinnedCreateHoldsItsNode checks that a create that
+// target_node pins claims its node, so the siblings that score while it
+// clones leave that node for last.
+func TestSpreadClaims_PinnedCreateHoldsItsNode(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	deps := spreadDeps(spreadClaimStore(t))
+	pinned := spreadParsed()
+	pinned.cloudProps.TargetNode = "pve1"
+	s := newSpreadClaims(deps, pinned, time.Now().Add(time.Hour), deps.Logger)
+	if s == nil {
+		t.Fatal("a pinned create in a spread group must hold a claim")
+	}
+	s.hold(ctx, "pve1")
+	b := placeSibling(t, deps, mustSpreadClaims(t, deps))
+	c := placeSibling(t, deps, mustSpreadClaims(t, deps))
+	got := []string{b, c}
+	slices.Sort(got)
+	if want := []string{"pve2", "pve3"}; !slices.Equal(got, want) {
+		t.Fatalf("siblings of the pinned create picked %v; want %v", got, want)
+	}
+}
+
+// TestRankStorageComputeGroups_CountsAndClaimsThroughTheSpread checks that a
+// storage plan ranks the nodes with the claims of the group's creates in
+// flight, and claims the node it ranks first.
+func TestRankStorageComputeGroups_CountsAndClaimsThroughTheSpread(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	deps := spreadDeps(spreadClaimStore(t))
+	weights := placement.DefaultWeights()
+	eligible := map[string]bool{"pve1": true, "pve2": true, "pve3": true}
+	rank := func(parsed *createVMParsedArgs) string {
+		t.Helper()
+		groups, err := rankStorageComputeGroups(ctx, deps, parsed, []string{""}, "", spreadFacts(), weights, nil,
+			nil, 1, 1, 512, eligible)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(groups) == 0 || len(groups[0].Nodes) == 0 {
+			t.Fatal("the ranking returned no node")
+		}
+		return groups[0].Nodes[0]
+	}
+	first := rank(spreadParsed())
+	sibling := mustSpreadClaims(t, deps)
+	sibling.move(ctx, first)
+
+	parsed := spreadParsed()
+	parsed.spread = mustSpreadClaims(t, deps)
+	got := rank(parsed)
+	if got == first {
+		t.Fatalf("the plan ranked %q first, where a sibling's claim already sits", got)
+	}
+	if held := parsed.spread.claim.Node(); held != got {
+		t.Errorf("the plan's claim holds %q; want the node it ranked first, %q", held, got)
+	}
+}
+
+// TestSpreadClaimScope_NamesTheCluster checks that two cpi_config entries
+// that reach one cluster through different hosts share a scope, that two
+// clusters never do, and that an entry falls back to its endpoints only when
+// the cluster's stamp is unknown.
+func TestSpreadClaimScope_NamesTheCluster(t *testing.T) {
+	t.Parallel()
+	viaA := &config.CPIConfig{Host: "pve-a.example", Port: 8006}
+	viaB := &config.CPIConfig{Host: "pve-b.example", Port: 8006}
+	if a, b := spreadClaimScope(viaA, "1a2b3c4d"), spreadClaimScope(viaB, "1a2b3c4d"); a != b {
+		t.Errorf("one cluster through two hosts got scopes %q and %q; want one", a, b)
+	}
+	if a, b := spreadClaimScope(viaA, "1a2b3c4d"), spreadClaimScope(viaA, "5e6f7a8b"); a == b {
+		t.Errorf("two clusters share the scope %q", a)
+	}
+	for _, stamp := range []string{"", vmcid.UnknownCluster} {
+		got := spreadClaimScope(viaA, stamp)
+		if want := "endpoints:" + ha.EpisodeScope(viaA); got != want {
+			t.Errorf("stamp %q: scope = %q; want the endpoints fallback %q", stamp, got, want)
+		}
+		if got == spreadClaimScope(viaB, stamp) {
+			t.Errorf("stamp %q: two endpoints share the fallback scope %q", stamp, got)
+		}
+	}
+	if got := spreadClaimScope(&config.CPIConfig{}, vmcid.UnknownCluster); got != "" {
+		t.Errorf("an entry with no stamp and no endpoints got scope %q; want none", got)
+	}
+}
+
+// TestEndpointCacheSpreadClaims_SharesTheRecordAcrossHosts checks the
+// production source. A claim made through one host counts for a create that
+// reaches the same cluster through another, and an entry with no scope makes
+// no claims.
+func TestEndpointCacheSpreadClaims_SharesTheRecordAcrossHosts(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "cache")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	viaA := &config.CPIConfig{Host: "pve-a.example", Port: 8006, EndpointCacheDir: dir}
+	viaB := &config.CPIConfig{Host: "pve-b.example", Port: 8006, EndpointCacheDir: dir}
+	logger := log.NewNopLogger()
+	exp := time.Now().Add(time.Hour)
+	ctx := context.Background()
+
+	a := EndpointCacheSpreadClaims(viaA, "1a2b3c4d", logger)
+	if a == nil {
+		t.Fatal("an entry with a cluster stamp must have a claim record")
+	}
+	claim, err := a.NewClaim("web", exp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.Move(ctx, "pve1"); err != nil {
+		t.Fatal(err)
+	}
+	seen := func(store *spreadclaim.Store) map[string]int {
+		t.Helper()
+		c, err := store.NewClaim("web", exp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]int
+		if _, err := c.Pick(ctx, func(m map[string]int) string { got = maps.Clone(m); return "" }); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	if got := seen(EndpointCacheSpreadClaims(viaB, "1a2b3c4d", logger)); !maps.Equal(got, map[string]int{"pve1": 1}) {
+		t.Errorf("claims through the other host = %v; want the claim on pve1", got)
+	}
+	if got := seen(EndpointCacheSpreadClaims(viaB, "5e6f7a8b", logger)); len(got) != 0 {
+		t.Errorf("claims in another cluster = %v; want none", got)
+	}
+	if got := EndpointCacheSpreadClaims(&config.CPIConfig{EndpointCacheDir: dir}, "", logger); got != nil {
+		t.Error("an entry with no stamp and no endpoints must make no claims")
+	}
+}
+
+// TestSpreadClaims_PickErrorsSayWhatTheSpreadLost checks that each way a turn
+// with the record fails gets its own warning, so a log never says the claims
+// were unused when they were counted.
+func TestSpreadClaims_PickErrorsSayWhatTheSpreadLost(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{fmt.Errorf("open: %w", spreadclaim.ErrUnavailable), "could not be used"},
+		{fmt.Errorf("write: %w", spreadclaim.ErrNotRecorded), "counted the claims of in-flight siblings"},
+		{fmt.Errorf("decode: %w", spreadclaim.ErrRewritten), "was rewritten"},
+		{errors.New("other"), "the spread claim record failed"},
+	}
+	for _, tc := range cases {
+		logger, obs := log.NewObservedLogger(log.LevelInfo)
+		(&spreadClaims{logger: logger}).logPickError(tc.err)
+		entries := obs.All()
+		if len(entries) != 1 || !strings.Contains(entries[0].Message, tc.want) {
+			t.Errorf("%v: logged %+v; want one warning that says %q", tc.err, entries, tc.want)
+		}
+	}
+	logger, obs := log.NewObservedLogger(log.LevelInfo)
+	(&spreadClaims{logger: logger}).logPickError(nil)
+	if obs.Len() != 0 {
+		t.Errorf("a turn that worked logged %+v", obs.All())
 	}
 }
