@@ -75,7 +75,14 @@ func (m *managedVMAllocation) infrastructureMutationParameters(ctx context.Conte
 	}
 }
 
-// admitManagedVMHARuleEdit lets a rule update or delete through only when the
+// admitManagedVMHARuleEdit lets a rule update or delete through a VM
+// allocation's guard only when the rule is one of ours (see
+// admitOwnedHARuleEdit). A rule read that fails refuses the edit as it is.
+func (m *managedVMAllocation) admitManagedVMHARuleEdit(ctx context.Context, call ManagedAllocationMutation) error {
+	return admitOwnedHARuleEdit(ctx, m.deps, call, func(err error) error { return err })
+}
+
+// admitOwnedHARuleEdit lets a rule update or delete through only when the
 // rule is one of ours. Its name must be a CPI rule name, bosh-na- or bosh-aa-,
 // and the rule as read now must carry this Director's ownership marker. An
 // update must also write that marker. A delete of a rule that is already gone
@@ -91,12 +98,17 @@ func (m *managedVMAllocation) infrastructureMutationParameters(ctx context.Conte
 // exactly as it reads, so the migration can neither claim the rule nor strip
 // another writer's comment. Without the permit, an edit of an unmarked rule is
 // refused as before.
-func (m *managedVMAllocation) admitManagedVMHARuleEdit(ctx context.Context, call ManagedAllocationMutation) error {
+//
+// readFailed builds the refusal for a rule read that returned an error, so
+// each guard can say whether that refusal locks it.
+func admitOwnedHARuleEdit(
+	ctx context.Context, deps Deps, call ManagedAllocationMutation, readFailed func(error) error,
+) error {
 	rule, _ := call.Args["rule"].(string)
 	if !strings.HasPrefix(rule, naRuleNamePrefix) && !strings.HasPrefix(rule, haRuleNamePrefix) {
 		return fmt.Errorf("HA rule %q is not a CPI rule", rule)
 	}
-	owner := m.deps.RequestDirectorUUID
+	owner := deps.RequestDirectorUUID
 	if owner == "" {
 		return fmt.Errorf("HA rule %q edit lacks a Director to own it", rule)
 	}
@@ -109,9 +121,9 @@ func (m *managedVMAllocation) admitManagedVMHARuleEdit(ctx context.Context, call
 		}
 		params = p
 	}
-	existing, err := readManagedVMHARule(ctx, m.deps, rule)
+	existing, err := readManagedVMHARule(ctx, deps, rule)
 	if err != nil {
-		return err
+		return readFailed(err)
 	}
 	if existing == nil {
 		if update {

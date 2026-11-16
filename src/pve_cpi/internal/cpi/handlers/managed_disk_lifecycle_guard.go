@@ -151,6 +151,11 @@ func (g *managedDiskLifecycleGuard) before(ctx context.Context, call ManagedAllo
 	if err := m.requestEndedRefusal(ctx, call); err != nil {
 		return "", err
 	}
+	if !m.external && isLifecycleHAWrite(call) {
+		// An HA rule or resource write names no VM and no volume, so it is
+		// judged by whose rule or resource it is (see admitLifecycleHAWrite).
+		return g.admitLifecycleHAWrite(ctx, call)
+	}
 	node, _ := call.Args[resourceTypeNode].(string)
 	if node == "" {
 		node = m.diskNode()

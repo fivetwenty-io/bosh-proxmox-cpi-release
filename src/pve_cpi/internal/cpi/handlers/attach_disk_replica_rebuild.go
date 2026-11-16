@@ -43,9 +43,11 @@ const replicaRebuildOp = "attach_disk"
 // later attach_disk to the VM, whatever disk it attaches, finishes the
 // rebuild, and so does the next reboot_vm or set_vm_metadata (see
 // finishReplicaRebuild). The pin and the job are written outside the disk's
-// lifecycle, because the lifecycle guard admits no HA rule write, and because
-// the VM's journal record, which the removal and the setup hold, is never
-// acquired while a disk's record is held.
+// lifecycle, because the VM's journal record, which the removal and the setup
+// hold, is never acquired while a disk's record is held. The lifecycle guard
+// would admit the pin write, since it judges an HA rule write by its owner
+// (see admitLifecycleHAWrite), but the job's removal and setup could not run
+// there.
 
 // replicaRebuildKey marks a context whose attach removed the VM's
 // replication job for its reassignment.

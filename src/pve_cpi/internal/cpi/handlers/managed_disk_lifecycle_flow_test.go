@@ -97,6 +97,10 @@ type lifecycleFlowPVE struct {
 	unlisted map[int]bool
 	// moveCalls counts every move POST the fake received.
 	moveCalls int
+	// haStore, when set, holds the cluster's HA resources and rules, so a row
+	// can attach into a VM under PVE HA. Without it the VM has no HA resource
+	// and the cluster lists no HA rule.
+	haStore *lifecycleFlowHA
 	// moveDigests records the source and target digests each move POST
 	// carried, empty when the POST sent none.
 	moveDigests [][2]string
@@ -1430,13 +1434,74 @@ func (q lifecycleFlowQEMU) Stop(_ context.Context, _ string, vmid int) (string, 
 	}
 	return "UPID:n1:stop", nil
 }
-func (c lifecycleFlowCluster) GetHaResources(context.Context, string) (*cluster.GetHaResourcesResponse, error) {
+func (c lifecycleFlowCluster) GetHaResources(ctx context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {
+	if store := c.c.haStore; store != nil && store.resources[sid] {
+		resp, err := store.GetHaResources(ctx, sid)
+		if err == nil && store.states[sid] != "" {
+			state := store.states[sid]
+			resp.State = &state
+		}
+		return resp, err
+	}
 	return nil, &sdkerrors.APIError{Code: 404, Message: "not found"}
 }
 
-func (c lifecycleFlowCluster) ListHaRules(context.Context, *cluster.ListHaRulesParams) (*cluster.ListHaRulesResponse, error) {
+func (c lifecycleFlowCluster) ListHaRules(ctx context.Context, p *cluster.ListHaRulesParams) (*cluster.ListHaRulesResponse, error) {
+	if store := c.c.haStore; store != nil {
+		return store.ListHaRules(ctx, p)
+	}
 	r := cluster.ListHaRulesResponse{}
 	return &r, nil
+}
+
+// lifecycleFlowHA is the flow fake's HA store, a rule store with the HA
+// resources it serves and the state requested for each.
+type lifecycleFlowHA struct {
+	*naClusterStub
+	states map[string]string
+	// writes names every HA write the store received, in order.
+	writes []string
+}
+
+func newLifecycleFlowHA() *lifecycleFlowHA {
+	stub := newNAStub()
+	stub.members = []string{"n1", "n2"}
+	return &lifecycleFlowHA{naClusterStub: stub, states: map[string]string{}}
+}
+
+func (c lifecycleFlowCluster) CreateHaRules(ctx context.Context, p *cluster.CreateHaRulesParams) error {
+	c.c.haStore.writes = append(c.c.haStore.writes, "create-rule:"+p.Rule)
+	return c.c.haStore.CreateHaRules(ctx, p)
+}
+
+func (c lifecycleFlowCluster) UpdateHaRules(ctx context.Context, rule string, p *cluster.UpdateHaRulesParams) error {
+	c.c.haStore.writes = append(c.c.haStore.writes, "update-rule:"+rule)
+	return c.c.haStore.UpdateHaRules(ctx, rule, p)
+}
+
+func (c lifecycleFlowCluster) DeleteHaRules(ctx context.Context, rule string) error {
+	c.c.haStore.writes = append(c.c.haStore.writes, "delete-rule:"+rule)
+	return c.c.haStore.DeleteHaRules(ctx, rule)
+}
+
+func (c lifecycleFlowCluster) DeleteHaResources(ctx context.Context, sid string, p *cluster.DeleteHaResourcesParams) error {
+	c.c.haStore.writes = append(c.c.haStore.writes, "delete-resource:"+sid)
+	return c.c.haStore.DeleteHaResources(ctx, sid, p)
+}
+
+func (c lifecycleFlowCluster) UpdateHaResources(_ context.Context, sid string, p *cluster.UpdateHaResourcesParams) error {
+	store := c.c.haStore
+	store.writes = append(store.writes, "update-resource:"+sid)
+	if !store.resources[sid] {
+		return fmt.Errorf("no such resource %s", sid)
+	}
+	if p.State != nil {
+		store.states[sid] = *p.State
+	}
+	if p.Comment != nil {
+		store.resComments[sid] = *p.Comment
+	}
+	return nil
 }
 
 func (c *lifecycleFlowPVE) ClusterStorage() clusterstorage.Service {
@@ -1545,7 +1610,10 @@ func testLocalMigrationChargesDestination(t *testing.T, pmxcfs bool) {
 	}
 }
 
-func (c lifecycleFlowCluster) ListHaResources(context.Context, *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
+func (c lifecycleFlowCluster) ListHaResources(ctx context.Context, p *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
+	if store := c.c.haStore; store != nil {
+		return store.ListHaResources(ctx, p)
+	}
 	rows := cluster.ListHaResourcesResponse{}
 	return &rows, nil
 }

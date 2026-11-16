@@ -575,8 +575,10 @@ func replicaPinComment(comment string) bool {
 }
 
 // errAttachReaddGuarded is the refusal of an HA re-registration under the
-// managed disk lifecycle, whose guard admits no HA resource write and no
-// description write, so a re-registration there would poison the lifecycle.
+// managed disk lifecycle. Its guard admits this Director's pin writes and
+// requested-state updates (see admitLifecycleHAWrite), but no HA resource
+// creation and no description write, so a re-registration there would poison
+// the lifecycle.
 func (h *attachHA) errAttachReaddGuarded() error {
 	sid := haResourceSid(h.vmid)
 	return cpierrors.Retriable("%s: the HA resource of VM %d is in the error state, and the attach of a "+

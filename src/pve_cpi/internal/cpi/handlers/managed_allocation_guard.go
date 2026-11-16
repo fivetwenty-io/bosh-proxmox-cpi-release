@@ -61,6 +61,16 @@ type ManagedAllocationHooks struct {
 	SettleFailedWrite func(context.Context, ManagedAllocationMutation, string, error) bool
 }
 
+// managedUnjournaledStep is the intent token a Before hook returns for a
+// write it admits without journaling a step, because the write cannot change
+// what the guard's record tracks. The disk lifecycle admits this Director's HA
+// rule and resource writes this way (see admitLifecycleHAWrite): a pin or a
+// requested state names no volume, and its writer reads its own outcome back.
+// The guard sends such a write under its lock like any other, but it neither
+// calls After for it nor locks itself when it fails, and the failure goes back
+// to the caller unchanged.
+const managedUnjournaledStep = "unjournaled"
+
 // ManagedAllocationGuard serializes writes and blocks further mutations after uncertainty.
 //
 // One invariant holds this together and nothing enforces it mechanically, so it
@@ -153,13 +163,14 @@ func (g *ManagedAllocationGuard) admit(ctx context.Context, m ManagedAllocationM
 	}
 	if errors.Is(err, errManagedRequestEnded) || errors.Is(err, errManagedDescriptionDigestStale) ||
 		errors.Is(err, errManagedTailReadFailed) || errors.Is(err, errManagedAdmissionReadFailed) ||
-		errors.Is(err, errManagedHAResourceDeleteRefused) {
+		errors.Is(err, errManagedHAResourceDeleteRefused) || errors.Is(err, errManagedHAWriteRefused) {
 		// The request's context ended before or during the checks for this
 		// mutation, a description-only write carried a digest the guard's own
 		// read no longer matches, a read the guard makes to admit the
-		// mutation returned an error, or a VM allocation refused an HA
-		// resource removal that does not undo its own staging. Each refusal
-		// came before any intent was written or PVE was called. Nothing is
+		// mutation returned an error, a VM allocation refused an HA resource
+		// removal that does not undo its own staging, or a disk lifecycle
+		// refused an HA write that is not this Director's. Each refusal came
+		// before any intent was written or PVE was called. Nothing is
 		// uncertain, so the guard stays usable, the way a cut-off protection
 		// write leaves it.
 		g.mu.Unlock()
@@ -207,6 +218,11 @@ func (e *managedMutationNotAttempted) Unwrap() []error {
 	return []error{e.err, pve.ErrMutationNotAttempted}
 }
 func (g *ManagedAllocationGuard) finish(ctx context.Context, m ManagedAllocationMutation, token string, result any, err error) error {
+	if token == managedUnjournaledStep {
+		// No step records the write, so there is nothing to observe and
+		// nothing the write can leave uncertain.
+		return err
+	}
 	if err != nil && g.hooks.SettleProtectionWrites {
 		switch classifyProtectionWriteFailure(ctx, m, err) {
 		case protectionWriteCutOff:
@@ -258,6 +274,9 @@ func (g *ManagedAllocationGuard) finish(ctx context.Context, m ManagedAllocation
 // so that it can still classify it. If After cannot settle the step, the
 // refusal is treated like any other failure.
 func (g *ManagedAllocationGuard) settleRefused(ctx context.Context, m ManagedAllocationMutation, token string, proof any, refusal error) error {
+	if token == managedUnjournaledStep {
+		return refusal
+	}
 	if err := g.hooks.After(ctx, m, token, proof); err != nil {
 		return g.finish(ctx, m, token, nil, refusal)
 	}
