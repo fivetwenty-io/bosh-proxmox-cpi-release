@@ -583,9 +583,9 @@ func IsTransientTransport(err error) bool {
 	// Permanent 500-with-text shapes are excluded before the blanket 5xx rule
 	// below: PVE answers a request-shaped rejection with a 500 body rather than
 	// a 4xx, so "is a 5xx" alone cannot distinguish a cycling worker from a
-	// verdict that will never change. See IsVolumeFormatUnknown and
-	// IsStorageVolumeMissing.
-	if IsVolumeFormatUnknown(err) || IsStorageVolumeMissing(err) {
+	// verdict that will never change. See IsVolumeFormatUnknown,
+	// IsStorageVolumeMissing, and IsMoveReplicationRefusal.
+	if IsVolumeFormatUnknown(err) || IsStorageVolumeMissing(err) || IsMoveReplicationRefusal(err) {
 		return false
 	}
 	if errors.Is(err, sdkerrors.ErrServer) {

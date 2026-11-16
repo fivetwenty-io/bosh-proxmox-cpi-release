@@ -453,6 +453,12 @@ func (g *managedDiskLifecycleGuard) after(ctx context.Context, call ManagedAlloc
 	if _, refused := result.(managedMoveSnapshotRefusal); refused {
 		return g.settleSnapshotRefusedMove(ctx, key, step, observation)
 	}
+	if _, refused := result.(managedMoveReplicationRefusal); refused {
+		if key != "Nodes.CreateQemuMoveDisk" {
+			return fmt.Errorf("move refusal names another mutation")
+		}
+		return g.settleRefusedMove(ctx, step, observation)
+	}
 	async := key == "QEMU.Create" || key == "QEMU.ResizeDisk" || key == "QEMU.Snapshot" || key == "QEMU.DeleteSnapshot" || key == "Nodes.CreateQemuMoveDisk" || key == "Nodes.CreateQemuMigrate" || key == "Nodes.DeleteQemu" || strings.HasSuffix(call.Method, "Async")
 	if key == "Storage.DeleteVolumeIfExistsAsync" {
 		values, ok := result.([]any)
@@ -1377,6 +1383,11 @@ type managedMoveDigestRefusal struct{}
 // managedMoveSnapshotRefusal is the After result for a move PVE refused in
 // the request because a snapshot or another drive key still names the volume.
 type managedMoveSnapshotRefusal struct{}
+
+// managedMoveReplicationRefusal is the After result for a move PVE refused in
+// the request because the receiving VM has a replication job and the volume's
+// storage cannot replicate.
+type managedMoveReplicationRefusal struct{}
 
 // settleSnapshotRefusedMove settles a move that PVE refused because a
 // snapshot still names the volume. Only a move onto a parker settles, and any

@@ -697,6 +697,13 @@ func (t *managedNodesService) CreateQemuMoveDisk(ctx context.Context, node, vmid
 		// stays usable. Any other move keeps the guard's failure path.
 		return nil, t.guard.settleRefused(ctx, m, token, managedMoveSnapshotRefusal{}, err)
 	}
+	if err != nil && ctx.Err() == nil && pve.IsMoveReplicationRefusal(err) {
+		// PVE refused the move in the request, before any task, because the
+		// receiving VM has a replication job and the volume's storage cannot
+		// replicate. Nothing moved, so the step settles by readback in either
+		// direction, and the attach's config-edit fallback stays admissible.
+		return nil, t.guard.settleRefused(ctx, m, token, managedMoveReplicationRefusal{}, err)
+	}
 	err = t.guard.finish(ctx, m, token, resp, err)
 	return
 }

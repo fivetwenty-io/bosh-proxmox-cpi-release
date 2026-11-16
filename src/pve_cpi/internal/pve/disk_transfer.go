@@ -100,6 +100,47 @@ func stopOnMoveSnapshotRefusal(err error) error {
 	return errors.New(err.Error())
 }
 
+// ErrMoveDiskReplicationRefused wraps PVE's refusal to reassign a volume into
+// a VM that has a replication job when the volume's storage cannot replicate
+// ("Cannot move disk to a replicated VM. Storage does not support
+// replication!"). PVE makes that check in the request, before it forks the
+// move task, and it matches any job of the target guest, a disabled one
+// included, so the refusal holds for as long as the job exists. Only a ZFS
+// pool replicates, so a volume on NFS, Ceph, LVM, or a directory storage gets
+// it. Callers detect it with errors.Is.
+var ErrMoveDiskReplicationRefused = errors.New("move_disk refused: the target VM is replicated and the disk's storage " +
+	"does not support replication")
+
+// moveReplicationRefusalText is the start of the message PVE's reassign check
+// dies with when the target VM has a replication job and the volume's storage
+// cannot replicate.
+const moveReplicationRefusalText = "Cannot move disk to a replicated VM"
+
+// IsMoveReplicationRefusal reports whether err is PVE's refusal to reassign a
+// volume into a replicated VM. PVE sends its own sentence, and the check that
+// dies with it runs before the task is forked, so the text alone proves the
+// request moved nothing, even when the client reads the answer without an
+// HTTP status.
+func IsMoveReplicationRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrMoveDiskReplicationRefused) || strings.Contains(err.Error(), moveReplicationRefusalText)
+}
+
+// stopOnMoveReplicationRefusal ends the move's retry loop on PVE's refusal to
+// reassign a volume into a replicated VM. The answer can read as a transport
+// fault to the loop, and PVE refuses again for as long as the job exists, so
+// retrying only spends the parker's window. The refusal leaves the loop with
+// its text and without the transport error underneath it. Any other error
+// comes back unchanged.
+func stopOnMoveReplicationRefusal(err error) error {
+	if err == nil || errors.Is(err, ErrMoveDiskReplicationRefused) || !IsMoveReplicationRefusal(err) {
+		return err
+	}
+	return errors.New(err.Error())
+}
+
 // ErrMoveDiskDigestRefused wraps PVE's refusal of a move_disk reassignment
 // whose source or target configuration changed after the CPI read the digest
 // it sent. PVE compares both digests before it renames anything, once in the
@@ -457,7 +498,7 @@ func moveDiskToVMPinned(
 			pendingUPID = ""
 			return nil
 		}
-		return stopOnMoveSnapshotRefusal(inner)
+		return stopOnMoveReplicationRefusal(stopOnMoveSnapshotRefusal(inner))
 	})
 	if moveErr != nil && unanswered && (errFromDigestRead || IsMoveDigestRefusal(moveErr)) {
 		// The refusal or the read error comes from a later attempt, and the
@@ -485,6 +526,12 @@ func moveDiskToVMPinned(
 		if IsMoveDiskSnapshotRefusal(moveErr) {
 			return fmt.Errorf("move %s of vm %d to vm %d slot %s: %w: %s",
 				disk, srcVMID, targetVMID, targetSlot, ErrMoveDiskSnapshotRefused, moveErr.Error())
+		}
+		// The job that makes PVE refuse stays until someone removes it, so
+		// the refusal is permanent for this move and never retriable.
+		if IsMoveReplicationRefusal(moveErr) {
+			return cpierrors.WrapAs(fmt.Errorf("%w: %s", ErrMoveDiskReplicationRefused, strings.TrimSpace(moveErr.Error())),
+				cpierrors.TypeCloud, fmt.Sprintf("move_disk %s of vm %d to vm %d slot %s", disk, srcVMID, targetVMID, targetSlot))
 		}
 		// A digest refusal that gets here means the volume is still where it
 		// was, because no earlier POST went unanswered or the readback above
