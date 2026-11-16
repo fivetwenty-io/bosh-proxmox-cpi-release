@@ -111,6 +111,13 @@ type lifecycleFlowPVE struct {
 	moveSnapshotRefusal bool
 	// snapshotAnswers counts the move POSTs refused that way.
 	snapshotAnswers int
+	// replicatedVMs names the VMs that have a replication job. A move POST
+	// that passes the digest check into one of them refuses in the request
+	// with PVE's answer for a volume whose storage cannot replicate, the
+	// check at Qemu.pm:5139, before any task forks.
+	replicatedVMs map[int]bool
+	// replicationAnswers counts the move POSTs refused that way.
+	replicationAnswers int
 	// moveTaskExit, when set, makes the next move start a task that exits
 	// with this status before its rename, so nothing moves.
 	moveTaskExit string
@@ -238,6 +245,12 @@ func moveDigestRefusal(vmid int) error {
 // another drive key of the source still names, as an HTTP 500.
 func moveSnapshotRefusal() error {
 	return sdkerrors.ParseAPIError(500, []byte(`{"message":"Can't move disk used by a snapshot to another VM\n"}`))
+}
+
+// moveReplicationRefusal is PVE's answer to a move into a VM that has a
+// replication job when the volume's storage cannot replicate, as an HTTP 500.
+func moveReplicationRefusal() error {
+	return sdkerrors.ParseAPIError(500, []byte(`{"message":"Cannot move disk to a replicated VM. Storage does not support replication!\n"}`))
 }
 
 // moveDigestMismatch reports which side of a move no longer matches the digest
@@ -771,6 +784,10 @@ func (n lifecycleFlowNodes) CreateQemuMoveDisk(_ context.Context, _ string, sour
 	if n.c.moveSnapshotRefusal {
 		n.c.snapshotAnswers++
 		return nil, moveSnapshotRefusal()
+	}
+	if n.c.replicatedVMs[targetID] {
+		n.c.replicationAnswers++
+		return nil, moveReplicationRefusal()
 	}
 	forked := lostMove{source: sourceID, target: targetID, disk: p.Disk, slot: *p.TargetDisk, digest: p.Digest, targetDigest: p.TargetDigest}
 	if n.c.loseMoveResponse {

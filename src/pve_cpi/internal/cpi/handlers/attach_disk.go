@@ -628,6 +628,23 @@ func attachDiskViaTransfer(
 	})
 	plan.parker = parker
 	if terr != nil {
+		if errors.Is(terr, pve.ErrMoveDiskReplicationRefused) {
+			// The check before the transfer could not tell that the VM is
+			// replicated, so PVE's refusal reaches here. It is the same
+			// verdict that check gives: a shared volume named for neither the
+			// parker nor a mover takes the config-edit attach, and any other
+			// disk is refused for good.
+			if refusal := replicaRefusalVerdict(ctx, deps, op, rd, preVolid, plan.parker, vmid, terr); refusal != nil {
+				return "", "", refusal
+			}
+			deps.Log(ctx).Warn(op+": reassignment refused because the VM is replicated and the disk's storage cannot "+
+				"replicate; falling back to the config-edit attach",
+				log.String("disk_cid", diskCID),
+				log.Int("parker_vmid", plan.parker.VMID),
+			)
+			return attachConfigEditFallback(ctx, deps, op, vmCID, node, vmid, diskCID, rd, plan, preVolid, targetSlot,
+				effectiveOpts, "replication fallback")
+		}
 		if errors.Is(terr, pve.ErrMoveDiskSnapshotRefused) {
 			if embedded, ok := pve.EmbeddedDiskVMID(preVolid); ok && embedded == plan.parker.VMID {
 				return "", "", cpierrors.Cloud(
@@ -641,20 +658,8 @@ func attachDiskViaTransfer(
 				log.String("disk_cid", diskCID),
 				log.Int("parker_vmid", plan.parker.VMID),
 			)
-			if unErr := pve.UnparkDiskAt(ctx, deps.PVE, deps.Log(ctx), preVolid, plan.parker, parkerCfg); unErr != nil {
-				return "", "", retriableUnlessPermanent(unErr, fmt.Sprintf("%s: unpark disk %s (snapshot fallback)", op, diskCID))
-			}
-			slot, devicePath, putErr := attachDiskConfigPut(
-				ctx, deps, op, vmCID, node, vmid, diskCID, rd, targetSlot, effectiveOpts, plan.judgeTarget)
-			// A volume named for its mover takes the hard error above, so a
-			// mover only gets here holding a volume named for something else.
-			// It goes through the same function as the mainline transfer below,
-			// so both places follow one rule about when a mover is destroyed
-			// and when it is kept.
-			if putErr == nil && plan.destroyMover {
-				destroyOrKeepMover(ctx, deps, op, plan.parker, nil)
-			}
-			return slot, devicePath, putErr
+			return attachConfigEditFallback(ctx, deps, op, vmCID, node, vmid, diskCID, rd, plan, preVolid, targetSlot,
+				effectiveOpts, "snapshot fallback")
 		}
 		return "", "", retriableUnlessPermanent(terr, fmt.Sprintf("%s: reassign disk %s from parker to VM %s", op, diskCID, vmCID))
 	}
@@ -700,6 +705,30 @@ func attachDiskViaTransfer(
 			fmt.Sprintf("%s: parker protection restore cut off after the disk reached VM %s as %s (disk %s)", op, vmCID, landed, diskCID))
 	}
 	return targetSlot, devicePath, nil
+}
+
+// attachConfigEditFallback attaches a parked disk by config edit after PVE
+// refused its reassignment: the unpark takes the volume off the parker under
+// its own name, and the config put writes it onto the VM. Only a volume named
+// for something other than the parker gets here, so the unpark cannot let PVE
+// deallocate it. what names the fallback in the unpark's error.
+func attachConfigEditFallback(
+	ctx context.Context, deps Deps, op, vmCID, node string, vmid int, diskCID string, rd resolvedDisk,
+	plan attachPlan, preVolid, targetSlot string, effectiveOpts map[string]string, what string,
+) (string, string, error) {
+	if unErr := pve.UnparkDiskAt(ctx, deps.PVE, deps.Log(ctx), preVolid, plan.parker, parkerReadConfigFor(deps)); unErr != nil {
+		return "", "", retriableUnlessPermanent(unErr, fmt.Sprintf("%s: unpark disk %s (%s)", op, diskCID, what))
+	}
+	slot, devicePath, putErr := attachDiskConfigPut(
+		ctx, deps, op, vmCID, node, vmid, diskCID, rd, targetSlot, effectiveOpts, plan.judgeTarget)
+	// A volume named for its mover takes a hard error before this, so a
+	// mover only gets here holding a volume named for something else. It goes
+	// through the same function as the mainline transfer, so both places
+	// follow one rule about when a mover is destroyed and when it is kept.
+	if putErr == nil && plan.destroyMover {
+		destroyOrKeepMover(ctx, deps, op, plan.parker, nil)
+	}
+	return slot, devicePath, putErr
 }
 
 // destroyOrKeepMover deals with a single-purpose migration mover once the disk
@@ -1362,6 +1391,38 @@ func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, rd *r
 	return guardHolderAndUnpark(ctx, deps, op, rd, node, targetVMID)
 }
 
+// sameNodeParkerPlan returns the transfer plan for a stable-ID disk on a
+// parker on the target VM's node, and true when the attach takes it. PVE
+// refuses to reassign a volume whose storage cannot replicate into a VM that
+// has a replication job. A shared volume named for neither the parker nor a
+// mover takes the config-edit attach instead, on either node, so this returns
+// false for it, and every other such disk is refused here, before the
+// reassignment or a migration changes anything.
+func sameNodeParkerPlan(
+	ctx context.Context, deps Deps, op string, rd resolvedDisk, holder pve.DiskHolder, node string, targetVMID int,
+	overlay map[string]string,
+) (attachPlan, bool, error) {
+	if !holder.Found || !holder.IsParker || rd.stableID == "" {
+		return attachPlan{}, false, nil
+	}
+	configEdit, err := replicatedTargetRoute(ctx, deps, op, rd, holder, targetVMID)
+	if err != nil {
+		return attachPlan{}, false, err
+	}
+	if holder.Node != node || configEdit {
+		return attachPlan{}, false, nil
+	}
+	// A mover already on the target node is an interrupted migration
+	// resuming. The ordinary transfer drains it, and destroyOrKeepMover then
+	// decides whether to destroy it.
+	return attachPlan{
+		viaTransfer:  true,
+		parker:       holder,
+		overlay:      overlay,
+		destroyMover: pve.TagsMarkDiskMover(holder.Tags),
+	}, true, nil
+}
+
 // guardHolderAndUnpark is guardAndUnparkBeforeAttach after the owned-volume
 // refusal: the holder scan, the resume, and the unpark or transfer plan.
 func guardHolderAndUnpark(ctx context.Context, deps Deps, op string, rd *resolvedDisk, node string, targetVMID int) (attachPlan, error) {
@@ -1456,18 +1517,11 @@ func guardHolderAndUnpark(ctx context.Context, deps Deps, op string, rd *resolve
 		}
 	}
 
-	if holder.Found && holder.IsParker && rd.stableID != "" {
-		if holder.Node == node {
-			// A mover already on the target node is an interrupted migration
-			// resuming. The ordinary transfer drains it, and destroyOrKeepMover
-			// then decides whether to destroy it.
-			return attachPlan{
-				viaTransfer:  true,
-				parker:       holder,
-				overlay:      overlay,
-				destroyMover: pve.TagsMarkDiskMover(holder.Tags),
-			}, nil
-		}
+	if plan, ok, err := sameNodeParkerPlan(ctx, deps, op, *rd, holder, node, targetVMID, overlay); err != nil || ok {
+		return plan, err
+	}
+
+	if holder.Found && holder.IsParker && rd.stableID != "" && holder.Node != node {
 		// PVE reassignment is same-node only ("Both VMs need to be on the
 		// same node"), so a cross-node parker means the volume itself has to
 		// move before the attach can land. Which paths exist depends on the

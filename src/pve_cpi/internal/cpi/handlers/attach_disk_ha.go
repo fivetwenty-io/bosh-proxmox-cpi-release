@@ -753,11 +753,13 @@ const pveHAStateError = "error"
 
 // preflight runs the attach's refusals that only read, before the attach
 // changes anything in HA. They are the refusal of a legacy disk named for the
-// VM, the snapshot guard, and the refusal of a disk another VM holds. The
-// attach runs each of them again in its own order, so a refusal here is the
-// same answer the attach would give, only earlier. A disk stranded on an
-// unused entry, or one whose transfer is still in flight, skips the holder
-// refusal, because the attach settles it first and only then knows its holder.
+// VM, the snapshot guard, the refusal of a disk another VM holds, and the
+// refusal of a parked disk that PVE would not let into the VM because the VM
+// is replicated. The attach runs each of them again in its own order, so a
+// refusal here is the same answer the attach would give, only earlier. A disk
+// stranded on an unused entry, or one whose transfer is still in flight, skips
+// the holder refusals, because the attach settles it first and only then knows
+// its holder.
 func (h *attachHA) preflight(ctx context.Context) error {
 	const op = attachHAOp
 	rd := h.disk
@@ -790,7 +792,31 @@ func (h *attachHA) preflight(ctx context.Context) error {
 	if holder.Found && !holder.IsParker && holder.VMID != h.vmid {
 		return foreignHolderError(ctx, h.deps, op, rd.diskCID, h.vmid, holder)
 	}
-	return nil
+	return h.refuseReplicatedReassign(holder)
+}
+
+// refuseReplicatedReassign is the replicated-VM refusal of the attach guard
+// (see replicatedTargetRoute), made from the jobs and storages the HA profile
+// read, so it costs no API call. A refusal here keeps the VM in HA with its
+// pin, where the same refusal after a leave would have taken the VM out of HA
+// for an attach that can never land. Facts the profile lacks skip it, and the
+// attach's own check then runs.
+func (h *attachHA) refuseReplicatedReassign(holder pve.DiskHolder) error {
+	rd := h.disk
+	if !holder.Found || !holder.IsParker || rd.stableID == "" {
+		return nil
+	}
+	jobs, ok := profileReplicaJobs(h.profile, h.vmid)
+	if !ok || len(jobs) == 0 {
+		return nil
+	}
+	storage, _, _ := strings.Cut(rd.volid, ":")
+	info, ok := profileStorage(h.profile, storage)
+	if !ok {
+		return nil
+	}
+	_, err := replicaReassignVerdict(attachHAOp, rd, holder, info, h.vmid, describeReplicaJobs(jobs))
+	return err
 }
 
 // attachUnchanged answers the barrier's Unchanged after an attach that
