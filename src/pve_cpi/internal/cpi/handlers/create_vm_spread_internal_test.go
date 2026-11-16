@@ -467,3 +467,30 @@ func TestSpreadClaims_PickErrorsSayWhatTheSpreadLost(t *testing.T) {
 		t.Errorf("a turn that worked logged %+v", obs.All())
 	}
 }
+
+// TestSpreadClaims_HoldWritesAClaimWhosePickFailedToRecord checks that a
+// claim whose pick could not write the record is written again by the next
+// hold or move to the same node, once the record works, so siblings that
+// score after that count it.
+func TestSpreadClaims_HoldWritesAClaimWhosePickFailedToRecord(t *testing.T) {
+	t.Parallel()
+	store := spreadClaimStore(t)
+	deps := spreadDeps(store)
+	// A directory in the record's place fails the write while the lock works.
+	blocker := filepath.Join(store.Dir.Override, spreadclaim.FileName)
+	if err := os.Mkdir(blocker, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a := mustSpreadClaims(t, deps)
+	node := placeSibling(t, deps, a)
+	if a.claim.Node() != node || a.claim.Holds(node) {
+		t.Fatalf("claim node %q held %v; want %q picked but not held", a.claim.Node(), a.claim.Holds(node), node)
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	a.hold(context.Background(), node)
+	if got := claimCounts(t, deps, spreadFacts()); !maps.Equal(got, map[string]int{node: 1}) {
+		t.Fatalf("claims after the hold = %v; want the claim on %s", got, node)
+	}
+}

@@ -14,8 +14,10 @@
 // from its tag leaves the claim out, so the member counts once.
 //
 // A claim whose create crashed lapses at that create's deadline. On a host
-// that reports its boot identity, as Linux does, a claim also stops counting
-// as soon as the process that made it is gone.
+// that reports its boot identity, as Linux does, a claim made in the same
+// boot and PID namespace also stops counting as soon as the process that made
+// it is gone. Every other claim, including one from another boot, which may
+// be another host that shares the cache directory, lapses at its expiry.
 //
 // All of a Director's CPI processes run on one host, and a group's tag names
 // its Director, so a record in the CPI's cache directory reaches every create
@@ -164,6 +166,10 @@ type Claim struct {
 	// recorded is true while the record may hold this claim, so a Release
 	// that has nothing to remove never waits for the record.
 	recorded bool
+	// current is true while the record holds this claim on node with vmid,
+	// as the last write left it. A claim whose write failed is not current,
+	// so the next Move or Bind writes it again.
+	current bool
 }
 
 // NewClaim returns an unrecorded claim for a create in group that ends at
@@ -185,6 +191,13 @@ func (c *Claim) Node() string {
 		return ""
 	}
 	return c.node
+}
+
+// Holds reports whether the record holds this claim on node, as far as the
+// claim's last write knows. A claim whose last write failed holds nothing, so
+// a caller that would skip a Move to the node it already claimed moves again.
+func (c *Claim) Holds(node string) bool {
+	return c != nil && node != "" && c.node == node && c.current
 }
 
 // Pick runs choose with the number of live claims each node holds for the
@@ -230,44 +243,54 @@ func (c *Claim) PickExcept(ctx context.Context, tagged func(vmid int) bool,
 	if node != "" {
 		c.node, c.vmid = node, 0
 		c.recorded = c.recorded || wrote
+		c.current = wrote
 	}
 	return node, err
 }
 
 // Move records this claim on node, as a create does when it tries another
-// node after an attempt failed on the one it picked. The claim names no VMID
-// until Bind names the VM of the new attempt.
+// node after an attempt failed on the one it picked. A claim moved to another
+// node names no VMID until Bind names the VM of the new attempt, and one moved
+// to the node it already claims keeps its VMID. Every Move writes the claim,
+// so a Move retries a write that failed before.
 func (c *Claim) Move(ctx context.Context, node string) error {
 	if c == nil || node == "" {
 		return nil
 	}
-	c.node, c.vmid = node, 0
+	if node != c.node {
+		c.vmid = 0
+	}
+	c.node = node
+	vmid := c.vmid
 	wrote, err := c.store.withRecord(ctx, func(rec *record, _ time.Time) bool {
-		c.put(rec, node, 0)
+		c.put(rec, node, vmid)
 		return true
 	})
 	c.recorded = c.recorded || wrote
+	c.current = wrote
 	return err
 }
 
 // Bind names vmid as the VM this claim's create allocated on the node it
-// holds. A claim that was never recorded touches nothing.
+// holds. It writes the claim whenever the record does not hold it on that node
+// with vmid, so a claim whose earlier write failed, or whose entry a rewrite
+// of the record lost, is recorded now.
 func (c *Claim) Bind(ctx context.Context, vmid int) error {
 	if c == nil || c.node == "" || vmid <= 0 {
 		return nil
 	}
 	c.vmid = vmid
-	if !c.recorded {
-		return nil
-	}
-	_, err := c.store.withRecord(ctx, func(rec *record, _ time.Time) bool {
-		e, ok := rec.Claims[c.id]
-		if !ok || e.VMID == vmid {
+	same := false
+	wrote, err := c.store.withRecord(ctx, func(rec *record, _ time.Time) bool {
+		if e, ok := rec.Claims[c.id]; ok && e.Node == c.node && e.VMID == vmid {
+			same = true
 			return false
 		}
 		c.put(rec, c.node, vmid)
 		return true
 	})
+	c.recorded = c.recorded || wrote
+	c.current = wrote || same
 	return err
 }
 
@@ -286,7 +309,7 @@ func (c *Claim) Release(ctx context.Context) error {
 	if c == nil || c.node == "" {
 		return nil
 	}
-	c.node, c.vmid = "", 0
+	c.node, c.vmid, c.current = "", 0, false
 	if !c.recorded {
 		return nil
 	}
@@ -336,22 +359,20 @@ func live(e entry, now time.Time) bool {
 }
 
 // gone reports whether the process that made e is known to have ended. That
-// is so when e was made in an earlier boot of this host, or in this boot and
-// PID namespace by a process that no longer runs. Without a boot identity on
-// either side, or from another PID namespace, nothing is known, and the claim
-// lapses at its expiry.
+// is only so when e was made in this boot and PID namespace by a process that
+// no longer runs. A claim from another boot may come from another host that
+// shares the cache directory, whose processes this host cannot see, so like a
+// claim from another PID namespace, or one without a boot identity on either
+// side, it lapses at its expiry.
 func (s *Store) gone(e entry) bool {
 	if e.PID <= 0 || e.Boot == "" {
 		return false
 	}
 	_, boot := s.process()
-	if boot == "" {
+	if boot == "" || e.Boot != boot {
 		return false
 	}
-	if e.Boot == boot {
-		return !s.alive(e.PID)
-	}
-	return bootID(e.Boot) != bootID(boot)
+	return !s.alive(e.PID)
 }
 
 func (s *Store) process() (int, string) {

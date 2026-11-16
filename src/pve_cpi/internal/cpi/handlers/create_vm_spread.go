@@ -133,6 +133,12 @@ func (s *spreadClaims) scoreAndPick(
 // pick runs choose in one turn with the claim record, with the live claims of
 // the group per node, leaving out the claims of siblings that facts already
 // count from their tag, and claims the node choose returns.
+//
+// The two counts can disagree for a moment, which only biases one pick. A
+// sibling whose member tag lands before its create binds the VMID counts
+// twice, once from the tag and once from its claim, until the bind. And when
+// a rolled-back VMID is allocated again while a fact still carries the old
+// VM's tag, the claim bound to that VMID is left out until the facts catch up.
 func (s *spreadClaims) pick(ctx context.Context, facts []placement.NodeFacts, choose func(map[string]int) string) {
 	tagged := map[int]bool{}
 	for i := range facts {
@@ -191,9 +197,10 @@ func withClaimCounts(pass []placement.NodeFacts, counts map[string]int, logger *
 
 // move claims node instead, as the fallback loop does before it tries an
 // alternate, and as a storage plan does once it settles on its node. A claim
-// that already holds node is left as it is.
+// that the record already holds on node is left as it is, and one whose last
+// write failed is written again.
 func (s *spreadClaims) move(ctx context.Context, node string) {
-	if s == nil || node == "" || s.claim.Node() == node {
+	if s == nil || node == "" || s.claim.Holds(node) {
 		return
 	}
 	if err := s.claim.Move(ctx, node); err != nil {

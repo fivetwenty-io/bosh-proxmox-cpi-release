@@ -307,8 +307,8 @@ func TestReleaseOfAnUnrecordedClaimDoesNotWait(t *testing.T) {
 	if _, err := c.Pick(context.Background(), leastClaimed("pve1")); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("pick err = %v; want the busy lock", err)
 	}
-	if err := c.Bind(context.Background(), 101); err != nil {
-		t.Fatalf("bind of an unrecorded claim = %v; want nothing to do", err)
+	if err := c.Bind(context.Background(), 101); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("bind of an unrecorded claim = %v; want it to try the busy lock again", err)
 	}
 	start := time.Now()
 	if err := c.Release(context.Background()); err != nil {
@@ -383,9 +383,11 @@ func TestPickExceptLeavesOutTaggedVMIDs(t *testing.T) {
 }
 
 // TestClaimsOfGoneProcessesDoNotCount pins the liveness check on a host with
-// a boot identity: a claim from a process of this boot that has ended, or from
-// an earlier boot, stops counting, while one whose process runs, one from
-// another PID namespace, and one without a PID all keep counting.
+// a boot identity: a claim from a process of this boot and PID namespace that
+// has ended stops counting, while one whose process runs, one from another
+// boot, one from another PID namespace, and one without a PID all keep
+// counting. A claim from another boot may come from another host that shares
+// the cache directory, so it lapses only at its expiry.
 func TestClaimsOfGoneProcessesDoNotCount(t *testing.T) {
 	t.Parallel()
 	exp := time.Now().Add(time.Hour)
@@ -394,14 +396,12 @@ func TestClaimsOfGoneProcessesDoNotCount(t *testing.T) {
 	maker := func(pid int, boot string) *Store {
 		return &Store{Dir: dir, Scope: "s", Process: func() (int, string) { return pid, boot }, Alive: alive}
 	}
-	// The earlier boot's claim is written first, because a writer of a later
-	// boot prunes it, as it should.
 	for _, tc := range []struct {
 		node string
 		pid  int
 		boot string
 	}{
-		{"earlier-boot", 12, "b0/ns1"},
+		{"other-boot", 12, "b0/ns1"},
 		{"running", 10, "b1/ns1"},
 		{"ended", 11, "b1/ns1"},
 		{"other-namespace", 13, "b1/ns2"},
@@ -420,7 +420,7 @@ func TestClaimsOfGoneProcessesDoNotCount(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	for node, want := range map[string]int{"running": 1, "ended": 0, "earlier-boot": 0, "other-namespace": 1,
+	for node, want := range map[string]int{"running": 1, "ended": 0, "other-boot": 1, "other-namespace": 1,
 		"no-pid": 1, "no-boot": 1} {
 		if seen[node] != want {
 			t.Errorf("claims on %s = %d; want %d (counts %v)", node, seen[node], want, seen)
@@ -452,5 +452,98 @@ func TestProcessAliveSeesThisProcess(t *testing.T) {
 	t.Parallel()
 	if !processAlive(os.Getpid()) {
 		t.Fatal("this process reads as gone")
+	}
+}
+
+// TestBootIdentityTurnsOffWithoutAPIDNamespace pins that a process that cannot
+// read its PID namespace reports no boot identity, which turns the liveness
+// check off, rather than one that another process could share by accident.
+func TestBootIdentityTurnsOffWithoutAPIDNamespace(t *testing.T) {
+	t.Parallel()
+	boot := func(string) ([]byte, error) { return []byte("b1\n"), nil }
+	ns := func(string) (string, error) { return "pid:[4026531836]", nil }
+	failed := func(string) (string, error) { return "", os.ErrPermission }
+	noBoot := func(string) ([]byte, error) { return nil, os.ErrNotExist }
+	for name, tc := range map[string]struct {
+		readFile func(string) ([]byte, error)
+		readlink func(string) (string, error)
+		want     string
+	}{
+		"both":         {boot, ns, "b1/pid:[4026531836]"},
+		"no namespace": {boot, failed, ""},
+		"no boot id":   {noBoot, ns, ""},
+	} {
+		if got := bootIdentity(tc.readFile, tc.readlink); got != tc.want {
+			t.Errorf("%s: identity = %q; want %q", name, got, tc.want)
+		}
+	}
+}
+
+// TestAClaimWhoseWriteFailedIsWrittenAgain pins that a claim whose write did
+// not land holds nothing as far as its caller knows, and that the next Move to
+// the same node, or the next Bind, writes it once the record works again. A
+// Move to the node the claim already holds keeps its VMID.
+func TestAClaimWhoseWriteFailedIsWrittenAgain(t *testing.T) {
+	t.Parallel()
+	for _, retry := range []string{"move", "bind"} {
+		s := testStore(t, nil)
+		blocker := filepath.Join(s.Dir.Override, FileName)
+		if err := os.Mkdir(blocker, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		exp := time.Now().Add(time.Hour)
+		c := mustClaim(t, s, "g", exp)
+		if _, err := c.Pick(context.Background(), leastClaimed("pve1")); !errors.Is(err, ErrNotRecorded) {
+			t.Fatalf("%s: pick err = %v; want the failed write", retry, err)
+		}
+		if c.Holds("pve1") {
+			t.Fatalf("%s: a claim whose write failed reads as held", retry)
+		}
+		if err := os.Remove(blocker); err != nil {
+			t.Fatal(err)
+		}
+		switch retry {
+		case "move":
+			if err := c.Move(context.Background(), "pve1"); err != nil {
+				t.Fatal(err)
+			}
+		case "bind":
+			if err := c.Bind(context.Background(), 101); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !c.Holds("pve1") {
+			t.Fatalf("%s: the claim does not read as held after its write landed", retry)
+		}
+		var seen map[string]int
+		if _, err := mustClaim(t, s, "g", exp).Pick(context.Background(), func(counts map[string]int) string {
+			seen = counts
+			return ""
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if seen["pve1"] != 1 {
+			t.Fatalf("%s: counts = %v; want the claim a sibling can see", retry, seen)
+		}
+	}
+	s := testStore(t, nil)
+	c := mustClaim(t, s, "g", time.Now().Add(time.Hour))
+	if err := c.Move(context.Background(), "pve1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Bind(context.Background(), 101); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Move(context.Background(), "pve1"); err != nil || c.VMID() != 101 {
+		t.Fatalf("vmid = %d (%v) after a move to the same node; want 101 kept", c.VMID(), err)
+	}
+	if _, err := mustClaim(t, s, "g", time.Now().Add(time.Hour)).PickExcept(context.Background(),
+		func(vmid int) bool { return vmid == 101 }, func(counts map[string]int) string {
+			if counts["pve1"] != 0 {
+				t.Errorf("counts = %v; want the bound claim left out", counts)
+			}
+			return ""
+		}); err != nil {
+		t.Fatal(err)
 	}
 }
