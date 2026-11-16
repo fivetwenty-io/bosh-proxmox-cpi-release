@@ -660,18 +660,20 @@ func createVM(
 	if err != nil {
 		return nil, cpierrors.Cloud("create_vm: %s", err.Error())
 	}
+	// A create that places an instance group's VM claims its node, so its
+	// siblings that place while it clones count it. The claim is held until
+	// the create returns, and the deferred release covers every exit. A
+	// create whose storage plan ranks the nodes claims through that ranking,
+	// and a set-managed create moves the claim to the node its allocation
+	// settles on and names its VMID there.
+	parsed.spread = newSpreadClaims(deps, parsed, spreadClaimExpiry(ctx, deps), logger)
+	defer parsed.spread.release(ctx)
 	if selection.SetManaged {
 		return createManagedVM(ctx, deps, args, parsed, selection)
 	}
 	if selection.UsesAtomicSelectors {
 		parsed.storageSelection = selection
 	}
-	// A create that places an instance group's VM claims its node, so its
-	// siblings that place while it clones count it. The claim is held until
-	// the create returns, and the deferred release covers every exit. A
-	// create whose storage plan ranks the nodes claims through that ranking.
-	parsed.spread = newSpreadClaims(deps, parsed, spreadClaimExpiry(ctx, deps), logger)
-	defer parsed.spread.release(ctx)
 
 	if selection.FuturePersistentSet != "" {
 		// No journal is open on this preflight, so there are no sibling

@@ -305,6 +305,11 @@ func (m *managedVMAllocation) execute(ctx context.Context, _ *managedVMObservati
 			return nil, err
 		}
 	}
+	// The claim follows the node this attempt builds on, which a retry may
+	// have planned again, and names the VMID, so a sibling that already
+	// counts the VM from its member tag leaves the claim out.
+	m.parsed.spread.move(ctx, m.shape.node)
+	m.parsed.spread.bind(ctx, m.vmid)
 	if err := m.newGuard(); err != nil {
 		return nil, err
 	}

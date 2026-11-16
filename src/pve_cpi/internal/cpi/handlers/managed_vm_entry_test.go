@@ -30,6 +30,8 @@ type managedVMEntryClient struct {
 	failStatus  bool
 	pauseReplan bool
 	destroys    int
+	// onCreate, when set, runs as PVE creates the VM, before it answers.
+	onCreate func(node string, vmid int)
 }
 
 func (c *managedVMEntryClient) QEMU() qemu.Service {
@@ -87,6 +89,9 @@ func (q *managedVMEntryQEMU) Create(ctx context.Context, node string, params map
 	}
 	if !recorded {
 		return "", fmt.Errorf("remote creation preceded durable VM target intent")
+	}
+	if q.client.onCreate != nil {
+		q.client.onCreate(node, vmid)
 	}
 	upid, err := q.managedDiskTestQEMU.Create(ctx, node, params)
 	if err != nil {
