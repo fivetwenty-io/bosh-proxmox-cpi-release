@@ -210,9 +210,11 @@ func writeMergedPinRule(
 	}
 
 	var planned *ha.Rule
+	var res *ha.ApplyResult
 	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		writer := newHARuleWriterFor(deps, profile, logger, req.Decision)
-		res, err := writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+		var err error
+		res, err = writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			cur := set.Find(ruleName)
 			if cur != nil && haOwnershipOf(cur.Comment, ident.Owner) == haOwnedByOther {
 				return nil, fmt.Errorf("node-affinity: rule %q carries another Director's ownership marker; "+
@@ -253,6 +255,7 @@ func writeMergedPinRule(
 		// anti-affinity when antiaffinity_verify is on.
 		return verifyAntiAffinityMember(ctx, deps, ruleName, sid, logger)
 	})
+	healAfterRepair(ctx, deps, res, "", logger)
 	if err != nil {
 		return nil, err
 	}
@@ -351,10 +354,12 @@ func deleteNodeAffinityRule(
 	ctx context.Context, deps Deps, vmid int, logger *log.Logger, keep func(cur *ha.Rule) error,
 ) error {
 	ruleName := naRuleNameFor(vmid)
+	var res *ha.ApplyResult
 	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		writer := newHARuleWriter(deps, nil, logger)
 		foreign := false
-		_, err := writer.Apply(ctx, "node-affinity cleanup", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+		var err error
+		res, err = writer.Apply(ctx, "node-affinity cleanup", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			cur := set.Find(ruleName)
 			if cur == nil {
 				return nil, nil
@@ -375,6 +380,7 @@ func deleteNodeAffinityRule(
 		}
 		return err
 	})
+	healAfterRepair(ctx, deps, res, "", logger)
 	if err != nil {
 		return fmt.Errorf("node-affinity: delete rule %q: %w", ruleName, err)
 	}

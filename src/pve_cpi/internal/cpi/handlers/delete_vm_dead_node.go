@@ -84,6 +84,12 @@ type deadNodeCompletion struct {
 	// storages is the storage index the deletion destinations read the reach
 	// of the VM's recorded storages from, read once per completion.
 	storages ha.StorageIndex
+	// lost maps each anti-affinity rule the rule edits deleted, or that a pin
+	// repair among them changed, to the comment the rule had, and confined
+	// holds the members of the pins a repair ran for. The group heal after
+	// the edits reads both.
+	lost     map[string]string
+	confined []string
 }
 
 // completeDeadNodeDelete runs the completion for the legacy delete of the VM
@@ -621,10 +627,37 @@ func (c *deadNodeCompletion) narrowRules(ctx context.Context) ([]string, error) 
 		}
 		return c.writePin(ctx, writer, final, "strict pin")
 	})
+	c.healGroups(ctx)
 	if err != nil {
 		return nil, deferHA(err)
 	}
 	return dests, nil
+}
+
+// noteRuleWrites adds the rule deletes and pin repairs of res to what the
+// group heal reads. comments holds the comment of each rule a delete was
+// planned for.
+func (c *deadNodeCompletion) noteRuleWrites(res *ha.ApplyResult, comments map[string]string) {
+	for id, comment := range writtenRuleDeletes(res, comments) {
+		if c.lost == nil {
+			c.lost = map[string]string{}
+		}
+		c.lost[id] = comment
+	}
+	c.confined = append(c.confined, confinedBy(res)...)
+}
+
+// healGroups writes the rules of each group again whose rule the rule edits
+// deleted or a pin repair changed without the rules lock, with the fenced VM
+// kept out. PVE takes no digest on a delete, so a release that deletes a rule
+// left with one member can take out a sibling that joined it meanwhile. The
+// edits are done by then, so a heal that fails is only logged.
+func (c *deadNodeCompletion) healGroups(ctx context.Context) {
+	if err := healAfterUnlockedDeletes(ctx, c.deps, c.lost, c.owner, c.sid, c.confined, c.logger); err != nil {
+		c.logger.Warn(deadNodeDelete+": the group's rules could not be written again after the fenced VM left "+
+			"them; a sibling that joined a deleted rule meanwhile may be out of every rule until the next create "+
+			"or delete of the group", log.String("sid", c.sid), log.Err(err))
+	}
 }
 
 // allowedWithinReach reports whether every node other than the dead one that
@@ -642,6 +675,7 @@ func (c *deadNodeCompletion) allowedWithinReach(set *ha.RuleSet, members []strin
 // that it is in effect.
 func (c *deadNodeCompletion) writePin(ctx context.Context, writer *ha.RuleWriter, want ha.Rule, what string) error {
 	res, err := writer.Apply(ctx, "dead-node "+what, ha.PlanDeadNodePin(want, c.ownedRule))
+	c.noteRuleWrites(res, nil)
 	if err != nil {
 		return c.deferWrap(err, "write the %s %q", what, want.ID)
 	}
@@ -664,7 +698,18 @@ func (c *deadNodeCompletion) writePin(ctx context.Context, writer *ha.RuleWriter
 
 // releaseAntiAffinity removes the VM from this Director's anti-affinity rules.
 func (c *deadNodeCompletion) releaseAntiAffinity(ctx context.Context, writer *ha.RuleWriter, pinID string) error {
-	res, err := writer.Apply(ctx, "dead-node anti-affinity", ha.PlanAntiAffinityRelease(c.sid, pinID, c.ownedRule))
+	release := ha.PlanAntiAffinityRelease(c.sid, pinID, c.ownedRule)
+	comments := map[string]string{}
+	res, err := writer.Apply(ctx, "dead-node anti-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+		ops, err := release(set)
+		for i := range ops {
+			if r := set.Find(ops[i].Rule.ID); r != nil && ops[i].Kind == ha.OpDelete {
+				comments[r.ID] = r.Comment
+			}
+		}
+		return ops, err
+	})
+	c.noteRuleWrites(res, comments)
 	if err != nil {
 		return c.deferWrap(err, "remove %s from its anti-affinity rules", c.sid)
 	}

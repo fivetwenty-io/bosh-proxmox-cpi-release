@@ -504,6 +504,15 @@ func TestRepairRevertsAWriteThatDisabledAPin(t *testing.T) {
 		if p := res.Set.Find("pin"); p == nil || len(p.Errors) != 0 {
 			t.Fatalf("pin after the repair = %+v", p)
 		}
+		// The revert's delete is reported with the comment the rule had, so
+		// a caller can tell whose group rule the repair removed.
+		if len(res.Repaired) != 1 || res.Repaired[0].Kind != OpDelete || res.Repaired[0].Rule.ID != "aa" ||
+			res.Repaired[0].Rule.Comment != ourMarker {
+			t.Fatalf("repaired = %+v; want the delete of aa with its comment", res.Repaired)
+		}
+		if !slices.Equal(res.Confined, []string{"vm:1"}) {
+			t.Fatalf("confined = %v; want the pinned VM", res.Confined)
+		}
 	}
 }
 
@@ -537,12 +546,43 @@ func TestConfinementOnlyDropsTheVMFromTheConflictingRule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.confinementOnly(context.Background(), &ApplyResult{Set: set}, set.Find("pin")); err != nil {
+	res := &ApplyResult{Set: set}
+	if err := w.confinementOnly(context.Background(), res, set.Find("pin")); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(api.writes, []string{"update:aa", "update:pin"}) ||
 		!slices.Equal(api.find("aa").Resources, []string{"vm:2", "vm:3"}) || api.find("pin").NodesParam() != "a" {
 		t.Fatalf("writes %v rules %+v", api.writes, api.rules)
+	}
+	if len(res.Repaired) != 2 || res.Repaired[0].Kind != OpUpdate || res.Repaired[0].Rule.ID != "aa" ||
+		!slices.Equal(res.Repaired[0].Rule.Resources, []string{"vm:2", "vm:3"}) ||
+		res.Repaired[1].Kind != OpUpdate || res.Repaired[1].Rule.ID != "pin" {
+		t.Fatalf("repaired = %+v; want the update of aa and of the pin", res.Repaired)
+	}
+}
+
+// TestConfinementOnlyReportsTheDeleteOfARuleItLeavesTooSmall pins that the
+// rewrite deletes an anti-affinity rule that would keep one member, and
+// reports that delete with the comment the rule had.
+func TestConfinementOnlyReportsTheDeleteOfARuleItLeavesTooSmall(t *testing.T) {
+	pin := ourPin("pin", true, map[string]int{"a": 2}, "vm:1")
+	api := &fakeRuleAPI{rules: []Rule{ourAA("aa", "vm:1", "vm:2"),
+		ourPin("p2", true, map[string]int{"a": 0}, "vm:2"), pin}}
+	w, _ := newTestWriter(api, []string{"a", "b", "c"})
+	set, err := w.read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := &ApplyResult{Set: set}
+	if err := w.confinementOnly(context.Background(), res, set.Find("pin")); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(api.writes, []string{"delete:aa", "update:pin"}) || api.find("aa") != nil {
+		t.Fatalf("writes %v rules %+v", api.writes, api.rules)
+	}
+	if len(res.Repaired) != 2 || res.Repaired[0].Kind != OpDelete || res.Repaired[0].Rule.ID != "aa" ||
+		res.Repaired[0].Rule.Comment != ourMarker {
+		t.Fatalf("repaired = %+v; want the delete of aa with its comment first", res.Repaired)
 	}
 }
 

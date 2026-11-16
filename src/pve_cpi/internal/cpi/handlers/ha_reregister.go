@@ -397,6 +397,7 @@ func leaveOwnedHARules(ctx context.Context, deps Deps, vmid int, owner string, l
 	sid := haResourceSid(vmid)
 	pinID := naRuleNameFor(vmid)
 	var deleted map[string]string
+	var confined []string
 	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		writer := newHARuleWriter(deps, nil, logger)
 		comments := map[string]string{}
@@ -421,10 +422,10 @@ func leaveOwnedHARules(ctx context.Context, deps Deps, vmid int, owner string, l
 			}
 			return ops, nil
 		})
-		deleted = writtenRuleDeletes(res, comments)
+		deleted, confined = writtenRuleDeletes(res, comments), confinedBy(res)
 		return err
 	})
-	if healErr := healAfterUnlockedDeletes(ctx, deps, deleted, owner, sid, logger); healErr != nil {
+	if healErr := healAfterUnlockedDeletes(ctx, deps, deleted, owner, sid, confined, logger); healErr != nil {
 		logger.Warn("ha readd: the group's rules could not be written again after this VM left them; a sibling "+
 			"that joined a deleted rule meanwhile may be out of every rule until the next create or delete of "+
 			"the group", log.String("sid", sid), log.Err(healErr))
@@ -512,9 +513,11 @@ func (w *readdWiring) withoutHA(ctx context.Context, _ *ha.VMDecision, rec ha.Re
 func enableOwnedGroupRules(ctx context.Context, deps Deps, ident haIdentity, vmid int, logger *log.Logger) error {
 	sid := haResourceSid(vmid)
 	base := ident.ruleName()
-	return withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
+	var res *ha.ApplyResult
+	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		writer := newHARuleWriter(deps, nil, logger)
-		_, err := writer.Apply(ctx, "anti-affinity enable", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+		var err error
+		res, err = writer.Apply(ctx, "anti-affinity enable", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			var ops []ha.RuleOp
 			for i := range set.Rules {
 				r := &set.Rules[i]
@@ -530,6 +533,8 @@ func enableOwnedGroupRules(ctx context.Context, deps Deps, ident haIdentity, vmi
 		})
 		return err
 	})
+	healAfterRepair(ctx, deps, res, "", logger)
+	return err
 }
 
 // finishPendingHAReadd finishes the HA re-registration of a VM that carries

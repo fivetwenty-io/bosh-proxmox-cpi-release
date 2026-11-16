@@ -13,6 +13,7 @@ import (
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
@@ -547,6 +548,163 @@ func TestLeaveOwnedHARules_AFailedHealDoesNotFailTheLeave(t *testing.T) {
 	}
 	if !warned {
 		t.Fatal("the failed heal was not logged")
+	}
+}
+
+// seedStrictPin stores a strict node-affinity pin of vmid to nodes, owned by
+// the test Director, and returns the pin's ID.
+func seedStrictPin(stub *aaClusterStub, vmid int, nodes string) string {
+	pin := naRuleNameFor(vmid)
+	stub.seedRuleWithComment(pin, haResourceSid(vmid), haIdentity{Owner: aaDirector}.marker())
+	stub.ruleTypes[pin], stub.ruleNodes[pin], stub.ruleStrict[pin] = ha.RuleTypeNodeAffinity, nodes, true
+	return pin
+}
+
+// pinOutWhileInRule makes PVE report pin as not in effect while rule holds
+// sid, the way PVE flags a pin that a resource-affinity rule contradicts.
+func pinOutWhileInRule(stub *aaClusterStub, pin, rule, sid string) {
+	stub.ruleErrors = func(name string) map[string][]string {
+		if name != pin || !slices.Contains(strings.Split(stub.rules[rule], ","), sid) {
+			return nil
+		}
+		return map[string][]string{"resources": {sid + " is also in resource-affinity rule " + rule}}
+	}
+}
+
+// TestEnsureAntiAffinity_UnlockedPinRepairHealsTheGroup pins that a create
+// whose write a pin repair undoes writes the group's rules again, with the
+// rules lock off. The create's join of the rule puts its own strict pin out
+// of effect, and a sibling writes itself into the rule between that join and
+// the repair. The repair puts back the rule it read before the join under a
+// fresh digest, which takes the sibling out. The heal must write the sibling
+// back and leave out the VM whose pin the repair protected.
+func TestEnsureAntiAffinity_UnlockedPinRepairHealsTheGroup(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	stub.enforceManaged = true
+	tagged := []int{101, 102, 103}
+	stub.listResourcesFn = func() *cluster.ListResourcesResponse {
+		resp := make(cluster.ListResourcesResponse, 0, len(tagged))
+		for _, v := range tagged {
+			resp = append(resp, aaQEMU(v, aaTag))
+		}
+		return &resp
+	}
+	stub.resources["vm:101"], stub.resources["vm:102"], stub.resources["vm:103"] = true, true, true
+	stub.seedRule(aaRule, "vm:101,vm:102")
+	pin := seedStrictPin(stub, 103, "pve1")
+	pinOutWhileInRule(stub, pin, aaRule, "vm:103")
+	raced := false
+	stub.onRuleWrite = func(rule string) {
+		if rule != aaRule || raced || !strings.Contains(stub.rules[aaRule], "vm:103") {
+			return
+		}
+		raced = true
+		tagged = append(tagged, 104)
+		stub.resources["vm:104"] = true
+		stub.rules[aaRule] += ",vm:104"
+		stub.digest++
+	}
+	deps := aaDeps(stub)
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4")
+	logger, observed := log.NewObservedLogger(log.LevelDebug)
+	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 103, logger); err != nil {
+		t.Fatal(err)
+	}
+	if !raced {
+		t.Fatal("the create never joined the rule, so the race never ran")
+	}
+	if got := stub.rules[aaRule]; got != "vm:101,vm:102,vm:104" {
+		t.Fatalf("rule = %q; want the sibling written back and the pinned VM left out", got)
+	}
+	if errs := stub.ruleErrors(pin); len(errs) > 0 {
+		t.Fatalf("pin %s is out of effect after the heal: %v", pin, errs)
+	}
+	for _, e := range observed.All() {
+		if e.Level == log.LevelWarn && strings.Contains(e.Message, "could not be written again") {
+			t.Fatalf("the heal failed: %s", e.Message)
+		}
+	}
+}
+
+// TestHealAfterRepair_WritesTheGroupBackWithoutThePinnedVM pins the heal a
+// pin writer runs after its repair deleted one of a group's rules. The repair
+// took the rule out to keep vm:103's pin in effect, and the heal must write
+// the group's other members back into a rule and leave vm:103 out, because
+// adding it would put the pin out of effect again.
+func TestHealAfterRepair_WritesTheGroupBackWithoutThePinnedVM(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	stub.enforceManaged = true
+	stub.tagged(aaQEMU(101, aaTag), aaQEMU(102, aaTag), aaQEMU(103, aaTag))
+	pin := seedStrictPin(stub, 103, "pve1")
+	pinOutWhileInRule(stub, pin, aaRule, "vm:103")
+	deps := aaDeps(stub)
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+	res := &ha.ApplyResult{
+		Repaired: []ha.RuleOp{{Kind: ha.OpDelete, Rule: ha.Rule{ID: aaRule, Comment: aaIdent("web").marker()}}},
+		Confined: []string{"vm:103"},
+	}
+	logger, observed := log.NewObservedLogger(log.LevelDebug)
+	healAfterRepair(context.Background(), deps, res, "", logger)
+	if got := stub.rules[aaRule]; got != "vm:101,vm:102" {
+		t.Fatalf("rule = %q; want the group's other members, without the pinned VM", got)
+	}
+	for _, e := range observed.All() {
+		if e.Level == log.LevelWarn {
+			t.Fatalf("unexpected warning: %s", e.Message)
+		}
+	}
+}
+
+// TestDeadNodeRelease_UnlockedReleaseHealsTheGroup pins that the dead-node
+// completion writes the group's rules again after its release deleted one,
+// with the rules lock off. The release reads the rule with one member besides
+// the fenced VM and deletes it, and a sibling writes itself into the rule
+// between that read and the delete. The heal must write the other member and
+// the sibling back, and keep the fenced VM out.
+func TestDeadNodeRelease_UnlockedReleaseHealsTheGroup(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	stub.enforceManaged = true
+	stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag), aaQEMU(102, aaTag))
+	stub.seedRule(aaRule, "vm:100,vm:101")
+	raced := false
+	racing := &aaRaceDelete{aaClusterStub: stub, before: func(rule string) {
+		if rule != aaRule || raced {
+			return
+		}
+		raced = true
+		stub.rules[aaRule] = "vm:100,vm:101,vm:102"
+		stub.digest++
+	}}
+	deps := aaDeps(stub)
+	deps.PVE = &icPVEClient{
+		clusterSvc: racing,
+		nodesSvc: &icNodesService{listFn: func(ctx context.Context, p *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return stub.ListResources(ctx, p)
+		}},
+	}
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+	logger, observed := log.NewObservedLogger(log.LevelDebug)
+	c := &deadNodeCompletion{deps: deps, vmid: 100, sid: "vm:100", owner: aaDirector, logger: logger}
+	writer := newHARuleWriter(deps, nil, logger)
+	writer.Managed = true
+	writer.Repair = ha.RepairDeps{}
+	if err := c.releaseAntiAffinity(context.Background(), writer, naRuleNameFor(100)); err != nil {
+		t.Fatal(err)
+	}
+	c.healGroups(context.Background())
+	if !raced {
+		t.Fatal("the release deleted no rule, so the race never ran")
+	}
+	if got := stub.rules[aaRule]; got != "vm:101,vm:102" {
+		t.Fatalf("rule = %q; want the other member and the sibling, without the fenced VM", got)
+	}
+	for _, e := range observed.All() {
+		if e.Level == log.LevelWarn {
+			t.Fatalf("unexpected warning: %s", e.Message)
+		}
 	}
 }
 

@@ -75,6 +75,10 @@ type aaClusterStub struct {
 	// purgeFromRules makes a purging resource delete take the sid out of
 	// every rule, and change the digest, the way PVE's purge does.
 	purgeFromRules bool
+	// ruleErrors, when set, gives the errors PVE reports on a rule, keyed by
+	// property, so a test can put a rule out of effect the way PVE's own
+	// checks do.
+	ruleErrors func(rule string) map[string][]string
 }
 
 func (s *aaClusterStub) record(ev string) {
@@ -247,6 +251,11 @@ func (s *aaClusterStub) ListHaRules(_ context.Context, _ *cluster.ListHaRulesPar
 		}
 		if s.ruleStrict[name] {
 			row["strict"] = 1
+		}
+		if s.ruleErrors != nil {
+			if errs := s.ruleErrors(name); len(errs) > 0 {
+				row["errors"] = errs
+			}
 		}
 		raw, _ := json.Marshal(row)
 		out = append(out, raw)

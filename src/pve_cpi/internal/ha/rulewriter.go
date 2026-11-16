@@ -127,6 +127,18 @@ type ApplyResult struct {
 	Set *RuleSet
 	// Wrote lists the writes that landed, in order.
 	Wrote []RuleOp
+	// Repaired lists the writes that the repair of a confinement pin made
+	// after Wrote, in order: the reverts of Wrote and the confinement-only
+	// rewrites. Each goes under the digest of a read the repair takes, not
+	// the plan's, so a delete or an update among them can take out a member
+	// that a sibling wrote into the rule after the plan's read. A delete
+	// carries the rule's ID and the comment the rule had.
+	Repaired []RuleOp
+	// Confined lists the resources of every confinement pin a repair ran
+	// for. A repair takes those resources out of the writes that put the pin
+	// out of effect, so a writer that writes the rules again afterwards
+	// leaves them where the repair did.
+	Confined []string
 }
 
 // Apply runs plan to completion under the rules lock. Each round reads the
@@ -586,6 +598,7 @@ func (w *RuleWriter) verify(ctx context.Context, label string, before *RuleSet, 
 		if !IsConfinement(r) {
 			continue
 		}
+		res.Confined = append(res.Confined, r.Resources...)
 		note, err := w.repairPin(ctx, label, before, res, r.ID, &reverted)
 		if err != nil {
 			return err
@@ -610,7 +623,7 @@ func (w *RuleWriter) repairPin(
 	// 1. Revert this call's writes when the pin was in effect before them.
 	if prev := before.Find(id); !*reverted && inEffect(prev, w.check(before.Rules)) {
 		*reverted = true
-		if err := w.revert(ctx, before, res.Wrote); err != nil {
+		if err := w.revert(ctx, before, res); err != nil {
 			return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("%s: revert the write that disabled confinement pin %q", label, id))
 		}
@@ -645,10 +658,11 @@ func (w *RuleWriter) repairPin(
 	return w.removeUnrepairable(ctx, label, res.Set.Find(id))
 }
 
-// revert undoes wrote, newest first, each under the digest of a fresh read.
-func (w *RuleWriter) revert(ctx context.Context, before *RuleSet, wrote []RuleOp) error {
-	for i := len(wrote) - 1; i >= 0; i-- {
-		op := wrote[i]
+// revert undoes res.Wrote, newest first, each under the digest of a fresh
+// read, and lists every undo that landed in res.Repaired.
+func (w *RuleWriter) revert(ctx context.Context, before *RuleSet, res *ApplyResult) error {
+	for i := len(res.Wrote) - 1; i >= 0; i-- {
+		op := res.Wrote[i]
 		prev := before.Find(op.Rule.ID)
 		var undo RuleOp
 		switch {
@@ -662,8 +676,20 @@ func (w *RuleWriter) revert(ctx context.Context, before *RuleSet, wrote []RuleOp
 		if err := w.writeOnce(ctx, normalizeOp(undo)); err != nil {
 			return err
 		}
+		addRepaired(res, undo, op.Rule.Comment)
 	}
 	return nil
+}
+
+// addRepaired lists op in res.Repaired. A delete keeps comment, the comment of
+// the rule it removed, which the write itself does not carry.
+func addRepaired(res *ApplyResult, op RuleOp, comment string) {
+	if op.Kind == OpDelete {
+		op.Rule = Rule{ID: op.Rule.ID, Comment: comment}
+	} else {
+		op.Rule = op.Rule.Clone()
+	}
+	res.Repaired = append(res.Repaired, op)
 }
 
 // writeOnce sends one write under a fresh digest and settles a held error with
@@ -742,13 +768,19 @@ func (w *RuleWriter) confinementOnly(ctx context.Context, res *ApplyResult, pin 
 		if err := w.writeOnce(ctx, normalizeOp(op)); err != nil {
 			return err
 		}
+		addRepaired(res, op, ra.Comment)
 	}
 	target := ConfinementOnly(pin)
 	target.Errors = nil
 	if SameRule(target, pin) {
 		return nil
 	}
-	return w.writeOnce(ctx, normalizeOp(RuleOp{Kind: OpUpdate, Rule: *target}))
+	op := RuleOp{Kind: OpUpdate, Rule: *target}
+	if err := w.writeOnce(ctx, normalizeOp(op)); err != nil {
+		return err
+	}
+	addRepaired(res, op, "")
+	return nil
 }
 
 // removeUnrepairable removes the pin's HA resource only when the repair

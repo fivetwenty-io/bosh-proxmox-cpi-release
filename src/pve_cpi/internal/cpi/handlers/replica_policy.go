@@ -136,9 +136,11 @@ func writeReplicaPin(
 	ctx context.Context, deps Deps, profile *ha.Profile, logger *log.Logger, vmid int, expect, pin *ha.Rule,
 ) error {
 	owner := deps.RequestDirectorUUID
+	var res *ha.ApplyResult
 	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		writer := newHARuleWriterFor(deps, profile, logger, nil)
-		_, err := writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+		var err error
+		res, err = writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			cur := set.Find(pin.ID)
 			switch {
 			case cur == nil:
@@ -158,6 +160,7 @@ func writeReplicaPin(
 		})
 		return err
 	})
+	healAfterRepair(ctx, deps, res, "", logger)
 	if err != nil {
 		return err
 	}
