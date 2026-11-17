@@ -1356,3 +1356,19 @@ func TestDifferingEntryNodesAreAGap(t *testing.T) {
 		t.Fatalf("effective=%s gaps=%v", p.Effective, p.Gaps)
 	}
 }
+
+// The startup line names the member whose clock measured the HA timestamps
+// when the entry node's own clock read failed, and says nothing otherwise.
+func TestLogLineNamesABorrowedClock(t *testing.T) {
+	p := &ha.Profile{Mode: config.HAModeAuto, Effective: ha.EffectiveFull, Health: &pve.NodeHealthReport{
+		EntryNode: "pve1", ClockNode: "pve1",
+	}}
+	if got := p.LogLine(); strings.Contains(got, "clock=") {
+		t.Fatalf("line %q must not name a clock when the entry node's answered", got)
+	}
+	p.Health.ClockNode = "pve2"
+	p.Health.ClockFallback = "the entry node's clock read failed"
+	if got := p.LogLine(); !strings.Contains(got, " clock=pve2") {
+		t.Fatalf("line %q must name the borrowed clock", got)
+	}
+}

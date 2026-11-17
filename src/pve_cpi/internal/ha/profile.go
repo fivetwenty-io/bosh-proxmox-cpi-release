@@ -658,6 +658,12 @@ func (p *Profile) LogLine() string {
 		" sys_console=%s crs=%s rebalance_on_start=%s",
 		p.Topology, version, yes(p.RulesSupported), crm, yes(p.Quorate && p.Clustered), votes, survives,
 		p.qdeviceWord(), online, len(p.Nodes), yes(p.SysConsole), crs, yes(p.CRS.RebalanceOnStart))
+	if p.Health != nil && p.Health.ClockFallback != "" {
+		// The entry node answered its own clock read with a server error, so
+		// the HA timestamps were measured on another member's clock. That
+		// entry node is usually shutting down or broken.
+		fmt.Fprintf(&b, " clock=%s", p.Health.ClockNode)
+	}
 	if p.Advice != "" {
 		fmt.Fprintf(&b, " advice=%s", p.Advice)
 	}
