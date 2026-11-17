@@ -28,6 +28,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - The guest-agent IP probe in `create_vm` now logs a warning that names the members it left out because the cluster reports them offline. A member whose corosync link failed can keep its guests running, so a guest there may still answer on the target IP.
 
+### Documentation
+
+- [HA and Resurrection](docs/ha-and-resurrection.md#set-agent_timeout-above-the-ha-recovery-time) now recommends a Director `hm.intervals.agent_timeout` of 300 seconds, up from 240, so that it sits above the time PVE HA takes to recover a VM from a failed node. A node's watchdog resets it about 60 seconds after it loses quorum, and the whole recovery takes about two to four minutes, which measured 178 to 188 seconds in our tests. The page now explains what a shorter timeout costs. The resurrector's `delete_vm` can reach the VM after PVE HA has already restarted it, and it then destroys the recovered VM and recreates it. The persistent disk stays safe on a parker, but in one test with the default 60 seconds the instance was down for about nine and a half minutes instead of about two and a half. [Operations](docs/operations.md#raise-agent_timeout-before-turning-ha-on) and [Troubleshooting](docs/troubleshooting.md#a-vm-that-pve-ha-recovered-is-deleted-and-recreated) cover the setting and the symptom, and the other pages that quoted 240 seconds now quote 300.
+
 ## [0.10.3] - 2026-11-17
 
 ### Fixed

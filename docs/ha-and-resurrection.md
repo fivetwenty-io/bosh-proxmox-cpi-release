@@ -148,10 +148,17 @@ sequenceDiagram
     Note over HA: VM running elsewhere a short time later
     HM->>HM: agent heartbeats return
     HM->>D: no further resurrection
+    Note over HM,D: A delete_vm retry that reaches the VM after HA restarted it deletes and recreates the VM, which a longer agent_timeout avoids
     Note over HM,D: If HA puts the VM in error, or leaves it in recovery past the grace window, the next scan_and_fix completes the delete and recreates the VM
 ```
 
-We recommend that operators who use HA raise the Director's `hm.intervals.agent_timeout` property to 240 seconds or more. The CPI neither reads nor checks the property, so it is an operator setting in the Director manifest. The `manifests/bosh/hm-tuning.yml` ops file in this repository sets 180 seconds, but it also turns the resurrector off for a single-host lab, so we do not copy its value into an HA deployment. A longer timeout lets PVE HA finish most recoveries before the resurrector looks at the VM. The defer in `delete_vm` keeps things safe even if the timeout stays at its default, but a longer timeout means fewer deferred tasks to read.
+### Set `agent_timeout` above the HA recovery time
+
+We set the Director's `hm.intervals.agent_timeout` property above the time PVE HA takes to recover a VM from a failed node, and we recommend 300 seconds. The CPI neither reads nor checks the property, so it is an operator setting in the Director manifest. The `manifests/bosh/hm-tuning.yml` ops file in this repository sets 180 seconds, but it also turns the resurrector off for a single-host lab, so we don't copy its value into an HA deployment.
+
+PVE HA recovers a VM in two stages. When a node loses quorum, its local resource manager stops renewing the node's watchdog, and the watchdog resets the node about 60 seconds later. The cluster resource manager on the quorate side waits until the failed node's lock has expired, treats the node as fenced, and then starts the node's VMs on the surviving nodes. From the failure to the VM running again takes about two to four minutes. In our node-failure tests in November 2026 it took between 178 and 188 seconds, and a 300-second timeout leaves room above that.
+
+When `agent_timeout` is shorter than the recovery, the Health Monitor reports the instance before PVE HA has finished, and the resurrector starts its scan-and-fix. Its `delete_vm` defers while the VM is in `fence` or `recovery`, as [When `delete_vm` defers](#when-delete_vm-defers) describes. A retry that arrives after PVE HA has started the VM on another node finds an ordinary running VM, so `delete_vm` destroys the VM that PVE HA just recovered, and `create_vm` builds a replacement. The persistent disk stays safe, because `delete_vm` moves it to a parker before the destroy, and the replacement attaches it from there. The cost is downtime. In one of those tests the Director ran with the default 60-second `agent_timeout`, and fence and recovery took about three minutes. The delete and the recreate that followed kept the instance down for about nine and a half minutes, where a timeout above the recovery time would have had it back after about two and a half.
 
 ## How the CPI prevents double recovery
 

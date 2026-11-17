@@ -2862,6 +2862,28 @@ We run `pve-cid ha` against the cluster. It is read-only. It prints the profile 
 
 For a removed key, we replace it as the error says. For a failed gate, we fix the cluster or the token, and the profile is probed again on the next call. For a deferred delete, we follow [When `delete_vm` defers](operations.md#when-delete_vm-defers), and for a dead node we follow [the dead-node procedure](operations.md#the-dead-node-procedure). For an `error` resource, we follow [Clearing an HA error by hand](operations.md#clearing-an-ha-error-by-hand). [HA and Resurrection](ha-and-resurrection.md) explains the ownership model behind all four.
 
+## A VM that PVE HA recovered is deleted and recreated
+
+**Symptom**
+
+After a node fails, `ha-manager status` shows the VM `started` on a surviving node, and a few minutes later the resurrector deletes it and creates a new VM with a new CID. The instance stays down far longer than the HA recovery took. `bosh tasks --recent` shows a `scan_and_fix` task whose first `delete_vm` deferred while the VM was in `fence` or `recovery`, followed by a `delete_vm` that succeeded and a `create_vm`.
+
+**Cause**
+
+The Director's `hm.intervals.agent_timeout` is shorter than the time PVE HA takes to fence the failed node and start the VM elsewhere. The watchdog resets a node about 60 seconds after it loses quorum, and the whole recovery takes about two to four minutes, while the default timeout is 60 seconds. The Health Monitor therefore reports the instance before the recovery ends. The CPI defers `delete_vm` during `fence` and `recovery`, but a retry that arrives after the VM is running again finds an ordinary VM and deletes it. The persistent disk stays safe on a parker, and the replacement attaches it, so the cost is downtime rather than data. In one test with the default timeout, the instance was down for about nine and a half minutes against about two and a half for the recovery alone.
+
+**Fix**
+
+We raise `hm.intervals.agent_timeout` above the HA recovery time, to 300 seconds, with an ops file on the Director manifest, and then redeploy the Director.
+
+```yaml
+- type: replace
+  path: /instance_groups/name=bosh/properties/hm/intervals?/agent_timeout?
+  value: 300
+```
+
+[HA and Resurrection](ha-and-resurrection.md#set-agent_timeout-above-the-ha-recovery-time) explains the timing.
+
 ## A VM's HA pin leaves out a node that has returned
 
 **Symptom**

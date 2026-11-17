@@ -663,6 +663,10 @@ The CPI also removes cache files that nobody has touched for 30 days when it wri
 
 This section is for operators who set `pve.ha.mode` to `auto` or `managed`, and for anyone who finds HA objects on a cluster after switching back to `off`. [HA and Resurrection](ha-and-resurrection.md) explains the model, and [Configuration, HA](configuration.md#ha) lists the properties. The commands below run on a PVE node as root unless they say otherwise.
 
+### Raise `agent_timeout` before turning HA on
+
+Before we set `pve.ha.mode` to `auto` or `managed`, we raise the Director's `hm.intervals.agent_timeout` to 300 seconds, which is above the two to four minutes PVE HA takes to fence a failed node and start its VMs elsewhere. With the default of 60 seconds, the resurrector can reach a VM after PVE HA has already recovered it, and its `delete_vm` then destroys the recovered VM and `create_vm` builds a replacement. The persistent disk survives on a parker, but the instance stays down several minutes longer than it needed to. [HA and Resurrection](ha-and-resurrection.md#set-agent_timeout-above-the-ha-recovery-time) gives the timing, and [A VM that PVE HA recovered is deleted and recreated](troubleshooting.md#a-vm-that-pve-ha-recovered-is-deleted-and-recreated) has the ops file.
+
 ### Reading the cluster with `pve-cid ha`
 
 The `pve-cid ha` subcommand is a read-only doctor. It never writes to PVE, and it runs in every mode, `off` included. On the Director VM we run it with the full path, because `pve-cid` is not on `PATH`. The `--config` flag is optional there, because the command looks for the configuration in `--config`, then in `$PVE_CPI_CONFIG`, and then at `/var/vcap/jobs/pve_cpi/config/cpi.json`.

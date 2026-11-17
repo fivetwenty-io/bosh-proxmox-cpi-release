@@ -117,7 +117,7 @@ The CPI never writes the cluster CRS option. It reads `/cluster/options` each ti
 
 We no longer ask operators to turn the BOSH resurrector off. PVE HA is the first responder for a registered VM, and the resurrector is the fallback. The CPI defers `delete_vm` while PVE HA is fencing or recovering a VM, `has_vm` never reports a VM in fence or recovery as gone, and `attach_disk` refuses a second holder of a disk with a retriable error, so the resurrector cannot build a replacement beside a guest that PVE HA is about to restart. Earlier releases told operators to run `bosh update-resurrection off` for these deployments. That advice is withdrawn.
 
-DLB adds one more thing to know. The cluster resource manager can move a DLB-registered VM at any time to rebalance load, and a migration in flight makes `delete_vm` wait for motion, as the defer table in [HA and Resurrection](ha-and-resurrection.md#when-delete_vm-defers) shows. Raise the Director's Health Monitor `agent_timeout` (the `hm.intervals.agent_timeout` property) to 240 seconds or more, as that page recommends, so that a short pause during a migration does not start a resurrection.
+DLB adds one more thing to know. The cluster resource manager can move a DLB-registered VM at any time to rebalance load, and a migration in flight makes `delete_vm` wait for motion, as the defer table in [HA and Resurrection](ha-and-resurrection.md#when-delete_vm-defers) shows. Raise the Director's Health Monitor `agent_timeout` (the `hm.intervals.agent_timeout` property) to 300 seconds or more, as that page recommends, so that a short pause during a migration does not start a resurrection.
 
 ### Shared Storage Required
 
