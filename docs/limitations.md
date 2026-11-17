@@ -125,7 +125,7 @@ This page collects every known limitation of the CPI in one place. Each entry is
   A release older than the one that introduced `pve.ha.local_policy: replicate` refuses such a record. See the [changelog](../CHANGELOG.md) and [Operations](operations.md#pve-ha).
 
 - The N+1 headroom check is a memory-only estimate
-  It ignores host overhead, ballooning, and recovery order, so a cluster that passes can still fail to restart every VM. See [HA and Resurrection](ha-and-resurrection.md#placement-under-ha).
+  It ignores host overhead, ballooning, and recovery order, so a cluster that passes can still fail to restart every VM. `create_vm` also skips the check for a `replicate` VM, because its replicated disk pins it to one node, so run `pve-cid ha` to see the margin with those VMs counted. See [HA and Resurrection](ha-and-resurrection.md#placement-under-ha).
 
 - `hold` VMs block node maintenance until an operator stops them
   The strict one-node pin forbids every other node, so HA cannot evacuate the VM. See [Operations](operations.md#node-maintenance-with-hold-vms).
