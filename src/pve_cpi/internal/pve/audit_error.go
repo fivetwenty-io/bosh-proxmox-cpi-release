@@ -72,17 +72,27 @@ var ErrAuditVisibilityReaderUnavailable error = &AuditVisibilityReadError{text: 
 
 // GuestEnumerationError names the cluster members whose guest listing failed.
 // Its own text carries only node names; Cause holds the per-node failure when
-// one API verdict decided the classification.
+// one API verdict decided the classification. Offline names the members among
+// Nodes that the quorate cluster reported offline when the listing gave up on
+// them, and the text then says that the call can succeed only once they are
+// back.
 type GuestEnumerationError struct {
-	Nodes []string
-	Cause error
+	Nodes   []string
+	Cause   error
+	Offline []string
 }
 
 func (e *GuestEnumerationError) Error() string {
 	if e.Cause != nil {
 		return fmt.Sprintf("could not list guests on node %s; refusing to decide from a partial fleet: %s", strings.Join(e.Nodes, ","), e.Cause.Error())
 	}
-	return fmt.Sprintf("could not list guests on node(s) %s; refusing to decide from a partial fleet", strings.Join(e.Nodes, ","))
+	text := fmt.Sprintf("could not list guests on node(s) %s; refusing to decide from a partial fleet", strings.Join(e.Nodes, ","))
+	if len(e.Offline) > 0 {
+		text += fmt.Sprintf("; the cluster reports node(s) %s offline, and their guests' configs can't be read until "+
+			"they return, so retry once node(s) %s are back in the cluster",
+			strings.Join(e.Offline, ","), strings.Join(e.Offline, ","))
+	}
+	return text
 }
 
 func (e *GuestEnumerationError) Unwrap() error { return e.Cause }

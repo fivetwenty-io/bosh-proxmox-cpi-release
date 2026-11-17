@@ -149,9 +149,31 @@ func ListMemberGuests(ctx context.Context, c Client, logger *log.Logger, nodes [
 		guests = append(guests, nodeGuests...)
 	}
 	if len(failedNodes) > 0 {
-		return nil, partialFleetError(failedNodes, failedErrs)
+		return nil, partialFleetError(failedNodes, failedErrs, failedMembersReportedOffline(ctx, c, logger, failedNodes))
 	}
 	return guests, nil
+}
+
+// failedMembersReportedOffline returns the members among failed that the
+// quorate cluster reports offline, read with a single status attempt after a
+// listing with the strict budget gave up on them. The strict listing never
+// leaves such a member out, because its callers need every member's guests
+// and a member that is offline still holds the configs of its guests. Naming
+// it as offline in the refusal tells the operator that the call can only
+// succeed once the member is back. A status read that fails, or a cluster
+// without quorum, names none, and the refusal reads as it did before.
+func failedMembersReportedOffline(ctx context.Context, c Client, logger *log.Logger, failed []string) []string {
+	offline := readOfflineClusterNodes(ctx, c, logger, 1)
+	if len(offline) == 0 {
+		return nil
+	}
+	var out []string
+	for _, node := range failed {
+		if offline[node] {
+			out = append(out, node)
+		}
+	}
+	return out
 }
 
 // ClusterReportsMemberOffline reports whether the quorate cluster now reports
@@ -253,7 +275,14 @@ func listGuestsAuthoritative(
 		guests = append(guests, nodeGuests...)
 	}
 	if len(failedNodes) > 0 {
-		return nil, nil, partialFleetError(failedNodes, failedErrs)
+		// Only the strict form names the failed members the cluster reports
+		// offline. The tolerant form leaves such a member out instead, so a
+		// member it failed on was still reported online.
+		var failedOffline []string
+		if offline == nil && wentOffline == nil {
+			failedOffline = failedMembersReportedOffline(ctx, c, logger, failedNodes)
+		}
+		return nil, nil, partialFleetError(failedNodes, failedErrs, failedOffline)
 	}
 	if !listedAny {
 		// Every member excluded as offline: an empty result here would read
@@ -407,8 +436,10 @@ func listNodeGuests(
 // on the Director's next attempt, and concluding from a partial fleet would
 // repeat the stale-index bug with a different source. Both shapes carry a
 // GuestEnumerationError, so an audit can name the failed nodes without
-// repeating the transport text.
-func partialFleetError(failedNodes []string, failedErrs []error) error {
+// repeating the transport text. failedOffline names the failed members the
+// quorate cluster reports offline, and only the retriable shape carries it,
+// because a member that gave a real API answer was reachable.
+func partialFleetError(failedNodes []string, failedErrs []error, failedOffline []string) error {
 	for i, fe := range failedErrs {
 		if _, isAPIVerdict := apiHTTPCode(fe); !isAPIVerdict {
 			continue
@@ -418,5 +449,5 @@ func partialFleetError(failedNodes []string, failedErrs []error) error {
 		}
 		return cpierrors.Wrap(&GuestEnumerationError{Nodes: []string{failedNodes[i]}, Cause: WrapError(fe)}, "ListGuestsAuthoritative")
 	}
-	return cpierrors.WrapAs(&GuestEnumerationError{Nodes: failedNodes}, cpierrors.TypeRetriableCloud, "ListGuestsAuthoritative")
+	return cpierrors.WrapAs(&GuestEnumerationError{Nodes: failedNodes, Offline: failedOffline}, cpierrors.TypeRetriableCloud, "ListGuestsAuthoritative")
 }
