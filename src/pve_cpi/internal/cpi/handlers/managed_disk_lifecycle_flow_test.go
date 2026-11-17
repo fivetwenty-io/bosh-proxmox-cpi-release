@@ -1527,6 +1527,13 @@ func (c lifecycleFlowCluster) DeleteHaResources(ctx context.Context, sid string,
 	return c.c.haStore.DeleteHaResources(ctx, sid, p)
 }
 
+func (c lifecycleFlowCluster) CreateHaResourcesMigrate(_ context.Context, sid string,
+	p *cluster.CreateHaResourcesMigrateParams,
+) (*cluster.CreateHaResourcesMigrateResponse, error) {
+	c.c.haStore.writes = append(c.c.haStore.writes, "migrate-resource:"+sid+":"+p.Node)
+	return &cluster.CreateHaResourcesMigrateResponse{Sid: sid, RequestedNode: p.Node}, nil
+}
+
 func (c lifecycleFlowCluster) UpdateHaResources(_ context.Context, sid string, p *cluster.UpdateHaResourcesParams) error {
 	store := c.c.haStore
 	store.writes = append(store.writes, "update-resource:"+sid)

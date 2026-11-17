@@ -471,6 +471,17 @@ func (t *managedClusterService) UpdateHaResources(ctx context.Context, sid strin
 	err = t.guard.finish(ctx, m, token, nil, err)
 	return
 }
+func (t *managedClusterService) CreateHaResourcesMigrate(ctx context.Context, sid string, params *cluster.CreateHaResourcesMigrateParams) (resp *cluster.CreateHaResourcesMigrateResponse, err error) {
+	m := ManagedAllocationMutation{Service: managedServiceCluster, Method: "CreateHaResourcesMigrate", Args: map[string]any{"sid": sid, managedArgumentParams: params}}
+	token, err := t.guard.begin(ctx, m)
+	if err != nil {
+		return
+	}
+	defer t.guard.end(ctx, m, token)
+	resp, err = t.Service.CreateHaResourcesMigrate(ctx, sid, params)
+	err = t.guard.finish(ctx, m, token, resp, err)
+	return
+}
 func (t *managedClusterService) DeleteHaResources(ctx context.Context, sid string, params *cluster.DeleteHaResourcesParams) (err error) {
 	m := ManagedAllocationMutation{Service: managedServiceCluster, Method: "DeleteHaResources", Args: map[string]any{"sid": sid, managedArgumentParams: params}}
 	token, err := t.guard.begin(ctx, m)

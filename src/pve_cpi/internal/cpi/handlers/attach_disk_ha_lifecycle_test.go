@@ -333,6 +333,30 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 		{"a removal without parameters", func() error {
 			return svc.DeleteHaResources(ctx, "vm:777", &cluster.DeleteHaResourcesParams{})
 		}},
+		{"a migrate request for another VM's resource of this Director", func() error {
+			_, err := svc.CreateHaResourcesMigrate(ctx, "vm:555", &cluster.CreateHaResourcesMigrateParams{Node: "n2"})
+			return err
+		}},
+		{"a migrate request for another Director's resource", func() error {
+			_, err := svc.CreateHaResourcesMigrate(ctx, "vm:888", &cluster.CreateHaResourcesMigrateParams{Node: "n2"})
+			return err
+		}},
+		{"a migrate request that names no node", func() error {
+			_, err := svc.CreateHaResourcesMigrate(ctx, "vm:777", &cluster.CreateHaResourcesMigrateParams{})
+			return err
+		}},
+		{"a migrate request while another Director's marker is on the resource",
+			withResourceComment(other, func() error {
+				_, err := svc.CreateHaResourcesMigrate(ctx, "vm:777",
+					&cluster.CreateHaResourcesMigrateParams{Node: "n2"})
+				return err
+			})},
+		{"a migrate request while the barrier holds the resource ignored",
+			withHeld("ignored", heldFromStarted, func() error {
+				_, err := svc.CreateHaResourcesMigrate(ctx, "vm:777",
+					&cluster.CreateHaResourcesMigrateParams{Node: "n2"})
+				return err
+			})},
 	}
 	// reasons holds the refusal that rows whose write another check could
 	// also refuse must give.
@@ -363,6 +387,15 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 		t.Fatal("a refused write changed VM 555's resource or pin")
 	}
 
+	// The move an attach asks PVE HA for, to bring its VM back into its node
+	// set, passes for the lifecycle's VM while it requests started.
+	if _, err := svc.CreateHaResourcesMigrate(ctx, "vm:777",
+		&cluster.CreateHaResourcesMigrateParams{Node: "n2"}); err != nil {
+		t.Fatalf("migrate this Director's resource: %v", err)
+	}
+	if !slices.Contains(store.writes, "migrate-resource:vm:777:n2") {
+		t.Fatalf("writes %v, want the migrate request sent", store.writes)
+	}
 	if err := svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &ignored,
 		Comment: &marker}); err != nil {
 		t.Fatalf("request ignored on this Director's resource: %v", err)

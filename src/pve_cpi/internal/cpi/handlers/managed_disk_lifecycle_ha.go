@@ -26,7 +26,8 @@ func isLifecycleHAWrite(call ManagedAllocationMutation) bool {
 		return false
 	}
 	switch call.Method {
-	case "CreateHaRules", "UpdateHaRules", "DeleteHaRules", "UpdateHaResources", "DeleteHaResources":
+	case "CreateHaRules", "UpdateHaRules", "DeleteHaRules", "UpdateHaResources", "DeleteHaResources",
+		"CreateHaResourcesMigrate":
 		return true
 	}
 	return false
@@ -61,8 +62,11 @@ func isLifecycleHAWrite(call ManagedAllocationMutation) bool {
 // and its delete list is read the way PVE reads it (see splitPVEList). A
 // comment it writes must keep the marker. A removal must purge the resource
 // from its rules, the only removal the CPI sends, and the removal of a
-// resource that is already gone changes nothing and passes. A disk lifecycle
-// never creates an HA resource, because a registration also rewrites the VM's
+// resource that is already gone changes nothing and passes. A migrate request
+// passes only for the VM's resource with a target node, and only when the
+// resource carries this Director's marker now and requests started or stopped,
+// which is the move an attach asks PVE HA for to bring a VM that drifted back
+// into its node set. A disk lifecycle never creates an HA resource, because a registration also rewrites the VM's
 // tags and description (see errAttachReaddGuarded).
 //
 // A refusal wraps errManagedHAWriteRefused and a read that fails wraps
@@ -118,6 +122,13 @@ func (g *managedDiskLifecycleGuard) admitLifecycleHAWrite(ctx context.Context, c
 			}
 			return refuse(err)
 		}
+	case "CreateHaResourcesMigrate":
+		if err := g.admitLifecycleHAMigrate(ctx, call, sid, owner); err != nil {
+			if errors.Is(err, errManagedAdmissionReadFailed) || errors.Is(err, errManagedRequestEnded) {
+				return "", err
+			}
+			return refuse(err)
+		}
 	case "UpdateHaResources", "DeleteHaResources":
 		if err := g.admitLifecycleHAResourceWrite(ctx, call, sid, owner); err != nil {
 			if errors.Is(err, errManagedAdmissionReadFailed) || errors.Is(err, errManagedRequestEnded) {
@@ -129,6 +140,39 @@ func (g *managedDiskLifecycleGuard) admitLifecycleHAWrite(ctx context.Context, c
 		return refuse(fmt.Errorf("unexpected HA write %s", call.Method))
 	}
 	return managedUnjournaledStep, nil
+}
+
+// admitLifecycleHAMigrate checks an HA migrate request inside a disk
+// lifecycle against want, the resource of the lifecycle's VM, and against the
+// resource as PVE holds it now (see admitLifecycleHAWrite).
+func (g *managedDiskLifecycleGuard) admitLifecycleHAMigrate(
+	ctx context.Context, call ManagedAllocationMutation, want, owner string,
+) error {
+	sid, _ := call.Args["sid"].(string)
+	if sid != want {
+		return fmt.Errorf("HA resource %q is not the resource %s of the lifecycle's VM", sid, want)
+	}
+	params, ok := call.Args[managedArgumentParams].(*cluster.CreateHaResourcesMigrateParams)
+	if !ok || params == nil || strings.TrimSpace(params.Node) == "" {
+		return fmt.Errorf("HA resource %s migrate request names no target node", sid)
+	}
+	got, err := g.lifecycle.deps.PVE.Cluster().GetHaResources(ctx, sid)
+	switch {
+	case err != nil && (isHaNotFound(err) || pve.IsNotFound(err)):
+		return fmt.Errorf("HA resource %s was absent before its migrate request", sid)
+	case err != nil:
+		return g.admissionReadFailed(ctx, call, "the owner of HA resource "+sid, err)
+	case got == nil:
+		return g.admissionReadFailed(ctx, call, "the owner of HA resource "+sid,
+			errors.New("the read returned nothing"))
+	case got.Comment == nil || haOwnershipOf(*got.Comment, owner) != haOwnedByUs:
+		return fmt.Errorf("HA resource %s does not carry this Director's ownership marker", sid)
+	}
+	if state := pve.HARequestedState(got.State); state != "started" && state != "stopped" {
+		return fmt.Errorf("HA resource %s requests %s, and a disk lifecycle migrates only a resource that "+
+			"requests started or stopped", sid, state)
+	}
+	return nil
 }
 
 // lifecycleHAStates lists the requested states a disk lifecycle may set on
