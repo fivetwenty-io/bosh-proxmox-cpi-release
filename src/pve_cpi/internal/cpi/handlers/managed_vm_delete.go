@@ -39,6 +39,17 @@ const (
 	managedVMCreateRollback
 )
 
+// Callers of the HA delete gate for a disposal that delete_vm does not run.
+// Only delete_vm records HA recovery deferrals and waits for a restarted VM
+// to settle (see haRecoveryCaller). A rolled-back create_vm attempt and a VM
+// an operator's storage-journal cleanup disposes of were never handed to the
+// Director, so no resurrector races PVE HA for them, and a settle wait would
+// only hold the cleanup and its generation back.
+const (
+	managedVMRollbackCaller = "create_vm: rollback"
+	managedVMCleanupCaller  = "storage allocation cleanup"
+)
+
 // settle applies the failure rule for this kind of disposal.
 func (d managedVMDisposal) settle(handle *aj.Handle, err error) error {
 	if d == managedVMCreateRollback {
@@ -50,7 +61,7 @@ func (d managedVMDisposal) settle(handle *aj.Handle, err error) error {
 // cleanupManagedVMAttempt returns fresh disposition evidence without closing the
 // generation. The caller may close the attempt, admit a retry, or tombstone it.
 func cleanupManagedVMAttempt(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle) (aj.Verification, error) {
-	return disposeManagedVM(ctx, deps, journal, handle, false)
+	return disposeManagedVMFor(ctx, deps, journal, handle, false, managedVMDeletion, managedVMCleanupCaller)
 }
 
 // rollbackManagedVMAttempt is cleanupManagedVMAttempt for a create_vm attempt
@@ -66,7 +77,7 @@ func cleanupManagedVMAttempt(ctx context.Context, deps Deps, journal *aj.Journal
 func rollbackManagedVMAttempt(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle) (aj.Verification, error) {
 	rollbackCtx, cancel := finishingContext(ctx, managedVMRollbackBudget(deps))
 	defer cancel()
-	return disposeManagedVMFor(rollbackCtx, deps, journal, handle, false, managedVMCreateRollback)
+	return disposeManagedVMFor(rollbackCtx, deps, journal, handle, false, managedVMCreateRollback, managedVMRollbackCaller)
 }
 
 // managedVMRollbackBudget is the least time a create_vm rollback's VM disposal
@@ -78,11 +89,18 @@ func managedVMRollbackBudget(deps Deps) time.Duration {
 	return time.Duration(deps.Config.OperationTimeoutDeleteSec()) * time.Second
 }
 
+// disposeManagedVM disposes of a VM for delete_vm.
 func disposeManagedVM(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle, retain bool) (aj.Verification, error) {
-	return disposeManagedVMFor(ctx, deps, journal, handle, retain, managedVMDeletion)
+	return disposeManagedVMFor(ctx, deps, journal, handle, retain, managedVMDeletion, haRecoveryCaller)
 }
 
-func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle, retain bool, disposal managedVMDisposal) (proof aj.Verification, retErr error) {
+// disposeManagedVMFor disposes of the VM the record names. haCaller is the
+// caller the HA delete gate names in its errors and logs, and only delete_vm
+// records HA recovery deferrals and waits for a restarted VM to settle.
+func disposeManagedVMFor(
+	ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle, retain bool, disposal managedVMDisposal,
+	haCaller string,
+) (proof aj.Verification, retErr error) {
 	if handle == nil || journal == nil {
 		return proof, storageRefusal("VM cleanup requires held journal authority")
 	}
@@ -112,7 +130,7 @@ func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, ha
 	if err := includePendingCleanupVolumes(ctx, deps, journal, record, owned); err != nil {
 		return proof, err
 	}
-	haState, err := locateAndGateManagedVM(ctx, deps, node, vmid)
+	haState, err := locateAndGateManagedVM(ctx, deps, haCaller, node, vmid)
 	if err != nil {
 		return proof, err
 	}
@@ -216,8 +234,8 @@ func auditManagedVMCleanup(ctx context.Context, deps Deps, journal *aj.Journal) 
 // only, so it runs before the disposal's config read, which fails on a dead or
 // fenced node, and before the admission, so a deferral leaves the record
 // exactly as it was and touches nothing in PVE. A record without a node has no
-// VM to gate and returns no state.
-func locateAndGateManagedVM(ctx context.Context, deps Deps, node string, vmid int) (*pve.HAServiceState, error) {
+// VM to gate and returns no state. caller is the caller the gate names.
+func locateAndGateManagedVM(ctx context.Context, deps Deps, caller, node string, vmid int) (*pve.HAServiceState, error) {
 	if vmid > 0 {
 		location, err := findVMAuthoritative(ctx, deps, vmid)
 		if err != nil {
@@ -231,7 +249,7 @@ func locateAndGateManagedVM(ctx context.Context, deps Deps, node string, vmid in
 		return nil, nil
 	}
 	logger := deps.Log(ctx).With(log.Int("vmid", vmid), log.String("node", node))
-	return gateHADelete(ctx, deps, "delete_vm", vmid, node, logger)
+	return gateHADelete(ctx, deps, caller, vmid, node, logger)
 }
 
 func managedVMDeleteTask(ctx context.Context, deps Deps, handle *aj.Handle, kind string, target aj.Target, submit func() (any, error), observe func() error) error {

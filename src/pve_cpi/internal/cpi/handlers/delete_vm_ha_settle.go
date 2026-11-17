@@ -52,8 +52,8 @@ const (
 const haRawStateStarted = "started"
 
 // haRecoveryCaller is the only caller whose deferrals are recorded and whose
-// deletes settle. The create_vm rollback and the deferred-teardown sweep never
-// read or write the record.
+// deletes settle. The create_vm rollbacks, the deferred-teardown sweep, and an
+// operator's storage-journal cleanup never read or write the record.
 const haRecoveryCaller = "delete_vm"
 
 // recordHARecoveryDeferral records that a delete_vm deferred a VM that PVE HA

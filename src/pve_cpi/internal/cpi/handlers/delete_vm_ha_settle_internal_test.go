@@ -229,6 +229,31 @@ func TestGateHADeleteSettleOnlyForDeleteVM(t *testing.T) {
 	}
 }
 
+// TestManagedVMDisposalsOutsideDeleteVMIgnoreTheSettleRecord gates the VM of
+// a rolled-back managed create_vm attempt and of an operator's storage-journal
+// cleanup. Neither VM was handed to the Director, so neither gate records a
+// deferral, and a recorded deferral never holds either one.
+func TestManagedVMDisposalsOutsideDeleteVMIgnoreTheSettleRecord(t *testing.T) {
+	for _, caller := range []string{managedVMRollbackCaller, managedVMCleanupCaller} {
+		t.Run(caller, func(t *testing.T) {
+			scene := recoveryScene()
+			f := newHADeleteFixture(t, scene, 600)
+			_, err := locateAndGateManagedVM(t.Context(), f.deps, caller, "pve-node2", 101)
+			requireHADeferral(t, err, caller+": VM 101", "grace window remain")
+			f.requireDeferralHeld(t, false)
+
+			if err := f.deps.HAEpisodes.RecordRecoveryDeferral("vm:101"); err != nil {
+				t.Fatal(err)
+			}
+			scene.Do(func(s *HADeleteScene) { restartInPlace(s, 10) })
+			st, err := locateAndGateManagedVM(t.Context(), f.deps, caller, "pve-node2", 101)
+			if err != nil || st == nil {
+				t.Fatalf("%s must not wait for a settle: st=%+v err=%v", caller, st, err)
+			}
+		})
+	}
+}
+
 // TestRecordHARecoveryDeferralForStatesThatMayHideARecovery records a
 // deferral for the defer and grace window answers of a managed VM and for
 // every unknown state, except one whose known state proves PVE HA does not
