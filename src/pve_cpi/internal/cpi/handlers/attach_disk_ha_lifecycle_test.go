@@ -24,7 +24,7 @@ import (
 // carry aaDirector's marker, and the pin records storages. The disk's storage
 // is shared NFS that both nodes reach. It returns the fixture, the HA store,
 // the journal, and the disk's record ID and CID.
-func haLifecycleFixture(t *testing.T, storages ...string) (Deps, *lifecycleFlowPVE, *lifecycleFlowHA, *aj.Journal, string, string) {
+func haLifecycleFixture(t *testing.T, storages ...string) haLifecycle {
 	t.Helper()
 	deps, client, jr, id, cid := lifecycleFlowFixture(t)
 	deps.Config.DetachedDiskStrategy = "parked"
@@ -56,7 +56,17 @@ func haLifecycleFixture(t *testing.T, storages ...string) (Deps, *lifecycleFlowP
 	repl.source = "n1"
 	deps.Replication, client.replication = repl, repl
 	client.state.configs[777]["tags"] = "bosh-cpi;" + haManagedTag
-	return deps, client, store, jr, id, cid
+	return haLifecycle{deps: deps, client: client, store: store, jr: jr, id: id, cid: cid}
+}
+
+// haLifecycle is what haLifecycleFixture builds.
+type haLifecycle struct {
+	deps   Deps
+	client *lifecycleFlowPVE
+	store  *lifecycleFlowHA
+	jr     *aj.Journal
+	id     string
+	cid    string
 }
 
 // TestManagedAttachWritesTheHAPinInsideTheDiskLifecycle attaches a
@@ -68,7 +78,8 @@ func haLifecycleFixture(t *testing.T, storages ...string) (Deps, *lifecycleFlowP
 // succeeds, the pin records the storage, and the disk's record does not ask for
 // reconciliation.
 func TestManagedAttachWritesTheHAPinInsideTheDiskLifecycle(t *testing.T) {
-	deps, client, store, jr, id, cid := haLifecycleFixture(t)
+	f := haLifecycleFixture(t)
+	deps, client, store, jr, id, cid := f.deps, f.client, f.store, f.jr, f.id, f.cid
 	_, err := HandleAttachDisk(deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, "777"), planJSON(t, cid)},
 		jsonrpc.Context{DirectorUUID: aaDirector})
 	if err != nil {
@@ -122,7 +133,8 @@ func TestManagedAttachWritesTheHAPinInsideTheDiskLifecycle(t *testing.T) {
 // guard usable too. A write that targets a VM still needs the VM's identity,
 // and one without it locks the guard as before.
 func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
-	deps, _, store, jr, id, cid := haLifecycleFixture(t)
+	f := haLifecycleFixture(t)
+	deps, store, jr, id, cid := f.deps, f.store, f.jr, f.id, f.cid
 	ctx := context.Background()
 	deps.RequestDirectorUUID = aaDirector
 	other := haIdentity{Owner: aaOtherDirector}.marker()
@@ -246,7 +258,8 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 // admission does not reach it, so it is refused for its missing target and
 // the guard locks, as it did before.
 func TestDiskLifecycleGuardStillNeedsTheVMOfAVMWrite(t *testing.T) {
-	deps, _, _, _, _, cid := haLifecycleFixture(t)
+	f := haLifecycleFixture(t)
+	deps, cid := f.deps, f.cid
 	ctx := context.Background()
 	deps.RequestDirectorUUID = aaDirector
 	bare, meta, err := decodeDiskCID(ctx, deps, "attach_disk", cid)
