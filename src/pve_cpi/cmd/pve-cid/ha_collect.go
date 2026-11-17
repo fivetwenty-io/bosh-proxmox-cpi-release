@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1094,8 +1096,8 @@ func (c *haCollector) reversedSync(g *haGuest, move ha.PartnerMove) (bool, strin
 		return false, "the VM's config or the storage index could not be read"
 	}
 	storages := make([]pve.StorageInfo, 0, len(c.storages))
-	for _, info := range c.storages {
-		storages = append(storages, info)
+	for _, name := range slices.Sorted(maps.Keys(c.storages)) {
+		storages = append(storages, c.storages[name])
 	}
 	volids, gaps := ha.ReplicaVolumes(g.ref.VMID, g.volumes, storages)
 	if len(gaps) > 0 {

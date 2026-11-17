@@ -859,7 +859,7 @@ func (c *attachRunClient) TaskLog(_ context.Context, node, upid string) ([]strin
 }
 
 // started records a qmstart task of VM 100 on node that ran from start to
-// end and ended with status, and returns its UPID, which carries its start
+// end and ended with status. which carries its start
 // time the way PVE's does.
 func (s *taskListStub) started(node string, start, end time.Time, status string) string {
 	task := pve.VMTask{UPID: fmt.Sprintf("UPID:%s:00000001:00000001:%08X:qmstart:100:root@pam:", node, start.Unix()),
@@ -872,15 +872,14 @@ func (s *taskListStub) started(node string, start, end time.Time, status string)
 }
 
 // migrated records a qmigrate task of VM 100 on node that ran from start to
-// end and ended with status, and returns its UPID.
-func (s *taskListStub) migrated(node string, start, end time.Time, status string) string {
+// end and ended with status.
+func (s *taskListStub) migrated(node string, start, end time.Time, status string) {
 	task := pve.VMTask{UPID: fmt.Sprintf("UPID:%s:00000001:00000001:%08X:qmigrate:100:root@pam:", node, start.Unix()),
 		Node: node, Type: "qmigrate", ID: "100", Status: status, StartTime: start.Unix()}
 	if !end.IsZero() {
 		task.EndTime = end.Unix()
 	}
 	s.migrations[node] = append(s.migrations[node], task)
-	return task.UPID
 }
 
 func TestAttachUnchangedReadsTheNewDisksStorage(t *testing.T) {
