@@ -88,6 +88,9 @@ type HAReader interface {
 	Storages(ctx context.Context) ([]pve.StorageInfo, error)
 	// NextID returns the datacenter next-id range as an inclusive band.
 	NextID(ctx context.Context) (pve.VMIDBand, error)
+	// EntryClock reads GET /nodes/{node}/time once, with no retry, and returns
+	// the failure when the node's clock cannot be read.
+	EntryClock(ctx context.Context, node string) error
 	// Journal reads the replicated allocations from the allocation journal.
 	// nodes are the cluster's node names, which identify the cluster.
 	Journal(ctx context.Context, nodes []string) (JournalView, error)
@@ -186,6 +189,20 @@ func (r *pveHAReader) ServiceStates(ctx context.Context) (map[string]string, err
 		return nil, fmt.Errorf("read HA manager status: %w", err)
 	}
 	return states, nil
+}
+
+func (r *pveHAReader) EntryClock(ctx context.Context, node string) error {
+	if err := r.ready(); err != nil {
+		return err
+	}
+	resp, err := r.client.Nodes().ListTime(ctx, node)
+	if err != nil {
+		return err
+	}
+	if resp == nil || resp.Time.Int() <= 0 {
+		return fmt.Errorf("node %s returned no clock", node)
+	}
+	return nil
 }
 
 func (r *pveHAReader) Rules(ctx context.Context) ([]ha.Rule, error) {

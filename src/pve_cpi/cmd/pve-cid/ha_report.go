@@ -20,6 +20,7 @@ const (
 	haKindUnchecked             = "unchecked"
 	haKindObserveOnly           = "observe_only"
 	haKindNodeDown              = "node_down"
+	haKindEntryClock            = "entry_clock_unreadable"
 	haKindQuorumFragile         = "quorum_fragile"
 	haKindQDeviceAdvice         = "qdevice_advice"
 	haKindAdvice                = "advice"

@@ -67,6 +67,11 @@ type fakeHA struct {
 
 	journal    JournalView
 	journalErr error
+
+	// clockErr is what a read of the entry node's clock returns, and clockReads
+	// counts those reads.
+	clockErr   error
+	clockReads int
 }
 
 var _ HAReader = (*fakeHA)(nil)
@@ -79,6 +84,11 @@ func (f *fakeHA) Resources(context.Context) ([]HAResourceRow, error) {
 
 func (f *fakeHA) ServiceStates(context.Context) (map[string]string, error) {
 	return f.states, f.statesErr
+}
+
+func (f *fakeHA) EntryClock(context.Context, string) error {
+	f.clockReads++
+	return f.clockErr
 }
 
 func (f *fakeHA) Rules(context.Context) ([]ha.Rule, error) { return f.rules, f.rulesErr }

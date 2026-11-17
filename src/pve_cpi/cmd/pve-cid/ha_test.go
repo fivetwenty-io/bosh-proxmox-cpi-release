@@ -449,3 +449,32 @@ func TestMainDispatchesHA(t *testing.T) {
 		t.Fatalf("usage lacks the ha line:\n%s", stdout.String())
 	}
 }
+
+func TestRunHAEntryClockKindAppearsInJSONAndBySeverity(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	f.profile.Health.EntryNode = "n1"
+	f.profile.Health.ClockNode = "n2"
+	f.profile.Health.ClockFallback = "the entry node's clock read failed (500), so timestamps are measured on node n2's clock"
+	f.clockErr = errFake
+	code, out, _ := runHATest(t, newHATestDeps(haCfg("auto", "none"), f), "--json")
+	if code != exitOK {
+		t.Fatalf("advice must not fail the run: code = %d", code)
+	}
+	var report haReport
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("json: %v\n%s", err, out)
+	}
+	if got := findings(&report, haKindEntryClock); len(got) != 1 || got[0].Severity != haSeverityAdvice || got[0].Subject != "n1" {
+		t.Fatalf("entry_clock_unreadable findings = %+v", got)
+	}
+
+	g := haBaseFake()
+	g.profile.Health.EntryNode = "n1"
+	g.profile.Health.HA = pve.HAViewUnreadable
+	g.profile.Health.HAReason = "entry node clock unreadable, so timestamps cannot be measured: 500"
+	code, out, _ = runHATest(t, newHATestDeps(haCfg("auto", "none"), g))
+	if code != exitError || !strings.Contains(out, "[problem] entry_clock_unreadable") {
+		t.Fatalf("no clock answered: code = %d\n%s", code, out)
+	}
+}

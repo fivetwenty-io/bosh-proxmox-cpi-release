@@ -531,6 +531,7 @@ func (c *haCollector) profileFindings() {
 		}
 		rep.problem(haKindObserveOnly, "", "%s", detail)
 	}
+	c.entryClockFinding()
 	if p.Health != nil {
 		for i := range p.Health.Nodes {
 			n := &p.Health.Nodes[i]
@@ -562,6 +563,36 @@ func (c *haCollector) profileFindings() {
 			rep.advise(haKindCRSMode, "",
 				"pve.ha.dlb.enabled is on, but the cluster's ha-auto-rebalance is off, so nothing rebalances; the CPI never writes CRS")
 		}
+	}
+}
+
+// entryClockFinding reports an entry node whose own clock cannot be read. A
+// node does that while systemd shuts it down, or when systemd-timedated is
+// broken. When a peer's clock was borrowed the HA view stays good, so the
+// finding is advice, and the doctor reads the entry node's clock once more so
+// that a one-off server error on a healthy node reports nothing. When no
+// clock answered, the profile is observe-only, so the finding is a problem.
+func (c *haCollector) entryClockFinding() {
+	h := c.p.Health
+	if h == nil {
+		return
+	}
+	entry := h.EntryNode
+	if h.ClockFallback != "" {
+		if entry != "" {
+			if err := c.r.EntryClock(c.ctx, entry); err == nil {
+				return
+			}
+		}
+		c.rep.advise(haKindEntryClock, entry,
+			"%s, and the doctor's own read of that clock failed too. A node does this while systemd shuts it down. Otherwise check timedatectl and systemd-timedated on %s, or put another node first in pve.endpoints",
+			h.ClockFallback, entry)
+		return
+	}
+	if h.HA == pve.HAViewUnreadable && strings.HasPrefix(h.HAReason, "entry node clock unreadable") {
+		c.rep.problem(haKindEntryClock, entry,
+			"no node's clock answered, so the HA view is unreadable and the profile is observe-only (%s). Check timedatectl and systemd-timedated on %s and on the other nodes, or put another node first in pve.endpoints",
+			h.HAReason, entry)
 	}
 }
 

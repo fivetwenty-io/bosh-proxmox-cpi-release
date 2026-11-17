@@ -2316,3 +2316,50 @@ func TestCollectCPUPinAgainstDomain(t *testing.T) {
 		})
 	}
 }
+
+func TestCollectEntryClockBorrowedIsAdviceAfterASecondFailedRead(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	f.profile.Health.EntryNode = "n1"
+	f.profile.Health.ClockNode = "n2"
+	f.profile.Health.ClockFallback = "the entry node's clock read failed (timedatectl exit code 1), so timestamps are measured on node n2's clock"
+	f.clockErr = errFake
+	r := runCollect(t, f, haCfg("auto", "none"))
+	want(t, r, haKindEntryClock, haSeverityAdvice, "n1", "timedatectl", "n2", "systemd-timedated", "pve.endpoints")
+	if f.clockReads != 1 {
+		t.Errorf("entry clock reads = %d, want one second read", f.clockReads)
+	}
+}
+
+func TestCollectEntryClockOneOffErrorReportsNothing(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	f.profile.Health.EntryNode = "n1"
+	f.profile.Health.ClockNode = "n2"
+	f.profile.Health.ClockFallback = "the entry node's clock read failed (500), so timestamps are measured on node n2's clock"
+	r := runCollect(t, f, haCfg("auto", "none"))
+	wantNone(t, r, haKindEntryClock)
+	if f.clockReads != 1 {
+		t.Errorf("entry clock reads = %d, want one second read", f.clockReads)
+	}
+}
+
+func TestCollectEntryClockNoClockAnsweredIsAProblem(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	f.profile.Health.EntryNode = "n1"
+	f.profile.Health.HA = pve.HAViewUnreadable
+	f.profile.Health.HAReason = "entry node clock unreadable, so timestamps cannot be measured: 500"
+	r := runCollect(t, f, haCfg("auto", "none"))
+	want(t, r, haKindEntryClock, haSeverityProblem, "n1", "no node's clock answered", "observe-only")
+}
+
+func TestCollectEntryClockHealthyEntryReportsNothing(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	r := runCollect(t, f, haCfg("auto", "none"))
+	wantNone(t, r, haKindEntryClock)
+	if f.clockReads != 0 {
+		t.Errorf("entry clock reads = %d, want none for a healthy entry", f.clockReads)
+	}
+}
