@@ -7,9 +7,39 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
+
+const (
+	// haClockWalkLimit bounds the whole walk over the peers. A request addressed
+	// to another node has no header deadline of its own in the endpoint pool, so
+	// a peer that accepts the connection and never answers would otherwise wait
+	// out pveproxy's timeout, and each HA decision reads the clock twice.
+	haClockWalkLimit = 15 * time.Second
+
+	// haClockMaxPeers is how many members the walk asks, which is the CRM
+	// master and two others. Any member that answers is as good as another, so
+	// more attempts add little.
+	haClockMaxPeers = 3
+)
+
+type haClockLimitKey struct{}
+
+// WithTestHAClockWalkLimit shortens the time limit on the walk over peers for
+// a test, so that a hung peer is cut off without a real wait. Production code
+// MUST NOT call it.
+func WithTestHAClockWalkLimit(ctx context.Context, limit time.Duration) context.Context {
+	return context.WithValue(ctx, haClockLimitKey{}, limit)
+}
+
+func haClockWalkLimitFor(ctx context.Context) time.Duration {
+	if limit, ok := ctx.Value(haClockLimitKey{}).(time.Duration); ok && limit > 0 {
+		return limit
+	}
+	return haClockWalkLimit
+}
 
 // haClock is the clock that one HA read measures its timestamps against. now
 // is that clock in Unix seconds, and node is the cluster member that served it.
@@ -53,7 +83,9 @@ func (c haClock) describe() string {
 // like any other transient failure, as the read did before peers existed. When
 // peers is not empty, the entry node's server error goes to the peers at once,
 // and each peer gets one attempt, so a broken entry node costs one request and
-// not the full retry budget.
+// not the full retry budget. The walk asks at most haClockMaxPeers members and
+// stops after haClockWalkLimit, so a peer that never answers cannot hold a
+// decision.
 func readHAClock(
 	ctx context.Context, nodesAPI NodeHealthNodes, entry string, peers []string, label string,
 ) (haClock, error) {
@@ -83,13 +115,18 @@ func readHAClock(
 		return haClock{now: now, node: entry}, nil
 	}
 
+	if len(peers) > haClockMaxPeers {
+		peers = peers[:haClockMaxPeers]
+	}
+	walkCtx, cancel := context.WithTimeout(ctx, haClockWalkLimitFor(ctx))
+	defer cancel()
 	failures := make([]string, 0, len(peers))
 	for _, peer := range peers {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := walkCtx.Err(); ctxErr != nil {
 			failures = append(failures, ctxErr.Error())
 			break
 		}
-		resp, peerErr := nodesAPI.ListTime(ctx, peer)
+		resp, peerErr := nodesAPI.ListTime(walkCtx, peer)
 		switch {
 		case peerErr != nil:
 			failures = append(failures, peer+": "+peerErr.Error())

@@ -16,17 +16,19 @@ import (
 )
 
 const (
-	// NodeHealthCRMMaxAge is the oldest CRM timestamp, measured on the entry
-	// node's clock, that NodeHealth still treats as a live view of the cluster.
+	// NodeHealthCRMMaxAge is the oldest CRM timestamp, measured on the clock of
+	// the member that measured the view, that NodeHealth still treats as a live
+	// view of the cluster. That member is the entry node unless its own clock
+	// read failed, and HAServiceState.ClockNode names it.
 	NodeHealthCRMMaxAge = 60 * time.Second
 
-	// NodeHealthLRMMaxAge is the oldest LRM timestamp, measured on the entry
-	// node's clock, that counts as a live answer for that node. It is the limit
-	// PVE uses for its own status display.
+	// NodeHealthLRMMaxAge is the oldest LRM timestamp, measured on the clock of
+	// the member that measured the view, that counts as a live answer for that
+	// node. It is the limit PVE uses for its own status display.
 	NodeHealthLRMMaxAge = 30 * time.Second
 
-	// NodeHealthMaxFutureSkew is how far ahead of the entry node's clock a CRM
-	// or LRM timestamp may lie before NodeHealth calls it stale. A few seconds
+	// NodeHealthMaxFutureSkew is how far ahead of the measuring member's clock
+	// a CRM or LRM timestamp may lie before NodeHealth calls it stale. A few seconds
 	// of drift between cluster members is normal; more than that means the
 	// timestamp cannot be trusted.
 	NodeHealthMaxFutureSkew = 5 * time.Second
@@ -114,7 +116,8 @@ type HAView string
 
 const (
 	// HAViewManagerStatus means a quorate entry node returned a manager status
-	// whose CRM timestamp is fresh on the entry node's clock.
+	// whose CRM timestamp is fresh on the clock of the member that measured it,
+	// which is the entry node unless its own clock read failed.
 	HAViewManagerStatus HAView = "manager_status"
 
 	// HAViewLRMText means manager status was empty or unreadable, so only the
@@ -184,7 +187,7 @@ type NodeHealthOptions struct {
 	MaintenanceTags []string
 
 	// SkipHA keeps NodeHealth from reading any HA source: the manager status,
-	// the entry node's clock, and the lrm text. Cluster status alone then
+	// the clock that measures their timestamps, and the lrm text. Cluster status alone then
 	// classifies the nodes, as it does when no HA source can be trusted. A
 	// caller sets it when pve.ha.mode is off and the call must read no HA
 	// state, at the cost of a node that is online in cluster status but
@@ -375,7 +378,8 @@ const (
 
 // NodeHealth merges every health source into one report. It reads cluster
 // status, the structured manager status with its node_status and lrm_status
-// maps, the entry node's clock, and, only when manager status is empty or
+// maps, the clock that measures their timestamps (the entry node's, or another
+// member's when the entry node's own clock read fails), and, only when manager status is empty or
 // unreadable, the text of the lrm entries in status/current. It then applies
 // the operator's maintenance tags as an extra input. With opts.SkipHA it reads
 // no HA source at all.
@@ -441,15 +445,35 @@ func NodeHealth(
 	}
 
 	report.Nodes = classifyNodes(view, report.HA, ha, opts)
+	report.withholdFailingEntry()
 	report.reindex()
 	return report, nil
+}
+
+// withholdFailingEntry takes the entry node out of placement when its own
+// clock read failed with a server error. A node does that while systemd shuts
+// it down, and its LRM reports the shutdown only on its next write, so until
+// then the LRM entry alone reads online and fresh. The node stays a proxy
+// target, because reads through it still work.
+func (r *NodeHealthReport) withholdFailingEntry() {
+	if r.ClockFallback == "" {
+		return
+	}
+	for i := range r.Nodes {
+		e := &r.Nodes[i]
+		if e.Name != r.EntryNode || !e.Placeable {
+			continue
+		}
+		e.Placeable = false
+		e.Reason += ", but its own clock read failed with a server error, which a node does while it shuts down"
+	}
 }
 
 // haInputs carries the trusted HA data into classification.
 type haInputs struct {
 	nodeStatus map[string]string
 	lrm        map[string]lrmWire
-	entryTime  int64 // entry node's clock in Unix seconds
+	entryTime  int64 // measuring member's clock in Unix seconds
 	text       map[string]lrmTextState
 }
 

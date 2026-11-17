@@ -412,8 +412,10 @@ func (b *barrier) viaIgnored(ctx context.Context, resumed bool) (pve.VMLocation,
 		b.deps.Logger.Info("ha narrow: requested ignored before a narrowing change",
 			log.Int("vmid", b.in.VMID), log.String("sid", b.sid), log.String("restore", b.restore))
 	}
-	// The request time is the entry node's clock read after the request
-	// landed, so any CRM round newer than it came after the request.
+	// The request time is the clock read after the request landed, which is
+	// the entry node's unless its own clock read failed, and then the clock of
+	// the member that the state names in ClockNode. Any CRM round newer than it
+	// came after the request.
 	after, err := b.readState(ctx, st.Node)
 	if err != nil {
 		return pve.VMLocation{}, b.restoreAfter(ctx, err)
