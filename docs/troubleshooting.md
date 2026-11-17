@@ -816,6 +816,33 @@ This is a race inside the Director, not a CPI failure. The Director runs one thr
 
 If the second run fails the same way, or fails on something other than the stemcell rows, the cause is something else, and the task's CPI log shows which call failed. See [Reading CPI errors](#reading-cpi-errors).
 
+### bosh clean-up --all fails with "CPI not found in cpi-config"
+
+**Symptom**
+
+```text
+Error: CPI 'az2-p4' not found in cpi-config
+```
+
+The error appears during `bosh clean-up --all` on a Director whose cpi-config once had an entry with that name and no longer does.
+
+**Diagnosis**
+
+The Director keeps one stemcell row for each cpi-config entry the stemcell was registered with, and it deletes each row through that row's CPI. A row whose entry has left the cpi-config has no CPI to call, so the task fails at that row. The Director deletes stemcells before orphaned disks, so the disks in the same run are left as well.
+
+**Fix**
+
+1. Put the entry back in the cpi-config with its old name, and run `scripts/bosh update-cpi-config`.
+   We should see the Director accept the cpi-config.
+
+2. Run `bosh clean-up --all`.
+   We should see the stemcell rows and the orphaned disks deleted, with every CPI call ending in success.
+
+3. Remove the entry again with `scripts/bosh update-cpi-config`.
+   We know it worked when `bosh stemcells` lists no row for that entry and `bosh disks --orphaned` is empty.
+
+We avoid this by cleaning up before an entry goes away. We delete the deployments that use its AZs and run `bosh clean-up --all` while the entry is still in the cpi-config, and only then remove it.
+
 ## Disk operation failures
 
 ### Snapshot guard blocks disk attach

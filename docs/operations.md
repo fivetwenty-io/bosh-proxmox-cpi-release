@@ -989,6 +989,8 @@ We never change the `host` or the `node` of an entry that serves live instances,
 
 We know the change worked when the cloud-config update and the deploy both pass, `bosh stemcells` lists every entry, and each entry has its own cache template on its own cluster. When `bosh clean-up --all` later fails on the stemcell rows, [the troubleshooting entry](troubleshooting.md#the-first-bosh-clean-up---all-fails-on-stemcell-rows) says to run it again.
 
+Before we remove an entry from the cpi-config, we delete the deployments that use its AZs and run `bosh clean-up --all` while the entry is still there. The Director deletes each stemcell row through that row's entry, so a row whose entry has gone stops the clean-up, as [the troubleshooting entry](troubleshooting.md#bosh-clean-up---all-fails-with-cpi-not-found-in-cpi-config) describes.
+
 ## Stemcell lifecycle across directors
 
 When two or more BOSH directors share one PVE cluster — a management director and one or more environment directors, or several environment directors side by side — they can all depend on the same stemcell. This section covers what happens to a stemcell's cache template and backing qcow2 file as each director independently uploads and cleans it up. See [Design Decisions, D3](design-decisions.md#d3-stemcell-refcounting-per-director-reference-sets) for the reference-tracking design behind this.
