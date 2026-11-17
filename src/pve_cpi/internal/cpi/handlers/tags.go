@@ -135,7 +135,7 @@ func hoistHeadTags(entries []string) []string {
 	rest := make([]string, 0, len(entries))
 	for _, e := range entries {
 		switch {
-		case e == ownershipTag:
+		case strings.EqualFold(e, ownershipTag):
 			head = append(head, e)
 		case hasHeadTagPrefix(e):
 			stamps = append(stamps, e)
@@ -160,10 +160,9 @@ func hasHeadTagPrefix(entry string) bool {
 }
 
 // hasCPIOwnedPrefix reports whether entry claims a prefix the CPI owns. The
-// inherited reservedBoshTagPrefixes are matched exactly, which is the comparison
-// they have always had. The create-time prefixes are matched without regard to
-// case, because an operator key of "Stemcell" is plainly an attempt at the same
-// namespace and there is no reason to let a shift key through a guard.
+// reservedBoshTagPrefixes and the create-time prefixes are both matched without
+// regard to case, because an operator key of "Stemcell" is plainly an attempt at
+// the same namespace and there is no reason to let a shift key through a guard.
 //
 // The teardown queue tags are CPI-owned too, so a custom tag can never
 // render one, or one that only starts like one.
@@ -265,11 +264,13 @@ func buildCustomTagsReporting(custom map[string]string) ([]string, []string) {
 }
 
 // mergeTagList concatenates existing and additions into a single PVE tag
-// string joined by ";". Duplicate entries (exact string match) are dropped,
-// preserving the first occurrence. The result is truncated at a tag boundary
-// so the total byte length never exceeds maxBytes; partial entries are never
-// emitted. maxBytes <= 0 disables truncation. A caller that wants to know
-// which entries the cap left out should call mergeTagListReporting instead.
+// string joined by ";". Duplicate entries are dropped, preserving the first
+// occurrence, and two entries that differ only in case count as the same entry,
+// because PVE stores every tag in lower case. The result never exceeds
+// maxBytes, and partial entries are never emitted. When the cap forces entries
+// out, mergeTagListReporting chooses which. maxBytes <= 0 disables truncation. A
+// caller that wants to know which entries the cap left out should call
+// mergeTagListReporting instead.
 func mergeTagList(existing []string, additions []string, maxBytes int) string {
 	merged, _ := mergeTagListReporting(existing, additions, maxBytes)
 	return merged
@@ -278,10 +279,19 @@ func mergeTagList(existing []string, additions []string, maxBytes int) string {
 // mergeTagListReporting merges the two lists exactly the way mergeTagList
 // does, and it also hands back the entries the byte cap left out. The second
 // return value holds those entries in the order we dropped them, already
-// deduplicated, and it is nil when everything fits. We report them because we
-// write the identity tag last, so it is the first entry to fall off a full
-// list, and a guest that quietly loses that tag no longer names the parkers
-// holding its detached disks.
+// deduplicated, and it is nil when everything fits.
+//
+// Entries are compared without regard to case, since PVE lower-cases the tags
+// it stores. A new entry such as "rM--<id>" therefore matches the stored
+// "rm--<id>" and does not sit beside it, where the duplicate would take bytes
+// from the cap.
+//
+// When the list is over the cap we drop from the tail, but never an entry that
+// identifies the guest. The ownership marker, the owner, CID, and cluster
+// stamps, and the vm-prefix identity tag are protected, because a guest that
+// quietly loses one of them is no longer recognized as ours, and no longer
+// names the parkers holding its detached disks. Only when the protected
+// entries alone exceed the cap do we fall back to cutting at the tail.
 func mergeTagListReporting(existing []string, additions []string, maxBytes int) (string, []string) {
 	seen := make(map[string]struct{}, len(existing)+len(additions))
 	parts := make([]string, 0, len(existing)+len(additions))
@@ -289,10 +299,11 @@ func mergeTagListReporting(existing []string, additions []string, maxBytes int) 
 		if p == "" {
 			return
 		}
-		if _, dup := seen[p]; dup {
+		key := strings.ToLower(p)
+		if _, dup := seen[key]; dup {
 			return
 		}
-		seen[p] = struct{}{}
+		seen[key] = struct{}{}
 		parts = append(parts, p)
 	}
 	for _, p := range existing {
@@ -308,22 +319,59 @@ func mergeTagListReporting(existing []string, additions []string, maxBytes int) 
 	if maxBytes <= 0 || len(joined) <= maxBytes {
 		return joined, nil
 	}
-	var truncated string
-	for i, p := range parts {
-		candidate := p
-		if i > 0 {
-			candidate = truncated + ";" + p
-		}
-		if len(candidate) > maxBytes {
-			// The first entry that does not fit ends the list, so every
-			// entry from here on goes with it and we name them all.
-			dropped := make([]string, len(parts)-i)
-			copy(dropped, parts[i:])
-			return truncated, dropped
-		}
-		truncated = candidate
+	return capTagParts(parts, len(joined), maxBytes)
+}
+
+// capTagParts shrinks parts, whose joined length is size, to fit maxBytes. It
+// removes unprotected entries from the tail first, then falls back to cutting
+// the remaining list at the tail when the protected entries are too long to fit
+// on their own. It returns the joined list and the entries it removed, in list order.
+func capTagParts(parts []string, size, maxBytes int) (string, []string) {
+	keep := make([]bool, len(parts))
+	for i := range keep {
+		keep[i] = true
 	}
-	return truncated, nil
+	for i := len(parts) - 1; i >= 0 && size > maxBytes; i-- {
+		if isIdentityTag(parts[i]) {
+			continue
+		}
+		keep[i] = false
+		size -= len(parts[i]) + 1
+	}
+	var dropped []string
+	kept := make([]string, 0, len(parts))
+	for i, p := range parts {
+		if keep[i] {
+			kept = append(kept, p)
+		} else {
+			dropped = append(dropped, p)
+		}
+	}
+	if size > maxBytes {
+		// The identity entries alone do not fit, so the first entry that does
+		// not fit ends the list and every entry from there on goes with it.
+		var truncated string
+		for i, p := range kept {
+			candidate := p
+			if i > 0 {
+				candidate = truncated + ";" + p
+			}
+			if len(candidate) > maxBytes {
+				return truncated, append(dropped, kept[i:]...)
+			}
+			truncated = candidate
+		}
+		return truncated, dropped
+	}
+	return strings.Join(kept, ";"), dropped
+}
+
+// isIdentityTag reports whether entry is one the byte cap must never drop,
+// compared without regard to case. They are the tags that say whose guest this
+// is, and the identity tag that names the prefix it belongs to.
+func isIdentityTag(entry string) bool {
+	return strings.EqualFold(entry, ownershipTag) || hasHeadTagPrefix(entry) ||
+		strings.HasPrefix(strings.ToLower(entry), pve.ParkerPrefixTagPrefix)
 }
 
 // parseTagsField splits a stored PVE tags string back into entries. PVE
@@ -368,9 +416,14 @@ func stripReservedBoshTags(entries []string) []string {
 	return out
 }
 
+// hasReservedBoshPrefix reports whether entry starts with one of
+// reservedBoshTagPrefixes, ignoring case. PVE stores tags in lower case, and a
+// custom tag keyed "Director" would otherwise slip past the guard and sit
+// beside the real one.
 func hasReservedBoshPrefix(entry string) bool {
+	lowered := strings.ToLower(entry)
 	for _, p := range reservedBoshTagPrefixes {
-		if strings.HasPrefix(entry, p) {
+		if strings.HasPrefix(lowered, p) {
 			return true
 		}
 	}

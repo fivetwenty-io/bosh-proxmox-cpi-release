@@ -31,7 +31,7 @@ const replicaOp = "replicate"
 
 // hasReplicaTag reports whether the PVE tags field carries haReplicaTag.
 func hasReplicaTag(tags string) bool {
-	return slices.Contains(parseTagsField(tags), haReplicaTag)
+	return tagsContainFold(parseTagsField(tags), haReplicaTag)
 }
 
 // configHasReplicaTag reports whether a VM config's tags carry haReplicaTag.
@@ -832,7 +832,7 @@ func setUpReplica(
 	}
 	if err := mutateVMTags(ctx, deps, node, vmid, op+": tag the VM as replicated", logger,
 		func(tags []string) []string {
-			if slices.Contains(tags, haReplicaTag) {
+			if tagsContainFold(tags, haReplicaTag) {
 				return tags
 			}
 			return append(slices.Clone(tags), haReplicaTag)

@@ -370,7 +370,7 @@ func setVMMetadataRMW(
 	// The ownership record goes at the head of the preserved list, because
 	// the merge below truncates from the tail and PVE may hand the tags back
 	// in a different order than create_vm wrote them.
-	preserved := hoistHeadTags(stripReservedBoshTags(existingTags))
+	preserved := hoistHeadTags(stripInstanceNameTags(stripReservedBoshTags(existingTags), metadata))
 	if ownerBackfill != "" {
 		preserved = withOwnerTag(preserved, ownerBackfill)
 		logger.Info("set_vm_metadata: stamping the owner tag on a VM created before owner tags existed",
@@ -557,12 +557,10 @@ func buildDescription(metadata map[string]any) string {
 // the "vm-prefix--<value>" identity tag. An empty vmPrefix omits the tag, which
 // the accessor never produces and a direct call from a test can.
 //
-// The prefix tag is appended last, after every other BOSH-managed entry, and
-// whoever adds the next tag should insert it before this one and leave the
-// prefix tag in last place. mergeTagList truncates the joined string at a tag
-// boundary against maxTagLength, and it drops the last entry first, so a
-// deployment and job set long enough to overflow the cap loses the identity tag
-// and keeps every entry BOSH itself supplied.
+// The prefix tag is appended last, after every other BOSH-managed entry. The
+// merge protects it from the byte cap, as it does the ownership stamps, so a
+// deployment and job set long enough to overflow the cap drops the entries
+// BOSH itself supplied and keeps the identity tag.
 func buildBoshManagedTags(metadata map[string]any, vmPrefix string) []string {
 	parts, _ := buildBoshManagedTagsReporting(metadata, vmPrefix)
 	return parts
@@ -600,6 +598,49 @@ func buildBoshManagedTagsReporting(metadata map[string]any, vmPrefix string) ([]
 		parts = append(parts, pve.ParkerPrefixTagPrefix+s)
 	}
 	return parts, refusedName
+}
+
+// instanceNameTagID returns the instance id that the name tag for metadata ends
+// in, lowercased, or "" when the metadata names no instance or the name does not
+// end in an id shape. The name tag is "<group>--<id>", and the id is what stays
+// the same when the group is renamed.
+func instanceNameTagID(metadata map[string]any) string {
+	v, ok := metadata[metadataKeyName]
+	if !ok || v == nil {
+		return ""
+	}
+	s := sanitizeTagValue(strings.ReplaceAll(fmt.Sprintf("%v", v), "/", "--"))
+	i := strings.LastIndex(s, "--")
+	if i <= 0 {
+		return ""
+	}
+	id := strings.ToLower(s[i+2:])
+	if !instanceUUIDValue.MatchString(id) {
+		return ""
+	}
+	return id
+}
+
+// stripInstanceNameTags drops the stored instance name tags that end in the
+// same id as the name in metadata, whatever case or group name they carry. We
+// rebuild that tag on every sync, so a renamed instance group leaves no stale
+// "<old group>--<id>" entry behind, and a stored lower-case "rm--<id>" cannot
+// sit beside the freshly built "rM--<id>". Entries under a CPI-owned prefix are
+// never touched.
+func stripInstanceNameTags(entries []string, metadata map[string]any) []string {
+	id := instanceNameTagID(metadata)
+	if id == "" || len(entries) == 0 {
+		return entries
+	}
+	suffix := "--" + id
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if strings.HasSuffix(strings.ToLower(e), suffix) && !hasCPIOwnedPrefix(e) && e != ownershipTag {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // preserveVMAllocationMarker keeps allocation provenance ahead of the shared

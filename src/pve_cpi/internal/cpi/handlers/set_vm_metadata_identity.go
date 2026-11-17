@@ -181,7 +181,7 @@ func backfillExcludedTag(entries []string) string {
 // hasOwnershipTag reports whether entries carry the fixed ownershipTag.
 func hasOwnershipTag(entries []string) bool {
 	for _, e := range entries {
-		if e == ownershipTag {
+		if strings.EqualFold(e, ownershipTag) {
 			return true
 		}
 	}
@@ -255,15 +255,15 @@ func storedInstanceEvidence(desc string, tags []string) instanceEvidence {
 	// finds its own older name tag.
 	jobs := make(map[string]struct{})
 	for _, v := range lines["job"] {
-		jobs[sanitizeTagValue(v)] = struct{}{}
+		jobs[strings.ToLower(sanitizeTagValue(v))] = struct{}{}
 	}
 	for _, v := range lines["instance_group"] {
-		jobs[sanitizeTagValue(v)] = struct{}{}
+		jobs[strings.ToLower(sanitizeTagValue(v))] = struct{}{}
 	}
 	for _, t := range tags {
 		for _, p := range []string{"job--", "instance-group--"} {
-			if strings.HasPrefix(t, p) {
-				jobs[t[len(p):]] = struct{}{}
+			if strings.HasPrefix(strings.ToLower(t), p) {
+				jobs[strings.ToLower(t[len(p):])] = struct{}{}
 			}
 		}
 	}
@@ -276,7 +276,7 @@ func storedInstanceEvidence(desc string, tags []string) instanceEvidence {
 			continue
 		}
 		for _, t := range tags {
-			if v, ok := strings.CutPrefix(t, prefix); ok && instanceIdentityTagValue.MatchString(strings.ToLower(v)) {
+			if v, ok := strings.CutPrefix(strings.ToLower(t), prefix); ok && instanceIdentityTagValue.MatchString(v) {
 				add(v)
 				tiedToJob[t] = true
 			}

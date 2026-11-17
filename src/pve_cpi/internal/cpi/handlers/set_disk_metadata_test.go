@@ -558,6 +558,35 @@ func TestHandleSetDiskMetadata_AppliesDiskTags(t *testing.T) {
 	}
 }
 
+// TestHandleSetDiskMetadata_MixedCaseKeyReplacesStoredTag verifies that a disk
+// tag keyed "Tier" replaces the stored "tier--" entry, which PVE lower-cased,
+// instead of sitting beside it.
+func TestHandleSetDiskMetadata_MixedCaseKeyReplacesStoredTag(t *testing.T) {
+	t.Parallel()
+
+	nodesSvc := &diskMetaNodesMock{}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
+		diskKey(testNode, int(testVMID)): {
+			"scsi0": testDiskCID,
+			"tags":  "env--prod;tier--silver",
+		},
+	}, nodesSvc)
+
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
+	meta := map[string]any{"tags": map[string]any{"Tier": "bronze"}}
+	if _, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, meta), jsonrpc.Context{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if nodesSvc.capturedTags == nil {
+		t.Fatal("UpdateQemuConfig did not write VM tags field")
+	}
+	got := strings.ToLower(*nodesSvc.capturedTags)
+	if strings.Contains(got, "tier--silver") || !strings.Contains(got, "tier--bronze") {
+		t.Errorf("want the tier tag replaced; got %q", *nodesSvc.capturedTags)
+	}
+}
+
 // TestHandleSetDiskMetadata_WarnsOnDroppedTags verifies that a disk tag the
 // byte cap pushes off the hosting VM's tag list is named in a warning rather
 // than lost in silence.

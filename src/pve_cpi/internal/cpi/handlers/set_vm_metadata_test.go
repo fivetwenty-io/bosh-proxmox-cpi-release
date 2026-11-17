@@ -279,7 +279,7 @@ func TestHandleSetVMMetadata_TagTruncation(t *testing.T) {
 
 // TestHandleSetVMMetadata_WarnsOnDroppedTags verifies that a metadata payload
 // long enough to overflow the byte cap leaves a warning naming the entries the
-// VM lost, the identity tag among them.
+// VM lost, which never include the identity tag.
 func TestHandleSetVMMetadata_WarnsOnDroppedTags(t *testing.T) {
 	t.Parallel()
 
@@ -319,8 +319,8 @@ func TestHandleSetVMMetadata_WarnsOnDroppedTags(t *testing.T) {
 	if got, ok := entry.Attrs["max_tag_bytes"]; !ok || got != int64(350) {
 		t.Errorf("warning should carry the 350 byte cap; got %v", entry.Attrs["max_tag_bytes"])
 	}
-	if !strings.Contains(dropped, "vm-prefix--bosh") {
-		t.Errorf("dropped tags should name the identity tag; got %q", dropped)
+	if strings.Contains(dropped, "vm-prefix--bosh") {
+		t.Errorf("the identity tag must never be dropped; got %q", dropped)
 	}
 }
 

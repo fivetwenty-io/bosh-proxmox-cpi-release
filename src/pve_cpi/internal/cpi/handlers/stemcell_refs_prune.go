@@ -2018,14 +2018,16 @@ func sweepStemcellRefsReplicas(
 	}
 }
 
-// sameTagSet compares two tag lists as sets.
+// sameTagSet compares two tag lists as sets, ignoring case, because PVE
+// stores the tags it is given in lower case.
 func sameTagSet(a, b []string) bool {
 	set := map[string]bool{}
 	for _, t := range a {
-		set[t] = true
+		set[strings.ToLower(t)] = true
 	}
 	other := map[string]bool{}
 	for _, t := range b {
+		t = strings.ToLower(t)
 		other[t] = true
 		if !set[t] {
 			return false

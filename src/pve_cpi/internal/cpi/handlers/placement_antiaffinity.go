@@ -1826,14 +1826,14 @@ func sidsCSV(sids map[string]struct{}) string {
 	return strings.Join(keys, ",")
 }
 
-// tagsContain reports whether the PVE tags field contains an exact match for
-// want, honoring PVE's ";"/"," separators (reuses parseTagsField).
+// tagsContain reports whether the PVE tags field contains want, ignoring case
+// because PVE stores tags in lower case, and honoring PVE's ";"/"," separators (reuses parseTagsField).
 func tagsContain(tags, want string) bool {
 	if tags == "" || want == "" {
 		return false
 	}
 	for _, t := range parseTagsField(tags) {
-		if t == want {
+		if strings.EqualFold(t, want) {
 			return true
 		}
 	}

@@ -139,26 +139,27 @@ func TestMergeTagListReporting_NothingDropped(t *testing.T) {
 	}
 }
 
-// TestMergeTagListReporting_OneDropped checks that the single entry the cap
-// pushes off the end comes back by name.
+// TestMergeTagListReporting_OneDropped checks that the cap drops an ordinary
+// entry by name and keeps the identity tag, even though the identity tag is the
+// last entry in the list.
 func TestMergeTagListReporting_OneDropped(t *testing.T) {
 	t.Parallel()
 	long := strings.Repeat("a", 80)
 	additions := []string{"k1--" + long, "k2--" + long, "vm-prefix--blue"}
-	// Two 84-byte entries and one separator fill 169 bytes, so a cap of 180
-	// leaves no room for the identity tag.
+	// Two 84-byte entries, the identity tag, and two separators fill 202
+	// bytes, so a cap of 180 forces one ordinary entry out.
 	merged, dropped := mergeTagListReporting(nil, additions, 180)
-	if strings.Contains(merged, "vm-prefix--blue") {
-		t.Errorf("merged should not hold the identity tag; got %q", merged)
+	if !strings.Contains(merged, "vm-prefix--blue") {
+		t.Errorf("merged should keep the identity tag; got %q", merged)
 	}
-	want := []string{"vm-prefix--blue"}
+	want := []string{"k2--" + long}
 	if !slices.Equal(dropped, want) {
 		t.Errorf("dropped = %v, want %v", dropped, want)
 	}
 }
 
-// TestMergeTagListReporting_SeveralDropped checks that every entry from the
-// first one that does not fit onwards is reported, in the order we dropped it.
+// TestMergeTagListReporting_SeveralDropped checks that every entry the cap
+// removes is reported, in list order.
 func TestMergeTagListReporting_SeveralDropped(t *testing.T) {
 	t.Parallel()
 	long := strings.Repeat("a", 80)
@@ -191,7 +192,7 @@ func TestMergeTagListReporting_DuplicatesNotDropped(t *testing.T) {
 
 // TestMergeTagListReporting_FirstEntryTooLong checks the corner where even one
 // entry overflows the cap. The merged string comes back empty and every entry
-// is reported.
+// is reported, since no entry is exempt when none can fit.
 func TestMergeTagListReporting_FirstEntryTooLong(t *testing.T) {
 	t.Parallel()
 	additions := []string{"k1--" + strings.Repeat("a", 80), "k2--short"}
@@ -400,5 +401,121 @@ func TestSanitizeVMName_TruncatesTo63(t *testing.T) {
 	}
 	if strings.HasSuffix(got, "-") {
 		t.Errorf("sanitizeVMName must not end in '-'; got %q", got)
+	}
+}
+
+// TestMergeTagListReporting_CaseInsensitiveDuplicates checks that a new entry
+// that differs from a stored one only in case does not sit beside it. PVE
+// stores tags in lower case, so a mixed-case instance group otherwise doubled
+// its name tag.
+func TestMergeTagListReporting_CaseInsensitiveDuplicates(t *testing.T) {
+	t.Parallel()
+	id := "1de28840-4a9e-4d4f-a421-50270360faac"
+	merged, dropped := mergeTagListReporting(
+		[]string{"bosh-cpi", "rm--" + id}, []string{"rM--" + id, "vm-prefix--halab-b"}, 350)
+	if want := "bosh-cpi;rm--" + id + ";vm-prefix--halab-b"; merged != want {
+		t.Errorf("merged = %q, want %q", merged, want)
+	}
+	if dropped != nil {
+		t.Errorf("dropped = %v, want nil", dropped)
+	}
+}
+
+// TestMergeTagListReporting_IdentityTagsSurviveCap checks that a full list
+// drops ordinary entries and keeps the ownership marker, the owner, CID, and
+// cluster stamps, and the vm-prefix tag, wherever they sit.
+func TestMergeTagListReporting_IdentityTagsSurviveCap(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("a", 60)
+	existing := []string{"bosh-cpi", "bosh-owner--abc", "bosh-cid--1", "bosh-cluster--c", "k1--" + long, "k2--" + long}
+	additions := []string{"k3--" + long, "vm-prefix--blue"}
+	merged, dropped := mergeTagListReporting(existing, additions, 200)
+	for _, must := range []string{"bosh-cpi", "bosh-owner--abc", "bosh-cid--1", "bosh-cluster--c", "vm-prefix--blue"} {
+		if !slices.Contains(strings.Split(merged, ";"), must) {
+			t.Errorf("merged lost %q: %q", must, merged)
+		}
+	}
+	if len(merged) > 200 {
+		t.Errorf("merged is %d bytes, over the cap", len(merged))
+	}
+	if len(dropped) == 0 {
+		t.Fatal("expected ordinary entries to be dropped")
+	}
+	for _, d := range dropped {
+		if isIdentityTag(d) {
+			t.Errorf("dropped identity tag %q", d)
+		}
+	}
+}
+
+// TestHasReservedBoshPrefix_IgnoresCase checks that a mixed-case key cannot
+// claim a CPI-owned prefix.
+func TestHasReservedBoshPrefix_IgnoresCase(t *testing.T) {
+	t.Parallel()
+	for _, e := range []string{"Director--x", "DEPLOYMENT--x", "Instance-Group--x", "VM-Prefix--x"} {
+		if !hasReservedBoshPrefix(e) {
+			t.Errorf("%q should count as reserved", e)
+		}
+	}
+}
+
+// TestSameTagSet_IgnoresCase checks that the readback comparison accepts the
+// lower-cased list PVE stores for a mixed-case write.
+func TestSameTagSet_IgnoresCase(t *testing.T) {
+	t.Parallel()
+	if !sameTagSet([]string{"rM--abc"}, []string{"rm--abc"}) {
+		t.Error("tag sets that differ only in case should be equal")
+	}
+	if sameTagSet([]string{"rM--abc"}, []string{"rm--abd"}) {
+		t.Error("different tags should not be equal")
+	}
+}
+
+// TestTagsContain_IgnoresCase checks the exact-match helper against a stored
+// lower-case list and a want built from a mixed-case group name.
+func TestTagsContain_IgnoresCase(t *testing.T) {
+	t.Parallel()
+	if !tagsContain("bosh-cpi;job--rm;deployment--p6-rm", "job--rM") {
+		t.Error("job--rM should match the stored job--rm")
+	}
+	if tagsContain("bosh-cpi;job--rm", "job--rn") {
+		t.Error("a different tag should not match")
+	}
+}
+
+// TestHasOwnershipTag_IgnoresCase checks that the ownership marker is found
+// whatever case it was stored in.
+func TestHasOwnershipTag_IgnoresCase(t *testing.T) {
+	t.Parallel()
+	if !hasOwnershipTag([]string{"Bosh-CPI"}) {
+		t.Error("Bosh-CPI should count as the ownership tag")
+	}
+	got := hoistHeadTags([]string{"a--b", "BOSH-CPI", "bosh-owner--x"})
+	if got[0] != "BOSH-CPI" || got[1] != "bosh-owner--x" {
+		t.Errorf("hoistHeadTags = %v, want the ownership tag and owner first", got)
+	}
+}
+
+// TestStoredInstanceEvidence_MixedCaseGroup checks that the stored lower-case
+// name tag is tied to a job record kept in mixed case, so it reads as the VM's
+// own instance and not as an orphan of some other instance.
+func TestStoredInstanceEvidence_MixedCaseGroup(t *testing.T) {
+	t.Parallel()
+	id := "1de28840-4a9e-4d4f-a421-50270360faac"
+	desc := "job: rM\ninstance_group: rM\n"
+	ev := storedInstanceEvidence(desc, []string{"bosh-cpi", "rm--" + id})
+	if len(ev.orphans) != 0 {
+		t.Errorf("orphans = %v, want none", ev.orphans)
+	}
+	if !slices.Contains(ev.values, id) {
+		t.Errorf("values = %v, want %s", ev.values, id)
+	}
+}
+
+// TestHasReplicaTag_IgnoresCase checks the replica marker lookup.
+func TestHasReplicaTag_IgnoresCase(t *testing.T) {
+	t.Parallel()
+	if !hasReplicaTag("bosh-cpi;Bosh-HA-Replica") {
+		t.Error("a differently cased replica tag should be found")
 	}
 }

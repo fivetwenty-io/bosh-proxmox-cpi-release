@@ -723,7 +723,7 @@ func applyCustomTagsToVM(ctx context.Context, deps Deps, node string, vmid int, 
 		if idx <= 0 {
 			continue
 		}
-		replacedPrefixes[e[:idx+2]] = struct{}{}
+		replacedPrefixes[strings.ToLower(e[:idx+2])] = struct{}{}
 	}
 
 	var existing []string
@@ -731,7 +731,7 @@ func applyCustomTagsToVM(ctx context.Context, deps Deps, node string, vmid int, 
 		for _, e := range parseTagsField(s) {
 			skip := false
 			for prefix := range replacedPrefixes {
-				if strings.HasPrefix(e, prefix) {
+				if strings.HasPrefix(strings.ToLower(e), prefix) {
 					skip = true
 					break
 				}
