@@ -84,6 +84,10 @@ type HADeleteScene struct {
 	StatusErr error
 	// StatusReads counts the status/current reads.
 	StatusReads int
+	// BrokenClocks are the members whose GET /nodes/{node}/time answers with
+	// a 500, the way a node in the middle of a shutdown answers once
+	// timedatectl fails. Their API keeps answering every other read.
+	BrokenClocks map[string]bool
 	// IndexNode and IndexHAState are the /cluster/resources row of each VM.
 	// A VM without an index node is absent from the index.
 	IndexNode    map[int]string
@@ -159,6 +163,7 @@ func NewHADeleteScene() *HADeleteScene {
 		Comments:     map[string]string{},
 		Power:        map[int]string{},
 		Uptime:       map[int]int64{},
+		BrokenClocks: map[string]bool{},
 		IndexNode:    map[int]string{},
 		IndexHAState: map[int]string{},
 		IndexLock:    map[int]string{},
@@ -756,16 +761,22 @@ func (HAClockNodes) ListTime(context.Context, string) (*nodes.ListTimeResponse, 
 	return &resp, nil
 }
 
-// HASceneNodes serves the entry node's clock and delegates every other call.
+// HASceneNodes serves each member's clock, failing the ones the scene lists
+// in BrokenClocks, and delegates every other call.
 type HASceneNodes struct {
 	nodes.Service
 	Scene *HADeleteScene
 }
 
-func (n *HASceneNodes) ListTime(context.Context, string) (*nodes.ListTimeResponse, error) {
+func (n *HASceneNodes) ListTime(_ context.Context, node string) (*nodes.ListTimeResponse, error) {
 	n.Scene.mu.Lock()
 	now := n.Scene.Now
+	broken := n.Scene.BrokenClocks[node]
 	n.Scene.mu.Unlock()
+	if broken {
+		return nil, sdkerrors.ParseAPIError(500,
+			[]byte(`{"data":null,"message":"command 'timedatectl show '--property=Timezone' --value' failed: exit code 1\n"}`))
+	}
 	var resp nodes.ListTimeResponse
 	raw, _ := json.Marshal(map[string]any{"time": now, "localtime": now, "timezone": "UTC"})
 	if err := json.Unmarshal(raw, &resp); err != nil {
