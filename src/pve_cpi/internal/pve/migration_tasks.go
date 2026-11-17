@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/url"
+	"regexp"
 	"strconv"
 	"time"
 )
@@ -36,8 +37,17 @@ func (t VMTask) Running() bool {
 	return t.EndTime <= 0 || t.Status == "" || t.Status == "RUNNING"
 }
 
-// Succeeded reports whether the task ended with PVE's OK status.
-func (t VMTask) Succeeded() bool { return t.EndTime > 0 && t.Status == "OK" }
+// Succeeded reports whether the task ended in success. PVE ends a task that
+// logged warnings with the status WARNINGS: n and counts it as a success
+// (pve-common PVE::Tools upid_normalize_status_type), so a migration that
+// warned about a leftover cloud-init drive still moved the VM.
+func (t VMTask) Succeeded() bool {
+	return t.EndTime > 0 && (t.Status == "OK" || taskWarningsStatus.MatchString(t.Status))
+}
+
+// taskWarningsStatus matches the status PVE gives a task that ended in success
+// after it logged warnings.
+var taskWarningsStatus = regexp.MustCompile(`^WARNINGS: \d+$`)
 
 // End returns the time the task ended, and the zero time for a task that is
 // still running.

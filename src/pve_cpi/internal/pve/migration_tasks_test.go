@@ -180,6 +180,10 @@ func TestMigrationTaskOutcome(t *testing.T) {
 		running, succeeded bool
 	}{
 		{pve.VMTask{Status: "OK", EndTime: 10}, false, true},
+		{pve.VMTask{Status: "WARNINGS: 2", EndTime: 10}, false, true},
+		{pve.VMTask{Status: "WARNINGS: 2"}, true, false},
+		{pve.VMTask{Status: "WARNINGS: two", EndTime: 10}, false, false},
+		{pve.VMTask{Status: "WARNINGS: 2 extra", EndTime: 10}, false, false},
 		{pve.VMTask{Status: "migration aborted", EndTime: 10}, false, false},
 		{pve.VMTask{Status: "RUNNING", EndTime: 10}, true, false},
 		{pve.VMTask{Status: "RUNNING"}, true, false},

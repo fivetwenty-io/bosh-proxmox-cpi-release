@@ -49,6 +49,12 @@ func TestMigrationEvidenceOf(t *testing.T) {
 			onNow: []pve.VMTask{ok(after.Add(-10 * time.Minute))}, changedAt: changed,
 			want: ha.MigrationProved},
 		{name: "no time of change", fromOld: []pve.VMTask{ok(after)}, want: ha.MigrationNone},
+		{name: "a migration from the old source that ended with warnings",
+			fromOld:   []pve.VMTask{migrationTask("WARNINGS: 2", after.Add(-time.Minute), after)},
+			changedAt: changed, want: ha.MigrationProved},
+		{name: "a migration away that ended with warnings", fromOld: []pve.VMTask{ok(after)},
+			onNow:     []pve.VMTask{migrationTask("WARNINGS: 1", after.Add(time.Hour), after.Add(time.Hour+time.Minute))},
+			changedAt: changed, want: ha.MigrationNone},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tasks := ha.PartnerTasks{FromOld: tc.fromOld, FromNode: tc.onNow}
