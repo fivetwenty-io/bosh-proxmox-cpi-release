@@ -46,6 +46,7 @@ const (
 	haKindReplicaMarkerEncode = "replica_marker_encoded"
 	haKindReplicaGoneVM       = "replica_gone_vm_volume"
 	haKindHoldMaintenance     = "hold_blocks_maintenance"
+	haKindMaintenanceStranded = "maintenance_stranded"
 	haKindHeadroomShort       = "headroom_short"
 	haKindHeadroomUnavailable = "headroom_unavailable"
 	haKindRuleUnmarked        = "rule_unmarked"

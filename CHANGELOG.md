@@ -80,6 +80,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - `create_vm` now logs that a VM is registered as a PVE HA resource only once PVE HA runs it. The line came from the config-drive ISO check, which runs before the staged VM is activated, so a VM whose confinement was then refused or found out of effect ran without HA after a line that claimed it was protected. The line was also logged on configuration alone, so a VM created under a profile that is observe-only, which never registers a VM, got it too. Such a VM now gets only the warning that its staged HA resource was removed, which names the VM and the reason. A VM that observe-only mode never registers gets only the line that says it runs without HA and why.
 
+- `pve-cid ha` now reports `maintenance_stranded` as a problem for each started HA VM that is still running on a node in maintenance, because a service the CRM cannot move off the node keeps the node's HA agent from finishing its restart.
+
 - `pve-cid ha` no longer reports `local_unprotected` for a CPI parker. A parker is a stopped VM that holds detached persistent disks, and it may be a stopped HA resource or sit outside HA by design, so the doctor now leaves any VM that carries the parker tag out of that finding.
 
 - `pve-cid ha` now names each group member that sits in no rule when an anti-affinity group is split across several rules. The `anti_affinity_split` finding used to say only how many rules the group spans, and it now adds a sentence such as "vm:210123 is in no anti-affinity rule for group bosh-aa-0123456789ab".

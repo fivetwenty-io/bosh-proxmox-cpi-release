@@ -422,6 +422,50 @@ func TestCollectLocalUnprotectedSkipsParker(t *testing.T) {
 	wantNone(t, runCollect(t, f, haCfg("auto", "hold")), haKindLocalUnprotected)
 }
 
+func maintenanceFake() *fakeHA {
+	f := haBaseFake()
+	f.profile.Health.Nodes[0] = pve.NodeHealthEntry{Name: "n1", Health: pve.NodeHealthMaintenance, Maintenance: true, ProxyTarget: true}
+	return f
+}
+
+func TestCollectMaintenanceStranded(t *testing.T) {
+	t.Parallel()
+	f := maintenanceFake()
+	r := runCollect(t, f, haCfg("auto", "none"))
+	want(t, r, haKindMaintenanceStranded, haSeverityProblem, "vm:100", "n1", "in maintenance", "can't restart")
+	// A pin to a single node is named as the reason.
+	f.rules = []ha.Rule{pinRule(100, haMarker, "n1")}
+	want(t, runCollect(t, f, haCfg("auto", "none")), haKindMaintenanceStranded, haSeverityProblem, "pin names no other node")
+}
+
+func TestCollectMaintenanceStrandedSkipsStoppedVM(t *testing.T) {
+	t.Parallel()
+	f := maintenanceFake()
+	f.resources[0].State = "stopped"
+	wantNone(t, runCollect(t, f, haCfg("auto", "none")), haKindMaintenanceStranded)
+}
+
+func TestCollectMaintenanceStrandedSkipsNormalNode(t *testing.T) {
+	t.Parallel()
+	wantNone(t, runCollect(t, haBaseFake(), haCfg("auto", "none")), haKindMaintenanceStranded)
+}
+
+func TestCollectMaintenanceStrandedSkipsOutOfScope(t *testing.T) {
+	t.Parallel()
+	f := maintenanceFake()
+	f.guests[0].Tags = "bosh-cpi;bosh-ha-managed;bosh-owner--bbbbbbbb-0000"
+	wantNone(t, runCollect(t, f, haCfg("auto", "none")), haKindMaintenanceStranded)
+}
+
+func TestCollectMaintenanceStrandedUnreadableStatus(t *testing.T) {
+	t.Parallel()
+	f := maintenanceFake()
+	f.profile.Health, f.profile.HealthErr = nil, "cluster status unreadable"
+	r := runCollect(t, f, haCfg("auto", "none"))
+	want(t, r, haKindUnchecked, haSeverityProblem, "node-health", "cluster status unreadable")
+	wantNone(t, r, haKindMaintenanceStranded)
+}
+
 func TestCollectHoldBlocksMaintenance(t *testing.T) {
 	t.Parallel()
 	f := haBaseFake()

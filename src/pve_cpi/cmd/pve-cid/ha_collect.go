@@ -226,6 +226,7 @@ func collectHAScoped(ctx context.Context, r HAReader, cfg *config.CPIConfig, own
 	c.antiAffinityFindings()
 	c.cpuFindings()
 	c.protectionFindings()
+	c.maintenanceStrandedFindings()
 	c.replicationFindings()
 	c.headroomFindings()
 	c.leftoverFindings()
@@ -813,6 +814,36 @@ func (c *haCollector) protectionFindings() {
 				}
 			}
 		}
+	}
+}
+
+// maintenanceStrandedFindings reports each started HA VM that is still running
+// on a node in maintenance. The CRM moves every service off such a node, and
+// one that has nowhere to go stays behind and keeps the node's LRM from
+// finishing its restart. A node health report that could not be built is
+// already reported as unchecked, so this check says nothing in that case.
+func (c *haCollector) maintenanceStrandedFindings() {
+	if c.off() || !c.guestsOK || !c.resourcesOK || c.p.Health == nil {
+		return
+	}
+	for _, g := range c.guests {
+		if !g.owned || g.ref.Template || g.resource == nil || !c.judgesVM(g) {
+			continue
+		}
+		if !strings.EqualFold(g.resource.State, "started") {
+			continue
+		}
+		h, found := healthEntry(c.p, g.ref.Node)
+		if !found || !h.Maintenance {
+			continue
+		}
+		why := ""
+		if pin := c.pinOf(g.ref.VMID); c.rulesOK && pin != nil && len(pin.Nodes) == 1 {
+			why = ", and its node-affinity pin names no other node"
+		}
+		c.rep.problem(haKindMaintenanceStranded, g.sid,
+			"%s is still running on %s, which is in maintenance, so the node's HA agent can't restart until it moves or stops%s",
+			g.sid, g.ref.Node, why)
 	}
 }
 
