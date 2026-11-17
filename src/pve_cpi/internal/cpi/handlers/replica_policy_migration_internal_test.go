@@ -13,6 +13,18 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
+// The logs of the start and migration tasks of VM 100, as PVE writes them. A
+// start that received a live migration logs where it listens for it, and only
+// a live migration logs the start of the VM on the target.
+var (
+	incomingStart = []string{"migration listens on unix:/run/qemu-server/100.migrate", "TASK OK"}
+	plainStart    = []string{"TASK OK"}
+	liveMove      = []string{"starting migration of VM 100 to node 'pve02' (10.0.0.2)",
+		"starting VM 100 on remote node 'pve02'", "migration finished successfully (duration 00:00:06)", "TASK OK"}
+	offlineMove = []string{"starting migration of VM 100 to node 'pve02' (10.0.0.2)",
+		"migration finished successfully (duration 00:00:03)", "TASK OK"}
+)
+
 // movedReplicaRig is VM 100 under its widened pin, pve01 the source and pve02
 // the partner, with the pin's last change two hours ago. The VM runs on pve02
 // now, after a migration from pve01 that ended an hour ago, and PVE runs job
@@ -273,11 +285,11 @@ func TestReconcileOnPartner_VerifiedSyncWithoutAMigrationWarnsOfLostWrites(t *te
 		},
 		"the old source's tasks cannot be read": {
 			setup: func(r *replicaRig, _ time.Time) { r.tasks.err["pve01"] = errors.New("needs Sys.Audit") },
-			warn:  "could not read the task lists that would prove a planned migration",
+			warn:  "could not read the task lists or task logs that would prove a planned migration",
 		},
 		"the new source's tasks cannot be read": {
 			setup: func(r *replicaRig, _ time.Time) { r.tasks.err["pve02"] = errors.New("needs Sys.Audit") },
-			warn:  "could not read the task lists that would prove a planned migration",
+			warn:  "could not read the task lists or task logs that would prove a planned migration",
 		},
 	}
 	for name, tc := range cases {
@@ -327,15 +339,25 @@ func TestReconcileOnPartner_ReadsTheMigrationTasksOfBothNodes(t *testing.T) {
 // window. That start belongs to the migration, so the move is still a planned
 // migration that loses no writes.
 func TestReconcileOnPartner_LiveMigrationWithItsIncomingStartIsPlanned(t *testing.T) {
-	cases := map[string]time.Duration{
-		"the target's clock agrees with the source's": 2 * time.Second,
-		"the target's clock runs four minutes ahead":  4 * time.Minute,
+	type move struct {
+		offset            time.Duration
+		startLog, moveLog []string
 	}
-	for name, offset := range cases {
+	cases := map[string]move{
+		"the target's clock agrees with the source's": {offset: 2 * time.Second, startLog: incomingStart},
+		"the target's clock runs four minutes ahead":  {offset: 4 * time.Minute, startLog: incomingStart},
+		"an offline relocation that HA started on the target": {offset: 62 * time.Second, startLog: plainStart,
+			moveLog: offlineMove},
+	}
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			r, changed := movedReplicaRig(t)
 			begun := changed.Add(time.Hour - time.Minute)
-			r.tasks.started("pve02", begun.Add(offset), begun.Add(offset+3*time.Second), "OK")
+			received := r.tasks.started("pve02", begun.Add(tc.offset), begun.Add(tc.offset+3*time.Second), "OK")
+			r.tasks.logs[received] = tc.startLog
+			if tc.moveLog != nil {
+				r.tasks.logs[r.tasks.migrations["pve01"][0].UPID] = tc.moveLog
+			}
 			r.tasks.started("pve01", changed.Add(-time.Hour), changed.Add(-time.Hour+5*time.Second), "OK")
 			logger, observed := log.NewObservedLogger(log.LevelInfo)
 			set, err := readHARuleSet(t.Context(), r.deps.PVE.Cluster())
@@ -381,13 +403,16 @@ func TestReconcileOnPartner_LiveMigrationWithItsIncomingStartIsPlanned(t *testin
 func TestReconcileOnPartner_RecoveryAfterAPlannedMigrationWarnsOfLostWrites(t *testing.T) {
 	type sequence func(r *replicaRig, ended time.Time)
 	incoming := func(r *replicaRig, ended time.Time) {
-		r.tasks.started("pve02", ended.Add(-58*time.Second), ended.Add(-55*time.Second), "OK")
+		upid := r.tasks.started("pve02", ended.Add(-58*time.Second), ended.Add(-55*time.Second), "OK")
+		r.tasks.logs[upid] = incomingStart
 	}
 	backToOld := func(r *replicaRig, ended time.Time) {
-		r.tasks.started("pve01", ended.Add(10*time.Minute), ended.Add(10*time.Minute+5*time.Second), "OK")
+		upid := r.tasks.started("pve01", ended.Add(10*time.Minute), ended.Add(10*time.Minute+5*time.Second), "OK")
+		r.tasks.logs[upid] = plainStart
 	}
 	toPartnerAgain := func(r *replicaRig, ended time.Time) {
-		r.tasks.started("pve02", ended.Add(20*time.Minute), ended.Add(20*time.Minute+5*time.Second), "OK")
+		upid := r.tasks.started("pve02", ended.Add(20*time.Minute), ended.Add(20*time.Minute+5*time.Second), "OK")
+		r.tasks.logs[upid] = plainStart
 	}
 	cases := map[string][]sequence{
 		"both recoveries listed":                        {incoming, backToOld, toPartnerAgain},
@@ -396,10 +421,19 @@ func TestReconcileOnPartner_RecoveryAfterAPlannedMigrationWarnsOfLostWrites(t *t
 		"the recovery to the partner alone":             {toPartnerAgain},
 		"the recovery back to the old source alone":     {incoming, backToOld},
 		"a second start soon after the incoming one ends": {incoming, func(r *replicaRig, ended time.Time) {
-			r.tasks.started("pve02", ended.Add(2*time.Minute), ended.Add(2*time.Minute+5*time.Second), "OK")
+			upid := r.tasks.started("pve02", ended.Add(2*time.Minute), ended.Add(2*time.Minute+5*time.Second), "OK")
+			r.tasks.logs[upid] = plainStart
+			r.tasks.logs[r.tasks.migrations["pve01"][0].UPID] = liveMove
+		}},
+		"a recovery start inside the migration's window": {func(r *replicaRig, ended time.Time) {
+			upid := r.tasks.started("pve02", ended.Add(-30*time.Second), ended.Add(-25*time.Second), "OK")
+			r.tasks.logs[upid] = plainStart
+			r.tasks.logs[r.tasks.migrations["pve01"][0].UPID] = liveMove
 		}},
 		"a recovery start on the partner that failed": {incoming, func(r *replicaRig, ended time.Time) {
-			r.tasks.started("pve02", ended.Add(20*time.Minute), ended.Add(20*time.Minute+time.Second), "start failed")
+			upid := r.tasks.started("pve02", ended.Add(20*time.Minute), ended.Add(20*time.Minute+time.Second),
+				"start failed")
+			r.tasks.logs[upid] = []string{"start failed: QEMU exited with code 1", "TASK ERROR: start failed"}
 		}},
 	}
 	for name, steps := range cases {
@@ -450,7 +484,7 @@ func TestReconcileOnPartner_UnreadableStartsLeaveTheMigrationUnproven(t *testing
 					partner, ok)
 			}
 			if len(warnings) != 1 ||
-				!strings.Contains(warnings[0], "could not read the task lists that would prove a planned migration") {
+				!strings.Contains(warnings[0], "could not read the task lists or task logs that would prove a planned migration") {
 				t.Fatalf("warnings %q; an unreadable start listing leaves the migration unproven", warnings)
 			}
 		})

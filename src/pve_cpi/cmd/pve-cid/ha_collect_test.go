@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -470,9 +471,24 @@ func TestCollectReplicaOnPartnerAfterAMove(t *testing.T) {
 		Type: "qmigrate", ID: "101", Status: "OK", StartTime: haNow.Add(-61 * time.Minute).Unix(),
 		EndTime: haNow.Add(-time.Hour).Unix()}
 	started := func(node string, at time.Time) pve.VMTask {
-		return pve.VMTask{UPID: "UPID:" + node + ":00000001:00000001:00000001:qmstart:101:root@pam:", Node: node,
-			Type: "qmstart", ID: "101", Status: "OK", StartTime: at.Unix(), EndTime: at.Add(5 * time.Second).Unix()}
+		return pve.VMTask{UPID: fmt.Sprintf("UPID:%s:00000001:00000001:%08X:qmstart:101:root@pam:", node, at.Unix()),
+			Node: node, Type: "qmstart", ID: "101", Status: "OK", StartTime: at.Unix(),
+			EndTime: at.Add(5 * time.Second).Unix()}
 	}
+	// logged gives each start the log PVE writes for it, which shows whether
+	// it received a live migration.
+	logged := func(f *fakeHA, incoming bool, tasks ...pve.VMTask) {
+		if f.taskLogs == nil {
+			f.taskLogs = map[string][]string{}
+		}
+		for _, task := range tasks {
+			f.taskLogs[task.UPID] = []string{"TASK OK"}
+			if incoming {
+				f.taskLogs[task.UPID] = []string{"migration listens on unix:/run/qemu-server/101.migrate", "TASK OK"}
+			}
+		}
+	}
+	incoming := started("n2", haNow.Add(-61*time.Minute+2*time.Second))
 	moved := func() *fakeHA {
 		f := replicaFake()
 		f.guests[1].Node = "n2"
@@ -504,15 +520,30 @@ func TestCollectReplicaOnPartnerAfterAMove(t *testing.T) {
 				"could not be read", "needs Sys.Audit", "may have been lost"},
 			absent: "rolls"},
 		{name: "planned migration with the target's incoming start", edit: func(f *fakeHA) {
-			f.starts = map[string][]pve.VMTask{"n2": {started("n2", haNow.Add(-61*time.Minute+2*time.Second))}}
+			f.starts = map[string][]pve.VMTask{"n2": {incoming}}
+			logged(f, true, incoming)
 		}, severity: haSeverityAdvice,
 			mentions: []string{"partner n2 after a planned migration", "names n1 as the partner"},
 			absent:   "failover"},
 		{name: "HA recoveries back to n1 and to n2 again after the migration", edit: func(f *fakeHA) {
+			recovery := started("n2", haNow.Add(-40*time.Minute))
 			f.starts = map[string][]pve.VMTask{
 				"n1": {started("n1", haNow.Add(-50*time.Minute))},
-				"n2": {started("n2", haNow.Add(-61*time.Minute+2*time.Second)), started("n2", haNow.Add(-40*time.Minute))},
+				"n2": {incoming, recovery},
 			}
+			logged(f, true, incoming)
+			logged(f, false, recovery)
+		}, severity: haSeverityProblem,
+			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
+				"a migration from n1 explains the move", "started again after it", "may have been lost",
+				"names n1 as the partner"},
+			absent: "planned migration"},
+		{name: "an HA recovery on n2 soon after the migration", edit: func(f *fakeHA) {
+			recovery := started("n2", haNow.Add(-58*time.Minute))
+			f.starts = map[string][]pve.VMTask{"n2": {incoming, recovery}}
+			logged(f, true, incoming)
+			logged(f, false, recovery)
+			f.taskLogs[migrated.UPID] = []string{"starting VM 101 on remote node 'n2'", "TASK OK"}
 		}, severity: haSeverityProblem,
 			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
 				"a migration from n1 explains the move", "started again after it", "may have been lost",
@@ -523,6 +554,12 @@ func TestCollectReplicaOnPartnerAfterAMove(t *testing.T) {
 		}, severity: haSeverityProblem,
 			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
 				"could not be read", "needs Sys.Audit", "may have been lost"},
+			absent: "rolls"},
+		{name: "a start's log unreadable", edit: func(f *fakeHA) {
+			f.starts = map[string][]pve.VMTask{"n2": {incoming}}
+		}, severity: haSeverityProblem,
+			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
+				"could not be read", "no log for task", "may have been lost"},
 			absent: "rolls"},
 		{name: "no sync from n2 yet", edit: func(f *fakeHA) {
 			f.status["101-0"] = ha.ReplicaSyncStatus{LastSync: changed.Add(-time.Hour)}

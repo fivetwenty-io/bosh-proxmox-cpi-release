@@ -1329,7 +1329,8 @@ func (w *replicaWiden) swapAfterMigration(
 	default:
 		logger.Warn(replicaOp+": the VM runs on its replication partner, and a verified sync from this node "+
 			"covers its volumes on the old source, so the pin keeps both nodes and names the old source as the "+
-			"partner now; the CPI could not read the task lists that would prove a planned migration, so if "+
+			"partner now; the CPI could not read the task lists or task logs that would prove a planned migration, "+
+			"so if "+
 			"this was a failover, writes made on the old source after its last sync before it were lost",
 			append(fields, log.Err(unread))...)
 	}
@@ -1341,9 +1342,9 @@ func (w *replicaWiden) swapAfterMigration(
 const migrationLookback = ha.MigrationLookback
 
 // migrationEvidence reads the qmigrate and qmstart tasks of the VM on
-// oldSource and on w.node and judges them (see ha.ReadMigrationEvidence). A
-// client that cannot list them, or a listing that fails, is MigrationUnread
-// with the cause.
+// oldSource and on w.node and judges them with the logs it needs (see
+// ha.ReadMigrationEvidence). A client that cannot list them, or a listing or
+// log read that fails, is MigrationUnread with the cause.
 func (w *replicaWiden) migrationEvidence(
 	ctx context.Context, oldSource string, changedAt time.Time,
 ) (ha.MigrationEvidence, error) {

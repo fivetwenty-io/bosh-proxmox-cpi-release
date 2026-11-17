@@ -1,9 +1,12 @@
 package ha
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
@@ -38,8 +41,8 @@ func ReplicaPinShape(pin *Rule) (source, partner string, ok bool) {
 type MigrationEvidence int
 
 const (
-	// MigrationUnread means a task list could not be read, so nothing is
-	// known.
+	// MigrationUnread means a task list or a task log it needs could not be
+	// read, so nothing is known.
 	MigrationUnread MigrationEvidence = iota
 	// MigrationNone means the lists were read and no migration explains the
 	// move, which is what an HA recovery after a node failure leaves.
@@ -64,11 +67,81 @@ const MigrationLookback = 24 * time.Hour
 // PartnerTasks holds the task lists of a VM that runs on its pin's partner.
 // FromOld and FromNode are the qmigrate tasks on the old source and on the
 // node the VM runs on, and StartsOnOld and StartsOnNode are the qmstart tasks
-// on the same two nodes.
+// on the same two nodes. Logs holds what the log of each task read so far
+// shows, by UPID.
 type PartnerTasks struct {
 	FromOld, FromNode         []pve.VMTask
 	StartsOnOld, StartsOnNode []pve.VMTask
+	Logs                      map[string]TaskLogKind
 }
+
+// TaskLogKind is what a task's log shows about the task.
+type TaskLogKind int
+
+const (
+	// TaskLogUnread means the log was not read.
+	TaskLogUnread TaskLogKind = iota
+	// TaskLogIncomingStart is a qmstart task that received a live migration.
+	TaskLogIncomingStart
+	// TaskLogPlainStart is any other qmstart task, such as an HA recovery, a
+	// reboot, a start by hand, or the start after an offline relocation.
+	TaskLogPlainStart
+	// TaskLogOnlineMigration is a qmigrate task that moved the VM while it
+	// ran.
+	TaskLogOnlineMigration
+	// TaskLogOfflineMigration is a qmigrate task that ended in success and
+	// moved the VM while it was stopped.
+	TaskLogOfflineMigration
+)
+
+// The log lines that tell the tasks apart. PVE's vm_start prints
+// incomingStartMark when it starts a VM to receive a live migration
+// (qemu-server QemuServer.pm vm_start_nolock), and nothing else prints it. The
+// source of a live migration logs onlineMigrationMark, with the VMID and the
+// target node after it, when it starts the VM on the target
+// (qemu-server QemuMigrate.pm phase2_start_local_cluster). An offline
+// migration skips that phase.
+const (
+	incomingStartMark   = "migration listens on"
+	onlineMigrationMark = "starting VM "
+)
+
+// taskEndMark matches the last line PVE writes to the log of a task that
+// ended in success.
+var taskEndMark = regexp.MustCompile(`^TASK (OK|WARNINGS: \d+)$`)
+
+// ClassifyTaskLog reads the log of task, a qmstart or a qmigrate task of the
+// VM, one string per line. A start is incoming when its log shows that it
+// received a migration, and plain otherwise. A migration is online when its
+// log shows that it started the VM on the target. It is offline only when its
+// log ended in success without that line, because a log that has not ended
+// may still print it, and such a log is an error.
+func ClassifyTaskLog(task pve.VMTask, lines []string) (TaskLogKind, error) {
+	switch task.Type {
+	case "qmstart":
+		for _, line := range lines {
+			if strings.Contains(line, incomingStartMark) {
+				return TaskLogIncomingStart, nil
+			}
+		}
+		return TaskLogPlainStart, nil
+	case "qmigrate":
+		online := onlineMigrationMark + task.ID + " on remote node "
+		for _, line := range lines {
+			if strings.Contains(line, online) {
+				return TaskLogOnlineMigration, nil
+			}
+		}
+		if len(lines) > 0 && taskEndMark.MatchString(strings.TrimSpace(lines[len(lines)-1])) {
+			return TaskLogOfflineMigration, nil
+		}
+		return TaskLogUnread, fmt.Errorf("the log of migration task %s has not ended in success", task.UPID)
+	}
+	return TaskLogUnread, fmt.Errorf("task %s is a %s task, not a start or a migration", task.UPID, task.Type)
+}
+
+// taskLogOf returns what the log of a task shows, reading it when needed.
+type taskLogOf func(task pve.VMTask) (TaskLogKind, error)
 
 // ProvingMigration returns the qmigrate task that explains how a VM came to
 // run on the partner its pin names, from fromOld, the old source's list, and
@@ -108,63 +181,101 @@ func ProvingMigration(fromOld, onNode []pve.VMTask, changedAt time.Time) (pve.VM
 
 // StartedAfter reports whether a start task shows that the VM started again
 // after migration, the qmigrate task on the old source that brought it to the
-// node it runs on. Every start counts, whether it is running, failed, or
-// succeeded, because an HA recovery may take more than one attempt.
+// node it runs on, reading the logs of the tasks it needs through logOf.
+// Every start counts, whether it is running, failed, or succeeded, because an
+// HA recovery may take more than one attempt.
 //
 // The old source's tasks share migration's clock, so any start there at or
 // after the migration ended means the VM came back to the old source, by an
 // HA recovery or otherwise, before it reached the node it runs on now.
 //
-// The node the VM runs on has its own clock, so the window around the
-// migration widens by the clock-skew tolerance on each side. A start there
-// that began clearly before the migration did belongs to an earlier stay on
-// that node. The target of a live migration may list one start of its own
-// inside the window, the qm start --migratedfrom that received the VM, so one
-// start inside the window is allowed. A second start inside it, or any start
-// clearly after the migration ended, means the VM started again on that node.
-// A start whose clock-skew window overlaps the migration's end can't be told
-// from the incoming one, and it counts as that one.
-func StartedAfter(migration pve.VMTask, onOld, onNode []pve.VMTask) bool {
+// The node the VM runs on has its own clock, so a start there that began
+// clearly before the migration did, by more than the clock-skew tolerance,
+// belongs to an earlier stay on that node. Any later start counts unless its
+// log shows that it received a live migration. The target of a live
+// migration lists that start of its own, the qm start --migratedfrom that
+// received the VM, and a failed earlier attempt lists one too, so no number
+// of them counts. The one other start allowed is the first plain start inside
+// the window of an offline migration, widened by the tolerance on each side,
+// because an HA relocation stops the VM, migrates it offline, and starts it on
+// the target. A log that can't be read is an error, because the start it
+// belongs to could be either.
+func StartedAfter(migration pve.VMTask, onOld, onNode []pve.VMTask, logOf taskLogOf) (bool, error) {
 	for _, task := range onOld {
 		if task.StartTime >= migration.EndTime {
-			return true
+			return true, nil
 		}
 	}
 	tolerance := int64(aj.ReplicaClockSkewTolerance / time.Second)
 	earliest, latest := migration.StartTime-tolerance, migration.EndTime+tolerance
-	incoming := 0
-	for _, task := range onNode {
-		switch {
-		case task.StartTime <= earliest:
+	starts := slices.Clone(onNode)
+	slices.SortStableFunc(starts, func(a, b pve.VMTask) int { return cmp.Compare(a.StartTime, b.StartTime) })
+	relocated := false
+	for _, task := range starts {
+		if task.StartTime <= earliest {
 			continue
-		case task.StartTime > latest:
-			return true
 		}
-		incoming++
+		kind, err := logOf(task)
+		switch {
+		case err != nil:
+			return false, err
+		case kind == TaskLogIncomingStart:
+			continue
+		case kind != TaskLogPlainStart:
+			return false, fmt.Errorf("the log of start task %s reads as no start", task.UPID)
+		case relocated || task.StartTime > latest:
+			return true, nil
+		}
+		moved, err := logOf(migration)
+		if err != nil {
+			return false, err
+		}
+		if moved != TaskLogOfflineMigration {
+			return true, nil
+		}
+		relocated = true
 	}
-	return incoming > 1
+	return false, nil
 }
 
 // MigrationEvidenceOf judges the task lists of a VM that runs on the partner
-// its pin names (see ProvingMigration and StartedAfter). Without a proving
-// migration it is MigrationNone, and the start tasks don't matter.
+// its pin names (see ProvingMigration and StartedAfter), with the logs that
+// tasks.Logs holds. Without a proving migration it is MigrationNone, and the
+// start tasks don't matter. A log that StartedAfter needs and tasks.Logs
+// lacks makes it MigrationUnread.
 func MigrationEvidenceOf(tasks PartnerTasks, changedAt time.Time) MigrationEvidence {
+	evidence, _ := migrationEvidence(tasks, changedAt, func(task pve.VMTask) (TaskLogKind, error) {
+		if kind, ok := tasks.Logs[task.UPID]; ok && kind != TaskLogUnread {
+			return kind, nil
+		}
+		return TaskLogUnread, fmt.Errorf("the log of task %s was not read", task.UPID)
+	})
+	return evidence
+}
+
+func migrationEvidence(tasks PartnerTasks, changedAt time.Time, logOf taskLogOf) (MigrationEvidence, error) {
 	migration, ok := ProvingMigration(tasks.FromOld, tasks.FromNode, changedAt)
-	switch {
-	case !ok:
-		return MigrationNone
-	case StartedAfter(migration, tasks.StartsOnOld, tasks.StartsOnNode):
-		return MigrationRestarted
+	if !ok {
+		return MigrationNone, nil
 	}
-	return MigrationProved
+	restarted, err := StartedAfter(migration, tasks.StartsOnOld, tasks.StartsOnNode, logOf)
+	switch {
+	case err != nil:
+		return MigrationUnread, err
+	case restarted:
+		return MigrationRestarted, nil
+	}
+	return MigrationProved, nil
 }
 
 // ReadMigrationEvidence reads the task lists of VM vmid, which runs on node,
 // the partner its pin names, with oldSource the node the pin names as its
 // source, and judges them (see MigrationEvidenceOf). It reads the qmigrate
 // tasks first and the qmstart tasks only when a migration explains the move,
-// because without one the starts change nothing. A listing that fails is
-// MigrationUnread with its cause, which names the node and the listing.
+// because without one the starts change nothing. It reads a task's log only
+// when StartedAfter needs it, and each log at most once. A listing or a log
+// read that fails is MigrationUnread with its cause, which names the node and
+// the read.
 func ReadMigrationEvidence(
 	ctx context.Context, reader pve.MigrationTaskReader, vmid int, node, oldSource string, changedAt time.Time,
 ) (MigrationEvidence, error) {
@@ -186,7 +297,35 @@ func ReadMigrationEvidence(
 	if tasks.StartsOnNode, err = reader.StartTasks(ctx, node, vmid, since); err != nil {
 		return MigrationUnread, fmt.Errorf("list the start tasks on node %s: %w", node, err)
 	}
-	return MigrationEvidenceOf(tasks, changedAt), nil
+	// StartedAfter reads the logs of the starts on node and of the migration
+	// that left the old source, and nothing else.
+	nodeOf := map[string]string{}
+	for _, task := range tasks.FromOld {
+		nodeOf[task.UPID] = oldSource
+	}
+	for _, task := range tasks.StartsOnNode {
+		nodeOf[task.UPID] = node
+	}
+	tasks.Logs = map[string]TaskLogKind{}
+	return migrationEvidence(tasks, changedAt, func(task pve.VMTask) (TaskLogKind, error) {
+		if kind, ok := tasks.Logs[task.UPID]; ok {
+			return kind, nil
+		}
+		at, ok := nodeOf[task.UPID]
+		if !ok || task.UPID == "" {
+			return TaskLogUnread, fmt.Errorf("task %q is not on a listed node", task.UPID)
+		}
+		lines, err := reader.TaskLog(ctx, at, task.UPID)
+		if err != nil {
+			return TaskLogUnread, fmt.Errorf("read the log of task %s on node %s: %w", task.UPID, at, err)
+		}
+		kind, err := ClassifyTaskLog(task, lines)
+		if err != nil {
+			return TaskLogUnread, fmt.Errorf("read the log of task %s on node %s: %w", task.UPID, at, err)
+		}
+		tasks.Logs[task.UPID] = kind
+		return kind, nil
+	})
 }
 
 // PartnerMove holds what is known about a replicate VM that runs on the

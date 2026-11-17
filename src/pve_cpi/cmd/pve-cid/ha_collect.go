@@ -1043,7 +1043,8 @@ func (c *haCollector) onPartner(g *haGuest, pin *ha.Rule, node, source string) {
 			node, source, source)
 	case ha.PartnerMoveUnproven:
 		c.rep.problem(haKindReplicaOnPartner, g.sid, moved+"; a sync from %s back to %s has run since, but the "+
-			"task lists that would prove a planned migration could not be read (%v), so writes made on %s "+
+			"task lists or task logs that would prove a planned migration could not be read (%v), so writes made "+
+			"on %s "+
 			"after its last sync before the move may have been lost; "+reconcile, id, node, node, source, unread,
 			source, source)
 	default:
@@ -1058,8 +1059,8 @@ func (c *haCollector) onPartner(g *haGuest, pin *ha.Rule, node, source string) {
 
 // migrationEvidence reads the qmigrate and qmstart tasks of the VM vmid on
 // the old source and on node, and judges them (see ha.ReadMigrationEvidence),
-// the read the CPI makes too. A listing that fails is MigrationUnread with its
-// cause.
+// the read the CPI makes too. A listing or log read that fails is
+// MigrationUnread with its cause.
 func (c *haCollector) migrationEvidence(
 	vmid int, node, source string, changedAt time.Time,
 ) (ha.MigrationEvidence, error) {
