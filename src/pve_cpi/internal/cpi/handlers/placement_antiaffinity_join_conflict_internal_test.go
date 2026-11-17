@@ -240,3 +240,71 @@ func TestHealAntiAffinityGroup_HealsAgainAfterARepairConfinesAMember(t *testing.
 		})
 	}
 }
+
+// TestEnsureAntiAffinity_SplitTriesALaterRuleForAConflictingSibling pins that
+// in split mode a sibling whose join conflicts with the group's first rule is
+// tried in the later rules that have room. Each of the two rules holds two
+// members on four nodes, so the first rule still has room once the create's
+// vm:106 joins it. vm:101 in the first rule and the sibling vm:103 are both
+// pinned strictly to pve1, so vm:103 must join the second rule. When vm:104
+// in the second rule is pinned strictly to pve1 too, vm:103 fits no rule and
+// must stay out of both, logged once.
+func TestEnsureAntiAffinity_SplitTriesALaterRuleForAConflictingSibling(t *testing.T) {
+	t.Parallel()
+	second := aaChunkName(aaRule, 2)
+	cases := []struct {
+		name       string
+		pins       map[int]string
+		wantFirst  string
+		wantSecond string
+		out        string
+	}{
+		{
+			name:       "fits the second rule",
+			pins:       map[int]string{101: "pve1", 103: "pve1"},
+			wantFirst:  "vm:101,vm:102,vm:106",
+			wantSecond: "vm:103,vm:104,vm:105",
+		},
+		{
+			name:       "fits no rule",
+			pins:       map[int]string{101: "pve1", 103: "pve1", 104: "pve1"},
+			wantFirst:  "vm:101,vm:102,vm:106",
+			wantSecond: "vm:104,vm:105",
+			out:        "vm:103",
+		},
+	}
+	for _, tc := range cases {
+		for _, mode := range aaModes {
+			t.Run(tc.name+"/"+mode, func(t *testing.T) {
+				t.Parallel()
+				stub := newAAStub()
+				stub.enforceManaged = true
+				managedGroup(stub, 101, 102, 103, 104, 105, 106)
+				stub.seedRule(aaRule, "vm:101,vm:102")
+				stub.seedRule(second, "vm:104,vm:105")
+				for vmid, nodes := range tc.pins {
+					seedStrictPin(stub, vmid, nodes)
+				}
+				deps := aaModeDeps(stub, mode, config.HAOverflowSplit, "pve1", "pve2", "pve3", "pve4")
+				logger, observed := log.NewObservedLogger(log.LevelDebug)
+				placedIn, err := ensureAntiAffinityMembershipFor(context.Background(), deps, aaIdent("web"), 106,
+					nil, logger)
+				if err != nil {
+					t.Fatalf("the create must join the first rule: %v", err)
+				}
+				if placedIn != aaRule {
+					t.Fatalf("placed in %q; want %q", placedIn, aaRule)
+				}
+				if got := stub.rules[aaRule]; got != tc.wantFirst {
+					t.Fatalf("first rule = %q; want %q", got, tc.wantFirst)
+				}
+				if got := stub.rules[second]; got != tc.wantSecond {
+					t.Fatalf("second rule = %q; want %q", got, tc.wantSecond)
+				}
+				if tc.out != "" {
+					requireLeftOutOnce(t, observed, tc.out)
+				}
+			})
+		}
+	}
+}

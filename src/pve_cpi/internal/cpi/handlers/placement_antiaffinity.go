@@ -624,6 +624,13 @@ func (p *aaPlanner) keptMembers(existing map[int]*ha.Rule, maxIndex int) (map[in
 // conflict lasts, and the first plan after the pin goes away or widens adds
 // it. This VM's own join is never held out, so a create whose own pin
 // conflicts still fails or logs the refusal the way its mode says.
+//
+// A member whose join conflicts with one rule is tried in each later rule
+// with room, which split mode gives a group with more members than nodes,
+// and it joins the first one where its join brings on no conflict. It stays
+// out only when every rule with room refuses it. No new rule opens for it
+// then, because a rule opens only once every rule is full, and every later
+// plan tries the member again.
 func (p *aaPlanner) assignPending(
 	set *ha.RuleSet, existing map[int]*ha.Rule, desired map[int][]string, assigned map[string]bool, maxIndex int,
 ) int {
@@ -656,22 +663,31 @@ func (p *aaPlanner) assignPending(
 		if s == "" || assigned[s] {
 			continue
 		}
-		target := 0
-		for n := 1; n <= maxIndex; n++ {
-			if len(desired[n]) < room {
-				target = n
-				break
+		target, roomy, refused, bad := 0, false, []string(nil), map[string][]string{}
+		for n := 1; n <= maxIndex && target == 0; n++ {
+			if len(desired[n]) >= room {
+				continue
 			}
+			roomy = true
+			if p.heal || s != p.sid {
+				if conflicts := p.joinConflicts(set, existing[n], n, desired[n], s); len(conflicts) > 0 {
+					refused = append(refused, aaChunkName(p.ident.ruleName(), n))
+					maps.Copy(bad, conflicts)
+					continue
+				}
+			}
+			target = n
 		}
-		if target == 0 && (p.split || maxIndex == 0) {
+		if target == 0 && !roomy && (p.split || maxIndex == 0) {
 			maxIndex++
 			target = maxIndex
 		}
-		if target == 0 || len(desired[target]) >= room {
-			p.logOverflow(s, len(desired[1]))
-			continue
-		}
-		if (p.heal || s != p.sid) && p.joinConflicts(set, existing[target], target, desired[target], s) {
+		if target == 0 {
+			if len(refused) > 0 {
+				p.logConflicted(s, strings.Join(refused, ","), bad)
+			} else {
+				p.logOverflow(s, len(desired[1]))
+			}
 			continue
 		}
 		assigned[s] = true
@@ -680,26 +696,23 @@ func (p *aaPlanner) assignPending(
 	return maxIndex
 }
 
-// joinConflicts reports whether adding s to the group's n-th rule, which the
-// plan has given members so far, brings on a feasibility conflict that the
-// rule set without s does not have. It checks the rules the way the writer's
-// check before a send does, with the rule written as chunkOps writes it and
-// with the members' pins flattened. A conflict that the rules held before the
-// join is left to that check. The first time it holds s out it logs why. With
+// joinConflicts returns the feasibility conflicts that adding s to the
+// group's n-th rule, which the plan has given members so far, brings on and
+// that the rule set without s does not have, or nil when there are none. It
+// checks the rules the way the writer's check before a send does, with the
+// rule written as chunkOps writes it and with the members' pins flattened. A
+// conflict that the rules held before the join is left to that check. With
 // the configured nodes unknown it checks nothing, as the writer does.
-func (p *aaPlanner) joinConflicts(set *ha.RuleSet, cur *ha.Rule, n int, members []string, s string) bool {
+func (p *aaPlanner) joinConflicts(
+	set *ha.RuleSet, cur *ha.Rule, n int, members []string, s string,
+) map[string][]string {
 	if len(p.clusterNodes) == 0 || len(members) == 0 || set == nil {
-		return false
+		return nil
 	}
 	name := aaChunkName(p.ident.ruleName(), n)
 	with := append(slices.Clone(members), s)
-	bad := ha.IntroducedConflicts(p.chunkCandidate(set, cur, name, members), p.chunkCandidate(set, cur, name, with),
+	return ha.IntroducedConflicts(p.chunkCandidate(set, cur, name, members), p.chunkCandidate(set, cur, name, with),
 		nil, p.clusterNodes)
-	if len(bad) == 0 {
-		return false
-	}
-	p.logConflicted(s, name, bad)
-	return true
 }
 
 // chunkCandidate returns set's rules with the rule name holding members, the
