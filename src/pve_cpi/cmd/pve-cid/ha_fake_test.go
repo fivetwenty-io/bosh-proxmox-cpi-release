@@ -27,9 +27,13 @@ type fakeHA struct {
 	resources    []HAResourceRow
 	resourcesErr error
 	states       map[string]string
-	statesErr    error
-	rules        []ha.Rule
-	rulesErr     error
+	// serviceNodes is the node of each service in the manager status. When it
+	// is nil the fake places each VM resource on the node of its guest.
+	serviceNodes    map[string]string
+	serviceNodesErr error
+	statesErr       error
+	rules           []ha.Rule
+	rulesErr        error
 
 	guests        []pve.GuestRef
 	excluded      []string
@@ -84,6 +88,22 @@ func (f *fakeHA) Resources(context.Context) ([]HAResourceRow, error) {
 
 func (f *fakeHA) ServiceStates(context.Context) (map[string]string, error) {
 	return f.states, f.statesErr
+}
+
+func (f *fakeHA) ServiceNodes(context.Context) (map[string]string, error) {
+	if f.serviceNodesErr != nil || f.serviceNodes != nil {
+		return f.serviceNodes, f.serviceNodesErr
+	}
+	out := map[string]string{}
+	for _, row := range f.resources {
+		out[row.SID] = ""
+		for _, g := range f.guests {
+			if row.SID == "vm:"+itoa(g.VMID) {
+				out[row.SID] = g.Node
+			}
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeHA) EntryClock(context.Context, string) error {

@@ -630,6 +630,33 @@ func ReadHAServiceStates(ctx context.Context, clusterAPI NodeHealthCluster) (map
 	return out, nil
 }
 
+// ReadHAServiceNodes returns the node the HA manager status places each
+// service on, keyed by service ID such as vm:100 or ct:200. Every service in
+// the status is listed, containers included. A service whose entry does not
+// parse or names no node maps to the empty string, so a caller can tell a
+// service it has no node for from one that is absent.
+func ReadHAServiceNodes(ctx context.Context, clusterAPI NodeHealthCluster) (map[string]string, error) {
+	if clusterAPI == nil {
+		return nil, cpierrors.Cloud("ReadHAServiceNodes: cluster client must not be nil")
+	}
+	mgr, err := readHAManagerStatus(ctx, clusterAPI)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(mgr.services))
+	for sid, raw := range mgr.services {
+		var wire struct {
+			Node string `json:"node"`
+		}
+		if json.Unmarshal(raw, &wire) != nil {
+			out[sid] = ""
+			continue
+		}
+		out[sid] = wire.Node
+	}
+	return out, nil
+}
+
 // haManagerView is what ReadHAServiceState keeps from manager status. It holds
 // the service_status entries that node health does not read.
 type haManagerView struct {

@@ -147,6 +147,8 @@ type haCollector struct {
 	resourcesOK bool
 	states      map[string]string
 	statesOK    bool
+	svcNodes    map[string]string
+	svcNodesOK  bool
 	clusterVMs  map[int]pve.GuestRef
 	clusterOK   bool
 	rules       []ha.Rule
@@ -284,6 +286,7 @@ func (c *haCollector) fillProfile() {
 func (c *haCollector) readSources() {
 	c.readResources()
 	c.readServiceStates()
+	c.readServiceNodes()
 	c.readClusterVMs()
 	c.readRules()
 	c.readGuests()
@@ -312,6 +315,15 @@ func (c *haCollector) readServiceStates() {
 		return
 	}
 	c.states, c.statesOK = states, true
+}
+
+func (c *haCollector) readServiceNodes() {
+	nodes, err := c.r.ServiceNodes(c.ctx)
+	if err != nil {
+		c.rep.unchecked("ha-service-node", "the HA manager status could not be read, so a node in maintenance is not called drained: %v", err)
+		return
+	}
+	c.svcNodes, c.svcNodesOK = nodes, true
 }
 
 func (c *haCollector) readClusterVMs() {
@@ -979,18 +991,34 @@ func (c *haCollector) protectionFindings() {
 // settleDrain fills the drain facts of each node line that is in maintenance.
 // The LRM enters state maintenance as soon as maintenance is requested and
 // keeps the agent lock and the watchdog until no service is left on the node,
-// so its state cannot say whether the drain has finished. A node counts as
-// drained once no HA service whose requested state keeps it running is on it.
-// When the doctor could not read the services or the guests, the answer is
-// unknown and the node is not called drained.
+// so its state cannot say whether the drain has finished. PVE counts every HA
+// service, containers included, so the doctor reads each service's node from
+// the manager status. A node counts as drained once no HA service whose
+// requested state keeps it running is on it. A service that keeps running and
+// has no node in the status, an unreadable status, or an unreadable resource
+// list leaves the answer unknown, and the node is not called drained. A VM
+// that the guest listing places on the node also counts as running there.
 func (c *haCollector) settleDrain() {
 	for i := range c.rep.Nodes {
 		n := &c.rep.Nodes[i]
 		if !n.Maintenance {
 			continue
 		}
-		known := c.guestsOK && !c.guestsPartial && c.resourcesOK
+		known := c.resourcesOK && c.svcNodesOK
 		running := false
+		if c.resourcesOK {
+			for sid, row := range c.resources {
+				if !haBlocksDrain(row.State) {
+					continue
+				}
+				switch node, listed := c.svcNodes[sid]; {
+				case listed && node == n.Name:
+					running = true
+				case !listed || node == "":
+					known = false
+				}
+			}
+		}
 		for _, g := range c.guests {
 			if g.ref.Node == n.Name && g.resource != nil && haBlocksDrain(g.resource.State) {
 				running = true

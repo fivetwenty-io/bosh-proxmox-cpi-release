@@ -2493,6 +2493,42 @@ func TestCollectReadsTheDrainFromTheServicesOnTheNode(t *testing.T) {
 			wantDog:   "armed",
 		},
 		{
+			name: "a running HA container is the only service left on the node",
+			build: func() *fakeHA {
+				f := drainFake("stopped")
+				setState(f, "vm:217", "stopped")
+				f.resources = append(f.resources, HAResourceRow{SID: "ct:500", State: "started", Comment: haMarker})
+				f.serviceNodes = map[string]string{
+					"vm:117": "n1", "vm:217": "n2", "vm:317": "n3", "vm:40": "n2", "ct:500": "n2",
+				}
+				return f
+			},
+			wantDog: "armed",
+		},
+		{
+			name: "an unreadable manager status is never read as drained",
+			build: func() *fakeHA {
+				f := drainFake("stopped")
+				setState(f, "vm:217", "stopped")
+				f.serviceNodesErr = errors.New("manager status unavailable")
+				return f
+			},
+			wantDog: "unknown",
+		},
+		{
+			name: "a service with no node in the manager status is never read as drained",
+			build: func() *fakeHA {
+				f := drainFake("stopped")
+				setState(f, "vm:217", "stopped")
+				f.resources = append(f.resources, HAResourceRow{SID: "ct:500", State: "started", Comment: haMarker})
+				f.serviceNodes = map[string]string{
+					"vm:117": "n1", "vm:217": "n2", "vm:317": "n3", "vm:40": "n2", "ct:500": "",
+				}
+				return f
+			},
+			wantDog: "unknown",
+		},
+		{
 			name: "a node with no started service has finished draining",
 			build: func() *fakeHA {
 				f := drainFake("stopped")

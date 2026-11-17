@@ -52,6 +52,10 @@ type HAReader interface {
 	// ServiceStates returns the raw state the HA manager reports for each
 	// service by service ID, such as recovery or started.
 	ServiceStates(ctx context.Context) (map[string]string, error)
+	// ServiceNodes returns the node the HA manager status places each service
+	// on, by service ID, for VMs and containers alike. A service with no node
+	// in the status maps to the empty string.
+	ServiceNodes(ctx context.Context) (map[string]string, error)
 	// Rules lists the HA rules.
 	Rules(ctx context.Context) ([]ha.Rule, error)
 	// Guests lists every QEMU guest of the cluster from the authoritative
@@ -206,6 +210,17 @@ func (r *pveHAReader) ServiceStates(ctx context.Context) (map[string]string, err
 		return nil, fmt.Errorf("read HA manager status: %w", err)
 	}
 	return states, nil
+}
+
+func (r *pveHAReader) ServiceNodes(ctx context.Context) (map[string]string, error) {
+	if err := r.ready(); err != nil {
+		return nil, err
+	}
+	nodes, err := pve.ReadHAServiceNodes(ctx, r.client.Cluster())
+	if err != nil {
+		return nil, fmt.Errorf("read HA manager status: %w", err)
+	}
+	return nodes, nil
 }
 
 func (r *pveHAReader) EntryClock(ctx context.Context, node string) error {

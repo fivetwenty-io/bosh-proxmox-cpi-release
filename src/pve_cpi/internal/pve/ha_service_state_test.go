@@ -942,3 +942,33 @@ func TestHAServiceState_OldCRMWithAnotherResourceIsUnknown(t *testing.T) {
 	}
 	haWant(t, st, pve.HAUnknown)
 }
+
+func TestReadHAServiceNodesListsContainersAndServicesWithoutANode(t *testing.T) {
+	t.Parallel()
+	c := &haCluster{nhCluster: nhHealthy()}
+	c.manager = haManagerBody(nhNow-5, "pve1",
+		map[string]string{"pve1": "online", "pve2": "online", "pve3": "online"},
+		map[string]map[string]any{"pve1": nhActive(nhNow)},
+		map[string]any{
+			"vm:100": haSvc("started", "pve2", ""),
+			"ct:200": haSvc("started", "pve3", ""),
+			"vm:300": map[string]any{"state": "started"},
+		})
+	got, err := pve.ReadHAServiceNodes(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"vm:100": "pve2", "ct:200": "pve3", "vm:300": ""}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for sid, node := range want {
+		if got[sid] != node {
+			t.Errorf("%s: node %q, want %q", sid, got[sid], node)
+		}
+	}
+	c.managerErr = errors.New("boom")
+	if _, err := pve.ReadHAServiceNodes(context.Background(), c); err == nil {
+		t.Error("an unreadable manager status must be an error")
+	}
+}
