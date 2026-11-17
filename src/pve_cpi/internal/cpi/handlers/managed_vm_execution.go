@@ -139,30 +139,33 @@ func (e *StorageVMExecution) shape(cfg *config.CPIConfig) (*createVMShape, error
 // Policy/ranking inputs and current hard storage bounds are revalidated
 // separately. Only material non-storage execution settings participate here.
 func managedVMExecutionFingerprint(cfg *config.CPIConfig) (string, error) {
-	return managedVMExecutionFingerprintOf(cfg, false)
+	return managedVMExecutionFingerprintOf(cfg, true)
 }
 
 // managedVMExecutionFingerprintMatches reports whether stored is the execution
-// fingerprint of cfg, either in full or with the API transport settings
-// cleared. Those settings (endpoints, endpoint_cache_dir, and
-// api_endpoint_discovery) arrived in 0.10.0 and decide how the CPI reaches the
-// PVE API, not what it builds, so a record frozen before an operator set them
-// still resumes and falls back once they are set. New records keep the full
-// fingerprint. The ha block stays in both forms, because an HA change between
+// fingerprint of cfg in either form a release has written. The API transport
+// settings (endpoints, endpoint_cache_dir, and api_endpoint_discovery) decide
+// how the CPI reaches the PVE API, not what it builds, so the fingerprint a
+// record stores leaves them out. That form is also the one 0.9.x computes,
+// since it has none of those keys, so a record keeps matching across an
+// upgrade, a rollback, and any change to those settings. Releases 0.10.0
+// through 0.10.2 stored the fingerprint with them included, so the full form
+// still matches a record those releases opened while the settings are
+// unchanged. The ha block stays in both forms, because an HA change between
 // an attempt and its resume is a change this guard still refuses.
 func managedVMExecutionFingerprintMatches(cfg *config.CPIConfig, stored string) (bool, error) {
-	full, err := managedVMExecutionFingerprintOf(cfg, false)
-	if err != nil {
-		return false, err
-	}
-	if stored == full {
-		return true, nil
-	}
 	transportless, err := managedVMExecutionFingerprintOf(cfg, true)
 	if err != nil {
 		return false, err
 	}
-	return stored == transportless, nil
+	if stored == transportless {
+		return true, nil
+	}
+	full, err := managedVMExecutionFingerprintOf(cfg, false)
+	if err != nil {
+		return false, err
+	}
+	return stored == full, nil
 }
 
 // managedVMTransportInputs are the top-level CPIConfig keys that choose how

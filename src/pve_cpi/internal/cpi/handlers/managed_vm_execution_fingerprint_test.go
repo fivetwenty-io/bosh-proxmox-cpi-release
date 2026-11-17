@@ -10,8 +10,11 @@ import (
 // TestManagedVMExecutionFingerprintAcceptsTransportSettings pins which config
 // changes a frozen VM execution survives. The API transport settings that
 // 0.10.0 added choose how the CPI reaches PVE, not what it builds, so a record
-// frozen before they were set still resumes and falls back once they are. Any
-// other change, the ha block included, still refuses the recorded execution.
+// stores its fingerprint without them, which is also what 0.9.x computes. A
+// record matches however those settings change, and a record that 0.10.0
+// through 0.10.2 froze with them included still matches while they are
+// unchanged. Any other change, the ha block included, still refuses the
+// recorded execution.
 func TestManagedVMExecutionFingerprintAcceptsTransportSettings(t *testing.T) {
 	base := func() *config.CPIConfig {
 		return &config.CPIConfig{Host: "pve.example", Node: "pve1", NetworkBridge: "vmbr0"}
@@ -22,6 +25,11 @@ func TestManagedVMExecutionFingerprintAcceptsTransportSettings(t *testing.T) {
 		cfg.APIEndpointDiscovery = config.DiscoveryModeOn
 		return cfg
 	}
+	otherTransport := func(cfg *config.CPIConfig) *config.CPIConfig {
+		cfg.Endpoints = []string{"pve.example:8006", "pve3.example:8006"}
+		cfg.APIEndpointDiscovery = config.DiscoveryModeOff
+		return cfg
+	}
 	fingerprint := func(cfg *config.CPIConfig) string {
 		fp, err := managedVMExecutionFingerprint(cfg)
 		if err != nil {
@@ -29,11 +37,23 @@ func TestManagedVMExecutionFingerprintAcceptsTransportSettings(t *testing.T) {
 		}
 		return fp
 	}
-	// A record frozen before the transport settings existed, as 0.9.x froze
-	// every record, holds the fingerprint of the config without them.
+	full := func(cfg *config.CPIConfig) string {
+		fp, err := managedVMExecutionFingerprintOf(cfg, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fp
+	}
+	// A record 0.9.x froze holds the fingerprint of the config without the
+	// transport settings, and so does every record this release freezes.
 	frozenBefore := fingerprint(base())
 	frozenWith := fingerprint(withTransport(base()))
-	if frozenBefore == frozenWith {
+	if frozenWith != frozenBefore {
+		t.Fatalf("a record frozen with transport settings stores %s, want the 0.9.x form %s", frozenWith, frozenBefore)
+	}
+	// A record that 0.10.0 through 0.10.2 froze holds the full fingerprint.
+	frozenTenZero := full(withTransport(base()))
+	if frozenTenZero == frozenBefore {
 		t.Fatal("the transport settings do not move the full fingerprint, so the test proves nothing")
 	}
 	strict := true
@@ -45,7 +65,11 @@ func TestManagedVMExecutionFingerprintAcceptsTransportSettings(t *testing.T) {
 	}{
 		{name: "unchanged config", current: base(), stored: frozenBefore, want: true},
 		{name: "transport settings added after the record froze", current: withTransport(base()), stored: frozenBefore, want: true},
-		{name: "full fingerprint with transport settings", current: withTransport(base()), stored: frozenWith, want: true},
+		{name: "record frozen with transport settings", current: withTransport(base()), stored: frozenWith, want: true},
+		{name: "transport settings changed after the record froze them", current: otherTransport(base()), stored: frozenWith, want: true},
+		{name: "transport settings removed after the record froze them", current: base(), stored: frozenWith, want: true},
+		{name: "0.10.0 to 0.10.2 full fingerprint, settings unchanged", current: withTransport(base()), stored: frozenTenZero, want: true},
+		{name: "0.10.0 to 0.10.2 full fingerprint, settings changed", current: otherTransport(base()), stored: frozenTenZero, want: false},
 		{name: "endpoints alone added", current: func() *config.CPIConfig {
 			cfg := base()
 			cfg.Endpoints = []string{"pve.example:8006"}
@@ -91,12 +115,13 @@ func TestManagedVMExecutionFingerprintAcceptsTransportSettings(t *testing.T) {
 			}
 		})
 	}
-	// New records keep writing the full fingerprint.
+	// New records store the fingerprint without the transport settings, which
+	// is the value 0.9.x computes for the same config after a rollback.
 	execution, err := freezeManagedVMExecution(withTransport(base()), &createVMShape{node: "pve1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if execution.InputFingerprint != frozenWith {
-		t.Fatalf("new record froze %s, want the full fingerprint %s", execution.InputFingerprint, frozenWith)
+	if execution.InputFingerprint != frozenBefore {
+		t.Fatalf("new record froze %s, want the transportless fingerprint %s", execution.InputFingerprint, frozenBefore)
 	}
 }
