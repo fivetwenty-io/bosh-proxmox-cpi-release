@@ -44,6 +44,7 @@ const (
 	haKindReplicaSuperseded   = "replica_superseded_copy"
 	haKindReplicaNoJournal    = "replica_journal_unconfigured"
 	haKindReplicaMarkerEncode = "replica_marker_encoded"
+	haKindReplicaGoneVM       = "replica_gone_vm_volume"
 	haKindHoldMaintenance     = "hold_blocks_maintenance"
 	haKindHeadroomShort       = "headroom_short"
 	haKindHeadroomUnavailable = "headroom_unavailable"

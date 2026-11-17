@@ -1684,3 +1684,72 @@ func makeDir(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 }
+
+// TestCollectReportsTheVolumeOfAGoneVM covers a replica copy whose VM is gone:
+// PVE purged the job with the VM and left the copy on the target node.
+func TestCollectReportsTheVolumeOfAGoneVM(t *testing.T) {
+	t.Parallel()
+	f := replicaFake()
+	f.volumes["n2/local-zfs"] = map[string]bool{
+		"local-zfs:vm-101-disk-0":                true,
+		"local-zfs:vm-559-ephemeral-0":           true,
+		"local-zfs:vm-560-disk-0":                true,
+		"local-zfs:vm-561-bosh-ns-alloc-abc.raw": true,
+		"local-zfs:vm-562-state-snap1":           true,
+		"local-zfs:vm-9500-disk-0":               true,
+		"local-zfs:vm-99-disk-0":                 true,
+	}
+	r := runCollect(t, f, haCfg("auto", "replicate"))
+	got := map[string]haFinding{}
+	for _, fd := range findings(r, haKindReplicaGoneVM) {
+		got[fd.Subject] = fd
+	}
+	wantSubjects := []string{
+		"local-zfs:vm-559-ephemeral-0", "local-zfs:vm-560-disk-0", "local-zfs:vm-561-bosh-ns-alloc-abc.raw",
+	}
+	if len(got) != len(wantSubjects) {
+		t.Fatalf("gone-VM findings %+v, want exactly %v; a name the CPI does not give, a VMID outside the band, "+
+			"or a live VM's volume is not reported", got, wantSubjects)
+	}
+	for _, subject := range wantSubjects {
+		if fd, ok := got[subject]; !ok || fd.Severity != haSeverityAdvice {
+			t.Errorf("finding for %s = %+v, want advice", subject, fd)
+		}
+	}
+	if d := got["local-zfs:vm-559-ephemeral-0"].Detail; !strings.Contains(d, "on n2") ||
+		!strings.Contains(d, "VMID 559") || !strings.Contains(d, "100 to 8999") {
+		t.Errorf("detail %q, want the node, the VMID, and the band", d)
+	}
+	wantNone(t, r, haKindReplicaOrphanVolume)
+
+	// A copy the journal recorded is reported as recorded, not again.
+	g := replicaFake()
+	g.volumes["n2/local-zfs"] = map[string]bool{"local-zfs:vm-559-ephemeral-0": true}
+	g.journal = JournalView{Configured: true, Records: []aj.Record{{Replication: &aj.Replication{
+		Owner: haDirector, Retired: true,
+		Job: &aj.ReplicaJob{ID: "559-0", Guest: 559, Source: "n1", Target: "n2", Generation: 1},
+		Copies: []aj.ReplicaCopy{{Kind: aj.ReplicaCopyOrphan, Node: "n2", JobID: "559-0",
+			VolIDs: []string{"local-zfs:vm-559-ephemeral-0"}, RecordedAt: haNow}},
+	}}}}
+	r = runCollect(t, g, haCfg("auto", "replicate"))
+	want(t, r, haKindReplicaRecordedOrph, haSeverityProblem, "local-zfs:vm-559-ephemeral-0@n2")
+	wantNone(t, r, haKindReplicaGoneVM)
+
+	// A VMID a job still names, a volume a read config references, and a run
+	// that could not list every node's guests report nothing.
+	h := replicaFake()
+	h.volumes["n2/local-zfs"] = map[string]bool{"local-zfs:vm-559-ephemeral-0": true}
+	h.jobs = append(h.jobs, ha.ReplicaJobState{ID: "559-0", Guest: 559, Source: "n1", Target: "n3",
+		Comment: haMarker + " gen=1"})
+	wantNone(t, runCollect(t, h, haCfg("auto", "replicate")), haKindReplicaGoneVM)
+
+	k := replicaFake()
+	k.volumes["n2/local-zfs"] = map[string]bool{"local-zfs:vm-559-disk-0": true}
+	k.configs[101]["scsi1"] = "local-zfs:vm-559-disk-0,size=1G"
+	wantNone(t, runCollect(t, k, haCfg("auto", "replicate")), haKindReplicaGoneVM)
+
+	m := replicaFake()
+	m.volumes["n2/local-zfs"] = map[string]bool{"local-zfs:vm-559-ephemeral-0": true}
+	m.excluded = []string{"n3"}
+	wantNone(t, runCollect(t, m, haCfg("auto", "replicate")), haKindReplicaGoneVM)
+}

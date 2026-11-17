@@ -55,6 +55,13 @@ var (
 	haBirthTagPattern = regexp.MustCompile(`^bosh-creating-(\d{1,19})$`)
 	// haVolumeGuestPattern captures the VMID a guest volume's name carries.
 	haVolumeGuestPattern = regexp.MustCompile(`^[^:]+:(?:[^/]+/)?vm-(\d+)-`)
+	// haCPIVolumePattern matches the names the CPI gives a VM's volumes on a
+	// block storage such as a ZFS pool: the cloned root and the persistent
+	// disks a reassignment renames to the VM (vm-<vmid>-disk-<n>), the
+	// ephemeral disk (vm-<vmid>-ephemeral-<n>), the cloud-init drive, and the
+	// allocations the managed lifecycle names (vm-<vmid>-bosh-...).
+	haCPIVolumePattern = regexp.MustCompile(
+		`^[^:]+:(?:[^/]+/)?vm-(\d+)-(?:disk-\d+|ephemeral-\d+|cloudinit|bosh-[A-Za-z0-9._-]+)(?:\.[a-z0-9]+)?$`)
 )
 
 // haRunsUnderHA says whether a requested state leaves the guest running under HA.
@@ -155,17 +162,20 @@ type haCollector struct {
 	guests      []*haGuest
 	byVMID      map[int]*haGuest
 	guestsOK    bool
-	storages    map[string]pve.StorageInfo
-	storagesOK  bool
-	jobs        []ha.ReplicaJobState
-	jobsOK      bool
-	jobStatus   map[string]ha.ReplicaSyncStatus
-	schedules   map[string]string
-	schedErr    error
-	awaiting    map[int]bool
-	journal     JournalView
-	journalOK   bool
-	memoryErr   error
+	// guestsPartial is true when offline nodes kept some guests out of the
+	// list, so a VMID missing from it may still name a guest.
+	guestsPartial bool
+	storages      map[string]pve.StorageInfo
+	storagesOK    bool
+	jobs          []ha.ReplicaJobState
+	jobsOK        bool
+	jobStatus     map[string]ha.ReplicaSyncStatus
+	schedules     map[string]string
+	schedErr      error
+	awaiting      map[int]bool
+	journal       JournalView
+	journalOK     bool
+	memoryErr     error
 
 	// euid is the doctor's own effective user, which the cache directory
 	// checks compare with the CPI's user.
@@ -298,6 +308,7 @@ func (c *haCollector) readGuests() {
 		return
 	}
 	if len(excluded) > 0 {
+		c.guestsPartial = true
 		c.rep.advise(haKindGuestsNotListed, strings.Join(excluded, ","),
 			"these offline nodes could not be asked, so their guests are missing from every VM check")
 	}
@@ -1259,7 +1270,8 @@ func (c *haCollector) firstSyncOverdue(jobID string, changed time.Time, haveChan
 }
 
 // orphanVolumes lists replica volumes that sit on a node other than their
-// VM's and that no replication job targets.
+// VM's and that no replication job targets, and the volumes of this
+// Director's VMs that outlived their VM (see goneVMVolume).
 func (c *haCollector) orphanVolumes() {
 	if !c.guestsOK || !c.storagesOK || !c.jobsOK {
 		return
@@ -1276,11 +1288,14 @@ func (c *haCollector) orphanVolumes() {
 	}
 	sort.Slice(storages, func(i, j int) bool { return storages[i].Name < storages[j].Name })
 	covered := map[string]bool{}
+	jobGuests := map[int]bool{}
 	for _, j := range c.jobs {
+		jobGuests[j.Guest] = true
 		if j.Fault == "" {
 			covered[strconv.Itoa(j.Guest)+"@"+j.Target] = true
 		}
 	}
+	gone := c.goneVMVolumeCheck(jobGuests)
 	for i := range c.p.Nodes {
 		node := c.p.Nodes[i]
 		if !node.Online {
@@ -1309,7 +1324,11 @@ func (c *haCollector) orphanVolumes() {
 				}
 				vmid, _ := strconv.Atoi(m[1])
 				g, ok := c.byVMID[vmid]
-				if !ok || !g.owned || g.ref.Node == node.Name || covered[m[1]+"@"+node.Name] {
+				if !ok {
+					gone(volid, node.Name, vmid)
+					continue
+				}
+				if !g.owned || g.ref.Node == node.Name || covered[m[1]+"@"+node.Name] {
 					continue
 				}
 				c.rep.problem(haKindReplicaOrphanVolume, volid,
@@ -1317,6 +1336,59 @@ func (c *haCollector) orphanVolumes() {
 					volid, node.Name, vmid, g.ref.Node, node.Name)
 			}
 		}
+	}
+}
+
+// goneVMVolumeCheck returns the check orphanVolumes runs on a volume whose
+// VMID names no guest in the cluster. Such a volume is most often the copy a
+// replication job left on its target when PVE purged the job with the VM, as
+// a forced retirement with no journal does, or as a destroy does when the CPI
+// left a job it did not recognize as its own. Once the VM is gone the volume
+// carries no ownership marker, and the PVE API does not list its replication
+// snapshots, so the doctor infers that it is this Director's only from the
+// VMID, which must fall inside the configured VM band, and from a name the
+// CPI gives a VM's volumes. It also requires that no guest config the doctor
+// read references the volume, that no replication job names the VMID, and
+// that the journal has not recorded the copy already, which recordedCopies
+// reports. Because the ownership is inferred, the finding is advice. The
+// check is off while offline nodes keep guests out of the list, because a
+// missing VMID then proves nothing.
+func (c *haCollector) goneVMVolumeCheck(jobGuests map[int]bool) func(volid, node string, vmid int) {
+	if c.guestsPartial || c.cfg == nil {
+		return func(string, string, int) {}
+	}
+	start, end := c.cfg.VMIDRangeStart, c.cfg.VMIDRangeEnd
+	referenced := map[string]bool{}
+	for _, g := range c.guests {
+		for _, v := range g.volumes {
+			referenced[v.Volume] = true
+		}
+	}
+	recorded := map[string]bool{}
+	if c.journalOK {
+		for i := range c.journal.Records {
+			rep := c.journal.Records[i].Replication
+			if rep == nil {
+				continue
+			}
+			for _, cp := range rep.Copies {
+				for _, v := range cp.VolIDs {
+					recorded[v+"@"+cp.Node] = true
+				}
+			}
+		}
+	}
+	return func(volid, node string, vmid int) {
+		if vmid < start || vmid > end || jobGuests[vmid] || referenced[volid] || recorded[volid+"@"+node] ||
+			!haCPIVolumePattern.MatchString(volid) {
+			return
+		}
+		c.rep.advise(haKindReplicaGoneVM, volid,
+			"%s on %s carries VMID %d, which falls in this Director's VM band (%d to %d) and names no guest in the "+
+				"cluster, and its name is one the CPI gives a VM's volumes. It is most likely a replica copy that PVE "+
+				"left when it purged the VM's job, or a volume a deletion left. Nothing removes it, so check that "+
+				"nothing needs it and remove it by hand",
+			volid, node, vmid, start, end)
 	}
 }
 
