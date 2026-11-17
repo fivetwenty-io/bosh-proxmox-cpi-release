@@ -246,19 +246,19 @@ func TestReconcileOnPartner_VerifiedSyncWithoutAMigrationWarnsOfLostWrites(t *te
 		warn  string
 	}{
 		"no migration task, as an HA recovery leaves": {
-			setup: func(r *replicaRig, _ time.Time) { r.tasks.migrations = map[string][]pve.MigrationTask{} },
+			setup: func(r *replicaRig, _ time.Time) { r.tasks.migrations = map[string][]pve.VMTask{} },
 			warn:  "after a failover, since no migration task on the old source explains the move",
 		},
 		"a migration that ended before the pin's last change": {
 			setup: func(r *replicaRig, changed time.Time) {
-				r.tasks.migrations = map[string][]pve.MigrationTask{}
+				r.tasks.migrations = map[string][]pve.VMTask{}
 				r.tasks.migrated("pve01", changed.Add(-2*time.Minute), changed.Add(-time.Minute), "OK")
 			},
 			warn: "after a failover, since no migration task on the old source explains the move",
 		},
 		"a migration that failed": {
 			setup: func(r *replicaRig, changed time.Time) {
-				r.tasks.migrations = map[string][]pve.MigrationTask{}
+				r.tasks.migrations = map[string][]pve.VMTask{}
 				r.tasks.migrated("pve01", changed.Add(time.Hour-time.Minute), changed.Add(time.Hour),
 					"migration aborted")
 			},

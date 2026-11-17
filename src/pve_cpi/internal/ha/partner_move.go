@@ -56,7 +56,7 @@ const (
 // clock-skew tolerance, and no task on the node the VM runs on succeeded after
 // it, which would mean the VM left that node again and came back some other
 // way. Anything else is MigrationNone.
-func MigrationEvidenceOf(fromOld, onNode []pve.MigrationTask, changedAt time.Time) MigrationEvidence {
+func MigrationEvidenceOf(fromOld, onNode []pve.VMTask, changedAt time.Time) MigrationEvidence {
 	if changedAt.IsZero() {
 		return MigrationNone
 	}

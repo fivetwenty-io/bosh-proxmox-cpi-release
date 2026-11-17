@@ -9,8 +9,8 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
-func migrationTask(status string, start, end time.Time) pve.MigrationTask {
-	task := pve.MigrationTask{Type: "qmigrate", ID: "100", Status: status, StartTime: start.Unix()}
+func migrationTask(status string, start, end time.Time) pve.VMTask {
+	task := pve.VMTask{Type: "qmigrate", ID: "100", Status: status, StartTime: start.Unix()}
 	if !end.IsZero() {
 		task.EndTime = end.Unix()
 	}
@@ -22,30 +22,30 @@ func migrationTask(status string, start, end time.Time) pve.MigrationTask {
 func TestMigrationEvidenceOf(t *testing.T) {
 	changed := time.Unix(1_700_000_000, 0)
 	after := changed.Add(time.Hour)
-	ok := func(end time.Time) pve.MigrationTask { return migrationTask("OK", end.Add(-time.Minute), end) }
+	ok := func(end time.Time) pve.VMTask { return migrationTask("OK", end.Add(-time.Minute), end) }
 	for _, tc := range []struct {
 		name           string
-		fromOld, onNow []pve.MigrationTask
+		fromOld, onNow []pve.VMTask
 		changedAt      time.Time
 		want           ha.MigrationEvidence
 	}{
-		{name: "a migration from the old source after the change", fromOld: []pve.MigrationTask{ok(after)},
+		{name: "a migration from the old source after the change", fromOld: []pve.VMTask{ok(after)},
 			changedAt: changed, want: ha.MigrationProved},
 		{name: "no task, as an HA recovery leaves", changedAt: changed, want: ha.MigrationNone},
-		{name: "a migration that ended before the change", fromOld: []pve.MigrationTask{ok(changed.Add(-time.Hour))},
+		{name: "a migration that ended before the change", fromOld: []pve.VMTask{ok(changed.Add(-time.Hour))},
 			changedAt: changed, want: ha.MigrationNone},
 		{name: "a migration within the clock-skew tolerance of the change",
-			fromOld: []pve.MigrationTask{ok(changed.Add(time.Minute))}, changedAt: changed, want: ha.MigrationNone},
-		{name: "a failed migration", fromOld: []pve.MigrationTask{migrationTask("migration aborted",
+			fromOld: []pve.VMTask{ok(changed.Add(time.Minute))}, changedAt: changed, want: ha.MigrationNone},
+		{name: "a failed migration", fromOld: []pve.VMTask{migrationTask("migration aborted",
 			after.Add(-time.Minute), after)}, changedAt: changed, want: ha.MigrationNone},
-		{name: "a migration still running", fromOld: []pve.MigrationTask{migrationTask("RUNNING",
+		{name: "a migration still running", fromOld: []pve.VMTask{migrationTask("RUNNING",
 			after, time.Time{})}, changedAt: changed, want: ha.MigrationNone},
-		{name: "the VM migrated away again after it arrived", fromOld: []pve.MigrationTask{ok(after)},
-			onNow: []pve.MigrationTask{ok(after.Add(time.Hour))}, changedAt: changed, want: ha.MigrationNone},
-		{name: "a migration away before the one that brought it", fromOld: []pve.MigrationTask{ok(after)},
-			onNow: []pve.MigrationTask{ok(after.Add(-10 * time.Minute))}, changedAt: changed,
+		{name: "the VM migrated away again after it arrived", fromOld: []pve.VMTask{ok(after)},
+			onNow: []pve.VMTask{ok(after.Add(time.Hour))}, changedAt: changed, want: ha.MigrationNone},
+		{name: "a migration away before the one that brought it", fromOld: []pve.VMTask{ok(after)},
+			onNow: []pve.VMTask{ok(after.Add(-10 * time.Minute))}, changedAt: changed,
 			want: ha.MigrationProved},
-		{name: "no time of change", fromOld: []pve.MigrationTask{ok(after)}, want: ha.MigrationNone},
+		{name: "no time of change", fromOld: []pve.VMTask{ok(after)}, want: ha.MigrationNone},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := ha.MigrationEvidenceOf(tc.fromOld, tc.onNow, tc.changedAt); got != tc.want {

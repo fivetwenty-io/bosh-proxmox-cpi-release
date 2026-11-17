@@ -191,7 +191,7 @@ type lifecycleFlowPVE struct {
 	activeMoveTasks   map[string][]pve.ActiveTask
 	activeMoveTaskErr error
 	// migrationTasks serves the qmigrate listing of each node.
-	migrationTasks    map[string][]pve.MigrationTask
+	migrationTasks    map[string][]pve.VMTask
 	onActiveMoveTasks func(node string)
 	moveTaskListings  []string
 	// destroyed records every volume PVE destroyed, in order, whether a
@@ -1046,8 +1046,8 @@ func (c *lifecycleFlowPVE) ActiveMoveTasks(_ context.Context, node string) ([]pv
 // test stores tasks for it.
 func (c *lifecycleFlowPVE) MigrationTasks(
 	_ context.Context, node string, _ int, _ time.Time,
-) ([]pve.MigrationTask, error) {
-	return append([]pve.MigrationTask{}, c.migrationTasks[node]...), nil
+) ([]pve.VMTask, error) {
+	return append([]pve.VMTask{}, c.migrationTasks[node]...), nil
 }
 
 // volumeDeleted applies visibilityErrAfterDelete and runs onVolumeDeleted

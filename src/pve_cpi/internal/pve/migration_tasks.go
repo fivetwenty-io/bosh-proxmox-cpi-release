@@ -12,12 +12,13 @@ import (
 // replicate policy reads it to tell a planned migration of a VM from a
 // failover, and to wait for a migration in flight.
 type MigrationTaskReader interface {
-	MigrationTasks(ctx context.Context, node string, vmid int, since time.Time) ([]MigrationTask, error)
+	MigrationTasks(ctx context.Context, node string, vmid int, since time.Time) ([]VMTask, error)
 }
 
-// MigrationTask is one row of a node's task list for a qmigrate task. A task
-// that is still running has no end time and no final status.
-type MigrationTask struct {
+// VMTask is one row of a node's task list for one VM, such as a qmigrate or
+// a qmstart task. A task that is still running has no end time and no final
+// status.
+type VMTask struct {
 	UPID      string `json:"upid"`
 	Node      string `json:"node"`
 	Type      string `json:"type"`
@@ -30,16 +31,16 @@ type MigrationTask struct {
 // Running reports whether the task may still run. PVE reports a task in the
 // active list as RUNNING until it archives it, whether or not it has ended,
 // so a row with no end time or no final status counts as running.
-func (t MigrationTask) Running() bool {
+func (t VMTask) Running() bool {
 	return t.EndTime <= 0 || t.Status == "" || t.Status == "RUNNING"
 }
 
 // Succeeded reports whether the task ended with PVE's OK status.
-func (t MigrationTask) Succeeded() bool { return t.EndTime > 0 && t.Status == "OK" }
+func (t VMTask) Succeeded() bool { return t.EndTime > 0 && t.Status == "OK" }
 
 // End returns the time the task ended, and the zero time for a task that is
 // still running.
-func (t MigrationTask) End() time.Time {
+func (t VMTask) End() time.Time {
 	if t.EndTime <= 0 {
 		return time.Time{}
 	}
@@ -60,7 +61,7 @@ const migrationTaskLimit = 1000
 // (pve-manager Tasks.pm:184 and :190), and an HA migration runs as root@pam,
 // so the listing first proves that grant and refuses without it, because a
 // listing that could hide a task proves nothing about it.
-func (c *sdkClient) MigrationTasks(ctx context.Context, node string, vmid int, since time.Time) ([]MigrationTask, error) {
+func (c *sdkClient) MigrationTasks(ctx context.Context, node string, vmid int, since time.Time) ([]VMTask, error) {
 	if c == nil {
 		return nil, ErrAuditVisibilityReaderUnavailable
 	}
@@ -69,7 +70,7 @@ func (c *sdkClient) MigrationTasks(ctx context.Context, node string, vmid int, s
 
 func observeMigrationTasks(
 	ctx context.Context, reader auditPermissionGetter, node string, vmid int, since time.Time,
-) ([]MigrationTask, error) {
+) ([]VMTask, error) {
 	if ctx == nil || reader == nil {
 		return nil, ErrAuditVisibilityReaderUnavailable
 	}
@@ -105,7 +106,7 @@ func observeMigrationTasks(
 	if err != nil {
 		return nil, malformed
 	}
-	var tasks []MigrationTask
+	var tasks []VMTask
 	if err := json.Unmarshal(encoded, &tasks); err != nil || tasks == nil || len(tasks) >= migrationTaskLimit {
 		return nil, malformed
 	}

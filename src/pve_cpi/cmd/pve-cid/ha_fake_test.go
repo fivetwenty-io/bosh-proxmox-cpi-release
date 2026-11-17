@@ -48,7 +48,7 @@ type fakeHA struct {
 	statusErr    map[string]error
 	volumes      map[string]map[string]bool
 	volumesErr   map[string]error
-	migrations   map[string][]pve.MigrationTask
+	migrations   map[string][]pve.VMTask
 	migrationErr map[string]error
 
 	storages    []pve.StorageInfo
@@ -102,7 +102,7 @@ func (f *fakeHA) ReplicaStatus(_ context.Context, _, id string) (ha.ReplicaSyncS
 	return f.status[id], nil
 }
 
-func (f *fakeHA) MigrationTasks(_ context.Context, node string, _ int, _ time.Time) ([]pve.MigrationTask, error) {
+func (f *fakeHA) MigrationTasks(_ context.Context, node string, _ int, _ time.Time) ([]pve.VMTask, error) {
 	if err := f.migrationErr[node]; err != nil {
 		return nil, err
 	}

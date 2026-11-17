@@ -781,7 +781,7 @@ func (c *attachRunClient) ActiveMoveTasks(_ context.Context, node string) ([]pve
 
 func (c *attachRunClient) MigrationTasks(
 	_ context.Context, node string, vmid int, since time.Time,
-) ([]pve.MigrationTask, error) {
+) ([]pve.VMTask, error) {
 	if c.tasks == nil {
 		return nil, errors.New("no task listing stubbed")
 	}
@@ -792,7 +792,7 @@ func (c *attachRunClient) MigrationTasks(
 	if err := c.tasks.err[node]; err != nil {
 		return nil, err
 	}
-	var out []pve.MigrationTask
+	var out []pve.VMTask
 	for _, task := range c.tasks.migrations[node] {
 		if task.ID == strconv.Itoa(vmid) && task.StartTime >= since.Unix() {
 			out = append(out, task)
@@ -805,21 +805,21 @@ func (c *attachRunClient) MigrationTasks(
 // error per node for both listings, and one for the migration listing alone.
 type taskListStub struct {
 	moves        map[string][]pve.ActiveTask
-	migrations   map[string][]pve.MigrationTask
+	migrations   map[string][]pve.VMTask
 	err          map[string]error
 	migrationErr map[string]error
 	calls        []string
 }
 
 func newTaskListStub() *taskListStub {
-	return &taskListStub{moves: map[string][]pve.ActiveTask{}, migrations: map[string][]pve.MigrationTask{},
+	return &taskListStub{moves: map[string][]pve.ActiveTask{}, migrations: map[string][]pve.VMTask{},
 		err: map[string]error{}, migrationErr: map[string]error{}}
 }
 
 // migrated records a qmigrate task of VM 100 on node that ran from start to
 // end and ended with status.
 func (s *taskListStub) migrated(node string, start, end time.Time, status string) {
-	task := pve.MigrationTask{UPID: "UPID:" + node + ":00000001:00000001:00000001:qmigrate:100:root@pam:",
+	task := pve.VMTask{UPID: "UPID:" + node + ":00000001:00000001:00000001:qmigrate:100:root@pam:",
 		Node: node, Type: "qmigrate", ID: "100", Status: status, StartTime: start.Unix()}
 	if !end.IsZero() {
 		task.EndTime = end.Unix()

@@ -116,14 +116,14 @@ func TestMigrationTasksWire(t *testing.T) {
 // TestMigrationTaskOutcome reads a task's outcome the way PVE reports it.
 func TestMigrationTaskOutcome(t *testing.T) {
 	for _, tc := range []struct {
-		task               pve.MigrationTask
+		task               pve.VMTask
 		running, succeeded bool
 	}{
-		{pve.MigrationTask{Status: "OK", EndTime: 10}, false, true},
-		{pve.MigrationTask{Status: "migration aborted", EndTime: 10}, false, false},
-		{pve.MigrationTask{Status: "RUNNING", EndTime: 10}, true, false},
-		{pve.MigrationTask{Status: "RUNNING"}, true, false},
-		{pve.MigrationTask{}, true, false},
+		{pve.VMTask{Status: "OK", EndTime: 10}, false, true},
+		{pve.VMTask{Status: "migration aborted", EndTime: 10}, false, false},
+		{pve.VMTask{Status: "RUNNING", EndTime: 10}, true, false},
+		{pve.VMTask{Status: "RUNNING"}, true, false},
+		{pve.VMTask{}, true, false},
 	} {
 		if got := tc.task.Running(); got != tc.running {
 			t.Errorf("%+v Running() = %v, want %v", tc.task, got, tc.running)
@@ -132,7 +132,7 @@ func TestMigrationTaskOutcome(t *testing.T) {
 			t.Errorf("%+v Succeeded() = %v, want %v", tc.task, got, tc.succeeded)
 		}
 	}
-	if !(pve.MigrationTask{EndTime: 10}).End().Equal(time.Unix(10, 0)) || !(pve.MigrationTask{}).End().IsZero() {
+	if !(pve.VMTask{EndTime: 10}).End().Equal(time.Unix(10, 0)) || !(pve.VMTask{}).End().IsZero() {
 		t.Error("End does not read the end time")
 	}
 }

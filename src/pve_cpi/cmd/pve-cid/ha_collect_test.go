@@ -466,7 +466,7 @@ func TestCollectReplicaOnPartnerAndAwaitingPinWidening(t *testing.T) {
 func TestCollectReplicaOnPartnerAfterAMove(t *testing.T) {
 	t.Parallel()
 	changed := haNow.Add(-2 * time.Hour)
-	migrated := pve.MigrationTask{UPID: "UPID:n1:00000001:00000001:00000001:qmigrate:101:root@pam:", Node: "n1",
+	migrated := pve.VMTask{UPID: "UPID:n1:00000001:00000001:00000001:qmigrate:101:root@pam:", Node: "n1",
 		Type: "qmigrate", ID: "101", Status: "OK", StartTime: haNow.Add(-61 * time.Minute).Unix(),
 		EndTime: haNow.Add(-time.Hour).Unix()}
 	moved := func() *fakeHA {
@@ -476,7 +476,7 @@ func TestCollectReplicaOnPartnerAfterAMove(t *testing.T) {
 			"n1", "n2")}
 		f.jobs[0].Source, f.jobs[0].Target = "n2", "n1"
 		f.status["101-0"] = ha.ReplicaSyncStatus{LastSync: haNow.Add(-10 * time.Minute)}
-		f.migrations = map[string][]pve.MigrationTask{"n1": {migrated}}
+		f.migrations = map[string][]pve.VMTask{"n1": {migrated}}
 		return f
 	}
 	for _, tc := range []struct {
