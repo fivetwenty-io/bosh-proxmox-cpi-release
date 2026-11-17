@@ -274,13 +274,9 @@ func TestHAClock_StandaloneEntryKeepsRetrying(t *testing.T) {
 
 // borrowedScene is a scene whose entry node pve1 cannot read its own clock, so
 // every HA read borrows another member's clock.
-func borrowedScene(t *testing.T, mutate func(s *haScene), nodeNow map[string]int64) (*haCluster, *nhNodes) {
+func borrowedScene(t *testing.T, nodeNow map[string]int64) (*haCluster, *nhNodes) {
 	t.Helper()
-	s := newHAScene("started")
-	if mutate != nil {
-		mutate(s)
-	}
-	return s.cluster(), &nhNodes{now: nhNow, nodeNow: nodeNow, nodeErr: map[string]error{"pve1": shutdownClockErr()}}
+	return newHAScene("started").cluster(), &nhNodes{now: nhNow, nodeNow: nodeNow, nodeErr: map[string]error{"pve1": shutdownClockErr()}}
 }
 
 // TestHAClock_BorrowedClockRejectsStaleCRM checks that a borrowed clock still
@@ -289,7 +285,7 @@ func borrowedScene(t *testing.T, mutate func(s *haScene), nodeNow map[string]int
 // have read it fresh. Both readers must refuse it.
 func TestHAClock_BorrowedClockRejectsStaleCRM(t *testing.T) {
 	t.Parallel()
-	c, n := borrowedScene(t, nil, map[string]int64{"pve2": nhNow + 90})
+	c, n := borrowedScene(t, map[string]int64{"pve2": nhNow + 90})
 
 	r, err := pve.NodeHealth(fastBackoff(t), c, n, pve.NodeHealthOptions{})
 	if err != nil {
@@ -319,7 +315,7 @@ func TestHAClock_BorrowedClockRejectsStaleCRM(t *testing.T) {
 // clock would have read it fresh.
 func TestHAClock_BorrowedClockRejectsStaleLRM(t *testing.T) {
 	t.Parallel()
-	c, n := borrowedScene(t, nil, map[string]int64{"pve2": nhNow + 43})
+	c, n := borrowedScene(t, map[string]int64{"pve2": nhNow + 43})
 
 	st, err := pve.ReadHAServiceState(fastBackoff(t), c, n,
 		pve.HAServiceStateInput{VMID: 100, VMNode: "pve2", Kind: pve.HADecisionLive})
@@ -365,7 +361,7 @@ func TestHAClock_MasterClockDecidesTheVerdict(t *testing.T) {
 		t.Parallel()
 		// With the entry node as the master there is no master peer, so pve2
 		// answers first and its clock reads the same timestamp as stale.
-		c, n := borrowedScene(t, nil, nodeNow)
+		c, n := borrowedScene(t, nodeNow)
 		r, err := pve.NodeHealth(fastBackoff(t), c, n, pve.NodeHealthOptions{})
 		if err != nil {
 			t.Fatal(err)
@@ -381,7 +377,7 @@ func TestHAClock_MasterClockDecidesTheVerdict(t *testing.T) {
 // while it shuts down, and that it stays a proxy target.
 func TestNodeHealth_FailingEntryIsNotPlaceable(t *testing.T) {
 	t.Parallel()
-	c, n := borrowedScene(t, nil, nil)
+	c, n := borrowedScene(t, nil)
 	r, err := pve.NodeHealth(fastBackoff(t), c, n, pve.NodeHealthOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -414,7 +410,7 @@ func TestNodeHealth_FailingEntryIsNotPlaceable(t *testing.T) {
 // end when its limit does, and must not move on to the next peer.
 func TestHAClock_HungPeerIsCutOff(t *testing.T) {
 	t.Parallel()
-	c, n := borrowedScene(t, nil, nil)
+	c, n := borrowedScene(t, nil)
 	n.hang = map[string]bool{"pve2": true}
 	ctx := pve.WithTestHAClockWalkLimit(fastBackoff(t), 20*time.Millisecond)
 
