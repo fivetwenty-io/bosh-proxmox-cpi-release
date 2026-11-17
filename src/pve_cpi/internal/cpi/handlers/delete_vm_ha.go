@@ -346,16 +346,23 @@ func haRecoveryGraceError(
 		log.String("elapsed", elapsed.Round(time.Second).String()), log.String("window", window.String()),
 	}
 	pinnedAlone := haPinnedToNodeAlone(ctx, deps, caller, st, logger)
+	// Only delete_vm waits for a restarted VM to settle (see
+	// awaitHARecoverySettle), so only its text promises that wait.
+	settleRunning, settleExpired := "", ""
+	if caller == haRecoveryCaller {
+		settleRunning = fmt.Sprintf(". After PVE HA restarts the VM, the delete waits up to %s of uptime so its "+
+			"agent can answer", haRecoverySettleWindow)
+		settleExpired = fmt.Sprintf(", and after the restart the delete waits up to %s of uptime so the VM's "+
+			"agent can answer", haRecoverySettleWindow)
+	}
 	if elapsed < window {
 		logger.Info(caller+": VM is in HA recovery; the grace window is running", fields...)
 		if pinnedAlone {
 			return cpierrors.Retriable(
 				"%s: VM %d deferred: %s. Its strict HA pin admits node %s alone, so PVE HA cannot recover it onto "+
 					"another node and restarts it in place once the node returns. %s of the %s grace window remain, "+
-					"and the delete keeps deferring while the window runs and after it expires for the same reason. "+
-					"After PVE HA restarts the VM, the delete waits up to %s of uptime so its agent can answer",
-				caller, st.VMID, reason, st.Node, (window - elapsed).Round(time.Second), window,
-				haRecoverySettleWindow)
+					"and the delete keeps deferring while the window runs and after it expires for the same reason%s",
+				caller, st.VMID, reason, st.Node, (window - elapsed).Round(time.Second), window, settleRunning)
 		}
 		return cpierrors.Retriable(
 			"%s: VM %d deferred: %s. PVE HA is still trying to recover it, and %s of the %s grace window remain; "+
@@ -367,11 +374,10 @@ func haRecoveryGraceError(
 		return cpierrors.Retriable(
 			"%s: VM %d deferred: %s, and the %s grace window expired %s ago. Its strict HA pin admits node %s "+
 				"alone, so no live node can take the VM's config, and PVE HA restarts the VM in place once the "+
-				"node returns. This call keeps deferring until then, and after the restart the delete waits up to "+
-				"%s of uptime so the VM's agent can answer. Check 'ha-manager status' for %s, and bring node %s "+
-				"back online",
+				"node returns. This call keeps deferring until then%s. Check 'ha-manager status' for %s, and bring "+
+				"node %s back online",
 			caller, st.VMID, reason, window, (elapsed - window).Round(time.Second), st.Node,
-			haRecoverySettleWindow, st.SID, st.Node)
+			settleExpired, st.SID, st.Node)
 	}
 	return cpierrors.Retriable(
 		"%s: VM %d deferred: %s, and the %s grace window expired %s ago without PVE HA recovering it. Past the "+

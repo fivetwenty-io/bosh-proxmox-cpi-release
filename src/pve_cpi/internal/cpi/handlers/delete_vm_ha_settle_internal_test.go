@@ -373,9 +373,39 @@ func TestGateHADeleteGraceTextForAVMPinnedToTheDeadNodeAlone(t *testing.T) {
 	f.clock.t = f.clock.t.Add(11 * time.Minute)
 	_, err = f.gate(t, "pve-node2")
 	requireHADeferral(t, err, "grace window expired 1m0s ago", "no live node can take the VM's config",
-		"restarts the VM in place once the node returns", "'ha-manager status' for vm:101")
+		"restarts the VM in place once the node returns", "after the restart the delete waits up to 5m0s of uptime",
+		"'ha-manager status' for vm:101")
 	if strings.Contains(err.Error(), "moves the config onto a live node") {
 		t.Fatalf("the expired text must not promise a config move: %v", err)
+	}
+}
+
+// TestGateHADeleteGraceTextPromisesNoSettleToOtherCallers gates the same
+// pinned VM for callers that never wait for a restarted VM to settle. Their
+// texts keep the pin and the restart in place, and they promise no uptime
+// wait.
+func TestGateHADeleteGraceTextPromisesNoSettleToOtherCallers(t *testing.T) {
+	for _, caller := range []string{"create_vm: rollback", "deferred teardown sweep", managedVMCleanupCaller} {
+		t.Run(caller, func(t *testing.T) {
+			scene := recoveryScene()
+			scene.Rules["bosh-na-101"] = map[string]any{"type": "node-affinity", "resources": "vm:101",
+				"nodes": "pve-node2", "strict": 1}
+			f := newHADeleteFixture(t, scene, 600)
+
+			_, err := gateHADelete(t.Context(), f.deps, caller, 101, "pve-node2", f.logger)
+			requireHADeferral(t, err, caller+": VM 101", "admits node pve-node2 alone",
+				"after it expires for the same reason")
+			if strings.Contains(err.Error(), "of uptime") {
+				t.Fatalf("%s never waits for a settle, but its text promises one: %v", caller, err)
+			}
+
+			f.clock.t = f.clock.t.Add(11 * time.Minute)
+			_, err = gateHADelete(t.Context(), f.deps, caller, 101, "pve-node2", f.logger)
+			requireHADeferral(t, err, "grace window expired 1m0s ago", "This call keeps deferring until then. Check")
+			if strings.Contains(err.Error(), "of uptime") {
+				t.Fatalf("%s never waits for a settle, but its expired text promises one: %v", caller, err)
+			}
+		})
 	}
 }
 
