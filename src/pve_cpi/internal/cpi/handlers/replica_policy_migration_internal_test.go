@@ -15,9 +15,9 @@ import (
 
 // movedReplicaRig is VM 100 under its widened pin, pve01 the source and pve02
 // the partner, with the pin's last change two hours ago. The VM runs on pve02
-// now, and PVE runs job 100-0 from pve02 back to pve01, the state a planned
-// live migration leaves. The last sync from pve02 covers the root volume on
-// pve01.
+// now, after a migration from pve01 that ended an hour ago, and PVE runs job
+// 100-0 from pve02 back to pve01, the state a planned live migration leaves.
+// The last sync from pve02 covers the root volume on pve01.
 func movedReplicaRig(t *testing.T) (*replicaRig, time.Time) {
 	t.Helper()
 	changed := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
@@ -29,6 +29,7 @@ func movedReplicaRig(t *testing.T) (*replicaRig, time.Time) {
 	r.repl.addJob("100-0", "pve02", "pve01", renderReplicaJobMarker(aaDirector, 1))
 	r.repl.status = verifiedSync(changed)
 	r.repl.listed[replicaRootVolume] = true
+	r.tasks.migrated("pve01", 100, changed.Add(time.Hour-time.Minute), changed.Add(time.Hour), "OK")
 	return r, changed
 }
 
@@ -78,7 +79,7 @@ func TestReconcileVMReplica_PlannedMigrationKeepsBothNodesAndMovesThePartner(t *
 	if got, ok := ha.ReplicaChanged(pin.Comment); !ok || !got.Equal(changed) {
 		t.Fatalf("pin comment %q; the time of the last change stays", pin.Comment)
 	}
-	if source, partner, ok := replicaPinShape(pin); !ok || source != "pve02" || partner != "pve01" {
+	if source, partner, ok := ha.ReplicaPinShape(pin); !ok || source != "pve02" || partner != "pve01" {
 		t.Fatalf("pin shape %q %q %v, want pve02 the source and pve01 the partner", source, partner, ok)
 	}
 	if !r.repl.called("status:pve02/100-0") || !r.repl.called("volumes:pve01/local-zfs") {
@@ -231,5 +232,89 @@ func TestReconcileVMReplica_UndecidedMoveWidensBackOnAVerifiedSync(t *testing.T)
 	}
 	if p, ok := ha.ReplicaPartner(r.pinComment()); !ok || p != "pve01" {
 		t.Fatalf("pin comment %q", r.pinComment())
+	}
+}
+
+// TestReconcileOnPartner_VerifiedSyncWithoutAMigrationWarnsOfLostWrites runs
+// the reconcile of a VM whose reversed sync is verified, with migration tasks
+// that do not prove a planned migration. The pin keeps both nodes, because
+// the old source's copy is current again, and the CPI warns that the move may
+// have lost writes instead of calling it a planned migration.
+func TestReconcileOnPartner_VerifiedSyncWithoutAMigrationWarnsOfLostWrites(t *testing.T) {
+	cases := map[string]struct {
+		setup func(r *replicaRig, changed time.Time)
+		warn  string
+	}{
+		"no migration task, as an HA recovery leaves": {
+			setup: func(r *replicaRig, _ time.Time) { r.tasks.migrations = map[string][]pve.MigrationTask{} },
+			warn:  "after a failover, since no migration task on the old source explains the move",
+		},
+		"a migration that ended before the pin's last change": {
+			setup: func(r *replicaRig, changed time.Time) {
+				r.tasks.migrations = map[string][]pve.MigrationTask{}
+				r.tasks.migrated("pve01", 100, changed.Add(-2*time.Minute), changed.Add(-time.Minute), "OK")
+			},
+			warn: "after a failover, since no migration task on the old source explains the move",
+		},
+		"a migration that failed": {
+			setup: func(r *replicaRig, changed time.Time) {
+				r.tasks.migrations = map[string][]pve.MigrationTask{}
+				r.tasks.migrated("pve01", 100, changed.Add(time.Hour-time.Minute), changed.Add(time.Hour),
+					"migration aborted")
+			},
+			warn: "after a failover, since no migration task on the old source explains the move",
+		},
+		"the VM migrated away and back, then failed over": {
+			setup: func(r *replicaRig, changed time.Time) {
+				r.tasks.migrated("pve02", 100, changed.Add(time.Hour+time.Minute), changed.Add(time.Hour+2*time.Minute),
+					"OK")
+			},
+			warn: "after a failover, since no migration task on the old source explains the move",
+		},
+		"the old source's tasks cannot be read": {
+			setup: func(r *replicaRig, _ time.Time) { r.tasks.err["pve01"] = errors.New("needs Sys.Audit") },
+			warn:  "could not read the migration tasks that would prove a planned migration",
+		},
+		"the new source's tasks cannot be read": {
+			setup: func(r *replicaRig, _ time.Time) { r.tasks.err["pve02"] = errors.New("needs Sys.Audit") },
+			warn:  "could not read the migration tasks that would prove a planned migration",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, changed := movedReplicaRig(t)
+			tc.setup(r, changed)
+			warnings, sl := reconcileMoved(t, r)
+			set, err := readHARuleSet(t.Context(), r.deps.PVE.Cluster())
+			if err != nil {
+				t.Fatal(err)
+			}
+			pin := set.Find("bosh-na-100")
+			if source, partner, ok := ha.ReplicaPinShape(pin); !ok || source != "pve02" || partner != "pve01" {
+				t.Fatalf("pin shape %q %q %v; the verified sync keeps both nodes and moves the partner", source,
+					partner, ok)
+			}
+			if len(warnings) != 1 || !strings.Contains(warnings[0], tc.warn) ||
+				!strings.Contains(warnings[0], "were lost") || strings.Contains(warnings[0], "by a planned migration") {
+				t.Fatalf("warnings %q; a move no migration task proves warns of lost writes", warnings)
+			}
+			if len(sl.events) != 0 || r.repl.called("schedule") {
+				t.Fatalf("events %v calls %v; a pin that keeps both nodes needs no barrier and no sync", sl.events,
+					r.repl.calls)
+			}
+		})
+	}
+}
+
+// TestReconcileOnPartner_ReadsTheMigrationTasksOfBothNodes checks that the
+// planned migration is proved from the old source's task list and checked
+// against the new source's.
+func TestReconcileOnPartner_ReadsTheMigrationTasksOfBothNodes(t *testing.T) {
+	r, _ := movedReplicaRig(t)
+	if warnings, _ := reconcileMoved(t, r); len(warnings) != 0 {
+		t.Fatalf("warnings %q; a planned migration loses no writes", warnings)
+	}
+	if !slices.Equal(r.tasks.calls, []string{"migrations:pve01", "migrations:pve02"}) {
+		t.Fatalf("task listings %v, want the old source's and the new source's", r.tasks.calls)
 	}
 }

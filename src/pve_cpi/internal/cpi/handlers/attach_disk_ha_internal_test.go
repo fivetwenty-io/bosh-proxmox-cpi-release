@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -761,9 +762,67 @@ func derefString(s *string) string {
 type attachRunClient struct {
 	*lrClient
 	cluster cluster.Service
+	// tasks serves the task listings, and a nil tasks fails them.
+	tasks *taskListStub
 }
 
 func (c *attachRunClient) Cluster() cluster.Service { return c.cluster }
+
+func (c *attachRunClient) ActiveMoveTasks(_ context.Context, node string) ([]pve.ActiveTask, error) {
+	if c.tasks == nil {
+		return nil, errors.New("no task listing stubbed")
+	}
+	c.tasks.calls = append(c.tasks.calls, "moves:"+node)
+	if err := c.tasks.err[node]; err != nil {
+		return nil, err
+	}
+	return c.tasks.moves[node], nil
+}
+
+func (c *attachRunClient) MigrationTasks(
+	_ context.Context, node string, vmid int, since time.Time,
+) ([]pve.MigrationTask, error) {
+	if c.tasks == nil {
+		return nil, errors.New("no task listing stubbed")
+	}
+	c.tasks.calls = append(c.tasks.calls, "migrations:"+node)
+	if err := c.tasks.err[node]; err != nil {
+		return nil, err
+	}
+	var out []pve.MigrationTask
+	for _, task := range c.tasks.migrations[node] {
+		if task.ID == strconv.Itoa(vmid) && task.StartTime >= since.Unix() {
+			out = append(out, task)
+		}
+	}
+	return out, nil
+}
+
+// taskListStub holds the move and migration tasks of each node, and a
+// listing error per node.
+type taskListStub struct {
+	moves      map[string][]pve.ActiveTask
+	migrations map[string][]pve.MigrationTask
+	err        map[string]error
+	calls      []string
+}
+
+func newTaskListStub() *taskListStub {
+	return &taskListStub{moves: map[string][]pve.ActiveTask{}, migrations: map[string][]pve.MigrationTask{},
+		err: map[string]error{}}
+}
+
+// migrated records a qmigrate task of VM vmid on node that ran from start to
+// end and ended with status.
+func (s *taskListStub) migrated(node string, vmid int, start, end time.Time, status string) {
+	task := pve.MigrationTask{UPID: "UPID:" + node + ":00000001:00000001:00000001:qmigrate:" + strconv.Itoa(vmid) +
+		":root@pam:", Node: node, Type: "qmigrate", ID: strconv.Itoa(vmid), Status: status,
+		StartTime: start.Unix()}
+	if !end.IsZero() {
+		task.EndTime = end.Unix()
+	}
+	s.migrations[node] = append(s.migrations[node], task)
+}
 
 func TestAttachUnchangedReadsTheNewDisksStorage(t *testing.T) {
 	cases := map[string]struct {

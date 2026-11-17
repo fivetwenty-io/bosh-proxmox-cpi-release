@@ -133,6 +133,7 @@ type replicaRig struct {
 	profile *ha.Profile
 	tags    string
 	cfg     map[string]any
+	tasks   *taskListStub
 }
 
 const replicaRootVolume = "local-zfs:vm-100-disk-0"
@@ -144,6 +145,7 @@ func newReplicaRig(mode string) *replicaRig {
 		comment: haIdentity{Owner: aaDirector}.marker()}
 	r.stub.members = []string{"pve01", "pve02", "pve03"}
 	r.nodes = &lrNodesStub{}
+	r.tasks = newTaskListStub()
 	r.nodes.onUpdate = func() {
 		if r.nodes.updatedTags != nil {
 			r.tags = *r.nodes.updatedTags
@@ -165,7 +167,7 @@ func newReplicaRig(mode string) *replicaRig {
 		pve.StorageInfo{Name: "local-zfs", Type: pve.StorageTypeZFSPool, Content: "images"})
 	r.deps = Deps{
 		Config: cfg, RequestDirectorUUID: aaDirector, Logger: log.NewNopLogger(), Replication: r.repl,
-		PVE:       &attachRunClient{lrClient: &lrClient{nodes: r.nodes, qemu: q}, cluster: r.stub},
+		PVE:       &attachRunClient{lrClient: &lrClient{nodes: r.nodes, qemu: q}, cluster: r.stub, tasks: r.tasks},
 		HAProfile: func(context.Context) (*ha.Profile, error) { return r.profile, nil },
 	}
 	return r
@@ -238,7 +240,7 @@ func TestReplicaPinShape(t *testing.T) {
 			source: "pve01", partner: "pve02", ok: true},
 	}
 	for name, tc := range cases {
-		source, partner, ok := replicaPinShape(tc.pin)
+		source, partner, ok := ha.ReplicaPinShape(tc.pin)
 		if source != tc.source || partner != tc.partner || ok != tc.ok {
 			t.Errorf("%s: got %q %q %v, want %q %q %v", name, source, partner, ok, tc.source, tc.partner, tc.ok)
 		}

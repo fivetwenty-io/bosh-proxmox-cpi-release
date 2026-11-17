@@ -496,20 +496,8 @@ func CheckReplicaSync(ctx context.Context, api ReplicationAPI, c ReplicaSyncChec
 			c.Source, err)
 	}
 	v := ReplicaSyncVerdict{Status: st}
-	earliest := ReplicaSyncEarliest(c.ChangedAt)
-	switch {
-	case st.Error != "":
-		v.Reason = "the job reports an error: " + st.Error
-		return v, nil
-	case st.FailCount != 0:
-		v.Reason = fmt.Sprintf("the job has failed %d time(s) since its last successful sync", st.FailCount)
-		return v, nil
-	case st.LastSync.IsZero():
-		v.Reason = "the job has not synced yet"
-		return v, nil
-	case !st.LastSync.After(earliest):
-		v.Reason = fmt.Sprintf("the last sync started at %s, which is not clearly after the volume set changed "+
-			"at %s", st.LastSync.Format(time.RFC3339), c.ChangedAt.UTC().Format(time.RFC3339))
+	if ok, reason := SyncAfterChange(st, c.ChangedAt); !ok {
+		v.Reason = reason
 		return v, nil
 	}
 	byStorage := map[string][]string{}
@@ -848,4 +836,9 @@ func replicaGap(guest int, v VMVolume, byName map[string]pve.StorageInfo) string
 			"owns", v.Volume, guest)
 	}
 	return ""
+}
+
+// failedSince names a job's failures since its last successful sync.
+func failedSince(count int64) string {
+	return fmt.Sprintf("the job has failed %d time(s) since its last successful sync", count)
 }

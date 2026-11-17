@@ -97,29 +97,6 @@ func replicaOtherNode(job ha.ReplicaJobState, live string) string {
 	return ""
 }
 
-// replicaPinShape reads the pin of a replicate VM. A pin that names one node
-// is the source-only pin, and a pin that names two nodes and carries the
-// partner token is the widened pin. Any other pin is not one the replicate
-// policy wrote, and ok is false.
-func replicaPinShape(pin *ha.Rule) (source, partner string, ok bool) {
-	if pin == nil || !pin.Strict || pin.Disabled {
-		return "", "", false
-	}
-	nodes := pin.NodeNames()
-	partner, widened := ha.ReplicaPartner(pin.Comment)
-	switch {
-	case !widened && len(nodes) == 1:
-		return nodes[0], "", true
-	case widened && len(nodes) == 2 && slices.Contains(nodes, partner):
-		for _, n := range nodes {
-			if n != partner {
-				return n, partner, true
-			}
-		}
-	}
-	return "", "", false
-}
-
 // narrowedReplicaPin is pin narrowed to node alone, with the partner token
 // removed and the time of the change recorded, so the next sync must start
 // after it before the pin may name a partner again.
@@ -203,7 +180,7 @@ func readOwnedReplicaPin(ctx context.Context, deps Deps, vmid int) (pin *ha.Rule
 	if pin == nil || haOwnershipOf(pin.Comment, deps.RequestDirectorUUID) != haOwnedByUs {
 		return nil, "", "", nil
 	}
-	source, partner, ok := replicaPinShape(pin)
+	source, partner, ok := ha.ReplicaPinShape(pin)
 	if !ok {
 		return nil, "", "", nil
 	}
@@ -1126,11 +1103,12 @@ func reconcileTouchedVMHA(ctx context.Context, deps Deps, op, vmCID string, vmid
 // reconcileVMReplica is the replicate policy's step of a call that touches a
 // VM. It runs only for a VM with the replicate tag, in mode auto or managed,
 // outside the managed lifecycle guard. A VM that runs on the partner its pin
-// names moved there by a planned migration or a failover. After a planned
-// migration, proved by the job running back to the old source and a verified
-// sync, the pin keeps both nodes and names the old source as the partner.
-// After a failover, or a move the CPI cannot prove a planned migration, the
-// pin is narrowed to the node the VM runs on now through the narrowing
+// names moved there by a planned migration or a failover. When the job runs
+// back to the old source and a sync from the VM's node is verified, the pin
+// keeps both nodes and names the old source as the partner, and the VM's
+// migration tasks decide whether the CPI warns of lost writes. After a
+// failover the job has not reversed for, or before that sync, the pin is
+// narrowed to the node the VM runs on now through the narrowing
 // barrier, because the old source's copy may be behind and the next sync
 // rolls it back (see reconcileOnPartner). The barrier's change asks the job
 // for a sync from the new source. A VM on its source with the
@@ -1210,8 +1188,11 @@ func reconcileVMReplica(ctx context.Context, deps Deps, op, vmCID string, vmid i
 // migration runs a last sync, hands the job's state to the node the VM moves
 // to, and swaps the job's direction, so both nodes hold the same data. The
 // pin then keeps both nodes, and its partner token moves to the old source
-// (see swapAfterMigration). Anything else is read as a failover and the pin
-// narrows to this node (see narrowAfterFailover). A job that runs from this
+// (see swapAfterMigration). A failover whose first reversed sync has run
+// looks the same, so a verified sync keeps both nodes either way, and only a
+// qmigrate task on the old source spares the warning that writes were lost.
+// Anything else is read as a failover and the pin narrows to this node (see
+// narrowAfterFailover). A job that runs from this
 // node to the old source with no sync from this node verified yet could be
 // either, and is read as a failover, because a pin that names the old source
 // while its copy is behind lets HA start the VM on stale data. The next
@@ -1264,14 +1245,22 @@ func swappedReplicaPin(pin *ha.Rule, node, oldSource string) *ha.Rule {
 }
 
 // swapAfterMigration checks whether a VM that runs on w.node, the partner its
-// widened pin names, got there by a planned migration from oldSource, and if
-// so writes the swapped pin (see swappedReplicaPin). A planned migration
-// leaves this Director's job enabled and running from w.node to oldSource,
-// oldSource online, and a sync from w.node verified to cover the VM's volumes
-// on oldSource after the pin's last change. swapped is false when any of that
-// does not hold, and undecided then names why when the job does run from
-// w.node to an online oldSource, the case the CPI cannot tell from a failover.
-// A failed read is undecided too, and only a failed pin write is an error.
+// widened pin names, may keep both nodes in its pin, and if so writes the
+// swapped pin (see swappedReplicaPin). It applies ha.JudgePartnerMove, the
+// rule the doctor applies too. Both nodes stay only when this Director's job
+// is enabled and runs from w.node to an online oldSource, and a sync from
+// w.node is verified to cover the VM's volumes on oldSource after the pin's
+// last change, because only then does the old source hold the VM's data. A
+// qmigrate task on oldSource that ended after that change makes the move a
+// planned migration. With no such task, the move was a failover whose first
+// reversed sync has run, and with a task list the CPI cannot read, the move
+// may have been one. Either keeps both nodes, because the old source's copy
+// is current again, and the CPI warns that writes made on the old source
+// after its last sync before the failover were lost. swapped is false when
+// the pin narrows instead, and undecided then names why when the job does run
+// from w.node to an online oldSource, the case the CPI cannot tell from a
+// failover yet. A failed read is undecided too, and only a failed pin write is
+// an error.
 func (w *replicaWiden) swapAfterMigration(
 	ctx context.Context, pin *ha.Rule, oldSource string,
 ) (swapped bool, undecided string, err error) {
@@ -1285,27 +1274,21 @@ func (w *replicaWiden) swapAfterMigration(
 		return false, "the replication jobs could not be listed: " + err.Error(), nil
 	}
 	job, _, err := guestReplicaJobs(jobs, w.vmid, w.deps.RequestDirectorUUID)
-	switch {
-	case err != nil:
+	if err != nil {
 		return false, err.Error(), nil
-	case job == nil, job.Disabled, job.RemoveJob != "":
-		// No job of this Director copies the VM now, so nothing kept the old
-		// source's copy current.
-		return false, "", nil
-	case job.Source != w.node || job.Target != oldSource:
-		// A planned migration swaps the job's direction as it ends. A job
-		// that PVE has not swapped is a failover that PVE's runner has not
-		// caught up with yet.
-		return false, "", nil
 	}
-	if online, err := replicaNodeOnline(w.profile, nil)(ctx, oldSource); err != nil || !online {
+	online, err := replicaNodeOnline(w.profile, nil)(ctx, oldSource)
+	move := ha.PartnerMove{Node: w.node, OldSource: oldSource, Job: job, OldSourceOnline: err == nil && online}
+	move.ChangedAt, _ = ha.ReplicaChanged(pin.Comment)
+	switch ha.JudgePartnerMove(move) {
+	case ha.PartnerMoveFailover:
 		return false, "", nil
+	case ha.PartnerMoveUndecided:
+		if move.ChangedAt.IsZero() {
+			return false, "the pin records no time of its last change", nil
+		}
 	}
-	changedAt, ok := ha.ReplicaChanged(pin.Comment)
-	if !ok {
-		return false, "the pin records no time of its last change", nil
-	}
-	synced, held, err := w.verifySync(ctx, *job, oldSource, changedAt, logger)
+	synced, held, err := w.verifySync(ctx, *job, oldSource, move.ChangedAt, logger)
 	switch {
 	case err != nil:
 		return false, err.Error(), nil
@@ -1314,15 +1297,63 @@ func (w *replicaWiden) swapAfterMigration(
 	case synced == nil:
 		return false, held.reason, nil
 	}
+	move.Synced = true
+	var unread error
+	move.Migration, unread = w.migrationEvidence(ctx, oldSource, move.ChangedAt)
+	verdict := ha.JudgePartnerMove(move)
+	if !verdict.KeepsBothNodes() {
+		return false, "the move could not be judged", nil
+	}
 	if err := writeReplicaPin(ctx, w.deps, w.profile, logger, w.vmid, pin,
 		swappedReplicaPin(pin, w.node, oldSource)); err != nil {
 		return false, "", err
 	}
-	logger.Info(replicaOp+": the VM moved to its replication partner by a planned migration, and a verified sync "+
-		"from this node covers its volumes on the old source; the pin keeps both nodes and names the old source "+
-		"as the partner now", log.String("job", job.ID),
-		log.String("last_sync", synced.lastSync.Format(time.RFC3339)))
+	fields := []log.Field{log.String("job", job.ID), log.String("last_sync", synced.lastSync.Format(time.RFC3339))}
+	switch verdict {
+	case ha.PartnerMovePlanned:
+		logger.Info(replicaOp+": the VM moved to its replication partner by a planned migration, and a verified "+
+			"sync from this node covers its volumes on the old source; the pin keeps both nodes and names the "+
+			"old source as the partner now", fields...)
+	case ha.PartnerMoveRecovered:
+		logger.Warn(replicaOp+": the VM runs on its replication partner after a failover, since no migration "+
+			"task on the old source explains the move; a verified sync from this node covers its volumes on the "+
+			"old source again, so the pin keeps both nodes and names the old source as the partner now, but "+
+			"writes made on the old source after its last sync before the failover were lost", fields...)
+	default:
+		logger.Warn(replicaOp+": the VM runs on its replication partner, and a verified sync from this node "+
+			"covers its volumes on the old source, so the pin keeps both nodes and names the old source as the "+
+			"partner now; the CPI could not read the migration tasks that would prove a planned migration, so if "+
+			"this was a failover, writes made on the old source after its last sync before it were lost",
+			append(fields, log.Err(unread))...)
+	}
 	return true, "", nil
+}
+
+// migrationLookback is how far before the pin's last change the migration
+// task listings reach, so that a migration that started before the change
+// and ended after it is listed.
+const migrationLookback = 24 * time.Hour
+
+// migrationEvidence reads the qmigrate tasks of the VM on oldSource and on
+// w.node and judges them (see ha.MigrationEvidenceOf). A client that cannot
+// list them, or a listing that fails, is MigrationUnread with the cause.
+func (w *replicaWiden) migrationEvidence(
+	ctx context.Context, oldSource string, changedAt time.Time,
+) (ha.MigrationEvidence, error) {
+	reader, ok := unguardedPVE(w.deps.PVE).(pve.MigrationTaskReader)
+	if !ok {
+		return ha.MigrationUnread, errors.New("the PVE client cannot list migration tasks")
+	}
+	since := changedAt.Add(-migrationLookback)
+	fromOld, err := reader.MigrationTasks(ctx, oldSource, w.vmid, since)
+	if err != nil {
+		return ha.MigrationUnread, fmt.Errorf("list the migration tasks on node %s: %w", oldSource, err)
+	}
+	onNode, err := reader.MigrationTasks(ctx, w.node, w.vmid, since)
+	if err != nil {
+		return ha.MigrationUnread, fmt.Errorf("list the migration tasks on node %s: %w", w.node, err)
+	}
+	return ha.MigrationEvidenceOf(fromOld, onNode, changedAt), nil
 }
 
 // narrowAfterFailover narrows the pin of a VM that runs on its partner to

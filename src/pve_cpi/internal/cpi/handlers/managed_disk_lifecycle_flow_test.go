@@ -190,6 +190,8 @@ type lifecycleFlowPVE struct {
 	// listed, in order.
 	activeMoveTasks   map[string][]pve.ActiveTask
 	activeMoveTaskErr error
+	// migrationTasks serves the qmigrate listing of each node.
+	migrationTasks    map[string][]pve.MigrationTask
 	onActiveMoveTasks func(node string)
 	moveTaskListings  []string
 	// destroyed records every volume PVE destroyed, in order, whether a
@@ -393,6 +395,12 @@ func (lifecycleFlowNodes) ListStorageStatus(context.Context, string, string) (*n
 		return nil, err
 	}
 	return out, nil
+}
+
+// ListTime serves the current time as every node's clock, which the HA state
+// read compares the CRM's timestamps with.
+func (n lifecycleFlowNodes) ListTime(ctx context.Context, node string) (*nodes.ListTimeResponse, error) {
+	return HAClockNodes{}.ListTime(ctx, node)
 }
 
 func (n lifecycleFlowNodes) ListStorageContent(ctx context.Context, node, pool string, params *nodes.ListStorageContentParams) (*nodes.ListStorageContentResponse, error) {
@@ -1034,6 +1042,14 @@ func (c *lifecycleFlowPVE) ActiveMoveTasks(_ context.Context, node string) ([]pv
 	return append([]pve.ActiveTask{}, c.activeMoveTasks[node]...), nil
 }
 
+// MigrationTasks serves the qmigrate listing of node, which is empty unless a
+// test stores tasks for it.
+func (c *lifecycleFlowPVE) MigrationTasks(
+	_ context.Context, node string, _ int, _ time.Time,
+) ([]pve.MigrationTask, error) {
+	return append([]pve.MigrationTask{}, c.migrationTasks[node]...), nil
+}
+
 // volumeDeleted applies visibilityErrAfterDelete and runs onVolumeDeleted
 // once any volume is deleted.
 func (c *lifecycleFlowPVE) volumeDeleted() {
@@ -1461,6 +1477,18 @@ type lifecycleFlowHA struct {
 	states map[string]string
 	// writes names every HA write the store received, in order.
 	writes []string
+	// manager serves the CRM's manager status when it is set, and the idle
+	// CRM of the rule store serves it otherwise.
+	manager func() *cluster.ListHaStatusManagerStatusResponse
+}
+
+func (c lifecycleFlowCluster) ListHaStatusManagerStatus(
+	ctx context.Context,
+) (*cluster.ListHaStatusManagerStatusResponse, error) {
+	if store := c.c.haStore; store != nil && store.manager != nil {
+		return store.manager(), nil
+	}
+	return c.managedDiskTestCluster.ListHaStatusManagerStatus(ctx)
 }
 
 func newLifecycleFlowHA() *lifecycleFlowHA {
