@@ -97,7 +97,8 @@ func ObserveStoragePlanCompute(ctx context.Context, deps Deps, parsed *createVMP
 	}
 	bridges := distinctBridges(plainBridgeRefs(ctx, deps, parsed, refs))
 	networkEligible := map[string]bool{}
-	for _, fact := range facts {
+	for i := range facts {
+		fact := &facts[i]
 		if !fact.Online {
 			continue
 		}
@@ -171,9 +172,10 @@ func rankStorageComputeGroups(ctx context.Context, deps Deps, parsed *createVMPa
 		}
 		pass, _ := placement.Filter(facts, placement.Request{CandidateNodes: candidates, RequiredCPU: int64(cores) * int64(sockets), RequiredMemBytes: int64(mem) * (1 << 20), RequiredPCIAddresses: addresses, PCIChecker: checker})
 		eligible := pass[:0]
-		for _, fact := range pass {
+		for i := range pass {
+			fact := &pass[i]
 			if networkEligible[fact.Node] {
-				eligible = append(eligible, fact)
+				eligible = append(eligible, *fact)
 			}
 		}
 		passes = append(passes, azPass{az: az, eligible: eligible})
@@ -216,7 +218,8 @@ func storageComputeHANodes(deps Deps, parsed *createVMParsedArgs, az string, nod
 	haCloudProps.AvailabilityZone = az
 	for _, node := range nodes {
 		if len(haRegistrationFeatures(deps, haCloudProps, node, parsed.env)) > 0 {
-			for _, fact := range facts {
+			for i := range facts {
+				fact := &facts[i]
 				haNodes = append(haNodes, fact.Node)
 			}
 			break

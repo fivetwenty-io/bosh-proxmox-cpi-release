@@ -204,7 +204,8 @@ func EstimateHeadroom(facts []NodeFacts, check HeadroomCheck, plannedNode string
 	}
 
 	failing := make([]string, 0, len(facts))
-	for _, f := range facts {
+	for i := range facts {
+		f := &facts[i]
 		if f.Online {
 			failing = append(failing, f.Node)
 		}
@@ -222,7 +223,8 @@ func EstimateHeadroom(facts []NodeFacts, check HeadroomCheck, plannedNode string
 
 // nodeOnline reports whether facts holds an online node named node.
 func nodeOnline(facts []NodeFacts, node string) bool {
-	for _, f := range facts {
+	for i := range facts {
+		f := &facts[i]
 		if f.Node == node && f.Online {
 			return true
 		}
@@ -271,7 +273,8 @@ func packFailure(facts []NodeFacts, guests []HeadroomGuest, failed string) (Head
 		used[g.Node] += g.MemBytes
 	}
 	free := make(map[string]int64, len(facts))
-	for _, f := range facts {
+	for i := range facts {
+		f := &facts[i]
 		if f.Node == failed || !f.Online || f.InMaintenance {
 			continue
 		}
@@ -465,7 +468,8 @@ func EstimateHeadroomMargin(facts []NodeFacts, guests []HeadroomGuest, guestsUnk
 		return HeadroomMargin{Unavailable: "the cluster's guests could not be read"}
 	}
 	var failing []string
-	for _, f := range facts {
+	for i := range facts {
+		f := &facts[i]
 		if !f.Online {
 			continue
 		}
@@ -493,7 +497,8 @@ func EstimateHeadroomMargin(facts []NodeFacts, guests []HeadroomGuest, guestsUnk
 			continue
 		}
 		var left, total int64
-		for _, f := range facts {
+		for i := range facts {
+			f := &facts[i]
 			if f.Node == failed || !f.Online || f.InMaintenance {
 				continue
 			}

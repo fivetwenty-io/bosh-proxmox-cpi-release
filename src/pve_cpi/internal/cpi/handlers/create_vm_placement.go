@@ -1171,7 +1171,8 @@ func utilizationGateForRequest(
 // missing or report no storage capacity (fail-open, consistent with the
 // enforce-mode Filter path's fail-open on TotalStorageBytes == 0).
 func warnIfNodeUtilizationExceeds(facts []placement.NodeFacts, node string, ceilingPct int, addBytes int64, logger *log.Logger) {
-	for _, f := range facts {
+	for i := range facts {
+		f := &facts[i]
 		if f.Node != node {
 			continue
 		}

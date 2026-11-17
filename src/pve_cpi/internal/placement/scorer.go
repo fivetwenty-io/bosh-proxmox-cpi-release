@@ -288,7 +288,8 @@ func Filter(facts []NodeFacts, req Request) (pass []NodeFacts, rejections map[st
 
 	rejections = make(map[string]string)
 
-	for _, f := range facts {
+	for i := range facts {
+		f := &facts[i]
 		if !f.Online {
 			rejections[f.Node] = "node offline"
 			continue
@@ -329,7 +330,7 @@ func Filter(facts []NodeFacts, req Request) (pass []NodeFacts, rejections map[st
 		// enforce mode only — see MaxUtilizationPct doc). Fail-open when
 		// TotalStorageBytes == 0, matching the RequiredStorageBytes fail-open
 		// semantics above.
-		if exceedsUtilizationCeiling(f, req) {
+		if exceedsUtilizationCeiling(*f, req) {
 			rejections[f.Node] = "storage utilization ceiling exceeded"
 			continue
 		}
@@ -356,7 +357,7 @@ func Filter(facts []NodeFacts, req Request) (pass []NodeFacts, rejections map[st
 			continue
 		}
 
-		pass = append(pass, f)
+		pass = append(pass, *f)
 	}
 
 	if len(rejections) == 0 {
@@ -415,8 +416,9 @@ func exceedsUtilizationCeiling(f NodeFacts, req Request) bool {
 func Score(facts []NodeFacts, w Weights, avoidNodes map[string]int) []ScoredNode {
 	scored := make([]ScoredNode, 0, len(facts))
 
-	for _, f := range facts {
-		s := computeScore(f, w, avoidNodes)
+	for i := range facts {
+		f := &facts[i]
+		s := computeScore(*f, w, avoidNodes)
 		scored = append(scored, ScoredNode{Node: f.Node, Score: s})
 	}
 

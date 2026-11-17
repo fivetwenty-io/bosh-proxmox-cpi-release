@@ -193,7 +193,8 @@ func (b bridgePlan) warnGaps(logger *log.Logger, pass []placement.NodeFacts, az 
 	if !b.warnOnly || len(b.required) == 0 {
 		return
 	}
-	for _, f := range pass {
+	for i := range pass {
+		f := &pass[i]
 		for _, bridge := range b.required {
 			present, err := b.checker(f.Node, bridge)
 			switch {

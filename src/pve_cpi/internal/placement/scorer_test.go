@@ -802,8 +802,8 @@ func TestScore_MemorySignalReserved_SequentialCreatesFanOut(t *testing.T) {
 
 func nodeNames(facts []placement.NodeFacts) []string {
 	names := make([]string, len(facts))
-	for i, f := range facts {
-		names[i] = f.Node
+	for i := range facts {
+		names[i] = facts[i].Node
 	}
 	return names
 }
