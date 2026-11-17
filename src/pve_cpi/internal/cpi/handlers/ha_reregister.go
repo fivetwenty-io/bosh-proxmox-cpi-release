@@ -533,7 +533,7 @@ func enableOwnedGroupRules(ctx context.Context, deps Deps, ident haIdentity, vmi
 		})
 		return err
 	})
-	healAfterRepair(ctx, deps, res, "", logger)
+	healAfterRepair(ctx, deps, res, logger)
 	return err
 }
 

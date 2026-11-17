@@ -160,7 +160,7 @@ func writeReplicaPin(
 		})
 		return err
 	})
-	healAfterRepair(ctx, deps, res, "", logger)
+	healAfterRepair(ctx, deps, res, logger)
 	if err != nil {
 		return err
 	}

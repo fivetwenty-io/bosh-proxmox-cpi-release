@@ -1101,12 +1101,11 @@ func confinedBy(res *ha.ApplyResult) []string {
 
 // healAfterRepair writes the rules again of every group whose rule a pin
 // repair in res deleted or rewrote without the rules lock, for a writer that
-// plans no anti-affinity rule of its own, such as a pin write. removed is the
-// sid of a VM that leaves its group's rules, which the heal keeps out, or "".
-// The writer's own write is done by then, so a heal that fails is only logged.
-func healAfterRepair(ctx context.Context, deps Deps, res *ha.ApplyResult, removed string, logger *log.Logger) {
+// plans no anti-affinity rule of its own, such as a pin write. The writer's
+// own write is done by then, so a heal that fails is only logged.
+func healAfterRepair(ctx context.Context, deps Deps, res *ha.ApplyResult, logger *log.Logger) {
 	deleted := writtenRuleDeletes(res, nil)
-	err := healAfterUnlockedDeletes(ctx, deps, deleted, deps.RequestDirectorUUID, removed, confinedBy(res), logger)
+	err := healAfterUnlockedDeletes(ctx, deps, deleted, deps.RequestDirectorUUID, "", confinedBy(res), logger)
 	if err != nil {
 		logger.Warn("anti-affinity: the group's rules could not be written again after a pin repair changed one "+
 			"of them; a sibling that joined that rule meanwhile may be out of every rule until the next create "+

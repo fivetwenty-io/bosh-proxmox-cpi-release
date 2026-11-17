@@ -647,7 +647,7 @@ func TestHealAfterRepair_WritesTheGroupBackWithoutThePinnedVM(t *testing.T) {
 		Confined: []string{"vm:103"},
 	}
 	logger, observed := log.NewObservedLogger(log.LevelDebug)
-	healAfterRepair(context.Background(), deps, res, "", logger)
+	healAfterRepair(context.Background(), deps, res, logger)
 	if got := stub.rules[aaRule]; got != "vm:101,vm:102" {
 		t.Fatalf("rule = %q; want the group's other members, without the pinned VM", got)
 	}

@@ -1153,7 +1153,7 @@ func (h *attachHA) writePinFor(ctx context.Context, d *ha.VMDecision, pin *ha.Ru
 		})
 		return err
 	})
-	healAfterRepair(ctx, h.deps, res, "", h.logger)
+	healAfterRepair(ctx, h.deps, res, h.logger)
 	if err != nil {
 		return err
 	}

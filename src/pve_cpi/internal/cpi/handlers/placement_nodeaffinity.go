@@ -255,7 +255,7 @@ func writeMergedPinRule(
 		// anti-affinity when antiaffinity_verify is on.
 		return verifyAntiAffinityMember(ctx, deps, ruleName, sid, logger)
 	})
-	healAfterRepair(ctx, deps, res, "", logger)
+	healAfterRepair(ctx, deps, res, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -380,7 +380,7 @@ func deleteNodeAffinityRule(
 		}
 		return err
 	})
-	healAfterRepair(ctx, deps, res, "", logger)
+	healAfterRepair(ctx, deps, res, logger)
 	if err != nil {
 		return fmt.Errorf("node-affinity: delete rule %q: %w", ruleName, err)
 	}
