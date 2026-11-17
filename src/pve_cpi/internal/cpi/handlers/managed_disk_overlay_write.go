@@ -63,7 +63,7 @@ func lifecycleOverlayOnlyConfigWrite(before map[string]any, fields map[string]an
 		return false
 	}
 	for key := range fields {
-		if key != pveConfigKeyDescription && key != "digest" {
+		if key != pveConfigKeyDescription && key != pveConfigKeyDigest {
 			return false
 		}
 	}

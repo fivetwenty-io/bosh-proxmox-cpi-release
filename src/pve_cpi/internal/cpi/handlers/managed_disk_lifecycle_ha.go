@@ -133,7 +133,7 @@ var lifecycleHAStates = []string{"started", "stopped", "ignored"}
 
 // lifecycleHAResourceUpdateFields lists the fields an HA resource update
 // inside a disk lifecycle may carry.
-var lifecycleHAResourceUpdateFields = []string{"state", "comment", "digest", "delete"}
+var lifecycleHAResourceUpdateFields = []string{"state", "comment", pveConfigKeyDigest, "delete"}
 
 // lifecycleHARuleEditTargets checks that an HA rule update or delete inside a
 // disk lifecycle names the pin of the lifecycle's VM, and that an update that

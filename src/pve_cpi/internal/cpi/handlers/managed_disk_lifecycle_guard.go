@@ -409,7 +409,7 @@ func lifecycleConfigHasAnyVolume(config map[string]any) bool {
 }
 func lifecycleValidateConfigMutation(before map[string]any, fields map[string]any, volume string) error {
 	for key, value := range fields {
-		if key == pveConfigKeyDescription || key == "protection" || key == "digest" {
+		if key == pveConfigKeyDescription || key == "protection" || key == pveConfigKeyDigest {
 			continue
 		}
 		if key == "delete" {

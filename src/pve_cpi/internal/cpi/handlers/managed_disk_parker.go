@@ -175,7 +175,7 @@ func managedDiskParkUpdateFields(params any) (map[string]any, error) {
 		return nil, fmt.Errorf("empty parker update")
 	}
 	for key := range fields {
-		if key != pveConfigKeyDescription && key != "protection" && key != "digest" {
+		if key != pveConfigKeyDescription && key != "protection" && key != pveConfigKeyDigest {
 			return nil, fmt.Errorf("unplanned parker configuration field %q", key)
 		}
 	}

@@ -72,7 +72,7 @@ func managedConfigFieldsMatchPending(config map[string]any, pendingDelete func(s
 	}
 	var pendingErr error
 	for key, want := range fields {
-		if key == "digest" {
+		if key == pveConfigKeyDigest {
 			continue
 		}
 		if key == "delete" {

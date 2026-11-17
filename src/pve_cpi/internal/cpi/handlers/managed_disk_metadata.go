@@ -57,7 +57,7 @@ func (m *managedDiskRequest) applyTags(ctx context.Context, handle *aj.Handle, c
 				return err
 			}
 			for key, want := range fields {
-				if key == "digest" {
+				if key == pveConfigKeyDigest {
 					continue
 				}
 				if got, ok := config[key]; !ok || managedDiskScalar(got) != managedDiskScalar(want) {
