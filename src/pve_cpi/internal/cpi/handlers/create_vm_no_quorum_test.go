@@ -89,3 +89,36 @@ func TestCreateVM_FailsFastWithoutQuorum(t *testing.T) {
 		})
 	}
 }
+
+// TestCreateVM_SkipsTheTeardownSweepWithoutQuorum creates a VM on a cluster
+// that has lost quorum. The deferred-teardown sweep lists the cluster's VMs
+// and takes a cluster lock for each VM it disposes of, and no lock can be
+// taken without quorum, so the call must skip the sweep and list nothing for it.
+func TestCreateVM_SkipsTheTeardownSweepWithoutQuorum(t *testing.T) {
+	t.Parallel()
+	var vmListings atomic.Int32
+	listResources := func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		if params != nil && params.Type != nil && *params.Type == "vm" {
+			vmListings.Add(1)
+		}
+		return emptyListResources(ctx, params)
+	}
+	var reads atomic.Int32
+	deps := buildVMDepsPlacement(&vmMockQEMU{}, &vmMockNodes{}, listStatusWithoutQuorum(&reads), listResources,
+		&vmMockAgent{}, nil)
+	deps.Config.EnsureNoIPConflicts = placementDisabled
+	args := mkArgs("agent-no-quorum", testStemcellCID, map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	_, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx("no-quorum"))
+	if err == nil || !strings.Contains(err.Error(), "the cluster has lost quorum") {
+		t.Fatalf("want the quorum error, got %v", err)
+	}
+	if n := vmListings.Load(); n != 0 {
+		t.Fatalf("create_vm listed the cluster's VMs %d times for the teardown sweep without quorum, want 0", n)
+	}
+	if n := reads.Load(); n != 1 {
+		t.Fatalf("create_vm read the cluster status %d times, want 1", n)
+	}
+}

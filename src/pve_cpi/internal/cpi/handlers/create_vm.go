@@ -638,10 +638,22 @@ func createVM(
 		return nil, poolErr
 	}
 
+	// A cluster without quorum refuses every write, so no node can receive a
+	// VM. The status is read once, here, before the first write. A status
+	// read that fails, or a standalone host, carries on.
+	lostQuorum := clusterLostQuorum(ctx, deps, logger, "create_vm")
+
 	// Drain the queue of disposals an earlier request could not finish: VMs
 	// tagged bosh-deleting, and failed or abandoned creates whose birth tag
-	// has aged past any create still running. Best-effort and bounded.
-	sweepDeferredTeardowns(ctx, deps, logger)
+	// has aged past any create still running. Best-effort and bounded. A
+	// cluster without quorum skips it, because each claim it takes would
+	// wait on a cluster lock that PVE cannot grant.
+	if lostQuorum {
+		logger.Warn("create_vm: skipped the deferred teardown sweep, because the entry node does not report " +
+			"the cluster quorate")
+	} else {
+		sweepDeferredTeardowns(ctx, deps, logger)
+	}
 
 	// The cluster stamp and token are settled once, ahead of placement and of
 	// the journal resume, because every candidate shape carries the same
@@ -664,12 +676,11 @@ func createVM(
 		return existing, resumeErr
 	}
 
-	// A cluster without quorum refuses every write, so no node can receive a
-	// VM. The call fails here, before the cluster stamp, placement, and the
+	// Without quorum the call fails here, after the resume, so a retry still
+	// gets the VM an earlier attempt finished, and before placement and the
 	// guest enumeration, which can take minutes against members that no
 	// longer answer. A pinned target_node gets the same answer as placement.
-	// A status read that fails, or a standalone host, carries on.
-	if clusterLostQuorum(ctx, deps, logger, "create_vm") {
+	if lostQuorum {
 		logger.Warn("create_vm: the entry node does not report the cluster quorate, so no node can receive a VM")
 		return nil, createQuorumError()
 	}
