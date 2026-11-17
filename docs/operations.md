@@ -853,6 +853,42 @@ ha-manager set vm:<vmid> --state started
 
 The doctor lists a `hold` VM as `hold_blocks_maintenance` only while its HA state is `started` and its node is in maintenance with the drain still running. A `hold` VM whose HA service we have stopped does not block the drain, so the finding goes away as soon as we stop it, and it stays away once the node's HA agent has finished draining. A VM under `local_policy: none` is not HA-managed, so maintenance mode does not touch it. It keeps running until the node reboots, and then it goes down with the node.
 
+### Node maintenance when a VM cannot leave the node
+
+The `hold` procedure above is one case of a wider rule. PVE waits forever on a node in maintenance for any HA service that cannot leave it. That wait blocks the maintenance request itself, a reboot while the node is in maintenance, and the restart of the local resource manager that the `pve-ha-manager` package upgrade runs. The resource manager logs that it ignores the shutdown policy while maintenance is on, and it never stops or fences the VM, so the node sits there until we release the service by hand. Two kinds of VM do this.
+
+- **A member of a full anti-affinity group**
+
+  Every other node that could take the VM already holds another member of its group, so the negative rule leaves the VM nowhere to go.
+
+- **A VM with a strict single-node pin**
+
+  That means a `hold` VM, or a `replicate` VM whose pin has not widened to its partner yet. The pin forbids every other node, so HA cannot migrate it.
+
+Before we enable maintenance, we run `pve-cid ha` and read its findings. A `hold` VM shows up as `hold_blocks_maintenance`. Any other started VM that cannot leave shows up as `maintenance_stranded`, with a reason that says either that its pin names no other usable node or that every other node that could take it holds a member of its group. The doctor names each VM once. Both findings only fire once the node is in maintenance, so we read them again right after we enable it, and we use the VM list from the group and pin findings to plan ahead. We then clear every blocker before we start the upgrade or the reboot.
+
+For a member of a full anti-affinity group, we pick one of these.
+
+- Run `bosh recreate` on the member so that it lands on another node, or scale the group below the node count.
+
+- Stop the member through HA with the command below, and start it again once the node is back.
+
+For a `hold` VM or a `replicate` VM that has not widened, we stop it through HA and accept the downtime. For a `replicate` VM, we can instead wait until the pin widens after a verified sync, and then HA migrates it like any other VM.
+
+```bash
+ha-manager set vm:<vmid> --state stopped
+```
+
+After the node is back and out of maintenance, we start the VM again.
+
+```bash
+ha-manager set vm:<vmid> --state started
+```
+
+Stopping a resource through HA changes nothing in the CPI's metadata, so the VM keeps its pin, its rules, and its place in the BOSH inventory. The Director still sees an instance whose agent has gone quiet, though, and the resurrector may act on it. We turn resurrection off for the deployment before we stop VMs this way, or we expect a recreate, and we turn it back on after the VMs run again.
+
+If a wedge has already started, for example a `pve-ha-manager` upgrade that is stuck in its restart of the resource manager, we do not kill anything on the node. We stop each blocking resource through HA with the first command above. The drain then finishes within seconds, the stuck restart or reboot goes on by itself, and `pve-cid ha` stops reporting the node. We start the VMs again with the second command once the node has left maintenance.
+
 ### Replicate failover and the old node's writes
 
 After a `replicate` VM fails over, PVE reverses its replication job, so that the job runs from the partner back to the old node. The job's next run receives with `zfs recv -F`, which rolls the old node's dataset back to the last common snapshot. Any write that existed only on the old node, which means every write since the last successful sync, is destroyed by that first run. Every resource the CPI registers has `failback` set to 0, so the VM stays on the partner when the old node returns. The next `reboot_vm` or `set_vm_metadata` call that touches the VM narrows its pin to the partner alone, and in the same step the CPI asks the job to sync from the partner. From then on the VM behaves like a `hold` VM on the partner, and the destructive first sync can start at the CPI's next touch of the VM, and not only on the job's own schedule.
