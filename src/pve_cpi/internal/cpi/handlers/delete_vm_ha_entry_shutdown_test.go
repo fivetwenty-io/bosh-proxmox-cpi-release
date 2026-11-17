@@ -23,7 +23,8 @@ func TestHandleDeleteVM_EntryNodeShuttingDownStillDeletes(t *testing.T) {
 			scene.BrokenClocks[node] = true
 		}
 		d := newLegacyHADelete(t, scene, "pve-node2", dlbEnabledConfig())
-		return d, d.run()
+		err := d.run()
+		return d, err
 	}
 	healthy, err := run(t)
 	if err != nil {
