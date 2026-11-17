@@ -79,6 +79,10 @@ type PartnerTasks struct {
 // changedAt, by more than the clock-skew tolerance. ok is false when there is
 // no such task, or when a task on the node the VM runs on succeeded after it,
 // which would mean the VM left that node again and came back some other way.
+// The two tasks' end times come from two node clocks, so a migration away
+// counts when it ended later than the arrival less the clock-skew tolerance.
+// That errs toward no proof, so two migrations closer together than the
+// tolerance read as a move that no migration explains.
 func ProvingMigration(fromOld, onNode []pve.VMTask, changedAt time.Time) (pve.VMTask, bool) {
 	if changedAt.IsZero() {
 		return pve.VMTask{}, false
@@ -93,8 +97,9 @@ func ProvingMigration(fromOld, onNode []pve.VMTask, changedAt time.Time) (pve.VM
 	if arrived.End().IsZero() {
 		return pve.VMTask{}, false
 	}
+	departed := arrived.End().Add(-aj.ReplicaClockSkewTolerance)
 	for _, task := range onNode {
-		if task.Succeeded() && task.End().After(arrived.End()) {
+		if task.Succeeded() && task.End().After(departed) {
 			return pve.VMTask{}, false
 		}
 	}
