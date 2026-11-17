@@ -157,7 +157,7 @@ func testBuildPlan(
 	if resolver == nil {
 		resolver = mustResolver(t, deps)
 	}
-	return buildHeadroomPlan(context.Background(), deps, cp, nil, resolver, nil, nil, bridges, facts, logger)
+	return buildHeadroomPlan(context.Background(), deps, cp, nil, resolver, nil, bridges, facts, logger)
 }
 
 func (r *headroomRig) place(t *testing.T, cp createVMCloudProps) (string, []string, error) {

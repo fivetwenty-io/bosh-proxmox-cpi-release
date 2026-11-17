@@ -344,9 +344,7 @@ func resolveTargetNodeWithBridges(
 		// and then no read is made and Request.Headroom stays nil. It belongs to
 		// this scoring branch alone, so target_node, a local-disk pin, placement
 		// disabled, and a storage plan skip it, as the spec and changelog say.
-		headroom := buildHeadroomPlan(
-			ctx, deps, cp, cloudPropsMap, cpResolver, diskCIDs, diskConstraints.diskNodes, bridges, facts, logger,
-		)
+		headroom := buildHeadroomPlan(ctx, deps, cp, cloudPropsMap, cpResolver, diskCIDs, bridges, facts, logger)
 
 		// One record per AZ attempt, so a reason recorded while filtering one AZ
 		// never masks another AZ's own reason.
@@ -652,10 +650,6 @@ type diskFaultConstraints struct {
 	// and the node recorded in the CID metadata otherwise (see
 	// placementLocalDiskNode). Empty means no local-node pin.
 	requiredLocalNode string
-	// diskNodes maps the CID of each node-local persistent disk to the node
-	// placementLocalDiskNode resolved for it, so the headroom estimate judges
-	// the disk against the same node placement does and runs no second search.
-	diskNodes map[string]string
 	// requiredAZs collects AZ labels from shared-storage disks. Empty means
 	// no AZ constraint from persistent disks.
 	requiredAZs map[string]struct{}
@@ -732,10 +726,6 @@ func deriveDiskFaultConstraints(ctx context.Context, deps Deps, diskCIDs []strin
 			}
 			if node != "" {
 				localNodes[node] = struct{}{}
-				if c.diskNodes == nil {
-					c.diskNodes = make(map[string]string)
-				}
-				c.diskNodes[cid] = node
 			}
 		} else if meta.AZ != "" {
 			// Shared backend: AZ constraint only.

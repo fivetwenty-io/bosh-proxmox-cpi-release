@@ -10,6 +10,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
@@ -205,47 +206,40 @@ func TestDeriveDiskFaultConstraints_KeepsTheCIDNodeForADiskTheSweepFindsNowhere(
 	}
 }
 
-// TestHeadroomVolumes_JudgeAReplicatedDiskOnItsLiveNodeAfterAFailover is the
-// failover from the first test, seen by the N+1 headroom estimate. The CID
-// names pve0, which holds the stale replica, and a parker on pve1 holds the
-// live copy. The estimate must take pve1 from the node placement resolved, and
-// it must not sweep a second time. A disk placement did not resolve keeps the
-// node in its CID.
-func TestHeadroomVolumes_JudgeAReplicatedDiskOnItsLiveNodeAfterAFailover(t *testing.T) {
+// TestResolveTargetNode_PinnedReplicatedDiskSkipsTheHeadroomCheck places
+// the VM of a replicated disk whose live copy is on pve02 while its CID names
+// pve01, with headroom enforce and the other two nodes full. The live copy
+// pins the VM to pve02, and a pin leaves no node to choose, so placement makes
+// no headroom read and gives no estimate. A replicate VM never reaches the
+// estimate in any case, because the estimate also decides the linked-clone
+// reading, and replicate refuses a linked clone.
+func TestResolveTargetNode_PinnedReplicatedDiskSkipsTheHeadroomCheck(t *testing.T) {
 	t.Parallel()
-	const birth = "local-zfs:vm-9001-disk-0"
-	const live = "local-zfs:vm-90000-disk-0"
-	rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce, nil, nil)
-	deps := rig.deps
-	deps.Logger = log.NewNopLogger()
-	fake := idTestDeps(newIDFakeClient(map[int]map[string]any{
-		90000: {"tags": "bosh-cpi;bosh-parker", diskKeyScsi0: live + ",serial=" + idTestToken},
-	}))
-	deps.PVE = fake.PVE
-	backend := &liveDiskBackend{storageType: pve.StorageTypeZFSPool, nodes: map[string]string{live: "pve1", birth: "pve0"}}
-	deps.Resolver = liveDiskResolver{b: backend}
-	cid := encodeZFSDiskCID(t, birth, idTestToken, "pve0")
+	const bare = "local-zfs:vm-9001-disk-0"
+	rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce, fullNonHAGuests("pve01", "pve03"),
+		func(c *config.CPIConfig) {
+			c.HA.LocalPolicy = haChoiceOf(config.HALocalPolicyReplicate)
+		})
+	profile := stagingProfile(config.HAModeAuto)
+	profile.Storages = append(profile.Storages, pve.StorageInfo{
+		Name: "local-zfs", Type: pve.StorageTypeZFSPool, Content: "images", Nodes: []string{"pve02", "pve03"},
+	})
+	rig.deps.HAProfile = func(context.Context) (*ha.Profile, error) { return profile, nil }
+	backend := &liveDiskBackend{storageType: pve.StorageTypeZFSPool, nodes: map[string]string{bare: "pve02"}}
+	rig.deps.Resolver = liveDiskResolver{b: backend}
+	cids := []string{encodeZFSDiskCID(t, bare, "", "pve01")}
 
-	c, err := deriveDiskFaultConstraints(context.Background(), deps, []string{cid})
+	node, alternates, err := rig.placeWith(createVMCloudProps{}, cids, nil, bridgePlan{})
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("placement: %v", err)
 	}
-	volumes, unknown := headroomVolumes(context.Background(), deps, createVMCloudProps{}, nil,
-		mustResolver(t, deps), []string{cid}, c.diskNodes)
-	if unknown != "" {
-		t.Fatalf("headroomVolumes ran no estimate: %s", unknown)
+	if node != "pve02" || len(alternates) != 0 {
+		t.Fatalf("placement = %q %v; want pve02, the node the live copy pins, with no alternates", node, alternates)
 	}
-	last := volumes[len(volumes)-1]
-	if last.HomeNode != "pve1" {
-		t.Errorf("persistent disk home node = %q, want pve1, the node that holds the live copy", last.HomeNode)
+	if got := rig.cluster.reads(); got != 0 {
+		t.Errorf("%d headroom reads; want none for a pinned VM", got)
 	}
-	if got := backend.askedVolumes(); !slices.Equal(got, []string{live}) {
-		t.Errorf("swept volumes %v, want one sweep of %s", got, live)
-	}
-
-	volumes, _ = headroomVolumes(context.Background(), deps, createVMCloudProps{}, nil,
-		mustResolver(t, deps), []string{cid}, nil)
-	if last := volumes[len(volumes)-1]; last.HomeNode != "pve0" {
-		t.Errorf("with no resolved node the home node = %q, want the CID's pve0", last.HomeNode)
+	if _, ok := hasWarn(rig.logs, "headroom estimate"); ok {
+		t.Errorf("a pinned VM got a headroom warning; logs: %v", rig.logs.All())
 	}
 }
