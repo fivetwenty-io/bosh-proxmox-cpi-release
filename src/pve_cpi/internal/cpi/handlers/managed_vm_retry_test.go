@@ -102,21 +102,7 @@ func testManagedVMRetryMode(t *testing.T, mode string) {
 	if mode == "changed-policy" {
 		nextPlan.PolicyFingerprint = strings.Repeat("e", 64)
 	}
-	switch mode {
-	case "changed-execution":
-		req.Selection.Policy.NetworkBridge = "changed"
-	case "added-transport":
-		// API transport settings set after the record froze its execution
-		// leave the fallback admitted.
-		req.Selection.Policy.Endpoints = []string{"pve.example:8006"}
-		req.Selection.Policy.EndpointCacheDir = "/var/vcap/data/pve_cpi/endpoint-cache"
-		req.Selection.Policy.APIEndpointDiscovery = config.DiscoveryModeOff
-	case "ten-zero-full-form-changed":
-		req.Selection.Policy.APIEndpointDiscovery = config.DiscoveryModeOff
-	case "added-ha":
-		strict := true
-		req.Selection.Policy.HA = &config.HAConfig{PinAZStrict: &strict}
-	}
+	applyRetryPolicyChange(mode, req.Selection.Policy)
 	next := &managedVMPlan{selection: req.Selection, collector: collector, inventory: req.Inventory, plan: &nextPlan}
 	deps := Deps{Config: req.Selection.Policy, Logger: log.NewNopLogger()}
 	runtime, err := beginManagedVMRetry(context.Background(), deps, &createVMParsedArgs{agentID: "agent"}, req.Selection, handle, next, proof("fresh independent admission after cleanup"))
@@ -197,5 +183,25 @@ func seedTenZeroFullForm(t *testing.T, mode string, policy *config.CPIConfig, pl
 	plan.VMExecution.InputFingerprint = fp
 	if intent.Plan, err = json.Marshal(plan); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// applyRetryPolicyChange edits the live policy for the modes that change it
+// between the first attempt and the fallback.
+func applyRetryPolicyChange(mode string, policy *config.CPIConfig) {
+	switch mode {
+	case "changed-execution":
+		policy.NetworkBridge = "changed"
+	case "added-transport":
+		// API transport settings set after the record froze its execution
+		// leave the fallback admitted.
+		policy.Endpoints = []string{"pve.example:8006"}
+		policy.EndpointCacheDir = "/var/vcap/data/pve_cpi/endpoint-cache"
+		policy.APIEndpointDiscovery = config.DiscoveryModeOff
+	case "ten-zero-full-form-changed":
+		policy.APIEndpointDiscovery = config.DiscoveryModeOff
+	case "added-ha":
+		strict := true
+		policy.HA = &config.HAConfig{PinAZStrict: &strict}
 	}
 }
