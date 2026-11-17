@@ -13,6 +13,10 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
+// noQuorumPoolText is PVE's message for a pool create without quorum, as
+// text that carries no answer from PVE.
+const noQuorumPoolText = "create pool failed: cfs-lock 'file-user_cfg' error: no quorum!"
+
 // noQuorumPoolBody is the body PVE sends with the HTTP 500 for a pool create
 // whose user.cfg lock it could not take because the cluster has no quorum.
 const noQuorumPoolBody = `{"data":null,"message":"create pool failed: cfs-lock 'file-user_cfg' error: no quorum!\n"}`
@@ -51,8 +55,7 @@ func TestIsCfsLockNoQuorum(t *testing.T) {
 			`{"data":null,"message":"create pool failed: cfs-lock 'file-user_cfg' error: got lock request timeout\n"}`), false},
 		{"a write that failed after the lock", sdkPoolCreateError(500,
 			`{"data":null,"message":"error writing config, cfs-lock failed - not quorate\n"}`), false},
-		{"the text without an answer from PVE", errors.New(
-			"create pool failed: cfs-lock 'file-user_cfg' error: no quorum!"), false},
+		{"the text without an answer from PVE", errors.New(noQuorumPoolText), false},
 		{"a cancelled request", fmt.Errorf("%w: %w", context.Canceled, sdkPoolCreateError(500, noQuorumPoolBody)), false},
 		{"nil", nil, false},
 	}

@@ -20,7 +20,7 @@ func listStatusWithoutQuorum(reads *atomic.Int32) func(context.Context) (*sdkclu
 	return func(context.Context) (*sdkcluster.ListStatusResponse, error) {
 		reads.Add(1)
 		gib := int64(1024 * 1024 * 1024)
-		rows := sdkcluster.ListStatusResponse{}
+		rows := make(sdkcluster.ListStatusResponse, 0, 4)
 		for _, row := range []map[string]any{
 			{"type": "cluster", "name": "az2", "quorate": 0, "nodes": 3},
 			{"type": "node", "name": "lab-pve-cpi-az2-0", "online": 0},
