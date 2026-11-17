@@ -2920,8 +2920,16 @@ func TestCreateVM_AZSet_UnknownAZ_CloudError(t *testing.T) {
 	n := &vmMockNodes{}
 	a := &vmMockAgent{}
 
+	// The quorum check reads the cluster's status once, and it finds the
+	// cluster quorate. Placement must not read it again, because AZ validation
+	// fires before GatherNodeFacts.
+	var statusReads atomic.Int32
 	panicStatus := func(_ context.Context) (*sdkcluster.ListStatusResponse, error) {
-		panic("ListStatus must not be called before AZ validation fails")
+		if statusReads.Add(1) == 1 {
+			rows := sdkcluster.ListStatusResponse{json.RawMessage(`{"type":"cluster","name":"c","quorate":1,"nodes":1}`)}
+			return &rows, nil
+		}
+		panic("ListStatus must not be called by placement before AZ validation fails")
 	}
 	deps := buildVMDepsPlacement(&vmMockQEMU{}, n, panicStatus, emptyListResources, a, func(c *config.CPIConfig) {
 		c.Placement = &config.PlacementConfig{

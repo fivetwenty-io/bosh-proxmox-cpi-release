@@ -289,7 +289,10 @@ func TestHandleSetDiskMetadata_UnreachableNodeReportedOnlineFailsClosed(t *testi
 
 // TestHandleSetDiskMetadata_NoQuorumFailsClosed: a cluster without quorum has
 // no authority to call a member offline, so the call never leaves the
-// unreachable member out, fails, and writes nothing.
+// unreachable member out, fails, and writes nothing. It asks the member once
+// rather than waiting out the retry budget, because a member the entry node
+// lists offline without quorum cannot answer until quorum returns, and the
+// error names the lost quorum.
 func TestHandleSetDiskMetadata_NoQuorumFailsClosed(t *testing.T) {
 	t.Parallel()
 	nodesSvc, client := diskMetaNodeDownFixture(t, "")
@@ -308,14 +311,17 @@ func TestHandleSetDiskMetadata_NoQuorumFailsClosed(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), diskMetaDownNode) {
 		t.Fatalf("a cluster without quorum must fail the call, got: %v", err)
 	}
-	if strings.Contains(err.Error(), "reports") {
+	if strings.Contains(err.Error(), "the cluster reports node(s)") {
 		t.Fatalf("a cluster without quorum must not call the member offline, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "does not report the cluster quorate and lists node(s) "+diskMetaDownNode+" offline") {
+		t.Fatalf("the error must name the lost quorum, got: %v", err)
 	}
 	if nodesSvc.capturedDesc != nil || nodesSvc.capturedTags != nil {
 		t.Fatal("nothing may be written without quorum")
 	}
-	if got := nodesSvc.listCalls[diskMetaDownNode]; got != pve.DefaultTransientMaxAttempts {
-		t.Fatalf("without quorum the member must get the full retry budget, got %d listing attempts", got)
+	if got := nodesSvc.listCalls[diskMetaDownNode]; got != 1 {
+		t.Fatalf("without quorum the member must be asked once, got %d listing attempts", got)
 	}
 }
 
