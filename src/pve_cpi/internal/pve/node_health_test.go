@@ -80,18 +80,31 @@ type nhNodes struct {
 	asked []string
 	// nodeErr fails the clock read of the nodes it names, ahead of err.
 	nodeErr map[string]error
+	// nodeNow gives the named nodes a clock of their own, so members can
+	// disagree on the time. A node it does not name answers now.
+	nodeNow map[string]int64
+	// hang makes the named nodes block until the call's context ends.
+	hang map[string]bool
 }
 
-func (n *nhNodes) ListTime(_ context.Context, node string) (*sdknodes.ListTimeResponse, error) {
+func (n *nhNodes) ListTime(ctx context.Context, node string) (*sdknodes.ListTimeResponse, error) {
 	n.asked = append(n.asked, node)
+	if n.hang[node] {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if err := n.nodeErr[node]; err != nil {
 		return nil, err
 	}
 	if n.err != nil {
 		return nil, n.err
 	}
+	now := n.now
+	if v, ok := n.nodeNow[node]; ok {
+		now = v
+	}
 	var resp sdknodes.ListTimeResponse
-	raw, _ := json.Marshal(map[string]any{"time": n.now, "localtime": n.now, "timezone": "UTC"})
+	raw, _ := json.Marshal(map[string]any{"time": now, "localtime": now, "timezone": "UTC"})
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return nil, err
 	}
