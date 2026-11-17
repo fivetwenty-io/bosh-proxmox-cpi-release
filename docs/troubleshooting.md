@@ -331,7 +331,7 @@ With the default `warn`, the same detail appears in a Warn log line that reads `
 
 **Cause**
 
-Every node that `az_map` lists for the AZ was rejected. The reason after each node says why, for example `node offline`, `node in maintenance`, `insufficient free memory`, or `storage utilization ceiling exceeded`. A node reported as `node not found in the cluster` is usually a typo in `az_map`, and that error is not retriable.
+Every node that `az_map` lists for the AZ was rejected. The reason after each node says why, for example `node offline`, `node in maintenance`, `insufficient free memory`, or `storage utilization ceiling exceeded`. A node that the node health check doesn't call placeable for a reason other than maintenance reads `node not placeable (<reason>)`, and while the cluster has lost quorum every node reads `node not placeable (entry node does not report the cluster quorate)`. That case is covered in [Cluster not quorate](#cluster-not-quorate). A node reported as `node not found in the cluster` is usually a typo in `az_map`, and that error is not retriable.
 
 **Fix**
 
@@ -2867,6 +2867,23 @@ Look at the `Quorate` line (`Yes`/`No`) and the `Votequorum information` block: 
 **Behavior**
 
 The CPI classifies this condition as retriable and injects an operator hint into the error message (`` cluster has lost quorum; mutations are blocked until quorum returns — check `pvecm status` ``) so the raw 5xx is not left anonymous in task output. Quorum loss is a minutes-scale condition, since waiting for a node to reboot or a network partition to heal takes far longer than a worker-pool hiccup. The CPI therefore retries it on the storage-lock backoff curve (2 seconds → 30 seconds, 10 attempts, ±30% jitter) rather than the shorter transient-transport curve (1 second → 15 seconds, 8 attempts) used for ordinary 5xx errors. If quorum returns within that window, the retry succeeds transparently and the BOSH task shows no visible interruption beyond the added latency; if quorum does not return in time, the error escalates to the task log as a retriable failure (`Bosh::Clouds::VMCreationFailed` from `create_vm`, `Bosh::Clouds::CloudError` with `ok_to_retry: true` elsewhere) and recovery happens on the next deploy or task retry.
+
+Some calls don't wait for that retry, because their work can only fail on a cluster without quorum and the reads they make first can take minutes against members that no longer answer. Each of them reads the cluster's status once, with a single attempt, and a status read that fails lets the call carry on as it did before.
+
+- **`create_vm`**
+  It returns a retriable error right away, whether or not the request pins a node with `target_node`. The check runs after the call looks for a VM that an earlier attempt already built. The error reads `create_vm: the cluster has lost quorum (the entry node does not report the cluster quorate), so no node can receive a VM; retry once 'pvecm status' reports the cluster quorate`.
+
+- **`delete_vm`**
+  It defers before it reads the journal or any node, and it returns the deferral that an unknown HA state gives, with the reason `the entry node does not report the cluster quorate`. Quorum can also be lost after that check. When PVE then refuses the delete's cluster lock with `cfs-lock 'file-user_cfg' error: no quorum!`, the CPI knows that PVE never took the lock, so it returns the same deferral instead of an error that calls the lock's outcome unknown.
+
+- **Guest listings and VM lookups**
+  A call that must list every node's guests, or that looks for the node holding a VM, asks a member once when the entry node doesn't report the cluster quorate and lists that member offline. It doesn't wait out the full retry budget, which costs about 30 seconds per attempt against a member that is gone. The member still counts as unread, so the call still refuses, and the error ends by saying that the listing was not retried and that we should retry once `pvecm status` reports the cluster quorate. A member that cluster status lists online keeps the full retry budget.
+
+- **Placement**
+  Every node is rejected with `node not placeable (entry node does not report the cluster quorate)`, and placement doesn't list storage on a node that cluster status lists offline.
+
+- **`pve-cid ha`**
+  The doctor skips each per-node read on a node that cluster status lists offline, and it reports the read as `unchecked` with a reason that names the lost quorum. [Reading the cluster with `pve-cid ha`](operations.md#reading-the-cluster-with-pve-cid-ha) describes the skip.
 
 **Fix**
 
