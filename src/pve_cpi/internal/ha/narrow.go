@@ -652,6 +652,11 @@ func (b *barrier) restoreAfter(ctx context.Context, cause error) error {
 	return cause
 }
 
+// NarrowMarkOf returns the state the barrier's token on an HA resource's
+// comment names, and whether the comment carries one. A guard reads it to tell
+// the barrier's own restore of that state from any other request for it.
+func NarrowMarkOf(comment *string) (string, bool) { return narrowMarkOf(comment) }
+
 // narrowMarkOf returns the state the barrier's token on comment names, and
 // whether the comment carries one.
 func narrowMarkOf(comment *string) (string, bool) {

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
@@ -52,7 +53,11 @@ func isLifecycleHAWrite(call ManagedAllocationMutation) bool {
 // and only when it carries this Director's marker now. An update may set the
 // requested state, the comment, and the digest, and nothing else. The state
 // must be started, stopped, or ignored, the states the barrier requests and
-// restores, so it never requests disabled. The update may delete no setting,
+// restores. It may be disabled only when it is the barrier's restore of a
+// resource that was disabled before the barrier held it. The resource must be
+// ignored now and carry the barrier's token naming disabled, and the update
+// must write a comment that drops the token. Any other request for disabled is
+// refused, so the lifecycle never disables a VM. The update may delete no setting,
 // and its delete list is read the way PVE reads it (see splitPVEList). A
 // comment it writes must keep the marker. A removal must purge the resource
 // from its rules, the only removal the CPI sends, and the removal of a
@@ -131,6 +136,11 @@ func (g *managedDiskLifecycleGuard) admitLifecycleHAWrite(ctx context.Context, c
 // started or stopped state the barrier puts back.
 var lifecycleHAStates = []string{"started", "stopped", "ignored"}
 
+// haStateDisabled is the requested state that stops a VM under PVE HA and keeps
+// it stopped. A disk lifecycle requests it only as the barrier's restore of a
+// resource that was disabled before.
+const haStateDisabled = "disabled"
+
 // lifecycleHAResourceUpdateFields lists the fields an HA resource update
 // inside a disk lifecycle may carry.
 var lifecycleHAResourceUpdateFields = []string{"state", "comment", pveConfigKeyDigest, "delete"}
@@ -164,8 +174,10 @@ func (g *managedDiskLifecycleGuard) admitLifecycleHAResourceWrite(
 		return fmt.Errorf("HA resource %q is not the resource %s of the lifecycle's VM", sid, want)
 	}
 	update := call.Method == "UpdateHaResources"
+	restoresDisabled := false
 	if update {
-		if err := lifecycleHAResourceUpdateAllowed(call, sid, owner); err != nil {
+		var err error
+		if restoresDisabled, err = lifecycleHAResourceUpdateAllowed(call, sid, owner); err != nil {
 			return err
 		}
 	} else if err := lifecycleHAResourceRemovalAllowed(call, sid); err != nil {
@@ -186,39 +198,63 @@ func (g *managedDiskLifecycleGuard) admitLifecycleHAResourceWrite(
 	case got.Comment == nil || haOwnershipOf(*got.Comment, owner) != haOwnedByUs:
 		return fmt.Errorf("HA resource %s does not carry this Director's ownership marker", sid)
 	}
+	if restoresDisabled {
+		from, marked := ha.NarrowMarkOf(got.Comment)
+		if !marked || from != haStateDisabled || pve.HARequestedState(got.State) != haResourceStateIgnored {
+			return fmt.Errorf("HA resource %s update requests disabled, and the barrier holds no disabled "+
+				"resource to restore", sid)
+		}
+	}
 	return nil
 }
 
 // lifecycleHAResourceUpdateAllowed checks the parameters of an HA resource
-// update inside a disk lifecycle (see admitLifecycleHAWrite).
-func lifecycleHAResourceUpdateAllowed(call ManagedAllocationMutation, sid, owner string) error {
+// update inside a disk lifecycle (see admitLifecycleHAWrite). It reports
+// whether the update requests disabled as the barrier's restore, which the
+// caller admits only once the resource shows the barrier holding a disabled
+// resource.
+func lifecycleHAResourceUpdateAllowed(call ManagedAllocationMutation, sid, owner string) (bool, error) {
 	params, ok := call.Args[managedArgumentParams].(*cluster.UpdateHaResourcesParams)
 	if !ok || params == nil {
-		return fmt.Errorf("HA resource %s update lacks its parameters", sid)
+		return false, fmt.Errorf("HA resource %s update lacks its parameters", sid)
 	}
 	fields, err := lifecycleMutationFields(params)
 	if err != nil {
-		return fmt.Errorf("HA resource %s update: %w", sid, err)
+		return false, fmt.Errorf("HA resource %s update: %w", sid, err)
 	}
 	for key := range fields {
 		if !slices.Contains(lifecycleHAResourceUpdateFields, key) {
-			return fmt.Errorf("HA resource %s update sets %s, more than its requested state and comment", sid, key)
+			return false, fmt.Errorf("HA resource %s update sets %s, more than its requested state and comment",
+				sid, key)
 		}
 	}
-	if params.State != nil && !slices.Contains(lifecycleHAStates, pve.HARequestedState(params.State)) {
-		return fmt.Errorf("HA resource %s update requests state %q, which a disk lifecycle never requests",
-			sid, *params.State)
+	restoresDisabled := false
+	if params.State != nil {
+		switch state := pve.HARequestedState(params.State); {
+		case slices.Contains(lifecycleHAStates, state):
+		case state == haStateDisabled && params.Comment != nil && !commentHasNarrowMark(params.Comment):
+			restoresDisabled = true
+		default:
+			return false, fmt.Errorf("HA resource %s update requests state %q, which a disk lifecycle never "+
+				"requests", sid, *params.State)
+		}
 	}
 	if params.Delete != nil {
 		if keys := splitPVEList(*params.Delete); len(keys) > 0 {
-			return fmt.Errorf("HA resource %s update deletes %s, and a disk lifecycle deletes no setting",
+			return false, fmt.Errorf("HA resource %s update deletes %s, and a disk lifecycle deletes no setting",
 				sid, strings.Join(keys, ","))
 		}
 	}
 	if params.Comment != nil && haOwnershipOf(*params.Comment, owner) != haOwnedByUs {
-		return fmt.Errorf("HA resource %s update does not carry this Director's ownership marker", sid)
+		return false, fmt.Errorf("HA resource %s update does not carry this Director's ownership marker", sid)
 	}
-	return nil
+	return restoresDisabled, nil
+}
+
+// commentHasNarrowMark reports whether comment carries the barrier's token.
+func commentHasNarrowMark(comment *string) bool {
+	_, marked := ha.NarrowMarkOf(comment)
+	return marked
 }
 
 // lifecycleHAResourceRemovalAllowed checks that an HA resource removal inside

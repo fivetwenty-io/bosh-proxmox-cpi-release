@@ -133,9 +133,11 @@ func TestManagedAttachWritesTheHAPinInsideTheDiskLifecycle(t *testing.T) {
 // another Director, a rule that is not a CPI rule, a pin or resource of
 // another VM even when it is this Director's, a pin that names another
 // resource, a pin creation while the pin exists, a resource update that sets
-// another field, requests disabled, or deletes a setting however PVE would
-// split the list, a removal that does not purge, and any write from a
-// lifecycle that serves no VM. A registration still locks the guard as before.
+// another field, requests disabled other than as the barrier's restore of a
+// resource it held from disabled, or deletes a setting however PVE would split
+// the list, a removal that does not purge, and any write from a lifecycle that
+// serves no VM. The barrier's restore of disabled goes through. A registration
+// still locks the guard as before.
 func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 	f := haLifecycleFixture(t)
 	deps, store, jr, id, cid := f.deps, f.store, f.jr, f.id, f.cid
@@ -196,6 +198,24 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 			store.rules["bosh-na-777"] = pin
 			defer func() { pin.Comment = was; store.rules["bosh-na-777"] = pin }()
 			return write()
+		}
+	}
+	// withHeld runs write while VM 777's resource requests state and carries
+	// comment, the way the barrier leaves it while it holds the VM, and puts the
+	// started resource with the marker back afterwards.
+	withHeld := func(state, comment string, write func() error) func() error {
+		return func() error {
+			store.states["vm:777"], store.resComments["vm:777"] = state, comment
+			defer func() { store.states["vm:777"], store.resComments["vm:777"] = "started", marker }()
+			return write()
+		}
+	}
+	heldFromDisabled := marker + " bosh-narrow-from=disabled"
+	heldFromStarted := marker + " bosh-narrow-from=started"
+	requestDisabled := func(comment string) func() error {
+		return func() error {
+			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &disabled,
+				Comment: &comment})
 		}
 	}
 	refused := []struct {
@@ -260,6 +280,15 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &disabled,
 				Comment: &marker})
 		}},
+		{"a request for disabled while the barrier's token names started",
+			withHeld("ignored", heldFromStarted, requestDisabled(marker))},
+		{"a request for disabled on a resource that is not ignored",
+			withHeld("started", heldFromDisabled, requestDisabled(marker))},
+		{"a request for disabled that keeps the barrier's token",
+			withHeld("ignored", heldFromDisabled, requestDisabled(heldFromDisabled))},
+		{"a request for disabled that writes no comment", withHeld("ignored", heldFromDisabled, func() error {
+			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &disabled})
+		})},
 		{"a resource update that sets another field", func() error {
 			restarts := int64(5)
 			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &ignored,
@@ -318,6 +347,16 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 	}
 	if store.states["vm:777"] != "ignored" {
 		t.Fatalf("state %q, want ignored", store.states["vm:777"])
+	}
+	// The barrier's restore of a resource that was disabled before it held
+	// the VM puts disabled back and drops the token.
+	store.resComments["vm:777"] = heldFromDisabled
+	if err := requestDisabled(marker)(); err != nil {
+		t.Fatalf("restore disabled on the resource the barrier held: %v", err)
+	}
+	if store.states["vm:777"] != "disabled" || store.resComments["vm:777"] != marker {
+		t.Fatalf("state %q comment %q, want disabled with the token dropped", store.states["vm:777"],
+			store.resComments["vm:777"])
 	}
 	stale := "stale"
 	if err := svc.UpdateHaRules(ctx, "bosh-na-777", &cluster.UpdateHaRulesParams{Comment: &marker,
@@ -506,6 +545,64 @@ func TestManagedAttachRebuildsTheReplicaOfAVMUnderHA(t *testing.T) {
 	if !store.resources["vm:777"] || store.states["vm:777"] != "started" {
 		t.Fatalf("HA resource present %v state %q, want the VM still started under HA",
 			store.resources["vm:777"], store.states["vm:777"])
+	}
+	record, err := jr.Inspect(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State == aj.ReconciliationRequired {
+		t.Fatalf("the attach left the record asking for reconciliation: %q", record.Reason)
+	}
+}
+
+// TestManagedAttachPutsBackADisabledHAResourceAfterTheBarrier attaches a
+// journal-managed disk on node-local storage into VM 777, whose HA resource an
+// operator disabled. Under the hold policy the pin narrows to n1, so the
+// attach runs inside the barrier: it requests ignored with the token that
+// names disabled, the pin narrows, the disk lands, and the barrier puts
+// disabled back. The disk lifecycle's guard admits that restore, so the attach
+// succeeds, the resource is disabled again without the token, and the disk's
+// record does not ask for reconciliation.
+func TestManagedAttachPutsBackADisabledHAResourceAfterTheBarrier(t *testing.T) {
+	f := haLifecycleFixture(t, "nfs")
+	deps, store, jr, id, cid := f.deps, f.store, f.jr, f.id, f.cid
+	deps.Config.HA.LocalPolicy = haChoiceOf(config.HALocalPolicyHold)
+	local := pve.StorageInfo{Name: deps.Config.DiskStorage, Type: pve.StorageTypeLVMThin, Content: "images,rootdir"}
+	profile, err := deps.HAProfile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.Storages = []pve.StorageInfo{local, {Name: "nfs", Type: pve.StorageTypeNFS, Shared: true,
+		Content: "images"}}
+	deps.Resolver = infoResolver{base: backendResolverOrDefault(deps), info: local}
+	store.states["vm:777"] = "disabled"
+	// The CRM reports the disabled VM stopped on n1 until the barrier's
+	// ignored request lands, and lists it no more after that. Each read is a
+	// round newer than the request, so the drain sees the CRM let go at once.
+	store.manager = func() *cluster.ListHaStatusManagerStatusResponse {
+		services := map[string]HASceneService{}
+		if store.states["vm:777"] != "ignored" {
+			services["vm:777"] = HASceneService{State: "stopped", Node: "n1", UID: "u1"}
+		}
+		return HAFreshManagerStatus(time.Now().Unix()+6, "n1", []string{"n2"}, services)
+	}
+	_, err = HandleAttachDisk(deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, "777"), planJSON(t, cid)},
+		jsonrpc.Context{DirectorUUID: aaDirector})
+	if err != nil {
+		t.Fatalf("attach into the disabled VM under HA: %v (writes %v)", err, store.writes)
+	}
+	if !slices.Contains(store.writes, "update-resource:vm:777") {
+		t.Fatalf("HA writes %v; the attach did not hold the VM inside the barrier", store.writes)
+	}
+	if store.states["vm:777"] != "disabled" {
+		t.Fatalf("HA resource state %q, want disabled put back", store.states["vm:777"])
+	}
+	if comment := store.resComments["vm:777"]; strings.Contains(comment, "bosh-narrow-from=") ||
+		haOwnershipOf(comment, aaDirector) != haOwnedByUs {
+		t.Fatalf("HA resource comment %q, want the marker without the barrier's token", comment)
+	}
+	if pin := store.rules["bosh-na-777"]; pin.Nodes == nil || *pin.Nodes != "n1" {
+		t.Fatalf("pin %+v, want it narrowed to n1", pin)
 	}
 	record, err := jr.Inspect(id)
 	if err != nil {
