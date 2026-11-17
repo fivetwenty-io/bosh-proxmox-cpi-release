@@ -118,7 +118,7 @@ func awaitHARecoverySettle(
 		log.String("deferred_ago", age.Round(time.Second).String()),
 		log.String("window", haRecoverySettleWindow.String()),
 	}
-	clear := func(msg string, extra ...log.Field) error {
+	release := func(msg string, extra ...log.Field) error {
 		logger.Info(caller+": "+msg, append(fields, extra...)...)
 		if err := store.ClearRecoveryDeferral(st.SID); err != nil {
 			logger.Warn(caller+": the HA recovery deferral could not be cleared; it expires on its own",
@@ -127,10 +127,10 @@ func awaitHARecoverySettle(
 		return nil
 	}
 	if age >= haRecoveryDeferralLife {
-		return clear("the last HA recovery deferral is too old to hold the delete; proceeding")
+		return release("the last HA recovery deferral is too old to hold the delete; proceeding")
 	}
 	if st.Raw != haRawStateStarted {
-		return clear("PVE HA does not hold the VM started, so there is no restart to wait for; proceeding")
+		return release("PVE HA does not hold the VM started, so there is no restart to wait for; proceeding")
 	}
 	limit := haRecoveryDeferralLife - age
 
@@ -157,10 +157,10 @@ func awaitHARecoverySettle(
 	if !ok {
 		logger.Warn(caller+": the running VM's status carries no readable uptime, so the delete proceeds "+
 			"without waiting for it to settle", fields...)
-		return clear("the HA recovery deferral no longer holds the delete; proceeding")
+		return release("the HA recovery deferral no longer holds the delete; proceeding")
 	}
 	if uptime >= haRecoverySettleWindow {
-		return clear("the VM has run past the settle window since PVE HA restarted it; proceeding",
+		return release("the VM has run past the settle window since PVE HA restarted it; proceeding",
 			log.String("uptime", uptime.Round(time.Second).String()))
 	}
 	wait := min(haRecoverySettleWindow-uptime, limit)
