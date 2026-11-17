@@ -223,9 +223,17 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 		write func() error
 	}{
 		{"a lifecycle that serves no VM", func() error {
+			// A resource vm:0 of this Director, so only the check that the
+			// lifecycle serves a VM refuses the write.
 			lifecycle.haVMID = 0
-			defer func() { lifecycle.haVMID = 777 }()
-			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &ignored,
+			store.resources["vm:0"], store.states["vm:0"], store.resComments["vm:0"] = true, "started", marker
+			defer func() {
+				lifecycle.haVMID = 777
+				delete(store.resources, "vm:0")
+				delete(store.states, "vm:0")
+				delete(store.resComments, "vm:0")
+			}()
+			return svc.UpdateHaResources(ctx, "vm:0", &cluster.UpdateHaResourcesParams{State: &ignored,
 				Comment: &marker})
 		}},
 		{"another Director's rule", func() error {
@@ -257,6 +265,11 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 				Resources: "vm:999", Comment: &marker, Nodes: &nodes})
 		}},
 		{"a pin creation that names another resource too", func() error {
+			// The pin is absent, so only the check of the new rule's resources
+			// refuses the creation.
+			pin := store.rules["bosh-na-777"]
+			delete(store.rules, "bosh-na-777")
+			defer func() { store.rules["bosh-na-777"] = pin }()
 			return svc.CreateHaRules(ctx, &cluster.CreateHaRulesParams{Rule: "bosh-na-777", Type: naRuleType,
 				Resources: "vm:777;vm:555", Comment: &marker, Nodes: &nodes})
 		}},
@@ -321,11 +334,20 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 			return svc.DeleteHaResources(ctx, "vm:777", &cluster.DeleteHaResourcesParams{})
 		}},
 	}
+	// reasons holds the refusal that rows whose write another check could
+	// also refuse must give.
+	reasons := map[string]string{
+		"a lifecycle that serves no VM":                  "serves no VM",
+		"a pin creation that names another resource too": "creation names resources",
+	}
 	for _, row := range refused {
 		writes := len(store.writes)
 		err := row.write()
 		if err == nil || !errors.Is(err, pve.ErrMutationNotAttempted) {
 			t.Fatalf("%s: err %v, want a refusal before the write was sent", row.name, err)
+		}
+		if reason, ok := reasons[row.name]; ok && !strings.Contains(err.Error(), reason) {
+			t.Fatalf("%s: err %v, want the refusal that says %q", row.name, err, reason)
 		}
 		if !errors.Is(err, errManagedHAWriteRefused) {
 			t.Fatalf("%s: err %v, want the HA write refusal", row.name, err)
