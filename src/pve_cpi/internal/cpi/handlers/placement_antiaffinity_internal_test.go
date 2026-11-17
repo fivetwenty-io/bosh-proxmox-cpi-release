@@ -79,6 +79,8 @@ type aaClusterStub struct {
 	// property, so a test can put a rule out of effect the way PVE's own
 	// checks do.
 	ruleErrors func(rule string) map[string][]string
+	// ruleDisabled marks the rules PVE reports as disabled.
+	ruleDisabled map[string]bool
 }
 
 func (s *aaClusterStub) record(ev string) {
@@ -251,6 +253,9 @@ func (s *aaClusterStub) ListHaRules(_ context.Context, _ *cluster.ListHaRulesPar
 		}
 		if s.ruleStrict[name] {
 			row["strict"] = 1
+		}
+		if s.ruleDisabled[name] {
+			row["disable"] = 1
 		}
 		if s.ruleErrors != nil {
 			if errs := s.ruleErrors(name); len(errs) > 0 {

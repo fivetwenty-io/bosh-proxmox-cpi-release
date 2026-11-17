@@ -313,9 +313,9 @@ func applyGroupPlan(
 //
 // Once any round's write needed a repair, the create succeeds only when the
 // last read shows the rule the last plan placed this VM in holding it,
-// enabled and with no error. In managed mode it otherwise returns the
-// writer's refusal, which fails the call. In auto mode it otherwise returns
-// placedNotInEffect's error, a plain cloud error, which the caller turns
+// enabled and with no error. Otherwise it returns placedNotInEffect's error.
+// In managed mode that error wraps the writer's last refusal, so it fails
+// the call. In auto mode it is a plain cloud error, which the caller turns
 // into a VM that runs without HA, because a VM never runs under HA without
 // the spread rule it was meant to join. That is what happens to an auto
 // create whose own pin PVE flags, since the repair takes its VM back out of
@@ -335,20 +335,18 @@ func applyCreatePlan(
 		if err != nil && !errors.Is(err, ha.ErrRuleNotInEffect) {
 			return writer, res, err
 		}
+		if err != nil {
+			refused = err
+		}
 		repaired = repaired || res != nil && len(res.Confined) > 0
 		if len(siblings) == 0 || round >= aaHealRounds {
 			switch {
 			case err != nil:
 				return writer, res, err
-			case refused != nil && !placedInEffect(res, planner):
-				return writer, res, refused
-			case repaired && planner.placedIn != "" && !placedInEffect(res, planner):
-				return writer, res, placedNotInEffect(res, planner, round)
+			case (refused != nil || repaired && planner.placedIn != "") && !placedInEffect(res, planner):
+				return writer, res, placedNotInEffect(res, planner, round, refused)
 			}
 			return writer, res, nil
-		}
-		if err != nil {
-			refused = err
 		}
 		for _, s := range siblings {
 			holdOut[s] = true
@@ -408,13 +406,17 @@ func placedState(res *ha.ApplyResult, planner *aaPlanner) string {
 	return ""
 }
 
-// placedNotInEffect returns the error of an auto create whose last read,
-// after rounds plans and a repair in at least one of them, does not show this
-// VM in effect in the rule its last plan placed it in. It describes that last
-// read.
-func placedNotInEffect(res *ha.ApplyResult, planner *aaPlanner, rounds int) error {
-	return cpierrors.Cloud("anti-affinity: after %d plans of the group's rules and a pin repair, %s", rounds,
+// placedNotInEffect returns the error of a create whose last read, after
+// rounds plans and a repair in at least one of them, does not show this VM in
+// effect in the rule its last plan placed it in. It describes that last read,
+// and it wraps refused, the writer's last refusal, when there was one.
+func placedNotInEffect(res *ha.ApplyResult, planner *aaPlanner, rounds int, refused error) error {
+	msg := fmt.Sprintf("anti-affinity: after %d plans of the group's rules and a pin repair, %s", rounds,
 		placedState(res, planner))
+	if refused != nil {
+		return cpierrors.WrapAs(refused, cpierrors.TypeCloud, msg)
+	}
+	return cpierrors.Cloud("%s", msg)
 }
 
 // groupRuleLoss is what a write of a group's rules leaves for a heal to make
