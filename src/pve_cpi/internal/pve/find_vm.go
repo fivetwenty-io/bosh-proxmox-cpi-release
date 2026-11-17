@@ -3,6 +3,7 @@ package pve
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -91,7 +92,10 @@ type VMLocation struct {
 // offline is excluded from the probe fan-out (its config endpoint can never
 // answer while the node is down) rather than blocking every miss-path lookup
 // cluster-wide, which would wedge exactly the has_vm/delete_vm re-drives that
-// resurrection depends on when a node dies. The absence conclusion stays
+// resurrection depends on when a node dies. A member the cluster begins
+// reporting offline during a sweep is excluded the same way after its first
+// failed probe, because a rebooting node stops answering its API before
+// corosync drops it from membership. The absence conclusion stays
 // sound because the index fast path above still covers the excluded member:
 // its guests' rows persist in /cluster/resources while the node is down, so
 // an index MISS plus a clean probe of every online member proves absence for
@@ -170,7 +174,9 @@ func FindVMByConfigProbe(ctx context.Context, c Client, vmid int) (VMLocation, e
 // because its index fast path still covers that member's guests. Without it,
 // such a member is not probed, since its config endpoint cannot answer while
 // the node is down, and a sweep with no hit returns a retriable error naming
-// it.
+// it. A failed probe reads the status once more, so a member the quorate
+// cluster begins reporting offline during the sweep is handled the same way
+// after one attempt instead of the whole retry budget.
 func probeVMConfigs(
 	ctx context.Context, c Client, vmid int, caller, why string, tolerateOffline bool,
 ) (loc VMLocation, skipped []string, err error) {
@@ -184,7 +190,8 @@ func probeVMConfigs(
 			"%s: VM %d %s, and node enumeration returned zero nodes; cannot prove absence", caller, vmid, why)
 	}
 
-	offline := offlineClusterNodes(ctx, c, log.FromContext(ctx))
+	logger := log.FromContext(ctx)
+	offline := offlineClusterNodes(ctx, c, logger)
 	var failedNodes []string
 	var unprovenOffline []string
 	var lastProbeErr error
@@ -194,7 +201,7 @@ func probeVMConfigs(
 			if tolerateOffline {
 				skipped = append(skipped, n)
 			} else {
-				log.FromContext(ctx).Warn(caller+": member the cluster reports offline cannot answer the config probe; absence stays unproven",
+				logger.Warn(caller+": member the cluster reports offline cannot answer the config probe; absence stays unproven",
 					log.String("node", n), log.Int("vmid", vmid))
 				unprovenOffline = append(unprovenOffline, n)
 			}
@@ -212,9 +219,35 @@ func probeVMConfigs(
 			if missing {
 				return nil
 			}
+			// A member can stop answering its API before corosync drops it, so
+			// the status read before the sweep still reported it online. One
+			// status attempt per failed probe catches the drop, and the
+			// member then gets no further attempts.
+			if inner != nil && readOfflineClusterNodes(ctx, c, logger, 1)[n] {
+				return &memberWentOfflineError{node: n, cause: inner}
+			}
 			return inner
 		})
 		if missing {
+			continue
+		}
+		var offlineErr *memberWentOfflineError
+		if errors.As(probeErr, &offlineErr) {
+			// The member is now treated exactly as one the status reported
+			// offline before the sweep. For FindVMAuthoritative it joins
+			// skipped, so proveVMAbsent's offline-member ties and its warning
+			// cover it, and the index read the absence rests on covers its
+			// guests either way. For FindVMByConfigProbe it leaves absence
+			// unproven at once, instead of after the whole retry budget.
+			if tolerateOffline {
+				logger.Warn(caller+": member the cluster began reporting offline during its config probe; excluding it",
+					log.String("node", n), log.Int("vmid", vmid), log.Err(offlineErr.cause))
+				skipped = append(skipped, n)
+			} else {
+				logger.Warn(caller+": member the cluster began reporting offline during its config probe; absence stays unproven",
+					log.String("node", n), log.Int("vmid", vmid), log.Err(offlineErr.cause))
+				unprovenOffline = append(unprovenOffline, n)
+			}
 			continue
 		}
 		if probeErr != nil {
