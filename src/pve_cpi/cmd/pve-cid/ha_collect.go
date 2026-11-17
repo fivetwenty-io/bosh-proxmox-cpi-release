@@ -1038,7 +1038,7 @@ func (c *haCollector) onPartner(g *haGuest, pin *ha.Rule, node, source string) {
 			"since; "+reconcile, id, node, source, source, node, source, source)
 	case ha.PartnerMoveRestarted:
 		c.rep.problem(haKindReplicaOnPartner, g.sid, moved+"; a migration from %s explains the move, but the VM "+
-			"started again after it, which an HA recovery does, so writes made after the last sync before that "+
+			"also started outside a migration since the pin last changed, which an HA recovery does, so writes made after the last sync before that "+
 			"start may have been lost, and a sync from %s back to %s has run since; "+reconcile, id, node, source,
 			node, source, source)
 	case ha.PartnerMoveUnproven:

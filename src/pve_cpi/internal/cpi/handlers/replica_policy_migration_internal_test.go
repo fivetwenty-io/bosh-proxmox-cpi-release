@@ -425,6 +425,12 @@ func TestReconcileOnPartner_RecoveryAfterAPlannedMigrationWarnsOfLostWrites(t *t
 			r.tasks.logs[upid] = plainStart
 			r.tasks.logs[r.tasks.migrations["pve01"][0].UPID] = liveMove
 		}},
+		"a recovery to the partner before a migration back and the migration": {incoming,
+			func(r *replicaRig, ended time.Time) {
+				upid := r.tasks.started("pve02", ended.Add(-40*time.Minute), ended.Add(-40*time.Minute+5*time.Second),
+					"OK")
+				r.tasks.logs[upid] = plainStart
+			}},
 		"a recovery start inside the migration's window": {func(r *replicaRig, ended time.Time) {
 			upid := r.tasks.started("pve02", ended.Add(-30*time.Second), ended.Add(-25*time.Second), "OK")
 			r.tasks.logs[upid] = plainStart
@@ -452,7 +458,7 @@ func TestReconcileOnPartner_RecoveryAfterAPlannedMigrationWarnsOfLostWrites(t *t
 				t.Fatalf("pin shape %q %q %v; the verified sync keeps both nodes and moves the partner", source,
 					partner, ok)
 			}
-			if len(warnings) != 1 || !strings.Contains(warnings[0], "started again after the migration") ||
+			if len(warnings) != 1 || !strings.Contains(warnings[0], "started outside a migration since the pin last changed") ||
 				!strings.Contains(warnings[0], "were lost") || strings.Contains(warnings[0], "by a planned migration") {
 				t.Fatalf("warnings %q; a start after the migration warns that writes may have been lost", warnings)
 			}

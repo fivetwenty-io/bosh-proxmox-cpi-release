@@ -1252,9 +1252,9 @@ func swappedReplicaPin(pin *ha.Rule, node, oldSource string) *ha.Rule {
 // w.node is verified to cover the VM's volumes on oldSource after the pin's
 // last change, because only then does the old source hold the VM's data. A
 // qmigrate task on oldSource that ended after that change, with no qmstart
-// task that shows the VM started again after it, makes the move a planned
-// migration. With no such task, the move was a failover whose first reversed
-// sync has run. With a start after the migration, which an HA recovery
+// task that shows the VM started outside a migration since the change, makes
+// the move a planned migration. With no such task, the move was a failover
+// whose first reversed sync has run. With such a start, which an HA recovery
 // leaves, or with a task list the CPI cannot read, the move may have been
 // one. Each keeps both nodes, because the old source's copy is current again,
 // and the CPI warns that writes were or may have been lost. swapped is false when
@@ -1322,10 +1322,10 @@ func (w *replicaWiden) swapAfterMigration(
 			"writes made on the old source after its last sync before the failover were lost", fields...)
 	case ha.PartnerMoveRestarted:
 		logger.Warn(replicaOp+": a migration from the old source brought the VM to its replication partner, but "+
-			"the VM started again after the migration, which an HA recovery does; a verified sync from this node "+
-			"covers its volumes on the old source again, so the pin keeps both nodes and names the old source as "+
-			"the partner now, but if that start was an HA recovery, writes made after the last sync before it "+
-			"were lost", fields...)
+			"a start task shows that the VM also started outside a migration since the pin last changed, which "+
+			"an HA recovery does; a verified sync from this node covers its volumes on the old source again, so "+
+			"the pin keeps both nodes and names the old source as the partner now, but if that start was an HA "+
+			"recovery, writes made after the last sync before it were lost", fields...)
 	default:
 		logger.Warn(replicaOp+": the VM runs on its replication partner, and a verified sync from this node "+
 			"covers its volumes on the old source, so the pin keeps both nodes and names the old source as the "+

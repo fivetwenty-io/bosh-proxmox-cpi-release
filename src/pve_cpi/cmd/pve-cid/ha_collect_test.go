@@ -535,8 +535,8 @@ func TestCollectReplicaOnPartnerAfterAMove(t *testing.T) {
 			logged(f, false, recovery)
 		}, severity: haSeverityProblem,
 			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
-				"a migration from n1 explains the move", "started again after it", "may have been lost",
-				"names n1 as the partner"},
+				"a migration from n1 explains the move", "started outside a migration since the pin last changed",
+				"may have been lost", "names n1 as the partner"},
 			absent: "planned migration"},
 		{name: "an HA recovery on n2 soon after the migration", edit: func(f *fakeHA) {
 			recovery := started("n2", haNow.Add(-58*time.Minute))
@@ -546,8 +546,8 @@ func TestCollectReplicaOnPartnerAfterAMove(t *testing.T) {
 			f.taskLogs[migrated.UPID] = []string{"starting VM 101 on remote node 'n2'", "TASK OK"}
 		}, severity: haSeverityProblem,
 			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
-				"a migration from n1 explains the move", "started again after it", "may have been lost",
-				"names n1 as the partner"},
+				"a migration from n1 explains the move", "started outside a migration since the pin last changed",
+				"may have been lost", "names n1 as the partner"},
 			absent: "planned migration"},
 		{name: "start tasks unreadable", edit: func(f *fakeHA) {
 			f.startErr = map[string]error{"n2": errors.New("needs Sys.Audit")}

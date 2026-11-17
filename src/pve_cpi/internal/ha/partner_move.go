@@ -49,12 +49,14 @@ const (
 	MigrationNone
 	// MigrationProved means a migration from the old source ended after the
 	// pin's last change, the VM has not migrated away since, and no start
-	// task shows that it started again after the migration.
+	// task shows that it started outside a migration since the pin's last
+	// change.
 	MigrationProved
 	// MigrationRestarted means a migration from the old source explains the
-	// move, but a start task shows that the VM started again after it. An HA
+	// move, but a start task shows that the VM started outside a migration
+	// since the pin's last change, before the migration or after it. An HA
 	// recovery starts the VM that way from its replica, so writes may have
-	// been lost after the migration. A restart by hand or a reboot looks the
+	// been lost. A restart by hand or a reboot looks the
 	// same, and the CPI can't tell them apart.
 	MigrationRestarted
 )
@@ -179,38 +181,51 @@ func ProvingMigration(fromOld, onNode []pve.VMTask, changedAt time.Time) (pve.VM
 	return arrived, true
 }
 
-// StartedAfter reports whether a start task shows that the VM started again
-// after migration, the qmigrate task on the old source that brought it to the
-// node it runs on, reading the logs of the tasks it needs through logOf.
-// Every start counts, whether it is running, failed, or succeeded, because an
-// HA recovery may take more than one attempt.
+// StartedAfter reports whether a start task shows that the VM started outside
+// a migration since changedAt, the pin's last change, given migration, the
+// qmigrate task on the old source that brought it to the node it runs on, and
+// moves, every qmigrate task on the old source. It reads the logs of the tasks
+// it needs through logOf. Every start counts, whether it is running, failed,
+// or succeeded, because an HA recovery may take more than one attempt.
 //
 // The old source's tasks share migration's clock, so any start there at or
 // after the migration ended means the VM came back to the old source, by an
 // HA recovery or otherwise, before it reached the node it runs on now.
 //
 // The node the VM runs on has its own clock, so a start there that began
-// clearly before the migration did, by more than the clock-skew tolerance,
-// belongs to an earlier stay on that node. Any later start counts unless its
-// log shows that it received a live migration. The target of a live
-// migration lists that start of its own, the qm start --migratedfrom that
-// received the VM, and a failed earlier attempt lists one too, so no number
-// of them counts. The one other start allowed is the first plain start inside
-// the window of an offline migration, widened by the tolerance on each side,
-// because an HA relocation stops the VM, migrates it offline, and starts it on
-// the target. A log that can't be read is an error, because the start it
-// belongs to could be either.
-func StartedAfter(migration pve.VMTask, onOld, onNode []pve.VMTask, logOf taskLogOf) (bool, error) {
+// clearly before the pin's last change or before the migration, whichever came
+// first, by more than the clock-skew tolerance, belongs to a stay on that node
+// that the pin's last change already covered. Any later start counts unless
+// its log shows that it received a live migration. That reaches back before
+// the migration, because an HA recovery to the node, followed by a migration
+// back to the old source and the migration that proves the move, leaves the
+// recovery's start before that migration. The target of a live migration lists
+// a start of its own, the qm start --migratedfrom that received the VM, and a
+// failed earlier attempt lists one too, so no number of them counts. The one
+// other start allowed per migration from the old source is the first plain
+// start inside its window, widened by the tolerance on each side, when its log
+// shows an offline migration, because an HA relocation stops the VM, migrates
+// it offline, and starts it on the target. A log that can't be read is an
+// error, because the start it belongs to could be either.
+func StartedAfter(
+	migration pve.VMTask, moves []pve.VMTask, changedAt time.Time, onOld, onNode []pve.VMTask, logOf taskLogOf,
+) (bool, error) {
 	for _, task := range onOld {
 		if task.StartTime >= migration.EndTime {
 			return true, nil
 		}
 	}
 	tolerance := int64(aj.ReplicaClockSkewTolerance / time.Second)
-	earliest, latest := migration.StartTime-tolerance, migration.EndTime+tolerance
+	earliest := min(migration.StartTime, changedAt.Unix()) - tolerance
+	relocations := slices.DeleteFunc(slices.Clone(moves), func(m pve.VMTask) bool {
+		return !m.Succeeded() || m.UPID == ""
+	})
+	if !slices.ContainsFunc(relocations, func(m pve.VMTask) bool { return m.UPID == migration.UPID }) {
+		relocations = append(relocations, migration)
+	}
 	starts := slices.Clone(onNode)
 	slices.SortStableFunc(starts, func(a, b pve.VMTask) int { return cmp.Compare(a.StartTime, b.StartTime) })
-	relocated := false
+	used := map[string]bool{}
 	for _, task := range starts {
 		if task.StartTime <= earliest {
 			continue
@@ -223,17 +238,37 @@ func StartedAfter(migration pve.VMTask, onOld, onNode []pve.VMTask, logOf taskLo
 			continue
 		case kind != TaskLogPlainStart:
 			return false, fmt.Errorf("the log of start task %s reads as no start", task.UPID)
-		case relocated || task.StartTime > latest:
+		}
+		explained, err := relocationStart(task, relocations, used, tolerance, logOf)
+		switch {
+		case err != nil:
+			return false, err
+		case !explained:
 			return true, nil
 		}
-		moved, err := logOf(migration)
+	}
+	return false, nil
+}
+
+// relocationStart reports whether start, a plain start on the node the VM
+// runs on, is the start of an offline relocation among moves that no earlier
+// start has claimed, and marks that relocation used. A migration whose window
+// holds the start and whose log can't be read is an error.
+func relocationStart(
+	start pve.VMTask, moves []pve.VMTask, used map[string]bool, tolerance int64, logOf taskLogOf,
+) (bool, error) {
+	for _, m := range moves {
+		if used[m.UPID] || start.StartTime <= m.StartTime-tolerance || start.StartTime > m.EndTime+tolerance {
+			continue
+		}
+		kind, err := logOf(m)
 		if err != nil {
 			return false, err
 		}
-		if moved != TaskLogOfflineMigration {
+		if kind == TaskLogOfflineMigration {
+			used[m.UPID] = true
 			return true, nil
 		}
-		relocated = true
 	}
 	return false, nil
 }
@@ -258,7 +293,7 @@ func migrationEvidence(tasks PartnerTasks, changedAt time.Time, logOf taskLogOf)
 	if !ok {
 		return MigrationNone, nil
 	}
-	restarted, err := StartedAfter(migration, tasks.StartsOnOld, tasks.StartsOnNode, logOf)
+	restarted, err := StartedAfter(migration, tasks.FromOld, changedAt, tasks.StartsOnOld, tasks.StartsOnNode, logOf)
 	switch {
 	case err != nil:
 		return MigrationUnread, err
@@ -297,7 +332,7 @@ func ReadMigrationEvidence(
 	if tasks.StartsOnNode, err = reader.StartTasks(ctx, node, vmid, since); err != nil {
 		return MigrationUnread, fmt.Errorf("list the start tasks on node %s: %w", node, err)
 	}
-	// StartedAfter reads the logs of the starts on node and of the migration
+	// StartedAfter reads the logs of the starts on node and of the migrations
 	// that left the old source, and nothing else.
 	nodeOf := map[string]string{}
 	for _, task := range tasks.FromOld {

@@ -139,7 +139,8 @@ func TestClassifyTaskLog(t *testing.T) {
 // TestMigrationEvidenceOfStarts judges the start tasks of a VM whose move a
 // migration from the old source explains. The migration ran on pve01 from an
 // hour after the pin's last change for a minute, and its log reads online
-// unless a row says otherwise.
+// unless a row says otherwise. A row with an earlier move adds a migration on
+// pve01 from ten minutes after the change for a minute, with that log.
 func TestMigrationEvidenceOfStarts(t *testing.T) {
 	changed := time.Unix(1_700_000_000, 0)
 	begun, ended := changed.Add(time.Hour), changed.Add(time.Hour+time.Minute)
@@ -153,6 +154,7 @@ func TestMigrationEvidenceOfStarts(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		moved        ha.TaskLogKind
+		earlierMove  ha.TaskLogKind
 		startsOnOld  []time.Time
 		startsOnNode []start
 		status       string
@@ -168,9 +170,39 @@ func TestMigrationEvidenceOfStarts(t *testing.T) {
 			want:         ha.MigrationProved},
 		{name: "the start that brought the VM to the old source before the migration",
 			startsOnOld: []time.Time{begun.Add(-30 * time.Minute)}, want: ha.MigrationProved},
-		{name: "a start on the target from an earlier stay, whose log is not needed",
-			startsOnNode: []start{unread(begun.Add(-time.Hour)), incoming(begun.Add(2 * time.Second))},
+		{name: "a start on the target before the pin's last change, whose log is not needed",
+			startsOnNode: []start{unread(changed.Add(-10 * time.Minute)), incoming(begun.Add(2 * time.Second))},
 			want:         ha.MigrationProved},
+		{name: "an earlier live stay on the target since the pin's last change",
+			startsOnNode: []start{incoming(changed.Add(10 * time.Minute)), incoming(begun.Add(2 * time.Second))},
+			want:         ha.MigrationProved},
+		{name: "an HA recovery to the target before a migration back and the migration",
+			startsOnNode: []start{plain(changed.Add(20 * time.Minute)), incoming(begun.Add(2 * time.Second))},
+			want:         ha.MigrationRestarted},
+		{name: "an HA recovery to the target just after the pin's last change",
+			startsOnNode: []start{plain(changed.Add(time.Minute)), incoming(begun.Add(2 * time.Second))},
+			want:         ha.MigrationRestarted},
+		{name: "an earlier offline relocation to the target since the pin's last change",
+			earlierMove: ha.TaskLogOfflineMigration,
+			startsOnNode: []start{plain(changed.Add(11*time.Minute + 10*time.Second)),
+				incoming(begun.Add(2 * time.Second))},
+			want: ha.MigrationProved},
+		{name: "a second start after an earlier offline relocation", earlierMove: ha.TaskLogOfflineMigration,
+			startsOnNode: []start{plain(changed.Add(11*time.Minute + 10*time.Second)),
+				plain(changed.Add(13 * time.Minute)), incoming(begun.Add(2 * time.Second))},
+			want: ha.MigrationRestarted},
+		{name: "a start inside the window of an earlier live migration", earlierMove: ha.TaskLogOnlineMigration,
+			startsOnNode: []start{plain(changed.Add(10*time.Minute + 30*time.Second)),
+				incoming(begun.Add(2 * time.Second))},
+			want: ha.MigrationRestarted},
+		{name: "a start inside the window of an earlier migration whose log was not read",
+			earlierMove: ha.TaskLogUnread,
+			startsOnNode: []start{plain(changed.Add(10*time.Minute + 30*time.Second)),
+				incoming(begun.Add(2 * time.Second))},
+			want: ha.MigrationUnread},
+		{name: "an earlier start on the target whose log was not read",
+			startsOnNode: []start{unread(changed.Add(20 * time.Minute)), incoming(begun.Add(2 * time.Second))},
+			want:         ha.MigrationUnread},
 		{name: "an HA recovery back to the old source and then to the target again",
 			startsOnOld:  []time.Time{ended.Add(10 * time.Minute)},
 			startsOnNode: []start{incoming(begun.Add(2 * time.Second)), plain(ended.Add(20 * time.Minute))},
@@ -209,6 +241,11 @@ func TestMigrationEvidenceOfStarts(t *testing.T) {
 			}
 			tasks := ha.PartnerTasks{FromOld: []pve.VMTask{migration},
 				Logs: map[string]ha.TaskLogKind{migration.UPID: moved}}
+			if tc.earlierMove != ha.TaskLogUnread || strings.Contains(tc.name, "earlier migration") {
+				earlier := withUPID(migrationTask("OK", changed.Add(10*time.Minute), changed.Add(11*time.Minute)))
+				tasks.FromOld = append(tasks.FromOld, earlier)
+				tasks.Logs[earlier.UPID] = tc.earlierMove
+			}
 			for _, at := range tc.startsOnOld {
 				tasks.StartsOnOld = append(tasks.StartsOnOld, withUPID(startTask("OK", at, at.Add(5*time.Second))))
 			}
