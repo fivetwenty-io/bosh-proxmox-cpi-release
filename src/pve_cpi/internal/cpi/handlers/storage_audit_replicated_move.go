@@ -44,16 +44,10 @@ type StorageReplicaMove struct {
 	Failover            bool   `json:"failover"`
 }
 
-// replicaJobMarker is the ownership marker in a replication job's comment.
-// Generation is the CPI's generation of the job, which the journal records
-// before it writes the comment.
-type replicaJobMarker struct {
-	Owner      string
-	Generation uint64
-	// Encoded is true when PVE percent-encoded the comment again after the
-	// CPI wrote it, so the marker reads canonically only once decoded.
-	Encoded bool
-}
+// replicaJobMarker is the ownership marker in a replication job's comment
+// (see ha.ReplicaJobMarker). Generation is the CPI's generation of the job,
+// which the journal records before it writes the comment.
+type replicaJobMarker = ha.ReplicaJobMarker
 
 // renderReplicaJobMarker renders the comment of a replication job the CPI
 // owns, "bosh-cpi:v1 owner=<director-uuid> gen=<n>".
@@ -62,44 +56,11 @@ func renderReplicaJobMarker(owner string, generation uint64) string {
 }
 
 // parseReplicaJobMarker reads the ownership marker at the start of a
-// replication job's comment. It reports false when the comment carries no
-// marker, a marker without an owner or a generation, a repeated owner or
-// generation, or a generation that is not a positive integer, because each of
-// those could be a reused job ID or a hand edit, and neither proves the job is
-// the one the journal recorded. Unknown keys are ignored so a later field
-// does not orphan the job. The marker is read through ha.MarkerFields, so a
-// comment PVE percent-encoded again on a later write of replication.cfg still
-// reads as the marker it holds, and Encoded says so.
+// replication job's comment through ha.ParseReplicaJobMarker, the reading the
+// doctor shares, so the CPI and the doctor agree on which jobs carry a marker
+// and on which of those PVE percent-encoded again.
 func parseReplicaJobMarker(comment string) (replicaJobMarker, bool) {
-	fields, encoded, ok := ha.MarkerFields(comment)
-	if !ok {
-		return replicaJobMarker{}, false
-	}
-	marker := replicaJobMarker{Encoded: encoded}
-	seenOwner, seenGeneration := false, false
-	for _, field := range fields {
-		key, value, ok := strings.Cut(field, "=")
-		if !ok {
-			continue
-		}
-		switch key {
-		case "owner":
-			if seenOwner || value == "" || value == haUnsetField {
-				return replicaJobMarker{}, false
-			}
-			seenOwner, marker.Owner = true, value
-		case "gen":
-			generation, err := strconv.ParseUint(value, 10, 64)
-			if seenGeneration || err != nil || generation == 0 {
-				return replicaJobMarker{}, false
-			}
-			seenGeneration, marker.Generation = true, generation
-		}
-	}
-	if !seenOwner || !seenGeneration {
-		return replicaJobMarker{}, false
-	}
-	return marker, true
+	return ha.ParseReplicaJobMarker(comment)
 }
 
 // storageAuditReplicated reports whether a record carries a replication that

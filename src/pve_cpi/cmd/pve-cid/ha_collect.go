@@ -91,37 +91,14 @@ func haMarkerOwner(comment string) (owner string, ok bool) {
 }
 
 // haJobMarker reports whether a replication job's comment holds the marker the
-// CPI writes, which carries an owner and a positive generation. A comment
-// without both is not a job the CPI can vouch for. Like haMarkerOwner, it
-// reads a comment PVE encoded again as the marker it holds.
+// CPI writes, which carries one owner and one positive generation. A comment
+// without both is not a job the CPI can vouch for. It reads the comment
+// through ha.ParseReplicaJobMarker, the reading the CPI's handlers use, so the
+// doctor counts a job as the CPI's exactly when the CPI does, encoded again or
+// not.
 func haJobMarker(comment string) bool {
-	fields, _, ok := ha.MarkerFields(comment)
-	if !ok {
-		return false
-	}
-	// The CPI refuses a job whose marker repeats owner or gen, or whose owner or
-	// gen is unusable on any occurrence, so the doctor does too.
-	var owner, gen bool
-	for _, f := range fields {
-		key, val, found := strings.Cut(f, "=")
-		if !found {
-			continue
-		}
-		switch key {
-		case "owner":
-			if owner || val == "" || val == "-" {
-				return false
-			}
-			owner = true
-		case "gen":
-			n, err := strconv.ParseUint(val, 10, 64)
-			if gen || err != nil || n == 0 {
-				return false
-			}
-			gen = true
-		}
-	}
-	return owner && gen
+	_, ok := ha.ParseReplicaJobMarker(comment)
+	return ok
 }
 
 // haGuest is a cluster guest with the facts the doctor derives from it.
@@ -1347,18 +1324,25 @@ func (c *haCollector) jobHealth() {
 // encodedMarker advises on a CPI job whose comment PVE percent-encoded again
 // after the CPI wrote it. PVE does that to every job's comment when one
 // scheduler pass writes replication.cfg more than once, as when HA recovers
-// several replicated guests onto one node. This CPI still reads the marker,
-// but a CPI that predates the tolerant reader disowns the job, so the advice
-// names the command that restores the canonical comment.
+// several replicated guests onto one node. The job is one markedJobs keeps,
+// and it reads as encoded through ha.ParseReplicaJobMarker, the reading the
+// CPI uses, so the doctor and the CPI agree on which jobs carry the marker and
+// which of those are encoded. The CPI writes the plain marker back on the
+// next set_vm_metadata or reboot_vm on the job's VM, with or without an
+// allocation journal. A CPI that predates the tolerant reader disowns the job
+// until then, so the advice also names the command that restores the plain
+// comment now. That command writes ha.DecodedMarkerComment, which is the
+// comment the CPI writes.
 func (c *haCollector) encodedMarker(j ha.ReplicaJobState) {
-	if _, encoded, ok := ha.MarkerFields(j.Comment); !ok || !encoded {
+	if m, ok := ha.ParseReplicaJobMarker(j.Comment); !ok || !m.Encoded {
 		return
 	}
 	c.rep.advise(haKindReplicaMarkerEncode, "job "+j.ID,
 		"PVE percent-encoded the comment of replication job %s again when it rewrote replication.cfg, so it "+
-			"reads %q. This CPI still reads it as its marker, but an older CPI does not, and the CPI rewrites it "+
-			"only when it next writes the job's marker. To restore it now, run pvesr update %s --comment %s",
-		j.ID, j.Comment, j.ID, haShellQuote(ha.DecodedMarkerComment(j.Comment)))
+			"reads %q. This CPI still reads it as its marker, but an older CPI does not. The CPI writes the plain "+
+			"marker back on the next set_vm_metadata or reboot_vm on VM %d, whether or not an allocation journal is "+
+			"configured. To restore it now, run pvesr update %s --comment %s",
+		j.ID, j.Comment, j.Guest, j.ID, haShellQuote(ha.DecodedMarkerComment(j.Comment)))
 }
 
 // haShellQuote quotes s as one POSIX shell word, so advice an operator pastes

@@ -2,11 +2,13 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -131,8 +133,8 @@ func TestReconcileVMReplica_WidensOverAnEncodedJob(t *testing.T) {
 	if r.pinNodes() != "pve01,pve02" {
 		t.Fatalf("pin nodes %q, want the partner added over the encoded job", r.pinNodes())
 	}
-	if r.repl.called("comment:") {
-		t.Fatalf("calls %v; a widen with no marker write of its own leaves the comment alone", r.repl.calls)
+	if got, want := r.repl.jobs[0].Comment, renderReplicaJobMarker(aaDirector, 1); got != want {
+		t.Fatalf("job comment %q, want the plain marker %q written back by the touch", got, want)
 	}
 }
 
@@ -211,4 +213,201 @@ type reencodingReplica struct{ *fakeReplica }
 
 func (f *reencodingReplica) SetComment(ctx context.Context, id, comment string) error {
 	return f.fakeReplica.SetComment(ctx, id, pveEncodedMarker(comment, 1))
+}
+
+// widenedTouch is VM 100 on its source pve01 with the pin widened to pve02
+// already, the steady state of a replicate VM, which the touch otherwise
+// leaves alone.
+func widenedTouch() (*replicaRig, pve.VMLocation) {
+	r := newReplicaRig(config.HAModeAuto)
+	r.setPin("pve01,pve02", func(c string) string { return ha.WithReplicaPartner(c, "pve02") })
+	return r, pve.VMLocation{Node: "pve01", Found: true, Tags: "bosh-cpi;" + haReplicaTag}
+}
+
+// noJournal fails the test unless the rig runs without an allocation journal,
+// which is the configuration in which no generation write ever rewrites a
+// marker.
+func noJournal(t *testing.T, r *replicaRig) {
+	t.Helper()
+	if r.deps.Config.StorageAllocationJournalDir != "" || r.deps.Config.StoragePlacementNamespace != "" {
+		t.Fatal("the rig configures an allocation journal")
+	}
+}
+
+func TestReconcileVMReplica_RewritesAnEncodedMarkerWithoutAJournal(t *testing.T) {
+	plain := renderReplicaJobMarker(aaDirector, 3)
+	for _, rounds := range []int{1, 2, 9, 12, 40} {
+		r, loc := widenedTouch()
+		noJournal(t, r)
+		r.ownEncodedJob(3, rounds)
+		if err := reconcileVMReplica(crhCtx(), r.deps, "set_vm_metadata", "100", 100, loc,
+			log.NewNopLogger()); err != nil {
+			t.Fatalf("%d rounds: unexpected error: %v", rounds, err)
+		}
+		if !slices.Equal(r.repl.calls, []string{"comment:100-0"}) || r.repl.jobs[0].Comment != plain {
+			t.Fatalf("%d rounds: calls %v comment %q, want one write of %q", rounds, r.repl.calls,
+				r.repl.jobs[0].Comment, plain)
+		}
+		if r.pinNodes() != "pve01,pve02" {
+			t.Fatalf("%d rounds: pin nodes %q; the repair changes the job's comment alone", rounds, r.pinNodes())
+		}
+	}
+}
+
+func TestReconcileVMReplica_KeepsAnUnknownMarkerFieldInTheRepair(t *testing.T) {
+	r, loc := widenedTouch()
+	plain := renderReplicaJobMarker(aaDirector, 2) + " note=kept"
+	r.repl.addJob("100-0", "pve01", "pve02", pveEncodedMarker(plain, 3))
+	if err := reconcileVMReplica(crhCtx(), r.deps, "set_vm_metadata", "100", 100, loc,
+		log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.repl.jobs[0].Comment != plain {
+		t.Fatalf("comment %q, want %q", r.repl.jobs[0].Comment, plain)
+	}
+}
+
+func TestReconcileVMReplica_RepairIsIdempotent(t *testing.T) {
+	r, loc := widenedTouch()
+	r.ownEncodedJob(1, 2)
+	for touch := 1; touch <= 3; touch++ {
+		if err := reconcileVMReplica(crhCtx(), r.deps, "set_vm_metadata", "100", 100, loc,
+			log.NewNopLogger()); err != nil {
+			t.Fatalf("touch %d: unexpected error: %v", touch, err)
+		}
+	}
+	if !slices.Equal(r.repl.calls, []string{"comment:100-0"}) ||
+		r.repl.jobs[0].Comment != renderReplicaJobMarker(aaDirector, 1) {
+		t.Fatalf("calls %v comment %q, want one write and then none", r.repl.calls, r.repl.jobs[0].Comment)
+	}
+
+	// A plain marker draws no write at all.
+	p, loc := widenedTouch()
+	p.ownJob(1)
+	if err := reconcileVMReplica(crhCtx(), p.deps, "set_vm_metadata", "100", 100, loc,
+		log.NewNopLogger()); err != nil || len(p.repl.calls) != 0 {
+		t.Fatalf("err %v calls %v, want no write for a plain marker", err, p.repl.calls)
+	}
+}
+
+func TestReconcileVMReplica_LeavesEveryOtherJobCommentAlone(t *testing.T) {
+	ownEncoded := pveEncodedMarker(renderReplicaJobMarker(aaDirector, 1), 2)
+	cases := map[string]func(r *replicaRig){
+		"another Director's encoded job on this VM": func(r *replicaRig) {
+			r.repl.addJob("100-0", "pve01", "pve02",
+				pveEncodedMarker(renderReplicaJobMarker(aaOtherDirector, 1), 2))
+		},
+		"this Director's encoded job on another VM": func(r *replicaRig) {
+			r.ownJob(1)
+			r.repl.addJob("101-0", "pve01", "pve02", ownEncoded)
+		},
+		"this Director's encoded job marked for removal": func(r *replicaRig) {
+			r.repl.addJob("100-0", "pve01", "pve02", ownEncoded)
+			r.repl.jobs[0].RemoveJob = "full"
+		},
+		"a comment with an escape PVE never writes for a marker": func(r *replicaRig) {
+			r.repl.addJob("100-0", "pve01", "pve02", "bosh%2Dcpi%3Av1 owner="+aaDirector+" gen=1")
+		},
+		"an encoded marker with no generation": func(r *replicaRig) {
+			r.repl.addJob("100-0", "pve01", "pve02", "bosh-cpi%253Av1 owner="+aaDirector)
+		},
+		"an encoded marker with a repeated generation": func(r *replicaRig) {
+			r.repl.addJob("100-0", "pve01", "pve02", "bosh-cpi%253Av1 owner="+aaDirector+" gen=1 gen=2")
+		},
+		"a marker past the decode cap": func(r *replicaRig) {
+			r.ownEncodedJob(1, ha.MaxMarkerDecodeRounds+1)
+		},
+		"two jobs of this Director on this VM": func(r *replicaRig) {
+			r.repl.addJob("100-0", "pve01", "pve02", ownEncoded)
+			r.repl.addJob("100-1", "pve01", "pve03", ownEncoded)
+		},
+	}
+	for name, setup := range cases {
+		r, loc := widenedTouch()
+		setup(r)
+		before := slices.Clone(r.repl.jobs)
+		if err := reconcileVMReplica(crhCtx(), r.deps, "set_vm_metadata", "100", 100, loc,
+			log.NewNopLogger()); err != nil {
+			t.Fatalf("%s: unexpected error: %v", name, err)
+		}
+		if r.repl.called("comment:") || !slices.Equal(r.repl.jobs, before) {
+			t.Fatalf("%s: calls %v jobs %+v; the touch must not write a comment it cannot prove is this "+
+				"Director's marker on this VM's job", name, r.repl.calls, r.repl.jobs)
+		}
+	}
+}
+
+func TestReconcileVMReplica_ARepairThatFailsLeavesTheCallAlone(t *testing.T) {
+	r, loc := widenedTouch()
+	r.ownEncodedJob(1, 2)
+	api := &failingCommentReplica{fakeReplica: r.repl}
+	r.deps.Replication = api
+	if err := reconcileVMReplica(crhCtx(), r.deps, "set_vm_metadata", "100", 100, loc,
+		log.NewNopLogger()); err != nil {
+		t.Fatalf("err %v; a repair that fails is logged and the call goes on", err)
+	}
+	if !api.tried {
+		t.Fatal("the repair never tried to write the plain marker")
+	}
+}
+
+// failingCommentReplica refuses every comment write.
+type failingCommentReplica struct {
+	*fakeReplica
+	tried bool
+}
+
+func (f *failingCommentReplica) SetComment(context.Context, string, string) error {
+	f.tried = true
+	return errors.New("connection reset")
+}
+
+func TestWritePlainReplicaMarkerUnderAJournalRecord(t *testing.T) {
+	changed := time.Now().Add(-time.Hour).Truncate(time.Second)
+	t.Run("the record's settled generation is rewritten", func(t *testing.T) {
+		r := newReplicaRig(config.HAModeManaged)
+		r.ownEncodedJob(1, 2)
+		handle := replicaHandle(t, changed)
+		got, err := writePlainReplicaMarker(crhCtx(), r.repl, log.NewNopLogger(), "set_vm_metadata", 100,
+			aaDirector, r.repl.jobs[0], handle)
+		if err != nil || got == nil || r.repl.jobs[0].Comment != renderReplicaJobMarker(aaDirector, 1) {
+			t.Fatalf("written %+v err %v comment %q", got, err, r.repl.jobs[0].Comment)
+		}
+	})
+	t.Run("a marker that differs from the record is left to the record's write", func(t *testing.T) {
+		r := newReplicaRig(config.HAModeManaged)
+		r.ownEncodedJob(2, 2)
+		handle := replicaHandle(t, changed)
+		got, err := writePlainReplicaMarker(crhCtx(), r.repl, log.NewNopLogger(), "set_vm_metadata", 100,
+			aaDirector, r.repl.jobs[0], handle)
+		if err != nil || got != nil || r.repl.called("comment:") {
+			t.Fatalf("written %+v err %v calls %v, want no write", got, err, r.repl.calls)
+		}
+	})
+	t.Run("a pending generation is left to the record's write", func(t *testing.T) {
+		r := newReplicaRig(config.HAModeManaged)
+		r.ownEncodedJob(1, 2)
+		handle := replicaHandle(t, changed)
+		if _, err := handle.PrepareReplicationJob(aj.ReplicaJob{ID: "100-0", Guest: 100, Source: "pve02",
+			Target: "pve01"}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := writePlainReplicaMarker(crhCtx(), r.repl, log.NewNopLogger(), "set_vm_metadata", 100,
+			aaDirector, r.repl.jobs[0], handle)
+		if err != nil || got != nil || r.repl.called("comment:") {
+			t.Fatalf("written %+v err %v calls %v, want no write", got, err, r.repl.calls)
+		}
+	})
+	t.Run("a job the second read no longer shows encoded is left alone", func(t *testing.T) {
+		r := newReplicaRig(config.HAModeManaged)
+		r.ownEncodedJob(1, 2)
+		stale := r.repl.jobs[0]
+		r.repl.jobs[0].Comment = renderReplicaJobMarker(aaDirector, 1)
+		handle := replicaHandle(t, changed)
+		got, err := writePlainReplicaMarker(crhCtx(), r.repl, log.NewNopLogger(), "set_vm_metadata", 100,
+			aaDirector, stale, handle)
+		if err != nil || got != nil || r.repl.called("comment:") {
+			t.Fatalf("written %+v err %v calls %v, want no write", got, err, r.repl.calls)
+		}
+	})
 }

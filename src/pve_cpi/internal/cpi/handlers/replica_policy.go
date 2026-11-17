@@ -1013,6 +1013,116 @@ func markKeptReplicaJob(
 	return nil
 }
 
+// encodedOwnedReplicaJob lists the replication jobs and returns the job of
+// guest vmid that carries owner's marker when PVE percent-encoded its comment
+// again, and nil when the guest has no such job. The job must be the guest's
+// own row, by the VMID PVE lists for it, and its decoded marker must name
+// owner, so the result is never another Director's job or a job the CPI did
+// not make. A job PVE marked for removal is left out, because pvesr deletes
+// it on its next run, and the doctor leaves it out the same way. Rows of the
+// guest that cannot be told apart are an error.
+func encodedOwnedReplicaJob(
+	ctx context.Context, api ha.ReplicationAPI, vmid int, owner string,
+) (*ha.ReplicaJobState, error) {
+	jobs, err := api.ListJobs(ctx)
+	if err != nil {
+		return nil, pve.WrapError(err)
+	}
+	owned, _, err := guestReplicaJobs(jobs, vmid, owner)
+	if err != nil || owned == nil || owned.RemoveJob != "" {
+		return nil, err
+	}
+	if m, ok := parseReplicaJobMarker(owned.Comment); !ok || !m.Encoded {
+		return nil, nil
+	}
+	return owned, nil
+}
+
+// repairTouchedReplicaMarker writes the plain form of the marker back over
+// the comment of the replicate VM's job when PVE percent-encoded it again,
+// whether or not an allocation journal is configured. Every call that touches
+// a replicate VM in HA runs it (see reconcileVMReplica), so the repair lands
+// on the next set_vm_metadata, which BOSH sends on every deploy, or reboot_vm,
+// or on an attach_disk after a failover, before more rounds of encoding can
+// pile up. It changes the comment alone, to ha.DecodedMarkerComment of what
+// PVE lists, which keeps the owner, the generation, and any other field the
+// marker holds. It writes nothing for a job that is plain already, another
+// Director's job, or a job the CPI did not make (see encodedOwnedReplicaJob).
+//
+// The first read takes no lock, so a VM whose job is plain costs one job
+// list. A VM with a journal record has the write made while the record is
+// held, after a second read, and only while the marker carries the record's
+// confirmed generation with no other one pending. Those are the conditions
+// under which no generation write can race it, because adoptSwappedReplicaJob
+// and markKeptReplicaJob write a new generation only while they hold the
+// record and rewrite an encoded marker themselves. Without a record no other
+// path writes a new generation, so the job read first is written. A failure
+// is logged and leaves the job as it is, because the CPI reads the encoded
+// marker as its own and the next call that touches the VM tries again.
+func repairTouchedReplicaMarker(
+	ctx context.Context, deps Deps, api ha.ReplicationAPI, logger *log.Logger, op, vmCID string, vmid int,
+) {
+	owner := deps.RequestDirectorUUID
+	job, err := encodedOwnedReplicaJob(ctx, api, vmid, owner)
+	if err != nil {
+		logger.Info(op+": the VM's replication job could not be read to check its marker; a later call checks "+
+			"again", log.Err(err))
+		return
+	}
+	if job == nil {
+		return
+	}
+	var written *ha.ReplicaJobState
+	err = withVMReplicaRecord(ctx, deps, vmCID, func(handle *aj.Handle) error {
+		var err error
+		written, err = writePlainReplicaMarker(ctx, api, logger, op, vmid, owner, *job, handle)
+		return err
+	})
+	switch {
+	case err != nil:
+		logger.Warn(op+": the VM's replication job keeps its encoded marker, which this CPI still reads as its "+
+			"own; a later call that touches the VM rewrites it", log.String("job", job.ID), log.Err(err))
+	case written != nil:
+		logger.Info(op+": PVE had percent-encoded the VM's replication job marker again, and the marker is "+
+			"written back in its plain form", log.String("job", written.ID), log.String("encoded", written.Comment),
+			log.String("comment", ha.DecodedMarkerComment(written.Comment)))
+	}
+}
+
+// writePlainReplicaMarker writes ha.DecodedMarkerComment over the comment of
+// job, the encoded job of this Director that encodedOwnedReplicaJob found for
+// guest vmid, and returns the job as it was before the write. handle is the
+// VM's journal record, held by the caller, or nil when the VM has none. With
+// a record the job is read again under it and written only while the record
+// holds that job settled at the marker's generation, because otherwise a
+// generation write of the record's own is due and rewrites the marker itself.
+// It returns nil when it writes nothing.
+func writePlainReplicaMarker(
+	ctx context.Context, api ha.ReplicationAPI, logger *log.Logger, op string, vmid int, owner string,
+	job ha.ReplicaJobState, handle *aj.Handle,
+) (*ha.ReplicaJobState, error) {
+	if handle != nil {
+		current, err := encodedOwnedReplicaJob(ctx, api, vmid, owner)
+		if err != nil || current == nil {
+			return nil, err
+		}
+		rep := handle.Record().Replication
+		m, _ := parseReplicaJobMarker(current.Comment)
+		if rep == nil || rep.Job == nil || rep.Retired || rep.PendingJob != nil || rep.Job.ID != current.ID ||
+			rep.Job.Generation != m.Generation {
+			logger.Info(op+": the VM's replication job marker is encoded, and the journal record does not "+
+				"hold the job settled at the marker's generation, so the record's own marker write rewrites it",
+				log.String("job", current.ID))
+			return nil, nil
+		}
+		job = *current
+	}
+	if err := api.SetComment(ctx, job.ID, ha.DecodedMarkerComment(job.Comment)); err != nil {
+		return nil, fmt.Errorf("write the plain marker into replication job %s: %w", job.ID, pve.WrapError(err))
+	}
+	return &job, nil
+}
+
 // prepareCreatedReplicaJob records the job in the VM's journal record and
 // returns the generation its marker carries, or 0 when the VM has no record.
 // A record that already holds the pending job, from an earlier attempt,
@@ -1127,6 +1237,9 @@ func reconcileTouchedVMHA(ctx context.Context, deps Deps, op, vmCID string, vmid
 // resolved for a narrowing, and a narrowing that cannot finish return a
 // retriable error, so the Director retries the call; a widening that cannot
 // finish, the profile it needs included, is logged.
+// After all of that, a job of this Director whose marker PVE percent-encoded
+// again gets its plain marker back, with or without an allocation journal
+// (see repairTouchedReplicaMarker).
 func reconcileVMReplica(ctx context.Context, deps Deps, op, vmCID string, vmid int, loc pve.VMLocation,
 	logger *log.Logger,
 ) error {
@@ -1156,6 +1269,9 @@ func reconcileVMReplica(ctx context.Context, deps Deps, op, vmCID string, vmid i
 		return nil
 	}
 	api := replicationAPIFor(deps)
+	// The marker repair runs last, so a narrowing the VM owes after a
+	// failover never waits on it.
+	defer repairTouchedReplicaMarker(ctx, deps, api, logger, op, vmCID, vmid)
 	switch loc.Node {
 	case source:
 		if finishPendingReplicaRebuild(ctx, deps, logger, op, vmCID, vmid, pin) || partner != "" {

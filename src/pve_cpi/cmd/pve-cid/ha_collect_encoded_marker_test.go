@@ -43,6 +43,8 @@ func TestMarkerParsingReadsRepeatedEncoding(t *testing.T) {
 		"bosh-cpi%253Av1 owner=- gen=1",
 		"sync 100% bosh-cpi:v1 owner=" + haDirector + " gen=4",
 		"bosh%2Dcpi%3Av1 owner=" + haDirector + " gen=4",
+		"bosh-cpi%253Av1 owner=" + haDirector + " gen=4 gen=5",
+		"bosh-cpi%253Av1 owner=" + haDirector + " owner=" + haDirector + " gen=4",
 	} {
 		if haJobMarker(comment) {
 			t.Errorf("haJobMarker(%q) = true, want no marker", comment)
@@ -56,7 +58,8 @@ func TestMarkerParsingReadsRepeatedEncoding(t *testing.T) {
 // recoverable, and says that PVE rewrote the comment.
 func TestCollectJudgesJobsWhoseMarkerPVEEncodedAgain(t *testing.T) {
 	t.Parallel()
-	for rounds := 1; rounds <= 3; rounds++ {
+	// Twelve rounds is past the eight the reader once stopped at.
+	for _, rounds := range []int{1, 2, 3, 12} {
 		f := replicaFake()
 		f.jobs[0].Comment = pveEncoded(haMarker+" gen=1", rounds)
 		f.status["101-0"] = ha.ReplicaSyncStatus{LastSync: haNow.Add(-time.Hour), FailCount: 1, Error: "no route"}
@@ -65,8 +68,17 @@ func TestCollectJudgesJobsWhoseMarkerPVEEncodedAgain(t *testing.T) {
 		want(t, r, haKindReplicaJobStale, haSeverityProblem, "101-0")
 		want(t, r, haKindReplicaMarkerEncode, haSeverityAdvice, "101-0",
 			"pvesr update 101-0 --comment '"+haMarker+" gen=1'")
+		want(t, r, haKindReplicaMarkerEncode, haSeverityAdvice, "101-0",
+			"whether or not an allocation journal is configured")
 		wantNone(t, r, haKindReplicaNotRecover)
 	}
+
+	// A marker the CPI cannot vouch for, such as one with a repeated
+	// generation, is no job of the CPI's, so the CPI never rewrites it and the
+	// doctor draws no advice that says it will.
+	d := replicaFake()
+	d.jobs[0].Comment = pveEncoded(haMarker+" gen=1 gen=2", 2)
+	wantNone(t, runCollect(t, d, haCfg("auto", "replicate")), haKindReplicaMarkerEncode)
 
 	// A comment PVE never encoded again draws no advice.
 	wantNone(t, runCollect(t, replicaFake(), haCfg("auto", "replicate")), haKindReplicaMarkerEncode)

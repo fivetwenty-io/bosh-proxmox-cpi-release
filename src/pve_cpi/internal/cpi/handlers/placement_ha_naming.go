@@ -22,7 +22,7 @@ const haHashLen = 12
 
 // haUnsetField stands in for a marker field the caller cannot name, such as the
 // deployment of a node-affinity pin, so every marker keeps all three fields.
-const haUnsetField = "-"
+const haUnsetField = ha.MarkerUnset
 
 // haIdentity names the BOSH instance group a rule serves and the Director that
 // owns it. Owner is the Director UUID, and the CPI edits or deletes only the
