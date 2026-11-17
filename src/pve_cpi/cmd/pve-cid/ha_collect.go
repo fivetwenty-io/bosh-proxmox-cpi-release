@@ -156,6 +156,8 @@ type haCollector struct {
 
 	resources   map[string]HAResourceRow
 	resourcesOK bool
+	states      map[string]string
+	statesOK    bool
 	rules       []ha.Rule
 	rulesOK     bool
 	guests      []*haGuest
@@ -227,6 +229,7 @@ func collectHAScoped(ctx context.Context, r HAReader, cfg *config.CPIConfig, own
 	c.cpuFindings()
 	c.protectionFindings()
 	c.maintenanceStrandedFindings()
+	c.recoveryStrandedFindings()
 	c.replicationFindings()
 	c.headroomFindings()
 	c.leftoverFindings()
@@ -280,6 +283,7 @@ func (c *haCollector) fillProfile() {
 // readSources reads the cluster objects the later checks share.
 func (c *haCollector) readSources() {
 	c.readResources()
+	c.readServiceStates()
 	c.readRules()
 	c.readGuests()
 	c.readStorages()
@@ -298,6 +302,15 @@ func (c *haCollector) readResources() {
 		c.resources[row.SID] = row
 	}
 	c.resourcesOK = true
+}
+
+func (c *haCollector) readServiceStates() {
+	states, err := c.r.ServiceStates(c.ctx)
+	if err != nil {
+		c.rep.unchecked("ha-service-state", "the HA manager status could not be read, so services waiting in recovery are unchecked: %v", err)
+		return
+	}
+	c.states, c.statesOK = states, true
 }
 
 func (c *haCollector) readRules() {
@@ -844,6 +857,33 @@ func (c *haCollector) maintenanceStrandedFindings() {
 		c.rep.problem(haKindMaintenanceStranded, g.sid,
 			"%s is still running on %s, which is in maintenance, so the node's HA agent can't restart until it moves or stops%s",
 			g.sid, g.ref.Node, why)
+	}
+}
+
+// recoveryStrandedFindings reports each HA VM the HA manager holds in the
+// recovery state. After a node fails and is fenced, the manager recovers each
+// of its services onto another node, and one with no admissible node stays in
+// recovery until one appears. A manager status that could not be read is
+// already reported as unchecked, so this check says nothing in that case.
+func (c *haCollector) recoveryStrandedFindings() {
+	if c.off() || !c.guestsOK || !c.resourcesOK || !c.statesOK {
+		return
+	}
+	for _, g := range c.guests {
+		if !g.owned || g.ref.Template || g.resource == nil || !c.judgesVM(g) {
+			continue
+		}
+		if !strings.EqualFold(c.states[g.sid], "recovery") {
+			continue
+		}
+		why := ""
+		if pin := c.pinOf(g.ref.VMID); c.rulesOK && pin != nil && len(pin.Nodes) == 1 {
+			if _, onIt := pin.Nodes[g.ref.Node]; onIt {
+				why = fmt.Sprintf(", because its strict pin names only %s", g.ref.Node)
+			}
+		}
+		c.rep.problem(haKindRecoveryStranded, g.sid,
+			"%s was on %s and waits in recovery with no node it may run on%s", g.sid, g.ref.Node, why)
 	}
 }
 

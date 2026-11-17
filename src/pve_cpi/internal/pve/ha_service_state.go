@@ -612,6 +612,32 @@ func readEntryTime(ctx context.Context, nodesAPI NodeHealthNodes, entry string) 
 	return now, err
 }
 
+// ReadHAServiceStates returns the raw CRM state of every service in manager
+// status, keyed by service ID such as vm:100. A service whose entry does not
+// parse or carries no state is left out, so a caller never reads a state the
+// CRM did not report. A cluster whose manager status is empty returns an empty
+// map.
+func ReadHAServiceStates(ctx context.Context, clusterAPI NodeHealthCluster) (map[string]string, error) {
+	if clusterAPI == nil {
+		return nil, cpierrors.Cloud("ReadHAServiceStates: cluster client must not be nil")
+	}
+	mgr, err := readHAManagerStatus(ctx, clusterAPI)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(mgr.services))
+	for sid, raw := range mgr.services {
+		var wire struct {
+			State string `json:"state"`
+		}
+		if json.Unmarshal(raw, &wire) != nil || wire.State == "" {
+			continue
+		}
+		out[sid] = wire.State
+	}
+	return out, nil
+}
+
 // haManagerView is what ReadHAServiceState keeps from manager status. It holds
 // the service_status entries that node health does not read.
 type haManagerView struct {

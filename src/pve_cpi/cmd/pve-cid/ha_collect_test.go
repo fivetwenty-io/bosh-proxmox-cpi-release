@@ -466,6 +466,46 @@ func TestCollectMaintenanceStrandedUnreadableStatus(t *testing.T) {
 	wantNone(t, r, haKindMaintenanceStranded)
 }
 
+func recoveryFake() *fakeHA {
+	f := haBaseFake()
+	f.states = map[string]string{"vm:100": "recovery"}
+	return f
+}
+
+func TestCollectRecoveryStranded(t *testing.T) {
+	t.Parallel()
+	f := recoveryFake()
+	r := runCollect(t, f, haCfg("auto", "none"))
+	want(t, r, haKindRecoveryStranded, haSeverityProblem, "vm:100", "n1", "waits in recovery", "no node it may run on")
+	wantNone(t, r, haKindUnchecked)
+	// A pin to the failed node alone is named as the reason.
+	f.rules = []ha.Rule{pinRule(100, haMarker, "n1")}
+	want(t, runCollect(t, f, haCfg("auto", "none")), haKindRecoveryStranded, haSeverityProblem, "strict pin names only n1")
+}
+
+func TestCollectRecoveryStrandedSkipsStartedService(t *testing.T) {
+	t.Parallel()
+	f := recoveryFake()
+	f.states["vm:100"] = "started"
+	wantNone(t, runCollect(t, f, haCfg("auto", "none")), haKindRecoveryStranded)
+}
+
+func TestCollectRecoveryStrandedSkipsOutOfScope(t *testing.T) {
+	t.Parallel()
+	f := recoveryFake()
+	f.guests[0].Tags = "bosh-cpi;bosh-ha-managed;bosh-owner--bbbbbbbb-0000"
+	wantNone(t, runCollect(t, f, haCfg("auto", "none")), haKindRecoveryStranded)
+}
+
+func TestCollectRecoveryStrandedUnreadableStatus(t *testing.T) {
+	t.Parallel()
+	f := recoveryFake()
+	f.states, f.statesErr = nil, errors.New("manager status unreadable")
+	r := runCollect(t, f, haCfg("auto", "none"))
+	want(t, r, haKindUnchecked, haSeverityProblem, "ha-service-state", "manager status unreadable")
+	wantNone(t, r, haKindRecoveryStranded)
+}
+
 func TestCollectHoldBlocksMaintenance(t *testing.T) {
 	t.Parallel()
 	f := haBaseFake()

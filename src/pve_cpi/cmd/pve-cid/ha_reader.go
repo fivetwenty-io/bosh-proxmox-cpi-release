@@ -49,6 +49,9 @@ type HAReader interface {
 	Profile(ctx context.Context) (*ha.Profile, error)
 	// Resources lists the HA resources.
 	Resources(ctx context.Context) ([]HAResourceRow, error)
+	// ServiceStates returns the raw state the HA manager reports for each
+	// service by service ID, such as recovery or started.
+	ServiceStates(ctx context.Context) (map[string]string, error)
 	// Rules lists the HA rules.
 	Rules(ctx context.Context) ([]ha.Rule, error)
 	// Guests lists every QEMU guest of the cluster from the authoritative
@@ -168,6 +171,17 @@ func (r *pveHAReader) Resources(ctx context.Context) ([]HAResourceRow, error) {
 		out = append(out, HAResourceRow{SID: row.SID, State: pve.HARequestedState(row.State), Comment: row.Comment})
 	}
 	return out, nil
+}
+
+func (r *pveHAReader) ServiceStates(ctx context.Context) (map[string]string, error) {
+	if err := r.ready(); err != nil {
+		return nil, err
+	}
+	states, err := pve.ReadHAServiceStates(ctx, r.client.Cluster())
+	if err != nil {
+		return nil, fmt.Errorf("read HA manager status: %w", err)
+	}
+	return states, nil
 }
 
 func (r *pveHAReader) Rules(ctx context.Context) ([]ha.Rule, error) {

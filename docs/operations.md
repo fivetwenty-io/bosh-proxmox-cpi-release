@@ -724,7 +724,7 @@ Each finding is either a problem or advice. The command exits with 0 when the re
   `rule_problem`, `rule_unmarked`, `pin_missing`, `anti_affinity_skipped`, `anti_affinity_split`, `anti_affinity_short`, `resource_ignored`, and `managed_without_resource`.
 
 - CPU and local storage
-  `cpu_unknown`, `cpu_host_multi_domain`, `cpu_domain_too_small`, `local_unprotected`, `hold_blocks_maintenance`, and `maintenance_stranded`.
+  `cpu_unknown`, `cpu_host_multi_domain`, `cpu_domain_too_small`, `local_unprotected`, `hold_blocks_maintenance`, `maintenance_stranded`, and `recovery_stranded`.
 
 - Replication
   `replica_on_partner`, `replica_awaiting_sync`, `replica_not_recoverable`, `replica_job_stale`, `replica_job_failing`, `replica_schedule_unjudged`, `replica_marker_encoded`, `replica_orphan_volume`, `replica_recorded_orphan`, `replica_gone_vm_volume`, `replica_superseded_copy`, and `replica_journal_unconfigured`.

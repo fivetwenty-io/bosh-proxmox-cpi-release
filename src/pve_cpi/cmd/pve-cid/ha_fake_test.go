@@ -26,6 +26,8 @@ type fakeHA struct {
 
 	resources    []HAResourceRow
 	resourcesErr error
+	states       map[string]string
+	statesErr    error
 	rules        []ha.Rule
 	rulesErr     error
 
@@ -71,6 +73,10 @@ func (f *fakeHA) Profile(context.Context) (*ha.Profile, error) { return f.profil
 
 func (f *fakeHA) Resources(context.Context) ([]HAResourceRow, error) {
 	return f.resources, f.resourcesErr
+}
+
+func (f *fakeHA) ServiceStates(context.Context) (map[string]string, error) {
+	return f.states, f.statesErr
 }
 
 func (f *fakeHA) Rules(context.Context) ([]ha.Rule, error) { return f.rules, f.rulesErr }
