@@ -105,18 +105,23 @@ type NodeConstraint struct {
 	// Nodes lists the nodes that meet it.
 	Nodes []string
 
-	// Pin marks the strict pin of a VM that already runs under HA, which
-	// bounds the decision like any other constraint. A VM whose node lies
-	// outside its own pin was moved there outside the CPI, so the decision
-	// defers with a retriable error and writes nothing, rather than take the
-	// VM out of HA for a state that a migration back or a wider pin ends.
+	// Pin marks the strict pin of a VM that already runs under HA. The pin is
+	// where such a VM carries the operator's strict AZ, which no later call
+	// can read from the VM's cloud properties, so it bounds the decision the
+	// way a strict AZ does (see strictBound). It narrows the hard admissible
+	// set after the shared check, and it never narrows the access set the
+	// shared check counts. A VM that create_vm registered with a strict pin
+	// to a one-node AZ therefore stays eligible as shared when a later call
+	// decides it again. A VM whose node lies outside its own pin was moved
+	// there outside the CPI, so the decision defers with a retriable error
+	// and writes nothing, rather than take the VM out of HA for a state that
+	// a migration back or a wider pin ends.
 	//
 	// The replicate policy is the one exception. Its pin names the source
 	// alone until a sync is verified, so a pin that names only the VM's node
 	// says where the VM runs and nothing about where its replica lives, and
 	// it does not bound the replica's partner. A pin that names more nodes
-	// names the partner it keeps, and it bounds the partner like any other
-	// constraint.
+	// names the partner it keeps, and it bounds the partner like a strict AZ.
 	Pin bool
 }
 
@@ -681,16 +686,21 @@ func (s storageIndex) Get(_ context.Context, name string) (pve.StorageInfo, erro
 	return info, nil
 }
 
-// narrow returns the access set of volumes, narrowed by the node constraints.
-// VolumeAccessSet reads an in-memory storage index and never uses its context,
-// so the background context never waits, and DecideVM stays a pure function
-// with no context parameter.
+// narrow returns the access set of volumes, narrowed by the hardware and
+// network constraints. The VM's own strict pin is not one of them, because it
+// bounds the admissible set after the shared check, as a strict AZ does (see
+// strictBound). VolumeAccessSet reads an in-memory storage index and never
+// uses its context, so the background context never waits, and DecideVM stays
+// a pure function with no context parameter.
 func (e *eligibility) narrow(getter pve.StorageInfoGetter, volumes []pve.AccessVolume) ([]string, error) {
 	access, err := pve.VolumeAccessSet(context.Background(), getter, e.members, volumes)
 	if err != nil {
 		return nil, err
 	}
 	for _, c := range e.in.Constraints {
+		if c.Pin {
+			continue
+		}
 		access = intersect(access, c.Nodes)
 	}
 	return access, nil
@@ -840,16 +850,13 @@ func (e *eligibility) localLinkedClones(classes []*volumeClass) []string {
 }
 
 // register ends the decision with a registration whose hard constraints are
-// hard intersected with the strict AZ, the node constraints, and the placed
-// node.
+// hard, narrowed by the strict AZ and the VM's own strict pin (see
+// strictBound), and checked against the placed node.
 func (e *eligibility) register(policy Policy, hard []string, reason string) {
-	set := append([]string{}, hard...)
-	if az := e.strictAZ(); az != nil {
-		set = intersect(set, az)
-	}
+	set := e.strictBound(hard, false)
 	if len(set) == 0 {
 		e.refuse(cpierrors.Cloud("VM %d has an empty hard admissible set: its volumes, hardware, CPU model, and "+
-			"availability zone %q leave no node that satisfies all of them", e.in.VMID, e.in.AZ), false)
+			"%s leave no node that satisfies all of them", e.in.VMID, e.boundName()), false)
 		return
 	}
 	if !contains(set, e.d.Node) {
@@ -869,6 +876,45 @@ func (e *eligibility) register(policy Policy, hard []string, reason string) {
 		e.d.Preferred = az
 	}
 	e.d.Priorities = e.priorities()
+}
+
+// strictBound narrows nodes by the operator's strict AZ and by the VM's own
+// strict pin. It is the one place where either enters a decision, and it runs
+// after the shared check, so a strict AZ never decides whether the VM's volumes
+// let it run as shared. create_vm states the AZ through VMInput.AZNodes, and a
+// later call that decides a VM under HA again states it through the VM's
+// strict pin, which create_vm wrote from the same AZ. The two calls therefore
+// reach the same decision for the same VM, storage, and settings. Under the
+// replicate policy, replica says the nodes are where the replica may live, and
+// a pin that names only the VM's node does not bound them (see
+// NodeConstraint.Pin).
+func (e *eligibility) strictBound(nodes []string, replica bool) []string {
+	out := append([]string{}, nodes...)
+	if az := e.strictAZ(); az != nil {
+		out = intersect(out, az)
+	}
+	for _, c := range e.in.Constraints {
+		if !c.Pin || (replica && sourceOnlyPin(c.Nodes, e.d.Node)) {
+			continue
+		}
+		out = intersect(out, c.Nodes)
+	}
+	return out
+}
+
+// boundName names what strictBound narrows by, for an error: the VM's AZ, and
+// its own strict pin when the decision has one.
+func (e *eligibility) boundName() string {
+	name := fmt.Sprintf("availability zone %q", e.in.AZ)
+	for _, c := range e.in.Constraints {
+		if c.Pin {
+			if e.in.AZ == "" {
+				return c.Name
+			}
+			return name + " and " + c.Name
+		}
+	}
+	return name
 }
 
 // strictAZ returns the nodes of a strict AZ, or nil when the AZ is not a hard
@@ -1023,21 +1069,19 @@ func (e *eligibility) decideReplicate(
 		return
 	}
 	e.d.Partner = partner
-	e.d.Widened = normalizeNodes([]string{e.d.Node, partner})
-	if az := e.strictAZ(); az != nil {
-		e.d.Widened = intersect(e.d.Widened, az)
-	}
+	e.d.Widened = e.strictBound(normalizeNodes([]string{e.d.Node, partner}), true)
 }
 
 // replicaCandidates returns the nodes a replica may live on before the volumes
-// narrow them: every node the constraints and the CPU domain allow, restricted
-// to the strict AZ. The VM's own pin bounds them only when it names more than
-// the VM's node, because the source-only pin the replicate policy writes says
-// nothing about where the replica lives (see NodeConstraint.Pin).
+// narrow them: every node the constraints and the CPU domain allow, bounded by
+// the strict AZ and the VM's own pin (see strictBound). The pin bounds them
+// only when it names more than the VM's node, because the source-only pin the
+// replicate policy writes says nothing about where the replica lives (see
+// NodeConstraint.Pin).
 func (e *eligibility) replicaCandidates(domain []string) []string {
 	out := append([]string{}, e.members...)
 	for _, c := range e.in.Constraints {
-		if c.Pin && sourceOnlyPin(c.Nodes, e.d.Node) {
+		if c.Pin {
 			continue
 		}
 		out = intersect(out, c.Nodes)
@@ -1045,9 +1089,7 @@ func (e *eligibility) replicaCandidates(domain []string) []string {
 	if domain != nil {
 		out = intersect(out, domain)
 	}
-	if az := e.strictAZ(); az != nil {
-		out = intersect(out, az)
-	}
+	out = e.strictBound(out, true)
 	sort.Strings(out)
 	return out
 }
