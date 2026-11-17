@@ -756,6 +756,11 @@ func (c *haCollector) protectionFindings() {
 		if !g.owned || g.ref.Template || g.cfg == nil || !c.judgesVM(g) {
 			continue
 		}
+		// A parker holds detached disks by design and is stopped, so it is never
+		// an unprotected VM.
+		if g.hasTag(pve.ParkerTag) {
+			continue
+		}
 		local := c.localVolumes(g)
 		if len(local) == 0 {
 			continue

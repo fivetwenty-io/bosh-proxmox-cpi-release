@@ -393,6 +393,15 @@ func TestCollectLocalUnprotected(t *testing.T) {
 	wantNone(t, runCollect(t, f, haCfg("auto", "hold")), haKindLocalUnprotected)
 }
 
+func TestCollectLocalUnprotectedSkipsParker(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	localVM(f, "n2", "bosh-cpi")
+	want(t, runCollect(t, f, haCfg("auto", "hold")), haKindLocalUnprotected, haSeverityProblem, "vm:101")
+	f.guests[1].Tags = "bosh-cpi;" + pve.ParkerTag
+	wantNone(t, runCollect(t, f, haCfg("auto", "hold")), haKindLocalUnprotected)
+}
+
 func TestCollectHoldBlocksMaintenance(t *testing.T) {
 	t.Parallel()
 	f := haBaseFake()
