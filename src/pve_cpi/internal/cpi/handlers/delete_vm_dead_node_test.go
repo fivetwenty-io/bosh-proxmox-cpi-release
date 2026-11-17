@@ -79,7 +79,10 @@ type deadNodeCluster struct {
 	failListRules bool
 	// ruleErrors adds PVE feasibility errors to the named rule on every read.
 	ruleErrors map[string]string
-	// onRulesRead runs before every rules read with its count.
+	// onRulesRead runs before every rules read with its count. The gate's
+	// grace window deferral reads the rules once to word its error, so the
+	// completion's first read is read 2 and its read under the rules lock is
+	// read 3.
 	onRulesRead func(n int)
 	rulesReads  int
 }
@@ -725,7 +728,7 @@ func TestDeadNodeDelete_RefusalsWriteNothing(t *testing.T) {
 func TestDeadNodeDelete_NodeComesBackBeforeTheRuleEdits(t *testing.T) {
 	f := newDeadNodeDelete(t)
 	f.cluster.onRulesRead = func(n int) {
-		if n == 1 {
+		if n == 2 {
 			f.scene.Do(func(s *handlers.HADeleteScene) {
 				s.Offline[deadNode] = false
 				s.NodeState[deadNode] = "online"
@@ -744,7 +747,7 @@ func TestDeadNodeDelete_NodeComesBackBeforeTheRuleEdits(t *testing.T) {
 func TestDeadNodeDelete_NewRecoveryEpisodeBeforeTheRuleEdits(t *testing.T) {
 	f := newDeadNodeDelete(t)
 	f.cluster.onRulesRead = func(n int) {
-		if n == 1 {
+		if n == 2 {
 			f.scene.Do(func(s *handlers.HADeleteScene) {
 				svc := s.Services["vm:101"]
 				svc.UID = "uid-202"
@@ -762,7 +765,7 @@ func TestDeadNodeDelete_NewRecoveryEpisodeBeforeTheRuleEdits(t *testing.T) {
 func TestDeadNodeDelete_RulesChangeBeforeTheRuleEdits(t *testing.T) {
 	f := newDeadNodeDelete(t)
 	f.cluster.onRulesRead = func(n int) {
-		if n == 2 {
+		if n == 3 {
 			f.scene.Do(func(s *handlers.HADeleteScene) {
 				s.Rules["operator-pin"] = map[string]any{"type": "node-affinity", "resources": "vm:101",
 					"nodes": "pve-node1"}

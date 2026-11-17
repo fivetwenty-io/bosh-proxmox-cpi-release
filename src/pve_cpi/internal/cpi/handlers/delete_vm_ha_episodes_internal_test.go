@@ -101,7 +101,7 @@ func TestRecoveryGraceWindowRunsOutAcrossCallsWithAMissingOverride(t *testing.T)
 		t.Fatalf("the earlier retry's record must be in the temporary layer: %v", err)
 	}
 
-	err := haRecoveryGraceError(deps, "delete_vm", st, "the node is fenced", logger)
+	err := haRecoveryGraceError(t.Context(), deps, "delete_vm", st, "the node is fenced", logger)
 	if err == nil || !strings.Contains(err.Error(), "grace window expired") {
 		t.Fatalf("a window started twenty minutes ago must be expired, got %v", err)
 	}

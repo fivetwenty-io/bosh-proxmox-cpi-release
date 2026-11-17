@@ -76,6 +76,14 @@ type HADeleteScene struct {
 	Comments map[string]string
 	// Power is each VM's power state on its node; a missing VM is running.
 	Power map[int]string
+	// Uptime is each running VM's uptime in seconds, as status/current
+	// reports it. A running VM without one has run for an hour, and a VM
+	// that is not running reports none.
+	Uptime map[int]int64
+	// StatusErr fails every status/current read when set.
+	StatusErr error
+	// StatusReads counts the status/current reads.
+	StatusReads int
 	// IndexNode and IndexHAState are the /cluster/resources row of each VM.
 	// A VM without an index node is absent from the index.
 	IndexNode    map[int]string
@@ -150,6 +158,7 @@ func NewHADeleteScene() *HADeleteScene {
 		StateWire:    map[string]string{},
 		Comments:     map[string]string{},
 		Power:        map[int]string{},
+		Uptime:       map[int]int64{},
 		IndexNode:    map[int]string{},
 		IndexHAState: map[int]string{},
 		IndexLock:    map[int]string{},
@@ -843,7 +852,20 @@ type HASceneQEMU struct {
 func (q *HASceneQEMU) Status(_ context.Context, _ string, vmid int) (map[string]any, error) {
 	q.Scene.mu.Lock()
 	defer q.Scene.mu.Unlock()
-	return map[string]any{"status": q.Scene.powerOf(vmid)}, nil
+	q.Scene.StatusReads++
+	if q.Scene.StatusErr != nil {
+		return nil, q.Scene.StatusErr
+	}
+	power := q.Scene.powerOf(vmid)
+	out := map[string]any{"status": power}
+	if power == "running" {
+		uptime, held := q.Scene.Uptime[vmid]
+		if !held {
+			uptime = 3600
+		}
+		out["uptime"] = uptime
+	}
+	return out, nil
 }
 
 // Config serves a VM config the scene holds, a copy so a caller's edit never

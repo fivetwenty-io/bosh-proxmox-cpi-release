@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
 
 // Raw CRM states and node states the delete reads by name. The normalized model
@@ -196,6 +198,9 @@ func gateHADeleteState(
 						"retry so the delete runs against the node that holds it", caller, vmid, st.SID, st.Node, node)
 			}
 			logHADeleteState(logger, caller, st, disp, reason)
+			if err := awaitHARecoverySettle(ctx, deps, caller, st, logger); err != nil {
+				return nil, err
+			}
 			return st, nil
 
 		case pve.HAWaitForMotion:
@@ -241,19 +246,24 @@ func gateHADeleteState(
 			}
 
 		default:
-			return nil, haDeleteRefusal(deps, caller, st, disp, reason, logger)
+			return nil, haDeleteRefusal(ctx, deps, caller, st, disp, reason, logger)
 		}
 	}
 }
 
 // haDeleteRefusal is the retriable error for an HA state that neither lets
-// the delete proceed nor is motion the delete waits out.
+// the delete proceed nor is motion the delete waits out. A delete_vm that it
+// defers for fence, a dead node, or recovery is recorded first, so a later
+// delete_vm can let the VM settle once PVE HA restarts it (see
+// awaitHARecoverySettle).
 func haDeleteRefusal(
-	deps Deps, caller string, st *pve.HAServiceState, disp pve.HADisposition, reason string, logger *log.Logger,
+	ctx context.Context, deps Deps, caller string, st *pve.HAServiceState, disp pve.HADisposition, reason string,
+	logger *log.Logger,
 ) error {
+	recordHARecoveryDeferral(deps, caller, st, disp, logger)
 	switch disp {
 	case pve.HAGraceWindow:
-		return haRecoveryGraceError(deps, caller, st, reason, logger)
+		return haRecoveryGraceError(ctx, deps, caller, st, reason, logger)
 	case pve.HADefer:
 		logHADeleteState(logger, caller, st, disp, reason)
 		return cpierrors.Retriable(
@@ -290,7 +300,7 @@ func haDeferralForUnreadableConfig(
 	if disp == pve.HAProceed {
 		return nil
 	}
-	return deferHA(haDeleteRefusal(deps, caller, st, disp, reason, logger))
+	return deferHA(haDeleteRefusal(ctx, deps, caller, st, disp, reason, logger))
 }
 
 // logHADeleteState records the HA reading a delete acted on.
@@ -312,8 +322,12 @@ func logHADeleteState(logger *log.Logger, caller string, st *pve.HAServiceState,
 // Once it expires the expiry is logged, and the deferral stands unless the
 // dead-node completion takes over. The error after the expiry is the one the
 // operator reads when the completion cannot start, so it says what the
-// completion needs and what the operator can do instead.
-func haRecoveryGraceError(deps Deps, caller string, st *pve.HAServiceState, reason string, logger *log.Logger) error {
+// completion needs and what the operator can do instead. A VM whose strict pin
+// admits the dead node alone can be recovered nowhere else, so for it both
+// texts say that PVE HA restarts it in place once the node returns.
+func haRecoveryGraceError(
+	ctx context.Context, deps Deps, caller string, st *pve.HAServiceState, reason string, logger *log.Logger,
+) error {
 	window := haMotionWait(deps)
 	ep, recErr := haEpisodes(deps, logger).Observe(st.SID, st.UID)
 	if recErr != nil {
@@ -325,14 +339,34 @@ func haRecoveryGraceError(deps Deps, caller string, st *pve.HAServiceState, reas
 		log.String("sid", st.SID), log.String("uid", st.UID), log.String("ha_node", st.Node),
 		log.String("elapsed", elapsed.Round(time.Second).String()), log.String("window", window.String()),
 	}
+	pinnedAlone := haPinnedToNodeAlone(ctx, deps, caller, st, logger)
 	if elapsed < window {
 		logger.Info(caller+": VM is in HA recovery; the grace window is running", fields...)
+		if pinnedAlone {
+			return cpierrors.Retriable(
+				"%s: VM %d deferred: %s. Its strict HA pin admits node %s alone, so PVE HA cannot recover it onto "+
+					"another node and restarts it in place once the node returns. %s of the %s grace window remain, "+
+					"and the delete keeps deferring while the window runs and after it expires for the same reason. "+
+					"After PVE HA restarts the VM, the delete waits up to %s of uptime so its agent can answer",
+				caller, st.VMID, reason, st.Node, (window - elapsed).Round(time.Second), window,
+				haRecoverySettleWindow)
+		}
 		return cpierrors.Retriable(
 			"%s: VM %d deferred: %s. PVE HA is still trying to recover it, and %s of the %s grace window remain; "+
 				"the delete keeps deferring while the window runs and proceeds once PVE HA has recovered the VM "+
 				"onto a live node", caller, st.VMID, reason, (window - elapsed).Round(time.Second), window)
 	}
 	logger.Warn(caller+": the HA recovery grace window expired", fields...)
+	if pinnedAlone {
+		return cpierrors.Retriable(
+			"%s: VM %d deferred: %s, and the %s grace window expired %s ago. Its strict HA pin admits node %s "+
+				"alone, so no live node can take the VM's config, and PVE HA restarts the VM in place once the "+
+				"node returns. This call keeps deferring until then, and after the restart the delete waits up to "+
+				"%s of uptime so the VM's agent can answer. Check 'ha-manager status' for %s, and bring node %s "+
+				"back online",
+			caller, st.VMID, reason, window, (elapsed - window).Round(time.Second), st.Node,
+			haRecoverySettleWindow, st.SID, st.Node)
+	}
 	return cpierrors.Retriable(
 		"%s: VM %d deferred: %s, and the %s grace window expired %s ago without PVE HA recovering it. Past the "+
 			"window, the delete_vm of a VM the storage allocation journal does not record completes once a fresh "+
@@ -341,6 +375,48 @@ func haRecoveryGraceError(deps Deps, caller string, st *pve.HAServiceState, reas
 			"'ha-manager status' for %s. The next retry tries again, and it proceeds at once if PVE HA recovers "+
 			"the VM or the node comes back",
 		caller, st.VMID, reason, window, (elapsed - window).Round(time.Second), st.SID)
+}
+
+// haPinRulesReadTimeout bounds the one read of the HA rules that words a grace
+// window deferral, so a slow cluster never holds the deferral up.
+const haPinRulesReadTimeout = 15 * time.Second
+
+// haPinnedToNodeAlone reports whether the VM's node-affinity pin is an
+// enabled, strict, positive rule that PVE reports no errors for, holds the
+// VM's service, and names the service's node and no other. It reads the rules
+// best effort, so a read that fails or a client with no cluster API reports
+// false, and the caller keeps the general text.
+func haPinnedToNodeAlone(
+	ctx context.Context, deps Deps, caller string, st *pve.HAServiceState, logger *log.Logger,
+) bool {
+	if deps.PVE == nil || st == nil || st.Node == "" {
+		return false
+	}
+	svc := deps.PVE.Cluster()
+	if svc == nil {
+		return false
+	}
+	readCtx, cancel := context.WithTimeout(ctx, haPinRulesReadTimeout)
+	defer cancel()
+	resp, err := svc.ListHaRules(readCtx, &cluster.ListHaRulesParams{})
+	if err != nil {
+		logger.Debug(caller+": the HA rules could not be read to word the grace window deferral",
+			log.String("sid", st.SID), log.Err(err))
+		return false
+	}
+	set, err := ha.ParseRuleList(resp)
+	if err != nil {
+		logger.Debug(caller+": the HA rules could not be parsed to word the grace window deferral",
+			log.String("sid", st.SID), log.Err(err))
+		return false
+	}
+	rule := set.Find(naRuleNameFor(st.VMID))
+	if rule == nil || rule.Type != ha.RuleTypeNodeAffinity || rule.Affinity != ha.AffinityPositive ||
+		!rule.Strict || rule.Disabled || len(rule.Errors) > 0 || !slices.Contains(rule.Resources, st.SID) {
+		return false
+	}
+	_, named := rule.Nodes[st.Node]
+	return named && len(rule.Nodes) == 1
 }
 
 // haDeleteSysConsole reports whether the token holds Sys.Console on /, which

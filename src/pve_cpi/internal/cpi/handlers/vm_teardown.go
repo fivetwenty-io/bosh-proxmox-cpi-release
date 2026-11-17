@@ -177,7 +177,7 @@ func (t *vmTeardown) settleHAGate(ctx context.Context, deps Deps) error {
 		}
 		disp, reason := st.Disposition()
 		if disp != pve.HAProceed {
-			return deferHA(haDeleteRefusal(deps, t.caller, st, disp, reason, t.logger))
+			return deferHA(haDeleteRefusal(ctx, deps, t.caller, st, disp, reason, t.logger))
 		}
 		if st.Node != t.node {
 			return deferHA(cpierrors.Retriable(
