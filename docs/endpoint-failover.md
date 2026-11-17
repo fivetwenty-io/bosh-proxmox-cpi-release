@@ -127,6 +127,8 @@ In this table, a hop means moving the same request to the next endpoint. A tethe
 
 A status moves a read only when the entry node caused it. The transport treats a response as caused by the entry node when the path names no node, such as `/cluster/resources`, or when the path's node segment is the entry endpoint's own node. A 595 for `/nodes/pve3/...` while `pve3` is down says nothing about the entry node, because every entry would answer the same way, so the response comes back and the entry stays where it is.
 
+A 500 is an answer, so the transport never moves a read on one, because PVE also answers 500 for ordinary failures such as a VM config that doesn't exist. That leaves one case the transport can't see. An entry node that systemd is shutting down keeps answering and serves every cluster read, but node-local commands on it fail with a 500. The HA view is the one read that depends on the entry node's own state, through its clock, and in that case it reads another member's clock, as [When `delete_vm` defers](ha-and-resurrection.md#when-delete_vm-defers) describes. Every other call goes on through that entry node until it stops answering.
+
 ### How long a walk can take
 
 A walk ends when a request gets an answer, when it has made four hops, or when it has tried every eligible endpoint once. It also has two time budgets, and the transport checks both before it starts each hop after the first. It starts no new hop once the walk has spent 30 seconds connecting, and it starts none once 90 seconds have passed since the walk began. A hop that has already started finishes.

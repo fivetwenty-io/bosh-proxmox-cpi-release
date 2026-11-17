@@ -762,6 +762,8 @@ A deferred `delete_vm` fails the Director's task with a retriable error that nam
 
 4. Run `bosh cck`, or wait for the next resurrection, and the delete then completes.
 
+A defer whose message says `entry node clock unreadable` means that no member's clock answered through the entry node. The CPI already reads another member's clock when the entry node's own clock read fails with a 5xx, so the message means that every online member failed as well, or that the entry node failed in a way that never borrows a clock, such as a failure to reach it or a 4xx. We check the entry node and `pveproxy` on the other members, and then we retry. A `bosh recreate` that failed on such a defer can be run again as it is. The deferred delete changed nothing in PVE, and a disk that `detach_disk` had already moved to a parker stays there until the retried recreate attaches it to the new VM.
+
 ### The dead-node procedure
 
 A delete on a dead node cannot complete through the normal path, because every call about the VM goes to its node. After the grace window, the CPI finishes the delete itself for a legacy VM on shared storage, as [HA and Resurrection](ha-and-resurrection.md#when-the-grace-window-expires-on-a-dead-node) describes. This procedure covers every other case, which includes a VM that is not HA-managed, a `hold` VM, a VM that the allocation journal records, a VM with a node-local volume, and a cluster whose token lacks `Sys.Console`.
