@@ -866,6 +866,8 @@ When those writes do not matter, we do nothing, and replication resumes in the n
 
 The doctor reports a `replicate` VM that runs on its partner as `replica_on_partner`, which tells us about the reversed job. That finding is a problem, so the doctor exits with 1 after every failover until the condition clears.
 
+A maintenance migration to the partner is not a failover, and it needs none of these steps. The next `reboot_vm` or `set_vm_metadata` call that verifies a sync from the partner back to the old node keeps both nodes in the pin and names the old node as the new partner, and the doctor's `replica_on_partner` finding clears then. Until that sync is verified, the CPI treats the move as a possible failover, narrows the pin, and says in its warning that it can't tell the two apart. [HA and Resurrection](ha-and-resurrection.md#the-replicate-data-loss-window) describes the checks.
+
 ### Removing orphan replicas
 
 `delete_vm` retires a `replicate` VM's job before it destroys the VM. When the partner is offline, or the job is still there after `pve.ha.motion_wait_sec`, the CPI deletes the job with `force=1`. That call drops the job configuration without removing the partner's copy. The CPI logs the partner and the volume IDs that stay behind, and it records them in the allocation journal when the VM had a journal record. The doctor reports an unattended copy as `replica_orphan_volume` or `replica_recorded_orphan`, and it reports an older copy that a later retirement will remove as the advice `replica_superseded_copy`.
