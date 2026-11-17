@@ -708,8 +708,9 @@ func (p *aaPlanner) joinConflicts(set *ha.RuleSet, cur *ha.Rule, n int, members 
 func (p *aaPlanner) chunkCandidate(set *ha.RuleSet, cur *ha.Rule, name string, members []string) []ha.Rule {
 	members = slices.Sorted(slices.Values(members))
 	flat := map[string]ha.Rule{}
-	for _, op := range flattenMemberPins(set, members, p.ident.Owner) {
-		flat[op.Rule.ID] = op.Rule
+	ops := flattenMemberPins(set, members, p.ident.Owner)
+	for i := range ops {
+		flat[ops[i].Rule.ID] = ops[i].Rule
 	}
 	out := make([]ha.Rule, 0, len(set.Rules)+1)
 	for i := range set.Rules {
