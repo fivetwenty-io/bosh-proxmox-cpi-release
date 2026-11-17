@@ -324,52 +324,93 @@ func (w *replicaWiden) run(ctx context.Context) (bool, error) {
 	if target == "" {
 		return false, nil
 	}
-	volids, gaps, err := replicaVolumesOn(ctx, w.deps, w.profile, w.node, w.vmid)
+	synced, held, err := w.verifySync(ctx, *job, target, changedAt, logger)
 	if err != nil {
 		return false, err
 	}
-	if len(gaps) > 0 {
-		logger.Warn(replicaOp+": the VM holds node-local volumes its replication job does not copy, so the "+
-			"partner would hold no copy of them; the pin keeps the source alone", log.String("job", job.ID),
-			log.String("gaps", strings.Join(gaps, "; ")))
+	if synced == nil {
+		held.log(logger, "the pin keeps the source alone")
 		return false, nil
-	}
-	if len(volids) == 0 {
-		logger.Warn(replicaOp + ": the VM holds no volume on node-local ZFS storage that the profile knows; the " +
-			"pin keeps the source alone")
-		return false, nil
-	}
-	evidence, err := w.journalEvidence(ctx, *job, target, volids, changedAt, logger)
-	if err != nil || evidence == nil {
-		return false, err
-	}
-	verdict, err := ha.CheckReplicaSync(ctx, w.api, ha.ReplicaSyncCheck{
-		JobID: job.ID, Source: w.node, Target: target, VolIDs: volids, ChangedAt: evidence.changedAt,
-	})
-	if err != nil {
-		return false, err
-	}
-	if !verdict.Verified {
-		logger.Info(replicaOp+": the replica is not verified yet; the pin keeps the source alone until a later "+
-			"call sees a sync that covers the VM's volumes", log.String("job", job.ID),
-			log.String("partner", target), log.String("reason", verdict.Reason))
-		return false, nil
-	}
-	if w.handle != nil {
-		if err := w.handle.RecordReplicaSync(aj.ReplicaSync{
-			JobID: job.ID, JobGeneration: evidence.jobGeneration, Source: w.node, Target: target,
-			VolumeSetGeneration: evidence.setGeneration, LastSync: verdict.Status.LastSync, VerifiedAt: w.now(),
-		}); err != nil {
-			return false, fmt.Errorf("record the verified sync of job %s: %w", job.ID, err)
-		}
 	}
 	if err := writeReplicaPin(ctx, w.deps, w.profile, logger, w.vmid, pin, widenedReplicaPin(pin, target)); err != nil {
 		return false, err
 	}
 	logger.Info(replicaOp+": a verified sync covers the VM's volumes; the pin names the partner now",
 		log.String("job", job.ID), log.String("partner", target),
-		log.String("last_sync", verdict.Status.LastSync.Format(time.RFC3339)))
+		log.String("last_sync", synced.lastSync.Format(time.RFC3339)))
 	return true, nil
+}
+
+// replicaHeld says why a check of a replica did not verify it. A held check
+// with no reason was logged where it was decided.
+type replicaHeld struct {
+	reason string
+	// warn marks a reason an operator must act on, such as a volume the job
+	// cannot copy.
+	warn bool
+}
+
+// log logs the reason with the consequence the caller names.
+func (h replicaHeld) log(logger *log.Logger, consequence string) {
+	switch {
+	case h.reason == "":
+	case h.warn:
+		logger.Warn(replicaOp + ": " + h.reason + "; " + consequence)
+	default:
+		logger.Info(replicaOp + ": " + h.reason + "; " + consequence)
+	}
+}
+
+// replicaSynced is a sync that verifySync found to cover the VM's volumes.
+type replicaSynced struct {
+	lastSync time.Time
+}
+
+// verifySync checks once that a sync of job from w.node to target covers the
+// volumes the VM holds on w.node, and records the verified sync in the VM's
+// journal record. A VM that holds a node-local volume the job does not copy,
+// or no volume the job copies, is held, and so is a sync that the journal
+// record or the sync gate does not let count. An error is a read or a write
+// that failed.
+func (w *replicaWiden) verifySync(
+	ctx context.Context, job ha.ReplicaJobState, target string, changedAt time.Time, logger *log.Logger,
+) (*replicaSynced, replicaHeld, error) {
+	volids, gaps, err := replicaVolumesOn(ctx, w.deps, w.profile, w.node, w.vmid)
+	if err != nil {
+		return nil, replicaHeld{}, err
+	}
+	if len(gaps) > 0 {
+		return nil, replicaHeld{warn: true, reason: fmt.Sprintf("the VM holds node-local volumes its replication "+
+			"job %s does not copy (%s), so node %s would hold no copy of them", job.ID, strings.Join(gaps, "; "),
+			target)}, nil
+	}
+	if len(volids) == 0 {
+		return nil, replicaHeld{warn: true,
+			reason: "the VM holds no volume on node-local ZFS storage that the profile knows"}, nil
+	}
+	evidence, err := w.journalEvidence(ctx, job, target, volids, changedAt, logger)
+	if err != nil || evidence == nil {
+		return nil, replicaHeld{}, err
+	}
+	verdict, err := ha.CheckReplicaSync(ctx, w.api, ha.ReplicaSyncCheck{
+		JobID: job.ID, Source: w.node, Target: target, VolIDs: volids, ChangedAt: evidence.changedAt,
+	})
+	if err != nil {
+		return nil, replicaHeld{}, err
+	}
+	if !verdict.Verified {
+		return nil, replicaHeld{reason: fmt.Sprintf("the replica on node %s is not verified yet (job %s: %s)",
+			target, job.ID, verdict.Reason)}, nil
+	}
+	if w.handle != nil {
+		if err := w.handle.RecordReplicaSync(aj.ReplicaSync{
+			JobID: job.ID, JobGeneration: evidence.jobGeneration, Source: w.node, Target: target,
+			VolumeSetGeneration: evidence.setGeneration, LastSync: verdict.Status.LastSync, VerifiedAt: w.now(),
+		}); err != nil {
+			return nil, replicaHeld{}, fmt.Errorf("record the verified sync of job %s: %w", job.ID, err)
+		}
+	}
+	return &replicaSynced{lastSync: verdict.Status.LastSync}, replicaHeld{}, nil
 }
 
 // replicaEvidence is what the journal binds a sync to.
@@ -1085,10 +1126,14 @@ func reconcileTouchedVMHA(ctx context.Context, deps Deps, op, vmCID string, vmid
 // reconcileVMReplica is the replicate policy's step of a call that touches a
 // VM. It runs only for a VM with the replicate tag, in mode auto or managed,
 // outside the managed lifecycle guard. A VM that runs on the partner its pin
-// names has failed over, and its pin is narrowed to the node it runs on now
-// through the narrowing barrier, because the old source's copy is behind the
-// partner's and the next sync rolls it back. The barrier's change asks the
-// job for a sync from the new source. A VM on its source with the
+// names moved there by a planned migration or a failover. After a planned
+// migration, proved by the job running back to the old source and a verified
+// sync, the pin keeps both nodes and names the old source as the partner.
+// After a failover, or a move the CPI cannot prove a planned migration, the
+// pin is narrowed to the node the VM runs on now through the narrowing
+// barrier, because the old source's copy may be behind and the next sync
+// rolls it back (see reconcileOnPartner). The barrier's change asks the job
+// for a sync from the new source. A VM on its source with the
 // source-only pin gets one check of its replica, and the pin widens when a
 // sync is verified. A VM with the replicate tag that left HA under an earlier
 // release, and kept its job, has the job retired (see retireStrandedReplica).
@@ -1153,11 +1198,131 @@ func reconcileVMReplica(ctx context.Context, deps Deps, op, vmCID string, vmid i
 				"narrow the pin of VM %d after its failover", op, vmid))
 		}
 		narrow := ha.NarrowDepsFor(deps.PVE, logger, haMotionWait(deps))
-		return narrowAfterFailover(ctx, deps, logger, op, api, narrow, profile, vmid, loc.Node, pin)
+		return reconcileOnPartner(ctx, deps, logger, op, vmCID, api, narrow, profile, vmid, loc.Node, pin, source)
 	}
 	logger.Warn(op+": the VM runs on a node its pin does not name; the CPI leaves its HA state as it is",
 		log.String("pinned_source", source), log.String("partner", partner))
 	return nil
+}
+
+// reconcileOnPartner reconciles the pin of a VM that runs on the partner its
+// pin names, after a planned migration or a failover. A planned live
+// migration runs a last sync, hands the job's state to the node the VM moves
+// to, and swaps the job's direction, so both nodes hold the same data. The
+// pin then keeps both nodes, and its partner token moves to the old source
+// (see swapAfterMigration). Anything else is read as a failover and the pin
+// narrows to this node (see narrowAfterFailover). A job that runs from this
+// node to the old source with no sync from this node verified yet could be
+// either, and is read as a failover, because a pin that names the old source
+// while its copy is behind lets HA start the VM on stale data. The next
+// verified sync widens that pin back to the old source. A swap whose pin write
+// fails returns a retriable error.
+func reconcileOnPartner(
+	ctx context.Context, deps Deps, logger *log.Logger, op, vmCID string, api ha.ReplicationAPI,
+	narrow ha.NarrowDeps, profile *ha.Profile, vmid int, node string, pin *ha.Rule, oldSource string,
+) error {
+	var swapped bool
+	var undecided string
+	err := withVMReplicaRecord(ctx, deps, vmCID, func(handle *aj.Handle) error {
+		w := &replicaWiden{deps: deps, logger: logger, api: api, profile: profile, vmid: vmid, node: node,
+			handle: handle}
+		var err error
+		swapped, undecided, err = w.swapAfterMigration(ctx, pin, oldSource)
+		return err
+	})
+	switch {
+	case err != nil:
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: move the partner of VM %d to its old source after a migration", op, vmid))
+	case swapped:
+		return nil
+	}
+	return narrowAfterFailover(ctx, deps, logger, op, api, narrow, profile, vmid, node, pin, undecided)
+}
+
+// swappedReplicaPin is the widened pin of a VM that moved from its source to
+// its partner node: both nodes stay, node takes the highest priority the pin
+// gives any node and the old source the lowest, so the old source never
+// outranks node, and the partner token names the old source.
+func swappedReplicaPin(pin *ha.Rule, node, oldSource string) *ha.Rule {
+	out := *pin
+	out.Resources = slices.Clone(pin.Resources)
+	highest, lowest, first := 0, 0, true
+	for _, p := range pin.Nodes {
+		if first || p > highest {
+			highest = p
+		}
+		if first || p < lowest {
+			lowest = p
+		}
+		first = false
+	}
+	out.Nodes = map[string]int{node: highest, oldSource: lowest}
+	out.Comment = ha.WithReplicaPartner(pin.Comment, oldSource)
+	out.Errors = nil
+	return &out
+}
+
+// swapAfterMigration checks whether a VM that runs on w.node, the partner its
+// widened pin names, got there by a planned migration from oldSource, and if
+// so writes the swapped pin (see swappedReplicaPin). A planned migration
+// leaves this Director's job enabled and running from w.node to oldSource,
+// oldSource online, and a sync from w.node verified to cover the VM's volumes
+// on oldSource after the pin's last change. swapped is false when any of that
+// does not hold, and undecided then names why when the job does run from
+// w.node to an online oldSource, the case the CPI cannot tell from a failover.
+// A failed read is undecided too, and only a failed pin write is an error.
+func (w *replicaWiden) swapAfterMigration(
+	ctx context.Context, pin *ha.Rule, oldSource string,
+) (swapped bool, undecided string, err error) {
+	if w.now == nil {
+		w.now = time.Now
+	}
+	logger := w.logger.With(log.Int(metadataKeyVMID, w.vmid), log.String("node", w.node),
+		log.String("old_source", oldSource))
+	jobs, err := w.api.ListJobs(ctx)
+	if err != nil {
+		return false, "the replication jobs could not be listed: " + err.Error(), nil
+	}
+	job, _, err := guestReplicaJobs(jobs, w.vmid, w.deps.RequestDirectorUUID)
+	switch {
+	case err != nil:
+		return false, err.Error(), nil
+	case job == nil, job.Disabled, job.RemoveJob != "":
+		// No job of this Director copies the VM now, so nothing kept the old
+		// source's copy current.
+		return false, "", nil
+	case job.Source != w.node || job.Target != oldSource:
+		// A planned migration swaps the job's direction as it ends. A job
+		// that PVE has not swapped is a failover that PVE's runner has not
+		// caught up with yet.
+		return false, "", nil
+	}
+	if online, err := replicaNodeOnline(w.profile, nil)(ctx, oldSource); err != nil || !online {
+		return false, "", nil
+	}
+	changedAt, ok := ha.ReplicaChanged(pin.Comment)
+	if !ok {
+		return false, "the pin records no time of its last change", nil
+	}
+	synced, held, err := w.verifySync(ctx, *job, oldSource, changedAt, logger)
+	switch {
+	case err != nil:
+		return false, err.Error(), nil
+	case synced == nil && held.reason == "":
+		return false, "the journal record does not bind a sync from this node yet", nil
+	case synced == nil:
+		return false, held.reason, nil
+	}
+	if err := writeReplicaPin(ctx, w.deps, w.profile, logger, w.vmid, pin,
+		swappedReplicaPin(pin, w.node, oldSource)); err != nil {
+		return false, "", err
+	}
+	logger.Info(replicaOp+": the VM moved to its replication partner by a planned migration, and a verified sync "+
+		"from this node covers its volumes on the old source; the pin keeps both nodes and names the old source "+
+		"as the partner now", log.String("job", job.ID),
+		log.String("last_sync", synced.lastSync.Format(time.RFC3339)))
+	return true, "", nil
 }
 
 // narrowAfterFailover narrows the pin of a VM that runs on its partner to
@@ -1167,10 +1332,12 @@ func reconcileVMReplica(ctx context.Context, deps Deps, op, vmCID string, vmid i
 // claim, with the narrowed pin written in the confinement step. The barrier
 // checks after the request that node reaches every volume. A failed request
 // is logged and never undoes the narrowing, because the wide pin names the
-// old source, whose copy is behind.
+// old source, whose copy is behind. undecided is empty for a failover, and
+// otherwise names why a move that may have been a planned migration could not
+// be proved one, which the warning says.
 func narrowAfterFailover(
 	ctx context.Context, deps Deps, logger *log.Logger, op string, api ha.ReplicationAPI, narrow ha.NarrowDeps,
-	profile *ha.Profile, vmid int, node string, pin *ha.Rule,
+	profile *ha.Profile, vmid int, node string, pin *ha.Rule, undecided string,
 ) error {
 	jobs, err := api.ListJobs(ctx)
 	if err != nil {
@@ -1182,9 +1349,17 @@ func narrowAfterFailover(
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, op+": narrow the pin after a failover")
 	}
 	newPin := narrowedReplicaPin(pin, node, time.Now())
-	logger.Warn(op+": the VM runs on its replication partner after a failover; its pin narrows to this node, and "+
-		"writes made on the old source after its last sync are lost when the next sync runs",
-		log.String("old_pin", strings.Join(pin.NodeNames(), ",")))
+	if undecided == "" {
+		logger.Warn(op+": the VM runs on its replication partner after a failover; its pin narrows to this node, "+
+			"and writes made on the old source after its last sync are lost when the next sync runs",
+			log.String("old_pin", strings.Join(pin.NodeNames(), ",")))
+	} else {
+		logger.Warn(op+": the VM runs on its replication partner, and its replication job runs from this node "+
+			"now, but the CPI cannot tell a planned migration from a failover until a sync from this node is "+
+			"verified; its pin narrows to this node, and the next verified sync widens it back to the old source. "+
+			"If this was a failover, writes made on the old source after its last sync are lost when the next "+
+			"sync runs", log.String("old_pin", strings.Join(pin.NodeNames(), ",")), log.String("reason", undecided))
+	}
 	writePin := func(ctx context.Context, p *ha.Rule) error {
 		cur, _, _, err := readOwnedReplicaPin(ctx, deps, vmid)
 		if err != nil {

@@ -769,7 +769,7 @@ func TestNarrowAfterFailover_NarrowsToTheNewSourceAndRequestsASync(t *testing.T)
 	sl := &stagingLog{}
 	res := &attachRunRes{log: sl, state: "started", comment: r.stub.comment}
 	err = narrowAfterFailover(crhCtx(), r.deps, log.NewNopLogger(), "reboot_vm", r.repl, failoverView(res, "pve02"),
-		r.profile, 100, "pve02", pin)
+		r.profile, 100, "pve02", pin, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1153,7 +1153,7 @@ func TestNarrowAfterFailover_ErroredResourceReregistersUnderTheClaim(t *testing.
 		return st, err
 	}
 	err = narrowAfterFailover(crhCtx(), r.deps, log.NewNopLogger(), "reboot_vm", r.repl, view, r.profile, 100,
-		"pve02", set.Find("bosh-na-100"))
+		"pve02", set.Find("bosh-na-100"), "")
 	if err == nil || strings.Contains(err.Error(), "operator must clear") || !strings.Contains(err.Error(), "vm-100") {
 		t.Fatalf("err %v; the errored resource goes to the re-registration, which takes the VMID claim", err)
 	}
