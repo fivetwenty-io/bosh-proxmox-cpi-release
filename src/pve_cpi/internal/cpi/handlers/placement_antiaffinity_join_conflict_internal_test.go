@@ -211,7 +211,7 @@ func TestEnsureAntiAffinity_CreateAfterARepairLeavesTheRuleRight(t *testing.T) {
 // TestHealAntiAffinityGroup_HealsAgainAfterARepairConfinesAMember pins that a
 // heal whose write a pin repair reverts runs its next round with the confined
 // member held out, in managed mode as in auto. A removal deleted the group's
-// rule, and only PVE reports that vm:103's strict pin conflicts with it, so
+// rule, and only PVE reports that vm:102's strict pin conflicts with it, so
 // the first round writes all three members. The repair reverts that create,
 // which leaves no rule, and the second round must write the other two.
 func TestHealAntiAffinityGroup_HealsAgainAfterARepairConfinesAMember(t *testing.T) {
@@ -222,8 +222,8 @@ func TestHealAntiAffinityGroup_HealsAgainAfterARepairConfinesAMember(t *testing.
 			stub := newAAStub()
 			stub.enforceManaged = true
 			managedGroup(stub, 101, 102, 103)
-			pin := seedStrictPin(stub, 103, "pve1")
-			pinOutWhileInRule(stub, pin, aaRule, "vm:103")
+			pin := seedStrictPin(stub, 102, "pve1")
+			pinOutWhileInRule(stub, pin, aaRule, "vm:102")
 			deps := aaModeDeps(stub, mode, "", "pve1", "pve2", "pve3")
 			logger, _ := log.NewObservedLogger(log.LevelDebug)
 			deleted := map[string]string{aaRule: aaIdent("web").marker()}
@@ -231,7 +231,7 @@ func TestHealAntiAffinityGroup_HealsAgainAfterARepairConfinesAMember(t *testing.
 				logger); err != nil {
 				t.Fatalf("the heal must write the rule again without the pinned member: %v", err)
 			}
-			if got := stub.rules[aaRule]; got != "vm:101,vm:102" {
+			if got := stub.rules[aaRule]; got != "vm:101,vm:103" {
 				t.Fatalf("rule = %q; want the other two members, without the pinned one", got)
 			}
 			if errs := stub.ruleErrors(pin); len(errs) > 0 {
