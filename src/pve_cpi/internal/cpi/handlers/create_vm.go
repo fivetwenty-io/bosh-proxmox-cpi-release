@@ -664,6 +664,16 @@ func createVM(
 		return existing, resumeErr
 	}
 
+	// A cluster without quorum refuses every write, so no node can receive a
+	// VM. The call fails here, before the cluster stamp, placement, and the
+	// guest enumeration, which can take minutes against members that no
+	// longer answer. A pinned target_node gets the same answer as placement.
+	// A status read that fails, or a standalone host, carries on.
+	if clusterLostQuorum(ctx, deps, logger, "create_vm") {
+		logger.Warn("create_vm: the entry node does not report the cluster quorate, so no node can receive a VM")
+		return nil, createQuorumError()
+	}
+
 	// Placement may build the VM's shape once per candidate node, so the
 	// missing-owner warning is logged here, once for the whole call.
 	warnMissingOwnerTag(deps, logger)
