@@ -283,7 +283,7 @@ PVE refuses every state request for a resource in `error` except `disabled`, and
 
 ## What happens to the disks
 
-A VM is only as recoverable as its volumes. The CPI computes the VM's access set, which is the intersection of the node sets of every volume the VM holds, including its config-drive ISO and its snapshot and state volumes. It narrows that set by the hardware and network needs placement already enforces. A VM is eligible as shared only when the set holds at least two placeable nodes, and when the set is smaller than the cluster, it joins the pin as a strict constraint.
+A VM is only as recoverable as its volumes. The CPI computes the VM's access set, which is the intersection of the node sets of every volume the VM holds, including its config-drive ISO and its snapshot and state volumes. It narrows that set by the hardware and network needs placement already enforces. A VM is eligible as shared only when the set holds at least two placeable nodes, and when the set is smaller than the cluster, it joins the pin as a strict constraint. A strict AZ doesn't narrow the set for that check. It narrows the pin after the check, so a VM whose strict AZ holds one node is still eligible as shared, and HA restarts it in place on that node. A later call that decides the VM's eligibility again, such as an `attach_disk` or the re-registration of a VM in the error state, can't read the VM's AZ, so it reads the strict AZ from the VM's strict pin. That call applies the pin after the check, as `create_vm` does, so it reaches the same decision for the same volumes.
 
 ### Shared storage
 
@@ -377,7 +377,7 @@ HA never moves a VM from one cluster to another, and BOSH never live-migrates a 
 
 - **The small-node-set wedge**
 
-  `pve.ha.pin_az_strict` defaults to `true`, so the AZ part of the pin is a hard guarantee. PVE HA will not relocate the VM off its AZ node set even when every node in that set is down. The CPI warns when a strict AZ pin resolves to one or two nodes, because when every pinned node is down or drained at once, PVE HA has nowhere in the AZ left to fail over to, and the VM stays down until a pinned node returns. The warning advises mapping the AZ to three or more nodes, or setting `pve.ha.pin_az_strict` to `false`. We map each AZ that uses a strict pin to at least three nodes. Setting `pve.ha.pin_az_strict: false` lets HA leave the AZ instead.
+  `pve.ha.pin_az_strict` defaults to `true`, so the AZ part of the pin is a hard guarantee. PVE HA will not relocate the VM off its AZ node set even when every node in that set is down. The CPI warns when a strict AZ pin resolves to one or two nodes, because when every pinned node is down or drained at once, PVE HA has nowhere in the AZ left to fail over to, and the VM stays down until a pinned node returns. The VM still runs under HA with its pin, so HA restarts it once a pinned node returns, and an `attach_disk` that adds a disk on shared storage keeps it under HA. The warning advises mapping the AZ to three or more nodes, or setting `pve.ha.pin_az_strict` to `false`. We map each AZ that uses a strict pin to at least three nodes. Setting `pve.ha.pin_az_strict: false` lets HA leave the AZ instead.
 
 - **Full anti-affinity groups**
 

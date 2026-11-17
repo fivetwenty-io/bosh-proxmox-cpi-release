@@ -233,7 +233,7 @@ pve.ha.pin_az_strict=false to allow HA to relocate off-AZ instead)
 az=z1 nodes=pve01 pinned_node_count=1
 ```
 
-The warning does not fail `create_vm`, and the VM is still created and pinned as configured. It is diagnostic only, for an operator scanning logs to catch a topology that will not fail over or drain cleanly before an incident forces the issue. The warning only fires for strict pins (`pve.ha.pin_az_strict: true`). A non-strict (preferred) pin on a small AZ has no failover hazard to warn about, since HA is free to relocate the VM off-AZ on failure.
+The warning does not fail `create_vm`, and the VM is still created and pinned as configured. The VM runs under PVE HA with that pin, so HA restarts it in place when its node returns, and a later `attach_disk` keeps it under HA with the same pin. The warning is diagnostic only, for an operator scanning logs to catch a topology that will not fail over or drain cleanly before an incident forces the issue. The warning only fires for strict pins (`pve.ha.pin_az_strict: true`). A non-strict (preferred) pin on a small AZ has no failover hazard to warn about, since HA is free to relocate the VM off-AZ on failure.
 
 ---
 
