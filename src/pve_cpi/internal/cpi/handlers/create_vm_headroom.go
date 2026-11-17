@@ -86,7 +86,8 @@ type headroomPlan struct {
 // transient condition and warn only logs.
 func buildHeadroomPlan(
 	ctx context.Context, deps Deps, cp createVMCloudProps, cloudPropsMap map[string]any, resolver *layeredResolver,
-	diskCIDs []string, bridges bridgePlan, facts []placement.NodeFacts, logger *log.Logger,
+	diskCIDs []string, diskNodes map[string]string, bridges bridgePlan, facts []placement.NodeFacts,
+	logger *log.Logger,
 ) *headroomPlan {
 	if deps.Config == nil || deps.PVE == nil || deps.Config.HAModeValue() == config.HAModeOff {
 		return nil
@@ -106,7 +107,7 @@ func buildHeadroomPlan(
 	if api == nil {
 		return nil
 	}
-	volumes, unknown := headroomVolumes(ctx, deps, cp, cloudPropsMap, resolver, diskCIDs)
+	volumes, unknown := headroomVolumes(ctx, deps, cp, cloudPropsMap, resolver, diskCIDs, diskNodes)
 	if unknown != "" {
 		logger.Debug("create_vm: placement: headroom check skipped, because " + unknown)
 		return nil
@@ -295,10 +296,11 @@ func factNodeNames(facts []placement.NodeFacts) []string {
 //
 // A pool a storage tier, a storage selector, or a storage plan picks is not
 // known, nor is the pool of an encrypted ephemeral disk or of a persistent disk
-// whose CID names none.
+// whose CID names none. A disk's home node is the one in diskNodes, which
+// placement resolved, and otherwise the one its CID records.
 func headroomVolumes(
 	ctx context.Context, deps Deps, cp createVMCloudProps, cloudPropsMap map[string]any, resolver *layeredResolver,
-	diskCIDs []string,
+	diskCIDs []string, diskNodes map[string]string,
 ) (volumes []ha.VMVolume, unknown string) {
 	cfg := deps.Config
 	if resolver == nil {
@@ -360,6 +362,12 @@ func headroomVolumes(
 		vol, ok := placementDiskVolume(cid)
 		if !ok {
 			return nil, "a persistent disk's CID names no pool"
+		}
+		// A replicated disk's CID names the node it was created on, which holds
+		// the stale copy after a failover. Placement already resolved the live
+		// node, so the estimate takes that one.
+		if node := diskNodes[cid]; node != "" {
+			vol.HomeNode = node
 		}
 		volumes = append(volumes, vol)
 	}

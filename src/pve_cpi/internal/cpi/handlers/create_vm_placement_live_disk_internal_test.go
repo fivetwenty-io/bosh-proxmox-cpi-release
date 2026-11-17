@@ -204,3 +204,48 @@ func TestDeriveDiskFaultConstraints_KeepsTheCIDNodeForADiskTheSweepFindsNowhere(
 		t.Fatalf("requiredLocalNode = %q, err %v; want the CID's node pve1", c.requiredLocalNode, err)
 	}
 }
+
+// TestHeadroomVolumes_JudgeAReplicatedDiskOnItsLiveNodeAfterAFailover is the
+// failover from the first test, seen by the N+1 headroom estimate. The CID
+// names pve0, which holds the stale replica, and a parker on pve1 holds the
+// live copy. The estimate must take pve1 from the node placement resolved, and
+// it must not sweep a second time. A disk placement did not resolve keeps the
+// node in its CID.
+func TestHeadroomVolumes_JudgeAReplicatedDiskOnItsLiveNodeAfterAFailover(t *testing.T) {
+	t.Parallel()
+	const birth = "local-zfs:vm-9001-disk-0"
+	const live = "local-zfs:vm-90000-disk-0"
+	rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce, nil, nil)
+	deps := rig.deps
+	deps.Logger = log.NewNopLogger()
+	fake := idTestDeps(newIDFakeClient(map[int]map[string]any{
+		90000: {"tags": "bosh-cpi;bosh-parker", diskKeyScsi0: live + ",serial=" + idTestToken},
+	}))
+	deps.PVE = fake.PVE
+	backend := &liveDiskBackend{storageType: pve.StorageTypeZFSPool, nodes: map[string]string{live: "pve1", birth: "pve0"}}
+	deps.Resolver = liveDiskResolver{b: backend}
+	cid := encodeZFSDiskCID(t, birth, idTestToken, "pve0")
+
+	c, err := deriveDiskFaultConstraints(context.Background(), deps, []string{cid})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	volumes, unknown := headroomVolumes(context.Background(), deps, createVMCloudProps{}, nil,
+		mustResolver(t, deps), []string{cid}, c.diskNodes)
+	if unknown != "" {
+		t.Fatalf("headroomVolumes ran no estimate: %s", unknown)
+	}
+	last := volumes[len(volumes)-1]
+	if last.HomeNode != "pve1" {
+		t.Errorf("persistent disk home node = %q, want pve1, the node that holds the live copy", last.HomeNode)
+	}
+	if got := backend.askedVolumes(); !slices.Equal(got, []string{live}) {
+		t.Errorf("swept volumes %v, want one sweep of %s", got, live)
+	}
+
+	volumes, _ = headroomVolumes(context.Background(), deps, createVMCloudProps{}, nil,
+		mustResolver(t, deps), []string{cid}, nil)
+	if last := volumes[len(volumes)-1]; last.HomeNode != "pve0" {
+		t.Errorf("with no resolved node the home node = %q, want the CID's pve0", last.HomeNode)
+	}
+}
