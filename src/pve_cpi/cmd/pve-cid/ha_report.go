@@ -32,6 +32,7 @@ const (
 	haKindAntiAffinityAmbiguous = "anti_affinity_ambiguous"
 	haKindCPUUnknown            = "cpu_unknown"
 	haKindCPUHostMulti          = "cpu_host_multi_domain"
+	haKindCPUPinCrossesDomain   = "cpu_pin_crosses_domain"
 	haKindCPUDomainTooSmall     = "cpu_domain_too_small"
 	haKindLocalUnprotected      = "local_unprotected"
 	haKindReplicaOnPartner      = "replica_on_partner"

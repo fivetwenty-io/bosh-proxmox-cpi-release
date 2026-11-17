@@ -2257,3 +2257,62 @@ func TestEntryScopesRecordWhichEntriesWriteAntiAffinityRules(t *testing.T) {
 		t.Errorf("far scope = %+v, want no disagreement", got[2])
 	}
 }
+
+func TestCollectCPUPinAgainstDomain(t *testing.T) {
+	t.Parallel()
+	pinRule := func(strict bool, nodes ...string) []ha.Rule {
+		m := map[string]int{}
+		for _, n := range nodes {
+			m[n] = 0
+		}
+		return []ha.Rule{{ID: haPinRulePrefix + "100", Type: ha.RuleTypeNodeAffinity, Strict: strict, Nodes: m,
+			Comment: haMarker, Resources: []string{"vm:100"}}}
+	}
+	tests := []struct {
+		name      string
+		rules     []ha.Rule
+		noHA      bool
+		kind      string
+		severity  string
+		fragments []string
+		absent    []string
+	}{
+		{name: "crossing strict pin", rules: pinRule(true, "n1", "n3"), kind: haKindCPUPinCrossesDomain,
+			severity: haSeverityProblem, fragments: []string{"vm:100", haPinRulePrefix + "100", "n3", "bosh recreate", "n1, n2"}},
+		{name: "non-strict pin naming every node", rules: pinRule(false, "n1", "n2", "n3"), kind: haKindCPUPinCrossesDomain,
+			severity: haSeverityProblem, fragments: []string{"vm:100", haPinRulePrefix + "100", "n3"}, absent: []string{"n1, n2, n3"}},
+		{name: "confined pin", rules: pinRule(true, "n1"), kind: haKindCPUHostMulti,
+			severity: haSeverityAdvice, fragments: []string{haPinRulePrefix + "100", "only nodes inside"}},
+		{name: "no HA resource", noHA: true, kind: haKindCPUHostMulti,
+			severity: haSeverityAdvice, fragments: []string{"not under HA"}, absent: []string{"pin"}},
+		{name: "resource without a pin", kind: haKindCPUHostMulti,
+			severity: haSeverityAdvice, fragments: []string{"no enabled node-affinity pin"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := haBaseFake()
+			f.profile.CPUDomains = []ha.CPUDomain{
+				{Model: "EPYC", Nodes: []string{"n1", "n2"}},
+				{Model: "XEON", Nodes: []string{"n3"}},
+			}
+			f.configs[100]["cpu"] = "host"
+			f.rules = tc.rules
+			if tc.noHA {
+				f.resources = nil
+			}
+			r := runCollect(t, f, haCfg("auto", "none"))
+			want(t, r, tc.kind, tc.severity, tc.fragments...)
+			other := haKindCPUHostMulti
+			if tc.kind == haKindCPUHostMulti {
+				other = haKindCPUPinCrossesDomain
+			}
+			wantNone(t, r, other)
+			for _, frag := range tc.absent {
+				if got := findings(r, tc.kind)[0].Detail; strings.Contains(got, frag) {
+					t.Errorf("detail %q must not mention %q", got, frag)
+				}
+			}
+		})
+	}
+}

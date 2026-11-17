@@ -781,13 +781,7 @@ func (c *haCollector) cpuFindings() {
 		}
 		dom, known := c.p.DomainOf(g.ref.Node)
 		if len(c.p.CPUDomains) > 1 {
-			where := "a domain the CPU of node " + g.ref.Node + " cannot place"
-			if known {
-				where = "the domain " + strings.Join(dom.Nodes, ", ")
-			}
-			c.rep.advise(haKindCPUHostMulti, g.sid,
-				"CPU type %s on a cluster with %d CPU migration domains confines the VM's pin to %s; set pve.cpu_type to a named model to let it move",
-				cpu, len(c.p.CPUDomains), where)
+			c.cpuMultiDomain(g, cpu, dom, known)
 		}
 		if !c.off() && c.p.Effective != ha.EffectiveObserveOnly && c.resourcesOK && g.resource == nil && !c.inFlight(g) &&
 			(!known || len(dom.Nodes) < 2) {
@@ -799,6 +793,57 @@ func (c *haCollector) cpuFindings() {
 				"the VM has CPU type %s and got no HA, because %s; set pve.cpu_type to a named model", cpu, why)
 		}
 	}
+}
+
+// cpuMultiDomain judges a host or max VM on a cluster with several CPU
+// migration domains against the node-affinity pin it actually has. A pin that
+// names a node outside the VM's domain is a problem, and every other case is
+// advice worded for what the VM has.
+func (c *haCollector) cpuMultiDomain(g *haGuest, cpu string, dom ha.CPUDomain, known bool) {
+	n := len(c.p.CPUDomains)
+	if !known {
+		c.rep.advise(haKindCPUHostMulti, g.sid,
+			"CPU type %s on a cluster with %d CPU migration domains needs a domain, and the CPU of node %s cannot place the VM in one; set pve.cpu_type to a named model to let it move",
+			cpu, n, g.ref.Node)
+		return
+	}
+	domain := strings.Join(dom.Nodes, ", ")
+	switch {
+	case !c.resourcesOK || !c.rulesOK:
+		c.rep.advise(haKindCPUHostMulti, g.sid,
+			"CPU type %s on a cluster with %d CPU migration domains needs the domain %s, and the doctor could not read the HA resources and rules to check the VM's pin; set pve.cpu_type to a named model to let it move",
+			cpu, n, domain)
+		return
+	case g.resource == nil:
+		c.rep.advise(haKindCPUHostMulti, g.sid,
+			"CPU type %s on a cluster with %d CPU migration domains needs the domain %s, and the VM is not under HA, so no node-affinity rule moves it; set pve.cpu_type to a named model to let it move",
+			cpu, n, domain)
+		return
+	}
+	pin := c.pinOf(g.ref.VMID)
+	if pin == nil || pin.Disabled || pin.Type != ha.RuleTypeNodeAffinity || !pin.HasResource(g.sid) {
+		c.rep.advise(haKindCPUHostMulti, g.sid,
+			"CPU type %s on a cluster with %d CPU migration domains needs the domain %s, and the VM has no enabled node-affinity pin, so HA may move it to any node; set pve.cpu_type to a named model to let it move",
+			cpu, n, domain)
+		return
+	}
+	var outside []string
+	for node := range pin.Nodes {
+		if !dom.Contains(node) {
+			outside = append(outside, node)
+		}
+	}
+	sort.Strings(outside)
+	if len(outside) > 0 {
+		c.rep.problem(haKindCPUPinCrossesDomain, g.sid,
+			"CPU type %s needs the domain %s, but the node-affinity rule %s also names %s, so a maintenance drain or a manual migration can move the VM to a node whose CPU differs and crash the guest; "+
+				"narrow the pin to the domain by running bosh recreate on the instance, which makes the CPI register HA again, or set pve.cpu_type to a named model",
+			cpu, domain, pin.ID, strings.Join(outside, ", "))
+		return
+	}
+	c.rep.advise(haKindCPUHostMulti, g.sid,
+		"CPU type %s on a cluster with %d CPU migration domains needs the domain %s, and the node-affinity rule %s names only nodes inside it; set pve.cpu_type to a named model to let the VM move to other domains",
+		cpu, n, domain, pin.ID)
 }
 
 // pinAllowsNode reports whether a pin is an enabled strict rule that names the
