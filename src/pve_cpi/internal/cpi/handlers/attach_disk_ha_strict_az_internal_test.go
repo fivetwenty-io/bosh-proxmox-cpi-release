@@ -52,8 +52,9 @@ func (r *strictAZRig) createDecision(t *testing.T, extra ...string) *ha.VMDecisi
 	for i, volid := range extra {
 		cfg[fmt.Sprintf("scsi%d", i+1)] = volid + ",size=10G"
 	}
-	in := createdVMHAInput(context.Background(), r.deps, r.parsed, &createVMShape{node: "pve01"}, 100, cfg,
-		r.profile)
+	ctx := context.Background()
+	in := createdVMHAInput(ctx, r.deps, r.parsed, &createVMShape{node: "pve01"}, 100, cfg,
+		r.profile, r.deps.Log(ctx))
 	d, err := r.profile.DecideVM(in)
 	if err != nil {
 		t.Fatalf("create decision: %v", err)
