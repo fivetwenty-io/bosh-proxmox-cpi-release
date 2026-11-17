@@ -393,7 +393,7 @@ func ReadHAServiceState(
 	st.EntryNode = health.EntryNode
 	switch {
 	case !health.Quorate:
-		return unknown("the entry node does not report the cluster quorate")
+		return unknown("%s", ReasonNotQuorate)
 	case health.EntryNode == "":
 		return unknown("no source names the entry node")
 	case !haViewReadable(health.HA):

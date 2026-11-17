@@ -276,11 +276,17 @@ func haDeleteRefusal(
 				"once it has", caller, st.VMID, reason)
 	default:
 		logHADeleteState(logger, caller, st, disp, reason)
-		return cpierrors.Retriable(
-			"%s: VM %d deferred because its HA state is unknown: %s. The CPI waits for a fresh HA view from "+
-				"one quorate entry node; check 'ha-manager status' and the nodes, and the next retry proceeds",
-			caller, st.VMID, reason)
+		return haUnknownDeferral(caller, st.VMID, reason)
 	}
+}
+
+// haUnknownDeferral is the retriable error for a delete of vmid that defers
+// because its HA state is unknown for reason.
+func haUnknownDeferral(caller string, vmid int, reason string) error {
+	return cpierrors.Retriable(
+		"%s: VM %d deferred because its HA state is unknown: %s. The CPI waits for a fresh HA view from "+
+			"one quorate entry node; check 'ha-manager status' and the nodes, and the next retry proceeds",
+		caller, vmid, reason)
 }
 
 // haDeferralForUnreadableConfig reads the VM's HA state once after its config

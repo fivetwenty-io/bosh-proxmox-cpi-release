@@ -295,6 +295,13 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			return nil, err
 		}
 		vmid := cid.VMID
+		// A cluster without quorum refuses every write, and the HA state of
+		// every VM is unknown, so the delete defers before the sweep, the
+		// journal, and the per-node reads, which can take minutes against
+		// members that no longer answer.
+		if err := deferDeleteWithoutQuorum(ctx, deps, "delete_vm", vmid, deps.Log(ctx)); err != nil {
+			return nil, err
+		}
 		// Drain the queue of disposals an earlier request could not finish
 		// before this delete starts. Best-effort and bounded.
 		sweepDeferredTeardowns(ctx, deps, deps.Log(ctx))
@@ -315,10 +322,12 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		// that node, and the journal's check runs again on the destination.
 		handled, managedErr := deleteManagedVMIfRecorded(ctx, deps, vmcid.PathOf(vmid), vmid)
 		if managedDeleteAnswers(handled, managedErr) {
-			return nil, managedDeleteVMError(deps.Log(ctx).With(log.String("vm_cid", vmCID)), managedErr)
+			return nil, deleteErrorWithoutQuorum("delete_vm", vmid,
+				managedDeleteVMError(deps.Log(ctx).With(log.String("vm_cid", vmCID)), managedErr), deps.Log(ctx))
 		}
 
-		return deleteLegacyVM(ctx, deps, vmCID, cid)
+		result, err := deleteLegacyVM(ctx, deps, vmCID, cid)
+		return result, deleteErrorWithoutQuorum("delete_vm", vmid, err, deps.Log(ctx))
 	})
 }
 

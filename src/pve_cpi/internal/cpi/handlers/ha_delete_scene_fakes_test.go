@@ -52,6 +52,11 @@ type HADeleteScene struct {
 	// NoCRM answers manager status with an empty body, the shape of a
 	// cluster that runs no HA.
 	NoCRM bool
+	// NotQuorate makes /cluster/status report the cluster not quorate, which
+	// is what the entry node answers once the cluster has lost quorum.
+	NotQuorate bool
+	// StatusListReads counts the /cluster/status reads.
+	StatusListReads int
 	// NoLocal leaves the local flag off every /cluster/status row, the shape
 	// of a cluster status that does not mark the node that answered.
 	NoLocal bool
@@ -327,8 +332,13 @@ func (s *HADeleteScene) pruneRules(sid string) {
 
 func (s *HADeleteScene) statusRows() *cluster.ListStatusResponse {
 	rows := make(cluster.ListStatusResponse, 0, 1+len(s.Members))
+	s.StatusListReads++
+	quorate := 1
+	if s.NotQuorate {
+		quorate = 0
+	}
 	rows = append(rows, json.RawMessage(
-		fmt.Sprintf(`{"type":"cluster","name":"scene","quorate":1,"nodes":%d}`, len(s.Members))))
+		fmt.Sprintf(`{"type":"cluster","name":"scene","quorate":%d,"nodes":%d}`, quorate, len(s.Members))))
 	for i, m := range s.Members {
 		online := 1
 		if s.Offline[m] {

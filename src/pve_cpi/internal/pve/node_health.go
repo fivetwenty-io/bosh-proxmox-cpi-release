@@ -485,11 +485,70 @@ func (r *NodeHealthReport) reindex() {
 	}
 }
 
+// ReasonNotQuorate is the reason the CPI gives when the node that answered
+// does not report the cluster quorate.
+const ReasonNotQuorate = "the entry node does not report the cluster quorate"
+
+// clusterStatusLister is the one cluster read a quorum check needs.
+type clusterStatusLister interface {
+	ListStatus(ctx context.Context) (*sdkcluster.ListStatusResponse, error)
+}
+
+// ClusterQuorum is what one read of GET /cluster/status says about quorum, as
+// the entry node sees it.
+type ClusterQuorum struct {
+	// Reported is true when the status carried a cluster or quorum row. A
+	// standalone host carries none.
+	Reported bool
+	// Quorate is the quorate flag of that row. A standalone host counts as
+	// quorate.
+	Quorate bool
+	// EntryNode is the node that answered, when the status marks one local.
+	EntryNode string
+	// Offline names the members the status reports offline.
+	Offline map[string]bool
+}
+
+// Lost reports whether the status proves that the cluster has lost quorum,
+// which takes a cluster row whose quorate flag is off. A standalone host and a
+// status without a cluster row never prove it.
+func (q ClusterQuorum) Lost() bool { return q.Reported && !q.Quorate }
+
+// ReadClusterQuorum reads GET /cluster/status with a single attempt and returns
+// what it says about quorum. A caller uses it to stop early when the cluster
+// has lost quorum and no write can land, so it never spends a retry budget
+// of its own, and a caller treats a failed read as "unknown" and carries on.
+func ReadClusterQuorum(ctx context.Context, clusterAPI clusterStatusLister) (ClusterQuorum, error) {
+	if ctx == nil || clusterAPI == nil {
+		return ClusterQuorum{}, cpierrors.Cloud("ReadClusterQuorum: cluster client unavailable")
+	}
+	view, err := readClusterViewAttempts(ctx, clusterAPI, 1)
+	if err != nil {
+		return ClusterQuorum{}, err
+	}
+	q := ClusterQuorum{Reported: view.clustered, Quorate: view.quorate, EntryNode: view.entry}
+	for name, row := range view.nodes {
+		if !row.Online {
+			if q.Offline == nil {
+				q.Offline = map[string]bool{}
+			}
+			q.Offline[name] = true
+		}
+	}
+	return q, nil
+}
+
 // readClusterView reads GET /cluster/status once and extracts membership, the
 // entry node, and the quorate flag as the entry node sees it.
-func readClusterView(ctx context.Context, clusterAPI NodeHealthCluster) (*clusterView, error) {
+func readClusterView(ctx context.Context, clusterAPI clusterStatusLister) (*clusterView, error) {
+	return readClusterViewAttempts(ctx, clusterAPI, 0)
+}
+
+// readClusterViewAttempts is readClusterView with the read's attempt budget
+// given; maxAttempts <= 0 takes RetryOnTransient's default.
+func readClusterViewAttempts(ctx context.Context, clusterAPI clusterStatusLister, maxAttempts int) (*clusterView, error) {
 	var resp *sdkcluster.ListStatusResponse
-	err := RetryOnTransient(ctx, nil, "node_health_cluster_status", 0, func() error {
+	err := RetryOnTransient(ctx, nil, "node_health_cluster_status", maxAttempts, func() error {
 		var inner error
 		resp, inner = clusterAPI.ListStatus(ctx)
 		return inner
