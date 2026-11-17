@@ -11,6 +11,7 @@ import (
 	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
@@ -602,5 +603,37 @@ func TestIsResourceNotFound(t *testing.T) {
 	}
 	if isResourceNotFound(nil) || isResourceNotFound(errors.New("500")) {
 		t.Error("nil and a server error are not not-found")
+	}
+}
+
+func TestStageKeepsAutoRebalanceOffForATargetedMemberUnderDLB(t *testing.T) {
+	t.Parallel()
+	p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+	in := baseInput(eligCfg(config.HAModeAuto, withDLB(true, "dlb")), vols("nfs:100/vm-101-disk-0")...)
+	for _, targeted := range []bool{false, true} {
+		in.NodeTargeted = targeted
+		d := mustDecide(t, p, in)
+		rig := &stageRig{}
+		if err := rig.stager().Stage(context.Background(), d, stageMarker); err != nil {
+			t.Fatal(err)
+		}
+		if rig.rebalance.Bool() == targeted {
+			t.Fatalf("targeted=%v: auto-rebalance = %v", targeted, rig.rebalance.Bool())
+		}
+	}
+}
+
+func TestStageLeavesTheFlagAloneOnAResourceThatAlreadyHoldsIt(t *testing.T) {
+	t.Parallel()
+	p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+	in := baseInput(eligCfg(config.HAModeAuto, withDLB(true, "dlb")), vols("nfs:100/vm-101-disk-0")...)
+	in.NodeTargeted = true
+	rig := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, failback: pveBool(false),
+		rebalance: pveBool(false)}
+	if err := rig.stager().Stage(context.Background(), mustDecide(t, p, in), stageMarker); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(rig.events, []string{"create:ignored", "get"}) || rig.rebalance.Bool() {
+		t.Fatalf("a resource with auto-rebalance off needs no update: %v", rig.events)
 	}
 }

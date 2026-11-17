@@ -879,3 +879,43 @@ func TestHAManagedTagAddAndRemove(t *testing.T) {
 		t.Fatalf("writes %v, want %v; a tag already present needs no write", writes, want)
 	}
 }
+
+// memberEnv is a BOSH env block that names an instance group.
+func memberEnv() map[string]any {
+	return map[string]any{"bosh": map[string]any{"instance": map[string]any{"name": "router"}}}
+}
+
+func TestCreatedVMHAInput_TargetNodeOfAGroupMember(t *testing.T) {
+	cfg := naPinConfig(map[string][]string{"z1": {"pve01", "pve02"}})
+	cfg.Placement.AntiAffinity = &config.AntiAffinityConfig{Enabled: boolPtrHelper(true)}
+	cfg.HA = haPinOn(boolPtrHelper(true))
+	cfg.HA.AntiAffinity = haChoiceOf("on")
+	deps := Deps{Config: cfg, RequestDirectorUUID: aaDirector}
+	shape := &createVMShape{node: "pve01"}
+	vmCfg := map[string]any{}
+	cases := map[string]struct {
+		target string
+		env    map[string]any
+		want   bool
+	}{
+		"member with target_node":      {"pve02", memberEnv(), true},
+		"member without target_node":   {"", memberEnv(), false},
+		"non-member with target_node":  {"pve02", map[string]any{}, false},
+		"blank target_node is not set": {"  ", memberEnv(), false},
+		"non-member without target":    {"", map[string]any{}, false},
+	}
+	for name, tc := range cases {
+		parsed := &createVMParsedArgs{cloudProps: createVMCloudProps{TargetNode: tc.target}, env: tc.env}
+		ctx := context.Background()
+		in := createdVMHAInput(ctx, deps, parsed, shape, 100, vmCfg, &ha.Profile{}, deps.Log(ctx))
+		if in.NodeTargeted != tc.want {
+			t.Errorf("%s: NodeTargeted = %v, want %v", name, in.NodeTargeted, tc.want)
+		}
+	}
+	off := *cfg
+	off.HA = haPinOn(boolPtrHelper(true))
+	off.HA.AntiAffinity = haChoiceOf("off")
+	if isAntiAffinityMember(Deps{Config: &off, RequestDirectorUUID: aaDirector}, memberEnv()) {
+		t.Error("pve.ha.anti_affinity off writes no membership, so the VM is no member")
+	}
+}

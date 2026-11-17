@@ -113,6 +113,11 @@ func decideCreatedVMHA(
 	for _, w := range decision.Warnings {
 		logger.Warn("create_vm: "+w, log.Int(metadataKeyVMID, vmid))
 	}
+	if decision.TargetNodeOverridesDLB {
+		logger.Info("create_vm: the VM sets target_node and is in an anti-affinity group, so target_node wins over "+
+			"the dynamic load balancer and its HA resource keeps auto-rebalance off",
+			log.Int(metadataKeyVMID, vmid), log.String("target_node", parsed.cloudProps.TargetNode))
+	}
 	switch decision.Outcome {
 	case ha.OutcomeFail:
 		failure := decision.Failure()
@@ -166,6 +171,14 @@ func warnRequestedHAWithoutRegistration(
 		log.String("reason", d.Reason))
 }
 
+// isAntiAffinityMember reports whether create_vm writes this VM into an
+// anti-affinity group's rule, which applyAntiAffinityMembership decides with
+// the same three checks.
+func isAntiAffinityMember(deps Deps, env map[string]any) bool {
+	return deps.Config.HAAntiAffinityValue() != config.HARuleOff && deps.Config.AntiAffinityEnabled() &&
+		haIdentityFor(deps, env).Group != ""
+}
+
 // createdVMHAInput builds the decision input from the VM's config, its shape,
 // and its cloud properties. It leaves State nil, because the VM was created by
 // this call and has no HA state for the decision to read yet, so the decision
@@ -184,6 +197,8 @@ func createdVMHAInput(
 		CPUType:     ha.EffectiveCPUType(deps.Config, &shape.cpuType, liveCPU),
 		InDLBAZ:     vmInDLBAZ(parsed.cloudProps, deps.Config),
 		LinkedClone: configHasLinkedClone(cfg) || shape.linkedClone,
+		NodeTargeted: strings.TrimSpace(parsed.cloudProps.TargetNode) != "" &&
+			isAntiAffinityMember(deps, parsed.env),
 	}
 	markLinkedRootDisk(in.Volumes, cfg, shape)
 	scopeHAInputToNode(&in, deps.Config, parsed.cloudProps, node)

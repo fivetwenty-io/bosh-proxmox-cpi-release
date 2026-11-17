@@ -156,6 +156,12 @@ type VMInput struct {
 	// InDLBAZ says the VM named the DLB sentinel AZ.
 	InDLBAZ bool
 
+	// NodeTargeted says the VM is a member of an anti-affinity group whose
+	// vm_type sets target_node. The operator named the node, so the resource
+	// is registered with auto-rebalance off even when the dynamic load
+	// balancer would otherwise take it (see VMDecision.TargetNodeOverridesDLB).
+	NodeTargeted bool
+
 	// LinkedClone says the VM's disks are linked clones of a base template,
 	// which replication cannot copy on its own.
 	LinkedClone bool
@@ -228,10 +234,14 @@ type VMDecision struct {
 
 	// Placed, Preferred, and DLB are the soft inputs of the pin. Priorities
 	// holds the resulting priority of each admissible node.
-	Placed     string
-	Preferred  []string
-	DLB        bool
-	Priorities map[string]int
+	Placed    string
+	Preferred []string
+	DLB       bool
+
+	// TargetNodeOverridesDLB is true when the VM would have been a DLB VM, and
+	// its input's NodeTargeted kept it out of the balancer.
+	TargetNodeOverridesDLB bool
+	Priorities             map[string]int
 
 	// Outside is the hard admissible set of a VM that already runs under HA
 	// and was refused because it is placed on a node outside that set. It is
@@ -513,6 +523,12 @@ func (e *eligibility) resolveDLB() bool {
 	sentinel := e.in.InDLBAZ && e.cfg.DLBAZName() != ""
 	global := e.cfg.HADLBEnabledValue()
 	if !sentinel && !global {
+		return true
+	}
+	if e.in.NodeTargeted {
+		// target_node wins for this VM, so it is not a DLB VM and its
+		// resource keeps auto-rebalance off.
+		e.d.TargetNodeOverridesDLB = true
 		return true
 	}
 	if e.p.DLBSupported {

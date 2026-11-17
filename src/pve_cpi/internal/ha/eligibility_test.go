@@ -744,6 +744,34 @@ func TestDecideVMAvailabilityZone(t *testing.T) {
 
 func TestDecideVMDLB(t *testing.T) {
 	disks := vols("nfs:100/vm-101-disk-0")
+	t.Run("target_node of a group member wins over the sentinel AZ and dlb.enabled", func(t *testing.T) {
+		p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+		sentinel := baseInput(eligCfg(config.HAModeAuto), disks...)
+		sentinel.InDLBAZ = true
+		global := baseInput(eligCfg(config.HAModeAuto, withDLB(true, "dlb")), disks...)
+		for name, in := range map[string]VMInput{"sentinel": sentinel, "global": global} {
+			in.NodeTargeted = true
+			d := mustDecide(t, p, in)
+			if !d.Registers() || d.DLB || !d.TargetNodeOverridesDLB {
+				t.Fatalf("%s: a targeted member is no DLB VM: %+v", name, d)
+			}
+		}
+	})
+	t.Run("a VM without target_node stays a DLB VM", func(t *testing.T) {
+		p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+		d := mustDecide(t, p, baseInput(eligCfg(config.HAModeAuto, withDLB(true, "dlb")), disks...))
+		if !d.DLB || d.TargetNodeOverridesDLB {
+			t.Fatalf("decision = %+v", d)
+		}
+	})
+	t.Run("target_node with no DLB in play overrides nothing", func(t *testing.T) {
+		p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+		in := baseInput(eligCfg(config.HAModeAuto, withDLB(false, "")), disks...)
+		in.NodeTargeted = true
+		if d := mustDecide(t, p, in); d.DLB || d.TargetNodeOverridesDLB {
+			t.Fatalf("decision = %+v", d)
+		}
+	})
 	t.Run("the sentinel AZ makes a DLB VM without a placed priority", func(t *testing.T) {
 		for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
 			p := eligProfile(mode, "pve1", "pve2", "pve3")

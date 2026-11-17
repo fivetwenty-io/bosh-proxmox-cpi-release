@@ -2363,3 +2363,19 @@ func TestCollectEntryClockHealthyEntryReportsNothing(t *testing.T) {
 		t.Errorf("entry clock reads = %d, want none for a healthy entry", f.clockReads)
 	}
 }
+
+// A VM whose vm_type set target_node and whose resource carries auto-rebalance
+// off under pve.ha.dlb.enabled is healthy. The doctor reads no per-resource
+// auto-rebalance flag, so it reports nothing about it.
+func TestCollectAcceptsATargetedMemberUnderDLB(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	f.profile.CRS = ha.CRS{Known: true, Mode: "dynamic", AutoRebalance: true}
+	cfg := haCfg("auto", "none")
+	on := true
+	cfg.HA.DLB = &config.HADLBConfig{Enabled: &on}
+	r := runCollect(t, f, cfg)
+	if len(r.Findings) != 0 {
+		t.Fatalf("a healthy resource gets no finding: %+v", r.Findings)
+	}
+}
