@@ -305,7 +305,7 @@ Local disks live on one node. A planned maintenance migration can copy them, but
 
 - **`hold`**
 
-  The VM is HA-managed with a strict pin that names only its own node. After a failure, HA waits for the node and restarts the VM in place, which is faster than waiting for the resurrector. HA cannot evacuate such a VM for maintenance, because the pin forbids every other node, so the maintenance request on the node never completes while the VM runs. Operators stop `hold` VMs before node maintenance, as [the maintenance procedure](operations.md#node-maintenance-with-hold-vms) describes.
+  The VM is HA-managed with a strict pin that names only its own node. After a failure, HA waits for the node and restarts the VM in place, which is faster than waiting for the resurrector. HA cannot evacuate such a VM for maintenance, because the pin forbids every other node, so the maintenance request on the node never completes while the VM runs. Operators stop `hold` VMs before node maintenance, as [the maintenance procedure](operations.md#node-maintenance-with-hold-vms) describes. Since a `hold` VM never leaves the node it was created on, its anti-affinity spread has to be right when the CPI places it. Parallel creates of an instance group count each other's picks through the spread claims, so two `hold` siblings that the Director creates at the same moment land on different nodes.
 
 - **`replicate`**
 

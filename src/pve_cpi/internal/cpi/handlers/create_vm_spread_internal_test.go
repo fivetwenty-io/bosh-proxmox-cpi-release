@@ -547,3 +547,54 @@ func TestSpreadClaims_ParallelSiblingsSpreadInEitherOverflowMode(t *testing.T) {
 		})
 	}
 }
+
+// TestSpreadClaims_ParallelLocalSiblingsInAnAZPickDistinctNodes places two
+// creates of one group at the same moment in an AZ of two nodes, with their
+// VMs on node-local storage and pve.ha.local_policy hold or replicate. A hold
+// VM can't move after it's placed, and a replicate VM moves only to its
+// replication target, so the spread must be right at the pick. Two siblings
+// on one node would also make their strict pins conflict in the group's
+// rule, and the guard would then take one of them out of HA. Whatever order
+// the picks run in, the two must land on the AZ's two nodes.
+func TestSpreadClaims_ParallelLocalSiblingsInAnAZPickDistinctNodes(t *testing.T) {
+	t.Parallel()
+	for _, policy := range []string{config.HALocalPolicyHold, config.HALocalPolicyReplicate} {
+		t.Run(policy, func(t *testing.T) {
+			t.Parallel()
+			deps := spreadDeps(spreadClaimStore(t))
+			deps.Config.Placement.AZMap = map[string][]string{"z2": {"pve2", "pve3"}}
+			deps.Config.HA = &config.HAConfig{Mode: haChoiceOf(config.HAModeAuto), LocalPolicy: haChoiceOf(policy)}
+			cp := createVMCloudProps{AvailabilityZone: "z2"}
+			claims := []*spreadClaims{mustSpreadClaims(t, deps), mustSpreadClaims(t, deps)}
+			var (
+				wg    sync.WaitGroup
+				mu    sync.Mutex
+				picks []string
+				errs  []error
+			)
+			start := make(chan struct{})
+			for _, c := range claims {
+				wg.Go(func() {
+					<-start
+					group := antiAffinityScorerGroup(deps, aaEnvForWebGroup())
+					group.claims = c
+					node, _, err := resolveTargetNodeWithBridges(context.Background(), deps, cp, group, nil, nil,
+						nil, 0, bridgePlan{})
+					mu.Lock()
+					defer mu.Unlock()
+					picks = append(picks, node)
+					errs = append(errs, err)
+				})
+			}
+			close(start)
+			wg.Wait()
+			if err := errors.Join(errs...); err != nil {
+				t.Fatal(err)
+			}
+			slices.Sort(picks)
+			if want := []string{"pve2", "pve3"}; !slices.Equal(picks, want) {
+				t.Fatalf("picks = %v; want one sibling on each node of the AZ %v", picks, want)
+			}
+		})
+	}
+}
