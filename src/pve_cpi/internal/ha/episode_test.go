@@ -590,8 +590,12 @@ func TestEpisodeStore_ForCallWarnsOnceHoweverManyTimesItObserves(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if _, _, err := call.ForCall().LastRecoveryDeferral("vm:101"); err != nil {
+		t.Fatal(err)
+	}
 	if warns := warnLines(logs); len(warns) != 1 {
-		t.Errorf("a call's store logged %d warnings for three observations, want one", len(warns))
+		t.Errorf("a call's store, and a copy made from it inside the call, logged %d warnings, want one",
+			len(warns))
 	}
 
 	// The copy leaves the store it came from alone, and the next call warns again.

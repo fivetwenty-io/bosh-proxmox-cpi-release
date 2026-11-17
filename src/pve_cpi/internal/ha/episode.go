@@ -140,13 +140,17 @@ type EpisodeStore struct {
 // most once however many observations it serves. One CPI call can observe an
 // episode twice, such as the delete gate and the dead-node completion that
 // follows it, and the operator reads one line about the directory. The copy
-// shares nothing else with the store, and a call builds its own.
+// shares nothing else with the store, and a call builds its own. A store that
+// is already a call's copy keeps its once, so a delete that the dead-node
+// completion runs again inside the same call does not warn a second time.
 func (s *EpisodeStore) ForCall() *EpisodeStore {
 	if s == nil {
 		return &EpisodeStore{warnOnce: new(sync.Once)}
 	}
 	call := *s
-	call.warnOnce = new(sync.Once)
+	if call.warnOnce == nil {
+		call.warnOnce = new(sync.Once)
+	}
 	return &call
 }
 
