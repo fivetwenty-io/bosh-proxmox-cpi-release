@@ -580,7 +580,7 @@ We have two ways out. We can bring the member back, and the next retry reads the
 **Symptom**
 
 ```text
-set_disk_metadata: disk "pvd-..." is not attached to a VM on any online node, and the cluster reports pve3 offline, so it may be attached to a VM there; metadata not persisted
+set_disk_metadata: disk "pvd-..." is not attached to a VM on any online node, and the cluster reports pve3 offline, so it may be attached to a VM there; metadata not persisted; retry once pve3 is back in the cluster
 create_disk: no allocation submitted: create_disk: hinted VM is not on any online node, and the cluster reports pve3 offline, and listing it again did not find the VM there either
 ```
 
@@ -588,7 +588,7 @@ When the second listing of the node itself fails, the node's listing error follo
 
 **Diagnosis**
 
-Both calls look for their target on the nodes the cluster reports online, and they leave out a node that is down. When the target turns up on an online node, the call goes ahead and the down node doesn't matter. When it doesn't, the call lists the left-out node again with the full retry budget, because a node whose corosync link drops for a few seconds keeps its guests running, and a target found there lets the call go ahead. These errors mean that the target wasn't on any online node and that the second listing didn't settle it, so the target is most likely on the node the error names. The CPI can't read or change a VM on a node that is down, and it won't guess that the target is gone, so it fails the call with a retriable error. `set_disk_metadata` writes nothing, and `create_disk` says "no allocation submitted" when it fails before it submits one.
+Both calls look for their target on the nodes the cluster reports online, and they leave out a node that is down. When the target turns up on an online node, the call goes ahead and the down node doesn't matter. When it doesn't, `set_disk_metadata` first reads the cluster index, which still lists the down node's guests. If every guest listed there is a container, a template, or a `bosh-parker` VM, no VM on the node can hold the disk, so the call reports it as not attached, logs a warning that names the node, and doesn't fail. Otherwise, and for `create_disk`, the call lists the left-out node again with the full retry budget, because a node whose corosync link drops for a few seconds keeps its guests running, and a target found there lets the call go ahead. These errors mean that the target wasn't on any online node and that the second listing didn't settle it, so the target is most likely on the node the error names. The CPI can't read or change a VM on a node that is down, and it won't guess that the target is gone, so it fails the call with a retriable error. `set_disk_metadata` writes nothing, and `create_disk` says "no allocation submitted" when it fails before it submits one.
 
 **Fix**
 
