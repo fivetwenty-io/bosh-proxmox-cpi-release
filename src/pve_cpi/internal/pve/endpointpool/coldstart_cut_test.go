@@ -18,7 +18,11 @@ import (
 
 // statusRoutes returns candidate routes whose probe path answers with code
 // once hang is false, and whose probe waits for the client to go away while
-// hang is true, signalling arrived when it starts waiting.
+// hang is true, signalling arrived when it starts waiting. A hung probe never
+// answers, not even when the client goes away: the handler aborts the
+// connection, because a handler that merely returns makes the server write an
+// empty 200 into a connection the client is closing, and the client may read
+// that byte before the close takes effect.
 func statusRoutes(code int, hang *atomic.Bool, arrived chan<- struct{}) *pvetest.Routes {
 	routes := pvetest.NewRoutes()
 	routes.HandleFunc(http.MethodGet, "/cluster/status", func(w http.ResponseWriter, r *http.Request) {
