@@ -62,6 +62,7 @@ const (
 	haKindOffModeRule           = "off_mode_rule"
 	haKindGuestsNotListed       = "guests_not_enumerated"
 	haKindCacheDirectory        = "cache_directory"
+	haKindSoftPinAffinity       = "soft_pin_resource_affinity"
 )
 
 // haFinding is one thing the doctor found.
