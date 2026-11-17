@@ -189,27 +189,12 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 		// the new disk, which is where an HA migration the CRM had queued
 		// leaves it. PVE HA moves it into the set first, so it keeps HA, and
 		// the decision runs again on the node it moved to.
-		moved, err := attachMoveIntoSet(ctx, deps, narrow, profile, vmid, loc.Node, d.Outside, oldPin, rd)
-		if err != nil {
+		if loc.Node, cfg, d, err = attachDecideInsideSet(ctx, deps, narrow, profile, attachOutside{
+			vmid: vmid, node: loc.Node, cfg: cfg, decision: d, res: res, oldPin: oldPin, disk: rd,
+		}); err != nil {
 			return nil, err
 		}
-		if moved != "" {
-			loc.Node = moved
-			if cfg, err = deps.PVE.QEMU().Config(ctx, moved, vmid); err != nil {
-				return nil, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
-					fmt.Sprintf("%s: read the config of VM %d for its HA decision after PVE HA moved it", op, vmid))
-			}
-			in = attachHAInput(deps, vmid, moved, cfg, res, oldPin, rd)
-			if d, err = profile.DecideVM(in); err != nil {
-				return nil, err
-			}
-			if len(d.Outside) > 0 {
-				return nil, cpierrors.Retriable("%s: PVE HA moved VM %d to node %s, and the VM is still outside its "+
-					"admissible set %s with the new disk, so the attach waits and the VM keeps its HA resource, "+
-					"its tag, and its pin. %s", op, vmid, moved, strings.Join(d.Outside, ","),
-					attachMoveAction(vmid, d.Outside))
-			}
-		}
+		in = attachHAInput(deps, vmid, loc.Node, cfg, res, oldPin, rd)
 	}
 	for _, w := range d.Warnings {
 		logger.Warn(op+": "+w, log.Int(metadataKeyVMID, vmid))
@@ -273,6 +258,49 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 // attachNarrowDeps wires the barrier, the removal from HA, and the move into
 // a node set to a client. Tests replace it to script PVE HA.
 var attachNarrowDeps = ha.NarrowDepsFor
+
+// attachOutside is the HA decision of a VM that DecideVM found outside its
+// admissible set, with what attachDecideInsideSet needs to decide again.
+type attachOutside struct {
+	vmid     int
+	node     string
+	cfg      map[string]any
+	decision *ha.VMDecision
+	res      *cluster.GetHaResourcesResponse
+	oldPin   *ha.Rule
+	disk     resolvedDisk
+}
+
+// attachDecideInsideSet has PVE HA move a VM that runs outside its admissible
+// set into it, and decides again on the node the VM reaches. It returns the
+// VM's node, its config, and the decision that apply from then on. When the
+// move fails and the VM leaves HA, it returns the first decision unchanged.
+func attachDecideInsideSet(ctx context.Context, deps Deps, narrow ha.NarrowDeps, profile *ha.Profile,
+	o attachOutside,
+) (string, map[string]any, *ha.VMDecision, error) {
+	const op = attachHAOp
+	moved, err := attachMoveIntoSet(ctx, deps, narrow, profile, o.vmid, o.node, o.decision.Outside, o.oldPin,
+		o.disk)
+	if err != nil || moved == "" {
+		return o.node, o.cfg, o.decision, err
+	}
+	cfg, err := deps.PVE.QEMU().Config(ctx, moved, o.vmid)
+	if err != nil {
+		return "", nil, nil, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: read the config of VM %d for its HA decision after PVE HA moved it", op, o.vmid))
+	}
+	d, err := profile.DecideVM(attachHAInput(deps, o.vmid, moved, cfg, o.res, o.oldPin, o.disk))
+	if err != nil {
+		return "", nil, nil, err
+	}
+	if len(d.Outside) > 0 {
+		return "", nil, nil, cpierrors.Retriable("%s: PVE HA moved VM %d to node %s, and the VM is still outside "+
+			"its admissible set %s with the new disk, so the attach waits and the VM keeps its HA resource, its "+
+			"tag, and its pin. %s", op, o.vmid, moved, strings.Join(d.Outside, ","), attachMoveAction(o.vmid,
+			d.Outside))
+	}
+	return moved, cfg, d, nil
+}
 
 // attachMoveIntoSet asks PVE HA to move an HA-managed VM that runs on node,
 // outside set, its admissible set with the new disk, to a node of set (see
