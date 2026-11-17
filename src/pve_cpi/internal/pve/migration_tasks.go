@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -15,6 +16,7 @@ import (
 type MigrationTaskReader interface {
 	MigrationTasks(ctx context.Context, node string, vmid int, since time.Time) ([]VMTask, error)
 	StartTasks(ctx context.Context, node string, vmid int, since time.Time) ([]VMTask, error)
+	TaskLog(ctx context.Context, node, upid string) ([]string, error)
 }
 
 // VMTask is one row of a node's task list for one VM, such as a qmigrate or
@@ -62,6 +64,7 @@ func (t VMTask) End() time.Time {
 const (
 	auditReadMigrationTasks = "migration tasks"
 	auditReadStartTasks     = "start tasks"
+	auditReadTaskLog        = "task log"
 )
 
 // migrationTaskLimit bounds one listing. A listing that comes back full may
@@ -157,4 +160,93 @@ func observeVMTasks(
 		}
 	}
 	return tasks, nil
+}
+
+// Bounds of a task log read. A page holds taskLogPage lines, and a log longer
+// than taskLogLimit lines is refused rather than read in part.
+const (
+	taskLogPage  = 1000
+	taskLogLimit = 50000
+)
+
+// taskLogLine is one line of GET /nodes/{node}/tasks/{upid}/log, numbered from
+// one.
+type taskLogLine struct {
+	N *int    `json:"n"`
+	T *string `json:"t"`
+}
+
+// TaskLog reads the whole log of the task upid on node, one string per line.
+// PVE shows another user's task log only to a caller with Sys.Audit on the
+// node (pve-manager API2/Tasks.pm read_task_log), so the read proves that
+// grant first, as the task listings do. It reads the log in pages and checks
+// that each page carries the lines it asked for, in order. PVE answers a log
+// it can't open, and an empty one, with a single line that stands in for the
+// log (pve-common PVE::Tools dump_logfile), so the read refuses both, and it
+// refuses a log longer than it reads.
+func (c *sdkClient) TaskLog(ctx context.Context, node, upid string) ([]string, error) {
+	if c == nil {
+		return nil, ErrAuditVisibilityReaderUnavailable
+	}
+	return observeTaskLog(ctx, c.auditReader, node, upid)
+}
+
+func observeTaskLog(ctx context.Context, reader auditPermissionGetter, node, upid string) ([]string, error) {
+	if ctx == nil || reader == nil {
+		return nil, ErrAuditVisibilityReaderUnavailable
+	}
+	match := cleanupTaskUPIDPattern.FindStringSubmatch(upid)
+	if node == "" || len(node) > 255 || !cleanupTaskNodePattern.MatchString(node) || match == nil ||
+		match[1] != node {
+		return nil, &AuditVisibilityReadError{Read: auditReadTaskLog, Path: "/nodes", Malformed: true,
+			text: "task log node or UPID malformed"}
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	privilegePath := "/nodes/" + node
+	permissions, err := auditPermissionsAt(ctx, reader, privilegePath)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := permissions["Sys.Audit"]; !ok {
+		return nil, &AuditVisibilityError{Privilege: "Sys.Audit", Path: privilegePath}
+	}
+	path := "/nodes/" + url.PathEscape(node) + "/tasks/" + url.PathEscape(upid) + "/log"
+	malformed := &AuditVisibilityReadError{Read: auditReadTaskLog, Path: path, Malformed: true,
+		text: "task log malformed"}
+	var lines []string
+	for {
+		raw, err := reader.GetCtx(ctx, path, map[string]interface{}{"start": len(lines), "limit": taskLogPage})
+		if err != nil {
+			return nil, &AuditVisibilityReadError{Read: auditReadTaskLog, Path: path, Cause: err,
+				text: "task log unavailable"}
+		}
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			return nil, malformed
+		}
+		var page []taskLogLine
+		if err := json.Unmarshal(encoded, &page); err != nil || page == nil {
+			return nil, malformed
+		}
+		for _, line := range page {
+			if line.N == nil || line.T == nil || *line.N != len(lines)+1 {
+				return nil, malformed
+			}
+			lines = append(lines, *line.T)
+		}
+		if len(lines) > taskLogLimit {
+			return nil, &AuditVisibilityReadError{Read: auditReadTaskLog, Path: path, Malformed: true,
+				text: "task log longer than the CPI reads"}
+		}
+		if len(page) < taskLogPage {
+			break
+		}
+	}
+	if len(lines) == 0 || len(lines) == 1 && (lines[0] == "no content" ||
+		strings.HasPrefix(lines[0], "unable to open file - ")) {
+		return nil, &AuditVisibilityReadError{Read: auditReadTaskLog, Path: path, Malformed: true,
+			text: "task log unreadable or empty"}
+	}
+	return lines, nil
 }

@@ -833,13 +833,28 @@ type taskListStub struct {
 	err          map[string]error
 	migrationErr map[string]error
 	startErr     map[string]error
-	calls        []string
+	// logs holds each task's log by UPID, and a task without one fails its
+	// log read.
+	logs  map[string][]string
+	calls []string
 }
 
 func newTaskListStub() *taskListStub {
 	return &taskListStub{moves: map[string][]pve.ActiveTask{}, migrations: map[string][]pve.VMTask{},
 		starts: map[string][]pve.VMTask{}, err: map[string]error{}, migrationErr: map[string]error{},
-		startErr: map[string]error{}}
+		startErr: map[string]error{}, logs: map[string][]string{}}
+}
+
+func (c *attachRunClient) TaskLog(_ context.Context, node, upid string) ([]string, error) {
+	if c.tasks == nil {
+		return nil, errors.New("no task listing stubbed")
+	}
+	c.tasks.calls = append(c.tasks.calls, "log:"+upid)
+	lines, ok := c.tasks.logs[upid]
+	if !ok {
+		return nil, errors.New("no log stubbed for task " + upid + " on " + node)
+	}
+	return lines, nil
 }
 
 // started records a qmstart task of VM 100 on node that ran from start to

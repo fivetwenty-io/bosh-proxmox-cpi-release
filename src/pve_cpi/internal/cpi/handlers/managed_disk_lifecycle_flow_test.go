@@ -1055,6 +1055,11 @@ func (c *lifecycleFlowPVE) StartTasks(context.Context, string, int, time.Time) (
 	return []pve.VMTask{}, nil
 }
 
+// TaskLog serves no task log, so a read of one fails.
+func (c *lifecycleFlowPVE) TaskLog(_ context.Context, node, upid string) ([]string, error) {
+	return nil, fmt.Errorf("no log for task %s on %s", upid, node)
+}
+
 // volumeDeleted applies visibilityErrAfterDelete and runs onVolumeDeleted
 // once any volume is deleted.
 func (c *lifecycleFlowPVE) volumeDeleted() {

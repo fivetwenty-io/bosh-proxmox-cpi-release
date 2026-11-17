@@ -134,7 +134,19 @@ func TestMigrationEvidenceOfStarts(t *testing.T) {
 type partnerTaskReader struct {
 	migrations, starts map[string][]pve.VMTask
 	errs               map[string]error
-	calls              []string
+	// logs holds each task's log by UPID, and a task without one fails its
+	// log read.
+	logs  map[string][]string
+	calls []string
+}
+
+func (r *partnerTaskReader) TaskLog(_ context.Context, node, upid string) ([]string, error) {
+	r.calls = append(r.calls, "log:"+upid)
+	lines, ok := r.logs[upid]
+	if !ok {
+		return nil, errors.New("no log for task " + upid + " on " + node)
+	}
+	return lines, nil
 }
 
 func (r *partnerTaskReader) MigrationTasks(_ context.Context, node string, _ int, _ time.Time) ([]pve.VMTask, error) {

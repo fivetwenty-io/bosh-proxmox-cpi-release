@@ -52,6 +52,9 @@ type fakeHA struct {
 	migrationErr map[string]error
 	starts       map[string][]pve.VMTask
 	startErr     map[string]error
+	// taskLogs holds each task's log by UPID, and a task without one fails
+	// its log read.
+	taskLogs map[string][]string
 
 	storages    []pve.StorageInfo
 	storagesErr error
@@ -116,6 +119,14 @@ func (f *fakeHA) StartTasks(_ context.Context, node string, _ int, _ time.Time) 
 		return nil, err
 	}
 	return f.starts[node], nil
+}
+
+func (f *fakeHA) TaskLog(_ context.Context, node, upid string) ([]string, error) {
+	lines, ok := f.taskLogs[upid]
+	if !ok {
+		return nil, errors.New("no log for task " + upid + " on " + node)
+	}
+	return lines, nil
 }
 
 func (f *fakeHA) StorageVolumes(_ context.Context, node, storage string) (map[string]bool, error) {

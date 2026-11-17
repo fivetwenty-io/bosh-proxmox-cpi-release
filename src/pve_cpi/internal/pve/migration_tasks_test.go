@@ -1,8 +1,11 @@
 package pve_test
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -198,5 +201,116 @@ func TestMigrationTaskOutcome(t *testing.T) {
 	}
 	if !(pve.VMTask{EndTime: 10}).End().Equal(time.Unix(10, 0)) || !(pve.VMTask{}).End().IsZero() {
 		t.Error("End does not read the end time")
+	}
+}
+
+// taskLogWireServer answers the permission read and the log of task
+// migrationTaskWireUPID on node pve1 with permission and the lines of log,
+// paged by the start and limit the read sends. A line holds its number and
+// its text, unless renumber changes the number PVE reports.
+func taskLogWireServer(
+	t *testing.T, permission string, log []string, renumber func(int) int, requests *[]string,
+) *http.ServeMux {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api2/json/", func(w http.ResponseWriter, r *http.Request) {
+		*requests = append(*requests, r.URL.Path)
+		if r.Method != "GET" {
+			t.Errorf("mutation attempted: %s", r.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api2/json/access/permissions":
+			if permission == "" {
+				permission = `{"data":{"/nodes/pve1":{"Sys.Audit":1}}}`
+			}
+			_, _ = w.Write([]byte(permission))
+		case "/api2/json/nodes/pve1/tasks/" + migrationTaskWireUPID + "/log":
+			start, _ := strconv.Atoi(r.URL.Query().Get("start"))
+			limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+			if limit != 1000 {
+				t.Errorf("the task log read asked for %d lines a page", limit)
+			}
+			page := []map[string]any{}
+			for i := start; i < len(log) && i < start+limit; i++ {
+				n := i + 1
+				if renumber != nil {
+					n = renumber(n)
+				}
+				page = append(page, map[string]any{"n": n, "t": log[i]})
+			}
+			body, _ := json.Marshal(map[string]any{"data": page, "total": len(log)})
+			_, _ = w.Write(body)
+		default:
+			t.Errorf("unexpected API path %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	})
+	return mux
+}
+
+// TestTaskLogWire reads the log of a qmigrate task on pve1 and checks that a
+// log PVE could not open, an empty log, a log with a missing line, a log
+// longer than the read allows, and a task of another node are refused.
+func TestTaskLogWire(t *testing.T) {
+	long := make([]string, 2500)
+	for i := range long {
+		long[i] = fmt.Sprintf("line %d", i+1)
+	}
+	tooLong := make([]string, 50001)
+	for i := range tooLong {
+		tooLong[i] = "x"
+	}
+	for _, tc := range []struct {
+		name, permission, node string
+		log                    []string
+		renumber               func(int) int
+		wantSysAudit, wantErr  bool
+		wantLines              int
+	}{
+		{name: "a short log", log: []string{"starting migration", "TASK OK"}, wantLines: 2},
+		{name: "a log over three pages", log: long, wantLines: 2500},
+		{name: "no Sys.Audit", log: []string{"TASK OK"}, permission: `{"data":{"/nodes/pve1":{"VM.Audit":1}}}`,
+			wantSysAudit: true, wantErr: true},
+		{name: "a log PVE could not open", log: []string{"unable to open file - No such file or directory"},
+			wantErr: true},
+		{name: "an empty log", log: []string{"no content"}, wantErr: true},
+		{name: "a line missing", log: []string{"a", "b", "c"},
+			renumber: func(n int) int { return map[bool]int{true: n + 1, false: n}[n > 1] }, wantErr: true},
+		{name: "a log longer than the read allows", log: tooLong, wantErr: true},
+		{name: "a task of another node", node: "pve2", log: []string{"TASK OK"}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests []string
+			client := newPoolStubClient(t, taskLogWireServer(t, tc.permission, tc.log, tc.renumber, &requests))
+			reader, ok := client.(pve.MigrationTaskReader)
+			if !ok {
+				t.Fatal("the PVE client cannot read task logs")
+			}
+			node := tc.node
+			if node == "" {
+				node = "pve1"
+			}
+			lines, err := reader.TaskLog(t.Context(), node, migrationTaskWireUPID)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("unexpected read: %d lines, %v", len(lines), err)
+			}
+			var visibility *pve.AuditVisibilityError
+			if got := errors.As(err, &visibility) && visibility.Privilege == "Sys.Audit"; got != tc.wantSysAudit {
+				t.Fatalf("want a Sys.Audit refusal %v, got %v", tc.wantSysAudit, err)
+			}
+			if tc.wantSysAudit && len(requests) != 1 {
+				t.Fatalf("the log read ran without Sys.Audit: %v", requests)
+			}
+			if err != nil {
+				if lines != nil {
+					t.Fatal("a partial log escaped")
+				}
+				return
+			}
+			if len(lines) != tc.wantLines || lines[0] != tc.log[0] || lines[len(lines)-1] != tc.log[len(tc.log)-1] {
+				t.Fatalf("read %d lines, want %d in order", len(lines), tc.wantLines)
+			}
+		})
 	}
 }
