@@ -203,7 +203,7 @@ func prepareManagedDisk(ctx context.Context, deps Deps, selection *StoragePlacem
 			return observed, e
 		}
 		if hint != "" {
-			node, e := managedDiskHintNode(ctx, deps, hint)
+			node, e := hintNodeBeforeSubmission(ctx, deps, hint)
 			if e != nil {
 				return nil, e
 			}
@@ -262,10 +262,20 @@ func managedDiskSize(sizeMB int) (uint64, int, error) {
 // the offline-tolerant guest listing, so a node the quorate cluster reports
 // offline is left out instead of stalling every hint read through the
 // listing's retries and then failing create_disk. A VM found on a listed node
-// settles the answer, because a VMID names one guest. When the VM is on no
-// listed node and a node was left out, the VM may be on that node, where no
-// disk can be created for it, so the call fails retriable and names the
-// node. Only a scan that left nothing out can say the VM does not exist.
+// settles the answer, because a VMID names one guest.
+//
+// When the VM is on no listed node and a node was left out, the VM may be on
+// that node. The left-out nodes are then listed again with the strict retry
+// budget, which rides out a corosync blip that dropped a node whose guests
+// kept running, and a VM found there settles the answer too. When the VM still
+// isn't found, the call fails retriable and names the nodes, because no disk
+// can be created for a VM on a node that can't answer, and because PVE HA may
+// have moved the VM between the two listings. Only a listing that left
+// nothing out can say the VM does not exist.
+//
+// The errors never say whether an allocation was submitted, because some
+// callers ask after a submission. hintNodeBeforeSubmission adds that for the
+// callers that ask before one.
 func managedDiskHintNode(ctx context.Context, deps Deps, hint string) (string, error) {
 	parsedHint, err := vmcid.Parse(hint)
 	if err != nil {
@@ -274,8 +284,31 @@ func managedDiskHintNode(ctx context.Context, deps Deps, hint string) (string, e
 	vmid := parsedHint.VMID
 	guests, offline, err := pve.ListGuestsAuthoritativeTolerant(ctx, deps.PVE, deps.Log(ctx))
 	if err != nil {
-		return "", cpierrors.Cloud("create_disk: current hinted VM location observation failed")
+		return "", cpierrors.Wrap(err, "create_disk: current hinted VM location observation failed")
 	}
+	node, err := hintedGuestNode(guests, vmid)
+	if err != nil || node != "" {
+		return node, err
+	}
+	if len(offline) == 0 {
+		return "", cpierrors.Cloud("create_disk: hinted VM does not exist")
+	}
+	notOnline := fmt.Sprintf("create_disk: hinted VM is not on any online node, and the cluster reports %s offline",
+		strings.Join(offline, ", "))
+	again, err := pve.ListMemberGuests(ctx, deps.PVE, deps.Log(ctx), offline)
+	if err != nil {
+		return "", cpierrors.Wrap(err, notOnline)
+	}
+	node, err = hintedGuestNode(again, vmid)
+	if err != nil || node != "" {
+		return node, err
+	}
+	return "", cpierrors.Retriable("%s, and listing it again did not find the VM there either", notOnline)
+}
+
+// hintedGuestNode returns the node of the guest with vmid in guests, or "" when
+// none has it. Two nodes listing the same VMID make the location ambiguous.
+func hintedGuestNode(guests []pve.GuestRef, vmid int) (string, error) {
 	node := ""
 	for _, guest := range guests {
 		if guest.VMID == vmid {
@@ -285,13 +318,15 @@ func managedDiskHintNode(ctx context.Context, deps Deps, hint string) (string, e
 			node = guest.Node
 		}
 	}
-	if node == "" && len(offline) > 0 {
-		return "", cpierrors.Retriable(
-			"create_disk: hinted VM is not on any online node, and the cluster reports %s offline; no allocation submitted",
-			strings.Join(offline, ", "))
-	}
-	if node == "" {
-		return "", cpierrors.Cloud("create_disk: hinted VM does not exist")
+	return node, nil
+}
+
+// hintNodeBeforeSubmission is managedDiskHintNode for a caller that asks before
+// any allocation is submitted, so a failure can say that nothing was.
+func hintNodeBeforeSubmission(ctx context.Context, deps Deps, hint string) (string, error) {
+	node, err := managedDiskHintNode(ctx, deps, hint)
+	if err != nil {
+		return "", cpierrors.Wrap(err, "create_disk: no allocation submitted")
 	}
 	return node, nil
 }
@@ -305,7 +340,7 @@ func managedDiskNodes(ctx context.Context, deps Deps, cp createDiskCloudProperti
 	}
 	switch {
 	case hint != "":
-		node, err := managedDiskHintNode(ctx, deps, hint)
+		node, err := hintNodeBeforeSubmission(ctx, deps, hint)
 		if err != nil {
 			return nil, err
 		}
@@ -634,7 +669,7 @@ func managedDiskPlanningNodes(ctx context.Context, deps Deps, hint string, nodes
 	if hint == "" {
 		return nodes, nil
 	}
-	node, err := managedDiskHintNode(ctx, deps, hint)
+	node, err := hintNodeBeforeSubmission(ctx, deps, hint)
 	if err != nil {
 		return nil, err
 	}

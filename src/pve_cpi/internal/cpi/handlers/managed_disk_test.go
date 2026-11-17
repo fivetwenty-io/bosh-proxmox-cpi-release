@@ -51,8 +51,13 @@ type managedDiskTestState struct {
 	guestErr      error
 	// downNode, when set, is a second member the quorate cluster reports
 	// offline. Its listing answers 595, and downLists counts the attempts.
-	downNode  string
-	downLists int
+	// downFailures, when positive, makes only that many listings fail, and
+	// the ones after them answer downGuests, the way a node that blipped
+	// answers once it is back.
+	downNode     string
+	downLists    int
+	downFailures int
+	downGuests   []int
 }
 type managedDiskTestStorage struct {
 	storage.Service
@@ -220,7 +225,15 @@ func (managedDiskTestDefinitions) ListStorage(context.Context, *clusterstorage.L
 func (n managedDiskTestNodes) ListQemu(_ context.Context, node string, _ *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
 	if n.state.downNode != "" && node == n.state.downNode {
 		n.state.downLists++
-		return nil, pveerrors.ParseAPIError(595, []byte(`{"message":"no route to host","code":595}`))
+		if n.state.downFailures <= 0 || n.state.downLists <= n.state.downFailures {
+			return nil, pveerrors.ParseAPIError(595, []byte(`{"message":"no route to host","code":595}`))
+		}
+		r := nodes.ListQemuResponse{}
+		for _, vmid := range n.state.downGuests {
+			raw, _ := json.Marshal(map[string]any{"vmid": vmid})
+			r = append(r, raw)
+		}
+		return &r, nil
 	}
 	if n.state.guestErr != nil {
 		return nil, n.state.guestErr
