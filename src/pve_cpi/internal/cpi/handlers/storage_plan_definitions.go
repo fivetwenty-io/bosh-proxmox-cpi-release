@@ -125,8 +125,8 @@ func storageDefinitionsWire(d map[string]pve.StorageInfo) map[string]storageDefi
 		return nil
 	}
 	out := make(map[string]storageDefinitionWire, len(d))
-	for id, info := range d {
-		out[id] = storageDefinitionWire(info)
+	for id := range d {
+		out[id] = storageDefinitionWire(d[id])
 	}
 	return out
 }
@@ -136,8 +136,8 @@ func storageDefinitionsSnakeWire(d map[string]pve.StorageInfo) map[string]storag
 		return nil
 	}
 	out := make(map[string]storageDefinitionSnakeWire, len(d))
-	for id, info := range d {
-		out[id] = storageDefinitionSnakeWire(info)
+	for id := range d {
+		out[id] = storageDefinitionSnakeWire(d[id])
 	}
 	return out
 }
