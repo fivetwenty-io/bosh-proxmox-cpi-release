@@ -218,6 +218,7 @@ func collectHAScoped(ctx context.Context, r HAReader, cfg *config.CPIConfig, own
 	c.p = p
 	c.fillProfile()
 	c.readSources()
+	c.settleDrain()
 	c.profileFindings()
 	c.ruleFindings()
 	c.softPinFindings()
@@ -270,7 +271,6 @@ func (c *haCollector) fillProfile() {
 			if h.LRMMode != "" || h.LRMState != "" {
 				line.LRM = "mode=" + h.LRMMode + "/state=" + h.LRMState
 			}
-			line.DrainComplete = h.DrainComplete
 		}
 		c.rep.Nodes = append(c.rep.Nodes, line)
 	}
@@ -966,12 +966,46 @@ func (c *haCollector) protectionFindings() {
 			continue
 		}
 		if len(pin.Nodes) == 1 && !c.replicates(g.ref.VMID, pin) && haBlocksDrain(g.resource.State) {
-			if h, found := c.maintenanceNode(g.ref.Node); found && !h.DrainComplete {
+			if c.inMaintenance(g.ref.Node) {
 				c.holdReported[g.sid] = true
 				c.rep.problem(haKindHoldMaintenance, g.sid,
 					"VM %d is held on %s, which is entering maintenance, and its node-local volumes keep it from moving; PVE cannot drain the node until the VM is stopped",
 					g.ref.VMID, g.ref.Node)
 			}
+		}
+	}
+}
+
+// settleDrain fills the drain facts of each node line that is in maintenance.
+// The LRM enters state maintenance as soon as maintenance is requested and
+// keeps the agent lock and the watchdog until no service is left on the node,
+// so its state cannot say whether the drain has finished. A node counts as
+// drained once no HA service whose requested state keeps it running is on it.
+// When the doctor could not read the services or the guests, the answer is
+// unknown and the node is not called drained.
+func (c *haCollector) settleDrain() {
+	for i := range c.rep.Nodes {
+		n := &c.rep.Nodes[i]
+		if !n.Maintenance {
+			continue
+		}
+		known := c.guestsOK && !c.guestsPartial && c.resourcesOK
+		running := false
+		for _, g := range c.guests {
+			if g.ref.Node == n.Name && g.resource != nil && haBlocksDrain(g.resource.State) {
+				running = true
+				break
+			}
+		}
+		n.DrainComplete = known && !running
+		if n.LRM != "mode=maintenance/state=maintenance" {
+			continue
+		}
+		switch {
+		case n.DrainComplete:
+			n.Watchdog = string(pve.WatchdogIdle)
+		case running:
+			n.Watchdog = string(pve.WatchdogArmed)
 		}
 	}
 }
@@ -982,15 +1016,17 @@ func haBlocksDrain(state string) bool {
 	return haRunsUnderHA(state)
 }
 
-// maintenanceNode returns the health entry of a node that is in maintenance
-// and has not finished draining. It finds nothing when the health report could
-// not be built, which is already reported as unchecked.
-func (c *haCollector) maintenanceNode(name string) (pve.NodeHealthEntry, bool) {
+// inMaintenance says whether a node is in maintenance. A
+// caller that holds a service whose requested state keeps it running on the
+// node has already shown that the drain is not finished, because PVE keeps the
+// node's agent lock until the last such service has left. It says no when the
+// health report could not be built, which is already reported as unchecked.
+func (c *haCollector) inMaintenance(name string) bool {
 	if c.p.Health == nil {
-		return pve.NodeHealthEntry{}, false
+		return false
 	}
 	h, found := healthEntry(c.p, name)
-	return h, found && h.Maintenance
+	return found && h.Maintenance
 }
 
 // maintenanceStrandedFindings reports each started HA VM that is still running
@@ -998,7 +1034,7 @@ func (c *haCollector) maintenanceNode(name string) (pve.NodeHealthEntry, bool) {
 // doctor can see one. The CRM moves every service off such a node, and one that
 // has nowhere to go stays behind and keeps the node's LRM from finishing its
 // drain. A hold VM is already reported as hold_blocks_maintenance, and a node
-// whose LRM has finished draining has nothing left to report. A node health
+// with no service left that keeps running has nothing left to report. A node health
 // report that could not be built is already reported as unchecked, so this
 // check says nothing in that case.
 func (c *haCollector) maintenanceStrandedFindings() {
@@ -1012,8 +1048,7 @@ func (c *haCollector) maintenanceStrandedFindings() {
 		if !strings.EqualFold(g.resource.State, "started") {
 			continue
 		}
-		h, found := c.maintenanceNode(g.ref.Node)
-		if !found || h.DrainComplete {
+		if !c.inMaintenance(g.ref.Node) {
 			continue
 		}
 		c.rep.problem(haKindMaintenanceStranded, g.sid,

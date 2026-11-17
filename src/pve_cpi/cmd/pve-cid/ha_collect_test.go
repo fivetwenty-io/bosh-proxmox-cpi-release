@@ -622,7 +622,7 @@ func drainFake(holdState string) *fakeHA {
 	f.clusterVMs = append([]pve.GuestRef(nil), f.guests...)
 	f.profile.Health.Nodes[1] = pve.NodeHealthEntry{
 		Name: "n2", Health: pve.NodeHealthMaintenance, Maintenance: true, ProxyTarget: true,
-		Watchdog: pve.WatchdogArmed, LRMMode: "maintenance", LRMState: "active",
+		Watchdog: pve.WatchdogUnknown, LRMMode: "maintenance", LRMState: "maintenance",
 	}
 	return f
 }
@@ -641,17 +641,6 @@ func TestCollectHoldBlocksMaintenanceOnlyWhileItsStateKeepsItRunning(t *testing.
 		}
 	}
 
-	// Once the LRM has finished the drain the finding is gone, even for a state
-	// the CRM still lists as started.
-	done := drainFake("started")
-	done.profile.Health.Nodes[1].DrainComplete = true
-	done.profile.Health.Nodes[1].LRMState = "maintenance"
-	done.profile.Health.Nodes[1].Watchdog = pve.WatchdogIdle
-	r := runCollect(t, done, haCfg("auto", "hold"))
-	wantNone(t, r, haKindHoldMaintenance, haKindMaintenanceStranded)
-	if n := r.Nodes[1]; !n.DrainComplete || n.Watchdog != "idle" || n.LRM != "mode=maintenance/state=maintenance" {
-		t.Errorf("node line = %+v, want the drained LRM state and an idle watchdog", n)
-	}
 }
 
 func TestCollectNamesEveryServiceThatCannotLeaveAMaintenanceNode(t *testing.T) {
@@ -2455,5 +2444,85 @@ func TestCollectSkipsGoneVMVolumesWhenAnOwnedConfigCouldNotBeRead(t *testing.T) 
 	}
 	if !named {
 		t.Errorf("the skipped check must be named as unchecked: %+v", r.Findings)
+	}
+}
+
+// TestCollectReadsTheDrainFromTheServicesOnTheNode covers the LRM's own state.
+// PVE puts the LRM into state maintenance the moment maintenance is requested,
+// and it keeps the agent lock and the watchdog until no service is left on the
+// node, so the entry reads maintenance/maintenance for the whole drain.
+func TestCollectReadsTheDrainFromTheServicesOnTheNode(t *testing.T) {
+	t.Parallel()
+	setState := func(f *fakeHA, sid, state string) {
+		for i := range f.resources {
+			if f.resources[i].SID == sid {
+				f.resources[i].State = state
+			}
+		}
+	}
+	tests := []struct {
+		name      string
+		build     func() *fakeHA
+		wantKinds map[string]string // kind to the subject it must name
+		wantDrain bool
+		wantDog   string
+		wantText  string
+	}{
+		{
+			name:      "a stuck hold VM keeps the drain running",
+			build:     func() *fakeHA { f := drainFake("started"); setState(f, "vm:217", "stopped"); return f },
+			wantKinds: map[string]string{haKindHoldMaintenance: "vm:40"},
+			wantDog:   "armed",
+			wantText:  "PVE cannot drain the node",
+		},
+		{
+			name:      "a full anti-affinity group member that cannot leave keeps the drain running",
+			build:     func() *fakeHA { f := drainFake("stopped"); return f },
+			wantKinds: map[string]string{haKindMaintenanceStranded: "vm:217"},
+			wantDog:   "armed",
+			wantText:  "anti-affinity group",
+		},
+		{
+			name: "a VM that is still moving is reported while it runs on the node",
+			build: func() *fakeHA {
+				f := drainFake("stopped")
+				f.clusterVMs = f.clusterVMs[:1]
+				return f
+			},
+			wantKinds: map[string]string{haKindMaintenanceStranded: "vm:217"},
+			wantDog:   "armed",
+		},
+		{
+			name: "a node with no started service has finished draining",
+			build: func() *fakeHA {
+				f := drainFake("stopped")
+				setState(f, "vm:217", "stopped")
+				return f
+			},
+			wantDrain: true,
+			wantDog:   "idle",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := runCollect(t, tt.build(), haCfg("auto", "hold"))
+			for kind, subject := range tt.wantKinds {
+				got := findings(r, kind)
+				if len(got) != 1 || got[0].Subject != subject || !strings.Contains(got[0].Detail, tt.wantText) {
+					t.Errorf("%s: want one finding for %s mentioning %q, got %+v", kind, subject, tt.wantText, got)
+				}
+				if got := findings(r, kind); len(got) == 1 && got[0].Severity != haSeverityProblem {
+					t.Errorf("%s: severity %s, want problem", kind, got[0].Severity)
+				}
+			}
+			if len(tt.wantKinds) == 0 {
+				wantNone(t, r, haKindHoldMaintenance, haKindMaintenanceStranded)
+			}
+			n := r.Nodes[1]
+			if n.DrainComplete != tt.wantDrain || n.Watchdog != tt.wantDog {
+				t.Errorf("node line = %+v, want drain_complete=%v and watchdog=%s", n, tt.wantDrain, tt.wantDog)
+			}
+		})
 	}
 }

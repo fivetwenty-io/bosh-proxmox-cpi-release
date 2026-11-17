@@ -100,10 +100,11 @@ const (
 	// draining for maintenance is in this state too.
 	WatchdogArmed WatchdogState = "armed"
 
-	// WatchdogIdle means the LRM entry is fresh and either waiting for the
-	// agent lock or in state maintenance, which the LRM enters once the drain
-	// has finished. Either way the node holds no lock and its watchdog is not
-	// running.
+	// WatchdogIdle means the LRM entry is fresh and waiting for the agent
+	// lock, so the node holds no lock and its watchdog is not running. State
+	// maintenance never reads as idle here, because the LRM enters it as soon
+	// as maintenance is requested and keeps the lock and the watchdog until
+	// the last service has left the node.
 	WatchdogIdle WatchdogState = "idle"
 
 	// WatchdogUnknown covers every other answer, including a missing or stale
@@ -230,11 +231,6 @@ type NodeHealthEntry struct {
 	// entry, or empty when no fresh entry was trusted.
 	LRMMode  string
 	LRMState string
-
-	// DrainComplete is true when the node's fresh LRM entry is in state
-	// maintenance. The LRM reaches that state only after every service has left
-	// the node, and it releases the agent lock and closes the watchdog there.
-	DrainComplete bool
 
 	// CRMState is the node's raw state in the CRM's node_status map, or empty
 	// when no fresh manager status was trusted or the map has no entry for it.
@@ -1278,10 +1274,14 @@ func classifyWithManagerStatus(e *NodeHealthEntry, ha haInputs) {
 		switch lrm.State {
 		case lrmStateActive:
 			e.Watchdog = WatchdogArmed
-		case lrmStateWaitForLock, lrmStateMaintenance:
+		case lrmStateWaitForLock:
 			e.Watchdog = WatchdogIdle
 		}
-		e.DrainComplete = lrm.State == lrmStateMaintenance
+		// State maintenance stays unknown. PVE sets it the moment maintenance
+		// is requested and keeps the agent lock and the watchdog until the
+		// last service has left, and the LRM entry does not say which of the
+		// two phases the node is in. A caller that needs to know has to look
+		// at the services that still run on the node.
 	}
 
 	if e.CRMState == crmNodeMaintenance {

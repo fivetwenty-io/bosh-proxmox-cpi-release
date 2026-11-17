@@ -863,7 +863,7 @@ The doctor lists a `hold` VM as `hold_blocks_maintenance` only while its HA stat
 
 ### Node maintenance when a VM cannot leave the node
 
-The `hold` procedure above is one case of a wider rule. PVE waits forever on a node in maintenance for any HA service that cannot leave it. That wait blocks the maintenance request itself, a reboot while the node is in maintenance, and the restart of the local resource manager that the `pve-ha-manager` package upgrade runs. The resource manager logs that it ignores the shutdown policy while maintenance is on, and it never stops or fences the VM, so the node sits there until we release the service by hand. Two kinds of VM do this.
+The `hold` procedure above is one case of a wider rule. PVE waits forever on a node in maintenance for any HA service that cannot leave it. The maintenance request itself does not wait. The enable command returns at once, and the node's resource manager enters maintenance mode within a few seconds. What waits is the drain, because the resource manager keeps its agent lock and its watchdog until the last service has left the node. That wait blocks a reboot while the node is in maintenance and the restart of the local resource manager that the `pve-ha-manager` package upgrade runs. The resource manager logs that it ignores the shutdown policy while maintenance is on, and it never stops or fences the VM, so the node sits there until we release the service by hand. Two kinds of VM do this.
 
 - **A member of a full anti-affinity group**
 
@@ -873,7 +873,7 @@ The `hold` procedure above is one case of a wider rule. PVE waits forever on a n
 
   That means a `hold` VM, or a `replicate` VM whose pin has not widened to its partner yet. The pin forbids every other node, so HA cannot migrate it.
 
-Before we enable maintenance, we run `pve-cid ha` and read its findings. A `hold` VM shows up as `hold_blocks_maintenance`. Any other started VM that cannot leave shows up as `maintenance_stranded`, with a reason that says either that its pin names no other usable node or that every other node that could take it holds a member of its group. The doctor names each VM once. Both findings only fire once the node is in maintenance, so we read them again right after we enable it, and the group and pin findings do not list the VMs that would block a drain, so before we enable it we check each hold VM, each `replicate` VM, and each anti-affinity group against the node count ourselves. We then clear every blocker before we start the upgrade or the reboot.
+Before we enable maintenance, we run `pve-cid ha` and read its findings. A `hold` VM shows up as `hold_blocks_maintenance`. Any other started VM that cannot leave shows up as `maintenance_stranded`, with a reason that says either that its pin names no other usable node or that every other node that could take it holds a member of its group. The doctor names each VM once. Both findings only fire once the node is in maintenance, and they keep firing for as long as the drain is stuck on the VM, so we read them again right after we enable maintenance, while the drain is still running. They clear once the VM stops or leaves. The group and pin findings do not list the VMs that would block a drain, so before we enable it we check each hold VM, each `replicate` VM, and each anti-affinity group against the node count ourselves. We then clear every blocker before we start the upgrade or the reboot.
 
 For a member of a full anti-affinity group, we pick one of these.
 

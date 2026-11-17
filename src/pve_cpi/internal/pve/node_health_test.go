@@ -216,8 +216,8 @@ func TestNodeHealth_MaintenanceFromCRM(t *testing.T) {
 	if e.Health != pve.NodeHealthMaintenance || !e.Maintenance || e.Placeable || !e.ProxyTarget || e.DeadOrFenced {
 		t.Errorf("pve2: %+v", e)
 	}
-	if e.Watchdog != pve.WatchdogIdle || !e.DrainComplete || e.LRMState != "maintenance" || e.LRMMode != "maintenance" {
-		t.Errorf("an LRM in state maintenance has released its lock and closed its watchdog: %+v", e)
+	if e.Watchdog != pve.WatchdogUnknown || e.LRMState != "maintenance" || e.LRMMode != "maintenance" {
+		t.Errorf("an LRM in state maintenance may still hold its lock and watchdog, so the watchdog is unknown: %+v", e)
 	}
 	if !r.Placeable("pve1") || r.Placeable("pve2") || !r.ProxyTarget("pve2") || r.DeadOrFenced("pve2") {
 		t.Error("accessors disagree with the entries")
@@ -234,7 +234,7 @@ func TestNodeHealth_DrainingNodeKeepsItsWatchdogArmed(t *testing.T) {
 		})
 	r, _ := nhRun(t, c, pve.NodeHealthOptions{})
 	e := nhEntry(t, r, "pve2")
-	if !e.Maintenance || e.Watchdog != pve.WatchdogArmed || e.DrainComplete || e.LRMState != "active" {
+	if !e.Maintenance || e.Watchdog != pve.WatchdogArmed || e.LRMState != "active" {
 		t.Errorf("an LRM that is still draining holds its lock and watchdog: %+v", e)
 	}
 }
