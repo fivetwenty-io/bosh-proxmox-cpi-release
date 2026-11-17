@@ -97,7 +97,7 @@ func TestParkFreshDisk_SweepsThePoolAfterThePark(t *testing.T) {
 
 	deps := parkedDeps()
 	if err := parkFreshDisk(context.Background(), deps, parkerCfgJobNode,
-		"pvd-abc", parkerCfgVolid, "stable-id"); err != nil {
+		"pvd-abc", pve.VolumeCreatedByThisRequest(parkerCfgVolid), "stable-id"); err != nil {
 		t.Fatalf("parkFreshDisk: unexpected error: %v", err)
 	}
 
@@ -110,7 +110,7 @@ func TestParkFreshDisk_SkipsTheSweepWhenTheParkFails(t *testing.T) {
 
 	deps := parkedDeps()
 	if err := parkFreshDisk(context.Background(), deps, parkerCfgJobNode,
-		"pvd-abc", parkerCfgVolid, "stable-id"); err == nil {
+		"pvd-abc", pve.VolumeCreatedByThisRequest(parkerCfgVolid), "stable-id"); err == nil {
 		t.Fatal("parkFreshDisk: want the park's failure, got nil")
 	}
 
@@ -1133,7 +1133,7 @@ func TestParkFreshDisk_SweepsExpiredDiskLocksAfterThePark(t *testing.T) {
 	calls := captureDiskLockSweep(t, nil)
 
 	if err := parkFreshDisk(context.Background(), parkedDeps(), parkerCfgJobNode,
-		"pvd-abc", parkerCfgVolid, "stable-id"); err != nil {
+		"pvd-abc", pve.VolumeCreatedByThisRequest(parkerCfgVolid), "stable-id"); err != nil {
 		t.Fatalf("parkFreshDisk: unexpected error: %v", err)
 	}
 	if len(*calls) != 1 {

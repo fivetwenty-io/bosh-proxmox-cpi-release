@@ -482,7 +482,9 @@ func (m *managedDiskRequest) executeAttempt(ctx context.Context, handle *aj.Hand
 		}
 	}
 	if m.deps.Config.DetachedDiskParkedEnabled() {
-		if err = m.park(ctx, handle, cid, volume); err != nil {
+		// The volume the create call above returned and the readback
+		// confirmed is the one this request made, and the park carries that.
+		if err = m.park(ctx, handle, cid, pve.VolumeCreatedByThisRequest(volume)); err != nil {
 			return nil, storageAllocationUncertain(handle, "persistent parker completion")
 		}
 	}

@@ -242,7 +242,7 @@ func TestParkFreshDisk_HandsDownPrefixPoolAndEmptyFallbackNode(t *testing.T) {
 
 	deps := Deps{Config: parkerCfgTestConfig(), Logger: log.NewNopLogger()}
 	if err := parkFreshDisk(context.Background(), deps, parkerCfgJobNode,
-		"pvd-abc", parkerCfgVolid, "stable-id"); err != nil {
+		"pvd-abc", pve.VolumeCreatedByThisRequest(parkerCfgVolid), "stable-id"); err != nil {
 		t.Fatalf("parkFreshDisk: unexpected error: %v", err)
 	}
 
@@ -253,6 +253,34 @@ func TestParkFreshDisk_HandsDownPrefixPoolAndEmptyFallbackNode(t *testing.T) {
 	}
 	if got.DiskStorage != parkerCfgStorage {
 		t.Errorf("parkFreshDisk: DiskStorage = %q; want %q", got.DiskStorage, parkerCfgStorage)
+	}
+}
+
+// TestParkFreshDisk_CarriesTheCreatedVolumeToThePark: the park of a fresh
+// disk carries the create step's record of the volume it made, so the holder
+// scan's offline refusal doesn't stop it, and the record names exactly the
+// volume the park attaches.
+func TestParkFreshDisk_CarriesTheCreatedVolumeToThePark(t *testing.T) {
+	var gotVolid string
+	var gotCtx pve.ParkContext
+	t.Cleanup(setParkDiskForTest(func(
+		_ context.Context, _ pve.Client, _ *log.Logger,
+		_, bareVolid string, _ pve.ParkerConfig, pctx pve.ParkContext,
+	) error {
+		gotVolid, gotCtx = bareVolid, pctx
+		return nil
+	}))
+
+	deps := Deps{Config: parkerCfgTestConfig(), Logger: log.NewNopLogger()}
+	if err := parkFreshDisk(context.Background(), deps, parkerCfgJobNode,
+		"pvd-abc", pve.VolumeCreatedByThisRequest(parkerCfgVolid), "stable-id"); err != nil {
+		t.Fatalf("parkFreshDisk: unexpected error: %v", err)
+	}
+	if gotVolid != parkerCfgVolid {
+		t.Fatalf("parkFreshDisk parked %q; want %q", gotVolid, parkerCfgVolid)
+	}
+	if gotCtx.Created.Volid() != parkerCfgVolid {
+		t.Fatalf("ParkContext.Created names %q; want the created volume %q", gotCtx.Created.Volid(), parkerCfgVolid)
 	}
 }
 
@@ -269,7 +297,7 @@ func TestParkFreshDisk_SkipsTheParkEntirelyUnderTheFreeStrategy(t *testing.T) {
 	cfg.DetachedDiskStrategy = "free"
 	deps := Deps{Config: cfg, Logger: log.NewNopLogger()}
 	if err := parkFreshDisk(context.Background(), deps, parkerCfgJobNode,
-		"pvd-abc", parkerCfgVolid, "stable-id"); err != nil {
+		"pvd-abc", pve.VolumeCreatedByThisRequest(parkerCfgVolid), "stable-id"); err != nil {
 		t.Fatalf("parkFreshDisk: unexpected error: %v", err)
 	}
 }

@@ -428,6 +428,11 @@ func HandleCreateDisk(deps Deps) Handler {
 		if err != nil {
 			return nil, cpierrors.Wrap(err, "create_disk: CreateVolume failed on node "+node+" storage "+storage)
 		}
+		// The volume the create call just returned is the one this request
+		// made. The park below carries that provenance, so a node the cluster
+		// reports offline doesn't make it refuse to park a disk no guest can
+		// hold yet.
+		created := pve.VolumeCreatedByThisRequest(bareDiskCID)
 
 		// From here on, any failure path must roll back the just-created
 		// volume so we never leak storage on partial failure. The flag is
@@ -533,7 +538,7 @@ func HandleCreateDisk(deps Deps) Handler {
 		// to the Director unowned (see parkFreshDisk). Runs after the CID
 		// length check: a CID that is about to be rejected should not spend
 		// the parker round trips first.
-		if parkErr := parkFreshDisk(ctx, deps, node, diskCID, bareDiskCID, stableID); parkErr != nil {
+		if parkErr := parkFreshDisk(ctx, deps, node, diskCID, created, stableID); parkErr != nil {
 			return nil, parkErr
 		}
 
@@ -880,13 +885,19 @@ func rollbackCreatedVolume(
 // through the shared holder guard, so a disk parked here attaches exactly
 // like one parked by detach_disk. No-op under strategy=free.
 //
+// created names the volume create_disk's own create call returned. The park
+// carries it in ParkContext.Created, so a holder scan that can't read a node
+// the cluster reports offline, and finds no holder anywhere else, doesn't
+// refuse to park a disk that no guest can hold yet.
+//
 // Failure is fail-closed: the caller returns the error, the deferred rollback
 // unparks (best-effort, in case the park half-committed) and deletes the
 // volume, and a Director retry re-creates from scratch.
-func parkFreshDisk(ctx context.Context, deps Deps, node, diskCID, bareDiskCID, stableID string) error {
+func parkFreshDisk(ctx context.Context, deps Deps, node, diskCID string, created pve.CreatedVolume, stableID string) error {
 	if !deps.Config.DetachedDiskParkedEnabled() {
 		return nil
 	}
+	bareDiskCID := created.Volid()
 	// parkerWriteConfigFor is the park-safe composition, and it carries the
 	// band, the director scope, the parker prefix and pool, the strict anchor
 	// invariant, and the DiskStorage that feeds WithStorageScan on parker VMID
@@ -896,7 +907,7 @@ func parkFreshDisk(ctx context.Context, deps Deps, node, diskCID, bareDiskCID, s
 	parkerCfg := parkerWriteConfigFor(deps)
 	// StableID makes the park attach bake the serial= identity onto the
 	// parker slot, and keys the provenance record by the token.
-	pctx := pve.ParkContext{DiskCID: diskCID, StableID: stableID}
+	pctx := pve.ParkContext{DiskCID: diskCID, StableID: stableID, Created: created}
 	if parkErr := parkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {
 		return retriableUnlessPermanent(parkErr,
 			fmt.Sprintf("create_disk: park fresh disk %s (fail-closed: rollback deletes the volume)", diskCID))

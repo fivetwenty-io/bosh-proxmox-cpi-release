@@ -14,10 +14,15 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
-func (m *managedDiskRequest) park(ctx context.Context, handle *aj.Handle, cid, volume string) error {
+// park parks the volume this request's create call returned. created names
+// it, and the park carries it in ParkContext.Created, so a holder scan that
+// can't read a node the cluster reports offline doesn't refuse a volume that
+// no guest can hold yet.
+func (m *managedDiskRequest) park(ctx context.Context, handle *aj.Handle, cid string, created pve.CreatedVolume) error {
+	volume := created.Volid()
 	cfg := parkerWriteConfigFor(m.deps)
 	cfg.DiskStorage = m.plan.Targets[0].StorageID
-	pctx := pve.ParkContext{DiskCID: cid, StableID: m.token, Opts: m.opts, AllocationID: m.id, AllocationNamespace: m.plan.Namespace, AllocationBacking: m.plan.Targets[0].BackingKey}
+	pctx := pve.ParkContext{DiskCID: cid, StableID: m.token, Opts: m.opts, AllocationID: m.id, AllocationNamespace: m.plan.Namespace, AllocationBacking: m.plan.Targets[0].BackingKey, Created: created}
 	guard, err := NewManagedAllocationGuard(m.deps.PVE, ManagedAllocationHooks{
 		Before: func(ctx context.Context, call ManagedAllocationMutation) (string, error) {
 			if err := m.revalidate(ctx); err != nil {
