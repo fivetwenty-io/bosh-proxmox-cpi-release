@@ -1516,7 +1516,10 @@ func (c *haCollector) margin() placement.HeadroomMargin {
 		}
 		hg := placement.HeadroomGuest{VMID: g.ref.VMID, Node: g.ref.Node, MemBytes: g.memBytes}
 		if g.resource != nil && haRunsUnderHA(g.resource.State) {
-			hg.HA, hg.Admissible = true, c.admissible(g, all)
+			hg.Admissible = c.admissible(g, all)
+			// A strict pin to the guest's own node is a hold: the guest waits for its
+			// node and is never recovered elsewhere.
+			hg.HA = len(hg.Admissible) != 1 || hg.Admissible[0] != g.ref.Node
 		}
 		guests = append(guests, hg)
 	}

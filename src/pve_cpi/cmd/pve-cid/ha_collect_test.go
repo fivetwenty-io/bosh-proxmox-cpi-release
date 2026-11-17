@@ -870,6 +870,30 @@ func TestCollectHeadroomShortAndUnavailable(t *testing.T) {
 	}
 }
 
+func TestCollectHeadroomLeavesOutGuestHeldToOwnNode(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	f.memory[100] = 60 * haGiB
+	f.rules = []ha.Rule{pinRule(100, haMarker, "n1")}
+	r := runCollect(t, f, haCfg("auto", "none"))
+	wantNone(t, r, haKindHeadroomShort)
+	if !strings.HasPrefix(r.Headroom, "ok(") {
+		t.Fatalf("headroom = %q, want ok", r.Headroom)
+	}
+
+	// A pin to a different single node still counts the guest as HA.
+	g := haBaseFake()
+	g.memory[100] = 60 * haGiB
+	g.guests = append(g.guests, pve.GuestRef{VMID: 102, Node: "n2", Tags: "bosh-cpi"})
+	g.memory[102] = 60 * haGiB
+	g.configs[102] = map[string]any{"cpu": "x86-64-v2-AES"}
+	g.rules = []ha.Rule{pinRule(100, haMarker, "n2")}
+	r = runCollect(t, g, haCfg("auto", "none"))
+	if len(findings(r, haKindHeadroomShort)) == 0 {
+		t.Fatalf("headroom = %q, want a headroom_short finding for a guest pinned to another node", r.Headroom)
+	}
+}
+
 func TestCollectHeadroomSkipsNonHAGuestAdmission(t *testing.T) {
 	t.Parallel()
 	f := haBaseFake()
