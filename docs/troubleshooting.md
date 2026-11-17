@@ -594,6 +594,26 @@ Both calls look for their target on the nodes the cluster reports online, and th
 
 The Director doesn't retry either call, so the deploy task fails, and a rerun of the deploy finishes the work. We bring the node back and rerun the deploy, and the calls find the target there. When the VM is under PVE HA, HA recovers it onto another node, and a rerun after that finds it there instead. If the node will never return and the VM isn't under HA, BOSH resurrection or `bosh cck` recreates the VM on another node, and the deploy that follows finds it there. A node that we remove for good with `pvecm delnode <node>` drops out of the scan entirely.
 
+### A disk call fails because a node is offline and the holder scan can't prove the disk is unattached
+
+**Symptom**
+
+```text
+disk "local-lvm:vm-9001-disk-0": not found among the reachable guests, but node(s) pve3 were excluded as offline; cannot prove the disk is unattached, so retry the operation once node(s) pve3 are back in the cluster
+```
+
+The call's own step, such as `ParkDisk: holder scan` or `IsDiskParked: cluster scan`, comes before the message.
+
+**Diagnosis**
+
+Before the CPI attaches, detaches, parks, moves, or deletes a disk, it scans the guest configs of the cluster for a VM that holds the disk. The scan leaves out a node that the quorate cluster reports offline, so a node that is down doesn't stall it. When a VM on an online node holds the disk, that answer stands, because a disk is attached to one VM at a time. When no VM on an online node holds it, the disk could still be attached to a guest on the node that was left out. Treating it as unattached could then attach one volume to two VMs or delete a volume that a VM still uses, so the call fails with a retriable error that names the node and changes nothing.
+
+The park inside `create_disk` is the one exception. It parks the volume that the same call created a moment earlier, which no guest can hold yet, so `create_disk` goes ahead while a node is offline and logs the nodes its scan skipped.
+
+**Fix**
+
+We bring the node back into the cluster and then rerun the deploy or the command that failed, and the scan reads the node's guests again. When the node will never return, we remove it from the cluster with `pvecm delnode <node>`, and the scan stops leaving it out.
+
 ## VM ownership refusals
 
 ### A call refuses a VM this Director does not own
