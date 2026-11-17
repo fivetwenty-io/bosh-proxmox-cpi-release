@@ -110,7 +110,7 @@ In this table, a hop means moving the same request to the next endpoint. A tethe
 
 | Outcome | Applies to | Hops? | Effect on the endpoint |
 |---|---|---|---|
-| Failure in the dial, the name lookup, or the TLS handshake | All | Yes, unless a concurrent request with the same key holds the tether | Demoted for this process, and a down mark is written when a cache exists |
+| Failure in the dial, the name lookup, or the TLS handshake | All | Yes, unless a concurrent request with the same key holds the tether | Demoted for this process, and a down mark is written when a usable cache directory exists, whatever the discovery mode |
 | Certificate check fails on a listed endpoint | All | Yes | Demoted, with the class `tls_verify`, and logged at Error |
 | Send-by deadline already passed | All | No | The request is refused with `ErrSendByPassed` and nothing is tethered |
 | Reset, EOF, or read timeout after the connection was made | Reads and the login | Yes | Demoted for this process |
@@ -157,7 +157,7 @@ A healthy pveproxy answers a dial in milliseconds and a read well inside a minut
 
 ### Across calls
 
-Every CPI call is a new process, so the active endpoint and the demotions live only for the life of one call. With no cache, each call walks the list in order, and a dead first endpoint costs each call one connect timeout, which is about five seconds with the default dial. When the cache is present, the first connect-phase failure to an endpoint also writes a down mark that lasts two minutes. A mark only moves that endpoint to the end of the walk in other processes. It never removes the endpoint and never pins a process to another one.
+Every CPI call is a new process, so the active endpoint and the demotions live only for the life of one call. With no usable cache directory, each call walks the list in order, and a dead first endpoint costs each call one connect timeout, which is about five seconds with the default dial. When a usable cache directory exists, the first connect-phase failure to an endpoint also writes a down mark that lasts two minutes, and it does so whatever the discovery mode. A call with discovery off, which includes `auto` with more than one endpoint, writes and reads those marks and nothing else, so it never writes a discovered node list, a pin, or a cold-start hint. A later process then starts on a live endpoint and skips the dial timeout until the mark expires. A mark only moves that endpoint to the end of the walk in other processes. It never removes the endpoint and never pins a process to another one.
 
 ## Tethers and their families
 
@@ -249,7 +249,7 @@ The CPI turns the configured mode into an effective mode once per call, and the 
   Discovery is off, with a Debug line. Every CPI call logs in afresh, and we did not want a default to start sending tickets to a new class of hosts. You can still choose `on` with a password when `verify_ssl` is true, and even then the password goes only to endpoints you listed.
 
 - The cache directory is unusable
-  Discovery is off, with a Debug line under `auto` and a Warn line under `on`. A directory counts as unusable when it fails the checks in [What the CPI requires of the directory](#what-the-cpi-requires-of-the-directory), and when the process has already started its exit drain, which is always a Debug line.
+  Discovery is off, with a Debug line under `auto` and a Warn line under `on`. The call also writes and reads no down marks, so it keeps today's behavior of one dial timeout per process on a dead endpoint. A directory counts as unusable when it fails the checks in [What the CPI requires of the directory](#what-the-cpi-requires-of-the-directory), and when the process has already started its exit drain, which is always a Debug line.
 
 - None of the above
   Discovery is on.
@@ -626,9 +626,9 @@ The same SDK release scrubs credentials and server-chosen values out of error te
 
 ## The reset
 
-Failover keeps nothing on disk by itself. The active endpoint, the demotions, and the tethers all end with the call, so with an explicit list and discovery off there is nothing to reset.
+Failover keeps nothing on disk except the down marks. The active endpoint, the demotions, and the tethers all end with the call. With an explicit list and discovery off, the only thing to reset is a down mark, which expires after two minutes on its own and which deleting the cache files clears sooner.
 
-When an endpoint cache exists, it holds the down marks, and it can hold more than that. The cache is plain JSON, and deleting its files is the supported reset. The next call that reaches an endpoint writes a fresh file. Deleting the whole directory also resets the cache. The CPI creates the temporary layer again on the next call, unless the temporary directory is missing, is not an absolute path, or fails the private checks. It also creates a missing directory beside the journal, or a missing `pve.endpoint_cache_dir`, on the next call, but only when [the creation rule](#when-the-cpi-creates-a-missing-directory) allows it. The rule requires, among other checks, that the process runs as the CPI's user and that the parent of the new directory sits on the same mount as the journal directory, or as the temporary directory when no journal directory is set. When the rule does not allow it, a directory beside the journal is created again by the next pre-start, so until then the CPI uses the temporary layer, and a directory you named with `pve.endpoint_cache_dir` stays missing, so discovery is off until you create it again. If you are not sure where the cache lives, [The three cache layers](#the-three-cache-layers) explains how the CPI chooses its directory.
+When an endpoint cache exists, it holds the down marks, which a call writes even with discovery off, and it can hold more than that when discovery is on. The cache is plain JSON, and deleting its files is the supported reset. The next call that reaches an endpoint writes a fresh file. Deleting the whole directory also resets the cache. The CPI creates the temporary layer again on the next call, unless the temporary directory is missing, is not an absolute path, or fails the private checks. It also creates a missing directory beside the journal, or a missing `pve.endpoint_cache_dir`, on the next call, but only when [the creation rule](#when-the-cpi-creates-a-missing-directory) allows it. The rule requires, among other checks, that the process runs as the CPI's user and that the parent of the new directory sits on the same mount as the journal directory, or as the temporary directory when no journal directory is set. When the rule does not allow it, a directory beside the journal is created again by the next pre-start, so until then the CPI uses the temporary layer, and a directory you named with `pve.endpoint_cache_dir` stays missing, so discovery is off until you create it again. If you are not sure where the cache lives, [The three cache layers](#the-three-cache-layers) explains how the CPI chooses its directory.
 
 Two things share that directory and are safe to lose. The first is the directory secret, which the CPI recreates, and every cache file written under the old one is rebuilt. The second is the HA recovery episode record. Losing it restarts the grace clock for a VM that is in HA recovery, which only delays the handover to BOSH. That record is written even when discovery is off, so the directory can exist on a deployment that discovers nothing.
 

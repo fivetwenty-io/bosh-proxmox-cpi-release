@@ -54,7 +54,10 @@ properties:
       means auto, which discovers only when the effective endpoint list holds
       exactly one endpoint and the CPI authenticates with an API token. The
       value `on` discovers even when the list holds several endpoints, and the
-      value `off` never discovers. Quote the value in a manifest, because
+      value `off` never discovers. Whatever the value, a call with several
+      endpoints still records which endpoint it found dead in the cache
+      directory when one is usable, so a later call skips that endpoint for
+      two minutes. Quote the value in a manifest, because
       YAML 1.1 reads a bare on or off as a boolean. The template accepts a
       boolean and renders true as `on` and false as `off`. An empty string and
       any other spelling fail the render. The value `on` with password auth

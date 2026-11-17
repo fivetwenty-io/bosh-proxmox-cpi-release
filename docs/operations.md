@@ -652,7 +652,7 @@ We delete the files and keep the directory. When we remove one of the first two 
 What the CPI does next depends on what we removed.
 
 - The endpoint cache file
-  The next call starts with the configured endpoints and no discovered nodes, down marks, or cold-start hint. When discovery is on, the first configured endpoint to answer finds no file, so the CPI discovers in the background and writes a fresh file before the process exits, waiting up to 3 seconds for the write. The calls after that start with the discovered nodes. Under `verify_ssl: false` the first discovery is trust on first use again, so we reset only when we trust the network path to the seed.
+  The next call starts with the configured endpoints and no discovered nodes, down marks, or cold-start hint. A call that has more than one configured endpoint writes down marks again as soon as it meets a dead endpoint, even with discovery off. When discovery is on, the first configured endpoint to answer finds no file, so the CPI discovers in the background and writes a fresh file before the process exits, waiting up to 3 seconds for the write. The calls after that start with the discovered nodes. Under `verify_ssl: false` the first discovery is trust on first use again, so we reset only when we trust the network path to the seed.
 
 - The directory secret
   The CPI creates a new one on the next call. A cache file's name depends on the secret, so the endpoint cache starts a new file under a new name, and the old file ages out after 30 days. The HA recovery episode record keeps its name, fails verification, and starts empty. The log shows `endpoint cache: replaced the directory secret, which had the wrong length` only when a secret exists with the wrong length, and not after a plain removal.
