@@ -533,6 +533,9 @@ type aaPlanner struct {
 	// conflicted holds the members already logged as left out because their
 	// join would bring on a feasibility conflict.
 	conflicted map[string]bool
+	// alone holds the members already logged as in no rule because the plan
+	// put each one alone in a rule of its own.
+	alone map[string]bool
 }
 
 // aaChunkName names a group's n-th rule, the first being the bare name.
@@ -959,6 +962,7 @@ func (p *aaPlanner) logHeldOut(siblings []string) {
 func (p *aaPlanner) chunkOps(set *ha.RuleSet, existing map[int]*ha.Rule, desired map[int][]string,
 	maxIndex int) []ha.RuleOp {
 	base := p.ident.ruleName()
+	p.logAlone(desired, maxIndex)
 	var pins, ops []ha.RuleOp
 	for n := 1; n <= maxIndex; n++ {
 		name := aaChunkName(base, n)
@@ -992,6 +996,37 @@ func (p *aaPlanner) chunkOps(set *ha.RuleSet, existing map[int]*ha.Rule, desired
 		return nil
 	}
 	return append(pins, ops...)
+}
+
+// logAlone says once per member, at Warn, that the plan put it alone in one of
+// the group's rules while another rule of the group holds two members or
+// more. chunkOps writes no rule below two members, so such a member is in no
+// rule of the group, which split mode reaches when the group has one member
+// more than a whole number of rules hold. A group with no rule at all is left
+// to the overflow and deferral lines, which already say why.
+func (p *aaPlanner) logAlone(desired map[int][]string, maxIndex int) {
+	grouped := false
+	for n := 1; n <= maxIndex; n++ {
+		grouped = grouped || len(desired[n]) >= 2
+	}
+	if !grouped {
+		return
+	}
+	for n := 1; n <= maxIndex; n++ {
+		if len(desired[n]) != 1 || p.alone[desired[n][0]] {
+			continue
+		}
+		sid := desired[n][0]
+		if p.alone == nil {
+			p.alone = map[string]bool{}
+		}
+		p.alone[sid] = true
+		p.logger.Warn("anti-affinity: member is in none of the group's rules, because the plan put it alone in a "+
+			"rule of its own and a negative rule needs two members; the next member of the group that the plan "+
+			"puts in that rule writes it with both",
+			log.String("sid", sid), log.String("rule", aaChunkName(p.ident.ruleName(), n)),
+			log.String("joining", p.sid))
+	}
 }
 
 // isManaged reports whether the last plan's read lists sid as an HA resource.
