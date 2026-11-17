@@ -497,6 +497,8 @@ func TestCollectReplicaOnPartnerAfterAMove(t *testing.T) {
 		f.jobs[0].Source, f.jobs[0].Target = "n2", "n1"
 		f.status["101-0"] = ha.ReplicaSyncStatus{LastSync: haNow.Add(-10 * time.Minute)}
 		f.migrations = map[string][]pve.VMTask{"n1": {migrated}}
+		// The sync back to n1 has copied the VM's volume there.
+		f.volumes["n1/local-zfs"] = map[string]bool{"local-zfs:vm-101-disk-0": true}
 		return f
 	}
 	for _, tc := range []struct {
@@ -507,8 +509,9 @@ func TestCollectReplicaOnPartnerAfterAMove(t *testing.T) {
 		absent   string
 	}{
 		{name: "planned migration", severity: haSeverityAdvice,
-			mentions: []string{"partner n2 after a planned migration", "names n1 as the partner"},
-			absent:   "failover"},
+			mentions: []string{"partner n2 after a planned migration",
+				"names n1 as the partner once it confirms that sync", "covers the VM's volumes"},
+			absent: "failover"},
 		{name: "no migration task", edit: func(f *fakeHA) { f.migrations = nil }, severity: haSeverityProblem,
 			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
 				"no migration task on n1", "were lost", "names n1 as the partner"},
@@ -566,6 +569,26 @@ func TestCollectReplicaOnPartnerAfterAMove(t *testing.T) {
 		}, severity: haSeverityProblem,
 			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
 				"rolls n1's copy back to match"},
+			absent: "planned"},
+		{name: "a volume missing on n1", edit: func(f *fakeHA) { delete(f.volumes, "n1/local-zfs") },
+			severity: haSeverityProblem,
+			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
+				"no sync from n2 back to n1 that covers the VM's volumes is confirmed yet",
+				"local-zfs:vm-101-disk-0 is not on node n1"},
+			absent: "planned"},
+		{name: "a job whose marker names no Director", edit: func(f *fakeHA) {
+			f.jobs[0].Comment = "bosh-cpi:v1 owner=- gen=1"
+			f.guests[1].Tags = "bosh-cpi;bosh-ha-managed;bosh-ha-replica"
+		}, severity: haSeverityProblem,
+			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet"},
+			absent:   "copies from"},
+		{name: "two jobs carry this Director's marker", edit: func(f *fakeHA) {
+			second := f.jobs[0]
+			second.ID, second.JobNum = "101-1", 1
+			f.jobs = append(f.jobs, second)
+		}, severity: haSeverityProblem,
+			mentions: []string{"the move can't be judged", "replication jobs 101-0 and 101-1",
+				"refuses to pick one"},
 			absent: "planned"},
 		{name: "job not swapped", edit: func(f *fakeHA) { f.jobs[0].Source, f.jobs[0].Target = "n1", "n2" },
 			severity: haSeverityProblem,

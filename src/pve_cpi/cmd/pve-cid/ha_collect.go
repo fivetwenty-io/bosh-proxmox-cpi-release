@@ -933,14 +933,27 @@ func (c *haCollector) replicaVMs() []int {
 }
 
 // liveJob returns the CPI-marked replication job of vmid that is still in use.
-func (c *haCollector) liveJob(vmid int) *ha.ReplicaJobState {
-	jobs := c.markedJobs()
-	for i := range jobs {
-		if jobs[i].Guest == vmid {
-			return &jobs[i]
+// When the run knows the requesting Director, the job's marker must name that
+// Director, the way the CPI picks the one job its pin speaks for. More than one
+// such job is an error, because the CPI refuses to pick among them too.
+func (c *haCollector) liveJob(vmid int) (*ha.ReplicaJobState, error) {
+	var found *ha.ReplicaJobState
+	ours := strings.Join(strings.Fields(c.owner), "_")
+	for _, j := range c.markedJobs() {
+		if j.Guest != vmid {
+			continue
 		}
+		if owner, _ := haMarkerOwner(j.Comment); c.owner != "" && owner != ours {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("VM %d has replication jobs %s and %s that both carry this Director's marker, "+
+				"and the CPI refuses to pick one", vmid, found.ID, j.ID)
+		}
+		job := j
+		found = &job
 	}
-	return nil
+	return found, nil
 }
 
 // replicaTagged reports whether any CPI-owned VM carries the replicate tag.
@@ -1006,7 +1019,13 @@ func (c *haCollector) onPartner(g *haGuest, pin *ha.Rule, node, source string) {
 	id := g.ref.VMID
 	move := ha.PartnerMove{Node: node, OldSource: source}
 	if c.jobsOK {
-		move.Job = c.liveJob(id)
+		job, err := c.liveJob(id)
+		if err != nil {
+			c.rep.problem(haKindReplicaOnPartner, g.sid, "replicate VM %d runs on its partner %s, and the move can't "+
+				"be judged: %v", id, node, err)
+			return
+		}
+		move.Job = job
 	}
 	for i := range c.p.Nodes {
 		if c.p.Nodes[i].Name == source {
@@ -1016,45 +1035,118 @@ func (c *haCollector) onPartner(g *haGuest, pin *ha.Rule, node, source string) {
 	if pin != nil {
 		move.ChangedAt, _ = ha.ReplicaChanged(pin.Comment)
 	}
-	if move.Job != nil {
-		if st, read := c.jobStatus[move.Job.ID]; read {
-			move.Synced, _ = ha.SyncAfterChange(st, move.ChangedAt)
-		}
-	}
+	var unsynced string
+	move.Synced, unsynced = c.reversedSync(g, move)
 	var unread error
 	if move.Synced {
 		move.Migration, unread = c.migrationEvidence(id, node, source, move.ChangedAt)
 	}
 	verdict := ha.JudgePartnerMove(move)
-	const reconcile = "the next reboot_vm or set_vm_metadata keeps both nodes and names %s as the partner"
-	const moved = "replicate VM %d runs on its partner %s after a failover, or after a move the CPI has not reconciled yet"
+	const reconcile = "the next reboot_vm or set_vm_metadata keeps both nodes and names %s as the partner once " +
+		"it confirms that sync"
+	const moved = "replicate VM %d runs on its partner %s after a failover, or after a move the CPI has not " +
+		"reconciled yet"
+	const synced = "a sync from %s back to %s that covers the VM's volumes has run since"
 	switch verdict {
 	case ha.PartnerMovePlanned:
 		c.rep.advise(haKindReplicaOnPartner, g.sid, "replicate VM %d runs on its partner %s after a planned "+
-			"migration, and a sync from %s back to %s has run since; "+reconcile, id, node, node, source, source)
+			"migration, and "+synced+"; "+reconcile, id, node, node, source, source)
 	case ha.PartnerMoveRecovered:
 		c.rep.problem(haKindReplicaOnPartner, g.sid, moved+"; no migration task on %s explains the move, so writes "+
-			"made on %s after its last sync before the move were lost, and a sync from %s back to %s has run "+
-			"since; "+reconcile, id, node, source, source, node, source, source)
+			"made on %s after its last sync before the move were lost, and "+synced+"; "+reconcile, id, node,
+			source, source, node, source, source)
 	case ha.PartnerMoveRestarted:
 		c.rep.problem(haKindReplicaOnPartner, g.sid, moved+"; a migration from %s explains the move, but the VM "+
-			"also started outside a migration since the pin last changed, which an HA recovery does, so writes made after the last sync before that "+
-			"start may have been lost, and a sync from %s back to %s has run since; "+reconcile, id, node, source,
-			node, source, source)
+			"also started outside a migration since the pin last changed, which an HA recovery does, so writes "+
+			"made after the last sync before that start may have been lost, and "+synced+"; "+reconcile, id, node,
+			source, node, source, source)
 	case ha.PartnerMoveUnproven:
-		c.rep.problem(haKindReplicaOnPartner, g.sid, moved+"; a sync from %s back to %s has run since, but the "+
-			"task lists or task logs that would prove a planned migration could not be read (%v), so writes made "+
-			"on %s "+
-			"after its last sync before the move may have been lost; "+reconcile, id, node, node, source, unread,
-			source, source)
+		c.rep.problem(haKindReplicaOnPartner, g.sid, moved+"; "+synced+", but the task lists or task logs that "+
+			"would prove a planned migration could not be read (%v), so writes made on %s after its last sync "+
+			"before the move may have been lost; "+reconcile, id, node, node, source, unread, source, source)
 	default:
-		back := ""
-		if source != "" {
-			back = fmt.Sprintf("; PVE's next run copies from %s back to %s and rolls %s's copy back to match",
+		detail := ""
+		if verdict == ha.PartnerMoveUndecided && unsynced != "" {
+			detail = fmt.Sprintf("; no sync from %s back to %s that covers the VM's volumes is confirmed yet (%s)",
+				node, source, unsynced)
+		}
+		if source != "" && move.Job != nil && !move.Job.Disabled && move.Job.RemoveJob == "" {
+			detail += fmt.Sprintf("; PVE's next run copies from %s back to %s and rolls %s's copy back to match",
 				node, source, source)
 		}
-		c.rep.problem(haKindReplicaOnPartner, g.sid, moved+"%s", id, node, back)
+		c.rep.problem(haKindReplicaOnPartner, g.sid, moved+"%s", id, node, detail)
 	}
+}
+
+// reversedSync runs the CPI's sync gate (see ha.CheckReplicaSync) on the
+// reversed job of a VM that runs on its partner, with the volumes the CPI
+// would check, so the doctor and the next call reach the same verdict. It
+// reports whether a sync from the VM's node covers those volumes on the old
+// source after the pin's last change, and otherwise why not. A job that isn't
+// reversed needs no sync, because the move then reads as a failover anyway.
+func (c *haCollector) reversedSync(g *haGuest, move ha.PartnerMove) (bool, string) {
+	job := move.Job
+	switch {
+	case job == nil || move.Node == "" || move.OldSource == "" || job.Source != move.Node ||
+		job.Target != move.OldSource:
+		return false, ""
+	case g.cfg == nil || !c.storagesOK:
+		return false, "the VM's config or the storage index could not be read"
+	}
+	storages := make([]pve.StorageInfo, 0, len(c.storages))
+	for _, info := range c.storages {
+		storages = append(storages, info)
+	}
+	volids, gaps := ha.ReplicaVolumes(g.ref.VMID, g.volumes, storages)
+	if len(gaps) > 0 {
+		return false, "the VM holds node-local volumes its job does not copy: " + strings.Join(gaps, "; ")
+	}
+	verdict, err := ha.CheckReplicaSync(c.ctx, doctorReplicaReads{c: c}, ha.ReplicaSyncCheck{
+		JobID: job.ID, Source: move.Node, Target: move.OldSource, VolIDs: volids, ChangedAt: move.ChangedAt,
+	})
+	switch {
+	case err != nil:
+		return false, err.Error()
+	case !verdict.Verified:
+		return false, verdict.Reason
+	}
+	return true, ""
+}
+
+// errDoctorReadOnly is the answer of every write doctorReplicaReads is asked
+// for.
+var errDoctorReadOnly = errors.New("the doctor makes no replication writes")
+
+// doctorReplicaReads is the read side of ha.ReplicationAPI over the doctor's
+// reader, so the doctor can run the CPI's sync gate. It reuses the job statuses
+// the doctor already read, and every write fails.
+type doctorReplicaReads struct{ c *haCollector }
+
+func (d doctorReplicaReads) ListJobs(context.Context) ([]ha.ReplicaJobState, error) {
+	return d.c.jobs, nil
+}
+
+func (doctorReplicaReads) CreateJob(context.Context, ha.ReplicaJobSpec) error {
+	return errDoctorReadOnly
+}
+
+func (doctorReplicaReads) SetComment(context.Context, string, string) error { return errDoctorReadOnly }
+
+func (doctorReplicaReads) DeleteJob(context.Context, string, bool) error { return errDoctorReadOnly }
+
+func (doctorReplicaReads) ScheduleNow(context.Context, string, string) error {
+	return errDoctorReadOnly
+}
+
+func (d doctorReplicaReads) Status(ctx context.Context, node, id string) (ha.ReplicaSyncStatus, error) {
+	if st, ok := d.c.jobStatus[id]; ok {
+		return st, nil
+	}
+	return d.c.r.ReplicaStatus(ctx, node, id)
+}
+
+func (d doctorReplicaReads) Volumes(ctx context.Context, node, storage string) (map[string]bool, error) {
+	return d.c.r.StorageVolumes(ctx, node, storage)
 }
 
 // migrationEvidence reads the qmigrate and qmstart tasks of the VM vmid on
@@ -1077,8 +1169,11 @@ func (c *haCollector) notRecoverable(g *haGuest, pin *ha.Rule, rec *aj.Record) {
 	if !c.jobsOK {
 		return
 	}
-	job := c.liveJob(id)
+	job, err := c.liveJob(id)
 	switch {
+	case err != nil:
+		c.rep.problem(haKindReplicaNotRecover, g.sid, "replicate VM %d can't be judged: %v", id, err)
+		return
 	case job == nil:
 		c.rep.problem(haKindReplicaNotRecover, g.sid,
 			"replicate VM %d is configured to replicate but no replication job the CPI marked exists for it, so no replica is kept", id)
