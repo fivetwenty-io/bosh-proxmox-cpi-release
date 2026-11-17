@@ -253,8 +253,10 @@ func TestEnsureAntiAffinity_LockedCreateAfterARepairLeavesTheRuleRight(t *testin
 // never plans around a repair of its own pin. Only PVE reports that vm:104's
 // strict pin conflicts with the group's rule, so the create's join puts the
 // pin out of effect and the repair reverts it. In managed mode the create must
-// fail with the writer's error, and in auto it must log it, and either way the
-// rule must keep its members without vm:104.
+// fail with the writer's error. In auto mode it must return an error that the
+// caller turns into a VM that runs without HA, rather than name a rule that
+// no longer holds the VM. Either way the rule must keep its members without
+// vm:104.
 func TestEnsureAntiAffinity_CreateWhosePinPVEFlagsStillFails(t *testing.T) {
 	t.Parallel()
 	for _, mode := range aaModes {
@@ -268,12 +270,21 @@ func TestEnsureAntiAffinity_CreateWhosePinPVEFlagsStillFails(t *testing.T) {
 			pinOutWhileInRule(stub, pin, aaRule, "vm:104")
 			deps := aaModeDeps(stub, mode, "", "pve1", "pve2", "pve3", "pve4")
 			logger, _ := log.NewObservedLogger(log.LevelDebug)
-			err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 104, logger)
+			placedIn, err := ensureAntiAffinityMembershipFor(context.Background(), deps, aaIdent("web"), 104, nil,
+				logger)
 			switch {
 			case mode == config.HAModeManaged && !errors.Is(err, ha.ErrRuleNotInEffect):
 				t.Fatalf("err = %v; want the managed writer's repair of the create's own pin to fail it", err)
-			case mode == config.HAModeAuto && err != nil:
-				t.Fatalf("err = %v; want the auto writer to log the repair", err)
+			case mode == config.HAModeAuto && err == nil:
+				t.Fatalf("placed in %q with no error; want an error that runs the VM without HA", placedIn)
+			case mode == config.HAModeAuto && propagateHARuleError(deps, err):
+				t.Fatalf("err = %v; want an auto error that leaves the VM unconfined, not one that fails the call", err)
+			}
+			if placedIn != "" {
+				t.Fatalf("placed in %q; want no rule, since the repair took vm:104 back out", placedIn)
+			}
+			if mode == config.HAModeAuto && !strings.Contains(err.Error(), "does not hold vm:104") {
+				t.Fatalf("err = %v; want it to say that the rule does not hold vm:104", err)
 			}
 			if got := stub.rules[aaRule]; got != "vm:101,vm:102" {
 				t.Fatalf("rule = %q; want it unchanged, without the create's VM", got)

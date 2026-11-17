@@ -578,7 +578,9 @@ func pinOutWhileInRule(stub *aaClusterStub, pin, rule, sid string) {
 // of effect, and a sibling writes itself into the rule between that join and
 // the repair. The repair puts back the rule it read before the join under a
 // fresh digest, which takes the sibling out. The heal must write the sibling
-// back and leave out the VM whose pin the repair protected.
+// back and leave out the VM whose pin the repair protected. The create itself
+// returns an error that runs its VM without HA, because the repair took the
+// VM out of the rule it was meant to join.
 func TestEnsureAntiAffinity_UnlockedPinRepairHealsTheGroup(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
@@ -609,8 +611,9 @@ func TestEnsureAntiAffinity_UnlockedPinRepairHealsTheGroup(t *testing.T) {
 	deps := aaDeps(stub)
 	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4")
 	logger, observed := log.NewObservedLogger(log.LevelDebug)
-	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 103, logger); err != nil {
-		t.Fatal(err)
+	err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 103, logger)
+	if err == nil || propagateHARuleError(deps, err) {
+		t.Fatalf("err = %v; want an auto error that runs the VM without HA", err)
 	}
 	if !raced {
 		t.Fatal("the create never joined the rule, so the race never ran")
