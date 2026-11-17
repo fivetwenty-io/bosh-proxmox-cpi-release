@@ -12,6 +12,16 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-11-17
+
+### Fixed
+
+- A Director that we upgraded from 0.9.x to 0.10.0, 0.10.1, or 0.10.2 can read its existing allocation journal again. Each journal record keeps a frozen copy of the storage definitions its plan chose, and 0.10.0 renamed the keys of that copy, so `IsMountpoint` became `is_mountpoint`. The CPI reads its own plans with unknown keys disallowed, so a 0.10 CPI refused every plan that a 0.9 release wrote, and each call that reached such a record failed with `invalid plan evidence; audit required`. The storage audit reported each of those records as `historical allocation plan could not be decoded`, which left the audit incomplete, and every call that the audit gates refused as well. A 0.9 CPI refused every plan that 0.10.0 through 0.10.2 wrote in the same way. This release reads both key forms, and each definition in a plan may use either one. It writes the form that 0.9 releases read, so a 0.9.7 CPI can read every plan this release writes. A definition that carries a key neither form defines still fails the read. The sibling accounting, which reads other allocations' plans leniently, used to read the mount flag as unset whenever a plan used the other key form, and it now reads the flag correctly in both forms.
+
+- A `create_vm` that falls back to another placement on a record that a 0.9 release opened no longer fails with `retry policy or frozen membership changed`. Each record stores a fingerprint of the storage inputs it froze, and the key change in 0.10.0 changed that fingerprint too. This release computes the fingerprint the way 0.9 releases did, and the fallback accepts a stored fingerprint in either form, so a record that 0.10.0 through 0.10.2 opened keeps its fallback as well.
+
+- **Downgrade note.** A rollback from this release to 0.9.7 reads the plans this release writes, but it still can't read the plans that 0.10.0 through 0.10.2 wrote, because those records keep the keys they were written with. Its storage audit reports each such record as undecodable and stays incomplete until those records leave the journal. The `replication` section that 0.10.0 added to the journal record of a `replicate` VM still blocks a rollback too. Every release before 0.10.0 refuses a record that carries it, and one such record makes every journal listing in the namespace fail, so we don't roll back below 0.10.0 while the journal holds a record of a VM that runs with `pve.ha.local_policy` at `replicate`.
+
 ## [0.10.2] - 2026-11-16
 
 ### Fixed
@@ -1088,6 +1098,7 @@ to end against a live cluster.
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
 [Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.2...HEAD
+[0.10.3]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.7...v0.10.0
