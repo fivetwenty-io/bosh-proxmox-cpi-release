@@ -20,8 +20,8 @@ func (c *haCollector) softPinFindings() {
 		return
 	}
 	configured := make([]string, 0, len(c.p.Nodes))
-	for _, n := range c.p.Nodes {
-		configured = append(configured, n.Name)
+	for i := range c.p.Nodes {
+		configured = append(configured, c.p.Nodes[i].Name)
 	}
 	for i := range c.rules {
 		pin := &c.rules[i]
