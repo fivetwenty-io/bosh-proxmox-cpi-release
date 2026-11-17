@@ -113,11 +113,14 @@ type GatherOptions struct {
 //  2. ListResources provides node CPU and memory counters, guest counts, BOSH
 //     group tags, and committed guest memory (non-fatal on error).
 //  3. Per-node ListStorage provides available storage bytes (non-fatal on error).
+//     Nodes that cluster status lists offline are not asked.
 //  4. pve.NodeHealth provides node placeability from the CRM and LRM state,
 //     cluster status, and operator tags (non-fatal on error). Every node that
 //     is not placeable is marked InMaintenance=true, which covers a node in
 //     maintenance, a fenced or unknown node, and every node when the entry node
-//     is not quorate.
+//     is not quorate. A node that is not placeable for a reason other than
+//     maintenance also carries that reason in UnplaceableReason, so a rejection
+//     names it.
 //
 // A ListResources error is non-fatal: GatherNodeFacts logs a warning and continues
 // with GuestCount=0, SameGroupCount=0, and CommittedMemBytes=0 for all nodes.
@@ -181,9 +184,17 @@ func GatherNodeFacts(
 		// A node that pve.NodeHealth does not call placeable is excluded. The
 		// report already folds the operator node tags into its answer. A node
 		// the report does not mention, or no report at all, leaves it included.
-		inMaintenance := false
-		if entry, ok := health.Node(nodeName); ok {
-			inMaintenance = !entry.Placeable
+		// The reason travels with it when the node is not in maintenance, so
+		// a rejection names a lost quorum or a fence instead of maintenance.
+		inMaintenance, unplaceableReason := false, ""
+		if entry, ok := health.Node(nodeName); ok && !entry.Placeable {
+			inMaintenance = true
+			if !entry.Maintenance {
+				unplaceableReason = entry.Reason
+				if unplaceableReason == "" {
+					unplaceableReason = "the node health check does not call it placeable"
+				}
+			}
 		}
 
 		// PVEFloat parses whatever string PVE sends, so a "nan" or "inf" cpu
@@ -199,6 +210,7 @@ func GatherNodeFacts(
 			Node:              nodeName,
 			Online:            item.Online.Bool(),
 			InMaintenance:     inMaintenance,
+			UnplaceableReason: unplaceableReason,
 			FreeMemBytes:      item.Maxmem.Int() - item.Mem.Int(),
 			TotalMemBytes:     item.Maxmem.Int(),
 			CommittedMemBytes: committedMem[nodeName],
@@ -313,6 +325,12 @@ func gatherStorageFacts(
 		return storageAvail, storageTotal
 	}
 	for _, item := range nodeItems {
+		// Cluster status already says an offline node cannot answer, and the
+		// filter rejects it before storage counts, so its listing is skipped.
+		// Each listing of a member that is gone can cost tens of seconds.
+		if !item.Online.Bool() {
+			continue
+		}
 		nodeName := item.Name
 		storResp, storErr := nodesClient.ListStorage(ctx, nodeName, &nodes.ListStorageParams{
 			Storage: &storageName,

@@ -8,6 +8,7 @@ package placement
 import (
 	"math/rand"
 	"sort"
+	"strings"
 )
 
 // Weights controls relative importance of each scoring axis.
@@ -99,6 +100,14 @@ type NodeFacts struct {
 	// for callers that do not populate this field (e.g. tests that construct
 	// NodeFacts by hand).
 	InMaintenance bool
+
+	// UnplaceableReason says why a node that is not in maintenance cannot take
+	// new work, such as a cluster that has lost quorum or an HA manager that
+	// reports the node fenced. GatherNodeFacts sets it, together with
+	// InMaintenance, whenever pve.NodeHealth calls a node not placeable for a
+	// reason other than maintenance, so the rejection names the real cause.
+	// It is empty for a node in maintenance and for a placeable node.
+	UnplaceableReason string
 
 	// FreeMemBytes is current free memory in bytes (Maxmem - Mem from cluster status).
 	// Backs the Mem axis when Weights.MemorySignal is MemorySignalResident (or unset).
@@ -286,7 +295,7 @@ func Filter(facts []NodeFacts, req Request) (pass []NodeFacts, rejections map[st
 		}
 
 		if f.InMaintenance {
-			rejections[f.Node] = "node in maintenance"
+			rejections[f.Node] = f.unplaceableRejection()
 			continue
 		}
 
@@ -532,4 +541,23 @@ func Pick(ranked []ScoredNode, rng *rand.Rand) string {
 		rng = rand.New(rand.NewSource(0)) // #nosec G404 -- non-crypto random for tie-break
 	}
 	return tied[rng.Intn(len(tied))]
+}
+
+// unplaceableRejectionPrefix starts the rejection of a node that cannot take
+// new work for a reason other than maintenance.
+const unplaceableRejectionPrefix = "node not placeable"
+
+// IsUnplaceableRejection reports whether reason is the rejection Filter gives a
+// node that cannot take new work for a reason other than maintenance.
+func IsUnplaceableRejection(reason string) bool {
+	return strings.HasPrefix(reason, unplaceableRejectionPrefix)
+}
+
+// unplaceableRejection is the rejection Filter gives a node that is marked
+// InMaintenance. It names the real reason when the node is not in maintenance.
+func (f NodeFacts) unplaceableRejection() string {
+	if f.UnplaceableReason == "" {
+		return "node in maintenance"
+	}
+	return unplaceableRejectionPrefix + " (" + f.UnplaceableReason + ")"
 }

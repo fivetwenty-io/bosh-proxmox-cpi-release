@@ -291,6 +291,14 @@ func resolveTargetNodeWithBridges(
 					localPin,
 				)
 			}
+			if pinnedFact.InMaintenance && pinnedFact.UnplaceableReason != "" {
+				return "", nil, cpierrors.Cloud(
+					"create_vm: local disk is pinned to node %q but that node "+
+						"cannot take new work (%s); wait for the node to become placeable "+
+						"or migrate the disk to a different node",
+					localPin, pinnedFact.UnplaceableReason,
+				)
+			}
 			if pinnedFact.InMaintenance {
 				return "", nil, cpierrors.Cloud(
 					"create_vm: local disk is pinned to node %q but that node "+
@@ -986,6 +994,12 @@ func isTransientRejectionReason(reason string) bool {
 	// just could not run. "missing required PCI device" stays permanent — the
 	// node answered and the device is absent.
 	if strings.HasPrefix(reason, "PCI device check error: ") {
+		return true
+	}
+	// A node that cannot take new work for a reason other than maintenance,
+	// such as a lost quorum or a fence, can recover in the same way a node in
+	// maintenance does.
+	if placement.IsUnplaceableRejection(reason) {
 		return true
 	}
 	// A failed network listing is transient in the same way. "missing bridge

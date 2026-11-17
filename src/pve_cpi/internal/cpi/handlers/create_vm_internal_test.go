@@ -846,13 +846,20 @@ func TestClassifyFilterResult_EmptyRejections_Retriable(t *testing.T) {
 // resolveTargetNodeWithRNG tests in the internal package.
 type placementInternalTestCluster struct {
 	nodes []map[string]any
+	// notQuorate makes the cluster row report the cluster not quorate.
+	notQuorate bool
 }
 
 func (c *placementInternalTestCluster) ListStatus(_ context.Context) (*sdkcluster.ListStatusResponse, error) {
 	resp := make(sdkcluster.ListStatusResponse, 0, len(c.nodes)+1)
 	if len(c.nodes) >= 2 {
-		// A real PVE cluster always reports a quorate cluster row.
-		raw, _ := json.Marshal(map[string]any{"type": "cluster", "name": "lab", "quorate": 1, "nodes": len(c.nodes)})
+		// A real PVE cluster always reports a cluster row, quorate unless the
+		// test says otherwise.
+		quorate := 1
+		if c.notQuorate {
+			quorate = 0
+		}
+		raw, _ := json.Marshal(map[string]any{"type": "cluster", "name": "lab", "quorate": quorate, "nodes": len(c.nodes)})
 		resp = append(resp, raw)
 	}
 	for _, n := range c.nodes {
