@@ -1047,21 +1047,21 @@ qm set <parker-vmid> --digest <digest> --description "$(cat parker-description.t
 
 When PVE refuses the write because the digest no longer matches, something changed the description after we read it, so we read it again and start the edit over. See [Persistent Disk Strategy](persistent-disk-strategy.md).
 
-### delete_vm warns that a volume is on node-local storage this node cannot reach
+### delete_vm warns that a node-local volume is not held by its node
 
 **Symptom**
 
 The CPI log of a `delete_vm` task holds a warning like this one.
 
 ```text
-delete_vm: the VM's volume local-lvm-data:vm-<vmid>-ephemeral-0 is on node-local storage local-lvm-data that this node cannot reach, so the destroy cannot free it. It will stay behind on the node that holds it, and needs removing there once that node is back (most likely <node>)
+delete_vm: the VM's volume local-lvm-data:vm-<vmid>-ephemeral-0 is on node-local storage local-lvm-data and node <node> does not hold it, either because the storage is not usable on this node or because this node's copy of the storage has no such volume, so the destroy cannot free it. It will stay behind on the node that holds it, and needs removing there once that node is back
 ```
 
 The delete itself succeeds.
 
 **Diagnosis**
 
-The VM's config sat on a node that has no access to one of its volumes, and the volume lives on a storage that is local to another node. This happens after we move a dead node's VM config to a live node by hand, as [the dead-node procedure](operations.md#the-dead-node-procedure) describes. PVE destroys the VM from the live node, cannot reach the volume, and logs nothing about it. The volume stays on the node that holds it. The warning names the VM, the volume ID, and the storage, and it names the likely node when the storage is limited to specific nodes.
+The VM's config sits on a node that doesn't hold one of its volumes, and the volume lives on a storage that is local to each node. This happens after we move a dead node's VM config to a live node by hand, as [the dead-node procedure](operations.md#the-dead-node-procedure) describes. PVE destroys the VM from the live node and logs nothing about the volume. The storage may be inactive on that node, or missing from it. A storage defined for every node is active on the live node too, so the destroy looks in the live node's own copy, finds no such volume, and skips it. The volume stays on the node that holds it. The warning names the VM, the volume ID, and the storage, and it names the likely node when the storage is limited to specific nodes. It doesn't say which cause applies, because the node can't tell.
 
 **Fix**
 

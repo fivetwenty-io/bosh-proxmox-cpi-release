@@ -779,7 +779,7 @@ Only follow it once the node is certain to be powered off. A node that is only p
 5. For a VM whose persistent disk lives on the dead node, either bring the node back or decide that the data is lost.
    When the data is lost, remove the disk reference with `bosh cck`.
 
-   The destroy runs on the live node, and that node cannot reach a volume on the dead node's local storage. PVE does not warn about such a volume, and the destroy finishes without it. The volume stays on the dead node, and we remove it in step 7. The CPI logs a warning when it deletes a VM whose volume sits on a node-local storage that the VM's node cannot reach. The warning names the VM, the volume ID, and the storage, and when the storage is limited to certain nodes it names the likely node too. We save those lines from the deleting task's CPI log, so that step 7 has a list.
+   The destroy runs on the live node, and that node cannot free a volume that sits on the dead node's local storage. A storage that is defined for every node, such as a shared LVM volume group name, looks active on the live node too, and the destroy looks in that node's own copy, finds no such volume, and skips it. PVE does not warn about such a volume, and the destroy finishes without it. The volume stays on the dead node, and we remove it in step 7. The CPI logs a warning when it deletes a VM whose volume sits on a node-local storage and the VM's node does not hold that volume. The warning names the VM, the volume ID, and the storage, and when the storage is limited to certain nodes it names the likely node too. We save those lines from the deleting task's CPI log, so that step 7 has a list.
 
 6. Run `bosh cck`, or wait for the next resurrection.
 
