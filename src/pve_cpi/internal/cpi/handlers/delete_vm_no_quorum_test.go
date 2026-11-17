@@ -33,7 +33,8 @@ const quorumDeferral = "delete_vm: VM 101 deferred because its HA state is unkno
 // TestHandleDeleteVM_DefersWithoutQuorumBeforeAnyWrite deletes a VM on a
 // cluster whose entry node reports it not quorate. The delete defers with the
 // unknown-HA-state text before it takes the VMID claim, so it makes no lock
-// create, no stop, and no destroy.
+// create, no stop, and no destroy. It records the deferral, so a delete that
+// reaches the VM after PVE HA restarts it lets it settle.
 func TestHandleDeleteVM_DefersWithoutQuorumBeforeAnyWrite(t *testing.T) {
 	t.Parallel()
 	scene := handlers.NewHADeleteScene()
@@ -53,6 +54,7 @@ func TestHandleDeleteVM_DefersWithoutQuorumBeforeAnyWrite(t *testing.T) {
 	if events := scene.EventsSnapshot(); len(events) != 0 {
 		t.Fatalf("a deferred delete must write nothing; events: %v", events)
 	}
+	d.requireDeferralHeld(t, true)
 }
 
 // TestHandleDeleteVM_LockRefusedForNoQuorumDefers covers quorum lost after
@@ -78,6 +80,7 @@ func TestHandleDeleteVM_LockRefusedForNoQuorumDefers(t *testing.T) {
 	if events := scene.EventsSnapshot(); len(events) != 0 {
 		t.Fatalf("a deferred delete must write nothing; events: %v", events)
 	}
+	d.requireDeferralHeld(t, true)
 }
 
 // setPools serves pools as the pool service of d's client.

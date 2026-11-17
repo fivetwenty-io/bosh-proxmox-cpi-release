@@ -4,8 +4,6 @@ import (
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
-	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
-	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 )
 
 // These tests drive delete_vm through the handler across a node outage that
@@ -73,7 +71,6 @@ func TestHandleDeleteVM_FreshHAVMWithoutDeferralsIsNotHeld(t *testing.T) {
 	scene.Manage(101, "pve-node1", "started", "started")
 	scene.Uptime[101] = 10
 	d := newLegacyHADelete(t, scene, "pve-node1", dlbEnabledConfig())
-	d.deps.HAEpisodes = &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: episodeCacheDir(t)}}
 
 	if err := d.run(); err != nil {
 		t.Fatalf("a fresh HA VM with no recovery deferral must be deleted at once: %v", err)
@@ -96,4 +93,83 @@ func TestHandleDeleteVM_DeadNodeCompletionClearsTheDeferral(t *testing.T) {
 	}
 	f.requireCompletedOn("pve-node1")
 	f.requireDeferralHeld(false)
+}
+
+// requireDeferralHeld fails unless d's record holds a deferral of vm:101
+// exactly when want says so.
+func (d *legacyHADelete) requireDeferralHeld(t *testing.T, want bool) {
+	t.Helper()
+	_, held, err := d.deps.HAEpisodes.LastRecoveryDeferral("vm:101")
+	if err != nil {
+		t.Fatalf("read the recovery deferral: %v", err)
+	}
+	if held != want {
+		t.Fatalf("recovery deferral of vm:101 held = %v, want %v", held, want)
+	}
+}
+
+// restartedOnMajority has quorum return with PVE HA holding vm:101 started on
+// pve-node1, where the majority side restarted it uptime seconds ago.
+func restartedOnMajority(s *handlers.HADeleteScene, uptime int64) {
+	s.NotQuorate = false
+	s.Uptime[101] = uptime
+}
+
+// TestHandleDeleteVM_QuorumDeferralHoldsAVMRestartedOnceQuorumReturns replays
+// a split that leaves the CPI's entry node on the minority side. Every
+// delete_vm defers there for lost quorum, while the majority side recovers
+// the VM. Once the split heals, the resurrector's next delete finds PVE HA
+// holding the VM started 32 seconds ago. That delete must wait as it does
+// after a fence or recovery deferral, and it must stop and destroy nothing.
+// Once the VM has run for five minutes, the next delete proceeds and clears
+// the deferral.
+func TestHandleDeleteVM_QuorumDeferralHoldsAVMRestartedOnceQuorumReturns(t *testing.T) {
+	t.Parallel()
+	scene := handlers.NewHADeleteScene()
+	scene.Manage(101, "pve-node1", "started", "started")
+	scene.NotQuorate = true
+	d := newLegacyHADelete(t, scene, "pve-node1", dlbEnabledConfig())
+
+	requireHARetriable(t, d.run(), quorumDeferral)
+	d.requireDeferralHeld(t, true)
+
+	scene.Do(func(s *handlers.HADeleteScene) { restartedOnMajority(s, 32) })
+	requireHARetriable(t, d.run(), "PVE HA restarted it on node pve-node1 32s ago", "has run for 5m0s")
+	if events := scene.EventsSnapshot(); len(events) != 0 {
+		t.Fatalf("the settle wait must write nothing; events: %v", events)
+	}
+	d.requireDeferralHeld(t, true)
+
+	scene.Do(func(s *handlers.HADeleteScene) { s.Uptime[101] = 301 })
+	if err := d.run(); err != nil {
+		t.Fatalf("the delete of a VM that has run past the settle window must proceed: %v", err)
+	}
+	if eventIndex(scene.EventsSnapshot(), "DeleteQemu") == -1 {
+		t.Fatalf("the VM was not destroyed; events: %v", scene.EventsSnapshot())
+	}
+	d.requireDeferralHeld(t, false)
+}
+
+// TestHandleDeleteVM_UnknownHAStateDeferralHoldsAVMRestartedLater defers a
+// delete because the LRM of the VM's node has no fresh timestamp, which is
+// how a node that PVE HA is about to fence reads. The node's VM is restarted
+// before the next delete, and that delete waits for it to settle.
+func TestHandleDeleteVM_UnknownHAStateDeferralHoldsAVMRestartedLater(t *testing.T) {
+	t.Parallel()
+	scene := handlers.NewHADeleteScene()
+	scene.Manage(101, "pve-node1", "started", "started")
+	scene.LRMAge["pve-node1"] = 3600
+	d := newLegacyHADelete(t, scene, "pve-node1", dlbEnabledConfig())
+
+	requireHARetriable(t, d.run(), "HA state is unknown", "no usable state")
+	d.requireDeferralHeld(t, true)
+
+	scene.Do(func(s *handlers.HADeleteScene) {
+		s.LRMAge["pve-node1"] = 2
+		s.Uptime[101] = 40
+	})
+	requireHARetriable(t, d.run(), "PVE HA restarted it on node pve-node1 40s ago")
+	if events := scene.EventsSnapshot(); len(events) != 0 {
+		t.Fatalf("the settle wait must write nothing; events: %v", events)
+	}
 }

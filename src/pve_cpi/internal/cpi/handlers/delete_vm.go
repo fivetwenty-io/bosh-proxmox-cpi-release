@@ -322,12 +322,12 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		// that node, and the journal's check runs again on the destination.
 		handled, managedErr := deleteManagedVMIfRecorded(ctx, deps, vmcid.PathOf(vmid), vmid)
 		if managedDeleteAnswers(handled, managedErr) {
-			return nil, deleteErrorWithoutQuorum("delete_vm", vmid,
+			return nil, deleteErrorWithoutQuorum(deps, "delete_vm", vmid,
 				managedDeleteVMError(deps.Log(ctx).With(log.String("vm_cid", vmCID)), managedErr), deps.Log(ctx))
 		}
 
 		result, err := deleteLegacyVM(ctx, deps, vmCID, cid)
-		return result, deleteErrorWithoutQuorum("delete_vm", vmid, err, deps.Log(ctx))
+		return result, deleteErrorWithoutQuorum(deps, "delete_vm", vmid, err, deps.Log(ctx))
 	})
 }
 

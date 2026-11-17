@@ -630,7 +630,7 @@ The directory holds these files, and the first two kinds belong to the endpoint 
   The HA recovery episode record, which the CPI writes even when discovery is off.
 
 - `ha-recovery-deferrals.json` and `ha-recovery-deferrals.lock`
-  The HA recovery deferral record, which holds the last time a `delete_vm` deferred each HA-managed VM for fence or recovery, so a later delete can let a VM that PVE HA restarted settle.
+  The HA recovery deferral record, which holds the last time a `delete_vm` deferred each VM for fence, recovery, an unknown HA state, or lost quorum, so a later delete can let a VM that PVE HA restarted settle.
 
 - `spread-claims.json` and `spread-claims.lock`
   The spread claim record. While a `create_vm` with `pve.placement.anti_affinity.enabled` runs, it holds a claim here on the node it picked, so a sibling that scores the nodes at the same moment counts it. The create gives its claim up when `create_vm` returns. On Linux a claim stops counting once the process that made it has exited, but only when that process ran in the same boot and the same PID namespace as the create that reads the claim. A claim from another PID namespace, such as another container, or from another host that shares the directory, lapses at its create's deadline, and so does every claim that a crash leaves behind on a host other than Linux. Removing the file costs only the spread of the creates that are running.

@@ -10,7 +10,9 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -70,6 +72,9 @@ func newLegacyHADelete(t *testing.T, scene *handlers.HADeleteScene, node string,
 	}
 	d.deps = testDepsFoundVM(101, qemuSvc, nodesSvc, tasksSvc, agentSvc)
 	d.deps.Config = cfg
+	// Each delete keeps its HA records in a directory of its own, so a
+	// deferral one test records never holds another test's delete.
+	d.deps.HAEpisodes = &ha.EpisodeStore{Dir: endpointcache.DirOptions{Override: episodeCacheDir(t)}}
 	d.deps.PVE = &handlers.HAScenePermsClient{Scene: scene, Client: &mockPVEClient{
 		qemuSvc:    &handlers.HASceneQEMU{Service: qemuSvc, Scene: scene},
 		nodesSvc:   &handlers.HASceneNodes{Service: nodesSvc, Scene: scene},

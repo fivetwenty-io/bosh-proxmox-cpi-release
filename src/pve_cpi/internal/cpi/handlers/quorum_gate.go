@@ -46,7 +46,11 @@ func deleteQuorumDeferral(caller string, vmid int) error {
 }
 
 // deferDeleteWithoutQuorum returns the quorum deferral when the cluster's
-// status proves it has lost quorum, and nil otherwise.
+// status proves it has lost quorum, and nil otherwise. The deferral is
+// recorded as an HA recovery deferral, because the members on the other side
+// of the split may hold quorum and be recovering the VM, and a delete that
+// reaches it once quorum returns must let it settle (see
+// awaitHARecoverySettle).
 func deferDeleteWithoutQuorum(ctx context.Context, deps Deps, caller string, vmid int, logger *log.Logger) error {
 	if !clusterLostQuorum(ctx, deps, logger, caller) {
 		return nil
@@ -55,14 +59,16 @@ func deferDeleteWithoutQuorum(ctx context.Context, deps Deps, caller string, vmi
 		logger.Warn(caller+": deferred because the entry node does not report the cluster quorate",
 			log.Int(metadataKeyVMID, vmid))
 	}
+	recordHARecoveryDeferralOf(deps, caller, pve.HAServiceSID(vmid), logger)
 	return deleteQuorumDeferral(caller, vmid)
 }
 
 // deleteErrorWithoutQuorum turns a delete error that carries a lock create PVE
-// refused for lack of quorum into the quorum deferral. Quorum can be lost
-// after the delete's own check, and the lock is then the first write to meet
-// it. Every other error comes back unchanged.
-func deleteErrorWithoutQuorum(caller string, vmid int, err error, logger *log.Logger) error {
+// refused for lack of quorum into the quorum deferral, and records it as the
+// quorum gate does. Quorum can be lost after the delete's own check, and the
+// lock is then the first write to meet it. Every other error comes back
+// unchanged.
+func deleteErrorWithoutQuorum(deps Deps, caller string, vmid int, err error, logger *log.Logger) error {
 	if err == nil || !errors.Is(err, pve.ErrClusterLockNoQuorum) {
 		return err
 	}
@@ -70,6 +76,7 @@ func deleteErrorWithoutQuorum(caller string, vmid int, err error, logger *log.Lo
 		logger.Warn(caller+": deferred because PVE refused a lock for lack of quorum",
 			log.Int(metadataKeyVMID, vmid), log.Err(err))
 	}
+	recordHARecoveryDeferralOf(deps, caller, pve.HAServiceSID(vmid), logger)
 	return deleteQuorumDeferral(caller, vmid)
 }
 

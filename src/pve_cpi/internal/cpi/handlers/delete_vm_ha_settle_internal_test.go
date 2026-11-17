@@ -229,32 +229,71 @@ func TestGateHADeleteSettleOnlyForDeleteVM(t *testing.T) {
 	}
 }
 
-// TestRecordHARecoveryDeferralOnlyForFenceAndRecovery records a deferral for
-// the defer and grace window answers, and none for motion, an unknown state,
-// or a VM that PVE HA does not manage.
-func TestRecordHARecoveryDeferralOnlyForFenceAndRecovery(t *testing.T) {
+// TestRecordHARecoveryDeferralForStatesThatMayHideARecovery records a
+// deferral for the defer and grace window answers of a managed VM and for
+// every unknown state, except one whose known state proves PVE HA does not
+// manage the VM. Motion, proceed, and an unmanaged VM's defer record nothing.
+func TestRecordHARecoveryDeferralForStatesThatMayHideARecovery(t *testing.T) {
 	managed := &pve.HAServiceState{SID: "vm:101", VMID: 101, Configured: true, InCRM: true}
 	cases := []struct {
-		name string
-		st   *pve.HAServiceState
-		disp pve.HADisposition
-		want bool
+		name   string
+		caller string
+		st     *pve.HAServiceState
+		disp   pve.HADisposition
+		want   bool
 	}{
-		{"defer", managed, pve.HADefer, true},
-		{"grace window", managed, pve.HAGraceWindow, true},
-		{"motion", managed, pve.HAWaitForMotion, false},
-		{"unknown", managed, pve.HAUnknown, false},
-		{"proceed", managed, pve.HAProceed, false},
-		{"not managed", &pve.HAServiceState{SID: "vm:101", VMID: 101}, pve.HADefer, false},
-		{"no state", nil, pve.HADefer, false},
+		{"defer", "delete_vm", managed, pve.HADefer, true},
+		{"grace window", "delete_vm", managed, pve.HAGraceWindow, true},
+		{"motion", "delete_vm", managed, pve.HAWaitForMotion, false},
+		{"unknown", "delete_vm", managed, pve.HAUnknown, true},
+		{"unknown and unread", "delete_vm", &pve.HAServiceState{SID: "vm:101", VMID: 101}, pve.HAUnknown, true},
+		{"unknown on a known unmanaged VM", "delete_vm",
+			&pve.HAServiceState{SID: "vm:101", VMID: 101, Known: true}, pve.HAUnknown, false},
+		{"proceed", "delete_vm", managed, pve.HAProceed, false},
+		{"not managed", "delete_vm", &pve.HAServiceState{SID: "vm:101", VMID: 101}, pve.HADefer, false},
+		{"no state", "delete_vm", nil, pve.HADefer, false},
+		{"unknown for the rollback", "create_vm: rollback", managed, pve.HAUnknown, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newHADeleteFixture(t, NewHADeleteScene(), 600)
-			recordHARecoveryDeferral(f.deps, "delete_vm", tc.st, tc.disp, f.logger)
+			recordHARecoveryDeferral(f.deps, tc.caller, tc.st, tc.disp, f.logger)
 			f.requireDeferralHeld(t, tc.want)
 		})
 	}
+}
+
+// TestGateHADeleteSettlesAVMRestartedAfterAnUnknownState defers a delete
+// because the LRM of the VM's node has no fresh timestamp, as it reads while
+// PVE HA decides to fence the node. The deferral is recorded, so when the
+// next delete finds the VM restarted 20 seconds ago it waits, and the delete
+// after the settle window proceeds and clears the record.
+func TestGateHADeleteSettlesAVMRestartedAfterAnUnknownState(t *testing.T) {
+	scene := NewHADeleteScene()
+	scene.Manage(101, "pve-node1", "started", "started")
+	scene.LRMAge["pve-node1"] = 3600
+	f := newHADeleteFixture(t, scene, 600)
+
+	_, err := f.gate(t, "pve-node1")
+	requireHADeferral(t, err, "HA state is unknown")
+	f.requireDeferralHeld(t, true)
+
+	f.clock.t = f.clock.t.Add(time.Minute)
+	scene.Do(func(s *HADeleteScene) {
+		s.LRMAge["pve-node1"] = 2
+		s.Uptime[101] = 20
+	})
+	st, err := f.gate(t, "pve-node1")
+	if st != nil {
+		t.Fatalf("a VM restarted 20s after an unknown-state deferral must not be released: %+v", st)
+	}
+	requireHADeferral(t, err, "PVE HA restarted it on node pve-node1 20s ago", "proceeds 4m40s from now")
+
+	scene.Do(func(s *HADeleteScene) { s.Uptime[101] = 300 })
+	if st, err := f.gate(t, "pve-node1"); err != nil || st == nil {
+		t.Fatalf("a VM that has run for the settle window must proceed: st=%+v err=%v", st, err)
+	}
+	f.requireDeferralHeld(t, false)
 }
 
 // TestStatusUptime reads the uptime status/current reports in each shape the

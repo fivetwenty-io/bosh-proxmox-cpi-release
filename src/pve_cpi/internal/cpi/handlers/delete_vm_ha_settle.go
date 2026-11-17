@@ -23,10 +23,13 @@ import (
 // The delete cannot tell a resurrector delete from any other, so it uses its
 // own history instead. Each delete_vm that defers an HA-managed VM for fence, a
 // dead node, or recovery records when it deferred (see
-// recordHARecoveryDeferral). A later delete_vm that finds the service started
-// with a recent deferral recorded lets the VM settle for a short window of
-// uptime, so the Director's next scan can find its agent answering and keep
-// the VM. A delete of a VM with no recorded deferral never waits.
+// recordHARecoveryDeferral). So does each delete_vm that defers because the
+// VM's HA state is unknown or the cluster has lost quorum, since PVE HA may be
+// recovering the VM on members the CPI cannot see. A later delete_vm that finds
+// the service started with a recent deferral recorded lets the VM settle for a
+// short window of uptime, so the Director's next scan can find its agent
+// answering and keep the VM. A delete of a VM with no recorded deferral never
+// waits.
 const (
 	// haRecoverySettleWindow is how long a VM that PVE HA restarted after a
 	// deferred delete may run before the delete proceeds. A BOSH stemcell boots
@@ -53,21 +56,48 @@ const haRawStateStarted = "started"
 // read or write the record.
 const haRecoveryCaller = "delete_vm"
 
-// recordHARecoveryDeferral records that a delete_vm deferred an HA-managed VM
-// because it is in fence, on a dead node, or in recovery, which are the
-// dispositions defer and grace_window. A failure to record is logged, and the
-// deferral it belongs to stands unchanged.
+// recordHARecoveryDeferral records that a delete_vm deferred a VM that PVE HA
+// may be recovering. That is an HA-managed VM in fence, on a dead node, or in
+// recovery, which are the dispositions defer and grace_window, and any VM
+// whose HA state is unknown, unless a known state proves PVE HA does not
+// manage it. An unknown state can hide a recovery that the next read finds
+// finished, so it is recorded as a recovery is. A record for a VM that turns
+// out not to be HA-managed changes nothing, because only a managed service
+// ever waits on it. A failure to record is logged, and the deferral it
+// belongs to stands unchanged.
 func recordHARecoveryDeferral(
 	deps Deps, caller string, st *pve.HAServiceState, disp pve.HADisposition, logger *log.Logger,
 ) {
-	if caller != haRecoveryCaller || st == nil || !st.Managed() ||
-		(disp != pve.HADefer && disp != pve.HAGraceWindow) {
+	if st == nil {
 		return
 	}
-	if err := haEpisodes(deps, logger).RecordRecoveryDeferral(st.SID); err != nil {
+	switch disp {
+	case pve.HADefer, pve.HAGraceWindow:
+		if !st.Managed() {
+			return
+		}
+	case pve.HAUnknown:
+		if st.Known && !st.Managed() {
+			return
+		}
+	default:
+		return
+	}
+	recordHARecoveryDeferralOf(deps, caller, st.SID, logger)
+}
+
+// recordHARecoveryDeferralOf records a delete_vm deferral of the HA service sid
+// without reading its HA state. The quorum gate uses it, because the cluster
+// that lost quorum cannot say whether PVE HA manages the VM, and the majority
+// side may be recovering it. Only delete_vm records.
+func recordHARecoveryDeferralOf(deps Deps, caller, sid string, logger *log.Logger) {
+	if caller != haRecoveryCaller {
+		return
+	}
+	if err := haEpisodes(deps, logger).RecordRecoveryDeferral(sid); err != nil && logger != nil {
 		logger.Warn(caller+": the HA recovery deferral could not be recorded, so a delete that reaches the VM "+
 			"right after PVE HA restarts it does not wait for it to settle",
-			log.String("sid", st.SID), log.Err(err))
+			log.String("sid", sid), log.Err(err))
 	}
 }
 

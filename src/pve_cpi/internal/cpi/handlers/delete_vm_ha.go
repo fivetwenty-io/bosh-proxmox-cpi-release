@@ -253,9 +253,9 @@ func gateHADeleteState(
 
 // haDeleteRefusal is the retriable error for an HA state that neither lets
 // the delete proceed nor is motion the delete waits out. A delete_vm that it
-// defers for fence, a dead node, or recovery is recorded first, so a later
-// delete_vm can let the VM settle once PVE HA restarts it (see
-// awaitHARecoverySettle).
+// defers for fence, a dead node, recovery, or an unknown HA state is recorded
+// first, so a later delete_vm can let the VM settle once PVE HA restarts it
+// (see recordHARecoveryDeferral and awaitHARecoverySettle).
 func haDeleteRefusal(
 	ctx context.Context, deps Deps, caller string, st *pve.HAServiceState, disp pve.HADisposition, reason string,
 	logger *log.Logger,
