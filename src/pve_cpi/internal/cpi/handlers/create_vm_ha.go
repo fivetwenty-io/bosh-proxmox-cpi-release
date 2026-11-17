@@ -114,8 +114,9 @@ func decideCreatedVMHA(
 		logger.Warn("create_vm: "+w, log.Int(metadataKeyVMID, vmid))
 	}
 	if decision.TargetNodeOverridesDLB {
-		logger.Info("create_vm: the VM sets target_node and is in an anti-affinity group, so target_node wins over "+
-			"the dynamic load balancer and its HA resource keeps auto-rebalance off",
+		logger.Info("create_vm: the VM sets target_node and is in an anti-affinity group, so target_node chose the "+
+			"creation node and the HA resource is registered with auto-rebalance off, so the dynamic load "+
+			"balancer leaves it alone",
 			log.Int(metadataKeyVMID, vmid), log.String("target_node", parsed.cloudProps.TargetNode))
 	}
 	switch decision.Outcome {

@@ -603,7 +603,7 @@ See [PVE Storage Locking](pve-storage-locking.md) for full lock mechanics.
 
 ### Resetting the endpoint cache
 
-We reset the cache when a finding tells us to, such as a cluster identity change that the CPI refused under `verify_ssl: false`, or when a node's certificate changed and the stored pins no longer fit. The files are plain JSON that we can read as `vcap`. The cache files hold no credential, although the directory secret that signs them does. A reset costs one rediscovery and nothing else, so it is safe to do on a live Director.
+We reset the cache when a finding tells us to, such as a cluster identity change that the CPI refused under `verify_ssl: false`, or when a node's certificate changed and the stored pins no longer fit. The files are plain JSON that we can read as `vcap`. The cache files hold no credential, although the directory secret that signs them does. A reset costs one rediscovery and nothing else, so it is safe to do on a live Director. We should expect the directory even when discovery is off. A pool with more than one endpoint and a usable cache directory writes the directory, its secret file, and the down-mark cache files, and a pool with a single endpoint writes nothing.
 
 First we find the directory. The CPI chooses it in three layers, and the first layer that applies wins.
 

@@ -115,6 +115,8 @@ properties:
       scans its own tree. This setting is process-level, like the journal
       directory, so a cpi-config entry cannot change it.
 
+      A pool with more than one endpoint writes cache files even when endpoint discovery is off. With a usable cache directory, the CPI then creates the directory, its secret file, and the down-mark cache files. A pool with a single endpoint writes nothing.
+
       Do not set pve.storage_allocation_journal_dir only to give the cache a durable home. Setting the journal directory turns on the allocation journal, so it also needs pve.storage_placement_namespace and an enrolled namespace, and without them create_vm and delete_vm refuse. Set this property instead for a durable cache without a journal.
   pve.user:
     description: |
