@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 
@@ -63,6 +64,14 @@ func (g GuestRef) SplitTags() []string {
 // a powered-off node's guests still reference their disks and tags in
 // config. Advisory or presence-driven callers that can safely act on a
 // reduced fleet use ListGuestsAuthoritativeTolerant instead.
+//
+// When a member's listing fails and the entry node does not report the
+// cluster quorate and lists that member offline, the listing stops retrying
+// it after that one attempt. Nothing brings the member back while quorum is
+// gone, and each attempt against a member that is gone can take tens of
+// seconds. The member still fails the enumeration, and the refusal names the
+// lost quorum. The cluster's status is read once per enumeration for this,
+// with a single attempt, and a failed read leaves the full retry budget.
 func ListGuestsAuthoritative(ctx context.Context, c Client, logger *log.Logger) ([]GuestRef, error) {
 	guests, _, err := listGuestsAuthoritative(ctx, c, logger, nil, nil)
 	return guests, err
@@ -108,11 +117,13 @@ func ListGuestsAuthoritativeTolerant(ctx context.Context, c Client, logger *log.
 	}
 	// One status attempt per failed listing attempt: the listing's own retry
 	// loop already paces the reads, and a status read with its own retries
-	// here would multiply the stall this check exists to cut short.
-	wentOffline := func(node string) bool {
-		return ClusterReportsMemberOffline(ctx, c, logger, node)
+	// here would multiply the stall this check exists to cut short. The same
+	// read answers whether the quorate cluster now reports the member offline
+	// and whether the cluster has lost quorum and lists it offline.
+	stop := func(node string, cause error) error {
+		return memberStopFromStatus(ctx, c, logger, node, cause)
 	}
-	return listGuestsAuthoritative(ctx, c, logger, offlineClusterNodes(ctx, c, logger), wentOffline)
+	return listGuestsAuthoritative(ctx, c, logger, offlineClusterNodes(ctx, c, logger), stop)
 }
 
 // ListMemberGuests lists the QEMU guests of the named members only, each with
@@ -134,22 +145,28 @@ func ListMemberGuests(ctx context.Context, c Client, logger *log.Logger, nodes [
 	var guests []GuestRef
 	var failedNodes []string
 	var failedErrs []error
+	var noQuorum []string
+	quorum := newQuorumLossProbe(ctx, c, logger)
 	seen := make(map[string]bool, len(nodes))
 	for _, node := range nodes {
 		if seen[node] {
 			continue
 		}
 		seen[node] = true
-		nodeGuests, err := listNodeGuests(ctx, c, logger, node, nil)
+		nodeGuests, err := listNodeGuests(ctx, c, logger, node, quorum.stop)
 		if err != nil {
 			failedNodes = append(failedNodes, node)
 			failedErrs = append(failedErrs, err)
+			var noQuorumErr *memberUnreachableWithoutQuorumError
+			if errors.As(err, &noQuorumErr) {
+				noQuorum = append(noQuorum, node)
+			}
 			continue
 		}
 		guests = append(guests, nodeGuests...)
 	}
 	if len(failedNodes) > 0 {
-		return nil, partialFleetError(failedNodes, failedErrs, failedMembersReportedOffline(ctx, c, logger, failedNodes))
+		return nil, partialFleetError(failedNodes, failedErrs, failedMembersReportedOffline(ctx, c, logger, failedNodes), noQuorum)
 	}
 	return guests, nil
 }
@@ -202,15 +219,102 @@ func (e *memberWentOfflineError) Error() string {
 	return "cluster reports member " + e.node + " offline"
 }
 
+// memberUnreachableWithoutQuorumError ends a member's listing retries because
+// the entry node does not report the cluster quorate and lists the member
+// offline. Without quorum nothing brings the member back within the retry
+// budget, and each attempt against a member that is gone can take tens of
+// seconds. Unlike memberWentOfflineError it never excludes the member, so the
+// enumeration still fails, only sooner. Like that error, it neither unwraps to
+// the failed attempt's error nor repeats its text, so the retry classifiers
+// stop on it.
+type memberUnreachableWithoutQuorumError struct {
+	node  string
+	cause error
+}
+
+func (e *memberUnreachableWithoutQuorumError) Error() string {
+	return "member " + e.node + " is offline and " + ReasonNotQuorate
+}
+
+// quorumLossProbe reads the cluster's status at most once per enumeration,
+// the first time a member's listing fails, and remembers whether the entry
+// node reported the cluster without quorum and which members it listed
+// offline. A failed read proves nothing, so it answers false for every member.
+type quorumLossProbe struct {
+	once    sync.Once
+	ctx     context.Context
+	c       Client
+	logger  *log.Logger
+	lost    bool
+	offline map[string]bool
+}
+
+func newQuorumLossProbe(ctx context.Context, c Client, logger *log.Logger) *quorumLossProbe {
+	return &quorumLossProbe{ctx: ctx, c: c, logger: logger}
+}
+
+// stop returns a *memberUnreachableWithoutQuorumError when the cluster has
+// lost quorum and lists node offline, and nil otherwise.
+func (p *quorumLossProbe) stop(node string, cause error) error {
+	p.once.Do(func() {
+		if p.c == nil || p.c.Cluster() == nil {
+			return
+		}
+		q, err := ReadClusterQuorum(p.ctx, p.c.Cluster())
+		if err != nil {
+			if p.logger != nil {
+				p.logger.Debug("ListGuestsAuthoritative: cluster status unreadable for the quorum check", log.Err(err))
+			}
+			return
+		}
+		p.lost, p.offline = q.Lost(), q.Offline
+	})
+	if p.lost && p.offline[node] {
+		return &memberUnreachableWithoutQuorumError{node: node, cause: cause}
+	}
+	return nil
+}
+
+// memberStopFromStatus reads the cluster's status with a single attempt after
+// a member's listing attempt failed. It returns a *memberWentOfflineError when
+// the quorate cluster now reports the member offline, a
+// *memberUnreachableWithoutQuorumError when the cluster has lost quorum and
+// lists the member offline, and nil when the read fails or the member is
+// listed online.
+func memberStopFromStatus(ctx context.Context, c Client, logger *log.Logger, node string, cause error) error {
+	if c == nil || c.Cluster() == nil {
+		return nil
+	}
+	q, err := ReadClusterQuorum(ctx, c.Cluster())
+	if err != nil {
+		if logger != nil {
+			logger.Debug("ListGuestsAuthoritative: cluster status unreadable after a failed listing", log.Err(err))
+		}
+		return nil
+	}
+	switch {
+	case !q.Offline[node]:
+		return nil
+	case q.Lost():
+		return &memberUnreachableWithoutQuorumError{node: node, cause: cause}
+	case q.Reported && q.Quorate:
+		return &memberWentOfflineError{node: node, cause: cause}
+	}
+	return nil
+}
+
 // listGuestsAuthoritative is the shared fan-out. offline is the set of
 // members to exclude (nil for the strict form); excluded reports the names
-// actually skipped, in membership order. wentOffline, when it isn't nil, is
-// asked after each failed listing attempt whether the cluster now reports
-// that member offline, and a yes excludes the member instead of retrying it.
-// The strict form passes nil, so an absence proof still rides out an outage
-// through the whole retry budget.
+// actually skipped, in membership order. stop, when it isn't nil, is asked
+// after each failed listing attempt whether to stop retrying that member. A
+// *memberWentOfflineError excludes the member, and a
+// *memberUnreachableWithoutQuorumError fails it at once. The strict form
+// passes nil and gets a check that only stops a member the cluster lists
+// offline after losing quorum, so an absence proof still rides out an outage
+// on a quorate cluster through the whole retry budget, and it still fails
+// when a member cannot be listed.
 func listGuestsAuthoritative(
-	ctx context.Context, c Client, logger *log.Logger, offline map[string]bool, wentOffline func(string) bool,
+	ctx context.Context, c Client, logger *log.Logger, offline map[string]bool, stop func(string, error) error,
 ) ([]GuestRef, []string, error) {
 	if ctx == nil {
 		return nil, nil, cpierrors.Cloud("ListGuestsAuthoritative: ctx must not be nil")
@@ -237,6 +341,11 @@ func listGuestsAuthoritative(
 	var excluded []string
 	var failedNodes []string
 	var failedErrs []error
+	var noQuorum []string
+	strict := offline == nil && stop == nil
+	if stop == nil {
+		stop = newQuorumLossProbe(ctx, c, logger).stop
+	}
 	listedAny := false
 	seenNodes := make(map[string]bool, len(nodeNames))
 	for _, node := range nodeNames {
@@ -252,7 +361,18 @@ func listGuestsAuthoritative(
 			}
 			continue
 		}
-		nodeGuests, listErr := listNodeGuests(ctx, c, logger, node, wentOffline)
+		nodeGuests, listErr := listNodeGuests(ctx, c, logger, node, stop)
+		var noQuorumErr *memberUnreachableWithoutQuorumError
+		if errors.As(listErr, &noQuorumErr) {
+			failedNodes = append(failedNodes, node)
+			failedErrs = append(failedErrs, listErr)
+			noQuorum = append(noQuorum, node)
+			if logger != nil {
+				logger.Warn("ListGuestsAuthoritative: member is offline and the cluster has no quorum; not retrying its listing",
+					log.String("node", node), log.Err(noQuorumErr.cause))
+			}
+			continue
+		}
 		var offlineErr *memberWentOfflineError
 		if errors.As(listErr, &offlineErr) {
 			excluded = append(excluded, node)
@@ -279,10 +399,10 @@ func listGuestsAuthoritative(
 		// offline. The tolerant form leaves such a member out instead, so a
 		// member it failed on was still reported online.
 		var failedOffline []string
-		if offline == nil && wentOffline == nil {
+		if strict {
 			failedOffline = failedMembersReportedOffline(ctx, c, logger, failedNodes)
 		}
-		return nil, nil, partialFleetError(failedNodes, failedErrs, failedOffline)
+		return nil, nil, partialFleetError(failedNodes, failedErrs, failedOffline, noQuorum)
 	}
 	if !listedAny {
 		// Every member excluded as offline: an empty result here would read
@@ -374,17 +494,19 @@ func readOfflineClusterNodes(ctx context.Context, c Client, logger *log.Logger, 
 // listNodeGuests lists one node's QEMU guests through RetryOnTransient and
 // decodes them into GuestRefs. Malformed elements are skipped, not fatal
 // (matches ResolveTemplateVMIDForNode), logged so schema drift leaves a
-// trail. When wentOffline is set and reports the node offline after a failed
-// attempt, the retries stop with a *memberWentOfflineError.
+// trail. When stop is set and returns an error after a failed attempt, the
+// retries stop with that error.
 func listNodeGuests(
-	ctx context.Context, c Client, logger *log.Logger, node string, wentOffline func(string) bool,
+	ctx context.Context, c Client, logger *log.Logger, node string, stop func(string, error) error,
 ) ([]GuestRef, error) {
 	var raws []json.RawMessage
 	listErr := RetryOnTransient(ctx, logger, "list_guests_node", 0, func() error {
 		resp, inner := c.Nodes().ListQemu(ctx, node, nil)
 		if inner != nil {
-			if wentOffline != nil && wentOffline(node) {
-				return &memberWentOfflineError{node: node, cause: inner}
+			if stop != nil {
+				if stopErr := stop(node, inner); stopErr != nil {
+					return stopErr
+				}
 			}
 			return inner
 		}
@@ -438,8 +560,10 @@ func listNodeGuests(
 // GuestEnumerationError, so an audit can name the failed nodes without
 // repeating the transport text. failedOffline names the failed members the
 // quorate cluster reports offline, and only the retriable shape carries it,
-// because a member that gave a real API answer was reachable.
-func partialFleetError(failedNodes []string, failedErrs []error, failedOffline []string) error {
+// because a member that gave a real API answer was reachable. noQuorum names
+// the failed members whose listing stopped early because the cluster has lost
+// quorum and lists them offline, and only the retriable shape carries it too.
+func partialFleetError(failedNodes []string, failedErrs []error, failedOffline, noQuorum []string) error {
 	for i, fe := range failedErrs {
 		if _, isAPIVerdict := apiHTTPCode(fe); !isAPIVerdict {
 			continue
@@ -449,5 +573,6 @@ func partialFleetError(failedNodes []string, failedErrs []error, failedOffline [
 		}
 		return cpierrors.Wrap(&GuestEnumerationError{Nodes: []string{failedNodes[i]}, Cause: WrapError(fe)}, "ListGuestsAuthoritative")
 	}
-	return cpierrors.WrapAs(&GuestEnumerationError{Nodes: failedNodes, Offline: failedOffline}, cpierrors.TypeRetriableCloud, "ListGuestsAuthoritative")
+	return cpierrors.WrapAs(&GuestEnumerationError{Nodes: failedNodes, Offline: failedOffline, NoQuorum: noQuorum},
+		cpierrors.TypeRetriableCloud, "ListGuestsAuthoritative")
 }

@@ -117,14 +117,14 @@ func TestAuditVisibilityErrorsAreTyped(t *testing.T) {
 }
 
 func TestPartialFleetErrorNamesFailedNodesWithUnchangedText(t *testing.T) {
-	retriable := partialFleetError([]string{"pve2", "pve3"}, []error{errors.New("dial"), errors.New("dial")}, nil)
+	retriable := partialFleetError([]string{"pve2", "pve3"}, []error{errors.New("dial"), errors.New("dial")}, nil, nil)
 	if !cpierrors.IsType(retriable, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("transport partial fleet lost its retriable class: %v", retriable)
 	}
 	if retriable.Error() != "ListGuestsAuthoritative: could not list guests on node(s) pve2,pve3; refusing to decide from a partial fleet" {
 		t.Fatalf("partial fleet text changed: %q", retriable.Error())
 	}
-	verdict := partialFleetError([]string{"pve2"}, []error{sdkerrors.ParseAPIError(403, []byte(`{"message":"denied"}`))}, []string{"pve2"})
+	verdict := partialFleetError([]string{"pve2"}, []error{sdkerrors.ParseAPIError(403, []byte(`{"message":"denied"}`))}, []string{"pve2"}, nil)
 	if cpierrors.IsType(verdict, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("permanent API verdict became retriable: %v", verdict)
 	}

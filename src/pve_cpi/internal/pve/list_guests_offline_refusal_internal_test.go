@@ -58,7 +58,8 @@ func TestListGuestsAuthoritative_StrictNamesMemberReportedOfflineAndTheRetry(t *
 
 // TestListGuestsAuthoritative_StrictNamesNoOfflineMemberWithoutQuorum: a
 // cluster without quorum has no authority to call a member offline, so the
-// refusal reads exactly as it did before.
+// refusal never says the cluster reports it offline. It names the lost quorum
+// instead, and says to retry once the cluster is quorate.
 func TestListGuestsAuthoritative_StrictNamesNoOfflineMemberWithoutQuorum(t *testing.T) {
 	t.Parallel()
 	c, _ := lgStrictDownCluster(lgStatusQuorate(false, map[string]bool{"pve1": true, "pve2": false}))
@@ -66,8 +67,11 @@ func TestListGuestsAuthoritative_StrictNamesNoOfflineMemberWithoutQuorum(t *test
 	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("the strict refusal must stay retriable, got: %v", err)
 	}
-	if got, want := err.Error(), "ListGuestsAuthoritative: could not list guests on node(s) pve2; refusing to decide from a partial fleet"; got != want {
-		t.Fatalf("a cluster without quorum must not change the refusal, got %q, want %q", got, want)
+	want := "ListGuestsAuthoritative: could not list guests on node(s) pve2; refusing to decide from a partial fleet; " +
+		"the entry node does not report the cluster quorate and lists node(s) pve2 offline, so their listing was " +
+		"not retried; retry once 'pvecm status' reports the cluster quorate"
+	if got := err.Error(); got != want {
+		t.Fatalf("a cluster without quorum must name the lost quorum, got %q, want %q", got, want)
 	}
 }
 

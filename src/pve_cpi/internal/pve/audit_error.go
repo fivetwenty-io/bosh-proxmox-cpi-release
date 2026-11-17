@@ -75,11 +75,15 @@ var ErrAuditVisibilityReaderUnavailable error = &AuditVisibilityReadError{text: 
 // one API verdict decided the classification. Offline names the members among
 // Nodes that the quorate cluster reported offline when the listing gave up on
 // them, and the text then says that the call can succeed only once they are
-// back.
+// back. NoQuorum names the members among Nodes whose listing stopped without
+// retries because the entry node did not report the cluster quorate and listed
+// them offline, and the text then says that the call can succeed only once the
+// cluster is quorate again.
 type GuestEnumerationError struct {
-	Nodes   []string
-	Cause   error
-	Offline []string
+	Nodes    []string
+	Cause    error
+	Offline  []string
+	NoQuorum []string
 }
 
 func (e *GuestEnumerationError) Error() string {
@@ -91,6 +95,11 @@ func (e *GuestEnumerationError) Error() string {
 		text += fmt.Sprintf("; the cluster reports node(s) %s offline, and their guests' configs can't be read until "+
 			"they return, so retry once node(s) %s are back in the cluster",
 			strings.Join(e.Offline, ","), strings.Join(e.Offline, ","))
+	}
+	if len(e.NoQuorum) > 0 {
+		text += fmt.Sprintf("; %s and lists node(s) %s offline, so their listing was not retried; "+
+			"retry once 'pvecm status' reports the cluster quorate",
+			ReasonNotQuorate, strings.Join(e.NoQuorum, ","))
 	}
 	return text
 }
