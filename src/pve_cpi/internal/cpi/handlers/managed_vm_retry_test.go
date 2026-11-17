@@ -73,20 +73,7 @@ func testManagedVMRetryMode(t *testing.T, mode string) {
 	case "changed-frozen-fingerprint":
 		intent.FrozenInputsFingerprint = strings.Repeat("f", 64)
 	}
-	switch mode {
-	case "ten-zero-full-form", "ten-zero-full-form-changed":
-		// A record that 0.10.0 through 0.10.2 opened holds the fingerprint
-		// with the API transport settings included.
-		req.Selection.Policy.Endpoints = []string{"pve.example:8006"}
-		req.Selection.Policy.APIEndpointDiscovery = config.DiscoveryModeOn
-		plan.VMExecution.InputFingerprint, err = managedVMExecutionFingerprintOf(req.Selection.Policy, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if intent.Plan, err = json.Marshal(plan); err != nil {
-			t.Fatal(err)
-		}
-	}
+	seedTenZeroFullForm(t, mode, req.Selection.Policy, plan, &intent)
 	handle, err := journal.AcquireVM(context.Background(), "agent", intent)
 	if err != nil {
 		t.Fatal(err)
@@ -190,5 +177,25 @@ func TestManagedVMRetryExcludesItsOwnAllocation(t *testing.T) {
 	key := siblingCapacityKey(t, request, siblingPlacementRootStorage(t, handle.Record()))
 	if other := charge("alloc-other"); other[key] == 0 {
 		t.Fatalf("the same record charges %v under another identifier, want its claim on %q", other, key)
+	}
+}
+
+// seedTenZeroFullForm rewrites the planned VM execution fingerprint into the
+// form that 0.10.0 through 0.10.2 stored, with the API transport settings
+// included, for the two modes that start from such a record.
+func seedTenZeroFullForm(t *testing.T, mode string, policy *config.CPIConfig, plan *StorageAllocationPlan, intent *aj.Intent) {
+	t.Helper()
+	if mode != "ten-zero-full-form" && mode != "ten-zero-full-form-changed" {
+		return
+	}
+	policy.Endpoints = []string{"pve.example:8006"}
+	policy.APIEndpointDiscovery = config.DiscoveryModeOn
+	fp, err := managedVMExecutionFingerprintOf(policy, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.VMExecution.InputFingerprint = fp
+	if intent.Plan, err = json.Marshal(plan); err != nil {
+		t.Fatal(err)
 	}
 }
