@@ -1283,7 +1283,11 @@ const aaHealRounds = 4
 // the legacy migration, because it places no member of its own. A heal whose
 // own writes deleted a rule, or whose own write a pin repair undid, heals
 // again, at most aaHealRounds times, and each round leaves out the members of
-// the pins the rounds before it repaired.
+// the pins the rounds before it repaired. That holds in managed mode too,
+// where the writer fails a write whose repair confined a member. The heal
+// then goes on to the next round with that member held out, and it returns
+// the writer's error only when the repair confined no member that was not
+// held out already, or when the rounds run out.
 func healAntiAffinityGroup(
 	ctx context.Context, deps Deps, ident haIdentity, self, removed string, confined []string, logger *log.Logger,
 ) error {
@@ -1295,6 +1299,7 @@ func healAntiAffinityGroup(
 	for _, s := range confined {
 		holdOut[s] = true
 	}
+	var notInEffect error
 	for range aaHealRounds {
 		scan, err := collectGroupMemberSids(ctx, deps, ident)
 		if err != nil {
@@ -1303,16 +1308,26 @@ func healAntiAffinityGroup(
 		planner := newGroupPlanner(ctx, deps, profile, ident, scan, logger)
 		planner.sid, planner.heal, planner.exclude, planner.holdOut = self, true, removed, holdOut
 		_, res, err := applyGroupPlan(ctx, deps, profile, planner, nil, logger)
-		if err != nil {
-			return err
-		}
 		loss := groupRuleLossOf(res, ident)
+		grew := false
+		for _, s := range loss.confined {
+			grew = grew || !holdOut[s]
+			holdOut[s] = true
+		}
+		if err != nil {
+			if !errors.Is(err, ha.ErrRuleNotInEffect) || !grew {
+				return err
+			}
+			notInEffect = err
+			continue
+		}
+		notInEffect = nil
 		if !loss.lost {
 			return nil
 		}
-		for _, s := range loss.confined {
-			holdOut[s] = true
-		}
+	}
+	if notInEffect != nil {
+		return notInEffect
 	}
 	return cpierrors.Retriable("anti-affinity: the rules of group %s lost a rule to a delete in each of %d heals",
 		ident.ruleName(), aaHealRounds)
