@@ -1098,9 +1098,7 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 	}
 
 	if len(excludedNodes) > 0 {
-		return DiskScanHit{StorageReferences: counts}, cpierrors.Retriable(
-			"disk %q: not found among the reachable guests, but node(s) %s were excluded as offline; cannot prove the disk is unattached",
-			volid, strings.Join(excludedNodes, ","))
+		return DiskScanHit{StorageReferences: counts}, diskHolderOfflineRefusal(volid, excludedNodes)
 	}
 	// The counts ride out on the not-found answer too, and that is the case
 	// they exist for: a disk nothing references is the one delete_disk is about
