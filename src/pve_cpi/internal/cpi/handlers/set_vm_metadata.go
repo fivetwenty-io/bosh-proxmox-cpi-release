@@ -147,6 +147,9 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		// A replicate VM that failed over has its pin narrowed to the node it
 		// runs on now, and one whose replica a sync now covers has its pin
 		// widened to the partner.
+		// A strict pin that left out a node because the node could not be read
+		// when the pin was written gets that node back once it reads as able
+		// to take the VM.
 		if haErr := reconcileTouchedVMHA(ctx, deps, "set_vm_metadata", vmCID, vmid, loc, logger); haErr != nil {
 			return nil, haErr
 		}

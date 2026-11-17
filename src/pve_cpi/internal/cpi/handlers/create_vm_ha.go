@@ -105,7 +105,7 @@ func decideCreatedVMHA(
 		return nil, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("create_vm: read the config of VM %d for its HA decision", vmid))
 	}
-	in := createdVMHAInput(ctx, deps, parsed, shape, vmid, cfg, profile)
+	in := createdVMHAInput(ctx, deps, parsed, shape, vmid, cfg, profile, logger)
 	decision, err := profile.DecideVM(in)
 	if err != nil {
 		return nil, err
@@ -172,7 +172,7 @@ func warnRequestedHAWithoutRegistration(
 // carries no CRM uid.
 func createdVMHAInput(
 	ctx context.Context, deps Deps, parsed *createVMParsedArgs, shape *createVMShape, vmid int,
-	cfg map[string]any, profile *ha.Profile,
+	cfg map[string]any, profile *ha.Profile, logger *log.Logger,
 ) ha.VMInput {
 	node := shape.node
 	liveCPU, _ := pve.ConfigString(cfg, "cpu")
@@ -187,7 +187,7 @@ func createdVMHAInput(
 	}
 	markLinkedRootDisk(in.Volumes, cfg, shape)
 	scopeHAInputToNode(&in, deps.Config, parsed.cloudProps, node)
-	in.Constraints = append(in.Constraints, createdVMBridgeConstraints(ctx, deps, parsed, profileNodeNames(profile))...)
+	in.Constraints = append(in.Constraints, createdVMBridgeConstraints(ctx, deps, parsed, profileNodeNames(profile), logger)...)
 	return in
 }
 
@@ -211,10 +211,13 @@ func scopeHAInputToNode(in *ha.VMInput, cfg *config.CPIConfig, cp createVMCloudP
 // createdVMBridgeConstraints returns one constraint for each plain bridge the
 // VM's NICs use, naming the cluster nodes that hold it. A node whose bridge
 // list cannot be read does not count as holding it, so the VM is never pinned
-// where its network may be missing. With the bridge check off, the operator
-// has said the bridges exist everywhere, and no constraint is made.
+// where its network may be missing. Such a node, which is often one that is
+// down, is named in a Warn, and the next set_vm_metadata or reboot_vm on the
+// VM gives it back to the pin once it answers (see widenNarrowedPin). With the
+// bridge check off, the operator has said the bridges exist everywhere, and
+// no constraint is made.
 func createdVMBridgeConstraints(
-	ctx context.Context, deps Deps, parsed *createVMParsedArgs, members []string,
+	ctx context.Context, deps Deps, parsed *createVMParsedArgs, members []string, logger *log.Logger,
 ) []ha.NodeConstraint {
 	if deps.Config == nil || deps.PVE == nil || len(members) == 0 ||
 		deps.Config.BridgeCheckMode() == config.BridgeCheckOff {
@@ -229,7 +232,14 @@ func createdVMBridgeConstraints(
 	for _, bridge := range bridges {
 		var nodes []string
 		for _, n := range members {
-			if present, err := checker.check(n, bridge); err == nil && present {
+			present, err := checker.check(n, bridge)
+			if err != nil {
+				logger.Warn("create_vm: the VM's HA pin leaves out a node whose bridges could not be read; the "+
+					"next set_vm_metadata or reboot_vm on the VM adds the node back once it answers",
+					log.String("node", n), log.String("bridge", bridge), log.Err(err))
+				continue
+			}
+			if present {
 				nodes = append(nodes, n)
 			}
 		}

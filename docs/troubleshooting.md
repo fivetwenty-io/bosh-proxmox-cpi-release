@@ -2862,6 +2862,20 @@ We run `pve-cid ha` against the cluster. It is read-only. It prints the profile 
 
 For a removed key, we replace it as the error says. For a failed gate, we fix the cluster or the token, and the profile is probed again on the next call. For a deferred delete, we follow [When `delete_vm` defers](operations.md#when-delete_vm-defers), and for a dead node we follow [the dead-node procedure](operations.md#the-dead-node-procedure). For an `error` resource, we follow [Clearing an HA error by hand](operations.md#clearing-an-ha-error-by-hand). [HA and Resurrection](ha-and-resurrection.md) explains the ownership model behind all four.
 
+## A VM's HA pin leaves out a node that has returned
+
+**Symptom**
+
+`pve-cid ha` or `ha-manager rules config` shows a strict `bosh-na-<vmid>` pin that leaves out a node which is back online and healthy. PVE HA then never recovers or migrates the VM onto that node. The `create_vm` log for the VM holds the warning `create_vm: the VM's HA pin leaves out a node whose bridges could not be read`, which names the node and the bridge.
+
+**Cause**
+
+The node was down, or didn't answer, while `create_vm` wrote the pin. `create_vm` pins a VM only to nodes whose bridge lists show the VM's bridges, so a node it couldn't read was left out. That keeps the VM off a node that may lack its network.
+
+**Fix**
+
+We let the next `set_vm_metadata` or `reboot_vm` on the VM widen the pin, and any deploy that touches the instance sends one. That call reads each online node the pin leaves out and gives it back to the pin when the node lists the VM's bridges and shows the VM's storage as active. The call logs `widened the VM's strict pin to the nodes that now reach its storage and network` with the old and new nodes. When a node's storage or bridge keeps it out of the pin, the call's debug log names the node and the storage or bridge it was missing, and a warning reports a check that couldn't finish. The CPI never widens a pin that another Director owns, a pin that isn't strict, the pin of a `replicate` VM, or a pin whose recorded storages no longer match the VM's disks. [HA and Resurrection](ha-and-resurrection.md#placement-under-ha) explains the rule.
+
 ## Task timeouts
 
 **Symptom**

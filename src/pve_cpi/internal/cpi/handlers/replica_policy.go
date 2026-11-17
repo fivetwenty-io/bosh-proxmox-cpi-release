@@ -945,15 +945,18 @@ func settleFailedReplicaCreate(
 	return cpierrors.Wrap(wrapped, fmt.Sprintf("create_vm: PVE refused replication job %s", id))
 }
 
-// reconcileTouchedVMHA runs the HA catch-up a touch call owes a located VM:
-// it finishes a pending re-registration first, then reconciles the pin of a
-// replicate VM with where it runs and what its replica covers.
+// reconcileTouchedVMHA runs the HA catch-up a touch call owes a located VM.
+// It finishes a pending re-registration first, then gives a strict pin back
+// the nodes it left out only because they could not be read when it was
+// written, and then reconciles the pin of a replicate VM with where it runs
+// and what its replica covers. The widening only logs when it fails.
 func reconcileTouchedVMHA(ctx context.Context, deps Deps, op, vmCID string, vmid int, loc pve.VMLocation,
 	logger *log.Logger,
 ) error {
 	if err := finishPendingHAReadd(ctx, deps, op, vmid, loc, logger); err != nil {
 		return err
 	}
+	widenNarrowedPin(ctx, deps, op, vmid, loc, logger)
 	return reconcileVMReplica(ctx, deps, op, vmCID, vmid, loc, logger)
 }
 
