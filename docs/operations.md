@@ -713,6 +713,8 @@ findings:
 result: 0 problem(s), 0 advice
 ```
 
+The node lines show what the node's HA agent reports. The `lrm=` part gives its mode and state, and `watchdog=armed` means the agent still holds its lock and runs its watchdog. A node that is draining for maintenance keeps its watchdog armed, with `lrm=mode=maintenance/state=active`. When the drain finishes, the agent enters the state `maintenance`, releases its lock, and closes the watchdog, and the line then reads `watchdog=idle` with `drain=complete`.
+
 The headroom field reads `headroom=ok(42%)` when every single-node failure leaves memory free on the survivors, where the percentage is the smallest margin over all such failures. It reads `short(<node>)` or `short(<node>+N)` when a failure leaves a VM with nowhere to go. The name is the first node whose loss does that, and N counts the other nodes that are short. It reads `unavailable` when the CPI could not read what it needs. The number is the same memory-only estimate that `create_vm` uses, so a result of `ok` does not promise that every VM restarts.
 
 Each finding is either a problem or advice. The command exits with 0 when the report holds no problem, with 1 when it holds a problem or a source it could not read, and with 2 for a usage error. An unreadable source counts as a problem with the kind `unchecked`, so a clean run proves that every check ran. The finding kinds fall into these groups.
@@ -725,6 +727,8 @@ Each finding is either a problem or advice. The command exits with 0 when the re
 
 - CPU and local storage
   `cpu_unknown`, `cpu_host_multi_domain`, `cpu_domain_too_small`, `local_unprotected`, `hold_blocks_maintenance`, `maintenance_stranded`, and `recovery_stranded`.
+
+  The `maintenance_stranded` problem names each started HA VM that is still running on a node in maintenance, once per VM, and it adds the reason when the doctor can see one. That is a strict node-affinity pin that names no other node the VM can move to, or an anti-affinity group that already holds a member on every other node that can take it. A `hold` VM is named by `hold_blocks_maintenance` instead, and neither finding appears once the node's HA agent has finished draining.
 
 - Replication
   `replica_on_partner`, `replica_awaiting_sync`, `replica_not_recoverable`, `replica_job_stale`, `replica_job_failing`, `replica_schedule_unjudged`, `replica_marker_encoded`, `replica_orphan_volume`, `replica_recorded_orphan`, `replica_gone_vm_volume`, `replica_superseded_copy`, and `replica_journal_unconfigured`.
@@ -847,7 +851,7 @@ When the maintenance is over, we start the VM again.
 ha-manager set vm:<vmid> --state started
 ```
 
-The doctor lists a `hold` VM on a node that is entering maintenance as `hold_blocks_maintenance`. A VM under `local_policy: none` is not HA-managed, so maintenance mode does not touch it. It keeps running until the node reboots, and then it goes down with the node.
+The doctor lists a `hold` VM as `hold_blocks_maintenance` only while its HA state is `started` and its node is in maintenance with the drain still running. A `hold` VM whose HA service we have stopped does not block the drain, so the finding goes away as soon as we stop it, and it stays away once the node's HA agent has finished draining. A VM under `local_policy: none` is not HA-managed, so maintenance mode does not touch it. It keeps running until the node reboots, and then it goes down with the node.
 
 ### Replicate failover and the old node's writes
 

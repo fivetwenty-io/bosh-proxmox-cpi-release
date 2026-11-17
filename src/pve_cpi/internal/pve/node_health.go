@@ -93,12 +93,15 @@ const (
 type WatchdogState string
 
 const (
-	// WatchdogArmed means the LRM entry is fresh and in state active or
-	// maintenance, so the node's watchdog is running.
+	// WatchdogArmed means the LRM entry is fresh and in state active, so the
+	// node holds the agent lock and its watchdog is running. A node still
+	// draining for maintenance is in this state too.
 	WatchdogArmed WatchdogState = "armed"
 
-	// WatchdogIdle means the LRM entry is fresh and waiting for the agent lock,
-	// so the node has no active service and its watchdog is not running.
+	// WatchdogIdle means the LRM entry is fresh and either waiting for the
+	// agent lock or in state maintenance, which the LRM enters once the drain
+	// has finished. Either way the node holds no lock and its watchdog is not
+	// running.
 	WatchdogIdle WatchdogState = "idle"
 
 	// WatchdogUnknown covers every other answer, including a missing or stale
@@ -219,6 +222,16 @@ type NodeHealthEntry struct {
 
 	// Watchdog is the node's watchdog state from its structured LRM entry.
 	Watchdog WatchdogState
+
+	// LRMMode and LRMState are the mode and state of the node's fresh LRM
+	// entry, or empty when no fresh entry was trusted.
+	LRMMode  string
+	LRMState string
+
+	// DrainComplete is true when the node's fresh LRM entry is in state
+	// maintenance. The LRM reaches that state only after every service has left
+	// the node, and it releases the agent lock and closes the watchdog there.
+	DrainComplete bool
 
 	// CRMState is the node's raw state in the CRM's node_status map, or empty
 	// when no fresh manager status was trusted or the map has no entry for it.
@@ -1159,12 +1172,14 @@ func classifyWithManagerStatus(e *NodeHealthEntry, ha haInputs) {
 	lrmFresh := hasLRM && lrm.Timestamp.Int() > 0 &&
 		timestampFresh(ha.entryTime, lrm.Timestamp.Int(), NodeHealthLRMMaxAge)
 	if lrmFresh {
+		e.LRMMode, e.LRMState = lrm.Mode, lrm.State
 		switch lrm.State {
-		case lrmStateActive, lrmStateMaintenance:
+		case lrmStateActive:
 			e.Watchdog = WatchdogArmed
-		case lrmStateWaitForLock:
+		case lrmStateWaitForLock, lrmStateMaintenance:
 			e.Watchdog = WatchdogIdle
 		}
+		e.DrainComplete = lrm.State == lrmStateMaintenance
 	}
 
 	if e.CRMState == crmNodeMaintenance {

@@ -567,6 +567,97 @@ func TestCollectHoldBlocksMaintenance(t *testing.T) {
 	wantNone(t, runCollect(t, f, haCfg("auto", "replicate")), haKindHoldMaintenance)
 }
 
+// drainFake is the lab's shape. Node n2 is in maintenance and holds a hold VM
+// under HA, whose pin names n2 alone, and a member of a full three-member
+// negative anti-affinity group. The group has one member on each node, so the
+// member on n2 has no node to move to.
+func drainFake(holdState string) *fakeHA {
+	const group = "bosh-aa-0123456789ab"
+	f := haBaseFake()
+	f.guests = nil
+	f.resources = nil
+	f.rules = nil
+	for i, node := range []string{"n1", "n2", "n3"} {
+		vmid := 117 + i*100
+		f.guests = append(f.guests, pve.GuestRef{
+			VMID: vmid, Node: node, Name: "member", Tags: "bosh-cpi;bosh-ha-managed;" + group, Status: "running",
+		})
+		f.memory[vmid] = 4 * haGiB
+		f.configs[vmid] = map[string]any{"cpu": "x86-64-v2-AES", "scsi0": "nfs1:" + itoa(vmid) + "/vm-" + itoa(vmid) + "-disk-0.raw,size=10G"}
+		f.resources = append(f.resources, HAResourceRow{SID: "vm:" + itoa(vmid), State: "started", Comment: haMarker})
+	}
+	f.rules = []ha.Rule{{
+		ID: group, Type: ha.RuleTypeResourceAffinity, Affinity: "negative", Comment: haMarker,
+		Resources: []string{"vm:117", "vm:217", "vm:317"},
+	}}
+	// The hold VM sits on n2 with a node-local volume and a pin to n2 alone.
+	f.guests = append(f.guests, pve.GuestRef{
+		VMID: 40, Node: "n2", Name: "hold", Tags: "bosh-cpi;bosh-ha-managed", Status: "running",
+	})
+	f.memory[40] = 4 * haGiB
+	f.configs[40] = map[string]any{"cpu": "x86-64-v2-AES", "scsi0": "local-zfs:vm-40-disk-0,size=10G"}
+	f.resources = append(f.resources, HAResourceRow{SID: "vm:40", State: holdState, Comment: haMarker})
+	f.rules = append(f.rules, pinRule(40, haMarker, "n2"))
+	f.clusterVMs = append([]pve.GuestRef(nil), f.guests...)
+	f.profile.Health.Nodes[1] = pve.NodeHealthEntry{
+		Name: "n2", Health: pve.NodeHealthMaintenance, Maintenance: true, ProxyTarget: true,
+		Watchdog: pve.WatchdogArmed, LRMMode: "maintenance", LRMState: "active",
+	}
+	return f
+}
+
+func TestCollectHoldBlocksMaintenanceOnlyWhileItsStateKeepsItRunning(t *testing.T) {
+	t.Parallel()
+	started := runCollect(t, drainFake("started"), haCfg("auto", "hold"))
+	want(t, started, haKindHoldMaintenance, haSeverityProblem, "vm:40", "n2")
+
+	// A stopped HA service does not block the drain.
+	stopped := runCollect(t, drainFake("stopped"), haCfg("auto", "hold"))
+	wantNone(t, stopped, haKindHoldMaintenance)
+	for _, f := range findings(stopped, haKindMaintenanceStranded) {
+		if f.Subject == "vm:40" {
+			t.Errorf("a stopped hold VM was reported as stranded: %+v", f)
+		}
+	}
+
+	// Once the LRM has finished the drain the finding is gone, even for a state
+	// the CRM still lists as started.
+	done := drainFake("started")
+	done.profile.Health.Nodes[1].DrainComplete = true
+	done.profile.Health.Nodes[1].LRMState = "maintenance"
+	done.profile.Health.Nodes[1].Watchdog = pve.WatchdogIdle
+	r := runCollect(t, done, haCfg("auto", "hold"))
+	wantNone(t, r, haKindHoldMaintenance, haKindMaintenanceStranded)
+	if n := r.Nodes[1]; !n.DrainComplete || n.Watchdog != "idle" || n.LRM != "mode=maintenance/state=maintenance" {
+		t.Errorf("node line = %+v, want the drained LRM state and an idle watchdog", n)
+	}
+}
+
+func TestCollectNamesEveryServiceThatCannotLeaveAMaintenanceNode(t *testing.T) {
+	t.Parallel()
+	r := runCollect(t, drainFake("started"), haCfg("auto", "hold"))
+	// The hold VM is named once, as hold_blocks_maintenance, and the group
+	// member is named once, as maintenance_stranded, with its reason.
+	want(t, r, haKindHoldMaintenance, haSeverityProblem, "vm:40")
+	want(t, r, haKindMaintenanceStranded, haSeverityProblem, "vm:217", "n2", "anti-affinity group")
+
+	// A strict pin that names no other node is named as the reason.
+	f := drainFake("started")
+	f.rules = append(f.rules, pinRule(217, haMarker, "n2"))
+	got := findings(runCollect(t, f, haCfg("auto", "hold")), haKindMaintenanceStranded)
+	if len(got) != 1 || !strings.Contains(got[0].Detail, "strict node-affinity pin") {
+		t.Errorf("want one finding that names the strict pin, got %+v", got)
+	}
+
+	// A member of a group with a free node is not told it has no place to go.
+	g := drainFake("started")
+	g.clusterVMs = g.clusterVMs[:1]
+	got = findings(runCollect(t, g, haCfg("auto", "hold")), haKindMaintenanceStranded)
+	if len(got) != 1 || strings.Contains(got[0].Detail, "anti-affinity") {
+		t.Errorf("want one finding without the anti-affinity reason, got %+v", got)
+	}
+}
+
 func replicaFake() *fakeHA {
 	f := haBaseFake()
 	localVM(f, "n1", "bosh-cpi;bosh-ha-managed")
@@ -2010,6 +2101,48 @@ func TestCollectLocalPolicyIsJudgedUnderTheOwningEntry(t *testing.T) {
 	want(t, first, haKindLocalUnprotected, haSeverityAdvice, "vm:101", "az2-none", "none or replicate", "cannot tell which entry owns it")
 	second := run(&haEntryScope{Band: band, Policy: "none", Peers: []string{"az2"}, PeerPolicies: []string{"replicate"}}, "none")
 	wantNone(t, second, haKindLocalUnprotected)
+}
+
+// TestCollectNoneVMIsNeverAProblemUnderAnotherDirectorsEntries builds the shape
+// of two Directors on one cluster. Director A owns the band 210000 to 210499
+// with a hold entry, and Director B owns 210500 to 210999 with a replicate
+// entry and a none entry. A healthy none VM sits in B's band.
+func TestCollectNoneVMIsNeverAProblemUnderAnotherDirectorsEntries(t *testing.T) {
+	t.Parallel()
+	entry := func(name, policy string, start, end int) cpiConfigEntry {
+		return cpiConfigEntry{Name: name, Type: "pve", Properties: map[string]any{
+			"pve_vmid_range_start": start, "pve_vmid_range_end": end,
+			"pve_ha": map[string]any{"local_policy": policy},
+		}}
+	}
+	base := haCfg("auto", "none")
+	run := func(entries []cpiConfigEntry, i int, policy string) *haReport {
+		f := haBaseFake()
+		const vmid = 210511
+		f.guests = []pve.GuestRef{{VMID: vmid, Node: "n2", Name: "none-vm", Tags: "bosh-cpi", Status: "running"}}
+		f.memory[vmid] = 4 * haGiB
+		f.configs[vmid] = map[string]any{"cpu": "x86-64-v2-AES", "scsi0": "local-zfs:vm-210511-disk-0,size=10G"}
+		f.resources = nil
+		scopes := entryScopes(entries, base)
+		return collectHAScoped(context.Background(), f, haCfg("auto", policy), "", haNow, scopes[i])
+	}
+	entries := []cpiConfigEntry{
+		entry("a-hold", "hold", 210000, 210499),
+		entry("b-replicate", "replicate", 210500, 210999),
+		entry("b-none", "none", 210500, 210999),
+	}
+	// Director A's hold entry does not own the band, so it says nothing.
+	wantNone(t, run(entries, 0, "hold"), haKindLocalUnprotected)
+	// Director B's two entries disagree, so the first reports one advice and
+	// the second stays silent.
+	first := run(entries, 1, "replicate")
+	want(t, first, haKindLocalUnprotected, haSeverityAdvice, "vm:210511", "b-none", "cannot tell which entry owns it")
+	if first.Problems() != 0 {
+		t.Errorf("problems = %d, want a healthy none VM to fail nothing", first.Problems())
+	}
+	wantNone(t, run(entries, 2, "none"), haKindLocalUnprotected)
+	// Alone in its band, the none entry still reports advice and never a problem.
+	want(t, run(entries[2:], 0, "none"), haKindLocalUnprotected, haSeverityAdvice, "vm:210511")
 }
 
 func TestEntryScopesGroupEntriesByClusterAndBand(t *testing.T) {

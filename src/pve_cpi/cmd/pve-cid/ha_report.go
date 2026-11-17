@@ -79,9 +79,13 @@ type haNode struct {
 	Placeable   bool   `json:"placeable"`
 	Maintenance bool   `json:"maintenance"`
 	Watchdog    string `json:"watchdog,omitempty"`
-	Version     string `json:"version,omitempty"`
-	CPU         string `json:"cpu,omitempty"`
-	Reason      string `json:"reason,omitempty"`
+	// LRM is the mode and state of the node's LRM, and DrainComplete says the
+	// LRM has finished draining a node in maintenance and released its lock.
+	LRM           string `json:"lrm,omitempty"`
+	DrainComplete bool   `json:"drain_complete,omitempty"`
+	Version       string `json:"version,omitempty"`
+	CPU           string `json:"cpu,omitempty"`
+	Reason        string `json:"reason,omitempty"`
 }
 
 // haDomain is one CPU migration domain.
@@ -207,6 +211,12 @@ func nodeLine(n haNode) string {
 	}
 	if n.Watchdog != "" {
 		parts = append(parts, "watchdog="+n.Watchdog)
+	}
+	if n.LRM != "" {
+		parts = append(parts, "lrm="+n.LRM)
+	}
+	if n.DrainComplete {
+		parts = append(parts, "drain=complete")
 	}
 	if n.Version != "" {
 		parts = append(parts, "pve="+n.Version)

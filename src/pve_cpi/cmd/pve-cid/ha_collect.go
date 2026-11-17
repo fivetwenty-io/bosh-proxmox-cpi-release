@@ -146,6 +146,10 @@ func (g *haGuest) tagsWithPrefix(prefix string) []string {
 // HAReader, and a read that fails becomes an unchecked finding instead of an
 // absent one.
 type haCollector struct {
+	// holdReported holds the services already reported as hold_blocks_maintenance,
+	// so the stranded check does not name them a second time.
+	holdReported map[string]bool
+
 	ctx   context.Context
 	r     HAReader
 	cfg   *config.CPIConfig
@@ -209,6 +213,7 @@ func collectHAScoped(ctx context.Context, r HAReader, cfg *config.CPIConfig, own
 		ctx: ctx, r: r, cfg: cfg, owner: owner, now: now, euid: os.Geteuid(), scope: scope,
 		rep:    &haReport{Mode: cfg.HAModeValue(), Nodes: []haNode{}, CPUDomains: []haDomain{}, Findings: []haFinding{}},
 		byVMID: map[int]*haGuest{}, jobStatus: map[string]ha.ReplicaSyncStatus{}, awaiting: map[int]bool{},
+		holdReported: map[string]bool{},
 	}
 	p, err := r.Profile(ctx)
 	if err != nil || p == nil {
@@ -273,6 +278,10 @@ func (c *haCollector) fillProfile() {
 			line.Health = fmt.Sprint(h.Health)
 			line.Placeable, line.Maintenance = h.Placeable, h.Maintenance
 			line.Watchdog, line.Reason = fmt.Sprint(h.Watchdog), h.Reason
+			if h.LRMMode != "" || h.LRMState != "" {
+				line.LRM = "mode=" + h.LRMMode + "/state=" + h.LRMState
+			}
+			line.DrainComplete = h.DrainComplete
 		}
 		c.rep.Nodes = append(c.rep.Nodes, line)
 	}
@@ -864,46 +873,84 @@ func (c *haCollector) protectionFindings() {
 				"VM %d holds node-local volumes but its confinement pin is not in force: %s", g.ref.VMID, why)
 			continue
 		}
-		if len(pin.Nodes) == 1 && !c.replicates(g.ref.VMID, pin) {
-			if c.p.Health != nil {
-				if h, found := healthEntry(c.p, g.ref.Node); found && h.Maintenance {
-					c.rep.problem(haKindHoldMaintenance, g.sid,
-						"VM %d is held on %s, which is entering maintenance, and its node-local volumes keep it from moving; PVE cannot drain the node until the VM is stopped",
-						g.ref.VMID, g.ref.Node)
-				}
+		if len(pin.Nodes) == 1 && !c.replicates(g.ref.VMID, pin) && haBlocksDrain(g.resource.State) {
+			if h, found := c.maintenanceNode(g.ref.Node); found && !h.DrainComplete {
+				c.holdReported[g.sid] = true
+				c.rep.problem(haKindHoldMaintenance, g.sid,
+					"VM %d is held on %s, which is entering maintenance, and its node-local volumes keep it from moving; PVE cannot drain the node until the VM is stopped",
+					g.ref.VMID, g.ref.Node)
 			}
 		}
 	}
 }
 
+// haBlocksDrain says whether a requested HA state keeps a service running on
+// its node, so that a drain cannot finish until the service moves or stops.
+func haBlocksDrain(state string) bool {
+	return haRunsUnderHA(state)
+}
+
+// maintenanceNode returns the health entry of a node that is in maintenance
+// and has not finished draining. It finds nothing when the health report could
+// not be built, which is already reported as unchecked.
+func (c *haCollector) maintenanceNode(name string) (pve.NodeHealthEntry, bool) {
+	if c.p.Health == nil {
+		return pve.NodeHealthEntry{}, false
+	}
+	h, found := healthEntry(c.p, name)
+	return h, found && h.Maintenance
+}
+
 // maintenanceStrandedFindings reports each started HA VM that is still running
-// on a node in maintenance. The CRM moves every service off such a node, and
-// one that has nowhere to go stays behind and keeps the node's LRM from
-// finishing its restart. A node health report that could not be built is
-// already reported as unchecked, so this check says nothing in that case.
+// on a node in maintenance, once and with the reason it cannot leave when the
+// doctor can see one. The CRM moves every service off such a node, and one that
+// has nowhere to go stays behind and keeps the node's LRM from finishing its
+// drain. A hold VM is already reported as hold_blocks_maintenance, and a node
+// whose LRM has finished draining has nothing left to report. A node health
+// report that could not be built is already reported as unchecked, so this
+// check says nothing in that case.
 func (c *haCollector) maintenanceStrandedFindings() {
 	if c.off() || !c.guestsOK || !c.resourcesOK || c.p.Health == nil {
 		return
 	}
 	for _, g := range c.guests {
-		if !g.owned || g.ref.Template || g.resource == nil || !c.judgesVM(g) {
+		if !g.owned || g.ref.Template || g.resource == nil || !c.judgesVM(g) || c.holdReported[g.sid] {
 			continue
 		}
 		if !strings.EqualFold(g.resource.State, "started") {
 			continue
 		}
-		h, found := healthEntry(c.p, g.ref.Node)
-		if !found || !h.Maintenance {
+		h, found := c.maintenanceNode(g.ref.Node)
+		if !found || h.DrainComplete {
 			continue
-		}
-		why := ""
-		if pin := c.pinOf(g.ref.VMID); c.rulesOK && pin != nil && len(pin.Nodes) == 1 {
-			why = ", and its node-affinity pin names no other node"
 		}
 		c.rep.problem(haKindMaintenanceStranded, g.sid,
 			"%s is still running on %s, which is in maintenance, so the node's HA agent can't restart until it moves or stops%s",
-			g.sid, g.ref.Node, why)
+			g.sid, g.ref.Node, c.cannotLeaveReason(g))
 	}
+}
+
+// cannotLeaveReason says why a service on a node in maintenance has no node to
+// move to, or returns nothing when the doctor sees no such reason.
+func (c *haCollector) cannotLeaveReason(g *haGuest) string {
+	if pin := c.pinOf(g.ref.VMID); c.rulesOK && pin != nil && !pin.Disabled && pin.Strict {
+		movable := false
+		for name := range pin.Nodes {
+			if name == g.ref.Node {
+				continue
+			}
+			if h, ok := healthEntry(c.p, name); !ok || h.Placeable {
+				movable = true
+			}
+		}
+		if !movable {
+			return ", and its strict node-affinity pin names no other node it can move to"
+		}
+	}
+	if c.groupBlocksEveryNode(g) {
+		return ", and every other node that can take it holds a member of its anti-affinity group"
+	}
+	return ""
 }
 
 // recoveryStrandedFindings reports each HA VM the HA manager holds in the
@@ -1000,6 +1047,9 @@ func (c *haCollector) groupBlocksEveryNode(g *haGuest) bool {
 		for i := range c.p.Nodes {
 			n := &c.p.Nodes[i]
 			if !n.Online || n.Name == g.ref.Node {
+				continue
+			}
+			if h, ok := healthEntry(c.p, n.Name); ok && h.Maintenance {
 				continue
 			}
 			others++
