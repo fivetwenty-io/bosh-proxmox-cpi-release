@@ -750,6 +750,13 @@ func pinAllowsNode(pin *ha.Rule, sid, node string) (bool, string) {
 	return true, ""
 }
 
+// judgesForProtection reports whether the protection findings apply to g. A
+// parker holds detached disks by design and is stopped, so it is never an
+// unprotected VM.
+func (c *haCollector) judgesForProtection(g *haGuest) bool {
+	return g.owned && !g.ref.Template && g.cfg != nil && !g.hasTag(pve.ParkerTag) && c.judgesVM(g)
+}
+
 // protectionFindings reports local-disk VMs that run unprotected, VMs whose
 // confinement pin is gone, and hold VMs on a node entering maintenance.
 func (c *haCollector) protectionFindings() {
@@ -758,12 +765,7 @@ func (c *haCollector) protectionFindings() {
 	}
 	policy := c.cfg.HALocalPolicyValue()
 	for _, g := range c.guests {
-		if !g.owned || g.ref.Template || g.cfg == nil || !c.judgesVM(g) {
-			continue
-		}
-		// A parker holds detached disks by design and is stopped, so it is never
-		// an unprotected VM.
-		if g.hasTag(pve.ParkerTag) {
+		if !c.judgesForProtection(g) {
 			continue
 		}
 		local := c.localVolumes(g)
