@@ -716,6 +716,46 @@ func TestCompleteCreatedVM_SaysTheVMIsRegisteredOnlyOnceHARunsIt(t *testing.T) {
 	}
 }
 
+// TestCompleteCreatedVM_ObserveOnlyNeverSaysTheVMIsRegistered pins the other
+// case of the line that says a VM is registered with PVE HA. Under a profile
+// that is observe-only, because the token lacks a privilege or a prerequisite
+// is missing, the HA decision registers nothing. The configuration still asks
+// for HA, here an AZ pin, so a line logged on intent would claim protection
+// the VM never had. The create must log no such line, and the decision must
+// say the VM runs without HA. It does not run in parallel, because the line
+// is logged once per process.
+func TestCompleteCreatedVM_ObserveOnlyNeverSaysTheVMIsRegistered(t *testing.T) {
+	defer resetHAResurrectorWarnOnceForTest()()
+	deps, rules, parsed := decideRig(config.HAModeAuto, aaDirector, nil)
+	profile := stagingProfile(config.HAModeAuto)
+	profile.Effective, profile.Reason = ha.EffectiveObserveOnly, "the token lacks Sys.Console"
+	deps.HAProfile = func(context.Context) (*ha.Profile, error) { return profile, nil }
+	if len(haRegistrationFeatures(deps, parsed.cloudProps, "pve01", parsed.env)) == 0 {
+		t.Fatal("the configuration must ask for HA, or the test proves nothing")
+	}
+	logger, observed := log.NewObservedLogger(log.LevelDebug)
+	shape := &createVMShape{node: "pve01"}
+	h, err := decideCreatedVMHA(context.Background(), deps, logger, parsed, shape, 100)
+	if err != nil || h != nil {
+		t.Fatalf("h %v err %v; want an observe-only profile to register nothing", h, err)
+	}
+	tags, writes := "bosh-cpi", []string{}
+	deps.PVE = taggedVMClient(rules, &tags, &writes)
+	if err := completeCreatedVM(crhCtx(), deps, logger, parsed, shape, 100, h,
+		func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := ownershipLines(observed); got != 0 {
+		t.Fatalf("lines saying the VM is registered = %d; want none for a VM observe-only never registers", got)
+	}
+	for _, e := range observed.All() {
+		if e.Message == "create_vm: the VM runs without HA" && e.Attrs[metadataKeyVMID] != nil {
+			return
+		}
+	}
+	t.Fatal("the create must say the VM runs without HA")
+}
+
 func TestCompleteCreatedVM_FailedLandingStillMovesTheShape(t *testing.T) {
 	// PVE HA started the VM outside its hard set. The create fails, and the
 	// shape names the node the VM runs on, because the rollback tears it down
