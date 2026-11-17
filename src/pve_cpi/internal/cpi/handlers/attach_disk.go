@@ -149,6 +149,10 @@ func HandleAttachDisk(deps Deps) Handler {
 		if lifecycle != nil {
 			rd = lifecycle.disk
 			defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
+			// The attach's HA writes inside the lifecycle are for this VM alone.
+			if parsed, err := vmcid.Parse(vmCID); err == nil {
+				lifecycle.haVMID = parsed.VMID
+			}
 		}
 		// The attach-time HA decision reads the VM's HA resource, its pin, and
 		// its config before the first mutation below, the resume of an

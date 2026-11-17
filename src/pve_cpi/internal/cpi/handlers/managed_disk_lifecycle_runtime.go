@@ -47,6 +47,10 @@ type managedDiskLifecycle struct {
 	// attach began. The clean exits judge only the steps from it on, because
 	// the VM allocation settles the steps it journaled itself.
 	stepsFrom int
+	// haVMID is the VM whose HA resource and pin this operation may write, the
+	// VM an attach names. It is zero for every other operation, and then the
+	// guard refuses every HA write (see admitLifecycleHAWrite).
+	haVMID int
 }
 
 func acquireManagedDiskLifecycle(ctx context.Context, deps Deps, rd resolvedDisk, operation string) (*managedDiskLifecycle, error) {

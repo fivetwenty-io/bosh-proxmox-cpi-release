@@ -37,19 +37,28 @@ func isLifecycleHAWrite(call ManagedAllocationMutation) bool {
 // write names a rule or a resource and no VM, so it gets none of the holder
 // checks a write to a VM gets. It names no volume either, and its writer reads
 // its outcome back, so it is admitted without a journal step (see
-// managedUnjournaledStep), and a failed write leaves the disk's record as it
-// was.
+// managedUnjournaledStep). A failed write leaves the guard usable. The
+// operation it belongs to still fails, so the lifecycle's finish marks the
+// disk's record for reconciliation as it does for any failed operation, and
+// the next call that resolves the disk readmits it.
 //
-// A rule write passes only when the rule is a CPI rule of this Director: a
-// create must name a bosh-na- or bosh-aa- rule that is absent and carry this
-// Director's marker, and an update or delete is judged the way a VM
-// allocation judges it (see admitOwnedHARuleEdit). A resource write passes
-// only for a VM resource that carries this Director's marker now. An update
-// may set the requested state and the comment, and a comment it writes must
-// keep the marker. The removal of a resource that is already gone changes
-// nothing and passes. A disk lifecycle never creates an HA resource, because
-// a registration also rewrites the VM's tags and description (see
-// errAttachReaddGuarded).
+// The lifecycle serves one VM, the one an attach names (see haVMID), and a
+// lifecycle that serves none refuses every HA write. A rule write passes only
+// for that VM's pin, bosh-na-<vmid>, as a CPI rule of this Director: a create
+// must name only the VM's resource, be absent, and carry this Director's
+// marker, an update that sets the resources must name only the VM's resource,
+// and an update or delete is judged the way a VM allocation judges it (see
+// admitOwnedHARuleEdit). A resource write passes only for the VM's resource,
+// and only when it carries this Director's marker now. An update may set the
+// requested state, the comment, and the digest, and nothing else. The state
+// must be started, stopped, or ignored, the states the barrier requests and
+// restores, so it never requests disabled. The update may delete no setting,
+// and its delete list is read the way PVE reads it (see splitPVEList). A
+// comment it writes must keep the marker. A removal must purge the resource
+// from its rules, the only removal the CPI sends, and the removal of a
+// resource that is already gone changes nothing and passes. A disk lifecycle
+// never creates an HA resource, because a registration also rewrites the VM's
+// tags and description (see errAttachReaddGuarded).
 //
 // A refusal wraps errManagedHAWriteRefused and a read that fails wraps
 // errManagedAdmissionReadFailed, so neither locks the guard.
@@ -66,14 +75,22 @@ func (g *managedDiskLifecycleGuard) admitLifecycleHAWrite(ctx context.Context, c
 	if owner == "" {
 		return refuse(errors.New("the HA write lacks a Director to own it"))
 	}
+	if m.haVMID <= 0 {
+		return refuse(errors.New("the disk's lifecycle serves no VM whose HA it may change"))
+	}
+	sid, pin := haResourceSid(m.haVMID), naRuleNameFor(m.haVMID)
 	switch call.Method {
 	case "CreateHaRules":
 		params, ok := call.Args[managedArgumentParams].(*cluster.CreateHaRulesParams)
 		if !ok || params == nil {
 			return refuse(errors.New("HA rule creation lacks its parameters"))
 		}
-		if !strings.HasPrefix(params.Rule, naRuleNamePrefix) && !strings.HasPrefix(params.Rule, haRuleNamePrefix) {
-			return refuse(fmt.Errorf("HA rule %q is not a CPI rule", params.Rule))
+		if params.Rule != pin {
+			return refuse(fmt.Errorf("HA rule %q is not the pin %s of VM %d", params.Rule, pin, m.haVMID))
+		}
+		if !slices.Equal(splitPVEList(params.Resources), []string{sid}) {
+			return refuse(fmt.Errorf("HA rule %q creation names resources %q, not only %s", params.Rule,
+				params.Resources, sid))
 		}
 		if params.Comment == nil || haOwnershipOf(*params.Comment, owner) != haOwnedByUs {
 			return refuse(fmt.Errorf("HA rule %q creation does not carry this Director's ownership marker",
@@ -87,6 +104,9 @@ func (g *managedDiskLifecycleGuard) admitLifecycleHAWrite(ctx context.Context, c
 			return refuse(fmt.Errorf("HA rule %q was not absent before its creation", params.Rule))
 		}
 	case "UpdateHaRules", "DeleteHaRules":
+		if err := lifecycleHARuleEditTargets(call, pin, sid); err != nil {
+			return refuse(err)
+		}
 		if err := admitOwnedHARuleEdit(ctx, m.deps, call, readFailed("the HA rules")); err != nil {
 			if errors.Is(err, errManagedAdmissionReadFailed) || errors.Is(err, errManagedRequestEnded) {
 				return "", err
@@ -94,7 +114,7 @@ func (g *managedDiskLifecycleGuard) admitLifecycleHAWrite(ctx context.Context, c
 			return refuse(err)
 		}
 	case "UpdateHaResources", "DeleteHaResources":
-		if err := g.admitLifecycleHAResourceWrite(ctx, call, owner); err != nil {
+		if err := g.admitLifecycleHAResourceWrite(ctx, call, sid, owner); err != nil {
 			if errors.Is(err, errManagedAdmissionReadFailed) || errors.Is(err, errManagedRequestEnded) {
 				return "", err
 			}
@@ -106,31 +126,50 @@ func (g *managedDiskLifecycleGuard) admitLifecycleHAWrite(ctx context.Context, c
 	return managedUnjournaledStep, nil
 }
 
+// lifecycleHAStates lists the requested states a disk lifecycle may set on
+// its VM's HA resource: ignored while the barrier holds the VM, and the
+// started or stopped state the barrier puts back.
+var lifecycleHAStates = []string{"started", "stopped", "ignored"}
+
+// lifecycleHAResourceUpdateFields lists the fields an HA resource update
+// inside a disk lifecycle may carry.
+var lifecycleHAResourceUpdateFields = []string{"state", "comment", "digest", "delete"}
+
+// lifecycleHARuleEditTargets checks that an HA rule update or delete inside a
+// disk lifecycle names the pin of the lifecycle's VM, and that an update that
+// sets the rule's resources names only the VM's resource.
+func lifecycleHARuleEditTargets(call ManagedAllocationMutation, pin, sid string) error {
+	rule, _ := call.Args["rule"].(string)
+	if rule != pin {
+		return fmt.Errorf("HA rule %q is not the pin %s", rule, pin)
+	}
+	if call.Method != "UpdateHaRules" {
+		return nil
+	}
+	params, ok := call.Args[managedArgumentParams].(*cluster.UpdateHaRulesParams)
+	if ok && params != nil && params.Resources != nil && !slices.Equal(splitPVEList(*params.Resources), []string{sid}) {
+		return fmt.Errorf("HA rule %q update names resources %q, not only %s", rule, *params.Resources, sid)
+	}
+	return nil
+}
+
 // admitLifecycleHAResourceWrite checks an HA resource update or removal
-// against the resource as PVE holds it now (see admitLifecycleHAWrite).
+// against want, the resource of the lifecycle's VM, and against the resource
+// as PVE holds it now (see admitLifecycleHAWrite).
 func (g *managedDiskLifecycleGuard) admitLifecycleHAResourceWrite(
-	ctx context.Context, call ManagedAllocationMutation, owner string,
+	ctx context.Context, call ManagedAllocationMutation, want, owner string,
 ) error {
 	sid, _ := call.Args["sid"].(string)
-	if !managedHAResourceSID(sid) || !strings.HasPrefix(sid, "vm:") {
-		return fmt.Errorf("HA resource %q is not a VM resource", sid)
+	if sid != want {
+		return fmt.Errorf("HA resource %q is not the resource %s of the lifecycle's VM", sid, want)
 	}
 	update := call.Method == "UpdateHaResources"
 	if update {
-		params, ok := call.Args[managedArgumentParams].(*cluster.UpdateHaResourcesParams)
-		if !ok || params == nil {
-			return fmt.Errorf("HA resource %s update lacks its parameters", sid)
+		if err := lifecycleHAResourceUpdateAllowed(call, sid, owner); err != nil {
+			return err
 		}
-		if params.Group != nil || params.MaxRelocate != nil || params.MaxRestart != nil ||
-			params.Failback != nil || params.AutoRebalance != nil {
-			return fmt.Errorf("HA resource %s update sets more than its requested state and comment", sid)
-		}
-		if params.Delete != nil && slices.Contains(strings.Split(*params.Delete, ","), "comment") {
-			return fmt.Errorf("HA resource %s update removes its ownership marker", sid)
-		}
-		if params.Comment != nil && haOwnershipOf(*params.Comment, owner) != haOwnedByUs {
-			return fmt.Errorf("HA resource %s update does not carry this Director's ownership marker", sid)
-		}
+	} else if err := lifecycleHAResourceRemovalAllowed(call, sid); err != nil {
+		return err
 	}
 	got, err := g.lifecycle.deps.PVE.Cluster().GetHaResources(ctx, sid)
 	switch {
@@ -148,4 +187,64 @@ func (g *managedDiskLifecycleGuard) admitLifecycleHAResourceWrite(
 		return fmt.Errorf("HA resource %s does not carry this Director's ownership marker", sid)
 	}
 	return nil
+}
+
+// lifecycleHAResourceUpdateAllowed checks the parameters of an HA resource
+// update inside a disk lifecycle (see admitLifecycleHAWrite).
+func lifecycleHAResourceUpdateAllowed(call ManagedAllocationMutation, sid, owner string) error {
+	params, ok := call.Args[managedArgumentParams].(*cluster.UpdateHaResourcesParams)
+	if !ok || params == nil {
+		return fmt.Errorf("HA resource %s update lacks its parameters", sid)
+	}
+	fields, err := lifecycleMutationFields(params)
+	if err != nil {
+		return fmt.Errorf("HA resource %s update: %w", sid, err)
+	}
+	for key := range fields {
+		if !slices.Contains(lifecycleHAResourceUpdateFields, key) {
+			return fmt.Errorf("HA resource %s update sets %s, more than its requested state and comment", sid, key)
+		}
+	}
+	if params.State != nil && !slices.Contains(lifecycleHAStates, pve.HARequestedState(params.State)) {
+		return fmt.Errorf("HA resource %s update requests state %q, which a disk lifecycle never requests",
+			sid, *params.State)
+	}
+	if params.Delete != nil {
+		if keys := splitPVEList(*params.Delete); len(keys) > 0 {
+			return fmt.Errorf("HA resource %s update deletes %s, and a disk lifecycle deletes no setting",
+				sid, strings.Join(keys, ","))
+		}
+	}
+	if params.Comment != nil && haOwnershipOf(*params.Comment, owner) != haOwnedByUs {
+		return fmt.Errorf("HA resource %s update does not carry this Director's ownership marker", sid)
+	}
+	return nil
+}
+
+// lifecycleHAResourceRemovalAllowed checks that an HA resource removal inside
+// a disk lifecycle purges the resource from its rules and carries nothing
+// else, which is the only removal the CPI sends.
+func lifecycleHAResourceRemovalAllowed(call ManagedAllocationMutation, sid string) error {
+	params, ok := call.Args[managedArgumentParams].(*cluster.DeleteHaResourcesParams)
+	if !ok || params == nil || params.Purge == nil || !*params.Purge {
+		return fmt.Errorf("HA resource %s removal does not purge it from its rules", sid)
+	}
+	return nil
+}
+
+// splitPVEList splits a list parameter the way PVE::Tools::split_list does,
+// which is how PVE reads the delete parameter of a config or HA update. A
+// list that holds a NUL byte splits on NUL bytes alone, and any other list
+// splits on commas, semicolons, and whitespace. Empty items are dropped.
+func splitPVEList(list string) []string {
+	if strings.ContainsRune(list, 0) {
+		return slices.DeleteFunc(strings.Split(list, "\x00"), func(item string) bool { return item == "" })
+	}
+	return strings.FieldsFunc(list, func(r rune) bool {
+		switch r {
+		case ',', ';', ' ', '\t', '\n', '\r', '\f', '\v':
+			return true
+		}
+		return false
+	})
 }

@@ -41,7 +41,7 @@ func configWriteDeletedSlots(call ManagedAllocationMutation) []string {
 	if err != nil || len(fields) != 0 {
 		return nil
 	}
-	keys := strings.Split(*params.Delete, ",")
+	keys := splitPVEList(*params.Delete)
 	for _, key := range keys {
 		if !isDiskOptionKey(key) || strings.HasPrefix(key, "unused") {
 			return nil

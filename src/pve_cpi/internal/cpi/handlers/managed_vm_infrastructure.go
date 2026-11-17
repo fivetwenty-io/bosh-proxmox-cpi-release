@@ -151,7 +151,7 @@ func admitOwnedHARuleEdit(
 // updateKeepsRuleComment reports whether an update leaves a rule's comment as
 // current reads: it neither sets a different comment nor deletes the comment.
 func updateKeepsRuleComment(params *cluster.UpdateHaRulesParams, current string) bool {
-	if params.Delete != nil && slices.Contains(strings.Split(*params.Delete, ","), "comment") {
+	if params.Delete != nil && slices.Contains(splitPVEList(*params.Delete), "comment") {
 		return false
 	}
 	if params.Comment == nil {

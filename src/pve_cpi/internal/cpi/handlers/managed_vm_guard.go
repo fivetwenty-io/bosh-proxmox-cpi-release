@@ -573,7 +573,7 @@ func (m *managedVMAllocation) observePendingConfigWrite(ctx context.Context, cal
 	if !errors.Is(err, errManagedConfigDeletePending) {
 		return false, err
 	}
-	deleted := strings.Split(*params.Delete, ",")
+	deleted := splitPVEList(*params.Delete)
 	if !pendingDeleteOnlyChange(m.configBefore[step], views, deleted) {
 		return false, fmt.Errorf("VM config deletion is pending alongside another change")
 	}

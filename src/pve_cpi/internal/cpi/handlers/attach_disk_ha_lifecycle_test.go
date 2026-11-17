@@ -125,24 +125,34 @@ func TestManagedAttachWritesTheHAPinInsideTheDiskLifecycle(t *testing.T) {
 }
 
 // TestDiskLifecycleGuardJudgesHAWritesByOwner opens the lifecycle of a
-// journal-managed disk and sends HA writes through its guarded client. A write
-// of this Director's pin or HA resource goes through without a journal step,
-// and a write PVE fails leaves the guard usable. A write of another
-// Director's rule or resource, of a rule that is not a CPI rule, or of a pin
-// update that drops the marker, is refused before it is sent and leaves the
-// guard usable too. A write that targets a VM still needs the VM's identity,
-// and one without it locks the guard as before.
+// journal-managed disk for an attach to VM 777 and sends HA writes through its
+// guarded client. A write of VM 777's pin or HA resource that carries this
+// Director's marker goes through without a journal step, and a write PVE
+// fails leaves the guard usable. Every other write is refused before it is
+// sent and leaves the guard usable too. That covers a rule or resource of
+// another Director, a rule that is not a CPI rule, a pin or resource of
+// another VM even when it is this Director's, a pin that names another
+// resource, a pin creation while the pin exists, a resource update that sets
+// another field, requests disabled, or deletes a setting however PVE would
+// split the list, a removal that does not purge, and any write from a
+// lifecycle that serves no VM. A registration still locks the guard as before.
 func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 	f := haLifecycleFixture(t)
 	deps, store, jr, id, cid := f.deps, f.store, f.jr, f.id, f.cid
 	ctx := context.Background()
 	deps.RequestDirectorUUID = aaDirector
 	other := haIdentity{Owner: aaOtherDirector}.marker()
+	marker := haIdentity{Owner: aaDirector}.marker()
 	foreign := "n1,n2"
 	store.rules["bosh-aa-other"] = cluster.CreateHaRulesParams{Rule: "bosh-aa-other", Type: "resource-affinity",
 		Resources: "vm:888", Comment: &other, Nodes: &foreign}
 	store.resources["vm:888"] = true
 	store.resComments["vm:888"] = other
+	store.resources["vm:555"] = true
+	store.resComments["vm:555"] = marker
+	store.states["vm:555"] = "started"
+	store.rules["bosh-na-555"] = cluster.CreateHaRulesParams{Rule: "bosh-na-555", Type: naRuleType,
+		Resources: "vm:555", Comment: &marker, Nodes: &foreign}
 	bare, meta, err := decodeDiskCID(ctx, deps, "attach_disk", cid)
 	if err != nil {
 		t.Fatal(err)
@@ -156,6 +166,7 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 		t.Fatalf("open the disk's lifecycle: %v", err)
 	}
 	defer func() { _ = lifecycle.finish(ctx, errors.New("the test ends the operation"), false) }()
+	lifecycle.haVMID = 777
 	steps := func() int {
 		record, err := jr.Inspect(id)
 		if err != nil {
@@ -165,31 +176,120 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 	}
 	before := steps()
 	svc := local.PVE.Cluster()
-	marker := haIdentity{Owner: aaDirector}.marker()
 	nodes := "n1"
+	ignored, disabled := "ignored", "disabled"
+	purge, keep := true, false
+	// withResourceComment and withPinComment run write while VM 777's resource
+	// or pin carries comment, and put the marker back afterwards.
+	withResourceComment := func(comment string, write func() error) func() error {
+		return func() error {
+			store.resComments["vm:777"] = comment
+			defer func() { store.resComments["vm:777"] = marker }()
+			return write()
+		}
+	}
+	withPinComment := func(comment string, write func() error) func() error {
+		return func() error {
+			pin := store.rules["bosh-na-777"]
+			was := pin.Comment
+			pin.Comment = &comment
+			store.rules["bosh-na-777"] = pin
+			defer func() { pin.Comment = was; store.rules["bosh-na-777"] = pin }()
+			return write()
+		}
+	}
 	refused := []struct {
 		name  string
 		write func() error
 	}{
+		{"a lifecycle that serves no VM", func() error {
+			lifecycle.haVMID = 0
+			defer func() { lifecycle.haVMID = 777 }()
+			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &ignored,
+				Comment: &marker})
+		}},
 		{"another Director's rule", func() error {
 			return svc.UpdateHaRules(ctx, "bosh-aa-other", &cluster.UpdateHaRulesParams{Comment: &marker})
 		}},
+		{"the pin while another Director's marker is on it", withPinComment(other, func() error {
+			return svc.UpdateHaRules(ctx, "bosh-na-777", &cluster.UpdateHaRulesParams{Comment: &marker,
+				Nodes: &nodes})
+		})},
 		{"a rule that is not a CPI rule", func() error { return svc.DeleteHaRules(ctx, "operator-rule") }},
 		{"a pin update without the marker", func() error {
 			plain := "no marker"
 			return svc.UpdateHaRules(ctx, "bosh-na-777", &cluster.UpdateHaRulesParams{Comment: &plain})
 		}},
 		{"a pin creation without the marker", func() error {
-			return svc.CreateHaRules(ctx, &cluster.CreateHaRulesParams{Rule: "bosh-na-999", Type: naRuleType,
-				Resources: "vm:999", Nodes: &nodes})
+			return svc.CreateHaRules(ctx, &cluster.CreateHaRulesParams{Rule: "bosh-na-777", Type: naRuleType,
+				Resources: "vm:777", Nodes: &nodes})
 		}},
+		{"a pin creation while the pin exists", func() error {
+			return svc.CreateHaRules(ctx, &cluster.CreateHaRulesParams{Rule: "bosh-na-777", Type: naRuleType,
+				Resources: "vm:777", Comment: &marker, Nodes: &nodes})
+		}},
+		{"another VM's pin of this Director", func() error {
+			return svc.UpdateHaRules(ctx, "bosh-na-555", &cluster.UpdateHaRulesParams{Comment: &marker,
+				Nodes: &nodes})
+		}},
+		{"a creation of another VM's pin", func() error {
+			return svc.CreateHaRules(ctx, &cluster.CreateHaRulesParams{Rule: "bosh-na-999", Type: naRuleType,
+				Resources: "vm:999", Comment: &marker, Nodes: &nodes})
+		}},
+		{"a pin creation that names another resource too", func() error {
+			return svc.CreateHaRules(ctx, &cluster.CreateHaRulesParams{Rule: "bosh-na-777", Type: naRuleType,
+				Resources: "vm:777;vm:555", Comment: &marker, Nodes: &nodes})
+		}},
+		{"a pin update that names another resource", func() error {
+			resources := "vm:555"
+			return svc.UpdateHaRules(ctx, "bosh-na-777", &cluster.UpdateHaRulesParams{Comment: &marker,
+				Nodes: &nodes, Resources: &resources})
+		}},
+		{"a removal of another VM's pin", func() error { return svc.DeleteHaRules(ctx, "bosh-na-555") }},
 		{"another Director's resource", func() error {
-			state := "ignored"
-			return svc.UpdateHaResources(ctx, "vm:888", &cluster.UpdateHaResourcesParams{State: &state})
+			return svc.UpdateHaResources(ctx, "vm:888", &cluster.UpdateHaResourcesParams{State: &ignored})
+		}},
+		{"the resource while another Director's marker is on it", withResourceComment(other, func() error {
+			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &ignored})
+		})},
+		{"another VM's resource of this Director", func() error {
+			return svc.UpdateHaResources(ctx, "vm:555", &cluster.UpdateHaResourcesParams{State: &ignored,
+				Comment: &marker})
+		}},
+		{"a resource update that requests disabled", func() error {
+			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &disabled,
+				Comment: &marker})
+		}},
+		{"a resource update that sets another field", func() error {
+			restarts := int64(5)
+			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &ignored,
+				MaxRestart: &restarts})
 		}},
 		{"a resource update that drops the marker", func() error {
 			del := "comment"
 			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{Delete: &del})
+		}},
+		{"a resource update that drops the marker in a semicolon list", func() error {
+			del := "state;comment"
+			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{Delete: &del})
+		}},
+		{"a resource update that drops the marker in a spaced list", func() error {
+			del := "state comment"
+			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{Delete: &del})
+		}},
+		{"a resource update that deletes another setting", func() error {
+			del := "max_restart"
+			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &ignored,
+				Delete: &del})
+		}},
+		{"a removal of another VM's resource", func() error {
+			return svc.DeleteHaResources(ctx, "vm:555", &cluster.DeleteHaResourcesParams{Purge: &purge})
+		}},
+		{"a removal that does not purge", func() error {
+			return svc.DeleteHaResources(ctx, "vm:777", &cluster.DeleteHaResourcesParams{Purge: &keep})
+		}},
+		{"a removal without parameters", func() error {
+			return svc.DeleteHaResources(ctx, "vm:777", &cluster.DeleteHaResourcesParams{})
 		}},
 	}
 	for _, row := range refused {
@@ -198,6 +298,9 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 		if err == nil || !errors.Is(err, pve.ErrMutationNotAttempted) {
 			t.Fatalf("%s: err %v, want a refusal before the write was sent", row.name, err)
 		}
+		if !errors.Is(err, errManagedHAWriteRefused) {
+			t.Fatalf("%s: err %v, want the HA write refusal", row.name, err)
+		}
 		if len(store.writes) != writes {
 			t.Fatalf("%s: the refused write reached PVE: %v", row.name, store.writes)
 		}
@@ -205,9 +308,11 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 			t.Fatalf("%s: the refusal locked the guard: %v", row.name, gerr)
 		}
 	}
+	if store.states["vm:555"] != "started" || store.rules["bosh-na-555"].Nodes == nil {
+		t.Fatal("a refused write changed VM 555's resource or pin")
+	}
 
-	state := "ignored"
-	if err := svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &state,
+	if err := svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &ignored,
 		Comment: &marker}); err != nil {
 		t.Fatalf("request ignored on this Director's resource: %v", err)
 	}
@@ -232,7 +337,7 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 	if err := svc.DeleteHaRules(ctx, "bosh-na-777"); err != nil {
 		t.Fatalf("delete this Director's pin: %v", err)
 	}
-	if err := svc.DeleteHaResources(ctx, "vm:777", &cluster.DeleteHaResourcesParams{}); err != nil {
+	if err := svc.DeleteHaResources(ctx, "vm:777", &cluster.DeleteHaResourcesParams{Purge: &purge}); err != nil {
 		t.Fatalf("remove this Director's resource: %v", err)
 	}
 	if after := steps(); after != before {
@@ -250,6 +355,28 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 	}
 	if err := lifecycle.guard.Err(); err == nil {
 		t.Fatal("an HA registration inside the lifecycle left the guard usable")
+	}
+}
+
+// TestSplitPVEListSplitsAsPVEDoes pins the list split PVE applies to a delete
+// parameter, so a check for a key sees every key PVE would delete.
+func TestSplitPVEListSplitsAsPVEDoes(t *testing.T) {
+	for _, row := range []struct {
+		list string
+		want []string
+	}{
+		{"", nil},
+		{" , ; ", nil},
+		{"comment", []string{"comment"}},
+		{"state,comment", []string{"state", "comment"}},
+		{"state;comment", []string{"state", "comment"}},
+		{" state  comment\t", []string{"state", "comment"}},
+		{"state, ;comment", []string{"state", "comment"}},
+		{"state\x00comment,x", []string{"state", "comment,x"}},
+	} {
+		if got := splitPVEList(row.list); !slices.Equal(got, row.want) {
+			t.Errorf("splitPVEList(%q) = %q, want %q", row.list, got, row.want)
+		}
 	}
 }
 
