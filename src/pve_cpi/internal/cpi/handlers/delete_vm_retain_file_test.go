@@ -184,6 +184,16 @@ func (n legacyDestroyNodes) DeleteQemu(ctx context.Context, node, vmid string, p
 	return n.volumeDestroyingNodes.DeleteQemu(ctx, node, vmid, p)
 }
 
+// ListStorageStatus answers the storage status read of the delete's check for
+// volumes its node cannot reach with an active storage.
+func (legacyDestroyNodes) ListStorageStatus(context.Context, string, string) (*nodes.ListStorageStatusResponse, error) {
+	out := &nodes.ListStorageStatusResponse{}
+	if err := json.Unmarshal([]byte(`{"active":1,"enabled":1}`), out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // legacyDestroyAgent accepts the agent cleanup that follows a destroy.
 type legacyDestroyAgent struct{}
 

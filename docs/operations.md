@@ -774,10 +774,32 @@ Only follow it once the node is certain to be powered off. A node that is only p
 
    The next `delete_vm` retry finds the VM on the live node and completes. It removes any node-affinity pin the VM still has. Afterward we run `pve-cid ha`, and we delete any rule that it reports as a `rule_problem` for the removed VM.
 
+   A volume on the dead node's local storage is not removed by this delete. Step 7 covers it.
+
 5. For a VM whose persistent disk lives on the dead node, either bring the node back or decide that the data is lost.
-   When the data is lost, remove the disk reference with `bosh cck`. PVE logs a warning for each local volume it cannot find during the destroy and finishes anyway.
+   When the data is lost, remove the disk reference with `bosh cck`.
+
+   The destroy runs on the live node, and that node cannot reach a volume on the dead node's local storage. PVE does not warn about such a volume, and the destroy finishes without it. The volume stays on the dead node, and we remove it in step 7. The CPI logs a warning when it deletes a VM whose volume sits on a node-local storage that the VM's node cannot reach. The warning names the VM, the volume ID, and the storage, and when the storage is limited to certain nodes it names the likely node too. We save those lines from the deleting task's CPI log, so that step 7 has a list.
 
 6. Run `bosh cck`, or wait for the next resurrection.
+
+7. Once the dead node is back and in the cluster, remove the volumes that the destroy left behind on it.
+   We take the volume IDs from the CPI's warnings. When the log is gone, we list the node's local storages instead, for example with `pvesm list <storage> --vmid <vmid>`, and look for volumes named for the deleted VM.
+
+   For each volume, we first confirm that no VM config in the cluster still references it, and that the VM ID no longer exists.
+
+   ```bash
+   grep -l -e '<volume name>' -e '<vmid>' /etc/pve/nodes/*/qemu-server/*.conf
+   pvesh get /cluster/resources --type vm | grep -w <vmid>
+   ```
+
+   Both commands must print nothing. A config that still names the volume means that some VM owns it, and we leave it alone. Then, on the node that holds the volume, we remove it.
+
+   ```bash
+   pvesm free <volid>
+   ```
+
+   We free the volume on the node that holds it, because a local storage answers only on its own node. The destroy leaves these volumes behind in silence, so a cluster that skips this step keeps the space for good.
 
 ### Clearing an HA error by hand
 

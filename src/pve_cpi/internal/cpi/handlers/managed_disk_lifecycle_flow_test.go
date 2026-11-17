@@ -341,6 +341,16 @@ type lifecycleFlowNodes struct {
 	cfg func(ctx context.Context, node string, vmid int) (map[string]any, error)
 }
 
+// ListStorageStatus answers the status read the delete's check for volumes its
+// node cannot reach makes, with an active storage.
+func (lifecycleFlowNodes) ListStorageStatus(context.Context, string, string) (*nodes.ListStorageStatusResponse, error) {
+	out := &nodes.ListStorageStatusResponse{}
+	if err := json.Unmarshal([]byte(`{"active":1,"enabled":1}`), out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (n lifecycleFlowNodes) ListStorageContent(ctx context.Context, node, pool string, params *nodes.ListStorageContentParams) (*nodes.ListStorageContentResponse, error) {
 	listing, err := n.managedDiskTestNodes.ListStorageContent(ctx, node, pool, params)
 	if err != nil || !n.c.localStorage {

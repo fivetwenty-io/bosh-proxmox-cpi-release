@@ -534,6 +534,10 @@ func deleteLegacyVMClaimed(ctx context.Context, deps Deps, vmCID string, cid vmc
 	if err != nil {
 		return nil, err
 	}
+	// A node-local volume this node cannot reach survives the destroy, so the
+	// log names it for the operator who has to remove it later.
+	warnUnreachableLocalVolumes(ctx, deps, vmCID, vmid, node,
+		[]map[string]any{liveConfig, holding.WithReplacements()}, logger)
 
 	// --- per-node in-flight gate (opt-in; limit=0 → unlimited, no gating) ---
 	if deps.Config != nil {

@@ -1047,6 +1047,26 @@ qm set <parker-vmid> --digest <digest> --description "$(cat parker-description.t
 
 When PVE refuses the write because the digest no longer matches, something changed the description after we read it, so we read it again and start the edit over. See [Persistent Disk Strategy](persistent-disk-strategy.md).
 
+### delete_vm warns that a volume is on node-local storage this node cannot reach
+
+**Symptom**
+
+The CPI log of a `delete_vm` task holds a warning like this one.
+
+```text
+delete_vm: the VM's volume local-lvm-data:vm-<vmid>-ephemeral-0 is on node-local storage local-lvm-data that this node cannot reach, so the destroy cannot free it. It will stay behind on the node that holds it, and needs removing there once that node is back (most likely <node>)
+```
+
+The delete itself succeeds.
+
+**Diagnosis**
+
+The VM's config sat on a node that has no access to one of its volumes, and the volume lives on a storage that is local to another node. This happens after we move a dead node's VM config to a live node by hand, as [the dead-node procedure](operations.md#the-dead-node-procedure) describes. PVE destroys the VM from the live node, cannot reach the volume, and logs nothing about it. The volume stays on the node that holds it. The warning names the VM, the volume ID, and the storage, and it names the likely node when the storage is limited to specific nodes.
+
+**Fix**
+
+Wait until the node that holds the volume is back in the cluster. Then confirm that nothing references the volume, and remove it on that node, as step 7 of the dead-node procedure lists.
+
 ### delete_vm refuses to destroy VM with attached unused disks
 
 **Symptom**
