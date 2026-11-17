@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -126,7 +127,7 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 		}
 
 		// --- scan VMs for disk ---
-		matches, err := findDiskMetadataHolders(ctx, deps, bareDiskCID, diskCID)
+		matches, err := findDiskMetadataHolders(ctx, deps, rd, bareDiskCID, diskCID)
 		if err != nil {
 			return nil, err
 		}
@@ -199,31 +200,57 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 	})
 }
 
-// findDiskMetadataHolders runs the holder scan and judges what it left out
-// through holderScanOfflineVerdict. bareDiskCID is the volid the scan matches,
-// and diskCID is the CID the Director sent, which the warning and the error
-// name.
-func findDiskMetadataHolders(ctx context.Context, deps Deps, bareDiskCID, diskCID string) ([]attachedVM, error) {
-	matches, offline, err := findVMsHostingDisk(ctx, deps, bareDiskCID)
+// findDiskMetadataHolders runs the holder scan and settles what it left out
+// before the handler acts on its matches. bareDiskCID is the volid the scan
+// matches, and diskCID is the CID the Director sent, which the warning and the
+// error name. rd is the resolved disk, whose identity-scan holder can prove
+// that a parker holds the disk.
+//
+// A scan that found a holder, or that left nothing out, needs nothing more.
+// A scan with no holder and a node left out can't tell "not attached" from
+// "attached to a VM on that node", so it settles the question in two steps.
+// First, a parker on an online node that holds the volume proves that the
+// disk isn't attached to an ordinary VM, because a disk is attached to one VM
+// at a time, and the call answers "not attached" as it does with every node
+// listed. Otherwise the scan lists the left-out nodes again with the strict
+// retry budget, which rides out a corosync blip that dropped a node whose
+// guests kept running, and reads their guests' configs. Only a node that
+// still can't be read leaves the answer unproven.
+func findDiskMetadataHolders(ctx context.Context, deps Deps, rd resolvedDisk, bareDiskCID, diskCID string) ([]attachedVM, error) {
+	scan, err := findVMsHostingDisk(ctx, deps, bareDiskCID)
 	if err != nil {
 		return nil, err
 	}
-	if err := holderScanOfflineVerdict(ctx, deps, diskCID, matches, offline); err != nil {
+	if len(scan.matches) == 0 && len(scan.offline) > 0 {
+		parker, parked := scan.parkedOnOnlineNode(ctx, deps, rd, bareDiskCID)
+		if parked {
+			deps.Log(ctx).Warn("set_disk_metadata: a parker on an online node holds the disk, so no VM on the nodes the cluster reports offline can hold it",
+				log.String("disk_cid", diskCID), log.Int("parker_vmid", parker.vmid), log.String("parker_node", parker.node),
+				log.String("offline_nodes", strings.Join(scan.offline, ",")))
+			return nil, nil
+		}
+		if err := scan.rescanOffline(ctx, deps, bareDiskCID, diskCID); err != nil {
+			return nil, err
+		}
+	}
+	if err := holderScanOfflineVerdict(ctx, deps, diskCID, scan.matches, scan.offline); err != nil {
 		return nil, err
 	}
-	return matches, nil
+	return scan.matches, nil
 }
 
-// holderScanOfflineVerdict judges a holder scan that left out nodes the
+// holderScanOfflineVerdict judges a holder scan that still leaves out nodes the
 // cluster reports offline, before the handler acts on its matches. With no
 // holder found, the disk may be attached to a VM on one of those nodes.
 // Answering "not attached" would drop the metadata with no error, and no write
 // can reach a VM on that node anyway, so the scan's answer becomes a retriable
-// error that names the nodes, and the Director sends the call again once they
-// are back. With one holder found, that holder settles where the metadata
-// goes, because a disk is attached to one VM at a time. The ambiguity check
-// the scan also gives can't cover the offline nodes, though, and the warning
-// says so. A scan that left nothing out passes through unjudged.
+// error that names the nodes. The Director doesn't retry set_disk_metadata on
+// its own, so the deploy task fails, and rerunning the deploy once the node is
+// back, or once the VM has moved, writes the metadata. With one holder found,
+// that holder settles where the metadata goes, because a disk is attached to
+// one VM at a time. The ambiguity check the scan also gives can't cover the
+// offline nodes, though, and the warning says so. A scan that left nothing out
+// passes through unjudged.
 func holderScanOfflineVerdict(ctx context.Context, deps Deps, diskCID string, matches []attachedVM, offline []string) error {
 	if len(offline) == 0 {
 		return nil
@@ -287,16 +314,41 @@ func coerceTagMap(v any) map[string]string {
 	}
 }
 
+// diskHolderScan is what the set_disk_metadata holder scan found. matches are
+// the ordinary VMs whose config names the disk. parkers are the parkers whose
+// config names it, among those the scan read. unreadParkers are the parkers the
+// listing row's tags already marked, whose configs the scan skips unless it
+// needs them. offline names the nodes the scan left out, either because the
+// quorate cluster reported them offline before the listing, or because it
+// began to while the scan read their guests. read holds the guests whose
+// config the scan has read, so that a second pass over a node reads each guest
+// once.
+type diskHolderScan struct {
+	matches       []attachedVM
+	parkers       []attachedVM
+	unreadParkers []pve.GuestRef
+	offline       []string
+	read          map[attachedVM]bool
+}
+
 // findVMsHostingDisk scans every cluster guest via authoritative per-node
 // listings and returns every (node, vmid) pair whose QEMU config contains
 // diskCID. Uses exact
 // volid equality (with option-string tolerance via pve.DiskOptStrContainsVolid)
 // to prevent false matches on diskCIDs that are substrings of other volids.
 //
-// VMs carrying the bosh-parker tag are silently skipped. A disk parked on a
+// Each config is read in both of PVE's views. A slot whose delete PVE could
+// only record as pending, as after a hot-unplug that failed during a detach,
+// is missing from the view the config endpoint returns, while the running
+// guest still has the disk, so a slot that either view names counts as
+// holding the disk, as it does in the identity scan.
+//
+// VMs carrying the bosh-parker tag are never holders. A disk parked on a
 // parker VM produces 0 matches, which flows into the existing warn+nil path
 // ("disk not attached; metadata not persisted"). This is correct: metadata
 // for a parked disk is irrelevant until the disk is attached to a real VM.
+// The scan still records a parker whose config names the disk, because that
+// parker proves where the disk is when a node was left out.
 //
 // The tag is tested twice and costs no extra API call either time. First on
 // the listing row, which the scan already has. Then on the VM config,
@@ -312,23 +364,25 @@ func coerceTagMap(v any) map[string]string {
 // lives.
 //
 // The enumeration is the offline-tolerant one. A node the quorate cluster
-// reports offline is left out of the scan, and its name comes back in the
-// second return value, instead of stalling the call through the listing's
-// retries and then failing it. A holder found on a listed node settles the
-// answer, because a disk is attached to one VM at a time. An answer with no
-// holder proves nothing while a node was left out, so the handler turns that
-// case into a retriable error rather than the "not attached" warning.
+// reports offline is left out of the scan, and its name comes back in
+// offline, instead of stalling the call through the listing's retries and
+// then failing it. So is a node that goes offline after its listing answered,
+// once a config read on it fails and the cluster reports it offline. A holder
+// found on a listed node settles the answer, because a disk is attached to one
+// VM at a time. An answer with no holder proves nothing while a node was left
+// out, so findDiskMetadataHolders settles that case before the handler acts.
 //
 // Transport errors from the enumeration propagate as wrapped retriable
 // errors.
 // Per-VM Config errors are skipped only when they are not-found (the VM was
-// deleted concurrently or its config is gone); any other Config error is
-// classified by pve.WrapConfigReadError, so a transient fault mid-scan is
-// retriable -- it must not produce a false 0-match (silent metadata loss) or a
-// false 1-match (masked multi-attach) -- while a denied VM.Audit grant stays
-// permanent and names itself. The scan never short-circuits on the first match:
-// visiting every VM is what makes ambiguity detection possible.
-func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attachedVM, []string, error) {
+// deleted concurrently or its config is gone); any other Config error on a
+// node still reported online is classified by pve.WrapConfigReadError, so a
+// transient fault mid-scan is retriable -- it must not produce a false
+// 0-match (silent metadata loss) or a false 1-match (masked multi-attach) --
+// while a denied VM.Audit grant stays permanent and names itself. The scan
+// never short-circuits on the first match: visiting every VM is what makes
+// ambiguity detection possible.
+func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) (*diskHolderScan, error) {
 	// The candidate list comes from authoritative per-node listings
 	// (ListGuestsAuthoritativeTolerant), not the /cluster/resources index: the
 	// index lags by minutes, so a young holder would be invisible to it,
@@ -338,14 +392,28 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 	// contract.
 	guests, offline, listErr := pve.ListGuestsAuthoritativeTolerant(ctx, deps.PVE, deps.Log(ctx))
 	if listErr != nil {
-		return nil, nil, cpierrors.Wrap(listErr, "set_disk_metadata: enumerate cluster guests")
+		return nil, cpierrors.Wrap(listErr, "set_disk_metadata: enumerate cluster guests")
 	}
+	scan := &diskHolderScan{offline: offline, read: map[attachedVM]bool{}}
+	if err := scan.scanGuests(ctx, deps, guests, diskCID); err != nil {
+		return nil, err
+	}
+	return scan, nil
+}
 
-	var matches []attachedVM
-
+// scanGuests reads the config of each guest the scan hasn't read yet and
+// records what it holds. A node whose config read fails while the quorate
+// cluster now reports it offline joins offline, and its remaining guests are
+// skipped.
+func (s *diskHolderScan) scanGuests(ctx context.Context, deps Deps, guests []pve.GuestRef, diskCID string) error {
+	dropped := map[string]bool{}
 	for _, g := range guests {
 		vmNode := g.Node
 		vmid := g.VMID
+		guest := attachedVM{node: vmNode, vmid: vmid}
+		if dropped[vmNode] || s.read[guest] {
+			continue
+		}
 
 		// Skip parker VMs: a parked disk on a parker VM should not be treated
 		// as "attached to a real VM". Uses only data from the listing row, no
@@ -358,18 +426,35 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 		// metadata into a parker's description — the field carrying the
 		// provenance sentinel for every disk it holds.
 		if pve.TagsMarkParker(g.Tags) {
+			s.unreadParkers = append(s.unreadParkers, g)
 			continue
 		}
 
-		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, vmNode, vmid)
+		views, cfgErr := pve.ReadQemuViews(ctx, deps.PVE, vmNode, vmid)
 		if cfgErr != nil {
 			if pve.IsNotFound(cfgErr) {
 				// VM deleted concurrently or config gone: cannot host the disk.
+				s.read[guest] = true
 				continue
 			}
-			return nil, nil, cpierrors.Wrap(pve.WrapConfigReadError(cfgErr),
+			// A node can go down after its listing answered. When the quorate
+			// cluster now reports it offline, it is left out like a node the
+			// listing excluded. A holder already found on it stays a match,
+			// and the settle before the write refuses a node that can't
+			// answer.
+			if pve.ClusterReportsMemberOffline(ctx, deps.PVE, deps.Log(ctx), vmNode) {
+				deps.Log(ctx).Warn("set_disk_metadata: leaving out a node the cluster began reporting offline during the holder scan",
+					log.String("node", vmNode), log.Int("vmid", vmid), log.Err(cfgErr))
+				dropped[vmNode] = true
+				if !slices.Contains(s.offline, vmNode) {
+					s.offline = append(s.offline, vmNode)
+				}
+				continue
+			}
+			return cpierrors.Wrap(pve.WrapConfigReadError(cfgErr),
 				fmt.Sprintf("set_disk_metadata: Config error for vm %d on node %s", vmid, vmNode))
 		}
+		s.read[guest] = true
 
 		// Second parker test, on the config just read. An empty tags field on
 		// the cluster-resources row proves nothing -- it cannot tell an untagged
@@ -378,19 +463,82 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 		// description that carries its provenance sentinel. delete_vm makes the
 		// same fallback for the same reason; here the config is already in hand,
 		// so it costs nothing.
-		if cfgTags, _ := pve.ConfigString(cfg, "tags"); pve.TagsMarkParker(cfgTags) {
+		holds := viewsHoldVolume(views, diskCID)
+		if cfgTags, _ := pve.ConfigString(views.Applied(), "tags"); pve.TagsMarkParker(cfgTags) {
+			if holds {
+				s.parkers = append(s.parkers, guest)
+			}
 			continue
 		}
-
-		// Use exact volid matching with option-string tolerance: a config value of
-		// "local-lvm:vm-100-disk-0,size=10G" must match diskCID "local-lvm:vm-100-disk-0"
-		// but must NOT match diskCID "local-lvm:vm-100-disk".
-		if pve.DiskOptStrContainsVolid(qemu.ParseDisks(cfg), diskCID) {
-			matches = append(matches, attachedVM{node: vmNode, vmid: vmid})
+		if holds {
+			s.matches = append(s.matches, guest)
 		}
 	}
+	return nil
+}
 
-	return matches, offline, nil
+// viewsHoldVolume reports whether a disk slot names volid in either view of a
+// config. It matches exactly, with option-string tolerance: a config value of
+// "local-lvm:vm-100-disk-0,size=10G" matches volid "local-lvm:vm-100-disk-0"
+// but must NOT match "local-lvm:vm-100-disk".
+func viewsHoldVolume(views pve.QemuViews, volid string) bool {
+	return pve.DiskOptStrContainsVolid(qemu.ParseDisks(views.Applied()), volid) ||
+		pve.DiskOptStrContainsVolid(qemu.ParseDisks(views.Current()), volid)
+}
+
+// parkedOnOnlineNode reports a parker on an online node that holds the disk,
+// which proves the disk isn't attached to an ordinary VM anywhere. The
+// identity scan's holder answers that for a disk with a stable ID at no cost.
+// Otherwise the parkers the scan already read answer it, and then the parkers
+// the listing marked, whose configs are read only now, because they matter
+// only when a node was left out. A parker whose config can't be read proves
+// nothing, so it is passed over.
+func (s *diskHolderScan) parkedOnOnlineNode(ctx context.Context, deps Deps, rd resolvedDisk, diskCID string) (attachedVM, bool) {
+	if h := rd.holder; h != nil && h.Found && (h.IsParker || pve.TagsMarkParker(h.Tags)) && !slices.Contains(s.offline, h.Node) {
+		return attachedVM{node: h.Node, vmid: h.VMID}, true
+	}
+	for _, p := range s.parkers {
+		if !slices.Contains(s.offline, p.node) {
+			return p, true
+		}
+	}
+	for _, g := range s.unreadParkers {
+		if slices.Contains(s.offline, g.Node) {
+			continue
+		}
+		views, err := pve.ReadQemuViews(ctx, deps.PVE, g.Node, g.VMID)
+		if err != nil {
+			if !pve.IsNotFound(err) {
+				deps.Log(ctx).Warn("set_disk_metadata: could not read a parker's config while looking for the disk",
+					log.String("node", g.Node), log.Int("vmid", g.VMID), log.Err(err))
+			}
+			continue
+		}
+		if viewsHoldVolume(views, diskCID) {
+			return attachedVM{node: g.Node, vmid: g.VMID}, true
+		}
+	}
+	return attachedVM{}, false
+}
+
+// rescanOffline lists the nodes the scan left out again, this time with the
+// strict retry budget, and reads their guests' configs. A corosync link that
+// drops for a few seconds gets a node reported offline while its guests keep
+// running, and failing at once would turn a blip that the strict listing rides
+// out into a failed deploy. This is the one case where the call can't succeed
+// without waiting anyway, because the only place the disk can still be is a
+// node the scan couldn't read. A node that answers leaves offline, and a node
+// that goes offline again during the config reads stays in it.
+func (s *diskHolderScan) rescanOffline(ctx context.Context, deps Deps, bareDiskCID, diskCID string) error {
+	nodes := s.offline
+	guests, err := pve.ListMemberGuests(ctx, deps.PVE, deps.Log(ctx), nodes)
+	if err != nil {
+		return cpierrors.Wrap(err, fmt.Sprintf(
+			"set_disk_metadata: disk %q is not attached to a VM on any online node, and the cluster reports %s offline, so it may be attached to a VM there; metadata not persisted",
+			diskCID, strings.Join(nodes, ", ")))
+	}
+	s.offline = nil
+	return s.scanGuests(ctx, deps, guests, bareDiskCID)
 }
 
 // persistMetadata reads the current VM description, merges the disk metadata into

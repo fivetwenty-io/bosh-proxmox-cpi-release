@@ -33,10 +33,18 @@ import (
 type diskMetaQEMUMock struct {
 	// configs maps "node:vmid" → config map.
 	configs map[string]map[string]any
+	// configErrs maps "node:vmid" to an error the config read answers, and
+	// configErrCalls counts the reads that answered one.
+	configErrs     map[string]error
+	configErrCalls int
 }
 
 func (m *diskMetaQEMUMock) Config(_ context.Context, node string, vmid int) (map[string]any, error) {
 	key := diskKey(node, vmid)
+	if err, ok := m.configErrs[key]; ok {
+		m.configErrCalls++
+		return nil, err
+	}
 	if cfg, ok := m.configs[key]; ok {
 		return cfg, nil
 	}
@@ -114,12 +122,18 @@ type diskMetaNodesMock struct {
 	// listCalls counts ListQemu calls per node.
 	failNodes map[string]error
 	listCalls map[string]int
+	// pending maps "node:vmid" to a pending-endpoint answer that replaces the
+	// one derived from the config read, for a slot with a pending change.
+	pending map[string]*sdknodes.ListQemuPendingResponse
 }
 
 // ListQemuPending serves the pending read from the client's config read.
 func (m *diskMetaNodesMock) ListQemuPending(
 	ctx context.Context, node, vmid string,
 ) (*sdknodes.ListQemuPendingResponse, error) {
+	if resp, ok := m.pending[node+":"+vmid]; ok {
+		return resp, nil
+	}
 	return handlers.PendingFromConfigRead(ctx, m.configRead, node, vmid)
 }
 
