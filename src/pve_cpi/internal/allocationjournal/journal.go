@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -667,8 +668,25 @@ const (
 	saveReplicationTransition
 )
 
-// clockNow reads the wall clock. Tests replace it to step the clock backward.
-var clockNow = time.Now
+// clockOverride, when set, replaces the wall clock the journal stamps records
+// with. SetClockForTest is the only writer.
+var clockOverride atomic.Pointer[func() time.Time]
+
+// clockNow reads the wall clock, or the clock a test installed.
+func clockNow() time.Time {
+	if f := clockOverride.Load(); f != nil {
+		return (*f)()
+	}
+	return time.Now()
+}
+
+// SetClockForTest makes the journal stamp records with now instead of the wall
+// clock, and returns a restore function. It lets a test step the clock
+// backward, and production code never calls it.
+func SetClockForTest(now func() time.Time) func() {
+	prev := clockOverride.Swap(&now)
+	return func() { clockOverride.Store(prev) }
+}
 
 // nextUpdatedAt returns the UpdatedAt a save stamps on the record. It is the
 // wall clock, held at or after the record's last UpdatedAt and its CreatedAt.

@@ -1087,8 +1087,7 @@ func TestReturnedRecordGoesStraightToObservedOnlyWithFreshEvidence(t *testing.T)
 func TestSaveKeepsUpdatedAtAfterCreatedAtWhenClockStepsBack(t *testing.T) {
 	start := time.Date(2026, 11, 17, 5, 0, 0, 0, time.UTC)
 	now := start
-	clockNow = func() time.Time { return now }
-	t.Cleanup(func() { clockNow = time.Now })
+	t.Cleanup(SetClockForTest(func() time.Time { return now }))
 
 	j, _ := fixture(t)
 	h := acquireVM(t, j)
