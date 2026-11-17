@@ -25,7 +25,11 @@ func statusRoutes(code int, hang *atomic.Bool, arrived chan<- struct{}) *pvetest
 		if hang != nil && hang.Swap(false) {
 			arrived <- struct{}{}
 			<-r.Context().Done()
-			return
+			// The candidate never answers. Returning here would make the
+			// server write an empty 200 once it sees the client go, and
+			// that response can reach a client that has not yet torn the
+			// connection down, which counts as an answer.
+			panic(http.ErrAbortHandler)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
