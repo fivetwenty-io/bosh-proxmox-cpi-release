@@ -44,7 +44,7 @@ func reconcileMoved(t *testing.T, r *replicaRig) ([]string, *stagingLog) {
 	}
 	sl := &stagingLog{}
 	res := &attachRunRes{log: sl, state: "started", comment: r.stub.comment}
-	err = reconcileOnPartner(crhCtx(), r.deps, logger, "set_vm_metadata", "100", r.repl, failoverView(res, "pve02"),
+	err = reconcileOnPartner(crhCtx(), r.deps, logger, "set_vm_metadata", "100", r.repl, failoverView(res),
 		r.profile, 100, "pve02", set.Find("bosh-na-100"), "pve01")
 	if err != nil {
 		t.Fatalf("reconcile on the partner: %v", err)
@@ -344,7 +344,7 @@ func TestReconcileOnPartner_LiveMigrationWithItsIncomingStartIsPlanned(t *testin
 			}
 			res := &attachRunRes{log: &stagingLog{}, state: "started", comment: r.stub.comment}
 			if err := reconcileOnPartner(crhCtx(), r.deps, logger, "set_vm_metadata", "100", r.repl,
-				failoverView(res, "pve02"), r.profile, 100, "pve02", set.Find("bosh-na-100"), "pve01"); err != nil {
+				failoverView(res), r.profile, 100, "pve02", set.Find("bosh-na-100"), "pve01"); err != nil {
 				t.Fatalf("reconcile on the partner: %v", err)
 			}
 			planned := false
@@ -397,6 +397,9 @@ func TestReconcileOnPartner_RecoveryAfterAPlannedMigrationWarnsOfLostWrites(t *t
 		"the recovery back to the old source alone":     {incoming, backToOld},
 		"a second start soon after the incoming one ends": {incoming, func(r *replicaRig, ended time.Time) {
 			r.tasks.started("pve02", ended.Add(2*time.Minute), ended.Add(2*time.Minute+5*time.Second), "OK")
+		}},
+		"a recovery start on the partner that failed": {incoming, func(r *replicaRig, ended time.Time) {
+			r.tasks.started("pve02", ended.Add(20*time.Minute), ended.Add(20*time.Minute+time.Second), "start failed")
 		}},
 	}
 	for name, steps := range cases {

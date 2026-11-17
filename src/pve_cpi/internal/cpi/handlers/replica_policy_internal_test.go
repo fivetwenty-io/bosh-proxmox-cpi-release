@@ -737,9 +737,10 @@ func TestReconcileVMReplica_FailoverNarrowingErrorFailsTheCall(t *testing.T) {
 	}
 }
 
-// failoverView is barrierView for a VM that runs on node, with the mutation
-// run on that node.
-func failoverView(res *attachRunRes, node string) ha.NarrowDeps {
+// failoverView is barrierView for a VM that runs on pve02, the partner its pin
+// names, with the mutation run on that node.
+func failoverView(res *attachRunRes) ha.NarrowDeps {
+	const node = "pve02"
 	v := barrierView(res)
 	read := v.ReadState
 	v.ReadState = func(ctx context.Context, vmid int, n string) (*pve.HAServiceState, error) {
@@ -770,7 +771,7 @@ func TestNarrowAfterFailover_NarrowsToTheNewSourceAndRequestsASync(t *testing.T)
 	pin := set.Find("bosh-na-100")
 	sl := &stagingLog{}
 	res := &attachRunRes{log: sl, state: "started", comment: r.stub.comment}
-	err = narrowAfterFailover(crhCtx(), r.deps, log.NewNopLogger(), "reboot_vm", r.repl, failoverView(res, "pve02"),
+	err = narrowAfterFailover(crhCtx(), r.deps, log.NewNopLogger(), "reboot_vm", r.repl, failoverView(res),
 		r.profile, 100, "pve02", pin, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1145,7 +1146,7 @@ func TestNarrowAfterFailover_ErroredResourceReregistersUnderTheClaim(t *testing.
 	}
 	sl := &stagingLog{}
 	res := &attachRunRes{log: sl, state: "error", comment: r.stub.comment}
-	view := failoverView(res, "pve02")
+	view := failoverView(res)
 	read := view.ReadState
 	view.ReadState = func(ctx context.Context, vmid int, n string) (*pve.HAServiceState, error) {
 		st, err := read(ctx, vmid, n)
