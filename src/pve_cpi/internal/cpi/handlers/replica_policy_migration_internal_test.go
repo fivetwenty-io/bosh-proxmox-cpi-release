@@ -29,7 +29,7 @@ func movedReplicaRig(t *testing.T) (*replicaRig, time.Time) {
 	r.repl.addJob("100-0", "pve02", "pve01", renderReplicaJobMarker(aaDirector, 1))
 	r.repl.status = verifiedSync(changed)
 	r.repl.listed[replicaRootVolume] = true
-	r.tasks.migrated("pve01", 100, changed.Add(time.Hour-time.Minute), changed.Add(time.Hour), "OK")
+	r.tasks.migrated("pve01", changed.Add(time.Hour-time.Minute), changed.Add(time.Hour), "OK")
 	return r, changed
 }
 
@@ -252,21 +252,21 @@ func TestReconcileOnPartner_VerifiedSyncWithoutAMigrationWarnsOfLostWrites(t *te
 		"a migration that ended before the pin's last change": {
 			setup: func(r *replicaRig, changed time.Time) {
 				r.tasks.migrations = map[string][]pve.MigrationTask{}
-				r.tasks.migrated("pve01", 100, changed.Add(-2*time.Minute), changed.Add(-time.Minute), "OK")
+				r.tasks.migrated("pve01", changed.Add(-2*time.Minute), changed.Add(-time.Minute), "OK")
 			},
 			warn: "after a failover, since no migration task on the old source explains the move",
 		},
 		"a migration that failed": {
 			setup: func(r *replicaRig, changed time.Time) {
 				r.tasks.migrations = map[string][]pve.MigrationTask{}
-				r.tasks.migrated("pve01", 100, changed.Add(time.Hour-time.Minute), changed.Add(time.Hour),
+				r.tasks.migrated("pve01", changed.Add(time.Hour-time.Minute), changed.Add(time.Hour),
 					"migration aborted")
 			},
 			warn: "after a failover, since no migration task on the old source explains the move",
 		},
 		"the VM migrated away and back, then failed over": {
 			setup: func(r *replicaRig, changed time.Time) {
-				r.tasks.migrated("pve02", 100, changed.Add(time.Hour+time.Minute), changed.Add(time.Hour+2*time.Minute),
+				r.tasks.migrated("pve02", changed.Add(time.Hour+time.Minute), changed.Add(time.Hour+2*time.Minute),
 					"OK")
 			},
 			warn: "after a failover, since no migration task on the old source explains the move",

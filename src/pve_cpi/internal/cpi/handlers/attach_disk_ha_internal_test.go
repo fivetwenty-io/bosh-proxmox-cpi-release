@@ -816,12 +816,11 @@ func newTaskListStub() *taskListStub {
 		err: map[string]error{}, migrationErr: map[string]error{}}
 }
 
-// migrated records a qmigrate task of VM vmid on node that ran from start to
+// migrated records a qmigrate task of VM 100 on node that ran from start to
 // end and ended with status.
-func (s *taskListStub) migrated(node string, vmid int, start, end time.Time, status string) {
-	task := pve.MigrationTask{UPID: "UPID:" + node + ":00000001:00000001:00000001:qmigrate:" + strconv.Itoa(vmid) +
-		":root@pam:", Node: node, Type: "qmigrate", ID: strconv.Itoa(vmid), Status: status,
-		StartTime: start.Unix()}
+func (s *taskListStub) migrated(node string, start, end time.Time, status string) {
+	task := pve.MigrationTask{UPID: "UPID:" + node + ":00000001:00000001:00000001:qmigrate:100:root@pam:",
+		Node: node, Type: "qmigrate", ID: "100", Status: status, StartTime: start.Unix()}
 	if !end.IsZero() {
 		task.EndTime = end.Unix()
 	}

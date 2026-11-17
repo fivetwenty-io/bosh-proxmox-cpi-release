@@ -1008,9 +1008,9 @@ func (c *haCollector) onPartner(g *haGuest, pin *ha.Rule, node, source string) {
 	if c.jobsOK {
 		move.Job = c.liveJob(id)
 	}
-	for _, n := range c.p.Nodes {
-		if n.Name == source {
-			move.OldSourceOnline = n.Online
+	for i := range c.p.Nodes {
+		if c.p.Nodes[i].Name == source {
+			move.OldSourceOnline = c.p.Nodes[i].Online
 		}
 	}
 	if pin != nil {

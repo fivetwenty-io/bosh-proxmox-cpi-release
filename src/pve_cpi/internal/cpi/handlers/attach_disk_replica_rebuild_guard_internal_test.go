@@ -112,7 +112,7 @@ func TestPrepareAttachReplicaRebuild_WaitsForAMoveInFlight(t *testing.T) {
 		},
 		"migration running": {
 			setup: func(r *replicaRig) {
-				r.tasks.migrated("pve01", 100, time.Now().Add(-time.Minute), time.Time{}, "")
+				r.tasks.migrated("pve01", time.Now().Add(-time.Minute), time.Time{}, "")
 			},
 			reason: "is running",
 		},
