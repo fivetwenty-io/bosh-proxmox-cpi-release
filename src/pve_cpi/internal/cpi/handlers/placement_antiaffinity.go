@@ -707,7 +707,9 @@ func (p *aaPlanner) keptMembers(existing map[int]*ha.Rule, maxIndex int) (map[in
 // and it joins the first one where its join brings on no conflict. It stays
 // out only when every rule with room refuses it. No new rule opens for it
 // then, because a rule opens only once every rule is full, and every later
-// plan tries the member again.
+// plan tries the member again. A rule that holds members comes before an
+// index whose rule a delete left out, and a member that a rule refused never
+// fills such a gap, because alone there it would be in no rule.
 func (p *aaPlanner) assignPending(
 	set *ha.RuleSet, existing map[int]*ha.Rule, desired map[int][]string, assigned map[string]bool, maxIndex int,
 ) int {
@@ -772,15 +774,21 @@ type memberFit struct {
 	bad     map[string][]string
 }
 
-// fitMember tries s in each of the group's rules that holds fewer than room
-// members, in index order, and returns the first one where its join brings
-// on no conflict. The create's own VM is never checked, except in a heal.
+// fitMember tries s in each of the group's rules that holds members and
+// fewer than room of them, in index order, and returns the first one where
+// its join brings on no conflict. The create's own VM is never checked,
+// except in a heal. Only when no rule with members takes s does it try an
+// index the plan has given no members yet, such as one whose rule a delete
+// left out, because s alone there ends up in no rule. An index like that
+// takes s only when no rule refused it, the way a new rule would, so a member
+// whose join conflicts stays out and is logged rather than fill the gap
+// alone.
 func (p *aaPlanner) fitMember(
 	set *ha.RuleSet, existing map[int]*ha.Rule, desired map[int][]string, maxIndex, room int, s string,
 ) memberFit {
 	var fit memberFit
 	for n := 1; n <= maxIndex; n++ {
-		if len(desired[n]) >= room {
+		if len(desired[n]) == 0 || len(desired[n]) >= room {
 			continue
 		}
 		fit.roomy = true
@@ -796,6 +804,16 @@ func (p *aaPlanner) fitMember(
 		}
 		fit.target = n
 		return fit
+	}
+	for n := 1; n <= maxIndex; n++ {
+		if len(desired[n]) != 0 || room <= 0 {
+			continue
+		}
+		fit.roomy = true
+		if len(fit.refused) == 0 {
+			fit.target = n
+			return fit
+		}
 	}
 	return fit
 }
