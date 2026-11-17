@@ -854,7 +854,18 @@ When those writes do not matter, we do nothing, and replication resumes in the n
    pvesr disable <job>
    ```
 
-2. Bring the old node back, and copy what is needed from its dataset, for example with `zfs send` of the newest snapshot or by mounting a clone of it.
+2. Bring the old node back, and save the writes from the live dataset on it. The lost writes exist only in that live dataset. The newest snapshot there is the last replication snapshot, which is the common base the partner already holds, so sending or cloning it recovers nothing. We take a new snapshot of each of the VM's volumes on the old node first, with a name that does not start with `__replicate_`, and then we send or clone that snapshot.
+
+   ```bash
+   zfs snapshot <pool>/vm-<vmid>-<name>@rescue
+   zfs send <pool>/vm-<vmid>-<name>@rescue | ssh <host> zfs recv <dataset>
+   ```
+
+   Once the copy sits somewhere else, we destroy the rescue snapshot, so that the last replication snapshot is again the newest one when the job's next receive runs.
+
+   ```bash
+   zfs destroy <pool>/vm-<vmid>-<name>@rescue
+   ```
 
 3. Enable the job again.
 
@@ -862,7 +873,7 @@ When those writes do not matter, we do nothing, and replication resumes in the n
    pvesr enable <job>
    ```
 
-   The job then overwrites the old node's dataset from the partner.
+   The job's next sync rolls the old node's live dataset back to the common snapshot and overwrites it from the partner, so the writes survive only in the copy we saved in step 2. A job that was never disabled does the same on its first run after the old node returns, which is why step 1 comes first.
 
 The doctor reports a `replicate` VM that runs on its partner as `replica_on_partner`, which tells us about the reversed job. After a failover, or after a move the CPI hasn't reconciled yet, that finding is a problem, so the doctor exits with 1 until the condition clears.
 
