@@ -61,13 +61,12 @@ func haRegistrationFeatures(deps Deps, cp createVMCloudProps, node string, env m
 }
 
 // warnHAResurrectorConflictOnce logs, once per CPI process, the line that
-// create_vm writes when it registers a VM under any HA-registration feature
-// (DLB, anti-affinity HA rules, or AZ node-affinity pinning). PVE HA and the
+// create_vm writes when it has registered a VM as a PVE HA resource. PVE HA and the
 // BOSH resurrector can both try to restart a failed guest. The CPI keeps them
 // from fighting: PVE HA recovers the guest first, the resurrector stays on as
 // the fallback, and delete_vm defers while PVE HA is fencing or recovering
 // the VM. The line tells the operator that ownership model and recommends a
-// Director agent_timeout of 240 seconds or more, so PVE HA finishes most
+// Director agent_timeout of 300 seconds or more, so PVE HA finishes most
 // recoveries before the resurrector looks at the VM. See
 // docs/ha-and-resurrection.md for the full ownership matrix.
 //
@@ -76,32 +75,33 @@ func haRegistrationFeatures(deps Deps, cp createVMCloudProps, node string, env m
 // vniZoneListWarnOnce once-per-process idiom (internal/pve/vni.go). The gate
 // itself and its test seam live in ha_warn_seam.go.
 //
-// Called from checkISOStorageForHA, which already computes
-// haRegistrationFeatures on every create_vm — piggybacking there avoids a
-// second create_vm.go call site. A no-op when features is empty (no
-// HA-registration feature fired for this VM) or logger is nil.
-//
-// NOTE for tests asserting on checkISOStorageForHA's logger: that function
-// writes BOTH this once-per-process line and the per-call ISO
-// migration-safety warning to the same logger. Assert on the specific message
-// under test rather than on buffer emptiness or length — otherwise whichever
-// test reaches this gate first in the binary captures an extra line and the
-// assertion becomes order-dependent.
+// completeCreatedVM calls it only once the activation has put the VM under
+// PVE HA, so the line follows the decision's outcome rather than the
+// configuration. A VM the decision keeps out of HA, or one that runs without
+// HA because its confinement could not be verified or its node's watchdog is
+// not armed, never logs it, even when the configuration enables a feature that
+// would register it. A registered VM logs it whether or not a feature fired.
+// features names the HA-registration features (DLB, anti-affinity HA rules,
+// or AZ node-affinity pinning) the configuration enables for the VM, and the
+// line leaves the features field out when none did. A nil logger is a no-op.
 func warnHAResurrectorConflictOnce(vmid int, features []haRegistrationFeature, logger *log.Logger) {
-	if len(features) == 0 || logger == nil {
+	if logger == nil {
 		return
 	}
 	haResurrectorWarnOnce.Load().Do(func() {
-		featureNames := make([]string, len(features))
-		for i, f := range features {
-			featureNames[i] = string(f)
+		fields := []log.Field{log.Int(metadataKeyVMID, vmid)}
+		if len(features) > 0 {
+			featureNames := make([]string, len(features))
+			for i, f := range features {
+				featureNames[i] = string(f)
+			}
+			fields = append(fields, log.String("features", strings.Join(featureNames, ",")))
 		}
 		logger.Info("create_vm: this VM is registered as a PVE HA resource; PVE HA recovers it first and the "+
 			"BOSH resurrector is the fallback, and delete_vm defers while PVE HA is fencing or recovering the "+
-			"VM; we recommend a Director agent_timeout (hm.intervals.agent_timeout) of 240 seconds or more so "+
+			"VM; we recommend a Director agent_timeout (hm.intervals.agent_timeout) of 300 seconds or more so "+
 			"PVE HA can finish most recoveries first; see docs/ha-and-resurrection.md",
-			log.Int(metadataKeyVMID, vmid),
-			log.String("features", strings.Join(featureNames, ",")),
+			fields...,
 		)
 	})
 }
@@ -143,8 +143,8 @@ func isoStorageScanTarget(ctx context.Context, deps Deps, vmStorage string) stri
 // because the ISO file does not exist there — silently defeating DLB
 // rebalancing, HA AZ pinning, and HA anti-affinity.
 //
-// A no-op (zero PVE calls) when haRegistrationFeatures reports no active
-// feature: most deployments never register any VM as a PVE HA resource, so
+// features is what haRegistrationFeatures reports for the VM. The check is a
+// no-op (zero PVE calls) when it names no active feature: most deployments never register any VM as a PVE HA resource, so
 // this check costs nothing for them. When at least one feature is active, the
 // same fail-open shared-storage lookup the DLB guard uses (dlbStorageIsShared)
 // classifies deps.EffectiveISOStorage:
@@ -158,17 +158,11 @@ func isoStorageScanTarget(ctx context.Context, deps Deps, vmStorage string) stri
 //     returns a non-retriable CloudError so create_vm fails (triggering the
 //     caller's rollback) instead of only warning.
 func checkISOStorageForHA(
-	ctx context.Context, deps Deps, vmid int, cp createVMCloudProps, node string, env map[string]any, logger *log.Logger,
+	ctx context.Context, deps Deps, vmid int, features []haRegistrationFeature, logger *log.Logger,
 ) error {
-	features := haRegistrationFeatures(deps, cp, node, env)
 	if len(features) == 0 {
 		return nil
 	}
-
-	// D11: one-per-process HA-vs-resurrector Warn. Independent of the
-	// ISO-storage migration-safety check below — it fires whenever any
-	// HA-registration feature is active, regardless of iso_storage sharing.
-	warnHAResurrectorConflictOnce(vmid, features, logger)
 
 	isoPool := deps.EffectiveISOStorage(ctx)
 	if isoPool == "" {

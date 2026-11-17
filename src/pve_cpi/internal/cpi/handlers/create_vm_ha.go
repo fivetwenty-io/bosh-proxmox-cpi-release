@@ -519,7 +519,7 @@ func (h *createdVMHA) runWithoutHA(ctx context.Context, reason string, start fun
 // forwarding, and the advertised routes, then writes the HA confinement, runs
 // the config-drive ISO check, and activates the staged VM. A VM PVE HA started
 // elsewhere has shape.node moved to its landing node, and an HA-managed VM
-// gets the bosh-ha-managed tag. A VM under the replicate policy then gets its
+// gets the bosh-ha-managed tag and the once-per-process ownership line. A VM under the replicate policy then gets its
 // replication job (see setUpCreatedReplica). The health gate runs last, on the
 // VM's node.
 func completeCreatedVM(
@@ -532,7 +532,8 @@ func completeCreatedVM(
 	if err := h.confine(ctx, parsed, shape.node); err != nil {
 		return err
 	}
-	if err := checkISOStorageForHA(ctx, deps, vmid, parsed.cloudProps, shape.node, parsed.env, logger); err != nil {
+	features := haRegistrationFeatures(deps, parsed.cloudProps, shape.node, parsed.env)
+	if err := checkISOStorageForHA(ctx, deps, vmid, features, logger); err != nil {
 		return err
 	}
 	// shape.node follows the VM to the node PVE HA started it on before the
@@ -549,8 +550,10 @@ func completeCreatedVM(
 	}
 	// The tag is a marker for operators. delete_vm finds an HA-managed VM by
 	// its HA resource, so a failed tag write is logged and the create goes on
-	// rather than tearing down a VM that runs under HA.
+	// rather than tearing down a VM that runs under HA. The ownership line
+	// says the VM is registered, so it follows the activation's outcome too.
 	if h.haActivated() {
+		warnHAResurrectorConflictOnce(vmid, features, logger)
 		if err := addHAManagedTag(ctx, deps, shape.node, vmid, logger); err != nil {
 			logger.Warn("create_vm: the bosh-ha-managed tag could not be written; the VM runs under PVE HA without it",
 				log.Int(metadataKeyVMID, vmid), log.String("node", shape.node), log.Err(err))

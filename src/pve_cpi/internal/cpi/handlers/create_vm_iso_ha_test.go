@@ -161,7 +161,7 @@ func TestCheckISOStorageForHA_NoFeatureActive_NoPVECallsNoError(t *testing.T) {
 	cfg := isoHABaseConfig("local")
 	deps := dlbDeps(nil, nil, panicStorageStub{t: t}, cfg)
 	cp := createVMCloudProps{}
-	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, log.NewNopLogger())
+	err := checkISOStorageForHA(context.Background(), deps, 100, haRegistrationFeatures(deps, cp, "pve01", nil), log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestCheckISOStorageForHA_DLBActive_LocalISO_WarnOnly(t *testing.T) {
 	// classification rather than a "not found" lookup error.
 	deps.Config.ISOStorage = "vm-storage"
 
-	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, log.NewNopLogger())
+	err := checkISOStorageForHA(context.Background(), deps, 100, haRegistrationFeatures(deps, cp, "pve01", nil), log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("require_shared_iso_for_ha is false: expected nil error (warn-only), got %v", err)
 	}
@@ -191,7 +191,7 @@ func TestCheckISOStorageForHA_DLBActive_SharedISO_NoWarnNoError(t *testing.T) {
 	deps := dlbDeps(nil, nil, storageSvc, cfg)
 	cp := createVMCloudProps{}
 
-	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, log.NewNopLogger())
+	err := checkISOStorageForHA(context.Background(), deps, 100, haRegistrationFeatures(deps, cp, "pve01", nil), log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("shared iso_storage: expected nil error, got %v", err)
 	}
@@ -206,7 +206,7 @@ func TestCheckISOStorageForHA_UndeterminableSharedNess_FailsOpen(t *testing.T) {
 	deps := dlbDeps(nil, nil, storageSvc, cfg)
 	cp := createVMCloudProps{}
 
-	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, log.NewNopLogger())
+	err := checkISOStorageForHA(context.Background(), deps, 100, haRegistrationFeatures(deps, cp, "pve01", nil), log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("undeterminable shared-ness must fail open (nil error), got %v", err)
 	}
@@ -221,7 +221,7 @@ func TestCheckISOStorageForHA_RequireSharedISOForHA_EscalatesToCloudError(t *tes
 	deps := dlbDeps(nil, nil, storageSvc, cfg)
 	cp := createVMCloudProps{}
 
-	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, log.NewNopLogger())
+	err := checkISOStorageForHA(context.Background(), deps, 100, haRegistrationFeatures(deps, cp, "pve01", nil), log.NewNopLogger())
 	if err == nil {
 		t.Fatal("require_shared_iso_for_ha=true: expected a CloudError, got nil")
 	}
@@ -249,7 +249,7 @@ func TestCheckISOStorageForHA_AntiAffinityActive_LocalISO_WarnOnly(t *testing.T)
 	cp := createVMCloudProps{}
 	env := isoHAGroupEnv("web")
 
-	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", env, log.NewNopLogger())
+	err := checkISOStorageForHA(context.Background(), deps, 100, haRegistrationFeatures(deps, cp, "pve01", env), log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("require_shared_iso_for_ha is false: expected nil error (warn-only), got %v", err)
 	}
@@ -339,12 +339,20 @@ func resetHAResurrectorWarnOnce(t *testing.T) {
 	t.Cleanup(resetHAResurrectorWarnOnceForTest())
 }
 
-func TestWarnHAResurrectorConflictOnce_EmptyFeatures_NoWarn(t *testing.T) {
+// TestWarnHAResurrectorConflictOnce_EmptyFeatures_StillLogs: the caller logs
+// the line only for a VM it registered, so a registration with no feature the
+// configuration names still logs it, and the line leaves the features field
+// out.
+func TestWarnHAResurrectorConflictOnce_EmptyFeatures_StillLogs(t *testing.T) {
 	resetHAResurrectorWarnOnce(t)
 	var buf bytes.Buffer
 	warnHAResurrectorConflictOnce(100, nil, infoLogger(t, &buf))
-	if out := buf.String(); out != "" {
-		t.Errorf("empty feature list must not warn, got %q", out)
+	out := buf.String()
+	if !strings.Contains(out, "registered as a PVE HA resource") {
+		t.Errorf("a registered VM with no feature must still log the ownership line, got %q", out)
+	}
+	if strings.Contains(out, `"features"`) {
+		t.Errorf("the line must leave out an empty features field, got %q", out)
 	}
 }
 
@@ -366,7 +374,7 @@ func TestWarnHAResurrectorConflictOnce_FiresOncePerProcess(t *testing.T) {
 		"PVE HA recovers it first",
 		"BOSH resurrector is the fallback",
 		"agent_timeout",
-		"240 seconds or more",
+		"300 seconds or more",
 		"docs/ha-and-resurrection.md",
 	} {
 		if !strings.Contains(first, want) {
@@ -393,7 +401,11 @@ func TestWarnHAResurrectorConflictOnce_FiresOncePerProcess(t *testing.T) {
 	}
 }
 
-func TestCheckISOStorageForHA_DLBActive_SharedISO_StillWarnsHAResurrector(t *testing.T) {
+// TestCheckISOStorageForHA_DLBActive_SharedISO_LogsNoOwnershipLine: the ISO
+// check runs before the VM's HA decision has an outcome, so it never says the
+// VM is registered, even with a feature active. completeCreatedVM logs that
+// line after the activation registers the VM.
+func TestCheckISOStorageForHA_DLBActive_SharedISO_LogsNoOwnershipLine(t *testing.T) {
 	resetHAResurrectorWarnOnce(t)
 	cfg := isoHABaseConfig("vm-storage")
 	cfg.HA = haDLBEnabled()
@@ -402,17 +414,12 @@ func TestCheckISOStorageForHA_DLBActive_SharedISO_StillWarnsHAResurrector(t *tes
 	cp := createVMCloudProps{}
 
 	var buf bytes.Buffer
-	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, infoLogger(t, &buf))
+	err := checkISOStorageForHA(context.Background(), deps, 100, haRegistrationFeatures(deps, cp, "pve01", nil), infoLogger(t, &buf))
 	if err != nil {
 		t.Fatalf("shared iso_storage: expected nil error, got %v", err)
 	}
-	// The ISO-storage migration-safety warning must NOT fire (shared pool),
-	// but the HA ownership line is logged regardless of ISO sharing.
-	if strings.Contains(buf.String(), "config-drive ISO on non-shared storage") {
-		t.Errorf("did not expect the ISO migration-safety warning for a shared pool, got %q", buf.String())
-	}
-	if !strings.Contains(buf.String(), "BOSH resurrector is the fallback") {
-		t.Errorf("expected the HA ownership line even with a shared iso_storage pool, got %q", buf.String())
+	if out := buf.String(); out != "" {
+		t.Errorf("a shared pool logs nothing, and the ISO check never logs the ownership line, got %q", out)
 	}
 }
 
@@ -423,7 +430,7 @@ func TestCheckISOStorageForHA_NoFeatureActive_NoHAResurrectorWarn(t *testing.T) 
 	cp := createVMCloudProps{}
 
 	var buf bytes.Buffer
-	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, infoLogger(t, &buf))
+	err := checkISOStorageForHA(context.Background(), deps, 100, haRegistrationFeatures(deps, cp, "pve01", nil), infoLogger(t, &buf))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -442,7 +449,7 @@ func TestCheckISOStorageForHA_AZPinActive_LocalISO_WarnOnly(t *testing.T) {
 	deps := dlbDeps(nil, nil, storageSvc, cfg)
 	cp := createVMCloudProps{AvailabilityZone: "z1"}
 
-	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, log.NewNopLogger())
+	err := checkISOStorageForHA(context.Background(), deps, 100, haRegistrationFeatures(deps, cp, "pve01", nil), log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("require_shared_iso_for_ha is false: expected nil error (warn-only), got %v", err)
 	}

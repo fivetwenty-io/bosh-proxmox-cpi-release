@@ -14,13 +14,8 @@ import (
 
 // migrationSafetyWarnText is the leading fragment of the one Warn these tests
 // are about (see checkISOStorageForHA). Both tests match on it rather than on
-// buffer emptiness: checkISOStorageForHA also drives the once-per-process
-// HA-vs-resurrector Warn (haResurrectorWarnOnce), so whichever test in the
-// binary reaches that once FIRST captures an extra, unrelated line in its
-// buffer. A length check therefore passes or fails on test ordering — it is
-// why these two tests failed under -shuffle and in isolation. Matching the
-// message keeps them order-independent without mutating process-wide state
-// from a parallel test.
+// buffer emptiness, so a later line the check gains can't make them depend on
+// test order.
 const migrationSafetyWarnText = "live migration and HA recovery of this VM will fail"
 
 func countMigrationSafetyWarns(logged string) int {
@@ -43,7 +38,7 @@ func TestCheckISOStorageForHA_ConfigDriftBacking_TreatedAsShared(t *testing.T) {
 	cp := createVMCloudProps{}
 
 	var buf bytes.Buffer
-	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, capturingLogger(t, &buf))
+	err := checkISOStorageForHA(context.Background(), deps, 100, haRegistrationFeatures(deps, cp, "pve01", nil), capturingLogger(t, &buf))
 	if err != nil {
 		t.Fatalf("iso-b shares iso-a's backing and iso-a is shared: expected nil error, got %v", err)
 	}
@@ -67,7 +62,7 @@ func TestCheckISOStorageForHA_DistinctBacking_StillWarns(t *testing.T) {
 	cp := createVMCloudProps{}
 
 	var buf bytes.Buffer
-	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, capturingLogger(t, &buf))
+	err := checkISOStorageForHA(context.Background(), deps, 100, haRegistrationFeatures(deps, cp, "pve01", nil), capturingLogger(t, &buf))
 	if err != nil {
 		t.Fatalf("require_shared_iso_for_ha is false: expected nil error (warn-only), got %v", err)
 	}

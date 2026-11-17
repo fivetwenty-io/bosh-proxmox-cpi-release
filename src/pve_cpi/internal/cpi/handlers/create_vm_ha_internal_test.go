@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"slices"
@@ -687,6 +688,75 @@ func TestCompleteCreatedVM_WithoutHAWritesNoTag(t *testing.T) {
 	if len(writes) != 0 || r.started != 0 || shape.node != "pve01" {
 		t.Errorf("writes %v starts %d node %q; a VM without HA was started before and gets no tag", writes,
 			r.started, shape.node)
+	}
+}
+
+// haOwnershipLine is a fragment of the once-per-process line create_vm logs
+// when it has registered a VM as a PVE HA resource.
+const haOwnershipLine = "registered as a PVE HA resource"
+
+// The ownership line tests below share the process-wide gate, so they reset
+// it and never run in parallel. The rig enables pin_az for the VM's AZ, so the
+// configuration names a registration feature in every case, and only the
+// decision's outcome tells them apart.
+
+func TestCompleteCreatedVM_VMKeptOutOfHALogsNoOwnershipLine(t *testing.T) {
+	resetHAResurrectorWarnOnce(t)
+	r := newStagingRig(t, config.HAModeAuto, true)
+	tags, writes := "bosh-cpi", []string{}
+	r.deps.PVE = taggedVMClient(r.rules, &tags, &writes)
+	if len(haRegistrationFeatures(r.deps, r.parsed.cloudProps, "pve01", r.parsed.env)) == 0 {
+		t.Fatal("the rig must enable a registration feature, or the test proves nothing")
+	}
+	var buf bytes.Buffer
+	shape := &createVMShape{node: "pve01"}
+	if err := completeCreatedVM(crhCtx(), r.deps, infoLogger(t, &buf), r.parsed, shape, 100, nil, r.start); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(buf.String(), haOwnershipLine) {
+		t.Fatalf("a VM the decision keeps out of HA must not be called registered, got %q", buf.String())
+	}
+}
+
+func TestCompleteCreatedVM_VMThatRunsWithoutHALogsNoOwnershipLine(t *testing.T) {
+	resetHAResurrectorWarnOnce(t)
+	r := newStagingRig(t, config.HAModeAuto, true)
+	tags, writes := "bosh-cpi", []string{}
+	r.deps.PVE = taggedVMClient(r.rules, &tags, &writes)
+	r.foreignPin()
+	r.stage(t)
+	var buf bytes.Buffer
+	shape := &createVMShape{node: "pve01"}
+	if err := completeCreatedVM(crhCtx(), r.deps, infoLogger(t, &buf), r.parsed, shape, 100, r.h, r.start); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.h.haActivated() || r.started != 1 {
+		t.Fatalf("activated %v direct starts %d; the refused pin must run the VM without HA", r.h.haActivated(), r.started)
+	}
+	if strings.Contains(buf.String(), haOwnershipLine) {
+		t.Fatalf("a VM whose staged resource was removed must not be called registered, got %q", buf.String())
+	}
+}
+
+func TestCompleteCreatedVM_RegisteredVMLogsOwnershipLine(t *testing.T) {
+	resetHAResurrectorWarnOnce(t)
+	r := newStagingRig(t, config.HAModeAuto, true)
+	tags, writes := "bosh-cpi", []string{}
+	r.deps.PVE = taggedVMClient(r.rules, &tags, &writes)
+	r.stage(t)
+	var buf bytes.Buffer
+	shape := &createVMShape{node: "pve01"}
+	if err := completeCreatedVM(crhCtx(), r.deps, infoLogger(t, &buf), r.parsed, shape, 100, r.h, r.start); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !r.h.haActivated() {
+		t.Fatal("the rig must register the VM, or the test proves nothing")
+	}
+	if got := strings.Count(buf.String(), haOwnershipLine); got != 1 {
+		t.Fatalf("a registered VM must log the ownership line once, got %d in %q", got, buf.String())
+	}
+	if !strings.Contains(buf.String(), string(haFeatureAZPin)) {
+		t.Errorf("the line must name the feature the configuration enables, got %q", buf.String())
 	}
 }
 
