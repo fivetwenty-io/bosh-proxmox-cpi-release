@@ -192,7 +192,7 @@ func TestEnsureAntiAffinity_CreateAfterARepairLeavesTheRuleRight(t *testing.T) {
 			pin := seedStrictPin(stub, 103, "pve1")
 			pinOutWhileInRule(stub, pin, aaRule, "vm:103")
 			deps := aaModeDeps(stub, mode, "", "pve1", "pve2", "pve3", "pve4")
-			logger, _ := log.NewObservedLogger(log.LevelDebug)
+			logger, observed := log.NewObservedLogger(log.LevelDebug)
 			placedIn, err := ensureAntiAffinityMembershipFor(context.Background(), deps, aaIdent("web"), 104, nil,
 				logger)
 			if err != nil {
@@ -207,7 +207,26 @@ func TestEnsureAntiAffinity_CreateAfterARepairLeavesTheRuleRight(t *testing.T) {
 			if errs := stub.ruleErrors(pin); len(errs) > 0 {
 				t.Fatalf("pin %s is out of effect: %v", pin, errs)
 			}
+			requireHeldOutWarnOnce(t, observed, "vm:103", pin)
 		})
+	}
+}
+
+// requireHeldOutWarnOnce fails the test unless the create warned exactly once
+// that a repair of pin held sid out of the group's rule.
+func requireHeldOutWarnOnce(t *testing.T, observed *log.Observer, sid, pin string) {
+	t.Helper()
+	n := 0
+	for _, e := range observed.All() {
+		if strings.Contains(e.Message, "because PVE put its strict pin out of effect") && e.Attrs["sid"] == sid {
+			if e.Level != log.LevelWarn || e.Attrs["pin"] != pin {
+				t.Fatalf("held-out line = %v at %v; want Warn naming pin %s", e.Attrs, e.Level, pin)
+			}
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("warned %d times that %s was held out; want once", n, sid)
 	}
 }
 
@@ -230,7 +249,7 @@ func TestEnsureAntiAffinity_LockedCreateAfterARepairLeavesTheRuleRight(t *testin
 			deps := aaModeDeps(stub, mode, "", "pve1", "pve2", "pve3", "pve4")
 			deps.Config.ClusterLock = "pool"
 			deps.PVE.(*icPVEClient).poolsSvc = newAALockPools(nil)
-			logger, _ := log.NewObservedLogger(log.LevelDebug)
+			logger, observed := log.NewObservedLogger(log.LevelDebug)
 			placedIn, err := ensureAntiAffinityMembershipFor(context.Background(), deps, aaIdent("web"), 104, nil,
 				logger)
 			if err != nil {
@@ -245,6 +264,7 @@ func TestEnsureAntiAffinity_LockedCreateAfterARepairLeavesTheRuleRight(t *testin
 			if errs := stub.ruleErrors(pin); len(errs) > 0 {
 				t.Fatalf("pin %s is out of effect: %v", pin, errs)
 			}
+			requireHeldOutWarnOnce(t, observed, "vm:103", pin)
 		})
 	}
 }

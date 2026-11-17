@@ -352,10 +352,7 @@ func applyCreatePlan(
 			holdOut[s] = true
 		}
 		planner.holdOut = holdOut
-		logger.Info("anti-affinity: a pin repair took siblings out of this create's write to keep their pins in "+
-			"effect, so the create plans its group's rules again without them",
-			log.String("rule", planner.ident.ruleName()), log.String("sid", planner.sid),
-			log.String("held_out", strings.Join(siblings, ",")))
+		planner.logHeldOut(siblings)
 	}
 }
 
@@ -929,6 +926,32 @@ func (p *aaPlanner) logConflicted(sid, rule string, bad map[string][]string) {
 		"adds it once the conflict is gone",
 		log.String("sid", sid), log.String("rule", rule),
 		log.String("conflicting", strings.Join(slices.Sorted(maps.Keys(bad)), ",")), log.String("joining", p.sid))
+}
+
+// logHeldOut says once per member, at Warn, that a pin repair took it out of
+// this create's write and that the create plans the group's rules again
+// without it. The member is then in no rule of the group, and under the
+// rules lock no heal follows to tell the operator, so the line names the pin
+// that PVE put out of effect.
+func (p *aaPlanner) logHeldOut(siblings []string) {
+	for _, sid := range siblings {
+		if p.conflicted[sid] {
+			continue
+		}
+		if p.conflicted == nil {
+			p.conflicted = map[string]bool{}
+		}
+		p.conflicted[sid] = true
+		pin := ""
+		if vmid, ok := vmidFromSid(sid); ok {
+			pin = naRuleNameFor(vmid)
+		}
+		p.logger.Warn("anti-affinity: member left out of the group's rule, because PVE put its strict pin out "+
+			"of effect when this create added it and a repair took it back out; a later write of the group adds "+
+			"it once its pin goes away or allows more nodes",
+			log.String("sid", sid), log.String("rule", p.ident.ruleName()), log.String("pin", pin),
+			log.String("joining", p.sid))
+	}
 }
 
 // chunkOps returns the writes that make the group's rules hold desired, led by
