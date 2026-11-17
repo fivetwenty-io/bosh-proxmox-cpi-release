@@ -694,27 +694,9 @@ func deriveDiskFaultConstraints(ctx context.Context, deps Deps, diskCIDs []strin
 		}
 
 		// Determine backend kind for this disk's pool.
-		pool := meta.Pool
-		if pool == "" {
-			// Pool absent from meta but node/AZ may still be set (e.g. CID
-			// written by an older CPI version that set Node/AZ without Pool).
-			// Derive the pool from the bare CID so the node/AZ constraint is
-			// not silently dropped. Fail closed: if ParseDiskCID cannot extract
-			// a storage prefix, skip with no constraint (cannot classify).
-			if meta.Node == "" && meta.AZ == "" {
-				// Truly empty meta — legacy upgrade path, no constraint.
-				continue
-			}
-			bareCID, _, parseErr := pve.ParseEncodedDiskCID(cid)
-			if parseErr != nil {
-				continue
-			}
-			derivedPool, _, parseErr := pve.ParseDiskCID(bareCID)
-			if parseErr != nil {
-				// Bare CID malformed; cannot classify. Skip — fail closed.
-				continue
-			}
-			pool = derivedPool
+		pool, ok := faultDomainDiskPool(cid, meta)
+		if !ok {
+			continue
 		}
 
 		backend, resolveErr := resolver.Resolve(ctx, pool)
@@ -731,14 +713,12 @@ func deriveDiskFaultConstraints(ctx context.Context, deps Deps, diskCIDs []strin
 			if node != "" {
 				localNodes[node] = struct{}{}
 			}
-		} else {
+		} else if meta.AZ != "" {
 			// Shared backend: AZ constraint only.
-			if meta.AZ != "" {
-				if c.requiredAZs == nil {
-					c.requiredAZs = make(map[string]struct{})
-				}
-				c.requiredAZs[meta.AZ] = struct{}{}
+			if c.requiredAZs == nil {
+				c.requiredAZs = make(map[string]struct{})
 			}
+			c.requiredAZs[meta.AZ] = struct{}{}
 		}
 	}
 
@@ -763,6 +743,33 @@ func deriveDiskFaultConstraints(ctx context.Context, deps Deps, diskCIDs []strin
 	}
 
 	return c, nil
+}
+
+// faultDomainDiskPool names the pool of a disk whose CID carries metadata.
+// The bool is false when the disk imposes no constraint.
+func faultDomainDiskPool(cid string, meta *pve.DiskCIDMeta) (string, bool) {
+	if meta.Pool != "" {
+		return meta.Pool, true
+	}
+	// Pool absent from meta but node/AZ may still be set (e.g. CID
+	// written by an older CPI version that set Node/AZ without Pool).
+	// Derive the pool from the bare CID so the node/AZ constraint is
+	// not silently dropped. Fail closed: if ParseDiskCID cannot extract
+	// a storage prefix, skip with no constraint (cannot classify).
+	if meta.Node == "" && meta.AZ == "" {
+		// Truly empty meta — legacy upgrade path, no constraint.
+		return "", false
+	}
+	bareCID, _, err := pve.ParseEncodedDiskCID(cid)
+	if err != nil {
+		return "", false
+	}
+	pool, _, err := pve.ParseDiskCID(bareCID)
+	if err != nil {
+		// Bare CID malformed; cannot classify. Skip — fail closed.
+		return "", false
+	}
+	return pool, true
 }
 
 // placementLocalDiskNode names the node a persistent disk on node-local
