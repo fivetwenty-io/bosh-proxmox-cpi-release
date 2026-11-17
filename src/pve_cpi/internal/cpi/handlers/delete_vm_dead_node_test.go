@@ -85,6 +85,8 @@ type deadNodeCluster struct {
 	// read 3.
 	onRulesRead func(n int)
 	rulesReads  int
+	// onRuleDelete runs before every rule delete with the rule's name.
+	onRuleDelete func(rule string)
 }
 
 var errLostAnswer = errors.New("500 Internal Server Error: proxy loop timed out (HTTP500)")
@@ -117,6 +119,16 @@ func (c *deadNodeCluster) UpdateHaRules(ctx context.Context, rule string, params
 		return errLostAnswer
 	}
 	return nil
+}
+
+func (c *deadNodeCluster) DeleteHaRules(ctx context.Context, rule string) error {
+	c.mu.Lock()
+	hook := c.onRuleDelete
+	c.mu.Unlock()
+	if hook != nil {
+		hook(rule)
+	}
+	return c.HASceneCluster.DeleteHaRules(ctx, rule)
 }
 
 func (c *deadNodeCluster) UpdateHaResources(
@@ -533,6 +545,64 @@ func TestDeadNodeDelete_FullAntiAffinityGroup(t *testing.T) {
 	pin := eventIndex(ev, "UpdateHaRules:bosh-na-101=vm:101")
 	if release == -1 || pin == -1 || release > pin {
 		t.Fatalf("want the anti-affinity release and then the pin; events: %v", ev)
+	}
+}
+
+// TestDeadNodeDelete_ReleaseHealsTheGroupItsDeleteRacedWith drives the whole
+// dead-node delete with a group rule the heal can find, under the hashed name
+// and marker, and with group and owner tags the scan reads from the index. The
+// release reads the rule with vm:102 besides the fenced vm:101 and deletes it,
+// and a sibling, vm:103, writes itself into the rule between that read and the
+// delete. The heal after the rule edits must write vm:102 and vm:103 back, and
+// vm:101 must never come back into any rule.
+func TestDeadNodeDelete_ReleaseHealsTheGroupItsDeleteRacedWith(t *testing.T) {
+	f := newDeadNodeDelete(t)
+	rule, marker := handlers.GroupRuleForTest(deadNodeOwner, "dep", "web")
+	f.scene.Do(func(s *handlers.HADeleteScene) { s.IndexTags = rule + ";bosh-owner--" + deadNodeOwner })
+	f.scene.Manage(102, "pve-node1", "started", "started")
+	f.scene.Manage(103, "pve-node3", "started", "started")
+	f.scene.Rules[rule] = map[string]any{
+		"type": "resource-affinity", "affinity": "negative", "resources": "vm:101,vm:102", "comment": marker,
+	}
+	var raced atomic.Bool
+	f.cluster.onRuleDelete = func(name string) {
+		if name != rule || !raced.CompareAndSwap(false, true) {
+			return
+		}
+		f.scene.Do(func(s *handlers.HADeleteScene) { s.Rules[rule]["resources"] = "vm:101,vm:102,vm:103" })
+	}
+	if err := f.run(); err != nil {
+		t.Fatalf("the delete must complete: %v", err)
+	}
+	if !raced.Load() {
+		t.Fatalf("the release deleted no rule, so the race never ran; events: %v", f.events())
+	}
+	f.requireCompletedOn("pve-node1")
+	var got any
+	f.scene.Do(func(s *handlers.HADeleteScene) {
+		if r, ok := s.Rules[rule]; ok {
+			got = r["resources"]
+		}
+		for name, r := range s.Rules {
+			if res, _ := r["resources"].(string); strings.HasPrefix(name, "bosh-aa-") &&
+				slices.Contains(strings.Split(res, ","), "vm:101") {
+				t.Errorf("rule %s holds the fenced vm:101 at the end: %q", name, res)
+			}
+		}
+	})
+	if got != "vm:102,vm:103" {
+		t.Fatalf("rule after the heal = %v; want vm:102 and the sibling, without vm:101; events: %v", got, f.events())
+	}
+	ev := f.events()
+	release := eventIndex(ev, "DeleteHaRules:"+rule)
+	if release == -1 {
+		t.Fatalf("want the release to delete the rule; events: %v", ev)
+	}
+	for _, e := range ev[release+1:] {
+		if (strings.HasPrefix(e, "CreateHaRules:bosh-aa-") || strings.HasPrefix(e, "UpdateHaRules:bosh-aa-")) &&
+			strings.Contains(e, "vm:101") {
+			t.Fatalf("a write after the release put vm:101 back into a rule (%s); events: %v", e, ev)
+		}
 	}
 }
 

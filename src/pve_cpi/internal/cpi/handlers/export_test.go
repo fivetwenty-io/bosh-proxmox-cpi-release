@@ -57,6 +57,15 @@ func HAOwnerMarkerForTest(owner string) string {
 	return haIdentity{Owner: owner}.marker()
 }
 
+// GroupRuleForTest returns the hashed anti-affinity rule name and the rule
+// comment marker of the instance group group in deployment, owned by the
+// Director with the given UUID, for handlers_test package tests that seed a
+// group's rule the heal can find. Test-only.
+func GroupRuleForTest(owner, deployment, group string) (rule, marker string) {
+	id := haIdentity{Owner: owner, Deployment: deployment, Group: group}
+	return id.ruleName(), id.marker()
+}
+
 // SpreadClaimKey re-exports the group name the create of a VM with env claims
 // its node under, for handlers_test package tests that read the claim record.
 // Test-only.
