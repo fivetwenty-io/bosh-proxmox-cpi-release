@@ -211,7 +211,7 @@ write one. That gap is why `disk-audit` classifies free-floating volumes separat
    its name. The provenance entry carries the disk CID but no
    `source_vm_cid` (the disk was never attached to a VM).
 4. The park's holder scan reads the guests of every node the quorate cluster reports online and leaves out a node the cluster reports offline. For any other disk, a scan that finds no holder after it left a node out refuses, because a guest on that node might still hold the disk. A volume that `create_disk` made a moment earlier can't be held by any guest, so the create step hands the park a record of the volume it created. For that volume alone, the park goes ahead and logs the offline nodes it skipped, so a node that is down no longer blocks new persistent disks anywhere in the cluster. A config read that fails on a node the cluster still reports online fails the park as it always has.
-5. Park failure is fail-closed: `create_disk` returns the error, unparks
+5. Park failure is fail-closed, so `create_disk` returns the error, unparks
    best-effort in case the park half-committed, deletes the volume, and the
    Director's retry re-creates from scratch.
 
