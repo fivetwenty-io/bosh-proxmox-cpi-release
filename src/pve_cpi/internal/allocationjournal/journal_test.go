@@ -1080,3 +1080,46 @@ func TestReturnedRecordGoesStraightToObservedOnlyWithFreshEvidence(t *testing.T)
 		})
 	}
 }
+
+// TestSaveKeepsUpdatedAtAfterCreatedAtWhenClockStepsBack steps the wall clock
+// back before each save. The record still reads back as valid evidence, and
+// its UpdatedAt never moves before its CreatedAt or its previous UpdatedAt.
+func TestSaveKeepsUpdatedAtAfterCreatedAtWhenClockStepsBack(t *testing.T) {
+	start := time.Date(2026, 11, 17, 5, 0, 0, 0, time.UTC)
+	now := start
+	clockNow = func() time.Time { return now }
+	t.Cleanup(func() { clockNow = time.Now })
+
+	j, _ := fixture(t)
+	h := acquireVM(t, j)
+	defer closeHandle(t, h)
+	created := h.Record().CreatedAt
+
+	now = start.Add(-time.Minute)
+	r := h.Record()
+	r.Steps = []Step{step()}
+	save(t, h, r)
+	if got := h.Record().UpdatedAt; got.Before(created) {
+		t.Fatalf("UpdatedAt %s is before CreatedAt %s", got, created)
+	}
+
+	now = start.Add(time.Minute)
+	r = h.Record()
+	r.State = Submitted
+	r.Steps[0].State = Submitted
+	r.Steps[0].UPID = "UPID:node-a:clone"
+	save(t, h, r)
+	high := h.Record().UpdatedAt
+
+	now = start
+	r = h.Record()
+	r.Steps[0].State = Observed
+	r.State = Observed
+	save(t, h, r)
+	if got := h.Record().UpdatedAt; got.Before(high) {
+		t.Fatalf("UpdatedAt %s moved back from %s", got, high)
+	}
+	if _, err := j.Inspect(h.Record().ID); err != nil {
+		t.Fatalf("record read back invalid: %v", err)
+	}
+}

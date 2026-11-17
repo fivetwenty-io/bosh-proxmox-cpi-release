@@ -363,7 +363,7 @@ func (j *Journal) newRecord(id, kind, agentID string, intent Intent) (Record, er
 	if err := validateIntent(intent); err != nil {
 		return Record{}, err
 	}
-	now := time.Now().UTC()
+	now := clockNow().UTC()
 	r := Record{Version: Version, ID: id, Namespace: j.auth.Namespace, ClusterID: j.auth.Enrollment.ClusterID, AuthorityEpoch: j.auth.Epoch, Kind: kind, AgentID: agentID, Intent: intent, State: Planned, CreatedAt: now, UpdatedAt: now}
 	if kind == "disk" {
 		token, err := DiskCorrelationToken(id)
@@ -667,6 +667,24 @@ const (
 	saveReplicationTransition
 )
 
+// clockNow reads the wall clock. Tests replace it to step the clock backward.
+var clockNow = time.Now
+
+// nextUpdatedAt returns the UpdatedAt a save stamps on the record. It is the
+// wall clock, held at or after the record's last UpdatedAt and its CreatedAt.
+// A wall clock that steps backward between two saves would otherwise stamp an
+// UpdatedAt before CreatedAt, which validateRecord rejects as corrupt, and the
+// record would read back as invalid evidence although nothing was lost.
+func nextUpdatedAt(prev Record) time.Time {
+	at := clockNow().UTC()
+	for _, floor := range []time.Time{prev.CreatedAt, prev.UpdatedAt} {
+		if at.Before(floor) {
+			at = floor
+		}
+	}
+	return at
+}
+
 func (h *Handle) saveLocked(next Record, kind saveKind) error {
 	if h.closed {
 		return ErrClosed
@@ -707,7 +725,7 @@ func (h *Handle) saveLocked(next Record, kind saveKind) error {
 	if terminal(h.record.State) {
 		return nil
 	}
-	next.UpdatedAt = time.Now().UTC()
+	next.UpdatedAt = nextUpdatedAt(h.record)
 	if h.saveFault != nil {
 		if err := h.saveFault(cloneRecord(next)); err != nil {
 			h.poisoned = true
