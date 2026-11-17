@@ -520,9 +520,11 @@ func TestManagedAttachRebuildsTheReplicaOfAVMUnderHA(t *testing.T) {
 	store.resComments["vm:777"] = marker
 	store.states["vm:777"] = "started"
 	// The CRM runs the VM on n1 and acts on no request for it, so the VM is
-	// settled there when the rebuild removes its job.
+	// settled there when the rebuild removes its job. Its last round and the
+	// LRM's report after it are always newer than the entry node's clock at the
+	// read before, so the rebuild sees a round after its pin at once.
 	store.manager = func() *cluster.ListHaStatusManagerStatusResponse {
-		return HAFreshManagerStatus(time.Now().Unix(), "n1", []string{"n2"},
+		return HAFreshManagerStatus(time.Now().Unix()+6, "n1", []string{"n2"},
 			map[string]HASceneService{"vm:777": {State: "started", Node: "n1", UID: "u1"}})
 	}
 	comment := ha.WithReplicaPartner(ha.WithReplicaChanged(ha.WithVolumeRecord(marker, nil),

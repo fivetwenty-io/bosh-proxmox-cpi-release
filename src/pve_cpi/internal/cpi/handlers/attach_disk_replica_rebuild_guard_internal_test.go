@@ -191,13 +191,38 @@ func TestAttachReplicaRebuildMarksOnlyARemovedJob(t *testing.T) {
 // holds the VM's HA service in the state the test sets.
 type haMotionCluster struct {
 	taggedIndexStub
-	manager *cluster.ListHaStatusManagerStatusResponse
+	manager func() *cluster.ListHaStatusManagerStatusResponse
 }
 
 func (c haMotionCluster) ListHaStatusManagerStatus(context.Context) (*cluster.ListHaStatusManagerStatusResponse,
 	error,
 ) {
-	return c.manager, nil
+	return c.manager(), nil
+}
+
+// haMotionRig is the rebuild rig with VM 100 under PVE HA, whose CRM reports
+// the VM in state on pve01 with the manager status manager builds from the
+// current time.
+func haMotionRig(state string, manager func(now int64, services map[string]HASceneService,
+) *cluster.ListHaStatusManagerStatusResponse) *replicaRig {
+	r := newRebuildRig()
+	r.stub.resources["vm:100"] = true
+	client := r.deps.PVE.(*attachRunClient)
+	services := map[string]HASceneService{"vm:100": {State: state, Node: "pve01", UID: "u1"}}
+	r.deps.PVE = haMotionClient{attachRunClient: client, cluster: haMotionCluster{
+		taggedIndexStub: client.cluster.(taggedIndexStub),
+		manager: func() *cluster.ListHaStatusManagerStatusResponse {
+			return manager(time.Now().Unix(), services)
+		},
+	}}
+	return r
+}
+
+// runningCRM is the manager status of a CRM that runs a round every few
+// seconds: its last round and the LRM's report after it are newer than the
+// entry node's clock at the read before.
+func runningCRM(now int64, services map[string]HASceneService) *cluster.ListHaStatusManagerStatusResponse {
+	return HAFreshManagerStatus(now+6, "pve01", []string{"pve02", "pve03"}, services)
 }
 
 // haMotionClient serves haMotionCluster and a node clock, so the CRM view
@@ -219,13 +244,7 @@ func (c haMotionClient) Nodes() sdknodes.Service {
 func TestPrepareAttachReplicaRebuild_WaitsForAnHAMove(t *testing.T) {
 	for _, state := range []string{"migrate", "relocate", "started"} {
 		t.Run(state, func(t *testing.T) {
-			r := newRebuildRig()
-			r.stub.resources["vm:100"] = true
-			client := r.deps.PVE.(*attachRunClient)
-			manager := HAFreshManagerStatus(time.Now().Unix(), "pve01", []string{"pve02", "pve03"},
-				map[string]HASceneService{"vm:100": {State: state, Node: "pve01", UID: "u1"}})
-			r.deps.PVE = haMotionClient{attachRunClient: client,
-				cluster: haMotionCluster{taggedIndexStub: client.cluster.(taggedIndexStub), manager: manager}}
+			r := haMotionRig(state, runningCRM)
 			rb, err := prepareAttachReplicaRebuild(crhCtx(), r.deps, "100", parkedNFSDisk())
 			if state == "started" {
 				if err != nil || rb == nil || !rb.removed || !r.repl.called("delete:100-0:force=false") {
@@ -239,6 +258,52 @@ func TestPrepareAttachReplicaRebuild_WaitsForAnHAMove(t *testing.T) {
 			}
 			if r.repl.called("delete:") || len(r.repl.jobs) != 1 {
 				t.Fatalf("calls %v jobs %v; the job stays while PVE HA moves the VM", r.repl.calls, r.repl.jobs)
+			}
+		})
+	}
+}
+
+// TestPrepareAttachReplicaRebuild_WaitsForACRMRoundAfterThePin is a rebuild
+// of a VM under PVE HA whose CRM has run no round since the narrowed pin
+// landed, or whose LRM has not reported since that round. A round that was
+// running when the pin landed may have started a migration under the wider
+// pin that no task or HA state shows yet, so the job stays and the attach is
+// retriable, with the narrowed pin and its token in place.
+func TestPrepareAttachReplicaRebuild_WaitsForACRMRoundAfterThePin(t *testing.T) {
+	defer SetHADeleteMotionPollForTest(10 * time.Millisecond)()
+	for name, tc := range map[string]struct {
+		manager func(int64, map[string]HASceneService) *cluster.ListHaStatusManagerStatusResponse
+		reason  string
+	}{
+		"no CRM round": {
+			manager: func(now int64, services map[string]HASceneService) *cluster.ListHaStatusManagerStatusResponse {
+				return HAFreshManagerStatus(now, "pve01", []string{"pve02", "pve03"}, services)
+			},
+			reason: "no CRM round has run since the narrowed pin",
+		},
+		"no LRM report after the round": {
+			manager: func(now int64, services map[string]HASceneService) *cluster.ListHaStatusManagerStatusResponse {
+				scene := &HADeleteScene{Now: now + 6, Members: []string{"pve01", "pve02", "pve03"}, CRMAge: 5,
+					LRMAge: map[string]int64{"pve01": 6, "pve02": 6, "pve03": 6}, Services: services}
+				return scene.managerBody()
+			},
+			reason: "has not reported since the CRM round after the narrowed pin",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := haMotionRig("started", tc.manager)
+			wait := 1
+			r.deps.Config.HA.MotionWaitSec = &wait
+			rb, err := prepareAttachReplicaRebuild(crhCtx(), r.deps, "100", parkedNFSDisk())
+			if rb != nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) ||
+				!strings.Contains(err.Error(), "may be migrating") || !strings.Contains(err.Error(), tc.reason) {
+				t.Fatalf("rebuild %+v err %v, want the retriable deferral for %q", rb, err, tc.reason)
+			}
+			if r.repl.called("delete:") || len(r.repl.jobs) != 1 {
+				t.Fatalf("calls %v jobs %v; the job stays until a CRM round after the pin", r.repl.calls, r.repl.jobs)
+			}
+			if p, ok := ha.ReplicaRebuild(r.pinComment()); !ok || p != "pve02" || r.pinNodes() != "pve01" {
+				t.Fatalf("pin %q nodes %q, want the narrowed pin with its token", r.pinComment(), r.pinNodes())
 			}
 		})
 	}

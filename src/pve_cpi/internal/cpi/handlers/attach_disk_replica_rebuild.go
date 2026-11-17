@@ -327,9 +327,13 @@ var errLeaveRetiresReplica = errors.New(replicaRebuildOp + ": the VM leaves HA, 
 // VM's job with cleanup, recorded in the VM's journal record first. The
 // narrowing comes first, so PVE HA never moves the VM to the partner whose
 // copy the removal deletes. A migration that started before the narrowing
-// can still be moving the VM onto that copy, so the removal waits until the
-// VM is settled on node (see replicaRebuildSettled). A VM that is not
-// settled makes the attach retriable with the job in place. A job PVE has
+// can still be moving the VM onto that copy, and a CRM round that was running
+// when the pin landed can start one. So the removal needs the VM settled on
+// node (see replicaRebuildSettled), then a CRM round after the pin (see
+// awaitReplicaPinRound), and then the VM settled on node again, which shows a
+// migration that round started. The first check turns a VM that is already
+// moving away at once. A VM that is not settled, or a round that doesn't
+// come, makes the attach retriable with the job in place. A job PVE has
 // marked for removal already is only waited on. The removal is never forced,
 // so a partner that cannot clean up makes the attach retriable. Either way the
 // pin keeps the token, so the retry, or a call that touches the VM, finds the
@@ -353,6 +357,12 @@ func (rb *attachReplicaRebuild) retire(ctx context.Context, deps Deps, node stri
 	if err := replicaRebuildSettled(ctx, deps, rb.vmid, node); err != nil {
 		return err
 	}
+	if err := awaitReplicaPinRound(ctx, deps, rb.vmid, node); err != nil {
+		return err
+	}
+	if err := replicaRebuildSettled(ctx, deps, rb.vmid, node); err != nil {
+		return err
+	}
 	logger.Warn(op + ": the VM's replication job is removed so that the disk can enter by reassignment, which PVE " +
 		"refuses into a replicated VM; the job is set up again to the same partner after the attach, and the next " +
 		"sync copies the VM in full")
@@ -370,6 +380,75 @@ func (rb *attachReplicaRebuild) retire(ctx context.Context, deps Deps, node stri
 	return nil
 }
 
+// replicaRebuildDeferred is the retriable error of a rebuild whose job stays
+// because VM vmid may be migrating off node, for reason.
+func replicaRebuildDeferred(vmid int, node, reason string) error {
+	return cpierrors.Retriable("%s: VM %d may be migrating off node %s (%s); its replication job stays "+
+		"until the VM is settled, and the attach can be retried", replicaRebuildOp, vmid, node, reason)
+}
+
+// awaitReplicaPinRound waits, after the rebuild wrote the VM's narrowed pin,
+// until the CRM has run a round that began after the pin landed and the LRM
+// of the VM's node has reported after that round. A round that was already
+// running when the pin landed may have started a migration under the wider
+// pin from a queued migrate request or from load balancing, and its task or
+// its HA state may not show yet. Once a later round and the LRM's report after
+// it are in, replicaRebuildSettled sees such a migration. The pin's landing is
+// the entry node's clock at the first HA read after the write, the way the
+// narrowing barrier measures its request. A VM that PVE HA doesn't manage
+// needs no round. A read that fails, a state that isn't known, or a round that
+// doesn't come within pve.ha.motion_wait_sec defers the rebuild with the job
+// in place.
+func awaitReplicaPinRound(ctx context.Context, deps Deps, vmid int, node string) error {
+	deadline := time.Now().Add(haMotionWait(deps))
+	var landed, round int64
+	for {
+		st, err := pve.ReadHAServiceState(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), pve.HAServiceStateInput{
+			VMID: vmid, VMNode: node, Kind: pve.HADecisionLive,
+		})
+		var why string
+		switch {
+		case err != nil:
+			why = "its HA state could not be read: " + err.Error()
+		case st == nil || !st.Known:
+			why = "its HA state is unknown"
+			if st != nil && st.Reason != "" {
+				why += ": " + st.Reason
+			}
+		case !st.Managed():
+			return nil
+		case landed == 0 && st.EntryTime == 0:
+			why = "the entry node's clock could not be read with the HA state"
+		case landed == 0:
+			// This read is the first after the pin landed, so its clock marks
+			// the landing, and the next read looks for a later round at once.
+			landed = st.EntryTime
+			continue
+		case st.CRMStamp <= landed:
+			why = "no CRM round has run since the narrowed pin"
+		default:
+			if round == 0 {
+				round = st.CRMStamp
+			}
+			if st.LRMStamp > round {
+				return nil
+			}
+			why = fmt.Sprintf("the LRM of node %s has not reported since the CRM round after the narrowed pin",
+				st.Node)
+		}
+		if !time.Now().Before(deadline) {
+			return replicaRebuildDeferred(vmid, node, why)
+		}
+		timer := time.NewTimer(haDeleteMotionPoll())
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return replicaRebuildDeferred(vmid, node, why+"; "+ctx.Err().Error())
+		case <-timer.C:
+		}
+	}
+}
+
 // replicaRebuildSettled returns nil when the VM vmid is settled on node, so
 // that the removal of its job with cleanup cannot delete the copy a migration
 // is moving it onto. The VM must still be on node, hold no config lock, such
@@ -379,11 +458,7 @@ func (rb *attachReplicaRebuild) retire(ctx context.Context, deps Deps, node stri
 // it ends. Anything else, and a read that fails, is retriable, and the job
 // stays.
 func replicaRebuildSettled(ctx context.Context, deps Deps, vmid int, node string) error {
-	const op = replicaRebuildOp
-	deferred := func(reason string) error {
-		return cpierrors.Retriable("%s: VM %d may be migrating off node %s (%s); its replication job stays "+
-			"until the VM is settled, and the attach can be retried", op, vmid, node, reason)
-	}
+	deferred := func(reason string) error { return replicaRebuildDeferred(vmid, node, reason) }
 	loc, err := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
 	switch {
 	case err != nil:
