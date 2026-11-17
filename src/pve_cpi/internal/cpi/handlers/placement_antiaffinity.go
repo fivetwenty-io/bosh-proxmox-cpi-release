@@ -1721,7 +1721,18 @@ func legacyMemberTags(ident haIdentity) []string {
 	if owner == "" || ident.Deployment == "" || ident.Group == "" {
 		return nil
 	}
-	return []string{"job--" + ident.Group, "deployment--" + ident.Deployment, owner}
+	return []string{legacyJobTag(ident.Group), legacyDeploymentTag(ident.Deployment), owner}
+}
+
+// legacyJobTag and legacyDeploymentTag spell the older job and deployment tags
+// the way PVE stores them, in lower case, as ownerTagFor spells the owner tag.
+// PVE cannot tell two names that differ only in case apart, so the legacy proof
+// cannot either. Every reader of these tags builds them here, so the rule scan
+// and the soft-spread scorer agree.
+func legacyJobTag(group string) string { return "job--" + strings.ToLower(group) }
+
+func legacyDeploymentTag(deployment string) string {
+	return "deployment--" + strings.ToLower(deployment)
 }
 
 // tagsContainAll reports whether the PVE tags field holds every tag in want.

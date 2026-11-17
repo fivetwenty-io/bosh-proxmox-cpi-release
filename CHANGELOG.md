@@ -20,6 +20,22 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Fixed
 
+- `pve-cid ha --cpi-config` no longer lets one cluster's unreachable node hide the same node name on another cluster. The run's node ledger used to name a cluster only by its member names, so two clusters whose nodes were all called `pve1`, `pve2`, and `pve3` shared one record, and the second was told that a healthy node was not asked. The ledger now keys a cluster by the stamp of its root CA, the identity the CPI already uses for its per-cluster records, and by a hash of the entry's endpoints when the stamp cannot be read. An entry with neither shares nothing.
+
+- `pve-cid ha` now judges an anti-affinity group only when at least one member sits inside the entry's own VMID band. Before, an entry that wrote anti-affinity rules reported `anti_affinity_short` as a problem on the groups of another entry in the same cluster that used soft spreading with the rules off, and the run exited with 1.
+
+- The `pvesr update` command that `pve-cid ha` prints for a replication comment that PVE encoded again now quotes the comment for a POSIX shell, so a comment that holds a single quote cannot run text when an operator pastes the command.
+
+- `pve-cid ha` now reads a replication job marker that repeats `owner` or `gen` as the CPI does, which is as no marker, and it compares the Director UUID with the marker's spelling of it when the UUID holds whitespace.
+
+- `pve-cid ha` now skips the check for volumes of a VM that no longer exists when the config of an owned VM could not be read, and it names the skip as `unchecked`. A volume that the unread config referenced could otherwise be reported as a leftover.
+
+- `pve-cid ha` now reports a `host` or `max` CPU VM that runs under HA with no enabled node-affinity pin as a problem when the cluster has several CPU migration domains, and its texts about `pve.cpu_type` now say that the change applies after `bosh recreate`. The `maintenance_stranded` finding now names a soft node-affinity pin whose highest priority class holds only the draining node as the reason the VM cannot leave.
+
+- The legacy anti-affinity scan and the soft-spread scorer now build the older `job--` and `deployment--` tags in lower case, as PVE stores them. Before, the scan compared without regard to case while the scorer compared exactly, so deployments that differ only in case could be merged into one rule while the scorer did not count their members.
+
+- A tag list that overflows the cap now drops the `index--` tag before the instance name tag, which the identity checks tie to the `job--` tag.
+
 - `delete_vm` now defers with the real reason when the cluster has lost quorum. It used to start the delete, and the cluster lock it takes failed with `create sentinel pool ... has an unknown outcome ... cfs-lock 'file-user_cfg' error: no quorum!`, so the error called the lock's outcome unknown when PVE had in fact refused it. The CPI now reads PVE's `no quorum!` answer to a lock create as a refusal, because PVE gives it before it takes the lock. `delete_vm` also reads the cluster's status once before it starts, and when the entry node doesn't report the cluster quorate it defers right away with the deferral that an unknown HA state gives, naming the lost quorum. A lock that PVE refuses for lack of quorum later in the delete gives the same deferral. The delete writes nothing in either case, and a retry after quorum returns proceeds. A status read that fails lets the delete carry on as before. [HA and Resurrection](docs/ha-and-resurrection.md#when-delete_vm-defers) and [Troubleshooting](docs/troubleshooting.md#cluster-not-quorate) describe it.
 
 - `create_vm` now fails right away when the cluster has lost quorum, and it gives the same error whether or not the request pins a node. With `target_node` set, it used to spend almost ten minutes retrying the guest lists of members that couldn't answer and then failed with a partial fleet error, and without it placement rejected every node as `node in maintenance`. The call now reads the cluster's status once, after it looks for a VM that an earlier attempt already built. When the entry node doesn't report the cluster quorate, it returns the retriable error `create_vm: the cluster has lost quorum (the entry node does not report the cluster quorate), so no node can receive a VM; retry once 'pvecm status' reports the cluster quorate`. A status read that fails lets the call carry on as before, so a healthy cluster pays one extra read per call.

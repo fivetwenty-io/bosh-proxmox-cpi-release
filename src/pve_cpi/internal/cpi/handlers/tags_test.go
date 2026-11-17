@@ -313,8 +313,8 @@ func TestBuildBoshManagedTags_PrefixTagAppendedLast(t *testing.T) {
 		"deployment--cf",
 		"instance-group--web",
 		"job--web",
-		"index--0",
 		"web--abc",
+		"index--0",
 		"vm-prefix--blue",
 	}
 	if !slices.Equal(got, want) {
@@ -517,5 +517,22 @@ func TestHasReplicaTag_IgnoresCase(t *testing.T) {
 	t.Parallel()
 	if !hasReplicaTag("bosh-cpi;Bosh-HA-Replica") {
 		t.Error("a differently cased replica tag should be found")
+	}
+}
+
+// TestBuildBoshManagedTags_OverflowDropsTheIndexBeforeTheNameTag: when the cap
+// forces one entry out, it is the index tag, and the instance name tag stays.
+func TestBuildBoshManagedTags_OverflowDropsTheIndexBeforeTheNameTag(t *testing.T) {
+	t.Parallel()
+	parts := buildBoshManagedTags(map[string]any{
+		"director": "d1", "deployment": "cf", "instance_group": "web", "job": "web", "index": "0", "name": "web/abc",
+	}, "blue")
+	withoutIndex := slices.DeleteFunc(slices.Clone(parts), func(p string) bool { return p == "index--0" })
+	merged, dropped := mergeTagListReporting(nil, parts, len(strings.Join(withoutIndex, ";")))
+	if !slices.Equal(dropped, []string{"index--0"}) {
+		t.Errorf("dropped = %v, want only index--0; merged %q", dropped, merged)
+	}
+	if !strings.Contains(merged, "web--abc") {
+		t.Errorf("the name tag must stay, got %q", merged)
 	}
 }

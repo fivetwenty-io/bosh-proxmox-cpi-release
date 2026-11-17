@@ -197,7 +197,7 @@ func TestLedgerReader_SharesGuestFailureWithoutQuorum(t *testing.T) {
 	if _, ok := findingWith(rep, "an earlier entry in this run already failed to list them"); !ok {
 		t.Fatalf("the second entry must report the shared failure, got %+v", rep.Findings)
 	}
-	if reason, ok := ledger.failure(haClusterKey(haNoQuorumProfile().Nodes), "n2"); !ok ||
+	if reason, ok := ledger.failure(haClusterKey("", haNoQuorumProfile().Nodes), "n2"); !ok ||
 		!strings.Contains(reason, pve.ReasonNotQuorate) {
 		t.Fatalf("n2 must be marked with the lost quorum, got %q", reason)
 	}
@@ -252,5 +252,65 @@ func TestRunHACPIConfig_SharesWhatOneEntryLearned(t *testing.T) {
 	}
 	if !strings.Contains(out, "an earlier entry in this run already failed to list them") {
 		t.Fatalf("the second entry must report the shared failure:\n%s", out)
+	}
+}
+
+// identifiedHA is a counting fake that also names its cluster, as the
+// production reader does.
+type identifiedHA struct {
+	*countingHA
+	identity string
+}
+
+func (i *identifiedHA) ClusterIdentity(context.Context, string) string { return i.identity }
+
+// TestLedgerReader_KeepsClustersWithSameMemberNamesApart: two clusters that
+// name their nodes alike do not share a node mark, while two readers that name
+// one cluster still do.
+func TestLedgerReader_KeepsClustersWithSameMemberNamesApart(t *testing.T) {
+	t.Parallel()
+	ledger := newHANodeLedger()
+	ctx := context.Background()
+
+	a := &identifiedHA{countingHA: newCountingHA(haBaseFake()), identity: "pve-root-ca:aaaaaaaa"}
+	a.volumesErr = map[string]error{"n2/local-zfs": lgUnreachable()}
+	ra := newLedgerHAReader(a, ledger)
+	if _, err := ra.Profile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ra.StorageVolumes(ctx, "n2", "local-zfs"); err == nil {
+		t.Fatal("the first read must fail as the fake says")
+	}
+
+	b := &identifiedHA{countingHA: newCountingHA(haBaseFake()), identity: "pve-root-ca:bbbbbbbb"}
+	rb := newLedgerHAReader(b, ledger)
+	if _, err := rb.Profile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rb.ReplicaStatus(ctx, "n2", "100-0"); err != nil && strings.Contains(err.Error(), "was not asked") {
+		t.Fatalf("a different cluster must not inherit the mark, got %v", err)
+	}
+	if b.statusReads["n2"] != 1 {
+		t.Fatalf("the second cluster's n2 was asked %d times, want 1", b.statusReads["n2"])
+	}
+
+	c := &identifiedHA{countingHA: newCountingHA(haBaseFake()), identity: "pve-root-ca:aaaaaaaa"}
+	rc := newLedgerHAReader(c, ledger)
+	if _, err := rc.Profile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rc.ReplicaStatus(ctx, "n2", "100-0"); err == nil || !strings.Contains(err.Error(), "was not asked") {
+		t.Fatalf("the same cluster must share the mark, got %v", err)
+	}
+
+	d := &identifiedHA{countingHA: newCountingHA(haBaseFake()), identity: ""}
+	d.volumesErr = map[string]error{"n2/local-zfs": lgUnreachable()}
+	rd := newLedgerHAReader(d, ledger)
+	if _, err := rd.Profile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = rd.StorageVolumes(ctx, "n2", "local-zfs")
+	if _, ok := ledger.failure("", "n2"); ok {
+		t.Fatal("a reader with no identity must record no claims")
 	}
 }

@@ -77,3 +77,44 @@ func TestCollectJudgesJobsWhoseMarkerPVEEncodedAgain(t *testing.T) {
 	g.status["101-0"] = ha.ReplicaSyncStatus{LastSync: haNow.Add(-time.Hour), FailCount: 3}
 	wantNone(t, runCollect(t, g, haCfg("auto", "replicate")), haKindReplicaJobFailing, haKindReplicaMarkerEncode)
 }
+
+// TestEncodedMarkerAdviceQuotesTheCommentForAShell: a job comment that holds a
+// single quote and a command after the marker stays one quoted word in the
+// pvesr command the doctor prints.
+func TestEncodedMarkerAdviceQuotesTheCommentForAShell(t *testing.T) {
+	t.Parallel()
+	f := replicaFake()
+	f.jobs[0].Comment = pveEncoded(haMarker+" gen=1 x';touch${IFS}/tmp/p;'", 2)
+	r := runCollect(t, f, haCfg("auto", "replicate"))
+	want(t, r, haKindReplicaMarkerEncode, haSeverityAdvice,
+		`pvesr update 101-0 --comment '`+haMarker+` gen=1 x'\''`+";touch${IFS}/tmp/p;"+`'\'''`)
+}
+
+func TestJobMarkerRefusesARepeatedOwnerOrGeneration(t *testing.T) {
+	t.Parallel()
+	for _, comment := range []string{
+		haMarker + " owner=" + haDirector,
+		"bosh-cpi:v1 owner=a owner=b gen=2",
+		"bosh-cpi:v1 owner=a owner=a gen=2",
+		"bosh-cpi:v1 owner=a gen=2 gen=3",
+		"bosh-cpi:v1 owner=a owner=- gen=2",
+	} {
+		if haJobMarker(comment) {
+			t.Errorf("haJobMarker(%q) = true, want the CPI's refusal", comment)
+		}
+	}
+	if !haJobMarker("bosh-cpi:v1 owner=a gen=2") {
+		t.Error("a single owner and generation must still read as the marker")
+	}
+}
+
+func TestForeignNormalisesTheDirectorUUIDLikeTheMarker(t *testing.T) {
+	t.Parallel()
+	c := &haCollector{owner: "dir ector"}
+	if c.foreign("bosh-cpi:v1 owner=dir_ector gen=1") {
+		t.Error("a marker the CPI wrote for this Director must not read as foreign")
+	}
+	if !c.foreign("bosh-cpi:v1 owner=other gen=1") {
+		t.Error("another Director's marker must read as foreign")
+	}
+}

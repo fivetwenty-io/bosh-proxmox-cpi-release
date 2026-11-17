@@ -99,6 +99,8 @@ func haJobMarker(comment string) bool {
 	if !ok {
 		return false
 	}
+	// The CPI refuses a job whose marker repeats owner or gen, or whose owner or
+	// gen is unusable on any occurrence, so the doctor does too.
 	var owner, gen bool
 	for _, f := range fields {
 		key, val, found := strings.Cut(f, "=")
@@ -107,10 +109,16 @@ func haJobMarker(comment string) bool {
 		}
 		switch key {
 		case "owner":
-			owner = val != "" && val != "-"
+			if owner || val == "" || val == "-" {
+				return false
+			}
+			owner = true
 		case "gen":
 			n, err := strconv.ParseUint(val, 10, 64)
-			gen = err == nil && n > 0
+			if gen || err != nil || n == 0 {
+				return false
+			}
+			gen = true
 		}
 	}
 	return owner && gen
@@ -172,6 +180,9 @@ type haCollector struct {
 	// guestsPartial is true when offline nodes kept some guests out of the
 	// list, so a VMID missing from it may still name a guest.
 	guestsPartial bool
+	// configsFailed is true when the config of an owned guest could not be
+	// read, which leaves the volumes that guest holds out of the referenced set.
+	configsFailed bool
 	storages      map[string]pve.StorageInfo
 	storagesOK    bool
 	jobs          []ha.ReplicaJobState
@@ -395,6 +406,7 @@ func (c *haCollector) readConfigs() {
 		if err != nil {
 			c.rep.unchecked(g.sid, "the config of VM %d on %s could not be read, so its CPU type and volumes are unchecked: %v",
 				g.ref.VMID, g.ref.Node, err)
+			c.configsFailed = true
 			continue
 		}
 		g.cfg = cfg
@@ -608,7 +620,13 @@ func ruleMarked(r *ha.Rule) bool {
 // its own, and so does a marker that names no owner.
 func (c *haCollector) foreign(comment string) bool {
 	owner, ok := haMarkerOwner(comment)
-	return ok && c.owner != "" && owner != "" && owner != c.owner
+	return ok && c.owner != "" && owner != "" && owner != haOwnerValue(c.owner)
+}
+
+// haOwnerValue spells a Director UUID the way the CPI writes it into a marker,
+// with each run of whitespace replaced by an underscore.
+func haOwnerValue(owner string) string {
+	return strings.Join(strings.Fields(owner), "_")
 }
 
 // cpiRuleName reports whether a rule's name is one the CPI gives rules.
@@ -688,8 +706,10 @@ func (c *haCollector) antiAffinityFindings() {
 		}
 	}
 	tags := make([]string, 0, len(groups))
-	for t := range groups {
-		tags = append(tags, t)
+	for t, members := range groups {
+		if c.groupInBand(members) {
+			tags = append(tags, t)
+		}
 	}
 	sort.Strings(tags)
 	unjudged := false
@@ -707,6 +727,23 @@ func (c *haCollector) antiAffinityFindings() {
 				"so the doctor cannot tell which groups with no rule should have one and does not judge them",
 			c.scope.peerList())
 	}
+}
+
+// groupInBand reports whether at least one member of a group sits in this
+// run's VM ID band. The group tag does not name a band, and the CPI stamps it
+// whenever soft anti-affinity is on, so a group whose members all lie in
+// another entry's band was made under that entry's policy and may rightly have
+// no rule.
+func (c *haCollector) groupInBand(members []*haGuest) bool {
+	if c.scope == nil {
+		return true
+	}
+	for _, g := range members {
+		if c.scope.Band.Contains(g.ref.VMID) {
+			return true
+		}
+	}
+	return false
 }
 
 // antiAffinityWrites reports whether the CPI writes anti-affinity rules at all.
@@ -822,7 +859,7 @@ func (c *haCollector) cpuFindings() {
 				why = fmt.Sprintf("its CPU migration domain holds %d node(s)", len(dom.Nodes))
 			}
 			c.rep.problem(haKindCPUDomainTooSmall, g.sid,
-				"the VM has CPU type %s and got no HA, because %s; set pve.cpu_type to a named model", cpu, why)
+				"the VM has CPU type %s and got no HA, because %s; set pve.cpu_type to a named model and run bosh recreate on the instance", cpu, why)
 		}
 	}
 }
@@ -835,7 +872,7 @@ func (c *haCollector) cpuMultiDomain(g *haGuest, cpu string, dom ha.CPUDomain, k
 	n := len(c.p.CPUDomains)
 	if !known {
 		c.rep.advise(haKindCPUHostMulti, g.sid,
-			"CPU type %s on a cluster with %d CPU migration domains needs a domain, and the CPU of node %s cannot place the VM in one; set pve.cpu_type to a named model to let it move",
+			"CPU type %s on a cluster with %d CPU migration domains needs a domain, and the CPU of node %s cannot place the VM in one; set pve.cpu_type to a named model and run bosh recreate on the instance to let it move",
 			cpu, n, g.ref.Node)
 		return
 	}
@@ -843,19 +880,19 @@ func (c *haCollector) cpuMultiDomain(g *haGuest, cpu string, dom ha.CPUDomain, k
 	switch {
 	case !c.resourcesOK || !c.rulesOK:
 		c.rep.advise(haKindCPUHostMulti, g.sid,
-			"CPU type %s on a cluster with %d CPU migration domains needs the domain %s, and the doctor could not read the HA resources and rules to check the VM's pin; set pve.cpu_type to a named model to let it move",
+			"CPU type %s on a cluster with %d CPU migration domains needs the domain %s, and the doctor could not read the HA resources and rules to check the VM's pin; set pve.cpu_type to a named model and run bosh recreate on the instance to let it move",
 			cpu, n, domain)
 		return
 	case g.resource == nil:
 		c.rep.advise(haKindCPUHostMulti, g.sid,
-			"CPU type %s on a cluster with %d CPU migration domains needs the domain %s, and the VM is not under HA, so no node-affinity rule moves it; set pve.cpu_type to a named model to let it move",
+			"CPU type %s on a cluster with %d CPU migration domains needs the domain %s, and the VM is not under HA, so no node-affinity rule moves it; set pve.cpu_type to a named model and run bosh recreate on the instance to let it move",
 			cpu, n, domain)
 		return
 	}
 	pin := c.pinOf(g.ref.VMID)
 	if pin == nil || pin.Disabled || pin.Type != ha.RuleTypeNodeAffinity || !pin.HasResource(g.sid) {
-		c.rep.advise(haKindCPUHostMulti, g.sid,
-			"CPU type %s on a cluster with %d CPU migration domains needs the domain %s, and the VM has no enabled node-affinity pin, so HA may move it to any node; set pve.cpu_type to a named model to let it move",
+		c.rep.problem(haKindCPUHostMulti, g.sid,
+			"CPU type %s on a cluster with %d CPU migration domains needs the domain %s, and the VM is under HA with no enabled node-affinity pin, so HA may move it to any node, including one whose CPU differs, and crash the guest; run bosh recreate on the instance so the CPI registers HA with a pin inside the domain, or set pve.cpu_type to a named model first and then recreate it",
 			cpu, n, domain)
 		return
 	}
@@ -869,12 +906,12 @@ func (c *haCollector) cpuMultiDomain(g *haGuest, cpu string, dom ha.CPUDomain, k
 	if len(outside) > 0 {
 		c.rep.problem(haKindCPUPinCrossesDomain, g.sid,
 			"CPU type %s needs the domain %s, but the node-affinity rule %s also names %s, so a maintenance drain or a manual migration can move the VM to a node whose CPU differs and crash the guest; "+
-				"narrow the pin to the domain by running bosh recreate on the instance, which makes the CPI register HA again, or set pve.cpu_type to a named model",
+				"narrow the pin to the domain by running bosh recreate on the instance, which makes the CPI register HA again, or set pve.cpu_type to a named model and then run bosh recreate on the instance",
 			cpu, domain, pin.ID, strings.Join(outside, ", "))
 		return
 	}
 	c.rep.advise(haKindCPUHostMulti, g.sid,
-		"CPU type %s on a cluster with %d CPU migration domains needs the domain %s, and the node-affinity rule %s names only nodes inside it; set pve.cpu_type to a named model to let the VM move to other domains",
+		"CPU type %s on a cluster with %d CPU migration domains needs the domain %s, and the node-affinity rule %s names only nodes inside it; set pve.cpu_type to a named model and run bosh recreate on the instance to let the VM move to other domains",
 		cpu, n, domain, pin.ID)
 }
 
@@ -1025,10 +1062,42 @@ func (c *haCollector) cannotLeaveReason(g *haGuest) string {
 			return ", and its strict node-affinity pin names no other node it can move to"
 		}
 	}
+	if c.rulesOK {
+		if pin := c.pinOf(g.ref.VMID); softPinHoldsOnlyNode(pin, g.sid, g.ref.Node) {
+			return ", and its soft node-affinity pin " + pin.ID + " puts only " + g.ref.Node +
+				" in its highest priority class, which keeps the service there while the node drains"
+		}
+	}
 	if c.groupBlocksEveryNode(g) {
 		return ", and every other node that can take it holds a member of its anti-affinity group"
 	}
 	return ""
+}
+
+// softPinHoldsOnlyNode reports whether pin is an enabled soft node-affinity
+// rule for sid whose highest priority class holds node and no other node, and
+// whose other nodes, named or not, rank below it. PVE keeps a service in the
+// highest class that has an online node, so such a pin keeps the service on
+// node even while the node drains. A pin that gives several nodes the top
+// priority forms a class that holds the others as well, so it is not one.
+func softPinHoldsOnlyNode(pin *ha.Rule, sid, node string) bool {
+	if pin == nil || pin.Disabled || pin.Strict || pin.Type != ha.RuleTypeNodeAffinity || !pin.HasResource(sid) {
+		return false
+	}
+	top, topNodes, ok := 0, 0, false
+	for _, prio := range pin.Nodes {
+		switch {
+		case !ok || prio > top:
+			top, topNodes, ok = prio, 1, true
+		case prio == top:
+			topNodes++
+		}
+	}
+	if !ok || topNodes != 1 {
+		return false
+	}
+	prio, named := pin.Nodes[node]
+	return named && prio == top
 }
 
 // recoveryStrandedFindings reports each HA VM the HA manager holds in the
@@ -1288,8 +1357,15 @@ func (c *haCollector) encodedMarker(j ha.ReplicaJobState) {
 	c.rep.advise(haKindReplicaMarkerEncode, "job "+j.ID,
 		"PVE percent-encoded the comment of replication job %s again when it rewrote replication.cfg, so it "+
 			"reads %q. This CPI still reads it as its marker, but an older CPI does not, and the CPI rewrites it "+
-			"only when it next writes the job's marker. To restore it now, run pvesr update %s --comment '%s'",
-		j.ID, j.Comment, j.ID, ha.DecodedMarkerComment(j.Comment))
+			"only when it next writes the job's marker. To restore it now, run pvesr update %s --comment %s",
+		j.ID, j.Comment, j.ID, haShellQuote(ha.DecodedMarkerComment(j.Comment)))
+}
+
+// haShellQuote quotes s as one POSIX shell word, so advice an operator pastes
+// into a shell cannot run text that a job comment carries. It wraps s in single
+// quotes and writes each single quote inside it as '\”.
+func haShellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // journalRecord returns the journal record of the replicated VM vmid.
@@ -1339,7 +1415,7 @@ func (c *haCollector) replicaVMs() []int {
 // such job is an error, because the CPI refuses to pick among them too.
 func (c *haCollector) liveJob(vmid int) (*ha.ReplicaJobState, error) {
 	var found *ha.ReplicaJobState
-	ours := strings.Join(strings.Fields(c.owner), "_")
+	ours := haOwnerValue(c.owner)
 	for _, j := range c.markedJobs() {
 		if j.Guest != vmid {
 			continue
@@ -1733,6 +1809,11 @@ func (c *haCollector) orphanVolumesOn(node, storage string, covered map[string]b
 // missing VMID then proves nothing.
 func (c *haCollector) goneVMVolumeCheck(jobGuests map[int]bool) func(volid, node string, vmid int) {
 	if c.guestsPartial || c.cfg == nil {
+		return func(string, string, int) {}
+	}
+	if c.configsFailed {
+		c.rep.unchecked("replica_gone_vm_volume", "the config of an owned VM could not be read, so a volume it holds "+
+			"cannot be told from a leftover, and the check for volumes of a VM that no longer exists is skipped")
 		return func(string, string, int) {}
 	}
 	start, end := c.cfg.VMIDRangeStart, c.cfg.VMIDRangeEnd

@@ -363,7 +363,7 @@ func TestCollectCPUFindings(t *testing.T) {
 	f.configs[100]["cpu"] = "host"
 	r := runCollect(t, f, haCfg("auto", "none"))
 	want(t, r, haKindCPUUnknown, haSeverityAdvice, "n3")
-	want(t, r, haKindCPUHostMulti, haSeverityAdvice, "vm:100", "host", "2 CPU migration domains", "n1, n2")
+	want(t, r, haKindCPUHostMulti, haSeverityProblem, "vm:100", "host", "2 CPU migration domains", "n1, n2", "bosh recreate")
 	wantNone(t, r, haKindCPUDomainTooSmall)
 
 	// A max-typed VM with no HA resource in a one-node domain got no HA.
@@ -436,6 +436,27 @@ func TestCollectMaintenanceStranded(t *testing.T) {
 	// A pin to a single node is named as the reason.
 	f.rules = []ha.Rule{pinRule(100, haMarker, "n1")}
 	want(t, runCollect(t, f, haCfg("auto", "none")), haKindMaintenanceStranded, haSeverityProblem, "pin names no other node")
+}
+
+// TestCollectMaintenanceStrandedNamesASoftSinglePin: a soft pin whose top
+// priority class holds only the draining node keeps the VM there, and the
+// finding says so. A soft pin that ranks two nodes first does not.
+func TestCollectMaintenanceStrandedNamesASoftSinglePin(t *testing.T) {
+	t.Parallel()
+	soft := func(prios map[string]int) ha.Rule {
+		r := pinRule(100, haMarker)
+		r.Strict, r.Nodes = false, prios
+		return r
+	}
+	f := maintenanceFake()
+	f.rules = []ha.Rule{soft(map[string]int{"n1": 2, "n2": 1, "n3": 1})}
+	want(t, runCollect(t, f, haCfg("auto", "none")), haKindMaintenanceStranded, haSeverityProblem,
+		"soft node-affinity pin", "only n1", "highest priority class")
+	f.rules = []ha.Rule{soft(map[string]int{"n1": 2, "n2": 2})}
+	got := findings(runCollect(t, f, haCfg("auto", "none")), haKindMaintenanceStranded)
+	if len(got) != 1 || strings.Contains(got[0].Detail, "soft node-affinity pin") {
+		t.Errorf("a shared top class must give no soft-pin reason, got %+v", got)
+	}
 }
 
 func TestCollectMaintenanceStrandedSkipsStoppedVM(t *testing.T) {
@@ -2286,7 +2307,7 @@ func TestCollectCPUPinAgainstDomain(t *testing.T) {
 		{name: "no HA resource", noHA: true, kind: haKindCPUHostMulti,
 			severity: haSeverityAdvice, fragments: []string{"not under HA"}, absent: []string{"pin"}},
 		{name: "resource without a pin", kind: haKindCPUHostMulti,
-			severity: haSeverityAdvice, fragments: []string{"no enabled node-affinity pin"}},
+			severity: haSeverityProblem, fragments: []string{"no enabled node-affinity pin", "bosh recreate"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2377,5 +2398,62 @@ func TestCollectAcceptsATargetedMemberUnderDLB(t *testing.T) {
 	r := runCollect(t, f, cfg)
 	if len(r.Findings) != 0 {
 		t.Fatalf("a healthy resource gets no finding: %+v", r.Findings)
+	}
+}
+
+// TestCollectAntiAffinityJudgesOnlyGroupsInTheEntryBand: a group whose members
+// all lie in another entry's band was made under that entry's policy, so an
+// entry that writes rules in its own band does not report it short.
+func TestCollectAntiAffinityJudgesOnlyGroupsInTheEntryBand(t *testing.T) {
+	t.Parallel()
+	mine := "bosh-aa-0123456789ab"
+	theirs := "bosh-aa-ba9876543210"
+	f := haBaseFake()
+	f.guests = []pve.GuestRef{
+		{VMID: 1100, Node: "n1", Tags: "bosh-cpi;" + mine},
+		{VMID: 1101, Node: "n2", Tags: "bosh-cpi;" + mine},
+		{VMID: 2100, Node: "n1", Tags: "bosh-cpi;" + theirs},
+		{VMID: 2101, Node: "n2", Tags: "bosh-cpi;" + theirs},
+	}
+	for _, id := range []int{1100, 1101, 2100, 2101} {
+		f.memory[id] = haGiB
+	}
+	f.resources = []HAResourceRow{
+		{SID: "vm:1100", State: "started"}, {SID: "vm:1101", State: "started"},
+		{SID: "vm:2100", State: "started"}, {SID: "vm:2101", State: "started"},
+	}
+	f.rules = []ha.Rule{
+		{ID: mine, Type: "resource-affinity", Affinity: "negative", Comment: haMarker, Resources: []string{"vm:1100"}},
+	}
+	scope := &haEntryScope{Band: pve.VMIDBand{Start: 1000, End: 1999}, AntiAffinity: true, Leader: true}
+	cfg := haCfgWith("auto", "none", `,"anti_affinity":"on"`, `,"placement":{"anti_affinity":{"enabled":true}}`)
+	r := collectHAScoped(context.Background(), f, cfg, "", haNow, scope)
+	var short []string
+	for _, fd := range r.Findings {
+		if fd.Kind == haKindAntiAffinityShort {
+			short = append(short, fd.Subject)
+		}
+	}
+	if len(short) != 1 || short[0] != mine {
+		t.Errorf("short groups = %v, want only %s", short, mine)
+	}
+}
+
+// TestCollectSkipsGoneVMVolumesWhenAnOwnedConfigCouldNotBeRead: a volume that
+// the unread config might reference cannot be called a leftover, so the check
+// is skipped and the skip is named as unchecked.
+func TestCollectSkipsGoneVMVolumesWhenAnOwnedConfigCouldNotBeRead(t *testing.T) {
+	t.Parallel()
+	f := replicaFake()
+	f.volumes["n2/local-zfs"] = map[string]bool{"local-zfs:vm-559-disk-0": true}
+	f.configErr = map[int]error{101: errors.New("config read failed")}
+	r := runCollect(t, f, haCfg("auto", "replicate"))
+	wantNone(t, r, haKindReplicaGoneVM)
+	named := false
+	for _, fd := range findings(r, haKindUnchecked) {
+		named = named || (fd.Subject == "replica_gone_vm_volume" && strings.Contains(fd.Detail, "skipped"))
+	}
+	if !named {
+		t.Errorf("the skipped check must be named as unchecked: %+v", r.Findings)
 	}
 }

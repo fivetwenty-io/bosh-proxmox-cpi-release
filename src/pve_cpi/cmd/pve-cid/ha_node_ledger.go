@@ -29,8 +29,9 @@ import (
 
 // haNodeLedger holds what one doctor run learned about nodes that cannot
 // answer. It is shared by every entry of the run, and it is keyed by the
-// cluster's identity, which is the sorted list of its member names, so two
-// entries that reach the same cluster share what each learned.
+// cluster's identity, which is the stamp of its root CA joined to the sorted
+// list of its member names, so two entries that reach the same cluster share
+// what each learned and two clusters that name their nodes alike do not.
 type haNodeLedger struct {
 	mu sync.Mutex
 	// failed maps a cluster key to its nodes and the read that failed on each.
@@ -80,14 +81,30 @@ func (l *haNodeLedger) recordGuestFailure(key string, err error) {
 	}
 }
 
-// haClusterKey identifies a cluster by the sorted names of its members.
-func haClusterKey(nodes []ha.NodeFacts) string {
+// haClusterIdentifier is an optional HAReader method that names the cluster
+// the reader talks to by something other than its member names. The answer is
+// the cluster's pve-root-ca stamp, or a hash of the configured endpoints when
+// the stamp cannot be read, and it is empty when neither is known. The CPI
+// scopes its own per-cluster records the same way.
+type haClusterIdentifier interface {
+	ClusterIdentity(ctx context.Context, entryNode string) string
+}
+
+// haClusterKey identifies a cluster by its identity and the sorted names of its
+// members. An empty identity from a reader that can give one yields an empty
+// key, because member names alone cannot tell clusters apart, and a ledger
+// that makes no claims can never be shared by mistake.
+func haClusterKey(identity string, nodes []ha.NodeFacts) string {
 	names := make([]string, 0, len(nodes))
 	for i := range nodes {
 		names = append(names, nodes[i].Name)
 	}
 	sort.Strings(names)
-	return strings.Join(names, ",")
+	joined := strings.Join(names, ",")
+	if identity == "" {
+		return joined
+	}
+	return identity + "|" + joined
 }
 
 // haSkippedReadError is what a per-node read returns when the doctor did not
@@ -126,7 +143,14 @@ func (r *ledgerHAReader) Profile(ctx context.Context) (*ha.Profile, error) {
 	if err != nil || p == nil {
 		return p, err
 	}
-	r.key = haClusterKey(p.Nodes)
+	r.key = ""
+	if identifier, ok := r.HAReader.(haClusterIdentifier); ok {
+		if identity := identifier.ClusterIdentity(ctx, p.EntryNode); identity != "" {
+			r.key = haClusterKey(identity, p.Nodes)
+		}
+	} else {
+		r.key = haClusterKey("", p.Nodes)
+	}
 	r.quorumLost = p.Clustered && !p.Quorate
 	r.offline = map[string]bool{}
 	for i := range p.Nodes {

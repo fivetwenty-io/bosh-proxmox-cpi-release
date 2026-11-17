@@ -128,6 +128,23 @@ func (r *pveHAReader) ready() error {
 	return nil
 }
 
+// ClusterIdentity names the cluster the reader talks to, for the node ledger.
+// It is the stamp of the cluster's pve-root-ca, which every node of a cluster
+// shares and no two clusters or standalone hosts do, and it falls back to a
+// hash of the configured endpoints when the stamp cannot be read. It is empty
+// when neither is known.
+func (r *pveHAReader) ClusterIdentity(ctx context.Context, entryNode string) string {
+	if r.ready() == nil {
+		if stamp, err := pve.ReadClusterStamp(ctx, r.client, entryNode); err == nil && stamp != "" {
+			return "pve-root-ca:" + stamp
+		}
+	}
+	if scope := ha.EpisodeScope(r.cfg); scope != "" {
+		return "endpoints:" + scope
+	}
+	return ""
+}
+
 func (r *pveHAReader) Profile(ctx context.Context) (*ha.Profile, error) {
 	if err := r.ready(); err != nil {
 		return nil, err

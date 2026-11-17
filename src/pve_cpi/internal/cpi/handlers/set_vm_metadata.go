@@ -557,7 +557,9 @@ func buildDescription(metadata map[string]any) string {
 // the "vm-prefix--<value>" identity tag. An empty vmPrefix omits the tag, which
 // the accessor never produces and a direct call from a test can.
 //
-// The prefix tag is appended last, after every other BOSH-managed entry. The
+// The instance name tag comes before the index tag, so a cap that overflows
+// drops the index first and keeps the name tag, which the identity checks tie
+// to the job tag, for longer. The prefix tag is appended last, after every other BOSH-managed entry. The
 // merge protects it from the byte cap, as it does the ownership stamps, so a
 // deployment and job set long enough to overflow the cap drops the entries
 // BOSH itself supplied and keeps the identity tag.
@@ -573,17 +575,20 @@ func buildBoshManagedTags(metadata map[string]any, vmPrefix string) []string {
 func buildBoshManagedTagsReporting(metadata map[string]any, vmPrefix string) ([]string, string) {
 	var parts []string
 	var refusedName string
-	for _, key := range []string{"director", "deployment", "instance_group", "job", "index"} {
-		v, ok := metadata[key]
-		if !ok || v == nil {
-			continue
+	appendKeys := func(keys ...string) {
+		for _, key := range keys {
+			v, ok := metadata[key]
+			if !ok || v == nil {
+				continue
+			}
+			s := sanitizeTagValue(fmt.Sprintf("%v", v))
+			if s == "" {
+				continue
+			}
+			parts = append(parts, sanitizeTagValue(key)+"--"+s)
 		}
-		s := sanitizeTagValue(fmt.Sprintf("%v", v))
-		if s == "" {
-			continue
-		}
-		parts = append(parts, sanitizeTagValue(key)+"--"+s)
 	}
+	appendKeys("director", "deployment", "instance_group", "job")
 	if v, ok := metadata[metadataKeyName]; ok && v != nil {
 		raw := strings.ReplaceAll(fmt.Sprintf("%v", v), "/", "--")
 		if s := sanitizeTagValue(raw); s != "" {
@@ -594,6 +599,7 @@ func buildBoshManagedTagsReporting(metadata map[string]any, vmPrefix string) ([]
 			}
 		}
 	}
+	appendKeys("index")
 	if s := sanitizeTagValue(vmPrefix); s != "" {
 		parts = append(parts, pve.ParkerPrefixTagPrefix+s)
 	}

@@ -309,12 +309,12 @@ func antiAffinityScorerGroup(deps Deps, env map[string]any) scorerGroup {
 	if ident.Group == "" {
 		return scorerGroup{}
 	}
-	g := scorerGroup{legacy: []string{"job--" + ident.Group}}
+	g := scorerGroup{legacy: []string{legacyJobTag(ident.Group)}}
 	if ident.valid() {
 		g.tag = ident.ruleName()
 	}
 	if ident.Deployment != "" {
-		g.legacy = append(g.legacy, "deployment--"+ident.Deployment)
+		g.legacy = append(g.legacy, legacyDeploymentTag(ident.Deployment))
 	}
 	if owner := ownerTagFor(ident.Owner); owner != "" {
 		g.legacy = append(g.legacy, owner)
