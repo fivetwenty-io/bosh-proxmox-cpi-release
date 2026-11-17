@@ -121,3 +121,64 @@ func TestListGuestsAuthoritative_StrictIgnoresMemberGoingOffline(t *testing.T) {
 		t.Fatalf("the strict form must use the full retry budget, got %d attempts, want %d", got, want)
 	}
 }
+
+// TestListGuestsAuthoritativeTolerant_EveryMemberExcludedFails: with one member
+// reported offline before the fan-out and the only other one going offline
+// during its listing, nothing was listed at all. The tolerance never turns a
+// fully dark cluster into an empty guest list, so the call fails retriable.
+func TestListGuestsAuthoritativeTolerant_EveryMemberExcludedFails(t *testing.T) {
+	t.Parallel()
+	nodesSvc := &lgNodes{failNodes: map[string]error{"pve2": lgProxyUnreachable()}}
+	c := &lgClient{
+		cluster: &lgCluster{
+			nodes: []string{"pve1", "pve2"},
+			statusFn: func() (*sdkcluster.ListStatusResponse, error) {
+				return lgStatus(map[string]bool{"pve1": false, "pve2": nodesSvc.calls["pve2"] == 0})()
+			},
+		},
+		nodes: nodesSvc,
+	}
+	guests, excluded, err := ListGuestsAuthoritativeTolerant(lgCtx(), c, nil)
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("every member excluded must fail retriable, got guests=%v excluded=%v err=%v", guests, excluded, err)
+	}
+	if !strings.Contains(err.Error(), "every cluster member reports offline") {
+		t.Fatalf("the error must say that every member is offline, got: %v", err)
+	}
+}
+
+// TestListGuestsAuthoritativeTolerant_StatusRecheckTakesOneAttempt: the status
+// read after a failed listing attempt gets a single attempt of its own. When
+// the status endpoint itself blips, a full budget there would add up to eight
+// status reads after every failed listing attempt.
+func TestListGuestsAuthoritativeTolerant_StatusRecheckTakesOneAttempt(t *testing.T) {
+	t.Parallel()
+	nodesSvc := &lgNodes{
+		listings:  map[string][]string{"pve1": {`{"vmid": 596}`}},
+		failNodes: map[string]error{"pve2": lgProxyUnreachable()},
+	}
+	statusCalls := 0
+	c := &lgClient{
+		cluster: &lgCluster{
+			nodes: []string{"pve1", "pve2"},
+			statusFn: func() (*sdkcluster.ListStatusResponse, error) {
+				statusCalls++
+				if statusCalls == 1 {
+					return lgStatus(map[string]bool{"pve1": true, "pve2": true})()
+				}
+				return nil, lgProxyUnreachable()
+			},
+		},
+		nodes: nodesSvc,
+	}
+	if _, _, err := ListGuestsAuthoritativeTolerant(lgCtx(), c, nil); err == nil {
+		t.Fatal("a member that never answers and is still reported online must fail the enumeration")
+	}
+	listAttempts := nodesSvc.calls["pve2"]
+	if listAttempts != transientMaxAttemptsDefault() {
+		t.Fatalf("the online member must keep the full retry budget, got %d attempts", listAttempts)
+	}
+	if want := 1 + listAttempts; statusCalls != want {
+		t.Fatalf("status read %d times; want %d, one before the fan-out and one per failed listing attempt", statusCalls, want)
+	}
+}
