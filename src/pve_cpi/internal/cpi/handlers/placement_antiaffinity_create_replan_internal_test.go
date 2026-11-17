@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -163,60 +164,71 @@ func TestEnsureAntiAffinity_CreateStopsAfterFourPlans(t *testing.T) {
 			stub.enforceManaged = true
 			managedGroup(stub, 101, 102, 103, 104, 105, 106, 107)
 			stub.seedRule(aaRule, "vm:101,vm:102")
-			flagged := []string{"vm:103", "vm:105", "vm:106", "vm:107"}
-			pins := map[string]string{}
-			for i, vmid := range []int{103, 105, 106, 107} {
-				pins[seedStrictPin(stub, vmid, []string{"pve1", "pve2", "pve3", "pve4"}[i])] = haResourceSid(vmid)
-			}
-			// Only the first flagged sibling the rule holds has its pin put
-			// out of effect, so each repair confines the next one.
-			stub.ruleErrors = func(name string) map[string][]string {
-				sid, ok := pins[name]
-				if !ok {
-					return nil
-				}
-				members := strings.Split(stub.rules[aaRule], ",")
-				for _, f := range flagged {
-					if slices.Contains(members, f) {
-						if f == sid {
-							return map[string][]string{"resources": {sid + " conflicts"}}
-						}
-						return nil
-					}
-				}
-				return nil
-			}
-			plans := 0
-			stub.onRuleWrite = func(rule string) {
-				members := strings.Split(stub.rules[rule], ",")
-				if rule == aaRule && slices.Contains(members, "vm:104") &&
-					slices.ContainsFunc(flagged, func(f string) bool { return slices.Contains(members, f) }) {
-					plans++
-				}
-			}
+			plans := flagOneSiblingPerRound(stub, []int{103, 105, 106, 107})
 			deps := aaModeDeps(stub, mode, "", "pve1", "pve2", "pve3", "pve4", "pve5", "pve6", "pve7", "pve8",
 				"pve9")
 			logger, _ := log.NewObservedLogger(log.LevelDebug)
 			_, err := ensureAntiAffinityMembershipFor(context.Background(), deps, aaIdent("web"), 104, nil, logger)
-			switch mode {
-			case config.HAModeManaged:
-				if !errors.Is(err, ha.ErrRuleNotInEffect) || !strings.Contains(err.Error(), naRuleNameFor(107)) {
-					t.Fatalf("err = %v; want the fourth round's refusal, which names %s", err, naRuleNameFor(107))
-				}
-			default:
-				if err == nil || propagateHARuleError(deps, err) {
-					t.Fatalf("err = %v; want an auto error that runs the VM without HA", err)
-				}
-				if !strings.Contains(err.Error(), "after 4 plans") {
-					t.Fatalf("err = %v; want it to name the fourth plan", err)
-				}
-			}
-			if plans != 4 {
-				t.Fatalf("the create wrote %d plans that joined vm:104 with a flagged sibling; want 4", plans)
+			requireFourthPlanOutcome(t, deps, mode, err)
+			if *plans != 4 {
+				t.Fatalf("the create wrote %d plans that joined vm:104 with a flagged sibling; want 4", *plans)
 			}
 			if got := stub.rules[aaRule]; got != "vm:101,vm:102,vm:104" {
 				t.Fatalf("rule = %q; want the heal to leave vm:104 in and the flagged siblings out", got)
 			}
 		})
+	}
+}
+
+// flagOneSiblingPerRound pins each of vmids strictly to its own node and has
+// PVE flag only the pin of the first of them that the rule holds, so each
+// repair confines the next one. It returns the count of writes of the rule
+// that joined vm:104 with a flagged sibling, which is one per plan.
+func flagOneSiblingPerRound(stub *aaClusterStub, vmids []int) *int {
+	flagged := make([]string, 0, len(vmids))
+	pins := map[string]string{}
+	for i, vmid := range vmids {
+		flagged = append(flagged, haResourceSid(vmid))
+		pins[seedStrictPin(stub, vmid, "pve"+strconv.Itoa(i+1))] = haResourceSid(vmid)
+	}
+	stub.ruleErrors = func(name string) map[string][]string {
+		sid, ok := pins[name]
+		if !ok {
+			return nil
+		}
+		members := strings.Split(stub.rules[aaRule], ",")
+		i := slices.IndexFunc(flagged, func(f string) bool { return slices.Contains(members, f) })
+		if i < 0 || flagged[i] != sid {
+			return nil
+		}
+		return map[string][]string{"resources": {sid + " conflicts"}}
+	}
+	plans := 0
+	stub.onRuleWrite = func(rule string) {
+		members := strings.Split(stub.rules[rule], ",")
+		if rule == aaRule && slices.Contains(members, "vm:104") &&
+			slices.ContainsFunc(flagged, func(f string) bool { return slices.Contains(members, f) }) {
+			plans++
+		}
+	}
+	return &plans
+}
+
+// requireFourthPlanOutcome checks the error of a create whose fourth plan was
+// its last. Managed mode fails with the fourth round's refusal, which names
+// vm:107's pin. Auto mode returns an error that runs the VM without HA.
+func requireFourthPlanOutcome(t *testing.T, deps Deps, mode string, err error) {
+	t.Helper()
+	if mode == config.HAModeManaged {
+		if !errors.Is(err, ha.ErrRuleNotInEffect) || !strings.Contains(err.Error(), naRuleNameFor(107)) {
+			t.Fatalf("err = %v; want the fourth round's refusal, which names %s", err, naRuleNameFor(107))
+		}
+		return
+	}
+	if err == nil || propagateHARuleError(deps, err) {
+		t.Fatalf("err = %v; want an auto error that runs the VM without HA", err)
+	}
+	if !strings.Contains(err.Error(), "after 4 plans") {
+		t.Fatalf("err = %v; want it to name the fourth plan", err)
 	}
 }

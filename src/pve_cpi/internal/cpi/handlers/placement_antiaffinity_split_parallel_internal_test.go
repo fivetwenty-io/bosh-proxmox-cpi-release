@@ -45,7 +45,6 @@ func (f *aaFleet) splitCreate(vmid int, mode string, logger *log.Logger) func(st
 func TestEnsureAntiAffinity_SplitParallelCreatesNameOnlyHAResources(t *testing.T) {
 	t.Parallel()
 	vmids := []int{101, 102, 103, 104}
-	second := aaChunkName(aaRule, 2)
 	for _, mode := range aaModes {
 		t.Run(mode, func(t *testing.T) {
 			t.Parallel()
@@ -62,35 +61,42 @@ func TestEnsureAntiAffinity_SplitParallelCreatesNameOnlyHAResources(t *testing.T
 						t.Fatalf("%s: create of %d failed, which rolls back a built VM: %v", run, vmids[i], err)
 					}
 				}
-				for _, e := range observed.All() {
-					if err := fmt.Sprint(e.Attrs["error"]); strings.Contains(err, "unmanaged resource") {
-						t.Fatalf("%s: a write named a sibling that is not an HA resource yet: %s", run, err)
-					}
-				}
-				first := strings.Split(f.stub.rules[aaRule], ",")
-				if len(first) != 3 {
-					t.Fatalf("%s: first rule = %q; want three members", run, f.stub.rules[aaRule])
-				}
-				if got, ok := f.stub.rules[second]; ok {
-					t.Fatalf("%s: second rule = %q; want none for one member", run, got)
-				}
-				var lone string
-				for _, v := range vmids {
-					if sid := haResourceSid(v); !slices.Contains(first, sid) {
-						lone = sid
-					}
-				}
-				warned := false
-				for _, e := range observed.All() {
-					if strings.Contains(e.Message, "member is in none of the group's rules") &&
-						e.Level == log.LevelWarn && e.Attrs["sid"] == lone && e.Attrs["rule"] == second {
-						warned = true
-					}
-				}
-				if !warned {
-					t.Fatalf("%s: %s is in no rule and no create warned about it", run, lone)
-				}
+				requireSplitRunRight(t, run, f, observed, vmids)
 			}
 		})
 	}
+}
+
+// requireSplitRunRight checks one run of the split creates. No write was
+// refused for naming a sibling that is not an HA resource yet, the first rule
+// holds three members, no second rule exists, and the member in no rule was
+// warned about, naming the second rule.
+func requireSplitRunRight(t *testing.T, run string, f *aaFleet, observed *log.Observer, vmids []int) {
+	t.Helper()
+	for _, e := range observed.All() {
+		if err := fmt.Sprint(e.Attrs["error"]); strings.Contains(err, "unmanaged resource") {
+			t.Fatalf("%s: a write named a sibling that is not an HA resource yet: %s", run, err)
+		}
+	}
+	second := aaChunkName(aaRule, 2)
+	first := strings.Split(f.stub.rules[aaRule], ",")
+	if len(first) != 3 {
+		t.Fatalf("%s: first rule = %q; want three members", run, f.stub.rules[aaRule])
+	}
+	if got, ok := f.stub.rules[second]; ok {
+		t.Fatalf("%s: second rule = %q; want none for one member", run, got)
+	}
+	var lone string
+	for _, v := range vmids {
+		if sid := haResourceSid(v); !slices.Contains(first, sid) {
+			lone = sid
+		}
+	}
+	for _, e := range observed.All() {
+		if strings.Contains(e.Message, "member is in none of the group's rules") &&
+			e.Level == log.LevelWarn && e.Attrs["sid"] == lone && e.Attrs["rule"] == second {
+			return
+		}
+	}
+	t.Fatalf("%s: %s is in no rule and no create warned about it", run, lone)
 }
