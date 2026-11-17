@@ -31,13 +31,15 @@ type fakeHA struct {
 	rules        []ha.Rule
 	rulesErr     error
 
-	guests    []pve.GuestRef
-	excluded  []string
-	guestsErr error
-	memory    map[int]int64
-	memoryErr error
-	configs   map[int]map[string]any
-	configErr map[int]error
+	guests        []pve.GuestRef
+	excluded      []string
+	guestsErr     error
+	memory        map[int]int64
+	clusterVMs    []pve.GuestRef
+	clusterVMsErr error
+	memoryErr     error
+	configs       map[int]map[string]any
+	configErr     map[int]error
 
 	facts    []placement.NodeFacts
 	factsErr error
@@ -83,6 +85,10 @@ func (f *fakeHA) Rules(context.Context) ([]ha.Rule, error) { return f.rules, f.r
 
 func (f *fakeHA) Guests(context.Context) ([]pve.GuestRef, []string, error) {
 	return f.guests, f.excluded, f.guestsErr
+}
+
+func (f *fakeHA) ClusterVMs(context.Context) ([]pve.GuestRef, error) {
+	return f.clusterVMs, f.clusterVMsErr
 }
 
 func (f *fakeHA) GuestMemory(context.Context) (map[int]int64, error) { return f.memory, f.memoryErr }

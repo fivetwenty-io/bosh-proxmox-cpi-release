@@ -58,6 +58,10 @@ type HAReader interface {
 	// per-node listings. excluded names members the listing could not ask
 	// because they are offline.
 	Guests(ctx context.Context) (guests []pve.GuestRef, excluded []string, err error)
+	// ClusterVMs lists the QEMU VMs of GET /cluster/resources, which names a VM
+	// whose node is offline as well, with the node and tags the cluster file
+	// system holds for it. The per-node guest listing cannot ask an offline node.
+	ClusterVMs(ctx context.Context) ([]pve.GuestRef, error)
 	// GuestMemory returns each guest's configured memory in bytes by VMID.
 	GuestMemory(ctx context.Context) (map[int]int64, error)
 	// GuestConfig returns the raw config of a QEMU guest.
@@ -203,7 +207,20 @@ func (r *pveHAReader) Guests(ctx context.Context) ([]pve.GuestRef, []string, err
 	return pve.ListGuestsAuthoritativeTolerant(ctx, r.client, r.logger)
 }
 
-func (r *pveHAReader) GuestMemory(ctx context.Context) (map[int]int64, error) {
+// clusterVMRow is the part of a GET /cluster/resources VM row the doctor reads.
+type clusterVMRow struct {
+	Type     string           `json:"type"`
+	VMID     sdkclient.PVEInt `json:"vmid"`
+	Maxmem   sdkclient.PVEInt `json:"maxmem"`
+	Node     string           `json:"node"`
+	Name     string           `json:"name"`
+	Tags     string           `json:"tags"`
+	Status   string           `json:"status"`
+	Template sdkclient.PVEInt `json:"template"`
+}
+
+// clusterVMRows reads GET /cluster/resources and returns its QEMU rows.
+func (r *pveHAReader) clusterVMRows(ctx context.Context) ([]clusterVMRow, error) {
 	if err := r.ready(); err != nil {
 		return nil, err
 	}
@@ -214,16 +231,39 @@ func (r *pveHAReader) GuestMemory(ctx context.Context) (map[int]int64, error) {
 	if resp == nil {
 		return nil, errors.New("list cluster resources: nil response")
 	}
-	out := map[int]int64{}
+	var out []clusterVMRow
 	for _, raw := range *resp {
-		var row struct {
-			Type   string           `json:"type"`
-			VMID   sdkclient.PVEInt `json:"vmid"`
-			Maxmem sdkclient.PVEInt `json:"maxmem"`
-		}
+		var row clusterVMRow
 		if err := json.Unmarshal(raw, &row); err != nil || row.Type != "qemu" || row.VMID.Int() <= 0 {
 			continue
 		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+func (r *pveHAReader) ClusterVMs(ctx context.Context) ([]pve.GuestRef, error) {
+	rows, err := r.clusterVMRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]pve.GuestRef, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, pve.GuestRef{
+			VMID: int(row.VMID.Int()), Node: row.Node, Name: row.Name, Tags: row.Tags, Status: row.Status,
+			Template: row.Template.Int() == 1,
+		})
+	}
+	return out, nil
+}
+
+func (r *pveHAReader) GuestMemory(ctx context.Context) (map[int]int64, error) {
+	rows, err := r.clusterVMRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := map[int]int64{}
+	for _, row := range rows {
 		out[int(row.VMID.Int())] = row.Maxmem.Int()
 	}
 	return out, nil

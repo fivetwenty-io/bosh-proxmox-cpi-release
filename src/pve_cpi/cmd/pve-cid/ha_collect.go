@@ -158,6 +158,8 @@ type haCollector struct {
 	resourcesOK bool
 	states      map[string]string
 	statesOK    bool
+	clusterVMs  map[int]pve.GuestRef
+	clusterOK   bool
 	rules       []ha.Rule
 	rulesOK     bool
 	guests      []*haGuest
@@ -284,6 +286,7 @@ func (c *haCollector) fillProfile() {
 func (c *haCollector) readSources() {
 	c.readResources()
 	c.readServiceStates()
+	c.readClusterVMs()
 	c.readRules()
 	c.readGuests()
 	c.readStorages()
@@ -311,6 +314,19 @@ func (c *haCollector) readServiceStates() {
 		return
 	}
 	c.states, c.statesOK = states, true
+}
+
+func (c *haCollector) readClusterVMs() {
+	refs, err := c.r.ClusterVMs(c.ctx)
+	if err != nil {
+		c.rep.unchecked("cluster-resources", "the cluster's VM list could not be read, so a service waiting in recovery on a node that is down is unchecked: %v", err)
+		return
+	}
+	c.clusterVMs = make(map[int]pve.GuestRef, len(refs))
+	for _, ref := range refs {
+		c.clusterVMs[ref.VMID] = ref
+	}
+	c.clusterOK = true
 }
 
 func (c *haCollector) readRules() {
@@ -863,28 +879,109 @@ func (c *haCollector) maintenanceStrandedFindings() {
 // recoveryStrandedFindings reports each HA VM the HA manager holds in the
 // recovery state. After a node fails and is fenced, the manager recovers each
 // of its services onto another node, and one with no admissible node stays in
-// recovery until one appears. A manager status that could not be read is
-// already reported as unchecked, so this check says nothing in that case.
+// recovery until one appears. The failed node is offline, so the per-node guest
+// listing cannot ask it, and the VM is matched through the cluster's VM list
+// instead, which still names it with its node and tags. A manager status that
+// could not be read is already reported as unchecked, so this check says
+// nothing in that case.
 func (c *haCollector) recoveryStrandedFindings() {
-	if c.off() || !c.guestsOK || !c.resourcesOK || !c.statesOK {
+	if c.off() || !c.resourcesOK || !c.statesOK {
 		return
 	}
-	for _, g := range c.guests {
-		if !g.owned || g.ref.Template || g.resource == nil || !c.judgesVM(g) {
+	sids := make([]string, 0, len(c.states))
+	for sid, state := range c.states {
+		if strings.EqualFold(state, "recovery") {
+			sids = append(sids, sid)
+		}
+	}
+	sort.Strings(sids)
+	for _, sid := range sids {
+		if _, ok := c.resources[sid]; !ok {
 			continue
 		}
-		if !strings.EqualFold(c.states[g.sid], "recovery") {
+		g := c.recoveryGuest(sid)
+		if g == nil || !g.owned || g.ref.Template || !c.judgesVM(g) {
 			continue
 		}
 		why := ""
-		if pin := c.pinOf(g.ref.VMID); c.rulesOK && pin != nil && len(pin.Nodes) == 1 {
-			if _, onIt := pin.Nodes[g.ref.Node]; onIt {
-				why = fmt.Sprintf(", because its strict pin names only %s", g.ref.Node)
-			}
+		pin := c.pinOf(g.ref.VMID)
+		switch {
+		case c.rulesOK && pin != nil && len(pin.Nodes) == 1 && hasNode(pin.Nodes, g.ref.Node):
+			why = fmt.Sprintf(", because its strict pin names only %s", g.ref.Node)
+		case c.groupBlocksEveryNode(g):
+			why = ", because every other node holds a member of its anti-affinity group"
 		}
 		c.rep.problem(haKindRecoveryStranded, g.sid,
 			"%s was on %s and waits in recovery with no node it may run on%s", g.sid, g.ref.Node, why)
 	}
+}
+
+func hasNode(nodes map[string]int, name string) bool {
+	_, ok := nodes[name]
+	return ok
+}
+
+// recoveryGuest returns the VM behind an HA service in recovery. The cluster's
+// VM list comes first because it names a VM on an offline node, and the
+// per-node listing is the fallback when that list could not be read.
+func (c *haCollector) recoveryGuest(sid string) *haGuest {
+	vmid, err := strconv.Atoi(strings.TrimPrefix(sid, "vm:"))
+	if err != nil || vmid <= 0 {
+		return nil
+	}
+	ref, ok := c.clusterVMs[vmid]
+	if !c.clusterOK || !ok {
+		if g := c.byVMID[vmid]; g != nil {
+			return g
+		}
+		return nil
+	}
+	g := &haGuest{ref: ref, tags: map[string]bool{}, sid: sid}
+	for _, t := range ref.SplitTags() {
+		g.tags[strings.ToLower(strings.TrimSpace(t))] = true
+	}
+	g.owned = g.hasTag(haOwnershipTag)
+	return g
+}
+
+// groupBlocksEveryNode reports whether g sits in an anti-affinity rule and
+// every online node other than the one it was on holds another member of that
+// group, so the rule leaves the VM no node to move to.
+func (c *haCollector) groupBlocksEveryNode(g *haGuest) bool {
+	if !c.rulesOK || !c.clusterOK {
+		return false
+	}
+	for t := range g.tags {
+		if !haGroupTagPattern.MatchString(t) || !namedByAny(c.groupRules(t), g.sid) {
+			continue
+		}
+		held := map[string]bool{}
+		for _, ref := range c.clusterVMs {
+			if ref.VMID == g.ref.VMID {
+				continue
+			}
+			for _, rt := range ref.SplitTags() {
+				if strings.EqualFold(strings.TrimSpace(rt), t) {
+					held[ref.Node] = true
+				}
+			}
+		}
+		others := 0
+		for i := range c.p.Nodes {
+			n := &c.p.Nodes[i]
+			if !n.Online || n.Name == g.ref.Node {
+				continue
+			}
+			others++
+			if !held[n.Name] {
+				return false
+			}
+		}
+		if others > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // inFlight reports whether g carries a birth tag younger than the sweep's

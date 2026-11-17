@@ -82,7 +82,7 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - `pve-cid ha` now reports `maintenance_stranded` as a problem for each started HA VM that is still running on a node in maintenance, because a service the CRM cannot move off the node keeps the node's HA agent from finishing its restart.
 
-- `pve-cid ha` now reports `recovery_stranded` as a problem for each HA VM that the HA manager holds in the recovery state, because a service with no node it may run on stays down until an admissible node returns. The finding names the node the VM was on, and it adds the reason when a strict pin names only that node.
+- `pve-cid ha` now reports `recovery_stranded` as a problem for each HA VM that the HA manager holds in the recovery state, because a service with no node it may run on stays down until an admissible node returns. The finding names the node the VM was on, and it finds a VM on a node that is down through the cluster's VM list, and it adds the reason when a strict pin names only that node or every other node holds a member of its anti-affinity group.
 
 - `pve-cid ha` no longer reports `local_unprotected` for a CPI parker. A parker is a stopped VM that holds detached persistent disks, and it may be a stopped HA resource or sit outside HA by design, so the doctor now leaves any VM that carries the parker tag out of that finding.
 

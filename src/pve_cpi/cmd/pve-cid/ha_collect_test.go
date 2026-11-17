@@ -506,6 +506,50 @@ func TestCollectRecoveryStrandedUnreadableStatus(t *testing.T) {
 	wantNone(t, r, haKindRecoveryStranded)
 }
 
+// fencedRecoveryFake is a cluster where n1 is down and fenced. The per-node
+// guest listing cannot ask n1, so VM 100 is missing from it, while the cluster
+// resource list still names the VM on n1.
+func fencedRecoveryFake() *fakeHA {
+	f := recoveryFake()
+	f.clusterVMs = append([]pve.GuestRef(nil), f.guests...)
+	f.guests, f.excluded = nil, []string{"n1"}
+	f.profile.Nodes[0].Online = false
+	f.profile.Health.Nodes[0].Health = pve.NodeHealthDead
+	return f
+}
+
+func TestCollectRecoveryStrandedOnOfflineNode(t *testing.T) {
+	t.Parallel()
+	f := fencedRecoveryFake()
+	want(t, runCollect(t, f, haCfg("auto", "none")), haKindRecoveryStranded, haSeverityProblem,
+		"vm:100", "was on n1", "waits in recovery")
+	// A VM of another Director on the offline node is out of scope.
+	f.clusterVMs[0].Tags = "bosh-cpi;bosh-ha-managed;bosh-owner--bbbbbbbb-0000"
+	wantNone(t, runCollect(t, f, haCfg("auto", "none")), haKindRecoveryStranded)
+}
+
+func TestCollectRecoveryStrandedAntiAffinityReason(t *testing.T) {
+	t.Parallel()
+	const group = "bosh-aa-0123456789ab"
+	f := fencedRecoveryFake()
+	f.clusterVMs[0].Tags += ";" + group
+	f.clusterVMs = append(f.clusterVMs,
+		pve.GuestRef{VMID: 101, Node: "n2", Name: "vm-101", Tags: "bosh-cpi;" + group, Status: "running"},
+		pve.GuestRef{VMID: 102, Node: "n3", Name: "vm-102", Tags: "bosh-cpi;" + group, Status: "running"})
+	f.rules = []ha.Rule{{
+		ID: group, Type: ha.RuleTypeResourceAffinity, Affinity: "negative", Comment: haMarker,
+		Resources: []string{"vm:100", "vm:101", "vm:102"},
+	}}
+	want(t, runCollect(t, f, haCfg("auto", "none")), haKindRecoveryStranded, haSeverityProblem,
+		"every other node holds a member of its anti-affinity group")
+	// With n3 free of a member the reason is left out.
+	f.clusterVMs = f.clusterVMs[:2]
+	got := findings(runCollect(t, f, haCfg("auto", "none")), haKindRecoveryStranded)
+	if len(got) != 1 || strings.Contains(got[0].Detail, "anti-affinity") {
+		t.Errorf("want one finding without the anti-affinity reason, got %+v", got)
+	}
+}
+
 func TestCollectHoldBlocksMaintenance(t *testing.T) {
 	t.Parallel()
 	f := haBaseFake()
