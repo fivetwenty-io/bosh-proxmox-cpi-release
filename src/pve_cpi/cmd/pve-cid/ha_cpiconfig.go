@@ -189,8 +189,11 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 	multi := &haMultiReport{Clusters: []*haReport{}, SharedExports: []haSharedFinding{}}
 	layouts := make([]pve.ClusterVMIDLayout, 0, len(entries))
 	scopes := entryScopes(entries, base)
+	// One ledger serves every entry, so a node one entry found unreachable is
+	// not asked again by the next entry that reaches the same cluster.
+	ledger := newHANodeLedger()
 	for i := range entries {
-		report, layout := checkCPIConfigEntry(ctx, &entries[i], base, logger, deps, scopes[i])
+		report, layout := checkCPIConfigEntry(ctx, &entries[i], base, logger, deps, scopes[i], ledger)
 		multi.Clusters = append(multi.Clusters, report)
 		layouts = append(layouts, layout)
 	}
@@ -234,9 +237,9 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 // checkCPIConfigEntry reports one cpis entry and gathers the layout the
 // cross-cluster check compares. Any step that cannot finish leaves the layout
 // unchecked with the reason, and the report carries the same reason as a
-// finding.
+// finding. ledger is the run's record of nodes that cannot answer.
 func checkCPIConfigEntry(ctx context.Context, entry *cpiConfigEntry, base *config.CPIConfig, logger *log.Logger,
-	deps haDeps, scope *haEntryScope,
+	deps haDeps, scope *haEntryScope, ledger *haNodeLedger,
 ) (*haReport, pve.ClusterVMIDLayout) {
 	layout := pve.ClusterVMIDLayout{Name: entry.Name}
 	fail := func(mode, reason string) (*haReport, pve.ClusterVMIDLayout) {
@@ -266,7 +269,7 @@ func checkCPIConfigEntry(ctx context.Context, entry *cpiConfigEntry, base *confi
 		return fail(eff.HAModeValue(), fmt.Sprintf("the datacenter next-id range could not be read: %s", err))
 	}
 	layout.Storages, layout.NextID = storages, next
-	report := collectHAScoped(ctx, reader, eff, "", deps.now(), scope)
+	report := collectHAScoped(ctx, newLedgerHAReader(reader, ledger), eff, "", deps.now(), scope)
 	report.Cluster = entry.Name
 	for _, key := range unknown {
 		report.advise(haKindAdvice, key, "the entry's property %q is not one the CPI reads, so it was ignored", key)

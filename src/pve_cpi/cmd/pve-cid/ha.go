@@ -104,7 +104,7 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 		_, _ = fmt.Fprintf(stderr, "pve-cid ha: cannot reach the cluster: %v\n", err)
 		return exitError
 	}
-	report := collectHA(ctx, reader, eff, owner, deps.now())
+	report := collectHA(ctx, newLedgerHAReader(reader, newHANodeLedger()), eff, owner, deps.now())
 	for _, key := range notes {
 		report.advise(haKindAdvice, key, "the request's cpi_config property %q is not one the CPI reads, so it was ignored", key)
 	}
