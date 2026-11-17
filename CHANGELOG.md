@@ -1101,7 +1101,7 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.2...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.3...HEAD
 [0.10.3]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.0...v0.10.1
