@@ -1,9 +1,11 @@
 package pve
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
@@ -180,5 +182,59 @@ func TestListGuestsAuthoritativeTolerant_StatusRecheckTakesOneAttempt(t *testing
 	}
 	if want := 1 + listAttempts; statusCalls != want {
 		t.Fatalf("status read %d times; want %d, one before the fan-out and one per failed listing attempt", statusCalls, want)
+	}
+}
+
+// TestListMemberGuests_RidesOutBlipOnMemberReportedOffline: a member the
+// cluster reports offline is listed anyway, with the full retry budget, so a
+// corosync blip that ends within the budget yields the member's guests.
+func TestListMemberGuests_RidesOutBlipOnMemberReportedOffline(t *testing.T) {
+	t.Parallel()
+	nodesSvc := &lgNodes{
+		listings:  map[string][]string{"pve2": {`{"vmid": 700}`}},
+		failNodes: map[string]error{"pve2": lgProxyUnreachable()},
+	}
+	c := &lgClient{
+		cluster: &lgCluster{nodes: []string{"pve1", "pve2"}, statusFn: lgStatus(map[string]bool{"pve1": true, "pve2": false})},
+		nodes:   nodesSvc,
+	}
+	// The backoff between attempts stands in for the clock: the blip ends
+	// after pve2's third failed listing.
+	ctx := WithTestBackoff(context.Background(), func(int) time.Duration {
+		if nodesSvc.calls["pve2"] >= 3 {
+			delete(nodesSvc.failNodes, "pve2")
+		}
+		return 0
+	})
+	guests, err := ListMemberGuests(ctx, c, nil, []string{"pve2"})
+	if err != nil {
+		t.Fatalf("a blip within the retry budget must be ridden out, got: %v", err)
+	}
+	if len(guests) != 1 || guests[0].VMID != 700 || guests[0].Node != "pve2" {
+		t.Fatalf("guests = %+v; want pve2's guest 700", guests)
+	}
+	if got := nodesSvc.calls["pve2"]; got != 4 {
+		t.Fatalf("pve2 was listed %d times; want 4", got)
+	}
+	if nodesSvc.calls["pve1"] != 0 {
+		t.Fatal("only the named members may be listed")
+	}
+}
+
+// TestListMemberGuests_FailsRetriableAfterBudget: a member that never answers
+// fails the call after the full budget with a retriable error that names it.
+func TestListMemberGuests_FailsRetriableAfterBudget(t *testing.T) {
+	t.Parallel()
+	nodesSvc := &lgNodes{failNodes: map[string]error{"pve2": lgProxyUnreachable()}}
+	c := &lgClient{
+		cluster: &lgCluster{nodes: []string{"pve1", "pve2"}, statusFn: lgStatus(map[string]bool{"pve1": true, "pve2": false})},
+		nodes:   nodesSvc,
+	}
+	_, err := ListMemberGuests(lgCtx(), c, nil, []string{"pve2"})
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !strings.Contains(err.Error(), "pve2") {
+		t.Fatalf("want a retriable error naming pve2, got: %v", err)
+	}
+	if got, want := nodesSvc.calls["pve2"], transientMaxAttemptsDefault(); got != want {
+		t.Fatalf("pve2 was listed %d times; want the full budget of %d", got, want)
 	}
 }

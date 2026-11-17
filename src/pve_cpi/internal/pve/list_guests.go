@@ -110,9 +110,60 @@ func ListGuestsAuthoritativeTolerant(ctx context.Context, c Client, logger *log.
 	// loop already paces the reads, and a status read with its own retries
 	// here would multiply the stall this check exists to cut short.
 	wentOffline := func(node string) bool {
-		return readOfflineClusterNodes(ctx, c, logger, 1)[node]
+		return ClusterReportsMemberOffline(ctx, c, logger, node)
 	}
 	return listGuestsAuthoritative(ctx, c, logger, offlineClusterNodes(ctx, c, logger), wentOffline)
+}
+
+// ListMemberGuests lists the QEMU guests of the named members only, each with
+// the strict form's full retry budget and no offline tolerance. It is for a
+// caller of ListGuestsAuthoritativeTolerant whose answer would rest on what the
+// excluded members hold. A corosync link that drops for a few seconds gets a
+// member excluded even though its guests keep running, and listing it again
+// with the full budget rides out a blip like that before the caller concludes
+// anything from the member's absence. A member that still doesn't answer fails
+// the call with the partial-fleet error, which names it and is retriable for
+// a transport fault.
+func ListMemberGuests(ctx context.Context, c Client, logger *log.Logger, nodes []string) ([]GuestRef, error) {
+	if ctx == nil {
+		return nil, cpierrors.Cloud("ListMemberGuests: ctx must not be nil")
+	}
+	if c == nil || c.Nodes() == nil {
+		return nil, cpierrors.Cloud("ListMemberGuests: nodes service unavailable")
+	}
+	var guests []GuestRef
+	var failedNodes []string
+	var failedErrs []error
+	seen := make(map[string]bool, len(nodes))
+	for _, node := range nodes {
+		if seen[node] {
+			continue
+		}
+		seen[node] = true
+		nodeGuests, err := listNodeGuests(ctx, c, logger, node, nil)
+		if err != nil {
+			failedNodes = append(failedNodes, node)
+			failedErrs = append(failedErrs, err)
+			continue
+		}
+		guests = append(guests, nodeGuests...)
+	}
+	if len(failedNodes) > 0 {
+		return nil, partialFleetError(failedNodes, failedErrs)
+	}
+	return guests, nil
+}
+
+// ClusterReportsMemberOffline reports whether the quorate cluster now reports
+// node offline. It reads /cluster/status with a single attempt, because its
+// callers ask after a read of that node has already failed, and a status read
+// with a retry budget of its own would stretch the stall it exists to cut
+// short. Any failure, and a cluster without quorum, answers false.
+func ClusterReportsMemberOffline(ctx context.Context, c Client, logger *log.Logger, node string) bool {
+	if c == nil {
+		return false
+	}
+	return readOfflineClusterNodes(ctx, c, logger, 1)[node]
 }
 
 // memberWentOfflineError ends a member's listing retries because the quorate
