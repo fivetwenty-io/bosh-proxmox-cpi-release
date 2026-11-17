@@ -261,10 +261,9 @@ func (c splitNodesClient) Nodes() nodes.Service {
 type splitNodesCluster struct{ cluster.Service }
 
 func (splitNodesCluster) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
-	rows := cluster.ListStatusResponse{json.RawMessage(`{"type":"cluster","quorate":1}`)}
-	rows = append(rows,
+	rows := cluster.ListStatusResponse{json.RawMessage(`{"type":"cluster","quorate":1}`),
 		json.RawMessage(`{"type":"node","name":"n1","online":1,"local":1,"maxcpu":8,"maxmem":17179869184,"mem":1073741824,"cpu":0.1}`),
-		json.RawMessage(`{"type":"node","name":"n2","online":1,"local":0,"maxcpu":8,"maxmem":17179869184,"mem":1073741824,"cpu":0.1}`))
+		json.RawMessage(`{"type":"node","name":"n2","online":1,"local":0,"maxcpu":8,"maxmem":17179869184,"mem":1073741824,"cpu":0.1}`)}
 	return &rows, nil
 }
 
