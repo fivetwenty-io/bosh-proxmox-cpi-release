@@ -31,6 +31,8 @@ type attachHAStub struct {
 	state     string
 	comment   string
 	rebalance bool
+	// node is where the index places the VM, pve01 when it is empty.
+	node string
 }
 
 func (s *attachHAStub) GetHaResources(_ context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {
@@ -48,7 +50,11 @@ func (s *attachHAStub) GetHaResources(_ context.Context, sid string) (*cluster.G
 func (s *attachHAStub) ListResources(context.Context, *cluster.ListResourcesParams) (*cluster.ListResourcesResponse,
 	error,
 ) {
-	raw, _ := json.Marshal(map[string]any{"type": "qemu", "vmid": 100, "node": "pve01", "id": "qemu/100"})
+	node := s.node
+	if node == "" {
+		node = "pve01"
+	}
+	raw, _ := json.Marshal(map[string]any{"type": "qemu", "vmid": 100, "node": node, "id": "qemu/100"})
 	return &cluster.ListResourcesResponse{raw}, nil
 }
 

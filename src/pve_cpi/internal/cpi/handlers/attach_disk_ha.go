@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -182,12 +183,40 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 	if err != nil {
 		return nil, err
 	}
+	narrow := attachNarrowDeps(deps.PVE, logger, haMotionWait(deps))
+	if len(d.Outside) > 0 {
+		// The VM runs under HA on a node outside the set it may run on with
+		// the new disk, which is where an HA migration the CRM had queued
+		// leaves it. PVE HA moves it into the set first, so it keeps HA, and
+		// the decision runs again on the node it moved to.
+		moved, err := attachMoveIntoSet(ctx, deps, narrow, profile, vmid, loc.Node, d.Outside, oldPin, rd)
+		if err != nil {
+			return nil, err
+		}
+		if moved != "" {
+			loc.Node = moved
+			if cfg, err = deps.PVE.QEMU().Config(ctx, moved, vmid); err != nil {
+				return nil, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
+					fmt.Sprintf("%s: read the config of VM %d for its HA decision after PVE HA moved it", op, vmid))
+			}
+			in = attachHAInput(deps, vmid, moved, cfg, res, oldPin, rd)
+			if d, err = profile.DecideVM(in); err != nil {
+				return nil, err
+			}
+			if len(d.Outside) > 0 {
+				return nil, cpierrors.Retriable("%s: PVE HA moved VM %d to node %s, and the VM is still outside its "+
+					"admissible set %s with the new disk, so the attach waits and the VM keeps its HA resource, "+
+					"its tag, and its pin. %s", op, vmid, moved, strings.Join(d.Outside, ","),
+					attachMoveAction(vmid, d.Outside))
+			}
+		}
+	}
 	for _, w := range d.Warnings {
 		logger.Warn(op+": "+w, log.Int(metadataKeyVMID, vmid))
 	}
 	h := &attachHA{
 		deps: deps, logger: logger, vmCID: vmCID, disk: rd, vmid: vmid, sid: sid, node: loc.Node,
-		profile: profile, decision: d, oldPin: oldPin, narrow: ha.NarrowDepsFor(deps.PVE, logger, haMotionWait(deps)),
+		profile: profile, decision: d, oldPin: oldPin, narrow: narrow,
 		replicaTagged: configHasReplicaTag(cfg),
 	}
 	// A transient refusal and a placeable shortfall come before the failure,
@@ -239,6 +268,80 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 		h.action = attachHALeave
 	}
 	return h, nil
+}
+
+// attachNarrowDeps wires the barrier, the removal from HA, and the move into
+// a node set to a client. Tests replace it to script PVE HA.
+var attachNarrowDeps = ha.NarrowDepsFor
+
+// attachMoveIntoSet asks PVE HA to move an HA-managed VM that runs on node,
+// outside set, its admissible set with the new disk, to a node of set (see
+// ha.MoveIntoSet). It returns the node the VM moved to.
+//
+// When the move does not happen, the VM keeps HA wherever leaving HA would not
+// help. A node that is down defers the attach in every mode, because PVE HA
+// recovers the VM by itself. Mode managed defers too, because it never takes a
+// VM out of HA. Mode auto takes the VM out of HA only when its node reaches the
+// new disk's storage, so the attach can then run there. It logs a warning that
+// names the VM, the set, and why the move did not happen, and returns "" with
+// no error, which leaves the decision's skip in place. A node that does not
+// reach the storage defers the attach, because the VM would leave HA and the
+// attach would still fail. Every error is retriable and names the set and what
+// an operator can do.
+func attachMoveIntoSet(ctx context.Context, deps Deps, narrow ha.NarrowDeps, profile *ha.Profile, vmid int,
+	node string, set []string, pin *ha.Rule, rd resolvedDisk,
+) (string, error) {
+	const op = attachHAOp
+	logger := deps.Log(ctx)
+	where := strings.Join(set, ",")
+	logger.Info(op+": the HA-managed VM runs outside its admissible set with the new disk, so PVE HA moves it "+
+		"into the set before the attach", log.Int(metadataKeyVMID, vmid), log.String("node", node),
+		log.String("set", where))
+	loc, err := ha.MoveIntoSet(ctx, narrow, ha.MoveInput{
+		VMID: vmid, Node: node, Set: set, Targets: ha.MoveTargets(profile, set, pin, node),
+		Budget: haMotionWait(deps),
+	})
+	if err == nil {
+		return loc.Node, nil
+	}
+	action := attachMoveAction(vmid, set)
+	keep := func(why string, cause error) error {
+		msg := fmt.Sprintf("%s: VM %d is HA-managed and runs on node %s, outside its admissible set %s with the new "+
+			"disk, and PVE HA did not move it into the set%s, so the attach waits and the VM keeps its HA resource, "+
+			"its tag, and its pin", op, vmid, node, where, why)
+		return cpierrors.WrapAs(fmt.Errorf("%w. %s", cause, action), cpierrors.TypeRetriableCloud, msg)
+	}
+	var moveErr *ha.MoveError
+	if errors.As(err, &moveErr) && moveErr.Failure == ha.MoveNodeDown {
+		return "", keep("", err)
+	}
+	if deps.Config.HAModeValue() == config.HAModeManaged {
+		return "", keep(", and pve.ha.mode managed never takes a VM out of HA", err)
+	}
+	if fitErr := storageFitsVMNode(ctx, deps, op, rd.volid, "", node); fitErr != nil {
+		logger.Warn(op+": PVE HA did not move the VM into its admissible set, and its node does not reach the new "+
+			"disk's storage, so the VM keeps HA and the attach waits", log.Int(metadataKeyVMID, vmid),
+			log.String("node", node), log.String("set", where), log.String("reason", err.Error()),
+			log.String("storage", fitErr.Error()))
+		return "", keep(", and leaving HA would not let the attach run there because the node does not reach the "+
+			"new disk's storage", err)
+	}
+	logger.Warn(op+": PVE HA did not move the VM into its admissible set, and its node reaches the new disk's "+
+		"storage, so the VM leaves PVE HA before the attach",
+		log.Int(metadataKeyVMID, vmid), log.String("node", node), log.String("set", where),
+		log.String("reason", err.Error()))
+	return "", nil
+}
+
+// attachMoveAction says what an operator does about an HA-managed VM outside
+// its admissible set.
+func attachMoveAction(vmid int, set []string) string {
+	example := "<node>"
+	if len(set) > 0 {
+		example = set[0]
+	}
+	return fmt.Sprintf("To fix it, migrate the VM to a node of %s, for example with ha-manager migrate %s %s, "+
+		"and retry the attach", strings.Join(set, ","), haResourceSid(vmid), example)
 }
 
 // pendingAttachLeave finishes, on the next attach, a removal from HA that an
@@ -506,6 +609,12 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 		Unchanged:  h.attachUnchanged,
 		Moving:     h.attachMoving,
 		Reregister: h.reregister,
+		MoveInto: func(ctx context.Context, node string, set []string) (pve.VMLocation, error) {
+			return ha.MoveIntoSet(ctx, narrowDeps, ha.MoveInput{
+				VMID: h.vmid, Node: node, Set: set, Targets: ha.MoveTargets(h.profile, set, h.newPin, node),
+				Budget: haMotionWait(h.deps),
+			})
+		},
 		SysConsole: h.profile.SysConsole,
 		Budget:     haMotionWait(h.deps),
 	})
