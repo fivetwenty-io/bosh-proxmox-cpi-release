@@ -786,6 +786,9 @@ func (c *attachRunClient) MigrationTasks(
 		return nil, errors.New("no task listing stubbed")
 	}
 	c.tasks.calls = append(c.tasks.calls, "migrations:"+node)
+	if err := c.tasks.migrationErr[node]; err != nil {
+		return nil, err
+	}
 	if err := c.tasks.err[node]; err != nil {
 		return nil, err
 	}
@@ -798,18 +801,19 @@ func (c *attachRunClient) MigrationTasks(
 	return out, nil
 }
 
-// taskListStub holds the move and migration tasks of each node, and a
-// listing error per node.
+// taskListStub holds the move and migration tasks of each node, a listing
+// error per node for both listings, and one for the migration listing alone.
 type taskListStub struct {
-	moves      map[string][]pve.ActiveTask
-	migrations map[string][]pve.MigrationTask
-	err        map[string]error
-	calls      []string
+	moves        map[string][]pve.ActiveTask
+	migrations   map[string][]pve.MigrationTask
+	err          map[string]error
+	migrationErr map[string]error
+	calls        []string
 }
 
 func newTaskListStub() *taskListStub {
 	return &taskListStub{moves: map[string][]pve.ActiveTask{}, migrations: map[string][]pve.MigrationTask{},
-		err: map[string]error{}}
+		err: map[string]error{}, migrationErr: map[string]error{}}
 }
 
 // migrated records a qmigrate task of VM vmid on node that ran from start to

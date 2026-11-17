@@ -1,10 +1,14 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
@@ -59,15 +63,30 @@ func TestPrepareAttachReplicaRebuild_HAWriteRefusalKeepsTheJob(t *testing.T) {
 // to a VM that has its pin and its job but no HA resource of this Director.
 // The leave path's resume owns that VM, so the rebuild changes nothing.
 func TestPrepareAttachReplicaRebuild_VMOutOfHAGetsNoRebuild(t *testing.T) {
-	r := newRebuildRig()
-	r.stub.missing = true
-	pin := r.pinComment()
-	rb, err := prepareAttachReplicaRebuild(crhCtx(), r.deps, "100", parkedNFSDisk())
-	if err != nil || rb != nil {
-		t.Fatalf("rebuild %+v err %v, want none for a VM out of HA", rb, err)
+	cases := map[string]func(r *replicaRig){
+		"HA resource gone": func(r *replicaRig) { r.stub.missing = true },
+		"HA resource foreign": func(r *replicaRig) {
+			r.stub.comment = haIdentity{Owner: "other-director"}.marker()
+		},
+		"HA resource gone with the token left and the job gone": func(r *replicaRig) {
+			r.stub.missing = true
+			r.repl.jobs = nil
+			r.setPin("pve01", func(c string) string { return ha.WithReplicaRebuild(c, "pve02") })
+		},
 	}
-	if r.repl.called("delete:") || len(r.repl.jobs) != 1 || r.pinComment() != pin {
-		t.Fatalf("calls %v jobs %v pin %q; nothing changes", r.repl.calls, r.repl.jobs, r.pinComment())
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := newRebuildRig()
+			setup(r)
+			jobs, pin := len(r.repl.jobs), r.pinComment()
+			rb, err := prepareAttachReplicaRebuild(crhCtx(), r.deps, "100", parkedNFSDisk())
+			if err != nil || rb != nil {
+				t.Fatalf("rebuild %+v err %v, want none for a VM out of this Director's HA", rb, err)
+			}
+			if r.repl.called("delete:") || len(r.repl.jobs) != jobs || r.pinComment() != pin {
+				t.Fatalf("calls %v jobs %v pin %q; nothing changes", r.repl.calls, r.repl.jobs, r.pinComment())
+			}
+		})
 	}
 }
 
@@ -98,8 +117,8 @@ func TestPrepareAttachReplicaRebuild_WaitsForAMoveInFlight(t *testing.T) {
 			reason: "is running",
 		},
 		"task listing unreadable": {
-			setup:  func(r *replicaRig) { r.tasks.migrations, r.tasks.err["pve01"] = nil, errNeedsSysAudit },
-			reason: "Sys.Audit",
+			setup:  func(r *replicaRig) { r.tasks.migrationErr["pve01"] = errNeedsSysAudit },
+			reason: "list the migration tasks on node pve01",
 		},
 	}
 	for name, tc := range cases {
@@ -165,5 +184,105 @@ func TestAttachReplicaRebuildMarksOnlyARemovedJob(t *testing.T) {
 	rb, err = prepareAttachReplicaRebuild(crhCtx(), removed.deps, "100", parkedNFSDisk())
 	if err != nil || rb == nil || !rb.removed || !replicaRebuildInFlight(rb.marked(crhCtx())) {
 		t.Fatalf("rebuild %+v err %v; a rebuild that removed the job marks the attach", rb, err)
+	}
+}
+
+// haMotionCluster is the rebuild rig's cluster with a fresh CRM view that
+// holds the VM's HA service in the state the test sets.
+type haMotionCluster struct {
+	taggedIndexStub
+	manager *cluster.ListHaStatusManagerStatusResponse
+}
+
+func (c haMotionCluster) ListHaStatusManagerStatus(context.Context) (*cluster.ListHaStatusManagerStatusResponse,
+	error,
+) {
+	return c.manager, nil
+}
+
+// haMotionClient serves haMotionCluster and a node clock, so the CRM view
+// reads as fresh.
+type haMotionClient struct {
+	*attachRunClient
+	cluster haMotionCluster
+}
+
+func (c haMotionClient) Cluster() cluster.Service { return c.cluster }
+
+func (c haMotionClient) Nodes() sdknodes.Service {
+	return HAClockNodes{Service: c.attachRunClient.Nodes()}
+}
+
+// TestPrepareAttachReplicaRebuild_WaitsForAnHAMove is a rebuild of a VM whose
+// HA service PVE is migrating or relocating. The job stays and the attach is
+// retriable, while a started service lets the rebuild remove the job.
+func TestPrepareAttachReplicaRebuild_WaitsForAnHAMove(t *testing.T) {
+	for _, state := range []string{"migrate", "relocate", "started"} {
+		t.Run(state, func(t *testing.T) {
+			r := newRebuildRig()
+			r.stub.resources["vm:100"] = true
+			client := r.deps.PVE.(*attachRunClient)
+			manager := HAFreshManagerStatus(time.Now().Unix(), "pve01", []string{"pve02", "pve03"},
+				map[string]HASceneService{"vm:100": {State: state, Node: "pve01", UID: "u1"}})
+			r.deps.PVE = haMotionClient{attachRunClient: client,
+				cluster: haMotionCluster{taggedIndexStub: client.cluster.(taggedIndexStub), manager: manager}}
+			rb, err := prepareAttachReplicaRebuild(crhCtx(), r.deps, "100", parkedNFSDisk())
+			if state == "started" {
+				if err != nil || rb == nil || !rb.removed || !r.repl.called("delete:100-0:force=false") {
+					t.Fatalf("rebuild %+v err %v calls %v; a settled VM has its job removed", rb, err, r.repl.calls)
+				}
+				return
+			}
+			if rb != nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) ||
+				!strings.Contains(err.Error(), "may be migrating") {
+				t.Fatalf("rebuild %+v err %v, want the retriable deferral", rb, err)
+			}
+			if r.repl.called("delete:") || len(r.repl.jobs) != 1 {
+				t.Fatalf("calls %v jobs %v; the job stays while PVE HA moves the VM", r.repl.calls, r.repl.jobs)
+			}
+		})
+	}
+}
+
+// movingIndexCluster is the rebuild rig's cluster whose index moves VM 100 to
+// pve02 once the rebuild has written the VM's pin, as a migration that starts
+// between the pin write and the job's removal would.
+type movingIndexCluster struct {
+	taggedIndexStub
+	pinWritten *bool
+}
+
+func (c movingIndexCluster) UpdateHaRules(ctx context.Context, rule string, p *cluster.UpdateHaRulesParams) error {
+	*c.pinWritten = true
+	return c.taggedIndexStub.UpdateHaRules(ctx, rule, p)
+}
+
+func (c movingIndexCluster) ListResources(ctx context.Context, p *cluster.ListResourcesParams) (
+	*cluster.ListResourcesResponse, error,
+) {
+	if *c.pinWritten {
+		c.node = "pve02"
+	}
+	return c.taggedIndexStub.ListResources(ctx, p)
+}
+
+// TestPrepareAttachReplicaRebuild_WaitsForAVMThatLeftItsNode is a rebuild
+// whose VM is on another node by the time the job would be removed. The job
+// stays and the attach is retriable.
+func TestPrepareAttachReplicaRebuild_WaitsForAVMThatLeftItsNode(t *testing.T) {
+	r := newRebuildRig()
+	client := r.deps.PVE.(*attachRunClient)
+	written := false
+	client.cluster = movingIndexCluster{taggedIndexStub: client.cluster.(taggedIndexStub), pinWritten: &written}
+	rb, err := prepareAttachReplicaRebuild(crhCtx(), r.deps, "100", parkedNFSDisk())
+	if !written {
+		t.Fatalf("rebuild %+v err %v; the rebuild never wrote the pin", rb, err)
+	}
+	if rb != nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) ||
+		!strings.Contains(err.Error(), "runs on node pve02") {
+		t.Fatalf("rebuild %+v err %v, want the retriable deferral naming pve02", rb, err)
+	}
+	if r.repl.called("delete:") || len(r.repl.jobs) != 1 {
+		t.Fatalf("calls %v jobs %v; the job stays while the VM is elsewhere", r.repl.calls, r.repl.jobs)
 	}
 }
