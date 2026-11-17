@@ -580,11 +580,11 @@ We have two ways out. We can bring the member back, and the next retry reads the
 **Symptom**
 
 ```text
-set_disk_metadata: disk "pvd-..." is not attached to a VM on any online node, and the cluster reports pve3 offline, so it may be attached to a VM there; metadata not persisted; retry once pve3 is back in the cluster
+set_disk_metadata: disk "pvd-..." is not attached to a VM on any online node, and the cluster reports pve3 offline, so it may be attached to a VM there; metadata not persisted: ListGuestsAuthoritative: could not list guests on node(s) pve3; refusing to decide from a partial fleet; the cluster reports node(s) pve3 offline, and their guests' configs can't be read until they return, so retry once node(s) pve3 are back in the cluster
 create_disk: no allocation submitted: create_disk: hinted VM is not on any online node, and the cluster reports pve3 offline, and listing it again did not find the VM there either
 ```
 
-When the second listing of the node itself fails, the node's listing error follows the message.
+The `set_disk_metadata` message ends with the error from its second listing of the node. When the cluster reports the node online again by the time that listing fails, the listing error doesn't call the node offline, so the message itself says `retry once pve3 is back in the cluster` before it.
 
 **Diagnosis**
 

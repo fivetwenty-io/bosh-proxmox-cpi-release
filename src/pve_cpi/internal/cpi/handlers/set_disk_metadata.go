@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -616,9 +617,17 @@ func (s *diskHolderScan) rescanOffline(ctx context.Context, deps Deps, bareDiskC
 	nodes := s.offline
 	guests, err := pve.ListMemberGuests(ctx, deps.PVE, deps.Log(ctx), nodes)
 	if err != nil {
+		// A listing refusal that names the members as offline already says
+		// to retry once they are back, so the wrapper leaves that out rather
+		// than say it twice.
+		retry := "; retry once " + strings.Join(nodes, ", ") + " is back in the cluster"
+		var enumeration *pve.GuestEnumerationError
+		if errors.As(err, &enumeration) && len(enumeration.Offline) > 0 {
+			retry = ""
+		}
 		return cpierrors.Wrap(err, fmt.Sprintf(
-			"set_disk_metadata: disk %q is not attached to a VM on any online node, and the cluster reports %s offline, so it may be attached to a VM there; metadata not persisted; retry once %s is back in the cluster",
-			diskCID, strings.Join(nodes, ", "), strings.Join(nodes, ", ")))
+			"set_disk_metadata: disk %q is not attached to a VM on any online node, and the cluster reports %s offline, so it may be attached to a VM there; metadata not persisted%s",
+			diskCID, strings.Join(nodes, ", "), retry))
 	}
 	s.offline = nil
 	return s.scanGuests(ctx, deps, guests, bareDiskCID)

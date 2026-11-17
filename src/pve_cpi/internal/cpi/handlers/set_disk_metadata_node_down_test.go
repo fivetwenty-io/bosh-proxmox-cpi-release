@@ -113,14 +113,45 @@ func TestHandleSetDiskMetadata_DiskOnDownNodeFailsRetriable(t *testing.T) {
 	if !strings.Contains(err.Error(), diskMetaDownNode) {
 		t.Fatalf("the error must name the offline member, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "retry once "+diskMetaDownNode+" is back in the cluster") {
-		t.Fatalf("the error must say to retry once the offline member is back, got: %v", err)
+	want := `set_disk_metadata: disk "` + mustEncodeDiskCID(t, testDiskCID, nil) + `" is not attached to a VM on any online node, ` +
+		"and the cluster reports pve-down offline, so it may be attached to a VM there; metadata not persisted: " +
+		"ListGuestsAuthoritative: could not list guests on node(s) pve-down; refusing to decide from a partial fleet; " +
+		"the cluster reports node(s) pve-down offline, and their guests' configs can't be read until they return, " +
+		"so retry once node(s) pve-down are back in the cluster"
+	if err.Error() != want {
+		t.Fatalf("the error must say to retry once, in the listing refusal\ngot:  %s\nwant: %s", err, want)
 	}
 	if nodesSvc.capturedDesc != nil || nodesSvc.capturedTags != nil {
 		t.Fatal("nothing may be written when the holder can't be found")
 	}
 	if got := nodesSvc.listCalls[diskMetaDownNode]; got != pve.DefaultTransientMaxAttempts {
 		t.Fatalf("the offline member must get one strict listing with the full budget, got %d listing attempts", got)
+	}
+}
+
+// TestHandleSetDiskMetadata_RelistOfMemberBackOnlineSaysRetryOnce: a member
+// the cluster reports offline during the scan, and online again while its
+// strict relist still fails, gets a listing refusal that doesn't call it
+// offline, so the call's own error says to retry once it is back, and says it
+// once.
+func TestHandleSetDiskMetadata_RelistOfMemberBackOnlineSaysRetryOnce(t *testing.T) {
+	t.Parallel()
+	nodesSvc, client := diskMetaNodeDownFixture(t, diskMetaDownNode)
+	client.clusterSvc.(*diskMetaClusterSvc).statusFn = func() (*sdkclusterapi.ListStatusResponse, error) {
+		return diskMetaStatus(nodesSvc.listCalls[diskMetaDownNode] > 0)
+	}
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(client))
+
+	_, err := h.Handle(nodeDownCtx(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("a relist that never answers must fail the call")
+	}
+	want := `set_disk_metadata: disk "` + mustEncodeDiskCID(t, testDiskCID, nil) + `" is not attached to a VM on any online node, ` +
+		"and the cluster reports pve-down offline, so it may be attached to a VM there; metadata not persisted; " +
+		"retry once pve-down is back in the cluster: " +
+		"ListGuestsAuthoritative: could not list guests on node(s) pve-down; refusing to decide from a partial fleet"
+	if err.Error() != want {
+		t.Fatalf("the error must say to retry once, in the call's own text\ngot:  %s\nwant: %s", err, want)
 	}
 }
 
