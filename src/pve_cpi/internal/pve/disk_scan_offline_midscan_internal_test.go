@@ -1,6 +1,7 @@
 package pve
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -86,5 +87,63 @@ func TestFindVMByDiskVolid_ConfigErrorOnOnlineNodeStillFails(t *testing.T) {
 	_, _, err := FindVMByDiskVolid(lgCtx(), c, "local-lvm:vm-700-disk-0")
 	if err == nil || !strings.Contains(err.Error(), "Config error for vm 596") {
 		t.Fatalf("want the config error on the online node, got: %v", err)
+	}
+}
+
+// TestResolveDiskHolderScan_CreatedVolumeRidesOutANodeLeftOutMidScan: a node
+// the cluster begins reporting offline during the scan leaves the answer
+// unproven for every volume, except one the request created, which resolves
+// as held by nothing.
+func TestResolveDiskHolderScan_CreatedVolumeRidesOutANodeLeftOutMidScan(t *testing.T) {
+	t.Parallel()
+	const volid = "local-lvm:vm-700-disk-0"
+	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999}
+
+	c, _ := midScanFlipClient(false, false)
+	holder, err := resolveDiskHolderScan(lgCtx(), c, nil, volid, cfg, nil, VolumeCreatedByThisRequest(volid))
+	if err != nil {
+		t.Fatalf("a volume this request created must resolve while a node drops mid-scan, got: %v", err)
+	}
+	if holder.found {
+		t.Fatalf("holder = %+v; want no holder", holder)
+	}
+
+	c, _ = midScanFlipClient(false, false)
+	_, err = resolveDiskHolderScan(lgCtx(), c, nil, volid, cfg, nil, CreatedVolume{})
+	var refusal *DiskHolderOfflineRefusal
+	if !errors.As(err, &refusal) || len(refusal.Nodes) != 1 || refusal.Nodes[0] != "pve1" {
+		t.Fatalf("without the created record the scan must refuse naming pve1, got: %v", err)
+	}
+}
+
+// TestResolveDiskHolderScan_CreatedVolumeKeepsAConfigErrorOnAnOnlineNode: the
+// created record excuses only nodes the cluster reports offline. A config
+// read that fails on a node still reported online fails the scan as before.
+func TestResolveDiskHolderScan_CreatedVolumeKeepsAConfigErrorOnAnOnlineNode(t *testing.T) {
+	t.Parallel()
+	const volid = "local-lvm:vm-700-disk-0"
+	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999}
+
+	c, _ := midScanFlipClient(false, true)
+	_, err := resolveDiskHolderScan(lgCtx(), c, nil, volid, cfg, nil, VolumeCreatedByThisRequest(volid))
+	if err == nil || !strings.Contains(err.Error(), "Config error for vm 596") {
+		t.Fatalf("want the config error on the online node, got: %v", err)
+	}
+}
+
+// TestResolveDiskHolderScan_CreatedVolumeStillSeesAHolder: the created record
+// never hides a holder the scan found on a node it could read.
+func TestResolveDiskHolderScan_CreatedVolumeStillSeesAHolder(t *testing.T) {
+	t.Parallel()
+	const volid = "local-lvm:vm-700-disk-0"
+	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999}
+
+	c, _ := midScanFlipClient(true, false)
+	holder, err := resolveDiskHolderScan(lgCtx(), c, nil, volid, cfg, nil, VolumeCreatedByThisRequest(volid))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !holder.found || holder.vmid != 700 || holder.node != "pve2" {
+		t.Fatalf("holder = %+v; want VM 700 on pve2", holder)
 	}
 }

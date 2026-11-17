@@ -246,6 +246,14 @@ type ParkContext struct {
 	// landed it as the volume on that slot. It isn't part of the provenance
 	// entry.
 	ClaimLandings []RecordedLanding
+	// Created says the calling request created the volume it parks, and
+	// names it. ParkDisk reads it only for the volume it names. When the
+	// holder scan finds no holder and its only gap is nodes the cluster
+	// reports offline, ParkDisk parks that volume, because no guest can hold
+	// a volume created moments earlier by the same request. Only create_disk
+	// sets it, from VolumeCreatedByThisRequest. The transfer and resume
+	// entry points ignore it, and it isn't part of the provenance entry.
+	Created CreatedVolume
 }
 
 // RecordedLanding is one move a disk's allocation record observed, from the
@@ -1709,7 +1717,7 @@ type diskHolder struct {
 // of the same answer, so ParkDisk resolves the holder once and reads both from
 // it rather than paying for the sweep twice on every detach.
 func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVolid string, cfg ParkerConfig) (diskHolder, error) {
-	return resolveDiskHolderScan(ctx, c, logger, bareVolid, cfg, nil)
+	return resolveDiskHolderScan(ctx, c, logger, bareVolid, cfg, nil, CreatedVolume{})
 }
 
 // vanishedParker names an in-band holder whose config vanished between the
@@ -1721,13 +1729,18 @@ type vanishedParker struct {
 
 // resolveDiskHolderScan is resolveDiskHolder. vanished is nil on the first
 // scan, and it names the gone holder on the one scan that follows a holder
-// whose config vanished.
+// whose config vanished. created names the volume when the calling request
+// created it, and is the zero value otherwise. See createdVolumeHolderGap.
 func resolveDiskHolderScan(
 	ctx context.Context, c Client, logger *log.Logger, bareVolid string, cfg ParkerConfig, vanished *vanishedParker,
+	created CreatedVolume,
 ) (diskHolder, error) {
 	hit, found, err := findVMByDiskVolidHit(ctx, c, bareVolid)
 	if err != nil {
-		return diskHolder{}, err
+		if !createdVolumeHolderGap(logger, created, bareVolid, err) {
+			return diskHolder{}, err
+		}
+		hit, found = DiskScanHit{}, false
 	}
 	refs := hit.StorageReferences
 	if !found {
@@ -1764,7 +1777,7 @@ func resolveDiskHolderScan(
 					logger.Info("the parker the holder scan named is gone; scanning once more for the disk's holder",
 						log.Int("vmid", holderVMID), log.String("node", holderNode), log.String("volid", bareVolid))
 				}
-				return resolveDiskHolderScan(ctx, c, logger, bareVolid, cfg, &gone)
+				return resolveDiskHolderScan(ctx, c, logger, bareVolid, cfg, &gone, created)
 			}
 			return vanishedHolderAnswer(cfg, gone, bareVolid, refs)
 		}
@@ -1802,6 +1815,30 @@ func resolveDiskHolderScan(
 		found: true, vmid: holderVMID, node: holderNode, isParker: true, slot: slot, tags: tagsRaw,
 		storageReferences: refs,
 	}, nil
+}
+
+// createdVolumeHolderGap reports whether the holder scan's error err may be
+// read as "no guest holds the volume" for bareVolid. That holds only when
+// created names bareVolid and err is the scan's refusal for nodes the cluster
+// reports offline, which the scan returns only after it read every other
+// node's guests and found no holder on any of them. A volume the calling
+// request created moments earlier can't be on any guest's config, offline
+// nodes included, so for that volume the refusal guards nothing. Any other
+// error, and the same refusal for any other volume, is returned as it was.
+func createdVolumeHolderGap(logger *log.Logger, created CreatedVolume, bareVolid string, err error) bool {
+	if !created.names(bareVolid) {
+		return false
+	}
+	var refusal *DiskHolderOfflineRefusal
+	if !errors.As(err, &refusal) || refusal.Volid != bareVolid {
+		return false
+	}
+	if logger != nil {
+		logger.Info("the holder scan could not read the guests of nodes the cluster reports offline; "+
+			"this request created the disk, so no guest can hold it, and the park goes ahead",
+			log.String("volid", bareVolid), log.String("offline_nodes", strings.Join(refusal.Nodes, ",")))
+	}
+	return true
 }
 
 // vanishedHolderAnswer answers for a disk whose in-band holder vanished and
@@ -1991,6 +2028,10 @@ func ParkedFromHolder(h DiskHolder, bareVolid string) (vmid int, node, slot stri
 // The algorithm:
 //  1. One cluster-wide holder scan, read two ways: already parked -> nil, held
 //     by a real VM -> refuse (parking would double-reference a live volume).
+//     A scan that found no holder but left out nodes the cluster reports
+//     offline refuses, unless pctx.Created names bareVolid. A volume the
+//     request created moments earlier can't be held by any guest, so for it
+//     that scan counts as finding no holder.
 //  2. List the same-prefix parkers on node and attach to the lowest one with a
 //     free slot, creating a parker only when none exists or all are full. A
 //     parker of another prefix is never a candidate, even with slots to spare.
@@ -2024,7 +2065,10 @@ func ParkDisk(ctx context.Context, c Client, logger *log.Logger, node, bareVolid
 	if cfg.FallbackNode == "" {
 		cfg.FallbackNode = node
 	}
-	holder, scanErr := resolveDiskHolder(ctx, c, logger, bareVolid, cfg)
+	// pctx.Created names the volume when this request created it. For that
+	// volume alone, a scan whose only gap is offline nodes counts as finding
+	// no holder, because nothing can hold a volume created moments ago.
+	holder, scanErr := resolveDiskHolderScan(ctx, c, logger, bareVolid, cfg, nil, pctx.Created)
 	if scanErr != nil {
 		return cpierrors.Wrap(scanErr, "ParkDisk: holder scan")
 	}

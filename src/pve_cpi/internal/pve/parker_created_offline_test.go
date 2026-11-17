@@ -89,8 +89,24 @@ func requireOfflineRefusal(t *testing.T, err error, where string) {
 	}
 }
 
-// TestParkDisk_ExistingDiskStillRefusesWhileANodeIsOffline: a park whose
-// holder scan can't read an offline node refuses, names the offline node, and tells
+// TestParkDisk_CreatedVolumeParksWhileANodeIsOffline: a volume the request
+// just created is parked even though the holder scan can't read the offline
+// node's guests, because no guest can hold it yet.
+func TestParkDisk_CreatedVolumeParksWhileANodeIsOffline(t *testing.T) {
+	t.Parallel()
+	c, attaches := offlineParkCluster()
+	pctx := pve.ParkContext{Created: pve.VolumeCreatedByThisRequest(offlineParkVolid)}
+
+	if err := pve.ParkDisk(context.Background(), c, nopLogger(), "pve1", offlineParkVolid, parkerTestCfg(), pctx); err != nil {
+		t.Fatalf("a volume this request created must park while a node is offline, got: %v", err)
+	}
+	if *attaches != 1 {
+		t.Fatalf("AttachDisk calls = %d; want the one park attach", *attaches)
+	}
+}
+
+// TestParkDisk_ExistingDiskStillRefusesWhileANodeIsOffline: without the
+// created record, the same park refuses, names the offline node, and tells
 // the operator to retry once it is back. Nothing is attached.
 func TestParkDisk_ExistingDiskStillRefusesWhileANodeIsOffline(t *testing.T) {
 	t.Parallel()
@@ -98,6 +114,21 @@ func TestParkDisk_ExistingDiskStillRefusesWhileANodeIsOffline(t *testing.T) {
 
 	err := pve.ParkDisk(context.Background(), c, nopLogger(), "pve1", offlineParkVolid, parkerTestCfg(), pve.ParkContext{})
 	requireOfflineRefusal(t, err, "ParkDisk")
+	if *attaches != 0 {
+		t.Fatalf("AttachDisk calls = %d; want none after the refusal", *attaches)
+	}
+}
+
+// TestParkDisk_CreatedRecordForAnotherVolumeStillRefuses: a created record
+// covers only the volume it names. Parking any other volume with it keeps the
+// refusal.
+func TestParkDisk_CreatedRecordForAnotherVolumeStillRefuses(t *testing.T) {
+	t.Parallel()
+	c, attaches := offlineParkCluster()
+	pctx := pve.ParkContext{Created: pve.VolumeCreatedByThisRequest("local-lvm:vm-9002-disk-0")}
+
+	err := pve.ParkDisk(context.Background(), c, nopLogger(), "pve1", offlineParkVolid, parkerTestCfg(), pctx)
+	requireOfflineRefusal(t, err, "ParkDisk with another volume's record")
 	if *attaches != 0 {
 		t.Fatalf("AttachDisk calls = %d; want none after the refusal", *attaches)
 	}
