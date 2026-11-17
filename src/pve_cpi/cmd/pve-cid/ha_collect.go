@@ -251,9 +251,9 @@ func healthEntry(p *ha.Profile, name string) (pve.NodeHealthEntry, bool) {
 	if p.Health == nil {
 		return pve.NodeHealthEntry{}, false
 	}
-	for _, e := range p.Health.Nodes {
-		if e.Name == name {
-			return e, true
+	for i := range p.Health.Nodes {
+		if p.Health.Nodes[i].Name == name {
+			return p.Health.Nodes[i], true
 		}
 	}
 	return pve.NodeHealthEntry{}, false
@@ -532,7 +532,8 @@ func (c *haCollector) profileFindings() {
 		rep.problem(haKindObserveOnly, "", "%s", detail)
 	}
 	if p.Health != nil {
-		for _, n := range p.Health.Nodes {
+		for i := range p.Health.Nodes {
+			n := &p.Health.Nodes[i]
 			if n.DeadOrFenced {
 				rep.problem(haKindNodeDown, n.Name, "the node is offline, unknown, fenced, or gone: %s", n.Reason)
 			}

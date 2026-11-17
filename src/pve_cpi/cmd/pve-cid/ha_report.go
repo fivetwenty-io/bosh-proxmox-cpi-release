@@ -160,8 +160,8 @@ func (r *haReport) writeText(w io.Writer, indent string) {
 	p := func(format string, args ...any) { _, _ = fmt.Fprintf(w, indent+format+"\n", args...) }
 	p("%s", r.Profile)
 	p("nodes:")
-	for _, n := range r.Nodes {
-		p("  %s", nodeLine(n))
+	for i := range r.Nodes {
+		p("  %s", nodeLine(r.Nodes[i]))
 	}
 	p("cpu migration domains:")
 	if len(r.CPUDomains) == 0 {

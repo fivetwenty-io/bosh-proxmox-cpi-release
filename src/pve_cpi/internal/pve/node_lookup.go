@@ -77,13 +77,13 @@ func storageReadNode(ctx context.Context, c Client, what string, storageNodes, p
 	if len(storageNodes) == 0 {
 		// Online nodes come before nodes in maintenance, which still answer
 		// but are the last resort.
-		for _, e := range report.Nodes {
-			if e.ProxyTarget && e.Health == NodeHealthOnline {
+		for i := range report.Nodes {
+			if e := &report.Nodes[i]; e.ProxyTarget && e.Health == NodeHealthOnline {
 				return e.Name, nil
 			}
 		}
-		for _, e := range report.Nodes {
-			if e.ProxyTarget {
+		for i := range report.Nodes {
+			if e := &report.Nodes[i]; e.ProxyTarget {
 				return e.Name, nil
 			}
 		}

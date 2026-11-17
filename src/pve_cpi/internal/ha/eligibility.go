@@ -1159,8 +1159,8 @@ func (p *Profile) nodeNames() []string {
 func (p *Profile) placeableSet() map[string]bool {
 	out := map[string]bool{}
 	if p.Health != nil {
-		for _, e := range p.Health.Nodes {
-			if e.Placeable {
+		for i := range p.Health.Nodes {
+			if e := &p.Health.Nodes[i]; e.Placeable {
 				out[e.Name] = true
 			}
 		}

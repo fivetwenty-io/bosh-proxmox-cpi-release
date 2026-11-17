@@ -57,8 +57,8 @@ func placeableNodeCount(p *ha.Profile) int {
 	}
 	if p.Health != nil {
 		n := 0
-		for _, e := range p.Health.Nodes {
-			if e.Placeable {
+		for i := range p.Health.Nodes {
+			if p.Health.Nodes[i].Placeable {
 				n++
 			}
 		}

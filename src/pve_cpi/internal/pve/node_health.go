@@ -444,8 +444,8 @@ type haInputs struct {
 func (r *NodeHealthReport) reindex() {
 	sort.Slice(r.Nodes, func(i, j int) bool { return r.Nodes[i].Name < r.Nodes[j].Name })
 	r.index = make(map[string]int, len(r.Nodes))
-	for i, e := range r.Nodes {
-		r.index[e.Name] = i
+	for i := range r.Nodes {
+		r.index[r.Nodes[i].Name] = i
 	}
 }
 
