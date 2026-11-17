@@ -723,7 +723,7 @@ Each finding is either a problem or advice. The command exits with 0 when the re
   `observe_only`, `node_down`, `entry_clock_unreadable`, `quorum_fragile`, `qdevice_advice`, `advice`, and `crs_mode`.
 
 - Rules and resources
-  `rule_problem`, `rule_unmarked`, `pin_missing`, `anti_affinity_skipped`, `anti_affinity_split`, `anti_affinity_short`, `anti_affinity_ambiguous`, `resource_ignored`, and `managed_without_resource`.
+  `rule_problem`, `rule_unmarked`, `pin_missing`, `soft_pin_resource_affinity`, `anti_affinity_skipped`, `anti_affinity_split`, `anti_affinity_short`, `anti_affinity_ambiguous`, `resource_ignored`, and `managed_without_resource`.
 
 - CPU and local storage
   `cpu_unknown`, `cpu_host_multi_domain`, `cpu_pin_crosses_domain`, `cpu_domain_too_small`, `local_unprotected`, `hold_blocks_maintenance`, `maintenance_stranded`, and `recovery_stranded`.
