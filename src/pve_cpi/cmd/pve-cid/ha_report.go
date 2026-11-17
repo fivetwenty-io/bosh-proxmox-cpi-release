@@ -43,6 +43,7 @@ const (
 	haKindReplicaRecordedOrph = "replica_recorded_orphan"
 	haKindReplicaSuperseded   = "replica_superseded_copy"
 	haKindReplicaNoJournal    = "replica_journal_unconfigured"
+	haKindReplicaMarkerEncode = "replica_marker_encoded"
 	haKindHoldMaintenance     = "hold_blocks_maintenance"
 	haKindHeadroomShort       = "headroom_short"
 	haKindHeadroomUnavailable = "headroom_unavailable"

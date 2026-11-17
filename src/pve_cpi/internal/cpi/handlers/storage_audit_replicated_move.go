@@ -11,6 +11,7 @@ import (
 	"time"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
@@ -49,6 +50,9 @@ type StorageReplicaMove struct {
 type replicaJobMarker struct {
 	Owner      string
 	Generation uint64
+	// Encoded is true when PVE percent-encoded the comment again after the
+	// CPI wrote it, so the marker reads canonically only once decoded.
+	Encoded bool
 }
 
 // renderReplicaJobMarker renders the comment of a replication job the CPI
@@ -63,15 +67,17 @@ func renderReplicaJobMarker(owner string, generation uint64) string {
 // generation, or a generation that is not a positive integer, because each of
 // those could be a reused job ID or a hand edit, and neither proves the job is
 // the one the journal recorded. Unknown keys are ignored so a later field
-// does not orphan the job.
+// does not orphan the job. The marker is read through ha.MarkerFields, so a
+// comment PVE percent-encoded again on a later write of replication.cfg still
+// reads as the marker it holds, and Encoded says so.
 func parseReplicaJobMarker(comment string) (replicaJobMarker, bool) {
-	fields := strings.Fields(comment)
-	if len(fields) == 0 || fields[0] != haMarkerPrefix {
+	fields, encoded, ok := ha.MarkerFields(comment)
+	if !ok {
 		return replicaJobMarker{}, false
 	}
-	var marker replicaJobMarker
+	marker := replicaJobMarker{Encoded: encoded}
 	seenOwner, seenGeneration := false, false
-	for _, field := range fields[1:] {
+	for _, field := range fields {
 		key, value, ok := strings.Cut(field, "=")
 		if !ok {
 			continue

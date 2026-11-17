@@ -40,7 +40,7 @@ const (
 	haBirthTagPrefix = "bosh-creating-"
 	// haMarkerPrefix opens the ownership marker in a rule, resource, or
 	// replication job comment.
-	haMarkerPrefix = "bosh-cpi:v1"
+	haMarkerPrefix = ha.MarkerPrefix
 	// haPinRulePrefix starts the name of a node-affinity pin, bosh-na-<vmid>.
 	haPinRulePrefix = "bosh-na-"
 	// haGroupRulePrefix starts the name of an anti-affinity rule and of its
@@ -68,13 +68,15 @@ func haRunsUnderHA(state string) bool {
 
 // haMarkerOwner reads the ownership marker at the start of a comment. ok is
 // false when the comment holds none, which is how an object from an older CPI
-// looks. owner is empty when the marker names no Director.
+// looks. owner is empty when the marker names no Director. The marker is read
+// through ha.MarkerFields, so a comment PVE encoded again still reads as the
+// marker it holds.
 func haMarkerOwner(comment string) (owner string, ok bool) {
-	fields := strings.Fields(comment)
-	if len(fields) == 0 || fields[0] != haMarkerPrefix {
+	fields, _, ok := ha.MarkerFields(comment)
+	if !ok {
 		return "", false
 	}
-	for _, f := range fields[1:] {
+	for _, f := range fields {
 		if key, val, found := strings.Cut(f, "="); found && key == "owner" && val != "-" {
 			owner = val
 		}
@@ -84,14 +86,15 @@ func haMarkerOwner(comment string) (owner string, ok bool) {
 
 // haJobMarker reports whether a replication job's comment holds the marker the
 // CPI writes, which carries an owner and a positive generation. A comment
-// without both is not a job the CPI can vouch for.
+// without both is not a job the CPI can vouch for. Like haMarkerOwner, it
+// reads a comment PVE encoded again as the marker it holds.
 func haJobMarker(comment string) bool {
-	fields := strings.Fields(comment)
-	if len(fields) == 0 || fields[0] != haMarkerPrefix {
+	fields, _, ok := ha.MarkerFields(comment)
+	if !ok {
 		return false
 	}
 	var owner, gen bool
-	for _, f := range fields[1:] {
+	for _, f := range fields {
 		key, val, found := strings.Cut(f, "=")
 		if !found {
 			continue
@@ -861,6 +864,7 @@ func (c *haCollector) jobHealth() {
 		return
 	}
 	for _, j := range c.markedJobs() {
+		c.encodedMarker(j)
 		st, ok := c.jobStatus[j.ID]
 		if !ok {
 			continue
@@ -891,6 +895,23 @@ func (c *haCollector) jobHealth() {
 				j.ID, c.now.Sub(st.LastSync).Round(time.Second), interval, schedule)
 		}
 	}
+}
+
+// encodedMarker advises on a CPI job whose comment PVE percent-encoded again
+// after the CPI wrote it. PVE does that to every job's comment when one
+// scheduler pass writes replication.cfg more than once, as when HA recovers
+// several replicated guests onto one node. This CPI still reads the marker,
+// but a CPI that predates the tolerant reader disowns the job, so the advice
+// names the command that restores the canonical comment.
+func (c *haCollector) encodedMarker(j ha.ReplicaJobState) {
+	if _, encoded, ok := ha.MarkerFields(j.Comment); !ok || !encoded {
+		return
+	}
+	c.rep.advise(haKindReplicaMarkerEncode, "job "+j.ID,
+		"PVE percent-encoded the comment of replication job %s again when it rewrote replication.cfg, so it "+
+			"reads %q. This CPI still reads it as its marker, but an older CPI does not, and the CPI rewrites it "+
+			"only when it next writes the job's marker. To restore it now, run pvesr update %s --comment '%s'",
+		j.ID, j.Comment, j.ID, ha.DecodedMarkerComment(j.Comment))
 }
 
 // journalRecord returns the journal record of the replicated VM vmid.

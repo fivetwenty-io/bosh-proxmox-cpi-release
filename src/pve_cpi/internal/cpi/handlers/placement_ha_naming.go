@@ -13,7 +13,7 @@ import (
 // haMarkerPrefix opens the ownership marker the CPI writes into the comment of
 // every HA rule and HA resource it creates. The version lets a later format
 // change be told apart from this one.
-const haMarkerPrefix = "bosh-cpi:v1"
+const haMarkerPrefix = ha.MarkerPrefix
 
 // haHashLen is the number of hex characters of the group hash that name an
 // anti-affinity rule and its member tag. PVE rule IDs follow the pve-configid
@@ -91,14 +91,16 @@ type haMarker struct {
 
 // parseHaMarker reads the ownership marker at the start of a comment. It
 // reports false when the comment holds no marker, which is how a rule or
-// resource from an older CPI looks.
+// resource from an older CPI looks. It reads the marker through
+// ha.MarkerFields, like every reader of a CPI comment, so a comment PVE
+// encoded again still reads as the marker it holds.
 func parseHaMarker(comment string) (haMarker, bool) {
-	fields := strings.Fields(comment)
-	if len(fields) == 0 || fields[0] != haMarkerPrefix {
+	fields, _, ok := ha.MarkerFields(comment)
+	if !ok {
 		return haMarker{}, false
 	}
 	var m haMarker
-	for _, f := range fields[1:] {
+	for _, f := range fields {
 		key, val, ok := strings.Cut(f, "=")
 		if !ok {
 			continue

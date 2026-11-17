@@ -511,7 +511,9 @@ func (w *replicaWiden) adoptSwappedReplicaJob(
 		return job, "", fmt.Errorf("record the new direction of replication job %s: %w", job.ID, err)
 	}
 	comment := renderReplicaJobMarker(rep.Owner, gen)
-	if marker.Generation != gen {
+	// The write also runs when PVE encoded the comment again, so the job
+	// carries the canonical marker for an older CPI and for operators.
+	if marker.Generation != gen || marker.Encoded {
 		if err := w.api.SetComment(ctx, job.ID, comment); err != nil {
 			return job, "", fmt.Errorf("write generation %d into the marker of replication job %s: %w", gen, job.ID,
 				pve.WrapError(err))
@@ -971,15 +973,17 @@ func ensureCreatedReplicaJob(
 }
 
 // markKeptReplicaJob writes generation gen into the marker of job, a job of
-// this Director that the setup keeps, when the marker carries another one,
-// and reads the job back to prove the write. The journal confirms gen only
-// after this, so the widening's check that the marker carries the record's
-// generation holds (see journalEvidence). Every failure is retriable, and the
-// journal keeps gen pending, so the retry writes the same marker.
+// this Director that the setup keeps, when the marker carries another one or
+// PVE encoded the comment again, and reads the job back to prove the write.
+// The journal confirms gen only after this, so the widening's check that the
+// marker carries the record's generation holds (see journalEvidence). Every
+// failure is retriable, and the journal keeps gen pending, so the retry
+// writes the same marker. The read back accepts a marker PVE encoded again
+// meanwhile, because the CPI reads such a marker as its own.
 func markKeptReplicaJob(
 	ctx context.Context, api ha.ReplicationAPI, op string, job ha.ReplicaJobState, vmid int, owner string, gen uint64,
 ) error {
-	if m, ok := parseReplicaJobMarker(job.Comment); ok && m.Generation == gen {
+	if m, ok := parseReplicaJobMarker(job.Comment); ok && m.Generation == gen && !m.Encoded {
 		return nil
 	}
 	if err := api.SetComment(ctx, job.ID, renderReplicaJobMarker(owner, gen)); err != nil {
