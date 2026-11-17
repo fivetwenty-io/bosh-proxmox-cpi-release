@@ -181,14 +181,14 @@ func (r *ISOStorageResolver) Resolve(ctx context.Context) string {
 	}
 }
 
-// ResolveISOStorage implements the opt-in pve.iso_storage_follow_vm_storage
-// resolution. Handlers reach it through an ISOStorageResolver, which runs it
-// against the cluster a request targets on first use and remembers a
-// conclusive answer, so the boot agent and the HA migration-safety checks see
-// the same effective iso_storage.
+// ResolveISOStorage implements the pve.iso_storage_follow_vm_storage
+// resolution, which is on by default because nil reads as true. Handlers reach
+// it through an ISOStorageResolver, which runs it against the cluster a request
+// targets on first use and remembers a conclusive answer, so the boot agent and
+// the HA migration-safety checks see the same effective iso_storage.
 //
 // Resolution order:
-//  1. iso_storage_follow_vm_storage is false (default), or cfg is nil, or the
+//  1. iso_storage_follow_vm_storage is explicitly false, or cfg is nil, or the
 //     effective agent mode is not cloudinit/auto (ISO storage is unused by
 //     noagent) -> cfg.ISOStorage unchanged, zero PVE calls.
 //  2. cfg.ISOStorage differs from the spec default "local" -> the operator
