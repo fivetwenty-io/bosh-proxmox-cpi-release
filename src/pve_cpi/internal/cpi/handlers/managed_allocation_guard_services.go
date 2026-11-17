@@ -575,6 +575,13 @@ func (t *managedPoolService) CreatePool(ctx context.Context, poolID, comment str
 		t.guard.rememberLockRefusal(poolID, held, err)
 		return err
 	}
+	if isManagedLockPool(poolID) && pve.IsCfsLockNoQuorum(err) {
+		// PVE never took its user.cfg lock, so the create never ran. The
+		// refusal settles like the duplicate verdict, and the lock code
+		// reports the lost quorum instead of an uncertain create.
+		t.guard.forgetLockRefusal(poolID)
+		return t.guard.settleRefused(ctx, m, token, managedLockPoolRejection{poolID: poolID, method: m.Method}, err)
+	}
 	t.guard.forgetLockRefusal(poolID)
 	err = t.guard.finish(ctx, m, token, nil, err)
 	return

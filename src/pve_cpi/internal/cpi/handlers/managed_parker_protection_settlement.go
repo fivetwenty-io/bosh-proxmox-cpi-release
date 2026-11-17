@@ -438,6 +438,8 @@ func parkerLockFailure(lockErr error) string {
 		return "the request ended while it waited for it"
 	case errors.Is(lockErr, pve.ErrClusterLockClaimTooShort):
 		return "the CPI confirmed its claim too late to use it"
+	case errors.Is(lockErr, pve.ErrClusterLockNoQuorum):
+		return "PVE refused its create because the cluster has no quorum"
 	case errors.Is(lockErr, pve.ErrClusterLockStateUnknown):
 		return "PVE never confirmed who holds it"
 	case errors.Is(lockErr, pve.ErrMutationNotAttempted):

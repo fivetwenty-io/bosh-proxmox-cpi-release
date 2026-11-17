@@ -379,6 +379,10 @@ func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) 
 // conditions send the record to reconciliation, and the next call's readback
 // settles the step.
 //
+// pve.ErrClusterLockNoQuorum counts the same way. PVE refused the sentinel
+// create because the cluster has no quorum, so nothing was created, and the
+// guard settled the create as a refusal.
+//
 // pve.ErrClusterLockClaimTooShort counts the same way. The acquire confirmed
 // its claim too late to use it and gave it up without entering the window,
 // and on its way out it reads and deletes its sentinel exactly as the
@@ -399,7 +403,8 @@ func (m *managedDiskLifecycle) cleanLockTimeout(operationErr error) bool {
 // isLockWaitWithoutEntry reports whether err is a lock acquire that gave up
 // without entering the work its lock guards. That is a wait that ran out
 // (pve.ErrClusterLockTimeout), an acquire that could not tell who holds the
-// lock (pve.ErrClusterLockStateUnknown), one that confirmed its claim too late
+// lock (pve.ErrClusterLockStateUnknown), one whose create PVE refused for lack
+// of quorum (pve.ErrClusterLockNoQuorum), one that confirmed its claim too late
 // to use it (pve.ErrClusterLockClaimTooShort), a wait a cancelled request cut
 // short (pve.ErrClusterLockInterrupted), a mutation the guard refused on an
 // ended request (errManagedRequestEnded), and a mutation the guard refused
@@ -408,7 +413,8 @@ func (m *managedDiskLifecycle) cleanLockTimeout(operationErr error) bool {
 // and the journaled steps.
 func isLockWaitWithoutEntry(err error) bool {
 	return errors.Is(err, pve.ErrClusterLockTimeout) || errors.Is(err, pve.ErrClusterLockStateUnknown) ||
-		errors.Is(err, pve.ErrClusterLockClaimTooShort) || errors.Is(err, pve.ErrClusterLockInterrupted) ||
+		errors.Is(err, pve.ErrClusterLockNoQuorum) || errors.Is(err, pve.ErrClusterLockClaimTooShort) ||
+		errors.Is(err, pve.ErrClusterLockInterrupted) ||
 		errors.Is(err, errManagedRequestEnded) || errors.Is(err, errManagedAdmissionReadFailed)
 }
 

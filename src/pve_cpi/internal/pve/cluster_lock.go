@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -897,8 +898,14 @@ func holderUnknown(pool, step string, err error) error {
 // unavailable to this identity rather than that somebody holds it. Neither
 // case reads or deletes anything.
 //
+// PVE's answer that it could not take its cluster filesystem lock for want of
+// quorum (IsCfsLockNoQuorum) is a refusal too. PVE puts that text in place of
+// the lock wait's timeout only when it never took the lock, so the code that
+// would have written the pool never ran. The error joins
+// ErrClusterLockNoQuorum, and nothing is read or deleted on the way out.
+//
 // Every other failure has an unknown outcome. That covers a transport fault, a
-// cancelled or expired context, a gateway status, and any 5xx. PVE may have
+// cancelled or expired context, a gateway status, and any other 5xx. PVE may have
 // applied the create, and a claim of ours would then block every other
 // acquirer for a whole TTL, so abandonLockCreate reads the sentinel back and
 // deletes it when that read proves it ours. The error joins
@@ -916,6 +923,10 @@ func createFailed(
 	if code, answered := pveAnswered(createErr); answered && code < 500 {
 		return cpierrors.WrapAs(errors.Join(createErr, ErrClusterLockCreateRefused), cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("AcquireClusterLock: %s %q", step, pool))
+	}
+	if IsCfsLockNoQuorum(createErr) {
+		return cpierrors.WrapAs(errors.Join(createErr, ErrClusterLockNoQuorum), cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("AcquireClusterLock: %s %q was refused because the cluster has no quorum", step, pool))
 	}
 	return giveUpLockCreate(ctx, pools, pool, owner, settings, clk,
 		cpierrors.WrapAs(errors.Join(createErr, ErrClusterLockStateUnknown), cpierrors.TypeRetriableCloud,
@@ -1293,6 +1304,33 @@ func lockOwnerToken(owner string) string {
 // the lock mechanism is unavailable, and a caller must not run the guarded
 // work unserialized beside a sentinel that may be ours or a live holder's.
 var ErrClusterLockStateUnknown = errors.New("cluster lock state unknown")
+
+// ErrClusterLockNoQuorum marks an acquire whose sentinel create PVE refused
+// because the cluster has no quorum (see IsCfsLockNoQuorum). The refusal
+// proves that no sentinel was created, so the acquire reads and deletes
+// nothing on its way out. It is not ErrClusterLockCreateRefused, because it
+// says nothing about this identity's access to the lock, and a caller must not
+// run its work unserialized after it. No write to the cluster's configuration
+// can land until quorum returns anyway.
+var ErrClusterLockNoQuorum = errors.New("cluster lock create refused for lack of quorum")
+
+// cfsLockNoQuorum matches PVE's text for a cluster filesystem lock it could not
+// take because the cluster has no quorum, as in
+// "create pool failed: cfs-lock 'file-user_cfg' error: no quorum!".
+var cfsLockNoQuorum = regexp.MustCompile(`cfs-lock '[^']+' error: no quorum!`)
+
+// IsCfsLockNoQuorum reports whether err is PVE's own answer that it refused a
+// write because it could not take a cluster filesystem lock without quorum.
+// PVE's cfs_lock waits about ten seconds for the lock. When that wait runs out
+// and the cluster is not quorate, it replaces the timeout with "no quorum!",
+// and it does so only when it never took the lock, so the code the lock guards
+// never ran. Only an HTTP 500 that PVE itself sent counts. A gateway status, a
+// 595, a timeout, or a broken connection never matches, even when its text
+// does, because the request may still have been applied.
+func IsCfsLockNoQuorum(err error) bool {
+	code, answered := pveAnswered(err)
+	return answered && code == http.StatusInternalServerError && cfsLockNoQuorum.MatchString(err.Error())
+}
 
 // ErrClusterLockClaimTooShort marks an acquire that confirmed its own claim
 // too late to use it, because the reads that confirm it failed until less
