@@ -738,28 +738,15 @@ func (p *aaPlanner) assignPending(
 		if s == "" || assigned[s] {
 			continue
 		}
-		target, roomy, refused, bad := 0, false, []string(nil), map[string][]string{}
-		for n := 1; n <= maxIndex && target == 0; n++ {
-			if len(desired[n]) >= room {
-				continue
-			}
-			roomy = true
-			if p.heal || s != p.sid {
-				if conflicts := p.joinConflicts(set, existing[n], n, desired[n], s); len(conflicts) > 0 {
-					refused = append(refused, aaChunkName(p.ident.ruleName(), n))
-					maps.Copy(bad, conflicts)
-					continue
-				}
-			}
-			target = n
-		}
-		if target == 0 && !roomy && (p.split || maxIndex == 0) {
+		fit := p.fitMember(set, existing, desired, maxIndex, room, s)
+		target := fit.target
+		if target == 0 && !fit.roomy && (p.split || maxIndex == 0) {
 			maxIndex++
 			target = maxIndex
 		}
 		if target == 0 {
-			if len(refused) > 0 {
-				p.logConflicted(s, strings.Join(refused, ","), bad)
+			if len(fit.refused) > 0 {
+				p.logConflicted(s, strings.Join(fit.refused, ","), fit.bad)
 			} else {
 				p.logOverflow(s, len(desired[1]))
 			}
@@ -769,6 +756,46 @@ func (p *aaPlanner) assignPending(
 		desired[target] = append(desired[target], s)
 	}
 	return maxIndex
+}
+
+// memberFit is where a pending member fits among the group's rules.
+type memberFit struct {
+	// target is the first rule with room that s can join, or 0.
+	target int
+	// roomy says that at least one rule had room.
+	roomy bool
+	// refused names the rules with room that s's join would make conflict,
+	// and bad holds the conflicts those joins bring on.
+	refused []string
+	bad     map[string][]string
+}
+
+// fitMember tries s in each of the group's rules that holds fewer than room
+// members, in index order, and returns the first one where its join brings
+// on no conflict. The create's own VM is never checked, except in a heal.
+func (p *aaPlanner) fitMember(
+	set *ha.RuleSet, existing map[int]*ha.Rule, desired map[int][]string, maxIndex, room int, s string,
+) memberFit {
+	var fit memberFit
+	for n := 1; n <= maxIndex; n++ {
+		if len(desired[n]) >= room {
+			continue
+		}
+		fit.roomy = true
+		if p.heal || s != p.sid {
+			if conflicts := p.joinConflicts(set, existing[n], n, desired[n], s); len(conflicts) > 0 {
+				fit.refused = append(fit.refused, aaChunkName(p.ident.ruleName(), n))
+				if fit.bad == nil {
+					fit.bad = map[string][]string{}
+				}
+				maps.Copy(fit.bad, conflicts)
+				continue
+			}
+		}
+		fit.target = n
+		return fit
+	}
+	return fit
 }
 
 // joinConflicts returns the feasibility conflicts that adding s to the
