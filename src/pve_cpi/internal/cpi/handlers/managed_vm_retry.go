@@ -51,9 +51,17 @@ func beginManagedVMRetry(ctx context.Context, deps Deps, parsed *createVMParsedA
 	if err != nil {
 		return nil, err
 	}
-	if intent.IntentFingerprint != original.IntentFingerprint || intent.PolicyFingerprint != original.PolicyFingerprint || intent.FrozenInputsFingerprint != original.FrozenInputsFingerprint {
+	frozenMatch, err := storageJournalFrozenInputsMatch(original.FrozenInputsFingerprint, selection, next.inventory, next.plan)
+	if err != nil {
+		return nil, err
+	}
+	if intent.IntentFingerprint != original.IntentFingerprint || intent.PolicyFingerprint != original.PolicyFingerprint || !frozenMatch {
 		return nil, fmt.Errorf("retry policy or frozen membership changed; no replacement allocated")
 	}
+	// The journal requires every attempt to repeat the fingerprint the record
+	// was opened with, which is in the snake_case form when 0.10.0 through
+	// 0.10.2 opened it, so the attempt carries the stored value.
+	intent.FrozenInputsFingerprint = original.FrozenInputsFingerprint
 	attempt := aj.AttemptPlan{Version: aj.AttemptVersion, PolicyFingerprint: intent.PolicyFingerprint, FrozenInputsFingerprint: intent.FrozenInputsFingerprint, PlanVersion: intent.PlanVersion, Plan: intent.Plan}
 	if err := handle.BeginAttempt(attempt, aj.AttemptVerification{Verification: proof, OutcomesKnown: true}); err != nil {
 		return nil, err

@@ -129,6 +129,8 @@ type StoragePlanTarget struct {
 }
 
 // StorageAllocationPlan retains the complete storage and compute decision for replay.
+// Its definitions write the 0.9.x key form and read both that and the form
+// 0.10.0 through 0.10.2 wrote (see StorageDefinitions).
 type StorageAllocationPlan struct {
 	VMExecution                                           *StorageVMExecution `json:",omitempty"`
 	Version                                               int
@@ -139,7 +141,7 @@ type StorageAllocationPlan struct {
 	Charges                                               []inv.ChargeRecord
 	Rankings                                              []rank.RankedCandidate
 	Strategies                                            map[string]rank.Policy
-	Definitions                                           map[string]pve.StorageInfo
+	Definitions                                           StorageDefinitions
 	CapacityDomains                                       map[string][]string
 	Rejections                                            []string
 	// Group is the sanitized instance group of this allocation. The omitempty

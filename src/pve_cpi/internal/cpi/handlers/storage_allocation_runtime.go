@@ -52,8 +52,32 @@ func storageJournalIntent(method string, args []json.RawMessage, selection *Stor
 	if err != nil {
 		return allocationjournal.Intent{}, err
 	}
+	frozen, err := storageJournalFrozenInputs(selection, inventory, plan)
+	if err != nil {
+		return allocationjournal.Intent{}, err
+	}
+	frozenFP, err := frozen.fingerprint()
+	if err != nil {
+		return allocationjournal.Intent{}, err
+	}
+	payload, err := json.Marshal(plan)
+	if err != nil {
+		return allocationjournal.Intent{}, err
+	}
+	return allocationjournal.Intent{IntentFingerprint: intentFP, PolicyFingerprint: plan.PolicyFingerprint, FrozenInputsFingerprint: frozenFP, PlanVersion: plan.Version, Plan: payload}, nil
+}
+
+// storageJournalFrozenInputs resolves what the frozen-inputs fingerprint
+// covers. That is the inventory's nodes, the membership of every set the
+// selection names, the definition of every storage named by those sets, by
+// the plan's capacity domains, definitions, or targets, and the plan's policy
+// fingerprint.
+func storageJournalFrozenInputs(selection *StoragePlacementSelection, inventory *storageinventory.Snapshot, plan *StorageAllocationPlan) (storageFrozenInputs, error) {
+	if selection == nil || selection.Policy == nil || inventory == nil || plan == nil {
+		return storageFrozenInputs{}, fmt.Errorf("storage journal requires a supported complete allocation plan")
+	}
 	memberships := map[string][]string{}
-	definitions := map[string]pve.StorageInfo{}
+	definitions := StorageDefinitions{}
 	addID := func(id string) error {
 		def, ok := inventory.Definition(id)
 		if !ok {
@@ -67,52 +91,51 @@ func storageJournalIntent(method string, args []json.RawMessage, selection *Stor
 	for name := range names {
 		members, ok := inventory.Members(name)
 		if !ok {
-			return allocationjournal.Intent{}, fmt.Errorf("frozen set %q missing", name)
+			return storageFrozenInputs{}, fmt.Errorf("frozen set %q missing", name)
 		}
 		sort.Strings(members)
 		memberships[name] = members
 		for _, id := range members {
 			if err := addID(id); err != nil {
-				return allocationjournal.Intent{}, err
+				return storageFrozenInputs{}, err
 			}
 		}
 	}
 	for _, members := range plan.CapacityDomains {
 		for _, id := range members {
 			if err := addID(id); err != nil {
-				return allocationjournal.Intent{}, err
+				return storageFrozenInputs{}, err
 			}
 		}
 	}
 	for id := range plan.Definitions {
 		if err := addID(id); err != nil {
-			return allocationjournal.Intent{}, err
+			return storageFrozenInputs{}, err
 		}
 	}
 	for rangeIndex98 := range plan.Targets {
 		if err := addID(plan.Targets[rangeIndex98].StorageID); err != nil {
-			return allocationjournal.Intent{}, err
+			return storageFrozenInputs{}, err
 		}
 		if plan.Targets[rangeIndex98].Source != nil {
 			if err := addID(plan.Targets[rangeIndex98].Source.StorageID); err != nil {
-				return allocationjournal.Intent{}, err
+				return storageFrozenInputs{}, err
 			}
 		}
 	}
-	frozenFP, err := allocationjournal.Fingerprint(struct {
-		Nodes             []string
-		Memberships       map[string][]string
-		Definitions       map[string]pve.StorageInfo
-		PolicyFingerprint string
-	}{inventory.Nodes(), memberships, definitions, plan.PolicyFingerprint})
+	return storageFrozenInputs{Nodes: inventory.Nodes(), Memberships: memberships, Definitions: definitions, PolicyFingerprint: plan.PolicyFingerprint}, nil
+}
+
+// storageJournalFrozenInputsMatch reports whether stored is the frozen-inputs
+// fingerprint of these inputs. A record opened by 0.10.0 through 0.10.2 holds
+// a fingerprint over the snake_case definitions, and every other release
+// writes one over the 0.9.x form, so either one matches.
+func storageJournalFrozenInputsMatch(stored string, selection *StoragePlacementSelection, inventory *storageinventory.Snapshot, plan *StorageAllocationPlan) (bool, error) {
+	frozen, err := storageJournalFrozenInputs(selection, inventory, plan)
 	if err != nil {
-		return allocationjournal.Intent{}, err
+		return false, err
 	}
-	payload, err := json.Marshal(plan)
-	if err != nil {
-		return allocationjournal.Intent{}, err
-	}
-	return allocationjournal.Intent{IntentFingerprint: intentFP, PolicyFingerprint: plan.PolicyFingerprint, FrozenInputsFingerprint: frozenFP, PlanVersion: plan.Version, Plan: payload}, nil
+	return frozen.matches(stored)
 }
 
 func activeStorageAllocationPlan(record allocationjournal.Record) (*StorageAllocationPlan, error) {
@@ -146,19 +169,29 @@ func activeStorageAllocationPlan(record allocationjournal.Record) (*StorageAlloc
 // audit the identity of a plan against the record that owns it, and a sibling
 // is not ours to audit. The owner's own decode through
 // activeStorageAllocationPlan stays strict and is not affected by this one.
+//
+// The definitions decode through lenientStorageDefinitions, which a shallower
+// field in the wrapper selects over the plan's own strict one. They still
+// read in either key form, so the mount flag survives whichever release wrote
+// the sibling, and they ignore an unknown key like the rest of this decode.
 func siblingStorageAllocationPlan(record allocationjournal.Record) (*StorageAllocationPlan, error) {
 	active := record.ActivePlan()
 	if active.PlanVersion != 1 {
 		return nil, cpierrors.Cloud("allocation %s uses an unsupported plan version; audit required", record.ID)
 	}
 	d := json.NewDecoder(bytes.NewReader(active.Plan))
-	var plan StorageAllocationPlan
-	if err := d.Decode(&plan); err != nil {
+	var wire struct {
+		StorageAllocationPlan
+		Definitions lenientStorageDefinitions
+	}
+	if err := d.Decode(&wire); err != nil {
 		return nil, cpierrors.Cloud("allocation %s has invalid plan evidence; audit required", record.ID)
 	}
 	if err := d.Decode(new(any)); err != io.EOF {
 		return nil, cpierrors.Cloud("allocation %s has invalid plan evidence; audit required", record.ID)
 	}
+	plan := wire.StorageAllocationPlan
+	plan.Definitions = StorageDefinitions(wire.Definitions)
 	return &plan, nil
 }
 

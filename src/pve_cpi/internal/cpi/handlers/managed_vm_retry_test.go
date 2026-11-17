@@ -13,7 +13,7 @@ import (
 )
 
 func TestManagedVMRetryPreservesGenerationAndFrozenBounds(t *testing.T) {
-	for _, mode := range []string{"same-policy", "changed-policy", "budget-exhausted", "changed-execution"} {
+	for _, mode := range []string{"same-policy", "snake-frozen-fingerprint", "changed-policy", "budget-exhausted", "changed-execution", "changed-frozen-fingerprint"} {
 		t.Run(mode, func(t *testing.T) {
 			testManagedVMRetryMode(t, mode)
 		})
@@ -59,6 +59,20 @@ func testManagedVMRetryMode(t *testing.T, mode string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	switch mode {
+	case "snake-frozen-fingerprint":
+		// A record that 0.10.0 through 0.10.2 opened holds the fingerprint
+		// over the snake_case definitions.
+		frozen, err := storageJournalFrozenInputs(req.Selection, req.Inventory, plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if intent.FrozenInputsFingerprint, err = frozen.snakeFingerprint(); err != nil {
+			t.Fatal(err)
+		}
+	case "changed-frozen-fingerprint":
+		intent.FrozenInputsFingerprint = strings.Repeat("f", 64)
+	}
 	handle, err := journal.AcquireVM(context.Background(), "agent", intent)
 	if err != nil {
 		t.Fatal(err)
@@ -93,7 +107,7 @@ func testManagedVMRetryMode(t *testing.T, mode string) {
 	next := &managedVMPlan{selection: req.Selection, collector: collector, inventory: req.Inventory, plan: &nextPlan}
 	deps := Deps{Config: req.Selection.Policy, Logger: log.NewNopLogger()}
 	runtime, err := beginManagedVMRetry(context.Background(), deps, &createVMParsedArgs{agentID: "agent"}, req.Selection, handle, next, proof("fresh independent admission after cleanup"))
-	if mode != "same-policy" {
+	if mode != "same-policy" && mode != "snake-frozen-fingerprint" {
 		if err == nil || handle.Record().ActiveAttempt() != 0 {
 			t.Fatal("changed constraint or exhausted budget admitted replacement")
 		}
@@ -111,6 +125,9 @@ func testManagedVMRetryMode(t *testing.T, mode string) {
 	}
 	if active.VMExecution.MaxAttempts != 2 || active.Seed[0] != 1 || handle.Record().Attempts[0].Completion == nil {
 		t.Fatal("new seed/frozen budget/cleanup proof lost")
+	}
+	if got := handle.Record().ActivePlan().FrozenInputsFingerprint; got != intent.FrozenInputsFingerprint {
+		t.Fatalf("attempt carries frozen fingerprint %s, the record was opened with %s", got, intent.FrozenInputsFingerprint)
 	}
 }
 
