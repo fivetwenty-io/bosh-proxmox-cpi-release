@@ -581,16 +581,18 @@ We have two ways out. We can bring the member back, and the next retry reads the
 
 ```text
 set_disk_metadata: disk "pvd-..." is not attached to a VM on any online node, and the cluster reports pve3 offline, so it may be attached to a VM there; metadata not persisted
-create_disk: hinted VM is not on any online node, and the cluster reports pve3 offline; no allocation submitted
+create_disk: no allocation submitted: create_disk: hinted VM is not on any online node, and the cluster reports pve3 offline, and listing it again did not find the VM there either
 ```
+
+When the second listing of the node itself fails, the node's listing error follows the message.
 
 **Diagnosis**
 
-Both calls look for their target on the nodes the cluster reports online, and they leave out a node that is down. When the target turns up on an online node, the call goes ahead and the down node doesn't matter. These errors mean the target wasn't on any online node, so it is most likely on the node the error names. The CPI can't read or change a VM on a node that is down, and it won't guess that the target is gone, so it fails the call with a retriable error and changes nothing.
+Both calls look for their target on the nodes the cluster reports online, and they leave out a node that is down. When the target turns up on an online node, the call goes ahead and the down node doesn't matter. When it doesn't, the call lists the left-out node again with the full retry budget, because a node whose corosync link drops for a few seconds keeps its guests running, and a target found there lets the call go ahead. These errors mean that the target wasn't on any online node and that the second listing didn't settle it, so the target is most likely on the node the error names. The CPI can't read or change a VM on a node that is down, and it won't guess that the target is gone, so it fails the call with a retriable error. `set_disk_metadata` writes nothing, and `create_disk` says "no allocation submitted" when it fails before it submits one.
 
 **Fix**
 
-We bring the node back, and the Director's next attempt finds the target there. When the VM is under PVE HA, HA recovers it onto another node, and the next attempt finds it there instead. If the node will never return and the VM isn't under HA, BOSH resurrection or `bosh cck` recreates the VM on another node, and the calls that follow find it there. A node that we remove for good with `pvecm delnode <node>` drops out of the scan entirely.
+The Director doesn't retry either call, so the deploy task fails, and a rerun of the deploy finishes the work. We bring the node back and rerun the deploy, and the calls find the target there. When the VM is under PVE HA, HA recovers it onto another node, and a rerun after that finds it there instead. If the node will never return and the VM isn't under HA, BOSH resurrection or `bosh cck` recreates the VM on another node, and the deploy that follows finds it there. A node that we remove for good with `pvecm delnode <node>` drops out of the scan entirely.
 
 ## VM ownership refusals
 
