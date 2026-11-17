@@ -350,7 +350,7 @@ func writeWidenedPin(
 	logger *log.Logger,
 ) error {
 	ruleName := naRuleNameFor(vmid)
-	return withHARulesLock(ctx, deps, vmid, logger, func() error {
+	return withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		writer := newHARuleWriterFor(deps, profile, logger, d)
 		res, err := writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			cur := set.Find(ruleName)
