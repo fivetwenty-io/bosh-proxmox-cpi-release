@@ -13,7 +13,7 @@ PVE HA is the first responder for every VM it manages, and the BOSH resurrector 
 | `off` | Any | BOSH resurrector, once the VM's node is back or an operator has moved the config | None |
 | `auto` or `managed` | Not HA-managed, such as local volumes with `local_policy: none`, or a cluster that failed a prerequisite | BOSH resurrector, once the VM's node is back or an operator has moved the config | None |
 | `auto` or `managed` | HA-managed, shared volumes | PVE HA | BOSH resurrector, when HA puts the VM in `error`, or leaves it in recovery past the grace window and the VM meets the [dead-node completion's preconditions](#when-the-grace-window-expires-on-a-dead-node). Otherwise the operator follows [the dead-node procedure](operations.md#the-dead-node-procedure) |
-| `auto` or `managed` | HA-managed with `hold` | PVE HA, restart in place only | Operator, because the disks cannot leave the node |
+| `auto` or `managed` | HA-managed with `hold` | PVE HA, which restarts the VM in place once the node returns. The CPI holds the resurrector's `delete_vm` until the restarted VM has had time to settle, as [After PVE HA restarts the VM](#after-pve-ha-restarts-the-vm) describes | Operator, because the disks cannot leave the node |
 | `auto` or `managed` | HA-managed with `replicate` | PVE HA, onto the partner node | BOSH resurrector, when HA puts the VM in `error`, or leaves it in recovery past the grace window and the VM meets the [dead-node completion's preconditions](#when-the-grace-window-expires-on-a-dead-node). Otherwise the operator follows [the dead-node procedure](operations.md#the-dead-node-procedure) |
 
 With a stock configuration, where `pve.ha.mode` stays at `off`, the CPI never registers a VM as a PVE HA resource. The BOSH resurrector is the only recovery mechanism, and it works as it always has. The CPI still reads HA state in that mode where doing so is safer. It also still handles a VM that is already HA-managed correctly when BOSH deletes it, because PVE routes a stop or a destroy of an HA-managed VM through its HA manager whatever the CPI's mode is.
@@ -148,7 +148,7 @@ sequenceDiagram
     Note over HA: VM running elsewhere a short time later
     HM->>HM: agent heartbeats return
     HM->>D: no further resurrection
-    Note over HM,D: A delete_vm retry that reaches the VM after HA restarted it deletes and recreates the VM, which a longer agent_timeout avoids
+    Note over HM,D: A delete_vm retry that reaches the VM in its first five minutes after HA restarted it waits, so an agent that answers keeps the VM
     Note over HM,D: If HA puts the VM in error, or leaves it in recovery past the grace window, the next scan_and_fix completes the delete and recreates the VM
 ```
 
@@ -158,7 +158,11 @@ We set the Director's `hm.intervals.agent_timeout` property above the time PVE H
 
 PVE HA recovers a VM in two stages. When a node loses quorum, its local resource manager stops renewing the node's watchdog, and the watchdog resets the node about 60 seconds later. The cluster resource manager on the quorate side waits until the failed node's lock has expired, treats the node as fenced, and then starts the node's VMs on the surviving nodes. From the failure to the VM running again takes about two to four minutes. In our node-failure tests in November 2026 it took between 178 and 188 seconds, and a 300-second timeout leaves room above that.
 
-When `agent_timeout` is shorter than the recovery, the Health Monitor reports the instance before PVE HA has finished, and the resurrector starts its scan-and-fix. Its `delete_vm` defers while the VM is in `fence` or `recovery`, as [When `delete_vm` defers](#when-delete_vm-defers) describes. A retry that arrives after PVE HA has started the VM on another node finds an ordinary running VM, so `delete_vm` destroys the VM that PVE HA just recovered, and `create_vm` builds a replacement. The persistent disk stays safe, because `delete_vm` moves it to a parker before the destroy, and the replacement attaches it from there. The cost is downtime. In one of those tests the Director ran with the default 60-second `agent_timeout`, and fence and recovery took about three minutes. The delete and the recreate that followed kept the instance down for about nine and a half minutes, where a timeout above the recovery time would have had it back after about two and a half.
+When `agent_timeout` is shorter than the recovery, the Health Monitor reports the instance before PVE HA has finished, and the resurrector starts its scan-and-fix. Its `delete_vm` defers while the VM is in `fence` or `recovery`, as [When `delete_vm` defers](#when-delete_vm-defers) describes. A retry that arrives after PVE HA has started the VM again finds it running. Because the CPI deferred that VM's delete during the outage, the retry waits until the VM has run for five minutes, as [After PVE HA restarts the VM](#after-pve-ha-restarts-the-vm) describes, and the Director's next scan normally finds the agent answering and keeps the VM.
+
+Earlier releases had no such wait. Their retry found an ordinary running VM, so `delete_vm` destroyed the VM that PVE HA had just recovered, and `create_vm` built a replacement. The persistent disk stayed safe on a parker, and the cost was downtime. In one of our tests the Director ran with the default 60-second `agent_timeout`, and fence and recovery took about three minutes. The delete and the recreate that followed kept the instance down for about nine and a half minutes, where a timeout above the recovery time would have had it back after about two and a half.
+
+Raising `agent_timeout` does not cover an outage that outlasts it. When a node stays down for longer than the timeout, as a `hold` VM's node does until someone brings it back, the resurrector's retries are already running when the node returns, and one of them can reach the VM while its guest is still booting. The settle wait covers that case whatever the timeout is. We still recommend 300 seconds, because a timeout above the recovery time spares the deferral loop for the common failure and keeps the Director's task list quiet.
 
 ## How the CPI prevents double recovery
 
@@ -198,7 +202,7 @@ No VM is HA-managed on such a cluster, so `delete_vm` proceeds as it does on a c
 |---|---|---|
 | Not in the CRM's state, and the request is `ignored` | Online | Proceeds, because the CRM never fences or moves an ignored resource |
 | Not in the CRM's state, and any other request | Not dead or fenced | Waits for motion, because the CRM has not processed the service yet |
-| `stopped`, `started`, or `error` | Online | Proceeds through the teardown protocol |
+| `stopped`, `started`, or `error` | Online | Proceeds through the teardown protocol. A `started` VM whose delete the CPI deferred for fence or recovery in the last 15 minutes first waits to settle, as [After PVE HA restarts the VM](#after-pve-ha-restarts-the-vm) describes |
 | `request_stop`, `request_start`, `request_start_balance`, `migrate`, or `relocate` | Online | Waits for motion |
 | `freeze` | Online | Waits for motion, because the LRM is restarting and will unfreeze the service |
 | `fence`, or any state while the node is in `fence` | Any | Defers |
@@ -209,7 +213,7 @@ No VM is HA-managed on such a cluster, so `delete_vm` proceeds as it does on a c
 
 Waiting for motion and deferring both return a retriable error, and the error text says what the CPI is waiting for. Waiting for motion has a budget, which is `pve.ha.motion_wait_sec`. A defer has no time limit, and the text tells the operator to resolve the fence or bring the node back.
 
-The grace window applies only to a service in `recovery`, which means PVE has fenced the node but has not yet placed the service anywhere. The CPI measures the window from the moment it first saw that recovery episode, not from the last heartbeat, because a long fencing delay could otherwise use up the whole window before HA had its first chance. The service ID together with the CRM's `uid` names an episode, and the CPI records the time it first saw the pair in a small file. A lost or unreadable record restarts the clock, which only delays the handover to BOSH. The window is as long as `pve.ha.motion_wait_sec`, 600 seconds by default. While it runs, PVE HA keeps trying to recover the VM, and the CPI logs the expiry when it comes.
+The grace window applies only to a service in `recovery`, which means PVE has fenced the node but has not yet placed the service anywhere. The CPI measures the window from the moment it first saw that recovery episode, not from the last heartbeat, because a long fencing delay could otherwise use up the whole window before HA had its first chance. The service ID together with the CRM's `uid` names an episode, and the CPI records the time it first saw the pair in a small file. A lost or unreadable record restarts the clock, which only delays the handover to BOSH. The window is as long as `pve.ha.motion_wait_sec`, 600 seconds by default. While it runs, PVE HA keeps trying to recover the VM, and the CPI logs the expiry when it comes. A VM whose strict pin admits only the dead node, such as a `hold` VM, cannot be recovered anywhere else. For such a VM the error says that PVE HA restarts it in place once the node returns, and that the delete keeps deferring after the window for the same reason.
 
 The record is `ha-recovery-episodes.json` in the same cache directory as the endpoint cache and the profile cache, and it follows `pve.endpoint_cache_dir` when we set one. Each entry is keyed by the VM's service ID, an at sign, and a 16-character digest of the cluster entry's configured endpoints. The digest sorts the endpoints, gives each an explicit port, and ignores discovery, so a cluster that grows keeps its key, and two entries that reach one cluster through the same endpoints share one. Two clusters that each hold a service with the same ID therefore keep separate entries. The CPI prunes an episode seven days after it first saw it.
 
@@ -244,6 +248,20 @@ This path has preconditions, and a missing one leaves the delete deferring with 
   The VM's recorded storages must be reachable from at least one online node with a fresh timestamp. A VM with a node-local volume, a `hold` VM, a VM whose pin records no storages, and a VM that the allocation journal records all keep deferring. For a `replicate` VM, the destination is the partner only when its job is this Director's, enabled, and between the dead node and the partner.
 
 For every case the completion does not cover, an operator follows [the dead-node procedure](operations.md#the-dead-node-procedure).
+
+### After PVE HA restarts the VM
+
+The resurrector keeps retrying while a node is down, and each retry's `delete_vm` defers. When the node comes back, PVE HA restarts the VM, either in place or on the node it recovered to, and the guest takes a minute or so to boot. A retry that scanned the agent during that minute still sends `delete_vm`, and by the time it arrives the service reads `started` on a live node. On its own, that state lets the delete proceed, so the VM that PVE HA had just restarted would be destroyed and rebuilt.
+
+The CPI prevents that with a record of its own. Every `delete_vm` that defers an HA-managed VM because it is in `fence`, on a dead or fenced node, or in `recovery` records the time of that deferral. A later `delete_vm` that finds the service `started` looks for the record. When the last deferral is less than 15 minutes old and the VM has run for less than five minutes, the delete returns a retriable error that stops and destroys nothing. The error says how long ago PVE HA restarted the VM and when a retry will proceed. If the agent answers by then, the Director's next scan finds the instance healthy and sends no delete. If it never answers, the first delete after five minutes of uptime proceeds and the resurrector replaces the VM.
+
+The wait has a hard bound. A settle deferral never refreshes the record, so no delete waits more than 15 minutes after the last deferral for fence or recovery, even for a guest that crashes and restarts in a loop. A VM that PVE HA holds `started` but that is not running yet waits too, under the same bound. The five minutes come from the VM's uptime, which the node measures, and the 15 minutes come from the Director's own clock at both ends, so no clock comparison between hosts enters the decision.
+
+The record never slows an ordinary delete. A VM whose delete never deferred, such as one that a failed deploy cleans up seconds after it started, has no record, so its delete reads one small local file and proceeds. A delete clears the record when PVE HA holds the VM stopped, when the record has aged past 15 minutes, when the VM has run past the window, and after the dead-node completion moves the config. A status read that fails while a fresh deferral is recorded defers again, because the stop and the destroy need the same API. A record that cannot be read lets the delete proceed as it did before the record existed. Only `delete_vm` reads or writes the record, so the `create_vm` rollbacks and the sweep of unfinished teardowns never wait.
+
+An operator's `bosh delete-deployment` or `bosh recreate` that reaches such a VM within the window waits as well, and the error says when to run it again. That happens only when the same VM's delete deferred for an outage in the last 15 minutes.
+
+The record is `ha-recovery-deferrals.json` beside the episode record, with the lock `ha-recovery-deferrals.lock`, and it uses the same directory, the same keys, and the same private-file checks. The CPI prunes an entry a day after it was written.
 
 ### Clearing an HA error
 

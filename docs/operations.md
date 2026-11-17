@@ -629,6 +629,9 @@ The directory holds these files, and the first two kinds belong to the endpoint 
 - `ha-recovery-episodes.json` and `ha-recovery-episodes.lock`
   The HA recovery episode record, which the CPI writes even when discovery is off.
 
+- `ha-recovery-deferrals.json` and `ha-recovery-deferrals.lock`
+  The HA recovery deferral record, which holds the last time a `delete_vm` deferred each HA-managed VM for fence or recovery, so a later delete can let a VM that PVE HA restarted settle.
+
 - `secret` and `secret.lock`
   The directory secret that signs the files. It never goes into a support bundle or a ticket.
 
@@ -654,6 +657,9 @@ What the CPI does next depends on what we removed.
 - The HA recovery episode record
   A VM that is in HA recovery restarts its grace window. That delays the handover to BOSH and breaks nothing else.
 
+- The HA recovery deferral record
+  A delete that reaches a VM which PVE HA has just restarted no longer waits for it to settle, which is how earlier releases behaved. The next deferral for fence or recovery starts the record again.
+
 - A file that is damaged, too large, or written by another release
   The CPI ignores it, logs `endpoint cache: the cache file is not usable and is ignored` at Debug under `auto` and at Warn under `on`, and replaces it on the next write. We do not need to delete it by hand. A file with the wrong owner, a group or other permission bit, or a symbolic link in its place is different. The CPI runs that call without discovery and does not replace the file, so we remove it by hand.
 
@@ -665,7 +671,7 @@ This section is for operators who set `pve.ha.mode` to `auto` or `managed`, and 
 
 ### Raise `agent_timeout` before turning HA on
 
-Before we set `pve.ha.mode` to `auto` or `managed`, we raise the Director's `hm.intervals.agent_timeout` to 300 seconds, which is above the two to four minutes PVE HA takes to fence a failed node and start its VMs elsewhere. With the default of 60 seconds, the resurrector can reach a VM after PVE HA has already recovered it, and its `delete_vm` then destroys the recovered VM and `create_vm` builds a replacement. The persistent disk survives on a parker, but the instance stays down several minutes longer than it needed to. [HA and Resurrection](ha-and-resurrection.md#set-agent_timeout-above-the-ha-recovery-time) gives the timing, and [A VM that PVE HA recovered is deleted and recreated](troubleshooting.md#a-vm-that-pve-ha-recovered-is-deleted-and-recreated) has the ops file.
+Before we set `pve.ha.mode` to `auto` or `managed`, we raise the Director's `hm.intervals.agent_timeout` to 300 seconds, which is above the two to four minutes PVE HA takes to fence a failed node and start its VMs elsewhere. With the default of 60 seconds, the resurrector starts its retries before PVE HA has finished, and its `delete_vm` defers on each one. The CPI lets a VM that PVE HA restarts settle for five minutes before a retried delete may proceed, as [After PVE HA restarts the VM](ha-and-resurrection.md#after-pve-ha-restarts-the-vm) describes, so an agent that answers in that time keeps the VM. A longer timeout spares that loop in the common case. It does not cover an outage that outlasts it, such as a `hold` VM's node that stays down until we bring it back, and there the settle wait is what keeps the restarted VM. [HA and Resurrection](ha-and-resurrection.md#set-agent_timeout-above-the-ha-recovery-time) gives the timing, and [A VM that PVE HA recovered is deleted and recreated](troubleshooting.md#a-vm-that-pve-ha-recovered-is-deleted-and-recreated) has the ops file.
 
 ### Reading the cluster with `pve-cid ha`
 
