@@ -900,6 +900,70 @@ func driveOptStrIsCDROM(optstr string) bool {
 	return false
 }
 
+// identityScanDrops tracks the nodes the disk identity scan stopped reading
+// because the cluster began reporting them offline during the scan. Each one
+// is appended to excluded, the scan's list of nodes it could not read.
+type identityScanDrops struct {
+	nodes    map[string]bool
+	excluded *[]string
+}
+
+// readViews reads guest g's config views for the disk identity scan. It
+// reports read false, with no error, for a guest the scan skips, which is a
+// guest on a dropped node, a guest deleted since the listing, or a guest on a
+// node that this read finds the cluster reporting offline.
+func (d *identityScanDrops) readViews(ctx context.Context, c Client, g GuestRef) (QemuViews, bool, error) {
+	if d.nodes[g.Node] {
+		return QemuViews{}, false, nil
+	}
+	views, cfgErr := ReadQemuViews(ctx, c, g.Node, g.VMID)
+	if cfgErr == nil {
+		return views, true, nil
+	}
+	dropNode, err := identityScanReadFailure(ctx, c, g.Node, g.VMID, cfgErr)
+	if dropNode {
+		if d.nodes == nil {
+			d.nodes = map[string]bool{}
+		}
+		d.nodes[g.Node] = true
+		*d.excluded = append(*d.excluded, g.Node)
+	}
+	return QemuViews{}, false, err
+}
+
+// identityScanReadFailure judges a config read that failed during the disk
+// identity scan. It returns no error and dropNode false for a clean 404,
+// because the VM was deleted between the listing and the read, so it holds no
+// QEMU disk. Any other error is potentially a fault on the VM that holds the
+// disk, and concluding "not attached to any VM" from it is how a volume ends
+// up attached twice, so it is returned rather than skipped. That includes the
+// pmxcfs "Configuration file ... does not exist" shape. On an authoritative
+// row it is most likely a guest mid-migration whose .conf has moved nodes, and
+// the wrapped error classifies retriable so the Director re-drives the scan
+// once the migration settles. WrapError makes the retriable and permanent
+// split on what the error actually is. A 403 on one VM's config is a grant
+// only a human can add, and re-driving it forever helps nobody.
+//
+// A node can go down after its listing answered and before the scan reaches
+// its guests. When the quorate cluster now reports it offline, dropNode is
+// true and the scan treats the node as one the listing left out. A hit
+// elsewhere still settles the holder, and a scan with no hit stays unproven,
+// exactly as for a node excluded up front.
+func identityScanReadFailure(ctx context.Context, c Client, vmNode string, vmid int, cfgErr error) (dropNode bool, err error) {
+	if IsNotFound(cfgErr) {
+		return false, nil
+	}
+	if ClusterReportsMemberOffline(ctx, c, nil, vmNode) {
+		log.FromContext(ctx).Warn("FindVMByDiskVolid: excluding a node the cluster began reporting offline during the scan",
+			log.String("node", vmNode), log.Int("vmid", vmid), log.Err(cfgErr))
+		return true, nil
+	}
+	return false, cpierrors.Wrap(
+		WrapConfigReadError(cfgErr),
+		fmt.Sprintf("FindVMByDiskVolid: Config error for vm %d on node %s", vmid, vmNode),
+	)
+}
+
 // findVMByDiskIdentityScan is the single cluster-wide disk scan behind
 // FindVMByDiskVolid and the stable-ID resolver. It reads every QEMU guest
 // config once. With an empty stableID it matches each active-bus drive entry
@@ -959,56 +1023,24 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 	var nameHolders []BirthNameHolder
 	hits := diskScanHits{everyHolder: stableID != ""}
 	seen := newIdentityScanReads(stableID != "")
-	// droppedNodes are the listed nodes the quorate cluster began reporting
+	// dropped holds the listed nodes the quorate cluster began reporting
 	// offline while the scan read their guests' configs. Their remaining
 	// guests are skipped, and the nodes join excludedNodes.
-	droppedNodes := map[string]bool{}
+	dropped := identityScanDrops{excluded: &excludedNodes}
 
 	for _, g := range guests {
 		vmid := g.VMID
 		vmNode := g.Node
-		if droppedNodes[vmNode] {
-			continue
-		}
 		// Both views come from one pending read. A slot whose delete PVE could
 		// only record as pending is missing from the config endpoint's view,
 		// while the running guest still has the disk, so the scan matches the
 		// current view too and counts such a slot as holding the disk.
-		views, cfgErr := ReadQemuViews(ctx, c, vmNode, vmid)
-		if cfgErr != nil {
-			// Skip a clean 404: the VM was deleted between the listing and
-			// this read, so it holds no QEMU disk. Any other error is
-			// potentially a fault on the VM that holds the disk, and
-			// concluding "not attached to any VM" from it is how a volume
-			// ends up attached twice, so it is returned rather than skipped.
-			// That includes the pmxcfs "Configuration file ... does not
-			// exist" shape: on an authoritative row it is most likely a
-			// guest mid-migration whose .conf has moved nodes, and the
-			// wrapped error classifies retriable so the Director re-drives
-			// the scan once the migration settles.
-			//
-			// WrapError makes the retriable/permanent split on what the error
-			// actually is: a 403 on one VM's config is a grant only a human
-			// can add, and re-driving it forever helps nobody.
-			if IsNotFound(cfgErr) {
-				continue
-			}
-			// A node can go down after its listing answered and before the
-			// scan reaches its guests. When the quorate cluster now reports it
-			// offline, the node is treated as one the listing left out: a
-			// hit elsewhere still settles the holder, and a scan with no hit
-			// stays unproven, exactly as for a node excluded up front.
-			if ClusterReportsMemberOffline(ctx, c, nil, vmNode) {
-				log.FromContext(ctx).Warn("FindVMByDiskVolid: excluding a node the cluster began reporting offline during the scan",
-					log.String("node", vmNode), log.Int("vmid", vmid), log.Err(cfgErr))
-				droppedNodes[vmNode] = true
-				excludedNodes = append(excludedNodes, vmNode)
-				continue
-			}
-			return DiskScanHit{}, cpierrors.Wrap(
-				WrapConfigReadError(cfgErr),
-				fmt.Sprintf("FindVMByDiskVolid: Config error for vm %d on node %s", vmid, vmNode),
-			)
+		views, read, err := dropped.readViews(ctx, c, g)
+		if err != nil {
+			return DiskScanHit{}, err
+		}
+		if !read {
+			continue
 		}
 
 		cfg := views.Applied()
