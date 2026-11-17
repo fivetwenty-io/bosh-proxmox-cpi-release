@@ -84,6 +84,11 @@ func haRegistrationFeatures(deps Deps, cp createVMCloudProps, node string, env m
 // features names the HA-registration features (DLB, anti-affinity HA rules,
 // or AZ node-affinity pinning) the configuration enables for the VM, and the
 // line leaves the features field out when none did. A nil logger is a no-op.
+//
+// A create whose confinement is refused or not in effect removes the staged
+// resource and runs the VM without HA, which the stager logs at Warn with the
+// reason, so logging the line before activation would claim protection that
+// such a VM ends up without.
 func warnHAResurrectorConflictOnce(vmid int, features []haRegistrationFeature, logger *log.Logger) {
 	if logger == nil {
 		return

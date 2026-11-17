@@ -404,7 +404,8 @@ func TestWarnHAResurrectorConflictOnce_FiresOncePerProcess(t *testing.T) {
 // TestCheckISOStorageForHA_DLBActive_SharedISO_LogsNoOwnershipLine: the ISO
 // check runs before the VM's HA decision has an outcome, so it never says the
 // VM is registered, even with a feature active. completeCreatedVM logs that
-// line after the activation registers the VM.
+// line once PVE HA runs the VM, because a VM whose confinement is refused
+// then runs without HA.
 func TestCheckISOStorageForHA_DLBActive_SharedISO_LogsNoOwnershipLine(t *testing.T) {
 	resetHAResurrectorWarnOnce(t)
 	cfg := isoHABaseConfig("vm-storage")

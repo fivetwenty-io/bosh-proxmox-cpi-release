@@ -517,7 +517,8 @@ func (h *createdVMHA) runWithoutHA(ctx context.Context, reason string, start fun
 // known, on the main path and on the fallback path alike. The VM is running
 // unless h staged it. It applies the firewall, the VIP ipfilter, the IP
 // forwarding, and the advertised routes, then writes the HA confinement, runs
-// the config-drive ISO check, and activates the staged VM. A VM PVE HA started
+// the config-drive ISO check, and activates the staged VM. The line that says
+// the VM is registered with PVE HA is logged only once PVE HA runs it. A VM PVE HA started
 // elsewhere has shape.node moved to its landing node, and an HA-managed VM
 // gets the bosh-ha-managed tag and the once-per-process ownership line. A VM under the replicate policy then gets its
 // replication job (see setUpCreatedReplica). The health gate runs last, on the

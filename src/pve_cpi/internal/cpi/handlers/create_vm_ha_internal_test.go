@@ -655,6 +655,67 @@ func TestCompleteCreatedVM_ActivatesTagsAndFollowsTheLanding(t *testing.T) {
 	}
 }
 
+// ownershipLines counts the lines that say a VM is registered with PVE HA.
+func ownershipLines(observed *log.Observer) int {
+	n := 0
+	for _, e := range observed.All() {
+		if strings.Contains(e.Message, "registered as a PVE HA resource") {
+			n++
+		}
+	}
+	return n
+}
+
+// TestCompleteCreatedVM_SaysTheVMIsRegisteredOnlyOnceHARunsIt pins where the
+// create logs that its VM is registered with PVE HA. A VM that PVE HA runs
+// gets the line. A VM whose confinement was refused, the way the feasibility
+// guard refuses a strict pin that conflicts with the group's rule, runs
+// without HA, so it must not get the line, and the log must instead say at
+// Warn that its HA resource was removed, naming the VM and the reason. It
+// does not run in parallel, because the line is logged once per process.
+func TestCompleteCreatedVM_SaysTheVMIsRegisteredOnlyOnceHARunsIt(t *testing.T) {
+	const reason = "the node-affinity pin could not be written: the pin conflicts with the group's rule"
+	for _, tc := range []struct {
+		name       string
+		unconfined string
+		want       int
+	}{
+		{"runs under HA", "", 1},
+		{"runs without HA", reason, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer resetHAResurrectorWarnOnceForTest()()
+			r := newStagingRig(t, config.HAModeAuto, true)
+			tags, writes := "bosh-cpi", []string{}
+			r.deps.PVE = taggedVMClient(r.rules, &tags, &writes)
+			r.stage(t)
+			logger, observed := log.NewObservedLogger(log.LevelDebug)
+			r.h.logger, r.h.stager.Logger = logger, logger
+			r.h.unconfined = tc.unconfined
+			shape := &createVMShape{node: "pve01"}
+			if err := completeCreatedVM(crhCtx(), r.deps, logger, r.parsed, shape, 100, r.h, r.start); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if r.h.haActivated() != (tc.unconfined == "") {
+				t.Fatalf("activated = %v; want %v", r.h.haActivated(), tc.unconfined == "")
+			}
+			if got := ownershipLines(observed); got != tc.want {
+				t.Fatalf("lines saying the VM is registered = %d; want %d", got, tc.want)
+			}
+			if tc.unconfined == "" {
+				return
+			}
+			for _, e := range observed.All() {
+				if strings.Contains(e.Message, "the VM runs without HA") && e.Level == log.LevelWarn &&
+					e.Attrs["sid"] == "vm:100" && e.Attrs["reason"] == reason {
+					return
+				}
+			}
+			t.Fatal("no Warn says the staged resource of vm:100 was removed and why")
+		})
+	}
+}
+
 func TestCompleteCreatedVM_FailedLandingStillMovesTheShape(t *testing.T) {
 	// PVE HA started the VM outside its hard set. The create fails, and the
 	// shape names the node the VM runs on, because the rollback tears it down
