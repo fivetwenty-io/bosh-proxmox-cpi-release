@@ -383,7 +383,7 @@ HA never moves a VM from one cluster to another, and BOSH never live-migrates a 
 
 - **Full anti-affinity groups**
 
-  A negative rule with more members than the cluster has nodes cannot be satisfied, and PVE disables it silently. `pve.ha.anti_affinity_overflow` decides what the CPI does. The default `skip` writes no rule and logs why, and `split` divides the group into rules that each fit. A group whose size equals the node count fits, but it leaves no legal target for a member whose node fails, so PVE cannot recover that member. It waits in `recovery`, the grace window then hands it to BOSH, and the replacement shares a node with another member until the failed node returns. A group that fills every node gets no anti-affinity protection during a node failure.
+  A negative rule with more members than the cluster has nodes cannot be satisfied, and PVE disables it silently. `pve.ha.anti_affinity_overflow` decides what the CPI does. The default `skip` writes no rule and logs why, and `split` divides the group into rules that each fit. With `skip`, nothing on the PVE side keeps the members apart, so the spread at create time is what keeps them on different nodes. Parallel creates of the group still spread, because each create claims the node it picks whether or not it writes a rule. A group whose size equals the node count fits, but it leaves no legal target for a member whose node fails, so PVE cannot recover that member. It waits in `recovery`, the grace window then hands it to BOSH, and the replacement shares a node with another member until the failed node returns. A group that fills every node gets no anti-affinity protection during a node failure.
 
 - **N+1 headroom**
 

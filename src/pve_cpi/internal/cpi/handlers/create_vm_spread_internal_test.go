@@ -494,3 +494,56 @@ func TestSpreadClaims_HoldWritesAClaimWhosePickFailedToRecord(t *testing.T) {
 		t.Fatalf("claims after the hold = %v; want the claim on %s", got, node)
 	}
 }
+
+// TestSpreadClaims_ParallelSiblingsSpreadInEitherOverflowMode places four
+// creates of one group on three nodes at the same moment, with HA on. The
+// group has more members than the cluster has nodes, so in skip mode no HA
+// rule keeps the members apart, and the claims are the only thing that
+// spreads the parallel creates. The claim must not depend on the overflow
+// mode or on a rule being written, so in both modes no node may get more
+// than two of the four siblings.
+func TestSpreadClaims_ParallelSiblingsSpreadInEitherOverflowMode(t *testing.T) {
+	t.Parallel()
+	for _, overflow := range []string{config.HAOverflowSkip, config.HAOverflowSplit} {
+		t.Run(overflow, func(t *testing.T) {
+			t.Parallel()
+			deps := spreadDeps(spreadClaimStore(t))
+			deps.Config.HA = &config.HAConfig{Mode: haChoiceOf(config.HAModeAuto),
+				AntiAffinityOverflow: haChoiceOf(overflow)}
+			claims := make([]*spreadClaims, 4)
+			for i := range claims {
+				claims[i] = mustSpreadClaims(t, deps)
+			}
+			var (
+				wg    sync.WaitGroup
+				mu    sync.Mutex
+				count = map[string]int{}
+				errs  []error
+			)
+			start := make(chan struct{})
+			for _, c := range claims {
+				wg.Go(func() {
+					<-start
+					node, err := trySibling(deps, c)
+					mu.Lock()
+					defer mu.Unlock()
+					count[node]++
+					errs = append(errs, err)
+				})
+			}
+			close(start)
+			wg.Wait()
+			if err := errors.Join(errs...); err != nil {
+				t.Fatal(err)
+			}
+			if len(count) != 3 {
+				t.Fatalf("picks per node = %v; want the four siblings on all three nodes", count)
+			}
+			for node, n := range count {
+				if n > 2 {
+					t.Fatalf("node %s got %d of the four siblings (%v); want at most two", node, n, count)
+				}
+			}
+		})
+	}
+}
