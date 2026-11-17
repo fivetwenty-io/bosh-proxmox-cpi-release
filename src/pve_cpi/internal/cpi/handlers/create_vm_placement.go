@@ -6,6 +6,7 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"sort"
 	"strings"
@@ -630,8 +631,10 @@ func buildAZOrder(cp createVMCloudProps, cfg *config.CPIConfig, rng *rand.Rand, 
 // this set when an AZ is configured; if not, placement is constrained to only
 // those AZs.
 type diskFaultConstraints struct {
-	// requiredLocalNode is set when one or more local-storage disks have a node
-	// recorded in their CID metadata. Empty means no local-node pin.
+	// requiredLocalNode is set when one or more local-storage disks pin a node:
+	// the node a live search finds for a disk on storage that can replicate,
+	// and the node recorded in the CID metadata otherwise (see
+	// placementLocalDiskNode). Empty means no local-node pin.
 	requiredLocalNode string
 	// requiredAZs collects AZ labels from shared-storage disks. Empty means
 	// no AZ constraint from persistent disks.
@@ -721,8 +724,12 @@ func deriveDiskFaultConstraints(ctx context.Context, deps Deps, diskCIDs []strin
 		}
 
 		if backend.Kind() == pve.BackendLocal {
-			if meta.Node != "" {
-				localNodes[meta.Node] = struct{}{}
+			node, err := placementLocalDiskNode(ctx, deps, backend, cid, meta)
+			if err != nil {
+				return diskFaultConstraints{}, err
+			}
+			if node != "" {
+				localNodes[node] = struct{}{}
 			}
 		} else {
 			// Shared backend: AZ constraint only.
@@ -756,6 +763,65 @@ func deriveDiskFaultConstraints(ctx context.Context, deps Deps, diskCIDs []strin
 	}
 
 	return c, nil
+}
+
+// placementLocalDiskNode names the node a persistent disk on node-local
+// storage pins the VM to. The node recorded in the CID is the node create_disk
+// put the disk on, and it stays right for storage that cannot replicate,
+// because such a volume never leaves its node without a disk move that the
+// CPI makes itself.
+//
+// A ZFS pool can replicate. A disk on one enters a replicate VM by a
+// reassignment, the job copies it to the partner, and after a failover the
+// live copy is the partner's while the CID still names the old node, which
+// may be down or hold a stale replica. So for such storage, and for storage
+// whose type is unknown, the node comes from a live search, the one attach_disk
+// and detach_disk make: the disk's identity is resolved to its current volume
+// and the backend's sweep finds the node that holds it. A sweep that finds
+// copies on several nodes settles them by the node of the VM or parker that
+// owns the volume, and fails with a retriable error naming the nodes when it
+// cannot tell, so create_vm never guesses. A disk the sweep proves absent
+// keeps the CID's node, which leaves the missing disk for attach_disk to
+// report as before.
+func placementLocalDiskNode(
+	ctx context.Context, deps Deps, backend pve.Backend, cid string, meta *pve.DiskCIDMeta,
+) (string, error) {
+	if !localDiskMayReplicate(backend) {
+		return meta.Node, nil
+	}
+	bare, _, err := pve.ParseEncodedDiskCID(cid)
+	if err != nil {
+		return meta.Node, nil
+	}
+	rd, err := resolveDiskForOp(ctx, deps, "create_vm", cid, bare, meta)
+	if err != nil {
+		return "", err
+	}
+	node, err := backend.NodeForExisting(ctx, rd.volid)
+	switch {
+	case err == nil:
+		if meta.Node != "" && node != meta.Node {
+			deps.Log(ctx).Info("create_vm: persistent disk is live on another node than its CID records",
+				log.String("disk_cid", bare), log.String("volume", rd.volid), log.String("cid_node", meta.Node),
+				log.String("node", node))
+		}
+		return node, nil
+	case pve.IsNotFound(err):
+		return meta.Node, nil
+	}
+	return "", cpierrors.Wrap(err, fmt.Sprintf("create_vm: find the node that holds persistent disk %s (volume %s)",
+		bare, rd.volid))
+}
+
+// localDiskMayReplicate reports whether a volume on the local backend's
+// storage may have a replica on another node, which is true for a ZFS pool and
+// for storage whose type the backend does not know.
+func localDiskMayReplicate(backend pve.Backend) bool {
+	info, ok := pve.BackendStorageInfo(backend)
+	if !ok || strings.TrimSpace(info.Type) == "" {
+		return true
+	}
+	return storageCanReplicate(info)
 }
 
 // resolveAZCandidatesValidated looks up the node list for az in the AZ map.

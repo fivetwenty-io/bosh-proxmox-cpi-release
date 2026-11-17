@@ -2002,12 +2002,16 @@ func (r *staticKindResolver) Resolve(_ context.Context, storage string) (pve.Bac
 	return &localKindBackend{}, nil
 }
 
-// localKindBackend is a minimal Backend that reports Kind()=BackendLocal.
-// NodeForCreate / NodeForExisting are not called in deriveDiskFaultConstraints
-// (which only uses Kind()), so they panic to detect unexpected calls.
+// localKindBackend is a minimal Backend that reports Kind()=BackendLocal on
+// LVM-thin storage, which cannot replicate. deriveDiskFaultConstraints keeps
+// the CID's node for such a disk and never searches for it, so NodeForCreate
+// and NodeForExisting panic to detect unexpected calls.
 type localKindBackend struct{}
 
 func (l *localKindBackend) Kind() pve.BackendKind { return pve.BackendLocal }
+func (l *localKindBackend) StorageInfo() pve.StorageInfo {
+	return pve.StorageInfo{Name: "local-lvm", Type: pve.StorageTypeLVMThin}
+}
 func (l *localKindBackend) NodeForCreate(_ context.Context, _, _ string) (string, error) {
 	panic("localKindBackend.NodeForCreate: not expected in fault-domain tests")
 }
