@@ -34,6 +34,24 @@ type zeroNineStorageInfo struct {
 	IsMountpoint bool
 }
 
+// tenZeroStorageInfo is pve.StorageInfo as 0.10.0 through 0.10.2 declared
+// it, with the snake_case tags those releases wrote into plans. The tests keep
+// their own frozen copy, because pve.StorageInfo's live tags belong to the HA
+// profile cache and may change with it, while the fingerprints those releases
+// stored never will.
+type tenZeroStorageInfo struct {
+	Name         string   `json:"name"`
+	Type         string   `json:"type"`
+	Shared       bool     `json:"shared"`
+	Disabled     bool     `json:"disabled"`
+	Nodes        []string `json:"nodes"`
+	Path         string   `json:"path"`
+	Server       string   `json:"server"`
+	Export       string   `json:"export"`
+	Content      string   `json:"content"`
+	IsMountpoint bool     `json:"is_mountpoint"`
+}
+
 // zeroNinePlan is StorageAllocationPlan as 0.9.7 declared it. Its nested
 // types other than the definitions are unchanged since 0.9.7, so they are
 // reused here.
@@ -104,7 +122,24 @@ func TestStoragePlanDefinitionsReadEveryReleaseForm(t *testing.T) {
 		{name: "empty definitions", definitions: "{}", want: map[string]pve.StorageInfo{}},
 		{name: "unknown key", definitions: `{"a":{"Name":"a","Type":"nfs","Shared":true,"Server":"nas","Export":"/a","Content":"images","Thinpool":"x"}}`,
 			want: map[string]pve.StorageInfo{"a": definitionFormWant["a"]}, strictFails: true},
-		{name: "mount flag under both keys", definitions: `{"m":{"Name":"m","IsMountpoint":true,"is_mountpoint":false}}`, strictFails: true, siblingFail: true},
+		// The strict decode refuses the shapes below, which no release writes
+		// and a plain decode would settle silently. The sibling decode never
+		// reads the flag, so it tolerates them rather than block a create.
+		{name: "mount flag under both keys", definitions: `{"m":{"Name":"m","IsMountpoint":true,"is_mountpoint":false}}`,
+			want: map[string]pve.StorageInfo{"m": {Name: "m", IsMountpoint: true}}, strictFails: true},
+		{name: "null 0.9.x mount flag", definitions: `{"m":{"Name":"m","IsMountpoint":null}}`,
+			want: map[string]pve.StorageInfo{"m": {Name: "m"}}, strictFails: true},
+		{name: "null snake_case mount flag", definitions: `{"m":{"name":"m","is_mountpoint":null}}`,
+			want: map[string]pve.StorageInfo{"m": {Name: "m"}}, strictFails: true},
+		{name: "null mount flag beside the other key", definitions: `{"m":{"Name":"m","IsMountpoint":true,"is_mountpoint":null}}`,
+			want: map[string]pve.StorageInfo{"m": {Name: "m", IsMountpoint: true}}, strictFails: true},
+		{name: "mount flag twice in one form", definitions: `{"m":{"Name":"m","IsMountpoint":true,"ismountpoint":false}}`,
+			want: map[string]pve.StorageInfo{"m": {Name: "m"}}, strictFails: true},
+		{name: "snake_case mount flag twice", definitions: `{"m":{"Name":"m","is_mountpoint":true,"IS_MOUNTPOINT":false}}`,
+			want: map[string]pve.StorageInfo{"m": {Name: "m"}}, strictFails: true},
+		{name: "other field twice", definitions: `{"a":{"Name":"a","name":"b"}}`,
+			want: map[string]pve.StorageInfo{"a": {Name: "b"}}, strictFails: true},
+		{name: "null entry", definitions: `{"m":null}`, want: map[string]pve.StorageInfo{"m": {}}},
 		{name: "wrong value type", definitions: `{"a":{"Name":"a","Shared":"yes"}}`, strictFails: true, siblingFail: true},
 		{name: "entry not an object", definitions: `{"a":"nfs"}`, strictFails: true, siblingFail: true},
 	} {
@@ -223,11 +258,13 @@ func TestStorageFrozenInputsFingerprintForms(t *testing.T) {
 		return hex.EncodeToString(sum[:])
 	}
 	untagged := map[string]zeroNineStorageInfo{}
-	for id, info := range frozen.Definitions {
-		untagged[id] = zeroNineStorageInfo(info)
+	tagged := map[string]tenZeroStorageInfo{}
+	for id := range frozen.Definitions {
+		untagged[id] = zeroNineStorageInfo(frozen.Definitions[id])
+		tagged[id] = tenZeroStorageInfo(frozen.Definitions[id])
 	}
 	zeroNine := hash(untagged)
-	snake := hash(map[string]pve.StorageInfo(frozen.Definitions))
+	snake := hash(tagged)
 	if zeroNine == snake {
 		t.Fatal("the two forms hash alike, so the test proves nothing")
 	}
@@ -292,5 +329,63 @@ func TestAllocationAuditReadsEveryPlanDefinitionForm(t *testing.T) {
 					strings.Join(report.Issues, "\n"), strings.Join(report.Conflicts, "\n"))
 			}
 		})
+	}
+}
+
+// TestAllocationAuditReadsZeroNineVMRecordFromJournal writes a VM record whose
+// plan carries 0.9.x definitions through a real on-disk journal, lists it
+// back, and audits the journal. The plan is encoded from 0.9.7's own
+// declaration, so its bytes are the ones a 0.9.x director left on disk.
+func TestAllocationAuditReadsZeroNineVMRecordFromJournal(t *testing.T) {
+	deps, j, c := auditFixture(t)
+	c.nodesRead.nodeNames = []string{"pve1"}
+	def, err := pve.ParseStorageEntry(c.storageRead.definitions[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := zeroNinePlan{Version: 1, Namespace: "director", AllocationKey: "agent", PolicyFingerprint: definitionFormPolicy, Node: "pve1",
+		Definitions: map[string]zeroNineStorageInfo{"a": zeroNineStorageInfo(def)},
+		Targets:     []StoragePlanTarget{{Role: "root", Node: "pve1", StorageID: "a", BackingKey: def.BackingKey(), VirtualBytes: 1 << 30}}}
+	payload, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(payload, []byte(`"IsMountpoint":false`)) {
+		t.Fatalf("fixture plan is not in the 0.9.x form: %s", payload)
+	}
+	args := []json.RawMessage{json.RawMessage(`"agent"`)}
+	fingerprint, err := storageCallerIntentFingerprint("create_vm", args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := j.AcquireVM(t.Context(), "agent", aj.Intent{IntentFingerprint: fingerprint, PolicyFingerprint: plan.PolicyFingerprint, PlanVersion: 1, Plan: payload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := j.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Kind != "vm" {
+		t.Fatalf("journal lists %d records, want the one VM record", len(records))
+	}
+	decoded, err := activeStorageAllocationPlan(records[0])
+	if err != nil {
+		t.Fatalf("owner decode refused the 0.9.x plan read back from disk: %v", err)
+	}
+	if !storageInfoEqual(decoded.Definitions["a"], def) {
+		t.Fatalf("decoded definition %+v, want %+v", decoded.Definitions["a"], def)
+	}
+	report, err := AuditStorageAllocations(t.Context(), deps, j, []string{"pve1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Complete || len(report.Issues) != 0 || len(report.Conflicts) != 0 {
+		t.Fatalf("audit of a 0.9.x VM record is not clean (complete=%t):\nissues: %s\nconflicts: %s", report.Complete,
+			strings.Join(report.Issues, "\n"), strings.Join(report.Conflicts, "\n"))
 	}
 }

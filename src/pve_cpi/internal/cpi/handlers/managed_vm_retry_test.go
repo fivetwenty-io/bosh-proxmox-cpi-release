@@ -13,7 +13,7 @@ import (
 )
 
 func TestManagedVMRetryPreservesGenerationAndFrozenBounds(t *testing.T) {
-	for _, mode := range []string{"same-policy", "snake-frozen-fingerprint", "changed-policy", "budget-exhausted", "changed-execution", "changed-frozen-fingerprint"} {
+	for _, mode := range []string{"same-policy", "snake-frozen-fingerprint", "changed-policy", "budget-exhausted", "changed-execution", "changed-frozen-fingerprint", "added-transport", "added-ha"} {
 		t.Run(mode, func(t *testing.T) {
 			testManagedVMRetryMode(t, mode)
 		})
@@ -101,15 +101,28 @@ func testManagedVMRetryMode(t *testing.T, mode string) {
 	if mode == "changed-policy" {
 		nextPlan.PolicyFingerprint = strings.Repeat("e", 64)
 	}
-	if mode == "changed-execution" {
+	switch mode {
+	case "changed-execution":
 		req.Selection.Policy.NetworkBridge = "changed"
+	case "added-transport":
+		// API transport settings set after the record froze its execution
+		// leave the fallback admitted.
+		req.Selection.Policy.Endpoints = []string{"pve.example:8006"}
+		req.Selection.Policy.EndpointCacheDir = "/var/vcap/data/pve_cpi/endpoint-cache"
+		req.Selection.Policy.APIEndpointDiscovery = config.DiscoveryModeOff
+	case "added-ha":
+		strict := true
+		req.Selection.Policy.HA = &config.HAConfig{PinAZStrict: &strict}
 	}
 	next := &managedVMPlan{selection: req.Selection, collector: collector, inventory: req.Inventory, plan: &nextPlan}
 	deps := Deps{Config: req.Selection.Policy, Logger: log.NewNopLogger()}
 	runtime, err := beginManagedVMRetry(context.Background(), deps, &createVMParsedArgs{agentID: "agent"}, req.Selection, handle, next, proof("fresh independent admission after cleanup"))
-	if mode != "same-policy" && mode != "snake-frozen-fingerprint" {
+	if mode != "same-policy" && mode != "snake-frozen-fingerprint" && mode != "added-transport" {
 		if err == nil || handle.Record().ActiveAttempt() != 0 {
 			t.Fatal("changed constraint or exhausted budget admitted replacement")
+		}
+		if (mode == "changed-execution" || mode == "added-ha") && !strings.Contains(err.Error(), "frozen VM execution inputs changed") {
+			t.Fatalf("%s refused for another reason: %v", mode, err)
 		}
 		return
 	}

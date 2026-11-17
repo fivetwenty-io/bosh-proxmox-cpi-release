@@ -94,11 +94,11 @@ func (e *StorageVMExecution) shape(cfg *config.CPIConfig) (*createVMShape, error
 	if e == nil || e.Version != 1 {
 		return nil, fmt.Errorf("recorded VM execution is unsupported")
 	}
-	fp, err := managedVMExecutionFingerprint(cfg)
+	matches, err := managedVMExecutionFingerprintMatches(cfg, e.InputFingerprint)
 	if err != nil {
 		return nil, err
 	}
-	if fp != e.InputFingerprint {
+	if !matches {
 		return nil, fmt.Errorf("VM execution defaults changed; reconciliation required")
 	}
 	shape := &createVMShape{
@@ -139,6 +139,38 @@ func (e *StorageVMExecution) shape(cfg *config.CPIConfig) (*createVMShape, error
 // Policy/ranking inputs and current hard storage bounds are revalidated
 // separately. Only material non-storage execution settings participate here.
 func managedVMExecutionFingerprint(cfg *config.CPIConfig) (string, error) {
+	return managedVMExecutionFingerprintOf(cfg, false)
+}
+
+// managedVMExecutionFingerprintMatches reports whether stored is the execution
+// fingerprint of cfg, either in full or with the API transport settings
+// cleared. Those settings (endpoints, endpoint_cache_dir, and
+// api_endpoint_discovery) arrived in 0.10.0 and decide how the CPI reaches the
+// PVE API, not what it builds, so a record frozen before an operator set them
+// still resumes and falls back once they are set. New records keep the full
+// fingerprint. The ha block stays in both forms, because an HA change between
+// an attempt and its resume is a change this guard still refuses.
+func managedVMExecutionFingerprintMatches(cfg *config.CPIConfig, stored string) (bool, error) {
+	full, err := managedVMExecutionFingerprintOf(cfg, false)
+	if err != nil {
+		return false, err
+	}
+	if stored == full {
+		return true, nil
+	}
+	transportless, err := managedVMExecutionFingerprintOf(cfg, true)
+	if err != nil {
+		return false, err
+	}
+	return stored == transportless, nil
+}
+
+// managedVMTransportInputs are the top-level CPIConfig keys that choose how
+// the CPI reaches the PVE API. A cpi-config entry's overrides land in these
+// same fields, so clearing them at the top level covers every entry.
+var managedVMTransportInputs = []string{"endpoints", "endpoint_cache_dir", "api_endpoint_discovery"}
+
+func managedVMExecutionFingerprintOf(cfg *config.CPIConfig, clearTransport bool) (string, error) {
 	// This temporary encoding never leaves memory. RedactSecrets below removes
 	// credentials before the only persisted value, the fingerprint, is computed.
 	raw, err := json.Marshal(cfg) // #nosec G117 -- input normalization only; redacted before fingerprinting.
@@ -151,6 +183,11 @@ func managedVMExecutionFingerprint(cfg *config.CPIConfig) (string, error) {
 	}
 	managedVMRemovePlacementInputs(values)
 	managedVMNormalizeDiskFormatInput(values)
+	if clearTransport {
+		for _, key := range managedVMTransportInputs {
+			delete(values, key)
+		}
+	}
 	return aj.Fingerprint(log.RedactSecrets(values))
 }
 

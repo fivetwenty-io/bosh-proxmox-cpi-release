@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -21,10 +22,10 @@ import (
 // the 0.9.x form again, so a director rolled back to 0.9.x still reads what
 // this release wrote, and it reads both forms, entry by entry.
 //
-// Decoding is strict: a key that neither form defines fails the decode, since
-// a custom UnmarshalJSON does not inherit the outer decoder's
-// DisallowUnknownFields. The sibling plan decode reads through
-// lenientStorageDefinitions instead.
+// Decoding is strict, because a custom UnmarshalJSON does not inherit the
+// outer decoder's DisallowUnknownFields. A key that neither form defines, two
+// keys that name the same field, and a null mount flag all fail the decode.
+// The sibling plan decode reads through lenientStorageDefinitions instead.
 type StorageDefinitions map[string]pve.StorageInfo
 
 // storageDefinitionWire is pve.StorageInfo exactly as releases up to 0.9.x
@@ -162,6 +163,11 @@ func decodeStorageDefinitions(data []byte, strict bool) (StorageDefinitions, err
 }
 
 func decodeStorageDefinition(raw json.RawMessage, strict bool) (pve.StorageInfo, error) {
+	if strict {
+		if err := checkStorageDefinitionKeys(raw); err != nil {
+			return pve.StorageInfo{}, err
+		}
+	}
 	d := json.NewDecoder(bytes.NewReader(raw))
 	if strict {
 		d.DisallowUnknownFields()
@@ -170,12 +176,10 @@ func decodeStorageDefinition(raw json.RawMessage, strict bool) (pve.StorageInfo,
 	if err := d.Decode(&entry); err != nil {
 		return pve.StorageInfo{}, err
 	}
-	// No release writes the flag under both keys, so an entry that carries
-	// both says the flag twice and may disagree with itself.
-	if entry.IsMountpoint != nil && entry.SnakeIsMountpoint != nil {
-		return pve.StorageInfo{}, fmt.Errorf("carries both IsMountpoint and is_mountpoint")
-	}
 	info := pve.StorageInfo(entry.storageDefinitionWire)
+	// The strict path has already refused an entry that names the flag under
+	// both keys. The lenient path reads the 0.9.x key first, which is the form
+	// this release writes.
 	switch {
 	case entry.IsMountpoint != nil:
 		info.IsMountpoint = *entry.IsMountpoint
@@ -183,6 +187,56 @@ func decodeStorageDefinition(raw json.RawMessage, strict bool) (pve.StorageInfo,
 		info.IsMountpoint = *entry.SnakeIsMountpoint
 	}
 	return info, nil
+}
+
+// checkStorageDefinitionKeys refuses the entry shapes that no release writes
+// and that a plain decode would settle silently. Two keys that name the same
+// field once case is folded would leave the last one winning, the mount flag
+// under both of its keys says the flag twice and may disagree with itself,
+// and a null mount flag would read as false. Only the strict owner decode
+// runs it. The sibling decode never reads the flag, so it keeps tolerating
+// these shapes rather than refuse a create over another allocation's plan.
+func checkStorageDefinitionKeys(raw json.RawMessage) error {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	open, err := d.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := open.(json.Delim); !ok || delim != '{' {
+		// A null entry or a non-object is left to the struct decode, which
+		// reads null as an empty definition and refuses anything else.
+		return nil
+	}
+	var keys []string
+	var goFlag, snakeFlag bool
+	for d.More() {
+		token, err := d.Token()
+		if err != nil {
+			return err
+		}
+		key, _ := token.(string)
+		for _, seen := range keys {
+			if strings.EqualFold(seen, key) {
+				return fmt.Errorf("carries %q and %q, which name the same field", seen, key)
+			}
+		}
+		keys = append(keys, key)
+		var value json.RawMessage
+		if err := d.Decode(&value); err != nil {
+			return err
+		}
+		goKey := strings.EqualFold(key, "IsMountpoint")
+		snakeKey := strings.EqualFold(key, "is_mountpoint")
+		if (goKey || snakeKey) && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("carries a null %s", key)
+		}
+		goFlag = goFlag || goKey
+		snakeFlag = snakeFlag || snakeKey
+	}
+	if goFlag && snakeFlag {
+		return fmt.Errorf("carries both IsMountpoint and is_mountpoint")
+	}
+	return nil
 }
 
 // storageFrozenInputs is what a journal intent's frozen-inputs fingerprint

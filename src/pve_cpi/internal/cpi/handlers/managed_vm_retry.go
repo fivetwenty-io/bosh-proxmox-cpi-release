@@ -43,7 +43,11 @@ func beginManagedVMRetry(ctx context.Context, deps Deps, parsed *createVMParsedA
 	if previous.VMExecution == nil || previous.VMExecution.MaxAttempts <= handle.Record().ActiveAttempt()+1 {
 		return nil, fmt.Errorf("frozen VM attempt budget exhausted")
 	}
-	if next.plan.VMExecution.InputFingerprint != previous.VMExecution.InputFingerprint {
+	executionMatch, err := managedVMExecutionFingerprintMatches(deps.Config, previous.VMExecution.InputFingerprint)
+	if err != nil {
+		return nil, err
+	}
+	if !executionMatch {
 		return nil, fmt.Errorf("frozen VM execution inputs changed; no replacement allocated")
 	}
 	next.plan.VMExecution.MaxAttempts = previous.VMExecution.MaxAttempts
