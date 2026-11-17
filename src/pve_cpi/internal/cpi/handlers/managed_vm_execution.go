@@ -143,29 +143,34 @@ func managedVMExecutionFingerprint(cfg *config.CPIConfig) (string, error) {
 }
 
 // managedVMExecutionFingerprintMatches reports whether stored is the execution
-// fingerprint of cfg in either form a release has written. The API transport
+// fingerprint of cfg in any form a release has written. The API transport
 // settings (endpoints, endpoint_cache_dir, and api_endpoint_discovery) decide
-// how the CPI reaches the PVE API, not what it builds, so the fingerprint a
-// record stores leaves them out. That form is also the one 0.9.x computes,
-// since it has none of those keys, so a record keeps matching across an
-// upgrade, a rollback, and any change to those settings. Releases 0.10.0
-// through 0.10.2 stored the fingerprint with them included, so the full form
-// still matches a record those releases opened while the settings are
-// unchanged. The ha block stays in both forms, because an HA change between
+// how the CPI reaches the PVE API, and release_version names the release that
+// rendered the config. Neither decides what the CPI builds, so the fingerprint
+// a record stores leaves them out, and a record keeps matching across an
+// upgrade, a rollback, and any change to those settings. Two older forms still
+// match. A 0.9.x release computes the form with only the transport settings
+// left out, because it has none of those keys but does hash release_version,
+// so a record it opened matches while the release version is unchanged.
+// Releases 0.10.0 through 0.10.2 stored the full form, so a record those
+// releases opened matches while every setting, release_version included, is
+// unchanged. The ha block stays in every form, because an HA change between
 // an attempt and its resume is a change this guard still refuses.
 func managedVMExecutionFingerprintMatches(cfg *config.CPIConfig, stored string) (bool, error) {
-	transportless, err := managedVMExecutionFingerprintOf(cfg, true)
-	if err != nil {
-		return false, err
+	for _, form := range []struct{ clearTransport, clearRelease bool }{
+		{true, true},
+		{false, false},
+		{true, false},
+	} {
+		fp, err := managedVMExecutionFingerprintForm(cfg, form.clearTransport, form.clearRelease)
+		if err != nil {
+			return false, err
+		}
+		if stored == fp {
+			return true, nil
+		}
 	}
-	if stored == transportless {
-		return true, nil
-	}
-	full, err := managedVMExecutionFingerprintOf(cfg, false)
-	if err != nil {
-		return false, err
-	}
-	return stored == full, nil
+	return false, nil
 }
 
 // managedVMTransportInputs are the top-level CPIConfig keys that choose how
@@ -173,7 +178,17 @@ func managedVMExecutionFingerprintMatches(cfg *config.CPIConfig, stored string) 
 // same fields, so clearing them at the top level covers every entry.
 var managedVMTransportInputs = []string{"endpoints", "endpoint_cache_dir", "api_endpoint_discovery"}
 
-func managedVMExecutionFingerprintOf(cfg *config.CPIConfig, clearTransport bool) (string, error) {
+// managedVMInformationalInputs are the top-level keys that describe the
+// release, not the VM, so they stay out of the stored fingerprint.
+var managedVMInformationalInputs = []string{"release_version"}
+
+// managedVMExecutionFingerprintOf computes the stored form when clearStored is
+// true and the full form when it is false.
+func managedVMExecutionFingerprintOf(cfg *config.CPIConfig, clearStored bool) (string, error) {
+	return managedVMExecutionFingerprintForm(cfg, clearStored, clearStored)
+}
+
+func managedVMExecutionFingerprintForm(cfg *config.CPIConfig, clearTransport, clearRelease bool) (string, error) {
 	// This temporary encoding never leaves memory. RedactSecrets below removes
 	// credentials before the only persisted value, the fingerprint, is computed.
 	raw, err := json.Marshal(cfg) // #nosec G117 -- input normalization only; redacted before fingerprinting.
@@ -188,6 +203,11 @@ func managedVMExecutionFingerprintOf(cfg *config.CPIConfig, clearTransport bool)
 	managedVMNormalizeDiskFormatInput(values)
 	if clearTransport {
 		for _, key := range managedVMTransportInputs {
+			delete(values, key)
+		}
+	}
+	if clearRelease {
+		for _, key := range managedVMInformationalInputs {
 			delete(values, key)
 		}
 	}
