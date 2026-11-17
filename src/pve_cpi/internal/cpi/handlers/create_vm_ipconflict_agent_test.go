@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -480,4 +481,57 @@ func agentContains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// TestProbeGuestAgentIPConflict_WarnsThatOfflineMembersWereNotProbed: a member
+// the quorate cluster reports offline is left out of the probe, but one whose
+// corosync link failed can keep its guests running, and one of them may answer
+// on a target IP. The probe warns and names the member so the gap shows in the
+// task log.
+func TestProbeGuestAgentIPConflict_WarnsThatOfflineMembersWereNotProbed(t *testing.T) {
+	t.Parallel()
+	const targetIP = "10.0.0.9"
+	row := func(vmid int, node string) json.RawMessage {
+		b, _ := json.Marshal(map[string]any{"vmid": vmid, "node": node, "type": "qemu", "status": "running"})
+		return b
+	}
+	var (
+		mu          sync.Mutex
+		probedNodes []string
+	)
+	deps := agentDeps(
+		func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			return agentListResp(row(200, "pve1"), row(300, "pve2")), nil
+		},
+		func(_ context.Context, node string, _ string) (*nodes.ListQemuAgentNetworkGetInterfacesResponse, error) {
+			mu.Lock()
+			probedNodes = append(probedNodes, node)
+			mu.Unlock()
+			return agentResp(agentIPFace("eth0", "ipv4", "10.0.0.50", 24)), nil
+		},
+	)
+	deps.PVE.(*icPVEClient).clusterSvc.(*icClusterService).statusFn = func() (*sdkcluster.ListStatusResponse, error) {
+		r := sdkcluster.ListStatusResponse{
+			json.RawMessage(`{"type":"cluster","quorate":1}`),
+			json.RawMessage(`{"type":"node","name":"pve1","online":1}`),
+			json.RawMessage(`{"type":"node","name":"pve2","online":0}`),
+		}
+		return &r, nil
+	}
+	logger, obs := log.NewObservedLogger(log.LevelWarn)
+	if err := probeGuestAgentIPConflict(context.Background(), deps, logger, []string{targetIP}); err != nil {
+		t.Fatalf("no probed guest holds the target IP, got: %v", err)
+	}
+	for _, n := range probedNodes {
+		if n == "pve2" {
+			t.Fatalf("the probe reached a guest on pve2, which the cluster reports offline")
+		}
+	}
+	for _, e := range obs.All() {
+		nodesAttr, _ := e.Attrs["nodes"].(string)
+		if agentContains(e.Message, "were not probed") && nodesAttr == "pve2" {
+			return
+		}
+	}
+	t.Fatalf("want a warning that names pve2 as not probed, got %+v", obs.All())
 }

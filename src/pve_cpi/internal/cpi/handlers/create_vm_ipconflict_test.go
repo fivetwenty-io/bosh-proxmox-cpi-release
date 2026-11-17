@@ -452,6 +452,9 @@ func (m *icQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ s
 type icClusterService struct {
 	sdkcluster.Service
 	listFn func(context.Context, *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
+	// statusFn, when set, answers ListStatus, so a test can report members
+	// offline. Unset, the cluster reads as fully online.
+	statusFn func() (*sdkcluster.ListStatusResponse, error)
 }
 
 var _ sdkcluster.Service = (*icClusterService)(nil)
@@ -1022,8 +1025,12 @@ func TestDetectIPConflict_SelfExclusion_ExternalConflictStillDetected(t *testing
 	}
 }
 
-// ListStatus reports no offline members; the fixture cluster is fully online.
+// ListStatus answers from statusFn when set, and otherwise reports no offline
+// members, so the fixture cluster is fully online.
 func (m *icClusterService) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	if m.statusFn != nil {
+		return m.statusFn()
+	}
 	empty := sdkcluster.ListStatusResponse{}
 	return &empty, nil
 }

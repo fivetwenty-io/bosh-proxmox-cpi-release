@@ -172,9 +172,14 @@ func probeGuestAgentIPConflict(
 	// Phase 1: enumerate every running guest from authoritative per-node
 	// listings, not the /cluster/resources index: the index lags by minutes,
 	// and a young VM already answering on the target IP is exactly what this
-	// probe exists to find. Tolerant form: the probe targets RUNNING guests,
-	// and an offline member runs none, so excluding it loses nothing.
-	guests, _, listErr := pve.ListGuestsAuthoritativeTolerant(ctx, deps.PVE, logger)
+	// probe exists to find. Tolerant form: the probe is a fail-open best
+	// effort, so it does not spend the listing retry budget on a member the
+	// quorate cluster reports offline. Leaving that member out does not mean
+	// it runs no guests. One whose corosync link failed can keep its guests
+	// running, and one of them may answer on a target IP, so the probe warns
+	// and names the members it did not cover, as the config-based detector
+	// does.
+	guests, excludedMembers, listErr := pve.ListGuestsAuthoritativeTolerant(ctx, deps.PVE, logger)
 	if listErr != nil {
 		// Infra error enumerating cluster guests: fail open so create_vm
 		// is never blocked by a probe/cluster-API error.
@@ -183,6 +188,11 @@ func probeGuestAgentIPConflict(
 			log.Err(listErr),
 		)
 		return nil
+	}
+	if len(excludedMembers) > 0 {
+		logger.Warn("probe_agent_ip: cluster members reported offline were not probed;"+
+			" IPs their running guests answer on are unverified",
+			log.String("nodes", strings.Join(excludedMembers, ",")))
 	}
 
 	type vmEntry struct {
