@@ -62,6 +62,10 @@ type endpointCache struct {
 	// the failure rules keep at Debug under auto.
 	mode   config.DiscoveryMode
 	logger *log.Logger
+	// marksOnly says discovery is off for this call, so the cache holds down
+	// marks alone. It has no worker, loads no discovered nodes or node names,
+	// and carries no cold start.
+	marksOnly bool
 	// discovered are the cached nodes handed to the pool, which the mark
 	// writes name as the pool's extra endpoints so their marks survive
 	// pruning.
@@ -95,10 +99,25 @@ func openEndpointCache(cfg *config.CPIConfig, plan *endpointPlan, logger *log.Lo
 	if reason != "" {
 		logger.LogAttrs(ctx, level, reason)
 	}
-	if mode != config.DiscoveryModeOn {
-		return nil
+	// A call whose discovery is off still keeps the down marks, so the first
+	// process that meets a dead endpoint spares the next one its dial timeout.
+	// That cache reads and writes marks and nothing else, and it logs at Debug
+	// whatever the configured mode.
+	marksOnly := mode != config.DiscoveryModeOn
+	if marksOnly {
+		// A pool of one endpoint has nowhere to fail over to, so it never
+		// writes a mark and the call touches no file.
+		if len(plan.endpoints) < 2 {
+			return nil
+		}
+		configured = config.DiscoveryModeOff
+		level = log.LevelDebug
 	}
 	off := func(why string) *endpointCache {
+		if marksOnly {
+			logger.LogAttrs(ctx, level, "endpoint down marks off: "+why)
+			return nil
+		}
 		plan.cacheUnusable = true
 		logger.LogAttrs(ctx, level, "api endpoint discovery off: "+why)
 		return nil
@@ -109,7 +128,7 @@ func openEndpointCache(cfg *config.CPIConfig, plan *endpointPlan, logger *log.Lo
 	// comes before the directory is chosen or opened, so the call touches
 	// nothing.
 	drainRefused := func() *endpointCache {
-		plan.cacheUnusable = true
+		plan.cacheUnusable = !marksOnly
 		logger.LogAttrs(ctx, log.LevelDebug, drainRefusalLine)
 		return nil
 	}
@@ -143,12 +162,15 @@ func openEndpointCache(cfg *config.CPIConfig, plan *endpointPlan, logger *log.Lo
 	if err != nil {
 		return off(fmt.Sprintf("cache directory %s could not be opened: %v", choice.Path, err))
 	}
-	cache := &endpointCache{store: store, mode: configured, logger: logger, cold: coldStartInputs{
-		names:      plan.coldStartNames,
-		seed:       plan.endpoints[0].Address,
-		configured: configuredAddresses(plan),
-		userAgent:  buildUserAgent(cfg),
-	}}
+	cache := &endpointCache{store: store, mode: configured, logger: logger, marksOnly: marksOnly}
+	if !marksOnly {
+		cache.cold = coldStartInputs{
+			names:      plan.coldStartNames,
+			seed:       plan.endpoints[0].Address,
+			configured: configuredAddresses(plan),
+			userAgent:  buildUserAgent(cfg),
+		}
+	}
 	// The release goes first, so every return below leaves the store closed
 	// by the drain or by the code that gave up on it.
 	if !endpointcache.AfterDrain(cache.release) {
@@ -164,11 +186,15 @@ func openEndpointCache(cfg *config.CPIConfig, plan *endpointPlan, logger *log.Lo
 	payload, ok := cache.read()
 	if !ok {
 		cache.release()
-		plan.cacheUnusable = true
+		plan.cacheUnusable = !marksOnly
 		return nil
 	}
 	cache.identity = newClusterIdentityWatch(logger, store.FileName(), payload)
 	cache.load(plan, payload)
+	if marksOnly {
+		cache.sink = &cacheMarkSink{store: store, mode: configured, logger: logger, now: cacheClock, start: endpointcache.Go}
+		return cache
+	}
 	if payload != nil {
 		if payload.ColdStart != nil {
 			cache.cold.hint = payload.ColdStart.Name
@@ -292,11 +318,14 @@ func (c *endpointCache) load(plan *endpointPlan, p *endpointcache.Payload) {
 	if p == nil {
 		return
 	}
-	if standingConflict(p) {
+	if !c.marksOnly && standingConflict(p) {
 		c.watch().warnConflict()
 	}
 	for i := range plan.endpoints[:plan.configured] {
 		plan.endpoints[i].DownMarkedAt = markTime(p, plan.endpoints[i].Address)
+	}
+	if c.marksOnly {
+		return
 	}
 	nameConfiguredEndpoints(plan, p)
 	if p.Discovery == nil {
@@ -413,6 +442,9 @@ func (c *endpointCache) attach(cfg *endpointpool.Config) {
 		return
 	}
 	cfg.MarkSink = c.sink
+	if c.marksOnly {
+		return
+	}
 	cfg.FirstAnswer = c.worker
 	c.attachColdStart(cfg)
 }
@@ -433,7 +465,7 @@ func (c *endpointCache) poolRefused(err error) {
 // configured only, so they never reach a discovered endpoint. A failed bind
 // costs the call its discovery and nothing else.
 func (c *endpointCache) bind(client Client, pool *endpointpool.Pool) {
-	if c == nil {
+	if c == nil || c.marksOnly {
 		return
 	}
 	if pool == nil {
