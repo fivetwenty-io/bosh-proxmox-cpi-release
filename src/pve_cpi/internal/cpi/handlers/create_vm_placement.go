@@ -908,7 +908,10 @@ func logFilterRejections(logger *log.Logger, rejections map[string]string, az st
 			)
 			continue
 		}
-		if reason == "node in maintenance" || reason == "node offline" {
+		// A node that cannot take new work, such as a fenced node or a node of
+		// a cluster without quorum, shows in the default log like one in
+		// maintenance.
+		if reason == "node in maintenance" || reason == "node offline" || placement.IsUnplaceableRejection(reason) {
 			logger.Info("create_vm: placement: node filtered",
 				log.String("node", n),
 				log.String("reason", reason),
