@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
@@ -364,7 +365,7 @@ func warnLogger(t *testing.T, buf *bytes.Buffer) *log.Logger {
 
 func TestWarnSingleNodeAZPin_SingleNodeStrict_Warns(t *testing.T) {
 	var buf bytes.Buffer
-	warnSingleNodeAZPin("z1", []string{"pve01"}, true, warnLogger(t, &buf))
+	warnSingleNodeAZPin("z1", []string{"pve01"}, true, "", warnLogger(t, &buf))
 	out := buf.String()
 	if !strings.Contains(out, "small node set") {
 		t.Errorf("expected small-node-set warning, got %q", out)
@@ -378,7 +379,7 @@ func TestWarnSingleNodeAZPin_TwoNodeStrict_Warns(t *testing.T) {
 	// A two-node pinned set still wedges if both nodes are simultaneously
 	// down or drained, so it must warn just like the single-node case.
 	var buf bytes.Buffer
-	warnSingleNodeAZPin("z1", []string{"pve01", "pve02"}, true, warnLogger(t, &buf))
+	warnSingleNodeAZPin("z1", []string{"pve01", "pve02"}, true, "", warnLogger(t, &buf))
 	out := buf.String()
 	if !strings.Contains(out, "small node set") {
 		t.Errorf("expected small-node-set warning for a two-node AZ, got %q", out)
@@ -390,7 +391,7 @@ func TestWarnSingleNodeAZPin_TwoNodeStrict_Warns(t *testing.T) {
 
 func TestWarnSingleNodeAZPin_ThreeOrMoreNodes_NoWarn(t *testing.T) {
 	var buf bytes.Buffer
-	warnSingleNodeAZPin("z1", []string{"pve01", "pve02", "pve03"}, true, warnLogger(t, &buf))
+	warnSingleNodeAZPin("z1", []string{"pve01", "pve02", "pve03"}, true, "", warnLogger(t, &buf))
 	if out := buf.String(); out != "" {
 		t.Errorf("AZ with >= 3 nodes must not warn, got %q", out)
 	}
@@ -400,7 +401,7 @@ func TestWarnSingleNodeAZPin_NonStrict_NoWarn(t *testing.T) {
 	var buf bytes.Buffer
 	// Single-node AZ, but the pin is preferred (non-strict): HA can relocate
 	// off-AZ on failure, so the hazard this warning describes does not apply.
-	warnSingleNodeAZPin("z1", []string{"pve01"}, false, warnLogger(t, &buf))
+	warnSingleNodeAZPin("z1", []string{"pve01"}, false, "", warnLogger(t, &buf))
 	if out := buf.String(); out != "" {
 		t.Errorf("non-strict pin must not warn, got %q", out)
 	}
@@ -410,7 +411,7 @@ func TestWarnSingleNodeAZPin_DedupCollapsesToSingleNode(t *testing.T) {
 	var buf bytes.Buffer
 	// Blank and duplicate entries collapse to one effective node; the hazard
 	// still applies and must be reported on the effective, not raw, count.
-	warnSingleNodeAZPin("z1", []string{"pve01", "", "pve01", "  "}, true, warnLogger(t, &buf))
+	warnSingleNodeAZPin("z1", []string{"pve01", "", "pve01", "  "}, true, "", warnLogger(t, &buf))
 	if out := buf.String(); !strings.Contains(out, "small node set") {
 		t.Errorf("expected small-node-set warning after dedup, got %q", out)
 	}
@@ -418,7 +419,7 @@ func TestWarnSingleNodeAZPin_DedupCollapsesToSingleNode(t *testing.T) {
 
 func TestWarnSingleNodeAZPin_EmptyNodesNoOp(t *testing.T) {
 	var buf bytes.Buffer
-	warnSingleNodeAZPin("z1", []string{"", "  "}, true, warnLogger(t, &buf))
+	warnSingleNodeAZPin("z1", []string{"", "  "}, true, "", warnLogger(t, &buf))
 	if out := buf.String(); out != "" {
 		t.Errorf("empty AZ node set must not warn (nothing will be pinned), got %q", out)
 	}
@@ -685,4 +686,58 @@ func ptrStr(p *string) string {
 		return "<nil>"
 	}
 	return *p
+}
+
+// narrowedPinWarning runs the AZ pin writer for a registered VM whose decision
+// narrows the hard set to the placed node under the given local policy, in a
+// two-node AZ, and returns what the Warn level logged.
+func narrowedPinWarning(t *testing.T, policy ha.Policy) string {
+	t.Helper()
+	var buf bytes.Buffer
+	deps := Deps{
+		RequestDirectorUUID: aaDirector,
+		HAProfile:           pve9Profile,
+		Config:              naPinConfig(map[string][]string{"z1": {"pve01", "pve02"}}),
+		PVE:                 &icPVEClient{clusterSvc: newNAStub()},
+		Agent:               &icAgentStub{},
+		Logger:              log.NewNopLogger(),
+	}
+	cp := createVMCloudProps{AvailabilityZone: "z1"}
+	d := testRegisteredDecision(deps, 100, cp, "pve02")
+	d.Policy = policy
+	d.Hard = []string{"pve02"}
+	d.Admissible = d.Hard
+	if _, err := applyAZNodeAffinityPin(context.Background(), deps, d, []string{testPinStorage}, cp, "pve02",
+		warnLogger(t, &buf)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return buf.String()
+}
+
+// TestApplyAZNodeAffinityPin_HoldVMWarnsAboutItsOwnPin checks that the small-AZ
+// Warn describes the one-node pin a hold VM got and names the policy that
+// narrowed it, rather than listing the two nodes of the AZ.
+func TestApplyAZNodeAffinityPin_HoldVMWarnsAboutItsOwnPin(t *testing.T) {
+	out := narrowedPinWarning(t, ha.PolicyHold)
+	if !strings.Contains(out, "small node set") {
+		t.Fatalf("expected the small-node-set warning, got %q", out)
+	}
+	if !strings.Contains(out, `"pinned_node_count":1`) || !strings.Contains(out, `"nodes":"pve02"`) {
+		t.Errorf("warning should report the pin's one node, got %q", out)
+	}
+	if strings.Contains(out, "pve01") {
+		t.Errorf("warning should not name the AZ's other node, got %q", out)
+	}
+	if !strings.Contains(out, "local_policy: hold") {
+		t.Errorf("warning should name the policy that narrowed the pin, got %q", out)
+	}
+}
+
+// TestApplyAZNodeAffinityPin_UnwidenedReplicateWarnsAboutItsOwnPin covers the
+// replicate VM whose pin still names the source alone.
+func TestApplyAZNodeAffinityPin_UnwidenedReplicateWarnsAboutItsOwnPin(t *testing.T) {
+	out := narrowedPinWarning(t, ha.PolicyReplicate)
+	if !strings.Contains(out, `"pinned_node_count":1`) || !strings.Contains(out, "local_policy: replicate") {
+		t.Errorf("warning should report one pinned node and the replicate policy, got %q", out)
+	}
 }

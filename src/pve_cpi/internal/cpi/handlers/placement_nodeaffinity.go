@@ -49,8 +49,9 @@ func applyAZNodeAffinityPin(
 	if !d.Registers() {
 		return nil, nil
 	}
+	az := ""
 	if deps.Config.HAPinAZValue() != config.HARuleOff {
-		warnAZPinScope(deps, d.VMID, cp, node, logger)
+		az = warnAZPinScope(deps, d.VMID, cp, node, logger)
 	}
 	ruleName := naRuleNameFor(d.VMID)
 	if deps.RequestDirectorUUID == "" {
@@ -62,17 +63,48 @@ func applyAZNodeAffinityPin(
 	if err != nil {
 		return nil, fmt.Errorf("node-affinity: %w", err)
 	}
-	return writeMergedPinRule(ctx, deps, profile, d.VMID, pinRequest{Decision: d, Storages: storages}, logger)
+	pin, err := writeMergedPinRule(ctx, deps, profile, d.VMID, pinRequest{Decision: d, Storages: storages}, logger)
+	if err != nil {
+		return nil, err
+	}
+	warnSmallAZPin(deps, az, d, pin, logger)
+	return pin, nil
+}
+
+// warnSmallAZPin warns about a strict pin in a small AZ, and it describes the
+// pin the CPI wrote and not the AZ's node set. A hold VM, and a replicate VM
+// that has not widened yet, are pinned to one node of the AZ, so the line
+// names that node and says which local policy narrowed the pin. az is "" when
+// no AZ resolved for the placed node, and the call is then a no-op.
+func warnSmallAZPin(deps Deps, az string, d *ha.VMDecision, pin *ha.Rule, logger *log.Logger) {
+	if az == "" || pin == nil || !pin.Strict {
+		return
+	}
+	azNodes, ok := deps.Config.AZCandidates(az)
+	if !ok || len(strings.Split(sortedNodesCSV(azNodes), ",")) > 2 {
+		return
+	}
+	pinned := make([]string, 0, len(pin.Nodes))
+	for n := range pin.Nodes {
+		pinned = append(pinned, n)
+	}
+	narrowedBy := ""
+	if len(pinned) < len(strings.Split(sortedNodesCSV(azNodes), ",")) &&
+		(d.Policy == ha.PolicyHold || d.Policy == ha.PolicyReplicate) {
+		narrowedBy = string(d.Policy)
+	}
+	warnSingleNodeAZPin(az, pinned, true, narrowedBy, logger)
 }
 
 // warnAZPinScope logs the AZ warnings of a pinned VM. With no AZ resolved for
 // the placed node while pve.ha.pin_az is on, the AZ part of the pin the
 // operator asked for is missing, and the message names the cloud-config
 // prerequisite because that is the fix in the common case.
-// With a strict pin, a small AZ gets warnSingleNodeAZPin.
-func warnAZPinScope(deps Deps, vmid int, cp createVMCloudProps, node string, logger *log.Logger) {
+// It returns the AZ it resolved for the placed node, or "" when there is none,
+// so the caller can warn about a small AZ once it knows the pin it wrote.
+func warnAZPinScope(deps Deps, vmid int, cp createVMCloudProps, node string, logger *log.Logger) string {
 	if deps.Config.Placement == nil || len(deps.Config.Placement.AZMap) == 0 || vmInDLBAZ(cp, deps.Config) {
-		return
+		return ""
 	}
 	az := pinAZForNode(cp, deps.Config, node)
 	if az == "" && deps.Config.HAPinAZValue() == config.HARuleOn {
@@ -92,14 +124,9 @@ func warnAZPinScope(deps Deps, vmid int, cp createVMCloudProps, node string, log
 			"BOSH merges an AZ's cloud_properties into every VM in that AZ (a VM pinned to a node outside its "+
 			"requested AZ by target_node, a local-disk pin, or the config.node fallback reaches here too)",
 			log.Int(metadataKeyVMID, vmid), log.String("node", node))
-		return
+		return ""
 	}
-	if az == "" {
-		return
-	}
-	if azNodes, ok := deps.Config.AZCandidates(az); ok {
-		warnSingleNodeAZPin(az, azNodes, deps.Config.HAPinAZStrictValue(), logger)
-	}
+	return az
 }
 
 // pinAZForNode returns the AZ the VM was placed in by walking the same AZ order
@@ -136,11 +163,16 @@ func pinAZForNode(cp createVMCloudProps, cfg *config.CPIConfig, node string) str
 // way ensureNodeAffinityPin does, so a config with blank or repeated entries
 // is judged on its effective node count, not its raw slice length. A no-op
 // when strict is false or the effective node count is more than two.
-func warnSingleNodeAZPin(az string, azNodes []string, strict bool, logger *log.Logger) {
+//
+// pinned is the node set of the pin the CPI wrote, and not the AZ's node set,
+// because a hold VM or an unwidened replicate VM is pinned to one node of a
+// larger set. narrowedBy names the local policy that narrowed the pin below the
+// AZ, or is empty when the pin holds the whole AZ.
+func warnSingleNodeAZPin(az string, pinned []string, strict bool, narrowedBy string, logger *log.Logger) {
 	if !strict {
 		return
 	}
-	nodesCSV := sortedNodesCSV(azNodes)
+	nodesCSV := sortedNodesCSV(pinned)
 	if nodesCSV == "" {
 		return
 	}
@@ -148,12 +180,18 @@ func warnSingleNodeAZPin(az string, azNodes []string, strict bool, logger *log.L
 	if len(nodes) > 2 {
 		return
 	}
+	attrs := []log.Field{
+		log.String("az", az), log.String("nodes", nodesCSV), log.Int("pinned_node_count", len(nodes)),
+	}
+	if narrowedBy != "" {
+		attrs = append(attrs, log.String("narrowed_by", "pve.ha.local_policy: "+narrowedBy))
+	}
 	logger.Warn("create_vm: strict AZ node-affinity pin targets a small node set; "+
 		"if every pinned node is simultaneously down or drained for maintenance, PVE HA has "+
 		"nowhere in the AZ left to fail over to and the VM stays down until a pinned node returns "+
 		"(map the AZ to >= 3 nodes to avoid this wedge risk, or set pve.ha.pin_az_strict=false "+
 		"to allow HA to relocate off-AZ instead)",
-		log.String("az", az), log.String("nodes", nodesCSV), log.Int("pinned_node_count", len(nodes)))
+		attrs...)
 }
 
 // pinRequest is one writer's contribution to a VM's merged pin.
