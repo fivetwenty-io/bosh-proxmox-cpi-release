@@ -272,9 +272,10 @@ func newGroupPlanner(
 	svc := deps.PVE.Cluster()
 	return &aaPlanner{
 		ident: ident, scan: scan, logger: logger,
-		nodes:     len(profileNodeNames(profile)),
-		placeable: placeableNodeCount(profile),
-		split:     deps.Config.HAAntiAffinityOverflowValue() == config.HAOverflowSplit,
+		nodes:        len(profileNodeNames(profile)),
+		clusterNodes: profileNodeNames(profile),
+		placeable:    placeableNodeCount(profile),
+		split:        deps.Config.HAAntiAffinityOverflowValue() == config.HAOverflowSplit,
 		managed: func() (map[string]struct{}, error) {
 			return listHAResourceSids(ctx, svc)
 		},
@@ -385,13 +386,18 @@ type aaPlanner struct {
 	// holdOut holds the members of the confinement pins that a repair took
 	// out of the group's writes. A heal keeps such a member where a rule
 	// still holds it and adds it to no rule, because the write that adds it
-	// would put its pin out of effect again.
+	// would put its pin out of effect again. The plan finds a conflict that
+	// the CPI's own feasibility checks can see by itself (see joinConflicts),
+	// so holdOut matters only for one that PVE alone reports.
 	holdOut   map[string]bool
 	scan      *groupScan
 	logger    *log.Logger
 	nodes     int
 	placeable int
 	split     bool
+	// clusterNodes is the configured node set the feasibility checks use, or
+	// nil when it is unknown, which turns off the plan's own check of a join.
+	clusterNodes []string
 	// managed lists the sids PVE manages as HA resources. It is read on
 	// every plan. Nil treats every scanned member as managed.
 	managed func() (map[string]struct{}, error)
@@ -410,6 +416,9 @@ type aaPlanner struct {
 	managedNow map[string]struct{}
 	// deferred holds the siblings already logged as left out for now.
 	deferred map[string]bool
+	// conflicted holds the members already logged as left out because their
+	// join would bring on a feasibility conflict.
+	conflicted map[string]bool
 }
 
 // aaChunkName names a group's n-th rule, the first being the bare name.
@@ -460,7 +469,7 @@ func (p *aaPlanner) plan(set *ha.RuleSet) ([]ha.RuleOp, error) {
 	if p.skipOversized(assigned) {
 		return nil, nil
 	}
-	maxIndex = p.assignPending(desired, assigned, maxIndex)
+	maxIndex = p.assignPending(set, existing, desired, assigned, maxIndex)
 	return p.chunkOps(set, existing, desired, maxIndex), nil
 }
 
@@ -604,7 +613,20 @@ func (p *aaPlanner) keptMembers(existing map[int]*ha.Rule, maxIndex int) (map[in
 // member that is not an HA resource yet waits for its own create to add it.
 // This VM is always pending, because create_vm stages its resource first,
 // except in a heal, where it joins only while it is managed.
-func (p *aaPlanner) assignPending(desired map[int][]string, assigned map[string]bool, maxIndex int) int {
+//
+// Every other member joins only when the CPI's feasibility checks find that
+// its join brings on no conflict that the rule set without it lacks, such as
+// a second member whose strict pin allows only the nodes another member's pin
+// already needs. The write that adds such a member would be refused before it
+// is sent, or would put a strict pin out of effect, so the plan leaves the
+// member out and writes the rest. Every writer of the group plans the same
+// way from the rules it reads, so none of them puts the member back while the
+// conflict lasts, and the first plan after the pin goes away or widens adds
+// it. This VM's own join is never held out, so a create whose own pin
+// conflicts still fails or logs the refusal the way its mode says.
+func (p *aaPlanner) assignPending(
+	set *ha.RuleSet, existing map[int]*ha.Rule, desired map[int][]string, assigned map[string]bool, maxIndex int,
+) int {
 	pending := map[string]struct{}{}
 	candidates := maps.Clone(p.scan.members)
 	if p.sid != "" {
@@ -649,10 +671,84 @@ func (p *aaPlanner) assignPending(desired map[int][]string, assigned map[string]
 			p.logOverflow(s, len(desired[1]))
 			continue
 		}
+		if (p.heal || s != p.sid) && p.joinConflicts(set, existing[target], target, desired[target], s) {
+			continue
+		}
 		assigned[s] = true
 		desired[target] = append(desired[target], s)
 	}
 	return maxIndex
+}
+
+// joinConflicts reports whether adding s to the group's n-th rule, which the
+// plan has given members so far, brings on a feasibility conflict that the
+// rule set without s does not have. It checks the rules the way the writer's
+// check before a send does, with the rule written as chunkOps writes it and
+// with the members' pins flattened. A conflict that the rules held before the
+// join is left to that check. The first time it holds s out it logs why. With
+// the configured nodes unknown it checks nothing, as the writer does.
+func (p *aaPlanner) joinConflicts(set *ha.RuleSet, cur *ha.Rule, n int, members []string, s string) bool {
+	if len(p.clusterNodes) == 0 || len(members) == 0 || set == nil {
+		return false
+	}
+	name := aaChunkName(p.ident.ruleName(), n)
+	with := append(slices.Clone(members), s)
+	bad := ha.IntroducedConflicts(p.chunkCandidate(set, cur, name, members), p.chunkCandidate(set, cur, name, with),
+		nil, p.clusterNodes)
+	if len(bad) == 0 {
+		return false
+	}
+	p.logConflicted(s, name, bad)
+	return true
+}
+
+// chunkCandidate returns set's rules with the rule name holding members, the
+// way chunkOps writes it, and with the members' pins flattened. A rule left
+// with fewer than two members is left out, because chunkOps deletes it.
+func (p *aaPlanner) chunkCandidate(set *ha.RuleSet, cur *ha.Rule, name string, members []string) []ha.Rule {
+	members = slices.Sorted(slices.Values(members))
+	flat := map[string]ha.Rule{}
+	for _, op := range flattenMemberPins(set, members, p.ident.Owner) {
+		flat[op.Rule.ID] = op.Rule
+	}
+	out := make([]ha.Rule, 0, len(set.Rules)+1)
+	for i := range set.Rules {
+		r := set.Rules[i]
+		if r.ID == name {
+			continue
+		}
+		if f, ok := flat[r.ID]; ok {
+			r = f
+		}
+		out = append(out, r)
+	}
+	if len(members) < 2 {
+		return out
+	}
+	chunk := ha.Rule{ID: name, Type: haRuleType, Affinity: haRuleAffinity, Resources: members,
+		Comment: p.ident.marker()}
+	if cur != nil {
+		chunk = cur.Clone()
+		chunk.Resources, chunk.Affinity, chunk.Errors = members, haRuleAffinity, nil
+	}
+	return append(out, chunk)
+}
+
+// logConflicted says once per member that it stays out of the group's rules
+// while its join would bring on the conflicts in bad.
+func (p *aaPlanner) logConflicted(sid, rule string, bad map[string][]string) {
+	if p.conflicted[sid] {
+		return
+	}
+	if p.conflicted == nil {
+		p.conflicted = map[string]bool{}
+	}
+	p.conflicted[sid] = true
+	p.logger.Warn("anti-affinity: member left out of the group's rule, because adding it would make the rules "+
+		"conflict, which would refuse the write or put a strict pin out of effect; a later write of the group "+
+		"adds it once the conflict is gone",
+		log.String("sid", sid), log.String("rule", rule),
+		log.String("conflicting", strings.Join(slices.Sorted(maps.Keys(bad)), ",")), log.String("joining", p.sid))
 }
 
 // chunkOps returns the writes that make the group's rules hold desired, led by
@@ -768,7 +864,8 @@ func (p *aaPlanner) logOverflow(sid string, size int) {
 // single priority. PVE refuses a node-affinity rule with several priorities
 // for a resource that is in a resource-affinity rule, so the pins go flat
 // before the member joins. A pin that carries another Director's marker is
-// left, and the feasibility checks then refuse the membership.
+// left, so the plan leaves a sibling whose join that pin would make conflict
+// out of the rule, and the writer's check refuses the create's own join.
 func flattenMemberPins(set *ha.RuleSet, members []string, owner string) []ha.RuleOp {
 	var ops []ha.RuleOp
 	for _, s := range members {
