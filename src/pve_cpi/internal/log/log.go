@@ -6,6 +6,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"reflect"
+	"slices"
+	"strconv"
 
 	"go.opentelemetry.io/otel/trace"
 )
@@ -29,9 +32,13 @@ type Field = slog.Attr
 // The ctx field carries a context set via WithContext; Debug/Info/Warn/Error
 // pass it to LogAttrs so that slog handlers can extract trace/span values.
 // Default is context.Background() when no context has been set.
+//
+// held lists the fields With attached, so a later With or log call that
+// repeats one of them does not write the key twice (see uniqueFields).
 type Logger struct {
 	*slog.Logger
-	ctx context.Context
+	ctx  context.Context
+	held []Field
 }
 
 // Field constructors mirror the names previously provided by zap so call-site
@@ -289,7 +296,7 @@ func (l *Logger) WithContext(ctx context.Context) *Logger {
 	fields = append(fields, SpanFields(ctx)...)
 	var next *Logger
 	if len(fields) == 0 {
-		next = &Logger{Logger: l.Logger, ctx: ctx}
+		next = &Logger{Logger: l.Logger, ctx: ctx, held: l.held}
 	} else {
 		next = l.With(fields...)
 		next.ctx = ctx
@@ -298,9 +305,79 @@ func (l *Logger) WithContext(ctx context.Context) *Logger {
 }
 
 // With returns a new Logger with the given fields attached.
-// The stored context is propagated to the new instance.
+// The stored context is propagated to the new instance. A field whose key
+// and value the Logger already holds is not attached again, and a field
+// whose key it holds with another value is attached under a distinct key
+// (see uniqueFields), so no log line carries one key twice.
 func (l *Logger) With(fields ...Field) *Logger {
-	return &Logger{Logger: l.Logger.With(attrsToArgs(fields)...), ctx: l.ctx}
+	kept := uniqueFields(l.held, fields)
+	if len(kept) == 0 {
+		return &Logger{Logger: l.Logger, ctx: l.ctx, held: l.held}
+	}
+	held := append(slices.Clip(l.held), kept...)
+	return &Logger{Logger: l.Logger.With(attrsToArgs(kept)...), ctx: l.ctx, held: held}
+}
+
+// uniqueFields returns the fields of next that add something to held. Every
+// handler layer of a call tends to attach the keys it knows, such as the VMID
+// and the node, and slog writes each attachment, so without this a line
+// repeated "vmid" once per layer. A field whose key and value held or an
+// earlier field of next already carries is dropped. A field whose key is
+// taken with a different value keeps its value under the first free key of
+// the form <key>_2, <key>_3, and so on, so no value is lost. Fields with an
+// empty key and groups pass through, because slog inlines or nests them.
+func uniqueFields(held, next []Field) []Field {
+	if len(next) == 0 {
+		return nil
+	}
+	out := make([]Field, 0, len(next))
+	lookup := func(key string) (Field, bool) {
+		for i := len(out) - 1; i >= 0; i-- {
+			if out[i].Key == key {
+				return out[i], true
+			}
+		}
+		for i := len(held) - 1; i >= 0; i-- {
+			if held[i].Key == key {
+				return held[i], true
+			}
+		}
+		return Field{}, false
+	}
+	for _, f := range next {
+		if f.Key == "" || f.Value.Kind() == slog.KindGroup {
+			out = append(out, f)
+			continue
+		}
+		key := f.Key
+		for n := 2; ; n++ {
+			have, taken := lookup(key)
+			if !taken {
+				f.Key = key
+				out = append(out, f)
+				break
+			}
+			if sameValue(have.Value, f.Value) {
+				break
+			}
+			key = f.Key + "_" + strconv.Itoa(n)
+		}
+	}
+	return out
+}
+
+// sameValue reports whether two field values are equal. slog's Value.Equal
+// compares values of kind Any with ==, which panics on a slice or a map, so
+// those are compared deeply instead.
+func sameValue(a, b slog.Value) bool {
+	a, b = a.Resolve(), b.Resolve()
+	if a.Kind() != b.Kind() {
+		return false
+	}
+	if a.Kind() == slog.KindAny {
+		return reflect.DeepEqual(a.Any(), b.Any())
+	}
+	return a.Equal(b)
 }
 
 // WithFields is an alias for With kept for source compatibility.
@@ -359,22 +436,22 @@ func (l *Logger) logCtx() context.Context {
 
 // Debug logs at debug level using the stored context (set via WithContext).
 func (l *Logger) Debug(msg string, fields ...Field) {
-	l.LogAttrs(l.logCtx(), slog.LevelDebug, msg, fields...)
+	l.LogAttrs(l.logCtx(), slog.LevelDebug, msg, uniqueFields(l.held, fields)...)
 }
 
 // Info logs at info level using the stored context (set via WithContext).
 func (l *Logger) Info(msg string, fields ...Field) {
-	l.LogAttrs(l.logCtx(), slog.LevelInfo, msg, fields...)
+	l.LogAttrs(l.logCtx(), slog.LevelInfo, msg, uniqueFields(l.held, fields)...)
 }
 
 // Warn logs at warn level using the stored context (set via WithContext).
 func (l *Logger) Warn(msg string, fields ...Field) {
-	l.LogAttrs(l.logCtx(), slog.LevelWarn, msg, fields...)
+	l.LogAttrs(l.logCtx(), slog.LevelWarn, msg, uniqueFields(l.held, fields)...)
 }
 
 // Error logs at error level using the stored context (set via WithContext).
 func (l *Logger) Error(msg string, fields ...Field) {
-	l.LogAttrs(l.logCtx(), slog.LevelError, msg, fields...)
+	l.LogAttrs(l.logCtx(), slog.LevelError, msg, uniqueFields(l.held, fields)...)
 }
 
 // Sync is a no-op; slog handlers flush per write. Retained for API symmetry
