@@ -78,10 +78,15 @@ type nhNodes struct {
 	now   int64
 	err   error
 	asked []string
+	// nodeErr fails the clock read of the nodes it names, ahead of err.
+	nodeErr map[string]error
 }
 
 func (n *nhNodes) ListTime(_ context.Context, node string) (*sdknodes.ListTimeResponse, error) {
 	n.asked = append(n.asked, node)
+	if err := n.nodeErr[node]; err != nil {
+		return nil, err
+	}
 	if n.err != nil {
 		return nil, n.err
 	}

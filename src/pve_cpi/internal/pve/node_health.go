@@ -261,10 +261,21 @@ type NodeHealthReport struct {
 	HA       HAView
 	HAReason string
 
+	// ClockNode names the member whose clock measured the HA timestamps. It is
+	// the entry node unless the entry node answered its own clock read with a
+	// server error, and it is empty when no clock was read. ClockFallback says
+	// why another member's clock was used, and it is empty when it was not.
+	ClockNode     string
+	ClockFallback string
+
 	// Nodes holds one entry per node, sorted by name.
 	Nodes []NodeHealthEntry
 
 	index map[string]int
+
+	// clockPeers is the order in which an HA read tries other members' clocks
+	// when the entry node's clock read fails with a server error.
+	clockPeers []string
 }
 
 // Node returns the entry for name, and false when no source mentions the node.
@@ -335,6 +346,7 @@ type managerView struct {
 	lrm                map[string]lrmWire
 	crmStamp           int64
 	quorumNode         string
+	masterNode         string
 	services           int
 	servicesUnreadable bool
 	disarmed           bool
@@ -533,6 +545,7 @@ func readManagerView(ctx context.Context, clusterAPI NodeHealthCluster) (*manage
 		ServiceStatus json.RawMessage `json:"service_status"`
 		Disarm        json.RawMessage `json:"disarm"`
 		Timestamp     json.RawMessage `json:"timestamp"`
+		MasterNode    json.RawMessage `json:"master_node"`
 	}
 	var top struct {
 		crmFields
@@ -566,9 +579,16 @@ func readManagerView(ctx context.Context, clusterAPI NodeHealthCluster) (*manage
 		if len(nested.Timestamp) > 0 {
 			crm.Timestamp = nested.Timestamp
 		}
+		if len(nested.MasterNode) > 0 {
+			crm.MasterNode = nested.MasterNode
+		}
 	}
 
-	view := &managerView{quorumNode: top.Quorum.Node, disarmed: jsonPresent(crm.Disarm)}
+	view := &managerView{
+		quorumNode: top.Quorum.Node,
+		masterNode: decodeMasterNode(crm.MasterNode),
+		disarmed:   jsonPresent(crm.Disarm),
+	}
 	if jsonErr := decodeHAMap(crm.NodeStatus, &view.nodeStatus); jsonErr != nil {
 		return nil, fmt.Errorf("node_status: %w", jsonErr)
 	}
@@ -637,21 +657,20 @@ func resolveManagerView(
 		return haInputs{}
 	}
 
-	var timeResp *sdknodes.ListTimeResponse
-	err := RetryOnTransient(ctx, nil, "node_health_entry_time", 0, func() error {
-		var inner error
-		timeResp, inner = nodesAPI.ListTime(ctx, report.EntryNode)
-		return inner
-	})
-	if err != nil || timeResp == nil || timeResp.Time.Int() <= 0 {
+	report.clockPeers = haClockPeers(view, report.EntryNode, mgr.masterNode)
+	clock, err := readHAClock(ctx, nodesAPI, report.EntryNode, report.clockPeers, "node_health_entry_time")
+	if err != nil {
 		report.HA = HAViewUnreadable
-		report.HAReason = "entry node clock unreadable, so timestamps cannot be measured"
-		if err != nil {
-			report.HAReason += ": " + err.Error()
-		}
+		report.HAReason = "entry node clock unreadable, so timestamps cannot be measured: " + err.Error()
 		return haInputs{}
 	}
-	now := timeResp.Time.Int()
+	report.ClockNode = clock.node
+	if clock.entryErr != nil {
+		report.ClockFallback = "the entry node's clock read failed (" + clock.entryErr.Error() +
+			"), so timestamps are measured on node " + clock.node + "'s clock"
+	}
+	now := clock.now
+	onClock := clock.describe()
 
 	if mgr.crmStamp <= 0 {
 		report.HA = HAViewStale
@@ -664,12 +683,12 @@ func resolveManagerView(
 			report.HA = HAViewIdle
 			report.HAReason = "the CRM is idle because the cluster has no HA resources and its last round held " +
 				"no service and no disarm request; its timestamp is " + describeAge(now, mgr.crmStamp) +
-				" on the entry node's clock"
+				" " + onClock
 			// The idle CRM's last round still says which nodes are in HA
 			// maintenance, because a change to node maintenance wakes the CRM.
 			return haInputs{nodeStatus: mgr.nodeStatus}
 		}
-		age := "CRM timestamp is " + describeAge(now, mgr.crmStamp) + " on the entry node's clock"
+		age := "CRM timestamp is " + describeAge(now, mgr.crmStamp) + " " + onClock
 		report.HA = HAViewStale
 		report.HAReason = age
 		if gap != "" {

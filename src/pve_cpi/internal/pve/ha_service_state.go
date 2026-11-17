@@ -176,7 +176,7 @@ type HAServiceState struct {
 	// EntryNode is the entry node every read of this decision came through.
 	EntryNode string
 
-	// EntryTime is the entry node's clock at the read, CRMStamp is the CRM
+	// EntryTime is the clock of ClockNode at the read, CRMStamp is the CRM
 	// round's timestamp, and LRMStamp is the timestamp of Node's LRM entry, all
 	// in seconds since the epoch. Each is zero when the read had no CRM view or
 	// the entry carried none. A caller that waits for the CRM to act on a
@@ -186,6 +186,13 @@ type HAServiceState struct {
 	EntryTime int64
 	CRMStamp  int64
 	LRMStamp  int64
+
+	// ClockNode names the member whose clock EntryTime came from. It is the
+	// entry node unless the entry node answered its own clock read with a
+	// server error, which a node in the middle of a shutdown does, and then it
+	// is another online member, the CRM master first. It is empty when the read
+	// had no CRM view.
+	ClockNode string
 }
 
 // Managed reports whether PVE HA holds the VM, either as a configured resource
@@ -421,18 +428,20 @@ func ReadHAServiceState(
 		if mgr.quorumNode == "" {
 			return unknown("manager status does not name the node that served it")
 		}
-		entryTime, err = readEntryTime(ctx, nodesAPI, health.EntryNode)
-		if err != nil {
-			return unknown("entry node clock unreadable: %v", err)
+		clock, clockErr := readHAClock(ctx, nodesAPI, health.EntryNode, health.clockPeers, "ha_service_state_entry_time")
+		if clockErr != nil {
+			return unknown("entry node clock unreadable: %v", clockErr)
 		}
+		entryTime = clock.now
 		if mgr.crmStamp <= 0 {
 			return unknown("manager status carries no CRM timestamp")
 		}
 		if !timestampFresh(entryTime, mgr.crmStamp, NodeHealthCRMMaxAge) {
-			return unknown("CRM timestamp is %s on the entry node's clock", describeAge(entryTime, mgr.crmStamp))
+			return unknown("CRM timestamp is %s %s", describeAge(entryTime, mgr.crmStamp), clock.describe())
 		}
 		st.CRMPresent = true
 		st.EntryTime = entryTime
+		st.ClockNode = clock.node
 		st.CRMStamp = mgr.crmStamp
 	}
 
@@ -593,23 +602,6 @@ func readConfiguredStateOf(ctx context.Context, clusterAPI HAServiceStateCluster
 			"answered for %s", sid, resp.Sid)
 	}
 	return HARequestedState(resp.State), ""
-}
-
-// readEntryTime reads the entry node's clock in Unix seconds.
-func readEntryTime(ctx context.Context, nodesAPI NodeHealthNodes, entry string) (int64, error) {
-	var now int64
-	err := RetryOnTransient(ctx, nil, "ha_service_state_entry_time", 0, func() error {
-		resp, inner := nodesAPI.ListTime(ctx, entry)
-		if inner != nil {
-			return inner
-		}
-		if resp == nil || resp.Time.Int() <= 0 {
-			return cpierrors.Retriable("node %s returned no clock", entry)
-		}
-		now = resp.Time.Int()
-		return nil
-	})
-	return now, err
 }
 
 // ReadHAServiceStates returns the raw CRM state of every service in manager
