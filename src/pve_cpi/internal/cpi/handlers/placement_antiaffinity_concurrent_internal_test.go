@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -700,6 +701,147 @@ func TestDeadNodeRelease_UnlockedReleaseHealsTheGroup(t *testing.T) {
 	}
 	if got := stub.rules[aaRule]; got != "vm:101,vm:102" {
 		t.Fatalf("rule = %q; want the other member and the sibling, without the fenced VM", got)
+	}
+	for _, e := range observed.All() {
+		if e.Level == log.LevelWarn {
+			t.Fatalf("unexpected warning: %s", e.Message)
+		}
+	}
+}
+
+// TestHealAntiAffinityGroup_HealsAgainAfterItsOwnDelete pins that a heal
+// whose own write deletes a rule heals again. The group is split across two
+// rules on a two-node cluster, and vm:100 leaves the second rule, which then
+// holds one member, so the first round deletes it. A sibling writes itself
+// into that rule between the round's read and its delete, and the delete
+// takes it out with the rule. The second round must write the rule again with
+// the member that stayed and the sibling.
+func TestHealAntiAffinityGroup_HealsAgainAfterItsOwnDelete(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	stub.tagged(aaQEMU(101, aaTag), aaQEMU(102, aaTag), aaQEMU(103, aaTag))
+	second := aaChunkName(aaRule, 2)
+	stub.seedRule(aaRule, "vm:101,vm:102")
+	stub.seedRule(second, "vm:100,vm:103")
+	raced := false
+	racing := &aaRaceDelete{aaClusterStub: stub, before: func(rule string) {
+		if rule != second || raced {
+			return
+		}
+		raced = true
+		stub.tagged(aaQEMU(101, aaTag), aaQEMU(102, aaTag), aaQEMU(103, aaTag), aaQEMU(104, aaTag))
+		stub.rules[second] = "vm:100,vm:103,vm:104"
+		stub.digest++
+	}}
+	deps := aaModeDeps(stub, config.HAModeAuto, config.HAOverflowSplit, "pve1", "pve2")
+	deps.PVE = &icPVEClient{
+		clusterSvc: racing,
+		nodesSvc: &icNodesService{listFn: func(ctx context.Context, p *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return stub.ListResources(ctx, p)
+		}},
+	}
+	if err := healAntiAffinityGroup(context.Background(), deps, aaIdent("web"), "", "vm:100", nil,
+		log.NewNopLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if !raced {
+		t.Fatal("the heal deleted no rule, so the race never ran")
+	}
+	if got := stub.rules[aaRule]; got != "vm:101,vm:102" {
+		t.Fatalf("first rule = %q; want it unchanged", got)
+	}
+	if got := stub.rules[second]; got != "vm:103,vm:104" {
+		t.Fatalf("second rule = %q; want the member that stayed and the sibling, written by a second round", got)
+	}
+}
+
+// TestHealAntiAffinityGroup_StopsAfterFourRoundsOfDeletes pins the bound on a
+// heal's rounds. A sibling keeps writing vm:100, which is leaving the group,
+// back into a rule with one other member before every round reads the group,
+// so every round deletes that rule. The heal must stop after four rounds with
+// an error the Director retries, instead of going round for as long as the
+// sibling does.
+func TestHealAntiAffinityGroup_StopsAfterFourRoundsOfDeletes(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	stub.tagged(aaQEMU(101, aaTag), aaQEMU(102, aaTag), aaQEMU(103, aaTag))
+	second := aaChunkName(aaRule, 2)
+	stub.seedRule(aaRule, "vm:101,vm:102")
+	members := stub.listResourcesFn
+	rounds := 0
+	stub.listResourcesFn = func() *cluster.ListResourcesResponse {
+		if _, ok := stub.rules[second]; !ok {
+			stub.seedRule(second, "vm:100,vm:103")
+			stub.digest++
+		}
+		rounds++
+		return members()
+	}
+	deps := aaModeDeps(stub, config.HAModeAuto, config.HAOverflowSplit, "pve1", "pve2")
+	err := healAntiAffinityGroup(context.Background(), deps, aaIdent("web"), "", "vm:100", nil, log.NewNopLogger())
+	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("heal = %v; want a retriable error once every round lost a rule to a delete", err)
+	}
+	if rounds != 4 || stub.deleteRuleCalls != 4 {
+		t.Fatalf("the heal read the group %d times and deleted %d rules; want 4 of each", rounds,
+			stub.deleteRuleCalls)
+	}
+}
+
+// TestEnsureAntiAffinity_UnlockedHealLeavesOutAPurgedCreate pins that the
+// heal a create runs after its own delete adds the create's VM only while it
+// is an HA resource. The create's plan deletes its group's rule, two siblings
+// write themselves into it between the create's read and its delete, and the
+// create's resource is purged right after the delete lands, before the heal.
+// PVE refuses a rule that names a resource it does not manage, so the heal
+// must write the rule with the two siblings alone.
+func TestEnsureAntiAffinity_UnlockedHealLeavesOutAPurgedCreate(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	stub.enforceManaged = true
+	tagged := []int{101}
+	stub.listResourcesFn = func() *cluster.ListResourcesResponse {
+		resp := make(cluster.ListResourcesResponse, 0, len(tagged))
+		for _, v := range tagged {
+			resp = append(resp, aaQEMU(v, aaTag))
+		}
+		return &resp
+	}
+	stub.resources["vm:101"] = true
+	stub.seedRule(aaRule, "vm:100")
+	raced := false
+	racing := &aaRaceDelete{aaClusterStub: stub, before: func(rule string) {
+		if rule != aaRule || raced {
+			return
+		}
+		raced = true
+		tagged = append(tagged, 102, 103)
+		stub.resources["vm:102"], stub.resources["vm:103"] = true, true
+		stub.rules[aaRule] = "vm:102,vm:103"
+		stub.digest++
+	}}
+	stub.onRuleWrite = func(rule string) {
+		if rule == aaRule && raced {
+			delete(stub.resources, "vm:101")
+		}
+	}
+	deps := aaDeps(stub)
+	deps.PVE = &icPVEClient{
+		clusterSvc: racing,
+		nodesSvc: &icNodesService{listFn: func(ctx context.Context, p *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return stub.ListResources(ctx, p)
+		}},
+	}
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+	logger, observed := log.NewObservedLogger(log.LevelDebug)
+	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 101, logger); err != nil {
+		t.Fatal(err)
+	}
+	if !raced {
+		t.Fatal("the create deleted no rule, so the race never ran")
+	}
+	if got := stub.rules[aaRule]; got != "vm:102,vm:103" {
+		t.Fatalf("rule = %q; want both siblings without the purged create", got)
 	}
 	for _, e := range observed.All() {
 		if e.Level == log.LevelWarn {
