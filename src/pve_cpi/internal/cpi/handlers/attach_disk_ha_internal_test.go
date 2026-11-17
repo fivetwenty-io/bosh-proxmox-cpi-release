@@ -801,19 +801,56 @@ func (c *attachRunClient) MigrationTasks(
 	return out, nil
 }
 
-// taskListStub holds the move and migration tasks of each node, a listing
-// error per node for both listings, and one for the migration listing alone.
+func (c *attachRunClient) StartTasks(
+	_ context.Context, node string, vmid int, since time.Time,
+) ([]pve.VMTask, error) {
+	if c.tasks == nil {
+		return nil, errors.New("no task listing stubbed")
+	}
+	c.tasks.calls = append(c.tasks.calls, "starts:"+node)
+	if err := c.tasks.startErr[node]; err != nil {
+		return nil, err
+	}
+	if err := c.tasks.err[node]; err != nil {
+		return nil, err
+	}
+	var out []pve.VMTask
+	for _, task := range c.tasks.starts[node] {
+		if task.ID == strconv.Itoa(vmid) && task.StartTime >= since.Unix() {
+			out = append(out, task)
+		}
+	}
+	return out, nil
+}
+
+// taskListStub holds the move, migration, and start tasks of each node, a
+// listing error per node for every listing, and one each for the migration
+// and the start listing alone.
 type taskListStub struct {
 	moves        map[string][]pve.ActiveTask
 	migrations   map[string][]pve.VMTask
+	starts       map[string][]pve.VMTask
 	err          map[string]error
 	migrationErr map[string]error
+	startErr     map[string]error
 	calls        []string
 }
 
 func newTaskListStub() *taskListStub {
 	return &taskListStub{moves: map[string][]pve.ActiveTask{}, migrations: map[string][]pve.VMTask{},
-		err: map[string]error{}, migrationErr: map[string]error{}}
+		starts: map[string][]pve.VMTask{}, err: map[string]error{}, migrationErr: map[string]error{},
+		startErr: map[string]error{}}
+}
+
+// started records a qmstart task of VM 100 on node that ran from start to
+// end and ended with status.
+func (s *taskListStub) started(node string, start, end time.Time, status string) {
+	task := pve.VMTask{UPID: "UPID:" + node + ":00000001:00000001:00000001:qmstart:100:root@pam:",
+		Node: node, Type: "qmstart", ID: "100", Status: status, StartTime: start.Unix()}
+	if !end.IsZero() {
+		task.EndTime = end.Unix()
+	}
+	s.starts[node] = append(s.starts[node], task)
 }
 
 // migrated records a qmigrate task of VM 100 on node that ran from start to

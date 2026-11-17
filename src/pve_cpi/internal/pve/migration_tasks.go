@@ -8,11 +8,12 @@ import (
 	"time"
 )
 
-// MigrationTaskReader lists the migration tasks of one VM on a node. The
-// replicate policy reads it to tell a planned migration of a VM from a
-// failover, and to wait for a migration in flight.
+// MigrationTaskReader lists the migration tasks and the start tasks of one VM
+// on a node. The replicate policy reads them to tell a planned migration of a
+// VM from a failover, and to wait for a migration in flight.
 type MigrationTaskReader interface {
 	MigrationTasks(ctx context.Context, node string, vmid int, since time.Time) ([]VMTask, error)
+	StartTasks(ctx context.Context, node string, vmid int, since time.Time) ([]VMTask, error)
 }
 
 // VMTask is one row of a node's task list for one VM, such as a qmigrate or
@@ -47,8 +48,11 @@ func (t VMTask) End() time.Time {
 	return time.Unix(t.EndTime, 0)
 }
 
-// The read the migration task listing names in an AuditVisibilityReadError.
-const auditReadMigrationTasks = "migration tasks"
+// The reads the task listings name in an AuditVisibilityReadError.
+const (
+	auditReadMigrationTasks = "migration tasks"
+	auditReadStartTasks     = "start tasks"
+)
 
 // migrationTaskLimit bounds one listing. A listing that comes back full may
 // have hidden a row, and it is refused.
@@ -65,18 +69,43 @@ func (c *sdkClient) MigrationTasks(ctx context.Context, node string, vmid int, s
 	if c == nil {
 		return nil, ErrAuditVisibilityReaderUnavailable
 	}
-	return observeMigrationTasks(ctx, c.auditReader, node, vmid, since)
+	return observeVMTasks(ctx, c.auditReader, vmTaskListing{taskType: "qmigrate", read: auditReadMigrationTasks,
+		what: "migration"}, node, vmid, since)
 }
 
-func observeMigrationTasks(
-	ctx context.Context, reader auditPermissionGetter, node string, vmid int, since time.Time,
+// StartTasks lists the qmstart tasks of vmid on node that started at or after
+// since, with the same Sys.Audit proof and the same refusals as
+// MigrationTasks. PVE's vm_start runs every start in a qmstart worker
+// (qemu-server API2/Qemu.pm vm_start), and an HA recovery starts the VM
+// through it as root@pam (pve-ha-manager Resources/PVEVM.pm start). The
+// target of a live migration starts the incoming VM with qm start
+// --migratedfrom (QemuMigrate.pm phase2_start_local_cluster), which runs the
+// same worker, so the target may list one qmstart task for each live
+// migration it received.
+func (c *sdkClient) StartTasks(ctx context.Context, node string, vmid int, since time.Time) ([]VMTask, error) {
+	if c == nil {
+		return nil, ErrAuditVisibilityReaderUnavailable
+	}
+	return observeVMTasks(ctx, c.auditReader, vmTaskListing{taskType: "qmstart", read: auditReadStartTasks,
+		what: "start"}, node, vmid, since)
+}
+
+// vmTaskListing names one task type a VM's task listing filters for, the read
+// its errors name, and the word its error texts use.
+type vmTaskListing struct {
+	taskType, read, what string
+}
+
+func observeVMTasks(
+	ctx context.Context, reader auditPermissionGetter, listing vmTaskListing, node string, vmid int,
+	since time.Time,
 ) ([]VMTask, error) {
 	if ctx == nil || reader == nil {
 		return nil, ErrAuditVisibilityReaderUnavailable
 	}
 	if node == "" || len(node) > 255 || !cleanupTaskNodePattern.MatchString(node) || vmid <= 0 {
-		return nil, &AuditVisibilityReadError{Read: auditReadMigrationTasks, Path: "/nodes", Malformed: true,
-			text: "migration task node or VM identity malformed"}
+		return nil, &AuditVisibilityReadError{Read: listing.read, Path: "/nodes", Malformed: true,
+			text: listing.what + " task node or VM identity malformed"}
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -90,18 +119,18 @@ func observeMigrationTasks(
 	}
 	path := "/nodes/" + url.PathEscape(node) + "/tasks"
 	query := map[string]interface{}{
-		"source": "all", "typefilter": "qmigrate", "vmid": vmid, "start": 0, "limit": migrationTaskLimit,
+		"source": "all", "typefilter": listing.taskType, "vmid": vmid, "start": 0, "limit": migrationTaskLimit,
 	}
 	if !since.IsZero() {
 		query["since"] = since.Unix()
 	}
 	raw, err := reader.GetCtx(ctx, path, query)
 	if err != nil {
-		return nil, &AuditVisibilityReadError{Read: auditReadMigrationTasks, Path: path, Cause: err,
-			text: "migration task listing unavailable"}
+		return nil, &AuditVisibilityReadError{Read: listing.read, Path: path, Cause: err,
+			text: listing.what + " task listing unavailable"}
 	}
-	malformed := &AuditVisibilityReadError{Read: auditReadMigrationTasks, Path: path, Malformed: true,
-		text: "migration task listing malformed"}
+	malformed := &AuditVisibilityReadError{Read: listing.read, Path: path, Malformed: true,
+		text: listing.what + " task listing malformed"}
 	encoded, err := json.Marshal(raw)
 	if err != nil {
 		return nil, malformed
@@ -112,7 +141,7 @@ func observeMigrationTasks(
 	}
 	id := strconv.Itoa(vmid)
 	for _, task := range tasks {
-		if !cleanupTaskUPIDPattern.MatchString(task.UPID) || task.Type != "qmigrate" || task.ID != id ||
+		if !cleanupTaskUPIDPattern.MatchString(task.UPID) || task.Type != listing.taskType || task.ID != id ||
 			task.Node != "" && task.Node != node {
 			return nil, malformed
 		}

@@ -1050,6 +1050,11 @@ func (c *lifecycleFlowPVE) MigrationTasks(
 	return append([]pve.VMTask{}, c.migrationTasks[node]...), nil
 }
 
+// StartTasks serves the qmstart listing of every node, which is empty.
+func (c *lifecycleFlowPVE) StartTasks(context.Context, string, int, time.Time) ([]pve.VMTask, error) {
+	return []pve.VMTask{}, nil
+}
+
 // volumeDeleted applies visibilityErrAfterDelete and runs onVolumeDeleted
 // once any volume is deleted.
 func (c *lifecycleFlowPVE) volumeDeleted() {

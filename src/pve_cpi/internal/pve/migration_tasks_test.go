@@ -12,10 +12,20 @@ import (
 
 const migrationTaskWireUPID = "UPID:pve1:0004D2A1:03504636:6AA1786A:qmigrate:777:root@pam:"
 
-// migrationTaskWireServer answers the permission read and the migration task
+// migrationTaskWireServer answers the permission read and the qmigrate task
 // listing of node pve1 with permission and listing, and fails the listing
 // when failure is set.
 func migrationTaskWireServer(t *testing.T, permission, listing string, failure bool, requests *[]string) *http.ServeMux {
+	t.Helper()
+	return vmTaskWireServer(t, "qmigrate", permission, listing, failure, requests)
+}
+
+// vmTaskWireServer answers the permission read and the taskType listing of
+// node pve1 with permission and listing, and fails the listing when failure
+// is set.
+func vmTaskWireServer(
+	t *testing.T, taskType, permission, listing string, failure bool, requests *[]string,
+) *http.ServeMux {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api2/json/", func(w http.ResponseWriter, r *http.Request) {
@@ -33,7 +43,7 @@ func migrationTaskWireServer(t *testing.T, permission, listing string, failure b
 			}
 		case "/api2/json/nodes/pve1/tasks":
 			q := r.URL.Query()
-			if q.Get("source") != "all" || q.Get("typefilter") != "qmigrate" || q.Get("vmid") != "777" ||
+			if q.Get("source") != "all" || q.Get("typefilter") != taskType || q.Get("vmid") != "777" ||
 				q.Get("start") != "0" || q.Get("limit") != "1000" || q.Get("since") != "1700000000" {
 				t.Errorf("the migration task listing was filtered wrongly or unbounded: %v", q)
 			}
@@ -108,6 +118,56 @@ func TestMigrationTasksWire(t *testing.T) {
 			}
 			if len(tasks) != tc.wantTasks {
 				t.Fatalf("tasks %+v, want %d", tasks, tc.wantTasks)
+			}
+		})
+	}
+}
+
+// TestStartTasksWire lists the qmstart tasks of VM 777 on pve1 through the
+// same proof and refusals as the migration listing.
+func TestStartTasksWire(t *testing.T) {
+	since := time.Unix(1700000000, 0)
+	upid := strings.Replace(migrationTaskWireUPID, ":qmigrate:", ":qmstart:", 1)
+	done := `{"upid":"` + upid + `","node":"pve1","type":"qmstart","id":"777","status":"OK",` +
+		`"starttime":1700000100,"endtime":1700000105}`
+	for _, tc := range []struct {
+		name, permission, listing string
+		wantSysAudit, wantErr     bool
+		wantTasks                 int
+	}{
+		{name: "empty"},
+		{name: "a start", listing: `{"data":[` + done + `]}`, wantTasks: 1},
+		{name: "no Sys.Audit", permission: `{"data":{"/nodes/pve1":{"VM.Audit":1}}}`, wantSysAudit: true,
+			wantErr: true},
+		{name: "another type", listing: `{"data":[` + strings.Replace(done, `"type":"qmstart"`, `"type":"qmigrate"`,
+			1) + `]}`, wantErr: true},
+		{name: "another VM", listing: `{"data":[` + strings.Replace(done, `"id":"777"`, `"id":"778"`, 1) + `]}`,
+			wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests []string
+			client := newPoolStubClient(t, vmTaskWireServer(t, "qmstart", tc.permission, tc.listing, false,
+				&requests))
+			reader, ok := client.(pve.MigrationTaskReader)
+			if !ok {
+				t.Fatal("the PVE client cannot list start tasks")
+			}
+			tasks, err := reader.StartTasks(t.Context(), "pve1", 777, since)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("unexpected listing: %+v %v", tasks, err)
+			}
+			var visibility *pve.AuditVisibilityError
+			if got := errors.As(err, &visibility) && visibility.Privilege == "Sys.Audit"; got != tc.wantSysAudit {
+				t.Fatalf("want a Sys.Audit refusal %v, got %v", tc.wantSysAudit, err)
+			}
+			if tc.wantSysAudit && len(requests) != 1 {
+				t.Fatalf("the listing ran without Sys.Audit: %v", requests)
+			}
+			if err == nil && len(tasks) != tc.wantTasks {
+				t.Fatalf("tasks %+v, want %d", tasks, tc.wantTasks)
+			}
+			if err != nil && tasks != nil {
+				t.Fatal("a partial listing escaped")
 			}
 		})
 	}
