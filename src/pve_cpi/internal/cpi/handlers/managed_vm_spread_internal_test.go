@@ -15,6 +15,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/spreadclaim"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdk "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 )
@@ -240,5 +241,130 @@ func TestCreateVM_ResumedSetManagedCreateHoldsAClaim(t *testing.T) {
 	}
 	if got := claimCounts(t, deps, []placement.NodeFacts{{Node: "n1"}}); len(got) != 0 {
 		t.Fatalf("claims after the resumed create_vm returned = %v; want none", got)
+	}
+}
+
+// splitNodesClient is the set-managed entry fixture with two online nodes
+// that score the same, where only n2 can see the storage. The compute
+// ranking breaks the tie toward n1, and the storage plan can only settle on
+// n2, so the two disagree about the node.
+type splitNodesClient struct{ *managedVMEntryClient }
+
+func (c splitNodesClient) Cluster() cluster.Service {
+	return splitNodesCluster{c.managedVMEntryClient.Cluster()}
+}
+
+func (c splitNodesClient) Nodes() nodes.Service {
+	return splitNodesNodes{c.managedVMEntryClient.Nodes()}
+}
+
+type splitNodesCluster struct{ cluster.Service }
+
+func (splitNodesCluster) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
+	rows := cluster.ListStatusResponse{json.RawMessage(`{"type":"cluster","quorate":1}`)}
+	rows = append(rows,
+		json.RawMessage(`{"type":"node","name":"n1","online":1,"local":1,"maxcpu":8,"maxmem":17179869184,"mem":1073741824,"cpu":0.1}`),
+		json.RawMessage(`{"type":"node","name":"n2","online":1,"local":0,"maxcpu":8,"maxmem":17179869184,"mem":1073741824,"cpu":0.1}`))
+	return &rows, nil
+}
+
+func (splitNodesCluster) ListConfigNodes(context.Context) (*cluster.ListConfigNodesResponse, error) {
+	rows := cluster.ListConfigNodesResponse{json.RawMessage(`{"name":"n1"}`), json.RawMessage(`{"name":"n2"}`)}
+	return &rows, nil
+}
+
+type splitNodesNodes struct{ nodes.Service }
+
+func (n splitNodesNodes) ListNodes(context.Context) (*nodes.ListNodesResponse, error) {
+	rows := nodes.ListNodesResponse{json.RawMessage(`{"node":"n1","status":"online"}`),
+		json.RawMessage(`{"node":"n2","status":"online"}`)}
+	return &rows, nil
+}
+
+func (n splitNodesNodes) ListStorage(ctx context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error) {
+	if node != "n2" {
+		rows := nodes.ListStorageResponse{}
+		return &rows, nil
+	}
+	return n.Service.ListStorage(ctx, node, params)
+}
+
+// TestCreateVM_SetManagedCreateClaimFollowsTheNodeThePlanSettlesOn runs a
+// set-managed create where the compute ranking favours n1 but the storage can
+// only be used from n2, so the plan settles on n2. The ranking claims n1 for
+// the create first, and the create must move that claim to n2 before PVE
+// builds the VM. While PVE creates the VM, the claim has to sit on the node
+// the VM is created on and on no other node, or a sibling that scores
+// meanwhile would count the wrong node. The test also ranks the nodes on its
+// own, with no claims, to prove that the ranking and the plan really
+// disagree, so it cannot pass by accident when both pick one node.
+func TestCreateVM_SetManagedCreateClaimFollowsTheNodeThePlanSettlesOn(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	on := true
+	cfg := &config.CPIConfig{Node: "n1", VMStorage: "a", EphemeralStorageSet: "E",
+		StoragePlacementNamespace: "namespace", StorageAllocationJournalDir: directory,
+		AgentMode: config.AgentModeNoAgent, StemcellStrategy: config.StemcellStrategyImport,
+		Placement: &config.PlacementConfig{AntiAffinity: &config.AntiAffinityConfig{Enabled: &on}},
+		StorageSets: map[string]config.StorageSet{"E": {Names: []string{"a", "b"},
+			Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}}}}
+	journal, err := aj.Initialize(t.Context(), directory, cfg.StoragePlacementNamespace, aj.Enrollment{
+		ClusterID: "pve-root-ca-sha256:" + strings.Repeat("ab", 32), AuthorityID: "authority", AuditID: "audit",
+		CompleteHistoricalAudit: true, PreviousWriterFenced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := journal.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	state := &managedDiskTestState{volumes: map[string]*nodes.GetStorageContentResponse{
+		"a:import/stemcell.qcow2": {Size: sdk.PVEInt(1 << 30), Format: "qcow2"}}}
+	entry := &managedVMEntryClient{diagnosticVMClient: diagnosticVMClient{managedDiskTestPVE{state: state}},
+		journal: journal}
+	client := splitNodesClient{entry}
+	store := spreadClaimStore(t)
+	deps := Deps{Config: cfg, PVE: client, Logger: log.NewNopLogger(), RequestDirectorUUID: aaDirector,
+		SpreadClaims: func(*config.CPIConfig, string, *log.Logger) *spreadclaim.Store { return store }}
+
+	rankedGroups, err := ObserveStoragePlanCompute(t.Context(), deps, spreadParsed(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ranked := rankedGroups[0].Nodes[0]
+
+	created := ""
+	entry.onCreate = func(node string, _ int) {
+		created = node
+		for _, name := range []string{"n1", "n2"} {
+			want := 0
+			if name == node {
+				want = 1
+			}
+			got := claimCounts(t, deps, []placement.NodeFacts{{Node: name}})[name]
+			if got != want {
+				t.Errorf("claims on %s while PVE creates the VM on %s = %d; want %d", name, node, got, want)
+			}
+		}
+	}
+	env, err := json.Marshal(aaEnvForWebGroup())
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := []json.RawMessage{json.RawMessage(`"spread-agent"`), json.RawMessage(`":heavy:a:import/stemcell.qcow2"`),
+		json.RawMessage(`{"cpu":1,"ram":1024,"root_disk_size":1024}`), json.RawMessage(`{}`), json.RawMessage(`[]`),
+		env}
+	if _, err := createVM(t.Context(), deps, args); err != nil {
+		t.Fatal(err)
+	}
+	if created == "" {
+		t.Fatal("the create never reached PVE")
+	}
+	if created == ranked {
+		t.Fatalf("the plan settled on %s, the node the ranking picked; want the two to disagree", created)
 	}
 }
