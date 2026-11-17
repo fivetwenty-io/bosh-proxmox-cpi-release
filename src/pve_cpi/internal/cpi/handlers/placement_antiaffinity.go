@@ -242,8 +242,7 @@ func ensureAntiAffinityMembershipLocked(
 	// roll it back, between two of this writer's attempts.
 	planner := newGroupPlanner(ctx, deps, profile, ident, scan, logger)
 	planner.sid = sid
-	writer, res, err := applyGroupPlan(ctx, deps, profile, planner, d, logger)
-	loss = groupRuleLossOf(res, ident)
+	writer, res, err := applyCreatePlan(ctx, deps, profile, planner, d, &loss, logger)
 	if err != nil {
 		return "", loss, err
 	}
@@ -301,6 +300,81 @@ func applyGroupPlan(
 	res, err := writer.Apply(ctx, "anti-affinity", planner.plan)
 	hold.allowYield(false)
 	return writer, res, err
+}
+
+// applyCreatePlan lets a rule writer apply a create's plan, and adds what each
+// write leaves for a heal to loss. When the repair of a pin takes a sibling
+// out of the write, because only PVE found that the sibling's join put its
+// strict pin out of effect, the create plans again with that sibling held
+// out, at most aaHealRounds times. In managed mode the writer fails such a
+// write even though the repair put it right, and the create would fail with
+// a rule that the heal after it writes right anyway. The create then succeeds
+// only when the last plan writes cleanly and the rule it places this VM in
+// holds it and is in effect. Otherwise it returns the writer's error. A
+// repair that confined this VM itself is never planned around, so a create
+// whose own pin the join puts out of effect fails or logs that the way its
+// mode says.
+func applyCreatePlan(
+	ctx context.Context, deps Deps, profile *ha.Profile, planner *aaPlanner, d *ha.VMDecision,
+	loss *groupRuleLoss, logger *log.Logger,
+) (*ha.RuleWriter, *ha.ApplyResult, error) {
+	holdOut := map[string]bool{}
+	var refused error
+	for round := 1; ; round++ {
+		writer, res, err := applyGroupPlan(ctx, deps, profile, planner, d, logger)
+		loss.add(res, planner.ident)
+		siblings := confinedSiblings(res, planner.sid, holdOut)
+		if err != nil && !errors.Is(err, ha.ErrRuleNotInEffect) {
+			return writer, res, err
+		}
+		if len(siblings) == 0 || round >= aaHealRounds {
+			switch {
+			case err != nil:
+				return writer, res, err
+			case refused != nil && !placedInEffect(res, planner):
+				return writer, res, refused
+			}
+			return writer, res, nil
+		}
+		if err != nil {
+			refused = err
+		}
+		for _, s := range siblings {
+			holdOut[s] = true
+		}
+		planner.holdOut = holdOut
+		logger.Info("anti-affinity: a pin repair took siblings out of this create's write to keep their pins in "+
+			"effect, so the create plans its group's rules again without them",
+			log.String("rule", planner.ident.ruleName()), log.String("sid", planner.sid),
+			log.String("held_out", strings.Join(siblings, ",")))
+	}
+}
+
+// confinedSiblings returns the members of the pins a repair in res ran for
+// that holdOut does not hold yet, or nil when there are none or when the
+// repair ran for sid's own pin.
+func confinedSiblings(res *ha.ApplyResult, sid string, holdOut map[string]bool) []string {
+	if res == nil || slices.Contains(res.Confined, sid) {
+		return nil
+	}
+	var out []string
+	for _, s := range res.Confined {
+		if !holdOut[s] && !slices.Contains(out, s) {
+			out = append(out, s)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// placedInEffect reports whether the last read in res shows the rule the
+// planner placed its VM in holding that VM, enabled and with no error.
+func placedInEffect(res *ha.ApplyResult, planner *aaPlanner) bool {
+	if res == nil || res.Set == nil || planner.placedIn == "" {
+		return false
+	}
+	r := res.Set.Find(planner.placedIn)
+	return r != nil && r.HasResource(planner.sid) && !r.Disabled && len(r.Errors) == 0
 }
 
 // groupRuleLoss is what a write of a group's rules leaves for a heal to make
@@ -384,11 +458,12 @@ type aaPlanner struct {
 	// plan drops it from the rules and never adds it.
 	exclude string
 	// holdOut holds the members of the confinement pins that a repair took
-	// out of the group's writes. A heal keeps such a member where a rule
-	// still holds it and adds it to no rule, because the write that adds it
-	// would put its pin out of effect again. The plan finds a conflict that
-	// the CPI's own feasibility checks can see by itself (see joinConflicts),
-	// so holdOut matters only for one that PVE alone reports.
+	// out of the group's writes. A heal, or a create that plans again after
+	// such a repair, keeps such a member where a rule still holds it and adds
+	// it to no rule, because the write that adds it would put its pin out of
+	// effect again. The plan finds a conflict that the CPI's own feasibility
+	// checks can see by itself (see joinConflicts), so holdOut matters only
+	// for one that PVE alone reports.
 	holdOut   map[string]bool
 	scan      *groupScan
 	logger    *log.Logger

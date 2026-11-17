@@ -6,10 +6,12 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // These tests cover the members a plan leaves out of the group's rules
@@ -175,9 +177,9 @@ func TestEnsureAntiAffinity_CreateWhoseOwnPinConflictsIsStillRefused(t *testing.
 // create does when only PVE reports the conflict of a sibling's pin. A repair
 // took vm:103 out of the group's rule to keep its strict pin in effect, and
 // the CPI's own checks see no conflict, so the create of vm:104 writes vm:103
-// back. PVE flags the pin, the repair reverts the write, and the create's heal
-// writes the rule with vm:104 and without vm:103. In managed mode the create
-// still fails, because its writer's repair ran.
+// back. PVE flags the pin and the repair reverts the write. The create must
+// then plan again with vm:103 held out and join the rule, and in managed mode
+// it must succeed, because the rule it ends in holds its VM and is in effect.
 func TestEnsureAntiAffinity_CreateAfterARepairLeavesTheRuleRight(t *testing.T) {
 	t.Parallel()
 	for _, mode := range aaModes {
@@ -191,15 +193,90 @@ func TestEnsureAntiAffinity_CreateAfterARepairLeavesTheRuleRight(t *testing.T) {
 			pinOutWhileInRule(stub, pin, aaRule, "vm:103")
 			deps := aaModeDeps(stub, mode, "", "pve1", "pve2", "pve3", "pve4")
 			logger, _ := log.NewObservedLogger(log.LevelDebug)
-			err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 104, logger)
-			switch {
-			case mode == config.HAModeManaged && !errors.Is(err, ha.ErrRuleNotInEffect):
-				t.Fatalf("err = %v; want the managed writer's repair to fail the create", err)
-			case mode == config.HAModeAuto && err != nil:
-				t.Fatalf("err = %v; want the auto writer to log the repair", err)
+			placedIn, err := ensureAntiAffinityMembershipFor(context.Background(), deps, aaIdent("web"), 104, nil,
+				logger)
+			if err != nil {
+				t.Fatalf("err = %v; want the create to join once the pinned sibling is held out", err)
+			}
+			if placedIn != aaRule {
+				t.Fatalf("placed in %q; want %q", placedIn, aaRule)
 			}
 			if got := stub.rules[aaRule]; got != "vm:101,vm:102,vm:104" {
 				t.Fatalf("rule = %q; want the create joined and the pinned sibling left out", got)
+			}
+			if errs := stub.ruleErrors(pin); len(errs) > 0 {
+				t.Fatalf("pin %s is out of effect: %v", pin, errs)
+			}
+		})
+	}
+}
+
+// TestEnsureAntiAffinity_LockedCreateAfterARepairLeavesTheRuleRight pins the
+// same case with the rules lock on, where no heal runs after the create. Only
+// PVE reports that the sibling vm:103's strict pin conflicts with the rule,
+// so the repair reverts the create's first write. The create's own plan must
+// then write the rule with vm:104 and without vm:103, in both modes. It runs
+// alone, because it shortens the lock's grace for the whole package.
+func TestEnsureAntiAffinity_LockedCreateAfterARepairLeavesTheRuleRight(t *testing.T) {
+	defer pve.SetClusterLockGraceForTest(time.Millisecond)()
+	for _, mode := range aaModes {
+		t.Run(mode, func(t *testing.T) {
+			stub := newAAStub()
+			stub.enforceManaged = true
+			managedGroup(stub, 101, 102, 103, 104)
+			stub.seedRule(aaRule, "vm:101,vm:102")
+			pin := seedStrictPin(stub, 103, "pve1")
+			pinOutWhileInRule(stub, pin, aaRule, "vm:103")
+			deps := aaModeDeps(stub, mode, "", "pve1", "pve2", "pve3", "pve4")
+			deps.Config.ClusterLock = "pool"
+			deps.PVE.(*icPVEClient).poolsSvc = newAALockPools(nil)
+			logger, _ := log.NewObservedLogger(log.LevelDebug)
+			placedIn, err := ensureAntiAffinityMembershipFor(context.Background(), deps, aaIdent("web"), 104, nil,
+				logger)
+			if err != nil {
+				t.Fatalf("err = %v; want the create to join once the pinned sibling is held out", err)
+			}
+			if placedIn != aaRule {
+				t.Fatalf("placed in %q; want %q", placedIn, aaRule)
+			}
+			if got := stub.rules[aaRule]; got != "vm:101,vm:102,vm:104" {
+				t.Fatalf("rule = %q; want the create joined and the pinned sibling left out", got)
+			}
+			if errs := stub.ruleErrors(pin); len(errs) > 0 {
+				t.Fatalf("pin %s is out of effect: %v", pin, errs)
+			}
+		})
+	}
+}
+
+// TestEnsureAntiAffinity_CreateWhosePinPVEFlagsStillFails pins that a create
+// never plans around a repair of its own pin. Only PVE reports that vm:104's
+// strict pin conflicts with the group's rule, so the create's join puts the
+// pin out of effect and the repair reverts it. In managed mode the create must
+// fail with the writer's error, and in auto it must log it, and either way the
+// rule must keep its members without vm:104.
+func TestEnsureAntiAffinity_CreateWhosePinPVEFlagsStillFails(t *testing.T) {
+	t.Parallel()
+	for _, mode := range aaModes {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			stub := newAAStub()
+			stub.enforceManaged = true
+			managedGroup(stub, 101, 102, 104)
+			stub.seedRule(aaRule, "vm:101,vm:102")
+			pin := seedStrictPin(stub, 104, "pve1")
+			pinOutWhileInRule(stub, pin, aaRule, "vm:104")
+			deps := aaModeDeps(stub, mode, "", "pve1", "pve2", "pve3", "pve4")
+			logger, _ := log.NewObservedLogger(log.LevelDebug)
+			err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 104, logger)
+			switch {
+			case mode == config.HAModeManaged && !errors.Is(err, ha.ErrRuleNotInEffect):
+				t.Fatalf("err = %v; want the managed writer's repair of the create's own pin to fail it", err)
+			case mode == config.HAModeAuto && err != nil:
+				t.Fatalf("err = %v; want the auto writer to log the repair", err)
+			}
+			if got := stub.rules[aaRule]; got != "vm:101,vm:102" {
+				t.Fatalf("rule = %q; want it unchanged, without the create's VM", got)
 			}
 			if errs := stub.ruleErrors(pin); len(errs) > 0 {
 				t.Fatalf("pin %s is out of effect: %v", pin, errs)
