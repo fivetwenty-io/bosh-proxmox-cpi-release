@@ -230,9 +230,13 @@ func probeVMConfigs(
 			// A member can stop answering its API before corosync drops it, so
 			// the status read before the sweep still reported it online. One
 			// status attempt per failed probe catches the drop, and the
-			// member then gets no further attempts.
-			if inner != nil && readOfflineClusterNodes(ctx, c, logger, 1)[n] {
-				return &memberWentOfflineError{node: n, cause: inner}
+			// member then gets no further attempts. The same read stops the
+			// retries on a member the cluster lists offline after losing
+			// quorum, which fails the lookup at once instead of excluding it.
+			if inner != nil {
+				if stopErr := memberStopFromStatus(ctx, c, logger, n, inner); stopErr != nil {
+					return stopErr
+				}
 			}
 			return inner
 		})
