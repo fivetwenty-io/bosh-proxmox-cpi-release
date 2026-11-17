@@ -27,7 +27,15 @@ func (p *noQuorumPools) CreatePool(context.Context, string, string) error {
 			[]byte(`{"data":null,"message":"create pool failed: cfs-lock 'file-user_cfg' error: no quorum!\n"}`)))
 }
 
+// quorumDeferral is the deferral the quorum check gives. It names the entry
+// node the status marks local, so an operator with several endpoints knows
+// which node sees the cluster without quorum.
 const quorumDeferral = "delete_vm: VM 101 deferred because its HA state is unknown: " +
+	"the entry node pve-node1 does not report the cluster quorate"
+
+// lockQuorumDeferral is the deferral a lock that PVE refused for lack of
+// quorum gives. No status was read for it, so it names no node.
+const lockQuorumDeferral = "delete_vm: VM 101 deferred because its HA state is unknown: " +
 	"the entry node does not report the cluster quorate"
 
 // TestHandleDeleteVM_DefersWithoutQuorumBeforeAnyWrite deletes a VM on a
@@ -70,7 +78,7 @@ func TestHandleDeleteVM_LockRefusedForNoQuorumDefers(t *testing.T) {
 	setPools(t, d, pools)
 
 	err := d.run()
-	requireHARetriable(t, err, quorumDeferral)
+	requireHARetriable(t, err, lockQuorumDeferral)
 	if strings.Contains(err.Error(), "unknown outcome") || strings.Contains(err.Error(), "cluster lock state unknown") {
 		t.Fatalf("the deferral still calls the refused lock create unknown: %v", err)
 	}

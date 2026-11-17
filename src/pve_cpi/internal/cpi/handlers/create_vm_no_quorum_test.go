@@ -38,7 +38,7 @@ func listStatusWithoutQuorum(reads *atomic.Int32) func(context.Context) (*sdkclu
 // TestCreateVM_FailsFastWithoutQuorum creates a VM on a cluster whose entry
 // node reports it not quorate, once with a pinned target_node and once through
 // placement. Both fail retriable with the same message, which names the lost
-// quorum, and neither creates anything.
+// quorum and the entry node that reported it, and neither creates anything.
 func TestCreateVM_FailsFastWithoutQuorum(t *testing.T) {
 	t.Parallel()
 	for name, cloudProps := range map[string]map[string]any{
@@ -70,7 +70,7 @@ func TestCreateVM_FailsFastWithoutQuorum(t *testing.T) {
 			if !errors.As(err, &typed) || !typed.OkToRetry() {
 				t.Fatalf("want a retriable error, got %T %v", err, err)
 			}
-			for _, want := range []string{"the cluster has lost quorum", "the entry node does not report the cluster quorate"} {
+			for _, want := range []string{"the cluster has lost quorum", "the entry node lab-pve-cpi-az2-1 does not report the cluster quorate"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("error %q does not name %q", err, want)
 				}

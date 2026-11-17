@@ -16,33 +16,48 @@ import (
 // A status read that fails proves nothing, so the call carries on as it did
 // before, and a standalone host never counts as having lost quorum.
 
-// clusterLostQuorum reads the cluster's status once and reports whether it
-// proves that the cluster has lost quorum. It returns false when the client
-// has no cluster service or the read fails.
-func clusterLostQuorum(ctx context.Context, deps Deps, logger *log.Logger, caller string) bool {
+// clusterLostQuorum reads the cluster's status once and, when it proves that
+// the cluster has lost quorum, returns the reason the call gives (see
+// quorumLossReason). It returns "" when the client has no cluster service,
+// the read fails, or the cluster is quorate.
+func clusterLostQuorum(ctx context.Context, deps Deps, logger *log.Logger, caller string) string {
 	if deps.PVE == nil {
-		return false
+		return ""
 	}
 	clusterAPI := deps.PVE.Cluster()
 	if clusterAPI == nil {
-		return false
+		return ""
 	}
 	q, err := pve.ReadClusterQuorum(ctx, clusterAPI)
 	if err != nil {
 		if logger != nil {
 			logger.Debug(caller+": cluster status unreadable before the quorum check, carrying on", log.Err(err))
 		}
-		return false
+		return ""
 	}
-	return q.Lost()
+	if !q.Lost() {
+		return ""
+	}
+	return quorumLossReason(q)
+}
+
+// quorumLossReason names the entry node that answered when the status marks
+// one local. With several endpoints, a minority node that still answers sees
+// the cluster without quorum while 'pvecm status' on a majority node reports
+// it quorate, so the operator needs to know which node was asked.
+func quorumLossReason(q pve.ClusterQuorum) string {
+	if q.EntryNode == "" {
+		return pve.ReasonNotQuorate
+	}
+	return "the entry node " + q.EntryNode + " does not report the cluster quorate"
 }
 
 // deleteQuorumDeferral is the HA deferral a delete of vmid returns when the
-// cluster has lost quorum. Its text is the one an unknown HA state gives,
-// because the HA state of every VM is unknown while the entry node does not
-// report the cluster quorate.
-func deleteQuorumDeferral(caller string, vmid int) error {
-	return deferHA(haUnknownDeferral(caller, vmid, pve.ReasonNotQuorate))
+// cluster has lost quorum, for the reason given. Its text is the one an
+// unknown HA state gives, because the HA state of every VM is unknown while
+// the entry node does not report the cluster quorate.
+func deleteQuorumDeferral(caller string, vmid int, reason string) error {
+	return deferHA(haUnknownDeferral(caller, vmid, reason))
 }
 
 // deferDeleteWithoutQuorum returns the quorum deferral when the cluster's
@@ -52,15 +67,15 @@ func deleteQuorumDeferral(caller string, vmid int) error {
 // reaches it once quorum returns must let it settle (see
 // awaitHARecoverySettle).
 func deferDeleteWithoutQuorum(ctx context.Context, deps Deps, caller string, vmid int, logger *log.Logger) error {
-	if !clusterLostQuorum(ctx, deps, logger, caller) {
+	reason := clusterLostQuorum(ctx, deps, logger, caller)
+	if reason == "" {
 		return nil
 	}
 	if logger != nil {
-		logger.Warn(caller+": deferred because the entry node does not report the cluster quorate",
-			log.Int(metadataKeyVMID, vmid))
+		logger.Warn(caller+": deferred because "+reason, log.Int(metadataKeyVMID, vmid))
 	}
 	recordHARecoveryDeferralOf(deps, caller, pve.HAServiceSID(vmid), logger)
-	return deleteQuorumDeferral(caller, vmid)
+	return deleteQuorumDeferral(caller, vmid, reason)
 }
 
 // deleteErrorWithoutQuorum turns a delete error that carries a lock create PVE
@@ -77,13 +92,15 @@ func deleteErrorWithoutQuorum(deps Deps, caller string, vmid int, err error, log
 			log.Int(metadataKeyVMID, vmid), log.Err(err))
 	}
 	recordHARecoveryDeferralOf(deps, caller, pve.HAServiceSID(vmid), logger)
-	return deleteQuorumDeferral(caller, vmid)
+	// No status was read here, so the reason cannot name the node that
+	// refused the lock.
+	return deleteQuorumDeferral(caller, vmid, pve.ReasonNotQuorate)
 }
 
 // createQuorumError is the retriable error create_vm returns when the cluster
-// has lost quorum. It names quorum whether or not the call pins a node,
-// because no node can receive a VM until quorum returns.
-func createQuorumError() error {
+// has lost quorum, for the reason given. It names quorum whether or not the
+// call pins a node, because no node can receive a VM until quorum returns.
+func createQuorumError(reason string) error {
 	return cpierrors.Retriable("create_vm: the cluster has lost quorum (%s), so no node can receive a VM; "+
-		"retry once 'pvecm status' reports the cluster quorate", pve.ReasonNotQuorate)
+		"retry once 'pvecm status' reports the cluster quorate", reason)
 }
