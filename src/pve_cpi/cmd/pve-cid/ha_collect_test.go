@@ -460,6 +460,72 @@ func TestCollectReplicaOnPartnerAndAwaitingPinWidening(t *testing.T) {
 	}
 }
 
+// TestCollectReplicaOnPartnerAfterAMove judges a replicate VM that runs on its
+// pin's partner n2 and whose job PVE has swapped to run from n2 back to n1,
+// by the sync from n2 and the migration tasks of the two nodes.
+func TestCollectReplicaOnPartnerAfterAMove(t *testing.T) {
+	t.Parallel()
+	changed := haNow.Add(-2 * time.Hour)
+	migrated := pve.MigrationTask{UPID: "UPID:n1:00000001:00000001:00000001:qmigrate:101:root@pam:", Node: "n1",
+		Type: "qmigrate", ID: "101", Status: "OK", StartTime: haNow.Add(-61 * time.Minute).Unix(),
+		EndTime: haNow.Add(-time.Hour).Unix()}
+	moved := func() *fakeHA {
+		f := replicaFake()
+		f.guests[1].Node = "n2"
+		f.rules = []ha.Rule{pinRule(101, ha.WithReplicaChanged(haMarker+" "+ha.ReplicaPartnerKey+"=n2", changed),
+			"n1", "n2")}
+		f.jobs[0].Source, f.jobs[0].Target = "n2", "n1"
+		f.status["101-0"] = ha.ReplicaSyncStatus{LastSync: haNow.Add(-10 * time.Minute)}
+		f.migrations = map[string][]pve.MigrationTask{"n1": {migrated}}
+		return f
+	}
+	for _, tc := range []struct {
+		name     string
+		edit     func(f *fakeHA)
+		severity string
+		mentions []string
+		absent   string
+	}{
+		{name: "planned migration", severity: haSeverityAdvice,
+			mentions: []string{"partner n2 after a planned migration", "names n1 as the partner"},
+			absent:   "failover"},
+		{name: "no migration task", edit: func(f *fakeHA) { f.migrations = nil }, severity: haSeverityProblem,
+			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
+				"no migration task on n1", "were lost", "names n1 as the partner"},
+			absent: "rolls"},
+		{name: "migration tasks unreadable", edit: func(f *fakeHA) {
+			f.migrationErr = map[string]error{"n1": errors.New("needs Sys.Audit")}
+		}, severity: haSeverityProblem,
+			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
+				"could not be read", "needs Sys.Audit", "may have been lost"},
+			absent: "rolls"},
+		{name: "no sync from n2 yet", edit: func(f *fakeHA) {
+			f.status["101-0"] = ha.ReplicaSyncStatus{LastSync: changed.Add(-time.Hour)}
+		}, severity: haSeverityProblem,
+			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
+				"rolls n1's copy back to match"},
+			absent: "planned"},
+		{name: "job not swapped", edit: func(f *fakeHA) { f.jobs[0].Source, f.jobs[0].Target = "n1", "n2" },
+			severity: haSeverityProblem,
+			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
+				"copies from n2 back to n1"},
+			absent: "planned"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := moved()
+			if tc.edit != nil {
+				tc.edit(f)
+			}
+			r := runCollect(t, f, haCfg("auto", "replicate"))
+			want(t, r, haKindReplicaOnPartner, tc.severity, append([]string{"vm:101"}, tc.mentions...)...)
+			if got := findings(r, haKindReplicaOnPartner)[0].Detail; strings.Contains(got, tc.absent) {
+				t.Fatalf("finding %q mentions %q", got, tc.absent)
+			}
+		})
+	}
+}
+
 func TestCollectReplicaAwaitingFirstSync(t *testing.T) {
 	t.Parallel()
 	changed := haNow.Add(-time.Minute).Unix()

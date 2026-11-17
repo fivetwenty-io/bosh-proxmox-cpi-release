@@ -973,17 +973,15 @@ func (c *haCollector) recoveryState() {
 			token, _ = ha.ReplicaPartner(pin.Comment)
 		}
 		rec := c.journalRecord(id)
-		partner, source := token, ""
-		if rec != nil && rec.Replication.Job != nil {
-			partner, source = rec.Replication.Job.Target, rec.Replication.Job.Source
+		source, partner, shaped := ha.ReplicaPinShape(pin)
+		if !shaped || partner == "" {
+			source, partner = "", token
+			if rec != nil && rec.Replication.Job != nil {
+				partner, source = rec.Replication.Job.Target, rec.Replication.Job.Source
+			}
 		}
 		if partner != "" && g.ref.Node == partner {
-			back := ""
-			if source != "" {
-				back = fmt.Sprintf("; PVE's next run copies from %s back to %s and rolls %s's copy back to match", partner, source, source)
-			}
-			c.rep.problem(haKindReplicaOnPartner, g.sid,
-				"replicate VM %d runs on its partner %s after a recovery%s", id, partner, back)
+			c.onPartner(g, pin, partner, source)
 		}
 		recoverable := token != ""
 		if rec != nil {
@@ -994,6 +992,81 @@ func (c *haCollector) recoveryState() {
 		}
 		c.notRecoverable(g, pin, rec)
 	}
+}
+
+// onPartner judges a replicate VM that runs on node, the partner its pin
+// names, with source the node the pin or the journal names as its source. It
+// applies ha.JudgePartnerMove, the rule the CPI applies when a call touches
+// the VM. A planned migration whose reversed sync has run is advice, because
+// the next reboot_vm or set_vm_metadata keeps both nodes and moves the
+// partner token. Anything else is a problem, since the VM got there by a
+// failover or by a move the CPI has not reconciled yet. While no reversed sync
+// has run, PVE's next run rolls the old source's copy back to match.
+func (c *haCollector) onPartner(g *haGuest, pin *ha.Rule, node, source string) {
+	id := g.ref.VMID
+	move := ha.PartnerMove{Node: node, OldSource: source}
+	if c.jobsOK {
+		move.Job = c.liveJob(id)
+	}
+	for _, n := range c.p.Nodes {
+		if n.Name == source {
+			move.OldSourceOnline = n.Online
+		}
+	}
+	if pin != nil {
+		move.ChangedAt, _ = ha.ReplicaChanged(pin.Comment)
+	}
+	if move.Job != nil {
+		if st, read := c.jobStatus[move.Job.ID]; read {
+			move.Synced, _ = ha.SyncAfterChange(st, move.ChangedAt)
+		}
+	}
+	var unread error
+	if move.Synced {
+		move.Migration, unread = c.migrationEvidence(id, node, source, move.ChangedAt)
+	}
+	verdict := ha.JudgePartnerMove(move)
+	const reconcile = "the next reboot_vm or set_vm_metadata keeps both nodes and names %s as the partner"
+	const moved = "replicate VM %d runs on its partner %s after a failover, or after a move the CPI has not reconciled yet"
+	switch verdict {
+	case ha.PartnerMovePlanned:
+		c.rep.advise(haKindReplicaOnPartner, g.sid, "replicate VM %d runs on its partner %s after a planned "+
+			"migration, and a sync from %s back to %s has run since; "+reconcile, id, node, node, source, source)
+	case ha.PartnerMoveRecovered:
+		c.rep.problem(haKindReplicaOnPartner, g.sid, moved+"; no migration task on %s explains the move, so writes "+
+			"made on %s after its last sync before the move were lost, and a sync from %s back to %s has run "+
+			"since; "+reconcile, id, node, source, source, node, source, source)
+	case ha.PartnerMoveUnproven:
+		c.rep.problem(haKindReplicaOnPartner, g.sid, moved+"; a sync from %s back to %s has run since, but the "+
+			"migration tasks that would prove a planned migration could not be read (%v), so writes made on %s "+
+			"after its last sync before the move may have been lost; "+reconcile, id, node, node, source, unread,
+			source, source)
+	default:
+		back := ""
+		if source != "" {
+			back = fmt.Sprintf("; PVE's next run copies from %s back to %s and rolls %s's copy back to match",
+				node, source, source)
+		}
+		c.rep.problem(haKindReplicaOnPartner, g.sid, moved+"%s", id, node, back)
+	}
+}
+
+// migrationEvidence reads the qmigrate tasks of the VM vmid on the old source
+// and on node, and judges them (see ha.MigrationEvidenceOf). A listing that
+// fails is MigrationUnread with its cause.
+func (c *haCollector) migrationEvidence(
+	vmid int, node, source string, changedAt time.Time,
+) (ha.MigrationEvidence, error) {
+	since := changedAt.Add(-24 * time.Hour)
+	fromOld, err := c.r.MigrationTasks(c.ctx, source, vmid, since)
+	if err != nil {
+		return ha.MigrationUnread, fmt.Errorf("node %s: %w", source, err)
+	}
+	onNode, err := c.r.MigrationTasks(c.ctx, node, vmid, since)
+	if err != nil {
+		return ha.MigrationUnread, fmt.Errorf("node %s: %w", node, err)
+	}
+	return ha.MigrationEvidenceOf(fromOld, onNode, changedAt), nil
 }
 
 // notRecoverable judges a replicate VM whose pin does not yet record a

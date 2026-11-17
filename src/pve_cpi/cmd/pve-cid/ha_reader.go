@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdkclusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
@@ -66,6 +67,9 @@ type HAReader interface {
 	ReplicationSchedules(ctx context.Context) (map[string]string, error)
 	// ReplicaStatus reads a replication job's status on its source node.
 	ReplicaStatus(ctx context.Context, node, id string) (ha.ReplicaSyncStatus, error)
+	// MigrationTasks lists the qmigrate tasks of vmid on node that started at
+	// or after since.
+	MigrationTasks(ctx context.Context, node string, vmid int, since time.Time) ([]pve.MigrationTask, error)
 	// StorageVolumes lists the volume IDs a storage holds on node.
 	StorageVolumes(ctx context.Context, node, storage string) (map[string]bool, error)
 	// Storages returns the storage index of the cluster.
@@ -257,6 +261,16 @@ func (r *pveHAReader) ReplicationSchedules(ctx context.Context) (map[string]stri
 
 func (r *pveHAReader) ReplicaStatus(ctx context.Context, node, id string) (ha.ReplicaSyncStatus, error) {
 	return r.replicas.Status(ctx, node, id)
+}
+
+func (r *pveHAReader) MigrationTasks(
+	ctx context.Context, node string, vmid int, since time.Time,
+) ([]pve.MigrationTask, error) {
+	reader, ok := r.client.(pve.MigrationTaskReader)
+	if !ok {
+		return nil, errors.New("pve-cid: the PVE client cannot list migration tasks")
+	}
+	return reader.MigrationTasks(ctx, node, vmid, since)
 }
 
 func (r *pveHAReader) StorageVolumes(ctx context.Context, node, storage string) (map[string]bool, error) {
