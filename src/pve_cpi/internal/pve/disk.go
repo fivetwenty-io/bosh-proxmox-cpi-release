@@ -21,6 +21,7 @@ import (
 	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // ErrDiskNotAttached is returned (wrapped via fmt.Errorf with %w) by
@@ -958,10 +959,17 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 	var nameHolders []BirthNameHolder
 	hits := diskScanHits{everyHolder: stableID != ""}
 	seen := newIdentityScanReads(stableID != "")
+	// droppedNodes are the listed nodes the quorate cluster began reporting
+	// offline while the scan read their guests' configs. Their remaining
+	// guests are skipped, and the nodes join excludedNodes.
+	droppedNodes := map[string]bool{}
 
 	for _, g := range guests {
 		vmid := g.VMID
 		vmNode := g.Node
+		if droppedNodes[vmNode] {
+			continue
+		}
 		// Both views come from one pending read. A slot whose delete PVE could
 		// only record as pending is missing from the config endpoint's view,
 		// while the running guest still has the disk, so the scan matches the
@@ -983,6 +991,18 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 			// actually is: a 403 on one VM's config is a grant only a human
 			// can add, and re-driving it forever helps nobody.
 			if IsNotFound(cfgErr) {
+				continue
+			}
+			// A node can go down after its listing answered and before the
+			// scan reaches its guests. When the quorate cluster now reports it
+			// offline, the node is treated as one the listing left out: a
+			// hit elsewhere still settles the holder, and a scan with no hit
+			// stays unproven, exactly as for a node excluded up front.
+			if ClusterReportsMemberOffline(ctx, c, nil, vmNode) {
+				log.FromContext(ctx).Warn("FindVMByDiskVolid: excluding a node the cluster began reporting offline during the scan",
+					log.String("node", vmNode), log.Int("vmid", vmid), log.Err(cfgErr))
+				droppedNodes[vmNode] = true
+				excludedNodes = append(excludedNodes, vmNode)
 				continue
 			}
 			return DiskScanHit{}, cpierrors.Wrap(
