@@ -505,8 +505,7 @@ func attachDecisionInput(
 		HAManaged: true,
 	}
 	if oldPin != nil && oldPin.Strict && !oldPin.Disabled {
-		in.Constraints = append(in.Constraints, ha.NodeConstraint{Name: "the VM's pin " + oldPin.ID,
-			Nodes: oldPin.NodeNames(), Pin: true})
+		in.Constraints = append(in.Constraints, ownPinConstraint(vmid, oldPin.NodeNames()))
 	}
 	if configHasPCIPassthrough(cfg) {
 		in.Constraints = append(in.Constraints, ha.NodeConstraint{Name: pciConstraintName, Nodes: []string{node}})

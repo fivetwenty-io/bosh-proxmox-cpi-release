@@ -339,8 +339,18 @@ func recordedPinConstraint(vmid int, rec ha.ReaddRecord) (ha.NodeConstraint, boo
 	if !rec.PinStrict || len(rec.PinNodes) == 0 {
 		return ha.NodeConstraint{}, false
 	}
-	return ha.NodeConstraint{Name: "the VM's pin " + naRuleNameFor(vmid), Nodes: slices.Clone(rec.PinNodes),
-		Pin: true}, true
+	return ownPinConstraint(vmid, rec.PinNodes), true
+}
+
+// ownPinConstraint states the strict pin over nodes of VM vmid, which already
+// runs under HA, as decision input. Every call that decides such a VM again
+// states the pin this way, because the pin is where the VM carries the
+// operator's strict AZ, which create_vm read from the VM's cloud properties
+// and no later call can read. The decision applies it as it applies the
+// strict AZ at create_vm, after the shared check (see ha.NodeConstraint.Pin),
+// so a VM in a strict AZ of one node keeps HA when a later call decides it.
+func ownPinConstraint(vmid int, nodes []string) ha.NodeConstraint {
+	return ha.NodeConstraint{Name: "the VM's pin " + naRuleNameFor(vmid), Nodes: slices.Clone(nodes), Pin: true}
 }
 
 // soleAZOfNode returns the one AZ of the AZ map, the DLB AZ aside, that lists
