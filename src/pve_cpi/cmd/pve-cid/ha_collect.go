@@ -641,9 +641,14 @@ func (c *haCollector) checkGroup(tag string, members []*haGuest, rules []*ha.Rul
 			c.rep.advise(haKindAntiAffinitySkipped, tag,
 				"the group has %d members but the cluster has %d nodes, so skip wrote no rule", len(members), nodes)
 		} else {
-			c.rep.advise(haKindAntiAffinitySplit, tag,
-				"the group has %d members but the cluster has %d nodes, so it is split across %d rules",
+			text := fmt.Sprintf("the group has %d members but the cluster has %d nodes, so it is split across %d rules",
 				len(members), nodes, len(rules))
+			for _, g := range members {
+				if g.resource != nil && !namedByAny(rules, g.sid) {
+					text += fmt.Sprintf("; %s is in no anti-affinity rule for group %s", g.sid, tag)
+				}
+			}
+			c.rep.advise(haKindAntiAffinitySplit, tag, "%s", text)
 		}
 		return
 	}

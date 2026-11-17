@@ -82,6 +82,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - `pve-cid ha` no longer reports `local_unprotected` for a CPI parker. A parker is a stopped VM that holds detached persistent disks, and it may be a stopped HA resource or sit outside HA by design, so the doctor now leaves any VM that carries the parker tag out of that finding.
 
+- `pve-cid ha` now names each group member that sits in no rule when an anti-affinity group is split across several rules. The `anti_affinity_split` finding used to say only how many rules the group spans, and it now adds a sentence such as "vm:210123 is in no anti-affinity rule for group bosh-aa-0123456789ab".
+
 - `pve-cid ha` no longer reports `anti_affinity_short` for a Director that does not write anti-affinity rules. The CPI writes a group rule only when `pve.ha.anti_affinity` is not `off` and scheduler-soft anti-affinity is enabled, so with either one off there is no rule for a group to fall short of. The doctor now skips the anti-affinity checks entirely in that case.
 
 - `pve-cid ha` no longer reports `replica_awaiting_sync` for a replicate VM that has no pin. The finding says the pin widens to the partner on the next `reboot_vm` or `set_vm_metadata` call, and a VM with no pin has nothing to widen, so the advice was false. The doctor now raises it only for a VM that has a pin, and the missing HA registration shows up in the other findings for that VM.

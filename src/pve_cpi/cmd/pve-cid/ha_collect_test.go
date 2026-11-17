@@ -332,6 +332,26 @@ func TestCollectAntiAffinityOverflowAndShortGroup(t *testing.T) {
 	wantNone(t, runCollect(t, f, haCfg("auto", "none")), haKindAntiAffinityShort, haKindAntiAffinitySplit)
 }
 
+func TestCollectAntiAffinitySplitNamesUncoveredMember(t *testing.T) {
+	t.Parallel()
+	group := "bosh-aa-0123456789ab"
+	f := haBaseFake()
+	f.guests = nil
+	f.resources = nil
+	for i := 0; i < 4; i++ {
+		id := 200 + i
+		f.guests = append(f.guests, pve.GuestRef{VMID: id, Node: "n" + itoa(i%3+1), Tags: "bosh-cpi;" + group})
+		f.memory[id] = haGiB
+		f.resources = append(f.resources, HAResourceRow{SID: "vm:" + itoa(id), State: "started"})
+	}
+	f.rules = []ha.Rule{
+		{ID: group, Type: "resource-affinity", Affinity: "negative", Comment: haMarker, Resources: []string{"vm:200", "vm:201", "vm:202"}},
+		{ID: group + "-2", Type: "resource-affinity", Affinity: "negative", Comment: haMarker, Resources: []string{"vm:200"}},
+	}
+	r := runCollect(t, f, haCfg("auto", "none"))
+	want(t, r, haKindAntiAffinitySplit, haSeverityAdvice, group, "vm:203 is in no anti-affinity rule for group "+group)
+}
+
 func TestCollectCPUFindings(t *testing.T) {
 	t.Parallel()
 	f := haBaseFake()
