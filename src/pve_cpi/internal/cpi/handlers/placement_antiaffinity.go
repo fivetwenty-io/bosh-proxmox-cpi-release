@@ -509,8 +509,9 @@ type aaPlanner struct {
 	nodes     int
 	placeable int
 	split     bool
-	// clusterNodes is the configured node set the feasibility checks use, or
-	// nil when it is unknown, which turns off the plan's own check of a join.
+	// clusterNodes is the configured node set, or nil when it is unknown.
+	// The feasibility checks use it, and nil turns off the plan's own check
+	// of a join. A member's soft pin is widened to it (see flattenMemberPins).
 	clusterNodes []string
 	// managed lists the sids PVE manages as HA resources. It is read on
 	// every plan. Nil treats every scanned member as managed.
@@ -887,7 +888,7 @@ func (p *aaPlanner) joinConflicts(
 func (p *aaPlanner) chunkCandidate(set *ha.RuleSet, cur *ha.Rule, name string, members []string) []ha.Rule {
 	members = slices.Sorted(slices.Values(members))
 	flat := map[string]ha.Rule{}
-	ops := flattenMemberPins(set, members, p.ident.Owner)
+	ops := flattenMemberPins(set, members, p.ident.Owner, p.clusterNodes)
 	for i := range ops {
 		flat[ops[i].Rule.ID] = ops[i].Rule
 	}
@@ -958,7 +959,9 @@ func (p *aaPlanner) logHeldOut(siblings []string) {
 }
 
 // chunkOps returns the writes that make the group's rules hold desired, led by
-// the pin flattening their members need, or nil when the rules already do.
+// the pin rewrites their members need, or nil when the rules and the pins
+// already hold. A member's pin that needs a rewrite gets it on any plan of the
+// group, even one that leaves the group's rules as they are.
 func (p *aaPlanner) chunkOps(set *ha.RuleSet, existing map[int]*ha.Rule, desired map[int][]string,
 	maxIndex int) []ha.RuleOp {
 	base := p.ident.ruleName()
@@ -980,7 +983,7 @@ func (p *aaPlanner) chunkOps(set *ha.RuleSet, existing map[int]*ha.Rule, desired
 		if slices.Contains(members, p.sid) {
 			p.placedIn = name
 		}
-		pins = append(pins, flattenMemberPins(set, members, p.ident.Owner)...)
+		pins = append(pins, flattenMemberPins(set, members, p.ident.Owner, p.clusterNodes)...)
 		want := ha.Rule{ID: name, Type: haRuleType, Affinity: haRuleAffinity, Resources: members,
 			Comment: p.ident.marker()}
 		switch {
@@ -992,7 +995,7 @@ func (p *aaPlanner) chunkOps(set *ha.RuleSet, existing map[int]*ha.Rule, desired
 			ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: next})
 		}
 	}
-	if len(ops) == 0 {
+	if len(ops) == 0 && len(pins) == 0 {
 		return nil
 	}
 	return append(pins, ops...)
@@ -1104,7 +1107,14 @@ func (p *aaPlanner) logOverflow(sid string, size int) {
 // before the member joins. A pin that carries another Director's marker is
 // left, so the plan leaves a sibling whose join that pin would make conflict
 // out of the rule, and the writer's check refuses the create's own join.
-func flattenMemberPins(set *ha.RuleSet, members []string, owner string) []ha.RuleOp {
+//
+// A soft pin of this Director's that names only some of the configured nodes
+// is also rewritten to name every one of them. PVE gives the nodes such a pin
+// leaves out a lower priority, and the CRM applies the group's rule only to
+// the nodes of the highest priority, so the pin would act as a strict one when
+// a sibling runs on its node (see ha.SoftPinNamesSomeNodes). An unmarked pin
+// is only flattened, because the CPI cannot tell what an older one meant by it.
+func flattenMemberPins(set *ha.RuleSet, members []string, owner string, configured []string) []ha.RuleOp {
 	var ops []ha.RuleOp
 	for _, s := range members {
 		vmid, ok := vmidFromSid(s)
@@ -1112,10 +1122,16 @@ func flattenMemberPins(set *ha.RuleSet, members []string, owner string) []ha.Rul
 			continue
 		}
 		pin := set.Find(naRuleNameFor(vmid))
-		if pin == nil || !pin.MultiplePriorities() || haOwnershipOf(pin.Comment, owner) == haOwnedByOther {
+		if pin == nil {
 			continue
 		}
-		ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: *ha.Flattened(pin)})
+		switch ownership := haOwnershipOf(pin.Comment, owner); {
+		case ownership == haOwnedByOther:
+		case ownership == haOwnedByUs && ha.SoftPinNamesSomeNodes(pin, configured):
+			ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: *ha.WithEveryNode(pin, configured)})
+		case pin.MultiplePriorities():
+			ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: *ha.Flattened(pin)})
+		}
 	}
 	return ops
 }
