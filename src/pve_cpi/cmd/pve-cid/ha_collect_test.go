@@ -462,13 +462,17 @@ func TestCollectReplicaOnPartnerAndAwaitingPinWidening(t *testing.T) {
 
 // TestCollectReplicaOnPartnerAfterAMove judges a replicate VM that runs on its
 // pin's partner n2 and whose job PVE has swapped to run from n2 back to n1,
-// by the sync from n2 and the migration tasks of the two nodes.
+// by the sync from n2 and the migration and start tasks of the two nodes.
 func TestCollectReplicaOnPartnerAfterAMove(t *testing.T) {
 	t.Parallel()
 	changed := haNow.Add(-2 * time.Hour)
 	migrated := pve.VMTask{UPID: "UPID:n1:00000001:00000001:00000001:qmigrate:101:root@pam:", Node: "n1",
 		Type: "qmigrate", ID: "101", Status: "OK", StartTime: haNow.Add(-61 * time.Minute).Unix(),
 		EndTime: haNow.Add(-time.Hour).Unix()}
+	started := func(node string, at time.Time) pve.VMTask {
+		return pve.VMTask{UPID: "UPID:" + node + ":00000001:00000001:00000001:qmstart:101:root@pam:", Node: node,
+			Type: "qmstart", ID: "101", Status: "OK", StartTime: at.Unix(), EndTime: at.Add(5 * time.Second).Unix()}
+	}
 	moved := func() *fakeHA {
 		f := replicaFake()
 		f.guests[1].Node = "n2"
@@ -495,6 +499,27 @@ func TestCollectReplicaOnPartnerAfterAMove(t *testing.T) {
 			absent: "rolls"},
 		{name: "migration tasks unreadable", edit: func(f *fakeHA) {
 			f.migrationErr = map[string]error{"n1": errors.New("needs Sys.Audit")}
+		}, severity: haSeverityProblem,
+			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
+				"could not be read", "needs Sys.Audit", "may have been lost"},
+			absent: "rolls"},
+		{name: "planned migration with the target's incoming start", edit: func(f *fakeHA) {
+			f.starts = map[string][]pve.VMTask{"n2": {started("n2", haNow.Add(-61*time.Minute+2*time.Second))}}
+		}, severity: haSeverityAdvice,
+			mentions: []string{"partner n2 after a planned migration", "names n1 as the partner"},
+			absent:   "failover"},
+		{name: "HA recoveries back to n1 and to n2 again after the migration", edit: func(f *fakeHA) {
+			f.starts = map[string][]pve.VMTask{
+				"n1": {started("n1", haNow.Add(-50*time.Minute))},
+				"n2": {started("n2", haNow.Add(-61*time.Minute+2*time.Second)), started("n2", haNow.Add(-40*time.Minute))},
+			}
+		}, severity: haSeverityProblem,
+			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
+				"a migration from n1 explains the move", "started again after it", "may have been lost",
+				"names n1 as the partner"},
+			absent: "planned migration"},
+		{name: "start tasks unreadable", edit: func(f *fakeHA) {
+			f.startErr = map[string]error{"n2": errors.New("needs Sys.Audit")}
 		}, severity: haSeverityProblem,
 			mentions: []string{"after a failover, or after a move the CPI has not reconciled yet",
 				"could not be read", "needs Sys.Audit", "may have been lost"},

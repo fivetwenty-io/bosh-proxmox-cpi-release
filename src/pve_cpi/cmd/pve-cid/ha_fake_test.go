@@ -50,6 +50,8 @@ type fakeHA struct {
 	volumesErr   map[string]error
 	migrations   map[string][]pve.VMTask
 	migrationErr map[string]error
+	starts       map[string][]pve.VMTask
+	startErr     map[string]error
 
 	storages    []pve.StorageInfo
 	storagesErr error
@@ -107,6 +109,13 @@ func (f *fakeHA) MigrationTasks(_ context.Context, node string, _ int, _ time.Ti
 		return nil, err
 	}
 	return f.migrations[node], nil
+}
+
+func (f *fakeHA) StartTasks(_ context.Context, node string, _ int, _ time.Time) ([]pve.VMTask, error) {
+	if err := f.startErr[node]; err != nil {
+		return nil, err
+	}
+	return f.starts[node], nil
 }
 
 func (f *fakeHA) StorageVolumes(_ context.Context, node, storage string) (map[string]bool, error) {

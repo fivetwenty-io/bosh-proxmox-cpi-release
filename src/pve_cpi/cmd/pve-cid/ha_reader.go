@@ -70,6 +70,9 @@ type HAReader interface {
 	// MigrationTasks lists the qmigrate tasks of vmid on node that started at
 	// or after since.
 	MigrationTasks(ctx context.Context, node string, vmid int, since time.Time) ([]pve.VMTask, error)
+	// StartTasks lists the qmstart tasks of vmid on node that started at or
+	// after since.
+	StartTasks(ctx context.Context, node string, vmid int, since time.Time) ([]pve.VMTask, error)
 	// StorageVolumes lists the volume IDs a storage holds on node.
 	StorageVolumes(ctx context.Context, node, storage string) (map[string]bool, error)
 	// Storages returns the storage index of the cluster.
@@ -271,6 +274,16 @@ func (r *pveHAReader) MigrationTasks(
 		return nil, errors.New("pve-cid: the PVE client cannot list migration tasks")
 	}
 	return reader.MigrationTasks(ctx, node, vmid, since)
+}
+
+func (r *pveHAReader) StartTasks(
+	ctx context.Context, node string, vmid int, since time.Time,
+) ([]pve.VMTask, error) {
+	reader, ok := r.client.(pve.MigrationTaskReader)
+	if !ok {
+		return nil, errors.New("pve-cid: the PVE client cannot list start tasks")
+	}
+	return reader.StartTasks(ctx, node, vmid, since)
 }
 
 func (r *pveHAReader) StorageVolumes(ctx context.Context, node, storage string) (map[string]bool, error) {

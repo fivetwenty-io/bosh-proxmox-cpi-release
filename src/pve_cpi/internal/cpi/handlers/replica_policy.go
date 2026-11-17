@@ -1251,12 +1251,13 @@ func swappedReplicaPin(pin *ha.Rule, node, oldSource string) *ha.Rule {
 // is enabled and runs from w.node to an online oldSource, and a sync from
 // w.node is verified to cover the VM's volumes on oldSource after the pin's
 // last change, because only then does the old source hold the VM's data. A
-// qmigrate task on oldSource that ended after that change makes the move a
-// planned migration. With no such task, the move was a failover whose first
-// reversed sync has run, and with a task list the CPI cannot read, the move
-// may have been one. Either keeps both nodes, because the old source's copy
-// is current again, and the CPI warns that writes made on the old source
-// after its last sync before the failover were lost. swapped is false when
+// qmigrate task on oldSource that ended after that change, with no qmstart
+// task that shows the VM started again after it, makes the move a planned
+// migration. With no such task, the move was a failover whose first reversed
+// sync has run. With a start after the migration, which an HA recovery
+// leaves, or with a task list the CPI cannot read, the move may have been
+// one. Each keeps both nodes, because the old source's copy is current again,
+// and the CPI warns that writes were or may have been lost. swapped is false when
 // the pin narrows instead, and undecided then names why when the job does run
 // from w.node to an online oldSource, the case the CPI cannot tell from a
 // failover yet. A failed read is undecided too, and only a failed pin write is
@@ -1319,10 +1320,16 @@ func (w *replicaWiden) swapAfterMigration(
 			"task on the old source explains the move; a verified sync from this node covers its volumes on the "+
 			"old source again, so the pin keeps both nodes and names the old source as the partner now, but "+
 			"writes made on the old source after its last sync before the failover were lost", fields...)
+	case ha.PartnerMoveRestarted:
+		logger.Warn(replicaOp+": a migration from the old source brought the VM to its replication partner, but "+
+			"the VM started again after the migration, which an HA recovery does; a verified sync from this node "+
+			"covers its volumes on the old source again, so the pin keeps both nodes and names the old source as "+
+			"the partner now, but if that start was an HA recovery, writes made after the last sync before it "+
+			"were lost", fields...)
 	default:
 		logger.Warn(replicaOp+": the VM runs on its replication partner, and a verified sync from this node "+
 			"covers its volumes on the old source, so the pin keeps both nodes and names the old source as the "+
-			"partner now; the CPI could not read the migration tasks that would prove a planned migration, so if "+
+			"partner now; the CPI could not read the task lists that would prove a planned migration, so if "+
 			"this was a failover, writes made on the old source after its last sync before it were lost",
 			append(fields, log.Err(unread))...)
 	}
@@ -1330,30 +1337,21 @@ func (w *replicaWiden) swapAfterMigration(
 }
 
 // migrationLookback is how far before the pin's last change the migration
-// task listings reach, so that a migration that started before the change
-// and ended after it is listed.
-const migrationLookback = 24 * time.Hour
+// task listings reach (see ha.MigrationLookback).
+const migrationLookback = ha.MigrationLookback
 
-// migrationEvidence reads the qmigrate tasks of the VM on oldSource and on
-// w.node and judges them (see ha.MigrationEvidenceOf). A client that cannot
-// list them, or a listing that fails, is MigrationUnread with the cause.
+// migrationEvidence reads the qmigrate and qmstart tasks of the VM on
+// oldSource and on w.node and judges them (see ha.ReadMigrationEvidence). A
+// client that cannot list them, or a listing that fails, is MigrationUnread
+// with the cause.
 func (w *replicaWiden) migrationEvidence(
 	ctx context.Context, oldSource string, changedAt time.Time,
 ) (ha.MigrationEvidence, error) {
 	reader, ok := unguardedPVE(w.deps.PVE).(pve.MigrationTaskReader)
 	if !ok {
-		return ha.MigrationUnread, errors.New("the PVE client cannot list migration tasks")
+		return ha.MigrationUnread, errors.New("the PVE client cannot list migration and start tasks")
 	}
-	since := changedAt.Add(-migrationLookback)
-	fromOld, err := reader.MigrationTasks(ctx, oldSource, w.vmid, since)
-	if err != nil {
-		return ha.MigrationUnread, fmt.Errorf("list the migration tasks on node %s: %w", oldSource, err)
-	}
-	onNode, err := reader.MigrationTasks(ctx, w.node, w.vmid, since)
-	if err != nil {
-		return ha.MigrationUnread, fmt.Errorf("list the migration tasks on node %s: %w", w.node, err)
-	}
-	return ha.MigrationEvidenceOf(fromOld, onNode, changedAt), nil
+	return ha.ReadMigrationEvidence(ctx, reader, w.vmid, w.node, oldSource, changedAt)
 }
 
 // narrowAfterFailover narrows the pin of a VM that runs on its partner to

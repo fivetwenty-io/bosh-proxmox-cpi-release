@@ -273,11 +273,11 @@ func TestReconcileOnPartner_VerifiedSyncWithoutAMigrationWarnsOfLostWrites(t *te
 		},
 		"the old source's tasks cannot be read": {
 			setup: func(r *replicaRig, _ time.Time) { r.tasks.err["pve01"] = errors.New("needs Sys.Audit") },
-			warn:  "could not read the migration tasks that would prove a planned migration",
+			warn:  "could not read the task lists that would prove a planned migration",
 		},
 		"the new source's tasks cannot be read": {
 			setup: func(r *replicaRig, _ time.Time) { r.tasks.err["pve02"] = errors.New("needs Sys.Audit") },
-			warn:  "could not read the migration tasks that would prove a planned migration",
+			warn:  "could not read the task lists that would prove a planned migration",
 		},
 	}
 	for name, tc := range cases {
@@ -314,7 +314,142 @@ func TestReconcileOnPartner_ReadsTheMigrationTasksOfBothNodes(t *testing.T) {
 	if warnings, _ := reconcileMoved(t, r); len(warnings) != 0 {
 		t.Fatalf("warnings %q; a planned migration loses no writes", warnings)
 	}
-	if !slices.Equal(r.tasks.calls, []string{"migrations:pve01", "migrations:pve02"}) {
-		t.Fatalf("task listings %v, want the old source's and the new source's", r.tasks.calls)
+	want := []string{"migrations:pve01", "migrations:pve02", "starts:pve01", "starts:pve02"}
+	if !slices.Equal(r.tasks.calls, want) {
+		t.Fatalf("task listings %v, want the migrations and then the starts of the old source and the new one",
+			r.tasks.calls)
+	}
+}
+
+// TestReconcileOnPartner_LiveMigrationWithItsIncomingStartIsPlanned runs the
+// reconcile of a VM whose live migration left the target's own start task,
+// the qm start --migratedfrom that received the VM, inside the migration's
+// window. That start belongs to the migration, so the move is still a planned
+// migration that loses no writes.
+func TestReconcileOnPartner_LiveMigrationWithItsIncomingStartIsPlanned(t *testing.T) {
+	cases := map[string]time.Duration{
+		"the target's clock agrees with the source's": 2 * time.Second,
+		"the target's clock runs four minutes ahead":  4 * time.Minute,
+	}
+	for name, offset := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, changed := movedReplicaRig(t)
+			begun := changed.Add(time.Hour - time.Minute)
+			r.tasks.started("pve02", begun.Add(offset), begun.Add(offset+3*time.Second), "OK")
+			r.tasks.started("pve01", changed.Add(-time.Hour), changed.Add(-time.Hour+5*time.Second), "OK")
+			logger, observed := log.NewObservedLogger(log.LevelInfo)
+			set, err := readHARuleSet(t.Context(), r.deps.PVE.Cluster())
+			if err != nil {
+				t.Fatal(err)
+			}
+			res := &attachRunRes{log: &stagingLog{}, state: "started", comment: r.stub.comment}
+			if err := reconcileOnPartner(crhCtx(), r.deps, logger, "set_vm_metadata", "100", r.repl,
+				failoverView(res, "pve02"), r.profile, 100, "pve02", set.Find("bosh-na-100"), "pve01"); err != nil {
+				t.Fatalf("reconcile on the partner: %v", err)
+			}
+			planned := false
+			for _, e := range observed.All() {
+				if e.Level >= log.LevelWarn {
+					t.Fatalf("warning %q; a live migration's own start loses no writes", e.Message)
+				}
+				planned = planned || strings.Contains(e.Message, "by a planned migration")
+			}
+			if !planned {
+				t.Fatal("the reconcile did not report a planned migration")
+			}
+			set, err = readHARuleSet(t.Context(), r.deps.PVE.Cluster())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if source, partner, ok := ha.ReplicaPinShape(set.Find("bosh-na-100")); !ok || source != "pve02" ||
+				partner != "pve01" {
+				t.Fatalf("pin shape %q %q %v; a planned migration keeps both nodes and moves the partner", source,
+					partner, ok)
+			}
+		})
+	}
+}
+
+// TestReconcileOnPartner_RecoveryAfterAPlannedMigrationWarnsOfLostWrites runs
+// the reconcile of a VM that a planned migration took from pve01 to pve02,
+// that an HA recovery then brought back to pve01, and that a second HA
+// recovery took to pve02 again, with no CPI call in between. Each recovery
+// starts the VM from its replica and leaves no migration task, so the
+// migration task on pve01 is still the latest one. The starts after it show
+// the recoveries, and the CPI keeps both nodes but warns that writes may have
+// been lost instead of calling the move a planned migration.
+func TestReconcileOnPartner_RecoveryAfterAPlannedMigrationWarnsOfLostWrites(t *testing.T) {
+	type sequence func(r *replicaRig, ended time.Time)
+	incoming := func(r *replicaRig, ended time.Time) {
+		r.tasks.started("pve02", ended.Add(-58*time.Second), ended.Add(-55*time.Second), "OK")
+	}
+	backToOld := func(r *replicaRig, ended time.Time) {
+		r.tasks.started("pve01", ended.Add(10*time.Minute), ended.Add(10*time.Minute+5*time.Second), "OK")
+	}
+	toPartnerAgain := func(r *replicaRig, ended time.Time) {
+		r.tasks.started("pve02", ended.Add(20*time.Minute), ended.Add(20*time.Minute+5*time.Second), "OK")
+	}
+	cases := map[string][]sequence{
+		"both recoveries listed":                        {incoming, backToOld, toPartnerAgain},
+		"the old source lost its start when it crashed": {incoming, toPartnerAgain},
+		"a target that lists no incoming start":         {backToOld, toPartnerAgain},
+		"the recovery to the partner alone":             {toPartnerAgain},
+		"the recovery back to the old source alone":     {incoming, backToOld},
+		"a second start soon after the incoming one ends": {incoming, func(r *replicaRig, ended time.Time) {
+			r.tasks.started("pve02", ended.Add(2*time.Minute), ended.Add(2*time.Minute+5*time.Second), "OK")
+		}},
+	}
+	for name, steps := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, changed := movedReplicaRig(t)
+			for _, step := range steps {
+				step(r, changed.Add(time.Hour))
+			}
+			warnings, sl := reconcileMoved(t, r)
+			set, err := readHARuleSet(t.Context(), r.deps.PVE.Cluster())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if source, partner, ok := ha.ReplicaPinShape(set.Find("bosh-na-100")); !ok || source != "pve02" ||
+				partner != "pve01" {
+				t.Fatalf("pin shape %q %q %v; the verified sync keeps both nodes and moves the partner", source,
+					partner, ok)
+			}
+			if len(warnings) != 1 || !strings.Contains(warnings[0], "started again after the migration") ||
+				!strings.Contains(warnings[0], "were lost") || strings.Contains(warnings[0], "by a planned migration") {
+				t.Fatalf("warnings %q; a start after the migration warns that writes may have been lost", warnings)
+			}
+			if len(sl.events) != 0 || r.repl.called("schedule") {
+				t.Fatalf("events %v calls %v; a pin that keeps both nodes needs no barrier and no sync", sl.events,
+					r.repl.calls)
+			}
+		})
+	}
+}
+
+// TestReconcileOnPartner_UnreadableStartsLeaveTheMigrationUnproven runs the
+// reconcile of a planned migration whose start tasks the CPI cannot read on
+// one node. A start it can't see may be an HA recovery, so the CPI keeps both
+// nodes and warns that it couldn't prove a planned migration.
+func TestReconcileOnPartner_UnreadableStartsLeaveTheMigrationUnproven(t *testing.T) {
+	for _, node := range []string{"pve01", "pve02"} {
+		t.Run(node, func(t *testing.T) {
+			r, _ := movedReplicaRig(t)
+			r.tasks.startErr[node] = errors.New("needs Sys.Audit")
+			warnings, _ := reconcileMoved(t, r)
+			set, err := readHARuleSet(t.Context(), r.deps.PVE.Cluster())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if source, partner, ok := ha.ReplicaPinShape(set.Find("bosh-na-100")); !ok || source != "pve02" ||
+				partner != "pve01" {
+				t.Fatalf("pin shape %q %q %v; the verified sync keeps both nodes and moves the partner", source,
+					partner, ok)
+			}
+			if len(warnings) != 1 ||
+				!strings.Contains(warnings[0], "could not read the task lists that would prove a planned migration") {
+				t.Fatalf("warnings %q; an unreadable start listing leaves the migration unproven", warnings)
+			}
+		})
 	}
 }

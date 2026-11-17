@@ -1036,9 +1036,14 @@ func (c *haCollector) onPartner(g *haGuest, pin *ha.Rule, node, source string) {
 		c.rep.problem(haKindReplicaOnPartner, g.sid, moved+"; no migration task on %s explains the move, so writes "+
 			"made on %s after its last sync before the move were lost, and a sync from %s back to %s has run "+
 			"since; "+reconcile, id, node, source, source, node, source, source)
+	case ha.PartnerMoveRestarted:
+		c.rep.problem(haKindReplicaOnPartner, g.sid, moved+"; a migration from %s explains the move, but the VM "+
+			"started again after it, which an HA recovery does, so writes made after the last sync before that "+
+			"start may have been lost, and a sync from %s back to %s has run since; "+reconcile, id, node, source,
+			node, source, source)
 	case ha.PartnerMoveUnproven:
 		c.rep.problem(haKindReplicaOnPartner, g.sid, moved+"; a sync from %s back to %s has run since, but the "+
-			"migration tasks that would prove a planned migration could not be read (%v), so writes made on %s "+
+			"task lists that would prove a planned migration could not be read (%v), so writes made on %s "+
 			"after its last sync before the move may have been lost; "+reconcile, id, node, node, source, unread,
 			source, source)
 	default:
@@ -1051,22 +1056,14 @@ func (c *haCollector) onPartner(g *haGuest, pin *ha.Rule, node, source string) {
 	}
 }
 
-// migrationEvidence reads the qmigrate tasks of the VM vmid on the old source
-// and on node, and judges them (see ha.MigrationEvidenceOf). A listing that
-// fails is MigrationUnread with its cause.
+// migrationEvidence reads the qmigrate and qmstart tasks of the VM vmid on
+// the old source and on node, and judges them (see ha.ReadMigrationEvidence),
+// the read the CPI makes too. A listing that fails is MigrationUnread with its
+// cause.
 func (c *haCollector) migrationEvidence(
 	vmid int, node, source string, changedAt time.Time,
 ) (ha.MigrationEvidence, error) {
-	since := changedAt.Add(-24 * time.Hour)
-	fromOld, err := c.r.MigrationTasks(c.ctx, source, vmid, since)
-	if err != nil {
-		return ha.MigrationUnread, fmt.Errorf("node %s: %w", source, err)
-	}
-	onNode, err := c.r.MigrationTasks(c.ctx, node, vmid, since)
-	if err != nil {
-		return ha.MigrationUnread, fmt.Errorf("node %s: %w", node, err)
-	}
-	return ha.MigrationEvidenceOf(fromOld, onNode, changedAt), nil
+	return ha.ReadMigrationEvidence(c.ctx, c.r, vmid, node, source, changedAt)
 }
 
 // notRecoverable judges a replicate VM whose pin does not yet record a
