@@ -29,7 +29,8 @@ func repeatedLineKeys(t *testing.T, line string) []string {
 			t.Fatalf("line %q: %v", line, err)
 		}
 		key, _ := tok.(string)
-		if seen[key]++; seen[key] == 2 {
+		seen[key]++
+		if seen[key] == 2 {
 			out = append(out, key)
 		}
 		var skip json.RawMessage

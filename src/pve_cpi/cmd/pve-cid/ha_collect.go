@@ -38,9 +38,6 @@ const (
 	haReplicaTag = "bosh-ha-replica"
 	// haBirthTagPrefix starts the tag a create_vm writes until it finishes.
 	haBirthTagPrefix = "bosh-creating-"
-	// haMarkerPrefix opens the ownership marker in a rule, resource, or
-	// replication job comment.
-	haMarkerPrefix = ha.MarkerPrefix
 	// haPinRulePrefix starts the name of a node-affinity pin, bosh-na-<vmid>.
 	haPinRulePrefix = "bosh-na-"
 	// haGroupRulePrefix starts the name of an anti-affinity rule and of its
@@ -1306,36 +1303,43 @@ func (c *haCollector) orphanVolumes() {
 			if len(s.Nodes) > 0 && !containsString(s.Nodes, node.Name) {
 				continue
 			}
-			volumes, err := c.r.StorageVolumes(c.ctx, node.Name, s.Name)
-			if err != nil {
-				c.rep.unchecked("storage "+s.Name+"@"+node.Name,
-					"the volumes of %s on %s could not be listed, so replica orphans there are unchecked: %v", s.Name, node.Name, err)
-				continue
-			}
-			ids := make([]string, 0, len(volumes))
-			for volid := range volumes {
-				ids = append(ids, volid)
-			}
-			sort.Strings(ids)
-			for _, volid := range ids {
-				m := haVolumeGuestPattern.FindStringSubmatch(volid)
-				if m == nil {
-					continue
-				}
-				vmid, _ := strconv.Atoi(m[1])
-				g, ok := c.byVMID[vmid]
-				if !ok {
-					gone(volid, node.Name, vmid)
-					continue
-				}
-				if !g.owned || g.ref.Node == node.Name || covered[m[1]+"@"+node.Name] {
-					continue
-				}
-				c.rep.problem(haKindReplicaOrphanVolume, volid,
-					"%s on %s is a copy of VM %d, which runs on %s, and no replication job targets %s for it; remove it by hand once nothing needs it",
-					volid, node.Name, vmid, g.ref.Node, node.Name)
-			}
+			c.orphanVolumesOn(node.Name, s.Name, covered, gone)
 		}
+	}
+}
+
+// orphanVolumesOn checks the volumes of storage on node for orphanVolumes.
+// covered holds "<vmid>@<target>" for each healthy job, and gone is the check
+// for a volume whose VM is gone.
+func (c *haCollector) orphanVolumesOn(node, storage string, covered map[string]bool, gone func(string, string, int)) {
+	volumes, err := c.r.StorageVolumes(c.ctx, node, storage)
+	if err != nil {
+		c.rep.unchecked("storage "+storage+"@"+node,
+			"the volumes of %s on %s could not be listed, so replica orphans there are unchecked: %v", storage, node, err)
+		return
+	}
+	ids := make([]string, 0, len(volumes))
+	for volid := range volumes {
+		ids = append(ids, volid)
+	}
+	sort.Strings(ids)
+	for _, volid := range ids {
+		m := haVolumeGuestPattern.FindStringSubmatch(volid)
+		if m == nil {
+			continue
+		}
+		vmid, _ := strconv.Atoi(m[1])
+		g, ok := c.byVMID[vmid]
+		if !ok {
+			gone(volid, node, vmid)
+			continue
+		}
+		if !g.owned || g.ref.Node == node || covered[m[1]+"@"+node] {
+			continue
+		}
+		c.rep.problem(haKindReplicaOrphanVolume, volid,
+			"%s on %s is a copy of VM %d, which runs on %s, and no replication job targets %s for it; remove it by hand once nothing needs it",
+			volid, node, vmid, g.ref.Node, node)
 	}
 }
 
