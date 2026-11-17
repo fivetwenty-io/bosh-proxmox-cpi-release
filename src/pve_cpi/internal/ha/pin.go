@@ -68,20 +68,26 @@ type PinSpec struct {
 	RebalanceOnStart bool
 	DLB              bool
 
-	// SinglePriority flattens every priority to one value. PVE refuses a pin
-	// with several priorities for a resource that is also in a
-	// resource-affinity rule.
+	// SinglePriority says the VM is in a resource-affinity rule, so its pin
+	// gets one priority on every node. PVE refuses a pin with several
+	// priorities for such a VM. A pin that is not strict also names every
+	// configured node, because PVE gives each node the pin leaves out a lower
+	// priority of its own (see SoftPinNamesSomeNodes).
 	SinglePriority bool
 }
 
 // BuildPin returns the merged node-affinity rule for spec, or nil when the VM
 // needs no pin. The rule names every node of the hard admissible set and is
 // strict when that set is smaller than the configured node set. Soft
-// constraints only add priorities.
+// constraints only add priorities. A VM in a resource-affinity rule with no
+// hard constraint gets no preference at all: its pin, when it needs one,
+// names every configured node at one priority, and when the configured node
+// set is unknown it gets none here, so DecisionPin gives it the record pin.
 func BuildPin(spec PinSpec) (*Rule, error) {
 	configured := toSet(trimmed(spec.Configured))
 	var nodes []string
 	strict := false
+	rebalancePin := spec.RebalanceOnStart && !spec.DLB && strings.TrimSpace(spec.Placed) != ""
 	switch {
 	case spec.Hard != nil:
 		var err error
@@ -89,13 +95,18 @@ func BuildPin(spec PinSpec) (*Rule, error) {
 			return nil, fmt.Errorf("pin %s: %w", spec.ID, err)
 		}
 		strict = len(configured) == 0 || len(nodes) < len(configured)
+	case spec.SinglePriority:
+		if len(configured) == 0 || len(trimmed(spec.Preferred)) == 0 && !rebalancePin {
+			return nil, nil
+		}
+		nodes = sortedKeys(configured)
 	case len(trimmed(spec.Preferred)) > 0:
 		if len(configured) > 0 {
 			nodes = sortedKeys(configured)
 		} else {
 			nodes = trimmed(append(append([]string{}, spec.Preferred...), spec.Placed))
 		}
-	case spec.RebalanceOnStart && !spec.DLB && strings.TrimSpace(spec.Placed) != "":
+	case rebalancePin:
 		nodes = []string{strings.TrimSpace(spec.Placed)}
 	default:
 		return nil, nil
@@ -152,6 +163,41 @@ func Flattened(pin *Rule) *Rule {
 		out.Nodes[n] = PinPriorityRest
 	}
 	return &out
+}
+
+// SoftPinNamesSomeNodes reports whether pin is an enabled positive pin that is
+// not strict and leaves out a node of configured. PVE gives every node such a
+// pin leaves out a priority below the ones it names, and the CRM picks a VM's
+// candidates from the highest priority among the online nodes before it applies
+// resource affinity. A pin like that on a VM in a negative resource-affinity
+// rule therefore acts as a strict one whenever group members hold every node it
+// names, because the CRM never falls back to the nodes it left out. It reports
+// false when configured is empty, because then the left-out nodes are unknown.
+func SoftPinNamesSomeNodes(pin *Rule, configured []string) bool {
+	if pin == nil || pin.Type != RuleTypeNodeAffinity || pin.Strict || pin.Disabled ||
+		pin.Affinity == AffinityNegative {
+		return false
+	}
+	for _, n := range trimmed(configured) {
+		if _, ok := pin.Nodes[n]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+// WithEveryNode returns the pin with every node of configured added and one
+// priority on every node, keeping its strictness. For a pin that is not
+// strict, this keeps every node the VM may run on and drops every preference.
+func WithEveryNode(pin *Rule, configured []string) *Rule {
+	out := Flattened(pin)
+	if out.Nodes == nil {
+		out.Nodes = map[string]int{}
+	}
+	for _, n := range trimmed(configured) {
+		out.Nodes[n] = PinPriorityRest
+	}
+	return out
 }
 
 // Narrows reports whether moving a VM from the pin old to the pin next shrinks
