@@ -113,11 +113,178 @@ func TestHandleSetDiskMetadata_DiskOnDownNodeFailsRetriable(t *testing.T) {
 	if !strings.Contains(err.Error(), diskMetaDownNode) {
 		t.Fatalf("the error must name the offline member, got: %v", err)
 	}
+	if !strings.Contains(err.Error(), "retry once "+diskMetaDownNode+" is back in the cluster") {
+		t.Fatalf("the error must say to retry once the offline member is back, got: %v", err)
+	}
 	if nodesSvc.capturedDesc != nil || nodesSvc.capturedTags != nil {
 		t.Fatal("nothing may be written when the holder can't be found")
 	}
 	if got := nodesSvc.listCalls[diskMetaDownNode]; got != pve.DefaultTransientMaxAttempts {
 		t.Fatalf("the offline member must get one strict listing with the full budget, got %d listing attempts", got)
+	}
+}
+
+// diskMetaIndexOnlyNonHolders points the node-down fixture's index at rows
+// that leave the down member with no guest that could hold the disk. The
+// online member has its ordinary VM and a container, and the down member has
+// only a parker and a template.
+func diskMetaIndexOnlyNonHolders(client *diskMetaClientMock) {
+	rows := sdkclusterapi.ListResourcesResponse{
+		json.RawMessage(`{"vmid":100,"node":"` + testNode + `","type":"qemu"}`),
+		json.RawMessage(`{"vmid":500,"node":"` + testNode + `","type":"lxc"}`),
+		json.RawMessage(`{"vmid":300,"node":"` + diskMetaDownNode + `","type":"qemu","tags":"bosh-parker"}`),
+		json.RawMessage(`{"vmid":301,"node":"` + diskMetaDownNode + `","type":"qemu","template":1}`),
+	}
+	client.clusterSvc.(*diskMetaClusterSvc).resp = &rows
+}
+
+// TestHandleSetDiskMetadata_OfflineNodeWithNoPossibleHolderReadsAsNotAttached:
+// with one member the quorate cluster reports offline and no holder on the
+// online member, a fresh index read that lists only a parker and a template on
+// the offline member proves no VM there holds the disk. The call answers "not
+// attached" without listing the offline member again, writes nothing, and
+// warns that it left that member out.
+func TestHandleSetDiskMetadata_OfflineNodeWithNoPossibleHolderReadsAsNotAttached(t *testing.T) {
+	t.Parallel()
+	nodesSvc, client := diskMetaNodeDownFixture(t, "")
+	diskMetaIndexOnlyNonHolders(client)
+	deps := makeDiskMetaDeps(client)
+	logger, obs := log.NewObservedLogger(log.LevelWarn)
+	deps.Logger = logger
+	h := handlers.HandleSetDiskMetadata(deps)
+
+	if _, err := h.Handle(nodeDownCtx(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{}); err != nil {
+		t.Fatalf("an offline member whose index rows can't hold the disk must not fail the call, got: %v", err)
+	}
+	if nodesSvc.capturedDesc != nil || nodesSvc.capturedTags != nil {
+		t.Fatal("nothing may be written for a disk that no VM holds")
+	}
+	if got := nodesSvc.listCalls[diskMetaDownNode]; got != 0 {
+		t.Fatalf("the index settles the answer, so the offline member must not be listed, got %d attempts", got)
+	}
+	for _, e := range obs.All() {
+		if strings.Contains(e.Message, "leaving out a node the cluster reports offline") && fmtAttr(e.Attrs["node"]) == diskMetaDownNode {
+			return
+		}
+	}
+	t.Fatalf("want a warning that names %s as left out, got %+v", diskMetaDownNode, obs.All())
+}
+
+// TestHandleSetDiskMetadata_UnreadableIndexKeepsOfflineNodeUnproven: an index
+// read that fails proves nothing, so the call falls back to listing the
+// offline member with the strict budget and fails retriable when it still
+// doesn't answer.
+func TestHandleSetDiskMetadata_UnreadableIndexKeepsOfflineNodeUnproven(t *testing.T) {
+	t.Parallel()
+	nodesSvc, client := diskMetaNodeDownFixture(t, "")
+	diskMetaIndexOnlyNonHolders(client)
+	clusterSvc := client.clusterSvc.(*diskMetaClusterSvc)
+	rows := clusterSvc.resp
+	clusterSvc.listFn = func(_ context.Context, params *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+		if params != nil && nodesSvc.listCalls[testNode] > 0 {
+			return nil, makeSdkAPIErr(403, "Permission check failed")
+		}
+		return rows, nil
+	}
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(client))
+
+	_, err := h.Handle(nodeDownCtx(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !strings.Contains(err.Error(), diskMetaDownNode) {
+		t.Fatalf("an unreadable index must leave the offline member unproven and fail retriable, got: %v", err)
+	}
+	if nodesSvc.capturedDesc != nil || nodesSvc.capturedTags != nil {
+		t.Fatal("nothing may be written when the offline member stays unproven")
+	}
+	if got := nodesSvc.listCalls[diskMetaDownNode]; got != pve.DefaultTransientMaxAttempts {
+		t.Fatalf("the offline member must get one strict listing with the full budget, got %d listing attempts", got)
+	}
+}
+
+// TestHandleSetDiskMetadata_IndexRowTheOnlineListingMissedKeepsOfflineNode:
+// an ordinary VM that the index lists on the online member but that member's
+// listing didn't return may have moved to the offline member, so the call
+// keeps that member unproven even though its own index rows can't hold the
+// disk.
+func TestHandleSetDiskMetadata_IndexRowTheOnlineListingMissedKeepsOfflineNode(t *testing.T) {
+	t.Parallel()
+	nodesSvc, client := diskMetaNodeDownFixture(t, "")
+	diskMetaIndexOnlyNonHolders(client)
+	clusterSvc := client.clusterSvc.(*diskMetaClusterSvc)
+	listed := clusterSvc.resp
+	indexed := append(sdkclusterapi.ListResourcesResponse{}, *listed...)
+	indexed = append(indexed, json.RawMessage(`{"vmid":400,"node":"`+testNode+`","type":"qemu"}`))
+	clusterSvc.resp = &indexed
+	nodesSvc.listQemuSrc = func(context.Context, *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+		return listed, nil
+	}
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(client))
+
+	_, err := h.Handle(nodeDownCtx(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !strings.Contains(err.Error(), diskMetaDownNode) {
+		t.Fatalf("an index row the online listing missed must keep the offline member unproven, got: %v", err)
+	}
+	if got := nodesSvc.listCalls[diskMetaDownNode]; got != pve.DefaultTransientMaxAttempts {
+		t.Fatalf("the offline member must get one strict listing with the full budget, got %d listing attempts", got)
+	}
+}
+
+// TestHandleSetDiskMetadata_UnreachableNodeReportedOnlineFailsClosed: a member
+// that doesn't answer while the quorate cluster still reports it online may be
+// running the VM that holds the disk, so the index never stands in for it.
+// The call fails after the full retry budget and writes nothing.
+func TestHandleSetDiskMetadata_UnreachableNodeReportedOnlineFailsClosed(t *testing.T) {
+	t.Parallel()
+	nodesSvc, client := diskMetaNodeDownFixture(t, "")
+	diskMetaIndexOnlyNonHolders(client)
+	client.clusterSvc.(*diskMetaClusterSvc).statusFn = func() (*sdkclusterapi.ListStatusResponse, error) {
+		return diskMetaStatus(true)
+	}
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(client))
+
+	_, err := h.Handle(nodeDownCtx(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if err == nil || !strings.Contains(err.Error(), diskMetaDownNode) {
+		t.Fatalf("an unreachable member reported online must fail the call, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "reports") {
+		t.Fatalf("a member the cluster reports online must not be called offline, got: %v", err)
+	}
+	if nodesSvc.capturedDesc != nil || nodesSvc.capturedTags != nil {
+		t.Fatal("nothing may be written when a member reported online can't be read")
+	}
+	if got := nodesSvc.listCalls[diskMetaDownNode]; got != pve.DefaultTransientMaxAttempts {
+		t.Fatalf("a member reported online must get the full retry budget, got %d listing attempts", got)
+	}
+}
+
+// TestHandleSetDiskMetadata_NoQuorumFailsClosed: a cluster without quorum has
+// no authority to call a member offline, so the call never leaves the
+// unreachable member out, fails, and writes nothing.
+func TestHandleSetDiskMetadata_NoQuorumFailsClosed(t *testing.T) {
+	t.Parallel()
+	nodesSvc, client := diskMetaNodeDownFixture(t, "")
+	diskMetaIndexOnlyNonHolders(client)
+	client.clusterSvc.(*diskMetaClusterSvc).statusFn = func() (*sdkclusterapi.ListStatusResponse, error) {
+		resp := sdkclusterapi.ListStatusResponse{
+			json.RawMessage(`{"type":"cluster","name":"lab","quorate":0}`),
+			json.RawMessage(`{"type":"node","name":"` + testNode + `","online":1}`),
+			json.RawMessage(`{"type":"node","name":"` + diskMetaDownNode + `","online":0}`),
+		}
+		return &resp, nil
+	}
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(client))
+
+	_, err := h.Handle(nodeDownCtx(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if err == nil || !strings.Contains(err.Error(), diskMetaDownNode) {
+		t.Fatalf("a cluster without quorum must fail the call, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "reports") {
+		t.Fatalf("a cluster without quorum must not call the member offline, got: %v", err)
+	}
+	if nodesSvc.capturedDesc != nil || nodesSvc.capturedTags != nil {
+		t.Fatal("nothing may be written without quorum")
+	}
+	if got := nodesSvc.listCalls[diskMetaDownNode]; got != pve.DefaultTransientMaxAttempts {
+		t.Fatalf("without quorum the member must get the full retry budget, got %d listing attempts", got)
 	}
 }
 

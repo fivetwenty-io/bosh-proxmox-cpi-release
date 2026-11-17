@@ -149,7 +149,7 @@ func TestListIndexedGuests_ReadsGuestRows(t *testing.T) {
 	if got[0].VMID != 101 || got[0].Node != "pve2" || got[0].Type != "qemu" || !TagsMarkParker(got[0].Tags) {
 		t.Errorf("first row decoded wrong: %+v", got[0])
 	}
-	if got[1].VMID != 102 || got[1].Type != "lxc" {
+	if got[1].VMID != 102 || !got[1].IsContainer() || got[0].IsContainer() || got[2].IsContainer() {
 		t.Errorf("second row decoded wrong: %+v", got[1])
 	}
 	if got[2].VMID != 103 || got[2].Type != "" || !got[2].Template {

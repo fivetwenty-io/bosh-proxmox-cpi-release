@@ -22,6 +22,12 @@ type IndexedGuest struct {
 	Type string
 }
 
+// IsContainer reports whether the row is an LXC container. A container can't
+// hold a QEMU disk, so a caller that only reads VM configs can pass over it.
+func (g IndexedGuest) IsContainer() bool {
+	return g.Type == clusterResourceTypeLXC
+}
+
 // ListIndexedGuests reads the /cluster/resources index once and returns every
 // guest row it lists, QEMU and LXC alike, in index order. It is the evidence a
 // caller of ListGuestsAuthoritativeTolerant can use for a member that the

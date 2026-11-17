@@ -212,10 +212,13 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 // First, a parker on an online node that holds the volume proves that the
 // disk isn't attached to an ordinary VM, because a disk is attached to one VM
 // at a time, and the call answers "not attached" as it does with every node
-// listed. Otherwise the scan lists the left-out nodes again with the strict
-// retry budget, which rides out a corosync blip that dropped a node whose
-// guests kept running, and reads their guests' configs. Only a node that
-// still can't be read leaves the answer unproven.
+// listed. Second, a fresh read of the cluster index stands in for the
+// left-out nodes' guests, and a node where the index lists no VM that could
+// hold the disk is left out for good (see leaveOutIndexCovered). Any node
+// still left out after that is listed again with the strict retry budget,
+// which rides out a corosync blip that dropped a node whose guests kept
+// running, and the scan reads its guests' configs. Only a node that still
+// can't be read leaves the answer unproven.
 func findDiskMetadataHolders(ctx context.Context, deps Deps, rd resolvedDisk, bareDiskCID, diskCID string) ([]attachedVM, error) {
 	scan, err := findVMsHostingDisk(ctx, deps, bareDiskCID)
 	if err != nil {
@@ -229,8 +232,11 @@ func findDiskMetadataHolders(ctx context.Context, deps Deps, rd resolvedDisk, ba
 				log.String("offline_nodes", strings.Join(scan.offline, ",")))
 			return nil, nil
 		}
-		if err := scan.rescanOffline(ctx, deps, bareDiskCID, diskCID); err != nil {
-			return nil, err
+		scan.leaveOutIndexCovered(ctx, deps, diskCID)
+		if len(scan.offline) > 0 {
+			if err := scan.rescanOffline(ctx, deps, bareDiskCID, diskCID); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if err := holderScanOfflineVerdict(ctx, deps, diskCID, scan.matches, scan.offline); err != nil {
@@ -258,8 +264,8 @@ func holderScanOfflineVerdict(ctx context.Context, deps Deps, diskCID string, ma
 	switch len(matches) {
 	case 0:
 		return cpierrors.Retriable(
-			"set_disk_metadata: disk %q is not attached to a VM on any online node, and the cluster reports %s offline, so it may be attached to a VM there; metadata not persisted",
-			diskCID, strings.Join(offline, ", "),
+			"set_disk_metadata: disk %q is not attached to a VM on any online node, and the cluster reports %s offline, so it may be attached to a VM there; metadata not persisted; retry once %s is back in the cluster",
+			diskCID, strings.Join(offline, ", "), strings.Join(offline, ", "),
 		)
 	case 1:
 		deps.Log(ctx).Warn("set_disk_metadata: writing to the holder found on an online node; the ambiguity check did not cover nodes the cluster reports offline",
@@ -521,6 +527,83 @@ func (s *diskHolderScan) parkedOnOnlineNode(ctx context.Context, deps Deps, rd r
 	return attachedVM{}, false
 }
 
+// leaveOutIndexCovered drops from offline each node whose guests a fresh read
+// of the cluster index shows can't hold the disk, and logs a Warn naming it.
+// The scan calls it only when it found no holder and a node was left out, so
+// the only question left is whether a VM on that node holds the disk. The
+// node's own API can't answer while it is down, because PVE proxies every
+// read of its guests to it. pmxcfs keeps the node's guest configs on the
+// quorate side, though, so the index still lists each of its guests with its
+// node and tags.
+//
+// The scan has already accounted for every guest whose config it read, and
+// for every parker the listing marked. Every other row in the index is a guest
+// the scan didn't see. A container, a template, and a VM whose tags mark a
+// parker can't hold the disk as an ordinary VM, because the CPI attaches a
+// persistent disk only to a QEMU workload VM and a template's volumes are its
+// base images.
+// Any other unseen row on a left-out node keeps that node in offline. An
+// unseen row on a node the scan listed keeps every left-out node in offline,
+// because the row may be a guest that moved to one of them and the index
+// hasn't caught up. An index that can't be read keeps them all.
+//
+// What this leaves uncovered is a guest created on the node in the index lag
+// just before it went dark. Its cost is metadata that isn't written, with the
+// "disk not attached" warning, and BOSH writes it again on the next deploy, so
+// we accept it rather than fail every call that touches a detached disk while
+// a node is down.
+func (s *diskHolderScan) leaveOutIndexCovered(ctx context.Context, deps Deps, diskCID string) {
+	logger := deps.Log(ctx)
+	rows, err := pve.ListIndexedGuests(ctx, deps.PVE)
+	if err != nil {
+		logger.Warn("set_disk_metadata: the cluster index could not be read to cover the nodes the cluster reports offline",
+			log.String("disk_cid", diskCID), log.String("offline_nodes", strings.Join(s.offline, ",")), log.Err(err))
+		return
+	}
+	seen := map[int]bool{}
+	for vm := range s.read {
+		seen[vm.vmid] = true
+	}
+	for _, g := range s.unreadParkers {
+		seen[g.VMID] = true
+	}
+	uncovered := map[string][]int{}
+	for _, row := range rows {
+		if seen[row.VMID] || row.IsContainer() || row.Template || pve.TagsMarkParker(row.Tags) {
+			continue
+		}
+		if !slices.Contains(s.offline, row.Node) {
+			logger.Warn("set_disk_metadata: the cluster index lists a VM on an online node that the node's listing did not; "+
+				"keeping the nodes the cluster reports offline unproven",
+				log.String("disk_cid", diskCID), log.Int("vmid", row.VMID), log.String("node", row.Node),
+				log.String("offline_nodes", strings.Join(s.offline, ",")))
+			return
+		}
+		uncovered[row.Node] = append(uncovered[row.Node], row.VMID)
+	}
+	var kept []string
+	for _, node := range s.offline {
+		if vmids, ok := uncovered[node]; ok {
+			kept = append(kept, node)
+			logger.Info("set_disk_metadata: the cluster index lists VMs on a node the cluster reports offline that could hold the disk",
+				log.String("disk_cid", diskCID), log.String("node", node), log.String("vmids", joinInts(vmids)))
+			continue
+		}
+		logger.Warn("set_disk_metadata: leaving out a node the cluster reports offline; the cluster index lists no VM there that could hold the disk",
+			log.String("disk_cid", diskCID), log.String("node", node))
+	}
+	s.offline = kept
+}
+
+// joinInts renders vmids as a comma-separated list for a log field.
+func joinInts(vmids []int) string {
+	parts := make([]string, len(vmids))
+	for i, v := range vmids {
+		parts[i] = strconv.Itoa(v)
+	}
+	return strings.Join(parts, ",")
+}
+
 // rescanOffline lists the nodes the scan left out again, this time with the
 // strict retry budget, and reads their guests' configs. A corosync link that
 // drops for a few seconds gets a node reported offline while its guests keep
@@ -534,8 +617,8 @@ func (s *diskHolderScan) rescanOffline(ctx context.Context, deps Deps, bareDiskC
 	guests, err := pve.ListMemberGuests(ctx, deps.PVE, deps.Log(ctx), nodes)
 	if err != nil {
 		return cpierrors.Wrap(err, fmt.Sprintf(
-			"set_disk_metadata: disk %q is not attached to a VM on any online node, and the cluster reports %s offline, so it may be attached to a VM there; metadata not persisted",
-			diskCID, strings.Join(nodes, ", ")))
+			"set_disk_metadata: disk %q is not attached to a VM on any online node, and the cluster reports %s offline, so it may be attached to a VM there; metadata not persisted; retry once %s is back in the cluster",
+			diskCID, strings.Join(nodes, ", "), strings.Join(nodes, ", ")))
 	}
 	s.offline = nil
 	return s.scanGuests(ctx, deps, guests, bareDiskCID)
