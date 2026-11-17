@@ -136,9 +136,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		if err != nil {
 			return nil, err
 		}
-		if rebuild != nil {
-			ctx = withReplicaRebuild(ctx)
-		}
+		ctx = rebuild.marked(ctx)
 		var haAttach *attachHA
 		outer := deps
 		defer func() { operationErr = finishAttachReplica(ctx, outer, vmCID, rebuild, haAttach, operationErr) }()

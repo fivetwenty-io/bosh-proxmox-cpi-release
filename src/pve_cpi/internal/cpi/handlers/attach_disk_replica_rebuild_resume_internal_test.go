@@ -183,7 +183,7 @@ func TestPrepareAttachReplicaRebuild_VMOnANodeItsPinDoesNotName(t *testing.T) {
 	client := r.deps.PVE.(*attachRunClient)
 	stub := client.cluster.(taggedIndexStub)
 	stub.node = "pve03"
-	r.deps.PVE = &attachRunClient{lrClient: client.lrClient, cluster: stub}
+	r.deps.PVE = &attachRunClient{lrClient: client.lrClient, cluster: stub, tasks: client.tasks}
 	pin := r.pinComment()
 	rb, err := prepareAttachReplicaRebuild(crhCtx(), r.deps, "100", parkedNFSDisk())
 	if err != nil || rb != nil {
@@ -204,7 +204,7 @@ func TestPrepareAttachReplicaRebuild_VMOnItsPartnerWaitsForTheReconcile(t *testi
 	client := r.deps.PVE.(*attachRunClient)
 	stub := client.cluster.(taggedIndexStub)
 	stub.node = "pve02"
-	r.deps.PVE = &attachRunClient{lrClient: client.lrClient, cluster: stub}
+	r.deps.PVE = &attachRunClient{lrClient: client.lrClient, cluster: stub, tasks: client.tasks}
 	r.deps.HAProfile = func(context.Context) (*ha.Profile, error) {
 		return nil, cpierrors.Retriable("profile unavailable")
 	}

@@ -75,6 +75,22 @@ type attachReplicaRebuild struct {
 	vmCID   string
 	vmid    int
 	partner string
+	// removed reports whether the VM's job is gone or on its way out, so the
+	// attach's refusals must not count it. It is false for a rebuild whose
+	// job stayed and only the token is left.
+	removed bool
+}
+
+// marked returns ctx marked as the context of an attach whose replica
+// rebuild removed the VM's job (see withReplicaRebuild). A nil rebuild, and a
+// rebuild whose job stayed so that only its token is left, return ctx as it
+// is, because the job they leave in place still counts in the attach's
+// refusals.
+func (rb *attachReplicaRebuild) marked(ctx context.Context) context.Context {
+	if rb == nil || !rb.removed {
+		return ctx
+	}
+	return withReplicaRebuild(ctx)
 }
 
 // prepareAttachReplicaRebuild starts the replica rebuild of an attach of the
@@ -166,6 +182,7 @@ func prepareAttachReplicaRebuild(
 		// attach sets it up again; no token means no rebuild of this attach
 		// removed it, and nothing here sets it up.
 		if rebuilding {
+			rb.removed = true
 			return rb, nil
 		}
 		return nil, nil
@@ -175,6 +192,7 @@ func prepareAttachReplicaRebuild(
 		if err := rb.retire(ctx, deps, loc.Node, pin); err != nil {
 			return nil, err
 		}
+		rb.removed = true
 		return rb, nil
 	case candidate:
 		if err := gateReplicaRebuild(ctx, deps, logger, vmCID, vmid, loc.Node, rd); err != nil {
@@ -186,6 +204,7 @@ func prepareAttachReplicaRebuild(
 		if err := rb.retire(ctx, deps, loc.Node, pin); err != nil {
 			return nil, err
 		}
+		rb.removed = true
 		return rb, nil
 	}
 	// The job stayed, as after a removal that never reached PVE, and the disk
@@ -307,10 +326,14 @@ var errLeaveRetiresReplica = errors.New(replicaRebuildOp + ": the VM leaves HA, 
 // retire narrows the VM's pin to node with the rebuild token, then removes the
 // VM's job with cleanup, recorded in the VM's journal record first. The
 // narrowing comes first, so PVE HA never moves the VM to the partner whose
-// copy the removal deletes. A job PVE has marked for removal already is only
-// waited on. The removal is never forced, so a partner that cannot clean up
-// makes the attach retriable, and the pin keeps the token, so the retry, or a
-// call that touches the VM, finds the rebuild.
+// copy the removal deletes. A migration that started before the narrowing
+// can still be moving the VM onto that copy, so the removal waits until the
+// VM is settled on node (see replicaRebuildSettled). A VM that is not
+// settled makes the attach retriable with the job in place. A job PVE has
+// marked for removal already is only waited on. The removal is never forced,
+// so a partner that cannot clean up makes the attach retriable. Either way the
+// pin keeps the token, so the retry, or a call that touches the VM, finds the
+// rebuild.
 func (rb *attachReplicaRebuild) retire(ctx context.Context, deps Deps, node string, pin *ha.Rule) error {
 	const op = replicaRebuildOp
 	logger := deps.Log(ctx).With(log.Int(metadataKeyVMID, rb.vmid), log.String("node", node),
@@ -327,6 +350,9 @@ func (rb *attachReplicaRebuild) retire(ctx context.Context, deps Deps, node stri
 			fmt.Sprintf("%s: narrow the pin of VM %d to its source before its replication job is removed", op,
 				rb.vmid))
 	}
+	if err := replicaRebuildSettled(ctx, deps, rb.vmid, node); err != nil {
+		return err
+	}
 	logger.Warn(op + ": the VM's replication job is removed so that the disk can enter by reassignment, which PVE " +
 		"refuses into a replicated VM; the job is set up again to the same partner after the attach, and the next " +
 		"sync copies the VM in full")
@@ -340,6 +366,59 @@ func (rb *attachReplicaRebuild) retire(ctx context.Context, deps Deps, node stri
 	if err != nil {
 		return retriableUnlessPermanent(err, fmt.Sprintf("%s: remove the replication job of VM %d for the "+
 			"reassignment of its disk", op, rb.vmid))
+	}
+	return nil
+}
+
+// replicaRebuildSettled returns nil when the VM vmid is settled on node, so
+// that the removal of its job with cleanup cannot delete the copy a migration
+// is moving it onto. The VM must still be on node, hold no config lock, such
+// as the migrate lock qemu-server takes for a migration, have no move task
+// and no qmigrate task running on node, and be in a state the CRM has
+// finished acting on, which an HA migrate or relocate request is not until
+// it ends. Anything else, and a read that fails, is retriable, and the job
+// stays.
+func replicaRebuildSettled(ctx context.Context, deps Deps, vmid int, node string) error {
+	const op = replicaRebuildOp
+	deferred := func(reason string) error {
+		return cpierrors.Retriable("%s: VM %d may be migrating off node %s (%s); its replication job stays "+
+			"until the VM is settled, and the attach can be retried", op, vmid, node, reason)
+	}
+	loc, err := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+	switch {
+	case err != nil:
+		return deferred("its node could not be read: " + pve.WrapError(err).Error())
+	case !loc.Found || loc.Node != node:
+		return deferred("it runs on node " + loc.Node + " now")
+	}
+	moving, err := vmMoveInFlight(ctx, deps, vmid, node)
+	switch {
+	case err != nil:
+		return deferred(err.Error())
+	case moving:
+		return deferred("it holds a config lock or a disk move is in flight")
+	}
+	reader, ok := unguardedPVE(deps.PVE).(pve.MigrationTaskReader)
+	if !ok {
+		return deferred("the PVE client cannot list migration tasks")
+	}
+	tasks, err := reader.MigrationTasks(ctx, node, vmid, time.Now().Add(-migrationLookback))
+	if err != nil {
+		return deferred("list the migration tasks on node " + node + ": " + err.Error())
+	}
+	for _, task := range tasks {
+		if task.Running() {
+			return deferred("migration task " + task.UPID + " is running")
+		}
+	}
+	st, err := pve.ReadHAServiceState(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), pve.HAServiceStateInput{
+		VMID: vmid, VMNode: node, Kind: pve.HADecisionLive,
+	})
+	if err != nil {
+		return deferred("its HA state could not be read: " + err.Error())
+	}
+	if disposition, reason := st.Disposition(); disposition != pve.HAProceed {
+		return deferred(reason)
 	}
 	return nil
 }

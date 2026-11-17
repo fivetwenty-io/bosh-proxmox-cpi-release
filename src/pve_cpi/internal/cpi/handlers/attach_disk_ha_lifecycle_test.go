@@ -458,6 +458,12 @@ func TestManagedAttachRebuildsTheReplicaOfAVMUnderHA(t *testing.T) {
 	store.resources["vm:777"] = true
 	store.resComments["vm:777"] = marker
 	store.states["vm:777"] = "started"
+	// The CRM runs the VM on n1 and acts on no request for it, so the VM is
+	// settled there when the rebuild removes its job.
+	store.manager = func() *cluster.ListHaStatusManagerStatusResponse {
+		return HAFreshManagerStatus(time.Now().Unix(), "n1", []string{"n2"},
+			map[string]HASceneService{"vm:777": {State: "started", Node: "n1", UID: "u1"}})
+	}
 	comment := ha.WithReplicaPartner(ha.WithReplicaChanged(ha.WithVolumeRecord(marker, nil),
 		time.Now().Add(-time.Hour)), "n2")
 	nodes, strict := "n1,n2", true

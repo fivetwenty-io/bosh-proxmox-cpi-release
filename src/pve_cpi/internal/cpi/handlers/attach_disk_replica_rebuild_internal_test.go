@@ -56,7 +56,7 @@ func newRebuildRig() *replicaRig {
 	r.ownJob(1)
 	r.repl.removeOnSchedule = true
 	client := r.deps.PVE.(*attachRunClient)
-	r.deps.PVE = &attachRunClient{lrClient: client.lrClient,
+	r.deps.PVE = &attachRunClient{lrClient: client.lrClient, tasks: r.tasks,
 		cluster: taggedIndexStub{attachHAStub: r.stub, tags: func() string { return r.tags }}}
 	r.deps.Resolver = infoResolver{base: backendResolverOrDefault(r.deps),
 		info: pve.StorageInfo{Type: pve.StorageTypeNFS, Shared: true, Content: "images"}}
