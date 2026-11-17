@@ -6,11 +6,13 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 )
@@ -80,7 +82,10 @@ func newLegacyHADelete(t *testing.T, scene *handlers.HADeleteScene, node string,
 }
 
 func (d *legacyHADelete) run() error {
-	_, err := handlers.HandleDeleteVM(d.deps).Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
+	// A millisecond backoff keeps a failing assertion from waiting out the real
+	// retry curve of the HA reads.
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return time.Millisecond })
+	_, err := handlers.HandleDeleteVM(d.deps).Handle(ctx, marshalArgs("101"), jsonrpc.Context{})
 	return err
 }
 

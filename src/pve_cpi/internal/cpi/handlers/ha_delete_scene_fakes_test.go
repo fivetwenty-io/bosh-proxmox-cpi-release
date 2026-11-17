@@ -88,6 +88,9 @@ type HADeleteScene struct {
 	// a 500, the way a node in the middle of a shutdown answers once
 	// timedatectl fails. Their API keeps answering every other read.
 	BrokenClocks map[string]bool
+	// NodeNow gives a member a clock of its own, in Unix seconds, so members
+	// can disagree on the time. A member it does not name answers Now.
+	NodeNow map[string]int64
 	// IndexNode and IndexHAState are the /cluster/resources row of each VM.
 	// A VM without an index node is absent from the index.
 	IndexNode    map[int]string
@@ -164,6 +167,7 @@ func NewHADeleteScene() *HADeleteScene {
 		Power:        map[int]string{},
 		Uptime:       map[int]int64{},
 		BrokenClocks: map[string]bool{},
+		NodeNow:      map[string]int64{},
 		IndexNode:    map[int]string{},
 		IndexHAState: map[int]string{},
 		IndexLock:    map[int]string{},
@@ -771,6 +775,9 @@ type HASceneNodes struct {
 func (n *HASceneNodes) ListTime(_ context.Context, node string) (*nodes.ListTimeResponse, error) {
 	n.Scene.mu.Lock()
 	now := n.Scene.Now
+	if own, ok := n.Scene.NodeNow[node]; ok {
+		now = own
+	}
 	broken := n.Scene.BrokenClocks[node]
 	n.Scene.mu.Unlock()
 	if broken {

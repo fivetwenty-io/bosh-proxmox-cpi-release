@@ -79,3 +79,51 @@ func TestHandleDeleteVM_UnreadableClockDefersCleanlyAndRetries(t *testing.T) {
 		t.Fatal("the retry must destroy and purge the VM")
 	}
 }
+
+// TestHandleDeleteVM_VMOnTheFailingEntryNodeStillDeletes is the shape of the
+// lab's failure. The VM sits on the entry node itself, which is in HA
+// maintenance with a fresh LRM, and the entry node's own clock read fails with
+// the shutdown 500. The HA view must stay readable on a peer's clock, and the
+// delete must stop the VM through PVE HA and destroy it.
+func TestHandleDeleteVM_VMOnTheFailingEntryNodeStillDeletes(t *testing.T) {
+	t.Parallel()
+	scene := handlers.NewHADeleteScene()
+	scene.Manage(101, "pve-node1", "started", "started")
+	scene.NodeState["pve-node1"] = "maintenance"
+	scene.BrokenClocks["pve-node1"] = true
+	d := newLegacyHADelete(t, scene, "pve-node1", dlbEnabledConfig())
+
+	if err := d.run(); err != nil {
+		t.Fatalf("a VM on a failing entry node in maintenance must still delete: %v", err)
+	}
+	events := scene.EventsSnapshot()
+	stop, destroy := eventIndex(events, "UpdateHaResources:vm:101=stopped"), eventIndex(events, "DeleteQemu")
+	if stop == -1 || destroy == -1 || stop > destroy {
+		t.Fatalf("the delete must stop through PVE HA before the destroy; events: %v", events)
+	}
+	if !d.purged || !d.gone.Load() {
+		t.Fatal("the delete must destroy and purge the VM")
+	}
+}
+
+// TestHandleDeleteVM_StaleCRMOnABorrowedClockDefers checks that the delete
+// still reads the age of the CRM timestamp when the clock is borrowed. The peer
+// whose clock the read borrows runs 95 seconds ahead of the CRM's last round,
+// so the view is stale and the delete must wait without writing anything.
+func TestHandleDeleteVM_StaleCRMOnABorrowedClockDefers(t *testing.T) {
+	t.Parallel()
+	scene := handlers.NewHADeleteScene()
+	scene.Manage(101, "pve-node2", "started", "started")
+	scene.BrokenClocks["pve-node1"] = true
+	scene.NodeNow["pve-node2"] = scene.Now + 90
+	d := newLegacyHADelete(t, scene, "pve-node2", dlbEnabledConfig())
+
+	err := d.run()
+	requireHARetriable(t, err, "HA state is unknown", "CRM timestamp", "on node pve-node2's clock")
+	if events := scene.EventsSnapshot(); len(events) != 0 {
+		t.Fatalf("a deferred delete must write nothing; events: %v", events)
+	}
+	if d.gone.Load() {
+		t.Fatal("a deferred delete must leave the VM in place")
+	}
+}
