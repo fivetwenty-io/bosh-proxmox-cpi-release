@@ -692,7 +692,9 @@ func (p *aaPlanner) keptMembers(existing map[int]*ha.Rule, maxIndex int) (map[in
 // Every other member joins only when the CPI's feasibility checks find that
 // its join brings on no conflict that the rule set without it lacks, such as
 // a second member whose strict pin allows only the nodes another member's pin
-// already needs. The write that adds such a member would be refused before it
+// already needs. A rule that conflicts already takes no such member either,
+// because the writer refuses to write it whether or not the join is the
+// cause. The write that adds such a member would be refused before it
 // is sent, or would put a strict pin out of effect, so the plan leaves the
 // member out and writes the rest. Every writer of the group plans the same
 // way from the rules it reads, so none of them puts the member back while the
@@ -799,12 +801,14 @@ func (p *aaPlanner) fitMember(
 }
 
 // joinConflicts returns the feasibility conflicts that adding s to the
-// group's n-th rule, which the plan has given members so far, brings on and
-// that the rule set without s does not have, or nil when there are none. It
-// checks the rules the way the writer's check before a send does, with the
-// rule written as chunkOps writes it and with the members' pins flattened. A
-// conflict that the rules held before the join is left to that check. With
-// the configured nodes unknown it checks nothing, as the writer does.
+// group's n-th rule, which the plan has given members so far, would leave in
+// the rules, or nil when there are none. It checks the rules the way the
+// writer's check before a send does, with the rule written as chunkOps writes
+// it and with the members' pins flattened. Like that check, it counts every
+// conflict on the n-th rule itself, even one the rule had before the join,
+// because the writer refuses to write a rule that conflicts at all. On every
+// other rule it counts only a conflict that the rule set without s lacks.
+// With the configured nodes unknown it checks nothing, as the writer does.
 func (p *aaPlanner) joinConflicts(
 	set *ha.RuleSet, cur *ha.Rule, n int, members []string, s string,
 ) map[string][]string {
@@ -814,7 +818,7 @@ func (p *aaPlanner) joinConflicts(
 	name := aaChunkName(p.ident.ruleName(), n)
 	with := append(slices.Clone(members), s)
 	return ha.IntroducedConflicts(p.chunkCandidate(set, cur, name, members), p.chunkCandidate(set, cur, name, with),
-		nil, p.clusterNodes)
+		[]string{name}, p.clusterNodes)
 }
 
 // chunkCandidate returns set's rules with the rule name holding members, the
