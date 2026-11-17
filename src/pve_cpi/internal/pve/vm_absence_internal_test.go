@@ -49,7 +49,9 @@ func absLookups() map[string]func(context.Context, Client, int) (VMLocation, err
 		"FindVMAuthoritative": func(ctx context.Context, c Client, vmid int) (VMLocation, error) {
 			return FindVMAuthoritative(ctx, c, vmid)
 		},
-		"FindVMByConfigProbe": FindVMByConfigProbe,
+		"FindVMByConfigProbe": func(ctx context.Context, c Client, vmid int) (VMLocation, error) {
+			return FindVMByConfigProbe(ctx, c, vmid)
+		},
 	}
 }
 

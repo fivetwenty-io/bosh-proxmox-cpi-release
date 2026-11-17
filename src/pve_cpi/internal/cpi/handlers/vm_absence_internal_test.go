@@ -183,6 +183,42 @@ func TestHasVM_OfflineMemberWithNoTieAnswersFalse(t *testing.T) {
 	}
 }
 
+// TestLocateAfterConfigMissing_OfflineMemberFollowsTheLookupRule pins that
+// the locate a destroy's absence proof runs treats an offline member exactly
+// as has_vm's lookup does. With nothing tying VM 123 to offline pve1 and the
+// index listing it nowhere, absence is proven. With the journal's open record
+// on pve1, the same tie that keeps has_vm retriable keeps the locate
+// retriable.
+func TestLocateAfterConfigMissing_OfflineMemberFollowsTheLookupRule(t *testing.T) {
+	t.Run("no tie proves absence", func(t *testing.T) {
+		deps := offlineMemberHasVMFixture(t)
+		untied := *deps.Config
+		untied.StorageAllocationJournalDir = ""
+		deps.Config = &untied
+
+		loc, err := locateAfterConfigMissing(context.Background(), deps, "delete_vm", 123, "pve2")
+		if err != nil || loc.Found {
+			t.Fatalf("locate = (%+v, %v), want absence proven with offline pve1 excluded", loc, err)
+		}
+	})
+	t.Run("a journal tie keeps it unproven", func(t *testing.T) {
+		deps := offlineMemberHasVMFixture(t)
+
+		loc, err := locateAfterConfigMissing(context.Background(), deps, "delete_vm", 123, "pve2")
+		if err == nil || loc.Found {
+			t.Fatalf("locate = (%+v, %v), want a retriable error while the journal ties VM 123 to pve1", loc, err)
+		}
+		if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+			t.Fatalf("err = %v, want retriable", err)
+		}
+		for _, want := range []string{"allocation journal record", "pve1"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err = %q, want it to mention %q", err.Error(), want)
+			}
+		}
+	})
+}
+
 // rbfdMovedClient is rbfdClient on a two-member cluster where VM 6031's config
 // has already moved from pve01 to pve02.
 type rbfdMovedClient struct {

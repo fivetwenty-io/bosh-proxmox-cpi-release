@@ -107,14 +107,30 @@ func TestFindVMAuthoritative_OfflineTieVetoesMemberGoneOfflineMidSweep(t *testin
 	}
 }
 
-// TestFindVMByConfigProbe_MemberGoingOfflineFailsFast: the config probe never
-// excludes a member, because no index row stands in for its guests, so a
-// member the cluster begins reporting offline leaves absence unproven. The
-// call fails retriable after one probe of it and names it, instead of spending
-// the retry budget first.
-func TestFindVMByConfigProbe_MemberGoingOfflineFailsFast(t *testing.T) {
+// TestFindVMByConfigProbe_AbsentBehindMemberGoingOffline: the config probe
+// excludes a member the cluster begins reporting offline during a sweep, as
+// FindVMAuthoritative does, so the absence proof completes after one probe of
+// it once the index lists the VM nowhere.
+func TestFindVMByConfigProbe_AbsentBehindMemberGoingOffline(t *testing.T) {
 	t.Parallel()
 	c, pve1Probes := midSweepFlipClient(false)
+	loc, err := FindVMByConfigProbe(lgCtx(), c, 4123)
+	if err != nil || loc.Found {
+		t.Fatalf("loc=%+v err=%v; want absence proven with the offline member excluded", loc, err)
+	}
+	if got := pve1Probes(); got != 1 {
+		t.Fatalf("pve1 got %d probes; want one before the status shows it offline", got)
+	}
+}
+
+// TestFindVMByConfigProbe_MemberGoingOfflineWithIndexRowFailsFast: when the
+// index still lists the VM, the member that went offline leaves absence
+// unproven, and the call refuses after one probe of it instead of spending the
+// retry budget first.
+func TestFindVMByConfigProbe_MemberGoingOfflineWithIndexRowFailsFast(t *testing.T) {
+	t.Parallel()
+	c, pve1Probes := midSweepFlipClient(false)
+	c.cluster.resourcesFn = lgIndex(map[int]string{4123: "pve1"})
 	loc, err := FindVMByConfigProbe(lgCtx(), c, 4123)
 	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || loc.Found {
 		t.Fatalf("loc=%+v err=%v; want a retriable error and Found=false", loc, err)
@@ -124,6 +140,22 @@ func TestFindVMByConfigProbe_MemberGoingOfflineFailsFast(t *testing.T) {
 	}
 	if got := pve1Probes(); got != 1 {
 		t.Fatalf("pve1 got %d probes; want one before the status shows it offline", got)
+	}
+}
+
+// TestFindVMByConfigProbe_OnlineMemberKeepsProbeRetryBudget: a member the
+// cluster still reports online is merely unreachable, and it may still be
+// running the VM. It keeps the whole retry budget and is never excluded.
+func TestFindVMByConfigProbe_OnlineMemberKeepsProbeRetryBudget(t *testing.T) {
+	t.Parallel()
+	c, pve1Probes := midSweepFlipClient(false)
+	c.cluster.statusFn = lgStatus(map[string]bool{"pve1": true, "pve2": true})
+	loc, err := FindVMByConfigProbe(lgCtx(), c, 4126)
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || loc.Found {
+		t.Fatalf("loc=%+v err=%v; want a retriable probe failure", loc, err)
+	}
+	if got := pve1Probes(); got != DefaultTransientMaxAttempts {
+		t.Fatalf("pve1 got %d probes; want the full budget of %d", got, DefaultTransientMaxAttempts)
 	}
 }
 

@@ -112,13 +112,16 @@ func requireProxyTarget(ctx context.Context, deps Deps, op string, vmid int, nod
 // the stale one. So node must first be one the cluster reports able to
 // answer, and then pve.FindVMByConfigProbe sweeps every member, skipping the
 // contradicted index row. A hit is where the VM is now, and Found=false is a
-// full absence proof. Every failure, a member the cluster reports offline
-// included, is a retriable error.
+// full absence proof. The probe excludes a member the quorate cluster reports
+// offline under the same rule as findVMAuthoritative, so it needs a fresh
+// index read that lists the VM nowhere, and the journal tie may still hold the
+// VM to that member. Every failure is a retriable error.
 func locateAfterConfigMissing(ctx context.Context, deps Deps, op string, vmid int, node string) (pve.VMLocation, error) {
 	if err := requireProxyTarget(ctx, deps, op, vmid, node); err != nil {
 		return pve.VMLocation{}, err
 	}
-	loc, err := pve.FindVMByConfigProbe(ctx, deps.PVE, vmid)
+	loc, err := pve.FindVMByConfigProbe(ctx, deps.PVE, vmid,
+		pve.WithOfflineMemberTie(journalOfflineMemberTie(deps.Config)))
 	if err != nil {
 		return pve.VMLocation{}, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
 			"%s: VM %d config is gone from node %s, and locating the VM again failed", op, vmid, node))

@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +33,10 @@ type lgCluster struct {
 	// haManagerFn overrides ListHaStatusManagerStatus; nil means an idle CRM
 	// that holds no services.
 	haManagerFn func() (*sdkcluster.ListHaStatusManagerStatusResponse, error)
+	// resourcesFn overrides ListResources; nil means an empty index.
+	resourcesFn func() (*sdkcluster.ListResourcesResponse, error)
+	// resourceReads counts the ListResources calls.
+	resourceReads int
 }
 
 func (s *lgCluster) ListHaResources(
@@ -63,11 +68,26 @@ func (s *lgCluster) ListConfigNodes(_ context.Context) (*sdkcluster.ListConfigNo
 	return &resp, nil
 }
 
-// ListResources reports an empty cluster index (the lag window); tests that
-// need index rows script their own cluster fake.
+// ListResources reports an empty cluster index (the lag window) unless
+// resourcesFn scripts it.
 func (s *lgCluster) ListResources(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+	s.resourceReads++
+	if s.resourcesFn != nil {
+		return s.resourcesFn()
+	}
 	empty := sdkcluster.ListResourcesResponse{}
 	return &empty, nil
+}
+
+// lgIndex scripts the cluster index to list each VMID in rows on its node.
+func lgIndex(rows map[int]string) func() (*sdkcluster.ListResourcesResponse, error) {
+	return func() (*sdkcluster.ListResourcesResponse, error) {
+		resp := make(sdkcluster.ListResourcesResponse, 0, len(rows))
+		for vmid, node := range rows {
+			resp = append(resp, json.RawMessage(fmt.Sprintf(`{"vmid": %d, "node": %q, "type": "qemu"}`, vmid, node)))
+		}
+		return &resp, nil
+	}
 }
 
 type lgNodes struct {

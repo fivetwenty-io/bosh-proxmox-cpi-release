@@ -29,18 +29,20 @@ var ErrHAManagerHoldsService = errors.New("the HA manager still holds the servic
 // ties it. An error means the record could not be read, which leaves absence
 // unproven.
 //
-// FindVMAuthoritative consults it only when its absence proof excluded an
-// offline member, because only then does the proof rest on the index for that
-// member's guests. A guest created on the member just before it went dark has
-// no index row yet, and a record that names the member is the only evidence of
-// it the CPI can still read.
+// FindVMAuthoritative and FindVMByConfigProbe consult it only when their
+// absence proof excluded an offline member, because only then does the proof
+// rest on the index for that member's guests. A guest created on the member
+// just before it went dark has no index row yet, and a record that names the
+// member is the only evidence of it the CPI can still read.
 type OfflineMemberTie func(ctx context.Context, vmid int, offline []string) (member, detail string, err error)
 
-// FindVMOption adjusts the absence proof of FindVMAuthoritative.
+// FindVMOption adjusts the absence proof of FindVMAuthoritative and
+// FindVMByConfigProbe.
 type FindVMOption func(*findVMOptions)
 
 type findVMOptions struct {
 	offlineTies []OfflineMemberTie
+	excludedOut *[]string
 }
 
 // WithOfflineMemberTie adds a source that can withhold the offline-member
@@ -53,28 +55,48 @@ func WithOfflineMemberTie(tie OfflineMemberTie) FindVMOption {
 	}
 }
 
+// WithExcludedOfflineMembers stores in dst, sorted, the members the quorate
+// cluster reports offline that a successful absence proof excluded, and
+// leaves dst empty when it excluded none or the answer is not proven absence.
+// A caller whose own observation must be stricter than the shared rule, such
+// as one that also reads back the deletion task, can then tell an absence
+// that every member proved from one that rests on the index for some. A nil
+// dst is ignored.
+func WithExcludedOfflineMembers(dst *[]string) FindVMOption {
+	return func(o *findVMOptions) {
+		if dst != nil {
+			o.excludedOut = dst
+		}
+	}
+}
+
 // proveVMAbsent is the absence proof behind FindVMAuthoritative's miss path and
 // FindVMByConfigProbe. It returns a location as soon as any sweep finds the
 // guest, and Found=false only when every source agrees the guest is gone:
 //
-//  1. Two complete sweeps found every member answering a clean not-found. The
-//     second sweep closes the window in which a migration's config rename lands
-//     between two probes of one sweep.
+//  1. Two complete sweeps found every member answering a clean not-found,
+//     except the members the quorate cluster reports offline, which the
+//     sweeps skip. The second sweep closes the window in which a migration's
+//     config rename lands between two probes of one sweep.
 //  2. /cluster/ha/resources configures no resource for the VMID.
 //  3. The CRM's service_status holds no service for the VMID.
-//  4. When tolerateOffline excluded an offline member from the sweeps, no
-//     OfflineMemberTie ties the guest to that member.
+//  4. When the sweeps skipped an offline member, no OfflineMemberTie ties the
+//     guest to that member.
+//  5. When the sweeps skipped an offline member, an index read after the
+//     sweeps lists the VMID on no node (see requireIndexCoversOffline).
 //
-// Every source that fails to answer leaves absence unproven, and so does every
-// source that still holds the guest, so the answer is then a retriable error.
-// caller and why name the public function and the reason the index answer was
-// set aside, for the log lines and the error text.
+// Both callers share these rules, so a lookup and the absence proof that
+// follows a destroy reach the same answer for the same cluster. Every source
+// that fails to answer leaves absence unproven, and so does every source that
+// still holds the guest, so the answer is then a retriable error. caller and
+// why name the public function and the reason the index answer was set aside,
+// for the log lines and the error text.
 func proveVMAbsent(
-	ctx context.Context, c Client, vmid int, caller, why string, tolerateOffline bool, opts findVMOptions,
+	ctx context.Context, c Client, vmid int, caller, why string, opts findVMOptions,
 ) (VMLocation, error) {
 	excluded := map[string]bool{}
 	for range configProbeAbsenceSweeps {
-		loc, skipped, err := probeVMConfigs(ctx, c, vmid, caller, why, tolerateOffline)
+		loc, skipped, err := probeVMConfigs(ctx, c, vmid, caller, why)
 		if err != nil {
 			return VMLocation{}, err
 		}
@@ -111,12 +133,52 @@ func proveVMAbsent(
 				caller, vmid, why, detail, member, member, member, member)
 		}
 	}
+	if err := requireIndexCoversOffline(ctx, c, vmid, caller, why, offline); err != nil {
+		return VMLocation{}, err
+	}
 	logger := log.FromContext(ctx)
 	for _, n := range offline {
 		logger.Warn(caller+": excluded a member the cluster reports offline; absence rests on the index for its guests",
 			log.String("node", n), log.Int("vmid", vmid))
 	}
+	if opts.excludedOut != nil {
+		*opts.excludedOut = offline
+	}
 	return VMLocation{}, nil
+}
+
+// requireIndexCoversOffline returns nil when a fresh read of the
+// /cluster/resources index lists vmid on no node. The sweeps could not probe
+// the members in offline, and the index is the evidence that stands in for
+// their guests. pmxcfs keeps each VMID's config in one member's directory, the
+// quorate side keeps an offline member's files, and the index lists the guests
+// it finds there, so an index miss means no offline member holds the VMID.
+//
+// A row for the VMID on any node refuses, because a row that the probes
+// contradict on an online member may be a lagging view of a guest that moved,
+// and a row on an offline member may be the guest itself. A read that fails
+// refuses too, because it leaves the offline members' guests unexamined.
+// Either way the answer is the offline refusal, the same text whatever the
+// index said, and ConfigProbeOfflineMembers recognizes it when caller is
+// FindVMByConfigProbe. A WARN records which of the two it was.
+func requireIndexCoversOffline(ctx context.Context, c Client, vmid int, caller, why string, offline []string) error {
+	row, err := findVMRowViaCluster(ctx, c, vmid)
+	if err == nil && !row.Found {
+		return nil
+	}
+	logger := log.FromContext(ctx)
+	if err != nil {
+		logger.Warn(caller+": the cluster index could not be read to cover the members the cluster reports offline; "+
+			"absence stays unproven",
+			log.Int("vmid", vmid), log.String("offline_nodes", strings.Join(offline, ",")), log.Err(err))
+	} else {
+		logger.Warn(caller+": the cluster index still lists the VM while the cluster reports members offline; "+
+			"absence stays unproven",
+			log.Int("vmid", vmid), log.String("node", row.Node), log.String("offline_nodes", strings.Join(offline, ",")))
+	}
+	return cpierrors.Retriable(
+		"%s: VM %d %s, and the cluster reports node(s) %s offline, so their configs cannot be probed; cannot prove absence",
+		caller, vmid, why, strings.Join(offline, ","))
 }
 
 // requireNoHAHold returns nil when neither the HA resource configuration nor the

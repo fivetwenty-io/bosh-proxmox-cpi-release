@@ -455,9 +455,9 @@ var errVMAbsent = errors.New("the VM exists on no cluster member")
 // node able to answer and then sweeps every member with
 // pve.FindVMByConfigProbe, skipping the index row that was just contradicted.
 // Proven absence returns errVMAbsent, and a hit runs the read once more on
-// the node it names. Every other failure is retriable, including a member the
-// cluster reports offline, which the probe cannot read and so cannot count as
-// absent.
+// the node it names. Every other failure is retriable. A member the quorate
+// cluster reports offline counts toward absence only under the rule
+// locateAfterConfigMissing describes.
 func readAtVMNode[T any](ctx context.Context, deps Deps, op string, vmid int, node string, read func(node string) (T, error)) (T, string, error) {
 	var zero T
 	got, err := read(node)

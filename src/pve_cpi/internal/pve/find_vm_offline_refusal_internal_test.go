@@ -14,15 +14,20 @@ import (
 
 // offlineRefusalClient is a three-member cluster whose quorate status reports
 // the members in offline as offline, and whose config probe answers through
-// configFn.
+// configFn. The index still lists VMs 4120 and 4122 on pve3, so a probe that
+// excludes an offline member refuses instead of proving absence.
 func offlineRefusalClient(offline map[string]bool, configFn func(node string) (map[string]any, error)) *lgClient {
 	online := map[string]bool{}
 	for _, n := range []string{"pve1", "pve2", "pve3"} {
 		online[n] = !offline[n]
 	}
 	return &lgClient{
-		cluster: &lgCluster{nodes: []string{"pve1", "pve2", "pve3"}, statusFn: lgStatus(online)},
-		nodes:   &lgNodes{},
+		cluster: &lgCluster{
+			nodes:       []string{"pve1", "pve2", "pve3"},
+			statusFn:    lgStatus(online),
+			resourcesFn: lgIndex(map[int]string{4120: "pve3", 4122: "pve3"}),
+		},
+		nodes: &lgNodes{},
 		qemu: &mnQEMU{configFn: func(node string, _ int) (map[string]any, error) {
 			if offline[node] {
 				return nil, errors.New("an offline member must not be probed")
@@ -38,8 +43,9 @@ func offlineRefusalNotFound(string) (map[string]any, error) {
 
 // TestConfigProbeOfflineMembers_NamesTheOfflineMembersOfAProbeWithNoHit runs
 // FindVMByConfigProbe on a cluster where every member that answers says the
-// VM's config is missing and two members are offline. The refusal is the
-// offline-only one, and the classifier names both members.
+// VM's config is missing, two members are offline, and the index still lists
+// the VM. The refusal is the offline-only one, and the classifier names both
+// members.
 func TestConfigProbeOfflineMembers_NamesTheOfflineMembersOfAProbeWithNoHit(t *testing.T) {
 	t.Parallel()
 	c := offlineRefusalClient(map[string]bool{"pve2": true, "pve3": true}, offlineRefusalNotFound)

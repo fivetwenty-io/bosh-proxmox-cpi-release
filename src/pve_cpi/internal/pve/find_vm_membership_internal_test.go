@@ -10,6 +10,7 @@ package pve
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -268,41 +269,117 @@ func TestFindVMAuthoritative_AllMembersOffline_Retriable(t *testing.T) {
 // FindVMByConfigProbe absence proof
 // ---------------------------------------------------------------------------
 
-// TestFindVMByConfigProbe_OfflineMemberLeavesAbsenceUnproven is the fixture
-// where FindVMAuthoritative excludes the offline member and proves absence.
-// FindVMByConfigProbe has no index row to cover that member's guests, so the
-// same answers leave absence unproven, and the error names the member.
-func TestFindVMByConfigProbe_OfflineMemberLeavesAbsenceUnproven(t *testing.T) {
-	t.Parallel()
+// offlineMemberProbeClient is a two-member cluster whose quorate status
+// reports pve2 offline and whose pve1 answers every probe with a clean
+// not-found. The index is empty unless the test scripts it.
+func offlineMemberProbeClient() (*lgClient, *mnQEMU) {
 	q := &mnQEMU{configFn: func(node string, _ int) (map[string]any, error) {
 		if node == "pve2" {
 			return nil, errors.New("offline member must not be probed")
 		}
 		return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
 	}}
-	c := &lgClient{
+	return &lgClient{
 		cluster: &lgCluster{
 			nodes:    []string{"pve1", "pve2"},
 			statusFn: lgStatus(map[string]bool{"pve1": true, "pve2": false}),
 		},
 		nodes: &lgNodes{},
 		qemu:  q,
+	}, q
+}
+
+// TestFindVMByConfigProbe_OfflineMemberExcluded_AbsenceProven is the fixture
+// where FindVMAuthoritative excludes the offline member and proves absence.
+// FindVMByConfigProbe follows the same rule, so the same answers prove
+// absence here too, after an index read that lists the VM on no node.
+func TestFindVMByConfigProbe_OfflineMemberExcluded_AbsenceProven(t *testing.T) {
+	t.Parallel()
+	c, q := offlineMemberProbeClient()
+	loc, err := FindVMByConfigProbe(lgCtx(), c, 4113)
+	if err != nil {
+		t.Fatalf("a quorate-reported-offline member must be excluded, as FindVMAuthoritative excludes it; got: %v", err)
+	}
+	if loc.Found {
+		t.Fatalf("loc = %+v; want Found=false (absence proven on every online member)", loc)
+	}
+	if strings.Join(q.probed, ",") != "pve1,pve1" {
+		t.Fatalf("probed %v; want only the online member probed, once per sweep", q.probed)
+	}
+	if c.cluster.resourceReads != 1 {
+		t.Fatalf("index read %d time(s); want one read to cover the offline member", c.cluster.resourceReads)
+	}
+}
+
+// TestFindVMByConfigProbe_OfflineMemberIndexStillListsVM_Unproven: the index
+// stands in for the offline member's guests, so a row for the VM, on any
+// node, leaves absence unproven with the offline refusal.
+func TestFindVMByConfigProbe_OfflineMemberIndexStillListsVM_Unproven(t *testing.T) {
+	t.Parallel()
+	for _, node := range []string{"pve1", "pve2"} {
+		t.Run("row on "+node, func(t *testing.T) {
+			t.Parallel()
+			c, _ := offlineMemberProbeClient()
+			c.cluster.resourcesFn = lgIndex(map[int]string{4113: node})
+			loc, err := FindVMByConfigProbe(lgCtx(), c, 4113)
+			requireRetriableContaining(t, loc, err, "pve2")
+			if offline, ok := ConfigProbeOfflineMembers(err, 4113); !ok || !slices.Equal(offline, []string{"pve2"}) {
+				t.Fatalf("ConfigProbeOfflineMembers(%v) = %v, %t; want the offline refusal naming pve2", err, offline, ok)
+			}
+		})
+	}
+}
+
+// TestFindVMByConfigProbe_OfflineMemberIndexUnreadable_Unproven: an index
+// read that fails leaves the offline member's guests unexamined.
+func TestFindVMByConfigProbe_OfflineMemberIndexUnreadable_Unproven(t *testing.T) {
+	t.Parallel()
+	c, _ := offlineMemberProbeClient()
+	c.cluster.resourcesFn = func() (*sdkcluster.ListResourcesResponse, error) {
+		return nil, &sdkerrors.APIError{HTTPCode: 403, Message: "permission denied"}
 	}
 	loc, err := FindVMByConfigProbe(lgCtx(), c, 4113)
-	if err == nil {
-		t.Fatalf("an offline member proves nothing on the probe path; want an error, got loc=%+v", loc)
+	requireRetriableContaining(t, loc, err, "pve2")
+	if _, ok := ConfigProbeOfflineMembers(err, 4113); !ok {
+		t.Fatalf("ConfigProbeOfflineMembers(%v) did not match; want the offline refusal", err)
 	}
-	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
-		t.Fatalf("error = %v; want retriable", err)
-	}
-	if !strings.Contains(err.Error(), "pve2") || !strings.Contains(err.Error(), "FindVMByConfigProbe") {
-		t.Fatalf("the error must name the offline member and the function, got: %v", err)
-	}
-	for _, n := range q.probed {
-		if n == "pve2" {
-			t.Fatalf("probed %v; an offline member's config endpoint cannot answer and must not be probed", q.probed)
+}
+
+// TestFindVMByConfigProbe_OfflineTieVetoesExclusion: an OfflineMemberTie
+// withholds the tolerance on the probe path exactly as it does for
+// FindVMAuthoritative.
+func TestFindVMByConfigProbe_OfflineTieVetoesExclusion(t *testing.T) {
+	t.Parallel()
+	c, _ := offlineMemberProbeClient()
+	tie := func(_ context.Context, _ int, offline []string) (string, string, error) {
+		if slices.Contains(offline, "pve2") {
+			return "pve2", "a live allocation-journal record", nil
 		}
+		return "", "", nil
 	}
+	loc, err := FindVMByConfigProbe(lgCtx(), c, 4113, WithOfflineMemberTie(tie))
+	requireRetriableContaining(t, loc, err, "journal")
+	if _, ok := ConfigProbeOfflineMembers(err, 4113); ok {
+		t.Fatalf("a tie's refusal must not read as the offline refusal: %v", err)
+	}
+}
+
+// TestFindVMAuthoritative_IndexListsVMAfterSweeps_Unproven: the fast path
+// misses, and the index read after the sweeps lists the VM on the offline
+// member. FindVMAuthoritative shares the probe path's rule, so absence stays
+// unproven.
+func TestFindVMAuthoritative_IndexListsVMAfterSweeps_Unproven(t *testing.T) {
+	t.Parallel()
+	c, _ := offlineMemberProbeClient()
+	listed := lgIndex(map[int]string{4113: "pve2"})
+	c.cluster.resourcesFn = func() (*sdkcluster.ListResourcesResponse, error) {
+		if c.cluster.resourceReads == 1 {
+			return &sdkcluster.ListResourcesResponse{}, nil
+		}
+		return listed()
+	}
+	loc, err := FindVMAuthoritative(lgCtx(), c, 4113)
+	requireRetriableContaining(t, loc, err, "pve2")
 }
 
 // TestFindVMByConfigProbe_OfflineMemberDoesNotHideAHit pins that the strict
@@ -401,9 +478,10 @@ func TestFindVMByConfigProbe_AbsenceTakesTwoSweeps(t *testing.T) {
 // TestFindVMByConfigProbe_SecondSweepFailureIsRetriable pins that the second
 // sweep is held to the same rules as the first. Every member answers 404 in
 // the first sweep, and the second sweep cannot finish: in one case pve2's
-// probe fails, and in the other the quorate cluster now reports pve2
-// offline. Neither may be answered as absence, because the second sweep is
-// the one that would see a migration that landed during the first.
+// probe fails, and in the other the quorate cluster now reports pve2 offline
+// while the index lists the VM there. Neither may be answered as absence,
+// because the second sweep is the one that would see a migration that landed
+// during the first.
 func TestFindVMByConfigProbe_SecondSweepFailureIsRetriable(t *testing.T) {
 	t.Parallel()
 	notFound := &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
@@ -461,6 +539,7 @@ func TestFindVMByConfigProbe_SecondSweepFailureIsRetriable(t *testing.T) {
 			nodes: &lgNodes{},
 			qemu:  probes,
 		}
+		c.cluster.resourcesFn = lgIndex(map[int]string{4118: "pve2"})
 		loc, err := FindVMByConfigProbe(lgCtx(), c, 4118)
 		if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || loc.Found {
 			t.Fatalf("loc=%+v err=%v; want a retriable error and Found=false", loc, err)

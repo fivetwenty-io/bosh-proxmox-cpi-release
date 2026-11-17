@@ -1047,16 +1047,19 @@ func configProbeFinding(location pve.VMLocation) string {
 // deleted still has a config on another member, so the probe of every member
 // has to find it nowhere too.
 //
-// A member the quorate cluster reports offline can't answer the probe, so the
-// probe refuses and names it even when every member that answered says the
-// config is gone. That refusal alone doesn't block the observation, because
-// the deletion task proves the deletion on the node that held the holder, and
-// a VMID's config exists on one member at a time. The deletion counts as
-// observed when the task reads back as the holder's qmdestroy task on the
-// recorded node, stopped with exit status OK, the recorded node isn't among the
-// offline members, and a second probe again finds no hit and refuses for
-// offline members alone. A WARN then names those members. A hit anywhere, any
-// other probe error, and a member enumeration that fails still refuse.
+// A member the quorate cluster reports offline can't answer the probe. The
+// probe then either refuses and names the offline members, or proves absence
+// with them excluded because the cluster index lists the holder on no node.
+// Neither answer alone settles the observation, because both rest on members
+// that didn't answer, and neither blocks it, because the deletion task proves
+// the deletion on the node that held the holder, and a VMID's config exists on
+// one member at a time. The deletion counts as observed when the task reads
+// back as the holder's qmdestroy task on the recorded node, stopped with exit
+// status OK, the recorded node isn't among the offline members, and a second
+// probe again finds no hit and either refuses for offline members alone or
+// proves absence with only offline members excluded. A WARN then names those
+// members. A hit anywhere, any other probe error, and a member enumeration
+// that fails still refuse.
 func (g *managedDiskLifecycleGuard) observeHolderDeletion(
 	ctx context.Context, observation managedDiskMutationObservation,
 ) ([]string, error) {
@@ -1103,25 +1106,33 @@ func holderDeletionUnobserved(format string, args ...any) error {
 }
 
 // probeDeletedHolder probes every member's config for the holder a DeleteQemu
-// removed. It returns no members and no error when the probe proves the holder
-// absent, and the members the cluster reports offline when the probe's only
-// reason to refuse is those members. A hit, any other probe error, and an
-// offline recorded node refuse.
+// removed. It returns no members and no error when every member answered and
+// the probe proves the holder absent. It returns the members the cluster
+// reports offline when the probe excluded them from an absence proof, or when
+// its only reason to refuse is those members, so that the caller reads the
+// deletion task back before it counts the deletion as observed. A hit, any
+// other probe error, and an offline recorded node refuse.
 func (g *managedDiskLifecycleGuard) probeDeletedHolder(
 	ctx context.Context, observation managedDiskMutationObservation,
 ) ([]string, error) {
-	location, err := pve.FindVMByConfigProbe(ctx, g.lifecycle.deps.PVE, observation.vmid)
+	var excluded []string
+	location, err := pve.FindVMByConfigProbe(ctx, g.lifecycle.deps.PVE, observation.vmid,
+		pve.WithExcludedOfflineMembers(&excluded))
 	if location.Found {
 		return nil, holderDeletionUnobserved("the config probe found holder %d on node %s",
 			observation.vmid, location.Node)
 	}
-	if err == nil {
-		return nil, nil
+	offline := excluded
+	if err != nil {
+		var ok bool
+		offline, ok = pve.ConfigProbeOfflineMembers(err, observation.vmid)
+		if !ok {
+			return nil, holderDeletionUnobserved("the config probe could not prove holder %d absent: %w",
+				observation.vmid, err)
+		}
 	}
-	offline, ok := pve.ConfigProbeOfflineMembers(err, observation.vmid)
-	if !ok {
-		return nil, holderDeletionUnobserved("the config probe could not prove holder %d absent: %w",
-			observation.vmid, err)
+	if len(offline) == 0 {
+		return nil, nil
 	}
 	if slices.Contains(offline, observation.node) {
 		return nil, holderDeletionUnobserved("the cluster reports node %s, which answered for holder %d, offline",
