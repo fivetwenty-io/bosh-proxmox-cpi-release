@@ -288,6 +288,10 @@ type haEntryScope struct {
 	PeerPolicies []string
 	// Policy is this entry's own local policy.
 	Policy string
+	// AntiAffinity says whether this entry writes anti-affinity rules, and
+	// PeerAntiAffinity says the same for each peer, in the same order as Peers.
+	AntiAffinity     bool
+	PeerAntiAffinity []bool
 	// Leader is true for the first entry of its group.
 	Leader bool
 }
@@ -300,6 +304,22 @@ func (s *haEntryScope) ambiguous() bool {
 	}
 	for _, p := range s.PeerPolicies {
 		if p != s.Policy {
+			return true
+		}
+	}
+	return false
+}
+
+// antiAffinityAmbiguous reports whether the entries that share the band
+// disagree on whether they write anti-affinity rules. A group tag carries no
+// mark of the entry that stamped it, so then the doctor cannot tell which
+// groups should have a rule.
+func (s *haEntryScope) antiAffinityAmbiguous() bool {
+	if s == nil {
+		return false
+	}
+	for _, p := range s.PeerAntiAffinity {
+		if p != s.AntiAffinity {
 			return true
 		}
 	}
@@ -330,6 +350,7 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntrySco
 		key    string
 		name   string
 		policy string
+		aa     bool
 		band   pve.VMIDBand
 	}
 	all := make([]*facts, len(entries))
@@ -341,6 +362,7 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntrySco
 		band := pve.VMIDBandsFromConfig(eff).VM
 		all[i] = &facts{
 			key: eff.Host + "|" + band.String(), name: entries[i].Name, policy: eff.HALocalPolicyValue(), band: band,
+			aa: antiAffinityWritten(eff),
 		}
 	}
 	out := make([]*haEntryScope, len(entries))
@@ -348,13 +370,14 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntrySco
 		if f == nil {
 			continue
 		}
-		sc := &haEntryScope{Band: f.band, Policy: f.policy, Leader: true}
+		sc := &haEntryScope{Band: f.band, Policy: f.policy, AntiAffinity: f.aa, Leader: true}
 		for j, o := range all {
 			if o == nil || j == i || o.key != f.key {
 				continue
 			}
 			sc.Peers = append(sc.Peers, o.name)
 			sc.PeerPolicies = append(sc.PeerPolicies, o.policy)
+			sc.PeerAntiAffinity = append(sc.PeerAntiAffinity, o.aa)
 			if j < i {
 				sc.Leader = false
 			}

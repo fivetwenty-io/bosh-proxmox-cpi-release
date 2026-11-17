@@ -617,8 +617,21 @@ func (c *haCollector) ruleFindings() {
 
 // antiAffinityFindings reports each anti-affinity group that overflowed its
 // cluster, and each group with a member its rule does not name.
+//
+// Entries that share a cluster and a VM ID band stamp the same group tags, so
+// when they disagree on whether they write rules, a group with no rule may have
+// come from an entry that writes none. Such a group is left unjudged and the
+// band gets one advice. A group that has a rule was written by an entry with
+// rules on, so it is still judged. Only the first entry of the band reports.
 func (c *haCollector) antiAffinityFindings() {
-	if !c.guestsOK || !c.rulesOK || !c.antiAffinityWrites() {
+	if !c.guestsOK || !c.rulesOK {
+		return
+	}
+	mixed := c.scope.antiAffinityAmbiguous()
+	if !mixed && !c.antiAffinityWrites() {
+		return
+	}
+	if mixed && !c.scope.Leader {
 		return
 	}
 	groups := map[string][]*haGuest{}
@@ -637,8 +650,20 @@ func (c *haCollector) antiAffinityFindings() {
 		tags = append(tags, t)
 	}
 	sort.Strings(tags)
+	unjudged := false
 	for _, tag := range tags {
-		c.checkGroup(tag, groups[tag], c.groupRules(tag))
+		rules := c.groupRules(tag)
+		if mixed && len(rules) == 0 {
+			unjudged = true
+			continue
+		}
+		c.checkGroup(tag, groups[tag], rules)
+	}
+	if unjudged {
+		c.rep.advise(haKindAntiAffinityAmbiguous, c.scope.Band.String(),
+			"the cpi-config entries %s share this cluster and VM ID band and disagree on pve.ha.anti_affinity, "+
+				"so the doctor cannot tell which groups with no rule should have one and does not judge them",
+			c.scope.peerList())
 	}
 }
 
@@ -647,7 +672,12 @@ func (c *haCollector) antiAffinityFindings() {
 // scheduler-soft anti-affinity is enabled, so a cluster set up otherwise has no
 // rule to judge a group against.
 func (c *haCollector) antiAffinityWrites() bool {
-	return c.cfg.HAAntiAffinityValue() != config.HARuleOff && c.cfg.AntiAffinityEnabled()
+	return antiAffinityWritten(c.cfg)
+}
+
+// antiAffinityWritten is antiAffinityWrites for one effective config.
+func antiAffinityWritten(cfg *config.CPIConfig) bool {
+	return cfg.HAAntiAffinityValue() != config.HARuleOff && cfg.AntiAffinityEnabled()
 }
 
 // groupRules returns the rules that carry a group's name: the rule itself and

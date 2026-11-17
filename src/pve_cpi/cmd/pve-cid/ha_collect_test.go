@@ -2034,3 +2034,93 @@ func TestEntryScopesGroupEntriesByClusterAndBand(t *testing.T) {
 		t.Errorf("far scope = %+v, want no peers", got[2])
 	}
 }
+
+func TestCollectAntiAffinityAcrossEntriesThatShareABand(t *testing.T) {
+	t.Parallel()
+	tagged := "bosh-aa-0123456789ab"
+	ruled := "bosh-aa-ba9876543210"
+	f := haBaseFake()
+	f.guests = []pve.GuestRef{
+		{VMID: 200, Node: "n1", Tags: "bosh-cpi;" + tagged},
+		{VMID: 201, Node: "n2", Tags: "bosh-cpi;" + tagged},
+		{VMID: 210, Node: "n1", Tags: "bosh-cpi;" + ruled},
+		{VMID: 211, Node: "n2", Tags: "bosh-cpi;" + ruled},
+	}
+	for _, id := range []int{200, 201, 210, 211} {
+		f.memory[id] = haGiB
+	}
+	f.resources = []HAResourceRow{
+		{SID: "vm:200", State: "started"}, {SID: "vm:201", State: "started"},
+		{SID: "vm:210", State: "started"}, {SID: "vm:211", State: "started"},
+	}
+	// The second group has a rule that misses one member, the first has none.
+	f.rules = []ha.Rule{{ID: ruled, Type: "resource-affinity", Affinity: "negative", Comment: haMarker, Resources: []string{"vm:210"}}}
+	band := pve.VMIDBand{Start: 200, End: 299}
+	run := func(scope *haEntryScope, extra string) *haReport {
+		return collectHAScoped(context.Background(), f, haCfgWith("auto", "none", extra, `,"placement":{"anti_affinity":{"enabled":true}}`), "", haNow, scope)
+	}
+	on := `,"anti_affinity":"on"`
+	off := `,"anti_affinity":"off"`
+
+	// One entry, or every entry with rules on, judges both groups.
+	shortFor := func(r *haReport, group string) bool {
+		for _, fd := range r.Findings {
+			if fd.Kind == haKindAntiAffinityShort && fd.Subject == group && fd.Severity == haSeverityProblem {
+				return true
+			}
+		}
+		return false
+	}
+	r := run(nil, on)
+	if !shortFor(r, tagged) || !shortFor(r, ruled) {
+		t.Errorf("single entry must judge both groups: %+v", r.Findings)
+	}
+	wantNone(t, r, haKindAntiAffinityAmbiguous)
+	agree := &haEntryScope{Band: band, AntiAffinity: true, Peers: []string{"b"}, PeerAntiAffinity: []bool{true}, Leader: true}
+	if r = run(agree, on); !shortFor(r, tagged) || !shortFor(r, ruled) {
+		t.Errorf("agreeing entries must judge both groups: %+v", r.Findings)
+	}
+
+	// Every entry with rules off judges nothing.
+	allOff := &haEntryScope{Band: band, Peers: []string{"b"}, PeerAntiAffinity: []bool{false}, Leader: true}
+	wantNone(t, run(allOff, off), haKindAntiAffinityShort, haKindAntiAffinityAmbiguous)
+
+	// Entries that disagree cannot tell who made the group with no rule, so it
+	// gets one advice that names the peers, while the group whose rule exists
+	// but is short is still a problem.
+	mixed := &haEntryScope{Band: band, AntiAffinity: true, Peers: []string{"az2-p4"}, PeerAntiAffinity: []bool{false}, Leader: true}
+	r = run(mixed, on)
+	want(t, r, haKindAntiAffinityAmbiguous, haSeverityAdvice, band.String(), "az2-p4", "pve.ha.anti_affinity")
+	want(t, r, haKindAntiAffinityShort, haSeverityProblem, ruled, "vm:211")
+	if shortFor(r, tagged) {
+		t.Errorf("group %s has no rule and must not be judged: %+v", tagged, r.Findings)
+	}
+
+	// The rules-off leader and a non-leader report the same once, or not at all.
+	offLeader := &haEntryScope{Band: band, Peers: []string{"az2"}, PeerAntiAffinity: []bool{true}, Leader: true}
+	r = run(offLeader, off)
+	want(t, r, haKindAntiAffinityAmbiguous, haSeverityAdvice, "az2")
+	want(t, r, haKindAntiAffinityShort, haSeverityProblem, ruled, "vm:211")
+	follower := &haEntryScope{Band: band, AntiAffinity: true, Peers: []string{"az2-p4"}, PeerAntiAffinity: []bool{false}}
+	wantNone(t, run(follower, on), haKindAntiAffinityShort, haKindAntiAffinityAmbiguous)
+}
+
+func TestEntryScopesRecordWhichEntriesWriteAntiAffinityRules(t *testing.T) {
+	t.Parallel()
+	base := haCfg("auto", "none")
+	entries := []cpiConfigEntry{
+		{Name: "az2", Type: "pve", Properties: map[string]any{"pve_ha": map[string]any{"anti_affinity": "on"}}},
+		{Name: "az2-p4", Type: "pve", Properties: map[string]any{"pve_ha": map[string]any{"anti_affinity": "off"}}},
+		{Name: "far", Type: "pve", Properties: map[string]any{"pve_vmid_range_start": 5000, "pve_vmid_range_end": 5999}},
+	}
+	got := entryScopes(entries, base)
+	if !got[0].antiAffinityAmbiguous() || !got[1].antiAffinityAmbiguous() {
+		t.Errorf("scopes = %+v %+v, want both ambiguous", got[0], got[1])
+	}
+	if !got[0].AntiAffinity || got[1].AntiAffinity {
+		t.Errorf("writes = %v %v, want true false", got[0].AntiAffinity, got[1].AntiAffinity)
+	}
+	if got[2].antiAffinityAmbiguous() {
+		t.Errorf("far scope = %+v, want no disagreement", got[2])
+	}
+}
