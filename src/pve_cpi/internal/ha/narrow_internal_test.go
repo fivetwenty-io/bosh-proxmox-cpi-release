@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -526,5 +527,45 @@ func TestNarrowRevertsThePinOnlyWhenTheFailedChangeProvedUnlanded(t *testing.T) 
 				t.Fatalf("events %v, want %v", r.events, want)
 			}
 		})
+	}
+}
+
+func TestNarrowNamesTheSetAndTheFixWhenTheVMDrainsOutsideIt(t *testing.T) {
+	r := &barrierRig{state: "started", settleOn: []string{"b"}, states: []*pve.HAServiceState{
+		crm("started", 100, 90, 95),
+		crm("migrate", 110, 90, 95),
+		dropped("a", 110, 120, 125),
+		dropped("b", 110, 130, 135),
+	}}
+	_, err := NarrowActive(context.Background(), r.deps(), r.input(&pinAB, &pinA))
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("err = %v", err)
+	}
+	for _, part := range []string{"drained on node b, outside the narrower set a",
+		"its requested state is back to started under its old pin", "ha-manager migrate vm:101 a", "and retry"} {
+		if !strings.Contains(err.Error(), part) {
+			t.Fatalf("err %q lacks %q", err, part)
+		}
+	}
+}
+
+func TestNarrowNamesTheSetAndTheFixWhenTheVMLandsOutsideIt(t *testing.T) {
+	r := &barrierRig{state: "started", settleOn: []string{"a"}, states: []*pve.HAServiceState{
+		crm("started", 100, 90, 95),
+		crm("started", 110, 90, 95),
+		dropped("a", 110, 120, 125),
+	}}
+	deps := r.deps()
+	deps.Mutate = func(context.Context, pve.VMConfigMutation) (pve.VMLocation, error) {
+		return pve.VMLocation{Node: "b", Found: true}, nil
+	}
+	_, err := NarrowActive(context.Background(), deps, r.input(&pinAB, &pinA))
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("err = %v", err)
+	}
+	for _, part := range []string{"on node b, outside the narrower set a", "stays ignored", "qm migrate 101 a"} {
+		if !strings.Contains(err.Error(), part) {
+			t.Fatalf("err %q lacks %q", err, part)
+		}
 	}
 }

@@ -228,6 +228,13 @@ type VMDecision struct {
 	DLB        bool
 	Priorities map[string]int
 
+	// Outside is the hard admissible set of a VM that already runs under HA
+	// and was refused because it is placed on a node outside that set. It is
+	// nil for every other decision. Such a VM could get HA inside the set, so
+	// a caller that can move it there through PVE HA does that first, and
+	// decides again, before it takes the VM out of HA.
+	Outside []string
+
 	// Partner is the replication partner, and Widened is the node set the pin
 	// grows to once the replica is recoverable. Both are empty unless Policy is
 	// PolicyReplicate. Hard names the source alone until then.
@@ -846,6 +853,9 @@ func (e *eligibility) register(policy Policy, hard []string, reason string) {
 		return
 	}
 	if !contains(set, e.d.Node) {
+		if e.in.HAManaged {
+			e.d.Outside = append([]string{}, set...)
+		}
 		e.refuse(cpierrors.Cloud("VM %d is placed on node %s, which lies outside its hard admissible set %s",
 			e.in.VMID, e.d.Node, strings.Join(set, ",")), false)
 		return

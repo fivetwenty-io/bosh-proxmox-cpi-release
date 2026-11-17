@@ -2,6 +2,7 @@ package ha
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -115,6 +116,10 @@ type ResourceAPI interface {
 // them to a client.
 type NarrowDeps struct {
 	Resources ResourceAPI
+	// Migrate asks PVE HA to migrate the VM, which MoveIntoSet does to bring
+	// a VM that drifted outside a narrower set back into it. nil makes every
+	// such move a refusal.
+	Migrate MigrateAPI
 	// ReadState reads the VM's normalized HA state, with node as the scan's
 	// node.
 	ReadState func(ctx context.Context, vmid int, node string) (*pve.HAServiceState, error)
@@ -132,6 +137,7 @@ type NarrowDeps struct {
 func NarrowDepsFor(c pve.Client, logger *log.Logger, motionWait time.Duration) NarrowDeps {
 	return NarrowDeps{
 		Resources: c.Cluster(),
+		Migrate:   c.Cluster(),
 		ReadState: func(ctx context.Context, vmid int, node string) (*pve.HAServiceState, error) {
 			return pve.ReadHAServiceState(ctx, c.Cluster(), c.Nodes(), pve.HAServiceStateInput{
 				VMID: vmid, VMNode: node, Kind: pve.HADecisionLive,
@@ -206,6 +212,14 @@ type NarrowInput struct {
 	// error that tells the operator to clear the error.
 	Reregister func(ctx context.Context, st *pve.HAServiceState,
 		between func(ctx context.Context, node string) (pve.VMLocation, error)) (pve.VMLocation, error)
+	// MoveInto brings a VM that drained outside the narrower set back into
+	// it through PVE HA, and returns where the VM settled. node is where the
+	// VM drained, and set is the narrower set. The barrier calls it at most
+	// once, after it has put the resource's requested state back under the
+	// old pin, and then runs again from the start. nil, or a move that fails,
+	// makes the barrier return a retriable error that names the set and what
+	// an operator can do.
+	MoveInto func(ctx context.Context, node string, set []string) (pve.VMLocation, error)
 }
 
 // NarrowActive applies a change that narrows where an HA-managed VM may run,
@@ -216,8 +230,11 @@ type NarrowInput struct {
 //     service, in a CRM round newer than the request on the entry node's
 //     clock, the VM's node has an LRM report newer than that round, the VM
 //     holds no lock, and the scan names the same node. When the VM moved
-//     outside the narrower set, put back the old state under the old pin and
-//     return a retriable error.
+//     outside the narrower set, put back the old state under the old pin,
+//     have MoveInto bring the VM into the set through PVE HA, and run the
+//     barrier again from step 1. Without MoveInto, or when the move fails,
+//     return a retriable error that names the set and what an operator can
+//     do.
 //  3. Write the narrower pin and verify it.
 //  4. Run the mutation.
 //  5. Re-read the config and check volume reach and the VM's node.
@@ -297,6 +314,18 @@ type barrier struct {
 	// the error state, which is what a removed errored resource leaves until
 	// the CRM's next round drops it.
 	tolerateError bool
+	// moved is true once MoveInto has run, so a VM that drains outside the
+	// narrower set again gets the error rather than a second move.
+	moved bool
+}
+
+// drainedOutside is what drain returns when the VM settled on a node outside
+// the narrower set. The drain leaves the resource ignored, and viaIgnored
+// hands it to outside, which puts the state back and moves the VM.
+type drainedOutside struct{ node string }
+
+func (e *drainedOutside) Error() string {
+	return "the VM drained on node " + e.node + ", outside the narrower set"
 }
 
 func (b *barrier) defaults() {
@@ -390,6 +419,9 @@ func (b *barrier) viaIgnored(ctx context.Context, resumed bool) (pve.VMLocation,
 		return pve.VMLocation{}, b.restoreAfter(ctx, err)
 	}
 	loc, err := b.drain(ctx, after.EntryTime, after.Node)
+	if out := (*drainedOutside)(nil); errors.As(err, &out) {
+		return b.outside(ctx, out.node)
+	}
 	if err != nil {
 		return loc, err
 	}
@@ -507,8 +539,12 @@ func (b *barrier) checkLanding(ctx context.Context, node string) error {
 		}
 	}
 	if !b.inNarrowSet(node) {
-		return cpierrors.Retriable("ha narrow: VM %d is on node %s, outside the narrower set, after the change; "+
-			"it stays ignored", b.in.VMID, node)
+		set := b.narrowSet()
+		return cpierrors.Retriable("ha narrow: VM %d is on node %s, outside the narrower set %s, after the change, "+
+			"so its HA resource stays ignored, where PVE HA cannot move it to a node that does not reach its "+
+			"volumes. To fix it, migrate the VM to a node of %s, for example with qm migrate %d %s --online, "+
+			"and retry, so the CPI puts its HA state back", b.in.VMID, node, strings.Join(set, ","),
+			strings.Join(set, ","), b.in.VMID, firstOr(set, "<node>"))
 	}
 	return nil
 }
@@ -516,6 +552,88 @@ func (b *barrier) checkLanding(ctx context.Context, node string) error {
 func (b *barrier) inNarrowSet(node string) bool {
 	set, all := allowedNodes(b.in.NewPin)
 	return all || set[node]
+}
+
+// narrowSet returns the narrower set's nodes, sorted, and nil when the new pin
+// confines the VM to no set.
+func (b *barrier) narrowSet() []string {
+	if _, all := allowedNodes(b.in.NewPin); all {
+		return nil
+	}
+	return b.in.NewPin.NodeNames()
+}
+
+// outside handles a VM that drained on node, outside the narrower set. The
+// change has not run and the pin is still the old one, so the barrier first
+// puts back the requested state the resource had, which PVE HA needs before it
+// takes a migrate request. MoveInto then brings the VM into the set, and the
+// barrier runs again from the start with the VM there. A restore that fails, a
+// move that is not possible or fails, and a VM that drains outside the set a
+// second time each return a retriable error that names the set and what an
+// operator can do. The VM keeps its HA resource in every case.
+func (b *barrier) outside(ctx context.Context, node string) (pve.VMLocation, error) {
+	set := b.narrowSet()
+	where := strings.Join(set, ",")
+	action := fmt.Sprintf("To fix it, migrate the VM to a node of %s, for example with ha-manager migrate %s %s, "+
+		"and retry", where, b.sid, firstOr(set, "<node>"))
+	at := pve.VMLocation{Node: node, Found: true}
+	if err := b.finish(ctx); err != nil {
+		b.deps.Logger.Warn("ha narrow: the VM drained outside the narrower set, and its requested state could not "+
+			"be put back; the resource stays ignored and the next call finishes it", log.Int("vmid", b.in.VMID),
+			log.String("sid", b.sid), log.String("node", node), log.String("set", where), log.Err(err))
+		return at, narrowOutsideError(fmt.Sprintf("ha narrow: VM %d drained on node %s, outside the narrower set "+
+			"%s, so the change did not run, and its requested state %s could not be put back", b.in.VMID, node,
+			where, b.restore), err, "The HA resource stays ignored with the barrier's token until the next call "+
+			"puts it back. "+action)
+	}
+	why := ""
+	switch {
+	case b.moved:
+		why = ", after PVE HA had already moved it into the set once"
+	case b.restore != haStateStarted && b.restore != haStateStopped:
+		why = fmt.Sprintf(", and PVE HA does not migrate a resource that requests %s", b.restore)
+	case b.in.MoveInto == nil:
+		why = ""
+	default:
+		b.moved = true
+		b.deps.Logger.Info("ha narrow: the VM drained outside the narrower set, so PVE HA moves it into the set "+
+			"before the change", log.Int("vmid", b.in.VMID), log.String("sid", b.sid), log.String("node", node),
+			log.String("set", where))
+		loc, err := b.in.MoveInto(ctx, node, set)
+		if err == nil && !b.inNarrowSet(loc.Node) {
+			err = fmt.Errorf("the VM settled on node %s", loc.Node)
+		}
+		if err != nil {
+			if loc.Node == "" {
+				loc = at
+			}
+			return loc, narrowOutsideError(fmt.Sprintf("ha narrow: VM %d drained on node %s, outside the narrower "+
+				"set %s, and PVE HA did not move it into the set, so the change did not run and the VM stays under "+
+				"PVE HA with its old pin", b.in.VMID, node, where), err, action)
+		}
+		b.in.Node = loc.Node
+		return b.viaIgnored(ctx, false)
+	}
+	return at, narrowOutsideError(fmt.Sprintf("ha narrow: VM %d drained on node %s, outside the narrower set %s%s, "+
+		"so the change did not run and its requested state is back to %s under its old pin", b.in.VMID, node,
+		where, why, b.restore), nil, action)
+}
+
+// narrowOutsideError is the retriable error of a VM outside the narrower set.
+// It reads as msg, then the cause when there is one, then action.
+func narrowOutsideError(msg string, cause error, action string) error {
+	if cause == nil {
+		return cpierrors.Retriable("%s. %s", msg, action)
+	}
+	return cpierrors.WrapAs(fmt.Errorf("%w. %s", cause, action), cpierrors.TypeRetriableCloud, msg)
+}
+
+// firstOr returns the first item of list, or fallback when list is empty.
+func firstOr(list []string, fallback string) string {
+	if len(list) == 0 {
+		return fallback
+	}
+	return list[0]
 }
 
 // drain waits until the CRM has dropped the service in a round after
@@ -559,8 +677,7 @@ func (b *barrier) drain(ctx context.Context, requestTime int64, node string) (pv
 				break
 			}
 			if !b.inNarrowSet(loc.Node) {
-				return loc, b.restoreAfter(ctx, cpierrors.Retriable("ha narrow: VM %d drained on node %s, which is "+
-					"outside the narrower set; its requested state was put back under its old pin", b.in.VMID, loc.Node))
+				return loc, &drainedOutside{node: loc.Node}
 			}
 			return loc, nil
 		}
