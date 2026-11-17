@@ -152,9 +152,10 @@ func (l *localBackend) nodeForExisting(
 	corroborators := l.emptyListingCorroborators(extra)
 	if l.replicaAware && (l.info.Type == StorageTypeZFSPool || l.info.Type == "") {
 		// Only a volume that a replication job may have copied takes the
-		// replica-aware sweep. Every other volume, which includes each CPI
-		// persistent disk because a disk ID owns it, keeps the first-hit sweep
-		// below exactly as it was.
+		// replica-aware sweep. Every other volume, which includes a CPI
+		// persistent disk while a disk ID or a parker owns it, keeps the
+		// first-hit sweep below exactly as it was. A persistent disk that a
+		// reassignment named for a replicated VM takes the replica-aware sweep.
 		covered, coverErr := l.replicationMayCover(ctx, volume)
 		if covered || coverErr != nil {
 			return l.nodeForReplicatedVolume(ctx, volume, candidates, corroborators, coverErr)

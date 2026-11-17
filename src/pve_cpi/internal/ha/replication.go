@@ -779,8 +779,10 @@ func findReplicaJob(ctx context.Context, api ReplicationAPI, id string) (Replica
 // of guest copies and the gaps, the node-local volumes it leaves on the
 // source. PVE replicates a volume only when it sits on node-local ZFS pool
 // storage, is not a CD-ROM, has its replicate flag on, and is owned by the
-// guest itself (get_replicatable_volumes in qemu-server), so a persistent disk
-// the CPI names after a disk ID is a gap. A volume on shared storage needs no
+// guest itself (get_replicatable_volumes in qemu-server). A persistent disk
+// that a disk ID or a parker still owns is a gap, while one that attach_disk
+// reassigned into the guest is named for the guest and replicates with its
+// other volumes. A volume on shared storage needs no
 // copy and is in neither list. A volume on a storage the index does not hold,
 // or one that names no storage, is a gap, because nothing proves it is
 // shared. Both answers are sorted, and each gap is a sentence that names the

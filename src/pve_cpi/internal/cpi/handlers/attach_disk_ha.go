@@ -657,10 +657,11 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 // the pin before the attach with the time the decision ran, and a sync must
 // start after the change has landed, not only after it was decided. The
 // attach does not wait for a sync and never widens the pin: a later call that
-// touches the VM checks the replica. A VM that now holds a persistent disk
-// keeps the source-only pin while the disk is attached, because replication
-// does not copy a volume a disk ID owns. A pin that changed since, or a write
-// that fails, is logged, and the earlier time stays on the pin.
+// touches the VM checks the replica. A persistent disk on ZFS pool storage
+// enters a replicated VM by a reassignment that names the volume for the VM,
+// so the job copies it, and the pin names the partner again only after a
+// sync that started after this time covers it. A pin that changed since, or a
+// write that fails, is logged, and the earlier time stays on the pin.
 func (h *attachHA) restampReplica(ctx context.Context, node string) {
 	if node == "" {
 		node = h.node

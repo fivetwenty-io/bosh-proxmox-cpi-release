@@ -245,8 +245,9 @@ type replicaWiden struct {
 // error: the pin keeps the source alone and a later call that touches the VM
 // checks again. The pin stays on the source while the job is disabled or
 // marked for removal, and while the VM holds a node-local volume the job does
-// not copy, such as a persistent disk, which replication never copies because
-// a disk ID owns it. A pin that records no time of its last change gets that
+// not copy, such as one on storage other than a ZFS pool. A persistent disk on
+// a ZFS pool is no such volume once attach_disk has reassigned it into the
+// VM, because the VM then owns it and the job copies it. A pin that records no time of its last change gets that
 // time now, so a later sync can cover it. An error is a read or a write that
 // failed.
 func (w *replicaWiden) run(ctx context.Context) (bool, error) {
