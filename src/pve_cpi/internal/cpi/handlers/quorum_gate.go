@@ -21,24 +21,33 @@ import (
 // quorumLossReason). It returns "" when the client has no cluster service,
 // the read fails, or the cluster is quorate.
 func clusterLostQuorum(ctx context.Context, deps Deps, logger *log.Logger, caller string) string {
-	if deps.PVE == nil {
+	q, ok := readClusterQuorum(ctx, deps, logger, caller)
+	if !ok || !q.Lost() {
 		return ""
+	}
+	return quorumLossReason(q)
+}
+
+// readClusterQuorum reads the cluster's status once, with a single attempt,
+// and returns what it says about quorum and about the members it reports
+// offline. ok is false when the client has no cluster service or the read
+// fails, and the caller then carries on as if it knew nothing.
+func readClusterQuorum(ctx context.Context, deps Deps, logger *log.Logger, caller string) (pve.ClusterQuorum, bool) {
+	if deps.PVE == nil {
+		return pve.ClusterQuorum{}, false
 	}
 	clusterAPI := deps.PVE.Cluster()
 	if clusterAPI == nil {
-		return ""
+		return pve.ClusterQuorum{}, false
 	}
 	q, err := pve.ReadClusterQuorum(ctx, clusterAPI)
 	if err != nil {
 		if logger != nil {
 			logger.Debug(caller+": cluster status unreadable before the quorum check, carrying on", log.Err(err))
 		}
-		return ""
+		return pve.ClusterQuorum{}, false
 	}
-	if !q.Lost() {
-		return ""
-	}
-	return quorumLossReason(q)
+	return q, true
 }
 
 // quorumLossReason names the entry node that answered when the status marks
@@ -103,4 +112,13 @@ func deleteErrorWithoutQuorum(deps Deps, caller string, vmid int, err error, log
 func createQuorumError(reason string) error {
 	return cpierrors.Retriable("create_vm: the cluster has lost quorum (%s), so no node can receive a VM; "+
 		"retry once 'pvecm status' reports the cluster quorate", reason)
+}
+
+// createOfflineTargetError is the retriable error create_vm returns when the
+// status it already read reports the pinned target_node offline. Placement
+// words the same condition for a disk's home node, and PVE would otherwise
+// fail the VMID allocation on that node only after its retry budget.
+func createOfflineTargetError(node string) error {
+	return cpierrors.Retriable("create_vm: target_node %q is offline; bring the node online or remove "+
+		"target_node so placement can pick another node", node)
 }

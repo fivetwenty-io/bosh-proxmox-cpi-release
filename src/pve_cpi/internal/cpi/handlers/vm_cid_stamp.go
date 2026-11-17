@@ -26,16 +26,26 @@ import (
 // The tags are written in both vm_cid_format modes, so a later switch to
 // stamped CIDs finds every VM already tagged.
 func resolveCreateStamp(ctx context.Context, deps Deps, parsed *createVMParsedArgs, logger *log.Logger) error {
+	node := ""
+	if deps.Config != nil {
+		node = deps.Config.Node
+	}
+	return resolveCreateStampFrom(ctx, deps, parsed, logger, node)
+}
+
+// resolveCreateStampFrom is resolveCreateStamp with the node the identity
+// read tries first given. create_vm passes the entry node of the status it
+// already read when the configured node is offline, because a read that
+// starts on a node that cannot answer spends its whole time budget there.
+func resolveCreateStampFrom(
+	ctx context.Context, deps Deps, parsed *createVMParsedArgs, logger *log.Logger, node string,
+) error {
 	if parsed == nil {
 		return cpierrors.Cloud("create_vm: no parsed arguments to stamp")
 	}
 	token, err := vmcid.NewToken()
 	if err != nil {
 		return cpierrors.Wrap(err, "create_vm: generate the VM CID token")
-	}
-	node := ""
-	if deps.Config != nil {
-		node = deps.Config.Node
 	}
 	var stamp string
 	if deps.PVE == nil {
@@ -126,4 +136,20 @@ func soleTagValue(tags []string, prefix string) (string, bool) {
 		}
 	}
 	return values[0], true
+}
+
+// identityReadNode is the node create_vm's cluster identity read tries
+// first. It is the configured node, unless the status create_vm read reports
+// that node offline and names the entry node that answered, which is online
+// by construction. A status that names no entry node leaves the read to try
+// the members it enumerates, since an empty name is never tried.
+func identityReadNode(deps Deps, status pve.ClusterQuorum) string {
+	node := ""
+	if deps.Config != nil {
+		node = deps.Config.Node
+	}
+	if status.Offline[node] {
+		return status.EntryNode
+	}
+	return node
 }

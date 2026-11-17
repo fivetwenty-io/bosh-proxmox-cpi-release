@@ -639,9 +639,14 @@ func createVM(
 	}
 
 	// A cluster without quorum refuses every write, so no node can receive a
-	// VM. The status is read once, here, before the first write. A status
-	// read that fails, or a standalone host, carries on.
-	quorumLoss := clusterLostQuorum(ctx, deps, logger, "create_vm")
+	// VM. The status is read once, here, before the first write, and the
+	// same read tells which members are offline. A status read that fails,
+	// or a standalone host, carries on.
+	status, statusKnown := readClusterQuorum(ctx, deps, logger, "create_vm")
+	quorumLoss := ""
+	if statusKnown && status.Lost() {
+		quorumLoss = quorumLossReason(status)
+	}
 
 	// Drain the queue of disposals an earlier request could not finish: VMs
 	// tagged bosh-deleting, and failed or abandoned creates whose birth tag
@@ -657,7 +662,9 @@ func createVM(
 	// The cluster stamp and token are settled once, ahead of placement and of
 	// the journal resume, because every candidate shape carries the same
 	// stamp tags and the spread claim below is scoped by the stamp.
-	if err := resolveCreateStamp(ctx, deps, parsed, logger); err != nil {
+	// The identity read tries the configured node first, so it starts on the
+	// entry node of the status read above when the configured node is offline.
+	if err := resolveCreateStampFrom(ctx, deps, parsed, logger, identityReadNode(deps, status)); err != nil {
 		return nil, err
 	}
 	// A create that places an instance group's VM claims its node, so its
@@ -682,6 +689,13 @@ func createVM(
 	if quorumLoss != "" {
 		logger.Warn("create_vm: " + quorumLoss + ", so no node can receive a VM")
 		return nil, createQuorumError(quorumLoss)
+	}
+	// A pinned target_node that the same status reports offline fails here
+	// too, in place of the VMID allocation, which retries its reads on that
+	// node until its budget runs out and then reports a bare gateway error.
+	if target := strings.TrimSpace(parsed.cloudProps.TargetNode); target != "" && status.Offline[target] {
+		logger.Warn("create_vm: target_node " + target + " is offline, so no VM can be created on it")
+		return nil, createOfflineTargetError(target)
 	}
 
 	// Placement may build the VM's shape once per candidate node, so the
