@@ -110,7 +110,10 @@ func TestInspectVMIndexLockCancellation(t *testing.T) {
 }
 func TestInspectVMConcurrentCreateDeleteSnapshots(t *testing.T) {
 	j, _ := fixture(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The deadline only guards against a hang. The writer makes ten fsync-bound
+	// saves while three readers hold the shared lock, so a tight budget measures
+	// runner load and not whether the writer finishes once the readers stop.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	start := make(chan struct{})
 	writerDone := make(chan error, 1)
