@@ -91,7 +91,7 @@ jobs:
       # Built from ci/Dockerfile by .github/workflows/ci-image.yml. Pinned by
       # digest the way the other workflows pin golang:1.27; update the pin
       # from the digest a ci-image.yml run prints after a Dockerfile change.
-      image: ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci@sha256:ed1c2b00891965fc1a60d4ad2fbb2b772603536764adf3b3a7a421bb34193b85
+      image: ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci@sha256:29400a8878ed8012c49c16eb7d721ac294c0919995ba01377768b53a7d4c8d73
       # Host-path caches follow the gha-container-cache pattern from ci.yml.
       # gha-lab-state-certification is DIFFERENT in kind: it is the
       # certification Director's slot (BOSH_STATE_DIR below), holding that

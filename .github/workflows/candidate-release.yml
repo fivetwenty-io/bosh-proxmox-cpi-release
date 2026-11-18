@@ -29,7 +29,7 @@ jobs:
       contents: read
       packages: read
     container:
-      image: ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci@sha256:ed1c2b00891965fc1a60d4ad2fbb2b772603536764adf3b3a7a421bb34193b85
+      image: ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci@sha256:29400a8878ed8012c49c16eb7d721ac294c0919995ba01377768b53a7d4c8d73
     defaults:
       run:
         shell: bash
