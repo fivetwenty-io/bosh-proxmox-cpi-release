@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-18
+
 ### Changed
 
 - The CPI now writes and reads endpoint down marks whenever a usable cache directory exists, whatever the discovery mode. Before, a call with discovery off, which includes `auto` with more than one endpoint in `pve.endpoints`, wrote no marks, so every CPI process spent one dial timeout on a dead endpoint before it failed over. Now the first process that meets the dead endpoint writes a mark, and later processes start on a live endpoint for the next two minutes. A call with discovery off records marks and nothing else, so it never writes a discovered node list, pins, or a cold-start hint. A mark has the same file mode, lock, expiry, and scope as before, and it only moves the endpoint to the end of the walk. When no usable cache directory exists, or the pool holds a single endpoint, the call writes no file and logs nothing new. [Endpoint Failover and Discovery](docs/endpoint-failover.md) describes the marks.
@@ -1239,7 +1241,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.3...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.3...v0.11.0
 [0.10.3]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.0...v0.10.1
