@@ -22,8 +22,13 @@ The [BOSH CPI certification](https://github.com/cloudfoundry/bosh-cpi-certificat
 |---|---|---|---|---|---|
 | 2026-11-17 | PASSED | 0.10.3 to candidate.tgz | 0 | 1h08m34s | [runs/2026-11-17-232331.md](runs/2026-11-17-232331.md) |
 | 2026-11-12 | PASSED | 0.9.7 to candidate.tgz | 0 | 1h08m27s | [runs/2026-11-12-143642.md](runs/2026-11-12-143642.md) |
+| 2026-11-12 | FAILED | 0.9.7 to candidate.tgz | 1 | 5m45s | [runs/2026-11-12-092001.md](runs/2026-11-12-092001.md) |
+| 2026-11-12 | PASSED | 0.9.6 to candidate.tgz | 0 | 1h03m40s | [runs/2026-11-12-023352.md](runs/2026-11-12-023352.md) |
+| 2026-11-12 | FAILED | 0.9.6 to candidate.tgz | 1 | 36m18s | [runs/2026-11-12-011240.md](runs/2026-11-12-011240.md) |
 | 2026-11-07 | PASSED | 0.9.4 to 0.9.5 | 0 | 1h07m12s | [runs/2026-11-07-023135.md](runs/2026-11-07-023135.md) |
 | 2026-11-02 | PASSED | 0.9.5 to candidate.tgz | 0 | 1h10m20s | [runs/2026-11-02-220122.md](runs/2026-11-02-220122.md) |
+| 2026-10-31 | PASSED | 0.9.4 to 0.9.5 | 0 | 1h17m49s | [runs/2026-10-31-023328.md](runs/2026-10-31-023328.md) |
+| 2026-10-24 | PASSED | 0.9.4 to 0.9.5 | 0 | 1h07m45s | [runs/2026-10-24-023946.md](runs/2026-10-24-023946.md) |
 | 2026-10-20 | PASSED | 0.9.4 to candidate.tgz | 0 | 1h06m26s | [runs/2026-10-20-195650.md](runs/2026-10-20-195650.md) |
 | 2026-10-19 | PASSED | 0.9.4 to candidate.tgz | 0 | 1h03m41s | [runs/2026-10-19-163817.md](runs/2026-10-19-163817.md) |
 | 2026-10-17 | PASSED | 0.9.3 to 0.9.4 | 0 | 1h01m08s | [runs/2026-10-17-023845.md](runs/2026-10-17-023845.md) |
