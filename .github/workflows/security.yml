@@ -33,7 +33,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     container:
       # Digest-pinned golang:1.27 (self-hosted runner has no build tools on the host)
-      image: golang:1.27@sha256:08bcb99a38f85a265f9a93d1d3323e2440eec333380f3ea26ee0dec9264bb41c
+      image: golang:1.27@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf
       # The container filesystem is fresh on every job, so the Go module and
       # build caches would start cold. These are host paths rather than the
       # Actions cache service: on a persistent self-hosted runner, restoring a
@@ -84,10 +84,10 @@ jobs:
           cache: false
 
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
 
       - name: Install gosec
-        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.30.0
 
       - name: Install trivy
         # SHA-pinned: upstream deletes old tags (v0.2.0 vanished and broke scheduled runs)

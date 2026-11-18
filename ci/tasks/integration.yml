@@ -66,15 +66,15 @@ run:
       # remove this block and update image_resource accordingly.
       #
       # Pinned versions:
-      #   bosh-cli   7.11.1  (same as ci/Dockerfile)
+      #   bosh-cli   7.11.2  (same as ci/Dockerfile)
       #   cf-cli     8.x     (CF Foundry maintained apt repo)
-      #   credhub    2.9.62  (same as ci/Dockerfile)
+      #   credhub    2.9.64  (same as ci/Dockerfile)
       #   uv         0.4.x   (astral-sh installer; latest stable)
       #   jq         1.7.x   (ubuntu 24.04 repo)
       #   curl, make, ca-certificates shipped with ubuntu base layer
       # ---------------------------------------------------------------
-      BOSH_CLI_VERSION="7.11.1"
-      CREDHUB_CLI_VERSION="2.9.62"
+      BOSH_CLI_VERSION="7.11.2"
+      CREDHUB_CLI_VERSION="2.9.64"
 
       apt-get update -qq
       apt-get install -y --no-install-recommends \

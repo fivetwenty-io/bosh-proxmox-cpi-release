@@ -50,7 +50,7 @@ jobs:
     timeout-minutes: 45
     container:
       # Digest-pinned golang:1.27 (self-hosted runner has no build tools on the host)
-      image: golang:1.27@sha256:08bcb99a38f85a265f9a93d1d3323e2440eec333380f3ea26ee0dec9264bb41c
+      image: golang:1.27@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf
       # The container filesystem is fresh on every job, so the Go module and
       # build caches would start cold. These are host paths rather than the
       # Actions cache service: on a persistent self-hosted runner, restoring a
@@ -75,12 +75,12 @@ jobs:
       # default GOCACHE would land there -- inside _work/_temp, wiped between
       # jobs and outside the mount above. Point it at the mounted path.
       GOCACHE: /root/.cache/go-build
-      BOSH_CLI_VERSION: "7.11.1"
-      # sha256 of bosh-cli-7.11.1-linux-amd64 from cloudfoundry/bosh-cli releases
-      BOSH_CLI_SHA256: "91dfeff2b222eadadbd9a17bf074bf5ece36d39c9b4f592a3b4f3c1f57534df2"
-      GH_CLI_VERSION: "2.102.0"
-      # sha256 of gh_2.102.0_linux_amd64.tar.gz from cli/cli releases
-      GH_CLI_SHA256: "bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386"
+      BOSH_CLI_VERSION: "7.11.2"
+      # sha256 of bosh-cli-7.11.2-linux-amd64 from cloudfoundry/bosh-cli releases
+      BOSH_CLI_SHA256: "839a92403901639e0e1f3130e4138c912bfd217bd1579277048fcd6bf5dee28c"
+      GH_CLI_VERSION: "2.105.0"
+      # sha256 of gh_2.105.0_linux_amd64.tar.gz from cli/cli releases
+      GH_CLI_SHA256: "79e7ab5db738c48777b696e374f8b428f0647debfb424f44d2f426370407fe2f"
 
     steps:
       - name: Checkout

@@ -12,6 +12,12 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Changed
+
+- Third-party Go dependencies are refreshed to their latest releases, including the AWS SDK for Go v2 modules behind the S3 stemcell fetcher, the Proxmox SDK at proxmox-apiclient-go v3.13.2, gRPC at v1.85.0, and `golang.org/x/net`, `golang.org/x/sync`, `golang.org/x/sys`, and `golang.org/x/text`. No direct dependency has a newer major version, and none is archived or deprecated.
+
+- The CI tooling moves to the latest releases, which means govulncheck v1.10.0, gosec v2.30.0, bosh CLI 7.11.2, gh 2.105.0, credhub CLI 2.9.64, and uv 0.13.9. The workflows also pin the current digest of the `golang:1.27` image, which still holds Go 1.27.4.
+
 ## [0.11.0] - 2026-11-18
 
 ### Changed
