@@ -20,12 +20,12 @@ import (
 
 func TestSetupLogs_Disabled_NoopHandlerAndShutdown(t *testing.T) {
 	logger := log.NewNopLogger()
+	collector := newSilentCollector(t)
 	cfg := config.OTelConfig{
 		LogsEnabled:          false,
-		LogsExporterEndpoint: "127.0.0.1:1", // reserved/unassigned port; must never be dialed
+		LogsExporterEndpoint: collector.addr, // must never be dialed
 	}
 
-	start := time.Now()
 	handler, shutdown, err := SetupLogs(context.Background(), cfg, logger)
 	if err != nil {
 		t.Fatalf("SetupLogs returned error for disabled config: %v", err)
@@ -39,9 +39,8 @@ func TestSetupLogs_Disabled_NoopHandlerAndShutdown(t *testing.T) {
 	if err := shutdown(context.Background()); err != nil {
 		t.Fatalf("no-op shutdown returned error: %v", err)
 	}
-	elapsed := time.Since(start)
-	if elapsed > 200*time.Millisecond {
-		t.Fatalf("disabled SetupLogs+shutdown took %v, want near-instant (no network dial)", elapsed)
+	if n := collector.contacts(); n != 0 {
+		t.Fatalf("disabled SetupLogs+shutdown connected to the collector %d time(s), want none", n)
 	}
 }
 
@@ -202,16 +201,20 @@ func TestSetupLogs_Enabled_UnreachableEndpoint_DoesNotBlock(t *testing.T) {
 	for _, protocol := range []string{"http", "grpc"} {
 		t.Run(protocol, func(t *testing.T) {
 			logger := log.NewNopLogger()
+			collector := newSilentCollector(t)
 			cfg := config.OTelConfig{
 				LogsEnabled:          true,
 				Protocol:             protocol,
-				LogsExporterEndpoint: "127.0.0.1:1", // reserved/unassigned port, refuses connections
+				LogsExporterEndpoint: collector.addr, // accepts connections and never answers
 				Insecure:             true,
 				ServiceName:          "svc",
 			}
 
+			ctx, cancel := context.WithTimeout(context.Background(), lazyDialCtxTimeout)
+			defer cancel()
+
 			start := time.Now()
-			handler, shutdown, err := SetupLogs(context.Background(), cfg, logger)
+			handler, shutdown, err := SetupLogs(ctx, cfg, logger)
 			if err != nil {
 				t.Fatalf("SetupLogs returned error for unreachable endpoint: %v", err)
 			}
@@ -219,8 +222,8 @@ func TestSetupLogs_Enabled_UnreachableEndpoint_DoesNotBlock(t *testing.T) {
 				t.Fatal("SetupLogs returned nil handler/shutdown for unreachable-endpoint config")
 			}
 			elapsed := time.Since(start)
-			if elapsed > 200*time.Millisecond {
-				t.Fatalf("SetupLogs against unreachable endpoint took %v, want near-instant (lazy dial)", elapsed)
+			if elapsed > lazyDialBound {
+				t.Fatalf("SetupLogs against a silent collector took %v, want under %v (lazy dial)", elapsed, lazyDialBound)
 			}
 		})
 	}

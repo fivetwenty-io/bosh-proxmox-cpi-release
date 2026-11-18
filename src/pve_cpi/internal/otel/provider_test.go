@@ -23,9 +23,9 @@ import (
 
 func TestSetup_Disabled_NoopTracerAndShutdown(t *testing.T) {
 	logger := log.NewNopLogger()
-	cfg := config.OTelConfig{Enabled: false}
+	collector := newSilentCollector(t)
+	cfg := config.OTelConfig{Enabled: false, ExporterEndpoint: collector.addr}
 
-	start := time.Now()
 	tracer, shutdown, err := Setup(context.Background(), cfg, logger)
 	if err != nil {
 		t.Fatalf("Setup returned error for disabled config: %v", err)
@@ -43,9 +43,8 @@ func TestSetup_Disabled_NoopTracerAndShutdown(t *testing.T) {
 	if err := shutdown(context.Background()); err != nil {
 		t.Fatalf("no-op shutdown returned error: %v", err)
 	}
-	elapsed := time.Since(start)
-	if elapsed > 200*time.Millisecond {
-		t.Fatalf("disabled Setup+shutdown took %v, want near-instant (no network dial)", elapsed)
+	if n := collector.contacts(); n != 0 {
+		t.Fatalf("disabled Setup+shutdown connected to the collector %d time(s), want none", n)
 	}
 }
 
@@ -55,12 +54,12 @@ func TestSetup_Disabled_NoopTracerAndShutdown(t *testing.T) {
 // error/hang if actually contacted.
 func TestSetup_Disabled_ImpossibleEndpoint_NeverDials(t *testing.T) {
 	logger := log.NewNopLogger()
+	collector := newSilentCollector(t)
 	cfg := config.OTelConfig{
 		Enabled:          false,
-		ExporterEndpoint: "127.0.0.1:1", // reserved/unassigned port, refuses connections
+		ExporterEndpoint: collector.addr,
 	}
 
-	start := time.Now()
 	tracer, shutdown, err := Setup(context.Background(), cfg, logger)
 	if err != nil {
 		t.Fatalf("Setup returned error for disabled config: %v", err)
@@ -72,9 +71,8 @@ func TestSetup_Disabled_ImpossibleEndpoint_NeverDials(t *testing.T) {
 	if err := shutdown(context.Background()); err != nil {
 		t.Fatalf("no-op shutdown returned error: %v", err)
 	}
-	elapsed := time.Since(start)
-	if elapsed > 200*time.Millisecond {
-		t.Fatalf("disabled Setup with impossible endpoint took %v, want near-instant (no dial attempted)", elapsed)
+	if n := collector.contacts(); n != 0 {
+		t.Fatalf("disabled Setup connected to the collector %d time(s), want none", n)
 	}
 }
 
@@ -542,18 +540,22 @@ func TestGRPCExporterOptionsFor_MalformedURLScheme_Errors(t *testing.T) {
 
 func TestSetup_Enabled_Grpc_LazyDial_NonBlocking(t *testing.T) {
 	logger := log.NewNopLogger()
+	collector := newSilentCollector(t)
 	cfg := config.OTelConfig{
 		Enabled:          true,
 		Protocol:         "grpc",
-		ExporterEndpoint: "127.0.0.1:1", // reserved/unassigned port, refuses connections
+		ExporterEndpoint: collector.addr, // accepts connections and never answers
 		Insecure:         true,
 		ServiceName:      "svc",
 		SampleRatio:      1.0,
 		ExportTimeoutMs:  5000,
 	}
 
+	ctx, cancelSetup := context.WithTimeout(context.Background(), lazyDialCtxTimeout)
+	defer cancelSetup()
+
 	start := time.Now()
-	tracer, shutdown, err := Setup(context.Background(), cfg, logger)
+	tracer, shutdown, err := Setup(ctx, cfg, logger)
 	if err != nil {
 		t.Fatalf("Setup returned error for grpc protocol: %v", err)
 	}
@@ -561,8 +563,8 @@ func TestSetup_Enabled_Grpc_LazyDial_NonBlocking(t *testing.T) {
 		t.Fatal("Setup returned nil tracer/shutdown for grpc protocol")
 	}
 	elapsed := time.Since(start)
-	if elapsed > 200*time.Millisecond {
-		t.Fatalf("grpc Setup took %v, want near-instant (otlptracegrpc.New dials lazily, never blocks)", elapsed)
+	if elapsed > lazyDialBound {
+		t.Fatalf("grpc Setup against a silent collector took %v, want under %v (otlptracegrpc.New dials lazily, never blocks)", elapsed, lazyDialBound)
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

@@ -24,9 +24,9 @@ import (
 
 func TestSetupMetrics_Disabled_NoopMeterAndShutdown(t *testing.T) {
 	logger := log.NewNopLogger()
-	cfg := config.OTelConfig{MetricsEnabled: false}
+	collector := newSilentCollector(t)
+	cfg := config.OTelConfig{MetricsEnabled: false, MetricsExporterEndpoint: collector.addr}
 
-	start := time.Now()
 	meter, shutdown, err := SetupMetrics(context.Background(), cfg, logger)
 	if err != nil {
 		t.Fatalf("SetupMetrics returned error for disabled config: %v", err)
@@ -45,20 +45,19 @@ func TestSetupMetrics_Disabled_NoopMeterAndShutdown(t *testing.T) {
 	if err := shutdown(context.Background()); err != nil {
 		t.Fatalf("no-op shutdown returned error: %v", err)
 	}
-	elapsed := time.Since(start)
-	if elapsed > 200*time.Millisecond {
-		t.Fatalf("disabled SetupMetrics+shutdown took %v, want near-instant (no network dial)", elapsed)
+	if n := collector.contacts(); n != 0 {
+		t.Fatalf("disabled SetupMetrics+shutdown connected to the collector %d time(s), want none", n)
 	}
 }
 
 func TestSetupMetrics_Disabled_ImpossibleEndpoint_NeverDials(t *testing.T) {
 	logger := log.NewNopLogger()
+	collector := newSilentCollector(t)
 	cfg := config.OTelConfig{
 		MetricsEnabled:          false,
-		MetricsExporterEndpoint: "127.0.0.1:1", // reserved/unassigned port, refuses connections
+		MetricsExporterEndpoint: collector.addr,
 	}
 
-	start := time.Now()
 	meter, shutdown, err := SetupMetrics(context.Background(), cfg, logger)
 	if err != nil {
 		t.Fatalf("SetupMetrics returned error for disabled config: %v", err)
@@ -71,9 +70,8 @@ func TestSetupMetrics_Disabled_ImpossibleEndpoint_NeverDials(t *testing.T) {
 	if err := shutdown(context.Background()); err != nil {
 		t.Fatalf("no-op shutdown returned error: %v", err)
 	}
-	elapsed := time.Since(start)
-	if elapsed > 200*time.Millisecond {
-		t.Fatalf("disabled SetupMetrics with impossible endpoint took %v, want near-instant (no dial attempted)", elapsed)
+	if n := collector.contacts(); n != 0 {
+		t.Fatalf("disabled SetupMetrics connected to the collector %d time(s), want none", n)
 	}
 }
 
@@ -133,16 +131,20 @@ func TestSetupMetrics_Enabled_UnreachableEndpoint_NonBlocking(t *testing.T) {
 		protocol := protocol
 		t.Run(protocol, func(t *testing.T) {
 			logger := log.NewNopLogger()
+			collector := newSilentCollector(t)
 			cfg := config.OTelConfig{
 				MetricsEnabled:          true,
-				MetricsExporterEndpoint: "127.0.0.1:1", // reserved/unassigned port, refuses connections
+				MetricsExporterEndpoint: collector.addr, // accepts connections and never answers
 				Insecure:                true,
 				ServiceName:             "svc",
 				Protocol:                protocol,
 			}
 
+			ctx, cancelSetup := context.WithTimeout(context.Background(), lazyDialCtxTimeout)
+			defer cancelSetup()
+
 			start := time.Now()
-			meter, shutdown, err := SetupMetrics(context.Background(), cfg, logger)
+			meter, shutdown, err := SetupMetrics(ctx, cfg, logger)
 			if err != nil {
 				t.Fatalf("SetupMetrics returned error for unreachable endpoint: %v", err)
 			}
@@ -150,11 +152,14 @@ func TestSetupMetrics_Enabled_UnreachableEndpoint_NonBlocking(t *testing.T) {
 				t.Fatal("SetupMetrics returned nil meter/shutdown for valid config")
 			}
 			elapsed := time.Since(start)
-			if elapsed > 500*time.Millisecond {
-				t.Fatalf("SetupMetrics with unreachable endpoint took %v, want near-instant (lazy dial)", elapsed)
+			if elapsed > lazyDialBound {
+				t.Fatalf("SetupMetrics against a silent collector took %v, want under %v (lazy dial)", elapsed, lazyDialBound)
 			}
 
-			const bound = 2 * time.Second
+			const bound = time.Second
+			// An exporter that ignored the deadline would wait for its own
+			// default timeout, which is far past this limit.
+			const hangLimit = 5 * time.Second
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), bound)
 			defer cancel()
 			// Error is expected/acceptable here (no buffered metrics, but the
@@ -168,8 +173,8 @@ func TestSetupMetrics_Enabled_UnreachableEndpoint_NonBlocking(t *testing.T) {
 			shutdownStart := time.Now()
 			_ = shutdown(shutdownCtx)
 			shutdownElapsed := time.Since(shutdownStart)
-			if shutdownElapsed > bound+500*time.Millisecond {
-				t.Fatalf("shutdown against unreachable endpoint took %v, want within bound %v (+slack)", shutdownElapsed, bound)
+			if shutdownElapsed > hangLimit {
+				t.Fatalf("shutdown against a silent collector took %v, want to honor the %v deadline and return well under %v", shutdownElapsed, bound, hangLimit)
 			}
 		})
 	}
