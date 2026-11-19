@@ -80,12 +80,30 @@ const rollbackDestroyMaxAttempts = 5
 // bounded by d, plus the cancel the caller must defer. It replaces bare
 // context.WithoutCancel for cleanup paths: detachment without a bound turns
 // every hung PVE call into an unbounded stall (see rollbackCleanupTimeout).
+// The context it returns carries a mark that detachedFromRequest reads, so
+// work the request defers past its end can tell it apart from the request's
+// own context, although both have a Done channel.
 func detachedContext(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
 	base := context.Background()
 	if parent != nil {
-		base = context.WithoutCancel(parent)
+		base = context.WithValue(context.WithoutCancel(parent), detachedFromRequestKey{}, true)
 	}
 	return context.WithTimeout(base, d)
+}
+
+// detachedFromRequestKey marks a context detachedContext detached from the
+// request's cancellation.
+type detachedFromRequestKey struct{}
+
+// detachedFromRequest reports whether ctx is free of the request's
+// cancellation, either because nothing can cancel it or because
+// detachedContext, finishingContext, or closingContext detached it.
+func detachedFromRequest(ctx context.Context) bool {
+	if ctx.Done() == nil {
+		return true
+	}
+	detached, _ := ctx.Value(detachedFromRequestKey{}).(bool)
+	return detached
 }
 
 // finishingContext returns the context for work that must finish once it has

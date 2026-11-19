@@ -82,7 +82,7 @@ func retireEmptiedParker(ctx context.Context, deps Deps, node string, vmid int, 
 		return
 	}
 	if q, ok := ctx.Value(retirementQueueKey{}).(*retirementQueue); ok && q != nil {
-		q.add(queuedRetirement{deps: deps, node: node, vmid: vmid, trigger: trigger, keepGoing: ctx.Done() == nil})
+		q.add(queuedRetirement{deps: deps, node: node, vmid: vmid, trigger: trigger, keepGoing: detachedFromRequest(ctx)})
 		return
 	}
 	(*retireEmptiedParkerImpl.Load())(ctx, deps, node, vmid, trigger)
@@ -99,12 +99,15 @@ type queuedRetirement struct {
 	vmid    int
 	trigger string
 	// keepGoing is set when the path called the retirement on a context free
-	// of the request's cancellation, as create_disk's rollback does, so the
-	// drain runs it free of that cancellation too.
+	// of the request's cancellation (detachedFromRequest), as create_disk's
+	// rollback and every caller on a detachedContext or finishingContext do,
+	// so the drain runs it free of that cancellation too.
 	keepGoing bool
 }
 
 // retirementQueue holds the retirements a handler deferred, each parker once.
+// A parker queued twice keeps its first entry, which runs free of the
+// request's cancellation when either caller's context was.
 type retirementQueue struct {
 	mu      sync.Mutex
 	pending []queuedRetirement
@@ -115,6 +118,7 @@ func (q *retirementQueue) add(e queuedRetirement) {
 	defer q.mu.Unlock()
 	for i := range q.pending {
 		if q.pending[i].node == e.node && q.pending[i].vmid == e.vmid {
+			q.pending[i].keepGoing = q.pending[i].keepGoing || e.keepGoing
 			return
 		}
 	}
