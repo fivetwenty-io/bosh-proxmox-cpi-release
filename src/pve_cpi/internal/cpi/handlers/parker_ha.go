@@ -98,6 +98,11 @@ const parkerRetireCaller = "parker retirement"
 // nothing more, and any other refusal of an unregistered parker is decided
 // before a claim is taken, because it writes nothing. At most one parker is
 // retired per pass, and the others wait for the next sweep.
+//
+// Under a handler's retirement queue (deferParkerRetirements), the pass
+// retires nothing and proves no leftover itself. It queues the retirement and
+// the node's leftover removal, and the handler's drain runs them once every
+// gate and lock the handler took is released.
 func reconcileParkerHA(ctx context.Context, deps Deps, node string, cfg pve.ParkerConfig) {
 	r, ok := newParkerHAPass(ctx, deps, node, cfg)
 	if !ok {
@@ -128,9 +133,14 @@ func reconcileParkerHA(ctx context.Context, deps Deps, node string, cfg pve.Park
 				log.Int("parker_vmid", vmid), log.String("node", node), log.Err(err))
 		}
 	}
-	if rctx.Err() == nil {
-		r.reconcileOrphans(rctx)
+	if rctx.Err() != nil {
+		return
 	}
+	if q := retirementQueueFrom(ctx); q != nil {
+		q.addOrphanScan(queuedOrphanScan{deps: deps, node: node, cfg: cfg, keepGoing: detachedFromRequest(ctx)})
+		return
+	}
+	r.reconcileOrphans(rctx)
 }
 
 // newParkerHAPass builds the state of one HA pass over the parkers of node,
@@ -159,7 +169,7 @@ func newParkerHAPass(ctx context.Context, deps Deps, node string, cfg pve.Parker
 	udeps := withRequestHAProfile(deps)
 	udeps.PVE = client
 	return &parkerHA{
-		deps: udeps, logger: logger, node: node, cfg: cfg,
+		deps: udeps, reqDeps: deps, logger: logger, node: node, cfg: cfg,
 		owner:   deps.RequestDirectorUUID,
 		managed: deps.Config.HAModeValue() == config.HAModeManaged,
 		base:    context.WithValue(ctx, vmidClaimSetKey{}, (*vmidClaimSet)(nil)),
@@ -169,7 +179,10 @@ func newParkerHAPass(ctx context.Context, deps Deps, node string, cfg pve.Parker
 // parkerHA carries one HA pass over the parkers of a node. deps.PVE is the
 // client no managed allocation guard wraps.
 type parkerHA struct {
-	deps    Deps
+	deps Deps
+	// reqDeps are the deps the pass was built from, which a retirement the
+	// pass queues is built from again when the queue drains.
+	reqDeps Deps
 	logger  *log.Logger
 	node    string
 	cfg     pve.ParkerConfig
@@ -225,6 +238,10 @@ func (r *parkerHA) reconcile(ctx context.Context, vmid int) error {
 	}
 	switch action {
 	case parkerHARetire:
+		if retirementQueueFrom(r.base) != nil {
+			r.queueRetirement(vmid)
+			return nil
+		}
 		return r.retireWithBudget(vmid)
 	case parkerHARegister:
 		registers, err := r.wouldRegister(ctx, vmid, snap.views)
@@ -349,6 +366,21 @@ func (r *parkerHA) retireWithBudget(vmid int) error {
 	defer cancel()
 	r.retired = true
 	return r.claimed(rctx, vmid, true)
+}
+
+// queueRetirement hands the retirement of one empty parker to the handler's
+// retirement queue, which runs it under its own claim, fresh read, and budget
+// once the handler released its gates and locks. The pass still queues at
+// most one retirement, as it would retire at most one inline.
+func (r *parkerHA) queueRetirement(vmid int) {
+	logger := r.logger.With(log.Int("parker_vmid", vmid), log.String("node", r.node))
+	if r.retired {
+		logger.Info("parker HA: this sweep already retired a parker, so the next sweep retires this empty one")
+		return
+	}
+	r.retired = true
+	retireEmptiedParker(r.base, r.reqDeps, r.node, vmid, "parker sweep")
+	logger.Debug("parker HA: the empty parker is retired once the request releases its gates and locks")
 }
 
 // wouldRegister decides, from reads that take no lock, whether an

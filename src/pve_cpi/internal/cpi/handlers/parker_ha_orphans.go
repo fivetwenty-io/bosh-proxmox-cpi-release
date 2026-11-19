@@ -85,6 +85,19 @@ type parkerHAOrphan struct {
 // parkerHAOrphanCaller names the step in its errors and logs.
 const parkerHAOrphanCaller = "parker HA leftover cleanup"
 
+// reconcileParkerOrphansNow removes the HA leftovers of gone parkers on node
+// under a pass of its own and the pass's time budget. A handler's retirement
+// queue runs it for the sweep that deferred the removal.
+func reconcileParkerOrphansNow(ctx context.Context, deps Deps, node string, cfg pve.ParkerConfig) {
+	r, ok := newParkerHAPass(ctx, deps, node, cfg)
+	if !ok {
+		return
+	}
+	rctx, cancel := context.WithTimeout(r.base, parkerHAReconcileTimeout)
+	defer cancel()
+	r.reconcileOrphans(rctx)
+}
+
 // reconcileOrphans removes the HA resource and the pin of every parker of
 // this Director whose config no member holds, as the comment above describes.
 // It never returns an error: a leftover it could not prove, or could not

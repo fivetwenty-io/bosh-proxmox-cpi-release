@@ -46,6 +46,15 @@ import (
 // the meantime, or a rollback that put the disk back, keeps the parker. The
 // other emptying paths retire inline, because they hold no gate that other
 // requests queue on while they finish.
+//
+// A parker pool sweep that runs under the queue, as the one an attach runs
+// after it parks a free-floating disk on the disk's own node does while it
+// holds the disk's lifecycle lock, defers the same way. Its HA pass queues the
+// retirement of the empty parker it would retire, and it queues its removal of
+// the HA leftovers of gone parkers on the node, whose proof reads the quorum
+// and probes every member under a claim. The drain runs the queued
+// retirements first and then each node's leftover removal, as the sweep runs
+// them inline.
 
 // retireEmptiedParkerFunc is the shape of retireEmptiedParkerNow, named for
 // the seam below.
@@ -81,7 +90,7 @@ func retireEmptiedParker(ctx context.Context, deps Deps, node string, vmid int, 
 	if vmid <= 0 || strings.TrimSpace(node) == "" {
 		return
 	}
-	if q, ok := ctx.Value(retirementQueueKey{}).(*retirementQueue); ok && q != nil {
+	if q := retirementQueueFrom(ctx); q != nil {
 		q.add(queuedRetirement{deps: deps, node: node, vmid: vmid, trigger: trigger, keepGoing: detachedFromRequest(ctx)})
 		return
 	}
@@ -105,12 +114,31 @@ type queuedRetirement struct {
 	keepGoing bool
 }
 
-// retirementQueue holds the retirements a handler deferred, each parker once.
-// A parker queued twice keeps its first entry, which runs free of the
-// request's cancellation when either caller's context was.
+// queuedOrphanScan is one node's removal of the HA leftovers of gone parkers
+// that a sweep deferred (reconcileParkerOrphansNow).
+type queuedOrphanScan struct {
+	deps Deps
+	node string
+	cfg  pve.ParkerConfig
+	// keepGoing is set as it is for a queuedRetirement.
+	keepGoing bool
+}
+
+// retirementQueue holds the retirements a handler deferred, each parker once,
+// and the leftover removals its sweeps deferred, each node once. An entry
+// queued twice keeps its first form, which runs free of the request's
+// cancellation when either caller's context was.
 type retirementQueue struct {
 	mu      sync.Mutex
 	pending []queuedRetirement
+	scans   []queuedOrphanScan
+}
+
+// retirementQueueFrom returns the queue deferParkerRetirements installed in
+// ctx, or nil.
+func retirementQueueFrom(ctx context.Context) *retirementQueue {
+	q, _ := ctx.Value(retirementQueueKey{}).(*retirementQueue)
+	return q
 }
 
 func (q *retirementQueue) add(e queuedRetirement) {
@@ -125,12 +153,24 @@ func (q *retirementQueue) add(e queuedRetirement) {
 	q.pending = append(q.pending, e)
 }
 
-func (q *retirementQueue) take() []queuedRetirement {
+func (q *retirementQueue) addOrphanScan(e queuedOrphanScan) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	out := q.pending
-	q.pending = nil
-	return out
+	for i := range q.scans {
+		if q.scans[i].node == e.node {
+			q.scans[i].keepGoing = q.scans[i].keepGoing || e.keepGoing
+			return
+		}
+	}
+	q.scans = append(q.scans, e)
+}
+
+func (q *retirementQueue) take() ([]queuedRetirement, []queuedOrphanScan) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	pending, scans := q.pending, q.scans
+	q.pending, q.scans = nil, nil
+	return pending, scans
 }
 
 // deferParkerRetirements makes every retirement of an emptied parker called
@@ -139,22 +179,29 @@ func (q *retirementQueue) take() []queuedRetirement {
 // it runs after every gate and lock the handler takes later is released. A
 // context that already carries a queue keeps it, and the drain returned then
 // does nothing, so the outermost handler drains. The drain runs each
-// retirement on ctx, the context the handler had before the queue, which
-// carries none of the claims or locks the path held.
+// retirement, and then each node's deferred leftover removal, on ctx, the
+// context the handler had before the queue, which carries none of the claims
+// or locks the path held, and no queue that a sweep could defer to again.
 func deferParkerRetirements(ctx context.Context) (context.Context, func()) {
-	if q, ok := ctx.Value(retirementQueueKey{}).(*retirementQueue); ok && q != nil {
+	if q := retirementQueueFrom(ctx); q != nil {
 		return ctx, func() {}
 	}
 	q := &retirementQueue{}
+	runCtx := func(keepGoing bool) context.Context {
+		if keepGoing {
+			return context.WithoutCancel(ctx)
+		}
+		return ctx
+	}
 	return context.WithValue(ctx, retirementQueueKey{}, q), func() {
-		pending := q.take()
+		pending, scans := q.take()
 		for i := range pending {
 			e := &pending[i]
-			rctx := ctx
-			if e.keepGoing {
-				rctx = context.WithoutCancel(ctx)
-			}
-			(*retireEmptiedParkerImpl.Load())(rctx, e.deps, e.node, e.vmid, e.trigger)
+			(*retireEmptiedParkerImpl.Load())(runCtx(e.keepGoing), e.deps, e.node, e.vmid, e.trigger)
+		}
+		for i := range scans {
+			e := &scans[i]
+			reconcileParkerOrphansNow(runCtx(e.keepGoing), e.deps, e.node, e.cfg)
 		}
 	}
 }
