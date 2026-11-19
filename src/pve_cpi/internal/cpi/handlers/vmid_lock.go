@@ -29,11 +29,14 @@ import (
 // dies blocks metadata writes on its VM until the claim's recorded expiry.
 const vmidLockTTL = 25 * time.Minute
 
-// vmidLockTimeout is the maximum time withVMIDLock waits to acquire the lock.
-// Set to 10s. On timeout AcquireClusterLock returns a retriable error so the
-// BOSH director re-drives the operation rather than failing the deployment.
-// It is a variable only so tests can shorten the wait.
-var vmidLockTimeout = 10 * time.Second
+// vmidLockTimeout is the maximum time withVMIDLock waits to acquire the lock,
+// and the wait of a disposal's claim. It outlasts a replica widening pass's
+// claim, so a call that queues behind a pass whose process died steals the
+// claim inside its wait (see replicaWidenClaimTTL). On timeout
+// AcquireClusterLock returns a retriable error so the BOSH director re-drives
+// the operation rather than failing the deployment. It is a variable only so
+// tests can shorten the wait.
+var vmidLockTimeout = 20 * time.Second
 
 // vmidLockHolderReadTimeout bounds the read that names the holder after the
 // wait for a VMID lock runs out. It runs on a detached context, because the

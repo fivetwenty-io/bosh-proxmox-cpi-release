@@ -153,6 +153,18 @@ type replicaPinWrite struct {
 	// written, and it is returned, so the caller can decide again from it.
 	// A nil standIn accepts no other pin, and the write fails as changed.
 	standIn func(cur *ha.Rule) bool
+	// around wraps the hold of the rules lock and the write under it, but
+	// not the verification after. It must call locked once, or return an
+	// error without calling it. A nil around takes the rules lock at once.
+	// The widening pass takes the VM's claim here, so the claim's pool calls
+	// run before and after the rules lock rather than while every other rule
+	// write in the cluster waits on it.
+	around func(ctx context.Context, locked func(context.Context) error) error
+	// confirmLost makes a write whose answer was lost, such as one whose
+	// context ended while the update was in flight, read the pin again on a
+	// fresh context. A pin that is pin by then counts as written, so the
+	// caller reports what is in PVE rather than a failure.
+	confirmLost bool
 }
 
 // replicaPinWritten is what writeReplicaPinWith did.
@@ -174,7 +186,7 @@ func writeReplicaPinWith(
 ) (out replicaPinWritten, err error) {
 	owner := deps.RequestDirectorUUID
 	var res *ha.ApplyResult
-	called := false
+	called, confirmed := false, false
 	write := func(ctx context.Context) error {
 		called = true
 		writer := newHARuleWriterFor(deps, profile, logger, nil)
@@ -202,25 +214,38 @@ func writeReplicaPinWith(
 			}
 			return []ha.RuleOp{{Kind: ha.OpUpdate, Rule: *pin}}, nil
 		})
+		if err != nil && how.confirmLost && out.standIn == nil && replicaPinLanded(ctx, deps, pin) {
+			logger.Warn(replicaOp+": the pin write's answer was lost, and the pin in PVE is the one it wrote",
+				log.Int(metadataKeyVMID, vmid), log.Err(err))
+			confirmed = true
+			return nil
+		}
 		return err
 	}
-	err = withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
-		if how.guard == nil {
-			return write(ctx)
-		}
-		if err := how.guard(ctx, write); err != nil {
-			return err
-		}
-		if !called {
-			return fmt.Errorf("node-affinity: the guard of the pin write of VM %d returned without writing", vmid)
-		}
-		return nil
-	})
+	locked := func(ctx context.Context) error {
+		return withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
+			if how.guard == nil {
+				return write(ctx)
+			}
+			if err := how.guard(ctx, write); err != nil {
+				return err
+			}
+			if !called {
+				return fmt.Errorf("node-affinity: the guard of the pin write of VM %d returned without writing", vmid)
+			}
+			return nil
+		})
+	}
+	if how.around != nil {
+		err = how.around(ctx, locked)
+	} else {
+		err = locked(ctx)
+	}
 	healAfterRepair(ctx, deps, res, logger)
 	if err != nil {
 		return replicaPinWritten{}, err
 	}
-	out.wrote = res != nil && len(res.Wrote) > 0
+	out.wrote = confirmed || (res != nil && len(res.Wrote) > 0)
 	if out.standIn != nil {
 		return out, nil
 	}
@@ -230,6 +255,24 @@ func writeReplicaPinWith(
 		Logger:    logger,
 	}
 	return out, stager.Verify(ctx, &ha.VMDecision{VMID: vmid, SID: haResourceSid(vmid)}, pin, "")
+}
+
+// replicaPinConfirmTimeout bounds the read that checks whether a pin write
+// whose answer was lost landed. It runs on a context detached from the
+// write's, because that context may be what ended.
+const replicaPinConfirmTimeout = 10 * time.Second
+
+// replicaPinLanded reports whether the pin in PVE is pin, read on a context
+// detached from ctx. A read that fails reports false.
+func replicaPinLanded(ctx context.Context, deps Deps, pin *ha.Rule) bool {
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), replicaPinConfirmTimeout)
+	defer cancel()
+	set, err := readHARuleSet(readCtx, deps.PVE.Cluster())
+	if err != nil {
+		return false
+	}
+	cur := set.Find(pin.ID)
+	return cur != nil && ha.SameRule(cur, pin)
 }
 
 // readOwnedReplicaPin reads the VM's pin and returns it when it carries this
@@ -307,6 +350,12 @@ type replicaWiden struct {
 	// a read that failed. A nil guard writes at once, which is the touch
 	// path's check.
 	guard func(ctx context.Context, proof replicaWidenProof, write func(context.Context) error) error
+	// claim wraps the hold of the rules lock and the guarded write, but not
+	// the verification after, the way replicaPinWrite.around does. The
+	// widening pass takes the VM's claim here. A nil claim takes the rules
+	// lock at once. With a claim set, a write whose answer was lost reads the
+	// pin again, so the check reports what is in PVE.
+	claim func(ctx context.Context, locked func(context.Context) error) error
 	// wrote is set by check when its write widened the pin in PVE. A pin that
 	// named the partner already, or that another call widened first, leaves
 	// it false.
@@ -425,7 +474,7 @@ func (w *replicaWiden) check(ctx context.Context) (widened bool, reason string, 
 		return false, "", err
 	}
 	written, err := writeReplicaPinWith(ctx, w.deps, w.profile, logger, w.vmid, pin, widenedReplicaPin(pin, target),
-		replicaPinWrite{guard: guard})
+		replicaPinWrite{guard: guard, around: w.claim, confirmLost: w.claim != nil})
 	w.wrote = written.wrote
 	if skip := (*replicaWidenSkip)(nil); errors.As(err, &skip) {
 		logger.Info(replicaOp+": the VM's state changed since its replica was checked; the pin keeps the source "+

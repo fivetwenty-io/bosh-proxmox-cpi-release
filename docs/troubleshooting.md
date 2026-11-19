@@ -514,7 +514,7 @@ A VM found this way needs the same `qm unlock <vmid>` fix before it can be destr
 `set_vm_metadata`, `set_disk_metadata`, and stemcell reference counting each take a lock on the VM before they rewrite its tags and description. The lock lives in a PVE resource pool named `bosh-lock-vm-<vmid>`, and the pool's comment holds the claim of whoever has it. When another process holds the lock for the whole 10-second wait, the call fails with a retriable error that quotes that claim.
 
 ```text
-withVMIDLock: lock "bosh-lock-vm-4242" is held by owner=set_vm_metadata/4242@director-0/1234-9f2c1a7e-7 exp=1790778395, which lapses at 2026-09-30T14:26:35Z: AcquireClusterLock: timed out after 10s waiting for lock "bosh-lock-vm-4242": ...
+withVMIDLock: lock "bosh-lock-vm-4242" is held by owner=set_vm_metadata/4242@director-0/1234-9f2c1a7e-7 exp=1790778395, which lapses at 2026-09-30T14:26:35Z: AcquireClusterLock: timed out after 20s waiting for lock "bosh-lock-vm-4242": ...
 ```
 
 We read the owner token from left to right. `set_vm_metadata/4242` is the operation that took the lock and the VMID it locked, `director-0` is the host the CPI ran on, and `1234` is the CPI's process ID on that host. `9f2c1a7e` is a random number that process drew when it started, and the trailing `7` counts the locks that process has taken. `exp` is the claim's expiry in Unix seconds, and the error repeats it as a UTC time.
@@ -3032,7 +3032,7 @@ At Debug, the CPI log also shows the sweep's reason for each VM it skipped, afte
 
 **Fix**
 
-We run the same command with `--apply`, as [Widening replica pins after a deploy](operations.md#widening-replica-pins-after-a-deploy) describes, or we wait for the next call that takes the HA rules lock. A VM that the pass skips because another call holds it, because it is migrating or recovering, or because its HA resource is ignored keeps its pin until a later pass finds it settled. One sweep widens at most one pin, so after a deploy that adds many `replicate` VMs, the command with `--apply` widens the rest at once. A VM whose job is failing needs the job fixed first, as [Operations, PVE HA](operations.md#pve-ha) describes for `replica_job_failing`.
+We run the same command with `--apply`, as [Widening replica pins after a deploy](operations.md#widening-replica-pins-after-a-deploy) describes, or we wait for the next call that takes the HA rules lock. A VM that the pass skips because another call holds it, because its locks took longer than its claim's lease on a busy cluster, because it is migrating or recovering, or because its HA resource is ignored keeps its pin until a later pass finds it settled. One sweep widens at most one pin, so after a deploy that adds many `replicate` VMs, the command with `--apply` widens the rest at once. A VM whose job is failing needs the job fixed first, as [Operations, PVE HA](operations.md#pve-ha) describes for `replica_job_failing`.
 
 ## Task timeouts
 

@@ -35,11 +35,32 @@ type sweepCluster struct {
 	// onResource runs before each HA resource read, with the call's number.
 	onResource    func(call int)
 	resourceCalls int
+	// latency is how long each read and write of the cluster takes.
+	latency time.Duration
 }
 
-func (s *sweepCluster) ListResources(context.Context, *cluster.ListResourcesParams) (*cluster.ListResourcesResponse,
+func (s *sweepCluster) ListHaRules(ctx context.Context, p *cluster.ListHaRulesParams) (*cluster.ListHaRulesResponse,
 	error,
 ) {
+	if err := answerAfter(ctx, s.latency); err != nil {
+		return nil, err
+	}
+	return s.attachHAStub.ListHaRules(ctx, p)
+}
+
+func (s *sweepCluster) UpdateHaRules(ctx context.Context, rule string, p *cluster.UpdateHaRulesParams) error {
+	if err := answerAfter(ctx, s.latency); err != nil {
+		return err
+	}
+	return s.attachHAStub.UpdateHaRules(ctx, rule, p)
+}
+
+func (s *sweepCluster) ListResources(ctx context.Context, _ *cluster.ListResourcesParams) (
+	*cluster.ListResourcesResponse, error,
+) {
+	if err := answerAfter(ctx, s.latency); err != nil {
+		return nil, err
+	}
 	s.listCalls++
 	if s.listPanic != nil {
 		panic(s.listPanic)
@@ -55,9 +76,12 @@ func (s *sweepCluster) ListResources(context.Context, *cluster.ListResourcesPara
 	return &out, nil
 }
 
-func (s *sweepCluster) ListHaStatusManagerStatus(context.Context) (*cluster.ListHaStatusManagerStatusResponse,
+func (s *sweepCluster) ListHaStatusManagerStatus(ctx context.Context) (*cluster.ListHaStatusManagerStatusResponse,
 	error,
 ) {
+	if err := answerAfter(ctx, s.latency); err != nil {
+		return nil, err
+	}
 	services := map[string]any{}
 	for sid, state := range s.services {
 		services[sid] = map[string]any{"state": state, "node": "pve01"}
@@ -68,6 +92,9 @@ func (s *sweepCluster) ListHaStatusManagerStatus(context.Context) (*cluster.List
 }
 
 func (s *sweepCluster) GetHaResources(ctx context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {
+	if err := answerAfter(ctx, s.latency); err != nil {
+		return nil, err
+	}
 	s.resourceCalls++
 	if s.onResource != nil {
 		s.onResource(s.resourceCalls)
@@ -111,9 +138,17 @@ type sweepRig struct {
 	hooked  *statusHookReplica
 	changed time.Time
 	// onClaimed runs once, before the first config read made while the pass
-	// claims VM 100, which is the guard's read under the rules lock and the
-	// claim.
+	// claims VM 100, which is the guard's read under the claim and the rules
+	// lock.
 	onClaimed func()
+	// latency is how long each PVE call takes (see slow).
+	latency time.Duration
+}
+
+// slow makes every PVE call of the rig take d: the cluster's reads and rule
+// writes, the config reads, and the lock pools' calls.
+func (s *sweepRig) slow(d time.Duration) {
+	s.latency, s.cluster.latency, s.pools.delay = d, d, d
 }
 
 func newSweepRig(t *testing.T) *sweepRig {
@@ -135,6 +170,7 @@ func newSweepRig(t *testing.T) *sweepRig {
 	r.deps.Replication = s.hooked
 	read := run.qemu.configFn
 	run.qemu.configFn = func(call int) (map[string]any, error) {
+		time.Sleep(s.latency)
 		if hook := s.onClaimed; hook != nil && s.pools.held(100) {
 			s.onClaimed = nil
 			hook()

@@ -51,9 +51,13 @@ const (
 	// lock, each bounded at lockReleaseTimeout. The journal record is a local
 	// file lock, and its release takes no PVE call.
 	replicaWidenReleaseReserve = 2 * lockReleaseTimeout
-	// replicaWidenSweepMinBudget is the least budget worth a sweep. A call
-	// whose deadline leaves less skips the sweep, and a later call sweeps.
-	replicaWidenSweepMinBudget = 10 * time.Second
+	// replicaWidenSweepMinBudget is the least budget worth a sweep. Every
+	// lock acquire stops pve.ClusterLockContextMargin before the sweep's
+	// deadline, so a budget under that margin could take no lock at all, and
+	// the other 15 seconds cover the listing, the status reads, a VM's reads,
+	// and its locks. A call whose deadline leaves less skips the sweep, and a
+	// later call sweeps.
+	replicaWidenSweepMinBudget = pve.ClusterLockContextMargin + 15*time.Second
 )
 
 // ReplicaWidenOutcome is what a widening pass did for one VM.
@@ -449,14 +453,17 @@ func replicaWidenServiceHeld(state string) string {
 }
 
 // widen checks one VM and widens its pin when the check passes. The checks
-// that need no lock run first. Then the VM's journal record, the HA rules
-// lock, and the pass's claim on the VM's VMID are each tried once, in that
-// order, and a lock another call holds is a skip. The claim is taken last,
-// inside the rules lock, around the guard's re-read and the write, with the
-// short lease replicaWidenClaimTTL. So the pass never waits on a lock while it
-// holds another, and a call on the same VM that waits on the claim gets it
-// well inside its own wait. halt is non-empty when no later VM can be claimed
-// either.
+// that need no lock run first. Then the VM's journal record, the pass's claim
+// on the VM's VMID, and the HA rules lock are each tried once, in that order,
+// and a lock another call holds is a skip. The claim, with the short lease
+// replicaWidenClaimTTL, covers the rules lock, the guard's re-read, and the
+// start of the write, and the rules lock covers only the re-read and the
+// write, so the claim's pool calls never run while every other rule write in
+// the cluster waits on the rules lock. The pass never waits on a lock, so it
+// can never be part of a wait that closes a cycle, whatever order the calls
+// it meets take their locks in, and a call on the same VM that waits on the
+// claim gets it inside its own wait. halt is non-empty when no later VM can
+// be claimed either.
 func (p *replicaWidenPass) widen(
 	ctx context.Context, c replicaWidenCandidate, profile *ha.Profile,
 ) (res ReplicaWidenResult, halt string) {
@@ -528,6 +535,9 @@ func (p *replicaWidenPass) checkVM(
 			handle: handle, now: p.now,
 			guard: func(ctx context.Context, proof replicaWidenProof, write func(context.Context) error) error {
 				return p.guard(ctx, c, profile, proof, logger, write)
+			},
+			claim: func(ctx context.Context, locked func(context.Context) error) error {
+				return p.claim(ctx, c, logger, locked)
 			}}
 		var err error
 		widened, reason, err = w.check(ctx)
@@ -538,6 +548,9 @@ func (p *replicaWidenPass) checkVM(
 		return false, "another call holds the VM's journal record", nil
 	case errors.Is(err, errReplicaWidenRecordUnmatched):
 		return false, err.Error(), nil
+	case errors.Is(err, pve.ErrClusterLockNoTimeToWait):
+		return false, "too little of the pass's time is left to take a lock and still release it before the " +
+			"deadline; a later pass checks the VM", nil
 	case errors.Is(err, pve.ErrClusterLockHeld):
 		return false, "another call holds the HA rules lock", nil
 	case err != nil:
@@ -598,12 +611,63 @@ func (p *replicaWidenPass) resourceHeld(ctx context.Context, vmid int) (string, 
 	return replicaWidenServiceHeld(states[sid]), nil
 }
 
-// guard runs under the rules lock and wraps the write of the widened pin. It
-// takes the pass's claim on the VM's VMID, trying once with the short lease
-// replicaWidenClaimTTL, then reads the VM's config on its node again and
-// writes the pin only while the config still lets the pin widen and its
-// volumes are the ones the sync was verified for. The rule writer checks the
-// pin itself against the one the check read.
+// claim runs locked, which takes the HA rules lock and writes the pin under
+// it, while the pass claims the VM's VMID. It tries the claim once with the
+// short lease replicaWidenClaimTTL, and a claim another call holds is a skip.
+// The claim's errors are mapped only when locked never ran, so an error of the
+// rules lock or the write inside reaches checkVM as it is.
+func (p *replicaWidenPass) claim(
+	ctx context.Context, c replicaWidenCandidate, logger *log.Logger, locked func(context.Context) error,
+) error {
+	ran := false
+	err := withVMIDClaim(ctx, p.deps, c.vmid, "replica-widen/"+strconv.Itoa(c.vmid), claimForReplicaWiden, logger,
+		func(ctx context.Context) error {
+			ran = true
+			return locked(ctx)
+		})
+	switch {
+	case err == nil || ran:
+		return err
+	case errors.Is(err, pve.ErrClusterLockNoTimeToWait):
+		// The deadline, not a holder, stopped the claim, and checkVM says so.
+		return err
+	case isVMIDClaimHeld(err):
+		return &replicaWidenSkip{reason: "another call claims the VM, such as a create, a delete, a metadata " +
+			"write, or another pass"}
+	case errors.Is(err, errVMIDClaimNoPools):
+		return &replicaWidenClaimRefused{reason: err.Error(), halt: "the PVE client offers no pool service, so " +
+			"no VM can be claimed"}
+	case pve.IsClusterLockPermissionRefused(err):
+		return &replicaWidenClaimRefused{
+			reason: "PVE refused the VMID claim for lack of permission: " + err.Error(),
+			halt: "PVE refused the VMID claim for lack of permission, so no VM can be claimed; grant " +
+				"Pool.Allocate and Pool.Audit on /pool so the CPI can create bosh-lock-vm-<vmid>",
+		}
+	}
+	return err
+}
+
+// replicaWidenWriteTimeout bounds the pin write once the guard has started
+// it. The write runs on a context detached from the pass's, so neither the
+// end of the claim's window nor the end of the pass's budget can cancel an
+// update that is already on its way to PVE and leave its outcome unknown. The
+// pass's budget leaves this much and more before the request's deadline,
+// because it takes at most half of what remains after the release reserve.
+const replicaWidenWriteTimeout = 10 * time.Second
+
+// guard runs under the rules lock, inside the pass's claim on the VM, and
+// wraps the write of the widened pin. It reads the VM's config on its node
+// again and writes the pin only while the config still lets the pin widen and
+// its volumes are the ones the sync was verified for. The rule writer checks
+// the pin itself against the one the check read.
+//
+// The write starts only while the claim's window is open, so the claim still
+// has replicaWidenClaimReserve to run when the update goes out, and a pass
+// whose locks took longer than that skips the VM instead. Once started, the
+// write runs on a context of its own (see replicaWidenWriteTimeout), and the
+// rules lock, which every pin write holds, is what keeps another writer out
+// until it is done. So the pass never reports a failure for a write that
+// landed.
 //
 // The guard reads only the config, because every other change the check's
 // reads could miss reaches the pin first, and the pin's compare-and-swap
@@ -621,43 +685,31 @@ func (p *replicaWidenPass) guard(
 	ctx context.Context, c replicaWidenCandidate, profile *ha.Profile, proof replicaWidenProof, logger *log.Logger,
 	write func(context.Context) error,
 ) error {
-	err := withVMIDClaim(ctx, p.deps, c.vmid, "replica-widen/"+strconv.Itoa(c.vmid), claimForReplicaWiden, logger,
-		func(ctx context.Context) error {
-			cfg, why, err := p.readConfig(ctx, c)
-			if err != nil {
-				return err
-			}
-			if why != "" {
-				return &replicaWidenSkip{reason: why}
-			}
-			volids, gaps := ha.ReplicaVolumes(c.vmid, haVolumesOfConfig(cfg, c.node, nil), profile.Storages)
-			if len(gaps) > 0 || !slices.Equal(normalizedVolIDs(volids), normalizedVolIDs(proof.volids)) {
-				return &replicaWidenSkip{reason: "the VM's volumes changed since the sync was verified"}
-			}
-			// A pass whose context ended, such as a pve-cid run an operator
-			// interrupted, writes nothing more and releases its locks.
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			return write(ctx)
-		})
-	switch {
-	case err == nil:
-		return nil
-	case isVMIDClaimHeld(err):
-		return &replicaWidenSkip{reason: "another call claims the VM, such as a create, a delete, a metadata " +
-			"write, or another pass"}
-	case errors.Is(err, errVMIDClaimNoPools):
-		return &replicaWidenClaimRefused{reason: err.Error(), halt: "the PVE client offers no pool service, so " +
-			"no VM can be claimed"}
-	case pve.IsClusterLockPermissionRefused(err):
-		return &replicaWidenClaimRefused{
-			reason: "PVE refused the VMID claim for lack of permission: " + err.Error(),
-			halt: "PVE refused the VMID claim for lack of permission, so no VM can be claimed; grant " +
-				"Pool.Allocate and Pool.Audit on /pool so the CPI can create bosh-lock-vm-<vmid>",
-		}
+	cfg, why, err := p.readConfig(ctx, c)
+	if err != nil {
+		return err
 	}
-	return err
+	if why != "" {
+		return &replicaWidenSkip{reason: why}
+	}
+	volids, gaps := ha.ReplicaVolumes(c.vmid, haVolumesOfConfig(cfg, c.node, nil), profile.Storages)
+	if len(gaps) > 0 || !slices.Equal(normalizedVolIDs(volids), normalizedVolIDs(proof.volids)) {
+		return &replicaWidenSkip{reason: "the VM's volumes changed since the sync was verified"}
+	}
+	// A pass whose context ended, such as a pve-cid run an operator
+	// interrupted, writes nothing more and releases its locks.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if windowEnd, ok := heldVMIDClaimWindow(ctx, c.vmid); !ok || !time.Now().Before(windowEnd) {
+		logger.Info(replicaWidenOp + ": the pass's claim on the VM ran short before the pin write, so the VM " +
+			"waits for a later pass")
+		return &replicaWidenSkip{reason: "the pass's claim on the VM ran short before the pin write, because its " +
+			"locks and reads took longer than its lease allows; a later pass checks the VM"}
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), replicaWidenWriteTimeout)
+	defer cancel()
+	return write(writeCtx)
 }
 
 // withRecord runs fn with the VM's journal record held. It tries the record's

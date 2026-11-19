@@ -34,7 +34,9 @@ func vmidClaimContextWithWindow(ctx context.Context, vmid int, windowEnd time.Ti
 // already exists, the way PVE does, so two claims on one VMID exclude each
 // other the way they do against a cluster. createErr, when set, answers every
 // create, and deleteErrs answers the next deletes in order before they go
-// through. onCreate, when set, runs before each create with the pool's ID.
+// through. onCreate, when set, runs before each create with the pool's ID,
+// and onDelete before each delete. delay, when set, is how long each create,
+// delete, and comment read takes, the way a busy pmxcfs answers.
 type exclusiveLockPools struct {
 	mu         sync.Mutex
 	pools      map[string]string
@@ -43,6 +45,8 @@ type exclusiveLockPools struct {
 	createErr  error
 	deleteErrs []error
 	onCreate   func(poolID string)
+	onDelete   func(poolID string)
+	delay      time.Duration
 }
 
 func newExclusiveLockPools() *exclusiveLockPools {
@@ -55,7 +59,10 @@ func (p *exclusiveLockPools) PoolHasVM(context.Context, string, int64) (bool, er
 	return false, nil
 }
 
-func (p *exclusiveLockPools) CreatePool(_ context.Context, poolID, comment string) error {
+func (p *exclusiveLockPools) CreatePool(ctx context.Context, poolID, comment string) error {
+	if err := answerAfter(ctx, p.delay); err != nil {
+		return err
+	}
 	if p.onCreate != nil {
 		p.onCreate(poolID)
 	}
@@ -72,7 +79,13 @@ func (p *exclusiveLockPools) CreatePool(_ context.Context, poolID, comment strin
 	return nil
 }
 
-func (p *exclusiveLockPools) DeletePool(_ context.Context, poolID string) error {
+func (p *exclusiveLockPools) DeletePool(ctx context.Context, poolID string) error {
+	if err := answerAfter(ctx, p.delay); err != nil {
+		return err
+	}
+	if p.onDelete != nil {
+		p.onDelete(poolID)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.deletes++
@@ -88,11 +101,31 @@ func (p *exclusiveLockPools) DeletePool(_ context.Context, poolID string) error 
 	return nil
 }
 
-func (p *exclusiveLockPools) GetPoolComment(_ context.Context, poolID string) (string, bool, error) {
+func (p *exclusiveLockPools) GetPoolComment(ctx context.Context, poolID string) (string, bool, error) {
+	if err := answerAfter(ctx, p.delay); err != nil {
+		return "", false, err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	comment, ok := p.pools[poolID]
 	return comment, ok, nil
+}
+
+// answerAfter waits d before a fake PVE call answers, the way a busy cluster
+// does, and returns ctx's error when ctx ends first, the way the HTTP client
+// gives up on a call whose context ended.
+func answerAfter(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // hold records a claim on vmid by owner that expires at exp, as another

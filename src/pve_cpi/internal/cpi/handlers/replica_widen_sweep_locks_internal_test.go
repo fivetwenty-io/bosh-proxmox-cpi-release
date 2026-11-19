@@ -97,8 +97,10 @@ func TestReplicaWidenPass_AClaimLeftByADeadPassIsStolenInsideAWait(t *testing.T)
 }
 
 // With the rules lock on, the pass takes the VM's journal record, then the
-// rules lock, then the VM's claim, each once, and a narrowing that waits on
-// the rules lock writes after the pass, so its pin is what stays.
+// VM's claim, then the rules lock, each once, and it gives the rules lock up
+// before it releases the claim, so the claim's pool calls never run while
+// every other rule write in the cluster waits. A narrowing that waits on the
+// rules lock writes after the pass, so its pin is what stays.
 func TestReplicaWidenPass_TakesTheRealRulesLockInOrder(t *testing.T) {
 	defer pve.SetClusterLockGraceForTest(0)()
 	s := newSweepRig(t)
@@ -115,6 +117,17 @@ func TestReplicaWidenPass_TakesTheRealRulesLockInOrder(t *testing.T) {
 			order = append(order, "claim")
 		default:
 			order = append(order, poolID)
+		}
+	}
+	var released []string
+	s.pools.onDelete = func(poolID string) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch poolID {
+		case rulesLockPool():
+			released = append(released, "rules")
+		case vmidLockPool(100):
+			released = append(released, "claim")
 		}
 	}
 	narrowed := time.Now().Truncate(time.Second)
@@ -145,13 +158,17 @@ func TestReplicaWidenPass_TakesTheRealRulesLockInOrder(t *testing.T) {
 	}
 	mu.Lock()
 	got := strings.Join(order, ",")
+	gotReleased := strings.Join(released, ",")
 	mu.Unlock()
 	close(finish)
 	if res := onlyResult(t, report); res.Outcome != ReplicaWidened {
 		t.Fatalf("result %+v", res)
 	}
-	if !strings.HasPrefix(got, "record,rules,claim") {
-		t.Fatalf("lock order %s, want the record, then the rules lock, then the claim", got)
+	if !strings.HasPrefix(got, "record,claim,rules") {
+		t.Fatalf("lock order %s, want the record, then the claim, then the rules lock", got)
+	}
+	if !strings.HasPrefix(gotReleased, "rules,claim") {
+		t.Fatalf("release order %s, want the rules lock given up before the claim", gotReleased)
 	}
 	if sawWidened := <-entered; !sawWidened {
 		t.Fatal("the narrowing ran inside the pass's hold of the rules lock")
@@ -164,8 +181,52 @@ func TestReplicaWidenPass_TakesTheRealRulesLockInOrder(t *testing.T) {
 	}
 }
 
-// A rules lock another call holds is a skip at once, and the pass takes no
-// claim and waits for nothing.
+// A busy cluster answers every call in 800 milliseconds, and the rules lock
+// pays its production grace. The pass still widens the pin inside its
+// claim's lease, and it never reports the VM as failed for the time its
+// locks took or for a write it made.
+func TestReplicaWidenPass_ASlowClusterWidensWithoutAFailure(t *testing.T) {
+	// The production grace, which TestMain shortens to nothing.
+	defer pve.SetClusterLockGraceForTest(2500 * time.Millisecond)()
+	s := newSweepRig(t)
+	s.deps.Config.ClusterLock = "pool"
+	s.slow(800 * time.Millisecond)
+	res := onlyResult(t, s.run(t, ReplicaWidenOptions{}))
+	if res.Outcome == ReplicaWidenFailed {
+		t.Fatalf("result %+v; a slow cluster must not fail the VM", res)
+	}
+	if (res.Outcome == ReplicaWidened) != s.widened() {
+		t.Fatalf("result %+v, pin %q %q; the report must say what the pass did to the pin", res, s.pinNodes(),
+			s.pinComment())
+	}
+	if res.Outcome != ReplicaWidened {
+		t.Fatalf("result %+v; at 800 milliseconds a call, the claim's lease covers the locks and the write", res)
+	}
+}
+
+// A pass whose budget leaves no time to wait on a lock, once the lock's own
+// margin is set aside, skips the VM and says why, rather than failing it or
+// blaming a holder that does not exist.
+func TestReplicaWidenPass_AShortBudgetSkipsRatherThanFails(t *testing.T) {
+	s := newSweepRig(t)
+	s.deps.Config.ClusterLock = "pool"
+	ctx, cancel := context.WithTimeout(crhCtx(), 12*time.Second)
+	defer cancel()
+	report, err := s.pass(ReplicaWidenOptions{}).run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := onlyResult(t, report)
+	if res.Outcome != ReplicaWidenSkipped || !strings.Contains(res.Reason, "time") || s.widened() {
+		t.Fatalf("result %+v; want a skip that says the pass had too little time for its locks", res)
+	}
+	if strings.Contains(res.Reason, "another call") {
+		t.Fatalf("result %+v; no other call holds a lock", res)
+	}
+}
+
+// A rules lock another call holds is a skip at once, and the pass gives up
+// its claim and waits for nothing.
 func TestReplicaWidenPass_AHeldRulesLockSkipsAtOnce(t *testing.T) {
 	defer pve.SetClusterLockGraceForTest(0)()
 	s := newSweepRig(t)
@@ -173,15 +234,13 @@ func TestReplicaWidenPass_AHeldRulesLockSkipsAtOnce(t *testing.T) {
 	s.pools.mu.Lock()
 	s.pools.pools[rulesLockPool()] = "owner=create_vm/101@other exp=" + itoa(int(time.Now().Add(time.Hour).Unix()))
 	s.pools.mu.Unlock()
-	claimed := false
-	s.pools.onCreate = func(poolID string) { claimed = claimed || poolID == vmidLockPool(100) }
 	start := time.Now()
 	res := onlyResult(t, s.run(t, ReplicaWidenOptions{}))
 	if res.Outcome != ReplicaWidenSkipped || !strings.Contains(res.Reason, "HA rules lock") || s.widened() {
 		t.Fatalf("result %+v", res)
 	}
-	if claimed || s.pools.held(100) {
-		t.Fatal("the pass claimed the VM without the rules lock")
+	if s.pools.held(100) || s.stub.updateCalls != 0 {
+		t.Fatal("the pass left the VM claimed or wrote its pin without the rules lock")
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("the pass waited %v on a held rules lock", elapsed)
@@ -345,13 +404,23 @@ func TestReplicaWidenSweepBudget(t *testing.T) {
 	if budget, ok := replicaWidenSweepBudgetFor(near); ok {
 		t.Fatalf("near deadline: budget %v; want no sweep", budget)
 	}
+	// A budget that leaves the locks no time once their margin is set aside
+	// is no sweep at all.
+	short, cancelShort := context.WithTimeout(context.Background(), replicaWidenReleaseReserve+2*12*time.Second+
+		time.Second)
+	defer cancelShort()
+	if budget, ok := replicaWidenSweepBudgetFor(short); ok {
+		t.Fatalf("short deadline: budget %v; the locks' margin of %v leaves it no time to take a lock", budget,
+			pve.ClusterLockContextMargin)
+	}
 	far, cancel2 := context.WithTimeout(context.Background(), replicaWidenReleaseReserve+2*replicaWidenSweepBudget+
 		10*time.Second)
 	defer cancel2()
 	if budget, ok := replicaWidenSweepBudgetFor(far); !ok || budget != replicaWidenSweepBudget {
 		t.Fatalf("far deadline: budget %v ok %v", budget, ok)
 	}
-	mid, cancel3 := context.WithTimeout(context.Background(), replicaWidenReleaseReserve+40*time.Second)
+	mid, cancel3 := context.WithTimeout(context.Background(), replicaWidenReleaseReserve+
+		2*replicaWidenSweepMinBudget+20*time.Second)
 	defer cancel3()
 	budget, ok := replicaWidenSweepBudgetFor(mid)
 	if dl, _ := mid.Deadline(); !ok || time.Now().Add(budget+replicaWidenReleaseReserve).After(dl) {

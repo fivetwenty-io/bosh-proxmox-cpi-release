@@ -79,22 +79,33 @@ const (
 	// replicaWidenClaimTTL instead of the disposal TTL, so a claim that a
 	// widening pass left behind when its process died lapses inside the
 	// vmidLockTimeout wait of a set_vm_metadata or a delete_vm that queues
-	// behind it.
+	// behind it. The work runs on the caller's context, not one that ends at
+	// the claim's window, because the pass takes the HA rules lock inside the
+	// claim, and a lock acquire under a context that ends within
+	// pve.ClusterLockContextMargin gives up at once. The work checks the
+	// window itself before it writes (see heldVMIDClaimWindow).
 	claimForReplicaWiden
 )
 
-// The lease of a replica widening claim. The pass takes the claim last,
-// inside the HA rules lock, around a config read and the pin write, so the
-// work under it is a few PVE calls.
+// The lease of a replica widening claim. The pass takes the claim before the
+// HA rules lock, and holds it around the rules lock's acquire, a config read,
+// and the start of the pin write.
 const (
-	// replicaWidenClaimTTL is the claim's lease. A caller that waits
-	// vmidLockTimeout for the VMID lock gets it even when the pass died
-	// holding it: the claim's whole-second expiry falls at most this long
-	// after the pass created it, and the waiter's next poll, at most one
-	// second later, steals it inside clusterLockStealBudget. That is nine
-	// seconds at most, under the ten the waiter waits.
-	replicaWidenClaimTTL = 6 * time.Second
-	// replicaWidenClaimReserve is what the claim keeps after its work ends:
+	// replicaWidenClaimTTL is the claim's lease. The claim's whole-second
+	// expiry falls between eleven and twelve seconds after the pass starts
+	// its create, and the window ends replicaWidenClaimReserve before that,
+	// at least eight seconds after the start. The work before the write is
+	// the claim's create and confirming read, the rules lock's create, its
+	// grace, and its two confirming reads, and the config read, which is
+	// six round trips and the grace, so the write still starts inside the
+	// window at a one-second round trip with no grace, or at about 900
+	// milliseconds with the grace. A caller that waits vmidLockTimeout for
+	// the VMID lock gets it even when the pass died holding the claim: the
+	// waiter's next poll after the expiry comes at most one second later and
+	// steals the claim inside clusterLockStealBudget, which is fifteen
+	// seconds at most, under the twenty the waiter waits.
+	replicaWidenClaimTTL = 12 * time.Second
+	// replicaWidenClaimReserve is what the claim keeps after its window ends:
 	// the release margin of a lock without the grace, which is the steal
 	// budget and one round trip, and one more round trip for the release.
 	replicaWidenClaimReserve = 3 * time.Second
@@ -392,7 +403,8 @@ func runInVMIDClaimWindow(ctx context.Context, vmid int, windowEnd time.Time, fn
 // fn does not run. A nil pool service runs fn without a claim (see
 // vmidClaimSet.acquire), except under claimForReplicaWiden, which returns
 // errVMIDClaimNoPools and does not run fn. Under claimForReplicaWiden the
-// claim has the lease replicaWidenClaimTTL.
+// claim has the lease replicaWidenClaimTTL, and fn runs on ctx, so fn must
+// check the claim's window itself before it writes.
 func withVMIDClaim(
 	ctx context.Context, deps Deps, vmid int, owner string, mode vmidClaimMode, logger *log.Logger,
 	fn func(context.Context) error,
@@ -418,6 +430,9 @@ func withVMIDClaim(
 		return err
 	}
 	defer set.release(ctx, vmid, logger)
+	if mode == claimForReplicaWiden {
+		return fn(ctx)
+	}
 	windowEnd, _ := heldVMIDClaimWindow(ctx, vmid)
 	return runInVMIDClaimWindow(ctx, vmid, windowEnd, fn)
 }
