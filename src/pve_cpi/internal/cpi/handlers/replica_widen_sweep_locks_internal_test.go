@@ -527,7 +527,7 @@ func (c *lostAnswerCluster) ListHaRules(ctx context.Context, p *cluster.ListHaRu
 // write.
 func TestReplicaWidenPass_AWriteWhoseAnswerIsLostCountsWhenItLanded(t *testing.T) {
 	s := newSweepRig(t)
-	s.deps.PVE.(*sweepPoolsClient).attachRunClient.cluster = &lostAnswerCluster{sweepCluster: s.cluster}
+	s.deps.PVE.(*sweepPoolsClient).cluster = &lostAnswerCluster{sweepCluster: s.cluster}
 	res := onlyResult(t, s.run(t, ReplicaWidenOptions{}))
 	if !s.widened() {
 		t.Fatalf("result %+v, pin %q %q; the write must have landed", res, s.pinNodes(), s.pinComment())
