@@ -671,7 +671,9 @@ func TestCollectNamesEveryServiceThatCannotLeaveAMaintenanceNode(t *testing.T) {
 func replicaFake() *fakeHA {
 	f := haBaseFake()
 	localVM(f, "n1", "bosh-cpi;bosh-ha-managed")
-	f.resources = append(f.resources, HAResourceRow{SID: "vm:101", State: "started", Comment: haMarker})
+	// create_vm registers a replicate VM with failback off.
+	f.resources = append(f.resources, HAResourceRow{SID: "vm:101", State: "started", Comment: haMarker,
+		Failback: failbackRow(false)})
 	f.rules = []ha.Rule{pinRule(101, haMarker+" "+ha.ReplicaPartnerKey+"=n2", "n1", "n2")}
 	f.jobs = []ha.ReplicaJobState{{
 		ID: "101-0", Guest: 101, JobNum: 0, Source: "n1", Target: "n2", Comment: haMarker + " gen=1",

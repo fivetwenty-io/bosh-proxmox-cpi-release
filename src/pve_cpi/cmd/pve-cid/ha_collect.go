@@ -224,6 +224,7 @@ func collectHAScoped(ctx context.Context, r HAReader, cfg *config.CPIConfig, own
 	c.profileFindings()
 	c.ruleFindings()
 	c.softPinFindings()
+	c.failbackFindings()
 	c.antiAffinityFindings()
 	c.cpuFindings()
 	c.protectionFindings()

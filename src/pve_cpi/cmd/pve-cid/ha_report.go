@@ -63,6 +63,8 @@ const (
 	haKindGuestsNotListed       = "guests_not_enumerated"
 	haKindCacheDirectory        = "cache_directory"
 	haKindSoftPinAffinity       = "soft_pin_resource_affinity"
+	haKindFailbackOnReplica     = "failback_on_replica"
+	haKindFailbackDrift         = "failback_drift"
 )
 
 // haFinding is one thing the doctor found.

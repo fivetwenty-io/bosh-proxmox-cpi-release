@@ -24,10 +24,12 @@ import (
 // HAResourceRow is the part of a GET /cluster/ha/resources row the doctor
 // reads. State is the requested state as PVE HA reads it, such as started,
 // stopped, disabled, or ignored, and a resource with no state reads as started.
+// Failback is nil when the row carries no failback flag, which PVE reads as on.
 type HAResourceRow struct {
-	SID     string
-	State   string
-	Comment string
+	SID      string
+	State    string
+	Comment  string
+	Failback *bool
 }
 
 // JournalView is what the doctor reads of the allocation journal. Configured is
@@ -183,20 +185,35 @@ func (r *pveHAReader) Resources(ctx context.Context) ([]HAResourceRow, error) {
 	}
 	out := make([]HAResourceRow, 0, len(*resp))
 	for _, raw := range *resp {
-		var row struct {
-			SID     string  `json:"sid"`
-			State   *string `json:"state"`
-			Comment string  `json:"comment"`
+		row, err := parseHAResourceRow(raw)
+		if err != nil {
+			return nil, err
 		}
-		if err := json.Unmarshal(raw, &row); err != nil {
-			return nil, fmt.Errorf("HA resource row unreadable: %w", err)
-		}
-		if row.SID == "" {
-			return nil, errors.New("HA resource row has no sid")
-		}
-		// A resource registered without a state carries none, and PVE HA
-		// reads it as started, so the row does too.
-		out = append(out, HAResourceRow{SID: row.SID, State: pve.HARequestedState(row.State), Comment: row.Comment})
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+// parseHAResourceRow reads one row of GET /cluster/ha/resources.
+func parseHAResourceRow(raw []byte) (HAResourceRow, error) {
+	var row struct {
+		SID      string             `json:"sid"`
+		State    *string            `json:"state"`
+		Comment  string             `json:"comment"`
+		Failback *sdkclient.PVEBool `json:"failback"`
+	}
+	if err := json.Unmarshal(raw, &row); err != nil {
+		return HAResourceRow{}, fmt.Errorf("HA resource row unreadable: %w", err)
+	}
+	if row.SID == "" {
+		return HAResourceRow{}, errors.New("HA resource row has no sid")
+	}
+	// A resource registered without a state carries none, and PVE HA reads it
+	// as started, so the row does too.
+	out := HAResourceRow{SID: row.SID, State: pve.HARequestedState(row.State), Comment: row.Comment}
+	if row.Failback != nil {
+		on := row.Failback.Bool()
+		out.Failback = &on
 	}
 	return out, nil
 }
