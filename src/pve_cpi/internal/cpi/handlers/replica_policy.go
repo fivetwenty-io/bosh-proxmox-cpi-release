@@ -135,21 +135,43 @@ func widenedReplicaPin(pin *ha.Rule, partner string) *ha.Rule {
 func writeReplicaPin(
 	ctx context.Context, deps Deps, profile *ha.Profile, logger *log.Logger, vmid int, expect, pin *ha.Rule,
 ) error {
-	_, err := writeReplicaPinGuarded(ctx, deps, profile, logger, vmid, expect, pin, nil)
+	_, err := writeReplicaPinWith(ctx, deps, profile, logger, vmid, expect, pin, replicaPinWrite{})
 	return err
 }
 
-// writeReplicaPinGuarded is writeReplicaPin with a guard that runs under the
-// rules lock and wraps the write. The guard gets the write and must either
-// call it, which writes the pin, or return an error and leave the pin as it
-// is, and that error is returned as it stands. A guard that returns nil
-// without calling the write is an error too. A nil guard writes at once.
-// wrote reports whether this call changed the pin in PVE, which is false when
-// the pin was written already.
-func writeReplicaPinGuarded(
+// replicaPinWrite is how writeReplicaPinWith writes a pin. The zero value
+// writes at once and accepts no pin but expect.
+type replicaPinWrite struct {
+	// guard runs under the rules lock and wraps the write. It gets the write
+	// and must either call it, which writes the pin, or return an error and
+	// leave the pin as it is, and that error is returned as it stands. A
+	// guard that returns nil without calling the write is an error too. A
+	// nil guard writes at once.
+	guard func(ctx context.Context, write func(context.Context) error) error
+	// standIn reports whether cur, a pin in PVE that is neither expect nor
+	// pin, stands in for expect. Such a pin is left as it is, nothing is
+	// written, and it is returned, so the caller can decide again from it.
+	// A nil standIn accepts no other pin, and the write fails as changed.
+	standIn func(cur *ha.Rule) bool
+}
+
+// replicaPinWritten is what writeReplicaPinWith did.
+type replicaPinWritten struct {
+	// wrote reports whether this call changed the pin in PVE, which is false
+	// when the pin was written already.
+	wrote bool
+	// standIn is the pin found in place of expect that the write's standIn
+	// accepted, or nil. Nothing was written when it is set.
+	standIn *ha.Rule
+}
+
+// writeReplicaPinWith is writeReplicaPin with the options of how (see
+// replicaPinWrite). A pin that stands in for expect is returned and not
+// verified, because this call wrote nothing.
+func writeReplicaPinWith(
 	ctx context.Context, deps Deps, profile *ha.Profile, logger *log.Logger, vmid int, expect, pin *ha.Rule,
-	guard func(ctx context.Context, write func(context.Context) error) error,
-) (wrote bool, err error) {
+	how replicaPinWrite,
+) (out replicaPinWritten, err error) {
 	owner := deps.RequestDirectorUUID
 	var res *ha.ApplyResult
 	called := false
@@ -158,6 +180,7 @@ func writeReplicaPinGuarded(
 		writer := newHARuleWriterFor(deps, profile, logger, nil)
 		var err error
 		res, err = writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+			out.standIn = nil
 			cur := set.Find(pin.ID)
 			switch {
 			case cur == nil:
@@ -169,6 +192,10 @@ func writeReplicaPinGuarded(
 				// The pin is written already: an earlier pass of this write
 				// landed, or another call wrote the same pin.
 				return nil, nil
+			case !ha.SameRule(cur, expect) && how.standIn != nil && how.standIn(cur):
+				found := cur.Clone()
+				out.standIn = &found
+				return nil, nil
 			case !ha.SameRule(cur, expect):
 				return nil, fmt.Errorf("node-affinity: pin %q of VM %d changed since it was read (%s); the next "+
 					"call that touches the VM settles it", pin.ID, vmid, strings.Join(ha.RuleDiff(expect, cur), ","))
@@ -178,10 +205,10 @@ func writeReplicaPinGuarded(
 		return err
 	}
 	err = withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
-		if guard == nil {
+		if how.guard == nil {
 			return write(ctx)
 		}
-		if err := guard(ctx, write); err != nil {
+		if err := how.guard(ctx, write); err != nil {
 			return err
 		}
 		if !called {
@@ -191,15 +218,18 @@ func writeReplicaPinGuarded(
 	})
 	healAfterRepair(ctx, deps, res, logger)
 	if err != nil {
-		return false, err
+		return replicaPinWritten{}, err
 	}
-	wrote = res != nil && len(res.Wrote) > 0
+	out.wrote = res != nil && len(res.Wrote) > 0
+	if out.standIn != nil {
+		return out, nil
+	}
 	stager := &ha.Stager{
 		ReadRules: func(ctx context.Context) (*ha.RuleSet, error) { return readHARuleSet(ctx, deps.PVE.Cluster()) },
 		Managed:   deps.Config.HAModeValue() == config.HAModeManaged,
 		Logger:    logger,
 	}
-	return wrote, stager.Verify(ctx, &ha.VMDecision{VMID: vmid, SID: haResourceSid(vmid)}, pin, "")
+	return out, stager.Verify(ctx, &ha.VMDecision{VMID: vmid, SID: haResourceSid(vmid)}, pin, "")
 }
 
 // readOwnedReplicaPin reads the VM's pin and returns it when it carries this
@@ -394,8 +424,9 @@ func (w *replicaWiden) check(ctx context.Context) (widened bool, reason string, 
 	if err := w.failbackOffBeforePartner(ctx); err != nil {
 		return false, "", err
 	}
-	w.wrote, err = writeReplicaPinGuarded(ctx, w.deps, w.profile, logger, w.vmid, pin, widenedReplicaPin(pin, target),
-		guard)
+	written, err := writeReplicaPinWith(ctx, w.deps, w.profile, logger, w.vmid, pin, widenedReplicaPin(pin, target),
+		replicaPinWrite{guard: guard})
+	w.wrote = written.wrote
 	if skip := (*replicaWidenSkip)(nil); errors.As(err, &skip) {
 		logger.Info(replicaOp+": the VM's state changed since its replica was checked; the pin keeps the source "+
 			"alone", log.String("reason", skip.reason))

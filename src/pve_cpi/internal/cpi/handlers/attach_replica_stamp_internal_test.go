@@ -166,3 +166,45 @@ func TestAttachToAReplicateVMRefusesAPinThatChangedSinceTheDecision(t *testing.T
 		t.Fatalf("err %v, want it to say the pin changed", err)
 	}
 }
+
+// A sweep that widens the pin between the decision and the hold only adds the
+// partner the replica was verified on, so the attach takes the widened pin as
+// the one it started from instead of failing. The barrier then narrows the
+// pin to the source, recording the latest time the attach can land, before it
+// attaches anything, and the pin ends on the source with the time the attach
+// finished.
+func TestAttachToAReplicateVMNarrowsAPinASweepWidenedSinceTheDecision(t *testing.T) {
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	comment := ha.WithReplicaChanged(ha.WithVolumeRecord(haIdentity{Owner: aaDirector}.marker(),
+		[]string{"local-zfs"}), old)
+	h, stub, cfg := replicaStampRig(t, comment, "pve01")
+	widened := ha.WithReplicaPartner(comment, "pve02")
+	nodes := "pve01,pve02"
+	rule := stub.rules["bosh-na-100"]
+	rule.Comment, rule.Nodes = &widened, &nodes
+	stub.rules["bosh-na-100"] = rule
+	var inside, during time.Time
+	var duringNodes string
+	err := h.run(context.Background(), func(context.Context) (string, error) {
+		inside = time.Now()
+		during = pinStamp(t, stub)
+		duringNodes = derefString(stub.rules["bosh-na-100"].Nodes)
+		cfg["scsi1"] = "local-zfs:vm-100-disk-1,size=5G"
+		return "pve01", nil
+	})
+	if err != nil {
+		t.Fatalf("run: %v; a pin a sweep widened since the decision must not fail the attach", err)
+	}
+	if duringNodes != "pve01" || !during.After(inside) {
+		t.Fatalf("while the attach ran the pin named %q and recorded the change at %v (attach at %v); want the "+
+			"source alone and a change no sync can have started after", duringNodes, during, inside)
+	}
+	pin := stub.rules["bosh-na-100"]
+	if partner, _ := ha.ReplicaPartner(derefString(pin.Comment)); derefString(pin.Nodes) != "pve01" || partner != "" {
+		t.Fatalf("pin nodes %q comment %q after the attach, want the source alone", derefString(pin.Nodes),
+			derefString(pin.Comment))
+	}
+	if after := pinStamp(t, stub); after.Before(inside.Truncate(time.Second)) || after.After(time.Now()) {
+		t.Fatalf("the pin records the change at %v after the attach, want the time it finished", after)
+	}
+}

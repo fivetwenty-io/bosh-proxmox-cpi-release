@@ -887,9 +887,19 @@ func attachReplicaLandBy(ctx context.Context, deps Deps, now time.Time) time.Tim
 // nodes, which the barrier makes mutation first. A change that narrows the
 // pin's nodes needs nothing here, because the barrier writes the new pin,
 // which records the change, before the attach. The write is a
-// compare-and-swap on the pin the decision read, so a pin another call
-// changed since, such as one a sweep widened, fails the attach retriably
-// before it attaches anything, and the next attach decides again.
+// compare-and-swap on the pin the decision read.
+//
+// A pin that a widening pass or a touch widened since the decision, and that
+// differs from the pin the decision read only by the partner the replica was
+// verified on, is taken as the pin the attach starts from, and nothing is
+// written here. The change then narrows the pin, so the barrier writes the
+// new pin, which names the source alone and records the latest time the
+// attach can land, before it attaches anything, and it puts the widened pin
+// back only when the attach provably did not land. The attach therefore never
+// fails because a pass widened the pin, which matters because the Director
+// does not retry attach_disk. Any other change since the decision fails the
+// attach retriably before it attaches anything, and the next attach decides
+// again.
 func (h *attachHA) holdReplicaUnproven(ctx context.Context) error {
 	if h.replicaChanged.IsZero() || h.oldPin == nil || h.newPin == nil || ha.Narrows(h.oldPin, h.newPin) {
 		return nil
@@ -899,12 +909,41 @@ func (h *attachHA) holdReplicaUnproven(ctx context.Context) error {
 	if ha.SameRule(&held, h.oldPin) {
 		return nil
 	}
-	if err := writeReplicaPin(ctx, h.deps, h.profile, h.logger, h.vmid, h.oldPin, &held); err != nil {
+	decided := h.oldPin
+	written, err := writeReplicaPinWith(ctx, h.deps, h.profile, h.logger, h.vmid, decided, &held, replicaPinWrite{
+		standIn: func(cur *ha.Rule) bool { return widenedSince(decided, cur) },
+	})
+	if err != nil {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf("%s: VM %d: record on the "+
 			"replicate VM's pin that its volume set is changing", attachHAOp, h.vmid))
 	}
+	if written.standIn != nil {
+		h.logger.Info(attachHAOp+": another call widened the replicate VM's pin to its partner since the attach "+
+			"decided, so the barrier narrows the pin to the source before the attach",
+			log.Int(metadataKeyVMID, h.vmid), log.String("nodes", strings.Join(written.standIn.NodeNames(), ",")))
+		h.oldPin = written.standIn
+		if !ha.Narrows(h.oldPin, h.newPin) {
+			return cpierrors.Retriable("%s: VM %d: the replicate VM's pin was widened since the attach decided, "+
+				"and the attach's pin does not narrow it; the next attach decides again", attachHAOp, h.vmid)
+		}
+		return nil
+	}
 	h.oldPin = &held
 	return nil
+}
+
+// widenedSince reports whether cur is decided widened to a partner and
+// nothing else, which is the only change a widening pass or a touch makes to
+// a source-only pin.
+func widenedSince(decided, cur *ha.Rule) bool {
+	partner, ok := ha.ReplicaPartner(cur.Comment)
+	if !ok || partner == "" {
+		return false
+	}
+	if _, has := decided.Nodes[partner]; has {
+		return false
+	}
+	return ha.SameRule(widenedReplicaPin(decided, partner), cur)
 }
 
 // restampReplica records on a replicate VM's pin, after the attach, the time
