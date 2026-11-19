@@ -43,6 +43,7 @@ type FindVMOption func(*findVMOptions)
 type findVMOptions struct {
 	offlineTies []OfflineMemberTie
 	excludedOut *[]string
+	removingSID string
 }
 
 // WithOfflineMemberTie adds a source that can withhold the offline-member
@@ -52,6 +53,18 @@ func WithOfflineMemberTie(tie OfflineMemberTie) FindVMOption {
 		if tie != nil {
 			o.offlineTies = append(o.offlineTies, tie)
 		}
+	}
+}
+
+// WithHAResourceUnderRemoval lets the proof pass over the one configured HA
+// resource sid, which the caller is proving absence for because it means to
+// remove the resource once the guest it names is proven gone. Every other veto
+// stands: the CRM still holding a service for the VMID refuses, because the CRM
+// holds a service while a recovery moves the guest's config, and so does any
+// other resource that names the VMID. An empty sid is ignored.
+func WithHAResourceUnderRemoval(sid string) FindVMOption {
+	return func(o *findVMOptions) {
+		o.removingSID = strings.TrimSpace(sid)
 	}
 }
 
@@ -78,7 +91,8 @@ func WithExcludedOfflineMembers(dst *[]string) FindVMOption {
 //     except the members the quorate cluster reports offline, which the
 //     sweeps skip. The second sweep closes the window in which a migration's
 //     config rename lands between two probes of one sweep.
-//  2. /cluster/ha/resources configures no resource for the VMID.
+//  2. /cluster/ha/resources configures no resource for the VMID, other than
+//     the one a caller removes (WithHAResourceUnderRemoval).
 //  3. The CRM's service_status holds no service for the VMID.
 //  4. When the sweeps skipped an offline member, no OfflineMemberTie ties the
 //     guest to that member.
@@ -107,7 +121,7 @@ func proveVMAbsent(
 			excluded[n] = true
 		}
 	}
-	if err := requireNoHAHold(ctx, c, vmid, caller, why); err != nil {
+	if err := requireNoHAHold(ctx, c, vmid, caller, why, opts.removingSID); err != nil {
 		return VMLocation{}, err
 	}
 	if len(excluded) == 0 {
@@ -188,7 +202,9 @@ func requireIndexCoversOffline(ctx context.Context, c Client, vmid int, caller, 
 // not proven the guest gone. A service ID of either guest type counts, because
 // the VMID is not free while a container holds it either. A source that fails
 // to answer, or answers with a row it cannot attribute, is a retriable error.
-func requireNoHAHold(ctx context.Context, c Client, vmid int, caller, why string) error {
+// A configured resource whose SID is removing does not hold the VMID, while
+// the CRM's service state for it still does.
+func requireNoHAHold(ctx context.Context, c Client, vmid int, caller, why, removing string) error {
 	clusterAPI := c.Cluster()
 	var resources *sdkcluster.ListHaResourcesResponse
 	err := RetryOnTransient(ctx, nil, "find_vm_absence_ha_resources", 0, func() error {
@@ -212,7 +228,7 @@ func requireNoHAHold(ctx context.Context, c Client, vmid int, caller, why string
 			return cpierrors.Retriable(
 				"%s: VM %d %s, and an HA resource row does not parse (%v); cannot prove absence", caller, vmid, why, jsonErr)
 		}
-		if haSIDNamesVMID(row.SID, vmid) {
+		if haSIDNamesVMID(row.SID, vmid) && (removing == "" || strings.TrimSpace(row.SID) != removing) {
 			return cpierrors.Retriable(
 				"%s: VM %d %s, but HA resource %s is still configured; cannot prove absence. If the VM is really gone, "+
 					"remove the resource with ha-manager remove %s", caller, vmid, why, row.SID, row.SID)

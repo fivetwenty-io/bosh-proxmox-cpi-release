@@ -313,3 +313,58 @@ func TestHASIDNamesVMID(t *testing.T) {
 		}
 	}
 }
+
+// TestProveVMAbsent_ResourceUnderRemovalDoesNotBlock proves the one HA
+// resource a caller is about to remove, because it outlived its guest, does
+// not by itself veto the proof.
+func TestProveVMAbsent_ResourceUnderRemovalDoesNotBlock(t *testing.T) {
+	t.Parallel()
+	c := &lgClient{
+		cluster: &lgCluster{
+			nodes:         []string{"pve1", "pve2"},
+			haResourcesFn: absHAResources(`{"sid": "vm:4140", "state": "stopped"}`),
+		},
+		nodes: &lgNodes{},
+		qemu:  absNotFound(),
+	}
+	loc, err := FindVMByConfigProbe(lgCtx(), c, 4140, WithHAResourceUnderRemoval("vm:4140"))
+	if err != nil || loc.Found {
+		t.Fatalf("loc=%+v err=%v; want proven absence, the only HA resource is the one under removal", loc, err)
+	}
+}
+
+// TestProveVMAbsent_ResourceUnderRemovalKeepsTheOtherVetoes proves the
+// tolerance covers only the configured resource it names: a service the CRM
+// still holds for the VMID, and another resource that names it, each still
+// veto the proof.
+func TestProveVMAbsent_ResourceUnderRemovalKeepsTheOtherVetoes(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		cluster *lgCluster
+		want    string
+	}{
+		"the CRM holds the service": {
+			cluster: &lgCluster{
+				nodes:         []string{"pve1"},
+				haResourcesFn: absHAResources(`{"sid": "vm:4141"}`),
+				haManagerFn:   absManager(`{"service_status": {"vm:4141": {"state": "stopped", "node": "pve1"}}}`),
+			},
+			want: "HA manager still holds service vm:4141",
+		},
+		"a container resource holds the VMID": {
+			cluster: &lgCluster{
+				nodes:         []string{"pve1"},
+				haResourcesFn: absHAResources(`{"sid": "vm:4141"}`, `{"sid": "ct:4141"}`),
+			},
+			want: "ct:4141",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			c := &lgClient{cluster: tc.cluster, nodes: &lgNodes{}, qemu: absNotFound()}
+			loc, err := FindVMByConfigProbe(lgCtx(), c, 4141, WithHAResourceUnderRemoval("vm:4141"))
+			requireRetriableContaining(t, loc, err, tc.want)
+		})
+	}
+}

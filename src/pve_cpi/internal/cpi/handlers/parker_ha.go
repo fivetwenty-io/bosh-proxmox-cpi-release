@@ -46,6 +46,10 @@ import (
 // attach a disk while the registration reads the parker or while the
 // retirement destroys it. Off mode, and a cluster where the CPI may not write
 // HA state, change nothing here.
+//
+// The sweep's pass ends by removing the HA resource and the pin of a parker
+// that is gone, once it proves the parker gone under the parker's claim
+// (reconcileOrphans in parker_ha_orphans.go).
 
 // parkerHAReconcileTimeout bounds the HA pass of one parker pool sweep, so a
 // slow cluster never holds up the request whose park has already landed. A
@@ -123,6 +127,9 @@ func reconcileParkerHA(ctx context.Context, deps Deps, node string, cfg pve.Park
 			logger.Info("parker HA: the parker's HA registration did not change; the next sweep tries again",
 				log.Int("parker_vmid", vmid), log.String("node", node), log.Err(err))
 		}
+	}
+	if rctx.Err() == nil {
+		r.reconcileOrphans(rctx)
 	}
 }
 

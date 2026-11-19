@@ -460,6 +460,9 @@ func (s *HADeleteScene) resourceRows() *cluster.ListHaResourcesResponse {
 	}
 	for sid, state := range s.Requested {
 		row := map[string]any{"sid": sid, "type": "vm", "state": state}
+		if comment, ok := s.Comments[sid]; ok {
+			row["comment"] = comment
+		}
 		if wire, ok := s.StateWire[sid]; ok {
 			delete(row, "state")
 			if wire != "" {
