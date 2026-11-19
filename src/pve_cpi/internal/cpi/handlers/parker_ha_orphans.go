@@ -20,16 +20,20 @@ import (
 
 // HA leftovers of a parker that is gone.
 //
-// A parker's HA resource and its pin can outlive the parker's config. A
-// destroy that an operator ran by hand leaves both behind, and so does a
-// retirement whose destroy landed but whose pin delete failed, which leaves
-// the pin. PVE's CRM drops the service of a VM that has no config, so the
-// leftover resource never fails over and nothing but this step removes it.
+// A parker's HA resource and its pin can outlive the parker's config. PVE
+// refuses to destroy a guest that HA manages unless the destroy purges it,
+// and a purge removes the HA resource before the config, so a destroy through
+// the API leaves no resource behind. A config that someone deleted from
+// /etc/pve by hand, or that went with the directory of a node removed from
+// the cluster, leaves both behind. A retirement whose destroy landed but
+// whose pin delete failed leaves the pin. PVE's CRM drops the service of a VM
+// that has no config, so the leftover resource never fails over and nothing
+// but this step removes it.
 //
 // The step runs at the end of the sweep's parker HA pass, only when the HA
 // profile lets the CPI write HA state, and it removes a leftover only when it
 // can prove both that the leftover is this Director's parker's and that the
-// parker is gone. Ownership is the marker the registration writes: a resource
+// parker is gone. Ownership is the marker the registration writes. A resource
 // carries this Director as owner and names no deployment or group, and a pin
 // is the parker's bosh-na-<vmid> node-affinity rule with this Director's
 // marker that names no other resource. Both name a VMID in this config's
@@ -53,12 +57,16 @@ import (
 // parker gone, which is why the proof needs every member online.
 //
 // The proof runs again under the parker's VMID claim, which every
-// registration and retirement of the parker holds, taken with a single try.
-// The create path writes a parker's config first, and only a registration
-// under the claim writes its resource and its pin after that, so a parker
-// that is still being created has a config the read under the claim finds,
-// and its leftovers stay. PVE records no creation time on a resource or a
-// rule, so that order is what keeps the step from racing a create.
+// registration, park, and retirement of the parker holds, taken with a single
+// try. A parker's create takes no claim, so the claim alone does not keep the
+// step from racing a create. The VMID allocation does that. Outside off mode
+// a parker's allocation reads the HA resources and rules and never picks a
+// VMID that a resource or a bosh-na pin still names, so no parker is created
+// at a VMID while its leftovers exist, and none inherits them. The step
+// removes the resource before the pin, so the VMID stays out of the
+// allocation's reach until both are gone. PVE records no creation time on a
+// resource or a rule, which is why the allocation, and not a timestamp, keeps
+// a new parker and an old parker's leftovers apart.
 
 // parkerHAOrphan is one VMID in the parker band whose leftovers the step may
 // remove.
@@ -85,13 +93,15 @@ func (r *parkerHA) reconcileOrphans(ctx context.Context) {
 	if r.deps.Config.DetachedDiskStrategyValue() != config.DetachedDiskStrategyParked {
 		return
 	}
-	if !r.loadProfile(ctx) {
-		return
-	}
 	orphans, err := r.orphanCandidates(ctx)
 	if err != nil {
 		r.logger.Debug("parker HA: the HA leftovers of gone parkers could not be listed; the next sweep tries "+
 			"again", log.String("node", r.node), log.Err(err))
+		return
+	}
+	// The profile is resolved only once a leftover is found, so a sweep that
+	// finds none never resolves it.
+	if len(orphans) == 0 || !r.loadProfile(ctx) {
 		return
 	}
 	for _, o := range orphans {
