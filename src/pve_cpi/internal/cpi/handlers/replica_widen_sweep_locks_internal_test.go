@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
@@ -494,5 +496,58 @@ func TestReplicaWidenPass_AnEndedContextReleasesTheLocks(t *testing.T) {
 	s.pools.mu.Unlock()
 	if rules {
 		t.Fatal("the pass left the HA rules lock held")
+	}
+}
+
+// lostAnswerCluster applies each rule write and then never answers it, as a
+// PVE that applied the write and then stalled does, so the write ends with
+// its context.
+type lostAnswerCluster struct{ *sweepCluster }
+
+func (c *lostAnswerCluster) UpdateHaRules(ctx context.Context, rule string, p *cluster.UpdateHaRulesParams) error {
+	if err := c.sweepCluster.UpdateHaRules(ctx, rule, p); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// ListHaRules fails on an ended context, as a real client's request does.
+func (c *lostAnswerCluster) ListHaRules(ctx context.Context, p *cluster.ListHaRulesParams) (
+	*cluster.ListHaRulesResponse, error,
+) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return c.sweepCluster.ListHaRules(ctx, p)
+}
+
+// A pin write whose answer never comes after PVE applied it is reported as
+// the widening it was, because the pass reads the pin again and finds its
+// write.
+func TestReplicaWidenPass_AWriteWhoseAnswerIsLostCountsWhenItLanded(t *testing.T) {
+	s := newSweepRig(t)
+	s.deps.PVE.(*sweepPoolsClient).attachRunClient.cluster = &lostAnswerCluster{sweepCluster: s.cluster}
+	res := onlyResult(t, s.run(t, ReplicaWidenOptions{}))
+	if !s.widened() {
+		t.Fatalf("result %+v, pin %q %q; the write must have landed", res, s.pinNodes(), s.pinComment())
+	}
+	if res.Outcome != ReplicaWidened {
+		t.Fatalf("result %+v; a write that landed is a widening, whatever its answer said", res)
+	}
+}
+
+// A pass whose locks and reads use up its claim's window before the pin
+// write skips the VM and writes nothing, rather than start a write it could
+// not finish inside its lease.
+func TestReplicaWidenPass_AClaimWindowThatRanShortSkipsBeforeTheWrite(t *testing.T) {
+	s := newSweepRig(t)
+	s.onClaimed = func() { time.Sleep(replicaWidenClaimTTL) }
+	res := onlyResult(t, s.run(t, ReplicaWidenOptions{}))
+	if s.widened() {
+		t.Fatalf("result %+v; a pass past its claim's window must not write the pin", res)
+	}
+	if res.Outcome != ReplicaWidenSkipped || !strings.Contains(res.Reason, "claim") {
+		t.Fatalf("result %+v; want a skip that says the claim ran short", res)
 	}
 }
