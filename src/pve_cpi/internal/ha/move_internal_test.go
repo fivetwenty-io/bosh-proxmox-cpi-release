@@ -96,6 +96,66 @@ func TestMoveIntoSetMigratesTheVMAndWaitsForIt(t *testing.T) {
 	}
 }
 
+func TestMoveIntoSetRunsBeforeMigrateRightBeforeTheRequest(t *testing.T) {
+	r := &moveRig{settleOn: []string{"b", "a"}, states: []*pve.HAServiceState{
+		managedOn("started", "b", 100, 90),
+		managedOn("started", "b", 100, 90),
+		managedOn("started", "b", 200, 190),
+		managedOn("started", "a", 220, 215),
+	}}
+	in := moveInput()
+	in.BeforeMigrate = func(context.Context) error {
+		r.events = append(r.events, "before")
+		return nil
+	}
+	if _, err := MoveIntoSet(context.Background(), r.deps(), in); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(r.events, []string{"before", "migrate:a"}) {
+		t.Fatalf("events %v, want the hook right before the request", r.events)
+	}
+}
+
+func TestMoveIntoSetSendsNoRequestWhenBeforeMigrateFails(t *testing.T) {
+	r := &moveRig{settleOn: []string{"b"}, states: []*pve.HAServiceState{managedOn("started", "b", 100, 90)}}
+	in := moveInput()
+	hold := errors.New("cfs lock timeout")
+	in.BeforeMigrate = func(context.Context) error { return hold }
+	_, err := MoveIntoSet(context.Background(), r.deps(), in)
+	if me := moveFailure(t, err); me.Failure != MoveRefused || !errors.Is(err, hold) {
+		t.Fatalf("failure %+v, want a refusal that wraps the hook's error", me)
+	}
+	if len(r.events) != 0 {
+		t.Fatalf("events %v, want no request", r.events)
+	}
+}
+
+func TestMoveIntoSetSkipsBeforeMigrateWhenNothingIsSent(t *testing.T) {
+	down := managedOn("started", "b", 100, 90)
+	down.NodeHealth = pve.NodeHealthEntry{Name: "b", DeadOrFenced: true}
+	for name, r := range map[string]*moveRig{
+		"node down": {settleOn: []string{"b"}, states: []*pve.HAServiceState{down}},
+		"inside":    {settleOn: []string{"a"}, states: []*pve.HAServiceState{managedOn("migrate", "b", 100, 90)}},
+		"no target": {settleOn: []string{"b"}, states: []*pve.HAServiceState{managedOn("started", "b", 100, 90)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			in := moveInput()
+			if name == "no target" {
+				in.Targets = nil
+			}
+			ran := false
+			in.BeforeMigrate = func(context.Context) error {
+				ran = true
+				return nil
+			}
+			_, _ = MoveIntoSet(context.Background(), r.deps(), in)
+			if ran {
+				t.Fatal("the hook ran for a move that sends no request")
+			}
+		})
+	}
+}
+
 func TestMoveIntoSetSendsNothingWhenAMigrationInFlightEndsInsideTheSet(t *testing.T) {
 	r := &moveRig{settleOn: []string{"a"}, states: []*pve.HAServiceState{managedOn("migrate", "b", 100, 90)}}
 	loc, err := MoveIntoSet(context.Background(), r.deps(), moveInput())

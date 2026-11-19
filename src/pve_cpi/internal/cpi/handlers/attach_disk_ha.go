@@ -367,9 +367,14 @@ func attachMoveIntoSet(ctx context.Context, deps Deps, narrow ha.NarrowDeps, pro
 	logger.Info(op+": the HA-managed VM runs outside its admissible set with the new disk, so PVE HA moves it "+
 		"into the set before the attach", log.Int(metadataKeyVMID, vmid), log.String("node", node),
 		log.String("set", where))
+	var holdErr error
 	loc, err := ha.MoveIntoSet(ctx, narrow, ha.MoveInput{
 		VMID: vmid, Node: node, Set: set, Targets: ha.MoveTargets(profile, set, pin, node),
 		Budget: haMotionWait(deps),
+		BeforeMigrate: func(ctx context.Context) error {
+			holdErr = holdFailbackForMove(ctx, deps, narrow, vmid)
+			return holdErr
+		},
 	})
 	if err == nil {
 		return loc.Node, nil
@@ -382,6 +387,12 @@ func attachMoveIntoSet(ctx context.Context, deps Deps, narrow ha.NarrowDeps, pro
 		return cpierrors.WrapAs(fmt.Errorf("%w. %s", cause, action), cpierrors.TypeRetriableCloud, msg)
 	}
 	var moveErr *ha.MoveError
+	if holdErr != nil {
+		// A failback flag that may still be on would undo the move, so the
+		// move never started, and leaving HA for that would be out of all
+		// proportion.
+		return "", keep(", because the attach could not turn off failback first", err)
+	}
 	if errors.As(err, &moveErr) && moveErr.Failure == ha.MoveNodeDown {
 		return "", keep("", err)
 	}
@@ -403,15 +414,34 @@ func attachMoveIntoSet(ctx context.Context, deps Deps, narrow ha.NarrowDeps, pro
 	return "", nil
 }
 
+// holdFailbackForMove turns failback off on the VM's HA resource right before
+// PVE HA is asked to move the VM into its admissible set. The VM's pin still
+// names its old placement then, and with failback on the CRM would pull the
+// VM back to the node that pin prefers as soon as the move lands, and the
+// attach would move it again on its retry. The barrier writes the new pin,
+// which records the moved-to node, and the attach turns failback on again
+// after that, when its decision allows it (see attachHA.syncFailback).
+func holdFailbackForMove(ctx context.Context, deps Deps, narrow ha.NarrowDeps, vmid int) error {
+	if _, err := setVMFailback(ctx, narrow.Resources, deps.RequestDirectorUUID, vmid, false); err != nil {
+		return fmt.Errorf("turn off failback on the HA resource of VM %d before the move: %w", vmid, err)
+	}
+	return nil
+}
+
 // attachMoveAction says what an operator does about an HA-managed VM outside
-// its admissible set.
+// its admissible set. The attach turned failback off before it asked for the
+// move, so a manual migration stays where it lands, and the attach's retry
+// writes the pin for the new node and turns failback on again.
 func attachMoveAction(vmid int, set []string) string {
 	example := "<node>"
 	if len(set) > 0 {
 		example = set[0]
 	}
 	return fmt.Sprintf("To fix it, migrate the VM to a node of %s, for example with ha-manager migrate %s %s, "+
-		"and retry the attach", strings.Join(set, ","), haResourceSid(vmid), example)
+		"and retry the attach. If the VM's HA resource has failback on, set it off first with ha-manager set "+
+		"%s --failback 0, or the CRM moves the VM back to the node its pin prefers; the attach "+
+		"turns failback on again once the pin names the new node", strings.Join(set, ","), haResourceSid(vmid),
+		example, haResourceSid(vmid))
 }
 
 // pendingAttachLeave finishes, on the next attach, a removal from HA that an
@@ -704,6 +734,9 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 			return ha.MoveIntoSet(ctx, narrowDeps, ha.MoveInput{
 				VMID: h.vmid, Node: node, Set: set, Targets: ha.MoveTargets(h.profile, set, h.newPin, node),
 				Budget: haMotionWait(h.deps),
+				BeforeMigrate: func(ctx context.Context) error {
+					return holdFailbackForMove(ctx, h.deps, narrowDeps, h.vmid)
+				},
 			})
 		},
 		Failback:      h.decision.Failback,

@@ -148,8 +148,10 @@ func TestAttachHARun_DriftDuringTheBarrierMovesTheVMBackUnderHA(t *testing.T) {
 	if err := runNarrowed(t, deps, h, sl); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"request:ignored", "request:started", "migrate:pve01", "request:ignored", "attach",
-		"request:started"}
+	// Failback goes off before the move and on again once the pin names
+	// the set, so the CRM never pulls the VM back to the node it left.
+	want := []string{"request:ignored", "request:started", "failback:false", "migrate:pve01", "request:ignored",
+		"attach", "request:started", "failback:true"}
 	if !slices.Equal(sl.events, want) {
 		t.Fatalf("events %v, want %v", sl.events, want)
 	}
@@ -179,7 +181,8 @@ func TestDecideAttachHA_RetryMovesAVMOutsideItsSetBackUnderHA(t *testing.T) {
 			if err := runNarrowed(t, deps, h, sl); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			want := []string{"migrate:pve01", "request:ignored", "attach", "request:started"}
+			want := []string{"failback:false", "migrate:pve01", "request:ignored", "attach", "request:started",
+				"failback:true"}
 			if !slices.Equal(sl.events, want) {
 				t.Fatalf("events %v, want %v", sl.events, want)
 			}
@@ -210,7 +213,7 @@ func TestDecideAttachHA_RefusedMoveKeepsHAUnderManaged(t *testing.T) {
 			t.Fatalf("err %q lacks %q", err, part)
 		}
 	}
-	if !slices.Equal(sl.events, []string{"migrate:pve01"}) || m.res.state != "started" {
+	if !slices.Equal(sl.events, []string{"failback:false", "migrate:pve01"}) || m.res.state != "started" {
 		t.Fatalf("events %v state %q", sl.events, m.res.state)
 	}
 }
@@ -233,7 +236,7 @@ func TestDecideAttachHA_RefusedMoveKeepsHAWhenTheNodeMissesTheDisk(t *testing.T)
 			t.Fatalf("err %q lacks %q", err, part)
 		}
 	}
-	if !slices.Equal(sl.events, []string{"migrate:pve01"}) || m.res.state != "started" {
+	if !slices.Equal(sl.events, []string{"failback:false", "migrate:pve01"}) || m.res.state != "started" {
 		t.Fatalf("events %v state %q", sl.events, m.res.state)
 	}
 }
@@ -265,7 +268,7 @@ func TestDecideAttachHA_RefusedMoveLeavesHAUnderAuto(t *testing.T) {
 	if err != nil || h == nil {
 		t.Fatalf("decision: h %+v err %v", h, err)
 	}
-	if h.action != attachHALeave || !slices.Equal(sl.events, []string{"migrate:pve01"}) {
+	if h.action != attachHALeave || !slices.Equal(sl.events, []string{"failback:false", "migrate:pve01"}) {
 		t.Fatalf("action %v events %v, want a leave after the refused move", h.action, sl.events)
 	}
 	warned := false
@@ -335,4 +338,124 @@ func (c *driftClient) ClusterStorage() clusterstorage.Service { return c.storage
 func withLiveStorage(deps Deps, rows ...map[string]any) Deps {
 	deps.PVE = &driftClient{icPVEClient: deps.PVE.(*icPVEClient), storage: &driftStorage{rows: rows}}
 	return deps
+}
+
+// preferringPin gives VM 100 a strict pin over all three nodes that prefers
+// pve03, so a VM with failback on that leaves pve03 is pulled back to it by
+// the CRM until the pin names another node.
+func preferringPin(stub *attachHAStub) {
+	stub.pin(true, "pve03:2,pve01,pve02", "nfs")
+}
+
+// watchFailbackWrites records, for each write of the failback flag, the value,
+// the node the VM was on, and the pin's node list at the moment it landed.
+type failbackWrite struct {
+	on   bool
+	node string
+	pin  string
+}
+
+func watchFailbackWrites(m *haMover, stub *attachHAStub) *[]failbackWrite {
+	var writes []failbackWrite
+	var hook func()
+	hook = func() {
+		pin := ""
+		if p := stub.rules["bosh-na-100"]; p.Nodes != nil {
+			pin = *p.Nodes
+		}
+		writes = append(writes, failbackWrite{on: ha.FailbackOf(m.res.failback), node: m.node, pin: pin})
+		m.res.afterFailbackWrite = hook
+	}
+	m.res.afterFailbackWrite = hook
+	return &writes
+}
+
+// eventIndex returns the index of the first event equal to want, or -1.
+func eventIndex(events []string, want string) int {
+	return slices.Index(events, want)
+}
+
+func TestDecideAttachHA_MoveIntoTheSetHoldsFailbackOffUntilThePinNamesTheNewNode(t *testing.T) {
+	// The VM runs on pve03, which its old pin prefers, and the new disk allows
+	// only pve01 and pve02. With failback on, the CRM would pull the VM back
+	// to pve03 as soon as PVE HA moved it, so the attach turns failback off
+	// before the move and turns it on again only once the pin names the set.
+	deps, stub, m, sl := driftRig(t, config.HAModeAuto, "pve03")
+	preferringPin(stub)
+	writes := watchFailbackWrites(m, stub)
+	h, err := decideAttachHA(context.Background(), deps, "100", narrowingDisk())
+	if err != nil || h == nil || h.action != attachHAGuarded {
+		t.Fatalf("decision: h %+v err %v", h, err)
+	}
+	off, moved := eventIndex(sl.events, "failback:false"), eventIndex(sl.events, "migrate:pve01")
+	if off < 0 || moved < 0 || off > moved {
+		t.Fatalf("events %v, want failback turned off before the move", sl.events)
+	}
+	if err := runNarrowed(t, deps, h, sl); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, w := range *writes {
+		if w.on && w.pin != "pve01,pve02" {
+			t.Fatalf("failback turned on while the pin named %q, want only after it names the set", w.pin)
+		}
+	}
+	if h.decision.Failback && !ha.FailbackOf(m.res.failback) {
+		t.Fatalf("failback stayed off after the pin named the set; writes %+v", *writes)
+	}
+	if m.node != "pve01" {
+		t.Fatalf("node %s, want pve01", m.node)
+	}
+}
+
+func TestAttachHARun_MoveBackAfterADriftHoldsFailbackOffUntilThePinNamesTheSet(t *testing.T) {
+	// A queued HA migration takes the VM to pve03, which the old pin prefers,
+	// during the drain. The barrier has PVE HA move it back into the set,
+	// which failback on would undo, so the attach turns failback off first.
+	deps, stub, m, sl := driftRig(t, config.HAModeAuto, "pve01")
+	preferringPin(stub)
+	h, err := decideAttachHA(context.Background(), deps, "100", narrowingDisk())
+	if err != nil || h == nil || h.action != attachHAGuarded {
+		t.Fatalf("decision: h %+v err %v", h, err)
+	}
+	if !h.decision.Failback {
+		t.Fatal("a shared VM with a shared disk keeps failback, which this test needs")
+	}
+	writes := watchFailbackWrites(m, stub)
+	m.driftTo = "pve03"
+	if err := runNarrowed(t, deps, h, sl); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	off, moved := eventIndex(sl.events, "failback:false"), eventIndex(sl.events, "migrate:pve01")
+	if off < 0 || moved < 0 || off > moved {
+		t.Fatalf("events %v, want failback turned off before the move", sl.events)
+	}
+	for _, w := range *writes {
+		if w.on && w.pin != "pve01,pve02" {
+			t.Fatalf("failback turned on while the pin named %q, want only after it names the set", w.pin)
+		}
+	}
+	if !ha.FailbackOf(m.res.failback) || m.node != "pve01" {
+		t.Fatalf("failback %v node %s, want failback on again on pve01; writes %+v",
+			ha.FailbackOf(m.res.failback), m.node, *writes)
+	}
+}
+
+func TestDecideAttachHA_FailbackWriteFailureBeforeTheMoveKeepsHA(t *testing.T) {
+	// A failback write that fails leaves the CRM free to pull the VM back, so
+	// the move does not start, and the attach waits with the VM under HA.
+	deps, stub, m, sl := driftRig(t, config.HAModeAuto, "pve03")
+	preferringPin(stub)
+	m.res.failbackErr = &sdkerrors.APIError{HTTPCode: 500, Message: "cfs lock timeout"}
+	h, err := decideAttachHA(context.Background(), deps, "100", narrowingDisk())
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || h != nil {
+		t.Fatalf("h %+v err %v, want a retriable error", h, err)
+	}
+	for _, part := range []string{"turn off failback", "cfs lock timeout", "keeps its HA resource"} {
+		if !strings.Contains(err.Error(), part) {
+			t.Fatalf("err %q lacks %q", err, part)
+		}
+	}
+	if len(sl.events) != 0 || m.res.state != "started" || m.node != "pve03" {
+		t.Fatalf("events %v state %q node %s, want nothing sent", sl.events, m.res.state, m.node)
+	}
 }

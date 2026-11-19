@@ -75,6 +75,12 @@ type MoveInput struct {
 	// between reads.
 	Budget       time.Duration
 	PollInterval time.Duration
+	// BeforeMigrate, when set, runs right before the migrate request, after
+	// every check that sends nothing, so it runs only for a move that PVE HA
+	// is asked for. The CPI turns failback off there, because failback on
+	// would have the CRM pull the VM back to the node its old pin prefers. An
+	// error stops the move with MoveRefused, and no request is sent.
+	BeforeMigrate func(ctx context.Context) error
 }
 
 // MoveIntoSet asks PVE HA to migrate an HA-managed VM to a node of in.Set and
@@ -88,8 +94,8 @@ type MoveInput struct {
 //     relocation, or lock in flight. A VM that settles inside the set needs
 //     no request.
 //  3. Check that PVE HA holds the VM with a requested state of started or
-//     stopped, the only states the CRM migrates, and send the request to the
-//     first target the VM is not on. A refusal, or a response that names
+//     stopped, the only states the CRM migrates, run in.BeforeMigrate, and
+//     send the request to the first target the VM is not on. A refusal, or a response that names
 //     resources blocking the move, returns MoveRefused.
 //  4. Wait for the move. A VM that settles inside the set ends the wait. The
 //     CRM reads its commands at the start of a round, so the first round
@@ -151,6 +157,12 @@ func MoveIntoSet(ctx context.Context, deps NarrowDeps, in MoveInput) (pve.VMLoca
 	if target == "" {
 		return loc, &MoveError{Failure: MoveRefused, Reason: fmt.Sprintf("no node of %s can take the VM now",
 			where)}
+	}
+	if in.BeforeMigrate != nil {
+		if err := in.BeforeMigrate(ctx); err != nil {
+			return loc, &MoveError{Failure: MoveRefused, Reason: fmt.Sprintf("the CPI could not prepare the "+
+				"migration of %s to node %s", sid, target), Err: err}
+		}
 	}
 	resp, err := deps.Migrate.CreateHaResourcesMigrate(ctx, sid, &sdkcluster.CreateHaResourcesMigrateParams{
 		Node: target,
