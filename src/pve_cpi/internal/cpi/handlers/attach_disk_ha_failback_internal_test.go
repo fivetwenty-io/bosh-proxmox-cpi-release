@@ -373,3 +373,38 @@ func TestAttachHARun_ReplicateTaggedVMKeepsFailbackOffWithASharedDisk(t *testing
 		t.Fatalf("events %v; a replicate-tagged VM keeps failback off", sl.events)
 	}
 }
+
+// TestAttachHARun_WidenedPinTurnsFailbackOffAgainAfterTheDiskLands attaches a
+// node-local disk to a hold VM whose strict pin already names its node alone,
+// so the barrier widens and writes nothing to resources.cfg around the
+// landing, and no digest refuses a concurrent raise. A call in another process
+// turns failback on after the attach's own off-writes and before the disk
+// lands, and the attach must turn it off again once the disk is in place.
+func TestAttachHARun_WidenedPinTurnsFailbackOffAgainAfterTheDiskLands(t *testing.T) {
+	deps, stub, _ := attachRig(config.HAModeAuto)
+	deps.Config.HA.LocalPolicy = haChoiceOf(config.HALocalPolicyHold)
+	stub.pin(true, "pve01", "nfs")
+	h, err := decideAttachHA(context.Background(), deps, "100", localDisk())
+	if err != nil || h == nil || h.action != attachHAGuarded || h.decision.Failback {
+		t.Fatalf("decision: h %+v err %v, want a guarded attach without failback", h, err)
+	}
+	if ha.Narrows(h.oldPin, h.newPin) {
+		t.Fatalf("pin %+v narrows %+v; the test needs the widening path", h.newPin, h.oldPin)
+	}
+	sl := &stagingLog{}
+	res := &attachRunRes{log: sl, state: "started", comment: stub.comment, failback: failbackFlag(false)}
+	h.narrow = barrierView(res)
+	if err := h.run(context.Background(), func(context.Context) (string, error) {
+		res.failback = failbackFlag(true)
+		sl.add("attach")
+		return "pve01", nil
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ha.FailbackOf(res.failback) {
+		t.Fatalf("failback is on after the attach, events %v", sl.events)
+	}
+	if want := []string{"attach", "failback:false"}; !slices.Equal(sl.events, want) {
+		t.Fatalf("events %v, want %v", sl.events, want)
+	}
+}
