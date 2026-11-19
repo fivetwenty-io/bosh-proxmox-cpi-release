@@ -168,71 +168,105 @@ func listHAStateVMIDs(ctx context.Context, c Client, policy HAStateScanPolicy) (
 		}
 		return nil, cpierrors.Cloud("NextVMID: the HA state scan has no cluster client")
 	}
-	used := map[int]struct{}{}
-	addSID := func(sid string) {
-		kind, id, ok := strings.Cut(strings.TrimSpace(sid), ":")
-		if !ok || (kind != "vm" && kind != "ct") {
-			return
-		}
-		if vmid, err := strconv.Atoi(id); err == nil && vmid > 0 {
-			used[vmid] = struct{}{}
-		}
+	s := &haStateScan{ctx: ctx, policy: policy, used: map[int]struct{}{}}
+	if stop, err := s.scanResources(svc); stop || err != nil {
+		return s.result(err)
 	}
-	// fail answers a list that could not be used. A nil answer lets the
-	// allocation go on with what the scan has read so far.
-	fail := func(err error, what string) (map[int]struct{}, error) {
-		if answer := haStateScanFailure(ctx, policy, err, what); answer != nil {
-			return nil, answer
-		}
-		return used, nil
-	}
+	return s.result(s.scanRules(svc))
+}
 
-	const resourcesList, rulesList = "HA resources", "HA rules"
+// haStateScan collects the VMIDs one HA state scan finds.
+type haStateScan struct {
+	ctx    context.Context //nolint:containedctx // One scan's reads share the allocation's context.
+	policy HAStateScanPolicy
+	used   map[int]struct{}
+}
+
+const haStateResourcesList, haStateRulesList = "HA resources", "HA rules"
+
+// result returns what the scan found, or err when the scan failed.
+func (s *haStateScan) result(err error) (map[int]struct{}, error) {
+	if err != nil {
+		return nil, err
+	}
+	return s.used, nil
+}
+
+// addSID records the VMID a vm: or ct: service ID names.
+func (s *haStateScan) addSID(sid string) {
+	kind, id, ok := strings.Cut(strings.TrimSpace(sid), ":")
+	if !ok || (kind != "vm" && kind != "ct") {
+		return
+	}
+	if vmid, err := strconv.Atoi(id); err == nil && vmid > 0 {
+		s.used[vmid] = struct{}{}
+	}
+}
+
+// fail answers a list that could not be used. A nil answer lets the
+// allocation go on with what the scan has read so far.
+func (s *haStateScan) fail(err error, what string) error {
+	return haStateScanFailure(s.ctx, s.policy, err, what)
+}
+
+// malformed answers a row that does not parse. A best-effort scan answers it
+// as any failed read, and every other scan fails the allocation.
+func (s *haStateScan) malformed(err error, what string, format string, args ...any) error {
+	if s.policy == HAStateScanBestEffort {
+		return s.fail(err, what)
+	}
+	return cpierrors.Cloud(format, args...)
+}
+
+// scanResources records the VMIDs the HA resources name. It reports stop when
+// the scan answered a failed read and must not read the rules.
+func (s *haStateScan) scanResources(svc sdkcluster.Service) (stop bool, err error) {
 	var resources *sdkcluster.ListHaResourcesResponse
-	missing, err := readHAStateList(ctx, "vmid_ha_resources_scan", func() error {
+	missing, err := readHAStateList(s.ctx, "vmid_ha_resources_scan", func() error {
 		var inner error
-		resources, inner = svc.ListHaResources(ctx, nil)
+		resources, inner = svc.ListHaResources(s.ctx, nil)
 		return inner
 	})
 	switch {
 	case err != nil:
-		return fail(err, resourcesList)
+		return true, s.fail(err, haStateResourcesList)
 	case missing:
-		log.FromContext(ctx).Debug("pve: PVE does not implement the HA resources list, so the VMID allocation " +
+		log.FromContext(s.ctx).Debug("pve: PVE does not implement the HA resources list, so the VMID allocation " +
 			"scans no HA resource")
+		return false, nil
 	case resources == nil:
-		return fail(cpierrors.Retriable("no rows returned"), resourcesList)
+		return true, s.fail(cpierrors.Retriable("no rows returned"), haStateResourcesList)
 	}
-	if resources != nil {
-		for i, raw := range *resources {
-			var row struct {
-				SID string `json:"sid"`
-			}
-			if err := json.Unmarshal(raw, &row); err != nil {
-				if policy == HAStateScanBestEffort {
-					return fail(err, resourcesList)
-				}
-				return nil, cpierrors.Cloud("NextVMID: HA resources row %d does not parse: %v", i, err)
-			}
-			addSID(row.SID)
+	for i, raw := range *resources {
+		var row struct {
+			SID string `json:"sid"`
 		}
+		if err := json.Unmarshal(raw, &row); err != nil {
+			return true, s.malformed(err, haStateResourcesList, "NextVMID: HA resources row %d does not parse: %v", i, err)
+		}
+		s.addSID(row.SID)
 	}
+	return false, nil
+}
 
+// scanRules records the VMIDs the HA rules name, by their resources and by a
+// node pin's name.
+func (s *haStateScan) scanRules(svc sdkcluster.Service) error {
 	var rules *sdkcluster.ListHaRulesResponse
-	missing, err = readHAStateList(ctx, "vmid_ha_rules_scan", func() error {
+	missing, err := readHAStateList(s.ctx, "vmid_ha_rules_scan", func() error {
 		var inner error
-		rules, inner = svc.ListHaRules(ctx, &sdkcluster.ListHaRulesParams{})
+		rules, inner = svc.ListHaRules(s.ctx, &sdkcluster.ListHaRulesParams{})
 		return inner
 	})
 	switch {
 	case err != nil:
-		return fail(err, rulesList)
+		return s.fail(err, haStateRulesList)
 	case missing:
-		log.FromContext(ctx).Debug("pve: PVE does not implement the HA rules list, as on PVE 8, so the VMID " +
+		log.FromContext(s.ctx).Debug("pve: PVE does not implement the HA rules list, as on PVE 8, so the VMID " +
 			"allocation scans the HA resources alone")
-		return used, nil
+		return nil
 	case rules == nil:
-		return fail(cpierrors.Retriable("no rows returned"), rulesList)
+		return s.fail(cpierrors.Retriable("no rows returned"), haStateRulesList)
 	}
 	for i, raw := range *rules {
 		var row struct {
@@ -240,28 +274,23 @@ func listHAStateVMIDs(ctx context.Context, c Client, policy HAStateScanPolicy) (
 			Resources json.RawMessage `json:"resources"`
 		}
 		if err := json.Unmarshal(raw, &row); err != nil {
-			if policy == HAStateScanBestEffort {
-				return fail(err, rulesList)
-			}
-			return nil, cpierrors.Cloud("NextVMID: HA rules row %d does not parse: %v", i, err)
+			return s.malformed(err, haStateRulesList, "NextVMID: HA rules row %d does not parse: %v", i, err)
 		}
 		if id, ok := strings.CutPrefix(row.Rule, haPinRuleNamePrefix); ok {
 			if vmid, err := strconv.Atoi(id); err == nil && vmid > 0 {
-				used[vmid] = struct{}{}
+				s.used[vmid] = struct{}{}
 			}
 		}
 		sids, err := haRuleResourceSIDs(row.Resources)
 		if err != nil {
-			if policy == HAStateScanBestEffort {
-				return fail(err, rulesList)
-			}
-			return nil, cpierrors.Cloud("NextVMID: HA rule %q lists resources that do not parse: %v", row.Rule, err)
+			return s.malformed(err, haStateRulesList,
+				"NextVMID: HA rule %q lists resources that do not parse: %v", row.Rule, err)
 		}
 		for _, sid := range sids {
-			addSID(sid)
+			s.addSID(sid)
 		}
 	}
-	return used, nil
+	return nil
 }
 
 // haRuleResourceSIDs reads a rule's resources field, which PVE sends as one
