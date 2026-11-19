@@ -12,6 +12,18 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Changed
+
+- The CPI now registers a VM's HA resource with `failback` on when every volume the VM holds, its persistent disks included, sits on shared storage. PVE then moves the VM back to its preferred node after a recovery, and back to its node when a maintenance there ends, so a rolling maintenance no longer leaves the node drained last nearly empty. A `hold` VM, a `replicate` VM, and any VM with a volume on node-local storage keep `failback` off, because moving a `replicate` VM back after a failover would run the reversed replication job, whose first run destroys the writes that existed only on the old node.
+
+- `attach_disk` now turns `failback` off before a disk lands that leaves the VM no longer shared, and it fails with a retriable error when it can't. It turns the flag on after a disk lands that keeps the VM shared. `detach_disk`, `reboot_vm`, and `set_vm_metadata` set the flag that the VM's volumes call for, and they write only when it differs, so a VM that an earlier release registered gets the new flag at its next such call or at a `bosh recreate`.
+
+### Added
+
+- `pve.ha.failback`, an optional boolean, turns `failback` off on every HA resource the CPI writes when it is `false`. Left unset, it lets the CPI turn the flag on for shared VMs. A cpi-config entry can override it under `pve_ha`.
+
+- `pve-cid ha` now reports a `replicate` VM whose HA resource has `failback` on as the `failback_on_replica` problem, and any other resource of this Director whose `failback` differs from the value the CPI writes as `failback_drift` advice.
+
 ## [0.11.1] - 2026-11-19
 
 ### Changed

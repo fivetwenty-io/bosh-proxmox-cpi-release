@@ -136,6 +136,7 @@ A deployment that adds no new spec properties gets exactly the behavior it had b
   default), read through `HAPinAZStrictValue()`. The earlier
   `PlacementConfig.ExcludeMaintenanceNodes` and `PlacementConfig.PinAZStrict`
   fields were removed with their placement keys.
+- `pve.ha.failback` defaults to `true` when unset, read through `HAFailbackEnabled()`, so a shared VM's HA resource gets PVE's own default for the flag. Only an explicit `false` turns it off.
 
 These fields use accessor methods that encode the Level 6 constant explicitly
 rather than relying on the Go zero value.

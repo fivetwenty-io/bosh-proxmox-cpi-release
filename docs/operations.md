@@ -723,7 +723,9 @@ Each finding is either a problem or advice. The command exits with 0 when the re
   `observe_only`, `node_down`, `entry_clock_unreadable`, `quorum_fragile`, `qdevice_advice`, `advice`, and `crs_mode`.
 
 - Rules and resources
-  `rule_problem`, `rule_unmarked`, `pin_missing`, `soft_pin_resource_affinity`, `anti_affinity_skipped`, `anti_affinity_split`, `anti_affinity_short`, `anti_affinity_ambiguous`, `resource_ignored`, and `managed_without_resource`.
+  `rule_problem`, `rule_unmarked`, `pin_missing`, `soft_pin_resource_affinity`, `anti_affinity_skipped`, `anti_affinity_split`, `anti_affinity_short`, `anti_affinity_ambiguous`, `resource_ignored`, `managed_without_resource`, `failback_on_replica`, and `failback_drift`.
+
+  The `failback_on_replica` problem names a `replicate` VM whose HA resource has `failback` on, because PVE would move such a VM back to its old node after a failover and run the reversed replication job, whose first run destroys the writes that existed only on that node. The `failback_drift` advice names any other resource of this Director whose `failback` differs from the value the CPI writes for it, which is on for a VM whose every volume sits on shared storage and off otherwise or when `pve.ha.failback` is `false`. The next `set_vm_metadata` or `reboot_vm` on the VM sets the flag, and so does `ha-manager set vm:<vmid> --failback 0` or `--failback 1`. The doctor skips a resource the narrowing barrier holds, a VM whose config, storages, rules, or replication jobs it could not read, and a VM whose strict pin names one node, because failback has nowhere to move such a VM.
 
 - CPU and local storage
   `cpu_unknown`, `cpu_host_multi_domain`, `cpu_pin_crosses_domain`, `cpu_domain_too_small`, `local_unprotected`, `hold_blocks_maintenance`, `maintenance_stranded`, and `recovery_stranded`.
@@ -843,7 +845,7 @@ ha-manager remove vm:<vmid>
 ha-manager add vm:<vmid> --state started
 ```
 
-The VM has no HA protection between those two commands, and a hand-made resource carries no pin or ownership marker, so we restore its rules afterward. When the CPI does the same work, it tags the VM `bosh-ha-readd-<unix seconds>` until the registration finishes. A tag that lingers past the create timeout plus `pve.ha.motion_wait_sec` means the registration did not finish, and the doctor reports it as `readd_tag`. We then add the resource with the command above, restore the VM's rules, and remove the tag.
+The VM has no HA protection between those two commands, and a hand-made resource carries no pin or ownership marker, so we restore its rules afterward. A resource added by hand gets `failback` on, which is PVE's default, and the CPI never changes a resource without its marker. So for a `replicate` VM, a `hold` VM, or any VM with a volume on node-local storage, we add `--failback 0` to the `ha-manager add` command. When the CPI does the same work, it tags the VM `bosh-ha-readd-<unix seconds>` until the registration finishes. A tag that lingers past the create timeout plus `pve.ha.motion_wait_sec` means the registration did not finish, and the doctor reports it as `readd_tag`. We then add the resource with the command above, restore the VM's rules, and remove the tag.
 
 ### Node maintenance with `hold` VMs
 
@@ -897,9 +899,15 @@ Stopping a resource through HA changes nothing in the CPI's metadata, so the VM 
 
 If a wedge has already started, for example a `pve-ha-manager` upgrade that is stuck in its restart of the resource manager, we do not kill anything on the node. We stop each blocking resource through HA with the first command above. The drain then finishes within seconds, the stuck restart or reboot goes on by itself, and `pve-cid ha` stops reporting the node. We start the VMs again with the second command once the node has left maintenance.
 
+### Where VMs go when a maintenance ends
+
+When a node leaves maintenance, PVE moves a VM back to it only when the VM's HA resource has `failback` on. The CPI turns the flag on for each VM whose volumes all sit on shared storage, so those VMs go back to their nodes by live migration as each maintenance ends, and a rolling maintenance across every node leaves the cluster about as balanced as it started. A `hold` VM, a `replicate` VM, and any other VM with a volume on node-local storage keep `failback` off. A `replicate` VM that a maintenance moved to its partner stays there, and its pin keeps both nodes, as [HA and Resurrection](ha-and-resurrection.md#the-replicate-data-loss-window) describes.
+
+With `pve.ha.failback: false`, no CPI VM moves back, and the node we drain last ends up nearly empty. We then move VMs back ourselves with `ha-manager migrate vm:<vmid> <node>`. Before a rolling maintenance, we run `pve-cid ha` and read any `failback_drift` advice, because a VM that an earlier release registered keeps `failback` off until a call touches it. A `bosh recreate` of the instance, or any `set_vm_metadata` or `reboot_vm` on the VM, sets the flag. [Failback](ha-and-resurrection.md#failback) covers what PVE does with the flag.
+
 ### Replicate failover and the old node's writes
 
-After a `replicate` VM fails over, PVE reverses its replication job, so that the job runs from the partner back to the old node. The job's next run receives with `zfs recv -F`, which rolls the old node's dataset back to the last common snapshot. Any write that existed only on the old node, which means every write since the last successful sync, is destroyed by that first run. Every resource the CPI registers has `failback` set to 0, so the VM stays on the partner when the old node returns. The next `reboot_vm` or `set_vm_metadata` call that touches the VM narrows its pin to the partner alone, and in the same step the CPI asks the job to sync from the partner. From then on the VM behaves like a `hold` VM on the partner, and the destructive first sync can start at the CPI's next touch of the VM, and not only on the job's own schedule.
+After a `replicate` VM fails over, PVE reverses its replication job, so that the job runs from the partner back to the old node. The job's next run receives with `zfs recv -F`, which rolls the old node's dataset back to the last common snapshot. Any write that existed only on the old node, which means every write since the last successful sync, is destroyed by that first run. The CPI registers every `replicate` VM's HA resource with `failback` off, whatever `pve.ha.failback` says, so the VM stays on the partner when the old node returns. The next `reboot_vm` or `set_vm_metadata` call that touches the VM narrows its pin to the partner alone, and in the same step the CPI asks the job to sync from the partner. From then on the VM behaves like a `hold` VM on the partner, and the destructive first sync can start at the CPI's next touch of the VM, and not only on the job's own schedule.
 
 When those writes do not matter, we do nothing, and replication resumes in the new direction by itself. When they do matter, we save them first.
 
