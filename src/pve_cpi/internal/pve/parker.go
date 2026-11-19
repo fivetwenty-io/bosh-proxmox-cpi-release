@@ -165,6 +165,12 @@ type ParkerConfig struct {
 	// the holder scan and the loops answer a vanished parker as they did
 	// before parkers were ever retired.
 	RetiresParkers bool
+	// ScanHAState makes a parker's VMID allocation skip every VMID the
+	// cluster's HA resources and rules still name (see WithHAStateScan), so a
+	// new parker never lands on a VMID whose leftover HA resource or pin a
+	// gone parker left behind, and never inherits them. It reads the HA
+	// resources and rules, so it is set only where the CPI may read HA state.
+	ScanHAState bool
 	// EmptyListingCorroborators supplies the second opinions the keep rule
 	// hands to ProveVolumeAbsent when it weighs whether a transfer record's
 	// volume is gone. It's the same supplier the local backend's sweep gets
@@ -1572,6 +1578,14 @@ func createParkerVM(ctx context.Context, c Client, logger *log.Logger, node stri
 	cores := 1
 	scsihw := "virtio-scsi-pci"
 
+	vmidOpts := []AllocOption{
+		WithRange(cfg.VMIDRangeStart, cfg.VMIDRangeEnd),
+		WithNoBackoff(),
+		WithStorageScan(node, cfg.DiskStorage),
+	}
+	if cfg.ScanHAState {
+		vmidOpts = append(vmidOpts, WithHAStateScan())
+	}
 	vmid, createErr := AllocateWithRetry(
 		ctx,
 		c,
@@ -1616,9 +1630,7 @@ func createParkerVM(ctx context.Context, c Client, logger *log.Logger, node stri
 		// closure via RetryOnTransientOrLock.
 		nil,
 		1,
-		WithRange(cfg.VMIDRangeStart, cfg.VMIDRangeEnd),
-		WithNoBackoff(),
-		WithStorageScan(node, cfg.DiskStorage),
+		vmidOpts...,
 	)
 	if createErr != nil {
 		// Create-conflict path: another CPI won the race. Re-find and adopt.

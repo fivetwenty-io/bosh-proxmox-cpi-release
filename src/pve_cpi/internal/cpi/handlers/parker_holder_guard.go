@@ -62,6 +62,11 @@ func parkerReadConfigFor(deps Deps) pve.ParkerConfig {
 		// mode but off, so only there can a parker vanish in a benign race.
 		// See ParkerConfig.RetiresParkers.
 		RetiresParkers: deps.Config.HAModeValue() != config.HAModeOff,
+		// Outside off mode a gone parker can leave its HA resource or its pin
+		// behind until the parker sweep proves it gone, so a new parker must
+		// not land on a VMID they still name. Off mode reads no HA state.
+		// See ParkerConfig.ScanHAState.
+		ScanHAState: deps.Config.HAModeValue() != config.HAModeOff,
 		// The keep rule proves a transfer record's volume gone with the same
 		// second opinions the local backend's sweep gets.
 		EmptyListingCorroborators: BackendCorroborators(deps.Config, deps.PVE),

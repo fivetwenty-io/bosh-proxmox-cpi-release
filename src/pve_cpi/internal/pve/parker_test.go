@@ -3345,3 +3345,49 @@ func (n *parkerNodesService) ListNodes(context.Context) (*sdknodes.ListNodesResp
 	empty := sdknodes.ListNodesResponse{}
 	return &empty, nil
 }
+
+// TestEnsureParker_SkipsAVMIDThatHAStateStillNames proves a parker created
+// under ScanHAState never lands on a VMID that a leftover HA resource or pin
+// still names, so it never inherits them, and that a config without it reads
+// no HA state.
+func TestEnsureParker_SkipsAVMIDThatHAStateStillNames(t *testing.T) {
+	t.Parallel()
+	for _, scan := range []bool{true, false} {
+		createdVMID := 0
+		qemuSvc := &parkerQEMU{
+			configFn: func(_ string, vmid int) (map[string]any, error) {
+				if createdVMID != 0 && vmid == createdVMID {
+					return map[string]any{"tags": "bosh-parker"}, nil
+				}
+				return map[string]any{}, nil
+			},
+			createFn: func(_ string, params map[string]any) (string, error) {
+				createdVMID, _ = params["vmid"].(int)
+				return "", nil
+			},
+		}
+		base := buildParkerClient(qemuSvc, func(context.Context, *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return parkerClusterResp(), nil
+		})
+		lists := &haListsCluster{}
+		for vmid := 90000; vmid < 90009; vmid += 2 {
+			lists.resources = append(lists.resources, map[string]any{"sid": fmt.Sprintf("vm:%d", vmid)})
+			lists.rules = append(lists.rules, map[string]any{
+				"rule": fmt.Sprintf("bosh-na-%d", vmid+1), "type": "node-affinity",
+				"resources": fmt.Sprintf("vm:%d", vmid+1),
+			})
+		}
+		c := &haScanClient{Client: base, lists: lists}
+		cfg := pve.ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90010, ScanHAState: scan}
+		vmid, err := pve.EnsureParker(context.Background(), c, nopLogger(), "pve1", cfg)
+		if err != nil {
+			t.Fatalf("scan %v: EnsureParker: %v", scan, err)
+		}
+		if scan && vmid != 90010 {
+			t.Fatalf("EnsureParker = %d, want 90010, the VMID no HA state names", vmid)
+		}
+		if !scan && lists.readCount() != 0 {
+			t.Fatalf("a config without ScanHAState read HA state %d times", lists.readCount())
+		}
+	}
+}

@@ -233,6 +233,23 @@ func TestParkerWriteConfigFor_CarriesTheSelectionRule(t *testing.T) {
 	}
 }
 
+// TestParkerConfigFor_ScansHAStateOutsideOffMode proves every parker create
+// outside off mode skips the VMIDs the cluster's HA state still names, so a
+// new parker never inherits a gone parker's leftover resource or pin, and
+// that off mode, which may lack the privilege to read HA state, reads none.
+func TestParkerConfigFor_ScansHAStateOutsideOffMode(t *testing.T) {
+	deps := idTestDeps(newIDFakeClient(nil))
+	if parkerWriteConfigFor(deps).ScanHAState || parkerReadConfigFor(deps).ScanHAState {
+		t.Fatal("off mode allocates parkers without reading HA state")
+	}
+	for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
+		deps.Config.HA = &config.HAConfig{Mode: haChoiceOf(mode)}
+		if !parkerWriteConfigFor(deps).ScanHAState || !parkerReadConfigFor(deps).ScanHAState {
+			t.Fatalf("%s mode must allocate parkers clear of the VMIDs HA state names", mode)
+		}
+	}
+}
+
 func TestVolumeStorageAndNodesOutside(t *testing.T) {
 	if got := volumeStorage(" ab:vm-1-disk-0 "); got != "ab" {
 		t.Errorf("volumeStorage = %q", got)

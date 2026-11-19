@@ -71,6 +71,9 @@ type allocOpts struct {
 	// enabled storage with images content that this node sees. Set via
 	// WithNodeImageStorageScan.
 	imageStorageScanNode string
+	// haStateScan makes NextVMID union the VMIDs the cluster's HA resources
+	// and rules name into its used-set. Set via WithHAStateScan.
+	haStateScan bool
 }
 
 // storageScanTarget is one (node, storage) pair queued by WithExtraStorageScan.
@@ -425,6 +428,15 @@ func NextVMID(ctx context.Context, c Client, opts ...AllocOption) (int, error) {
 		used[id] = struct{}{}
 	}
 	logStorageOnlyReservations(ctx, storageOnly, ao.rangeStart, ao.rangeEnd)
+	if ao.haStateScan {
+		haUsed, hErr := listHAStateVMIDs(ctx, c)
+		if hErr != nil {
+			return 0, hErr
+		}
+		for id := range haUsed {
+			used[id] = struct{}{}
+		}
+	}
 
 	// Lock only for the pure in-memory scan so two goroutines with identical
 	// "used" snapshots cannot return the same VMID. The randomised start in
