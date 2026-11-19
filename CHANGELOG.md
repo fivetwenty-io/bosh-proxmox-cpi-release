@@ -12,6 +12,14 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Added
+
+- `pve.ha.failback`, an optional boolean, turns `failback` off on every HA resource the CPI writes when it is `false`. Left unset, it lets the CPI turn the flag on for shared VMs. A cpi-config entry can override it under `pve_ha`.
+
+- `pve-cid ha` now reports a `replicate` VM whose HA resource has `failback` on as the `failback_on_replica` problem, and any other resource of this Director whose `failback` differs from the value the CPI writes as `failback_drift` advice.
+
+- `pve-cid ha --widen-replicas` runs the CPI's replica widening pass on demand. It finds each `replicate` VM of one Director whose pin still names its source node alone, and it lists every such VM with what the pass would do and the reason. It is a dry run unless we add `--apply`, and then it widens each pin that a verified sync covers, with the same check and the same locks that `reboot_vm` and `set_vm_metadata` use. The Director's UUID comes from `--request` or `--director-uuid`, and the flag can't be combined with `--cpi-config`. The command exits with 1 when a VM failed or the pass stopped early. We run it as `vcap` on the Director after a deploy that adds `replicate` VMs, once each new job has completed a sync. The `replica_awaiting_sync` advice now names it. [Widening replica pins after a deploy](docs/operations.md#widening-replica-pins-after-a-deploy) shows the command and its output.
+
 ### Changed
 
 - **Upgrade note.** After the upgrade, the first `set_vm_metadata` or `reboot_vm` on a VM whose volumes all sit on shared storage can turn `failback` on for its HA resource, and any deploy that touches the instance sends one of those calls. When that VM runs on a node other than the top-priority node of its pin, PVE live-migrates it to that node at once. To choose when those moves happen, we set `pve.ha.failback: false` before the upgrade, so no call turns the flag on. Then, during a maintenance window, we set it back to `true` or remove it, and the next call that touches each VM turns the flag on. `pve-cid ha` lists each VM whose flag is still off as `failback_drift` advice until a call reaches it.
@@ -50,11 +58,7 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - Staging now records whether the CPI registered a VM as a DLB VM on its HA resource's comment, as `bosh-dlb=1` or `bosh-dlb=0`. `attach_disk`, the pin widening, and the re-registration of a VM read the membership from that record, and fall back to the `auto-rebalance` flag only for a resource an earlier release registered. Before, an operator who turned Auto-Rebalance on in the PVE GUI for a VM outside the dynamic load balancer made the CPI treat the VM as a DLB VM, so a re-registration dropped its AZ preference and wrote `auto-rebalance` on.
 
-### Added
-
-- `pve.ha.failback`, an optional boolean, turns `failback` off on every HA resource the CPI writes when it is `false`. Left unset, it lets the CPI turn the flag on for shared VMs. A cpi-config entry can override it under `pve_ha`.
-
-- `pve-cid ha` now reports a `replicate` VM whose HA resource has `failback` on as the `failback_on_replica` problem, and any other resource of this Director whose `failback` differs from the value the CPI writes as `failback_drift` advice.
+- A `replicate` VM's pin now widens to its partner soon after its first verified sync, without waiting for a `reboot_vm` or `set_vm_metadata` on that VM. Every CPI call that takes the HA rules lock, such as `create_vm`, `delete_vm`, or `attach_disk` on an HA VM, now sweeps this Director's `replicate` VMs after its own work and widens each pin that a verified sync now covers. The sweep makes the same check as `reboot_vm`, under the VM's VMID claim, its journal record, and the HA rules lock, and it reads the VM's HA resource, config, volumes, and job again right before it writes. It touches only VMs that carry this Director's owner tag and whose pin and job carry this Director's marker. It skips a VM that another call holds, that is migrating or recovering, whose HA resource is ignored or held by the narrowing barrier, or whose state changed while it ran. One sweep widens at most three pins, claims at most six VMs, and stops after 60 seconds or half of the call's remaining time. The sweep is best-effort, and a sweep that fails never fails the call. [HA and Resurrection](docs/ha-and-resurrection.md#local-storage) describes it.
 
 ## [0.11.1] - 2026-11-19
 

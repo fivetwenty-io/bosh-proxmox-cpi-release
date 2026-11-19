@@ -3010,6 +3010,30 @@ We run `ha-manager config` to read the resource's `failback` flag, which is on w
 
 For an upgrade, we set `pve.ha.failback: false` before the upgrade, and we set it back to `true` or remove it during a maintenance window, so the moves happen while we watch. To move a VM for good, we give the target node the highest priority in its pin with `ha-manager rules set node-affinity bosh-na-<vmid> --nodes <target>:2,<other>:1`, and PVE moves the VM there by itself. A `failback` that we turn off by hand only lasts until the next `set_vm_metadata` or `reboot_vm`. [Failback](ha-and-resurrection.md#failback) explains the flag.
 
+## A replicate VM's pin still names only its own node
+
+**Symptom**
+
+`pve-cid ha` reports `replica_awaiting_sync` for a `replicate` VM, or `ha-manager rules config` shows its strict `bosh-na-<vmid>` pin with only the VM's own node, some time after the deploy that created the VM. HA can't migrate the VM, and a node maintenance waits on it.
+
+**Cause**
+
+The pin names the partner only after the VM's replication job reports a sync that started more than five minutes after the last change to the VM's volumes, with no error, no failures, and every volume on the partner. `create_vm` doesn't wait for that sync, so the VM leaves the deploy on the narrow pin. The CPI widens such pins in a sweep after every call that takes the HA rules lock, and a `reboot_vm` or `set_vm_metadata` on the VM widens its own pin, but when no such call comes after the sync, nothing widens it.
+
+**Diagnosis**
+
+We read the advice. When it says the job `has not completed its first sync` or `has not completed a sync that started after the last volume change`, the VM is still waiting for a sync, and we check the job with `pvesr status` on the VM's node. When it says the job synced but the pin does not yet name the partner, the VM is ready. A dry run of the widening pass shows each VM with its reason.
+
+```bash
+sudo -u vcap /var/vcap/packages/pve_cpi/bin/pve-cid ha --widen-replicas --director-uuid <uuid>
+```
+
+At Debug, the CPI log also shows the sweep's reason for each VM it skipped, after the line prefix `replica widen sweep:`.
+
+**Fix**
+
+We run the same command with `--apply`, as [Widening replica pins after a deploy](operations.md#widening-replica-pins-after-a-deploy) describes, or we wait for the next call that takes the HA rules lock. A VM that the pass skips because another call holds it, because it is migrating or recovering, or because its HA resource is ignored keeps its pin until a later pass finds it settled. A VM whose job is failing needs the job fixed first, as [Operations, PVE HA](operations.md#pve-ha) describes for `replica_job_failing`.
+
 ## Task timeouts
 
 **Symptom**

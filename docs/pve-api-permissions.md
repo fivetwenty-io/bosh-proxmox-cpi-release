@@ -88,6 +88,8 @@ The probe reads rather than writes because there is no side-effect-free way to t
 
 Beyond that check, `GetPoolComment` is also read by the default-on empty-pool reaper (`pve.pool_reap_empty`, checking a pool's provenance comment before deleting it) and when `cluster_lock_mode: pool` (`cluster_lock.go` reading a lock pool's owner/expiry when stealing or verifying a hold).
 
+The `pve-cid ha --widen-replicas --apply` command loads the token from the CPI's `cpi.json`, so it runs with the CPI's own grants. It writes the same node-affinity pins that `reboot_vm` and `set_vm_metadata` write, so it needs `Sys.Console` on `/` for the rule writes, and it reads replication job status, HA status, and VM configs with the grants the CPI already uses for them. Its VMID claims create and delete lock pools, so a token without `Pool.Allocate` and `Pool.Audit` on `/pool` stops the pass at its first claim, and the command says so and exits with 1. A dry run, without `--apply`, writes nothing and needs only the read grants.
+
 The check can only probe the static pool names; the per-deployment names `pve.vm_pool_template` renders do not exist until their first `create_vm`, so a missing `/pool` grant for them surfaces as a named, non-retriable `create_vm` error directing the operator to grant `Pool.Allocate` at `/pool` or set `pve.vm_pool_template: ""`.
 
 The grant drops out only when `vm_pool_template`, `vm_pool`, `stemcell_template_pool`, and `parker_pool` are all set to `""`, `cluster_lock_mode: pool` and `pool_reap_empty` are unused, and nothing parks disks. The check then makes zero PVE calls.

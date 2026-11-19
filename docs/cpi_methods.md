@@ -287,7 +287,7 @@ flowchart TD
 
 If the VM is stopped when `reboot_vm` is called, the CPI starts it so the VM ends up running, matching the BOSH expectation. The BOSH wire contract is unchanged: `reboot_vm` accepts only `vm_cid`.
 
-For a VM under PVE HA, `reboot_vm` waits out VM motion before it acts and follows a VM that moved to another node. A `replicate` VM whose pin still names its own node alone is checked again here, and the pin widens once a verified sync exists. When the VM's HA resource is in the `error` state and the VM runs, the call clears the error without stopping the guest, by removing the resource and registering it again, as [HA and Resurrection](ha-and-resurrection.md#clearing-an-ha-error) describes. Without `Sys.Console` it returns a retriable error that names the `ha-manager` commands to run by hand.
+For a VM under PVE HA, `reboot_vm` waits out VM motion before it acts and follows a VM that moved to another node. A `replicate` VM whose pin still names its own node alone is checked again here, and the pin widens once a verified sync exists. The same check also runs in the sweep that follows every call that takes the HA rules lock, as [HA and Resurrection](ha-and-resurrection.md#local-storage) describes. When the VM's HA resource is in the `error` state and the VM runs, the call clears the error without stopping the guest, by removing the resource and registering it again, as [HA and Resurrection](ha-and-resurrection.md#clearing-an-ha-error) describes. Without `Sys.Console` it returns a retriable error that names the `ha-manager` commands to run by hand.
 
 ---
 

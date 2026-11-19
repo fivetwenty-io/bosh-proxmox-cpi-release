@@ -678,7 +678,7 @@ Before we set `pve.ha.mode` to `auto` or `managed`, we raise the Director's `hm.
 
 ### Reading the cluster with `pve-cid ha`
 
-The `pve-cid ha` subcommand is a read-only doctor. It never writes to PVE, and it runs in every mode, `off` included. On the Director VM we run it with the full path, because `pve-cid` is not on `PATH`. The `--config` flag is optional there, because the command looks for the configuration in `--config`, then in `$PVE_CPI_CONFIG`, and then at `/var/vcap/jobs/pve_cpi/config/cpi.json`.
+The `pve-cid ha` subcommand is a read-only doctor. It never writes to PVE, and it runs in every mode, `off` included. The one exception is `--widen-replicas --apply`, which runs the CPI's own replica widening pass instead of the doctor, as [Widening replica pins after a deploy](#widening-replica-pins-after-a-deploy) describes. On the Director VM we run it with the full path, because `pve-cid` is not on `PATH`. The `--config` flag is optional there, because the command looks for the configuration in `--config`, then in `$PVE_CPI_CONFIG`, and then at `/var/vcap/jobs/pve_cpi/config/cpi.json`.
 
 ```bash
 /var/vcap/packages/pve_cpi/bin/pve-cid ha
@@ -697,6 +697,15 @@ The command takes these flags.
 
 - `--json`
   This prints the report as JSON.
+
+- `--widen-replicas`
+  This runs the replica widening pass in place of the doctor. Without `--apply` it is a dry run that claims and writes nothing. It needs the Director's UUID from `--request` or `--director-uuid`, and it cannot be combined with `--cpi-config`.
+
+- `--apply`
+  With `--widen-replicas`, this writes the widened pins.
+
+- `--director-uuid UUID`
+  With `--widen-replicas`, this names the Director whose VMs the pass may widen when no `--request` names it. When both are given, they must name the same Director.
 
 The report starts with the profile line that the CPI logs, with the headroom result added at its end. It then lists the nodes, the CPU migration domains, and the findings, and it ends with a count.
 
@@ -751,11 +760,30 @@ Entries of a `--cpi-config` document that share one cluster and one VMID band st
 
 The `entry_clock_unreadable` finding names the entry node, and it covers an entry node whose own clock read fails. A node does that while systemd shuts it down, and it also does it when `systemd-timedated` is broken. When the CPI borrowed another member's clock, the HA view is still good, so the finding is advice. The doctor reads the entry node's clock once more before it reports, so a one-off server error on a healthy node reports nothing. When no member's clock answered, the HA view is unreadable and the profile is observe-only, so the finding is a problem. In both cases we check `timedatectl` and `systemd-timedated` on the entry node, or we put another node first in `pve.endpoints`.
 
-A `replicate` VM shows `replica_awaiting_sync` as advice while its job works but the pin has not yet widened. It shows `replica_not_recoverable` as a problem only when no usable job exists, the job is disabled, or the first sync is more than twice its schedule plus the clock-skew bound overdue. A schedule the doctor cannot measure, such as a weekday list, gets `replica_schedule_unjudged` and is never called stale or healthy.
+A `replicate` VM shows `replica_awaiting_sync` as advice while its job works but the pin has not yet widened. Once a sync is verified, the pin widens after the next CPI call that takes the HA rules lock, and the advice names `pve-cid ha --widen-replicas --apply` for widening it now. It shows `replica_not_recoverable` as a problem only when no usable job exists, the job is disabled, or the first sync is more than twice its schedule plus the clock-skew bound overdue. A schedule the doctor cannot measure, such as a weekday list, gets `replica_schedule_unjudged` and is never called stale or healthy.
 
 PVE percent-encodes a replication job's comment again each time one pvescheduler pass writes `replication.cfg` more than once, which happens when HA recovers several replicated guests onto one node. The CPI's marker `bosh-cpi:v1` then reads `bosh-cpi%3Av1` or `bosh-cpi%253Av1` through the API. The CPI and the doctor undo those rounds before they read the marker, so the job stays this Director's, and the doctor reports it as the advice `replica_marker_encoded`. The finding names the `pvesr update <job> --comment '<marker>'` command that writes the marker back in its plain form, with the comment quoted so a shell reads it as one word, which matters because an older CPI no longer recognizes the encoded one. The CPI writes the plain form back itself on the next `set_vm_metadata` or `reboot_vm` on the VM, whether or not an allocation journal is configured. It rewrites only the VM's own job, only when the job's decoded marker names this Director, and it changes nothing but the comment. When the allocation journal holds a new generation of the job that it has not confirmed yet, the CPI leaves the comment to the write of that generation, which also writes the plain form. BOSH sends `set_vm_metadata` on every deploy that touches the VM, and a job whose VM gets neither call keeps the encoded marker until it does, because the CPI adds no pass that rewrites other jobs. The CPI and the doctor undo up to 2048 rounds, which is more than a comment within PVE's 4096-character limit can carry, so even a failover that moves many replicated guests onto one node in one pass leaves the jobs readable as this Director's.
 
 With `--cpi-config`, the command also reports three kinds of overlap. The first is overlapping VMID bands on one export. The second is a `next-id` range that overlaps a band or the `next-id` range of another cluster on the same export. The third is a `next-id` range that overlaps the cluster's own bands when another checked cluster mounts one of its exports. A possible shared backing, which is one export path behind different server strings, is advice and does not fail the run. The command exits with 1 for any failing finding. PVE's default `next-id` range of 100 to 999999 overlaps every band, so a cluster on a shared export keeps getting the finding until the operator sets a range outside the bands, as [Shared-storage rules](multi-cluster.md#shared-storage-rules) says.
+
+### Widening replica pins after a deploy
+
+A `replicate` VM's pin names only its own node until a sync that started more than five minutes after the VM's last volume change is verified. The CPI widens such pins in a sweep after every call that takes the HA rules lock, but a deploy's last VMs often finish before any sync can count, and no later call may come for a while. After a deploy that adds `replicate` VMs, we wait until each new job has completed a scheduled sync, and then we widen the pins on the Director by hand. The command runs as `vcap`, because the pass opens the allocation journal, which opens only for its owner. It also needs the Director's UUID, because the pass widens only the pins that Director owns, and `bosh env --json` prints it in the `uuid` column.
+
+```bash
+sudo -u vcap /var/vcap/packages/pve_cpi/bin/pve-cid ha --widen-replicas --director-uuid <uuid>
+```
+
+That first run is a dry run. It reads the cluster, claims nothing, and writes nothing, and it lists every `replicate` VM of the Director whose pin still names its source alone, with what the pass would do and the reason.
+
+```
+Replica pin widening for Director 6c8e1d2a-4b3f-4e5a-9c7d-0f1e2d3c4b5a (a dry run, so nothing was written; add --apply to widen)
+  VM 1042 on pve1: would widen to pve2, because the job's last sync follows the pin's last change; the check under the VM's claim decides
+  VM 1043 on pve1: skipped, because the VM's volumes changed at 2026-11-19T10:02:40Z, less than five minutes ago, so no sync can count yet
+0 widened, 1 would widen, 1 skipped, 0 failed, and 0 deferred
+```
+
+A dry run reads no journal record and takes no lock, so a VM it lists as `would widen` can still be skipped by the real run. We then run the same command with `--apply`, and the pass prints `widened` with the job and the time of the sync that covers the VM. The pass now takes each VM's VMID claim, its journal record, and the HA rules lock, makes the same check that `reboot_vm` and `set_vm_metadata` make, and widens each pin that a verified sync covers. A VM whose HA resource, config, volumes, job, or pin changed while the pass ran is skipped with the reason, and so is a VM that another call holds, a VM that is migrating or recovering, and a VM whose HA resource is ignored. We run the command again later for a skipped VM, or we let the next call that takes the HA rules lock widen it. The command exits with 0 when no VM failed, and with 1 when a VM failed or the pass stopped early, for example because the token lacks the `Pool.Allocate` and `Pool.Audit` privileges that the VMID claims need. With `--json` it prints the Director's UUID, whether it applied, the results with an outcome and a reason for each VM, and the count of deferred VMs. For a Director with several `cpi_config` entries, we pass `--request` with a context that names the entry and the Director's UUID, once for each entry, because the pass reads one cluster.
 
 ### When `delete_vm` defers
 
@@ -883,7 +911,7 @@ For a member of a full anti-affinity group, we pick one of these.
 
 - Stop the member through HA with the command below, and start it again once the node is back.
 
-For a `hold` VM or a `replicate` VM that has not widened, we stop it through HA and accept the downtime. For a `replicate` VM, we can instead wait until the pin widens after a verified sync, and then HA migrates it like any other VM.
+For a `hold` VM or a `replicate` VM that has not widened, we stop it through HA and accept the downtime. For a `replicate` VM, we can instead wait until its job has completed a sync that started more than five minutes after the VM's last volume change, run `pve-cid ha --widen-replicas --apply` as [Widening replica pins after a deploy](#widening-replica-pins-after-a-deploy) shows, and then HA migrates it like any other VM.
 
 ```bash
 ha-manager set vm:<vmid> --state stopped
