@@ -113,8 +113,8 @@ type retirementQueue struct {
 func (q *retirementQueue) add(e queuedRetirement) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for _, p := range q.pending {
-		if p.node == e.node && p.vmid == e.vmid {
+	for i := range q.pending {
+		if q.pending[i].node == e.node && q.pending[i].vmid == e.vmid {
 			return
 		}
 	}
@@ -143,7 +143,9 @@ func deferParkerRetirements(ctx context.Context) (context.Context, func()) {
 	}
 	q := &retirementQueue{}
 	return context.WithValue(ctx, retirementQueueKey{}, q), func() {
-		for _, e := range q.take() {
+		pending := q.take()
+		for i := range pending {
+			e := &pending[i]
 			rctx := ctx
 			if e.keepGoing {
 				rctx = context.WithoutCancel(ctx)

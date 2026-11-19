@@ -3,6 +3,7 @@ package pve
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -108,25 +109,33 @@ func listHAStateVMIDs(ctx context.Context, c Client) (map[int]struct{}, error) {
 // comma-separated string and a client may see as an array of strings. An
 // absent or null field lists none.
 func haRuleResourceSIDs(raw json.RawMessage) ([]string, error) {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" || trimmed == "null" {
+	if strings.TrimSpace(string(raw)) == "" {
 		return nil, nil
 	}
-	var list []string
-	if strings.HasPrefix(trimmed, "[") {
-		if err := json.Unmarshal(raw, &list); err != nil {
-			return nil, err
-		}
-		return list, nil
-	}
-	var joined string
-	if err := json.Unmarshal(raw, &joined); err != nil {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
 		return nil, err
 	}
-	for _, sid := range strings.Split(joined, ",") {
-		if sid = strings.TrimSpace(sid); sid != "" {
+	var list []string
+	switch v := value.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		for _, sid := range strings.Split(v, ",") {
+			if sid = strings.TrimSpace(sid); sid != "" {
+				list = append(list, sid)
+			}
+		}
+	case []any:
+		for _, item := range v {
+			sid, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("a rule resource is %T, not a string", item)
+			}
 			list = append(list, sid)
 		}
+	default:
+		return nil, fmt.Errorf("the rule resources field is %T, not a string or a list", value)
 	}
 	return list, nil
 }
