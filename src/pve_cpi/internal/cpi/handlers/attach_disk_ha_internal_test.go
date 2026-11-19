@@ -502,6 +502,8 @@ type attachRunRes struct {
 	// failback is the resource's failback flag, nil for PVE's default of on.
 	failback    *sdkclient.PVEBool
 	failbackErr error
+	// rebalance is the resource's auto-rebalance flag, nil when it is unset.
+	rebalance *sdkclient.PVEBool
 	// version numbers the content of resources.cfg, which its digest names.
 	// Every write that changes the resource changes it, and a write that
 	// names another digest is refused the way PVE refuses it.
@@ -519,7 +521,7 @@ func (r *attachRunRes) GetHaResources(_ context.Context, sid string) (*cluster.G
 	}
 	state, comment := r.state, r.comment
 	return &cluster.GetHaResourcesResponse{Sid: sid, State: &state, Comment: &comment, Failback: r.failback,
-		Digest: r.digest()}, nil
+		AutoRebalance: r.rebalance, Digest: r.digest()}, nil
 }
 
 func (r *attachRunRes) CreateHaResources(context.Context, *cluster.CreateHaResourcesParams) error {
@@ -951,5 +953,50 @@ func TestAttachUnchangedReadsTheNewDisksStorage(t *testing.T) {
 	h := &attachHA{vmid: 100, disk: resolvedDisk{volid: "novolid"}}
 	if _, err := h.attachUnchanged(context.Background(), "pve01"); err == nil {
 		t.Fatal("a disk that names no storage must not read as unchanged")
+	}
+}
+
+// captureNarrowInput makes every barrier record the input it is given, and
+// returns the inputs in order.
+func captureNarrowInput(t *testing.T) *[]ha.NarrowInput {
+	t.Helper()
+	var seen []ha.NarrowInput
+	was := narrowActive
+	narrowActive = func(ctx context.Context, deps ha.NarrowDeps, in ha.NarrowInput) (pve.VMLocation, error) {
+		seen = append(seen, in)
+		return was(ctx, deps, in)
+	}
+	t.Cleanup(func() { narrowActive = was })
+	return &seen
+}
+
+func TestAttachHARun_BarrierCarriesTheDecisionsFlags(t *testing.T) {
+	// The removal fallback of the barrier registers the resource again with
+	// the flags it is given, which must be the attach's HA decision.
+	for _, rebalance := range []bool{false, true} {
+		deps, stub, _ := attachRig(config.HAModeAuto)
+		stub.recordPin("nfs")
+		stub.rebalance = rebalance
+		h, err := decideAttachHA(context.Background(), deps, "100", narrowingDisk())
+		if err != nil || h == nil || h.action != attachHAGuarded {
+			t.Fatalf("decision: h %+v err %v", h, err)
+		}
+		seen := captureNarrowInput(t)
+		sl := &stagingLog{}
+		h.narrow = barrierView(&attachRunRes{log: sl, state: "started", comment: stub.comment})
+		if err := runNarrowed(t, deps, h, sl); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(*seen) != 1 {
+			t.Fatalf("barrier inputs %d, want 1", len(*seen))
+		}
+		in := (*seen)[0]
+		if in.Failback != h.decision.Failback || in.AutoRebalance != h.decision.DLB {
+			t.Fatalf("rebalance %v: barrier failback %v auto-rebalance %v, want the decision's %v and %v",
+				rebalance, in.Failback, in.AutoRebalance, h.decision.Failback, h.decision.DLB)
+		}
+		if !in.Failback {
+			t.Fatal("a shared VM with a shared disk keeps failback, which this test needs")
+		}
 	}
 }

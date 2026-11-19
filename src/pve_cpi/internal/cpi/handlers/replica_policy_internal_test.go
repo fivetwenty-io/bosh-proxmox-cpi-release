@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
@@ -790,6 +791,45 @@ func TestNarrowAfterFailover_NarrowsToTheNewSourceAndRequestsASync(t *testing.T)
 	}
 	if !slices.Equal(sl.events, []string{"request:ignored", "request:started"}) {
 		t.Fatalf("events %v; the narrowing runs inside the barrier", sl.events)
+	}
+}
+
+func TestNarrowAfterFailover_BarrierKeepsTheResourcesAutoRebalance(t *testing.T) {
+	// The removal fallback of the barrier registers the resource again with
+	// the flags it is given. A replicate VM keeps failback off, and its
+	// auto-rebalance is what the resource carries, on when it is unset, as
+	// PVE reads it.
+	for name, tc := range map[string]struct {
+		flag *sdkclient.PVEBool
+		want bool
+	}{
+		"on":    {flag: failbackFlag(true), want: true},
+		"off":   {flag: failbackFlag(false), want: false},
+		"unset": {flag: nil, want: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newReplicaRig(config.HAModeAuto)
+			r.setPin("pve01,pve02", func(c string) string { return ha.WithReplicaPartner(c, "pve02") })
+			r.repl.addJob("100-0", "pve02", "pve01", renderReplicaJobMarker(aaDirector, 1))
+			set, err := readHARuleSet(context.Background(), r.deps.PVE.Cluster())
+			if err != nil {
+				t.Fatal(err)
+			}
+			seen := captureNarrowInput(t)
+			res := &attachRunRes{log: &stagingLog{}, state: "started", comment: r.stub.comment, rebalance: tc.flag}
+			err = narrowAfterFailover(crhCtx(), r.deps, log.NewNopLogger(), "reboot_vm", r.repl, failoverView(res),
+				r.profile, 100, "pve02", set.Find("bosh-na-100"), "")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(*seen) != 1 {
+				t.Fatalf("barrier inputs %d, want 1", len(*seen))
+			}
+			if in := (*seen)[0]; in.Failback || in.AutoRebalance != tc.want {
+				t.Fatalf("barrier failback %v auto-rebalance %v, want off and %v", in.Failback, in.AutoRebalance,
+					tc.want)
+			}
+		})
 	}
 }
 

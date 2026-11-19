@@ -301,6 +301,10 @@ func skippedAttachFailback(ctx context.Context, deps Deps, vmCID string, rd reso
 // a node set to a client. Tests replace it to script PVE HA.
 var attachNarrowDeps = ha.NarrowDepsFor
 
+// narrowActive runs the narrowing barrier. Tests replace it to read the input
+// a caller gives the barrier.
+var narrowActive = ha.NarrowActive
+
 // attachOutside is the HA decision of a VM that DecideVM found outside its
 // admissible set, with what attachDecideInsideSet needs to decide again.
 type attachOutside struct {
@@ -696,7 +700,7 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 		}
 		return pve.VMLocation{Node: landed, Found: true}, nil
 	}
-	_, err := ha.NarrowActive(ctx, narrowDeps, ha.NarrowInput{
+	_, err := narrowActive(ctx, narrowDeps, ha.NarrowInput{
 		VMID:   h.vmid,
 		Node:   h.node,
 		OldPin: h.oldPin,
