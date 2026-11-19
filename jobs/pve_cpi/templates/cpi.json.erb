@@ -428,7 +428,7 @@
   ha_int = lambda { |v| v.is_a?(String) && v.strip =~ /\A\d+\z/ ? v.strip.to_i : v }
   ha = {}
   [ "mode", "storage_topology", "local_policy", "anti_affinity",
-    "anti_affinity_overflow", "pin_az", "pin_az_strict", "headroom",
+    "anti_affinity_overflow", "pin_az", "pin_az_strict", "failback", "headroom",
   ].each do |key|
     if_p("pve.ha.#{key}") { |v| ha[key] = v }
   end

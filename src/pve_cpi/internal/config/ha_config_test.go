@@ -51,6 +51,7 @@ func TestHAConfig_DefaultsWhenUnset(t *testing.T) {
 				{"anti_affinity_overflow", cfg.HAAntiAffinityOverflowValue(), "skip"},
 				{"pin_az", cfg.HAPinAZValue(), "auto"},
 				{"pin_az_strict", cfg.HAPinAZStrictValue(), true},
+				{"failback", cfg.HAFailbackEnabled(), true},
 				{"headroom", cfg.HAHeadroomValue(), "warn"},
 				{"dlb.enabled", cfg.HADLBEnabledValue(), false},
 				{"dlb.az_name", cfg.HADLBAZNameValue(), "dlb"},
@@ -70,7 +71,7 @@ func TestHAConfig_DefaultsWhenUnset(t *testing.T) {
 func TestHAConfig_NilConfigReadsDefaults(t *testing.T) {
 	t.Parallel()
 	var cfg *config.CPIConfig
-	if cfg.HAModeValue() != "off" || cfg.HAWritesEnabled() || !cfg.HAPinAZStrictValue() ||
+	if cfg.HAModeValue() != "off" || cfg.HAWritesEnabled() || !cfg.HAPinAZStrictValue() || !cfg.HAFailbackEnabled() ||
 		cfg.HADLBAZNameValue() != "dlb" || cfg.HAMotionWaitSecValue() != 600 {
 		t.Error("a nil config must read every ha key as its default")
 	}
@@ -86,7 +87,7 @@ func TestHAConfig_AbsentBlockStaysNil(t *testing.T) {
 func TestHAConfig_EachKeyRoundTrips(t *testing.T) {
 	t.Parallel()
 	cfg := haBase(t, `{"mode":"managed","storage_topology":"mixed","local_policy":"none","anti_affinity":"on",`+
-		`"anti_affinity_overflow":"split","pin_az":"on","pin_az_strict":false,"headroom":"enforce",`+
+		`"anti_affinity_overflow":"split","pin_az":"on","pin_az_strict":false,"failback":false,"headroom":"enforce",`+
 		`"dlb":{"enabled":true,"az_name":"balance"},"motion_wait_sec":900,`+
 		`"replication":{"schedule":"mon..fri 22:00","rate_mbps":50}}`)
 	checks := []struct {
@@ -102,6 +103,7 @@ func TestHAConfig_EachKeyRoundTrips(t *testing.T) {
 		{"anti_affinity_overflow", cfg.HAAntiAffinityOverflowValue(), "split"},
 		{"pin_az", cfg.HAPinAZValue(), "on"},
 		{"pin_az_strict", cfg.HAPinAZStrictValue(), false},
+		{"failback", cfg.HAFailbackEnabled(), false},
 		{"headroom", cfg.HAHeadroomValue(), "enforce"},
 		{"dlb.enabled", cfg.HADLBEnabledValue(), true},
 		{"dlb.az_name", cfg.HADLBAZNameValue(), "balance"},
@@ -138,9 +140,15 @@ func TestHAConfig_EveryEnumValueAccepted(t *testing.T) {
 
 func TestHAConfig_ExplicitFalsyValuesCountAsSet(t *testing.T) {
 	t.Parallel()
-	cfg := haBase(t, `{"pin_az_strict":false,"dlb":{"enabled":false,"az_name":""}}`)
+	cfg := haBase(t, `{"pin_az_strict":false,"failback":false,"dlb":{"enabled":false,"az_name":""}}`)
 	if cfg.HAPinAZStrictValue() {
 		t.Error("an explicit pin_az_strict false must read false")
+	}
+	if cfg.HAFailbackEnabled() {
+		t.Error("an explicit failback false must read false")
+	}
+	if !haBase(t, `{"failback":true}`).HAFailbackEnabled() {
+		t.Error("an explicit failback true must read true")
 	}
 	if cfg.HADLBEnabledValue() {
 		t.Error("an explicit dlb.enabled false must read false")
@@ -303,7 +311,8 @@ func TestHAConfig_DoesNotValidateUnsetKeys(t *testing.T) {
 
 func TestHAConfig_MalformedTypesFailToLoad(t *testing.T) {
 	t.Parallel()
-	for _, block := range []string{`{"mode":5}`, `{"pin_az_strict":"yes"}`, `{"motion_wait_sec":"soon"}`,
+	for _, block := range []string{`{"mode":5}`, `{"pin_az_strict":"yes"}`, `{"failback":"no"}`,
+		`{"motion_wait_sec":"soon"}`,
 		`{"dlb":"on"}`, `{"mode":{"x":1}}`} {
 		if _, err := mustLoad(t, haJSON(block)); err == nil {
 			t.Errorf("block %s must fail to load", block)
@@ -317,7 +326,7 @@ func TestHAConfig_MalformedTypesFailToLoad(t *testing.T) {
 
 func TestApplyContextOverrides_HA_OnlyModeInheritsTheRest(t *testing.T) {
 	t.Parallel()
-	base := haBase(t, `{"headroom":"enforce","pin_az_strict":false,"motion_wait_sec":900,`+
+	base := haBase(t, `{"headroom":"enforce","pin_az_strict":false,"failback":false,"motion_wait_sec":900,`+
 		`"dlb":{"az_name":"balance"},"replication":{"schedule":"*/15","rate_mbps":20}}`)
 
 	eff, applied, unknown, err := config.ApplyContextOverrides(base, map[string]any{
@@ -332,7 +341,8 @@ func TestApplyContextOverrides_HA_OnlyModeInheritsTheRest(t *testing.T) {
 	if eff.HAModeValue() != "auto" {
 		t.Errorf("mode = %s, want the entry's auto", eff.HAModeValue())
 	}
-	if eff.HAHeadroomValue() != "enforce" || eff.HAPinAZStrictValue() || eff.HAMotionWaitSecValue() != 900 ||
+	if eff.HAHeadroomValue() != "enforce" || eff.HAPinAZStrictValue() || eff.HAFailbackEnabled() ||
+		eff.HAMotionWaitSecValue() != 900 ||
 		eff.HADLBAZNameValue() != "balance" || eff.HAReplicationScheduleValue() != "*/15" ||
 		eff.HAReplicationRateMbpsValue() != 20 {
 		t.Errorf("the entry must inherit every key it does not name, got %+v", eff.HA)

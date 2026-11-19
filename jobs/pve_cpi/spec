@@ -326,6 +326,18 @@ properties:
       only raises the priority of its nodes inside the VM's admissible set and
       never removes a node from that set, so HA can still leave the AZ when every
       node in it is down.
+  pve.ha.failback:
+    description: |
+      Whether the CPI registers an HA resource with failback on when every
+      volume of the VM is on shared storage, which covers the boot, ephemeral,
+      persistent, and config-drive volumes. Default true. With failback on, PVE
+      HA moves the VM back to the highest-priority node of its pin once that
+      node is online again, which returns the VMs a maintenance drain moved
+      away. Replicate VMs, hold VMs, and any VM with a volume on node-local
+      storage keep failback off whatever this key says, because a failback of
+      a replicate VM would lose the writes its partner took. Set it to false to
+      keep failback off for every VM. The CPI recomputes the flag when a VM's
+      disks change, and set_vm_metadata brings an existing resource in line.
   pve.ha.headroom:
     description: |
       The N+1 memory check, which asks whether the surviving nodes could absorb

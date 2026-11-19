@@ -70,6 +70,7 @@ var jobSpecPropertyNames = []string{
 	"pve.ha.anti_affinity_overflow",
 	"pve.ha.dlb.az_name",
 	"pve.ha.dlb.enabled",
+	"pve.ha.failback",
 	"pve.ha.headroom",
 	"pve.ha.local_policy",
 	"pve.ha.mode",

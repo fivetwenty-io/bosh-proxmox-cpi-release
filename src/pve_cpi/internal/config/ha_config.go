@@ -126,6 +126,13 @@ type HAConfig struct {
 	// true.
 	PinAZStrict *bool `json:"pin_az_strict,omitempty"`
 
+	// Failback decides whether the HA resource of a VM whose every volume is
+	// on shared storage is registered with failback on, so PVE HA moves it
+	// back to the highest-priority node of its pin once that node can take it
+	// again. Default true. Replicate and hold VMs, and every VM with a volume
+	// on node-local storage, get failback off whatever this key says.
+	Failback *bool `json:"failback,omitempty"`
+
 	// Headroom is off, warn (default), or enforce, and sets the N+1 memory
 	// check.
 	Headroom *HAChoice `json:"headroom,omitempty"`
@@ -248,6 +255,13 @@ func (c *CPIConfig) HAPinAZValue() string {
 // true; only an explicit false returns false.
 func (c *CPIConfig) HAPinAZStrictValue() bool {
 	p := c.haBlock().PinAZStrict
+	return p == nil || *p
+}
+
+// HAFailbackEnabled returns the effective pve.ha.failback. Defaults to true;
+// only an explicit false returns false.
+func (c *CPIConfig) HAFailbackEnabled() bool {
+	p := c.haBlock().Failback
 	return p == nil || *p
 }
 
@@ -437,6 +451,7 @@ func (h *HAConfig) merged(over *HAConfig) *HAConfig {
 		AntiAffinityOverflow: haPick(over.AntiAffinityOverflow, h.AntiAffinityOverflow),
 		PinAZ:                haPick(over.PinAZ, h.PinAZ),
 		PinAZStrict:          haPick(over.PinAZStrict, h.PinAZStrict),
+		Failback:             haPick(over.Failback, h.Failback),
 		Headroom:             haPick(over.Headroom, h.Headroom),
 		MotionWaitSec:        haPick(over.MotionWaitSec, h.MotionWaitSec),
 	}

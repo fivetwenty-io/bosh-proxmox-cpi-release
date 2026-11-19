@@ -500,13 +500,13 @@ assert_json_lacks_key "case12-empty" "$JSON_12E" ha  || FAILED=$((FAILED+1))
 JSON_12M="$(render "$(props_with_ha '{"mode":"auto"}')")"
 assert_json_valid "case12-mode" "$JSON_12M" || FAILED=$((FAILED+1))
 assert_ha_block   "case12-mode" "$JSON_12M" '{"mode":"auto"}'
-JSON_12F="$(render "$(props_with_ha '{"mode":"managed","storage_topology":"mixed","local_policy":"none","anti_affinity":"on","anti_affinity_overflow":"split","pin_az":"on","pin_az_strict":false,"headroom":"enforce","dlb":{"enabled":true,"az_name":"balance"},"motion_wait_sec":900,"replication":{"schedule":"*/15","rate_mbps":50}}')")"
+JSON_12F="$(render "$(props_with_ha '{"mode":"managed","storage_topology":"mixed","local_policy":"none","anti_affinity":"on","anti_affinity_overflow":"split","pin_az":"on","pin_az_strict":false,"failback":true,"headroom":"enforce","dlb":{"enabled":true,"az_name":"balance"},"motion_wait_sec":900,"replication":{"schedule":"*/15","rate_mbps":50}}')")"
 assert_json_valid "case12-full" "$JSON_12F" || FAILED=$((FAILED+1))
-assert_ha_block   "case12-full" "$JSON_12F" '{"mode":"managed","storage_topology":"mixed","local_policy":"none","anti_affinity":"on","anti_affinity_overflow":"split","pin_az":"on","pin_az_strict":false,"headroom":"enforce","motion_wait_sec":900,"dlb":{"enabled":true,"az_name":"balance"},"replication":{"schedule":"*/15","rate_mbps":50}}'
+assert_ha_block   "case12-full" "$JSON_12F" '{"mode":"managed","storage_topology":"mixed","local_policy":"none","anti_affinity":"on","anti_affinity_overflow":"split","pin_az":"on","pin_az_strict":false,"failback":true,"headroom":"enforce","motion_wait_sec":900,"dlb":{"enabled":true,"az_name":"balance"},"replication":{"schedule":"*/15","rate_mbps":50}}'
 # Keys set to false, or to an empty string, are still set and still render.
-JSON_12S="$(render "$(props_with_ha '{"mode":false,"pin_az_strict":false,"dlb":{"enabled":false,"az_name":""}}')")"
+JSON_12S="$(render "$(props_with_ha '{"mode":false,"pin_az_strict":false,"failback":false,"dlb":{"enabled":false,"az_name":""}}')")"
 assert_json_valid "case12-set-falsy" "$JSON_12S" || FAILED=$((FAILED+1))
-assert_ha_block   "case12-set-falsy" "$JSON_12S" '{"mode":false,"pin_az_strict":false,"dlb":{"enabled":false,"az_name":""}}'
+assert_ha_block   "case12-set-falsy" "$JSON_12S" '{"mode":false,"pin_az_strict":false,"failback":false,"dlb":{"enabled":false,"az_name":""}}'
 # A quoted decimal integer renders as a number.
 JSON_12Q="$(render "$(props_with_ha '{"motion_wait_sec":"900","replication":{"rate_mbps":" 25 "}}')")"
 assert_ha_block "case12-quoted-int" "$JSON_12Q" '{"motion_wait_sec":900,"replication":{"rate_mbps":25}}'
@@ -527,8 +527,8 @@ SPEC_HA_DEFAULTS="$(ruby -ryaml -e '
   puts props.count
   puts props.select { |_, v| v.key?("default") }.keys.join(",")
 ' "${REPO_ROOT}/jobs/pve_cpi/spec")"
-if [ "$(printf '%s' "$SPEC_HA_DEFAULTS" | sed -n 1p)" != "13" ] || [ -n "$(printf '%s' "$SPEC_HA_DEFAULTS" | sed -n 2p)" ]; then
-  echo "FAIL [case12-spec]: expected 13 pve.ha properties with no default, got: ${SPEC_HA_DEFAULTS}" >&2
+if [ "$(printf '%s' "$SPEC_HA_DEFAULTS" | sed -n 1p)" != "14" ] || [ -n "$(printf '%s' "$SPEC_HA_DEFAULTS" | sed -n 2p)" ]; then
+  echo "FAIL [case12-spec]: expected 14 pve.ha properties with no default, got: ${SPEC_HA_DEFAULTS}" >&2
   FAILED=$((FAILED+1))
 fi
 
@@ -594,7 +594,7 @@ if [ "$(printf '%s' "$JSON_13" | ruby -rjson -e 'print JSON.generate(JSON.parse(
 fi
 assert_json_lacks_key "case13-unset" "$JSON_1" placement || FAILED=$((FAILED+1))
 # The spec keeps all nine with no default and a REMOVED description, and the
-# pve.ha count stays 13.
+# pve.ha count stays 14.
 SPEC_REMOVED="$(ruby -ryaml -e '
   spec = YAML.load_file(ARGV[0])
   names = %w[pve.placement.anti_affinity.use_ha_rules pve.placement.anti_affinity.strict
