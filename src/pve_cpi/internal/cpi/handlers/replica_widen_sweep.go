@@ -192,13 +192,44 @@ func (p *replicaWidenPass) run(ctx context.Context) (ReplicaWidenReport, error) 
 	if err != nil {
 		return report, fmt.Errorf("replica widen: read the HA rules: %w", err)
 	}
-	now := p.now()
-	type pinned struct {
-		row       replicaWidenRow
-		changedAt time.Time
-		stamped   bool
+	awaiting := p.awaitingPins(rows, set, &report)
+	if len(awaiting) == 0 {
+		sortReplicaWidenResults(report.Results)
+		return report, nil
 	}
-	var awaiting []pinned
+	profile, err := resolveHAProfile(ctx, p.deps)
+	if err != nil {
+		return report, fmt.Errorf("replica widen: resolve the HA profile: %w", err)
+	}
+	if !profile.WritesAllowed() {
+		return report, errors.New("replica widen: the HA profile does not let the CPI write HA state")
+	}
+	candidates, err := p.candidates(ctx, client, awaiting, &report)
+	if err != nil {
+		return report, err
+	}
+	p.widenCandidates(ctx, candidates, profile, &report)
+	sortReplicaWidenResults(report.Results)
+	return report, nil
+}
+
+// replicaWidenPinned is a VM whose owned pin names its source alone and whose
+// last change is old enough for a sync to count.
+type replicaWidenPinned struct {
+	row       replicaWidenRow
+	changedAt time.Time
+	stamped   bool
+}
+
+// awaitingPins keeps the listed VMs whose pin is this Director's, names the
+// row's node as the source alone, and changed long enough ago for a sync to
+// count. It records a skip for each VM it holds back for a reason an operator
+// can act on.
+func (p *replicaWidenPass) awaitingPins(
+	rows []replicaWidenRow, set *ha.RuleSet, report *ReplicaWidenReport,
+) []replicaWidenPinned {
+	now := p.now()
+	var awaiting []replicaWidenPinned
 	for _, row := range rows {
 		vmid := int(row.VMID.Int())
 		pin := set.Find(naRuleNameFor(vmid))
@@ -230,27 +261,24 @@ func (p *replicaWidenPass) run(ctx context.Context) (ReplicaWidenReport, error) 
 				"minutes ago, so no sync can count yet")
 			continue
 		}
-		awaiting = append(awaiting, pinned{row: row, changedAt: changedAt, stamped: stamped})
+		awaiting = append(awaiting, replicaWidenPinned{row: row, changedAt: changedAt, stamped: stamped})
 	}
-	if len(awaiting) == 0 {
-		sortReplicaWidenResults(report.Results)
-		return report, nil
-	}
+	return awaiting
+}
 
-	profile, err := resolveHAProfile(ctx, p.deps)
-	if err != nil {
-		return report, fmt.Errorf("replica widen: resolve the HA profile: %w", err)
-	}
-	if !profile.WritesAllowed() {
-		return report, errors.New("replica widen: the HA profile does not let the CPI write HA state")
-	}
+// candidates reads the jobs and the HA manager's status once each, and the
+// job status of each VM under the status cap, and returns the VMs worth a
+// claim. It records a skip, a failure, or a deferral for each other VM.
+func (p *replicaWidenPass) candidates(
+	ctx context.Context, client pve.Client, awaiting []replicaWidenPinned, report *ReplicaWidenReport,
+) ([]replicaWidenCandidate, error) {
 	jobs, err := p.api.ListJobs(ctx)
 	if err != nil {
-		return report, fmt.Errorf("replica widen: list the replication jobs: %w", err)
+		return nil, fmt.Errorf("replica widen: list the replication jobs: %w", err)
 	}
 	states, err := pve.ReadHAServiceStates(ctx, client.Cluster())
 	if err != nil {
-		return report, fmt.Errorf("replica widen: read the HA manager status: %w", err)
+		return nil, fmt.Errorf("replica widen: read the HA manager status: %w", err)
 	}
 
 	var candidates []replicaWidenCandidate
@@ -307,7 +335,14 @@ func (p *replicaWidenPass) run(ctx context.Context) (ReplicaWidenReport, error) 
 		}
 		candidates = append(candidates, replicaWidenCandidate{vmid: vmid, node: node, target: target})
 	}
+	return candidates, nil
+}
 
+// widenCandidates claims and widens the candidates in random order, under the
+// caps and the context, and stops when a claim shows no claim can succeed.
+func (p *replicaWidenPass) widenCandidates(
+	ctx context.Context, candidates []replicaWidenCandidate, profile *ha.Profile, report *ReplicaWidenReport,
+) {
 	if p.shuffle != nil {
 		p.shuffle(candidates)
 	} else {
@@ -338,8 +373,6 @@ func (p *replicaWidenPass) run(ctx context.Context) (ReplicaWidenReport, error) 
 			break
 		}
 	}
-	sortReplicaWidenResults(report.Results)
-	return report, nil
 }
 
 // listRows lists the guests once and keeps the QEMU VMs that carry the
