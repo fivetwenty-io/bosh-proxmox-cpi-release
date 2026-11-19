@@ -153,7 +153,7 @@ func (r *casRig) UpdateHaResources(_ context.Context, _ string, p *sdkcluster.Up
 		return r.updateErr
 	}
 	if p.Digest != nil && *p.Digest != r.digest() {
-		return errors.New("detected modified configuration - file changed by other user? Try again.")
+		return errors.New("detected modified configuration - file changed by other user")
 	}
 	r.writes = append(r.writes, *p.Failback)
 	if r.failback != *p.Failback {

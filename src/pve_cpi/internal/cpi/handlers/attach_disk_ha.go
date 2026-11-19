@@ -426,7 +426,7 @@ func attachMoveIntoSet(ctx context.Context, deps Deps, narrow ha.NarrowDeps, pro
 // which records the moved-to node, and the attach turns failback on again
 // after that, when its decision allows it (see attachHA.syncFailback).
 func holdFailbackForMove(ctx context.Context, deps Deps, narrow ha.NarrowDeps, vmid int) error {
-	if _, err := setVMFailback(ctx, narrow.Resources, deps.RequestDirectorUUID, vmid, false); err != nil {
+	if _, err := clearVMFailback(ctx, narrow.Resources, deps.RequestDirectorUUID, vmid); err != nil {
 		return fmt.Errorf("turn off failback on the HA resource of VM %d before the move: %w", vmid, err)
 	}
 	return nil
@@ -781,7 +781,7 @@ func (h *attachHA) runFailbackOff(ctx context.Context, attach func(context.Conte
 // lowerFailback turns failback off on the VM's HA resource before a disk that
 // may not fail back lands, and returns a retriable error when it cannot.
 func (h *attachHA) lowerFailback(ctx context.Context) error {
-	if _, err := setVMFailback(ctx, h.narrow.Resources, h.deps.RequestDirectorUUID, h.vmid, false); err != nil {
+	if _, err := clearVMFailback(ctx, h.narrow.Resources, h.deps.RequestDirectorUUID, h.vmid); err != nil {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("%s: turn off failback on the HA resource of VM %d before the attach", attachHAOp, h.vmid))
 	}
@@ -791,7 +791,7 @@ func (h *attachHA) lowerFailback(ctx context.Context) error {
 // recheckFailbackOff turns failback off once more after a disk that may not
 // fail back has landed, when the flag reads on, and logs a write that fails.
 func (h *attachHA) recheckFailbackOff(ctx context.Context) {
-	changed, err := setVMFailback(ctx, h.narrow.Resources, h.deps.RequestDirectorUUID, h.vmid, false)
+	changed, err := clearVMFailback(ctx, h.narrow.Resources, h.deps.RequestDirectorUUID, h.vmid)
 	logger := h.logger.With(log.Int(metadataKeyVMID, h.vmid))
 	switch {
 	case err != nil:

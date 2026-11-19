@@ -537,7 +537,7 @@ func (r *attachRunRes) UpdateHaResources(_ context.Context, _ string, p *cluster
 		if p.Failback != nil {
 			r.log.add(fmt.Sprintf("stale:failback:%v", *p.Failback))
 		}
-		return errors.New("detected modified configuration - file changed by other user? Try again.")
+		return errors.New("detected modified configuration - file changed by other user")
 	}
 	before := fmt.Sprintf("%s|%s|%v", r.state, r.comment, ha.FailbackOf(r.failback))
 	if p.Failback != nil {

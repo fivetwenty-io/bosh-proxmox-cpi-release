@@ -52,7 +52,7 @@ func (c *failbackCluster) UpdateHaResources(_ context.Context, _ string, p *clus
 		return c.updateErr
 	}
 	if p.Digest != nil && *p.Digest != c.digest() {
-		return errors.New("detected modified configuration - file changed by other user? Try again.")
+		return errors.New("detected modified configuration - file changed by other user")
 	}
 	c.writes = append(c.writes, *p.Failback)
 	if ha.FailbackOf(c.failback) != *p.Failback || c.failback == nil {

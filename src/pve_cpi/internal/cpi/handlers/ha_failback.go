@@ -116,7 +116,7 @@ func syncVMFailback(ctx context.Context, deps Deps, api ha.FailbackAPI, profile 
 		return
 	}
 	if !w.want {
-		changed, err := setVMFailback(ctx, api, deps.RequestDirectorUUID, vmid, false)
+		changed, err := clearVMFailback(ctx, api, deps.RequestDirectorUUID, vmid)
 		switch {
 		case err != nil:
 			logger.Warn(op+": the failback flag of the VM's HA resource could not be set; a later call sets it",
@@ -162,7 +162,7 @@ func confirmFailbackBasis(ctx context.Context, deps Deps, api ha.FailbackAPI, op
 	default:
 		return
 	}
-	if _, err := setVMFailback(ctx, api, deps.RequestDirectorUUID, vmid, false); err != nil {
+	if _, err := clearVMFailback(ctx, api, deps.RequestDirectorUUID, vmid); err != nil {
 		logger.Warn(op+": failback was turned on, and the VM's config changed or could not be read again, and "+
 			"failback could not be turned off again; the next attach or reconcile of the VM sets it",
 			log.String("reason", why), log.Err(err))
@@ -184,11 +184,12 @@ func failbackBasis(cfg map[string]any, node string) string {
 	return fmt.Sprintf("volumes=%s replicate=%v", strings.Join(ids, ","), configHasReplicaTag(cfg))
 }
 
-// setVMFailback sets the failback flag of the HA resource of VM vmid that
-// Director owner owns to want when it reads otherwise, through api (see
-// ha.ReconcileFailback).
-func setVMFailback(ctx context.Context, api ha.FailbackAPI, owner string, vmid int, want bool) (bool, error) {
-	return ha.ReconcileFailback(ctx, api, haResourceSid(vmid), want, func(comment string) bool {
+// clearVMFailback turns off the failback flag of the HA resource of VM vmid
+// that Director owner owns when it reads on, through api (see
+// ha.ReconcileFailback). Raising the flag goes through ha.RaiseFailback with
+// the digest of the read the decision rested on, never through this helper.
+func clearVMFailback(ctx context.Context, api ha.FailbackAPI, owner string, vmid int) (bool, error) {
+	return ha.ReconcileFailback(ctx, api, haResourceSid(vmid), false, func(comment string) bool {
 		return owner != "" && haOwnershipOf(comment, owner) == haOwnedByUs
 	})
 }
