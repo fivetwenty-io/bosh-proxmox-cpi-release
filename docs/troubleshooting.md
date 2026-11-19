@@ -3018,7 +3018,7 @@ For an upgrade, we set `pve.ha.failback: false` before the upgrade, and we set i
 
 **Cause**
 
-The pin names the partner only after the VM's replication job reports a sync that started more than five minutes after the last change to the VM's volumes, with no error, no failures, and every volume on the partner. `create_vm` doesn't wait for that sync, so the VM leaves the deploy on the narrow pin. The CPI widens such pins in a sweep after every call that takes the HA rules lock, and a `reboot_vm` or `set_vm_metadata` on the VM widens its own pin, but when no such call comes after the sync, nothing widens it.
+The pin names the partner only after the VM's replication job reports a sync that started more than five minutes after the last change to the VM's volumes, with no error, no failures, and every volume on the partner. `create_vm` doesn't wait for that sync, so the VM leaves the deploy on the narrow pin. The CPI widens such pins in a sweep after every successful call that takes the HA rules lock, and a `reboot_vm` or `set_vm_metadata` on the VM widens its own pin, but when no such call comes after the sync, nothing widens it.
 
 **Diagnosis**
 
@@ -3032,7 +3032,7 @@ At Debug, the CPI log also shows the sweep's reason for each VM it skipped, afte
 
 **Fix**
 
-We run the same command with `--apply`, as [Widening replica pins after a deploy](operations.md#widening-replica-pins-after-a-deploy) describes, or we wait for the next call that takes the HA rules lock. A VM that the pass skips because another call holds it, because it is migrating or recovering, or because its HA resource is ignored keeps its pin until a later pass finds it settled. A VM whose job is failing needs the job fixed first, as [Operations, PVE HA](operations.md#pve-ha) describes for `replica_job_failing`.
+We run the same command with `--apply`, as [Widening replica pins after a deploy](operations.md#widening-replica-pins-after-a-deploy) describes, or we wait for the next call that takes the HA rules lock. A VM that the pass skips because another call holds it, because it is migrating or recovering, or because its HA resource is ignored keeps its pin until a later pass finds it settled. One sweep widens at most one pin, so after a deploy that adds many `replicate` VMs, the command with `--apply` widens the rest at once. A VM whose job is failing needs the job fixed first, as [Operations, PVE HA](operations.md#pve-ha) describes for `replica_job_failing`.
 
 ## Task timeouts
 
