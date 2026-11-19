@@ -408,3 +408,35 @@ func TestAttachHARun_WidenedPinTurnsFailbackOffAgainAfterTheDiskLands(t *testing
 		t.Fatalf("events %v, want %v", sl.events, want)
 	}
 }
+
+// TestAttachHARun_SkippedDecisionWithFailbackOffChecksAgainAfterTheDiskLands
+// attaches a node-local disk to a VM whose strict pin names two nodes and
+// already records the disk's storage, so the attach skips the HA decision.
+// The resource reads failback off when the attach decides, and a call in
+// another process turns it on before the disk lands. The attach must still
+// check the flag after the landing and turn it off.
+func TestAttachHARun_SkippedDecisionWithFailbackOffChecksAgainAfterTheDiskLands(t *testing.T) {
+	deps, stub, _ := attachRig(config.HAModeAuto)
+	stub.pin(true, "pve01,pve02", "nfs", testPinStorage)
+	stub.failback = failbackFlag(false)
+	h, err := decideAttachHA(context.Background(), deps, "100", localDisk())
+	if err != nil || h == nil || !h.failbackOff {
+		t.Fatalf("decision: h %+v err %v, want a skipped decision that guards failback", h, err)
+	}
+	sl := &stagingLog{}
+	res := &attachRunRes{log: sl, state: "started", comment: stub.comment, failback: failbackFlag(false)}
+	h.narrow = barrierView(res)
+	if err := h.run(context.Background(), func(context.Context) (string, error) {
+		res.failback = failbackFlag(true)
+		sl.add("attach")
+		return "pve01", nil
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ha.FailbackOf(res.failback) {
+		t.Fatalf("failback is on after the attach, events %v", sl.events)
+	}
+	if want := []string{"attach", "failback:false"}; !slices.Equal(sl.events, want) {
+		t.Fatalf("events %v, want %v", sl.events, want)
+	}
+}

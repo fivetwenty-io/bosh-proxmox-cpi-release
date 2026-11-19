@@ -77,9 +77,10 @@ type attachHA struct {
 	// ends (see recordLeftReplica).
 	leftReplica *retiredReplica
 
-	// failbackOff is set on an attach that skips the HA decision while the
-	// VM's resource reads failback on and the disk's storage is not proven
-	// shared. The attach then turns failback off before the disk lands.
+	// failbackOff is set on an attach that skips the HA decision under a
+	// strict pin while the disk's storage is not proven shared. The attach
+	// then turns failback off before the disk lands and checks it again after
+	// the landing.
 	failbackOff bool
 }
 
@@ -157,7 +158,7 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 	}
 	legacyManaged := rd.stableID == "" && deps.Config.HAModeValue() == config.HAModeManaged
 	if attachSkipsHADecision(oldPin, res, storage, legacyManaged) {
-		return skippedAttachFailback(ctx, deps, vmCID, rd, vmid, res, oldPin, storage), nil
+		return skippedAttachFailback(ctx, deps, vmCID, rd, vmid, oldPin, storage), nil
 	}
 
 	profile, err := resolveHAProfile(ctx, deps)
@@ -263,17 +264,20 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 // skippedAttachFailback guards failback on an attach that skips the HA
 // decision because the VM's pin already records the disk's storage. A pin
 // that records a storage says nothing about the failback flag, which an
-// operator or an older release may have turned on, so a resource that reads
-// failback on under a strict pin, while the disk's storage is not proven
-// shared, gets an attach that turns it off before the disk lands. A storage
-// the profile cannot classify counts as not shared. A non-strict pin needs no
-// check and no profile: the decision writes one only when every node reaches
-// every volume, so each storage it records was shared when it was recorded.
-// Every other skip gets no HA action.
+// operator or an older release may have turned on, so a strict pin over a
+// storage that is not proven shared gets an attach that turns failback off
+// before the disk lands and checks it again after the landing. That holds for
+// a resource that reads failback off at the decision too, because a call in
+// another process may raise the flag before the disk lands, and only the
+// check after the landing catches that. A storage the profile cannot classify
+// counts as not shared. A non-strict pin needs no check and no profile: the
+// decision writes one only when every node reaches every volume, so each
+// storage it records was shared when it was recorded. Every other skip gets
+// no HA action.
 func skippedAttachFailback(ctx context.Context, deps Deps, vmCID string, rd resolvedDisk, vmid int,
-	res *cluster.GetHaResourcesResponse, pin *ha.Rule, storage string,
+	pin *ha.Rule, storage string,
 ) *attachHA {
-	if !ha.FailbackOf(res.Failback) || pin == nil || !pin.Strict {
+	if pin == nil || !pin.Strict {
 		return nil
 	}
 	logger := deps.Log(ctx)
@@ -288,8 +292,8 @@ func skippedAttachFailback(ctx context.Context, deps Deps, vmCID string, rd reso
 			why = "the storage definitions do not classify the storage"
 		}
 	}
-	logger.Info(attachHAOp+": the VM's pin records the disk's storage, and its HA resource has failback on "+
-		"while the storage is not proven shared, so the attach turns failback off before the disk lands",
+	logger.Info(attachHAOp+": the VM's strict pin records the disk's storage, which is not proven shared, so "+
+		"the attach turns failback off before the disk lands and checks it again after the landing",
 		log.Int(metadataKeyVMID, vmid), log.String("storage", storage), log.String("reason", why))
 	return &attachHA{
 		deps: deps, logger: logger, vmCID: vmCID, disk: rd, vmid: vmid, sid: haResourceSid(vmid),

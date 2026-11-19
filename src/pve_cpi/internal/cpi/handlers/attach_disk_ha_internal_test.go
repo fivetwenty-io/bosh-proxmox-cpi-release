@@ -31,6 +31,8 @@ type attachHAStub struct {
 	state     string
 	comment   string
 	rebalance bool
+	// failback is the resource's failback flag, nil for PVE's default of on.
+	failback *sdkclient.PVEBool
 	// node is where the index places the VM, pve01 when it is empty.
 	node string
 }
@@ -44,7 +46,8 @@ func (s *attachHAStub) GetHaResources(_ context.Context, sid string) (*cluster.G
 	}
 	state, comment := s.state, s.comment
 	rebalance := sdkclient.PVEBool(s.rebalance)
-	return &cluster.GetHaResourcesResponse{Sid: sid, State: &state, Comment: &comment, AutoRebalance: &rebalance}, nil
+	return &cluster.GetHaResourcesResponse{Sid: sid, State: &state, Comment: &comment, AutoRebalance: &rebalance,
+		Failback: s.failback}, nil
 }
 
 func (s *attachHAStub) ListResources(context.Context, *cluster.ListResourcesParams) (*cluster.ListResourcesResponse,
