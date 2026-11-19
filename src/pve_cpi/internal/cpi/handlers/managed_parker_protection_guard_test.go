@@ -123,7 +123,17 @@ func TestGuardFinishesProtectionWritesWithoutLocking(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+			// A write that is cut off needs a context that has ended, and an
+			// already passed deadline ends it without waiting on a clock. Every
+			// other write gets a live context, so a slow runner cannot turn a
+			// refusal into a cut-off. The long limit only guards against a hang.
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if tc.probe.block {
+				ctx, cancel = context.WithDeadline(t.Context(), time.Now().Add(-time.Hour))
+			} else {
+				ctx, cancel = context.WithTimeout(t.Context(), time.Minute)
+			}
 			defer cancel()
 			writeErr := guard.Client().Nodes().UpdateQemuConfig(ctx, "n1", "90000", tc.params)
 			if writeErr == nil {
