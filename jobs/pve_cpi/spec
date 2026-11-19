@@ -336,8 +336,15 @@ properties:
       away. Replicate VMs, hold VMs, and any VM with a volume on node-local
       storage keep failback off whatever this key says, because a failback of
       a replicate VM would lose the writes its partner took. Set it to false to
-      keep failback off for every VM. The CPI recomputes the flag when a VM's
-      disks change, and set_vm_metadata brings an existing resource in line.
+      keep failback off for every VM, and so does a VM that only one node can
+      take. The CPI recomputes the flag when a VM's disks change, and
+      set_vm_metadata and reboot_vm bring an existing resource in line. After
+      an upgrade from a release that wrote failback off, the first
+      set_vm_metadata or reboot_vm on a shared VM that runs away from the
+      top-priority node of its pin turns failback on, and PVE live-migrates
+      the VM to that node at once. To choose when that happens, set this key
+      to false before the upgrade, and set it back to true during a
+      maintenance window.
   pve.ha.headroom:
     description: |
       The N+1 memory check, which asks whether the surviving nodes could absorb

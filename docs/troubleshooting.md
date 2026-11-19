@@ -2984,6 +2984,32 @@ The node was down, or didn't answer, while `create_vm` wrote the pin. `create_vm
 
 We let the next `set_vm_metadata` or `reboot_vm` on the VM widen the pin, and any deploy that touches the instance sends one. That call reads each online node the pin leaves out and gives it back to the pin when the node lists the VM's bridges and shows the VM's storage as active. The call logs `widened the VM's strict pin to the nodes that now reach its storage and network` with the old and new nodes. When a node's storage or bridge keeps it out of the pin, the call's debug log names the node and the storage or bridge it was missing, and a warning reports a check that couldn't finish. The CPI never widens a pin that another Director owns, a pin that isn't strict, the pin of a `replicate` VM, or a pin whose recorded storages no longer match the VM's disks. [HA and Resurrection](ha-and-resurrection.md#placement-under-ha) explains the rule.
 
+## A VM moves to another node on its own
+
+**Symptom**
+
+A VM live-migrates to another node without a maintenance or a failure. The task list shows an HA migration that no one asked for, often right after a deploy, or a few seconds after we ran `ha-manager migrate` on the VM.
+
+**Cause**
+
+The VM's HA resource has `failback` on, and the VM ran on a node with a lower priority in its pin than another online node. The HA manager then moves the VM to the best node its rules allow on every round. Two cases cause this.
+
+- **The first call after an upgrade**
+
+  Releases before this change wrote `failback` off. The first `set_vm_metadata` or `reboot_vm` after the upgrade turns the flag on for a VM whose volumes all sit on shared storage, and any deploy that touches the instance sends such a call.
+
+- **A manual migration**
+
+  `ha-manager migrate` moved the VM to a node that its pin does not prefer, and the HA manager moved it back.
+
+**Diagnosis**
+
+We run `ha-manager config` to read the resource's `failback` flag, which is on when the resource doesn't list it, and `ha-manager rules config` to read the priorities of its `bosh-na-<vmid>` pin.
+
+**Fix**
+
+For an upgrade, we set `pve.ha.failback: false` before the upgrade, and we set it back to `true` or remove it during a maintenance window, so the moves happen while we watch. To move a VM for good, we give the target node the highest priority in its pin with `ha-manager rules set node-affinity bosh-na-<vmid> --nodes <target>:2,<other>:1`, and PVE moves the VM there by itself. A `failback` that we turn off by hand only lasts until the next `set_vm_metadata` or `reboot_vm`. [Failback](ha-and-resurrection.md#failback) explains the flag.
+
 ## Task timeouts
 
 **Symptom**

@@ -14,9 +14,27 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Changed
 
+- **Upgrade note.** After the upgrade, the first `set_vm_metadata` or `reboot_vm` on a VM whose volumes all sit on shared storage can turn `failback` on for its HA resource, and any deploy that touches the instance sends one of those calls. When that VM runs on a node other than the top-priority node of its pin, PVE live-migrates it to that node at once. To choose when those moves happen, we set `pve.ha.failback: false` before the upgrade, so no call turns the flag on. Then, during a maintenance window, we set it back to `true` or remove it, and the next call that touches each VM turns the flag on. `pve-cid ha` lists each VM whose flag is still off as `failback_drift` advice until a call reaches it.
+
 - The CPI now registers a VM's HA resource with `failback` on when every volume the VM holds, its persistent disks included, sits on shared storage. PVE then moves the VM back to its preferred node after a recovery, and back to its node when a maintenance there ends, so a rolling maintenance no longer leaves the node drained last nearly empty. A `hold` VM, a `replicate` VM, and any VM with a volume on node-local storage keep `failback` off, because moving a `replicate` VM back after a failover would run the reversed replication job, whose first run destroys the writes that existed only on the old node.
 
 - `attach_disk` now turns `failback` off before a disk lands that leaves the VM no longer shared, and it fails with a retriable error when it can't. It turns the flag on after a disk lands that keeps the VM shared. `detach_disk`, `reboot_vm`, and `set_vm_metadata` set the flag that the VM's volumes call for, and they write only when it differs, so a VM that an earlier release registered gets the new flag at its next such call or at a `bosh recreate`.
+
+- A VM that only one node can take, such as a `hold` VM, keeps `failback` off even when its volumes all sit on shared storage, because failback has no other node to move it to.
+
+- An `attach_disk` that skips the HA decision, because the VM's pin already records the disk's storage, now turns `failback` off before a disk lands on storage that not every node reaches, and it checks the flag again after the disk lands.
+
+- No lock covers both an `attach_disk` and the failback reconcile of `set_vm_metadata` or `reboot_vm` in another CPI process, so the reconcile no longer trusts a decision made from a config read before the attach. It reads the HA resource first and turns `failback` on only against that read's digest, so PVE refuses the write when an attach changed the resource in between. It leaves alone a resource that the narrowing barrier holds. Once the flag is on, it reads the VM's config again and turns the flag off when the VM's volumes or its replicate tag changed. `attach_disk` turns the flag off again right before a disk that must not fail back lands, and it checks the flag once more after the disk lands.
+
+- `attach_disk` now holds `failback` off while PVE HA moves a VM into the node set its new disk allows, and it turns the flag on again only after the pin names the node the VM moved to. With the flag on, the CRM pulled the VM back to the node its old pin preferred as soon as the move landed. The advice for a VM outside its set now says to turn `failback` off before a manual migration.
+
+- `attach_disk` now decides `failback` afresh after a disk lands that keeps the VM shared, so a VM with the replicate tag, or with a pin that carries a token of the replicate policy, keeps the flag off, as the reconcile keeps it.
+
+- A parker whose disks all sit on shared storage now registers with `failback` on. That changes nothing, because a parker stays stopped and PVE never moves a stopped resource back.
+
+- When the pin of a `replicate` VM narrows after a failover, the narrowing barrier now keeps the HA resource's `auto-rebalance` flag for a re-registration, and reads it as on when the resource leaves it unset, as PVE does.
+
+- `pve-cid ha` no longer reports `failback_drift` for a parker, which no call ever reaches, or for a VM the CPI's HA decision does not register as a plain shared VM, such as one with a PCI passthrough device or a host CPU type that one node alone runs. It now counts a pin that records a change to the VM's replicated volumes as the `replicate` policy, as the CPI does.
 
 ### Added
 
