@@ -499,6 +499,9 @@ type attachRunRes struct {
 	state   string
 	comment string
 	gone    bool
+	// failback is the resource's failback flag, nil for PVE's default of on.
+	failback    *sdkclient.PVEBool
+	failbackErr error
 }
 
 func (r *attachRunRes) GetHaResources(_ context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {
@@ -506,7 +509,7 @@ func (r *attachRunRes) GetHaResources(_ context.Context, sid string) (*cluster.G
 		return nil, errors.New("no such resource '" + sid + "'")
 	}
 	state, comment := r.state, r.comment
-	return &cluster.GetHaResourcesResponse{Sid: sid, State: &state, Comment: &comment}, nil
+	return &cluster.GetHaResourcesResponse{Sid: sid, State: &state, Comment: &comment, Failback: r.failback}, nil
 }
 
 func (r *attachRunRes) CreateHaResources(context.Context, *cluster.CreateHaResourcesParams) error {
@@ -515,6 +518,14 @@ func (r *attachRunRes) CreateHaResources(context.Context, *cluster.CreateHaResou
 }
 
 func (r *attachRunRes) UpdateHaResources(_ context.Context, _ string, p *cluster.UpdateHaResourcesParams) error {
+	if p.Failback != nil {
+		if r.failbackErr != nil {
+			return r.failbackErr
+		}
+		v := sdkclient.PVEBool(*p.Failback)
+		r.failback = &v
+		r.log.add(fmt.Sprintf("failback:%v", *p.Failback))
+	}
 	if p.State != nil {
 		r.state = *p.State
 		r.log.add("request:" + r.state)

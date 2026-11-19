@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strconv"
 	"time"
 
@@ -21,6 +22,22 @@ func managedEvidenceObject(value any) (map[string]any, error) {
 	}
 	return fields, nil
 }
+
+// managedHAResourceFieldsMatch compares a requested HA resource write against
+// the resource PVE reads back. PVE defaults failback to on and may leave the
+// key out of the read when it holds that default, so an absent failback
+// proves a request for on, and only a request for on.
+func managedHAResourceFieldsMatch(readback, params map[string]any) error {
+	if want, ok := params["failback"].(bool); ok && want {
+		if _, present := readback["failback"]; !present {
+			withDefault := maps.Clone(readback)
+			withDefault["failback"] = true
+			readback = withDefault
+		}
+	}
+	return managedConfigFieldsMatch(readback, params)
+}
+
 func managedEvidenceListMatch(raw any, fields map[string]any) error {
 	encoded, err := json.Marshal(raw)
 	if err != nil {
@@ -83,7 +100,7 @@ func (m *managedVMAllocation) observePolicyMutation(ctx context.Context, call Ma
 		if err != nil {
 			return err
 		}
-		return managedConfigFieldsMatch(fields, params)
+		return managedHAResourceFieldsMatch(fields, params)
 	case "Cluster.CreateHaRules":
 		response, err := m.deps.PVE.Cluster().ListHaRules(ctx, nil)
 		if err != nil {

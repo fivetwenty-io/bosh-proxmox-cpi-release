@@ -604,6 +604,15 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 		_, err = attach(ctx)
 		return err
 	}
+	// A VM that may not fail back with the new disk, such as one that gains a
+	// node-local or replicated disk, has failback turned off before the disk
+	// lands, so PVE HA never moves it back while it holds that disk.
+	if !h.decision.Failback {
+		if _, err := setVMFailback(ctx, narrowDeps.Resources, h.deps.RequestDirectorUUID, h.vmid, false); err != nil {
+			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("%s: turn off failback on the HA resource of VM %d before the attach", op, h.vmid))
+		}
+	}
 	// The barrier's mutation is the whole rest of the attach, which locates the
 	// VM itself, so the node the drain found is only where it starts.
 	var landed string
@@ -645,11 +654,32 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 		SysConsole: h.profile.SysConsole,
 		Budget:     haMotionWait(h.deps),
 	})
-	if err != nil || h.replicaChanged.IsZero() {
+	if err != nil {
 		return err
 	}
-	h.restampReplica(ctx, landed)
+	if h.decision.Failback {
+		h.raiseFailback(ctx, narrowDeps.Resources)
+	}
+	if !h.replicaChanged.IsZero() {
+		h.restampReplica(ctx, landed)
+	}
 	return nil
+}
+
+// raiseFailback turns failback on, after the attach, for a VM whose volumes
+// all stay on shared storage with the new disk. A write that fails is logged,
+// and the next call that touches the VM sets the flag (see
+// reconcileVMFailback).
+func (h *attachHA) raiseFailback(ctx context.Context, api ha.FailbackAPI) {
+	changed, err := setVMFailback(ctx, api, h.deps.RequestDirectorUUID, h.vmid, true)
+	logger := h.logger.With(log.Int(metadataKeyVMID, h.vmid))
+	switch {
+	case err != nil:
+		logger.Warn(attachHAOp+": failback could not be turned on for the VM's HA resource; a later call turns "+
+			"it on", log.Err(err))
+	case changed:
+		logger.Info(attachHAOp + ": turned on failback for the VM's HA resource, whose volumes are all shared")
+	}
 }
 
 // restampReplica records on a replicate VM's pin, after the attach, the time

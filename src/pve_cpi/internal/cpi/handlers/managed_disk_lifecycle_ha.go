@@ -186,8 +186,10 @@ var lifecycleHAStates = []string{"started", "stopped", "ignored"}
 const haStateDisabled = "disabled"
 
 // lifecycleHAResourceUpdateFields lists the fields an HA resource update
-// inside a disk lifecycle may carry.
-var lifecycleHAResourceUpdateFields = []string{"state", "comment", pveConfigKeyDigest, "delete"}
+// inside a disk lifecycle may carry. Failback is among them because a disk
+// that changes where the VM's volumes live changes whether PVE HA may move the
+// VM back after it moved away.
+var lifecycleHAResourceUpdateFields = []string{"state", "comment", "failback", pveConfigKeyDigest, "delete"}
 
 // lifecycleHARuleEditTargets checks that an HA rule update or delete inside a
 // disk lifecycle names the pin of the lifecycle's VM, and that an update that
@@ -268,8 +270,8 @@ func lifecycleHAResourceUpdateAllowed(call ManagedAllocationMutation, sid, owner
 	}
 	for key := range fields {
 		if !slices.Contains(lifecycleHAResourceUpdateFields, key) {
-			return false, fmt.Errorf("HA resource %s update sets %s, more than its requested state and comment",
-				sid, key)
+			return false, fmt.Errorf("HA resource %s update sets %s, more than its requested state, comment, "+
+				"and failback", sid, key)
 		}
 	}
 	restoresDisabled := false

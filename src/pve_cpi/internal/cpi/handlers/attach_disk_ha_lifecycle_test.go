@@ -302,6 +302,15 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 		{"a request for disabled that writes no comment", withHeld("ignored", heldFromDisabled, func() error {
 			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &disabled})
 		})},
+		{"a failback update on another VM's resource of this Director", func() error {
+			off := false
+			return svc.UpdateHaResources(ctx, "vm:555", &cluster.UpdateHaResourcesParams{Failback: &off})
+		}},
+		{"a failback update while another Director's marker is on the resource",
+			withResourceComment(other, func() error {
+				off := false
+				return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{Failback: &off})
+			})},
 		{"a resource update that sets another field", func() error {
 			restarts := int64(5)
 			return svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{State: &ignored,
@@ -402,6 +411,11 @@ func TestDiskLifecycleGuardJudgesHAWritesByOwner(t *testing.T) {
 	}
 	if store.states["vm:777"] != "ignored" {
 		t.Fatalf("state %q, want ignored", store.states["vm:777"])
+	}
+	// The attach sets the failback the VM's new volume set calls for.
+	off := false
+	if err := svc.UpdateHaResources(ctx, "vm:777", &cluster.UpdateHaResourcesParams{Failback: &off}); err != nil {
+		t.Fatalf("set failback on this Director's resource: %v", err)
 	}
 	// The barrier's restore of a resource that was disabled before it held
 	// the VM puts disabled back and drops the token.

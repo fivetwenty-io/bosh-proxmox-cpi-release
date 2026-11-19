@@ -256,6 +256,15 @@ func HandleDetachDisk(deps Deps) Handler {
 		if settleErr := settleDetachVM(ctx, deps, vmCID, vmid); settleErr != nil {
 			return nil, settleErr
 		}
+		// A detach that succeeded may leave the VM with only shared volumes, so
+		// its HA resource gets the failback flag those call for. This runs after
+		// the disk's lifecycle has ended, with the request's own client.
+		failbackDeps := deps
+		defer func() {
+			if operationErr == nil {
+				reconcileDetachedVMFailback(ctx, failbackDeps, vmid)
+			}
+		}()
 
 		// Stable-ID disks detach by ownership transfer: the volume is
 		// reassigned onto a parker rather than config-edited off the VM. The
@@ -1129,6 +1138,23 @@ func detachDiskArguments(args []json.RawMessage) (string, string, error) {
 		return "", "", cpierrors.Cloud("detach_disk: args[1] disk_cid must not be empty")
 	}
 	return vmCID, diskCID, nil
+}
+
+// reconcileDetachedVMFailback sets the failback flag of the HA resource of VM
+// vmid for the volumes it kept after a detach (see reconcileVMFailback). It
+// locates the VM itself, and a VM it cannot locate is left alone.
+func reconcileDetachedVMFailback(ctx context.Context, deps Deps, vmid int) {
+	if deps.Config == nil || deps.PVE == nil || deps.Config.HAModeValue() == config.HAModeOff {
+		return
+	}
+	logger := deps.Log(ctx)
+	loc, err := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+	if err != nil || !loc.Found || loc.Node == "" {
+		logger.Debug("detach_disk: the VM was not located to set the failback flag of its HA resource",
+			log.Int(metadataKeyVMID, vmid), log.Err(err))
+		return
+	}
+	reconcileVMFailback(ctx, deps, "detach_disk", vmid, loc, logger)
 }
 
 // settleDetachVM waits out a migration of the VM, and then finishes an HA

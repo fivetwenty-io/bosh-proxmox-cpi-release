@@ -1206,8 +1206,9 @@ func settleFailedReplicaCreate(
 // reconcileTouchedVMHA runs the HA catch-up a touch call owes a located VM.
 // It finishes a pending re-registration first, then gives a strict pin back
 // the nodes it left out only because they could not be read when it was
-// written, and then reconciles the pin of a replicate VM with where it runs
-// and what its replica covers. The widening only logs when it fails.
+// written, then sets the failback flag the VM's volumes call for, and then
+// reconciles the pin of a replicate VM with where it runs and what its
+// replica covers. The widening and the failback step only log when they fail.
 func reconcileTouchedVMHA(ctx context.Context, deps Deps, op, vmCID string, vmid int, loc pve.VMLocation,
 	logger *log.Logger,
 ) error {
@@ -1215,6 +1216,7 @@ func reconcileTouchedVMHA(ctx context.Context, deps Deps, op, vmCID string, vmid
 		return err
 	}
 	widenNarrowedPin(ctx, deps, op, vmid, loc, logger)
+	reconcileVMFailback(ctx, deps, op, vmid, loc, logger)
 	return reconcileVMReplica(ctx, deps, op, vmCID, vmid, loc, logger)
 }
 
