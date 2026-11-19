@@ -211,10 +211,9 @@ func TestReconcileFailbackAfterDetach(t *testing.T) {
 	failed := errors.New("detach failed")
 	r := newFailbackRig(t, failbackFlag(false))
 	r.deps.PVE.(*icPVEClient).clusterSvc = indexedFailbackCluster{r.cluster}
-	reconcileFailbackAfterDetach(context.Background(), r.deps, 100, &failed)
+	reconcileFailbackAfterDetach(context.Background(), r.deps, 100, failed)
 	r.requireWrites(t)
 
-	var ok error
-	reconcileFailbackAfterDetach(context.Background(), r.deps, 100, &ok)
+	reconcileFailbackAfterDetach(context.Background(), r.deps, 100, nil)
 	r.requireWrites(t, true)
 }
