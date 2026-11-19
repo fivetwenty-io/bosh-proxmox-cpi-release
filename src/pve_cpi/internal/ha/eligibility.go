@@ -893,7 +893,11 @@ func (e *eligibility) register(policy Policy, hard []string, reason string) {
 	}
 	e.d.Outcome, e.d.Policy, e.d.Reason = OutcomeRegister, policy, reason
 	e.d.Admissible = set
-	e.d.Failback = policy == PolicyShared && e.cfg.HAFailbackEnabled()
+	// A set of one node leaves failback nowhere to move the VM, and it is
+	// what a VM's own strict one-node pin gives, the pin a hold VM keeps after
+	// its last node-local disk is gone. Such a VM keeps failback off, so a
+	// later node-local disk never lands under failback on.
+	e.d.Failback = policy == PolicyShared && e.cfg.HAFailbackEnabled() && len(set) >= 2
 	if !sameSet(set, e.members) {
 		e.d.Hard = set
 	}

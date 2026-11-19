@@ -59,3 +59,21 @@ func TestDecideVMSharedVMOnASingleReachingNodeHoldsWithoutFailback(t *testing.T)
 		t.Fatalf("decision = %+v; a VM that cannot move to a second node must not get failback", d)
 	}
 }
+
+// TestDecideVMSelfPinnedSharedVMKeepsFailbackOff decides an all-shared VM
+// under its own strict one-node pin, the pin a hold VM keeps after its last
+// node-local disk is gone. The admissible set holds that one node, so the
+// decision registers the VM under the shared policy with nowhere to fail back
+// to, and failback must stay off.
+func TestDecideVMSelfPinnedSharedVMKeepsFailbackOff(t *testing.T) {
+	in := baseInput(eligCfg(config.HAModeAuto), vols("nfs:100/vm-101-disk-0")...)
+	in.Constraints = append(in.Constraints, NodeConstraint{Name: "the VM's pin bosh-na-101", Nodes: []string{"pve1"},
+		Pin: true})
+	d := mustDecide(t, eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3"), in)
+	if !d.Registers() {
+		t.Fatalf("decision = %+v, want a registration", d)
+	}
+	if d.Failback {
+		t.Fatalf("decision = %+v; a VM whose admissible set holds one node must not get failback", d)
+	}
+}

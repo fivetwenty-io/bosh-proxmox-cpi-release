@@ -217,3 +217,26 @@ func TestReconcileFailbackAfterDetach(t *testing.T) {
 	reconcileFailbackAfterDetach(context.Background(), r.deps, 100, nil)
 	r.requireWrites(t, true)
 }
+
+// TestReconcileVMFailback_HoldVMAfterDetachKeepsFailbackOff reconciles a hold
+// VM whose node-local disk was detached. Its own strict pin still names its
+// node alone, so the decision leaves it nowhere to fail back to, and the
+// reconcile must not turn failback on, which a later attach of a node-local
+// disk that skips the decision would then find.
+func TestReconcileVMFailback_HoldVMAfterDetachKeepsFailbackOff(t *testing.T) {
+	r := newFailbackRig(t, failbackFlag(false))
+	r.deps.Config.HA.LocalPolicy = haChoiceOf(config.HALocalPolicyHold)
+	r.cluster.pin(true, "pve01", "nfs", testPinStorage)
+	reconcileFailbackAfterDetach(context.Background(), withIndexedFailback(r), 100, nil)
+	r.requireWrites(t)
+	if r.cluster.failback == nil || r.cluster.failback.Bool() {
+		t.Fatalf("failback %v, want it left off", r.cluster.failback)
+	}
+}
+
+// withIndexedFailback returns the rig's deps with a cluster index that lists
+// VM 100, so the detach path can locate it.
+func withIndexedFailback(r *failbackRig) Deps {
+	r.deps.PVE.(*icPVEClient).clusterSvc = indexedFailbackCluster{r.cluster}
+	return r.deps
+}
