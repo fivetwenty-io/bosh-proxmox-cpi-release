@@ -62,14 +62,38 @@ func parkerReadConfigFor(deps Deps) pve.ParkerConfig {
 		// mode but off, so only there can a parker vanish in a benign race.
 		// See ParkerConfig.RetiresParkers.
 		RetiresParkers: deps.Config.HAModeValue() != config.HAModeOff,
-		// Outside off mode a gone parker can leave its HA resource or its pin
-		// behind until the parker sweep proves it gone, so a new parker must
-		// not land on a VMID they still name. Off mode reads no HA state.
-		// See ParkerConfig.ScanHAState.
-		ScanHAState: deps.Config.HAModeValue() != config.HAModeOff,
+		// A gone parker can leave its HA resource or its pin behind until the
+		// parker sweep proves it gone, and a cluster that ran auto or managed
+		// mode keeps them after a change to off, so a new parker must not land
+		// on a VMID they still name. See ParkerConfig.HAStateScan and
+		// parkerHAStateScanPolicy.
+		HAStateScan: parkerHAStateScanPolicy(deps.Config),
 		// The keep rule proves a transfer record's volume gone with the same
 		// second opinions the local backend's sweep gets.
 		EmptyListingCorroborators: BackendCorroborators(deps.Config, deps.PVE),
+	}
+}
+
+// parkerHAStateScanPolicy says how a parker's VMID allocation reads the HA
+// state under cfg's pve.ha.mode, answering a failed read the way the parker
+// selection rule answers one (parkerHAReadFailure). Off mode reads it as a
+// best effort, because nothing there promised to read HA state before a park,
+// so no failed read fails the park. Auto mode allocates without it when PVE
+// refuses the read for a missing grant, and fails the park on any other
+// failed read, retriably when the failure may pass. Managed mode fails the
+// park on every failed read, and a refusal for a missing grant fails it with
+// a non-retriable error that names the grant.
+func parkerHAStateScanPolicy(cfg *config.CPIConfig) pve.HAStateScanPolicy {
+	if cfg == nil {
+		return pve.HAStateScanNone
+	}
+	switch cfg.HAModeValue() {
+	case config.HAModeManaged:
+		return pve.HAStateScanRequiringGrant
+	case config.HAModeAuto:
+		return pve.HAStateScanToleratingDenial
+	default:
+		return pve.HAStateScanBestEffort
 	}
 }
 

@@ -72,8 +72,9 @@ type allocOpts struct {
 	// WithNodeImageStorageScan.
 	imageStorageScanNode string
 	// haStateScan makes NextVMID union the VMIDs the cluster's HA resources
-	// and rules name into its used-set. Set via WithHAStateScan.
-	haStateScan bool
+	// and rules name into its used-set, answering a failed read as the
+	// policy says. Set via WithHAStateScan; HAStateScanNone reads nothing.
+	haStateScan HAStateScanPolicy
 }
 
 // storageScanTarget is one (node, storage) pair queued by WithExtraStorageScan.
@@ -428,8 +429,8 @@ func NextVMID(ctx context.Context, c Client, opts ...AllocOption) (int, error) {
 		used[id] = struct{}{}
 	}
 	logStorageOnlyReservations(ctx, storageOnly, ao.rangeStart, ao.rangeEnd)
-	if ao.haStateScan {
-		haUsed, hErr := listHAStateVMIDs(ctx, c)
+	if ao.haStateScan != HAStateScanNone {
+		haUsed, hErr := listHAStateVMIDs(ctx, c, ao.haStateScan)
 		if hErr != nil {
 			return 0, hErr
 		}

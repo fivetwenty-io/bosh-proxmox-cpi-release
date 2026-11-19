@@ -988,7 +988,7 @@ pvesm free <storage>:<volume>
 
 ### Turning HA off after it was on
 
-Setting `pve.ha.mode: off` makes the CPI write no more HA state, but it does not remove the resources and rules that the CPI or an older release created. Until we remove them, the CPI still stops and deletes those VMs correctly, because the delete path reads the HA state and stops an HA-managed VM through PVE HA whatever the mode is. The doctor lists what is left as `off_mode_resource` and `off_mode_rule`. We remove each leftover in the PVE UI, or with the following commands.
+Setting `pve.ha.mode: off` makes the CPI write no more HA state, but it does not remove the resources and rules that the CPI or an older release created. Until we remove them, the CPI still stops and deletes those VMs correctly, because the delete path reads the HA state and stops an HA-managed VM through PVE HA whatever the mode is. The doctor lists what is left as `off_mode_resource` and `off_mode_rule`. While they remain, a new parker still never takes a VMID that one of them names, because a parker's VMID allocation reads the HA resources and rules in every mode. We remove each leftover in the PVE UI, or with the following commands.
 
 ```bash
 ha-manager remove vm:<vmid>

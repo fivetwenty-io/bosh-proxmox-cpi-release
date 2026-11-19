@@ -181,6 +181,15 @@ func (c managedDiskTestCluster) GetHaResources(_ context.Context, sid string) (*
 	return nil, fmt.Errorf("no such resource '%s'", sid)
 }
 
+// ListHaResources and ListHaRules answer a new parker's VMID allocation with
+// a cluster that holds no HA resource and no HA rule.
+func (managedDiskTestCluster) ListHaResources(context.Context, *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
+	return &cluster.ListHaResourcesResponse{}, nil
+}
+func (managedDiskTestCluster) ListHaRules(context.Context, *cluster.ListHaRulesParams) (*cluster.ListHaRulesResponse, error) {
+	return &cluster.ListHaRulesResponse{}, nil
+}
+
 func (c managedDiskTestCluster) ListResources(context.Context, *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
 	r := make(cluster.ListResourcesResponse, 0, len(c.state.configs))
 	for vmid, vm := range c.state.configs {

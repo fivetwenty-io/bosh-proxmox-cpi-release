@@ -14,6 +14,14 @@ func ResetVNIZoneListWarnOnce() {
 	vniZoneListWarnOnce = sync.Once{}
 }
 
+// ResetHAStateScanWarnings forgets that this process has warned about an
+// allocation that went on without the HA state, so a test can watch the
+// first warning. Test-only.
+func ResetHAStateScanWarnings() {
+	haStateScanWarned.denied.Store(false)
+	haStateScanWarned.unreadable.Store(false)
+}
+
 // WithPollIntervalForTest sets the poll interval passed to AwaitTask /
 // WaitForSnapshotAbsent's underlying loop. Values ≤ 0 are ignored (default
 // applies). Call-scoped (unlike SetTaskPollingForTest's process-wide atomic

@@ -3347,12 +3347,12 @@ func (n *parkerNodesService) ListNodes(context.Context) (*sdknodes.ListNodesResp
 }
 
 // TestEnsureParker_SkipsAVMIDThatHAStateStillNames proves a parker created
-// under ScanHAState never lands on a VMID that a leftover HA resource or pin
+// under HAStateScan never lands on a VMID that a leftover HA resource or pin
 // still names, so it never inherits them, and that a config without it reads
 // no HA state.
 func TestEnsureParker_SkipsAVMIDThatHAStateStillNames(t *testing.T) {
 	t.Parallel()
-	for _, scan := range []bool{true, false} {
+	for _, scan := range []pve.HAStateScanPolicy{pve.HAStateScanRequiringGrant, pve.HAStateScanNone} {
 		createdVMID := 0
 		qemuSvc := &parkerQEMU{
 			configFn: func(_ string, vmid int) (map[string]any, error) {
@@ -3378,16 +3378,16 @@ func TestEnsureParker_SkipsAVMIDThatHAStateStillNames(t *testing.T) {
 			})
 		}
 		c := &haScanClient{Client: base, lists: lists}
-		cfg := pve.ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90010, ScanHAState: scan}
+		cfg := pve.ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90010, HAStateScan: scan}
 		vmid, err := pve.EnsureParker(context.Background(), c, nopLogger(), "pve1", cfg)
 		if err != nil {
 			t.Fatalf("scan %v: EnsureParker: %v", scan, err)
 		}
-		if scan && vmid != 90010 {
+		if scan != pve.HAStateScanNone && vmid != 90010 {
 			t.Fatalf("EnsureParker = %d, want 90010, the VMID no HA state names", vmid)
 		}
-		if !scan && lists.readCount() != 0 {
-			t.Fatalf("a config without ScanHAState read HA state %d times", lists.readCount())
+		if scan == pve.HAStateScanNone && lists.readCount() != 0 {
+			t.Fatalf("a config without HAStateScan read HA state %d times", lists.readCount())
 		}
 	}
 }
