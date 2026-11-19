@@ -32,6 +32,7 @@ type barrierRig struct {
 	restored   []Rule
 	persisted  []Rule
 	persistErr error
+	created    []*sdkcluster.CreateHaResourcesParams
 	// comment is the resource's comment, "owner" when nil.
 	comment *string
 }
@@ -54,6 +55,7 @@ func (r *barrierRig) GetHaResources(_ context.Context, sid string) (*sdkcluster.
 
 func (r *barrierRig) CreateHaResources(_ context.Context, p *sdkcluster.CreateHaResourcesParams) error {
 	r.events = append(r.events, "register:"+*p.State)
+	r.created = append(r.created, p)
 	r.state, r.missing = *p.State, false
 	if p.Comment != nil {
 		c := *p.Comment
@@ -567,5 +569,46 @@ func TestNarrowNamesTheSetAndTheFixWhenTheVMLandsOutsideIt(t *testing.T) {
 		if !strings.Contains(err.Error(), part) {
 			t.Fatalf("err %q lacks %q", err, part)
 		}
+	}
+}
+
+// TestNarrowRemovalFallbackRegistersWhatStagingWrites proves the fallback
+// barrier registers the resource again with the failback and auto-rebalance
+// flags the normal registration writes for the same VM.
+func TestNarrowRemovalFallbackRegistersWhatStagingWrites(t *testing.T) {
+	narrowUseRemoval = true
+	t.Cleanup(func() { narrowUseRemoval = false })
+	for _, tc := range []struct {
+		name  string
+		facts FailbackFacts
+		dlb   bool
+	}{
+		{"shared", FailbackFacts{Enabled: true}, false},
+		{"replicate", FailbackFacts{Enabled: true, Replicate: true}, false},
+		{"local disk", FailbackFacts{Enabled: true, Local: true}, false},
+		{"dlb", FailbackFacts{Enabled: true}, true},
+		{"failback key false", FailbackFacts{Enabled: false}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wantFailback, _ := ExpectedFailback(tc.facts)
+			r := &barrierRig{state: "started", settleOn: []string{"a"}, snapshot: []Rule{pinAB},
+				states: []*pve.HAServiceState{crm("started", 100, 90, 95), crm("started", 100, 90, 95),
+					{Known: true, Node: "a"}}}
+			in := r.input(&pinAB, &pinA)
+			in.Failback, in.AutoRebalance = wantFailback, tc.dlb
+			if _, err := NarrowActive(context.Background(), r.deps(), in); err != nil {
+				t.Fatal(err)
+			}
+			if len(r.created) != 1 {
+				t.Fatalf("registered %d times, want 1", len(r.created))
+			}
+			got := r.created[0]
+			if got.Failback == nil || *got.Failback != wantFailback {
+				t.Errorf("failback %v, want %v", got.Failback, wantFailback)
+			}
+			if got.AutoRebalance == nil || *got.AutoRebalance != tc.dlb {
+				t.Errorf("auto-rebalance %v, want %v", got.AutoRebalance, tc.dlb)
+			}
+		})
 	}
 }

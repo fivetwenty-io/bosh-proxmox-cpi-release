@@ -651,8 +651,10 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 				Budget: haMotionWait(h.deps),
 			})
 		},
-		SysConsole: h.profile.SysConsole,
-		Budget:     haMotionWait(h.deps),
+		Failback:      h.decision.Failback,
+		AutoRebalance: h.decision.DLB,
+		SysConsole:    h.profile.SysConsole,
+		Budget:        haMotionWait(h.deps),
 	})
 	if err != nil {
 		return err

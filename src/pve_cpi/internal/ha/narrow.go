@@ -188,6 +188,11 @@ type NarrowInput struct {
 	// barrier's error retriable. An error, or a nil Moving, also keeps the
 	// narrower pin, so a caller that cannot tell never gets a wider pin.
 	Moving func(ctx context.Context, node string) (bool, error)
+	// Failback and AutoRebalance are the flags the removal fallback registers
+	// the resource with again. They are the VM's HA decision, the same values
+	// registration and staging write for it.
+	Failback      bool
+	AutoRebalance bool
 	// SysConsole says the token holds Sys.Console, which the ignored and
 	// started requests need.
 	SysConsole bool
@@ -822,9 +827,9 @@ func withNarrowMark(comment *string, restore string) string {
 // viaRemoval is the fallback barrier. It snapshots the CPI-owned rules that
 // name the VM and persists the snapshot, removes the HA resource, waits for the
 // CRM and the config to drop it, runs the mutation, registers the resource
-// again as ignored with its old comment, the barrier's token, and failback
-// off, rewrites the narrower pin and the rule memberships, and puts back the
-// state the resource had. It refuses before any write unless the snapshot can
+// again as ignored with its old comment, the barrier's token, and the failback
+// and auto-rebalance flags the VM's decision has, rewrites the narrower pin and
+// the rule memberships, and puts back the state the resource had. It refuses before any write unless the snapshot can
 // be persisted, because a crash after the removal would otherwise lose the
 // VM's memberships.
 func (b *barrier) viaRemoval(ctx context.Context) (pve.VMLocation, error) {
@@ -889,14 +894,13 @@ func (b *barrier) viaRemoval(ctx context.Context) (pve.VMLocation, error) {
 // token, restores its rules with the narrower pin, and puts back the state the
 // resource had, unless cause is set, in which case the resource stays ignored
 // and cause is returned.
-// The resource comes back with failback off, the value that is safe for every
-// policy, and a caller whose VM is to have failback on sets it once the
-// barrier has finished.
+// The resource comes back with the failback and auto-rebalance flags the VM's
+// decision names, as registration writes them.
 func (b *barrier) reregister(ctx context.Context, rules []Rule, cause error) error {
-	ignored, failback := haStateIgnored, false
+	ignored, failback, rebalance := haStateIgnored, b.in.Failback, b.in.AutoRebalance
 	comment := withNarrowMark(b.comment, b.restore)
 	err := b.deps.Resources.CreateHaResources(ctx, &sdkcluster.CreateHaResourcesParams{
-		Sid: b.sid, State: &ignored, Comment: &comment, Failback: &failback,
+		Sid: b.sid, State: &ignored, Comment: &comment, Failback: &failback, AutoRebalance: &rebalance,
 	})
 	if err != nil && !isRuleAlreadyDefined(err) {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
