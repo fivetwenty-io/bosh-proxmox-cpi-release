@@ -76,6 +76,11 @@ type attachHA struct {
 	// when it retired none. The journal records it after the disk's lifecycle
 	// ends (see recordLeftReplica).
 	leftReplica *retiredReplica
+
+	// failbackOff is set on an attach that skips the HA decision while the
+	// VM's resource reads failback on and the disk's storage is not proven
+	// shared. The attach then turns failback off before the disk lands.
+	failbackOff bool
 }
 
 // decideAttachHA makes the attach-time HA decision for attaching the disk rd
@@ -152,7 +157,7 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 	}
 	legacyManaged := rd.stableID == "" && deps.Config.HAModeValue() == config.HAModeManaged
 	if attachSkipsHADecision(oldPin, res, storage, legacyManaged) {
-		return nil, nil
+		return skippedAttachFailback(ctx, deps, vmCID, rd, vmid, res, storage), nil
 	}
 
 	profile, err := resolveHAProfile(ctx, deps)
@@ -253,6 +258,40 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 		h.action = attachHALeave
 	}
 	return h, nil
+}
+
+// skippedAttachFailback guards failback on an attach that skips the HA
+// decision because the VM's pin already records the disk's storage. A pin
+// that records a storage says nothing about the failback flag, which an
+// operator or an older release may have turned on, so a resource that reads
+// failback on while the disk's storage is not proven shared gets an attach
+// that turns it off before the disk lands. A storage the profile cannot
+// classify counts as not shared. Every other skip gets no HA action.
+func skippedAttachFailback(ctx context.Context, deps Deps, vmCID string, rd resolvedDisk, vmid int,
+	res *cluster.GetHaResourcesResponse, storage string,
+) *attachHA {
+	if !ha.FailbackOf(res.Failback) {
+		return nil
+	}
+	logger := deps.Log(ctx)
+	why := "the HA profile could not be resolved"
+	if profile, err := resolveHAProfile(ctx, deps); err == nil {
+		shared, known := profile.StorageShared(deps.Config, storage)
+		if shared {
+			return nil
+		}
+		why = "the storage is node-local"
+		if !known {
+			why = "the storage definitions do not classify the storage"
+		}
+	}
+	logger.Info(attachHAOp+": the VM's pin records the disk's storage, and its HA resource has failback on "+
+		"while the storage is not proven shared, so the attach turns failback off before the disk lands",
+		log.Int(metadataKeyVMID, vmid), log.String("storage", storage), log.String("reason", why))
+	return &attachHA{
+		deps: deps, logger: logger, vmCID: vmCID, disk: rd, vmid: vmid, sid: haResourceSid(vmid),
+		action: attachHANone, failbackOff: true, narrow: attachNarrowDeps(deps.PVE, logger, haMotionWait(deps)),
+	}
 }
 
 // attachNarrowDeps wires the barrier, the removal from HA, and the move into
@@ -566,6 +605,9 @@ func attachNewPin(
 // were (see preflight).
 func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string, error)) error {
 	const op = attachHAOp
+	if h != nil && h.failbackOff {
+		return h.runFailbackOff(ctx, attach)
+	}
 	if h == nil || h.action == attachHANone {
 		_, err := attach(ctx)
 		return err
@@ -608,9 +650,8 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 	// node-local or replicated disk, has failback turned off before the disk
 	// lands, so PVE HA never moves it back while it holds that disk.
 	if !h.decision.Failback {
-		if _, err := setVMFailback(ctx, narrowDeps.Resources, h.deps.RequestDirectorUUID, h.vmid, false); err != nil {
-			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("%s: turn off failback on the HA resource of VM %d before the attach", op, h.vmid))
+		if err := h.lowerFailback(ctx); err != nil {
+			return err
 		}
 	}
 	// The barrier's mutation is the whole rest of the attach, which locates the
@@ -666,6 +707,49 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 		h.restampReplica(ctx, landed)
 	}
 	return nil
+}
+
+// runFailbackOff runs an attach that skipped the HA decision with failback
+// turned off before the disk lands, and fails it with a retriable error when
+// the flag cannot be turned off. Once the disk has landed it turns failback
+// off again when the flag reads on, because a call in another process may have
+// turned it on in between from a config without the disk. That second write
+// only logs a failure, because the disk is in place and that call checks its
+// own write against the config once more (see reconcileVMFailback).
+func (h *attachHA) runFailbackOff(ctx context.Context, attach func(context.Context) (string, error)) error {
+	if err := h.lowerFailback(ctx); err != nil {
+		return err
+	}
+	if _, err := attach(ctx); err != nil {
+		return err
+	}
+	h.recheckFailbackOff(ctx)
+	return nil
+}
+
+// lowerFailback turns failback off on the VM's HA resource before a disk that
+// may not fail back lands, and returns a retriable error when it cannot.
+func (h *attachHA) lowerFailback(ctx context.Context) error {
+	if _, err := setVMFailback(ctx, h.narrow.Resources, h.deps.RequestDirectorUUID, h.vmid, false); err != nil {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("%s: turn off failback on the HA resource of VM %d before the attach", attachHAOp, h.vmid))
+	}
+	return nil
+}
+
+// recheckFailbackOff turns failback off once more after a disk that may not
+// fail back has landed, when the flag reads on, and logs a write that fails.
+func (h *attachHA) recheckFailbackOff(ctx context.Context) {
+	changed, err := setVMFailback(ctx, h.narrow.Resources, h.deps.RequestDirectorUUID, h.vmid, false)
+	logger := h.logger.With(log.Int(metadataKeyVMID, h.vmid))
+	switch {
+	case err != nil:
+		logger.Warn(attachHAOp+": failback could not be checked after the disk landed; a later call sets it",
+			log.Err(err))
+	case changed:
+		logger.Warn(attachHAOp + ": failback was on again when the disk landed, which a concurrent call set, " +
+			"and the attach turned it off")
+	}
 }
 
 // raiseFailback turns failback on, after the attach, for a VM whose volumes

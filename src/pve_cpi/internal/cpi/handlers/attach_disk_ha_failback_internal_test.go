@@ -124,3 +124,65 @@ func TestAttachHARun_FailbackOffKeyKeepsASharedVMAtZero(t *testing.T) {
 		t.Fatalf("events %v; a resource already at 0 needs no write", sl.events)
 	}
 }
+
+// TestAttachHARun_SkippedDecisionTurnsFailbackOffBeforeALocalDisk attaches a
+// node-local disk to a hold VM whose pin already records the disk's storage,
+// so the attach skips the HA decision. The resource reads failback on, which a
+// resource can carry from an operator or an older release, and the attach must
+// still turn it off before the disk lands.
+func TestAttachHARun_SkippedDecisionTurnsFailbackOffBeforeALocalDisk(t *testing.T) {
+	deps, stub, _ := attachRig(config.HAModeAuto)
+	deps.Config.HA.LocalPolicy = haChoiceOf(config.HALocalPolicyHold)
+	stub.pin(true, "pve01", "nfs", testPinStorage)
+	h, err := decideAttachHA(context.Background(), deps, "100", localDisk())
+	if err != nil || h == nil || h.action != attachHANone {
+		t.Fatalf("decision: h %+v err %v, want a skipped decision that still guards failback", h, err)
+	}
+	sl := &stagingLog{}
+	res := &attachRunRes{log: sl, state: "started", comment: stub.comment}
+	h.narrow = barrierView(res)
+	if err := h.run(context.Background(), func(context.Context) (string, error) {
+		if res.failback == nil || res.failback.Bool() {
+			t.Error("the node-local disk lands while the resource still has failback on")
+		}
+		sl.add("attach")
+		return "pve01", nil
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := []string{"failback:false", "attach"}; !slices.Equal(sl.events, want) {
+		t.Fatalf("events %v, want %v", sl.events, want)
+	}
+}
+
+// TestAttachHARun_SkippedDecisionFailbackWriteFailureStopsTheAttach fails a
+// skipped-decision attach of a node-local disk whose failback cannot be
+// turned off, before anything changes.
+func TestAttachHARun_SkippedDecisionFailbackWriteFailureStopsTheAttach(t *testing.T) {
+	deps, stub, _ := attachRig(config.HAModeAuto)
+	deps.Config.HA.LocalPolicy = haChoiceOf(config.HALocalPolicyHold)
+	stub.pin(true, "pve01", "nfs", testPinStorage)
+	h, err := decideAttachHA(context.Background(), deps, "100", localDisk())
+	if err != nil || h == nil {
+		t.Fatalf("decision: h %+v err %v", h, err)
+	}
+	res := &attachRunRes{log: &stagingLog{}, state: "started", comment: stub.comment,
+		failbackErr: errors.New("cfs lock timeout (HTTP500)")}
+	h.narrow = barrierView(res)
+	attached := false
+	err = h.run(context.Background(), func(context.Context) (string, error) { attached = true; return "pve01", nil })
+	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || attached {
+		t.Fatalf("err = %v attached %v, want a retriable error before the attach", err, attached)
+	}
+}
+
+// TestDecideAttachHA_SkippedDecisionLeavesFailbackForASharedDisk keeps the
+// skip as it was for a disk on shared storage, whose failback may stay on.
+func TestDecideAttachHA_SkippedDecisionLeavesFailbackForASharedDisk(t *testing.T) {
+	deps, stub, _ := attachRig(config.HAModeAuto)
+	stub.recordPin("nfs", "nfs2")
+	h, err := decideAttachHA(context.Background(), deps, "100", sharedDisk())
+	if err != nil || h != nil {
+		t.Fatalf("decision: h %+v err %v, want no HA action", h, err)
+	}
+}

@@ -170,6 +170,26 @@ func (p *Profile) WritesAllowed() bool {
 	return p != nil && p.Effective == EffectiveFull
 }
 
+// StorageShared reports whether the HA decision counts a volume on storage as
+// shared, the way it classifies the volumes of a VM under cfg. known is false
+// when the storage definitions could not be read or do not list storage, and
+// the caller must then treat the storage as one a VM cannot follow.
+func (p *Profile) StorageShared(cfg *config.CPIConfig, storage string) (shared, known bool) {
+	if p == nil || p.StoragesErr != "" {
+		return false, false
+	}
+	for i := range p.Storages {
+		if p.Storages[i].Name != storage {
+			continue
+		}
+		if cfg.HAStorageTopologyValue() == config.HAStorageTopologyLocal {
+			return false, true
+		}
+		return p.Storages[i].IsShared(), true
+	}
+	return false, false
+}
+
 // PrerequisiteError returns the error a managed-mode call fails with, or nil.
 // It is non-nil only when the mode is managed and a prerequisite is missing,
 // and it names every missing prerequisite. Auto mode never fails a call for a

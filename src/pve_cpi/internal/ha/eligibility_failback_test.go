@@ -77,3 +77,32 @@ func TestDecideVMSelfPinnedSharedVMKeepsFailbackOff(t *testing.T) {
 		t.Fatalf("decision = %+v; a VM whose admissible set holds one node must not get failback", d)
 	}
 }
+
+func TestProfileStorageSharedClassifiesLikeTheDecision(t *testing.T) {
+	p := eligProfile(config.HAModeAuto, "pve1", "pve2")
+	cases := map[string]struct {
+		cfg           *config.CPIConfig
+		storage       string
+		shared, known bool
+	}{
+		"a shared storage":                      {eligCfg(config.HAModeAuto), "nfs", true, true},
+		"a node-local storage":                  {eligCfg(config.HAModeAuto), "local-lvm", false, true},
+		"a storage the definitions do not list": {eligCfg(config.HAModeAuto), "gone", false, false},
+		"a shared storage under topology local": {
+			eligCfg(config.HAModeAuto, withTopology(config.HAStorageTopologyLocal)), "nfs", false, true,
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			shared, known := p.StorageShared(c.cfg, c.storage)
+			if shared != c.shared || known != c.known {
+				t.Fatalf("StorageShared = %v, %v, want %v, %v", shared, known, c.shared, c.known)
+			}
+		})
+	}
+	broken := eligProfile(config.HAModeAuto, "pve1")
+	broken.StoragesErr = "storage read failed"
+	if shared, known := broken.StorageShared(eligCfg(config.HAModeAuto), "nfs"); shared || known {
+		t.Fatalf("StorageShared = %v, %v with unreadable definitions, want false, false", shared, known)
+	}
+}
