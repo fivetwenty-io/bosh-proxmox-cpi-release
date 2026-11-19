@@ -38,13 +38,15 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - When the pin of a `replicate` VM narrows after a failover, the narrowing barrier now keeps the HA resource's `auto-rebalance` flag for a re-registration, and reads it as on when the resource leaves it unset, as PVE does.
 
-- The CPI now reads an HA resource that leaves `auto-rebalance` unset as having it on, which is PVE's default. Before, `attach_disk`, the pin widening, and the re-registration of a VM read the unset flag as off, so they could take a VM out of the dynamic load balancer that PVE was still rebalancing. Staging left an unset flag in place on a VM the CPI meant to keep out of rebalancing, and the evidence check of a managed allocation refused a resource that PVE read back with the key left out at its default.
+- The CPI now reads an HA resource that leaves `auto-rebalance` unset as having it on, which is PVE's default, when every online node runs pve-manager 9.1.14 or later. On an older release, which has no such key, an unset flag reads as off, so no VM counts as a DLB VM there. Before, `attach_disk`, the pin widening, and the re-registration of a VM read the unset flag as off, so they could take a VM out of the dynamic load balancer that PVE was still rebalancing. Staging left an unset flag in place on a VM the CPI meant to keep out of rebalancing, and the evidence check of a managed allocation refused a resource that PVE read back with the key left out at its default.
 
 - `pve-cid ha` no longer reports `failback_drift` for a parker, which no call ever reaches, or for a VM the CPI's HA decision does not register as a plain shared VM, such as one with a PCI passthrough device or a host CPU type that one node alone runs. It now counts a pin that records a change to the VM's replicated volumes as the `replicate` policy, as the CPI does.
 
 - `pve-cid ha` now reports `failback_drift` for a VM whose flag reads on when the CPI writes it off because only one node can take the VM, such as a VM whose strict pin names one node, one with a PCI passthrough device, or one with a host CPU type that one node alone runs. Before, it stayed silent about those VMs until the next call turned the flag off.
 
 - The pin of a `replicate` VM now names its replication partner only after the CPI turns `failback` off on the VM's HA resource, both when the pin widens after a verified sync and when a pin swap after a migration keeps both nodes. When that write fails, the widening leaves the pin on the VM's own node and logs a warning, and the swap fails with a retriable error, so a later call tries again. Before, a widening that followed a failed failback write could leave the flag on under a pin that names the partner, and a failover followed by the old node's return would then run the reversed replication job.
+
+- The CPI now names the `auto-rebalance` key of an HA resource only when every online node runs pve-manager 9.1.14 or later, which is the first release whose HA manager has the key. PVE 9.0, and 9.1 before 9.1.14, refuse a write that names it, so staging, and the barrier's re-registration, failed on those releases. `pve-cid ha` reports no failback finding on a cluster where a node runs a release without the `failback` key or where it could not read every node's release.
 
 ### Added
 

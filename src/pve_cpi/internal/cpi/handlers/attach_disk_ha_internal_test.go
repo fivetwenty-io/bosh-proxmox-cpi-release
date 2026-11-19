@@ -100,6 +100,10 @@ func attachProfile(mode string) *ha.Profile {
 
 // attachRig returns the deps of an attach to VM 100, which runs on pve01 with
 // a root disk on nfs and is registered by aaDirector, and its cluster stub.
+// pve92ResourceKeys are the resource keys of PVE 9.2, which accepts every
+// optional key the CPI writes.
+var pve92ResourceKeys = ha.ResourceKeys{Failback: true, AutoRebalance: true}
+
 func attachRig(mode string) (Deps, *attachHAStub, *ha.Profile) {
 	stub := &attachHAStub{naClusterStub: newNAStub(), state: "started",
 		comment: haIdentity{Owner: aaDirector}.marker()}
@@ -472,7 +476,7 @@ func TestAttachHAInput(t *testing.T) {
 	vmCfg := map[string]any{"scsi0": "nfs:vm-100-disk-0,size=10G", "hostpci0": "0000:01:00.0"}
 	rebalance := sdkclient.PVEBool(true)
 	old := &ha.Rule{ID: "bosh-na-100", Nodes: map[string]int{"pve01": 0, "pve02": 0}, Strict: true}
-	in := attachHAInput(deps, 100, "pve01", vmCfg, &cluster.GetHaResourcesResponse{AutoRebalance: &rebalance}, old,
+	in := attachHAInput(deps, pve92ResourceKeys, 100, "pve01", vmCfg, &cluster.GetHaResourcesResponse{AutoRebalance: &rebalance}, old,
 		resolvedDisk{volid: "nfs2:vm-100-disk-1"})
 	if !in.InDLBAZ {
 		t.Error("a resource that rebalances is a DLB VM")
@@ -499,7 +503,7 @@ func TestAttachHAInput(t *testing.T) {
 		{ID: "bosh-na-100", Nodes: map[string]int{"pve01": 0}},
 		{ID: "bosh-na-100", Nodes: map[string]int{"pve01": 0}, Strict: true, Disabled: true},
 	} {
-		in := attachHAInput(deps, 100, "pve01", vmCfg, &cluster.GetHaResourcesResponse{AutoRebalance: &rebalance},
+		in := attachHAInput(deps, pve92ResourceKeys, 100, "pve01", vmCfg, &cluster.GetHaResourcesResponse{AutoRebalance: &rebalance},
 			loose, resolvedDisk{volid: "nfs2:vm-100-disk-1"})
 		for _, c := range in.Constraints {
 			if c.Name == "the VM's pin bosh-na-100" {
@@ -515,19 +519,71 @@ func TestAttachHAInput_ReadsAnUnsetAutoRebalanceAsOn(t *testing.T) {
 	cfg.HA = haModeAuto()
 	vmCfg := map[string]any{"scsi0": "nfs:vm-100-disk-0,size=10G"}
 	off := sdkclient.PVEBool(false)
+	keys := (&ha.Profile{MinVersion: "9.2.4"}).ResourceKeys()
 	for name, tc := range map[string]struct {
 		flag *sdkclient.PVEBool
 		want bool
 	}{"unset": {nil, true}, "off": {&off, false}} {
 		res := &cluster.GetHaResourcesResponse{AutoRebalance: tc.flag}
-		in := attachHAInput(Deps{Config: cfg}, 100, "pve01", vmCfg, res, nil, resolvedDisk{volid: "nfs:vm-100-disk-1"})
+		in := attachHAInput(Deps{Config: cfg}, keys, 100, "pve01", vmCfg, res, nil,
+			resolvedDisk{volid: "nfs:vm-100-disk-1"})
 		if in.InDLBAZ != tc.want {
 			t.Errorf("%s: attach InDLBAZ = %v, want %v, because PVE defaults auto-rebalance to on", name,
 				in.InDLBAZ, tc.want)
 		}
-		if got := pinWidenInput(Deps{Config: cfg}, 100, "pve01", vmCfg, res); got.InDLBAZ != tc.want {
+		if got := pinWidenInput(Deps{Config: cfg}, keys, 100, "pve01", vmCfg, res); got.InDLBAZ != tc.want {
 			t.Errorf("%s: widen InDLBAZ = %v, want %v, because PVE defaults auto-rebalance to on", name,
 				got.InDLBAZ, tc.want)
+		}
+	}
+}
+
+// TestAttachHAInput_ReadsAnUnsetAutoRebalanceAsOffWithoutTheKey proves a
+// release without the auto-rebalance key, PVE 9.0 and 9.1 before 9.1.14,
+// never reads a resource as a DLB VM, because none of its resources carries
+// the key, and PVE's default of on does not exist there.
+func TestAttachHAInput_ReadsAnUnsetAutoRebalanceAsOffWithoutTheKey(t *testing.T) {
+	cfg := icMinConfig()
+	cfg.HA = haModeAuto()
+	vmCfg := map[string]any{"scsi0": "nfs:vm-100-disk-0,size=10G"}
+	for version, want := range map[string]bool{"9.0.11": false, "9.1.13": false, "9.1.14": true, "9.2.4": true} {
+		keys := (&ha.Profile{MinVersion: version}).ResourceKeys()
+		res := &cluster.GetHaResourcesResponse{}
+		in := attachHAInput(Deps{Config: cfg}, keys, 100, "pve01", vmCfg, res, nil,
+			resolvedDisk{volid: "nfs:vm-100-disk-1"})
+		if in.InDLBAZ != want {
+			t.Errorf("PVE %s: attach InDLBAZ = %v, want %v", version, in.InDLBAZ, want)
+		}
+		if got := pinWidenInput(Deps{Config: cfg}, keys, 100, "pve01", vmCfg, res); got.InDLBAZ != want {
+			t.Errorf("PVE %s: widen InDLBAZ = %v, want %v", version, got.InDLBAZ, want)
+		}
+	}
+}
+
+// TestAttachHARun_BarrierCarriesTheResourceKeysOfTheProfile proves the
+// barrier's removal fallback names only the resource keys the cluster's
+// releases accept.
+func TestAttachHARun_BarrierCarriesTheResourceKeysOfTheProfile(t *testing.T) {
+	for version, want := range map[string]ha.ResourceKeys{
+		"9.1.13": {Failback: true},
+		"9.2.4":  {Failback: true, AutoRebalance: true},
+	} {
+		deps, stub, profile := attachRig(config.HAModeAuto)
+		profile.MinVersion = version
+		profile.DLBSupported = version == "9.2.4"
+		stub.recordPin("nfs")
+		h, err := decideAttachHA(context.Background(), deps, "100", narrowingDisk())
+		if err != nil || h == nil || h.action != attachHAGuarded {
+			t.Fatalf("PVE %s: decision: h %+v err %v", version, h, err)
+		}
+		seen := captureNarrowInput(t)
+		sl := &stagingLog{}
+		h.narrow = barrierView(&attachRunRes{log: sl, state: "started", comment: stub.comment})
+		if err := runNarrowed(t, deps, h, sl); err != nil {
+			t.Fatalf("PVE %s: unexpected error: %v", version, err)
+		}
+		if len(*seen) != 1 || (*seen)[0].Keys != want {
+			t.Fatalf("PVE %s: barrier inputs %+v, want keys %+v", version, *seen, want)
 		}
 	}
 }

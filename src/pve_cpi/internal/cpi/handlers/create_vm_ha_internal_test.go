@@ -919,3 +919,23 @@ func TestCreatedVMHAInput_TargetNodeOfAGroupMember(t *testing.T) {
 		t.Error("pve.ha.anti_affinity off writes no membership, so the VM is no member")
 	}
 }
+
+// TestNewHAStager_NamesTheResourceKeysOfTheProfile proves staging names only
+// the resource keys the lowest online release accepts, so a create on PVE 9.0
+// or 9.1 before 9.1.14 never sends auto-rebalance, which those releases
+// refuse.
+func TestNewHAStager_NamesTheResourceKeysOfTheProfile(t *testing.T) {
+	for version, want := range map[string]ha.ResourceKeys{
+		"9.0.11": {Failback: true},
+		"9.1.13": {Failback: true},
+		"9.1.14": {Failback: true, AutoRebalance: true},
+		"9.2.4":  {Failback: true, AutoRebalance: true},
+	} {
+		profile := stagingProfile(config.HAModeAuto)
+		profile.MinVersion = version
+		deps := Deps{Config: icMinConfig(), PVE: &icPVEClient{}}
+		if got := newHAStager(deps, aaDirector, profile, false, log.NewNopLogger()).Keys; got != want {
+			t.Errorf("PVE %s: stager keys %+v, want %+v", version, got, want)
+		}
+	}
+}

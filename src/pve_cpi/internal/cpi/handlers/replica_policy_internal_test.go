@@ -795,6 +795,41 @@ func TestNarrowAfterFailover_NarrowsToTheNewSourceAndRequestsASync(t *testing.T)
 	}
 }
 
+// TestNarrowAfterFailover_BarrierCarriesTheResourceKeysOfTheProfile proves
+// the failover narrowing's removal fallback names only the resource keys the
+// cluster's releases accept, and that a resource without auto-rebalance on a
+// release without the key reads as off.
+func TestNarrowAfterFailover_BarrierCarriesTheResourceKeysOfTheProfile(t *testing.T) {
+	for version, want := range map[string]ha.ResourceKeys{
+		"9.0.11": {Failback: true},
+		"9.1.13": {Failback: true},
+		"9.2.4":  {Failback: true, AutoRebalance: true},
+	} {
+		r := newReplicaRig(config.HAModeAuto)
+		r.profile.MinVersion = version
+		r.setPin("pve01,pve02", func(c string) string { return ha.WithReplicaPartner(c, "pve02") })
+		r.repl.addJob("100-0", "pve02", "pve01", renderReplicaJobMarker(aaDirector, 1))
+		set, err := readHARuleSet(context.Background(), r.deps.PVE.Cluster())
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen := captureNarrowInput(t)
+		res := &attachRunRes{log: &stagingLog{}, state: "started", comment: r.stub.comment}
+		err = narrowAfterFailover(crhCtx(), r.deps, log.NewNopLogger(), "reboot_vm", r.repl, failoverView(res),
+			r.profile, 100, "pve02", set.Find("bosh-na-100"), "")
+		if err != nil {
+			t.Fatalf("PVE %s: unexpected error: %v", version, err)
+		}
+		if len(*seen) != 1 {
+			t.Fatalf("PVE %s: barrier inputs %d, want 1", version, len(*seen))
+		}
+		if in := (*seen)[0]; in.Keys != want || in.AutoRebalance != want.AutoRebalance {
+			t.Fatalf("PVE %s: barrier keys %+v auto-rebalance %v, want %+v and %v", version, in.Keys,
+				in.AutoRebalance, want, want.AutoRebalance)
+		}
+	}
+}
+
 func TestNarrowAfterFailover_BarrierKeepsTheResourcesAutoRebalance(t *testing.T) {
 	// The removal fallback of the barrier registers the resource again with
 	// the flags it is given. A replicate VM keeps failback off, and its

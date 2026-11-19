@@ -196,6 +196,11 @@ type Stager struct {
 	Managed       bool
 	FragileQuorum bool
 
+	// Keys names the optional resource keys the cluster's releases accept,
+	// which is the profile's ResourceKeys in production. Stage names only
+	// those keys, and failback off, which a write must name.
+	Keys ResourceKeys
+
 	Logger *log.Logger
 }
 
@@ -208,9 +213,12 @@ func (s *Stager) logger() *log.Logger {
 
 // Stage registers the VM's resource as ignored with marker as its comment,
 // the decision's failback, and auto-rebalance on only for a DLB VM, and marks the
-// decision staged. A resource that already exists counts as staged only when
-// it carries this Director's marker and requests ignored, and its comment and
-// flags are then set to what the stage writes. Any other resource fails the
+// decision staged. It names auto-rebalance only where every online node's
+// release has the key, and failback where the release has it or the decision
+// turns it off (see ResourceKeys). A resource that already exists counts as
+// staged only when it carries this Director's marker and requests ignored,
+// and its comment and the flags the stage names are then set to what the
+// stage writes. Any other resource fails the
 // call with a retriable error and is left alone, because it may be an
 // operator's or a resource the CRM already manages. A held error re-reads the
 // resource and counts the stage as done only when the read shows it.
@@ -224,9 +232,15 @@ func (s *Stager) Stage(ctx context.Context, d *VMDecision, marker string) error 
 		return cpierrors.Cloud("ha stage: the comment of %s does not carry this Director's ownership marker", d.SID)
 	}
 	ignored, failback, rebalance := haStateIgnored, d.Failback, d.DLB
-	err := s.Resources.CreateHaResources(ctx, &sdkcluster.CreateHaResourcesParams{
-		Sid: d.SID, State: &ignored, Comment: &marker, Failback: &failback, AutoRebalance: &rebalance,
-	})
+	failbackKey, rebalanceKey := s.Keys.sendsFailback(failback), s.Keys.AutoRebalance
+	create := &sdkcluster.CreateHaResourcesParams{Sid: d.SID, State: &ignored, Comment: &marker}
+	if failbackKey {
+		create.Failback = &failback
+	}
+	if rebalanceKey {
+		create.AutoRebalance = &rebalance
+	}
+	err := s.Resources.CreateHaResources(ctx, create)
 	if err == nil {
 		d.MarkStaged()
 		s.logger().Info("ha: staged the HA resource as ignored", log.String("sid", d.SID),
@@ -242,11 +256,16 @@ func (s *Stager) Stage(ctx context.Context, d *VMDecision, marker string) error 
 		return cpierrors.Retriable("ha stage: %s already exists and %s, so the CPI leaves it alone and does not "+
 			"register VM %d; remove the resource or let the earlier call finish, and retry", d.SID, blocker, d.VMID)
 	}
-	if got.Comment == nil || *got.Comment != marker || FailbackOf(got.Failback) != failback ||
-		AutoRebalanceOf(got.AutoRebalance) != rebalance {
-		if updErr := s.Resources.UpdateHaResources(ctx, d.SID, &sdkcluster.UpdateHaResourcesParams{
-			Comment: &marker, Failback: &failback, AutoRebalance: &rebalance,
-		}); updErr != nil {
+	if got.Comment == nil || *got.Comment != marker || failbackKey && FailbackOf(got.Failback) != failback ||
+		rebalanceKey && AutoRebalanceOf(got.AutoRebalance) != rebalance {
+		update := &sdkcluster.UpdateHaResourcesParams{Comment: &marker}
+		if failbackKey {
+			update.Failback = &failback
+		}
+		if rebalanceKey {
+			update.AutoRebalance = &rebalance
+		}
+		if updErr := s.Resources.UpdateHaResources(ctx, d.SID, update); updErr != nil {
 			return cpierrors.WrapAs(updErr, cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("ha stage: set the staged flags of %s", d.SID))
 		}

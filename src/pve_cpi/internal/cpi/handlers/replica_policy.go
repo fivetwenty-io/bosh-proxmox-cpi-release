@@ -1550,14 +1550,19 @@ func narrowAfterFailover(
 	}
 	// The barrier's removal fallback registers the resource again with these
 	// flags. A replicate VM keeps failback off, and auto-rebalance stays what
-	// the resource carries, on when it is unset, as PVE reads it. A resource
-	// that is gone is left to the barrier, which reports it.
+	// the resource carries, on when it is unset where the release has the key,
+	// as PVE reads it. A resource that is gone is left to the barrier, which
+	// reports it.
 	res, err := narrow.Resources.GetHaResources(ctx, haResourceSid(vmid))
 	if err != nil && !isHaNotFound(err) && !pve.IsNotFound(err) {
 		return cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("%s: read the HA resource of VM %d before its pin narrows after a failover", op, vmid))
 	}
-	rebalance := err != nil || res == nil || ha.AutoRebalanceOf(res.AutoRebalance)
+	keys := profile.ResourceKeys()
+	rebalance := keys.AutoRebalance
+	if err == nil && res != nil {
+		rebalance = keys.AutoRebalanceOf(res.AutoRebalance)
+	}
 	_, err = narrowActive(ctx, narrow, ha.NarrowInput{
 		VMID:     vmid,
 		Node:     node,
@@ -1591,6 +1596,7 @@ func narrowAfterFailover(
 		},
 		Failback:      false,
 		AutoRebalance: rebalance,
+		Keys:          keys,
 		SysConsole:    profile.SysConsole,
 		Budget:        haMotionWait(deps),
 	})

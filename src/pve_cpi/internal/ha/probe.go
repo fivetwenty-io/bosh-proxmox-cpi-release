@@ -707,6 +707,11 @@ func (v Version) AtLeast(major, minor int) bool {
 	return v.Major > major || v.Major == major && v.Minor >= minor
 }
 
+// AtLeastPatch reports whether v is at least major.minor.patch.
+func (v Version) AtLeastPatch(major, minor, patch int) bool {
+	return !v.less(Version{Major: major, Minor: minor, Patch: patch})
+}
+
 func (v Version) less(o Version) bool {
 	if v.Major != o.Major {
 		return v.Major < o.Major

@@ -274,7 +274,7 @@ func wantVMFailback(ctx context.Context, deps Deps, api ha.FailbackAPI, profile 
 	if configHasReplicaTag(cfg) {
 		return off("the VM replicates its volumes to a partner node")
 	}
-	in := pinWidenInput(deps, vmid, loc.Node, cfg, res)
+	in := pinWidenInput(deps, profile.ResourceKeys(), vmid, loc.Node, cfg, res)
 	if pin != nil && pin.Strict && !pin.Disabled && haOwnershipOf(pin.Comment, deps.RequestDirectorUUID) == haOwnedByUs {
 		in.Constraints = append(in.Constraints, ownPinConstraint(vmid, pin.NodeNames()))
 	}

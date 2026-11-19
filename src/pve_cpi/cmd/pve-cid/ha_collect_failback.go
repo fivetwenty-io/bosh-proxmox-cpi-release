@@ -25,12 +25,15 @@ import (
 // into the VM's admissible set holds, a VM whose config, storages, rules, or
 // replication jobs could not be read, a volume on a storage the index does not
 // list, a strict pin that names one node while the flag reads off, and a VM
-// whose decision fails or refuses HA for a reason that may pass. It also
+// whose decision fails or refuses HA for a reason that may pass. It reports
+// nothing on a cluster where a node runs a release without the failback key,
+// or whose releases it could not read, because the CPI has no flag to set
+// there. It also
 // leaves parkers alone, because a parker stays stopped, so failback never
 // moves it, and the Director never calls set_vm_metadata or reboot_vm on one,
 // so a finding about it would never clear.
 func (c *haCollector) failbackFindings() {
-	if c.off() || !c.guestsOK || !c.resourcesOK {
+	if c.off() || !c.guestsOK || !c.resourcesOK || !c.p.ResourceKeys().Failback {
 		return
 	}
 	for _, g := range c.guests {

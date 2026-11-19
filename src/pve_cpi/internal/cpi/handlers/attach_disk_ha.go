@@ -184,7 +184,7 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 			fmt.Sprintf("%s: read the config of VM %d for its HA decision", op, vmid))
 	}
 
-	in := attachHAInput(deps, vmid, loc.Node, cfg, res, oldPin, rd)
+	in := attachHAInput(deps, profile.ResourceKeys(), vmid, loc.Node, cfg, res, oldPin, rd)
 	d, err := profile.DecideVM(in)
 	if err != nil {
 		return nil, err
@@ -200,7 +200,7 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 		}); err != nil {
 			return nil, err
 		}
-		in = attachHAInput(deps, vmid, loc.Node, cfg, res, oldPin, rd)
+		in = attachHAInput(deps, profile.ResourceKeys(), vmid, loc.Node, cfg, res, oldPin, rd)
 	}
 	for _, w := range d.Warnings {
 		logger.Warn(op+": "+w, log.Int(metadataKeyVMID, vmid))
@@ -339,7 +339,7 @@ func attachDecideInsideSet(ctx context.Context, deps Deps, narrow ha.NarrowDeps,
 		return "", nil, nil, cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("%s: read the config of VM %d for its HA decision after PVE HA moved it", op, o.vmid))
 	}
-	d, err := profile.DecideVM(attachHAInput(deps, o.vmid, moved, cfg, o.res, o.oldPin, o.disk))
+	d, err := profile.DecideVM(attachHAInput(deps, profile.ResourceKeys(), o.vmid, moved, cfg, o.res, o.oldPin, o.disk))
 	if err != nil {
 		return "", nil, nil, err
 	}
@@ -562,10 +562,10 @@ func readHARuleSet(ctx context.Context, svc cluster.Service) (*ha.RuleSet, error
 // resource ignored with its token, which the next attach finishes, rather
 // than removing a resource the CRM is acting on.
 func attachHAInput(
-	deps Deps, vmid int, node string, cfg map[string]any, res *cluster.GetHaResourcesResponse, oldPin *ha.Rule,
-	rd resolvedDisk,
+	deps Deps, keys ha.ResourceKeys, vmid int, node string, cfg map[string]any, res *cluster.GetHaResourcesResponse,
+	oldPin *ha.Rule, rd resolvedDisk,
 ) ha.VMInput {
-	return attachDecisionInput(deps, vmid, node, cfg, ha.AutoRebalanceOf(res.AutoRebalance), oldPin, rd)
+	return attachDecisionInput(deps, vmid, node, cfg, keys.AutoRebalanceOf(res.AutoRebalance), oldPin, rd)
 }
 
 // attachDecisionInput is attachHAInput with the resource's auto-rebalance flag
@@ -755,6 +755,7 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 		},
 		Failback:      h.decision.Failback,
 		AutoRebalance: h.decision.DLB,
+		Keys:          h.profile.ResourceKeys(),
 		SysConsole:    h.profile.SysConsole,
 		Budget:        haMotionWait(h.deps),
 	})

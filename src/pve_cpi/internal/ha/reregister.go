@@ -857,7 +857,7 @@ func (r *readd) snapshot(
 	}
 	rec := ReaddRecord{
 		Comment:       strings.TrimSpace(*stripNarrowMark(&comment)),
-		AutoRebalance: AutoRebalanceOf(res.AutoRebalance),
+		AutoRebalance: r.in.Stager.Keys.AutoRebalanceOf(res.AutoRebalance),
 	}
 	set, err := r.in.Stager.ReadRules(ctx)
 	if err != nil {

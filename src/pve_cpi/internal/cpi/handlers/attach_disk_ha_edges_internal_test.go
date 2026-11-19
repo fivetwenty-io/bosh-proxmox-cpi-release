@@ -140,7 +140,7 @@ func TestAttachHAInput_MarksTheVMAndItsPin(t *testing.T) {
 	cfg := icMinConfig()
 	cfg.HA = haModeAuto()
 	old := &ha.Rule{ID: "bosh-na-100", Nodes: map[string]int{"pve01": 0, "pve02": 0}, Strict: true}
-	in := attachHAInput(Deps{Config: cfg}, 100, "pve01", map[string]any{"scsi0": "nfs:vm-100-disk-0,size=10G",
+	in := attachHAInput(Deps{Config: cfg}, pve92ResourceKeys, 100, "pve01", map[string]any{"scsi0": "nfs:vm-100-disk-0,size=10G",
 		"hostpci0": "0000:01:00.0"}, &cluster.GetHaResourcesResponse{}, old, resolvedDisk{volid: "nfs2:vm-100-disk-1"})
 	if !in.HAManaged {
 		t.Error("an attach decides for a VM that runs under HA")

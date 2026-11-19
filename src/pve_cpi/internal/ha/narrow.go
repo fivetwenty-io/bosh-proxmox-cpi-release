@@ -193,6 +193,10 @@ type NarrowInput struct {
 	// registration and staging write for it.
 	Failback      bool
 	AutoRebalance bool
+	// Keys names the optional resource keys the cluster's releases accept,
+	// which is the profile's ResourceKeys. The removal fallback names only
+	// those keys, and failback off, which a write must name.
+	Keys ResourceKeys
 	// SysConsole says the token holds Sys.Console, which the ignored and
 	// started requests need.
 	SysConsole bool
@@ -895,13 +899,19 @@ func (b *barrier) viaRemoval(ctx context.Context) (pve.VMLocation, error) {
 // resource had, unless cause is set, in which case the resource stays ignored
 // and cause is returned.
 // The resource comes back with the failback and auto-rebalance flags the VM's
-// decision names, as registration writes them.
+// decision names, as registration writes them, and with only the keys the
+// cluster's releases accept, as staging names them.
 func (b *barrier) reregister(ctx context.Context, rules []Rule, cause error) error {
 	ignored, failback, rebalance := haStateIgnored, b.in.Failback, b.in.AutoRebalance
 	comment := withNarrowMark(b.comment, b.restore)
-	err := b.deps.Resources.CreateHaResources(ctx, &sdkcluster.CreateHaResourcesParams{
-		Sid: b.sid, State: &ignored, Comment: &comment, Failback: &failback, AutoRebalance: &rebalance,
-	})
+	create := &sdkcluster.CreateHaResourcesParams{Sid: b.sid, State: &ignored, Comment: &comment}
+	if b.in.Keys.sendsFailback(failback) {
+		create.Failback = &failback
+	}
+	if b.in.Keys.AutoRebalance {
+		create.AutoRebalance = &rebalance
+	}
+	err := b.deps.Resources.CreateHaResources(ctx, create)
 	if err != nil && !isRuleAlreadyDefined(err) {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("ha narrow: register %s again after the fallback barrier", b.sid))

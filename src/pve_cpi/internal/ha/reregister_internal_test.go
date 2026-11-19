@@ -232,6 +232,7 @@ func (r *readdRig) input() ReregisterInput {
 		Stager: &Stager{
 			Resources: r,
 			Owned:     ownedMarker,
+			Keys:      ResourceKeys{Failback: true, AutoRebalance: true},
 			ReadRules: func(context.Context) (*RuleSet, error) {
 				if err := r.failOnce("rules"); err != nil {
 					return nil, err
@@ -632,7 +633,8 @@ func TestReregisterCountsAnUnansweredRemovalThatLanded(t *testing.T) {
 	in := r.input()
 	inner := in.Stager.Resources
 	in.Stager = &Stager{Resources: &lostAnswer{ResourceAPI: inner, rig: r}, Owned: in.Stager.Owned,
-		ReadRules: in.Stager.ReadRules, Watchdog: in.Stager.Watchdog, SetStarted: in.Stager.SetStarted}
+		ReadRules: in.Stager.ReadRules, Watchdog: in.Stager.Watchdog, SetStarted: in.Stager.SetStarted,
+		Keys: in.Stager.Keys}
 	res, err := r.run(t, in)
 	r.registeredAgain(t, res, err)
 }

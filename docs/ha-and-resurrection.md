@@ -100,7 +100,7 @@ The effective state is `full`, `observe-only`, or `off`. In `observe-only` the C
 
 - **PVE 9 or later**
 
-  PVE 9 replaced HA groups with node-affinity and resource-affinity rules, and the CPI writes only rules. Every online node must report PVE 9 or later, and the rules endpoint must answer. A cluster in the middle of an upgrade stays without CPI HA until its last node finishes. The dynamic load balancer needs PVE 9.2.
+  PVE 9 replaced HA groups with node-affinity and resource-affinity rules, and the CPI writes only rules. Every online node must report PVE 9 or later, and the rules endpoint must answer. A cluster in the middle of an upgrade stays without CPI HA until its last node finishes. The dynamic load balancer needs PVE 9.2. The `auto-rebalance` key of an HA resource arrived with pve-manager 9.1.14, so on PVE 9.0, and on 9.1 before 9.1.14, the CPI leaves the key out of every resource it writes and reads no resource as a DLB VM. [DLB-aware placement](dlb-aware-placement.md) has the details.
 
 - **Sys.Console**
 

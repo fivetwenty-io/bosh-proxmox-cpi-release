@@ -63,7 +63,13 @@ func (r *stageRig) CreateHaResources(_ context.Context, p *sdkcluster.CreateHaRe
 		return errors.New("resource 'vm:101' already defined")
 	}
 	r.exists, r.state, r.comment = true, *p.State, *p.Comment
-	r.failback, r.rebalance = pveBool(*p.Failback), pveBool(*p.AutoRebalance)
+	r.failback, r.rebalance = nil, nil
+	if p.Failback != nil {
+		r.failback = pveBool(*p.Failback)
+	}
+	if p.AutoRebalance != nil {
+		r.rebalance = pveBool(*p.AutoRebalance)
+	}
 	return r.createErr
 }
 
@@ -108,7 +114,11 @@ func stageDecision() *VMDecision {
 		Admissible: []string{"a", "b"}, Hard: []string{"a", "b"}, Placed: "a"}
 }
 
-func (r *stageRig) stager() *Stager { return &Stager{Resources: r, Owned: ownedMarker} }
+// stager stages against a cluster whose releases accept every optional
+// resource key, as PVE 9.2 does.
+func (r *stageRig) stager() *Stager {
+	return &Stager{Resources: r, Owned: ownedMarker, Keys: ResourceKeys{Failback: true, AutoRebalance: true}}
+}
 
 func TestStageRegistersAnIgnoredResource(t *testing.T) {
 	t.Parallel()

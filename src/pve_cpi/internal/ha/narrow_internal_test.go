@@ -115,6 +115,7 @@ func (r *barrierRig) deps() NarrowDeps {
 func (r *barrierRig) input(old, next *Rule) NarrowInput {
 	return NarrowInput{
 		VMID: 101, Node: "a", OldPin: old, NewPin: next, SysConsole: true, Budget: time.Minute,
+		Keys:     ResourceKeys{Failback: true, AutoRebalance: true},
 		Mutation: pve.VMConfigMutation{Apply: func(context.Context, string) error { return nil }},
 		WritePin: func(_ context.Context, pin *Rule) error {
 			id := "none"

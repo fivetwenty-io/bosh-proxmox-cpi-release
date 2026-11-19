@@ -247,3 +247,23 @@ func TestCollectFailbackReportsOnWhereTheDecisionTurnsItOff(t *testing.T) {
 		})
 	}
 }
+
+// TestCollectFailbackLeavesAReleaseWithoutTheKeyAlone proves the doctor
+// reports no failback finding on a cluster where a node runs a release
+// without the failback key, or whose releases it could not read, because the
+// CPI then has no flag to set.
+func TestCollectFailbackLeavesAReleaseWithoutTheKeyAlone(t *testing.T) {
+	t.Parallel()
+	for _, version := range []string{"8.4.1", ""} {
+		f := haBaseFake()
+		f.profile.MinVersion = version
+		f.resources[0].Failback = failbackRow(false)
+		r := runCollect(t, f, haCfg("auto", "none"))
+		wantNone(t, r, haKindFailbackDrift)
+		wantNone(t, r, haKindFailbackOnReplica)
+	}
+	f := haBaseFake()
+	f.resources[0].Failback = failbackRow(false)
+	r := runCollect(t, f, haCfg("auto", "none"))
+	want(t, r, haKindFailbackDrift, haSeverityAdvice, "vm:100", "failback off")
+}

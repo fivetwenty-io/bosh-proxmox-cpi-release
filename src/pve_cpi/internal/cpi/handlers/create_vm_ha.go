@@ -387,6 +387,7 @@ func newHAStager(deps Deps, owner string, profile *ha.Profile, managed bool, log
 	return &ha.Stager{
 		Resources: svc,
 		Owned:     func(comment string) bool { return haOwnershipOf(comment, owner) == haOwnedByUs },
+		Keys:      profile.ResourceKeys(),
 		ReadRules: func(ctx context.Context) (*ha.RuleSet, error) {
 			resp, err := svc.ListHaRules(ctx, &cluster.ListHaRulesParams{})
 			if err != nil {

@@ -129,7 +129,7 @@ func widenPinOnce(ctx context.Context, deps Deps, vmid int, node string, logger 
 	if err != nil {
 		return nil, nil, fmt.Errorf("read the config of VM %d on node %s: %w", vmid, node, pve.WrapError(err))
 	}
-	in := pinWidenInput(deps, vmid, node, cfg, res)
+	in := pinWidenInput(deps, profile.ResourceKeys(), vmid, node, cfg, res)
 	storages := ha.VolumeStorages(in.Volumes)
 	if !slices.Equal(storages, recorded) {
 		// An attach or a detach changed the VM's volumes since the pin was
@@ -216,7 +216,9 @@ func pinWidenAZ(cfg *config.CPIConfig, pinNodes []string) (az string, nodes []st
 // the old pin, because the old pin is what the widening may grow. The VM's
 // PCI devices hold it to its node, and the caller adds the zone and the nodes
 // the widening found reachable.
-func pinWidenInput(deps Deps, vmid int, node string, cfg map[string]any, res *cluster.GetHaResourcesResponse) ha.VMInput {
+func pinWidenInput(
+	deps Deps, keys ha.ResourceKeys, vmid int, node string, cfg map[string]any, res *cluster.GetHaResourcesResponse,
+) ha.VMInput {
 	liveCPU, _ := pve.ConfigString(cfg, "cpu")
 	in := ha.VMInput{
 		Config:      deps.Config,
@@ -224,7 +226,7 @@ func pinWidenInput(deps Deps, vmid int, node string, cfg map[string]any, res *cl
 		Node:        node,
 		Volumes:     haVolumesOfConfig(cfg, node, nil),
 		CPUType:     ha.EffectiveCPUType(deps.Config, nil, liveCPU),
-		InDLBAZ:     ha.AutoRebalanceOf(res.AutoRebalance),
+		InDLBAZ:     keys.AutoRebalanceOf(res.AutoRebalance),
 		LinkedClone: configHasLinkedClone(cfg),
 		HAManaged:   true,
 	}
