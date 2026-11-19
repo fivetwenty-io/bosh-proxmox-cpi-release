@@ -2566,3 +2566,80 @@ func TestCollectReadsTheDrainFromTheServicesOnTheNode(t *testing.T) {
 		})
 	}
 }
+
+// parkedCfg is the auto mode config under the parked strategy, with the
+// parker band 90000 to 90999.
+func parkedCfg() *config.CPIConfig {
+	return haCfgWith("auto", "none", "", `,"detached_disk_strategy":"parked",`+
+		`"parked_disk_vmid_range_start":90000,"parked_disk_vmid_range_end":90999`)
+}
+
+// TestCollectParkerLeftovers proves the doctor reports this Director's parker
+// resource and parker pin that name a VMID in the parker band no guest holds,
+// and passes over the ones a guest still holds, another Director's, an
+// instance group's resource, a VMID outside the band, and the free strategy.
+func TestCollectParkerLeftovers(t *testing.T) {
+	t.Parallel()
+	other := "bosh-cpi:v1 owner=aaaaaaaa-0000-0000-0000-000000000000"
+	f := haBaseFake()
+	f.guests = append(f.guests, pve.GuestRef{VMID: 90001, Node: "n2", Tags: "bosh-cpi;bosh-parker", Status: "stopped"})
+	f.configs[90001] = map[string]any{"tags": "bosh-cpi;bosh-parker"}
+	f.memory[90001] = haGiB
+	f.clusterVMs = append(f.clusterVMs, f.guests...)
+	f.resources = append(f.resources,
+		HAResourceRow{SID: "vm:90000", State: "stopped", Comment: haMarker + " deployment=- group=-"},
+		HAResourceRow{SID: "vm:90001", State: "stopped", Comment: haMarker},
+		HAResourceRow{SID: "vm:90002", State: "stopped", Comment: other},
+		HAResourceRow{SID: "vm:90003", State: "stopped", Comment: haMarker + " deployment=cf group=router"},
+		HAResourceRow{SID: "vm:91000", State: "stopped", Comment: haMarker},
+	)
+	f.rules = []ha.Rule{
+		pinRule(90000, haMarker, "n1", "n2"),
+		pinRule(90001, haMarker, "n1", "n2"),
+		pinRule(90002, other, "n1"),
+		pinRule(90004, haMarker, "n3"),
+		pinRule(91000, haMarker, "n1"),
+	}
+	r := runCollect(t, f, parkedCfg())
+	if got := findings(r, haKindParkerResourceOrphan); len(got) != 1 {
+		t.Fatalf("parker resource leftovers = %+v, want only vm:90000", got)
+	}
+	want(t, r, haKindParkerResourceOrphan, haSeverityProblem, "vm:90000", "ha-manager remove vm:90000")
+	got := findings(r, haKindParkerPinOrphan)
+	if len(got) != 2 || got[0].Subject != "bosh-na-90000" || got[1].Subject != "bosh-na-90004" {
+		t.Fatalf("parker pin leftovers = %+v, want bosh-na-90000 and bosh-na-90004", got)
+	}
+	for _, g := range got {
+		if !strings.Contains(g.Detail, "ha-manager rules remove "+g.Subject) || g.Severity != haSeverityProblem {
+			t.Errorf("parker pin leftover = %+v, want a problem that names ha-manager rules remove", g)
+		}
+	}
+
+	free := haCfgWith("auto", "none", "", `,"detached_disk_strategy":"free"`)
+	wantNone(t, runCollect(t, f, free), haKindParkerResourceOrphan, haKindParkerPinOrphan)
+}
+
+// TestCollectParkerLeftoversNeedACompleteGuestList proves a VMID missing from
+// a guest list that offline nodes cut short, or with no cluster VM list to
+// confirm it, is never called a gone parker.
+func TestCollectParkerLeftoversNeedACompleteGuestList(t *testing.T) {
+	t.Parallel()
+	setup := func() *fakeHA {
+		f := haBaseFake()
+		f.clusterVMs = append(f.clusterVMs, f.guests...)
+		f.resources = append(f.resources, HAResourceRow{SID: "vm:90000", State: "stopped", Comment: haMarker})
+		f.rules = []ha.Rule{pinRule(90000, haMarker, "n1")}
+		return f
+	}
+	partial := setup()
+	partial.excluded = []string{"n3"}
+	wantNone(t, runCollect(t, partial, parkedCfg()), haKindParkerResourceOrphan, haKindParkerPinOrphan)
+
+	unread := setup()
+	unread.clusterVMsErr = errFake
+	wantNone(t, runCollect(t, unread, parkedCfg()), haKindParkerResourceOrphan, haKindParkerPinOrphan)
+
+	listed := setup()
+	listed.clusterVMs = append(listed.clusterVMs, pve.GuestRef{VMID: 90000, Node: "n3"})
+	wantNone(t, runCollect(t, listed, parkedCfg()), haKindParkerResourceOrphan, haKindParkerPinOrphan)
+}

@@ -65,6 +65,8 @@ const (
 	haKindSoftPinAffinity       = "soft_pin_resource_affinity"
 	haKindFailbackOnReplica     = "failback_on_replica"
 	haKindFailbackDrift         = "failback_drift"
+	haKindParkerResourceOrphan  = "parker_resource_orphan"
+	haKindParkerPinOrphan       = "parker_pin_orphan"
 )
 
 // haFinding is one thing the doctor found.

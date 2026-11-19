@@ -2022,6 +2022,85 @@ func (c *haCollector) leftoverFindings() {
 	c.resourceLeftovers()
 	c.ruleLeftovers()
 	c.guestLeftovers()
+	c.parkerLeftovers()
+}
+
+// parkerLeftovers reports this Director's parker resources and parker pins
+// that name a VMID in the parker band no guest holds. The parker HA pass of a
+// sweep removes such a leftover once it proves the parker gone, so one that
+// the doctor sees has not been proven yet: the HA manager still holds the
+// service, no pin names a node to prove the parker gone on, a node the pin
+// names does not answer, or no sweep has run since. The check needs the
+// parked strategy, both a guest list that every node answered and the
+// cluster's VM list, so a VMID missing from both proves the guest gone. Off
+// mode has its own leftover findings.
+func (c *haCollector) parkerLeftovers() {
+	if c.off() || c.cfg == nil || c.cfg.DetachedDiskStrategyValue() != config.DetachedDiskStrategyParked ||
+		!c.guestsOK || c.guestsPartial || !c.clusterOK {
+		return
+	}
+	start, end := c.cfg.ParkedDiskVMIDRangeStartValue(), c.cfg.ParkedDiskVMIDRangeEndValue()
+	gone := func(id string) (int, bool) {
+		vmid, err := strconv.Atoi(id)
+		if err != nil || strconv.Itoa(vmid) != id || vmid < start || vmid > end {
+			return 0, false
+		}
+		_, listed := c.byVMID[vmid]
+		_, indexed := c.clusterVMs[vmid]
+		return vmid, !listed && !indexed
+	}
+	if c.resourcesOK {
+		sids := make([]string, 0, len(c.resources))
+		for sid := range c.resources {
+			sids = append(sids, sid)
+		}
+		sort.Strings(sids)
+		for _, sid := range sids {
+			row := c.resources[sid]
+			id, isVM := strings.CutPrefix(sid, "vm:")
+			if _, marked := haMarkerOwner(row.Comment); !isVM || !marked || c.foreign(row.Comment) ||
+				haMarkerNamesGroup(row.Comment) {
+				continue
+			}
+			if vmid, ok := gone(id); ok {
+				c.rep.problem(haKindParkerResourceOrphan, sid,
+					"the CPI-owned resource names parker VM %d, which no node holds a config for; the parker sweep "+
+						"removes it once it proves the parker gone, and if it stays, remove it with ha-manager remove %s",
+					vmid, sid)
+			}
+		}
+	}
+	if c.rulesOK {
+		for i := range c.rules {
+			r := &c.rules[i]
+			id, isPin := strings.CutPrefix(r.ID, haPinRulePrefix)
+			if !isPin || !ruleMarked(r) || c.foreign(r.Comment) {
+				continue
+			}
+			if vmid, ok := gone(id); ok {
+				c.rep.problem(haKindParkerPinOrphan, r.ID,
+					"the CPI-owned pin names parker VM %d, which no node holds a config for; the parker sweep "+
+						"removes it once it proves the parker gone, and if it stays, remove it with ha-manager rules "+
+						"remove %s", vmid, r.ID)
+			}
+		}
+	}
+}
+
+// haMarkerNamesGroup reports whether a marker names a deployment or an
+// instance group, which a VM's resource does and a parker's never does.
+func haMarkerNamesGroup(comment string) bool {
+	fields, _, ok := ha.MarkerFields(comment)
+	if !ok {
+		return false
+	}
+	for _, f := range fields {
+		key, val, found := strings.Cut(f, "=")
+		if found && (key == "deployment" || key == "group") && val != "" && val != ha.MarkerUnset {
+			return true
+		}
+	}
+	return false
 }
 
 // resourceLeftovers reports CPI resources left in the ignored state, and the
