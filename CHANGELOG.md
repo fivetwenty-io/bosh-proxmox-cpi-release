@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-11-19
+
 ### Changed
 
 - Third-party Go dependencies are refreshed to their latest releases, including the AWS SDK for Go v2 modules behind the S3 stemcell fetcher, the Proxmox SDK at proxmox-apiclient-go v3.13.2, gRPC at v1.85.0, and `golang.org/x/net`, `golang.org/x/sync`, `golang.org/x/sys`, and `golang.org/x/text`. No direct dependency has a newer major version, and none is archived or deprecated.
@@ -1247,7 +1249,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.3...v0.11.0
 [0.10.3]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.1...v0.10.2
