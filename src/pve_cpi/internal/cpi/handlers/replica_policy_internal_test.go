@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -1319,4 +1320,67 @@ func TestDeadNodeReplicaCopies(t *testing.T) {
 			t.Fatal("a rule read that fails must be an error")
 		}
 	})
+}
+
+// failbackPinWatch records, for each failback write on the replica rig's HA
+// resource, the value and the pin's nodes at that moment.
+func (r *replicaRig) failbackPinWatch() *[]string {
+	var writes []string
+	r.stub.onFailbackWrite = func(on bool) {
+		writes = append(writes, fmt.Sprintf("failback:%v@%s", on, r.pinNodes()))
+	}
+	return &writes
+}
+
+func TestReconcileVMReplica_WidenTurnsFailbackOffBeforeThePinNamesThePartner(t *testing.T) {
+	// The resource reads failback on, which the reconcile left after a
+	// failed clear. The pin must not name the partner while it is on, or a
+	// failover and the old node's return run the reversed job.
+	r := newReplicaRig(config.HAModeAuto)
+	changed := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	r.setPin("pve01", func(c string) string { return ha.WithReplicaChanged(c, changed) })
+	r.ownJob(1)
+	r.repl.status = verifiedSync(changed)
+	r.repl.listed[replicaRootVolume] = true
+	r.stub.failback = failbackFlag(true)
+	writes := r.failbackPinWatch()
+	loc := pve.VMLocation{Node: "pve01", Found: true, Tags: "bosh-cpi;" + haReplicaTag}
+	if err := reconcileVMReplica(crhCtx(), r.deps, "set_vm_metadata", "100", 100, loc,
+		log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !slices.Equal(*writes, []string{"failback:false@pve01"}) || r.pinNodes() != "pve01,pve02" {
+		t.Fatalf("failback writes %v, pin nodes %q; want failback off before the pin names the partner",
+			*writes, r.pinNodes())
+	}
+}
+
+func TestReconcileVMReplica_WidenWaitsWhenFailbackCannotBeTurnedOff(t *testing.T) {
+	r := newReplicaRig(config.HAModeAuto)
+	changed := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	r.setPin("pve01", func(c string) string { return ha.WithReplicaChanged(c, changed) })
+	r.ownJob(1)
+	r.repl.status = verifiedSync(changed)
+	r.repl.listed[replicaRootVolume] = true
+	r.stub.failback = failbackFlag(true)
+	r.stub.failbackErr = errors.New("cfs lock timeout")
+	// A widening that cannot finish is logged, as every widening is, and the
+	// pin keeps the source alone until a later call.
+	logger, observed := log.NewObservedLogger(log.LevelInfo)
+	loc := pve.VMLocation{Node: "pve01", Found: true, Tags: "bosh-cpi;" + haReplicaTag}
+	if err := reconcileVMReplica(crhCtx(), r.deps, "set_vm_metadata", "100", 100, loc, logger); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.pinNodes() != "pve01" {
+		t.Fatalf("pin nodes %q, want the source alone while failback may be on", r.pinNodes())
+	}
+	warned := false
+	for _, e := range observed.All() {
+		if e.Level >= log.LevelWarn && strings.Contains(e.Message+fmt.Sprint(e.Attrs), "turn off failback") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("no warning names the failback write; logs %+v", observed.All())
+	}
 }

@@ -33,8 +33,34 @@ type attachHAStub struct {
 	rebalance bool
 	// failback is the resource's failback flag, nil for PVE's default of on.
 	failback *sdkclient.PVEBool
+	// failbackErr fails every write of the failback flag.
+	failbackErr error
+	// onFailbackWrite runs after each write of the failback flag lands.
+	onFailbackWrite func(on bool)
 	// node is where the index places the VM, pve01 when it is empty.
 	node string
+}
+
+// UpdateHaResources takes a write of the resource's failback flag, comment,
+// or requested state.
+func (s *attachHAStub) UpdateHaResources(_ context.Context, _ string, p *cluster.UpdateHaResourcesParams) error {
+	if p.Failback != nil && s.failbackErr != nil {
+		return s.failbackErr
+	}
+	if p.State != nil {
+		s.state = *p.State
+	}
+	if p.Comment != nil {
+		s.comment = *p.Comment
+	}
+	if p.Failback != nil {
+		v := sdkclient.PVEBool(*p.Failback)
+		s.failback = &v
+		if s.onFailbackWrite != nil {
+			s.onFailbackWrite(*p.Failback)
+		}
+	}
+	return nil
 }
 
 func (s *attachHAStub) GetHaResources(_ context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {

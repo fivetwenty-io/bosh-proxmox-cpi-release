@@ -44,6 +44,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - `pve-cid ha` now reports `failback_drift` for a VM whose flag reads on when the CPI writes it off because only one node can take the VM, such as a VM whose strict pin names one node, one with a PCI passthrough device, or one with a host CPU type that one node alone runs. Before, it stayed silent about those VMs until the next call turned the flag off.
 
+- The pin of a `replicate` VM now names its replication partner only after the CPI turns `failback` off on the VM's HA resource, both when the pin widens after a verified sync and when a pin swap after a migration keeps both nodes. When that write fails, the widening leaves the pin on the VM's own node and logs a warning, and the swap fails with a retriable error, so a later call tries again. Before, a widening that followed a failed failback write could leave the flag on under a pin that names the partner, and a failover followed by the old node's return would then run the reversed replication job.
+
 ### Added
 
 - `pve.ha.failback`, an optional boolean, turns `failback` off on every HA resource the CPI writes when it is `false`. Left unset, it lets the CPI turn the flag on for shared VMs. A cpi-config entry can override it under `pve_ha`.

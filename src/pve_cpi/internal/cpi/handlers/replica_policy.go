@@ -313,6 +313,9 @@ func (w *replicaWiden) run(ctx context.Context) (bool, error) {
 		held.log(logger, "the pin keeps the source alone")
 		return false, nil
 	}
+	if err := w.failbackOffBeforePartner(ctx); err != nil {
+		return false, err
+	}
 	if err := writeReplicaPin(ctx, w.deps, w.profile, logger, w.vmid, pin, widenedReplicaPin(pin, target)); err != nil {
 		return false, err
 	}
@@ -320,6 +323,22 @@ func (w *replicaWiden) run(ctx context.Context) (bool, error) {
 		log.String("job", job.ID), log.String("partner", target),
 		log.String("last_sync", synced.lastSync.Format(time.RFC3339)))
 	return true, nil
+}
+
+// failbackOffBeforePartner turns failback off on the VM's HA resource right
+// before the pin names a replication partner, when it reads on. A pin over the
+// source and its partner is what turns failback on into a loss of writes: after
+// a failover, the old source's return would pull the VM back and run the
+// reversed job, whose first run receives with zfs recv -F. The reconcile only
+// logs a failback write that fails, so the widening checks the flag itself and
+// fails closed: a write that fails returns a retriable error, and the pin keeps
+// the source alone until a later call.
+func (w *replicaWiden) failbackOffBeforePartner(ctx context.Context) error {
+	if _, err := clearVMFailback(ctx, w.deps.PVE.Cluster(), w.deps.RequestDirectorUUID, w.vmid); err != nil {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf("%s: turn off failback on the HA "+
+			"resource of VM %d before its pin names the replication partner", replicaOp, w.vmid))
+	}
+	return nil
 }
 
 // replicaHeld says why a check of a replica did not verify it. A held check
@@ -1430,6 +1449,9 @@ func (w *replicaWiden) swapAfterMigration(
 	verdict := ha.JudgePartnerMove(move)
 	if !verdict.KeepsBothNodes() {
 		return false, "the move could not be judged", nil
+	}
+	if err := w.failbackOffBeforePartner(ctx); err != nil {
+		return false, "", err
 	}
 	if err := writeReplicaPin(ctx, w.deps, w.profile, logger, w.vmid, pin,
 		swappedReplicaPin(pin, w.node, oldSource)); err != nil {

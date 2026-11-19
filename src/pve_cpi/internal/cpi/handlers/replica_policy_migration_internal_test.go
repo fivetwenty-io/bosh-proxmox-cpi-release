@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -494,5 +495,37 @@ func TestReconcileOnPartner_UnreadableStartsLeaveTheMigrationUnproven(t *testing
 				t.Fatalf("warnings %q; an unreadable start listing leaves the migration unproven", warnings)
 			}
 		})
+	}
+}
+
+func TestReconcileVMReplica_SwapWaitsWhenFailbackCannotBeTurnedOff(t *testing.T) {
+	// A planned migration to the partner would keep both nodes on the pin,
+	// which a VM with failback on must not get.
+	r, _ := movedReplicaRig(t)
+	before := r.pinNodes()
+	r.stub.failback = failbackFlag(true)
+	r.stub.failbackErr = errors.New("cfs lock timeout")
+	loc := pve.VMLocation{Node: "pve02", Found: true, Tags: "bosh-cpi;" + haReplicaTag}
+	err := reconcileVMReplica(crhCtx(), r.deps, "set_vm_metadata", "100", 100, loc, log.NewNopLogger())
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !strings.Contains(err.Error(), "failback") {
+		t.Fatalf("err %v, want a retriable error about failback", err)
+	}
+	if r.pinNodes() != before {
+		t.Fatalf("pin nodes %q, want %q while failback may be on", r.pinNodes(), before)
+	}
+}
+
+func TestReconcileVMReplica_SwapTurnsFailbackOffBeforeThePinKeepsBothNodes(t *testing.T) {
+	r, _ := movedReplicaRig(t)
+	before := r.pinNodes()
+	r.stub.failback = failbackFlag(true)
+	writes := r.failbackPinWatch()
+	loc := pve.VMLocation{Node: "pve02", Found: true, Tags: "bosh-cpi;" + haReplicaTag}
+	if err := reconcileVMReplica(crhCtx(), r.deps, "set_vm_metadata", "100", 100, loc,
+		log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !slices.Equal(*writes, []string{"failback:false@" + before}) || ha.FailbackOf(r.stub.failback) {
+		t.Fatalf("failback writes %v, want failback off while the pin was still %q", *writes, before)
 	}
 }
