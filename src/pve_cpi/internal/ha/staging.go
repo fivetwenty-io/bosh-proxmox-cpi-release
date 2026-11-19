@@ -207,7 +207,7 @@ func (s *Stager) logger() *log.Logger {
 }
 
 // Stage registers the VM's resource as ignored with marker as its comment,
-// failback off, and auto-rebalance on only for a DLB VM, and marks the
+// the decision's failback, and auto-rebalance on only for a DLB VM, and marks the
 // decision staged. A resource that already exists counts as staged only when
 // it carries this Director's marker and requests ignored, and its comment and
 // flags are then set to what the stage writes. Any other resource fails the
@@ -223,14 +223,14 @@ func (s *Stager) Stage(ctx context.Context, d *VMDecision, marker string) error 
 	case !s.Owned(marker):
 		return cpierrors.Cloud("ha stage: the comment of %s does not carry this Director's ownership marker", d.SID)
 	}
-	ignored, failback, rebalance := haStateIgnored, false, d.DLB
+	ignored, failback, rebalance := haStateIgnored, d.Failback, d.DLB
 	err := s.Resources.CreateHaResources(ctx, &sdkcluster.CreateHaResourcesParams{
 		Sid: d.SID, State: &ignored, Comment: &marker, Failback: &failback, AutoRebalance: &rebalance,
 	})
 	if err == nil {
 		d.MarkStaged()
 		s.logger().Info("ha: staged the HA resource as ignored", log.String("sid", d.SID),
-			log.Bool("auto_rebalance", rebalance))
+			log.Bool("failback", failback), log.Bool("auto_rebalance", rebalance))
 		return nil
 	}
 	got, readErr := s.Resources.GetHaResources(ctx, d.SID)
@@ -242,7 +242,7 @@ func (s *Stager) Stage(ctx context.Context, d *VMDecision, marker string) error 
 		return cpierrors.Retriable("ha stage: %s already exists and %s, so the CPI leaves it alone and does not "+
 			"register VM %d; remove the resource or let the earlier call finish, and retry", d.SID, blocker, d.VMID)
 	}
-	if got.Comment == nil || *got.Comment != marker || !pveBoolIs(got.Failback, false) ||
+	if got.Comment == nil || *got.Comment != marker || FailbackOf(got.Failback) != failback ||
 		!pveBoolIs(got.AutoRebalance, rebalance) {
 		if updErr := s.Resources.UpdateHaResources(ctx, d.SID, &sdkcluster.UpdateHaResourcesParams{
 			Comment: &marker, Failback: &failback, AutoRebalance: &rebalance,
@@ -268,9 +268,15 @@ func (s *Stager) stagedBlocker(got *sdkcluster.GetHaResourcesResponse) string {
 	return ""
 }
 
+// FailbackOf reads the failback flag of an HA resource. PVE defaults failback
+// to on, so an unset flag reads as true.
+func FailbackOf(v *sdkclient.PVEBool) bool {
+	return v == nil || v.Bool()
+}
+
 // pveBoolIs reports whether a PVE flag reads as want, with an unset flag
-// reading as false, which is PVE's default for failback and auto-rebalance on a
-// resource the CPI wrote.
+// reading as false. Failback defaults to on, so it is read with FailbackOf
+// instead.
 func pveBoolIs(v *sdkclient.PVEBool, want bool) bool {
 	if v == nil {
 		return !want

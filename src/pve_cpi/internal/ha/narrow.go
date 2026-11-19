@@ -889,6 +889,9 @@ func (b *barrier) viaRemoval(ctx context.Context) (pve.VMLocation, error) {
 // token, restores its rules with the narrower pin, and puts back the state the
 // resource had, unless cause is set, in which case the resource stays ignored
 // and cause is returned.
+// The resource comes back with failback off, the value that is safe for every
+// policy, and a caller whose VM is to have failback on sets it once the
+// barrier has finished.
 func (b *barrier) reregister(ctx context.Context, rules []Rule, cause error) error {
 	ignored, failback := haStateIgnored, false
 	comment := withNarrowMark(b.comment, b.restore)

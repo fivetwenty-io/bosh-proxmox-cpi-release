@@ -628,12 +628,56 @@ func TestStageLeavesTheFlagAloneOnAResourceThatAlreadyHoldsIt(t *testing.T) {
 	p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
 	in := baseInput(eligCfg(config.HAModeAuto, withDLB(true, "dlb")), vols("nfs:100/vm-101-disk-0")...)
 	in.NodeTargeted = true
-	rig := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, failback: pveBool(false),
+	rig := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, failback: pveBool(true),
 		rebalance: pveBool(false)}
 	if err := rig.stager().Stage(context.Background(), mustDecide(t, p, in), stageMarker); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(rig.events, []string{"create:ignored", "get"}) || rig.rebalance.Bool() {
 		t.Fatalf("a resource with auto-rebalance off needs no update: %v", rig.events)
+	}
+}
+
+func TestStageWritesTheDecisionsFailback(t *testing.T) {
+	t.Parallel()
+	for _, want := range []bool{false, true} {
+		rig := &stageRig{}
+		d := stageDecision()
+		d.Failback = want
+		if err := rig.stager().Stage(context.Background(), d, stageMarker); err != nil {
+			t.Fatal(err)
+		}
+		if rig.failback == nil || rig.failback.Bool() != want {
+			t.Fatalf("want=%v: the create wrote failback %v", want, rig.failback)
+		}
+	}
+}
+
+func TestStageReadsAnUnsetFailbackAsOn(t *testing.T) {
+	t.Parallel()
+	on := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker}
+	d := stageDecision()
+	d.Failback = true
+	if err := on.stager().Stage(context.Background(), d, stageMarker); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(on.events, []string{"create:ignored", "get"}) {
+		t.Fatalf("an unset failback is PVE's default of on, so nothing is updated: %v", on.events)
+	}
+
+	off := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker}
+	if err := off.stager().Stage(context.Background(), stageDecision(), stageMarker); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(off.events, []string{"create:ignored", "get", "update:-"}) || off.failback == nil ||
+		off.failback.Bool() {
+		t.Fatalf("an unset failback reads as on and must be turned off: %v, %v", off.events, off.failback)
+	}
+}
+
+func TestFailbackOf(t *testing.T) {
+	t.Parallel()
+	if !FailbackOf(nil) || !FailbackOf(pveBool(true)) || FailbackOf(pveBool(false)) {
+		t.Fatal("FailbackOf must read nil and true as on, and false as off")
 	}
 }

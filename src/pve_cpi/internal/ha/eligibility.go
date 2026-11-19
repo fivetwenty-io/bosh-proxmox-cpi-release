@@ -238,6 +238,14 @@ type VMDecision struct {
 	Preferred []string
 	DLB       bool
 
+	// Failback is the failback flag the VM's resource carries. It is true only
+	// for a VM under PolicyShared, whose every volume moves with it, and only
+	// while pve.ha.failback is not false. A replicate VM never gets it, because
+	// the first run of the reversed replication job after a failback rolls the
+	// source's volumes back with zfs recv -F, and a hold VM never gets it
+	// because its strict self pin leaves PVE no node to move it back to.
+	Failback bool
+
 	// TargetNodeOverridesDLB is true when the VM would have been a DLB VM, and
 	// its input's NodeTargeted kept it out of the balancer.
 	TargetNodeOverridesDLB bool
@@ -885,6 +893,7 @@ func (e *eligibility) register(policy Policy, hard []string, reason string) {
 	}
 	e.d.Outcome, e.d.Policy, e.d.Reason = OutcomeRegister, policy, reason
 	e.d.Admissible = set
+	e.d.Failback = policy == PolicyShared && e.cfg.HAFailbackEnabled()
 	if !sameSet(set, e.members) {
 		e.d.Hard = set
 	}
