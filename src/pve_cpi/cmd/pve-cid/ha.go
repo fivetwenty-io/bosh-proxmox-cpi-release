@@ -17,15 +17,17 @@ import (
 // haInputLimit caps the size of a request or cpi-config file the doctor reads.
 const haInputLimit = 1 << 20
 
-const haUsage = "usage: pve-cid ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]"
+const haUsage = "usage: pve-cid ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]\n" +
+	"       pve-cid ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]"
 
 // haDeps are the pieces of the ha subcommand a test replaces: how the base CPI
 // config is loaded, how a reader is opened for an effective config, and the
-// clock every age is measured on.
+// clock every age is measured on, and the replica widening pass.
 type haDeps struct {
 	loadConfig func(path string, stderr io.Writer) (*config.CPIConfig, *log.Logger, error)
 	openReader func(cfg *config.CPIConfig, logger *log.Logger) (HAReader, error)
 	now        func() time.Time
+	widen      haWidenFunc
 }
 
 // productionHADeps wires the ha subcommand to the real config loader and PVE
@@ -40,7 +42,8 @@ func productionHADeps() haDeps {
 			}
 			return newPVEHAReader(client, cfg, logger), nil
 		},
-		now: time.Now,
+		now:   time.Now,
+		widen: productionHAWiden,
 	}
 }
 
@@ -49,8 +52,10 @@ func runHA(args []string, stdout, stderr io.Writer) int {
 	return runHAWith(args, stdout, stderr, productionHADeps())
 }
 
-// runHAWith runs the doctor against the pieces in deps. It reads PVE and
-// nothing else: no reader method writes.
+// runHAWith runs the doctor against the pieces in deps. The doctor reads PVE
+// and nothing else, because no reader method writes. The one exception is
+// --widen-replicas --apply, which runs the CPI's own replica widening pass and
+// writes the node-affinity pins that pass widens.
 func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 	fs := flag.NewFlagSet("ha", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -58,6 +63,9 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 	requestPath := fs.String("request", "", "CPI request JSON file whose context selects a cpi_config entry")
 	cpiConfigPath := fs.String("cpi-config", "", "BOSH cpi-config as JSON (not the rendered cpi.json), used to check every cpis entry of type pve and the exports they share")
 	asJSON := fs.Bool("json", false, "JSON output")
+	widenReplicas := fs.Bool("widen-replicas", false, "widen the pin of each replicate VM whose replica a verified sync covers, using the check the CPI runs (a dry run unless --apply is given)")
+	apply := fs.Bool("apply", false, "with --widen-replicas, write the widened pins")
+	directorUUID := fs.String("director-uuid", "", "with --widen-replicas, the UUID of the Director whose VMs the pass may widen, when no --request names it")
 	if err := fs.Parse(args); errors.Is(err, flag.ErrHelp) {
 		fs.SetOutput(stderr)
 		_, _ = fmt.Fprintln(stderr, haUsage)
@@ -71,6 +79,9 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 		_, _ = fmt.Fprintln(stderr, "pve-cid ha: --request and --cpi-config cannot be combined")
 		_, _ = fmt.Fprintln(stderr, haUsage)
 		return exitUsage
+	}
+	if code, ok := checkHAWidenFlags(*widenReplicas, *apply, *cpiConfigPath, *directorUUID, stderr); !ok {
+		return code
 	}
 
 	base, logger, err := deps.loadConfig(*configPath, stderr)
@@ -99,6 +110,16 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 			return exitError
 		}
 	}
+	if *widenReplicas {
+		if *directorUUID != "" {
+			if owner != "" && owner != *directorUUID {
+				_, _ = fmt.Fprintln(stderr, "pve-cid ha: --director-uuid names a different Director than the request")
+				return exitUsage
+			}
+			owner = *directorUUID
+		}
+		return runHAWiden(ctx, eff, logger, owner, *apply, *asJSON, stdout, stderr, deps)
+	}
 	reader, err := deps.openReader(eff, logger)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "pve-cid ha: cannot reach the cluster: %v\n", err)
@@ -119,6 +140,22 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 		return exitError
 	}
 	return exitOK
+}
+
+// checkHAWidenFlags refuses the flag combinations --widen-replicas does not
+// take, and the widening flags without it.
+func checkHAWidenFlags(widen, apply bool, cpiConfigPath, directorUUID string, stderr io.Writer) (int, bool) {
+	switch {
+	case !widen && (apply || directorUUID != ""):
+		_, _ = fmt.Fprintln(stderr, "pve-cid ha: --apply and --director-uuid go with --widen-replicas")
+	case widen && cpiConfigPath != "":
+		_, _ = fmt.Fprintln(stderr, "pve-cid ha: --widen-replicas and --cpi-config cannot be combined; "+
+			"run it once per cpis entry with that entry's --request")
+	default:
+		return exitOK, true
+	}
+	_, _ = fmt.Fprintln(stderr, haUsage)
+	return exitUsage, false
 }
 
 // readHARequestContext reads the context of a CPI request file. The file is

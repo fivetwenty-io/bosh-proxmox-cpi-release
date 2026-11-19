@@ -706,15 +706,17 @@ func TestCollectReplicaOnPartnerAndAwaitingPinWidening(t *testing.T) {
 	r := runCollect(t, f, haCfg("auto", "replicate"))
 	want(t, r, haKindReplicaOnPartner, haSeverityProblem, "vm:101", "partner n2", "from n2 back to n1")
 	// The job has synced and the journal holds no verified sync yet, so the pin
-	// has not been widened: that is a wait for the next call, not a fault.
-	want(t, r, haKindReplicaAwaiting, haSeverityAdvice, "vm:101", "synced at", "reboot_vm or set_vm_metadata")
+	// has not been widened: that is a wait for the next call, not a fault, and
+	// the advice names the command that widens it now.
+	want(t, r, haKindReplicaAwaiting, haSeverityAdvice, "vm:101", "synced at",
+		"the next CPI call that takes the HA rules lock", "pve-cid ha --widen-replicas --apply")
 	wantNone(t, r, haKindReplicaNotRecover)
 
 	// With no pin token and no journal proof, the VM is awaiting the same way.
 	g := replicaFake()
 	g.rules = []ha.Rule{pinRule(101, haMarker, "n1", "n2")}
 	r = runCollect(t, g, haCfg("auto", "replicate"))
-	want(t, r, haKindReplicaAwaiting, haSeverityAdvice, "vm:101", "reboot_vm or set_vm_metadata")
+	want(t, r, haKindReplicaAwaiting, haSeverityAdvice, "vm:101", "the next CPI call that takes the HA rules lock")
 	wantNone(t, r, haKindReplicaNotRecover, haKindReplicaOnPartner, haKindReplicaJobStale)
 	if r.Problems() != 0 {
 		t.Fatalf("a healthy job awaiting its pin must not fail the run: %+v", r.Findings)

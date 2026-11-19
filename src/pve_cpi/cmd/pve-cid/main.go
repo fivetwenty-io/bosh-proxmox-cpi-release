@@ -1,10 +1,12 @@
-// Package main implements pve-cid, a read-only operator CLI for inspecting
+// Package main implements pve-cid, an operator CLI for inspecting
 // BOSH Proxmox CPI CIDs (cloud IDs) and correlating them against live PVE
 // cluster state.
 //
-// pve-cid never mutates PVE: every subcommand either decodes/encodes a CID
-// offline, or performs read-only API calls (GET-only) to locate and
-// inventory CPI-managed resources.
+// pve-cid reads and does not change PVE. Every subcommand either decodes or
+// encodes a CID offline, or makes read-only API calls to locate and inventory
+// CPI-managed resources. The one exception is "pve-cid ha --widen-replicas
+// --apply", which runs the CPI's own replica widening pass and writes the
+// node-affinity pins it widens. Without --apply that command is a dry run.
 //
 // # CID families
 //
@@ -64,6 +66,16 @@
 //	    cpis entry of type pve (it is not the rendered cpi.json, which --config
 //	    takes), then checks that clusters mounting one shared export do not overlap on
 //	    VMID bands or next-id ranges. It exits 1 when any problem is found.
+//
+//	pve-cid ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]
+//	    Online. Runs the CPI's replica widening pass for one Director. The
+//	    pass finds each replicate VM of that Director whose pin still names
+//	    its source node alone and checks it the way reboot_vm and
+//	    set_vm_metadata do, under the same locks. Without --apply it is a
+//	    dry run that claims and writes nothing. With --apply it widens each
+//	    pin a verified sync covers. It prints every VM it considered with
+//	    the outcome and the reason, and exits 1 when a VM failed or the pass
+//	    stopped early.
 //
 // # Config resolution (locate, stemcells, ha)
 //
@@ -150,7 +162,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func printUsage(w io.Writer) {
-	_, _ = fmt.Fprint(w, `pve-cid — read-only operator CLI for BOSH Proxmox CPI CIDs
+	_, _ = fmt.Fprint(w, `pve-cid, the operator CLI for BOSH Proxmox CPI CIDs
 
 Usage:
   pve-cid decode <cid> [--json]
@@ -159,13 +171,16 @@ Usage:
   pve-cid storage-plan --request PATH [--config PATH] [--json]
   pve-cid stemcells [--storage ID] [--node N] [--orphans] [--config PATH] [--json]
   pve-cid ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]
+  pve-cid ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]
   pve-cid version
   pve-cid help
 
 decode and encode are fully offline (no PVE API calls). locate, stemcells,
 and ha are read-only online commands: they load the CPI's cpi.json (--config flag,
 then $PVE_CPI_CONFIG, then /var/vcap/jobs/pve_cpi/config/cpi.json) and query
-the configured PVE cluster; pve-cid never mutates PVE.
+the configured PVE cluster. pve-cid changes nothing in PVE, except that
+"ha --widen-replicas --apply" widens the replica pins the CPI's own check
+finds ready.
 
 Run "pve-cid <subcommand> --help" for subcommand-specific flags.
 `)
