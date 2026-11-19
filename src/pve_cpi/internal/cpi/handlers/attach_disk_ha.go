@@ -71,6 +71,10 @@ type attachHA struct {
 	// restamped the pin with the time it did.
 	replicaChanged time.Time
 
+	// clock is the attach's clock for the land-by time it records before the
+	// disk lands. nil is time.Now, and tests set it.
+	clock func() time.Time
+
 	// replicaTagged is true when the VM carries the replicate tag, so a
 	// removal from HA retires the VM's replication job too.
 	replicaTagged bool
@@ -708,6 +712,18 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 	if err := h.holdReplicaUnproven(ctx); err != nil {
 		return err
 	}
+	// While the barrier keeps the pin's nodes, the VM's HA resource stays as
+	// it is, so the pin's land-by time is all that keeps a sync from proving
+	// the VM's volume set until the disk lands. The attach records a later
+	// one right before the disk lands when it ran long (see
+	// recordLandingTime). A barrier that narrows the pin holds the resource
+	// ignored until it ends, so no pass checks the VM meanwhile.
+	var landing func(context.Context) error
+	if !h.replicaChanged.IsZero() && h.oldPin != nil && h.newPin != nil && !ha.Narrows(h.oldPin, h.newPin) {
+		own := *h.oldPin
+		h.oldPin = &own
+		landing = h.recordLandingTime
+	}
 	// The barrier's mutation is the whole rest of the attach, which locates the
 	// VM itself, so the node the drain found is only where it starts.
 	var landed string
@@ -739,7 +755,7 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 						return err
 					}
 				}
-				node, err := attach(ctx)
+				node, err := attach(withAttachLanding(ctx, landing))
 				landed = node
 				if err == nil && !h.decision.Failback {
 					h.recheckFailbackOff(ctx)
@@ -866,19 +882,112 @@ func (h *attachHA) syncFailback(ctx context.Context, node string) {
 // barrier's restore.
 const attachReplicaLandWaits = 3
 
+// attachReplicaLandingWaits bounds the landing of the disk, in HA motion
+// waits, from the start of the shared attach core: one for the core's wait
+// out of a migration that starts while it writes the config, and one for the
+// config write and for a PVE task that runs on after the call stops waiting
+// for it, as it does when the request's deadline ends the call.
+const attachReplicaLandingWaits = 2
+
+// attachLandingKey carries recordLandingTime to attachDiskSteps, which runs
+// it right before the shared attach core, where the disk lands.
+type attachLandingKey struct{}
+
+// withAttachLanding returns ctx carrying fn, or ctx itself when fn is nil.
+func withAttachLanding(ctx context.Context, fn func(context.Context) error) context.Context {
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, attachLandingKey{}, fn)
+}
+
+// beforeAttachLanding runs the function withAttachLanding put on ctx, if
+// any. attachDiskSteps calls it right before the disk lands.
+func beforeAttachLanding(ctx context.Context) error {
+	if fn, ok := ctx.Value(attachLandingKey{}).(func(context.Context) error); ok {
+		return fn(ctx)
+	}
+	return nil
+}
+
+// recordLandingTime makes sure the pin's land-by time is no earlier than
+// attachReplicaLandingWaits HA motion waits after now, right before the disk
+// lands. The steps before the landing, such as a holder guard that migrates
+// the disk or the per-node in-flight gate, can take longer than the bound the
+// attach recorded when it decided, and without this a sync that starts after
+// that bound, but before the disk lands, could prove the old volume set.
+//
+// The barrier writes the pin after the mutation without comparing it, so it
+// would narrow a pin a pass widened meanwhile anyway, but only after the disk
+// landed. So a pin a pass widened since the hold is narrowed back to the
+// source here, before the disk lands, instead of failing the attach, which
+// the Director does not retry. Any other change to the pin fails the attach
+// retriably before the disk lands. The barrier's pins take the new time too,
+// so the pin it writes after the attach, or puts back after an attach that
+// failed, keeps it.
+func (h *attachHA) recordLandingTime(ctx context.Context) error {
+	now := time.Now
+	if h.clock != nil {
+		now = h.clock
+	}
+	by := now().Add(attachReplicaLandingWaits * haMotionWait(h.deps))
+	if !by.After(h.replicaChanged) {
+		return nil
+	}
+	held := *h.oldPin
+	held.Comment = ha.WithReplicaChanged(h.oldPin.Comment, by)
+	expect := h.oldPin
+	written, err := writeReplicaPinWith(ctx, h.deps, h.profile, h.logger, h.vmid, expect, &held, replicaPinWrite{
+		standIn: func(cur *ha.Rule) bool { return widenedSince(expect, cur) },
+	})
+	if err == nil && written.standIn != nil {
+		h.logger.Info(attachHAOp+": another call widened the replicate VM's pin to its partner while the attach "+
+			"ran, so the attach narrows the pin to the source before the disk lands",
+			log.Int(metadataKeyVMID, h.vmid), log.String("nodes", strings.Join(written.standIn.NodeNames(), ",")))
+		_, err = writeReplicaPinWith(ctx, h.deps, h.profile, h.logger, h.vmid, written.standIn, &held,
+			replicaPinWrite{})
+	}
+	if err != nil {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf("%s: VM %d: record on the "+
+			"replicate VM's pin a later time its volume set can change, before the disk lands", attachHAOp, h.vmid))
+	}
+	h.logger.Info(attachHAOp+": the attach ran past the time its replicate VM's pin allowed it to land, so the "+
+		"pin records a later one before the disk lands", log.Int(metadataKeyVMID, h.vmid),
+		log.String("land_by", by.UTC().Format(time.RFC3339)))
+	*h.oldPin = held
+	h.newPin.Comment = ha.WithReplicaChanged(h.newPin.Comment, by)
+	h.replicaChanged = by
+	return nil
+}
+
 // attachReplicaLandBy returns the latest time an attach decided at now can
-// land: attachReplicaLandWaits HA motion waits after now, or the request's
-// deadline when that comes first. A replicate VM's pin records it as the
-// change of the VM's volume set while the attach runs, so no sync that
-// starts before the new disk lands can prove the volume set, and an attach
-// that stops before it restamps the pin holds the pin on the source no
-// longer than that.
+// land. That is attachReplicaLandWaits HA motion waits after now, or, when it
+// comes first, attachReplicaLandingWaits motion waits after the request's
+// deadline, because the deadline ends the attach's work but not a PVE task
+// that is still running then. A replicate VM's pin records it as the change
+// of the VM's volume set while the attach runs, so no sync that starts
+// before the new disk lands can prove the volume set, and an attach that
+// stops before it restamps the pin holds the pin on the source no longer
+// than that. An attach whose steps before the landing run past the bound
+// records a later one right before the disk lands (see recordLandingTime).
+//
+// A sync counts only when it starts more than the clock-skew tolerance after
+// the recorded time, so the bound must hold on its own, without that
+// tolerance, which is there for the nodes' clocks.
 func attachReplicaLandBy(ctx context.Context, deps Deps, now time.Time) time.Time {
 	by := now.Add(attachReplicaLandWaits * haMotionWait(deps))
-	if deadline, ok := ctx.Deadline(); ok && deadline.Before(by) {
-		by = deadline
+	if deadline, ok := ctx.Deadline(); ok {
+		by = minTime(by, deadline.Add(attachReplicaLandingWaits*haMotionWait(deps)))
 	}
 	return by
+}
+
+// minTime returns the earlier of a and b.
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
 }
 
 // holdReplicaUnproven records on a replicate VM's pin, before the attach,

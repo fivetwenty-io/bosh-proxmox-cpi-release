@@ -105,13 +105,15 @@ func TestAttachToAReplicateVMHoldsTheReplicaUnprovenWhileItRuns(t *testing.T) {
 	}
 }
 
-// A request deadline earlier than the attach's own bound is the latest time
-// the attach can land, so the pin records that instead.
+// A request deadline earlier than the attach's own bound ends the attach's
+// work, and the disk then lands within the landing allowance after it, since
+// a PVE task can run on after the call stops waiting, so the pin records
+// that instead.
 func TestAttachToAReplicateVMRecordsTheRequestDeadlineWhileItRuns(t *testing.T) {
 	old := time.Now().Add(-time.Hour).Truncate(time.Second)
 	comment := ha.WithReplicaChanged(ha.WithVolumeRecord(haIdentity{Owner: aaDirector}.marker(),
 		[]string{"local-zfs"}), old)
-	deadline := time.Now().Add(90 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	deps, stub, profile := attachRig(config.HAModeAuto)
@@ -136,8 +138,9 @@ func TestAttachToAReplicateVMRecordsTheRequestDeadlineWhileItRuns(t *testing.T) 
 		t.Fatalf("decision: h %+v err %v", h, err)
 	}
 	got, ok := ha.ReplicaChanged(h.newPin.Comment)
-	if !ok || got.After(deadline) || got.Before(deadline.Truncate(time.Second).Add(-time.Second)) {
-		t.Fatalf("new pin records %v, want the request's deadline %v", got, deadline)
+	want := deadline.Add(attachReplicaLandingWaits * time.Duration(wait) * time.Second)
+	if !ok || got.After(want) || got.Before(want.Truncate(time.Second).Add(-time.Second)) {
+		t.Fatalf("new pin records %v, want the request's deadline and the landing allowance, %v", got, want)
 	}
 }
 
@@ -206,5 +209,109 @@ func TestAttachToAReplicateVMNarrowsAPinASweepWidenedSinceTheDecision(t *testing
 	}
 	if after := pinStamp(t, stub); after.Before(inside.Truncate(time.Second)) || after.After(time.Now()) {
 		t.Fatalf("the pin records the change at %v after the attach, want the time it finished", after)
+	}
+}
+
+// An attach whose steps before the landing ran longer than the land-by time
+// it recorded leaves room for records a later one right before the disk
+// lands, so the pin's time stays no earlier than the landing. An attach that
+// reaches the landing in time writes nothing more.
+func TestAttachToAReplicateVMRecordsALaterLandByBeforeALateLanding(t *testing.T) {
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	comment := ha.WithReplicaChanged(ha.WithVolumeRecord(haIdentity{Owner: aaDirector}.marker(),
+		[]string{"local-zfs"}), old)
+	h, stub, cfg := replicaStampRig(t, comment, "pve01")
+	var held, timely, late, landing time.Time
+	err := h.run(context.Background(), func(ctx context.Context) (string, error) {
+		held = pinStamp(t, stub)
+		if err := beforeAttachLanding(ctx); err != nil {
+			return "", err
+		}
+		timely = pinStamp(t, stub)
+		late = time.Now().Add(2 * time.Minute)
+		h.clock = func() time.Time { return late }
+		if err := beforeAttachLanding(ctx); err != nil {
+			return "", err
+		}
+		landing = pinStamp(t, stub)
+		cfg["scsi1"] = "local-zfs:vm-100-disk-1,size=5G"
+		return "pve01", nil
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !timely.Equal(held) {
+		t.Fatalf("a landing in time moved the pin's time from %v to %v; want no write", held, timely)
+	}
+	if want := late.Add(2 * time.Minute).Truncate(time.Second); landing.Before(want) {
+		t.Fatalf("before a late landing at %v the pin records %v; want no earlier than %v, the landing's "+
+			"allowance after it", late, landing, want)
+	}
+	if derefString(stub.rules["bosh-na-100"].Nodes) != "pve01" {
+		t.Fatalf("pin nodes %q, want the source alone", derefString(stub.rules["bosh-na-100"].Nodes))
+	}
+}
+
+// A pass that widened the pin after its land-by time while the attach still
+// ran, before the disk landed, is narrowed back to the source with a later
+// land-by time before the disk lands, and the attach succeeds.
+func TestAttachToAReplicateVMNarrowsAPinWidenedBeforeALateLanding(t *testing.T) {
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	comment := ha.WithReplicaChanged(ha.WithVolumeRecord(haIdentity{Owner: aaDirector}.marker(),
+		[]string{"local-zfs"}), old)
+	h, stub, cfg := replicaStampRig(t, comment, "pve01")
+	var late, landing time.Time
+	var landingNodes string
+	err := h.run(context.Background(), func(ctx context.Context) (string, error) {
+		rule := stub.rules["bosh-na-100"]
+		widened := ha.WithReplicaPartner(derefString(rule.Comment), "pve02")
+		nodes := "pve01,pve02"
+		rule.Comment, rule.Nodes = &widened, &nodes
+		stub.rules["bosh-na-100"] = rule
+		late = time.Now().Add(2 * time.Minute)
+		h.clock = func() time.Time { return late }
+		if err := beforeAttachLanding(ctx); err != nil {
+			return "", err
+		}
+		landing = pinStamp(t, stub)
+		landingNodes = derefString(stub.rules["bosh-na-100"].Nodes)
+		cfg["scsi1"] = "local-zfs:vm-100-disk-1,size=5G"
+		return "pve01", nil
+	})
+	if err != nil {
+		t.Fatalf("run: %v; a pin widened before the landing must not fail the attach", err)
+	}
+	if partner, _ := ha.ReplicaPartner(derefString(stub.rules["bosh-na-100"].Comment)); landingNodes != "pve01" ||
+		partner != "" {
+		t.Fatalf("before the landing the pin named %q; want the source alone", landingNodes)
+	}
+	if want := late.Add(2 * time.Minute).Truncate(time.Second); landing.Before(want) {
+		t.Fatalf("before the landing the pin records %v; want no earlier than %v", landing, want)
+	}
+}
+
+// Without a request deadline, the land-by time is the attach's own bound,
+// and a deadline earlier than that bound gives the deadline and the landing
+// allowance, whichever is earlier.
+func TestAttachReplicaLandBy(t *testing.T) {
+	deps, _, _ := attachRig(config.HAModeAuto)
+	wait := 60
+	deps.Config.HA.MotionWaitSec = &wait
+	mw := time.Duration(wait) * time.Second
+	now := time.Now()
+	if got := attachReplicaLandBy(context.Background(), deps, now); !got.Equal(now.Add(attachReplicaLandWaits * mw)) {
+		t.Fatalf("no deadline: %v", got)
+	}
+	near := now.Add(30 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), near)
+	defer cancel()
+	if got := attachReplicaLandBy(ctx, deps, now); !got.Equal(near.Add(attachReplicaLandingWaits * mw)) {
+		t.Fatalf("near deadline: %v, want %v", got, near.Add(attachReplicaLandingWaits*mw))
+	}
+	far := now.Add(time.Hour)
+	ctxFar, cancelFar := context.WithDeadline(context.Background(), far)
+	defer cancelFar()
+	if got := attachReplicaLandBy(ctxFar, deps, now); !got.Equal(now.Add(attachReplicaLandWaits * mw)) {
+		t.Fatalf("far deadline: %v", got)
 	}
 }

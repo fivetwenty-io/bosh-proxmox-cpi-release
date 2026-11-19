@@ -302,6 +302,11 @@ func attachDiskSteps(
 	// CID record. create_vm's disk_cids pre-attach runs the identical
 	// sequence (see attachDiskCore).
 	// --------------------------------------------------------------------
+	// The disk lands in the core, so an attach to a replicate VM records on
+	// the VM's pin, first, a land-by time that covers the core.
+	if err := beforeAttachLanding(ctx); err != nil {
+		return "", "", "", err
+	}
 	diskID, devicePath, err := attachDiskCore(ctx, deps, "attach_disk", vmCID, node, vmid, diskCID, rd, plan)
 	if err != nil {
 		return "", "", "", err
