@@ -444,14 +444,7 @@ func HandleCreateDisk(deps Deps) Handler {
 			if success {
 				return
 			}
-			// Under the parked strategy the disk may already sit on a parker
-			// slot by the time a later step fails; delete would then rip the
-			// volume out from under that reference. Unpark first (best-effort;
-			// a no-op when the park never ran or never committed).
-			if deps.Config.DetachedDiskParkedEnabled() {
-				unparkCreatedDiskForRollback(ctx, deps, bareDiskCID)
-			}
-			rollbackCreatedVolume(ctx, deps, node, storage, canonicalVolID, deps.Log(ctx))
+			rollbackFreshDisk(ctx, deps, node, storage, canonicalVolID, bareDiskCID)
 		}()
 
 		// Append placement metadata so downstream handlers (attach_disk and
@@ -916,13 +909,31 @@ func parkFreshDisk(ctx context.Context, deps Deps, node, diskCID string, created
 	return nil
 }
 
+// rollbackFreshDisk is create_disk's rollback of the volume it created.
+// Under the parked strategy the disk may already sit on a parker slot by the
+// time a later step fails, and a delete would then rip the volume out from
+// under that reference, so the disk is unparked first (best-effort, and a
+// no-op when the park never ran or never committed). A parker PVE HA manages
+// that the unpark emptied is retired after the volume's delete, on a context
+// free of the request's cancellation, because the likeliest reason for the
+// rollback is that the request ran out. The retirement bounds its own work.
+func rollbackFreshDisk(ctx context.Context, deps Deps, node, storage, canonicalVolID, bareDiskCID string) {
+	var emptied pve.DiskHolder
+	if deps.Config.DetachedDiskParkedEnabled() {
+		emptied = unparkCreatedDiskForRollback(ctx, deps, bareDiskCID)
+	}
+	rollbackCreatedVolume(ctx, deps, node, storage, canonicalVolID, deps.Log(ctx))
+	retireEmptiedHolder(context.WithoutCancel(ctx), deps, emptied, "create_disk rollback")
+}
+
 // unparkCreatedDiskForRollback best-effort detaches a possibly-parked fresh
 // disk from its parker before the rollback delete, so a half-registered
 // parker slot never outlives the volume it references. Runs on a detached,
 // bounded context like rollbackCreatedVolume. All failures are logged and
 // swallowed: the volume delete still runs, and the provenance-tagged
-// disk-audit sweep covers whatever a crash mid-rollback leaves behind.
-func unparkCreatedDiskForRollback(ctx context.Context, deps Deps, bareDiskCID string) {
+// disk-audit sweep covers whatever a crash mid-rollback leaves behind. It
+// returns the parker the disk left, and the zero holder when it left none.
+func unparkCreatedDiskForRollback(ctx context.Context, deps Deps, bareDiskCID string) pve.DiskHolder {
 	rollbackCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
 	defer rbCancel()
 	logger := deps.Log(rollbackCtx)
@@ -933,7 +944,7 @@ func unparkCreatedDiskForRollback(ctx context.Context, deps Deps, bareDiskCID st
 			log.String("volid", bareDiskCID),
 			log.Err(resolveErr),
 		)
-		return
+		return pve.DiskHolder{}
 	}
 	// UnparkDiskAt is a no-op when the resolved holder is not a parker,
 	// which covers every failure path that never reached parkFreshDisk.
@@ -942,5 +953,10 @@ func unparkCreatedDiskForRollback(ctx context.Context, deps Deps, bareDiskCID st
 			log.String("volid", bareDiskCID),
 			log.Err(unparkErr),
 		)
+		return pve.DiskHolder{}
 	}
+	if !holder.Found || !holder.IsParker {
+		return pve.DiskHolder{}
+	}
+	return holder
 }

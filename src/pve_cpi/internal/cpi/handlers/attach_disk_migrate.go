@@ -179,5 +179,7 @@ func attachViaMigration(
 
 	rd.volid = landed
 	rd.holder = &mover
-	return attachPlan{viaTransfer: true, parker: mover, overlay: overlay, destroyMover: true}, nil
+	// The migration took the disk off holder, which attachDiskCore retires
+	// once the attach has run when PVE HA manages it.
+	return attachPlan{viaTransfer: true, parker: mover, overlay: overlay, destroyMover: true, emptied: holder}, nil
 }

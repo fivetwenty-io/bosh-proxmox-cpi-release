@@ -33,13 +33,15 @@ import (
 //
 // When the last disk leaves a registered parker, the parker is destroyed
 // through the teardown protocol with purge=1, which removes its HA resource and
-// its rule memberships with it. An unregistered parker stays when it empties,
-// as it always has.
+// its rule memberships with it, and its pin is deleted after it. An
+// unregistered parker stays when it empties, as it always has.
 //
-// The work runs after a park, in the parker pool sweep of the park's node, and
-// it is best-effort like the rest of that sweep: a park that has landed is
-// never taken back for it, and anything it could not finish waits for the next
-// sweep on that node. Every change to one parker runs under that parker's VMID
+// The retirement runs in the call that emptied the parker, once that call's
+// own work on the disk is done (retireEmptiedParker in parker_retire.go). The
+// registration, and a retirement that call could not finish, run after a park,
+// in the parker pool sweep of the park's node. Both are best-effort: a park
+// or an unpark that has landed is never taken back for them, and anything
+// they could not finish waits for the next sweep on that node. Every change to one parker runs under that parker's VMID
 // claim, which is the lock its protection window takes too, so no park can
 // attach a disk while the registration reads the parker or while the
 // retirement destroys it. Off mode, and a cluster where the CPI may not write
@@ -66,6 +68,9 @@ func parkerRetireBudget() time.Duration { return haDeleteDestroyReserve() + park
 // protection again after a retirement failed past clearing it.
 const parkerRetireRestoreTimeout = 30 * time.Second
 
+// parkerRetirePinTimeout bounds the delete of a retired parker's pin.
+const parkerRetirePinTimeout = 30 * time.Second
+
 // parkerHAStateIgnored and parkerHAStateStopped are the requested states a
 // parker's HA resource passes through.
 const (
@@ -90,43 +95,19 @@ const parkerRetireCaller = "parker retirement"
 // before a claim is taken, because it writes nothing. At most one parker is
 // retired per pass, and the others wait for the next sweep.
 func reconcileParkerHA(ctx context.Context, deps Deps, node string, cfg pve.ParkerConfig) {
-	if deps.Config == nil || deps.Config.HAModeValue() == config.HAModeOff {
+	r, ok := newParkerHAPass(ctx, deps, node, cfg)
+	if !ok {
 		return
 	}
-	logger := deps.Log(ctx)
-	if strings.TrimSpace(deps.RequestDirectorUUID) == "" {
-		logger.Debug("parker HA: the request carries no director_uuid to mark a parker's HA resource with, so the "+
-			"parkers stay as they are", log.String("node", node))
-		return
-	}
-	client := unguardedPVE(deps.PVE)
-	if client == nil || client.Cluster() == nil {
-		return
-	}
-	udeps := withRequestHAProfile(deps)
-	udeps.PVE = client
-
-	// The pass takes claims of its own, one parker at a time. A claim set
-	// the park carried would let withVMIDClaim reuse a claim the park holds,
-	// so the pass drops it.
-	base := context.WithValue(ctx, vmidClaimSetKey{}, (*vmidClaimSet)(nil))
-	rctx, cancel := context.WithTimeout(base, parkerHAReconcileTimeout)
+	logger := r.logger
+	rctx, cancel := context.WithTimeout(r.base, parkerHAReconcileTimeout)
 	defer cancel()
 
-	parkers, err := pve.ListParkersForNode(rctx, client, node, cfg)
+	parkers, err := pve.ListParkersForNode(rctx, r.deps.PVE, node, cfg)
 	if err != nil {
 		logger.Info("parker HA: the parkers of the node could not be listed; the next sweep tries again",
 			log.String("node", node), log.Err(err))
 		return
-	}
-	if len(parkers) == 0 {
-		return
-	}
-	r := &parkerHA{
-		deps: udeps, logger: logger, node: node, cfg: cfg,
-		owner:   deps.RequestDirectorUUID,
-		managed: deps.Config.HAModeValue() == config.HAModeManaged,
-		base:    base,
 	}
 	for _, vmid := range parkers {
 		if rctx.Err() != nil {
@@ -143,6 +124,39 @@ func reconcileParkerHA(ctx context.Context, deps Deps, node string, cfg pve.Park
 				log.Int("parker_vmid", vmid), log.String("node", node), log.Err(err))
 		}
 	}
+}
+
+// newParkerHAPass builds the state of one HA pass over the parkers of node,
+// which the sweep's pass and the retirement of an emptied parker
+// (retireEmptiedParker) share. It reports false when the pass has nothing to
+// do: off mode, a request that carries no director_uuid to mark an HA
+// resource with, or a client with no cluster API. The pass runs on the client
+// no managed allocation guard wraps, and its base context drops the claim set
+// the request carries, because the pass takes claims of its own, one parker at
+// a time, and a claim set the request carried would let withVMIDClaim reuse a
+// claim the request holds.
+func newParkerHAPass(ctx context.Context, deps Deps, node string, cfg pve.ParkerConfig) (*parkerHA, bool) {
+	if deps.Config == nil || deps.Config.HAModeValue() == config.HAModeOff {
+		return nil, false
+	}
+	logger := deps.Log(ctx)
+	if strings.TrimSpace(deps.RequestDirectorUUID) == "" {
+		logger.Debug("parker HA: the request carries no director_uuid to mark a parker's HA resource with, so the "+
+			"parkers stay as they are", log.String("node", node))
+		return nil, false
+	}
+	client := unguardedPVE(deps.PVE)
+	if client == nil || client.Cluster() == nil {
+		return nil, false
+	}
+	udeps := withRequestHAProfile(deps)
+	udeps.PVE = client
+	return &parkerHA{
+		deps: udeps, logger: logger, node: node, cfg: cfg,
+		owner:   deps.RequestDirectorUUID,
+		managed: deps.Config.HAModeValue() == config.HAModeManaged,
+		base:    context.WithValue(ctx, vmidClaimSetKey{}, (*vmidClaimSet)(nil)),
+	}, true
 }
 
 // parkerHA carries one HA pass over the parkers of a node. deps.PVE is the
@@ -165,6 +179,11 @@ type parkerHA struct {
 	// not be resolved, the CPI may not write HA state, or PVE refused an HA
 	// read for a missing grant. The remaining parkers wait for the next sweep.
 	halted bool
+	// retireOnly is set for the retirement of a parker the request emptied
+	// (retireEmptiedParker). Such a pass only ever retires, so a parker that
+	// needs a registration under the claim is left for the next sweep, and a
+	// claim another request holds is logged where an operator sees it.
+	retireOnly bool
 }
 
 // parkerHAAction is what one parker needs from the pass.
@@ -212,7 +231,18 @@ func (r *parkerHA) reconcile(ctx context.Context, vmid int) error {
 // claimed runs the parker's change under its VMID claim, from a fresh read.
 // A parker whose action turned into a retirement since the unlocked read is
 // retired only when retire is set, which is when ctx carries a retirement's
-// budget; otherwise the next sweep retires it.
+// budget; otherwise the next sweep retires it. A retire-only pass registers
+// nothing, so a parker that took a disk again since its unlocked read stays
+// as it is for the next sweep.
+//
+// The claim is the lock the parker's protection window takes, and the pass
+// takes it once without waiting (claimForSweep). Every write that brings a
+// volume into a parker runs inside that window and reads the parker first, so
+// a park either finishes before the claim is taken, and the fresh read below
+// sees its disk or its transfer record, or it starts after the retirement
+// released the claim, and its first read finds the parker gone and moves on.
+// Because the claim never waits, the pass can never deadlock against a park,
+// whatever locks the request around it holds.
 func (r *parkerHA) claimed(ctx context.Context, vmid int, retire bool) error {
 	claimErr := withVMIDClaim(ctx, r.deps, vmid, "parker-ha/"+strconv.Itoa(vmid), claimForSweep, r.logger,
 		func(claimCtx context.Context) error {
@@ -222,6 +252,11 @@ func (r *parkerHA) claimed(ctx context.Context, vmid int, retire bool) error {
 			}
 			switch r.action(vmid, snap) {
 			case parkerHARegister, parkerHAFinishStaging:
+				if r.retireOnly {
+					r.logger.Info("parker HA: the emptied parker holds a disk again, so it stays",
+						log.Int("parker_vmid", vmid), log.String("node", r.node))
+					return nil
+				}
 				return r.register(claimCtx, vmid, snap)
 			case parkerHARetire:
 				if !retire {
@@ -231,12 +266,20 @@ func (r *parkerHA) claimed(ctx context.Context, vmid int, retire bool) error {
 				}
 				return r.retire(claimCtx, vmid, snap)
 			default:
+				if r.retireOnly {
+					r.logger.Info("parker HA: the emptied parker no longer needs a retirement, so it stays as it is",
+						log.Int("parker_vmid", vmid), log.String("node", r.node))
+				}
 				return nil
 			}
 		})
 	if claimErr != nil && isVMIDClaimHeld(claimErr) {
-		r.logger.Debug("parker HA: a park or another pass holds the parker's claim; the next sweep tries again",
-			log.Int("parker_vmid", vmid), log.String("node", r.node))
+		msg := "parker HA: a park or another pass holds the parker's claim; the next sweep tries again"
+		if r.retireOnly {
+			r.logger.Info(msg, log.Int("parker_vmid", vmid), log.String("node", r.node))
+			return nil
+		}
+		r.logger.Debug(msg, log.Int("parker_vmid", vmid), log.String("node", r.node))
 		return nil
 	}
 	return claimErr
@@ -617,13 +660,27 @@ func (r *parkerHA) retire(ctx context.Context, vmid int, snap parkerSnapshot) er
 			result.stage))
 	}
 	if !result.gone {
-		if ruleErr := deleteNodeAffinityRule(ctx, r.deps, vmid, logger, nil); ruleErr != nil {
-			logger.Warn("parker HA: the pin of the retired parker could not be removed; it names no resource now",
-				log.Err(ruleErr))
-		}
+		r.removeRetiredPin(ctx, vmid, logger)
 	}
 	logger.Info("parker HA: the last disk left the parker, so it was destroyed with its HA resource")
 	return nil
+}
+
+// removeRetiredPin deletes the pin of a parker the retirement destroyed. The
+// purge removes the parker from its rules, and PVE deletes a pin it leaves
+// with no member, but a PVE that keeps or disables such a rule would leave a
+// pin that names no resource, and no later sweep finds a parker that is gone.
+// So the delete runs here, still under the parker's claim, on a context of its
+// own bounded by parkerRetirePinTimeout and free of ctx's cancellation,
+// because a retirement that spent its budget on the destroy must still not
+// leave the pin behind.
+func (r *parkerHA) removeRetiredPin(ctx context.Context, vmid int, logger *log.Logger) {
+	pinCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), parkerRetirePinTimeout)
+	defer cancel()
+	if err := deleteNodeAffinityRule(pinCtx, r.deps, vmid, logger, nil); err != nil {
+		logger.Warn("parker HA: the pin of the retired parker could not be removed; it names no resource now",
+			log.Err(err))
+	}
 }
 
 // retireGuard runs every check a retirement makes before the teardown reads

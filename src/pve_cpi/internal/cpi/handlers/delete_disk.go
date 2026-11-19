@@ -40,9 +40,15 @@ import (
 // idempotent path reads. The second is a promised anchor whose volume is not
 // on storage at all: nothing to unpark and nothing to delete, so the delete
 // the Director asked for has already happened.
-func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node string) (bool, error) {
+//
+// The holder it returns is the parker the disk left, and the zero holder when
+// the disk was on none. The caller hands it to retireEmptiedHolder once its
+// own work on the disk is done, so a parker PVE HA manages that this delete
+// emptied is retired in the same call.
+func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node string) (bool, pve.DiskHolder, error) {
+	var none pve.DiskHolder
 	if deps.Config == nil {
-		return false, nil
+		return false, none, nil
 	}
 	parkerCfg := parkerReadConfigFor(deps)
 	var holder pve.DiskHolder
@@ -59,12 +65,12 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node st
 		var resolveErr error
 		holder, resolveErr = pve.ResolveDiskHolder(ctx, deps.PVE, deps.Log(ctx), rd.volid, parkerCfg)
 		if resolveErr != nil {
-			return false, wrapHolderScanError(resolveErr, "delete_disk: resolve current holder before delete")
+			return false, none, wrapHolderScanError(resolveErr, "delete_disk: resolve current holder before delete")
 		}
 		refs = holder.StorageReferences
 	}
 	if err := refusePendingDeleteHolder(rd.diskCID, holder); err != nil {
-		return false, err
+		return false, none, err
 	}
 	// A disk whose CID promises a parker anchor must have a holder while
 	// detached; no holder at all means the parker vanished out-of-band, and
@@ -79,15 +85,15 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node st
 		// a probe that fails proves nothing, so the refusal stands, and
 		// proveAnchorVolumeGone writes the warning that says why it stands.
 		if !proveAnchorVolumeGoneAt(ctx, deps, "delete_disk", rd.diskCID, rd.volid, node, refs) {
-			return false, anchorErr
+			return false, none, anchorErr
 		}
 		deps.Log(ctx).Info("delete_disk: promised anchor has no holder and the volume is not on storage, treating as already-deleted",
 			log.String("disk_cid", rd.diskCID),
 		)
-		return true, nil
+		return true, none, nil
 	}
 	if strandedErr := strandedParkerRefusal(deps, "delete_disk", rd.diskCID, holder); strandedErr != nil {
-		return false, strandedErr
+		return false, none, strandedErr
 	}
 	// The holder VM may be mid-migration, and its node may not answer. Every
 	// step below writes to the holder's node, and none of them is safe to send
@@ -100,7 +106,7 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node st
 	if holder.Found && holder.VMID > 0 {
 		settled, settleErr := settleDiskVM(ctx, deps, "delete_disk", strconv.Itoa(holder.VMID), holder.VMID, true)
 		if settleErr != nil {
-			return false, settleErr
+			return false, none, settleErr
 		}
 		if settled.Found {
 			holder.Node = settled.Node
@@ -109,12 +115,12 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node st
 	if holder.Found && holder.IsParker && rd.stableID != "" {
 		if embedded, ok := pve.EmbeddedDiskVMID(rd.volid); ok && embedded == holder.VMID {
 			if delErr := pve.DeleteParkedOwnedDisk(ctx, deps.PVE, deps.Log(ctx), holder.Node, holder.VMID, rd.volid, rd.stableID, parkerCfg); delErr != nil {
-				return false, retriableUnlessPermanent(delErr,
+				return false, none, retriableUnlessPermanent(delErr,
 					fmt.Sprintf("delete_disk: deallocate parked disk %s on its parker", rd.diskCID))
 			}
 			// The detach deallocated the volume. There is nothing left for a
 			// storage delete to remove.
-			return true, nil
+			return true, holder, nil
 		}
 	}
 	// UnparkDiskAt reuses the holder just resolved and is a no-op when the disk
@@ -127,9 +133,12 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node st
 		deps.Log(ctx).Info("delete_disk: unpark failed",
 			log.String("disk_cid", rd.diskCID),
 		)
-		return false, cpierrors.Wrap(unparkErr, "delete_disk: unpark before delete")
+		return false, none, cpierrors.Wrap(unparkErr, "delete_disk: unpark before delete")
 	}
-	return false, nil
+	if holder.Found && holder.IsParker {
+		return false, holder, nil
+	}
+	return false, none, nil
 }
 
 // volumeAbsentFromStorage reports whether the volume is provably not on
@@ -450,10 +459,15 @@ func HandleDeleteDisk(deps Deps) Handler {
 		//     Unpark failure → retriable; the disk is still safe on the
 		//     parker VM and the caller can retry.
 		// ----------------------------------------------------------------
-		alreadyDeleted, err := unparkBeforeDelete(ctx, deps, rd, node)
+		alreadyDeleted, emptied, err := unparkBeforeDelete(ctx, deps, rd, node)
 		if err != nil {
 			return nil, err
 		}
+		// A parker PVE HA manages that the unpark emptied is retired once the
+		// volume's delete has run, whatever that delete answered: the parker
+		// is empty either way, and a retry of the delete no longer passes
+		// through it.
+		defer retireEmptiedHolder(ctx, deps, emptied, "delete_disk")
 		if alreadyDeleted {
 			deps.Log(ctx).Info("delete_disk", log.String("disk_cid", diskCID), log.String("node", node))
 			return nil, nil

@@ -28,7 +28,7 @@ func TestExplicitCleanupReconcilesAnchoredDiskAfterHolderReferenceRemoval(t *tes
 	if disk.holder != nil {
 		t.Fatal("fixture still has a disk holder")
 	}
-	if _, err := unparkBeforeDelete(t.Context(), deps, disk, deps.Config.Node); err == nil {
+	if _, _, err := unparkBeforeDelete(t.Context(), deps, disk, deps.Config.Node); err == nil {
 		t.Fatal("ordinary delete lost the missing-anchor refusal")
 	}
 	deps.PVE = &cleanupTaskClient{Client: deps.PVE}

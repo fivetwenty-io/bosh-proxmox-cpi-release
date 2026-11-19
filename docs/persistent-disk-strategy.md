@@ -318,7 +318,7 @@ is tagged, so on a CPI-managed cluster that fallback never fires.
 
 ### Parker teardown procedure
 
-The CPI destroys one kind of parker on its own. When `pve.ha.mode` is `auto` or `managed` and a parker that PVE HA manages holds nothing, the next parker sweep on its node destroys it together with its HA resource. A parker that PVE HA does not manage is never destroyed automatically, and it stays in place when its last disk leaves. To remove such a parker manually:
+The CPI destroys one kind of parker on its own. When `pve.ha.mode` is `auto` or `managed`, the call that takes the last disk off a parker that PVE HA manages destroys that parker, together with its HA resource and its node pin. Every call that can empty a parker does this, which covers `delete_disk`, `attach_disk` and the attaches that run through it, the rollback of a failed `create_disk`, and the cleanups of a managed disk allocation. The call first reads the parker again under the parker's own lock, and it keeps the parker when a bus slot, an `unusedN` entry, a pending change, or a transfer record still names a volume, when the parker has a snapshot, or when a park holds the lock. The destroy runs with `destroy-unreferenced-disks=0` and only after those checks pass, so it frees no volume. A retirement that can't run or that fails never fails the call, and the next parker sweep on the parker's node retires the parker instead. A parker that PVE HA does not manage is never destroyed automatically, and it stays in place when its last disk leaves. To remove such a parker manually:
 
 1. Run `scripts/disk-audit` and confirm that parker's row shows `0` under both
    `DISKS` and `UNUSED`, and that the audit emitted no `unusedN` warning naming
@@ -590,8 +590,10 @@ or `delete_disk`. Both handlers resolve the volume's current holder before they
 act; when that holder is a parker they unpark first, and the disk becomes
 free-floating. The band resolves to `90000–90999` even when unset, so no
 property needs to be carried forward for the drain to work — switching the
-strategy is the whole migration. Parker VMs that become empty remain in PVE;
-remove them manually following the teardown procedure above.
+strategy is the whole migration. A parker that PVE HA manages is destroyed by
+the call that empties it, as the teardown procedure above describes. Other
+parkers that become empty remain in PVE, and we remove them by hand following
+that procedure.
 
 **Mixed state is safe.** `attach_disk` and `delete_disk` resolve the holder on
 every call, whatever `detached_disk_strategy` says, so free-floating and parked
@@ -652,8 +654,8 @@ straight down the path that attaches a volume the parker still references.
 
 The error names the parker and carries the `qm unlink` sequence that clears the
 reference, the same condition is logged at ERROR, and `disk-audit` counts the
-`unusedN` key: the parker is not reported as empty, it is not offered as a
-teardown candidate, and it draws a warning of its own naming the same sequence. Destroying that parker by hand before the reference is
+`unusedN` key, so the parker is not reported as empty, it is not offered as a
+teardown candidate, and it draws a warning of its own naming the same sequence. The CPI's retirement of an emptied parker that PVE HA manages counts the key too, so that parker stays in place. Destroying that parker by hand before the reference is
 cleared frees the live volume with it, since `qm destroy` walks the config's
 `unusedN` entries too. Treat it as an action item, not a warning.
 

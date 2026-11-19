@@ -247,9 +247,12 @@ func TestManagedVMEphemeralRetentionPreservesRenamedOwnedVolume(t *testing.T) {
 	if err := handle.Save(closed); err != nil {
 		t.Fatal(err)
 	}
+	retirements := captureRetirements(t)
 	if err := cleanupManagedRetainedEphemeral(context.Background(), deps, handle, target); err != nil {
 		t.Fatal(err)
 	}
+	requireRetirements(t, retirements(),
+		retiredParker{node: target.Node, vmid: target.VMID, trigger: "retained ephemeral cleanup"})
 	if client.state.volumes[retained] != nil || handle.Record().State != aj.VMDeletedRetained {
 		t.Fatal("retained cleanup deleted evidence or reopened VM generation")
 	}

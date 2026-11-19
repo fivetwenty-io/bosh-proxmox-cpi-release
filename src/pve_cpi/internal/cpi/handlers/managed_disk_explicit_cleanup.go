@@ -126,10 +126,14 @@ func cleanupManagedDiskAllocation(ctx context.Context, deps Deps, journal *aj.Jo
 	// must not force this proven free volume back through ordinary unpark.
 	// The guarded storage deletion repeats identity and reference checks.
 	if disk.holder != nil {
-		deleted, err = unparkBeforeDelete(ctx, local, disk, node)
+		var emptied pve.DiskHolder
+		deleted, emptied, err = unparkBeforeDelete(ctx, local, disk, node)
 		if err != nil {
 			return proof, err
 		}
+		// A parker PVE HA manages that the unpark emptied is retired once
+		// the cleanup's own work on the disk is done.
+		defer retireEmptiedHolder(ctx, local, emptied, "storage allocation cleanup")
 	}
 	if !deleted {
 		storage, _, err := pve.ParseDiskCID(disk.volid)

@@ -364,6 +364,11 @@ func attachDiskCore(
 ) (diskID, devicePath string, err error) {
 	const bus = "scsi"
 
+	// The guard took the disk off plan.emptied already, so that parker is
+	// empty whatever the attach below answers, and a retry of the attach no
+	// longer passes through it.
+	defer retireEmptiedHolder(ctx, deps, plan.emptied, op)
+
 	desiredDiskID, prepErr := chooseSCSISlotSkippingZero(ctx, deps, op, node, vmid, rd.volid, plan.judgeTarget)
 	var refusal attachTargetRefusal
 	if errors.As(prepErr, &refusal) {
@@ -724,6 +729,12 @@ func attachDiskViaTransfer(
 	// landed.
 	if plan.destroyMover {
 		destroyOrKeepMover(ctx, deps, op, plan.parker, restoreCutOff)
+	} else if restoreCutOff == nil {
+		// The reassignment took the disk off the parker and its provenance
+		// entry is gone, so a parker PVE HA manages that this emptied is
+		// retired now. A parker whose protection restore was cut off stays,
+		// because a retry comes back to it and settles the restore first.
+		retireEmptiedHolder(ctx, deps, plan.parker, op)
 	}
 	if restoreCutOff != nil {
 		// Retriable: a retry comes back to this parker, and the settler
@@ -747,6 +758,11 @@ func attachConfigEditFallback(
 ) (string, string, error) {
 	if unErr := pve.UnparkDiskAt(ctx, deps.PVE, deps.Log(ctx), preVolid, plan.parker, parkerReadConfigFor(deps)); unErr != nil {
 		return "", "", retriableUnlessPermanent(unErr, fmt.Sprintf("%s: unpark disk %s (%s)", op, diskCID, what))
+	}
+	if !plan.destroyMover {
+		// The unpark emptied the parker whatever the put answers, so a parker
+		// PVE HA manages is retired once the put has run.
+		defer retireEmptiedHolder(ctx, deps, plan.parker, op)
 	}
 	slot, devicePath, putErr := attachDiskConfigPut(
 		ctx, deps, op, vmCID, node, vmid, diskCID, rd, targetSlot, effectiveOpts, plan.judgeTarget)
@@ -1333,6 +1349,11 @@ type attachPlan struct {
 	// first write. nil skips it, which is right for create_vm's own attaches
 	// to the VM it just created.
 	judgeTarget func(cfg map[string]any) error
+	// emptied is the parker the guard already took the disk off, by an unpark
+	// or by the migration onto a mover, and the zero holder when it took the
+	// disk off none. attachDiskCore retires it once the attach has run, so a
+	// parker PVE HA manages that the attach emptied goes in the same call.
+	emptied pve.DiskHolder
 }
 
 // attachTargetRefusal carries judgeTarget's answer out of the slot choice, so
@@ -1614,7 +1635,9 @@ func guardHolderAndUnpark(ctx context.Context, deps Deps, op string, rd *resolve
 		// into attaching a volume the parker still references.
 		return attachPlan{}, retriableUnlessPermanent(unErr, fmt.Sprintf("%s: unpark disk %s", op, rd.diskCID))
 	}
-	return attachPlan{overlay: overlay}, nil
+	// UnparkDiskAt took the disk off holder when holder is a parker, and did
+	// nothing otherwise, which retireEmptiedHolder tells apart.
+	return attachPlan{overlay: overlay, emptied: holder}, nil
 }
 
 // attachAnchorRefusal is the missing-anchor refusal for the attach guard, or

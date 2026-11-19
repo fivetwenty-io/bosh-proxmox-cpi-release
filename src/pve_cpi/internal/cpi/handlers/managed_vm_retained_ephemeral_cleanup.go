@@ -133,6 +133,9 @@ func cleanupManagedRetainedEphemeral(ctx context.Context, deps Deps, handle *aj.
 	if err := pve.DeleteParkedOwnedDisk(ctx, local.PVE, local.Log(ctx), target.Node, target.VMID, target.IntendedVolume, disk.stableID, parkerWriteConfigFor(local)); err != nil {
 		return err
 	}
+	// The deallocation took the disk off its parker, so a parker PVE HA
+	// manages that it emptied is retired once the cleanup's own work is done.
+	defer retireEmptiedParker(ctx, local, target.Node, target.VMID, "retained ephemeral cleanup")
 	absent, err := volumeAbsentFromStorage(ctx, deps, target.Node, target.IntendedVolume, nil)
 	if err != nil || !absent {
 		return fmt.Errorf("retained volume deletion is not observed")

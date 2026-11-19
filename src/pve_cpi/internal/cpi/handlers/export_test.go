@@ -1,6 +1,9 @@
 package handlers
 
 import (
+	"context"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 )
@@ -71,4 +74,31 @@ func GroupRuleForTest(owner, deployment, group string) (rule, marker string) {
 // Test-only.
 func SpreadClaimKey(deps Deps, env map[string]any) string {
 	return antiAffinityScorerGroup(deps, env).claimKey()
+}
+
+// RetiredParker is one call of the emptied-parker retirement a test captured
+// with SetRetireEmptiedParkerForTest. Test-only.
+type RetiredParker struct {
+	Node    string
+	VMID    int
+	Trigger string
+}
+
+// SetRetireEmptiedParkerForTest replaces the retirement every emptying path
+// calls with a recorder and returns the calls it saw and a func that restores
+// the production retirement. A test that calls it must not run in parallel.
+// Test-only.
+func SetRetireEmptiedParkerForTest() (calls func() []RetiredParker, restore func()) {
+	var mu sync.Mutex
+	var seen []RetiredParker
+	restore = setRetireEmptiedParkerForTest(func(_ context.Context, _ Deps, node string, vmid int, trigger string) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, RetiredParker{Node: node, VMID: vmid, Trigger: trigger})
+	})
+	return func() []RetiredParker {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(seen)
+	}, restore
 }
