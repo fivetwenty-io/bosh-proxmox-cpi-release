@@ -620,6 +620,27 @@ func (j *Journal) Acquire(ctx context.Context, id string) (*Handle, error) {
 	if err != nil {
 		return nil, err
 	}
+	return j.handleFor(ctx, id, l)
+}
+
+// TryAcquire is Acquire that tries the record's lock once. When another
+// holder has the lock it returns at once with no handle, ok false, and no
+// error, so a caller that would rather move on than wait never waits.
+func (j *Journal) TryAcquire(ctx context.Context, id string) (h *Handle, ok bool, err error) {
+	if !allocationIDPattern.MatchString(id) {
+		return nil, false, fmt.Errorf("journal: invalid allocation UUID")
+	}
+	l, ok, err := tryLock(j.root, id+".lock")
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	h, err = j.handleFor(ctx, id, l)
+	return h, err == nil, err
+}
+
+// handleFor returns the handle of record id, whose lock l the caller holds,
+// and releases l when the record cannot be read.
+func (j *Journal) handleFor(ctx context.Context, id string, l *fileLock) (*Handle, error) {
 	if err := j.checkAuthority(); err != nil {
 		return nil, errors.Join(err, l.close())
 	}
