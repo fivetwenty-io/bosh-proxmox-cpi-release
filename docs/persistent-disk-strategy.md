@@ -334,6 +334,8 @@ Do not skip step 1. Destroying a parker that still holds disks deletes all of
 them, and `qm destroy --purge` frees the volume behind an `unusedN` entry as
 readily as one in a `scsiN` slot.
 
+A parker's HA resource and its node pin can outlive the parker. That happens when someone destroys a registered parker by hand without `--purge`, or when a retirement destroyed the parker but couldn't delete its pin. The parker sweep removes these leftovers when `pve.ha.mode` is `auto` or `managed`. It removes one only when the resource or the pin carries this Director's parker marker and names a VMID in the parker band, and when it has proved under the parker's lock that the parker is gone. The proof needs the cluster index to list no guest at the VMID, every node the pin names to answer that the config doesn't exist, a probe of every member to find no config, and the HA manager to hold no service for the VMID. The sweep takes the parker's lock with a single try and skips the VMID when a park or a create holds it. A parker that is still being created already has its config, because the create writes the config before anything registers the parker with HA, so the proof keeps its resource and its pin. PVE drops the service of a VM that has no config, and until it does, the sweep keeps the leftover and tries again on a later sweep. A resource that has no pin names no node to read, so the sweep keeps it too. The doctor reports every leftover the sweep keeps as `parker_resource_orphan` or `parker_pin_orphan`.
+
 ---
 
 ## Stable disk identity and ownership transfer
