@@ -264,6 +264,15 @@ func newHARuleWriterFor(deps Deps, profile *ha.Profile, logger *log.Logger, deci
 // it belongs to this VM, so it stays, as does another Director's resource or one
 // whose owner cannot be read.
 func removeOwnedHaResource(ctx context.Context, svc cluster.Service, sid, owner string) error {
+	return removeOwnedHaResourceIf(ctx, svc, sid, owner, nil)
+}
+
+// removeOwnedHaResourceIf is removeOwnedHaResource with a further check of the
+// marker it read. A non-nil check runs on that comment after the ownership
+// check, and an error from it keeps the resource and is returned.
+func removeOwnedHaResourceIf(
+	ctx context.Context, svc cluster.Service, sid, owner string, check func(comment string) error,
+) error {
 	got, err := svc.GetHaResources(ctx, sid)
 	switch {
 	case err != nil && (isHaNotFound(err) || pve.IsNotFound(err)):
@@ -276,6 +285,11 @@ func removeOwnedHaResource(ctx context.Context, svc cluster.Service, sid, owner 
 		return fmt.Errorf("%s carries no ownership marker, so the CPI cannot prove it is this VM's", sid)
 	case haOwnershipOf(*got.Comment, owner) != haOwnedByUs:
 		return fmt.Errorf("%s belongs to another Director", sid)
+	}
+	if check != nil {
+		if err := check(*got.Comment); err != nil {
+			return err
+		}
 	}
 	purge := true
 	if err := svc.DeleteHaResources(ctx, sid, &cluster.DeleteHaResourcesParams{Purge: &purge}); err != nil &&

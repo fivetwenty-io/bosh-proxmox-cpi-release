@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
@@ -20,6 +22,9 @@ type orphanRigClient struct {
 	*retireRigClient
 	mu          sync.Mutex
 	heldAtWrite map[string]bool
+	// failMembersUnderClaim is how many member list reads fail while parker
+	// 90000's claim is held.
+	failMembersUnderClaim int
 }
 
 func (c *orphanRigClient) Cluster() cluster.Service {
@@ -45,6 +50,21 @@ func (c *orphanRigClient) writesHeld() map[string]bool {
 type orphanRigCluster struct {
 	cluster.Service
 	c *orphanRigClient
+}
+
+// ListConfigNodes fails while the parker's claim is held and the rig still
+// has failures to give, and otherwise answers as the scene does.
+func (cl *orphanRigCluster) ListConfigNodes(ctx context.Context) (*cluster.ListConfigNodesResponse, error) {
+	cl.c.mu.Lock()
+	fail := cl.c.failMembersUnderClaim > 0 && cl.c.pools().held(90000)
+	if fail {
+		cl.c.failMembersUnderClaim--
+	}
+	cl.c.mu.Unlock()
+	if fail {
+		return nil, errors.New("connection reset by peer")
+	}
+	return cl.Service.ListConfigNodes(ctx)
 }
 
 func (cl *orphanRigCluster) DeleteHaResources(
@@ -106,8 +126,7 @@ func (r *orphanRig) haRemovals() []string {
 
 // requireRemoved fails unless the pin is gone, and the resource too when
 // resource is set, each removed while the parker's claim was held, and the
-// claim was released after. A resource is only ever removed with its pin,
-// because the pin names the node its absence proof reads.
+// claim was released after.
 func (r *orphanRig) requireRemoved(t *testing.T, resource bool) {
 	t.Helper()
 	if resource && r.resourcePresent() {
@@ -227,9 +246,37 @@ func TestParkerHAOrphans_KeepsWhatItCannotProve(t *testing.T) {
 		{name: "the free strategy", mutate: func(r *orphanRig) {
 			r.deps.Config.DetachedDiskStrategy = "free"
 		}, resource: true, pin: true},
-		{name: "no pin to name a node to read", mutate: func(r *orphanRig) {
+		{name: "a resource with no pin while a member is offline", mutate: func(r *orphanRig) {
 			r.scene.Do(func(s *HADeleteScene) { delete(s.Rules, naRuleNameFor(90000)) })
+			r.scene.MarkNodeDead("pve03")
 		}, resource: true},
+		{name: "a resource with no pin on a cluster that is not quorate", mutate: func(r *orphanRig) {
+			r.scene.Do(func(s *HADeleteScene) {
+				delete(s.Rules, naRuleNameFor(90000))
+				s.NotQuorate = true
+			})
+		}, resource: true},
+		{name: "a cluster that is not quorate", mutate: func(r *orphanRig) {
+			r.scene.Do(func(s *HADeleteScene) { s.NotQuorate = true })
+		}, resource: true, pin: true},
+		{name: "a member the pin does not name is offline", mutate: func(r *orphanRig) {
+			r.scene.Do(func(s *HADeleteScene) { s.Rules[naRuleNameFor(90000)]["nodes"] = "pve01,pve02" })
+			r.scene.MarkNodeDead("pve03")
+		}, resource: true, pin: true},
+		{name: "a container resource at the VMID", mutate: func(r *orphanRig) {
+			r.scene.Do(func(s *HADeleteScene) { s.Requested["ct:90000"] = "stopped" })
+		}, resource: true, pin: true},
+		{name: "the HA profile does not allow writes", mutate: func(r *orphanRig) {
+			profile := phProfile(r.deps.Config.HAModeValue())
+			profile.Effective = ha.EffectiveObserveOnly
+			profile.Reason = "observe only"
+			r.deps.HAProfile = func(context.Context) (*ha.Profile, error) { return profile, nil }
+		}, resource: true, pin: true},
+		{name: "the member list cannot be read under the claim while the pin names a node it may not list",
+			mutate: func(r *orphanRig) {
+				r.scene.Do(func(s *HADeleteScene) { s.Rules[naRuleNameFor(90000)]["nodes"] = "pve01,pve04" })
+				r.orphans.failMembersUnderClaim = 1
+			}, resource: true, pin: true},
 		{name: "the HA manager still holds the service", mutate: func(r *orphanRig) {
 			r.scene.Do(func(s *HADeleteScene) {
 				s.Services[phSID] = HASceneService{State: "stopped", Node: "pve02", UID: "uid-90000"}
@@ -309,4 +356,64 @@ func TestParkerHAOrphans_AFailedResourceRemovalKeepsThePin(t *testing.T) {
 	r.scene.Do(func(s *HADeleteScene) { s.RefuseRemoval = false })
 	r.sweep(phParkerCfg())
 	r.requireRemoved(t, true)
+}
+
+// TestParkerHAOrphans_RemovesALeftoverResourceThatNoPinNames proves a resource
+// of this Director's parker that no pin names a node for is removed once the
+// index and a probe of every member, on a quorate cluster with every member
+// online, find the parker nowhere.
+func TestParkerHAOrphans_RemovesALeftoverResourceThatNoPinNames(t *testing.T) {
+	r := newOrphanRig()
+	r.scene.Do(func(s *HADeleteScene) { delete(s.Rules, naRuleNameFor(90000)) })
+	r.sweep(phParkerCfg())
+	r.requireRemoved(t, true)
+	if got := r.haRemovals(); !slices.Equal(got, []string{"DeleteHaResources:" + phSID}) {
+		t.Fatalf("writes %v, want the one resource removal", got)
+	}
+}
+
+// TestParkerHAOrphans_SkipsANodeTheClusterNoLongerLists proves a pin that names
+// a node the cluster's member list and its status both leave out, as after
+// the node was removed from the cluster, is removed with its resource, while
+// the nodes it names that are still members are read.
+func TestParkerHAOrphans_SkipsANodeTheClusterNoLongerLists(t *testing.T) {
+	r := newOrphanRig()
+	r.scene.Do(func(s *HADeleteScene) { s.Rules[naRuleNameFor(90000)]["nodes"] = "pve01,pve04" })
+	r.sweep(phParkerCfg())
+	r.requireRemoved(t, true)
+	if r.client.claimedReads == 0 {
+		t.Fatal("the step must read the parker's config on the member the pin names")
+	}
+}
+
+// TestParkerHAOrphans_AResourceThatChangesOwnerUnderTheClaimStays proves the
+// removal reads the resource again under the claim and keeps it, and so its
+// pin, when it no longer carries this Director's parker marker.
+func TestParkerHAOrphans_AResourceThatChangesOwnerUnderTheClaimStays(t *testing.T) {
+	r := newOrphanRig()
+	r.client.onClaimedRead = func() {
+		r.scene.Do(func(s *HADeleteScene) {
+			s.Comments[phSID] = haIdentity{Owner: aaDirector, Deployment: "cf", Group: "router"}.marker()
+		})
+	}
+	r.sweep(phParkerCfg())
+	r.requireKept(t, true, true)
+	if r.client.claimedReads == 0 {
+		t.Fatal("the step must read the parker's config under its claim")
+	}
+}
+
+// TestParkerHAOrphans_AMemberThatGoesOfflineDuringTheProofKeepsTheLeftovers
+// proves a member the cluster reports offline after the proof read the
+// cluster's quorum, which the probe of every member then skips, keeps the
+// leftovers, because the proof needs every member's answer.
+func TestParkerHAOrphans_AMemberThatGoesOfflineDuringTheProofKeepsTheLeftovers(t *testing.T) {
+	r := newOrphanRig()
+	r.scene.Do(func(s *HADeleteScene) { s.Rules[naRuleNameFor(90000)]["nodes"] = "pve01,pve02" })
+	r.client.onClaimedRead = func() { r.scene.MarkNodeDead("pve03") }
+	r.sweep(phParkerCfg())
+	r.requireKept(t, true, true)
+	if r.client.claimedReads == 0 {
+		t.Fatal("the step must read the parker's config under its claim")
+	}
 }

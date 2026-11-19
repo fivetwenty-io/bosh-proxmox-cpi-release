@@ -26,26 +26,31 @@ import (
 // the pin. PVE's CRM drops the service of a VM that has no config, so the
 // leftover resource never fails over and nothing but this step removes it.
 //
-// The step runs at the end of the sweep's parker HA pass, and it removes a
-// leftover only when it can prove both that the leftover is this Director's
-// parker's and that the parker is gone. Ownership is the marker the
-// registration writes: a resource carries this Director as owner and names no
-// deployment or group, and a pin is the parker's bosh-na-<vmid> node-affinity
-// rule with this Director's marker that names no other resource. Both name a
-// VMID in this config's parker band, under the parked strategy, whose band no
-// other VMID range may overlap. Absence is a cluster index that lists no guest
-// at the VMID, a config read on every node the pin names that answers that the
-// config does not exist, from nodes the cluster reports able to answer, and a
-// probe of every member that finds the config nowhere while the CRM holds no
-// service for the VMID. Any other answer keeps the leftover, and the doctor
-// reports it.
+// The step runs at the end of the sweep's parker HA pass, only when the HA
+// profile lets the CPI write HA state, and it removes a leftover only when it
+// can prove both that the leftover is this Director's parker's and that the
+// parker is gone. Ownership is the marker the registration writes: a resource
+// carries this Director as owner and names no deployment or group, and a pin
+// is the parker's bosh-na-<vmid> node-affinity rule with this Director's
+// marker that names no other resource. Both name a VMID in this config's
+// parker band, under the parked strategy, whose band no other VMID range may
+// overlap. The removal reads the resource again and keeps it unless it still
+// carries that marker.
 //
-// The node a resource last named is the pin's. The CRM's status names a node
-// for the service only while it still holds the service, and while it holds
-// it the proof refuses, because the CRM holds a service while a recovery
-// moves its guest's config. Once the guest's config is gone the CRM drops the
-// service, so a resource that has no pin names no node, and it stays for the
-// doctor to report.
+// Absence takes a quorate cluster and a cluster index that lists no guest at
+// the VMID. Every node the pin names that is still a cluster member must
+// answer a config read that the config does not exist, and must be a node the
+// cluster reports able to answer. A node that both the member list and the
+// cluster status leave out was removed from the cluster, so it is not read,
+// and a config left in its directory would still show in the index. Then a
+// probe of every member must find the config nowhere, skip no member as
+// offline, and see the CRM hold no service for the VMID. Any other answer
+// keeps the leftover, and the doctor reports it.
+//
+// A resource that has no pin names no node, because the CRM's status names a
+// node for a service only while it still holds the service, and while it holds
+// it the proof refuses. The probe of every member is what proves such a
+// parker gone, which is why the proof needs every member online.
 //
 // The proof runs again under the parker's VMID claim, which every
 // registration and retirement of the parker holds, taken with a single try.
@@ -78,6 +83,9 @@ const parkerHAOrphanCaller = "parker HA leftover cleanup"
 // remove, waits for the next sweep.
 func (r *parkerHA) reconcileOrphans(ctx context.Context) {
 	if r.deps.Config.DetachedDiskStrategyValue() != config.DetachedDiskStrategyParked {
+		return
+	}
+	if !r.loadProfile(ctx) {
 		return
 	}
 	orphans, err := r.orphanCandidates(ctx)
@@ -229,18 +237,12 @@ func sortedRuleNodes(rule *ha.Rule) []string {
 
 // reconcileOrphan proves, under the parker's claim, that parker o.vmid is gone,
 // and removes its resource and then its pin. A resource whose removal fails
-// keeps its pin, so the next sweep finds the same pair and the pin still names
-// the node to read.
+// keeps its pin, so the next sweep finds the same pair.
 func (r *parkerHA) reconcileOrphan(ctx context.Context, o parkerHAOrphan) {
 	logger := r.logger.With(log.Int("parker_vmid", o.vmid))
-	if len(o.nodes) == 0 {
-		logger.Debug("parker HA: an HA resource names a parker no member lists, but no pin names a node to prove " +
-			"the parker gone on, so it stays for the doctor to report")
-		return
-	}
 	err := withVMIDClaim(ctx, r.deps, o.vmid, "parker-ha-orphan/"+strconv.Itoa(o.vmid), claimForSweep, logger,
 		func(claimCtx context.Context) error {
-			if err := r.proveParkerGone(claimCtx, o); err != nil {
+			if err := r.proveParkerGone(claimCtx, o, logger); err != nil {
 				return err
 			}
 			return r.removeOrphan(claimCtx, o, logger)
@@ -256,12 +258,20 @@ func (r *parkerHA) reconcileOrphan(ctx context.Context, o parkerHAOrphan) {
 	}
 }
 
-// proveParkerGone is the absence proof under the claim: the index lists no
-// guest at the VMID, every node the pin names answers that the config does
-// not exist and is a node the cluster reports able to answer, and a probe of
-// every member finds the config nowhere while no HA source but the resource
-// under removal holds the VMID.
-func (r *parkerHA) proveParkerGone(ctx context.Context, o parkerHAOrphan) error {
+// proveParkerGone is the absence proof under the claim. The cluster must be
+// quorate, and the index must list no guest at the VMID. Every node the pin
+// names that is still a member must answer that the config does not exist,
+// and must be a node the cluster reports able to answer. A probe of every
+// member must then find the config nowhere, skip no member as offline, and
+// see no HA source but the resource under removal hold the VMID.
+func (r *parkerHA) proveParkerGone(ctx context.Context, o parkerHAOrphan, logger *log.Logger) error {
+	quorum, err := pve.ReadClusterQuorum(ctx, r.deps.PVE.Cluster())
+	if err != nil {
+		return fmt.Errorf("%s: read the cluster's quorum: %w", parkerHAOrphanCaller, err)
+	}
+	if !quorum.Quorate {
+		return cpierrors.Retriable("%s: the cluster is not quorate", parkerHAOrphanCaller)
+	}
 	guests, err := pve.ListIndexedGuests(ctx, r.deps.PVE)
 	if err != nil {
 		return err
@@ -272,7 +282,11 @@ func (r *parkerHA) proveParkerGone(ctx context.Context, o parkerHAOrphan) error 
 				o.vmid, g.Node)
 		}
 	}
-	for _, node := range o.nodes {
+	nodes, err := r.pinMembers(ctx, o, logger)
+	if err != nil {
+		return err
+	}
+	for _, node := range nodes {
 		_, err := pve.ReadQemuViews(ctx, r.deps.PVE, node, o.vmid)
 		switch {
 		case err == nil:
@@ -283,12 +297,16 @@ func (r *parkerHA) proveParkerGone(ctx context.Context, o parkerHAOrphan) error 
 				node, err)
 		}
 	}
-	for _, node := range o.nodes {
+	for _, node := range nodes {
 		if err := requireProxyTarget(ctx, r.deps, parkerHAOrphanCaller, o.vmid, node); err != nil {
 			return err
 		}
 	}
-	opts := []pve.FindVMOption{pve.WithOfflineMemberTie(journalOfflineMemberTie(r.deps.Config))}
+	var excluded []string
+	opts := []pve.FindVMOption{
+		pve.WithOfflineMemberTie(journalOfflineMemberTie(r.deps.Config)),
+		pve.WithExcludedOfflineMembers(&excluded),
+	}
 	if o.resource {
 		opts = append(opts, pve.WithHAResourceUnderRemoval("vm:"+strconv.Itoa(o.vmid)))
 	}
@@ -299,7 +317,41 @@ func (r *parkerHA) proveParkerGone(ctx context.Context, o parkerHAOrphan) error 
 	if loc.Found {
 		return cpierrors.Cloud("%s: node %s holds the config of vmid %d", parkerHAOrphanCaller, loc.Node, o.vmid)
 	}
+	if len(excluded) > 0 {
+		return cpierrors.Retriable("%s: the probe skipped members %v as offline, and the proof needs every "+
+			"member's answer", parkerHAOrphanCaller, excluded)
+	}
 	return nil
+}
+
+// pinMembers returns the nodes the pin names that the proof must read. It
+// leaves out only a node that both the cluster's member list and its status
+// leave out, which is what a node removed from the cluster looks like. A
+// config left in such a node's directory still shows in the cluster index,
+// which the proof read first. Either read failing fails the proof, so a node
+// is never skipped because the CPI could not tell whether it is a member.
+func (r *parkerHA) pinMembers(ctx context.Context, o parkerHAOrphan, logger *log.Logger) ([]string, error) {
+	if len(o.nodes) == 0 {
+		return nil, nil
+	}
+	members, err := pve.ListClusterMemberNames(ctx, r.deps.PVE)
+	if err != nil {
+		return nil, fmt.Errorf("%s: list the cluster's members: %w", parkerHAOrphanCaller, err)
+	}
+	report, err := pve.NodeHealth(ctx, r.deps.PVE.Cluster(), r.deps.PVE.Nodes(), pve.NodeHealthOptions{SkipHA: true})
+	if err != nil {
+		return nil, fmt.Errorf("%s: read the cluster's status: %w", parkerHAOrphanCaller, err)
+	}
+	out := make([]string, 0, len(o.nodes))
+	for _, node := range o.nodes {
+		if _, listed := report.Node(node); slices.Contains(members, node) || listed {
+			out = append(out, node)
+			continue
+		}
+		logger.Debug("parker HA: the pin of a gone parker names a node that is no longer a cluster member, so the "+
+			"proof does not read it", log.String("node", node))
+	}
+	return out, nil
 }
 
 // removeOrphan removes the parker's resource and then its pin. Each removal
@@ -308,7 +360,14 @@ func (r *parkerHA) proveParkerGone(ctx context.Context, o parkerHAOrphan) error 
 func (r *parkerHA) removeOrphan(ctx context.Context, o parkerHAOrphan, logger *log.Logger) error {
 	sid := "vm:" + strconv.Itoa(o.vmid)
 	if o.resource {
-		if err := removeOwnedHaResource(ctx, r.deps.PVE.Cluster(), sid, r.owner); err != nil {
+		err := removeOwnedHaResourceIf(ctx, r.deps.PVE.Cluster(), sid, r.owner, func(comment string) error {
+			if !r.parkerMarked(comment) {
+				return cpierrors.Cloud("%s: %s no longer carries this Director's parker marker", parkerHAOrphanCaller,
+					sid)
+			}
+			return nil
+		})
+		if err != nil {
 			return fmt.Errorf("remove HA resource %s: %w", sid, err)
 		}
 		logger.Info("parker HA: removed the HA resource of a parker no member holds a config for",
