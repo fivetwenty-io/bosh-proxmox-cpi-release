@@ -77,8 +77,9 @@ func parkerAdmitFor(deps Deps) func(ctx context.Context, node string, parkerVMID
 // ignored and one another owner registered, it answers true only when the
 // disk is on shared storage whose nodes cover the parker's reach
 // (parkerReach). A fact it cannot prove, such as a storage the HA profile
-// does not list, refuses the parker. A failed HA read is an error, classified
-// by parkerHAReadFailure.
+// does not list, refuses the parker, and so does a registered parker that the
+// request emptied and queued for retirement (deferParkerRetirements). A failed
+// HA read is an error, classified by parkerHAReadFailure.
 func admitDiskIntoParker(ctx context.Context, deps Deps, node string, parkerVMID int, bareVolid string) (bool, error) {
 	if deps.Config == nil || deps.Config.HAModeValue() == config.HAModeOff {
 		return true, nil
@@ -106,6 +107,12 @@ func admitDiskIntoParker(ctx context.Context, deps Deps, node string, parkerVMID
 	case res == nil:
 		return false, cpierrors.Retriable(
 			"parker selection: the read of the HA resource of parker vmid %d returned nothing", parkerVMID)
+	}
+	if q := retirementQueueFrom(ctx); q != nil && q.holds(node, parkerVMID) {
+		// The request emptied this parker and retires it once its handler
+		// returns, so a step of the same request that planned a park here
+		// could find the parker gone on its retry.
+		return refuse("the request emptied the registered parker and retires it when it ends", nil)
 	}
 
 	profile, err := resolveHAProfile(ctx, deps)

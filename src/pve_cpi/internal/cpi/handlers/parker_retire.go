@@ -153,6 +153,18 @@ func (q *retirementQueue) add(e queuedRetirement) {
 	q.pending = append(q.pending, e)
 }
 
+// holds reports whether the queue holds a retirement of parker vmid on node.
+func (q *retirementQueue) holds(node string, vmid int) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i := range q.pending {
+		if q.pending[i].node == node && q.pending[i].vmid == vmid {
+			return true
+		}
+	}
+	return false
+}
+
 func (q *retirementQueue) addOrphanScan(e queuedOrphanScan) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
