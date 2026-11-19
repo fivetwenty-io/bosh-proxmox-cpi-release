@@ -80,7 +80,19 @@ type fakeHA struct {
 
 var _ HAReader = (*fakeHA)(nil)
 
-func (f *fakeHA) Profile(context.Context) (*ha.Profile, error) { return f.profile, f.profileErr }
+// Profile returns the fake's profile. A profile that lists no storages gets
+// the fake's storage list, as ha.Resolve fills it from the same read, so the
+// doctor's HA decisions judge the storages the rest of the report reads.
+func (f *fakeHA) Profile(context.Context) (*ha.Profile, error) {
+	if f.profile != nil && f.profile.Storages == nil && f.profile.StoragesErr == "" {
+		if f.storagesErr != nil {
+			f.profile.StoragesErr = f.storagesErr.Error()
+		} else {
+			f.profile.Storages = f.storages
+		}
+	}
+	return f.profile, f.profileErr
+}
 
 func (f *fakeHA) Resources(context.Context) ([]HAResourceRow, error) {
 	return f.resources, f.resourcesErr

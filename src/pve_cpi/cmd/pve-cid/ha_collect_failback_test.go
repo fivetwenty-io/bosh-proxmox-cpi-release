@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // failbackRow returns a pointer to b, the failback flag of a resource row.
@@ -115,6 +116,9 @@ func TestCollectFailbackLeavesResourcesItCannotJudge(t *testing.T) {
 		"storage not in index":   {edit: func(f *fakeHA) { f.configs[100]["scsi1"] = "gone:100/vm-100-disk-1.raw,size=1G" }},
 		"strict single-node pin": {edit: func(f *fakeHA) { f.rules = []ha.Rule{pinRule(100, haMarker, "n1")} }},
 		"no resource":            {edit: func(f *fakeHA) { f.resources = nil }},
+		// A parker stays stopped, so failback never moves it, and no
+		// set_vm_metadata or reboot_vm reaches it to set the flag.
+		"parker": {edit: func(f *fakeHA) { f.guests[0].Tags = "bosh-cpi;bosh-ha-managed;" + pve.ParkerTag }},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -160,4 +164,46 @@ func flagText(b *bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+// TestCollectFailbackLeavesAVMTheDecisionGivesNoSharedHA reports nothing for
+// a VM on shared storage that the CPI's HA decision does not register as a
+// plain shared VM, such as one whose PCI passthrough device or host CPU type
+// ties it to one node. The CPI keeps failback off for such a VM, so drift
+// against an expected on would never clear.
+func TestCollectFailbackLeavesAVMTheDecisionGivesNoSharedHA(t *testing.T) {
+	t.Parallel()
+	for name, edit := range map[string]func(f *fakeHA){
+		"PCI passthrough": func(f *fakeHA) { f.configs[100]["hostpci0"] = "0000:01:00.0" },
+		"host CPU in a one-node CPU domain": func(f *fakeHA) {
+			f.configs[100]["cpu"] = "host"
+			f.profile.CPUDomains = []ha.CPUDomain{{Model: "EPYC", Nodes: []string{"n1"}},
+				{Model: "XEON", Nodes: []string{"n2", "n3"}}}
+			for i := range f.profile.Nodes {
+				if f.profile.Nodes[i].Name != "n1" {
+					f.profile.Nodes[i].CPU.Model = "XEON"
+				}
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := haBaseFake()
+			f.resources[0].Failback = failbackRow(false)
+			edit(f)
+			wantNone(t, runCollect(t, f, haCfg("auto", "none")), haKindFailbackDrift, haKindFailbackOnReplica)
+		})
+	}
+}
+
+// TestCollectFailbackJudgesAPinThatRecordsAReplicaChangeAsReplicate reports
+// nothing for a VM whose pin records a change to its replicated volume set and
+// names no partner yet, because the CPI treats that token as the replicate
+// policy and keeps failback off.
+func TestCollectFailbackJudgesAPinThatRecordsAReplicaChangeAsReplicate(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	f.resources[0].Failback = failbackRow(false)
+	f.rules = []ha.Rule{pinRule(100, ha.WithReplicaChanged(haMarker, haNow), "n1", "n2")}
+	wantNone(t, runCollect(t, f, haCfg("auto", "replicate")), haKindFailbackDrift, haKindFailbackOnReplica)
 }
