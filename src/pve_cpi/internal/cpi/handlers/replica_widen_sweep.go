@@ -82,6 +82,10 @@ type ReplicaWidenResult struct {
 	Partner string              `json:"partner,omitempty"`
 	Outcome ReplicaWidenOutcome `json:"outcome"`
 	Reason  string              `json:"reason"`
+
+	// operatorMustAct marks a failure that no later sweep clears by itself,
+	// so its log line asks an operator to act instead of promising a retry.
+	operatorMustAct bool
 }
 
 // ReplicaWidenReport is what a widening pass did. Results list every
@@ -316,11 +320,19 @@ func (p *replicaWidenPass) candidates(
 			continue
 		}
 		job, _, err := guestReplicaJobs(jobs, vmid, p.owner)
+		var dup *replicaDuplicateJobsError
 		switch {
-		case err != nil:
+		case errors.As(err, &dup):
 			// More than one job of this Director copies the VM, which no
-			// call of the CPI sets up, so an operator must remove the extra
-			// one before the pin can widen.
+			// call of the CPI sets up, so no later sweep can widen the pin
+			// until an operator removes the extra one.
+			report.Results = append(report.Results, ReplicaWidenResult{VMID: vmid, Node: node,
+				Outcome: ReplicaWidenFailed, operatorMustAct: true, Reason: fmt.Sprintf("the VM has two "+
+					"replication jobs of this Director, %s and %s, and its pin cannot widen until an operator "+
+					"removes the extra one, most likely %s, for example with `pvesr delete %s`", dup.first,
+					dup.extra, dup.extra, dup.extra)})
+			continue
+		case err != nil:
 			report.Results = append(report.Results, ReplicaWidenResult{VMID: vmid, Node: node,
 				Outcome: ReplicaWidenFailed, Reason: err.Error()})
 			continue
@@ -884,16 +896,22 @@ func sweepAwaitingReplicaPins(ctx context.Context, deps Deps) {
 	logReplicaWidenReport(logger, report)
 }
 
-// logReplicaWidenReport logs what a sweep did: each widening and failure, and
-// a summary when the sweep considered any VM.
+// logReplicaWidenReport logs what a sweep did, which is each widening and
+// failure, and a summary when the sweep considered any VM. A request runs at
+// most one sweep, so a VM's failure logs one Warn per request. A failure that
+// only an operator can clear, such as a second job of this Director, says so
+// instead of promising that a later sweep tries again.
 func logReplicaWidenReport(logger *log.Logger, report ReplicaWidenReport) {
 	for _, r := range report.Results {
 		fields := []log.Field{log.Int(metadataKeyVMID, r.VMID), log.String("node", r.Node),
 			log.String("partner", r.Partner), log.String("reason", r.Reason)}
-		switch r.Outcome {
-		case ReplicaWidened:
+		switch {
+		case r.Outcome == ReplicaWidened:
 			logger.Info(replicaWidenOp+": widened the VM's pin to its partner", fields...)
-		case ReplicaWidenFailed:
+		case r.Outcome == ReplicaWidenFailed && r.operatorMustAct:
+			logger.Warn(replicaWidenOp+": the VM's pin cannot widen until an operator fixes its replication "+
+				"jobs; every sweep reports it until then (non-fatal)", fields...)
+		case r.Outcome == ReplicaWidenFailed:
 			logger.Warn(replicaWidenOp+": the VM's replica could not be checked; a later sweep tries again "+
 				"(non-fatal)", fields...)
 		default:

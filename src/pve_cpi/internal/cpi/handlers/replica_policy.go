@@ -74,13 +74,26 @@ func guestReplicaJobs(
 			continue
 		}
 		if owned != nil {
-			return nil, nil, fmt.Errorf("VM %d has replication jobs %s and %s that both carry this Director's "+
-				"marker", vmid, owned.ID, j.ID)
+			return nil, nil, &replicaDuplicateJobsError{vmid: vmid, first: owned.ID, extra: j.ID}
 		}
 		job := j
 		owned = &job
 	}
 	return owned, foreign, nil
+}
+
+// replicaDuplicateJobsError is guestReplicaJobs' error for a VM with more
+// than one job that carries this Director's marker. The jobs sort by job
+// number, and the CPI gives a VM's job the lowest free number, so extra is
+// most likely the one an operator added.
+type replicaDuplicateJobsError struct {
+	vmid         int
+	first, extra string
+}
+
+func (e *replicaDuplicateJobsError) Error() string {
+	return fmt.Sprintf("VM %d has replication jobs %s and %s that both carry this Director's marker", e.vmid,
+		e.first, e.extra)
 }
 
 // replicaOtherNode returns the node that holds the copy of a job whose VM runs

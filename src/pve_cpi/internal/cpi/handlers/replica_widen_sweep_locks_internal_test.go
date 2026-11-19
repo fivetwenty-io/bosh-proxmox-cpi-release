@@ -362,6 +362,37 @@ func TestReplicaWidenPass_DuplicateJobsFail(t *testing.T) {
 	if res.Outcome != ReplicaWidenFailed || s.widened() {
 		t.Fatalf("result %+v; want a failure an operator sees", res)
 	}
+	for _, want := range []string{"100-0", "100-1", "pvesr delete 100-1", "until an operator removes"} {
+		if !strings.Contains(res.Reason, want) {
+			t.Fatalf("reason %q; want it to name both jobs and how to remove the extra one (%q)", res.Reason, want)
+		}
+	}
+}
+
+// The log line for a VM with two jobs of this Director says that an operator
+// must act, once for the sweep, and never that a later sweep fixes it.
+func TestReplicaWidenPass_DuplicateJobsLogWhatTheOperatorMustDo(t *testing.T) {
+	s := newSweepRig(t)
+	s.repl.addJob("100-1", "pve01", "pve03", renderReplicaJobMarker(aaDirector, 1))
+	report := s.run(t, ReplicaWidenOptions{})
+	logger, obs := log.NewObservedLogger(log.LevelDebug)
+	logReplicaWidenReport(logger, report)
+	warns := 0
+	for _, e := range obs.All() {
+		if e.Level != log.LevelWarn {
+			continue
+		}
+		warns++
+		if strings.Contains(e.Message, "tries again") || !strings.Contains(e.Message, "operator") {
+			t.Fatalf("warn %q; want it to say an operator must act, not that a later sweep fixes it", e.Message)
+		}
+		if reason, _ := e.Attrs["reason"].(string); !strings.Contains(reason, "pvesr delete 100-1") {
+			t.Fatalf("warn reason %q; want the job to remove", reason)
+		}
+	}
+	if warns != 1 {
+		t.Fatalf("warns %d; want one for the VM", warns)
+	}
 }
 
 // A Director UUID with surrounding spaces names the same Director in every
