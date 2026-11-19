@@ -64,8 +64,11 @@ type attachHA struct {
 	// from HA, wired to the VM's client.
 	narrow ha.NarrowDeps
 
-	// replicaChanged is when the attach changed a replicate VM's volume set,
-	// zero for any other VM.
+	// replicaChanged is the change of a replicate VM's volume set that the
+	// VM's pin records while the attach runs, zero for any other VM. It is
+	// the latest time the attach can land (see attachReplicaLandBy), so no
+	// sync can prove the VM's volume set until the attach has finished and
+	// restamped the pin with the time it did.
 	replicaChanged time.Time
 
 	// replicaTagged is true when the VM carries the replicate tag, so a
@@ -247,8 +250,9 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 		if d.Policy == ha.PolicyReplicate {
 			// The pin names the VM's node alone while the new disk has no
 			// replica, and it records when the volume set changed, which the
-			// next verified sync must follow.
-			h.replicaChanged = time.Now()
+			// next verified sync must follow. Until the attach lands, that
+			// is the latest time it can land.
+			h.replicaChanged = attachReplicaLandBy(ctx, deps, time.Now())
 			newPin.Comment = ha.WithReplicaChanged(ha.WithReplicaPartner(newPin.Comment, ""), h.replicaChanged)
 		}
 		h.action, h.newPin = attachHAGuarded, newPin
@@ -701,6 +705,9 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 			return err
 		}
 	}
+	if err := h.holdReplicaUnproven(ctx); err != nil {
+		return err
+	}
 	// The barrier's mutation is the whole rest of the attach, which locates the
 	// VM itself, so the node the drain found is only where it starts.
 	var landed string
@@ -854,16 +861,64 @@ func (h *attachHA) syncFailback(ctx context.Context, node string) {
 		pve.VMLocation{Node: node, Found: true}, h.logger)
 }
 
+// attachReplicaLandWaits bounds an attach to a replicate VM, in HA motion
+// waits: one for the barrier's drain, one for the attach, and one for the
+// barrier's restore.
+const attachReplicaLandWaits = 3
+
+// attachReplicaLandBy returns the latest time an attach decided at now can
+// land: attachReplicaLandWaits HA motion waits after now, or the request's
+// deadline when that comes first. A replicate VM's pin records it as the
+// change of the VM's volume set while the attach runs, so no sync that
+// starts before the new disk lands can prove the volume set, and an attach
+// that stops before it restamps the pin holds the pin on the source no
+// longer than that.
+func attachReplicaLandBy(ctx context.Context, deps Deps, now time.Time) time.Time {
+	by := now.Add(attachReplicaLandWaits * haMotionWait(deps))
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(by) {
+		by = deadline
+	}
+	return by
+}
+
+// holdReplicaUnproven records on a replicate VM's pin, before the attach,
+// that its volume set is changing, when the barrier would otherwise write
+// the pin only after the attach. That is a change that keeps the pin's
+// nodes, which the barrier makes mutation first. A change that narrows the
+// pin's nodes needs nothing here, because the barrier writes the new pin,
+// which records the change, before the attach. The write is a
+// compare-and-swap on the pin the decision read, so a pin another call
+// changed since, such as one a sweep widened, fails the attach retriably
+// before it attaches anything, and the next attach decides again.
+func (h *attachHA) holdReplicaUnproven(ctx context.Context) error {
+	if h.replicaChanged.IsZero() || h.oldPin == nil || h.newPin == nil || ha.Narrows(h.oldPin, h.newPin) {
+		return nil
+	}
+	held := *h.oldPin
+	held.Comment = ha.WithReplicaChanged(h.oldPin.Comment, h.replicaChanged)
+	if ha.SameRule(&held, h.oldPin) {
+		return nil
+	}
+	if err := writeReplicaPin(ctx, h.deps, h.profile, h.logger, h.vmid, h.oldPin, &held); err != nil {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf("%s: VM %d: record on the "+
+			"replicate VM's pin that its volume set is changing", attachHAOp, h.vmid))
+	}
+	h.oldPin = &held
+	return nil
+}
+
 // restampReplica records on a replicate VM's pin, after the attach, the time
-// the attach finished as the time its volume set changed. The barrier wrote
-// the pin before the attach with the time the decision ran, and a sync must
-// start after the change has landed, not only after it was decided. The
+// the attach finished as the time its volume set changed. The pin recorded
+// the latest time the attach could land while it ran (see
+// attachReplicaLandBy), and a sync must start after the change has landed,
+// not only after it was decided. The
 // attach does not wait for a sync and never widens the pin: a later call that
 // touches the VM checks the replica. A persistent disk on ZFS pool storage
 // enters a replicated VM by a reassignment that names the volume for the VM,
 // so the job copies it, and the pin names the partner again only after a
 // sync that started after this time covers it. A pin that changed since, or a
-// write that fails, is logged, and the earlier time stays on the pin.
+// write that fails, is logged, and the later time stays on the pin, which
+// holds the pin on the source until that time has passed.
 func (h *attachHA) restampReplica(ctx context.Context, node string) {
 	if node == "" {
 		node = h.node
@@ -884,7 +939,7 @@ func (h *attachHA) restampReplica(ctx context.Context, node string) {
 	stamped.Comment = ha.WithReplicaChanged(pin.Comment, time.Now())
 	if err := writeReplicaPin(ctx, h.deps, h.profile, logger, h.vmid, pin, &stamped); err != nil {
 		logger.Warn(attachHAOp+": the replicate VM's pin could not record when the attach finished; it keeps the "+
-			"time the attach was decided", log.Err(err))
+			"latest time the attach could land", log.Err(err))
 	}
 }
 

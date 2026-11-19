@@ -1020,6 +1020,7 @@ func TestAttachToAReplicateVMNarrowsAndRestampsTheChange(t *testing.T) {
 	stub.rules["bosh-na-100"] = cluster.CreateHaRulesParams{Rule: "bosh-na-100", Type: naRuleType,
 		Resources: "vm:100", Comment: &comment, Nodes: &nodes, Strict: &strict}
 	disk := resolvedDisk{volid: "local-zfs:vm-100-disk-1", stableID: "abcd1234"}
+	decided := time.Now()
 	h, err := decideAttachHA(context.Background(), deps, "100", disk)
 	if err != nil || h == nil || h.action != attachHAGuarded {
 		t.Fatalf("decision: h %+v err %v; a recorded storage does not skip a replicate VM's attach", h, err)
@@ -1046,9 +1047,9 @@ func TestAttachToAReplicateVMNarrowsAndRestampsTheChange(t *testing.T) {
 		t.Fatalf("pin nodes %q; the attach before the first sync keeps the source alone", derefString(pin.Nodes))
 	}
 	stamped, ok := ha.ReplicaChanged(derefString(pin.Comment))
-	if !ok || stamped.Before(h.replicaChanged.Truncate(time.Second)) {
-		t.Fatalf("pin comment %q; the change is stamped no earlier than the decision at %v",
-			derefString(pin.Comment), h.replicaChanged)
+	if !ok || stamped.Before(decided.Truncate(time.Second)) || stamped.After(time.Now()) {
+		t.Fatalf("pin comment %q; the change is stamped when the attach finished, after the decision at %v",
+			derefString(pin.Comment), decided)
 	}
 	if len(repl.calls) != 0 {
 		t.Fatalf("calls %v; the attach requests no sync and reads no sync state", repl.calls)
