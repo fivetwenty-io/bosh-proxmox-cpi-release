@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -27,12 +29,23 @@ type retiredParker struct {
 // the test and returns the calls it saw.
 func captureRetirements(t *testing.T) func() []retiredParker {
 	t.Helper()
+	return captureRetirementsAt(t, nil)
+}
+
+// captureRetirementsAt is captureRetirements that also runs check inside each
+// call, so a test can assert what had landed by the time the retirement ran.
+func captureRetirementsAt(t *testing.T, check func(retiredParker)) func() []retiredParker {
+	t.Helper()
 	var mu sync.Mutex
 	var seen []retiredParker
 	restore := setRetireEmptiedParkerForTest(func(_ context.Context, _ Deps, node string, vmid int, trigger string) {
+		call := retiredParker{node: node, vmid: vmid, trigger: trigger}
+		if check != nil {
+			check(call)
+		}
 		mu.Lock()
 		defer mu.Unlock()
-		seen = append(seen, retiredParker{node: node, vmid: vmid, trigger: trigger})
+		seen = append(seen, call)
 	})
 	t.Cleanup(restore)
 	return func() []retiredParker {
@@ -47,6 +60,24 @@ func requireRetirements(t *testing.T, got []retiredParker, want ...retiredParker
 	if !slices.Equal(got, want) {
 		t.Fatalf("retirements %+v, want %+v", got, want)
 	}
+}
+
+// requireAttachLanded reports an error unless parker 90000 holds no disk and VM
+// 700 holds one that carries the test's serial, which is what the attach has
+// written by the time it hands the parker to the retirement.
+func requireAttachLanded(t *testing.T, c *migFakeClient) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, still := c.configs[90000]["scsi0"]; still {
+		t.Error("the retirement ran while the parker still held the disk")
+	}
+	for _, v := range c.configs[700] {
+		if s, ok := v.(string); ok && strings.Contains(s, migTestToken) {
+			return
+		}
+	}
+	t.Errorf("the retirement ran before VM 700 held the disk; config %v", c.configs[700])
 }
 
 // TestRetireEmptiedParker_AttachMigrationRetiresTheSourceParker proves the
@@ -68,7 +99,7 @@ func TestRetireEmptiedParker_AttachMigrationRetiresTheSourceParker(t *testing.T)
 		diskCID: "pvd-x", birth: "data:vm-9001-disk-0", volid: "data:vm-90000-disk-0",
 		meta: &pve.DiskCIDMeta{ID: migTestToken, Anchor: true}, stableID: migTestToken, holder: &holder,
 	}
-	calls := captureRetirements(t)
+	calls := captureRetirementsAt(t, func(retiredParker) { requireAttachLanded(t, c) })
 
 	plan, err := guardAndUnparkBeforeAttach(context.Background(), deps, "attach_disk", &rd, "pve2", 700)
 	if err != nil || !plan.destroyMover {
@@ -102,7 +133,7 @@ func TestRetireEmptiedParker_AttachUnparkRetiresTheParker(t *testing.T) {
 		diskCID: "pvd-x", birth: "data:vm-9001-disk-0", volid: "data:vm-9001-disk-0",
 		meta: &pve.DiskCIDMeta{ID: migTestToken, Anchor: true}, stableID: migTestToken, holder: &holder,
 	}
-	calls := captureRetirements(t)
+	calls := captureRetirementsAt(t, func(retiredParker) { requireAttachLanded(t, c) })
 
 	plan, err := guardAndUnparkBeforeAttach(context.Background(), deps, "attach_disk", &rd, "pve2", 700)
 	if err != nil || plan.viaTransfer {
@@ -123,7 +154,14 @@ func TestRetireEmptiedParker_ManagedPathsRetireTheParker(t *testing.T) {
 	t.Run("attach reassignment", func(t *testing.T) {
 		d := newParkedFlowDisk(t, newLockContention(t))
 		const node = "n1"
-		calls := captureRetirements(t)
+		calls := captureRetirementsAt(t, func(retiredParker) {
+			if n := flowDiskSlots(d.client.state.configs[d.parker]); n != 0 {
+				t.Errorf("the retirement ran while the parker still held %d disks", n)
+			}
+			if n := flowDiskSlots(d.client.state.configs[777]); n == 0 {
+				t.Error("the retirement ran before VM 777 held the disk")
+			}
+		})
 		if err := d.attach(t.Context()); err != nil {
 			t.Fatalf("attach: %v", err)
 		}
@@ -132,7 +170,11 @@ func TestRetireEmptiedParker_ManagedPathsRetireTheParker(t *testing.T) {
 	t.Run("delete_disk", func(t *testing.T) {
 		d := newParkedFlowDisk(t, newLockContention(t))
 		const node = "n1"
-		calls := captureRetirements(t)
+		calls := captureRetirementsAt(t, func(retiredParker) {
+			if d.client.deletes == 0 {
+				t.Error("the retirement ran before delete_disk deleted the volume")
+			}
+		})
 		if _, err := HandleDeleteDisk(d.deps).Handle(t.Context(), []json.RawMessage{planJSON(t, d.cid)},
 			jsonrpc.Context{}); err != nil {
 			t.Fatalf("delete_disk: %v", err)
@@ -143,7 +185,11 @@ func TestRetireEmptiedParker_ManagedPathsRetireTheParker(t *testing.T) {
 		d := newParkedFlowDisk(t, newLockContention(t))
 		const node = "n1"
 		markRecordUncertain(t, d, "operator cleanup")
-		calls := captureRetirements(t)
+		calls := captureRetirementsAt(t, func(retiredParker) {
+			if d.client.deletes == 0 {
+				t.Error("the retirement ran before the cleanup deleted the volume")
+			}
+		})
 		if _, err := CleanupStorageAllocation(t.Context(), attestedCleanupDeps(d.deps), d.journal,
 			[]string{"n1"}, cleanupAttestedDecision(d.id)); err != nil {
 			t.Fatalf("cleanup: %v", err)
@@ -151,6 +197,68 @@ func TestRetireEmptiedParker_ManagedPathsRetireTheParker(t *testing.T) {
 		requireRetirements(t, calls(),
 			retiredParker{node: node, vmid: d.parker, trigger: "storage allocation cleanup"})
 	})
+}
+
+// flowDiskSlots counts the bus slots and unused entries a lifecycle flow
+// config holds, which are the keys that can name a volume.
+func flowDiskSlots(cfg map[string]any) int {
+	n := 0
+	for key := range cfg {
+		for _, prefix := range []string{"scsi", "virtio", "sata", "ide", "unused"} {
+			if rest, ok := strings.CutPrefix(key, prefix); ok && rest != "" {
+				if _, err := strconv.Atoi(rest); err == nil {
+					n++
+				}
+			}
+		}
+	}
+	return n
+}
+
+// TestRetireEmptiedParker_AttachRetiresOnceItsGateAndLockAreReleased proves
+// the attach that empties a parker retires it only after it has released the
+// node's in-flight slot and the disk's lifecycle lock, so the retirement's
+// budget is not spent while other requests wait on them.
+func TestRetireEmptiedParker_AttachRetiresOnceItsGateAndLockAreReleased(t *testing.T) {
+	d := newParkedFlowDisk(t, newLockContention(t))
+	registry := NewInflightRegistry()
+	d.deps.Inflight = registry
+	d.deps.Config.MaxInflightPerNode = 1
+	checked := false
+	calls := captureRetirementsAt(t, func(retiredParker) {
+		checked = true
+		registry.mu.Lock()
+		for node, slots := range registry.m {
+			if len(slots) != 0 {
+				t.Errorf("the retirement ran while the attach held node %s's in-flight slot", node)
+			}
+		}
+		registry.mu.Unlock()
+		release, held, err := d.journal.TryHoldShared(d.id)
+		if err != nil {
+			t.Errorf("probe the disk's lifecycle lock: %v", err)
+			return
+		}
+		if !held {
+			t.Error("the retirement ran while the attach held the disk's lifecycle lock")
+			return
+		}
+		if err := release(); err != nil {
+			t.Errorf("release the probe: %v", err)
+		}
+	})
+	if err := d.attach(t.Context()); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if !checked {
+		t.Fatal("the attach must hand the emptied parker to the retirement")
+	}
+	requireRetirements(t, calls(), retiredParker{node: "n1", vmid: d.parker, trigger: "attach_disk"})
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if len(registry.m) == 0 {
+		t.Fatal("the attach must take the node's in-flight slot")
+	}
 }
 
 // freshRollbackClient is the migration fake with the storage a create_disk
@@ -174,7 +282,15 @@ func TestRetireEmptiedParker_CreateDiskRollbackRetiresTheParker(t *testing.T) {
 	deps := migTestDeps(c)
 	deps.PVE = &freshRollbackClient{migFakeClient: c, storage: storage}
 	deps.Config.DetachedDiskStrategy = "parked"
-	calls := captureRetirements(t)
+	calls := captureRetirementsAt(t, func(retiredParker) {
+		if _, still := c.configs[90000]["scsi0"]; still {
+			t.Error("the retirement ran before the rollback unparked the disk")
+		}
+		if len(storage.deleteAsyncCalls) != 1 {
+			t.Errorf("the retirement ran before the rollback deleted the volume; deletes %+v",
+				storage.deleteAsyncCalls)
+		}
+	})
 
 	rollbackFreshDisk(context.Background(), deps, "pve1", "data", "data:vm-9001-disk-0", "data:vm-9001-disk-0")
 	if _, still := c.configs[90000]["scsi0"]; still {
@@ -187,4 +303,47 @@ func TestRetireEmptiedParker_CreateDiskRollbackRetiresTheParker(t *testing.T) {
 
 	rollbackFreshDisk(context.Background(), deps, "pve1", "data", "data:vm-9001-disk-1", "data:vm-9001-disk-1")
 	requireRetirements(t, calls(), retiredParker{node: "pve1", vmid: 90000, trigger: "create_disk rollback"})
+}
+
+// TestDeferParkerRetirements_TheOutermostHandlerDrainsEachParkerOnce proves
+// a queued retirement waits for the drain, a nested handler leaves the drain
+// to the outermost one, a parker emptied twice is retired once, and a call
+// made free of the request's cancellation is drained free of it too.
+func TestDeferParkerRetirements_TheOutermostHandlerDrainsEachParkerOnce(t *testing.T) {
+	var mu sync.Mutex
+	var seen []retiredParker
+	canceled := map[int]bool{}
+	restore := setRetireEmptiedParkerForTest(func(ctx context.Context, _ Deps, node string, vmid int, trigger string) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, retiredParker{node: node, vmid: vmid, trigger: trigger})
+		canceled[vmid] = ctx.Err() != nil
+	})
+	t.Cleanup(restore)
+	count := func() int { mu.Lock(); defer mu.Unlock(); return len(seen) }
+
+	outer, cancel := context.WithCancel(context.Background())
+	ctx, drain := deferParkerRetirements(outer)
+	inner, innerDrain := deferParkerRetirements(ctx)
+	retireEmptiedParker(inner, Deps{}, "n1", 90000, "attach_disk")
+	retireEmptiedParker(ctx, Deps{}, "n1", 90000, "attach_disk")
+	retireEmptiedParker(context.WithoutCancel(inner), Deps{}, "n2", 90001, "create_disk rollback")
+	innerDrain()
+	if n := count(); n != 0 {
+		t.Fatalf("no retirement may run before the outermost drain; ran %d", n)
+	}
+	cancel()
+	drain()
+	mu.Lock()
+	defer mu.Unlock()
+	want := []retiredParker{
+		{node: "n1", vmid: 90000, trigger: "attach_disk"},
+		{node: "n2", vmid: 90001, trigger: "create_disk rollback"},
+	}
+	if !slices.Equal(seen, want) {
+		t.Fatalf("retirements %+v, want %+v", seen, want)
+	}
+	if !canceled[90000] || canceled[90001] {
+		t.Fatalf("only the call made free of cancellation runs free of it; canceled %v", canceled)
+	}
 }

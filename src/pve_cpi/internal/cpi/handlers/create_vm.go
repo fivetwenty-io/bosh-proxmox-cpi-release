@@ -558,6 +558,10 @@ func HandleCreateVM(deps Deps) cpi.Handler {
 		// Hand the After hooks an annotator on this request's effective client,
 		// so notes_audit never writes through the job-level cluster.
 		cpi.PublishRequestAnnotator(ctx, NewVMAnnotator(deps))
+		// A parker an attach of the create empties is retired once the create
+		// has released its gates and its locks (see parker_retire.go).
+		ctx, retireEmptied := deferParkerRetirements(ctx)
+		defer retireEmptied()
 		return createVM(ctx, deps, args)
 	})
 }

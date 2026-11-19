@@ -90,6 +90,11 @@ func HandleAttachDisk(deps Deps) Handler {
 		if err != nil {
 			return nil, err
 		}
+		// A parker the attach empties is retired once the attach has released
+		// its gate and its locks (see parker_retire.go). Deferred first, so it
+		// runs last.
+		ctx, retireEmptied := deferParkerRetirements(ctx)
+		defer retireEmptied()
 		// --------------------------------------------------------------------
 		// 1. Unmarshal and validate arguments.
 		// --------------------------------------------------------------------
@@ -732,8 +737,10 @@ func attachDiskViaTransfer(
 	} else if restoreCutOff == nil {
 		// The reassignment took the disk off the parker and its provenance
 		// entry is gone, so a parker PVE HA manages that this emptied is
-		// retired now. A parker whose protection restore was cut off stays,
-		// because a retry comes back to it and settles the restore first.
+		// handed to the retirement, which the handler runs once it has
+		// released its gate and its locks. A parker whose protection restore
+		// was cut off stays, because a retry comes back to it and settles the
+		// restore first.
 		retireEmptiedHolder(ctx, deps, plan.parker, op)
 	}
 	if restoreCutOff != nil {

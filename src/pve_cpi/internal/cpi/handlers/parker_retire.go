@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -30,6 +31,21 @@ import (
 // has. The retirement never fails the call: a park or a sweep that holds the
 // parker's claim, a request with too little time left, or any failed step
 // leaves the parker for the next parker sweep on its node, which retires it.
+//
+// attach_disk and create_vm run the retirement after the handler returns
+// from its work, not where the disk leaves the parker. A retirement can spend
+// up to its whole budget on a slow HA stop or destroy, and inline it would do
+// that while the call still held the node's in-flight slot, the disk's
+// lifecycle lock, and the target VM's locks, so every request waiting on them
+// would wait on the retirement too. The handler installs a queue in its
+// context (deferParkerRetirements), each emptying path in it adds the parker
+// to the queue, and the handler drains the queue once every gate and lock it
+// took is released. The deferral is safe because the retirement decides
+// nothing from what the path saw. It takes the parker's claim with a single
+// try and reads the parker again under it, so a disk that was parked there in
+// the meantime, or a rollback that put the disk back, keeps the parker. The
+// other emptying paths retire inline, because they hold no gate that other
+// requests queue on while they finish.
 
 // retireEmptiedParkerFunc is the shape of retireEmptiedParkerNow, named for
 // the seam below.
@@ -65,7 +81,76 @@ func retireEmptiedParker(ctx context.Context, deps Deps, node string, vmid int, 
 	if vmid <= 0 || strings.TrimSpace(node) == "" {
 		return
 	}
+	if q, ok := ctx.Value(retirementQueueKey{}).(*retirementQueue); ok && q != nil {
+		q.add(queuedRetirement{deps: deps, node: node, vmid: vmid, trigger: trigger, keepGoing: ctx.Done() == nil})
+		return
+	}
 	(*retireEmptiedParkerImpl.Load())(ctx, deps, node, vmid, trigger)
+}
+
+// retirementQueueKey keys the queue deferParkerRetirements installs.
+type retirementQueueKey struct{}
+
+// queuedRetirement is one retirement a handler runs once it has released its
+// gates and locks.
+type queuedRetirement struct {
+	deps    Deps
+	node    string
+	vmid    int
+	trigger string
+	// keepGoing is set when the path called the retirement on a context free
+	// of the request's cancellation, as create_disk's rollback does, so the
+	// drain runs it free of that cancellation too.
+	keepGoing bool
+}
+
+// retirementQueue holds the retirements a handler deferred, each parker once.
+type retirementQueue struct {
+	mu      sync.Mutex
+	pending []queuedRetirement
+}
+
+func (q *retirementQueue) add(e queuedRetirement) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, p := range q.pending {
+		if p.node == e.node && p.vmid == e.vmid {
+			return
+		}
+	}
+	q.pending = append(q.pending, e)
+}
+
+func (q *retirementQueue) take() []queuedRetirement {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	out := q.pending
+	q.pending = nil
+	return out
+}
+
+// deferParkerRetirements makes every retirement of an emptied parker called
+// on the returned context wait until the returned drain runs, as the comment
+// at the top of this file describes. The handler defers the drain first, so
+// it runs after every gate and lock the handler takes later is released. A
+// context that already carries a queue keeps it, and the drain returned then
+// does nothing, so the outermost handler drains. The drain runs each
+// retirement on ctx, the context the handler had before the queue, which
+// carries none of the claims or locks the path held.
+func deferParkerRetirements(ctx context.Context) (context.Context, func()) {
+	if q, ok := ctx.Value(retirementQueueKey{}).(*retirementQueue); ok && q != nil {
+		return ctx, func() {}
+	}
+	q := &retirementQueue{}
+	return context.WithValue(ctx, retirementQueueKey{}, q), func() {
+		for _, e := range q.take() {
+			rctx := ctx
+			if e.keepGoing {
+				rctx = context.WithoutCancel(ctx)
+			}
+			(*retireEmptiedParkerImpl.Load())(rctx, e.deps, e.node, e.vmid, e.trigger)
+		}
+	}
 }
 
 // retireEmptiedHolder retires the parker a disk left, when holder names one.
