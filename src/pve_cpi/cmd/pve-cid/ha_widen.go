@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
@@ -22,12 +23,23 @@ type haWidenFunc func(ctx context.Context, cfg *config.CPIConfig, logger *log.Lo
 func productionHAWiden(ctx context.Context, cfg *config.CPIConfig, logger *log.Logger, owner string,
 	dryRun bool,
 ) (handlers.ReplicaWidenReport, error) {
+	deps, err := haWidenDeps(cfg, logger, owner)
+	if err != nil {
+		return handlers.ReplicaWidenReport{}, err
+	}
+	return handlers.WidenAwaitingReplicaPins(ctx, deps, handlers.ReplicaWidenOptions{DryRun: dryRun})
+}
+
+// haWidenDeps returns the deps the widening pass runs with: the config, the
+// logger, the trimmed Director UUID, and the CPI's own PVE client, whose pool
+// service the pass's VMID claims and the HA rules lock take.
+func haWidenDeps(cfg *config.CPIConfig, logger *log.Logger, owner string) (handlers.Deps, error) {
 	client, err := newPVEClient(cfg, logger)
 	if err != nil {
-		return handlers.ReplicaWidenReport{}, fmt.Errorf("cannot reach the cluster: %w", err)
+		return handlers.Deps{}, fmt.Errorf("cannot reach the cluster: %w", err)
 	}
-	deps := handlers.Deps{Config: cfg, PVE: client, Logger: logger, RequestDirectorUUID: owner}
-	return handlers.WidenAwaitingReplicaPins(ctx, deps, handlers.ReplicaWidenOptions{DryRun: dryRun})
+	return handlers.Deps{Config: cfg, PVE: client, Logger: logger,
+		RequestDirectorUUID: strings.TrimSpace(owner)}, nil
 }
 
 // haWidenOutput is the JSON form of a widening run.

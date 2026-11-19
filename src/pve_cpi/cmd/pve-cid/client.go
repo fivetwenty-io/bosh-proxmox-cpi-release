@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	sdkclusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -259,10 +261,24 @@ type readerOpener func(configPath string, stderr io.Writer) (*config.CPIConfig, 
 
 // commandContext returns the context a subcommand runs its PVE calls under.
 // Like the CPI dispatcher does for each call, it installs an affinity scope, so
-// a tether the command's mutations make lasts as long as the command. The
-// returned function releases the scope, and the caller defers it.
+// a tether the command's mutations make lasts as long as the command. An
+// interrupt or a SIGTERM ends the context, so a command such as ha
+// --widen-replicas --apply stops its work and runs its deferred releases of
+// the HA rules lock and the VMID claims it holds, rather than dying with them
+// held. The first signal also restores the default handling, so a second one
+// stops the command at once. The returned function releases the scope and the
+// signal handling, and the caller defers it.
 func commandContext() (context.Context, func()) {
-	return endpointpool.WithAffinityScope(context.Background())
+	signaled, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signaled.Done()
+		stopSignals()
+	}()
+	ctx, releaseScope := endpointpool.WithAffinityScope(signaled)
+	return ctx, func() {
+		releaseScope()
+		stopSignals()
+	}
 }
 
 // loadConfigAndReader loads the config as loadConfigAndLogger does and

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -103,7 +104,7 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 			_, _ = fmt.Fprintf(stderr, "pve-cid ha: %s\n", err)
 			return exitUsage
 		}
-		owner = reqCtx.DirectorUUID
+		owner = strings.TrimSpace(reqCtx.DirectorUUID)
 		eff, _, notes, err = config.ApplyContextOverrides(base, reqCtx.Extra)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "pve-cid ha: the request's cpi_config properties do not apply: %s\n", err)
@@ -111,12 +112,12 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 		}
 	}
 	if *widenReplicas {
-		if *directorUUID != "" {
-			if owner != "" && owner != *directorUUID {
+		if named := strings.TrimSpace(*directorUUID); named != "" {
+			if owner != "" && owner != named {
 				_, _ = fmt.Fprintln(stderr, "pve-cid ha: --director-uuid names a different Director than the request")
 				return exitUsage
 			}
-			owner = *directorUUID
+			owner = named
 		}
 		return runHAWiden(ctx, eff, logger, owner, *apply, *asJSON, stdout, stderr, deps)
 	}

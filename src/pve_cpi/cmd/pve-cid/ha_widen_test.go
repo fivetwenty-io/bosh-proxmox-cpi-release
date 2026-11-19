@@ -176,3 +176,42 @@ func TestRunHAWidenFailures(t *testing.T) {
 		t.Fatalf("code = %d\n%s", code, out)
 	}
 }
+
+// The Director's UUID is trimmed once, so a padded --director-uuid or request
+// UUID names the same Director as the bare one, and the two agree.
+func TestRunHAWidenTrimsTheDirectorUUID(t *testing.T) {
+	t.Parallel()
+	d := newHATestDeps(haCfg("auto", "none"))
+	calls := withWiden(d, handlers.ReplicaWidenReport{}, nil)
+	code, _, errOut := runHATest(t, d, "--widen-replicas", "--director-uuid", "  "+haDirector+"\n")
+	if code != exitOK || len(*calls) != 1 || (*calls)[0].owner != haDirector {
+		t.Fatalf("code = %d, calls = %+v, stderr = %q; want the trimmed UUID", code, *calls, errOut)
+	}
+
+	request := `{"context":{"director_uuid":" ` + haDirector + ` "}}`
+	path := writeTemp(t, "request.json", request)
+	d = newHATestDeps(haCfg("auto", "none"))
+	calls = withWiden(d, handlers.ReplicaWidenReport{}, nil)
+	code, _, errOut = runHATest(t, d, "--widen-replicas", "--request", path, "--director-uuid", haDirector)
+	if code != exitOK || len(*calls) != 1 || (*calls)[0].owner != haDirector {
+		t.Fatalf("code = %d, calls = %+v, stderr = %q; a padded request UUID names the same Director", code,
+			*calls, errOut)
+	}
+}
+
+// The production pass runs on a client that offers the pool service its
+// VMID claims and the HA rules lock need, for the trimmed Director.
+func TestHAWidenDepsCarryAPoolServiceAndTheTrimmedOwner(t *testing.T) {
+	t.Parallel()
+	cfg := haCfg("auto", "replicate")
+	deps, err := haWidenDeps(cfg, log.NewNopLogger(), " "+haDirector+"\t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deps.PVE == nil || deps.PVE.Pools() == nil {
+		t.Fatal("the pass's client offers no pool service, so it could claim no VM")
+	}
+	if deps.RequestDirectorUUID != haDirector || deps.Config != cfg || deps.Logger == nil {
+		t.Fatalf("deps = %+v; want the config, a logger, and the trimmed Director", deps)
+	}
+}

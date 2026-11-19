@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
@@ -163,4 +164,27 @@ func TestStoragePlanRunsUnderAnAffinityScope(t *testing.T) {
 		t.Fatalf("exit %d stdout %q stderr %q", code, stdout.String(), stderr.String())
 	}
 	rec.requireOneLiveScope(t)
+}
+
+// An interrupt ends the command's context, so the command unwinds through its
+// deferred releases instead of dying with the HA rules lock or a VMID claim
+// held.
+func TestCommandContextEndsOnAnInterrupt(t *testing.T) {
+	ctx, release := commandContext()
+	defer release()
+	self, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := self.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("an interrupt did not end the command's context")
+	}
+	if endpointpool.ScopeFromContext(ctx) == nil {
+		t.Fatal("the command context lost its affinity scope")
+	}
 }
