@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -29,6 +30,28 @@ type retireRigClient struct {
 	pending       map[string]string
 	onClaimedRead func()
 	claimedReads  int
+	// claimedStatus counts the power-state reads of parker 90000 made while
+	// its claim is held, which only the retirement's guard makes, after the
+	// read under the claim decided to retire.
+	claimedStatus int
+}
+
+func (c *retireRigClient) QEMU() qemu.Service {
+	return &retireRigQEMU{Service: c.managedParkerClient.QEMU(), c: c}
+}
+
+type retireRigQEMU struct {
+	qemu.Service
+	c *retireRigClient
+}
+
+func (q *retireRigQEMU) Status(ctx context.Context, node string, vmid int) (map[string]any, error) {
+	if vmid == 90000 && q.c.pools().held(90000) {
+		q.c.mu.Lock()
+		q.c.claimedStatus++
+		q.c.mu.Unlock()
+	}
+	return q.Service.Status(ctx, node, vmid)
 }
 
 func (c *retireRigClient) Nodes() sdknodes.Service {
@@ -295,6 +318,10 @@ func TestRetireEmptiedParker_AParkThatLandsBeforeTheClaimKeepsTheParker(t *testi
 			r.retire()
 			if r.client.claimedReads == 0 {
 				t.Fatal("the retirement must read the parker again under its claim")
+			}
+			if r.client.claimedStatus != 0 {
+				t.Fatalf("the read under the claim must keep the parker before the retirement's guard runs; "+
+					"the guard read its power state %d times", r.client.claimedStatus)
 			}
 			r.requireUntouched(t)
 		})
