@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -30,22 +31,29 @@ const replicaWidenOp = "replica widen sweep"
 
 // The replica widening sweep's bounds. A call that took the HA rules lock
 // pays for at most this much of it, because the sweep is housekeeping that
-// rides on another request.
+// rides on another request. Every widening holds the cluster-wide rules lock
+// for a moment, so the sweep widens one pin per call and leaves bulk widening
+// to pve-cid ha --widen-replicas.
 const (
 	// replicaWidenSweepMaxWidened caps the pins one sweep widens.
-	replicaWidenSweepMaxWidened = 3
-	// replicaWidenSweepMaxAttempts caps the VMs one sweep claims.
-	replicaWidenSweepMaxAttempts = 6
+	replicaWidenSweepMaxWidened = 1
+	// replicaWidenSweepMaxAttempts caps the VMs one sweep checks.
+	replicaWidenSweepMaxAttempts = 3
 	// replicaWidenSweepMaxStatusReads caps the job status reads one sweep
-	// makes to decide which VMs are worth a claim.
+	// makes to decide which VMs are worth a check.
 	replicaWidenSweepMaxStatusReads = 12
 	// replicaWidenSweepBudget bounds one sweep, and so does half of what
-	// remains of the request's deadline.
+	// remains of the request's deadline once replicaWidenReleaseReserve is
+	// set aside.
 	replicaWidenSweepBudget = 60 * time.Second
-	// replicaWidenRecordWait bounds the wait for a VM's journal record. A
-	// record held longer belongs to a call that is changing the VM, and the
-	// VM waits for a later pass.
-	replicaWidenRecordWait = 5 * time.Second
+	// replicaWidenReleaseReserve is the time the releases after a sweep can
+	// take on their detached contexts: the VM's claim and then the HA rules
+	// lock, each bounded at lockReleaseTimeout. The journal record is a local
+	// file lock, and its release takes no PVE call.
+	replicaWidenReleaseReserve = 2 * lockReleaseTimeout
+	// replicaWidenSweepMinBudget is the least budget worth a sweep. A call
+	// whose deadline leaves less skips the sweep, and a later call sweeps.
+	replicaWidenSweepMinBudget = 10 * time.Second
 )
 
 // ReplicaWidenOutcome is what a widening pass did for one VM.
@@ -97,10 +105,10 @@ func (r ReplicaWidenReport) Count(o ReplicaWidenOutcome) int {
 type ReplicaWidenOptions struct {
 	// MaxWidened caps the pins the pass widens.
 	MaxWidened int
-	// MaxAttempts caps the VMs the pass claims.
+	// MaxAttempts caps the VMs the pass checks.
 	MaxAttempts int
 	// MaxStatusReads caps the job status reads that decide which VMs are
-	// worth a claim.
+	// worth a check.
 	MaxStatusReads int
 	// DryRun makes the pass read and report and take no claim, so it writes
 	// nothing.
@@ -113,10 +121,12 @@ type ReplicaWidenOptions struct {
 // lock run after their work, and the one pve-cid ha --widen-replicas runs on
 // demand. deps.RequestDirectorUUID names the Director. The check of each VM is
 // the one a reboot_vm or set_vm_metadata call makes (see replicaWiden), run
-// under the VM's VMID claim and its journal record, with the VM's HA state,
-// config, and job read again under the rules lock right before the write. A
-// VM whose state changed, or that another call holds, is skipped with the
-// reason, and a later pass checks it again. The error is for a pass that
+// under the VM's journal record. The write runs under the HA rules lock and,
+// inside it, under the pass's own short claim on the VM's VMID, with the VM's
+// config read again right before the write. Each of the three locks is tried
+// once, so the pass never waits on a lock, and a VM whose state changed, or
+// that another call holds, is skipped with the reason, and a later pass
+// checks it again. The error is for a pass that
 // could not start: no configuration, mode off, no director UUID, no client,
 // a listing that failed, or an HA profile that does not let the CPI write.
 func WidenAwaitingReplicaPins(ctx context.Context, deps Deps, opts ReplicaWidenOptions) (ReplicaWidenReport, error) {
@@ -141,16 +151,24 @@ type replicaWidenPass struct {
 	shuffle func([]replicaWidenCandidate)
 }
 
-// replicaWidenCandidate is a VM the pass found worth a claim.
+// replicaWidenCandidate is a VM the pass found worth a check. stamped says
+// whether its pin records the time of its last change, without which the
+// check stamps the pin and widens nothing.
 type replicaWidenCandidate struct {
-	vmid   int
-	node   string
-	target string
+	vmid    int
+	node    string
+	target  string
+	stamped bool
 }
 
+// newReplicaWidenPass returns a pass for the Director deps names. The UUID is
+// trimmed once here, and the pass's deps carry the trimmed value, so the
+// listing, the check, and the rule writes all judge ownership by the same
+// owner.
 func newReplicaWidenPass(deps Deps, opts ReplicaWidenOptions) *replicaWidenPass {
+	deps.RequestDirectorUUID = strings.TrimSpace(deps.RequestDirectorUUID)
 	return &replicaWidenPass{deps: deps, logger: deps.Log(context.Background()), opts: opts,
-		owner: strings.TrimSpace(deps.RequestDirectorUUID), now: time.Now}
+		owner: deps.RequestDirectorUUID, now: time.Now}
 }
 
 // replicaWidenRow is the part of a /cluster/resources row the pass reads.
@@ -268,7 +286,7 @@ func (p *replicaWidenPass) awaitingPins(
 
 // candidates reads the jobs and the HA manager's status once each, and the
 // job status of each VM under the status cap, and returns the VMs worth a
-// claim. It records a skip, a failure, or a deferral for each other VM.
+// check. It records a skip, a failure, or a deferral for each other VM.
 func (p *replicaWidenPass) candidates(
 	ctx context.Context, client pve.Client, awaiting []replicaWidenPinned, report *ReplicaWidenReport,
 ) ([]replicaWidenCandidate, error) {
@@ -296,7 +314,11 @@ func (p *replicaWidenPass) candidates(
 		job, _, err := guestReplicaJobs(jobs, vmid, p.owner)
 		switch {
 		case err != nil:
-			skip(err.Error())
+			// More than one job of this Director copies the VM, which no
+			// call of the CPI sets up, so an operator must remove the extra
+			// one before the pin can widen.
+			report.Results = append(report.Results, ReplicaWidenResult{VMID: vmid, Node: node,
+				Outcome: ReplicaWidenFailed, Reason: err.Error()})
 			continue
 		case job == nil:
 			skip("the VM has no replication job of this Director")
@@ -333,13 +355,16 @@ func (p *replicaWidenPass) candidates(
 				continue
 			}
 		}
-		candidates = append(candidates, replicaWidenCandidate{vmid: vmid, node: node, target: target})
+		candidates = append(candidates, replicaWidenCandidate{vmid: vmid, node: node, target: target,
+			stamped: a.stamped})
 	}
 	return candidates, nil
 }
 
-// widenCandidates claims and widens the candidates in random order, under the
-// caps and the context, and stops when a claim shows no claim can succeed.
+// widenCandidates checks and widens the candidates in random order, under the
+// caps and the context, and stops when a claim shows no claim can succeed. A
+// pin that named the partner already, or that another call widened first,
+// is a skip and does not count toward MaxWidened.
 func (p *replicaWidenPass) widenCandidates(
 	ctx context.Context, candidates []replicaWidenCandidate, profile *ha.Profile, report *ReplicaWidenReport,
 ) {
@@ -351,9 +376,15 @@ func (p *replicaWidenPass) widenCandidates(
 	widened, attempts := 0, 0
 	for i, c := range candidates {
 		if p.opts.DryRun {
-			report.Results = append(report.Results, ReplicaWidenResult{VMID: c.vmid, Node: c.node, Partner: c.target,
-				Outcome: ReplicaWouldWiden, Reason: "the job's last sync follows the pin's last change; the check " +
-					"under the VM's claim decides"})
+			res := ReplicaWidenResult{VMID: c.vmid, Node: c.node, Partner: c.target, Outcome: ReplicaWouldWiden,
+				Reason: "the job's last sync follows the pin's last change; the check under the VM's journal " +
+					"record decides"}
+			if !c.stamped {
+				res.Outcome = ReplicaWidenSkipped
+				res.Reason = "the pin records no time of its last change, so --apply stamps it with the time it " +
+					"runs and widens nothing; a sync after that time can widen it"
+			}
+			report.Results = append(report.Results, res)
 			continue
 		}
 		if (p.opts.MaxWidened > 0 && widened >= p.opts.MaxWidened) ||
@@ -417,54 +448,58 @@ func replicaWidenServiceHeld(state string) string {
 	return "the HA manager reports the VM as " + strconv.Quote(state) + ", so a move or a recovery may be running"
 }
 
-// widen checks one VM under its VMID claim and widens its pin when the check
-// passes. halt is non-empty when no later VM can be claimed either.
+// widen checks one VM and widens its pin when the check passes. The checks
+// that need no lock run first. Then the VM's journal record, the HA rules
+// lock, and the pass's claim on the VM's VMID are each tried once, in that
+// order, and a lock another call holds is a skip. The claim is taken last,
+// inside the rules lock, around the guard's re-read and the write, with the
+// short lease replicaWidenClaimTTL. So the pass never waits on a lock while it
+// holds another, and a call on the same VM that waits on the claim gets it
+// well inside its own wait. halt is non-empty when no later VM can be claimed
+// either.
 func (p *replicaWidenPass) widen(
 	ctx context.Context, c replicaWidenCandidate, profile *ha.Profile,
 ) (res ReplicaWidenResult, halt string) {
 	res = ReplicaWidenResult{VMID: c.vmid, Node: c.node, Partner: c.target, Outcome: ReplicaWidenSkipped}
 	logger := p.logger.With(log.Int(metadataKeyVMID, c.vmid), log.String("node", c.node))
-	var widened bool
-	var reason string
-	var workErr error
 	// The pass takes claims of its own. A claim set the caller's context
 	// carried would let withVMIDClaim reuse a claim the caller holds, so the
 	// pass drops it, and a VM the caller claims reads as held.
-	base := context.WithValue(ctx, vmidClaimSetKey{}, (*vmidClaimSet)(nil))
-	claimErr := withVMIDClaim(base, p.deps, c.vmid, "replica-widen/"+strconv.Itoa(c.vmid), claimForSweep, logger,
-		func(ctx context.Context) error {
-			widened, reason, workErr = p.widenClaimed(ctx, c, profile, logger)
-			return nil
-		})
+	base := withHARulesLockTryOnce(context.WithValue(ctx, vmidClaimSetKey{}, (*vmidClaimSet)(nil)))
+	widened, reason, err := p.checkVM(base, c, profile, logger)
+	var refused *replicaWidenClaimRefused
 	switch {
-	case claimErr == nil && workErr == nil:
+	case err == nil:
 		res.Reason = reason
 		if widened {
 			res.Outcome = ReplicaWidened
 		}
-	case claimErr == nil:
-		res.Outcome, res.Reason = ReplicaWidenFailed, workErr.Error()
-	case isVMIDClaimHeld(claimErr):
-		res.Reason = "another call claims the VM, such as a create, a delete, or another pass"
-	case pve.IsClusterLockPermissionRefused(claimErr):
-		res.Outcome = ReplicaWidenFailed
-		res.Reason = "PVE refused the VMID claim for lack of permission: " + claimErr.Error()
-		halt = "PVE refused the VMID claim for lack of permission, so no VM can be claimed; grant Pool.Allocate " +
-			"and Pool.Audit on /pool so the CPI can create bosh-lock-vm-<vmid>"
+	case errors.As(err, &refused):
+		res.Outcome, res.Reason, halt = ReplicaWidenFailed, refused.reason, refused.halt
 	default:
-		res.Outcome, res.Reason = ReplicaWidenFailed, "claim the VM: "+claimErr.Error()
+		res.Outcome, res.Reason = ReplicaWidenFailed, err.Error()
 	}
 	return res, halt
 }
 
-// widenClaimed is the check of one claimed VM. It reads the VM's config on
-// the node the listing named, which proves the VM still runs there, and
-// checks that the VM holds no PVE lock, still carries the replicate tag, is
-// this Director's, and that its HA resource carries this Director's marker
-// and is not held by an operator or by the narrowing barrier. The replica
-// check then runs with the VM's journal record held, and its write is guarded
-// by the same reads under the rules lock.
-func (p *replicaWidenPass) widenClaimed(
+// replicaWidenClaimRefused is a claim the pass cannot take on any VM, which
+// stops the pass.
+type replicaWidenClaimRefused struct {
+	reason string
+	halt   string
+}
+
+func (e *replicaWidenClaimRefused) Error() string { return e.reason }
+
+// checkVM is the check of one VM. It reads the VM's config on the node the
+// listing named, which proves the VM still runs there, and checks that the VM
+// holds no PVE lock, still carries the replicate tag, is this Director's, and
+// that its HA resource carries this Director's marker and is not held by an
+// operator or by the narrowing barrier. The replica check then runs with the
+// VM's journal record held, and its write is guarded by the claim and a
+// re-read of the config under the rules lock (see guard). widened is true
+// only for a pin this check widened in PVE.
+func (p *replicaWidenPass) checkVM(
 	ctx context.Context, c replicaWidenCandidate, profile *ha.Profile, logger *log.Logger,
 ) (widened bool, reason string, err error) {
 	cfg, why, err := p.readConfig(ctx, c)
@@ -483,14 +518,16 @@ func (p *replicaWidenPass) widenClaimed(
 	if why, err := p.resourceHeld(ctx, c.vmid); err != nil || why != "" {
 		return false, why, err
 	}
+	var w *replicaWiden
 	err = p.withRecord(ctx, c.vmid, cfg, func(handle *aj.Handle) error {
 		if handle != nil && vmRecordTerminal(handle.Record().State) {
-			reason = "the VM's journal record ended while the pass waited for it"
+			reason = "the VM's journal record ended before the pass took it"
 			return nil
 		}
-		w := &replicaWiden{deps: p.deps, logger: logger, api: p.api, profile: profile, vmid: c.vmid, node: c.node,
-			handle: handle, now: p.now, guard: func(ctx context.Context, proof replicaWidenProof) error {
-				return p.guard(ctx, c, profile, proof)
+		w = &replicaWiden{deps: p.deps, logger: logger, api: p.api, profile: profile, vmid: c.vmid, node: c.node,
+			handle: handle, now: p.now,
+			guard: func(ctx context.Context, proof replicaWidenProof, write func(context.Context) error) error {
+				return p.guard(ctx, c, profile, proof, logger, write)
 			}}
 		var err error
 		widened, reason, err = w.check(ctx)
@@ -501,8 +538,15 @@ func (p *replicaWidenPass) widenClaimed(
 		return false, "another call holds the VM's journal record", nil
 	case errors.Is(err, errReplicaWidenRecordUnmatched):
 		return false, err.Error(), nil
+	case errors.Is(err, pve.ErrClusterLockHeld):
+		return false, "another call holds the HA rules lock", nil
 	case err != nil:
 		return false, "", err
+	}
+	if widened && (w == nil || !w.wrote) {
+		// The pin named the partner already, or another call widened it
+		// first, so this pass widened nothing.
+		return false, reason, nil
 	}
 	return widened, reason, nil
 }
@@ -554,53 +598,70 @@ func (p *replicaWidenPass) resourceHeld(ctx context.Context, vmid int) (string, 
 	return replicaWidenServiceHeld(states[sid]), nil
 }
 
-// guard is the re-read under the rules lock, right before the widened pin is
-// written. The rule writer checks the pin itself against the one the check
-// read. The guard checks the rest: the HA resource and the manager's state,
-// the VM's config on its node with its volumes, and the job the sync ran
-// under. Anything that differs from what the check verified is a skip.
+// guard runs under the rules lock and wraps the write of the widened pin. It
+// takes the pass's claim on the VM's VMID, trying once with the short lease
+// replicaWidenClaimTTL, then reads the VM's config on its node again and
+// writes the pin only while the config still lets the pin widen and its
+// volumes are the ones the sync was verified for. The rule writer checks the
+// pin itself against the one the check read.
+//
+// The guard reads only the config, because every other change the check's
+// reads could miss reaches the pin first, and the pin's compare-and-swap
+// under this lock refuses the write. The narrowing barrier writes its pin
+// under this lock before it changes the VM, and a barrier that has only asked
+// HA to ignore the VM writes its narrowed pin over the widened one, while HA
+// ignores the VM, before it changes anything. A replica rebuild narrows the
+// pin before it removes the job, and an attach records on the pin, before
+// it changes the VM, the latest time it could land as the pin's change time
+// (see attachReplicaLandBy), so no sync can count while it runs. A job an
+// operator disables or a move the HA manager starts after the check leaves
+// the verified sync on the partner as it was, so neither makes the widened
+// pin wrong.
 func (p *replicaWidenPass) guard(
-	ctx context.Context, c replicaWidenCandidate, profile *ha.Profile, proof replicaWidenProof,
+	ctx context.Context, c replicaWidenCandidate, profile *ha.Profile, proof replicaWidenProof, logger *log.Logger,
+	write func(context.Context) error,
 ) error {
-	if why, err := p.resourceHeld(ctx, c.vmid); err != nil || why != "" {
-		if err != nil {
-			return err
-		}
-		return &replicaWidenSkip{reason: why}
-	}
-	cfg, why, err := p.readConfig(ctx, c)
-	if err != nil {
-		return err
-	}
-	if why != "" {
-		return &replicaWidenSkip{reason: why}
-	}
-	volids, gaps := ha.ReplicaVolumes(c.vmid, haVolumesOfConfig(cfg, c.node, nil), profile.Storages)
-	if len(gaps) > 0 || !slices.Equal(normalizedVolIDs(volids), normalizedVolIDs(proof.volids)) {
-		return &replicaWidenSkip{reason: "the VM's volumes changed since the sync was verified"}
-	}
-	jobs, err := p.api.ListJobs(ctx)
-	if err != nil {
-		return fmt.Errorf("list the replication jobs: %w", err)
-	}
-	job, _, err := guestReplicaJobs(jobs, c.vmid, p.owner)
+	err := withVMIDClaim(ctx, p.deps, c.vmid, "replica-widen/"+strconv.Itoa(c.vmid), claimForReplicaWiden, logger,
+		func(ctx context.Context) error {
+			cfg, why, err := p.readConfig(ctx, c)
+			if err != nil {
+				return err
+			}
+			if why != "" {
+				return &replicaWidenSkip{reason: why}
+			}
+			volids, gaps := ha.ReplicaVolumes(c.vmid, haVolumesOfConfig(cfg, c.node, nil), profile.Storages)
+			if len(gaps) > 0 || !slices.Equal(normalizedVolIDs(volids), normalizedVolIDs(proof.volids)) {
+				return &replicaWidenSkip{reason: "the VM's volumes changed since the sync was verified"}
+			}
+			// A pass whose context ended, such as a pve-cid run an operator
+			// interrupted, writes nothing more and releases its locks.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return write(ctx)
+		})
 	switch {
-	case err != nil:
-		return err
-	case job == nil || job.ID != proof.jobID:
-		return &replicaWidenSkip{reason: "the VM's replication job changed since the sync was verified"}
-	case job.Disabled || job.RemoveJob != "":
-		return &replicaWidenSkip{reason: "the VM's replication job " + job.ID + " was disabled or marked for " +
-			"removal since the sync was verified"}
-	case replicaOtherNode(*job, c.node) != proof.target:
-		return &replicaWidenSkip{reason: "the VM's replication job " + job.ID + " no longer copies to node " +
-			proof.target}
+	case err == nil:
+		return nil
+	case isVMIDClaimHeld(err):
+		return &replicaWidenSkip{reason: "another call claims the VM, such as a create, a delete, a metadata " +
+			"write, or another pass"}
+	case errors.Is(err, errVMIDClaimNoPools):
+		return &replicaWidenClaimRefused{reason: err.Error(), halt: "the PVE client offers no pool service, so " +
+			"no VM can be claimed"}
+	case pve.IsClusterLockPermissionRefused(err):
+		return &replicaWidenClaimRefused{
+			reason: "PVE refused the VMID claim for lack of permission: " + err.Error(),
+			halt: "PVE refused the VMID claim for lack of permission, so no VM can be claimed; grant " +
+				"Pool.Allocate and Pool.Audit on /pool so the CPI can create bosh-lock-vm-<vmid>",
+		}
 	}
-	return nil
+	return err
 }
 
-// withRecord runs fn with the VM's journal record held, waiting a bounded
-// time for it.
+// withRecord runs fn with the VM's journal record held. It tries the record's
+// lock once, and a record another call holds returns errVMRecordBusy.
 func (p *replicaWidenPass) withRecord(
 	ctx context.Context, vmid int, cfg map[string]any, fn func(*aj.Handle) error,
 ) error {
@@ -608,7 +669,7 @@ func (p *replicaWidenPass) withRecord(
 		return p.record(ctx, vmid, cfg, fn)
 	}
 	pick := func(records []aj.Record) (*aj.Record, error) { return replicaWidenRecordFor(records, vmid, cfg) }
-	return withVMRecordWhere(ctx, p.deps, pick, replicaWidenRecordWait, fn)
+	return withVMRecordWhere(ctx, p.deps, pick, vmRecordTryOnce, fn)
 }
 
 // errReplicaWidenRecordUnmatched says the journal holds a live record for the
@@ -695,39 +756,65 @@ func (t *replicaWidenTrigger) take() (Deps, bool) {
 }
 
 // withReplicaWidenSweep wraps a CPI handler so that a request that took the
-// HA rules lock runs the replica widening sweep after its work, with the deps
-// of the first call that took the lock. The handler's result and error are
-// returned as they are, whatever the sweep does.
+// HA rules lock and succeeded runs the replica widening sweep after its work,
+// with the deps of the first call that took the lock. A request that failed
+// skips the sweep, so its error reaches the Director as soon as it can. The
+// handler's result and error are returned as they are, whatever the sweep
+// does, and a sweep that panics is logged and recovered.
 func withReplicaWidenSweep(h Handler) Handler {
 	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
 		trigger := &replicaWidenTrigger{}
 		out, err := h.Handle(context.WithValue(ctx, replicaWidenTriggerKey{}, trigger), args, reqCtx)
-		if deps, ok := trigger.take(); ok && ctx.Err() == nil {
-			sweepAwaitingReplicaPins(ctx, deps)
+		if deps, ok := trigger.take(); ok && err == nil && ctx.Err() == nil {
+			runReplicaWidenSweep(ctx, deps)
 		}
 		return out, err
 	})
+}
+
+// runReplicaWidenSweep runs the sweep and recovers a panic in it, which it
+// logs at Error with the stack. The sweep's locks are released by their
+// deferred releases as the panic unwinds.
+func runReplicaWidenSweep(ctx context.Context, deps Deps) {
+	defer func() {
+		if r := recover(); r != nil {
+			deps.Log(ctx).Error(replicaWidenOp+": the sweep panicked; the call's own result stands, and a later "+
+				"call that takes the HA rules lock sweeps again (non-fatal)",
+				log.String("panic", fmt.Sprint(r)), log.String("stack", string(debug.Stack())))
+		}
+	}()
+	sweepAwaitingReplicaPins(ctx, deps)
+}
+
+// replicaWidenSweepBudgetFor returns the sweep's budget under ctx: the
+// smaller of replicaWidenSweepBudget and half of what remains of the
+// request's deadline once replicaWidenReleaseReserve is set aside for the
+// releases after the sweep. ok is false when that leaves less than
+// replicaWidenSweepMinBudget, and the sweep does not run.
+func replicaWidenSweepBudgetFor(ctx context.Context) (budget time.Duration, ok bool) {
+	budget = replicaWidenSweepBudget
+	if dl, has := ctx.Deadline(); has {
+		budget = min(budget, (time.Until(dl)-replicaWidenReleaseReserve)/2)
+	}
+	return budget, budget >= replicaWidenSweepMinBudget
 }
 
 // sweepAwaitingReplicaPins is the widening pass a call that took the HA rules
 // lock runs after its work, so a replicate VM's pin names its partner soon
 // after the first verified sync, without waiting for a deploy to touch the VM.
 // It is best-effort: every failure is logged and never fails the call. It is
-// bounded by the sweep's caps and by the smaller of its budget and half of
-// what remains of the request's deadline.
+// bounded by the sweep's caps and by replicaWidenSweepBudgetFor, which keeps
+// the releases after the sweep inside the request's deadline.
 func sweepAwaitingReplicaPins(ctx context.Context, deps Deps) {
 	if deps.Config == nil || deps.Config.HAModeValue() == config.HAModeOff || deps.PVE == nil ||
 		strings.TrimSpace(deps.RequestDirectorUUID) == "" {
 		return
 	}
 	logger := deps.Log(ctx)
-	budget := replicaWidenSweepBudget
-	if dl, ok := ctx.Deadline(); ok {
-		if half := time.Until(dl) / 2; half < budget {
-			budget = half
-		}
-	}
-	if budget <= 0 {
+	budget, ok := replicaWidenSweepBudgetFor(ctx)
+	if !ok {
+		logger.Debug(replicaWidenOp + ": the request's deadline leaves too little time for a sweep and its " +
+			"releases; a later call sweeps")
 		return
 	}
 	sctx, cancel := context.WithTimeout(context.WithValue(ctx, replicaWidenTriggerKey{}, (*replicaWidenTrigger)(nil)),

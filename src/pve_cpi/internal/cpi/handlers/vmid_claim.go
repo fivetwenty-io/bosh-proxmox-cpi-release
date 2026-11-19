@@ -74,7 +74,35 @@ const (
 	// the sweep's only proof that a VM is abandoned, so without it the sweep
 	// destroys nothing.
 	claimForSweep
+	// claimForReplicaWiden tries once, never runs the work unclaimed, and
+	// refuses to run without a pool service. Its claim has the short lease
+	// replicaWidenClaimTTL instead of the disposal TTL, so a claim that a
+	// widening pass left behind when its process died lapses inside the
+	// vmidLockTimeout wait of a set_vm_metadata or a delete_vm that queues
+	// behind it.
+	claimForReplicaWiden
 )
+
+// The lease of a replica widening claim. The pass takes the claim last,
+// inside the HA rules lock, around a config read and the pin write, so the
+// work under it is a few PVE calls.
+const (
+	// replicaWidenClaimTTL is the claim's lease. A caller that waits
+	// vmidLockTimeout for the VMID lock gets it even when the pass died
+	// holding it: the claim's whole-second expiry falls at most this long
+	// after the pass created it, and the waiter's next poll, at most one
+	// second later, steals it inside clusterLockStealBudget. That is nine
+	// seconds at most, under the ten the waiter waits.
+	replicaWidenClaimTTL = 6 * time.Second
+	// replicaWidenClaimReserve is what the claim keeps after its work ends:
+	// the release margin of a lock without the grace, which is the steal
+	// budget and one round trip, and one more round trip for the release.
+	replicaWidenClaimReserve = 3 * time.Second
+)
+
+// errVMIDClaimNoPools says the PVE client offers no pool service, so a VMID
+// cannot be claimed.
+var errVMIDClaimNoPools = errors.New("the PVE client offers no pool service, so the VMID cannot be claimed")
 
 type vmidClaimSetKey struct{}
 
@@ -130,7 +158,9 @@ func heldVMIDClaimWindow(ctx context.Context, vmid int) (time.Time, bool) {
 }
 
 // acquire claims vmid for this request with ttl. With wait false the acquire
-// tries once, and with wait true it waits up to vmidLockTimeout. A holder that
+// tries once, and with wait true it waits up to vmidLockTimeout. reserve is
+// the part of the claim the work under it leaves for the release, so the
+// claim's window ends reserve before its expiry. A holder that
 // stays live returns a vmidClaimHeldError, and after a wait that error names
 // the holder. A VMID the set still holds, because an earlier release of it
 // failed, returns a vmidClaimHeldError too, so a create moves to a fresh VMID.
@@ -141,6 +171,7 @@ func heldVMIDClaimWindow(ctx context.Context, vmid int) (time.Time, bool) {
 // never races the work.
 func (s *vmidClaimSet) acquire(
 	ctx context.Context, pools pve.PoolService, vmid int, owner string, ttl time.Duration, wait bool,
+	reserve time.Duration,
 ) error {
 	if pools == nil {
 		return nil
@@ -167,7 +198,7 @@ func (s *vmidClaimSet) acquire(
 		}
 		return err
 	}
-	entry := &vmidClaimEntry{handle: handle, windowEnd: handle.WindowDeadline(vmidLockTTLMargin)}
+	entry := &vmidClaimEntry{handle: handle, windowEnd: handle.WindowDeadline(reserve)}
 	s.mu.Lock()
 	s.held[vmid] = entry
 	s.mu.Unlock()
@@ -357,8 +388,11 @@ func runInVMIDClaimWindow(ctx context.Context, vmid int, windowEnd time.Time, fn
 // released when fn returns. A holder that stays live returns an error that
 // carries errVMIDClaimHeld. Under claimForDisposal, a claim PVE refuses for
 // lack of permission runs fn unclaimed on ctx (see proceedUnclaimedAfter).
-// Under claimForSweep that refusal is returned, and fn does not run. A nil
-// pool service runs fn without a claim (see vmidClaimSet.acquire).
+// Under claimForSweep and claimForReplicaWiden that refusal is returned, and
+// fn does not run. A nil pool service runs fn without a claim (see
+// vmidClaimSet.acquire), except under claimForReplicaWiden, which returns
+// errVMIDClaimNoPools and does not run fn. Under claimForReplicaWiden the
+// claim has the lease replicaWidenClaimTTL.
 func withVMIDClaim(
 	ctx context.Context, deps Deps, vmid int, owner string, mode vmidClaimMode, logger *log.Logger,
 	fn func(context.Context) error,
@@ -367,10 +401,17 @@ func withVMIDClaim(
 		return runInVMIDClaimWindow(ctx, vmid, windowEnd, fn)
 	}
 	if deps.PVE == nil || deps.PVE.Pools() == nil {
+		if mode == claimForReplicaWiden {
+			return errVMIDClaimNoPools
+		}
 		return fn(ctx)
 	}
+	ttl, reserve := disposalClaimTTL(ctx), vmidLockTTLMargin
+	if mode == claimForReplicaWiden {
+		ttl, reserve = replicaWidenClaimTTL, replicaWidenClaimReserve
+	}
 	ctx, set := withVMIDClaimSet(ctx)
-	if err := set.acquire(ctx, deps.PVE.Pools(), vmid, owner, disposalClaimTTL(ctx), mode != claimForSweep); err != nil {
+	if err := set.acquire(ctx, deps.PVE.Pools(), vmid, owner, ttl, mode == claimForDisposal, reserve); err != nil {
 		if mode == claimForDisposal && set.proceedUnclaimedAfter(err, vmid, logger) {
 			return fn(ctx)
 		}
@@ -392,7 +433,8 @@ func claimCreateCandidate(ctx context.Context, deps Deps, candidate int, logger 
 		return nil
 	}
 	owner := fmt.Sprintf("create_vm/%d", candidate)
-	err := set.acquire(ctx, deps.PVE.Pools(), candidate, owner, createClaimTTL(ctx, createVMIDClaimBudget(deps)), false)
+	err := set.acquire(ctx, deps.PVE.Pools(), candidate, owner, createClaimTTL(ctx, createVMIDClaimBudget(deps)), false,
+		vmidLockTTLMargin)
 	if err != nil && set.proceedUnclaimedAfter(err, candidate, logger) {
 		return nil
 	}

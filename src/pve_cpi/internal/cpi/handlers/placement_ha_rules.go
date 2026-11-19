@@ -69,7 +69,8 @@ func placeableNodeCount(p *ha.Profile) int {
 
 // withHARulesLock runs fn under the cluster-scoped rules lock when the cluster
 // lock is enabled. A lock that cannot be taken is returned as the retriable
-// error acquireAntiAffinityLock builds, and fn does not run. fn gets a context
+// error acquireAntiAffinityLock builds, and fn does not run. Under a context
+// from withHARulesLockTryOnce the lock is tried once (see pve.WithoutWait). fn gets a context
 // that carries the hold, and the rule writers built from it wait through the
 // hold (see rulesLockHold), so fn must use that context for its writes. A
 // request whose fn runs here sweeps the replicate VMs whose pins still name
@@ -81,7 +82,11 @@ func withHARulesLock(
 		noteHARulesLock(ctx, deps)
 		return fn(ctx)
 	}
-	handle, err := acquireAntiAffinityLock(ctx, deps, haRulesLockKey, vmid)
+	var opts []pve.ClusterLockOption
+	if haRulesLockTriesOnce(ctx) {
+		opts = append(opts, pve.WithoutWait())
+	}
+	handle, err := acquireAntiAffinityLock(ctx, deps, haRulesLockKey, vmid, opts...)
 	if err != nil {
 		return err
 	}
@@ -89,6 +94,25 @@ func withHARulesLock(
 	hold := &rulesLockHold{deps: deps, vmid: vmid, logger: logger, handle: handle, heldWait: rulesLockHeldWaitBudget}
 	defer hold.release(ctx)
 	return fn(context.WithValue(ctx, rulesLockHoldKey{}, hold))
+}
+
+// haRulesLockTryOnceKey is the context key that makes withHARulesLock try the
+// rules lock once.
+type haRulesLockTryOnceKey struct{}
+
+// withHARulesLockTryOnce returns ctx with which withHARulesLock tries the rules
+// lock once and, while another process holds it, returns at once with an
+// error that matches pve.ErrClusterLockHeld instead of waiting. The replica
+// widening pass uses it, because it would rather skip a VM than make the
+// calls that queue on the lock wait longer.
+func withHARulesLockTryOnce(ctx context.Context) context.Context {
+	return context.WithValue(ctx, haRulesLockTryOnceKey{}, true)
+}
+
+// haRulesLockTriesOnce reports whether ctx came from withHARulesLockTryOnce.
+func haRulesLockTriesOnce(ctx context.Context) bool {
+	once, _ := ctx.Value(haRulesLockTryOnceKey{}).(bool)
+	return once
 }
 
 // rulesLockHeldWaitBudget bounds the time one hold of the rules lock spends in

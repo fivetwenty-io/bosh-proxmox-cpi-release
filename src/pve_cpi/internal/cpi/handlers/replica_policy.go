@@ -135,25 +135,26 @@ func widenedReplicaPin(pin *ha.Rule, partner string) *ha.Rule {
 func writeReplicaPin(
 	ctx context.Context, deps Deps, profile *ha.Profile, logger *log.Logger, vmid int, expect, pin *ha.Rule,
 ) error {
-	return writeReplicaPinGuarded(ctx, deps, profile, logger, vmid, expect, pin, nil)
+	_, err := writeReplicaPinGuarded(ctx, deps, profile, logger, vmid, expect, pin, nil)
+	return err
 }
 
 // writeReplicaPinGuarded is writeReplicaPin with a guard that runs under the
-// rules lock, right before the write. A guard that returns an error leaves
-// the pin as it is, and the error is returned as it stands. A nil guard
-// checks nothing.
+// rules lock and wraps the write. The guard gets the write and must either
+// call it, which writes the pin, or return an error and leave the pin as it
+// is, and that error is returned as it stands. A guard that returns nil
+// without calling the write is an error too. A nil guard writes at once.
+// wrote reports whether this call changed the pin in PVE, which is false when
+// the pin was written already.
 func writeReplicaPinGuarded(
 	ctx context.Context, deps Deps, profile *ha.Profile, logger *log.Logger, vmid int, expect, pin *ha.Rule,
-	guard func(context.Context) error,
-) error {
+	guard func(ctx context.Context, write func(context.Context) error) error,
+) (wrote bool, err error) {
 	owner := deps.RequestDirectorUUID
 	var res *ha.ApplyResult
-	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
-		if guard != nil {
-			if err := guard(ctx); err != nil {
-				return err
-			}
-		}
+	called := false
+	write := func(ctx context.Context) error {
+		called = true
 		writer := newHARuleWriterFor(deps, profile, logger, nil)
 		var err error
 		res, err = writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
@@ -175,17 +176,30 @@ func writeReplicaPinGuarded(
 			return []ha.RuleOp{{Kind: ha.OpUpdate, Rule: *pin}}, nil
 		})
 		return err
+	}
+	err = withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
+		if guard == nil {
+			return write(ctx)
+		}
+		if err := guard(ctx, write); err != nil {
+			return err
+		}
+		if !called {
+			return fmt.Errorf("node-affinity: the guard of the pin write of VM %d returned without writing", vmid)
+		}
+		return nil
 	})
 	healAfterRepair(ctx, deps, res, logger)
 	if err != nil {
-		return err
+		return false, err
 	}
+	wrote = res != nil && len(res.Wrote) > 0
 	stager := &ha.Stager{
 		ReadRules: func(ctx context.Context) (*ha.RuleSet, error) { return readHARuleSet(ctx, deps.PVE.Cluster()) },
 		Managed:   deps.Config.HAModeValue() == config.HAModeManaged,
 		Logger:    logger,
 	}
-	return stager.Verify(ctx, &ha.VMDecision{VMID: vmid, SID: haResourceSid(vmid)}, pin, "")
+	return wrote, stager.Verify(ctx, &ha.VMDecision{VMID: vmid, SID: haResourceSid(vmid)}, pin, "")
 }
 
 // readOwnedReplicaPin reads the VM's pin and returns it when it carries this
@@ -256,12 +270,17 @@ type replicaWiden struct {
 	// must carry the evidence before the pin names the partner.
 	handle *aj.Handle
 	now    func() time.Time
-	// guard runs under the rules lock right before the widened pin is
-	// written, with what the check verified. An error leaves the pin as it
-	// is: a *replicaWidenSkip says why the VM's state no longer lets the pin
-	// widen, and any other error is a read that failed. A nil guard checks
-	// nothing, which is the touch path's check.
-	guard func(ctx context.Context, proof replicaWidenProof) error
+	// guard runs under the rules lock and wraps the write of the widened
+	// pin, with what the check verified. It calls write to widen the pin, or
+	// returns an error and leaves the pin as it is: a *replicaWidenSkip says
+	// why the VM's state no longer lets the pin widen, and any other error is
+	// a read that failed. A nil guard writes at once, which is the touch
+	// path's check.
+	guard func(ctx context.Context, proof replicaWidenProof, write func(context.Context) error) error
+	// wrote is set by check when its write widened the pin in PVE. A pin that
+	// named the partner already, or that another call widened first, leaves
+	// it false.
+	wrote bool
 }
 
 // replicaWidenProof is what a check of a replica verified before it widens
@@ -310,6 +329,13 @@ func (w *replicaWiden) check(ctx context.Context) (widened bool, reason string, 
 	case pin == nil:
 		logger.Info(replicaOp + ": the VM has no pin of this Director in the replicate shape; nothing to widen")
 		return false, "the VM has no pin of this Director in the replicate shape", nil
+	}
+	if _, rebuilding := ha.ReplicaRebuild(pin.Comment); rebuilding {
+		logger.Info(replicaOp + ": the VM's pin carries the replica rebuild token, so its replica is being " +
+			"rebuilt; the pin keeps the source alone")
+		return false, "the pin carries the replica rebuild token, so the VM's replica is being rebuilt", nil
+	}
+	switch {
 	case partner != "":
 		return true, "the pin names the partner " + partner + " already", nil
 	case source != w.node:
@@ -358,15 +384,18 @@ func (w *replicaWiden) check(ctx context.Context) (widened bool, reason string, 
 		held.log(logger, "the pin keeps the source alone")
 		return false, held.reason, nil
 	}
-	var guard func(context.Context) error
+	var guard func(context.Context, func(context.Context) error) error
 	if w.guard != nil {
 		proof := replicaWidenProof{jobID: job.ID, target: target, volids: synced.volids}
-		guard = func(ctx context.Context) error { return w.guard(ctx, proof) }
+		guard = func(ctx context.Context, write func(context.Context) error) error {
+			return w.guard(ctx, proof, write)
+		}
 	}
 	if err := w.failbackOffBeforePartner(ctx); err != nil {
 		return false, "", err
 	}
-	err = writeReplicaPinGuarded(ctx, w.deps, w.profile, logger, w.vmid, pin, widenedReplicaPin(pin, target), guard)
+	w.wrote, err = writeReplicaPinGuarded(ctx, w.deps, w.profile, logger, w.vmid, pin, widenedReplicaPin(pin, target),
+		guard)
 	if skip := (*replicaWidenSkip)(nil); errors.As(err, &skip) {
 		logger.Info(replicaOp+": the VM's state changed since its replica was checked; the pin keeps the source "+
 			"alone", log.String("reason", skip.reason))
@@ -374,6 +403,9 @@ func (w *replicaWiden) check(ctx context.Context) (widened bool, reason string, 
 	}
 	if err != nil {
 		return false, "", err
+	}
+	if !w.wrote {
+		return true, "another call widened the pin to the partner " + target + " first", nil
 	}
 	logger.Info(replicaOp+": a verified sync covers the VM's volumes; the pin names the partner now",
 		log.String("job", job.ID), log.String("partner", target),
@@ -1763,11 +1795,17 @@ func withVMReplicaRecord(ctx context.Context, deps Deps, vmCID string, fn func(*
 // than the caller would wait.
 var errVMRecordBusy = errors.New("another call holds the VM's journal record")
 
+// vmRecordTryOnce is the wait that tells withVMRecordWhere to try the record's
+// lock once and return errVMRecordBusy at once when another call holds it.
+const vmRecordTryOnce time.Duration = -1
+
 // withVMRecordWhere runs fn with the journal record pick selects when the
 // journal is configured and the record is live, and with nil otherwise. The
 // record is acquired for fn and released after it. A positive wait bounds the
 // wait for the record's lock, and a lock held past it returns an error that
-// matches errVMRecordBusy, and fn does not run.
+// matches errVMRecordBusy, and fn does not run. A wait of vmRecordTryOnce
+// tries the lock once and returns errVMRecordBusy at once when it is held, and
+// a wait of zero waits for as long as ctx allows.
 func withVMRecordWhere(
 	ctx context.Context, deps Deps, pick func([]aj.Record) (*aj.Record, error), wait time.Duration,
 	fn func(*aj.Handle) error,
@@ -1795,6 +1833,17 @@ func withVMRecordWhere(
 	}
 	if selected == nil || vmRecordTerminal(selected.State) {
 		return fn(nil)
+	}
+	if wait == vmRecordTryOnce {
+		handle, ok, err := journal.TryAcquire(ctx, selected.ID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errVMRecordBusy
+		}
+		defer func() { retErr = errors.Join(retErr, handle.Close()) }()
+		return fn(handle)
 	}
 	actx, cancel := ctx, context.CancelFunc(func() {})
 	if wait > 0 {

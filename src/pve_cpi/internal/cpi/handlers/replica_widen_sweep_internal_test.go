@@ -28,6 +28,8 @@ type sweepCluster struct {
 	rows      []map[string]any
 	listErr   error
 	listCalls int
+	// listPanic, when non-nil, is the value the guest listing panics with.
+	listPanic any
 	// services is the HA manager's state of each service.
 	services map[string]string
 	// onResource runs before each HA resource read, with the call's number.
@@ -39,6 +41,9 @@ func (s *sweepCluster) ListResources(context.Context, *cluster.ListResourcesPara
 	error,
 ) {
 	s.listCalls++
+	if s.listPanic != nil {
+		panic(s.listPanic)
+	}
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
@@ -105,6 +110,10 @@ type sweepRig struct {
 	pools   *exclusiveLockPools
 	hooked  *statusHookReplica
 	changed time.Time
+	// onClaimed runs once, before the first config read made while the pass
+	// claims VM 100, which is the guard's read under the rules lock and the
+	// claim.
+	onClaimed func()
 }
 
 func newSweepRig(t *testing.T) *sweepRig {
@@ -124,6 +133,14 @@ func newSweepRig(t *testing.T) *sweepRig {
 	r.deps.PVE = &sweepPoolsClient{attachRunClient: run, pools: s.pools}
 	s.hooked = &statusHookReplica{fakeReplica: r.repl}
 	r.deps.Replication = s.hooked
+	read := run.qemu.configFn
+	run.qemu.configFn = func(call int) (map[string]any, error) {
+		if hook := s.onClaimed; hook != nil && s.pools.held(100) {
+			s.onClaimed = nil
+			hook()
+		}
+		return read(call)
+	}
 	return s
 }
 
@@ -365,22 +382,29 @@ func TestReplicaWidenPass_SkipsAVMTheBarrierHolds(t *testing.T) {
 }
 
 // A narrowing that starts after the check verified the sync and before the
-// widened pin is written must win: the guard under the rules lock reads the
-// barrier's ignored request, and the pin keeps the source alone.
+// widened pin is written must win. The barrier writes its narrowed pin under
+// the rules lock before it changes the VM, so the pin the check read is gone
+// and the write's compare-and-swap refuses. The pass reads the HA resource
+// once, before it takes any lock.
 func TestReplicaWidenPass_RacingNarrowingBarrierWins(t *testing.T) {
 	s := newSweepRig(t)
-	s.cluster.onResource = func(call int) {
+	narrowed := time.Now().Truncate(time.Second)
+	s.hooked.onStatus = func(call int) {
 		if call == 2 {
 			s.stub.state = "ignored"
 			s.stub.comment = haIdentity{Owner: aaDirector}.marker() + " bosh-narrow-from=started"
+			s.setPin("pve01", func(c string) string { return ha.WithReplicaChanged(c, narrowed) })
 		}
 	}
 	res := onlyResult(t, s.run(t, ReplicaWidenOptions{}))
-	if res.Outcome != ReplicaWidenSkipped || !strings.Contains(res.Reason, "narrowing barrier") || s.widened() {
+	if res.Outcome == ReplicaWidened || !strings.Contains(res.Reason, "changed since it was read") || s.widened() {
 		t.Fatalf("result %+v, pin %q %q; want the barrier's narrowing kept", res, s.pinNodes(), s.pinComment())
 	}
-	if s.cluster.resourceCalls != 2 {
-		t.Fatalf("HA resource reads %d, want the claim's read and the guard's", s.cluster.resourceCalls)
+	if got, ok := ha.ReplicaChanged(s.pinComment()); !ok || !got.Equal(narrowed) {
+		t.Fatalf("pin comment %q lost the barrier's pin", s.pinComment())
+	}
+	if s.cluster.resourceCalls != 1 {
+		t.Fatalf("HA resource reads %d, want the one before the locks", s.cluster.resourceCalls)
 	}
 }
 
@@ -405,21 +429,21 @@ func TestReplicaWidenPass_RacingPinNarrowingKeepsTheNarrowedPin(t *testing.T) {
 }
 
 // A change to the VM's volumes between the check and the write, such as an
-// attach the barrier ran to the end, is caught by the guard.
+// attach the barrier ran to the end, is caught by the guard's config read
+// under the rules lock and the claim.
 func TestReplicaWidenPass_RacingVolumeChangeSkips(t *testing.T) {
 	s := newSweepRig(t)
-	s.cluster.onResource = func(call int) {
-		if call == 2 {
-			s.cfg["scsi1"] = "local-zfs:vm-100-disk-1,size=5G"
-		}
-	}
+	s.onClaimed = func() { s.cfg["scsi1"] = "local-zfs:vm-100-disk-1,size=5G" }
 	res := onlyResult(t, s.run(t, ReplicaWidenOptions{}))
 	if res.Outcome != ReplicaWidenSkipped || !strings.Contains(res.Reason, "volumes changed") || s.widened() {
 		t.Fatalf("result %+v, pin %q", res, s.pinNodes())
 	}
 }
 
-func TestReplicaWidenPass_RacingJobChangeSkips(t *testing.T) {
+// A job change before the check reads the jobs holds the pin on the source.
+// One after the check verified the sync leaves the verified copy on the
+// partner as it was, so the pin still widens, and the guard reads no job.
+func TestReplicaWidenPass_RacingJobChange(t *testing.T) {
 	cases := map[string]func(s *sweepRig){
 		"disabled":            func(s *sweepRig) { s.repl.jobs[0].Disabled = true },
 		"marked for removal":  func(s *sweepRig) { s.repl.jobs[0].RemoveJob = "full" },
@@ -427,16 +451,28 @@ func TestReplicaWidenPass_RacingJobChangeSkips(t *testing.T) {
 		"replaced by another": func(s *sweepRig) { s.repl.jobs[0].ID = "100-1"; s.repl.jobs[0].JobNum = 1 },
 	}
 	for name, change := range cases {
-		t.Run(name, func(t *testing.T) {
-			s := newSweepRig(t)
-			s.cluster.onResource = func(call int) {
-				if call == 2 {
-					change(s)
+		if name == "disabled" || name == "marked for removal" {
+			t.Run(name+" before the check", func(t *testing.T) {
+				s := newSweepRig(t)
+				s.cluster.onResource = func(int) { change(s) }
+				res := onlyResult(t, s.run(t, ReplicaWidenOptions{}))
+				if res.Outcome != ReplicaWidenSkipped || !strings.Contains(res.Reason, "replication job") ||
+					s.widened() {
+					t.Fatalf("result %+v, pin %q", res, s.pinNodes())
 				}
-			}
+			})
+		}
+		t.Run(name+" after the sync was verified", func(t *testing.T) {
+			s := newSweepRig(t)
+			s.onClaimed = func() { change(s) }
 			res := onlyResult(t, s.run(t, ReplicaWidenOptions{}))
-			if res.Outcome != ReplicaWidenSkipped || !strings.Contains(res.Reason, "replication job") || s.widened() {
-				t.Fatalf("result %+v, pin %q", res, s.pinNodes())
+			listed := s.repl.listCalls
+			if res.Outcome != ReplicaWidened || !s.widened() {
+				t.Fatalf("result %+v, pin %q; the copy the sync verified is still on the partner", res,
+					s.pinNodes())
+			}
+			if listed != 2 {
+				t.Fatalf("job listings %d, want the candidates' and the check's, and none under the lock", listed)
 			}
 		})
 	}
@@ -451,8 +487,8 @@ func TestReplicaWidenPass_RacingDeleteHoldsTheClaim(t *testing.T) {
 		s.widened() {
 		t.Fatalf("result %+v, pin %q", res, s.pinNodes())
 	}
-	if s.cluster.resourceCalls != 0 {
-		t.Fatal("the pass read the VM's HA resource without its claim")
+	if s.stub.updateCalls != 0 || s.stub.createCalls != 0 {
+		t.Fatal("the pass wrote a rule while another call claimed the VM")
 	}
 	if comment, _ := s.pools.comment(100); !strings.Contains(comment, "delete_vm/100") {
 		t.Fatalf("the delete's claim changed: %q", comment)
@@ -477,19 +513,31 @@ func TestReplicaWidenPass_RacingDeleteRecreatesNothing(t *testing.T) {
 			t.Fatalf("the pass wrote the deleted VM's pin back (creates %d)", s.stub.createCalls)
 		}
 	})
-	t.Run("HA resource removed before the write", func(t *testing.T) {
+	t.Run("HA resource removed before the check", func(t *testing.T) {
 		s := newSweepRig(t)
-		s.cluster.onResource = func(call int) {
-			if call == 2 {
-				s.stub.missing = true
-			}
-		}
+		s.stub.missing = true
 		res := onlyResult(t, s.run(t, ReplicaWidenOptions{}))
 		if res.Outcome != ReplicaWidenSkipped || !strings.Contains(res.Reason, "no HA resource") || s.widened() {
 			t.Fatalf("result %+v, pin %q", res, s.pinNodes())
 		}
 		if s.stub.createCalls != 0 || s.stub.updateCalls != 0 {
 			t.Fatal("the pass wrote a rule for a VM whose HA resource is gone")
+		}
+	})
+	t.Run("VM and pin removed under the claim", func(t *testing.T) {
+		// A delete removes the HA resource and then the pin. Once the pin
+		// is gone, the write refuses, and the pass recreates nothing.
+		s := newSweepRig(t)
+		s.onClaimed = func() {
+			s.stub.missing = true
+			delete(s.stub.rules, "bosh-na-100")
+		}
+		res := onlyResult(t, s.run(t, ReplicaWidenOptions{}))
+		if res.Outcome == ReplicaWidened {
+			t.Fatalf("result %+v", res)
+		}
+		if _, ok := s.stub.rules["bosh-na-100"]; ok || s.stub.createCalls != 0 {
+			t.Fatalf("the pass wrote the deleted VM's pin back (creates %d)", s.stub.createCalls)
 		}
 	})
 }
@@ -566,8 +614,8 @@ func TestReplicaWidenPass_CapsBoundTheWork(t *testing.T) {
 		s := newSweepRig(t)
 		s.addPinnedVMs(101, 102, 103)
 		report := s.run(t, ReplicaWidenOptions{MaxAttempts: 2})
-		if len(report.Results) != 2 || report.Deferred != 2 || s.pools.creates != 2 {
-			t.Fatalf("results %+v, deferred %d, claims %d; want two claimed and two deferred", report.Results,
+		if len(report.Results) != 2 || report.Deferred != 2 || s.pools.creates > 2 {
+			t.Fatalf("results %+v, deferred %d, claims %d; want two checked and two deferred", report.Results,
 				report.Deferred, s.pools.creates)
 		}
 	})
@@ -652,11 +700,10 @@ func TestReplicaWidenRecordFor(t *testing.T) {
 	}
 }
 
-// The wrapper runs the sweep after a request that took the HA rules lock, and
-// returns the handler's answer as it stands whatever the sweep does.
+// The wrapper runs the sweep after a request that took the HA rules lock and
+// succeeded, and returns the handler's answer as it stands.
 func TestWithReplicaWidenSweep_RunsAfterACallThatTookTheLock(t *testing.T) {
 	s := newSweepRig(t)
-	wantErr := errors.New("the call's own failure")
 	h := withReplicaWidenSweep(handlerFunc(func(ctx context.Context) (any, error) {
 		if err := withHARulesLock(ctx, s.deps, 100, s.deps.Logger, func(context.Context) error { return nil }); err != nil {
 			t.Fatal(err)
@@ -664,14 +711,34 @@ func TestWithReplicaWidenSweep_RunsAfterACallThatTookTheLock(t *testing.T) {
 		if s.cluster.listCalls != 0 {
 			t.Fatal("the sweep ran inside the call")
 		}
+		return "answer", nil
+	}))
+	out, err := h.Handle(crhCtx(), nil, jsonrpc.Context{})
+	if out != "answer" || err != nil {
+		t.Fatalf("handler answer %v %v changed", out, err)
+	}
+	if !s.widened() {
+		t.Fatalf("pin %q; want the sweep to widen it after the call", s.pinNodes())
+	}
+}
+
+// A call that took the lock and failed returns its error at once, with no
+// sweep after it.
+func TestWithReplicaWidenSweep_SkipsACallThatFailed(t *testing.T) {
+	s := newSweepRig(t)
+	wantErr := errors.New("the call's own failure")
+	h := withReplicaWidenSweep(handlerFunc(func(ctx context.Context) (any, error) {
+		if err := withHARulesLock(ctx, s.deps, 100, s.deps.Logger, func(context.Context) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
 		return "answer", wantErr
 	}))
 	out, err := h.Handle(crhCtx(), nil, jsonrpc.Context{})
 	if out != "answer" || !errors.Is(err, wantErr) {
 		t.Fatalf("handler answer %v %v changed", out, err)
 	}
-	if !s.widened() {
-		t.Fatalf("pin %q; want the sweep to widen it after the call", s.pinNodes())
+	if s.cluster.listCalls != 0 || s.widened() {
+		t.Fatal("the sweep ran after a call that failed")
 	}
 }
 

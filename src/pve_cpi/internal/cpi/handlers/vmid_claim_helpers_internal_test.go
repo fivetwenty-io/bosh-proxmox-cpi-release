@@ -34,7 +34,7 @@ func vmidClaimContextWithWindow(ctx context.Context, vmid int, windowEnd time.Ti
 // already exists, the way PVE does, so two claims on one VMID exclude each
 // other the way they do against a cluster. createErr, when set, answers every
 // create, and deleteErrs answers the next deletes in order before they go
-// through.
+// through. onCreate, when set, runs before each create with the pool's ID.
 type exclusiveLockPools struct {
 	mu         sync.Mutex
 	pools      map[string]string
@@ -42,6 +42,7 @@ type exclusiveLockPools struct {
 	deletes    int
 	createErr  error
 	deleteErrs []error
+	onCreate   func(poolID string)
 }
 
 func newExclusiveLockPools() *exclusiveLockPools {
@@ -55,6 +56,9 @@ func (p *exclusiveLockPools) PoolHasVM(context.Context, string, int64) (bool, er
 }
 
 func (p *exclusiveLockPools) CreatePool(_ context.Context, poolID, comment string) error {
+	if p.onCreate != nil {
+		p.onCreate(poolID)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.creates++

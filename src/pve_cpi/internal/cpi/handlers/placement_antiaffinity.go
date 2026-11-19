@@ -191,8 +191,10 @@ func releaseAntiAffinityLock(ctx context.Context, handle *pve.ClusterLockHandle,
 // the lock plumbing (owner token, timeout/TTL from config) stays out of the RMW
 // body. key is haRulesLockKey, the one lock every CPI rule write holds, or the
 // bare group name, which is the key an older CPI locks its bosh-aa-<group>
-// rule under.
-func acquireAntiAffinityLock(ctx context.Context, deps Deps, key string, vmid int) (*pve.ClusterLockHandle, error) {
+// rule under. opts are added to the lock's own options.
+func acquireAntiAffinityLock(
+	ctx context.Context, deps Deps, key string, vmid int, opts ...pve.ClusterLockOption,
+) (*pve.ClusterLockHandle, error) {
 	poolSvc := deps.PVE.Pools()
 	if poolSvc == nil {
 		// No pool service wired: cannot lock. Treat as retriable so the operator
@@ -213,7 +215,8 @@ func acquireAntiAffinityLock(ctx context.Context, deps Deps, key string, vmid in
 	owner := clusterLockOwner(key, vmid)
 	// Two holders at once would place two instances of a group on one node,
 	// so this lock pays the grace pause on every create to narrow that.
-	return pve.AcquireClusterLock(ctx, poolSvc, antiAffinityLockPrefix+key, owner, ttl, timeout, pve.WithCreateGrace())
+	opts = append([]pve.ClusterLockOption{pve.WithCreateGrace()}, opts...)
+	return pve.AcquireClusterLock(ctx, poolSvc, antiAffinityLockPrefix+key, owner, ttl, timeout, opts...)
 }
 
 // ensureAntiAffinityMembershipLocked is the read-modify-write body, run under
