@@ -282,7 +282,14 @@ func (p *replicaWidenPass) awaitingPins(
 			continue
 		}
 		changedAt, stamped := ha.ReplicaChanged(pin.Comment)
-		if stamped && !now.After(ha.ReplicaSyncEarliest(changedAt)) {
+		switch {
+		case stamped && changedAt.After(now):
+			// An attach that still runs stamps the latest time it can land,
+			// which lies ahead of now.
+			skip("an attach is changing the VM's volumes and may land as late as " +
+				changedAt.UTC().Format(time.RFC3339) + ", so no sync can count until five minutes after that")
+			continue
+		case stamped && !now.After(ha.ReplicaSyncEarliest(changedAt)):
 			skip("the VM's volumes changed at " + changedAt.UTC().Format(time.RFC3339) + ", less than five " +
 				"minutes ago, so no sync can count yet")
 			continue

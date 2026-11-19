@@ -272,6 +272,20 @@ func TestReplicaWidenPass_RecentChangeWaitsWithoutAStatusRead(t *testing.T) {
 	}
 }
 
+// A land-by stamp in the future, which an attach that still runs writes,
+// reads as an attach that may land as late as that time, and never as a
+// change less than five minutes ago.
+func TestReplicaWidenPass_AFutureStampNamesTheAttach(t *testing.T) {
+	s := newSweepRig(t)
+	landBy := time.Now().Add(10 * time.Minute).Truncate(time.Second)
+	s.setPin("pve01", func(c string) string { return ha.WithReplicaChanged(c, landBy) })
+	res := onlyResult(t, s.run(t, ReplicaWidenOptions{}))
+	if res.Outcome != ReplicaWidenSkipped || strings.Contains(res.Reason, "ago") ||
+		!strings.Contains(res.Reason, "an attach") || !strings.Contains(res.Reason, landBy.UTC().Format(time.RFC3339)) {
+		t.Fatalf("result %+v; want the skip to say an attach may land as late as %v", res, landBy)
+	}
+}
+
 func TestReplicaWidenPass_OwnershipFilter(t *testing.T) {
 	const other = "11111111-2222-3333-4444-555555555555"
 	cases := map[string]struct {
