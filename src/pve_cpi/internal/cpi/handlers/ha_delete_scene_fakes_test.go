@@ -16,6 +16,7 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
@@ -79,6 +80,9 @@ type HADeleteScene struct {
 	// Comments are the HA resources' comments by SID; a resource without one
 	// has none.
 	Comments map[string]string
+	// Rebalance holds the HA resources' auto-rebalance flags by SID. A
+	// resource without one leaves the flag unset, which PVE reads as on.
+	Rebalance map[string]bool
 	// Power is each VM's power state on its node; a missing VM is running.
 	Power map[int]string
 	// Uptime is each running VM's uptime in seconds, as status/current
@@ -157,6 +161,14 @@ type HADeleteScene struct {
 
 // NewHADeleteScene returns a three-member scene entered through pve-node1 in
 // which nothing is HA-managed yet.
+// setRebalance records a written auto-rebalance flag. The caller holds mu.
+func (s *HADeleteScene) setRebalance(sid string, on bool) {
+	if s.Rebalance == nil {
+		s.Rebalance = map[string]bool{}
+	}
+	s.Rebalance[sid] = on
+}
+
 func NewHADeleteScene() *HADeleteScene {
 	return &HADeleteScene{
 		Now:          time.Now().Unix(),
@@ -169,6 +181,7 @@ func NewHADeleteScene() *HADeleteScene {
 		Requested:    map[string]string{},
 		StateWire:    map[string]string{},
 		Comments:     map[string]string{},
+		Rebalance:    map[string]bool{},
 		Power:        map[int]string{},
 		Uptime:       map[int]int64{},
 		BrokenClocks: map[string]bool{},
@@ -560,6 +573,10 @@ func (c *HASceneCluster) GetHaResources(_ context.Context, sid string) (*cluster
 	if comment, ok := c.Scene.Comments[sid]; ok {
 		resp.Comment = &comment
 	}
+	if on, ok := c.Scene.Rebalance[sid]; ok {
+		flag := sdkclient.PVEBool(on)
+		resp.AutoRebalance = &flag
+	}
 	return resp, nil
 }
 
@@ -582,6 +599,9 @@ func (c *HASceneCluster) UpdateHaResources(_ context.Context, sid string, params
 			c.Scene.Comments = map[string]string{}
 		}
 		c.Scene.Comments[sid] = *params.Comment
+	}
+	if params != nil && params.AutoRebalance != nil {
+		c.Scene.setRebalance(sid, *params.AutoRebalance)
 	}
 	vmid, _ := strconv.Atoi(strings.TrimPrefix(sid, "vm:"))
 	switch state {
@@ -618,6 +638,7 @@ func (c *HASceneCluster) DeleteHaResources(_ context.Context, sid string, _ *clu
 	delete(c.Scene.StateWire, sid)
 	delete(c.Scene.Services, sid)
 	delete(c.Scene.Comments, sid)
+	delete(c.Scene.Rebalance, sid)
 	c.Scene.pruneRules(sid)
 	return nil
 }
@@ -639,6 +660,9 @@ func (c *HASceneCluster) CreateHaResources(_ context.Context, params *cluster.Cr
 	c.Scene.Requested[params.Sid] = state
 	if params.Comment != nil {
 		c.Scene.Comments[params.Sid] = *params.Comment
+	}
+	if params.AutoRebalance != nil {
+		c.Scene.setRebalance(params.Sid, *params.AutoRebalance)
 	}
 	vmid, _ := strconv.Atoi(strings.TrimPrefix(params.Sid, "vm:"))
 	c.Scene.IndexHAState[vmid] = state

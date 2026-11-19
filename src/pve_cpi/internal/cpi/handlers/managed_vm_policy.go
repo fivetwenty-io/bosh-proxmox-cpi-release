@@ -24,19 +24,30 @@ func managedEvidenceObject(value any) (map[string]any, error) {
 }
 
 // managedHAResourceFieldsMatch compares a requested HA resource write against
-// the resource PVE reads back. PVE defaults failback to on and may leave the
-// key out of the read when it holds that default, so an absent failback
-// proves a request for on, and only a request for on.
+// the resource PVE reads back. PVE defaults failback and auto-rebalance to on
+// and may leave either key out of the read when it holds that default, so an
+// absent flag proves a request for on, and only a request for on.
 func managedHAResourceFieldsMatch(readback, params map[string]any) error {
-	if want, ok := params["failback"].(bool); ok && want {
-		if _, present := readback["failback"]; !present {
-			withDefault := maps.Clone(readback)
-			withDefault["failback"] = true
-			readback = withDefault
+	var withDefault map[string]any
+	for _, key := range managedHAResourceDefaultOnFlags {
+		want, ok := params[key].(bool)
+		if _, present := readback[key]; !ok || !want || present {
+			continue
 		}
+		if withDefault == nil {
+			withDefault = maps.Clone(readback)
+		}
+		withDefault[key] = true
+	}
+	if withDefault != nil {
+		readback = withDefault
 	}
 	return managedConfigFieldsMatch(readback, params)
 }
+
+// managedHAResourceDefaultOnFlags lists the HA resource flags PVE defaults to
+// on.
+var managedHAResourceDefaultOnFlags = []string{"failback", "auto-rebalance"}
 
 func managedEvidenceListMatch(raw any, fields map[string]any) error {
 	encoded, err := json.Marshal(raw)

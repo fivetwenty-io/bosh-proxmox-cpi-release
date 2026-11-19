@@ -38,6 +38,8 @@ func newReaddRig(t *testing.T, mode string) *readdRig {
 	scene.Do(func(s *HADeleteScene) {
 		s.Power[readdVMID] = "running"
 		s.Comments[sid] = marker
+		// Staging writes auto-rebalance off for a VM outside the DLB.
+		s.Rebalance[sid] = false
 		s.Configs = map[int]map[string]any{readdVMID: {
 			"tags":   "bosh-cpi;" + haManagedTag,
 			"scsi0":  "nfs:vm-101-disk-0,size=10G",

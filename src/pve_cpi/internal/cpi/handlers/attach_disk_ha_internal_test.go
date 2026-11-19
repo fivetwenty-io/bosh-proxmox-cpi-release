@@ -481,6 +481,28 @@ func TestAttachHAInput(t *testing.T) {
 	}
 }
 
+func TestAttachHAInput_ReadsAnUnsetAutoRebalanceAsOn(t *testing.T) {
+	cfg := icMinConfig()
+	cfg.HA = haModeAuto()
+	vmCfg := map[string]any{"scsi0": "nfs:vm-100-disk-0,size=10G"}
+	off := sdkclient.PVEBool(false)
+	for name, tc := range map[string]struct {
+		flag *sdkclient.PVEBool
+		want bool
+	}{"unset": {nil, true}, "off": {&off, false}} {
+		res := &cluster.GetHaResourcesResponse{AutoRebalance: tc.flag}
+		in := attachHAInput(Deps{Config: cfg}, 100, "pve01", vmCfg, res, nil, resolvedDisk{volid: "nfs:vm-100-disk-1"})
+		if in.InDLBAZ != tc.want {
+			t.Errorf("%s: attach InDLBAZ = %v, want %v, because PVE defaults auto-rebalance to on", name,
+				in.InDLBAZ, tc.want)
+		}
+		if got := pinWidenInput(Deps{Config: cfg}, 100, "pve01", vmCfg, res); got.InDLBAZ != tc.want {
+			t.Errorf("%s: widen InDLBAZ = %v, want %v, because PVE defaults auto-rebalance to on", name,
+				got.InDLBAZ, tc.want)
+		}
+	}
+}
+
 func TestAttachHARun_NoActionAttaches(t *testing.T) {
 	calls := 0
 	attach := func(context.Context) (string, error) { calls++; return "pve01", nil }

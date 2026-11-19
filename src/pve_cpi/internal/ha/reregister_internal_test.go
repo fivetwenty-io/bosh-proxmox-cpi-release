@@ -28,6 +28,9 @@ type readdRig struct {
 	requested string
 	comment   string
 	rebalance bool
+	// rebalanceUnset leaves auto-rebalance out of the resource read, which is
+	// how PVE reads a resource that holds the flag's default.
+	rebalanceUnset bool
 	// raw is the CRM state while the CRM lists the service, and listed says
 	// whether it does.
 	raw    string
@@ -101,8 +104,11 @@ func (r *readdRig) GetHaResources(_ context.Context, sid string) (*sdkcluster.Ge
 		return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "no such resource"}
 	}
 	st, c := r.requested, r.comment
-	return &sdkcluster.GetHaResourcesResponse{Sid: sid, State: &st, Comment: &c, AutoRebalance: pveBool(r.rebalance)},
-		nil
+	rebalance := pveBool(r.rebalance)
+	if r.rebalanceUnset {
+		rebalance = nil
+	}
+	return &sdkcluster.GetHaResourcesResponse{Sid: sid, State: &st, Comment: &c, AutoRebalance: rebalance}, nil
 }
 
 func (r *readdRig) CreateHaResources(_ context.Context, p *sdkcluster.CreateHaResourcesParams) error {
@@ -1014,6 +1020,23 @@ func TestReregisterSnapshotStripsTheNarrowMark(t *testing.T) {
 	r.registeredAgain(t, res, err)
 	if got.Comment != readdMarker || !got.AutoRebalance || !got.PinStrict {
 		t.Fatalf("record %+v", got)
+	}
+}
+
+func TestReregisterSnapshotReadsAnUnsetAutoRebalanceAsOn(t *testing.T) {
+	r := newReaddRig()
+	r.rebalanceUnset = true
+	var got ReaddRecord
+	in := r.input()
+	write := in.WriteIntent
+	in.WriteIntent = func(ctx context.Context, node, tag string, rec ReaddRecord) error {
+		got = rec
+		return write(ctx, node, tag, rec)
+	}
+	res, err := r.run(t, in)
+	r.registeredAgain(t, res, err)
+	if !got.AutoRebalance {
+		t.Fatalf("PVE defaults auto-rebalance to on, so an unset flag records a resource that rebalances: %+v", got)
 	}
 }
 

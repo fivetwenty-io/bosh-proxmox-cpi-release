@@ -1535,7 +1535,7 @@ func narrowAfterFailover(
 		return cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("%s: read the HA resource of VM %d before its pin narrows after a failover", op, vmid))
 	}
-	rebalance := err != nil || res == nil || res.AutoRebalance == nil || res.AutoRebalance.Bool()
+	rebalance := err != nil || res == nil || ha.AutoRebalanceOf(res.AutoRebalance)
 	_, err = narrowActive(ctx, narrow, ha.NarrowInput{
 		VMID:     vmid,
 		Node:     node,

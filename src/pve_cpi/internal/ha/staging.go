@@ -243,7 +243,7 @@ func (s *Stager) Stage(ctx context.Context, d *VMDecision, marker string) error 
 			"register VM %d; remove the resource or let the earlier call finish, and retry", d.SID, blocker, d.VMID)
 	}
 	if got.Comment == nil || *got.Comment != marker || FailbackOf(got.Failback) != failback ||
-		!pveBoolIs(got.AutoRebalance, rebalance) {
+		AutoRebalanceOf(got.AutoRebalance) != rebalance {
 		if updErr := s.Resources.UpdateHaResources(ctx, d.SID, &sdkcluster.UpdateHaResourcesParams{
 			Comment: &marker, Failback: &failback, AutoRebalance: &rebalance,
 		}); updErr != nil {
@@ -274,14 +274,11 @@ func FailbackOf(v *sdkclient.PVEBool) bool {
 	return v == nil || v.Bool()
 }
 
-// pveBoolIs reports whether a PVE flag reads as want, with an unset flag
-// reading as false. Failback defaults to on, so it is read with FailbackOf
-// instead.
-func pveBoolIs(v *sdkclient.PVEBool, want bool) bool {
-	if v == nil {
-		return !want
-	}
-	return v.Bool() == want
+// AutoRebalanceOf reads the auto-rebalance flag of an HA resource. PVE
+// defaults auto-rebalance to on and may leave the key out of a read that holds
+// the default, so an unset flag reads as true.
+func AutoRebalanceOf(v *sdkclient.PVEBool) bool {
+	return v == nil || v.Bool()
 }
 
 // Verify re-reads every rule and checks the VM's confinement. The pin must

@@ -34,6 +34,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - When the pin of a `replicate` VM narrows after a failover, the narrowing barrier now keeps the HA resource's `auto-rebalance` flag for a re-registration, and reads it as on when the resource leaves it unset, as PVE does.
 
+- The CPI now reads an HA resource that leaves `auto-rebalance` unset as having it on, which is PVE's default. Before, `attach_disk`, the pin widening, and the re-registration of a VM read the unset flag as off, so they could take a VM out of the dynamic load balancer that PVE was still rebalancing. Staging left an unset flag in place on a VM the CPI meant to keep out of rebalancing, and the evidence check of a managed allocation refused a resource that PVE read back with the key left out at its default.
+
 - `pve-cid ha` no longer reports `failback_drift` for a parker, which no call ever reaches, or for a VM the CPI's HA decision does not register as a plain shared VM, such as one with a PCI passthrough device or a host CPU type that one node alone runs. It now counts a pin that records a change to the VM's replicated volumes as the `replicate` policy, as the CPI does.
 
 ### Added

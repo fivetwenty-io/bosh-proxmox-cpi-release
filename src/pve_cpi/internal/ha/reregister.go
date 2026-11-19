@@ -857,7 +857,7 @@ func (r *readd) snapshot(
 	}
 	rec := ReaddRecord{
 		Comment:       strings.TrimSpace(*stripNarrowMark(&comment)),
-		AutoRebalance: pveBoolIs(res.AutoRebalance, true),
+		AutoRebalance: AutoRebalanceOf(res.AutoRebalance),
 	}
 	set, err := r.in.Stager.ReadRules(ctx)
 	if err != nil {

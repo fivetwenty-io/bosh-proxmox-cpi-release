@@ -144,7 +144,8 @@ func TestStageAdoptsOurOwnIgnoredResource(t *testing.T) {
 		t.Fatalf("events %v", rig.events)
 	}
 
-	same := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, failback: pveBool(false)}
+	same := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, failback: pveBool(false),
+		rebalance: pveBool(false)}
 	if err := same.stager().Stage(context.Background(), stageDecision(), stageMarker); err != nil {
 		t.Fatal(err)
 	}
@@ -655,7 +656,7 @@ func TestStageWritesTheDecisionsFailback(t *testing.T) {
 
 func TestStageReadsAnUnsetFailbackAsOn(t *testing.T) {
 	t.Parallel()
-	on := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker}
+	on := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, rebalance: pveBool(false)}
 	d := stageDecision()
 	d.Failback = true
 	if err := on.stager().Stage(context.Background(), d, stageMarker); err != nil {
@@ -665,13 +666,42 @@ func TestStageReadsAnUnsetFailbackAsOn(t *testing.T) {
 		t.Fatalf("an unset failback is PVE's default of on, so nothing is updated: %v", on.events)
 	}
 
-	off := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker}
+	off := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, rebalance: pveBool(false)}
 	if err := off.stager().Stage(context.Background(), stageDecision(), stageMarker); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(off.events, []string{"create:ignored", "get", "update:-"}) || off.failback == nil ||
 		off.failback.Bool() {
 		t.Fatalf("an unset failback reads as on and must be turned off: %v, %v", off.events, off.failback)
+	}
+}
+
+func TestStageReadsAnUnsetAutoRebalanceAsOn(t *testing.T) {
+	t.Parallel()
+	on := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, failback: pveBool(false)}
+	d := stageDecision()
+	d.DLB = true
+	if err := on.stager().Stage(context.Background(), d, stageMarker); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(on.events, []string{"create:ignored", "get"}) {
+		t.Fatalf("an unset auto-rebalance is PVE's default of on, so nothing is updated: %v", on.events)
+	}
+
+	off := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, failback: pveBool(false)}
+	if err := off.stager().Stage(context.Background(), stageDecision(), stageMarker); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(off.events, []string{"create:ignored", "get", "update:-"}) || off.rebalance == nil ||
+		off.rebalance.Bool() {
+		t.Fatalf("an unset auto-rebalance reads as on and must be turned off: %v, %v", off.events, off.rebalance)
+	}
+}
+
+func TestAutoRebalanceOf(t *testing.T) {
+	t.Parallel()
+	if !AutoRebalanceOf(nil) || !AutoRebalanceOf(pveBool(true)) || AutoRebalanceOf(pveBool(false)) {
+		t.Fatal("PVE defaults auto-rebalance to on, so only an explicit 0 reads as off")
 	}
 }
 
