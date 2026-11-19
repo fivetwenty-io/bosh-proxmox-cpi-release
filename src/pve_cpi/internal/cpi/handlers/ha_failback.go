@@ -93,6 +93,12 @@ func reconcileVMFailback(ctx context.Context, deps Deps, op string, vmid int, lo
 	syncVMFailback(ctx, deps, deps.PVE.Cluster(), nil, op, vmid, loc, logger)
 }
 
+// failbackRaiseAttempts is how many times syncVMFailback decides the flag and
+// tries to raise it when PVE refuses the raise because resources.cfg changed
+// after the read. The digest covers every resource, so any other VM's staging
+// write or requested state refuses a raise, and that is common during a deploy.
+const failbackRaiseAttempts = 4
+
 // syncVMFailback decides the failback flag of VM vmid's HA resource afresh
 // and sets it through api, which reads and writes the resource, while deps
 // reads the rules and the VM's config. A nil profile is resolved. A flag that
@@ -100,7 +106,10 @@ func reconcileVMFailback(ctx context.Context, deps Deps, op string, vmid int, lo
 // be on is raised only against the digest of the resource read the decision
 // started from (see ha.RaiseFailback), so an attach that turned failback off,
 // or a barrier that holds the resource, after that read makes PVE refuse the
-// raise. A disk that lands between the decision's config read and the raise
+// raise. A refused raise is decided again from a fresh read of the resource,
+// the rules, and the config, so every guard applies again, up to
+// failbackRaiseAttempts times in all, and the flag then stays off for a later
+// call. A disk that lands between the decision's config read and the raise
 // changes no HA state, so once the raise has landed the config is read again,
 // and a change in the VM's volumes or replicate tag, or a read that fails,
 // turns failback off again for the next call to decide. Every failure is
@@ -109,45 +118,58 @@ func syncVMFailback(ctx context.Context, deps Deps, api ha.FailbackAPI, profile 
 	loc pve.VMLocation, logger *log.Logger,
 ) {
 	logger = logger.With(log.Int(metadataKeyVMID, vmid), log.String("node", loc.Node))
-	w, err := wantVMFailback(ctx, deps, api, profile, vmid, loc)
-	if err != nil {
-		logger.Warn(op+": the failback flag of the VM's HA resource could not be checked; a later call checks "+
-			"again", log.Err(err))
-		return
-	}
-	if !w.decided {
-		logger.Debug(op+": the failback flag of the VM's HA resource stays as it is", log.String("reason", w.reason))
-		return
-	}
-	if !w.want {
-		changed, err := clearVMFailback(ctx, api, deps.RequestDirectorUUID, vmid)
+	for attempt := 1; ; attempt++ {
+		w, err := wantVMFailback(ctx, deps, api, profile, vmid, loc)
+		if err != nil {
+			logger.Warn(op+": the failback flag of the VM's HA resource could not be checked; a later call "+
+				"checks again", log.Err(err))
+			return
+		}
+		if !w.decided {
+			logger.Debug(op+": the failback flag of the VM's HA resource stays as it is",
+				log.String("reason", w.reason))
+			return
+		}
+		if !w.want {
+			changed, err := clearVMFailback(ctx, api, deps.RequestDirectorUUID, vmid)
+			switch {
+			case err != nil:
+				logger.Warn(op+": the failback flag of the VM's HA resource could not be set; a later call sets "+
+					"it", log.Bool("failback", false), log.String("reason", w.reason), log.Err(err))
+			case changed:
+				logger.Info(op+": set the failback flag of the VM's HA resource", log.Bool("failback", false),
+					log.String("reason", w.reason))
+			}
+			return
+		}
+		if w.current {
+			return
+		}
+		raised, err := ha.RaiseFailback(ctx, api, haResourceSid(vmid), w.digest)
 		switch {
 		case err != nil:
 			logger.Warn(op+": the failback flag of the VM's HA resource could not be set; a later call sets it",
-				log.Bool("failback", false), log.String("reason", w.reason), log.Err(err))
-		case changed:
-			logger.Info(op+": set the failback flag of the VM's HA resource", log.Bool("failback", false),
+				log.Bool("failback", true), log.String("reason", w.reason), log.Err(err))
+			return
+		case raised:
+			logger.Info(op+": set the failback flag of the VM's HA resource", log.Bool("failback", true),
 				log.String("reason", w.reason))
+			confirmFailbackBasis(ctx, deps, api, op, vmid, loc.Node, w.basis, logger)
+			return
+		case w.digest == "":
+			logger.Info(op+": the read of the VM's HA resource named no digest, so failback stays off; a later "+
+				"call decides it again", log.String("reason", w.reason))
+			return
+		case attempt < failbackRaiseAttempts:
+			logger.Debug(op+": resources.cfg changed after the VM's HA resource was read, so the failback flag "+
+				"is decided again", log.Int("attempt", attempt))
+			continue
 		}
+		logger.Warn(op+": resources.cfg changed after every read of the VM's HA resource, so failback stays off; "+
+			"pve-cid ha reports the resource as failback_drift until a later call sets the flag",
+			log.Int("attempts", attempt), log.String("reason", w.reason))
 		return
 	}
-	if w.current {
-		return
-	}
-	raised, err := ha.RaiseFailback(ctx, api, haResourceSid(vmid), w.digest)
-	switch {
-	case err != nil:
-		logger.Warn(op+": the failback flag of the VM's HA resource could not be set; a later call sets it",
-			log.Bool("failback", true), log.String("reason", w.reason), log.Err(err))
-		return
-	case !raised:
-		logger.Info(op+": the VM's HA resource changed after it was read, or its read named no digest, so "+
-			"failback stays off; a later call decides it again", log.String("reason", w.reason))
-		return
-	}
-	logger.Info(op+": set the failback flag of the VM's HA resource", log.Bool("failback", true),
-		log.String("reason", w.reason))
-	confirmFailbackBasis(ctx, deps, api, op, vmid, loc.Node, w.basis, logger)
 }
 
 // confirmFailbackBasis reads VM vmid's config again after failback was turned

@@ -440,3 +440,43 @@ func TestAttachHARun_SkippedDecisionWithFailbackOffChecksAgainAfterTheDiskLands(
 		t.Fatalf("events %v, want %v", sl.events, want)
 	}
 }
+
+// TestReconcileVMFailback_RaiseRefusedForAnotherWriteIsDecidedAgain has
+// another VM's staging write change resources.cfg between the reconcile's
+// read and its raise, twice. PVE refuses both raises, and the reconcile
+// decides again from a fresh read each time, so the third raise lands.
+func TestReconcileVMFailback_RaiseRefusedForAnotherWriteIsDecidedAgain(t *testing.T) {
+	r := newRaceRig(t, failbackFlag(false))
+	r.onRead = func(read int) map[string]any {
+		if read <= 2 {
+			r.res.version++
+		}
+		return nil
+	}
+	r.reconcile()
+	want := []string{"stale:failback:true", "stale:failback:true", "failback:true"}
+	if !slices.Equal(r.sl.events, want) || !ha.FailbackOf(r.res.failback) {
+		t.Fatalf("events %v failback %v, want %v and failback on", r.sl.events, ha.FailbackOf(r.res.failback),
+			want)
+	}
+}
+
+// TestReconcileVMFailback_RaiseRefusedOnEveryTryStaysOff has resources.cfg
+// change before every raise. The reconcile stops after a bounded number of
+// tries and leaves failback off for a later call.
+func TestReconcileVMFailback_RaiseRefusedOnEveryTryStaysOff(t *testing.T) {
+	r := newRaceRig(t, failbackFlag(false))
+	r.onRead = func(int) map[string]any {
+		r.res.version++
+		return nil
+	}
+	r.reconcile()
+	if ha.FailbackOf(r.res.failback) {
+		t.Fatalf("failback is on, events %v", r.sl.events)
+	}
+	stale := slices.Repeat([]string{"stale:failback:true"}, failbackRaiseAttempts)
+	if !slices.Equal(r.sl.events, stale) || r.reads != failbackRaiseAttempts {
+		t.Fatalf("events %v after %d config reads, want %d refused raises", r.sl.events, r.reads,
+			failbackRaiseAttempts)
+	}
+}

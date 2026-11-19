@@ -30,6 +30,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - While `attach_disk` moves a VM into its node set, the resource's comment now carries a `bosh-failback-hold=<unix time>` token, which the attach writes together with `failback` off. A `set_vm_metadata`, `reboot_vm`, or `detach_disk` in another CPI process no longer turns `failback` on while the token is less than 30 minutes old, so it can't send the VM back to the node its old pin prefers before the attach writes the new pin. The attach drops the token once the pin names the new node, and `pve-cid ha` leaves a resource with a fresh token alone.
 
+- When PVE refuses the failback reconcile's write because `resources.cfg` changed after the reconcile read it, the reconcile now reads the resource, the rules, and the VM's config again and decides once more, up to four times in all. The digest covers every HA resource, so another VM's staging write during a busy deploy used to leave the VM with `failback` off until a later call. When every try is refused, the reconcile logs a warning, and `pve-cid ha` reports the resource as `failback_drift` until a later call sets the flag.
+
 - `attach_disk` now decides `failback` afresh after a disk lands that keeps the VM shared, so a VM with the replicate tag, or with a pin that carries a token of the replicate policy, keeps the flag off, as the reconcile keeps it.
 
 - A parker whose disks all sit on shared storage now registers with `failback` on. That changes nothing, because a parker stays stopped and PVE never moves a stopped resource back.
