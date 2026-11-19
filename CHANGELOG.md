@@ -42,6 +42,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - `pve-cid ha` no longer reports `failback_drift` for a parker, which no call ever reaches, or for a VM the CPI's HA decision does not register as a plain shared VM, such as one with a PCI passthrough device or a host CPU type that one node alone runs. It now counts a pin that records a change to the VM's replicated volumes as the `replicate` policy, as the CPI does.
 
+- `pve-cid ha` now reports `failback_drift` for a VM whose flag reads on when the CPI writes it off because only one node can take the VM, such as a VM whose strict pin names one node, one with a PCI passthrough device, or one with a host CPU type that one node alone runs. Before, it stayed silent about those VMs until the next call turned the flag off.
+
 ### Added
 
 - `pve.ha.failback`, an optional boolean, turns `failback` off on every HA resource the CPI writes when it is `false`. Left unset, it lets the CPI turn the flag on for shared VMs. A cpi-config entry can override it under `pve_ha`.

@@ -210,3 +210,40 @@ func TestCollectFailbackJudgesAPinThatRecordsAReplicaChangeAsReplicate(t *testin
 	f.rules = []ha.Rule{pinRule(100, ha.WithReplicaChanged(haMarker, haNow), "n1", "n2")}
 	wantNone(t, runCollect(t, f, haCfg("auto", "replicate")), haKindFailbackDrift, haKindFailbackOnReplica)
 }
+
+// TestCollectFailbackReportsOnWhereTheDecisionTurnsItOff reports a resource
+// with failback on whose VM the CPI's HA decision gives failback off: a VM
+// under a strict pin that names one node, which the decision gives an
+// admissible set of one node, and a VM that a PCI passthrough device or a host
+// CPU type ties to one node. The next call that touches each VM turns the flag
+// off, so the doctor says so.
+func TestCollectFailbackReportsOnWhereTheDecisionTurnsItOff(t *testing.T) {
+	t.Parallel()
+	for name, edit := range map[string]func(f *fakeHA){
+		"strict single-node pin": func(f *fakeHA) { f.rules = []ha.Rule{pinRule(100, haMarker, "n1")} },
+		"PCI passthrough":        func(f *fakeHA) { f.configs[100]["hostpci0"] = "0000:01:00.0" },
+		"host CPU in a one-node CPU domain": func(f *fakeHA) {
+			f.configs[100]["cpu"] = "host"
+			f.profile.CPUDomains = []ha.CPUDomain{{Model: "EPYC", Nodes: []string{"n1"}},
+				{Model: "XEON", Nodes: []string{"n2", "n3"}}}
+			for i := range f.profile.Nodes {
+				if f.profile.Nodes[i].Name != "n1" {
+					f.profile.Nodes[i].CPU.Model = "XEON"
+				}
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			for _, flag := range []*bool{failbackRow(true), nil} {
+				f := haBaseFake()
+				f.resources[0].Failback = flag
+				edit(f)
+				r := runCollect(t, f, haCfg("auto", "none"))
+				want(t, r, haKindFailbackDrift, haSeverityAdvice, "vm:100", "failback on", "writes failback off",
+					"HA decision")
+				wantNone(t, r, haKindFailbackOnReplica)
+			}
+		})
+	}
+}

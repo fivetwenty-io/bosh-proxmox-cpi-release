@@ -16,14 +16,19 @@ import (
 // reversed job overwrites the volumes on that node. Any other difference is
 // advice, because the next call that touches the VM sets the flag.
 //
+// The CPI's HA decision settles the flag of a VM whose facts call for it on,
+// and of a VM whose flag reads on under a strict pin that names one node (see
+// decidedFailback), so a VM that only one node can take is reported when its
+// flag reads on, because the next call turns it off.
+//
 // The check leaves alone a resource it cannot judge: one the barrier or a move
 // into the VM's admissible set holds, a VM whose config, storages, rules, or
 // replication jobs could not be read, a volume on a storage the index does not
-// list, a strict pin that names one node, under which failback has nowhere to
-// move the VM, and a VM the CPI's HA decision does not register as a plain
-// shared VM (see sharedFailback). It also leaves parkers alone, because a parker stays stopped, so failback never moves it,
-// and the Director never calls set_vm_metadata or reboot_vm on one, so a
-// finding about it would never clear.
+// list, a strict pin that names one node while the flag reads off, and a VM
+// whose decision fails or refuses HA for a reason that may pass. It also
+// leaves parkers alone, because a parker stays stopped, so failback never
+// moves it, and the Director never calls set_vm_metadata or reboot_vm on one,
+// so a finding about it would never clear.
 func (c *haCollector) failbackFindings() {
 	if c.off() || !c.guestsOK || !c.resourcesOK {
 		return
@@ -39,8 +44,16 @@ func (c *haCollector) failbackFindings() {
 			continue
 		}
 		want, known := ha.ExpectedFailback(facts)
-		if known && want {
-			want, known = c.sharedFailback(g)
+		switch {
+		case known && want, !known && have && facts.SelfPinned && !facts.Unknown:
+			// The facts call for failback on, or the flag reads on under a
+			// strict pin that names one node. Either way the CPI's HA
+			// decision settles it, and the reconcile writes what it says.
+			var why string
+			want, known, why = c.decidedFailback(g)
+			if known && !want {
+				reason = why
+			}
 		}
 		if !known || want == have {
 			continue
@@ -123,16 +136,18 @@ func replicaChangePending(pin *ha.Rule) bool {
 	return changed
 }
 
-// sharedFailback runs the CPI's HA decision for g the way the failback
-// reconcile does, for a VM whose facts say failback on. The CPI writes the
-// decision's flag only when the decision registers g as a plain shared VM,
-// and writes failback off for every other outcome, such as a PCI passthrough
-// device or a host CPU type that ties the VM to one node. The doctor's facts
-// cannot see those, so any outcome other than a plain shared registration,
-// and a decision that fails, leaves the flag unknown rather than expected on.
-func (c *haCollector) sharedFailback(g *haGuest) (want, known bool) {
+// decidedFailback runs the CPI's HA decision for g the way the failback
+// reconcile does, and returns the flag the reconcile writes for g and, when
+// that flag is off, why. The reconcile writes the decision's flag for a VM the
+// decision registers, which is off for a VM that only one node can take, such
+// as one under a strict pin that names one node, one with a PCI passthrough
+// device, or one with a host CPU type that one node alone runs. It writes off
+// for a VM the decision gives no HA. A decision that fails, or that refuses
+// HA for a reason that may pass, leaves the flag unknown, because the
+// reconcile then leaves the flag as it is.
+func (c *haCollector) decidedFailback(g *haGuest) (want, known bool, reason string) {
 	if g.cfg == nil {
-		return false, false
+		return false, false, ""
 	}
 	cpu, _ := pve.ConfigString(g.cfg, "cpu")
 	in := ha.VMInput{
@@ -153,10 +168,15 @@ func (c *haCollector) sharedFailback(g *haGuest) (want, known bool) {
 		}
 	}
 	d, err := c.p.DecideVM(in)
-	if err != nil || !d.Registers() || d.Transient || d.Policy != ha.PolicyShared {
-		return false, false
+	switch {
+	case err != nil, d.Transient, d.PlaceableShortfall:
+		return false, false, ""
+	case d.Registers() && d.Failback:
+		return true, true, ""
+	case d.Registers():
+		return false, true, "the CPI's HA decision registers the VM with failback off (" + d.Reason + ")"
 	}
-	return d.Failback, true
+	return false, true, "the CPI's HA decision gives the VM no HA (" + d.Reason + ")"
 }
 
 // onOff spells a failback flag the way the doctor's findings do.
