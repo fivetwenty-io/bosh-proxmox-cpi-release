@@ -2643,3 +2643,33 @@ func TestCollectParkerLeftoversNeedACompleteGuestList(t *testing.T) {
 	listed.clusterVMs = append(listed.clusterVMs, pve.GuestRef{VMID: 90000, Node: "n3"})
 	wantNone(t, runCollect(t, listed, parkedCfg()), haKindParkerResourceOrphan, haKindParkerPinOrphan)
 }
+
+// TestCollectParkerLeftoversNeedThisDirectorsParker proves the doctor reports
+// a parker leftover only when it carries this Director's owner, which the run
+// must know, and a pin only when it is a node-affinity rule that names the
+// parker alone, as the parker sweep requires before it removes one.
+func TestCollectParkerLeftoversNeedThisDirectorsParker(t *testing.T) {
+	t.Parallel()
+	setup := func() *fakeHA {
+		f := haBaseFake()
+		f.clusterVMs = append(f.clusterVMs, f.guests...)
+		f.resources = append(f.resources, HAResourceRow{SID: "vm:90000", State: "stopped", Comment: haMarker})
+		f.rules = []ha.Rule{pinRule(90000, haMarker, "n1")}
+		return f
+	}
+	r := collectHA(context.Background(), setup(), parkedCfg(), "", haNow)
+	wantNone(t, r, haKindParkerResourceOrphan, haKindParkerPinOrphan)
+
+	ownerless := setup()
+	ownerless.resources[len(ownerless.resources)-1].Comment = "bosh-cpi:v1"
+	ownerless.rules[0].Comment = "bosh-cpi:v1"
+	wantNone(t, runCollect(t, ownerless, parkedCfg()), haKindParkerResourceOrphan, haKindParkerPinOrphan)
+
+	shared := setup()
+	shared.rules[0].Resources = append(shared.rules[0].Resources, "vm:100")
+	wantNone(t, runCollect(t, shared, parkedCfg()), haKindParkerPinOrphan)
+
+	colocation := setup()
+	colocation.rules[0].Type = ha.RuleTypeResourceAffinity
+	wantNone(t, runCollect(t, colocation, parkedCfg()), haKindParkerPinOrphan)
+}

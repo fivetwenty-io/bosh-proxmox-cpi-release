@@ -2028,16 +2028,24 @@ func (c *haCollector) leftoverFindings() {
 // parkerLeftovers reports this Director's parker resources and parker pins
 // that name a VMID in the parker band no guest holds. The parker HA pass of a
 // sweep removes such a leftover once it proves the parker gone, so one that
-// the doctor sees has not been proven yet: the HA manager still holds the
-// service, no pin names a node to prove the parker gone on, a node the pin
-// names does not answer, or no sweep has run since. The check needs the
-// parked strategy, both a guest list that every node answered and the
-// cluster's VM list, so a VMID missing from both proves the guest gone. Off
-// mode has its own leftover findings.
+// the doctor sees has not been proven yet. The HA manager may still hold the
+// service, the cluster may not be quorate or may report a member offline, a
+// node the pin names may not answer, or no sweep has run since. The check
+// matches the sweep's ownership rule, so it needs the run's Director UUID and
+// reports only a marker that names that Director, and a pin only when it is a
+// node-affinity rule that names the parker alone. It also needs the parked
+// strategy, a guest list that every node answered, and the cluster's VM list,
+// so a VMID missing from both proves the guest gone. Off mode has its own
+// leftover findings.
 func (c *haCollector) parkerLeftovers() {
-	if c.off() || c.cfg == nil || c.cfg.DetachedDiskStrategyValue() != config.DetachedDiskStrategyParked ||
+	if c.off() || c.owner == "" || c.cfg == nil ||
+		c.cfg.DetachedDiskStrategyValue() != config.DetachedDiskStrategyParked ||
 		!c.guestsOK || c.guestsPartial || !c.clusterOK {
 		return
+	}
+	ours := func(comment string) bool {
+		owner, marked := haMarkerOwner(comment)
+		return marked && owner == haOwnerValue(c.owner)
 	}
 	start, end := c.cfg.ParkedDiskVMIDRangeStartValue(), c.cfg.ParkedDiskVMIDRangeEndValue()
 	gone := func(id string) (int, bool) {
@@ -2058,8 +2066,7 @@ func (c *haCollector) parkerLeftovers() {
 		for _, sid := range sids {
 			row := c.resources[sid]
 			id, isVM := strings.CutPrefix(sid, "vm:")
-			if _, marked := haMarkerOwner(row.Comment); !isVM || !marked || c.foreign(row.Comment) ||
-				haMarkerNamesGroup(row.Comment) {
+			if !isVM || !ours(row.Comment) || haMarkerNamesGroup(row.Comment) {
 				continue
 			}
 			if vmid, ok := gone(id); ok {
@@ -2074,7 +2081,7 @@ func (c *haCollector) parkerLeftovers() {
 		for i := range c.rules {
 			r := &c.rules[i]
 			id, isPin := strings.CutPrefix(r.ID, haPinRulePrefix)
-			if !isPin || !ruleMarked(r) || c.foreign(r.Comment) {
+			if !isPin || r.Type != ha.RuleTypeNodeAffinity || !ours(r.Comment) || !namesOnly(r, "vm:"+id) {
 				continue
 			}
 			if vmid, ok := gone(id); ok {
@@ -2085,6 +2092,16 @@ func (c *haCollector) parkerLeftovers() {
 			}
 		}
 	}
+}
+
+// namesOnly reports whether every resource rule names is sid.
+func namesOnly(r *ha.Rule, sid string) bool {
+	for _, res := range r.Resources {
+		if res != sid {
+			return false
+		}
+	}
+	return true
 }
 
 // haMarkerNamesGroup reports whether a marker names a deployment or an
