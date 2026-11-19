@@ -104,14 +104,16 @@ func (r *orphanRig) haRemovals() []string {
 	return out
 }
 
-// requireRemoved fails unless the leftovers named are gone, each removed
-// while the parker's claim was held, and the claim was released after.
-func (r *orphanRig) requireRemoved(t *testing.T, resource, pin bool) {
+// requireRemoved fails unless the pin is gone, and the resource too when
+// resource is set, each removed while the parker's claim was held, and the
+// claim was released after. A resource is only ever removed with its pin,
+// because the pin names the node its absence proof reads.
+func (r *orphanRig) requireRemoved(t *testing.T, resource bool) {
 	t.Helper()
 	if resource && r.resourcePresent() {
 		t.Fatalf("the leftover HA resource must be removed; events %v", r.scene.EventsSnapshot())
 	}
-	if pin && r.pinPresent() {
+	if r.pinPresent() {
 		t.Fatalf("the leftover pin must be removed; events %v", r.scene.EventsSnapshot())
 	}
 	for what, held := range r.orphans.writesHeld() {
@@ -149,7 +151,7 @@ func (r *orphanRig) requireKept(t *testing.T, resource, pin bool) {
 func TestParkerHAOrphans_RemovesALeftoverResourceAndItsPin(t *testing.T) {
 	r := newOrphanRig()
 	r.sweep(phParkerCfg())
-	r.requireRemoved(t, true, true)
+	r.requireRemoved(t, true)
 	if got := r.orphans.writesHeld(); !got["resource"] {
 		t.Fatalf("the resource removal must be one of the writes; writes %v", got)
 	}
@@ -164,7 +166,7 @@ func TestParkerHAOrphans_RemovesAPinThatNamesAMissingParker(t *testing.T) {
 		delete(s.Comments, phSID)
 	})
 	r.sweep(phParkerCfg())
-	r.requireRemoved(t, false, true)
+	r.requireRemoved(t, false)
 	if got := r.orphans.writesHeld(); !got["pin"] {
 		t.Fatalf("the pin removal must be one of the writes; writes %v", got)
 	}
@@ -269,7 +271,7 @@ func TestParkerHAOrphans_AHeldClaimKeepsTheLeftovers(t *testing.T) {
 	r.requireKept(t, true, true)
 
 	r.sweep(phParkerCfg())
-	r.requireRemoved(t, true, true)
+	r.requireRemoved(t, true)
 }
 
 // TestParkerHAOrphans_AParkerCreatedBeforeTheClaimedReadKeepsItsLeftovers
@@ -306,5 +308,5 @@ func TestParkerHAOrphans_AFailedResourceRemovalKeepsThePin(t *testing.T) {
 
 	r.scene.Do(func(s *HADeleteScene) { s.RefuseRemoval = false })
 	r.sweep(phParkerCfg())
-	r.requireRemoved(t, true, true)
+	r.requireRemoved(t, true)
 }
