@@ -16,12 +16,12 @@ import (
 // reversed job overwrites the volumes on that node. Any other difference is
 // advice, because the next call that touches the VM sets the flag.
 //
-// The check leaves alone a resource it cannot judge: one the barrier holds, a
-// VM whose config, storages, rules, or replication jobs could not be read, a
-// volume on a storage the index does not list, a strict pin that names one
-// node, under which failback has nowhere to move the VM, and a VM the CPI's HA
-// decision does not register as a plain shared VM (see sharedFailback). It also leaves
-// parkers alone, because a parker stays stopped, so failback never moves it,
+// The check leaves alone a resource it cannot judge: one the barrier or a move
+// into the VM's admissible set holds, a VM whose config, storages, rules, or
+// replication jobs could not be read, a volume on a storage the index does not
+// list, a strict pin that names one node, under which failback has nowhere to
+// move the VM, and a VM the CPI's HA decision does not register as a plain
+// shared VM (see sharedFailback). It also leaves parkers alone, because a parker stays stopped, so failback never moves it,
 // and the Director never calls set_vm_metadata or reboot_vm on one, so a
 // finding about it would never clear.
 func (c *haCollector) failbackFindings() {
@@ -64,14 +64,15 @@ func (c *haCollector) failbackFindings() {
 }
 
 // ownsFailbackOf reports whether the CPI sets the failback flag of res: the
-// resource carries this Director's marker, and the narrowing barrier does not
-// hold it.
+// resource carries this Director's marker, the narrowing barrier does not
+// hold it, and no fresh hold token says an attach is moving the VM into its
+// admissible set, which the attach finishes by setting the flag itself.
 func (c *haCollector) ownsFailbackOf(res *HAResourceRow) bool {
 	if _, marked := haMarkerOwner(res.Comment); !marked || c.foreign(res.Comment) {
 		return false
 	}
 	_, held := ha.NarrowMarkOf(&res.Comment)
-	return !held
+	return !held && !ha.FailbackHeld(&res.Comment, c.now)
 }
 
 // failbackFacts gathers what the expected failback flag of g rests on, and

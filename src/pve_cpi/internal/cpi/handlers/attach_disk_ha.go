@@ -423,14 +423,21 @@ func attachMoveIntoSet(ctx context.Context, deps Deps, narrow ha.NarrowDeps, pro
 }
 
 // holdFailbackForMove turns failback off on the VM's HA resource right before
-// PVE HA is asked to move the VM into its admissible set. The VM's pin still
-// names its old placement then, and with failback on the CRM would pull the
-// VM back to the node that pin prefers as soon as the move lands, and the
-// attach would move it again on its retry. The barrier writes the new pin,
-// which records the moved-to node, and the attach turns failback on again
-// after that, when its decision allows it (see attachHA.syncFailback).
+// PVE HA is asked to move the VM into its admissible set, and puts a hold
+// token on the resource's comment in the same write (see ha.HoldFailback).
+// The VM's pin still names its old placement then, and with failback on the
+// CRM would pull the VM back to the node that pin prefers as soon as the move
+// lands, and the attach would move it again on its retry. The token keeps a
+// reconcile in another process from turning failback on before the pin names
+// the set, and the write changes the digest a reconcile that read earlier
+// raises against. The barrier writes the new pin, which records the moved-to
+// node, and the attach then drops the token and turns failback on again when
+// its decision allows it (see attachHA.releaseFailbackHold).
 func holdFailbackForMove(ctx context.Context, deps Deps, narrow ha.NarrowDeps, vmid int) error {
-	if _, err := clearVMFailback(ctx, narrow.Resources, deps.RequestDirectorUUID, vmid); err != nil {
+	owner := deps.RequestDirectorUUID
+	if _, err := ha.HoldFailback(ctx, narrow.Resources, haResourceSid(vmid), time.Now(),
+		func(comment string) bool { return owner != "" && haOwnershipOf(comment, owner) == haOwnedByUs },
+	); err != nil {
 		return fmt.Errorf("turn off failback on the HA resource of VM %d before the move: %w", vmid, err)
 	}
 	return nil
@@ -754,6 +761,7 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 	if err != nil {
 		return err
 	}
+	h.releaseFailbackHold(ctx)
 	if h.decision.Failback {
 		h.syncFailback(ctx, landed)
 	}
@@ -803,6 +811,31 @@ func (h *attachHA) recheckFailbackOff(ctx context.Context) {
 	case changed:
 		logger.Warn(attachHAOp + ": failback was on again when the disk landed, which a concurrent call set, " +
 			"and the attach turned it off")
+	}
+}
+
+// releaseFailbackHold drops the hold token a move into the VM's admissible
+// set left on its HA resource (see holdFailbackForMove), once the barrier has
+// written the pin for the node the VM landed on, so the move the token covered
+// is over. The barrier drops a token that its own move wrote, so this matters
+// for the move the decision made before the barrier, and for a token a call
+// that stopped part way left. A write that fails is logged, and the token then
+// keeps failback off until it expires (see ha.FailbackHoldTTL).
+func (h *attachHA) releaseFailbackHold(ctx context.Context) {
+	owner := h.deps.RequestDirectorUUID
+	owned := func(comment string) bool { return owner != "" && haOwnershipOf(comment, owner) == haOwnedByUs }
+	res, err := h.narrow.Resources.GetHaResources(ctx, h.sid)
+	if err != nil || res == nil {
+		return
+	}
+	tok, held := ha.FailbackHoldOf(res.Comment)
+	if !held {
+		return
+	}
+	if _, err := ha.ReleaseFailbackHold(ctx, h.narrow.Resources, h.sid, tok, owned); err != nil {
+		h.logger.Warn(attachHAOp+": the failback hold could not be dropped from the VM's HA resource after its "+
+			"pin named the new node; failback stays off until the hold expires and a later call sets it",
+			log.Int(metadataKeyVMID, h.vmid), log.Err(err))
 	}
 }
 

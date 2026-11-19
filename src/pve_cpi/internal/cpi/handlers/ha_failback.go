@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -28,7 +29,10 @@ import (
 //
 //   - The reconcile raises the flag only against the digest of resources.cfg
 //     it read before the rules and the config (see ha.RaiseFailback), and
-//     leaves a resource the narrowing barrier holds alone.
+//     leaves a resource the narrowing barrier holds alone. It never raises
+//     the flag while a fresh hold token says PVE HA is moving the VM into its
+//     admissible set and the pin does not name that set yet (see
+//     holdFailbackForMove).
 //   - The attach turns failback off before the barrier, again right before
 //     the disk lands, and once more after it has landed.
 //   - A raise that lands reads the VM's config again and turns failback off
@@ -257,6 +261,9 @@ func wantVMFailback(ctx context.Context, deps Deps, api ha.FailbackAPI, profile 
 		return vmFailbackWant{}, fmt.Errorf("decide HA for the VM: %w", err)
 	}
 	switch {
+	case d.Registers() && d.Failback && ha.FailbackHeld(res.Comment, time.Now()):
+		return vmFailbackWant{reason: "a move into the VM's admissible set holds failback off until the VM's " +
+			"pin names the node it moved to, and the call that moves it sets the flag"}, nil
 	case d.Registers():
 		return vmFailbackWant{decided: true, want: d.Failback, reason: d.Reason,
 			current: ha.FailbackOf(res.Failback), digest: res.Digest, basis: failbackBasis(cfg, loc.Node)}, nil

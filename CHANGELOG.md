@@ -28,6 +28,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - `attach_disk` now holds `failback` off while PVE HA moves a VM into the node set its new disk allows, and it turns the flag on again only after the pin names the node the VM moved to. With the flag on, the CRM pulled the VM back to the node its old pin preferred as soon as the move landed. The advice for a VM outside its set now says to turn `failback` off before a manual migration.
 
+- While `attach_disk` moves a VM into its node set, the resource's comment now carries a `bosh-failback-hold=<unix time>` token, which the attach writes together with `failback` off. A `set_vm_metadata`, `reboot_vm`, or `detach_disk` in another CPI process no longer turns `failback` on while the token is less than 30 minutes old, so it can't send the VM back to the node its old pin prefers before the attach writes the new pin. The attach drops the token once the pin names the new node, and `pve-cid ha` leaves a resource with a fresh token alone.
+
 - `attach_disk` now decides `failback` afresh after a disk lands that keeps the VM shared, so a VM with the replicate tag, or with a pin that carries a token of the replicate policy, keeps the flag off, as the reconcile keeps it.
 
 - A parker whose disks all sit on shared storage now registers with `failback` on. That changes nothing, because a parker stays stopped and PVE never moves a stopped resource back.

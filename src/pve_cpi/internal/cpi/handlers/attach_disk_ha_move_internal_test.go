@@ -459,3 +459,90 @@ func TestDecideAttachHA_FailbackWriteFailureBeforeTheMoveKeepsHA(t *testing.T) {
 		t.Fatalf("events %v state %q node %s, want nothing sent", sl.events, m.res.state, m.node)
 	}
 }
+
+// moveReconciler is a reconcile in another process that acts on the mover's
+// HA resource and on a VM config whose volumes are all on shared storage, so
+// it wants failback on.
+func moveReconciler(deps Deps, stub *attachHAStub, m *haMover) func() {
+	rdeps := deps
+	rdeps.Logger = log.NewNopLogger()
+	rdeps.PVE = &icPVEClient{clusterSvc: &sharedResCluster{attachHAStub: stub, res: m.res},
+		qemuSvc: &icQEMUService{configFn: func(context.Context, string, int) (map[string]any, error) {
+			return map[string]any{"scsi0": "nfs:vm-100-disk-0,size=10G", "tags": haManagedTag}, nil
+		}}}
+	return func() {
+		reconcileVMFailback(context.Background(), rdeps, "set_vm_metadata", 100,
+			pve.VMLocation{Node: m.node, Found: true, Tags: haManagedTag}, rdeps.Logger)
+	}
+}
+
+func TestDecideAttachHA_ReconcileDuringTheMoveIntoTheSetLeavesFailbackOff(t *testing.T) {
+	// The attach turns failback off and asks PVE HA to move the VM from pve03,
+	// which its old pin prefers, into the set the new disk allows. A reconcile
+	// in another process runs right after that write, while the pin still
+	// prefers pve03. It must not turn failback on, or the CRM pulls the VM
+	// back to pve03 and the attach moves it again on every retry.
+	deps, stub, m, sl := driftRig(t, config.HAModeAuto, "pve03")
+	preferringPin(stub)
+	writes := watchFailbackWrites(m, stub)
+	reconcile := moveReconciler(deps, stub, m)
+	hold := m.res.afterFailbackWrite
+	m.res.afterFailbackWrite = func() {
+		hold()
+		reconcile()
+	}
+	h, err := decideAttachHA(context.Background(), deps, "100", narrowingDisk())
+	if err != nil || h == nil || h.action != attachHAGuarded {
+		t.Fatalf("decision: h %+v err %v", h, err)
+	}
+	if err := runNarrowed(t, deps, h, sl); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, w := range *writes {
+		if w.on && w.pin != "pve01,pve02" {
+			t.Fatalf("failback turned on while the pin named %q, want only after it names the set; events %v",
+				w.pin, sl.events)
+		}
+	}
+	if !h.decision.Failback || !ha.FailbackOf(m.res.failback) {
+		t.Fatalf("failback %v, want on again once the pin names the set; events %v",
+			ha.FailbackOf(m.res.failback), sl.events)
+	}
+	if m.res.comment != stub.comment {
+		t.Fatalf("comment %q, want %q without the hold's token once the attach is done", m.res.comment,
+			stub.comment)
+	}
+}
+
+func TestReconcileVMFailback_HoldTokenBlocksOnlyTheRaiseAndOnlyWhileFresh(t *testing.T) {
+	// A fresh hold keeps the reconcile from turning failback on. An expired
+	// one, which a call that stopped part way leaves, does not, so failback
+	// comes back once the hold is over.
+	deps, stub, m, sl := driftRig(t, config.HAModeAuto, "pve01")
+	reconcile := moveReconciler(deps, stub, m)
+	m.res.failback = failbackFlag(false)
+	m.res.comment = ha.WithFailbackHold(stub.comment, time.Now())
+	reconcile()
+	if ha.FailbackOf(m.res.failback) || len(sl.events) != 0 {
+		t.Fatalf("a fresh hold let the reconcile write: events %v", sl.events)
+	}
+	m.res.comment = ha.WithFailbackHold(stub.comment, time.Now().Add(-ha.FailbackHoldTTL-time.Minute))
+	reconcile()
+	if !ha.FailbackOf(m.res.failback) || !slices.Equal(sl.events, []string{"failback:true"}) {
+		t.Fatalf("an expired hold kept failback off: events %v", sl.events)
+	}
+}
+
+func TestReconcileVMFailback_HoldTokenStillLetsFailbackBeTurnedOff(t *testing.T) {
+	// The hold blocks only the raise. A VM whose decision wants failback off
+	// still gets it off while the hold is fresh.
+	deps, stub, m, sl := driftRig(t, config.HAModeAuto, "pve01")
+	deps.Config.HA.Failback = new(bool)
+	reconcile := moveReconciler(deps, stub, m)
+	m.res.failback = failbackFlag(true)
+	m.res.comment = ha.WithFailbackHold(stub.comment, time.Now())
+	reconcile()
+	if ha.FailbackOf(m.res.failback) || !slices.Equal(sl.events, []string{"failback:false"}) {
+		t.Fatalf("events %v, want failback turned off under the hold", sl.events)
+	}
+}

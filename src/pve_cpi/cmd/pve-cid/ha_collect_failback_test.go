@@ -102,20 +102,23 @@ func TestCollectFailbackLeavesResourcesItCannotJudge(t *testing.T) {
 		edit func(f *fakeHA)
 		mode string
 	}{
-		"mode off":               {edit: func(f *fakeHA) { f.profile = haHealthyProfile("off") }, mode: "off"},
-		"operator's resource":    {edit: func(f *fakeHA) { f.resources[0].Comment = "operator made this" }},
-		"other Director's":       {edit: func(f *fakeHA) { f.resources[0].Comment = foreign }},
-		"barrier holds it":       {edit: func(f *fakeHA) { f.resources[0].Comment = haMarker + " bosh-narrow-from=started" }},
-		"VM of other Director":   {edit: func(f *fakeHA) { f.guests[0].Tags = "bosh-cpi;bosh-ha-managed;bosh-owner--bbbbbbbb-0000" }},
-		"not the CPI's VM":       {edit: func(f *fakeHA) { f.guests[0].Tags = "bosh-ha-managed" }},
-		"template":               {edit: func(f *fakeHA) { f.guests[0].Template = true }},
-		"storage index unread":   {edit: func(f *fakeHA) { f.storagesErr = errFake }},
-		"config unread":          {edit: func(f *fakeHA) { f.configErr = map[int]error{100: errFake} }},
-		"rules unread":           {edit: func(f *fakeHA) { f.rulesErr = errFake }},
-		"jobs unread":            {edit: func(f *fakeHA) { f.jobsErr = errFake }},
-		"storage not in index":   {edit: func(f *fakeHA) { f.configs[100]["scsi1"] = "gone:100/vm-100-disk-1.raw,size=1G" }},
-		"strict single-node pin": {edit: func(f *fakeHA) { f.rules = []ha.Rule{pinRule(100, haMarker, "n1")} }},
-		"no resource":            {edit: func(f *fakeHA) { f.resources = nil }},
+		"mode off":            {edit: func(f *fakeHA) { f.profile = haHealthyProfile("off") }, mode: "off"},
+		"operator's resource": {edit: func(f *fakeHA) { f.resources[0].Comment = "operator made this" }},
+		"other Director's":    {edit: func(f *fakeHA) { f.resources[0].Comment = foreign }},
+		"barrier holds it":    {edit: func(f *fakeHA) { f.resources[0].Comment = haMarker + " bosh-narrow-from=started" }},
+		// The attach that moves the VM into its set turns failback on once
+		// the pin names the set, and drops the hold then.
+		"a move holds failback off": {edit: func(f *fakeHA) { f.resources[0].Comment = ha.WithFailbackHold(haMarker, haNow) }},
+		"VM of other Director":      {edit: func(f *fakeHA) { f.guests[0].Tags = "bosh-cpi;bosh-ha-managed;bosh-owner--bbbbbbbb-0000" }},
+		"not the CPI's VM":          {edit: func(f *fakeHA) { f.guests[0].Tags = "bosh-ha-managed" }},
+		"template":                  {edit: func(f *fakeHA) { f.guests[0].Template = true }},
+		"storage index unread":      {edit: func(f *fakeHA) { f.storagesErr = errFake }},
+		"config unread":             {edit: func(f *fakeHA) { f.configErr = map[int]error{100: errFake} }},
+		"rules unread":              {edit: func(f *fakeHA) { f.rulesErr = errFake }},
+		"jobs unread":               {edit: func(f *fakeHA) { f.jobsErr = errFake }},
+		"storage not in index":      {edit: func(f *fakeHA) { f.configs[100]["scsi1"] = "gone:100/vm-100-disk-1.raw,size=1G" }},
+		"strict single-node pin":    {edit: func(f *fakeHA) { f.rules = []ha.Rule{pinRule(100, haMarker, "n1")} }},
+		"no resource":               {edit: func(f *fakeHA) { f.resources = nil }},
 		// A parker stays stopped, so failback never moves it, and no
 		// set_vm_metadata or reboot_vm reaches it to set the flag.
 		"parker": {edit: func(f *fakeHA) { f.guests[0].Tags = "bosh-cpi;bosh-ha-managed;" + pve.ParkerTag }},
