@@ -11,6 +11,7 @@ import (
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
@@ -26,6 +27,27 @@ type widenCluster struct {
 	vnets      []string
 	ruleReads  int
 	beforeRead map[int]func()
+	// failback is the HA resource's failback flag, nil for PVE's default of
+	// on, and failbackWrites records each value a call wrote.
+	failback       *sdkclient.PVEBool
+	failbackWrites []bool
+}
+
+func (c *widenCluster) GetHaResources(ctx context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {
+	res, err := c.attachHAStub.GetHaResources(ctx, sid)
+	if err == nil {
+		res.Failback = c.failback
+	}
+	return res, err
+}
+
+func (c *widenCluster) UpdateHaResources(_ context.Context, _ string, p *cluster.UpdateHaResourcesParams) error {
+	if p.Failback != nil {
+		v := sdkclient.PVEBool(*p.Failback)
+		c.failback = &v
+		c.failbackWrites = append(c.failbackWrites, *p.Failback)
+	}
+	return nil
 }
 
 func (c *widenCluster) ListSdnVnets(context.Context, *cluster.ListSdnVnetsParams) (*cluster.ListSdnVnetsResponse, error) {
@@ -316,6 +338,11 @@ func TestWidenNarrowedPin_ConcurrentChangeWins(t *testing.T) {
 	}
 	if r.cluster.updateCalls != 0 {
 		t.Errorf("rule updates = %d; want none", r.cluster.updateCalls)
+	}
+	// The concurrent pin names one node, where failback has nowhere to move
+	// the VM, so the reconcile turns it off.
+	if !slices.Equal(r.cluster.failbackWrites, []bool{false}) {
+		t.Errorf("failback writes = %v; want failback turned off under the one-node pin", r.cluster.failbackWrites)
 	}
 }
 
