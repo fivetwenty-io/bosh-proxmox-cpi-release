@@ -541,8 +541,8 @@ func TestDecideCreatedVMHA_SharedStorageStagesTheResource(t *testing.T) {
 	if !h.staged() || !rules.resources["vm:100"] {
 		t.Fatalf("staged %v resources %v, want vm:100 staged", h.staged(), rules.resources)
 	}
-	if got := rules.resComments["vm:100"]; got != (haIdentity{Owner: aaDirector}).marker() {
-		t.Errorf("resource comment %q, want the ownership marker", got)
+	if got := rules.resComments["vm:100"]; got != ha.WithDLBRecord((haIdentity{Owner: aaDirector}).marker(), false) {
+		t.Errorf("resource comment %q, want the ownership marker and the record of a VM outside the DLB", got)
 	}
 	if !slices.Equal(h.storages, []string{"nfs"}) {
 		t.Errorf("storages %v, want [nfs]", h.storages)

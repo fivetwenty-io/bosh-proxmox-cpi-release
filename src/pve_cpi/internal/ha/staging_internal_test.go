@@ -129,7 +129,7 @@ func TestStageRegistersAnIgnoredResource(t *testing.T) {
 		if err := rig.stager().Stage(context.Background(), d, stageMarker); err != nil {
 			t.Fatal(err)
 		}
-		if !d.StagedIgnored || rig.state != haStateIgnored || rig.comment != stageMarker ||
+		if !d.StagedIgnored || rig.state != haStateIgnored || rig.comment != WithDLBRecord(stageMarker, dlb) ||
 			rig.failback.Bool() || rig.rebalance.Bool() != dlb {
 			t.Fatalf("dlb=%v: staged %+v; decision %+v", dlb, rig, d)
 		}
@@ -147,15 +147,15 @@ func TestStageAdoptsOurOwnIgnoredResource(t *testing.T) {
 	if err := rig.stager().Stage(context.Background(), d, stageMarker); err != nil {
 		t.Fatal(err)
 	}
-	if !d.StagedIgnored || rig.comment != stageMarker || rig.failback.Bool() {
+	if !d.StagedIgnored || rig.comment != WithDLBRecord(stageMarker, false) || rig.failback.Bool() {
 		t.Fatalf("the comment and flags are rewritten: %+v", rig)
 	}
 	if !slices.Equal(rig.events, []string{"create:ignored", "get", "update:-"}) {
 		t.Fatalf("events %v", rig.events)
 	}
 
-	same := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, failback: pveBool(false),
-		rebalance: pveBool(false)}
+	same := &stageRig{exists: true, state: haStateIgnored, comment: WithDLBRecord(stageMarker, false),
+		failback: pveBool(false), rebalance: pveBool(false)}
 	if err := same.stager().Stage(context.Background(), stageDecision(), stageMarker); err != nil {
 		t.Fatal(err)
 	}
@@ -639,8 +639,8 @@ func TestStageLeavesTheFlagAloneOnAResourceThatAlreadyHoldsIt(t *testing.T) {
 	p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
 	in := baseInput(eligCfg(config.HAModeAuto, withDLB(true, "dlb")), vols("nfs:100/vm-101-disk-0")...)
 	in.NodeTargeted = true
-	rig := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, failback: pveBool(true),
-		rebalance: pveBool(false)}
+	rig := &stageRig{exists: true, state: haStateIgnored, comment: WithDLBRecord(stageMarker, false),
+		failback: pveBool(true), rebalance: pveBool(false)}
 	if err := rig.stager().Stage(context.Background(), mustDecide(t, p, in), stageMarker); err != nil {
 		t.Fatal(err)
 	}
@@ -666,7 +666,8 @@ func TestStageWritesTheDecisionsFailback(t *testing.T) {
 
 func TestStageReadsAnUnsetFailbackAsOn(t *testing.T) {
 	t.Parallel()
-	on := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, rebalance: pveBool(false)}
+	on := &stageRig{exists: true, state: haStateIgnored, comment: WithDLBRecord(stageMarker, false),
+		rebalance: pveBool(false)}
 	d := stageDecision()
 	d.Failback = true
 	if err := on.stager().Stage(context.Background(), d, stageMarker); err != nil {
@@ -676,7 +677,8 @@ func TestStageReadsAnUnsetFailbackAsOn(t *testing.T) {
 		t.Fatalf("an unset failback is PVE's default of on, so nothing is updated: %v", on.events)
 	}
 
-	off := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, rebalance: pveBool(false)}
+	off := &stageRig{exists: true, state: haStateIgnored, comment: WithDLBRecord(stageMarker, false),
+		rebalance: pveBool(false)}
 	if err := off.stager().Stage(context.Background(), stageDecision(), stageMarker); err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +690,8 @@ func TestStageReadsAnUnsetFailbackAsOn(t *testing.T) {
 
 func TestStageReadsAnUnsetAutoRebalanceAsOn(t *testing.T) {
 	t.Parallel()
-	on := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, failback: pveBool(false)}
+	on := &stageRig{exists: true, state: haStateIgnored, comment: WithDLBRecord(stageMarker, true),
+		failback: pveBool(false)}
 	d := stageDecision()
 	d.DLB = true
 	if err := on.stager().Stage(context.Background(), d, stageMarker); err != nil {
@@ -698,7 +701,8 @@ func TestStageReadsAnUnsetAutoRebalanceAsOn(t *testing.T) {
 		t.Fatalf("an unset auto-rebalance is PVE's default of on, so nothing is updated: %v", on.events)
 	}
 
-	off := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker, failback: pveBool(false)}
+	off := &stageRig{exists: true, state: haStateIgnored, comment: WithDLBRecord(stageMarker, false),
+		failback: pveBool(false)}
 	if err := off.stager().Stage(context.Background(), stageDecision(), stageMarker); err != nil {
 		t.Fatal(err)
 	}

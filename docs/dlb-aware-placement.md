@@ -43,6 +43,8 @@ The sentinel AZ provides per-workload opt-in without changing the global flag. L
 
 - When the HA decision registers the VM, the CPI adds it as a PVE HA resource with `auto-rebalance=1`, so CRS/DLB places and rebalances it.
 
+- The resource's comment records the VM's membership as `bosh-dlb=1`, and every other VM the CPI registers gets `bosh-dlb=0`. An attach, a pin widening, and a re-registration read the membership from that record, so an operator who turns Auto-Rebalance on or off in the PVE GUI changes how PVE balances the VM but not the placement class the CPI keeps for it. A resource that an earlier release registered has no record, so the CPI reads its `auto-rebalance` flag instead until the next registration writes one.
+
 - The VM gets no AZ pin, because there is no fixed AZ to pin to. Like every registered VM, it still carries a pin that is not strict, names every node it may run on, and records the storages of its volumes.
 
 To disable the sentinel entirely, set `pve.ha.dlb.az_name: ""`. With the sentinel disabled, only the master flag can trigger DLB.

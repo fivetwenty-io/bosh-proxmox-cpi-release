@@ -144,8 +144,8 @@ func TestStageSendsOnlyTheResourceKeysTheReleaseAccepts(t *testing.T) {
 func TestStageAdoptsAResourceWithoutAutoRebalanceOnAReleaseWithoutTheKey(t *testing.T) {
 	t.Parallel()
 	for _, version := range []string{keysPVE90, keysPVE91} {
-		rig := &keyRig{stageRig: stageRig{exists: true, state: haStateIgnored, comment: stageMarker,
-			failback: pveBool(false)}}
+		rig := &keyRig{stageRig: stageRig{exists: true, state: haStateIgnored,
+			comment: WithDLBRecord(stageMarker, false), failback: pveBool(false)}}
 		s := &Stager{Resources: rig, Owned: ownedMarker, Keys: keysOf(version)}
 		if err := s.Stage(context.Background(), stageDecision(), stageMarker); err != nil {
 			t.Fatalf("PVE %s: %v", version, err)

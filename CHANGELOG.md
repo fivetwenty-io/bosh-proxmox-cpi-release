@@ -48,6 +48,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - The CPI now names the `auto-rebalance` key of an HA resource only when every online node runs pve-manager 9.1.14 or later, which is the first release whose HA manager has the key. PVE 9.0, and 9.1 before 9.1.14, refuse a write that names it, so staging, and the barrier's re-registration, failed on those releases. `pve-cid ha` reports no failback finding on a cluster where a node runs a release without the `failback` key or where it could not read every node's release.
 
+- Staging now records whether the CPI registered a VM as a DLB VM on its HA resource's comment, as `bosh-dlb=1` or `bosh-dlb=0`. `attach_disk`, the pin widening, and the re-registration of a VM read the membership from that record, and fall back to the `auto-rebalance` flag only for a resource an earlier release registered. Before, an operator who turned Auto-Rebalance on in the PVE GUI for a VM outside the dynamic load balancer made the CPI treat the VM as a DLB VM, so a re-registration dropped its AZ preference and wrote `auto-rebalance` on.
+
 ### Added
 
 - `pve.ha.failback`, an optional boolean, turns `failback` off on every HA resource the CPI writes when it is `false`. Left unset, it lets the CPI turn the flag on for shared VMs. A cpi-config entry can override it under `pve_ha`.

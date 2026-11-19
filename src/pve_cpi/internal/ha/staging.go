@@ -213,7 +213,8 @@ func (s *Stager) logger() *log.Logger {
 
 // Stage registers the VM's resource as ignored with marker as its comment,
 // the decision's failback, and auto-rebalance on only for a DLB VM, and marks the
-// decision staged. It names auto-rebalance only where every online node's
+// decision staged. The comment also records whether the decision is a DLB VM
+// (see DLBRecordKey), replacing any record marker carried. It names auto-rebalance only where every online node's
 // release has the key, and failback where the release has it or the decision
 // turns it off (see ResourceKeys). A resource that already exists counts as
 // staged only when it carries this Director's marker and requests ignored,
@@ -233,7 +234,8 @@ func (s *Stager) Stage(ctx context.Context, d *VMDecision, marker string) error 
 	}
 	ignored, failback, rebalance := haStateIgnored, d.Failback, d.DLB
 	failbackKey, rebalanceKey := s.Keys.sendsFailback(failback), s.Keys.AutoRebalance
-	create := &sdkcluster.CreateHaResourcesParams{Sid: d.SID, State: &ignored, Comment: &marker}
+	comment := WithDLBRecord(marker, d.DLB)
+	create := &sdkcluster.CreateHaResourcesParams{Sid: d.SID, State: &ignored, Comment: &comment}
 	if failbackKey {
 		create.Failback = &failback
 	}
@@ -256,9 +258,9 @@ func (s *Stager) Stage(ctx context.Context, d *VMDecision, marker string) error 
 		return cpierrors.Retriable("ha stage: %s already exists and %s, so the CPI leaves it alone and does not "+
 			"register VM %d; remove the resource or let the earlier call finish, and retry", d.SID, blocker, d.VMID)
 	}
-	if got.Comment == nil || *got.Comment != marker || failbackKey && FailbackOf(got.Failback) != failback ||
+	if got.Comment == nil || *got.Comment != comment || failbackKey && FailbackOf(got.Failback) != failback ||
 		rebalanceKey && AutoRebalanceOf(got.AutoRebalance) != rebalance {
-		update := &sdkcluster.UpdateHaResourcesParams{Comment: &marker}
+		update := &sdkcluster.UpdateHaResourcesParams{Comment: &comment}
 		if failbackKey {
 			update.Failback = &failback
 		}

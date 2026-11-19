@@ -111,9 +111,11 @@ func WithoutReaddTags(tags []string) []string {
 
 // ReaddRecord is what the re-registration needs from the HA resource and the
 // pin after the removal has taken them away: the resource's comment, which
-// carries the ownership marker, its auto-rebalance flag, which says the VM is
-// a DLB VM, and the nodes of the VM's pin and whether it was strict, which is
-// a constraint the decision must keep.
+// carries the ownership marker, whether the CPI counts the VM as a DLB VM
+// (see InDLB), and the nodes of the VM's pin and whether it was strict, which
+// is a constraint the decision must keep. AutoRebalance holds the DLB
+// membership, and it keeps its name and JSON key so a record an earlier
+// release wrote still reads.
 type ReaddRecord struct {
 	Comment       string   `json:"comment"`
 	AutoRebalance bool     `json:"auto_rebalance,omitempty"`
@@ -857,7 +859,7 @@ func (r *readd) snapshot(
 	}
 	rec := ReaddRecord{
 		Comment:       strings.TrimSpace(*stripNarrowMark(&comment)),
-		AutoRebalance: r.in.Stager.Keys.AutoRebalanceOf(res.AutoRebalance),
+		AutoRebalance: r.in.Stager.Keys.InDLB(res.Comment, res.AutoRebalance),
 	}
 	set, err := r.in.Stager.ReadRules(ctx)
 	if err != nil {

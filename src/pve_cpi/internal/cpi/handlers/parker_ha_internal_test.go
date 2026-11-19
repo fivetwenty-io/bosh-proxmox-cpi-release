@@ -51,8 +51,9 @@ func TestParkerHA_RegistersAWidelySharedParkerAsStopped(t *testing.T) {
 	if !slices.Equal(r.cluster.log.events, want) {
 		t.Fatalf("events %v, want %v", r.cluster.log.events, want)
 	}
-	if r.state() != parkerHAStateStopped || r.cluster.res[phSID].comment != ourMarker() {
-		t.Fatalf("resource %+v, want stopped with this Director's marker", r.cluster.res[phSID])
+	if r.state() != parkerHAStateStopped || r.cluster.res[phSID].comment != ha.WithDLBRecord(ourMarker(), false) {
+		t.Fatalf("resource %+v, want stopped with this Director's marker and a parker's DLB record",
+			r.cluster.res[phSID])
 	}
 	pin := r.pin(t)
 	if pin == nil || pin.Strict {

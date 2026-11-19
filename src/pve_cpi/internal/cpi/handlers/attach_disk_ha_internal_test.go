@@ -538,6 +538,41 @@ func TestAttachHAInput_ReadsAnUnsetAutoRebalanceAsOn(t *testing.T) {
 	}
 }
 
+// TestAttachHAInput_ReadsTheDLBRecordBeforeTheFlag proves the attach and the
+// pin widening take a VM's DLB membership from the record staging wrote on
+// the resource's comment, so an operator who turns auto-rebalance on in the
+// GUI for a VM outside the DLB, or off for a DLB VM, never changes the VM's
+// placement class. A resource without a record falls back to the flag.
+func TestAttachHAInput_ReadsTheDLBRecordBeforeTheFlag(t *testing.T) {
+	cfg := icMinConfig()
+	cfg.HA = haModeAuto()
+	vmCfg := map[string]any{"scsi0": "nfs:vm-100-disk-0,size=10G"}
+	on, off := sdkclient.PVEBool(true), sdkclient.PVEBool(false)
+	marker := haIdentity{Owner: aaDirector}.marker()
+	for name, tc := range map[string]struct {
+		comment string
+		flag    *sdkclient.PVEBool
+		want    bool
+	}{
+		"record off, flag unset": {ha.WithDLBRecord(marker, false), nil, false},
+		"record off, flag on":    {ha.WithDLBRecord(marker, false), &on, false},
+		"record on, flag off":    {ha.WithDLBRecord(marker, true), &off, true},
+		"no record, flag unset":  {marker, nil, true},
+	} {
+		comment := tc.comment
+		res := &cluster.GetHaResourcesResponse{Comment: &comment, AutoRebalance: tc.flag}
+		in := attachHAInput(Deps{Config: cfg}, pve92ResourceKeys, 100, "pve01", vmCfg, res, nil,
+			resolvedDisk{volid: "nfs:vm-100-disk-1"})
+		if in.InDLBAZ != tc.want {
+			t.Errorf("%s: attach InDLBAZ = %v, want %v", name, in.InDLBAZ, tc.want)
+		}
+		got := pinWidenInput(Deps{Config: cfg}, pve92ResourceKeys, 100, "pve01", vmCfg, res)
+		if got.InDLBAZ != tc.want {
+			t.Errorf("%s: widen InDLBAZ = %v, want %v", name, got.InDLBAZ, tc.want)
+		}
+	}
+}
+
 // TestAttachHAInput_ReadsAnUnsetAutoRebalanceAsOffWithoutTheKey proves a
 // release without the auto-rebalance key, PVE 9.0 and 9.1 before 9.1.14,
 // never reads a resource as a DLB VM, because none of its resources carries

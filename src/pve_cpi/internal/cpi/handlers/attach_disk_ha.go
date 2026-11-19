@@ -565,7 +565,7 @@ func attachHAInput(
 	deps Deps, keys ha.ResourceKeys, vmid int, node string, cfg map[string]any, res *cluster.GetHaResourcesResponse,
 	oldPin *ha.Rule, rd resolvedDisk,
 ) ha.VMInput {
-	return attachDecisionInput(deps, vmid, node, cfg, keys.AutoRebalanceOf(res.AutoRebalance), oldPin, rd)
+	return attachDecisionInput(deps, vmid, node, cfg, keys.InDLB(res.Comment, res.AutoRebalance), oldPin, rd)
 }
 
 // attachDecisionInput is attachHAInput with the resource's auto-rebalance flag

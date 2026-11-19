@@ -339,7 +339,9 @@ func (r *readdRig) registeredAgain(t *testing.T, res ReregisterResult, err error
 	if res.Outcome != ReaddRegistered || res.Node != "a" {
 		t.Fatalf("result %+v (events %v)", res, r.events)
 	}
-	if !r.exists || r.requested != haStateStarted || r.comment != readdMarker {
+	// The resource comes back with its marker and the DLB record of the
+	// decision, which is never a DLB VM on the rig's profile.
+	if !r.exists || r.requested != haStateStarted || r.comment != WithDLBRecord(readdMarker, false) {
 		t.Fatalf("resource exists=%v requested=%s comment=%q", r.exists, r.requested, r.comment)
 	}
 	if _, _, ok := ReaddTagOf(r.tags); ok || r.record != nil {

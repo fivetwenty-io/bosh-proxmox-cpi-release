@@ -226,7 +226,7 @@ func pinWidenInput(
 		Node:        node,
 		Volumes:     haVolumesOfConfig(cfg, node, nil),
 		CPUType:     ha.EffectiveCPUType(deps.Config, nil, liveCPU),
-		InDLBAZ:     keys.AutoRebalanceOf(res.AutoRebalance),
+		InDLBAZ:     keys.InDLB(res.Comment, res.AutoRebalance),
 		LinkedClone: configHasLinkedClone(cfg),
 		HAManaged:   true,
 	}
