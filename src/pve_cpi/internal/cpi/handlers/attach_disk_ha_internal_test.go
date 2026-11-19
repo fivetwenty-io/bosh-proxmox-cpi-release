@@ -502,14 +502,24 @@ type attachRunRes struct {
 	// failback is the resource's failback flag, nil for PVE's default of on.
 	failback    *sdkclient.PVEBool
 	failbackErr error
+	// version numbers the content of resources.cfg, which its digest names.
+	// Every write that changes the resource changes it, and a write that
+	// names another digest is refused the way PVE refuses it.
+	version int
+	// afterFailbackWrite, when set, runs once after the next write of the
+	// failback flag has landed.
+	afterFailbackWrite func()
 }
+
+func (r *attachRunRes) digest() string { return fmt.Sprintf("digest-%d", r.version) }
 
 func (r *attachRunRes) GetHaResources(_ context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {
 	if r.gone {
 		return nil, errors.New("no such resource '" + sid + "'")
 	}
 	state, comment := r.state, r.comment
-	return &cluster.GetHaResourcesResponse{Sid: sid, State: &state, Comment: &comment, Failback: r.failback}, nil
+	return &cluster.GetHaResourcesResponse{Sid: sid, State: &state, Comment: &comment, Failback: r.failback,
+		Digest: r.digest()}, nil
 }
 
 func (r *attachRunRes) CreateHaResources(context.Context, *cluster.CreateHaResourcesParams) error {
@@ -518,10 +528,17 @@ func (r *attachRunRes) CreateHaResources(context.Context, *cluster.CreateHaResou
 }
 
 func (r *attachRunRes) UpdateHaResources(_ context.Context, _ string, p *cluster.UpdateHaResourcesParams) error {
-	if p.Failback != nil {
-		if r.failbackErr != nil {
-			return r.failbackErr
+	if p.Failback != nil && r.failbackErr != nil {
+		return r.failbackErr
+	}
+	if p.Digest != nil && *p.Digest != r.digest() {
+		if p.Failback != nil {
+			r.log.add(fmt.Sprintf("stale:failback:%v", *p.Failback))
 		}
+		return errors.New("detected modified configuration - file changed by other user? Try again.")
+	}
+	before := fmt.Sprintf("%s|%s|%v", r.state, r.comment, ha.FailbackOf(r.failback))
+	if p.Failback != nil {
 		v := sdkclient.PVEBool(*p.Failback)
 		r.failback = &v
 		r.log.add(fmt.Sprintf("failback:%v", *p.Failback))
@@ -535,6 +552,13 @@ func (r *attachRunRes) UpdateHaResources(_ context.Context, _ string, p *cluster
 		r.comment = *p.Comment
 	case p.Delete != nil && *p.Delete == "comment":
 		r.comment = ""
+	}
+	if fmt.Sprintf("%s|%s|%v", r.state, r.comment, ha.FailbackOf(r.failback)) != before {
+		r.version++
+	}
+	if hook := r.afterFailbackWrite; p.Failback != nil && hook != nil {
+		r.afterFailbackWrite = nil
+		hook()
 	}
 	return nil
 }

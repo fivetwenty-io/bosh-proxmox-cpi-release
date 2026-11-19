@@ -157,7 +157,7 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 	}
 	legacyManaged := rd.stableID == "" && deps.Config.HAModeValue() == config.HAModeManaged
 	if attachSkipsHADecision(oldPin, res, storage, legacyManaged) {
-		return skippedAttachFailback(ctx, deps, vmCID, rd, vmid, res, storage), nil
+		return skippedAttachFailback(ctx, deps, vmCID, rd, vmid, res, oldPin, storage), nil
 	}
 
 	profile, err := resolveHAProfile(ctx, deps)
@@ -264,13 +264,16 @@ func decideAttachHA(ctx context.Context, deps Deps, vmCID string, rd resolvedDis
 // decision because the VM's pin already records the disk's storage. A pin
 // that records a storage says nothing about the failback flag, which an
 // operator or an older release may have turned on, so a resource that reads
-// failback on while the disk's storage is not proven shared gets an attach
-// that turns it off before the disk lands. A storage the profile cannot
-// classify counts as not shared. Every other skip gets no HA action.
+// failback on under a strict pin, while the disk's storage is not proven
+// shared, gets an attach that turns it off before the disk lands. A storage
+// the profile cannot classify counts as not shared. A non-strict pin needs no
+// check and no profile: the decision writes one only when every node reaches
+// every volume, so each storage it records was shared when it was recorded.
+// Every other skip gets no HA action.
 func skippedAttachFailback(ctx context.Context, deps Deps, vmCID string, rd resolvedDisk, vmid int,
-	res *cluster.GetHaResourcesResponse, storage string,
+	res *cluster.GetHaResourcesResponse, pin *ha.Rule, storage string,
 ) *attachHA {
-	if !ha.FailbackOf(res.Failback) {
+	if !ha.FailbackOf(res.Failback) || pin == nil || !pin.Strict {
 		return nil
 	}
 	logger := deps.Log(ctx)
@@ -677,8 +680,19 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 			MotionWait: haMotionWait(h.deps),
 			Label:      op + ": attach the disk inside the HA barrier",
 			Apply: func(ctx context.Context, _ string) error {
+				if !h.decision.Failback {
+					// A reconcile in another process may have turned failback
+					// on since the write before the barrier, from a config
+					// without this disk.
+					if err := h.lowerFailback(ctx); err != nil {
+						return err
+					}
+				}
 				node, err := attach(ctx)
 				landed = node
+				if err == nil && !h.decision.Failback {
+					h.recheckFailbackOff(ctx)
+				}
 				return err
 			},
 		},
@@ -701,7 +715,7 @@ func (h *attachHA) run(ctx context.Context, attach func(context.Context) (string
 		return err
 	}
 	if h.decision.Failback {
-		h.raiseFailback(ctx, narrowDeps.Resources)
+		h.syncFailback(ctx, landed)
 	}
 	if !h.replicaChanged.IsZero() {
 		h.restampReplica(ctx, landed)
@@ -752,20 +766,18 @@ func (h *attachHA) recheckFailbackOff(ctx context.Context) {
 	}
 }
 
-// raiseFailback turns failback on, after the attach, for a VM whose volumes
-// all stay on shared storage with the new disk. A write that fails is logged,
-// and the next call that touches the VM sets the flag (see
-// reconcileVMFailback).
-func (h *attachHA) raiseFailback(ctx context.Context, api ha.FailbackAPI) {
-	changed, err := setVMFailback(ctx, api, h.deps.RequestDirectorUUID, h.vmid, true)
-	logger := h.logger.With(log.Int(metadataKeyVMID, h.vmid))
-	switch {
-	case err != nil:
-		logger.Warn(attachHAOp+": failback could not be turned on for the VM's HA resource; a later call turns "+
-			"it on", log.Err(err))
-	case changed:
-		logger.Info(attachHAOp + ": turned on failback for the VM's HA resource, whose volumes are all shared")
+// syncFailback decides failback afresh after an attach whose decision allows
+// it, and sets it through the barrier's resource client (see syncVMFailback).
+// The fresh decision applies every check the reconcile makes, the replicate
+// tag and the replica tokens on the pin included, and it reads the VM's pin as
+// the barrier left it. A write that fails is logged, and the next call that
+// touches the VM sets the flag.
+func (h *attachHA) syncFailback(ctx context.Context, node string) {
+	if node == "" {
+		node = h.node
 	}
+	syncVMFailback(ctx, h.deps, h.narrow.Resources, h.profile, attachHAOp, h.vmid,
+		pve.VMLocation{Node: node, Found: true}, h.logger)
 }
 
 // restampReplica records on a replicate VM's pin, after the attach, the time

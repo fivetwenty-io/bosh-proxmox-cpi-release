@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"testing"
 
@@ -19,17 +21,25 @@ import (
 
 // failbackCluster is the attach stub with a failback flag on VM 100's HA
 // resource, nil for PVE's default of on, and a record of the flags written.
+//
+// Its resources.cfg has a digest that changes with every write that changes
+// the file, and a write that names an older digest is refused the way PVE
+// refuses it.
 type failbackCluster struct {
 	*attachHAStub
 	failback  *sdkclient.PVEBool
 	writes    []bool
 	updateErr error
+	version   int
 }
+
+func (c *failbackCluster) digest() string { return fmt.Sprintf("digest-%d", c.version) }
 
 func (c *failbackCluster) GetHaResources(ctx context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {
 	res, err := c.attachHAStub.GetHaResources(ctx, sid)
 	if res != nil {
 		res.Failback = c.failback
+		res.Digest = c.digest()
 	}
 	return res, err
 }
@@ -41,7 +51,13 @@ func (c *failbackCluster) UpdateHaResources(_ context.Context, _ string, p *clus
 	if c.updateErr != nil {
 		return c.updateErr
 	}
+	if p.Digest != nil && *p.Digest != c.digest() {
+		return errors.New("detected modified configuration - file changed by other user? Try again.")
+	}
 	c.writes = append(c.writes, *p.Failback)
+	if ha.FailbackOf(c.failback) != *p.Failback || c.failback == nil {
+		c.version++
+	}
 	c.failback = failbackFlag(*p.Failback)
 	return nil
 }
@@ -54,6 +70,10 @@ type failbackRig struct {
 	cfg     map[string]any
 	loc     pve.VMLocation
 	obs     *log.Observer
+	// onConfig, when set, runs at each config read, numbered from 1, and the
+	// config it returns, when not nil, is the one the read answers.
+	onConfig    func(read int) map[string]any
+	configReads int
 }
 
 func newFailbackRig(t *testing.T, failback *sdkclient.PVEBool) *failbackRig {
@@ -65,7 +85,15 @@ func newFailbackRig(t *testing.T, failback *sdkclient.PVEBool) *failbackRig {
 		cfg: map[string]any{"scsi0": "nfs:vm-100-disk-0,size=10G", "cpu": "x86-64-v3", "tags": haManagedTag},
 		loc: pve.VMLocation{Node: "pve01", Found: true, Tags: haManagedTag},
 	}
-	q := &icQEMUService{configFn: func(context.Context, string, int) (map[string]any, error) { return r.cfg, nil }}
+	q := &icQEMUService{configFn: func(context.Context, string, int) (map[string]any, error) {
+		r.configReads++
+		if r.onConfig != nil {
+			if cfg := r.onConfig(r.configReads); cfg != nil {
+				return cfg, nil
+			}
+		}
+		return maps.Clone(r.cfg), nil
+	}}
 	r.deps.PVE = &icPVEClient{clusterSvc: r.cluster, qemuSvc: q}
 	logger, obs := log.NewObservedLogger(log.LevelDebug)
 	r.deps.Logger, r.obs = logger, obs
@@ -239,4 +267,53 @@ func TestReconcileVMFailback_HoldVMAfterDetachKeepsFailbackOff(t *testing.T) {
 func withIndexedFailback(r *failbackRig) Deps {
 	r.deps.PVE.(*icPVEClient).clusterSvc = indexedFailbackCluster{r.cluster}
 	return r.deps
+}
+
+// TestReconcileVMFailback_DiskLandingBetweenReadAndWriteTurnsFailbackOffAgain
+// lands a node-local disk, as an attach in another process does, after the
+// reconcile has read the VM's config and before it writes. Nothing in
+// resources.cfg changed, so the raise lands, and the reconcile must then see
+// the disk in a fresh read of the config and turn failback off again.
+func TestReconcileVMFailback_DiskLandingBetweenReadAndWriteTurnsFailbackOffAgain(t *testing.T) {
+	r := newFailbackRig(t, failbackFlag(false))
+	r.onConfig = func(read int) map[string]any {
+		if read != 1 {
+			return nil
+		}
+		stale := maps.Clone(r.cfg)
+		r.cfg["scsi1"] = testPinStorage + ":vm-100-disk-1,size=1G"
+		return stale
+	}
+	r.reconcile()
+	r.requireWrites(t, true, false)
+	if failbackLogged(r.obs, log.LevelWarn, "turned failback off again") != 1 {
+		t.Fatalf("the undone raise must be logged as a warning, logs %v", r.obs.All())
+	}
+}
+
+// TestReconcileVMFailback_ResourceChangedSinceTheReadIsNotRaised changes
+// resources.cfg, as the off-write or the barrier of an attach in another
+// process does, after the reconcile has read the resource. The raise names
+// the digest it read, so PVE refuses it and failback stays off.
+func TestReconcileVMFailback_ResourceChangedSinceTheReadIsNotRaised(t *testing.T) {
+	r := newFailbackRig(t, failbackFlag(false))
+	r.onConfig = func(int) map[string]any {
+		r.cluster.version++
+		return nil
+	}
+	r.reconcile()
+	r.requireWrites(t)
+	if r.cluster.failback.Bool() {
+		t.Fatal("failback must stay off")
+	}
+}
+
+// TestReconcileVMFailback_LeavesAResourceTheBarrierHolds leaves the flag of a
+// resource the narrowing barrier holds to the call that holds it.
+func TestReconcileVMFailback_LeavesAResourceTheBarrierHolds(t *testing.T) {
+	r := newFailbackRig(t, failbackFlag(false))
+	r.cluster.state = "ignored"
+	r.cluster.comment = haIdentity{Owner: aaDirector}.marker() + " bosh-narrow-from=started"
+	r.reconcile()
+	r.requireWrites(t)
 }

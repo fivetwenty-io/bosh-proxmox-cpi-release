@@ -6,6 +6,7 @@ import (
 	"slices"
 	"testing"
 
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
@@ -129,3 +130,74 @@ func TestExpectedFailback(t *testing.T) {
 }
 
 func failbackFlag(b bool) *bool { return &b }
+
+// casRig is one HA resource whose writes PVE checks against the digest of
+// resources.cfg, which changes with every write that changes the file.
+type casRig struct {
+	version   int
+	failback  bool
+	writes    []bool
+	updateErr error
+}
+
+func (r *casRig) digest() string { return "digest-" + string(rune('a'+r.version)) }
+
+func (r *casRig) GetHaResources(_ context.Context, sid string) (*sdkcluster.GetHaResourcesResponse, error) {
+	c := stageMarker
+	return &sdkcluster.GetHaResourcesResponse{Sid: sid, Comment: &c, Failback: pveBool(r.failback),
+		Digest: r.digest()}, nil
+}
+
+func (r *casRig) UpdateHaResources(_ context.Context, _ string, p *sdkcluster.UpdateHaResourcesParams) error {
+	if r.updateErr != nil {
+		return r.updateErr
+	}
+	if p.Digest != nil && *p.Digest != r.digest() {
+		return errors.New("detected modified configuration - file changed by other user? Try again.")
+	}
+	r.writes = append(r.writes, *p.Failback)
+	if r.failback != *p.Failback {
+		r.failback = *p.Failback
+		r.version++
+	}
+	return nil
+}
+
+func TestRaiseFailbackWritesOnlyAgainstTheDigestItRead(t *testing.T) {
+	t.Parallel()
+	rig := &casRig{}
+	read := rig.digest()
+	raised, err := RaiseFailback(context.Background(), rig, "vm:101", read)
+	if err != nil || !raised || !rig.failback {
+		t.Fatalf("raised = %v, err = %v, failback %v; a write against the current digest lands", raised, err,
+			rig.failback)
+	}
+
+	stale := &casRig{}
+	read = stale.digest()
+	// Another process turns failback off, and back on, and off again after
+	// the read, so the file changed even though the flag reads as it did.
+	stale.version += 2
+	raised, err = RaiseFailback(context.Background(), stale, "vm:101", read)
+	if err != nil || raised || stale.failback || len(stale.writes) != 0 {
+		t.Fatalf("raised = %v, err = %v, writes %v; a write against a stale digest must not land", raised, err,
+			stale.writes)
+	}
+}
+
+func TestRaiseFailbackNeedsADigest(t *testing.T) {
+	t.Parallel()
+	rig := &casRig{}
+	raised, err := RaiseFailback(context.Background(), rig, "vm:101", "")
+	if err != nil || raised || len(rig.writes) != 0 {
+		t.Fatalf("raised = %v, err = %v, writes %v; without a digest nothing is written", raised, err, rig.writes)
+	}
+}
+
+func TestRaiseFailbackReturnsOtherWriteErrors(t *testing.T) {
+	t.Parallel()
+	rig := &casRig{updateErr: errors.New("500 cfs lock")}
+	if _, err := RaiseFailback(context.Background(), rig, "vm:101", rig.digest()); err == nil {
+		t.Fatal("a failed write that is not a digest conflict must be returned")
+	}
+}

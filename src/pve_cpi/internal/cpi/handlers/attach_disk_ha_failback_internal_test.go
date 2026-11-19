@@ -3,13 +3,18 @@ package handlers
 import (
 	"context"
 	"errors"
+	"maps"
 	"slices"
 	"testing"
 
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 func failbackFlag(b bool) *sdkclient.PVEBool {
@@ -184,5 +189,187 @@ func TestDecideAttachHA_SkippedDecisionLeavesFailbackForASharedDisk(t *testing.T
 	h, err := decideAttachHA(context.Background(), deps, "100", sharedDisk())
 	if err != nil || h != nil {
 		t.Fatalf("decision: h %+v err %v, want no HA action", h, err)
+	}
+}
+
+// sharedResCluster answers the HA resource of VM 100 from res, the resource
+// an attach's barrier reads and writes, and the rest from the attach stub, so
+// a reconcile in another process and an attach act on one resource.
+type sharedResCluster struct {
+	*attachHAStub
+	res *attachRunRes
+}
+
+func (c *sharedResCluster) GetHaResources(ctx context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {
+	return c.res.GetHaResources(ctx, sid)
+}
+
+func (c *sharedResCluster) UpdateHaResources(ctx context.Context, sid string,
+	p *cluster.UpdateHaResourcesParams,
+) error {
+	return c.res.UpdateHaResources(ctx, sid, p)
+}
+
+// raceRig is a hold attach of a node-local disk to VM 100, whose pin is
+// non-strict over three nodes and records nfs, and the deps of a reconcile in
+// another process that acts on the same HA resource and VM config.
+type raceRig struct {
+	h      *attachHA
+	res    *attachRunRes
+	sl     *stagingLog
+	vmCfg  map[string]any
+	rdeps  Deps
+	reads  int
+	onRead func(read int) map[string]any
+}
+
+func newRaceRig(t *testing.T, failback *sdkclient.PVEBool) *raceRig {
+	t.Helper()
+	deps, stub, _ := attachRig(config.HAModeAuto)
+	deps.Config.HA.LocalPolicy = haChoiceOf(config.HALocalPolicyHold)
+	stub.recordPin("nfs")
+	r := &raceRig{sl: &stagingLog{},
+		vmCfg: map[string]any{"scsi0": "nfs:vm-100-disk-0,size=10G", "cpu": "x86-64-v3", "tags": haManagedTag}}
+	deps.PVE.(*icPVEClient).qemuSvc = &icQEMUService{configFn: func(context.Context, string, int) (map[string]any,
+		error,
+	) {
+		return maps.Clone(r.vmCfg), nil
+	}}
+	h, err := decideAttachHA(context.Background(), deps, "100", localDisk())
+	if err != nil || h == nil || h.action != attachHAGuarded || h.decision.Failback {
+		t.Fatalf("decision: h %+v err %v, want a guarded attach without failback", h, err)
+	}
+	r.h = h
+	r.res = &attachRunRes{log: r.sl, state: "started", comment: stub.comment, failback: failback}
+	h.narrow = barrierView(r.res)
+	r.rdeps = deps
+	r.rdeps.Logger = log.NewNopLogger()
+	r.rdeps.PVE = &icPVEClient{clusterSvc: &sharedResCluster{attachHAStub: stub, res: r.res},
+		qemuSvc: &icQEMUService{configFn: func(context.Context, string, int) (map[string]any, error) {
+			r.reads++
+			if r.onRead != nil {
+				if cfg := r.onRead(r.reads); cfg != nil {
+					return cfg, nil
+				}
+			}
+			return maps.Clone(r.vmCfg), nil
+		}}}
+	return r
+}
+
+// attach is the rest of the attach: it lands the node-local disk in the VM's
+// config and checks that failback is off when it does.
+func (r *raceRig) attach(t *testing.T) func(context.Context) (string, error) {
+	return func(context.Context) (string, error) {
+		if ha.FailbackOf(r.res.failback) {
+			t.Error("the node-local disk lands while the resource has failback on")
+		}
+		r.vmCfg["scsi1"] = testPinStorage + ":vm-100-disk-1,size=1G"
+		r.sl.add("attach")
+		return "pve01", nil
+	}
+}
+
+func (r *raceRig) reconcile() {
+	reconcileVMFailback(context.Background(), r.rdeps, "set_vm_metadata", 100,
+		pve.VMLocation{Node: "pve01", Found: true, Tags: haManagedTag}, r.rdeps.Logger)
+}
+
+// TestAttachHARun_ReconcileThatReadBeforeTheAttachCannotRaiseFailback reads
+// the resource and the config in a reconcile before the attach, runs the whole
+// attach, and only then lets the reconcile write. The reconcile decided from a
+// config without the node-local disk, so it wants failback on, and the write
+// must not land.
+func TestAttachHARun_ReconcileThatReadBeforeTheAttachCannotRaiseFailback(t *testing.T) {
+	r := newRaceRig(t, failbackFlag(false))
+	r.onRead = func(read int) map[string]any {
+		if read != 1 {
+			return nil
+		}
+		stale := maps.Clone(r.vmCfg)
+		if err := r.h.run(context.Background(), r.attach(t)); err != nil {
+			t.Errorf("attach: %v", err)
+		}
+		return stale
+	}
+	r.reconcile()
+	if ha.FailbackOf(r.res.failback) {
+		t.Fatalf("failback is on after the race, events %v", r.sl.events)
+	}
+	if slices.Contains(r.sl.events, "failback:true") {
+		t.Fatalf("events %v; the reconcile's write must not land", r.sl.events)
+	}
+}
+
+// TestAttachHARun_ReconcileBeforeTheBarrierIsUndoneBeforeTheDiskLands runs a
+// whole reconcile right after the attach turned failback off and before the
+// barrier holds the resource. The reconcile sees a config without the new
+// disk and turns failback on, and the attach must turn it off again before
+// the disk lands.
+func TestAttachHARun_ReconcileBeforeTheBarrierIsUndoneBeforeTheDiskLands(t *testing.T) {
+	r := newRaceRig(t, nil)
+	r.res.afterFailbackWrite = r.reconcile
+	if err := r.h.run(context.Background(), r.attach(t)); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if !slices.Contains(r.sl.events, "failback:true") {
+		t.Fatalf("events %v; the reconcile was meant to turn failback on in between", r.sl.events)
+	}
+	if ha.FailbackOf(r.res.failback) {
+		t.Fatalf("failback is on after the attach, events %v", r.sl.events)
+	}
+}
+
+// TestAttachHARun_SkippedDecisionTurnsFailbackOffAgainAfterTheDiskLands has a
+// call in another process turn failback on while a skipped-decision attach of
+// a node-local disk lands it, and the attach turns it off again.
+func TestAttachHARun_SkippedDecisionTurnsFailbackOffAgainAfterTheDiskLands(t *testing.T) {
+	deps, stub, _ := attachRig(config.HAModeAuto)
+	deps.Config.HA.LocalPolicy = haChoiceOf(config.HALocalPolicyHold)
+	stub.pin(true, "pve01", "nfs", testPinStorage)
+	h, err := decideAttachHA(context.Background(), deps, "100", localDisk())
+	if err != nil || h == nil || !h.failbackOff {
+		t.Fatalf("decision: h %+v err %v", h, err)
+	}
+	sl := &stagingLog{}
+	res := &attachRunRes{log: sl, state: "started", comment: stub.comment}
+	h.narrow = barrierView(res)
+	if err := h.run(context.Background(), func(context.Context) (string, error) {
+		res.failback = failbackFlag(true)
+		sl.add("attach")
+		return "pve01", nil
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := []string{"failback:false", "attach", "failback:false"}; !slices.Equal(sl.events, want) {
+		t.Fatalf("events %v, want %v", sl.events, want)
+	}
+}
+
+// TestAttachHARun_ReplicateTaggedVMKeepsFailbackOffWithASharedDisk attaches a
+// shared disk to a VM with the replicate tag whose volumes are all shared.
+// The decision alone would allow failback, and the attach must apply the
+// replica checks the reconcile makes and leave it off.
+func TestAttachHARun_ReplicateTaggedVMKeepsFailbackOffWithASharedDisk(t *testing.T) {
+	deps, stub, _ := attachRig(config.HAModeAuto)
+	stub.recordPin("nfs")
+	deps.PVE.(*icPVEClient).qemuSvc = &icQEMUService{configFn: func(context.Context, string, int) (map[string]any,
+		error,
+	) {
+		return map[string]any{"scsi0": "nfs:vm-100-disk-0,size=10G", "cpu": "x86-64-v3",
+			"tags": haManagedTag + ";" + haReplicaTag}, nil
+	}}
+	h, err := decideAttachHA(context.Background(), deps, "100", narrowingDisk())
+	if err != nil || h == nil || h.action != attachHAGuarded || !h.replicaTagged {
+		t.Fatalf("decision: h %+v err %v, want a guarded attach of a replicate-tagged VM", h, err)
+	}
+	sl := &stagingLog{}
+	res := &attachRunRes{log: sl, state: "started", comment: stub.comment, failback: failbackFlag(false)}
+	h.narrow = barrierView(res)
+	if err := h.run(context.Background(), func(context.Context) (string, error) { return "pve01", nil }); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if slices.Contains(sl.events, "failback:true") || ha.FailbackOf(res.failback) {
+		t.Fatalf("events %v; a replicate-tagged VM keeps failback off", sl.events)
 	}
 }

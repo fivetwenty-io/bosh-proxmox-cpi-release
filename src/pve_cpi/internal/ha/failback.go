@@ -62,6 +62,33 @@ func ReconcileFailback(ctx context.Context, api FailbackAPI, sid string, want bo
 	return true, nil
 }
 
+// RaiseFailback turns failback on for the resource sid only while
+// resources.cfg still has digest, the digest of the read the caller decided
+// from. PVE checks the digest under its HA domain lock, so a write that any
+// other writer of resources.cfg came before, such as an attach that turned
+// failback off or a narrowing barrier that holds the resource, is refused, and
+// RaiseFailback reports that it wrote nothing. An empty digest writes nothing
+// either, because the raise must never land unchecked. Any other failure is
+// returned.
+func RaiseFailback(ctx context.Context, api FailbackAPI, sid, digest string) (bool, error) {
+	if api == nil {
+		return false, cpierrors.Cloud("ha failback: the resource client must be set")
+	}
+	if digest == "" {
+		return false, nil
+	}
+	on := true
+	err := api.UpdateHaResources(ctx, sid, &sdkcluster.UpdateHaResourcesParams{Failback: &on, Digest: &digest})
+	switch {
+	case err == nil:
+		return true, nil
+	case IsDigestConflict(err):
+		return false, nil
+	}
+	return false, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+		fmt.Sprintf("ha failback: set failback on the HA resource %s", sid))
+}
+
 // FailbackFacts are what the expected failback flag of a CPI resource rests on
 // when no HA decision is at hand, which is how the doctor judges a resource.
 type FailbackFacts struct {
