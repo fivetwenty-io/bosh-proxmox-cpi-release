@@ -258,13 +258,9 @@ func HandleDetachDisk(deps Deps) Handler {
 		}
 		// A detach that succeeded may leave the VM with only shared volumes, so
 		// its HA resource gets the failback flag those call for. This runs after
-		// the disk's lifecycle has ended, with the request's own client.
-		failbackDeps := deps
-		defer func() {
-			if operationErr == nil {
-				reconcileDetachedVMFailback(ctx, failbackDeps, vmid)
-			}
-		}()
+		// the disk's lifecycle has ended, with the request's own client, which
+		// the deferred call's arguments capture here.
+		defer reconcileFailbackAfterDetach(ctx, deps, vmid, &operationErr)
 
 		// Stable-ID disks detach by ownership transfer: the volume is
 		// reassigned onto a parker rather than config-edited off the VM. The
@@ -1138,6 +1134,15 @@ func detachDiskArguments(args []json.RawMessage) (string, string, error) {
 		return "", "", cpierrors.Cloud("detach_disk: args[1] disk_cid must not be empty")
 	}
 	return vmCID, diskCID, nil
+}
+
+// reconcileFailbackAfterDetach runs reconcileDetachedVMFailback once the
+// detach has returned, and only when *operationErr is nil, so a detach that
+// failed leaves the flag to the next call.
+func reconcileFailbackAfterDetach(ctx context.Context, deps Deps, vmid int, operationErr *error) {
+	if *operationErr == nil {
+		reconcileDetachedVMFailback(ctx, deps, vmid)
+	}
 }
 
 // reconcileDetachedVMFailback sets the failback flag of the HA resource of VM

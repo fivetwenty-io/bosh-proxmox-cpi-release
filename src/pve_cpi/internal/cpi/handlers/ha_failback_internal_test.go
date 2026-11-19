@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"strings"
@@ -187,4 +188,33 @@ func TestReconcileVMFailback_WriteFailureOnlyLogs(t *testing.T) {
 	if failbackLogged(r.obs, log.LevelWarn, "could not be set") != 1 {
 		t.Fatalf("the failed write must be logged as a warning, logs %v", r.obs.All())
 	}
+}
+
+// indexedFailbackCluster is the failback stub with a cluster index that lists
+// VM 100 on pve01 with the HA-managed tag, so the detach path can locate it.
+type indexedFailbackCluster struct{ *failbackCluster }
+
+func (indexedFailbackCluster) ListResources(context.Context, *cluster.ListResourcesParams) (
+	*cluster.ListResourcesResponse, error,
+) {
+	entry, err := json.Marshal(map[string]any{"vmid": 100, "node": "pve01", "type": "qemu", "tags": haManagedTag})
+	if err != nil {
+		return nil, err
+	}
+	resp := cluster.ListResourcesResponse{entry}
+	return &resp, nil
+}
+
+// TestReconcileFailbackAfterDetach sets the flag only after a detach that
+// succeeded, and leaves it to the next call after one that failed.
+func TestReconcileFailbackAfterDetach(t *testing.T) {
+	failed := errors.New("detach failed")
+	r := newFailbackRig(t, failbackFlag(false))
+	r.deps.PVE.(*icPVEClient).clusterSvc = indexedFailbackCluster{r.cluster}
+	reconcileFailbackAfterDetach(context.Background(), r.deps, 100, &failed)
+	r.requireWrites(t)
+
+	var ok error
+	reconcileFailbackAfterDetach(context.Background(), r.deps, 100, &ok)
+	r.requireWrites(t, true)
 }
