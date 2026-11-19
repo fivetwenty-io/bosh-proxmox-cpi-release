@@ -188,10 +188,12 @@ func backendResolverOrDefault(d Deps) pve.BackendResolver {
 // mustRegister calls d.Register and panics on error. All names passed here are
 // compile-time constants matching the canonical Methods() set; an error indicates
 // a programming mistake (e.g. a typo in a method name) that must be caught at
-// startup rather than silently producing a broken dispatcher.
+// startup rather than silently producing a broken dispatcher. Every handler is
+// wrapped so that a request that takes the HA rules lock runs the replica
+// widening sweep after its work (see withReplicaWidenSweep).
 func mustRegister(d *cpi.Dispatcher, method string, h Handler) {
 	// invariant violation: unknown or duplicate method name passed at startup; cannot occur at runtime
-	if err := d.Register(method, h); err != nil {
+	if err := d.Register(method, withReplicaWidenSweep(h)); err != nil {
 		panic("cpi: RegisterAll: " + err.Error())
 	}
 }

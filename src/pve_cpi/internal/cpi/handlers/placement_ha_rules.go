@@ -71,17 +71,21 @@ func placeableNodeCount(p *ha.Profile) int {
 // lock is enabled. A lock that cannot be taken is returned as the retriable
 // error acquireAntiAffinityLock builds, and fn does not run. fn gets a context
 // that carries the hold, and the rule writers built from it wait through the
-// hold (see rulesLockHold), so fn must use that context for its writes.
+// hold (see rulesLockHold), so fn must use that context for its writes. A
+// request whose fn runs here sweeps the replicate VMs whose pins still name
+// their source alone after its work (see withReplicaWidenSweep).
 func withHARulesLock(
 	ctx context.Context, deps Deps, vmid int, logger *log.Logger, fn func(ctx context.Context) error,
 ) error {
 	if !deps.Config.ClusterLockEnabled() {
+		noteHARulesLock(ctx, deps)
 		return fn(ctx)
 	}
 	handle, err := acquireAntiAffinityLock(ctx, deps, haRulesLockKey, vmid)
 	if err != nil {
 		return err
 	}
+	noteHARulesLock(ctx, deps)
 	hold := &rulesLockHold{deps: deps, vmid: vmid, logger: logger, handle: handle, heldWait: rulesLockHeldWaitBudget}
 	defer hold.release(ctx)
 	return fn(context.WithValue(ctx, rulesLockHoldKey{}, hold))

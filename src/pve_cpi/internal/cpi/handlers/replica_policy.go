@@ -135,9 +135,25 @@ func widenedReplicaPin(pin *ha.Rule, partner string) *ha.Rule {
 func writeReplicaPin(
 	ctx context.Context, deps Deps, profile *ha.Profile, logger *log.Logger, vmid int, expect, pin *ha.Rule,
 ) error {
+	return writeReplicaPinGuarded(ctx, deps, profile, logger, vmid, expect, pin, nil)
+}
+
+// writeReplicaPinGuarded is writeReplicaPin with a guard that runs under the
+// rules lock, right before the write. A guard that returns an error leaves
+// the pin as it is, and the error is returned as it stands. A nil guard
+// checks nothing.
+func writeReplicaPinGuarded(
+	ctx context.Context, deps Deps, profile *ha.Profile, logger *log.Logger, vmid int, expect, pin *ha.Rule,
+	guard func(context.Context) error,
+) error {
 	owner := deps.RequestDirectorUUID
 	var res *ha.ApplyResult
 	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
+		if guard != nil {
+			if err := guard(ctx); err != nil {
+				return err
+			}
+		}
 		writer := newHARuleWriterFor(deps, profile, logger, nil)
 		var err error
 		res, err = writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
@@ -240,7 +256,27 @@ type replicaWiden struct {
 	// must carry the evidence before the pin names the partner.
 	handle *aj.Handle
 	now    func() time.Time
+	// guard runs under the rules lock right before the widened pin is
+	// written, with what the check verified. An error leaves the pin as it
+	// is: a *replicaWidenSkip says why the VM's state no longer lets the pin
+	// widen, and any other error is a read that failed. A nil guard checks
+	// nothing, which is the touch path's check.
+	guard func(ctx context.Context, proof replicaWidenProof) error
 }
+
+// replicaWidenProof is what a check of a replica verified before it widens
+// the pin: the job, the partner it copies to, and the volumes it covers.
+type replicaWidenProof struct {
+	jobID  string
+	target string
+	volids []string
+}
+
+// replicaWidenSkip is a guard's answer that the VM's state changed since the
+// check read it, so the pin keeps the source alone.
+type replicaWidenSkip struct{ reason string }
+
+func (e *replicaWidenSkip) Error() string { return e.reason }
 
 // run checks the replica once and widens the pin when the check passes. It
 // reports whether the pin names the partner afterwards. A replica that is not
@@ -254,6 +290,14 @@ type replicaWiden struct {
 // time now, so a later sync can cover it. An error is a read or a write that
 // failed.
 func (w *replicaWiden) run(ctx context.Context) (bool, error) {
+	widened, _, err := w.check(ctx)
+	return widened, err
+}
+
+// check is run with the reason the pin names the partner or keeps the source
+// alone, which a sweep reports. The reasons are logged here, as run logs
+// them.
+func (w *replicaWiden) check(ctx context.Context) (widened bool, reason string, err error) {
 	if w.now == nil {
 		w.now = time.Now
 	}
@@ -262,67 +306,80 @@ func (w *replicaWiden) run(ctx context.Context) (bool, error) {
 	pin, source, partner, err := readOwnedReplicaPin(ctx, w.deps, w.vmid)
 	switch {
 	case err != nil:
-		return false, fmt.Errorf("read the pin of VM %d: %w", w.vmid, err)
+		return false, "", fmt.Errorf("read the pin of VM %d: %w", w.vmid, err)
 	case pin == nil:
 		logger.Info(replicaOp + ": the VM has no pin of this Director in the replicate shape; nothing to widen")
-		return false, nil
+		return false, "the VM has no pin of this Director in the replicate shape", nil
 	case partner != "":
-		return true, nil
+		return true, "the pin names the partner " + partner + " already", nil
 	case source != w.node:
 		logger.Info(replicaOp+": the VM runs away from its pinned node; the pin stays as it is",
 			log.String("pinned", source))
-		return false, nil
+		return false, "the VM runs away from its pinned node " + source, nil
 	}
 	changedAt, ok := ha.ReplicaChanged(pin.Comment)
 	if !ok {
 		stamped := *pin
 		stamped.Comment = ha.WithReplicaChanged(pin.Comment, w.now())
 		if err := writeReplicaPin(ctx, w.deps, w.profile, logger, w.vmid, pin, &stamped); err != nil {
-			return false, fmt.Errorf("record the time of the last change on the pin of VM %d: %w", w.vmid, err)
+			return false, "", fmt.Errorf("record the time of the last change on the pin of VM %d: %w", w.vmid, err)
 		}
 		logger.Info(replicaOp + ": the VM's pin recorded no time of its last change, and records now as that " +
 			"time; a sync that follows it can widen the pin")
-		return false, nil
+		return false, "the pin recorded no time of its last change and records one now, so a sync that follows " +
+			"it can widen the pin", nil
 	}
 	jobs, err := w.api.ListJobs(ctx)
 	if err != nil {
-		return false, fmt.Errorf("list the replication jobs: %w", err)
+		return false, "", fmt.Errorf("list the replication jobs: %w", err)
 	}
 	job, _, err := guestReplicaJobs(jobs, w.vmid, owner)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	if job == nil {
 		logger.Info(replicaOp + ": the VM has no replication job of this Director; the pin keeps the source alone")
-		return false, nil
+		return false, "the VM has no replication job of this Director", nil
 	}
 	if job.Disabled || job.RemoveJob != "" {
 		logger.Info(replicaOp+": the VM's replication job is disabled or marked for removal; the pin keeps the "+
 			"source alone", log.String("job", job.ID), log.String("remove_job", job.RemoveJob))
-		return false, nil
+		return false, "the VM's replication job " + job.ID + " is disabled or marked for removal", nil
 	}
 	target := replicaOtherNode(*job, w.node)
 	if target == "" {
-		return false, nil
+		return false, "the VM's replication job " + job.ID + " names no node other than " + w.node, nil
 	}
 	synced, held, err := w.verifySync(ctx, *job, target, changedAt, logger)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	if synced == nil {
 		held.log(logger, "the pin keeps the source alone")
-		return false, nil
+		return false, held.reason, nil
+	}
+	var guard func(context.Context) error
+	if w.guard != nil {
+		proof := replicaWidenProof{jobID: job.ID, target: target, volids: synced.volids}
+		guard = func(ctx context.Context) error { return w.guard(ctx, proof) }
 	}
 	if err := w.failbackOffBeforePartner(ctx); err != nil {
-		return false, err
+		return false, "", err
 	}
-	if err := writeReplicaPin(ctx, w.deps, w.profile, logger, w.vmid, pin, widenedReplicaPin(pin, target)); err != nil {
-		return false, err
+	err = writeReplicaPinGuarded(ctx, w.deps, w.profile, logger, w.vmid, pin, widenedReplicaPin(pin, target), guard)
+	if skip := (*replicaWidenSkip)(nil); errors.As(err, &skip) {
+		logger.Info(replicaOp+": the VM's state changed since its replica was checked; the pin keeps the source "+
+			"alone", log.String("reason", skip.reason))
+		return false, skip.reason, nil
+	}
+	if err != nil {
+		return false, "", err
 	}
 	logger.Info(replicaOp+": a verified sync covers the VM's volumes; the pin names the partner now",
 		log.String("job", job.ID), log.String("partner", target),
 		log.String("last_sync", synced.lastSync.Format(time.RFC3339)))
-	return true, nil
+	return true, fmt.Sprintf("a sync of job %s at %s covers the VM's volumes", job.ID,
+		synced.lastSync.UTC().Format(time.RFC3339)), nil
 }
 
 // failbackOffBeforePartner turns failback off on the VM's HA resource right
@@ -341,19 +398,21 @@ func (w *replicaWiden) failbackOffBeforePartner(ctx context.Context) error {
 	return nil
 }
 
-// replicaHeld says why a check of a replica did not verify it. A held check
-// with no reason was logged where it was decided.
+// replicaHeld says why a check of a replica did not verify it.
 type replicaHeld struct {
 	reason string
 	// warn marks a reason an operator must act on, such as a volume the job
 	// cannot copy.
 	warn bool
+	// logged marks a reason that was logged where it was decided, which log
+	// then leaves alone.
+	logged bool
 }
 
 // log logs the reason with the consequence the caller names.
 func (h replicaHeld) log(logger *log.Logger, consequence string) {
 	switch {
-	case h.reason == "":
+	case h.reason == "", h.logged:
 	case h.warn:
 		logger.Warn(replicaOp + ": " + h.reason + "; " + consequence)
 	default:
@@ -364,6 +423,8 @@ func (h replicaHeld) log(logger *log.Logger, consequence string) {
 // replicaSynced is a sync that verifySync found to cover the VM's volumes.
 type replicaSynced struct {
 	lastSync time.Time
+	// volids are the volumes the sync covers.
+	volids []string
 }
 
 // verifySync checks once that a sync of job from w.node to target covers the
@@ -388,9 +449,12 @@ func (w *replicaWiden) verifySync(
 		return nil, replicaHeld{warn: true,
 			reason: "the VM holds no volume on node-local ZFS storage that the profile knows"}, nil
 	}
-	evidence, err := w.journalEvidence(ctx, job, target, volids, changedAt, logger)
-	if err != nil || evidence == nil {
+	evidence, why, err := w.journalEvidence(ctx, job, target, volids, changedAt, logger)
+	if err != nil {
 		return nil, replicaHeld{}, err
+	}
+	if evidence == nil {
+		return nil, replicaHeld{reason: "the journal record does not let the pin widen yet: " + why, logged: true}, nil
 	}
 	verdict, err := ha.CheckReplicaSync(ctx, w.api, ha.ReplicaSyncCheck{
 		JobID: job.ID, Source: w.node, Target: target, VolIDs: volids, ChangedAt: evidence.changedAt,
@@ -410,7 +474,7 @@ func (w *replicaWiden) verifySync(
 			return nil, replicaHeld{}, fmt.Errorf("record the verified sync of job %s: %w", job.ID, err)
 		}
 	}
-	return &replicaSynced{lastSync: verdict.Status.LastSync}, replicaHeld{}, nil
+	return &replicaSynced{lastSync: verdict.Status.LastSync, volids: volids}, replicaHeld{}, nil
 }
 
 // replicaEvidence is what the journal binds a sync to.
@@ -428,22 +492,23 @@ type replicaEvidence struct {
 // set changed at the pin's time of change. A record that names the job in the
 // other direction, after a failover PVE has swapped the job for, is moved to
 // this direction first (see adoptSwappedReplicaJob). nil with no error means
-// the record does not let the pin widen now, which is logged.
+// the record does not let the pin widen now, which is logged, and why says
+// what the record lacks.
 func (w *replicaWiden) journalEvidence(
 	ctx context.Context, job ha.ReplicaJobState, target string, volids []string, changedAt time.Time,
 	logger *log.Logger,
-) (*replicaEvidence, error) {
+) (evidence *replicaEvidence, why string, err error) {
 	if w.handle == nil {
-		return &replicaEvidence{changedAt: changedAt}, nil
+		return &replicaEvidence{changedAt: changedAt}, "", nil
 	}
-	refuse := func(why string) (*replicaEvidence, error) {
+	refuse := func(why string) (*replicaEvidence, string, error) {
 		logger.Info(replicaOp+": the journal record does not let the pin widen yet: "+why, log.String("job", job.ID))
-		return nil, nil
+		return nil, why, nil
 	}
 	adopted, why, err := w.adoptSwappedReplicaJob(ctx, job, target, logger)
 	switch {
 	case err != nil:
-		return nil, err
+		return nil, "", err
 	case why != "":
 		return refuse(why)
 	}
@@ -466,20 +531,21 @@ func (w *replicaWiden) journalEvidence(
 		}
 		gen, err := w.handle.PrepareReplicaVolumeSet(volids, changedAt, nil)
 		if err != nil {
-			return nil, fmt.Errorf("record the VM's volume set: %w", err)
+			return nil, "", fmt.Errorf("record the VM's volume set: %w", err)
 		}
 		if err := w.handle.CommitReplicaVolumeSet(gen); err != nil {
-			return nil, fmt.Errorf("commit the VM's volume set: %w", err)
+			return nil, "", fmt.Errorf("commit the VM's volume set: %w", err)
 		}
 		rep = w.handle.Record().Replication
 		if set, ok = rep.CommittedVolumeSet(); !ok || set.Generation != gen {
-			return nil, fmt.Errorf("the journal does not show volume set %d as committed", gen)
+			return nil, "", fmt.Errorf("the journal does not show volume set %d as committed", gen)
 		}
 	}
 	if set.ChangedAt.After(changedAt) {
 		changedAt = set.ChangedAt
 	}
-	return &replicaEvidence{changedAt: changedAt, jobGeneration: rep.Job.Generation, setGeneration: set.Generation}, nil
+	return &replicaEvidence{changedAt: changedAt, jobGeneration: rep.Job.Generation, setGeneration: set.Generation},
+		"", nil
 }
 
 // adoptSwappedReplicaJob checks that the VM's journal record names job as it
@@ -1685,8 +1751,28 @@ func checkPinReach(ctx context.Context, deps Deps, profile *ha.Profile, vmid int
 // withVMReplicaRecord runs fn with the VM's journal record when the journal
 // is configured and holds a live record for vmCID, and with nil otherwise.
 // The record is acquired for fn and released after it.
-func withVMReplicaRecord(ctx context.Context, deps Deps, vmCID string, fn func(*aj.Handle) error) (retErr error) {
-	if deps.Config == nil || vmCID == "" ||
+func withVMReplicaRecord(ctx context.Context, deps Deps, vmCID string, fn func(*aj.Handle) error) error {
+	if vmCID == "" {
+		return fn(nil)
+	}
+	pick := func(records []aj.Record) (*aj.Record, error) { return managedVMRecordForCID(records, vmCID) }
+	return withVMRecordWhere(ctx, deps, pick, 0, fn)
+}
+
+// errVMRecordBusy says another call held the VM's journal record for longer
+// than the caller would wait.
+var errVMRecordBusy = errors.New("another call holds the VM's journal record")
+
+// withVMRecordWhere runs fn with the journal record pick selects when the
+// journal is configured and the record is live, and with nil otherwise. The
+// record is acquired for fn and released after it. A positive wait bounds the
+// wait for the record's lock, and a lock held past it returns an error that
+// matches errVMRecordBusy, and fn does not run.
+func withVMRecordWhere(
+	ctx context.Context, deps Deps, pick func([]aj.Record) (*aj.Record, error), wait time.Duration,
+	fn func(*aj.Handle) error,
+) (retErr error) {
+	if deps.Config == nil ||
 		deps.Config.StoragePlacementNamespace == "" && deps.Config.StorageAllocationJournalDir == "" {
 		return fn(nil)
 	}
@@ -1703,18 +1789,31 @@ func withVMReplicaRecord(ctx context.Context, deps Deps, vmCID string, fn func(*
 	if err != nil {
 		return err
 	}
-	selected, err := managedVMRecordForCID(records, vmCID)
+	selected, err := pick(records)
 	if err != nil {
 		return err
 	}
-	if selected == nil || selected.State == aj.Deleted || selected.State == aj.Cleaned ||
-		selected.State == aj.VMDeletedRetained {
+	if selected == nil || vmRecordTerminal(selected.State) {
 		return fn(nil)
 	}
-	handle, err := journal.Acquire(ctx, selected.ID)
+	actx, cancel := ctx, context.CancelFunc(func() {})
+	if wait > 0 {
+		actx, cancel = context.WithTimeout(ctx, wait)
+	}
+	handle, err := journal.Acquire(actx, selected.ID)
+	cancel()
 	if err != nil {
+		if wait > 0 && ctx.Err() == nil && errors.Is(actx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("%w: %w", errVMRecordBusy, err)
+		}
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, handle.Close()) }()
 	return fn(handle)
+}
+
+// vmRecordTerminal reports whether a VM record's state ends its life: the VM
+// is deleted, cleaned up, or deleted with its disks retained.
+func vmRecordTerminal(state aj.State) bool {
+	return state == aj.Deleted || state == aj.Cleaned || state == aj.VMDeletedRetained
 }
