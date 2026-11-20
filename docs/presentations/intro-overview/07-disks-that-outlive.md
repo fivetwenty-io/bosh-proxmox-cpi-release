@@ -25,12 +25,12 @@ flowchart LR
     M --> M4["performance options"]
 ```
 
-- Long opaque IDs are envelopes — `pve-cid decode` opens them
+- Long opaque IDs are envelopes — `pve-ops decode` opens them
 - The 9000–29999 band guards against wrong deletion
 
 <!--
 - The platform won't store identity, so it rides inside the ID the Director already never loses. Paperwork travels with the disk; nothing needs remembering.
-- pve-cid decode 'pvd-…' turns any ID from an error message into pool + node + volume name.
+- pve-ops decode 'pvd-…' turns any ID from an error message into pool + node + volume name.
 - The synthetic VMID band is load-bearing safety: deletion guards distinguish a persistent disk from a VM's scratch disks by band, and refuse to destroy data they can't prove is disposable.
 -->
 

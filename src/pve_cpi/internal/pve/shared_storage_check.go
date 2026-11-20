@@ -2,7 +2,7 @@
 //
 // No CPI call sees a sibling cpi_config entry, so the CPI cannot refuse two
 // clusters whose VMID bands overlap on a shared export. A command that reads
-// every entry, such as `pve-cid ha --cpi-config`, gathers each cluster's
+// every entry, such as `pve-ops ha --cpi-config`, gathers each cluster's
 // storage index, effective bands, and datacenter next-id range, and hands them
 // to CheckSharedExports, which is pure and reads nothing from PVE.
 package pve

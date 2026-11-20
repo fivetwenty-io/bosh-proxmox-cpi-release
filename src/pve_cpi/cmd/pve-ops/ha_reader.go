@@ -129,7 +129,7 @@ func newPVEHAReader(client pve.Client, cfg *config.CPIConfig, logger *log.Logger
 
 func (r *pveHAReader) ready() error {
 	if r.client == nil || r.client.Cluster() == nil || r.client.Nodes() == nil {
-		return errors.New("pve-cid: no cluster or nodes service available")
+		return errors.New("pve-ops: no cluster or nodes service available")
 	}
 	return nil
 }
@@ -337,7 +337,7 @@ func (r *pveHAReader) GuestMemory(ctx context.Context) (map[int]int64, error) {
 
 func (r *pveHAReader) GuestConfig(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	if r.client == nil || r.client.QEMU() == nil {
-		return nil, errors.New("pve-cid: no QEMU service available")
+		return nil, errors.New("pve-ops: no QEMU service available")
 	}
 	return r.client.QEMU().Config(ctx, node, vmid)
 }
@@ -393,7 +393,7 @@ func (r *pveHAReader) MigrationTasks(
 ) ([]pve.VMTask, error) {
 	reader, ok := r.client.(pve.MigrationTaskReader)
 	if !ok {
-		return nil, errors.New("pve-cid: the PVE client cannot list migration tasks")
+		return nil, errors.New("pve-ops: the PVE client cannot list migration tasks")
 	}
 	return reader.MigrationTasks(ctx, node, vmid, since)
 }
@@ -403,7 +403,7 @@ func (r *pveHAReader) StartTasks(
 ) ([]pve.VMTask, error) {
 	reader, ok := r.client.(pve.MigrationTaskReader)
 	if !ok {
-		return nil, errors.New("pve-cid: the PVE client cannot list start tasks")
+		return nil, errors.New("pve-ops: the PVE client cannot list start tasks")
 	}
 	return reader.StartTasks(ctx, node, vmid, since)
 }
@@ -411,7 +411,7 @@ func (r *pveHAReader) StartTasks(
 func (r *pveHAReader) TaskLog(ctx context.Context, node, upid string) ([]string, error) {
 	reader, ok := r.client.(pve.MigrationTaskReader)
 	if !ok {
-		return nil, errors.New("pve-cid: the PVE client cannot read task logs")
+		return nil, errors.New("pve-ops: the PVE client cannot read task logs")
 	}
 	return reader.TaskLog(ctx, node, upid)
 }
@@ -422,7 +422,7 @@ func (r *pveHAReader) StorageVolumes(ctx context.Context, node, storage string) 
 
 func (r *pveHAReader) Storages(ctx context.Context) ([]pve.StorageInfo, error) {
 	if r.client == nil || r.client.ClusterStorage() == nil {
-		return nil, errors.New("pve-cid: no cluster storage service available")
+		return nil, errors.New("pve-ops: no cluster storage service available")
 	}
 	resp, err := r.client.ClusterStorage().ListStorage(ctx, &sdkclusterstorage.ListStorageParams{})
 	if err != nil {

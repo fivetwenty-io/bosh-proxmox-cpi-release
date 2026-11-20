@@ -8,7 +8,7 @@ import (
 
 // parkedDiskEntry is a minimal, read-only mirror of internal/pve's private
 // parkerProvEntry (parker.go), reimplemented here for the same reason as
-// templateProvenance (provenance.go): pve-cid only ever reads this JSON.
+// templateProvenance (provenance.go): pve-ops only ever reads this JSON.
 type parkedDiskEntry struct {
 	DiskCID     string `json:"disk_cid"`
 	SourceVMCID string `json:"source_vm_cid,omitempty"`
@@ -33,7 +33,7 @@ const (
 // bareVolid in a VM description's bosh_attached_disks sentinel.
 //
 // Returns ("", false) when description carries no bosh_attached_disks block,
-// the block is malformed, or bareVolid has no entry in it — pve-cid treats
+// the block is malformed, or bareVolid has no entry in it — pve-ops treats
 // all three as "no sentinel data", matching the CPI's own best-effort
 // decode contract (GetAttachedDiskCIDs in internal/pve/attached_disks.go).
 // Stable-ID disks are recorded under their bpd- token instead of the bare

@@ -11,8 +11,8 @@ import (
 // internal/cpi/handlers/stemcell_provenance.go's stemcellProvenance). It is
 // reimplemented here — rather than importing the handlers package, which is
 // internal to the CPI's handler layer and mid-churn across other in-flight
-// work — because pve-cid only ever reads this JSON, never constructs or
-// mutates it. Only the fields pve-cid's locate/stemcells subcommands surface
+// work — because pve-ops only ever reads this JSON, never constructs or
+// mutates it. Only the fields pve-ops's locate/stemcells subcommands surface
 // are included; unknown fields are ignored by json.Unmarshal.
 type templateProvenance struct {
 	Name         string   `json:"name"`
@@ -51,7 +51,7 @@ func parseTemplateProvenance(description string) (templateProvenance, bool) {
 // package-internal to handlers — reimplemented here for the same reason as
 // templateProvenance above). Pure string-matching constants, not business
 // logic: the risk of drift is a stale tag prefix, caught immediately by
-// pve-cid's own tests failing to match live PVE tags.
+// pve-ops's own tests failing to match live PVE tags.
 const (
 	stemcellMarkerTag        = "bosh-stemcell"
 	stemcellNameTagPrefix    = "bosh-stemcell-name-"

@@ -92,7 +92,7 @@ func TestDirOptionsAndOptionsCarryTheSameFields(t *testing.T) {
 
 // probeAsCallers are the only non-test sources that may call ProbeAs, because
 // a choice judged as another user is never one the CPI may use.
-var probeAsCallers = []string{"../../cmd/pve-cid/", "../../internal/endpointcache/"}
+var probeAsCallers = []string{"../../cmd/pve-ops/", "../../internal/endpointcache/"}
 
 func TestProbeAsIsCalledOnlyByTheDiagnostic(t *testing.T) {
 	var offenders []string

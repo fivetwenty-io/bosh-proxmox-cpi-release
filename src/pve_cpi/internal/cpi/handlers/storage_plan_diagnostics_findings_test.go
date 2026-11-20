@@ -11,7 +11,7 @@ import (
 
 // TestDiagnosticJournalListsAuditFindings pins that the storage-plan
 // diagnostic names the audit's findings, not only their counts, so an
-// operator reading pve-cid output learns which VM or storage blocks
+// operator reading pve-ops output learns which VM or storage blocks
 // allocation.
 func TestDiagnosticJournalListsAuditFindings(t *testing.T) {
 	deps, _, c := auditFixture(t)

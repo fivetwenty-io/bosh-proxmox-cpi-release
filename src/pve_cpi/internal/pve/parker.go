@@ -392,7 +392,7 @@ func parkerProvKey(bareVolid, stableID string) string {
 // buildParkerProvEntry assembles one provenance record. Volid and Slot are
 // recorded only for stable-ID disks — legacy entries otherwise keep their
 // pre-stable-ID JSON shape, which external readers (scripts/disk-audit,
-// scripts/_pve_verify.py, pve-cid) parse; those readers tolerate the
+// scripts/_pve_verify.py, pve-ops) parse; those readers tolerate the
 // optional opts field, which either generation may carry.
 func buildParkerProvEntry(ctx context.Context, node, bareVolid, slot string, cfg ParkerConfig, pctx ParkContext) parkerProvEntry {
 	// disk_cid: prefer the full encoded CID from ParkContext (as the Director

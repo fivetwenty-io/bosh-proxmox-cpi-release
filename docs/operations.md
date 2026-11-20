@@ -613,7 +613,7 @@ First we find the directory. The CPI chooses it in three layers, and the first l
 
 3. The `pve_cpi-endpoint-cache.<uid>` directory under the temporary directory, which the CPI creates itself.
 
-A Debug line at the start of a call names the choice, in the form `pve endpoints: cache directory <path>, beside the allocation journal directory`. When the call created the directory, the line ends with `, created by this call`. We set `pve.log_level: debug` to see it, and `pve-cid ha` judges the same layers without creating anything.
+A Debug line at the start of a call names the choice, in the form `pve endpoints: cache directory <path>, beside the allocation journal directory`. When the call created the directory, the line ends with `, created by this call`. We set `pve.log_level: debug` to see it, and `pve-ops ha` judges the same layers without creating anything.
 
 The directory holds these files, and the first two kinds belong to the endpoint cache.
 
@@ -676,12 +676,12 @@ This section is for operators who set `pve.ha.mode` to `auto` or `managed`, and 
 
 Before we set `pve.ha.mode` to `auto` or `managed`, we raise the Director's `hm.intervals.agent_timeout` to 300 seconds, which is above the two to four minutes PVE HA takes to fence a failed node and start its VMs elsewhere. With the default of 60 seconds, the resurrector starts its retries before PVE HA has finished, and its `delete_vm` defers on each one. The CPI lets a VM that PVE HA restarts settle for five minutes before a retried delete may proceed, as [After PVE HA restarts the VM](ha-and-resurrection.md#after-pve-ha-restarts-the-vm) describes, so an agent that answers in that time keeps the VM. A longer timeout spares that loop in the common case. It does not cover an outage that outlasts it, such as a `hold` VM's node that stays down until we bring it back, and there the settle wait is what keeps the restarted VM. [HA and Resurrection](ha-and-resurrection.md#set-agent_timeout-above-the-ha-recovery-time) gives the timing, and [A VM that PVE HA recovered is deleted and recreated](troubleshooting.md#a-vm-that-pve-ha-recovered-is-deleted-and-recreated) has the ops file.
 
-### Reading the cluster with `pve-cid ha`
+### Reading the cluster with `pve-ops ha`
 
-The `pve-cid ha` subcommand is a read-only doctor. It never writes to PVE, and it runs in every mode, `off` included. The one exception is `--widen-replicas --apply`, which runs the CPI's own replica widening pass instead of the doctor, as [Widening replica pins after a deploy](#widening-replica-pins-after-a-deploy) describes. On the Director VM we run it with the full path, because `pve-cid` is not on `PATH`. The `--config` flag is optional there, because the command looks for the configuration in `--config`, then in `$PVE_CPI_CONFIG`, and then at `/var/vcap/jobs/pve_cpi/config/cpi.json`.
+The `pve-ops ha` subcommand is a read-only doctor. It never writes to PVE, and it runs in every mode, `off` included. The one exception is `--widen-replicas --apply`, which runs the CPI's own replica widening pass instead of the doctor, as [Widening replica pins after a deploy](#widening-replica-pins-after-a-deploy) describes. On the Director VM we run it with the full path, because `pve-ops` is not on `PATH`. The `--config` flag is optional there, because the command looks for the configuration in `--config`, then in `$PVE_CPI_CONFIG`, and then at `/var/vcap/jobs/pve_cpi/config/cpi.json`.
 
 ```bash
-/var/vcap/packages/pve_cpi/bin/pve-cid ha
+/var/vcap/packages/pve_cpi/bin/pve-ops ha
 ```
 
 The command takes these flags.
@@ -762,7 +762,7 @@ Entries of a `--cpi-config` document that share one cluster and one VMID band st
 
 The `entry_clock_unreadable` finding names the entry node, and it covers an entry node whose own clock read fails. A node does that while systemd shuts it down, and it also does it when `systemd-timedated` is broken. When the CPI borrowed another member's clock, the HA view is still good, so the finding is advice. The doctor reads the entry node's clock once more before it reports, so a one-off server error on a healthy node reports nothing. When no member's clock answered, the HA view is unreadable and the profile is observe-only, so the finding is a problem. In both cases we check `timedatectl` and `systemd-timedated` on the entry node, or we put another node first in `pve.endpoints`.
 
-A `replicate` VM shows `replica_awaiting_sync` as advice while its job works but the pin has not yet widened. Once a sync is verified, the pin widens after the next CPI call that takes the HA rules lock, and the advice names `pve-cid ha --widen-replicas --apply` for widening it now. It shows `replica_not_recoverable` as a problem only when no usable job exists, the job is disabled, or the first sync is more than twice its schedule plus the clock-skew bound overdue. A schedule the doctor cannot measure, such as a weekday list, gets `replica_schedule_unjudged` and is never called stale or healthy.
+A `replicate` VM shows `replica_awaiting_sync` as advice while its job works but the pin has not yet widened. Once a sync is verified, the pin widens after the next CPI call that takes the HA rules lock, and the advice names `pve-ops ha --widen-replicas --apply` for widening it now. It shows `replica_not_recoverable` as a problem only when no usable job exists, the job is disabled, or the first sync is more than twice its schedule plus the clock-skew bound overdue. A schedule the doctor cannot measure, such as a weekday list, gets `replica_schedule_unjudged` and is never called stale or healthy.
 
 PVE percent-encodes a replication job's comment again each time one pvescheduler pass writes `replication.cfg` more than once, which happens when HA recovers several replicated guests onto one node. The CPI's marker `bosh-cpi:v1` then reads `bosh-cpi%3Av1` or `bosh-cpi%253Av1` through the API. The CPI and the doctor undo those rounds before they read the marker, so the job stays this Director's, and the doctor reports it as the advice `replica_marker_encoded`. The finding names the `pvesr update <job> --comment '<marker>'` command that writes the marker back in its plain form, with the comment quoted so a shell reads it as one word, which matters because an older CPI no longer recognizes the encoded one. The CPI writes the plain form back itself on the next `set_vm_metadata` or `reboot_vm` on the VM, whether or not an allocation journal is configured. It rewrites only the VM's own job, only when the job's decoded marker names this Director, and it changes nothing but the comment. When the allocation journal holds a new generation of the job that it has not confirmed yet, the CPI leaves the comment to the write of that generation, which also writes the plain form. BOSH sends `set_vm_metadata` on every deploy that touches the VM, and a job whose VM gets neither call keeps the encoded marker until it does, because the CPI adds no pass that rewrites other jobs. The CPI and the doctor undo up to 2048 rounds, which is more than a comment within PVE's 4096-character limit can carry, so even a failover that moves many replicated guests onto one node in one pass leaves the jobs readable as this Director's.
 
@@ -773,7 +773,7 @@ With `--cpi-config`, the command also reports three kinds of overlap. The first 
 A `replicate` VM's pin names only its own node until a sync that started more than five minutes after the VM's last volume change is verified. The CPI widens such pins in a sweep after every successful call that takes the HA rules lock, but a deploy's last VMs often finish before any sync can count, and no later call may come for a while. After a deploy that adds `replicate` VMs, we wait until each new job has completed a scheduled sync, and then we widen the pins on the Director by hand. The command runs as `vcap`, because the pass opens the allocation journal, which opens only for its owner. It also needs the Director's UUID, because the pass widens only the pins that Director owns, and `bosh env --json` prints it in the `uuid` column.
 
 ```bash
-sudo -u vcap /var/vcap/packages/pve_cpi/bin/pve-cid ha --widen-replicas --director-uuid <uuid>
+sudo -u vcap /var/vcap/packages/pve_cpi/bin/pve-ops ha --widen-replicas --director-uuid <uuid>
 ```
 
 That first run is a dry run. It reads the cluster, claims nothing, and writes nothing, and it lists every `replicate` VM of the Director whose pin still names its source alone, with what the pass would do and the reason.
@@ -793,7 +793,7 @@ A deferred `delete_vm` fails the Director's task with a retriable error that nam
 
 1. Find the defer message with `bosh task <id>` or `bosh tasks --recent`.
 
-2. Run `pve-cid ha` against that cluster to see the node states and every CPI-owned HA resource.
+2. Run `pve-ops ha` against that cluster to see the node states and every CPI-owned HA resource.
 
 3. Act on the state.
    For `fence` on a node that is still running, restore corosync or power the node off, so that PVE can fence it and recover the VM. For a dead node that PVE cannot fence, or a VM that is not HA-managed, follow [the dead-node procedure](#the-dead-node-procedure).
@@ -829,7 +829,7 @@ Only follow it once the node is certain to be powered off. A node that is only p
    mv /etc/pve/nodes/<dead>/qemu-server/<vmid>.conf /etc/pve/nodes/<live>/qemu-server/
    ```
 
-   The next `delete_vm` retry finds the VM on the live node and completes. It removes any node-affinity pin the VM still has. Afterward we run `pve-cid ha`, and we delete any rule that it reports as a `rule_problem` for the removed VM.
+   The next `delete_vm` retry finds the VM on the live node and completes. It removes any node-affinity pin the VM still has. Afterward we run `pve-ops ha`, and we delete any rule that it reports as a `rule_problem` for the removed VM.
 
    A volume on the dead node's local storage is not removed by this delete. Step 7 covers it.
 
@@ -905,7 +905,7 @@ The `hold` procedure above is one case of a wider rule. PVE waits forever on a n
 
   That means a `hold` VM, or a `replicate` VM whose pin has not widened to its partner yet. The pin forbids every other node, so HA cannot migrate it.
 
-Before we enable maintenance, we run `pve-cid ha` and read its findings. A `hold` VM shows up as `hold_blocks_maintenance`. Any other started VM that cannot leave shows up as `maintenance_stranded`, with a reason that says either that its pin names no other usable node or that every other node that could take it holds a member of its group. The doctor names each VM once. Both findings only fire once the node is in maintenance, and they keep firing for as long as the drain is stuck on the VM, so we read them again right after we enable maintenance, while the drain is still running. They clear once the VM stops or leaves. The group and pin findings do not list the VMs that would block a drain, so before we enable it we check each hold VM, each `replicate` VM, and each anti-affinity group against the node count ourselves. We then clear every blocker before we start the upgrade or the reboot.
+Before we enable maintenance, we run `pve-ops ha` and read its findings. A `hold` VM shows up as `hold_blocks_maintenance`. Any other started VM that cannot leave shows up as `maintenance_stranded`, with a reason that says either that its pin names no other usable node or that every other node that could take it holds a member of its group. The doctor names each VM once. Both findings only fire once the node is in maintenance, and they keep firing for as long as the drain is stuck on the VM, so we read them again right after we enable maintenance, while the drain is still running. They clear once the VM stops or leaves. The group and pin findings do not list the VMs that would block a drain, so before we enable it we check each hold VM, each `replicate` VM, and each anti-affinity group against the node count ourselves. We then clear every blocker before we start the upgrade or the reboot.
 
 For a member of a full anti-affinity group, we pick one of these.
 
@@ -913,7 +913,7 @@ For a member of a full anti-affinity group, we pick one of these.
 
 - Stop the member through HA with the command below, and start it again once the node is back.
 
-For a `hold` VM or a `replicate` VM that has not widened, we stop it through HA and accept the downtime. For a `replicate` VM, we can instead wait until its job has completed a sync that started more than five minutes after the VM's last volume change, run `pve-cid ha --widen-replicas --apply` as [Widening replica pins after a deploy](#widening-replica-pins-after-a-deploy) shows, and then HA migrates it like any other VM.
+For a `hold` VM or a `replicate` VM that has not widened, we stop it through HA and accept the downtime. For a `replicate` VM, we can instead wait until its job has completed a sync that started more than five minutes after the VM's last volume change, run `pve-ops ha --widen-replicas --apply` as [Widening replica pins after a deploy](#widening-replica-pins-after-a-deploy) shows, and then HA migrates it like any other VM.
 
 ```bash
 ha-manager set vm:<vmid> --state stopped
@@ -927,13 +927,13 @@ ha-manager set vm:<vmid> --state started
 
 Stopping a resource through HA changes nothing in the CPI's metadata, so the VM keeps its pin, its rules, and its place in the BOSH inventory. The Director still sees an instance whose agent has gone quiet, though, and the resurrector may act on it. We turn resurrection off for the deployment before we stop VMs this way, or we expect a recreate, and we turn it back on after the VMs run again.
 
-If a wedge has already started, for example a `pve-ha-manager` upgrade that is stuck in its restart of the resource manager, we do not kill anything on the node. We stop each blocking resource through HA with the first command above. The drain then finishes within seconds, the stuck restart or reboot goes on by itself, and `pve-cid ha` stops reporting the node. We start the VMs again with the second command once the node has left maintenance.
+If a wedge has already started, for example a `pve-ha-manager` upgrade that is stuck in its restart of the resource manager, we do not kill anything on the node. We stop each blocking resource through HA with the first command above. The drain then finishes within seconds, the stuck restart or reboot goes on by itself, and `pve-ops ha` stops reporting the node. We start the VMs again with the second command once the node has left maintenance.
 
 ### Where VMs go when a maintenance ends
 
 When a node leaves maintenance, PVE moves a VM back to it only when the VM's HA resource has `failback` on. The CPI turns the flag on for each VM whose volumes all sit on shared storage, so those VMs go back to their nodes by live migration as each maintenance ends, and a rolling maintenance across every node leaves the cluster about as balanced as it started. A `hold` VM, a `replicate` VM, and any other VM with a volume on node-local storage keep `failback` off. A `replicate` VM that a maintenance moved to its partner stays there, and its pin keeps both nodes, as [HA and Resurrection](ha-and-resurrection.md#the-replicate-data-loss-window) describes.
 
-With `pve.ha.failback: false`, no CPI VM moves back, and the node we drain last ends up nearly empty. We then move VMs back ourselves with `ha-manager migrate vm:<vmid> <node>`. Before a rolling maintenance, we run `pve-cid ha` and read any `failback_drift` advice, because a VM that an earlier release registered keeps `failback` off until a call touches it. A `bosh recreate` of the instance, or any `set_vm_metadata` or `reboot_vm` on the VM, sets the flag. [Failback](ha-and-resurrection.md#failback) covers what PVE does with the flag.
+With `pve.ha.failback: false`, no CPI VM moves back, and the node we drain last ends up nearly empty. We then move VMs back ourselves with `ha-manager migrate vm:<vmid> <node>`. Before a rolling maintenance, we run `pve-ops ha` and read any `failback_drift` advice, because a VM that an earlier release registered keeps `failback` off until a call touches it. A `bosh recreate` of the instance, or any `set_vm_metadata` or `reboot_vm` on the VM, sets the flag. [Failback](ha-and-resurrection.md#failback) covers what PVE does with the flag.
 
 Turning the flag on can move a VM at once. When we upgrade from a release that wrote `failback` off, the first `set_vm_metadata` or `reboot_vm` on a shared VM turns the flag on, and if the VM runs on a node other than the top-priority node of its pin, PVE live-migrates it to that node right away. To keep those moves inside a maintenance window, we set `pve.ha.failback: false` before the upgrade, and we set it back to `true` or remove it during the window. The next call that touches each VM then turns the flag on, and any deploy that touches the instance sends such a call.
 
@@ -999,7 +999,7 @@ Removing a resource does not stop its guest.
 
 ### Clusters that share an export
 
-Several clusters that mount one export share a volume namespace, so they need disjoint VMID bands and disjoint `next-id` ranges. [Shared-storage rules](multi-cluster.md#shared-storage-rules) covers the rules, including how the CPI refuses to delete a volume that another cluster owns. We run `pve-cid ha --cpi-config` against the cpi-config to check the pair.
+Several clusters that mount one export share a volume namespace, so they need disjoint VMID bands and disjoint `next-id` ranges. [Shared-storage rules](multi-cluster.md#shared-storage-rules) covers the rules, including how the CPI refuses to delete a volume that another cluster owns. We run `pve-ops ha --cpi-config` against the cpi-config to check the pair.
 
 `qm rescan` on one cluster can add another cluster's volume to a VM's config as an `unusedN` entry. We never remove such an entry with `qm set --delete`, because that frees the volume and destroys the other cluster's disk. We edit the VM's config file under `/etc/pve/qemu-server/` and remove the line instead.
 
@@ -1092,7 +1092,7 @@ A VM this release creates gets a CID such as `101-0a1b2c3d-4e5f6a7b`. The middle
 
 ```bash
 # Decode a CID, then find the VM that carries its token
-pve-cid decode 101-0a1b2c3d-4e5f6a7b
+pve-ops decode 101-0a1b2c3d-4e5f6a7b
 pvesh get /cluster/resources --type vm \
   | jq -r --arg want bosh-cid--4e5f6a7b \
       '.[] | select(.tags != null) | select(.tags | gsub(","; ";") | split(";") | index($want)) | "\(.vmid) \(.node) \(.name)"'
@@ -1299,7 +1299,7 @@ cpi stemcell-refs prune --config /path/to/cpi.json --reconcile-tags --apply
 
 The reconcile removes every `director--` tag that no ref in the template's description maps to, on every stemcell cache template the scan finds, replicas included. It keeps each tag that a ref maps to, and when the removals would leave a template with no generation marker, the same write adds the `bosh-stemcell-cache` tag. It never removes a ref and never destroys a template, because the description's refs alone decide whether a template stays. It skips a template whose config can't be read, whose description doesn't parse, whose refs are unknown, whose destroy is already pending, or that holds no ref, and it lists each skip with its reason without counting it as a failure. Each write takes the same per-VMID lock and the same fresh read as the other prunes, so the apply reports a template a Director changed after the plan and leaves it alone. We run it once after upgrading from an earlier release, so the tags on older templates name only the directors that hold them now. A template that holds no ref keeps its tags, because those tags are what keep it reachable by its director's orphan prune, and we free it with a `--vmid` prune once we know nothing uses it.
 
-The prune frees templates, not files. For a `:heavy:` stemcell the qcow2 under `import/` stays, because a Director that still lists the stemcell could build a new template from it. Once no Director lists the stemcell, `pve-cid stemcells --orphans` shows the file with no correlated template, and we remove it with `pvesm free`, as the example in [Operator caveats](light-stemcells.md#operator-caveats) shows.
+The prune frees templates, not files. For a `:heavy:` stemcell the qcow2 under `import/` stays, because a Director that still lists the stemcell could build a new template from it. Once no Director lists the stemcell, `pve-ops stemcells --orphans` shows the file with no correlated template, and we remove it with `pvesm free`, as the example in [Operator caveats](light-stemcells.md#operator-caveats) shows.
 
 The exit code is 0 for success, 1 for a runtime, config, or refusal error or for any template that failed, and 2 for a usage error. We pass exactly one of `--director`, `--vmid`, and `--reconcile-tags`. `--allow-owned-vms` works only with `--director`, and `--untracked` works only with `--vmid`. With `--json`, an `--apply` run always prints the apply result, and when the plan is refused that result has `refused` set and an empty `results` list.
 
@@ -1385,10 +1385,10 @@ Tearing down a multi-director environment in the wrong order can leave orphaned 
 
 ### Post-teardown verification
 
-After the last director is gone, confirm nothing was left behind. `pve-cid` ships on the Director VM at `/var/vcap/packages/pve_cpi/bin/pve-cid` — not on `PATH` by default, so either invoke it by full path or `export PATH="/var/vcap/packages/pve_cpi/bin:$PATH"` first:
+After the last director is gone, confirm nothing was left behind. `pve-ops` ships on the Director VM at `/var/vcap/packages/pve_cpi/bin/pve-ops` — not on `PATH` by default, so either invoke it by full path or `export PATH="/var/vcap/packages/pve_cpi/bin:$PATH"` first:
 
 ```bash
-/var/vcap/packages/pve_cpi/bin/pve-cid stemcells --orphans --config <path-to-cpi.json>
+/var/vcap/packages/pve_cpi/bin/pve-ops stemcells --orphans --config <path-to-cpi.json>
 python3 scripts/disk-audit --config <path-to-audit-config.json>
 ```
 
@@ -1797,7 +1797,7 @@ The report also lists every volume that more than one guest's config names, whet
 
 The owner matters because PVE decides from the volume's name alone which VM owns it, reading the VMID from the start of the name's last segment, as in `vm-<vmid>-` or `base-<vmid>-`. Destroying the owner deletes the volume, and so does removing the owner's unused entry, even while another guest still names it. Removing a non-owner's entry, or destroying a VM that doesn't own the volume, only drops that reference and leaves the volume alone. When the owner exists but names the volume nowhere, destroying it with `destroy-unreferenced-disks` deletes the volume too, so a deployment that sets `pve.destroy_unreferenced_disks` needs the same care there. Until we know which guest really holds the disk, we leave every reference in place and destroy none of the guests involved.
 
-To find the real holder, we start from the Director's own pairing. `bosh -d <deployment> instances --details` puts each instance's VM CID next to its disk CIDs. On the Director VM, `/var/vcap/packages/pve_cpi/bin/pve-cid locate <disk-cid>` lists the candidates. It names every guest whose active slot carries the disk's serial or its volid. It also names every unused entry that refers to the volume, whether by its original volid or by the name a matching slot gives it. When more than one guest turns up, locate warns on stderr, and it warns as well when it can't read a guest's config, because a candidate could then be missing. The same tool's `decode <vm-cid>` gives the VMID of the guest the Director believes holds the disk. That guest holds the disk when locate lists it on an active slot. When locate lists more than one guest on an active slot, the Director's VM CID decides which one holds the disk. When locate finds no active slot at all, the volume most likely sits on a guest's unused entry after a transfer that stopped partway, and [delete_vm refuses to destroy VM with attached unused disks](troubleshooting.md#delete_vm-refuses-to-destroy-vm-with-attached-unused-disks) gives the checks and the recovery for that case.
+To find the real holder, we start from the Director's own pairing. `bosh -d <deployment> instances --details` puts each instance's VM CID next to its disk CIDs. On the Director VM, `/var/vcap/packages/pve_cpi/bin/pve-ops locate <disk-cid>` lists the candidates. It names every guest whose active slot carries the disk's serial or its volid. It also names every unused entry that refers to the volume, whether by its original volid or by the name a matching slot gives it. When more than one guest turns up, locate warns on stderr, and it warns as well when it can't read a guest's config, because a candidate could then be missing. The same tool's `decode <vm-cid>` gives the VMID of the guest the Director believes holds the disk. That guest holds the disk when locate lists it on an active slot. When locate lists more than one guest on an active slot, the Director's VM CID decides which one holds the disk. When locate finds no active slot at all, the volume most likely sits on a guest's unused entry after a transfer that stopped partway, and [delete_vm refuses to destroy VM with attached unused disks](troubleshooting.md#delete_vm-refuses-to-destroy-vm-with-attached-unused-disks) gives the checks and the recovery for that case.
 
 The report reads each guest's config in both of PVE's views, the running one and the one with pending changes applied, so a drive whose delete is only pending still counts as held. It doesn't count a reference kept only in a snapshot section, and it reads QEMU guests only, so a container that names a volume isn't counted either. It can also see only the guests the token can audit. When the token lacks `VM.Audit` on `/vms`, or when the script can't read the token's permissions, the script warns that the report may miss a second guest, and the JSON sets `multiply_referenced_visibility` to `limited` or `unknown`. A guest whose config didn't come back is listed in `multiply_referenced_unreadable_vmids`, and `multiply_referenced_complete` is `true` only when nothing is missing. None of this changes the exit code.
 

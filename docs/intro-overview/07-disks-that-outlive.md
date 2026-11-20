@@ -10,10 +10,10 @@ BOSH's most important promise is the one from Chapter 3: data survives compute. 
 
 Where does a disk's identity live if the platform will not store it? Inside the one thing that never gets lost: the disk's own ID. When the CPI creates a persistent disk, the identifier it hands back to the Director is more than a name — encoded inside it are the storage pool, the node, the availability zone, and the disk's performance settings. The Director faithfully hands that ID back on every later request, so the disk's paperwork travels with the disk. Nothing needs to be remembered, because everything is carried.
 
-This is also why those IDs look long and opaque in BOSH output. They are envelopes, not labels — and the `pve-cid` tool from Chapter 2 opens them:
+This is also why those IDs look long and opaque in BOSH output. They are envelopes, not labels — and the `pve-ops` tool from Chapter 2 opens them:
 
 ```bash
-/var/vcap/packages/pve_cpi/bin/pve-cid decode 'pvd-eyJ2b2xpZCI6...'
+/var/vcap/packages/pve_cpi/bin/pve-ops decode 'pvd-eyJ2b2xpZCI6...'
 ```
 
 One command turns any ID from an error message back into a storage pool, a node, and a volume name we can go look at.

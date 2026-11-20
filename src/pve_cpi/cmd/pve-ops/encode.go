@@ -41,7 +41,7 @@ func (o optFlag) Set(s string) error {
 	return nil
 }
 
-// encodeResult is the JSON shape emitted by "pve-cid encode --json".
+// encodeResult is the JSON shape emitted by "pve-ops encode --json".
 type encodeResult struct {
 	CID        string `json:"cid"`
 	Length     int    `json:"length"`
@@ -57,13 +57,13 @@ type encodeResult struct {
 
 // runEncode implements:
 //
-//	pve-cid encode --volid <storage:path> [--pool P] [--node N] [--az Z]
+//	pve-ops encode --volid <storage:path> [--pool P] [--node N] [--az Z]
 //	               [--opt k=v ...] [--compress] [--json]
 //
 // Fully offline: builds the pvd-/pvz- envelope via internal/pve's own
 // encoder, guaranteeing byte-for-byte parity with what the CPI itself emits.
 func runEncode(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("pve-cid encode", flag.ContinueOnError)
+	fs := flag.NewFlagSet("pve-ops encode", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	volid := fs.String("volid", "", "bare PVE volid to encode, format <storage>:<volume> (required)")
 	pool := fs.String("pool", "", "PVE storage pool name to embed in the CID metadata")
@@ -78,29 +78,29 @@ func runEncode(args []string, stdout, stderr io.Writer) int {
 	opts := optFlag{}
 	fs.Var(opts, "opt", "per-disk performance option key=value (repeatable, e.g. --opt iothread=1 --opt cache=writeback)")
 	fs.Usage = func() {
-		_, _ = fmt.Fprintln(stderr, "Usage: pve-cid encode --volid <storage:path> [--pool P] [--node N] [--az Z] [--anchor] [--format F] [--id BPD] [--opt k=v ...] [--compress] [--json]")
+		_, _ = fmt.Fprintln(stderr, "Usage: pve-ops encode --volid <storage:path> [--pool P] [--node N] [--az Z] [--anchor] [--format F] [--id BPD] [--opt k=v ...] [--compress] [--json]")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
 	if fs.NArg() != 0 {
-		_, _ = fmt.Fprintf(stderr, "pve-cid encode: unexpected positional arguments: %v\n", fs.Args())
+		_, _ = fmt.Fprintf(stderr, "pve-ops encode: unexpected positional arguments: %v\n", fs.Args())
 		fs.Usage()
 		return exitUsage
 	}
 	if *volid == "" {
-		_, _ = fmt.Fprintln(stderr, "pve-cid encode: --volid is required")
+		_, _ = fmt.Fprintln(stderr, "pve-ops encode: --volid is required")
 		fs.Usage()
 		return exitUsage
 	}
 
 	if _, _, err := pve.ParseDiskCID(*volid); err != nil {
-		_, _ = fmt.Fprintf(stderr, "pve-cid encode: invalid --volid: %s\n", err)
+		_, _ = fmt.Fprintf(stderr, "pve-ops encode: invalid --volid: %s\n", err)
 		return exitError
 	}
 	if len(*id) > pve.DiskStableIDLen {
-		_, _ = fmt.Fprintf(stderr, "pve-cid encode: --id %q exceeds the %d-byte PVE drive-serial cap\n", *id, pve.DiskStableIDLen)
+		_, _ = fmt.Fprintf(stderr, "pve-ops encode: --id %q exceeds the %d-byte PVE drive-serial cap\n", *id, pve.DiskStableIDLen)
 		return exitError
 	}
 
@@ -121,7 +121,7 @@ func runEncode(args []string, stdout, stderr io.Writer) int {
 		cid, err = pve.EncodeDiskCID(*volid, meta)
 	}
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "pve-cid encode: %s\n", err)
+		_, _ = fmt.Fprintf(stderr, "pve-ops encode: %s\n", err)
 		return exitError
 	}
 
@@ -137,7 +137,7 @@ func runEncode(args []string, stdout, stderr io.Writer) int {
 	}
 	_, _ = fmt.Fprintf(stdout, "%s\nlength: %d\n", cid, len(cid))
 	if overTarget {
-		_, _ = fmt.Fprintf(stderr, "pve-cid encode: WARNING: CID length %d exceeds the varchar(255) target (%d); "+
+		_, _ = fmt.Fprintf(stderr, "pve-ops encode: WARNING: CID length %d exceeds the varchar(255) target (%d); "+
 			"the BOSH Director's disk_cid column will reject this value. Retry with --compress, "+
 			"or use fewer --opt entries / a shorter --pool, --node, or --az value.\n",
 			len(cid), pve.DiskCIDLengthTarget)

@@ -5,7 +5,7 @@
 // cluster stamp and the eight-character per-VM token. Every handler parses its
 // CID once at entry and uses PathID for each PVE call, so a stamped CID never
 // reaches PVE as a path segment. The package is a leaf with no CPI imports so
-// handlers, the pve backends, the hooks, and cmd/pve-cid can share it.
+// handlers, the pve backends, the hooks, and cmd/pve-ops can share it.
 package vmcid
 
 import (

@@ -165,9 +165,9 @@ characters is likewise rejected at `create_disk` time (with the just-created
 volume rolled back) because a MySQL-backed Director would truncate it and
 orphan the disk; the compressed `pvz-` fallback below engages automatically
 before that rejection, so only an envelope gzip cannot shrink under the limit
-fails. Use the bundled `pve-cid` tool
-(`pve-cid decode <cid>`, installed on the Director VM at
-`/var/vcap/packages/pve_cpi/bin/pve-cid`, not on `PATH` by default) to inspect
+fails. Use the bundled `pve-ops` tool
+(`pve-ops decode <cid>`, installed on the Director VM at
+`/var/vcap/packages/pve_cpi/bin/pve-ops`, not on `PATH` by default) to inspect
 any CID offline.
 
 A rejected CID is reported to the Director as `DiskNotFound`, which is accurate

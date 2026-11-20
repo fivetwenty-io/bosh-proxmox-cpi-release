@@ -1392,7 +1392,7 @@ func deleteTemplateVM(ctx context.Context, deps Deps, node string, vmid int64, l
 // freeze-await) failure. An unfrozen VM created by ensureTemplateVM /
 // ensureReplicaTemplateVM never carries template=true, so it is invisible to
 // every discovery scan (dedup, delete_stemcell's sweep, the orphan prune,
-// pve-cid stemcells) — left in place it permanently occupies a VMID in the
+// pve-ops stemcells) — left in place it permanently occupies a VMID in the
 // template band and a disk on vm_storage with no automated reclaim path.
 // stage names the failing step for the warn log; the original freeze error is
 // always what the caller returns, regardless of whether this cleanup succeeds.

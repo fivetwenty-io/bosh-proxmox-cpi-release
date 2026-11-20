@@ -378,7 +378,7 @@ type createVMParsedArgs struct {
 	stemcellCID string
 	// stemcellKind is the decoded CID family (StemcellKindLight/StemcellKindHeavy).
 	// Purely informational here — create_vm treats both kinds identically;
-	// delete_stemcell and pve-cid are what act on the distinction.
+	// delete_stemcell and pve-ops are what act on the distinction.
 	stemcellKind pve.StemcellKind
 	// stemcellStorage is the PVE storage pool name decoded from the CID. Used
 	// both as the import-from= source storage and, when deps.Config.VMStorage

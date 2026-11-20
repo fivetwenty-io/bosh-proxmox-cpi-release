@@ -106,7 +106,7 @@ class PlacementVerificationTests(unittest.TestCase):
 
     def test_preflight_uses_private_request_and_production_cli(self):
         def observe(command):
-            self.assertEqual(command[:2], [str(self.root.resolve() / "pve-cid"), "storage-plan"])
+            self.assertEqual(command[:2], [str(self.root.resolve() / "pve-ops"), "storage-plan"])
             request = Path(command[command.index("--request") + 1])
             self.assertEqual(request.stat().st_mode & 0o777, 0o600)
             self.assertEqual(json.loads(request.read_text())["method"], "create_vm")

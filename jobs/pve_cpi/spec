@@ -628,7 +628,7 @@ properties:
       named model keeps the full set of nodes. HA never moves a VM between
       clusters, so CPU differences between AZ clusters do not matter. Nodes of
       one generation with different SKUs form separate domains, which a named
-      model joins. The command "pve-cid ha" lists the cluster's CPU migration
+      model joins. The command "pve-ops ha" lists the cluster's CPU migration
       domains.
 
       Precedence (highest wins): cloud_properties.cpu_type (per-instance-group,

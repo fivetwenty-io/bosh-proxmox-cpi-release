@@ -709,7 +709,7 @@ func TestCollectReplicaOnPartnerAndAwaitingPinWidening(t *testing.T) {
 	// has not been widened: that is a wait for the next call, not a fault, and
 	// the advice names the command that widens it now.
 	want(t, r, haKindReplicaAwaiting, haSeverityAdvice, "vm:101", "synced at",
-		"the next CPI call that takes the HA rules lock", "pve-cid ha --widen-replicas --apply")
+		"the next CPI call that takes the HA rules lock", "pve-ops ha --widen-replicas --apply")
 	wantNone(t, r, haKindReplicaNotRecover)
 
 	// With no pin token and no journal proof, the VM is awaiting the same way.

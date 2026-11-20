@@ -131,22 +131,22 @@ pushd "${BOSH_COMPILE_TARGET}/pve_cpi" >/dev/null
     -o "${BOSH_INSTALL_TARGET}/bin/cpi" \
     ./cmd/cpi
 
-  # pve-cid: read-only operator CLI for decoding/locating CPI CIDs (see
-  # src/pve_cpi/cmd/pve-cid). Ships alongside the cpi binary in this same
+  # pve-ops: read-only operator CLI for decoding/locating CPI CIDs (see
+  # src/pve_cpi/cmd/pve-ops). Ships alongside the cpi binary in this same
   # package — same module, same vendor tree, no extra spec dependency (the
   # package spec's "pve_cpi/cmd/**/*.go" glob already covers this
   # subdirectory).
   go build \
     -trimpath \
     -ldflags "-s -w -X main.cliVersion=${BOSH_PACKAGE_VERSION_SANITIZED}" \
-    -o "${BOSH_INSTALL_TARGET}/bin/pve-cid" \
-    ./cmd/pve-cid
+    -o "${BOSH_INSTALL_TARGET}/bin/pve-ops" \
+    ./cmd/pve-ops
 
 popd >/dev/null
 
 # Confirm each binary is a Linux ELF (sanity check on the host-fallback path).
 if command -v file >/dev/null 2>&1; then
-  for bin in cpi pve-cid; do
+  for bin in cpi pve-ops; do
     BIN_TYPE="$(file -b "${BOSH_INSTALL_TARGET}/bin/${bin}")"
     case "${BIN_TYPE}" in
       ELF*) ;;
@@ -159,4 +159,4 @@ if command -v file >/dev/null 2>&1; then
 fi
 
 echo "==> pve_cpi built at ${BOSH_INSTALL_TARGET}/bin/cpi"
-echo "==> pve-cid built at ${BOSH_INSTALL_TARGET}/bin/pve-cid"
+echo "==> pve-ops built at ${BOSH_INSTALL_TARGET}/bin/pve-ops"

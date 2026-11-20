@@ -314,7 +314,7 @@ func sortStemcellInventory(entries []StemcellInventoryEntry) {
 
 // classifyStemcellOrphan returns the set of reasons entry is an orphan
 // candidate ("safe to review for deletion"), per the operator-facing
-// contract of "pve-cid stemcells --orphans":
+// contract of "pve-ops stemcells --orphans":
 //
 //   - templates carrying zero director references (the aggregate across
 //     every template sharing this sha8, since replicas legitimately split
@@ -397,7 +397,7 @@ func filterOrphans(entries []StemcellInventoryEntry) []StemcellInventoryEntry {
 
 // runStemcells implements:
 //
-//	pve-cid stemcells [--storage ID] [--node N] [--orphans] [--config PATH] [--json]
+//	pve-ops stemcells [--storage ID] [--node N] [--orphans] [--config PATH] [--json]
 func runStemcells(args []string, stdout, stderr io.Writer) int {
 	return runStemcellsWith(args, stdout, stderr, loadConfigAndReader)
 }
@@ -405,7 +405,7 @@ func runStemcells(args []string, stdout, stderr io.Writer) int {
 // runStemcellsWith runs the stemcells subcommand, opening its reader through
 // open.
 func runStemcellsWith(args []string, stdout, stderr io.Writer, open readerOpener) int {
-	fs := flag.NewFlagSet("pve-cid stemcells", flag.ContinueOnError)
+	fs := flag.NewFlagSet("pve-ops stemcells", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "path to CPI JSON config file (default: $PVE_CPI_CONFIG or "+defaultConfigPath+")")
 	storageFlag := fs.String("storage", "", "PVE storage ID to scan for stemcell qcow2 files (default: the CPI config's stemcell_storage)")
@@ -413,14 +413,14 @@ func runStemcellsWith(args []string, stdout, stderr io.Writer, open readerOpener
 	orphans := fs.Bool("orphans", false, "show only orphan candidates (zero director refs, untagged templates, uncorrelated files, missing backing files)")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON instead of a table")
 	fs.Usage = func() {
-		_, _ = fmt.Fprintln(stderr, "Usage: pve-cid stemcells [--storage ID] [--node N] [--orphans] [--config PATH] [--json]")
+		_, _ = fmt.Fprintln(stderr, "Usage: pve-ops stemcells [--storage ID] [--node N] [--orphans] [--config PATH] [--json]")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
 	if fs.NArg() != 0 {
-		_, _ = fmt.Fprintf(stderr, "pve-cid stemcells: unexpected positional arguments: %v\n", fs.Args())
+		_, _ = fmt.Fprintf(stderr, "pve-ops stemcells: unexpected positional arguments: %v\n", fs.Args())
 		fs.Usage()
 		return exitUsage
 	}
@@ -439,7 +439,7 @@ func runStemcellsWith(args []string, stdout, stderr io.Writer, open readerOpener
 		storage = cfg.StemcellStorage
 	}
 	if storage == "" {
-		_, _ = fmt.Fprintln(stderr, "pve-cid stemcells: no stemcell storage configured (pve.stemcell_storage) and --storage not given")
+		_, _ = fmt.Fprintln(stderr, "pve-ops stemcells: no stemcell storage configured (pve.stemcell_storage) and --storage not given")
 		return exitError
 	}
 
@@ -454,7 +454,7 @@ func runStemcellsWith(args []string, stdout, stderr io.Writer, open readerOpener
 			return exitError
 		}
 		if len(nodes) == 0 {
-			_, _ = fmt.Fprintln(stderr, "pve-cid stemcells: no cluster nodes found and --node not given")
+			_, _ = fmt.Fprintln(stderr, "pve-ops stemcells: no cluster nodes found and --node not given")
 			return exitError
 		}
 		sort.Strings(nodes)

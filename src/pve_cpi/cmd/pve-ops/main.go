@@ -1,10 +1,10 @@
-// Package main implements pve-cid, an operator CLI for inspecting
+// Package main implements pve-ops, an operator CLI for inspecting
 // BOSH Proxmox CPI CIDs (cloud IDs) and correlating them against live PVE
 // cluster state.
 //
-// pve-cid reads and does not change PVE. Every subcommand either decodes or
+// pve-ops reads and does not change PVE. Every subcommand either decodes or
 // encodes a CID offline, or makes read-only API calls to locate and inventory
-// CPI-managed resources. The one exception is "pve-cid ha --widen-replicas
+// CPI-managed resources. The one exception is "pve-ops ha --widen-replicas
 // --apply", which runs the CPI's own replica widening pass and writes the
 // node-affinity pins it widens. Without --apply that command is a dry run.
 //
@@ -22,18 +22,18 @@
 //
 // # Subcommands
 //
-//	pve-cid decode <cid> [--json]
+//	pve-ops decode <cid> [--json]
 //	    Decode any CID family offline; no PVE API calls. Prints family,
 //	    decoded fields, and (for disk CIDs) the encoded length against the
 //	    varchar(255) Director column target.
 //
-//	pve-cid encode --volid <storage:path> [--pool P] [--node N] [--az Z]
+//	pve-ops encode --volid <storage:path> [--pool P] [--node N] [--az Z]
 //	                [--opt k=v ...] [--compress] [--json]
 //	    Build a pvd-/pvz- disk CID envelope offline. --compress allows the
 //	    gzip-compressed pvz- form when the plain form would exceed the
 //	    varchar(255) target (mirrors create_disk's automatic fallback).
 //
-//	pve-cid locate <cid|volid> [--config PATH] [--json]
+//	pve-ops locate <cid|volid> [--config PATH] [--json]
 //	    Online. Accepts a disk CID (pvd-/pvz-), a raw PVE volid
 //	    ("<storage>:<volume>"), or a stemcell path CID (":light:"/":heavy:").
 //	    For disks: scans every cluster VM's active bus slots (scsi/virtio/
@@ -45,7 +45,7 @@
 //	    director references, and reports whether the backing qcow2 still
 //	    exists on the named storage.
 //
-//	pve-cid stemcells [--storage ID] [--node N] [--orphans] [--json]
+//	pve-ops stemcells [--storage ID] [--node N] [--orphans] [--json]
 //	                  [--config PATH]
 //	    Online. Cluster-wide stemcell inventory: every bosh-stemcell-tagged
 //	    cache template correlated against every bosh-stemcell-*.qcow2 file on
@@ -54,7 +54,7 @@
 //	    with no correlated template (kind unknown), or templates whose
 //	    backing file is gone — the "what is safe to delete" view.
 //
-//	pve-cid ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]
+//	pve-ops ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]
 //	    Online. The HA doctor. Probes the cluster even when pve.ha.mode is
 //	    off, then prints the HA profile (nodes, quorum, CPU migration
 //	    domains, N+1 memory headroom) and everything the CPI left that
@@ -67,7 +67,7 @@
 //	    takes), then checks that clusters mounting one shared export do not overlap on
 //	    VMID bands or next-id ranges. It exits 1 when any problem is found.
 //
-//	pve-cid ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]
+//	pve-ops ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]
 //	    Online. Runs the CPI's replica widening pass for one Director. The
 //	    pass finds each replicate VM of that Director whose pin still names
 //	    its source node alone and checks it the way reboot_vm and
@@ -101,7 +101,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 )
 
-// cliVersion is pve-cid's own version string, independent of the cpi
+// cliVersion is pve-ops's own version string, independent of the cpi
 // binary's internal/version package (a different compiled artifact from the
 // same module). Overridable at build time via
 // -ldflags "-X main.cliVersion=...".
@@ -129,7 +129,7 @@ func main() {
 // starts no worker never waits.
 func run(args []string, stdout, stderr io.Writer) int {
 	endpointcache.Open()
-	defer endpointcache.DrainAtExit("pve-cid", stderr, 0)
+	defer endpointcache.DrainAtExit("pve-ops", stderr, 0)
 	if len(args) == 0 {
 		printUsage(stderr)
 		return exitUsage
@@ -140,7 +140,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		printUsage(stdout)
 		return exitOK
 	case "-version", "--version", "version":
-		_, _ = fmt.Fprintln(stdout, "pve-cid "+cliVersion)
+		_, _ = fmt.Fprintln(stdout, "pve-ops "+cliVersion)
 		return exitOK
 	case "decode":
 		return runDecode(args[1:], stdout, stderr)
@@ -155,40 +155,40 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "ha":
 		return runHA(args[1:], stdout, stderr)
 	default:
-		_, _ = fmt.Fprintf(stderr, "pve-cid: unknown subcommand %q\n\n", args[0])
+		_, _ = fmt.Fprintf(stderr, "pve-ops: unknown subcommand %q\n\n", args[0])
 		printUsage(stderr)
 		return exitUsage
 	}
 }
 
 func printUsage(w io.Writer) {
-	_, _ = fmt.Fprint(w, `pve-cid, the operator CLI for BOSH Proxmox CPI CIDs
+	_, _ = fmt.Fprint(w, `pve-ops, the operator CLI for BOSH Proxmox CPI CIDs
 
 Usage:
-  pve-cid decode <cid> [--json]
-  pve-cid encode --volid <storage:path> [--pool P] [--node N] [--az Z] [--opt k=v ...] [--compress] [--json]
-  pve-cid locate <cid|volid> [--config PATH] [--json]
-  pve-cid storage-plan --request PATH [--config PATH] [--json]
-  pve-cid stemcells [--storage ID] [--node N] [--orphans] [--config PATH] [--json]
-  pve-cid ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]
-  pve-cid ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]
-  pve-cid version
-  pve-cid help
+  pve-ops decode <cid> [--json]
+  pve-ops encode --volid <storage:path> [--pool P] [--node N] [--az Z] [--opt k=v ...] [--compress] [--json]
+  pve-ops locate <cid|volid> [--config PATH] [--json]
+  pve-ops storage-plan --request PATH [--config PATH] [--json]
+  pve-ops stemcells [--storage ID] [--node N] [--orphans] [--config PATH] [--json]
+  pve-ops ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]
+  pve-ops ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]
+  pve-ops version
+  pve-ops help
 
 decode and encode are fully offline (no PVE API calls). locate, stemcells,
 and ha are read-only online commands: they load the CPI's cpi.json (--config flag,
 then $PVE_CPI_CONFIG, then /var/vcap/jobs/pve_cpi/config/cpi.json) and query
-the configured PVE cluster. pve-cid changes nothing in PVE, except that
+the configured PVE cluster. pve-ops changes nothing in PVE, except that
 "ha --widen-replicas --apply" widens the replica pins the CPI's own check
 finds ready.
 
-Run "pve-cid <subcommand> --help" for subcommand-specific flags.
+Run "pve-ops <subcommand> --help" for subcommand-specific flags.
 `)
 }
 
 // parseWithPositionals parses args with fs, allowing flags and positional
 // arguments in any order (stdlib flag stops at the first non-flag argument,
-// which would reject the "pve-cid decode <cid> --json" form the usage text
+// which would reject the "pve-ops decode <cid> --json" form the usage text
 // advertises). It returns the positional arguments in their original order.
 // Flag values are never misread as positionals because each fs.Parse round
 // consumes value-taking flags itself.
@@ -213,7 +213,7 @@ func writeJSON(w, errw io.Writer, v any) int {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(v); err != nil {
-		_, _ = fmt.Fprintf(errw, "pve-cid: json encode: %s\n", err)
+		_, _ = fmt.Fprintf(errw, "pve-ops: json encode: %s\n", err)
 		return exitError
 	}
 	return exitOK

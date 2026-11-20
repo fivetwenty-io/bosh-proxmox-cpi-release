@@ -7,14 +7,14 @@ import (
 	"sort"
 )
 
-// runDecode implements "pve-cid decode <cid> [--json]". Fully offline: no
+// runDecode implements "pve-ops decode <cid> [--json]". Fully offline: no
 // PVE API calls, no config load.
 func runDecode(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("pve-cid decode", flag.ContinueOnError)
+	fs := flag.NewFlagSet("pve-ops decode", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON instead of a table")
 	fs.Usage = func() {
-		_, _ = fmt.Fprintln(stderr, "Usage: pve-cid decode <cid> [--json]")
+		_, _ = fmt.Fprintln(stderr, "Usage: pve-ops decode <cid> [--json]")
 		fs.PrintDefaults()
 	}
 	positionals, err := parseWithPositionals(fs, args)
@@ -22,7 +22,7 @@ func runDecode(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	if len(positionals) != 1 {
-		_, _ = fmt.Fprintf(stderr, "pve-cid decode: expected exactly one CID argument, got %d\n", len(positionals))
+		_, _ = fmt.Fprintf(stderr, "pve-ops decode: expected exactly one CID argument, got %d\n", len(positionals))
 		fs.Usage()
 		return exitUsage
 	}

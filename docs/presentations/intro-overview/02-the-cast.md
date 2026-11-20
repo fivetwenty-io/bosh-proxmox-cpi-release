@@ -48,17 +48,17 @@ layout: section
 ```mermaid {scale: 0.75}
 flowchart TD
     R["release: bosh-proxmox-cpi"] --> J["job: pve_cpi<br/>bin/cpi + config/cpi.json"]
-    R --> P1["package: pve_cpi<br/>the CPI binary + pve-cid"]
+    R --> P1["package: pve_cpi<br/>the CPI binary + pve-ops"]
     R --> P2["package: golang<br/>build toolchain"]
     J --> DVM["lives on the Director VM"]
     P1 --> DVM
 ```
 
 - One job, two packages, no running process
-- `pve-cid`: read-only decoder for every ID we will meet
+- `pve-ops`: read-only decoder for every ID we will meet
 
 <!--
 - Standard BOSH release; the job colocates on the Director VM. Compiled hermetically — all dependencies vendored, no network during build.
 - The monit file is deliberately directive-free: there is no process to keep alive. That one detail encodes the whole design.
-- pve-cid ships at /var/vcap/packages/pve_cpi/bin/pve-cid (not on PATH). Decodes IDs offline, locates disks/stemcells live, never mutates. First tool to reach for when an ID in an error needs to become a real object.
+- pve-ops ships at /var/vcap/packages/pve_cpi/bin/pve-ops (not on PATH). Decodes IDs offline, locates disks/stemcells live, never mutates. First tool to reach for when an ID in an error needs to become a real object.
 -->

@@ -30,7 +30,7 @@ func (e *firstUse) Unwrap() []error { return []error{fs.ErrNotExist, ErrCreatedO
 // the CPI declines to create it. It matches fs.ErrNotExist, because the
 // directory is still missing, so a caller that falls back from a missing
 // override still does. It also unwraps to Reason, which says why the CPI
-// declined, so pve-cid ha and the log lines can name it.
+// declined, so pve-ops ha and the log lines can name it.
 type NotCreatedError struct {
 	Path   string
 	Reason error

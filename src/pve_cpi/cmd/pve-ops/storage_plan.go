@@ -75,7 +75,7 @@ func runStoragePlanWithObserver(args []string, stdout, stderr io.Writer, load fu
 		fs.PrintDefaults()
 		return exitOK
 	} else if err != nil || fs.NArg() != 0 || *requestPath == "" {
-		_, _ = fmt.Fprintln(stderr, "usage: pve-cid storage-plan --request PATH [--config PATH] [--json]")
+		_, _ = fmt.Fprintln(stderr, "usage: pve-ops storage-plan --request PATH [--config PATH] [--json]")
 		return exitUsage
 	}
 	file, err := os.Open(*requestPath)

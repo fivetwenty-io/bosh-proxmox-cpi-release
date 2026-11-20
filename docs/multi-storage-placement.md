@@ -106,7 +106,7 @@ Nothing ages a record out of an in-flight state, so a CPI that dies between writ
 
 A member the capacity ceiling excludes now leaves a rejection in the plan instead of disappearing silently, so an operator can see which members the ceiling refused and which ones the ranking never saw. That change and the sibling bytes both push more candidates through the rejection path, so the `cpi.storage.candidate_rejections` counter reads higher after this release even when nothing is wrong.
 
-The `pve-cid storage-plan` diagnostic opens no journal for its ranking, so it ranks against the capacity snapshot alone and charges no in-flight sibling. It reads no sibling record either, so every sibling count comes back empty and the band partition is skipped altogether. What it explains is the strategy's own order over all the candidates, rather than the bucketed order a live create produces. A placement it explains can therefore differ from one a live create makes while peers are in flight, and that difference is expected rather than a fault.
+The `pve-ops storage-plan` diagnostic opens no journal for its ranking, so it ranks against the capacity snapshot alone and charges no in-flight sibling. It reads no sibling record either, so every sibling count comes back empty and the band partition is skipped altogether. What it explains is the strategy's own order over all the candidates, rather than the bucketed order a live create produces. A placement it explains can therefore differ from one a live create makes while peers are in flight, and that difference is expected rather than a fault.
 
 ## Spread an instance group across members
 

@@ -27,7 +27,7 @@ func namespaceRefused(t *testing.T, what string, err error) {
 
 // workerDirEnv names the directory the stand-in worker of
 // TestBPMWorkerViewSeesTheWorkersMounts works in.
-const workerDirEnv = "PVE_CID_TEST_WORKER_DIR"
+const workerDirEnv = "PVE_OPS_TEST_WORKER_DIR"
 
 // workerReady is what the stand-in worker prints once its mount is in place.
 const workerReady = "worker ready"

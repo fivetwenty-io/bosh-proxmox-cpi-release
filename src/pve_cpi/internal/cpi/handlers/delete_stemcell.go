@@ -547,7 +547,7 @@ func handleDeleteStemcellNoTemplate(
 // remove a file the other cluster's templates still use. Reference counts live
 // on each cluster's own templates, so the CPI cannot count across clusters;
 // keeping the file leaks it instead of losing it. The template is already
-// gone, so `pve-cid stemcells --orphans` reports the file as having no
+// gone, so `pve-ops stemcells --orphans` reports the file as having no
 // correlated cache template, and the operator removes it with `pvesm free`.
 //
 // A request with no applied override (every single-cluster install) and a
@@ -561,7 +561,7 @@ func keepHeavyQcow2OnSharedExport(ctx context.Context, deps Deps, logger *log.Lo
 	}
 	logger.Warn("delete_stemcell: heavy qcow2 kept on shared storage because this request came through a cpi_config entry; "+
 		"another cluster that mounts the same export may still use the file. "+
-		"Find it with `pve-cid stemcells --orphans` and remove it with `pvesm free` once no cluster needs it",
+		"Find it with `pve-ops stemcells --orphans` and remove it with `pvesm free` once no cluster needs it",
 		log.String("storage", storage),
 		log.String("volume", volumePath),
 		log.String("free_command", "pvesm free "+storage+":"+volumePath),

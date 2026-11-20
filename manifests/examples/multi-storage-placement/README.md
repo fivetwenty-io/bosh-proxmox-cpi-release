@@ -22,7 +22,7 @@ The root and a dedicated ephemeral disk share a target by default. A root overri
 Inspect a persistent request with the read-only planner after replacing the configuration values:
 
 ```sh
-pve-cid storage-plan \
+pve-ops storage-plan \
   --config separate-sets.json \
   --request disk-request.json \
   --json

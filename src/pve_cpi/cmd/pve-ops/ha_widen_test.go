@@ -142,7 +142,7 @@ func TestRunHAWidenUsageErrors(t *testing.T) {
 			d := newHATestDeps(haCfg("auto", "none"))
 			calls := withWiden(d, handlers.ReplicaWidenReport{}, nil)
 			code, _, errOut := runHATest(t, d, args...)
-			if code != exitUsage || len(*calls) != 0 || !strings.Contains(errOut, "usage: pve-cid ha") {
+			if code != exitUsage || len(*calls) != 0 || !strings.Contains(errOut, "usage: pve-ops ha") {
 				t.Fatalf("code = %d, calls = %d, stderr = %q", code, len(*calls), errOut)
 			}
 		})

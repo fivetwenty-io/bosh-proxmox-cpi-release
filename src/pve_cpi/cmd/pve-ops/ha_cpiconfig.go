@@ -178,12 +178,12 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 ) int {
 	data, err := readLimited(path)
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "pve-cid ha: cpi-config file: %s\n", err)
+		_, _ = fmt.Fprintf(stderr, "pve-ops ha: cpi-config file: %s\n", err)
 		return exitUsage
 	}
 	entries, err := parseCPIConfig(data)
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "pve-cid ha: %s\n", err)
+		_, _ = fmt.Fprintf(stderr, "pve-ops ha: %s\n", err)
 		return exitUsage
 	}
 	multi := &haMultiReport{Clusters: []*haReport{}, SharedExports: []haSharedFinding{}}

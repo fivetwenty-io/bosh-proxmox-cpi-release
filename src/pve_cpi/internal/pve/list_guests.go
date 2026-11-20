@@ -105,7 +105,7 @@ func ListGuestsAuthoritative(ctx context.Context, c Client, logger *log.Logger) 
 // Only advisory or presence-driven callers belong here: the VMID allocator's
 // union leg, the IP-conflict probes, the anti-affinity live set (which must
 // gate its drops on an empty excluded list), and the orphan-template prune
-// (under-enumeration only skips candidates). Absence proofs, and the pve-cid
+// (under-enumeration only skips candidates). Absence proofs, and the pve-ops
 // inventory (which must surface a partial fleet rather than silently
 // under-report), use the strict ListGuestsAuthoritative.
 func ListGuestsAuthoritativeTolerant(ctx context.Context, c Client, logger *log.Logger) ([]GuestRef, []string, error) {

@@ -24,7 +24,7 @@ class FakeRunner:
         self.base_config = {}
         self.config_path = "/private/config.json"
         self.policy = {"disk_size_mib": 64, "persistent_storage_ids": ["p1", "p2"], "ephemeral_storage_ids": ["e1", "e2", "e3"]}
-        self.verification = SimpleNamespace(cli="/candidate/pve-cid", inventory_pairs={("n1", "p1")})
+        self.verification = SimpleNamespace(cli="/candidate/pve-ops", inventory_pairs={("n1", "p1")})
         self.verifier = SimpleNamespace(_get=Mock())
         self.active_resources = {}
         self.checkpoint = Mock()
@@ -64,7 +64,7 @@ class ConstraintsTests(unittest.TestCase):
 
     def test_production_diagnostic_invocation_has_private_request(self):
         def command(arguments, **_kwargs):
-            self.assertEqual(arguments[:2], ["/candidate/pve-cid", "storage-plan"])
+            self.assertEqual(arguments[:2], ["/candidate/pve-ops", "storage-plan"])
             path = Path(arguments[arguments.index("--request") + 1])
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(json.loads(path.read_text())["method"], "create_disk")

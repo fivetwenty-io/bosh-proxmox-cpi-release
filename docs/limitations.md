@@ -48,7 +48,7 @@ This page collects every known limitation of the CPI in one place. Each entry is
 ## Storage and stemcells
 
 - `:heavy:` files on a shared export are kept, not deleted, under cpi-config
-  Reference counts are scoped to one cpi-config entry, so `delete_stemcell` keeps the qcow2 when the request came through an entry and the storage is shared, and `pve-cid stemcells --orphans` reports the leftover file for removal with `pvesm free`. An entry does not have to set `pve.host`, because one that sets other override keys inherits the host of the job. Every entry, including the one for the job's cluster, must set at least one `pve` override, because an entry with empty properties looks like a Director with no cpi_config and still deletes the file. See [Light Stemcells](light-stemcells.md#heavy-and-a-cross-cluster-shared-export-do-not-mix).
+  Reference counts are scoped to one cpi-config entry, so `delete_stemcell` keeps the qcow2 when the request came through an entry and the storage is shared, and `pve-ops stemcells --orphans` reports the leftover file for removal with `pvesm free`. An entry does not have to set `pve.host`, because one that sets other override keys inherits the host of the job. Every entry, including the one for the job's cluster, must set at least one `pve` override, because an entry with empty properties looks like a Director with no cpi_config and still deletes the file. See [Light Stemcells](light-stemcells.md#heavy-and-a-cross-cluster-shared-export-do-not-mix).
 
 - Fast-path delete skips the pool reaper
   With `pve.fast_path_delete: true`, a resource pool emptied by the fast path is reaped only by a later synchronous-path delete or by hand, even when `pve.pool_reap_empty` is on. See [Operations Runbook](operations.md#known-limitation-fast-path-delete-skips-the-pool-reaper).
@@ -125,7 +125,7 @@ This page collects every known limitation of the CPI in one place. Each entry is
   A release older than the one that introduced `pve.ha.local_policy: replicate` refuses such a record. See the [changelog](../CHANGELOG.md) and [Operations](operations.md#pve-ha).
 
 - The N+1 headroom check is a memory-only estimate
-  It ignores host overhead, ballooning, and recovery order, so a cluster that passes can still fail to restart every VM. `create_vm` also skips the check for a `replicate` VM, because its replicated disk pins it to one node, so run `pve-cid ha` to see the margin with those VMs counted. See [HA and Resurrection](ha-and-resurrection.md#placement-under-ha).
+  It ignores host overhead, ballooning, and recovery order, so a cluster that passes can still fail to restart every VM. `create_vm` also skips the check for a `replicate` VM, because its replicated disk pins it to one node, so run `pve-ops ha` to see the margin with those VMs counted. See [HA and Resurrection](ha-and-resurrection.md#placement-under-ha).
 
 - `hold` VMs block node maintenance until an operator stops them
   The strict one-node pin forbids every other node, so HA cannot evacuate the VM. See [Operations](operations.md#node-maintenance-with-hold-vms).
@@ -137,7 +137,7 @@ This page collects every known limitation of the CPI in one place. Each entry is
   PVE accepts only `disabled` for a resource in `error`, and `disabled` stops the guest, so a VM that BOSH keeps needs its resource removed and added again. Both steps need `Sys.Console` on `/`, so a deployment in observe-only gets a retriable error that names the privilege and the `ha-manager` commands to run by hand. See [HA and Resurrection](ha-and-resurrection.md#clearing-an-ha-error) and [Operations](operations.md#clearing-an-ha-error-by-hand).
 
 - The doctor reads a cpi-config entry from JSON or a bare list
-  `pve-cid ha --cpi-config` accepts a JSON document or a bare list of entries, not the rendered `cpi.json`. A YAML cpi-config converts with `yq -o=json`. See [Operations](operations.md#pve-ha).
+  `pve-ops ha --cpi-config` accepts a JSON document or a bare list of entries, not the rendered `cpi.json`. A YAML cpi-config converts with `yq -o=json`. See [Operations](operations.md#pve-ha).
 
 ## Permissions
 

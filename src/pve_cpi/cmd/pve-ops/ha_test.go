@@ -149,7 +149,7 @@ func TestRunHAUsageErrors(t *testing.T) {
 	} {
 		d := newHATestDeps(haCfg("auto", "none"), haBaseFake())
 		code, _, errOut := runHATest(t, d, args...)
-		if code != exitUsage || !strings.Contains(errOut, "usage: pve-cid ha") {
+		if code != exitUsage || !strings.Contains(errOut, "usage: pve-ops ha") {
 			t.Errorf("%s: code = %d, stderr = %q", name, code, errOut)
 		}
 	}
@@ -163,7 +163,7 @@ func TestRunHALoadAndOpenFailures(t *testing.T) {
 	t.Parallel()
 	d := newHATestDeps(haCfg("auto", "none"))
 	d.deps.loadConfig = func(string, io.Writer) (*config.CPIConfig, *log.Logger, error) {
-		return nil, nil, errors.New("pve-cid: config load failed (x)")
+		return nil, nil, errors.New("pve-ops: config load failed (x)")
 	}
 	code, _, errOut := runHATest(t, d)
 	if code != exitError || !strings.Contains(errOut, "config load failed") {
@@ -214,7 +214,7 @@ func TestRunHARequestFailures(t *testing.T) {
 	} {
 		path := writeTemp(t, "r.json", content)
 		code, _, errOut := runHATest(t, newHATestDeps(haCfg("auto", "none"), haBaseFake()), "--request", path)
-		if code != exitUsage || !strings.Contains(errOut, "pve-cid ha:") {
+		if code != exitUsage || !strings.Contains(errOut, "pve-ops ha:") {
 			t.Errorf("%s: code = %d, stderr = %q", name, code, errOut)
 		}
 	}
@@ -400,7 +400,7 @@ func TestRunHACPIConfigInputFailures(t *testing.T) {
 	} {
 		path := writeTemp(t, "cpi.json", tc.content)
 		code, _, errOut := runHATest(t, newHATestDeps(haCfg("auto", "none"), haBaseFake()), "--cpi-config", path)
-		if code != exitUsage || !strings.Contains(errOut, "pve-cid ha:") || !strings.Contains(errOut, tc.hint) {
+		if code != exitUsage || !strings.Contains(errOut, "pve-ops ha:") || !strings.Contains(errOut, tc.hint) {
 			t.Errorf("%s: code = %d, stderr = %q", name, code, errOut)
 		}
 	}
@@ -440,12 +440,12 @@ func TestMainDispatchesHA(t *testing.T) {
 	if code := run([]string{"ha", "--bogus"}, &stdout, &stderr); code != exitUsage {
 		t.Fatalf("code = %d", code)
 	}
-	if !strings.Contains(stderr.String(), "usage: pve-cid ha") {
+	if !strings.Contains(stderr.String(), "usage: pve-ops ha") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 	stdout.Reset()
 	printUsage(&stdout)
-	if !strings.Contains(stdout.String(), "pve-cid ha [--config PATH]") {
+	if !strings.Contains(stdout.String(), "pve-ops ha [--config PATH]") {
 		t.Fatalf("usage lacks the ha line:\n%s", stdout.String())
 	}
 }

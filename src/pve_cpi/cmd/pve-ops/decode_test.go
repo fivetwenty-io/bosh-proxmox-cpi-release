@@ -40,7 +40,7 @@ func TestRunDecode_JSON(t *testing.T) {
 }
 
 // TestRunDecode_FlagAfterPositional verifies the usage-text form
-// "pve-cid decode <cid> --json" works: stdlib flag stops parsing at the
+// "pve-ops decode <cid> --json" works: stdlib flag stops parsing at the
 // first non-flag argument, so parseWithPositionals must resume flag
 // parsing after extracting the CID.
 func TestRunDecode_FlagAfterPositional(t *testing.T) {

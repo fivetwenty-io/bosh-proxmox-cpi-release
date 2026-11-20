@@ -239,7 +239,7 @@ class ScenarioTests(unittest.TestCase):
             cfg, binary = root / "config", root / "cpi"
             cfg.write_text(json.dumps(config()))
             binary.write_bytes(b"offline-cpi")
-            (root / "pve-cid").write_bytes(b"offline-diagnostic")
+            (root / "pve-ops").write_bytes(b"offline-diagnostic")
             runner = scenarios.ScenarioRunner(str(cfg), manifest, str(binary), str(root / "report"),
                                               cases=["policy-spread-psingleton-eplural"])
             self.addCleanup(runner.close)

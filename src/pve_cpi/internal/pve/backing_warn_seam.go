@@ -89,7 +89,7 @@ func AdviseSharedExportBandsOnce(ctx context.Context, infos []StorageInfo, bands
 	log.FromContext(ctx).Info("pve: this cluster has network file storage and every VMID band is at its default; "+
 		"if another cluster mounts the same export, give each cluster disjoint vm, disk, stemcell template, "+
 		"and parker bands and set the datacenter next-id range outside them, then run "+
-		"`pve-cid ha --cpi-config` to check the pair",
+		"`pve-ops ha --cpi-config` to check the pair",
 		log.String("storage", storageName),
 		log.String("bands", bands.String()))
 }

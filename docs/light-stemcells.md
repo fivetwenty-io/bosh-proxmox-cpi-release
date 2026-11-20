@@ -340,7 +340,7 @@ Every entry in cpi_config, including the one for the job's own cluster, must car
 
 A request with no cpi-config overrides, which is every single-cluster install, deletes the file as before, and so does a request whose storage is node-local or whose shared flag cannot be read.
 
-To find a kept file, run `pve-cid stemcells --orphans --json --config <cpi.json>` against the entry. The file shows up as an entry with no templates and the reason "qcow2 file has no correlated cache template", and its `volid` field names the volume. Once no cluster that mounts the export still needs the stemcell, remove it from a PVE host shell with `pvesm free <storage>:import/<filename>`. The other clusters' own runs of the same command show the file as correlated while they still hold a template for it.
+To find a kept file, run `pve-ops stemcells --orphans --json --config <cpi.json>` against the entry. The file shows up as an entry with no templates and the reason "qcow2 file has no correlated cache template", and its `volid` field names the volume. Once no cluster that mounts the export still needs the stemcell, remove it from a PVE host shell with `pvesm free <storage>:import/<filename>`. The other clusters' own runs of the same command show the file as correlated while they still hold a template for it.
 
 Putting `:heavy:` stemcells on storage only one entry can reach, or using `:light:` on the shared pool, avoids the leak altogether.
 
@@ -360,21 +360,21 @@ pvesm free <storage>:import/<filename>
 pvesm free nfs-stemcells:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2
 ```
 
-## Inspecting stemcell CIDs with `pve-cid`
+## Inspecting stemcell CIDs with `pve-ops`
 
-`pve-cid` ships on the Director VM at `/var/vcap/packages/pve_cpi/bin/pve-cid` — not on `PATH` by default. The examples below assume `export PATH="/var/vcap/packages/pve_cpi/bin:$PATH"`, or invoke the full path directly.
+`pve-ops` ships on the Director VM at `/var/vcap/packages/pve_cpi/bin/pve-ops` — not on `PATH` by default. The examples below assume `export PATH="/var/vcap/packages/pve_cpi/bin:$PATH"`, or invoke the full path directly.
 
-`pve-cid decode` is fully offline (no PVE API call, no config load) and prints a CID's structure — storage, volume path, filename, and (when extractable) sha8:
+`pve-ops decode` is fully offline (no PVE API call, no config load) and prints a CID's structure — storage, volume path, filename, and (when extractable) sha8:
 
 ```bash
-pve-cid decode ':light:nfs-stemcells:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2'
-pve-cid decode ':heavy:local:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2' --json
+pve-ops decode ':light:nfs-stemcells:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2'
+pve-ops decode ':heavy:local:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2' --json
 ```
 
-`pve-cid stemcells` scans a live cluster (requires CPI config) and correlates cache templates with storage files, grouped by sha8, flagging entries with zero director references as orphan candidates:
+`pve-ops stemcells` scans a live cluster (requires CPI config) and correlates cache templates with storage files, grouped by sha8, flagging entries with zero director references as orphan candidates:
 
 ```bash
-pve-cid stemcells --config /path/to/cpi.json --orphans
+pve-ops stemcells --config /path/to/cpi.json --orphans
 ```
 
 A template whose only reference belongs to a director that no longer exists doesn't show up as an orphan candidate here, because that reference still counts. `cpi stemcell-refs report` lists every reference with the number of VMs that still carry its owner tag, which is how we spot a stale one.

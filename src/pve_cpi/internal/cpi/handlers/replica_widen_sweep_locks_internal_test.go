@@ -476,7 +476,7 @@ func TestReplicaWidenSweepBudget(t *testing.T) {
 }
 
 // A pass whose context ends while it holds the rules lock and the claim, as
-// pve-cid's does on an interrupt, stops and releases both.
+// pve-ops's does on an interrupt, stops and releases both.
 func TestReplicaWidenPass_AnEndedContextReleasesTheLocks(t *testing.T) {
 	defer pve.SetClusterLockGraceForTest(0)()
 	s := newSweepRig(t)

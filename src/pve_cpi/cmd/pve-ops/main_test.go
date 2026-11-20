@@ -12,7 +12,7 @@ func TestRun_NoArgsPrintsUsageAndExitsUsage(t *testing.T) {
 	if code != exitUsage {
 		t.Errorf("exit code = %d, want %d", code, exitUsage)
 	}
-	if !strings.Contains(stderr.String(), "pve-cid") {
+	if !strings.Contains(stderr.String(), "pve-ops") {
 		t.Errorf("usage not printed to stderr: %q", stderr.String())
 	}
 }
@@ -48,15 +48,15 @@ func TestRun_Version(t *testing.T) {
 		if code != exitOK {
 			t.Errorf("run(%q) exit code = %d, want %d", arg, code, exitOK)
 		}
-		if !strings.HasPrefix(stdout.String(), "pve-cid ") {
-			t.Errorf("run(%q) stdout = %q, want prefix %q", arg, stdout.String(), "pve-cid ")
+		if !strings.HasPrefix(stdout.String(), "pve-ops ") {
+			t.Errorf("run(%q) stdout = %q, want prefix %q", arg, stdout.String(), "pve-ops ")
 		}
 	}
 }
 
 // TestRun_DecodeSmoke exercises the full offline dispatch path end to end
 // (run -> runDecode -> DecodeCID) the way an operator invokes the binary:
-// "pve-cid decode ':light:nfs:import/bosh-stemcell-ubuntu-jammy-1.719-cafebabe.qcow2'".
+// "pve-ops decode ':light:nfs:import/bosh-stemcell-ubuntu-jammy-1.719-cafebabe.qcow2'".
 func TestRun_DecodeSmoke(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"decode", ":light:nfs:import/bosh-stemcell-ubuntu-jammy-1.719-cafebabe.qcow2"}, &stdout, &stderr)

@@ -424,7 +424,7 @@ The HA pin only protects a VM once it exists. At creation, when no node in the r
 
 **Best practice.** PVE names every volume for the VM ID that owns it, so clusters that mount one export share one namespace. Each cluster needs its own VM, disk, stemcell template, and parker bands, and the datacenter `next-id` range must sit outside every band of every cluster on the export.
 
-**CPI behavior.** Allocation reserves the ID of every config-drive ISO it finds, a destroy keeps the unreferenced-disk sweep off on shared storage, and a volume delete is refused when the volume's owner lies outside every band of the cluster. The CPI logs one line of advice when it sees network file storage with every band at its default, and `pve-cid ha --cpi-config` checks a set of clusters for overlapping bands and `next-id` ranges.
+**CPI behavior.** Allocation reserves the ID of every config-drive ISO it finds, a destroy keeps the unreferenced-disk sweep off on shared storage, and a volume delete is refused when the volume's owner lies outside every band of the cluster. The CPI logs one line of advice when it sees network file storage with every band at its default, and `pve-ops ha --cpi-config` checks a set of clusters for overlapping bands and `next-id` ranges.
 
 **Status.** Configurable. See [Multi-Cluster Deployments](multi-cluster.md#shared-storage-rules).
 

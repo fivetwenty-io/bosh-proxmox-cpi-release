@@ -33,7 +33,7 @@ const replicaWidenOp = "replica widen sweep"
 // pays for at most this much of it, because the sweep is housekeeping that
 // rides on another request. Every widening holds the cluster-wide rules lock
 // for a moment, so the sweep widens one pin per call and leaves bulk widening
-// to pve-cid ha --widen-replicas.
+// to pve-ops ha --widen-replicas.
 const (
 	// replicaWidenSweepMaxWidened caps the pins one sweep widens.
 	replicaWidenSweepMaxWidened = 1
@@ -126,7 +126,7 @@ type ReplicaWidenOptions struct {
 // WidenAwaitingReplicaPins widens the pin of every replicate VM of this
 // Director whose pin still names its source alone and whose replica a
 // verified sync now covers. It is the pass the calls that take the HA rules
-// lock run after their work, and the one pve-cid ha --widen-replicas runs on
+// lock run after their work, and the one pve-ops ha --widen-replicas runs on
 // demand. deps.RequestDirectorUUID names the Director. The check of each VM is
 // the one a reboot_vm or set_vm_metadata call makes (see replicaWiden), run
 // under the VM's journal record. The write runs under the HA rules lock and,
@@ -715,7 +715,7 @@ func (p *replicaWidenPass) guard(
 	if len(gaps) > 0 || !slices.Equal(normalizedVolIDs(volids), normalizedVolIDs(proof.volids)) {
 		return &replicaWidenSkip{reason: "the VM's volumes changed since the sync was verified"}
 	}
-	// A pass whose context ended, such as a pve-cid run an operator
+	// A pass whose context ended, such as a pve-ops run an operator
 	// interrupted, writes nothing more and releases its locks.
 	if err := ctx.Err(); err != nil {
 		return err

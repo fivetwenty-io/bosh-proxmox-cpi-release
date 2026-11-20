@@ -55,7 +55,7 @@ func TestSharedExportAdvice(t *testing.T) {
 			if !tc.wantAdvice {
 				return
 			}
-			for _, want := range []string{"pve-cid ha --cpi-config", "next-id", `"storage":"` + tc.wantStorage + `"`, `"level":"INFO"`} {
+			for _, want := range []string{"pve-ops ha --cpi-config", "next-id", `"storage":"` + tc.wantStorage + `"`, `"level":"INFO"`} {
 				if !strings.Contains(out, want) {
 					t.Errorf("advice lacks %s:\n%s", want, out)
 				}

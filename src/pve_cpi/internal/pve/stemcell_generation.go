@@ -44,7 +44,7 @@ const (
 // the cache tag, or a non-empty director reference tag. See the package
 // comment above for why sha-tag identity alone is not sufficient.
 //
-// Exported for cmd/pve-cid, whose stemcell inventory must classify the same
+// Exported for cmd/pve-ops, whose stemcell inventory must classify the same
 // templates this package's lookups filter on. The operator tool deliberately
 // LISTS previous-generation templates that the CPI ignores — an inventory
 // exists to surface leftovers — so it needs the predicate as a label rather

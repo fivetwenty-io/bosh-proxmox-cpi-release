@@ -49,20 +49,20 @@ type haWidenOutput struct {
 	handlers.ReplicaWidenReport
 }
 
-// runHAWiden implements "pve-cid ha --widen-replicas". Without apply it is a
+// runHAWiden implements "pve-ops ha --widen-replicas". Without apply it is a
 // dry run that reads the cluster and claims nothing.
 func runHAWiden(ctx context.Context, eff *config.CPIConfig, logger *log.Logger, owner string, apply,
 	asJSON bool, stdout, stderr io.Writer, deps haDeps,
 ) int {
 	if owner == "" {
-		_, _ = fmt.Fprintln(stderr, "pve-cid ha: --widen-replicas needs the Director's UUID from --request or "+
+		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --widen-replicas needs the Director's UUID from --request or "+
 			"--director-uuid, because it widens only the pins that Director owns")
 		_, _ = fmt.Fprintln(stderr, haUsage)
 		return exitUsage
 	}
 	report, err := deps.widen(ctx, eff, logger, owner, !apply)
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "pve-cid ha: the replica widening pass did not run: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "pve-ops ha: the replica widening pass did not run: %v\n", err)
 		return exitError
 	}
 	if asJSON {

@@ -83,8 +83,8 @@ docs/intro-overview/index.html
 docs/intro-overview/node_modules/
 node_modules
 
-# Locally built operator CLI (go build ./cmd/pve-cid)
-src/pve_cpi/pve-cid
+# Locally built operator CLI (go build ./cmd/pve-ops)
+src/pve_cpi/pve-ops
 
 # BOSH blobstore credentials (bosh upload-blobs) — never commit
 config/private.yml

@@ -10,7 +10,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
-// Family discriminates the CID shapes pve-cid understands. Values mirror the
+// Family discriminates the CID shapes pve-ops understands. Values mirror the
 // grammar table documented in internal/pve/stemcell_volume.go.
 type Family string
 
@@ -24,7 +24,7 @@ const (
 )
 
 // DecodedCID is the offline-decoded view of any CID family, and the shape
-// emitted by "pve-cid decode --json". Fields are grouped by family; only the
+// emitted by "pve-ops decode --json". Fields are grouped by family; only the
 // fields relevant to Family are populated (the rest are omitted from JSON via
 // omitempty).
 type DecodedCID struct {
@@ -97,7 +97,7 @@ func isAllDigits(s string) bool {
 	return true
 }
 
-// DecodeCID decodes raw against every CID family pve-cid understands,
+// DecodeCID decodes raw against every CID family pve-ops understands,
 // offline (no PVE API calls). Family detection mirrors the discriminator
 // table in internal/pve/stemcell_volume.go, tried in this fixed order so no
 // two families can ever claim the same input:
@@ -113,7 +113,7 @@ func isAllDigits(s string) bool {
 // currently emit.
 func DecodeCID(raw string) (*DecodedCID, error) {
 	if raw == "" {
-		return nil, fmt.Errorf("pve-cid: empty CID")
+		return nil, fmt.Errorf("pve-ops: empty CID")
 	}
 
 	switch {
@@ -129,7 +129,7 @@ func DecodeCID(raw string) (*DecodedCID, error) {
 			return decodeSnapshotCID(raw)
 		}
 		return nil, fmt.Errorf(
-			"pve-cid: unrecognized CID %q: expected a stemcell (\":light:\"/\":heavy:\"), "+
+			"pve-ops: unrecognized CID %q: expected a stemcell (\":light:\"/\":heavy:\"), "+
 				"disk (\"pvd-\"/\"pvz-\"), VM (\"<vmid>\" or \"<vmid>-<cluster>-<token>\"), or snapshot (\"<vm cid>:<name>\") CID",
 			raw,
 		)
@@ -139,7 +139,7 @@ func DecodeCID(raw string) (*DecodedCID, error) {
 func decodeStemcellCID(raw string) (*DecodedCID, error) {
 	kind, storage, volumePath, err := pve.ParseStemcellPathCID(raw)
 	if err != nil {
-		return nil, fmt.Errorf("pve-cid: %w", err)
+		return nil, fmt.Errorf("pve-ops: %w", err)
 	}
 
 	family := FamilyStemcellLight
@@ -161,11 +161,11 @@ func decodeStemcellCID(raw string) (*DecodedCID, error) {
 func decodeDiskCID(raw string) (*DecodedCID, error) {
 	bareCID, meta, err := pve.ParseEncodedDiskCID(raw)
 	if err != nil {
-		return nil, fmt.Errorf("pve-cid: %w", err)
+		return nil, fmt.Errorf("pve-ops: %w", err)
 	}
 	storage, volume, err := pve.ParseDiskCID(bareCID)
 	if err != nil {
-		return nil, fmt.Errorf("pve-cid: decoded envelope volid %q: %w", bareCID, err)
+		return nil, fmt.Errorf("pve-ops: decoded envelope volid %q: %w", bareCID, err)
 	}
 
 	family := FamilyDiskPVD
@@ -204,7 +204,7 @@ func isStampedVMCID(s string) bool {
 func decodeVMCID(raw string) (*DecodedCID, error) {
 	cid, err := vmcid.Parse(raw)
 	if err != nil {
-		return nil, fmt.Errorf("pve-cid: invalid VM CID %q: must be a positive integer VMID, optionally followed by "+
+		return nil, fmt.Errorf("pve-ops: invalid VM CID %q: must be a positive integer VMID, optionally followed by "+
 			"-<cluster>-<token>", raw)
 	}
 	return &DecodedCID{Family: FamilyVM, Raw: raw, VMID: cid.VMID, ClusterStamp: cid.Cluster, Token: cid.Token}, nil
@@ -213,7 +213,7 @@ func decodeVMCID(raw string) (*DecodedCID, error) {
 func decodeSnapshotCID(raw string) (*DecodedCID, error) {
 	vmCID, snapName, err := pve.ParseSnapshotCID(raw)
 	if err != nil {
-		return nil, fmt.Errorf("pve-cid: invalid snapshot CID %q: %w", raw, err)
+		return nil, fmt.Errorf("pve-ops: invalid snapshot CID %q: %w", raw, err)
 	}
 	// vmCID passed the caller's dispatch check, so this parse cannot fail;
 	// vmid stays 0 (omitted from JSON) in the defensive error case rather

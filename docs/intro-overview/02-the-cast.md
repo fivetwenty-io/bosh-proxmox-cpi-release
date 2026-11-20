@@ -41,13 +41,13 @@ Colocated on the Director VM. It renders two files: `bin/cpi`, the entry point t
 - **Two packages**
 A pinned Go toolchain, and the CPI source itself. At deploy time BOSH compiles the source hermetically — every dependency is vendored, so the build touches no network — and the result lands at `/var/vcap/packages/pve_cpi/bin/` on the Director VM.
 
-- **A second, quieter tool: `pve-cid`**
+- **A second, quieter tool: `pve-ops`**
 The same package ships a small read-only command-line tool alongside the CPI. It decodes the identifiers we will meet in Chapter 3, locates disks and stemcells on the live cluster, and never mutates anything. It is the first thing to reach for when an ID in a BOSH error message needs to be turned back into a real object.
 
 ```mermaid
 flowchart TD
     R["release: bosh-proxmox-cpi"] --> J["job: pve_cpi<br/>bin/cpi + config/cpi.json"]
-    R --> P1["package: pve_cpi<br/>the CPI binary + pve-cid"]
+    R --> P1["package: pve_cpi<br/>the CPI binary + pve-ops"]
     R --> P2["package: golang<br/>build toolchain"]
     J --> DVM["lives on the Director VM"]
     P1 --> DVM

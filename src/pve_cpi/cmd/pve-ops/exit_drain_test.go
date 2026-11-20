@@ -201,7 +201,7 @@ func finishedIfNotCancelled(t *testing.T) *atomic.Bool {
 	return &wrote
 }
 
-// pve-cid passes the drain no wait of its own, so the drain applies its default
+// pve-ops passes the drain no wait of its own, so the drain applies its default
 // bound. A worker that needs a fraction of that bound finishes before run
 // returns, whichever command ran.
 func TestRunWaitsForABackgroundWriteWithTheDefaultBound(t *testing.T) {

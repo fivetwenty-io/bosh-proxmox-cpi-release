@@ -671,7 +671,7 @@ The same refusal can come from `reboot_vm`, `set_vm_metadata`, `attach_disk`, or
 
 **Diagnosis**
 
-The CPI found no VM with the CID's VMID on any member of the cluster this request reached, and the CID's stamp doesn't name that cluster. The VM the CID named may still be running on the cluster that the stamp does name. We decode the CID with `pve-cid decode <cid>`, which prints its `cluster_stamp` and `token`, and we read each cluster's own stamp on any of its nodes:
+The CPI found no VM with the CID's VMID on any member of the cluster this request reached, and the CID's stamp doesn't name that cluster. The VM the CID named may still be running on the cluster that the stamp does name. We decode the CID with `pve-ops decode <cid>`, which prints its `cluster_stamp` and `token`, and we read each cluster's own stamp on any of its nodes:
 
 ```bash
 # The first eight hex characters of the root CA's SHA-256 fingerprint
@@ -1114,10 +1114,10 @@ To tell the cases apart, read the VM's config:
 
 ```bash
 qm config <N>
-pve-cid decode <cid>
+pve-ops decode <cid>
 ```
 
-The VM's description carries a `bosh_attached_disks` entry for each disk the CPI attached. When an entry is keyed by a `bpd-` serial that no active slot of the VM carries, the unused entry is that disk's volume. `pve-cid decode` on the entry's CID prints the serial and the name the volume was created with. If the unused entry still has that name, it is the same disk.
+The VM's description carries a `bosh_attached_disks` entry for each disk the CPI attached. When an entry is keyed by a `bpd-` serial that no active slot of the VM carries, the unused entry is that disk's volume. `pve-ops decode` on the entry's CID prints the serial and the name the volume was created with. If the unused entry still has that name, it is the same disk.
 
 **Fix**
 
@@ -1137,7 +1137,7 @@ Before we touch anything, all four of these checks have to pass. If any one of t
 
    Every line it prints must come from `<N>.conf`, the VM we are recovering, and the text after the file name and line number must start with `#`, which is how PVE stores the description. A line from any other VM means another guest or a parker still names the disk, and a line that doesn't start with `#` means a drive of that VM still carries the serial. Either one fails the check.
 
-3. The VM has exactly one candidate. Its description's `bosh_attached_disks` names exactly one `bpd-` serial that none of its active slots carries, and its config has exactly one unused entry on the disk storage. When the volume still has its birth name, the unused entry must name exactly the `volid` that `pve-cid decode <cid>` prints for that serial's CID. PVE leaves a birth-named volume on an unused entry only when the birth name carries this VM's own VMID. That happens only when the VM band was moved over VMIDs that still name disks, so the case is rare.
+3. The VM has exactly one candidate. Its description's `bosh_attached_disks` names exactly one `bpd-` serial that none of its active slots carries, and its config has exactly one unused entry on the disk storage. When the volume still has its birth name, the unused entry must name exactly the `volid` that `pve-ops decode <cid>` prints for that serial's CID. PVE leaves a birth-named volume on an unused entry only when the birth name carries this VM's own VMID. That happens only when the VM band was moved over VMIDs that still name disks, so the case is rare.
 
 4. When the volume was renamed for the VM, which is when its name carries the VM's VMID, its size must match the disk the Director knows. `pvesm list <storage> --vmid <N>` prints the volume's size in bytes. The Director's size comes from the instance group's `persistent_disk` in `bosh -d <deployment> manifest`, or from its `persistent_disk_type` and that type's `disk_size` in `bosh cloud-config`. The CPI rounds that size up to whole GiB when it creates the disk, and a later resize changes it, so we compare against the size the disk has now.
 
@@ -2553,7 +2553,7 @@ We keep the log and report it as a bug.
 
 **Symptom**
 
-`pve-cid ha` prints advice of the kind `cache_directory`.
+`pve-ops ha` prints advice of the kind `cache_directory`.
 
 **Diagnosis**
 
@@ -2585,7 +2585,7 @@ The CPI keeps the endpoint cache, the HA profile cache, and the HA recovery epis
 
 **Fix**
 
-We apply the step the finding names and run `pve-cid ha` again. See [Reading the cluster with `pve-cid ha`](operations.md#reading-the-cluster-with-pve-cid-ha).
+We apply the step the finding names and run `pve-ops ha` again. See [Reading the cluster with `pve-ops ha`](operations.md#reading-the-cluster-with-pve-ops-ha).
 
 ### Discovery is off for this call
 
@@ -2605,7 +2605,7 @@ One variant stays at Debug whatever the mode, and it reads `api endpoint discove
 
 **Fix**
 
-We run `pve-cid ha`, which judges every layer as the CPI's user and names the directory, its owner, and its mode, and then we apply the step it names. See [The HA doctor reports a cache directory problem](#the-ha-doctor-reports-a-cache-directory-problem). For a directory in the temporary layer owned by another user, we remove it and the CPI creates its own. For the other two layers we give the directory to the CPI's user with mode `0700`.
+We run `pve-ops ha`, which judges every layer as the CPI's user and names the directory, its owner, and its mode, and then we apply the step it names. See [The HA doctor reports a cache directory problem](#the-ha-doctor-reports-a-cache-directory-problem). For a directory in the temporary layer owned by another user, we remove it and the CPI creates its own. For the other two layers we give the directory to the CPI's user with mode `0700`.
 
 ### The cache file is not usable
 
@@ -2776,7 +2776,7 @@ The CPI had something to remember and could not write it. The first line means a
 
 **Fix**
 
-We act only when the line repeats on every call. Then we check the disk space and the directory's owner and mode with `pve-cid ha`, and we reset the cache if a stale lock holder is suspected.
+We act only when the line repeats on every call. Then we check the disk space and the directory's owner and mode with `pve-ops ha`, and we reset the cache if a stale lock holder is suspected.
 
 ### The pool refused the cached nodes
 
@@ -2909,8 +2909,8 @@ Some calls don't wait for that retry, because their work can only fail on a clus
 - **Placement**
   Every node is rejected with `node not placeable (entry node does not report the cluster quorate)`, and placement doesn't list storage on a node that cluster status lists offline.
 
-- **`pve-cid ha`**
-  The doctor skips each per-node read on a node that cluster status lists offline, and it reports the read as `unchecked` with a reason that names the lost quorum. [Reading the cluster with `pve-cid ha`](operations.md#reading-the-cluster-with-pve-cid-ha) describes the skip.
+- **`pve-ops ha`**
+  The doctor skips each per-node read on a node that cluster status lists offline, and it reports the read as `unchecked` with a reason that names the lost quorum. [Reading the cluster with `pve-ops ha`](operations.md#reading-the-cluster-with-pve-ops-ha) describes the skip.
 
 **Fix**
 
@@ -2940,7 +2940,7 @@ Each message maps to one of four causes.
 
 **Diagnosis**
 
-We run `pve-cid ha` against the cluster. It is read-only. It prints the profile line, the node states, the CPU migration domains, and the findings, which cover the CPI-owned HA resources and replication jobs. See [Reading the cluster with `pve-cid ha`](operations.md#reading-the-cluster-with-pve-cid-ha).
+We run `pve-ops ha` against the cluster. It is read-only. It prints the profile line, the node states, the CPU migration domains, and the findings, which cover the CPI-owned HA resources and replication jobs. See [Reading the cluster with `pve-ops ha`](operations.md#reading-the-cluster-with-pve-ops-ha).
 
 **Fix**
 
@@ -2968,13 +2968,13 @@ We raise `hm.intervals.agent_timeout` above the HA recovery time, to 300 seconds
 
 [HA and Resurrection](ha-and-resurrection.md#set-agent_timeout-above-the-ha-recovery-time) explains the timing.
 
-This release no longer deletes a VM that PVE HA restarted after this CPI deferred its delete, because the delete first waits until the VM has run for five minutes, as [After PVE HA restarts the VM](ha-and-resurrection.md#after-pve-ha-restarts-the-vm) describes. The timeout cannot cover an outage that outlasts it, so the wait is what protects a VM whose node stayed down for longer than `agent_timeout`. When a VM is still replaced, either its agent did not answer within those five minutes or the deferral record was missing, and the `delete_vm` log says which. A log line that says `the HA recovery deferral could not be recorded` or `record is unreadable` points to the cache directory, which [the endpoint cache section](operations.md#resetting-the-endpoint-cache) and `pve-cid ha` check.
+This release no longer deletes a VM that PVE HA restarted after this CPI deferred its delete, because the delete first waits until the VM has run for five minutes, as [After PVE HA restarts the VM](ha-and-resurrection.md#after-pve-ha-restarts-the-vm) describes. The timeout cannot cover an outage that outlasts it, so the wait is what protects a VM whose node stayed down for longer than `agent_timeout`. When a VM is still replaced, either its agent did not answer within those five minutes or the deferral record was missing, and the `delete_vm` log says which. A log line that says `the HA recovery deferral could not be recorded` or `record is unreadable` points to the cache directory, which [the endpoint cache section](operations.md#resetting-the-endpoint-cache) and `pve-ops ha` check.
 
 ## A VM's HA pin leaves out a node that has returned
 
 **Symptom**
 
-`pve-cid ha` or `ha-manager rules config` shows a strict `bosh-na-<vmid>` pin that leaves out a node which is back online and healthy. PVE HA then never recovers or migrates the VM onto that node. The `create_vm` log for the VM holds the warning `create_vm: the VM's HA pin leaves out a node whose bridges could not be read`, which names the node and the bridge.
+`pve-ops ha` or `ha-manager rules config` shows a strict `bosh-na-<vmid>` pin that leaves out a node which is back online and healthy. PVE HA then never recovers or migrates the VM onto that node. The `create_vm` log for the VM holds the warning `create_vm: the VM's HA pin leaves out a node whose bridges could not be read`, which names the node and the bridge.
 
 **Cause**
 
@@ -3014,7 +3014,7 @@ For an upgrade, we set `pve.ha.failback: false` before the upgrade, and we set i
 
 **Symptom**
 
-`pve-cid ha` reports `replica_awaiting_sync` for a `replicate` VM, or `ha-manager rules config` shows its strict `bosh-na-<vmid>` pin with only the VM's own node, some time after the deploy that created the VM. HA can't migrate the VM, and a node maintenance waits on it.
+`pve-ops ha` reports `replica_awaiting_sync` for a `replicate` VM, or `ha-manager rules config` shows its strict `bosh-na-<vmid>` pin with only the VM's own node, some time after the deploy that created the VM. HA can't migrate the VM, and a node maintenance waits on it.
 
 **Cause**
 
@@ -3025,7 +3025,7 @@ The pin names the partner only after the VM's replication job reports a sync tha
 We read the advice. When it says the job `has not completed its first sync` or `has not completed a sync that started after the last volume change`, the VM is still waiting for a sync, and we check the job with `pvesr status` on the VM's node. When it says the job synced but the pin does not yet name the partner, the VM is ready. A dry run of the widening pass shows each VM with its reason.
 
 ```bash
-sudo -u vcap /var/vcap/packages/pve_cpi/bin/pve-cid ha --widen-replicas --director-uuid <uuid>
+sudo -u vcap /var/vcap/packages/pve_cpi/bin/pve-ops ha --widen-replicas --director-uuid <uuid>
 ```
 
 At Debug, the CPI log also shows the sweep's reason for each VM it skipped, after the line prefix `replica widen sweep:`.

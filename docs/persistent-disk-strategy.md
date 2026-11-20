@@ -145,7 +145,7 @@ are keyed by their `bpd-` identity token, because a reassignment renames the
 volume and a volid-keyed record would be orphaned by the first transfer.
 Readers must accept both: match the key against the bare volid and the token,
 and match the `volid` field against the volume's current name. Both
-`disk-audit` and `pve-cid locate` do.
+`disk-audit` and `pve-ops locate` do.
 
 Fields:
 

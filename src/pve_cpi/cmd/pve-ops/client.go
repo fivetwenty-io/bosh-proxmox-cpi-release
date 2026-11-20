@@ -27,7 +27,7 @@ const envConfigPath = "PVE_CPI_CONFIG"
 const defaultConfigPath = "/var/vcap/jobs/pve_cpi/config/cpi.json"
 
 // ClusterVM is the subset of an authoritative per-node qemu listing row
-// pve-cid's online subcommands need.
+// pve-ops's online subcommands need.
 type ClusterVM struct {
 	VMID int
 	Node string
@@ -41,7 +41,7 @@ type ClusterVM struct {
 }
 
 // StorageContentItem is the subset of a GET
-// /nodes/{node}/storage/{storage}/content row pve-cid's online subcommands
+// /nodes/{node}/storage/{storage}/content row pve-ops's online subcommands
 // need.
 type StorageContentItem struct {
 	VolID string
@@ -52,7 +52,7 @@ type StorageContentItem struct {
 // stemcells subcommands depend on. Production is satisfied by pveReader,
 // which adapts a real pve.Client; tests substitute a fake implementing this
 // interface directly — mirroring how internal/pve's own tests mock narrow
-// service slices rather than the full SDK client. pve-cid never calls a
+// service slices rather than the full SDK client. pve-ops never calls a
 // mutating PVE endpoint, so Reader exposes only List/Get-shaped methods.
 type Reader interface {
 	// ListClusterVMs returns every QEMU guest (VM or template) in the
@@ -96,7 +96,7 @@ func strPtr(s string) *string { return &s }
 
 func (r *pveReader) ListClusterVMs(ctx context.Context) ([]ClusterVM, error) {
 	if r.client == nil {
-		return nil, fmt.Errorf("pve-cid: no client available")
+		return nil, fmt.Errorf("pve-ops: no client available")
 	}
 	// Authoritative per-node listings, not the /cluster/resources index: the
 	// index lags node-local state by minutes, so an inventory read from it
@@ -106,7 +106,7 @@ func (r *pveReader) ListClusterVMs(ctx context.Context) ([]ClusterVM, error) {
 	// under-report.
 	guests, err := pve.ListGuestsAuthoritative(ctx, r.client, nil)
 	if err != nil {
-		return nil, fmt.Errorf("pve-cid: list cluster guests: %w", err)
+		return nil, fmt.Errorf("pve-ops: list cluster guests: %w", err)
 	}
 
 	var out []ClusterVM
@@ -124,7 +124,7 @@ func (r *pveReader) ListClusterVMs(ctx context.Context) ([]ClusterVM, error) {
 
 func (r *pveReader) VMConfig(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	if r.client == nil || r.client.QEMU() == nil {
-		return nil, fmt.Errorf("pve-cid: no QEMU service available")
+		return nil, fmt.Errorf("pve-ops: no QEMU service available")
 	}
 	return r.client.QEMU().Config(ctx, node, vmid)
 }
@@ -139,13 +139,13 @@ func (r *pveReader) FindStemcellVolume(ctx context.Context, node, storage, filen
 
 func (r *pveReader) ListStorageContent(ctx context.Context, node, storage string) ([]StorageContentItem, error) {
 	if r.client == nil || r.client.Nodes() == nil {
-		return nil, fmt.Errorf("pve-cid: no nodes service available")
+		return nil, fmt.Errorf("pve-ops: no nodes service available")
 	}
 	resp, err := r.client.Nodes().ListStorageContent(ctx, node, storage, &sdknodes.ListStorageContentParams{
 		Content: strPtr("import"),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("pve-cid: list storage content on %q/%q: %w", node, storage, err)
+		return nil, fmt.Errorf("pve-ops: list storage content on %q/%q: %w", node, storage, err)
 	}
 	if resp == nil {
 		return nil, nil
@@ -170,11 +170,11 @@ func (r *pveReader) ListStorageContent(ctx context.Context, node, storage string
 
 func (r *pveReader) ListNodes(ctx context.Context) ([]string, error) {
 	if r.client == nil || r.client.Nodes() == nil {
-		return nil, fmt.Errorf("pve-cid: no nodes service available")
+		return nil, fmt.Errorf("pve-ops: no nodes service available")
 	}
 	resp, err := r.client.Nodes().ListNodes(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("pve-cid: list nodes: %w", err)
+		return nil, fmt.Errorf("pve-ops: list nodes: %w", err)
 	}
 	if resp == nil {
 		return nil, nil
@@ -230,26 +230,26 @@ func loadConfigAndLogger(configPath string, stderr io.Writer) (*config.CPIConfig
 
 	cfg, err := config.LoadFile(configPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("pve-cid: config load failed (%s): %w", configPath, err)
+		return nil, nil, fmt.Errorf("pve-ops: config load failed (%s): %w", configPath, err)
 	}
 
 	logger, err := log.NewLogger(cfg.LogLevel, stderr)
 	if err != nil {
-		return nil, nil, fmt.Errorf("pve-cid: logger init failed: %w", err)
+		return nil, nil, fmt.Errorf("pve-ops: logger init failed: %w", err)
 	}
 	return cfg, logger, nil
 }
 
 // newPVEClient constructs a live client against the cluster cfg names, reusing
 // pve.NewClientWithTracer, which is the client-construction path cmd/cpi/main.go
-// uses, so pve-cid's connection, auth, and retry behavior matches the CPI
+// uses, so pve-ops's connection, auth, and retry behavior matches the CPI
 // exactly. The nil tracer makes pve.NewClientWithTracer skip the tracing
 // decorator layer entirely, as in the cpi binary's tracing-disabled path: a
 // read-only inspection tool has no reason to stand up an OTel pipeline.
 func newPVEClient(cfg *config.CPIConfig, logger *log.Logger) (pve.Client, error) {
 	client, err := pve.NewClientWithTracer(cfg, logger, nil)
 	if err != nil {
-		return nil, fmt.Errorf("pve-cid: pve client init failed: %w", err)
+		return nil, fmt.Errorf("pve-ops: pve client init failed: %w", err)
 	}
 	return client, nil
 }

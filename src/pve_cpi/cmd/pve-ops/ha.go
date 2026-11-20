@@ -18,8 +18,8 @@ import (
 // haInputLimit caps the size of a request or cpi-config file the doctor reads.
 const haInputLimit = 1 << 20
 
-const haUsage = "usage: pve-cid ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]\n" +
-	"       pve-cid ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]"
+const haUsage = "usage: pve-ops ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]\n" +
+	"       pve-ops ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]"
 
 // haDeps are the pieces of the ha subcommand a test replaces: how the base CPI
 // config is loaded, how a reader is opened for an effective config, and the
@@ -48,7 +48,7 @@ func productionHADeps() haDeps {
 	}
 }
 
-// runHA implements "pve-cid ha".
+// runHA implements "pve-ops ha".
 func runHA(args []string, stdout, stderr io.Writer) int {
 	return runHAWith(args, stdout, stderr, productionHADeps())
 }
@@ -77,7 +77,7 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 		return exitUsage
 	}
 	if *requestPath != "" && *cpiConfigPath != "" {
-		_, _ = fmt.Fprintln(stderr, "pve-cid ha: --request and --cpi-config cannot be combined")
+		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --request and --cpi-config cannot be combined")
 		_, _ = fmt.Fprintln(stderr, haUsage)
 		return exitUsage
 	}
@@ -101,20 +101,20 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 	if *requestPath != "" {
 		reqCtx, err := readHARequestContext(*requestPath)
 		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "pve-cid ha: %s\n", err)
+			_, _ = fmt.Fprintf(stderr, "pve-ops ha: %s\n", err)
 			return exitUsage
 		}
 		owner = strings.TrimSpace(reqCtx.DirectorUUID)
 		eff, _, notes, err = config.ApplyContextOverrides(base, reqCtx.Extra)
 		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "pve-cid ha: the request's cpi_config properties do not apply: %s\n", err)
+			_, _ = fmt.Fprintf(stderr, "pve-ops ha: the request's cpi_config properties do not apply: %s\n", err)
 			return exitError
 		}
 	}
 	if *widenReplicas {
 		if named := strings.TrimSpace(*directorUUID); named != "" {
 			if owner != "" && owner != named {
-				_, _ = fmt.Fprintln(stderr, "pve-cid ha: --director-uuid names a different Director than the request")
+				_, _ = fmt.Fprintln(stderr, "pve-ops ha: --director-uuid names a different Director than the request")
 				return exitUsage
 			}
 			owner = named
@@ -123,7 +123,7 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 	}
 	reader, err := deps.openReader(eff, logger)
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "pve-cid ha: cannot reach the cluster: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "pve-ops ha: cannot reach the cluster: %v\n", err)
 		return exitError
 	}
 	report := collectHA(ctx, newLedgerHAReader(reader, newHANodeLedger()), eff, owner, deps.now())
@@ -148,9 +148,9 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 func checkHAWidenFlags(widen, apply bool, cpiConfigPath, directorUUID string, stderr io.Writer) (int, bool) {
 	switch {
 	case !widen && (apply || directorUUID != ""):
-		_, _ = fmt.Fprintln(stderr, "pve-cid ha: --apply and --director-uuid go with --widen-replicas")
+		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --apply and --director-uuid go with --widen-replicas")
 	case widen && cpiConfigPath != "":
-		_, _ = fmt.Fprintln(stderr, "pve-cid ha: --widen-replicas and --cpi-config cannot be combined; "+
+		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --widen-replicas and --cpi-config cannot be combined; "+
 			"run it once per cpis entry with that entry's --request")
 	default:
 		return exitOK, true

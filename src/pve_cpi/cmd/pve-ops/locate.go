@@ -100,7 +100,7 @@ type DiskLocateResult struct {
 // Returns an error only when the initial cluster VM listing itself fails.
 func locateDisk(ctx context.Context, r Reader, bareVolid, stableID string) (*DiskLocateResult, error) {
 	if bareVolid == "" {
-		return nil, fmt.Errorf("pve-cid: locateDisk: bareVolid must not be empty")
+		return nil, fmt.Errorf("pve-ops: locateDisk: bareVolid must not be empty")
 	}
 
 	vms, err := r.ListClusterVMs(ctx)
@@ -243,7 +243,7 @@ type StemcellLocateResult struct {
 // still exists on the named storage.
 func locateStemcell(ctx context.Context, r Reader, decoded *DecodedCID) (*StemcellLocateResult, error) {
 	if decoded.Family != FamilyStemcellLight && decoded.Family != FamilyStemcellHeavy {
-		return nil, fmt.Errorf("pve-cid: locateStemcell: %q is not a stemcell CID", decoded.Raw)
+		return nil, fmt.Errorf("pve-ops: locateStemcell: %q is not a stemcell CID", decoded.Raw)
 	}
 
 	kind := string(pve.StemcellKindLight)
@@ -262,7 +262,7 @@ func locateStemcell(ctx context.Context, r Reader, decoded *DecodedCID) (*Stemce
 
 	if result.SHA8 == "" {
 		return nil, fmt.Errorf(
-			"pve-cid: locateStemcell: could not extract sha8 from filename %q — cannot look up cache templates",
+			"pve-ops: locateStemcell: could not extract sha8 from filename %q — cannot look up cache templates",
 			decoded.Filename,
 		)
 	}
@@ -304,7 +304,7 @@ func locateStemcell(ctx context.Context, r Reader, decoded *DecodedCID) (*Stemce
 
 // resolveBareVolid accepts either a pvd-/pvz- envelope CID or a raw PVE
 // volid ("<storage>:<volume>") and returns the bare volid to scan for.
-// "pve-cid locate" is the one subcommand that accepts a raw volid directly
+// "pve-ops locate" is the one subcommand that accepts a raw volid directly
 // (an operator convenience "decode" deliberately does not extend to, since
 // bare volids are never a Director-visible CID — see DecodeCID's doc
 // comment).
@@ -312,7 +312,7 @@ func resolveBareVolid(raw string) (bareVolid, stableID string, err error) {
 	if strings.HasPrefix(raw, "pvd-") || strings.HasPrefix(raw, "pvz-") {
 		bareCID, meta, decErr := pve.ParseEncodedDiskCID(raw)
 		if decErr != nil {
-			return "", "", fmt.Errorf("pve-cid: %w", decErr)
+			return "", "", fmt.Errorf("pve-ops: %w", decErr)
 		}
 		if meta != nil {
 			stableID = meta.ID
@@ -321,7 +321,7 @@ func resolveBareVolid(raw string) (bareVolid, stableID string, err error) {
 	}
 	if _, _, parseErr := pve.ParseDiskCID(raw); parseErr != nil {
 		return "", "", fmt.Errorf(
-			"pve-cid: locate: %q is neither a stemcell CID (\":light:\"/\":heavy:\"), "+
+			"pve-ops: locate: %q is neither a stemcell CID (\":light:\"/\":heavy:\"), "+
 				"a disk CID (\"pvd-\"/\"pvz-\"), nor a raw volid (\"<storage>:<volume>\"): %w",
 			raw, parseErr,
 		)
@@ -329,19 +329,19 @@ func resolveBareVolid(raw string) (bareVolid, stableID string, err error) {
 	return raw, "", nil
 }
 
-// runLocate implements "pve-cid locate <cid|volid> [--config PATH] [--json]".
+// runLocate implements "pve-ops locate <cid|volid> [--config PATH] [--json]".
 func runLocate(args []string, stdout, stderr io.Writer) int {
 	return runLocateWith(args, stdout, stderr, loadConfigAndReader)
 }
 
 // runLocateWith runs the locate subcommand, opening its reader through open.
 func runLocateWith(args []string, stdout, stderr io.Writer, open readerOpener) int {
-	fs := flag.NewFlagSet("pve-cid locate", flag.ContinueOnError)
+	fs := flag.NewFlagSet("pve-ops locate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "path to CPI JSON config file (default: $PVE_CPI_CONFIG or "+defaultConfigPath+")")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON instead of a table")
 	fs.Usage = func() {
-		_, _ = fmt.Fprintln(stderr, "Usage: pve-cid locate <cid|volid> [--config PATH] [--json]")
+		_, _ = fmt.Fprintln(stderr, "Usage: pve-ops locate <cid|volid> [--config PATH] [--json]")
 		fs.PrintDefaults()
 	}
 	positionals, err := parseWithPositionals(fs, args)
@@ -349,7 +349,7 @@ func runLocateWith(args []string, stdout, stderr io.Writer, open readerOpener) i
 		return exitUsage
 	}
 	if len(positionals) != 1 {
-		_, _ = fmt.Fprintf(stderr, "pve-cid locate: expected exactly one CID or volid argument, got %d\n", len(positionals))
+		_, _ = fmt.Fprintf(stderr, "pve-ops locate: expected exactly one CID or volid argument, got %d\n", len(positionals))
 		fs.Usage()
 		return exitUsage
 	}

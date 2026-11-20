@@ -18,7 +18,7 @@ class PlacementVerification:
     def __init__(self, config_path: str, cpi_bin: str, report_path: str) -> None:
         self.config_path = config_path
         self.cpi_bin = cpi_bin
-        self.cli = str(Path(cpi_bin).resolve().with_name("pve-cid"))
+        self.cli = str(Path(cpi_bin).resolve().with_name("pve-ops"))
         self.report_path = Path(report_path)
         self.config = json.loads(Path(config_path).read_text())
         self.report: dict[str, Any] = {

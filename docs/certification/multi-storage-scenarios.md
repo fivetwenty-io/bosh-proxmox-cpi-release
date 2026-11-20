@@ -2,7 +2,7 @@
 
 Run `scripts/_storage_placement_scenarios.py` against a disposable PVE lab to collect placement and lifecycle evidence from the candidate CPI. The runner checks actual volumes and journal identities after operations. It also reads guest filesystem mappings through QEMU Guest Agent to distinguish a root-derived data disk from a dedicated ephemeral disk.
 
-Build and install `cpi` and `pve-cid` together from the same candidate. Prepare the lab topology and enroll the durable journal using the [base lifecycle guide](multi-storage-placement.md). Policy cases retain that namespace and journal throughout configuration changes. Recovery cases create separate disposable authorities, as described below.
+Build and install `cpi` and `pve-ops` together from the same candidate. Prepare the lab topology and enroll the durable journal using the [base lifecycle guide](multi-storage-placement.md). Policy cases retain that namespace and journal throughout configuration changes. Recovery cases create separate disposable authorities, as described below.
 
 ## Declare the lab fixtures
 
@@ -62,7 +62,7 @@ A passing row includes physical volume evidence and final journal disposition. R
 
 ## Exercise topology and capacity constraints
 
-The planning cases in the constraints suite invoke the candidate's production `pve-cid storage-plan` command. Positive planning cases must return a feasible observation-only plan and leave journal and volume inventories unchanged. Negative planning cases also invoke the corresponding CPI request, require the expected error class, and require unchanged journal fingerprints and actual storage volumes. A returned resource on a negative case is recorded for cleanup and makes the case fail.
+The planning cases in the constraints suite invoke the candidate's production `pve-ops storage-plan` command. Positive planning cases must return a feasible observation-only plan and leave journal and volume inventories unchanged. Negative planning cases also invoke the corresponding CPI request, require the expected error class, and require unchanged journal fingerprints and actual storage volumes. A returned resource on a negative case is recorded for cleanup and makes the case fail.
 
 Add a `constraints` object to the shared manifest.
 

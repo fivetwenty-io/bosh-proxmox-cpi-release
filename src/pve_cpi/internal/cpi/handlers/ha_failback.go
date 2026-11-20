@@ -166,7 +166,7 @@ func syncVMFailback(ctx context.Context, deps Deps, api ha.FailbackAPI, profile 
 			continue
 		}
 		logger.Warn(op+": resources.cfg changed after every read of the VM's HA resource, so failback stays off; "+
-			"pve-cid ha reports the resource as failback_drift until a later call sets the flag",
+			"pve-ops ha reports the resource as failback_drift until a later call sets the flag",
 			log.Int("attempts", attempt), log.String("reason", w.reason))
 		return
 	}

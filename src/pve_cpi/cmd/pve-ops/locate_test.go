@@ -274,7 +274,7 @@ func TestLocateStemcell_TemplateFoundWithRefs(t *testing.T) {
 
 // TestLocateStemcell_OrphanTemplate covers a cache template with zero
 // director references — the locate-time signal that corroborates
-// "pve-cid stemcells --orphans" for this one CID.
+// "pve-ops stemcells --orphans" for this one CID.
 func TestLocateStemcell_OrphanTemplate(t *testing.T) {
 	decoded, err := DecodeCID(":heavy:local:import/bosh-stemcell-x-1-deadbeef.qcow2")
 	if err != nil {

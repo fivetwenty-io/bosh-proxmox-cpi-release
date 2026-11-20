@@ -1688,7 +1688,7 @@ func (c *haCollector) migrationEvidence(
 // verified replica. create_vm does not wait for the first sync. The pin widens
 // once a sync that started after the last volume change is verified, on a
 // later reboot_vm or set_vm_metadata, in the sweep after any CPI call that
-// takes the HA rules lock, or with pve-cid ha --widen-replicas --apply, so a VM
+// takes the HA rules lock, or with pve-ops ha --widen-replicas --apply, so a VM
 // with a working job is only awaiting that sync.
 func (c *haCollector) notRecoverable(g *haGuest, pin *ha.Rule, rec *aj.Record) {
 	id := g.ref.VMID
@@ -1715,7 +1715,7 @@ func (c *haCollector) notRecoverable(g *haGuest, pin *ha.Rule, rec *aj.Record) {
 	}
 	changed, haveChange := c.volumeChange(pin, rec)
 	const widens = "; once a sync is verified, the pin widens to the partner after the next CPI call that takes the HA " +
-		"rules lock, or now with pve-cid ha --widen-replicas --apply"
+		"rules lock, or now with pve-ops ha --widen-replicas --apply"
 	switch {
 	case pin != nil && !st.LastSync.IsZero() && (!haveChange || st.LastSync.After(changed.Add(aj.ReplicaClockSkewTolerance))):
 		c.awaiting[id] = true

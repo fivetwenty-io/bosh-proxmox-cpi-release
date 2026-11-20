@@ -11,7 +11,7 @@ This is the operator-facing record of the design decisions behind the pre-releas
 | D1 | Stemcell CID architecture | Path-identity CIDs (`:light:`/`:heavy:`) naming the qcow2 file directly; the template VM becomes a lazily-reused per-cluster cache, not the identity |
 | D2 | VM-creation strategy | `pve.stemcell_strategy: template \| import`, default `template`, with a per-stemcell override |
 | D3 | Stemcell refcounting | Per-director reference sets keyed by BOSH director UUID, stored in the cache template's provenance, with an operator command that prunes a ref a rebuilt director left behind |
-| D4 | Disk CIDs | Kept the `pvd-`/`pvz-` envelope; shipped a first-class `pve-cid` operator tool; fixed a sentinel gap |
+| D4 | Disk CIDs | Kept the `pvd-`/`pvz-` envelope; shipped a first-class `pve-ops` operator tool; fixed a sentinel gap |
 | D5 | `network_mode` default | `bridge` (plain Linux bridges, zero SDN prerequisites); SDN is a one-line opt-in |
 | D6 | Resource pools | Kept default-on (`bosh`/`bosh-templates`); added a per-request pool check that fails `create_vm` and `create_stemcell` on a missing grant |
 | D7 | `iso_storage` default | Follows `vm_storage` when eligible, instead of always defaulting to node-local `local` |
@@ -67,7 +67,7 @@ The CPI emits and accepts six CID shapes in total:
 
 Every `create_stemcell` call builds (or reuses) the per-cluster cache template, tagged `bosh-stemcell-cache`, regardless of which `stemcell_strategy` you have configured. This is deliberate, not an oversight: the cache template's provenance JSON is also where the set of referencing director UUIDs lives (D3). If the template were skipped for `strategy: import`, two import-strategy directors registering the same `:heavy:` stemcell would have no shared place to record their references, and the first director to delete the stemcell would remove the qcow2 out from under the second. So `stemcell_strategy` only governs how `create_vm` materializes a VM's root disk (clone from the cache versus import the qcow2 directly); it never determines whether the cache/anchor template gets built.
 
-**Operator-visible consequences.** Stemcell CIDs recorded in the Director database change shape, because the template VMID is never part of the CID and is never exposed to BOSH. `pve-cid decode <cid>` (see D4) understands the new grammar. A stemcell uploaded once as `:light:` on storage shared by multiple clusters can be consumed by every cluster from that one file.
+**Operator-visible consequences.** Stemcell CIDs recorded in the Director database change shape, because the template VMID is never part of the CID and is never exposed to BOSH. `pve-ops decode <cid>` (see D4) understands the new grammar. A stemcell uploaded once as `:light:` on storage shared by multiple clusters can be consumed by every cluster from that one file.
 
 **Migration.** Pre-cutover stemcells, templates, and any deployment referencing them must be deleted before redeploying. There is no decode path for the old template-VMID or bare-integer CID forms, so a `delete_stemcell` call against one is a hard parse error.
 
@@ -113,22 +113,22 @@ Every `create_stemcell` call builds (or reuses) the per-cluster cache template, 
 
 **Options considered.** Keep the envelope unchanged; move to a human-readable disk CID grammar (explicitly out of scope; see [Out of scope](#out-of-scope) below); keep the envelope and add first-class tooling around it.
 
-**Chosen: keep the envelope, delete every legacy decode branch, ship `pve-cid`.** The envelope format is unchanged. Every garbage-tolerant legacy decode arm, meaning a `|`-separator branch and colon-escape special cases for storage names that happened to look like other CID shapes, is deleted; an unrecognized prefix is now a hard parse error rather than a silently-swallowed pass-through. `pve-cid` (`src/pve_cpi/cmd/pve-cid`) is a new, read-only Go CLI that ships in the release, installed on the Director VM at `/var/vcap/packages/pve_cpi/bin/pve-cid` (not on `PATH` by default):
+**Chosen: keep the envelope, delete every legacy decode branch, ship `pve-ops`.** The envelope format is unchanged. Every garbage-tolerant legacy decode arm, meaning a `|`-separator branch and colon-escape special cases for storage names that happened to look like other CID shapes, is deleted; an unrecognized prefix is now a hard parse error rather than a silently-swallowed pass-through. `pve-ops` (`src/pve_cpi/cmd/pve-ops`) is a new, read-only Go CLI that ships in the release, installed on the Director VM at `/var/vcap/packages/pve_cpi/bin/pve-ops` (not on `PATH` by default):
 
 | Subcommand | Purpose |
 |---|---|
-| `pve-cid decode <cid>` | Decode any CID family offline, with no PVE API calls |
-| `pve-cid encode --volid ...` | Build a `pvd-`/`pvz-` envelope offline |
-| `pve-cid locate <cid\|volid>` | Online: find the holder VM for a disk CID, or the cache templates and director references for a stemcell CID |
-| `pve-cid stemcells [--orphans]` | Online: per-cluster stemcell inventory that compares qcow2 files against cache templates against director references, the "what is safe to delete" view |
+| `pve-ops decode <cid>` | Decode any CID family offline, with no PVE API calls |
+| `pve-ops encode --volid ...` | Build a `pvd-`/`pvz-` envelope offline |
+| `pve-ops locate <cid\|volid>` | Online: find the holder VM for a disk CID, or the cache templates and director references for a stemcell CID |
+| `pve-ops stemcells [--orphans]` | Online: per-cluster stemcell inventory that compares qcow2 files against cache templates against director references, the "what is safe to delete" view |
 
-`pve-cid` never mutates PVE; every online subcommand is read-only.
+`pve-ops` never mutates PVE; every online subcommand is read-only.
 
 **A residual gap closed alongside the tool.** VM disks attached inline during `create_vm` (as opposed to attached later via `attach_disk`) were not recording their CID sentinel the same way `attach_disk` does. `get_disks` on such a VM could return incorrect data and cloud-check membership comparisons could disagree. `create_vm`'s disk-attach path now records the sentinel identically to `attach_disk`.
 
 **A second gap closed: over-length CIDs.** A `pvd-` CID exceeding the Director's 255-character column, with `disk_cid_compression` off, previously only emitted a warning. The volume was created, the Director then received a CID too long to store, and the disk was effectively orphaned. `create_disk` now fails fast in that case with a remediation error naming `disk_cid_compression: true`, and rolls back the volume it created. (Superseded later: the compressed `pvz-` fallback now engages automatically whenever the plain form would overflow, and the property is retained as an accepted no-op; the fail-fast survives only for envelopes gzip cannot shrink under the limit.)
 
-**Operator-visible consequences.** `pve-cid decode <cid>` replaces manual base64/gzip decoding for support and debugging. An over-255-character disk CID with compression disabled now fails at `create_disk` time with an actionable message, instead of silently producing a Director-side orphan.
+**Operator-visible consequences.** `pve-ops decode <cid>` replaces manual base64/gzip decoding for support and debugging. An over-255-character disk CID with compression disabled now fails at `create_disk` time with an actionable message, instead of silently producing a Director-side orphan.
 
 **Migration.** Delete any deployment carrying disk CIDs in the removed legacy grammars before upgrading; the new build will not parse them.
 
@@ -228,7 +228,7 @@ Both were already anticipated in the pre-existing per-NIC design; the bridge-mod
 
 **Operator-visible consequences.** A `:heavy:` stemcell's file lifetime tracks director references, not template-freeze timing. If an independent cluster is missing its own copy of a shared `:heavy:` stemcell's qcow2 (deleted, never uploaded there, or lost), it self-heals silently by re-uploading on its next `create_stemcell` dedup miss rather than erroring. `:light:` files are never touched by the CPI, at any reference count, and cross-cluster sharing on shared storage is achieved entirely through `:light:` mode, by design.
 
-There is one exception to the `:heavy:` rule. When a `delete_stemcell` request comes through a cpi-config entry and the stemcell's storage is shared, the CPI destroys the cache template but keeps the qcow2, because another cluster may mount the same export and the CPI cannot count references across clusters. `pve-cid stemcells --orphans` reports the kept file, and the operator removes it with `pvesm free`. See [Light Stemcells](light-stemcells.md#heavy-and-a-cross-cluster-shared-export-do-not-mix).
+There is one exception to the `:heavy:` rule. When a `delete_stemcell` request comes through a cpi-config entry and the stemcell's storage is shared, the CPI destroys the cache template but keeps the qcow2, because another cluster may mount the same export and the CPI cannot count references across clusters. `pve-ops stemcells --orphans` reports the kept file, and the operator removes it with `pvesm free`. See [Light Stemcells](light-stemcells.md#heavy-and-a-cross-cluster-shared-export-do-not-mix).
 
 **Migration.** Pre-cutover `:heavy:`-equivalent stemcells relied on post-freeze reclaim and had no director-reference tracking at all. Delete them and re-upload after the redeploy.
 
@@ -328,7 +328,7 @@ An endpoint change also resets the settings that would otherwise act on the wron
 
 **Why the default is on rather than opt-in.** An operator who binds a storage set has already told us where roots may land, and the slow full clone is the surprise, not the replica. The flag is therefore tri-state. Left unset it replicates wherever replication can change the outcome, which means wherever an effective root set is bound and the strategy builds templates. An explicit `false` opts out. An explicit `true` additionally makes those preconditions mandatory, so an operator who means to depend on replicas hears about a missing set or the `import` strategy as a config error instead of getting silence.
 
-**Operator-visible consequences.** One extra template per member per stemcell in the 30000 band. Creates on every member run at linked-clone speed. A missing replica is a warning on the create and a full clone, never a failure. The PVE token needs `Datastore.AllocateSpace`, `Datastore.Audit`, and `Datastore.Allocate` on every member of a bound set. That requirement now arrives with the binding rather than with an opt-in. Two explicit member names that sanitize to the same tag are a config error when the flag is explicitly true, and a skip with a warning otherwise. `pve-cid stemcells` shows replicas under their sha8 as before.
+**Operator-visible consequences.** One extra template per member per stemcell in the 30000 band. Creates on every member run at linked-clone speed. A missing replica is a warning on the create and a full clone, never a failure. The PVE token needs `Datastore.AllocateSpace`, `Datastore.Audit`, and `Datastore.Allocate` on every member of a bound set. That requirement now arrives with the binding rather than with an opt-in. Two explicit member names that sanitize to the same tag are a config error when the flag is explicitly true, and a skip with a warning otherwise. `pve-ops stemcells` shows replicas under their sha8 as before.
 
 **Migration.** None for anyone with no storage set bound. A deployment that does bind one starts building replicas on its next stemcell upload, and `bosh upload-stemcell --fix` builds them for stemcells already uploaded. Set the property to `false` to keep the old behavior.
 
@@ -346,7 +346,7 @@ An endpoint change also resets the settings that would otherwise act on the wron
 
 **Context.** The ownership guard judges a VM that exists, and it can't help once the VMID is gone. A bare CID says nothing about the cluster it came from. When a `cpi_config` entry is pointed at another cluster, or two clusters hand out the same VMIDs, a bare CID can reach a VM it never named. A VMID that's free on the new cluster gets the answer for a VM that's gone, and for `delete_vm` that answer is success, so the Director drops its only record of a VM that may still be running on the old cluster.
 
-**Chosen: a CID that carries a cluster stamp and a per-VM token.** `create_vm` now returns `<vmid>-<cluster>-<token>`, for example `101-0a1b2c3d-4e5f6a7b`. The cluster stamp is the first eight hex characters of the SHA-256 of the cluster's root CA, which the CPI reads from `GET /nodes/{node}/certificates/info`. The token is eight random hex characters, new for every VM. The VM carries both as tags, `bosh-cluster--<stamp>` and `bosh-cid--<token>`, right after its `bosh-cpi` and owner tags. A create whose tag list would push either tag past PVE's 350-byte cap fails before it creates anything, because a VM without them would get a CID that its own checks refuse. When the CPI can't read the root CA, the create still succeeds and logs a warning, and the CID carries the stamp `00000000`, which names no cluster. A snapshot CID names its VM by the VM's CID, so a stamped VM's snapshots get CIDs such as `101-0a1b2c3d-4e5f6a7b:<snapshot>`, and `pve-cid decode` reports the stamp and the token of either form.
+**Chosen: a CID that carries a cluster stamp and a per-VM token.** `create_vm` now returns `<vmid>-<cluster>-<token>`, for example `101-0a1b2c3d-4e5f6a7b`. The cluster stamp is the first eight hex characters of the SHA-256 of the cluster's root CA, which the CPI reads from `GET /nodes/{node}/certificates/info`. The token is eight random hex characters, new for every VM. The VM carries both as tags, `bosh-cluster--<stamp>` and `bosh-cid--<token>`, right after its `bosh-cpi` and owner tags. A create whose tag list would push either tag past PVE's 350-byte cap fails before it creates anything, because a VM without them would get a CID that its own checks refuse. When the CPI can't read the root CA, the create still succeeds and logs a warning, and the CID carries the stamp `00000000`, which names no cluster. A snapshot CID names its VM by the VM's CID, so a stamped VM's snapshots get CIDs such as `101-0a1b2c3d-4e5f6a7b:<snapshot>`, and `pve-ops decode` reports the stamp and the token of either form.
 
 Every check that judges a VM compares a stamped CID with those tags first. A VM that records another cluster is refused. A VM on the right cluster that carries another token holds a VMID that the CID's VM gave up, so the call answers `VMNotFound` and leaves that VM alone. When the VMID is absent from every member, the CPI reads this cluster's stamp once and compares it with the CID's. A CID that names another cluster then gets an answer that keeps the Director's record:
 
@@ -392,7 +392,7 @@ A few adjacent ideas were explicitly weighed and rejected for this pass:
   The bridge-creation path remains single-node only, and `managed: false` against a pre-provisioned bridge is the documented multi-node pattern (see [Networks](networks.md)).
 
 - **A human-readable disk-CID grammar**
-  We rejected this in favor of keeping the proven `pvd-`/`pvz-` envelope and shipping `pve-cid` as the readability layer instead (D4).
+  We rejected this in favor of keeping the proven `pvd-`/`pvz-` envelope and shipping `pve-ops` as the readability layer instead (D4).
 
 ## See also
 
