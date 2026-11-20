@@ -164,14 +164,45 @@ type HAPattern struct {
 	aapattern.Pattern
 }
 
-// UnmarshalJSON reads the pattern and names the key in any error.
+// UnmarshalJSON reads the pattern and names the key in any error. An empty
+// list or map, which an ops file leaves when it clears the key, reads as a
+// pattern with no terms, and the config treats that as unset.
 func (p *HAPattern) UnmarshalJSON(raw []byte) error {
+	if emptyJSONContainer(raw) {
+		p.Pattern = aapattern.Pattern{}
+		return nil
+	}
 	got, err := aapattern.DecodeJSON(raw)
 	if err != nil {
 		return fmt.Errorf("ha.anti_affinity_pattern: %w", err)
 	}
 	p.Pattern = got
 	return nil
+}
+
+// emptyJSONContainer reports whether raw is a JSON list or map with nothing
+// in it, whatever whitespace it holds.
+func emptyJSONContainer(raw []byte) bool {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return false
+	}
+	switch x := v.(type) {
+	case []any:
+		return len(x) == 0
+	case map[string]any:
+		return len(x) == 0
+	}
+	return false
+}
+
+// setHAPattern returns p when it names at least one term, and nil when it is
+// nil or empty, so an empty value reads as unset everywhere.
+func setHAPattern(p *HAPattern) *HAPattern {
+	if p == nil || len(p.Terms) == 0 {
+		return nil
+	}
+	return p
 }
 
 // cloneHAPattern returns a deep copy of p, or nil.
@@ -283,7 +314,7 @@ func (c *CPIConfig) HAAntiAffinityOverflowValue() string {
 // pve.ha.anti_affinity_pattern, or the built-in block pattern when the key is
 // unset. The result shares nothing with the config.
 func (c *CPIConfig) HAAntiAffinityPatternValue() aapattern.Pattern {
-	if p := c.haBlock().AntiAffinityPattern; p != nil {
+	if p := setHAPattern(c.haBlock().AntiAffinityPattern); p != nil {
 		return p.Clone().OrDefault()
 	}
 	return aapattern.Default()
@@ -292,7 +323,7 @@ func (c *CPIConfig) HAAntiAffinityPatternValue() aapattern.Pattern {
 // HAAntiAffinityPatternSet reports whether pve.ha.anti_affinity_pattern is
 // set, by the job or by the cpi-config entry.
 func (c *CPIConfig) HAAntiAffinityPatternSet() bool {
-	return c.haBlock().AntiAffinityPattern != nil
+	return setHAPattern(c.haBlock().AntiAffinityPattern) != nil
 }
 
 // HAPinAZValue returns the effective pve.ha.pin_az. Defaults to auto.
@@ -498,7 +529,7 @@ func (h *HAConfig) merged(over *HAConfig) *HAConfig {
 		LocalPolicy:          haPick(over.LocalPolicy, h.LocalPolicy),
 		AntiAffinity:         haPick(over.AntiAffinity, h.AntiAffinity),
 		AntiAffinityOverflow: haPick(over.AntiAffinityOverflow, h.AntiAffinityOverflow),
-		AntiAffinityPattern:  cloneHAPattern(haPickPointer(over.AntiAffinityPattern, h.AntiAffinityPattern)),
+		AntiAffinityPattern:  cloneHAPattern(haPickPointer(setHAPattern(over.AntiAffinityPattern), setHAPattern(h.AntiAffinityPattern))),
 		PinAZ:                haPick(over.PinAZ, h.PinAZ),
 		PinAZStrict:          haPick(over.PinAZStrict, h.PinAZStrict),
 		Failback:             haPick(over.Failback, h.Failback),

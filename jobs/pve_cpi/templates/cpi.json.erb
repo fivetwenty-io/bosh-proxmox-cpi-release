@@ -437,8 +437,10 @@
   # pve.ha.anti_affinity_pattern is checked for its shape only, the way the
   # CPI's config parser checks it, so a typo fails the render instead of the
   # first create. The node count is unknown here, so nothing about it is
-  # checked. The value passes through unchanged.
+  # checked. The value passes through unchanged. An empty list or map, which
+  # an ops file leaves when it clears the key, reads as unset and is omitted.
   if_p("pve.ha.anti_affinity_pattern") do |v|
+    next if (v.is_a?(Array) || v.is_a?(Hash)) && v.empty?
     aa_key = "pve.ha.anti_affinity_pattern"
     aa_int = lambda do |x, lo, hi, what|
       unless x.is_a?(Integer) && x >= lo && x <= hi

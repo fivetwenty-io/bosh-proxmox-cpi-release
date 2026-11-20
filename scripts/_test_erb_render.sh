@@ -526,7 +526,14 @@ assert_json_valid "case12-pattern" "$JSON_12P" || FAILED=$((FAILED+1))
 assert_ha_block   "case12-pattern" "$JSON_12P" '{"anti_affinity_pattern":[{"stride":2},{"sets":[[0,1]],"drain_safe":true}]}'
 JSON_12PB="$(render "$(props_with_ha '{"anti_affinity_pattern":{"block":null}}')")"
 assert_ha_block   "case12-pattern-block" "$JSON_12PB" '{"anti_affinity_pattern":{"block":null}}'
-for bad in '{"stride":1}' '{"strde":2}' '{"block":{"size":1}}' '"block"' '[]' '{"sets":[[0,0]]}' \
+# An empty list or map, which an ops file leaves when it clears the key,
+# reads as unset, so the render omits the key and the CPI uses block.
+for empty in '[]' '{}'; do
+  JSON_12PE="$(render "$(props_with_ha "{\"mode\":\"auto\",\"anti_affinity_pattern\":${empty}}")")"
+  assert_json_valid "case12-pattern-empty" "$JSON_12PE" || FAILED=$((FAILED+1))
+  assert_ha_block   "case12-pattern-empty" "$JSON_12PE" '{"mode":"auto"}'
+done
+for bad in '{"stride":1}' '{"strde":2}' '{"block":{"size":1}}' '"block"' '{"sets":[[0,0]]}' \
   '{"window":2,"drain_safe":"no"}' '{"stride":2,"window":3}' '[{"block":{}},{"block":{}}]' \
   '[{"stride":2,"drain_safe":false},{"sets":[[0,1]],"drain_safe":true}]' '{"window":"3"}'; do
   rc=0

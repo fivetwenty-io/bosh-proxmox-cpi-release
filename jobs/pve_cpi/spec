@@ -319,7 +319,7 @@ properties:
       The default anti-affinity pattern of every instance group that names
       none in its ha_anti_affinity cloud property. Unset means the built-in
       block pattern, which fills rules of one fewer member than the nodes from
-      the lowest instance index. A pattern is a map with one of block, stride,
+      the lowest instance index. An empty list or map counts as unset. A pattern is a map with one of block, stride,
       window, or sets, or a list of up to eight such maps. block takes an
       optional size of at least 2, stride and window take an integer from 2 to
       64, and sets takes up to 32 lists of 2 to 64 distinct indexes. Any term

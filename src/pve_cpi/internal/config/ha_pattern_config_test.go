@@ -27,6 +27,34 @@ func TestHAConfig_PatternDefaultsToBlockAndOverflowToSplit(t *testing.T) {
 	}
 }
 
+// TestHAConfig_AnEmptyPatternReadsAsUnset pins that an empty list or map,
+// which an ops file leaves when it clears the key, reads as unset. The job
+// then falls back to the built-in block, and an entry falls back to the job.
+func TestHAConfig_AnEmptyPatternReadsAsUnset(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{`[]`, `{}`, ` [ ] `} {
+		cfg := haBase(t, `{"mode":"auto","anti_affinity_pattern":`+raw+`}`)
+		if got := cfg.HAAntiAffinityPatternValue(); got.Canonical() != "block" || !got.IsDefaultBlock() {
+			t.Errorf("pattern %q: pattern = %s, want the built-in block", raw, got.Canonical())
+		}
+		if cfg.HAAntiAffinityPatternSet() {
+			t.Errorf("pattern %q: the pattern must read as unset", raw)
+		}
+	}
+	base := haBase(t, `{"mode":"auto","anti_affinity_pattern":{"stride":2}}`)
+	for _, empty := range []any{[]any{}, map[string]any{}} {
+		eff, _, _, err := config.ApplyContextOverrides(base, map[string]any{
+			"pve_ha": map[string]any{"anti_affinity_pattern": empty},
+		})
+		if err != nil {
+			t.Fatalf("entry pattern %v: unexpected error: %v", empty, err)
+		}
+		if got := eff.HAAntiAffinityPatternValue().Canonical(); got != "stride:2" {
+			t.Errorf("entry pattern %v = %s, want the job's stride:2 inherited", empty, got)
+		}
+	}
+}
+
 func TestHAConfig_PatternLoadsEveryShape(t *testing.T) {
 	t.Parallel()
 	tests := map[string]string{
@@ -56,7 +84,6 @@ func TestHAConfig_PatternRejectsBadShapes(t *testing.T) {
 		`{"strde":2}`:                 "unknown anti-affinity pattern key",
 		`{"block":{"size":1}}`:        "at least 2",
 		`"block"`:                     "must be a map or a list",
-		`[]`:                          "at least one term",
 		`{"sets":[[0,0]]}`:            "twice",
 		`{"window":2,"drain_safe":1}`: "boolean",
 	}

@@ -36,6 +36,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Changed
 
+- An empty `pve.ha.anti_affinity_pattern`, written as `[]` or `{}`, now counts as unset. The render omits it, the job falls back to the built-in `block` pattern, and a cpi-config entry falls back to the job's pattern. Before, the render failed, so an ops file that cleared the key broke the deploy.
+
 - With `pve.cluster_lock` at `pool`, `set_vm_metadata` no longer takes the HA rules lock for a VM that its anti-affinity group's rules already hold where the plan puts it. The call plans the group from a read made without the lock and returns when that plan would write nothing. Before, every metadata call for a group member waited on the cluster-wide lock, so a parallel deploy of fifty instances ran their metadata calls one at a time.
 
 - Scored placement now reads node health a second time when the first read of `/cluster/status` fails. When the second read fails too, and the CPI writes HA state (`pve.ha.mode` is `auto` or `managed`) or `pve.placement.maintenance_node_tags` names at least one tag, `create_vm` stops with a retriable error and creates nothing, because it cannot tell which nodes are in maintenance. Before, placement warned and treated every node as healthy, so a VM could land on a node in maintenance and join HA rules there. With HA writes off and no tags named, placement still warns and carries on as before.
