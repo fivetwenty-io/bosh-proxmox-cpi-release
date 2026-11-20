@@ -198,6 +198,10 @@ func TestRebalanceRules_GroupsSplitRulesAndKeepsOnlyEnabledNegativeOnes(t *testi
 			Resources: []string{"vm:101", "vm:102", "ct:500"}},
 		{ID: "bosh-aa-0123456789ab-2", Type: ha.RuleTypeResourceAffinity, Affinity: ha.AffinityNegative,
 			Resources: []string{"vm:101", "vm:103"}},
+		{ID: "bosh-aa-abcdef012345-p3", Type: ha.RuleTypeResourceAffinity, Affinity: ha.AffinityNegative,
+			Resources: []string{"vm:107", "vm:108"}},
+		{ID: "bosh-aa-abcdef012345-p0", Type: ha.RuleTypeResourceAffinity, Affinity: ha.AffinityNegative,
+			Resources: []string{"vm:107", "vm:109"}},
 		{ID: "operator-spread", Type: ha.RuleTypeResourceAffinity, Affinity: ha.AffinityNegative,
 			Resources: []string{"vm:104", "vm:x"}},
 		{ID: "bosh-aa-ffffffffffff", Type: ha.RuleTypeResourceAffinity, Affinity: ha.AffinityNegative,
@@ -211,6 +215,8 @@ func TestRebalanceRules_GroupsSplitRulesAndKeepsOnlyEnabledNegativeOnes(t *testi
 	want := []harebalance.Rule{
 		{ID: "bosh-aa-0123456789ab", Group: "bosh-aa-0123456789ab", Members: []int{101, 102}},
 		{ID: "bosh-aa-0123456789ab-2", Group: "bosh-aa-0123456789ab", Members: []int{101, 103}},
+		{ID: "bosh-aa-abcdef012345-p3", Group: "bosh-aa-abcdef012345", Members: []int{107, 108}},
+		{ID: "bosh-aa-abcdef012345-p0", Group: "bosh-aa-abcdef012345", Members: []int{107, 109}},
 		{ID: "operator-spread", Group: "operator-spread", Members: []int{104}},
 	}
 	if len(got) != len(want) {

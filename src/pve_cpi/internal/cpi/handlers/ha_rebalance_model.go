@@ -388,8 +388,9 @@ func positiveAffinityRule(set *ha.RuleSet, sid string) string {
 }
 
 // aaGroupPattern splits a CPI anti-affinity rule's id into its group and the
-// suffix of a split rule.
-var aaGroupPattern = regexp.MustCompile(`^(` + haRuleNamePrefix + `[0-9a-f]{12})(-\d+)?$`)
+// suffix of a split rule, which is -<n> for a block rule and -p<n> for a
+// pattern rule.
+var aaGroupPattern = regexp.MustCompile(`^(` + haRuleNamePrefix + `[0-9a-f]{12})(-p?\d+)?$`)
 
 // rebalanceRules returns the enabled negative resource affinity rules with
 // their VM members. A split rule of a CPI group belongs to the group its
