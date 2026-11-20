@@ -64,6 +64,10 @@ type rebalanceIO interface {
 		vmFailbackWant, error)
 	// locate returns the node the VM is on.
 	locate(ctx context.Context, vmid int) (string, error)
+	// drainState is ha.StopForDrain when stop is set, with the drained node,
+	// and ha.StartAfterDrain otherwise.
+	drainState(ctx context.Context, vmid int, read *sdkcluster.GetHaResourcesResponse, stop bool, node string) (
+		bool, error)
 }
 
 // pveRebalanceIO is rebalanceIO against PVE.
@@ -507,6 +511,15 @@ func (p *pveRebalanceIO) wantFailback(ctx context.Context, profile *ha.Profile, 
 	node string,
 ) (vmFailbackWant, error) {
 	return wantVMFailbackForRebalance(ctx, p.deps, p.deps.PVE.Cluster(), profile, vmid, loc, node)
+}
+
+func (p *pveRebalanceIO) drainState(ctx context.Context, vmid int, read *sdkcluster.GetHaResourcesResponse,
+	stop bool, node string,
+) (bool, error) {
+	if stop {
+		return ha.StopForDrain(ctx, p.deps.PVE.Cluster(), haResourceSid(vmid), read, node)
+	}
+	return ha.StartAfterDrain(ctx, p.deps.PVE.Cluster(), haResourceSid(vmid), read)
 }
 
 func (p *pveRebalanceIO) locate(ctx context.Context, vmid int) (string, error) {

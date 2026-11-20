@@ -143,19 +143,22 @@ func rebalanceGates(cfg *config.CPIConfig, profile *ha.Profile, snap *rebalanceS
 		settledGate(snap.states),
 		journalGate(journal, apply),
 		activityGate(act),
-	}
-	if apply {
-		gates = append(gates, RebalanceGate{Name: RebalanceGateRunLock, OK: true,
-			Detail: "this run holds the run lock"})
-	} else {
-		g := RebalanceGate{Name: RebalanceGateRunLock, OK: !act.runLock,
-			Detail: "no other rebalance holds the run lock"}
-		if act.runLock {
-			g.Detail = "another rebalance holds the run lock bosh-lock-ha-rebalance"
-		}
-		gates = append(gates, g)
+		runLockGate(act, apply),
 	}
 	return gates
+}
+
+// runLockGate is the run lock gate: an applied run holds the lock, and a dry
+// run refuses while another run holds it.
+func runLockGate(act rebalanceActivity, apply bool) RebalanceGate {
+	if apply {
+		return RebalanceGate{Name: RebalanceGateRunLock, OK: true, Detail: "this run holds the run lock"}
+	}
+	g := RebalanceGate{Name: RebalanceGateRunLock, OK: !act.runLock, Detail: "no other rebalance holds the run lock"}
+	if act.runLock {
+		g.Detail = "another rebalance holds the run lock bosh-lock-ha-rebalance"
+	}
+	return g
 }
 
 func profileGate(cfg *config.CPIConfig, profile *ha.Profile) RebalanceGate {

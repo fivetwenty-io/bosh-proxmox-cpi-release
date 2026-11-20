@@ -85,6 +85,19 @@ type fakeRebalanceIO struct {
 	snapshots   int
 	unmarks     []string
 	pinWrites   []string
+
+	// foreign holds the guests of no VM of this Director, by VMID, with their
+	// node, and foreignState their HA manager state, started unless set.
+	foreign      map[int]string
+	foreignState map[int]string
+	// jobs are the replication jobs the snapshot reads.
+	jobs []ha.ReplicaJobState
+	// drainHook replaces the result of a drain state write.
+	drainHook func(vmid int, stop bool) (bool, error)
+	// stopSettle lets a VM the drain stopped read as stopped to the HA
+	// manager after that many service state reads, and startSettle the same
+	// for a VM the undrain started. Zero settles at once.
+	stopSettle, startSettle int
 }
 
 func newFakeRebalanceIO() *fakeRebalanceIO {
@@ -246,6 +259,11 @@ func (f *fakeRebalanceIO) snapshot(context.Context, *ha.Profile) (*rebalanceSnap
 			snap.rules.Rules = append(snap.rules.Rules, *p)
 		}
 	}
+	for _, id := range slices.Sorted(maps.Keys(f.foreign)) {
+		snap.guests = append(snap.guests, harebalance.Guest{VMID: id, Node: f.foreign[id], HA: true,
+			Admissible: []string{"pve01", "pve02", "pve03"}})
+	}
+	snap.jobs = slices.Clone(f.jobs)
 	return snap, nil
 }
 
@@ -253,11 +271,22 @@ func (f *fakeRebalanceIO) statesLocked() map[string]string {
 	out := map[string]string{}
 	for id, v := range f.vms {
 		raw := v.raw
-		if raw == "" {
+		switch {
+		case raw != "":
+		case v.state == "stopped":
+			raw = "stopped"
+		default:
 			raw = "started"
 		}
 		if f.moving[id] {
 			raw = "migrate"
+		}
+		out[haResourceSid(id)] = raw
+	}
+	for id := range f.foreign {
+		raw := f.foreignState[id]
+		if raw == "" {
+			raw = "started"
 		}
 		out[haResourceSid(id)] = raw
 	}
@@ -485,4 +514,39 @@ func rbSkewed(f *fakeRebalanceIO) {
 	f.addVM(101, "pve01", 8)
 	f.addVM(102, "pve01", 8)
 	f.addVM(103, "pve01", 8)
+}
+
+func (f *fakeRebalanceIO) drainState(_ context.Context, vmid int, read *sdkcluster.GetHaResourcesResponse,
+	stop bool, node string,
+) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	verb := "start"
+	if stop {
+		verb = "stop"
+	}
+	f.log("%s %d", verb, vmid)
+	if f.drainHook != nil {
+		if ok, err := f.drainHook(vmid, stop); !ok || err != nil {
+			return ok, err
+		}
+	}
+	v := f.vms[vmid]
+	if v == nil || v.noResource || read == nil || read.Digest != "d"+strconv.Itoa(f.digest) {
+		return false, nil
+	}
+	f.digest++
+	if stop {
+		v.state, v.comment, v.raw = "stopped", ha.WithDrainMark(v.comment, node), "started"
+		if f.stopSettle == 0 {
+			v.raw = ""
+		}
+		return true, nil
+	}
+	v.comment, _ = ha.WithoutDrainMark(v.comment)
+	v.state, v.raw = "started", "stopped"
+	if f.startSettle == 0 {
+		v.raw = ""
+	}
+	return true, nil
 }
