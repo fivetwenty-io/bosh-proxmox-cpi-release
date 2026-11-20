@@ -500,3 +500,61 @@ func TestDrainRun_AnUnreadableStorageListRefusesAndStopsNothing(t *testing.T) {
 		t.Fatalf("exit %d halted %q vms %v", rep.ExitCode, rep.Halted, drVMs(rep.VMs))
 	}
 }
+
+func TestDrainRun_ASoftPinnedVMThatPVEKeepsIsStoppedAtTheTimeout(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	drMaintenance(f)
+	// The soft pin puts only pve01 in its highest priority class.
+	f.addVM(101, "pve01", 4).tags += ";" + deploymentTagPrefix + "cf"
+	f.pins[101] = rbPin(101, map[string]int{"pve01": 2, "pve02": 1, "pve03": 1})
+	drHold(f, 102)
+	r := drRun(f, DrainCommand, true)
+	r.settle = time.Minute
+	rep := r.drain(context.Background())
+	if rep.ExitCode != RebalanceExitOK || rep.Halted != "" {
+		t.Fatalf("exit %d halted %q vms %+v", rep.ExitCode, rep.Halted, rep.VMs)
+	}
+	if got, want := drVMs(rep.VMs), []string{"101 stays stopped", "102 stays stopped"}; !slices.Equal(got, want) {
+		t.Fatalf("vms %v, want %v", got, want)
+	}
+	if !strings.Contains(rep.VMs[0].Reason, "soft node-affinity rule "+naRuleNameFor(101)) {
+		t.Fatalf("reason %q", rep.VMs[0].Reason)
+	}
+	if by, ok := ha.DrainStopped(&f.vms[101].comment); !ok || by != "pve01" || f.vms[101].state != "stopped" {
+		t.Fatalf("VM 101 state %q comment %q", f.vms[101].state, f.vms[101].comment)
+	}
+	if !slices.Equal(rep.Deployments, []string{"cf"}) {
+		t.Fatalf("deployments %v", rep.Deployments)
+	}
+
+	// The plan warns about such a VM before any wait.
+	f = newFakeRebalanceIO()
+	f.addVM(101, "pve01", 4)
+	f.pins[101] = rbPin(101, map[string]int{"pve01": 2, "pve02": 1, "pve03": 1})
+	rep = drRun(f, DrainCommand, false).drain(context.Background())
+	if len(rep.Warnings) != 1 || !strings.Contains(rep.Warnings[0], "VM 101") ||
+		!strings.Contains(rep.Warnings[0], "stops it once the settle timeout runs out") {
+		t.Fatalf("warnings %q", rep.Warnings)
+	}
+}
+
+func TestDrainRun_ASoftPinnedVMStillWaitsWhileAnotherVMThatCouldLeaveStays(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	drMaintenance(f)
+	f.addVM(101, "pve01", 4)
+	f.pins[101] = rbPin(101, map[string]int{"pve01": 2, "pve02": 1, "pve03": 1})
+	// A pin with several nodes in its top class holds nothing.
+	f.addVM(103, "pve01", 4)
+	f.pins[103] = rbPin(103, map[string]int{"pve01": 2, "pve02": 2, "pve03": 1})
+	r := drRun(f, DrainCommand, true)
+	r.settle = time.Minute
+	rep := r.drain(context.Background())
+	if rep.ExitCode != RebalanceExitError || !strings.Contains(rep.Halted, "2 VMs that could leave node pve01") {
+		t.Fatalf("exit %d halted %q", rep.ExitCode, rep.Halted)
+	}
+	if len(f.callsWith("stop ")) != 0 {
+		t.Fatalf("a drain that timed out with a VM it can't explain stopped a VM: %v", f.calls)
+	}
+}

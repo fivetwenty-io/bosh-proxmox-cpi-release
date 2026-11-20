@@ -45,6 +45,11 @@ type drainVMFate struct {
 	Reason string
 	// Targets lists the nodes that can take a VM that leaves, sorted.
 	Targets []string
+	// softPin names the soft node-affinity rule of a VM that leaves when the
+	// rule puts only the drained node in its highest priority class. PVE HA
+	// should move such a VM to the rule's next class, and a VM it keeps on the
+	// node through the settle timeout is one the drain stops.
+	softPin string
 	facts   *rebalanceVMFacts
 }
 
@@ -104,9 +109,41 @@ func decideDrainFates(cfg *config.CPIConfig, profile *ha.Profile, snap *rebalanc
 			out[i].Fate = DrainStays
 		default:
 			out[i].Fate, out[i].Reason = DrainLeaves, ""
+			out[i].softPin = d.softPinOn(haResourceSid(out[i].VMID))
 		}
 	}
 	return out
+}
+
+// softPinOn returns the ID of an applied soft node-affinity rule for sid whose
+// highest priority class holds the drained node and no other node, or "".
+func (d *drainDecider) softPinOn(sid string) string {
+	for i := range d.rules {
+		if r := &d.rules[i]; drainSoftPinHolds(r, sid, d.node) {
+			return r.ID
+		}
+	}
+	return ""
+}
+
+// drainSoftPinHolds reports whether r is an enabled soft node-affinity rule
+// for sid whose highest priority class holds node alone. It reads a pin the
+// way the doctor's maintenance_stranded finding does.
+func drainSoftPinHolds(r *ha.Rule, sid, node string) bool {
+	if r.Disabled || r.Strict || r.Type != ha.RuleTypeNodeAffinity || !r.HasResource(sid) {
+		return false
+	}
+	top, topNodes, ok := 0, 0, false
+	for _, prio := range r.Nodes {
+		switch {
+		case !ok || prio > top:
+			top, topNodes, ok = prio, 1, true
+		case prio == top:
+			topNodes++
+		}
+	}
+	prio, named := r.Nodes[node]
+	return ok && topNodes == 1 && named && prio == top
 }
 
 // drainDecider holds what every VM's decision reads.

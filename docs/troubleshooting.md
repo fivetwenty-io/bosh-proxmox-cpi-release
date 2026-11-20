@@ -3146,7 +3146,7 @@ A refusal that names another node means we must bring that node back online or o
 
 **Cause**
 
-The rules say that another node can take the VM, yet PVE HA didn't move it within `--settle-timeout`. Something other than the rules is holding it. The usual causes are a migration that fails or stalls, a target node that lacks the memory or the storage for the VM, a VM with a mounted local ISO or a passthrough device that blocks live migration, and a cluster resource scheduler that keeps choosing a node that the rules forbid.
+The rules say that another node can take the VM, yet PVE HA didn't move it within `--settle-timeout`. Something other than the rules is holding it. The usual causes are a migration that fails or stalls, a target node that lacks the memory or the storage for the VM, a VM with a mounted local ISO or a passthrough device that blocks live migration, and a cluster resource scheduler that keeps choosing a node that the rules forbid. A VM whose soft node-affinity rule puts only the drained node in its highest priority class doesn't end the run this way when such VMs are all that is left, because the drain then stops them, as [Draining and undraining a node with `pve-ops ha drain`](operations.md#draining-and-undraining-a-node-with-pve-ops-ha-drain) explains.
 
 **Diagnosis**
 

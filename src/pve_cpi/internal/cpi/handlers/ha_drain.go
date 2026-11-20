@@ -503,6 +503,7 @@ func (r *drainRun) drain(ctx context.Context) DrainReport {
 		return r.readFailed(ctx, err)
 	}
 	r.recordFates(view)
+	r.warnSoftPins(view)
 	if !r.report.GatesOK() || !r.apply {
 		r.remind(DrainCommand)
 		if !r.report.GatesOK() {
@@ -537,6 +538,43 @@ func (r *drainRun) drain(ctx context.Context) DrainReport {
 	return r.report
 }
 
+// warnSoftPins warns about each VM that can leave while its soft pin puts only
+// the drained node in its highest priority class. PVE HA should move it to the
+// pin's next class, and a VM PVE keeps on the node is one the drain stops once
+// the settle timeout runs out.
+func (r *drainRun) warnSoftPins(view *drainView) {
+	for i := range view.fates {
+		if f := &view.fates[i]; f.Fate == DrainLeaves && f.softPin != "" {
+			r.warn(fmt.Sprintf("VM %d has the soft node-affinity rule %s, which puts only node %s in its highest "+
+				"priority class; PVE HA should move it to the rule's next class, and if PVE keeps it on the node, "+
+				"the drain stops it once the settle timeout runs out", f.VMID, f.softPin, r.node))
+		}
+	}
+}
+
+// softHeld turns each VM in leaving into one that can't leave when every one
+// of them has a soft pin that holds the drained node and nothing is moving,
+// because PVE HA kept them all on the node through the settle timeout. It
+// reports whether it did.
+func (r *drainRun) softHeld(leaving []*drainVMFate, moving []string) bool {
+	if len(leaving) == 0 || len(moving) > 0 {
+		return false
+	}
+	for _, f := range leaving {
+		if f.softPin == "" {
+			return false
+		}
+	}
+	for _, f := range leaving {
+		f.Fate, f.Targets = DrainStays, nil
+		f.Reason = "its soft node-affinity rule " + f.softPin + " puts only node " + r.node + " in its highest " +
+			"priority class, and PVE HA kept it on the node until the settle timeout ran out"
+		r.logger.Warn(r.op+": PVE HA kept a VM with a soft pin on the node, so the drain stops it",
+			log.Int(metadataKeyVMID, f.VMID), log.String("rule", f.softPin))
+	}
+	return true
+}
+
 // leftRunning says how many VMs the drain left running.
 func (r *drainRun) leftRunning() string {
 	n := r.report.Count(DrainOutcomeBusy) + r.report.Count(DrainOutcomeFailed)
@@ -548,7 +586,9 @@ func (r *drainRun) leftRunning() string {
 // the node and nothing is migrating or relocating, apart from the VMs that
 // can't leave. A VM whose fate a poll can't decide keeps the wait going too,
 // and when it is still undecided at the timeout, the caller's fates gate ends
-// the run. It reads the cluster and decides the fates again on each poll, and
+// the run. When every VM still on the node at the timeout has a soft pin that
+// holds the node, and nothing is moving, those VMs become VMs that can't leave,
+// so the caller stops them. It reads the cluster and decides the fates again on each poll, and
 // returns the last view. false means the run halted.
 func (r *drainRun) waitForPVE(ctx context.Context, view *drainView) (*drainView, bool) {
 	deadline := r.io.now().Add(r.settle)
@@ -571,7 +611,7 @@ func (r *drainRun) waitForPVE(ctx context.Context, view *drainView) (*drainView,
 		if len(leaving) == 0 && len(moving) == 0 && undecided == 0 {
 			return view, true
 		}
-		if !r.io.now().Before(deadline) && len(leaving) == 0 && len(moving) == 0 {
+		if !r.io.now().Before(deadline) && (len(leaving) == 0 && len(moving) == 0 || r.softHeld(leaving, moving)) {
 			return view, true
 		}
 		if !r.io.now().Before(deadline) {
