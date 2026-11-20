@@ -678,7 +678,7 @@ Before we set `pve.ha.mode` to `auto` or `managed`, we raise the Director's `hm.
 
 ### Reading the cluster with `pve-ops ha`
 
-The `pve-ops ha` subcommand is a read-only doctor. It never writes to PVE, and it runs in every mode, `off` included. The one exception is `--widen-replicas --apply`, which runs the CPI's own replica widening pass instead of the doctor, as [Widening replica pins after a deploy](#widening-replica-pins-after-a-deploy) describes. On the Director VM we run it with the full path, because `pve-ops` is not on `PATH`. The `--config` flag is optional there, because the command looks for the configuration in `--config`, then in `$PVE_CPI_CONFIG`, and then at `/var/vcap/jobs/pve_cpi/config/cpi.json`.
+The `pve-ops ha` subcommand is a read-only doctor. It never writes to PVE, and it runs in every mode, `off` included. There are two exceptions. The first is `--widen-replicas --apply`, which runs the CPI's own replica widening pass instead of the doctor, as [Widening replica pins after a deploy](#widening-replica-pins-after-a-deploy) describes. The second is `pve-ops ha rebalance --apply`, which live-migrates this Director's HA VMs back into a good spread, as [Rebalancing HA VMs after node maintenance](#rebalancing-ha-vms-after-node-maintenance) describes. The doctor itself runs the rebalance as a dry run to judge the spread, and that dry run writes nothing. On the Director VM we run it with the full path, because `pve-ops` is not on `PATH`. The `--config` flag is optional there, because the command looks for the configuration in `--config`, then in `$PVE_CPI_CONFIG`, and then at `/var/vcap/jobs/pve_cpi/config/cpi.json`.
 
 ```bash
 /var/vcap/packages/pve_cpi/bin/pve-ops ha
@@ -732,9 +732,11 @@ Each finding is either a problem or advice. The command exits with 0 when the re
   `observe_only`, `node_down`, `entry_clock_unreadable`, `quorum_fragile`, `qdevice_advice`, `advice`, and `crs_mode`.
 
 - Rules and resources
-  `rule_problem`, `rule_unmarked`, `pin_missing`, `soft_pin_resource_affinity`, `anti_affinity_skipped`, `anti_affinity_split`, `anti_affinity_short`, `anti_affinity_ambiguous`, `resource_ignored`, `managed_without_resource`, `failback_on_replica`, and `failback_drift`.
+  `rule_problem`, `rule_unmarked`, `pin_missing`, `soft_pin_resource_affinity`, `anti_affinity_skipped`, `anti_affinity_split`, `anti_affinity_short`, `anti_affinity_ambiguous`, `resource_ignored`, `managed_without_resource`, `failback_on_replica`, `failback_drift`, `rebalance_pending`, and `spread_skewed`.
 
-  The `failback_on_replica` problem names a `replicate` VM whose HA resource has `failback` on, because PVE would move such a VM back to its old node after a failover and run the reversed replication job, whose first run destroys the writes that existed only on that node. The `failback_drift` advice names any other resource of this Director whose `failback` differs from the value the CPI writes for it, which is on for a VM whose every volume sits on shared storage and off otherwise or when `pve.ha.failback` is `false`. The next `set_vm_metadata` or `reboot_vm` on the VM sets the flag, and so does `ha-manager set vm:<vmid> --failback 0` or `--failback 1`. For a VM that only one node can take, such as one whose strict pin names one node, one with a PCI passthrough device, or one with a host CPU type that one node alone runs, the CPI writes `failback` off, so the doctor reports such a VM when its flag reads on. The doctor skips a resource that the narrowing barrier holds, a resource whose fresh `bosh-failback-hold` token says an attach is moving the VM, and a VM whose config, storages, rules, or replication jobs it couldn't read. It also skips a VM whose HA decision fails or refuses HA for a reason that may pass, and parkers, which stay stopped and which no call ever reaches. A pin that records a change to the VM's replicated volumes counts as the `replicate` policy, as it does in the CPI.
+  The `failback_on_replica` problem names a `replicate` VM whose HA resource has `failback` on, because PVE would move such a VM back to its old node after a failover and run the reversed replication job, whose first run destroys the writes that existed only on that node. The `failback_drift` advice names any other resource of this Director whose `failback` differs from the value the CPI writes for it, which is on for a VM whose every volume sits on shared storage and off otherwise or when `pve.ha.failback` is `false`. The next `set_vm_metadata` or `reboot_vm` on the VM sets the flag, and so does `ha-manager set vm:<vmid> --failback 0` or `--failback 1`. For a VM that only one node can take, such as one whose strict pin names one node, one with a PCI passthrough device, or one with a host CPU type that one node alone runs, the CPI writes `failback` off, so the doctor reports such a VM when its flag reads on. The doctor skips a resource that the narrowing barrier holds, a resource whose fresh `bosh-failback-hold` token says an attach is moving the VM, and a VM whose config, storages, rules, or replication jobs it couldn't read. It also skips a VM whose HA decision fails or refuses HA for a reason that may pass, and parkers, which stay stopped and which no call ever reaches. A pin that records a change to the VM's replicated volumes counts as the `replicate` policy, as it does in the CPI. The doctor also skips a resource that carries a `bosh-rebalance-to` mark, because a rebalance holds its `failback` off on purpose.
+
+  The `rebalance_pending` problem names a resource of this Director that carries a `bosh-rebalance-to=<node>` mark while no rebalance holds the run lock `bosh-lock-ha-rebalance`, which means a run stopped part way and left the VM's `failback` off. The finding names the `pve-ops ha rebalance --apply` command that finishes or undoes the move. When the doctor can't read the run lock, it reports the marks as `unchecked`. The `spread_skewed` advice appears when a dry run of the rebalance would move a VM back into its AZ, or when the committed memory of the fullest node and the emptiest node lies more than 15 points apart. It counts the VMs outside their AZ, gives the spread, and names the dry run command. The doctor runs that dry run only when the request names a Director and its own reads of the HA resources, the service states, the rules, and the guests all succeeded, and it reports nothing when the dry run's own reads fail, so the advice never fails the run.
 
 - CPU and local storage
   `cpu_unknown`, `cpu_host_multi_domain`, `cpu_pin_crosses_domain`, `cpu_domain_too_small`, `local_unprotected`, `hold_blocks_maintenance`, `maintenance_stranded`, and `recovery_stranded`.
@@ -937,7 +939,7 @@ When the CPI cannot read the node health at all, it fails the create with a retr
 
 ### Where VMs go when a maintenance ends
 
-When a node leaves maintenance, PVE moves a VM back to it only when the VM's HA resource has `failback` on. The CPI turns the flag on for each VM whose volumes all sit on shared storage, so those VMs go back to their nodes by live migration as each maintenance ends, and a rolling maintenance across every node leaves the cluster about as balanced as it started. A `hold` VM, a `replicate` VM, and any other VM with a volume on node-local storage keep `failback` off. A `replicate` VM that a maintenance moved to its partner stays there, and its pin keeps both nodes, as [HA and Resurrection](ha-and-resurrection.md#the-replicate-data-loss-window) describes.
+When a node leaves maintenance, PVE moves a VM back to it only when the VM's HA resource has `failback` on. The CPI turns the flag on for each VM whose volumes all sit on shared storage, so those VMs go back to their nodes by live migration as each maintenance ends, and a rolling maintenance across every node leaves the cluster about as balanced as it started. A `hold` VM, a `replicate` VM, and any other VM with a volume on node-local storage keep `failback` off. A `replicate` VM that a maintenance moved to its partner stays there, and its pin keeps both nodes, as [HA and Resurrection](ha-and-resurrection.md#the-replicate-data-loss-window) describes. After the last node of a rolling maintenance comes back, `pve-ops ha` reports the `spread_skewed` advice when VMs sit outside their AZ or the nodes' committed memory is far apart, and [Rebalancing HA VMs after node maintenance](#rebalancing-ha-vms-after-node-maintenance) shows how we move them back.
 
 With `pve.ha.failback: false`, no CPI VM moves back, and the node we drain last ends up nearly empty. We then move VMs back ourselves with `ha-manager migrate vm:<vmid> <node>`. Before a rolling maintenance, we run `pve-ops ha` and read any `failback_drift` advice, because a VM that an earlier release registered keeps `failback` off until a call touches it. A `bosh recreate` of the instance, or any `set_vm_metadata` or `reboot_vm` on the VM, sets the flag. [Failback](ha-and-resurrection.md#failback) covers what PVE does with the flag.
 
@@ -1160,6 +1162,95 @@ Two limits are worth knowing before we start the first node.
   A deployment that sets only `pve.host`, with discovery off or without an API token, has nowhere to go. We list at least two nodes in `pve.endpoints`, or we leave discovery on, before we rely on this.
 
 We still cycle one node at a time, and we wait for the cluster to be quorate before we start the next one.
+
+### Rebalancing HA VMs after node maintenance
+
+A rolling maintenance moves every HA VM off each node in turn, and PVE moves a VM back only when its HA resource has `failback` on. So after the last node comes back, some VMs can sit outside their AZ, two members of an anti-affinity group can share a node, and the committed memory of the nodes can be far apart. The `pve-ops ha rebalance` command puts this Director's HA VMs back into a good spread. It works in three phases. First it separates anti-affinity members that share a node, then it moves each VM that sits outside its AZ back into its AZ, and last it evens out committed memory among the VMs that may run on more than one node. Each move is a live migration through PVE HA, and it stays inside the VM's pin and AZ and obeys the anti-affinity rules.
+
+We run it once the last node has left maintenance and `bosh tasks` shows no task running, because a CPI call and a move must not change the same VM. The command runs as `vcap` on the Director, because it opens the allocation journal, which opens only for its owner. It also needs the Director's UUID, which `bosh env --json` prints in the `uuid` column, because it moves only the VMs that Director owns.
+
+```bash
+sudo -u vcap /var/vcap/packages/pve_cpi/bin/pve-ops ha rebalance --director-uuid <uuid>
+```
+
+That first run is a dry run. It reads the cluster, takes no lock, and writes nothing. It prints the gates, the committed memory of each node now and after the plan, each move it plans with the reason, and each VM it leaves where it is.
+
+```
+HA rebalance for Director 6c8e1d2a-4b3f-4e5a-9c7d-0f1e2d3c4b5a on cluster prod-east (token bosh-cpi@pve!****), a dry run, so nothing moved; add --apply to move
+pve-ops 0.12.0 with the configuration /var/vcap/jobs/pve_cpi/config/cpi.json
+Gates
+  pve.ha.mode is auto, and the HA profile lets the CPI write HA state
+  quorum is held
+  all 3 nodes are online, and none is in maintenance
+  the HA manager's master is pve1, and its status is fresh
+  no HA service is migrating or relocating
+  the allocation journal holds no open record
+  no CPI task or lock is active
+  no other rebalance holds the run lock
+Nodes, memory committed now and after the plan
+  pve1   72%   50%
+  pve2   55%   52%
+  pve3   20%   45%
+Moves
+  1. VM 1042 (vm-8a1f2c3d) from pve1 to pve3, because VM 1042 is on pve1, and its AZ z3 is pve3
+  2. VM 1077 (vm-4b9e0d21) from pve1 to pve3, because pve1 holds 61% of its memory and pve3 holds 33%, and the move narrows the spread of 28 points
+Skipped
+  VM 1050 (vm-c07a5e19) on pve1, because it is a replicate VM, and a move would reverse its replication job
+2 moves planned, 0 made, 1 VM skipped, and 0 deferred, and the spread goes from 52 points to 7
+```
+
+The spread is the committed memory of the fullest node minus that of the emptiest, in points. Memory evening starts only when the spread passes the start threshold, which is 0.15 by default, and it stops once the spread falls below the stop threshold, which is 0.05. The command never moves a `replicate` VM, a `hold` VM, a DLB member, a parker, a VM with a node-local disk, a VM in a positive resource affinity rule, a stopped VM, or a VM of another Director. It counts the memory of every VM, moved or not.
+
+We then run the same command with `--apply`. The run takes the run lock `bosh-lock-ha-rebalance`, so two runs never move VMs at once, and it makes one move at a time. Before each move it checks every gate again from fresh reads and waits for the cluster to settle. For each move it turns the HA resource's `failback` off and writes the mark `bosh-rebalance-to=<node>` into the resource's comment in one write, and then it asks PVE HA to migrate the VM and waits for the VM to settle on the target. When the VM's pin prefers another node, the run rewrites the pin's priorities so the target comes first, which the move's reason states with `its pin is rewritten to prefer <node>`, because failback would otherwise send the VM back. It then restores the `failback` flag the CPI writes for the VM, drops the mark, and checks after two rounds of the HA manager that the VM stayed. The run plans again after each move, so the moves it makes can differ from the first plan, and the output then says so.
+
+The command takes these flags.
+
+- `--apply`
+  This makes the moves. Without it the command is a dry run.
+
+- `--director-uuid UUID` or `--request PATH`
+  One of these names the Director whose VMs the run may move. A request's context also picks a cpi-config entry, and the run reads that entry's cluster.
+
+- `--config PATH`
+  This names the CPI configuration file, as it does for `pve-ops ha`.
+
+- `--max-moves N`
+  This caps the moves of one run, and it is 10 by default. The summary counts the moves left over as deferred, and the next run makes them.
+
+- `--settle-timeout DURATION`
+  This bounds the wait for each move to settle, and the wait for the cluster to settle before each move. It is 10 minutes by default and at least 1 minute.
+
+- `--max-duration DURATION`
+  This bounds the run, and no move starts after it passes. It is 60 minutes by default.
+
+- `--start-threshold FRACTION` and `--stop-threshold FRACTION`
+  These set when memory evening starts and stops. The start threshold lies above 0 and at most 1, and the stop threshold is at least 0 and below the start threshold.
+
+- `--restore-only`
+  This runs only the separation and the AZ restore phases.
+
+- `--json`
+  This prints the report as JSON, with the Director's UUID, the masked credential, the gates, the warnings, the nodes, the first plan, the moves with their outcomes, the skipped VMs, the spread before and after, and the exit code.
+
+The gates refuse a run, or stop it before its next move, when `pve.ha.mode` is `off` or the HA profile doesn't let the CPI write HA state, when the cluster lacks quorum, when a node is offline, in maintenance, or unable to take work, when the HA manager has no master or its status is stale, when an HA service is migrating or relocating, when the allocation journal holds an open record, when a CPI lock is held or the CPI's token user runs a task, or when another rebalance holds the run lock. A refused gate prints `REFUSED:` with the reason. A dry run whose gate refused still prints the plan an applied run would make once the gate clears.
+
+The command exits with these codes.
+
+- `0`
+  The run ended clean, and every move it made landed or PVE refused it with the VM left where it was.
+
+- `1`
+  A read or a move failed, the run was interrupted, or a move was left part way. The output names the cause, and a move left part way prints `left part way`.
+
+- `2`
+  A flag was wrong or missing.
+
+- `3`
+  A gate refused the run, or stopped it before its next move, and no move was left part way.
+
+An interrupt or SIGTERM never cuts a write short. The run finishes the write in progress, releases the run lock, and stops before its next move. A move that a stop or a failure leaves part way keeps its mark, and the mark keeps the resource's `failback` off, so a `set_vm_metadata` or `reboot_vm` can't pull the VM back to its old node. `pve-ops ha` reports such a VM as the `rebalance_pending` problem. The next run with `--apply` finishes each marked move whose VM reached its target, undoes each one whose VM never left its node, and only then plans anything new, as [A rebalance left a move part way](troubleshooting.md#a-rebalance-left-a-move-part-way) describes.
+
+On a bastion, the dry run works, but `--apply` refuses at the journal gate when the configuration names an allocation journal the bastion can't read. When the configuration names no journal, `--apply` runs from a bastion and prints a warning, because the run then can't see the Director's own journal records. That is safe only when the Director's own CPI has no journal configured either. For a Director with several `cpi_config` entries, we pass `--request` with a context that names the entry and the Director's UUID, once for each entry, because the run reads one cluster.
 
 ### Rolling back below endpoint lists
 

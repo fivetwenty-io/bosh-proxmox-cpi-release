@@ -47,6 +47,8 @@ The sentinel AZ provides per-workload opt-in without changing the global flag. L
 
 - The VM gets no AZ pin, because there is no fixed AZ to pin to. Like every registered VM, it still carries a pin that is not strict, names every node it may run on, and records the storages of its volumes.
 
+- `pve-ops ha rebalance` never moves a DLB member, because CRS places it. The command reads the membership from the `bosh-dlb` record, or from the `auto-rebalance` flag of a resource that has no record, and lists each member as skipped. It still counts the memory of DLB members when it evens out the other VMs, and when the cluster's CRS auto-rebalance is on it warns that CRS may move DLB members in response to its moves. [Rebalancing HA VMs after node maintenance](operations.md#rebalancing-ha-vms-after-node-maintenance) covers the command.
+
 To disable the sentinel entirely, set `pve.ha.dlb.az_name: ""`. With the sentinel disabled, only the master flag can trigger DLB.
 
 The sentinel works only when `pve.ha.mode` is `auto` or `managed`. Under `pve.ha.mode: off` no VM is affected by HA, so a `create_vm` in the sentinel AZ fails with an error that tells the operator to set the mode, instead of creating a VM that DLB never sees. Earlier releases registered the VM for DLB with no other key set, so a deployment that relied on the sentinel must now set `pve.ha.mode`.

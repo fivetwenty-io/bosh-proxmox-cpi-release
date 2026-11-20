@@ -3034,6 +3034,48 @@ At Debug, the CPI log also shows the sweep's reason for each VM it skipped, afte
 
 We run the same command with `--apply`, as [Widening replica pins after a deploy](operations.md#widening-replica-pins-after-a-deploy) describes, or we wait for the next call that takes the HA rules lock. A VM that the pass skips because another call holds it, because its locks took longer than its claim's lease on a busy cluster, because it is migrating or recovering, or because its HA resource is ignored keeps its pin until a later pass finds it settled. One sweep widens at most one pin, so after a deploy that adds many `replicate` VMs, the command with `--apply` widens the rest at once. A VM whose job is failing needs the job fixed first, as [Operations, PVE HA](operations.md#pve-ha) describes for `replica_job_failing`. A VM with two replication jobs that carry this Director's marker fails every pass, and the CPI log shows `the VM's pin cannot widen until an operator fixes its replication jobs` at Warn. The reason names both jobs, and the higher-numbered one is most likely a copy someone made by hand, because the CPI gives each VM one job with the lowest free number. We remove the extra job with `pvesr delete <job-id>` on the VM's node, and once PVE has removed it, the next pass widens the pin.
 
+## A rebalance refuses with exit 3
+
+**Symptom**
+
+`pve-ops ha rebalance` exits with 3, and its output shows a gate line that starts with `REFUSED:` and ends with `The run stopped, because the <gate> gate refused.`
+
+**Cause**
+
+The command moves VMs only on a calm cluster, and it checks its gates before the first move and again before every move. A gate refuses when `pve.ha.mode` is `off` or the HA profile doesn't let the CPI write HA state, when the cluster lacks quorum, when a node is offline, in maintenance, or unable to take work, when the HA manager has no master or its status is stale, when an HA service is migrating or relocating, when the allocation journal holds an open record, when a CPI lock is held or the CPI's token user runs a task, or when another rebalance holds the run lock `bosh-lock-ha-rebalance`. The journal gate also refuses `--apply` where the configured journal can't be read, such as on a bastion or as a user other than `vcap`.
+
+**Diagnosis**
+
+The `REFUSED:` line names what the gate saw, such as the node in maintenance, the services that are moving, the records that are open, or the locks and tasks that are active. A dry run whose gate refused still prints its plan, so we can read what the run would do once the gate clears.
+
+**Fix**
+
+We clear the cause and run the command again. A node still in maintenance needs its maintenance ended. A moving service or an active CPI task usually finishes on its own, so we wait until `bosh tasks` shows no task running and `ha-manager status` shows no service in `migrate` or `relocate`. An open journal record clears when the call that holds it finishes or a reconcile settles it. For the journal gate on a bastion, we run the command as `vcap` on the Director instead. A gate that refuses between moves leaves no move part way, because the run checks the gates only before a move starts.
+
+## A rebalance left a move part way
+
+**Symptom**
+
+`pve-ops ha` reports the `rebalance_pending` problem for a VM, or `pve-ops ha rebalance --apply` exited with 1 and listed a move as `left part way`. The VM's HA resource carries `bosh-rebalance-to=<node>` in its comment, and its `failback` is off.
+
+**Cause**
+
+A rebalance writes the mark together with `failback` off before it migrates a VM, and it drops the mark once the move ends. A run that stops in between leaves the mark. That happens when the run gets an interrupt or SIGTERM during the migration or the settle wait, when the migration doesn't settle within `--settle-timeout`, when the VM settles on a node other than the target, or when the write that ends the move fails. The mark keeps `failback` off on purpose, so a `set_vm_metadata` or `reboot_vm` can't pull the VM back while the move is unfinished. The doctor reports the mark only while no rebalance holds the run lock, because a mark under a live run is a move in progress.
+
+**Diagnosis**
+
+The finding names the VM and the target node. `ha-manager status` shows where the VM runs now, and the rebalance's output names the cause of the stop.
+
+**Fix**
+
+We run the command the finding names, as `vcap` on the Director.
+
+```bash
+sudo -u vcap /var/vcap/packages/pve_cpi/bin/pve-ops ha rebalance --apply --director-uuid <uuid>
+```
+
+Before it plans anything new, the run handles each marked VM. It finishes the move of a VM that reached its target, which rewrites the pin when the move calls for it, restores `failback`, and drops the mark. It undoes the move of a VM that never left its node, which restores `failback` and drops the mark. A VM that PVE is still moving keeps its mark, and we run the command again once the move has settled. The output lists these under `Moves of an earlier run`. When a mark can't be cleared, the run exits with 1 and starts no new move, and we fix the cause it names and run the command again. A dry run shows what the run would do with each marked VM without changing anything.
+
 ## Task timeouts
 
 **Symptom**
