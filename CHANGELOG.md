@@ -22,6 +22,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Changed
 
+- The operator CLI `pve-cid` is now `pve-ops`, because it has grown from a CID decoder into the tool we use to read and repair the CPI's HA state. The package still installs `pve-cid` as an alias that prints a deprecation notice on stderr and then runs `pve-ops`. We remove the alias in 0.13.0, so scripts should switch to `pve-ops` now.
+
 - **Upgrade note.** After the upgrade, the first `set_vm_metadata` or `reboot_vm` on a VM whose volumes all sit on shared storage can turn `failback` on for its HA resource, and any deploy that touches the instance sends one of those calls. When that VM runs on a node other than the top-priority node of its pin, PVE live-migrates it to that node at once. To choose when those moves happen, we set `pve.ha.failback: false` before the upgrade, so no call turns the flag on. Then, during a maintenance window, we set it back to `true` or remove it, and the next call that touches each VM turns the flag on. `pve-ops ha` lists each VM whose flag is still off as `failback_drift` advice until a call reaches it.
 
 - The CPI now registers a VM's HA resource with `failback` on when every volume the VM holds, its persistent disks included, sits on shared storage. PVE then moves the VM back to its preferred node after a recovery, and back to its node when a maintenance there ends, so a rolling maintenance no longer leaves the node drained last nearly empty. A `hold` VM, a `replicate` VM, and any VM with a volume on node-local storage keep `failback` off, because moving a `replicate` VM back after a failover would run the reversed replication job, whose first run destroys the writes that existed only on the old node.
