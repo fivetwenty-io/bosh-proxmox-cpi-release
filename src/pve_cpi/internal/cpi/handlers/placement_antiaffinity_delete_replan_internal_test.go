@@ -225,24 +225,10 @@ func TestRemoveAntiAffinity_RollingUpdateWritesEachMembersRulesOnly(t *testing.T
 			deps := aaReplanDeps(stub, true)
 			deps.HAProfile = pve9ClusterProfile(tc.nodes...)
 			vmids := []int{100, 101, 102, 103, 104, 105}
-			list := func() {
-				rows := make([]json.RawMessage, 0, len(vmids))
-				for i, v := range vmids {
-					if v != 0 {
-						rows = append(rows, aaQEMU(v, aaTag+";index--"+strconv.Itoa(i)))
-					}
-				}
-				stub.tagged(rows...)
-			}
+			list := func() { listIndexedMembers(stub, vmids) }
 			list()
 			markWebMembers(stub, vmids...)
-			for i, r := range tc.rules {
-				name := aaRule
-				if i > 0 {
-					name = aaRule + "-" + strconv.Itoa(i+1)
-				}
-				stub.seedRule(name, r)
-			}
+			seedRuleChain(stub, tc.rules)
 			start := aaRuleOfMembers(stub.rules)
 			writes := func() int { return stub.createRuleCalls + stub.updateRuleCalls + stub.deleteRuleCalls }
 			before := writes()
@@ -262,24 +248,54 @@ func TestRemoveAntiAffinity_RollingUpdateWritesEachMembersRulesOnly(t *testing.T
 				markWebMembers(stub, vmids[i])
 				joinAntiAffinityAtMetadata(context.Background(), deps, vmids[i], map[string]any{"index": float64(i)},
 					log.NewNopLogger())
-				now := aaRuleOfMembers(stub.rules)
-				for sid, rule := range now {
+				for sid, rule := range aaRuleOfMembers(stub.rules) {
 					if sid != haResourceSid(vmids[i]) && prev[sid] != rule {
 						t.Errorf("replacing index %d moved %s from %q to %q", i, sid, prev[sid], rule)
 					}
 				}
 			}
-			end := aaRuleOfMembers(stub.rules)
-			for i, v := range vmids {
-				if got, want := end[haResourceSid(v)], start[haResourceSid(100+i)]; got != want {
-					t.Errorf("index %d ends in %q; started in %q", i, got, want)
-				}
-			}
+			assertEachIndexBackInItsRule(t, start, aaRuleOfMembers(stub.rules), vmids)
 			if n := writes() - before; n > 2*len(vmids) {
 				t.Errorf("the update wrote rules %d times for %d members; want at most %d", n, len(vmids),
 					2*len(vmids))
 			}
 		})
+	}
+}
+
+// listIndexedMembers lists each nonzero VMID of vmids as the group member
+// whose index is its position.
+func listIndexedMembers(stub *aaClusterStub, vmids []int) {
+	rows := make([]json.RawMessage, 0, len(vmids))
+	for i, v := range vmids {
+		if v != 0 {
+			rows = append(rows, aaQEMU(v, aaTag+";index--"+strconv.Itoa(i)))
+		}
+	}
+	stub.tagged(rows...)
+}
+
+// seedRuleChain seeds the group's rules in order, the first under the base
+// name and each later one under the base name with its suffix.
+func seedRuleChain(stub *aaClusterStub, rules []string) {
+	for i, r := range rules {
+		name := aaRule
+		if i > 0 {
+			name = aaRule + "-" + strconv.Itoa(i+1)
+		}
+		stub.seedRule(name, r)
+	}
+}
+
+// assertEachIndexBackInItsRule checks that the VM at each index of vmids
+// ends in the rule that the original VM of that index, 100 plus the index,
+// started in.
+func assertEachIndexBackInItsRule(t *testing.T, start, end map[string]string, vmids []int) {
+	t.Helper()
+	for i, v := range vmids {
+		if got, want := end[haResourceSid(v)], start[haResourceSid(100+i)]; got != want {
+			t.Errorf("index %d ends in %q; started in %q", i, got, want)
+		}
 	}
 }
 

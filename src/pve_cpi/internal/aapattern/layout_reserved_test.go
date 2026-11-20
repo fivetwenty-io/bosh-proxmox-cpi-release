@@ -7,10 +7,10 @@ import (
 	"testing"
 )
 
-// reservedAt returns the reserved place of the member with index i, under a
-// key no live member uses.
-func reservedAt(i int) Member {
-	return Member{Key: fmt.Sprintf("vm:%d", 900+i), Index: i, Reserved: true}
+// reservedFirst returns the reserved place of the member with index 0, under
+// a key no live member uses.
+func reservedFirst() Member {
+	return Member{Key: "vm:900", Index: 0, Reserved: true}
 }
 
 // The place of a member that just left stays free for the recreate of its
@@ -18,7 +18,7 @@ func reservedAt(i int) Member {
 // nobody moves into it and the recreate takes it back with one write.
 func TestLayout_ReservedPlaceWaitsForTheRecreate(t *testing.T) {
 	t.Parallel()
-	gone := reservedAt(0).Key
+	gone := reservedFirst().Key
 	for name, tc := range map[string]struct {
 		nodes   int
 		present []int
@@ -42,7 +42,7 @@ func TestLayout_ReservedPlaceWaitsForTheRecreate(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			ms := append(members("", tc.present...), reservedAt(0))
+			ms := append(members("", tc.present...), reservedFirst())
 			out := Layout(Input{Base: base, Split: true, Domains: oneDomain(tc.nodes), Members: ms, Rules: tc.rules})
 			if got := render(out.Rules); got != tc.want {
 				t.Fatalf("rules = %s; want %s", got, tc.want)
@@ -65,11 +65,11 @@ func TestLayout_ReservedPlaceWaitsForTheRecreate(t *testing.T) {
 // and no rule's join check sees it.
 func TestLayout_ReservedPlaceYieldsToALiveMember(t *testing.T) {
 	t.Parallel()
-	ms := append(members("", 0, 1, 2), reservedAt(0))
+	ms := append(members("", 0, 1, 2), reservedFirst())
 	ms[3].Born = 1 << 40
 	out := Layout(Input{Base: base, Split: true, Domains: oneDomain(4), Members: ms,
 		CanJoin: func(_ string, keys []string, key string) bool {
-			if key == reservedAt(0).Key || slices.Contains(keys, reservedAt(0).Key) {
+			if key == reservedFirst().Key || slices.Contains(keys, reservedFirst().Key) {
 				t.Errorf("the join check saw the reserved place: %s joining %v", key, keys)
 			}
 			return true
