@@ -88,43 +88,73 @@ func FailbackHeld(comment *string, now time.Time) bool {
 // that names now on its comment, in one write, and returns the token. It
 // writes even when failback already reads off, because the write changes the
 // digest of resources.cfg, so a raise that a reconcile decided from an earlier
-// read is refused (see RaiseFailback). A resource that is missing, and one
-// whose comment owned does not accept, are left alone, and the token is then
-// empty. A read or a write that fails is returned.
+// read is refused (see RaiseFailback). The write names the digest of the read
+// the comment was changed from, so a token another writer adds in between
+// makes PVE refuse it rather than lose the token, and a refused write is read
+// and merged again, up to CommentWriteAttempts times. A resource that is
+// missing, and one whose comment owned does not accept, are left alone, and
+// the token is then empty. A read or a write that fails is returned.
+//
+// A hold that runs out of attempts, or whose read names no digest, cannot put
+// its token on the comment without risking another writer's. It then turns
+// failback off with a write of the flag alone, which leaves the comment as it
+// is (see ReconcileFailback), and returns a retriable error with an empty
+// token, so failback is off and every token stays, and the caller asks for no
+// move that the hold would have covered.
 func HoldFailback(ctx context.Context, api FailbackAPI, sid string, now time.Time, owned func(string) bool) (
 	string, error,
 ) {
 	if api == nil || owned == nil {
 		return "", cpierrors.Cloud("ha failback: the resource client and the ownership check must be set")
 	}
-	got, err := api.GetHaResources(ctx, sid)
-	switch {
-	case err != nil && isResourceNotFound(err):
-		return "", nil
-	case err != nil:
-		return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("ha failback: read the HA resource %s", sid))
-	case got == nil:
-		return "", cpierrors.Retriable("ha failback: the read of the HA resource %s returned nothing", sid)
-	case got.Comment == nil || !owned(*got.Comment):
-		return "", nil
+	var why string
+	for attempt := 1; ; attempt++ {
+		got, err := readOwnedResource(ctx, api, sid, owned)
+		if err != nil || got == nil {
+			return "", err
+		}
+		if got.Digest == "" {
+			why = "the read of the HA resource " + sid + " named no digest"
+			break
+		}
+		off, digest := false, got.Digest
+		comment := WithFailbackHold(*got.Comment, now)
+		err = api.UpdateHaResources(ctx, sid, &sdkcluster.UpdateHaResourcesParams{Failback: &off,
+			Comment: &comment, Digest: &digest})
+		switch {
+		case err == nil:
+			tok, _ := FailbackHoldOf(&comment)
+			return tok, nil
+		case !IsDigestConflict(err):
+			return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("ha failback: set failback off on the HA resource %s", sid))
+		case attempt < CommentWriteAttempts:
+			continue
+		}
+		why = fmt.Sprintf("resources.cfg changed under %d writes of the hold on the HA resource %s", attempt, sid)
+		break
 	}
-	off := false
-	comment := WithFailbackHold(*got.Comment, now)
-	if err := api.UpdateHaResources(ctx, sid, &sdkcluster.UpdateHaResourcesParams{Failback: &off,
-		Comment: &comment}); err != nil {
-		return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("ha failback: set failback off on the HA resource %s", sid))
+	if _, err := ReconcileFailback(ctx, api, sid, false, owned); err != nil {
+		return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf("ha failback: %s, and "+
+			"failback could not be turned off without the hold either", why))
 	}
-	tok, _ := FailbackHoldOf(&comment)
-	return tok, nil
+	return "", cpierrors.Retriable("ha failback: %s, so failback is off without the hold token that keeps a "+
+		"reconcile from turning it on; retry", why)
 }
 
 // ReleaseFailbackHold drops the hold token tok from the comment of the
 // resource sid when the comment still carries exactly that token, so a
 // release never drops a later hold that another call wrote. It reports
-// whether it wrote. A resource that is missing, or whose comment owned does
-// not accept, is left alone. A read or a write that fails is returned.
+// whether it wrote. The write names the digest of the read it dropped the
+// token from, and a write PVE refuses because resources.cfg changed is read
+// and judged again, up to CommentWriteAttempts times. A resource that is
+// missing, or whose comment owned does not accept, is left alone. A read or a
+// write that fails is returned.
+//
+// A release that runs out of attempts, or whose read names no digest, writes
+// nothing and returns a retriable error. The token then stays, and it keeps
+// failback off until it expires (see FailbackHoldTTL), so a release that fails
+// never turns failback on and never drops another writer's token.
 func ReleaseFailbackHold(ctx context.Context, api FailbackAPI, sid, tok string, owned func(string) bool) (
 	bool, error,
 ) {
@@ -134,25 +164,54 @@ func ReleaseFailbackHold(ctx context.Context, api FailbackAPI, sid, tok string, 
 	if api == nil || owned == nil {
 		return false, cpierrors.Cloud("ha failback: the resource client and the ownership check must be set")
 	}
+	for attempt := 1; ; attempt++ {
+		got, err := readOwnedResource(ctx, api, sid, owned)
+		if err != nil || got == nil {
+			return false, err
+		}
+		if have, _ := FailbackHoldOf(got.Comment); have != tok {
+			return false, nil
+		}
+		if got.Digest == "" {
+			return false, cpierrors.Retriable("ha failback: the read of the HA resource %s named no digest, so the "+
+				"failback hold stays until it expires", sid)
+		}
+		comment, _ := StripFailbackHold(*got.Comment)
+		digest := got.Digest
+		err = api.UpdateHaResources(ctx, sid, &sdkcluster.UpdateHaResourcesParams{Comment: &comment,
+			Digest: &digest})
+		switch {
+		case err == nil:
+			return true, nil
+		case !IsDigestConflict(err):
+			return false, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("ha failback: drop the failback hold from the HA resource %s", sid))
+		case attempt < CommentWriteAttempts:
+			continue
+		}
+		return false, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf("ha failback: resources.cfg "+
+			"changed under %d writes that drop the failback hold from the HA resource %s, so the hold stays until "+
+			"it expires", attempt, sid))
+	}
+}
+
+// readOwnedResource reads the resource sid for a writer of its comment. It
+// returns nil and no error for a resource that is missing or whose comment
+// owned does not accept, which the writer leaves alone.
+func readOwnedResource(ctx context.Context, api FailbackAPI, sid string, owned func(string) bool) (
+	*sdkcluster.GetHaResourcesResponse, error,
+) {
 	got, err := api.GetHaResources(ctx, sid)
 	switch {
 	case err != nil && isResourceNotFound(err):
-		return false, nil
+		return nil, nil
 	case err != nil:
-		return false, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+		return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("ha failback: read the HA resource %s", sid))
 	case got == nil:
-		return false, cpierrors.Retriable("ha failback: the read of the HA resource %s returned nothing", sid)
+		return nil, cpierrors.Retriable("ha failback: the read of the HA resource %s returned nothing", sid)
 	case got.Comment == nil || !owned(*got.Comment):
-		return false, nil
+		return nil, nil
 	}
-	if have, _ := FailbackHoldOf(got.Comment); have != tok {
-		return false, nil
-	}
-	comment, _ := StripFailbackHold(*got.Comment)
-	if err := api.UpdateHaResources(ctx, sid, &sdkcluster.UpdateHaResourcesParams{Comment: &comment}); err != nil {
-		return false, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("ha failback: drop the failback hold from the HA resource %s", sid))
-	}
-	return true, nil
+	return got, nil
 }
