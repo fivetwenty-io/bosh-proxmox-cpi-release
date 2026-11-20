@@ -678,7 +678,7 @@ Before we set `pve.ha.mode` to `auto` or `managed`, we raise the Director's `hm.
 
 ### Reading the cluster with `pve-ops ha`
 
-The `pve-ops ha` subcommand is a read-only doctor. It never writes to PVE, and it runs in every mode, `off` included. There are two exceptions. The first is `--widen-replicas --apply`, which runs the CPI's own replica widening pass instead of the doctor, as [Widening replica pins after a deploy](#widening-replica-pins-after-a-deploy) describes. The second is `pve-ops ha rebalance --apply`, which live-migrates this Director's HA VMs back into a good spread, as [Rebalancing HA VMs after node maintenance](#rebalancing-ha-vms-after-node-maintenance) describes. The doctor itself runs the rebalance as a dry run to judge the spread, and that dry run writes nothing. On the Director VM we run it with the full path, because `pve-ops` is not on `PATH`. The `--config` flag is optional there, because the command looks for the configuration in `--config`, then in `$PVE_CPI_CONFIG`, and then at `/var/vcap/jobs/pve_cpi/config/cpi.json`.
+The `pve-ops ha` subcommand is a read-only doctor. It never writes to PVE, and it runs in every mode, `off` included. There are four exceptions. The first is `--widen-replicas --apply`, which runs the CPI's own replica widening pass instead of the doctor, as [Widening replica pins after a deploy](#widening-replica-pins-after-a-deploy) describes. The second is `pve-ops ha rebalance --apply`, which live-migrates this Director's HA VMs back into a good spread, as [Rebalancing HA VMs after node maintenance](#rebalancing-ha-vms-after-node-maintenance) describes. The third is `pve-ops ha drain <node> --apply`, which stops through PVE HA each VM that can't leave a node in maintenance, and the fourth is `pve-ops ha undrain <node> --apply`, which starts those VMs again and then runs the rebalance, as [Draining and undraining a node with `pve-ops ha drain`](#draining-and-undraining-a-node-with-pve-ops-ha-drain) describes. The doctor itself runs the rebalance as a dry run to judge the spread, and that dry run writes nothing, and both new commands are dry runs until we add `--apply`. On the Director VM we run it with the full path, because `pve-ops` is not on `PATH`. The `--config` flag is optional there, because the command looks for the configuration in `--config`, then in `$PVE_CPI_CONFIG`, and then at `/var/vcap/jobs/pve_cpi/config/cpi.json`.
 
 ```bash
 /var/vcap/packages/pve_cpi/bin/pve-ops ha
@@ -914,9 +914,123 @@ ha-manager add vm:<vmid> --state started
 
 The VM has no HA protection between those two commands, and a hand-made resource carries no pin or ownership marker, so we restore its rules afterward. A resource added by hand gets `failback` on, which is PVE's default, and the CPI never changes a resource without its marker. So for a `replicate` VM, a `hold` VM, or any VM with a volume on node-local storage, we add `--failback 0` to the `ha-manager add` command. When the CPI does the same work, it tags the VM `bosh-ha-readd-<unix seconds>` until the registration finishes. A tag that lingers past the create timeout plus `pve.ha.motion_wait_sec` means the registration did not finish, and the doctor reports it as `readd_tag`. We then add the resource with the command above, restore the VM's rules, and remove the tag.
 
+### Draining and undraining a node with `pve-ops ha drain`
+
+A rolling maintenance sticks when a VM can't leave its node, because PVE waits on the node's HA agent until the last service has gone. The `pve-ops ha drain <node>` and `pve-ops ha undrain <node>` commands take that wait away. The drain lets PVE HA move every VM that can leave, and it stops each VM that can't through PVE HA, so the node empties of running HA VMs and the maintenance finishes. The undrain starts those VMs again and then runs the same rebalance that `pve-ops ha rebalance --apply` runs. Both commands act only on the VMs of the Director we name, and we run them as `vcap` on the Director, for the same reason the rebalance needs that user.
+
+PVE offers no API call that turns HA node maintenance on or off, and the CPI reaches PVE only through the API. So the maintenance itself stays our step. We run `ha-manager crm-command node-maintenance enable <node>` on a PVE node before the drain, and `ha-manager crm-command node-maintenance disable <node>` on a PVE node after the work. The commands check for it. A `drain --apply` refuses with exit 3 until the HA manager reports the node in maintenance, and an `undrain --apply` refuses with exit 3 while the node is still in maintenance or carries one of the operator maintenance tags in `pve.placement.maintenance_node_tags`. Each refusal prints the command we need. A tag alone doesn't satisfy the drain, because PVE moves nothing for a tag.
+
+We always read the plan first, and the dry run works before maintenance starts. It reads the cluster, takes no lock, and writes nothing.
+
+```bash
+sudo -u vcap /var/vcap/packages/pve_cpi/bin/pve-ops ha drain <node> --director-uuid <uuid>
+```
+
+The output lists each of the Director's VMs on the node, and it says for each whether PVE HA will move it or whether it can't leave and why.
+
+```
+HA drain of node pve2 for Director 6c8e1d2a-4b3f-4e5a-9c7d-0f1e2d3c4b5a on cluster prod-east (token bosh-cpi@pve!****), a dry run, so nothing stopped; add --apply to stop the VMs that can't leave
+pve-ops 0.12.0 with the configuration /var/vcap/jobs/pve_cpi/config/cpi.json
+Gates
+  pve.ha.mode is auto, and the HA profile lets the CPI write HA state
+  quorum is held
+  for --apply, the HA manager doesn't report node pve2 in maintenance; run `ha-manager crm-command node-maintenance enable pve2` on a PVE node first
+  node pve2 is online, and the other 2 nodes are online, out of maintenance, and able to take work
+VMs on pve2
+  VM 1042 (vm-8a1f2c3d), leaves for pve1 or pve3
+  VM 1050 (vm-c07a5e19), can't leave, because its strict node-affinity rule bosh-na-1050 names no other node that can take it: stop planned
+  VM 1061 (vm-f31b9a77), stays, because it has no HA resource, so maintenance won't move it, and the drain won't stop it; it goes down when the node reboots
+1 VM can leave, 1 VM can't, and 0 stopped
+Turn resurrection off for `cf` until `pve-ops ha undrain pve2 --apply` finishes, for example with `bosh update-resurrection off`, because the Health Monitor sees the agents of the stopped VMs go quiet and would recreate them.
+```
+
+The drain decides which VMs can't leave from PVE's own rules and the cluster's facts. It starts with the nodes that are online, out of maintenance, and placeable, minus the drained node, and it narrows that set with each strict node-affinity rule that names the VM, the node-local storage the VM uses and the targets of its replication jobs, every negative resource-affinity rule, and every positive resource-affinity group the VM belongs to. A VM whose set ends empty can't leave. A VM with no HA resource is listed with a warning, because maintenance never moves it and the drain never stops it, so it goes down with the node when we reboot. We deal with such a VM by hand, as the sections below describe. A VM whose HA resource already requests a state other than `started` stays where it is, and the output says why.
+
+With `--apply`, the drain takes the run lock `bosh-lock-ha-rebalance`, so a drain, an undrain, and a rebalance never run at once on one cluster. It then works through these steps.
+
+1. It reads the cluster and checks the gates again from a fresh read.
+
+2. It waits for PVE HA to move every VM that can leave. It reads the cluster every 5 seconds, and it stops waiting once no such VM is left on the node and no HA service is migrating or relocating. A VM that can leave but is still on the node when the settle timeout runs out ends the run with exit 1, and the report names the nodes that could take it, because something other than the rules is holding it.
+
+3. For each VM that can't leave, it reads the HA resource again under the VM's journal record and claim, and it confirms that the VM is still on the node and still requests `started`. In one write, it sets the resource's state to `stopped` and adds the comment token `bosh-drain-stopped=<node>`. It keeps the ownership marker and every other token in the comment. It never calls `qm stop`, so PVE HA itself shuts the guest down.
+
+4. It waits until the HA manager reports every stopped VM as `stopped`, and then it prints the resurrection reminder.
+
+The reminder names the deployments of the stopped VMs, and we turn resurrection off for them before we run the drain with `--apply`, for example with `bosh update-resurrection off`. Without that, the Health Monitor sees the silent agents of the stopped VMs and recreates them. The dry run prints the same reminder, because that is the moment it matters.
+
+The undrain mirrors the drain. We disable maintenance on the node, and we run the undrain as a dry run first if we want to read the list of VMs that carry the node's token.
+
+```bash
+sudo -u vcap /var/vcap/packages/pve_cpi/bin/pve-ops ha undrain <node> --director-uuid <uuid> --apply
+```
+
+With `--apply`, it takes the run lock and checks the gates with the node out of maintenance. It finds every resource of this Director whose comment carries a drain token that names the node, wherever the VM runs now. In one write for each of them, it sets the state back to `started` and drops the token. It waits until the HA manager reports each of those VMs as `started` and no HA service is migrating or relocating, so the failback moves that PVE makes after maintenance have ended too. A VM in `error`, or one that hasn't started in time, ends the run with exit 1, and the rebalance doesn't run. Unless we pass `--no-rebalance`, the undrain then runs the rebalance with the same code path as [Rebalancing HA VMs after node maintenance](#rebalancing-ha-vms-after-node-maintenance), and its report carries the rebalance's report. Last, it prints a reminder to turn resurrection back on, for example with `bosh update-resurrection on`.
+
+Both commands take these flags, and the undrain takes the extra flags that follow. The node is the one positional argument, and it may come before or after the flags.
+
+- `--apply`
+  This makes the changes. Without it each command is a dry run.
+
+- `--director-uuid UUID` or `--request PATH`
+  One of these names the Director whose VMs the run acts on, as for the rebalance. The commands refuse `--cpi-config` and `--widen-replicas` with exit 2.
+
+- `--config PATH`
+  This names the CPI configuration file, as it does for `pve-ops ha`.
+
+- `--settle-timeout DURATION`
+  For the drain, this bounds each of its two waits, the one for the VMs that can leave and the one for the stops, and it is 30 minutes by default because a node can hold many VMs. For the undrain, it bounds the wait for the started VMs, it becomes the rebalance's settle timeout, and it is 10 minutes by default. Both must be at least 1 minute.
+
+- `--json`
+  This prints the report as JSON, with the Director's UUID, the masked credential, the gates, the warnings, each VM with its fate, reason, target nodes, and outcome, the deployments, the reminder, the rebalance's report for an undrain, whether the run applied, the reason it halted, and the exit code.
+
+- `--no-rebalance`
+  This is an undrain flag. It starts the VMs and skips the rebalance.
+
+- `--max-moves N`, `--max-duration DURATION`, `--start-threshold FRACTION`, `--stop-threshold FRACTION`, and `--restore-only`
+  These are undrain flags, and the undrain passes them to the rebalance unchanged, so they mean what the rebalance section says.
+
+The text output shows the gates, then one line per VM, a summary, and the reminder. A drain line says that the VM leaves for one or more nodes, or that it can't leave and why, or that it stays and why, and an applied run adds the outcome. An undrain line names the node the VM sits on now and its outcome. The outcomes are as follows.
+
+- `stopped` and `started`
+  The drain stopped the VM through PVE HA, or the undrain started it.
+
+- `stopped_earlier`
+  An earlier drain of this node already stopped the VM, so this run counts it and doesn't write.
+
+- `planned`
+  A dry run plans the stop or the start, or an applied run did not reach it.
+
+- `skipped`
+  The VM's HA resource changed so that the stop or start no longer applies, for example because the VM left the node.
+
+- `busy`
+  Another call held the VM's journal record or VMID claim, so a rerun has to stop or start it.
+
+- `failed`
+  A write failed, a VM that could leave stayed, or the HA manager reports the VM in `error`.
+
+- `left_pending`
+  PVE HA had not finished the stop or the start when the settle timeout ran out. The token stays on the VM.
+
+The commands exit with these codes.
+
+- `0`
+  The run finished. That includes a completed dry run and a drain whose node now holds no running VM of this Director.
+
+- `1`
+  A read or a write failed, a VM that could leave stayed, a stop or a start didn't settle in time, the run was interrupted, or the rebalance it ran ended with 1. A rerun goes on from the tokens.
+
+- `2`
+  A flag was wrong or missing, or the node was not named exactly once.
+
+- `3`
+  A gate refused the run, including the maintenance gate, and nothing was left part way. The gates are the rebalance's, with one change. Every node except the named one must be online, out of maintenance, and able to take work, because draining a second node while another is down is not a rolling maintenance. The named node must be online. The gate that waits for the cluster to settle doesn't apply, because a drain causes migrations and waits for them itself.
+
+A rerun is how we resume. The token goes on in the same write that stops the VM and comes off in the same write that starts it, so a crash never leaves a VM that is stopped with no token or started with a stale one. A drain that stopped some VMs and then died leaves each stopped VM with its token, and the rerun lists those VMs as stopped by an earlier drain and stops whatever is left. A stop that conflicts or finds the record busy leaves the VM running with no token, the run finishes the other stops and exits with 1, and the rerun stops that VM. A stop that doesn't finish in time keeps its token, PVE goes on with it, and the rerun waits for it. A crash during the undrain leaves each VM either stopped with its token or started without it, and the rerun starts what is left, waits, and runs the rebalance, which resumes its own marks. A VM that we start by hand during the maintenance keeps its token, and the undrain then only drops the token. [Troubleshooting](troubleshooting.md#a-drain-refuses-with-the-maintenance-gate) covers the failures we meet most often.
+
 ### Node maintenance with `hold` VMs
 
-PVE HA cannot evacuate a `hold` VM, because its strict pin forbids every other node. The maintenance request on the node therefore never completes while the VM runs. Before we put a node into maintenance, we stop its `hold` VMs with the command below, and we start them again afterward. A soft `bosh stop` stops only the jobs and leaves the guest running, and `bosh stop --hard` deletes the VM, so a recreated VM with a node-local disk would have to land back on the node that holds the disk. The `ha-manager` command avoids both problems.
+PVE HA cannot evacuate a `hold` VM, because its strict pin forbids every other node. The maintenance request on the node therefore never completes while the VM runs. The drain described above stops such a VM for us, and we use the manual steps below only when the drain is not available, for example on a cluster where we can't run it. Before we put a node into maintenance, we stop its `hold` VMs with the command below, and we start them again afterward. A soft `bosh stop` stops only the jobs and leaves the guest running, and `bosh stop --hard` deletes the VM, so a recreated VM with a node-local disk would have to land back on the node that holds the disk. The `ha-manager` command avoids both problems.
 
 ```bash
 ha-manager set vm:<vmid> --state stopped
@@ -932,7 +1046,7 @@ The doctor lists a `hold` VM as `hold_blocks_maintenance` only while its HA stat
 
 ### Node maintenance when a VM cannot leave the node
 
-The `hold` procedure above is one case of a wider rule. PVE waits forever on a node in maintenance for any HA service that cannot leave it. The maintenance request itself does not wait. The enable command returns at once, and the node's resource manager enters maintenance mode within a few seconds. What waits is the drain, because the resource manager keeps its agent lock and its watchdog until the last service has left the node. That wait blocks a reboot while the node is in maintenance and the restart of the local resource manager that the `pve-ha-manager` package upgrade runs. The resource manager logs that it ignores the shutdown policy while maintenance is on, and it never stops or fences the VM, so the node sits there until we release the service by hand. Two kinds of VM do this.
+The `hold` procedure above is one case of a wider rule, and `pve-ops ha drain` handles every case of it for the VMs of one Director, as [Draining and undraining a node with `pve-ops ha drain`](#draining-and-undraining-a-node-with-pve-ops-ha-drain) describes. This section stays as the fallback, and it is the only way to deal with a VM that has no HA resource or that belongs to another Director. PVE waits forever on a node in maintenance for any HA service that cannot leave it. The maintenance request itself does not wait. The enable command returns at once, and the node's resource manager enters maintenance mode within a few seconds. What waits is the drain, because the resource manager keeps its agent lock and its watchdog until the last service has left the node. That wait blocks a reboot while the node is in maintenance and the restart of the local resource manager that the `pve-ha-manager` package upgrade runs. The resource manager logs that it ignores the shutdown policy while maintenance is on, and it never stops or fences the VM, so the node sits there until we release the service by hand. Two kinds of VM do this.
 
 - **A member of a full anti-affinity group**
 
@@ -1198,7 +1312,25 @@ Two limits are worth knowing before we start the first node.
 - A pool with one endpoint behaves as it always did.
   A deployment that sets only `pve.host`, with discovery off or without an API token, has nowhere to go. We list at least two nodes in `pve.endpoints`, or we leave discovery on, before we rely on this.
 
-We still cycle one node at a time, and we wait for the cluster to be quorate before we start the next one.
+We still cycle one node at a time, and we wait for the cluster to be quorate before we start the next one. For each node, we follow these steps.
+
+1. Run `pve-ops ha drain <node>` as a dry run, and read which VMs leave and which can't.
+
+2. Run `ha-manager crm-command node-maintenance enable <node>` on a PVE node.
+
+3. Turn resurrection off for the deployments that the dry run names, for example with `bosh update-resurrection off`.
+
+4. Run `pve-ops ha drain <node> --apply`, and wait for it to exit with 0.
+
+5. Do the maintenance, such as the upgrade and the reboot, and wait until the node is back and the cluster is quorate.
+
+6. Run `ha-manager crm-command node-maintenance disable <node>` on a PVE node.
+
+7. Run `pve-ops ha undrain <node> --apply`, which starts the stopped VMs and rebalances.
+
+8. Turn resurrection back on for the same deployments.
+
+A VM with no HA resource is neither moved by maintenance nor stopped by the drain, so we stop it ourselves through the Director before step 5, or we accept that it goes down with the node. [Draining and undraining a node with `pve-ops ha drain`](#draining-and-undraining-a-node-with-pve-ops-ha-drain) describes both commands.
 
 ### Rebalancing HA VMs after node maintenance
 
@@ -1288,6 +1420,8 @@ The command exits with these codes.
 An interrupt or SIGTERM never cuts a write short. The run finishes the write in progress, releases the run lock, and stops before its next move. A move that a stop or a failure leaves part way keeps its mark, and the mark keeps the resource's `failback` off, so a `set_vm_metadata` or `reboot_vm` can't pull the VM back to its old node. `pve-ops ha` reports such a VM as the `rebalance_pending` problem. The next run with `--apply` finishes each marked move whose VM reached its target, undoes each one whose VM never left its node, and only then plans anything new, as [A rebalance left a move part way](troubleshooting.md#a-rebalance-left-a-move-part-way) describes.
 
 On a bastion, the dry run works, but `--apply` refuses at the journal gate when the configuration names an allocation journal the bastion can't read. When the configuration names no journal, `--apply` runs from a bastion and prints a warning, because the run then can't see the Director's own journal records. That is safe only when the Director's own CPI has no journal configured either. For a Director with several `cpi_config` entries, we pass `--request` with a context that names the entry and the Director's UUID, once for each entry, because the run reads one cluster.
+
+The undrain runs this same rebalance when it finishes, so after a drain we normally don't run the rebalance by hand. We run it alone when the undrain ran with `--no-rebalance`, when the rebalance ended with 1 or 3 inside the undrain, or after a maintenance that we did without the drain.
 
 ### Rolling back below endpoint lists
 

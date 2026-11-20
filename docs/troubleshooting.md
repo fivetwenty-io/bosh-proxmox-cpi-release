@@ -3114,6 +3114,95 @@ sudo -u vcap /var/vcap/packages/pve_cpi/bin/pve-ops ha rebalance --apply --direc
 
 Before it plans anything new, the run handles each marked VM. It finishes the move of a VM that reached its target, which rewrites the pin when the move calls for it, restores `failback`, and drops the mark. It undoes the move of a VM that never left its node, which restores `failback` and drops the mark. A VM that PVE is still moving keeps its mark, and we run the command again once the move has settled. The output lists these under `Moves of an earlier run`. When a mark can't be cleared, the run exits with 1 and starts no new move, and we fix the cause it names and run the command again. A dry run shows what the run would do with each marked VM without changing anything.
 
+## A drain refuses with the maintenance gate
+
+**Symptom**
+
+`pve-ops ha drain <node> --apply` exits with 3, and its output shows a `REFUSED:` gate line that says the HA manager doesn't report the node in maintenance, and names the command `ha-manager crm-command node-maintenance enable <node>`.
+
+**Cause**
+
+PVE has no API call that turns HA node maintenance on, so the CPI can't do it for us. The drain waits for PVE HA to move the VMs that can leave, and PVE moves nothing until the HA manager has the node in maintenance. A dry run reports the same line without refusing, so we can read the plan before maintenance starts. An operator maintenance tag alone doesn't satisfy the gate, because PVE moves nothing for a tag, and the refusal says so when the node carries one. The same exit code also comes from the rebalance's other gates, such as another node being offline or in maintenance, and a refusal of that kind names the node.
+
+**Diagnosis**
+
+The `REFUSED:` line names what the gate saw. `ha-manager status` on a PVE node shows the node's state, and it reads `maintenance` once the request has taken effect.
+
+**Fix**
+
+We run the command the refusal prints on a PVE node, wait a few seconds for the node's resource manager to enter maintenance, and run the drain again.
+
+```bash
+ha-manager crm-command node-maintenance enable <node>
+```
+
+A refusal that names another node means we must bring that node back online or out of maintenance first, because a rolling maintenance takes one node at a time. [Draining and undraining a node with `pve-ops ha drain`](operations.md#draining-and-undraining-a-node-with-pve-ops-ha-drain) lists every gate.
+
+## A VM that could leave stayed on the drained node
+
+**Symptom**
+
+`pve-ops ha drain <node> --apply` exits with 1, and its output says that a VM that could leave node `<node>` stayed past the settle timeout. The VM's line says that it leaves for one or more nodes, and its outcome is `failed`.
+
+**Cause**
+
+The rules say that another node can take the VM, yet PVE HA didn't move it within `--settle-timeout`. Something other than the rules is holding it. The usual causes are a migration that fails or stalls, a target node that lacks the memory or the storage for the VM, a VM with a mounted local ISO or a passthrough device that blocks live migration, and a cluster resource scheduler that keeps choosing a node that the rules forbid.
+
+**Diagnosis**
+
+The report names the nodes that could take the VM. `ha-manager status` shows whether the service is in `migrate`, `relocate`, or `error`, and the node's task list and the HA manager's log show why a migration failed.
+
+```bash
+ha-manager status
+pvesh get /nodes/<node>/tasks --typefilter qmigrate
+```
+
+**Fix**
+
+We clear the cause PVE reports, such as a blocking device or too little room on the targets, and run the drain again with `--apply`. The rerun waits again and stops whatever is still left, and it keeps the VMs that an earlier run stopped. When the VM is one that we can't move for a while, we stop it through HA ourselves, as [Node maintenance when a VM cannot leave the node](operations.md#node-maintenance-when-a-vm-cannot-leave-the-node) shows, and then run the drain.
+
+## A drain or an undrain left a stop or a start part way
+
+**Symptom**
+
+`pve-ops ha drain --apply` or `pve-ops ha undrain --apply` exits with 1, and a VM's line shows the outcome `left_pending`, `busy`, or `failed`. The VM's HA resource carries `bosh-drain-stopped=<node>` in its comment, or it requests `stopped` or `started` without the state we expected.
+
+**Cause**
+
+The commands write each VM's HA state and token in one write, and they wait for PVE HA to carry out the change. A run can end before that. A `left_pending` VM had not finished stopping or starting when the settle timeout ran out, so PVE is still working and the token stays. A `busy` VM had a journal record or a VMID claim that another call held, so the run didn't write, and it left the VM running with no token. A `failed` VM had a write that failed, or the HA manager reports it in `error`. An interrupt or a crash leaves each VM either stopped with its token or started without it, because the token and the state change together.
+
+**Diagnosis**
+
+The output names each VM and its outcome, and the line ends with the error for a failed VM. `ha-manager status` shows the VM's current state, and `pve-ops ha` shows the resource's comment.
+
+**Fix**
+
+We run the same command again with `--apply`. A drain rerun lists the VMs that an earlier drain stopped, waits for any stop that PVE still carries out, and stops what is left. An undrain rerun starts what is left, waits, and runs the rebalance. A busy VM clears once the call that holds it finishes. A VM in `error` needs the cause fixed first, and PVE accepts only `disabled` for a resource in that state, so we follow the recovery that [Operations, PVE HA](operations.md#pve-ha) describes before the rerun. A VM that we started or stopped by hand keeps its token until an undrain drops it, which is harmless.
+
+## An undrain refuses because the node is still in maintenance or tagged
+
+**Symptom**
+
+`pve-ops ha undrain <node> --apply` exits with 3, and its output shows a `REFUSED:` gate line that says either that the node is still in HA maintenance, with the command `ha-manager crm-command node-maintenance disable <node>`, or that the node carries an operator maintenance tag and the tag has to go first.
+
+**Cause**
+
+The undrain starts VMs that the drain stopped and then lets the rebalance place VMs, and it does neither on a node that PVE still treats as in maintenance. The CPI also places nothing on a node that carries one of the tags in `pve.placement.maintenance_node_tags`, so a tag keeps the gate shut as well as HA maintenance does. The gate checks both, and a dry run reports the state without refusing.
+
+**Diagnosis**
+
+The `REFUSED:` line says which of the two holds. `ha-manager status` shows whether the node is still in maintenance, and the CPI's `pve.placement.maintenance_node_tags` property names the tags that count.
+
+**Fix**
+
+For HA maintenance, we run the command that the refusal prints on a PVE node, wait for the node to leave maintenance, and run the undrain again.
+
+```bash
+ha-manager crm-command node-maintenance disable <node>
+```
+
+For a tag, we remove it from the node and run the undrain again. Nothing was left part way, because the gate refuses before the first write.
+
 ## Task timeouts
 
 **Symptom**
