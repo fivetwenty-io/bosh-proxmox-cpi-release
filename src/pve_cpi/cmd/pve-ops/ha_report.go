@@ -43,6 +43,7 @@ const (
 	haKindReplicaOnPartner      = "replica_on_partner"
 	haKindReplicaNotRecover     = "replica_not_recoverable"
 	haKindReplicaAwaiting       = "replica_awaiting_sync"
+	haKindReplicaPinUnshaped    = "replica_pin_unshaped"
 	haKindReplicaJobStale       = "replica_job_stale"
 	haKindReplicaJobFailing     = "replica_job_failing"
 	haKindReplicaScheduleSkip   = "replica_schedule_unjudged"

@@ -1667,6 +1667,13 @@ func (c *haCollector) recoveryState() {
 		if partner != "" && g.ref.Node == partner {
 			c.onPartner(g, pin, partner, source)
 		}
+		if !shaped && token != "" && pin.Strict && !pin.Disabled && len(pin.NodeNames()) == 1 {
+			c.rep.advise(haKindReplicaPinUnshaped, g.sid,
+				"replicate VM %d has pin %s, which names only %s but still carries the %s=%s token, so the "+
+					"widen sweep skips it as not a replicate pin. Remove the token from the pin's comment, then run "+
+					"pve-ops ha --widen-replicas --apply to widen it", id, pin.ID, pin.NodeNames()[0],
+				ha.ReplicaPartnerKey, token)
+		}
 		recoverable := token != ""
 		if rec != nil {
 			recoverable = rec.Replication.Recoverable()

@@ -916,6 +916,26 @@ func TestCollectReplicaAwaitingFirstSync(t *testing.T) {
 	wantNone(t, runCollect(t, f, haCfg("auto", "replicate")), haKindReplicaNotRecover)
 }
 
+func TestCollectReplicaPinNarrowedKeepsToken(t *testing.T) {
+	t.Parallel()
+	// A hand edit left one node and the partner token, which no CPI write produces.
+	f := replicaFake()
+	f.rules = []ha.Rule{pinRule(101, haMarker+" "+ha.ReplicaPartnerKey+"=n2", "n1")}
+	r := runCollect(t, f, haCfg("auto", "replicate"))
+	want(t, r, haKindReplicaPinUnshaped, haSeverityAdvice, "vm:101", "bosh-na-101", ha.ReplicaPartnerKey, "--widen-replicas")
+	for _, fd := range r.Findings {
+		if fd.Severity == haSeverityProblem {
+			t.Fatalf("a narrowed pin with a token must stay advice: %+v", r.Findings)
+		}
+	}
+
+	// The shapes the CPI writes stay quiet.
+	wantNone(t, runCollect(t, replicaFake(), haCfg("auto", "replicate")), haKindReplicaPinUnshaped)
+	g := replicaFake()
+	g.rules = []ha.Rule{pinRule(101, haMarker, "n1")}
+	wantNone(t, runCollect(t, g, haCfg("auto", "replicate")), haKindReplicaPinUnshaped)
+}
+
 func TestCollectReplicaTagFindsVMWithoutJob(t *testing.T) {
 	t.Parallel()
 	// The job is gone, so only the tag says the VM was meant to replicate.

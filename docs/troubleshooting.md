@@ -3072,6 +3072,20 @@ At Debug, the CPI log also shows the sweep's reason for each VM it skipped, afte
 
 We run the same command with `--apply`, as [Widening replica pins after a deploy](operations.md#widening-replica-pins-after-a-deploy) describes, or we wait for the next call that takes the HA rules lock. A VM that the pass skips because another call holds it, because its locks took longer than its claim's lease on a busy cluster, because it is migrating or recovering, or because its HA resource is ignored keeps its pin until a later pass finds it settled. One sweep widens at most one pin, so after a deploy that adds many `replicate` VMs, the command with `--apply` widens the rest at once. A VM whose job is failing needs the job fixed first, as [Operations, PVE HA](operations.md#pve-ha) describes for `replica_job_failing`. A VM with two replication jobs that carry this Director's marker fails every pass, and the CPI log shows `the VM's pin cannot widen until an operator fixes its replication jobs` at Warn. The reason names both jobs, and the higher-numbered one is most likely a copy someone made by hand, because the CPI gives each VM one job with the lowest free number. We remove the extra job with `pvesr delete <job-id>` on the VM's node, and once PVE has removed it, the next pass widens the pin.
 
+## A replicate VM's pin names one node but still carries its replica token
+
+**Symptom**
+
+`pve-ops ha` reports `replica_pin_unshaped` as advice for a `replicate` VM. The strict `bosh-na-<vmid>` pin names only one node, and its comment still holds a `bosh-replica=<node>` token. HA can't migrate the VM, and `pve-ops ha --widen-replicas` lists nothing for it.
+
+**Cause**
+
+The CPI never writes this shape. Every place where it narrows a pin to one node removes the token in the same write. Someone edited the pin's node list by hand, in the PVE UI or with `ha-manager rules set`, and left the comment alone. The widen sweep and the widening command look only for a pin that names its source node alone and has no token, so they skip this pin, and the token makes the doctor's recovery check read the VM as recoverable.
+
+**Fix**
+
+We remove the `bosh-replica=<node>` token from the pin's comment and leave the rest of the comment, including the Director's marker, as it is. Then we run `pve-ops ha --widen-replicas --apply`, as [Widening replica pins after a deploy](operations.md#widening-replica-pins-after-a-deploy) describes. The pass treats the pin as a new source-only pin, waits for a sync that started more than five minutes after the change it stamps, and then widens the pin.
+
 ## A rebalance refuses with exit 3
 
 **Symptom**
