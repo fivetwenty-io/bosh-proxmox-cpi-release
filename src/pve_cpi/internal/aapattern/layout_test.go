@@ -124,12 +124,16 @@ func TestLayout_EveryMemberStaysDrainSafe(t *testing.T) {
 	}
 }
 
+// TestLayout_TrimmingKeepsTheLowestTwoApart pins that window:3 on three
+// nodes, which trims every run of three, adds the rule over 0 and 1. The run
+// from 4 holds only 4 and 5, so it fits on its own once the trim drops the run
+// from 3 that covers it.
 func TestLayout_TrimmingKeepsTheLowestTwoApart(t *testing.T) {
 	t.Parallel()
 	out := Layout(Input{Base: base, Pattern: mustParse(t, "window:3"), Split: true, Domains: oneDomain(3),
 		Members: members("", seq(6)...)})
-	if got := render(out.Rules); got != "-p0={0,1}" {
-		t.Fatalf("rules = %s; want only the added rule over 0 and 1", got)
+	if got := render(out.Rules); got != "-p0={0,1} -p100004={4,5}" {
+		t.Fatalf("rules = %s; want the added rule over 0 and 1 and the run from 4", got)
 	}
 	if len(out.Trimmed) == 0 || len(out.AddedFirst) != 1 {
 		t.Fatalf("trimmed = %v, added = %v; want the windows trimmed and the pair rule added", out.Trimmed,
@@ -397,4 +401,69 @@ func TestLayout_EvensOfTen(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLayout_WindowKeepsACoveredRunWhenTrimDropsItsCover pins that a window
+// run whose members another run holds is dropped only when that other run is
+// kept. On five nodes, window:3 trims the runs from 2 and 3, and the run from
+// 4, which the run from 3 covers, then protects 4 and 5 on its own. Every run
+// the bound allows is kept or covered by a kept rule.
+func TestLayout_WindowKeepsACoveredRunWhenTrimDropsItsCover(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		count int
+		want  string
+	}{
+		{6, "-p100000={0,1,2} -p100001={1,2,3} -p100004={4,5}"},
+		{10, "-p100000={0,1,2} -p100001={1,2,3} -p100004={4,5,6} -p100005={5,6,7} -p100008={8,9}"},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprint(tc.count), func(t *testing.T) {
+			t.Parallel()
+			in := Input{Base: base, Pattern: mustParse(t, "window:3"), Split: true, Domains: oneDomain(5),
+				Members: members("", seq(tc.count)...)}
+			out := Layout(in)
+			if got := render(out.Rules); got != tc.want {
+				t.Fatalf("rules = %s; want %s", got, tc.want)
+			}
+			for k, ps := range Partners(out.Rules) {
+				if len(ps) > 3 {
+					t.Fatalf("%s has %d partners; want at most 3", k, len(ps))
+				}
+			}
+			for s := range tc.count {
+				run := []string{}
+				for i := s; i < min(s+3, tc.count); i++ {
+					run = append(run, key(i))
+				}
+				if len(run) < 2 || inSomeRule(out.Rules, run) || !fitsBound(out.Rules, run, 3) {
+					continue
+				}
+				t.Fatalf("run from %d fits the bound but no rule holds it: %s", s, render(out.Rules))
+			}
+		})
+	}
+}
+
+// inSomeRule reports whether one rule of rules holds every key of run.
+func inSomeRule(rules map[string][]string, run []string) bool {
+	for _, keys := range rules {
+		if !slices.ContainsFunc(run, func(k string) bool { return !slices.Contains(keys, k) }) {
+			return true
+		}
+	}
+	return false
+}
+
+// fitsBound reports whether adding a rule over run keeps every member within
+// limit partners.
+func fitsBound(rules map[string][]string, run []string, limit int) bool {
+	with := maps.Clone(rules)
+	with["probe"] = run
+	for _, ps := range Partners(with) {
+		if len(ps) > limit {
+			return false
+		}
+	}
+	return true
 }

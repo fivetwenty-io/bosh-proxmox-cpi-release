@@ -122,6 +122,9 @@ type candRule struct {
 	term    int
 	low     int
 	fixed   bool
+	// window marks a window run, which dropCoveredRuns leaves out when a
+	// kept run of the same term holds its members.
+	window bool
 	// current holds the rule's members now, for a fixed rule's joins.
 	current map[string]bool
 }
@@ -315,7 +318,7 @@ func (l *layout) planDomain(dk string) []candRule {
 		}
 	}
 	kept, trimmed := l.trim(dom, ms, cands)
-	kept = l.joinFixed(dom, kept)
+	kept = dropCoveredRuns(l.joinFixed(dom, kept))
 	if trimmed {
 		kept = l.keepLowestApart(dom, ms, cands, kept)
 	}
@@ -742,8 +745,9 @@ func (l *layout) fixedMembers(ms []*mstate, want func(int) bool, n int) ([]*msta
 }
 
 // planWindow asks for one rule over every run of K consecutive indexes that
-// holds two members or more, leaving out a run whose members another run
-// holds already.
+// holds two members or more. A run whose members another run holds stays a
+// candidate, because trimming may drop the other run, and dropCoveredRuns
+// leaves it out after the trim only when the other run is kept.
 func (l *layout) planWindow(dom Domain, ms []*mstate, t Term, term int) []candRule {
 	var starts []int
 	for _, m := range ms {
@@ -760,23 +764,33 @@ func (l *layout) planWindow(dom Domain, ms []*mstate, t Term, term int) []candRu
 			continue
 		}
 		out = append(out, candRule{name: PatternRuleName(l.in.Base, n), members: members, term: term,
-			low: lowIndex(members), fixed: true, current: current})
+			low: lowIndex(members), fixed: true, current: current, window: true})
 	}
-	// A run whose members another run holds adds nothing.
-	var kept []candRule
-	for i, c := range out {
+	return out
+}
+
+// dropCoveredRuns leaves out each window run whose members a kept run of the
+// same term holds, because it adds nothing. It runs after the trim and the
+// joins, so a run whose cover the trim dropped, or whose cover lost a member
+// to a refused join, still protects its members.
+func dropCoveredRuns(kept []candRule) []candRule {
+	out := make([]candRule, 0, len(kept))
+	for i, c := range kept {
 		covered := false
-		for j, o := range out {
-			if i != j && subset(c.members, o.members) && (len(c.members) < len(o.members) || j < i) {
+		for j, o := range kept {
+			if i == j || !c.window || !o.window || c.term != o.term || !subset(c.members, o.members) {
+				continue
+			}
+			if len(c.members) < len(o.members) || j < i {
 				covered = true
 				break
 			}
 		}
 		if !covered {
-			kept = append(kept, c)
+			out = append(out, c)
 		}
 	}
-	return kept
+	return out
 }
 
 // planSets asks for one rule over each set that holds two members or more.
