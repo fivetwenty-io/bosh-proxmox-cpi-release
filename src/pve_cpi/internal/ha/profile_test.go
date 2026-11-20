@@ -933,10 +933,12 @@ func TestQDeviceBodies(t *testing.T) {
 func TestEntryAndNodeFacts(t *testing.T) {
 	w := three()
 	w.entry = "pve2"
+	w.clusterName = "prod-east"
 	w.nodes[0].votes = votes(1)
 	p := resolve(t, w, cfgMode(config.HAModeAuto))
-	if p.EntryNode != "pve2" || !p.Clustered || !p.Quorate || p.CRMMaster != "pve1" {
-		t.Fatalf("entry=%s clustered=%v quorate=%v master=%s", p.EntryNode, p.Clustered, p.Quorate, p.CRMMaster)
+	if p.EntryNode != "pve2" || !p.Clustered || !p.Quorate || p.CRMMaster != "pve1" || p.ClusterName != "prod-east" {
+		t.Fatalf("entry=%s clustered=%v quorate=%v master=%s cluster=%s", p.EntryNode, p.Clustered, p.Quorate,
+			p.CRMMaster, p.ClusterName)
 	}
 	if len(p.Nodes) != 3 || p.Nodes[2].Name != "pve3" || p.Nodes[2].Votes != 1 || !p.Nodes[2].VotesKnown ||
 		p.Nodes[2].Version != "9.2.4" || !p.Nodes[2].CPU.Known {

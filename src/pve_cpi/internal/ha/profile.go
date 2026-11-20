@@ -101,10 +101,13 @@ type Profile struct {
 	TopologySource string
 
 	// EntryNode is the node that answered, and Clustered is false for a
-	// standalone host. Quorate is the entry node's quorate flag.
-	EntryNode string
-	Clustered bool
-	Quorate   bool
+	// standalone host. Quorate is the entry node's quorate flag. ClusterName
+	// is the name of the cluster row of /cluster/status, empty for a
+	// standalone host.
+	EntryNode   string
+	ClusterName string
+	Clustered   bool
+	Quorate     bool
 
 	// Nodes holds one entry per cluster member, sorted by name.
 	Nodes []NodeFacts
@@ -286,6 +289,7 @@ func (p *Profile) probe(ctx context.Context, deps Deps) {
 		return
 	}
 	p.EntryNode, p.Clustered, p.Quorate = cs.Entry, cs.Clustered, cs.Quorate
+	p.ClusterName = cs.Name
 	for _, n := range cs.Nodes {
 		p.Nodes = append(p.Nodes, NodeFacts{Name: n.Name, Online: n.Online})
 	}
