@@ -292,12 +292,12 @@ func (d *drainDecider) narrowToPartners(fate *drainVMFate, sid string, sets map[
 			continue
 		}
 		for _, partner := range r.Resources {
-			if partner != sid && d.undecided[partner] {
+			if why := d.partnerUndecided(partner, sid, sets); why != "" {
 				d.undecided[sid] = true
 				delete(sets, sid)
 				fate.Fate, fate.Targets = DrainUndecided, nil
 				fate.Reason = "its positive resource-affinity rule " + r.ID + " keeps it with VM " +
-					sidNumber(partner) + ", whose fate the drain can't decide"
+					sidNumber(partner) + ", " + why
 				return true
 			}
 			theirs, ok := d.partnerSet(partner, sid, sets)
@@ -319,6 +319,27 @@ func (d *drainDecider) narrowToPartners(fate *drainVMFate, sid string, sets map[
 		}
 	}
 	return changed
+}
+
+// partnerUndecided returns why the drain can't decide where a positive partner
+// of sid can go, or "". That is a partner whose own fate is undecided, and an
+// active partner on the drained node that is no VM the drain decides, such as
+// another Director's VM, because the drain never reads its config.
+func (d *drainDecider) partnerUndecided(partner, sid string, sets map[string][]string) string {
+	if partner == sid {
+		return ""
+	}
+	if d.undecided[partner] {
+		return "whose fate the drain can't decide"
+	}
+	if _, decided := sets[partner]; decided {
+		return ""
+	}
+	if at, active := d.activeNode(partner); active && at == d.node {
+		return "which runs on node " + d.node + " and isn't a VM of this Director, so the drain can't tell " +
+			"whether the two can leave together"
+	}
+	return ""
 }
 
 // partnerSet returns the nodes a positive partner of sid can be on: its own

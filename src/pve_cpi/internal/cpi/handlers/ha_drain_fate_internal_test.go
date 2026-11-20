@@ -184,3 +184,24 @@ func TestDrainFatesOfAVMOnStorageOfUnknownKindAreUndecided(t *testing.T) {
 	wantFate(t, fates, 103, DrainUndecided, "storage ghost")
 	wantFate(t, fates, 104, DrainUndecided, "positive resource-affinity rule together keeps it with VM 103")
 }
+
+func TestDrainFatesOfAVMWithAForeignPartnerOnTheNodeAreUndecided(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	f.foreign = map[int]string{301: "pve01", 302: "pve02", 303: "pve01"}
+	f.foreignState = map[int]string{303: "stopped"}
+	f.addVM(101, "pve01", 4)
+	f.addVM(102, "pve01", 4)
+	f.addVM(103, "pve01", 4)
+	f.extraRules = append(f.extraRules,
+		ha.Rule{ID: "with-local", Type: ha.RuleTypeResourceAffinity, Affinity: ha.AffinityPositive,
+			Resources: []string{haResourceSid(101), haResourceSid(301)}},
+		ha.Rule{ID: "with-away", Type: ha.RuleTypeResourceAffinity, Affinity: ha.AffinityPositive,
+			Resources: []string{haResourceSid(102), haResourceSid(302)}},
+		ha.Rule{ID: "with-stopped", Type: ha.RuleTypeResourceAffinity, Affinity: ha.AffinityPositive,
+			Resources: []string{haResourceSid(103), haResourceSid(303)}})
+	fates := drainFatesOf(t, f)
+	wantFate(t, fates, 101, DrainUndecided, "rule with-local keeps it with VM 301, which runs on node pve01")
+	wantFate(t, fates, 102, DrainLeaves, "", "pve02")
+	wantFate(t, fates, 103, DrainLeaves, "", "pve02", "pve03")
+}
