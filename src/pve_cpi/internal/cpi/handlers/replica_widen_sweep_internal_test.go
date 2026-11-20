@@ -435,8 +435,9 @@ func TestReplicaWidenPass_SkipsAVMTheBarrierHolds(t *testing.T) {
 // widened pin is written must win. The barrier writes its narrowed pin under
 // the rules lock before it changes the VM, so the pin the check read is gone
 // and the write's compare-and-swap refuses. The pass reads the HA resource
-// only before it takes any lock: once to see whether the barrier holds it, and
-// once to turn failback off before the pin names the partner.
+// once before it takes any lock, to see whether the barrier holds it. It reads
+// the resource again to turn failback off only once the rule writer has found
+// the pin the check read, so a refused write reads it no more.
 func TestReplicaWidenPass_RacingNarrowingBarrierWins(t *testing.T) {
 	s := newSweepRig(t)
 	narrowed := time.Now().Truncate(time.Second)
@@ -456,8 +457,8 @@ func TestReplicaWidenPass_RacingNarrowingBarrierWins(t *testing.T) {
 	if got, ok := ha.ReplicaChanged(s.pinComment()); !ok || !got.Equal(narrowed) {
 		t.Fatalf("pin comment %q lost the barrier's pin", s.pinComment())
 	}
-	if readsAtClaim != 2 || s.cluster.resourceCalls != readsAtClaim {
-		t.Fatalf("HA resource reads %d, %d of them before the claim; want the two before the locks and none "+
+	if readsAtClaim != 1 || s.cluster.resourceCalls != readsAtClaim {
+		t.Fatalf("HA resource reads %d, %d of them before the claim; want the one before the locks and none "+
 			"under them", s.cluster.resourceCalls, readsAtClaim)
 	}
 }

@@ -4,8 +4,11 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 )
 
 // The sweep turns failback off on the VM's HA resource before the widened pin
@@ -49,5 +52,44 @@ func TestReplicaWidenPass_FailbackWriteThatFailsKeepsTheSourcePin(t *testing.T) 
 	}
 	if s.pools.held(100) {
 		t.Fatal("the pass kept the VM's claim after the failback write failed")
+	}
+}
+
+// The sweep turns failback off only once the widening goes ahead. A guard
+// that skips the VM, or a pin the rule writer finds changed since the check
+// read it, leaves the pin on the source, and the HA resource gets no write.
+func TestReplicaWidenPass_SkippedWideningWritesNoFailback(t *testing.T) {
+	cases := map[string]func(s *sweepRig){
+		"the guard finds the volumes changed": func(s *sweepRig) {
+			s.onClaimed = func() { s.cfg["scsi1"] = "local-zfs:vm-100-disk-1,size=5G" }
+		},
+		"the guard finds a PVE lock": func(s *sweepRig) {
+			s.onClaimed = func() { s.cfg["lock"] = "migrate" }
+		},
+		"the pin changed since the check read it": func(s *sweepRig) {
+			restamped := time.Now().Truncate(time.Second)
+			s.hooked.onStatus = func(call int) {
+				if call == 2 {
+					s.setPin("pve01", func(c string) string { return ha.WithReplicaChanged(c, restamped) })
+				}
+			}
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := newSweepRig(t)
+			on := sdkclient.PVEBool(true)
+			s.stub.failback = &on
+			writes := 0
+			s.stub.onFailbackWrite = func(bool) { writes++ }
+			setup(s)
+			res := onlyResult(t, s.run(t, ReplicaWidenOptions{}))
+			if res.Outcome == ReplicaWidened || s.widened() {
+				t.Fatalf("result %+v, pin %q; want the source pin kept", res, s.pinNodes())
+			}
+			if writes != 0 || s.stub.failback == nil || !bool(*s.stub.failback) {
+				t.Fatalf("failback writes %d; want none for a widening that did not go ahead", writes)
+			}
+		})
 	}
 }

@@ -178,6 +178,13 @@ type replicaPinWrite struct {
 	// fresh context. A pin that is pin by then counts as written, so the
 	// caller reports what is in PVE rather than a failure.
 	confirmLost bool
+	// beforeWrite runs under the rules lock, after the guard let the write
+	// go ahead and the rule writer found the pin in PVE to be expect, and
+	// right before the update of the pin goes out. An error leaves the pin as
+	// it is and is returned as it stands. The rule writer plans again after a
+	// write PVE refused because the rules changed, so beforeWrite may run more
+	// than once and must do nothing the second time that it did the first.
+	beforeWrite func(ctx context.Context) error
 }
 
 // replicaPinWritten is what writeReplicaPinWith did.
@@ -224,6 +231,11 @@ func writeReplicaPinWith(
 			case !ha.SameRule(cur, expect):
 				return nil, fmt.Errorf("node-affinity: pin %q of VM %d changed since it was read (%s); the next "+
 					"call that touches the VM settles it", pin.ID, vmid, strings.Join(ha.RuleDiff(expect, cur), ","))
+			}
+			if how.beforeWrite != nil {
+				if err := how.beforeWrite(ctx); err != nil {
+					return nil, err
+				}
 			}
 			return []ha.RuleOp{{Kind: ha.OpUpdate, Rule: *pin}}, nil
 		})
@@ -483,11 +495,9 @@ func (w *replicaWiden) check(ctx context.Context) (widened bool, reason string, 
 			return w.guard(ctx, proof, write)
 		}
 	}
-	if err := w.failbackOffBeforePartner(ctx); err != nil {
-		return false, "", err
-	}
 	written, err := writeReplicaPinWith(ctx, w.deps, w.profile, logger, w.vmid, pin, widenedReplicaPin(pin, target),
-		replicaPinWrite{guard: guard, around: w.claim, confirmLost: w.claim != nil})
+		replicaPinWrite{guard: guard, around: w.claim, confirmLost: w.claim != nil,
+			beforeWrite: w.failbackOffBeforePartner})
 	w.wrote = written.wrote
 	if skip := (*replicaWidenSkip)(nil); errors.As(err, &skip) {
 		logger.Info(replicaOp+": the VM's state changed since its replica was checked; the pin keeps the source "+
@@ -514,7 +524,11 @@ func (w *replicaWiden) check(ctx context.Context) (widened bool, reason string, 
 // reversed job, whose first run receives with zfs recv -F. The reconcile only
 // logs a failback write that fails, so the widening checks the flag itself and
 // fails closed: a write that fails returns a retriable error, and the pin keeps
-// the source alone until a later call.
+// the source alone until a later call. It runs as the pin write's beforeWrite,
+// so it writes only once the guard has let the widening go ahead and the rule
+// writer has found the pin the check read, and a widening that is skipped
+// writes nothing to the HA resource. It writes only while the flag reads on,
+// so a second plan of the same write only reads.
 func (w *replicaWiden) failbackOffBeforePartner(ctx context.Context) error {
 	if _, err := clearVMFailback(ctx, w.deps.PVE.Cluster(), w.deps.RequestDirectorUUID, w.vmid); err != nil {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf("%s: turn off failback on the HA "+
