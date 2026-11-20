@@ -678,7 +678,7 @@ Before we set `pve.ha.mode` to `auto` or `managed`, we raise the Director's `hm.
 
 ### Reading the cluster with `pve-ops ha`
 
-The `pve-ops ha` subcommand is a read-only doctor. It never writes to PVE, and it runs in every mode, `off` included. There are four exceptions. The first is `--widen-replicas --apply`, which runs the CPI's own replica widening pass instead of the doctor, as [Widening replica pins after a deploy](#widening-replica-pins-after-a-deploy) describes. The second is `pve-ops ha rebalance --apply`, which live-migrates this Director's HA VMs back into a good spread, as [Rebalancing HA VMs after node maintenance](#rebalancing-ha-vms-after-node-maintenance) describes. The third is `pve-ops ha drain <node> --apply`, which stops through PVE HA each VM that can't leave a node in maintenance, and the fourth is `pve-ops ha undrain <node> --apply`, which starts those VMs again and then runs the rebalance, as [Draining and undraining a node with `pve-ops ha drain`](#draining-and-undraining-a-node-with-pve-ops-ha-drain) describes. The doctor itself runs the rebalance as a dry run to judge the spread, and that dry run writes nothing, and both new commands are dry runs until we add `--apply`. On the Director VM we run it with the full path, because `pve-ops` is not on `PATH`. The `--config` flag is optional there, because the command looks for the configuration in `--config`, then in `$PVE_CPI_CONFIG`, and then at `/var/vcap/jobs/pve_cpi/config/cpi.json`.
+The `pve-ops ha` subcommand is a read-only doctor. It never writes to PVE, and it runs in every mode, `off` included. There are four exceptions. The first is `--widen-replicas --apply`, which runs the CPI's own replica widening pass instead of the doctor, as [Widening replica pins after a deploy](#widening-replica-pins-after-a-deploy) describes. The second is `pve-ops ha rebalance --apply`, which live-migrates this Director's HA VMs back into a good spread, as [Rebalancing HA VMs after node maintenance](#rebalancing-ha-vms-after-node-maintenance) describes. The third is `pve-ops ha drain <node> --apply`, which stops each VM that can't leave a node in maintenance, through PVE HA. The fourth is `pve-ops ha undrain <node> --apply`, which starts those VMs again and then runs the rebalance, as [Draining and undraining a node with `pve-ops ha drain`](#draining-and-undraining-a-node-with-pve-ops-ha-drain) describes. The doctor itself runs the rebalance as a dry run to judge the spread, and that dry run writes nothing. Both new commands are also dry runs until we add `--apply`. On the Director VM we run the subcommand with the full path, because `pve-ops` is not on `PATH`. The `--config` flag is optional there, because the command looks for the configuration in `--config`, then in `$PVE_CPI_CONFIG`, and then at `/var/vcap/jobs/pve_cpi/config/cpi.json`.
 
 ```bash
 /var/vcap/packages/pve_cpi/bin/pve-ops ha
@@ -918,9 +918,9 @@ The VM has no HA protection between those two commands, and a hand-made resource
 
 A rolling maintenance sticks when a VM can't leave its node, because PVE waits on the node's HA agent until the last service has gone. The `pve-ops ha drain <node>` and `pve-ops ha undrain <node>` commands take that wait away. The drain lets PVE HA move every VM that can leave, and it stops each VM that can't through PVE HA, so the node empties of running HA VMs and the maintenance finishes. The undrain starts those VMs again and then runs the same rebalance that `pve-ops ha rebalance --apply` runs. Both commands act only on the VMs of the Director we name, and we run them as `vcap` on the Director, for the same reason the rebalance needs that user.
 
-PVE offers no API call that turns HA node maintenance on or off, and the CPI reaches PVE only through the API. So the maintenance itself stays our step. We run `ha-manager crm-command node-maintenance enable <node>` on a PVE node before the drain, and `ha-manager crm-command node-maintenance disable <node>` on a PVE node after the work. The commands check for it. A `drain --apply` refuses with exit 3 until the HA manager reports the node in maintenance, and an `undrain --apply` refuses with exit 3 while the node is still in maintenance or carries one of the operator maintenance tags in `pve.placement.maintenance_node_tags`. Each refusal prints the command we need. A tag alone doesn't satisfy the drain, because PVE moves nothing for a tag.
+PVE offers no API call that turns HA node maintenance on or off, and the CPI reaches PVE only through the API. So the maintenance itself stays our step. We run `ha-manager crm-command node-maintenance enable <node>` on a PVE node before the drain, and `ha-manager crm-command node-maintenance disable <node>` on a PVE node after the work. The commands check that the maintenance is on. A `drain --apply` refuses with exit 3 until the HA manager reports the node in maintenance, and an `undrain --apply` refuses with exit 3 while the node is still in maintenance or carries one of the operator maintenance tags in `pve.placement.maintenance_node_tags`. Each refusal prints the command we need. A tag alone doesn't satisfy the drain, because PVE moves nothing for a tag.
 
-We always read the plan first, and the dry run works before maintenance starts. It reads the cluster, takes no lock, and writes nothing.
+We always read the plan first, and the dry run works before maintenance starts. The dry run reads the cluster, takes no lock, and writes nothing.
 
 ```bash
 sudo -u vcap /var/vcap/packages/pve_cpi/bin/pve-ops ha drain <node> --director-uuid <uuid>
@@ -934,8 +934,12 @@ pve-ops 0.12.0 with the configuration /var/vcap/jobs/pve_cpi/config/cpi.json
 Gates
   pve.ha.mode is auto, and the HA profile lets the CPI write HA state
   quorum is held
-  for --apply, the HA manager doesn't report node pve2 in maintenance; run `ha-manager crm-command node-maintenance enable pve2` on a PVE node first
   node pve2 is online, and the other 2 nodes are online, out of maintenance, and able to take work
+  for --apply, the HA manager doesn't report node pve2 in maintenance; run `ha-manager crm-command node-maintenance enable pve2` on a PVE node first
+  the HA manager's master is pve1, and its status is fresh
+  the allocation journal holds no open record
+  no CPI task or lock is active
+  no other rebalance holds the run lock
 VMs on pve2
   VM 1042 (vm-8a1f2c3d), leaves for pve1 or pve3
   VM 1050 (vm-c07a5e19), can't leave, because its strict node-affinity rule bosh-na-1050 names no other node that can take it: stop planned
@@ -944,7 +948,7 @@ VMs on pve2
 Turn resurrection off for `cf` until `pve-ops ha undrain pve2 --apply` finishes, for example with `bosh update-resurrection off`, because the Health Monitor sees the agents of the stopped VMs go quiet and would recreate them.
 ```
 
-The drain decides which VMs can't leave from PVE's own rules and the cluster's facts. It starts with the nodes that are online, out of maintenance, and placeable, minus the drained node, and it narrows that set with each strict node-affinity rule that names the VM, the node-local storage the VM uses and the targets of its replication jobs, every negative resource-affinity rule, and every positive resource-affinity group the VM belongs to. A VM whose set ends empty can't leave. A VM with no HA resource is listed with a warning, because maintenance never moves it and the drain never stops it, so it goes down with the node when we reboot. We deal with such a VM by hand, as the sections below describe. A VM whose HA resource already requests a state other than `started` stays where it is, and the output says why.
+The drain decides which VMs can't leave from PVE's own rules and the cluster's facts. It starts with the nodes that are online, out of maintenance, and placeable, without the drained node, and it narrows that set with each strict node-affinity rule that names the VM, the node-local storage the VM uses and the targets of its replication jobs, every negative resource-affinity rule, and every positive resource-affinity group the VM belongs to. A VM whose set ends empty can't leave. A VM with no HA resource is listed with a warning, because maintenance never moves it and the drain never stops it, so it goes down with the node when we reboot. We deal with such a VM by hand, as the sections below describe. A VM whose HA resource already requests a state other than `started` stays where it is, and the output says why.
 
 With `--apply`, the drain takes the run lock `bosh-lock-ha-rebalance`, so a drain, an undrain, and a rebalance never run at once on one cluster. It then works through these steps.
 
@@ -1030,7 +1034,7 @@ A rerun is how we resume. The token goes on in the same write that stops the VM 
 
 ### Node maintenance with `hold` VMs
 
-PVE HA cannot evacuate a `hold` VM, because its strict pin forbids every other node. The maintenance request on the node therefore never completes while the VM runs. The drain described above stops such a VM for us, and we use the manual steps below only when the drain is not available, for example on a cluster where we can't run it. Before we put a node into maintenance, we stop its `hold` VMs with the command below, and we start them again afterward. A soft `bosh stop` stops only the jobs and leaves the guest running, and `bosh stop --hard` deletes the VM, so a recreated VM with a node-local disk would have to land back on the node that holds the disk. The `ha-manager` command avoids both problems.
+PVE HA cannot evacuate a `hold` VM, because its strict pin forbids every other node. The maintenance request on the node therefore never completes while the VM runs. The drain described above stops such a VM for us, and we use the manual steps below only when we can't run the drain. Before we put a node into maintenance, we stop its `hold` VMs with the command below, and we start them again afterward. A soft `bosh stop` stops only the jobs and leaves the guest running, and `bosh stop --hard` deletes the VM, so a recreated VM with a node-local disk would have to land back on the node that holds the disk. The `ha-manager` command avoids both problems.
 
 ```bash
 ha-manager set vm:<vmid> --state stopped
