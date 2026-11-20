@@ -16,18 +16,19 @@ import (
 
 // maintenanceTargetCluster wraps the shared cluster mock so a test can script
 // the node tags in cluster status and the lrm text of status/current, and make
-// a later status read fail.
+// a later status read, or the reads failOn names by their order, fail.
 type maintenanceTargetCluster struct {
 	*vmMockCluster
 	tags      map[string]string
 	lrmText   map[string]string
 	failAfter int32
+	failOn    map[int32]bool
 	reads     atomic.Int32
 }
 
 func (c *maintenanceTargetCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
 	n := c.reads.Add(1)
-	if c.failAfter > 0 && n > c.failAfter {
+	if c.failAfter > 0 && n > c.failAfter || c.failOn[n] {
 		return nil, errors.New("cluster status unavailable")
 	}
 	rows := sdkcluster.ListStatusResponse{}
@@ -171,5 +172,83 @@ func TestCreateVM_RefusesATargetNodeThatCannotTakeWork(t *testing.T) {
 	}
 	if created != 0 {
 		t.Fatal("create_vm created a VM on a node that cannot take work")
+	}
+}
+
+// healthReadsFail fails the third and fourth cluster status reads of a
+// scored create. The create reads cluster status once before placement, and
+// the gather reads the node list before node health, so these are the node
+// health read and its retry.
+var healthReadsFail = map[int32]bool{3: true, 4: true}
+
+// createOnScoredNode runs create_vm with no target_node, so the scored
+// placement path picks the node, against c and a config that mutate edits.
+func createOnScoredNode(t *testing.T, c *maintenanceTargetCluster, mutate func(*config.CPIConfig)) (int32, error) {
+	t.Helper()
+	var created atomic.Int32
+	q := &vmMockQEMU{
+		createFn: func(context.Context, string, map[string]any) (string, error) {
+			created.Add(1)
+			return "UPID:pve1:ok", nil
+		},
+	}
+	deps := buildVMDepsPlacement(q, &vmMockNodes{}, nil, emptyListResources, &vmMockAgent{},
+		func(cfg *config.CPIConfig) {
+			cfg.Node = "pve1"
+			if mutate != nil {
+				mutate(cfg)
+			}
+		})
+	c.vmMockCluster = &vmMockCluster{listResourcesFn: emptyListResources}
+	deps.PVE.(*mockPVEClient).clusterSvc = c
+	deps.Config.EnsureNoIPConflicts = placementDisabled
+	args := mkArgs("agent-scored-health", testStemcellCID, map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+	_, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx("scored-health"))
+	return created.Load(), err
+}
+
+// TestCreateVM_ScoredPlacementRefusesWhenNodeHealthStaysUnreadable pins the
+// fail-closed side of scored placement. When the operator names maintenance
+// tags, placement relies on node health to keep new VMs off a node in
+// maintenance, so a health read that fails twice must stop the create with a
+// retriable error and no clone.
+func TestCreateVM_ScoredPlacementRefusesWhenNodeHealthStaysUnreadable(t *testing.T) {
+	t.Parallel()
+	c := &maintenanceTargetCluster{failOn: healthReadsFail}
+	created, err := createOnScoredNode(t, c, func(cfg *config.CPIConfig) {
+		cfg.Placement = &config.PlacementConfig{MaintenanceNodeTags: []string{"maintenance"}}
+	})
+	if err == nil {
+		t.Fatal("create_vm placed a VM although node health was unreadable")
+	}
+	var typed *cpierrors.Error
+	if !errors.As(err, &typed) || !typed.OkToRetry() {
+		t.Fatalf("want a retriable error, got %T %v", err, err)
+	}
+	for _, want := range []string{"cannot tell which nodes are in maintenance", "failed twice", "retry once the cluster answers"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not contain %q", err, want)
+		}
+	}
+	if created != 0 {
+		t.Fatal("create_vm created a VM although node health was unreadable")
+	}
+}
+
+// TestCreateVM_ScoredPlacementFailsOpenWhenNodeHealthIsNotRequired pins the
+// fail-open side. With HA writes off and no maintenance tags named, a health
+// read that fails twice leaves placement treating every node as healthy, as
+// it did before, and the create goes ahead.
+func TestCreateVM_ScoredPlacementFailsOpenWhenNodeHealthIsNotRequired(t *testing.T) {
+	t.Parallel()
+	c := &maintenanceTargetCluster{failOn: healthReadsFail}
+	created, err := createOnScoredNode(t, c, nil)
+	if err != nil {
+		t.Fatalf("create_vm failed although node health is not required: %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("create_vm created %d VMs, want 1", created)
 	}
 }

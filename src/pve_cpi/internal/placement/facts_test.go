@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"sync/atomic"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -26,9 +27,15 @@ type stubCluster struct {
 	haStatusCalled bool
 	managerFn      func() (*cluster.ListHaStatusManagerStatusResponse, error)
 	managerCalled  bool
+	// statusFails lists the 1-based status reads that fail.
+	statusFails map[int32]bool
+	statusReads atomic.Int32
 }
 
 func (s *stubCluster) ListStatus(_ context.Context) (*cluster.ListStatusResponse, error) {
+	if s.statusFails[s.statusReads.Add(1)] {
+		return nil, errors.New("cluster status timed out")
+	}
 	return s.statusResp, s.statusErr
 }
 
@@ -945,5 +952,69 @@ func TestGatherNodeFacts_RealMembershipAndNodeResources(t *testing.T) {
 	facts, err = placement.GatherNodeFacts(t.Context(), cl, &stubNodes{}, nopLogger(), placement.GatherOptions{})
 	if err != nil || facts[0].MaxCPU != 8 || facts[0].FreeMemBytes != 6*gib {
 		t.Fatalf("resource observation was not authoritative: %+v %v", facts, err)
+	}
+}
+
+// taggedMaintenanceCluster returns a one-node cluster whose node carries the
+// maintenance tag, with the status reads in fails failing. The first read is
+// the gather's own, and the ones after it are the node health reads.
+func taggedMaintenanceCluster(fails ...int32) *stubCluster {
+	statusRaw, _ := json.Marshal(map[string]any{
+		"type": "node", "name": "pve1", "maxcpu": 8, "maxmem": 8 * gib, "mem": 4 * gib, "online": 1, "cpu": 0.0,
+		"tags": "maintenance",
+	})
+	resp := cluster.ListStatusResponse{json.RawMessage(statusRaw)}
+	cl := &stubCluster{statusResp: &resp, resResp: &cluster.ListResourcesResponse{}, statusFails: map[int32]bool{}}
+	for _, n := range fails {
+		cl.statusFails[n] = true
+	}
+	return cl
+}
+
+// TestGatherNodeFacts_RetriesAFailedHealthReadOnce pins that one failed node
+// health read is read again, so a single timeout does not hide a node in
+// maintenance from placement.
+func TestGatherNodeFacts_RetriesAFailedHealthReadOnce(t *testing.T) {
+	t.Parallel()
+	for _, require := range []bool{false, true} {
+		cl := taggedMaintenanceCluster(2)
+		facts, err := placement.GatherNodeFacts(context.Background(), cl, &stubNodes{}, nopLogger(),
+			placement.GatherOptions{MaintenanceNodeTags: []string{"maintenance"}, RequireNodeHealth: require})
+		if err != nil {
+			t.Fatalf("require %v: unexpected error: %v", require, err)
+		}
+		if len(facts) != 1 || !facts[0].InMaintenance {
+			t.Fatalf("require %v: facts = %+v; want pve1 in maintenance from the second read", require, facts)
+		}
+	}
+}
+
+// TestGatherNodeFacts_FailsWhenTheHealthReadFailsTwiceAndHealthIsRequired
+// pins that a gather that needs node health, because the CPI writes HA state
+// or the operator tags nodes for maintenance, fails with
+// ErrNodeHealthUnavailable when the read fails twice, instead of scoring a
+// node in maintenance like any other.
+func TestGatherNodeFacts_FailsWhenTheHealthReadFailsTwiceAndHealthIsRequired(t *testing.T) {
+	t.Parallel()
+	cl := taggedMaintenanceCluster(2, 3)
+	_, err := placement.GatherNodeFacts(context.Background(), cl, &stubNodes{}, nopLogger(),
+		placement.GatherOptions{MaintenanceNodeTags: []string{"maintenance"}, RequireNodeHealth: true})
+	if !errors.Is(err, placement.ErrNodeHealthUnavailable) {
+		t.Fatalf("err = %v; want ErrNodeHealthUnavailable", err)
+	}
+}
+
+// TestGatherNodeFacts_FailsOpenWhenHealthIsNotRequired pins that a gather
+// that does not need node health still fails open after two failed reads.
+func TestGatherNodeFacts_FailsOpenWhenHealthIsNotRequired(t *testing.T) {
+	t.Parallel()
+	cl := taggedMaintenanceCluster(2, 3)
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, &stubNodes{}, nopLogger(),
+		placement.GatherOptions{MaintenanceNodeTags: []string{"maintenance"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(facts) != 1 || facts[0].InMaintenance {
+		t.Fatalf("facts = %+v; want pve1 scored as a normal node", facts)
 	}
 }

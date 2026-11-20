@@ -3,6 +3,8 @@ package placement
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
 	"strings"
 
@@ -105,7 +107,19 @@ type GatherOptions struct {
 	// regardless of HA status. Empty list disables tag-based detection.
 	// The tags field on cluster status items is checked; not per-QEMU resource tags.
 	MaintenanceNodeTags []string
+
+	// RequireNodeHealth makes a node health read that fails twice fail the
+	// gather with ErrNodeHealthUnavailable. Without it, the gather fails open
+	// and scores every node with no maintenance filter. A caller sets it when
+	// a node in maintenance matters, because the CPI writes HA state or the
+	// operator tags nodes for maintenance.
+	RequireNodeHealth bool
 }
+
+// ErrNodeHealthUnavailable is the error GatherNodeFacts wraps when
+// GatherOptions.RequireNodeHealth is set and the node health read failed on
+// its retry too.
+var ErrNodeHealthUnavailable = errors.New("node health unavailable")
 
 // GatherNodeFacts assembles NodeFacts for every node reported by the PVE cluster.
 // It observes the following APIs:
@@ -129,10 +143,14 @@ type GatherOptions struct {
 // TotalStorageBytes remain 0, which causes the Storage scoring axis to be skipped
 // for that node.
 //
-// A NodeHealth failure is non-fatal: all nodes are left with
-// InMaintenance=false (fail-open) so a transient API outage never blocks VM
-// creation. NodeHealth itself degrades past an unreadable HA source, so only
-// a failed cluster status read reaches this path.
+// A NodeHealth failure is read once more. When the retry fails too and
+// opts.RequireNodeHealth is set, the gather fails with
+// ErrNodeHealthUnavailable, so placement never scores a node in maintenance
+// as a normal one. Otherwise it is non-fatal: all nodes are left with
+// InMaintenance=false (fail-open), so a transient API outage does not block
+// VM creation where nothing marks nodes for maintenance. NodeHealth itself
+// degrades past an unreadable HA source, so only a failed cluster status read
+// reaches this path.
 //
 // A ListStatus error is fatal — it is the primary data source.
 func GatherNodeFacts(
@@ -164,7 +182,10 @@ func GatherNodeFacts(
 	}
 
 	// Phase 1b: node health (non-fatal).
-	health := gatherNodeHealth(ctx, clusterClient, nodesClient, logger, opts.MaintenanceNodeTags)
+	health, err := gatherNodeHealth(ctx, clusterClient, nodesClient, logger, opts)
+	if err != nil {
+		return nil, err
+	}
 
 	// Phase 2: node compute counters, guest count, group tags, and committed
 	// memory from ListResources (non-fatal).
@@ -227,29 +248,41 @@ func GatherNodeFacts(
 	return facts, nil
 }
 
-// gatherNodeHealth asks pve.NodeHealth for the merged health of every node. A
-// failure is non-fatal: the returned report is nil (fail-open) and a warning is
-// logged. This mirrors the storage-facts fail-open pattern.
+// gatherNodeHealth asks pve.NodeHealth for the merged health of every node,
+// and asks once more when the first read fails. When the second read fails
+// too, it returns ErrNodeHealthUnavailable if opts.RequireNodeHealth is set,
+// and otherwise a nil report (fail-open) with a warning, the way the storage
+// facts fail open.
 func gatherNodeHealth(
 	ctx context.Context,
 	clusterClient ClusterClient,
 	nodesClient NodesClient,
 	logger *log.Logger,
-	maintenanceTags []string,
-) *pve.NodeHealthReport {
-	report, err := pve.NodeHealth(ctx, clusterClient, nodesClient, pve.NodeHealthOptions{
-		MaintenanceTags: maintenanceTags,
-	})
+	opts GatherOptions,
+) (*pve.NodeHealthReport, error) {
+	read := func() (*pve.NodeHealthReport, error) {
+		return pve.NodeHealth(ctx, clusterClient, nodesClient, pve.NodeHealthOptions{
+			MaintenanceTags: opts.MaintenanceNodeTags,
+		})
+	}
+	report, err := read()
+	if err != nil && ctx.Err() == nil {
+		logger.Info("placement: node health read failed, reading it once more", log.Err(err))
+		report, err = read()
+	}
 	if err != nil {
+		if opts.RequireNodeHealth {
+			return nil, fmt.Errorf("%w: %w", ErrNodeHealthUnavailable, err)
+		}
 		logger.Warn("placement: node health unavailable — maintenance detection disabled (fail-open)",
 			log.Err(err))
-		return nil
+		return nil, nil
 	}
 	if report.HA != pve.HAViewManagerStatus {
 		logger.Debug("placement: node health did not use a fresh CRM view",
 			log.String("view", string(report.HA)), log.String("reason", report.HAReason))
 	}
-	return report
+	return report, nil
 }
 
 // gatherResourceFacts reads node compute counters and tallies QEMU guest

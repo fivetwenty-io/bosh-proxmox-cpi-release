@@ -36,6 +36,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Changed
 
+- Scored placement now reads node health a second time when the first read of `/cluster/status` fails. When the second read fails too, and the CPI writes HA state (`pve.ha.mode` is `auto` or `managed`) or `pve.placement.maintenance_node_tags` names at least one tag, `create_vm` stops with a retriable error and creates nothing, because it cannot tell which nodes are in maintenance. Before, placement warned and treated every node as healthy, so a VM could land on a node in maintenance and join HA rules there. With HA writes off and no tags named, placement still warns and carries on as before.
+
 - With `pve.ha.anti_affinity_overflow: skip`, a plan now logs one warning that counts the members it leaves out of the group's rules, names the lowest instance index among them, and lists them, where it logged one warning for each member before. A large group no longer floods the log on every create and delete.
 
 - `create_vm` now refuses a `cloud_properties.target_node` that is in maintenance, with a retriable error that names the node and says to retry once it leaves maintenance. Before, a pinned node was used without any maintenance check, so a VM could land on a node that was draining. The CPI judges the node the way placement does, counting both HA maintenance and the tags in `placement.maintenance_node_tags`, in every `pve.ha.mode`. It never places the VM on another node instead. When the node health cannot be read, the call also fails with a retriable error, because a pinned node has no alternative. The local-disk pin and the offline check behave as before.

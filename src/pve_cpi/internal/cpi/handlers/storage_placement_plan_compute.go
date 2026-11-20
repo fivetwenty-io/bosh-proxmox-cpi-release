@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"math"
 	"math/rand"
 	"slices"
@@ -52,7 +53,12 @@ func ObserveStoragePlanCompute(ctx context.Context, deps Deps, parsed *createVMP
 	group := antiAffinityScorerGroup(deps, parsed.env)
 	facts, err := placement.GatherNodeFacts(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), deps.Log(ctx), placement.GatherOptions{
 		StorageName: "", GroupTag: group.tag, LegacyGroupTags: group.legacy, MaintenanceNodeTags: cfg.MaintenanceNodeTagsValue(),
+		RequireNodeHealth: cfg.NodeHealthRequired(),
 	})
+	if errors.Is(err, placement.ErrNodeHealthUnavailable) {
+		return nil, planError(StoragePlanObservation, "placement cannot tell which nodes are in maintenance, "+
+			"because the node health read failed twice (%v); retry once the cluster answers", err)
+	}
 	if err != nil {
 		return nil, planError(StoragePlanObservation, "compute facts: %v", err)
 	}

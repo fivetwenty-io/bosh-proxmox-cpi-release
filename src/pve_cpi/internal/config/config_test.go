@@ -4144,6 +4144,31 @@ func TestMaintenanceNodeTagsValue_Custom(t *testing.T) {
 	}
 }
 
+func TestNodeHealthRequired(t *testing.T) {
+	t.Parallel()
+	auto, managed, off := config.HAChoice("auto"), config.HAChoice("managed"), config.HAChoice("off")
+	cases := []struct {
+		name string
+		cfg  *config.CPIConfig
+		want bool
+	}{
+		{"defaults", &config.CPIConfig{}, false},
+		{"ha off", &config.CPIConfig{HA: &config.HAConfig{Mode: &off}}, false},
+		{"ha auto", &config.CPIConfig{HA: &config.HAConfig{Mode: &auto}}, true},
+		{"ha managed", &config.CPIConfig{HA: &config.HAConfig{Mode: &managed}}, true},
+		{"tags set", &config.CPIConfig{Placement: &config.PlacementConfig{MaintenanceNodeTags: []string{"drain"}}}, true},
+		{"tags empty", &config.CPIConfig{Placement: &config.PlacementConfig{MaintenanceNodeTags: []string{}}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tc.cfg.NodeHealthRequired(); got != tc.want {
+				t.Errorf("NodeHealthRequired() = %v; want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // AZFallbackOrderValue / AZShuffleEnabled
 // ---------------------------------------------------------------------------

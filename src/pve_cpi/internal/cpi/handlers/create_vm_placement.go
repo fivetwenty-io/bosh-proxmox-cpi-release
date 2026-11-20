@@ -6,6 +6,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -241,8 +242,13 @@ func resolveTargetNodeWithBridges(
 				GroupTag:            group.tag,
 				LegacyGroupTags:     group.legacy,
 				MaintenanceNodeTags: deps.Config.MaintenanceNodeTagsValue(),
+				RequireNodeHealth:   deps.Config.NodeHealthRequired(),
 			},
 		)
+		if errors.Is(gatherErr, placement.ErrNodeHealthUnavailable) {
+			return "", nil, cpierrors.Retriable("create_vm: placement cannot tell which nodes are in maintenance, "+
+				"because the node health read failed twice (%v); retry once the cluster answers", gatherErr)
+		}
 		if gatherErr != nil {
 			return "", nil, cpierrors.Wrap(pve.WrapError(gatherErr),
 				"create_vm: placement: gather node facts")

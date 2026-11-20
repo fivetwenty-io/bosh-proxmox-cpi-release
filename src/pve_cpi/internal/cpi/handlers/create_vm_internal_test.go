@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -848,9 +849,16 @@ type placementInternalTestCluster struct {
 	nodes []map[string]any
 	// notQuorate makes the cluster row report the cluster not quorate.
 	notQuorate bool
+	// failReads fails the cluster status reads it names by their order,
+	// counting from 1.
+	failReads map[int32]bool
+	reads     atomic.Int32
 }
 
 func (c *placementInternalTestCluster) ListStatus(_ context.Context) (*sdkcluster.ListStatusResponse, error) {
+	if c.failReads[c.reads.Add(1)] {
+		return nil, stderrors.New("cluster status unavailable")
+	}
 	resp := make(sdkcluster.ListStatusResponse, 0, len(c.nodes)+1)
 	if len(c.nodes) >= 2 {
 		// A real PVE cluster always reports a cluster row, quorate unless the

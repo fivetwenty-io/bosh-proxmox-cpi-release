@@ -3034,6 +3034,19 @@ func (c *CPIConfig) MaintenanceNodeTagsValue() []string {
 	return c.Placement.MaintenanceNodeTags
 }
 
+// NodeHealthRequired reports whether scored placement must refuse to place a
+// VM when it cannot read node health. It is true when the CPI writes HA state,
+// because a VM placed on a node in maintenance would join HA rules there, and
+// when the operator names maintenance tags, because the operator then relies on
+// those tags to keep new VMs off a node. With neither, placement keeps its
+// fail-open behavior and warns that it treats every node as healthy.
+func (c *CPIConfig) NodeHealthRequired() bool {
+	if c.HAWritesEnabled() {
+		return true
+	}
+	return c.Placement != nil && len(c.Placement.MaintenanceNodeTags) > 0
+}
+
 // AZFallbackOrderValue returns the operator-configured AZ fallback chain.
 // Returns nil when Placement is nil or the field is empty.
 func (c *CPIConfig) AZFallbackOrderValue() []string {
