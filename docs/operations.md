@@ -732,7 +732,13 @@ Each finding is either a problem or advice. The command exits with 0 when the re
   `observe_only`, `node_down`, `entry_clock_unreadable`, `quorum_fragile`, `qdevice_advice`, `advice`, and `crs_mode`.
 
 - Rules and resources
-  `rule_problem`, `rule_unmarked`, `pin_missing`, `soft_pin_resource_affinity`, `anti_affinity_skipped`, `anti_affinity_split`, `anti_affinity_short`, `anti_affinity_ambiguous`, `resource_ignored`, `managed_without_resource`, `failback_on_replica`, `failback_drift`, `rebalance_pending`, and `spread_skewed`.
+  `rule_problem`, `rule_unmarked`, `pin_missing`, `soft_pin_resource_affinity`, `anti_affinity_skipped`, `anti_affinity_split`, `anti_affinity_short`, `anti_affinity_ambiguous`, `aa_rule_full`, `aa_layout_drift`, `aa_pattern_trimmed`, `aa_pattern_blocks_drain`, `resource_ignored`, `managed_without_resource`, `failback_on_replica`, `failback_drift`, `rebalance_pending`, and `spread_skewed`.
+
+  The four `aa_` kinds apply to groups whose rules or HA resources carry the CPI's group marker.
+
+  The `aa_rule_full` problem names a rule that holds as many members as its domain has nodes, so a drain of one node leaves a member with no free node. It is advice instead when the group's pattern sets `drain_safe: false`. Its text names `pve-ops ha --fix-anti-affinity --apply`. The `aa_layout_drift` advice says that the group's rules differ from the layout the CPI plans, and its detail lists each write the plan would make, such as `update bosh-aa-<hash12> with vm:100,vm:101,vm:102`. It is a problem when the CPI could not plan the group at all. The `aa_pattern_trimmed` advice says that the pattern asks for rules that drain safety leaves out. The `aa_pattern_blocks_drain` advice says that the pattern sets `drain_safe: false`, so a drain of one node can leave a member with no node to move to. After an upgrade, a rule that an older release filled to the number of nodes shows as `aa_rule_full` until the group's next `set_vm_metadata` rewrites it or we run the fix command, as [Fixing an anti-affinity layout](#fixing-an-anti-affinity-layout) shows.
+
+  A group from an older CPI, whose rules carry no group marker, still gets `anti_affinity_skipped`, `anti_affinity_split`, and `anti_affinity_short`, now judged against the cap of one fewer member than the domain has nodes. The `anti_affinity_short` text says that the member is missing until `set_vm_metadata` or `pve-ops ha --fix-anti-affinity --apply` adds it.
 
   The `failback_on_replica` problem names a `replicate` VM whose HA resource has `failback` on, because PVE would move such a VM back to its old node after a failover and run the reversed replication job, whose first run destroys the writes that existed only on that node. The `failback_drift` advice names any other resource of this Director whose `failback` differs from the value the CPI writes for it, which is on for a VM whose every volume sits on shared storage and off otherwise or when `pve.ha.failback` is `false`. The next `set_vm_metadata` or `reboot_vm` on the VM sets the flag, and so does `ha-manager set vm:<vmid> --failback 0` or `--failback 1`. For a VM that only one node can take, such as one whose strict pin names one node, one with a PCI passthrough device, or one with a host CPU type that one node alone runs, the CPI writes `failback` off, so the doctor reports such a VM when its flag reads on. The doctor skips a resource that the narrowing barrier holds, a resource whose fresh `bosh-failback-hold` token says an attach is moving the VM, and a VM whose config, storages, rules, or replication jobs it couldn't read. It also skips a VM whose HA decision fails or refuses HA for a reason that may pass, and parkers, which stay stopped and which no call ever reaches. A pin that records a change to the VM's replicated volumes counts as the `replicate` policy, as it does in the CPI. The doctor also skips a resource that carries a `bosh-rebalance-to` mark, because a rebalance holds its `failback` off on purpose.
 
@@ -788,6 +794,33 @@ Replica pin widening for Director 6c8e1d2a-4b3f-4e5a-9c7d-0f1e2d3c4b5a (a dry ru
 ```
 
 A dry run reads no journal record and takes no lock, so a VM it lists as `would widen` can still be skipped by the real run. While an `attach_disk` changes a VM's volumes, the pin records the latest time the attach can land, which can lie ahead of the clock, and the VM is skipped because `an attach is changing the VM's volumes and may land as late as` that time. We then run the same command with `--apply`, and the pass prints `widened` with the job and the time of the sync that covers the VM. The pass now tries each VM's journal record once and makes the same check that `reboot_vm` and `set_vm_metadata` make, which turns `failback` off on the VM's HA resource right before the pin names the partner. A VM that the pass skips keeps its `failback` setting. A VM whose failback write fails is reported as `failed` and keeps the pin on its own node. Before it writes, it tries a short claim of its own on the VM's VMID once and, inside it, the HA rules lock once, so it waits on no lock, and then it widens each pin that a verified sync covers. A VM whose record, rules lock, or VMID another call holds is skipped with the reason, and so is a VM whose volumes or pin changed while the pass ran, a VM that is migrating or recovering, and a VM whose HA resource is ignored. Unlike the sweep, the command applies no caps and no time limit of its own, and an interrupt or SIGTERM stops it and releases the locks it holds. We run the command again later for a skipped VM, or we let the next call that takes the HA rules lock widen it. The command exits with 0 when no VM failed, and with 1 when a VM failed or the pass stopped early, for example because the token lacks the `Pool.Allocate` and `Pool.Audit` privileges that the VMID claims need. With `--json` it prints the Director's UUID, whether it applied, the results with an outcome and a reason for each VM, and the count of deferred VMs. For a Director with several `cpi_config` entries, we pass `--request` with a context that names the entry and the Director's UUID, once for each entry, because the pass reads one cluster.
+
+### Fixing an anti-affinity layout
+
+A member joins its group's anti-affinity rules at `set_vm_metadata`, and a delete leaves room in a rule that nothing fills until a member's next `set_vm_metadata`. After an upgrade, a rule that an older release filled to the number of nodes stays that way until the group's next `set_vm_metadata`. When we want the rules right now, we run `pve-ops ha --fix-anti-affinity`, which plans each anti-affinity group of one Director again, the way the CPI plans it, and reports each group. It needs the Director's UUID, from `--director-uuid` or from `--request`, and `bosh env --json` prints it in the `uuid` column. The usage line is as follows.
+
+```text
+pve-ops ha --fix-anti-affinity [--group RULE] [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]
+```
+
+The first run is a dry run, and it writes nothing.
+
+```bash
+sudo -u vcap /var/vcap/packages/pve_cpi/bin/pve-ops ha --fix-anti-affinity --director-uuid <uuid>
+```
+
+It prints each group with its member count, its pattern, and each write the plan would make.
+
+```text
+Anti-affinity layout for Director 11111111-2222-3333-4444-555555555555 (a dry run, so nothing was written; add --apply to write)
+  Group web of deployment cf (bosh-aa-0123456789ab), 4 members, pattern block: the rules differ from the planned layout, and the fix would write these changes
+    update bosh-aa-0123456789ab with vm:100,vm:101,vm:102
+0 in layout, 1 would be fixed, 0 fixed, 0 failed, and 0 not planned
+```
+
+Each group ends in one of five outcomes. `in_layout` means the rules already match the plan. `would_fix` means a dry run found a difference. `fixed` means the run wrote the group's rules. `failed` means a write failed. `not_planned` means the CPI could not plan the group. When the plan is right, we run the same command with `--apply`, and it writes each group whose rules differ, under the HA rules lock. The option `--group bosh-aa-<hash12>` limits the run to one group.
+
+The command refuses to run when `pve.ha.mode` or `pve.ha.anti_affinity` is off, or when scheduler-soft anti-affinity is disabled. We can't combine it with `--widen-replicas` or `--cpi-config`, and `--group` needs `--fix-anti-affinity`. It exits with 1 when a group failed or could not be planned. With `--json` it prints the results as JSON. For a Director with several `cpi_config` entries, we pass `--request` with a context that names the entry and the Director's UUID, once for each entry, because the pass reads one cluster.
 
 ### When `delete_vm` defers
 
@@ -901,7 +934,7 @@ The `hold` procedure above is one case of a wider rule. PVE waits forever on a n
 
 - **A member of a full anti-affinity group**
 
-  Every other node that could take the VM already holds another member of its group, so the negative rule leaves the VM nowhere to go.
+  Every other node that could take the VM already holds another member of its group, so the negative rule leaves the VM nowhere to go. A rule that an older release filled to the number of nodes does this, and a rule written by this release holds one fewer member than the nodes, so it does not.
 
 - **A VM with a strict single-node pin**
 
@@ -910,6 +943,8 @@ The `hold` procedure above is one case of a wider rule. PVE waits forever on a n
 Before we enable maintenance, we run `pve-ops ha` and read its findings. A `hold` VM shows up as `hold_blocks_maintenance`. Any other started VM that cannot leave shows up as `maintenance_stranded`, with a reason that says either that its pin names no other usable node or that every other node that could take it holds a member of its group. The doctor names each VM once. Both findings only fire once the node is in maintenance, and they keep firing for as long as the drain is stuck on the VM, so we read them again right after we enable maintenance, while the drain is still running. They clear once the VM stops or leaves. The group and pin findings do not list the VMs that would block a drain, so before we enable it we check each hold VM, each `replicate` VM, and each anti-affinity group against the node count ourselves. We then clear every blocker before we start the upgrade or the reboot.
 
 For a member of a full anti-affinity group, we pick one of these.
+
+- Run `pve-ops ha --fix-anti-affinity`, and add `--apply` once the plan looks right, so that the group's rules hold one fewer member than the nodes they cover, as [Fixing an anti-affinity layout](#fixing-an-anti-affinity-layout) shows. A rule that an older release filled to the number of nodes shows as `aa_rule_full`.
 
 - Run `bosh recreate` on the member so that it lands on another node, or scale the group below the node count.
 

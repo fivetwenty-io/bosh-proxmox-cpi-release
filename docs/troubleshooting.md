@@ -2984,6 +2984,42 @@ The node was down, or didn't answer, while `create_vm` wrote the pin. `create_vm
 
 We let the next `set_vm_metadata` or `reboot_vm` on the VM widen the pin, and any deploy that touches the instance sends one. That call reads each online node the pin leaves out and gives it back to the pin when the node lists the VM's bridges and shows the VM's storage as active. The call logs `widened the VM's strict pin to the nodes that now reach its storage and network` with the old and new nodes. When a node's storage or bridge keeps it out of the pin, the call's debug log names the node and the storage or bridge it was missing, and a warning reports a check that couldn't finish. The CPI never widens a pin that another Director owns, a pin that isn't strict, the pin of a `replicate` VM, or a pin whose recorded storages no longer match the VM's disks. [HA and Resurrection](ha-and-resurrection.md#placement-under-ha) explains the rule.
 
+## `pve-ops ha` reports `aa_rule_full` or `aa_layout_drift` after an upgrade
+
+**Symptom**
+
+After an upgrade, `pve-ops ha` reports `aa_rule_full` as a problem or `aa_layout_drift` as advice for an anti-affinity group. The `aa_layout_drift` detail lists writes such as `update bosh-aa-<hash12> with vm:100,vm:101,vm:102`.
+
+**Cause**
+
+Older releases filled an anti-affinity rule up to the number of nodes its members may run on. This release holds a rule to one fewer member, so that every member keeps a free node while one node drains. A rule that an older release wrote stays as it is until the group is planned again, and until then the doctor sees a rule that is full and a layout that differs from the plan.
+
+**Diagnosis**
+
+We run `pve-ops ha --fix-anti-affinity --director-uuid <uuid>`. It is a dry run, and it lists each group with the writes the plan would make. [Fixing an anti-affinity layout](operations.md#fixing-an-anti-affinity-layout) shows the output.
+
+**Fix**
+
+The group's next `set_vm_metadata` rewrites it to the new layout, and any deploy that touches one of its instances sends that call. To rewrite it now, we run `pve-ops ha --fix-anti-affinity --apply`, and we add `--group bosh-aa-<hash12>` to limit the run to one group. When the finding stays after that, the pattern may ask for a rule that holds as many members as its domain has nodes. We then either lower the pattern's demand or accept the advice with `drain_safe: false`, as [Anti-affinity patterns](ha-and-resurrection.md#anti-affinity-patterns) explains.
+
+## A VM could not join its anti-affinity group's rules
+
+**Symptom**
+
+The log of a `set_vm_metadata` call holds a warning that the VM could not join its anti-affinity group's rules. The call itself succeeds. Later, `pve-ops ha` shows the VM missing from the group's rules, for example as `anti_affinity_short` or `aa_layout_drift`.
+
+**Cause**
+
+A member joins its group's rules at `set_vm_metadata`, where the Director names its instance index. The rule write can fail for a reason such as a rules lock that stayed busy, a write that a sibling's write kept overtaking, a pin conflict, or a PVE error. The CPI logs the failure as a warning and never fails the call, whatever `pve.ha.mode` says, so the deploy goes on without the VM in a rule.
+
+**Diagnosis**
+
+We read the warning for the reason, then run `pve-ops ha --fix-anti-affinity --director-uuid <uuid>` to see what the plan would write.
+
+**Fix**
+
+The next `set_vm_metadata` of any member of the group tries again. To place the VM now, we run `pve-ops ha --fix-anti-affinity --apply`. When it fails again for the same reason, we clear that reason first, such as a strict pin that conflicts with another member's pin, as [HA and Resurrection](ha-and-resurrection.md#what-the-cpi-registers) explains.
+
 ## A VM moves to another node on its own
 
 **Symptom**
