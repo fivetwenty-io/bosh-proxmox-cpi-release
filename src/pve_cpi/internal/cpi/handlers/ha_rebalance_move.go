@@ -150,7 +150,8 @@ func (r *rebalanceRun) preMoveFailure(err error, rec *RebalanceMove) (int, strin
 
 // hold is step 1. It reads the VM's config and HA resource and the pin again,
 // confirms they are the ones the plan was built from, and turns failback off
-// with the mark in one write against the digest of the read.
+// with the mark in one write against the digest of the read. A claim whose
+// window ran out during the reads leaves the VM where it is.
 func (r *rebalanceRun) hold(ctx context.Context, plan *rebalanceVMPlan, m harebalance.Move) error {
 	cfg, res, pin, err := r.io.reread(ctx, m.VMID, m.From)
 	if err != nil {
@@ -161,6 +162,9 @@ func (r *rebalanceRun) hold(ctx context.Context, plan *rebalanceVMPlan, m hareba
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if err := r.claimWindowOpen(ctx, m.VMID); err != nil {
+		return &rebalanceSkip{reason: err.Error() + ", so nothing moved"}
 	}
 	var ok bool
 	err = detached(ctx, func(ctx context.Context) error {

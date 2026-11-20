@@ -188,6 +188,16 @@ func TestRebalanceRun_AMoveThatCannotStartIsRefusedAndTheVMIsExcluded(t *testing
 				}
 			}
 		},
+		"claim window ran short before the hold": func(f *fakeRebalanceIO) {
+			f.claimWindow = map[int]time.Duration{101: 12 * time.Second}
+			f.beforeReread = func(vmid int) {
+				if vmid == 101 {
+					f.mu.Lock()
+					f.clock = f.clock.Add(time.Minute)
+					f.mu.Unlock()
+				}
+			}
+		},
 		"fresh failback hold": func(f *fakeRebalanceIO) {
 			f.beforeReread = func(vmid int) {
 				if vmid == 101 {

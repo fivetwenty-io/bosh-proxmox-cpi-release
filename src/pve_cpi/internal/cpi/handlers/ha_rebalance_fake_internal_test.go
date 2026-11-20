@@ -86,6 +86,10 @@ type fakeRebalanceIO struct {
 	unmarks     []string
 	pinWrites   []string
 
+	// claimWindow gives the claim on a VMID a window that ends this long
+	// after the fake's clock when the claim is taken. A VMID it doesn't name
+	// gets a claim with no window.
+	claimWindow map[int]time.Duration
 	// foreign holds the guests of no VM of this Director, by VMID, with their
 	// node, and foreignState their HA manager state, started unless set.
 	foreign      map[int]string
@@ -335,11 +339,17 @@ func (f *fakeRebalanceIO) withClaim(ctx context.Context, vmid int, fn func(conte
 	f.mu.Lock()
 	err := f.claimErr[vmid]
 	f.log("claim %d", vmid)
+	window, windowed := f.claimWindow[vmid]
+	end := f.clock.Add(window)
 	f.mu.Unlock()
 	if err != nil {
 		return err
 	}
 	defer f.logLocked("unclaim %d", vmid)
+	if windowed {
+		ctx = context.WithValue(ctx, vmidClaimSetKey{},
+			&vmidClaimSet{held: map[int]*vmidClaimEntry{vmid: {windowEnd: end}}})
+	}
 	return fn(ctx)
 }
 
