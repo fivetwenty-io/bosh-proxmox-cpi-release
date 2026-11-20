@@ -343,26 +343,56 @@ func pinWidens(pinNodes, next []string) bool {
 	return true
 }
 
-// writeWidenedPin replaces oldPin with newPin under the HA rules lock. The
-// write happens only when the pin is still exactly oldPin, so a pin another
-// call changed since the read is left to that call. A pin that already reads
-// as newPin, which another call wrote, needs no write.
+// writeWidenedPin replaces oldPin with newPin under the HA rules lock (see
+// writeReplacedPin). A pin that changed since the read, and one that already
+// reads as newPin, end the widening as a skip.
 func writeWidenedPin(
 	ctx context.Context, deps Deps, profile *ha.Profile, d *ha.VMDecision, vmid int, oldPin, newPin *ha.Rule,
 	logger *log.Logger,
 ) error {
+	wrote, err := writeReplacedPin(ctx, deps, profile, d, vmid, oldPin, newPin, logger)
+	switch {
+	case errors.Is(err, errPinChanged):
+		return errPinWidenSkip
+	case err != nil:
+		return err
+	case !wrote:
+		return errPinWidenSkip
+	}
+	return nil
+}
+
+// errPinChanged ends a pin replacement that found the pin in PVE neither the
+// pin it was decided from nor the one it would write. The caller leaves the
+// pin to whichever call changed it.
+var errPinChanged = errors.New("the pin changed since it was read")
+
+// writeReplacedPin replaces oldPin, the pin bosh-na-<vmid> as the caller read
+// it, with newPin under the HA rules lock, and then checks that the VM is
+// still a member of its anti-affinity rule (see verifyAntiAffinityMember). It
+// reports whether it wrote. The write happens only when the pin is still
+// exactly oldPin, so a pin another call changed since the read is left to that
+// call, and errPinChanged is returned. A pin that already reads as newPin,
+// which another call wrote, needs no write, and it reports false with no
+// error. Under a context from withHARulesLockTryOnce the rules lock is tried
+// once.
+func writeReplacedPin(
+	ctx context.Context, deps Deps, profile *ha.Profile, d *ha.VMDecision, vmid int, oldPin, newPin *ha.Rule,
+	logger *log.Logger,
+) (bool, error) {
 	ruleName := naRuleNameFor(vmid)
-	return withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
+	wrote := false
+	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		writer := newHARuleWriterFor(deps, profile, logger, d)
 		res, err := writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			cur := set.Find(ruleName)
 			switch {
 			case cur != nil && ha.SameRule(newPin, cur):
-				// The writer plans again after each write, and the wider pin
+				// The writer plans again after each write, and the new pin
 				// it reads back is the end of the plan.
 				return nil, nil
 			case cur == nil || !ha.SameRule(oldPin, cur):
-				return nil, errPinWidenSkip
+				return nil, errPinChanged
 			}
 			return []ha.RuleOp{{Kind: ha.OpUpdate, Rule: *newPin}}, nil
 		})
@@ -370,8 +400,10 @@ func writeWidenedPin(
 			return err
 		}
 		if len(res.Wrote) == 0 {
-			return errPinWidenSkip
+			return nil
 		}
+		wrote = true
 		return verifyAntiAffinityMember(ctx, deps, ruleName, haResourceSid(vmid), logger)
 	})
+	return wrote, err
 }

@@ -85,7 +85,21 @@ const (
 	// pve.ClusterLockContextMargin gives up at once. The work checks the
 	// window itself before it writes (see heldVMIDClaimWindow).
 	claimForReplicaWiden
+	// claimForRebalance is how pve-ops ha rebalance claims a VM. It takes the
+	// claim the way claimForReplicaWiden does, with the same short lease, and
+	// for the same reason: a claim that a rebalance left behind when its
+	// process died must lapse inside the wait of a VM call that queues behind
+	// it. The rebalance holds the claim for one short step of a move, never
+	// across the migration.
+	claimForRebalance
 )
+
+// shortLeaseClaim reports whether mode takes a claim with the short lease of
+// replicaWidenClaimTTL, refuses to run without a pool service, and runs its
+// work on the caller's context.
+func (mode vmidClaimMode) shortLeaseClaim() bool {
+	return mode == claimForReplicaWiden || mode == claimForRebalance
+}
 
 // The lease of a replica widening claim. The pass takes the claim before the
 // HA rules lock, and holds it around the rules lock's acquire, a config read,
@@ -399,12 +413,12 @@ func runInVMIDClaimWindow(ctx context.Context, vmid int, windowEnd time.Time, fn
 // released when fn returns. A holder that stays live returns an error that
 // carries errVMIDClaimHeld. Under claimForDisposal, a claim PVE refuses for
 // lack of permission runs fn unclaimed on ctx (see proceedUnclaimedAfter).
-// Under claimForSweep and claimForReplicaWiden that refusal is returned, and
-// fn does not run. A nil pool service runs fn without a claim (see
-// vmidClaimSet.acquire), except under claimForReplicaWiden, which returns
-// errVMIDClaimNoPools and does not run fn. Under claimForReplicaWiden the
-// claim has the lease replicaWidenClaimTTL, and fn runs on ctx, so fn must
-// check the claim's window itself before it writes.
+// Under every other mode that refusal is returned, and fn does not run. A nil
+// pool service runs fn without a claim (see vmidClaimSet.acquire), except
+// under claimForReplicaWiden and claimForRebalance, which return
+// errVMIDClaimNoPools and do not run fn. Under those two modes the claim has
+// the lease replicaWidenClaimTTL, and fn runs on ctx, so fn must check the
+// claim's window itself before it writes.
 func withVMIDClaim(
 	ctx context.Context, deps Deps, vmid int, owner string, mode vmidClaimMode, logger *log.Logger,
 	fn func(context.Context) error,
@@ -413,13 +427,13 @@ func withVMIDClaim(
 		return runInVMIDClaimWindow(ctx, vmid, windowEnd, fn)
 	}
 	if deps.PVE == nil || deps.PVE.Pools() == nil {
-		if mode == claimForReplicaWiden {
+		if mode.shortLeaseClaim() {
 			return errVMIDClaimNoPools
 		}
 		return fn(ctx)
 	}
 	ttl, reserve := disposalClaimTTL(ctx), vmidLockTTLMargin
-	if mode == claimForReplicaWiden {
+	if mode.shortLeaseClaim() {
 		ttl, reserve = replicaWidenClaimTTL, replicaWidenClaimReserve
 	}
 	ctx, set := withVMIDClaimSet(ctx)
@@ -430,7 +444,7 @@ func withVMIDClaim(
 		return err
 	}
 	defer set.release(ctx, vmid, logger)
-	if mode == claimForReplicaWiden {
+	if mode.shortLeaseClaim() {
 		return fn(ctx)
 	}
 	windowEnd, _ := heldVMIDClaimWindow(ctx, vmid)
