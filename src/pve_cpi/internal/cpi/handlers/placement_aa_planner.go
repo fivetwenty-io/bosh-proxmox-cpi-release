@@ -73,6 +73,12 @@ type aaPlanner struct {
 	// exclude is the sid of a member that delete_vm is removing, or "". The
 	// plan drops it from the rules and never adds it.
 	exclude string
+	// excludeIndex is exclude's instance index when the caller knows it, or
+	// -1, which reads it from the scan. While the index is known, the plan
+	// holds exclude's place as a reserved place, in the rule whose left=
+	// record names it or else by the index, so no member moves into it and
+	// the recreate of the index takes it back with one write.
+	excludeIndex int
 	// holdOut holds the members of the confinement pins that a repair took
 	// out of the group's writes. A heal, or a create that plans again after
 	// such a repair, keeps such a member where a rule still holds it and adds
@@ -240,7 +246,7 @@ func (p *aaPlanner) layoutInput(set *ha.RuleSet, existing map[string]*ha.Rule) a
 		keys[p.sid] = true
 	}
 	delete(keys, p.exclude)
-	members := make([]aapattern.Member, 0, len(keys))
+	members := make([]aapattern.Member, 0, len(keys)+1)
 	domainKeys := map[string]bool{}
 	var newest aaPatternSource
 	for _, k := range slices.Sorted(maps.Keys(keys)) {
@@ -251,6 +257,10 @@ func (p *aaPlanner) layoutInput(set *ha.RuleSet, existing map[string]*ha.Rule) a
 		members = append(members, m)
 		domainKeys[m.Domain] = true
 		newest.consider(k, p.markerOf(k))
+	}
+	if m, ok := p.reservedPlace(set, existing, rules); ok {
+		members = append(members, m)
+		domainKeys[m.Domain] = true
 	}
 	return aapattern.Input{
 		Base:    p.ident.ruleName(),
@@ -263,6 +273,34 @@ func (p *aaPlanner) layoutInput(set *ha.RuleSet, existing map[string]*ha.Rule) a
 			return p.canJoin(set, existing[rule], rule, ms, key)
 		},
 	}
+}
+
+// reservedPlace returns the reserved place of the member a delete removes,
+// and false when there is none or its index is unknown. A rule whose left=
+// record names the member holds the place in rules, so the plan keeps it
+// where the member was.
+func (p *aaPlanner) reservedPlace(
+	set *ha.RuleSet, existing map[string]*ha.Rule, rules map[string][]string,
+) (aapattern.Member, bool) {
+	if p.exclude == "" {
+		return aapattern.Member{}, false
+	}
+	index := p.excludeIndex
+	if g, ok := p.scan.guests[p.exclude]; ok && index < 0 {
+		index = guestIndex(g)
+	}
+	if index < 0 {
+		return aapattern.Member{}, false
+	}
+	for name, r := range existing {
+		if m, ok := parseHaMarker(r.Comment); ok && slices.Contains(m.Left, p.exclude) &&
+			!slices.Contains(rules[name], p.exclude) {
+			rules[name] = append(rules[name], p.exclude)
+		}
+	}
+	return aapattern.Member{
+		Key: p.exclude, Index: index, Domain: p.topo.domainOf(set, p.exclude, p.ident.Owner), Reserved: true,
+	}, true
 }
 
 // member returns the layout's view of the member keyed sid, and false when

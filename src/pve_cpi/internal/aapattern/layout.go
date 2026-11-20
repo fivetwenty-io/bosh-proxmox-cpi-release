@@ -28,6 +28,14 @@ type Member struct {
 	// Joinable says the member may be added to a rule that does not hold it
 	// now. A member that is not joinable may only keep a place it has.
 	Joinable bool
+	// Reserved marks the place of a member that just left the group, such as
+	// one a delete took out of its rules. The layout places it like a
+	// joinable member, in the rule that holds it or else by its index, so
+	// the plan keeps that place free for the recreate of the index instead
+	// of moving another member into it, which the recreate would undo. No
+	// rule or list of the plan names it, no join check sees it, and it never
+	// takes an index's place from a member that is not reserved.
+	Reserved bool
 }
 
 // Domain is a set of nodes a group's members may run on. Rules only ever
@@ -175,8 +183,40 @@ func Layout(in Input) Output {
 		out = again
 	}
 	out.Displaced = displaced
-	out.finish()
+	out.dropReserved(in.Members)
 	return out
+}
+
+// dropReserved takes the reserved places of members out of the plan. A rule
+// left with fewer than two members goes, as a rule that holds one member
+// spreads nothing.
+func (o *Output) dropReserved(members []Member) {
+	reserved := map[string]bool{}
+	for _, m := range members {
+		if m.Reserved {
+			reserved[m.Key] = true
+		}
+	}
+	if len(reserved) > 0 {
+		isReserved := func(k string) bool { return reserved[k] }
+		for name, keys := range o.Rules {
+			keys = slices.DeleteFunc(keys, isReserved)
+			if len(keys) < 2 {
+				delete(o.Rules, name)
+				continue
+			}
+			o.Rules[name] = keys
+		}
+		for _, list := range []*[]string{&o.Overflow, &o.Alone, &o.Displaced, &o.Unindexed} {
+			*list = slices.DeleteFunc(*list, isReserved)
+		}
+		o.AddedFirst = slices.DeleteFunc(o.AddedFirst, func(name string) bool { return o.Rules[name] == nil })
+		for k := range reserved {
+			delete(o.AloneIn, k)
+			delete(o.Refused, k)
+		}
+	}
+	o.finish()
 }
 
 // sameRules reports whether a and b name the same rules with the same
@@ -217,7 +257,7 @@ func (l *layout) loadMembers() {
 		if m.Key == "" || l.members[m.Key] != nil {
 			continue
 		}
-		s := &mstate{Member: m, primary: true, joinable: m.Joinable}
+		s := &mstate{Member: m, primary: true, joinable: m.Joinable || m.Reserved}
 		l.members[m.Key] = s
 		if m.Index < 0 {
 			continue
@@ -228,7 +268,12 @@ func (l *layout) loadMembers() {
 			continue
 		}
 		newer, older := s, prev
-		if prev.Born > s.Born || prev.Born == s.Born && prev.Key > s.Key {
+		switch {
+		case s.Reserved != prev.Reserved:
+			if s.Reserved {
+				newer, older = prev, s
+			}
+		case prev.Born > s.Born || prev.Born == s.Born && prev.Key > s.Key:
 			newer, older = prev, s
 		}
 		older.primary, older.joinable = false, false
@@ -1132,10 +1177,20 @@ func (o *Output) finish() {
 
 // canJoin asks the caller whether key may join the rule.
 func (l *layout) canJoin(rule string, members []string, key string) bool {
-	if l.in.CanJoin == nil || len(members) == 0 {
+	if l.in.CanJoin == nil || l.reserved(key) {
 		return true
 	}
-	return l.in.CanJoin(rule, slices.Clone(members), key)
+	members = slices.DeleteFunc(slices.Clone(members), l.reserved)
+	if len(members) == 0 {
+		return true
+	}
+	return l.in.CanJoin(rule, members, key)
+}
+
+// reserved reports whether key is the reserved place of a member that left.
+func (l *layout) reserved(key string) bool {
+	m := l.members[key]
+	return m != nil && m.Reserved
 }
 
 // refuse records that rule refused key's join.

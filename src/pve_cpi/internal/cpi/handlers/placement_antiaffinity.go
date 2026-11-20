@@ -864,9 +864,10 @@ func replanGroupsAfterDelete(
 		groups = append(groups, found...)
 	}
 	deps = withRequestHAProfile(deps)
+	index := guestIndex(pve.GuestRef{Tags: tags})
 	for _, ident := range groups {
 		healErr := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
-			return healAntiAffinityGroup(ctx, deps, ident, "", sid, confined, logger)
+			return healAntiAffinityGroupHolding(ctx, deps, ident, "", sid, index, confined, logger)
 		})
 		if healErr != nil {
 			err = errors.Join(err, fmt.Errorf("anti-affinity: plan the rules of group %s again after the delete: %w",
@@ -1129,6 +1130,18 @@ const aaHealRounds = 4
 func healAntiAffinityGroup(
 	ctx context.Context, deps Deps, ident haIdentity, self, removed string, confined []string, logger *log.Logger,
 ) error {
+	return healAntiAffinityGroupHolding(ctx, deps, ident, self, removed, -1, confined, logger)
+}
+
+// healAntiAffinityGroupHolding is healAntiAffinityGroup with removed's
+// instance index, or -1 when the caller does not know it. With the index
+// known, from the caller or from removed's guest, the plan holds removed's
+// place free for the recreate of its index instead of moving another member
+// into it (see aaPlanner.excludeIndex).
+func healAntiAffinityGroupHolding(
+	ctx context.Context, deps Deps, ident haIdentity, self, removed string, removedIndex int, confined []string,
+	logger *log.Logger,
+) error {
 	profile, err := haRuleWriteProfile(ctx, deps)
 	if err != nil {
 		return err
@@ -1145,6 +1158,7 @@ func healAntiAffinityGroup(
 		}
 		planner := newGroupPlanner(ctx, deps, profile, ident, scan, logger)
 		planner.sid, planner.heal, planner.exclude, planner.holdOut = self, true, removed, holdOut
+		planner.excludeIndex = removedIndex
 		_, res, err := applyGroupPlan(ctx, deps, profile, planner, nil, logger)
 		loss := groupRuleLossOf(res, ident)
 		grew := false

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -45,11 +46,15 @@ func webTags(vmid int) string {
 }
 
 // TestRemoveAntiAffinity_PlansTheGroupAgainByIndex pins that a delete plans
-// the rest of its group into the index layout, with the rules lock on and
-// off. On four nodes a rule holds three members. The rule holds indexes 0, 1,
-// and 2, and index 3 waits outside it. Once index 1 is deleted, index 3 takes
-// the free place, and the record of the leaving member is gone with its HA
-// resource.
+// the rest of its group again with the deleted member's place held for the
+// recreate of its index, with the rules lock on and off. On four nodes a rule
+// holds three members. The rule holds indexes 0, 1, and 2, and index 3 waits
+// outside it. Once index 1 is deleted, index 3 stays out of the free place,
+// because the recreate of index 1 would take the place back and move index 3
+// out again, which costs two writes and can migrate index 3 twice. So the
+// plan writes nothing, and the recreate of index 1 joins the rule with one
+// write, which also drops the record of the member that left, since its HA
+// resource is purged.
 func TestRemoveAntiAffinity_PlansTheGroupAgainByIndex(t *testing.T) {
 	t.Parallel()
 	for name, lock := range map[string]bool{"lock on": true, "lock off": false} {
@@ -64,14 +69,26 @@ func TestRemoveAntiAffinity_PlansTheGroupAgainByIndex(t *testing.T) {
 				log.NewNopLogger()); err != nil {
 				t.Fatal(err)
 			}
-			if got := stub.rules[aaRule]; got != "vm:100,vm:102,vm:103" {
-				t.Fatalf("rule = %q; want index 3 in the place index 1 left", got)
-			}
-			if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker() {
-				t.Fatalf("comment = %q; want the plain marker once the HA resource is purged", got)
+			if got := stub.rules[aaRule]; got != "vm:100,vm:102" {
+				t.Fatalf("rule = %q; want the place index 1 left held for its recreate", got)
 			}
 			if _, ok := stub.rules[aaRule+"-2"]; ok {
 				t.Fatalf("rules = %v; want no second rule", stub.rules)
+			}
+			stub.tagged(aaQEMU(100, webTags(100)), aaQEMU(102, webTags(102)), aaQEMU(103, webTags(103)),
+				aaQEMU(104, aaTag+";index--1"))
+			markWebMembers(stub, 104)
+			before := stub.createRuleCalls + stub.updateRuleCalls + stub.deleteRuleCalls
+			joinAntiAffinityAtMetadata(context.Background(), aaReplanDeps(stub, lock), 104,
+				map[string]any{"index": 1.0}, log.NewNopLogger())
+			if got := stub.rules[aaRule]; got != "vm:100,vm:102,vm:104" {
+				t.Fatalf("rule = %q after the recreate; want index 1 back in its place", got)
+			}
+			if n := stub.createRuleCalls + stub.updateRuleCalls + stub.deleteRuleCalls - before; n != 1 {
+				t.Fatalf("the recreate wrote %d rules; want 1", n)
+			}
+			if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker() {
+				t.Fatalf("comment = %q; want the plain marker once the HA resource is purged", got)
 			}
 		})
 	}
@@ -81,22 +98,24 @@ func TestRemoveAntiAffinity_PlansTheGroupAgainByIndex(t *testing.T) {
 // delete whose destroy already purged the VM's HA resource, which took the VM
 // out of every rule, still plans the group again. The rules no longer name
 // the VM, so the group comes from the member tag on the tags the delete read
-// before the destroy. Without that tag the delete finds no group.
+// before the destroy. Without that tag the delete finds no group. The rule an
+// older release filled to the four nodes shows the plan: it keeps index 1's
+// place free and moves indexes 3 and 4 to a second rule.
 func TestRemoveAntiAffinity_FindsTheGroupFromTheTagsAfterThePurge(t *testing.T) {
 	t.Parallel()
 	for name, tc := range map[string]struct {
 		tags string
 		want string
 	}{
-		"member tag":    {tags: webTags(101), want: "vm:100,vm:102,vm:103"},
-		"no member tag": {tags: "index--1", want: "vm:100,vm:102"},
+		"member tag":    {tags: aaTag + ";index--1", want: "vm:100,vm:102"},
+		"no member tag": {tags: "index--1", want: "vm:100,vm:102,vm:103,vm:104"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			stub := newAAStub()
-			indexedWebGuests(stub, 100, 102, 103)
-			markWebMembers(stub, 100, 102, 103)
-			stub.seedRule(aaRule, "vm:100,vm:102")
+			indexedWebGuests(stub, 100, 102, 103, 104)
+			markWebMembers(stub, 100, 102, 103, 104)
+			stub.seedRule(aaRule, "vm:100,vm:102,vm:103,vm:104")
 			if err := removeAntiAffinityMembership(context.Background(), aaReplanDeps(stub, true), 101, tc.tags,
 				log.NewNopLogger()); err != nil {
 				t.Fatal(err)
@@ -157,13 +176,14 @@ func TestRemoveAntiAffinity_LeavesAnotherDirectorsGroupAlone(t *testing.T) {
 
 // TestCleanupHAMembership_AFailedReplanOnlyWarns pins that a delete whose
 // plan of the group fails to write still succeeds, and that the failure is
-// logged as a warning.
+// logged as a warning. The plan cuts a rule an older release filled to the
+// four nodes, so it has a rule to write.
 func TestCleanupHAMembership_AFailedReplanOnlyWarns(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
-	indexedWebGuests(stub, 100, 102, 103)
-	markWebMembers(stub, 100, 102, 103)
-	stub.seedRule(aaRule, "vm:100,vm:102")
+	indexedWebGuests(stub, 100, 102, 103, 104)
+	markWebMembers(stub, 100, 102, 103, 104)
+	stub.seedRule(aaRule, "vm:100,vm:102,vm:103,vm:104")
 	stub.failUpdateRule = true
 	logger, obs := log.NewObservedLogger(slog.LevelDebug)
 	st := &pve.HAServiceState{SID: "vm:101", VMID: 101, Known: true, Configured: true, Raw: "stopped", Node: "pve1"}
@@ -181,4 +201,97 @@ func TestCleanupHAMembership_AFailedReplanOnlyWarns(t *testing.T) {
 		}
 	}
 	t.Fatalf("no warning about the failed plan in %+v", obs.All())
+}
+
+// TestRemoveAntiAffinity_RollingUpdateWritesEachMembersRulesOnly pins what a
+// rolling update of a group costs. BOSH deletes each instance and creates it
+// again under a new VMID with the same index, which joins at
+// set_vm_metadata. Each instance may cost one write when it leaves and one
+// when it comes back, no other member may change rules, and the group ends
+// in the layout it started in.
+func TestRemoveAntiAffinity_RollingUpdateWritesEachMembersRulesOnly(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		nodes []string
+		rules []string
+	}{
+		"three nodes": {[]string{"pve1", "pve2", "pve3"}, []string{"vm:100,vm:101", "vm:102,vm:103", "vm:104,vm:105"}},
+		"four nodes":  {[]string{"pve1", "pve2", "pve3", "pve4"}, []string{"vm:100,vm:101,vm:102", "vm:103,vm:104,vm:105"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			stub := newAAStub()
+			stub.purgeFromRules = true
+			deps := aaReplanDeps(stub, true)
+			deps.HAProfile = pve9ClusterProfile(tc.nodes...)
+			vmids := []int{100, 101, 102, 103, 104, 105}
+			list := func() {
+				rows := make([]json.RawMessage, 0, len(vmids))
+				for i, v := range vmids {
+					if v != 0 {
+						rows = append(rows, aaQEMU(v, aaTag+";index--"+strconv.Itoa(i)))
+					}
+				}
+				stub.tagged(rows...)
+			}
+			list()
+			markWebMembers(stub, vmids...)
+			for i, r := range tc.rules {
+				name := aaRule
+				if i > 0 {
+					name = aaRule + "-" + strconv.Itoa(i+1)
+				}
+				stub.seedRule(name, r)
+			}
+			start := aaRuleOfMembers(stub.rules)
+			writes := func() int { return stub.createRuleCalls + stub.updateRuleCalls + stub.deleteRuleCalls }
+			before := writes()
+			for i, old := range slices.Clone(vmids) {
+				tags := aaTag + ";index--" + strconv.Itoa(i)
+				prev := aaRuleOfMembers(stub.rules)
+				// The destroy lands before the delete's cleanup, and the
+				// recreate's guest appears only after it.
+				vmids[i] = 0
+				list()
+				if err := removeAntiAffinityMembership(context.Background(), deps, old, tags,
+					log.NewNopLogger()); err != nil {
+					t.Fatal(err)
+				}
+				vmids[i] = 200 + i
+				list()
+				markWebMembers(stub, vmids[i])
+				joinAntiAffinityAtMetadata(context.Background(), deps, vmids[i], map[string]any{"index": float64(i)},
+					log.NewNopLogger())
+				now := aaRuleOfMembers(stub.rules)
+				for sid, rule := range now {
+					if sid != haResourceSid(vmids[i]) && prev[sid] != rule {
+						t.Errorf("replacing index %d moved %s from %q to %q", i, sid, prev[sid], rule)
+					}
+				}
+			}
+			end := aaRuleOfMembers(stub.rules)
+			for i, v := range vmids {
+				if got, want := end[haResourceSid(v)], start[haResourceSid(100+i)]; got != want {
+					t.Errorf("index %d ends in %q; started in %q", i, got, want)
+				}
+			}
+			if n := writes() - before; n > 2*len(vmids) {
+				t.Errorf("the update wrote rules %d times for %d members; want at most %d", n, len(vmids),
+					2*len(vmids))
+			}
+		})
+	}
+}
+
+// aaRuleOfMembers maps each sid the stub's rules hold to its rule.
+func aaRuleOfMembers(rules map[string]string) map[string]string {
+	out := map[string]string{}
+	for name, members := range rules {
+		for _, sid := range strings.Split(members, ",") {
+			if sid != "" {
+				out[sid] = name
+			}
+		}
+	}
+	return out
 }
