@@ -156,7 +156,7 @@ func TestUnmarkRebalanceSetsFailbackAndDropsTheMarkInOneWrite(t *testing.T) {
 		rig := &stageRig{exists: true, state: "started", failback: pveBool(false),
 			comment: stageMarker + " " + rebalanceMark + " " + FailbackHoldKey + "9"}
 		read, _ := rig.GetHaResources(context.Background(), "vm:101")
-		ok, err := UnmarkRebalance(context.Background(), rig, "vm:101", read, want)
+		ok, err := UnmarkRebalance(context.Background(), rig, "vm:101", read, want, time.Now())
 		if err != nil || !ok || rig.failback.Bool() != want || rig.comment != stageMarker+" "+FailbackHoldKey+"9" {
 			t.Fatalf("want %v: ok %v err %v failback %v comment %q", want, ok, err, rig.failback.Bool(),
 				rig.comment)
@@ -169,8 +169,23 @@ func TestUnmarkRebalanceSetsFailbackAndDropsTheMarkInOneWrite(t *testing.T) {
 		comment: stageMarker + " " + rebalanceMark}
 	read, _ := stale.GetHaResources(context.Background(), "vm:101")
 	stale.beforeUpdate = func(int) { stale.version++ }
-	if ok, err := UnmarkRebalance(context.Background(), stale, "vm:101", read, true); err != nil || ok ||
+	if ok, err := UnmarkRebalance(context.Background(), stale, "vm:101", read, true, time.Now()); err != nil || ok ||
 		stale.failback.Bool() || stale.comment != stageMarker+" "+rebalanceMark {
 		t.Fatalf("a refused write must leave the mark and failback off: ok %v err %v", ok, err)
+	}
+}
+
+func TestUnmarkRebalanceKeepsFailbackOffUnderAFreshHold(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_800_000_000, 0)
+	rig := &stageRig{exists: true, state: "started", failback: pveBool(false),
+		comment: WithFailbackHold(stageMarker+" "+rebalanceMark, now.Add(-time.Minute))}
+	read, _ := rig.GetHaResources(context.Background(), "vm:101")
+	ok, err := UnmarkRebalance(context.Background(), rig, "vm:101", read, true, now)
+	if err != nil || !ok || rig.failback.Bool() {
+		t.Fatalf("ok %v err %v failback %v", ok, err, rig.failback.Bool())
+	}
+	if _, held := FailbackHoldOf(&rig.comment); !held {
+		t.Fatalf("the hold is gone: %q", rig.comment)
 	}
 }

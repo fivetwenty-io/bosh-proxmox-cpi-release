@@ -490,7 +490,7 @@ func (p *pveRebalanceIO) mark(ctx context.Context, vmid int, read *sdkcluster.Ge
 func (p *pveRebalanceIO) unmark(ctx context.Context, vmid int, read *sdkcluster.GetHaResourcesResponse,
 	failback bool,
 ) (bool, error) {
-	return ha.UnmarkRebalance(ctx, p.deps.PVE.Cluster(), haResourceSid(vmid), read, failback)
+	return ha.UnmarkRebalance(ctx, p.deps.PVE.Cluster(), haResourceSid(vmid), read, failback, time.Now())
 }
 
 func (p *pveRebalanceIO) migrate(ctx context.Context, vmid int, from, to string,

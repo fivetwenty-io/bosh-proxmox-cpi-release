@@ -311,7 +311,8 @@ func (r *rebalanceRun) writePin(ctx context.Context, profile *ha.Profile, plan *
 // release is step 5, and the abort of a move. It decides the failback the VM
 // gets, which counts the mark that names to as the run's own, and writes it
 // with the mark dropped, against the digest of a fresh read. An undecided
-// failback stays off, and keepOff keeps it off whatever the decision.
+// failback stays off, keepOff keeps it off whatever the decision, and so does
+// a failback hold that is fresh in the read the write names.
 func (r *rebalanceRun) release(ctx context.Context, profile *ha.Profile, f *rebalanceVMFacts, to string,
 	keepOff bool,
 ) error {
@@ -339,6 +340,10 @@ func (r *rebalanceRun) release(ctx context.Context, profile *ha.Profile, f *reba
 			return err
 		}
 		failback := !keepOff && want.decided && want.want
+		if unmarked, _ := ha.WithoutRebalanceMark(*res.Comment); !ha.FailbackAllowed(failback, unmarked,
+			r.io.now()) {
+			failback = false
+		}
 		var ok bool
 		err = detached(ctx, func(ctx context.Context) error {
 			var err error

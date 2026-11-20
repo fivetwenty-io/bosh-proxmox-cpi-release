@@ -488,3 +488,32 @@ func TestRebalanceRun_ABastionApplyWithNoJournalWarns(t *testing.T) {
 		t.Fatalf("a dry run warned %v", rep.Warnings)
 	}
 }
+
+func TestRebalanceRun_AFreshFailbackHoldKeepsFailbackOffAtTheRelease(t *testing.T) {
+	f := newFakeRebalanceIO()
+	f.addVM(101, "pve01", 8)
+	f.addVM(102, "pve01", 8)
+	f.addVM(103, "pve01", 8)
+	// An attach holds failback on VM 101 while the VM moves.
+	f.migrateFn = func(_ context.Context, vmid int, _, to string) (pve.VMLocation, error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		v := f.vms[vmid]
+		v.node = to
+		if vmid == 101 {
+			v.comment = ha.WithFailbackHold(v.comment, f.clock)
+			f.digest++
+		}
+		return pve.VMLocation{Node: to, Found: true}, nil
+	}
+	rep := rbRun(f, RebalanceOptions{Apply: true, MaxMoves: 1}).run(context.Background())
+	if rep.ExitCode != RebalanceExitOK {
+		t.Fatalf("exit %d halted %q", rep.ExitCode, rep.Halted)
+	}
+	if !slices.Equal(f.unmarks, []string{"101:false"}) || f.vms[101].failback {
+		t.Fatalf("unmarks %v failback %v", f.unmarks, f.vms[101].failback)
+	}
+	if _, held := ha.FailbackHoldOf(&f.vms[101].comment); !held {
+		t.Fatalf("the release dropped the hold: %q", f.vms[101].comment)
+	}
+}

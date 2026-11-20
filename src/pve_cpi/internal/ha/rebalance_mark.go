@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 
@@ -80,18 +81,20 @@ func MarkRebalance(ctx context.Context, api FailbackAPI, sid string, read *sdkcl
 
 // UnmarkRebalance sets failback to failback on the resource sid and drops the
 // rebalance token from its comment, in one write that names the digest of
-// read, the caller's read of the resource. It reports whether the write
-// landed, and a write PVE refuses because resources.cfg changed after read
+// read, the caller's read of the resource. A failback hold in read that is
+// still fresh at now keeps failback off whatever the caller asks, because the
+// hold's writer is moving the VM. It reports whether the write landed, and a write PVE refuses because resources.cfg changed after read
 // reports false with no error, so the caller reads and decides afresh. The
 // token and failback off then stay, which keeps the VM where it is. An empty
 // digest writes nothing. Any other failure is returned.
 func UnmarkRebalance(ctx context.Context, api FailbackAPI, sid string, read *sdkcluster.GetHaResourcesResponse,
-	failback bool,
+	failback bool, now time.Time,
 ) (bool, error) {
 	if api == nil || read == nil || read.Comment == nil {
 		return false, cpierrors.Cloud("ha rebalance: the resource client and the read of the resource must be set")
 	}
 	comment, _ := WithoutRebalanceMark(*read.Comment)
+	failback = FailbackAllowed(failback, comment, now)
 	return writeAgainstRead(ctx, api, sid, read, &sdkcluster.UpdateHaResourcesParams{Failback: &failback,
 		Comment: &comment}, fmt.Sprintf("ha rebalance: set failback %v and drop the rebalance mark from", failback))
 }
