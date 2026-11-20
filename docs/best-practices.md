@@ -356,7 +356,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** A node an operator has explicitly put into HA maintenance state is being drained for a reason; placing a new VM there works against that intent.
 
-**CPI behavior.** The node health check always runs: any node PVE's HA subsystem reports in a `maintenance`, `error`, `fence`, or `recovery` state is excluded from candidate scoring, as is any node carrying a tag listed in `pve.placement.maintenance_node_tags`. Leaving that property unset gives the tag `maintenance`, and setting it to `[]` turns tag detection off while the health check keeps running.
+**CPI behavior.** The node health check always runs, and it excludes from candidate scoring any node that PVE's HA subsystem reports in a `maintenance`, `error`, `fence`, or `recovery` state, as it does any node carrying a tag listed in `pve.placement.maintenance_node_tags`. Leaving that property unset gives the tag `maintenance`, and setting it to `[]` turns tag detection off while the health check keeps running.
 
 **Status.** Meets.
 

@@ -319,8 +319,9 @@ properties:
       The default anti-affinity pattern of every instance group that names
       none in its ha_anti_affinity cloud property. Unset means the built-in
       block pattern, which fills rules of one fewer member than the nodes from
-      the lowest instance index. An empty list or map counts as unset. A pattern is a map with one of block, stride,
-      window, or sets, or a list of up to eight such maps. block takes an
+      the lowest instance index. An empty list or map counts as unset. A
+      pattern is a map with one of block, stride, window, or sets, or a list of
+      up to eight such maps. block takes an
       optional size of at least 2, stride and window take an integer from 2 to
       64, and sets takes up to 32 lists of 2 to 64 distinct indexes. Any term
       may carry drain_safe, a boolean that defaults to true, and every term
@@ -360,9 +361,9 @@ properties:
       node is online again, which returns the VMs a maintenance drain moved
       away. Replicate VMs, hold VMs, and any VM with a volume on node-local
       storage keep failback off whatever this key says, because a failback of
-      a replicate VM would lose the writes its partner took. Set it to false to
-      keep failback off for every VM, and so does a VM that only one node can
-      take. The CPI recomputes the flag when a VM's disks change, and
+      a replicate VM would lose the writes its partner took. A VM that only
+      one node can take keeps failback off too. Set this key to false to keep
+      failback off for every VM. The CPI recomputes the flag when a VM's disks change, and
       set_vm_metadata and reboot_vm bring an existing resource in line. After
       an upgrade from a release that wrote failback off, the first
       set_vm_metadata or reboot_vm on a shared VM that runs away from the

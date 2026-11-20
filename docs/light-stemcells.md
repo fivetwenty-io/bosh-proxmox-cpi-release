@@ -362,9 +362,9 @@ pvesm free nfs-stemcells:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2
 
 ## Inspecting stemcell CIDs with `pve-ops`
 
-`pve-ops` ships on the Director VM at `/var/vcap/packages/pve_cpi/bin/pve-ops` — not on `PATH` by default. The examples below assume `export PATH="/var/vcap/packages/pve_cpi/bin:$PATH"`, or invoke the full path directly.
+`pve-ops` ships on the Director VM at `/var/vcap/packages/pve_cpi/bin/pve-ops`, and it is not on `PATH` by default. The examples below assume `export PATH="/var/vcap/packages/pve_cpi/bin:$PATH"`, or invoke the full path directly.
 
-`pve-ops decode` is fully offline (no PVE API call, no config load) and prints a CID's structure — storage, volume path, filename, and (when extractable) sha8:
+`pve-ops decode` is fully offline (no PVE API call, no config load) and prints a CID's structure, which covers the storage, the volume path, the filename, and the sha8 when it can be extracted:
 
 ```bash
 pve-ops decode ':light:nfs-stemcells:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2'

@@ -25,7 +25,7 @@ flowchart LR
     M --> M4["performance options"]
 ```
 
-- Long opaque IDs are envelopes — `pve-ops decode` opens them
+- Long opaque IDs are envelopes, and `pve-ops decode` opens them
 - The 9000–29999 band guards against wrong deletion
 
 <!--
