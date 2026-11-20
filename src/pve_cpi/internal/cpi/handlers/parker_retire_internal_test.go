@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
@@ -402,4 +404,136 @@ func TestRetireEmptiedParker_SkipsANodeOrVMIDItCannotName(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("a parker holder is retired; calls %d", calls)
 	}
+}
+
+// setParkerRetireSettleWaitForTest replaces how long the drained retirement
+// waits for PVE HA to finish stopping an emptied parker, and returns a restore
+// function. The value is process-wide, so tests using it must not call
+// t.Parallel.
+func setParkerRetireSettleWaitForTest(d time.Duration) func() {
+	prev := parkerRetireSettleWaitNs.Swap(int64(d))
+	return func() { parkerRetireSettleWaitNs.Store(prev) }
+}
+
+// registrationStopRig is the emptied parker of emptiedRig whose HA resource the
+// CRM is still stopping, the way it is a few seconds after create_disk
+// registered the parker and requested stopped. The CRM finishes the stop at
+// manager status read stopAt, or never when stopAt is zero. One read of the HA
+// state makes two manager status reads, the health report's and the state's,
+// so an odd stopAt finishes the stop between two whole reads.
+type registrationStopRig struct {
+	*emptiedRig
+	mu sync.Mutex
+	// heldWhileStopping counts the manager status reads made while the CRM
+	// still reported request_stop and the parker's claim was held.
+	heldWhileStopping int
+}
+
+func newRegistrationStopRig(t *testing.T, stopAt int) *registrationStopRig {
+	t.Helper()
+	t.Cleanup(SetHADeleteMotionPollForTest(time.Millisecond))
+	r := &registrationStopRig{emptiedRig: newEmptiedParkerRig()}
+	pools := r.client.pools()
+	r.scene.Do(func(s *HADeleteScene) {
+		s.Services[phSID] = HASceneService{State: haRawStateRequestStop, Node: phNode, UID: "uid-90000"}
+		s.IndexHAState[90000] = haRawStateRequestStop
+		s.Power[90000] = vmPowerStateStopped
+		s.OnRead = func(s *HADeleteScene, reads int) {
+			if s.Services[phSID].State != haRawStateRequestStop {
+				return
+			}
+			if pools.held(90000) {
+				r.mu.Lock()
+				r.heldWhileStopping++
+				r.mu.Unlock()
+			}
+			if stopAt > 0 && reads >= stopAt {
+				s.Services[phSID] = HASceneService{State: "stopped", Node: phNode, UID: "uid-90000-stopped"}
+				s.IndexHAState[90000] = "stopped"
+			}
+		}
+	})
+	return r
+}
+
+// retireThroughDrain runs the retirement the way attach_disk and create_vm run
+// it, from the queue their handler drains once it has released its gates and
+// locks.
+func (r *registrationStopRig) retireThroughDrain() {
+	ctx, drain := deferParkerRetirements(context.Background())
+	retireEmptiedParker(ctx, r.deps, phNode, 90000, "attach_disk")
+	drain()
+}
+
+func (r *registrationStopRig) claimsTaken() int {
+	pools := r.client.pools()
+	pools.mu.Lock()
+	defer pools.mu.Unlock()
+	return pools.creates
+}
+
+// TestRetireEmptiedParker_TheDrainWaitsOutTheRegistrationStop proves the
+// retirement an attach runs once it has released its locks waits, holding no
+// claim, while PVE HA finishes the stop that the parker's registration
+// requested, and then destroys the parker with its HA resource and pin. A
+// fresh deploy empties a parker a few seconds after create_disk registered
+// it, while the CRM still reports request_stop, so without the wait every
+// fresh deploy leaves an empty HA parker behind.
+func TestRetireEmptiedParker_TheDrainWaitsOutTheRegistrationStop(t *testing.T) {
+	r := newRegistrationStopRig(t, 5)
+	r.retireThroughDrain()
+
+	r.requireRetired(t)
+	if r.heldWhileStopping != 0 {
+		t.Fatalf("the wait for the HA stop must hold no claim on the parker; %d reads held it",
+			r.heldWhileStopping)
+	}
+}
+
+// TestRetireEmptiedParker_AStopThatOutlastsTheWaitLeavesTheParkerForTheSweep
+// proves a stop that PVE HA has not finished when the wait runs out leaves
+// the parker exactly as it was, with no claim taken, logs why it stays, and
+// leaves the retirement to the parker sweep that the next park on the node
+// runs.
+func TestRetireEmptiedParker_AStopThatOutlastsTheWaitLeavesTheParkerForTheSweep(t *testing.T) {
+	r := newRegistrationStopRig(t, 0)
+	t.Cleanup(setParkerRetireSettleWaitForTest(20 * time.Millisecond))
+	logger, observer := log.NewObservedLogger(log.LevelInfo)
+	r.deps.Logger = logger
+	r.retireThroughDrain()
+
+	r.requireUntouched(t)
+	if n := r.claimsTaken(); n != 0 {
+		t.Fatalf("a retirement whose wait ran out takes no claim on the parker; claims %d", n)
+	}
+	found := false
+	for _, e := range observer.All() {
+		if strings.Contains(e.Message, "still stopping the emptied parker") &&
+			strings.Contains(e.Message, "next parker sweep on its node retires it") &&
+			e.Attrs["raw_state"] == haRawStateRequestStop {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the log must say the parker stays because PVE HA was still stopping it; entries %+v",
+			observer.All())
+	}
+
+	r.scene.Do(func(s *HADeleteScene) {
+		s.Services[phSID] = HASceneService{State: "stopped", Node: phNode, UID: "uid-90000-stopped"}
+		s.IndexHAState[90000] = "stopped"
+	})
+	reconcileParkerHA(context.Background(), r.deps, phNode, phParkerCfg())
+	r.requireRetired(t)
+}
+
+// TestRetireEmptiedParker_AnInlineRetirementDoesNotWaitForTheStop proves the
+// emptying paths that retire inline, while they may still hold the disk's
+// lifecycle lock, read the HA state once and leave a parker PVE HA is still
+// stopping for the sweep, as they always have, so no request queued on those
+// locks waits for the CRM.
+func TestRetireEmptiedParker_AnInlineRetirementDoesNotWaitForTheStop(t *testing.T) {
+	r := newRegistrationStopRig(t, 3)
+	r.retire()
+	r.requireUntouched(t)
 }

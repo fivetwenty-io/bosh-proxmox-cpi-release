@@ -97,7 +97,12 @@ const parkerRetireCaller = "parker retirement"
 // with a disk on storage that is not shared can never register, so it costs
 // nothing more, and any other refusal of an unregistered parker is decided
 // before a claim is taken, because it writes nothing. At most one parker is
-// retired per pass, and the others wait for the next sweep.
+// retired per pass, and the others wait for the next sweep. The limit bounds
+// what a sweep adds to the park that runs it, because each retirement may
+// spend a whole retirement's budget. The wait a drained retirement makes for
+// the HA stop (awaitRegistrationStop) leaves it as it is. The call that
+// empties a parker retires that parker itself, so the limit only paces the
+// parkers whose own retirement could not finish.
 //
 // Under a handler's retirement queue (deferParkerRetirements), the pass
 // retires nothing and proves no leftover itself. It queues the retirement and

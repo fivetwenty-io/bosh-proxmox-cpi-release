@@ -20,9 +20,10 @@ import (
 // in pve.HAServiceState accepts only raw CRM states, so these compare against
 // HAServiceState.Raw and NodeHealthEntry.CRMState.
 const (
-	haRawStateError = "error"
-	haRawStateFence = "fence"
-	haNodeFence     = "fence"
+	haRawStateError       = "error"
+	haRawStateFence       = "fence"
+	haRawStateRequestStop = "request_stop"
+	haNodeFence           = "fence"
 )
 
 // haDeleteMotionPollNs is the pause between two HA reads while the delete waits

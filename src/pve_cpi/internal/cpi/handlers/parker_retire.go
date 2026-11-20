@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -29,7 +30,8 @@ import (
 // Director with no snapshot, whose HA resource carries this Director's marker.
 // A parker that PVE HA does not manage stays when it empties, as it always
 // has. The retirement never fails the call: a park or a sweep that holds the
-// parker's claim, a request with too little time left, or any failed step
+// parker's claim, a request with too little time left, an HA stop that is
+// still under way when the wait described below runs out, or any failed step
 // leaves the parker for the next parker sweep on its node, which retires it.
 //
 // attach_disk and create_vm run the retirement after the handler returns
@@ -46,6 +48,19 @@ import (
 // the meantime, or a rollback that put the disk back, keeps the parker. The
 // other emptying paths retire inline, because they hold no gate that other
 // requests queue on while they finish.
+//
+// A retirement the drain runs also waits, bounded, for PVE HA to finish the
+// stop that the parker's registration requested (awaitRegistrationStop). A
+// fresh deploy needs that wait, because create_disk parks the new disk and
+// registers the parker as stopped, and attach_disk takes the disk out a few
+// seconds later, while the CRM still reports request_stop. The teardown's HA
+// gate counts request_stop as motion and defers on it, so without the wait
+// every fresh deploy would leave an empty HA parker for the sweep. The wait
+// runs before the retirement takes the parker's claim, so it holds no lock
+// that a park waits on, and it runs only in the drain, after the handler
+// released every gate and lock it took, so it holds up no other request
+// either. An inline retirement reads the HA state once, as it always has,
+// because the disk's lifecycle lock may still be held around it.
 //
 // A parker pool sweep that runs under the queue, as the one an attach runs
 // after it parks a free-floating disk on the disk's own node does while it
@@ -72,7 +87,22 @@ var retireEmptiedParkerImpl atomic.Pointer[retireEmptiedParkerFunc]
 func init() {
 	production := retireEmptiedParkerFunc(retireEmptiedParkerNow)
 	retireEmptiedParkerImpl.Store(&production)
+	parkerRetireSettleWaitNs.Store(int64(parkerRetireSettleWaitDefault))
 }
+
+// parkerRetireSettleWaitDefault is how long a drained retirement waits for
+// PVE HA to finish the stop that the parker's registration requested
+// (awaitRegistrationStop). The CRM runs a round about every ten seconds, and
+// the stop of a parker that never ran takes two or three of them. One sends
+// request_stop to the node's LRM, which finds the parker already stopped, and
+// a later one records stopped. Thirty seconds covers three rounds.
+const parkerRetireSettleWaitDefault = 30 * time.Second
+
+// parkerRetireSettleWaitNs holds the wait as nanoseconds in an atomic, so a
+// test can shorten it race-safely.
+var parkerRetireSettleWaitNs atomic.Int64
+
+func parkerRetireSettleWait() time.Duration { return time.Duration(parkerRetireSettleWaitNs.Load()) }
 
 // setRetireEmptiedParkerForTest replaces the retirement for the duration of a
 // test and returns a restore function. The seam is process-wide, so tests
@@ -99,6 +129,17 @@ func retireEmptiedParker(ctx context.Context, deps Deps, node string, vmid int, 
 
 // retirementQueueKey keys the queue deferParkerRetirements installs.
 type retirementQueueKey struct{}
+
+// drainedRetirementKey marks the context a queued retirement runs on, which
+// carries none of the gates or locks the handler held.
+type drainedRetirementKey struct{}
+
+// drainedRetirement reports whether ctx is that of a retirement the drain of a
+// handler's queue runs.
+func drainedRetirement(ctx context.Context) bool {
+	drained, _ := ctx.Value(drainedRetirementKey{}).(bool)
+	return drained
+}
 
 // queuedRetirement is one retirement a handler runs once it has released its
 // gates and locks.
@@ -193,7 +234,9 @@ func (q *retirementQueue) take() ([]queuedRetirement, []queuedOrphanScan) {
 // does nothing, so the outermost handler drains. The drain runs each
 // retirement, and then each node's deferred leftover removal, on ctx, the
 // context the handler had before the queue, which carries none of the claims
-// or locks the path held, and no queue that a sweep could defer to again.
+// or locks the path held, and no queue that a sweep could defer to again. Each
+// retirement's context is marked as drained, which lets it wait for PVE HA to
+// finish stopping the parker.
 func deferParkerRetirements(ctx context.Context) (context.Context, func()) {
 	if q := retirementQueueFrom(ctx); q != nil {
 		return ctx, func() {}
@@ -209,7 +252,8 @@ func deferParkerRetirements(ctx context.Context) (context.Context, func()) {
 		pending, scans := q.take()
 		for i := range pending {
 			e := &pending[i]
-			(*retireEmptiedParkerImpl.Load())(runCtx(e.keepGoing), e.deps, e.node, e.vmid, e.trigger)
+			rctx := context.WithValue(runCtx(e.keepGoing), drainedRetirementKey{}, true)
+			(*retireEmptiedParkerImpl.Load())(rctx, e.deps, e.node, e.vmid, e.trigger)
 		}
 		for i := range scans {
 			e := &scans[i]
@@ -232,7 +276,8 @@ func retireEmptiedHolder(ctx context.Context, deps Deps, holder pve.DiskHolder, 
 // config. A parker the reads find empty and registered is retired under its
 // claim and a retirement's own budget, exactly as the sweep retires it,
 // including the fresh read under the claim that keeps a parker a park reached
-// in the meantime.
+// in the meantime. A retirement the drain runs first waits for PVE HA to finish
+// a stop the parker's registration requested.
 func retireEmptiedParkerNow(ctx context.Context, deps Deps, node string, vmid int, trigger string) {
 	if deps.Config == nil {
 		return
@@ -261,8 +306,88 @@ func retireEmptiedParkerNow(ctx context.Context, deps Deps, node string, vmid in
 	if !r.loadProfile(rctx) {
 		return
 	}
+	if drainedRetirement(ctx) && !r.awaitRegistrationStop(vmid) {
+		return
+	}
 	if err := r.retireWithBudget(vmid); err != nil {
 		logger.Info("parker HA: the emptied parker was not retired; the next parker sweep on its node retires it",
 			log.Err(err))
 	}
+}
+
+// awaitRegistrationStop waits while PVE HA is still carrying out the stop that
+// the parker's registration requested, and reports whether the retirement goes
+// on. It holds no claim and no lock while it waits, so a park into the parker
+// goes ahead, and the read under the claim that follows then finds the disk
+// and keeps the parker.
+//
+// The wait covers one state only, a resource that requests stopped while the
+// CRM reports request_stop or has not processed it yet. Every other answer,
+// a read that failed included, ends the wait at once and leaves the decision
+// to the teardown's HA gate, which reads the state again under the claim and
+// defers on anything that does not let the destroy proceed, as it always has.
+//
+// The wait lasts parkerRetireSettleWait at most, cut short so the request
+// still has a retirement's budget left after it, and it never starts when the
+// request has less than that left. A stop that outlasts it, or a request that
+// ends during it, leaves the parker as it was, with nothing written, and is
+// logged with the reason. The parker is then still an empty parker that PVE HA
+// manages, so the parker pool sweep that the next park on its node runs
+// retires it, unless that park reuses it.
+func (r *parkerHA) awaitRegistrationStop(vmid int) bool {
+	ctx := r.base
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	budget := parkerRetireSettleWait()
+	deadline, _ := haDeleteWaitLimit(ctx, budget, parkerRetireBudget())
+	if !time.Now().Before(deadline) {
+		return true
+	}
+	start := time.Now()
+	waiting := false
+	for {
+		st, err := readHADeleteState(ctx, r.deps, parkerRetireCaller, vmid, r.node)
+		if err != nil {
+			return true
+		}
+		disp, reason := st.Disposition()
+		if !parkerStopInProgress(st, disp) {
+			if waiting {
+				r.logger.Info("parker HA: PVE HA finished stopping the emptied parker, so the retirement goes on",
+					log.String("raw_state", st.Raw), log.String("waited", time.Since(start).Round(time.Second).String()))
+			}
+			return true
+		}
+		fields := []log.Field{
+			log.String("sid", st.SID), log.String("raw_state", st.Raw), log.String("requested", st.Requested),
+			log.String("reason", reason), log.String("waited", time.Since(start).Round(time.Second).String()),
+			log.String("wait", budget.String()),
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			r.logger.Info("parker HA: PVE HA was still stopping the emptied parker when the wait for the stop ran "+
+				"out, so it stays; the next parker sweep on its node retires it", fields...)
+			return false
+		}
+		if !waiting {
+			waiting = true
+			r.logger.Info("parker HA: PVE HA is still stopping the emptied parker, as its registration asked, so the "+
+				"retirement waits for the stop", fields...)
+		}
+		if err := sleepOrDone(ctx, min(haDeleteMotionPoll(), remaining)); err != nil {
+			r.logger.Info("parker HA: the request ended while the retirement waited for PVE HA to stop the emptied "+
+				"parker, so it stays; the next parker sweep on its node retires it", append(fields, log.Err(err))...)
+			return false
+		}
+	}
+}
+
+// parkerStopInProgress reports whether st shows the stop that a parker's
+// registration requested still under way. That is a resource that requests
+// stopped while the CRM reports request_stop or has not processed it yet,
+// which the state table answers with a wait for motion.
+func parkerStopInProgress(st *pve.HAServiceState, disp pve.HADisposition) bool {
+	return disp == pve.HAWaitForMotion && st.Requested == parkerHAStateStopped &&
+		(st.Raw == haRawStateRequestStop || !st.InCRM)
 }
