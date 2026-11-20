@@ -321,9 +321,9 @@ func retireEmptiedParkerNow(ctx context.Context, deps Deps, node string, vmid in
 // goes ahead, and the read under the claim that follows then finds the disk
 // and keeps the parker.
 //
-// The wait covers one state only, a resource that requests stopped while the
-// CRM reports request_stop or has not processed it yet. Every other answer,
-// a read that failed included, ends the wait at once and leaves the decision
+// The wait covers one state only. That state is a resource that requests
+// stopped while the CRM reports request_stop or has not processed it yet.
+// Every other answer, a read that failed included, ends the wait at once and leaves the decision
 // to the teardown's HA gate, which reads the state again under the claim and
 // defers on anything that does not let the destroy proceed, as it always has.
 //

@@ -99,8 +99,8 @@ const parkerRetireCaller = "parker retirement"
 // before a claim is taken, because it writes nothing. At most one parker is
 // retired per pass, and the others wait for the next sweep. The limit bounds
 // what a sweep adds to the park that runs it, because each retirement may
-// spend a whole retirement's budget. The wait a drained retirement makes for
-// the HA stop (awaitRegistrationStop) leaves it as it is. The call that
+// spend a whole retirement's budget. The wait that a drained retirement makes
+// for the HA stop (awaitRegistrationStop) does not change that limit. The call that
 // empties a parker retires that parker itself, so the limit only paces the
 // parkers whose own retirement could not finish.
 //
