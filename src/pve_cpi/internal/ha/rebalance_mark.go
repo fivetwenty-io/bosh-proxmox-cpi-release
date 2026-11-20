@@ -75,7 +75,7 @@ func MarkRebalance(ctx context.Context, api FailbackAPI, sid string, read *sdkcl
 	off := false
 	comment := WithRebalanceMark(*read.Comment, node)
 	return writeAgainstRead(ctx, api, sid, read, &sdkcluster.UpdateHaResourcesParams{Failback: &off,
-		Comment: &comment}, "set failback off and mark the move to "+node+" on")
+		Comment: &comment}, "ha rebalance: set failback off and mark the move to "+node+" on")
 }
 
 // UnmarkRebalance sets failback to failback on the resource sid and drops the
@@ -93,12 +93,13 @@ func UnmarkRebalance(ctx context.Context, api FailbackAPI, sid string, read *sdk
 	}
 	comment, _ := WithoutRebalanceMark(*read.Comment)
 	return writeAgainstRead(ctx, api, sid, read, &sdkcluster.UpdateHaResourcesParams{Failback: &failback,
-		Comment: &comment}, fmt.Sprintf("set failback %v and drop the rebalance mark from", failback))
+		Comment: &comment}, fmt.Sprintf("ha rebalance: set failback %v and drop the rebalance mark from", failback))
 }
 
 // writeAgainstRead sends params to the resource sid with the digest of read,
 // and reports whether the write landed. A refusal because resources.cfg
 // changed, and a read that named no digest, land nothing and return no error.
+// what names the write, with its command, in the error of a failed write.
 func writeAgainstRead(ctx context.Context, api FailbackAPI, sid string, read *sdkcluster.GetHaResourcesResponse,
 	params *sdkcluster.UpdateHaResourcesParams, what string,
 ) (bool, error) {
@@ -115,5 +116,5 @@ func writeAgainstRead(ctx context.Context, api FailbackAPI, sid string, read *sd
 		return false, nil
 	}
 	return false, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-		fmt.Sprintf("ha rebalance: %s the HA resource %s", what, sid))
+		fmt.Sprintf("%s the HA resource %s", what, sid))
 }
