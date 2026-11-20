@@ -115,6 +115,23 @@ func decideDrainFates(cfg *config.CPIConfig, profile *ha.Profile, snap *rebalanc
 	return out
 }
 
+// drainDecider holds what every VM's decision reads.
+type drainDecider struct {
+	cfg     *config.CPIConfig
+	profile *ha.Profile
+	snap    *rebalanceSnapshot
+	node    string
+	// where maps a guest's VMID, as text, to its node.
+	where map[string]string
+	// rules are the rules PVE applies.
+	rules []ha.Rule
+	// candidates are the nodes other than the drained one that can take work.
+	candidates []string
+	// undecided holds the service IDs of the VMs whose fate the drain can't
+	// decide.
+	undecided map[string]bool
+}
+
 // softPinOn returns the ID of an applied soft node-affinity rule for sid whose
 // highest priority class holds the drained node and no other node, or "".
 func (d *drainDecider) softPinOn(sid string) string {
@@ -144,23 +161,6 @@ func drainSoftPinHolds(r *ha.Rule, sid, node string) bool {
 	}
 	prio, named := r.Nodes[node]
 	return ok && topNodes == 1 && named && prio == top
-}
-
-// drainDecider holds what every VM's decision reads.
-type drainDecider struct {
-	cfg     *config.CPIConfig
-	profile *ha.Profile
-	snap    *rebalanceSnapshot
-	node    string
-	// where maps a guest's VMID, as text, to its node.
-	where map[string]string
-	// rules are the rules PVE applies.
-	rules []ha.Rule
-	// candidates are the nodes other than the drained one that can take work.
-	candidates []string
-	// undecided holds the service IDs of the VMs whose fate the drain can't
-	// decide.
-	undecided map[string]bool
 }
 
 // drainAppliedRules returns the rules PVE applies: enabled, and with no

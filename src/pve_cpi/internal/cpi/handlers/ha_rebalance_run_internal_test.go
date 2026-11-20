@@ -146,8 +146,10 @@ func TestRebalanceRun_GatesAreCheckedAgainBeforeEveryMove(t *testing.T) {
 	}
 }
 
-func TestRebalanceRun_AMoveThatCannotStartIsRefusedAndTheVMIsExcluded(t *testing.T) {
-	cases := map[string]func(f *fakeRebalanceIO){
+// rbRefusedMoveCases returns the ways VM 101's move can be unable to start,
+// each as a change to the fake.
+func rbRefusedMoveCases() map[string]func(f *fakeRebalanceIO) {
+	return map[string]func(f *fakeRebalanceIO){
 		"digest conflict on the hold": func(f *fakeRebalanceIO) {
 			f.markHook = func(vmid int) (bool, error) { return vmid != 101, nil }
 		},
@@ -213,29 +215,39 @@ func TestRebalanceRun_AMoveThatCannotStartIsRefusedAndTheVMIsExcluded(t *testing
 			}
 		},
 	}
-	for name, setup := range cases {
+}
+
+// rbCheckRefusedMove fails t unless rep shows VM 101's move refused, nothing
+// written for it, and the run gone on with another VM.
+func rbCheckRefusedMove(t *testing.T, f *fakeRebalanceIO, rep RebalanceReport) {
+	t.Helper()
+	if rep.ExitCode != RebalanceExitOK {
+		t.Fatalf("exit %d halted %q", rep.ExitCode, rep.Halted)
+	}
+	if rep.Moves[0].VMID != 101 || rep.Moves[0].Outcome != RebalanceRefused || rep.Moves[0].Error == "" {
+		t.Fatalf("first move %+v", rep.Moves[0])
+	}
+	for _, w := range f.writes() {
+		if strings.HasPrefix(w, "migrate 101") || w == "mark 101 pve02" {
+			t.Fatalf("VM 101 was written: %v", f.writes())
+		}
+	}
+	if !rep.DiffersFromPlan || rep.Count(RebalanceMoved) == 0 {
+		t.Fatalf("the run did not go on with another VM: %v", rbMoves(rep.Moves))
+	}
+	if k := rbSkipKind(rep.Skipped, 101); k != harebalance.SkipRefused && f.vms[101].node == "pve01" {
+		t.Fatalf("VM 101 is skipped as %q, want refused", k)
+	}
+}
+
+func TestRebalanceRun_AMoveThatCannotStartIsRefusedAndTheVMIsExcluded(t *testing.T) {
+	for name, setup := range rbRefusedMoveCases() {
 		t.Run(name, func(t *testing.T) {
 			f := newFakeRebalanceIO()
 			rbSkewed(f)
 			setup(f)
 			rep := rbRun(f, RebalanceOptions{Apply: true}).run(context.Background())
-			if rep.ExitCode != RebalanceExitOK {
-				t.Fatalf("exit %d halted %q", rep.ExitCode, rep.Halted)
-			}
-			if rep.Moves[0].VMID != 101 || rep.Moves[0].Outcome != RebalanceRefused || rep.Moves[0].Error == "" {
-				t.Fatalf("first move %+v", rep.Moves[0])
-			}
-			for _, w := range f.writes() {
-				if strings.HasPrefix(w, "migrate 101") || w == "mark 101 pve02" {
-					t.Fatalf("VM 101 was written: %v", f.writes())
-				}
-			}
-			if !rep.DiffersFromPlan || rep.Count(RebalanceMoved) == 0 {
-				t.Fatalf("the run did not go on with another VM: %v", rbMoves(rep.Moves))
-			}
-			if k := rbSkipKind(rep.Skipped, 101); k != harebalance.SkipRefused && f.vms[101].node == "pve01" {
-				t.Fatalf("VM 101 is skipped as %q, want refused", k)
-			}
+			rbCheckRefusedMove(t, f, rep)
 		})
 	}
 }
