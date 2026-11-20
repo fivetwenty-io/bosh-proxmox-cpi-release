@@ -170,17 +170,35 @@ func refuseMaintenanceTarget(ctx context.Context, deps Deps, target string, logg
 		return createMaintenanceUnknownError(target, err)
 	}
 	entry, ok := report.Node(target)
-	if !ok || entry.Placeable {
+	if !ok {
+		return nil
+	}
+	refusal := targetNodeRefusal(target, entry)
+	switch {
+	case refusal == nil:
+	case entry.Maintenance:
+		logger.Warn("create_vm: target_node " + target + " is in maintenance, so no VM can be created on it")
+	default:
+		logger.Warn("create_vm: target_node " + target + " cannot take new work, so no VM can be created on it")
+	}
+	return refusal
+}
+
+// targetNodeRefusal returns the error that refuses a create on the pinned
+// target node whose health entry is entry, or nil when the node is
+// placeable. A node in maintenance gets the maintenance error, and any other
+// node that cannot take work gets the unplaceable one. Each names the reason
+// health gives, or a default one when health gives none.
+func targetNodeRefusal(target string, entry pve.NodeHealthEntry) error {
+	if entry.Placeable {
 		return nil
 	}
 	reason := entry.Reason
 	if reason == "" {
 		reason = "the node health check does not call it placeable"
 	}
-	if !entry.Maintenance {
-		logger.Warn("create_vm: target_node " + target + " cannot take new work, so no VM can be created on it")
-		return createUnplaceableTargetError(target, reason)
+	if entry.Maintenance {
+		return createMaintenanceTargetError(target, reason)
 	}
-	logger.Warn("create_vm: target_node " + target + " is in maintenance, so no VM can be created on it")
-	return createMaintenanceTargetError(target, reason)
+	return createUnplaceableTargetError(target, reason)
 }

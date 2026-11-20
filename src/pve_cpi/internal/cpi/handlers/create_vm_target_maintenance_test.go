@@ -143,3 +143,33 @@ func TestCreateVM_RefusesATargetNodeWhenTheHealthReadFails(t *testing.T) {
 		t.Fatal("create_vm created a VM although node health was unreadable")
 	}
 }
+
+// TestCreateVM_RefusesATargetNodeThatCannotTakeWork pins the refusal of a
+// pinned node that health calls not placeable although it is not in
+// maintenance, here because its LRM reports an old timestamp. The error must
+// say the node cannot take a new VM and why, not that it is in maintenance,
+// and it must be retriable with no clone.
+func TestCreateVM_RefusesATargetNodeThatCannotTakeWork(t *testing.T) {
+	t.Parallel()
+	c := &maintenanceTargetCluster{lrmText: map[string]string{"pve1": "active", "pve2": "old timestamp - dead?"}}
+	created, err := createOnPinnedNode(t, c)
+	if err == nil {
+		t.Fatal("create_vm succeeded on a target_node that cannot take work")
+	}
+	var typed *cpierrors.Error
+	if !errors.As(err, &typed) || !typed.OkToRetry() {
+		t.Fatalf("want a retriable error, got %T %v", err, err)
+	}
+	for _, want := range []string{`"pve2"`, "cannot take a new VM", "lrm status text reports an old timestamp",
+		"retry once the node can take new work"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not contain %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "in maintenance") {
+		t.Fatalf("error %q calls a node that is not in maintenance in maintenance", err)
+	}
+	if created != 0 {
+		t.Fatal("create_vm created a VM on a node that cannot take work")
+	}
+}
