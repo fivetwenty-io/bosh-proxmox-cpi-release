@@ -5,14 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
-	"math"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
@@ -74,23 +73,17 @@ func haResourceSid(vmid int) string {
 	return "vm:" + strconv.Itoa(vmid)
 }
 
-// applyAntiAffinityMembership is the create_vm entry point for HA
-// anti-affinity, and it returns the name of the rule the VM was placed in, or
-// "" when it was placed in none. It writes only for a VM whose HA decision
-// registers it, when pve.ha.anti_affinity is not off, scheduler-soft
-// anti-affinity is enabled, and the VM carries an instance-group name. The
-// decision already required a profile that lets the CPI write HA state. Every
-// failure is returned for the caller, which fails the call when
-// propagateHARuleError says so and otherwise runs the VM without HA, so a VM
-// never runs under HA without the spread rule it was meant to join.
+// applyAntiAffinityMembership puts a VM into the rules of its anti-affinity
+// group, and it returns the name of the rule the VM was placed in, or "" when
+// it was placed in none. set_vm_metadata calls it, because the rules choose
+// their members by instance index and the Director names the index there. It
+// writes only when pve.ha.mode is not off, pve.ha.anti_affinity is not off,
+// scheduler-soft anti-affinity is enabled, and the identity names a group.
+// Every failure is returned for the caller.
 func applyAntiAffinityMembership(
-	ctx context.Context, deps Deps, d *ha.VMDecision, env map[string]any, logger *log.Logger,
+	ctx context.Context, deps Deps, ident haIdentity, vmid int, opts aaJoinOpts, logger *log.Logger,
 ) (string, error) {
-	if !d.Registers() || deps.Config.HAAntiAffinityValue() == config.HARuleOff || !deps.Config.AntiAffinityEnabled() {
-		return "", nil
-	}
-	ident := haIdentityFor(deps, env)
-	if ident.Group == "" {
+	if !antiAffinityJoinEnabled(deps.Config) || ident.Group == "" {
 		return "", nil
 	}
 	if ident.Owner == "" {
@@ -99,7 +92,13 @@ func applyAntiAffinityMembership(
 		return "", fmt.Errorf("anti-affinity: the request carries no director_uuid to mark the rule of group %q with",
 			ident.Group)
 	}
-	return ensureAntiAffinityMembershipFor(ctx, deps, ident, d.VMID, d, logger)
+	return ensureAntiAffinityMembershipWith(ctx, deps, ident, vmid, nil, opts, logger)
+}
+
+// antiAffinityJoinEnabled reports whether the settings let a VM join its
+// group's anti-affinity rules.
+func antiAffinityJoinEnabled(cfg *config.CPIConfig) bool {
+	return cfg.HAWritesEnabled() && cfg.HAAntiAffinityValue() != config.HARuleOff && cfg.AntiAffinityEnabled()
 }
 
 // ensureAntiAffinityMembership adds the VM to the cluster-level negative
@@ -140,6 +139,26 @@ func ensureAntiAffinityMembership(ctx context.Context, deps Deps, ident haIdenti
 func ensureAntiAffinityMembershipFor(
 	ctx context.Context, deps Deps, ident haIdentity, vmid int, d *ha.VMDecision, logger *log.Logger,
 ) (string, error) {
+	return ensureAntiAffinityMembershipWith(ctx, deps, ident, vmid, d, aaJoinOpts{index: -1}, logger)
+}
+
+// aaJoinOpts tunes how a VM joins its group's rules.
+type aaJoinOpts struct {
+	// index is the VM's instance index, or -1 to read it from the VM's
+	// index tag or name.
+	index int
+	// checkSelf puts the VM's own join through the feasibility checks every
+	// other member's join gets, so a join that would make the rules conflict
+	// leaves the VM out instead of sending a write PVE refuses.
+	checkSelf bool
+}
+
+// ensureAntiAffinityMembershipWith is ensureAntiAffinityMembershipFor with
+// the join tuned by opts.
+func ensureAntiAffinityMembershipWith(
+	ctx context.Context, deps Deps, ident haIdentity, vmid int, d *ha.VMDecision, opts aaJoinOpts,
+	logger *log.Logger,
+) (string, error) {
 	if !ident.valid() {
 		return "", nil
 	}
@@ -156,7 +175,8 @@ func ensureAntiAffinityMembershipFor(
 	var loss groupRuleLoss
 	err = withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		var lockedErr error
-		placedIn, loss, lockedErr = ensureAntiAffinityMembershipLocked(ctx, deps, profile, ident, vmid, d, logger)
+		placedIn, loss, lockedErr = ensureAntiAffinityMembershipLocked(ctx, deps, profile, ident, vmid, d, opts,
+			logger)
 		return lockedErr
 	})
 	if loss.lost && !deps.Config.ClusterLockEnabled() {
@@ -229,7 +249,7 @@ func acquireAntiAffinityLock(
 // does, and so does a pin repair's write, even when a later step fails.
 func ensureAntiAffinityMembershipLocked(
 	ctx context.Context, deps Deps, profile *ha.Profile, ident haIdentity, vmid int,
-	d *ha.VMDecision, logger *log.Logger,
+	d *ha.VMDecision, opts aaJoinOpts, logger *log.Logger,
 ) (placedIn string, loss groupRuleLoss, err error) {
 	sid := haResourceSid(vmid)
 
@@ -244,7 +264,7 @@ func ensureAntiAffinityMembershipLocked(
 	// resources again, because a sibling's create may stage its resource, or
 	// roll it back, between two of this writer's attempts.
 	planner := newGroupPlanner(ctx, deps, profile, ident, scan, logger)
-	planner.sid = sid
+	planner.sid, planner.index, planner.checkSelf = sid, opts.index, opts.checkSelf
 	writer, res, err := applyCreatePlan(ctx, deps, profile, planner, d, &loss, logger)
 	if err != nil {
 		return "", loss, err
@@ -272,18 +292,28 @@ func newGroupPlanner(
 	ctx context.Context, deps Deps, profile *ha.Profile, ident haIdentity, scan *groupScan, logger *log.Logger,
 ) *aaPlanner {
 	svc := deps.PVE.Cluster()
+	p := newAAPlanner(deps.Config, profile, ident, scan, logger)
+	p.managed = func() (map[string]string, error) {
+		return listHAResources(ctx, svc)
+	}
+	p.rescan = func() (*groupScan, error) {
+		return collectGroupMemberSids(ctx, deps, ident)
+	}
+	return p
+}
+
+// newAAPlanner returns a planner of ident's group rules over scan that reads
+// no PVE state of its own. Its caller sets managed and rescan when the plan
+// should read them.
+func newAAPlanner(
+	cfg *config.CPIConfig, profile *ha.Profile, ident haIdentity, scan *groupScan, logger *log.Logger,
+) *aaPlanner {
 	return &aaPlanner{
-		ident: ident, scan: scan, logger: logger,
-		nodes:        len(profileNodeNames(profile)),
+		ident: ident, scan: scan, logger: logger, index: -1,
 		clusterNodes: profileNodeNames(profile),
-		placeable:    placeableNodeCount(profile),
-		split:        deps.Config.HAAntiAffinityOverflowValue() == config.HAOverflowSplit,
-		managed: func() (map[string]struct{}, error) {
-			return listHAResourceSids(ctx, svc)
-		},
-		rescan: func() (*groupScan, error) {
-			return collectGroupMemberSids(ctx, deps, ident)
-		},
+		topo:         newAATopology(cfg, profile),
+		split:        cfg.HAAntiAffinityOverflowValue() == config.HAOverflowSplit,
+		pattern:      cfg.HAAntiAffinityPatternValue(),
 	}
 }
 
@@ -446,183 +476,15 @@ func (l *groupRuleLoss) add(res *ha.ApplyResult, ident haIdentity) {
 	l.confined = append(l.confined, res.Confined...)
 	for i := range res.Wrote {
 		op := &res.Wrote[i]
-		if _, ok := aaChunkIndex(base, op.Rule.ID); ok && op.Kind == ha.OpDelete {
+		if aapattern.IsGroupRule(base, op.Rule.ID) && op.Kind == ha.OpDelete {
 			l.lost = true
 		}
 	}
 	for i := range res.Repaired {
-		if _, ok := aaChunkIndex(base, res.Repaired[i].Rule.ID); ok {
+		if aapattern.IsGroupRule(base, res.Repaired[i].Rule.ID) {
 			l.lost = true
 		}
 	}
-}
-
-// aaPlanner plans a group's negative rules from the member scan and a read of
-// the rules. It is called again after every write with a fresh read, so it
-// returns no writes once the rules hold the plan.
-//
-// A group's rule is bosh-aa-<hash12>. With pve.ha.anti_affinity_overflow
-// split, a group with more members than the cluster's configured nodes spills
-// into bosh-aa-<hash12>-2, -3, and so on, because PVE disables a negative rule
-// with more members than configured nodes. With skip, the default, such a group
-// gets no rule written, and the reason is logged. Either way a member joins a
-// rule only while that rule has fewer members than placeable nodes, so a node in
-// maintenance never makes the CPI rewrite a rule, and a replacement member waits
-// until it can be placed apart. Existing members keep their rule.
-//
-// A scanned sibling joins a rule only once it is an HA resource. PVE refuses
-// a rule that names a resource it does not manage, and the Director creates an
-// instance group's VMs in parallel, so a sibling whose create has tagged its
-// guest but not yet staged its resource would make every write of this create
-// fail. Such a sibling is left out, and its own create adds it once its
-// resource is staged. Each create stages its resource and then scans, reads
-// the resources, and plans, so of any two siblings the one that staged second
-// sees the other as managed. Every write carries the digest of the read it
-// was planned from and keeps every member that read held whose guest is live,
-// so no write drops another's member, and the group converges on every
-// sibling. The scan is older than the read, so a plan that would drop a member
-// whose guest the scan missed scans again first. That holds
-// without the rules lock, which pve.cluster_lock turns on and which only
-// serializes the writers. Without it, siblings whose writes collide on the
-// digest plan again, and a writer that plans again usually finds itself
-// already added by a sibling that saw it as managed.
-type aaPlanner struct {
-	ident haIdentity
-	// sid is the member the plan is for, or "". A create's own member always
-	// joins, because its create staged its resource first.
-	sid string
-	// heal plans the group's rules again after a delete, for no create of its
-	// own. sid then joins only while it is an HA resource, like every scanned
-	// member, so a member that another removal purges while the heal runs
-	// drops out of the plan on the next read of the resources.
-	heal bool
-	// exclude is the sid of a member that delete_vm is removing, or "". The
-	// plan drops it from the rules and never adds it.
-	exclude string
-	// holdOut holds the members of the confinement pins that a repair took
-	// out of the group's writes. A heal, or a create that plans again after
-	// such a repair, keeps such a member where a rule still holds it and adds
-	// it to no rule, because the write that adds it would put its pin out of
-	// effect again. The plan finds a conflict that the CPI's own feasibility
-	// checks can see by itself (see joinConflicts), so holdOut matters only
-	// for one that PVE alone reports.
-	holdOut   map[string]bool
-	scan      *groupScan
-	logger    *log.Logger
-	nodes     int
-	placeable int
-	split     bool
-	// clusterNodes is the configured node set, or nil when it is unknown.
-	// The feasibility checks use it, and nil turns off the plan's own check
-	// of a join. A member's soft pin is widened to it (see flattenMemberPins).
-	clusterNodes []string
-	// managed lists the sids PVE manages as HA resources. It is read on
-	// every plan. Nil treats every scanned member as managed.
-	managed func() (map[string]struct{}, error)
-	// rescan scans the group's members again. A plan calls it before it
-	// drops a rule member whose guest the scan did not see, because the scan
-	// is older than the rule read it plans from. A sibling whose guest is
-	// newer than the scan can have written itself into the rule since, after
-	// a digest conflict or a backoff, and only a scan taken after the read
-	// can tell that member from one whose guest is gone. Nil keeps the scan.
-	rescan func() (*groupScan, error)
-
-	// placedIn is the rule this VM is in after the last plan, or "".
-	placedIn string
-	logged   bool
-	// managedNow is the last plan's read of managed, or nil.
-	managedNow map[string]struct{}
-	// deferred holds the siblings already logged as left out for now.
-	deferred map[string]bool
-	// conflicted holds the members already logged as left out because their
-	// join would bring on a feasibility conflict.
-	conflicted map[string]bool
-	// alone holds the members already logged as in no rule because the plan
-	// put each one alone in a rule of its own.
-	alone map[string]bool
-}
-
-// aaChunkName names a group's n-th rule, the first being the bare name.
-func aaChunkName(base string, n int) string {
-	if n <= 1 {
-		return base
-	}
-	return base + "-" + strconv.Itoa(n)
-}
-
-// aaChunkIndex returns n when id is the group's n-th rule.
-func aaChunkIndex(base, id string) (int, bool) {
-	if id == base {
-		return 1, true
-	}
-	rest, ok := strings.CutPrefix(id, base+"-")
-	if !ok {
-		return 0, false
-	}
-	n, err := strconv.Atoi(rest)
-	if err != nil || n < 2 || strconv.Itoa(n) != rest {
-		return 0, false
-	}
-	return n, true
-}
-
-func (p *aaPlanner) plan(set *ha.RuleSet) ([]ha.RuleOp, error) {
-	p.placedIn = ""
-	if p.managed != nil {
-		managed, err := p.managed()
-		if err != nil {
-			return nil, fmt.Errorf("anti-affinity: list HA resources: %w", err)
-		}
-		p.managedNow = managed
-	}
-	existing, maxIndex, err := p.existingChunks(set)
-	if err != nil {
-		return nil, err
-	}
-	if p.rescan != nil && p.wouldDropUnseen(existing) {
-		scan, err := p.rescan()
-		if err != nil {
-			return nil, fmt.Errorf("anti-affinity: scan group members again: %w", err)
-		}
-		p.scan = scan
-	}
-	desired, assigned := p.keptMembers(existing, maxIndex)
-	if p.skipOversized(assigned) {
-		return nil, nil
-	}
-	maxIndex = p.assignPending(set, existing, desired, assigned, maxIndex)
-	return p.chunkOps(set, existing, desired, maxIndex), nil
-}
-
-// skipOversized reports whether skip mode leaves the group's rules alone,
-// because the group has more members than the cluster's configured nodes. PVE
-// disables a negative rule that large, so skip writes no rule: a new group gets
-// none, and an existing rule keeps the members it has. Split mode, and a cluster
-// whose configured nodes are unknown, never skip.
-func (p *aaPlanner) skipOversized(assigned map[string]bool) bool {
-	if p.split || p.nodes <= 0 {
-		return false
-	}
-	total := len(assigned)
-	if p.sid != "" && p.sid != p.exclude && !assigned[p.sid] {
-		total++
-	}
-	for s := range p.scan.members {
-		if s != p.sid && s != p.exclude && !assigned[s] {
-			total++
-		}
-	}
-	if total <= p.nodes {
-		return false
-	}
-	if !p.logged {
-		p.logged = true
-		p.logger.Warn("anti-affinity: this group has more instances than the cluster has nodes, so no rule is "+
-			"written for it (pve.ha.anti_affinity_overflow is skip; split divides the group into rules that fit)",
-			log.String("rule", p.ident.ruleName()), log.String("sid", p.sid), log.Int("members", total),
-			log.Int("configured_nodes", p.nodes), log.String("overflow", config.HAOverflowSkip))
-	}
-	return true
 }
 
 // heldByChunks returns the sids of mine that one of the group's hashed rules
@@ -635,7 +497,7 @@ func heldByChunks(set *ha.RuleSet, ident haIdentity, mine map[string]struct{}) m
 	out := map[string]struct{}{}
 	for i := range set.Rules {
 		r := &set.Rules[i]
-		if _, ok := aaChunkIndex(base, r.ID); !ok || r.Disabled {
+		if !aapattern.IsGroupRule(base, r.ID) || r.Disabled {
 			continue
 		}
 		for _, sid := range r.Resources {
@@ -647,461 +509,31 @@ func heldByChunks(set *ha.RuleSet, ident haIdentity, mine map[string]struct{}) m
 	return out
 }
 
-// existingChunks returns the group's rules keyed by chunk index, and the
-// highest index. A rule under our hashed name that does not carry our marker is
-// not ours to rewrite, so it fails the plan.
-func (p *aaPlanner) existingChunks(set *ha.RuleSet) (map[int]*ha.Rule, int, error) {
-	base := p.ident.ruleName()
-	existing := map[int]*ha.Rule{}
-	maxIndex := 0
-	for i := range set.Rules {
-		r := &set.Rules[i]
-		n, ok := aaChunkIndex(base, r.ID)
-		if !ok {
-			continue
-		}
-		if haOwnershipOf(r.Comment, p.ident.Owner) != haOwnedByUs || r.Type != haRuleType {
-			return nil, 0, fmt.Errorf("anti-affinity: rule %q exists without this Director's ownership marker; "+
-				"leaving it alone", r.ID)
-		}
-		existing[n] = r
-		maxIndex = max(maxIndex, n)
-	}
-	return existing, maxIndex, nil
-}
-
-// wouldDropUnseen reports whether keptMembers would drop a member of an
-// existing rule because the scan saw no live guest for it. The excluded
-// member goes whatever the scan says, so it never calls for a rescan.
-func (p *aaPlanner) wouldDropUnseen(existing map[int]*ha.Rule) bool {
-	if !p.scan.liveComplete {
-		return false
-	}
-	for _, r := range existing {
-		for _, s := range r.Resources {
-			if s == p.exclude {
-				continue
-			}
-			if _, ok := p.scan.live[s]; !ok {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// keptMembers returns the members each existing rule keeps.
-//
-// This ensure path only ever grows a rule: the existing members stay, whatever
-// the scan says. However authoritative the scan, its TAG view can still trail
-// reality (a same-group twin mid-create has no tag yet), and the delete path
-// (removeAntiAffinityMembership) is the sole authority for shrinking. The one
-// exception is a sid whose GUEST no longer exists anywhere in the fleet, which
-// is dropped only when the enumeration covered every member (liveComplete),
-// because a rule around a dangling sid would name a resource PVE no longer has
-// and wedge every later create.
-func (p *aaPlanner) keptMembers(existing map[int]*ha.Rule, maxIndex int) (map[int][]string, map[string]bool) {
-	desired := map[int][]string{}
-	assigned := map[string]bool{}
-	for n := 1; n <= maxIndex; n++ {
-		r := existing[n]
-		if r == nil {
-			continue
-		}
-		for _, s := range r.Resources {
-			if s == p.exclude {
-				continue
-			}
-			if _, ok := p.scan.live[s]; !ok && p.scan.liveComplete {
-				p.logger.Info("anti-affinity: dropping rule member with no live guest",
-					log.String("rule", r.ID), log.String("sid", s))
-				continue
-			}
-			if assigned[s] {
-				continue
-			}
-			assigned[s] = true
-			desired[n] = append(desired[n], s)
-		}
-	}
-	return desired, assigned
-}
-
-// assignPending places this VM and every scanned member not yet in a rule into
-// the first rule with room, opening a new rule in split mode (or when the group
-// has none), and returns the new highest index. A rule has room while it holds
-// fewer members than the configured nodes and the placeable nodes. A scanned
-// member that is not an HA resource yet waits for its own create to add it.
-// This VM is always pending, because create_vm stages its resource first,
-// except in a heal, where it joins only while it is managed.
-//
-// Every other member joins only when the CPI's feasibility checks find that
-// its join brings on no conflict that the rule set without it lacks, such as
-// a second member whose strict pin allows only the nodes another member's pin
-// already needs. A rule that conflicts already takes no such member either,
-// because the writer refuses to write it whether or not the join is the
-// cause. The write that adds such a member would be refused before it
-// is sent, or would put a strict pin out of effect, so the plan leaves the
-// member out and writes the rest. Every writer of the group plans the same
-// way from the rules it reads, so none of them puts the member back while the
-// conflict lasts, and the first plan after the pin goes away or widens adds
-// it. This VM's own join is never held out, so a create whose own pin
-// conflicts still fails or logs the refusal the way its mode says.
-//
-// A member whose join conflicts with one rule is tried in each later rule
-// with room, which split mode gives a group with more members than nodes,
-// and it joins the first one where its join brings on no conflict. It stays
-// out only when every rule with room refuses it. No new rule opens for it
-// then, because a rule opens only once every rule is full, and every later
-// plan tries the member again. A rule that holds members comes before an
-// index whose rule a delete left out, and a member that a rule refused never
-// fills such a gap, because alone there it would be in no rule.
-func (p *aaPlanner) assignPending(
-	set *ha.RuleSet, existing map[int]*ha.Rule, desired map[int][]string, assigned map[string]bool, maxIndex int,
-) int {
-	pending := map[string]struct{}{}
-	candidates := maps.Clone(p.scan.members)
-	if p.sid != "" {
-		if candidates == nil {
-			candidates = map[string]struct{}{}
-		}
-		candidates[p.sid] = struct{}{}
-	}
-	for s := range candidates {
-		if s == p.exclude || p.holdOut[s] && !assigned[s] {
-			continue
-		}
-		if (p.heal || s != p.sid) && !assigned[s] && !p.isManaged(s) {
-			p.logDeferred(s)
-			continue
-		}
-		pending[s] = struct{}{}
-	}
-	room := p.nodes
-	if room <= 0 {
-		room = math.MaxInt
-	}
-	if p.placeable > 0 {
-		room = min(room, p.placeable)
-	}
-	for _, s := range strings.Split(sidsCSV(pending), ",") {
-		if s == "" || assigned[s] {
-			continue
-		}
-		fit := p.fitMember(set, existing, desired, maxIndex, room, s)
-		target := fit.target
-		if target == 0 && !fit.roomy && (p.split || maxIndex == 0) {
-			maxIndex++
-			target = maxIndex
-		}
-		if target == 0 {
-			if len(fit.refused) > 0 {
-				p.logConflicted(s, strings.Join(fit.refused, ","), fit.bad)
-			} else {
-				p.logOverflow(s, len(desired[1]))
-			}
-			continue
-		}
-		assigned[s] = true
-		desired[target] = append(desired[target], s)
-	}
-	return maxIndex
-}
-
-// memberFit is where a pending member fits among the group's rules.
-type memberFit struct {
-	// target is the first rule with room that s can join, or 0.
-	target int
-	// roomy says that at least one rule had room.
-	roomy bool
-	// refused names the rules with room that s's join would make conflict,
-	// and bad holds the conflicts those joins bring on.
-	refused []string
-	bad     map[string][]string
-}
-
-// fitMember tries s in each of the group's rules that holds members and
-// fewer than room of them, in index order, and returns the first one where
-// its join brings on no conflict. The create's own VM is never checked,
-// except in a heal. Only when no rule with members takes s does it try an
-// index the plan has given no members yet, such as one whose rule a delete
-// left out, because s alone there ends up in no rule. An index like that
-// takes s only when no rule refused it, the way a new rule would, so a member
-// whose join conflicts stays out and is logged rather than fill the gap
-// alone.
-func (p *aaPlanner) fitMember(
-	set *ha.RuleSet, existing map[int]*ha.Rule, desired map[int][]string, maxIndex, room int, s string,
-) memberFit {
-	var fit memberFit
-	for n := 1; n <= maxIndex; n++ {
-		if len(desired[n]) == 0 || len(desired[n]) >= room {
-			continue
-		}
-		fit.roomy = true
-		if p.heal || s != p.sid {
-			if conflicts := p.joinConflicts(set, existing[n], n, desired[n], s); len(conflicts) > 0 {
-				fit.refused = append(fit.refused, aaChunkName(p.ident.ruleName(), n))
-				if fit.bad == nil {
-					fit.bad = map[string][]string{}
-				}
-				maps.Copy(fit.bad, conflicts)
-				continue
-			}
-		}
-		fit.target = n
-		return fit
-	}
-	for n := 1; n <= maxIndex; n++ {
-		if len(desired[n]) != 0 || room <= 0 {
-			continue
-		}
-		fit.roomy = true
-		if len(fit.refused) == 0 {
-			fit.target = n
-			return fit
-		}
-	}
-	return fit
-}
-
-// joinConflicts returns the feasibility conflicts that adding s to the
-// group's n-th rule, which the plan has given members so far, would leave in
-// the rules, or nil when there are none. It checks the rules the way the
-// writer's check before a send does, with the rule written as chunkOps writes
-// it and with the members' pins flattened. Like that check, it counts every
-// conflict on the n-th rule itself, even one the rule had before the join,
-// because the writer refuses to write a rule that conflicts at all. On every
-// other rule it counts only a conflict that the rule set without s lacks.
-// With the configured nodes unknown it checks nothing, as the writer does.
-func (p *aaPlanner) joinConflicts(
-	set *ha.RuleSet, cur *ha.Rule, n int, members []string, s string,
-) map[string][]string {
-	if len(p.clusterNodes) == 0 || len(members) == 0 || set == nil {
-		return nil
-	}
-	name := aaChunkName(p.ident.ruleName(), n)
-	with := append(slices.Clone(members), s)
-	return ha.IntroducedConflicts(p.chunkCandidate(set, cur, name, members), p.chunkCandidate(set, cur, name, with),
-		[]string{name}, p.clusterNodes)
-}
-
-// chunkCandidate returns set's rules with the rule name holding members, the
-// way chunkOps writes it, and with the members' pins flattened. A rule left
-// with fewer than two members is left out, because chunkOps deletes it.
-func (p *aaPlanner) chunkCandidate(set *ha.RuleSet, cur *ha.Rule, name string, members []string) []ha.Rule {
-	members = slices.Sorted(slices.Values(members))
-	flat := map[string]ha.Rule{}
-	ops := flattenMemberPins(set, members, p.ident.Owner, p.clusterNodes)
-	for i := range ops {
-		flat[ops[i].Rule.ID] = ops[i].Rule
-	}
-	out := make([]ha.Rule, 0, len(set.Rules)+1)
-	for i := range set.Rules {
-		r := set.Rules[i]
-		if r.ID == name {
-			continue
-		}
-		if f, ok := flat[r.ID]; ok {
-			r = f
-		}
-		out = append(out, r)
-	}
-	if len(members) < 2 {
-		return out
-	}
-	chunk := ha.Rule{ID: name, Type: haRuleType, Affinity: haRuleAffinity, Resources: members,
-		Comment: p.ident.marker()}
-	if cur != nil {
-		chunk = cur.Clone()
-		chunk.Resources, chunk.Affinity, chunk.Errors = members, haRuleAffinity, nil
-	}
-	return append(out, chunk)
-}
-
-// logConflicted says once per member that it stays out of the group's rules
-// while its join would bring on the conflicts in bad.
-func (p *aaPlanner) logConflicted(sid, rule string, bad map[string][]string) {
-	if p.conflicted[sid] {
-		return
-	}
-	if p.conflicted == nil {
-		p.conflicted = map[string]bool{}
-	}
-	p.conflicted[sid] = true
-	p.logger.Warn("anti-affinity: member left out of the group's rule, because adding it would make the rules "+
-		"conflict, which would refuse the write or put a strict pin out of effect; a later write of the group "+
-		"adds it once the conflict is gone",
-		log.String("sid", sid), log.String("rule", rule),
-		log.String("conflicting", strings.Join(slices.Sorted(maps.Keys(bad)), ",")), log.String("joining", p.sid))
-}
-
-// logHeldOut says once per member, at Warn, that a pin repair took it out of
-// this create's write and that the create plans the group's rules again
-// without it. The member is then in no rule of the group, and under the
-// rules lock no heal follows to tell the operator, so the line names the pin
-// that PVE put out of effect.
-func (p *aaPlanner) logHeldOut(siblings []string) {
-	for _, sid := range siblings {
-		if p.conflicted[sid] {
-			continue
-		}
-		if p.conflicted == nil {
-			p.conflicted = map[string]bool{}
-		}
-		p.conflicted[sid] = true
-		pin := ""
-		if vmid, ok := vmidFromSid(sid); ok {
-			pin = naRuleNameFor(vmid)
-		}
-		p.logger.Warn("anti-affinity: member left out of the group's rule, because PVE put its strict pin out "+
-			"of effect when this create added it and a repair took it back out; a later write of the group adds "+
-			"it once its pin goes away or allows more nodes",
-			log.String("sid", sid), log.String("rule", p.ident.ruleName()), log.String("pin", pin),
-			log.String("joining", p.sid))
-	}
-}
-
-// chunkOps returns the writes that make the group's rules hold desired, led by
-// the pin rewrites their members need, or nil when the rules and the pins
-// already hold. A member's pin that needs a rewrite gets it on any plan of the
-// group, even one that leaves the group's rules as they are.
-func (p *aaPlanner) chunkOps(set *ha.RuleSet, existing map[int]*ha.Rule, desired map[int][]string,
-	maxIndex int) []ha.RuleOp {
-	base := p.ident.ruleName()
-	p.logAlone(desired, maxIndex)
-	var pins, ops []ha.RuleOp
-	for n := 1; n <= maxIndex; n++ {
-		name := aaChunkName(base, n)
-		members := desired[n]
-		sort.Strings(members)
-		cur := existing[n]
-		if len(members) < 2 {
-			// A negative rule is meaningless below two members: remove a
-			// stale one left from an earlier, larger membership.
-			if cur != nil {
-				ops = append(ops, ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: name}})
-			}
-			continue
-		}
-		if slices.Contains(members, p.sid) {
-			p.placedIn = name
-		}
-		pins = append(pins, flattenMemberPins(set, members, p.ident.Owner, p.clusterNodes)...)
-		want := ha.Rule{ID: name, Type: haRuleType, Affinity: haRuleAffinity, Resources: members,
-			Comment: p.ident.marker()}
-		switch {
-		case cur == nil:
-			ops = append(ops, ha.RuleOp{Kind: ha.OpCreate, Rule: want})
-		case !slices.Equal(cur.Resources, members) || cur.Affinity != haRuleAffinity:
-			next := cur.Clone()
-			next.Resources, next.Affinity, next.Errors = members, haRuleAffinity, nil
-			ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: next})
-		}
-	}
-	if len(ops) == 0 && len(pins) == 0 {
-		return nil
-	}
-	return append(pins, ops...)
-}
-
-// logAlone says once per member, at Warn, that the plan put it alone in one of
-// the group's rules while another rule of the group holds two members or
-// more. chunkOps writes no rule below two members, so such a member is in no
-// rule of the group, which split mode reaches when the group has one member
-// more than a whole number of rules hold. A group with no rule at all is left
-// to the overflow and deferral lines, which already say why.
-func (p *aaPlanner) logAlone(desired map[int][]string, maxIndex int) {
-	grouped := false
-	for n := 1; n <= maxIndex; n++ {
-		grouped = grouped || len(desired[n]) >= 2
-	}
-	if !grouped {
-		return
-	}
-	for n := 1; n <= maxIndex; n++ {
-		if len(desired[n]) != 1 || p.alone[desired[n][0]] {
-			continue
-		}
-		sid := desired[n][0]
-		if p.alone == nil {
-			p.alone = map[string]bool{}
-		}
-		p.alone[sid] = true
-		p.logger.Warn("anti-affinity: member is in none of the group's rules, because the plan put it alone in a "+
-			"rule of its own and a negative rule needs two members; the next member of the group that the plan "+
-			"puts in that rule writes it with both",
-			log.String("sid", sid), log.String("rule", aaChunkName(p.ident.ruleName(), n)),
-			log.String("joining", p.sid))
-	}
-}
-
-// isManaged reports whether the last plan's read lists sid as an HA resource.
-// Without a read every member counts as managed.
-func (p *aaPlanner) isManaged(sid string) bool {
-	if p.managedNow == nil {
-		return true
-	}
-	_, ok := p.managedNow[sid]
-	return ok
-}
-
-// logDeferred says once per sibling that it stays out of the rule until its
-// own create adds it.
-func (p *aaPlanner) logDeferred(sid string) {
-	if p.deferred[sid] {
-		return
-	}
-	if p.deferred == nil {
-		p.deferred = map[string]bool{}
-	}
-	p.deferred[sid] = true
-	p.logger.Info("anti-affinity: sibling is not an HA resource yet, so its own create adds it to the rule",
-		log.String("sid", sid), log.String("rule", p.ident.ruleName()), log.String("joining", p.sid))
-}
-
-// listHAResourceSids returns the sids of every HA resource PVE manages. A
-// resource staged as ignored is managed too, and PVE accepts it in a rule.
-func listHAResourceSids(ctx context.Context, svc cluster.Service) (map[string]struct{}, error) {
+// listHAResources returns the comment of every HA resource PVE manages, keyed
+// by its sid. A resource staged as ignored is managed too, and PVE accepts it
+// in a rule.
+func listHAResources(ctx context.Context, svc cluster.Service) (map[string]string, error) {
 	rows, err := svc.ListHaResources(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]struct{}{}
+	out := map[string]string{}
 	if rows == nil {
 		return out, nil
 	}
 	for _, raw := range *rows {
 		var row struct {
-			SID string `json:"sid"`
+			SID     string `json:"sid"`
+			Comment string `json:"comment"`
 		}
 		if err := json.Unmarshal(raw, &row); err != nil {
 			return nil, fmt.Errorf("decode an HA resource row: %w", err)
 		}
 		if row.SID != "" {
-			out[row.SID] = struct{}{}
+			out[row.SID] = row.Comment
 		}
 	}
 	return out, nil
-}
-
-// logOverflow says once per plan why a member stays out of every rule: in
-// split mode, or when the configured nodes are unknown, only because the
-// cluster has fewer placeable nodes than the group has members.
-func (p *aaPlanner) logOverflow(sid string, size int) {
-	if p.logged {
-		return
-	}
-	p.logged = true
-	mode := config.HAOverflowSkip
-	if p.split {
-		mode = config.HAOverflowSplit
-	}
-	p.logger.Warn("anti-affinity: member left out of the group's rules, because the cluster has fewer placeable "+
-		"nodes than the group has members; a later create adds it once it can be placed apart from every other "+
-		"member",
-		log.String("sid", sid), log.String("rule", p.ident.ruleName()), log.Int("members", size),
-		log.Int("configured_nodes", p.nodes), log.Int("placeable_nodes", p.placeable),
-		log.String("overflow", mode))
 }
 
 // flattenMemberPins returns the writes that give every member's CPI pin a
@@ -1407,6 +839,12 @@ func planAntiAffinityRemoval(set *ha.RuleSet, sid, owner string, comments map[st
 		}
 		next := r.Clone()
 		next.Resources, next.Errors = rest, nil
+		// The member stays an HA resource until the purge that follows, so
+		// the write records it as leaving, and no plan of the group puts it
+		// back meanwhile.
+		if m, ok := parseHaMarker(r.Comment); ok && haOwnershipOf(r.Comment, owner) == haOwnedByUs {
+			next.Comment = withLeavingMembers(r.Comment, append(slices.Clone(m.Left), sid))
+		}
 		ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: next})
 	}
 	return ops
@@ -1488,7 +926,7 @@ func deletedGroupRules(deleted map[string]string, owner string) []haIdentity {
 			continue
 		}
 		ident := haIdentity{Owner: owner, Deployment: m.Deployment, Group: m.Group}
-		if _, ok := aaChunkIndex(ident.ruleName(), id); !ok || !ident.valid() || seen[ident.ruleName()] {
+		if !aapattern.IsGroupRule(ident.ruleName(), id) || !ident.valid() || seen[ident.ruleName()] {
 			continue
 		}
 		seen[ident.ruleName()] = true
@@ -1594,8 +1032,8 @@ func healAntiAffinityGroup(
 // group that this Director owns and that holds fewer than two members. A VM
 // leaving HA through the purge of its resource drops out of its rule, and a
 // rule left with one member spreads nothing, which some PVE versions keep as a
-// rule rather than removing it. The group's rules are its hashed rule and that
-// rule's chunks. A rule another Director owns, or one with no marker, is left
+// rule rather than removing it. The group's rules are every rule that
+// aapattern.IsGroupRule names, its block rules and its pattern rules. A rule another Director owns, or one with no marker, is left
 // alone. It runs under the HA rules lock and reports the writer's error.
 // Without the lock, a prune that deleted a rule writes the group's rules again
 // afterwards, with the VM kept out, as a removal does.
@@ -1615,7 +1053,7 @@ func pruneGroupAntiAffinityRules(ctx context.Context, deps Deps, ident haIdentit
 			var ops []ha.RuleOp
 			for i := range set.Rules {
 				r := &set.Rules[i]
-				if _, ok := aaChunkIndex(base, r.ID); !ok || r.Type != haRuleType {
+				if !aapattern.IsGroupRule(base, r.ID) || r.Type != haRuleType {
 					continue
 				}
 				if haOwnershipOf(r.Comment, ident.Owner) != haOwnedByUs || len(r.Resources) >= 2 {
@@ -1664,6 +1102,9 @@ type groupScan struct {
 	// liveComplete is true only when the enumeration covered every cluster
 	// member.
 	liveComplete bool
+	// guests holds the guest of each sid in members, from which a plan reads
+	// the member's instance index.
+	guests map[string]pve.GuestRef
 }
 
 // collectGroupMemberSids scans the cluster for QEMU guests that belong to the
@@ -1694,11 +1135,18 @@ func collectGroupMemberSids(ctx context.Context, deps Deps, ident haIdentity) (*
 	if err != nil {
 		return nil, err
 	}
+	return scanGroupMembers(guests, len(excluded) == 0, ident), nil
+}
+
+// scanGroupMembers finds the members of ident's group among guests, which
+// lists every live guest when complete is true. See collectGroupMemberSids.
+func scanGroupMembers(guests []pve.GuestRef, complete bool, ident haIdentity) *groupScan {
 	scan := &groupScan{
 		members:      make(map[string]struct{}),
 		legacy:       make(map[string]struct{}),
 		live:         make(map[string]struct{}, len(guests)),
-		liveComplete: len(excluded) == 0,
+		liveComplete: complete,
+		guests:       make(map[string]pve.GuestRef),
 	}
 	groupTag := ident.ruleName()
 	legacyTags := legacyMemberTags(ident)
@@ -1708,12 +1156,14 @@ func collectGroupMemberSids(ctx context.Context, deps Deps, ident haIdentity) (*
 		switch {
 		case tagsContain(g.Tags, groupTag):
 			scan.members[sid] = struct{}{}
+			scan.guests[sid] = g
 		case len(legacyTags) > 0 && tagsContainAll(g.Tags, legacyTags):
 			scan.members[sid] = struct{}{}
 			scan.legacy[sid] = struct{}{}
+			scan.guests[sid] = g
 		}
 	}
-	return scan, nil
+	return scan
 }
 
 // legacyMemberTags returns the tags that together prove a guest without the

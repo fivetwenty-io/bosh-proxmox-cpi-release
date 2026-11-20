@@ -169,7 +169,11 @@ func (s *aaClusterStub) ListHaResources(_ context.Context, _ *cluster.ListHaReso
 		if !ok {
 			continue
 		}
-		raw, _ := json.Marshal(map[string]any{"sid": sid, "state": "started"})
+		row := map[string]any{"sid": sid, "state": "started"}
+		if c, ok := s.resComments[sid]; ok {
+			row["comment"] = c
+		}
+		raw, _ := json.Marshal(row)
 		out = append(out, raw)
 	}
 	if s.afterListHaResources != nil {
@@ -760,7 +764,7 @@ func (s *aaClusterStub) ListStatus(context.Context) (*cluster.ListStatusResponse
 // reason to scan again.
 func TestAAPlanner_WouldDropUnseenSkipsTheExcludedMember(t *testing.T) {
 	t.Parallel()
-	existing := map[int]*ha.Rule{1: {ID: aaRule, Resources: []string{"vm:100", "vm:101", "vm:102"}}}
+	existing := map[string]*ha.Rule{aaRule: {ID: aaRule, Resources: []string{"vm:100", "vm:101", "vm:102"}}}
 	scan := &groupScan{
 		live:         map[string]struct{}{"vm:101": {}, "vm:102": {}},
 		liveComplete: true,

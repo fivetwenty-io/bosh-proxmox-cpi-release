@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -127,7 +128,7 @@ func TestHealAntiAffinityGroup_LeavesOutMembersWhoseStrictPinsConflict(t *testin
 				for vmid, nodes := range tc.pins {
 					seedStrictPin(stub, vmid, nodes)
 				}
-				deps := aaModeDeps(stub, mode, "", "pve1", "pve2", "pve3", "pve4")
+				deps := aaModeDeps(stub, mode, "", "pve1", "pve2", "pve3", "pve4", "pve5")
 				logger, observed := log.NewObservedLogger(log.LevelDebug)
 				if err := healAntiAffinityGroup(context.Background(), deps, aaIdent("web"), "", "", nil,
 					logger); err != nil {
@@ -160,7 +161,7 @@ func TestEnsureAntiAffinity_CreateWhoseOwnPinConflictsIsStillRefused(t *testing.
 			stub.seedRule(aaRule, "vm:101,vm:102")
 			seedStrictPin(stub, 101, "pve1")
 			seedStrictPin(stub, 103, "pve1")
-			deps := aaModeDeps(stub, mode, "", "pve1", "pve2", "pve3")
+			deps := aaModeDeps(stub, mode, "", "pve1", "pve2", "pve3", "pve4")
 			logger, _ := log.NewObservedLogger(log.LevelDebug)
 			_, err := ensureAntiAffinityMembershipFor(context.Background(), deps, aaIdent("web"), 103, nil, logger)
 			if !errors.Is(err, ha.ErrRuleInfeasible) {
@@ -359,7 +360,7 @@ func TestHealAntiAffinityGroup_HealsAgainAfterARepairConfinesAMember(t *testing.
 // must stay out of both, logged once.
 func TestEnsureAntiAffinity_SplitTriesALaterRuleForAConflictingSibling(t *testing.T) {
 	t.Parallel()
-	second := aaChunkName(aaRule, 2)
+	second := aapattern.ChunkName(aaRule, 2)
 	cases := []struct {
 		name       string
 		pins       map[int]string
@@ -393,7 +394,7 @@ func TestEnsureAntiAffinity_SplitTriesALaterRuleForAConflictingSibling(t *testin
 				for vmid, nodes := range tc.pins {
 					seedStrictPin(stub, vmid, nodes)
 				}
-				deps := aaModeDeps(stub, mode, config.HAOverflowSplit, "pve1", "pve2", "pve3", "pve4")
+				deps := aaModeDeps(stub, mode, config.HAOverflowSplit, "pve1", "pve2", "pve3", "pve4", "pve5")
 				logger, observed := log.NewObservedLogger(log.LevelDebug)
 				placedIn, err := ensureAntiAffinityMembershipFor(context.Background(), deps, aaIdent("web"), 106,
 					nil, logger)

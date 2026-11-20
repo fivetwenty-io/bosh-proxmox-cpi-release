@@ -60,11 +60,12 @@ func azPinApply(
 	return err
 }
 
-// aaApply runs the anti-affinity writer the way create_vm's confinement step
-// does for a registered VM, with the error handling of azPinApply.
+// aaApply runs the anti-affinity join the way set_vm_metadata does for the
+// group in env, with the VM's index read from its guest, and filters its error
+// the way azPinApply does.
 func aaApply(ctx context.Context, deps Deps, vmid int, env map[string]any, logger *log.Logger) error {
-	_, err := applyAntiAffinityMembership(ctx, deps, testRegisteredDecision(deps, vmid, createVMCloudProps{}, ""),
-		env, logger)
+	_, err := applyAntiAffinityMembership(ctx, deps, haIdentityFor(deps, env), vmid,
+		aaJoinOpts{index: -1, checkSelf: true}, logger)
 	if err != nil && !propagateHARuleError(deps, err) {
 		logger.Warn("test: anti-affinity membership not applied", log.Err(err))
 		return nil

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
@@ -521,7 +522,7 @@ func enableOwnedGroupRules(ctx context.Context, deps Deps, ident haIdentity, vmi
 			var ops []ha.RuleOp
 			for i := range set.Rules {
 				r := &set.Rules[i]
-				if _, ok := aaChunkIndex(base, r.ID); !ok || !r.Disabled || !r.HasResource(sid) ||
+				if !aapattern.IsGroupRule(base, r.ID) || !r.Disabled || !r.HasResource(sid) ||
 					len(r.Resources) < 2 || haOwnershipOf(r.Comment, ident.Owner) != haOwnedByUs {
 					continue
 				}

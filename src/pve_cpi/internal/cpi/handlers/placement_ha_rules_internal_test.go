@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
@@ -29,18 +30,21 @@ func aaModeDeps(stub *aaClusterStub, mode, overflow string, nodes ...string) Dep
 	return deps
 }
 
-func TestAntiAffinityOverflowSkipWritesNoRule(t *testing.T) {
+// TestAntiAffinityOverflowSkipWritesOnlyTheFirstRule pins that skip writes
+// the group's first rule and no other: a member the first rule has no room
+// for stays out, and a rule the group already has is not rewritten for it.
+func TestAntiAffinityOverflowSkipWritesOnlyTheFirstRule(t *testing.T) {
 	for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
 		t.Run(mode, func(t *testing.T) {
 			stub := newAAStub()
 			stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag))
-			deps := aaModeDeps(stub, mode, config.HAOverflowSkip, "pve1", "pve2")
+			deps := aaModeDeps(stub, mode, config.HAOverflowSkip, "pve1", "pve2", "pve3")
 			if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 102,
 				log.NewNopLogger()); err != nil {
 				t.Fatalf("skip must not fail the call in %s: %v", mode, err)
 			}
-			if len(stub.rules) != 0 || stub.createRuleCalls != 0 {
-				t.Fatalf("an oversized group got a rule: %v", stub.rules)
+			if stub.rules[aaRule] != "vm:100,vm:101" || len(stub.rules) != 1 {
+				t.Fatalf("skip rules = %v; want only the first rule, with two members", stub.rules)
 			}
 
 			// A rule the group already has keeps its members, and nothing is
@@ -48,7 +52,7 @@ func TestAntiAffinityOverflowSkipWritesNoRule(t *testing.T) {
 			stub = newAAStub()
 			stub.seedRule(aaRule, "vm:100,vm:101")
 			stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag))
-			deps = aaModeDeps(stub, mode, config.HAOverflowSkip, "pve1", "pve2")
+			deps = aaModeDeps(stub, mode, config.HAOverflowSkip, "pve1", "pve2", "pve3")
 			if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 102,
 				log.NewNopLogger()); err != nil {
 				t.Fatal(err)
@@ -61,17 +65,45 @@ func TestAntiAffinityOverflowSkipWritesNoRule(t *testing.T) {
 	}
 }
 
+// TestAntiAffinityTwoNodeClusterWritesNoRule pins that a group on two nodes
+// gets no rule, because a rule there would hold one member fewer than the
+// nodes, which is one member, and that a rule an older CPI wrote over both
+// nodes is deleted.
+func TestAntiAffinityTwoNodeClusterWritesNoRule(t *testing.T) {
+	stub := newAAStub()
+	stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag))
+	deps := aaModeDeps(stub, config.HAModeAuto, "", "pve1", "pve2")
+	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 102,
+		log.NewNopLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if len(stub.rules) != 0 || stub.createRuleCalls != 0 {
+		t.Fatalf("a two-node group got a rule: %v", stub.rules)
+	}
+	stub = newAAStub()
+	stub.seedRule(aaRule, "vm:100,vm:101")
+	stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag))
+	deps = aaModeDeps(stub, config.HAModeAuto, "", "pve1", "pve2")
+	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 101,
+		log.NewNopLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if len(stub.rules) != 0 {
+		t.Fatalf("the rule over both nodes was kept: %v", stub.rules)
+	}
+}
+
 func TestAntiAffinityOverflowSplitWritesRulesThatFit(t *testing.T) {
 	for _, mode := range []string{config.HAModeAuto, config.HAModeManaged} {
 		t.Run(mode, func(t *testing.T) {
 			stub := newAAStub()
 			stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag), aaQEMU(102, aaTag))
-			deps := aaModeDeps(stub, mode, config.HAOverflowSplit, "pve1", "pve2")
+			deps := aaModeDeps(stub, mode, config.HAOverflowSplit, "pve1", "pve2", "pve3")
 			if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 103,
 				log.NewNopLogger()); err != nil {
 				t.Fatal(err)
 			}
-			if stub.rules[aaRule] != "vm:100,vm:101" || stub.rules[aaChunkName(aaRule, 2)] != "vm:102,vm:103" ||
+			if stub.rules[aaRule] != "vm:100,vm:101" || stub.rules[aapattern.ChunkName(aaRule, 2)] != "vm:102,vm:103" ||
 				len(stub.rules) != 2 {
 				t.Fatalf("split rules = %v", stub.rules)
 			}
@@ -81,14 +113,16 @@ func TestAntiAffinityOverflowSplitWritesRulesThatFit(t *testing.T) {
 
 func TestAntiAffinityPlaceableCapAndMaintenance(t *testing.T) {
 	profile := func(context.Context) (*ha.Profile, error) {
-		p, _ := pve9ClusterProfile("pve1", "pve2", "pve3")(context.Background())
+		p, _ := pve9ClusterProfile("pve1", "pve2", "pve3", "pve4")(context.Background())
 		p.Health = &pve.NodeHealthReport{Nodes: []pve.NodeHealthEntry{
 			{Name: "pve1", Placeable: true}, {Name: "pve2", Placeable: true}, {Name: "pve3", Maintenance: true},
+			{Name: "pve4", Maintenance: true},
 		}}
 		return p, nil
 	}
 
-	// Two placeable nodes: a third member waits for its rule.
+	// Two placeable nodes of four: a third member waits for its rule, though
+	// the cap of three has room for it.
 	stub := newAAStub()
 	stub.seedRule(aaRule, "vm:100,vm:101")
 	stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag))
@@ -102,8 +136,8 @@ func TestAntiAffinityPlaceableCapAndMaintenance(t *testing.T) {
 		t.Fatalf("a member joined beyond the placeable nodes: %v", stub.rules)
 	}
 
-	// A node entering maintenance never rewrites a rule that already holds
-	// every member.
+	// Nodes entering maintenance never rewrite a rule that holds more members
+	// than the placeable nodes but no more than the cap.
 	stub = newAAStub()
 	stub.seedRule(aaRule, "vm:100,vm:101,vm:102")
 	stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag), aaQEMU(102, aaTag))

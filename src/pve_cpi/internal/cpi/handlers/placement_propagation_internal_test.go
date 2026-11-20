@@ -1,6 +1,6 @@
-// Internal tests proving that the create_vm call-site routing functions —
-// applyAntiAffinityMembership and applyAZNodeAffinityPin — forward
-// TypeRetriableCloud errors to the director while swallowing generic HA blips as
+// Internal tests proving that the routing functions applyAntiAffinityMembership,
+// which set_vm_metadata calls, and applyAZNodeAffinityPin, which create_vm
+// calls, forward TypeRetriableCloud errors to the director while swallowing generic HA blips as
 // best-effort warnings. The tests drive the REAL routing functions end-to-end
 // rather than a test-local copy of the conditional, so a drift between the test
 // and the production routing cannot pass unnoticed.
@@ -18,9 +18,9 @@ import (
 
 // aaEnvForWebGroup builds a BOSH env whose instanceGroupName resolves to group:
 // the full group ("d-<group>") plus a groups list from which the shortest
-// "-<group>" suffix is selected. This drives the REAL applyAntiAffinityMembership
-// through its group-derivation path rather than calling ensureAntiAffinityMembership
-// with a pre-baked key.
+// "-<group>" suffix is selected. The tests derive the group from it through
+// haIdentityFor and drive the REAL applyAntiAffinityMembership, rather than
+// calling ensureAntiAffinityMembership with a pre-baked key.
 func aaEnvForWebGroup() map[string]any {
 	return map[string]any{
 		"bosh": map[string]any{

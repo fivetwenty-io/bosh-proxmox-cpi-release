@@ -109,7 +109,7 @@ func TestEnsureAntiAffinity_ParallelSiblingCreatesConvergeInEveryOrder(t *testin
 		stub.listResourcesFn = aaResourcesFn(aaQEMU(101, aaTag), aaQEMU(102, aaTag), aaQEMU(103, aaTag))
 		watchAARule(t, stub, order)
 		deps := aaDeps(stub)
-		deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+		deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4")
 		waits := 0
 		deps.HARuleSleep = func(context.Context, time.Duration) error {
 			waits++
@@ -144,7 +144,7 @@ func TestEnsureAntiAffinity_SiblingMidCreateJoinsThroughItsOwnCreate(t *testing.
 	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag), aaQEMU(101, aaTag), aaQEMU(102, aaTag),
 		aaQEMU(103, aaTag))
 	deps := aaDeps(stub)
-	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4")
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4", "pve5")
 
 	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 102,
 		log.NewNopLogger()); err != nil {
@@ -179,7 +179,7 @@ func TestEnsureAntiAffinity_SiblingRollbackBetweenPlanAndWriteWaitsAndReplans(t 
 	}
 	watchAARule(t, stub, "rollback")
 	deps := aaDeps(stub)
-	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4")
 	var waits []time.Duration
 	deps.HARuleSleep = func(_ context.Context, d time.Duration) error {
 		waits = append(waits, d)

@@ -99,6 +99,20 @@ func resolveProfileLayer(callCP map[string]any, selectorKey string, profiles map
 	return profile.CloudProperties, nil
 }
 
+// Raw walks layers in order and returns the first value present under any of
+// keys, whatever its type, so a caller can decode a structured value. A null
+// value counts as absent. Returns (nil, false) when no layer holds one.
+func (r *layeredResolver) Raw(keys ...string) (any, bool) {
+	for _, layer := range r.layers {
+		for _, key := range keys {
+			if v, present := layer[key]; present && v != nil {
+				return v, true
+			}
+		}
+	}
+	return nil, false
+}
+
 // String walks layers in order. Within each layer it tries each key left-to-right.
 // The first layer that contains any of the keys with a non-empty, non-whitespace
 // string value returns (trimmedValue, true). Non-string values in a layer are

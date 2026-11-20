@@ -71,7 +71,7 @@ func TestAntiAffinityLeavesConfiningAndForeignMemberPins(t *testing.T) {
 	foreign := seedMemberPin(stub, 102, "pve3", false, haIdentity{Owner: aaOtherDirector}.marker())
 	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag), aaQEMU(101, aaTag), aaQEMU(102, aaTag))
 	deps := aaDeps(stub)
-	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4")
 	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 102,
 		log.NewNopLogger()); err != nil {
 		t.Fatal(err)

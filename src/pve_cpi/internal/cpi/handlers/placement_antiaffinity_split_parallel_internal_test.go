@@ -7,11 +7,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
-// splitCreate is aaFleet.create in split mode on a cluster of three nodes,
+// splitCreate is aaFleet.create in split mode on a cluster of four nodes,
 // logging to logger. Its clone tags the guest before it stages its HA
 // resource, so a sibling that plans in between sees a member that is not an
 // HA resource yet.
@@ -20,7 +21,7 @@ func (f *aaFleet) splitCreate(vmid int, mode string, logger *log.Logger) func(st
 		deps := f.deps(step)
 		deps.Config.HA = &config.HAConfig{Mode: haChoiceOf(mode),
 			AntiAffinityOverflow: haChoiceOf(config.HAOverflowSplit)}
-		deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+		deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4")
 		f.tagged[vmid] = true
 		step()
 		sid := haResourceSid(vmid)
@@ -32,7 +33,7 @@ func (f *aaFleet) splitCreate(vmid int, mode string, logger *log.Logger) func(st
 }
 
 // TestEnsureAntiAffinity_SplitParallelCreatesNameOnlyHAResources runs four
-// sibling creates of one group in split mode on three nodes, with the rules
+// sibling creates of one group in split mode on four nodes, with the rules
 // lock off, their reads, plans, and writes interleaved in many orders. Each
 // create tags its guest before it stages its HA resource, and PVE refuses a
 // rule that names a resource it does not manage. No write may name a sibling
@@ -78,7 +79,7 @@ func requireSplitRunRight(t *testing.T, run string, f *aaFleet, observed *log.Ob
 			t.Fatalf("%s: a write named a sibling that is not an HA resource yet: %s", run, err)
 		}
 	}
-	second := aaChunkName(aaRule, 2)
+	second := aapattern.ChunkName(aaRule, 2)
 	first := strings.Split(f.stub.rules[aaRule], ",")
 	if len(first) != 3 {
 		t.Fatalf("%s: first rule = %q; want three members", run, f.stub.rules[aaRule])

@@ -250,6 +250,13 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 			return nil, lockErr
 		}
 
+		// --- anti-affinity membership ---
+		// The VM joins its group's rules now that the Director has named its
+		// instance index. Outside the VMID lock, because the join takes the
+		// HA rules lock, and warn-only, because a failed join never fails
+		// the metadata write.
+		joinAntiAffinityAtMetadata(ctx, deps, vmid, metadata, logger)
+
 		logger.Info("set_vm_metadata: VM metadata updated")
 		return nil, nil
 	})

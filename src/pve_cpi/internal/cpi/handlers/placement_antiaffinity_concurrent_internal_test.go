@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
@@ -134,10 +135,12 @@ type aaFleet struct {
 	tagged map[int]bool
 	// gone holds the sids a delete removes, which a write may drop.
 	gone map[string]bool
+	// nodes is the cluster's node count, five unless a test sets more.
+	nodes int
 }
 
 func newAAFleet() *aaFleet {
-	f := &aaFleet{stub: newAAStub(), tagged: map[int]bool{}, gone: map[string]bool{}}
+	f := &aaFleet{stub: newAAStub(), tagged: map[int]bool{}, gone: map[string]bool{}, nodes: 5}
 	f.stub.enforceManaged = true
 	f.stub.strictCreate = true
 	f.stub.purgeFromRules = true
@@ -176,7 +179,11 @@ func (f *aaFleet) deps(step func()) Deps {
 			return gated.ListResources(ctx, p)
 		}},
 	}
-	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4", "pve5")
+	nodes := make([]string, 0, f.nodes)
+	for i := range f.nodes {
+		nodes = append(nodes, fmt.Sprintf("pve%d", i+1))
+	}
+	deps.HAProfile = pve9ClusterProfile(nodes...)
 	deps.HARuleSleep = func(context.Context, time.Duration) error {
 		step()
 		return nil
@@ -254,8 +261,18 @@ func (f *aaFleet) watch(t *testing.T, run string) (check func()) {
 			prev = nil
 			return
 		}
-		if got := f.stub.ruleComments[aaRule]; got != aaIdent("web").marker() {
+		// The comment is the marker, plus the record of the members whose
+		// delete took them out ahead of their purge.
+		got := f.stub.ruleComments[aaRule]
+		if withLeavingMembers(got, nil) != aaIdent("web").marker() {
 			t.Errorf("%s: rule written with comment %q; want the marker", run, got)
+		}
+		if m, _ := parseHaMarker(got); len(m.Left) > 0 {
+			for _, s := range m.Left {
+				if !f.gone[s] {
+					t.Errorf("%s: rule records %s as leaving, which no delete removed", run, s)
+				}
+			}
 		}
 		cur := strings.Split(f.stub.rules[aaRule], ",")
 		for _, m := range prev {
@@ -376,12 +393,15 @@ func TestEnsureAntiAffinity_UnlockedPruneAlongsideCreate(t *testing.T) {
 // purges a member the heal read as managed, so the heal must read the
 // managed members again on every plan rather than insist on one of them.
 // Whatever the order, the rule must end with the remaining member and both
-// new siblings.
+// new siblings. The cluster has six nodes, so a rule holds five members and
+// the cap never leaves a sibling out when both creates plan before either
+// delete lands.
 func TestEnsureAntiAffinity_UnlockedTwoDeletesAlongsideCreates(t *testing.T) {
 	t.Parallel()
 	for seed := range uint64(aaConcurrentSeeds) {
 		run := fmt.Sprintf("seed %d", seed)
 		f := newAAFleet()
+		f.nodes = 6
 		f.member(100)
 		f.member(101)
 		f.member(102)
@@ -450,7 +470,7 @@ func TestEnsureAntiAffinity_UnlockedCreateHealsAfterItsOwnDelete(t *testing.T) {
 			return stub.ListResources(ctx, p)
 		}},
 	}
-	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4")
 	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 101,
 		log.NewNopLogger()); err != nil {
 		t.Fatal(err)
@@ -723,7 +743,7 @@ func TestHealAntiAffinityGroup_HealsAgainAfterItsOwnDelete(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
 	stub.tagged(aaQEMU(101, aaTag), aaQEMU(102, aaTag), aaQEMU(103, aaTag))
-	second := aaChunkName(aaRule, 2)
+	second := aapattern.ChunkName(aaRule, 2)
 	stub.seedRule(aaRule, "vm:101,vm:102")
 	stub.seedRule(second, "vm:100,vm:103")
 	raced := false
@@ -736,7 +756,7 @@ func TestHealAntiAffinityGroup_HealsAgainAfterItsOwnDelete(t *testing.T) {
 		stub.rules[second] = "vm:100,vm:103,vm:104"
 		stub.digest++
 	}}
-	deps := aaModeDeps(stub, config.HAModeAuto, config.HAOverflowSplit, "pve1", "pve2")
+	deps := aaModeDeps(stub, config.HAModeAuto, config.HAOverflowSplit, "pve1", "pve2", "pve3")
 	deps.PVE = &icPVEClient{
 		clusterSvc: racing,
 		nodesSvc: &icNodesService{listFn: func(ctx context.Context, p *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
@@ -768,7 +788,7 @@ func TestHealAntiAffinityGroup_StopsAfterFourRoundsOfDeletes(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
 	stub.tagged(aaQEMU(101, aaTag), aaQEMU(102, aaTag), aaQEMU(103, aaTag))
-	second := aaChunkName(aaRule, 2)
+	second := aapattern.ChunkName(aaRule, 2)
 	stub.seedRule(aaRule, "vm:101,vm:102")
 	members := stub.listResourcesFn
 	rounds := 0
@@ -780,7 +800,7 @@ func TestHealAntiAffinityGroup_StopsAfterFourRoundsOfDeletes(t *testing.T) {
 		rounds++
 		return members()
 	}
-	deps := aaModeDeps(stub, config.HAModeAuto, config.HAOverflowSplit, "pve1", "pve2")
+	deps := aaModeDeps(stub, config.HAModeAuto, config.HAOverflowSplit, "pve1", "pve2", "pve3")
 	err := healAntiAffinityGroup(context.Background(), deps, aaIdent("web"), "", "vm:100", nil, log.NewNopLogger())
 	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("heal = %v; want a retriable error once every round lost a rule to a delete", err)
@@ -872,7 +892,7 @@ func TestEnsureAntiAffinity_LockedWaitReleasesTheRulesLock(t *testing.T) {
 	}
 	pools := newAALockPools(&events)
 	deps := aaDepsLock(aaLockConfig("pool", false, 30), stub, pools)
-	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4")
 	waits := 0
 	deps.HARuleSleep = func(context.Context, time.Duration) error {
 		waits++

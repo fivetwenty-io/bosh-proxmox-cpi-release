@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
@@ -23,7 +24,7 @@ import (
 // must keep its members.
 func TestEnsureAntiAffinity_SplitKeepsASiblingOutOfARuleThatAlreadyConflicts(t *testing.T) {
 	t.Parallel()
-	second := aaChunkName(aaRule, 2)
+	second := aapattern.ChunkName(aaRule, 2)
 	for _, mode := range aaModes {
 		t.Run(mode, func(t *testing.T) {
 			t.Parallel()
@@ -39,7 +40,7 @@ func TestEnsureAntiAffinity_SplitKeepsASiblingOutOfARuleThatAlreadyConflicts(t *
 			stub.seedRuleWithComment("op-pin-103", "vm:103", "")
 			stub.ruleTypes["op-pin-103"], stub.ruleNodes["op-pin-103"], stub.ruleStrict["op-pin-103"] =
 				"node-affinity", "pve1", true
-			deps := aaModeDeps(stub, mode, config.HAOverflowSplit, "pve1", "pve2", "pve3", "pve4")
+			deps := aaModeDeps(stub, mode, config.HAOverflowSplit, "pve1", "pve2", "pve3", "pve4", "pve5")
 			logger, observed := log.NewObservedLogger(log.LevelDebug)
 			placedIn, err := ensureAntiAffinityMembershipFor(context.Background(), deps, aaIdent("web"), 106, nil,
 				logger)
@@ -72,7 +73,7 @@ func TestEnsureAntiAffinity_SplitKeepsASiblingOutOfARuleThatAlreadyConflicts(t *
 // the gap alone.
 func TestEnsureAntiAffinity_SplitPrefersARuleWithMembersOverAGap(t *testing.T) {
 	t.Parallel()
-	second, third := aaChunkName(aaRule, 2), aaChunkName(aaRule, 3)
+	second, third := aapattern.ChunkName(aaRule, 2), aapattern.ChunkName(aaRule, 3)
 	cases := []struct {
 		name      string
 		pins      map[int]string
@@ -103,7 +104,7 @@ func TestEnsureAntiAffinity_SplitPrefersARuleWithMembersOverAGap(t *testing.T) {
 				for vmid, nodes := range tc.pins {
 					seedStrictPin(stub, vmid, nodes)
 				}
-				deps := aaModeDeps(stub, mode, config.HAOverflowSplit, "pve1", "pve2", "pve3", "pve4")
+				deps := aaModeDeps(stub, mode, config.HAOverflowSplit, "pve1", "pve2", "pve3", "pve4", "pve5")
 				logger, observed := log.NewObservedLogger(log.LevelDebug)
 				placedIn, err := ensureAntiAffinityMembershipFor(context.Background(), deps, aaIdent("web"), 106,
 					nil, logger)

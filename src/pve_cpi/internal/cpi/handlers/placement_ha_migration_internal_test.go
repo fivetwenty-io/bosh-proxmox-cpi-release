@@ -251,17 +251,19 @@ func inScorerGroup(g scorerGroup, tags string) bool {
 // --------------------------------------------------------------------------
 
 // haProbeCluster answers the cluster reads ha.Resolve makes on top of the
-// anti-affinity fixture. The cluster is one quorate node, pve1, and the reads
-// the profile can do without are refused, which only records gaps.
+// anti-affinity fixture. The cluster is three quorate nodes, so a domain is
+// large enough for an anti-affinity rule, and the reads the profile can do
+// without are refused, which only records gaps.
 type haProbeCluster struct {
 	*aaClusterStub
 }
 
 func (c *haProbeCluster) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
 	resp := cluster.ListStatusResponse{
-		[]byte(`{"type":"cluster","name":"lab","quorate":1,"nodes":2}`),
+		[]byte(`{"type":"cluster","name":"lab","quorate":1,"nodes":3}`),
 		[]byte(`{"type":"node","name":"pve1","online":1,"local":1}`),
 		[]byte(`{"type":"node","name":"pve2","online":1}`),
+		[]byte(`{"type":"node","name":"pve3","online":1}`),
 	}
 	return &resp, nil
 }
@@ -369,8 +371,8 @@ func TestHAProfileResolvedOnceThroughTheProbeForBothWriters(t *testing.T) {
 		t.Errorf("node-affinity rule = %q; want vm:101", got)
 	}
 	// One version read per online node, which is one probe for the request.
-	if nodesSvc.versionCalls != 2 {
-		t.Errorf("the profile read node versions %d times; want one probe of both nodes for the whole request",
+	if nodesSvc.versionCalls != 3 {
+		t.Errorf("the profile read node versions %d times; want one probe of the three nodes for the whole request",
 			nodesSvc.versionCalls)
 	}
 }
@@ -392,8 +394,8 @@ func TestHAProfileProbeRefusesBelowPVE9OnceForBothWriters(t *testing.T) {
 	if len(stub.rules) != 0 || len(stub.resources) != 0 {
 		t.Errorf("nothing may be written below PVE 9: rules %v resources %v", stub.rules, stub.resources)
 	}
-	if nodesSvc.versionCalls != 2 {
-		t.Errorf("the profile read node versions %d times; want one probe of both nodes", nodesSvc.versionCalls)
+	if nodesSvc.versionCalls != 3 {
+		t.Errorf("the profile read node versions %d times; want one probe of the three nodes", nodesSvc.versionCalls)
 	}
 }
 

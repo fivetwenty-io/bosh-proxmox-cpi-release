@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 
@@ -40,10 +41,9 @@ type createdVMHA struct {
 	storages []string
 	stager   *ha.Stager
 
-	// pin is the merged pin the call wrote and aaRule the anti-affinity rule
-	// the VM was placed in, or "" when it is in none. Verify checks both.
-	pin    *ha.Rule
-	aaRule string
+	// pin is the merged pin the call wrote, which Verify checks. The VM is in
+	// no anti-affinity rule yet, because it joins at set_vm_metadata.
+	pin *ha.Rule
 
 	// unconfined says why a write of the VM's confinement failed in auto. A
 	// non-empty value makes the activation remove the staged resource, so the
@@ -145,10 +145,21 @@ func decideCreatedVMHA(
 		storages: ha.VolumeStorages(in.Volumes),
 	}
 	h.stager = h.newStager(managed)
-	if err := h.stager.Stage(ctx, decision, ident.marker()); err != nil {
+	if err := h.stager.Stage(ctx, decision, createdVMResourceMarker(deps, parsed, ident, time.Now())); err != nil {
 		return nil, err
 	}
 	return h, nil
+}
+
+// createdVMResourceMarker returns the marker for the comment of a created
+// VM's HA resource. A member of an anti-affinity group also records its birth
+// and the pattern its create named, which the group's later plans read,
+// because the VM joins its group's rules only at set_vm_metadata.
+func createdVMResourceMarker(deps Deps, parsed *createVMParsedArgs, ident haIdentity, now time.Time) string {
+	if !isAntiAffinityMember(deps, parsed.env) {
+		return ident.marker()
+	}
+	return ident.resourceMarker(parsed.aaPattern, now.Unix())
 }
 
 // warnRequestedHAWithoutRegistration logs a warning when the operator set
@@ -172,12 +183,11 @@ func warnRequestedHAWithoutRegistration(
 		log.String("reason", d.Reason))
 }
 
-// isAntiAffinityMember reports whether create_vm writes this VM into an
-// anti-affinity group's rule, which applyAntiAffinityMembership decides with
-// the same three checks.
+// isAntiAffinityMember reports whether this VM is a member of an
+// anti-affinity group, which set_vm_metadata later puts into the group's
+// rules. applyAntiAffinityMembership checks the same settings.
 func isAntiAffinityMember(deps Deps, env map[string]any) bool {
-	return deps.Config.HAAntiAffinityValue() != config.HARuleOff && deps.Config.AntiAffinityEnabled() &&
-		haIdentityFor(deps, env).Group != ""
+	return antiAffinityJoinEnabled(deps.Config) && haIdentityFor(deps, env).Group != ""
 }
 
 // createdVMHAInput builds the decision input from the VM's config, its shape,
@@ -418,8 +428,9 @@ func newHAStager(deps Deps, owner string, profile *ha.Profile, managed bool, log
 }
 
 // confine writes the staged VM's confinement, which is step 3 of the staging
-// order: its anti-affinity membership first, so the pin's priorities see the
-// membership, and then its merged pin with the volume record. It then checks
+// order. It writes the VM's merged pin with the volume record. The VM joins
+// no anti-affinity rule here, because a rule's members are chosen by instance
+// index and the Director names the index only at set_vm_metadata. It then checks
 // that a PCI VM's pin holds its node alone and, for a DLB VM, the cluster's CRS
 // mode. An error that must fail the call is returned: a retriable one, and in
 // managed every one. Any other write failure in auto marks the VM unconfined,
@@ -428,11 +439,6 @@ func (h *createdVMHA) confine(ctx context.Context, parsed *createVMParsedArgs, n
 	if !h.staged() {
 		return nil
 	}
-	aaRule, err := applyAntiAffinityMembership(ctx, h.deps, h.decision, parsed.env, h.logger)
-	if err != nil {
-		return h.confinementFailure("anti-affinity membership", err)
-	}
-	h.aaRule = aaRule
 	pin, err := applyAZNodeAffinityPin(ctx, h.deps, h.decision, h.storages, parsed.cloudProps, node, h.logger)
 	if err != nil {
 		return h.confinementFailure("node-affinity pin", err)
@@ -473,7 +479,7 @@ func (h *createdVMHA) activate(ctx context.Context, node string, start func(cont
 	}
 	reason := h.unconfined
 	if reason == "" {
-		switch err := h.stager.Verify(ctx, h.decision, h.pin, h.aaRule); {
+		switch err := h.stager.Verify(ctx, h.decision, h.pin, ""); {
 		case err == nil:
 		case errors.Is(err, ha.ErrConfinementUnverified) && !h.stager.Managed:
 			reason = err.Error()
@@ -526,7 +532,6 @@ func (h *createdVMHA) runWithoutHA(ctx context.Context, reason string, start fun
 			"they name no resource of this VM now", log.Int(metadataKeyVMID, h.vmid), log.Err(err))
 	}
 	h.pin = nil
-	h.aaRule = ""
 	return start(ctx)
 }
 

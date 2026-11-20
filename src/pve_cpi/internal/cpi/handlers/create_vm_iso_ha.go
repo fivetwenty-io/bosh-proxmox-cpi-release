@@ -28,8 +28,8 @@ const (
 //   - DLB:            deps.Config.DLBEligibleForAZ (same predicate the step 10
 //     block in create_vm.go guards on).
 //   - Anti-affinity:  deps.Config.HAAntiAffinityRulesEnabled() and a
-//     non-empty sanitized instance-group name (mirrors
-//     applyAntiAffinityMembership's early-return gate).
+//     non-empty sanitized instance-group name. The VM joins its group's
+//     rules later, at set_vm_metadata, through applyAntiAffinityMembership.
 //   - AZ node-affinity pin: deps.Config.HANodeAffinityPinEnabled() and a
 //     resolvable pin AZ with a non-empty node candidate set (mirrors
 //     applyAZNodeAffinityPin's early-return gates).

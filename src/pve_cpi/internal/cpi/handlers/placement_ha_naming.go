@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -82,11 +84,35 @@ func markerValue(s string) string {
 	return s
 }
 
+// resourceMarker renders the marker for the comment of a member's HA
+// resource. It adds the member's birth, born=<unix seconds>, which orders two
+// members with one instance index, and, when the create named one through
+// ha_anti_affinity, the group's pattern, aa=<canonical form>. Both are marker
+// fields, which Stage owns and keeps on every later stage.
+func (i haIdentity) resourceMarker(aa string, born int64) string {
+	m := i.marker()
+	if aa != "" {
+		m += " aa=" + markerValue(aa)
+	}
+	if born > 0 {
+		m += " born=" + strconv.FormatInt(born, 10)
+	}
+	return m
+}
+
 // haMarker is a parsed ownership marker.
 type haMarker struct {
 	Owner      string
 	Deployment string
 	Group      string
+	// AA is the anti-affinity pattern a member's create named, in canonical
+	// form, or "".
+	AA string
+	// Born is a member's birth in Unix seconds, or 0 when the marker has none.
+	Born int64
+	// Left names the members a delete took out of an anti-affinity rule
+	// whose HA resources may not be purged yet, in sorted order.
+	Left []string
 }
 
 // parseHaMarker reads the ownership marker at the start of a comment. It
@@ -115,9 +141,58 @@ func parseHaMarker(comment string) (haMarker, bool) {
 			m.Deployment = val
 		case "group":
 			m.Group = val
+		case "aa":
+			m.AA = val
+		case "born":
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n > 0 {
+				m.Born = n
+			}
+		case "left":
+			for _, v := range strings.Split(val, ".") {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 && strconv.Itoa(n) == v {
+					m.Left = append(m.Left, haResourceSid(n))
+				}
+			}
 		}
 	}
 	return m, true
+}
+
+// withLeavingMembers returns the rule comment with its record of leaving
+// members replaced by left, or with no record when left is empty. The record
+// is one field, left=<vmid>.<vmid>, in VMID order, which holds no character
+// PVE escapes in a comment. A delete_vm writes the record in the same write
+// that takes its member out of the rule, because the member stays an HA
+// resource until the purge that follows, and every plan of the group in that
+// window would otherwise put it back and give its place away. A comment that
+// holds no marker is returned as it is, and one PVE encoded again is written
+// back plain.
+func withLeavingMembers(comment string, left []string) string {
+	fields, _, ok := ha.MarkerFields(comment)
+	if !ok {
+		return comment
+	}
+	out := []string{haMarkerPrefix}
+	for _, f := range fields {
+		if !strings.HasPrefix(f, "left=") {
+			out = append(out, f)
+		}
+	}
+	var vmids []int
+	for _, sid := range left {
+		if n, ok := vmidFromSid(sid); ok {
+			vmids = append(vmids, n)
+		}
+	}
+	if len(vmids) > 0 {
+		vmids = slices.Compact(slices.Sorted(slices.Values(vmids)))
+		nums := make([]string, 0, len(vmids))
+		for _, n := range vmids {
+			nums = append(nums, strconv.Itoa(n))
+		}
+		out = append(out, "left="+strings.Join(nums, "."))
+	}
+	return strings.Join(out, " ")
 }
 
 // haOwnership says whose an HA rule or resource is, judged by its comment.

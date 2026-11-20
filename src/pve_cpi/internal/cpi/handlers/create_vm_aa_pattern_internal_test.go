@@ -1,0 +1,73 @@
+package handlers
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+)
+
+func TestResolveAntiAffinityPattern_ReadsEveryLayer(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{
+		VMTypes: map[string]config.TypeProfile{
+			"spread": {CloudProperties: map[string]any{"ha_anti_affinity": map[string]any{"stride": 2}}},
+		},
+	}
+	cases := []struct {
+		name string
+		cp   string
+		want string
+	}{
+		{"unset", `{}`, ""},
+		{"null", `{"ha_anti_affinity": null}`, ""},
+		{"call", `{"ha_anti_affinity": {"window": 3}}`, "window:3"},
+		{"list", `{"ha_anti_affinity": [{"stride": 2}, {"block": {}, "drain_safe": false}]}`,
+			"stride:2+block!unsafe"},
+		{"vm_type", `{"vm_type": "spread"}`, "stride:2"},
+		{"call beats vm_type", `{"vm_type": "spread", "ha_anti_affinity": {"sets": [[0, 1]]}}`, "sets:0.1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var cp map[string]any
+			if err := json.Unmarshal([]byte(tc.cp), &cp); err != nil {
+				t.Fatal(err)
+			}
+			got, err := resolveAntiAffinityPattern(cp, cfg)
+			if err != nil || got != tc.want {
+				t.Fatalf("resolveAntiAffinityPattern(%s) = %q, %v; want %q", tc.cp, got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveAntiAffinityPattern_RefusesABadValue(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{`{"ha_anti_affinity": "block"}`, `{"ha_anti_affinity": {"stride": 1}}`,
+		`{"ha_anti_affinity": {"strde": 2}}`} {
+		var cp map[string]any
+		if err := json.Unmarshal([]byte(raw), &cp); err != nil {
+			t.Fatal(err)
+		}
+		_, err := resolveAntiAffinityPattern(cp, &config.CPIConfig{})
+		if err == nil || !strings.Contains(err.Error(), "ha_anti_affinity") {
+			t.Errorf("resolveAntiAffinityPattern(%s) err = %v; want one that names the property", raw, err)
+		}
+	}
+}
+
+func TestLayeredResolver_RawReturnsAStructuredValue(t *testing.T) {
+	t.Parallel()
+	r, err := newLayeredResolver(map[string]any{"k": []any{1.0}, "n": nil}, &config.CPIConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := r.Raw("n", "k"); !ok || len(v.([]any)) != 1 {
+		t.Fatalf("Raw = %v, %v; want the list, with the null skipped", v, ok)
+	}
+	if _, ok := r.Raw("missing"); ok {
+		t.Fatal("Raw found a missing key")
+	}
+}

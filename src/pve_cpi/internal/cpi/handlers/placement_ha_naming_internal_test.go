@@ -346,8 +346,10 @@ func TestRemoveAntiAffinityOnlyTouchesOwnAndUnmarkedRules(t *testing.T) {
 	if got := stub.rules[aaRule]; got != "vm:100,vm:102" {
 		t.Errorf("own rule = %q; want vm:100,vm:102", got)
 	}
-	if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker() {
-		t.Errorf("own rule lost its marker: %q", got)
+	// The own rule keeps its marker, and the same write records vm:101 as
+	// leaving, because its HA resource is purged only after this removal.
+	if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker()+" left=101" {
+		t.Errorf("own rule lost its marker or the leaving record: %q", got)
 	}
 	if got := stub.rules[foreign.ruleName()]; got != "vm:101,vm:300" {
 		t.Errorf("another Director's rule changed to %q", got)

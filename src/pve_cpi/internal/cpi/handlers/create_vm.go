@@ -397,6 +397,10 @@ type createVMParsedArgs struct {
 	// stemcellVolPath.
 	rawVolid   string
 	cloudProps createVMCloudProps
+	// aaPattern is the canonical form of the ha_anti_affinity cloud
+	// property, or "" when no layer sets it. The VM's HA resource marker
+	// records it, and the group's rules follow the newest member's pattern.
+	aaPattern string
 	// cloudPropsMap is the raw map decoded from args[2] (same JSON as
 	// cloudProps). It carries the vm_type / disk_type selector keys and any
 	// extra cloud_properties (e.g. storage_pool) that are not modelled as
@@ -606,6 +610,9 @@ func createVM(
 		return nil, err
 	}
 	warnIgnoredNodeKey(logger, parsed.cloudPropsMap)
+	if parsed.aaPattern, err = resolveAntiAffinityPattern(parsed.cloudPropsMap, deps.Config); err != nil {
+		return nil, err
+	}
 
 	// -----------------------------------------------------------------------
 	// 1a. DLB sentinel AZ under pve.ha.mode "off". Naming the sentinel AZ used

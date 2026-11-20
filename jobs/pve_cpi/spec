@@ -291,18 +291,20 @@ properties:
       names no node besides the VM's own is never forced.
   pve.ha.anti_affinity:
     description: |
-      Whether the CPI writes a negative resource-affinity rule for an instance
-      group whose members are HA-managed. "auto" (the default) writes the rule
-      when the cluster profile allows rules, and otherwise skips it with one Info
-      line. "on" does the same and adds a warning when the HA decision gives the
-      VM no HA, so no rule can be written, plus a strict-config check that
-      pve.placement.anti_affinity.enabled is true. The pve.ha.mode key decides how
-      a failed rule write is handled, and "auto" and "on" handle it the same way.
-      In auto mode the failure is logged, except that a retriable error fails the
-      call. In managed mode the failure fails the call. "off" never writes one. Every value except "off" writes a
-      rule only when pve.placement.anti_affinity.enabled is true and the request
-      carries an instance-group name. "on" needs pve.ha.mode set to "auto" or
-      "managed".
+      Whether the CPI writes negative resource-affinity rules for an instance
+      group whose members are HA-managed. A member joins its group's rules at
+      set_vm_metadata, once the Director has named its instance index, and
+      create_vm writes no anti-affinity rule. "auto" (the default) writes the
+      rules when the cluster profile allows rules, and otherwise skips them
+      with one Info line. "on" does the same and adds a warning when the HA
+      decision gives the VM no HA, so no rule can be written, plus a
+      strict-config check that pve.placement.anti_affinity.enabled is true. A
+      failed rule write is logged as a warning and never fails the call,
+      whatever pve.ha.mode says, and pve-ops ha --fix-anti-affinity places the
+      member later. "off" never writes one. Every value except "off" writes
+      rules only when pve.placement.anti_affinity.enabled is true and the
+      request carries an instance-group name. "on" needs pve.ha.mode set to
+      "auto" or "managed".
   pve.ha.anti_affinity_overflow:
     description: |
       What happens when an instance group has more members than one rule may
@@ -337,8 +339,9 @@ properties:
       for the placed node or when the HA decision gives the VM no HA. "off" never
       folds an AZ into the pin. Every HA-registered VM carries a bosh-na-<vmid>
       pin whatever this key says, and the key only decides whether the AZ node set
-      joins it. A failed pin write is handled by pve.ha.mode in the same way as a
-      failed anti-affinity rule write. "on" needs pve.ha.mode set to "auto" or
+      joins it. In auto mode a failed pin write is logged, except that a
+      retriable error fails the call, and in managed mode it fails the call.
+      "on" needs pve.ha.mode set to "auto" or
       "managed".
   pve.ha.pin_az_strict:
     description: |
