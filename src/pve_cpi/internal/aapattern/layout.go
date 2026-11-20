@@ -88,6 +88,8 @@ type Output struct {
 	// Alone holds the members the plan put alone in a block or stride rule,
 	// which writes no rule, while another rule of the same kind holds two.
 	Alone []string
+	// AloneIn names the rule each member of Alone was put in alone.
+	AloneIn map[string]string
 	// Displaced holds the members that lost their place and may not join
 	// another rule.
 	Displaced []string
@@ -549,10 +551,25 @@ func (f *filler) start() *fillRun {
 
 // fillFirst fills the first rule with the lowest-ranked members up to the
 // cap. A member already in it stays, and a new one joins while there is room
-// and the rule takes it.
+// and the rule takes it. A new member whose index is unknown only fills the
+// room the members ranked by index leave, so it never displaces a member
+// already in the rule, and one that a later rule holds keeps that rule,
+// because the key order it ranks by is no reason to move it.
 func (f *filler) fillFirst(r *fillRun) {
 	l := f.l
+	order := make([]*mstate, 0, len(r.ranked))
+	var unindexed []*mstate
 	for _, m := range r.ranked {
+		n, held := r.inChunk[m.Key]
+		switch {
+		case m.Index >= 0 || r.first != 0 && n == r.first:
+			order = append(order, m)
+		case !held:
+			unindexed = append(unindexed, m)
+		}
+	}
+	order = append(order, unindexed...)
+	for _, m := range order {
 		if r.first != 0 && len(r.desired[r.first]) >= f.capacity {
 			return
 		}
@@ -675,6 +692,10 @@ func (f *filler) rules(term int, order []int, desired map[int][]string) ([]candR
 		keys := desired[n]
 		if len(keys) == 1 {
 			singles = append(singles, keys[0])
+			if f.l.out.AloneIn == nil {
+				f.l.out.AloneIn = map[string]string{}
+			}
+			f.l.out.AloneIn[keys[0]] = f.name(n)
 		}
 		if len(keys) < 2 {
 			continue

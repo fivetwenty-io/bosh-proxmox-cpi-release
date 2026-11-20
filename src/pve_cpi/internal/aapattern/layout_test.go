@@ -264,6 +264,39 @@ func TestLayout_UnindexedJoinAfterIndexedAndOnlyUnderBlock(t *testing.T) {
 	}
 }
 
+// TestLayout_UnindexedJoinersOnlyFillRoom pins that a member whose index is
+// unknown never takes a kept member's place in the first rule, because the
+// key order it ranks by says nothing about which member should lead.
+func TestLayout_UnindexedJoinersOnlyFillRoom(t *testing.T) {
+	t.Parallel()
+	ms := make([]Member, 0, 5)
+	for i := range 5 {
+		ms = append(ms, Member{Key: key(i), Index: -1, Joinable: true})
+	}
+	out := Layout(Input{Base: base, Split: true, Domains: oneDomain(4), Members: ms,
+		Rules: map[string][]string{base: {key(2), key(4)}}})
+	if got := render(out.Rules); got != "={0,2,4} -2={1,3}" {
+		t.Fatalf("rules = %s; want 2 and 4 kept and the unindexed joiners filling the room", got)
+	}
+	// One already in a later rule keeps it, though the first rule has room.
+	out = Layout(Input{Base: base, Split: true, Domains: oneDomain(5), Members: ms,
+		Rules: map[string][]string{base: {key(2), key(4)}, base + "-2": {key(1), key(3)}}})
+	if got := render(out.Rules); got != "={0,2,4} -2={1,3}" {
+		t.Fatalf("rules = %s; want the later rule kept whole", got)
+	}
+}
+
+// TestLayout_NamesTheRuleAMemberIsAloneIn pins that the layout names the
+// rule a member was put in alone, so the warning about it can name the rule
+// the next member completes.
+func TestLayout_NamesTheRuleAMemberIsAloneIn(t *testing.T) {
+	t.Parallel()
+	out := Layout(Input{Base: base, Split: true, Domains: oneDomain(4), Members: members("", seq(4)...)})
+	if !slices.Equal(out.Alone, []string{key(3)}) || out.AloneIn[key(3)] != base+"-2" {
+		t.Fatalf("alone = %v in %v; want index 3 alone in the second rule", out.Alone, out.AloneIn)
+	}
+}
+
 func TestLayout_NotJoinableKeepsOnlyItsPlace(t *testing.T) {
 	t.Parallel()
 	ms := members("", 0, 1, 2)
