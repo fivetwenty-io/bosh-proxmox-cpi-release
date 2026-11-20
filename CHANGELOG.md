@@ -36,6 +36,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Changed
 
+- With `pve.ha.anti_affinity_overflow: skip`, a plan now logs one warning that counts the members it leaves out of the group's rules, names the lowest instance index among them, and lists them, where it logged one warning for each member before. A large group no longer floods the log on every create and delete.
+
 - `create_vm` now refuses a `cloud_properties.target_node` that is in maintenance, with a retriable error that names the node and says to retry once it leaves maintenance. Before, a pinned node was used without any maintenance check, so a VM could land on a node that was draining. The CPI judges the node the way placement does, counting both HA maintenance and the tags in `placement.maintenance_node_tags`, in every `pve.ha.mode`. It never places the VM on another node instead. When the node health cannot be read, the call also fails with a retriable error, because a pinned node has no alternative. The local-disk pin and the offline check behave as before.
 
 - While a rebalance moves a VM, the VM's HA resource carries a `bosh-rebalance-to=<node>` mark, and the CPI leaves the resource's failback alone until the move ends. So a `set_vm_metadata` or `reboot_vm` during a move can't pull the VM back to its old node. The mark holds `failback` off the way a fresh `bosh-failback-hold` token does, but it has no expiry, so staging, the narrowing barrier, and the failback reconcile never turn the flag on while it is there. Every writer of the resource's comment keeps the mark. The doctor's `failback_drift` finding skips a resource with the mark.

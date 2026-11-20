@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -62,6 +63,43 @@ func TestAntiAffinityOverflowSkipWritesOnlyTheFirstRule(t *testing.T) {
 				t.Fatalf("skip rewrote the rule: %v", stub.rules)
 			}
 		})
+	}
+}
+
+// TestAntiAffinityOverflowSkipWarnsOncePerPlan pins that skip logs the
+// members it leaves out of the group's rules in one warning per plan, with
+// their count and the lowest index among them, and not one warning for each
+// member, which on a large group buries every other line of the call.
+func TestAntiAffinityOverflowSkipWarnsOncePerPlan(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	entries := make([]json.RawMessage, 0, 8)
+	for i := range 8 {
+		entries = append(entries, aaQEMU(100+i, aaTag+";index--"+strconv.Itoa(i)))
+	}
+	stub.tagged(entries...)
+	deps := aaModeDeps(stub, config.HAModeAuto, config.HAOverflowSkip, "pve1", "pve2", "pve3")
+	logger, observed := log.NewObservedLogger(log.LevelDebug)
+	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 107, logger); err != nil {
+		t.Fatal(err)
+	}
+	if got := stub.rules[aaRule]; got != "vm:100,vm:101" || len(stub.rules) != 1 {
+		t.Fatalf("rules = %v; want only the first rule with indexes 0 and 1", stub.rules)
+	}
+	var lines []log.Entry
+	for _, e := range observed.All() {
+		if strings.Contains(e.Message, "no rule has room") {
+			lines = append(lines, e)
+		}
+	}
+	if len(lines) != 1 {
+		t.Fatalf("logged %d overflow warnings; want one for the plan", len(lines))
+	}
+	if got := fmt.Sprint(lines[0].Attrs["count"]); got != "6" {
+		t.Errorf("count = %s; want 6", got)
+	}
+	if got := fmt.Sprint(lines[0].Attrs["lowest_index"]); got != "2" {
+		t.Errorf("lowest_index = %s; want 2", got)
 	}
 }
 

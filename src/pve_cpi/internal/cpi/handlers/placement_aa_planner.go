@@ -735,14 +735,20 @@ func aloneRule(out aapattern.Output, sid string, fallback log.Field) log.Field {
 	return fallback
 }
 
-// logMembers says once per member why the plan left it out of the rules.
+// logMembers says once per member why the plan left it out of the rules. The
+// members that no rule has room for share one line, with their count and the
+// lowest index among them, because skip leaves out most of a large group.
 func (p *aaPlanner) logMembers(out aapattern.Output, rule, joining log.Field) {
-	for _, sid := range out.Overflow {
-		if p.once("overflow " + sid) {
-			p.logger.Warn("anti-affinity: member left out of the group's rules, because no rule has room for it; "+
-				"a rule fills to one member fewer than its domain's nodes, and to no more than its placeable nodes",
-				log.String("sid", sid), rule, joining, log.Bool("split", p.split))
+	if len(out.Overflow) > 0 && p.once("overflow") {
+		fields := []log.Field{log.Int("count", len(out.Overflow))}
+		if lowest := p.lowestIndex(out.Overflow); lowest >= 0 {
+			fields = append(fields, log.Int("lowest_index", lowest))
 		}
+		fields = append(fields, log.String("sids", capJoin(slices.Sorted(slices.Values(out.Overflow)), ",")),
+			rule, joining, log.Bool("split", p.split))
+		p.logger.Warn("anti-affinity: members left out of the group's rules, because no rule has room for them; "+
+			"a rule fills to one member fewer than its domain's nodes, and to no more than its placeable nodes",
+			fields...)
 	}
 	for _, sid := range slices.Sorted(maps.Keys(out.Refused)) {
 		if !p.once("conflicted " + sid) {
@@ -773,6 +779,18 @@ func (p *aaPlanner) logMembers(out aapattern.Output, rule, joining log.Field) {
 				log.String("sid", sid), rule, joining)
 		}
 	}
+}
+
+// lowestIndex returns the lowest instance index among sids in the last
+// plan's input, or -1 when none of them has one.
+func (p *aaPlanner) lowestIndex(sids []string) int {
+	lowest := -1
+	for _, m := range p.lastIn.Members {
+		if m.Index >= 0 && (lowest < 0 || m.Index < lowest) && slices.Contains(sids, m.Key) {
+			lowest = m.Index
+		}
+	}
+	return lowest
 }
 
 // aaDomainLabel names a domain key in a log line.
