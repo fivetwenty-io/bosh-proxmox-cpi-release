@@ -91,7 +91,7 @@ func TestRunHARebalanceDryRunText(t *testing.T) {
 		"Moves\n  1. VM 1042 (vm-3f2a9c1e) from pve2 to pve1, because its AZ z1 is pve1 and it stayed on pve2 " +
 			"after maintenance\n",
 		"Skipped\n  VM 1060 (vm-0aa1e7c3) on pve3, because it is a replicate VM",
-		"1 moves planned, 0 made, 1 VMs skipped, and 0 deferred, and the spread goes from 59 points to 2\n",
+		"1 move planned, 0 made, 1 VM skipped, and 0 deferred, and the spread goes from 59 points to 2\n",
 	} {
 		if !strings.Contains(out, frag) {
 			t.Errorf("output lacks %q:\n%s", frag, out)
@@ -136,7 +136,7 @@ func TestRunHARebalanceApplyPassesTheOptionsAndPrintsEachMove(t *testing.T) {
 		"Moves\n  1. VM 1042 (vm-3f2a9c1e) from pve2 to pve1, moved in 41.2s, because",
 		"  2. VM 1077 from pve2 to pve3, left part way in 600.0s, because the move lowers the spread " +
 			"(the VM had not settled on pve3)\n",
-		"1 moves planned, 1 made,",
+		"1 move planned, 1 made,",
 		"The moves made differ from the first plan",
 		"The run stopped, because VM 1077 was left part way.\n",
 		"Run the command again with --apply",

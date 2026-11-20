@@ -310,9 +310,9 @@ func writeHARebalanceSummary(w io.Writer, r *handlers.RebalanceReport) {
 		planned = len(r.Planned)
 	}
 	made := r.Count(handlers.RebalanceMoved)
-	_, _ = fmt.Fprintf(w, "%d moves planned, %d made, %d VMs skipped, and %d deferred, and the spread goes from "+
-		"%d points to %d\n", planned, made, len(r.Skipped), r.Deferred, haPercent(r.SpreadBefore),
-		haPercent(r.SpreadAfter))
+	_, _ = fmt.Fprintf(w, "%s planned, %d made, %s skipped, and %d deferred, and the spread goes from "+
+		"%d points to %d\n", haCount(planned, "move", "moves"), made, haCount(len(r.Skipped), "VM", "VMs"),
+		r.Deferred, haPercent(r.SpreadBefore), haPercent(r.SpreadAfter))
 	if r.DiffersFromPlan {
 		_, _ = fmt.Fprintln(w, "The moves made differ from the first plan, because the run planned again "+
 			"after each move.")
@@ -334,6 +334,14 @@ func haRebalanceOutcomeText(o handlers.RebalanceOutcome) string {
 		return "left part way"
 	}
 	return string(o)
+}
+
+// haCount spells n with the singular or plural noun.
+func haCount(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
 }
 
 func haNameSuffix(name string) string {
