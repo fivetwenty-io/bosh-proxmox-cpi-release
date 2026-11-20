@@ -86,7 +86,7 @@ func (c *aaMetadataClient) Nodes() sdknodes.Service { return c.nodes }
 // fill the rule, and VM 103 is staged as a member with no index tag yet.
 func aaMetadataHandlerDeps(stub *aaClusterStub) (Deps, *aaMetadataGuest) {
 	guestTags := ownerTagFor(aaDirector) + ";" + aaTag
-	rows := []json.RawMessage{}
+	rows := make([]json.RawMessage, 0, 4)
 	for i, v := range []int{100, 101, 102} {
 		rows = append(rows, aaMetadataRow(v, aaTag+";index--"+strconv.Itoa(i+1)))
 	}
@@ -121,7 +121,6 @@ func aaMetadataRow(vmid int, tags string) json.RawMessage {
 // given instance index, the way the Director calls it.
 func callSetVMMetadata(t *testing.T, deps Deps, index string) error {
 	t.Helper()
-	args := []json.RawMessage{json.RawMessage(`"103"`)}
 	md, err := json.Marshal(map[string]any{
 		"director": "bosh", "deployment": aaDeployment, "job": "web", "instance_group": "web",
 		"index": index, "name": "web/6a0b0e5c-6f43-4f6e-8a0e-2b1f0c9d7e11",
@@ -129,7 +128,7 @@ func callSetVMMetadata(t *testing.T, deps Deps, index string) error {
 	if err != nil {
 		t.Fatal(err)
 	}
-	args = append(args, md)
+	args := []json.RawMessage{json.RawMessage(`"103"`), md}
 	_, err = HandleSetVMMetadata(deps).Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: aaDirector})
 	return err
 }

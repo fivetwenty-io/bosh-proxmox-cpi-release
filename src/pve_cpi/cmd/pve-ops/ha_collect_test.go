@@ -2293,7 +2293,7 @@ func TestEntryScopesListEveryEntryOnTheCluster(t *testing.T) {
 	if got[0] == nil || got[0].Name != "az2" {
 		t.Fatalf("first scope = %+v, want one named az2", got[0])
 	}
-	var names []string
+	names := make([]string, 0, len(got[0].Cluster))
 	for _, e := range got[0].Cluster {
 		names = append(names, e.Name)
 	}
