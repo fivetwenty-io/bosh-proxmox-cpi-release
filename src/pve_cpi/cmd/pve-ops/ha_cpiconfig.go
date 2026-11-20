@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -283,7 +284,8 @@ func checkCPIConfigEntry(ctx context.Context, entry *cpiConfigEntry, base *confi
 // cluster and a band cannot be told apart, and a VM in that band is judged once,
 // by the first of them, without naming a policy as if it were known.
 type haEntryScope struct {
-	// Band is the entry's VM ID band.
+	// Name is the entry's name, and Band is its VM ID band.
+	Name string
 	Band pve.VMIDBand
 	// Peers names the other entries on the same cluster and band, and
 	// PeerPolicies holds the local policy of each, in the same order.
@@ -297,6 +299,23 @@ type haEntryScope struct {
 	PeerAntiAffinity []bool
 	// Leader is true for the first entry of its group.
 	Leader bool
+	// Cluster lists every entry that reaches the same cluster, this one
+	// included, in cpi-config order, whatever its band.
+	Cluster []haClusterEntry
+}
+
+// haClusterEntry is one cpi-config entry on the cluster a run reads. A group's
+// members can lie in the bands of several entries, and each entry plans the
+// group with its own default pattern when no member's create named one.
+type haClusterEntry struct {
+	Name string
+	Band pve.VMIDBand
+	// AntiAffinity says whether the entry writes anti-affinity rules, and
+	// Pattern is its pve.ha.anti_affinity_pattern default.
+	AntiAffinity bool
+	Pattern      aapattern.Pattern
+	// Self marks the entry the scope belongs to.
+	Self bool
 }
 
 // ambiguous reports whether the entries that share the band disagree on the
@@ -350,11 +369,13 @@ func (s *haEntryScope) policyList() string {
 // not apply gets nil and is reported as unchecked by its own run.
 func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntryScope {
 	type facts struct {
-		key    string
-		name   string
-		policy string
-		aa     bool
-		band   pve.VMIDBand
+		key     string
+		host    string
+		name    string
+		policy  string
+		aa      bool
+		band    pve.VMIDBand
+		pattern aapattern.Pattern
 	}
 	all := make([]*facts, len(entries))
 	for i := range entries {
@@ -364,8 +385,8 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntrySco
 		}
 		band := pve.VMIDBandsFromConfig(eff).VM
 		all[i] = &facts{
-			key: eff.Host + "|" + band.String(), name: entries[i].Name, policy: eff.HALocalPolicyValue(), band: band,
-			aa: antiAffinityWritten(eff),
+			key: eff.Host + "|" + band.String(), host: eff.Host, name: entries[i].Name, policy: eff.HALocalPolicyValue(),
+			band: band, aa: antiAffinityWritten(eff), pattern: eff.HAAntiAffinityPatternValue(),
 		}
 	}
 	out := make([]*haEntryScope, len(entries))
@@ -373,8 +394,13 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntrySco
 		if f == nil {
 			continue
 		}
-		sc := &haEntryScope{Band: f.band, Policy: f.policy, AntiAffinity: f.aa, Leader: true}
+		sc := &haEntryScope{Name: f.name, Band: f.band, Policy: f.policy, AntiAffinity: f.aa, Leader: true}
 		for j, o := range all {
+			if o != nil && o.host == f.host {
+				sc.Cluster = append(sc.Cluster, haClusterEntry{
+					Name: o.name, Band: o.band, AntiAffinity: o.aa, Pattern: o.pattern, Self: j == i,
+				})
+			}
 			if o == nil || j == i || o.key != f.key {
 				continue
 			}

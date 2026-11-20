@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"strconv"
 	"testing"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
@@ -102,4 +104,62 @@ func TestCollectAntiAffinityLayoutPatternFindings(t *testing.T) {
 	r = runCollect(t, f, haCfg("auto", "none"))
 	want(t, r, haKindAAPatternBlocksDrain, haSeverityAdvice, g.rule, "drain_safe to false")
 	want(t, r, haKindAARuleFull, haSeverityAdvice, g.rule, "drain_safe false allows")
+}
+
+// aaEntryScope is the scope of entry az2, band 200-299, which shares the
+// cluster and band with entry az2-window, whose default pattern is window:2.
+// writes says whether az2 itself writes anti-affinity rules.
+func aaEntryScope(t *testing.T, writes bool) *haEntryScope {
+	t.Helper()
+	window, err := aapattern.Parse("window:2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	band := pve.VMIDBand{Start: 200, End: 299}
+	return &haEntryScope{
+		Name: "az2", Band: band, AntiAffinity: writes, Leader: true,
+		Peers: []string{"az2-window"}, PeerAntiAffinity: []bool{true}, PeerPolicies: []string{"none"}, Policy: "none",
+		Cluster: []haClusterEntry{
+			{Name: "az2", Band: band, AntiAffinity: writes, Pattern: aapattern.Default(), Self: true},
+			{Name: "az2-window", Band: band, AntiAffinity: true, Pattern: window},
+		},
+	}
+}
+
+// TestCollectAntiAffinityLayoutUsesTheOwningEntrysDefault pins that under
+// --cpi-config a group whose members named no pattern is planned with the
+// default of the entry that writes its rules. The run's own entry writes
+// none, and the entry that shares its band writes rules with window:2, so
+// the plan of six members on three nodes trims that window.
+func TestCollectAntiAffinityLayoutUsesTheOwningEntrysDefault(t *testing.T) {
+	t.Parallel()
+	g := newAALayoutGroup()
+	f := aaLayoutFake(g, "", 6)
+	f.rules = g.rulesOf([]string{"vm:200", "vm:201"}, []string{"vm:202", "vm:203"}, []string{"vm:204", "vm:205"})
+	cfg := haCfgWith("auto", "none", `,"anti_affinity":"off"`, `,"placement":{"anti_affinity":{"enabled":true}}`)
+	r := collectHAScoped(context.Background(), f, cfg, "", haNow, aaEntryScope(t, false))
+	want(t, r, haKindAAPatternTrimmed, haSeverityAdvice, g.rule, "window:2")
+}
+
+// TestCollectAntiAffinityLayoutOwnersThatDisagree pins that a group whose
+// owning entries set different default patterns, and whose members named
+// none, is not judged against either layout and gets one advice that names
+// the entries and their patterns. A group whose members named a pattern is
+// planned with it and judged as usual.
+func TestCollectAntiAffinityLayoutOwnersThatDisagree(t *testing.T) {
+	t.Parallel()
+	g := newAALayoutGroup()
+	rules := g.rulesOf([]string{"vm:200", "vm:201"}, []string{"vm:202", "vm:203"}, []string{"vm:204", "vm:205"})
+	cfg := haCfgWith("auto", "none", `,"anti_affinity":"on"`, `,"placement":{"anti_affinity":{"enabled":true}}`)
+
+	f := aaLayoutFake(g, "", 6)
+	f.rules = rules
+	r := collectHAScoped(context.Background(), f, cfg, "", haNow, aaEntryScope(t, true))
+	want(t, r, haKindAntiAffinityAmbiguous, haSeverityAdvice, g.rule, "az2, az2-window", "block", "window:2")
+	wantNone(t, r, haKindAAPatternTrimmed, haKindAALayoutDrift, haKindAARuleFull)
+
+	f = aaLayoutFake(g, "block", 6)
+	f.rules = rules
+	r = collectHAScoped(context.Background(), f, cfg, "", haNow, aaEntryScope(t, true))
+	wantNone(t, r, haKindAntiAffinityAmbiguous, haKindAAPatternTrimmed, haKindAALayoutDrift, haKindAARuleFull)
 }

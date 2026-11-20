@@ -678,6 +678,13 @@ func (c *haCollector) ruleFindings() {
 // come from an entry that writes none. Such a group is left unjudged and the
 // band gets one advice. A group that has a rule was written by an entry with
 // rules on, so it is still judged. Only the first entry of the band reports.
+//
+// Under --cpi-config a group is planned with the default pattern of the
+// entries that write its rules, which are the entries with rules on whose
+// bands hold its members. When those entries set different defaults and no
+// member's create named a pattern, the layout the CPI plans depends on which
+// entry serves the call, so the group's layout is left unjudged and the group
+// gets one advice.
 func (c *haCollector) antiAffinityFindings() {
 	if !c.guestsOK || !c.rulesOK {
 		return
@@ -707,10 +714,15 @@ func (c *haCollector) antiAffinityFindings() {
 		}
 	}
 	sort.Strings(tags)
-	planned := c.layoutChecks()
+	defaults, split := c.groupDefaults(groups, tags)
+	planned := c.layoutChecks(defaults)
 	unjudged := false
 	for _, tag := range tags {
 		if chk, ok := planned[tag]; ok {
+			if owners, ok := split[tag]; ok && !chk.PatternRecorded && chk.Problem == "" {
+				c.adviseSplitDefaults(tag, chk.Group, owners)
+				continue
+			}
 			c.layoutFindings(chk)
 			continue
 		}
@@ -727,6 +739,74 @@ func (c *haCollector) antiAffinityFindings() {
 				"so the doctor cannot tell which groups with no rule should have one and does not judge them",
 			c.scope.peerList())
 	}
+}
+
+// groupDefaults returns the default pattern each group is planned with under
+// --cpi-config, keyed by the group's tag, and, for each group whose owning
+// entries set different defaults, those entries. A group's owners are the
+// entries on this cluster that write anti-affinity rules and whose band holds
+// at least one of its members. A group with no owner is planned with the
+// run's own default, as is every group outside --cpi-config.
+func (c *haCollector) groupDefaults(groups map[string][]*haGuest, tags []string,
+) (map[string]aapattern.Pattern, map[string][]haClusterEntry) {
+	if c.scope == nil {
+		return nil, nil
+	}
+	defaults := map[string]aapattern.Pattern{}
+	split := map[string][]haClusterEntry{}
+	for _, tag := range tags {
+		owners := groupOwners(c.scope.Cluster, groups[tag])
+		if len(owners) == 0 {
+			continue
+		}
+		agree := true
+		for _, o := range owners[1:] {
+			if o.Pattern.Canonical() != owners[0].Pattern.Canonical() {
+				agree = false
+			}
+		}
+		if agree {
+			defaults[tag] = owners[0].Pattern
+		} else {
+			split[tag] = owners
+		}
+	}
+	return defaults, split
+}
+
+// groupOwners returns the entries that write anti-affinity rules and whose
+// band holds at least one of members, in cpi-config order.
+func groupOwners(entries []haClusterEntry, members []*haGuest) []haClusterEntry {
+	var out []haClusterEntry
+	for _, e := range entries {
+		if !e.AntiAffinity {
+			continue
+		}
+		for _, g := range members {
+			if e.Band.Contains(g.ref.VMID) {
+				out = append(out, e)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// adviseSplitDefaults reports a group whose owning entries set different
+// default patterns while no member's create named one.
+func (c *haCollector) adviseSplitDefaults(tag, group string, owners []haClusterEntry) {
+	names := make([]string, 0, len(owners))
+	patterns := make([]string, 0, len(owners))
+	for _, o := range owners {
+		names = append(names, o.Name)
+		patterns = append(patterns, o.Name+" "+o.Pattern.Canonical())
+	}
+	c.rep.advise(haKindAntiAffinityAmbiguous, tag,
+		"the cpi-config entries %s write the rules of group %s and set different pve.ha.anti_affinity_pattern "+
+			"defaults (%s), and no member's create named a pattern through ha_anti_affinity, so the layout the CPI "+
+			"plans depends on which entry serves the call, and the doctor does not judge the group's layout; set "+
+			"ha_anti_affinity on the group's vm_type, or give the entries one default",
+		strings.Join(names, ", "), group, strings.Join(patterns, ", "))
 }
 
 // groupInBand reports whether at least one member of a group sits in this
@@ -760,16 +840,19 @@ func antiAffinityWritten(cfg *config.CPIConfig) bool {
 }
 
 // layoutChecks plans every group that a CPI marker names, the way the CPI
-// plans it, and returns each check by the group's base rule name. Without
-// the HA resources the plan cannot tell which members may join, so nothing
-// is planned.
-func (c *haCollector) layoutChecks() map[string]handlers.AntiAffinityGroupCheck {
+// plans it, and returns each check by the group's base rule name. defaults
+// holds the default pattern of some groups by their tag, which is also their
+// base rule name, and every other group is planned with the run's default.
+// Without the HA resources the plan cannot tell which members may join, so
+// nothing is planned.
+func (c *haCollector) layoutChecks(defaults map[string]aapattern.Pattern) map[string]handlers.AntiAffinityGroupCheck {
 	if !c.resourcesOK || c.p == nil {
 		return nil
 	}
 	in := handlers.AntiAffinityCheckInput{
 		Config: c.cfg, Profile: c.p, Owner: c.owner, GuestsComplete: !c.guestsPartial,
 		Rules: &ha.RuleSet{Rules: c.rules}, Resources: make(map[string]string, len(c.resources)), Now: c.now,
+		GroupPatterns: defaults,
 	}
 	for _, g := range c.guests {
 		in.Guests = append(in.Guests, g.ref)

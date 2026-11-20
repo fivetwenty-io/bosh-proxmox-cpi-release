@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
@@ -100,6 +101,34 @@ func TestCheckAntiAffinityGroups_ReportsTrimmingAndUnsafePatterns(t *testing.T) 
 	c = oneCheck(t, newAACheckFixture(t, 3, "window:2!unsafe", 100, 101, 102, 103, 104, 105).in)
 	if !c.BlocksDrain {
 		t.Fatalf("check = %+v; want the pattern reported as blocking drains", c)
+	}
+}
+
+// TestCheckAntiAffinityGroups_PlansAGroupWithItsOwnDefault pins that a
+// default named for a group in GroupPatterns takes the place of the config's
+// pve.ha.anti_affinity_pattern, and that a pattern a member's create named
+// still wins over it. The check says which of the two the plan used.
+func TestCheckAntiAffinityGroups_PlansAGroupWithItsOwnDefault(t *testing.T) {
+	t.Parallel()
+	window, err := aapattern.Parse("window:2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newAACheckFixture(t, 3, "", 100, 101, 102, 103, 104, 105)
+	c := oneCheck(t, f.in)
+	if c.Pattern != "block" || c.PatternRecorded {
+		t.Fatalf("check = %+v; want the config's block pattern", c)
+	}
+	f.in.GroupPatterns = map[string]aapattern.Pattern{aaRule: window}
+	c = oneCheck(t, f.in)
+	if c.Pattern != "window:2" || c.PatternRecorded || len(c.Trimmed) == 0 {
+		t.Fatalf("check = %+v; want the group's own window:2 default, trimmed", c)
+	}
+	f = newAACheckFixture(t, 3, "block", 100, 101, 102, 103, 104, 105)
+	f.in.GroupPatterns = map[string]aapattern.Pattern{aaRule: window}
+	c = oneCheck(t, f.in)
+	if c.Pattern != "block" || !c.PatternRecorded {
+		t.Fatalf("check = %+v; want the block pattern the members' creates named", c)
 	}
 }
 

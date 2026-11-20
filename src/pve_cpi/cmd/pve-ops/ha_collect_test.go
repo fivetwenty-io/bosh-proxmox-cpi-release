@@ -2273,6 +2273,51 @@ func TestEntryScopesRecordWhichEntriesWriteAntiAffinityRules(t *testing.T) {
 	}
 }
 
+// TestEntryScopesListEveryEntryOnTheCluster pins that each scope lists the
+// entries that reach the same cluster, itself included, in cpi-config order,
+// with the band, the anti-affinity setting, and the default pattern of each.
+// An entry on another cluster is left out.
+func TestEntryScopesListEveryEntryOnTheCluster(t *testing.T) {
+	t.Parallel()
+	base := haCfg("auto", "none")
+	entries := []cpiConfigEntry{
+		{Name: "az2", Type: "pve", Properties: map[string]any{}},
+		{Name: "az2-window", Type: "pve", Properties: map[string]any{
+			"pve_ha": map[string]any{"anti_affinity_pattern": map[string]any{"window": 2}}}},
+		{Name: "far", Type: "pve", Properties: map[string]any{"pve_vmid_range_start": 5000, "pve_vmid_range_end": 5999,
+			"pve_ha": map[string]any{"anti_affinity": "off"}}},
+		{Name: "elsewhere", Type: "pve", Properties: map[string]any{"pve_host": "pve-other.test.local",
+			"pve_api_token": "root@pam!cpi=other-token"}},
+	}
+	got := entryScopes(entries, base)
+	if got[0] == nil || got[0].Name != "az2" {
+		t.Fatalf("first scope = %+v, want one named az2", got[0])
+	}
+	var names []string
+	for _, e := range got[0].Cluster {
+		names = append(names, e.Name)
+	}
+	if strings.Join(names, ",") != "az2,az2-window,far" {
+		t.Fatalf("cluster entries = %v, want az2, az2-window, and far", names)
+	}
+	self, window, far := got[0].Cluster[0], got[0].Cluster[1], got[0].Cluster[2]
+	if !self.Self || window.Self || far.Self {
+		t.Errorf("self flags = %v %v %v, want only the first", self.Self, window.Self, far.Self)
+	}
+	if self.Pattern.Canonical() != "block" || window.Pattern.Canonical() != "window:2" {
+		t.Errorf("patterns = %s %s, want block and window:2", self.Pattern.Canonical(), window.Pattern.Canonical())
+	}
+	if !self.AntiAffinity || !window.AntiAffinity || far.AntiAffinity {
+		t.Errorf("writes = %v %v %v, want true true false", self.AntiAffinity, window.AntiAffinity, far.AntiAffinity)
+	}
+	if far.Band.Start != 5000 || far.Band.End != 5999 {
+		t.Errorf("far band = %s, want 5000-5999", far.Band)
+	}
+	if got[3] == nil || len(got[3].Cluster) != 1 || !got[3].Cluster[0].Self {
+		t.Errorf("elsewhere scope = %+v, want only itself on its cluster", got[3])
+	}
+}
+
 func TestCollectCPUPinAgainstDomain(t *testing.T) {
 	t.Parallel()
 	pinRule := func(strict bool, nodes ...string) []ha.Rule {

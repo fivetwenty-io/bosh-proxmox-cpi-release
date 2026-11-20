@@ -33,6 +33,12 @@ type AntiAffinityCheckInput struct {
 	// Resources holds the comment of every HA resource, keyed by its sid.
 	Resources map[string]string
 	Now       time.Time
+	// GroupPatterns holds a default pattern for some groups, keyed by the
+	// group's base rule name, which a plan of that group uses in place of
+	// Config's pve.ha.anti_affinity_pattern. The doctor sets it under
+	// --cpi-config to the default of the entry that writes the group's rules.
+	// A pattern a member's create named still wins over it.
+	GroupPatterns map[string]aapattern.Pattern
 }
 
 // AntiAffinityGroupCheck is the check of one anti-affinity group.
@@ -43,9 +49,12 @@ type AntiAffinityGroupCheck struct {
 	Owner      string `json:"owner"`
 	Deployment string `json:"deployment"`
 	Group      string `json:"group"`
-	// Pattern is the canonical form of the pattern the plan used.
-	Pattern string `json:"pattern"`
-	Members int    `json:"members"`
+	// Pattern is the canonical form of the pattern the plan used, and
+	// PatternRecorded says a member's create named it through
+	// ha_anti_affinity, so no default pattern played a part.
+	Pattern         string `json:"pattern"`
+	PatternRecorded bool   `json:"pattern_recorded,omitempty"`
+	Members         int    `json:"members"`
 	// Trimmed names the rules the pattern asked for that the drain-safety
 	// check, or the fit check of a pattern that gave up drain safety, left
 	// out.
@@ -131,6 +140,9 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 	}
 	scan := scanGroupMembers(in.Guests, in.GuestsComplete, ident)
 	p := newAAPlanner(in.Config, in.Profile, ident, scan, log.NewNopLogger())
+	if pat, ok := in.GroupPatterns[ident.ruleName()]; ok {
+		p.pattern = pat.Clone().OrDefault()
+	}
 	p.heal = true
 	p.managed = func() (map[string]string, error) { return in.Resources, nil }
 	if !in.Now.IsZero() {
@@ -141,7 +153,7 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 		c.Problem = err.Error()
 		return c
 	}
-	c.Pattern = p.lastIn.Pattern.Canonical()
+	c.Pattern, c.PatternRecorded = p.lastIn.Pattern.Canonical(), p.lastRecorded
 	c.Members = len(p.lastIn.Members)
 	c.Trimmed = slices.Clone(p.lastOut.Trimmed)
 	c.BlocksDrain = p.lastOut.Unsafe

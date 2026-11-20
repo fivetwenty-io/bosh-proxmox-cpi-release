@@ -124,6 +124,9 @@ type aaPlanner struct {
 	// the doctor's check of a group reads.
 	lastIn  aapattern.Input
 	lastOut aapattern.Output
+	// lastRecorded says the last plan's pattern came from a member's
+	// create, not from pve.ha.anti_affinity_pattern.
+	lastRecorded bool
 }
 
 // once reports whether the line keyed key has not been logged yet, and marks
@@ -367,6 +370,7 @@ func (a *aaPatternSource) consider(sid string, m haMarker) {
 // recorded pattern that no longer parses, and members that disagree, are
 // logged once.
 func (p *aaPlanner) groupPattern(src aaPatternSource) aapattern.Pattern {
+	p.lastRecorded = false
 	if src.sid == "" {
 		return p.pattern
 	}
@@ -385,6 +389,7 @@ func (p *aaPlanner) groupPattern(src aaPatternSource) aapattern.Pattern {
 		}
 		return p.pattern
 	}
+	p.lastRecorded = true
 	return pat
 }
 
