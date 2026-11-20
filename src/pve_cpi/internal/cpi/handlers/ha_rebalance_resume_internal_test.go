@@ -219,3 +219,35 @@ func TestRebalanceMove_TheHoldIsConfirmedRightBeforeTheMigration(t *testing.T) {
 		}
 	})
 }
+
+func TestRebalanceMove_AMarkAnotherWriterTookIsRefusedWithoutARelease(t *testing.T) {
+	cases := map[string]func(v *rbVM){
+		"mark gone": func(v *rbVM) { v.comment, _ = ha.WithoutRebalanceMark(v.comment) },
+		"mark names another node": func(v *rbVM) {
+			c, _ := ha.WithoutRebalanceMark(v.comment)
+			v.comment = ha.WithRebalanceMark(c, "pve03")
+		},
+		"resource gone": func(v *rbVM) { v.noResource = true },
+	}
+	for name, breakHold := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeRebalanceIO()
+			rbSkewed(f)
+			f.beforeMigrate = func(vmid int) {
+				if vmid == 101 {
+					breakHold(f.vms[101])
+				}
+			}
+			rep := rbRun(f, RebalanceOptions{Apply: true, MaxMoves: 1}).run(context.Background())
+			if rep.ExitCode != RebalanceExitOK || rep.Halted != "" {
+				t.Fatalf("exit %d halted %q", rep.ExitCode, rep.Halted)
+			}
+			if rep.Moves[0].Outcome != RebalanceRefused || !strings.Contains(rep.Moves[0].Error, "another writer") {
+				t.Fatalf("moves %v", rbMoves(rep.Moves))
+			}
+			if len(f.unmarks) != 0 {
+				t.Fatalf("the run tried to drop a mark it no longer owns: %v", f.unmarks)
+			}
+		})
+	}
+}

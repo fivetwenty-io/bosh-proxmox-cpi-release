@@ -18,6 +18,10 @@ import (
 // errRebalanceBusy is a lock another call holds, which skips the VM.
 var errRebalanceBusy = errors.New("another call holds the VM")
 
+// errRebalanceMarkLost says the VM's HA resource no longer carries the run's
+// mark, so another writer took the VM and the run has nothing to release.
+var errRebalanceMarkLost = errors.New("another writer took the VM")
+
 // rebalanceSkip is a check that leaves the VM where it is, with the reason.
 type rebalanceSkip struct{ reason string }
 
@@ -221,10 +225,11 @@ func (r *rebalanceRun) confirmMark(ctx context.Context, vmid int, to string) err
 		return err
 	}
 	if res == nil {
-		return errors.New("the VM's HA resource is gone")
+		return fmt.Errorf("the VM's HA resource is gone, so %w", errRebalanceMarkLost)
 	}
 	if node, ok := ha.RebalancePending(res.Comment); !ok || node != to {
-		return errors.New("the VM's HA resource lost the rebalance mark that names " + to)
+		return fmt.Errorf("the VM's HA resource lost the rebalance mark that names %s, so %w", to,
+			errRebalanceMarkLost)
 	}
 	if res.Failback == nil || res.Failback.Bool() {
 		return errors.New("the VM's failback is on again")
@@ -243,6 +248,12 @@ func (r *rebalanceRun) migrateFailure(ctx context.Context, view *rebalanceView, 
 		failure = me.Failure
 	}
 	rec.Error = err.Error()
+	if errors.Is(err, errRebalanceMarkLost) {
+		// No request went out, and the mark the release would drop is no
+		// longer the run's to drop.
+		rec.Outcome = RebalanceRefused
+		return RebalanceExitOK, ""
+	}
 	if failure == ha.MoveIncomplete {
 		// The migration may still run, or it may have ended on the source. A
 		// VM that is still moving, or that the run can't read, keeps the mark
