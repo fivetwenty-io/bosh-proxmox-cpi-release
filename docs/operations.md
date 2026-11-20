@@ -797,7 +797,7 @@ A dry run reads no journal record and takes no lock, so a VM it lists as `would 
 
 ### Fixing an anti-affinity layout
 
-A member joins its group's anti-affinity rules at `set_vm_metadata`, and a delete leaves room in a rule that nothing fills until a member's next `set_vm_metadata`. After an upgrade, a rule that an older release filled to the number of nodes stays that way until the group's next `set_vm_metadata`. When we want the rules right now, we run `pve-ops ha --fix-anti-affinity`, which plans each anti-affinity group of one Director again, the way the CPI plans it, and reports each group. It needs the Director's UUID, from `--director-uuid` or from `--request`, and `bosh env --json` prints it in the `uuid` column. The usage line is as follows.
+A member joins its group's anti-affinity rules at `set_vm_metadata`, and a delete plans the rest of its group again. After an upgrade, a rule that an older release filled to the number of nodes stays that way until the group's next `set_vm_metadata` or `delete_vm`. When we want the rules right now, we run `pve-ops ha --fix-anti-affinity`, which plans each anti-affinity group of one Director again, the way the CPI plans it, and reports each group. It needs the Director's UUID, from `--director-uuid` or from `--request`, and `bosh env --json` prints it in the `uuid` column. The usage line is as follows.
 
 ```text
 pve-ops ha --fix-anti-affinity [--group RULE] [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]

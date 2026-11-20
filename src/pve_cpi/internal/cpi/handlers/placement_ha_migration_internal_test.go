@@ -408,7 +408,7 @@ func TestDeregisterSkipsPurgeWhenOwnershipReadFails(t *testing.T) {
 	stub := newAAStub()
 	stub.resources["vm:101"] = true
 	stub.getResErr = fmt.Errorf("connection reset by peer")
-	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, log.NewNopLogger()); err != nil {
+	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, "", log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !stub.resources["vm:101"] {
@@ -424,7 +424,7 @@ func TestDeregisterTreatsANotFoundReadAsDone(t *testing.T) {
 	stub := newAAStub()
 	stub.getResErr = fmt.Errorf("no such resource 'vm:101'")
 	stub.resources["vm:101"] = true
-	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, log.NewNopLogger()); err != nil {
+	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, "", log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !stub.resources["vm:101"] {

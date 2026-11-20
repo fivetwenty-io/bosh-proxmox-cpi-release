@@ -539,7 +539,7 @@ func sweepDeferredTeardown(
 			cleanupAgentForVM(ctx, deps, node, vmid, sweepLogger)
 		})
 		runPostDestroyCleanup(ctx, deps, identity, "ha_membership", sweepLogger, func() {
-			cleanupHAMembershipAfterDestroy(ctx, deps, teardown.haState, vmid, sweepLogger)
+			cleanupHAMembershipAfterDestroy(ctx, deps, teardown.haState, vmid, authTags, sweepLogger)
 		})
 		runPostDestroyCleanup(ctx, deps, identity, "advertised_routes", sweepLogger, func() {
 			cleanupAdvertisedRoutes(ctx, deps, vmid, authTags, sweepLogger)

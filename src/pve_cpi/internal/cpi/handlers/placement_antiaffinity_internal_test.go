@@ -587,7 +587,7 @@ func TestEnsureAntiAffinity_ListRulesFailureReturnsError(t *testing.T) {
 func TestRemoveAntiAffinity_RecreatesWithoutVMID(t *testing.T) {
 	stub := newAAStub()
 	stub.seedRule(aaRule, "vm:100,vm:101,vm:102")
-	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, log.NewNopLogger()); err != nil {
+	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, "", log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got := stub.rules[aaRule]; got != "vm:100,vm:102" {
@@ -598,7 +598,7 @@ func TestRemoveAntiAffinity_RecreatesWithoutVMID(t *testing.T) {
 func TestRemoveAntiAffinity_DeletesWhenSingleMemberRemains(t *testing.T) {
 	stub := newAAStub()
 	stub.seedRule(aaRule, "vm:100,vm:101")
-	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, log.NewNopLogger()); err != nil {
+	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, "", log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if _, ok := stub.rules[aaRule]; ok {
@@ -645,7 +645,7 @@ func TestPruneGroupAntiAffinityRules_DeletesOnlyOurRulesWithOneMember(t *testing
 func TestRemoveAntiAffinity_NonMemberNoOp(t *testing.T) {
 	stub := newAAStub()
 	stub.seedRule(aaRule, "vm:100,vm:102")
-	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 999, log.NewNopLogger()); err != nil {
+	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 999, "", log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got := stub.rules[aaRule]; got != "vm:100,vm:102" {
@@ -656,7 +656,7 @@ func TestRemoveAntiAffinity_NonMemberNoOp(t *testing.T) {
 func TestRemoveAntiAffinity_IgnoresForeignRules(t *testing.T) {
 	stub := newAAStub()
 	stub.rules["operator-custom-rule"] = "vm:100,vm:101"
-	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, log.NewNopLogger()); err != nil {
+	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, "", log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got := stub.rules["operator-custom-rule"]; got != "vm:100,vm:101" {

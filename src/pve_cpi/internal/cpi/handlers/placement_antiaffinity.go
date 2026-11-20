@@ -768,28 +768,37 @@ func verifyAntiAffinityMember(ctx context.Context, deps Deps, ruleName, sid stri
 }
 
 // removeAntiAffinityMembership removes a VM from any CPI-managed HA anti-affinity
-// rule and deregisters its HA resource. It is keyed solely on vmid because
-// delete_vm has no access to env.bosh (the group name is unknown at delete
-// time): it scans every bosh-aa-* rule for the VM's sid. It edits only a rule
-// that carries this Director's marker, or an unmarked rule from an older CPI,
-// and leaves a rule that names another Director alone. The rules change under
-// the rules lock, with a PUT that carries the read's digest, and a rule left
-// with fewer than two members is deleted. The HA resource is deregistered even
-// when the rule writes fail, because its purge also takes the sid out of every
-// rule. All failures are returned for the caller to log; cleanup never blocks
-// VM deletion.
+// rule, deregisters its HA resource, and plans the rest of each of its groups
+// again. delete_vm has no access to env.bosh, so the group name is unknown at
+// delete time: the removal scans every bosh-aa-* rule for the VM's sid. It
+// edits only a rule that carries this Director's marker, or an unmarked rule
+// from an older CPI, and leaves a rule that names another Director alone. The
+// rules change under the rules lock, with a PUT that carries the read's
+// digest, and a rule left with fewer than two members is deleted. The HA
+// resource is deregistered even when the rule writes fail, because its purge
+// also takes the sid out of every rule. All failures are returned for the
+// caller to log; cleanup never blocks VM deletion.
+//
+// With anti-affinity writes on (see antiAffinityJoinEnabled), the delete then
+// plans each group the VM was in again, the way pve-ops ha
+// --fix-anti-affinity does, so the members it left move into the index
+// layout (see replanGroupsAfterDelete). tags are the VM's tags as the delete
+// read them before the destroy. The destroy's purge has usually taken the sid
+// out of every rule already, so the member tag in tags is what names the
+// group then.
 //
 // PVE takes no digest on a rule delete, so a delete planned from a read that a
 // sibling's create has since grown would take the sibling out with the rule.
 // The rules lock rules that out. Without it, a removal that deleted one of
 // this Director's group rules writes the group's rules again once the purge is
-// done (see healAfterUnlockedDeletes), so a sibling that joined the rule
-// between the read and the delete gets its place back.
-func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logger *log.Logger) error {
+// done (see healAfterUnlockedDeletes, or the plan above when it runs), so a
+// sibling that joined the rule between the read and the delete gets its place
+// back.
+func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, tags string, logger *log.Logger) error {
 	svc := deps.PVE.Cluster()
 	sid := haResourceSid(vmid)
 	owner := deps.RequestDirectorUUID
-	var deleted map[string]string
+	var deleted, written map[string]string
 	var confined []string
 
 	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
@@ -800,7 +809,7 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logg
 		res, err := writer.Apply(ctx, "anti-affinity cleanup", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			return planAntiAffinityRemoval(set, sid, owner, comments), nil
 		})
-		deleted, confined = writtenRuleDeletes(res, comments), confinedBy(res)
+		deleted, written, confined = writtenRuleDeletes(res, comments), writtenRules(res, comments), confinedBy(res)
 		return err
 	})
 	if err != nil {
@@ -808,13 +817,124 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logg
 	}
 
 	deregisterHaResource(ctx, svc, sid, owner, logger)
-	return errors.Join(err, healAfterUnlockedDeletes(ctx, deps, deleted, owner, sid, confined, logger))
+	if !antiAffinityJoinEnabled(deps.Config) || owner == "" {
+		return errors.Join(err, healAfterUnlockedDeletes(ctx, deps, deleted, owner, sid, confined, logger))
+	}
+	return errors.Join(err, replanGroupsAfterDelete(ctx, deps, vmid, tags, written, confined, logger))
+}
+
+// replanGroupsAfterDelete plans the rules of every group the deleted VM was in
+// again, each under the HA rules lock, through the heal that pve-ops ha
+// --fix-anti-affinity uses. So every write carries the digest of its read,
+// flattens the members' pins, and passes the join conflict checks. The groups
+// are those of the rules the removal wrote, from the comments in written, and
+// those whose member tag is in tags, which it finds from the markers on the
+// rules and the HA resources. Only this Director's groups count. The deleted
+// VM stays out of every plan, and confined holds the members of the pins a
+// repair in the removal ran for. A plan that moves a member from one rule to
+// another can make PVE live-migrate it, which is how a group from an older
+// release reaches the index layout. Every failure is returned for the caller
+// to log, and none of them fails the delete.
+func replanGroupsAfterDelete(
+	ctx context.Context, deps Deps, vmid int, tags string, written map[string]string, confined []string,
+	logger *log.Logger,
+) error {
+	owner := deps.RequestDirectorUUID
+	sid := haResourceSid(vmid)
+	groups := deletedGroupRules(written, owner)
+	known := map[string]bool{}
+	for _, g := range groups {
+		known[g.ruleName()] = true
+	}
+	var missing map[string]bool
+	for _, tag := range memberTagsOf(tags) {
+		if !known[tag] {
+			if missing == nil {
+				missing = map[string]bool{}
+			}
+			missing[tag] = true
+		}
+	}
+	var err error
+	if len(missing) > 0 {
+		found, findErr := antiAffinityGroupsNamed(ctx, deps, owner, missing)
+		if findErr != nil {
+			err = fmt.Errorf("anti-affinity: find the groups of %s's member tags: %w", sid, findErr)
+		}
+		groups = append(groups, found...)
+	}
+	deps = withRequestHAProfile(deps)
+	for _, ident := range groups {
+		healErr := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
+			return healAntiAffinityGroup(ctx, deps, ident, "", sid, confined, logger)
+		})
+		if healErr != nil {
+			err = errors.Join(err, fmt.Errorf("anti-affinity: plan the rules of group %s again after the delete: %w",
+				ident.ruleName(), healErr))
+			continue
+		}
+		logger.Info("anti-affinity: planned the group's rules again after the delete",
+			log.String("rule", ident.ruleName()), log.String("sid", sid))
+	}
+	return err
+}
+
+// memberTagsOf returns the anti-affinity member tags in a VM's tags, each the
+// name bosh-aa-<hash12> of a group's first rule, in the order they appear.
+func memberTagsOf(tags string) []string {
+	var out []string
+	for _, t := range parseTagsField(tags) {
+		t = strings.ToLower(t)
+		if isMemberTag(t) && !slices.Contains(out, t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// isMemberTag reports whether tag is a group's member tag, bosh-aa- followed
+// by twelve lower-case hex digits.
+func isMemberTag(tag string) bool {
+	hash, ok := strings.CutPrefix(tag, haRuleNamePrefix)
+	if !ok || len(hash) != 12 {
+		return false
+	}
+	for _, c := range hash {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// antiAffinityGroupsNamed returns owner's groups whose first rule is named in
+// names, from the markers on the rules and the HA resources.
+func antiAffinityGroupsNamed(
+	ctx context.Context, deps Deps, owner string, names map[string]bool,
+) ([]haIdentity, error) {
+	svc := deps.PVE.Cluster()
+	set, err := readHARuleSet(ctx, svc)
+	if err != nil {
+		return nil, fmt.Errorf("read the HA rules: %w", err)
+	}
+	resources, err := listHAResources(ctx, svc)
+	if err != nil {
+		return nil, fmt.Errorf("read the HA resources: %w", err)
+	}
+	var out []haIdentity
+	for _, ident := range antiAffinityGroupsOf(owner, set, resources) {
+		if names[ident.ruleName()] {
+			out = append(out, ident)
+		}
+	}
+	return out, nil
 }
 
 // planAntiAffinityRemoval plans the writes that take sid out of every
 // bosh-aa-* rule that this Director or an older CPI owns. A rule left with
-// fewer than two members is deleted, and comments records the comment of each
-// rule a delete is planned for, which the delete itself does not keep.
+// fewer than two members is deleted, and comments records the comment each
+// rule had when a write was planned for it, which a delete does not keep and
+// an update changes.
 func planAntiAffinityRemoval(set *ha.RuleSet, sid, owner string, comments map[string]string) []ha.RuleOp {
 	var ops []ha.RuleOp
 	for i := range set.Rules {
@@ -831,10 +951,10 @@ func planAntiAffinityRemoval(set *ha.RuleSet, sid, owner string, comments map[st
 				rest = append(rest, s)
 			}
 		}
+		comments[r.ID] = r.Comment
 		if len(rest) < 2 {
 			// Empty or now single-member: the rule no longer spreads anything.
 			ops = append(ops, ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: r.ID}})
-			comments[r.ID] = r.Comment
 			continue
 		}
 		next := r.Clone()
@@ -882,6 +1002,28 @@ func writtenRuleDeletes(res *ha.ApplyResult, comments map[string]string) map[str
 	return deleted
 }
 
+// writtenRules returns the comment of each rule that res reports written,
+// whether deleted or updated, keyed by the rule ID. comments holds the comment
+// of each rule a write was planned for. Every anti-affinity rule that a pin
+// repair in res deleted or rewrote counts too, as in writtenRuleDeletes. It
+// returns nil when none was.
+func writtenRules(res *ha.ApplyResult, comments map[string]string) map[string]string {
+	if res == nil {
+		return nil
+	}
+	written := writtenRuleDeletes(res, comments)
+	for i := range res.Wrote {
+		op := &res.Wrote[i]
+		if c, ok := comments[op.Rule.ID]; ok {
+			if written == nil {
+				written = map[string]string{}
+			}
+			written[op.Rule.ID] = c
+		}
+	}
+	return written
+}
+
 // confinedBy returns the members of the confinement pins a repair in res ran
 // for, or nil.
 func confinedBy(res *ha.ApplyResult) []string {
@@ -905,9 +1047,10 @@ func healAfterRepair(ctx context.Context, deps Deps, res *ha.ApplyResult, logger
 	}
 }
 
-// deletedGroupRules returns the groups whose rules a removal deleted, from the
-// rule IDs and the comments they carried. Only a rule whose marker names this
-// Director, and whose ID is a rule of the group the marker names, counts.
+// deletedGroupRules returns the groups of the rules a removal deleted or
+// wrote, from the rule IDs and the comments they carried. Only a rule whose
+// marker names this Director, and whose ID is a rule of the group the marker
+// names, counts.
 func deletedGroupRules(deleted map[string]string, owner string) []haIdentity {
 	seen := map[string]bool{}
 	var out []haIdentity

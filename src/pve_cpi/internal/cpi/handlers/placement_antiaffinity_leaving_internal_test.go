@@ -74,7 +74,7 @@ func TestEnsureAntiAffinity_LeavesALeavingMemberOut(t *testing.T) {
 	// The purge lands. vm:104 leaves too, and its own record joins the
 	// first, because a removal does not read which HA resources are left.
 	delete(stub.resources, "vm:101")
-	if err := removeAntiAffinityMembership(context.Background(), deps, 104, log.NewNopLogger()); err != nil {
+	if err := removeAntiAffinityMembership(context.Background(), deps, 104, "", log.NewNopLogger()); err != nil {
 		t.Fatal(err)
 	}
 	if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker()+" left=101.104" {

@@ -3000,7 +3000,7 @@ We run `pve-ops ha --fix-anti-affinity --director-uuid <uuid>`. It is a dry run,
 
 **Fix**
 
-The group's next `set_vm_metadata` rewrites it to the new layout, and any deploy that touches one of its instances sends that call. To rewrite it now, we run `pve-ops ha --fix-anti-affinity --apply`, and we add `--group bosh-aa-<hash12>` to limit the run to one group. When the finding stays after that, the pattern may ask for a rule that holds as many members as its domain has nodes. We then either lower the pattern's demand or accept the advice with `drain_safe: false`, as [Anti-affinity patterns](ha-and-resurrection.md#anti-affinity-patterns) explains.
+The group's next `set_vm_metadata` or `delete_vm` rewrites it to the new layout, and any deploy that touches one of its instances sends one of those calls. To rewrite it now, we run `pve-ops ha --fix-anti-affinity --apply`, and we add `--group bosh-aa-<hash12>` to limit the run to one group. When the finding stays after that, the pattern may ask for a rule that holds as many members as its domain has nodes. We then either lower the pattern's demand or accept the advice with `drain_safe: false`, as [Anti-affinity patterns](ha-and-resurrection.md#anti-affinity-patterns) explains.
 
 ## A VM could not join its anti-affinity group's rules
 
@@ -3018,7 +3018,7 @@ We read the warning for the reason, then run `pve-ops ha --fix-anti-affinity --d
 
 **Fix**
 
-The next `set_vm_metadata` of any member of the group tries again. To place the VM now, we run `pve-ops ha --fix-anti-affinity --apply`. When it fails again for the same reason, we clear that reason first, such as a strict pin that conflicts with another member's pin, as [HA and Resurrection](ha-and-resurrection.md#what-the-cpi-registers) explains.
+The next `set_vm_metadata` or `delete_vm` of any member of the group tries again. To place the VM now, we run `pve-ops ha --fix-anti-affinity --apply`. When it fails again for the same reason, we clear that reason first, such as a strict pin that conflicts with another member's pin, as [HA and Resurrection](ha-and-resurrection.md#what-the-cpi-registers) explains.
 
 ## A VM moves to another node on its own
 
@@ -3038,9 +3038,11 @@ The VM's HA resource has `failback` on, and the VM ran on a node with a lower pr
 
   `ha-manager migrate` moved the VM to a node that its pin does not prefer, and the HA manager moved it back.
 
+An anti-affinity rewrite can move a VM too. The first `set_vm_metadata` or `delete_vm` in a group after the upgrade rewrites the group's rules into the index layout. When the rewrite puts two members that run on the same node into one rule, the HA manager moves one of them to another node. Each group settles after its first rewrite.
+
 **Diagnosis**
 
-We run `ha-manager config` to read the resource's `failback` flag, which is on when the resource doesn't list it, and `ha-manager rules config` to read the priorities of its `bosh-na-<vmid>` pin.
+We run `ha-manager config` to read the resource's `failback` flag, which is on when the resource doesn't list it, and `ha-manager rules config` to read the priorities of its `bosh-na-<vmid>` pin. When the move followed a change to a `bosh-aa-<hash12>` rule that now names the VM and a member on the VM's old node, the rewrite caused it, and nothing more needs doing.
 
 **Fix**
 

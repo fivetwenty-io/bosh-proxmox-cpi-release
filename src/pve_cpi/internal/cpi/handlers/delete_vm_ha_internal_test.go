@@ -640,14 +640,14 @@ func TestCleanupHAMembershipRefusesFenceAndUnknown(t *testing.T) {
 		"fence": fenced, "node fence": nodeFenced, "unknown": unknown, "unread": nil,
 	} {
 		t.Run(name, func(t *testing.T) {
-			err := cleanupHAMembership(t.Context(), f.deps, st, 101, f.logger)
+			err := cleanupHAMembership(t.Context(), f.deps, st, 101, "", f.logger)
 			requireHADeferral(t, err, "HA membership cleanup of VM 101 refused")
 			if events := scene.EventsSnapshot(); len(events) != 0 {
 				t.Fatalf("a refused cleanup must touch nothing, got %v", events)
 			}
 		})
 	}
-	cleanupHAMembershipAfterDestroy(t.Context(), f.deps, fenced, 101, f.logger)
+	cleanupHAMembershipAfterDestroy(t.Context(), f.deps, fenced, 101, "", f.logger)
 	if !f.logged(slog.LevelWarn, "HA membership cleanup after the destroy refused") {
 		t.Fatal("a refusal after the destroy must be logged")
 	}
@@ -667,7 +667,7 @@ func TestCleanupHAMembershipFollowsTheHAState(t *testing.T) {
 			f := newHADeleteFixture(t, scene, 600)
 			st := &pve.HAServiceState{SID: "vm:101", VMID: 101, Known: true, Configured: managed, Raw: "stopped",
 				Node: "pve-node1"}
-			if err := cleanupHAMembership(t.Context(), f.deps, st, 101, f.logger); err != nil {
+			if err := cleanupHAMembership(t.Context(), f.deps, st, 101, "", f.logger); err != nil {
 				t.Fatalf("cleanup: %v", err)
 			}
 			scene.Do(func(s *HADeleteScene) {

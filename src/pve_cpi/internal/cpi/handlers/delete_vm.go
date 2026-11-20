@@ -117,7 +117,7 @@ func fastPathDeleteVM(
 	// because the fast path returns before the sync path's cleanup. The calls
 	// are synchronous and bounded, with no task await. It runs before the
 	// tag stamp, so a refusal leaves the VM untagged.
-	if err := cleanupHAMembership(ctx, deps, haState, vmid, logger); err != nil {
+	if err := cleanupHAMembership(ctx, deps, haState, vmid, "", logger); err != nil {
 		return err
 	}
 
@@ -709,7 +709,7 @@ func deleteLegacyVMAndArtifacts(
 			})
 		}
 		runPostDestroyCleanup(ctx, deps, identity, "ha_membership", logger, func() {
-			cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, logger)
+			cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, vmTags, logger)
 		})
 		runPostDestroyCleanup(ctx, deps, identity, "advertised_routes", logger, func() {
 			cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
@@ -718,10 +718,11 @@ func deleteLegacyVMAndArtifacts(
 	}
 
 	// --- HA anti-affinity / DLB / node-affinity pin cleanup (best-effort) ---
-	// The destroy's purge removed the HA resource, so this only clears CPI
-	// rules that still name the VM.
+	// The destroy's purge removed the HA resource, so this clears the CPI
+	// rules that still name the VM and plans the VM's anti-affinity groups
+	// again, which it finds from the member tag in vmTags.
 	runPostDestroyCleanup(ctx, deps, identity, "ha_membership", logger, func() {
-		cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, logger)
+		cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, vmTags, logger)
 	})
 
 	// --- opt-in empty-pool reaper: run AFTER the destroy has completed so
@@ -887,14 +888,22 @@ func refuseIfParkerVM(ctx context.Context, deps Deps, loc pve.VMLocation, vmid i
 // and delete_vm has no cloud_properties to tell which one ran. For a VM that
 // never had a pin, it costs two cheap not-found no-ops.
 //
+// tags are the VM's tags as the delete read them before the destroy. The
+// anti-affinity removal finds the VM's groups from the member tag in them once
+// the purge has taken the VM out of every rule, and plans each group again
+// (see removeAntiAffinityMembership). The fast path passes none, because it
+// runs the removal for no VM.
+//
 // Past the refusal everything is best-effort: HA failures are logged and never
 // block the delete.
-func cleanupHAMembership(ctx context.Context, deps Deps, haState *pve.HAServiceState, vmid int, logger *log.Logger) error {
+func cleanupHAMembership(
+	ctx context.Context, deps Deps, haState *pve.HAServiceState, vmid int, tags string, logger *log.Logger,
+) error {
 	if err := haRefusesMembershipCleanup(haState, vmid); err != nil {
 		return err
 	}
 	if haState.Managed() {
-		if aaErr := removeAntiAffinityMembership(ctx, deps, vmid, logger); aaErr != nil {
+		if aaErr := removeAntiAffinityMembership(ctx, deps, vmid, tags, logger); aaErr != nil {
 			logger.Warn("delete_vm: HA anti-affinity/DLB cleanup incomplete (non-fatal)", log.Err(aaErr))
 		}
 	}
@@ -906,8 +915,10 @@ func cleanupHAMembership(ctx context.Context, deps Deps, haState *pve.HAServiceS
 
 // cleanupHAMembershipAfterDestroy runs cleanupHAMembership once the VM is gone,
 // when the delete can no longer fail on it, so a refusal is only logged.
-func cleanupHAMembershipAfterDestroy(ctx context.Context, deps Deps, haState *pve.HAServiceState, vmid int, logger *log.Logger) {
-	if err := cleanupHAMembership(ctx, deps, haState, vmid, logger); err != nil {
+func cleanupHAMembershipAfterDestroy(
+	ctx context.Context, deps Deps, haState *pve.HAServiceState, vmid int, tags string, logger *log.Logger,
+) {
+	if err := cleanupHAMembership(ctx, deps, haState, vmid, tags, logger); err != nil {
 		logger.Warn("delete_vm: HA membership cleanup after the destroy refused", log.Err(err))
 	}
 }

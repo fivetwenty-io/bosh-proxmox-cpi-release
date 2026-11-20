@@ -211,7 +211,7 @@ func (f *aaFleet) create(vmid int) func(step func()) error {
 func (f *aaFleet) remove(vmid int) func(step func()) error {
 	f.gone[haResourceSid(vmid)] = true
 	return func(step func()) error {
-		return removeAntiAffinityMembership(context.Background(), f.deps(step), vmid, log.NewNopLogger())
+		return removeAntiAffinityMembership(context.Background(), f.deps(step), vmid, "", log.NewNopLogger())
 	}
 }
 
@@ -949,7 +949,7 @@ func TestRulesLockHold_WaitsThatKeepTheLockStayInsideTheBudget(t *testing.T) {
 		}
 		return nil
 	}
-	err := removeAntiAffinityMembership(context.Background(), deps, 100, log.NewNopLogger())
+	err := removeAntiAffinityMembership(context.Background(), deps, 100, "", log.NewNopLogger())
 	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("err = %v; want the retriable give-up", err)
 	}
@@ -981,20 +981,39 @@ func TestDeletedGroupRules(t *testing.T) {
 	}
 }
 
-// TestRemoveAntiAffinity_LockedDeleteDoesNotRewrite pins that with the rules
-// lock on, a removal that deletes the group's rule writes nothing after it,
-// because the lock kept every create out between its read and its delete.
-func TestRemoveAntiAffinity_LockedDeleteDoesNotRewrite(t *testing.T) {
+// TestRemoveAntiAffinity_LockedDeletePlansTheGroupAgain pins that with the
+// rules lock on, a removal that deletes the group's rule plans the rest of the
+// group again under the lock, so the members it left join a rule by index.
+// Without anti-affinity writes turned on, the removal only deletes the rule
+// and writes nothing after it, because the lock kept every create out between
+// its read and its delete.
+func TestRemoveAntiAffinity_LockedDeletePlansTheGroupAgain(t *testing.T) {
 	t.Parallel()
-	stub := newAAStub()
-	stub.seedRule(aaRule, "vm:100,vm:101")
-	stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag), aaQEMU(102, aaTag))
-	stub.resources["vm:101"], stub.resources["vm:102"] = true, true
-	deps := aaDepsLock(aaLockConfig("pool", false, 30), stub, newAALockPools(nil))
-	if err := removeAntiAffinityMembership(context.Background(), deps, 100, log.NewNopLogger()); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := stub.rules[aaRule]; ok {
-		t.Fatalf("rule = %q; want it deleted and not written again", stub.rules[aaRule])
+	for name, tc := range map[string]struct {
+		writes bool
+		want   string
+	}{
+		"anti-affinity on":  {writes: true, want: "vm:101,vm:102"},
+		"anti-affinity off": {writes: false, want: ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			stub := newAAStub()
+			stub.seedRule(aaRule, "vm:100,vm:101")
+			stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag), aaQEMU(102, aaTag))
+			stub.resources["vm:101"], stub.resources["vm:102"] = true, true
+			cfg := aaLockConfig("pool", false, 30)
+			if tc.writes {
+				cfg = aaMembershipConfig("pool", false, 30)
+			}
+			deps := aaDepsLock(cfg, stub, newAALockPools(nil))
+			deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4")
+			if err := removeAntiAffinityMembership(context.Background(), deps, 100, aaTag, log.NewNopLogger()); err != nil {
+				t.Fatal(err)
+			}
+			if got := stub.rules[aaRule]; got != tc.want {
+				t.Fatalf("rule = %q; want %q", got, tc.want)
+			}
+		})
 	}
 }

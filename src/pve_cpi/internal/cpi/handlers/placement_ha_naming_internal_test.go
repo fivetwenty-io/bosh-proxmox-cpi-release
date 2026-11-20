@@ -340,7 +340,7 @@ func TestRemoveAntiAffinityOnlyTouchesOwnAndUnmarkedRules(t *testing.T) {
 	foreign := haIdentity{Owner: aaOtherDirector, Deployment: aaDeployment, Group: "api"}
 	stub.seedRuleWithComment(foreign.ruleName(), "vm:101,vm:300", foreign.marker())
 	stub.seedRuleWithComment("bosh-aa-db", "vm:101,vm:400,vm:401", "BOSH anti-affinity for instance group db")
-	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, log.NewNopLogger()); err != nil {
+	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, "", log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got := stub.rules[aaRule]; got != "vm:100,vm:102" {
@@ -364,7 +364,7 @@ func TestRemoveAntiAffinityKeepsResourceMarkedForAnotherDirector(t *testing.T) {
 	stub := newAAStub()
 	stub.resources["vm:101"] = true
 	stub.resComments["vm:101"] = haIdentity{Owner: aaOtherDirector}.marker()
-	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, log.NewNopLogger()); err != nil {
+	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, "", log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !stub.resources["vm:101"] {
