@@ -3,6 +3,7 @@ package ha
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -34,7 +35,21 @@ type stageRig struct {
 	updateLands bool
 	getErr      error
 	deleteErr   error
+
+	// version numbers the content of resources.cfg, which its digest names.
+	// Every write that lands changes it, and an update that names another
+	// digest is refused the way PVE refuses it.
+	version int
+	// noDigest makes every read name no digest.
+	noDigest bool
+	// beforeUpdate, when set, runs at the start of each update, before the
+	// digest is checked, the way another writer's write lands between this
+	// call's read and its write. It gets the update's number, from 1.
+	beforeUpdate func(n int)
+	updates      int
 }
+
+func (r *stageRig) digest() string { return fmt.Sprintf("digest-%d", r.version) }
 
 func pveBool(b bool) *sdkclient.PVEBool {
 	v := sdkclient.PVEBool(b)
@@ -50,8 +65,12 @@ func (r *stageRig) GetHaResources(_ context.Context, sid string) (*sdkcluster.Ge
 		return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "no such resource"}
 	}
 	st, c := r.state, r.comment
+	digest := r.digest()
+	if r.noDigest {
+		digest = ""
+	}
 	return &sdkcluster.GetHaResourcesResponse{Sid: sid, State: &st, Comment: &c, Failback: r.failback,
-		AutoRebalance: r.rebalance}, nil
+		AutoRebalance: r.rebalance, Digest: digest}, nil
 }
 
 func (r *stageRig) CreateHaResources(_ context.Context, p *sdkcluster.CreateHaResourcesParams) error {
@@ -63,6 +82,7 @@ func (r *stageRig) CreateHaResources(_ context.Context, p *sdkcluster.CreateHaRe
 		return errors.New("resource 'vm:101' already defined")
 	}
 	r.exists, r.state, r.comment = true, *p.State, *p.Comment
+	r.version++
 	r.failback, r.rebalance = nil, nil
 	if p.Failback != nil {
 		r.failback = pveBool(*p.Failback)
@@ -79,9 +99,17 @@ func (r *stageRig) UpdateHaResources(_ context.Context, _ string, p *sdkcluster.
 		state = *p.State
 	}
 	r.events = append(r.events, "update:"+state)
+	r.updates++
+	if r.beforeUpdate != nil {
+		r.beforeUpdate(r.updates)
+	}
 	if r.updateErr != nil && !r.updateLands {
 		return r.updateErr
 	}
+	if p.Digest != nil && *p.Digest != r.digest() {
+		return errors.New("detected modified configuration - file changed by other user")
+	}
+	r.version++
 	if p.State != nil {
 		r.state = *p.State
 	}
@@ -723,5 +751,109 @@ func TestFailbackOf(t *testing.T) {
 	t.Parallel()
 	if !FailbackOf(nil) || !FailbackOf(pveBool(true)) || FailbackOf(pveBool(false)) {
 		t.Fatal("FailbackOf must read nil and true as on, and false as off")
+	}
+}
+
+// Stage owns the ownership marker and the DLB record on an HA resource's
+// comment, and a re-registration rewrites only those. Every token another
+// writer put there stays, and so does an unknown bosh- token, which a later
+// writer may own.
+func TestStageKeepsTheTokensOtherWritersOwn(t *testing.T) {
+	t.Parallel()
+	others := " bosh-narrow-from=started " + FailbackHoldKey + "5000 " + DeadNodeSourceKey + "=b " +
+		"bosh-rebalance-to=c bosh-future"
+	rig := &stageRig{exists: true, state: haStateIgnored, failback: pveBool(true),
+		comment: "bosh-cpi:v1 owner=us deployment=- group=- bosh-dlb=1 stray=1" + others}
+	d := stageDecision()
+	if err := rig.stager().Stage(context.Background(), d, stageMarker); err != nil {
+		t.Fatal(err)
+	}
+	if want := stageMarker + " bosh-dlb=0" + others; rig.comment != want {
+		t.Fatalf("comment %q, want %q", rig.comment, want)
+	}
+	if !d.StagedIgnored || rig.failback.Bool() {
+		t.Fatalf("staged %v failback %v", d.StagedIgnored, rig.failback.Bool())
+	}
+
+	// A comment that already carries the marker and the record, with other
+	// writers' tokens after them, needs no write.
+	same := &stageRig{exists: true, state: haStateIgnored, comment: stageMarker + " bosh-dlb=0" + others,
+		failback: pveBool(false), rebalance: pveBool(false)}
+	if err := same.stager().Stage(context.Background(), stageDecision(), stageMarker); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(same.events, []string{"create:ignored", "get"}) {
+		t.Fatalf("a resource that already matches needs no update: %v", same.events)
+	}
+}
+
+// A re-registration passes the comment it recorded as the marker. A token
+// another writer owns that the resource carries now wins over the recorded
+// one, and a recorded one the resource lacks stays.
+func TestStageKeepsTheResourcesTokenOverTheRecordedOne(t *testing.T) {
+	t.Parallel()
+	rig := &stageRig{exists: true, state: haStateIgnored, failback: pveBool(false), rebalance: pveBool(false),
+		comment: stageMarker + " bosh-dlb=0 " + FailbackHoldKey + "5000"}
+	recorded := stageMarker + " " + FailbackHoldKey + "1000 " + DeadNodeSourceKey + "=b"
+	if err := rig.stager().Stage(context.Background(), stageDecision(), recorded); err != nil {
+		t.Fatal(err)
+	}
+	want := stageMarker + " " + DeadNodeSourceKey + "=b bosh-dlb=0 " + FailbackHoldKey + "5000"
+	if rig.comment != want {
+		t.Fatalf("comment %q, want %q", rig.comment, want)
+	}
+}
+
+// The update of a resource that is already there names the digest of the read
+// it was merged from, so a token another writer adds in between is never lost.
+func TestStageUpdateComparesTheDigest(t *testing.T) {
+	t.Parallel()
+	rig := &stageRig{exists: true, state: haStateIgnored, failback: pveBool(true),
+		comment: "bosh-cpi:v1 owner=us deployment=- group=-"}
+	rig.beforeUpdate = func(n int) {
+		if n == 1 {
+			rig.comment += " " + FailbackHoldKey + "7000"
+			rig.version++
+		}
+	}
+	d := stageDecision()
+	if err := rig.stager().Stage(context.Background(), d, stageMarker); err != nil {
+		t.Fatal(err)
+	}
+	if want := stageMarker + " bosh-dlb=0 " + FailbackHoldKey + "7000"; rig.comment != want || !d.StagedIgnored {
+		t.Fatalf("comment %q staged %v, want %q", rig.comment, d.StagedIgnored, want)
+	}
+	if want := []string{"create:ignored", "get", "update:-", "get", "update:-"}; !slices.Equal(rig.events, want) {
+		t.Fatalf("events %v, want %v", rig.events, want)
+	}
+}
+
+// A resource whose resources.cfg keeps changing, or whose read names no
+// digest, is never written unchecked. The stage fails with a retriable error,
+// the resource stays ignored, which the CRM never acts on, and the tokens on
+// it stay.
+func TestStageUpdateNeverWritesUnchecked(t *testing.T) {
+	t.Parallel()
+	start := "bosh-cpi:v1 owner=us deployment=- group=- " + FailbackHoldKey + "7000"
+	busy := &stageRig{exists: true, state: haStateIgnored, failback: pveBool(true), comment: start}
+	busy.beforeUpdate = func(int) { busy.version++ }
+	d := stageDecision()
+	err := busy.stager().Stage(context.Background(), d, stageMarker)
+	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !strings.Contains(err.Error(), "changed") || d.StagedIgnored {
+		t.Fatalf("err %v staged %v; want a retriable refusal", err, d.StagedIgnored)
+	}
+	if busy.comment != start || busy.updates != CommentWriteAttempts {
+		t.Fatalf("comment %q after %d updates; want it untouched after %d", busy.comment, busy.updates,
+			CommentWriteAttempts)
+	}
+
+	blind := &stageRig{exists: true, state: haStateIgnored, failback: pveBool(true), comment: start, noDigest: true}
+	d = stageDecision()
+	err = blind.stager().Stage(context.Background(), d, stageMarker)
+	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !strings.Contains(err.Error(), "digest") || d.StagedIgnored {
+		t.Fatalf("err %v staged %v; want a retriable refusal", err, d.StagedIgnored)
+	}
+	if blind.updates != 0 || blind.comment != start {
+		t.Fatalf("a read without a digest was written: %d updates, comment %q", blind.updates, blind.comment)
 	}
 }

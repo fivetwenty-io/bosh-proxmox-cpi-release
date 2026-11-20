@@ -40,7 +40,13 @@ type phCluster struct {
 	// each write and its verification.
 	mangle   func(p *cluster.CreateHaRulesParams)
 	getCalls int
+	// version numbers the content of resources.cfg, which its digest names.
+	// Every write that lands changes it, and an update that names another
+	// digest is refused the way PVE refuses it.
+	version int
 }
+
+func (c *phCluster) resourcesDigest() string { return fmt.Sprintf("digest-%d", c.version) }
 
 func newPHCluster(members ...string) *phCluster {
 	stub := newNAStub()
@@ -60,7 +66,7 @@ func (c *phCluster) GetHaResources(_ context.Context, sid string) (*cluster.GetH
 		return nil, fmt.Errorf("no such resource '%s'", sid)
 	}
 	state, comment := r.state, r.comment
-	return &cluster.GetHaResourcesResponse{Sid: sid, State: &state, Comment: &comment}, nil
+	return &cluster.GetHaResourcesResponse{Sid: sid, State: &state, Comment: &comment, Digest: c.resourcesDigest()}, nil
 }
 
 func (c *phCluster) CreateHaResources(_ context.Context, p *cluster.CreateHaResourcesParams) error {
@@ -74,6 +80,7 @@ func (c *phCluster) CreateHaResources(_ context.Context, p *cluster.CreateHaReso
 		r.comment = *p.Comment
 	}
 	c.res[p.Sid] = r
+	c.version++
 	c.log.add("stage:" + r.state)
 	return nil
 }
@@ -88,6 +95,10 @@ func (c *phCluster) UpdateHaResources(_ context.Context, sid string, p *cluster.
 	if !ok {
 		return fmt.Errorf("no such resource '%s'", sid)
 	}
+	if p.Digest != nil && *p.Digest != c.resourcesDigest() {
+		return errors.New("detected modified configuration - file changed by other user")
+	}
+	c.version++
 	if p.Comment != nil {
 		r.comment = *p.Comment
 	}
@@ -102,6 +113,7 @@ func (c *phCluster) DeleteHaResources(_ context.Context, sid string, _ *cluster.
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.res, sid)
+	c.version++
 	c.log.add("unstage")
 	return nil
 }

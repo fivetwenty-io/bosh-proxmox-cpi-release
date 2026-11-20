@@ -212,17 +212,26 @@ func (s *Stager) logger() *log.Logger {
 }
 
 // Stage registers the VM's resource as ignored with marker as its comment,
-// the decision's failback, and auto-rebalance on only for a DLB VM, and marks the
-// decision staged. The comment also records whether the decision is a DLB VM
-// (see DLBRecordKey), replacing any record marker carried. It names auto-rebalance only where every online node's
-// release has the key, and failback where the release has it or the decision
-// turns it off (see ResourceKeys). A resource that already exists counts as
-// staged only when it carries this Director's marker and requests ignored,
-// and its comment and the flags the stage names are then set to what the
-// stage writes. Any other resource fails the
-// call with a retriable error and is left alone, because it may be an
-// operator's or a resource the CRM already manages. A held error re-reads the
-// resource and counts the stage as done only when the read shows it.
+// the decision's failback, and auto-rebalance on only for a DLB VM, and marks
+// the decision staged. The comment also records whether the decision is a DLB
+// VM (see DLBRecordKey), replacing any record marker carried. It names
+// auto-rebalance only where every online node's release has the key, and
+// failback where the release has it or the decision turns it off (see
+// ResourceKeys).
+//
+// A resource that already exists counts as staged only when it carries this
+// Director's marker and requests ignored. Its marker, its DLB record, and the
+// flags the stage names are then set to what the stage writes, and every
+// token another writer put on its comment stays (see stagedComment). That
+// write names the digest of the read it merged the comment from, and a write
+// PVE refuses because resources.cfg changed is read, judged, and merged again,
+// up to CommentWriteAttempts times. A stage that runs out of attempts, or
+// whose read names no digest, fails with a retriable error and writes nothing
+// more, so the resource stays ignored, which the CRM never acts on, and keeps
+// every token it had. Any other resource fails the call with a retriable
+// error and is left alone, because it may be an operator's or a resource the
+// CRM already manages. A held error re-reads the resource and counts the
+// stage as done only when the read shows it.
 func (s *Stager) Stage(ctx context.Context, d *VMDecision, marker string) error {
 	switch {
 	case !d.Registers():
@@ -249,28 +258,57 @@ func (s *Stager) Stage(ctx context.Context, d *VMDecision, marker string) error 
 			log.Bool("failback", failback), log.Bool("auto_rebalance", rebalance))
 		return nil
 	}
-	got, readErr := s.Resources.GetHaResources(ctx, d.SID)
-	if readErr != nil || got == nil {
-		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("ha stage: register %s as ignored", d.SID))
-	}
-	if blocker := s.stagedBlocker(got); blocker != "" {
-		return cpierrors.Retriable("ha stage: %s already exists and %s, so the CPI leaves it alone and does not "+
-			"register VM %d; remove the resource or let the earlier call finish, and retry", d.SID, blocker, d.VMID)
-	}
-	if got.Comment == nil || *got.Comment != comment || failbackKey && FailbackOf(got.Failback) != failback ||
-		rebalanceKey && AutoRebalanceOf(got.AutoRebalance) != rebalance {
-		update := &sdkcluster.UpdateHaResourcesParams{Comment: &comment}
+	for attempt := 1; ; attempt++ {
+		got, readErr := s.Resources.GetHaResources(ctx, d.SID)
+		if readErr != nil || got == nil {
+			if attempt > 1 {
+				err = readErr
+				if err == nil {
+					err = errors.New("the read returned nothing")
+				}
+				return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+					fmt.Sprintf("ha stage: read %s again after resources.cfg changed", d.SID))
+			}
+			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("ha stage: register %s as ignored", d.SID))
+		}
+		if blocker := s.stagedBlocker(got); blocker != "" {
+			return cpierrors.Retriable("ha stage: %s already exists and %s, so the CPI leaves it alone and does "+
+				"not register VM %d; remove the resource or let the earlier call finish, and retry", d.SID, blocker,
+				d.VMID)
+		}
+		merged := stagedComment(marker, d.DLB, *got.Comment)
+		if *got.Comment == merged && (!failbackKey || FailbackOf(got.Failback) == failback) &&
+			(!rebalanceKey || AutoRebalanceOf(got.AutoRebalance) == rebalance) {
+			break
+		}
+		if got.Digest == "" {
+			return cpierrors.Retriable("ha stage: the read of %s named no digest, so the CPI cannot write its "+
+				"comment without losing a token another call adds; the resource stays ignored, and a retry "+
+				"stages it again", d.SID)
+		}
+		digest := got.Digest
+		update := &sdkcluster.UpdateHaResourcesParams{Comment: &merged, Digest: &digest}
 		if failbackKey {
 			update.Failback = &failback
 		}
 		if rebalanceKey {
 			update.AutoRebalance = &rebalance
 		}
-		if updErr := s.Resources.UpdateHaResources(ctx, d.SID, update); updErr != nil {
+		updErr := s.Resources.UpdateHaResources(ctx, d.SID, update)
+		switch {
+		case updErr == nil:
+		case !IsDigestConflict(updErr):
 			return cpierrors.WrapAs(updErr, cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("ha stage: set the staged flags of %s", d.SID))
+		case attempt < CommentWriteAttempts:
+			continue
+		default:
+			return cpierrors.WrapAs(updErr, cpierrors.TypeRetriableCloud, fmt.Sprintf("ha stage: resources.cfg "+
+				"changed under %d writes of the staged flags of %s, so the resource stays ignored with the "+
+				"comment it had; a retry stages it again", attempt, d.SID))
 		}
+		break
 	}
 	d.MarkStaged()
 	s.logger().Info("ha: found the HA resource already staged as ignored", log.String("sid", d.SID))

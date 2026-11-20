@@ -3,6 +3,7 @@ package ha
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -28,6 +29,9 @@ type readdRig struct {
 	requested string
 	comment   string
 	rebalance bool
+	// version numbers the content of resources.cfg, which its digest names,
+	// and every write that lands changes it.
+	version int
 	// rebalanceUnset leaves auto-rebalance out of the resource read, which is
 	// how PVE reads a resource that holds the flag's default.
 	rebalanceUnset bool
@@ -108,7 +112,8 @@ func (r *readdRig) GetHaResources(_ context.Context, sid string) (*sdkcluster.Ge
 	if r.rebalanceUnset {
 		rebalance = nil
 	}
-	return &sdkcluster.GetHaResourcesResponse{Sid: sid, State: &st, Comment: &c, AutoRebalance: rebalance}, nil
+	return &sdkcluster.GetHaResourcesResponse{Sid: sid, State: &st, Comment: &c, AutoRebalance: rebalance,
+		Digest: fmt.Sprintf("digest-%d", r.version)}, nil
 }
 
 func (r *readdRig) CreateHaResources(_ context.Context, p *sdkcluster.CreateHaResourcesParams) error {
@@ -121,6 +126,7 @@ func (r *readdRig) CreateHaResources(_ context.Context, p *sdkcluster.CreateHaRe
 	r.events = append(r.events, "stage:"+*p.State)
 	r.exists, r.requested, r.comment, r.listed = true, *p.State, *p.Comment, false
 	r.rebalance = p.AutoRebalance != nil && *p.AutoRebalance
+	r.version++
 	return nil
 }
 
@@ -135,6 +141,10 @@ func (r *readdRig) UpdateHaResources(_ context.Context, _ string, p *sdkcluster.
 	if err := r.failOnce("request:" + state); err != nil {
 		return err
 	}
+	if p.Digest != nil && *p.Digest != fmt.Sprintf("digest-%d", r.version) {
+		return errors.New("detected modified configuration - file changed by other user")
+	}
+	r.version++
 	r.events = append(r.events, "request:"+state)
 	if p.State != nil {
 		r.requested = *p.State
