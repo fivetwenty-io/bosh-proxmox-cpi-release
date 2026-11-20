@@ -20,6 +20,8 @@ const haInputLimit = 1 << 20
 
 const haUsage = "usage: pve-ops ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]\n" +
 	"       pve-ops ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]\n" +
+	"       pve-ops ha --fix-anti-affinity [--group RULE] [--apply] [--config PATH] [--request PATH | " +
+	"--director-uuid UUID] [--json]\n" +
 	"       pve-ops ha rebalance [--apply] [--config PATH] [--request PATH] [--director-uuid UUID] [flags]"
 
 // haDeps are the pieces of the ha subcommand a test replaces: how the base CPI
@@ -32,6 +34,7 @@ type haDeps struct {
 	now        func() time.Time
 	widen      haWidenFunc
 	rebalance  haRebalanceFunc
+	fixAA      haFixAAFunc
 }
 
 // productionHADeps wires the ha subcommand to the real config loader and PVE
@@ -49,6 +52,7 @@ func productionHADeps() haDeps {
 		now:       time.Now,
 		widen:     productionHAWiden,
 		rebalance: productionHARebalance,
+		fixAA:     productionHAFixAA,
 	}
 }
 
@@ -73,8 +77,10 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 	cpiConfigPath := fs.String("cpi-config", "", "BOSH cpi-config as JSON (not the rendered cpi.json), used to check every cpis entry of type pve and the exports they share")
 	asJSON := fs.Bool("json", false, "JSON output")
 	widenReplicas := fs.Bool("widen-replicas", false, "widen the pin of each replicate VM whose replica a verified sync covers, using the check the CPI runs (a dry run unless --apply is given)")
-	apply := fs.Bool("apply", false, "with --widen-replicas, write the widened pins")
-	directorUUID := fs.String("director-uuid", "", "with --widen-replicas, the UUID of the Director whose VMs the pass may widen, when no --request names it")
+	fixAA := fs.Bool("fix-anti-affinity", false, "plan each anti-affinity group of the Director again the way the CPI plans it, and report the groups whose rules differ (a dry run unless --apply is given)")
+	group := fs.String("group", "", "with --fix-anti-affinity, the base rule name bosh-aa-<hash12> of the one group to fix")
+	apply := fs.Bool("apply", false, "with --widen-replicas, write the widened pins, and with --fix-anti-affinity, write the planned rules")
+	directorUUID := fs.String("director-uuid", "", "with --widen-replicas or --fix-anti-affinity, the UUID of the Director whose VMs or rules the run may change, when no --request names it")
 	if err := fs.Parse(args); errors.Is(err, flag.ErrHelp) {
 		fs.SetOutput(stderr)
 		_, _ = fmt.Fprintln(stderr, haUsage)
@@ -89,7 +95,8 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 		_, _ = fmt.Fprintln(stderr, haUsage)
 		return exitUsage
 	}
-	if code, ok := checkHAWidenFlags(*widenReplicas, *apply, *cpiConfigPath, *directorUUID, stderr); !ok {
+	if code, ok := checkHAWriteFlags(*widenReplicas, *fixAA, *apply, *cpiConfigPath, *directorUUID, *group,
+		stderr); !ok {
 		return code
 	}
 
@@ -119,13 +126,17 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 			return exitError
 		}
 	}
-	if *widenReplicas {
+	if *widenReplicas || *fixAA {
 		if named := strings.TrimSpace(*directorUUID); named != "" {
 			if owner != "" && owner != named {
 				_, _ = fmt.Fprintln(stderr, "pve-ops ha: --director-uuid names a different Director than the request")
 				return exitUsage
 			}
 			owner = named
+		}
+		if *fixAA {
+			return runHAFixAA(ctx, eff, logger, owner, strings.TrimSpace(*group), *apply, *asJSON, stdout, stderr,
+				deps)
 		}
 		return runHAWiden(ctx, eff, logger, owner, *apply, *asJSON, stdout, stderr, deps)
 	}
@@ -151,15 +162,23 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 	return exitOK
 }
 
-// checkHAWidenFlags refuses the flag combinations --widen-replicas does not
-// take, and the widening flags without it.
-func checkHAWidenFlags(widen, apply bool, cpiConfigPath, directorUUID string, stderr io.Writer) (int, bool) {
+// checkHAWriteFlags refuses the flag combinations --widen-replicas and
+// --fix-anti-affinity do not take, and their flags without them.
+func checkHAWriteFlags(
+	widen, fixAA, apply bool, cpiConfigPath, directorUUID, group string, stderr io.Writer,
+) (int, bool) {
+	writes := widen || fixAA
 	switch {
-	case !widen && (apply || directorUUID != ""):
-		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --apply and --director-uuid go with --widen-replicas")
-	case widen && cpiConfigPath != "":
-		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --widen-replicas and --cpi-config cannot be combined; "+
-			"run it once per cpis entry with that entry's --request")
+	case widen && fixAA:
+		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --widen-replicas and --fix-anti-affinity cannot be combined")
+	case !writes && (apply || directorUUID != ""):
+		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --apply and --director-uuid go with --widen-replicas or "+
+			"--fix-anti-affinity")
+	case !fixAA && group != "":
+		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --group goes with --fix-anti-affinity")
+	case writes && cpiConfigPath != "":
+		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --widen-replicas and --fix-anti-affinity cannot be combined with "+
+			"--cpi-config; run them once per cpis entry with that entry's --request")
 	default:
 		return exitOK, true
 	}

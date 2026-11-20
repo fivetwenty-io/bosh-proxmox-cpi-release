@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
@@ -668,7 +669,9 @@ func (c *haCollector) ruleFindings() {
 }
 
 // antiAffinityFindings reports each anti-affinity group that overflowed its
-// cluster, and each group with a member its rule does not name.
+// cluster, and each group with a member its rule does not name. A group whose
+// rules or HA resources carry a CPI marker that names it is planned the way
+// the CPI plans it instead, and layoutFindings reports what that plan finds.
 //
 // Entries that share a cluster and a VM ID band stamp the same group tags, so
 // when they disagree on whether they write rules, a group with no rule may have
@@ -704,8 +707,13 @@ func (c *haCollector) antiAffinityFindings() {
 		}
 	}
 	sort.Strings(tags)
+	planned := c.layoutChecks()
 	unjudged := false
 	for _, tag := range tags {
+		if chk, ok := planned[tag]; ok {
+			c.layoutFindings(chk)
+			continue
+		}
 		rules := c.groupRules(tag)
 		if mixed && len(rules) == 0 {
 			unjudged = true
@@ -739,9 +747,9 @@ func (c *haCollector) groupInBand(members []*haGuest) bool {
 }
 
 // antiAffinityWrites reports whether the CPI writes anti-affinity rules at all.
-// create_vm writes a group rule only when pve.ha.anti_affinity is not off and
-// scheduler-soft anti-affinity is enabled, so a cluster set up otherwise has no
-// rule to judge a group against.
+// set_vm_metadata places a member in its group's rules only when
+// pve.ha.anti_affinity is not off and scheduler-soft anti-affinity is enabled,
+// so a cluster set up otherwise has no rule to judge a group against.
 func (c *haCollector) antiAffinityWrites() bool {
 	return antiAffinityWritten(c.cfg)
 }
@@ -751,13 +759,74 @@ func antiAffinityWritten(cfg *config.CPIConfig) bool {
 	return cfg.HAAntiAffinityValue() != config.HARuleOff && cfg.AntiAffinityEnabled()
 }
 
-// groupRules returns the rules that carry a group's name: the rule itself and
-// the numbered rules an overflow split adds.
+// layoutChecks plans every group that a CPI marker names, the way the CPI
+// plans it, and returns each check by the group's base rule name. Without
+// the HA resources the plan cannot tell which members may join, so nothing
+// is planned.
+func (c *haCollector) layoutChecks() map[string]handlers.AntiAffinityGroupCheck {
+	if !c.resourcesOK || c.p == nil {
+		return nil
+	}
+	in := handlers.AntiAffinityCheckInput{
+		Config: c.cfg, Profile: c.p, Owner: c.owner, GuestsComplete: !c.guestsPartial,
+		Rules: &ha.RuleSet{Rules: c.rules}, Resources: make(map[string]string, len(c.resources)), Now: c.now,
+	}
+	for _, g := range c.guests {
+		in.Guests = append(in.Guests, g.ref)
+	}
+	for sid, row := range c.resources {
+		in.Resources[sid] = row.Comment
+	}
+	out := map[string]handlers.AntiAffinityGroupCheck{}
+	checks := handlers.CheckAntiAffinityGroups(in)
+	for i := range checks {
+		out[checks[i].Rule] = checks[i]
+	}
+	return out
+}
+
+// layoutFindings reports what the plan of one group finds: rules its pattern
+// gave up for drain safety, a pattern that gave drain safety up, rules that
+// hold as many members as their nodes, and rules that differ from the plan.
+func (c *haCollector) layoutFindings(chk handlers.AntiAffinityGroupCheck) {
+	if chk.Problem != "" {
+		c.rep.problem(haKindAALayoutDrift, chk.Rule, "the group's rules could not be planned: %s", chk.Problem)
+		return
+	}
+	if len(chk.Trimmed) > 0 {
+		c.rep.advise(haKindAAPatternTrimmed, chk.Rule,
+			"the pattern %s of group %s asks for rules %s, which the CPI leaves out, because each would leave a "+
+				"member with no free node while one node drains", chk.Pattern, chk.Group, strings.Join(chk.Trimmed, ", "))
+	}
+	if chk.BlocksDrain {
+		c.rep.advise(haKindAAPatternBlocksDrain, chk.Rule,
+			"the pattern %s of group %s sets drain_safe to false, so a drain of one node can leave a member "+
+				"with no node to move to, and pve-ops ha drain stops such a member through HA", chk.Pattern, chk.Group)
+	}
+	for _, f := range chk.Full {
+		text := "rule %s holds %d members on %d nodes, so a drain of one node leaves a member with no free node"
+		if chk.BlocksDrain {
+			c.rep.advise(haKindAARuleFull, f.Rule, text+", which the pattern's drain_safe false allows",
+				f.Rule, f.Members, f.Nodes)
+			continue
+		}
+		c.rep.problem(haKindAARuleFull, f.Rule, text+"; pve-ops ha --fix-anti-affinity --apply rewrites it",
+			f.Rule, f.Members, f.Nodes)
+	}
+	if len(chk.Drift) > 0 {
+		c.rep.advise(haKindAALayoutDrift, chk.Rule,
+			"the rules of group %s differ from the layout the CPI plans, which the next set_vm_metadata "+
+				"of a member writes, or pve-ops ha --fix-anti-affinity --apply now: %s",
+			chk.Group, strings.Join(chk.Drift, "; "))
+	}
+}
+
+// groupRules returns the rules that carry a group's name: the rule itself,
+// the numbered rules an overflow split adds, and the rules a pattern adds.
 func (c *haCollector) groupRules(tag string) []*ha.Rule {
 	var rules []*ha.Rule
 	for i := range c.rules {
-		id := c.rules[i].ID
-		if id == tag || strings.HasPrefix(id, tag+"-") && isDigits(strings.TrimPrefix(id, tag+"-")) {
+		if aapattern.IsGroupRule(tag, c.rules[i].ID) {
 			rules = append(rules, &c.rules[i])
 		}
 	}
@@ -765,15 +834,18 @@ func (c *haCollector) groupRules(tag string) []*ha.Rule {
 }
 
 // checkGroup judges one group against its rules and the cluster's node count.
+// A rule holds at most one member fewer than the cluster's nodes, so a group
+// with more members than that overflows its first rule.
 func (c *haCollector) checkGroup(tag string, members []*haGuest, rules []*ha.Rule) {
 	nodes := len(c.p.Nodes)
-	if nodes > 0 && len(members) > nodes {
+	if room := nodes - 1; nodes > 0 && len(members) > room {
 		if len(rules) == 0 {
 			c.rep.advise(haKindAntiAffinitySkipped, tag,
-				"the group has %d members but the cluster has %d nodes, so skip wrote no rule", len(members), nodes)
+				"the group has %d members but a rule holds at most %d on the cluster's %d nodes, and the group "+
+					"has no rule", len(members), room, nodes)
 		} else {
-			text := fmt.Sprintf("the group has %d members but the cluster has %d nodes, so it is split across %d rules",
-				len(members), nodes, len(rules))
+			text := fmt.Sprintf("the group has %d members but a rule holds at most %d on the cluster's %d nodes, "+
+				"so it is split across %d rules", len(members), room, nodes, len(rules))
 			for _, g := range members {
 				if g.resource != nil && !namedByAny(rules, g.sid) {
 					text += fmt.Sprintf("; %s is in no anti-affinity rule for group %s", g.sid, tag)
@@ -794,7 +866,8 @@ func (c *haCollector) checkGroup(tag string, members []*haGuest, rules []*ha.Rul
 	}
 	if len(missing) > 0 {
 		c.rep.problem(haKindAntiAffinityShort, tag,
-			"the group's rule does not name %s, so the group is short of a member until a later create_vm adds it",
+			"the group's rule does not name %s, so the group is short of a member until set_vm_metadata or "+
+				"pve-ops ha --fix-anti-affinity --apply adds it",
 			strings.Join(missing, ", "))
 	}
 }
@@ -807,18 +880,6 @@ func namedByAny(rules []*ha.Rule, sid string) bool {
 		}
 	}
 	return false
-}
-
-func isDigits(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
 }
 
 // cpuFindings reports nodes whose CPU is unreadable, VMs whose host or max CPU

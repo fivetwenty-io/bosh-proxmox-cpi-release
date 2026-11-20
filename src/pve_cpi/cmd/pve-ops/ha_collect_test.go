@@ -320,15 +320,16 @@ func TestCollectAntiAffinityOverflowAndShortGroup(t *testing.T) {
 	want(t, r, haKindAntiAffinitySplit, haSeverityAdvice, group, "2 rules")
 	wantNone(t, r, haKindAntiAffinitySkipped)
 
-	// Three members fit the cluster; a member with a resource that its rule does
-	// not name leaves the group short.
-	f.guests = f.guests[:3]
-	f.resources = []HAResourceRow{{SID: "vm:200", State: "started"}, {SID: "vm:201", State: "started"}, {SID: "vm:202", State: "started"}}
-	f.rules = []ha.Rule{{ID: group, Type: "resource-affinity", Affinity: "negative", Comment: haMarker, Resources: []string{"vm:200", "vm:201"}}}
+	// Two members fit one rule on three nodes, because a rule holds at most one
+	// member fewer than the cluster has nodes. A member with a resource that its
+	// rule does not name leaves the group short.
+	f.guests = f.guests[:2]
+	f.resources = []HAResourceRow{{SID: "vm:200", State: "started"}, {SID: "vm:201", State: "started"}}
+	f.rules = []ha.Rule{{ID: group, Type: "resource-affinity", Affinity: "negative", Comment: haMarker, Resources: []string{"vm:200"}}}
 	r = runCollect(t, f, haCfg("auto", "none"))
-	want(t, r, haKindAntiAffinityShort, haSeverityProblem, group, "vm:202")
+	want(t, r, haKindAntiAffinityShort, haSeverityProblem, group, "vm:201")
 
-	f.rules[0].Resources = []string{"vm:200", "vm:201", "vm:202"}
+	f.rules[0].Resources = []string{"vm:200", "vm:201"}
 	wantNone(t, runCollect(t, f, haCfg("auto", "none")), haKindAntiAffinityShort, haKindAntiAffinitySplit)
 }
 
