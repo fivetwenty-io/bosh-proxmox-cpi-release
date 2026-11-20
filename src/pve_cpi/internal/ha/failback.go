@@ -36,7 +36,7 @@ type FailbackAPI interface {
 // not accept. A resource a narrowing barrier holds is written too, because the
 // barrier sets only the requested state and the comment, and its fallback
 // registers the resource again with the flags the caller's decision names. It
-// never turns failback on while the comment carries a fresh hold token (see
+// never turns failback on while the comment holds it off with a fresh hold token or a rebalance token (see
 // FailbackAllowed), and it then reports no change. A read or a write that
 // fails is returned.
 func ReconcileFailback(ctx context.Context, api FailbackAPI, sid string, want bool, owned func(string) bool) (

@@ -66,12 +66,17 @@ func FailbackHoldOf(comment *string) (string, bool) {
 	return "", false
 }
 
-// FailbackHeld reports whether comment carries a hold token that is still
-// fresh at now: one written less than FailbackHoldTTL ago. A token that names
-// a time more than FailbackHoldTTL ahead of now, which only a broken clock
-// writes, and one whose time does not parse, hold nothing, so no token keeps
-// failback off for longer than FailbackHoldTTL after the clock reads it.
+// FailbackHeld reports whether comment holds failback off at now. A rebalance
+// token holds it for as long as the token is there (see RebalanceMarkKey). A
+// hold token holds it while it is still fresh: written less than
+// FailbackHoldTTL ago. A hold token that names a time more than
+// FailbackHoldTTL ahead of now, which only a broken clock writes, and one
+// whose time does not parse, hold nothing, so no hold token keeps failback off
+// for longer than FailbackHoldTTL after the clock reads it.
 func FailbackHeld(comment *string, now time.Time) bool {
+	if _, ok := RebalancePending(comment); ok {
+		return true
+	}
 	tok, ok := FailbackHoldOf(comment)
 	if !ok {
 		return false
@@ -87,9 +92,10 @@ func FailbackHeld(comment *string, now time.Time) bool {
 // FailbackAllowed returns the failback flag a writer that wants want may
 // write on a resource whose comment is comment: want, unless comment holds
 // failback off at now (see FailbackHeld). A writer may always turn failback
-// off, and no writer turns it on while a hold is fresh, because the VM's pin
-// still prefers the node a move takes it away from, and failback would pull
-// it back there once the resource is under PVE HA.
+// off, and no writer turns it on while a hold is fresh or a rebalance token is
+// there, because the VM's pin still prefers the node a move takes it away
+// from, and failback would pull it back there once the resource is under PVE
+// HA.
 func FailbackAllowed(want bool, comment string, now time.Time) bool {
 	return want && !FailbackHeld(&comment, now)
 }

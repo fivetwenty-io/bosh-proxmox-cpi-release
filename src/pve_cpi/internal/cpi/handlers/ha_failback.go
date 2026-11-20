@@ -223,9 +223,29 @@ func clearVMFailback(ctx context.Context, api ha.FailbackAPI, owner string, vmid
 // wantVMFailback finds the failback flag VM vmid's HA resource should carry.
 // It reads the resource through api before it reads the rules and the config,
 // so the digest it returns predates every fact the decision rests on. A nil
-// profile is resolved.
+// profile is resolved. A resource that carries a rebalance token is pending,
+// and the decision leaves its flag to the rebalance that moves it.
 func wantVMFailback(ctx context.Context, deps Deps, api ha.FailbackAPI, profile *ha.Profile, vmid int,
 	loc pve.VMLocation,
+) (vmFailbackWant, error) {
+	return decideVMFailback(ctx, deps, api, profile, vmid, loc, "")
+}
+
+// wantVMFailbackForRebalance is wantVMFailback for the rebalance that moved
+// VM vmid to node and holds the resource's rebalance token naming node. That
+// token doesn't make the resource pending, and the decision is the one the VM
+// gets without it. A token that names another node still does, and so does a
+// fresh failback hold.
+func wantVMFailbackForRebalance(ctx context.Context, deps Deps, api ha.FailbackAPI, profile *ha.Profile,
+	vmid int, loc pve.VMLocation, node string,
+) (vmFailbackWant, error) {
+	return decideVMFailback(ctx, deps, api, profile, vmid, loc, node)
+}
+
+// decideVMFailback is wantVMFailback, for the rebalance that moved the VM to
+// movedTo when movedTo is not empty.
+func decideVMFailback(ctx context.Context, deps Deps, api ha.FailbackAPI, profile *ha.Profile, vmid int,
+	loc pve.VMLocation, movedTo string,
 ) (vmFailbackWant, error) {
 	if profile == nil {
 		var err error
@@ -259,6 +279,15 @@ func wantVMFailback(ctx context.Context, deps Deps, api ha.FailbackAPI, profile 
 		return vmFailbackWant{reason: "a narrowing barrier holds the VM's HA resource, and the call that holds " +
 			"it sets the flag"}, nil
 	}
+	held := res.Comment
+	if node, ok := ha.RebalancePending(res.Comment); ok {
+		if node != movedTo {
+			return vmFailbackWant{reason: "a rebalance is moving the VM to " + node + ", and the rebalance sets " +
+				"the flag when the move ends"}, nil
+		}
+		stripped, _ := ha.WithoutRebalanceMark(*res.Comment)
+		held = &stripped
+	}
 	set, err := readHARuleSet(ctx, deps.PVE.Cluster())
 	if err != nil {
 		return vmFailbackWant{}, fmt.Errorf("read the HA rules: %w", err)
@@ -283,7 +312,7 @@ func wantVMFailback(ctx context.Context, deps Deps, api ha.FailbackAPI, profile 
 		return vmFailbackWant{}, fmt.Errorf("decide HA for the VM: %w", err)
 	}
 	switch {
-	case d.Registers() && d.Failback && ha.FailbackHeld(res.Comment, time.Now()):
+	case d.Registers() && d.Failback && ha.FailbackHeld(held, time.Now()):
 		return vmFailbackWant{reason: "a move into the VM's admissible set holds failback off until the VM's " +
 			"pin names the node it moved to, and the call that moves it sets the flag"}, nil
 	case d.Registers():
