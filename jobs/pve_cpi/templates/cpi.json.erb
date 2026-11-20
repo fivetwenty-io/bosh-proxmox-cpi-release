@@ -502,6 +502,26 @@
       end
     end
     raise "#{aa_key} may hold only one block term" if aa_blocks > 1
+    # The CPI records the pattern's short form on every member's HA resource
+    # and refuses a pattern whose short form passes 1024 characters, so the
+    # render builds that form the way the CPI does and checks its length.
+    aa_short = aa_terms.map do |term|
+      kind = (term.keys.map(&:to_s) & [ "block", "stride", "window", "sets" ]).first
+      value = term[kind]
+      case kind
+      when "block"
+        value.is_a?(Hash) && value.key?("size") ? "block:#{value["size"]}" : "block"
+      when "stride", "window"
+        "#{kind}:#{value}"
+      when "sets"
+        "sets:" + value.map { |set| set.join(".") }.join("/")
+      end
+    end.join("+")
+    aa_short += "!unsafe" if aa_drain == false
+    if aa_short.length > 1024
+      raise "#{aa_key} is too long to record on an HA resource: its short form is " \
+        "#{aa_short.length} characters, and the most is 1024"
+    end
     ha["anti_affinity_pattern"] = v
   end
 

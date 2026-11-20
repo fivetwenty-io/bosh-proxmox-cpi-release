@@ -328,7 +328,9 @@ properties:
       that would leave a member without a free node during a drain. With
       drain_safe false it keeps such rules, warns on every plan, and the
       doctor reports the group. The render and the CPI's config check the
-      shape only. See docs/ha-and-resurrection.md for the kinds and examples.
+      shape, and they refuse a pattern whose short form, which the CPI
+      records on each member's HA resource, is longer than 1024 characters.
+      See docs/ha-and-resurrection.md for the kinds and examples.
 
       Overridable per cpi-config entry under pve_ha.
   pve.ha.pin_az:

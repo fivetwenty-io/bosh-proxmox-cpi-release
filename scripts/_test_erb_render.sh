@@ -526,6 +526,11 @@ assert_json_valid "case12-pattern" "$JSON_12P" || FAILED=$((FAILED+1))
 assert_ha_block   "case12-pattern" "$JSON_12P" '{"anti_affinity_pattern":[{"stride":2},{"sets":[[0,1]],"drain_safe":true}]}'
 JSON_12PB="$(render "$(props_with_ha '{"anti_affinity_pattern":{"block":null}}')")"
 assert_ha_block   "case12-pattern-block" "$JSON_12PB" '{"anti_affinity_pattern":{"block":null}}'
+# A pattern whose short form comes to 994 characters, under the CPI's limit
+# of 1024, renders. Twelve such sets would come to 1084 and fail.
+LONG_OK="$(ruby -rjson -e 'print JSON.generate({"sets" => Array.new(11) { (10..39).to_a }})')"
+JSON_12PL="$(render "$(props_with_ha "{\"anti_affinity_pattern\":${LONG_OK}}")")"
+assert_ha_block "case12-pattern-long" "$JSON_12PL" "{\"anti_affinity_pattern\":${LONG_OK}}"
 # An empty list or map, which an ops file leaves when it clears the key,
 # reads as unset, so the render omits the key and the CPI uses block.
 for empty in '[]' '{}'; do
@@ -535,7 +540,8 @@ for empty in '[]' '{}'; do
 done
 for bad in '{"stride":1}' '{"strde":2}' '{"block":{"size":1}}' '"block"' '{"sets":[[0,0]]}' \
   '{"window":2,"drain_safe":"no"}' '{"stride":2,"window":3}' '[{"block":{}},{"block":{}}]' \
-  '[{"stride":2,"drain_safe":false},{"sets":[[0,1]],"drain_safe":true}]' '{"window":"3"}'; do
+  '[{"stride":2,"drain_safe":false},{"sets":[[0,1]],"drain_safe":true}]' '{"window":"3"}' \
+  "$(ruby -rjson -e 'print JSON.generate({"sets" => Array.new(32) { (10..39).to_a }})')"; do
   rc=0
   out="$(render "$(props_with_ha "{\"anti_affinity_pattern\":${bad}}")" 2>&1)" || rc=$?
   if [ "$rc" -eq 0 ] || ! printf '%s' "$out" | grep -qF "pve.ha.anti_affinity_pattern"; then
