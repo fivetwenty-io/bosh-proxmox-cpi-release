@@ -558,3 +558,30 @@ func TestDrainRun_ASoftPinnedVMStillWaitsWhileAnotherVMThatCouldLeaveStays(t *te
 		t.Fatalf("a drain that timed out with a VM it can't explain stopped a VM: %v", f.calls)
 	}
 }
+
+func TestUndrainRun_TheRebalanceStopsMovingBeforeTheUndrainLeaseRunsOut(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	rbSkewed(f)
+	drStopped(f, 110, "pve01")
+	// The start of VM 110 runs long, so the rebalance begins late in the
+	// undrain's lease.
+	f.drainHook = func(vmid int, stop bool) (bool, error) {
+		if vmid == 110 && !stop {
+			f.clock = f.clock.Add(100 * time.Minute)
+		}
+		return true, nil
+	}
+	r := drRun(f, UndrainCommand, true)
+	rr := newRebalanceRun(r.deps, r.rebalance, f)
+	rep := r.undrain(context.Background())
+	if len(f.lockTTLs) != 1 || f.lockTTLs[0] != r.settle+rr.runLockTTL() {
+		t.Fatalf("lease %v, want %v", f.lockTTLs, r.settle+rr.runLockTTL())
+	}
+	if rep.ExitCode != RebalanceExitOK || rep.Rebalance == nil || rep.Rebalance.Deferred == 0 {
+		t.Fatalf("exit %d halted %q rebalance %+v", rep.ExitCode, rep.Halted, rep.Rebalance)
+	}
+	if len(f.callsWith("migrate ")) != 0 {
+		t.Fatalf("the rebalance started a move the undrain's lease could not cover: %v", f.calls)
+	}
+}

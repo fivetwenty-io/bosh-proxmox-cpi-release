@@ -232,6 +232,9 @@ type drainRun struct {
 	// noRebalance and rebalance shape the rebalance an undrain runs.
 	noRebalance bool
 	rebalance   RebalanceOptions
+	// leaseEnd is when the run lock's lease runs out. An undrain hands it to
+	// its rebalance, which starts no move that could outlast it.
+	leaseEnd time.Time
 }
 
 func newDrainRun(deps Deps, command, node string, apply bool, settle time.Duration, rio rebalanceIO) *drainRun {
@@ -876,10 +879,13 @@ func (r *drainRun) remind(command string) {
 // undrain runs the steps of section 23.7 of the design.
 func (r *drainRun) undrain(ctx context.Context) DrainReport {
 	if r.apply {
+		// The lease covers the wait for the starts and the whole rebalance,
+		// which runs under this lock.
 		ttl := r.settle + rebalanceRunLockMargin
 		if !r.noRebalance {
-			ttl = r.settle + r.rebalance.MaxDuration + r.rebalance.SettleTimeout + rebalanceRunLockMargin
+			ttl = r.settle + newRebalanceRun(r.deps, r.rebalance, r.io).runLockTTL()
 		}
+		r.leaseEnd = r.io.now().Add(ttl)
 		release, ok := r.lock(ctx, ttl)
 		if !ok {
 			return r.report
@@ -943,7 +949,7 @@ func (r *drainRun) undrain(ctx context.Context) DrainReport {
 		return r.report
 	}
 	rr := newRebalanceRun(r.deps, r.rebalance, r.io)
-	rr.runLockHeld = true
+	rr.runLockHeld, rr.leaseEnd = true, r.leaseEnd
 	rep := rr.run(ctx)
 	r.report.Rebalance = &rep
 	if rep.ExitCode != RebalanceExitOK {

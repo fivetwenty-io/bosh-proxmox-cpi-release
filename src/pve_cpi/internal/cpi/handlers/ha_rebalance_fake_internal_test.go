@@ -59,6 +59,8 @@ type fakeRebalanceIO struct {
 	journ   rebalanceJournal
 	lockErr error
 	release int
+	// lockTTLs records the lease of each run lock taken.
+	lockTTLs []time.Duration
 
 	// moving names the VMs the HA manager reports in migrate, and settleAfter
 	// clears it after that many service state reads.
@@ -207,10 +209,11 @@ func (f *fakeRebalanceIO) sleep(ctx context.Context, d time.Duration) error {
 	return nil
 }
 
-func (f *fakeRebalanceIO) runLock(context.Context, time.Duration) (func(), error) {
+func (f *fakeRebalanceIO) runLock(_ context.Context, ttl time.Duration) (func(), error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.log("runlock")
+	f.lockTTLs = append(f.lockTTLs, ttl)
 	if f.lockErr != nil {
 		return nil, f.lockErr
 	}

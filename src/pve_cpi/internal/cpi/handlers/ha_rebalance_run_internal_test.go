@@ -534,3 +534,35 @@ func TestRebalanceRun_AFreshFailbackHoldKeepsFailbackOffAtTheRelease(t *testing.
 		t.Fatalf("the release dropped the hold: %q", f.vms[101].comment)
 	}
 }
+
+func TestRebalanceRun_TheRunLockLeaseOutlastsAMoveThatStartsAtMaxDuration(t *testing.T) {
+	f := newFakeRebalanceIO()
+	rbSkewed(f)
+	r := rbRun(f, RebalanceOptions{Apply: true})
+	r.run(context.Background())
+	// A move that starts as MaxDuration passes may wait out the motion wait
+	// before the request and again after the VM lands, the settle timeout
+	// for the move, and the check that the VM stayed.
+	move := 2*pve.DefaultMotionWait + r.opts.SettleTimeout + rebalanceConfirmWait
+	if len(f.lockTTLs) != 1 || f.lockTTLs[0] < r.opts.MaxDuration+move+rebalanceRunLockMargin {
+		t.Fatalf("lease %v, want at least %v", f.lockTTLs, r.opts.MaxDuration+move+rebalanceRunLockMargin)
+	}
+}
+
+func TestRebalanceRun_AMoveThatCouldOutlastTheLeaseIsDeferred(t *testing.T) {
+	f := newFakeRebalanceIO()
+	rbSkewed(f)
+	r := rbRun(f, RebalanceOptions{Apply: true})
+	r.runLockHeld = true
+	r.leaseEnd = f.clock.Add(20 * time.Minute)
+	rep := r.run(context.Background())
+	if rep.ExitCode != RebalanceExitOK || len(rep.Moves) != 0 || rep.Deferred == 0 {
+		t.Fatalf("exit %d moves %v deferred %d", rep.ExitCode, rbMoves(rep.Moves), rep.Deferred)
+	}
+	if len(f.callsWith("migrate ")) != 0 || len(f.callsWith("mark ")) != 0 {
+		t.Fatalf("a move started that the lease could not cover: %v", f.calls)
+	}
+	if !slices.ContainsFunc(rep.Warnings, func(w string) bool { return strings.Contains(w, "lease") }) {
+		t.Fatalf("warnings %v", rep.Warnings)
+	}
+}

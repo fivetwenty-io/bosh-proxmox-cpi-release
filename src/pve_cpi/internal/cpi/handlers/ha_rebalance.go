@@ -269,6 +269,9 @@ type rebalanceRun struct {
 	// runLockHeld says the caller already holds the run lock, as an undrain
 	// does when it hands off to the rebalance, so the run takes no lock.
 	runLockHeld bool
+	// leaseEnd is when the run lock's lease runs out, or zero when the run
+	// holds no lock. The run starts no move that could outlast it.
+	leaseEnd time.Time
 }
 
 func newRebalanceRun(deps Deps, opts RebalanceOptions, rio rebalanceIO) *rebalanceRun {
@@ -280,9 +283,25 @@ func newRebalanceRun(deps Deps, opts RebalanceOptions, rio rebalanceIO) *rebalan
 }
 
 // runLockTTL is the lease of the run lock, which covers the longest run and
-// the move that may still run at its end.
+// the move that may still run at its end. The sentinel pool behind the lock
+// has no renewal, so the lease must cover the whole run up front.
 func (r *rebalanceRun) runLockTTL() time.Duration {
-	return r.opts.MaxDuration + r.opts.SettleTimeout + rebalanceRunLockMargin
+	return r.opts.MaxDuration + r.moveBound() + rebalanceRunLockMargin
+}
+
+// moveBound is the longest one move can run once it starts. The settle
+// before the migrate request and the settle once the VM lands each take up
+// to the motion wait, the wait for the move takes up to the settle timeout,
+// and the check that the VM stayed follows. The run lock margin covers the
+// reads and the writes around them.
+func (r *rebalanceRun) moveBound() time.Duration {
+	return 2*haMotionWait(r.deps) + r.opts.SettleTimeout + rebalanceConfirmWait
+}
+
+// leaseCovers says whether the run lock's lease outlasts a move that starts
+// now. A run that holds no lock has no lease to outlast.
+func (r *rebalanceRun) leaseCovers() bool {
+	return r.leaseEnd.IsZero() || !r.io.now().Add(r.moveBound()+rebalanceRunLockMargin).After(r.leaseEnd)
 }
 
 // halt ends the run with code and the reason.
@@ -294,7 +313,9 @@ func (r *rebalanceRun) halt(code int, why string) RebalanceReport {
 func (r *rebalanceRun) run(ctx context.Context) RebalanceReport {
 	r.started = r.io.now()
 	if r.opts.Apply && !r.runLockHeld {
-		release, err := r.io.runLock(ctx, r.runLockTTL())
+		ttl := r.runLockTTL()
+		r.leaseEnd = r.started.Add(ttl)
+		release, err := r.io.runLock(ctx, ttl)
 		switch {
 		case errors.Is(err, pve.ErrClusterLockHeld):
 			r.setGate(RebalanceGateRunLock, false, "another rebalance holds the run lock bosh-lock-ha-rebalance")
@@ -343,6 +364,12 @@ func (r *rebalanceRun) run(ctx context.Context) RebalanceReport {
 		}
 		if moves >= r.opts.MaxMoves || !r.io.now().Before(r.started.Add(r.opts.MaxDuration)) {
 			r.report.Deferred = len(plan.Moves)
+			return r.report
+		}
+		if !r.leaseCovers() {
+			r.report.Deferred = len(plan.Moves)
+			r.warn("the run lock's lease could run out during the next move, so the run stopped before it; " +
+				"run the command again to go on")
 			return r.report
 		}
 		r.spreading = plan.Spreading
