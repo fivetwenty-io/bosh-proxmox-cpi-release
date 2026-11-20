@@ -1604,10 +1604,12 @@ type PlacementConfig struct {
 
 	// MaintenanceNodeTags is the list of PVE node tags that indicate a node is in
 	// maintenance and should be excluded from placement. A node carrying any tag in
-	// this list is excluded. Default ["maintenance"]. Empty slice disables
-	// tag-based detection while still honoring the node health helper's own
-	// reading of the cluster.
-	MaintenanceNodeTags []string `json:"maintenance_node_tags,omitempty"`
+	// this list is excluded. A nil slice (the key is absent) means the default
+	// ["maintenance"]. A non-nil empty slice (an explicit []) disables tag-based
+	// detection while still honoring the node health helper's own reading of the
+	// cluster. The tag is omitzero rather than omitempty so that the explicit
+	// empty list survives a marshal and unmarshal round trip.
+	MaintenanceNodeTags []string `json:"maintenance_node_tags,omitzero"`
 
 	// AZFallbackOrder is an ordered list of AZ names appended as fallback after
 	// cloud_properties.availability_zones are exhausted. Useful for a cluster-wide
@@ -3026,9 +3028,10 @@ func (c *CPIConfig) AZCandidates(az string) ([]string, bool) {
 }
 
 // MaintenanceNodeTagsValue returns the effective list of operator maintenance
-// tags. When the field is nil or empty, returns ["maintenance"] (the default).
+// tags. When the field is nil (unset), returns ["maintenance"] (the default). A
+// non-nil empty slice is an explicit [] and returns no tags.
 func (c *CPIConfig) MaintenanceNodeTagsValue() []string {
-	if c.Placement == nil || len(c.Placement.MaintenanceNodeTags) == 0 {
+	if c.Placement == nil || c.Placement.MaintenanceNodeTags == nil {
 		return []string{"maintenance"}
 	}
 	return c.Placement.MaintenanceNodeTags
@@ -3037,14 +3040,16 @@ func (c *CPIConfig) MaintenanceNodeTagsValue() []string {
 // NodeHealthRequired reports whether scored placement must refuse to place a
 // VM when it cannot read node health. It is true when the CPI writes HA state,
 // because a VM placed on a node in maintenance would join HA rules there, and
-// when the operator names maintenance tags, because the operator then relies on
-// those tags to keep new VMs off a node. With neither, placement keeps its
-// fail-open behavior and warns that it treats every node as healthy.
+// when the effective maintenance tag list is not empty, because the operator
+// then relies on those tags to keep new VMs off a node. An unset list counts as
+// the default ["maintenance"]. Only HA writes off together with an explicit []
+// keeps the fail-open behavior, where placement warns that it treats every node
+// as healthy.
 func (c *CPIConfig) NodeHealthRequired() bool {
 	if c.HAWritesEnabled() {
 		return true
 	}
-	return c.Placement != nil && len(c.Placement.MaintenanceNodeTags) > 0
+	return len(c.MaintenanceNodeTagsValue()) > 0
 }
 
 // AZFallbackOrderValue returns the operator-configured AZ fallback chain.

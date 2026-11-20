@@ -1016,6 +1016,31 @@ assert_json_lacks_key "case16-journal-only" "$JSON_16D" storage_placement_namesp
 JSON_16M="$(render "$(props_with_pve '{"storage_placement_namespace":7}')")"
 assert_json_key_equals "case16-malformed-namespace" "$JSON_16M" storage_placement_namespace 7 || FAILED=$((FAILED+1))
 
+echo "Case 17: placement.maintenance_node_tags"
+# The property has no spec default, so an unset property leaves the key out of
+# the JSON, an explicit empty list renders as an empty list, and a list renders
+# as given.
+JSON_17U="$(render "$(props_with_pve '{}')")"
+assert_json_lacks_key "case17-unset" "$JSON_17U" placement || FAILED=$((FAILED+1))
+JSON_17E="$(render "$(props_with_pve '{"placement":{"maintenance_node_tags":[]}}')")"
+assert_json_has_key "case17-empty" "$JSON_17E" placement || FAILED=$((FAILED+1))
+if [ "$(printf '%s' "$JSON_17E" | ruby -rjson -e 'print JSON.parse(STDIN.read)["placement"].fetch("maintenance_node_tags", "<absent>").inspect')" != "[]" ]; then
+  echo "FAIL [case17-empty]: an explicit empty maintenance_node_tags did not render as []" >&2
+  FAILED=$((FAILED+1))
+fi
+JSON_17L="$(render "$(props_with_pve '{"placement":{"maintenance_node_tags":["drain","maint"]}}')")"
+if [ "$(printf '%s' "$JSON_17L" | ruby -rjson -e 'print JSON.parse(STDIN.read)["placement"].fetch("maintenance_node_tags", "<absent>").inspect')" != '["drain", "maint"]' ]; then
+  echo "FAIL [case17-list]: maintenance_node_tags did not render as given" >&2
+  FAILED=$((FAILED+1))
+fi
+SPEC_17="$(ruby -ryaml -e '
+  print(YAML.load_file(ARGV[0]).fetch("properties").fetch("pve.placement.maintenance_node_tags").key?("default") ? "bad" : "ok")
+' "${REPO_ROOT}/jobs/pve_cpi/spec")"
+if [ "$SPEC_17" != "ok" ]; then
+  echo "FAIL [case17-spec]: pve.placement.maintenance_node_tags must carry no default" >&2
+  FAILED=$((FAILED+1))
+fi
+
 if [ "$FAILED" -ne 0 ]; then
   echo "RESULT: ${FAILED} assertion(s) FAILED" >&2
   exit 1

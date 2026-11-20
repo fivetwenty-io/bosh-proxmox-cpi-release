@@ -258,7 +258,7 @@ Every CPI rule write holds the same cluster-wide lock, the sentinel pool `bosh-l
 | `ListStatus` | **Fatal** | No candidate list, so placement fails entirely. |
 | `ListResources` | Non-fatal | `GuestCount` and `SameGroupCount` set to 0 for all nodes; a warning is logged. |
 | Per-node `ListStorage` | Non-fatal | `FreeStorageBytes` and `TotalStorageBytes` remain 0; the Storage scoring axis is skipped for that node. |
-| Node health `ListStatus` | Retried once, then fatal or non-fatal | The health check reads `/cluster/status` on its own and reads it once more when that read fails. A second failure stops placement with a retriable error when `pve.ha.mode` is `auto` or `managed` or `placement.maintenance_node_tags` names a tag. Otherwise a warning is logged and every node counts as healthy. |
+| Node health `ListStatus` | Retried once, then fatal or non-fatal | The health check reads `/cluster/status` on its own and reads it once more when that read fails. A second failure stops placement with a retriable error when `pve.ha.mode` is `auto` or `managed` or the effective `placement.maintenance_node_tags` list is not empty, and an unset list gives `["maintenance"]`. Otherwise, with HA writes off and the list set to `[]`, a warning is logged and every node counts as healthy. |
 | `ListHaStatusCurrent` | Non-fatal | The node health check falls back to the cluster status plus `placement.maintenance_node_tags`; a transient HA-API outage never blocks VM creation. |
 
 The node health check always runs. It no longer depends on a key, because the `exclude_maintenance_nodes` key was removed.

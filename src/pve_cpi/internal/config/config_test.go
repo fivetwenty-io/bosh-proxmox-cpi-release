@@ -4144,6 +4144,88 @@ func TestMaintenanceNodeTagsValue_Custom(t *testing.T) {
 	}
 }
 
+func TestMaintenanceNodeTagsValue_ExplicitEmptyDisablesTags(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{Placement: &config.PlacementConfig{MaintenanceNodeTags: []string{}}}
+	if got := cfg.MaintenanceNodeTagsValue(); len(got) != 0 {
+		t.Errorf("MaintenanceNodeTagsValue() = %v; want no tags", got)
+	}
+	unset := &config.CPIConfig{Placement: &config.PlacementConfig{}}
+	if got := unset.MaintenanceNodeTagsValue(); len(got) != 1 || got[0] != "maintenance" {
+		t.Errorf("unset MaintenanceNodeTagsValue() = %v; want [maintenance]", got)
+	}
+}
+
+func TestLoad_MaintenanceNodeTags(t *testing.T) {
+	t.Parallel()
+	const base = `{"host":"h","user":"u","password":"p","vm_storage":"s","disk_storage":"s","network_bridge":"br"%s}`
+	cases := []struct {
+		name, extra string
+		want        []string
+	}{
+		{"no placement block", ``, []string{"maintenance"}},
+		{"unset", `,"placement":{}`, []string{"maintenance"}},
+		{"explicit empty", `,"placement":{"maintenance_node_tags":[]}`, []string{}},
+		{"list", `,"placement":{"maintenance_node_tags":["drain","maint"]}`, []string{"drain", "maint"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := mustLoad(t, fmt.Sprintf(base, tc.extra))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			got := cfg.MaintenanceNodeTagsValue()
+			if len(got) != len(tc.want) {
+				t.Fatalf("MaintenanceNodeTagsValue() = %v; want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("MaintenanceNodeTagsValue() = %v; want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestMaintenanceNodeTags_JSONRoundTripKeepsExplicitEmpty(t *testing.T) {
+	t.Parallel()
+	for name, tags := range map[string][]string{"unset": nil, "empty": {}, "list": {"a"}} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			raw, err := json.Marshal(config.PlacementConfig{MaintenanceNodeTags: tags})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var back config.PlacementConfig
+			if err := json.Unmarshal(raw, &back); err != nil {
+				t.Fatal(err)
+			}
+			if (tags == nil) != (back.MaintenanceNodeTags == nil) || len(tags) != len(back.MaintenanceNodeTags) {
+				t.Errorf("round trip of %#v through %s gave %#v", tags, raw, back.MaintenanceNodeTags)
+			}
+		})
+	}
+}
+
+func TestApplyContextOverrides_Placement_MaintenanceNodeTags(t *testing.T) {
+	t.Parallel()
+	base := validBaseCfg()
+	base.ApplyDefaults()
+	eff, _, _, err := config.ApplyContextOverrides(base, map[string]any{
+		"pve_placement": map[string]any{"maintenance_node_tags": []any{}},
+	})
+	if err != nil {
+		t.Fatalf("ApplyContextOverrides: %v", err)
+	}
+	if got := eff.MaintenanceNodeTagsValue(); len(got) != 0 {
+		t.Errorf("entry with an empty list: MaintenanceNodeTagsValue() = %v; want no tags", got)
+	}
+	if eff.NodeHealthRequired() != eff.HAWritesEnabled() {
+		t.Error("an entry with an empty list and HA writes off must not require node health")
+	}
+}
+
 func TestNodeHealthRequired(t *testing.T) {
 	t.Parallel()
 	auto, managed, off := config.HAChoice("auto"), config.HAChoice("managed"), config.HAChoice("off")
@@ -4152,8 +4234,13 @@ func TestNodeHealthRequired(t *testing.T) {
 		cfg  *config.CPIConfig
 		want bool
 	}{
-		{"defaults", &config.CPIConfig{}, false},
-		{"ha off", &config.CPIConfig{HA: &config.HAConfig{Mode: &off}}, false},
+		{"defaults", &config.CPIConfig{}, true},
+		{"ha off", &config.CPIConfig{HA: &config.HAConfig{Mode: &off}}, true},
+		{"ha off tags unset", &config.CPIConfig{HA: &config.HAConfig{Mode: &off}, Placement: &config.PlacementConfig{}}, true},
+		{"ha off tags empty", &config.CPIConfig{HA: &config.HAConfig{Mode: &off}, Placement: &config.PlacementConfig{MaintenanceNodeTags: []string{}}}, false},
+		{"ha off tags set", &config.CPIConfig{HA: &config.HAConfig{Mode: &off}, Placement: &config.PlacementConfig{MaintenanceNodeTags: []string{"drain"}}}, true},
+		{"ha auto tags empty", &config.CPIConfig{HA: &config.HAConfig{Mode: &auto}, Placement: &config.PlacementConfig{MaintenanceNodeTags: []string{}}}, true},
+		{"ha managed tags empty", &config.CPIConfig{HA: &config.HAConfig{Mode: &managed}, Placement: &config.PlacementConfig{MaintenanceNodeTags: []string{}}}, true},
 		{"ha auto", &config.CPIConfig{HA: &config.HAConfig{Mode: &auto}}, true},
 		{"ha managed", &config.CPIConfig{HA: &config.HAConfig{Mode: &managed}}, true},
 		{"tags set", &config.CPIConfig{Placement: &config.PlacementConfig{MaintenanceNodeTags: []string{"drain"}}}, true},

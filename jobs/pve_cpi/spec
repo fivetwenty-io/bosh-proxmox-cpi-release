@@ -1567,10 +1567,11 @@ properties:
   pve.placement.maintenance_node_tags:
     description: |
       List of PVE node tags that mark a node as in maintenance. A node carrying any
-      tag in this list is excluded from placement. Default ["maintenance"]. Set to []
-      to disable tag-based detection while still honoring the node health check, which
-      always runs. Leave unset to accept the default.
-    default: []
+      tag in this list is excluded from placement. Leave it unset to get the default
+      ["maintenance"]. Set it to [] to disable tag-based detection while still honoring
+      the node health check, which always runs. Set it to a list to use those tags
+      instead. The property has no spec default, so the CPI can tell an unset property
+      from an explicit [].
   pve.placement.az_fallback_order:
     description: |
       Ordered list of AZ names appended as fallback candidates after

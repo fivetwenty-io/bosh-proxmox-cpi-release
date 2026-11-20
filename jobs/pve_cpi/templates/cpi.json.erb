@@ -369,11 +369,13 @@
   end
   placement["weights"] = weights unless weights.empty?
 
-  # placement.maintenance_node_tags: emit only when the operator overrides the
-  # default ["maintenance"] with a non-empty list. When unset or empty, the Go
-  # accessor supplies ["maintenance"] so the key is omitted here.
-  maintenance_node_tags = p("pve.placement.maintenance_node_tags", [])
-  placement["maintenance_node_tags"] = maintenance_node_tags unless maintenance_node_tags.nil? || maintenance_node_tags.empty?
+  # placement.maintenance_node_tags: emit exactly when the operator sets it,
+  # including an explicit []. The spec has no default, so an unset property
+  # leaves the key out and the Go accessor supplies ["maintenance"], while an
+  # explicit [] reaches the CPI and turns tag detection off.
+  if_p("pve.placement.maintenance_node_tags") do |tags|
+    placement["maintenance_node_tags"] = tags unless tags.nil?
+  end
 
   # placement.az_fallback_order: emit only when the operator provides a non-empty
   # list. When unset or empty, Go defaults to no config-level fallback chain.
