@@ -251,3 +251,41 @@ func TestRebalanceMove_AMarkAnotherWriterTookIsRefusedWithoutARelease(t *testing
 		})
 	}
 }
+
+func TestRebalanceMove_APositiveRuleAddedAfterThePlanRefusesTheMigration(t *testing.T) {
+	f := newFakeRebalanceIO()
+	rbSkewed(f)
+	f.beforeMigrate = func(vmid int) {
+		if vmid == 101 {
+			f.extraRules = append(f.extraRules, ha.Rule{ID: "together", Type: ha.RuleTypeResourceAffinity,
+				Affinity: ha.AffinityPositive, Resources: []string{haResourceSid(101), haResourceSid(104)}})
+		}
+	}
+	rep := rbRun(f, RebalanceOptions{Apply: true, MaxMoves: 1}).run(context.Background())
+	if rep.ExitCode != RebalanceExitOK || rep.Moves[0].VMID != 101 || rep.Moves[0].Outcome != RebalanceRefused ||
+		!strings.Contains(rep.Moves[0].Error, "positive resource affinity rule together") {
+		t.Fatalf("exit %d halted %q moves %v", rep.ExitCode, rep.Halted, rbMoves(rep.Moves))
+	}
+	if len(f.callsWith("migrate 101 pve01>pve02 not sent")) != 1 {
+		t.Fatalf("calls %v", f.calls)
+	}
+	if !slices.Equal(f.unmarks, []string{"101:true"}) {
+		t.Fatalf("unmarks %v, want the hold released with failback restored", f.unmarks)
+	}
+}
+
+func TestRebalanceMove_ResourcesPVEMovesWithTheVMStopTheRun(t *testing.T) {
+	f := newFakeRebalanceIO()
+	rbSkewed(f)
+	f.comigrated = map[int][]string{101: {haResourceSid(104)}}
+	rep := rbRun(f, RebalanceOptions{Apply: true}).run(context.Background())
+	if rep.ExitCode != RebalanceExitError || !strings.Contains(rep.Halted, "vm:104") || len(rep.Moves) != 1 {
+		t.Fatalf("exit %d halted %q moves %v", rep.ExitCode, rep.Halted, rbMoves(rep.Moves))
+	}
+	if rep.Moves[0].Outcome != RebalanceMoved || !strings.Contains(rep.Moves[0].Error, "vm:104") {
+		t.Fatalf("moves %+v", rep.Moves)
+	}
+	if _, marked := ha.RebalancePending(&f.vms[101].comment); marked {
+		t.Fatal("the VM kept its rebalance mark")
+	}
+}

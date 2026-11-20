@@ -64,7 +64,7 @@ func (r *rebalanceRun) makeMove(ctx context.Context, view *rebalanceView, m hare
 // moveSteps runs the steps of one move.
 func (r *rebalanceRun) moveSteps(ctx context.Context, view *rebalanceView, m harebalance.Move, rec *RebalanceMove,
 	logger *log.Logger,
-) (int, string) {
+) (code int, why string) {
 	plan := view.plans[m.VMID]
 	if plan == nil {
 		rec.Outcome, rec.Error = RebalanceRefused, "the run holds no plan for the VM"
@@ -81,9 +81,15 @@ func (r *rebalanceRun) moveSteps(ctx context.Context, view *rebalanceView, m har
 
 	// Steps 2 and 3: migrate with no claim, and wait for the VM to settle on
 	// the target.
-	loc, err := r.io.migrate(ctx, m.VMID, m.From, m.To, func(ctx context.Context) error {
+	loc, partners, err := r.io.migrate(ctx, m.VMID, m.From, m.To, func(ctx context.Context) error {
 		return r.confirmMark(ctx, m.VMID, m.To)
 	})
+	if len(partners) > 0 {
+		// A positive rule appeared between the check and the request, and PVE
+		// HA moves its other resources with the VM, outside the plan. The move
+		// still runs its steps, and the run stops after it.
+		defer func() { code, why = r.comigrated(m, rec, partners, code, why) }()
+	}
 	if err != nil {
 		return r.migrateFailure(ctx, view, plan, m, rec, err, logger)
 	}
@@ -129,6 +135,30 @@ func (r *rebalanceRun) moveSteps(ctx context.Context, view *rebalanceView, m har
 	}
 	rec.Outcome = RebalanceMoved
 	return RebalanceExitOK, ""
+}
+
+// comigrated ends a move whose migrate request PVE HA answered with resources
+// that move with the VM. Those resources carry no mark and no hold, and the
+// plan never counted them, so the run stops with an error once the move's
+// own steps end.
+func (r *rebalanceRun) comigrated(m harebalance.Move, rec *RebalanceMove, partners []string, code int,
+	why string,
+) (int, string) {
+	list := strings.Join(partners, ", ")
+	note := "PVE HA moved " + list + " with the VM, because a positive resource affinity rule names them"
+	if rec.Error == "" {
+		rec.Error = note
+	} else {
+		rec.Error += "; " + note
+	}
+	r.logger.Warn(rebalanceOp+": PVE HA moved other resources with the VM", log.Int("vmid", m.VMID),
+		log.String("comigrated", list))
+	if code != RebalanceExitOK {
+		return code, why + "; and " + note
+	}
+	return RebalanceExitError, fmt.Sprintf("PVE HA moved %s with VM %d to %s, because a positive resource "+
+		"affinity rule names them, so the run stopped; check the spread and run the command again", list, m.VMID,
+		m.To)
 }
 
 // preMoveFailure maps an error of step 1. done is true when the move ends.
@@ -218,7 +248,8 @@ func (r *rebalanceRun) inputsChanged(plan *rebalanceVMPlan, cfg map[string]any,
 }
 
 // confirmMark is the check right before the migrate request: the resource
-// still carries the mark that names the target, with failback off.
+// still carries the mark that names the target, with failback off, and no
+// positive resource affinity rule names the VM.
 func (r *rebalanceRun) confirmMark(ctx context.Context, vmid int, to string) error {
 	res, err := r.io.readResource(ctx, vmid)
 	if err != nil {
@@ -233,6 +264,17 @@ func (r *rebalanceRun) confirmMark(ctx context.Context, vmid int, to string) err
 	}
 	if res.Failback == nil || res.Failback.Bool() {
 		return errors.New("the VM's failback is on again")
+	}
+	// PVE HA moves every resource a positive rule names along with the VM,
+	// which the plan never counted, so a rule added since the plan refuses
+	// the move.
+	rule, err := r.io.positiveRule(ctx, vmid)
+	if err != nil {
+		return err
+	}
+	if rule != "" {
+		return errors.New("the positive resource affinity rule " + rule + " now names the VM, so PVE HA would " +
+			"move the rule's other resources with it")
 	}
 	return nil
 }

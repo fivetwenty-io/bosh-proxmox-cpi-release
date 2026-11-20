@@ -26,6 +26,7 @@ type moveRig struct {
 	now        time.Time
 	migrateErr error
 	blocking   []json.RawMessage
+	comigrated []json.RawMessage
 }
 
 func (r *moveRig) CreateHaResourcesMigrate(_ context.Context, sid string,
@@ -36,7 +37,7 @@ func (r *moveRig) CreateHaResourcesMigrate(_ context.Context, sid string,
 		return nil, r.migrateErr
 	}
 	return &sdkcluster.CreateHaResourcesMigrateResponse{Sid: sid, RequestedNode: p.Node,
-		BlockingResources: r.blocking}, nil
+		BlockingResources: r.blocking, ComigratedResources: r.comigrated}, nil
 }
 
 func (r *moveRig) deps() NarrowDeps {
@@ -254,5 +255,28 @@ func TestMoveTargetsOrdersPlaceableNodesByPriority(t *testing.T) {
 	got := MoveTargets(p, []string{"d", "c", "b", "a"}, &pin, "b")
 	if !slices.Equal(got, []string{"c", "a"}) {
 		t.Fatalf("targets %v", got)
+	}
+}
+
+func TestMoveIntoSetReportsComigratedResourcesAndWaitsForTheMove(t *testing.T) {
+	r := &moveRig{settleOn: []string{"b", "a"}, comigrated: []json.RawMessage{
+		json.RawMessage(`"vm:102"`), json.RawMessage(`{"sid":"vm:103"}`),
+	}, states: []*pve.HAServiceState{
+		managedOn("started", "b", 100, 90),
+		managedOn("started", "b", 100, 90),
+		managedOn("started", "b", 200, 190),
+		managedOn("started", "a", 220, 215),
+	}}
+	in := moveInput()
+	var got []string
+	in.OnComigrated = func(sids []string) { got = append(got, sids...) }
+	loc, err := MoveIntoSet(context.Background(), r.deps(), in)
+	if err != nil || loc.Node != "a" {
+		t.Fatalf("loc %+v err %v", loc, err)
+	}
+	// PVE queues the request before it reports the partners, so the move
+	// goes on and the caller learns which resources moved with the VM.
+	if !slices.Equal(got, []string{"vm:102", "vm:103"}) {
+		t.Fatalf("comigrated %v", got)
 	}
 }

@@ -368,17 +368,23 @@ func intersectNodes(a, b []string) []string {
 // inPositiveAffinityRule reports whether an enabled positive resource affinity
 // rule names sid.
 func inPositiveAffinityRule(set *ha.RuleSet, sid string) bool {
+	return positiveAffinityRule(set, sid) != ""
+}
+
+// positiveAffinityRule returns the id of the first enabled positive resource
+// affinity rule that names sid, or "".
+func positiveAffinityRule(set *ha.RuleSet, sid string) string {
 	if set == nil {
-		return false
+		return ""
 	}
 	for i := range set.Rules {
 		r := &set.Rules[i]
 		if r.Type == ha.RuleTypeResourceAffinity && r.Affinity == ha.AffinityPositive && !r.Disabled &&
 			r.HasResource(sid) {
-			return true
+			return r.ID
 		}
 	}
-	return false
+	return ""
 }
 
 // aaGroupPattern splits a CPI anti-affinity rule's id into its group and the

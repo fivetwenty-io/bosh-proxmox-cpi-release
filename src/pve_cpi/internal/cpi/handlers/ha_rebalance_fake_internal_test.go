@@ -72,6 +72,9 @@ type fakeRebalanceIO struct {
 	markHook   func(vmid int) (bool, error)
 	unmarkHook func(vmid int, failback bool) (bool, error)
 	migrateFn  func(ctx context.Context, vmid int, from, to string) (pve.VMLocation, error)
+	// comigrated names the resources a migrate request of the VM reports as
+	// moving with it.
+	comigrated map[int][]string
 	pinErr     error
 	want       vmFailbackWant
 	wantErr    error
@@ -447,7 +450,7 @@ func (f *fakeRebalanceIO) unmark(ctx context.Context, vmid int, read *sdkcluster
 
 func (f *fakeRebalanceIO) migrate(ctx context.Context, vmid int, from, to string,
 	before func(context.Context) error,
-) (pve.VMLocation, error) {
+) (pve.VMLocation, []string, error) {
 	if f.beforeMigrate != nil {
 		f.beforeMigrate(vmid)
 	}
@@ -455,19 +458,27 @@ func (f *fakeRebalanceIO) migrate(ctx context.Context, vmid int, from, to string
 		f.mu.Lock()
 		f.log("migrate %d %s>%s not sent", vmid, from, to)
 		f.mu.Unlock()
-		return pve.VMLocation{Node: from}, &ha.MoveError{Failure: ha.MoveRefused, Reason: "prepare", Err: err}
+		return pve.VMLocation{Node: from}, nil, &ha.MoveError{Failure: ha.MoveRefused, Reason: "prepare", Err: err}
 	}
 	f.mu.Lock()
 	f.log("migrate %d %s>%s", vmid, from, to)
 	fn := f.migrateFn
+	partners := slices.Clone(f.comigrated[vmid])
 	f.mu.Unlock()
 	if fn != nil {
-		return fn(ctx, vmid, from, to)
+		loc, err := fn(ctx, vmid, from, to)
+		return loc, partners, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.vms[vmid].node = to
-	return pve.VMLocation{Node: to, Found: true}, nil
+	return pve.VMLocation{Node: to, Found: true}, partners, nil
+}
+
+func (f *fakeRebalanceIO) positiveRule(_ context.Context, vmid int) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return positiveAffinityRule(&ha.RuleSet{Rules: slices.Clone(f.extraRules)}, haResourceSid(vmid)), nil
 }
 
 func (f *fakeRebalanceIO) writePin(ctx context.Context, _ *ha.Profile, _ *ha.VMDecision, vmid int,

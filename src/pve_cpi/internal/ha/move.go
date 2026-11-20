@@ -81,6 +81,10 @@ type MoveInput struct {
 	// would have the CRM pull the VM back to the node its old pin prefers. An
 	// error stops the move with MoveRefused, and no request is sent.
 	BeforeMigrate func(ctx context.Context) error
+	// OnComigrated, when set, receives the resources a migrate response
+	// names as comigrated. PVE queues the request before it reports them, so
+	// they move with the VM, and the move goes on.
+	OnComigrated func(sids []string)
 }
 
 // MoveIntoSet asks PVE HA to migrate an HA-managed VM to a node of in.Set and
@@ -96,7 +100,8 @@ type MoveInput struct {
 //  3. Check that PVE HA holds the VM with a requested state of started or
 //     stopped, the only states the CRM migrates, run in.BeforeMigrate, and
 //     send the request to the first target the VM is not on. A refusal, or a response that names
-//     resources blocking the move, returns MoveRefused.
+//     resources blocking the move, returns MoveRefused. A response that names comigrated resources
+//     goes to in.OnComigrated, and the move goes on, because PVE has queued it already.
 //  4. Wait for the move. A VM that settles inside the set ends the wait. The
 //     CRM reads its commands at the start of a round, so the first round
 //     stamped after the request may still predate it, and only a second round
@@ -174,6 +179,14 @@ func MoveIntoSet(ctx context.Context, deps NarrowDeps, in MoveInput) (pve.VMLoca
 	if blocking := moveBlockers(resp); blocking != "" {
 		return loc, &MoveError{Failure: MoveRefused, Reason: fmt.Sprintf("PVE HA will not migrate %s to node %s, "+
 			"because %s", sid, target, blocking)}
+	}
+	if partners := moveComigrated(resp); len(partners) > 0 {
+		deps.Logger.Warn("ha move: PVE HA moves other resources with the VM, because a positive resource "+
+			"affinity rule names them", log.Int("vmid", in.VMID), log.String("sid", sid),
+			log.String("to", target), log.String("comigrated", strings.Join(partners, ",")))
+		if in.OnComigrated != nil {
+			in.OnComigrated(partners)
+		}
 	}
 	deps.Logger.Info("ha move: asked PVE HA to migrate the VM into its node set",
 		log.Int("vmid", in.VMID), log.String("sid", sid), log.String("from", loc.Node),
@@ -294,6 +307,32 @@ func moveBlockers(resp *sdkcluster.CreateHaResourcesMigrateResponse) string {
 		}
 	}
 	return strings.Join(parts, ", and ")
+}
+
+// moveComigrated returns the resources a migrate response names as moving
+// with the VM. PVE lists each as a service id, and an entry of another shape
+// is kept as its raw JSON so it still reaches the caller.
+func moveComigrated(resp *sdkcluster.CreateHaResourcesMigrateResponse) []string {
+	if resp == nil {
+		return nil
+	}
+	var out []string
+	for _, raw := range resp.ComigratedResources {
+		var sid string
+		if err := json.Unmarshal(raw, &sid); err == nil && sid != "" {
+			out = append(out, sid)
+			continue
+		}
+		var obj struct {
+			SID string `json:"sid"`
+		}
+		if err := json.Unmarshal(raw, &obj); err == nil && obj.SID != "" {
+			out = append(out, obj.SID)
+			continue
+		}
+		out = append(out, string(raw))
+	}
+	return out
 }
 
 // MoveTargets returns the nodes of set that can take a VM now, other than

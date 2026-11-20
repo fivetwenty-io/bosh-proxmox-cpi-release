@@ -50,12 +50,16 @@ type rebalanceIO interface {
 		*ha.Rule, error)
 	// readResource reads the VM's HA resource, nil when it has none.
 	readResource(ctx context.Context, vmid int) (*sdkcluster.GetHaResourcesResponse, error)
+	// positiveRule returns the id of an enabled positive resource affinity
+	// rule that names the VM, or "" when none does.
+	positiveRule(ctx context.Context, vmid int) (string, error)
 	// mark and unmark are ha.MarkRebalance and ha.UnmarkRebalance.
 	mark(ctx context.Context, vmid int, read *sdkcluster.GetHaResourcesResponse, node string) (bool, error)
 	unmark(ctx context.Context, vmid int, read *sdkcluster.GetHaResourcesResponse, failback bool) (bool, error)
-	// migrate is ha.MoveIntoSet with the set and the targets of one node.
+	// migrate is ha.MoveIntoSet with the set and the targets of one node. It
+	// also returns the resources PVE HA named as moving with the VM.
 	migrate(ctx context.Context, vmid int, from, to string, before func(context.Context) error) (pve.VMLocation,
-		error)
+		[]string, error)
 	// writePin is writeReplacedPin with the rules lock tried once.
 	writePin(ctx context.Context, profile *ha.Profile, d *ha.VMDecision, vmid int, oldPin, newPin *ha.Rule) (bool,
 		error)
@@ -495,10 +499,21 @@ func (p *pveRebalanceIO) unmark(ctx context.Context, vmid int, read *sdkcluster.
 
 func (p *pveRebalanceIO) migrate(ctx context.Context, vmid int, from, to string,
 	before func(context.Context) error,
-) (pve.VMLocation, error) {
+) (pve.VMLocation, []string, error) {
 	deps := ha.NarrowDepsFor(p.deps.PVE, p.logger, haMotionWait(p.deps))
-	return ha.MoveIntoSet(ctx, deps, ha.MoveInput{VMID: vmid, Node: from, Set: []string{to}, Targets: []string{to},
-		Budget: p.opts.SettleTimeout, BeforeMigrate: before})
+	var partners []string
+	loc, err := ha.MoveIntoSet(ctx, deps, ha.MoveInput{VMID: vmid, Node: from, Set: []string{to},
+		Targets: []string{to}, Budget: p.opts.SettleTimeout, BeforeMigrate: before,
+		OnComigrated: func(sids []string) { partners = append(partners, sids...) }})
+	return loc, partners, err
+}
+
+func (p *pveRebalanceIO) positiveRule(ctx context.Context, vmid int) (string, error) {
+	rules, err := readHARuleSet(ctx, p.deps.PVE.Cluster())
+	if err != nil {
+		return "", fmt.Errorf("read the HA rules: %w", err)
+	}
+	return positiveAffinityRule(rules, haResourceSid(vmid)), nil
 }
 
 func (p *pveRebalanceIO) writePin(ctx context.Context, profile *ha.Profile, d *ha.VMDecision, vmid int,
