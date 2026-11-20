@@ -121,6 +121,63 @@ func TestJoinAntiAffinityAtMetadata_AFailedWriteOnlyWarns(t *testing.T) {
 	t.Fatalf("no warning about the failed join in %+v", obs.All())
 }
 
+// lockedMetadataDeps returns aaMetadataDeps with the rules lock on, and
+// records each lock attempt in events.
+func lockedMetadataDeps(stub *aaClusterStub, events *[]string) Deps {
+	deps := aaDepsLock(aaMembershipConfig("pool", false, 1), stub, newAALockPools(events))
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4")
+	return deps
+}
+
+// TestJoinAntiAffinityAtMetadata_TakesNoLockForAVMAlreadyInPlace pins the
+// fast path of the join. When the group's rules already hold the VM where the
+// plan puts it, the join reads them without the rules lock and returns, so a
+// parallel deploy does not queue every set_vm_metadata call on that lock.
+func TestJoinAntiAffinityAtMetadata_TakesNoLockForAVMAlreadyInPlace(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	stub.tagged(aaQEMU(100, aaTag+";index--0"), aaQEMU(101, aaTag+";index--1"))
+	markWebMembers(stub, 100, 101)
+	stub.seedRule(aaRule, "vm:100,vm:101")
+	events := []string{}
+	logger, obs := log.NewObservedLogger(slog.LevelDebug)
+	joinAntiAffinityAtMetadata(context.Background(), lockedMetadataDeps(stub, &events), 101,
+		map[string]any{"index": "1"}, logger)
+	if len(events) != 0 {
+		t.Fatalf("lock events = %v; want no lock for a VM already in place", events)
+	}
+	if n := stub.createRuleCalls + stub.updateRuleCalls + stub.deleteRuleCalls; n != 0 {
+		t.Fatalf("rule writes = %d; want none", n)
+	}
+	for _, e := range obs.All() {
+		if e.Level == slog.LevelWarn {
+			t.Fatalf("unexpected warning %q", e.Message)
+		}
+		if e.Level == slog.LevelInfo && strings.Contains(e.Message, "is in its anti-affinity group's rule") {
+			return
+		}
+	}
+	t.Fatalf("no line naming the VM's rule in %+v", obs.All())
+}
+
+// TestJoinAntiAffinityAtMetadata_LocksToPlaceAVMNotInPlace pins that a VM the
+// rules do not hold yet still joins under the rules lock.
+func TestJoinAntiAffinityAtMetadata_LocksToPlaceAVMNotInPlace(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	stub.tagged(aaQEMU(100, aaTag+";index--0"), aaQEMU(101, aaTag+";index--1"))
+	markWebMembers(stub, 100, 101)
+	events := []string{}
+	joinAntiAffinityAtMetadata(context.Background(), lockedMetadataDeps(stub, &events), 101,
+		map[string]any{"index": "1"}, log.NewNopLogger())
+	if len(events) == 0 {
+		t.Fatal("the join wrote the rules without the rules lock")
+	}
+	if got := stub.rules[aaRule]; got != "vm:100,vm:101" {
+		t.Fatalf("rule = %q; want vm:100,vm:101", got)
+	}
+}
+
 func TestMetadataIndex_ReadsAStringOrANumber(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

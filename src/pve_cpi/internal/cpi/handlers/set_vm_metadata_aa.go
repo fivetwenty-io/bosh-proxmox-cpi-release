@@ -50,7 +50,48 @@ func joinAntiAffinityGroupOf(ctx context.Context, deps Deps, vmid, index int, lo
 	}
 	m, _ := parseHaMarker(comment)
 	ident := haIdentity{Owner: m.Owner, Deployment: m.Deployment, Group: m.Group}
+	if rule, ok := antiAffinityJoinSettled(ctx, deps, ident, vmid, index); ok {
+		return rule, nil
+	}
 	return applyAntiAffinityMembership(ctx, deps, ident, vmid, aaJoinOpts{index: index, checkSelf: true}, logger)
+}
+
+// antiAffinityJoinSettled plans the VM's group from a read made without the
+// rules lock, and returns the rule that holds the VM when that plan writes
+// nothing. The rule writer writes nothing for such a plan under the lock
+// either, so the join can skip the lock, and a parallel deploy does not queue
+// every set_vm_metadata call behind it. Any doubt, such as a failed read, a
+// plan that would write, a VM in no rule, or an unmarked rule from an older
+// CPI that the locked join would migrate, sends the join down the locked
+// path. Without the rules lock there is nothing to skip, so it reports false.
+func antiAffinityJoinSettled(ctx context.Context, deps Deps, ident haIdentity, vmid, index int) (string, bool) {
+	if !deps.Config.ClusterLockEnabled() || !ident.valid() || ident.Owner == "" {
+		return "", false
+	}
+	profile, err := haRuleWriteProfile(ctx, deps)
+	if err != nil {
+		return "", false
+	}
+	scan, err := collectGroupMemberSids(ctx, deps, ident)
+	if err != nil {
+		return "", false
+	}
+	set, err := readHARuleSet(ctx, deps.PVE.Cluster())
+	if err != nil {
+		return "", false
+	}
+	if legacy := legacyRuleName(ident); legacy != ident.ruleName() && set.Find(legacy) != nil {
+		return "", false
+	}
+	// The locked join plans and logs again when this plan finds work, so this
+	// one logs nothing.
+	planner := newGroupPlanner(ctx, deps, profile, ident, scan, log.NewNopLogger())
+	planner.sid, planner.index, planner.checkSelf = haResourceSid(vmid), index, true
+	ops, err := planner.plan(set)
+	if err != nil || len(ops) > 0 || planner.placedIn == "" {
+		return "", false
+	}
+	return planner.placedIn, true
 }
 
 // metadataIndex returns the instance index in set_vm_metadata's metadata, or

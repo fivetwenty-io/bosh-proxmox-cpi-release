@@ -36,6 +36,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Changed
 
+- With `pve.cluster_lock` at `pool`, `set_vm_metadata` no longer takes the HA rules lock for a VM that its anti-affinity group's rules already hold where the plan puts it. The call plans the group from a read made without the lock and returns when that plan would write nothing. Before, every metadata call for a group member waited on the cluster-wide lock, so a parallel deploy of fifty instances ran their metadata calls one at a time.
+
 - Scored placement now reads node health a second time when the first read of `/cluster/status` fails. When the second read fails too, and the CPI writes HA state (`pve.ha.mode` is `auto` or `managed`) or `pve.placement.maintenance_node_tags` names at least one tag, `create_vm` stops with a retriable error and creates nothing, because it cannot tell which nodes are in maintenance. Before, placement warned and treated every node as healthy, so a VM could land on a node in maintenance and join HA rules there. With HA writes off and no tags named, placement still warns and carries on as before.
 
 - With `pve.ha.anti_affinity_overflow: skip`, a plan now logs one warning that counts the members it leaves out of the group's rules, names the lowest instance index among them, and lists them, where it logged one warning for each member before. A large group no longer floods the log on every create and delete.
