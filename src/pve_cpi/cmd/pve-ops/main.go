@@ -6,9 +6,11 @@
 // encodes a CID offline, or makes read-only API calls to locate and inventory
 // CPI-managed resources. There are two exceptions. "pve-ops ha
 // --widen-replicas --apply" runs the CPI's own replica widening pass and
-// writes the node-affinity pins it widens, and "pve-ops ha rebalance --apply"
-// live-migrates this Director's HA VMs back into a good spread. Without
-// --apply both commands are dry runs.
+// writes the node-affinity pins it widens, "pve-ops ha rebalance --apply"
+// live-migrates this Director's HA VMs back into a good spread, and
+// "pve-ops ha drain --apply" and "pve-ops ha undrain --apply" stop and start
+// through PVE HA the VMs that can't leave a node in maintenance. Without
+// --apply every one of these commands is a dry run.
 //
 // # CID families
 //
@@ -90,6 +92,25 @@
 //	    waits for each to settle. It exits 1 when a read or a move failed or
 //	    a move was left part way, and 3 when a safety gate refused the run.
 //
+//	pve-ops ha drain <node> [--apply] [--config PATH] [--request PATH] [--director-uuid UUID]
+//	                 [--settle-timeout D] [--json]
+//	    Online. Decides, from PVE's HA rules and the cluster's placement
+//	    facts, which of one Director's VMs on a node in HA maintenance can
+//	    leave it. With --apply it waits for PVE HA to move those, then stops
+//	    each VM that can't leave by setting its HA resource's state to
+//	    stopped, and records the stop with a drain token on the resource. It
+//	    names the deployments whose resurrection to turn off. It exits 1 when
+//	    a read or a stop failed or a VM that could leave stayed, and 3 when a
+//	    safety gate refused the run, such as a node not yet in maintenance.
+//
+//	pve-ops ha undrain <node> [--apply] [--config PATH] [--request PATH] [--director-uuid UUID]
+//	                   [--settle-timeout D] [--no-rebalance] [rebalance flags] [--json]
+//	    Online. Once the node's maintenance ends, starts through PVE HA each
+//	    VM that carries the node's drain token, drops the token, waits for
+//	    the VMs, and then runs "pve-ops ha rebalance --apply" unless
+//	    --no-rebalance is given. Its exit codes are the drain's, and the
+//	    rebalance's when that ended with one.
+//
 // # Config resolution (locate, stemcells, ha)
 //
 // The online subcommands load the same cpi.json the pve_cpi job runs
@@ -102,7 +123,7 @@
 //	0  success
 //	1  runtime error (parse failure, PVE API error, config load failure)
 //	2  usage error (bad flags/arguments)
-//	3  ha rebalance only: a safety gate refused or stopped the run
+//	3  ha rebalance, drain, and undrain only: a safety gate refused or stopped the run
 package main
 
 import (
@@ -204,6 +225,11 @@ Usage:
   pve-ops ha rebalance [--apply] [--config PATH] [--request PATH] [--director-uuid UUID] [--max-moves N]
                        [--settle-timeout D] [--max-duration D] [--start-threshold F] [--stop-threshold F]
                        [--restore-only] [--json]
+  pve-ops ha drain <node> [--apply] [--config PATH] [--request PATH] [--director-uuid UUID]
+                   [--settle-timeout D] [--json]
+  pve-ops ha undrain <node> [--apply] [--config PATH] [--request PATH] [--director-uuid UUID]
+                     [--settle-timeout D] [--no-rebalance] [--max-moves N] [--max-duration D]
+                     [--start-threshold F] [--stop-threshold F] [--restore-only] [--json]
   pve-ops version
   pve-ops help
 
@@ -212,7 +238,9 @@ and ha are read-only online commands: they load the CPI's cpi.json (--config fla
 then $PVE_CPI_CONFIG, then /var/vcap/jobs/pve_cpi/config/cpi.json) and query
 the configured PVE cluster. pve-ops changes nothing in PVE, except that
 "ha --widen-replicas --apply" widens the replica pins the CPI's own check
-finds ready, and "ha rebalance --apply" live-migrates this Director's HA VMs.
+finds ready, "ha rebalance --apply" live-migrates this Director's HA VMs, and
+"ha drain --apply" and "ha undrain --apply" stop and start through PVE HA the
+VMs that can't leave a node in maintenance.
 
 Run "pve-ops <subcommand> --help" for subcommand-specific flags.
 `)

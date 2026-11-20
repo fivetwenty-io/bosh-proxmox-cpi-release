@@ -128,45 +128,12 @@ func runHARebalance(args []string, stdout, stderr io.Writer, deps haDeps) int {
 	if !ok {
 		return code
 	}
-	owner := strings.TrimSpace(f.directorUUID)
-	var extra map[string]any
-	if f.requestPath != "" {
-		reqCtx, err := readHARequestContext(f.requestPath)
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "pve-ops ha rebalance: %s\n", err)
-			return exitUsage
-		}
-		named := strings.TrimSpace(reqCtx.DirectorUUID)
-		if owner != "" && named != "" && owner != named {
-			_, _ = fmt.Fprintln(stderr, "pve-ops ha rebalance: --director-uuid names a different Director than "+
-				"the request")
-			return exitUsage
-		}
-		if owner == "" {
-			owner = named
-		}
-		extra = reqCtx.Extra
+	run, code, ok := resolveHAWriteRun("ha rebalance", haRebalanceUsage, f.configPath, f.requestPath,
+		f.directorUUID, stderr, deps)
+	if !ok {
+		return code
 	}
-	if owner == "" {
-		_, _ = fmt.Fprintln(stderr, "pve-ops ha rebalance: the Director's UUID must come from --request or "+
-			"--director-uuid, because the run moves only the VMs that Director owns")
-		_, _ = fmt.Fprintln(stderr, haRebalanceUsage)
-		return exitUsage
-	}
-	configPath := resolveConfigPath(f.configPath)
-	base, logger, err := deps.loadConfig(configPath, stderr)
-	if err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
-		return exitError
-	}
-	eff := base
-	if extra != nil {
-		if eff, _, _, err = config.ApplyContextOverrides(base, extra); err != nil {
-			_, _ = fmt.Fprintf(stderr, "pve-ops ha rebalance: the request's cpi_config properties do not "+
-				"apply: %s\n", err)
-			return exitError
-		}
-	}
+	owner, eff, logger, configPath := run.owner, run.cfg, run.logger, run.configPath
 	ctx, release := commandContext()
 	defer release()
 	report, err := deps.rebalance(ctx, eff, logger, owner, f.opts)
@@ -184,6 +151,65 @@ func runHARebalance(args []string, stdout, stderr io.Writer, deps haDeps) int {
 		writeHARebalanceText(stdout, &out)
 	}
 	return report.ExitCode
+}
+
+// haWriteRun is what a command that writes HA state runs against: the
+// Director it acts for, the effective configuration, its logger, and the path
+// it was loaded from.
+type haWriteRun struct {
+	owner      string
+	cfg        *config.CPIConfig
+	logger     *log.Logger
+	configPath string
+}
+
+// resolveHAWriteRun names the Director from --director-uuid or the request,
+// loads the configuration, and applies the request's cpi_config properties.
+// ok is false when the command should exit with code, after the message it
+// printed.
+func resolveHAWriteRun(op, usage, configFlag, requestPath, directorUUID string, stderr io.Writer, deps haDeps) (
+	haWriteRun, int, bool,
+) {
+	owner := strings.TrimSpace(directorUUID)
+	var extra map[string]any
+	if requestPath != "" {
+		reqCtx, err := readHARequestContext(requestPath)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "pve-ops %s: %s\n", op, err)
+			return haWriteRun{}, exitUsage, false
+		}
+		named := strings.TrimSpace(reqCtx.DirectorUUID)
+		if owner != "" && named != "" && owner != named {
+			_, _ = fmt.Fprintf(stderr, "pve-ops %s: --director-uuid names a different Director than the request\n",
+				op)
+			return haWriteRun{}, exitUsage, false
+		}
+		if owner == "" {
+			owner = named
+		}
+		extra = reqCtx.Extra
+	}
+	if owner == "" {
+		_, _ = fmt.Fprintf(stderr, "pve-ops %s: the Director's UUID must come from --request or --director-uuid, "+
+			"because the run acts only on the VMs that Director owns\n", op)
+		_, _ = fmt.Fprintln(stderr, usage)
+		return haWriteRun{}, exitUsage, false
+	}
+	configPath := resolveConfigPath(configFlag)
+	base, logger, err := deps.loadConfig(configPath, stderr)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return haWriteRun{}, exitError, false
+	}
+	eff := base
+	if extra != nil {
+		if eff, _, _, err = config.ApplyContextOverrides(base, extra); err != nil {
+			_, _ = fmt.Fprintf(stderr, "pve-ops %s: the request's cpi_config properties do not apply: %s\n", op,
+				err)
+			return haWriteRun{}, exitError, false
+		}
+	}
+	return haWriteRun{owner: owner, cfg: eff, logger: logger, configPath: configPath}, exitOK, true
 }
 
 // haRebalanceOutput is the JSON form of a rebalance run.

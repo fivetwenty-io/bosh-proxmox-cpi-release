@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
@@ -22,12 +23,14 @@ const haUsage = "usage: pve-ops ha [--config PATH] [--request PATH | --cpi-confi
 	"       pve-ops ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]\n" +
 	"       pve-ops ha --fix-anti-affinity [--group RULE] [--apply] [--config PATH] [--request PATH | " +
 	"--director-uuid UUID] [--json]\n" +
-	"       pve-ops ha rebalance [--apply] [--config PATH] [--request PATH] [--director-uuid UUID] [flags]"
+	"       pve-ops ha rebalance [--apply] [--config PATH] [--request PATH] [--director-uuid UUID] [flags]\n" +
+	"       pve-ops ha drain <node> [--apply] [--config PATH] [--request PATH] [--director-uuid UUID] [flags]\n" +
+	"       pve-ops ha undrain <node> [--apply] [--config PATH] [--request PATH] [--director-uuid UUID] [flags]"
 
 // haDeps are the pieces of the ha subcommand a test replaces: how the base CPI
 // config is loaded, how a reader is opened for an effective config, and the
-// clock every age is measured on, the replica widening pass, and the
-// rebalance.
+// clock every age is measured on, the replica widening pass, the rebalance,
+// the drain, and the undrain.
 type haDeps struct {
 	loadConfig func(path string, stderr io.Writer) (*config.CPIConfig, *log.Logger, error)
 	openReader func(cfg *config.CPIConfig, logger *log.Logger) (HAReader, error)
@@ -35,6 +38,8 @@ type haDeps struct {
 	widen      haWidenFunc
 	rebalance  haRebalanceFunc
 	fixAA      haFixAAFunc
+	drain      haDrainFunc
+	undrain    haUndrainFunc
 }
 
 // productionHADeps wires the ha subcommand to the real config loader and PVE
@@ -53,6 +58,8 @@ func productionHADeps() haDeps {
 		widen:     productionHAWiden,
 		rebalance: productionHARebalance,
 		fixAA:     productionHAFixAA,
+		drain:     productionHADrain,
+		undrain:   productionHAUndrain,
 	}
 }
 
@@ -64,11 +71,18 @@ func runHA(args []string, stdout, stderr io.Writer) int {
 // runHAWith runs the doctor against the pieces in deps. The doctor reads PVE
 // and nothing else, because no reader method writes. The exceptions are
 // --widen-replicas --apply, which runs the CPI's own replica widening pass and
-// writes the node-affinity pins that pass widens, and rebalance --apply, which
-// live-migrates this Director's HA VMs.
+// writes the node-affinity pins that pass widens, rebalance --apply, which
+// live-migrates this Director's HA VMs, and drain --apply and undrain --apply,
+// which stop and start through PVE HA the VMs that can't leave a node in
+// maintenance.
 func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
-	if len(args) > 0 && args[0] == "rebalance" {
-		return runHARebalance(args[1:], stdout, stderr, deps)
+	if len(args) > 0 {
+		switch args[0] {
+		case "rebalance":
+			return runHARebalance(args[1:], stdout, stderr, deps)
+		case handlers.DrainCommand, handlers.UndrainCommand:
+			return runHADrain(args[0], args[1:], stdout, stderr, deps)
+		}
 	}
 	fs := flag.NewFlagSet("ha", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
