@@ -221,12 +221,7 @@ func (r *pveReader) StorageIsShared(ctx context.Context, storage string) (shared
 // client reports through. It does not construct a client, so a caller that
 // applies per-request overrides to the config can do that first.
 func loadConfigAndLogger(configPath string, stderr io.Writer) (*config.CPIConfig, *log.Logger, error) {
-	if configPath == "" {
-		configPath = os.Getenv(envConfigPath)
-	}
-	if configPath == "" {
-		configPath = defaultConfigPath
-	}
+	configPath = resolveConfigPath(configPath)
 
 	cfg, err := config.LoadFile(configPath)
 	if err != nil {
@@ -238,6 +233,18 @@ func loadConfigAndLogger(configPath string, stderr io.Writer) (*config.CPIConfig
 		return nil, nil, fmt.Errorf("pve-ops: logger init failed: %w", err)
 	}
 	return cfg, logger, nil
+}
+
+// resolveConfigPath returns the configuration path a command reads: the
+// --config flag, then $PVE_CPI_CONFIG, then the release job's default path.
+func resolveConfigPath(flagPath string) string {
+	if flagPath != "" {
+		return flagPath
+	}
+	if env := os.Getenv(envConfigPath); env != "" {
+		return env
+	}
+	return defaultConfigPath
 }
 
 // newPVEClient constructs a live client against the cluster cfg names, reusing

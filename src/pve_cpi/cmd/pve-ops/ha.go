@@ -19,16 +19,19 @@ import (
 const haInputLimit = 1 << 20
 
 const haUsage = "usage: pve-ops ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]\n" +
-	"       pve-ops ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]"
+	"       pve-ops ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]\n" +
+	"       pve-ops ha rebalance [--apply] [--config PATH] [--request PATH] [--director-uuid UUID] [flags]"
 
 // haDeps are the pieces of the ha subcommand a test replaces: how the base CPI
 // config is loaded, how a reader is opened for an effective config, and the
-// clock every age is measured on, and the replica widening pass.
+// clock every age is measured on, the replica widening pass, and the
+// rebalance.
 type haDeps struct {
 	loadConfig func(path string, stderr io.Writer) (*config.CPIConfig, *log.Logger, error)
 	openReader func(cfg *config.CPIConfig, logger *log.Logger) (HAReader, error)
 	now        func() time.Time
 	widen      haWidenFunc
+	rebalance  haRebalanceFunc
 }
 
 // productionHADeps wires the ha subcommand to the real config loader and PVE
@@ -43,8 +46,9 @@ func productionHADeps() haDeps {
 			}
 			return newPVEHAReader(client, cfg, logger), nil
 		},
-		now:   time.Now,
-		widen: productionHAWiden,
+		now:       time.Now,
+		widen:     productionHAWiden,
+		rebalance: productionHARebalance,
 	}
 }
 
@@ -54,10 +58,14 @@ func runHA(args []string, stdout, stderr io.Writer) int {
 }
 
 // runHAWith runs the doctor against the pieces in deps. The doctor reads PVE
-// and nothing else, because no reader method writes. The one exception is
+// and nothing else, because no reader method writes. The exceptions are
 // --widen-replicas --apply, which runs the CPI's own replica widening pass and
-// writes the node-affinity pins that pass widens.
+// writes the node-affinity pins that pass widens, and rebalance --apply, which
+// live-migrates this Director's HA VMs.
 func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
+	if len(args) > 0 && args[0] == "rebalance" {
+		return runHARebalance(args[1:], stdout, stderr, deps)
+	}
 	fs := flag.NewFlagSet("ha", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	configPath := fs.String("config", "", "CPI configuration file")

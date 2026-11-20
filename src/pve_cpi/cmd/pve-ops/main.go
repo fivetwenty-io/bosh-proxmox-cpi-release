@@ -4,9 +4,11 @@
 //
 // pve-ops reads and does not change PVE. Every subcommand either decodes or
 // encodes a CID offline, or makes read-only API calls to locate and inventory
-// CPI-managed resources. The one exception is "pve-ops ha --widen-replicas
-// --apply", which runs the CPI's own replica widening pass and writes the
-// node-affinity pins it widens. Without --apply that command is a dry run.
+// CPI-managed resources. There are two exceptions. "pve-ops ha
+// --widen-replicas --apply" runs the CPI's own replica widening pass and
+// writes the node-affinity pins it widens, and "pve-ops ha rebalance --apply"
+// live-migrates this Director's HA VMs back into a good spread. Without
+// --apply both commands are dry runs.
 //
 // # CID families
 //
@@ -77,6 +79,17 @@
 //	    the outcome and the reason, and exits 1 when a VM failed or the pass
 //	    stopped early.
 //
+//	pve-ops ha rebalance [--apply] [--config PATH] [--request PATH] [--director-uuid UUID]
+//	                     [--max-moves N] [--settle-timeout D] [--max-duration D]
+//	                     [--start-threshold F] [--stop-threshold F] [--restore-only] [--json]
+//	    Online. Plans the live migrations that return one Director's HA VMs
+//	    to their AZs, separate anti-affinity members that share a node, and
+//	    even out committed memory, and prints each move with its reason.
+//	    Without --apply it is a dry run that takes no lock and writes
+//	    nothing. With --apply it makes one move at a time through PVE HA and
+//	    waits for each to settle. It exits 1 when a read or a move failed or
+//	    a move was left part way, and 3 when a safety gate refused the run.
+//
 // # Config resolution (locate, stemcells, ha)
 //
 // The online subcommands load the same cpi.json the pve_cpi job runs
@@ -89,6 +102,7 @@
 //	0  success
 //	1  runtime error (parse failure, PVE API error, config load failure)
 //	2  usage error (bad flags/arguments)
+//	3  ha rebalance only: a safety gate refused or stopped the run
 package main
 
 import (
@@ -187,6 +201,9 @@ Usage:
   pve-ops stemcells [--storage ID] [--node N] [--orphans] [--config PATH] [--json]
   pve-ops ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]
   pve-ops ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]
+  pve-ops ha rebalance [--apply] [--config PATH] [--request PATH] [--director-uuid UUID] [--max-moves N]
+                       [--settle-timeout D] [--max-duration D] [--start-threshold F] [--stop-threshold F]
+                       [--restore-only] [--json]
   pve-ops version
   pve-ops help
 
@@ -195,7 +212,7 @@ and ha are read-only online commands: they load the CPI's cpi.json (--config fla
 then $PVE_CPI_CONFIG, then /var/vcap/jobs/pve_cpi/config/cpi.json) and query
 the configured PVE cluster. pve-ops changes nothing in PVE, except that
 "ha --widen-replicas --apply" widens the replica pins the CPI's own check
-finds ready.
+finds ready, and "ha rebalance --apply" live-migrates this Director's HA VMs.
 
 Run "pve-ops <subcommand> --help" for subcommand-specific flags.
 `)
