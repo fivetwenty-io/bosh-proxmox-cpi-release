@@ -1441,6 +1441,14 @@ func decodeLockExpiry(comment string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// ClusterLockExpiry returns the expiry a sentinel pool's comment records, and
+// whether the comment records one that parses.
+func ClusterLockExpiry(comment string) (time.Time, bool) { return decodeLockExpiry(comment) }
+
+// IsClusterLockPool reports whether poolID names a sentinel pool of a cluster
+// lock, which is a pool whose id starts with bosh-lock-.
+func IsClusterLockPool(poolID string) bool { return strings.HasPrefix(poolID, clusterLockPoolPrefix) }
+
 // isPoolAlreadyExists reports whether err positively indicates the sentinel pool
 // id is already taken — the duplicate-create signal that means "lock held".
 //
