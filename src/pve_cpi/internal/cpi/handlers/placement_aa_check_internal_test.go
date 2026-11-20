@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
@@ -75,10 +77,12 @@ func TestCheckAntiAffinityGroups_ARuleOfNMembersIsFullAndDrifts(t *testing.T) {
 }
 
 // TestCheckAntiAffinityGroups_AGroupInItsLayoutReadsClean pins that a group
-// whose rules hold the plan reports nothing.
+// whose rules hold the plan reports nothing. Its members record their
+// pattern, as every member this release creates does, so the rules need no
+// record of it.
 func TestCheckAntiAffinityGroups_AGroupInItsLayoutReadsClean(t *testing.T) {
 	t.Parallel()
-	f := newAACheckFixture(t, 4, "", 100, 101, 102)
+	f := newAACheckFixture(t, 4, "block", 100, 101, 102)
 	f.rule(aaRule, "vm:100", "vm:101", "vm:102")
 	c := oneCheck(t, f.in)
 	if len(c.Drift) != 0 || len(c.Full) != 0 || len(c.Trimmed) != 0 || c.BlocksDrain || c.Problem != "" {
@@ -200,5 +204,49 @@ func TestFixAntiAffinityGroups_RefusesWithoutADirectorOrWithRulesOff(t *testing.
 	deps.Config.HA = haModeOff()
 	if _, err := FixAntiAffinityGroups(context.Background(), deps, AntiAffinityFixOptions{}); err == nil {
 		t.Fatal("a fix with mode off ran")
+	}
+}
+
+// TestFixAntiAffinityGroups_StampsThePatternOfAGroupThatRecordsNone pins that
+// a group whose members record no pattern, as members of an older release
+// do, gets the pattern its first plan used stamped on its rules. A plan under
+// another default, such as one through a cpi-config entry with its own
+// pve.ha.anti_affinity_pattern, then keeps that pattern and writes nothing,
+// and the doctor counts the pattern as recorded.
+func TestFixAntiAffinityGroups_StampsThePatternOfAGroupThatRecordsNone(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	stub.tagged(aaQEMU(100, aaTag+";index--0"), aaQEMU(101, aaTag+";index--1"), aaQEMU(102, aaTag+";index--2"),
+		aaQEMU(103, aaTag+";index--3"))
+	markWebMembers(stub, 100, 101, 102, 103)
+	stride, err := aapattern.Parse("stride:2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := aaMetadataDeps(stub)
+	deps.Config.HA.AntiAffinityPattern = &config.HAPattern{Pattern: stride}
+	if _, err := FixAntiAffinityGroups(context.Background(), deps, AntiAffinityFixOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(stub.rules) == 0 {
+		t.Fatal("the fix wrote no rule")
+	}
+	for name := range stub.rules {
+		if m, _ := parseHaMarker(stub.ruleComments[name]); m.AA != "stride:2" {
+			t.Fatalf("rule %s comment = %q; want the plan's pattern stamped", name, stub.ruleComments[name])
+		}
+	}
+	layout := maps.Clone(stub.rules)
+	writes := stub.createRuleCalls + stub.updateRuleCalls + stub.deleteRuleCalls
+	other := aaMetadataDeps(stub)
+	got, err := FixAntiAffinityGroups(context.Background(), other, AntiAffinityFixOptions{})
+	if err != nil || len(got) != 1 || got[0].Outcome != AntiAffinityInLayout {
+		t.Fatalf("fix under the block default = %+v, %v; want the group in its stamped layout", got, err)
+	}
+	if !maps.Equal(stub.rules, layout) || stub.createRuleCalls+stub.updateRuleCalls+stub.deleteRuleCalls != writes {
+		t.Fatalf("rules = %v; want %v unchanged", stub.rules, layout)
+	}
+	if !got[0].PatternRecorded || got[0].Pattern != "stride:2" {
+		t.Fatalf("check = %+v; want the stamped pattern counted as recorded", got[0])
 	}
 }

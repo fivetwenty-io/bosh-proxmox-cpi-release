@@ -195,6 +195,34 @@ func withLeavingMembers(comment string, left []string) string {
 	return strings.Join(out, " ")
 }
 
+// withPatternStamp returns the rule comment with its recorded pattern
+// replaced by aa, the canonical form of the group's pattern. It keeps every
+// other marker field and puts the record of leaving members last, where
+// withLeavingMembers writes it. An empty aa, or a comment that holds no
+// marker, returns the comment as it is.
+func withPatternStamp(comment, aa string) string {
+	if aa == "" {
+		return comment
+	}
+	fields, _, ok := ha.MarkerFields(comment)
+	if !ok {
+		return comment
+	}
+	out := []string{haMarkerPrefix}
+	var left []string
+	for _, f := range fields {
+		switch {
+		case strings.HasPrefix(f, "aa="):
+		case strings.HasPrefix(f, "left="):
+			left = append(left, f)
+		default:
+			out = append(out, f)
+		}
+	}
+	out = append(out, "aa="+markerValue(aa))
+	return strings.Join(append(out, left...), " ")
+}
+
 // haOwnership says whose an HA rule or resource is, judged by its comment.
 type haOwnership int
 

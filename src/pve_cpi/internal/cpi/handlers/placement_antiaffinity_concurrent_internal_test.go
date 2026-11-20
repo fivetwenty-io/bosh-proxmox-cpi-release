@@ -264,7 +264,7 @@ func (f *aaFleet) watch(t *testing.T, run string) (check func()) {
 		// The comment is the marker, plus the record of the members whose
 		// delete took them out ahead of their purge.
 		got := f.stub.ruleComments[aaRule]
-		if withLeavingMembers(got, nil) != aaIdent("web").marker() {
+		if withLeavingMembers(got, nil) != aaRuleMarker() {
 			t.Errorf("%s: rule written with comment %q; want the marker", run, got)
 		}
 		if m, _ := parseHaMarker(got); len(m.Left) > 0 {

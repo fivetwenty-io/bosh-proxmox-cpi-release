@@ -397,8 +397,8 @@ type createVMParsedArgs struct {
 	// stemcellVolPath.
 	rawVolid   string
 	cloudProps createVMCloudProps
-	// aaPattern is the canonical form of the ha_anti_affinity cloud
-	// property, or "" when no layer sets it. The VM's HA resource marker
+	// aaPattern is the canonical form of the effective ha_anti_affinity
+	// pattern, which is the job default when no layer sets it. The VM's HA resource marker
 	// records it, and the group's rules follow the newest member's pattern.
 	aaPattern string
 	// cloudPropsMap is the raw map decoded from args[2] (same JSON as

@@ -159,6 +159,10 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 	c.BlocksDrain = p.lastOut.Unsafe
 	c.Layout = p.lastOut.Rules
 	for i := range ops {
+		if p.stampOnly[ops[i].Rule.ID] {
+			c.Drift = append(c.Drift, fmt.Sprintf("record the pattern %s on %s", p.stamp, ops[i].Rule.ID))
+			continue
+		}
 		c.Drift = append(c.Drift, describeRuleOp(&ops[i]))
 	}
 	c.Full = fullGroupRules(set, ident, p.lastIn)

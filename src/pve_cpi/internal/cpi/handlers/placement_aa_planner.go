@@ -131,8 +131,17 @@ type aaPlanner struct {
 	lastIn  aapattern.Input
 	lastOut aapattern.Output
 	// lastRecorded says the last plan's pattern came from a member's
-	// create, not from pve.ha.anti_affinity_pattern.
+	// create or from the record on the group's rules, not from
+	// pve.ha.anti_affinity_pattern.
 	lastRecorded bool
+	// stamp is the canonical pattern the last plan records on each of the
+	// group's rules, or "" when a member records the pattern. A group whose
+	// members came from a CPI that recorded no pattern keeps the one it was
+	// first planned with this way, so a later change of the job default does
+	// not move its members.
+	stamp string
+	// stampOnly names the rules whose only write records the stamp.
+	stampOnly map[string]bool
 }
 
 // once reports whether the line keyed key has not been logged yet, and marks
@@ -264,7 +273,7 @@ func (p *aaPlanner) layoutInput(set *ha.RuleSet, existing map[string]*ha.Rule) a
 	}
 	return aapattern.Input{
 		Base:    p.ident.ruleName(),
-		Pattern: p.groupPattern(newest),
+		Pattern: p.groupPattern(newest, existing),
 		Split:   p.split,
 		Domains: p.topo.domains(domainKeys),
 		Members: members,
@@ -404,13 +413,16 @@ func (a *aaPatternSource) consider(sid string, m haMarker) {
 }
 
 // groupPattern returns the group's pattern: the newest member's, when a
-// member's create named one, and otherwise pve.ha.anti_affinity_pattern. A
-// recorded pattern that no longer parses, and members that disagree, are
-// logged once.
-func (p *aaPlanner) groupPattern(src aaPatternSource) aapattern.Pattern {
-	p.lastRecorded = false
+// member's create named one, then the pattern recorded on the group's rules,
+// and otherwise pve.ha.anti_affinity_pattern. When no member records a
+// pattern, the plan records the one it uses on every rule of the group, so a
+// group whose members a CPI that recorded no pattern created keeps its
+// pattern across a change of the job default. A recorded pattern that no
+// longer parses, and members that disagree, are logged once.
+func (p *aaPlanner) groupPattern(src aaPatternSource, existing map[string]*ha.Rule) aapattern.Pattern {
+	p.lastRecorded, p.stamp = false, ""
 	if src.sid == "" {
-		return p.pattern
+		return p.rulePattern(existing)
 	}
 	if len(src.patterns) > 1 && p.once("disagree") {
 		p.logger.Warn("anti-affinity: the group's members were created with different ha_anti_affinity patterns; "+
@@ -429,6 +441,38 @@ func (p *aaPlanner) groupPattern(src aaPatternSource) aapattern.Pattern {
 	}
 	p.lastRecorded = true
 	return pat
+}
+
+// rulePattern returns the pattern recorded on the group's rules, reading the
+// base rule first and then the others by name, or pve.ha.anti_affinity_pattern
+// when no rule records one. It sets the stamp the plan records on the rules.
+// A recorded pattern that does not parse, which a newer CPI may have written,
+// is logged once and left in place, and the plan stamps nothing.
+func (p *aaPlanner) rulePattern(existing map[string]*ha.Rule) aapattern.Pattern {
+	base := p.ident.ruleName()
+	names := slices.Sorted(maps.Keys(existing))
+	if i := slices.Index(names, base); i > 0 {
+		names = append([]string{base}, slices.Delete(names, i, i+1)...)
+	}
+	for _, name := range names {
+		m, ok := parseHaMarker(existing[name].Comment)
+		if !ok || m.AA == "" {
+			continue
+		}
+		pat, err := aapattern.Parse(m.AA)
+		if err != nil {
+			if p.once("unparsed rule") {
+				p.logger.Warn("anti-affinity: the pattern recorded on the group's rule does not parse; the plan "+
+					"uses pve.ha.anti_affinity_pattern",
+					log.String("rule", name), log.Err(err))
+			}
+			return p.pattern
+		}
+		p.lastRecorded, p.stamp = true, pat.Canonical()
+		return pat
+	}
+	p.stamp = p.pattern.Canonical()
+	return p.pattern
 }
 
 // canJoin reports whether key may join the rule named rule, which the layout
@@ -501,11 +545,12 @@ func (p *aaPlanner) ruleCandidate(set *ha.RuleSet, cur *ha.Rule, name string, me
 }
 
 // wantRule returns the rule name holding members as ruleOps writes it: cur
-// with its members replaced, or a new rule with the group's marker.
+// with its members replaced, or a new rule with the group's marker. Either
+// records the plan's stamp, when it has one.
 func (p *aaPlanner) wantRule(cur *ha.Rule, name string, members []string) ha.Rule {
 	if cur == nil {
 		return ha.Rule{ID: name, Type: haRuleType, Affinity: haRuleAffinity, Resources: members,
-			Comment: p.ident.marker()}
+			Comment: withPatternStamp(p.ident.marker(), p.stamp)}
 	}
 	next := cur.Clone()
 	next.Resources, next.Affinity, next.Errors = members, haRuleAffinity, nil
@@ -518,6 +563,7 @@ func (p *aaPlanner) wantRule(cur *ha.Rule, name string, members []string) ha.Rul
 		})
 		next.Comment = withLeavingMembers(cur.Comment, left)
 	}
+	next.Comment = withPatternStamp(next.Comment, p.stamp)
 	return next
 }
 
@@ -530,6 +576,7 @@ func (p *aaPlanner) wantRule(cur *ha.Rule, name string, members []string) ha.Rul
 func (p *aaPlanner) ruleOps(set *ha.RuleSet, existing map[string]*ha.Rule, out aapattern.Output) []ha.RuleOp {
 	var pins, shrink, grow []ha.RuleOp
 	pinned := map[string]bool{}
+	p.stampOnly = nil
 	for _, name := range slices.Sorted(maps.Keys(out.Rules)) {
 		members := out.Rules[name]
 		if p.placedIn == "" && slices.Contains(members, p.sid) {
@@ -553,6 +600,12 @@ func (p *aaPlanner) ruleOps(set *ha.RuleSet, existing map[string]*ha.Rule, out a
 			} else {
 				shrink = append(shrink, op)
 			}
+		case p.stamp != "" && ruleStamp(cur) != p.stamp:
+			if p.stampOnly == nil {
+				p.stampOnly = map[string]bool{}
+			}
+			p.stampOnly[name] = true
+			grow = append(grow, ha.RuleOp{Kind: ha.OpUpdate, Rule: p.wantRule(cur, name, members)})
 		}
 	}
 	var deletes []ha.RuleOp
@@ -570,6 +623,12 @@ func (p *aaPlanner) ruleOps(set *ha.RuleSet, existing map[string]*ha.Rule, out a
 	ops = append(ops, deletes...)
 	ops = append(ops, shrink...)
 	return append(ops, grow...)
+}
+
+// ruleStamp returns the pattern recorded on a rule's comment, or "".
+func ruleStamp(r *ha.Rule) string {
+	m, _ := parseHaMarker(r.Comment)
+	return m.AA
 }
 
 // subset reports whether every sid of have is in want.

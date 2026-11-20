@@ -58,7 +58,7 @@ func TestEnsureAntiAffinity_LeavesALeavingMemberOut(t *testing.T) {
 	for _, v := range []int{100, 101, 102, 103, 104} {
 		stub.resComments[haResourceSid(v)] = aaIdent("web").marker()
 	}
-	stub.seedRuleWithComment(aaRule, "vm:100,vm:102", aaIdent("web").marker()+" left=101")
+	stub.seedRuleWithComment(aaRule, "vm:100,vm:102", aaRuleMarker()+" left=101")
 	deps := aaDeps(stub)
 	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4", "pve5")
 	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 103,
@@ -68,7 +68,7 @@ func TestEnsureAntiAffinity_LeavesALeavingMemberOut(t *testing.T) {
 	if got := stub.rules[aaRule]; got != "vm:100,vm:102,vm:103,vm:104" {
 		t.Fatalf("rule = %q; want the leaving vm:101 left out", got)
 	}
-	if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker()+" left=101" {
+	if got := stub.ruleComments[aaRule]; got != aaRuleMarker()+" left=101" {
 		t.Fatalf("comment = %q; want the record kept while vm:101 is still an HA resource", got)
 	}
 	// The purge lands. vm:104 leaves too, and its own record joins the
@@ -77,7 +77,7 @@ func TestEnsureAntiAffinity_LeavesALeavingMemberOut(t *testing.T) {
 	if err := removeAntiAffinityMembership(context.Background(), deps, 104, "", log.NewNopLogger()); err != nil {
 		t.Fatal(err)
 	}
-	if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker()+" left=101.104" {
+	if got := stub.ruleComments[aaRule]; got != aaRuleMarker()+" left=101.104" {
 		t.Fatalf("comment = %q; want both leaving members recorded", got)
 	}
 	// The next write of a joining member drops the records whose HA
@@ -90,7 +90,7 @@ func TestEnsureAntiAffinity_LeavesALeavingMemberOut(t *testing.T) {
 	if got := stub.rules[aaRule]; got != "vm:100,vm:102,vm:103,vm:105" {
 		t.Fatalf("rule = %q; want vm:105 in it", got)
 	}
-	if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker() {
+	if got := stub.ruleComments[aaRule]; got != aaRuleMarker() {
 		t.Fatalf("comment = %q; want the stale records dropped", got)
 	}
 }
@@ -102,7 +102,7 @@ func TestEnsureAntiAffinity_ARecreatedVMIDJoinsDespiteARecord(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
 	stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag), aaQEMU(102, aaTag))
-	stub.seedRuleWithComment(aaRule, "vm:100,vm:102", aaIdent("web").marker()+" left=101")
+	stub.seedRuleWithComment(aaRule, "vm:100,vm:102", aaRuleMarker()+" left=101")
 	deps := aaDeps(stub)
 	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4")
 	if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 101,
@@ -112,7 +112,7 @@ func TestEnsureAntiAffinity_ARecreatedVMIDJoinsDespiteARecord(t *testing.T) {
 	if got := stub.rules[aaRule]; got != "vm:100,vm:101,vm:102" {
 		t.Fatalf("rule = %q; want the recreated vm:101 in it", got)
 	}
-	if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker() {
+	if got := stub.ruleComments[aaRule]; got != aaRuleMarker() {
 		t.Fatalf("comment = %q; want the record cleared", got)
 	}
 }

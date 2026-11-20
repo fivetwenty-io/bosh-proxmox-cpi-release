@@ -81,7 +81,7 @@ func watchAARule(t *testing.T, stub *aaClusterStub, order string) {
 			prev = nil
 			return
 		}
-		if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker() {
+		if got := stub.ruleComments[aaRule]; got != aaRuleMarker() {
 			t.Errorf("%s: rule written with comment %q; want the marker", order, got)
 		}
 		cur := strings.Split(stub.rules[aaRule], ",")

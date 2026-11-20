@@ -78,11 +78,12 @@ func TestCollectAntiAffinityLayoutFullRuleAndDrift(t *testing.T) {
 }
 
 // TestCollectAntiAffinityLayoutInPlanReadsClean pins that a group whose rules
-// hold the plan gets no layout finding.
+// hold the plan gets no layout finding. Its members record their pattern, as
+// every member this release creates does, so the rules need no record of it.
 func TestCollectAntiAffinityLayoutInPlanReadsClean(t *testing.T) {
 	t.Parallel()
 	g := newAALayoutGroup()
-	f := aaLayoutFake(g, "", 2)
+	f := aaLayoutFake(g, "block", 2)
 	f.rules = g.rulesOf([]string{"vm:200", "vm:201"})
 	wantNone(t, runCollect(t, f, haCfg("auto", "none")), haKindAARuleFull, haKindAALayoutDrift,
 		haKindAAPatternTrimmed, haKindAAPatternBlocksDrain, haKindAntiAffinityShort)

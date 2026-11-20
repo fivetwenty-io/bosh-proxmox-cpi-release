@@ -488,7 +488,7 @@ For example, six members on a domain of three nodes under `stride: 2` give the r
 ha_anti_affinity: [{stride: 2}, {sets: [[0, 1]]}]
 ```
 
-A cluster that serves one AZ sees only the indexes that BOSH put in its AZ, so a pattern can do less there than it does on one big cluster. When a cluster sees only the even indexes, `window: 2` keeps nothing apart there, because no two consecutive indexes meet. We set the pattern with the `ha_anti_affinity` cloud property or with `pve.ha.anti_affinity_pattern`, as [Configuration](configuration.md#anti-affinity-pattern) explains. The group's pattern is the one its newest member recorded, judged by `born=`, or the job default when no member recorded one. `pve-ops ha` prints each group's layout, so we can check the effect before we rely on it.
+A cluster that serves one AZ sees only the indexes that BOSH put in its AZ, so a pattern can do less there than it does on one big cluster. When a cluster sees only the even indexes, `window: 2` keeps nothing apart there, because no two consecutive indexes meet. We set the pattern with the `ha_anti_affinity` cloud property or with `pve.ha.anti_affinity_pattern`, as [Configuration](configuration.md#anti-affinity-pattern) explains. The group's pattern is the one its newest member recorded, judged by `born=`. A create that names no pattern records the job default. A group whose members an older CPI created records no pattern on them, so its first plan records the pattern it uses as `aa=<pattern>` in the comments of the group's rules, and later plans read it there. Only a group that records no pattern anywhere follows the job default. `pve-ops ha` prints each group's layout, so we can check the effect before we rely on it.
 
 ## Sizing a small cluster
 

@@ -20,8 +20,8 @@ func TestResolveAntiAffinityPattern_ReadsEveryLayer(t *testing.T) {
 		cp   string
 		want string
 	}{
-		{"unset", `{}`, ""},
-		{"null", `{"ha_anti_affinity": null}`, ""},
+		{"unset", `{}`, "block"},
+		{"null", `{"ha_anti_affinity": null}`, "block"},
 		{"call", `{"ha_anti_affinity": {"window": 3}}`, "window:3"},
 		{"list", `{"ha_anti_affinity": [{"stride": 2}, {"block": {}, "drain_safe": false}]}`,
 			"stride:2+block!unsafe"},
@@ -40,6 +40,28 @@ func TestResolveAntiAffinityPattern_ReadsEveryLayer(t *testing.T) {
 				t.Fatalf("resolveAntiAffinityPattern(%s) = %q, %v; want %q", tc.cp, got, err, tc.want)
 			}
 		})
+	}
+}
+
+// The pattern a create records is the effective one, so a group that relies
+// on pve.ha.anti_affinity_pattern records that default, and a later plan
+// under another default keeps it.
+func TestResolveAntiAffinityPattern_RecordsTheConfigDefault(t *testing.T) {
+	t.Parallel()
+	var hp config.HAPattern
+	if err := json.Unmarshal([]byte(`{"window": 3}`), &hp); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.CPIConfig{HA: &config.HAConfig{AntiAffinityPattern: &hp}}
+	for cp, want := range map[string]string{`{}`: "window:3", `{"ha_anti_affinity": {"stride": 2}}`: "stride:2"} {
+		var props map[string]any
+		if err := json.Unmarshal([]byte(cp), &props); err != nil {
+			t.Fatal(err)
+		}
+		got, err := resolveAntiAffinityPattern(props, cfg)
+		if err != nil || got != want {
+			t.Errorf("resolveAntiAffinityPattern(%s) = %q, %v; want %q", cp, got, err, want)
+		}
 	}
 }
 

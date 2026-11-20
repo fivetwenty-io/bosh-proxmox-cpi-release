@@ -185,7 +185,7 @@ func TestEnsureAntiAffinityWritesHashedRuleWithMarkers(t *testing.T) {
 	if _, bare := stub.rules["bosh-aa-web"]; bare {
 		t.Error("the bare group name must no longer be a rule name")
 	}
-	if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker() {
+	if got := stub.ruleComments[aaRule]; got != aaRuleMarker() {
 		t.Errorf("rule comment = %q; want the ownership marker", got)
 	}
 	if _, wrote := stub.resComments["vm:101"]; wrote {
@@ -348,7 +348,7 @@ func TestRemoveAntiAffinityOnlyTouchesOwnAndUnmarkedRules(t *testing.T) {
 	}
 	// The own rule keeps its marker, and the same write records vm:101 as
 	// leaving, because its HA resource is purged only after this removal.
-	if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker()+" left=101" {
+	if got := stub.ruleComments[aaRule]; got != aaRuleMarker()+" left=101" {
 		t.Errorf("own rule lost its marker or the leaving record: %q", got)
 	}
 	if got := stub.rules[foreign.ruleName()]; got != "vm:101,vm:300" {

@@ -14,9 +14,13 @@ const haAntiAffinityCloudProp = "ha_anti_affinity"
 
 // resolveAntiAffinityPattern reads the ha_anti_affinity cloud property from
 // the call's cloud_properties, then the disk_type profile, then the vm_type
-// profile, and returns the pattern's canonical form, or "" when no layer sets
-// it. A value that is not a valid pattern fails the create before any VM
-// exists, because it is a manifest error that no retry fixes.
+// profile, and returns the effective pattern's canonical form. When no layer
+// sets it, the effective pattern is pve.ha.anti_affinity_pattern, or the
+// built-in block pattern when that is unset too, so every member records the
+// pattern its group was planned with and a later change of the job default
+// does not change the layout of a group that already exists. A value that is
+// not a valid pattern fails the create before any VM exists, because it is a
+// manifest error that no retry fixes.
 func resolveAntiAffinityPattern(cloudProps map[string]any, cfg *config.CPIConfig) (string, error) {
 	r, err := newLayeredResolver(cloudProps, cfg)
 	if err != nil {
@@ -24,7 +28,7 @@ func resolveAntiAffinityPattern(cloudProps map[string]any, cfg *config.CPIConfig
 	}
 	v, ok := r.Raw(haAntiAffinityCloudProp)
 	if !ok {
-		return "", nil
+		return cfg.HAAntiAffinityPatternValue().Canonical(), nil
 	}
 	raw, err := json.Marshal(v)
 	if err != nil {

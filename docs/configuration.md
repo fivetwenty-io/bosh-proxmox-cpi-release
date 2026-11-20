@@ -680,7 +680,7 @@ vm_types:
     ha_anti_affinity: [{stride: 2}, {sets: [[0, 1]]}]
 ```
 
-A group has one pattern, and it is the one that the group's newest member recorded in the comment of its HA resource, or the job default when no member recorded one. [HA and Resurrection](ha-and-resurrection.md#anti-affinity-patterns) explains the kinds, drain safety, and the rule names.
+A group has one pattern, and it is the one that the group's newest member recorded in the comment of its HA resource. A create that names no pattern records the job default, so changing the default later does not move the members of a group that already exists. A group whose members an older CPI created records no pattern on them, so the CPI records the pattern it first plans the group with in the comments of the group's rules and keeps using that one. The job default applies only to a group that records no pattern anywhere. [HA and Resurrection](ha-and-resurrection.md#anti-affinity-patterns) explains the kinds, drain safety, and the rule names.
 
 ## Stemcell Management
 

@@ -87,7 +87,7 @@ func TestRemoveAntiAffinity_PlansTheGroupAgainByIndex(t *testing.T) {
 			if n := stub.createRuleCalls + stub.updateRuleCalls + stub.deleteRuleCalls - before; n != 1 {
 				t.Fatalf("the recreate wrote %d rules; want 1", n)
 			}
-			if got := stub.ruleComments[aaRule]; got != aaIdent("web").marker() {
+			if got := stub.ruleComments[aaRule]; got != aaRuleMarker() {
 				t.Fatalf("comment = %q; want the plain marker once the HA resource is purged", got)
 			}
 		})

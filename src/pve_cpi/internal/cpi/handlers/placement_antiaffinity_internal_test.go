@@ -101,7 +101,14 @@ func newAAStub() *aaClusterStub {
 
 // seedRule stores a rule owned by the test Director, the way the CPI writes it.
 func (s *aaClusterStub) seedRule(name, csv string) {
-	s.seedRuleWithComment(name, csv, aaIdent("web").marker())
+	s.seedRuleWithComment(name, csv, aaRuleMarker())
+}
+
+// aaRuleMarker is the comment the CPI writes on a rule of the test group. The
+// stub's members record no pattern on their HA resources, so the rule records
+// the pattern the group is planned with, the default block.
+func aaRuleMarker() string {
+	return withPatternStamp(aaIdent("web").marker(), "block")
 }
 
 // seedRuleWithComment stores a rule with an exact comment, such as an old
