@@ -873,7 +873,7 @@ def _run_deploy_with_watchdog(deploy_cmd: list[str], stall_s: int, recover_cb=No
         deploy_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1,
     )
-    state = {"last": time.monotonic(), "task_id": None, "cancelled": False}
+    state = {"last": time.monotonic(), "task_id": None, "canceled": False}
     task_re = re.compile(r"Task (\d+)")
     # The director prints this verbatim when an agent RPC times out (the wedge
     # signature). Capturing the instance lets recover_cb hard-reset exactly that
@@ -905,9 +905,9 @@ def _run_deploy_with_watchdog(deploy_cmd: list[str], stall_s: int, recover_cb=No
 
     while proc.poll() is None:
         time.sleep(5)
-        if state["cancelled"] or time.monotonic() - state["last"] <= stall_s:
+        if state["canceled"] or time.monotonic() - state["last"] <= stall_s:
             continue
-        state["cancelled"] = True
+        state["canceled"] = True
         tid = state["task_id"]
         print(
             f"\n>>> deploy stalled: no progress for {stall_s}s; "
@@ -926,7 +926,7 @@ def _run_deploy_with_watchdog(deploy_cmd: list[str], stall_s: int, recover_cb=No
     rc = proc.wait()
     # A stall-cancel can still let bosh exit 0 in a race; force non-zero so the
     # caller treats it as a failed attempt and retries.
-    if state["cancelled"] and rc == 0:
+    if state["canceled"] and rc == 0:
         return 1
     return rc
 
@@ -1009,7 +1009,7 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
     # surfaces after the cap.
     max_attempts = max(1, int(os.environ.get("SCRIPTS_CF_DEPLOY_ATTEMPTS", "8") or "8"))
     # Watchdog stall threshold: if the deploy emits no progress for this long the
-    # task is cancelled so a wedged pre-stop/drain poll cannot hang forever
+    # task is canceled so a wedged pre-stop/drain poll cannot hang forever
     # holding the lock. 0 disables the watchdog (plain blocking run).
     stall_s = int(os.environ.get("SCRIPTS_CF_DEPLOY_STALL_S", "900") or "900")
     # Concurrent recovery: hard-reset any VM whose agent black-holes mid-deploy

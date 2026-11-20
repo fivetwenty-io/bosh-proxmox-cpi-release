@@ -36,6 +36,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Changed
 
+- The endpoint pool's cold start debug line now spells its `reason` value `canceled` when the request's context ends, where it used to say `cancelled`. If a log filter matches the old spelling, we update it to the new one.
+
 - An empty `pve.ha.anti_affinity_pattern`, written as `[]` or `{}`, now counts as unset. The render omits it, the job falls back to the built-in `block` pattern, and a cpi-config entry falls back to the job's pattern. Before, the render failed, so an ops file that cleared the key broke the deploy.
 
 - With `pve.cluster_lock` at `pool`, `set_vm_metadata` no longer takes the HA rules lock for a VM that its anti-affinity group's rules already hold where the plan puts it. The call plans the group from a read made without the lock and returns when that plan would write nothing. Before, every metadata call for a group member waited on the cluster-wide lock, so a parallel deploy of fifty instances ran their metadata calls one at a time.

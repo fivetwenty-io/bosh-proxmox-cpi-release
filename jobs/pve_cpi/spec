@@ -1082,7 +1082,7 @@ properties:
       operating system gives up. One case is a pool of more than one endpoint
       at construction, whether from pve.endpoints or from endpoints discovered
       for the cluster, and not counting cold-start candidates. The other is a
-      pool of one endpoint while discovery is effectively on. When set, the TCP dial is cancelled if it has not
+      pool of one endpoint while discovery is effectively on. When set, the TCP dial is canceled if it has not
       completed within this many seconds. Useful on high-latency or flaky
       networks to surface connection failures faster. Must be >= 0.
     default: 0
@@ -1096,7 +1096,7 @@ properties:
       from endpoints discovered for the cluster, and not counting cold-start
       candidates. The other is a pool of one endpoint while discovery is
       effectively on. When set, the handshake is
-      cancelled if it has not completed within this many seconds. Must be >= 0.
+      canceled if it has not completed within this many seconds. Must be >= 0.
     default: 0
   pve.api_max_idle_conns_per_host:
     description: |
