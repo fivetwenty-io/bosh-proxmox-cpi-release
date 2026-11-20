@@ -43,10 +43,10 @@ func commentTokenKey(token string) string {
 // record.
 func stageOwnsToken(token string) bool {
 	key := commentTokenKey(token)
-	switch {
-	case key == DLBRecordKey:
+	switch key {
+	case DLBRecordKey:
 		return true
-	case key == DeadNodeSourceKey+"=":
+	case DeadNodeSourceKey + "=":
 		return false
 	}
 	return !strings.HasPrefix(key, commentTokenPrefix)
