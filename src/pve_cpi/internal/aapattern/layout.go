@@ -2,6 +2,7 @@ package aapattern
 
 import (
 	"cmp"
+	"maps"
 	"math"
 	"slices"
 )
@@ -140,8 +141,43 @@ type layout struct {
 	out     *Output
 }
 
-// Layout plans the rules of one group.
+// settleRounds bounds the plans Layout makes to reach a plan that planning
+// again leaves as it is.
+const settleRounds = 8
+
+// Layout plans the rules of one group. It plans again from the rules each
+// plan asks for until the plan stops changing, so the plan it returns is one
+// that the next plan of the same group keeps. A single plan can stop short of
+// that, for example when a member's move in one domain frees a rule number
+// another domain then takes, and every extra plan the rule writer made to get
+// there would cost a write that can migrate a member. The members a plan
+// displaced stay reported, because a later round no longer sees their place.
 func Layout(in Input) Output {
+	out := layoutOnce(in)
+	displaced := slices.Clone(out.Displaced)
+	for range settleRounds - 1 {
+		next := in
+		next.Rules = out.Rules
+		again := layoutOnce(next)
+		if sameRules(again.Rules, out.Rules) {
+			break
+		}
+		displaced = append(displaced, again.Displaced...)
+		out = again
+	}
+	out.Displaced = displaced
+	out.finish()
+	return out
+}
+
+// sameRules reports whether a and b name the same rules with the same
+// members, each list in sorted order.
+func sameRules(a, b map[string][]string) bool {
+	return maps.EqualFunc(a, b, slices.Equal[[]string])
+}
+
+// layoutOnce makes one plan of the group's rules from in.
+func layoutOnce(in Input) Output {
 	l := &layout{
 		in:      in,
 		p:       in.Pattern.OrDefault(),
@@ -160,7 +196,7 @@ func Layout(in Input) Output {
 		all = append(all, l.planDomain(dk)...)
 	}
 	l.capRules(all)
-	l.finish()
+	l.out.finish()
 	return *l.out
 }
 
@@ -1058,31 +1094,31 @@ func (l *layout) capRules(all []candRule) {
 }
 
 // finish sorts and dedupes the diagnostics.
-func (l *layout) finish() {
-	for _, list := range []*[]string{&l.out.Trimmed, &l.out.Capped, &l.out.Overflow, &l.out.Alone,
-		&l.out.Displaced, &l.out.Unindexed, &l.out.LowFree, &l.out.AddedFirst, &l.out.Small} {
+func (o *Output) finish() {
+	for _, list := range []*[]string{&o.Trimmed, &o.Capped, &o.Overflow, &o.Alone,
+		&o.Displaced, &o.Unindexed, &o.LowFree, &o.AddedFirst, &o.Small} {
 		slices.Sort(*list)
 		*list = slices.Compact(*list)
 	}
 	placed := map[string]bool{}
-	for _, keys := range l.out.Rules {
+	for _, keys := range o.Rules {
 		for _, k := range keys {
 			placed[k] = true
 		}
 	}
 	// A member some rule holds was not left out, whatever another term said.
-	for _, list := range []*[]string{&l.out.Overflow, &l.out.Displaced, &l.out.Unindexed} {
+	for _, list := range []*[]string{&o.Overflow, &o.Displaced, &o.Unindexed} {
 		*list = slices.DeleteFunc(*list, func(k string) bool { return placed[k] })
 	}
-	for k, rules := range l.out.Refused {
+	for k, rules := range o.Refused {
 		if placed[k] {
-			delete(l.out.Refused, k)
+			delete(o.Refused, k)
 			continue
 		}
 		slices.Sort(rules)
-		l.out.Refused[k] = slices.Compact(rules)
+		o.Refused[k] = slices.Compact(rules)
 	}
-	l.out.Overflow = slices.DeleteFunc(l.out.Overflow, func(k string) bool { return l.out.Refused[k] != nil })
+	o.Overflow = slices.DeleteFunc(o.Overflow, func(k string) bool { return o.Refused[k] != nil })
 }
 
 // canJoin asks the caller whether key may join the rule.

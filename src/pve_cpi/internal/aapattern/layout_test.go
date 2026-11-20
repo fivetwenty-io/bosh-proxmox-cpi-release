@@ -3,6 +3,7 @@ package aapattern
 import (
 	"fmt"
 	"maps"
+	"math/rand"
 	"slices"
 	"strings"
 	"testing"
@@ -486,5 +487,61 @@ func TestLayout_SkipPlacesAnUnindexedMemberOfALaterRuleAtOnce(t *testing.T) {
 	in.Rules = first.Rules
 	if second := Layout(in); render(second.Rules) != render(first.Rules) {
 		t.Fatalf("second plan %s differs from first %s", render(second.Rules), render(first.Rules))
+	}
+}
+
+// TestLayout_PlanOfItsOwnPlanIsTheSame checks over random groups that a plan
+// is a fixed point: planning again from the rules a plan asks for asks for the
+// same rules. The groups span one or two domains, carry duplicate and unknown
+// indexes, and start from random rules, as a group from an older release or
+// one mid-deploy does. A plan that is not a fixed point makes the rule writer
+// spend extra writes, and each one can migrate a member.
+func TestLayout_PlanOfItsOwnPlanIsTheSame(t *testing.T) {
+	t.Parallel()
+	patterns := []string{"block", "block:2", "stride:2", "stride:3", "window:2", "window:3", "sets:0.1.2/0.1.3",
+		"stride:2+sets:0.1", "window:3+stride:2", "block+window:2", "window:3!unsafe"}
+	r := rand.New(rand.NewSource(1))
+	for iter := range 4000 {
+		pattern := patterns[r.Intn(len(patterns))]
+		doms := oneDomain(2 + r.Intn(6))
+		multi := r.Intn(3) == 0
+		if multi {
+			doms = map[string]Domain{"az1": {Ord: 1, Nodes: 2 + r.Intn(6)}, "az2": {Ord: 2, Nodes: 3 + r.Intn(3)}}
+		}
+		count := 1 + r.Intn(10)
+		ms := make([]Member, 0, count)
+		for i := range count {
+			idx := r.Intn(12)
+			if r.Intn(8) == 0 {
+				idx = -1
+			}
+			d := ""
+			if multi {
+				d = []string{"az1", "az2"}[r.Intn(2)]
+			}
+			ms = append(ms, Member{Key: key(i), Index: idx, Born: int64(r.Intn(3)), Domain: d, Joinable: true})
+		}
+		rules := map[string][]string{}
+		if r.Intn(2) == 0 {
+			for n := 1; n <= 3; n++ {
+				var keys []string
+				for _, m := range ms {
+					if r.Intn(3) == 0 {
+						keys = append(keys, m.Key)
+					}
+				}
+				if len(keys) > 0 {
+					rules[ChunkName(base, n)] = keys
+				}
+			}
+		}
+		in := Input{Base: base, Pattern: mustParse(t, pattern), Split: r.Intn(4) != 0, Domains: doms, Members: ms,
+			Rules: rules}
+		first := Layout(in)
+		in.Rules = first.Rules
+		if second := Layout(in); render(second.Rules) != render(first.Rules) {
+			t.Fatalf("case %d, %s split=%v domains=%v members=%+v rules=%v: second plan %s differs from first %s",
+				iter, pattern, in.Split, doms, ms, rules, render(second.Rules), render(first.Rules))
+		}
 	}
 }
