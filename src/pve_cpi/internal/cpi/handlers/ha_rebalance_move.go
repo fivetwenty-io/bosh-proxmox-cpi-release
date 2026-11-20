@@ -197,6 +197,9 @@ func (r *rebalanceRun) inputsChanged(plan *rebalanceVMPlan, cfg map[string]any,
 	if node, ok := ha.RebalancePending(res.Comment); ok {
 		return "the VM already carries a rebalance mark that names " + node
 	}
+	if ha.FailbackHeld(res.Comment, r.io.now()) {
+		return "the VM's HA resource now carries a fresh failback hold, so an attach or a narrowing is moving it"
+	}
 	if lock, _ := pve.ConfigString(cfg, "lock"); strings.TrimSpace(lock) != "" {
 		return "the VM now holds the PVE lock " + lock
 	}

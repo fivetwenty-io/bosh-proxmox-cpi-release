@@ -188,6 +188,13 @@ func TestRebalanceRun_AMoveThatCannotStartIsRefusedAndTheVMIsExcluded(t *testing
 				}
 			}
 		},
+		"fresh failback hold": func(f *fakeRebalanceIO) {
+			f.beforeReread = func(vmid int) {
+				if vmid == 101 {
+					f.vms[101].comment = ha.WithFailbackHold(f.vms[101].comment, f.clock)
+				}
+			}
+		},
 		"VM gone from its node": func(f *fakeRebalanceIO) {
 			f.beforeReread = func(vmid int) {
 				if vmid == 101 {

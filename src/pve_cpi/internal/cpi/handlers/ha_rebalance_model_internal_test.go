@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
@@ -43,6 +44,9 @@ func TestRebalanceModel_EachExclusionNamesItsKind(t *testing.T) {
 		}, harebalance.SkipReplicate, "token of the replicate policy"},
 		{"marked", func(f *fakeRebalanceIO, _ *rbVM) { rbMarked(f, 101, "pve02") },
 			harebalance.SkipRebalancePending, "moves it to pve02"},
+		{"failback hold", func(f *fakeRebalanceIO, v *rbVM) {
+			v.comment = ha.WithFailbackHold(v.comment, f.clock.Add(-time.Minute))
+		}, harebalance.SkipFailbackHeld, "fresh failback hold"},
 		{"narrowing", func(_ *fakeRebalanceIO, v *rbVM) {
 			v.comment += " bosh-narrow-from=started"
 			v.state = "ignored"
@@ -82,6 +86,15 @@ func TestRebalanceModel_EachExclusionNamesItsKind(t *testing.T) {
 				t.Fatalf("skip %q %q plan %v, want %q naming %q", v.Skip, v.SkipReason, plan, c.kind, c.reason)
 			}
 		})
+	}
+}
+
+func TestRebalanceModel_AnExpiredFailbackHoldLeavesTheVMACandidate(t *testing.T) {
+	f := newFakeRebalanceIO()
+	rbSkewed(f)
+	f.vms[101].comment = ha.WithFailbackHold(f.vms[101].comment, f.clock.Add(-time.Hour))
+	if v, plan := rbModelVM(t, rbRun(f, RebalanceOptions{}), 101); v.Skip != "" || plan == nil {
+		t.Fatalf("skip %q %q plan %v", v.Skip, v.SkipReason, plan)
 	}
 }
 

@@ -126,6 +126,10 @@ func (b *rebalanceModelBuilder) vm(f *rebalanceVMFacts) (harebalance.VM, *rebala
 		return skip(harebalance.SkipRebalancePending, "it carries the mark of an earlier rebalance that moves it "+
 			"to "+node+", which a run with --apply finishes first")
 	}
+	if ha.FailbackHeld(f.res.Comment, b.now) {
+		return skip(harebalance.SkipFailbackHeld, "its HA resource carries a fresh failback hold, so an attach "+
+			"or a narrowing is moving it")
+	}
 	if ha.NarrowPending(f.res.State, f.res.Comment) {
 		return skip(harebalance.SkipNarrowing, "the narrowing barrier holds its HA resource while a CPI call "+
 			"changes it")

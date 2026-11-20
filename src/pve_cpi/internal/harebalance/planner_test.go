@@ -108,7 +108,7 @@ func contains[T comparable](s []T, v T) bool {
 func TestBuild_SkippedVMsAreListedAndNeverMove(t *testing.T) {
 	r := newRig()
 	kinds := []SkipKind{SkipReplicate, SkipHold, SkipLocalDisk, SkipDLB, SkipNotStarted, SkipLocked,
-		SkipNarrowing, SkipPositiveAffinity, SkipFailbackPending}
+		SkipNarrowing, SkipPositiveAffinity, SkipFailbackPending, SkipFailbackHeld}
 	for i, k := range kinds {
 		v := r.inAZ(100+i, "n2", 5, "z1", "n1")
 		v.Skip, v.SkipReason = k, "because of "+string(k)
@@ -125,7 +125,7 @@ func TestBuild_SkippedVMsAreListedAndNeverMove(t *testing.T) {
 			t.Fatalf("skip %d is %+v", i, s)
 		}
 	}
-	if got := p.Before["n2"].Committed; math.Abs(got-0.45) > 1e-9 {
+	if got := p.Before["n2"].Committed; math.Abs(got-0.5) > 1e-9 {
 		t.Fatalf("the skipped VMs' memory must count in n2's load, got %v", got)
 	}
 }

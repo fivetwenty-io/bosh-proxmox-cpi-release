@@ -62,6 +62,9 @@ const (
 	// SkipFailbackPending is a VM with failback on that is off its
 	// highest-priority online node, which PVE HA returns on its own.
 	SkipFailbackPending SkipKind = "failback_pending"
+	// SkipFailbackHeld is a VM whose HA resource carries a fresh failback
+	// hold, because an attach or a narrowing is moving it.
+	SkipFailbackHeld SkipKind = "failback_held"
 	// SkipRebalancePending is a VM that carries a rebalance mark that the run
 	// could not finish.
 	SkipRebalancePending SkipKind = "rebalance_pending"
