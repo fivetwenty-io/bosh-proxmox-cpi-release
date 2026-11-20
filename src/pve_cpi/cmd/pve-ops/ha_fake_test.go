@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -76,6 +77,18 @@ type fakeHA struct {
 	// counts those reads.
 	clockErr   error
 	clockReads int
+
+	// runLockExpiry, runLockHeld, and runLockErr are what a read of the
+	// rebalance run lock returns, and runLockReads counts those reads.
+	runLockExpiry time.Time
+	runLockHeld   bool
+	runLockErr    error
+	runLockReads  int
+	// plan and planErr are what the rebalance dry run returns, and planOwners
+	// records the Director each dry run named.
+	plan       handlers.RebalanceReport
+	planErr    error
+	planOwners []string
 }
 
 var _ HAReader = (*fakeHA)(nil)
@@ -199,6 +212,16 @@ func (f *fakeHA) NextID(context.Context) (pve.VMIDBand, error) { return f.nextID
 
 func (f *fakeHA) Journal(context.Context, []string) (JournalView, error) {
 	return f.journal, f.journalErr
+}
+
+func (f *fakeHA) RebalanceRunLock(context.Context) (time.Time, bool, error) {
+	f.runLockReads++
+	return f.runLockExpiry, f.runLockHeld, f.runLockErr
+}
+
+func (f *fakeHA) RebalancePlan(_ context.Context, owner string) (handlers.RebalanceReport, error) {
+	f.planOwners = append(f.planOwners, owner)
+	return f.plan, f.planErr
 }
 
 // haCfg builds a valid CPI config with the given HA mode and local policy.

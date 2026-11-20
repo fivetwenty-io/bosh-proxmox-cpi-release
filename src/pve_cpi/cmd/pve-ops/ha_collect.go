@@ -225,6 +225,7 @@ func collectHAScoped(ctx context.Context, r HAReader, cfg *config.CPIConfig, own
 	c.ruleFindings()
 	c.softPinFindings()
 	c.failbackFindings()
+	c.rebalancePendingFindings()
 	c.antiAffinityFindings()
 	c.cpuFindings()
 	c.protectionFindings()
@@ -232,6 +233,7 @@ func collectHAScoped(ctx context.Context, r HAReader, cfg *config.CPIConfig, own
 	c.recoveryStrandedFindings()
 	c.replicationFindings()
 	c.headroomFindings()
+	c.spreadSkewedFindings()
 	c.leftoverFindings()
 	c.cacheDirectoryFindings()
 	return c.rep

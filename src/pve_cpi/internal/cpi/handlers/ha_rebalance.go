@@ -33,9 +33,9 @@ const (
 	RebalanceExitGate  = 3
 )
 
-// rebalanceRunLockName is the logical name of the run lock, whose sentinel
+// RebalanceRunLockName is the logical name of the run lock, whose sentinel
 // pool is bosh-lock-ha-rebalance.
-const rebalanceRunLockName = "ha-rebalance"
+const RebalanceRunLockName = "ha-rebalance"
 
 // rebalanceRunLockMargin is what the run lock's lease adds to the run's
 // longest time, because a sentinel pool has no renewal.

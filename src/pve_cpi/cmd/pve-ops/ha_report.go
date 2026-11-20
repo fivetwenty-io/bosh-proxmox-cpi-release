@@ -67,6 +67,8 @@ const (
 	haKindFailbackDrift         = "failback_drift"
 	haKindParkerResourceOrphan  = "parker_resource_orphan"
 	haKindParkerPinOrphan       = "parker_pin_orphan"
+	haKindRebalancePending      = "rebalance_pending"
+	haKindSpreadSkewed          = "spread_skewed"
 )
 
 // haFinding is one thing the doctor found.

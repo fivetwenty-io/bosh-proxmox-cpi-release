@@ -15,6 +15,7 @@ import (
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
@@ -100,6 +101,13 @@ type HAReader interface {
 	// Journal reads the replicated allocations from the allocation journal.
 	// nodes are the cluster's node names, which identify the cluster.
 	Journal(ctx context.Context, nodes []string) (JournalView, error)
+	// RebalanceRunLock reads the run lock of pve-ops ha rebalance. held says
+	// its sentinel pool exists, and expiry is the lease the pool's comment
+	// names, which is zero when the comment names none.
+	RebalanceRunLock(ctx context.Context) (expiry time.Time, held bool, err error)
+	// RebalancePlan plans a rebalance of owner's HA VMs as a dry run, which
+	// writes nothing.
+	RebalancePlan(ctx context.Context, owner string) (handlers.RebalanceReport, error)
 }
 
 // replicaReader is the read half of ha.ReplicationAPI. The doctor holds only
@@ -543,4 +551,27 @@ func (r *pveHAReader) Journal(ctx context.Context, nodes []string) (JournalView,
 		}
 	}
 	return view, nil
+}
+
+// RebalanceRunLock reads the sentinel pool of the rebalance run lock.
+func (r *pveHAReader) RebalanceRunLock(ctx context.Context) (expiry time.Time, held bool, err error) {
+	if r.client == nil || r.client.Pools() == nil {
+		return time.Time{}, false, errors.New("pve-ops: no pools service available")
+	}
+	comment, found, err := r.client.Pools().GetPoolComment(ctx, haRebalanceLockPool)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("read the lock pool %s: %w", haRebalanceLockPool, err)
+	}
+	if !found {
+		return time.Time{}, false, nil
+	}
+	expiry, _ = pve.ClusterLockExpiry(comment)
+	return expiry, true, nil
+}
+
+// RebalancePlan plans a rebalance of owner's HA VMs as a dry run, which reads
+// the cluster, takes no lock, and writes nothing.
+func (r *pveHAReader) RebalancePlan(ctx context.Context, owner string) (handlers.RebalanceReport, error) {
+	return handlers.RebalanceHA(ctx, handlers.Deps{Config: r.cfg, PVE: r.client, Logger: r.logger,
+		RequestDirectorUUID: owner}, handlers.RebalanceOptions{MaxMoves: haRebalancePlanMoves})
 }

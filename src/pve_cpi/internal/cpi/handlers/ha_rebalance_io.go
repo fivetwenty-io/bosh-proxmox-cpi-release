@@ -98,7 +98,7 @@ func (p *pveRebalanceIO) sleep(ctx context.Context, d time.Duration) error {
 
 func (p *pveRebalanceIO) runLock(ctx context.Context, ttl time.Duration) (func(), error) {
 	owner := "ha-rebalance/" + p.deps.RequestDirectorUUID
-	h, err := pve.AcquireClusterLock(ctx, p.deps.PVE.Pools(), rebalanceRunLockName, owner, ttl,
+	h, err := pve.AcquireClusterLock(ctx, p.deps.PVE.Pools(), RebalanceRunLockName, owner, ttl,
 		rebalanceRunLockWait, pve.WithoutWait())
 	if err != nil {
 		return nil, err
@@ -272,7 +272,7 @@ func (p *pveRebalanceIO) activity(ctx context.Context) (rebalanceActivity, error
 	}
 	var act rebalanceActivity
 	now := p.now()
-	runPool := "bosh-lock-" + rebalanceRunLockName
+	runPool := pve.ClusterLockPoolName(RebalanceRunLockName)
 	var nodes []string
 	for i := range rows {
 		row := &rows[i]
