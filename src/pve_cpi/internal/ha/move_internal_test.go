@@ -280,3 +280,58 @@ func TestMoveIntoSetReportsComigratedResourcesAndWaitsForTheMove(t *testing.T) {
 		t.Fatalf("comigrated %v", got)
 	}
 }
+
+func TestMoveIntoSetWaitsOutARequestPVENeverAnswered(t *testing.T) {
+	states := []*pve.HAServiceState{
+		managedOn("started", "b", 100, 90),
+		managedOn("started", "b", 100, 90),
+		managedOn("started", "b", 200, 190),
+		managedOn("migrate", "b", 210, 205),
+		managedOn("started", "a", 220, 215),
+	}
+	cases := map[string]struct {
+		err      error
+		await    bool
+		failure  MoveFailure
+		reachesA bool
+	}{
+		"lost on the wire, awaited":        {errors.New("read: connection reset by peer"), true, 0, true},
+		"gateway timeout, awaited":         {&sdkerrors.APIError{HTTPCode: 504, Message: "gateway"}, true, 0, true},
+		"lost on the wire, not awaited":    {errors.New("read: connection reset by peer"), false, MoveRefused, false},
+		"answered with a refusal, awaited": {&sdkerrors.APIError{HTTPCode: 500, Message: "no"}, true, MoveRefused, false},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := &moveRig{settleOn: []string{"b", "a"}, migrateErr: c.err, states: slices.Clone(states)}
+			in := moveInput()
+			in.AwaitUnanswered = c.await
+			loc, err := MoveIntoSet(context.Background(), r.deps(), in)
+			if c.reachesA {
+				if err != nil || loc.Node != "a" {
+					t.Fatalf("loc %+v err %v", loc, err)
+				}
+				return
+			}
+			if me := moveFailure(t, err); me.Failure != c.failure || r.reads != 2 {
+				t.Fatalf("failure %+v reads %d", me, r.reads)
+			}
+		})
+	}
+}
+
+func TestMoveIntoSetCallsARequestCutOffByTheContextIncomplete(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &moveRig{settleOn: []string{"b", "a"}, migrateErr: context.Canceled, states: []*pve.HAServiceState{
+		managedOn("started", "b", 100, 90),
+	}}
+	in := moveInput()
+	in.AwaitUnanswered = true
+	in.BeforeMigrate = func(context.Context) error {
+		cancel()
+		return nil
+	}
+	_, err := MoveIntoSet(ctx, r.deps(), in)
+	if me := moveFailure(t, err); me.Failure != MoveIncomplete {
+		t.Fatalf("failure %+v", me)
+	}
+}

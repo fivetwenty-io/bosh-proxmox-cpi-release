@@ -503,7 +503,7 @@ func (p *pveRebalanceIO) migrate(ctx context.Context, vmid int, from, to string,
 	deps := ha.NarrowDepsFor(p.deps.PVE, p.logger, haMotionWait(p.deps))
 	var partners []string
 	loc, err := ha.MoveIntoSet(ctx, deps, ha.MoveInput{VMID: vmid, Node: from, Set: []string{to},
-		Targets: []string{to}, Budget: p.opts.SettleTimeout, BeforeMigrate: before,
+		Targets: []string{to}, Budget: p.opts.SettleTimeout, BeforeMigrate: before, AwaitUnanswered: true,
 		OnComigrated: func(sids []string) { partners = append(partners, sids...) }})
 	return loc, partners, err
 }

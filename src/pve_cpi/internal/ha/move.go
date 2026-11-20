@@ -85,6 +85,13 @@ type MoveInput struct {
 	// names as comigrated. PVE queues the request before it reports them, so
 	// they move with the VM, and the move goes on.
 	OnComigrated func(sids []string)
+	// AwaitUnanswered, when set, treats a migrate request that PVE never
+	// answered, such as one lost on the wire or cut off by a gateway, as one
+	// PVE may have queued. The move then waits as it would after an answer,
+	// and a CRM that drops the request ends it with MoveIncomplete instead of
+	// MoveRefused. A request cut off by the end of ctx returns
+	// MoveIncomplete.
+	AwaitUnanswered bool
 }
 
 // MoveIntoSet asks PVE HA to migrate an HA-managed VM to a node of in.Set and
@@ -101,7 +108,8 @@ type MoveInput struct {
 //     stopped, the only states the CRM migrates, run in.BeforeMigrate, and
 //     send the request to the first target the VM is not on. A refusal, or a response that names
 //     resources blocking the move, returns MoveRefused. A response that names comigrated resources
-//     goes to in.OnComigrated, and the move goes on, because PVE has queued it already.
+//     goes to in.OnComigrated, and the move goes on, because PVE has queued it already. With
+//     in.AwaitUnanswered, a request PVE never answered goes on to the wait as well.
 //  4. Wait for the move. A VM that settles inside the set ends the wait. The
 //     CRM reads its commands at the start of a round, so the first round
 //     stamped after the request may still predate it, and only a second round
@@ -173,6 +181,17 @@ func MoveIntoSet(ctx context.Context, deps NarrowDeps, in MoveInput) (pve.VMLoca
 		Node: target,
 	})
 	if err != nil {
+		if _, answered := pve.AnsweredStatus(err); !answered && in.AwaitUnanswered {
+			if ctx.Err() != nil {
+				return loc, &MoveError{Failure: MoveIncomplete, Reason: fmt.Sprintf("the migrate request of %s "+
+					"to node %s ended before PVE answered, so PVE may have queued it", sid, target),
+					Err: pve.WrapError(err)}
+			}
+			deps.Logger.Warn("ha move: PVE never answered the migrate request, so the move waits in case PVE "+
+				"queued it", log.Int("vmid", in.VMID), log.String("sid", sid), log.String("to", target),
+				log.Err(err))
+			return awaitMove(ctx, deps, in, set, loc.Node, target)
+		}
 		return loc, &MoveError{Failure: MoveRefused, Reason: fmt.Sprintf("PVE refused to migrate %s to node %s",
 			sid, target), Err: pve.WrapError(err)}
 	}
