@@ -2842,18 +2842,18 @@ If we renewed the node's certificate, we delete the cache file as above. If we d
 
 ```text
 endpoint cache: background worker panicked
-endpoint cache: cancelled background work still running at exit
+endpoint cache: canceled background work still running at exit
 ```
 
-The first line is at Error and carries `worker`, `panic`, and `stack` fields. The second carries `workers`, `started`, and `waited`, and it is at Warn only when a cancelled worker served a config with an explicit `on`, and otherwise at Debug.
+The first line is at Error and carries `worker`, `panic`, and `stack` fields. The second carries `workers`, `started`, and `waited`, and it is at Warn only when a canceled worker served a config with an explicit `on`, and otherwise at Debug.
 
 **Diagnosis**
 
-The CPI waits up to 3 seconds at exit for the discovery refresh and the cache writes to finish. A panic is a defect, and the worker's stack is in the line. A cancelled worker means a write was still running when the wait ended, so that result may not have been saved. The call was not affected, and the next call discovers again.
+The CPI waits up to 3 seconds at exit for the discovery refresh and the cache writes to finish. A panic is a defect, and the worker's stack is in the line. A canceled worker means a write was still running when the wait ended, so that result may not have been saved. The call was not affected, and the next call discovers again.
 
 **Fix**
 
-For a panic we keep the log and report it as a bug. For a cancelled worker we do nothing unless it recurs, which suggests a slow disk or a slow cluster.
+For a panic we keep the log and report it as a bug. For a canceled worker we do nothing unless it recurs, which suggests a slow disk or a slow cluster.
 
 ## Cluster not quorate
 
@@ -3208,7 +3208,7 @@ For a tag, we remove it from the node and run the undrain again. Nothing was lef
 **Symptom**
 
 ```text
-AwaitTask <upid>: context cancelled
+AwaitTask <upid>: context canceled
 ```
 
 or a PVE task that does not complete within the CPI's deadline.

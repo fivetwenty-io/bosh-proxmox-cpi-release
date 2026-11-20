@@ -277,7 +277,7 @@ A refresh is due in any of these cases.
 
 No refresh is due while the stored identity holds a conflict, whatever the other cases say.
 
-The refresh runs in the background, after the first request that one of your listed endpoints answers. The `info` method dials nothing, so it never starts one. Only one process at a time refreshes a given cache file, because the worker takes a non-blocking lock and skips the refresh when another process holds it. Before the process exits, the CPI waits up to three seconds for a running refresh, a down-mark write, or a cold-start hint write, and a worker that is still running at that point is cancelled. A signal ends the wait at once. The `pve-ops` commands that build a client drain the same way. Most calls pay nothing, because the wait ends as soon as the workers finish.
+The refresh runs in the background, after the first request that one of your listed endpoints answers. The `info` method dials nothing, so it never starts one. Only one process at a time refreshes a given cache file, because the worker takes a non-blocking lock and skips the refresh when another process holds it. Before the process exits, the CPI waits up to three seconds for a running refresh, a down-mark write, or a cold-start hint write, and a worker that is still running at that point is canceled. A signal ends the wait at once. The `pve-ops` commands that build a client drain the same way. Most calls pay nothing, because the wait ends as soon as the workers finish.
 
 ### What discovery reads
 
