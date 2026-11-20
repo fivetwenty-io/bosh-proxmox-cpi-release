@@ -43,7 +43,7 @@ func (c *maintenanceTargetCluster) ListStatus(context.Context) (*sdkcluster.List
 }
 
 func (c *maintenanceTargetCluster) ListHaStatusCurrent(context.Context) (*sdkcluster.ListHaStatusCurrentResponse, error) {
-	resp := sdkcluster.ListHaStatusCurrentResponse{}
+	resp := make(sdkcluster.ListHaStatusCurrentResponse, 0, len(c.lrmText))
 	for node, text := range c.lrmText {
 		raw, _ := json.Marshal(map[string]any{"type": "lrm", "node": node, "status": node + " (" + text + ")"})
 		resp = append(resp, raw)
@@ -51,7 +51,10 @@ func (c *maintenanceTargetCluster) ListHaStatusCurrent(context.Context) (*sdkclu
 	return &resp, nil
 }
 
-func createOnPinnedNode(t *testing.T, c *maintenanceTargetCluster, target string) (int32, error) {
+// pinnedNode is the node every test in this file pins.
+const pinnedNode = "pve2"
+
+func createOnPinnedNode(t *testing.T, c *maintenanceTargetCluster) (int32, error) {
 	t.Helper()
 	var created atomic.Int32
 	q := &vmMockQEMU{
@@ -65,7 +68,7 @@ func createOnPinnedNode(t *testing.T, c *maintenanceTargetCluster, target string
 	c.vmMockCluster = &vmMockCluster{listResourcesFn: emptyListResources}
 	deps.PVE.(*mockPVEClient).clusterSvc = c
 	deps.Config.EnsureNoIPConflicts = placementDisabled
-	args := mkArgs("agent-maintenance-target", testStemcellCID, map[string]any{"target_node": target},
+	args := mkArgs("agent-maintenance-target", testStemcellCID, map[string]any{"target_node": pinnedNode},
 		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
 		[]string{}, map[string]any{})
 	_, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx("maintenance-target"))
@@ -94,14 +97,14 @@ func requireRetriableMaintenanceRefusal(t *testing.T, err error, created int32, 
 func TestCreateVM_RefusesATargetNodeInHAMaintenance(t *testing.T) {
 	t.Parallel()
 	c := &maintenanceTargetCluster{lrmText: map[string]string{"pve1": "active", "pve2": "maintenance"}}
-	created, err := createOnPinnedNode(t, c, "pve2")
+	created, err := createOnPinnedNode(t, c)
 	requireRetriableMaintenanceRefusal(t, err, created, "pve2")
 }
 
 func TestCreateVM_RefusesATargetNodeInTagMaintenance(t *testing.T) {
 	t.Parallel()
 	c := &maintenanceTargetCluster{tags: map[string]string{"pve2": "maintenance"}}
-	created, err := createOnPinnedNode(t, c, "pve2")
+	created, err := createOnPinnedNode(t, c)
 	requireRetriableMaintenanceRefusal(t, err, created, "pve2")
 }
 
@@ -111,7 +114,7 @@ func TestCreateVM_CreatesOnAHealthyTargetNode(t *testing.T) {
 		tags:    map[string]string{"pve1": "maintenance"},
 		lrmText: map[string]string{"pve1": "maintenance", "pve2": "active"},
 	}
-	created, err := createOnPinnedNode(t, c, "pve2")
+	created, err := createOnPinnedNode(t, c)
 	if err != nil {
 		t.Fatalf("a healthy target_node was refused: %v", err)
 	}
@@ -123,7 +126,7 @@ func TestCreateVM_CreatesOnAHealthyTargetNode(t *testing.T) {
 func TestCreateVM_RefusesATargetNodeWhenTheHealthReadFails(t *testing.T) {
 	t.Parallel()
 	c := &maintenanceTargetCluster{failAfter: 1}
-	created, err := createOnPinnedNode(t, c, "pve2")
+	created, err := createOnPinnedNode(t, c)
 	if err == nil {
 		t.Fatal("create_vm succeeded although the node health read failed")
 	}
