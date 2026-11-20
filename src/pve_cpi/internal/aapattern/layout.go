@@ -37,9 +37,14 @@ type Domain struct {
 	// Ord numbers the domain in pattern rule names: 0 for the whole
 	// cluster, and an AZ's position plus one otherwise.
 	Ord int
-	// Nodes is the domain's configured node count, N, or 0 when it is
-	// unknown, which turns off the cap and the drain-safety check.
+	// Nodes is the domain's configured node count, N. A count of 0 means
+	// unknown, which turns off the cap and the drain-safety check, unless
+	// NodesKnown is set.
 	Nodes int
+	// NodesKnown says Nodes was read from the cluster's node list, so a count
+	// of 0 means that none of the domain's nodes is in the cluster and the
+	// domain has room for no rule.
+	NodesKnown bool
 	// Placeable is how many of the domain's nodes can take a VM now. A member
 	// joins a rule only while the rule holds fewer members than this. It is
 	// read only when PlaceableKnown is set or it is above 0, so a zero value
@@ -332,7 +337,7 @@ func (l *layout) best(keys []string) *mstate {
 func (l *layout) planDomain(dk string) []candRule {
 	dom := l.domain(dk)
 	ms := l.domainMembers(dk)
-	if dom.Nodes > 0 && dom.Nodes < 3 && !l.p.Unsafe {
+	if dom.NodesKnown && dom.Nodes == 0 || dom.Nodes > 0 && dom.Nodes < 3 && !l.p.Unsafe {
 		l.out.Small = append(l.out.Small, dk)
 		return nil
 	}

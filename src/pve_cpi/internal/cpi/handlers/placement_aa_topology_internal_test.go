@@ -42,3 +42,26 @@ func TestAATopology_NoProfileLeavesPlaceableUnknown(t *testing.T) {
 		}
 	}
 }
+
+// An AZ whose nodes are all outside the cluster's node list has a known count
+// of 0, so the planner gives it no rule rather than an uncapped one.
+func TestAATopology_AZWithNoClusterNodeIsKnownEmpty(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{Placement: &config.PlacementConfig{
+		AZMap: map[string][]string{"az1": {"pve1", "pve2"}, "gone": {"old1", "old2"}},
+	}}
+	profile := &ha.Profile{HAVersionOK: true}
+	for _, n := range []string{"pve1", "pve2"} {
+		profile.Nodes = append(profile.Nodes, ha.NodeFacts{Name: n, Online: true, Version: "9.2.4"})
+	}
+	doms := newAATopology(cfg, profile).domains(map[string]bool{"": true, "az1": true, "gone": true})
+	if d := doms["gone"]; !d.NodesKnown || d.Nodes != 0 {
+		t.Fatalf("gone: nodes %d known %v; want 0 known", d.Nodes, d.NodesKnown)
+	}
+	if d := doms["az1"]; !d.NodesKnown || d.Nodes != 2 {
+		t.Fatalf("az1: nodes %d known %v; want 2 known", d.Nodes, d.NodesKnown)
+	}
+	if d := newAATopology(cfg, nil).domains(map[string]bool{"": true})[""]; d.NodesKnown {
+		t.Fatal("cluster domain: node count known without a profile")
+	}
+}

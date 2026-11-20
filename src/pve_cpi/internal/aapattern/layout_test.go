@@ -356,6 +356,41 @@ func TestLayout_NoPlaceableNodeHoldsEveryRule(t *testing.T) {
 	}
 }
 
+// A domain known to hold no configured node, such as an AZ whose nodes all
+// left the cluster, has no room for any rule, so the plan writes none there
+// and reports it, whatever the pattern says about drain safety. A domain
+// whose count is unknown keeps its uncapped plan.
+func TestLayout_DomainWithNoNodeGetsNoRule(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		pattern string
+		dom     Domain
+		want    string
+		small   bool
+	}{
+		"no node":              {"", Domain{Ord: 1, NodesKnown: true}, "", true},
+		"no node, not drained": {"block:3!unsafe", Domain{Ord: 1, NodesKnown: true}, "", true},
+		"unknown":              {"", Domain{Ord: 1}, "={0,1,2,3}", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var p Pattern
+			if tc.pattern != "" {
+				p = mustParse(t, tc.pattern)
+			}
+			out := Layout(Input{Base: base, Pattern: p, Split: true,
+				Domains: map[string]Domain{"az1": tc.dom}, Members: members("az1", seq(4)...),
+				Rules: map[string][]string{base: {key(0), key(1), key(2)}}})
+			if got := render(out.Rules); got != tc.want {
+				t.Fatalf("rules = %s; want %q", got, tc.want)
+			}
+			if got := slices.Contains(out.Small, "az1"); got != tc.small {
+				t.Fatalf("small = %v (%v); want %v", got, out.Small, tc.small)
+			}
+		})
+	}
+}
+
 func TestLayout_DomainsGetTheirOwnRules(t *testing.T) {
 	t.Parallel()
 	ms := append(members("az1", 0, 2, 4), members("az2", 1, 3, 5)...)

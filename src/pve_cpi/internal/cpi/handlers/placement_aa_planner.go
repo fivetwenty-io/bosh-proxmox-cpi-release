@@ -609,6 +609,11 @@ func (p *aaPlanner) logLayout(in aapattern.Input, out aapattern.Output) {
 			"of the highest indexes are left out", rule, log.Int("left_out", len(out.Capped)))
 	}
 	for _, dk := range out.Small {
+		if in.Domains[dk].Nodes == 0 && p.once("small "+dk) {
+			p.logger.Warn("anti-affinity: none of the domain's nodes is in the cluster, so the group gets no rule "+
+				"there; check placement.az_map against the cluster's nodes", rule, log.String("domain", aaDomainLabel(dk)))
+			continue
+		}
 		if p.once("small " + dk) {
 			p.logger.Warn("anti-affinity: the domain has too few nodes for a rule that leaves a node free for a "+
 				"rolling drain, so the group gets no rule there; the placement scorer still spreads it",
@@ -822,7 +827,8 @@ func (t aaTopology) domains(keys map[string]bool) map[string]aapattern.Domain {
 	for dk := range keys {
 		if dk == "" {
 			out[dk] = aapattern.Domain{
-				Key: dk, Nodes: len(t.configured), Placeable: t.clusterPlaceable, PlaceableKnown: t.placeableKnown,
+				Key: dk, Nodes: len(t.configured), NodesKnown: len(t.configured) > 0,
+				Placeable: t.clusterPlaceable, PlaceableKnown: t.placeableKnown,
 			}
 			continue
 		}
@@ -838,7 +844,8 @@ func (t aaTopology) domains(keys map[string]bool) map[string]aapattern.Domain {
 		}
 		sort.Strings(nodes)
 		out[dk] = aapattern.Domain{
-			Key: dk, Ord: i + 1, Nodes: len(nodes), Placeable: t.placeable(nodes), PlaceableKnown: t.placeableKnown,
+			Key: dk, Ord: i + 1, Nodes: len(nodes), NodesKnown: len(t.configured) > 0,
+			Placeable: t.placeable(nodes), PlaceableKnown: t.placeableKnown,
 		}
 	}
 	return out
