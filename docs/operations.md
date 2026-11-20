@@ -929,6 +929,12 @@ Stopping a resource through HA changes nothing in the CPI's metadata, so the VM 
 
 If a wedge has already started, for example a `pve-ha-manager` upgrade that is stuck in its restart of the resource manager, we do not kill anything on the node. We stop each blocking resource through HA with the first command above. The drain then finishes within seconds, the stuck restart or reboot goes on by itself, and `pve-ops ha` stops reporting the node. We start the VMs again with the second command once the node has left maintenance.
 
+### A create that pins a node in maintenance
+
+A `create_vm` call whose `cloud_properties.target_node` names a node in maintenance fails with a retriable error, and the CPI never places that VM on another node instead. The error names the node and says to retry once it leaves maintenance. The CPI judges the node the same way placement does, so a node counts when the HA view reports it in maintenance and when it carries one of the tags in `placement.maintenance_node_tags`. The check runs in every `pve.ha.mode`, including `off`. A node that is fenced or otherwise unable to take new work is refused with a retriable error as well, and its message names the reason.
+
+When the CPI cannot read the node health at all, it fails the create with a retriable error too, because it cannot rule maintenance out. Placement lets that read fail and carries on, since it has other nodes to choose from, but a pinned node has no alternative. During a rolling maintenance, the Director retries the call, and it goes through once the node is back. If we would rather have the VM land on any healthy node, we remove `target_node` and let placement choose.
+
 ### Where VMs go when a maintenance ends
 
 When a node leaves maintenance, PVE moves a VM back to it only when the VM's HA resource has `failback` on. The CPI turns the flag on for each VM whose volumes all sit on shared storage, so those VMs go back to their nodes by live migration as each maintenance ends, and a rolling maintenance across every node leaves the cluster about as balanced as it started. A `hold` VM, a `replicate` VM, and any other VM with a volume on node-local storage keep `failback` off. A `replicate` VM that a maintenance moved to its partner stays there, and its pin keeps both nodes, as [HA and Resurrection](ha-and-resurrection.md#the-replicate-data-loss-window) describes.

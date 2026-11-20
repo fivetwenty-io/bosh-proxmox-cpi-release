@@ -2385,7 +2385,9 @@ VM is produced on bad input. Every node-resolution path — including the static
 bypass the placement filter (`target_node`, local-disk pin, `config.node` fallback,
 placement disabled) — re-verifies the chosen node's device inventory before any clone, so a
 PCI VM is never created on a node lacking the device: device absent is a non-retriable
-error, an inventory API fault is retriable. Hardware ids reported in domain-less short form
+error, an inventory API fault is retriable. A `target_node` that is in maintenance is
+refused before any of this, with a retriable error, and the VM is never placed elsewhere.
+Hardware ids reported in domain-less short form
 (`01:00.0`) are normalized before comparison. The pin is removed unconditionally on create
 rollback and on `delete_vm` (sync and fast path) — removal is not gated by
 `pve.ha.pin_az`, and the PCI pin is written whenever `pve.ha.mode` is `auto` or `managed`.
