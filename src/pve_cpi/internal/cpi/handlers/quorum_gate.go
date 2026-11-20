@@ -122,3 +122,65 @@ func createOfflineTargetError(node string) error {
 	return cpierrors.Retriable("create_vm: target_node %q is offline; bring the node online or remove "+
 		"target_node so placement can pick another node", node)
 }
+
+// createMaintenanceTargetError is the retriable error create_vm returns when
+// the pinned target_node is in maintenance, for the reason node health gives.
+// A pinned node never gives way to another one, so the call waits for the node.
+func createMaintenanceTargetError(node, reason string) error {
+	return cpierrors.Retriable("create_vm: target_node %q is in maintenance (%s), so it cannot take a new VM; "+
+		"retry once the node leaves maintenance, or remove target_node so placement can pick another node",
+		node, reason)
+}
+
+// createUnplaceableTargetError is the retriable error create_vm returns when
+// the pinned target_node is not in maintenance but node health still says it
+// cannot take new work, for example because it is fenced.
+func createUnplaceableTargetError(node, reason string) error {
+	return cpierrors.Retriable("create_vm: target_node %q cannot take a new VM (%s); "+
+		"retry once the node can take new work, or remove target_node so placement can pick another node",
+		node, reason)
+}
+
+// createMaintenanceUnknownError is the retriable error create_vm returns when
+// the health of the pinned target_node cannot be read, so the call cannot tell
+// whether the node is in maintenance.
+func createMaintenanceUnknownError(node string, cause error) error {
+	return cpierrors.Retriable("create_vm: cannot tell whether target_node %q is in maintenance, because "+
+		"the node health read failed (%v); retry once the cluster answers", node, cause)
+}
+
+// refuseMaintenanceTarget fails a create whose pinned target_node is in
+// maintenance. It reads the node health the way placement does, so the HA
+// state and the operator's maintenance tags both count, in every HA mode, and
+// a node that health calls not placeable is refused for the reason health
+// gives. Placement lets a failed health read pass, since it has other nodes to
+// choose from. A pinned node has no alternative, so a failed read refuses the
+// create with a retriable error. A node the report does not mention, or a
+// client without a cluster service, passes.
+func refuseMaintenanceTarget(ctx context.Context, deps Deps, target string, logger *log.Logger) error {
+	if deps.PVE == nil || deps.PVE.Cluster() == nil || deps.Config == nil {
+		return nil
+	}
+	report, err := pve.NodeHealth(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), pve.NodeHealthOptions{
+		MaintenanceTags: deps.Config.MaintenanceNodeTagsValue(),
+	})
+	if err != nil {
+		logger.Warn("create_vm: node health unavailable, so target_node "+target+" cannot be checked for maintenance",
+			log.Err(err))
+		return createMaintenanceUnknownError(target, err)
+	}
+	entry, ok := report.Node(target)
+	if !ok || entry.Placeable {
+		return nil
+	}
+	reason := entry.Reason
+	if reason == "" {
+		reason = "the node health check does not call it placeable"
+	}
+	if !entry.Maintenance {
+		logger.Warn("create_vm: target_node " + target + " cannot take new work, so no VM can be created on it")
+		return createUnplaceableTargetError(target, reason)
+	}
+	logger.Warn("create_vm: target_node " + target + " is in maintenance, so no VM can be created on it")
+	return createMaintenanceTargetError(target, reason)
+}

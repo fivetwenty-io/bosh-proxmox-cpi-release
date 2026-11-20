@@ -701,6 +701,13 @@ func createVM(
 		logger.Warn("create_vm: target_node " + target + " is offline, so no VM can be created on it")
 		return nil, createOfflineTargetError(target)
 	}
+	// A pinned target_node in maintenance fails the create too. It never
+	// quietly places the VM elsewhere.
+	if target := strings.TrimSpace(parsed.cloudProps.TargetNode); target != "" {
+		if err := refuseMaintenanceTarget(ctx, deps, target, logger); err != nil {
+			return nil, err
+		}
+	}
 
 	// Placement may build the VM's shape once per candidate node, so the
 	// missing-owner warning is logged here, once for the whole call.
