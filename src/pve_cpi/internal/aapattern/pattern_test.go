@@ -176,3 +176,32 @@ func TestNaming_RoundTrips(t *testing.T) {
 		}
 	}
 }
+
+func TestPattern_CloneSharesNothing(t *testing.T) {
+	t.Parallel()
+	p, err := Parse("sets:0.1.2+stride:2!unsafe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := p.Clone()
+	c.Terms[0].Sets[0][0] = 9
+	c.Terms[1].K = 5
+	if p.Canonical() != "sets:0.1.2+stride:2!unsafe" {
+		t.Fatalf("the original changed to %s", p.Canonical())
+	}
+	if (Pattern{}).Clone().Terms != nil {
+		t.Fatal("a zero pattern must clone to a zero pattern")
+	}
+}
+
+func TestPattern_ZeroMarshalsAsTheDefault(t *testing.T) {
+	t.Parallel()
+	raw, err := json.Marshal(Pattern{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := DecodeJSON(raw)
+	if err != nil || p.Canonical() != "block" {
+		t.Fatalf("zero pattern marshals to %s, which decodes to %v, %v", raw, p.Canonical(), err)
+	}
+}

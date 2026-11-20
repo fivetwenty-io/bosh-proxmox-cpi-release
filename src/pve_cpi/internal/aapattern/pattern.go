@@ -102,6 +102,26 @@ func (p Pattern) OrDefault() Pattern {
 	return p
 }
 
+// Clone returns a deep copy of p, so a caller can hand it on without sharing
+// its terms or sets.
+func (p Pattern) Clone() Pattern {
+	out := Pattern{Unsafe: p.Unsafe}
+	if p.Terms == nil {
+		return out
+	}
+	out.Terms = make([]Term, len(p.Terms))
+	for i, t := range p.Terms {
+		out.Terms[i] = t
+		if t.Sets != nil {
+			out.Terms[i].Sets = make([][]int, len(t.Sets))
+			for j, set := range t.Sets {
+				out.Terms[i].Sets[j] = append([]int(nil), set...)
+			}
+		}
+	}
+	return out
+}
+
 // HasKind reports whether p has a term of kind k.
 func (p Pattern) HasKind(k Kind) bool {
 	for _, t := range p.Terms {
@@ -537,10 +557,10 @@ func (p Pattern) MarshalJSON() ([]byte, error) {
 		}
 		terms = append(terms, m)
 	}
+	if len(terms) == 0 {
+		terms = append(terms, map[string]any{"block": map[string]any{}})
+	}
 	if p.Unsafe {
-		if len(terms) == 0 {
-			terms = append(terms, map[string]any{"block": map[string]any{}})
-		}
 		terms[0]["drain_safe"] = false
 	}
 	if len(terms) == 1 {

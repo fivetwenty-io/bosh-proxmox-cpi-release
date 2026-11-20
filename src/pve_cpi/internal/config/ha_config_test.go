@@ -48,7 +48,7 @@ func TestHAConfig_DefaultsWhenUnset(t *testing.T) {
 				{"storage_topology", cfg.HAStorageTopologyValue(), "auto"},
 				{"local_policy", cfg.HALocalPolicyValue(), "none"},
 				{"anti_affinity", cfg.HAAntiAffinityValue(), "auto"},
-				{"anti_affinity_overflow", cfg.HAAntiAffinityOverflowValue(), "skip"},
+				{"anti_affinity_overflow", cfg.HAAntiAffinityOverflowValue(), "split"},
 				{"pin_az", cfg.HAPinAZValue(), "auto"},
 				{"pin_az_strict", cfg.HAPinAZStrictValue(), true},
 				{"failback", cfg.HAFailbackEnabled(), true},

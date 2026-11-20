@@ -68,6 +68,7 @@ var jobSpecPropertyNames = []string{
 	"pve.fetch_credential_defaults",
 	"pve.ha.anti_affinity",
 	"pve.ha.anti_affinity_overflow",
+	"pve.ha.anti_affinity_pattern",
 	"pve.ha.dlb.az_name",
 	"pve.ha.dlb.enabled",
 	"pve.ha.failback",

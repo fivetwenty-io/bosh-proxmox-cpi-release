@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"unicode"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
 )
 
 // Values of the pve.ha.mode key.
@@ -113,9 +115,15 @@ type HAConfig struct {
 	// mode.
 	AntiAffinity *HAChoice `json:"anti_affinity,omitempty"`
 
-	// AntiAffinityOverflow is skip (default) or split and decides what happens
-	// when a group has more members than the cluster has nodes.
+	// AntiAffinityOverflow is split (default) or skip and decides what happens
+	// when a group has more members than one rule may hold. Split writes
+	// further rules by index, and skip writes only the group's first rule.
 	AntiAffinityOverflow *HAChoice `json:"anti_affinity_overflow,omitempty"`
+
+	// AntiAffinityPattern is the default anti-affinity pattern of every
+	// instance group that names none in its ha_anti_affinity cloud property.
+	// Unset means the built-in block pattern.
+	AntiAffinityPattern *HAPattern `json:"anti_affinity_pattern,omitempty"`
 
 	// PinAZ is off, auto (default), or on. Auto folds a VM's AZ node set into
 	// its node-affinity pin when the VM is HA-managed and placement.az_map
@@ -147,6 +155,31 @@ type HAConfig struct {
 	// Replication holds the settings of each replication job that the
 	// replicate local policy creates.
 	Replication *HAReplicationConfig `json:"replication,omitempty"`
+}
+
+// HAPattern is the pve.ha.anti_affinity_pattern value. It decodes through
+// aapattern.DecodeJSON, so a bad shape fails the load with an error that
+// names the key.
+type HAPattern struct {
+	aapattern.Pattern
+}
+
+// UnmarshalJSON reads the pattern and names the key in any error.
+func (p *HAPattern) UnmarshalJSON(raw []byte) error {
+	got, err := aapattern.DecodeJSON(raw)
+	if err != nil {
+		return fmt.Errorf("ha.anti_affinity_pattern: %w", err)
+	}
+	p.Pattern = got
+	return nil
+}
+
+// cloneHAPattern returns a deep copy of p, or nil.
+func cloneHAPattern(p *HAPattern) *HAPattern {
+	if p == nil {
+		return nil
+	}
+	return &HAPattern{Pattern: p.Clone()}
 }
 
 // HADLBConfig holds the pve.ha.dlb keys.
@@ -241,9 +274,25 @@ func (c *CPIConfig) HAAntiAffinityValue() string {
 }
 
 // HAAntiAffinityOverflowValue returns the effective
-// pve.ha.anti_affinity_overflow. Defaults to skip.
+// pve.ha.anti_affinity_overflow. Defaults to split.
 func (c *CPIConfig) HAAntiAffinityOverflowValue() string {
-	return haChoiceValue(c.haBlock().AntiAffinityOverflow, HAOverflowSkip)
+	return haChoiceValue(c.haBlock().AntiAffinityOverflow, HAOverflowSplit)
+}
+
+// HAAntiAffinityPatternValue returns the effective
+// pve.ha.anti_affinity_pattern, or the built-in block pattern when the key is
+// unset. The result shares nothing with the config.
+func (c *CPIConfig) HAAntiAffinityPatternValue() aapattern.Pattern {
+	if p := c.haBlock().AntiAffinityPattern; p != nil {
+		return p.Clone().OrDefault()
+	}
+	return aapattern.Default()
+}
+
+// HAAntiAffinityPatternSet reports whether pve.ha.anti_affinity_pattern is
+// set, by the job or by the cpi-config entry.
+func (c *CPIConfig) HAAntiAffinityPatternSet() bool {
+	return c.haBlock().AntiAffinityPattern != nil
 }
 
 // HAPinAZValue returns the effective pve.ha.pin_az. Defaults to auto.
@@ -449,6 +498,7 @@ func (h *HAConfig) merged(over *HAConfig) *HAConfig {
 		LocalPolicy:          haPick(over.LocalPolicy, h.LocalPolicy),
 		AntiAffinity:         haPick(over.AntiAffinity, h.AntiAffinity),
 		AntiAffinityOverflow: haPick(over.AntiAffinityOverflow, h.AntiAffinityOverflow),
+		AntiAffinityPattern:  cloneHAPattern(haPickPointer(over.AntiAffinityPattern, h.AntiAffinityPattern)),
 		PinAZ:                haPick(over.PinAZ, h.PinAZ),
 		PinAZStrict:          haPick(over.PinAZStrict, h.PinAZStrict),
 		Failback:             haPick(over.Failback, h.Failback),
@@ -482,6 +532,15 @@ func (h *HAConfig) merged(over *HAConfig) *HAConfig {
 		}
 	}
 	return out
+}
+
+// haPickPointer returns over when it is set and base otherwise, without
+// copying, for a caller that deep-copies the result itself.
+func haPickPointer[T any](over, base *T) *T {
+	if over != nil {
+		return over
+	}
+	return base
 }
 
 // haPick returns a copy of over when it is set and a copy of base otherwise.

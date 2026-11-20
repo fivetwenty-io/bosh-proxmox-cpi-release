@@ -519,6 +519,23 @@ JSON_12D="$(render "$(props_with_ha '{"dlb":{"enabled":true}}')")"
 assert_ha_block "case12-dlb-only" "$JSON_12D" '{"dlb":{"enabled":true}}'
 JSON_12R="$(render "$(props_with_ha '{"replication":{"schedule":"mon..fri 22:00"}}')")"
 assert_ha_block "case12-replication-only" "$JSON_12R" '{"replication":{"schedule":"mon..fri 22:00"}}'
+# The anti-affinity pattern passes through unchanged once its shape checks
+# out, and a bad shape fails the render with the key in the message.
+JSON_12P="$(render "$(props_with_ha '{"anti_affinity_pattern":[{"stride":2},{"sets":[[0,1]],"drain_safe":true}]}')")"
+assert_json_valid "case12-pattern" "$JSON_12P" || FAILED=$((FAILED+1))
+assert_ha_block   "case12-pattern" "$JSON_12P" '{"anti_affinity_pattern":[{"stride":2},{"sets":[[0,1]],"drain_safe":true}]}'
+JSON_12PB="$(render "$(props_with_ha '{"anti_affinity_pattern":{"block":null}}')")"
+assert_ha_block   "case12-pattern-block" "$JSON_12PB" '{"anti_affinity_pattern":{"block":null}}'
+for bad in '{"stride":1}' '{"strde":2}' '{"block":{"size":1}}' '"block"' '[]' '{"sets":[[0,0]]}' \
+  '{"window":2,"drain_safe":"no"}' '{"stride":2,"window":3}' '[{"block":{}},{"block":{}}]' \
+  '[{"stride":2,"drain_safe":false},{"sets":[[0,1]],"drain_safe":true}]' '{"window":"3"}'; do
+  rc=0
+  out="$(render "$(props_with_ha "{\"anti_affinity_pattern\":${bad}}")" 2>&1)" || rc=$?
+  if [ "$rc" -eq 0 ] || ! printf '%s' "$out" | grep -qF "pve.ha.anti_affinity_pattern"; then
+    echo "FAIL [case12-pattern-bad]: pattern ${bad} must fail the render naming the key, got rc=${rc}: ${out}" >&2
+    FAILED=$((FAILED+1))
+  fi
+done
 # Every pve.ha property the spec declares is one the template reads, and the
 # spec declares no default for any of them.
 SPEC_HA_DEFAULTS="$(ruby -ryaml -e '
@@ -527,8 +544,8 @@ SPEC_HA_DEFAULTS="$(ruby -ryaml -e '
   puts props.count
   puts props.select { |_, v| v.key?("default") }.keys.join(",")
 ' "${REPO_ROOT}/jobs/pve_cpi/spec")"
-if [ "$(printf '%s' "$SPEC_HA_DEFAULTS" | sed -n 1p)" != "14" ] || [ -n "$(printf '%s' "$SPEC_HA_DEFAULTS" | sed -n 2p)" ]; then
-  echo "FAIL [case12-spec]: expected 14 pve.ha properties with no default, got: ${SPEC_HA_DEFAULTS}" >&2
+if [ "$(printf '%s' "$SPEC_HA_DEFAULTS" | sed -n 1p)" != "15" ] || [ -n "$(printf '%s' "$SPEC_HA_DEFAULTS" | sed -n 2p)" ]; then
+  echo "FAIL [case12-spec]: expected 15 pve.ha properties with no default, got: ${SPEC_HA_DEFAULTS}" >&2
   FAILED=$((FAILED+1))
 fi
 

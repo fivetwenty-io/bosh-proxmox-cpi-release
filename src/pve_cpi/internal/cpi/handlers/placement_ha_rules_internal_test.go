@@ -18,7 +18,7 @@ import (
 )
 
 // aaModeDeps returns aaDeps over a cluster whose configured nodes are nodes, in
-// mode with the overflow choice overflow ("" keeps the default, skip).
+// mode with the overflow choice overflow ("" keeps the default, split).
 func aaModeDeps(stub *aaClusterStub, mode, overflow string, nodes ...string) Deps {
 	deps := aaDeps(stub)
 	deps.Config.HA = &config.HAConfig{Mode: haChoiceOf(mode)}
@@ -34,7 +34,7 @@ func TestAntiAffinityOverflowSkipWritesNoRule(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			stub := newAAStub()
 			stub.tagged(aaQEMU(100, aaTag), aaQEMU(101, aaTag))
-			deps := aaModeDeps(stub, mode, "", "pve1", "pve2")
+			deps := aaModeDeps(stub, mode, config.HAOverflowSkip, "pve1", "pve2")
 			if err := ensureAntiAffinityMembership(context.Background(), deps, aaIdent("web"), 102,
 				log.NewNopLogger()); err != nil {
 				t.Fatalf("skip must not fail the call in %s: %v", mode, err)

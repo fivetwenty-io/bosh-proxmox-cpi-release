@@ -434,6 +434,75 @@
   end
   if_p("pve.ha.motion_wait_sec") { |v| ha["motion_wait_sec"] = ha_int.call(v) }
 
+  # pve.ha.anti_affinity_pattern is checked for its shape only, the way the
+  # CPI's config parser checks it, so a typo fails the render instead of the
+  # first create. The node count is unknown here, so nothing about it is
+  # checked. The value passes through unchanged.
+  if_p("pve.ha.anti_affinity_pattern") do |v|
+    aa_key = "pve.ha.anti_affinity_pattern"
+    aa_int = lambda do |x, lo, hi, what|
+      unless x.is_a?(Integer) && x >= lo && x <= hi
+        raise "#{aa_key}: #{what} must be an integer from #{lo} to #{hi}, got #{x.inspect}"
+      end
+    end
+    aa_terms = v.is_a?(Array) ? v : [v]
+    unless v.is_a?(Hash) || v.is_a?(Array)
+      raise "#{aa_key} must be a map or a list of maps, got #{v.inspect}"
+    end
+    raise "#{aa_key} must name at least one term" if aa_terms.empty?
+    raise "#{aa_key} may hold at most 8 terms, got #{aa_terms.size}" if aa_terms.size > 8
+    aa_drain = nil
+    aa_blocks = 0
+    aa_terms.each do |term|
+      raise "#{aa_key}: each term must be a map, got #{term.inspect}" unless term.is_a?(Hash)
+      unknown = term.keys.map(&:to_s) - [ "block", "stride", "window", "sets", "drain_safe" ]
+      raise "#{aa_key}: unknown anti-affinity pattern key #{unknown.first}" unless unknown.empty?
+      kinds = term.keys.map(&:to_s) & [ "block", "stride", "window", "sets" ]
+      raise "#{aa_key}: a term must name one of block, stride, window, or sets" if kinds.empty?
+      raise "#{aa_key}: a term may name only one of block, stride, window, or sets" if kinds.size > 1
+      kind = kinds.first
+      value = term[kind]
+      case kind
+      when "block"
+        aa_blocks += 1
+        unless value.nil?
+          raise "#{aa_key}: block must be a map, got #{value.inspect}" unless value.is_a?(Hash)
+          bad = value.keys.map(&:to_s) - [ "size" ]
+          raise "#{aa_key}: block has an unknown key #{bad.first}" unless bad.empty?
+          if value.key?("size")
+            size = value["size"]
+            unless size.is_a?(Integer) && size >= 2
+              raise "#{aa_key}: block size must be an integer of at least 2, got #{size.inspect}"
+            end
+          end
+        end
+      when "stride", "window"
+        aa_int.call(value, 2, 64, kind)
+      when "sets"
+        unless value.is_a?(Array) && value.size >= 1 && value.size <= 32
+          raise "#{aa_key}: sets must be a list of from 1 to 32 sets, got #{value.inspect}"
+        end
+        value.each do |set|
+          unless set.is_a?(Array) && set.size >= 2 && set.size <= 64
+            raise "#{aa_key}: each set must be a list of from 2 to 64 indexes, got #{set.inspect}"
+          end
+          set.each { |i| aa_int.call(i, 0, 99999, "a set's index") }
+          raise "#{aa_key}: a set names an index twice: #{set.inspect}" if set.uniq.size != set.size
+        end
+      end
+      if term.key?("drain_safe")
+        ds = term["drain_safe"]
+        raise "#{aa_key}: drain_safe must be a boolean, got #{ds.inspect}" unless ds == true || ds == false
+        if !aa_drain.nil? && aa_drain != ds
+          raise "#{aa_key}: the terms set drain_safe to different values"
+        end
+        aa_drain = ds
+      end
+    end
+    raise "#{aa_key} may hold only one block term" if aa_blocks > 1
+    ha["anti_affinity_pattern"] = v
+  end
+
   ha_dlb = {}
   if_p("pve.ha.dlb.enabled") { |v| ha_dlb["enabled"] = v }
   if_p("pve.ha.dlb.az_name") { |v| ha_dlb["az_name"] = v }
