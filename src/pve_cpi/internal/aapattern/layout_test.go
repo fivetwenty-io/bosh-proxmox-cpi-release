@@ -467,3 +467,24 @@ func fitsBound(rules map[string][]string, run []string, limit int) bool {
 	}
 	return true
 }
+
+// TestLayout_SkipPlacesAnUnindexedMemberOfALaterRuleAtOnce pins that skip
+// mode, which writes only the first rule, places an unindexed member that a
+// later rule holds in the same plan that drops the later rule. Before, the
+// first plan left it out and the second plan added it, so a switch from split
+// to skip took two writes.
+func TestLayout_SkipPlacesAnUnindexedMemberOfALaterRuleAtOnce(t *testing.T) {
+	t.Parallel()
+	ms := members("", 0, 1)
+	ms = append(ms, Member{Key: key(9), Index: -1, Domain: "", Joinable: true})
+	in := Input{Base: base, Domains: oneDomain(4), Members: ms,
+		Rules: map[string][]string{base: {key(0), key(1)}, ChunkName(base, 2): {key(9), key(1)}}}
+	first := Layout(in)
+	if got := render(first.Rules); got != "={0,1,9}" {
+		t.Fatalf("rules = %s; want the unindexed member in the first rule", got)
+	}
+	in.Rules = first.Rules
+	if second := Layout(in); render(second.Rules) != render(first.Rules) {
+		t.Fatalf("second plan %s differs from first %s", render(second.Rules), render(first.Rules))
+	}
+}

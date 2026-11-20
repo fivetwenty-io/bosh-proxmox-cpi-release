@@ -557,7 +557,8 @@ func (f *filler) start() *fillRun {
 // and the rule takes it. A new member whose index is unknown only fills the
 // room the members ranked by index leave, so it never displaces a member
 // already in the rule, and one that a later rule holds keeps that rule,
-// because the key order it ranks by is no reason to move it.
+// because the key order it ranks by is no reason to move it. Without split
+// the later rules go, so such a member fills the room like one in no rule.
 func (f *filler) fillFirst(r *fillRun) {
 	l := f.l
 	order := make([]*mstate, 0, len(r.ranked))
@@ -567,7 +568,7 @@ func (f *filler) fillFirst(r *fillRun) {
 		switch {
 		case m.Index >= 0 || r.first != 0 && n == r.first:
 			order = append(order, m)
-		case !held:
+		case !held || !l.in.Split:
 			unindexed = append(unindexed, m)
 		}
 	}
