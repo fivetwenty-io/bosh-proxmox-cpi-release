@@ -585,3 +585,23 @@ func TestUndrainRun_TheRebalanceStopsMovingBeforeTheUndrainLeaseRunsOut(t *testi
 		t.Fatalf("the rebalance started a move the undrain's lease could not cover: %v", f.calls)
 	}
 }
+
+func TestUndrainRun_ATokenedVMThatAlreadyRunsOnlyLosesItsToken(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	// A re-registration while the node was in maintenance requested started
+	// again and kept the drain token.
+	v := drStopped(f, 102, "pve01")
+	v.state, v.raw = "started", ""
+	r := drRun(f, UndrainCommand, true)
+	r.noRebalance = true
+	rep := r.undrain(context.Background())
+	if rep.ExitCode != RebalanceExitOK || f.vms[102].state != "started" ||
+		strings.Contains(f.vms[102].comment, ha.DrainMarkKey) {
+		t.Fatalf("exit %d halted %q state %q comment %q", rep.ExitCode, rep.Halted, f.vms[102].state,
+			f.vms[102].comment)
+	}
+	if got := drVMs(rep.VMs); !slices.Equal(got, []string{"102  started"}) {
+		t.Fatalf("vms %v", got)
+	}
+}
