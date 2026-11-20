@@ -266,6 +266,9 @@ type rebalanceRun struct {
 	started   time.Time
 	// planned is set once the report holds the first plan.
 	planned bool
+	// runLockHeld says the caller already holds the run lock, as an undrain
+	// does when it hands off to the rebalance, so the run takes no lock.
+	runLockHeld bool
 }
 
 func newRebalanceRun(deps Deps, opts RebalanceOptions, rio rebalanceIO) *rebalanceRun {
@@ -290,7 +293,7 @@ func (r *rebalanceRun) halt(code int, why string) RebalanceReport {
 
 func (r *rebalanceRun) run(ctx context.Context) RebalanceReport {
 	r.started = r.io.now()
-	if r.opts.Apply {
+	if r.opts.Apply && !r.runLockHeld {
 		release, err := r.io.runLock(ctx, r.runLockTTL())
 		switch {
 		case errors.Is(err, pve.ErrClusterLockHeld):

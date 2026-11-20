@@ -45,7 +45,7 @@ type drainVMFate struct {
 
 // drainInactiveStates are the HA manager states of a service that holds no
 // node for a resource affinity rule, because PVE counts only active services.
-var drainInactiveStates = []string{"stopped", "disabled", "ignored"}
+var drainInactiveStates = []string{haRequestStopped, "disabled", "ignored"}
 
 // decideDrainFates decides, for each VM of this Director on node, whether PVE
 // HA can move it off the node, from PVE's own rules and the cluster's
@@ -73,7 +73,7 @@ func decideDrainFates(cfg *config.CPIConfig, profile *ha.Profile, snap *rebalanc
 		case f.res == nil:
 			fate.Fate, fate.Reason = DrainNotHA, "it has no HA resource, so maintenance won't move it, and the "+
 				"drain won't stop it; it goes down when the node reboots"
-		case pve.HARequestedState(f.res.State) != "started":
+		case pve.HARequestedState(f.res.State) != haRawStateStarted:
 			fate.Fate = DrainNotStarted
 			fate.Reason = "its HA resource requests " + pve.HARequestedState(f.res.State)
 			if stoppedBy, ok := ha.DrainStopped(f.res.Comment); ok {
@@ -119,9 +119,9 @@ func drainAppliedRules(set *ha.RuleSet) []ha.Rule {
 		return nil
 	}
 	var out []ha.Rule
-	for _, r := range set.Rules {
-		if !r.Disabled && len(r.Errors) == 0 {
-			out = append(out, r)
+	for i := range set.Rules {
+		if r := &set.Rules[i]; !r.Disabled && len(r.Errors) == 0 {
+			out = append(out, *r)
 		}
 	}
 	return out
@@ -131,7 +131,8 @@ func drainAppliedRules(set *ha.RuleSet) []ha.Rule {
 // maintenance, and placeable, sorted.
 func (d *drainDecider) takers() []string {
 	var out []string
-	for _, n := range d.profile.Nodes {
+	for i := range d.profile.Nodes {
+		n := &d.profile.Nodes[i]
 		if n.Name == d.node || !n.Online {
 			continue
 		}
@@ -246,41 +247,59 @@ func (d *drainDecider) joinPositiveGroups(fates []drainVMFate, sets map[string][
 		for i := range fates {
 			fate := &fates[i]
 			sid := haResourceSid(fate.VMID)
-			mine, ok := sets[sid]
-			if !ok || len(mine) == 0 {
-				continue
-			}
-			for j := range d.rules {
-				r := &d.rules[j]
-				if r.Type != ha.RuleTypeResourceAffinity || r.Affinity != ha.AffinityPositive || !r.HasResource(sid) {
-					continue
-				}
-				for _, partner := range r.Resources {
-					if partner == sid {
-						continue
-					}
-					var theirs []string
-					if set, here := sets[partner]; here {
-						theirs = set
-					} else if at, active := d.activeNode(partner); active && at != d.node {
-						theirs = []string{at}
-					} else {
-						continue
-					}
-					narrowed := intersectNodes(mine, theirs)
-					if len(narrowed) == len(mine) {
-						continue
-					}
-					mine, changed = narrowed, true
-					sets[sid], fate.Targets = mine, mine
-					if len(mine) == 0 {
-						fate.Reason = "its positive resource-affinity rule " + r.ID + " keeps it with VM " +
-							sidNumber(partner) + ", and no node can take them both"
-					}
-				}
+			if mine, ok := sets[sid]; ok && len(mine) > 0 && d.narrowToPartners(fate, sid, sets) {
+				changed = true
 			}
 		}
 	}
+}
+
+// narrowToPartners narrows the set of the VM sid to the nodes the partners of
+// its positive resource-affinity rules can take, and reports whether it
+// changed. A set that ends empty names the rule and the partner as the reason.
+func (d *drainDecider) narrowToPartners(fate *drainVMFate, sid string, sets map[string][]string) bool {
+	changed := false
+	for j := range d.rules {
+		r := &d.rules[j]
+		if r.Type != ha.RuleTypeResourceAffinity || r.Affinity != ha.AffinityPositive || !r.HasResource(sid) {
+			continue
+		}
+		for _, partner := range r.Resources {
+			theirs, ok := d.partnerSet(partner, sid, sets)
+			if !ok {
+				continue
+			}
+			mine := sets[sid]
+			narrowed := intersectNodes(mine, theirs)
+			if len(narrowed) == len(mine) {
+				continue
+			}
+			changed = true
+			sets[sid], fate.Targets = narrowed, narrowed
+			if len(narrowed) == 0 {
+				fate.Reason = "its positive resource-affinity rule " + r.ID + " keeps it with VM " +
+					sidNumber(partner) + ", and no node can take them both"
+				return true
+			}
+		}
+	}
+	return changed
+}
+
+// partnerSet returns the nodes a positive partner of sid can be on: its own
+// set when it is on the drained node, and its node when it is active
+// elsewhere. false means the partner narrows nothing.
+func (d *drainDecider) partnerSet(partner, sid string, sets map[string][]string) ([]string, bool) {
+	if partner == sid {
+		return nil, false
+	}
+	if set, here := sets[partner]; here {
+		return set, true
+	}
+	if at, active := d.activeNode(partner); active && at != d.node {
+		return []string{at}, true
+	}
+	return nil, false
 }
 
 // sidNumber returns the VMID of an HA service ID such as vm:101.

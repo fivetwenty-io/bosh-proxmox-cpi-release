@@ -307,6 +307,8 @@ func (f *fakeRebalanceIO) serviceStates(context.Context) (map[string]string, err
 			f.moving = map[int]bool{}
 		}
 	}
+	f.stopSettle = f.settleRaw(f.stopSettle, "stopped", "started")
+	f.startSettle = f.settleRaw(f.startSettle, "started", "stopped")
 	return f.statesLocked(), nil
 }
 
@@ -549,4 +551,22 @@ func (f *fakeRebalanceIO) drainState(_ context.Context, vmid int, read *sdkclust
 		v.raw = ""
 	}
 	return true, nil
+}
+
+// settleRaw counts down left, and when it reaches zero it lets every VM whose
+// resource requests state, and that the HA manager still reports as raw, read
+// as state.
+func (f *fakeRebalanceIO) settleRaw(left int, state, raw string) int {
+	if left <= 0 {
+		return left
+	}
+	left--
+	if left == 0 {
+		for _, v := range f.vms {
+			if v.state == state && v.raw == raw {
+				v.raw = ""
+			}
+		}
+	}
+	return left
 }

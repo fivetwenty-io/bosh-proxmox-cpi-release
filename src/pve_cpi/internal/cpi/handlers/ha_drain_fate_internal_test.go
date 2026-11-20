@@ -20,15 +20,15 @@ func negativeRule(id string, vmids ...int) ha.Rule {
 	return r
 }
 
-// drainFatesOf decides the fates of the fake's VMs on node.
-func drainFatesOf(t *testing.T, f *fakeRebalanceIO, node string) map[int]drainVMFate {
+// drainFatesOf decides the fates of the fake's VMs on pve01.
+func drainFatesOf(t *testing.T, f *fakeRebalanceIO) map[int]drainVMFate {
 	t.Helper()
 	snap, err := f.snapshot(context.Background(), f.profileVal)
 	if err != nil {
 		t.Fatal(err)
 	}
 	out := map[int]drainVMFate{}
-	for _, fate := range decideDrainFates(&config.CPIConfig{}, f.profileVal, snap, node) {
+	for _, fate := range decideDrainFates(&config.CPIConfig{}, f.profileVal, snap, "pve01") {
 		if _, dup := out[fate.VMID]; dup {
 			t.Fatalf("VM %d decided twice", fate.VMID)
 		}
@@ -102,7 +102,7 @@ func TestDrainFatesFollowPVERulesAndPlacementFacts(t *testing.T) {
 	f.addVM(121, "pve01", 4).state = "stopped"
 	f.addVM(122, "pve02", 4)
 
-	fates := drainFatesOf(t, f, "pve01")
+	fates := drainFatesOf(t, f)
 	wantFate(t, fates, 101, DrainLeaves, "", "pve02", "pve03")
 	wantFate(t, fates, 102, DrainStays, "strict node-affinity rule "+naRuleNameFor(102))
 	wantFate(t, fates, 103, DrainStays, "VM 104 on pve02 in bosh-aa-one, and VM 105 on pve03 in bosh-aa-one")
@@ -132,12 +132,12 @@ func TestDrainFatesLeaveOutNodesThatCantTakeWork(t *testing.T) {
 	f.profileVal.Health.Nodes[2].Maintenance = true
 	f.profileVal.Health.Nodes[2].Placeable = false
 
-	fates := drainFatesOf(t, f, "pve01")
+	fates := drainFatesOf(t, f)
 	wantFate(t, fates, 101, DrainLeaves, "", "pve02")
 	wantFate(t, fates, 102, DrainStays, "VM 103 on pve02 in bosh-aa-one")
 
 	f.profileVal.Health.Nodes[1].Placeable = false
-	fates = drainFatesOf(t, f, "pve01")
+	fates = drainFatesOf(t, f)
 	wantFate(t, fates, 101, DrainStays, "no other node is online, out of maintenance, and able to take work")
 }
 
@@ -148,7 +148,7 @@ func TestDrainFatesOfALocalISOOrAnUnreplicatedDriveStay(t *testing.T) {
 	f.addVM(102, "pve01", 4).cfg["scsi1"] = testPinStorage + ":vm-102-disk-1,size=1G,replicate=0"
 	f.jobs = []ha.ReplicaJobState{{ID: "101-0", Guest: 101, Target: "pve02"},
 		{ID: "102-0", Guest: 102, Target: "pve02"}}
-	fates := drainFatesOf(t, f, "pve01")
+	fates := drainFatesOf(t, f)
 	wantFate(t, fates, 101, DrainStays, "replication doesn't copy it")
 	wantFate(t, fates, 102, DrainStays, "replication doesn't copy it")
 
@@ -156,6 +156,6 @@ func TestDrainFatesOfALocalISOOrAnUnreplicatedDriveStay(t *testing.T) {
 	f.addVM(103, "pve01", 4).cfg["scsi0"] = testPinStorage + ":vm-103-disk-0,size=10G"
 	f.jobs = []ha.ReplicaJobState{{ID: "103-0", Guest: 103, Target: "pve02", Disabled: true},
 		{ID: "103-1", Guest: 103, Target: "pve03", Fault: "bad"}}
-	fates = drainFatesOf(t, f, "pve01")
+	fates = drainFatesOf(t, f)
 	wantFate(t, fates, 103, DrainStays, "no replica")
 }
