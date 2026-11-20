@@ -841,10 +841,11 @@ func (h *attachHA) recheckFailbackOff(ctx context.Context) {
 // releaseFailbackHold drops the hold token a move into the VM's admissible
 // set left on its HA resource (see holdFailbackForMove), once the barrier has
 // written the pin for the node the VM landed on, so the move the token covered
-// is over. The barrier drops a token that its own move wrote, so this matters
-// for the move the decision made before the barrier, and for a token a call
-// that stopped part way left. A write that fails is logged, and the token then
-// keeps failback off until it expires (see ha.FailbackHoldTTL).
+// is over. The barrier keeps the token through its own requests, so this
+// drops the token of a move the barrier made, of the move the decision made
+// before the barrier, and of a call that stopped part way. A write that fails
+// is logged, and the token then keeps failback off until it expires (see
+// ha.FailbackHoldTTL).
 func (h *attachHA) releaseFailbackHold(ctx context.Context) {
 	owner := h.deps.RequestDirectorUUID
 	owned := func(comment string) bool { return owner != "" && haOwnershipOf(comment, owner) == haOwnedByUs }

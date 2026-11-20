@@ -3,6 +3,7 @@ package ha
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -35,7 +36,17 @@ type barrierRig struct {
 	created    []*sdkcluster.CreateHaResourcesParams
 	// comment is the resource's comment, "owner" when nil.
 	comment *string
+	// digests makes a read name the digest of resources.cfg and an update
+	// that names a digest compare it, the way PVE does. version counts the
+	// writes, beforeUpdate runs at the start of each update with its number,
+	// and updates counts them.
+	digests      bool
+	version      int
+	beforeUpdate func(n int)
+	updates      int
 }
+
+func (r *barrierRig) digest() string { return fmt.Sprintf("digest-%d", r.version) }
 
 func (r *barrierRig) currentComment() string {
 	if r.comment == nil {
@@ -50,7 +61,11 @@ func (r *barrierRig) GetHaResources(_ context.Context, sid string) (*sdkcluster.
 	}
 	st := r.state
 	comment := r.currentComment()
-	return &sdkcluster.GetHaResourcesResponse{Sid: sid, State: &st, Comment: &comment}, nil
+	res := &sdkcluster.GetHaResourcesResponse{Sid: sid, State: &st, Comment: &comment}
+	if r.digests {
+		res.Digest = r.digest()
+	}
+	return res, nil
 }
 
 func (r *barrierRig) CreateHaResources(_ context.Context, p *sdkcluster.CreateHaResourcesParams) error {
@@ -65,6 +80,14 @@ func (r *barrierRig) CreateHaResources(_ context.Context, p *sdkcluster.CreateHa
 }
 
 func (r *barrierRig) UpdateHaResources(_ context.Context, _ string, p *sdkcluster.UpdateHaResourcesParams) error {
+	r.updates++
+	if r.beforeUpdate != nil {
+		r.beforeUpdate(r.updates)
+	}
+	if r.digests && p.Digest != nil && *p.Digest != r.digest() {
+		return errors.New("detected modified configuration - file changed by other user")
+	}
+	r.version++
 	r.events = append(r.events, "request:"+*p.State)
 	r.state = *p.State
 	switch {

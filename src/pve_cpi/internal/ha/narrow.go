@@ -723,25 +723,36 @@ func (b *barrier) readState(ctx context.Context, node string) (*pve.HAServiceSta
 
 // request sets the resource's requested state in one write with its comment.
 // mark puts the barrier's token, which names the state to restore, on the
-// comment, and otherwise the comment goes back to what it was before the
-// barrier. A held error is settled with a read of the resource.
+// comment, and otherwise the request drops it. The barrier owns no other token
+// of the comment: other writers add theirs while the barrier holds the
+// resource, such as the failback hold a move into the narrower set writes, so
+// each request reads the comment afresh, changes only the barrier's token, and
+// names the digest of that read. A write PVE refuses because resources.cfg
+// changed is read and tried again, up to CommentWriteAttempts writes, and then
+// the request fails and the resource keeps the state and comment it had. A
+// read that names no digest leaves the write unchecked, and a read that fails
+// leaves the request to write the comment the barrier read last, so a failed
+// read never keeps the barrier from putting back the state. A held error is
+// settled with a read of the resource.
 func (b *barrier) request(ctx context.Context, state string, mark bool) error {
 	want := state
-	p := &sdkcluster.UpdateHaResourcesParams{State: &want}
-	switch {
-	case mark:
-		c := withNarrowMark(b.comment, b.restore)
-		p.Comment = &c
-	case b.comment != nil && *b.comment != "":
-		p.Comment = b.comment
-	case b.marked:
-		del := "comment"
-		p.Delete = &del
-	}
-	err := b.deps.Resources.UpdateHaResources(ctx, b.sid, p)
-	if err == nil {
-		b.marked = mark
-		return nil
+	var err error
+	for attempt := 1; ; attempt++ {
+		p := &sdkcluster.UpdateHaResourcesParams{State: &want}
+		b.requestComment(ctx, p, mark)
+		err = b.deps.Resources.UpdateHaResources(ctx, b.sid, p)
+		if err == nil {
+			b.marked = mark
+			return nil
+		}
+		if p.Digest == nil || !IsDigestConflict(err) {
+			break
+		}
+		if attempt >= CommentWriteAttempts {
+			err = fmt.Errorf("resources.cfg changed under %d writes, so the resource keeps the state and comment "+
+				"it had: %w", attempt, err)
+			break
+		}
 	}
 	got, readErr := b.deps.Resources.GetHaResources(ctx, b.sid)
 	if readErr == nil && got != nil && pve.HARequestedState(got.State) == state {
@@ -752,6 +763,35 @@ func (b *barrier) request(ctx context.Context, state string, mark bool) error {
 	}
 	return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 		fmt.Sprintf("ha narrow: request %s for %s", state, b.sid))
+}
+
+// requestComment puts on p the comment a request writes and the digest it
+// names. It reads the resource, keeps every token of its comment but the
+// barrier's, and adds the barrier's token when mark is set, and a comment left
+// with no token is deleted. The digest is the read's, when it names one. A
+// read that fails or returns nothing leaves the comment the barrier read last
+// and no digest.
+func (b *barrier) requestComment(ctx context.Context, p *sdkcluster.UpdateHaResourcesParams, mark bool) {
+	base, held := b.comment, b.marked
+	if got, err := b.deps.Resources.GetHaResources(ctx, b.sid); err == nil && got != nil {
+		base = stripNarrowMark(got.Comment)
+		held = got.Comment != nil && strings.TrimSpace(*got.Comment) != ""
+		b.comment = base
+		if got.Digest != "" {
+			digest := got.Digest
+			p.Digest = &digest
+		}
+	}
+	switch {
+	case mark:
+		c := withNarrowMark(base, b.restore)
+		p.Comment = &c
+	case base != nil && strings.TrimSpace(*base) != "":
+		p.Comment = base
+	case held:
+		del := "comment"
+		p.Delete = &del
+	}
 }
 
 // finish puts back the state the resource had before the barrier and drops
