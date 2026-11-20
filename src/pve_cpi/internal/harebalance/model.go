@@ -68,6 +68,10 @@ const (
 	// SkipUndecided is a VM whose HA decision or pin could not be read into a
 	// set of targets.
 	SkipUndecided SkipKind = "undecided"
+	// SkipRefused is a VM whose move this run tried and left where it was,
+	// because PVE refused it, a write lost a race, or another call held the
+	// VM, so no later plan of the run chooses it again.
+	SkipRefused SkipKind = "refused"
 	// SkipPinRewrite is a VM whose move would need a pin that changes more
 	// than the priorities of the pin it has.
 	SkipPinRewrite SkipKind = "pin_rewrite"
