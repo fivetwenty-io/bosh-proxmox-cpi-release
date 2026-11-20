@@ -238,13 +238,15 @@ func TestCreateVM_ScoredPlacementRefusesWhenNodeHealthStaysUnreadable(t *testing
 }
 
 // TestCreateVM_ScoredPlacementFailsOpenWhenNodeHealthIsNotRequired pins the
-// fail-open side. With HA writes off and no maintenance tags named, a health
-// read that fails twice leaves placement treating every node as healthy, as
+// fail-open side. With HA writes off and maintenance_node_tags set to an
+// explicit [], a health read that fails twice leaves placement treating every node as healthy, as
 // it did before, and the create goes ahead.
 func TestCreateVM_ScoredPlacementFailsOpenWhenNodeHealthIsNotRequired(t *testing.T) {
 	t.Parallel()
 	c := &maintenanceTargetCluster{failOn: healthReadsFail}
-	created, err := createOnScoredNode(t, c, nil)
+	created, err := createOnScoredNode(t, c, func(cfg *config.CPIConfig) {
+		cfg.Placement = &config.PlacementConfig{MaintenanceNodeTags: []string{}}
+	})
 	if err != nil {
 		t.Fatalf("create_vm failed although node health is not required: %v", err)
 	}

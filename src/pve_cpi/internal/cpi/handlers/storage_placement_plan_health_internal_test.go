@@ -43,11 +43,13 @@ func TestObserveStoragePlanCompute_RefusesWhenNodeHealthStaysUnreadable(t *testi
 }
 
 // TestObserveStoragePlanCompute_FailsOpenWhenNodeHealthIsNotRequired pins
-// that with HA writes off and no maintenance tags named, the plan still treats
-// every node as healthy when node health stays unreadable.
+// that with HA writes off and maintenance_node_tags set to an explicit [], the
+// plan still treats every node as healthy when node health stays unreadable.
 func TestObserveStoragePlanCompute_FailsOpenWhenNodeHealthIsNotRequired(t *testing.T) {
 	t.Parallel()
-	deps := planHealthDeps(t, map[int32]bool{2: true, 3: true}, nil)
+	deps := planHealthDeps(t, map[int32]bool{2: true, 3: true}, func(c *config.CPIConfig) {
+		c.Placement.MaintenanceNodeTags = []string{}
+	})
 	groups, err := ObserveStoragePlanCompute(context.Background(), deps, oneNet(), nil)
 	if err != nil {
 		t.Fatalf("the plan failed although node health is not required: %v", err)
