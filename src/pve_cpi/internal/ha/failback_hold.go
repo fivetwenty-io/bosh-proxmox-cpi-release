@@ -84,6 +84,16 @@ func FailbackHeld(comment *string, now time.Time) bool {
 	return now.Before(at.Add(FailbackHoldTTL)) && at.Before(now.Add(FailbackHoldTTL))
 }
 
+// FailbackAllowed returns the failback flag a writer that wants want may
+// write on a resource whose comment is comment: want, unless comment holds
+// failback off at now (see FailbackHeld). A writer may always turn failback
+// off, and no writer turns it on while a hold is fresh, because the VM's pin
+// still prefers the node a move takes it away from, and failback would pull
+// it back there once the resource is under PVE HA.
+func FailbackAllowed(want bool, comment string, now time.Time) bool {
+	return want && !FailbackHeld(&comment, now)
+}
+
 // HoldFailback turns failback off on the resource sid and puts a hold token
 // that names now on its comment, in one write, and returns the token. It
 // writes even when failback already reads off, because the write changes the

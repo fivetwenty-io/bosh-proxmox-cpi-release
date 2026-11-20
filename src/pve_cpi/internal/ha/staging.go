@@ -201,7 +201,18 @@ type Stager struct {
 	// those keys, and failback off, which a write must name.
 	Keys ResourceKeys
 
+	// Now reads the clock that judges a failback hold token, and nil reads
+	// time.Now.
+	Now func() time.Time
+
 	Logger *log.Logger
+}
+
+func (s *Stager) now() time.Time {
+	if s.Now != nil {
+		return s.Now()
+	}
+	return time.Now()
 }
 
 func (s *Stager) logger() *log.Logger {
@@ -218,6 +229,12 @@ func (s *Stager) logger() *log.Logger {
 // auto-rebalance only where every online node's release has the key, and
 // failback where the release has it or the decision turns it off (see
 // ResourceKeys).
+//
+// Failback is never written on while the comment the write carries holds it
+// off (see FailbackHeld): a re-registration stages the comment it recorded,
+// and an existing resource keeps the hold another call put on it, and that
+// call sets the flag once the VM's pin names the node it moved to. The stage
+// writes failback off in that case.
 //
 // A resource that already exists counts as staged only when it carries this
 // Director's marker and requests ignored. Its marker, its DLB record, and the
@@ -241,9 +258,10 @@ func (s *Stager) Stage(ctx context.Context, d *VMDecision, marker string) error 
 	case !s.Owned(marker):
 		return cpierrors.Cloud("ha stage: the comment of %s does not carry this Director's ownership marker", d.SID)
 	}
-	ignored, failback, rebalance := haStateIgnored, d.Failback, d.DLB
-	failbackKey, rebalanceKey := s.Keys.sendsFailback(failback), s.Keys.AutoRebalance
+	ignored, rebalance := haStateIgnored, d.DLB
 	comment := WithDLBRecord(marker, d.DLB)
+	failback := FailbackAllowed(d.Failback, comment, s.now())
+	failbackKey, rebalanceKey := s.Keys.sendsFailback(failback), s.Keys.AutoRebalance
 	create := &sdkcluster.CreateHaResourcesParams{Sid: d.SID, State: &ignored, Comment: &comment}
 	if failbackKey {
 		create.Failback = &failback
@@ -278,6 +296,8 @@ func (s *Stager) Stage(ctx context.Context, d *VMDecision, marker string) error 
 				d.VMID)
 		}
 		merged := stagedComment(marker, d.DLB, *got.Comment)
+		failback = FailbackAllowed(d.Failback, merged, s.now())
+		failbackKey = s.Keys.sendsFailback(failback)
 		if *got.Comment == merged && (!failbackKey || FailbackOf(got.Failback) == failback) &&
 			(!rebalanceKey || AutoRebalanceOf(got.AutoRebalance) == rebalance) {
 			break

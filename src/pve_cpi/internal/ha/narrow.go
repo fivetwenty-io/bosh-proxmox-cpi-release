@@ -940,10 +940,12 @@ func (b *barrier) viaRemoval(ctx context.Context) (pve.VMLocation, error) {
 // and cause is returned.
 // The resource comes back with the failback and auto-rebalance flags the VM's
 // decision names, as registration writes them, and with only the keys the
-// cluster's releases accept, as staging names them.
+// cluster's releases accept, as staging names them. Failback comes back off
+// while the comment carries a fresh hold token (see FailbackAllowed).
 func (b *barrier) reregister(ctx context.Context, rules []Rule, cause error) error {
-	ignored, failback, rebalance := haStateIgnored, b.in.Failback, b.in.AutoRebalance
+	ignored, rebalance := haStateIgnored, b.in.AutoRebalance
 	comment := withNarrowMark(b.comment, b.restore)
+	failback := FailbackAllowed(b.in.Failback, comment, b.deps.Now())
 	create := &sdkcluster.CreateHaResourcesParams{Sid: b.sid, State: &ignored, Comment: &comment}
 	if b.in.Keys.sendsFailback(failback) {
 		create.Failback = &failback
