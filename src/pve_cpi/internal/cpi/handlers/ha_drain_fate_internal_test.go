@@ -159,3 +159,28 @@ func TestDrainFatesOfALocalISOOrAnUnreplicatedDriveStay(t *testing.T) {
 	fates = drainFatesOf(t, f)
 	wantFate(t, fates, 103, DrainStays, "no replica")
 }
+
+func TestDrainFatesOfAVMOnStorageOfUnknownKindAreUndecided(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	f.addVM(101, "pve01", 4)
+	// A strict pin that names only the drained node decides the VM before
+	// its storage matters.
+	drHold(f, 102)
+	f.profileVal.StoragesErr = "GET /storage: 500 Internal Server Error"
+	fates := drainFatesOf(t, f)
+	wantFate(t, fates, 101, DrainUndecided, "the storage definitions couldn't be read")
+	wantFate(t, fates, 102, DrainStays, "strict node-affinity rule")
+
+	// A storage the list doesn't name leaves only its VM undecided, and a
+	// positive partner of that VM can't be decided either.
+	f.profileVal.StoragesErr = ""
+	f.addVM(103, "pve01", 4).cfg["scsi1"] = "ghost:vm-103-disk-1,size=1G"
+	f.addVM(104, "pve01", 4)
+	f.extraRules = append(f.extraRules, ha.Rule{ID: "together", Type: ha.RuleTypeResourceAffinity,
+		Affinity: ha.AffinityPositive, Resources: []string{haResourceSid(103), haResourceSid(104)}})
+	fates = drainFatesOf(t, f)
+	wantFate(t, fates, 101, DrainLeaves, "", "pve02", "pve03")
+	wantFate(t, fates, 103, DrainUndecided, "storage ghost")
+	wantFate(t, fates, 104, DrainUndecided, "positive resource-affinity rule together keeps it with VM 103")
+}

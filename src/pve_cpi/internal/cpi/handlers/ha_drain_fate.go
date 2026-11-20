@@ -28,6 +28,10 @@ const (
 	// DrainNotStarted is a VM whose HA resource does not request started, so
 	// it doesn't block the node's maintenance.
 	DrainNotStarted DrainFate = "not_started"
+	// DrainUndecided is a started HA VM whose fate the drain can't decide
+	// from what it read, such as a VM on a storage it can't classify. The
+	// fates gate fails while any VM is undecided, so the drain stops nothing.
+	DrainUndecided DrainFate = "undecided"
 )
 
 // drainVMFate is the fate of one VM of this Director on the drained node.
@@ -36,7 +40,8 @@ type drainVMFate struct {
 	Name       string
 	Deployment string
 	Fate       DrainFate
-	// Reason says why a VM stays, has no HA resource, or isn't started.
+	// Reason says why a VM stays, has no HA resource, isn't started, or
+	// can't be decided.
 	Reason string
 	// Targets lists the nodes that can take a VM that leaves, sorted.
 	Targets []string
@@ -55,7 +60,7 @@ var drainInactiveStates = []string{haRequestStopped, "disabled", "ignored"}
 func decideDrainFates(cfg *config.CPIConfig, profile *ha.Profile, snap *rebalanceSnapshot, node string,
 ) []drainVMFate {
 	d := drainDecider{cfg: cfg, profile: profile, snap: snap, node: node, where: map[string]string{},
-		rules: drainAppliedRules(snap.rules)}
+		rules: drainAppliedRules(snap.rules), undecided: map[string]bool{}}
 	for i := range snap.guests {
 		g := &snap.guests[i]
 		d.where[strconv.Itoa(g.VMID)] = g.Node
@@ -80,8 +85,14 @@ func decideDrainFates(cfg *config.CPIConfig, profile *ha.Profile, snap *rebalanc
 				fate.Reason += ", and the drain of " + stoppedBy + " stopped it"
 			}
 		default:
-			fate.Targets, fate.Reason = d.targets(f)
-			sets[haResourceSid(f.vmid)] = fate.Targets
+			var undecided bool
+			fate.Targets, fate.Reason, undecided = d.targets(f)
+			if undecided {
+				fate.Fate = DrainUndecided
+				d.undecided[haResourceSid(f.vmid)] = true
+			} else {
+				sets[haResourceSid(f.vmid)] = fate.Targets
+			}
 		}
 		out = append(out, fate)
 	}
@@ -110,6 +121,9 @@ type drainDecider struct {
 	rules []ha.Rule
 	// candidates are the nodes other than the drained one that can take work.
 	candidates []string
+	// undecided holds the service IDs of the VMs whose fate the drain can't
+	// decide.
+	undecided map[string]bool
 }
 
 // drainAppliedRules returns the rules PVE applies: enabled, and with no
@@ -148,12 +162,13 @@ func (d *drainDecider) takers() []string {
 
 // targets returns the nodes that can take the VM, and the reason when there is
 // none. Each step narrows the set, and the first step that empties it names
-// the reason.
-func (d *drainDecider) targets(f *rebalanceVMFacts) ([]string, string) {
+// the reason. true means the drain can't decide the VM's fate, and the reason
+// says why.
+func (d *drainDecider) targets(f *rebalanceVMFacts) ([]string, string, bool) {
 	sid := haResourceSid(f.vmid)
 	set := slices.Clone(d.candidates)
 	if len(set) == 0 {
-		return nil, "no other node is online, out of maintenance, and able to take work"
+		return nil, "no other node is online, out of maintenance, and able to take work", false
 	}
 	for i := range d.rules {
 		r := &d.rules[i]
@@ -165,12 +180,12 @@ func (d *drainDecider) targets(f *rebalanceVMFacts) ([]string, string) {
 			return slices.Contains(named, n) == (r.Affinity == ha.AffinityNegative)
 		})
 		if len(set) == 0 {
-			return nil, "its strict node-affinity rule " + r.ID + " names no other node that can take it"
+			return nil, "its strict node-affinity rule " + r.ID + " names no other node that can take it", false
 		}
 	}
-	set, why := d.storageTargets(f, set)
-	if len(set) == 0 {
-		return nil, why
+	set, why, undecided := d.storageTargets(f, set)
+	if undecided || len(set) == 0 {
+		return nil, why, undecided
 	}
 	var held []string
 	for i := range d.rules {
@@ -189,24 +204,35 @@ func (d *drainDecider) targets(f *rebalanceVMFacts) ([]string, string) {
 	}
 	if len(set) == 0 {
 		return nil, "every other node that can take it holds a partner from its negative resource-affinity " +
-			"rules: " + rebalanceDetail(held)
+			"rules: " + rebalanceDetail(held), false
 	}
-	return set, ""
+	return set, "", false
 }
 
 // storageTargets narrows set to the nodes that hold every node-local volume of
-// the VM: the targets of its replication jobs that are enabled and sound. A
-// volume replication never copies keeps no node.
-func (d *drainDecider) storageTargets(f *rebalanceVMFacts, set []string) ([]string, string) {
+// the VM, which are the targets of its replication jobs that are enabled and
+// sound. A volume replication never copies keeps no node. true means a volume
+// sits on a storage the drain can't classify, because the storage list
+// couldn't be read or doesn't name it, so the drain can't tell whether the
+// volume keeps the VM on the node.
+func (d *drainDecider) storageTargets(f *rebalanceVMFacts, set []string) ([]string, string, bool) {
 	local := false
 	for _, v := range haVolumesOfConfig(f.cfg, f.node, nil) {
 		storage, _, _ := strings.Cut(v.Volume, ":")
-		if shared, known := d.profile.StorageShared(d.cfg, storage); shared && known {
+		shared, known := d.profile.StorageShared(d.cfg, storage)
+		switch {
+		case !known && d.profile != nil && d.profile.StoragesErr != "":
+			return nil, "the storage definitions couldn't be read (" + d.profile.StoragesErr + "), so the " +
+				"drain can't tell whether its volume " + v.Volume + " sits on shared storage", true
+		case !known:
+			return nil, "the cluster's storage list doesn't name storage " + storage + ", which holds its " +
+				"volume " + v.Volume + ", so the drain can't tell whether it is shared", true
+		case shared:
 			continue
 		}
 		if v.Kind == ha.VolumeISO || v.NoReplicate {
 			return nil, "its volume " + v.Volume + " sits on node-local storage " + storage + ", and " +
-				"replication doesn't copy it"
+				"replication doesn't copy it", false
 		}
 		if !local {
 			local = true
@@ -220,10 +246,10 @@ func (d *drainDecider) storageTargets(f *rebalanceVMFacts, set []string) ([]stri
 		}
 		if len(set) == 0 {
 			return nil, "its volume " + v.Volume + " sits on node-local storage " + storage + ", and no " +
-				"replica of it is on another node that can take it"
+				"replica of it is on another node that can take it", false
 		}
 	}
-	return set, ""
+	return set, "", false
 }
 
 // activeNode returns the node of the service sid when the HA manager counts it
@@ -240,7 +266,8 @@ func (d *drainDecider) activeNode(sid string) (string, bool) {
 // joinPositiveGroups narrows each VM in a positive resource-affinity rule to
 // the nodes its partners can take too, because PVE moves such a group
 // together. A partner on another node keeps only that node, and a partner on
-// the drained node keeps only its own set. It repeats until nothing changes.
+// the drained node keeps only its own set. A partner whose fate the drain
+// can't decide leaves the VM undecided too. It repeats until nothing changes.
 func (d *drainDecider) joinPositiveGroups(fates []drainVMFate, sets map[string][]string) {
 	for changed := true; changed; {
 		changed = false
@@ -265,6 +292,14 @@ func (d *drainDecider) narrowToPartners(fate *drainVMFate, sid string, sets map[
 			continue
 		}
 		for _, partner := range r.Resources {
+			if partner != sid && d.undecided[partner] {
+				d.undecided[sid] = true
+				delete(sets, sid)
+				fate.Fate, fate.Targets = DrainUndecided, nil
+				fate.Reason = "its positive resource-affinity rule " + r.ID + " keeps it with VM " +
+					sidNumber(partner) + ", whose fate the drain can't decide"
+				return true
+			}
 			theirs, ok := d.partnerSet(partner, sid, sets)
 			if !ok {
 				continue

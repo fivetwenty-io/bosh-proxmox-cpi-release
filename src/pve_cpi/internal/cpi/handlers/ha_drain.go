@@ -27,6 +27,10 @@ const (
 // the named node's HA maintenance.
 const RebalanceGateMaintenance = "maintenance"
 
+// DrainGateFates is the gate of a drain that passes once the drain could
+// decide the fate of every VM on the node.
+const DrainGateFates = "fates"
+
 // The commands a DrainReport records.
 const (
 	DrainCommand   = "drain"
@@ -292,6 +296,7 @@ func (r *drainRun) observe(ctx context.Context) (*drainView, error) {
 		gates: drainGates(r.deps, profile, act, journal, r.node, r.apply, undrain)}
 	if !undrain {
 		view.fates = decideDrainFates(r.deps.Config, profile, snap, r.node)
+		view.gates = append(view.gates, drainFatesGate(view.fates, r.node))
 	}
 	if r.apply && !journal.configured {
 		r.warn("the configuration names no allocation journal, so the run can't see the Director's own records; " +
@@ -337,6 +342,26 @@ func drainGates(deps Deps, profile *ha.Profile, act rebalanceActivity, journal r
 		activityGate(act),
 		runLockGate(act, apply),
 	}
+}
+
+// drainFatesGate passes when the drain decided the fate of every VM on node.
+// A VM it can't decide might leave or might not, so the drain refuses before
+// it stops anything, and a rerun decides again from a fresh read.
+func drainFatesGate(fates []drainVMFate, node string) RebalanceGate {
+	g := RebalanceGate{Name: DrainGateFates}
+	var undecided []string
+	for i := range fates {
+		if fates[i].Fate == DrainUndecided {
+			undecided = append(undecided, fmt.Sprintf("VM %d, because %s", fates[i].VMID, fates[i].Reason))
+		}
+	}
+	if len(undecided) > 0 {
+		g.Detail = "the drain can't decide whether PVE HA can move " + rebalanceDetail(undecided) +
+			"; run the drain again once the cause is fixed"
+		return g
+	}
+	g.OK, g.Detail = true, "the drain decided the fate of every VM of this Director on node "+node
+	return g
 }
 
 // drainNodesGate passes when node is an online node of the cluster and every
@@ -521,13 +546,16 @@ func (r *drainRun) leftRunning() string {
 
 // waitForPVE waits up to the settle timeout until no VM that can leave is on
 // the node and nothing is migrating or relocating, apart from the VMs that
-// can't leave. It reads the cluster and decides the fates again on each poll,
-// and returns the last view. false means the run halted.
+// can't leave. A VM whose fate a poll can't decide keeps the wait going too,
+// and when it is still undecided at the timeout, the caller's fates gate ends
+// the run. It reads the cluster and decides the fates again on each poll, and
+// returns the last view. false means the run halted.
 func (r *drainRun) waitForPVE(ctx context.Context, view *drainView) (*drainView, bool) {
 	deadline := r.io.now().Add(r.settle)
 	for {
 		stuck := map[string]bool{}
 		var leaving []*drainVMFate
+		undecided := 0
 		for i := range view.fates {
 			f := &view.fates[i]
 			switch f.Fate {
@@ -535,10 +563,15 @@ func (r *drainRun) waitForPVE(ctx context.Context, view *drainView) (*drainView,
 				stuck[haResourceSid(f.VMID)] = true
 			case DrainLeaves:
 				leaving = append(leaving, f)
+			case DrainUndecided:
+				undecided++
 			}
 		}
 		moving := slices.DeleteFunc(movingServices(view.snap.states), func(sid string) bool { return stuck[sid] })
-		if len(leaving) == 0 && len(moving) == 0 {
+		if len(leaving) == 0 && len(moving) == 0 && undecided == 0 {
+			return view, true
+		}
+		if !r.io.now().Before(deadline) && len(leaving) == 0 && len(moving) == 0 {
 			return view, true
 		}
 		if !r.io.now().Before(deadline) {

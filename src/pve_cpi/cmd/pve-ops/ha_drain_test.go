@@ -91,6 +91,28 @@ func TestRunHADrainDryRunText(t *testing.T) {
 	}
 }
 
+func TestRunHADrainTextNamesAVMItCantDecide(t *testing.T) {
+	t.Parallel()
+	d := newHATestDeps(rbCfg())
+	rep := drainDryRun()
+	rep.VMs = append(rep.VMs, handlers.DrainVM{VMID: 104, Name: "vm-d", Node: "pve1",
+		Fate: handlers.DrainUndecided, Reason: "the storage definitions couldn't be read (boom), so the drain " +
+			"can't tell whether its volume nfs:vm-104-disk-0 sits on shared storage"})
+	withDrain(d, rep, nil)
+	code, out, _ := runHATest(t, d, "drain", "pve1", "--director-uuid", haDirector)
+	if code != exitOK {
+		t.Fatalf("code = %d", code)
+	}
+	for _, frag := range []string{
+		"  VM 104 (vm-d), can't be decided, because the storage definitions couldn't be read (boom)",
+		"1 VM can leave, 1 VM can't, 1 VM can't be decided, and 0 stopped\n",
+	} {
+		if !strings.Contains(out, frag) {
+			t.Fatalf("output lacks %q:\n%s", frag, out)
+		}
+	}
+}
+
 func TestRunHADrainTakesTheNodeAfterTheFlagsAndPrintsJSON(t *testing.T) {
 	t.Parallel()
 	d := newHATestDeps(rbCfg())

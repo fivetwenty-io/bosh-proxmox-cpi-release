@@ -940,6 +940,7 @@ Gates
   the allocation journal holds no open record
   no CPI task or lock is active
   no other rebalance holds the run lock
+  the drain decided the fate of every VM of this Director on node pve2
 VMs on pve2
   VM 1042 (vm-8a1f2c3d), leaves for pve1 or pve3
   VM 1050 (vm-c07a5e19), can't leave, because its strict node-affinity rule bosh-na-1050 names no other node that can take it: stop planned
@@ -950,11 +951,13 @@ Turn resurrection off for `cf` until `pve-ops ha undrain pve2 --apply` finishes,
 
 The drain decides which VMs can't leave from PVE's own rules and the cluster's facts. It starts with the nodes that are online, out of maintenance, and placeable, without the drained node, and it narrows that set with each strict node-affinity rule that names the VM, the node-local storage the VM uses and the targets of its replication jobs, every negative resource-affinity rule, and every positive resource-affinity group the VM belongs to. A VM whose set ends empty can't leave. A VM with no HA resource is listed with a warning, because maintenance never moves it and the drain never stops it, so it goes down with the node when we reboot. We deal with such a VM by hand, as the sections below describe. A VM whose HA resource already requests a state other than `started` stays where it is, and the output says why.
 
+Sometimes the drain can't tell whether a VM can leave. That happens when the cluster's storage list couldn't be read, when the list doesn't name a storage that holds one of the VM's volumes, or when the VM belongs to a positive resource-affinity group with a VM the drain can't decide. The VM's line then says that it can't be decided and why, and the `fates` gate refuses with exit 3 before anything stops. A rerun decides again from a fresh read, so we run the drain again once the read works.
+
 With `--apply`, the drain takes the run lock `bosh-lock-ha-rebalance`, so a drain, an undrain, and a rebalance never run at once on one cluster. It then works through these steps.
 
 1. It reads the cluster and checks the gates again from a fresh read.
 
-2. It waits for PVE HA to move every VM that can leave. It reads the cluster every 5 seconds, and it stops waiting once no such VM is left on the node and no HA service is migrating or relocating. A VM that can leave but is still on the node when the settle timeout runs out ends the run with exit 1, and the report names the nodes that could take it, because something other than the rules is holding it.
+2. It waits for PVE HA to move every VM that can leave. It reads the cluster every 5 seconds, and it stops waiting once no such VM is left on the node and no HA service is migrating or relocating. A poll that can't decide a VM's fate keeps the wait going, and a VM that is still undecided when the settle timeout runs out makes the `fates` gate refuse with exit 3, with nothing stopped. A VM that can leave but is still on the node when the settle timeout runs out ends the run with exit 1, and the report names the nodes that could take it, because something other than the rules is holding it.
 
 3. For each VM that can't leave, it reads the HA resource again under the VM's journal record and claim, and it confirms that the VM is still on the node and still requests `started`. In one write, it sets the resource's state to `stopped` and adds the comment token `bosh-drain-stopped=<node>`. It keeps the ownership marker and every other token in the comment. It never calls `qm stop`, so PVE HA itself shuts the guest down.
 

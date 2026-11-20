@@ -276,6 +276,8 @@ func haDrainVMText(vm *handlers.DrainVM, drain bool) string {
 			line += ", leaves for " + strings.Join(vm.Targets, " or ")
 		case handlers.DrainStays:
 			line += ", can't leave, because " + vm.Reason
+		case handlers.DrainUndecided:
+			line += ", can't be decided, because " + vm.Reason
 		case handlers.DrainNotHA, handlers.DrainNotStarted:
 			line += ", stays, because " + vm.Reason
 		}
@@ -310,15 +312,22 @@ func writeHADrainSummary(w io.Writer, r *handlers.DrainReport) {
 			r.Count(handlers.DrainOutcomeStarted))
 		return
 	}
-	leaves, stays := 0, 0
+	leaves, stays, undecided := 0, 0, 0
 	for i := range r.VMs {
 		switch r.VMs[i].Fate {
 		case handlers.DrainLeaves:
 			leaves++
 		case handlers.DrainStays:
 			stays++
+		case handlers.DrainUndecided:
+			undecided++
 		}
 	}
-	_, _ = fmt.Fprintf(w, "%s can leave, %s can't, and %d stopped\n", haCount(leaves, "VM", "VMs"),
-		haCount(stays, "VM", "VMs"), r.Count(handlers.DrainOutcomeStopped)+r.Count(handlers.DrainOutcomeStoppedEarlier))
+	undecidedText := ""
+	if undecided > 0 {
+		undecidedText = haCount(undecided, "VM", "VMs") + " can't be decided, "
+	}
+	_, _ = fmt.Fprintf(w, "%s can leave, %s can't, %sand %d stopped\n", haCount(leaves, "VM", "VMs"),
+		haCount(stays, "VM", "VMs"), undecidedText,
+		r.Count(handlers.DrainOutcomeStopped)+r.Count(handlers.DrainOutcomeStoppedEarlier))
 }

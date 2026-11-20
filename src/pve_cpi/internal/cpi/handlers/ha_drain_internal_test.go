@@ -449,3 +449,54 @@ func TestDrainGates_TheNodesAndMaintenanceGates(t *testing.T) {
 		t.Fatalf("an unknown node passed %+v", g)
 	}
 }
+
+func TestDrainRun_AnUnreadableStorageListRefusesAndStopsNothing(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	drMaintenance(f)
+	f.addVM(101, "pve01", 4)
+	drHold(f, 102)
+	f.profileVal.StoragesErr = "GET /storage: 500 Internal Server Error"
+	rep := drRun(f, DrainCommand, true).drain(context.Background())
+	if rep.ExitCode != RebalanceExitGate || rep.Halted != DrainGateFates {
+		t.Fatalf("exit %d halted %q gates %+v", rep.ExitCode, rep.Halted, rep.Gates)
+	}
+	var gate RebalanceGate
+	for _, g := range rep.Gates {
+		if g.Name == DrainGateFates {
+			gate = g
+		}
+	}
+	if gate.OK || !strings.Contains(gate.Detail, "VM 101") || strings.Contains(gate.Detail, "VM 102") {
+		t.Fatalf("fates gate %+v", gate)
+	}
+	if got, want := drVMs(rep.VMs), []string{"101 undecided", "102 stays planned"}; !slices.Equal(got, want) {
+		t.Fatalf("vms %v, want %v", got, want)
+	}
+	if len(f.callsWith("stop ")) != 0 || f.vms[101].state != "started" || f.vms[102].state != "started" {
+		t.Fatalf("a drain that couldn't decide stopped a VM: %v", f.calls)
+	}
+
+	// A storage read that fails while PVE HA moves VMs keeps the wait going,
+	// and the drain stops the VM that can't leave once the read recovers.
+	f = newFakeRebalanceIO()
+	drMaintenance(f)
+	f.addVM(101, "pve01", 4)
+	drHold(f, 102)
+	f.moving[101] = true
+	f.stopSettle = 1
+	f.observeHook = func(n int) {
+		switch n {
+		case 2:
+			f.profileVal.StoragesErr = "GET /storage: 500 Internal Server Error"
+			delete(f.moving, 101)
+		case 3:
+			f.profileVal.StoragesErr = ""
+			f.vms[101].node = "pve02"
+		}
+	}
+	rep = drRun(f, DrainCommand, true).drain(context.Background())
+	if rep.ExitCode != RebalanceExitOK || !slices.Equal(drVMs(rep.VMs), []string{"102 stays stopped"}) {
+		t.Fatalf("exit %d halted %q vms %v", rep.ExitCode, rep.Halted, drVMs(rep.VMs))
+	}
+}
