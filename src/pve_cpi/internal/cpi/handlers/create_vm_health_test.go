@@ -398,10 +398,10 @@ func TestCreateVM_HealthGate_Timeout_DiagnosticsRunInTheCallsAffinityScope(t *te
 }
 
 // --------------------------------------------------------------------------
-// Scenario 5: enabled + context cancelled before deadline → error + rollback
+// Scenario 5: enabled + context canceled before deadline → error + rollback
 // --------------------------------------------------------------------------
 
-func TestCreateVM_HealthGate_Enabled_ContextCancelled(t *testing.T) {
+func TestCreateVM_HealthGate_Enabled_ContextCanceled(t *testing.T) {
 	t.Parallel()
 	// A 1ms floor lets the context expiry (200ms) drive the test, not the floor.
 	seamCtx := handlers.WithHealthPollMinIntervalForTest(context.Background(), time.Millisecond)
@@ -438,7 +438,7 @@ func TestCreateVM_HealthGate_Enabled_ContextCancelled(t *testing.T) {
 	h := handlers.HandleCreateVM(deps)
 	_, err := h.Handle(ctx, args, mkCtx("health-ctx-cancel"))
 	if err == nil {
-		t.Fatal("expected error when context is cancelled during health ping")
+		t.Fatal("expected error when context is canceled during health ping")
 	}
 	if deleteQemuCalled {
 		// Rollback is attempted with a detached context (contextWithoutCancel).

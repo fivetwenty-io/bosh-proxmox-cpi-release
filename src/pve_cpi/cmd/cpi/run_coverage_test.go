@@ -99,13 +99,13 @@ func TestRunCPI_MissingMethodField(t *testing.T) {
 	}
 }
 
-// TestRunCPI_ContextCancelledBetweenRequests cancels the context while the
+// TestRunCPI_ContextCanceledBetweenRequests cancels the context while the
 // first request's handler is executing and verifies runCPI returns errSignaled.
 // Determinism comes from the handler closing handlerRunning before returning:
 // the test cancels at that moment, so by the time runCPI reaches its
-// post-writeResponse select on ctx.Done(), the context is already cancelled.
+// post-writeResponse select on ctx.Done(), the context is already canceled.
 // No reliance on polling, sleep, or pipe close ordering.
-func TestRunCPI_ContextCancelledBetweenRequests(t *testing.T) {
+func TestRunCPI_ContextCanceledBetweenRequests(t *testing.T) {
 	t.Parallel()
 	_, logger := makeTestDeps(t)
 

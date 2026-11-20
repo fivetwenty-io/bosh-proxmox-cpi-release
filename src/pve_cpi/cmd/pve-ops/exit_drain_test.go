@@ -181,12 +181,12 @@ func TestRunDrainsTheEndpointCacheBeforeItReturns(t *testing.T) {
 	}
 }
 
-// finishedIfNotCancelled starts a worker that records a write 300 milliseconds
+// finishedIfNotCanceled starts a worker that records a write 300 milliseconds
 // after it starts, unless its context ends first, and returns a flag that says
 // whether the write happened. The 300 milliseconds are well short of the
 // drain's default bound and long enough that a drain with no wait cancels the
 // worker first.
-func finishedIfNotCancelled(t *testing.T) *atomic.Bool {
+func finishedIfNotCanceled(t *testing.T) *atomic.Bool {
 	t.Helper()
 	var wrote atomic.Bool
 	if err := endpointcache.Go("slow write", config.DiscoveryModeAuto, func(ctx context.Context) {
@@ -207,14 +207,14 @@ func finishedIfNotCancelled(t *testing.T) *atomic.Bool {
 func TestRunWaitsForABackgroundWriteWithTheDefaultBound(t *testing.T) {
 	endpointcache.Open()
 	t.Cleanup(endpointcache.Open)
-	wrote := finishedIfNotCancelled(t)
+	wrote := finishedIfNotCanceled(t)
 
 	var stdout, stderr syncBuffer
 	if code := run([]string{"version"}, &stdout, &stderr); code != exitOK {
 		t.Fatalf("exit %d, want %d: %s", code, exitOK, stderr.String())
 	}
 	if !wrote.Load() {
-		t.Error("run returned before the background write finished, or cancelled it")
+		t.Error("run returned before the background write finished, or canceled it")
 	}
 }
 
@@ -280,10 +280,10 @@ func TestRunEndsItsDrainOnSIGTERMAndKeepsTheExitCode(t *testing.T) {
 			held := make(chan os.Signal, 1)
 			signal.Notify(held, syscall.SIGTERM)
 			t.Cleanup(func() { signal.Stop(held) })
-			cancelled := make(chan struct{})
+			canceled := make(chan struct{})
 			if err := endpointcache.Go("stuck write", config.DiscoveryModeAuto, func(ctx context.Context) {
 				<-ctx.Done()
-				close(cancelled)
+				close(canceled)
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -315,7 +315,7 @@ func TestRunEndsItsDrainOnSIGTERMAndKeepsTheExitCode(t *testing.T) {
 				t.Fatal("SIGTERM did not end the exit drain")
 			}
 			select {
-			case <-cancelled:
+			case <-canceled:
 			case <-time.After(5 * time.Second):
 				t.Error("the signal did not cancel the slow worker")
 			}
@@ -327,7 +327,7 @@ func TestRunEndsItsDrainOnSIGTERMAndKeepsTheExitCode(t *testing.T) {
 // command's standard error, and the command keeps the exit code it computed. A
 // SIGTERM ends the wait at once, so the worker is still running when the drain
 // cancels it.
-func TestRunWarnsOnStderrAboutAWorkerTheExitDrainCancelledUnderOn(t *testing.T) {
+func TestRunWarnsOnStderrAboutAWorkerTheExitDrainCanceledUnderOn(t *testing.T) {
 	endpointcache.Open()
 	t.Cleanup(endpointcache.Open)
 	held := make(chan os.Signal, 1)
@@ -361,7 +361,7 @@ func TestRunWarnsOnStderrAboutAWorkerTheExitDrainCancelledUnderOn(t *testing.T) 
 		t.Fatal("SIGTERM did not end the exit drain")
 	}
 	for _, want := range []string{
-		`"level":"WARN"`, "cancelled background work still running at exit", "stuck refresh",
+		`"level":"WARN"`, "canceled background work still running at exit", "stuck refresh",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Errorf("stderr = %q, want it to contain %q", stderr.String(), want)

@@ -207,7 +207,7 @@ type coldLimits struct {
 // coldStart is the cold start of one pool. A process runs one cold start. One
 // walk at a time probes its candidates, and every other walk that reaches it
 // meanwhile waits for that walk. When the walk that probes them stops because
-// its own request was cancelled, its send-by deadline passed, or its context
+// its own request was canceled, its send-by deadline passed, or its context
 // left less than one probe may take, the candidates it never probed pass to
 // the next walk that reaches the cold start, which goes on where it stopped.
 // A candidate whose probe that request's own context cut before it answered
@@ -816,7 +816,7 @@ func (p *Pool) logColdStartDropped(probed, unprobed int) {
 func coldStopReason(stop stopReason, unprobed int) (string, string) {
 	switch {
 	case stop == stopCaller:
-		return "cancelled", "the request's context ended"
+		return "canceled", "the request's context ended"
 	case stop == stopSendBy:
 		return "send_by", "the request's send-by deadline passed"
 	case stop == stopShort:
@@ -1080,7 +1080,7 @@ func (t *probeTransport) seal() (answered bool, proof error) {
 // ended reports whether the probe's own context has ended, counting a deadline
 // that has passed before its timer fired, so a failure the probe's deadline
 // caused is never read as the candidate's. Which error the transport returned
-// says nothing here, because a context cancelled with a cause hands the
+// says nothing here, because a context canceled with a cause hands the
 // transport that cause, and a dial that ran out its own cap returns an error
 // that matches context.DeadlineExceeded.
 func (t *probeTransport) ended() bool {

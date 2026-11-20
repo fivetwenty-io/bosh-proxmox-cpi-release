@@ -407,7 +407,7 @@ func NewStorageInfoCache(lister StorageLister, ttl time.Duration, opts ...Storag
 //
 // Inputs and failure modes:
 //   - name "" → error before any lock or fetch.
-//   - ctx cancelled while waiting on inflight → returns ctx.Err() wrapped.
+//   - ctx canceled while waiting on inflight → returns ctx.Err() wrapped.
 //   - lister error → refresh goroutine returns the error; waiters receive it
 //     because the cache is not populated and they attempt their own refresh
 //     via the same coalescing path (the inflight channel is deleted after

@@ -216,7 +216,7 @@ func (p *Pool) sendFollowing(req *http.Request, target tetherTarget, configuredO
 // demotes it and is recorded as a connect-phase failure, and nothing
 // a routed request gets ever makes an endpoint active. When the request's own
 // context ends during the dial, net/http returns the context's error, which
-// carries no tag, so a cancelled request records nothing, and a connect meter
+// carries no tag, so a canceled request records nothing, and a connect meter
 // on the clone shows whether it ever got a connection. A pin or verification
 // failure that finished after the send-by bound still counts against its
 // endpoint, while the request reports the send-by refusal. The error is
@@ -295,7 +295,7 @@ func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCl
 }
 
 // routedOutcome is the outcome of a routed request of the given class, which
-// sent clone and got err. cancelledUnsent says the request's own context had
+// sent clone and got err. canceledUnsent says the request's own context had
 // ended and the clone never got a connection. A routed request never hops and
 // never promotes, so the outcome only says what was sent, whether a send-by
 // deadline refused it, and whether the pool refused it for a defect. It is
@@ -303,19 +303,19 @@ func (p *Pool) sendRouted(req *http.Request, target tetherTarget, body io.ReadCl
 // provesNeverSent, and on a caller cancellation before a connection, which
 // sentState explains. A refused send-by carries the tag and follows the
 // connect-phase rule, so a mutation Go may have replayed is maybe sent.
-func routedOutcome(class reqClass, clone *http.Request, err error, cancelledUnsent bool) outcome {
+func routedOutcome(class reqClass, clone *http.Request, err error, canceledUnsent bool) outcome {
 	if err == nil {
 		return outcome{action: actReturn, sent: sentAnswered}
 	}
 	oc := outcome{action: actReturn, sent: sentMaybe, class: classTransport}
 	cpe, tagged := AsConnectPhase(err)
-	cancelled := cancelledUnsent && !errors.Is(err, ErrSendByPassed)
-	if cancelled {
+	canceled := canceledUnsent && !errors.Is(err, ErrSendByPassed)
+	if canceled {
 		oc.sent = sentNever
 	}
 	if !tagged {
-		if cancelled {
-			oc.class = classCancelled
+		if canceled {
+			oc.class = classCanceled
 		}
 		return oc
 	}
@@ -780,7 +780,7 @@ func (w *walker) end(h hopResult, stop stopReason, next int, rebuildErr error) (
 	oc := outcome{action: actReturn, sent: h.oc.sent, class: h.oc.class, addr: h.ep.addr}
 	switch stop {
 	case stopCaller:
-		oc.class = classCancelled
+		oc.class = classCanceled
 		return nil, oc, w.req.Context().Err()
 	case stopSendBy:
 		oc.sendBy, oc.class = true, classSendBy

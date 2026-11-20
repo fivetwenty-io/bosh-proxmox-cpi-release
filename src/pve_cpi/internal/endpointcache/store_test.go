@@ -540,7 +540,7 @@ func TestStoreUpdateWritesNothingWhenContextEndsDuringMerge(t *testing.T) {
 	}
 }
 
-// lockHeldContext reports itself cancelled once the store's lock is held
+// lockHeldContext reports itself canceled once the store's lock is held
 // elsewhere, so a test can end a context at the moment Update has just taken
 // the lock. The lock wait runs on a child context and never calls Err on this
 // one, so the first call is Update's own check after the lock is held.

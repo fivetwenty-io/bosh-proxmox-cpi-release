@@ -217,8 +217,8 @@ func drainProcessRegistry(t *testing.T) endpointcache.DrainResult {
 	t.Helper()
 	result := endpointcache.Drain(context.Background(), 30*time.Second)
 	endpointcache.Open()
-	if len(result.Cancelled) > 0 || len(result.Panics) > 0 {
-		t.Fatalf("the drain cancelled %v and met panics %v", result.Cancelled, result.Panics)
+	if len(result.Canceled) > 0 || len(result.Panics) > 0 {
+		t.Fatalf("the drain canceled %v and met panics %v", result.Canceled, result.Panics)
 	}
 	return result
 }

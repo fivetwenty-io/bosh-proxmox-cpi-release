@@ -285,7 +285,7 @@ func (s *vmidClaimSet) release(ctx context.Context, vmid int, logger *log.Logger
 }
 
 // releaseVMIDClaimHandle deletes a claim's sentinel. It runs on a context
-// detached from the request and bounded at lockReleaseTimeout, so a cancelled
+// detached from the request and bounded at lockReleaseTimeout, so a canceled
 // request still deletes its sentinel. A failed delete is sent again up to
 // vmidClaimReleaseAttempts times in all, pausing vmidClaimReleaseBackoff and
 // then twice that, inside the same bound. Release leaves a handle whose delete

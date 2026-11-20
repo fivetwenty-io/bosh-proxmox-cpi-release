@@ -13,7 +13,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 )
 
-// blockingHandler blocks until its context is cancelled, then returns the
+// blockingHandler blocks until its context is canceled, then returns the
 // context error wrapped as a generic (non-retriable) cloud error — exactly how
 // a real handler whose retry/poll loop observes ctx.Done() would behave when a
 // deadline fires.
@@ -207,7 +207,7 @@ func TestDispatcher_NoResolver_BehaviorUnchanged(t *testing.T) {
 // TestDispatcher_MethodTimeout_ParentCancelNotTimeout verifies that a handler
 // erroring due to PARENT context cancellation (signal shutdown), not the
 // per-method deadline, is NOT relabeled as a retriable timeout. The parent is
-// cancelled while the per-method budget is large, so callCtx.Err() is
+// canceled while the per-method budget is large, so callCtx.Err() is
 // context.Canceled, not DeadlineExceeded.
 func TestDispatcher_MethodTimeout_ParentCancelNotTimeout(t *testing.T) {
 	t.Parallel()

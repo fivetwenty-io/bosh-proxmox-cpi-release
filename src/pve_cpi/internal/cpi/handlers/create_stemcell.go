@@ -576,7 +576,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 			inflightRelease, inflightErr := deps.Inflight.acquire(ctx, templateNode, deps.Config.MaxInflightPerNodeLimit())
 			if inflightErr != nil {
 				return nil, cpierrors.Retriable(
-					"create_stemcell: in-flight limit exceeded or context cancelled on node %s: %s",
+					"create_stemcell: in-flight limit exceeded or context canceled on node %s: %s",
 					templateNode, inflightErr.Error())
 			}
 			defer inflightRelease()

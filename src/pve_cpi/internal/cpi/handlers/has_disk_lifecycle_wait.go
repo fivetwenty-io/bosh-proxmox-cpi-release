@@ -730,7 +730,7 @@ const (
 	// hasDiskStillHeld is a wait that ran out while the lifecycle still held
 	// the disk's record.
 	hasDiskStillHeld hasDiskWaitOutcome = "it still holds the disk's allocation record"
-	// hasDiskRequestEnded is a request that was cancelled, or whose deadline
+	// hasDiskRequestEnded is a request that was canceled, or whose deadline
 	// passed, during the wait or the second look.
 	hasDiskRequestEnded hasDiskWaitOutcome = "the request ended before has_disk could look at the disk again"
 	// hasDiskNoTimeToLook is a request with too little time left for the

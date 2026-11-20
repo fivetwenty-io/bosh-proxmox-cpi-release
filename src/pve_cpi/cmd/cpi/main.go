@@ -278,7 +278,7 @@ func entryClientFactory(
 //
 // Every path opens the endpoint cache's worker registry and drains it before
 // returning, so a background cache write that a PVE client started finishes,
-// or is cancelled, before the process exits. The main path drains beside the
+// or is canceled, before the process exits. The main path drains beside the
 // OTel flush, and the deferred drain below covers the subcommands and every
 // early return. It finds an already-drained registry on the main path and
 // returns at once, and a path that started no worker never waits.
@@ -334,7 +334,7 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		return 1
 	}
 
-	// Root context cancelled on SIGINT/SIGTERM. defer cancel() fires when
+	// Root context canceled on SIGINT/SIGTERM. defer cancel() fires when
 	// runWithArgs returns, deregistering the signal handler and releasing
 	// resources even though main calls os.Exit — the exit is deferred until
 	// after run() returns. Built before tracer setup because otel.Setup dials
@@ -361,7 +361,7 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// across all three) so a slow or hung collector on one signal cannot
 	// starve the flush budget of another. The deadline's parent is
 	// context.Background() rather than rootCtx: by the time this defer runs,
-	// rootCtx may already be cancelled (e.g. by the same SIGTERM that ended
+	// rootCtx may already be canceled (e.g. by the same SIGTERM that ended
 	// the request loop), which would leave zero budget to flush buffered
 	// spans/logs/metrics. A flush/export failure is logged at Warn and never
 	// changes the process's exit code: every deadline is bounded, and an
@@ -616,8 +616,8 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 
 // drainBackgroundWork waits for the endpoint cache's background workers, for
 // at most wait or endpointcache.DrainWait when wait is zero, cancels the ones
-// still running, and logs what the drain found on logger. The cancelled-work
-// line is at the level the drain reports, which is Warn when a cancelled
+// still running, and logs what the drain found on logger. The canceled-work
+// line is at the level the drain reports, which is Warn when a canceled
 // worker serves a cluster config with an explicit "on" and Debug otherwise.
 func drainBackgroundWork(ctx context.Context, logger *log.Logger, wait time.Duration) {
 	logDrainResult(logger, endpointcache.Drain(ctx, drainWait(wait)))
@@ -646,7 +646,7 @@ func logDrainResult(logger *log.Logger, result endpointcache.DrainResult) {
 	endpointcache.LogDrainResult(logger, result)
 }
 
-// errSignaled is returned by runCPI when the parent context is cancelled by a signal.
+// errSignaled is returned by runCPI when the parent context is canceled by a signal.
 var errSignaled = errors.New("cpi: terminated by signal")
 
 // runCPI is the testable inner loop. It reads JSON-RPC requests from r until
@@ -659,7 +659,7 @@ var errSignaled = errors.New("cpi: terminated by signal")
 // lines are skipped silently.
 //
 // Inputs:
-//   - ctx: cancelled by SIGINT/SIGTERM; cancellation finishes the current request then returns errSignaled.
+//   - ctx: canceled by SIGINT/SIGTERM; cancellation finishes the current request then returns errSignaled.
 //   - r: JSON-RPC request stream (typically os.Stdin).
 //   - w: JSON-RPC response stream (typically os.Stdout); wrapped in bufio.Writer and flushed after each response.
 //   - d: dispatcher with handlers pre-registered.

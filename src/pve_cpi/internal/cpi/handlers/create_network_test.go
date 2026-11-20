@@ -1705,7 +1705,7 @@ func TestHandleCreateNetwork_LayeredResolver_VMTypeProfile_SuppliesNode(t *testi
 
 // -- TestCreateNetwork_RollbackSurvivesParentCancel --
 //
-// Verifies that when the caller's context is cancelled mid-flow, the
+// Verifies that when the caller's context is canceled mid-flow, the
 // best-effort rollback path still executes its cleanup I/O — i.e. the
 // rollback uses a detached context that survives parent cancellation.
 //
@@ -1716,7 +1716,7 @@ func TestHandleCreateNetwork_LayeredResolver_VMTypeProfile_SuppliesNode(t *testi
 //     cancels the parent context, simulating an upstream abort.
 //  4. CreateSdnVnetsSubnets returns a non-409 error, triggering rollback.
 //  5. The rollback must call DeleteSdnVnets and UpdateSdn (apply) even
-//     though the parent context is already cancelled.
+//     though the parent context is already canceled.
 
 func TestCreateNetwork_RollbackSurvivesParentCancel(t *testing.T) {
 	t.Parallel()

@@ -480,7 +480,7 @@ func moverProtectionReadsBack(ctx context.Context, c Client, logger *log.Logger,
 // where the mover is. It returns an error when neither read places the mover.
 //
 // The reads run on a context that outlives the request, bounded by the restore
-// timeout, so a request that was cancelled still finds the mover and restores
+// timeout, so a request that was canceled still finds the mover and restores
 // its protection.
 func locateMoverAfterMigrate(ctx context.Context, c Client, logger *log.Logger, mover DiskHolder) (string, error) {
 	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), parkerRestoreTimeout(ctx))

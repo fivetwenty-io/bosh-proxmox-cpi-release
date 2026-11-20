@@ -17,7 +17,7 @@ import (
 )
 
 // spreadClaimReleaseTimeout bounds the release of a claim, which runs detached
-// from the request so a cancelled create still gives its claim up.
+// from the request so a canceled create still gives its claim up.
 const spreadClaimReleaseTimeout = 5 * time.Second
 
 // EndpointCacheSpreadClaims is the production source of spread claim records.
@@ -222,7 +222,7 @@ func (s *spreadClaims) bind(ctx context.Context, vmid int) {
 }
 
 // release gives the claim up when create_vm returns. It runs detached from
-// ctx, so a cancelled create still releases, and it is free to call again.
+// ctx, so a canceled create still releases, and it is free to call again.
 func (s *spreadClaims) release(ctx context.Context) {
 	if s == nil || s.claim.Node() == "" {
 		return

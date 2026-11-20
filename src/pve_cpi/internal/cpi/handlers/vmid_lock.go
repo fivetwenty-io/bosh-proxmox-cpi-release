@@ -152,7 +152,7 @@ func withVMIDLockFor(
 	}
 	defer func() {
 		// Release is cleanup: run it on a detached, bounded context so an
-		// expired or cancelled request ctx cannot make DeletePool fail
+		// expired or canceled request ctx cannot make DeletePool fail
 		// instantly and orphan the sentinel pool until a later acquirer
 		// steals it past the TTL.
 		relCtx, relCancel := detachedContext(ctx, lockReleaseTimeout)

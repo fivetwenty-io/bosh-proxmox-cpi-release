@@ -30,7 +30,7 @@ import (
 //
 // Otherwise an error the endpoint pool marked with endpointpool.MaybeSentError
 // never counts, whatever it wraps, and neither does any other transport
-// fault, a timeout, a cancelled context, or a gateway or relay status such as
+// fault, a timeout, a canceled context, or a gateway or relay status such as
 // 596. Those leave the outcome unknown. nil reports false.
 func IsMutationRefusedOrUnsent(err error) bool {
 	if err == nil {

@@ -202,7 +202,7 @@ func WithNodeImageStorageScan(node string) AllocOption {
 // and returns the slept duration so callers can log it. The order of
 // precedence is: noBackoff (returns 0) > backoffFn > default jitter.
 //
-// The sleep is context-aware: if ctx is cancelled or its deadline expires
+// The sleep is context-aware: if ctx is canceled or its deadline expires
 // before the sleep completes, retryBackoff returns ctx.Err() immediately
 // so callers stop retrying without waiting for the full sleep duration.
 //
@@ -213,7 +213,7 @@ func WithNodeImageStorageScan(node string) AllocOption {
 //   - attempt: 0-indexed retry count.
 //
 // Failure modes:
-//   - ctx cancelled/deadline exceeded before sleep completes → returns ctx.Err().
+//   - ctx canceled/deadline exceeded before sleep completes → returns ctx.Err().
 //   - noBackoff set → returns nil immediately (d == 0).
 //   - normal completion → returns nil.
 func retryBackoff(ctx context.Context, ao *allocOpts, err error, attempt int) error {
@@ -881,7 +881,7 @@ func AllocateWithRetry(
 				lastConflictErr = createErr
 				if attempt < maxAttempts-1 {
 					if sleepErr := retryBackoff(ctx, ao, createErr, attempt); sleepErr != nil {
-						return 0, cpierrors.Wrap(sleepErr, "AllocateWithRetry: context cancelled during backoff")
+						return 0, cpierrors.Wrap(sleepErr, "AllocateWithRetry: context canceled during backoff")
 					}
 				}
 				continue
@@ -957,7 +957,7 @@ func AllocateDiskWithRetry(
 				lastConflictErr = createErr
 				if attempt < maxAttempts-1 {
 					if sleepErr := retryBackoff(ctx, ao, createErr, attempt); sleepErr != nil {
-						return 0, cpierrors.Wrap(sleepErr, "AllocateDiskWithRetry: context cancelled during backoff")
+						return 0, cpierrors.Wrap(sleepErr, "AllocateDiskWithRetry: context canceled during backoff")
 					}
 				}
 				continue

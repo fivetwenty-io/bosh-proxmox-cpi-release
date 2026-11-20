@@ -111,7 +111,7 @@ func TestSendByDoesNotChangeContextCancellation(t *testing.T) {
 	ctx := WithSendBy(parent, time.Now().Add(time.Hour), "DELETE", "/pools")
 	cancel()
 	if ctx.Err() == nil {
-		t.Error("cancelling the parent should cancel the derived context")
+		t.Error("canceling the parent should cancel the derived context")
 	}
 }
 

@@ -55,11 +55,11 @@ type DiscoveryWorkerConfig struct {
 	// discover lock, and writes through it. The caller keeps owning it and
 	// closes it after the exit drain. The drain cancels a worker that is still
 	// running and does not wait for it to return, so the store may be closed
-	// while a cancelled worker is still unwinding. That is safe. The store
+	// while a canceled worker is still unwinding. That is safe. The store
 	// guards its directory against Close, a worker that finds its context
-	// cancelled returns before it touches the store, and one that meets the
+	// canceled returns before it touches the store, and one that meets the
 	// closed store after the cancel returns without a line, because the drain
-	// reports the cancelled worker.
+	// reports the canceled worker.
 	Store *endpointcache.Store
 	// Mode is the configured discovery mode of the cluster config the store
 	// serves, from CPIConfig.DiscoveryModeValue, not the effective mode. It
@@ -263,7 +263,7 @@ func (w *DiscoveryWorker) launch(via string, b DiscoveryBinding) {
 // process may have finished a refresh in between, and then discovers, which
 // records the attempt before any read.
 func (w *DiscoveryWorker) refresh(ctx context.Context, via string, b DiscoveryBinding) {
-	// A worker the drain cancelled before it started has nothing to do, and
+	// A worker the drain canceled before it started has nothing to do, and
 	// the caller may be closing the store.
 	if ctx.Err() != nil {
 		return
@@ -312,7 +312,7 @@ func (w *DiscoveryWorker) refresh(ctx context.Context, via string, b DiscoveryBi
 // cannot read for another reason, such as a failed ownership check, makes no
 // refresh due, because the write would fail the same way. A read that fails
 // after the context ended, such as one that meets a store the caller closed
-// behind a drain, says nothing, because the drain reports the cancelled
+// behind a drain, says nothing, because the drain reports the canceled
 // worker. A pin failure in another process counts through the file's
 // pin_failed_at, which endpointcache.RefreshDue reads, and through a pin mark
 // the reader still loads, which lives two minutes and so is always younger
@@ -497,7 +497,7 @@ const maxHiddenWait = discoveryFailureWait + endpointcache.FutureSkew
 // the reads may start. When the attempt does not reach the file, because the
 // write failed or the lock wait ran out, the refresh is skipped, as due skips
 // one whose write would fail, because a refresh that runs unrecorded and is
-// then cancelled would start again on every call.
+// then canceled would start again on every call.
 //
 // A stored section that a reader hides for being dated ahead of the clock
 // takes no attempt, because the merge never moves that section's time. Such a

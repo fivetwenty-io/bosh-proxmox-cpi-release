@@ -194,7 +194,7 @@ func ensureAntiAffinityMembershipWith(
 }
 
 // releaseAntiAffinityLock releases an anti-affinity lock. The release is
-// detached and bounded for the same reason as withVMIDLock's: a cancelled
+// detached and bounded for the same reason as withVMIDLock's: a canceled
 // request must not orphan the sentinel pool, and the anti-affinity lock's
 // longer TTL makes an orphan proportionally more disruptive to concurrent
 // create_vm calls. A failure is only logged.

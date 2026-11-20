@@ -68,7 +68,7 @@ func WithMaxWait(d time.Duration) AwaitOption {
 //   - upid is empty — non-retriable CloudError (programming error).
 //   - node is empty — non-retriable CloudError (programming error).
 //   - ctx is nil — non-retriable CloudError (programming error).
-//   - ctx cancelled / deadline exceeded — retriable RetriableCloudError; the
+//   - ctx canceled / deadline exceeded — retriable RetriableCloudError; the
 //     BOSH director re-issues the CPI action with a new VMID.
 //   - transient poll fault (5xx, connection error, network timeout, 595 from
 //     a down task node) — re-polled at the poll interval until the task's
@@ -249,7 +249,7 @@ func waitTaskThroughTransientFaults(
 		// a fresh VMID on retry and the VMID range-scan prevents collision.
 		if ctx.Err() != nil {
 			return nil, cpierrors.WrapAs(ctx.Err(), cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("AwaitTask %s: context cancelled", upid))
+				fmt.Sprintf("AwaitTask %s: context canceled", upid))
 		}
 		// The SDK reports a RESOLVED task's failing exit status as an error
 		// of its own ("task failed: <exit text>", parseTaskStatus in
@@ -336,7 +336,7 @@ func waitTaskThroughTransientFaults(
 		case <-ctx.Done():
 			sleep.Stop()
 			return nil, cpierrors.WrapAs(ctx.Err(), cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("AwaitTask %s: context cancelled", upid))
+				fmt.Sprintf("AwaitTask %s: context canceled", upid))
 		case <-deadlineTimer.C:
 			sleep.Stop()
 			finalPoll = true
@@ -431,7 +431,7 @@ func adaptiveTaskInterval(elapsed time.Duration, progress float64, fallback time
 //   - terminal "stopped" with any other exit → classified by exit text:
 //     lock/quorum/pushback contention retriable, everything else permanent
 //   - poll deadline exceeded while still running → retriable (task still running)
-//   - ctx cancelled → retriable
+//   - ctx canceled → retriable
 //   - initial not-found reads → retried three times for PVE task registration
 //   - persistent not-found, or disappearance after observation → non-retriable
 //   - other transient read errors → retried until the deadline
@@ -459,7 +459,7 @@ func awaitTaskAdaptive(ctx context.Context, c Client, node, upid string, opts ..
 		case err != nil:
 			if ctx.Err() != nil {
 				return cpierrors.WrapAs(ctx.Err(), cpierrors.TypeRetriableCloud,
-					fmt.Sprintf("AwaitTask %s: context cancelled", upid))
+					fmt.Sprintf("AwaitTask %s: context canceled", upid))
 			}
 			if actx.Err() != nil {
 				return pollTimeoutUnresolved(upid)
@@ -502,7 +502,7 @@ func awaitTaskAdaptive(ctx context.Context, c Client, node, upid string, opts ..
 		select {
 		case <-ctx.Done():
 			return cpierrors.WrapAs(ctx.Err(), cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("AwaitTask %s: context cancelled", upid))
+				fmt.Sprintf("AwaitTask %s: context canceled", upid))
 		case <-actx.Done():
 			return pollTimeoutUnresolved(upid)
 		case <-time.After(d):

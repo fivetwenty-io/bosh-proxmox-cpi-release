@@ -2390,7 +2390,7 @@ func attachToParkerLocked(ctx context.Context, c Client, logger *log.Logger, nod
 		if !demoted {
 			return
 		}
-		// Cleanup, so it runs on a detached, bounded context. A cancelled or
+		// Cleanup, so it runs on a detached, bounded context. A canceled or
 		// timed-out park is exactly when the stranded reference matters most,
 		// and both the sentinel-pool acquire and the detach it guards would
 		// otherwise fail instantly on the dead context and leave the unusedN
@@ -2950,7 +2950,7 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 			// already be waiting on it, so running the window unserialized
 			// could overlap a holder.
 			//
-			// A wait cut short by a cancelled request is the same case too. The
+			// A wait cut short by a canceled request is the same case too. The
 			// request has ended, so there is no window left to run.
 			//
 			// So is a create that the client refused before it reached PVE,
@@ -2979,7 +2979,7 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 		return fn(context.WithValue(ctx, parkerLockUnserializedKey{}, true))
 	}
 	defer func() {
-		// Release on a detached context: an already-cancelled request would
+		// Release on a detached context: an already-canceled request would
 		// otherwise fail the delete instantly and strand the sentinel pool
 		// until a later acquirer steals it past the TTL.
 		relCtx, relCancel := context.WithTimeout(context.WithoutCancel(ctx), parkerLockReleaseTimeout)
@@ -3070,7 +3070,7 @@ func parkerProtectionRestoreWorstCase() time.Duration {
 
 // parkerProtectionRestoreReserveNow is the time set aside for the protection
 // restore that runs after the window body, on a detached context so a
-// cancelled call still puts the flag back. It is also the restore's own
+// canceled call still puts the flag back. It is also the restore's own
 // deadline. It is parkerProtectionRestoreReserveFloor unless pve.retry
 // lengthens a curve far enough that a restore needing its last attempt no
 // longer fits, and then it is that worst case rounded up to a whole second,
@@ -3262,7 +3262,7 @@ func unparkAtLocked(ctx context.Context, c Client, logger *log.Logger, bareVolid
 	// which is the only window in which PVE will accept the removal.
 	//
 	// Detached and separately bounded, like the park path's deferred sweep and
-	// for the same reason: the detach has already happened, so a cancelled or
+	// for the same reason: the detach has already happened, so a canceled or
 	// deadline-stopped unpark is exactly when the stranded reference matters
 	// most. On the window context this sweep would fail on the dead context
 	// without looking at the parker at all, and report a permanent action item
@@ -3276,7 +3276,7 @@ func unparkAtLocked(ctx context.Context, c Client, logger *log.Logger, bareVolid
 	// unprotected is the one outcome worse than a failed unpark, since the
 	// parker may still hold other deployments' disks. The restore runs on a
 	// detached context, so it stays reachable when the request context is
-	// already done, and a cancelled or timed-out unpark is exactly when the
+	// already done, and a canceled or timed-out unpark is exactly when the
 	// window would otherwise stay open indefinitely. It also has its own
 	// deadline, so a PVE that stops answering cannot hold it past the lock's
 	// TTL. A restore failure is logged rather than returned: the detach result
@@ -3584,7 +3584,7 @@ func sweepParkerUnusedSlotsProtectedLocked(ctx context.Context, c Client, logger
 
 // reassertParkerProtection puts protection back on a parker after a successful
 // attach. It is the counterpart to the unpark window: a restore that failed, a
-// request cancelled mid-unpark, or a CPI process killed between the clear and
+// request canceled mid-unpark, or a CPI process killed between the clear and
 // the restore all leave a parker unprotected with no other caller able to
 // notice. Since the park path already knows it just wrote to this parker, one
 // idempotent PUT here closes that window at the next use.
@@ -3605,7 +3605,7 @@ func reassertParkerProtection(ctx context.Context, c Client, logger *log.Logger,
 // setParkerProtection sets or clears the PVE protection flag on a parker VM.
 // Used by UnparkDisk to open a bounded window for the detach, and by the park
 // path to re-assert the flag on every successful attach, which is what closes
-// the window a failed restore, a cancelled request, or a killed CPI process
+// the window a failed restore, a canceled request, or a killed CPI process
 // would otherwise leave open. A nil nodes service (test stubs without
 // injection) is a no-op.
 // cfgKeyTags is the QEMU create/update config key for the tag string.

@@ -141,7 +141,7 @@ func TestDiscoveryWorker_StoreClosedAfterTheDrainIsNotARaceOrAWarn(t *testing.T)
 		e.registry.Open()
 		for _, entry := range e.lines() {
 			if entry.Level >= log.LevelWarn {
-				t.Fatalf("a cancelled worker logged %v %q", entry.Level, entry.Message)
+				t.Fatalf("a canceled worker logged %v %q", entry.Level, entry.Message)
 			}
 		}
 	}
@@ -149,7 +149,7 @@ func TestDiscoveryWorker_StoreClosedAfterTheDrainIsNotARaceOrAWarn(t *testing.T)
 
 // A refresh whose context ended before it began touches nothing, and a due
 // check that fails after the context ended says nothing.
-func TestDiscoveryWorker_CancelledContextTouchesNothing(t *testing.T) {
+func TestDiscoveryWorker_CanceledContextTouchesNothing(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -164,7 +164,7 @@ func TestDiscoveryWorker_CancelledContextTouchesNothing(t *testing.T) {
 		e.begin()
 		e.newWorker().refresh(ctx, workerSeed, e.binding())
 		if asked.Load() != 0 || e.requests() != 0 || len(e.lines()) != 0 {
-			t.Fatalf("a cancelled refresh asked the pool %d times, sent %d requests, logged %s",
+			t.Fatalf("a canceled refresh asked the pool %d times, sent %d requests, logged %s",
 				asked.Load(), e.requests(), e.dump())
 		}
 	})
@@ -177,7 +177,7 @@ func TestDiscoveryWorker_CancelledContextTouchesNothing(t *testing.T) {
 		e.begin()
 		w := e.newWorker()
 		if due := w.due(ctx, e.binding()); due || len(e.lines()) != 0 {
-			t.Fatalf("a cancelled due check on a closed store: due %v, lines %s", due, e.dump())
+			t.Fatalf("a canceled due check on a closed store: due %v, lines %s", due, e.dump())
 		}
 		// The same read with a live context is a failure worth a line.
 		if due := w.due(context.Background(), e.binding()); due {

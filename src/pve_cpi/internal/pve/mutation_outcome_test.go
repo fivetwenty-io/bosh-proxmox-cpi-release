@@ -84,7 +84,7 @@ func TestIsMutationRefusedOrUnsent(t *testing.T) {
 		{name: "untagged read fault", err: fmt.Errorf("Post: %w", read), want: false},
 		{name: "plain error", err: errors.New("something broke"), want: false},
 		{name: "deadline", err: fmt.Errorf("Post: %w", context.DeadlineExceeded), want: false},
-		{name: "cancelled", err: context.Canceled, want: false},
+		{name: "canceled", err: context.Canceled, want: false},
 		{name: "sdk connection error around a dial", err: sdkConn(dial), want: true},
 		{name: "sdk connection error around an unreachable pool", err: sdkConn(unreachable), want: true},
 		{name: "sdk connection error around a maybe sent connect phase",

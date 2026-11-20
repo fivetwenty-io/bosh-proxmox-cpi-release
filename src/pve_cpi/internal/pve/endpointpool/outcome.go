@@ -91,7 +91,7 @@ const (
 // phases, which use their Phase value.
 const (
 	classSendBy         = "send_by"
-	classCancelled      = "cancelled"
+	classCanceled       = "canceled"
 	classRequest        = "request"
 	classHeaderDeadline = "header_deadline"
 	classTransport      = "transport"
@@ -219,9 +219,9 @@ func classifyError(a attempt) outcome {
 	case errors.Is(a.err, ErrSendByPassed):
 		return outcome{action: actReturn, sent: sent, sendBy: true, class: classSendBy}
 	case a.callerDone && !a.gotConn:
-		return outcome{action: actReturn, sent: sentNever, class: classCancelled}
+		return outcome{action: actReturn, sent: sentNever, class: classCanceled}
 	case a.callerDone:
-		return outcome{action: actReturn, sent: sentMaybe, demote: a.class == classMutation, class: classCancelled}
+		return outcome{action: actReturn, sent: sentMaybe, demote: a.class == classMutation, class: classCanceled}
 	case tagged:
 		blamed := blamesEndpoint(a.err)
 		oc := outcome{

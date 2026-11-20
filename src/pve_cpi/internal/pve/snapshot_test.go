@@ -288,16 +288,16 @@ func TestWaitForSnapshotAbsent_TransientInPollLoop_Retries(t *testing.T) {
 	}
 }
 
-func TestWaitForSnapshotAbsent_ContextCancelled(t *testing.T) {
+func TestWaitForSnapshotAbsent_ContextCanceled(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancelled before the first poll completes its wait
+	cancel() // canceled before the first poll completes its wait
 	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 		return snapEntries("current", "snap1"), nil // never clears → forces the wait/select
 	})
 	err := pve.WaitForSnapshotAbsent(ctx, client, "pve1", 9001, "snap1",
 		pve.WithPollIntervalForTest(50*time.Millisecond), pve.WithMaxWait(10*time.Second))
 	if err == nil {
-		t.Fatal("expected error when context is cancelled")
+		t.Fatal("expected error when context is canceled")
 	}
 }

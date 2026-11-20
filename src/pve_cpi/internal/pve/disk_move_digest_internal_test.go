@@ -65,7 +65,7 @@ func TestPVEAnsweredSeparatesAnswersFromLostRequests(t *testing.T) {
 		"dropped connection": &sdkerrors.ConnectionError{Host: "pve1", Port: 8006, Message: "connection reset by peer"},
 		"client timeout":     &sdkerrors.TimeoutError{Operation: "POST /nodes/pve1/qemu/777/move_disk", Duration: "30s"},
 		"deadline":           fmt.Errorf("post move_disk: %w", context.DeadlineExceeded),
-		"cancelled":          fmt.Errorf("post move_disk: %w", context.Canceled),
+		"canceled":           fmt.Errorf("post move_disk: %w", context.Canceled),
 		"596":                apiError(596, "Connection refused"),
 		"502":                apiError(502, "Bad Gateway"),
 		"503":                apiError(503, "Service Unavailable"),
@@ -106,7 +106,7 @@ type unansweredMoveClient struct {
 	cutOff       context.Context
 	cancelCutOff context.CancelFunc
 	// restoreEarly records a protection restore that reached the parker
-	// before the mid-commit read cancelled cutOff.
+	// before the mid-commit read canceled cutOff.
 	restoreEarly bool
 }
 

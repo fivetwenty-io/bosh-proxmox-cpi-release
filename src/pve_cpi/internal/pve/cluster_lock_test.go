@@ -464,7 +464,7 @@ func TestDefaultLockClock_SleepReturnsContextErrOnCancellation(t *testing.T) {
 	cancel()
 	err := clk.sleep(ctx, time.Second)
 	if err == nil {
-		t.Fatal("expected sleep to return an error for an already-cancelled context")
+		t.Fatal("expected sleep to return an error for an already-canceled context")
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("expected context.Canceled; got %v", err)
@@ -800,11 +800,11 @@ func TestAcquireClusterLock_TooLittleTimeLeftCreatesNothing(t *testing.T) {
 	}
 }
 
-// TestAcquireClusterLock_CancelledWaitIsInterrupted covers a plain
+// TestAcquireClusterLock_CanceledWaitIsInterrupted covers a plain
 // cancellation, as a SIGTERM makes. The wait ends with
 // ErrClusterLockInterrupted, which callers match with errors.Is, and not with
 // the timeout, so the two stay apart.
-func TestAcquireClusterLock_CancelledWaitIsInterrupted(t *testing.T) {
+func TestAcquireClusterLock_CanceledWaitIsInterrupted(t *testing.T) {
 	t.Parallel()
 	start := time.Unix(1000, 0)
 	f := newFakeLockPools()

@@ -771,7 +771,7 @@ func (c *deadNodeCompletion) awaitMove(ctx context.Context, dests []string) (str
 				"strict pin stays, and the next retry resumes", strings.Join(dests, ", "), wait)
 		}
 		if err := sleepOrDone(ctx, min(haDeleteMotionPoll(), remaining)); err != nil {
-			return "", c.deferWrap(err, "the wait for the CRM to move the config was cancelled")
+			return "", c.deferWrap(err, "the wait for the CRM to move the config was canceled")
 		}
 	}
 }

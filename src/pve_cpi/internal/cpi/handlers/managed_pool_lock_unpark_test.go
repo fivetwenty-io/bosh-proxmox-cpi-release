@@ -969,17 +969,17 @@ func assertCleanCancellation(t *testing.T, disk *parkedFlowDisk, err error, sign
 	if !errors.Is(err, signal) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("want a retriable error carrying %v, got %v", signal, err)
 	}
-	assertReturnedRecord(t, "cancelled", disk.record(t))
+	assertReturnedRecord(t, "canceled", disk.record(t))
 }
 
-// TestManagedAttachCancelledDuringTheConfirmReturnsTheAllocation cancels the
+// TestManagedAttachCanceledDuringTheConfirmReturnsTheAllocation cancels the
 // request while its parker lock is confirming a create whose reads fail. The
 // acquire cannot tell whether it holds the lock and gives up. Its way out runs
 // on a detached context, reads the sentinel, proves it ours, and deletes it,
 // and the guard admits that delete although the request has ended. Nothing
 // else was admitted, so the allocation is returned with a retriable error and
 // the sentinel is gone.
-func TestManagedAttachCancelledDuringTheConfirmReturnsTheAllocation(t *testing.T) {
+func TestManagedAttachCanceledDuringTheConfirmReturnsTheAllocation(t *testing.T) {
 	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
@@ -1003,11 +1003,11 @@ func TestManagedAttachCancelledDuringTheConfirmReturnsTheAllocation(t *testing.T
 	}
 }
 
-// TestManagedAttachCancelledWhileWaitingReturnsTheAllocation cancels the
+// TestManagedAttachCanceledWhileWaitingReturnsTheAllocation cancels the
 // request while its parker lock waits behind another request's live claim.
 // The wait ends interrupted, the window never runs, and the allocation is
 // returned with a retriable error. The holder's claim is untouched.
-func TestManagedAttachCancelledWhileWaitingReturnsTheAllocation(t *testing.T) {
+func TestManagedAttachCanceledWhileWaitingReturnsTheAllocation(t *testing.T) {
 	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
@@ -1036,13 +1036,13 @@ func TestManagedAttachCancelledWhileWaitingReturnsTheAllocation(t *testing.T) {
 	}
 }
 
-// TestManagedAttachCancelledInsideTheWindowReturnsTheAllocation cancels the
+// TestManagedAttachCanceledInsideTheWindowReturnsTheAllocation cancels the
 // request as its parker lock confirms the claim for the last time, so the
 // window opens on an ended request. The guard refuses the window's first
 // mutation before it reaches PVE, without poisoning, and still admits the
 // release of our sentinel. Nothing was admitted, so the allocation is returned
 // with a retriable error and the sentinel is gone.
-func TestManagedAttachCancelledInsideTheWindowReturnsTheAllocation(t *testing.T) {
+func TestManagedAttachCanceledInsideTheWindowReturnsTheAllocation(t *testing.T) {
 	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
@@ -1071,12 +1071,12 @@ func TestManagedAttachCancelledInsideTheWindowReturnsTheAllocation(t *testing.T)
 	}
 }
 
-// TestManagedAttachCancelledAfterAnAdmittedMoveStaysUncertain is the other
+// TestManagedAttachCanceledAfterAnAdmittedMoveStaysUncertain is the other
 // side. The guard admitted the disk move before the request ended, and the
 // move then failed on the ended request. A mutation that was admitted may
 // have changed the disk, so the guard is poisoned and the allocation needs
 // reconciliation, exactly as before.
-func TestManagedAttachCancelledAfterAnAdmittedMoveStaysUncertain(t *testing.T) {
+func TestManagedAttachCanceledAfterAnAdmittedMoveStaysUncertain(t *testing.T) {
 	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)

@@ -809,11 +809,11 @@ func (r *recordingPoolService) PoolHasVM(context.Context, string, int64) (bool, 
 	return false, nil
 }
 
-// TestWithParkerProtectionLock_CancelledWaitDoesNotRunTheWindow covers a
-// request cancelled while its parker lock waits behind a live holder. The wait
+// TestWithParkerProtectionLock_CanceledWaitDoesNotRunTheWindow covers a
+// request canceled while its parker lock waits behind a live holder. The wait
 // ends interrupted, and the window must not run unserialized on the ended
 // request.
-func TestWithParkerProtectionLock_CancelledWaitDoesNotRunTheWindow(t *testing.T) {
+func TestWithParkerProtectionLock_CanceledWaitDoesNotRunTheWindow(t *testing.T) {
 	t.Parallel()
 	pools := newFakeLockPools()
 	pools.pools[ClusterLockPoolName("vm-90000")] = encodeLockComment("unpark/1/90000", time.Now().Add(time.Hour))
@@ -825,7 +825,7 @@ func TestWithParkerProtectionLock_CancelledWaitDoesNotRunTheWindow(t *testing.T)
 		return nil
 	})
 	if ran {
-		t.Fatal("the window ran unserialized on a cancelled request")
+		t.Fatal("the window ran unserialized on a canceled request")
 	}
 	if !errors.Is(err, ErrClusterLockInterrupted) {
 		t.Fatalf("want the interrupted wait, got %v", err)

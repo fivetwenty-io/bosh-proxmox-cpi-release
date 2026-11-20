@@ -286,7 +286,7 @@ func (r *RequestOverrideRuntime) resolve(ctx context.Context, cfg *config.CPICon
 	if !isLeader {
 		// Follower: wait for the leader's build to finish (success or
 		// failure) rather than starting a redundant build of our own. The
-		// ctx arm is an escape hatch, not a build abort: a cancelled
+		// ctx arm is an escape hatch, not a build abort: a canceled
 		// follower stops waiting, but the leader's build continues for the
 		// other followers.
 		select {

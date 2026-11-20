@@ -242,7 +242,7 @@ func gateHADeleteState(
 			}
 			if err := sleepOrDone(ctx, min(haDeleteMotionPoll(), time.Until(deadline))); err != nil {
 				return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
-					"%s: VM %d: the wait for HA motion was cancelled", caller, vmid))
+					"%s: VM %d: the wait for HA motion was canceled", caller, vmid))
 			}
 
 		default:

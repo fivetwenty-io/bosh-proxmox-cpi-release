@@ -438,7 +438,7 @@ func waitUntilAgentReady(
 		select {
 		case <-ctx.Done():
 			return gatherHealthDiagnostics(ctx, deps, node, vmid, vmidStr, logger,
-				fmt.Sprintf("create_vm: health gate: context cancelled waiting for agent on vm %d: %v",
+				fmt.Sprintf("create_vm: health gate: context canceled waiting for agent on vm %d: %v",
 					vmid, ctx.Err()))
 		default:
 		}
@@ -459,7 +459,7 @@ func waitUntilAgentReady(
 		}
 		if ctx.Err() != nil {
 			return gatherHealthDiagnostics(ctx, deps, node, vmid, vmidStr, logger,
-				fmt.Sprintf("create_vm: health gate: context cancelled waiting for agent on vm %d: %v",
+				fmt.Sprintf("create_vm: health gate: context canceled waiting for agent on vm %d: %v",
 					vmid, ctx.Err()))
 		}
 
@@ -489,7 +489,7 @@ func waitUntilAgentReady(
 		case <-time.After(effectiveInterval):
 		case <-ctx.Done():
 			return gatherHealthDiagnostics(ctx, deps, node, vmid, vmidStr, logger,
-				fmt.Sprintf("create_vm: health gate: context cancelled waiting for agent on vm %d: %v",
+				fmt.Sprintf("create_vm: health gate: context canceled waiting for agent on vm %d: %v",
 					vmid, ctx.Err()))
 		case <-hcCtx.Done():
 			msg := fmt.Sprintf(
@@ -516,7 +516,7 @@ func gatherHealthDiagnostics(
 	baseMsg string,
 ) error {
 	// Use a fresh deadline for the diagnostic scrape; the original context may
-	// already be cancelled or at its deadline. The scrape keeps the call's values,
+	// already be canceled or at its deadline. The scrape keeps the call's values,
 	// so it runs inside the call's affinity scope.
 	diagCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()

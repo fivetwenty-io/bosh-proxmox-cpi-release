@@ -180,7 +180,7 @@ const (
 	// observed and the guard stays usable.
 	protectionWriteRefused
 	// protectionWriteCutOff is a protection-only write that failed without an
-	// answer from PVE: its context ended, the request was cancelled, or the
+	// answer from PVE: its context ended, the request was canceled, or the
 	// transport failed. Nobody knows whether it applied, so the step stays
 	// planned for the settler, and the guard stays usable so the rest of the
 	// operation can record where the disk is. What makes this safe is the

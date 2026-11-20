@@ -430,7 +430,7 @@ func TestManagedDiskSelectedTargetAndFreeCID(t *testing.T) {
 }
 
 func TestManagedDiskUncertainFailuresNeverRetryOrCleanup(t *testing.T) {
-	for _, failure := range []string{"transport", "quota", "readonly", "readback", "wrong-return", "cancelled"} {
+	for _, failure := range []string{"transport", "quota", "readonly", "readback", "wrong-return", "canceled"} {
 		t.Run(failure, func(t *testing.T) {
 			m, h, state := managedDiskFixture(t, "spread", true)
 			ctx, cancel := context.WithCancel(t.Context())
@@ -443,7 +443,7 @@ func TestManagedDiskUncertainFailuresNeverRetryOrCleanup(t *testing.T) {
 				state.readErr = errors.New("read failed")
 			case "wrong-return":
 				state.badReturn = true
-			case "cancelled":
+			case "canceled":
 				before := state.before
 				state.before = func(v string) { before(v); cancel() }
 			}

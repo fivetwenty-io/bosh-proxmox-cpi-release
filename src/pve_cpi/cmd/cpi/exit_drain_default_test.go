@@ -47,6 +47,6 @@ func TestSubcommandDrainAppliesTheDefaultBoundWhenNoWaitIsSet(t *testing.T) {
 		t.Fatalf("exit %d, want the computed 1: %s", code, stderr.String())
 	}
 	if !wrote.Load() {
-		t.Fatal("the subcommand returned before its background write finished, or cancelled it")
+		t.Fatal("the subcommand returned before its background write finished, or canceled it")
 	}
 }

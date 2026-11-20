@@ -60,7 +60,7 @@ func TestRebalancePVEIOSleepStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := p.sleep(ctx, time.Hour); err == nil {
-		t.Fatal("a cancelled sleep returned no error")
+		t.Fatal("a canceled sleep returned no error")
 	}
 	if p.now().IsZero() {
 		t.Fatal("now is zero")

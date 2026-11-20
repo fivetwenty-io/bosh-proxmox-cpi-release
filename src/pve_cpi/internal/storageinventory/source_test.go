@@ -130,7 +130,7 @@ func TestCollectorRejectsMalformedSetupAndDefinitionLists(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := c.Discover(ctx, policy("a"), Request{Nodes: []string{"n1"}}); !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled discovery: %v", err)
+		t.Fatalf("canceled discovery: %v", err)
 	}
 	for _, defs := range [][]json.RawMessage{{definition(t, "a", nil), definition(t, "a", nil)}, {json.RawMessage(`{"storage":"a","type":"nfs","content":null}`)}, {json.RawMessage(`{"storage":"a"}`)}} {
 		s := sourceFor(t, "a")

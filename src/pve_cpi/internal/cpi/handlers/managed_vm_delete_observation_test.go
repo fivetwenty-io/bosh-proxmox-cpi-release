@@ -15,7 +15,7 @@ import (
 )
 
 func TestManagedVMDeleteAbsenceConvergencePreservesMutationHistory(t *testing.T) {
-	for _, mode := range []string{"converges", "permission uncertainty", "listing uncertainty", "deadline", "cancelled", "cancel during proof"} {
+	for _, mode := range []string{"converges", "permission uncertainty", "listing uncertainty", "deadline", "canceled", "cancel during proof"} {
 		t.Run(mode, func(t *testing.T) { testVMDeleteConvergence(t, mode) })
 	}
 }
@@ -46,7 +46,7 @@ func testVMDeleteConvergence(t *testing.T, mode string) {
 			probeCtx, stop = context.WithDeadline(ctx, time.Now().Add(-time.Second))
 			defer stop()
 		}
-		if mode == "cancelled" {
+		if mode == "canceled" {
 			cancel()
 		}
 		return pollManagedVMVolumeAbsence(probeCtx, time.Microsecond, func(context.Context) (bool, error) {

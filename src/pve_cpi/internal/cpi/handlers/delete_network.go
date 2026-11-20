@@ -7,7 +7,7 @@
 // Idempotency: every NotFound response is treated as success. Concurrent
 // deletes targeting the same network_cid both return nil. All cleanup I/O
 // runs on a detached, sdnCleanupTimeout-bounded context (detachedContext) so
-// a cancelled parent does not leave half-deleted SDN state pending an apply,
+// a canceled parent does not leave half-deleted SDN state pending an apply,
 // and a hung cluster cannot stall the handler indefinitely either.
 package handlers
 
@@ -73,7 +73,7 @@ func deleteNetwork(ctx context.Context, deps Deps, args []json.RawMessage) error
 	}
 
 	// Run all PVE I/O on a context that survives parent cancellation. The CPI
-	// surface may invoke this handler from a request whose ctx is cancelled
+	// surface may invoke this handler from a request whose ctx is canceled
 	// once the JSON-RPC response is written; deletes must run to completion
 	// to avoid leaving half-applied SDN state. Bounded by sdnCleanupTimeout —
 	// detachment must not also detach from every deadline, or a quorum-less

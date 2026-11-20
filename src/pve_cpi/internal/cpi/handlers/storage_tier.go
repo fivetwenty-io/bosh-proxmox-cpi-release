@@ -95,7 +95,7 @@ type storageLister interface {
 //   - nil or empty list response → treated as zero matches.
 //   - zero matches after filtering → non-retriable CloudError naming the tier.
 //   - entry with malformed JSON → skipped (same behavior as StorageInfoCache.refresh).
-//   - ctx cancelled before or during list → wrapped context error returned.
+//   - ctx canceled before or during list → wrapped context error returned.
 func resolveStorageTier(ctx context.Context, lister storageLister, cfg *config.CPIConfig, tier string, encrypted bool) (string, error) {
 	criteria, ok := cfg.StorageTiers[tier]
 	if !ok {

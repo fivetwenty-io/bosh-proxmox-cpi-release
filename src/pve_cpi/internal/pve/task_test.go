@@ -294,9 +294,9 @@ func TestAwaitTask_Adaptive_DisappearanceIsImmediatelyNonRetriable(t *testing.T)
 	}
 }
 
-// TestAwaitTask_Adaptive_ContextCancelledIsRetriable verifies parent-context
+// TestAwaitTask_Adaptive_ContextCanceledIsRetriable verifies parent-context
 // cancellation surfaces as a retriable error.
-func TestAwaitTask_Adaptive_ContextCancelledIsRetriable(t *testing.T) {
+func TestAwaitTask_Adaptive_ContextCanceledIsRetriable(t *testing.T) {
 	defer pve.SetAdaptiveTaskPollForTest(true)()
 
 	svc := &mockTasksService{
@@ -308,7 +308,7 @@ func TestAwaitTask_Adaptive_ContextCancelledIsRetriable(t *testing.T) {
 	cancel() // cancel before the call so the running-task select takes the ctx.Done arm
 	err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:slow")
 	if err == nil {
-		t.Fatal("expected error on cancelled context")
+		t.Fatal("expected error on canceled context")
 	}
 	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Errorf("context cancellation must be retriable, got: %v", err)
@@ -574,7 +574,7 @@ func TestAwaitTask_StatusShapedContentionExitStaysRetriable(t *testing.T) {
 	}
 }
 
-func TestAwaitTask_ContextCancelled(t *testing.T) {
+func TestAwaitTask_ContextCanceled(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -589,7 +589,7 @@ func TestAwaitTask_ContextCancelled(t *testing.T) {
 
 	err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:abc")
 	if err == nil {
-		t.Fatal("expected error for cancelled context, got nil")
+		t.Fatal("expected error for canceled context, got nil")
 	}
 	// DEC-4: ctx-cancel must be retriable so the director re-issues the action.
 	var cpiErr *cpierrors.Error
@@ -883,10 +883,10 @@ func TestAwaitTask_TransientFaultShrinksWaitWindow(t *testing.T) {
 	}
 }
 
-// TestAwaitTask_TransientFaultContextCancelledIsRetriable verifies cancelling
+// TestAwaitTask_TransientFaultContextCanceledIsRetriable verifies canceling
 // the caller's context during the sleep between polls returns the
 // cancellation error.
-func TestAwaitTask_TransientFaultContextCancelledIsRetriable(t *testing.T) {
+func TestAwaitTask_TransientFaultContextCanceledIsRetriable(t *testing.T) {
 	t.Parallel()
 	connErr := &sdkerrors.ConnectionError{Host: "pve1", Port: 8006, Message: "connection refused"}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -909,7 +909,7 @@ func TestAwaitTask_TransientFaultContextCancelledIsRetriable(t *testing.T) {
 		t.Errorf("cancellation must be retriable: %v", err)
 	}
 	if pve.IsTaskPollUnresolved(err) {
-		t.Errorf("a cancelled context is not an unresolved poll: %v", err)
+		t.Errorf("a canceled context is not an unresolved poll: %v", err)
 	}
 }
 

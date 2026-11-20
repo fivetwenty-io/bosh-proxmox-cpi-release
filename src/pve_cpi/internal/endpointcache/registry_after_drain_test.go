@@ -41,8 +41,8 @@ func TestAfterDrainRunsOnceWhenTheDrainGivesUp(t *testing.T) {
 		t.Fatalf("Go: %v", err)
 	}
 	first := r.Drain(context.Background(), 10*time.Millisecond)
-	if len(first.Cancelled) != 1 {
-		t.Fatalf("Cancelled = %v, want the stuck worker", first.Cancelled)
+	if len(first.Canceled) != 1 {
+		t.Fatalf("Canceled = %v, want the stuck worker", first.Canceled)
 	}
 	r.Drain(context.Background(), 10*time.Millisecond)
 	if got := runs.Load(); got != 1 {

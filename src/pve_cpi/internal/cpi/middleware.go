@@ -67,7 +67,7 @@ var _ Hook = HookFunc{}
 // introduced a new error after the handler itself succeeded. When
 // handlerErr==nil && err!=nil (hook turned success into failure), fireRollback
 // is called on a cancellation-detached context so cleanup completes even when
-// the caller's context has been cancelled. This prevents an orphaned VM when a
+// the caller's context has been canceled. This prevents an orphaned VM when a
 // post-hook (e.g. stemcell provenance, HA membership) fails after the VM is
 // already committed — without double-cleanup with the handler's own defer.
 func WrapHandler(method string, inner Handler, hooks []Hook) Handler {
@@ -86,7 +86,7 @@ func WrapHandler(method string, inner Handler, hooks []Hook) Handler {
 			result, err = hooks[i].After(ctx, method, result, err)
 		}
 		if method == "create_vm" && handlerErr == nil && err != nil {
-			// Detach from the caller's cancellation so a Director-cancelled call
+			// Detach from the caller's cancellation so a Director-canceled call
 			// still cleans up, but apply a bounded deadline so a wedged PVE
 			// during rollback cannot hang the dispatch indefinitely.
 			rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackCleanupTimeout)

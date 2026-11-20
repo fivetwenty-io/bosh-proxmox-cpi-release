@@ -615,10 +615,10 @@ func TestRequestEnded(t *testing.T) {
 	if requestEnded(live) {
 		t.Error("a live context reported as ended")
 	}
-	cancelled, cancel := context.WithCancel(context.Background())
+	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if !requestEnded(cancelled) {
-		t.Error("a cancelled request was not reported as ended")
+	if !requestEnded(canceled) {
+		t.Error("a canceled request was not reported as ended")
 	}
 	expired, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Hour))
 	defer stop()

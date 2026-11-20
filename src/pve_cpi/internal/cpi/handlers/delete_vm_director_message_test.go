@@ -86,7 +86,7 @@ func TestDeleteVMRetryShowsTheDirectorTheUnsettledStep(t *testing.T) {
 // a journal-managed delete can end in through the production dispatcher and
 // reads the error body the Director receives. A refusal the CPI wrote, an
 // audit gate's findings, and a lock timeout keep their own text. A journal
-// write that failed, a PVE answer, and a cancelled request keep the generic
+// write that failed, a PVE answer, and a canceled request keep the generic
 // evidence line, and a transient PVE fault stays retriable. Every type and
 // retry flag is the one the same failure carried behind the generic line.
 func TestManagedDeleteVMFailuresReachTheDirector(t *testing.T) {
@@ -106,7 +106,7 @@ func TestManagedDeleteVMFailuresReachTheDirector(t *testing.T) {
 		{"journal persistence", persistence, generic, false},
 		{"permanent PVE answer", fmt.Errorf("read config: %w", sdkerrors.ParseAPIError(403, []byte(`{"message":"Permission check failed"}`))), generic, false},
 		{"transient PVE fault", fmt.Errorf("read config: %w", sdkerrors.ParseAPIError(503, []byte(`{"message":"proxy loop"}`))), "transient transport fault: " + generic, true},
-		{"cancelled request", context.Canceled, generic, false},
+		{"canceled request", context.Canceled, generic, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := cpi.NewDispatcherWithOptions(log.NewNopLogger(), cpi.WithTransientClassifier(pve.IsTransientTransport))

@@ -359,7 +359,7 @@ func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) 
 // settled, so it still goes uncertain.
 //
 // A request whose context ended counts the same way. pve.ErrClusterLockInterrupted
-// is a lock wait that a cancelled request cut short, and errManagedRequestEnded
+// is a lock wait that a canceled request cut short, and errManagedRequestEnded
 // is a mutation the guard refused on an ended request before it reached PVE.
 // Neither changed anything, so the same conditions decide.
 //
@@ -405,7 +405,7 @@ func (m *managedDiskLifecycle) cleanLockTimeout(operationErr error) bool {
 // (pve.ErrClusterLockTimeout), an acquire that could not tell who holds the
 // lock (pve.ErrClusterLockStateUnknown), one whose create PVE refused for lack
 // of quorum (pve.ErrClusterLockNoQuorum), one that confirmed its claim too late
-// to use it (pve.ErrClusterLockClaimTooShort), a wait a cancelled request cut
+// to use it (pve.ErrClusterLockClaimTooShort), a wait a canceled request cut
 // short (pve.ErrClusterLockInterrupted), a mutation the guard refused on an
 // ended request (errManagedRequestEnded), and a mutation the guard refused
 // because a read that admits it failed (errManagedAdmissionReadFailed). It is

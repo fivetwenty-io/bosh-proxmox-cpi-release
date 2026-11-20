@@ -351,7 +351,7 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 	// excluded, because that is process shutdown, not a per-operation budget
 	// overrun.
 	// The ctx.Err()==nil guard closes the razor-thin race where the parent is
-	// cancelled at the same instant the child deadline fires: in that window
+	// canceled at the same instant the child deadline fires: in that window
 	// callCtx.Err() may report DeadlineExceeded even though the real cause was
 	// shutdown, so we additionally require the parent to be live.
 	if err != nil && budget > 0 && callCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil && !cpierrors.IsDefinite(err) {

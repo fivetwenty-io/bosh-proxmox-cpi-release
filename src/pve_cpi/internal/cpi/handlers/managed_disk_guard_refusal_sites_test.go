@@ -439,7 +439,7 @@ func TestManagedGuardRefusalSites(t *testing.T) {
 	fixed := func(call ManagedAllocationMutation) func(*guardSiteFixture) ManagedAllocationMutation {
 		return func(*guardSiteFixture) ManagedAllocationMutation { return call }
 	}
-	cancelling := func(s *guardSiteFixture) func(context.Context) error {
+	canceling := func(s *guardSiteFixture) func(context.Context) error {
 		return func(ctx context.Context) error {
 			s.cancel()
 			return ctx.Err()
@@ -484,7 +484,7 @@ func TestManagedGuardRefusalSites(t *testing.T) {
 		{
 			name: "resize capacity check ends with the request", operation: "resize_disk", call: fixed(guardSiteResize()),
 			fault: func(s *guardSiteFixture) *guardSiteFault {
-				return &guardSiteFault{read: guardSiteReadStatuses, armRead: guardSiteReadConfig, armWithin: []string{"readHolderConfig"}, act: cancelling(s)}
+				return &guardSiteFault{read: guardSiteReadStatuses, armRead: guardSiteReadConfig, armWithin: []string{"readHolderConfig"}, act: canceling(s)}
 			},
 			want: guardSiteEnded,
 		},
@@ -547,7 +547,7 @@ func TestManagedGuardRefusalSites(t *testing.T) {
 		{
 			name: "migration capacity check ends with the request", operation: "attach_disk", call: fixed(guardSiteMigration()),
 			fault: func(s *guardSiteFixture) *guardSiteFault {
-				return &guardSiteFault{read: guardSiteReadStatuses, armRead: guardSiteReadVolume, armWithin: []string{"prepareMigration"}, localMigration: true, act: cancelling(s)}
+				return &guardSiteFault{read: guardSiteReadStatuses, armRead: guardSiteReadVolume, armWithin: []string{"prepareMigration"}, localMigration: true, act: canceling(s)}
 			},
 			want: guardSiteEnded,
 		},
@@ -569,7 +569,7 @@ func TestManagedGuardRefusalSites(t *testing.T) {
 		{
 			name: "delete identity check ends with the request", operation: "delete_disk", call: (*guardSiteFixture).deletion,
 			fault: func(s *guardSiteFixture) *guardSiteFault {
-				return &guardSiteFault{read: guardSiteReadMembers, within: []string{"prepareDeletion"}, act: cancelling(s)}
+				return &guardSiteFault{read: guardSiteReadMembers, within: []string{"prepareDeletion"}, act: canceling(s)}
 			},
 			setup: func(_ *testing.T, s *guardSiteFixture) { s.detach() },
 			want:  guardSiteEnded,

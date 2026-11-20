@@ -342,10 +342,10 @@ func TestGateHADeleteMotionWaitEndsWithTheContext(t *testing.T) {
 	}
 	_, err := gateHADelete(settleClockCtx(ctx), f.deps, "delete_vm", 101, "pve-node1", f.logger)
 	if err == nil {
-		t.Fatal("a cancelled wait must fail")
+		t.Fatal("a canceled wait must fail")
 	}
 	if !okToRetryCPIError(err) {
-		t.Fatalf("a cancelled wait must be retriable, got %v", err)
+		t.Fatalf("a canceled wait must be retriable, got %v", err)
 	}
 }
 

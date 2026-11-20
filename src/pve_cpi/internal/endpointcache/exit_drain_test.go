@@ -91,7 +91,7 @@ func TestDrainAtExitAppliesTheDefaultBoundToAZeroOrNegativeWait(t *testing.T) {
 			var stderr bytes.Buffer
 			DrainAtExit("tool", &stderr, tc.wait)
 			if !done.Load() {
-				t.Errorf("a drain with a wait of %s cancelled a write that needed 300ms, want the default bound of %s",
+				t.Errorf("a drain with a wait of %s canceled a write that needed 300ms, want the default bound of %s",
 					tc.wait, DrainWait)
 			}
 			if stderr.Len() != 0 {
@@ -103,10 +103,10 @@ func TestDrainAtExitAppliesTheDefaultBoundToAZeroOrNegativeWait(t *testing.T) {
 
 func TestDrainAtExitCancelsWorkThatRunsPastTheBound(t *testing.T) {
 	resetProcessRegistry(t)
-	cancelled := make(chan struct{})
+	canceled := make(chan struct{})
 	if err := Go("stuck write", config.DiscoveryModeAuto, func(ctx context.Context) {
 		<-ctx.Done()
-		close(cancelled)
+		close(canceled)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -116,9 +116,9 @@ func TestDrainAtExitCancelsWorkThatRunsPastTheBound(t *testing.T) {
 		t.Errorf("the drain took %s with a 50ms bound", took)
 	}
 	select {
-	case <-cancelled:
+	case <-canceled:
 	case <-time.After(5 * time.Second):
-		t.Error("the stuck worker was never cancelled")
+		t.Error("the stuck worker was never canceled")
 	}
 }
 
@@ -158,7 +158,7 @@ func exitStuckWorker(t *testing.T, name string, mode config.DiscoveryMode) {
 // A worker the drain cancels under an explicit on is one Warn line on stderr
 // that names the worker, because the operator asked for a cache the command
 // did not finish writing.
-func TestDrainAtExitWarnsOnceAboutACancelledWorkerUnderOn(t *testing.T) {
+func TestDrainAtExitWarnsOnceAboutACanceledWorkerUnderOn(t *testing.T) {
 	resetProcessRegistry(t)
 	exitStuckWorker(t, "stuck refresh", config.DiscoveryModeOn)
 	var stderr bytes.Buffer
@@ -168,7 +168,7 @@ func TestDrainAtExitWarnsOnceAboutACancelledWorkerUnderOn(t *testing.T) {
 		t.Fatalf("stderr = %q, want exactly one line", stderr.String())
 	}
 	for _, want := range []string{
-		`"level":"WARN"`, "cancelled background work still running at exit", "stuck refresh",
+		`"level":"WARN"`, "canceled background work still running at exit", "stuck refresh",
 	} {
 		if !strings.Contains(lines[0], want) {
 			t.Errorf("line %q does not contain %q", lines[0], want)
@@ -176,7 +176,7 @@ func TestDrainAtExitWarnsOnceAboutACancelledWorkerUnderOn(t *testing.T) {
 	}
 }
 
-// A worker stuck past the bound is reported by the drain that cancelled it and
+// A worker stuck past the bound is reported by the drain that canceled it and
 // by no later drain of the run, so the last drain at exit adds nothing to the
 // line the first one wrote.
 func TestDrainAtExitDoesNotRepeatAWorkerAnEarlierDrainReported(t *testing.T) {
@@ -199,7 +199,7 @@ func TestDrainAtExitDoesNotRepeatAWorkerAnEarlierDrainReported(t *testing.T) {
 
 // Under auto the cancellation is a Debug line, which a command that logs at
 // Warn does not write.
-func TestDrainAtExitWritesNothingAboutACancelledWorkerUnderAuto(t *testing.T) {
+func TestDrainAtExitWritesNothingAboutACanceledWorkerUnderAuto(t *testing.T) {
 	resetProcessRegistry(t)
 	exitStuckWorker(t, "stuck refresh", config.DiscoveryModeAuto)
 	var stderr bytes.Buffer
@@ -209,7 +209,7 @@ func TestDrainAtExitWritesNothingAboutACancelledWorkerUnderAuto(t *testing.T) {
 	}
 }
 
-// A worker cancelled under on and a worker that panicked each get their line,
+// A worker canceled under on and a worker that panicked each get their line,
 // the cancellation at Warn and the panic at Error.
 func TestDrainAtExitReportsAPanicAndACancellationTogether(t *testing.T) {
 	resetProcessRegistry(t)
@@ -223,7 +223,7 @@ func TestDrainAtExitReportsAPanicAndACancellationTogether(t *testing.T) {
 	out := stderr.String()
 	for _, want := range []string{
 		`"level":"ERROR"`, "background worker panicked", "bad write", "the write blew up",
-		`"level":"WARN"`, "cancelled background work still running at exit", "stuck refresh",
+		`"level":"WARN"`, "canceled background work still running at exit", "stuck refresh",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stderr = %q, want it to contain %q", out, want)
@@ -232,15 +232,15 @@ func TestDrainAtExitReportsAPanicAndACancellationTogether(t *testing.T) {
 }
 
 // A SIGTERM during the wait ends it at once. The process still returns to its
-// caller, who computes the exit code, and the worker is cancelled.
+// caller, who computes the exit code, and the worker is canceled.
 func TestDrainAtExitEndsOnASignal(t *testing.T) {
 	resetProcessRegistry(t)
 	held := make(chan os.Signal, 1)
 	notifyTerm(t, held)
-	cancelled := make(chan struct{})
+	canceled := make(chan struct{})
 	if err := Go("stuck write", config.DiscoveryModeAuto, func(ctx context.Context) {
 		<-ctx.Done()
-		close(cancelled)
+		close(canceled)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +267,7 @@ func TestDrainAtExitEndsOnASignal(t *testing.T) {
 		t.Fatal("SIGTERM did not end the drain")
 	}
 	select {
-	case <-cancelled:
+	case <-canceled:
 	case <-time.After(5 * time.Second):
 		t.Error("the signal did not cancel the worker")
 	}

@@ -33,7 +33,7 @@ import (
 const rollbackCleanupTimeout = 10 * time.Minute
 
 // sdnCleanupTimeout bounds delete_network's SDN teardown, which detaches from
-// the request ctx so a cancelled caller cannot leave half-applied SDN state.
+// the request ctx so a canceled caller cannot leave half-applied SDN state.
 // Wider than rollbackCleanupTimeout because the teardown is a sequence — one
 // delete per subnet, an apply with task await, and a conditional zone
 // removal — but still far under both the delete-class operation-timeout
@@ -117,7 +117,7 @@ func detachedFromRequest(ctx context.Context) bool {
 // and leave a record that refuses the retry.
 //
 // A request without a deadline has no deadline to outlive, so the work runs on
-// the request's own context, even when a stop signal has already cancelled it.
+// the request's own context, even when a stop signal has already canceled it.
 // That is the case for every CPI call when operation_timeout is off, so the
 // work keeps the same unbounded time it has always had there, and a stop
 // signal still stops it.
@@ -140,7 +140,7 @@ func finishingContext(parent context.Context, budget time.Duration) (context.Con
 // audit that returns a disk after a clean lock timeout or delete_vm's readback
 // after a retention lock timeout. That work already ran detached for the
 // allowance whenever the request had ended, so a request without a deadline
-// that a stop signal has cancelled still gets the allowance here, the way it
+// that a stop signal has canceled still gets the allowance here, the way it
 // did before finishingContext existed.
 func closingContext(parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := finishingContext(parent, pve.ClusterLockCompletionAllowance)

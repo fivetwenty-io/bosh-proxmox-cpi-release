@@ -65,7 +65,7 @@ func IPConflictCloudError(conflict *IPConflict, bridge string, vlan int) *cpierr
 // targetIPs on the named bridge. Returns nil, nil when no conflict exists.
 //
 // Parameters:
-//   - ctx: cancellation context; cancelled context stops in-flight goroutines.
+//   - ctx: cancellation context; canceled context stops in-flight goroutines.
 //   - deps: handler dependencies (PVE client, logger).
 //   - targetIPs: the IP addresses (plain, no CIDR prefix) to check; e.g. ["10.0.0.5"].
 //     Empty or nil slice returns nil, nil immediately.
@@ -168,7 +168,7 @@ func detectIPConflict(
 		found      *IPConflict
 	)
 
-	// scanCtx is cancelled either by the parent or as soon as a conflict is found
+	// scanCtx is canceled either by the parent or as soon as a conflict is found
 	// so remaining goroutines abort early.
 	scanCtx, cancelScan := context.WithCancel(ctx)
 	defer cancelScan()

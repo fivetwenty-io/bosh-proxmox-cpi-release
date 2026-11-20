@@ -282,7 +282,7 @@ func TestProbeGuestAgentIPConflict_ArrayResponseFormat(t *testing.T) {
 	}
 }
 
-// TestProbeGuestAgentIPConflict_ContextCancellation verifies cancelled context does not hang or panic.
+// TestProbeGuestAgentIPConflict_ContextCancellation verifies canceled context does not hang or panic.
 func TestProbeGuestAgentIPConflict_ContextCancellation(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())

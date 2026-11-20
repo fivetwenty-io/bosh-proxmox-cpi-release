@@ -649,7 +649,7 @@ func TestHasDiskLooksAgainOnAShortBudget(t *testing.T) {
 	}
 }
 
-// TestHasDiskSecondLookEndsWithTheRequest covers a request that is cancelled
+// TestHasDiskSecondLookEndsWithTheRequest covers a request that is canceled
 // while has_disk's second look reads the cluster, with no lifecycle holding
 // the disk's record. has_disk returns a retriable error that says the
 // request ended before it could look again, and names no operation, because
@@ -671,9 +671,9 @@ func TestHasDiskSecondLookEndsWithTheRequest(t *testing.T) {
 	})
 	present, err := HandleHasDisk(f.deps).Handle(ctx, []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
 	if err == nil || !isTypedCPIError(err) || !okToRetryCPIError(err) {
-		t.Fatalf("has_disk cancelled during its second look = %v, %v, want a retriable error", present, err)
+		t.Fatalf("has_disk canceled during its second look = %v, %v, want a retriable error", present, err)
 	}
-	requireText(t, err, "has_disk cancelled during its second look",
+	requireText(t, err, "has_disk canceled during its second look",
 		[]string{f.cid, "no other operation held", "the request ended before has_disk could look at the disk again", "rerun the cloud check"},
 		"lifecycle ", "another disk operation")
 }
@@ -709,10 +709,10 @@ func TestHasDiskSecondLookStopsBeforeTheDeadline(t *testing.T) {
 	requireText(t, err, "has_disk whose second look ran into the deadline", []string{f.cid, "the request ended before has_disk could look at the disk again"})
 }
 
-// TestHasDiskCancelledWaitIsRetriable covers a request that is cancelled
+// TestHasDiskCanceledWaitIsRetriable covers a request that is canceled
 // while has_disk waits for a lifecycle. has_disk returns its retriable wait
 // error with the time it waited, never the first look's permanent refusal.
-func TestHasDiskCancelledWaitIsRetriable(t *testing.T) {
+func TestHasDiskCanceledWaitIsRetriable(t *testing.T) {
 	f := digestManagedFixture(t)
 	holdRecord(t, f, "detach_disk")
 	restore := hideVolumeOnce(t, f)
@@ -723,12 +723,12 @@ func TestHasDiskCancelledWaitIsRetriable(t *testing.T) {
 	start := time.Now()
 	_, err := HandleHasDisk(f.deps).Handle(ctx, []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
 	if waited := time.Since(start); waited > 10*time.Second {
-		t.Errorf("has_disk returned %s after the request was cancelled, want it to stop at once", waited)
+		t.Errorf("has_disk returned %s after the request was canceled, want it to stop at once", waited)
 	}
 	if err == nil || !isTypedCPIError(err) || !okToRetryCPIError(err) {
 		t.Fatalf("has_disk: error %v, want a retriable error", err)
 	}
-	requireText(t, err, "has_disk's cancelled wait", []string{"lifecycle detach_disk", f.cid, "the request ended", "rerun the cloud check once that operation completes"})
+	requireText(t, err, "has_disk's canceled wait", []string{"lifecycle detach_disk", f.cid, "the request ended", "rerun the cloud check once that operation completes"})
 }
 
 // unsettleAttachLanding rewrites the disk's record the way a call that died
@@ -890,11 +890,11 @@ func TestHasDiskFalseAnswerNeedsTheJournal(t *testing.T) {
 // refusal may rest on a lifecycle it never got to wait for.
 func TestHasDiskRefusalWhenTheJournalFails(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		cancelled bool
+		name     string
+		canceled bool
 	}{
 		{name: "request running"},
-		{name: "request ended", cancelled: true},
+		{name: "request ended", canceled: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := digestManagedFixture(t)
@@ -910,7 +910,7 @@ func TestHasDiskRefusalWhenTheJournalFails(t *testing.T) {
 					hidden = true
 					delete(f.client.state.volumes, f.volume)
 					refuseCertificates(f)
-					if tc.cancelled {
+					if tc.canceled {
 						cancel()
 					}
 				}
@@ -926,7 +926,7 @@ func TestHasDiskRefusalWhenTheJournalFails(t *testing.T) {
 			if err == nil || !isTypedCPIError(err) {
 				t.Fatalf("has_disk = %v, %v, want a typed error", present, err)
 			}
-			if !tc.cancelled {
+			if !tc.canceled {
 				if okToRetryCPIError(err) || !strings.HasPrefix(err.Error(), "managed disk ownership provenance references a missing volume") {
 					t.Fatalf("has_disk with the journal unreachable = %v, want the first look's permanent refusal", err)
 				}

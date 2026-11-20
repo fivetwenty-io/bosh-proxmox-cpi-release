@@ -1611,7 +1611,7 @@ func managedRequestEnded(cause error) error {
 // on its own live context.
 func (m *managedDiskLifecycle) requestEndedRefusal(ctx context.Context, call ManagedAllocationMutation) error {
 	if m.requestContext == nil {
-		return fmt.Errorf("managed lifecycle request cancelled before mutation")
+		return fmt.Errorf("managed lifecycle request canceled before mutation")
 	}
 	cause := m.requestContext.Err()
 	if cause == nil {

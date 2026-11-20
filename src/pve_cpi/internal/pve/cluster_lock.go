@@ -397,7 +397,7 @@ func ClusterLockPoolName(name string) string {
 }
 
 // AcquireClusterLock acquires the named cross-process lock, blocking until it is
-// held, the timeout elapses, or ctx is cancelled.
+// held, the timeout elapses, or ctx is canceled.
 //
 // name is the logical lock key (e.g. an instance-group name); it is namespaced
 // and sanitized into a sentinel poolid. owner is a caller-supplied token that
@@ -905,7 +905,7 @@ func holderUnknown(pool, step string, err error) error {
 // ErrClusterLockNoQuorum, and nothing is read or deleted on the way out.
 //
 // Every other failure has an unknown outcome. That covers a transport fault, a
-// cancelled or expired context, a gateway status, and any other 5xx. PVE may have
+// canceled or expired context, a gateway status, and any other 5xx. PVE may have
 // applied the create, and a claim of ours would then block every other
 // acquirer for a whole TTL, so abandonLockCreate reads the sentinel back and
 // deletes it when that read proves it ours. The error joins
@@ -1194,7 +1194,7 @@ func (h *ClusterLockHandle) Release(ctx context.Context) error {
 		return nil
 	}
 	if err != nil && !isPoolNotFound(err) {
-		// released stays false: a failed delete (cancelled ctx, transient
+		// released stays false: a failed delete (canceled ctx, transient
 		// API fault, a failed pre-delete read in the guard) must not latch
 		// the handle closed, or a retried Release silently no-ops and the
 		// sentinel pool is orphaned until a later acquirer steals it past the
@@ -1398,7 +1398,7 @@ var ErrClusterLockHeld = errors.New("cluster lock is held by a live owner")
 var ErrClusterLockNoTimeToWait = errors.New("the request's deadline leaves no time to wait")
 
 // ErrClusterLockInterrupted marks an acquire whose wait was cut short because
-// its request context was cancelled, as a SIGTERM does. It is kept apart from a
+// its request context was canceled, as a SIGTERM does. It is kept apart from a
 // timeout, so callers can tell the two, and like a timeout it is not a sign
 // that the lock mechanism is unavailable.
 var ErrClusterLockInterrupted = errors.New("cluster lock wait interrupted")

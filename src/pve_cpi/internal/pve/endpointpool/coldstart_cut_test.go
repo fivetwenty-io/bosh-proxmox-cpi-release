@@ -60,7 +60,7 @@ func mustHandOnLine(t *testing.T, l *lab, reason string, probed, unprobed int64)
 // the cold start is not over, and the next request probes it and is answered.
 // That holds whether the prober waited on its context without sending the
 // probe or the probe was in flight at the candidate, and whether the owner was
-// cancelled plainly or with a cause, which the transport returns in place of a
+// canceled plainly or with a cause, which the transport returns in place of a
 // context error.
 func TestColdStartProbeCutByTheOwnerHandsOnItsCandidate(t *testing.T) {
 	cases := []struct {
@@ -70,7 +70,7 @@ func TestColdStartProbeCutByTheOwnerHandsOnItsCandidate(t *testing.T) {
 	}{
 		{"the prober waits on its context", false, false},
 		{"the probe waits at the candidate", true, false},
-		{"the probe waits at the candidate and the owner is cancelled with a cause", true, true},
+		{"the probe waits at the candidate and the owner is canceled with a cause", true, true},
 	}
 	for _, tc := range cases {
 		inFlight := tc.inFlight
@@ -114,7 +114,7 @@ func TestColdStartProbeCutByTheOwnerHandsOnItsCandidate(t *testing.T) {
 			if err := <-done; !errors.Is(err, context.Canceled) {
 				t.Fatalf("owner err = %v, want context.Canceled", err)
 			}
-			mustHandOnLine(t, l, "cancelled", 0, 1)
+			mustHandOnLine(t, l, "canceled", 0, 1)
 			if !coldBegun(p) {
 				t.Fatal("the cut run left the cold start unbegun")
 			}
@@ -359,7 +359,7 @@ func TestProbeTransportEndedCountsAPassedDeadline(t *testing.T) {
 		{"a deadline ahead", deadlineOnly{context.Background(), time.Now().Add(time.Hour)}, false},
 		{"a deadline passed before its timer fired", deadlineOnly{context.Background(), time.Now().Add(-time.Second)},
 			true},
-		{"cancelled", func() context.Context {
+		{"canceled", func() context.Context {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 			return ctx

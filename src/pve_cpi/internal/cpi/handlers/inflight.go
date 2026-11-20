@@ -8,7 +8,7 @@ import (
 // nodeInflightRegistry holds one buffered channel per node name. The channel
 // acts as a counting semaphore: each token in the buffer represents one
 // outstanding mutating PVE call slot. When the buffer is full, acquire blocks
-// until a caller releases a slot or the context is cancelled.
+// until a caller releases a slot or the context is canceled.
 //
 // The registry is process-scoped: semaphore sizes are fixed on first creation
 // for a given node. To resize, restart the CPI process (matching PVE session
@@ -35,7 +35,7 @@ func NewInflightRegistry() *nodeInflightRegistry { //nolint:revive // unexported
 // When limit > 0, a buffered channel of size limit is lazily created for node
 // on first call. Subsequent calls with a different limit for the same node reuse
 // the original channel (the limit is process-stable). The function blocks until
-// either a slot becomes available or ctx is cancelled.
+// either a slot becomes available or ctx is canceled.
 //
 // The returned release function must be called exactly once, typically via
 // defer. It is safe to call release multiple times: a sync.Once guard ensures
@@ -43,8 +43,8 @@ func NewInflightRegistry() *nodeInflightRegistry { //nolint:revive // unexported
 // that would inflate available capacity.
 //
 // Error cases:
-//   - ctx already cancelled on entry: returns ctx.Err() immediately.
-//   - ctx cancelled while blocked: returns ctx.Err() with no slot consumed.
+//   - ctx already canceled on entry: returns ctx.Err() immediately.
+//   - ctx canceled while blocked: returns ctx.Err() with no slot consumed.
 //   - limit <= 0: always returns (noop, nil).
 func (r *nodeInflightRegistry) acquire(ctx context.Context, node string, limit int) (release func(), err error) {
 	noop := func() {}

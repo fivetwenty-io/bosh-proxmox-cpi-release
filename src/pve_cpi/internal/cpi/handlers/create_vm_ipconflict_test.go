@@ -896,7 +896,7 @@ func TestDetectIPConflict_MalformedResourceRowSkipped(t *testing.T) {
 }
 
 func TestDetectIPConflict_ContextCancellation(t *testing.T) {
-	// Pre-cancelled context must not hang or panic.
+	// Pre-canceled context must not hang or panic.
 	entries := make([]json.RawMessage, 20)
 	for i := range entries {
 		entries[i] = ipVMResource(1000+i, fmt.Sprintf("vm-%d", 1000+i))

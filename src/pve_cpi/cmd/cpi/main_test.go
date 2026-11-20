@@ -623,9 +623,9 @@ var _ slog.Handler = (*lineSpyHandler)(nil)
 
 // The drain's log lines, as logDrainResult words them.
 const (
-	panicLine     = "endpoint cache: background worker panicked"
-	cancelledLine = "endpoint cache: cancelled background work still running at exit"
-	finishedLine  = "endpoint cache: background work finished before exit"
+	panicLine    = "endpoint cache: background worker panicked"
+	canceledLine = "endpoint cache: canceled background work still running at exit"
+	finishedLine = "endpoint cache: background work finished before exit"
 )
 
 // drainInfoRequest is an `info` request, which answers from constants.
@@ -680,11 +680,11 @@ func (w *drainTestWorker) finish() { w.once.Do(func() { close(w.release) }) }
 // has opened its run of the registry.
 func (w *drainTestWorker) waitStarted(t *testing.T) {
 	t.Helper()
-	w.cancelled(t)
+	w.canceled(t)
 }
 
-// cancelled reports whether the worker started and its context has ended.
-func (w *drainTestWorker) cancelled(t *testing.T) bool {
+// canceled reports whether the worker started and its context has ended.
+func (w *drainTestWorker) canceled(t *testing.T) bool {
 	t.Helper()
 	select {
 	case ctx := <-w.ctx:
@@ -790,12 +790,12 @@ func TestDrainStopsAtItsBoundAndKeepsExitCode(t *testing.T) {
 	if took > bound+drainTestSlack {
 		t.Fatalf("run took %s, past the %s drain bound", took, bound)
 	}
-	if !worker.cancelled(t) {
+	if !worker.canceled(t) {
 		t.Fatal("the drain did not cancel the slow worker")
 	}
-	if !strings.Contains(stderr, "endpoint cache: cancelled background work still running at exit") ||
+	if !strings.Contains(stderr, "endpoint cache: canceled background work still running at exit") ||
 		!strings.Contains(stderr, "discovery") {
-		t.Fatalf("stderr lacks the cancelled-work line naming the worker: %s", stderr)
+		t.Fatalf("stderr lacks the canceled-work line naming the worker: %s", stderr)
 	}
 }
 
@@ -819,7 +819,7 @@ func TestSlowWorkerKeepsFailingExitCode(t *testing.T) {
 	if slow != baseline {
 		t.Fatalf("slow worker changed the exit code from %d to %d", baseline, slow)
 	}
-	if !worker.cancelled(t) {
+	if !worker.canceled(t) {
 		t.Fatal("the drain did not cancel the slow worker")
 	}
 }
@@ -919,7 +919,7 @@ func TestSubcommandDrainsBackgroundWork(t *testing.T) {
 	if took < bound || took > bound+drainTestSlack {
 		t.Fatalf("subcommand took %s, want about the %s bound", took, bound)
 	}
-	if !worker.cancelled(t) {
+	if !worker.canceled(t) {
 		t.Fatal("the subcommand's drain did not cancel the slow worker")
 	}
 	if !strings.Contains(stderr, "simulated subcommand defect") {
@@ -927,7 +927,7 @@ func TestSubcommandDrainsBackgroundWork(t *testing.T) {
 	}
 }
 
-// A signal ends the drain's wait at once, and the cancelled-work line follows
+// A signal ends the drain's wait at once, and the canceled-work line follows
 // the configured mode of the cluster config that started the worker, Debug
 // under auto and Warn under an explicit "on".
 func TestDrainBackgroundWorkSignalAndLevel(t *testing.T) {
@@ -956,21 +956,21 @@ func TestDrainBackgroundWorkSignalAndLevel(t *testing.T) {
 			if took := time.Since(start); took > drainTestSlack {
 				t.Fatalf("drain after a signal took %s", took)
 			}
-			if !worker.cancelled(t) {
+			if !worker.canceled(t) {
 				t.Fatal("the drain did not cancel the worker")
 			}
 			entries := observed.All()
-			if len(entries) != 1 || entries[0].Level != tc.want || entries[0].Message != cancelledLine {
-				t.Fatalf("entries = %+v, want one cancelled-work line at %s", entries, tc.want)
+			if len(entries) != 1 || entries[0].Level != tc.want || entries[0].Message != canceledLine {
+				t.Fatalf("entries = %+v, want one canceled-work line at %s", entries, tc.want)
 			}
 		})
 	}
 }
 
-// A cancelled worker that serves a cluster config with an explicit "on" is
+// A canceled worker that serves a cluster config with an explicit "on" is
 // reported at Warn, although the job-level mode, which this config leaves
 // unset, reads as auto.
-func TestCancelledWorkerLevelFollowsItsOwnConfigMode(t *testing.T) {
+func TestCanceledWorkerLevelFollowsItsOwnConfigMode(t *testing.T) {
 	cfgPath := writeOTelWiringConfigAtLevel(t, "debug", "")
 	for _, tc := range []struct {
 		mode config.DiscoveryMode
@@ -993,8 +993,8 @@ func TestCancelledWorkerLevelFollowsItsOwnConfigMode(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("exit %d: %s", code, stderr)
 			}
-			if level, ok := spy.levelOf(cancelledLine); !ok || level != tc.want {
-				t.Fatalf("cancelled-work line at %v (present %v), want %v", level, ok, tc.want)
+			if level, ok := spy.levelOf(canceledLine); !ok || level != tc.want {
+				t.Fatalf("canceled-work line at %v (present %v), want %v", level, ok, tc.want)
 			}
 		})
 	}
@@ -1009,7 +1009,7 @@ func TestLastDrainWaitsForNothingAfterTheFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	drainBackgroundWork(context.Background(), log.NewNopLogger(), 20*time.Millisecond)
-	if !worker.cancelled(t) {
+	if !worker.canceled(t) {
 		t.Fatal("the first drain did not cancel the worker")
 	}
 	assertLastDrainWaitsForNothing(t)
@@ -1029,7 +1029,7 @@ func TestLastDrainWaitsForNothingAfterASignalledDrain(t *testing.T) {
 	finishesWithin(t, "a drain with an ended context cancels at once", func() {
 		drainBackgroundWork(signalled, log.NewNopLogger(), time.Hour)
 	})
-	if !worker.cancelled(t) {
+	if !worker.canceled(t) {
 		t.Fatal("the first drain did not cancel the worker")
 	}
 	assertLastDrainWaitsForNothing(t)
@@ -1041,11 +1041,11 @@ func assertLastDrainWaitsForNothing(t *testing.T) {
 	t.Helper()
 	var stderr bytes.Buffer
 	start := time.Now()
-	finishesWithin(t, "the last drain waits for a worker an earlier drain cancelled", func() {
+	finishesWithin(t, "the last drain waits for a worker an earlier drain canceled", func() {
 		drainRemainingBackgroundWork(&stderr, time.Hour)
 	})
 	if took := time.Since(start); took > drainTestSlack {
-		t.Fatalf("the last drain waited %s for a worker the first drain cancelled", took)
+		t.Fatalf("the last drain waited %s for a worker the first drain canceled", took)
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("the last drain wrote %q with no panic to report", stderr.String())
@@ -1098,7 +1098,7 @@ func TestSignalEndsTheMainDrainAndKeepsExitCode(t *testing.T) {
 	if resp := parseResponse(t, stdout.String()); resp.Error != nil {
 		t.Fatalf("info returned an error: %+v", resp.Error)
 	}
-	if !worker.cancelled(t) {
+	if !worker.canceled(t) {
 		t.Fatal("the signal did not cancel the slow worker")
 	}
 }
@@ -1149,7 +1149,7 @@ func TestSignalEndsASubcommandDrainAndKeepsExitCode(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("exit %d after a signal during the subcommand's drain, want the computed 1: %s", code, stderr.String())
 	}
-	if !worker.cancelled(t) {
+	if !worker.canceled(t) {
 		t.Fatal("the signal did not cancel the slow worker")
 	}
 }

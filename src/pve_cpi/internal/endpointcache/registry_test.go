@@ -131,7 +131,7 @@ func TestDrainWithNoWorkersReturnsAtOnce(t *testing.T) {
 	if took > drainSlack {
 		t.Fatalf("empty drain took %s", took)
 	}
-	if result.Started != 0 || len(result.Cancelled) != 0 || len(result.Panics) != 0 {
+	if result.Started != 0 || len(result.Canceled) != 0 || len(result.Panics) != 0 {
 		t.Fatalf("empty drain result = %+v, want nothing", result)
 	}
 }
@@ -156,10 +156,10 @@ func TestDrainWaitsForWorkThatFinishes(t *testing.T) {
 		t.Fatalf("drain took %s for work that finished after 50ms", took)
 	}
 	if sawCancel.Load() {
-		t.Fatal("worker saw its context cancelled before it finished")
+		t.Fatal("worker saw its context canceled before it finished")
 	}
-	if result.Started != 1 || len(result.Cancelled) != 0 {
-		t.Fatalf("result = %+v, want one started and none cancelled", result)
+	if result.Started != 1 || len(result.Canceled) != 0 {
+		t.Fatalf("result = %+v, want one started and none canceled", result)
 	}
 }
 
@@ -182,8 +182,8 @@ func TestDrainStopsAtBoundAndCancels(t *testing.T) {
 	if !errors.Is(ctx.Err(), context.Canceled) {
 		t.Fatalf("worker context after the drain: %v, want canceled", ctx.Err())
 	}
-	if !slices.Equal(result.Cancelled, []string{"down mark"}) || result.Started != 1 {
-		t.Fatalf("result = %+v, want the down mark cancelled", result)
+	if !slices.Equal(result.Canceled, []string{"down mark"}) || result.Started != 1 {
+		t.Fatalf("result = %+v, want the down mark canceled", result)
 	}
 	if result.Waited < bound {
 		t.Fatalf("Waited = %s, want at least %s", result.Waited, bound)
@@ -194,7 +194,7 @@ func TestDrainStopsAtBoundAndCancels(t *testing.T) {
 // drain must still list that worker, so the test holds the drain right after
 // its cancel until the worker has returned and then gives the worker's removal
 // time to run. The removal needs the registry's lock, which the drain holds
-// there, so it cannot finish first. A drain that cancelled before it took the
+// there, so it cannot finish first. A drain that canceled before it took the
 // lock would lose the worker from the list every time.
 func TestDrainCancelsCooperativeWorker(t *testing.T) {
 	t.Parallel()
@@ -217,8 +217,8 @@ func TestDrainCancelsCooperativeWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := drainWithin(t, "a drain stops at its bound", context.Background(), r, 20*time.Millisecond)
-	if !slices.Equal(result.Cancelled, []string{"discovery"}) {
-		t.Fatalf("Cancelled = %v, want [discovery]", result.Cancelled)
+	if !slices.Equal(result.Canceled, []string{"discovery"}) {
+		t.Fatalf("Canceled = %v, want [discovery]", result.Canceled)
 	}
 	if err := <-got; !errors.Is(err, context.Canceled) {
 		t.Fatalf("worker context error = %v, want canceled", err)
@@ -249,8 +249,8 @@ func TestDrainEndsEarly(t *testing.T) {
 			if took > drainSlack {
 				t.Fatalf("drain took %s", took)
 			}
-			if ctx.Err() == nil || !slices.Equal(result.Cancelled, []string{"discovery"}) {
-				t.Fatalf("worker context %v, result %+v; want the worker cancelled", ctx.Err(), result)
+			if ctx.Err() == nil || !slices.Equal(result.Canceled, []string{"discovery"}) {
+				t.Fatalf("worker context %v, result %+v; want the worker canceled", ctx.Err(), result)
 			}
 		})
 	}
@@ -268,8 +268,8 @@ func TestDrainContextEndingDuringWait(t *testing.T) {
 	if took > drainSlack {
 		t.Fatalf("drain took %s after its context ended", took)
 	}
-	if !slices.Equal(result.Cancelled, []string{"discovery"}) {
-		t.Fatalf("Cancelled = %v, want [discovery]", result.Cancelled)
+	if !slices.Equal(result.Canceled, []string{"discovery"}) {
+		t.Fatalf("Canceled = %v, want [discovery]", result.Canceled)
 	}
 }
 
@@ -284,8 +284,8 @@ func TestDrainNilContext(t *testing.T) {
 	if took < 50*time.Millisecond || took > 50*time.Millisecond+drainSlack {
 		t.Fatalf("drain with a nil context took %s, want about 50ms", took)
 	}
-	if len(result.Cancelled) != 1 {
-		t.Fatalf("Cancelled = %v, want one worker", result.Cancelled)
+	if len(result.Canceled) != 1 {
+		t.Fatalf("Canceled = %v, want one worker", result.Canceled)
 	}
 }
 
@@ -314,8 +314,8 @@ func TestGoRefusedOnceDrainStarts(t *testing.T) {
 	case <-time.After(drainGuard):
 		t.Fatalf("a drain returns once its last worker does: Drain was still waiting after %s", drainGuard)
 	}
-	if len(result.Cancelled) != 0 {
-		t.Fatalf("Cancelled = %v after every worker finished", result.Cancelled)
+	if len(result.Canceled) != 0 {
+		t.Fatalf("Canceled = %v after every worker finished", result.Canceled)
 	}
 	if err := r.Go("after drain", config.DiscoveryModeAuto, refused); !errors.Is(err, ErrRegistryClosed) {
 		t.Fatalf("Go after the drain returned: %v, want ErrRegistryClosed", err)
@@ -344,12 +344,12 @@ func TestSecondDrainWaitsForNothing(t *testing.T) {
 	r := NewRegistry()
 	startStuck(t, r, "discovery")
 	drainWithin(t, "a drain stops at its bound", context.Background(), r, 20*time.Millisecond)
-	result, took := timedDrain(t, "a drain after a cancelled run waits for nothing", context.Background(), r, time.Hour)
+	result, took := timedDrain(t, "a drain after a canceled run waits for nothing", context.Background(), r, time.Hour)
 	if took > drainSlack {
 		t.Fatalf("second drain took %s", took)
 	}
-	if !slices.Equal(result.Cancelled, []string{"discovery"}) {
-		t.Fatalf("second drain Cancelled = %v, want the worker still listed", result.Cancelled)
+	if !slices.Equal(result.Canceled, []string{"discovery"}) {
+		t.Fatalf("second drain Canceled = %v, want the worker still listed", result.Canceled)
 	}
 }
 
@@ -392,8 +392,8 @@ func TestOverlappingDrainKeepsItsOwnShorterBound(t *testing.T) {
 	if took < bound || took > bound+drainSlack {
 		t.Fatalf("overlapping drain took %s, want about its own %s bound", took, bound)
 	}
-	if !slices.Equal(result.Cancelled, []string{"discovery"}) {
-		t.Fatalf("Cancelled = %v, want the stuck worker", result.Cancelled)
+	if !slices.Equal(result.Canceled, []string{"discovery"}) {
+		t.Fatalf("Canceled = %v, want the stuck worker", result.Canceled)
 	}
 	stuck.finish()
 	select {
@@ -420,8 +420,8 @@ func TestDrainAfterEndedContextDrainWaitsForNothing(t *testing.T) {
 	if took > drainSlack {
 		t.Fatalf("later drain took %s after the first drain gave up", took)
 	}
-	if !slices.Equal(result.Cancelled, []string{"discovery"}) {
-		t.Fatalf("later drain Cancelled = %v, want the worker still listed", result.Cancelled)
+	if !slices.Equal(result.Canceled, []string{"discovery"}) {
+		t.Fatalf("later drain Canceled = %v, want the worker still listed", result.Canceled)
 	}
 }
 
@@ -439,18 +439,18 @@ func TestShorterDrainEndsLongerDrain(t *testing.T) {
 	drainWithin(t, "a drain stops at its bound", context.Background(), r, bound)
 	select {
 	case result := <-longDone:
-		if !slices.Equal(result.Cancelled, []string{"discovery"}) {
-			t.Fatalf("longer drain Cancelled = %v, want the worker", result.Cancelled)
+		if !slices.Equal(result.Canceled, []string{"discovery"}) {
+			t.Fatalf("longer drain Canceled = %v, want the worker", result.Canceled)
 		}
 	case <-time.After(drainGuard):
 		t.Fatalf("a drain keeps waiting after another drain of its run gave up: still waiting after %s", drainGuard)
 	}
 }
 
-// The level of the cancelled-work line is the highest among the cancelled
+// The level of the canceled-work line is the highest among the canceled
 // workers, each judged by its own cluster config's mode, and a worker that
 // finished does not count.
-func TestCancelledLevelFollowsWorkerModes(t *testing.T) {
+func TestCanceledLevelFollowsWorkerModes(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name  string
@@ -469,7 +469,7 @@ func TestCancelledLevelFollowsWorkerModes(t *testing.T) {
 			want:  slog.LevelWarn,
 		},
 		{
-			name:  "on finished, auto cancelled",
+			name:  "on finished, auto canceled",
 			modes: []config.DiscoveryMode{config.DiscoveryModeAuto},
 			done:  []config.DiscoveryMode{config.DiscoveryModeOn},
 			want:  slog.LevelDebug,
@@ -491,16 +491,16 @@ func TestCancelledLevelFollowsWorkerModes(t *testing.T) {
 			}
 			waitRunning(t, r, len(tc.modes))
 			result := drainWithin(t, "a drain stops at its bound", context.Background(), r, 20*time.Millisecond)
-			if result.CancelledLevel != tc.want {
+			if result.CanceledLevel != tc.want {
 				t.Fatalf(
-					"CancelledLevel = %v, want %v for %d cancelled workers",
-					result.CancelledLevel,
+					"CanceledLevel = %v, want %v for %d canceled workers",
+					result.CanceledLevel,
 					tc.want,
-					len(result.Cancelled),
+					len(result.Canceled),
 				)
 			}
-			if len(result.Cancelled) != len(tc.modes) {
-				t.Fatalf("Cancelled = %v, want %d workers", result.Cancelled, len(tc.modes))
+			if len(result.Canceled) != len(tc.modes) {
+				t.Fatalf("Canceled = %v, want %d workers", result.Canceled, len(tc.modes))
 			}
 		})
 	}
@@ -562,7 +562,7 @@ func TestOpenStartsFreshRun(t *testing.T) {
 	if took > drainSlack {
 		t.Fatalf("drain of the fresh run took %s", took)
 	}
-	if result.Started != 0 || len(result.Cancelled) != 0 {
+	if result.Started != 0 || len(result.Canceled) != 0 {
 		t.Fatalf("fresh run result = %+v, want nothing", result)
 	}
 }
@@ -575,8 +575,8 @@ func TestOpenOnOpenRegistryKeepsRun(t *testing.T) {
 	stuck := startStuck(t, r, "discovery")
 	r.Open()
 	result := drainWithin(t, "a drain stops at its bound", context.Background(), r, 10*time.Millisecond)
-	if !slices.Equal(result.Cancelled, []string{"discovery"}) {
-		t.Fatalf("Cancelled = %v, want the worker started before Open", result.Cancelled)
+	if !slices.Equal(result.Canceled, []string{"discovery"}) {
+		t.Fatalf("Canceled = %v, want the worker started before Open", result.Canceled)
 	}
 	stuck.finish()
 }
@@ -684,8 +684,8 @@ func TestConcurrentRegistrationAndDrain(t *testing.T) {
 	if int64(result.Started) != accepted.Load() {
 		t.Fatalf("Started = %d, accepted = %d", result.Started, accepted.Load())
 	}
-	if len(result.Cancelled) != 0 {
-		t.Fatalf("Cancelled = %d workers that finish at once", len(result.Cancelled))
+	if len(result.Canceled) != 0 {
+		t.Fatalf("Canceled = %d workers that finish at once", len(result.Canceled))
 	}
 	// The drain waited for every accepted worker, so each has run by now.
 	acceptedIDs.Range(func(id, _ any) bool {
@@ -728,7 +728,7 @@ func TestProcessRegistry(t *testing.T) {
 	}
 }
 
-// Workers, cancelled ones included, leave no goroutine behind once they
+// Workers, canceled ones included, leave no goroutine behind once they
 // return, and the drain itself starts none.
 func TestRegistryLeavesNoGoroutines(t *testing.T) {
 	before := runtime.NumGoroutine()
@@ -746,7 +746,7 @@ func TestRegistryLeavesNoGoroutines(t *testing.T) {
 		}
 	}
 	result := drainWithin(t, "a drain stops at its bound", context.Background(), r, 20*time.Millisecond)
-	if len(result.Cancelled) == 0 {
+	if len(result.Canceled) == 0 {
 		t.Fatal("no worker was still running at the bound")
 	}
 	close(release)

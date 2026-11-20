@@ -445,7 +445,7 @@ func (s *Store) checkKey(payload json.RawMessage) error {
 //
 // The caller's context is checked once the lock is held and again after merge
 // returns, so a caller whose context has ended, such as a worker the exit
-// drain cancelled, writes nothing. A check that finds the context ended
+// drain canceled, writes nothing. A check that finds the context ended
 // returns its error, wrapped.
 //
 // An error comes back when the caller's context ends, whether during the

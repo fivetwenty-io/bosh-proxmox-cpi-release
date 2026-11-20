@@ -201,7 +201,7 @@ func TestNilLogger(t *testing.T) {
 	}
 }
 
-// TestCallerContextCancel verifies that cancelling the caller's context
+// TestCallerContextCancel verifies that canceling the caller's context
 // also stops the child process (context propagation).
 func TestCallerContextCancel(t *testing.T) {
 	sleepPath := "/bin/sleep"

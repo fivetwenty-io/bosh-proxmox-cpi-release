@@ -100,10 +100,10 @@ func TestHoldSharedEndsWithTheContext(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) || done != nil {
 		t.Fatalf("HoldShared = %v, %v, want no release and the deadline's error", done != nil, err)
 	}
-	cancelled, stop := context.WithCancel(context.Background())
+	canceled, stop := context.WithCancel(context.Background())
 	stop()
-	if _, err := j.HoldShared(cancelled, id); !errors.Is(err, context.Canceled) {
-		t.Fatalf("HoldShared on a cancelled context: %v, want context.Canceled", err)
+	if _, err := j.HoldShared(canceled, id); !errors.Is(err, context.Canceled) {
+		t.Fatalf("HoldShared on a canceled context: %v, want context.Canceled", err)
 	}
 }
 

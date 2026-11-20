@@ -409,7 +409,7 @@ func HandleCreateDisk(deps Deps) Handler {
 		if deps.Config != nil {
 			inflightRelease, inflightErr := deps.Inflight.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
 			if inflightErr != nil {
-				return nil, cpierrors.Retriable("create_disk: in-flight limit exceeded or context cancelled on node %s: %s", node, inflightErr.Error())
+				return nil, cpierrors.Retriable("create_disk: in-flight limit exceeded or context canceled on node %s: %s", node, inflightErr.Error())
 			}
 			defer inflightRelease()
 		}
@@ -830,7 +830,7 @@ func attemptCreateVolume(
 
 // rollbackCreatedVolume best-effort deletes a successfully created volume when
 // a subsequent step in create_disk fails. Runs on a detached, bounded context
-// (detachedContext) so cleanup completes even if the caller cancelled the
+// (detachedContext) so cleanup completes even if the caller canceled the
 // request without stalling past rollbackCleanupTimeout. Logs errors; never
 // panics.
 func rollbackCreatedVolume(

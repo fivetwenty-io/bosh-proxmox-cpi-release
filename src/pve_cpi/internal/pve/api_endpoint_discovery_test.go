@@ -303,8 +303,8 @@ func (e *workerEnv) drain() {
 	e.t.Helper()
 	res := e.registry.Drain(context.Background(), 30*time.Second)
 	e.registry.Open()
-	if len(res.Cancelled) > 0 || len(res.Panics) > 0 {
-		e.t.Fatalf("drain cancelled %v, panics %v", res.Cancelled, res.Panics)
+	if len(res.Canceled) > 0 || len(res.Panics) > 0 {
+		e.t.Fatalf("drain canceled %v, panics %v", res.Canceled, res.Panics)
 	}
 }
 
@@ -937,7 +937,7 @@ func TestDiscoveryWorker_DrainCutsTheWriteOffWithoutATornFile(t *testing.T) {
 		!reflect.DeepEqual(after.Discovery.Nodes, before.Discovery.Nodes) ||
 		!after.Discovery.DiscoveredAt.Equal(e.clock.Now()) ||
 		after.Discovery.LastFailure != endpointcache.FailureReadsTimedOut {
-		t.Fatalf("the cancelled write changed the file beyond its attempt: %+v", after.Discovery)
+		t.Fatalf("the canceled write changed the file beyond its attempt: %+v", after.Discovery)
 	}
 	if temps := e.tempFiles(); len(temps) > 0 {
 		t.Fatalf("temporary files left behind: %v", temps)
@@ -1425,10 +1425,10 @@ func TestDiscoveryWorker_Helpers(t *testing.T) {
 // A refresh the drain cancels during its reads has already recorded its
 // attempt, so it backs off the usual hour as a failed refresh does, and the
 // calls inside that hour start no reads. It logs no failure line, because the
-// drain reports the cancelled worker, and it leaves the stored outcome, nodes,
+// drain reports the canceled worker, and it leaves the stored outcome, nodes,
 // and pins as they were. That holds on a file with a result and on a cache
 // that has none yet.
-func TestDiscoveryWorker_CancelledRefreshBacksOffLikeAFailedOne(t *testing.T) {
+func TestDiscoveryWorker_CanceledRefreshBacksOffLikeAFailedOne(t *testing.T) {
 	t.Parallel()
 	for _, withResult := range []bool{true, false} {
 		t.Run(fmt.Sprintf("with a stored result %v", withResult), func(t *testing.T) {
@@ -1462,15 +1462,15 @@ func TestDiscoveryWorker_CancelledRefreshBacksOffLikeAFailedOne(t *testing.T) {
 			res := e.registry.Drain(context.Background(), 50*time.Millisecond)
 			<-done
 			e.registry.Open()
-			if len(res.Cancelled) != 1 {
-				t.Fatalf("drain cancelled %v, want the discovery worker", res.Cancelled)
+			if len(res.Canceled) != 1 {
+				t.Fatalf("drain canceled %v, want the discovery worker", res.Canceled)
 			}
 			e.noLine("api endpoint discovery: no result")
 			e.noLine("the cache write failed")
 
 			p := e.payload()
 			if p == nil || p.Discovery == nil {
-				t.Fatalf("a cancelled refresh left no attempt: %+v", p)
+				t.Fatalf("a canceled refresh left no attempt: %+v", p)
 			}
 			d := p.Discovery
 			if d.LastFailure != endpointcache.FailureReadsTimedOut || !d.DiscoveredAt.Equal(e.clock.Now()) ||
@@ -1480,19 +1480,19 @@ func TestDiscoveryWorker_CancelledRefreshBacksOffLikeAFailedOne(t *testing.T) {
 			if withResult && (d.Outcome != before.Discovery.Outcome ||
 				!reflect.DeepEqual(d.Nodes, before.Discovery.Nodes) ||
 				p.Cluster.RootCASHA256 != before.Cluster.RootCASHA256) {
-				t.Fatalf("a cancelled refresh changed the result: %+v", d)
+				t.Fatalf("a canceled refresh changed the result: %+v", d)
 			}
 			if !withResult && (d.Outcome != "" || len(d.Nodes) != 0 || p.Cluster != nil) {
 				t.Fatalf("payload %+v, want only the attempt", p)
 			}
 			if endpointcache.RefreshDue(p, e.clock.Now(), false) {
-				t.Fatal("a refresh is still due after a cancelled one")
+				t.Fatal("a refresh is still due after a canceled one")
 			}
 
 			e.clock.advance(endpointcache.RefreshInterval - time.Second)
 			e.run()
 			if n := e.requests(); n != 0 {
-				t.Fatalf("a call inside the hour after a cancelled refresh sent %d requests", n)
+				t.Fatalf("a call inside the hour after a canceled refresh sent %d requests", n)
 			}
 		})
 	}

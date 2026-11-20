@@ -798,7 +798,7 @@ func createVM(
 		var inflightErr error
 		inflightRelease, inflightErr = deps.Inflight.acquire(ctx, shape.node, deps.Config.MaxInflightPerNodeLimit())
 		if inflightErr != nil {
-			return nil, cpierrors.Retriable("create_vm: in-flight limit exceeded or context cancelled on node %s: %s", shape.node, inflightErr.Error())
+			return nil, cpierrors.Retriable("create_vm: in-flight limit exceeded or context canceled on node %s: %s", shape.node, inflightErr.Error())
 		}
 		defer inflightRelease()
 	}

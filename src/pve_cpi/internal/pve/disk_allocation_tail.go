@@ -34,7 +34,7 @@ func IsConfigDigestRefusal(err error) bool {
 
 // AnsweredStatus returns the HTTP status of an error PVE answered, and false
 // for a failure PVE never answered, such as a transport error, a gateway status,
-// or a cancelled context.
+// or a canceled context.
 func AnsweredStatus(err error) (int, bool) {
 	return pveAnswered(err)
 }

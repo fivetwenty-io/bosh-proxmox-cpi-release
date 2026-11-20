@@ -27,14 +27,14 @@ func DrainWaitFor(wait time.Duration) time.Duration {
 // with AfterDrain, which close the cache stores. A command opens the registry
 // with Open when it starts and defers DrainAtExit, so a down mark or a
 // discovery refresh that a client started just before the command ends
-// finishes, or is cancelled, before the process exits.
+// finishes, or is canceled, before the process exits.
 //
 // A SIGINT or SIGTERM during the wait ends the wait at once, and the command
 // still exits with the code its caller computed, because the signal is caught
 // here and not left to kill the process. command names the caller in the one
 // line the drain writes when its logger fails. The command has no other logger,
 // so the drain reports on stderr, through LogDrainResult at Warn. A panicked
-// worker is an Error line there, and a cancelled worker is a Warn line only
+// worker is an Error line there, and a canceled worker is a Warn line only
 // when it serves a cluster config with an explicit "on", because that is the
 // level its own config's mode gives. A normal exit writes nothing, and a
 // command that started no worker never waits.
@@ -47,7 +47,7 @@ func DrainAtExit(command string, stderr io.Writer, wait time.Duration) {
 	}
 	logger, err := log.NewLogger("warn", stderr)
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "%s: background workers panicked (%d) or were cancelled (%d), and the logger "+
+		_, _ = fmt.Fprintf(stderr, "%s: background workers panicked (%d) or were canceled (%d), and the logger "+
 			"failed: %s\n", command, len(result.Panics), len(result.Unreported()), err)
 		return
 	}
@@ -55,8 +55,8 @@ func DrainAtExit(command string, stderr io.Writer, wait time.Duration) {
 }
 
 // LogDrainResult logs a drain's findings on logger. A panicked worker is an
-// Error with its stack. Cancelled work is logged at the level the drain
-// reports, a Debug line, or a Warn when a cancelled worker serves a cluster
+// Error with its stack. Canceled work is logged at the level the drain
+// reports, a Debug line, or a Warn when a canceled worker serves a cluster
 // config with an explicit "on", because the operator asked for a cache this
 // call did not finish writing. Work that finished in time is a Debug line, and
 // a call that started no worker logs nothing.
@@ -68,14 +68,14 @@ func LogDrainResult(logger *log.Logger, result DrainResult) {
 			log.String("stack", string(p.Stack)),
 		)
 	}
-	cancelled := result.Unreported()
+	canceled := result.Unreported()
 	switch {
-	case len(result.Cancelled) > 0 && len(cancelled) == 0:
+	case len(result.Canceled) > 0 && len(canceled) == 0:
 		// An earlier drain of this run already reported these workers.
-	case len(cancelled) > 0:
-		logger.LogAttrs(context.Background(), result.CancelledLevel,
-			"endpoint cache: cancelled background work still running at exit",
-			log.String("workers", strings.Join(cancelled, ", ")),
+	case len(canceled) > 0:
+		logger.LogAttrs(context.Background(), result.CanceledLevel,
+			"endpoint cache: canceled background work still running at exit",
+			log.String("workers", strings.Join(canceled, ", ")),
 			log.Int("started", result.Started),
 			log.String("waited", result.Waited.Round(time.Millisecond).String()),
 		)

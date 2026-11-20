@@ -87,12 +87,12 @@ func TestPermissionlessDepsDowngradeWithAnExplicitReason(t *testing.T) {
 	}
 }
 
-func TestCancelledContextFailsClosed(t *testing.T) {
+func TestCanceledContextFailsClosed(t *testing.T) {
 	w := three()
 	d := w.deps(cfgMode(config.HAModeAuto))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	d.Cluster = &cancelledCluster{fakeCluster: w.cluster}
+	d.Cluster = &canceledCluster{fakeCluster: w.cluster}
 	p, err := ha.Resolve(ctx, d)
 	if err != nil {
 		t.Fatal(err)
@@ -102,8 +102,8 @@ func TestCancelledContextFailsClosed(t *testing.T) {
 	}
 }
 
-type cancelledCluster struct{ *fakeCluster }
+type canceledCluster struct{ *fakeCluster }
 
-func (c *cancelledCluster) ListStatus(ctx context.Context) (*sdkcluster.ListStatusResponse, error) {
+func (c *canceledCluster) ListStatus(ctx context.Context) (*sdkcluster.ListStatusResponse, error) {
 	return nil, errors.Join(ctx.Err(), errors.New("request aborted"))
 }

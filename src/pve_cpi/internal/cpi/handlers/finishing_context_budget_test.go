@@ -30,7 +30,7 @@ func TestFinishingContextBudget(t *testing.T) {
 		defer cancel()
 		assertFinishingWindow(t, got, budget-time.Second, budget)
 	})
-	t.Run("cancelled request without a deadline runs unchanged", func(t *testing.T) {
+	t.Run("canceled request without a deadline runs unchanged", func(t *testing.T) {
 		t.Parallel()
 		parent, stop := context.WithCancel(base)
 		stop()

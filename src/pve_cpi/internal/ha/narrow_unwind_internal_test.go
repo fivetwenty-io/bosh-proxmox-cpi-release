@@ -211,7 +211,7 @@ func TestUnwindContext(t *testing.T) {
 					t.Fatalf("the step ended %v after the request did, want at least the %v window", spent, window)
 				}
 				if !errors.Is(step.Err(), context.Canceled) {
-					t.Fatalf("the step ended with %v, want it cancelled when its window ran out", step.Err())
+					t.Fatalf("the step ended with %v, want it canceled when its window ran out", step.Err())
 				}
 			})
 		}

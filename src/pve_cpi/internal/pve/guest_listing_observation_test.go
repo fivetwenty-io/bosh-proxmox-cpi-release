@@ -114,6 +114,6 @@ func TestGuestListingPreservesCancellationAndFalseParameter(t *testing.T) {
 		t.Fatalf("cancellation lost: %v", err)
 	}
 	if calls != 1 {
-		t.Fatal("cancelled request reached server")
+		t.Fatal("canceled request reached server")
 	}
 }

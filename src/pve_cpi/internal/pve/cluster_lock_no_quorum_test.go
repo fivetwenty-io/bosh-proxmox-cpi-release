@@ -56,7 +56,7 @@ func TestIsCfsLockNoQuorum(t *testing.T) {
 		{"a write that failed after the lock", sdkPoolCreateError(500,
 			`{"data":null,"message":"error writing config, cfs-lock failed - not quorate\n"}`), false},
 		{"the text without an answer from PVE", errors.New(noQuorumPoolText), false},
-		{"a cancelled request", fmt.Errorf("%w: %w", context.Canceled, sdkPoolCreateError(500, noQuorumPoolBody)), false},
+		{"a canceled request", fmt.Errorf("%w: %w", context.Canceled, sdkPoolCreateError(500, noQuorumPoolBody)), false},
 		{"nil", nil, false},
 	}
 	for _, tc := range cases {

@@ -228,18 +228,18 @@ func TestDeleteParkedOwnedDisk_HungRestoreHitsItsDeadline(t *testing.T) {
 	}
 }
 
-// TestRestoreParkerProtection_SurvivesACancelledRequest checks that the
+// TestRestoreParkerProtection_SurvivesACanceledRequest checks that the
 // restore still runs, and succeeds, when the request context is already
-// cancelled, because it runs on context.WithoutCancel.
-func TestRestoreParkerProtection_SurvivesACancelledRequest(t *testing.T) {
+// canceled, because it runs on context.WithoutCancel.
+func TestRestoreParkerProtection_SurvivesACanceledRequest(t *testing.T) {
 	c := newScanFakeClient(map[int]map[string]any{90000: {cfgKeyTags: "bosh-parker", paramProtection: false}})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := restoreParkerProtection(ctx, c, nil, "transfer out", "pve1", 90000, "the disk transfer to vm 700 slot scsi1 completed"); err != nil {
-		t.Fatalf("restore on a cancelled request: %v", err)
+		t.Fatalf("restore on a canceled request: %v", err)
 	}
 	if prot, _ := c.configs[90000][paramProtection].(bool); !prot {
-		t.Fatal("protection was not restored on a cancelled request")
+		t.Fatal("protection was not restored on a canceled request")
 	}
 }
 

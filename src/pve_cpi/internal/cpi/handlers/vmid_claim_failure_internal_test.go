@@ -222,9 +222,9 @@ func TestVMIDClaimSet_KeepsAClaimWhoseReleaseKeepsFailing(t *testing.T) {
 	}
 }
 
-// TestWithVMIDClaim_ReleasesAfterTheRequestIsCancelled shows a request that
-// is cancelled while it holds the claim still deletes the sentinel.
-func TestWithVMIDClaim_ReleasesAfterTheRequestIsCancelled(t *testing.T) {
+// TestWithVMIDClaim_ReleasesAfterTheRequestIsCanceled shows a request that
+// is canceled while it holds the claim still deletes the sentinel.
+func TestWithVMIDClaim_ReleasesAfterTheRequestIsCanceled(t *testing.T) {
 	pools := newExclusiveLockPools()
 	ctx, cancel := context.WithCancel(crhCtx())
 	defer cancel()
@@ -238,13 +238,13 @@ func TestWithVMIDClaim_ReleasesAfterTheRequestIsCancelled(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if pools.held(100) {
-		t.Fatal("a cancelled request must still release its claim")
+		t.Fatal("a canceled request must still release its claim")
 	}
 }
 
 // TestRunInVMIDClaimWindow_ACutOffIsRetriable shows that work the claim's
 // window cuts off reaches the Director as retriable, whatever the interrupted
-// call returned, while a request that was itself cancelled keeps its error.
+// call returned, while a request that was itself canceled keeps its error.
 func TestRunInVMIDClaimWindow_ACutOffIsRetriable(t *testing.T) {
 	cut := func(ctx context.Context) error {
 		<-ctx.Done()
@@ -259,7 +259,7 @@ func TestRunInVMIDClaimWindow_ACutOffIsRetriable(t *testing.T) {
 	cancel()
 	err = runInVMIDClaimWindow(parent, 100, time.Now().Add(time.Hour), cut)
 	if okToRetryCPIError(err) {
-		t.Fatalf("a cancelled request is not a window cut, got %v", err)
+		t.Fatalf("a canceled request is not a window cut, got %v", err)
 	}
 
 	if err := runInVMIDClaimWindow(context.Background(), 100, time.Now().Add(time.Hour),

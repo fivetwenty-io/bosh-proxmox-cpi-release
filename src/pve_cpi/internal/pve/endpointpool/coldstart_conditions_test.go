@@ -273,12 +273,12 @@ func (f *twoCandidates) mustProbed(t *testing.T, pve2, pve3 int) {
 	}
 }
 
-// A walk that probes the candidates and is cancelled after a candidate
+// A walk that probes the candidates and is canceled after a candidate
 // answered and was refused passes the candidates it never probed to the walk
 // waiting for it, which goes on where it stopped: the refused candidate is not
 // probed again, no second cold start begins, and the end line says why the run
 // stopped and how many candidates it left.
-func TestColdStartOwnerCancelledHandsOnTheRest(t *testing.T) {
+func TestColdStartOwnerCanceledHandsOnTheRest(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	waiting := make(chan struct{}, 4)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -319,7 +319,7 @@ func TestColdStartOwnerCancelledHandsOnTheRest(t *testing.T) {
 	}
 	f.mustProbed(t, 1, 1)
 	end := f.l.entries(slog.LevelDebug, "pve endpoints: the cold start from placement.az_map accepted no candidate")
-	if len(end) != 1 || end[0].Attrs["reason"] != "cancelled" || end[0].Attrs["unprobed"] != int64(1) ||
+	if len(end) != 1 || end[0].Attrs["reason"] != "canceled" || end[0].Attrs["unprobed"] != int64(1) ||
 		!strings.HasSuffix(end[0].Message, "with 1 candidates never probed, which the next request that reaches "+
 			"the cold start probes") {
 		t.Fatalf("end lines = %+v", end)
@@ -439,7 +439,7 @@ func TestColdStartWaiterOutOfBudgetAfterTheWaitDoesNotHop(t *testing.T) {
 // A walk whose own request ends right after its probe proved the candidate
 // returns the caller's error and sends nothing, and the candidate stays
 // accepted for the next request.
-func TestColdStartCancelledAfterAProvedProbeSendsNothing(t *testing.T) {
+func TestColdStartCanceledAfterAProvedProbeSendsNothing(t *testing.T) {
 	l := newLab(t)
 	seed := l.refused(t)
 	cand, c := l.candidate(t, "pve2.example.com", nil)
@@ -468,7 +468,7 @@ func TestColdStartCancelledAfterAProvedProbeSendsNothing(t *testing.T) {
 // A mutation whose own request ends right after its probe proved the candidate
 // is proven unsent and leaves no tether, so the next mutation with its key
 // still reaches the candidate the cold start accepted.
-func TestColdStartCancelledMutationAfterAProvedProbeLeavesNoTether(t *testing.T) {
+func TestColdStartCanceledMutationAfterAProvedProbeLeavesNoTether(t *testing.T) {
 	l := newLab(t)
 	seed := l.refused(t)
 	cand, c := l.candidate(t, "pve2.example.com", nil)

@@ -193,7 +193,7 @@ func TestNodeEndpointResolver_MarkDirectRouteFailed(t *testing.T) {
 	nilResolver.MarkDirectRouteFailed("pve2") // must not panic
 }
 
-func TestNodeEndpointResolver_CancelledDiscoveryNotMemoized(t *testing.T) {
+func TestNodeEndpointResolver_CanceledDiscoveryNotMemoized(t *testing.T) {
 	t.Parallel()
 	resp := sdkcluster.ListStatusResponse([]json.RawMessage{
 		statusRow("node", "pve2", "10.0.0.2", 1),
@@ -210,14 +210,14 @@ func TestNodeEndpointResolver_CancelledDiscoveryNotMemoized(t *testing.T) {
 	}
 	r := pve.NewNodeEndpointResolver(c, nil, "pve1.example.com", true, log.NewNopLogger())
 
-	cancelled, cancel := context.WithCancel(context.Background())
+	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, ok := r.HostFor(cancelled, "pve2"); ok {
-		t.Error("HostFor with a cancelled ctx: expected no override")
+	if _, ok := r.HostFor(canceled, "pve2"); ok {
+		t.Error("HostFor with a canceled ctx: expected no override")
 	}
 	// The cancellation must not poison the process; a live ctx retries.
 	if h, ok := r.HostFor(context.Background(), "pve2"); !ok || h != "10.0.0.2" {
-		t.Errorf("HostFor after cancelled first fetch = %q, %v; want discovered 10.0.0.2, true", h, ok)
+		t.Errorf("HostFor after canceled first fetch = %q, %v; want discovered 10.0.0.2, true", h, ok)
 	}
 }
 

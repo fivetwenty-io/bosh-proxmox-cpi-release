@@ -296,7 +296,7 @@ func attachDiskSteps(
 	if deps.Config != nil {
 		inflightRelease, inflightErr := deps.Inflight.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
 		if inflightErr != nil {
-			return "", "", "", cpierrors.Retriable("attach_disk: in-flight limit exceeded or context cancelled on node %s: %s", node, inflightErr.Error())
+			return "", "", "", cpierrors.Retriable("attach_disk: in-flight limit exceeded or context canceled on node %s: %s", node, inflightErr.Error())
 		}
 		defer inflightRelease()
 	}

@@ -193,7 +193,7 @@ func TestInflightAcquireFailureIsRetriable(t *testing.T) {
 		t.Fatal("acquire did not return after ctx cancel")
 	}
 	if acquireErr == nil {
-		t.Fatal("expected non-nil error when slot full and ctx cancelled")
+		t.Fatal("expected non-nil error when slot full and ctx canceled")
 	}
 	// Wrap exactly as handlers do; verify OkToRetry=true.
 	wrapped := cpierrors.Retriable("handler: in-flight limit exceeded: %s", acquireErr.Error())

@@ -75,7 +75,7 @@ type Registry struct {
 // running after its run was drained cannot hold up or join a later run.
 type workerRun struct {
 	// ctx is every worker's context. A drain cancels it when it gives up, and
-	// a drain that finds it cancelled, or sees it cancelled while it waits,
+	// a drain that finds it canceled, or sees it canceled while it waits,
 	// returns at once. So drains of one run never add up to more than one
 	// bound, and a later drain, such as the last one after a signal ended the
 	// first, never waits again.
@@ -90,7 +90,7 @@ type workerRun struct {
 	nextID  uint64
 	started int
 	panics  []WorkerPanic
-	// reported holds the workers a drain already named in Cancelled, so a
+	// reported holds the workers a drain already named in Canceled, so a
 	// later drain of the same run names only the ones it has not.
 	reported map[uint64]bool
 	// afterDrain holds the functions AfterDrain registered and no drain has
@@ -126,30 +126,30 @@ type DrainResult struct {
 	Started int
 	// Waited is how long the drain took.
 	Waited time.Duration
-	// Cancelled names the workers still running when the drain gave up, in
-	// sorted order. Each was cancelled and is expected to write nothing, and
+	// Canceled names the workers still running when the drain gave up, in
+	// sorted order. Each was canceled and is expected to write nothing, and
 	// the drain did not wait for it to return.
-	Cancelled []string
-	// Reported names the workers in Cancelled that an earlier drain of the
-	// same run already named, in sorted order. A caller that logs Cancelled
+	Canceled []string
+	// Reported names the workers in Canceled that an earlier drain of the
+	// same run already named, in sorted order. A caller that logs Canceled
 	// leaves these out, so the same worker is never logged twice.
 	Reported []string
-	// CancelledLevel is the level for the line that reports the cancelled
+	// CanceledLevel is the level for the line that reports the canceled
 	// workers Reported does not name: the highest Level among them, each judged by the
 	// configured mode of the cluster config that started it. It is Debug when
-	// no worker was cancelled.
-	CancelledLevel slog.Level
+	// no worker was canceled.
+	CanceledLevel slog.Level
 	// Panics holds the workers that panicked and that no earlier drain
 	// reported.
 	Panics []WorkerPanic
 }
 
-// Unreported returns the cancelled workers that no earlier drain of the run
+// Unreported returns the canceled workers that no earlier drain of the run
 // named, in sorted order.
 func (d DrainResult) Unreported() []string {
 	var names []string
 	skip := slices.Clone(d.Reported)
-	for _, name := range d.Cancelled {
+	for _, name := range d.Canceled {
 		if i := slices.Index(skip, name); i >= 0 {
 			skip = slices.Delete(skip, i, i+1)
 			continue
@@ -173,9 +173,9 @@ func newWorkerRun() *workerRun {
 // Open starts a new run when the current one has been drained, so a process
 // that serves more than one call, such as a test binary, gets an open
 // registry for each call. It has no effect on an open registry. A worker left
-// running by the drained run stays in that run, which is already cancelled.
+// running by the drained run stays in that run, which is already canceled.
 // Every Open must be followed by a Drain, because the workers of the new run
-// are waited for or cancelled only by a drain.
+// are waited for or canceled only by a drain.
 func (r *Registry) Open() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -188,8 +188,8 @@ func (r *Registry) Open() {
 // the drain saw every worker return or gave up on the ones still running. It
 // is how a caller that cannot see the end of the call, such as a client
 // factory, releases something the workers share, like a cache store, once the
-// drain has waited for or cancelled them. fn runs once, on the goroutine of
-// the first drain of the run to finish, after the run's context is cancelled
+// drain has waited for or canceled them. fn runs once, on the goroutine of
+// the first drain of the run to finish, after the run's context is canceled
 // and outside the registry's lock. Functions run in the order they were
 // registered, and a panic in one is recovered so the rest still run and the
 // drain still returns. The drain reports that panic, under the name "after
@@ -295,7 +295,7 @@ func (r *Registry) work(run *workerRun, id uint64, name string, fn func(ctx cont
 // The first drain closes the run, and Go refuses workers from then on. Once
 // any drain of the run gives up, every drain of the run returns, so a longer
 // drain never outlasts a shorter one that overlaps it, and a drain after the
-// run was cancelled waits for nothing. Two drains of one run therefore never
+// run was canceled waits for nothing. Two drains of one run therefore never
 // add up to more than one bound. A drain never changes anything about the
 // call's result, and the caller decides how to log what it reports.
 func (r *Registry) Drain(ctx context.Context, wait time.Duration) DrainResult {
@@ -326,9 +326,9 @@ func (r *Registry) Drain(ctx context.Context, wait time.Duration) DrainResult {
 	}
 	result := DrainResult{Started: run.started, Waited: time.Since(start), Panics: run.panics}
 	run.panics = nil
-	result.CancelledLevel = Level(config.DiscoveryModeAuto)
+	result.CanceledLevel = Level(config.DiscoveryModeAuto)
 	for id, w := range run.workers {
-		result.Cancelled = append(result.Cancelled, w.name)
+		result.Canceled = append(result.Canceled, w.name)
 		if run.reported[id] {
 			result.Reported = append(result.Reported, w.name)
 			continue
@@ -337,9 +337,9 @@ func (r *Registry) Drain(ctx context.Context, wait time.Duration) DrainResult {
 			run.reported = make(map[uint64]bool)
 		}
 		run.reported[id] = true
-		result.CancelledLevel = max(result.CancelledLevel, Level(w.mode))
+		result.CanceledLevel = max(result.CanceledLevel, Level(w.mode))
 	}
-	slices.Sort(result.Cancelled)
+	slices.Sort(result.Canceled)
 	slices.Sort(result.Reported)
 	release := run.afterDrain
 	run.afterDrain = nil

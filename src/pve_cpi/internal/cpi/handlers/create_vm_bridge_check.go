@@ -241,7 +241,7 @@ func (p *createVMParsedArgs) sharedBridgeChecker(ctx context.Context, c pve.Clie
 // reaches afterwards, and some of those nodes were never listed. Such an entry
 // is flagged, and checkFresh lists the node once more under a fresh budget and
 // caches the new result unflagged. Any other cached error, such as an API
-// failure or a cancelled request, is reused as it is.
+// failure or a canceled request, is reused as it is.
 type nodeBridgeChecker struct {
 	ctx      context.Context
 	client   pve.Client

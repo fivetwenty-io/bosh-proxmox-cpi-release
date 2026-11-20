@@ -585,7 +585,7 @@ func createSubnetIdempotent(
 // applyWithRollback calls applySDN and, on failure, invokes rollbackFn then
 // returns the original apply error. rollbackFn must use a detached context
 // (detachedContext, bounded by rollbackCleanupTimeout) so cleanup completes even when the caller's context
-// is cancelled; the caller is responsible for constructing that context and
+// is canceled; the caller is responsible for constructing that context and
 // closing over it inside rollbackFn.
 func applyWithRollback(
 	ctx context.Context,
@@ -604,7 +604,7 @@ func applyWithRollback(
 // createNetworkSDN implements the SDN vnet creation flow.
 //
 // Rollback discipline: every best-effort cleanup call uses a context derived
-// via detachedContext so a caller-cancelled request still releases the
+// via detachedContext so a caller-canceled request still releases the
 // staged PVE state. Original-call errors are wrapped through pve.WrapError so
 // transient classes (5xx, ConnectionError, TimeoutError, storage lock) keep
 // their Retriable type all the way back to the BOSH director.
@@ -718,7 +718,7 @@ func createNetworkSDN(
 	// Phase 4: apply SDN config to data plane. On failure roll back only what
 	// THIS call created (subnetCreated / vnetCreated / createdZone guard against
 	// touching pre-existing state). Rollback runs on a detached context so it
-	// completes even when the caller cancelled the request.
+	// completes even when the caller canceled the request.
 	rollbackCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
 	defer rbCancel()
 	applyErr := applyWithRollback(ctx, deps, clusterSvc, sdnApplyArgs{opCtx: "create_network"},

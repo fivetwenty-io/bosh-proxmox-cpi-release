@@ -18,14 +18,14 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 )
 
-// TestCreateVMRollbackStopsWhenAnUnboundedRequestIsCancelled runs the
+// TestCreateVMRollbackStopsWhenAnUnboundedRequestIsCanceled runs the
 // lock-timeout rollback with operation_timeout off, so the request has no
 // deadline. A stop signal cancels the request after the disk's lock wait gives
 // up and before the rollback begins. Without a deadline the rollback runs on
 // the request's own context, the way it always has, so the signal stops it
 // instead of the rollback running on for a whole delete_sec after the process
 // was told to stop.
-func TestCreateVMRollbackStopsWhenAnUnboundedRequestIsCancelled(t *testing.T) {
+func TestCreateVMRollbackStopsWhenAnUnboundedRequestIsCanceled(t *testing.T) {
 	t.Parallel()
 	flow := newRollbackFlow(t)
 	req, stop := context.WithCancel(flow.ctx)
@@ -43,10 +43,10 @@ func TestCreateVMRollbackStopsWhenAnUnboundedRequestIsCancelled(t *testing.T) {
 	flow.vms.onDisposal = flow.locks.reset
 
 	if _, err := createVM(req, deps, flow.args); err == nil {
-		t.Fatal("create_vm succeeded although its request was cancelled")
+		t.Fatal("create_vm succeeded although its request was canceled")
 	}
 	if req.Err() == nil {
-		t.Fatal("the disk never read its VM back after the lock wait, so the request was never cancelled")
+		t.Fatal("the disk never read its VM back after the lock wait, so the request was never canceled")
 	}
 	if len(flow.vms.destroyed) != 0 {
 		t.Fatalf("the rollback ran on after the stop signal and destroyed %v", flow.vms.destroyed)

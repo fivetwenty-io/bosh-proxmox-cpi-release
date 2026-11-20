@@ -237,9 +237,9 @@ func TestMarkSinkWriteHandsTheStoreTheMarkAndThePool(t *testing.T) {
 	}
 }
 
-// A write whose context a drain cancelled never reaches the store, and the
+// A write whose context a drain canceled never reaches the store, and the
 // cancellation is not reported as a failure of the mark.
-func TestMarkSinkWriteWithACancelledContextSkipsTheStoreAndSaysNothing(t *testing.T) {
+func TestMarkSinkWriteWithACanceledContextSkipsTheStoreAndSaysNothing(t *testing.T) {
 	logger, obs := log.NewObservedLogger(log.LevelDebug)
 	store := &fakeUpdater{}
 	sink := &cacheMarkSink{store: store, mode: config.DiscoveryModeOn, logger: logger, now: time.Now}
@@ -247,10 +247,10 @@ func TestMarkSinkWriteWithACancelledContextSkipsTheStoreAndSaysNothing(t *testin
 	cancel()
 	sink.write(ctx, endpointpool.Mark{Endpoint: "pve1.dc1.example.com:8006", At: time.Now()}, endpointcache.MarkDial)
 	if store.count() != 0 {
-		t.Errorf("the store saw %d updates from a cancelled write, want none", store.count())
+		t.Errorf("the store saw %d updates from a canceled write, want none", store.count())
 	}
 	if len(obs.All()) != 0 {
-		t.Errorf("a cancelled write logged %v", obs.All())
+		t.Errorf("a canceled write logged %v", obs.All())
 	}
 }
 
@@ -284,10 +284,10 @@ func TestMarkSinkWriteSaysNothingWhenTheDrainCancelsItMidWrite(t *testing.T) {
 			sink := &cacheMarkSink{store: store, mode: mode, logger: logger, now: time.Now}
 			sink.write(ctx, endpointpool.Mark{Endpoint: "pve1:8006", At: time.Now()}, endpointcache.MarkDial)
 			if got := store.count(); got != 1 {
-				t.Fatalf("the store saw %d writes, want the one that was cancelled", got)
+				t.Fatalf("the store saw %d writes, want the one that was canceled", got)
 			}
 			if got := obs.All(); len(got) != 0 {
-				t.Errorf("a write the drain cancelled logged %v, want nothing", got)
+				t.Errorf("a write the drain canceled logged %v, want nothing", got)
 			}
 		})
 	}

@@ -2570,7 +2570,7 @@ func ProtectionWriteRefused(err error) bool {
 // the body broke off after the backend had answered, so the backend may
 // already have forked a task. 595 stays an answer, because pveproxy sends it
 // when it could not connect, before anything reached the backend. It is false
-// for a transport fault, a timeout, and a cancelled or expired context, where
+// for a transport fault, a timeout, and a canceled or expired context, where
 // the request may have been applied.
 func pveAnswered(err error) (int, bool) {
 	if err == nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -2624,7 +2624,7 @@ func (e *ProtectionRestoreCutOffError) Unwrap() error { return e.err }
 // migration, on that window's own live context.
 //
 // The write runs on context.WithoutCancel(ctx), so a request that was
-// cancelled, or a window whose deadline stopped the work, still puts the flag
+// canceled, or a window whose deadline stopped the work, still puts the flag
 // back. Without a deadline of its own, though, a PVE that never answers would
 // hold the restore open past the lock's TTL, so it gets
 // parkerRestoreTimeout. It returns the write's error and whether that
@@ -2738,7 +2738,7 @@ func restoreParkerProtectionLogged(ctx context.Context, c Client, logger *log.Lo
 // disk transfer to vm 700 slot scsi1 completed", so an operator reading a
 // cut-off restore knows whether the disk moved.
 //
-// The write goes through putParkerProtectionBack, so a cancelled request still
+// The write goes through putParkerProtectionBack, so a canceled request still
 // sends it, and parkerRestoreTimeout bounds it.
 //
 // Five outcomes:

@@ -691,7 +691,7 @@ func TestLockWait(t *testing.T) {
 	done, stop := context.WithCancel(context.Background())
 	stop()
 	if _, err := p.WaitLock(done, root, "a.lock"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("WaitLock with a cancelled context = %v", err)
+		t.Fatalf("WaitLock with a canceled context = %v", err)
 	}
 
 	go func() {

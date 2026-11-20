@@ -552,7 +552,7 @@ func deleteLegacyVMClaimed(ctx context.Context, deps Deps, vmCID string, cid vmc
 	if deps.Config != nil {
 		inflightRelease, inflightErr := deps.Inflight.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
 		if inflightErr != nil {
-			return nil, cpierrors.Retriable("delete_vm: in-flight limit exceeded or context cancelled on node %s: %s", node, inflightErr.Error())
+			return nil, cpierrors.Retriable("delete_vm: in-flight limit exceeded or context canceled on node %s: %s", node, inflightErr.Error())
 		}
 		defer inflightRelease()
 	}
@@ -1007,7 +1007,7 @@ func waitForVMStopped(ctx context.Context, deps Deps, node string, vmid int, vmC
 		logger.Debug("delete_vm: waiting for VM to stop", log.String("state", state))
 		select {
 		case <-ctx.Done():
-			return cpierrors.Retriable("delete_vm: context cancelled while waiting for VM %s to stop", vmCID)
+			return cpierrors.Retriable("delete_vm: context canceled while waiting for VM %s to stop", vmCID)
 		case <-time.After(deleteStopPollInterval()):
 		}
 	}

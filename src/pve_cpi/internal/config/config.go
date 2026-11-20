@@ -1207,14 +1207,14 @@ type CPIConfig struct {
 
 	// PVEDialTimeoutSec bounds the TCP dial step of every PVE API HTTP request.
 	// 0 (default) leaves the transport at the SDK default (no explicit dial
-	// timeout). When > 0, the TCP dial is cancelled if it has not completed within
+	// timeout). When > 0, the TCP dial is canceled if it has not completed within
 	// this many seconds. Valid range: >= 0; negative values are rejected.
 	// validate-only-when-set; omit from ERB when zero.
 	PVEDialTimeoutSec int `json:"pve_api_dial_timeout_sec,omitempty"`
 
 	// PVETLSHandshakeTimeoutSec bounds the TLS handshake step of every PVE API
 	// HTTPS request. 0 (default) leaves the transport at the SDK default (no
-	// explicit handshake timeout). When > 0, the handshake is cancelled if it
+	// explicit handshake timeout). When > 0, the handshake is canceled if it
 	// has not completed within this many seconds. Useful on high-latency paths.
 	// validate-only-when-set; omit from ERB when zero.
 	PVETLSHandshakeTimeoutSec int `json:"pve_api_tls_handshake_timeout_sec,omitempty"`

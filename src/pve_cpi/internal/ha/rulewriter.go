@@ -286,7 +286,7 @@ func (w *RuleWriter) logger() *log.Logger {
 // nothing yet (see Backoff). A wait that would run past the request's deadline
 // is not started, because the attempt after it could not finish, and the error
 // is retriable so the Director drives the call again. A wait that ends early,
-// because the request was cancelled or the lock could not be taken again,
+// because the request was canceled or the lock could not be taken again,
 // returns a retriable error too.
 func (w *RuleWriter) wait(ctx context.Context, label string, d time.Duration, idle bool) error {
 	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= d {
