@@ -728,6 +728,10 @@ type aaTopology struct {
 	placeable func(nodes []string) int
 	// clusterPlaceable is the cluster's placeable node count.
 	clusterPlaceable int
+	// placeableKnown says the counts were read from a profile that lists the
+	// cluster's nodes or carries a health report, so a count of 0 means that
+	// no node can take a VM rather than that nobody looked.
+	placeableKnown bool
 }
 
 // aaAZ is one AZ of placement.az_map.
@@ -743,6 +747,7 @@ func newAATopology(cfg *config.CPIConfig, profile *ha.Profile) aaTopology {
 		configured:       profileNodeNames(profile),
 		clusterPlaceable: placeableNodeCount(profile),
 		placeable:        func(nodes []string) int { return placeableAmong(profile, nodes) },
+		placeableKnown:   profile != nil && (profile.Health != nil || len(profile.Nodes) > 0),
 	}
 	if cfg != nil && cfg.Placement != nil {
 		for _, name := range slices.Sorted(maps.Keys(cfg.Placement.AZMap)) {
@@ -816,7 +821,9 @@ func (t aaTopology) domains(keys map[string]bool) map[string]aapattern.Domain {
 	out := make(map[string]aapattern.Domain, len(keys))
 	for dk := range keys {
 		if dk == "" {
-			out[dk] = aapattern.Domain{Key: dk, Nodes: len(t.configured), Placeable: t.clusterPlaceable}
+			out[dk] = aapattern.Domain{
+				Key: dk, Nodes: len(t.configured), Placeable: t.clusterPlaceable, PlaceableKnown: t.placeableKnown,
+			}
 			continue
 		}
 		i := slices.IndexFunc(t.azs, func(az aaAZ) bool { return az.name == dk })
@@ -830,7 +837,9 @@ func (t aaTopology) domains(keys map[string]bool) map[string]aapattern.Domain {
 			})
 		}
 		sort.Strings(nodes)
-		out[dk] = aapattern.Domain{Key: dk, Ord: i + 1, Nodes: len(nodes), Placeable: t.placeable(nodes)}
+		out[dk] = aapattern.Domain{
+			Key: dk, Ord: i + 1, Nodes: len(nodes), Placeable: t.placeable(nodes), PlaceableKnown: t.placeableKnown,
+		}
 	}
 	return out
 }

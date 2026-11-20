@@ -332,6 +332,30 @@ func TestLayout_PlaceableLimitsJoins(t *testing.T) {
 	}
 }
 
+// TestLayout_NoPlaceableNodeHoldsEveryRule pins that a domain whose health
+// read found no node that can take a VM, such as an AZ whose nodes are all in
+// maintenance, lets no member join a rule there. A member keeps the place it
+// has. With the count unknown, the rules fill to the cap as before.
+func TestLayout_NoPlaceableNodeHoldsEveryRule(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		dom  Domain
+		want string
+	}{
+		"none placeable": {Domain{Nodes: 5, Placeable: 0, PlaceableKnown: true}, "={0,1}"},
+		"unknown":        {Domain{Nodes: 5}, "={0,1,2,3}"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			out := Layout(Input{Base: base, Split: true, Domains: map[string]Domain{"": tc.dom},
+				Members: members("", seq(4)...), Rules: map[string][]string{base: {key(0), key(1)}}})
+			if got := render(out.Rules); got != tc.want {
+				t.Fatalf("rules = %s; want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLayout_DomainsGetTheirOwnRules(t *testing.T) {
 	t.Parallel()
 	ms := append(members("az1", 0, 2, 4), members("az2", 1, 3, 5)...)

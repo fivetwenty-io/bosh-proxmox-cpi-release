@@ -40,10 +40,14 @@ type Domain struct {
 	// Nodes is the domain's configured node count, N, or 0 when it is
 	// unknown, which turns off the cap and the drain-safety check.
 	Nodes int
-	// Placeable is how many of the domain's nodes can take a VM now, or 0
-	// when that is unknown. A member joins a rule only while the rule holds
-	// fewer members than this.
+	// Placeable is how many of the domain's nodes can take a VM now. A member
+	// joins a rule only while the rule holds fewer members than this. It is
+	// read only when PlaceableKnown is set or it is above 0, so a zero value
+	// alone means the count is unknown.
 	Placeable int
+	// PlaceableKnown says Placeable was read, so a count of 0 means that no
+	// node of the domain can take a VM now, and no member joins a rule there.
+	PlaceableKnown bool
 }
 
 // Input is what the layout plans from.
@@ -383,8 +387,8 @@ func blockCap(t Term, dom Domain, unsafe bool) int {
 
 // joinRoom returns how many members a rule of cap members may grow to now.
 func joinRoom(capacity int, dom Domain) int {
-	if dom.Placeable > 0 {
-		return min(capacity, dom.Placeable)
+	if dom.PlaceableKnown || dom.Placeable > 0 {
+		return min(capacity, max(dom.Placeable, 0))
 	}
 	return capacity
 }
