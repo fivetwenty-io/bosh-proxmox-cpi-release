@@ -299,7 +299,7 @@ func retireEmptiedParkerNow(ctx context.Context, deps Deps, node string, vmid in
 		return
 	}
 	if r.action(vmid, snap) != parkerHARetire {
-		logger.Debug("parker HA: the parker the call emptied is not one PVE HA manages for this Director, or it " +
+		logger.Info("parker HA: the parker the call emptied is not one PVE HA manages for this Director, or it " +
 			"holds something still, so it stays")
 		return
 	}
