@@ -160,6 +160,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Fixed
 
+- `pve-ops ha` no longer reports a VM on a node in maintenance as `maintenance_stranded` because another member of its anti-affinity group holds every other node, when that member sits in another rule or in no rule at all. The doctor now counts only the partners that the VM's own enabled negative resource-affinity rules name, adds up the partners of every such rule, and skips a partner that the HA manager reports stopped, disabled, or ignored, which is how PVE decides where the VM can go. A strict pin and the partners now narrow the nodes together, so a VM whose pin allows only nodes that hold partners is reported with the partner reason. The `recovery_stranded` reason follows the same rule.
+
 - `pve-ops ha --cpi-config` now judges each anti-affinity group with the one entry whose placement it belongs to. That's the entry with rules on, a member in its VMID band, and a `placement.az_map` that holds the strict pins of the most members. Before, an entry without the AZ in its map planned a group from a two-node AZ over the cluster's three nodes and reported the full rule it would create as `aa_layout_drift`, while the entry that placed the group, which was not the band's first entry, never judged it.
 
 - `pve-ops ha --fix-anti-affinity` now reports a group as `not_planned`, and writes nothing, when its plan would put members in a rule of the whole cluster's domain that their strict pins leave no free node for. No AZ of the entry's `placement.az_map` holds those pins, which means another entry placed the group. Before, a run against such an entry would flatten the members' pins and create a rule that the entry which placed the group leaves out on purpose.

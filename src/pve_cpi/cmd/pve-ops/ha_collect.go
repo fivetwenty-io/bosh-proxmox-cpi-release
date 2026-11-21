@@ -1302,26 +1302,41 @@ func (c *haCollector) maintenanceStrandedFindings() {
 }
 
 // cannotLeaveReason says why a service on a node in maintenance has no node to
-// move to, or returns nothing when the doctor sees no such reason.
+// move to, or returns nothing when the doctor sees no such reason. It starts
+// from the other nodes that can take work and narrows them the way PVE does: a
+// strict pin keeps only its nodes, and then each node that holds an active
+// partner from the VM's own negative resource-affinity rules drops out. The
+// first step that leaves no node gives the reason.
 func (c *haCollector) cannotLeaveReason(g *haGuest) string {
+	takers := c.takerNodes(g.ref.Node)
 	if pin := c.pinOf(g.ref.VMID); c.rulesOK && pin != nil && !pin.Disabled && pin.Strict {
-		movable := false
-		for name := range pin.Nodes {
-			if name == g.ref.Node {
-				continue
-			}
-			if h, ok := healthEntry(c.p, name); !ok || h.Placeable {
-				movable = true
-			}
-		}
-		if !movable {
+		takers = slices.DeleteFunc(takers, func(n string) bool { return !hasNode(pin.Nodes, n) })
+		if len(takers) == 0 {
 			return ", and its strict node-affinity pin names no other node it can move to"
 		}
 	}
-	if c.groupBlocksEveryNode(g) {
-		return ", and every other node that can take it holds a member of its anti-affinity group"
+	if c.partnersHoldEvery(g, takers) {
+		return ", and every other node that can take it holds a partner from its anti-affinity rules"
 	}
 	return ""
+}
+
+// takerNodes returns the online nodes other than from that can take work: out
+// of maintenance and placeable. A node the health report doesn't list counts,
+// because the doctor can't show that it refuses work.
+func (c *haCollector) takerNodes(from string) []string {
+	var out []string
+	for i := range c.p.Nodes {
+		n := &c.p.Nodes[i]
+		if !n.Online || n.Name == from {
+			continue
+		}
+		if h, ok := healthEntry(c.p, n.Name); ok && (h.Maintenance || !h.Placeable) {
+			continue
+		}
+		out = append(out, n.Name)
+	}
+	return out
 }
 
 // recoveryStrandedFindings reports each HA VM the HA manager holds in the
@@ -1356,8 +1371,8 @@ func (c *haCollector) recoveryStrandedFindings() {
 		switch {
 		case c.rulesOK && pin != nil && len(pin.Nodes) == 1 && hasNode(pin.Nodes, g.ref.Node):
 			why = fmt.Sprintf(", because its strict pin names only %s", g.ref.Node)
-		case c.groupBlocksEveryNode(g):
-			why = ", because every other node holds a member of its anti-affinity group"
+		case c.partnersHoldEvery(g, c.recoveryNodes(g.ref.Node)):
+			why = ", because every other node holds a partner from its anti-affinity rules"
 		}
 		c.rep.problem(haKindRecoveryStranded, g.sid,
 			"%s was on %s and waits in recovery with no node it may run on%s", g.sid, g.ref.Node, why)
@@ -1392,47 +1407,76 @@ func (c *haCollector) recoveryGuest(sid string) *haGuest {
 	return g
 }
 
-// groupBlocksEveryNode reports whether g sits in an anti-affinity rule and
-// every online node other than the one it was on holds another member of that
-// group, so the rule leaves the VM no node to move to.
-func (c *haCollector) groupBlocksEveryNode(g *haGuest) bool {
-	if !c.rulesOK || !c.clusterOK {
-		return false
-	}
-	for t := range g.tags {
-		if !haGroupTagPattern.MatchString(t) || !namedByAny(c.groupRules(t), g.sid) {
+// recoveryNodes returns the online nodes other than from that are not in
+// maintenance, which are the nodes PVE may recover a service onto.
+func (c *haCollector) recoveryNodes(from string) []string {
+	var out []string
+	for i := range c.p.Nodes {
+		n := &c.p.Nodes[i]
+		if !n.Online || n.Name == from {
 			continue
 		}
-		held := map[string]bool{}
-		for _, ref := range c.clusterVMs {
-			if ref.VMID == g.ref.VMID {
-				continue
-			}
-			for _, rt := range ref.SplitTags() {
-				if strings.EqualFold(strings.TrimSpace(rt), t) {
-					held[ref.Node] = true
-				}
-			}
+		if h, ok := healthEntry(c.p, n.Name); ok && h.Maintenance {
+			continue
 		}
-		others := 0
-		for i := range c.p.Nodes {
-			n := &c.p.Nodes[i]
-			if !n.Online || n.Name == g.ref.Node {
-				continue
-			}
-			if h, ok := healthEntry(c.p, n.Name); ok && h.Maintenance {
-				continue
-			}
-			others++
-			if !held[n.Name] {
-				return false
-			}
+		out = append(out, n.Name)
+	}
+	return out
+}
+
+// partnersHoldEvery reports whether every node in nodes holds an active
+// partner of g, and nodes is not empty. A partner is another resource of an
+// enabled negative resource-affinity rule that names g and that PVE applies,
+// so a rule with feasibility errors doesn't count. Only the rules that name g
+// count, not every member of g's group, because a group that splits into
+// several rules, or leaves a member out of every rule, keeps g apart only from
+// the members its own rules name. Partners from every such rule add up, the
+// operator's rules included, because PVE applies them all. A partner the HA
+// manager reports stopped, disabled, or ignored holds no node, because PVE
+// counts only active services.
+func (c *haCollector) partnersHoldEvery(g *haGuest, nodes []string) bool {
+	if !c.rulesOK || !c.clusterOK || len(nodes) == 0 {
+		return false
+	}
+	held := map[string]bool{}
+	for i := range c.rules {
+		r := &c.rules[i]
+		if r.Type != ha.RuleTypeResourceAffinity || r.Affinity != ha.AffinityNegative || r.Disabled ||
+			len(r.Errors) > 0 || !r.HasResource(g.sid) {
+			continue
 		}
-		if others > 0 {
-			return true
+		for _, partner := range r.Resources {
+			if node, ok := c.activePartnerNode(partner, g.sid); ok {
+				held[node] = true
+			}
 		}
 	}
-	return false
+	for _, n := range nodes {
+		if !held[n] {
+			return false
+		}
+	}
+	return true
+}
+
+// activePartnerNode returns the node of the partner sid when it is a VM other
+// than self that the HA manager counts as active.
+func (c *haCollector) activePartnerNode(sid, self string) (string, bool) {
+	if sid == self {
+		return "", false
+	}
+	if c.statesOK {
+		switch strings.ToLower(c.states[sid]) {
+		case "stopped", "disabled", "ignored":
+			return "", false
+		}
+	}
+	vmid, err := strconv.Atoi(strings.TrimPrefix(sid, "vm:"))
+	if err != nil || !strings.HasPrefix(sid, "vm:") {
+		return "", false
+	}
+	ref, ok := c.clusterVMs[vmid]
+	return ref.Node, ok && ref.Node != ""
 }
 
 // inFlight reports whether g carries a birth tag younger than the sweep's

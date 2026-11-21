@@ -577,7 +577,7 @@ func TestCollectRecoveryStrandedAntiAffinityReason(t *testing.T) {
 		Resources: []string{"vm:100", "vm:101", "vm:102"},
 	}}
 	want(t, runCollect(t, f, haCfg("auto", "none")), haKindRecoveryStranded, haSeverityProblem,
-		"every other node holds a member of its anti-affinity group")
+		"every other node holds a partner from its anti-affinity rules")
 	// With n3 free of a member the reason is left out.
 	f.clusterVMs = f.clusterVMs[:2]
 	got := findings(runCollect(t, f, haCfg("auto", "none")), haKindRecoveryStranded)
@@ -664,7 +664,7 @@ func TestCollectNamesEveryServiceThatCannotLeaveAMaintenanceNode(t *testing.T) {
 	// The hold VM is named once, as hold_blocks_maintenance, and the group
 	// member is named once, as maintenance_stranded, with its reason.
 	want(t, r, haKindHoldMaintenance, haSeverityProblem, "vm:40")
-	want(t, r, haKindMaintenanceStranded, haSeverityProblem, "vm:217", "n2", "anti-affinity group")
+	want(t, r, haKindMaintenanceStranded, haSeverityProblem, "vm:217", "n2", "partner from its anti-affinity rules")
 
 	// A strict pin that names no other node is named as the reason.
 	f := drainFake("started")
@@ -681,6 +681,56 @@ func TestCollectNamesEveryServiceThatCannotLeaveAMaintenanceNode(t *testing.T) {
 	if len(got) != 1 || strings.Contains(got[0].Detail, "anti-affinity") {
 		t.Errorf("want one finding without the anti-affinity reason, got %+v", got)
 	}
+}
+
+// TestCollectStrandedCountsOnlyThePartnersOfTheVMsOwnRules is the lab case. A
+// group of three on three nodes splits into the rule {117, 217} and the lone
+// member 317, which sits in no rule. With n2 in maintenance, 317 on n3 holds
+// the group's tag but no rule keeps 217 off n3, so PVE moves 217 there, and the
+// doctor must not call it stranded.
+func TestCollectStrandedCountsOnlyThePartnersOfTheVMsOwnRules(t *testing.T) {
+	t.Parallel()
+	split := func() *fakeHA {
+		f := drainFake("started")
+		f.rules[0].Resources = []string{"vm:117", "vm:217"}
+		return f
+	}
+	r := runCollect(t, split(), haCfg("auto", "hold"))
+	want(t, r, haKindMaintenanceStranded, haSeverityAdvice, "vm:217", "n2", "PVE is expected to move it")
+	for _, f := range findings(r, haKindMaintenanceStranded) {
+		if f.Subject == "vm:217" && strings.Contains(f.Detail, "anti-affinity") {
+			t.Errorf("a member outside the VM's rules was counted as a partner: %+v", f)
+		}
+	}
+
+	// A partner the HA manager reports stopped holds no node, as in PVE.
+	f := drainFake("started")
+	f.states = map[string]string{"vm:117": "started", "vm:217": "started", "vm:317": "stopped", "vm:40": "started"}
+	want(t, runCollect(t, f, haCfg("auto", "hold")), haKindMaintenanceStranded, haSeverityAdvice, "vm:217",
+		"PVE is expected to move it")
+
+	// A disabled rule keeps nothing apart.
+	f = drainFake("started")
+	f.rules[0].Disabled = true
+	want(t, runCollect(t, f, haCfg("auto", "hold")), haKindMaintenanceStranded, haSeverityAdvice, "vm:217",
+		"PVE is expected to move it")
+
+	// A strict pin and a partner together leave no node. The pin keeps n1 and
+	// n2, and the partner 117 holds n1, while n3 is free of any partner.
+	f = split()
+	f.rules = append(f.rules, pinRule(217, haMarker, "n1", "n2"))
+	want(t, runCollect(t, f, haCfg("auto", "hold")), haKindMaintenanceStranded, haSeverityProblem, "vm:217",
+		"every other node that can take it holds a partner from its anti-affinity rules")
+
+	// Partners from every rule that names the VM add up, foreign rules
+	// included, because PVE applies them all.
+	f = split()
+	f.rules = append(f.rules, ha.Rule{
+		ID: "operator-apart", Type: ha.RuleTypeResourceAffinity, Affinity: "negative",
+		Resources: []string{"vm:217", "vm:317"},
+	})
+	want(t, runCollect(t, f, haCfg("auto", "hold")), haKindMaintenanceStranded, haSeverityProblem, "vm:217",
+		"every other node that can take it holds a partner from its anti-affinity rules")
 }
 
 func replicaFake() *fakeHA {
@@ -2607,7 +2657,7 @@ func TestCollectReadsTheDrainFromTheServicesOnTheNode(t *testing.T) {
 			build:     func() *fakeHA { f := drainFake("stopped"); return f },
 			wantKinds: map[string]string{haKindMaintenanceStranded: "vm:217"},
 			wantDog:   "armed",
-			wantText:  "anti-affinity group",
+			wantText:  "partner from its anti-affinity rules",
 		},
 		{
 			name: "a VM that is still moving is reported while it runs on the node",
