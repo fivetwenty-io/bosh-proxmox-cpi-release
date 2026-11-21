@@ -2394,6 +2394,42 @@ func TestEntryScopesGroupEntriesByClusterAndBand(t *testing.T) {
 	}
 }
 
+// TestEntryScopesGroupEntriesByClusterIdentity pins that two entries whose
+// pve_host values differ count as one cluster when their readers give one
+// cluster identity, and as two when no identity is known, so an entry that
+// reaches the cluster through another node still sees its sibling.
+func TestEntryScopesGroupEntriesByClusterIdentity(t *testing.T) {
+	t.Parallel()
+	base := haCfg("auto", "none")
+	entry := func(name, host string) cpiConfigEntry {
+		return cpiConfigEntry{Name: name, Type: "pve", Properties: map[string]any{"pve_host": host,
+			"pve_api_token": "cpi@pve!" + name + "=11111111-2222-3333-4444-555555555555"}}
+	}
+	entries := []cpiConfigEntry{entry("via-n1", "n1.example.test"), entry("via-n2", "n2.example.test"),
+		entry("other", "o1.example.test")}
+	if _, _, _, err := config.ApplyContextOverrides(base, entries[0].Properties); err != nil {
+		t.Fatalf("entry properties: %v", err)
+	}
+	apart := entryScopes(entries, base, nil)
+	for i, sc := range apart {
+		if sc == nil || len(sc.Cluster) != 1 || len(sc.Peers) != 0 {
+			t.Fatalf("scope %d without identities = %+v; want the entry alone", i, sc)
+		}
+	}
+	got := entryScopesOn(entries, base, nil, []string{"pve-root-ca:0a1b2c3d", "pve-root-ca:0a1b2c3d",
+		"pve-root-ca:99999999"})
+	if len(got[0].Cluster) != 2 || len(got[1].Cluster) != 2 || len(got[2].Cluster) != 1 {
+		t.Fatalf("clusters = %d %d %d; want 2 2 1", len(got[0].Cluster), len(got[1].Cluster), len(got[2].Cluster))
+	}
+	if len(got[0].Peers) != 1 || got[0].Peers[0] != "via-n2" || !got[0].Leader || got[1].Leader {
+		t.Errorf("scopes = %+v and %+v; want via-n2 as via-n1's peer, with via-n1 leading", got[0], got[1])
+	}
+	partly := entryScopesOn(entries, base, nil, []string{"pve-root-ca:0a1b2c3d", "", ""})
+	if len(partly[0].Cluster) != 1 || len(partly[1].Cluster) != 1 {
+		t.Errorf("an entry with no identity joined another host's cluster: %+v", partly[1])
+	}
+}
+
 func TestCollectAntiAffinityAcrossEntriesThatShareABand(t *testing.T) {
 	t.Parallel()
 	tagged := "bosh-aa-0123456789ab"

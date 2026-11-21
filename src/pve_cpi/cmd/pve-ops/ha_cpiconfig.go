@@ -220,12 +220,14 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 			unowned = append(unowned, entries[i].Name)
 		}
 	}
-	scopes := entryScopes(entries, base, owners)
+	readers, identities := openEntryReaders(ctx, entries, base, logger, deps)
+	scopes := entryScopesOn(entries, base, owners, identities)
 	// One ledger serves every entry, so a node one entry found unreachable is
 	// not asked again by the next entry that reaches the same cluster.
 	ledger := newHANodeLedger()
 	for i := range entries {
-		report, layout := checkCPIConfigEntry(ctx, &entries[i], base, logger, deps, scopes[i], ledger, owners[i])
+		report, layout := checkCPIConfigEntry(ctx, &entries[i], base, logger, deps, scopes[i], ledger, owners[i],
+			readers[i])
 		if report.Effective == "unknown" {
 			markUnread(scopes, i)
 		}
@@ -335,12 +337,48 @@ func joinNames(names []string) string {
 	return strings.Join(names[:len(names)-1], ", ") + ", and " + names[len(names)-1]
 }
 
+// entryReader is the reader a run opened for one entry, or the error that
+// kept it from opening one.
+type entryReader struct {
+	reader HAReader
+	err    error
+}
+
+// openEntryReaders opens a reader for each entry whose properties apply and
+// asks it for the identity of its cluster, which is the stamp of the
+// cluster's pve-root-ca when the cluster answers. The identities let the run
+// count two entries that reach one cluster through different hosts as
+// siblings. An entry whose properties do not apply gets no reader, and its
+// own check reports why.
+func openEntryReaders(ctx context.Context, entries []cpiConfigEntry, base *config.CPIConfig, logger *log.Logger,
+	deps haDeps,
+) ([]*entryReader, []string) {
+	readers := make([]*entryReader, len(entries))
+	identities := make([]string, len(entries))
+	for i := range entries {
+		eff, _, _, err := config.ApplyContextOverrides(base, entries[i].Properties)
+		if err != nil {
+			continue
+		}
+		reader, err := deps.openReader(eff, logger)
+		readers[i] = &entryReader{reader: reader, err: err}
+		if err != nil {
+			continue
+		}
+		if identifier, ok := reader.(haClusterIdentifier); ok {
+			identities[i] = identifier.ClusterIdentity(ctx, "")
+		}
+	}
+	return readers, identities
+}
+
 // checkCPIConfigEntry reports one cpis entry and gathers the layout the
 // cross-cluster check compares. Any step that cannot finish leaves the layout
 // unchecked with the reason, and the report carries the same reason as a
-// finding. ledger is the run's record of nodes that cannot answer.
+// finding. ledger is the run's record of nodes that cannot answer. opened is
+// the reader the run already opened for the entry, or nil to open one.
 func checkCPIConfigEntry(ctx context.Context, entry *cpiConfigEntry, base *config.CPIConfig, logger *log.Logger,
-	deps haDeps, scope *haEntryScope, ledger *haNodeLedger, owner string,
+	deps haDeps, scope *haEntryScope, ledger *haNodeLedger, owner string, opened *entryReader,
 ) (*haReport, pve.ClusterVMIDLayout) {
 	layout := pve.ClusterVMIDLayout{Name: entry.Name}
 	fail := func(mode, reason string) (*haReport, pve.ClusterVMIDLayout) {
@@ -357,9 +395,13 @@ func checkCPIConfigEntry(ctx context.Context, entry *cpiConfigEntry, base *confi
 		return fail(base.HAModeValue(), fmt.Sprintf("the entry's properties do not apply: %s", err))
 	}
 	layout.Bands = pve.VMIDBandsFromConfig(eff)
-	reader, err := deps.openReader(eff, logger)
-	if err != nil {
-		return fail(eff.HAModeValue(), fmt.Sprintf("cannot reach the cluster: %s", err))
+	if opened == nil {
+		reader, err := deps.openReader(eff, logger)
+		opened = &entryReader{reader: reader, err: err}
+	}
+	reader := opened.reader
+	if opened.err != nil {
+		return fail(eff.HAModeValue(), fmt.Sprintf("cannot reach the cluster: %s", opened.err))
 	}
 	storages, err := reader.Storages(ctx)
 	if err != nil {
@@ -512,18 +554,29 @@ func (s *haEntryScope) policyList() string {
 // owners holds the Director UUID the run judges each entry for, in the same
 // order, and may be nil when no entry has one.
 func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig, owners []string) []*haEntryScope {
+	return entryScopesOn(entries, base, owners, nil)
+}
+
+// entryScopesOn is entryScopes with the cluster identity each entry's reader
+// gave, in the same order, or "" where none is known. Two entries reach one
+// cluster when their pve_host values match, or when both identities are
+// known and match, so an entry that reaches the cluster through another node
+// still counts as a sibling.
+func entryScopesOn(
+	entries []cpiConfigEntry, base *config.CPIConfig, owners, identities []string,
+) []*haEntryScope {
 	type facts struct {
-		key     string
-		host    string
-		name    string
-		policy  string
-		aa      bool
-		band    pve.VMIDBand
-		pattern aapattern.Pattern
-		azMap   map[string][]string
-		cfg     *config.CPIConfig
-		owner   string
-		parkers pve.VMIDBand
+		host     string
+		identity string
+		name     string
+		policy   string
+		aa       bool
+		band     pve.VMIDBand
+		pattern  aapattern.Pattern
+		azMap    map[string][]string
+		cfg      *config.CPIConfig
+		owner    string
+		parkers  pve.VMIDBand
 	}
 	all := make([]*facts, len(entries))
 	for i := range entries {
@@ -533,11 +586,14 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig, owners []stri
 		}
 		band := pve.VMIDBandsFromConfig(eff).VM
 		all[i] = &facts{
-			key: eff.Host + "|" + band.String(), host: eff.Host, name: entries[i].Name, policy: eff.HALocalPolicyValue(),
+			host: eff.Host, name: entries[i].Name, policy: eff.HALocalPolicyValue(),
 			band: band, aa: antiAffinityWritten(eff), pattern: eff.HAAntiAffinityPatternValue(), cfg: eff,
 		}
 		if i < len(owners) {
 			all[i].owner = owners[i]
+		}
+		if i < len(identities) {
+			all[i].identity = identities[i]
 		}
 		if eff.Placement != nil {
 			all[i].azMap = eff.Placement.AZMap
@@ -547,6 +603,9 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig, owners []stri
 				End: eff.ParkedDiskVMIDRangeEndValue()}
 		}
 	}
+	sameCluster := func(a, b *facts) bool {
+		return a.host == b.host || a.identity != "" && a.identity == b.identity
+	}
 	out := make([]*haEntryScope, len(entries))
 	for i, f := range all {
 		if f == nil {
@@ -554,13 +613,13 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig, owners []stri
 		}
 		sc := &haEntryScope{Name: f.name, Band: f.band, Policy: f.policy, AntiAffinity: f.aa, Leader: true}
 		for j, o := range all {
-			if o != nil && o.host == f.host {
+			if o != nil && sameCluster(o, f) {
 				sc.Cluster = append(sc.Cluster, haClusterEntry{
 					Name: o.name, Band: o.band, AntiAffinity: o.aa, Pattern: o.pattern, AZMap: o.azMap, Owner: o.owner,
 					Parkers: o.parkers, Config: o.cfg, Self: j == i, index: j,
 				})
 			}
-			if o == nil || j == i || o.key != f.key {
+			if o == nil || j == i || !sameCluster(o, f) || o.band != f.band {
 				continue
 			}
 			sc.Peers = append(sc.Peers, o.name)
