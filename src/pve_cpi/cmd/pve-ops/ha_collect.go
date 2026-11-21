@@ -657,7 +657,7 @@ func (c *haCollector) ruleFindings() {
 	for i := range c.rules {
 		r := &c.rules[i]
 		marked := ruleMarked(r)
-		if (!marked && !cpiRuleName(r.ID)) || c.foreign(r.Comment) {
+		if (!marked && !cpiRuleName(r.ID)) || c.foreign(r.Comment) || !c.reportsRule(r) {
 			continue
 		}
 		if !marked {
@@ -751,17 +751,21 @@ func (c *haCollector) antiAffinityFindings() {
 // every member of the group, whatever band holds it, and only that entry's
 // run judges it, because entries that share a cluster can map AZs
 // differently and so plan one group over different nodes. A group with no
-// such entry is judged by the first entry on the cluster, in cpi-config
-// order, whose band holds one of its members, so it too is judged once.
+// such entry, or whose entry's cluster the doctor could not read, is judged by
+// the first entry on the cluster, in cpi-config order, that the doctor read
+// and whose band holds one of its members, so it too is judged once.
 // owner is the Director the group's marker names, or "".
 func (c *haCollector) judgesGroup(members []*haGuest, owner string) bool {
 	if c.scope == nil {
 		return true
 	}
-	if placer, ok := c.groupPlacer(members, owner); ok {
+	if placer, ok := c.groupPlacer(members, owner); ok && !placer.Unread {
 		return placer.Self
 	}
 	for _, e := range c.clusterEntries() {
+		if e.Unread {
+			continue
+		}
 		for _, g := range members {
 			if e.holds(g) {
 				return e.Self
@@ -1581,11 +1585,11 @@ func (c *haCollector) replicates(vmid int, pin *ha.Rule) bool {
 
 // markedJobs returns the usable replication jobs that carry the CPI's marker,
 // are not being removed, do not belong to another Director, and, under a
-// cpi-config entry, name a VM inside the entry's VM ID band.
+// cpi-config entry, name a VM the entry judges (see judgesVMID).
 func (c *haCollector) markedJobs() []ha.ReplicaJobState {
 	var out []ha.ReplicaJobState
 	for _, j := range c.jobs {
-		if j.Fault == "" && j.RemoveJob == "" && haJobMarker(j.Comment) && !c.foreign(j.Comment) && c.inBand(j.Guest) {
+		if j.Fault == "" && j.RemoveJob == "" && haJobMarker(j.Comment) && !c.foreign(j.Comment) && c.judgesVMID(j.Guest) {
 			out = append(out, j)
 		}
 	}
@@ -1721,7 +1725,7 @@ func (c *haCollector) replicaVMs() []int {
 	}
 	for i := range c.journal.Records {
 		rep := c.journal.Records[i].Replication
-		if rep != nil && rep.Job != nil && !rep.Retired && c.inBand(rep.Job.Guest) {
+		if rep != nil && rep.Job != nil && !rep.Retired && c.judgesVMID(rep.Job.Guest) {
 			vmids[rep.Job.Guest] = true
 		}
 	}
@@ -2138,7 +2142,8 @@ func (c *haCollector) orphanVolumesOn(node, storage string, covered map[string]b
 // left a job it did not recognize as its own. Once the VM is gone the volume
 // carries no ownership marker, and the PVE API does not list its replication
 // snapshots, so the doctor infers that it is this Director's only from the
-// VMID, which must fall inside the configured VM band, and from a name the
+// VMID, which must fall inside the configured VM band, and under --cpi-config
+// in a band this entry judges (see judgesVMID), and from a name the
 // CPI gives a VM's volumes. It also requires that no guest config the doctor
 // read references the volume, that no replication job names the VMID, and
 // that the journal has not recorded the copy already, which recordedCopies
@@ -2176,8 +2181,8 @@ func (c *haCollector) goneVMVolumeCheck(jobGuests map[int]bool) func(volid, node
 		}
 	}
 	return func(volid, node string, vmid int) {
-		if vmid < start || vmid > end || jobGuests[vmid] || referenced[volid] || recorded[volid+"@"+node] ||
-			!haCPIVolumePattern.MatchString(volid) {
+		if vmid < start || vmid > end || !c.judgesVMID(vmid) || jobGuests[vmid] || referenced[volid] ||
+			recorded[volid+"@"+node] || !haCPIVolumePattern.MatchString(volid) {
 			return
 		}
 		c.rep.advise(haKindReplicaGoneVM, volid,
@@ -2355,7 +2360,7 @@ func (c *haCollector) parkerLeftovers() {
 	start, end := c.cfg.ParkedDiskVMIDRangeStartValue(), c.cfg.ParkedDiskVMIDRangeEndValue()
 	gone := func(id string) (int, bool) {
 		vmid, err := strconv.Atoi(id)
-		if err != nil || strconv.Itoa(vmid) != id || vmid < start || vmid > end {
+		if err != nil || strconv.Itoa(vmid) != id || vmid < start || vmid > end || c.parkerReportedEarlier(vmid) {
 			return 0, false
 		}
 		_, listed := c.byVMID[vmid]
@@ -2399,6 +2404,25 @@ func (c *haCollector) parkerLeftovers() {
 	}
 }
 
+// parkerReportedEarlier reports whether an earlier entry on the cluster, one
+// of the same Director that the doctor read and that parks detached disks,
+// holds vmid in its parker band, so that entry reports a leftover of it.
+func (c *haCollector) parkerReportedEarlier(vmid int) bool {
+	if c.scope == nil {
+		return false
+	}
+	for i := range c.scope.Cluster {
+		e := &c.scope.Cluster[i]
+		if e.Self {
+			return false
+		}
+		if c.sharesDirector(e) && e.Parkers.Contains(vmid) {
+			return true
+		}
+	}
+	return false
+}
+
 // namesOnly reports whether every resource rule names is sid.
 func namesOnly(r *ha.Rule, sid string) bool {
 	for _, res := range r.Resources {
@@ -2438,7 +2462,7 @@ func (c *haCollector) resourceLeftovers() {
 	sort.Strings(sids)
 	for _, sid := range sids {
 		row := c.resources[sid]
-		if c.foreign(row.Comment) {
+		if c.foreign(row.Comment) || !c.reportsSID(sid) {
 			continue
 		}
 		_, marked := haMarkerOwner(row.Comment)
@@ -2459,7 +2483,7 @@ func (c *haCollector) ruleLeftovers() {
 		return
 	}
 	for i := range c.rules {
-		if ruleMarked(&c.rules[i]) && !c.foreign(c.rules[i].Comment) {
+		if ruleMarked(&c.rules[i]) && !c.foreign(c.rules[i].Comment) && c.reportsRule(&c.rules[i]) {
 			c.rep.problem(haKindOffModeRule, c.rules[i].ID,
 				"the CPI-owned HA rule still exists while pve.ha.mode is off; remove it in the PVE UI or with ha-manager rules remove")
 		}
@@ -2525,7 +2549,7 @@ func (c *haCollector) ownerTagMissing(g *haGuest) {
 // predates the owner tag and is far likelier this Director's than a stranger's;
 // ownerTagMissing advises on it and names adopt-owners.
 func (c *haCollector) judgesVM(g *haGuest) bool {
-	return ownerAdmits(c.owner, g) && c.inBand(g.ref.VMID)
+	return ownerAdmits(c.owner, g) && c.judgesVMID(g.ref.VMID)
 }
 
 // ownerAdmits reports whether the Director owner may judge g: a run that
@@ -2555,10 +2579,108 @@ func (c *haCollector) judges(g *haGuest) bool {
 	return g.owned && !g.ref.Template && c.judgesVM(g)
 }
 
-// inBand reports whether vmid lies inside the VM ID band of the cpi-config
-// entry this run reports for. A run with no entry judges every VM ID.
-func (c *haCollector) inBand(vmid int) bool {
-	return c.scope == nil || c.scope.Band.Contains(vmid)
+// judgesVMID reports whether this run reports on vmid as a VM of its own. A
+// run with no cpi-config entry judges every VM ID. Under an entry the VM ID
+// must lie in the entry's band, and the entry must be the first on the cluster
+// whose band holds it among the entries of the same Director that the doctor
+// read, so a VM that two such entries' bands share is reported once.
+func (c *haCollector) judgesVMID(vmid int) bool {
+	self, held := c.firstHolder(vmid)
+	return held && self
+}
+
+// reportsVMID reports whether this run reports a resource, a rule, or a
+// planned move that names vmid. These belong to the Director whether or not an
+// entry's band holds the VM ID, so the first entry whose band holds it reports
+// them, and when no entry's band does, the entry that reports the Director's
+// cluster findings does (see reportsCluster).
+func (c *haCollector) reportsVMID(vmid int) bool {
+	if self, held := c.firstHolder(vmid); held {
+		return self
+	}
+	return c.reportsCluster()
+}
+
+// reportsSID is reportsVMID for an HA resource ID. A resource that names no VM
+// ID is the Director's cluster finding.
+func (c *haCollector) reportsSID(sid string) bool {
+	if vmid, ok := sidVMID(sid); ok {
+		return c.reportsVMID(vmid)
+	}
+	return c.reportsCluster()
+}
+
+// reportsRule is reportsVMID for a rule. A pin names its VM in its ID, and
+// every other rule is the Director's cluster finding.
+func (c *haCollector) reportsRule(r *ha.Rule) bool {
+	if id, ok := strings.CutPrefix(r.ID, haPinRulePrefix); ok {
+		if vmid, err := strconv.Atoi(id); err == nil && strconv.Itoa(vmid) == id {
+			return c.reportsVMID(vmid)
+		}
+	}
+	return c.reportsCluster()
+}
+
+// firstHolder finds the first entry on the cluster, in cpi-config order, whose
+// band holds vmid and that is either this run's entry or an entry of the same
+// Director that the doctor read. held is false when there is none, and self
+// says whether it is this run's entry. A scope built without the cluster's
+// entries stands for its own band alone.
+func (c *haCollector) firstHolder(vmid int) (self, held bool) {
+	if c.scope == nil {
+		return true, true
+	}
+	if len(c.scope.Cluster) == 0 {
+		in := c.scope.Band.Contains(vmid)
+		return in, in
+	}
+	for i := range c.scope.Cluster {
+		e := &c.scope.Cluster[i]
+		if e.Band.Contains(vmid) && (e.Self || c.sharesDirector(e)) {
+			return e.Self, true
+		}
+	}
+	return false, false
+}
+
+// reportsCluster reports whether this run reports the findings that belong to
+// its Director's part of the cluster as a whole, such as a group rule or the
+// memory spread. Every entry of the same Director on the cluster reads the
+// same rules and resources, so only the first that the doctor read reports
+// them. A run with no cpi-config entry always does.
+func (c *haCollector) reportsCluster() bool {
+	if c.scope == nil {
+		return true
+	}
+	for i := range c.scope.Cluster {
+		e := &c.scope.Cluster[i]
+		if e.Self {
+			return true
+		}
+		if c.sharesDirector(e) {
+			return false
+		}
+	}
+	return true
+}
+
+// sharesDirector reports whether e is another entry the doctor read that it
+// judges for this run's Director, so e reports what this run would report.
+func (c *haCollector) sharesDirector(e *haClusterEntry) bool {
+	return !e.Self && !e.Unread && strings.EqualFold(haOwnerValue(e.Owner), haOwnerValue(c.owner))
+}
+
+// sidVMID returns the VM ID an HA resource ID names.
+func sidVMID(sid string) (int, bool) {
+	id, ok := strings.CutPrefix(sid, "vm:")
+	if !ok {
+		return 0, false
+	}
+	vmid, err := strconv.Atoi(id)
+	if err != nil || strconv.Itoa(vmid) != id {
+		return 0, false
+	}
+	return vmid, true
 }
 
 // ownedResource reports whether sid names a VM the CPI created.

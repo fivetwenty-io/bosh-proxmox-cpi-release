@@ -34,7 +34,7 @@ func (c *haCollector) rebalancePendingFindings() {
 	for _, sid := range slices.Sorted(maps.Keys(c.resources)) {
 		res := c.resources[sid]
 		owner, ok := haMarkerOwner(res.Comment)
-		if !ok || c.foreign(res.Comment) {
+		if !ok || c.foreign(res.Comment) || !c.reportsSID(sid) {
 			continue
 		}
 		if target, held := ha.RebalancePending(&res.Comment); held {
@@ -69,13 +69,44 @@ func (c *haCollector) rebalancePendingFindings() {
 	}
 }
 
+// rebalanceRunAdvice names the dry run that lists the moves spreadSkewedFindings
+// counts. Under --cpi-config the doctor plans with the entry's settings, which
+// pve-ops ha rebalance takes from a request, and counts only the moves of VMs
+// the entry reports on, while the dry run plans every HA VM of the Director on
+// the cluster. The dry run lists at most --max-moves moves, so when the plan
+// holds more than the default the advice names the flag that lists them all.
+func (c *haCollector) rebalanceRunAdvice(planned int) string {
+	command := "pve-ops ha rebalance --director-uuid " + haOwnerValue(c.owner)
+	if c.scope != nil {
+		command += " --request <file>"
+	}
+	if planned > handlers.RebalanceDefaultMaxMoves {
+		command += fmt.Sprintf(" --max-moves %d", planned)
+	}
+	text := "Run " + command
+	if c.scope != nil {
+		text = "The counts cover the VMs this entry reports on, and the dry run plans every HA VM of this Director " +
+			"on the cluster. " + text + ", where the request's context carries the properties of the cpi_config " +
+			"entry " + c.scope.Name + ","
+	}
+	text += " to see the moves a rebalance would make, and add --apply to make them."
+	if planned > handlers.RebalanceDefaultMaxMoves {
+		text += fmt.Sprintf(" The plan holds %d moves, and without --max-moves the dry run lists the first %d and "+
+			"defers the rest.", planned, handlers.RebalanceDefaultMaxMoves)
+	}
+	return text
+}
+
 // spreadSkewedFindings advises a rebalance when the dry run of pve-ops ha
 // rebalance would move a VM back into its AZ or pull apart two members of an
 // anti-affinity rule that share a node, or when the spread of committed
 // memory across the nodes passes the rebalance's start threshold. The advice
 // never fails the doctor, and it appears only when the doctor's own reads and
 // the dry run's reads succeeded, because a plan built on a failed read could
-// advise a move the cluster doesn't need.
+// advise a move the cluster doesn't need. Under --cpi-config each entry counts
+// the moves of the VMs it reports on (see reportsVMID), and only the entry that
+// reports the Director's cluster findings states the memory spread, so entries
+// of one Director on one cluster never repeat a move or the spread.
 func (c *haCollector) spreadSkewedFindings() {
 	if c.off() || c.owner == "" || !c.resourcesOK || !c.statesOK || !c.rulesOK || !c.guestsOK ||
 		c.guestsPartial {
@@ -92,6 +123,9 @@ func (c *haCollector) spreadSkewedFindings() {
 	}
 	outside, separate := 0, 0
 	for i := range rep.Moves {
+		if !c.reportsVMID(rep.Moves[i].VMID) {
+			continue
+		}
 		switch rep.Moves[i].Phase {
 		case harebalance.PhaseRestore:
 			outside++
@@ -101,7 +135,8 @@ func (c *haCollector) spreadSkewedFindings() {
 		}
 	}
 	spread := int(math.Round(rep.SpreadBefore * 100))
-	if outside == 0 && separate == 0 && rep.SpreadBefore <= handlers.RebalanceDefaultStart {
+	skewed := rep.SpreadBefore > handlers.RebalanceDefaultStart && c.reportsCluster()
+	if outside == 0 && separate == 0 && !skewed {
 		return
 	}
 	subject := rep.Cluster
@@ -124,12 +159,11 @@ func (c *haCollector) spreadSkewedFindings() {
 		detail = append(detail, fmt.Sprintf("A rebalance would make %d %s apart members of an anti-affinity rule "+
 			"sharing a node.", separate, moves))
 	}
-	if rep.SpreadBefore > handlers.RebalanceDefaultStart {
+	if skewed {
 		detail = append(detail, fmt.Sprintf("The committed memory of the nodes spreads %d points from the fullest "+
 			"node to the emptiest, against a start threshold of %d.", spread,
 			int(math.Round(handlers.RebalanceDefaultStart*100))))
 	}
-	detail = append(detail, fmt.Sprintf("Run pve-ops ha rebalance --director-uuid %s to see the moves a rebalance "+
-		"would make, and add --apply to make them.", haOwnerValue(c.owner)))
+	detail = append(detail, c.rebalanceRunAdvice(len(rep.Moves)))
 	c.rep.advise(haKindSpreadSkewed, subject, "%s", strings.Join(detail, " "))
 }

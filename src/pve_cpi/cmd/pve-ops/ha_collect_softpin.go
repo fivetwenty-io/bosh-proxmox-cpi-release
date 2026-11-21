@@ -26,7 +26,7 @@ func (c *haCollector) softPinFindings() {
 	for i := range c.rules {
 		pin := &c.rules[i]
 		if !strings.HasPrefix(pin.ID, haPinRulePrefix) || !ruleMarked(pin) || c.foreign(pin.Comment) ||
-			!ha.SoftPinNamesSomeNodes(pin, configured) {
+			!c.reportsRule(pin) || !ha.SoftPinNamesSomeNodes(pin, configured) {
 			continue
 		}
 		for _, sid := range pin.Resources {

@@ -312,8 +312,9 @@ func TestCollectFailbackLeavesAFlagAPeerEntryWrites(t *testing.T) {
 	want(t, alone(0, failbackRow(false)), haKindFailbackDrift, haSeverityAdvice, "vm:100", "failback off")
 	want(t, alone(1, failbackRow(true)), haKindFailbackDrift, haSeverityAdvice, "vm:100", "pve.ha.failback is false")
 
-	// A replicate VM with failback on is a problem under both entries, because
-	// neither writes failback on for it.
+	// A replicate VM with failback on is a problem, because neither entry
+	// writes failback on for it. Both entries judge it for the same Director,
+	// so the first entry reports it and the second stays quiet.
 	for i := range entries {
 		eff, _, _, err := config.ApplyContextOverrides(base, entries[i].Properties)
 		if err != nil {
@@ -322,6 +323,10 @@ func TestCollectFailbackLeavesAFlagAPeerEntryWrites(t *testing.T) {
 		f := replicaFake()
 		f.resources[1].Failback = nil
 		r := collectHAScoped(context.Background(), f, eff, "", haNow, scopes[i])
-		want(t, r, haKindFailbackOnReplica, haSeverityProblem, "vm:101", "failback on")
+		if i == 0 {
+			want(t, r, haKindFailbackOnReplica, haSeverityProblem, "vm:101", "failback on")
+		} else {
+			wantNone(t, r, haKindFailbackOnReplica)
+		}
 	}
 }

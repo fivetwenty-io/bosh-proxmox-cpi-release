@@ -226,6 +226,9 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 	ledger := newHANodeLedger()
 	for i := range entries {
 		report, layout := checkCPIConfigEntry(ctx, &entries[i], base, logger, deps, scopes[i], ledger, owners[i])
+		if report.Effective == "unknown" {
+			markUnread(scopes, i)
+		}
 		multi.Clusters = append(multi.Clusters, report)
 		layouts = append(layouts, layout)
 	}
@@ -421,14 +424,37 @@ type haClusterEntry struct {
 	// Owner is the Director UUID the run judges the entry for, or "" when it
 	// knows none.
 	Owner string
+	// Parkers is the entry's parker band when it parks detached disks, and
+	// the zero band otherwise.
+	Parkers pve.VMIDBand
 	// Self marks the entry the scope belongs to.
 	Self bool
+	// Unread marks an entry whose cluster the doctor could not read, so the
+	// findings it would have reported fall to the next entry that holds them.
+	Unread bool
+	// index is the entry's position in the cpi-config.
+	index int
 }
 
 // holds reports whether g could have been created through the entry: its
 // band holds g's VM ID, and its Director may judge g (see ownerAdmits).
 func (e *haClusterEntry) holds(g *haGuest) bool {
 	return e.Band.Contains(g.ref.VMID) && ownerAdmits(e.Owner, g)
+}
+
+// markUnread records in every scope that the doctor could not read the
+// cluster of entry i, so a later entry reports what entry i would have.
+func markUnread(scopes []*haEntryScope, i int) {
+	for _, sc := range scopes {
+		if sc == nil {
+			continue
+		}
+		for k := range sc.Cluster {
+			if sc.Cluster[k].index == i {
+				sc.Cluster[k].Unread = true
+			}
+		}
+	}
 }
 
 // ambiguous reports whether the entries that share the band disagree on the
@@ -494,6 +520,7 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig, owners []stri
 		azMap   map[string][]string
 		cfg     *config.CPIConfig
 		owner   string
+		parkers pve.VMIDBand
 	}
 	all := make([]*facts, len(entries))
 	for i := range entries {
@@ -512,6 +539,10 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig, owners []stri
 		if eff.Placement != nil {
 			all[i].azMap = eff.Placement.AZMap
 		}
+		if eff.DetachedDiskStrategyValue() == config.DetachedDiskStrategyParked {
+			all[i].parkers = pve.VMIDBand{Start: eff.ParkedDiskVMIDRangeStartValue(),
+				End: eff.ParkedDiskVMIDRangeEndValue()}
+		}
 	}
 	out := make([]*haEntryScope, len(entries))
 	for i, f := range all {
@@ -523,7 +554,7 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig, owners []stri
 			if o != nil && o.host == f.host {
 				sc.Cluster = append(sc.Cluster, haClusterEntry{
 					Name: o.name, Band: o.band, AntiAffinity: o.aa, Pattern: o.pattern, AZMap: o.azMap, Owner: o.owner,
-					Self: j == i,
+					Parkers: o.parkers, Self: j == i, index: j,
 				})
 			}
 			if o == nil || j == i || o.key != f.key {
