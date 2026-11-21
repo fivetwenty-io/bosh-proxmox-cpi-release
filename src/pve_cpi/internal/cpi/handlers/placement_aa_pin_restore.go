@@ -91,9 +91,10 @@ func (p *aaPlanner) pinRestores(set *ha.RuleSet) []aaPinRestore {
 // for a live hold.
 func (p *aaPlanner) restoreOps(set *ha.RuleSet) []ha.RuleOp {
 	var ops []ha.RuleOp
-	for _, r := range p.pinRestores(set) {
-		if !r.Deferred {
-			ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: r.rule})
+	restores := p.pinRestores(set)
+	for i := range restores {
+		if !restores[i].Deferred {
+			ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: restores[i].rule})
 		}
 	}
 	return ops
@@ -136,14 +137,15 @@ func restoreGroupPins(
 		if _, err := rp.plan(set); err != nil {
 			return nil, err
 		}
-		for _, r := range rp.pinRestores(set) {
-			planned[r.Pin] = r
+		restores := rp.pinRestores(set)
+		for i := range restores {
+			planned[restores[i].Pin] = restores[i]
 		}
 		return rp.restoreOps(set), nil
 	})
 	if res != nil {
-		for _, op := range res.Wrote {
-			r, ok := planned[op.Rule.ID]
+		for i := range res.Wrote {
+			r, ok := planned[res.Wrote[i].Rule.ID]
 			if !ok {
 				continue
 			}

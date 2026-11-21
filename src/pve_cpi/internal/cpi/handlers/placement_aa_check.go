@@ -237,7 +237,9 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 		c.Drift = append(c.Drift, fmt.Sprintf("record the holds %s on the HA resource %s", formatAAHolds(e.add),
 			e.sid))
 	}
-	for _, r := range p.pinRestores(set) {
+	restores := p.pinRestores(set)
+	for i := range restores {
+		r := &restores[i]
 		c.PinRestores = append(c.PinRestores, AntiAffinityPinRestore{
 			SID: r.SID, Pin: r.Pin, Action: r.Action.String(), Nodes: r.Nodes, Reason: r.Reason, Deferred: r.Deferred,
 		})
