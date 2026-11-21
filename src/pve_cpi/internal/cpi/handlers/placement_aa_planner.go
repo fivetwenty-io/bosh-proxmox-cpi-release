@@ -690,13 +690,7 @@ func (p *aaPlanner) ruleOps(set *ha.RuleSet, existing map[string]*ha.Rule, out a
 			p.placedIn = name
 		}
 		if !p.removal {
-			flat := flattenMemberPins(set, members, p.ident.Owner, p.clusterNodes)
-			for i := range flat {
-				if !pinned[flat[i].Rule.ID] {
-					pinned[flat[i].Rule.ID] = true
-					pins = append(pins, flat[i])
-				}
-			}
+			pins = append(pins, p.newMemberPins(set, members, pinned)...)
 		}
 		cur := existing[name]
 		if cur != nil {
@@ -735,18 +729,7 @@ func (p *aaPlanner) ruleOps(set *ha.RuleSet, existing map[string]*ha.Rule, out a
 			cleanup = append(cleanup, ha.RuleOp{Kind: ha.OpUpdate, Rule: p.holdRule(cur, nil)})
 		}
 	}
-	var deletes, heldDeletes []ha.RuleOp
-	for _, name := range slices.Sorted(maps.Keys(existing)) {
-		if _, ok := out.Rules[name]; ok {
-			continue
-		}
-		op := ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: name}}
-		if p.carriesLive(existing[name]) {
-			heldDeletes = append(heldDeletes, op)
-		} else {
-			deletes = append(deletes, op)
-		}
-	}
+	deletes, heldDeletes := p.ruleDeletes(existing, out)
 	p.leading = len(pins)
 	total := p.leading + len(holdAdds) + len(deletes) + len(heldDeletes) + len(shrink) + len(grow)
 	if total == 0 {
@@ -760,6 +743,38 @@ func (p *aaPlanner) ruleOps(set *ha.RuleSet, existing map[string]*ha.Rule, out a
 	ops = append(ops, shrink...)
 	ops = append(ops, grow...)
 	return append(ops, cleanup...)
+}
+
+// newMemberPins returns the pin rewrites that members need and that no
+// earlier rule of the plan has asked for, and marks them in pinned.
+func (p *aaPlanner) newMemberPins(set *ha.RuleSet, members []string, pinned map[string]bool) []ha.RuleOp {
+	var pins []ha.RuleOp
+	flat := flattenMemberPins(set, members, p.ident.Owner, p.clusterNodes)
+	for i := range flat {
+		if !pinned[flat[i].Rule.ID] {
+			pinned[flat[i].Rule.ID] = true
+			pins = append(pins, flat[i])
+		}
+	}
+	return pins
+}
+
+// ruleDeletes returns the deletes of the existing rules the layout drops, in
+// name order, split into those of rules that record no live hold and those
+// of rules that record one.
+func (p *aaPlanner) ruleDeletes(existing map[string]*ha.Rule, out aapattern.Output) (deletes, heldDeletes []ha.RuleOp) {
+	for _, name := range slices.Sorted(maps.Keys(existing)) {
+		if _, ok := out.Rules[name]; ok {
+			continue
+		}
+		op := ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: name}}
+		if p.carriesLive(existing[name]) {
+			heldDeletes = append(heldDeletes, op)
+		} else {
+			deletes = append(deletes, op)
+		}
+	}
+	return deletes, heldDeletes
 }
 
 // movesHold reports whether one of holds is recorded on a rule or a resource

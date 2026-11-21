@@ -24,7 +24,9 @@ func aaDoctorDrift(t *testing.T, deps Deps) []string {
 		t.Fatalf("read the check input: %v", err)
 	}
 	var drift []string
-	for _, c := range CheckAntiAffinityGroups(in) {
+	checks := CheckAntiAffinityGroups(in)
+	for i := range checks {
+		c := &checks[i]
 		if c.Problem != "" {
 			drift = append(drift, "problem: "+c.Problem)
 		}
@@ -97,82 +99,90 @@ func TestRemoveAntiAffinity_ConcurrentDeletesHoldEachOthersPlaces(t *testing.T) 
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			ctx := context.Background()
-			stub := newAAStub()
-			stub.purgeFromRules = true
-			fleet := newAAHoldFleet(stub, 100, 101, 102, 103, 104)
-			stub.seedRule(aaRule, "vm:100,vm:101,vm:102")
-			stub.seedRule(aaRule+"-2", "vm:103,vm:104")
-			var locks []string
-			pools := newAALockPools(&locks)
-			deps := aaReplanDepsWithLocks(stub, tc.lock, pools)
-			if d := aaDoctorDrift(t, deps); len(d) != 0 {
-				t.Fatalf("drift before the deletes = %v; want the group in its layout", d)
-			}
-			writes := 0
-			check := func(what string) {
-				writes++
-				if strings.Contains(stub.rules[aaRule], "vm:103") {
-					t.Errorf("write %d (%s) moved index 3 into the first rule: %v", writes, what, stub.rules)
-				}
-				if d := aaDoctorDrift(t, deps); len(d) != 0 {
-					t.Errorf("after write %d (%s) the doctor would write %v; rules %v, comments %v", writes, what,
-						d, stub.rules, stub.ruleComments)
-				}
-			}
-			stub.onRuleWrite = func(rule string) { check("rule " + rule) }
-			stub.onResourceWrite = func(sid string) { check("resource " + sid) }
-			remove := func(vmid int) {
-				if err := removeAntiAffinityMembership(ctx, deps, vmid, webTags(vmid), log.NewNopLogger()); err != nil {
-					t.Errorf("remove %d: %v", vmid, err)
-				}
-			}
-			nested := false
-			stub.onDeleteResource = func(sid string) {
-				if sid != haResourceSid(tc.first) || nested {
-					return
-				}
-				nested = true
-				if len(pools.pools) != 0 {
-					t.Errorf("the first delete purges its resource while it holds the lock %v", pools.pools)
-				}
-				taken := len(locks)
-				fleet.destroy(tc.second)
-				remove(tc.second)
-				if tc.lock && aaLocksTaken(locks[taken:]) < 2 {
-					t.Errorf("the second delete took the rules lock %d times; want its removal and its plan "+
-						"each under the lock", aaLocksTaken(locks[taken:]))
-				}
-			}
-			fleet.destroy(tc.first)
-			remove(tc.first)
-			if !nested {
-				t.Fatal("the second delete never ran")
-			}
-			if want := map[string]string{aaRule: "vm:100,vm:102"}; !maps.Equal(stub.rules, want) {
-				t.Fatalf("rules = %v after both deletes; want %v", stub.rules, want)
-			}
-			holds, _ := parseHaMarker(stub.ruleComments[aaRule])
-			if !strings.Contains(stub.ruleComments[aaRule], "hold=1.101@") ||
-				!strings.Contains(stub.ruleComments[aaRule], "4.104@") {
-				t.Fatalf("comment = %q (%+v); want the holds of both deleted indexes", stub.ruleComments[aaRule], holds)
-			}
-
-			for _, r := range []struct{ vmid, index int }{{105, 1}, {106, 4}} {
-				fleet.add(r.vmid, r.index)
-				joinAntiAffinityAtMetadata(ctx, deps, r.vmid, map[string]any{"index": float64(r.index)},
-					log.NewNopLogger())
-			}
-			want := map[string]string{aaRule: "vm:100,vm:102,vm:105", aaRule + "-2": "vm:103,vm:106"}
-			if !maps.Equal(stub.rules, want) {
-				t.Fatalf("rules = %v after the recreates; want %v", stub.rules, want)
-			}
-			for name, c := range stub.ruleComments {
-				if c != aaRuleMarker() {
-					t.Errorf("comment of %s = %q; want the plain marker once both holds are consumed", name, c)
-				}
-			}
+			testConcurrentDeletesHoldEachOthersPlaces(t, tc.first, tc.second, tc.lock)
 		})
+	}
+}
+
+// testConcurrentDeletesHoldEachOthersPlaces runs one case of
+// TestRemoveAntiAffinity_ConcurrentDeletesHoldEachOthersPlaces. It deletes
+// first, and the delete of second runs nested in the first one's purge.
+func testConcurrentDeletesHoldEachOthersPlaces(t *testing.T, first, second int, lock bool) {
+	t.Helper()
+	ctx := context.Background()
+	stub := newAAStub()
+	stub.purgeFromRules = true
+	fleet := newAAHoldFleet(stub, 100, 101, 102, 103, 104)
+	stub.seedRule(aaRule, "vm:100,vm:101,vm:102")
+	stub.seedRule(aaRule+"-2", "vm:103,vm:104")
+	var locks []string
+	pools := newAALockPools(&locks)
+	deps := aaReplanDepsWithLocks(stub, lock, pools)
+	if d := aaDoctorDrift(t, deps); len(d) != 0 {
+		t.Fatalf("drift before the deletes = %v; want the group in its layout", d)
+	}
+	writes := 0
+	check := func(what string) {
+		writes++
+		if strings.Contains(stub.rules[aaRule], "vm:103") {
+			t.Errorf("write %d (%s) moved index 3 into the first rule: %v", writes, what, stub.rules)
+		}
+		if d := aaDoctorDrift(t, deps); len(d) != 0 {
+			t.Errorf("after write %d (%s) the doctor would write %v; rules %v, comments %v", writes, what,
+				d, stub.rules, stub.ruleComments)
+		}
+	}
+	stub.onRuleWrite = func(rule string) { check("rule " + rule) }
+	stub.onResourceWrite = func(sid string) { check("resource " + sid) }
+	remove := func(vmid int) {
+		if err := removeAntiAffinityMembership(ctx, deps, vmid, webTags(vmid), log.NewNopLogger()); err != nil {
+			t.Errorf("remove %d: %v", vmid, err)
+		}
+	}
+	nested := false
+	stub.onDeleteResource = func(sid string) {
+		if sid != haResourceSid(first) || nested {
+			return
+		}
+		nested = true
+		if len(pools.pools) != 0 {
+			t.Errorf("the first delete purges its resource while it holds the lock %v", pools.pools)
+		}
+		taken := len(locks)
+		fleet.destroy(second)
+		remove(second)
+		if lock && aaLocksTaken(locks[taken:]) < 2 {
+			t.Errorf("the second delete took the rules lock %d times; want its removal and its plan "+
+				"each under the lock", aaLocksTaken(locks[taken:]))
+		}
+	}
+	fleet.destroy(first)
+	remove(first)
+	if !nested {
+		t.Fatal("the second delete never ran")
+	}
+	if want := map[string]string{aaRule: "vm:100,vm:102"}; !maps.Equal(stub.rules, want) {
+		t.Fatalf("rules = %v after both deletes; want %v", stub.rules, want)
+	}
+	holds, _ := parseHaMarker(stub.ruleComments[aaRule])
+	if !strings.Contains(stub.ruleComments[aaRule], "hold=1.101@") ||
+		!strings.Contains(stub.ruleComments[aaRule], "4.104@") {
+		t.Fatalf("comment = %q (%+v); want the holds of both deleted indexes", stub.ruleComments[aaRule], holds)
+	}
+
+	for _, r := range []struct{ vmid, index int }{{105, 1}, {106, 4}} {
+		fleet.add(r.vmid, r.index)
+		joinAntiAffinityAtMetadata(ctx, deps, r.vmid, map[string]any{"index": float64(r.index)},
+			log.NewNopLogger())
+	}
+	want := map[string]string{aaRule: "vm:100,vm:102,vm:105", aaRule + "-2": "vm:103,vm:106"}
+	if !maps.Equal(stub.rules, want) {
+		t.Fatalf("rules = %v after the recreates; want %v", stub.rules, want)
+	}
+	for name, c := range stub.ruleComments {
+		if c != aaRuleMarker() {
+			t.Errorf("comment of %s = %q; want the plain marker once both holds are consumed", name, c)
+		}
 	}
 }
 

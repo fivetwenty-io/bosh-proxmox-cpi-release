@@ -721,37 +721,8 @@ func (p *aaPlanner) holdReport(set *ha.RuleSet) (live, lapsed []AntiAffinityHold
 // already, needs neither. avoid names the resources that must not record a
 // hold, such as that of the member a delete or a repair is taking out.
 func (p *aaPlanner) carryHolds(set *ha.RuleSet, deleting map[string]bool, avoid ...string) []ha.RuleOp {
-	now := p.clock().Unix()
-	base := p.ident.ruleName()
-	rules := map[string]*ha.Rule{}
-	for i := range set.Rules {
-		r := &set.Rules[i]
-		if aapattern.IsGroupRule(base, r.ID) && r.Type == haRuleType &&
-			haOwnershipOf(r.Comment, p.ident.Owner) == haOwnedByUs {
-			rules[r.ID] = r
-		}
-	}
-	type carried struct {
-		aaGroupHold
-		from *ha.Rule
-	}
-	var pending []carried
-	for _, name := range p.sortedRuleNames(slices.Collect(maps.Keys(rules))) {
-		r := rules[name]
-		if !deleting[name] {
-			continue
-		}
-		for _, h := range holdsOf(r.Comment) {
-			if h.Until <= now || slices.ContainsFunc(pending, func(c carried) bool { return c.Index == h.Index }) {
-				continue
-			}
-			dom := p.ruleDomain(set, r.Resources)
-			if len(r.Resources) == 0 {
-				dom = p.topo.domainOf(set, h.sid(), p.ident.Owner)
-			}
-			pending = append(pending, carried{aaGroupHold{aaHold: h, Domain: dom}, r})
-		}
-	}
+	rules := p.ownedGroupRules(set)
+	pending := p.holdsToCarry(set, rules, deleting)
 	if len(pending) == 0 {
 		return nil
 	}
@@ -759,22 +730,9 @@ func (p *aaPlanner) carryHolds(set *ha.RuleSet, deleting map[string]bool, avoid 
 		managed, err := p.managed()
 		if err != nil {
 			p.logger.Warn("anti-affinity: the HA resources could not be listed to keep the holds of the rules a "+
-				"write deletes (non-fatal)", log.String("rule", base), log.Err(err))
+				"write deletes (non-fatal)", log.String("rule", p.ident.ruleName()), log.Err(err))
 		}
 		p.managedNow = managed
-	}
-	recorded := func(index int) bool {
-		for name, r := range rules {
-			if !deleting[name] && recordsIndex(holdsOf(r.Comment), index) {
-				return true
-			}
-		}
-		for sid := range p.managedNow {
-			if m, ok := p.groupMarkerOf(sid); ok && recordsIndex(m.Holds, index) {
-				return true
-			}
-		}
-		return false
 	}
 	var keptNames []string
 	for name, r := range rules {
@@ -786,7 +744,7 @@ func (p *aaPlanner) carryHolds(set *ha.RuleSet, deleting map[string]bool, avoid 
 	adds := map[string][]aaHold{}
 	var edits []aaResourceHoldEdit
 	for _, c := range pending {
-		if recorded(c.Index) {
+		if p.recordedOutside(rules, deleting, c.Index) {
 			continue
 		}
 		if i := slices.IndexFunc(keptNames, func(n string) bool {
@@ -818,6 +776,68 @@ func (p *aaPlanner) carryHolds(set *ha.RuleSet, deleting map[string]bool, avoid 
 		ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: next})
 	}
 	return ops
+}
+
+// aaCarriedHold is a live hold that carryHolds moves off the rule from,
+// which a write deletes.
+type aaCarriedHold struct {
+	aaGroupHold
+	from *ha.Rule
+}
+
+// ownedGroupRules returns the group's anti-affinity rules in set that this
+// Director owns, by name.
+func (p *aaPlanner) ownedGroupRules(set *ha.RuleSet) map[string]*ha.Rule {
+	base := p.ident.ruleName()
+	rules := map[string]*ha.Rule{}
+	for i := range set.Rules {
+		r := &set.Rules[i]
+		if aapattern.IsGroupRule(base, r.ID) && r.Type == haRuleType &&
+			haOwnershipOf(r.Comment, p.ident.Owner) == haOwnedByUs {
+			rules[r.ID] = r
+		}
+	}
+	return rules
+}
+
+// holdsToCarry returns the live holds of the rules in deleting, one per
+// index, in rule order, each with the domain it keeps a place in.
+func (p *aaPlanner) holdsToCarry(set *ha.RuleSet, rules map[string]*ha.Rule, deleting map[string]bool) []aaCarriedHold {
+	now := p.clock().Unix()
+	var pending []aaCarriedHold
+	for _, name := range p.sortedRuleNames(slices.Collect(maps.Keys(rules))) {
+		r := rules[name]
+		if !deleting[name] {
+			continue
+		}
+		for _, h := range holdsOf(r.Comment) {
+			if h.Until <= now || slices.ContainsFunc(pending, func(c aaCarriedHold) bool { return c.Index == h.Index }) {
+				continue
+			}
+			dom := p.ruleDomain(set, r.Resources)
+			if len(r.Resources) == 0 {
+				dom = p.topo.domainOf(set, h.sid(), p.ident.Owner)
+			}
+			pending = append(pending, aaCarriedHold{aaGroupHold{aaHold: h, Domain: dom}, r})
+		}
+	}
+	return pending
+}
+
+// recordedOutside reports whether a rule outside deleting, or a member
+// resource the planner has listed, records a hold for index already.
+func (p *aaPlanner) recordedOutside(rules map[string]*ha.Rule, deleting map[string]bool, index int) bool {
+	for name, r := range rules {
+		if !deleting[name] && recordsIndex(holdsOf(r.Comment), index) {
+			return true
+		}
+	}
+	for sid := range p.managedNow {
+		if m, ok := p.groupMarkerOf(sid); ok && recordsIndex(m.Holds, index) {
+			return true
+		}
+	}
+	return false
 }
 
 // holdResource returns the HA resource, in domain, that takes over a hold
