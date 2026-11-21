@@ -175,6 +175,14 @@ const settleRounds = 8
 // get there would cost a write that can migrate a member. The members a plan
 // displaced stay reported, because a later round no longer sees their place.
 func Layout(in Input) Output {
+	out := settle(in)
+	out.dropReserved(in.Members)
+	return out
+}
+
+// settle makes the plan Layout returns, with the reserved places of members
+// still in its rules.
+func settle(in Input) Output {
 	out := layoutOnce(in)
 	displaced := slices.Clone(out.Displaced)
 	for range settleRounds - 1 {
@@ -188,7 +196,44 @@ func Layout(in Input) Output {
 		out = again
 	}
 	out.Displaced = displaced
-	out.dropReserved(in.Members)
+	return out
+}
+
+// HeldPartners returns the members that the plan of in puts in a rule with
+// the member keyed key, in sorted order. It leaves out every reserved place,
+// as those name no member that is present. It makes the same plan Layout
+// makes, so its answer and Layout's rules never disagree.
+//
+// Its use is for key to be the reserved place of a hold. Layout drops that
+// place from the rules it returns, but it places the hold where the recreate
+// of the hold's index will go, so the hold's partners here are the present
+// members the recreate shares a rule with once it joins. A caller that does
+// not know a new member's index yet can read them before the member exists.
+// A key that is not a member, or one the plan puts in no rule, has none.
+func HeldPartners(in Input, key string) []string {
+	reserved := map[string]bool{}
+	found := false
+	for _, m := range in.Members {
+		found = found || m.Key == key
+		if m.Reserved {
+			reserved[m.Key] = true
+		}
+	}
+	if !found {
+		return nil
+	}
+	var out []string
+	for _, keys := range settle(in).Rules {
+		if !slices.Contains(keys, key) {
+			continue
+		}
+		for _, k := range keys {
+			if k != key && !reserved[k] && !slices.Contains(out, k) {
+				out = append(out, k)
+			}
+		}
+	}
+	slices.Sort(out)
 	return out
 }
 
