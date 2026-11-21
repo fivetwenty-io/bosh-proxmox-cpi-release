@@ -42,6 +42,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Changed
 
+- `pve-ops ha --cpi-config` now says once for the run, rather than once for each entry, that no Director UUID is known. It gives one advice finding on the report of the first entry without a UUID, and that finding names every such entry, so a cpi-config of seven entries no longer repeats the same advice seven times. The doctor also logs one warning that names the same entries. [Operations](docs/operations.md) describes the scoping.
+
 - The CPI no longer warns on every plan about a member that the anti-affinity layout leaves alone by design, such as index 4 of five members on three nodes. It logs that member at Info in the plan for the member itself and at Debug in every other plan, and the line no longer promises that a later member will join its rule. It says that the rule is written only if the group grows a member into that run.
 
 - `create_vm` now keeps a recreate off the nodes of the members its anti-affinity rule will hold.

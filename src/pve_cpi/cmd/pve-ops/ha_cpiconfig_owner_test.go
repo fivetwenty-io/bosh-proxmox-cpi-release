@@ -71,3 +71,41 @@ func TestRunHACPIConfig_ScopesEachEntryToItsDirector(t *testing.T) {
 		})
 	}
 }
+
+// TestRunHACPIConfig_SaysOnceThatNoDirectorUUIDIsKnown pins that a run whose
+// entries name no Director UUID gives the advice once, on the first such
+// entry, and names every entry it applies to. An entry that names its own
+// UUID is left out of the list, and the other entries carry no copy.
+func TestRunHACPIConfig_SaysOnceThatNoDirectorUUIDIsKnown(t *testing.T) {
+	t.Parallel()
+	doc := `[{"name":"a","type":"pve","properties":{"pve_vmid_range_start":100,"pve_vmid_range_end":199}},` +
+		`{"name":"b","type":"pve","director_uuid":"aaaaaaaa-0000",` +
+		`"properties":{"pve_vmid_range_start":200,"pve_vmid_range_end":299}},` +
+		`{"name":"c","type":"pve","properties":{"pve_vmid_range_start":300,"pve_vmid_range_end":399}}]`
+	f := haBaseFake()
+	deps := haDeps{
+		openReader: func(*config.CPIConfig, *log.Logger) (HAReader, error) { return f, nil },
+		now:        func() time.Time { return haNow },
+	}
+	path := filepath.Join(t.TempDir(), "cpi-config.json")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	runHACPIConfig(context.Background(), path, haCfg("auto", "hold"), nil, "", true, &stdout, &stderr, deps)
+	var out haMultiReport
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil || len(out.Clusters) != 3 {
+		t.Fatalf("output %q (%v), stderr %q", stdout.String(), err, stderr.String())
+	}
+	var notes []string
+	for _, c := range out.Clusters {
+		for _, n := range findings(c, haKindAdvice) {
+			if strings.Contains(n.Detail, "no Director UUID is known") {
+				notes = append(notes, c.Cluster+": "+n.Detail)
+			}
+		}
+	}
+	if len(notes) != 1 || !strings.HasPrefix(notes[0], "a: ") || !strings.Contains(notes[0], "the entries a and c, so") {
+		t.Fatalf("advice = %q; want it once, on entry a, naming a and c", notes)
+	}
+}

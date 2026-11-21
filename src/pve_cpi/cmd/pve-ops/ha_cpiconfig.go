@@ -210,15 +210,27 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 	// One ledger serves every entry, so a node one entry found unreachable is
 	// not asked again by the next entry that reaches the same cluster.
 	ledger := newHANodeLedger()
+	owners := make([]string, len(entries))
+	var unowned []string
 	for i := range entries {
-		owner := strings.TrimSpace(entries[i].DirectorUUID)
-		if owner == "" {
-			owner = documentUUID
+		owners[i] = strings.TrimSpace(entries[i].DirectorUUID)
+		if owners[i] == "" {
+			owners[i] = documentUUID
 		}
-		if owner == "" {
-			owner = strings.TrimSpace(directorUUID)
+		if owners[i] == "" {
+			owners[i] = strings.TrimSpace(directorUUID)
 		}
-		report, layout := checkCPIConfigEntry(ctx, &entries[i], base, logger, deps, scopes[i], ledger, owner)
+		if owners[i] == "" {
+			unowned = append(unowned, entries[i].Name)
+		}
+	}
+	advised := false
+	for i := range entries {
+		report, layout := checkCPIConfigEntry(ctx, &entries[i], base, logger, deps, scopes[i], ledger, owners[i])
+		if owners[i] == "" && !advised {
+			adviseNoDirectorUUID(report, logger, unowned)
+			advised = true
+		}
 		multi.Clusters = append(multi.Clusters, report)
 		layouts = append(layouts, layout)
 	}
@@ -259,6 +271,47 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 	return exitOK
 }
 
+// adviseNoDirectorUUID says once per run, on the report of the first entry
+// that has no owner, that the entries named in unowned are scoped by their VM
+// ID bands alone. The band is the only boundary left for those entries, so a
+// VM another Director created inside a band is judged as the entry's. The
+// condition is one setting of the run, not of each cluster, so repeating it on
+// every entry would only bury the other findings.
+func adviseNoDirectorUUID(report *haReport, logger *log.Logger, unowned []string) {
+	if len(unowned) == 0 {
+		return
+	}
+	names := joinNames(unowned)
+	if logger != nil {
+		logger.Warn("the doctor has no Director UUID for some cpi-config entries, so it scopes each of them by its VM ID band alone",
+			log.String("entries", strings.Join(unowned, ",")))
+	}
+	if len(unowned) == 1 {
+		report.advise(haKindAdvice, unowned[0], "no Director UUID is known for the entry %s, so the doctor scopes it by its "+
+			"VM ID band alone and judges every VM in the band, including one that another Director created there. Set "+
+			"director_uuid on the entry or on the document, or pass --director-uuid", names)
+		return
+	}
+	report.advise(haKindAdvice, unowned[0], "no Director UUID is known for the entries %s, so the doctor scopes each of "+
+		"them by its VM ID band alone and judges every VM in the band, including one that another Director created there. "+
+		"Set director_uuid on each entry or on the document, or pass --director-uuid. The doctor says this once for the "+
+		"run, on the first of those entries", names)
+}
+
+// joinNames lists names in prose, with an Oxford comma before the last of
+// three or more.
+func joinNames(names []string) string {
+	switch len(names) {
+	case 0:
+		return ""
+	case 1:
+		return names[0]
+	case 2:
+		return names[0] + " and " + names[1]
+	}
+	return strings.Join(names[:len(names)-1], ", ") + ", and " + names[len(names)-1]
+}
+
 // checkCPIConfigEntry reports one cpis entry and gathers the layout the
 // cross-cluster check compares. Any step that cannot finish leaves the layout
 // unchecked with the reason, and the report carries the same reason as a
@@ -296,17 +349,6 @@ func checkCPIConfigEntry(ctx context.Context, entry *cpiConfigEntry, base *confi
 	layout.Storages, layout.NextID = storages, next
 	report := collectHAScoped(ctx, newLedgerHAReader(reader, ledger), eff, owner, deps.now(), scope)
 	report.Cluster = entry.Name
-	if owner == "" {
-		// The entry's band is the only boundary left, so a VM another Director
-		// created inside the band is judged as this entry's.
-		if logger != nil {
-			logger.Warn("the doctor has no Director UUID for this cpi-config entry, so it scopes the entry by its VM ID band alone",
-				log.String("entry", entry.Name))
-		}
-		report.advise(haKindAdvice, entry.Name, "no Director UUID is known for this entry, so the doctor scopes it by its "+
-			"VM ID band alone and judges every VM in the band, including one that another Director created there. Set "+
-			"director_uuid on the entry or on the document, or pass --director-uuid")
-	}
 	for _, key := range unknown {
 		report.advise(haKindAdvice, key, "the entry's property %q is not one the CPI reads, so it was ignored", key)
 	}
