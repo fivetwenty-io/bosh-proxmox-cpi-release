@@ -52,7 +52,8 @@ func aaPartnerFleet(t *testing.T, maintenance ...string) (Deps, *aaClusterStub, 
 	free := map[string]int64{"pve1": 6, "pve2": 4, "pve3": 2}
 	stub.statusFn = func() (*cluster.ListStatusResponse, error) {
 		raw, _ := json.Marshal(map[string]any{"type": "cluster", "name": "lab", "quorate": 1, "nodes": 3})
-		resp := cluster.ListStatusResponse{raw}
+		resp := make(cluster.ListStatusResponse, 0, 1+len(aaPartnerNodes))
+		resp = append(resp, raw)
 		for _, n := range aaPartnerNodes {
 			row := onlineNode(n)
 			if slices.Contains(maintenance, n) {
@@ -105,9 +106,10 @@ func aaDeleteMember(t *testing.T, deps Deps, fleet *aaCanonFleet, vmid int) {
 // aaPlaceRecreate scores the nodes for a create of the web group the way
 // create_vm does, reading the group's partners first unless plain is set,
 // and returns the node and the partners it read.
-func aaPlaceRecreate(t *testing.T, deps Deps, cp createVMCloudProps, plain bool) (string, map[string]int) {
+func aaPlaceRecreate(t *testing.T, deps Deps, plain bool) (string, map[string]int) {
 	t.Helper()
 	ctx := context.Background()
+	var cp createVMCloudProps
 	group := antiAffinityScorerGroup(deps, aaEnvForWebGroup())
 	if !plain {
 		group.partners = antiAffinityPartnerNodes(ctx, deps, aaEnvForWebGroup(), cp)
@@ -147,14 +149,14 @@ func TestAntiAffinityPartnerNodes_ARecreateLandsAwayFromItsPartners(t *testing.T
 			for _, v := range tc.deleted {
 				aaDeleteMember(t, deps, fleet, v)
 			}
-			node, partners := aaPlaceRecreate(t, deps, createVMCloudProps{}, false)
+			node, partners := aaPlaceRecreate(t, deps, false)
 			if !maps.Equal(partners, tc.partners) {
 				t.Fatalf("partner nodes = %v; want %v", partners, tc.partners)
 			}
 			if partners[node] > 0 {
 				t.Fatalf("the recreate landed on %s, which runs a partner (partners %v)", node, partners)
 			}
-			if plain, _ := aaPlaceRecreate(t, deps, createVMCloudProps{}, true); plain != tc.plainPick {
+			if plain, _ := aaPlaceRecreate(t, deps, true); plain != tc.plainPick {
 				t.Fatalf("without the partners the scorer picks %s; want %s", plain, tc.plainPick)
 			}
 		})
@@ -271,7 +273,7 @@ func TestAntiAffinityPartnerNodes_AFailedReadKeepsTodaysPlacement(t *testing.T) 
 			if warns != 1 {
 				t.Fatalf("Warn lines about the partners = %d; want 1 (%v)", warns, obs.All())
 			}
-			if node, _ := aaPlaceRecreate(t, deps, createVMCloudProps{}, false); node == "" {
+			if node, _ := aaPlaceRecreate(t, deps, false); node == "" {
 				t.Fatal("the create placed nowhere")
 			}
 		})
@@ -321,7 +323,7 @@ func TestAntiAffinityPartnerNodes_MaintenanceComesFirst(t *testing.T) {
 			t.Parallel()
 			deps, _, fleet := aaPartnerFleet(t, tc.maintenance...)
 			aaDeleteMember(t, deps, fleet, 101)
-			node, partners := aaPlaceRecreate(t, deps, createVMCloudProps{}, false)
+			node, partners := aaPlaceRecreate(t, deps, false)
 			if !maps.Equal(partners, map[string]int{"pve1": 1}) {
 				t.Fatalf("partner nodes = %v; want pve1", partners)
 			}
@@ -364,7 +366,7 @@ func aaReplayLabRoll(t *testing.T, plain bool) []string {
 			aaDeleteMember(t, deps, fleet, 100+i)
 		}
 		for _, i := range batch {
-			node, partners := aaPlaceRecreate(t, deps, createVMCloudProps{}, plain)
+			node, partners := aaPlaceRecreate(t, deps, plain)
 			if !plain && partners[node] > 0 {
 				t.Errorf("batch %v: the recreate of index %d landed on %s, which runs a partner (%v)", batch, i,
 					node, partners)

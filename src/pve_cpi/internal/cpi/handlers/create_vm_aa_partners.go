@@ -108,7 +108,8 @@ func antiAffinityPartnerNodes(
 // leaves for the recreate of its index.
 func groupRecordsHolds(ident haIdentity, set *ha.RuleSet, managed map[string]string) bool {
 	base := ident.ruleName()
-	for _, r := range set.Rules {
+	for i := range set.Rules {
+		r := &set.Rules[i]
 		if aapattern.IsGroupRule(base, r.ID) && haOwnershipOf(r.Comment, ident.Owner) == haOwnedByUs &&
 			len(holdsOf(r.Comment)) > 0 {
 			return true
