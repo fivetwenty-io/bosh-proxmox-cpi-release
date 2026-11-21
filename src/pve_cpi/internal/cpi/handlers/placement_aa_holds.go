@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"cmp"
+	"context"
 	"maps"
 	"slices"
 	"strconv"
@@ -415,9 +416,13 @@ func (p *aaPlanner) sortedRuleNames(names []string) []string {
 // keeps that rule, so the write that takes the member out records the hold
 // and the recreate's join drops it again, with no write of its own for
 // either. A hold whose member's rule goes goes on the lowest-numbered rule
-// of the plan in its domain, and when the domain has no rule, on the HA
-// resource of the domain's lowest-indexed member. ruleHolds and resHolds then hold what each carrier
-// should record, and a consumed or lapsed hold is recorded nowhere.
+// of the plan in its domain that exists now. When the domain has no such
+// rule, it goes on the HA resource of the domain's lowest-indexed member,
+// because the plan writes the deletes of its rules before the creates, so a
+// rule it creates could record the hold only after the delete of the rule
+// that records it now. Only a domain with neither puts the hold on a rule the
+// plan creates. ruleHolds and resHolds then hold what each carrier should
+// record, and a consumed or lapsed hold is recorded nowhere.
 func (p *aaPlanner) assignHolds(in aapattern.Input, existing map[string]*ha.Rule, out aapattern.Output) {
 	p.ruleHolds, p.resHolds = map[string][]aaHold{}, map[string][]aaHold{}
 	domainOf := map[string]string{}
@@ -465,12 +470,18 @@ func (p *aaPlanner) assignHolds(in aapattern.Input, existing map[string]*ha.Rule
 			p.ruleHolds[name] = append(p.ruleHolds[name], h.aaHold)
 			continue
 		}
-		if i := slices.IndexFunc(names, func(n string) bool { return ruleDom[n] == h.Domain }); i >= 0 {
+		if i := slices.IndexFunc(names, func(n string) bool {
+			return ruleDom[n] == h.Domain && existing[n] != nil
+		}); i >= 0 {
 			p.ruleHolds[names[i]] = append(p.ruleHolds[names[i]], h.aaHold)
 			continue
 		}
 		if i := slices.IndexFunc(carriers, func(m aapattern.Member) bool { return m.Domain == h.Domain }); i >= 0 {
 			p.resHolds[carriers[i].Key] = append(p.resHolds[carriers[i].Key], h.aaHold)
+			continue
+		}
+		if i := slices.IndexFunc(names, func(n string) bool { return ruleDom[n] == h.Domain }); i >= 0 {
+			p.ruleHolds[names[i]] = append(p.ruleHolds[names[i]], h.aaHold)
 			continue
 		}
 		if p.once("unrecorded hold " + h.String()) {
@@ -695,4 +706,163 @@ func (p *aaPlanner) holdReport(set *ha.RuleSet) (live, lapsed []AntiAffinityHold
 		lapsed = append(lapsed, report(h, g != nil && g.state == aaHoldConsumed && h.Until > p.clock().Unix()))
 	}
 	return live, lapsed
+}
+
+// carryHolds keeps recorded the live holds of the group's rules in deleting,
+// for a write that deletes those rules without a plan of the group, such as a
+// prune or the repair of a confinement pin. Each such hold moves to the
+// lowest-numbered rule of the group in its domain that the write keeps with
+// two members or more, through the update carryHolds returns, which the
+// caller sends before the delete. A hold whose domain keeps no such rule goes
+// on the HA resource of a member of that domain, first a member of the rule
+// that goes and then any member of the group, by sid. carryHolds writes that
+// edit itself through recordHolds before it returns. A hold that has lapsed,
+// or whose index a rule outside deleting or a member resource records
+// already, needs neither. avoid names the resources that must not record a
+// hold, such as that of the member a delete or a repair is taking out.
+func (p *aaPlanner) carryHolds(set *ha.RuleSet, deleting map[string]bool, avoid ...string) []ha.RuleOp {
+	now := p.clock().Unix()
+	base := p.ident.ruleName()
+	rules := map[string]*ha.Rule{}
+	for i := range set.Rules {
+		r := &set.Rules[i]
+		if aapattern.IsGroupRule(base, r.ID) && r.Type == haRuleType &&
+			haOwnershipOf(r.Comment, p.ident.Owner) == haOwnedByUs {
+			rules[r.ID] = r
+		}
+	}
+	type carried struct {
+		aaGroupHold
+		from *ha.Rule
+	}
+	var pending []carried
+	for _, name := range p.sortedRuleNames(slices.Collect(maps.Keys(rules))) {
+		r := rules[name]
+		if !deleting[name] {
+			continue
+		}
+		for _, h := range holdsOf(r.Comment) {
+			if h.Until <= now || slices.ContainsFunc(pending, func(c carried) bool { return c.Index == h.Index }) {
+				continue
+			}
+			dom := p.ruleDomain(set, r.Resources)
+			if len(r.Resources) == 0 {
+				dom = p.topo.domainOf(set, h.sid(), p.ident.Owner)
+			}
+			pending = append(pending, carried{aaGroupHold{aaHold: h, Domain: dom}, r})
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	if p.managed != nil {
+		managed, err := p.managed()
+		if err != nil {
+			p.logger.Warn("anti-affinity: the HA resources could not be listed to keep the holds of the rules a "+
+				"write deletes (non-fatal)", log.String("rule", base), log.Err(err))
+		}
+		p.managedNow = managed
+	}
+	recorded := func(index int) bool {
+		for name, r := range rules {
+			if !deleting[name] && recordsIndex(holdsOf(r.Comment), index) {
+				return true
+			}
+		}
+		for sid := range p.managedNow {
+			if m, ok := p.groupMarkerOf(sid); ok && recordsIndex(m.Holds, index) {
+				return true
+			}
+		}
+		return false
+	}
+	var keptNames []string
+	for name, r := range rules {
+		if !deleting[name] && len(r.Resources) >= 2 {
+			keptNames = append(keptNames, name)
+		}
+	}
+	keptNames = p.sortedRuleNames(keptNames)
+	adds := map[string][]aaHold{}
+	var edits []aaResourceHoldEdit
+	for _, c := range pending {
+		if recorded(c.Index) {
+			continue
+		}
+		if i := slices.IndexFunc(keptNames, func(n string) bool {
+			return p.ruleDomain(set, rules[n].Resources) == c.Domain
+		}); i >= 0 {
+			adds[keptNames[i]] = append(adds[keptNames[i]], c.aaHold)
+			continue
+		}
+		if sid, ok := p.holdResource(set, c.Domain, c.from.Resources, append([]string{c.sid()}, avoid...)); ok {
+			edits = append(edits, aaResourceHoldEdit{sid: sid, add: []aaHold{c.aaHold}})
+			continue
+		}
+		if p.once("uncarried hold " + c.String()) {
+			p.logger.Warn("anti-affinity: no rule or member of the group is left in the deleted member's domain to "+
+				"take over the hold of a rule a write deletes, so the hold lapses with the rule",
+				log.String("rule", c.from.ID), log.Int("index", c.Index), log.String("sid", c.sid()),
+				log.String("domain", aaDomainLabel(c.Domain)))
+		}
+	}
+	p.writeResourceHolds(edits)
+	var ops []ha.RuleOp
+	for _, name := range keptNames {
+		if len(adds[name]) == 0 {
+			continue
+		}
+		next := rules[name].Clone()
+		next.Errors = nil
+		next.Comment = withHolds(next.Comment, append(holdsOf(next.Comment), adds[name]...))
+		ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: next})
+	}
+	return ops
+}
+
+// holdResource returns the HA resource, in domain, that takes over a hold
+// for carryHolds: a member resource of the group among first, then any
+// member resource of the group by sid, and never one in avoid.
+func (p *aaPlanner) holdResource(set *ha.RuleSet, domain string, first, avoid []string) (string, bool) {
+	fits := func(sid string) bool {
+		if slices.Contains(avoid, sid) {
+			return false
+		}
+		_, ok := p.groupMarkerOf(sid)
+		return ok && p.topo.domainOf(set, sid, p.ident.Owner) == domain
+	}
+	for _, sid := range slices.Sorted(slices.Values(first)) {
+		if fits(sid) {
+			return sid, true
+		}
+	}
+	for _, sid := range slices.Sorted(maps.Keys(p.managedNow)) {
+		if fits(sid) {
+			return sid, true
+		}
+	}
+	return "", false
+}
+
+// carryRepairHolds returns the rule writer's CarryHolds for the repair of a
+// confinement pin. When the repair deletes an anti-affinity rule of a group
+// this Director owns, the rule's live holds move to another rule of the
+// group or to a member's HA resource first (see carryHolds), and never to
+// the resource of a VM the repair takes out of the rule.
+func carryRepairHolds(
+	deps Deps, logger *log.Logger,
+) func(ctx context.Context, set *ha.RuleSet, gone *ha.Rule, leaving []string) []ha.RuleOp {
+	owner := deps.RequestDirectorUUID
+	return func(ctx context.Context, set *ha.RuleSet, gone *ha.Rule, leaving []string) []ha.RuleOp {
+		m, ok := parseHaMarker(gone.Comment)
+		if !ok || len(m.Holds) == 0 || haOwnershipOf(gone.Comment, owner) != haOwnedByUs {
+			return nil
+		}
+		ident := haIdentity{Owner: owner, Deployment: m.Deployment, Group: m.Group}
+		if !ident.valid() || !aapattern.IsGroupRule(ident.ruleName(), gone.ID) {
+			return nil
+		}
+		p := newGroupPlanner(ctx, deps, nil, ident, &groupScan{}, logger)
+		return p.carryHolds(set, map[string]bool{gone.ID: true}, leaving...)
+	}
 }

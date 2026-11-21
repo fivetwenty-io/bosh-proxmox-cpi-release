@@ -119,6 +119,14 @@ type RuleWriter struct {
 	// has writes a repair may have to revert, so the lock must stay held.
 	Backoff func(ctx context.Context, d time.Duration, idle bool) error
 	Repair  RepairDeps
+	// CarryHolds, when set, returns the writes that keep what an owned rule
+	// records for others, such as an anti-affinity hold, before a repair
+	// deletes that rule. leaving names the resources the repair takes out of
+	// the rule. The repair asks with a fresh read that still holds gone,
+	// sends the first write it returns under that read's digest, and asks
+	// again, until it returns none. It may make writes of its own that are
+	// not rule writes, such as a resource comment, before it returns.
+	CarryHolds func(ctx context.Context, set *RuleSet, gone *Rule, leaving []string) []RuleOp
 }
 
 // ApplyResult is what one Apply did.
@@ -764,6 +772,8 @@ func (w *RuleWriter) confinementOnly(ctx context.Context, res *ApplyResult, pin 
 			next := ra.Clone()
 			next.Resources = keep
 			op = RuleOp{Kind: OpUpdate, Rule: next}
+		} else if err := w.carryHolds(ctx, res, ra.ID, pin.Resources); err != nil {
+			return err
 		}
 		if err := w.writeOnce(ctx, normalizeOp(op)); err != nil {
 			return err
@@ -781,6 +791,67 @@ func (w *RuleWriter) confinementOnly(ctx context.Context, res *ApplyResult, pin 
 	}
 	addRepaired(res, op, "")
 	return nil
+}
+
+// carryHolds sends the writes CarryHolds returns for the rule id that a
+// repair is about to delete, as it takes leaving out of it. Each round reads the rules, asks CarryHolds,
+// and sends the first write under that read's digest, so a carry never
+// overwrites a change another writer made after the plan's read. A conflict
+// or a held write that did not land goes round again, up to
+// RuleWriterMaxAttempts times, and each write that lands joins res.Repaired.
+// A CarryHolds that asks for more writes than the read holds rules never
+// settles, so the repair stops there with a retriable error.
+func (w *RuleWriter) carryHolds(ctx context.Context, res *ApplyResult, id string, leaving []string) error {
+	if w.CarryHolds == nil {
+		return nil
+	}
+	for attempt, carried := 1, 0; ; {
+		set, err := w.read(ctx)
+		if err != nil {
+			return err
+		}
+		gone := set.Find(id)
+		if gone == nil {
+			return nil
+		}
+		if carried > len(set.Rules) {
+			return cpierrors.Retriable("carry what rule %q records: %d writes did not settle", id, carried)
+		}
+		ops := w.CarryHolds(ctx, set, gone, leaving)
+		if len(ops) == 0 {
+			return nil
+		}
+		op := normalizeOp(ops[0])
+		sendErr := w.send(ctx, set, op)
+		outcome := classifyRuleWrite(op, sendErr)
+		switch outcome {
+		case writeLanded:
+			addRepaired(res, op, "")
+			carried++
+			continue
+		case writeRejected:
+			return sendErr
+		case writeHeld:
+			fresh, err := w.read(ctx)
+			if err != nil {
+				return err
+			}
+			if landed(op, fresh) {
+				addRepaired(res, op, "")
+				carried++
+				continue
+			}
+		}
+		if attempt >= RuleWriterMaxAttempts {
+			return sendErr
+		}
+		if outcome == writeConflict {
+			if err := w.wait(ctx, "carry", ruleBackoff(attempt), false); err != nil {
+				return err
+			}
+		}
+		attempt++
+	}
 }
 
 // removeUnrepairable removes the pin's HA resource only when the repair

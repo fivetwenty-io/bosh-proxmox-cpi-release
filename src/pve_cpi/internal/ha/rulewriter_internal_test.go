@@ -586,6 +586,53 @@ func TestConfinementOnlyReportsTheDeleteOfARuleItLeavesTooSmall(t *testing.T) {
 	}
 }
 
+// TestConfinementOnlyCarriesWhatTheRuleItDeletesRecordsFirst pins that the
+// rewrite asks CarryHolds what keeps the record of an anti-affinity rule it
+// deletes, with a fresh read of the rules, and sends those writes before the
+// delete. Each carry write is reported among the repair's writes, and the
+// writer asks again after each one, so a carry that has landed is not sent
+// twice.
+func TestConfinementOnlyCarriesWhatTheRuleItDeletesRecordsFirst(t *testing.T) {
+	pin := ourPin("pin", true, map[string]int{"a": 2}, "vm:1")
+	api := &fakeRuleAPI{rules: []Rule{ourAA("aa", "vm:1", "vm:2"), ourAA("aa2", "vm:3", "vm:4"),
+		ourPin("p2", true, map[string]int{"a": 0}, "vm:2"), pin}}
+	w, _ := newTestWriter(api, []string{"a", "b", "c"})
+	const carried = ourMarker + " carried"
+	var asked []string
+	w.CarryHolds = func(_ context.Context, set *RuleSet, gone *Rule, leaving []string) []RuleOp {
+		asked = append(asked, gone.ID)
+		if gone.ID != "aa" || set.Find("aa") == nil || !slices.Equal(leaving, []string{"vm:1"}) {
+			t.Errorf("CarryHolds got rule %q leaving %v; want aa leaving vm:1, with a read that still holds it",
+				gone.ID, leaving)
+		}
+		next := set.Find("aa2").Clone()
+		if next.Comment == carried {
+			return nil
+		}
+		next.Comment = carried
+		return []RuleOp{{Kind: OpUpdate, Rule: next}}
+	}
+	set, err := w.read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := &ApplyResult{Set: set}
+	if err := w.confinementOnly(context.Background(), res, set.Find("pin")); err != nil {
+		t.Fatal(err)
+	}
+	wantWrites := []string{"update:aa2", "delete:aa", "update:pin"}
+	if !slices.Equal(api.writes, wantWrites) || api.find("aa2").Comment != carried {
+		t.Fatalf("writes %v rules %+v; want the carry, then the delete, then the pin", api.writes, api.rules)
+	}
+	if !slices.Equal(asked, []string{"aa", "aa"}) {
+		t.Errorf("CarryHolds was asked about %v; want aa before the carry and again after it", asked)
+	}
+	if len(res.Repaired) != 3 || res.Repaired[0].Rule.ID != "aa2" || res.Repaired[1].Kind != OpDelete ||
+		res.Repaired[1].Rule.ID != "aa" {
+		t.Fatalf("repaired = %+v; want the carry, then the delete of aa", res.Repaired)
+	}
+}
+
 func unrepairable(f *fakeRuleAPI) {
 	if p := f.find("pin"); p != nil {
 		p.Errors = []string{"resources: unrepairable"}

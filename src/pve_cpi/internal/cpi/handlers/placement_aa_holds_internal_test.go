@@ -493,3 +493,203 @@ func TestFixAntiAffinityGroups_DropsALapsedHold(t *testing.T) {
 		t.Fatalf("second fix = %+v, %v; want the group in its layout", got, err)
 	}
 }
+
+// TestPruneGroupAntiAffinityRules_CarriesTheHoldOfARuleItDeletes pins that a
+// prune that deletes a rule of one member keeps the live hold the rule
+// records. The hold moves to a rule of the group that the prune keeps, or,
+// when it keeps none in the hold's domain, to the HA resource of the member
+// the rule had left. The move lands before the delete, so after every write
+// some rule or resource of the group records the hold.
+func TestPruneGroupAntiAffinityRules_CarriesTheHoldOfARuleItDeletes(t *testing.T) {
+	t.Parallel()
+	hold := aaHold{Index: 1, VMID: 101, Until: time.Now().Add(20 * time.Minute).Unix()}
+	for name, tc := range map[string]struct {
+		vmids   []int
+		rules   map[string]string
+		carrier string
+	}{
+		"to another rule": {[]int{100, 102, 103}, map[string]string{aaRule: "vm:100", aaRule + "-2": "vm:102,vm:103"},
+			"rule " + aaRule + "-2"},
+		"to a member's resource": {[]int{100}, map[string]string{aaRule: "vm:100"}, "resource vm:100"},
+	} {
+		for _, lock := range []bool{false, true} {
+			t.Run(name+" lock "+strconv.FormatBool(lock), func(t *testing.T) {
+				t.Parallel()
+				stub := newAAStub()
+				newAAHoldFleet(stub, tc.vmids...)
+				for rule, members := range tc.rules {
+					stub.seedRule(rule, members)
+				}
+				stub.ruleComments[aaRule] = withHolds(stub.ruleComments[aaRule], []aaHold{hold})
+				deps := aaReplanDeps(stub, lock)
+				deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+				writes := 0
+				check := func(what string) {
+					writes++
+					if len(aaHoldCarriers(stub, 1)) == 0 {
+						t.Errorf("after write %d (%s) no rule or resource records the hold; rules %v, comments %v, "+
+							"resources %v", writes, what, stub.rules, stub.ruleComments, stub.resComments)
+					}
+				}
+				stub.onRuleWrite = func(rule string) { check("rule " + rule) }
+				stub.onResourceWrite = func(sid string) { check("resource " + sid) }
+				if err := pruneGroupAntiAffinityRules(context.Background(), deps, aaIdent("web"), 101,
+					log.NewNopLogger()); err != nil {
+					t.Fatalf("prune: %v", err)
+				}
+				if _, ok := stub.rules[aaRule]; ok {
+					t.Fatalf("rules = %v; want the rule of one member gone", stub.rules)
+				}
+				if got := aaHoldCarriers(stub, 1); !slices.Equal(got, []string{tc.carrier}) {
+					t.Fatalf("the hold of index 1 is recorded on %v; want %s", got, tc.carrier)
+				}
+				if got := holdsOf(aaHoldComment(stub, tc.carrier)); !slices.Equal(got, []aaHold{hold}) {
+					t.Errorf("the carrier records %v; want %v", got, []aaHold{hold})
+				}
+			})
+		}
+	}
+}
+
+// aaHoldComment returns the comment of a carrier aaHoldCarriers names.
+func aaHoldComment(stub *aaClusterStub, carrier string) string {
+	if id, ok := strings.CutPrefix(carrier, "rule "); ok {
+		return stub.ruleComments[id]
+	}
+	return stub.resComments[strings.TrimPrefix(carrier, "resource ")]
+}
+
+// TestPinRepair_CarriesTheHoldOfARuleItDeletes pins that the repair of a
+// confinement pin keeps the live hold of an anti-affinity rule it deletes,
+// with the rules lock off. An operator's pin keeps vm:101 on pve1, and vm:101
+// is the one member of the rule that records the hold. The pin write for vm:103 pins it to pve1
+// too, and a sibling writes vm:103 into the rule as that write lands. PVE then
+// keeps vm:103's pin out of effect, so the repair takes vm:103 out of the rule
+// again, which leaves one member and deletes it. The rule's hold must move
+// first, to a rule of the group the repair keeps or to the HA resource of the
+// member the rule had left, and after every write some rule or resource of
+// the group records it.
+func TestPinRepair_CarriesTheHoldOfARuleItDeletes(t *testing.T) {
+	t.Parallel()
+	hold := aaHold{Index: 2, VMID: 102, Until: time.Now().Add(20 * time.Minute).Unix()}
+	for name, tc := range map[string]struct {
+		vmids   []int
+		rules   map[string]string
+		carrier string
+	}{
+		// The heal after the repair writes the group as one rule under the
+		// base name, which the plan creates after it deletes the rule that
+		// took the hold over, so the hold moves to vm:101's resource first.
+		"to another rule, then a member's resource": {[]int{101, 103, 104, 105},
+			map[string]string{aaRule: "vm:101", aaRule + "-2": "vm:104,vm:105"}, "resource vm:101"},
+		"to a member's resource": {[]int{101, 103}, map[string]string{aaRule: "vm:101"}, "resource vm:101"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			stub := newAAStub()
+			newAAHoldFleet(stub, tc.vmids...)
+			for rule, members := range tc.rules {
+				stub.seedRule(rule, members)
+			}
+			stub.ruleComments[aaRule] = withHolds(stub.ruleComments[aaRule], []aaHold{hold})
+			stub.ruleComments[seedStrictPin(stub, 101, "pve1")] = ""
+			pin := naRuleNameFor(103)
+			pinOutWhileInRule(stub, pin, aaRule, "vm:103")
+			deps := aaReplanDeps(stub, false)
+			deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4", "pve5")
+			writes, raced, deleted := 0, false, false
+			stub.onRuleWrite = func(rule string) {
+				writes++
+				if rule == pin && !raced {
+					raced = true
+					stub.rules[aaRule] += ",vm:103"
+					stub.digest++
+				}
+				if _, ok := stub.rules[aaRule]; !ok {
+					deleted = true
+				}
+				if len(aaHoldCarriers(stub, 2)) == 0 {
+					t.Errorf("after write %d (rule %s) no rule or resource records the hold; rules %v, comments %v, "+
+						"resources %v", writes, rule, stub.rules, stub.ruleComments, stub.resComments)
+				}
+			}
+			if err := ensureNodeAffinityPin(context.Background(), deps, 103, []string{"pve1"}, true,
+				log.NewNopLogger()); err != nil {
+				t.Logf("pin write: %v", err)
+			}
+			if !raced || !deleted {
+				t.Fatalf("raced = %v, deleted = %v; want the sibling's write and the repair's delete of %s; rules %v",
+					raced, deleted, aaRule, stub.rules)
+			}
+			if got := aaHoldCarriers(stub, 2); !slices.Equal(got, []string{tc.carrier}) {
+				t.Fatalf("the hold of index 2 is recorded on %v; want %s; rules %v", got, tc.carrier, stub.rules)
+			}
+			if got := holdsOf(aaHoldComment(stub, tc.carrier)); !slices.Equal(got, []aaHold{hold}) {
+				t.Errorf("the carrier records %v; want %v", got, []aaHold{hold})
+			}
+		})
+	}
+}
+
+// TestLegacyMigration_CarriesTheHoldOfARuleItsRepairDeletes pins that a
+// legacy rule migration keeps the live hold of a group rule that the repair
+// after its write deletes. The migration only ever deletes the unmarked rule
+// of an older CPI, which records no hold, so its loss comes from that repair.
+// An operator's pin keeps vm:101 on pve1, the CPI's pin keeps vm:103 there,
+// and vm:101 is the one member of the rule that records the hold. A sibling writes vm:103 into that rule as the
+// migration's write lands, which puts vm:103's pin out of effect. The repair
+// reverts the migration's write, which does not help, and then takes vm:103
+// out of the rule, which leaves one member and deletes it. The hold must move
+// to vm:101's HA resource first.
+func TestLegacyMigration_CarriesTheHoldOfARuleItsRepairDeletes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	hold := aaHold{Index: 2, VMID: 102, Until: time.Now().Add(20 * time.Minute).Unix()}
+	stub := newAAStub()
+	markWebMembers(stub, 101, 103)
+	legacy := legacyRuleName(aaIdent("web"))
+	stub.seedRuleWithComment(legacy, "vm:100,vm:200,vm:201", "BOSH anti-affinity for instance group web")
+	stub.seedRule(aaRule, "vm:101")
+	stub.ruleComments[aaRule] = withHolds(stub.ruleComments[aaRule], []aaHold{hold})
+	stub.ruleComments[seedStrictPin(stub, 101, "pve1")] = ""
+	seedStrictPin(stub, 103, "pve1")
+	pinOutWhileInRule(stub, naRuleNameFor(103), aaRule, "vm:103")
+	deps := aaReplanDeps(stub, false)
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4", "pve5")
+	profile, err := deps.HAProfile(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writes, raced, deleted := 0, false, false
+	stub.onRuleWrite = func(rule string) {
+		writes++
+		if rule == legacy && !raced {
+			raced = true
+			stub.rules[aaRule] += ",vm:103"
+			stub.digest++
+		}
+		if _, ok := stub.rules[aaRule]; !ok {
+			deleted = true
+		}
+		if len(aaHoldCarriers(stub, 2)) == 0 {
+			t.Errorf("after write %d (rule %s) no rule or resource records the hold; rules %v, comments %v, "+
+				"resources %v", writes, rule, stub.rules, stub.ruleComments, stub.resComments)
+		}
+	}
+	logger := log.NewNopLogger()
+	var loss groupRuleLoss
+	if err := migrateLegacyAntiAffinityRule(ctx, deps, newHARuleWriter(deps, profile, logger), aaIdent("web"),
+		map[string]struct{}{"vm:100": {}}, 100, &loss, logger); err != nil {
+		t.Logf("migration: %v", err)
+	}
+	if !raced || !deleted {
+		t.Fatalf("raced = %v, deleted = %v; want the sibling's write and the repair's delete of %s; rules %v",
+			raced, deleted, aaRule, stub.rules)
+	}
+	if got := aaHoldCarriers(stub, 2); !slices.Equal(got, []string{"resource vm:101"}) {
+		t.Fatalf("the hold of index 2 is recorded on %v; want resource vm:101; rules %v", got, stub.rules)
+	}
+	if !loss.lost {
+		t.Error("the repair's delete of a group rule is not reported to the heal")
+	}
+}

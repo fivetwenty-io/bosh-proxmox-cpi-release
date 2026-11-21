@@ -1284,8 +1284,10 @@ func healAntiAffinityGroupHolding(
 // rule left with one member spreads nothing, which some PVE versions keep as a
 // rule rather than removing it. The group's rules are every rule that
 // aapattern.IsGroupRule names, its block rules and its pattern rules. A rule another Director owns, or one with no marker, is left
-// alone. It runs under the HA rules lock and reports the writer's error.
-// Without the lock, a prune that deleted a rule writes the group's rules again
+// alone. A live hold that a deleted rule records moves first to a rule of
+// the group the prune keeps, or to a member's HA resource (see carryHolds).
+// It runs under the HA rules lock and reports the writer's error. Without
+// the lock, a prune that deleted a rule writes the group's rules again
 // afterwards, with the VM kept out, as a removal does.
 func pruneGroupAntiAffinityRules(ctx context.Context, deps Deps, ident haIdentity, vmid int, logger *log.Logger) error {
 	if !ident.valid() {
@@ -1298,9 +1300,11 @@ func pruneGroupAntiAffinityRules(ctx context.Context, deps Deps, ident haIdentit
 		// No profile: a deletion only shrinks rules, as in
 		// removeAntiAffinityMembership.
 		writer := newHARuleWriter(deps, nil, logger)
+		holds := newGroupPlanner(ctx, deps, nil, ident, &groupScan{}, logger)
 		comments := map[string]string{}
 		res, err := writer.Apply(ctx, "anti-affinity prune", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			var ops []ha.RuleOp
+			deleting := map[string]bool{}
 			for i := range set.Rules {
 				r := &set.Rules[i]
 				if !aapattern.IsGroupRule(base, r.ID) || r.Type != haRuleType {
@@ -1311,8 +1315,11 @@ func pruneGroupAntiAffinityRules(ctx context.Context, deps Deps, ident haIdentit
 				}
 				ops = append(ops, ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: r.ID}})
 				comments[r.ID] = r.Comment
+				deleting[r.ID] = true
 			}
-			return ops, nil
+			// The holds of the rules that go move first, so the group never
+			// stops recording them.
+			return append(holds.carryHolds(set, deleting, haResourceSid(vmid)), ops...), nil
 		})
 		deleted, confined = writtenRuleDeletes(res, comments), confinedBy(res)
 		return err
