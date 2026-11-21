@@ -641,16 +641,15 @@ func (p *aaPlanner) resourceHoldEdits() (adds, cleanups []aaResourceHoldEdit) {
 }
 
 // writeResourceHolds sends edits through recordHolds. A planner without it,
-// such as the doctor's, records each edit that adds a hold as pending. A
+// such as the doctor's or the unlocked fast path of set_vm_metadata's join,
+// records each edit as pending instead and writes nothing. A
 // write that fails is logged once at Warn and not tried again by this
 // planner, because a hold that a resource fails to record only loses its
 // place to the next plan once this one is done.
 func (p *aaPlanner) writeResourceHolds(edits []aaResourceHoldEdit) {
 	for _, e := range edits {
 		if p.recordHolds == nil {
-			if len(e.add) > 0 {
-				p.pendingHolds = append(p.pendingHolds, e)
-			}
+			p.pendingHolds = append(p.pendingHolds, e)
 			continue
 		}
 		if p.holdWriteFailed[e.sid] {

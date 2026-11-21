@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -194,5 +195,60 @@ func TestMetadataIndex_ReadsAStringOrANumber(t *testing.T) {
 	}
 	if got := metadataIndex(map[string]any{}); got != -1 {
 		t.Errorf("metadataIndex of no index = %d; want -1", got)
+	}
+}
+
+// TestJoinAntiAffinityAtMetadata_TheFastPathWritesNoHold pins that the join's
+// fast path, which reads without the rules lock, never writes the holds a
+// member's HA resource records. A stale hold to drop, or a live hold that
+// moves to another member's resource, sends the join down the locked path,
+// and every resource write then lands under the rules lock.
+func TestJoinAntiAffinityAtMetadata_TheFastPathWritesNoHold(t *testing.T) {
+	t.Parallel()
+	live := aaHold{Index: 2, VMID: 102, Until: time.Now().Add(20 * time.Minute).Unix()}
+	for name, seed := range map[string]func(stub *aaClusterStub){
+		// The member with index 1 holds its place, so the hold of index 1
+		// is consumed and only its record is left to drop.
+		"a consumed hold": func(stub *aaClusterStub) {
+			stub.resComments["vm:100"] = withHolds(stub.resComments["vm:100"],
+				[]aaHold{{Index: 1, VMID: 99, Until: live.Until}})
+		},
+		// The deleted member's own resource records its hold, which moves
+		// to the resource of the lowest-indexed member.
+		"a hold on the deleted member": func(stub *aaClusterStub) {
+			markWebMembers(stub, 102)
+			stub.resComments["vm:102"] = withHolds(stub.resComments["vm:102"], []aaHold{live})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			stub := newAAStub()
+			stub.tagged(aaQEMU(100, aaTag+";index--0"), aaQEMU(101, aaTag+";index--1"))
+			markWebMembers(stub, 100, 101)
+			stub.seedRule(aaRule, "vm:100,vm:101")
+			seed(stub)
+			events := []string{}
+			deps := lockedMetadataDeps(stub, &events)
+			ident := aaIdent("web")
+			if rule, ok := antiAffinityJoinSettled(context.Background(), deps, ident, 101, 1); ok {
+				t.Fatalf("the fast path settled in %q; want the locked path for a hold write", rule)
+			}
+			if stub.resUpdateCalls != 0 {
+				t.Fatalf("the fast path wrote %d HA resource comments; want none", stub.resUpdateCalls)
+			}
+			stub.events = &events
+			joinAntiAffinityAtMetadata(context.Background(), deps, 101, map[string]any{"index": "1"},
+				log.NewNopLogger())
+			if stub.resUpdateCalls == 0 {
+				t.Fatal("the locked join wrote no hold")
+			}
+			locked := false
+			for _, ev := range events {
+				locked = locked || strings.HasPrefix(ev, "lock-create:")
+				if strings.HasPrefix(ev, "update-resource:") && !locked {
+					t.Fatalf("events = %v; a resource write went before the rules lock", events)
+				}
+			}
+		})
 	}
 }

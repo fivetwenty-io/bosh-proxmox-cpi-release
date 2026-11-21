@@ -184,8 +184,9 @@ type aaPlanner struct {
 	// leading counts the writes of the last plan that go before the writes
 	// that record a hold.
 	leading int
-	// pendingHolds holds the resource writes the last plan would send
-	// without recordHolds.
+	// pendingHolds holds the resource writes the last plan would send, the
+	// ones that add a hold and the ones that only drop stale holds, when it
+	// has no recordHolds.
 	pendingHolds []aaResourceHoldEdit
 	// holdWriteFailed holds the resources whose hold write failed, which the
 	// planner does not write again.

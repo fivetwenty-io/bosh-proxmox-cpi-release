@@ -238,6 +238,9 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 		}
 	}
 	for _, e := range p.pendingHolds {
+		if len(e.add) == 0 {
+			continue
+		}
 		c.Drift = append(c.Drift, fmt.Sprintf("record the holds %s on the HA resource %s", formatAAHolds(e.add),
 			e.sid))
 	}
