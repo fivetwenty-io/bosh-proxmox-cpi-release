@@ -161,7 +161,7 @@ func TestCollectScopedEntriesSplitFindingsByBand(t *testing.T) {
 		}
 	}
 	highSpread := findings(high, haKindSpreadSkewed)[0].Detail
-	for _, s := range []string{"A rebalance would make 1 move that pulls apart", "the cpi_config entry high,"} {
+	for _, s := range []string{"A rebalance would make 1 separation move. It moves", "the cpi_config entry high,"} {
 		if !strings.Contains(highSpread, s) {
 			t.Errorf("entry high's advice lacks %q: %s", s, highSpread)
 		}

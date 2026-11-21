@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -158,14 +159,24 @@ func TestCollectSpreadSkewedCountsSeparationMoves(t *testing.T) {
 	f := haBaseFake()
 	f.plan = separationPlan()
 	want(t, runCollect(t, f, haCfg("auto", "none")), haKindSpreadSkewed, haSeverityAdvice, "prod-east",
-		"A rebalance would make 2 moves that pull apart members of an anti-affinity rule sharing a node",
+		"A rebalance would make 2 separation moves. Each one moves a member of an anti-affinity rule off a node "+
+			"that holds another member of the same rule, or moves a member of an anti-affinity group off a node "+
+			"that holds more of the group's members than its share. A group's share of a node is the number of "+
+			"members its rules name, divided by the number of nodes those members may run on, rounded up.",
 		"pve-ops ha rebalance --director-uuid "+haDirector)
 
 	f = haBaseFake()
 	f.plan = separationPlan()
 	f.plan.Moves = f.plan.Moves[:1]
 	want(t, runCollect(t, f, haCfg("auto", "none")), haKindSpreadSkewed, haSeverityAdvice,
-		"A rebalance would make 1 move that pulls apart members of an anti-affinity rule sharing a node")
+		"A rebalance would make 1 separation move. It moves a member of an anti-affinity rule off a node that "+
+			"holds another member of the same rule, or moves a member of an anti-affinity group off a node that "+
+			"holds more of the group's members than its share.")
+	for _, d := range findings(runCollect(t, f, haCfg("auto", "none")), haKindSpreadSkewed) {
+		if strings.Contains(d.Detail, "pull apart") || strings.Contains(d.Detail, "sharing a node") {
+			t.Errorf("the advice says separation only pulls apart rule members that share a node: %s", d.Detail)
+		}
+	}
 }
 
 // TestCollectSpreadSkewedStatesOnlyNonzeroClauses pins the whole advice for a
@@ -175,7 +186,10 @@ func TestCollectSpreadSkewedStatesOnlyNonzeroClauses(t *testing.T) {
 	t.Parallel()
 	run := "Run pve-ops ha rebalance --director-uuid " + haDirector +
 		" to see the moves a rebalance would make, and add --apply to make them."
-	apart := "A rebalance would make 2 moves that pull apart members of an anti-affinity rule sharing a node."
+	apart := "A rebalance would make 2 separation moves. Each one moves a member of an anti-affinity rule off a " +
+		"node that holds another member of the same rule, or moves a member of an anti-affinity group off a node " +
+		"that holds more of the group's members than its share. A group's share of a node is the number of " +
+		"members its rules name, divided by the number of nodes those members may run on, rounded up."
 	outside := "2 HA VMs of this Director run outside their AZ."
 	for name, tc := range map[string]struct {
 		plan func() handlers.RebalanceReport

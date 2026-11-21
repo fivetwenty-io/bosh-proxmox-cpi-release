@@ -69,6 +69,28 @@ func (c *haCollector) rebalancePendingFindings() {
 	}
 }
 
+// separationAdvice states the count of the plan's separation moves and what
+// that phase moves, the way harebalance plans it. The phase moves a member of
+// a rule off a node that holds another member of that rule, and then moves
+// members of a group off a node that holds more of the group's members than
+// its share, which is the number of members the group's rules name divided by
+// the number of nodes those members may run on, rounded up. Members of one
+// group that sit in different rules and share a node only make the second
+// kind of move.
+func separationAdvice(n int) string {
+	what := "It moves a member of an anti-affinity rule off a node that holds another member of the same rule, or " +
+		"moves a member of an anti-affinity group off a node that holds more of the group's members than its share."
+	if n != 1 {
+		what = "Each one" + strings.TrimPrefix(what, "It")
+	}
+	moves := "moves"
+	if n == 1 {
+		moves = "move"
+	}
+	return fmt.Sprintf("A rebalance would make %d separation %s. %s A group's share of a node is the number of "+
+		"members its rules name, divided by the number of nodes those members may run on, rounded up.", n, moves, what)
+}
+
 // rebalanceRunAdvice names the dry run that lists the moves spreadSkewedFindings
 // counts. Under --cpi-config the doctor plans with the entry's settings, which
 // pve-ops ha rebalance takes from a request, and counts only the moves of VMs
@@ -98,8 +120,8 @@ func (c *haCollector) rebalanceRunAdvice(planned int) string {
 }
 
 // spreadSkewedFindings advises a rebalance when the dry run of pve-ops ha
-// rebalance would move a VM back into its AZ or pull apart two members of an
-// anti-affinity rule that share a node, or when the spread of committed
+// rebalance would move a VM back into its AZ or make a separation move (see
+// separationAdvice), or when the spread of committed
 // memory across the nodes passes the rebalance's start threshold. The advice
 // never fails the doctor, and it appears only when the doctor's own reads and
 // the dry run's reads succeeded, because a plan built on a failed read could
@@ -152,12 +174,7 @@ func (c *haCollector) spreadSkewedFindings() {
 		detail = append(detail, fmt.Sprintf("%d %s.", outside, vms))
 	}
 	if separate > 0 {
-		moves := "moves that pull"
-		if separate == 1 {
-			moves = "move that pulls"
-		}
-		detail = append(detail, fmt.Sprintf("A rebalance would make %d %s apart members of an anti-affinity rule "+
-			"sharing a node.", separate, moves))
+		detail = append(detail, separationAdvice(separate))
 	}
 	if skewed {
 		detail = append(detail, fmt.Sprintf("The committed memory of the nodes spreads %d points from the fullest "+
