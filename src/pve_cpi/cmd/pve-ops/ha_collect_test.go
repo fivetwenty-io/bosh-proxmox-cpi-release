@@ -2776,3 +2776,30 @@ func TestCollectParkerLeftoversNeedThisDirectorsParker(t *testing.T) {
 	colocation.rules[0].Type = ha.RuleTypeResourceAffinity
 	wantNone(t, runCollect(t, colocation, parkedCfg()), haKindParkerPinOrphan)
 }
+
+// TestCollectCPUFindingsSkipVMsOutsideTheEntryBand puts a host-typed VM that
+// another Director's CPI created next to one inside the entry's VM ID band. The
+// entry judges only the second.
+func TestCollectCPUFindingsSkipVMsOutsideTheEntryBand(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	f.profile.CPUDomains = []ha.CPUDomain{
+		{Model: "EPYC", Nodes: []string{"n1", "n2"}},
+		{Model: "XEON", Nodes: []string{"n3"}},
+	}
+	f.guests, f.resources = nil, nil
+	for _, id := range []int{3945, 210001} {
+		f.guests = append(f.guests, pve.GuestRef{VMID: id, Node: "n1", Name: "vm-" + itoa(id), Tags: "bosh-cpi", Status: "running"})
+		f.memory[id] = haGiB
+		f.configs[id] = map[string]any{"cpu": "host", "scsi0": "nfs1:" + itoa(id) + "/vm-" + itoa(id) + "-disk-0.raw,size=10G"}
+		f.resources = append(f.resources, HAResourceRow{SID: "vm:" + itoa(id), State: "started", Comment: haMarker})
+	}
+	scope := &haEntryScope{Band: pve.VMIDBand{Start: 210000, End: 210199}, Leader: true}
+	r := collectHAScoped(context.Background(), f, haCfg("auto", "none"), "", haNow, scope)
+	want(t, r, haKindCPUHostMulti, haSeverityProblem, "vm:210001")
+	for _, fd := range findings(r, haKindCPUHostMulti) {
+		if fd.Subject == "vm:3945" {
+			t.Errorf("a VM outside the entry's band must not be judged: %+v", fd)
+		}
+	}
+}

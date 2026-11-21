@@ -977,7 +977,7 @@ func (c *haCollector) cpuFindings() {
 		return
 	}
 	for _, g := range c.guests {
-		if !g.owned || g.ref.Template || g.cfg == nil {
+		if !g.owned || g.ref.Template || g.cfg == nil || !c.judgesVM(g) {
 			continue
 		}
 		cpu, _ := pve.ConfigStringValue(g.cfg["cpu"])
