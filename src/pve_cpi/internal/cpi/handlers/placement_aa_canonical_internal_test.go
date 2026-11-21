@@ -255,7 +255,7 @@ func TestAntiAffinity_RollsKeepThePlannerAndTheDoctorInAgreement(t *testing.T) {
 		for b := 0; b < size; b += mif {
 			batches = append(batches, order[b:min(b+mif, size)])
 		}
-		var events [][]string
+		events := make([][]string, 0, len(batches))
 		for _, batch := range batches {
 			events = append(events, aaRollEvents(r, batch))
 		}

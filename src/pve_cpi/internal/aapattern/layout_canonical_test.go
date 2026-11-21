@@ -54,9 +54,9 @@ func joinInOrder(in Input, order []int) map[string][]string {
 // rules and the rendered rules of every plan.
 func joinSteps(in Input, steps [][]int) (map[string][]string, []string) {
 	rules := map[string][]string{}
-	var seen []string
+	seen := make([]string, 0, len(steps))
 	for _, known := range steps {
-		var ms []Member
+		ms := make([]Member, 0, len(in.Members))
 		for _, m := range in.Members {
 			if !slices.Contains(known, m.Index) {
 				m.Index, m.Joinable = -1, false
@@ -90,7 +90,7 @@ func TestLayout_AnyJoinOrderGivesTheCanonicalLayout(t *testing.T) {
 		if multi {
 			doms = map[string]Domain{"az1": {Ord: 1, Nodes: nodes}, "az2": {Ord: 2, Nodes: 3 + r.Intn(3)}}
 		}
-		var ms []Member
+		ms := make([]Member, 0, size)
 		for i := range size {
 			d := ""
 			if multi {
@@ -198,62 +198,84 @@ func TestLayout_RollsMoveNoMemberButTheRecreatedOnes(t *testing.T) {
 		split := r.Intn(4) != 0
 		in := Input{Base: base, Pattern: mustParse(t, pattern), Split: split, Domains: oneDomain(nodes),
 			Members: members("", seq(size)...)}
-		rules := Layout(in).Rules
-		start := rulesOf(rules)
 		name := fmt.Sprintf("case %d, %s on %d nodes, %d members, max_in_flight %d, split=%v", iter, pattern, nodes,
 			size, mif, split)
-		keys := map[int]string{}
-		for i := range size {
-			keys[i] = key(i)
+		testRoll(t, r, name, in, size, mif)
+	}
+}
+
+// testRoll runs one case of TestLayout_RollsMoveNoMemberButTheRecreatedOnes:
+// a roll of the size members of in, max_in_flight at a time, in a random
+// order and interleaving.
+func testRoll(t *testing.T, r *rand.Rand, name string, in Input, size, mif int) {
+	t.Helper()
+	rules := Layout(in).Rules
+	start := rulesOf(rules)
+	keys := map[int]string{}
+	for i := range size {
+		keys[i] = key(i)
+	}
+	order := r.Perm(size)
+	for b := 0; b < size; b += mif {
+		batch := order[b:min(b+mif, size)]
+		state := map[int]string{}
+		for _, ev := range rollBatch(r, batch) {
+			state[ev.index] = ev.kind
+			switch ev.kind {
+			case "delete":
+				rules = withoutMember(rules, keys[ev.index])
+			case "stage":
+				keys[ev.index] = fmt.Sprintf("vm:%d", 1000*(b+1)+ev.index)
+			}
+			step := in
+			step.Members, step.Rules = rollMembers(size, state, keys), rules
+			rules = Layout(step).Rules
+			where := fmt.Sprintf("%s, batch %v, after the %s of %d", name, batch, ev.kind, ev.index)
+			checkRollStep(t, where, rules, start, state, keys, size)
 		}
-		order := r.Perm(size)
-		for b := 0; b < size; b += mif {
-			batch := order[b:min(b+mif, size)]
-			state := map[int]string{}
-			for _, ev := range rollBatch(r, batch) {
-				state[ev.index] = ev.kind
-				switch ev.kind {
-				case "delete":
-					gone := keys[ev.index]
-					for rn, rk := range rules {
-						rules[rn] = slices.DeleteFunc(slices.Clone(rk), func(k string) bool { return k == gone })
-						if len(rules[rn]) < 2 {
-							delete(rules, rn)
-						}
-					}
-				case "stage":
-					keys[ev.index] = fmt.Sprintf("vm:%d", 1000*(b+1)+ev.index)
-				}
-				step := in
-				step.Members, step.Rules = rollMembers(size, state, keys), rules
-				rules = Layout(step).Rules
-				placed := rulesOf(rules)
-				where := fmt.Sprintf("%s, batch %v, after the %s of %d", name, batch, ev.kind, ev.index)
-				for i := range size {
-					from := start[key(i)]
-					for _, rn := range placed[keys[i]] {
-						if !slices.Contains(from, rn) {
-							t.Fatalf("%s: index %d is in %s; it started in %v (rules %s)", where, i, rn, from,
-								render(rules))
-						}
-					}
-					if state[i] != "" && state[i] != "join" {
-						continue
-					}
-					for _, rn := range from {
-						if rules[rn] != nil && !slices.Contains(placed[keys[i]], rn) {
-							t.Fatalf("%s: index %d is out of %s, which is still written (rules %s)", where, i, rn,
-								render(rules))
-						}
-					}
-				}
+	}
+	end := rulesOf(rules)
+	for i := range size {
+		if !slices.Equal(end[keys[i]], start[key(i)]) {
+			t.Fatalf("%s: index %d ends in %v; it started in %v (rules %s)", name, i, end[keys[i]],
+				start[key(i)], render(rules))
+		}
+	}
+}
+
+// withoutMember returns rules with gone taken out, and with every rule that
+// is left with fewer than two members dropped, the way a delete leaves them.
+func withoutMember(rules map[string][]string, gone string) map[string][]string {
+	out := map[string][]string{}
+	for rn, rk := range rules {
+		rest := slices.DeleteFunc(slices.Clone(rk), func(k string) bool { return k == gone })
+		if len(rest) >= 2 {
+			out[rn] = rest
+		}
+	}
+	return out
+}
+
+// checkRollStep fails the test when a member is in a rule its index did not
+// start in, or when a member that is present and indexed is out of a rule it
+// started in that is still written.
+func checkRollStep(t *testing.T, where string, rules, start map[string][]string, state map[int]string,
+	keys map[int]string, size int) {
+	t.Helper()
+	placed := rulesOf(rules)
+	for i := range size {
+		from := start[key(i)]
+		for _, rn := range placed[keys[i]] {
+			if !slices.Contains(from, rn) {
+				t.Fatalf("%s: index %d is in %s; it started in %v (rules %s)", where, i, rn, from, render(rules))
 			}
 		}
-		end := rulesOf(rules)
-		for i := range size {
-			if !slices.Equal(end[keys[i]], start[key(i)]) {
-				t.Fatalf("%s: index %d ends in %v; it started in %v (rules %s)", name, i, end[keys[i]],
-					start[key(i)], render(rules))
+		if state[i] != "" && state[i] != "join" {
+			continue
+		}
+		for _, rn := range from {
+			if rules[rn] != nil && !slices.Contains(placed[keys[i]], rn) {
+				t.Fatalf("%s: index %d is out of %s, which is still written (rules %s)", where, i, rn, render(rules))
 			}
 		}
 	}
