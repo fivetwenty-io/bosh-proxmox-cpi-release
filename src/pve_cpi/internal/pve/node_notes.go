@@ -95,7 +95,8 @@ func WarnNotesNearMisses(logger *log.Logger, report *NodeHealthReport, op string
 	if report == nil {
 		return
 	}
-	for _, e := range report.Nodes {
+	for i := range report.Nodes {
+		e := &report.Nodes[i]
 		for _, line := range e.NotesNearMiss {
 			logger.Warn(op+": a line in the node's notes looks like a maintenance marker but is not one, so the "+
 				"node stays in placement; write it as \"tags: <tag>\" at the start of its own line to take the "+

@@ -309,13 +309,13 @@ func gatherNodeHealth(
 // notesUnreadNodes names the nodes whose notes report could not read, in the
 // report's order.
 func notesUnreadNodes(report *pve.NodeHealthReport) []string {
-	var nodes []string
-	for _, e := range report.Nodes {
-		if e.NotesUnread {
-			nodes = append(nodes, e.Name)
+	var unread []string
+	for i := range report.Nodes {
+		if report.Nodes[i].NotesUnread {
+			unread = append(unread, report.Nodes[i].Name)
 		}
 	}
-	return nodes
+	return unread
 }
 
 // gatherResourceFacts reads node compute counters and tallies QEMU guest
