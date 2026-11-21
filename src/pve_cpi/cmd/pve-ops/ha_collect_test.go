@@ -448,6 +448,39 @@ func TestCollectMaintenanceStranded(t *testing.T) {
 	want(t, runCollect(t, f, haCfg("auto", "none")), haKindMaintenanceStranded, haSeverityProblem, "pin names no other node")
 }
 
+// TestCollectMaintenanceStrandedJudgesTheNodesPVEMovesTo pins that the
+// stranded reason uses the nodes the CRM would move the VM to, which are the
+// online nodes out of HA maintenance. A node in maintenance only by the
+// marker in its notes, or one the CPI won't place on for its own reasons,
+// still takes the VM, so a strict pin that names it is no reason. A cluster
+// whose every other node is offline or in HA maintenance leaves the VM
+// nowhere to go, which is a reason even without a pin.
+func TestCollectMaintenanceStrandedJudgesTheNodesPVEMovesTo(t *testing.T) {
+	t.Parallel()
+	for name, n2 := range map[string]pve.NodeHealthEntry{
+		"notes marker": {Name: "n2", Health: pve.NodeHealthMaintenance, Maintenance: true, NotesTag: "maintenance",
+			ProxyTarget: true, Reason: `its notes carry the maintenance tag "maintenance"`},
+		"not placeable": {Name: "n2", Health: pve.NodeHealthOnline, ProxyTarget: true,
+			Reason: "the CPI does not place on it"},
+	} {
+		f := maintenanceFake()
+		f.profile.Health.Nodes[1] = n2
+		f.rules = []ha.Rule{pinRule(100, haMarker, "n1", "n2")}
+		r := runCollect(t, f, haCfg("auto", "none"))
+		want(t, r, haKindMaintenanceStranded, haSeverityAdvice, "vm:100", "PVE is expected to move it")
+		if r.Problems() != 0 {
+			t.Errorf("%s: a pin that names a node PVE moves to must not be a reason: %+v", name, r.Findings)
+		}
+	}
+
+	f := maintenanceFake()
+	f.profile.Health.Nodes[1] = pve.NodeHealthEntry{Name: "n2", Health: pve.NodeHealthMaintenance, Maintenance: true,
+		ProxyTarget: true}
+	f.profile.Nodes[2].Online = false
+	want(t, runCollect(t, f, haCfg("auto", "none")), haKindMaintenanceStranded, haSeverityProblem, "vm:100",
+		"no other online node is out of HA maintenance")
+}
+
 // TestCollectMaintenanceStrandedNeverBlamesASoftPin: PVE moves a soft-pinned
 // VM off a node in maintenance, so a soft pin is never the reason a VM cannot
 // leave. With no reason the finding is advice that says PVE should move it.

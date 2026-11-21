@@ -1343,12 +1343,16 @@ func (c *haCollector) maintenanceStrandedFindings() {
 
 // cannotLeaveReason says why a service on a node in maintenance has no node to
 // move to, or returns nothing when the doctor sees no such reason. It starts
-// from the other nodes that can take work and narrows them the way PVE does: a
-// strict pin keeps only its nodes, and then each node that holds an active
-// partner from the VM's own negative resource-affinity rules drops out. The
-// first step that leaves no node gives the reason.
+// from the nodes PVE would move the service to, which recoveryNodes gives, and
+// narrows them the way PVE does: a strict pin keeps only its nodes, and then
+// each node that holds an active partner from the VM's own negative
+// resource-affinity rules drops out. The first step that leaves no node gives
+// the reason.
 func (c *haCollector) cannotLeaveReason(g *haGuest) string {
-	takers := c.takerNodes(g.ref.Node)
+	takers := c.recoveryNodes(g.ref.Node)
+	if len(takers) == 0 {
+		return ", and no other online node is out of HA maintenance"
+	}
 	if pin := c.pinOf(g.ref.VMID); c.rulesOK && pin != nil && !pin.Disabled && pin.Strict {
 		takers = slices.DeleteFunc(takers, func(n string) bool { return !hasNode(pin.Nodes, n) })
 		if len(takers) == 0 {
@@ -1359,24 +1363,6 @@ func (c *haCollector) cannotLeaveReason(g *haGuest) string {
 		return ", and every other node that can take it holds a partner from its anti-affinity rules"
 	}
 	return ""
-}
-
-// takerNodes returns the online nodes other than from that can take work: out
-// of maintenance and placeable. A node the health report doesn't list counts,
-// because the doctor can't show that it refuses work.
-func (c *haCollector) takerNodes(from string) []string {
-	var out []string
-	for i := range c.p.Nodes {
-		n := &c.p.Nodes[i]
-		if !n.Online || n.Name == from {
-			continue
-		}
-		if h, ok := healthEntry(c.p, n.Name); ok && (h.Maintenance || !h.Placeable) {
-			continue
-		}
-		out = append(out, n.Name)
-	}
-	return out
 }
 
 // recoveryStrandedFindings reports each HA VM the HA manager holds in the
@@ -1447,8 +1433,12 @@ func (c *haCollector) recoveryGuest(sid string) *haGuest {
 	return g
 }
 
-// recoveryNodes returns the online nodes other than from that are not in
-// maintenance, which are the nodes PVE may recover a service onto.
+// recoveryNodes returns the online nodes other than from that are not in PVE
+// HA maintenance, which are the nodes the CRM may move or recover a service
+// onto. The CRM knows nothing of the CPI's own placement filters or of the
+// maintenance marker in a node's notes, so a node the CPI won't place on still
+// counts. A node the health report doesn't list counts too, because the doctor
+// can't show that the CRM refuses it.
 func (c *haCollector) recoveryNodes(from string) []string {
 	var out []string
 	for i := range c.p.Nodes {
