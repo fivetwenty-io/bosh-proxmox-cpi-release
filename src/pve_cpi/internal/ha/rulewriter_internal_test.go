@@ -761,3 +761,58 @@ func TestRemovalBlocker(t *testing.T) {
 		t.Fatal("a container sid parsed as a VM")
 	}
 }
+
+// TestRepairCarriesTheResourceHoldsBeforeItRemovesTheResource pins that the
+// last step of an unrepairable pin's repair asks CarryResourceHolds what
+// keeps the records the VM's HA resource carries, sends those writes before
+// it removes the resource, and keeps the resource when the carry fails.
+func TestRepairCarriesTheResourceHoldsBeforeItRemovesTheResource(t *testing.T) {
+	const carried = ourMarker + " carried"
+	for name, fail := range map[string]bool{"carried": false, "carry fails": true} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeRuleAPI{evaluate: unrepairable, rules: []Rule{ourAA("aa", "vm:2", "vm:3")}}
+			w, _ := newTestWriter(api, nil)
+			var removed []string
+			var asked []string
+			w.Repair = RepairDeps{StagedIgnored: func(string) bool { return true },
+				RemoveResource: func(_ context.Context, sid string) error {
+					if api.find("aa").Comment != carried {
+						t.Errorf("the resource went before the carry landed; writes %v", api.writes)
+					}
+					removed = append(removed, sid)
+					return nil
+				}}
+			w.CarryResourceHolds = func(_ context.Context, set *RuleSet, sid string) ([]RuleOp, error) {
+				asked = append(asked, sid)
+				if fail {
+					return nil, errors.New("the HA resources could not be listed")
+				}
+				next := set.Find("aa").Clone()
+				if next.Comment == carried {
+					return nil, nil
+				}
+				next.Comment = carried
+				return []RuleOp{{Kind: OpUpdate, Rule: next}}, nil
+			}
+			_, err := w.Apply(context.Background(), "t", func(set *RuleSet) ([]RuleOp, error) {
+				if set.Find("pin") == nil {
+					return []RuleOp{{Kind: OpCreate, Rule: ourPin("pin", true, map[string]int{"a": 0}, "vm:101")}}, nil
+				}
+				return nil, nil
+			})
+			if fail {
+				if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || len(removed) != 0 {
+					t.Fatalf("err = %v, removed %v; want the resource kept with a retriable error", err, removed)
+				}
+				return
+			}
+			if err != nil || !slices.Equal(removed, []string{"vm:101"}) {
+				t.Fatalf("err = %v, removed %v; want vm:101 removed", err, removed)
+			}
+			if !slices.Equal(asked, []string{"vm:101", "vm:101"}) {
+				t.Errorf("CarryResourceHolds was asked about %v; want vm:101 before the carry and again after it",
+					asked)
+			}
+		})
+	}
+}

@@ -129,6 +129,14 @@ type RuleWriter struct {
 	// error means it can't keep the record, and the repair stops with it
 	// before the delete.
 	CarryHolds func(ctx context.Context, set *RuleSet, gone *Rule, leaving []string) ([]RuleOp, error)
+	// CarryResourceHolds, when set, does for the HA resource sid what
+	// CarryHolds does for a rule, before the last step of a repair removes
+	// that resource: it returns the rule writes that keep what the
+	// resource's comment records for others, such as an anti-affinity hold,
+	// and may write another resource's comment itself. The repair asks again
+	// after each write until it returns none, and an error keeps the
+	// resource.
+	CarryResourceHolds func(ctx context.Context, set *RuleSet, sid string) ([]RuleOp, error)
 }
 
 // ApplyResult is what one Apply did.
@@ -665,7 +673,7 @@ func (w *RuleWriter) repairPin(
 	}
 
 	// 3. Remove the HA resource only when that is proven safe.
-	return w.removeUnrepairable(ctx, label, res.Set.Find(id))
+	return w.removeUnrepairable(ctx, label, res, res.Set.Find(id))
 }
 
 // revert undoes res.Wrote, newest first, each under the digest of a fresh
@@ -808,19 +816,41 @@ func (w *RuleWriter) carryHolds(ctx context.Context, res *ApplyResult, id string
 	if w.CarryHolds == nil {
 		return nil
 	}
+	return w.carry(ctx, res, "rule "+strconv.Quote(id), func(set *RuleSet) ([]RuleOp, error) {
+		gone := set.Find(id)
+		if gone == nil {
+			return nil, nil
+		}
+		return w.CarryHolds(ctx, set, gone, leaving)
+	})
+}
+
+// carryResourceHolds sends the writes CarryResourceHolds returns for the HA
+// resource sid that a repair is about to remove, the way carryHolds does for
+// a rule.
+func (w *RuleWriter) carryResourceHolds(ctx context.Context, res *ApplyResult, sid string) error {
+	if w.CarryResourceHolds == nil {
+		return nil
+	}
+	return w.carry(ctx, res, "HA resource "+sid, func(set *RuleSet) ([]RuleOp, error) {
+		return w.CarryResourceHolds(ctx, set, sid)
+	})
+}
+
+// carry sends, one per fresh read, the writes ask returns for that read,
+// until it returns none (see carryHolds). what names the thing that goes.
+func (w *RuleWriter) carry(
+	ctx context.Context, res *ApplyResult, what string, ask func(set *RuleSet) ([]RuleOp, error),
+) error {
 	for attempt, carried := 1, 0; ; {
 		set, err := w.read(ctx)
 		if err != nil {
 			return err
 		}
-		gone := set.Find(id)
-		if gone == nil {
-			return nil
-		}
 		if carried > len(set.Rules) {
-			return cpierrors.Retriable("carry what rule %q records: %d writes did not settle", id, carried)
+			return cpierrors.Retriable("carry what %s records: %d writes did not settle", what, carried)
 		}
-		ops, err := w.CarryHolds(ctx, set, gone, leaving)
+		ops, err := ask(set)
 		if err != nil {
 			return err
 		}
@@ -862,8 +892,12 @@ func (w *RuleWriter) carryHolds(ctx context.Context, res *ApplyResult, id string
 
 // removeUnrepairable removes the pin's HA resource only when the repair
 // dependencies prove it safe, and otherwise keeps it and returns a retriable
-// error that names the VM and the rule.
-func (w *RuleWriter) removeUnrepairable(ctx context.Context, label string, pin *Rule) (string, error) {
+// error that names the VM and the rule. What the resource's comment records
+// for others moves first (see carryResourceHolds), and a carry that fails
+// keeps the resource too.
+func (w *RuleWriter) removeUnrepairable(ctx context.Context, label string, res *ApplyResult, pin *Rule) (
+	string, error,
+) {
 	if pin == nil || len(pin.Resources) == 0 {
 		return "confinement pin left without resources after its repair", nil
 	}
@@ -876,8 +910,14 @@ func (w *RuleWriter) removeUnrepairable(ctx context.Context, label string, pin *
 	if rd.RemoveResource == nil {
 		return keep("no removal path is available")
 	}
+	remove := func() error {
+		if err := w.carryResourceHolds(ctx, res, sid); err != nil {
+			return fmt.Errorf("what its comment records could not be moved first: %w", err)
+		}
+		return rd.RemoveResource(ctx, sid)
+	}
 	if rd.StagedIgnored != nil && rd.StagedIgnored(sid) {
-		if err := rd.RemoveResource(ctx, sid); err != nil {
+		if err := remove(); err != nil {
 			return keep(fmt.Sprintf("removing the staged resource failed: %v", err))
 		}
 		return fmt.Sprintf("confinement pin %q could not be repaired, so the staged resource %s was removed",
@@ -901,7 +941,7 @@ func (w *RuleWriter) removeUnrepairable(ctx context.Context, label string, pin *
 	if why := removalBlocker(st, sid, uid); why != "" {
 		return keep(why)
 	}
-	if err := rd.RemoveResource(ctx, sid); err != nil {
+	if err := remove(); err != nil {
 		return keep(fmt.Sprintf("the removal failed: %v", err))
 	}
 	return fmt.Sprintf("confinement pin %q could not be repaired, so the resource %s was removed", pin.ID, sid), nil

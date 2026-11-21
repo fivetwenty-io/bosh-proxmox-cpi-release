@@ -785,3 +785,69 @@ func TestPruneGroupAntiAffinityRules_KeepsARuleWhoseHoldItCannotCarry(t *testing
 		})
 	}
 }
+
+// TestCarryResourceHolds_MovesTheHoldsOfAResourceARepairRemoves pins the
+// rule writer's CarryResourceHolds. Before the repair of a confinement pin
+// removes vm:100's HA resource, the live hold that resource records moves to
+// a rule of the group that keeps two members without vm:100, or to another
+// member's resource, and a failed listing of the HA resources stops the
+// removal with a retriable error.
+func TestCarryResourceHolds_MovesTheHoldsOfAResourceARepairRemoves(t *testing.T) {
+	t.Parallel()
+	hold := aaHold{Index: 1, VMID: 101, Until: time.Now().Add(20 * time.Minute).Unix()}
+	for name, tc := range map[string]struct {
+		vmids   []int
+		rules   map[string]string
+		listErr error
+		carrier string
+	}{
+		"to a rule": {vmids: []int{100, 102, 103},
+			rules:   map[string]string{aaRule: "vm:100,vm:102", aaRule + "-2": "vm:102,vm:103"},
+			carrier: "rule " + aaRule + "-2"},
+		"to a member's resource": {vmids: []int{100, 102}, rules: map[string]string{aaRule: "vm:100,vm:102"},
+			carrier: "resource vm:102"},
+		"a failed listing": {vmids: []int{100, 102}, listErr: errors.New("connection refused"),
+			carrier: "resource vm:100"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			stub := newAAStub()
+			newAAHoldFleet(stub, tc.vmids...)
+			for rule, members := range tc.rules {
+				stub.seedRule(rule, members)
+			}
+			stub.resComments["vm:100"] = withHolds(stub.resComments["vm:100"], []aaHold{hold})
+			deps := aaReplanDeps(stub, false)
+			deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+			stub.listHaResErr = tc.listErr
+			carry := carryResourceHolds(deps, log.NewNopLogger())
+			for range 4 {
+				set, err := readHARuleSet(context.Background(), stub)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ops, err := carry(context.Background(), set, "vm:100")
+				if tc.listErr != nil {
+					if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+						t.Fatalf("err = %v; want a retriable error", err)
+					}
+					break
+				}
+				if err != nil {
+					t.Fatalf("carry: %v", err)
+				}
+				if len(ops) == 0 {
+					break
+				}
+				r := ops[0].Rule
+				stub.ruleComments[r.ID] = r.Comment
+			}
+			got := slices.DeleteFunc(aaHoldCarriers(stub, 1), func(c string) bool {
+				return c == "resource vm:100" && tc.carrier != c
+			})
+			if !slices.Equal(got, []string{tc.carrier}) {
+				t.Fatalf("the hold of index 1 is recorded on %v; want %s", got, tc.carrier)
+			}
+		})
+	}
+}

@@ -247,6 +247,7 @@ func newHARuleWriterFor(deps Deps, profile *ha.Profile, logger *log.Logger, deci
 		},
 	}
 	writer.CarryHolds = carryRepairHolds(deps, logger)
+	writer.CarryResourceHolds = carryResourceHolds(deps, logger)
 	if decision != nil {
 		writer.Repair = decision.RepairDeps(
 			func(ctx context.Context, vmid int) (*pve.HAServiceState, error) {
