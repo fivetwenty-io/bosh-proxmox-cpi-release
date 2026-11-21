@@ -56,7 +56,7 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
   - The record is a `hold=<index>.<vmid>@<unix-until>` field in the `bosh-cpi:v1` comment of one of the group's rules, with several holds separated by commas.
 
-  - The hold goes first on the rule the deleted member leaves, so the write that takes the member out records the hold and the recreate's join drops it again, with no write of its own for either. When that rule goes, the hold goes next on the group's lowest-numbered rule in the member's domain that exists already, and failing that on the HA resource of the domain's lowest-indexed member. A rule that the plan creates records a hold only when the domain has no member resource either, because the plan writes its deletes before its creates.
+  - The hold goes first on the rule the deleted member leaves, so the write that takes the member out records the hold and the recreate's join drops it again, with no write of its own for either. When that rule goes, the hold goes next on the group's lowest-numbered rule in the member's domain that exists already, and failing that on the HA resource of the domain's lowest-indexed member. A rule that the same plan creates is the last resort, and it records a hold only when the domain has no member's HA resource either, because the plan writes its deletes before its creates.
 
   - A hold is written before the delete of the rule that frees its place. A prune of a rule left with one member, and the repair of a confinement pin that deletes a rule, first move the rule's live holds to another rule of the group or to a member's HA resource, so after every write some rule or resource of the group records each live hold.
 
