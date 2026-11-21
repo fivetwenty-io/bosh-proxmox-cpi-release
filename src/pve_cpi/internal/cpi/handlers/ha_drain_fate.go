@@ -144,8 +144,7 @@ func (d *drainDecider) softPinOn(sid string) string {
 }
 
 // drainSoftPinHolds reports whether r is an enabled soft node-affinity rule
-// for sid whose highest priority class holds node alone. It reads a pin the
-// way the doctor's maintenance_stranded finding does.
+// for sid whose highest priority class holds node alone.
 func drainSoftPinHolds(r *ha.Rule, sid, node string) bool {
 	if r.Disabled || r.Strict || r.Type != ha.RuleTypeNodeAffinity || !r.HasResource(sid) {
 		return false

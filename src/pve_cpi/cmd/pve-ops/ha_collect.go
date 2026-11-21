@@ -1226,9 +1226,19 @@ func (c *haCollector) maintenanceStrandedFindings() {
 		if !c.inMaintenance(g.ref.Node) {
 			continue
 		}
+		reason := c.cannotLeaveReason(g)
+		if reason == "" {
+			// A soft node-affinity pin does not hold a VM on a node in maintenance, because PVE
+			// moves it to the next priority class, so with no reason the VM is most likely on its way.
+			c.rep.advise(haKindMaintenanceStranded, g.sid,
+				"%s is still running on %s, which is in maintenance, and the doctor sees nothing that stops it from leaving, so PVE is expected to move it; "+
+					"check again after the HA manager's next round, because the node's HA agent can't finish draining until the VM has moved or stopped",
+				g.sid, g.ref.Node)
+			continue
+		}
 		c.rep.problem(haKindMaintenanceStranded, g.sid,
 			"%s is still running on %s, which is in maintenance, so the node's HA agent can't restart until it moves or stops%s",
-			g.sid, g.ref.Node, c.cannotLeaveReason(g))
+			g.sid, g.ref.Node, reason)
 	}
 }
 
@@ -1249,42 +1259,10 @@ func (c *haCollector) cannotLeaveReason(g *haGuest) string {
 			return ", and its strict node-affinity pin names no other node it can move to"
 		}
 	}
-	if c.rulesOK {
-		if pin := c.pinOf(g.ref.VMID); softPinHoldsOnlyNode(pin, g.sid, g.ref.Node) {
-			return ", and its soft node-affinity pin " + pin.ID + " puts only " + g.ref.Node +
-				" in its highest priority class, which keeps the service there while the node drains"
-		}
-	}
 	if c.groupBlocksEveryNode(g) {
 		return ", and every other node that can take it holds a member of its anti-affinity group"
 	}
 	return ""
-}
-
-// softPinHoldsOnlyNode reports whether pin is an enabled soft node-affinity
-// rule for sid whose highest priority class holds node and no other node, and
-// whose other nodes, named or not, rank below it. PVE keeps a service in the
-// highest class that has an online node, so such a pin keeps the service on
-// node even while the node drains. A pin that gives several nodes the top
-// priority forms a class that holds the others as well, so it is not one.
-func softPinHoldsOnlyNode(pin *ha.Rule, sid, node string) bool {
-	if pin == nil || pin.Disabled || pin.Strict || pin.Type != ha.RuleTypeNodeAffinity || !pin.HasResource(sid) {
-		return false
-	}
-	top, topNodes, ok := 0, 0, false
-	for _, prio := range pin.Nodes {
-		switch {
-		case !ok || prio > top:
-			top, topNodes, ok = prio, 1, true
-		case prio == top:
-			topNodes++
-		}
-	}
-	if !ok || topNodes != 1 {
-		return false
-	}
-	prio, named := pin.Nodes[node]
-	return named && prio == top
 }
 
 // recoveryStrandedFindings reports each HA VM the HA manager holds in the

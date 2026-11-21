@@ -433,30 +433,35 @@ func TestCollectMaintenanceStranded(t *testing.T) {
 	t.Parallel()
 	f := maintenanceFake()
 	r := runCollect(t, f, haCfg("auto", "none"))
-	want(t, r, haKindMaintenanceStranded, haSeverityProblem, "vm:100", "n1", "in maintenance", "can't restart")
+	want(t, r, haKindMaintenanceStranded, haSeverityAdvice, "vm:100", "n1", "in maintenance", "PVE is expected to move it")
 	// A pin to a single node is named as the reason.
 	f.rules = []ha.Rule{pinRule(100, haMarker, "n1")}
 	want(t, runCollect(t, f, haCfg("auto", "none")), haKindMaintenanceStranded, haSeverityProblem, "pin names no other node")
 }
 
-// TestCollectMaintenanceStrandedNamesASoftSinglePin: a soft pin whose top
-// priority class holds only the draining node keeps the VM there, and the
-// finding says so. A soft pin that ranks two nodes first does not.
-func TestCollectMaintenanceStrandedNamesASoftSinglePin(t *testing.T) {
+// TestCollectMaintenanceStrandedNeverBlamesASoftPin: PVE moves a soft-pinned
+// VM off a node in maintenance, so a soft pin is never the reason a VM cannot
+// leave. With no reason the finding is advice that says PVE should move it.
+func TestCollectMaintenanceStrandedNeverBlamesASoftPin(t *testing.T) {
 	t.Parallel()
 	soft := func(prios map[string]int) ha.Rule {
 		r := pinRule(100, haMarker)
 		r.Strict, r.Nodes = false, prios
 		return r
 	}
-	f := maintenanceFake()
-	f.rules = []ha.Rule{soft(map[string]int{"n1": 2, "n2": 1, "n3": 1})}
-	want(t, runCollect(t, f, haCfg("auto", "none")), haKindMaintenanceStranded, haSeverityProblem,
-		"soft node-affinity pin", "only n1", "highest priority class")
-	f.rules = []ha.Rule{soft(map[string]int{"n1": 2, "n2": 2})}
-	got := findings(runCollect(t, f, haCfg("auto", "none")), haKindMaintenanceStranded)
-	if len(got) != 1 || strings.Contains(got[0].Detail, "soft node-affinity pin") {
-		t.Errorf("a shared top class must give no soft-pin reason, got %+v", got)
+	for _, prios := range []map[string]int{{"n1": 2, "n2": 1, "n3": 1}, {"n1": 2, "n2": 2}} {
+		f := maintenanceFake()
+		f.rules = []ha.Rule{soft(prios)}
+		r := runCollect(t, f, haCfg("auto", "none"))
+		want(t, r, haKindMaintenanceStranded, haSeverityAdvice, "vm:100", "n1", "PVE is expected to move it", "check again")
+		got := findings(r, haKindMaintenanceStranded)
+		if len(got) != 1 || strings.Contains(got[0].Detail, "soft node-affinity pin") ||
+			strings.Contains(got[0].Detail, "highest priority class") {
+			t.Errorf("a soft pin must give no reason, got %+v", got)
+		}
+		if r.Problems() != 0 {
+			t.Errorf("a VM PVE is still moving must not fail the run: %+v", r.Findings)
+		}
 	}
 }
 
@@ -2571,6 +2576,7 @@ func TestCollectReadsTheDrainFromTheServicesOnTheNode(t *testing.T) {
 		name      string
 		build     func() *fakeHA
 		wantKinds map[string]string // kind to the subject it must name
+		wantAdv   bool              // the findings are advice, not problems
 		wantDrain bool
 		wantDog   string
 		wantText  string
@@ -2597,6 +2603,7 @@ func TestCollectReadsTheDrainFromTheServicesOnTheNode(t *testing.T) {
 				return f
 			},
 			wantKinds: map[string]string{haKindMaintenanceStranded: "vm:217"},
+			wantAdv:   true,
 			wantDog:   "armed",
 		},
 		{
@@ -2655,8 +2662,12 @@ func TestCollectReadsTheDrainFromTheServicesOnTheNode(t *testing.T) {
 				if len(got) != 1 || got[0].Subject != subject || !strings.Contains(got[0].Detail, tt.wantText) {
 					t.Errorf("%s: want one finding for %s mentioning %q, got %+v", kind, subject, tt.wantText, got)
 				}
-				if got := findings(r, kind); len(got) == 1 && got[0].Severity != haSeverityProblem {
-					t.Errorf("%s: severity %s, want problem", kind, got[0].Severity)
+				severity := haSeverityProblem
+				if tt.wantAdv {
+					severity = haSeverityAdvice
+				}
+				if got := findings(r, kind); len(got) == 1 && got[0].Severity != severity {
+					t.Errorf("%s: severity %s, want %s", kind, got[0].Severity, severity)
 				}
 			}
 			if len(tt.wantKinds) == 0 {
