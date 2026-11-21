@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"log/slog"
 	"slices"
 	"strconv"
 	"strings"
@@ -200,6 +202,68 @@ func TestFixAntiAffinityGroups_LeavesARuleNamedForAnotherAZMapAlone(t *testing.T
 	}
 	if _, ok := stub.rules[aaRule+"-2"]; ok || stub.rules[aaRule] != "vm:100,vm:101,vm:102" {
 		t.Fatalf("rules = %v; want the three lowest indexes in the base rule alone", stub.rules)
+	}
+}
+
+// TestAAPlanner_WarnsWhenItRenamesARuleNamedUnderAnotherAZMap pins that a
+// write plan that deletes or rewrites a rule its own az_map never names logs
+// one Warn that names the rule, because two cpis entries that share a
+// cluster and map AZs differently rename each other's rules on every write
+// of a group that spans them. The plan itself still writes its layout, which
+// renames a rule an older release named once. A plan whose map gives the
+// rules their names logs nothing, and neither does a removal, which keeps
+// every rule's name.
+func TestAAPlanner_WarnsWhenItRenamesARuleNamedUnderAnotherAZMap(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	stub.tagged(aaQEMU(100, aaTag+";index--0"), aaQEMU(101, aaTag+";index--1"),
+		aaQEMU(102, aaTag+";index--2"), aaQEMU(103, aaTag+";index--3"))
+	markWebMembers(stub, 100, 101, 102, 103)
+	stub.seedRule(aaRule, "vm:100,vm:101")
+	stub.seedRule(aaRule+"-2", "vm:102,vm:103")
+	warns := func(azMap map[string][]string, removal bool) []log.Entry {
+		t.Helper()
+		deps := aaMetadataDeps(stub)
+		deps.Config.Placement.AZMap = azMap
+		in, err := readAntiAffinityCheckInput(t.Context(), deps)
+		if err != nil {
+			t.Fatalf("read the check input: %v", err)
+		}
+		set, err := readHARuleSet(t.Context(), deps.PVE.Cluster())
+		if err != nil {
+			t.Fatalf("read the rules: %v", err)
+		}
+		logger, obs := log.NewObservedLogger(slog.LevelDebug)
+		ident := aaIdent("web")
+		p := newAAPlanner(in.Config, in.Profile, ident, scanGroupMembers(in.Guests, in.GuestsComplete, ident), logger)
+		p.heal = true
+		p.managed = func() (map[string]string, error) { return in.Resources, nil }
+		if removal {
+			p.removal, p.exclude = true, "vm:103"
+		}
+		for range 2 {
+			if _, err := p.plan(set); err != nil {
+				t.Fatalf("plan: %v", err)
+			}
+		}
+		var out []log.Entry
+		for _, e := range obs.All() {
+			if e.Level == slog.LevelWarn && strings.Contains(e.Message, "another numbering") {
+				out = append(out, e)
+			}
+		}
+		return out
+	}
+	threeAZs := map[string][]string{"a": {"pve1"}, "b": {"pve2"}, "c": {"pve3", "pve4"}}
+	got := warns(threeAZs, false)
+	if len(got) != 1 || got[0].Attrs["rule"] != aaRule+"-2" {
+		t.Fatalf("warnings = %+v; want one that names %s-2", got, aaRule)
+	}
+	if got := warns(nil, false); len(got) != 0 {
+		t.Fatalf("warnings with no az_map = %+v; want none", got)
+	}
+	if got := warns(threeAZs, true); len(got) != 0 {
+		t.Fatalf("warnings of a removal = %+v; want none", got)
 	}
 }
 

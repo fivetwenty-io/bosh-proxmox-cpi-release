@@ -247,8 +247,45 @@ func (p *aaPlanner) plan(set *ha.RuleSet) ([]ha.RuleOp, error) {
 		if len(ops) == 0 && !p.keepStale {
 			p.writeResourceHolds(cleanups)
 		}
+		p.warnForeignNames(set, in, ops)
 		return ops, nil
 	}
+}
+
+// rewrittenRules names the rules that ops delete, or update for more than
+// the pattern stamp or the holds they record.
+func (p *aaPlanner) rewrittenRules(ops []ha.RuleOp) map[string]bool {
+	rewritten := map[string]bool{}
+	for i := range ops {
+		id := ops[i].Rule.ID
+		if ops[i].Kind == ha.OpDelete || ops[i].Kind == ha.OpUpdate && !p.stampOnly[id] && !p.holdOnly[id] {
+			rewritten[id] = true
+		}
+	}
+	return rewritten
+}
+
+// warnForeignNames logs once, at Warn, when a layout plan deletes or rewrites
+// a group rule whose name this entry's placement.az_map never gives the
+// rule's members. Two cpis entries that share a cluster and map AZs
+// differently number a group's rules differently, so when one group spans
+// both, each entry renames the other's rules on every write of the group.
+// The plan still writes its layout, because an older release, or this entry
+// before its az_map changed, named such a rule too, and the first write
+// renames it once. A removal keeps every rule's name and logs nothing.
+func (p *aaPlanner) warnForeignNames(set *ha.RuleSet, in aapattern.Input, ops []ha.RuleOp) {
+	if p.removal || len(ops) == 0 || p.said["foreign names"] {
+		return
+	}
+	rule, _ := foreignNamedRuleWhere(set, p.ident, in, p.rewrittenRules(ops))
+	if rule == "" || !p.once("foreign names") {
+		return
+	}
+	p.logger.Warn("anti-affinity: the plan renames a rule of the group that carries a name from another numbering "+
+		"of the group's AZs; a rule from before 0.12.0, or from before this entry's az_map changed, is renamed once, "+
+		"but when this repeats, another cpis entry on this cluster with a different az_map writes the same group, "+
+		"so keep each instance group's AZs on one entry per cluster",
+		log.String("rule", rule), log.String("group", p.ident.ruleName()))
 }
 
 // prepare reads what a plan plans from, the HA resources, the group's rules,

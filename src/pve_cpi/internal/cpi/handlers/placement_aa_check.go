@@ -234,14 +234,7 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 		c.Problem = reason
 		return c
 	}
-	rewritten := map[string]bool{}
-	for i := range ops {
-		id := ops[i].Rule.ID
-		if ops[i].Kind == ha.OpDelete || ops[i].Kind == ha.OpUpdate && !p.stampOnly[id] && !p.holdOnly[id] {
-			rewritten[id] = true
-		}
-	}
-	c.ForeignRule = foreignNamedRule(set, ident, p.lastIn, rewritten)
+	c.ForeignRule = foreignNamedRule(set, ident, p.lastIn, p.rewrittenRules(ops))
 	for i := range ops {
 		switch id := ops[i].Rule.ID; {
 		case p.stampOnly[id]:
@@ -474,6 +467,24 @@ func crossDomainRule(set *ha.RuleSet, ident haIdentity, in aapattern.Input) stri
 // to that write. A rule whose members are all gone says nothing of its
 // writer, so the plan may still delete it.
 func foreignNamedRule(set *ha.RuleSet, ident haIdentity, in aapattern.Input, rewritten map[string]bool) string {
+	id, where := foreignNamedRuleWhere(set, ident, in, rewritten)
+	if id == "" {
+		return ""
+	}
+	return fmt.Sprintf("the plan would delete or rewrite rule %s, whose members are in %s, but placement.az_map "+
+		"never gives a rule of %s that name. Another cpis entry on this cluster whose az_map defines other AZs "+
+		"most likely wrote the rule and keeps it, so check the group under --cpi-config and fix it with that "+
+		"entry's request. A rule written before 0.12.0, or before this entry's az_map changed, also carries such "+
+		"a name, and the group's next write by a member's set_vm_metadata or delete_vm renames it",
+		id, where, where)
+}
+
+// foreignNamedRuleWhere returns the first rule of rewritten whose name the
+// numbering of in never gives its members' domain, with that domain in
+// words, or "" when there is none.
+func foreignNamedRuleWhere(
+	set *ha.RuleSet, ident haIdentity, in aapattern.Input, rewritten map[string]bool,
+) (string, string) {
 	domainOf := make(map[string]string, len(in.Members))
 	for _, m := range in.Members {
 		domainOf[m.Key] = m.Domain
@@ -512,14 +523,9 @@ func foreignNamedRule(set *ha.RuleSet, ident haIdentity, in aapattern.Input, rew
 		if dk != "" {
 			where = "AZ " + dk
 		}
-		return fmt.Sprintf("the plan would delete or rewrite rule %s, whose members are in %s, but placement.az_map "+
-			"never gives a rule of %s that name. Another cpis entry on this cluster whose az_map defines other AZs "+
-			"most likely wrote the rule and keeps it, so check the group under --cpi-config and fix it with that "+
-			"entry's request. A rule written before 0.12.0, or before this entry's az_map changed, also carries such "+
-			"a name, and the group's next write by a member's set_vm_metadata or delete_vm renames it",
-			r.ID, where, where)
+		return r.ID, where
 	}
-	return ""
+	return "", ""
 }
 
 // fullGroupRules returns the group's rules that hold as many members as the
