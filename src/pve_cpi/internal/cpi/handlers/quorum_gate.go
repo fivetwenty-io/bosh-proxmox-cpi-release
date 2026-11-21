@@ -163,6 +163,7 @@ func refuseMaintenanceTarget(ctx context.Context, deps Deps, target string, logg
 	}
 	report, err := pve.NodeHealth(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), pve.NodeHealthOptions{
 		MaintenanceTags: deps.Config.MaintenanceNodeTagsValue(),
+		NotesNodes:      []string{target},
 	})
 	if err != nil {
 		logger.Warn("create_vm: node health unavailable, so target_node "+target+" cannot be checked for maintenance",

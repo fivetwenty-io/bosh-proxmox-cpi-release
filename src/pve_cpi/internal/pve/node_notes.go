@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
@@ -83,39 +84,86 @@ func normalizeMaintenanceTags(want []string) []string {
 
 type nodeNotesCacheKey struct{}
 
-// nodeNotesCache keeps the notes each node answered with, for one CPI call.
-// It keeps only answers, so a failed read is asked again next time.
+// nodeNotesReadsPerCall is how many failed reads of one node's notes a
+// cache allows before it keeps the failure. Two gives the placement read its
+// retry, and every later read of the call then costs nothing.
+const nodeNotesReadsPerCall = 2
+
+// nodeNotesCache keeps the notes each node answered with, for one CPI call,
+// and the failure of a node whose reads failed nodeNotesReadsPerCall times.
 type nodeNotesCache struct {
-	mu    sync.Mutex
-	notes map[string]string
+	mu       sync.Mutex
+	notes    map[string]string
+	failures map[string]int
+	lastErr  map[string]error
 }
 
 // WithNodeNotesCache returns a context under which NodeHealth reads each
-// node's notes at most once, however many times it runs. A CPI call installs
-// it at its start, so the placement read, its retry, the target_node check,
-// and the HA profile share one read per node. The cache is keyed by node name
-// alone, so a context must carry the reads of one cluster. A context that
-// already carries a cache is returned as it is.
+// node's notes at most once when the node answers, and at most twice when it
+// doesn't, however many times it runs. A CPI call installs it at its start, so
+// the placement read, its retry, the target_node check, and the HA profile
+// share the reads, and a node that failed twice is not asked again during the
+// call. The cache is keyed by node name alone, so a context must carry the
+// reads of one cluster. A context that already carries a cache is returned as
+// it is.
 func WithNodeNotesCache(ctx context.Context) context.Context {
 	if _, ok := ctx.Value(nodeNotesCacheKey{}).(*nodeNotesCache); ok {
 		return ctx
 	}
-	return context.WithValue(ctx, nodeNotesCacheKey{}, &nodeNotesCache{notes: map[string]string{}})
+	return context.WithValue(ctx, nodeNotesCacheKey{}, &nodeNotesCache{
+		notes: map[string]string{}, failures: map[string]int{}, lastErr: map[string]error{},
+	})
 }
 
-// readNodeNotes returns node's notes, from the context's cache when it holds
-// them, and otherwise from GET /nodes/{node}/config with the transient retry
-// every other node health read uses. PVE proxies the read to the node itself.
+// lookup reports whether the cache knows node's answer, and returns its notes,
+// or the error that ends its reads.
+func (c *nodeNotesCache) lookup(node string) (notes string, known bool, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if notes, ok := c.notes[node]; ok {
+		return notes, true, nil
+	}
+	if c.failures[node] >= nodeNotesReadsPerCall {
+		return "", true, c.lastErr[node]
+	}
+	return "", false, nil
+}
+
+// record keeps the outcome of one read of node's notes.
+func (c *nodeNotesCache) record(node, notes string, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err != nil {
+		c.failures[node]++
+		c.lastErr[node] = err
+		return
+	}
+	c.notes[node] = notes
+}
+
+// readNodeNotes returns node's notes, from the context's cache when it knows
+// them or has given up on the node, and otherwise from GET /nodes/{node}/config
+// with the transient retry every other node health read uses. PVE proxies the
+// read to the node itself.
 func readNodeNotes(ctx context.Context, nodesAPI NodeHealthNodes, node string) (string, error) {
 	cache, _ := ctx.Value(nodeNotesCacheKey{}).(*nodeNotesCache)
-	if cache != nil {
-		cache.mu.Lock()
-		notes, ok := cache.notes[node]
-		cache.mu.Unlock()
-		if ok {
-			return notes, nil
-		}
+	if cache == nil {
+		return fetchNodeNotes(ctx, nodesAPI, node)
 	}
+	if notes, known, err := cache.lookup(node); known {
+		return notes, err
+	}
+	notes, err := fetchNodeNotes(ctx, nodesAPI, node)
+	if err != nil && ctx.Err() != nil {
+		// A read the call's own end cut short says nothing about the node.
+		return "", err
+	}
+	cache.record(node, notes, err)
+	return notes, err
+}
+
+// fetchNodeNotes reads node's notes from PVE.
+func fetchNodeNotes(ctx context.Context, nodesAPI NodeHealthNodes, node string) (string, error) {
 	var resp *sdknodes.ListConfigResponse
 	err := RetryOnTransient(ctx, nil, "node_health_node_notes", 0, func() error {
 		var inner error
@@ -132,11 +180,6 @@ func readNodeNotes(ctx context.Context, nodesAPI NodeHealthNodes, node string) (
 	if resp.Description != nil {
 		notes = *resp.Description
 	}
-	if cache != nil {
-		cache.mu.Lock()
-		cache.notes[node] = notes
-		cache.mu.Unlock()
-	}
 	return notes, nil
 }
 
@@ -147,9 +190,10 @@ func readNodeNotes(ctx context.Context, nodesAPI NodeHealthNodes, node string) (
 // or fenced, needs no read that could fail. A node whose notes cannot be read
 // is taken out of placement too, and r.NotesErr records why, so a caller that
 // must know whether a node is in maintenance can treat the report as a failed
-// read. It reads nothing when want holds no tag.
-func applyNodeNotes(ctx context.Context, nodesAPI NodeHealthNodes, r *NodeHealthReport, want []string) {
-	wanted := normalizeMaintenanceTags(want)
+// read. It reads nothing when opts names no tag, and when opts.NotesNodes
+// names nodes it reads only theirs.
+func applyNodeNotes(ctx context.Context, nodesAPI NodeHealthNodes, r *NodeHealthReport, opts NodeHealthOptions) {
+	wanted := normalizeMaintenanceTags(opts.MaintenanceTags)
 	if len(wanted) == 0 {
 		return
 	}
@@ -157,6 +201,9 @@ func applyNodeNotes(ctx context.Context, nodesAPI NodeHealthNodes, r *NodeHealth
 	for i := range r.Nodes {
 		e := &r.Nodes[i]
 		if !e.Placeable {
+			continue
+		}
+		if len(opts.NotesNodes) > 0 && !slices.Contains(opts.NotesNodes, e.Name) {
 			continue
 		}
 		notes, err := readNodeNotes(ctx, nodesAPI, e.Name)

@@ -196,6 +196,13 @@ type NodeHealthOptions struct {
 	// once per node under a context from WithNodeNotesCache.
 	MaintenanceTags []string
 
+	// NotesNodes, when it names any node, limits the notes reads to those
+	// nodes. A caller that asks about one node, such as the target_node check,
+	// sets it so it pays for no other node's read. The entries of the nodes it
+	// leaves out don't reflect the marker, so such a caller must read only the
+	// entries it named.
+	NotesNodes []string
+
 	// SkipHA keeps NodeHealth from reading any HA source: the manager status,
 	// the clock that measures their timestamps, and the lrm text. Cluster status alone then
 	// classifies the nodes, as it does when no HA source can be trusted. A
@@ -448,7 +455,7 @@ func NodeHealth(
 		report.HAReason = "the caller asked for no HA source"
 		report.Nodes = classifyNodes(view, report.HA, haInputs{})
 		report.reindex()
-		applyNodeNotes(ctx, nodesAPI, report, opts.MaintenanceTags)
+		applyNodeNotes(ctx, nodesAPI, report, opts)
 		return report, nil
 	}
 
@@ -472,7 +479,7 @@ func NodeHealth(
 	report.Nodes = classifyNodes(view, report.HA, ha)
 	report.withholdFailingEntry()
 	report.reindex()
-	applyNodeNotes(ctx, nodesAPI, report, opts.MaintenanceTags)
+	applyNodeNotes(ctx, nodesAPI, report, opts)
 	return report, nil
 }
 

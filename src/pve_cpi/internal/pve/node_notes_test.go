@@ -6,6 +6,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -114,6 +115,7 @@ func TestNotesMaintenanceTag_MatchRules(t *testing.T) {
 // it holds, and it records each node whose config was read.
 type nnNodes struct {
 	nhNodes
+	mu         sync.Mutex
 	notes      map[string]string
 	notesErr   map[string]error
 	notesAsked []string
@@ -125,6 +127,8 @@ type nnNodes struct {
 func (n *nnNodes) ListConfig(
 	_ context.Context, node string, _ *sdknodes.ListConfigParams,
 ) (*sdknodes.ListConfigResponse, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.notesAsked = append(n.notesAsked, node)
 	if err := n.notesErr[node]; err != nil {
 		return nil, err
@@ -372,5 +376,92 @@ func TestNodeHealth_NotesCacheKeepsNoFailure(t *testing.T) {
 	}
 	if want := []string{"pve1", "pve2", "pve3", "pve2"}; !slices.Equal(n.notesAsked, want) {
 		t.Errorf("notes read for %v, want %v", n.notesAsked, want)
+	}
+}
+
+// A node whose notes failed on two reads keeps failing for the rest of the
+// call without another read, so one unreachable node costs each later health
+// read of the call nothing.
+func TestNodeHealth_NotesCacheKeepsAFailureAfterTwoReads(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithNodeNotesCache(t.Context())
+	n := &nnNodes{notesErr: map[string]error{"pve2": errors.New("595 no route to host")}}
+	for i := range 4 {
+		r := nnRun(t, ctx, nhHealthy(), n, nnTags)
+		e := nhEntry(t, r, "pve2")
+		if r.Placeable("pve2") || !e.NotesUnread || r.NotesErr == nil ||
+			!strings.Contains(r.NotesErr.Error(), "595 no route to host") {
+			t.Fatalf("read %d: pve2 must stay unread with its cause: %v %+v", i+1, r.NotesErr, e)
+		}
+		if !r.Placeable("pve1") || !r.Placeable("pve3") {
+			t.Fatalf("read %d: the other nodes answered: %+v", i+1, r.Nodes)
+		}
+	}
+	if want := []string{"pve1", "pve2", "pve3", "pve2"}; !slices.Equal(n.notesAsked, want) {
+		t.Errorf("notes read for %v, want %v", n.notesAsked, want)
+	}
+}
+
+// NotesNodes limits the notes reads to the nodes a caller asks about.
+func TestNodeHealth_NotesNodesReadsOnlyTheNamedNodes(t *testing.T) {
+	t.Parallel()
+	n := &nnNodes{
+		notes:    map[string]string{"pve2": "tags: maintenance"},
+		notesErr: map[string]error{"pve3": errors.New("boom")},
+	}
+	opts := nnTags
+	opts.NotesNodes = []string{"pve2"}
+	r := nnRun(t, t.Context(), nhHealthy(), n, opts)
+	if !slices.Equal(n.notesAsked, []string{"pve2"}) {
+		t.Errorf("notes read for %v, want only pve2", n.notesAsked)
+	}
+	if e := nhEntry(t, r, "pve2"); !e.Maintenance || e.Placeable {
+		t.Errorf("pve2 carries the marker: %+v", e)
+	}
+	if r.NotesErr != nil {
+		t.Errorf("a node that was not asked about must not fail the read: %v", r.NotesErr)
+	}
+}
+
+// Every reader of one call shares the cache, and the CPI's reads can run on
+// several goroutines, so the cache must hold up under concurrent use. Run it
+// with -race.
+func TestNodeHealth_NotesCacheIsSafeForConcurrentReads(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithNodeNotesCache(t.Context())
+	n := &nnNodes{
+		notes:    map[string]string{"pve1": "tags: maintenance"},
+		notesErr: map[string]error{"pve3": errors.New("boom")},
+	}
+	c := nhHealthy()
+	opts := pve.NodeHealthOptions{SkipHA: true, MaintenanceTags: []string{"maintenance"}}
+	var wg sync.WaitGroup
+	errs := make(chan error, 16)
+	for range 16 {
+		wg.Go(func() {
+			r, err := pve.NodeHealth(ctx, c, n, opts)
+			switch {
+			case err != nil:
+				errs <- err
+			case r.Placeable("pve1") || !r.Placeable("pve2") || r.Placeable("pve3"):
+				errs <- errors.New("a concurrent read gave the wrong answer")
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	n.mu.Lock()
+	asked := len(n.notesAsked)
+	n.mu.Unlock()
+	// Every node has now answered, or failed at least twice, so a further
+	// read of the call asks no node again.
+	nnRun(t, ctx, c, n, opts)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if len(n.notesAsked) != asked {
+		t.Errorf("a read after the burst asked again: %v", n.notesAsked[asked:])
 	}
 }

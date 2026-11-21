@@ -494,6 +494,7 @@ func placeableConfigNode(ctx context.Context, deps Deps, node string) (string, e
 	}
 	report, err := pve.NodeHealth(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), pve.NodeHealthOptions{
 		MaintenanceTags: deps.Config.MaintenanceNodeTagsValue(),
+		NotesNodes:      []string{node},
 	})
 	if err != nil {
 		return "", cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,

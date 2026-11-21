@@ -444,3 +444,24 @@ func TestCreateVM_ReadsEachNodesNotesOncePerCall(t *testing.T) {
 		t.Fatalf("pve2's notes were read %d times, want 2 (the failed read and its retry)", n)
 	}
 }
+
+// TestCreateVM_TargetNodeCheckReadsOnlyTheTargetsNotes pins that the
+// target_node check asks only the pinned node for its notes, so another
+// node's slow or failing read costs the pinned create nothing.
+func TestCreateVM_TargetNodeCheckReadsOnlyTheTargetsNotes(t *testing.T) {
+	t.Parallel()
+	c := &maintenanceTargetCluster{notesFailures: map[string]int{"pve1": -1}}
+	created, err := createOnPinnedNode(t, c)
+	if err != nil {
+		t.Fatalf("a healthy target_node was refused over another node's notes: %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("create_vm created %d VMs, want 1", created)
+	}
+	if n := c.readsOf("pve1"); n != 0 {
+		t.Fatalf("pve1's notes were read %d times for a create pinned to pve2, want 0", n)
+	}
+	if n := c.readsOf("pve2"); n != 1 {
+		t.Fatalf("pve2's notes were read %d times, want 1", n)
+	}
+}
