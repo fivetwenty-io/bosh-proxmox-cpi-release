@@ -88,6 +88,16 @@ type aaPlanner struct {
 	// keepStale leaves recorded holds that keep no place any more where they
 	// are, so the doctor's check reports them as lapsed instead of as drift.
 	keepStale bool
+	// keepInFlight leaves as it is a rule that still holds the deleted
+	// member of a live hold, when the plan's only change to the rule is to
+	// take that member out. The delete that recorded the hold records it
+	// before it takes its member out, and its removal writes that change
+	// next, so the doctor's check does not report the removal in flight as
+	// drift. Once the hold lapses, the rule reads as drift again.
+	keepInFlight bool
+	// deletedHolders holds the members of the last plan's rules that are the
+	// deleted members of live holds, which the plan leaves out.
+	deletedHolders map[string]bool
 	// recordHolds writes a change of the holds a member's HA resource
 	// records, against the digest of the read it edits. Nil records nothing,
 	// and the plan keeps each such change in pendingHolds instead.
@@ -234,6 +244,9 @@ func (p *aaPlanner) plan(set *ha.RuleSet) ([]ha.RuleOp, error) {
 	} else {
 		out = aapattern.Layout(in)
 		p.logLayout(in, out)
+		if p.keepInFlight {
+			p.keepInFlightRemovals(existing, &out)
+		}
 	}
 	p.lastIn, p.lastOut = in, out
 	p.assignHolds(in, existing, out)
@@ -261,9 +274,30 @@ func (p *aaPlanner) removalLayout(existing map[string]*ha.Rule) aapattern.Output
 	return out
 }
 
+// keepInFlightRemovals puts back in out each rule of existing that holds a
+// deleted member of a live hold, when out holds that rule without those
+// members, or drops the rule because it would be left with fewer than two.
+func (p *aaPlanner) keepInFlightRemovals(existing map[string]*ha.Rule, out *aapattern.Output) {
+	isDeleted := func(s string) bool { return p.deletedHolders[s] }
+	for _, name := range slices.Sorted(maps.Keys(existing)) {
+		r := existing[name]
+		if !slices.ContainsFunc(r.Resources, isDeleted) {
+			continue
+		}
+		rest := slices.Sorted(slices.Values(slices.DeleteFunc(slices.Clone(r.Resources), isDeleted)))
+		want, ok := out.Rules[name]
+		if ok && !slices.Equal(slices.Sorted(slices.Values(want)), rest) || !ok && len(rest) >= 2 {
+			continue
+		}
+		if out.Rules == nil {
+			out.Rules = map[string][]string{}
+		}
+		out.Rules[name] = slices.Clone(r.Resources)
+	}
+}
+
 // leadsHoldAdds reports whether ops starts with a write that goes before the
-// writes that record a hold: a pin rewrite, or the delete of a rule that
-// records no live hold.
+// writes that record a hold, which only a pin rewrite does.
 func (p *aaPlanner) leadsHoldAdds(ops []ha.RuleOp) bool {
 	return p.leading > 0 && len(ops) > 0
 }
@@ -628,15 +662,18 @@ func (p *aaPlanner) wantRule(cur *ha.Rule, name string, members []string) ha.Rul
 
 // ruleOps returns the writes that make the group's rules hold the layout's
 // plan, or nil when the rules and the pins already hold. The pin rewrites the
-// members need lead, then the deletes of rules that record no live hold, then
-// the writes that record a hold on a rule that keeps its members, then the
+// members need lead, then the writes that record a hold on a rule that keeps
+// its members, then the deletes of rules that record no live hold, then the
 // deletes of rules that record one, then the writes that take a member out
 // of a rule, and then the ones that only add. The writes that only drop holds
 // that keep no place come last, and a plan with keepStale leaves them out.
 // The writer sends one write per read, so a member that moves leaves its old
 // rule before it joins its new one, no read between two writes shows it in
-// both, and a hold is recorded on the rule that keeps it before the rule that
-// recorded it goes.
+// both, and a hold is recorded on the rule that keeps it before any rule
+// goes. That covers the rule a delete leaves with one member, which takes
+// the deleted member's place with it, as well as a rule that records a hold
+// already. A hold that a member's HA resource is to record is written before
+// the first of these writes, once no pin rewrite leads.
 func (p *aaPlanner) ruleOps(set *ha.RuleSet, existing map[string]*ha.Rule, out aapattern.Output) []ha.RuleOp {
 	var pins, holdAdds, shrink, grow, cleanup []ha.RuleOp
 	pinned := map[string]bool{}
@@ -710,15 +747,15 @@ func (p *aaPlanner) ruleOps(set *ha.RuleSet, existing map[string]*ha.Rule, out a
 			deletes = append(deletes, op)
 		}
 	}
-	p.leading = len(pins) + len(deletes)
-	total := p.leading + len(holdAdds) + len(heldDeletes) + len(shrink) + len(grow)
+	p.leading = len(pins)
+	total := p.leading + len(holdAdds) + len(deletes) + len(heldDeletes) + len(shrink) + len(grow)
 	if total == 0 {
 		return cleanup
 	}
 	ops := make([]ha.RuleOp, 0, total+len(cleanup))
 	ops = append(ops, pins...)
-	ops = append(ops, deletes...)
 	ops = append(ops, holdAdds...)
+	ops = append(ops, deletes...)
 	ops = append(ops, heldDeletes...)
 	ops = append(ops, shrink...)
 	ops = append(ops, grow...)

@@ -166,7 +166,7 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 	if pat, ok := in.GroupPatterns[ident.ruleName()]; ok {
 		p.pattern = pat.Clone().OrDefault()
 	}
-	p.heal, p.keepStale = true, true
+	p.heal, p.keepStale, p.keepInFlight = true, true, true
 	p.managed = func() (map[string]string, error) { return in.Resources, nil }
 	if !in.Now.IsZero() {
 		p.now = func() time.Time { return in.Now }

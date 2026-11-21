@@ -260,6 +260,87 @@ func TestRemoveAntiAffinity_TheLastRuleLeavesItsHoldOnAMember(t *testing.T) {
 	}
 }
 
+// TestRemoveAntiAffinity_TheHoldLandsBeforeTheRuleGoes pins that a delete
+// that leaves its rule with one member records its hold before it deletes the
+// rule, so no state between two writes leaves the deleted member's place
+// recorded nowhere. On three nodes a rule holds two members. With a second
+// rule left in the group the hold goes on that rule, and with none left it
+// goes on the HA resource of the member that stays. After every write the
+// doctor's plan writes nothing, with the rules lock on and off.
+func TestRemoveAntiAffinity_TheHoldLandsBeforeTheRuleGoes(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		vmids   []int
+		rules   map[string]string
+		carrier string
+	}{
+		"another rule": {[]int{100, 101, 102, 103}, map[string]string{aaRule: "vm:100,vm:101", aaRule + "-2": "vm:102,vm:103"},
+			"rule " + aaRule + "-2"},
+		"a member's resource": {[]int{100, 101}, map[string]string{aaRule: "vm:100,vm:101"}, "resource vm:100"},
+	} {
+		for _, lock := range []bool{false, true} {
+			t.Run(name+" lock "+strconv.FormatBool(lock), func(t *testing.T) {
+				t.Parallel()
+				stub := newAAStub()
+				stub.purgeFromRules = true
+				fleet := newAAHoldFleet(stub, tc.vmids...)
+				for rule, members := range tc.rules {
+					stub.seedRule(rule, members)
+				}
+				deps := aaReplanDeps(stub, lock)
+				deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+				writes := 0
+				var carriers []string
+				check := func(what string) {
+					writes++
+					carriers = aaHoldCarriers(stub, 1)
+					inRule := slices.ContainsFunc(slices.Collect(maps.Values(stub.rules)), func(csv string) bool {
+						return slices.Contains(strings.Split(csv, ","), "vm:101")
+					})
+					if !inRule && len(carriers) == 0 {
+						t.Errorf("after write %d (%s) vm:101 is out of its rule and no rule or resource records "+
+							"its hold; rules %v, comments %v, resources %v", writes, what, stub.rules,
+							stub.ruleComments, stub.resComments)
+					}
+					if d := aaDoctorDrift(t, deps); len(d) != 0 {
+						t.Errorf("after write %d (%s) the doctor would write %v; rules %v", writes, what, d, stub.rules)
+					}
+				}
+				stub.onRuleWrite = func(rule string) { check("rule " + rule) }
+				stub.onResourceWrite = func(sid string) { check("resource " + sid) }
+				fleet.destroy(101)
+				if err := removeAntiAffinityMembership(context.Background(), deps, 101, webTags(101),
+					log.NewNopLogger()); err != nil {
+					t.Fatalf("remove: %v", err)
+				}
+				if _, ok := stub.rules[aaRule]; ok {
+					t.Fatalf("rules = %v; want the rule of one member gone", stub.rules)
+				}
+				if !slices.Equal(carriers, []string{tc.carrier}) {
+					t.Fatalf("the hold of index 1 is recorded on %v; want %s", carriers, tc.carrier)
+				}
+			})
+		}
+	}
+}
+
+// aaHoldCarriers names each rule and resource of the stub that records a hold
+// of index, as "rule <id>" or "resource <sid>", in order.
+func aaHoldCarriers(stub *aaClusterStub, index int) []string {
+	var out []string
+	for _, id := range slices.Sorted(maps.Keys(stub.ruleComments)) {
+		if recordsIndex(holdsOf(stub.ruleComments[id]), index) {
+			out = append(out, "rule "+id)
+		}
+	}
+	for _, sid := range slices.Sorted(maps.Keys(stub.resComments)) {
+		if stub.resources[sid] && recordsIndex(holdsOf(stub.resComments[sid]), index) {
+			out = append(out, "resource "+sid)
+		}
+	}
+	return out
+}
+
 // TestCheckAntiAffinityGroups_ListsTheHolds pins what the check reports of
 // each recorded hold: a live one with the rule that records it, and as lapsed
 // one that expired and one whose index a member holds.

@@ -308,10 +308,12 @@ func (p *aaPlanner) sortedHolds() []*aaGroupHold {
 }
 
 // dropDeletedHolders takes out of keys the deleted member of each live hold,
-// whose HA resource or rule place can outlive its guest for a moment. A
-// member with that VMID that was born after the hold was written is a new
-// VM that got the VMID back, and it stays, as does the plan's own member.
+// whose HA resource or rule place can outlive its guest for a moment, and
+// records each one it takes out in deletedHolders. A member with that VMID
+// that was born after the hold was written is a new VM that got the VMID
+// back, and it stays, as does the plan's own member.
 func (p *aaPlanner) dropDeletedHolders(keys map[string]bool) {
+	p.deletedHolders = map[string]bool{}
 	for _, h := range p.sortedHolds() {
 		sid := h.sid()
 		if h.state != aaHoldLive || sid == "" || sid == p.sid || !keys[sid] {
@@ -319,6 +321,7 @@ func (p *aaPlanner) dropDeletedHolders(keys map[string]bool) {
 		}
 		if born := p.markerOf(sid).Born; born == 0 || born < h.made() {
 			delete(keys, sid)
+			p.deletedHolders[sid] = true
 		}
 	}
 }
