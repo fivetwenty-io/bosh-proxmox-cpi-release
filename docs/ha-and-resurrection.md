@@ -34,7 +34,7 @@ At each `create_vm` the CPI decides whether the VM can run under HA, from its vo
 
 - **A failback flag**
 
-  The resource's `failback` flag is on when the HA decision registers the VM as shared, which means that every volume the VM holds, its persistent disks included, sits on storage that at least two placeable nodes reach. A `hold` VM, a `replicate` VM, a VM that only one node can take, and any VM with a volume on node-local storage get `failback` off, and so does every VM when `pve.ha.failback` is `false`. [Failback](#failback) explains what PVE does with the flag and when the CPI changes it.
+  The resource's `failback` flag is on when the HA decision registers the VM as shared, which means that every volume the VM holds, its persistent disks included, sits on storage that at least two placeable nodes reach. A `hold` VM, a `replicate` VM, a VM that only one node can take, and any VM with a volume on node-local storage get `failback` off, and so does every VM when `pve.ha.failback` is `false`. A soft AZ pin doesn't confine a VM, so a one-node AZ with `pve.ha.pin_az_strict: false` still gets failback on. [Failback](#failback) explains what PVE does with the flag and when the CPI changes it.
 
 - **An ownership marker**
 
