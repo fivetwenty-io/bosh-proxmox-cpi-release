@@ -70,7 +70,7 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
   - Before, each delete held only its own place while it planned, so a second delete that planned while the first one's place was free moved another member into it, and the doctor then reported that move as `aa_layout_drift` until the recreate moved the member back. The doctor treats a live hold as an occupied place, so it reports no drift for it, and once a hold lapses, it plans the place as free again.
 
-  - Each write of a hold carries the digest of its read, as every other rule and resource write does. Older releases ignore the field, so a downgrade only loses the holds.
+  - Each write of a hold carries the digest of its read, as every other rule and resource write does. Release 0.11.1 and older ignore the field, and a rule comment keeps it when they write the rule. They drop it from a member's HA resource comment, though, the first time they write that resource. A hold lapses within 30 minutes anyway, so a downgrade costs at most the layout of a roll that is in progress, and we let any roll finish before we downgrade.
 
 - An anti-affinity group's rules now follow its members' indexes alone, so the order in which the members joined no longer shapes a rule.
 
