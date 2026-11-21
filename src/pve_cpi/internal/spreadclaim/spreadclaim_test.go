@@ -612,3 +612,88 @@ func TestAClaimWhoseWriteFailedIsWrittenAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestPickLiveShowsEachClaimWithItsVM pins that PickLive hands choose every
+// live claim of the group other than its own, each with the node and the VMID
+// it names, and records its own claim on the chosen node with its VMID, so
+// the next turn sees which VM is going where.
+func TestPickLiveShowsEachClaimWithItsVM(t *testing.T) {
+	t.Parallel()
+	s := testStore(t, nil)
+	exp := time.Now().Add(time.Hour)
+	ctx := context.Background()
+	bound := mustClaim(t, s, "g", exp)
+	if err := bound.Move(ctx, "pve1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bound.Bind(ctx, 101); err != nil {
+		t.Fatal(err)
+	}
+	if err := mustClaim(t, s, "g", exp).Move(ctx, "pve2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mustClaim(t, s, "other", exp).Move(ctx, "pve3"); err != nil {
+		t.Fatal(err)
+	}
+	mover := mustClaim(t, s, "g", exp)
+	var seen []Live
+	node, err := mover.PickLive(ctx, 102, func(live []Live) string {
+		seen = live
+		return "pve3"
+	})
+	if err != nil || node != "pve3" {
+		t.Fatalf("PickLive = %q, %v; want pve3", node, err)
+	}
+	want := []Live{{Node: "pve1", VMID: 101}, {Node: "pve2"}}
+	if len(seen) != len(want) || seen[0] != want[0] || seen[1] != want[1] {
+		t.Fatalf("live = %+v; want %+v, sorted, without the other group's claim", seen, want)
+	}
+	if mover.VMID() != 102 || !mover.Holds("pve3") {
+		t.Fatalf("mover holds %q with vmid %d; want pve3 with 102", mover.Node(), mover.VMID())
+	}
+	var next []Live
+	if _, err := mustClaim(t, s, "g", exp).PickLive(ctx, 103, func(live []Live) string {
+		next = live
+		return ""
+	}); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, l := range next {
+		found = found || l == Live{Node: "pve3", VMID: 102}
+	}
+	if !found {
+		t.Fatalf("live = %+v; want the mover's claim on pve3 with its VMID", next)
+	}
+	if err := mover.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPickLiveWithoutTheRecordStillChooses pins that PickLive runs choose with
+// no claims when the record can't be used, and returns the error that says
+// so, so a caller that must not act blind can tell.
+func TestPickLiveWithoutTheRecordStillChooses(t *testing.T) {
+	t.Parallel()
+	s := testStore(t, nil)
+	s.LockWait = 10 * time.Millisecond
+	root, err := os.OpenRoot(s.Dir.Override)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	held, err := endpointcache.LockFile(context.Background(), root, LockFileName, Name, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Close() }()
+	c := mustClaim(t, s, "g", time.Now().Add(time.Hour))
+	called := false
+	node, err := c.PickLive(context.Background(), 7, func(live []Live) string {
+		called = live == nil
+		return "pve1"
+	})
+	if !called || node != "pve1" || !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("PickLive = %q, %v, called with nil %v; want pve1, ErrUnavailable, and true", node, err, called)
+	}
+}

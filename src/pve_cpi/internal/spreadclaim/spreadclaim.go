@@ -253,6 +253,68 @@ func (c *Claim) PickExcept(ctx context.Context, tagged func(vmid int) bool,
 	return node, err
 }
 
+// Live is one live claim of the group as a turn with the record reads it.
+// VMID is 0 for a claim whose create has no VM yet.
+type Live struct {
+	Node string
+	VMID int
+}
+
+// PickLive is Pick for a caller that already has its VM, such as a
+// set_vm_metadata that moves a member off its partners' nodes. choose gets
+// every live claim of the group other than this one, sorted by node and then
+// VMID, so it can tell which VM is going where, and the claim is recorded on
+// the node choose returns with vmid as its VM. A sibling that takes its turn
+// next sees that the VM is on its way there. choose returning "" records
+// nothing and keeps an earlier claim.
+//
+// When the record cannot be used, choose runs with no claims, and the error
+// matches ErrUnavailable. The other errors are those of PickExcept.
+func (c *Claim) PickLive(ctx context.Context, vmid int, choose func(live []Live) string) (string, error) {
+	if c == nil {
+		return choose(nil), nil
+	}
+	var node string
+	counted := false
+	wrote, err := c.turn(ctx, func(rec *record, now time.Time) bool {
+		counted = true
+		node = choose(c.live(rec, now))
+		if node == "" {
+			return false
+		}
+		c.put(rec, node, vmid)
+		return true
+	})
+	if !counted {
+		node = choose(nil)
+	}
+	if node != "" {
+		c.node, c.vmid = node, vmid
+		c.recorded = c.recorded || wrote
+		c.current = wrote
+	}
+	return node, err
+}
+
+// live returns the live claims of the group in the store's scope, leaving out
+// this claim, sorted by node and then VMID.
+func (c *Claim) live(rec *record, now time.Time) []Live {
+	out := []Live{}
+	for id, e := range rec.Claims {
+		if id == c.id || e.Scope != c.store.Scope || e.Group != c.group || !c.store.counts(e, now) {
+			continue
+		}
+		out = append(out, Live{Node: e.Node, VMID: e.VMID})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Node != out[j].Node {
+			return out[i].Node < out[j].Node
+		}
+		return out[i].VMID < out[j].VMID
+	})
+	return out
+}
+
 // Move records this claim on node, as a create does when it tries another
 // node after an attempt failed on the one it picked. A claim moved to another
 // node names no VMID until Bind names the VM of the new attempt, and one moved
