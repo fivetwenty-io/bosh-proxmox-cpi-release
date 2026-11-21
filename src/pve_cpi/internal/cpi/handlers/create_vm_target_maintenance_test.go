@@ -12,6 +12,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
@@ -103,6 +104,15 @@ func createOnPinnedNode(t *testing.T, c *maintenanceTargetCluster) (int32, error
 // config that mutate edits.
 func createOnPinnedNodeWith(t *testing.T, c *maintenanceTargetCluster, mutate func(*config.CPIConfig)) (int32, error) {
 	t.Helper()
+	return createOnPinnedNodeLogged(t, c, mutate, nil)
+}
+
+// createOnPinnedNodeLogged is createOnPinnedNodeWith with logger in place of
+// the deps' own logger when logger is not nil.
+func createOnPinnedNodeLogged(t *testing.T, c *maintenanceTargetCluster, mutate func(*config.CPIConfig),
+	logger *log.Logger,
+) (int32, error) {
+	t.Helper()
 	var created atomic.Int32
 	q := &vmMockQEMU{
 		createFn: func(context.Context, string, map[string]any) (string, error) {
@@ -120,6 +130,9 @@ func createOnPinnedNodeWith(t *testing.T, c *maintenanceTargetCluster, mutate fu
 	c.vmMockCluster = &vmMockCluster{listResourcesFn: emptyListResources}
 	deps.PVE.(*mockPVEClient).clusterSvc = c
 	deps.Config.EnsureNoIPConflicts = placementDisabled
+	if logger != nil {
+		deps.Logger = logger
+	}
 	args := mkArgs("agent-maintenance-target", testStemcellCID, map[string]any{"target_node": pinnedNode},
 		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
 		[]string{}, map[string]any{})
@@ -208,6 +221,37 @@ func TestCreateVM_IgnoresNotesWithoutMaintenanceTags(t *testing.T) {
 	}
 	if n := c.readsOf("pve2"); n != 0 {
 		t.Fatalf("pve2's notes were read %d times with no maintenance tags configured, want 0", n)
+	}
+}
+
+// TestCreateVM_WarnsOnATargetNodeNotesLineThatMissesTheMarker pins the
+// pinned path's warning for a notes line that looks like the maintenance
+// marker but is not one. The node stays placeable, so the create goes on, and
+// the warning names the node and the line so the operator can fix it.
+func TestCreateVM_WarnsOnATargetNodeNotesLineThatMissesTheMarker(t *testing.T) {
+	t.Parallel()
+	c := &maintenanceTargetCluster{notes: map[string]string{"pve2": "Rack 4\n- tags: maintenance"}}
+	logger, obs := log.NewObservedLogger(log.LevelDebug)
+	created, err := createOnPinnedNodeLogged(t, c, nil, logger)
+	if err != nil {
+		t.Fatalf("a target_node whose notes only miss the marker was refused: %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("create_vm created %d VMs, want 1", created)
+	}
+	var warned int
+	for _, e := range obs.All() {
+		if e.Level != log.LevelWarn || !strings.HasPrefix(e.Message, "create_vm: a line in the node's notes looks "+
+			"like a maintenance marker") {
+			continue
+		}
+		warned++
+		if e.Attrs["node"] != "pve2" || e.Attrs["line"] != "- tags: maintenance" {
+			t.Fatalf("warning attrs %v, want node pve2 and the line", e.Attrs)
+		}
+	}
+	if warned != 1 {
+		t.Fatalf("got %d near-miss warnings, want 1; entries %+v", warned, obs.All())
 	}
 }
 
