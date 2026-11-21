@@ -2163,10 +2163,10 @@ func (c *haCollector) goneVMVolumeCheck(jobGuests map[int]bool) func(volid, node
 				"cluster, and its name is one the CPI gives a VM's volumes. It is most likely a replica copy that PVE "+
 				"left when it purged the VM's job, or a volume a deletion left. Nothing removes it, so we remove it "+
 				"by hand, in this order. First, check the whole cluster, because the doctor read only the configs "+
-				"of the VMs it owns and so cannot rule out a VM it does not own. Run grep -l -e '%s' -e '%d' "+
-				"/etc/pve/nodes/*/qemu-server/*.conf and pvesh get /cluster/resources --type vm | grep -w %d, and "+
+				"of the VMs it owns and so cannot rule out a VM it does not own. Run grep -s -l -e '%s' -e '%d' "+
+				"/etc/pve/nodes/*/qemu-server/*.conf /etc/pve/nodes/*/lxc/*.conf and pvesh get /cluster/resources --type vm | grep -w %d, and "+
 				"expect both to print nothing. Also run pvesr list | grep -w %d on every node, which lists only that "+
-				"node's jobs, and expect no output. A config that names the volume means some VM owns it, so we "+
+				"node's jobs, and expect no output. A config that names the volume means some VM or container owns it, so we "+
 				"leave it alone. Second, on %s, run pvesm path %s, which prints /dev/zvol/ followed by the dataset, and then "+
 				"zfs list -t snapshot -o name <dataset> to list the snapshots, which should all be __replicate_ "+
 				"snapshots. Third, on %s, run pvesm free %s, which normally removes the volume with its snapshots. Only "+

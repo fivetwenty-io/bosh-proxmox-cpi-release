@@ -2142,7 +2142,7 @@ func TestGoneVMVolumeAdviceNamesTheRemovalCommands(t *testing.T) {
 	detail := fds[0].Detail
 	wantInOrder := []string{
 		"read only the configs of the VMs it owns",
-		"grep -l -e 'vm-560-disk-0' -e '560' /etc/pve/nodes/*/qemu-server/*.conf",
+		"grep -s -l -e 'vm-560-disk-0' -e '560' /etc/pve/nodes/*/qemu-server/*.conf /etc/pve/nodes/*/lxc/*.conf",
 		"pvesh get /cluster/resources --type vm | grep -w 560",
 		"pvesr list | grep -w 560 on every node",
 		"Second, on n2, run pvesm path local-zfs:vm-560-disk-0",

@@ -3137,12 +3137,12 @@ PVE purged a replicated VM's job when the VM went away, and it left the copy on 
 We run these steps by hand, in this order. First, we check the whole cluster from any node, with the volume name and the VMID from the finding.
 
 ```bash
-grep -l -e '<volume name>' -e '<vmid>' /etc/pve/nodes/*/qemu-server/*.conf
+grep -s -l -e '<volume name>' -e '<vmid>' /etc/pve/nodes/*/qemu-server/*.conf /etc/pve/nodes/*/lxc/*.conf
 pvesh get /cluster/resources --type vm | grep -w <vmid>
 pvesr list | grep -w <vmid>
 ```
 
-The first two commands must print nothing. The third lists only the jobs whose source is the node it runs on, so we run it on every node, and it must print nothing there too. A config that names the volume means some VM owns it, so we leave the volume alone.
+The first two commands must print nothing. The first reads the configs of containers as well as VMs, and its `-s` keeps it quiet on a cluster that has no containers. The third lists only the jobs whose source is the node it runs on, so we run it on every node, and it must print nothing there too. A config that names the volume means some VM or container owns it, so we leave the volume alone.
 
 Second, on the node that the finding names, we find the dataset and list its snapshots. The command `pvesm path` prints `/dev/zvol/` followed by the dataset, and every snapshot in the list should be a `__replicate_` snapshot.
 
