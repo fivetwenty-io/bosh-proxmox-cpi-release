@@ -50,6 +50,13 @@ func joinAntiAffinityGroupOf(ctx context.Context, deps Deps, vmid, index int, lo
 	}
 	m, _ := parseHaMarker(comment)
 	ident := haIdentity{Owner: m.Owner, Deployment: m.Deployment, Group: m.Group}
+	// The move runs outside the rules lock, which would otherwise hold every
+	// sibling's join for the whole migration. The locked join plans again from
+	// fresh reads, and the layout places members by index alone, so the move
+	// changes no rule. Its claim lasts until the rule is written, so a sibling
+	// that joins meanwhile sees this VM on its way to the new node.
+	release := moveJoinerOffPartners(ctx, deps, ident, vmid, index, m.Born, logger)
+	defer release()
 	if rule, ok := antiAffinityJoinSettled(ctx, deps, ident, vmid, index); ok {
 		return rule, nil
 	}

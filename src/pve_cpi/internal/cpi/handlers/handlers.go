@@ -137,6 +137,11 @@ type Deps struct {
 	// store, turns the claims off, and the spread counts only the members
 	// already tagged.
 	SpreadClaims func(cfg *config.CPIConfig, clusterStamp string, logger *log.Logger) *spreadclaim.Store
+
+	// coloMove fakes the reads and the migration of set_vm_metadata's move of
+	// a joining member off its anti-affinity partners' nodes in tests. Nil
+	// uses the cluster.
+	coloMove *aaColoMoveHooks
 }
 
 // EffectiveISOStorage returns the pool config-drive ISOs live on for this
