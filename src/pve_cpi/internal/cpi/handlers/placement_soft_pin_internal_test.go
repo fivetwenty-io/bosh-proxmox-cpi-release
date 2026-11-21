@@ -37,8 +37,11 @@ func TestAntiAffinityWidensASoftSingleNodeMemberPin(t *testing.T) {
 		log.NewNopLogger()); err != nil {
 		t.Fatal(err)
 	}
-	for _, pin := range []string{pin100, pin101} {
-		if stub.ruleNodes[pin] != "pve1,pve2,pve3" || stub.ruleStrict[pin] || stub.ruleComments[pin] != ours {
+	// Each widened pin records the node it named, so the restore can give it
+	// back once the member leaves the rule.
+	for pin, was := range map[string]string{pin100: "pve2", pin101: "pve1"} {
+		comment := ours + " " + ha.PinRestoreKey + "=" + was
+		if stub.ruleNodes[pin] != "pve1,pve2,pve3" || stub.ruleStrict[pin] || stub.ruleComments[pin] != comment {
 			t.Errorf("pin %s nodes %q strict %v comment %q", pin, stub.ruleNodes[pin], stub.ruleStrict[pin],
 				stub.ruleComments[pin])
 		}
