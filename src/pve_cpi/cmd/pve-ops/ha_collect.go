@@ -2320,6 +2320,7 @@ func (c *haCollector) guestLeftovers() {
 		if !c.judgesVM(g) {
 			continue
 		}
+		c.ownerTagMissing(g)
 		for _, t := range g.tagsWithPrefix(haBirthTagPrefix) {
 			if born, ok := birthTagTime(t); ok && c.now.Sub(born) > c.birthTagAge() {
 				c.rep.problem(haKindBirthTagStale, g.sid,
@@ -2341,10 +2342,32 @@ func (c *haCollector) guestLeftovers() {
 	}
 }
 
+// ownerTagMissing advises on a VM the CPI created that carries no owner tag
+// of any Director. Such a VM predates the owner tag, so the run cannot tell
+// whose it is. The doctor still judges it, because it is far likelier to be this
+// Director's than a stranger's, and it names the command that stamps the tag.
+// A run that names no Director has nothing to stamp, so it says nothing.
+func (c *haCollector) ownerTagMissing(g *haGuest) {
+	if c.owner == "" || !c.judges(g) {
+		return
+	}
+	for t := range g.tags {
+		if strings.HasPrefix(strings.ToLower(t), strings.ToLower(handlers.OwnerTagPrefix)) {
+			return
+		}
+	}
+	c.rep.advise(haKindOwnerTagMissing, g.sid,
+		"VM %d on %s carries bosh-cpi but no owner tag, so it predates the owner tag and the doctor cannot tell which Director owns it; "+
+			"it is judged as this Director's, and `cpi stemcell-refs adopt-owners` stamps the owner tag on the Director's older VMs",
+		g.ref.VMID, g.ref.Node)
+}
+
 // judgesVM reports whether the local policy of this run applies to g. A VM
 // whose owner tag names another Director belongs to that Director's policy,
 // and under a cpi-config entry a VM outside the entry's VM ID band cannot have
-// been created through it.
+// been created through it. A VM with no owner tag at all passes, because it
+// predates the owner tag and is far likelier this Director's than a stranger's;
+// ownerTagMissing advises on it and names adopt-owners.
 func (c *haCollector) judgesVM(g *haGuest) bool {
 	if c.owner != "" {
 		mine := handlers.OwnerTagFor(c.owner)

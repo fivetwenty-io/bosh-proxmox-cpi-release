@@ -21,6 +21,15 @@ import (
 
 func runCollect(t *testing.T, f *fakeHA, cfg *config.CPIConfig) *haReport {
 	t.Helper()
+	// A VM the fixtures build carries only bosh-cpi, which no current CPI writes,
+	// so the run would advise on every one. Stamp the run's own owner tag, the
+	// way create_vm does, on each that has none.
+	for i := range f.guests {
+		tags := f.guests[i].Tags
+		if strings.Contains(tags, "bosh-cpi") && !strings.Contains(tags, "bosh-owner--") {
+			f.guests[i].Tags = tags + ";bosh-owner--" + haDirector
+		}
+	}
 	return collectHA(context.Background(), f, cfg, haDirector, haNow)
 }
 

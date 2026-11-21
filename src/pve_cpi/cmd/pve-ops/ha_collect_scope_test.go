@@ -139,3 +139,29 @@ func TestCollectScopedRunJudgesOnlyTheBandMembersOfAMixedGroup(t *testing.T) {
 		}
 	}
 }
+
+// TestCollectAdvisesOwnerTagMissingForAVMThatPredatesTheOwnerTag: a VM with the
+// bosh-cpi tag and no owner tag is judged as this Director's, and a run that
+// names its Director points the operator at adopt-owners.
+func TestCollectAdvisesOwnerTagMissingForAVMThatPredatesTheOwnerTag(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	localVM(f, "n1", "bosh-cpi")
+	f.guests = append(f.guests, pve.GuestRef{VMID: 102, Node: "n1", Name: "mine", Tags: "bosh-cpi;bosh-owner--aaaaaaaa-0000", Status: "running"})
+	f.memory[102] = haGiB
+	f.configs[102] = map[string]any{"cpu": "x86-64-v2-AES"}
+	r := collectHA(context.Background(), f, haCfg("auto", "hold"), "aaaaaaaa-0000", haNow)
+	got := map[string]haFinding{}
+	for _, fd := range findings(r, haKindOwnerTagMissing) {
+		got[fd.Subject] = fd
+	}
+	// VM 100 is the base fixture's VM, which carries no owner tag either.
+	if len(got) != 2 || got["vm:100"].Severity != haSeverityAdvice ||
+		got["vm:101"].Severity != haSeverityAdvice || !strings.Contains(got["vm:101"].Detail, "cpi stemcell-refs adopt-owners") {
+		t.Errorf("want advice for vm:100 and vm:101 only, naming adopt-owners, got %+v", got)
+	}
+	// The VM is still judged, so its local-disk finding stays.
+	want(t, r, haKindLocalUnprotected, haSeverityProblem, "vm:101")
+	// A run that names no Director cannot say whose the VM is.
+	wantNone(t, collectHA(context.Background(), f, haCfg("auto", "hold"), "", haNow), haKindOwnerTagMissing)
+}

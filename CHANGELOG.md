@@ -14,6 +14,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Added
 
+- `pve-ops ha` reports the advice `owner_tag_missing` for a VM that carries `bosh-cpi` but no owner tag, when the run names its Director. Such a VM predates the owner tag, so the doctor still judges it as this Director's and now names `cpi stemcell-refs adopt-owners`, which stamps the tag.
+
 - `pve.ha.failback`, an optional boolean, turns `failback` off on every HA resource the CPI writes when we set it to `false`. Left unset, it lets the CPI turn the flag on for shared VMs. A cpi-config entry can override it under `pve_ha`.
 
 - `pve-ops ha` now reports a `replicate` VM whose HA resource has `failback` on as the `failback_on_replica` problem, and any other resource of this Director whose `failback` differs from the value the CPI writes as `failback_drift` advice.
