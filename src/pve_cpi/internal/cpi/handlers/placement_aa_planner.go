@@ -244,6 +244,7 @@ func (p *aaPlanner) plan(set *ha.RuleSet) ([]ha.RuleOp, error) {
 	} else {
 		out = aapattern.Layout(in)
 		p.logLayout(in, out)
+		p.logMoves(in, existing, out)
 		if p.keepInFlight {
 			p.keepInFlightRemovals(existing, &out)
 		}
@@ -259,6 +260,32 @@ func (p *aaPlanner) plan(set *ha.RuleSet) ([]ha.RuleOp, error) {
 		p.writeResourceHolds(cleanups)
 	}
 	return ops, nil
+}
+
+// logMoves logs once, at Info, when the plan takes members other than sid
+// out of rules they are in now, which happens when the group's rules do not
+// follow its members' indexes, such as rules an earlier release laid out by
+// the order its members joined in. The rewrite goes through the same rule
+// write as every plan, so it happens once.
+func (p *aaPlanner) logMoves(in aapattern.Input, existing map[string]*ha.Rule, out aapattern.Output) {
+	var moved []string
+	for _, m := range in.Members {
+		if m.Reserved || !m.Joinable || m.Key == p.sid || slices.Contains(moved, m.Key) {
+			continue
+		}
+		for name, r := range existing {
+			if slices.Contains(r.Resources, m.Key) && !slices.Contains(out.Rules[name], m.Key) {
+				moved = append(moved, m.Key)
+				break
+			}
+		}
+	}
+	if len(moved) == 0 || !p.once("moves") {
+		return
+	}
+	slices.Sort(moved)
+	p.logger.Info("anti-affinity: the plan moves members of the group to other rules, so that the rules follow "+
+		"the members' indexes", log.String("rule", p.ident.ruleName()), log.String("moved", strings.Join(moved, ",")))
 }
 
 // removalLayout returns the group's rules as the removal of exclude leaves
@@ -385,6 +412,7 @@ func (p *aaPlanner) layoutInput(set *ha.RuleSet, existing map[string]*ha.Rule) a
 		Domains: p.topo.domains(domainKeys),
 		Members: members,
 		Rules:   rules,
+		Spread:  len(p.topo.azs),
 		CanJoin: func(rule string, ms []string, key string) bool {
 			return p.canJoin(set, existing[rule], rule, ms, key)
 		},
