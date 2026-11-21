@@ -1382,8 +1382,8 @@ func TestLogLineNamesABorrowedClock(t *testing.T) {
 // cannot be read is left out of placement without failing the profile.
 func TestProfileHealthCarriesTheNotesMarker(t *testing.T) {
 	w := three()
-	w.nodes[1].notes = "Rack 4\ntags: maintenance"
-	w.nodes[2].notesErr = errors.New("node config unavailable")
+	w.notes = map[string]string{"pve2": "Rack 4\ntags: maintenance"}
+	w.notesErr = map[string]error{"pve3": errors.New("node config unavailable")}
 	cfg := cfgMode(config.HAModeAuto)
 	d := w.deps(cfg)
 	d.MaintenanceTags = cfg.MaintenanceNodeTagsValue()
@@ -1408,7 +1408,7 @@ func TestProfileHealthCarriesTheNotesMarker(t *testing.T) {
 	}
 
 	quiet := three()
-	quiet.nodes[1].notes = "tags: maintenance"
+	quiet.notes = map[string]string{"pve2": "tags: maintenance"}
 	if p := resolve(t, quiet, cfg); quiet.nodesAP.calls["config"] != 0 {
 		t.Fatalf("Deps without maintenance tags read %d node configs, want 0 (profile %s)",
 			quiet.nodesAP.calls["config"], p.Effective)

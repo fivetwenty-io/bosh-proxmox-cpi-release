@@ -29,9 +29,6 @@ type wnode struct {
 
 	versionErr error
 	statusErr  error
-
-	notes    string // the node's notes, the description of its node config
-	notesErr error
 }
 
 func votes(n int) *int { return &n }
@@ -40,6 +37,11 @@ func votes(n int) *int { return &n }
 // means a healthy answer.
 type world struct {
 	nodes []wnode
+
+	// notes holds each node's notes, the description of its node config, and
+	// notesErr fails the node config read of the nodes it names.
+	notes    map[string]string
+	notesErr map[string]error
 
 	noClusterRow bool // standalone shape
 	notQuorate   bool
@@ -372,13 +374,11 @@ func (n *fakeNodes) find(name string) (wnode, bool) {
 
 func (n *fakeNodes) ListConfig(_ context.Context, node string, _ *sdknodes.ListConfigParams) (*sdknodes.ListConfigResponse, error) {
 	n.hit("config")
-	x, _ := n.find(node)
-	if x.notesErr != nil {
-		return nil, x.notesErr
+	if err := n.w.notesErr[node]; err != nil {
+		return nil, err
 	}
 	resp := &sdknodes.ListConfigResponse{}
-	if x.notes != "" {
-		notes := x.notes
+	if notes, ok := n.w.notes[node]; ok {
 		resp.Description = &notes
 	}
 	return resp, nil
