@@ -1998,6 +1998,43 @@ func makeDir(t *testing.T, path string) {
 	}
 }
 
+// TestGoneVMVolumeAdviceNamesTheRemovalCommands checks that the advice prints
+// the operator's commands in order, filled in with the volume ID, node, and
+// VMID, and that the check across the cluster comes first.
+func TestGoneVMVolumeAdviceNamesTheRemovalCommands(t *testing.T) {
+	t.Parallel()
+	f := replicaFake()
+	f.volumes["n2/local-zfs"] = map[string]bool{"local-zfs:vm-560-disk-0": true}
+	r := runCollect(t, f, haCfg("auto", "replicate"))
+	fds := findings(r, haKindReplicaGoneVM)
+	if len(fds) != 1 {
+		t.Fatalf("gone-VM findings %+v, want one", fds)
+	}
+	detail := fds[0].Detail
+	wantInOrder := []string{
+		"read only the configs of the VMs it owns",
+		"grep -l -e 'vm-560-disk-0' -e '560' /etc/pve/nodes/*/qemu-server/*.conf",
+		"pvesh get /cluster/resources --type vm | grep -w 560",
+		"pvesr list | grep -w 560 on every node",
+		"Second, on n2, run pvesm path local-zfs:vm-560-disk-0",
+		"zfs list -t snapshot -o name <dataset>",
+		"Third, on n2, run pvesm free local-zfs:vm-560-disk-0",
+		"Only if PVE refuses because snapshots remain",
+		"zfs destroy <dataset>@<snapshot>",
+	}
+	at := 0
+	for _, want := range wantInOrder {
+		i := strings.Index(detail[at:], want)
+		if i < 0 {
+			t.Fatalf("detail lacks %q after offset %d, in order:\n%s", want, at, detail)
+		}
+		at += i + len(want)
+	}
+	if !strings.Contains(detail, "docs/troubleshooting.md#removing-the-volume-of-a-vm-that-no-longer-exists") {
+		t.Errorf("detail does not point to the troubleshooting procedure:\n%s", detail)
+	}
+}
+
 // TestCollectReportsTheVolumeOfAGoneVM covers a replica copy whose VM is gone:
 // PVE purged the job with the VM and left the copy on the target node.
 func TestCollectReportsTheVolumeOfAGoneVM(t *testing.T) {

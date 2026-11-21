@@ -142,6 +142,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Changed
 
+- The `replica_gone_vm_volume` advice from `pve-ops ha` now prints the commands that remove the leftover volume, in order, with the volume ID, node, and VMID filled in. They start with a cluster-wide check that no guest config, VM, or replication job names the volume, because the doctor read only the configs of the VMs it owns. Then they find the dataset and its snapshots, free the volume on its node, and destroy only its `__replicate_` snapshots if PVE refuses. Nothing removes the volume automatically, and [Troubleshooting](docs/troubleshooting.md#removing-the-volume-of-a-vm-that-no-longer-exists) describes the procedure.
+
 - Third-party Go dependencies are refreshed to their latest releases, including the AWS SDK for Go v2 modules behind the S3 stemcell fetcher, the Proxmox SDK at proxmox-apiclient-go v3.13.2, gRPC at v1.85.0, and `golang.org/x/net`, `golang.org/x/sync`, `golang.org/x/sys`, and `golang.org/x/text`. No direct dependency has a newer major version, and none is archived or deprecated.
 
 - The CI tooling moves to the latest releases, which means govulncheck v1.10.0, gosec v2.30.0, bosh CLI 7.11.2, gh 2.105.0, credhub CLI 2.9.64, and uv 0.13.9. The workflows also pin the current digest of the `golang:1.27` image, which still holds Go 1.27.4.

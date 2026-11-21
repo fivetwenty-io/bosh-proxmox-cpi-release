@@ -3086,6 +3086,50 @@ The CPI never writes this shape. Every place where it narrows a pin to one node 
 
 We remove the `bosh-replica=<node>` token from the pin's comment and leave the rest of the comment, including the Director's marker, as it is. Then we run `pve-ops ha --widen-replicas --apply`, as [Widening replica pins after a deploy](operations.md#widening-replica-pins-after-a-deploy) describes. The pass treats the pin as a new source-only pin, waits for a sync that started more than five minutes after the change it stamps, and then widens the pin.
 
+## Removing the volume of a VM that no longer exists
+
+**Symptom**
+
+`pve-ops ha` reports `replica_gone_vm_volume` as advice for a volume. Its VMID falls in this Director's VM band, no guest in the cluster has that VMID, and its name follows the CPI's volume naming.
+
+**Cause**
+
+PVE purged a replicated VM's job when the VM went away, and it left the copy on the target node. A deletion can leave a volume the same way. The CPI and the doctor never remove a volume themselves. The doctor also read only the configs of the VMs it owns, so it can't rule out a VM that this Director does not own.
+
+**Fix**
+
+We run these steps by hand, in this order. First, we check the whole cluster from any node, with the volume name and the VMID from the finding.
+
+```bash
+grep -l -e '<volume name>' -e '<vmid>' /etc/pve/nodes/*/qemu-server/*.conf
+pvesh get /cluster/resources --type vm | grep -w <vmid>
+pvesr list | grep -w <vmid>
+```
+
+The first two commands must print nothing. The third lists only the jobs whose source is the node it runs on, so we run it on every node, and it must print nothing there too. A config that names the volume means some VM owns it, so we leave the volume alone.
+
+Second, on the node that the finding names, we find the dataset and list its snapshots. The command `pvesm path` prints `/dev/zvol/` followed by the dataset, and every snapshot in the list should be a `__replicate_` snapshot.
+
+```bash
+pvesm path <volid>
+zfs list -t snapshot -o name <dataset>
+```
+
+Third, on the same node, we free the volume. PVE normally removes the volume together with its `__replicate_` snapshot, so the next step is rarely needed.
+
+```bash
+pvesm free <volid>
+```
+
+Only if PVE refuses because snapshots remain, we destroy only this volume's `__replicate_` snapshots, one at a time, and run `pvesm free` again.
+
+```bash
+zfs destroy <dataset>@<snapshot>
+pvesm free <volid>
+```
+
+The same check and removal for other orphan copies appear in [Removing orphan replicas](operations.md#removing-orphan-replicas).
+
 ## A rebalance refuses with exit 3
 
 **Symptom**
