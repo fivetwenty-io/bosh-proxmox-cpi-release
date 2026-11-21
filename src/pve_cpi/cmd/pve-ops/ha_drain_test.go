@@ -67,7 +67,8 @@ func TestRunHADrainDryRunText(t *testing.T) {
 	if code != exitOK || errOut != "" {
 		t.Fatalf("code = %d, stderr = %q", code, errOut)
 	}
-	want := handlers.DrainOptions{Node: "pve1", SettleTimeout: 30 * time.Minute}
+	want := handlers.DrainOptions{Node: "pve1", SettleTimeout: 30 * time.Minute,
+		MaintenanceWait: handlers.DrainDefaultMaintenanceWait}
 	if len(calls.drain) != 1 || calls.drain[0] != want || calls.owners[0] != haDirector {
 		t.Fatalf("calls = %+v, want one dry run with %+v", calls, want)
 	}
@@ -124,8 +125,8 @@ func TestRunHADrainTakesTheNodeAfterTheFlagsAndPrintsJSON(t *testing.T) {
 	if code != exitGate {
 		t.Fatalf("code = %d, want the report's", code)
 	}
-	if want := (handlers.DrainOptions{Node: "pve1", Apply: true, SettleTimeout: 45 * time.Minute}); calls.drain[0] !=
-		want {
+	if want := (handlers.DrainOptions{Node: "pve1", Apply: true, SettleTimeout: 45 * time.Minute,
+		MaintenanceWait: handlers.DrainDefaultMaintenanceWait}); calls.drain[0] != want {
 		t.Fatalf("options = %+v, want %+v", calls.drain[0], want)
 	}
 	var got map[string]any
@@ -152,6 +153,7 @@ func TestRunHAUndrainPassesTheRebalanceOptions(t *testing.T) {
 	}
 	o := calls.undrain[0]
 	if o.Node != "pve1" || !o.Apply || o.SettleTimeout != 10*time.Minute || o.NoRebalance ||
+		o.MaintenanceWait != handlers.DrainDefaultMaintenanceWait ||
 		o.Rebalance.MaxMoves != 3 || !o.Rebalance.RestoreOnly || o.Rebalance.MaxDuration != time.Hour {
 		t.Fatalf("options = %+v", o)
 	}
@@ -181,6 +183,8 @@ func TestRunHADrainUsageErrors(t *testing.T) {
 		{[]string{"drain", "pve1", "pve2", "--director-uuid", haDirector}, "name exactly one node"},
 		{[]string{"drain", "pve1", "--settle-timeout", "30s", "--director-uuid", haDirector},
 			"--settle-timeout must be at least 1m"},
+		{[]string{"drain", "pve1", "--maintenance-wait", "-1s", "--director-uuid", haDirector},
+			"--maintenance-wait must not be negative"},
 		{[]string{"drain", "pve1", "--widen-replicas"}, "--widen-replicas does not go with drain"},
 		{[]string{"undrain", "pve1", "--cpi-config", "x.json"}, "--cpi-config does not go with undrain"},
 		{[]string{"undrain", "pve1", "--max-moves", "0", "--director-uuid", haDirector},
@@ -213,5 +217,24 @@ func TestRunHADrainHelp(t *testing.T) {
 	code, out, _ := runHATest(t, d, "undrain", "--help")
 	if code != exitOK || !strings.Contains(out, haUndrainUsage) || !strings.Contains(out, "-no-rebalance") {
 		t.Fatalf("code = %d, out = %q", code, out)
+	}
+}
+
+func TestRunHADrainAndUndrainTakeTheMaintenanceWait(t *testing.T) {
+	t.Parallel()
+	d := newHATestDeps(rbCfg())
+	calls := withDrain(d, drainDryRun(), nil)
+	_, _, _ = runHATest(t, d, "drain", "pve1", "--apply", "--maintenance-wait", "2m", "--director-uuid", haDirector)
+	_, _, _ = runHATest(t, d, "undrain", "pve1", "--apply", "--maintenance-wait=0", "--director-uuid", haDirector)
+	if got := calls.drain[0].MaintenanceWait; got != 2*time.Minute {
+		t.Fatalf("drain wait = %s, want 2m", got)
+	}
+	if got := calls.undrain[0].MaintenanceWait; got != 0 {
+		t.Fatalf("undrain wait = %s, want 0", got)
+	}
+	for _, usage := range []string{haDrainUsage, haUndrainUsage} {
+		if !strings.Contains(usage, "[--maintenance-wait DURATION]") {
+			t.Fatalf("usage lacks the flag: %s", usage)
+		}
 	}
 }

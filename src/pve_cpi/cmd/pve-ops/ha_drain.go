@@ -16,11 +16,12 @@ import (
 
 const haDrainUsage = "usage: pve-ops ha drain <node> [--apply] [--config PATH] [--request PATH] " +
 	"[--director-uuid UUID]\n" +
-	"       [--settle-timeout DURATION] [--json]"
+	"       [--settle-timeout DURATION] [--maintenance-wait DURATION] [--json]"
 
 const haUndrainUsage = "usage: pve-ops ha undrain <node> [--apply] [--config PATH] [--request PATH] " +
 	"[--director-uuid UUID]\n" +
-	"       [--settle-timeout DURATION] [--no-rebalance] [--max-moves N] [--max-duration DURATION]\n" +
+	"       [--settle-timeout DURATION] [--maintenance-wait DURATION] [--no-rebalance] [--max-moves N]\n" +
+	"       [--max-duration DURATION]\n" +
 	"       [--start-threshold FRACTION] [--stop-threshold FRACTION] [--restore-only] [--json]"
 
 // haDrainFunc runs a drain for one Director against the cluster cfg names.
@@ -94,7 +95,7 @@ func parseHADrainFlags(command string, args []string, stdout, stderr io.Writer) 
 	fs.StringVar(&f.directorUUID, "director-uuid", "", "the UUID of the Director whose VMs the run acts on")
 	fs.BoolVar(&f.asJSON, "json", false, "JSON output")
 	var apply bool
-	var settle time.Duration
+	var settle, maintWait time.Duration
 	if command == handlers.DrainCommand {
 		fs.BoolVar(&apply, "apply", false, "stop the VMs that can't leave (without it the command is a dry run)")
 		fs.DurationVar(&settle, "settle-timeout", handlers.DrainDefaultSettleTimeout,
@@ -115,6 +116,9 @@ func parseHADrainFlags(command string, args []string, stdout, stderr io.Writer) 
 			"the memory spread at which memory evening stops")
 		fs.BoolVar(&o.RestoreOnly, "restore-only", false, "run only the separation and AZ restore phases")
 	}
+	fs.DurationVar(&maintWait, "maintenance-wait", handlers.DrainDefaultMaintenanceWait,
+		"with --apply, how long to wait for PVE to report the maintenance you just enabled (drain) or disabled "+
+			"(undrain) before the gate refuses; 0 refuses at once, and a dry run never waits")
 	var nodes []string
 	for rest := args; ; {
 		if err := fs.Parse(rest); errors.Is(err, flag.ErrHelp) {
@@ -135,11 +139,15 @@ func parseHADrainFlags(command string, args []string, stdout, stderr io.Writer) 
 		return fail("name exactly one node")
 	}
 	node := strings.TrimSpace(nodes[0])
+	if maintWait < 0 {
+		return fail("--maintenance-wait must not be negative")
+	}
 	if settle < handlers.RebalanceMinSettleTimeout {
 		return fail("--settle-timeout must be at least 1m")
 	}
-	f.drain = handlers.DrainOptions{Node: node, Apply: apply, SettleTimeout: settle}
+	f.drain = handlers.DrainOptions{Node: node, Apply: apply, SettleTimeout: settle, MaintenanceWait: maintWait}
 	f.undrain.Node, f.undrain.Apply, f.undrain.SettleTimeout = node, apply, settle
+	f.undrain.MaintenanceWait = maintWait
 	if command == handlers.UndrainCommand {
 		check := f.undrain.Rebalance
 		check.SettleTimeout = settle

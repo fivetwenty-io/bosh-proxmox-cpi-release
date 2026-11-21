@@ -605,3 +605,173 @@ func TestUndrainRun_ATokenedVMThatAlreadyRunsOnlyLosesItsToken(t *testing.T) {
 		t.Fatalf("vms %v", got)
 	}
 }
+
+// drLast returns the index of the last call that starts with prefix, or -1.
+func drLast(calls []string, prefix string) int {
+	for i := len(calls) - 1; i >= 0; i-- {
+		if strings.HasPrefix(calls[i], prefix) {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestDrainRun_ApplyWaitsForMaintenanceThatPVEReportsLate(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	drHold(f, 102)
+	// The operator enabled maintenance, and PVE reports it on the third read.
+	f.observeHook = func(n int) {
+		if n == 3 {
+			drMaintenance(f)
+		}
+	}
+	r := drRun(f, DrainCommand, true)
+	r.maintWait = 90 * time.Second
+	rep := r.drain(context.Background())
+	if rep.ExitCode != RebalanceExitOK || rep.Halted != "" {
+		t.Fatalf("exit %d halted %q", rep.ExitCode, rep.Halted)
+	}
+	if got := len(f.callsWith("sleep 5s")); got < 2 {
+		t.Fatalf("the run did not wait: %v", f.calls)
+	}
+	// The wait holds no lock, so the run lock comes after the last wait poll.
+	if lock, wait := slices.Index(f.calls, "runlock"), drLast(f.calls, "sleep"); lock < 0 || lock < wait {
+		t.Fatalf("the run took its lock before the wait ended: %v", f.calls)
+	}
+	if f.vms[102].state != "stopped" {
+		t.Fatalf("VM 102 state %q", f.vms[102].state)
+	}
+}
+
+func TestDrainRun_ApplyRefusesAfterTheMaintenanceWait(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	drHold(f, 102)
+	e := &f.profileVal.Health.Nodes[0]
+	e.CRMState, e.LRMMode, e.LRMState = "online", "active", "active"
+	r := drRun(f, DrainCommand, true)
+	r.maintWait = 20 * time.Second
+	rep := r.drain(context.Background())
+	if rep.ExitCode != RebalanceExitGate || rep.Halted != RebalanceGateMaintenance {
+		t.Fatalf("exit %d halted %q", rep.ExitCode, rep.Halted)
+	}
+	g := drGate(t, rep.Gates)
+	if g.OK || !strings.Contains(g.Detail, "CRM state online") || !strings.Contains(g.Detail, "LRM mode active") ||
+		!strings.Contains(g.Detail, "LRM state active") || !strings.Contains(g.Detail, "after waiting 20s") {
+		t.Fatalf("maintenance gate %+v", g)
+	}
+	if got := len(f.callsWith("sleep 5s")); got != 4 {
+		t.Fatalf("polled %d times, want 4: %v", got, f.calls)
+	}
+	if len(f.callsWith("stop ")) != 0 || f.release != 1 {
+		t.Fatalf("a refused run wrote or kept its lock: %v", f.calls)
+	}
+
+	// A dry run never waits, and a wait of zero refuses at once.
+	for _, tc := range []struct {
+		apply bool
+		wait  time.Duration
+	}{{false, 90 * time.Second}, {true, 0}} {
+		f = newFakeRebalanceIO()
+		r = drRun(f, DrainCommand, tc.apply)
+		r.maintWait = tc.wait
+		r.drain(context.Background())
+		if len(f.callsWith("sleep")) != 0 {
+			t.Fatalf("apply %v wait %s slept: %v", tc.apply, tc.wait, f.calls)
+		}
+	}
+}
+
+func TestDrainRun_TheMaintenanceWaitStopsOnInterrupt(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	drHold(f, 102)
+	f.sleepHook = func(context.Context, time.Duration) error { return context.Canceled }
+	r := drRun(f, DrainCommand, true)
+	r.maintWait = 90 * time.Second
+	rep := r.drain(context.Background())
+	if rep.ExitCode != RebalanceExitError || !strings.Contains(rep.Halted, "interrupted") {
+		t.Fatalf("exit %d halted %q", rep.ExitCode, rep.Halted)
+	}
+	if len(f.callsWith("runlock")) != 0 || len(f.callsWith("stop ")) != 0 {
+		t.Fatalf("an interrupted wait took a lock or wrote: %v", f.calls)
+	}
+}
+
+func TestUndrainRun_ApplyWaitsForTheCRMToLeaveMaintenance(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	drStopped(f, 102, "pve01")
+	// The LRM is active, and the CRM leaves maintenance on the fourth read.
+	f.profileVal.Health.Nodes[0].CRMState = "maintenance"
+	f.observeHook = func(n int) {
+		if n == 4 {
+			f.profileVal.Health.Nodes[0].CRMState = "online"
+		}
+	}
+	r := drRun(f, UndrainCommand, true)
+	r.maintWait = 90 * time.Second
+	r.noRebalance = true
+	rep := r.undrain(context.Background())
+	if rep.ExitCode != RebalanceExitOK || rep.Halted != "" {
+		t.Fatalf("exit %d halted %q", rep.ExitCode, rep.Halted)
+	}
+	if got := len(f.callsWith("sleep 5s")); got != 3 {
+		t.Fatalf("polled %d times, want 3: %v", got, f.calls)
+	}
+	if lock, wait := slices.Index(f.calls, "runlock"), drLast(f.calls, "sleep"); lock < 0 || lock < wait {
+		t.Fatalf("the run took its lock before the wait ended: %v", f.calls)
+	}
+	if f.vms[102].state != "started" {
+		t.Fatalf("VM 102 state %q", f.vms[102].state)
+	}
+}
+
+func TestUndrainRun_ApplyRefusesAfterTheMaintenanceWait(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	drMaintenance(f)
+	drStopped(f, 102, "pve01")
+	r := drRun(f, UndrainCommand, true)
+	r.maintWait = 15 * time.Second
+	rep := r.undrain(context.Background())
+	if rep.ExitCode != RebalanceExitGate || rep.Halted != RebalanceGateMaintenance {
+		t.Fatalf("exit %d halted %q", rep.ExitCode, rep.Halted)
+	}
+	g := drGate(t, rep.Gates)
+	if g.OK || !strings.Contains(g.Detail, "CRM state maintenance") || !strings.Contains(g.Detail, "LRM mode maintenance") ||
+		!strings.Contains(g.Detail, "LRM state empty") || !strings.Contains(g.Detail, "after waiting 15s") {
+		t.Fatalf("maintenance gate %+v", g)
+	}
+	if len(f.callsWith("start ")) != 0 || f.vms[102].state != "stopped" {
+		t.Fatal("a refused undrain started a VM")
+	}
+}
+
+func TestDrainRun_ASoftPinWarningDropsWhenTheVMLeavesDuringTheWait(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	drMaintenance(f)
+	f.addVM(101, "pve01", 4)
+	f.pins[101] = rbPin(101, map[string]int{"pve01": 2, "pve02": 1, "pve03": 1})
+	// The first read lists VM 101 on the node, and PVE HA moves it before the
+	// second.
+	f.observeHook = func(n int) {
+		if n == 2 {
+			f.vms[101].node = "pve02"
+		}
+	}
+	rep := drRun(f, DrainCommand, true).drain(context.Background())
+	if rep.ExitCode != RebalanceExitOK || rep.Halted != "" {
+		t.Fatalf("exit %d halted %q", rep.ExitCode, rep.Halted)
+	}
+	if len(rep.VMs) != 0 {
+		t.Fatalf("vms %v", drVMs(rep.VMs))
+	}
+	for _, w := range rep.Warnings {
+		if strings.Contains(w, "soft node-affinity") {
+			t.Fatalf("a VM that left still draws a soft pin warning: %q", rep.Warnings)
+		}
+	}
+}

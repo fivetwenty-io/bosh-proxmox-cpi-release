@@ -18,6 +18,11 @@ const (
 	// DrainDefaultSettleTimeout bounds each wait of a drain. A node can hold
 	// many VMs, and PVE HA moves them a few at a time.
 	DrainDefaultSettleTimeout = 30 * time.Minute
+	// DrainDefaultMaintenanceWait bounds how long an applied drain or undrain
+	// waits for PVE to report the maintenance the operator just enabled or
+	// disabled. The CRM took 30 to 40 seconds to leave maintenance in a lab
+	// run, so 90 seconds leaves a margin.
+	DrainDefaultMaintenanceWait = 90 * time.Second
 	// UndrainDefaultSettleTimeout bounds the wait for the VMs an undrain
 	// starts, and it is the settle timeout of the rebalance that follows.
 	UndrainDefaultSettleTimeout = 10 * time.Minute
@@ -75,6 +80,10 @@ type DrainOptions struct {
 	// SettleTimeout bounds the wait for PVE HA to move the VMs that can
 	// leave, and the wait for the stops.
 	SettleTimeout time.Duration
+	// MaintenanceWait bounds the wait, with Apply, for the HA manager to
+	// report the node in maintenance after the operator enabled it. Zero
+	// refuses at once. A dry run never waits.
+	MaintenanceWait time.Duration
 }
 
 // UndrainOptions shape a run of pve-ops ha undrain.
@@ -93,6 +102,10 @@ type UndrainOptions struct {
 	// restore-only choice. Its Apply and SettleTimeout are set from the
 	// undrain's.
 	Rebalance RebalanceOptions
+	// MaintenanceWait bounds the wait, with Apply, for the HA manager to
+	// leave maintenance after the operator disabled it. Zero refuses at once.
+	// A dry run never waits.
+	MaintenanceWait time.Duration
 }
 
 // DrainVM is one VM of this Director in a drain or an undrain.
@@ -173,6 +186,7 @@ func DrainHA(ctx context.Context, deps Deps, opts DrainOptions) (DrainReport, er
 	}
 	rio := newPVERebalanceIO(deps, RebalanceOptions{SettleTimeout: opts.SettleTimeout}.withDefaults())
 	r := newDrainRun(deps, DrainCommand, opts.Node, opts.Apply, opts.SettleTimeout, rio)
+	r.maintWait = opts.MaintenanceWait
 	return r.drain(ctx), nil
 }
 
@@ -193,7 +207,7 @@ func UndrainHA(ctx context.Context, deps Deps, opts UndrainOptions) (DrainReport
 	opts.Rebalance = opts.Rebalance.withDefaults()
 	r := newDrainRun(deps, UndrainCommand, opts.Node, opts.Apply, opts.SettleTimeout,
 		newPVERebalanceIO(deps, opts.Rebalance))
-	r.noRebalance, r.rebalance = opts.NoRebalance, opts.Rebalance
+	r.noRebalance, r.rebalance, r.maintWait = opts.NoRebalance, opts.Rebalance, opts.MaintenanceWait
 	return r.undrain(ctx), nil
 }
 
@@ -223,11 +237,19 @@ type drainRun struct {
 	node   string
 	apply  bool
 	settle time.Duration
-	io     rebalanceIO
-	logger *log.Logger
-	op     string
+	// maintWait bounds the wait for PVE to report the operator's enable or
+	// disable of maintenance. Zero refuses at once.
+	maintWait time.Duration
+	io        rebalanceIO
+	logger    *log.Logger
+	op        string
 
 	report DrainReport
+
+	// waited is how long the maintenance wait ran, zero when it did not.
+	waited time.Duration
+	// softHeldIDs holds the VMs whose soft pin PVE HA kept on the node.
+	softHeldIDs map[int]bool
 
 	// noRebalance and rebalance shape the rebalance an undrain runs.
 	noRebalance bool
@@ -305,6 +327,13 @@ func (r *drainRun) observe(ctx context.Context) (*drainView, error) {
 		r.warn("the configuration names no allocation journal, so the run can't see the Director's own records; " +
 			"the Director's own CPI must have no journal either, or this run may stop or start a VM under a CPI " +
 			"call")
+	}
+	if r.waited > 0 {
+		for i := range view.gates {
+			if g := &view.gates[i]; g.Name == RebalanceGateMaintenance && !g.OK {
+				g.Detail += fmt.Sprintf(", after waiting %s", r.waited)
+			}
+		}
 	}
 	r.report.Gates = view.gates
 	if profile != nil {
@@ -417,6 +446,80 @@ func pveMaintenance(e *pve.NodeHealthEntry) bool {
 	return e.CRMState == "maintenance" || e.LRMMode == "maintenance" || e.LRMState == "maintenance"
 }
 
+// maintenanceReads names the three fields the maintenance gate read and their
+// values, so a refusal shows what PVE reported.
+func maintenanceReads(e *pve.NodeHealthEntry) string {
+	val := func(v string) string {
+		if v == "" {
+			return "empty"
+		}
+		return v
+	}
+	return fmt.Sprintf(" (the last read was CRM state %s, LRM mode %s, and LRM state %s)", val(e.CRMState),
+		val(e.LRMMode), val(e.LRMState))
+}
+
+// awaitMaintenance gives PVE a bounded time to report what the operator just
+// did, which is the enable for a drain and the disable for an undrain. It runs
+// before the run takes any lock or writes any record, polls on the gates'
+// own reads, and returns once the maintenance gate passes, once another gate
+// refuses, or once the wait runs out. In each case the caller goes on and
+// reaches its own verdict. It returns false, with the report halted, when a
+// read failed or the run was interrupted. A dry run, and a wait of zero, return
+// at once.
+func (r *drainRun) awaitMaintenance(ctx context.Context) bool {
+	if !r.apply || r.maintWait <= 0 {
+		return true
+	}
+	undrain := r.report.Command == UndrainCommand
+	deadline := r.io.now().Add(r.maintWait)
+	for {
+		view, err := r.observe(ctx)
+		if err != nil {
+			r.readFailed(ctx, err)
+			return false
+		}
+		if !r.onlyMaintenanceRefuses(view, undrain) {
+			return true
+		}
+		if !r.io.now().Before(deadline) {
+			r.waited = r.maintWait
+			return true
+		}
+		if err := r.io.sleep(ctx, rebalanceSettlePoll); err != nil {
+			r.halt(RebalanceExitError, "the run was interrupted while it waited for PVE to report the maintenance "+
+				"of node "+r.node+"; run it again to go on")
+			return false
+		}
+	}
+}
+
+// onlyMaintenanceRefuses reports whether the maintenance gate is the one gate
+// that refuses, and PVE still reports what the operator's command should have
+// changed. An undrain waits only for PVE's own maintenance to end, because an
+// operator tag stays until the operator removes it.
+func (r *drainRun) onlyMaintenanceRefuses(view *drainView, undrain bool) bool {
+	refusing := 0
+	for i := range view.gates {
+		g := &view.gates[i]
+		if g.OK {
+			continue
+		}
+		if g.Name != RebalanceGateMaintenance {
+			return false
+		}
+		refusing++
+	}
+	if refusing != 1 {
+		return false
+	}
+	if !undrain {
+		return true
+	}
+	e := healthEntry(view.profile.Health, r.node)
+	return e != nil && pveMaintenance(e)
+}
+
 // maintenanceGate reads the named node's maintenance. A drain needs the node
 // in PVE HA maintenance, and an undrain needs it out of PVE HA maintenance and
 // free of an operator maintenance tag. A dry run reports the node's state and
@@ -439,12 +542,18 @@ func maintenanceGate(profile *ha.Profile, node string, apply, undrain bool) Reba
 	case !undrain:
 		g.Detail = "the HA manager doesn't report node " + node + " in maintenance; run `ha-manager crm-command " +
 			"node-maintenance enable " + node + "` on a PVE node first"
+		if apply {
+			g.Detail += maintenanceReads(e)
+		}
 		if e.Maintenance {
 			g.Detail += ", because an operator maintenance tag alone moves nothing"
 		}
 	case inPVE:
 		g.Detail = "node " + node + " is still in HA maintenance; run `ha-manager crm-command node-maintenance " +
 			"disable " + node + "` on a PVE node first"
+		if apply {
+			g.Detail += maintenanceReads(e)
+		}
 	case e.Maintenance:
 		g.Detail = "node " + node + " carries an operator maintenance tag, so the CPI places nothing on it; " +
 			"remove the tag first"
@@ -480,6 +589,7 @@ func (r *drainRun) recordFates(view *drainView) {
 	for i := range view.fates {
 		r.report.VMs = append(r.report.VMs, drainVMOf(&view.fates[i], r.node))
 	}
+	r.warnSoftPins(view)
 }
 
 // reportVM returns the report entry of vmid, or nil.
@@ -494,6 +604,9 @@ func (r *drainRun) reportVM(vmid int) *DrainVM {
 
 // drain runs the steps of section 23.5 of the design.
 func (r *drainRun) drain(ctx context.Context) DrainReport {
+	if !r.awaitMaintenance(ctx) {
+		return r.report
+	}
 	if r.apply {
 		release, ok := r.lock(ctx, 2*r.settle+rebalanceRunLockMargin)
 		if !ok {
@@ -506,7 +619,6 @@ func (r *drainRun) drain(ctx context.Context) DrainReport {
 		return r.readFailed(ctx, err)
 	}
 	r.recordFates(view)
-	r.warnSoftPins(view)
 	if !r.report.GatesOK() || !r.apply {
 		r.remind(DrainCommand)
 		if !r.report.GatesOK() {
@@ -541,14 +653,23 @@ func (r *drainRun) drain(ctx context.Context) DrainReport {
 	return r.report
 }
 
-// warnSoftPins warns about each VM that can leave while its soft pin puts only
-// the drained node in its highest priority class. PVE HA should move it to the
-// pin's next class, and a VM PVE keeps on the node is one the drain stops once
-// the settle timeout runs out.
+// softPinWarningMark is the words every soft pin warning carries, which lets a
+// rebuild find and drop the earlier ones.
+const softPinWarningMark = "has the soft node-affinity rule"
+
+// warnSoftPins rebuilds the soft pin warnings from view, so they name only the
+// VMs still on the node at the last read. It warns about each VM that can leave
+// while its soft pin puts only the drained node in its highest priority class,
+// and about each such VM PVE HA kept on the node. PVE HA should move the first
+// kind to the pin's next class, and a VM PVE keeps on the node is one the drain
+// stops once the settle timeout runs out.
 func (r *drainRun) warnSoftPins(view *drainView) {
+	r.report.Warnings = slices.DeleteFunc(r.report.Warnings, func(w string) bool {
+		return strings.Contains(w, softPinWarningMark)
+	})
 	for i := range view.fates {
-		if f := &view.fates[i]; f.Fate == DrainLeaves && f.softPin != "" {
-			r.warn(fmt.Sprintf("VM %d has the soft node-affinity rule %s, which puts only node %s in its highest "+
+		if f := &view.fates[i]; f.softPin != "" && (f.Fate == DrainLeaves || r.softHeldIDs[f.VMID]) {
+			r.warn(fmt.Sprintf("VM %d "+softPinWarningMark+" %s, which puts only node %s in its highest "+
 				"priority class; PVE HA should move it to the rule's next class, and if PVE keeps it on the node, "+
 				"the drain stops it once the settle timeout runs out", f.VMID, f.softPin, r.node))
 		}
@@ -569,6 +690,10 @@ func (r *drainRun) softHeld(leaving []*drainVMFate, moving []string) bool {
 		}
 	}
 	for _, f := range leaving {
+		if r.softHeldIDs == nil {
+			r.softHeldIDs = map[int]bool{}
+		}
+		r.softHeldIDs[f.VMID] = true
 		f.Fate, f.Targets = DrainStays, nil
 		f.Reason = "its soft node-affinity rule " + f.softPin + " puts only node " + r.node + " in its highest " +
 			"priority class, and PVE HA kept it on the node until the settle timeout ran out"
@@ -878,6 +1003,9 @@ func (r *drainRun) remind(command string) {
 
 // undrain runs the steps of section 23.7 of the design.
 func (r *drainRun) undrain(ctx context.Context) DrainReport {
+	if !r.awaitMaintenance(ctx) {
+		return r.report
+	}
 	if r.apply {
 		// The lease covers the wait for the starts and the whole rebalance,
 		// which runs under this lock.
