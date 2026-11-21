@@ -3028,7 +3028,7 @@ Nothing needs to happen, because the group's next rule write drops the hold. To 
 
 **Cause**
 
-A join flattens a member's pin, because PVE refuses several priorities for a VM in a resource-affinity rule, and the field records the priorities the pin had. The plan that takes the member out of its last rule writes them back. The field stays when that write failed, which the CPI logs as a warning, or when a live hold of the group defers the restore until the recreate the hold waits for has joined.
+A join flattens a member's pin, because PVE refuses several priorities for a VM in a resource-affinity rule, and the field records the priorities the pin had. The plan that takes the member out of its last rule writes them back. The field stays when that write failed, which the CPI logs as a warning, or when a live hold of the group defers the restore until the recreate the hold waits for has joined. The call that starts such a wait logs it once at Info, with the VM's `sid`, its `group`, and its `pin`, so a deferred restore shows in the task log of the delete that left the member in no rule.
 
 **Diagnosis**
 

@@ -934,6 +934,9 @@ func removeFromGroupRules(
 		})
 		maps.Copy(written, writtenRules(res, comments))
 		confined = append(confined, confinedBy(res)...)
+		if err == nil && res != nil {
+			logRestoreWaits(p, res.Set, logger)
+		}
 		if err != nil {
 			errs = errors.Join(errs, fmt.Errorf("anti-affinity: take %s out of the rules of group %s: %w", sid,
 				ident.ruleName(), err))

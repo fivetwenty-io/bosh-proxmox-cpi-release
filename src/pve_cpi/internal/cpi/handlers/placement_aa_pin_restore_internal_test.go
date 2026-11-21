@@ -362,3 +362,87 @@ func TestPinRestore_OlderReadersIgnoreTheRecord(t *testing.T) {
 		t.Fatalf("marker with a record = %+v, %v; want %+v, %v", got, okGot, want, okWant)
 	}
 }
+
+// TestPinRestore_AWaitForALiveHoldLogsOnceAtInfo walks the scale-down the lab
+// ran. On four nodes the rule holds the three members 100, 101, and 102, and
+// 100's pin is flat with the priorities its join took recorded. The delete of
+// 101 leaves 100 in the rule, so nothing waits. The delete of 102 takes 100
+// out of its last rule while the group records live holds, so the restore
+// waits, and that delete logs one Info line that names the VM and the group.
+// A later plan that finds the restore still waiting logs it at Debug only.
+func TestPinRestore_AWaitForALiveHoldLogsOnceAtInfo(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	stub := newAAStub()
+	stub.purgeFromRules = true
+	fleet := newAAHoldFleet(stub, 100, 101, 102)
+	stub.seedRule(aaRule, "vm:100,vm:101,vm:102")
+	pin := naRuleNameFor(100)
+	stub.seedRuleWithComment(pin, "vm:100",
+		haIdentity{Owner: aaDirector}.marker()+" "+ha.PinRestoreKey+"=pve1:2,pve2,pve3,pve4")
+	stub.ruleTypes[pin] = ha.RuleTypeNodeAffinity
+	stub.ruleNodes[pin] = "pve1,pve2,pve3,pve4"
+	deps := aaReplanDeps(stub, true)
+	waits := func(obs *log.Observer, level slog.Level) int {
+		n := 0
+		for _, e := range obs.All() {
+			if e.Level == level && strings.Contains(e.Message, "restore of the priorities") &&
+				strings.Contains(e.Message, "waits") {
+				n++
+			}
+		}
+		return n
+	}
+
+	logger, obs := log.NewObservedLogger(slog.LevelDebug)
+	fleet.destroy(101)
+	if err := removeAntiAffinityMembership(ctx, deps, 101, webTags(101), logger); err != nil {
+		t.Fatalf("remove 101: %v", err)
+	}
+	if n := waits(obs, slog.LevelInfo) + waits(obs, slog.LevelDebug); n != 0 {
+		t.Fatalf("the delete of 101 logged %d waits; 100 is still in the rule", n)
+	}
+
+	logger, obs = log.NewObservedLogger(slog.LevelDebug)
+	fleet.destroy(102)
+	if err := removeAntiAffinityMembership(ctx, deps, 102, webTags(102), logger); err != nil {
+		t.Fatalf("remove 102: %v", err)
+	}
+	if rec, ok := pinRecord(stub, pin); !ok || stub.ruleNodes[pin] != "pve1,pve2,pve3,pve4" {
+		t.Fatalf("pin = %q with record %q, %v; want it flat and waiting", stub.ruleNodes[pin], rec, ok)
+	}
+	if n := waits(obs, slog.LevelInfo); n != 1 {
+		t.Fatalf("the delete of 102 logged %d waits at Info; want 1 in %+v", n, obs.All())
+	}
+	for _, e := range obs.All() {
+		if e.Level != slog.LevelInfo || !strings.Contains(e.Message, "waits") {
+			continue
+		}
+		for k, v := range map[string]string{"sid": "vm:100", "group": "web", "rule": aaRule, "pin": pin} {
+			if got := e.Attrs[k]; got != v {
+				t.Errorf("field %s = %v; want %q", k, got, v)
+			}
+		}
+	}
+
+	in, err := readAntiAffinityCheckInput(ctx, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := readHARuleSet(ctx, deps.PVE.Cluster())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident := aaIdent("web")
+	p := newAAPlanner(in.Config, in.Profile, ident, scanGroupMembers(in.Guests, in.GuestsComplete, ident),
+		log.NewNopLogger())
+	p.heal, p.managed = true, func() (map[string]string, error) { return in.Resources, nil }
+	if _, err := p.plan(set); err != nil {
+		t.Fatal(err)
+	}
+	logger, obs = log.NewObservedLogger(slog.LevelDebug)
+	restoreGroupPins(ctx, deps, in.Profile, p, set, logger)
+	if info, debug := waits(obs, slog.LevelInfo), waits(obs, slog.LevelDebug); info != 0 || debug != 1 {
+		t.Fatalf("a later plan logged %d waits at Info and %d at Debug; want 0 and 1", info, debug)
+	}
+}

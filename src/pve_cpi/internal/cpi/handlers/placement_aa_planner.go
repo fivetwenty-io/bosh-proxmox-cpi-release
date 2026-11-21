@@ -195,6 +195,10 @@ type aaPlanner struct {
 	// drops them, because they record a live hold that no other rule or
 	// resource could take over once a hold write failed.
 	keepForHold map[string]bool
+	// ruled names every member that one of the group's rules held in any
+	// plan of this planner, so the call that takes a member out of its last
+	// rule can tell, even when the rule write plans again after it wrote.
+	ruled map[string]bool
 }
 
 // once reports whether the line keyed key has not been logged yet, and marks
@@ -264,7 +268,13 @@ func (p *aaPlanner) prepare(set *ha.RuleSet) (map[string]*ha.Rule, aapattern.Inp
 		return nil, aapattern.Input{}, err
 	}
 	p.leaving = map[string]bool{}
+	if p.ruled == nil {
+		p.ruled = map[string]bool{}
+	}
 	for _, r := range existing {
+		for _, s := range r.Resources {
+			p.ruled[s] = true
+		}
 		if m, ok := parseHaMarker(r.Comment); ok {
 			for _, s := range m.Left {
 				p.leaving[s] = true

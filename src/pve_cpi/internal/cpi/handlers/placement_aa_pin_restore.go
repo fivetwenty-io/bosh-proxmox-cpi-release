@@ -124,7 +124,11 @@ func inAnyResourceAffinityRule(set *ha.RuleSet, sid string) bool {
 func restoreGroupPins(
 	ctx context.Context, deps Deps, profile *ha.Profile, planner *aaPlanner, set *ha.RuleSet, logger *log.Logger,
 ) {
-	if planner == nil || set == nil || len(planner.restoreOps(set)) == 0 {
+	if planner == nil || set == nil {
+		return
+	}
+	logRestoreWaits(planner, set, logger)
+	if len(planner.restoreOps(set)) == 0 {
 		return
 	}
 	// The restore plans on a copy, so the caller's planner keeps what its
@@ -164,6 +168,37 @@ func restoreGroupPins(
 		logger.Warn("anti-affinity: could not restore the priorities of a member's pin, so the pin keeps one "+
 			"priority on every node until the group's next plan or a fix of the group restores them",
 			log.String("rule", planner.ident.ruleName()), log.Err(err))
+	}
+}
+
+// logRestoreWaits says that the restore of a member's pin waits while the
+// group records a live hold. planner's last plan must have been written, and
+// set is the rules as that write left them. It logs at Info once per wait,
+// for the plan that took the member out of the last of the group's rules it
+// was in, which is a delete's removal or a join's plan, and at Debug for
+// every later plan that finds the restore still waiting, so a scale-down that
+// deletes several members logs the wait once. The group's first write after
+// the hold lapses or its recreate joins restores the pin, and that write logs
+// the restore.
+func logRestoreWaits(planner *aaPlanner, set *ha.RuleSet, logger *log.Logger) {
+	restores := planner.pinRestores(set)
+	for i := range restores {
+		r := &restores[i]
+		if !r.Deferred {
+			continue
+		}
+		left := planner.ruled[r.SID]
+		fields := []log.Field{log.String("pin", r.Pin), log.String("sid", r.SID),
+			log.String("deployment", planner.ident.Deployment), log.String("group", planner.ident.Group),
+			log.String("rule", planner.ident.ruleName()), log.String("nodes", r.Nodes)}
+		const msg = "anti-affinity: a member left its last anti-affinity rule while the group records a live hold, " +
+			"so the restore of the priorities its join took from its pin waits until the hold lapses or its " +
+			"recreate joins"
+		if left && planner.once("restore wait "+r.SID) {
+			logger.Info(msg, fields...)
+			continue
+		}
+		logger.Debug(msg, fields...)
 	}
 }
 
