@@ -527,6 +527,46 @@ func TestRetireEmptiedParker_AStopThatOutlastsTheWaitLeavesTheParkerForTheSweep(
 	r.requireRetired(t)
 }
 
+// TestRetireEmptiedParker_AParkerTheCRMNeverPicksUpEndsTheWaitAfterARound
+// proves the drained retirement stops waiting for a parker whose stop the
+// CRM has not taken up once a whole CRM round has run since the wait began,
+// instead of spending the full wait on a state that no later round is
+// likely to change. Retirements run one after another, so each such parker
+// would otherwise add the whole wait to the response.
+func TestRetireEmptiedParker_AParkerTheCRMNeverPicksUpEndsTheWaitAfterARound(t *testing.T) {
+	r := newRegistrationStopRig(t, 0)
+	t.Cleanup(setParkerRetireSettleWaitForTest(10 * time.Second))
+	reads := 0
+	r.scene.Do(func(s *HADeleteScene) {
+		delete(s.Services, phSID)
+		delete(s.IndexHAState, 90000)
+		s.CRMAge = 2
+		// Each manager status read sees a CRM round five seconds newer.
+		s.OnRead = func(s *HADeleteScene, n int) {
+			reads = n
+			s.Now += 5
+		}
+	})
+	logger, observer := log.NewObservedLogger(log.LevelInfo)
+	r.deps.Logger = logger
+	r.retireThroughDrain()
+
+	got := 0
+	r.scene.Do(func(*HADeleteScene) { got = reads })
+	if got > 12 {
+		t.Fatalf("the wait kept polling a parker the CRM never took up: %d manager status reads", got)
+	}
+	found := false
+	for _, e := range observer.All() {
+		if strings.Contains(e.Message, "has not taken up the stop") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the log must say the CRM ran a round without taking up the parker; entries %+v", observer.All())
+	}
+}
+
 // TestRetireEmptiedParker_AnInlineRetirementDoesNotWaitForTheStop proves the
 // emptying paths that retire inline, while they may still hold the disk's
 // lifecycle lock, read the HA state once and leave a parker PVE HA is still

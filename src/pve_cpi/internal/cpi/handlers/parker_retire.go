@@ -327,6 +327,12 @@ func retireEmptiedParkerNow(ctx context.Context, deps Deps, node string, vmid in
 // to the teardown's HA gate, which reads the state again under the claim and
 // defers on anything that does not let the destroy proceed, as it always has.
 //
+// A parker the CRM has not taken up yet waits for one CRM round only. Once a
+// round that began after the first read has run and the CRM still doesn't
+// hold the parker, or when the read has no CRM round at all, the wait ends
+// and the HA gate decides, because later rounds are unlikely to change it and
+// retirements run one after another.
+//
 // The wait lasts parkerRetireSettleWait at most, cut short so the request
 // still has a retirement's budget left after it, and it never starts when the
 // request has less than that left. A stop that outlasts it, or a request that
@@ -346,6 +352,7 @@ func (r *parkerHA) awaitRegistrationStop(vmid int) bool {
 	}
 	start := time.Now()
 	waiting := false
+	var pickup crmPickupWait
 	for {
 		st, err := readHADeleteState(ctx, r.deps, parkerRetireCaller, vmid, r.node)
 		if err != nil {
@@ -357,6 +364,13 @@ func (r *parkerHA) awaitRegistrationStop(vmid int) bool {
 				r.logger.Info("parker HA: PVE HA finished stopping the emptied parker, so the retirement goes on",
 					log.String("raw_state", st.Raw), log.String("waited", time.Since(start).Round(time.Second).String()))
 			}
+			return true
+		}
+		if pickup.givenUp(st) {
+			r.logger.Info("parker HA: PVE HA has run a round since the wait began and has not taken up the stop of "+
+				"the emptied parker, so the retirement stops waiting and its HA check decides",
+				log.String("sid", st.SID), log.String("requested", st.Requested),
+				log.String("waited", time.Since(start).Round(time.Second).String()))
 			return true
 		}
 		fields := []log.Field{
@@ -380,6 +394,39 @@ func (r *parkerHA) awaitRegistrationStop(vmid int) bool {
 				"parker, so it stays; the next parker sweep on its node retires it", append(fields, log.Err(err))...)
 			return false
 		}
+	}
+}
+
+// crmPickupWait follows the CRM rounds while a parker's HA resource is not in
+// the CRM's service status yet.
+type crmPickupWait struct {
+	timed       bool
+	waitStarted int64
+	firstRound  int64
+}
+
+// givenUp reports whether the wait should stop waiting for the CRM to take up
+// the service st reads. That is a read with no CRM round at all, or a read
+// whose CRM round is newer than the first round that came after the wait's
+// first read, which may itself have begun before the wait. A service the CRM
+// holds never gives up here.
+func (w *crmPickupWait) givenUp(st *pve.HAServiceState) bool {
+	if !w.timed {
+		w.waitStarted, w.timed = st.EntryTime, true
+	}
+	if st.InCRM {
+		return false
+	}
+	switch {
+	case st.CRMStamp == 0:
+		return true
+	case st.CRMStamp <= w.waitStarted:
+		return false
+	case w.firstRound == 0:
+		w.firstRound = st.CRMStamp
+		return false
+	default:
+		return st.CRMStamp > w.firstRound
 	}
 }
 
