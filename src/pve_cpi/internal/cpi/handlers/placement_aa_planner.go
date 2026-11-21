@@ -207,35 +207,10 @@ func (p *aaPlanner) once(key string) bool {
 
 func (p *aaPlanner) plan(set *ha.RuleSet) ([]ha.RuleOp, error) {
 	p.placedIn = ""
-	if p.managed != nil {
-		managed, err := p.managed()
-		if err != nil {
-			return nil, fmt.Errorf("anti-affinity: list HA resources: %w", err)
-		}
-		p.managedNow = managed
-	}
-	existing, err := p.existingRules(set)
+	existing, in, err := p.prepare(set)
 	if err != nil {
 		return nil, err
 	}
-	p.leaving = map[string]bool{}
-	for _, r := range existing {
-		if m, ok := parseHaMarker(r.Comment); ok {
-			for _, s := range m.Left {
-				p.leaving[s] = true
-			}
-		}
-	}
-	if p.rescan != nil && p.wouldDropUnseen(existing) {
-		scan, err := p.rescan()
-		if err != nil {
-			return nil, fmt.Errorf("anti-affinity: scan group members again: %w", err)
-		}
-		p.scan = scan
-	}
-	p.ruleHolds, p.resHolds, p.pendingHolds = nil, nil, nil
-	p.collectHolds(set, existing)
-	in := p.layoutInput(set, existing)
 	p.conflicts = nil
 	var out aapattern.Output
 	if p.removal {
@@ -260,6 +235,42 @@ func (p *aaPlanner) plan(set *ha.RuleSet) ([]ha.RuleOp, error) {
 		p.writeResourceHolds(cleanups)
 	}
 	return ops, nil
+}
+
+// prepare reads what a plan plans from, the HA resources, the group's rules,
+// and its holds, and returns the group's rules and the layout's input. It
+// writes nothing, so a caller that only reads the plan, such as create_vm's
+// partner read, runs it alone.
+func (p *aaPlanner) prepare(set *ha.RuleSet) (map[string]*ha.Rule, aapattern.Input, error) {
+	if p.managed != nil {
+		managed, err := p.managed()
+		if err != nil {
+			return nil, aapattern.Input{}, fmt.Errorf("anti-affinity: list HA resources: %w", err)
+		}
+		p.managedNow = managed
+	}
+	existing, err := p.existingRules(set)
+	if err != nil {
+		return nil, aapattern.Input{}, err
+	}
+	p.leaving = map[string]bool{}
+	for _, r := range existing {
+		if m, ok := parseHaMarker(r.Comment); ok {
+			for _, s := range m.Left {
+				p.leaving[s] = true
+			}
+		}
+	}
+	if p.rescan != nil && p.wouldDropUnseen(existing) {
+		scan, err := p.rescan()
+		if err != nil {
+			return nil, aapattern.Input{}, fmt.Errorf("anti-affinity: scan group members again: %w", err)
+		}
+		p.scan = scan
+	}
+	p.ruleHolds, p.resHolds, p.pendingHolds = nil, nil, nil
+	p.collectHolds(set, existing)
+	return existing, p.layoutInput(set, existing), nil
 }
 
 // logMoves logs once, at Info, when the plan takes members other than sid

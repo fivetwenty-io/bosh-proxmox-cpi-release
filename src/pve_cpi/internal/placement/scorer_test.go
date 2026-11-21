@@ -439,6 +439,58 @@ func TestScore_AntiAffinityPenaltyOrders(t *testing.T) {
 	}
 }
 
+// TestScore_PartnerPenaltyOutweighsTheGroupCount pins that a node running a
+// rule partner of the VM's index scores below a node that runs more members
+// of the group but no partner, and below a node with far less free memory.
+func TestScore_PartnerPenaltyOutweighsTheGroupCount(t *testing.T) {
+	t.Parallel()
+	w := placement.DefaultWeights()
+	facts := []placement.NodeFacts{
+		{Node: "pve1", Online: true, FreeMemBytes: 7 * gib, TotalMemBytes: 8 * gib, SameGroupCount: 1, PartnerCount: 1},
+		{Node: "pve2", Online: true, FreeMemBytes: 1 * gib, TotalMemBytes: 8 * gib, SameGroupCount: 3},
+	}
+	scored := placement.Score(facts, w, nil)
+	if scored[0].Node != "pve2" {
+		t.Fatalf("pve2 should win (no partner of the index); got %s first: %+v", scored[0].Node, scored)
+	}
+	gap := scored[0].Score - scored[1].Score
+	if want := w.AntiAffinity * placement.PartnerWeight; gap < want-3*w.AntiAffinity-3 {
+		t.Errorf("score gap %.2f; want about one partner penalty, %.2f, less the group count and resource axes", gap, want)
+	}
+}
+
+// TestScore_PartnerPenaltyCountsEachPartner pins that the penalty grows with
+// the partners a node runs, so a node with one partner beats a node with two
+// when every node runs some.
+func TestScore_PartnerPenaltyCountsEachPartner(t *testing.T) {
+	t.Parallel()
+	w := placement.DefaultWeights()
+	facts := []placement.NodeFacts{
+		{Node: "pve1", Online: true, FreeMemBytes: 8 * gib, TotalMemBytes: 8 * gib, PartnerCount: 2},
+		{Node: "pve2", Online: true, FreeMemBytes: 1 * gib, TotalMemBytes: 8 * gib, PartnerCount: 1},
+	}
+	scored := placement.Score(facts, w, nil)
+	if scored[0].Node != "pve2" {
+		t.Errorf("pve2 should win (one partner against two); got %s first", scored[0].Node)
+	}
+}
+
+// TestScore_PartnerPenaltyNeedsTheAntiAffinityAxis pins that the partner
+// penalty is part of the anti-affinity axis, so weights that turn the axis
+// off leave a node's partners out of its score.
+func TestScore_PartnerPenaltyNeedsTheAntiAffinityAxis(t *testing.T) {
+	t.Parallel()
+	w := placement.Weights{Mem: 1.0}
+	facts := []placement.NodeFacts{
+		{Node: "pve1", Online: true, FreeMemBytes: 7 * gib, TotalMemBytes: 8 * gib, PartnerCount: 2},
+		{Node: "pve2", Online: true, FreeMemBytes: 1 * gib, TotalMemBytes: 8 * gib},
+	}
+	scored := placement.Score(facts, w, nil)
+	if scored[0].Node != "pve1" {
+		t.Errorf("pve1 should win on memory with the anti-affinity axis off; got %s first", scored[0].Node)
+	}
+}
+
 func TestScore_AvoidNodesPenalty(t *testing.T) {
 	t.Parallel()
 	// avoidNodes provides an override count higher than SameGroupCount.

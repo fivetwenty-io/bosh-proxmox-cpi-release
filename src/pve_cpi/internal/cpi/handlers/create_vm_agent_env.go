@@ -284,6 +284,10 @@ type scorerGroup struct {
 	// scorer also counts the members whose create is still running. Nil
 	// counts only the tagged members.
 	claims *spreadClaims
+	// partners counts, by node, the present members the group's rules will
+	// keep apart from the VM once its index is known (see
+	// antiAffinityPartnerNodes). Nil leaves them out of the score.
+	partners map[string]int
 }
 
 // enabled reports whether the scorer has any way to recognize a member, which

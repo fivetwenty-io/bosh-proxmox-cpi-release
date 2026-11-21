@@ -75,6 +75,7 @@ func ObserveStoragePlanCompute(ctx context.Context, deps Deps, parsed *createVMP
 	if group.enabled() {
 		weights.AntiAffinity = placement.DefaultWeights().AntiAffinity
 	}
+	facts = withPartnerCounts(facts, parsed.aaPartners, deps.Log(ctx))
 	if err := validatePCIPassthroughs(cp.PCIPassthroughs); err != nil {
 		return nil, err
 	}

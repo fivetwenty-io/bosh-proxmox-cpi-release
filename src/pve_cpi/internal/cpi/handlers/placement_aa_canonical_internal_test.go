@@ -22,6 +22,10 @@ import (
 type aaCanonFleet struct {
 	stub  *aaClusterStub
 	index map[int]int
+	// node, when set, places each VMID's guest on a node, and nodeRows lists
+	// the nodes' own rows with the guests, so placement reads their counters.
+	node     map[int]string
+	nodeRows []json.RawMessage
 }
 
 // newAACanonFleet lists each VMID as a member whose index is the VMID's last
@@ -43,8 +47,14 @@ func (f *aaCanonFleet) list() {
 		if i := f.index[v]; i >= 0 {
 			tags += ";index--" + strconv.Itoa(i)
 		}
+		if n := f.node[v]; n != "" {
+			raw, _ := json.Marshal(map[string]any{"type": "qemu", "vmid": v, "tags": tags, "node": n})
+			rows = append(rows, raw)
+			continue
+		}
 		rows = append(rows, aaQEMU(v, tags))
 	}
+	rows = append(rows, f.nodeRows...)
 	f.stub.listResourcesFn = aaResourcesFn(rows...)
 }
 

@@ -34,6 +34,7 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 	// membership and behavior is identical to Tier 1.
 	group := antiAffinityScorerGroup(deps, parsed.env)
 	group.claims = parsed.spread
+	group.partners = parsed.aaPartners
 
 	node, _, err := resolveTargetNodeWithBridges(ctx, deps, cp, group, parsed.diskCIDs, nil, parsed.cloudPropsMap, 0,
 		placementBridgePlan(ctx, deps, parsed))
@@ -63,6 +64,7 @@ func resolveVMShapeWithAlternates(
 	cp := parsed.cloudProps
 	group := antiAffinityScorerGroup(deps, parsed.env)
 	group.claims = parsed.spread
+	group.partners = parsed.aaPartners
 
 	winner, alts, nodeErr := resolveTargetNodeWithBridges(
 		ctx, deps, cp, group, parsed.diskCIDs, nil, parsed.cloudPropsMap, fallbackMax,
@@ -279,6 +281,7 @@ func resolveTargetNodeWithBridges(
 		if group.enabled() {
 			weights.AntiAffinity = placement.DefaultWeights().AntiAffinity
 		}
+		facts = withPartnerCounts(facts, group.partners, logger)
 
 		localPin := diskConstraints.requiredLocalNode
 		if localPin != "" {

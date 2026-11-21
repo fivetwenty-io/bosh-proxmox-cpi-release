@@ -371,8 +371,12 @@ type createVMParsedArgs struct {
 	// spread is the create's claim on the node placement picks for its
 	// instance group (see spreadClaims). Nil when the create does not score
 	// nodes with the anti-affinity axis.
-	spread  *spreadClaims
-	agentID string
+	spread *spreadClaims
+	// aaPartners counts, by node, the present rule partners of the index
+	// this create recreates, read once before placement (see
+	// antiAffinityPartnerNodes). Nil when the index cannot be inferred.
+	aaPartners map[string]int
+	agentID    string
 	// stemcellCID is the original path-identity CID as received
 	// (":light:<storage>:import/<file>" or ":heavy:<storage>:import/<file>").
 	stemcellCID string
@@ -719,6 +723,13 @@ func createVM(
 	// Placement may build the VM's shape once per candidate node, so the
 	// missing-owner warning is logged here, once for the whole call.
 	warnMissingOwnerTag(deps, logger)
+
+	// A create during a roll of an anti-affinity group recreates the index
+	// of a member whose delete left a hold. The Director names the index
+	// only at set_vm_metadata, so placement reads the group's live holds
+	// here and avoids the nodes of the members the recreate's rule will
+	// hold, which PVE would otherwise move it away from once it joins.
+	parsed.aaPartners = antiAffinityPartnerNodes(ctx, deps, parsed.env, parsed.cloudProps)
 
 	selection, err := ResolveStoragePlacementSelectors(deps.Config, "create_vm", parsed.cloudPropsMap, parsed.cloudProps.EphemeralDiskSizeMB > 0)
 	if err != nil {

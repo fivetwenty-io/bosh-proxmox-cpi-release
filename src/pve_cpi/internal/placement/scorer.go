@@ -154,7 +154,21 @@ type NodeFacts struct {
 	// member tag, in the order cluster/resources listed them. A VMID PVE left
 	// out reads as 0.
 	SameGroupVMIDs []int
+
+	// PartnerCount is the number of VMs on this node that the group's
+	// anti-affinity rules will keep apart from the VM being placed once its
+	// index is known, its rule partners. Used by the anti-affinity axis, which
+	// weighs each one PartnerWeight times a member of the group.
+	PartnerCount int
 }
+
+// PartnerWeight is how many members of the group one rule partner of the VM
+// being placed weighs in the anti-affinity penalty. It is large enough that a
+// node running a partner scores below any node that runs none, short of one
+// running twenty more members of the group, because PVE would move the VM off
+// a partner's node as soon as the rule holds it. The penalty stays soft, so a
+// create with no other node still lands.
+const PartnerWeight = 20.0
 
 // Request describes placement requirements for a single VM create operation.
 type Request struct {
@@ -442,6 +456,7 @@ func Score(facts []NodeFacts, w Weights, avoidNodes map[string]int) []ScoredNode
 //	      + w.CPU * headroomFraction                             [when maxCPU > 0]
 //	      + w.GuestCount * (1 / (1 + guestCount))
 //	      − w.AntiAffinity * sameGroupCount
+//	      − w.AntiAffinity * PartnerWeight * partnerCount
 func computeScore(f NodeFacts, w Weights, avoidNodes map[string]int) float64 {
 	var score float64
 
@@ -481,6 +496,9 @@ func computeScore(f NodeFacts, w Weights, avoidNodes map[string]int) float64 {
 	}
 	if w.AntiAffinity > 0 && sameGroup > 0 {
 		score -= w.AntiAffinity * float64(sameGroup)
+	}
+	if w.AntiAffinity > 0 && f.PartnerCount > 0 {
+		score -= w.AntiAffinity * PartnerWeight * float64(f.PartnerCount)
 	}
 
 	return score
