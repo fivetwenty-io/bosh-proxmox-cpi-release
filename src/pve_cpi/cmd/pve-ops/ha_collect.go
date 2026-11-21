@@ -773,7 +773,9 @@ func (c *haCollector) judgesGroup(members []*haGuest, owner, tag string) bool {
 	if placer, ok := c.groupPlacer(members, owner, tag); ok && !placer.Unread {
 		return placer.Self
 	}
-	for _, e := range c.clusterEntries() {
+	entries := c.clusterEntries()
+	for i := range entries {
+		e := &entries[i]
 		if e.Unread {
 			continue
 		}
@@ -797,8 +799,9 @@ func (c *haCollector) groupMember(g *haGuest) bool {
 	if c.scope == nil {
 		return true
 	}
-	for _, e := range c.clusterEntries() {
-		if e.holds(g) {
+	entries := c.clusterEntries()
+	for i := range entries {
+		if entries[i].holds(g) {
 			return true
 		}
 	}
@@ -918,11 +921,13 @@ func (c *haCollector) adviseContestedDelete(tag string, members []*haGuest, chk 
 	if len(deletes) == 0 {
 		return false
 	}
-	for _, e := range groupOwners(c.clusterEntries(), members) {
+	owners := groupOwners(c.clusterEntries(), members)
+	for i := range owners {
+		e := &owners[i]
 		if e.Self {
 			continue
 		}
-		other, ok := c.entryCheck(&e, tag)
+		other, ok := c.entryCheck(e, tag)
 		if !ok || other.Problem != "" {
 			continue
 		}
@@ -960,8 +965,8 @@ func (c *haCollector) groupDefaults(groups map[string][]*haGuest, tags []string,
 			continue
 		}
 		agree := true
-		for _, o := range owners[1:] {
-			if o.Pattern.Canonical() != owners[0].Pattern.Canonical() {
+		for i := 1; i < len(owners); i++ {
+			if owners[i].Pattern.Canonical() != owners[0].Pattern.Canonical() {
 				agree = false
 			}
 		}
@@ -979,13 +984,14 @@ func (c *haCollector) groupDefaults(groups map[string][]*haGuest, tags []string,
 // order.
 func groupOwners(entries []haClusterEntry, members []*haGuest) []haClusterEntry {
 	var out []haClusterEntry
-	for _, e := range entries {
+	for i := range entries {
+		e := &entries[i]
 		if !e.AntiAffinity {
 			continue
 		}
 		for _, g := range members {
 			if e.holds(g) {
-				out = append(out, e)
+				out = append(out, *e)
 				break
 			}
 		}
@@ -998,9 +1004,9 @@ func groupOwners(entries []haClusterEntry, members []*haGuest) []haClusterEntry 
 func (c *haCollector) adviseSplitDefaults(tag, group string, owners []haClusterEntry) {
 	names := make([]string, 0, len(owners))
 	patterns := make([]string, 0, len(owners))
-	for _, o := range owners {
-		names = append(names, o.Name)
-		patterns = append(patterns, o.Name+" "+o.Pattern.Canonical())
+	for i := range owners {
+		names = append(names, owners[i].Name)
+		patterns = append(patterns, owners[i].Name+" "+owners[i].Pattern.Canonical())
 	}
 	c.rep.advise(haKindAntiAffinityAmbiguous, tag,
 		"the cpi-config entries %s write the rules of group %s and set different pve.ha.anti_affinity_pattern "+
