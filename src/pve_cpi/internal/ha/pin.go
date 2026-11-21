@@ -74,6 +74,12 @@ type PinSpec struct {
 	// configured node, because PVE gives each node the pin leaves out a lower
 	// priority of its own (see SoftPinNamesSomeNodes).
 	SinglePriority bool
+
+	// PreferenceKnown says the spec states every preference the CPI has for
+	// the VM, which is true when the call knows the VM's AZ or pin_az is off.
+	// Any other call cannot tell a VM with no preference from one whose
+	// preference it doesn't know (see recordFreePin).
+	PreferenceKnown bool
 }
 
 // BuildPin returns the merged node-affinity rule for spec, or nil when the VM
@@ -96,11 +102,22 @@ func BuildPin(spec PinSpec) (*Rule, error) {
 	return pin, nil
 }
 
-// recordFreePin records on the comment of pin, which BuildPin made from spec
-// for a VM in a resource-affinity rule, the pin spec gives the VM outside the
-// rule, when that pin has other nodes or priorities. Any older record on the
-// comment goes, because the pin spec asks for now is what the VM should get
-// back. A spec for a VM in no such rule leaves pin alone.
+// recordFreePin records on the comment of pin, which BuildPin or DecisionPin
+// made from spec for a VM in a resource-affinity rule, the pin spec gives the
+// VM outside the rule, when that pin has other nodes or priorities. Any older
+// record on the comment goes, because the pin spec asks for now is what the
+// VM should get back. A spec that gives no pin outside the rule stands for
+// pin itself, which is what DecisionPin writes then.
+//
+// When the spec knows the VM's preference (see PinSpec.PreferenceKnown), the
+// record is written even when it names the nodes and priorities pin has
+// already, because it says that the CPI has judged the VM's preference. A
+// writer then never carries the record of the pin it replaces (see
+// CarryPinRestore), whose priorities the CPI no longer asks for, such as an
+// AZ preference after pin_az is turned off, and the restore only drops the
+// record. A spec that doesn't know the preference records nothing then, so
+// the writer keeps the record the pin had. A spec for a VM in no such rule
+// leaves pin alone.
 func recordFreePin(pin *Rule, spec PinSpec) {
 	if !spec.SinglePriority {
 		return
@@ -108,7 +125,13 @@ func recordFreePin(pin *Rule, spec PinSpec) {
 	pin.Comment = WithoutPinRestoreRecord(pin.Comment)
 	spec.SinglePriority = false
 	free, err := buildPin(spec)
-	if err != nil || free == nil || free.NodesParam() == pin.NodesParam() {
+	if err != nil {
+		return
+	}
+	if free == nil {
+		free = pin
+	}
+	if !spec.PreferenceKnown && free.NodesParam() == pin.NodesParam() {
 		return
 	}
 	pin.Comment = WithPinRestoreRecord(pin.Comment, free)

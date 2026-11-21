@@ -238,6 +238,12 @@ type VMDecision struct {
 	Preferred []string
 	DLB       bool
 
+	// PreferenceKnown says Preferred states the VM's AZ preference, because
+	// the call named the VM's AZ or pin_az is off. A later call that decides
+	// a VM under HA again names no AZ, so it can't tell a VM with no
+	// preference from one whose preference it doesn't know.
+	PreferenceKnown bool
+
 	// Failback is the failback flag the VM's resource carries. It is true only
 	// for a VM under PolicyShared, whose every volume moves with it, and only
 	// while pve.ha.failback is not false. A replicate VM never gets it, because
@@ -317,7 +323,7 @@ func (d *VMDecision) PinSpec(id, comment string, configured []string, rebalanceO
 	return PinSpec{
 		ID: id, Comment: comment, SID: d.SID,
 		Hard: d.Hard, Configured: configured,
-		Placed: d.Placed, Preferred: d.Preferred,
+		Placed: d.Placed, Preferred: d.Preferred, PreferenceKnown: d.PreferenceKnown,
 		RebalanceOnStart: rebalanceOnStart, DLB: d.DLB,
 	}
 }
@@ -904,6 +910,7 @@ func (e *eligibility) register(policy Policy, hard []string, reason string) {
 	if az := e.preferredAZ(); az != nil {
 		e.d.Preferred = az
 	}
+	e.d.PreferenceKnown = e.cfg.HAPinAZValue() == config.HARuleOff || len(e.in.AZNodes) > 0
 	e.d.Priorities = e.priorities()
 }
 

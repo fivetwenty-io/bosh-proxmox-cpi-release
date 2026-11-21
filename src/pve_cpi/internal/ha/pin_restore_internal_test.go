@@ -281,3 +281,62 @@ func TestBuildPinRecordsThePinOutsideTheRule(t *testing.T) {
 		t.Fatalf("pin with no preference = %+v, %v", none, err)
 	}
 }
+
+// TestAFreshPinWithNoPreferenceDropsAnOutdatedRecord shows that a writer
+// that builds the pin of a VM in a resource-affinity rule afresh, when it
+// knows the VM's preference and the pin the VM gets outside the rule has none
+// of its own, does not carry the record of the pin it replaces. That record
+// names priorities the CPI no longer asks for, so the restore would write
+// them back and failback would move the VM. A writer that doesn't know the
+// preference keeps the record.
+func TestAFreshPinWithNoPreferenceDropsAnOutdatedRecord(t *testing.T) {
+	configured := []string{"a", "b", "c"}
+	cur := &Rule{
+		ID: "bosh-na-101", Type: RuleTypeNodeAffinity, Affinity: AffinityPositive, Resources: []string{"vm:101"},
+		Nodes:   map[string]int{"a": PinPriorityRest, "b": PinPriorityRest, "c": PinPriorityRest},
+		Comment: WithPinRestoreRecord(restoreTestMarker, &Rule{Nodes: map[string]int{"a": 2, "b": 2, "c": 0}}),
+	}
+
+	t.Run("no preference at all", func(t *testing.T) {
+		d := &VMDecision{VMID: 101, SID: "vm:101", Node: "a", Outcome: OutcomeRegister, Policy: PolicyShared,
+			Admissible: configured, PreferenceKnown: true}
+		next, err := DecisionPin(d, "bosh-na-101", restoreTestMarker, []string{"nfs"}, configured, false, true)
+		if err != nil || next == nil {
+			t.Fatalf("pin = %+v, %v", next, err)
+		}
+		CarryPinRestore(cur, next)
+		if raw, present := pinRestoreValue(next.Comment); present && raw == "a:2,b:2,c" {
+			t.Fatalf("the fresh pin carries the outdated record: %q", next.Comment)
+		}
+		if got, act, why := PlanPinRestore(next, configured); act == PinRestoreWrite && got.MultiplePriorities() {
+			t.Fatalf("the restore writes priorities the CPI no longer asks for: %+v (%s)", got.Nodes, why)
+		}
+	})
+
+	t.Run("a preference for every node", func(t *testing.T) {
+		next, err := BuildPin(PinSpec{
+			ID: "bosh-na-101", Comment: restoreTestMarker, SID: "vm:101", Configured: configured,
+			Preferred: configured, SinglePriority: true, PreferenceKnown: true,
+		})
+		if err != nil || next == nil {
+			t.Fatalf("pin = %+v, %v", next, err)
+		}
+		CarryPinRestore(cur, next)
+		if got, act, why := PlanPinRestore(next, configured); act == PinRestoreWrite && got.MultiplePriorities() {
+			t.Fatalf("the restore writes priorities the CPI no longer asks for: %+v (%s)", got.Nodes, why)
+		}
+	})
+
+	t.Run("a preference the writer doesn't know", func(t *testing.T) {
+		d := &VMDecision{VMID: 101, SID: "vm:101", Node: "a", Outcome: OutcomeRegister, Policy: PolicyShared,
+			Admissible: configured}
+		next, err := DecisionPin(d, "bosh-na-101", restoreTestMarker, []string{"nfs"}, configured, false, true)
+		if err != nil || next == nil {
+			t.Fatalf("pin = %+v, %v", next, err)
+		}
+		CarryPinRestore(cur, next)
+		if raw, _ := pinRestoreValue(next.Comment); raw != "a:2,b:2,c" {
+			t.Fatalf("a writer that doesn't know the preference must keep the record: %q", next.Comment)
+		}
+	})
+}

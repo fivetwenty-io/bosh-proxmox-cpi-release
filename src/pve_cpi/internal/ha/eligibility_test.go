@@ -1561,3 +1561,25 @@ func TestDecideVMOutsideItsStrictPinDefers(t *testing.T) {
 		deferredRetriable(t, mustDecide(t, p, in), "(none)")
 	})
 }
+
+// TestDecideVMKnowsThePreferenceOnlyWithTheAZOrPinAZOff shows when a decision
+// states every preference the CPI has for the VM.
+func TestDecideVMKnowsThePreferenceOnlyWithTheAZOrPinAZOff(t *testing.T) {
+	disks := vols("nfs:100/vm-101-disk-0")
+	p := eligProfile(config.HAModeAuto, "pve1", "pve2", "pve3")
+	off := eligCfg(config.HAModeAuto, func(h *config.HAConfig) { c := config.HAChoice(config.HARuleOff); h.PinAZ = &c })
+	withAZ := baseInput(eligCfg(config.HAModeAuto), disks...)
+	withAZ.AZ, withAZ.AZNodes = "az1", []string{"pve1", "pve2"}
+	for name, c := range map[string]struct {
+		in   VMInput
+		want bool
+	}{
+		"the AZ named":             {withAZ, true},
+		"pin_az off":               {baseInput(off, disks...), true},
+		"no AZ while pin_az is on": {baseInput(eligCfg(config.HAModeAuto), disks...), false},
+	} {
+		if d := mustDecide(t, p, c.in); !d.Registers() || d.PreferenceKnown != c.want {
+			t.Errorf("%s: PreferenceKnown = %v, want %v (decision %+v)", name, d.PreferenceKnown, c.want, d)
+		}
+	}
+}
