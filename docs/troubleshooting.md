@@ -3020,6 +3020,24 @@ We run `pve-ops ha --fix-anti-affinity --director-uuid <uuid>`. Its dry run list
 
 Nothing needs to happen, because the group's next rule write drops the hold. To drop it now, we run `pve-ops ha --fix-anti-affinity --apply`, and we add `--group bosh-aa-<hash12>` to limit the run to one group.
 
+## `pve-ops ha` reports `aa_pin_restore`
+
+**Symptom**
+
+`pve-ops ha` reports the advice `aa_pin_restore` for a member's pin, `bosh-na-<vmid>`. The pin has one priority on every node, and its comment holds a field such as `bosh-prio=pve1,pve2,pve3:2`, while the VM is in no anti-affinity rule.
+
+**Cause**
+
+A join flattens a member's pin, because PVE refuses several priorities for a VM in a resource-affinity rule, and the field records the priorities the pin had. The plan that takes the member out of its last rule writes them back. The field stays when that write failed, which the CPI logs as a warning, or when a live hold of the group defers the restore until the recreate the hold waits for has joined.
+
+**Diagnosis**
+
+We run `pve-ops ha --fix-anti-affinity --director-uuid <uuid>`. Its dry run lists the write as `restore the priorities <nodes> on bosh-na-<vmid>`, or as `drop the priority record from bosh-na-<vmid>` with the reason when someone changed the pin after the join. A deferred restore isn't listed, and the advice says that a hold defers it.
+
+**Fix**
+
+The group's next rule write restores the pin. To restore it now, we run `pve-ops ha --fix-anti-affinity --apply`. When the warning in the CPI's log names a refused write, we fix its cause first, such as a missing permission.
+
 ## A VM could not join its anti-affinity group's rules
 
 **Symptom**
