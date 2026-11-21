@@ -698,7 +698,7 @@ func (c *haCollector) antiAffinityFindings() {
 	}
 	groups := map[string][]*haGuest{}
 	for _, g := range c.guests {
-		if !g.owned {
+		if !g.owned || !c.judgesVM(g) {
 			continue
 		}
 		for t := range g.tags {
@@ -1446,11 +1446,12 @@ func (c *haCollector) replicates(vmid int, pin *ha.Rule) bool {
 }
 
 // markedJobs returns the usable replication jobs that carry the CPI's marker,
-// are not being removed, and do not belong to another Director.
+// are not being removed, do not belong to another Director, and, under a
+// cpi-config entry, name a VM inside the entry's VM ID band.
 func (c *haCollector) markedJobs() []ha.ReplicaJobState {
 	var out []ha.ReplicaJobState
 	for _, j := range c.jobs {
-		if j.Fault == "" && j.RemoveJob == "" && haJobMarker(j.Comment) && !c.foreign(j.Comment) {
+		if j.Fault == "" && j.RemoveJob == "" && haJobMarker(j.Comment) && !c.foreign(j.Comment) && c.inBand(j.Guest) {
 			out = append(out, j)
 		}
 	}
@@ -1586,12 +1587,12 @@ func (c *haCollector) replicaVMs() []int {
 	}
 	for i := range c.journal.Records {
 		rep := c.journal.Records[i].Replication
-		if rep != nil && rep.Job != nil && !rep.Retired {
+		if rep != nil && rep.Job != nil && !rep.Retired && c.inBand(rep.Job.Guest) {
 			vmids[rep.Job.Guest] = true
 		}
 	}
 	for _, g := range c.guests {
-		if g.owned && !g.ref.Template && g.hasTag(haReplicaTag) {
+		if c.judges(g) && g.hasTag(haReplicaTag) {
 			vmids[g.ref.VMID] = true
 		}
 	}
@@ -1630,7 +1631,7 @@ func (c *haCollector) liveJob(vmid int) (*ha.ReplicaJobState, error) {
 // replicaTagged reports whether any CPI-owned VM carries the replicate tag.
 func (c *haCollector) replicaTagged() bool {
 	for _, g := range c.guests {
-		if g.owned && !g.ref.Template && g.hasTag(haReplicaTag) {
+		if c.judges(g) && g.hasTag(haReplicaTag) {
 			return true
 		}
 	}
@@ -1987,7 +1988,7 @@ func (c *haCollector) orphanVolumesOn(node, storage string, covered map[string]b
 			gone(volid, node, vmid)
 			continue
 		}
-		if !g.owned || g.ref.Node == node || covered[m[1]+"@"+node] {
+		if !g.owned || !c.judgesVM(g) || g.ref.Node == node || covered[m[1]+"@"+node] {
 			continue
 		}
 		c.rep.problem(haKindReplicaOrphanVolume, volid,
@@ -2338,6 +2339,9 @@ func (c *haCollector) guestLeftovers() {
 		return
 	}
 	for _, g := range c.guests {
+		if !c.judgesVM(g) {
+			continue
+		}
 		for _, t := range g.tagsWithPrefix(haBirthTagPrefix) {
 			if born, ok := birthTagTime(t); ok && c.now.Sub(born) > c.birthTagAge() {
 				c.rep.problem(haKindBirthTagStale, g.sid,
@@ -2380,7 +2384,19 @@ func (c *haCollector) judgesVM(g *haGuest) bool {
 			return false
 		}
 	}
-	return c.scope == nil || c.scope.Band.Contains(g.ref.VMID)
+	return c.inBand(g.ref.VMID)
+}
+
+// judges reports whether this run judges the findings about g. It is a VM the
+// CPI created, not a template, and one that judgesVM lets through.
+func (c *haCollector) judges(g *haGuest) bool {
+	return g.owned && !g.ref.Template && c.judgesVM(g)
+}
+
+// inBand reports whether vmid lies inside the VM ID band of the cpi-config
+// entry this run reports for. A run with no entry judges every VM ID.
+func (c *haCollector) inBand(vmid int) bool {
+	return c.scope == nil || c.scope.Band.Contains(vmid)
 }
 
 // ownedResource reports whether sid names a VM the CPI created.

@@ -19,7 +19,7 @@ import (
 // haInputLimit caps the size of a request or cpi-config file the doctor reads.
 const haInputLimit = 1 << 20
 
-const haUsage = "usage: pve-ops ha [--config PATH] [--request PATH | --cpi-config PATH] [--json]\n" +
+const haUsage = "usage: pve-ops ha [--config PATH] [--request PATH | --cpi-config PATH [--director-uuid UUID]] [--json]\n" +
 	"       pve-ops ha --widen-replicas [--apply] [--config PATH] [--request PATH | --director-uuid UUID] [--json]\n" +
 	"       pve-ops ha --fix-anti-affinity [--group RULE] [--apply] [--config PATH] [--request PATH | " +
 	"--director-uuid UUID] [--json]\n" +
@@ -94,7 +94,7 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 	fixAA := fs.Bool("fix-anti-affinity", false, "plan each anti-affinity group of the Director again the way the CPI plans it, and report the groups whose rules differ (a dry run unless --apply is given)")
 	group := fs.String("group", "", "with --fix-anti-affinity, the base rule name bosh-aa-<hash12> of the one group to fix")
 	apply := fs.Bool("apply", false, "with --widen-replicas, write the widened pins, and with --fix-anti-affinity, write the planned rules")
-	directorUUID := fs.String("director-uuid", "", "with --widen-replicas or --fix-anti-affinity, the UUID of the Director whose VMs or rules the run may change, when no --request names it")
+	directorUUID := fs.String("director-uuid", "", "with --widen-replicas or --fix-anti-affinity, the UUID of the Director whose VMs or rules the run may change, when no --request names it; with --cpi-config, the UUID of the Director that owns every entry that names none")
 	if err := fs.Parse(args); errors.Is(err, flag.ErrHelp) {
 		fs.SetOutput(stderr)
 		_, _ = fmt.Fprintln(stderr, haUsage)
@@ -122,7 +122,7 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 	ctx, release := commandContext()
 	defer release()
 	if *cpiConfigPath != "" {
-		return runHACPIConfig(ctx, *cpiConfigPath, base, logger, *asJSON, stdout, stderr, deps)
+		return runHACPIConfig(ctx, *cpiConfigPath, base, logger, strings.TrimSpace(*directorUUID), *asJSON, stdout, stderr, deps)
 	}
 
 	eff, owner := base, ""
@@ -185,7 +185,7 @@ func checkHAWriteFlags(
 	switch {
 	case widen && fixAA:
 		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --widen-replicas and --fix-anti-affinity cannot be combined")
-	case !writes && (apply || directorUUID != ""):
+	case !writes && (apply || (directorUUID != "" && cpiConfigPath == "")):
 		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --apply and --director-uuid go with --widen-replicas or "+
 			"--fix-anti-affinity")
 	case !fixAA && group != "":

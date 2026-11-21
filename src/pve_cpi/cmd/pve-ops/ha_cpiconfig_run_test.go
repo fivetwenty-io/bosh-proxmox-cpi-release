@@ -50,7 +50,7 @@ func TestRunHACPIConfig_SharesOneLedgerAndKeepsEachEntrysScope(t *testing.T) {
 	}
 	base := haCfgWith("auto", "replicate", "", `,"placement":{"anti_affinity":{"enabled":true}}`)
 	var stdout, stderr bytes.Buffer
-	code := runHACPIConfig(context.Background(), path, base, nil, true, &stdout, &stderr, deps)
+	code := runHACPIConfig(context.Background(), path, base, nil, "", true, &stdout, &stderr, deps)
 	if code != exitError {
 		t.Fatalf("exit code = %d, want %d; stderr %q", code, exitError, stderr.String())
 	}

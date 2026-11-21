@@ -21,6 +21,22 @@ type cpiConfigEntry struct {
 	Name       string         `json:"name"`
 	Type       string         `json:"type"`
 	Properties map[string]any `json:"properties"`
+	// DirectorUUID names the Director whose entry this is. A BOSH cpi-config
+	// does not carry it, so the doctor reads it from this optional key, from
+	// the document's own director_uuid key, or from --director-uuid.
+	DirectorUUID string `json:"director_uuid"`
+}
+
+// cpiConfigDirectorUUID reads the optional director_uuid key of a cpi-config
+// document that is an object. A bare list has none.
+func cpiConfigDirectorUUID(data []byte) string {
+	var doc struct {
+		DirectorUUID string `json:"director_uuid"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(doc.DirectorUUID)
 }
 
 // decodeEntryList decodes a JSON list of cpis entries. It decodes the list as
@@ -174,7 +190,7 @@ func (m *haMultiReport) failing() bool {
 // runHACPIConfig runs the doctor against every cpis entry and then the
 // cross-cluster check over what it read. An entry whose cluster cannot be read
 // is reported as unchecked and takes part in no comparison.
-func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, logger *log.Logger, asJSON bool,
+func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, logger *log.Logger, directorUUID string, asJSON bool,
 	stdout, stderr io.Writer, deps haDeps,
 ) int {
 	data, err := readLimited(path)
@@ -187,6 +203,7 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 		_, _ = fmt.Fprintf(stderr, "pve-ops ha: %s\n", err)
 		return exitUsage
 	}
+	documentUUID := cpiConfigDirectorUUID(data)
 	multi := &haMultiReport{Clusters: []*haReport{}, SharedExports: []haSharedFinding{}}
 	layouts := make([]pve.ClusterVMIDLayout, 0, len(entries))
 	scopes := entryScopes(entries, base)
@@ -194,7 +211,14 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 	// not asked again by the next entry that reaches the same cluster.
 	ledger := newHANodeLedger()
 	for i := range entries {
-		report, layout := checkCPIConfigEntry(ctx, &entries[i], base, logger, deps, scopes[i], ledger)
+		owner := strings.TrimSpace(entries[i].DirectorUUID)
+		if owner == "" {
+			owner = documentUUID
+		}
+		if owner == "" {
+			owner = strings.TrimSpace(directorUUID)
+		}
+		report, layout := checkCPIConfigEntry(ctx, &entries[i], base, logger, deps, scopes[i], ledger, owner)
 		multi.Clusters = append(multi.Clusters, report)
 		layouts = append(layouts, layout)
 	}
@@ -240,7 +264,7 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 // unchecked with the reason, and the report carries the same reason as a
 // finding. ledger is the run's record of nodes that cannot answer.
 func checkCPIConfigEntry(ctx context.Context, entry *cpiConfigEntry, base *config.CPIConfig, logger *log.Logger,
-	deps haDeps, scope *haEntryScope, ledger *haNodeLedger,
+	deps haDeps, scope *haEntryScope, ledger *haNodeLedger, owner string,
 ) (*haReport, pve.ClusterVMIDLayout) {
 	layout := pve.ClusterVMIDLayout{Name: entry.Name}
 	fail := func(mode, reason string) (*haReport, pve.ClusterVMIDLayout) {
@@ -270,8 +294,19 @@ func checkCPIConfigEntry(ctx context.Context, entry *cpiConfigEntry, base *confi
 		return fail(eff.HAModeValue(), fmt.Sprintf("the datacenter next-id range could not be read: %s", err))
 	}
 	layout.Storages, layout.NextID = storages, next
-	report := collectHAScoped(ctx, newLedgerHAReader(reader, ledger), eff, "", deps.now(), scope)
+	report := collectHAScoped(ctx, newLedgerHAReader(reader, ledger), eff, owner, deps.now(), scope)
 	report.Cluster = entry.Name
+	if owner == "" {
+		// The entry's band is the only boundary left, so a VM another Director
+		// created inside the band is judged as this entry's.
+		if logger != nil {
+			logger.Warn("the doctor has no Director UUID for this cpi-config entry, so it scopes the entry by its VM ID band alone",
+				log.String("entry", entry.Name))
+		}
+		report.advise(haKindAdvice, entry.Name, "no Director UUID is known for this entry, so the doctor scopes it by its "+
+			"VM ID band alone and judges every VM in the band, including one that another Director created there; set "+
+			"director_uuid on the entry or on the document, or pass --director-uuid")
+	}
 	for _, key := range unknown {
 		report.advise(haKindAdvice, key, "the entry's property %q is not one the CPI reads, so it was ignored", key)
 	}
