@@ -14,6 +14,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Added
 
+- `set_vm_metadata` moves a VM off the node of an anti-affinity partner before it writes the rule that pairs them, so a parallel deploy that put two members on one node pays one live migration instead of two. PVE's CRM moves both members of such a pair in the same round when a third node is free. The CPI picks the target with the `create_vm` scorer among the free nodes the VM's pin prefers most, asks PVE HA to migrate the VM, and waits at most three minutes or `pve.ha.motion_wait_sec`, whichever is shorter. It moves only a VM on its first join whose pairing no later index can change, and it leaves a VM with local storage, a PCI device, or a positive affinity rule to PVE. Siblings that join at once share the spread claim record, so only one of them moves. A move that fails or runs out of time logs a warning, and the rule is written as before.
+
 - `pve-ops ha` reports `owner_tag_missing` advice for a VM that carries `bosh-cpi` but no owner tag, when the run names its Director. Such a VM predates the owner tag, so the doctor still judges it as this Director's and now names `cpi stemcell-refs adopt-owners`, which stamps the tag.
 
 - `pve.ha.failback`, an optional boolean, turns `failback` off on every HA resource the CPI writes when we set it to `false`. Left unset, it lets the CPI turn the flag on for shared VMs. A cpi-config entry can override it under `pve_ha`.
