@@ -222,6 +222,10 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 		c.Problem = reason
 		return c
 	}
+	if reason := crossDomainRule(set, ident, p.lastIn); reason != "" {
+		c.Problem = reason
+		return c
+	}
 	for i := range ops {
 		switch id := ops[i].Rule.ID; {
 		case p.stampOnly[id]:
@@ -254,7 +258,10 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 // them, no more nodes than the rule has members. No AZ of placement.az_map
 // holds those pins, or the members would be in that AZ's domain, so the plan
 // counts the cluster's nodes where the members may run on fewer, and the rule
-// would leave no node free while one of them drains. Entries of a cpi-config
+// would leave no node free while one of them drains. A rule whose members
+// each hold a strict pin to one node of their own is not confined that way,
+// because the hold policy writes such pins and a drain moves none of those
+// members, so each stays on its own node and the rule holds. Entries of a cpi-config
 // that share a cluster can map AZs differently, and such a group was most
 // likely placed by an entry whose az_map holds the pins, which plans it over
 // that AZ's nodes. The check reports the group as not planned, so neither the
@@ -270,24 +277,25 @@ func confinedLayoutRule(set *ha.RuleSet, owner string, in aapattern.Input, out a
 			continue
 		}
 		nodes := map[string]bool{}
-		confined := true
+		confined, held := true, true
 		for _, sid := range sids {
 			pinned := strictPinNodes(set, sid, owner)
 			if d, ok := domainOf[sid]; !ok || d != "" || len(pinned) == 0 {
 				confined = false
 				break
 			}
+			held = held && len(pinned) == 1
 			for _, n := range pinned {
 				nodes[n] = true
 			}
 		}
-		if !confined || len(nodes) > len(sids) {
+		if !confined || len(nodes) > len(sids) || held && len(nodes) == len(sids) {
 			continue
 		}
 		return fmt.Sprintf("the plan puts %s in rule %s, but their strict pins leave them only the nodes %s, so the "+
 			"rule would leave no node free while one of them drains. No AZ of placement.az_map holds those nodes, so "+
-			"the group was most likely placed by another cpis entry whose az_map does; check and fix the group with "+
-			"that entry's request or under --cpi-config", strings.Join(sids, ", "), rule,
+			"the group was most likely placed by another cpis entry whose az_map does; check the group under "+
+			"--cpi-config, and fix it with that entry's request", strings.Join(sids, ", "), rule,
 			strings.Join(slices.Sorted(maps.Keys(nodes)), ", "))
 	}
 	return ""
@@ -315,6 +323,49 @@ func AntiAffinityPlacementFit(azMap map[string][]string, set *ha.RuleSet, owner 
 		width += len(azMap[dk])
 	}
 	return misses, width
+}
+
+// crossDomainRule returns why a plan cannot judge the group's rules under the
+// config it was planned with, or "". That is so when one of the group's rules
+// names members that the config's placement.az_map puts in different domains.
+// The CPI never writes such a rule, because a plan's rules only ever name
+// members of one domain, so another cpis entry whose az_map puts those
+// members in one domain most likely wrote it, and a plan under this config
+// would delete a rule that entry's plan keeps. The check reports the group as
+// not planned, so neither the doctor's drift nor the fix deletes the rule.
+func crossDomainRule(set *ha.RuleSet, ident haIdentity, in aapattern.Input) string {
+	domainOf := make(map[string]string, len(in.Members))
+	for _, m := range in.Members {
+		domainOf[m.Key] = m.Domain
+	}
+	base := ident.ruleName()
+	for i := range set.Rules {
+		r := &set.Rules[i]
+		if !aapattern.IsGroupRule(base, r.ID) || r.Type != haRuleType {
+			continue
+		}
+		domains := map[string]bool{}
+		for _, sid := range r.Resources {
+			if dk, ok := domainOf[sid]; ok {
+				domains[dk] = true
+			}
+		}
+		if len(domains) < 2 {
+			continue
+		}
+		names := make([]string, 0, len(domains))
+		for _, dk := range slices.Sorted(maps.Keys(domains)) {
+			if dk == "" {
+				dk = "the whole cluster"
+			}
+			names = append(names, dk)
+		}
+		return fmt.Sprintf("rule %s names %s, whose strict pins put them in different domains of "+
+			"placement.az_map (%s), and the CPI never writes a rule across domains, so the group was most likely "+
+			"placed by another cpis entry whose az_map puts them in one domain; check the group under --cpi-config, "+
+			"and fix it with that entry's request", r.ID, strings.Join(r.Resources, ", "), strings.Join(names, ", "))
+	}
+	return ""
 }
 
 // fullGroupRules returns the group's rules that hold as many members as the

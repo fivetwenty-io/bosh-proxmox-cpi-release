@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
@@ -419,4 +420,177 @@ func TestCollectAntiAffinityLayoutPlacerBelongsToTheGroupsDirector(t *testing.T)
 	sc.Cluster[0].Owner, sc.Cluster[1].Owner = haDirector, "bbbbbbbb-0000"
 	r := collectHAScoped(context.Background(), f, plain, haDirector, haNow, sc)
 	want(t, r, haKindAALayoutDrift, haSeverityProblem, g.rule, "could not be planned")
+}
+
+// holdGroupEntries are two entries of one Director that share a cluster and a
+// band, the way the lab's az2 and az2-client do. az2 has no AZ map, and
+// az2-client maps each node to its own AZ. Both use the hold policy and write
+// anti-affinity rules.
+func holdGroupEntries() []cpiConfigEntry {
+	haProps := map[string]any{"local_policy": "hold", "anti_affinity": "on"}
+	return []cpiConfigEntry{
+		{Name: "az2", Type: "pve", Properties: map[string]any{"pve_ha": haProps,
+			"pve_placement": map[string]any{"anti_affinity": map[string]any{"enabled": true}}}},
+		{Name: "az2-client", Type: "pve", Properties: map[string]any{"pve_ha": haProps,
+			"pve_placement": map[string]any{"anti_affinity": map[string]any{"enabled": true},
+				"az_map": map[string]any{"c1": []any{"n1"}, "c2": []any{"n2"}, "c3": []any{"n3"}}}}},
+	}
+}
+
+// holdGroupFake is a block group of three hold members, each held to its own
+// node by a strict one-node pin. The plan of an entry with no AZ map puts the
+// first two in the group's base rule, which az2 wrote.
+func holdGroupFake(g aaLayoutGroup) *fakeHA {
+	f := aaLayoutFake(g, "block", 3)
+	for _, guest := range f.guests {
+		f.rules = append(f.rules, pinRule(guest.VMID, haMarker+" deployment=- group=-", guest.Node))
+	}
+	f.rules = append(f.rules, g.rulesOf([]string{"vm:200", "vm:201"})...)
+	for i := range f.guests {
+		f.guests[i].Tags += ";bosh-owner--" + haDirector
+	}
+	return f
+}
+
+// TestCollectAntiAffinityLayoutHoldGroupBelongsToTheEntryWhoseRulesItHolds
+// pins that a group of hold members, each strictly pinned to its own node, is
+// judged by the entry whose plan holds the group's rules, not by the entry
+// whose one-node AZs fit the pins most tightly. az2's plan holds the base rule
+// as it stands, and az2-client's plan would put each member in its own
+// one-node AZ and delete the rule, so az2 judges the group and finds nothing,
+// and neither run calls the rule full or advises deleting it.
+func TestCollectAntiAffinityLayoutHoldGroupBelongsToTheEntryWhoseRulesItHolds(t *testing.T) {
+	t.Parallel()
+	g := newAALayoutGroup()
+	entries := holdGroupEntries()
+	base := haCfg("auto", "hold")
+	scopes := entryScopes(entries, base, []string{haDirector, haDirector})
+	layoutKinds := []string{haKindAALayoutDrift, haKindAARuleFull, haKindAAPatternTrimmed, haKindAntiAffinityShort,
+		haKindAntiAffinitySplit, haKindAntiAffinitySkipped, haKindAntiAffinityAmbiguous}
+	for i := range entries {
+		eff, _, _, err := config.ApplyContextOverrides(base, entries[i].Properties)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := collectHAScoped(context.Background(), holdGroupFake(g), eff, haDirector, haNow, scopes[i])
+		wantNone(t, r, layoutKinds...)
+	}
+}
+
+// holdEntryConfig returns the effective settings of entry i of
+// holdGroupEntries, which a run with that entry's request judges under.
+func holdEntryConfig(t *testing.T, i int) *config.CPIConfig {
+	t.Helper()
+	eff, _, _, err := config.ApplyContextOverrides(haCfg("auto", "hold"), holdGroupEntries()[i].Properties)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return eff
+}
+
+// TestCollectAntiAffinityLayoutHoldPinsDoNotConfineARule pins that a rule
+// whose members each hold a strict pin to a node of their own is judged as
+// planned. The hold policy writes those pins and a drain moves none of the
+// members, so the rule is no sign of another entry's AZ. Members whose pins
+// share their nodes are still a rule the plan cannot judge.
+func TestCollectAntiAffinityLayoutHoldPinsDoNotConfineARule(t *testing.T) {
+	t.Parallel()
+	g := newAALayoutGroup()
+	wantNone(t, runCollect(t, holdGroupFake(g), holdEntryConfig(t, 0)), haKindAALayoutDrift, haKindAARuleFull)
+
+	f := holdGroupFake(g)
+	for i := range f.rules {
+		if f.rules[i].ID == "bosh-na-201" {
+			f.rules[i].Nodes = map[string]int{"n1": 0}
+		}
+	}
+	want(t, runCollect(t, f, holdEntryConfig(t, 0)), haKindAALayoutDrift, haSeverityProblem, g.rule,
+		"could not be planned", "leave them only the nodes n1")
+}
+
+// TestCollectAntiAffinityLayoutRuleAcrossDomainsIsNotDeleted pins that a run
+// whose AZ map puts the members of one of the group's rules in different
+// domains does not plan the group, because the CPI never writes a rule across
+// domains, so another entry wrote it. The run reports why and offers no
+// delete, so a fix with that entry's request leaves the rule alone.
+func TestCollectAntiAffinityLayoutRuleAcrossDomainsIsNotDeleted(t *testing.T) {
+	t.Parallel()
+	g := newAALayoutGroup()
+	r := runCollect(t, holdGroupFake(g), holdEntryConfig(t, 1))
+	want(t, r, haKindAALayoutDrift, haSeverityProblem, g.rule, "could not be planned", "vm:200, vm:201",
+		"different domains of placement.az_map (c1, c2)", "check the group under --cpi-config")
+	wantNone(t, r, haKindAARuleFull)
+	for _, fd := range r.Findings {
+		if strings.Contains(fd.Detail, "delete "+g.rule) {
+			t.Errorf("a run under another entry's AZ map offers to delete the rule: %+v", fd)
+		}
+	}
+}
+
+// TestCollectAntiAffinityLayoutContestedDeleteIsNotOffered pins that the
+// entry that judges a group does not offer to delete a rule that another of
+// the group's owners plans. Three members on the pattern window:2 carry strict
+// pins to every node. The entry az1 maps one AZ to all three nodes, so it plans
+// the group's rules in that AZ, and az2 has no AZ map, so it plans them over
+// the cluster, and the two plans name their rules apart. The cluster holds
+// both plans' rules. Each plan deletes the other's rules, and az1 judges the
+// group because its AZ holds the pins, so it reports the conflict as advice
+// instead of the delete, and az2 reports nothing.
+func TestCollectAntiAffinityLayoutContestedDeleteIsNotOffered(t *testing.T) {
+	t.Parallel()
+	g := newAALayoutGroup()
+	haProps := map[string]any{"local_policy": "none", "anti_affinity": "on"}
+	entries := []cpiConfigEntry{
+		{Name: "az1", Type: "pve", Properties: map[string]any{"pve_ha": haProps,
+			"pve_placement": map[string]any{"anti_affinity": map[string]any{"enabled": true},
+				"az_map": map[string]any{"z1": []any{"n1", "n2", "n3"}}}}},
+		{Name: "az2", Type: "pve", Properties: map[string]any{"pve_ha": haProps,
+			"pve_placement": map[string]any{"anti_affinity": map[string]any{"enabled": true}}}},
+	}
+	base := haCfg("auto", "none")
+	effs := make([]*config.CPIConfig, len(entries))
+	for i := range entries {
+		eff, _, _, err := config.ApplyContextOverrides(base, entries[i].Properties)
+		if err != nil {
+			t.Fatal(err)
+		}
+		effs[i] = eff
+	}
+	fake := func() *fakeHA {
+		f := aaLayoutFake(g, "window:2", 3)
+		for _, guest := range f.guests {
+			f.rules = append(f.rules, pinRule(guest.VMID, haMarker+" deployment=- group=-", "n1", "n2", "n3"))
+		}
+		for k := range f.guests {
+			f.guests[k].Tags += ";bosh-owner--" + haDirector
+		}
+		return f
+	}
+	// The rule each entry's plan creates, read from what a run under that
+	// entry alone would write on a cluster with no group rule.
+	creates := make([]string, len(entries))
+	for i := range entries {
+		for _, d := range findings(runCollect(t, fake(), effs[i]), haKindAALayoutDrift) {
+			if _, rest, ok := strings.Cut(d.Detail, "create "); ok {
+				creates[i], _, _ = strings.Cut(rest, " ")
+			}
+		}
+	}
+	if creates[0] == "" || creates[1] == "" || creates[0] == creates[1] {
+		t.Fatalf("the entries' plans create %q, want one rule each, named apart", creates)
+	}
+	scopes := entryScopes(entries, base, []string{haDirector, haDirector})
+	run := func(i int) *haReport {
+		f := fake()
+		for _, id := range creates {
+			f.rules = append(f.rules, ha.Rule{ID: id, Type: "resource-affinity", Affinity: "negative",
+				Comment: g.marker, Resources: []string{"vm:200", "vm:201"}})
+		}
+		return collectHAScoped(context.Background(), f, effs[i], haDirector, haNow, scopes[i])
+	}
+	judge := run(0)
+	want(t, judge, haKindAntiAffinityAmbiguous, haSeverityAdvice, g.rule, "deletes the rule "+creates[1],
+		"the cpi-config entry az2 keeps")
+	wantNone(t, judge, haKindAALayoutDrift, haKindAARuleFull)
+	wantNone(t, run(1), haKindAALayoutDrift, haKindAARuleFull, haKindAntiAffinityAmbiguous)
 }

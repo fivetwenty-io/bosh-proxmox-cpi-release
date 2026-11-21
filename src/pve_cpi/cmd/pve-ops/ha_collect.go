@@ -135,6 +135,12 @@ type haCollector struct {
 	// holdReported holds the services already reported as hold_blocks_maintenance,
 	// so the stranded check does not name them a second time.
 	holdReported map[string]bool
+	// aaDefaults holds the default pattern of each group under --cpi-config
+	// (see groupDefaults), and entryChecks the plans of the groups under
+	// each entry's settings, keyed by the entry's name, as groupPlacer
+	// builds them.
+	aaDefaults  map[string]aapattern.Pattern
+	entryChecks map[string]map[string]handlers.AntiAffinityGroupCheck
 
 	ctx   context.Context
 	r     HAReader
@@ -716,16 +722,20 @@ func (c *haCollector) antiAffinityFindings() {
 	}
 	sort.Strings(tags)
 	defaults, split := c.groupDefaults(groups, tags)
+	c.aaDefaults = defaults
 	checks := c.layoutChecks(defaults)
 	unjudged := false
 	for _, tag := range tags {
 		chk, planned := checks[tag]
-		if !c.judgesGroup(groups[tag], chk.Owner) {
+		if !c.judgesGroup(groups[tag], chk.Owner, tag) {
 			continue
 		}
 		if planned {
 			if owners, ok := split[tag]; ok && !chk.PatternRecorded && chk.Problem == "" {
 				c.adviseSplitDefaults(tag, chk.Group, owners)
+				continue
+			}
+			if c.adviseContestedDelete(tag, groups[tag], chk) {
 				continue
 			}
 			c.layoutFindings(chk)
@@ -754,12 +764,13 @@ func (c *haCollector) antiAffinityFindings() {
 // such entry, or whose entry's cluster the doctor could not read, is judged by
 // the first entry on the cluster, in cpi-config order, that the doctor read
 // and whose band holds one of its members, so it too is judged once.
-// owner is the Director the group's marker names, or "".
-func (c *haCollector) judgesGroup(members []*haGuest, owner string) bool {
+// owner is the Director the group's marker names, or "", and tag is the
+// group's tag, which is also its base rule name.
+func (c *haCollector) judgesGroup(members []*haGuest, owner, tag string) bool {
 	if c.scope == nil {
 		return true
 	}
-	if placer, ok := c.groupPlacer(members, owner); ok && !placer.Unread {
+	if placer, ok := c.groupPlacer(members, owner, tag); ok && !placer.Unread {
 		return placer.Self
 	}
 	for _, e := range c.clusterEntries() {
@@ -806,13 +817,19 @@ func (c *haCollector) clusterEntries() []haClusterEntry {
 }
 
 // groupPlacer returns the entry whose placement a group belongs to, from the
-// group's owners (see groupOwners). It is the owner whose AZ map holds the
-// strict pins of the most members, with ties going to the owner whose AZs
-// that hold them are smallest, the way a plan picks a member's domain, and
-// then to the first in cpi-config order. A pin is read as the Director's
+// group's owners (see groupOwners). The CPI writes a group's rules from the
+// plan of the entry that placed it, so that entry's plan holds the rules as
+// they stand, while another entry's plan, made over its own AZ map, may hold
+// different rules. Each owner's settings plan the group (see entryCheck), and
+// the owner whose plan could be made wins over one whose plan could not, then
+// the owner whose plan deletes the fewest of the group's rules. A tie goes to
+// the owner whose AZ map holds the strict pins of the most members, then to
+// the owner whose AZs that hold them are smallest, the way a plan picks a
+// member's domain, then to the owner whose plan writes the fewest changes,
+// and then to the first in cpi-config order. A pin is read as the Director's
 // that owner names, or the run's own when the marker names none. It returns
 // false when the group has no owner.
-func (c *haCollector) groupPlacer(members []*haGuest, owner string) (haClusterEntry, bool) {
+func (c *haCollector) groupPlacer(members []*haGuest, owner, tag string) (haClusterEntry, bool) {
 	owners := groupOwners(c.clusterEntries(), members)
 	if len(owners) == 0 {
 		return haClusterEntry{}, false
@@ -825,15 +842,103 @@ func (c *haCollector) groupPlacer(members []*haGuest, owner string) (haClusterEn
 	for _, g := range members {
 		sids = append(sids, g.sid)
 	}
-	best := 0
-	bestMisses, bestWidth := handlers.AntiAffinityPlacementFit(owners[0].AZMap, set, owner, sids)
+	type fit struct{ problem, deletes, misses, width, writes int }
+	score := func(e *haClusterEntry) fit {
+		var f fit
+		f.misses, f.width = handlers.AntiAffinityPlacementFit(e.AZMap, set, owner, sids)
+		if chk, ok := c.entryCheck(e, tag); ok {
+			if chk.Problem != "" {
+				f.problem = 1
+			}
+			f.deletes = len(planDeletes(chk))
+			f.writes = len(chk.Drift)
+		}
+		return f
+	}
+	less := func(a, b fit) bool {
+		for _, d := range [][2]int{{a.problem, b.problem}, {a.deletes, b.deletes}, {a.misses, b.misses},
+			{a.width, b.width}, {a.writes, b.writes}} {
+			if d[0] != d[1] {
+				return d[0] < d[1]
+			}
+		}
+		return false
+	}
+	best, bestFit := 0, score(&owners[0])
 	for i := 1; i < len(owners); i++ {
-		misses, width := handlers.AntiAffinityPlacementFit(owners[i].AZMap, set, owner, sids)
-		if misses < bestMisses || misses == bestMisses && width < bestWidth {
-			best, bestMisses, bestWidth = i, misses, width
+		if f := score(&owners[i]); less(f, bestFit) {
+			best, bestFit = i, f
 		}
 	}
 	return owners[best], true
+}
+
+// entryCheck returns the plan of the group tag under the settings of entry
+// e, which the doctor builds once for each entry and keeps. It returns false
+// when the scope carries no settings for e, as a scope built by hand does, or
+// when the plan does not cover the group.
+func (c *haCollector) entryCheck(e *haClusterEntry, tag string) (handlers.AntiAffinityGroupCheck, bool) {
+	if e.Config == nil {
+		return handlers.AntiAffinityGroupCheck{}, false
+	}
+	if c.entryChecks == nil {
+		c.entryChecks = map[string]map[string]handlers.AntiAffinityGroupCheck{}
+	}
+	checks, ok := c.entryChecks[e.Name]
+	if !ok {
+		checks = c.checksUnder(e.Config, c.aaDefaults)
+		c.entryChecks[e.Name] = checks
+	}
+	chk, ok := checks[tag]
+	return chk, ok
+}
+
+// planDeletes returns the rules a plan deletes.
+func planDeletes(chk handlers.AntiAffinityGroupCheck) []string {
+	var out []string
+	for _, d := range chk.Drift {
+		if rule, ok := strings.CutPrefix(d, "delete "); ok {
+			out = append(out, rule)
+		}
+	}
+	return out
+}
+
+// adviseContestedDelete reports a group whose plan under this run's settings
+// deletes a rule that the plan of another of the group's owners keeps or
+// creates, and reports true, so the doctor neither reports the delete as drift
+// nor offers a fix that removes a rule another entry's plan wants. Only a
+// plan that could be made counts.
+func (c *haCollector) adviseContestedDelete(tag string, members []*haGuest, chk handlers.AntiAffinityGroupCheck,
+) bool {
+	if c.scope == nil {
+		return false
+	}
+	deletes := planDeletes(chk)
+	if len(deletes) == 0 {
+		return false
+	}
+	for _, e := range groupOwners(c.clusterEntries(), members) {
+		if e.Self {
+			continue
+		}
+		other, ok := c.entryCheck(&e, tag)
+		if !ok || other.Problem != "" {
+			continue
+		}
+		for _, rule := range deletes {
+			if _, wanted := other.Layout[rule]; wanted {
+				c.rep.advise(haKindAntiAffinityAmbiguous, tag,
+					"the plan of group %s under this entry's settings deletes the rule %s, which the plan under the "+
+						"settings of the cpi-config entry %s keeps, so the doctor does not judge the group's layout "+
+						"and does not offer to fix it; the entries map the group's nodes differently, so serve the "+
+						"group through one entry, or give the entries one placement.az_map",
+					chk.Group, rule, e.Name)
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // groupDefaults returns the default pattern each group is planned with under
@@ -925,11 +1030,17 @@ func antiAffinityWritten(cfg *config.CPIConfig) bool {
 // Without the HA resources the plan cannot tell which members may join, so
 // nothing is planned.
 func (c *haCollector) layoutChecks(defaults map[string]aapattern.Pattern) map[string]handlers.AntiAffinityGroupCheck {
+	return c.checksUnder(c.cfg, defaults)
+}
+
+// checksUnder is layoutChecks under the settings cfg.
+func (c *haCollector) checksUnder(cfg *config.CPIConfig, defaults map[string]aapattern.Pattern,
+) map[string]handlers.AntiAffinityGroupCheck {
 	if !c.resourcesOK || c.p == nil {
 		return nil
 	}
 	in := handlers.AntiAffinityCheckInput{
-		Config: c.cfg, Profile: c.p, Owner: c.owner, GuestsComplete: !c.guestsPartial,
+		Config: cfg, Profile: c.p, Owner: c.owner, GuestsComplete: !c.guestsPartial,
 		Rules: &ha.RuleSet{Rules: c.rules}, Resources: make(map[string]string, len(c.resources)), Now: c.now,
 		GroupPatterns: defaults,
 	}

@@ -427,6 +427,9 @@ type haClusterEntry struct {
 	// Parkers is the entry's parker band when it parks detached disks, and
 	// the zero band otherwise.
 	Parkers pve.VMIDBand
+	// Config is the entry's effective configuration, which plans a group the
+	// way the entry would (see groupPlacer), or nil in a scope built by hand.
+	Config *config.CPIConfig
 	// Self marks the entry the scope belongs to.
 	Self bool
 	// Unread marks an entry whose cluster the doctor could not read, so the
@@ -554,7 +557,7 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig, owners []stri
 			if o != nil && o.host == f.host {
 				sc.Cluster = append(sc.Cluster, haClusterEntry{
 					Name: o.name, Band: o.band, AntiAffinity: o.aa, Pattern: o.pattern, AZMap: o.azMap, Owner: o.owner,
-					Parkers: o.parkers, Self: j == i, index: j,
+					Parkers: o.parkers, Config: o.cfg, Self: j == i, index: j,
 				})
 			}
 			if o == nil || j == i || o.key != f.key {
