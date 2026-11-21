@@ -425,3 +425,58 @@ func TestJoinAntiAffinityAtMetadata_AMemberAloneByDesignLogsNoWarning(t *testing
 		}
 	}
 }
+
+// TestAntiAffinity_AGroupAnOlderReleaseWroteKeepsItsResourceMarkers pins that
+// the rewrite of a group an older release wrote changes only the group's
+// rules. The older release marked each rule and each member's HA resource with
+// the owner, deployment, and group alone, and it filled the first rule to the
+// number of nodes. On three nodes the next set_vm_metadata rewrites the rules
+// to indexes 0 and 1, and 2 and 3, with index 4 alone, and records the pattern
+// it used on the rules. It leaves every resource comment as it was, because
+// only create_vm knows a member's birth and the pattern its create named, and
+// the plan needs neither for a member whose index it knows. The next plan
+// writes nothing, and the doctor finds nothing to fix.
+func TestAntiAffinity_AGroupAnOlderReleaseWroteKeepsItsResourceMarkers(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	stub := newAAStub()
+	newAACanonFleet(stub, 100, 101, 102, 103, 104)
+	old := aaIdent("web").marker()
+	for v := 100; v <= 104; v++ {
+		stub.resComments[haResourceSid(v)] = old
+	}
+	stub.seedRuleWithComment(aaRule, "vm:100,vm:101,vm:102", old)
+	stub.seedRuleWithComment(aaRule+"-2", "vm:103,vm:104", old)
+	deps := aaReplanDepsWithLocks(stub, true, newAALockPools(nil))
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+	logger, obs := log.NewObservedLogger(slog.LevelDebug)
+	joinAntiAffinityAtMetadata(ctx, deps, 102, map[string]any{"index": 2.0}, logger)
+	want := map[string]string{aaRule: "vm:100,vm:101", aaRule + "-2": "vm:102,vm:103"}
+	if !maps.Equal(stub.rules, want) {
+		t.Fatalf("rules = %v; want %v", stub.rules, want)
+	}
+	if n := aaMoveLogs(obs); n != 1 {
+		t.Fatalf("the rewrite logged %d times at Info; want once (%+v)", n, obs.All())
+	}
+	stamped := withPatternStamp(old, "block")
+	for name := range want {
+		if got := stub.ruleComments[name]; got != stamped {
+			t.Fatalf("rule %s comment = %q; want %q", name, got, stamped)
+		}
+	}
+	for v := 100; v <= 104; v++ {
+		if got := stub.resComments[haResourceSid(v)]; got != old {
+			t.Fatalf("vm:%d resource comment = %q; want the older release's %q", v, got, old)
+		}
+	}
+	if d := aaDoctorDrift(t, deps); len(d) != 0 {
+		t.Fatalf("the doctor would write %v after the rewrite", d)
+	}
+	before := aaRuleWrites(stub)
+	for v := 100; v <= 104; v++ {
+		joinAntiAffinityAtMetadata(ctx, deps, v, map[string]any{"index": float64(v % 100)}, log.NewNopLogger())
+	}
+	if aaRuleWrites(stub) != before || !maps.Equal(stub.rules, want) {
+		t.Fatalf("the next plans wrote %d rules, leaving %v; want none", aaRuleWrites(stub)-before, stub.rules)
+	}
+}
