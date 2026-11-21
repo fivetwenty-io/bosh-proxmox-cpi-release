@@ -980,11 +980,21 @@ func (p *aaPlanner) logMembers(in aapattern.Input, out aapattern.Output, rule, j
 			log.String("conflicting", strings.Join(slices.Sorted(maps.Keys(p.conflicts[sid])), ",")), joining)
 	}
 	for _, sid := range out.Alone {
-		if p.once("alone " + sid) {
-			p.logger.Warn("anti-affinity: member is in none of the group's rules, because the plan put it alone in a "+
-				"rule of its own and a negative rule needs two members; the next member of the group that the plan "+
-				"puts in that rule writes it with both", log.String("sid", sid), aloneRule(out, sid, rule), joining)
+		if !p.once("alone " + sid) {
+			continue
 		}
+		// The layout leaves a member alone only when its run holds no other
+		// place, present or held, so no member the group has now joins it.
+		// That is the layout working as designed, so the plan for the member
+		// itself says it at Info and every other plan at Debug.
+		say := p.logger.Debug
+		if sid == p.sid {
+			say = p.logger.Info
+		}
+		say("anti-affinity: member is in none of the group's rules by design, because the layout leaves it "+
+			"alone in a run of its own and a negative rule needs two members; the spread at create time keeps it "+
+			"on a node of its own, and the rule is written only if the group grows a member into that run",
+			log.String("sid", sid), aloneRule(out, sid, rule), joining)
 	}
 	for _, sid := range out.Displaced {
 		if p.once("displaced " + sid) {

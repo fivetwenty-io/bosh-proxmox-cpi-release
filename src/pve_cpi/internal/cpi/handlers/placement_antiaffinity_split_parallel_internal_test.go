@@ -41,8 +41,9 @@ func (f *aaFleet) splitCreate(vmid int, mode string, logger *log.Logger) func(st
 // sent it then waits and plans again, or fails once its attempts run out. No
 // create may fail. The group's first rule must end with
 // three members and no second rule may exist, since one member alone cannot
-// make a negative rule. The member left in no rule must be logged at Warn,
-// naming the group's second rule.
+// make a negative rule. The member left in no rule must be logged, naming
+// the group's second rule, at Info or Debug and never as a warning, because
+// the layout leaves it alone by design.
 func TestEnsureAntiAffinity_SplitParallelCreatesNameOnlyHAResources(t *testing.T) {
 	t.Parallel()
 	vmids := []int{101, 102, 103, 104}
@@ -71,7 +72,7 @@ func TestEnsureAntiAffinity_SplitParallelCreatesNameOnlyHAResources(t *testing.T
 // requireSplitRunRight checks one run of the split creates. No write was
 // refused for naming a sibling that is not an HA resource yet, the first rule
 // holds three members, no second rule exists, and the member in no rule was
-// warned about, naming the second rule.
+// logged below Warn, naming the second rule.
 func requireSplitRunRight(t *testing.T, run string, f *aaFleet, observed *log.Observer, vmids []int) {
 	t.Helper()
 	for _, e := range observed.All() {
@@ -93,11 +94,18 @@ func requireSplitRunRight(t *testing.T, run string, f *aaFleet, observed *log.Ob
 			lone = sid
 		}
 	}
+	logged := false
 	for _, e := range observed.All() {
-		if strings.Contains(e.Message, "member is in none of the group's rules") &&
-			e.Level == log.LevelWarn && e.Attrs["sid"] == lone && e.Attrs["rule"] == second {
-			return
+		if !strings.Contains(e.Message, "member is in none of the group's rules by design") ||
+			e.Attrs["sid"] != lone || e.Attrs["rule"] != second {
+			continue
 		}
+		if e.Level >= log.LevelWarn {
+			t.Fatalf("%s: %s is alone by design, and a create logged it at %v: %+v", run, lone, e.Level, e)
+		}
+		logged = true
 	}
-	t.Fatalf("%s: %s is in no rule and no create warned about it", run, lone)
+	if !logged {
+		t.Fatalf("%s: %s is in no rule and no create logged it", run, lone)
+	}
 }

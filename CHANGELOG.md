@@ -42,6 +42,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Changed
 
+- The CPI no longer warns on every plan about a member that the anti-affinity layout leaves alone by design, such as index 4 of five members on three nodes. It logs that member at Info in the plan for the member itself and at Debug in every other plan, and the line no longer promises that a later member will join its rule. It says that the rule is written only if the group grows a member into that run.
+
 - `create_vm` now keeps a recreate off the nodes of the members its anti-affinity rule will hold.
 
   - BOSH names the index only at `set_vm_metadata`, so the create infers it from the group's live holds, which each delete leaves for the recreate of its index, and it asks the same layout the rule writer uses which present members each held index will share a rule with. With several holds, as in a roll with a `max_in_flight` above 1, it counts the partners of every live hold.

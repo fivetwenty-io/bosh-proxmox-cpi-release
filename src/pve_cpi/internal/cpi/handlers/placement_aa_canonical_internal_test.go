@@ -382,3 +382,46 @@ func aaRulesOfIndex(rules map[string]string) map[int][]string {
 	}
 	return out
 }
+
+// TestJoinAntiAffinityAtMetadata_AMemberAloneByDesignLogsNoWarning pins the
+// log line for a member that the canonical layout leaves alone. Five members
+// on three nodes leave index 4 in a run of its own, so no rule holds it while
+// the group keeps five members. The plan for index 0, which writes the second
+// rule, says so at Debug, and the plan for index 4 itself says it at Info.
+// Neither is a warning, and the line promises no member that will join index
+// 4's rule.
+func TestJoinAntiAffinityAtMetadata_AMemberAloneByDesignLogsNoWarning(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	stub := newAAStub()
+	newAACanonFleet(stub, 100, 101, 102, 103, 104)
+	stub.seedRule(aaRule, "vm:100,vm:101")
+	deps := aaReplanDepsWithLocks(stub, true, newAALockPools(nil))
+	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+	for _, tc := range []struct {
+		vmid  int
+		level slog.Level
+	}{{100, slog.LevelDebug}, {104, slog.LevelInfo}} {
+		logger, obs := log.NewObservedLogger(slog.LevelDebug)
+		joinAntiAffinityAtMetadata(ctx, deps, tc.vmid, map[string]any{"index": float64(tc.vmid % 100)}, logger)
+		var alone []log.Entry
+		for _, e := range obs.All() {
+			if strings.Contains(e.Message, "alone") {
+				alone = append(alone, e)
+			}
+		}
+		if len(alone) != 1 {
+			t.Fatalf("plan of vm:%d logged %d lines about the member alone; want one (%+v)", tc.vmid, len(alone),
+				obs.All())
+		}
+		e := alone[0]
+		if e.Level != tc.level || strings.Contains(e.Message, "next member") ||
+			!strings.Contains(e.Message, "by design") || e.Attrs["sid"] != "vm:104" {
+			t.Fatalf("plan of vm:%d logged %+v; want one %v line for vm:104 that says it is alone by design and "+
+				"promises no later member", tc.vmid, e, tc.level)
+		}
+		if stub.rules[aaRule] != "vm:100,vm:101" || stub.rules[aaRule+"-2"] != "vm:102,vm:103" {
+			t.Fatalf("rules = %v; want the canonical layout", stub.rules)
+		}
+	}
+}
