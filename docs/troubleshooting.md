@@ -3297,6 +3297,24 @@ ha-manager crm-command node-maintenance disable <node>
 
 For a tag, we remove it from the node and run the undrain again. For notes that couldn't be read, we check that the node answers, for example with `pvesh get /nodes/<node>/config`, and run the undrain again once it does. Nothing was left part way, because the gate refuses before the first write.
 
+## The CPI still places VMs on a node whose notes mention the maintenance tag
+
+**Symptom**
+
+New VMs land on a node whose Notes panel mentions `maintenance`, and the CPI log carries a warning that says a line in the node's notes looks like a maintenance marker but is not one. The warning names the node and the line.
+
+**Cause**
+
+The CPI takes a node out of placement only for a line that starts with the key `tags:` and lists a tag from `pve.placement.maintenance_node_tags`. A Markdown list item such as `- tags: maintenance`, bold text such as `**tags:** maintenance`, a heading, a quote, and a form such as `tags = maintenance` don't start with the key, so they do nothing. The CPI warns about such a line on every `create_vm` while it names a configured tag, because we most likely meant it as the marker.
+
+**Diagnosis**
+
+The warning's `line` field shows the text the CPI read. We compare it with the marker form in [Operations](operations.md), and `pvesh get /nodes/<node>/config --output-format json` shows the whole notes as PVE stores them.
+
+**Fix**
+
+We rewrite the line as `tags: maintenance` at the start of its own line in the node's Notes panel, and we keep the rest of the notes. The next `create_vm` leaves the node out and logs no warning.
+
 ## Task timeouts
 
 **Symptom**

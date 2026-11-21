@@ -1574,8 +1574,10 @@ properties:
       "tags: <list>" and the list shares a tag with this property. The line may sit
       anywhere in the notes, and the key and the tags match without regard to case.
       The line has to start with the key, so a Markdown list item, a heading, a quote,
-      or a form like "tags = x" never counts. The list splits on commas, semicolons,
-      and whitespace, and every marker line counts. A node that carries the marker is
+      or a form like "tags = x" never counts, and the CPI logs a warning that names
+      such a line when it holds a configured tag. The list splits on commas,
+      semicolons, and whitespace. Brackets, quotes, and a period at the end are
+      ignored, and every marker line counts. A node that carries the marker is
       excluded from placement, and a target_node that carries it is refused with a
       retriable error. Each CPI call reads each placeable node's notes at most once,
       asks a node whose read fails at most twice, reads only the pinned

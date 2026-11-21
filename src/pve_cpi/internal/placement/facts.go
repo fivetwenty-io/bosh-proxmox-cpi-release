@@ -294,6 +294,7 @@ func gatherNodeHealth(
 			log.Err(err))
 		return nil, nil
 	}
+	pve.WarnNotesNearMisses(logger, report, "placement")
 	if report.NotesErr != nil {
 		logger.Warn("placement: node notes unreadable, so placement leaves out the nodes that did not answer",
 			log.String("nodes", strings.Join(notesUnreadNodes(report), ",")), log.Err(report.NotesErr))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -1110,4 +1111,28 @@ func TestGatherNodeFacts_ReadsNoNotesWithoutMaintenanceTags(t *testing.T) {
 	if got := ns.notesReads.Load(); got != 0 {
 		t.Errorf("notes read %d times, want none", got)
 	}
+}
+
+// TestGatherNodeFacts_WarnsAboutANotesLineThatLooksLikeAMarker pins that a
+// node whose notes hold a line that looks like a maintenance marker but is not
+// one stays in placement, and the gather logs a warning that names the node
+// and the line, so the operator learns the marker does nothing.
+func TestGatherNodeFacts_WarnsAboutANotesLineThatLooksLikeAMarker(t *testing.T) {
+	t.Parallel()
+	ns := &stubNodes{notes: map[string]string{"pve1": "Rack 4\n- tags: maintenance"}, notesFails: map[int32]bool{}}
+	logger, observed := log.NewObservedLogger(slog.LevelDebug)
+	facts, err := placement.GatherNodeFacts(context.Background(), taggedMaintenanceCluster(), ns, logger,
+		placement.GatherOptions{MaintenanceNodeTags: []string{"maintenance"}, RequireNodeHealth: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(facts) != 1 || facts[0].InMaintenance {
+		t.Fatalf("facts = %+v; want pve1 still in placement", facts)
+	}
+	for _, e := range observed.All() {
+		if e.Level == slog.LevelWarn && e.Attrs["node"] == "pve1" && e.Attrs["line"] == "- tags: maintenance" {
+			return
+		}
+	}
+	t.Fatalf("no warning names pve1 and its near-miss line: %+v", observed.All())
 }

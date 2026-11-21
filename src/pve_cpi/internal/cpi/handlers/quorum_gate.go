@@ -170,6 +170,7 @@ func refuseMaintenanceTarget(ctx context.Context, deps Deps, target string, logg
 			log.Err(err))
 		return createMaintenanceUnknownError(target, err)
 	}
+	pve.WarnNotesNearMisses(logger, report, "create_vm")
 	entry, ok := report.Node(target)
 	if !ok {
 		return nil

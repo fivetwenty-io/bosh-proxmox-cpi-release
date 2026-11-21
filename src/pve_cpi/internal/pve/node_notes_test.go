@@ -77,6 +77,75 @@ func TestNotesTags_RejectedForms(t *testing.T) {
 	}
 }
 
+// TestNotesTags_AcceptsCommonDecorations pins that a marker line still counts
+// when a byte order mark starts the notes, when its list sits in brackets,
+// when a tag sits in quotes, and when the line ends with a period, because an
+// operator writes these forms meaning the plain line.
+func TestNotesTags_AcceptsCommonDecorations(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		notes string
+		want  []string
+	}{
+		{"byte order mark", "\uFEFFtags: maintenance", []string{"maintenance"}},
+		{"bracketed list", "tags: [maintenance]", []string{"maintenance"}},
+		{"bracketed pair", "tags: [maintenance, drain]", []string{"maintenance", "drain"}},
+		{"double quotes", `tags: "maintenance"`, []string{"maintenance"}},
+		{"single quotes", "tags: 'maintenance'", []string{"maintenance"}},
+		{"quoted list", `tags: ["maintenance", "drain"]`, []string{"maintenance", "drain"}},
+		{"trailing period", "tags: maintenance.", []string{"maintenance"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := pve.NotesTags(tc.notes); !slices.Equal(got, tc.want) {
+				t.Errorf("NotesTags(%q) = %q, want %q", tc.notes, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNotesNearMisses_NamesLinesThatLookLikeAMarker pins that a line that
+// names "tags" and a wanted tag but is not a marker line is reported, so the
+// CPI can warn about a marker that does nothing, and that a marker line, a
+// line without "tags", and a line without a wanted tag are not.
+func TestNotesNearMisses_NamesLinesThatLookLikeAMarker(t *testing.T) {
+	t.Parallel()
+	want := []string{"maintenance"}
+	for _, line := range []string{
+		"- tags: maintenance",
+		"* tags: maintenance",
+		"**tags:** maintenance",
+		"tags=maintenance",
+		"tags = maintenance",
+		"tags : maintenance",
+		"tags maintenance",
+		"# tags: maintenance",
+		"> tags: maintenance",
+		"TAG: Maintenance",
+	} {
+		notes := "Rack 4\n  " + line + "  \nOwner: platform"
+		if got := pve.NotesNearMisses(notes, want); !slices.Equal(got, []string{line}) {
+			t.Errorf("NotesNearMisses(%q) = %q, want [%q]", notes, got, line)
+		}
+	}
+	for _, notes := range []string{
+		"",
+		"tags: maintenance",
+		"tags: drain\n- tags: drain",
+		"This node is in maintenance until Friday.",
+		"mytags: drain",
+	} {
+		if got := pve.NotesNearMisses(notes, want); len(got) != 0 {
+			t.Errorf("NotesNearMisses(%q) = %q, want none", notes, got)
+		}
+	}
+	if got := pve.NotesNearMisses("- tags: maintenance", nil); len(got) != 0 {
+		t.Errorf("NotesNearMisses with no wanted tag = %q, want none", got)
+	}
+}
+
 func TestNotesMaintenanceTag_MatchRules(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -199,6 +268,37 @@ func TestNodeHealth_NodeWithNoNotesStaysPlaceable(t *testing.T) {
 	}
 	if r.NotesErr != nil {
 		t.Errorf("NotesErr = %v", r.NotesErr)
+	}
+}
+
+// TestNodeHealth_RecordsANearMissWithoutActingOnIt pins that a node whose
+// notes hold a line that looks like a marker but is not one stays placeable,
+// and its entry names the line so a caller can warn the operator. A node whose
+// notes hold a real marker names no near miss, because the marker already
+// works.
+func TestNodeHealth_RecordsANearMissWithoutActingOnIt(t *testing.T) {
+	t.Parallel()
+	n := &nnNodes{notes: map[string]string{
+		"pve1": "Rack 4\n- tags: maintenance",
+		"pve2": "tags: maintenance\n- tags: maintenance",
+		"pve3": "Rack 5",
+	}}
+	r := nnRun(t, t.Context(), nhHealthy(), n, nnTags)
+	for _, e := range r.Nodes {
+		switch e.Name {
+		case "pve1":
+			if !e.Placeable || e.Maintenance || !slices.Equal(e.NotesNearMiss, []string{"- tags: maintenance"}) {
+				t.Errorf("pve1 = %+v; want placeable with the list item as its near miss", e)
+			}
+		case "pve2":
+			if e.Placeable || len(e.NotesNearMiss) != 0 {
+				t.Errorf("pve2 = %+v; want in maintenance with no near miss", e)
+			}
+		default:
+			if !e.Placeable || len(e.NotesNearMiss) != 0 {
+				t.Errorf("%s = %+v; want placeable with no near miss", e.Name, e)
+			}
+		}
 	}
 }
 

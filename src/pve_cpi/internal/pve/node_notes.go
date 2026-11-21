@@ -7,10 +7,12 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"unicode"
 
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // PVE has no tags on nodes, so an operator marks a node for maintenance with a
@@ -26,8 +28,17 @@ import (
 // key, so a sentence, a Markdown list item, or a heading that mentions tags
 // never counts. The list after the colon is split on commas, semicolons, and
 // whitespace, as PVE splits guest tags. Every marker line counts, and the tags
-// of all of them are joined.
+// of all of them are joined. A byte order mark before the line, brackets
+// around the list, quotes around a tag, and a period at the end of the line
+// are dropped, because an operator who writes them means the plain line.
+// A line that names a tag and a wanted tag but is not a marker line, such as
+// a list item or "tags = maintenance", does nothing, and NotesNearMisses
+// names it so the CPI can warn about it.
 const notesTagsKey = "tags:"
+
+// notesByteOrderMark is the byte order mark an editor can put before the
+// notes.
+const notesByteOrderMark = "\uFEFF"
 
 // NotesTags returns the tags of every marker line in notes, in the order they
 // appear, with their case kept. It returns nil when notes holds no marker line
@@ -35,21 +46,99 @@ const notesTagsKey = "tags:"
 func NotesTags(notes string) []string {
 	var tags []string
 	for line := range strings.SplitSeq(notes, "\n") {
-		line = strings.TrimSpace(line)
-		if len(line) < len(notesTagsKey) || !strings.EqualFold(line[:len(notesTagsKey)], notesTagsKey) {
-			continue
+		if list, ok := notesMarkerList(line); ok {
+			tags = append(tags, splitNotesTags(list)...)
 		}
-		tags = append(tags, splitNotesTags(line[len(notesTagsKey):])...)
 	}
 	return tags
 }
 
-// splitNotesTags splits a marker line's list on commas, semicolons, and
-// whitespace, and drops the empty pieces that runs of separators leave.
-func splitNotesTags(list string) []string {
-	return strings.FieldsFunc(list, func(r rune) bool {
-		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\r' || r == '\v' || r == '\f'
+// notesMarkerList returns the list of line after the key, and true, when line
+// is a marker line.
+func notesMarkerList(line string) (string, bool) {
+	line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), notesByteOrderMark))
+	if len(line) < len(notesTagsKey) || !strings.EqualFold(line[:len(notesTagsKey)], notesTagsKey) {
+		return "", false
+	}
+	return line[len(notesTagsKey):], true
+}
+
+// NotesNearMisses returns each line of notes, trimmed, that looks like a
+// marker line for one of want but is not one, in the order they appear. Such
+// a line holds a word that starts with "tag" and a word that matches a wanted
+// tag without regard to case, such as "- tags: maintenance" or
+// "tags = maintenance". A marker line is never a near miss, even when it names
+// no wanted tag. It returns nil when want holds no tag.
+func NotesNearMisses(notes string, want []string) []string {
+	wanted := normalizeMaintenanceTags(want)
+	if len(wanted) == 0 {
+		return nil
+	}
+	var misses []string
+	for line := range strings.SplitSeq(notes, "\n") {
+		if _, ok := notesMarkerList(line); ok {
+			continue
+		}
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), notesByteOrderMark))
+		if notesLineNamesATag(line, wanted) {
+			misses = append(misses, line)
+		}
+	}
+	return misses
+}
+
+// WarnNotesNearMisses logs a warning for each near-miss line that report
+// records, naming the node and the line, because such a line does nothing and
+// the operator who wrote it expects the node out of placement. op starts each
+// message. A nil report logs nothing.
+func WarnNotesNearMisses(logger *log.Logger, report *NodeHealthReport, op string) {
+	if report == nil {
+		return
+	}
+	for _, e := range report.Nodes {
+		for _, line := range e.NotesNearMiss {
+			logger.Warn(op+": a line in the node's notes looks like a maintenance marker but is not one, so the "+
+				"node stays in placement; write it as \"tags: <tag>\" at the start of its own line to take the "+
+				"node out", log.String("node", e.Name), log.String("line", line))
+		}
+	}
+}
+
+// notesLineNamesATag reports whether line holds a word that starts with "tag"
+// and a word that matches one of wanted, both without regard to case.
+func notesLineNamesATag(line string, wanted []string) bool {
+	words := strings.FieldsFunc(line, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' && r != '_' && r != '+' && r != '.'
 	})
+	var key, tag bool
+	for _, w := range words {
+		w = strings.TrimRight(w, ".")
+		if len(w) >= 3 && strings.EqualFold(w[:3], "tag") {
+			key = true
+		}
+		for _, x := range wanted {
+			if strings.EqualFold(w, x) {
+				tag = true
+			}
+		}
+	}
+	return key && tag
+}
+
+// splitNotesTags splits a marker line's list on commas, semicolons, and
+// whitespace, drops the brackets and quotes around each piece and a period
+// after it, and drops the empty pieces that runs of separators leave.
+func splitNotesTags(list string) []string {
+	var tags []string
+	for _, piece := range strings.FieldsFunc(list, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\r' || r == '\v' || r == '\f'
+	}) {
+		piece = strings.TrimRight(strings.TrimLeft(piece, "[\"'"), "]\"'.")
+		if piece != "" {
+			tags = append(tags, piece)
+		}
+	}
+	return tags
 }
 
 // NotesMaintenanceTag returns the first tag of notes' marker lines that matches
@@ -232,6 +321,7 @@ func applyNodeNotes(ctx context.Context, nodesAPI NodeHealthNodes, r *NodeHealth
 		}
 		tag, ok := NotesMaintenanceTag(notes, wanted)
 		if !ok {
+			e.NotesNearMiss = NotesNearMisses(notes, wanted)
 			continue
 		}
 		e.Placeable = false

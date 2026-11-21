@@ -236,6 +236,12 @@ type NodeHealthEntry struct {
 	// out a maintenance tag. NodeHealthReport.NotesErr says why.
 	NotesUnread bool
 
+	// NotesNearMiss holds each line of the node's notes that looks like a
+	// maintenance marker for a wanted tag but is not one, such as a list item
+	// or "tags = maintenance". It is set only for a node whose notes were read
+	// and carry no marker, so a caller can warn that the line does nothing.
+	NotesNearMiss []string
+
 	// Placeable is true only for a node that is online, has quorum, is not in
 	// maintenance, is not fenced, and, when a fresh manager status exists, has a
 	// fresh LRM entry whose mode allows new work. Only placeable nodes can
