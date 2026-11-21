@@ -224,15 +224,13 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 			unowned = append(unowned, entries[i].Name)
 		}
 	}
-	advised := false
 	for i := range entries {
 		report, layout := checkCPIConfigEntry(ctx, &entries[i], base, logger, deps, scopes[i], ledger, owners[i])
-		if owners[i] == "" && !advised {
-			adviseNoDirectorUUID(report, logger, unowned)
-			advised = true
-		}
 		multi.Clusters = append(multi.Clusters, report)
 		layouts = append(layouts, layout)
+	}
+	if at := noDirectorUUIDReport(multi.Clusters, owners); at >= 0 {
+		adviseNoDirectorUUID(multi.Clusters[at], logger, unowned)
 	}
 	for _, f := range pve.CheckSharedExports(layouts) {
 		multi.SharedExports = append(multi.SharedExports, haSharedFinding{
@@ -271,8 +269,30 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 	return exitOK
 }
 
-// adviseNoDirectorUUID says once per run, on the report of the first entry
-// that has no owner, that the entries named in unowned are scoped by their VM
+// noDirectorUUIDReport returns the index of the report that carries the
+// once-per-run advice about entries with no owner, or -1 when every entry has
+// one. It is the first such entry whose cluster the doctor read, because an
+// entry it couldn't read judged nothing under the band-only scope the advice
+// describes. When it read none of them, it is the first such entry, so the
+// advice is never dropped.
+func noDirectorUUIDReport(reports []*haReport, owners []string) int {
+	first := -1
+	for i, r := range reports {
+		if owners[i] != "" {
+			continue
+		}
+		if r.Effective != "unknown" {
+			return i
+		}
+		if first < 0 {
+			first = i
+		}
+	}
+	return first
+}
+
+// adviseNoDirectorUUID says once per run, on the report noDirectorUUIDReport
+// picks, that the entries named in unowned are scoped by their VM
 // ID bands alone. The band is the only boundary left for those entries, so a
 // VM another Director created inside a band is judged as the entry's. The
 // condition is one setting of the run, not of each cluster, so repeating it on
@@ -295,7 +315,7 @@ func adviseNoDirectorUUID(report *haReport, logger *log.Logger, unowned []string
 	report.advise(haKindAdvice, unowned[0], "no Director UUID is known for the entries %s, so the doctor scopes each of "+
 		"them by its VM ID band alone and judges every VM in the band, including one that another Director created there. "+
 		"Set director_uuid on each entry or on the document, or pass --director-uuid. The doctor says this once for the "+
-		"run, on the first of those entries", names)
+		"run, on the first of those entries whose cluster it read", names)
 }
 
 // joinNames lists names in prose, with an Oxford comma before the last of

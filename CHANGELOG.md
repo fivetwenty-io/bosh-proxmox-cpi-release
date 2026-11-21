@@ -162,6 +162,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Fixed
 
+- `pve-ops ha --cpi-config` now puts its once-per-run advice that no Director UUID is known on the first entry without a UUID whose cluster it could read. Before, the advice could land on an entry whose cluster was unreachable, which judged nothing, while a later entry without a UUID was the one the doctor judged by its VM ID band alone. [Operations](docs/operations.md#reading-the-cluster-with-pve-ops-ha)
+
 - The `replica_gone_vm_volume` advice of `pve-ops ha` now has us check container configs as well as VM configs before we remove the volume. Its `grep` reads `/etc/pve/nodes/*/lxc/*.conf` beside `/etc/pve/nodes/*/qemu-server/*.conf`, so a container that names the volume also keeps it. [Troubleshooting](docs/troubleshooting.md#removing-the-volume-of-a-vm-that-no-longer-exists)
 
 - `pve-ops ha` now judges whether a VM on a node in maintenance is `maintenance_stranded` against the nodes the HA manager would move it to, which are the other online nodes out of PVE HA maintenance. Before, it also left out a node that carried only the maintenance marker in its notes and a node the CPI won't place on, so a strict pin that named such a node read as a reason the VM couldn't leave, although PVE moves the VM there. The finding is now also a problem when no other online node is out of HA maintenance, which before read as advice that PVE was expected to move the VM. [Operations](docs/operations.md#reading-the-cluster-with-pve-ops-ha)

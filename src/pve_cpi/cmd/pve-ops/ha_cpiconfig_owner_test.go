@@ -109,3 +109,51 @@ func TestRunHACPIConfig_SaysOnceThatNoDirectorUUIDIsKnown(t *testing.T) {
 		t.Fatalf("advice = %q; want it once, on entry a, naming a and c", notes)
 	}
 }
+
+// TestRunHACPIConfig_PutsTheNoDirectorUUIDAdviceOnAnEntryThatWasRead pins
+// that the once-per-run advice lands on the first entry without a UUID whose
+// cluster the doctor read, not on an entry whose cluster it couldn't reach and
+// so judged nothing. When no such entry was read, the advice stays on the
+// first entry without a UUID, so it is never dropped.
+func TestRunHACPIConfig_PutsTheNoDirectorUUIDAdviceOnAnEntryThatWasRead(t *testing.T) {
+	t.Parallel()
+	doc := `[{"name":"a","type":"pve","properties":{"pve_host":"down","pve_vmid_range_start":100,"pve_vmid_range_end":199}},` +
+		`{"name":"b","type":"pve","properties":{"pve_vmid_range_start":200,"pve_vmid_range_end":299}}]`
+	run := func(t *testing.T, down func(host string) bool) map[string]bool {
+		t.Helper()
+		deps := haDeps{
+			openReader: func(cfg *config.CPIConfig, _ *log.Logger) (HAReader, error) {
+				if down(cfg.Host) {
+					return nil, errFake
+				}
+				return haBaseFake(), nil
+			},
+			now: func() time.Time { return haNow },
+		}
+		path := filepath.Join(t.TempDir(), "cpi-config.json")
+		if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var stdout, stderr bytes.Buffer
+		runHACPIConfig(context.Background(), path, haCfg("auto", "hold"), nil, "", true, &stdout, &stderr, deps)
+		var out haMultiReport
+		if err := json.Unmarshal(stdout.Bytes(), &out); err != nil || len(out.Clusters) != 2 {
+			t.Fatalf("output %q (%v), stderr %q", stdout.String(), err, stderr.String())
+		}
+		got := map[string]bool{}
+		for _, c := range out.Clusters {
+			for _, n := range findings(c, haKindAdvice) {
+				if strings.Contains(n.Detail, "no Director UUID is known") {
+					got[c.Cluster] = true
+				}
+			}
+		}
+		return got
+	}
+	if got := run(t, func(host string) bool { return host == "down" }); len(got) != 1 || !got["b"] {
+		t.Errorf("advice on %v, want it once, on entry b, whose cluster was read", got)
+	}
+	if got := run(t, func(string) bool { return true }); len(got) != 1 || !got["a"] {
+		t.Errorf("advice on %v, want it once, on entry a, when no entry was read", got)
+	}
+}
