@@ -271,6 +271,7 @@ func TestPrepareAttachReplicaRebuild_WaitsForAnHAMove(t *testing.T) {
 // retriable, with the narrowed pin and its token in place.
 func TestPrepareAttachReplicaRebuild_WaitsForACRMRoundAfterThePin(t *testing.T) {
 	defer SetHADeleteMotionPollForTest(10 * time.Millisecond)()
+	var lrmFirst int64
 	for name, tc := range map[string]struct {
 		manager func(int64, map[string]HASceneService) *cluster.ListHaStatusManagerStatusResponse
 		reason  string
@@ -282,8 +283,16 @@ func TestPrepareAttachReplicaRebuild_WaitsForACRMRoundAfterThePin(t *testing.T) 
 			reason: "no CRM round has run since the narrowed pin",
 		},
 		"no LRM report after the round": {
+			// The CRM's round and the LRM's last report are fixed at the clock
+			// of the first read, so the LRM never reports after the round
+			// however long the machine stalls between two reads. Stamps that
+			// slid with each read's clock let a stall of two seconds move the
+			// LRM's report past the round the rebuild recorded.
 			manager: func(now int64, services map[string]HASceneService) *cluster.ListHaStatusManagerStatusResponse {
-				scene := &HADeleteScene{Now: now + 6, Members: []string{"pve01", "pve02", "pve03"}, CRMAge: 5,
+				if lrmFirst == 0 {
+					lrmFirst = now
+				}
+				scene := &HADeleteScene{Now: lrmFirst + 6, Members: []string{"pve01", "pve02", "pve03"}, CRMAge: 3,
 					LRMAge: map[string]int64{"pve01": 6, "pve02": 6, "pve03": 6}, Services: services}
 				return scene.managerBody()
 			},
