@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -206,17 +207,30 @@ func TestCleanupHAMembership_AFailedReplanOnlyWarns(t *testing.T) {
 // TestRemoveAntiAffinity_RollingUpdateWritesEachMembersRulesOnly pins what a
 // rolling update of a group costs. BOSH deletes each instance and creates it
 // again under a new VMID with the same index, which joins at
-// set_vm_metadata. Each instance may cost one write when it leaves and one
-// when it comes back, no other member may change rules, and the group ends
-// in the layout it started in.
+// set_vm_metadata. Each instance may cost one write that changes a rule's
+// members when it leaves and one when it comes back, no other member may
+// change rules, and the group ends in the layout it started in.
+//
+// The writes that change only the holds a rule records are counted apart,
+// against an exact number. On four nodes the deleted member's rule keeps two
+// members, so the shrink that takes the member out records its hold and the
+// recreate's join drops it, and no write changes the holds alone. On three
+// nodes the delete leaves its rule with one member, and a rule delete carries
+// no comment, so each member costs two such writes. The first records the
+// hold on the group's other rule before the delete, so the place is never
+// recorded nowhere, and the second drops it from that rule once the recreate
+// has joined.
 func TestRemoveAntiAffinity_RollingUpdateWritesEachMembersRulesOnly(t *testing.T) {
 	t.Parallel()
 	for name, tc := range map[string]struct {
-		nodes []string
-		rules []string
+		nodes    []string
+		rules    []string
+		holdOnly int
 	}{
-		"three nodes": {[]string{"pve1", "pve2", "pve3"}, []string{"vm:100,vm:101", "vm:102,vm:103", "vm:104,vm:105"}},
-		"four nodes":  {[]string{"pve1", "pve2", "pve3", "pve4"}, []string{"vm:100,vm:101,vm:102", "vm:103,vm:104,vm:105"}},
+		"three nodes": {[]string{"pve1", "pve2", "pve3"}, []string{"vm:100,vm:101", "vm:102,vm:103", "vm:104,vm:105"},
+			12},
+		"four nodes": {[]string{"pve1", "pve2", "pve3", "pve4"}, []string{"vm:100,vm:101,vm:102", "vm:103,vm:104,vm:105"},
+			0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -230,8 +244,7 @@ func TestRemoveAntiAffinity_RollingUpdateWritesEachMembersRulesOnly(t *testing.T
 			markWebMembers(stub, vmids...)
 			seedRuleChain(stub, tc.rules)
 			start := aaRuleOfMembers(stub.rules)
-			writes := func() int { return stub.createRuleCalls + stub.updateRuleCalls + stub.deleteRuleCalls }
-			before := writes()
+			members, holdOnly := countRuleWrites(t, stub)
 			for i, old := range slices.Clone(vmids) {
 				tags := aaTag + ";index--" + strconv.Itoa(i)
 				prev := aaRuleOfMembers(stub.rules)
@@ -255,12 +268,45 @@ func TestRemoveAntiAffinity_RollingUpdateWritesEachMembersRulesOnly(t *testing.T
 				}
 			}
 			assertEachIndexBackInItsRule(t, start, aaRuleOfMembers(stub.rules), vmids)
-			if n := writes() - before; n > 2*len(vmids) {
-				t.Errorf("the update wrote rules %d times for %d members; want at most %d", n, len(vmids),
-					2*len(vmids))
+			if n := *members; n > 2*len(vmids) {
+				t.Errorf("the update changed rule members in %d writes for %d members; want at most %d", n,
+					len(vmids), 2*len(vmids))
+			}
+			if n := *holdOnly; n != tc.holdOnly {
+				t.Errorf("the update changed only the holds of a rule in %d writes; want %d", n, tc.holdOnly)
+			}
+			for name, c := range stub.ruleComments {
+				if len(holdsOf(c)) != 0 {
+					t.Errorf("comment of %s = %q after the update; want every hold consumed and dropped", name, c)
+				}
 			}
 		})
 	}
+}
+
+// countRuleWrites counts the stub's rule writes from now on, as the writes
+// that change a rule's members, which every create and delete does, and the
+// writes that change only the holds a rule records. A write that keeps the
+// members and changes any other part of the comment fails the test.
+func countRuleWrites(t *testing.T, stub *aaClusterStub) (members, holdOnly *int) {
+	t.Helper()
+	members, holdOnly = new(int), new(int)
+	rules, comments := maps.Clone(stub.rules), maps.Clone(stub.ruleComments)
+	stub.onRuleWrite = func(rule string) {
+		was, had := rules[rule]
+		now, has := stub.rules[rule]
+		switch {
+		case !had || !has || was != now:
+			*members++
+		case withHolds(comments[rule], holdsOf(stub.ruleComments[rule])) == stub.ruleComments[rule]:
+			*holdOnly++
+		default:
+			t.Errorf("write of %s kept its members and changed its comment from %q to %q", rule, comments[rule],
+				stub.ruleComments[rule])
+		}
+		rules, comments = maps.Clone(stub.rules), maps.Clone(stub.ruleComments)
+	}
+	return members, holdOnly
 }
 
 // listIndexedMembers lists each nonzero VMID of vmids as the group member

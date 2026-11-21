@@ -408,9 +408,12 @@ func (p *aaPlanner) sortedRuleNames(names []string) []string {
 // assignHolds decides where every live hold is recorded once the plan's
 // rules are written. A hold stays on each rule of the plan in its domain, and
 // each member resource of its domain, that records its index already.
-// Otherwise it goes on the lowest-numbered rule of the plan in its domain,
-// and when the domain has no rule, on the HA resource of the domain's
-// lowest-indexed member. ruleHolds and resHolds then hold what each carrier
+// Otherwise it goes on the rule its deleted member leaves, when the plan
+// keeps that rule, so the write that takes the member out records the hold
+// and the recreate's join drops it again, with no write of its own for
+// either. A hold whose member's rule goes goes on the lowest-numbered rule
+// of the plan in its domain, and when the domain has no rule, on the HA
+// resource of the domain's lowest-indexed member. ruleHolds and resHolds then hold what each carrier
 // should record, and a consumed or lapsed hold is recorded nowhere.
 func (p *aaPlanner) assignHolds(in aapattern.Input, existing map[string]*ha.Rule, out aapattern.Output) {
 	p.ruleHolds, p.resHolds = map[string][]aaHold{}, map[string][]aaHold{}
@@ -455,6 +458,10 @@ func (p *aaPlanner) assignHolds(in aapattern.Input, existing map[string]*ha.Rule
 		if placed {
 			continue
 		}
+		if name, ok := p.leftRule(h, names, ruleDom, existing); ok {
+			p.ruleHolds[name] = append(p.ruleHolds[name], h.aaHold)
+			continue
+		}
 		if i := slices.IndexFunc(names, func(n string) bool { return ruleDom[n] == h.Domain }); i >= 0 {
 			p.ruleHolds[names[i]] = append(p.ruleHolds[names[i]], h.aaHold)
 			continue
@@ -470,6 +477,31 @@ func (p *aaPlanner) assignHolds(in aapattern.Input, existing map[string]*ha.Rule
 				log.String("domain", aaDomainLabel(h.Domain)))
 		}
 	}
+}
+
+// leftRule returns the lowest-numbered rule among names, in the hold's
+// domain, that holds the hold's deleted member now or records it as leaving,
+// and false when the plan keeps no such rule or the hold names no VMID.
+func (p *aaPlanner) leftRule(
+	h *aaGroupHold, names []string, ruleDom map[string]string, existing map[string]*ha.Rule,
+) (string, bool) {
+	sid := h.sid()
+	if sid == "" {
+		return "", false
+	}
+	for _, name := range names {
+		r := existing[name]
+		if ruleDom[name] != h.Domain || r == nil {
+			continue
+		}
+		if r.HasResource(sid) {
+			return name, true
+		}
+		if m, ok := parseHaMarker(r.Comment); ok && slices.Contains(m.Left, sid) {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 // resourceCarriers returns the members whose HA resources can record a hold:
