@@ -189,8 +189,12 @@ type aaPlanner struct {
 	// has no recordHolds.
 	pendingHolds []aaResourceHoldEdit
 	// holdWriteFailed holds the resources whose hold write failed, which the
-	// planner does not write again.
+	// planner does not write again and does not choose to record a hold.
 	holdWriteFailed map[string]bool
+	// keepForHold names the rules the last plan keeps, although its layout
+	// drops them, because they record a live hold that no other rule or
+	// resource could take over once a hold write failed.
+	keepForHold map[string]bool
 }
 
 // once reports whether the line keyed key has not been logged yet, and marks
@@ -226,16 +230,21 @@ func (p *aaPlanner) plan(set *ha.RuleSet) ([]ha.RuleOp, error) {
 		}
 	}
 	p.lastIn, p.lastOut = in, out
-	p.assignHolds(in, existing, out)
-	ops := p.ruleOps(set, existing, out)
-	adds, cleanups := p.resourceHoldEdits()
-	if len(adds) > 0 && !p.leadsHoldAdds(ops) {
-		p.writeResourceHolds(adds)
+	// A hold that a member's HA resource fails to record goes to another
+	// carrier, so the plan assigns the holds again after each failed write.
+	// Every round leaves out one more resource, so the loop ends.
+	for {
+		p.assignHolds(in, existing, out)
+		ops := p.ruleOps(set, existing, out)
+		adds, cleanups := p.resourceHoldEdits()
+		if len(adds) > 0 && !p.leadsHoldAdds(ops) && !p.writeResourceHolds(adds) {
+			continue
+		}
+		if len(ops) == 0 && !p.keepStale {
+			p.writeResourceHolds(cleanups)
+		}
+		return ops, nil
 	}
-	if len(ops) == 0 && !p.keepStale {
-		p.writeResourceHolds(cleanups)
-	}
-	return ops, nil
 }
 
 // prepare reads what a plan plans from, the HA resources, the group's rules,
@@ -801,10 +810,10 @@ func (p *aaPlanner) newMemberPins(set *ha.RuleSet, members []string, pinned map[
 
 // ruleDeletes returns the deletes of the existing rules the layout drops, in
 // name order, split into those of rules that record no live hold and those
-// of rules that record one.
+// of rules that record one. A rule in keepForHold is not deleted.
 func (p *aaPlanner) ruleDeletes(existing map[string]*ha.Rule, out aapattern.Output) (deletes, heldDeletes []ha.RuleOp) {
 	for _, name := range slices.Sorted(maps.Keys(existing)) {
-		if _, ok := out.Rules[name]; ok {
+		if _, ok := out.Rules[name]; ok || p.keepForHold[name] {
 			continue
 		}
 		op := ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: name}}

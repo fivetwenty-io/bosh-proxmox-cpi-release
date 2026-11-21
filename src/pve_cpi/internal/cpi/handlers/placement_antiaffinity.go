@@ -305,12 +305,32 @@ func newGroupPlanner(
 		return collectGroupMemberSids(ctx, deps, ident)
 	}
 	p.recordHolds = func(e aaResourceHoldEdit) error {
-		_, err := ha.EditResourceComment(ctx, svc, e.sid, func(comment string) bool {
-			return haOwnershipOf(comment, ident.Owner) == haOwnedByUs
-		}, e.apply)
-		return err
+		return recordResourceHolds(ctx, svc, ident.Owner, e)
 	}
 	return p
+}
+
+// recordResourceHolds writes a change of the holds sid's HA resource records.
+// A resource that is missing, or whose comment no longer carries owner's
+// marker, takes no write, and that is an error too, because the plan must not
+// count a hold as recorded where nothing records it. A comment that records
+// the change already needs no write.
+func recordResourceHolds(ctx context.Context, svc cluster.Service, owner string, e aaResourceHoldEdit) error {
+	read := false
+	_, err := ha.EditResourceComment(ctx, svc, e.sid, func(comment string) bool {
+		return haOwnershipOf(comment, owner) == haOwnedByUs
+	}, func(comment string) string {
+		read = true
+		return e.apply(comment)
+	})
+	switch {
+	case err != nil:
+		return err
+	case !read:
+		return cpierrors.Retriable("anti-affinity: the HA resource %s is gone or no longer carries this Director's "+
+			"marker, so it records no hold", e.sid)
+	}
+	return nil
 }
 
 // newAAPlanner returns a planner of ident's group rules over scan that reads

@@ -422,9 +422,12 @@ func (p *aaPlanner) sortedRuleNames(names []string) []string {
 // rule it creates could record the hold only after the delete of the rule
 // that records it now. Only a domain with neither puts the hold on a rule the
 // plan creates. ruleHolds and resHolds then hold what each carrier should
-// record, and a consumed or lapsed hold is recorded nowhere.
+// record, and a consumed or lapsed hold is recorded nowhere. A resource whose
+// hold write failed records no hold. When that leaves a hold with no carrier,
+// the plan keeps every rule that records the hold now, in keepForHold, so the
+// hold stays recorded until a later plan can move it.
 func (p *aaPlanner) assignHolds(in aapattern.Input, existing map[string]*ha.Rule, out aapattern.Output) {
-	p.ruleHolds, p.resHolds = map[string][]aaHold{}, map[string][]aaHold{}
+	p.ruleHolds, p.resHolds, p.keepForHold = map[string][]aaHold{}, map[string][]aaHold{}, nil
 	domainOf := map[string]string{}
 	var present []aapattern.Member
 	for _, m := range in.Members {
@@ -484,6 +487,9 @@ func (p *aaPlanner) assignHolds(in aapattern.Input, existing map[string]*ha.Rule
 			p.ruleHolds[names[i]] = append(p.ruleHolds[names[i]], h.aaHold)
 			continue
 		}
+		if p.keepHoldRules(h, existing) {
+			continue
+		}
 		if p.once("unrecorded hold " + h.String()) {
 			p.logger.Warn("anti-affinity: no rule or member of the group is left in the deleted member's domain to "+
 				"record its hold, so only this plan keeps its place free",
@@ -491,6 +497,37 @@ func (p *aaPlanner) assignHolds(in aapattern.Input, existing map[string]*ha.Rule
 				log.String("domain", aaDomainLabel(h.Domain)))
 		}
 	}
+}
+
+// keepHoldRules marks in keepForHold every rule of existing that records h's
+// index, once a failed hold write has left h with no other carrier, and
+// reports whether it marked one. The plan then keeps those rules as they are,
+// and a later plan, which tries the resource again, moves the hold and drops
+// them.
+func (p *aaPlanner) keepHoldRules(h *aaGroupHold, existing map[string]*ha.Rule) bool {
+	if len(p.holdWriteFailed) == 0 {
+		return false
+	}
+	var kept []string
+	for _, name := range slices.Sorted(maps.Keys(existing)) {
+		if recordsIndex(holdsOf(existing[name].Comment), h.Index) {
+			if p.keepForHold == nil {
+				p.keepForHold = map[string]bool{}
+			}
+			p.keepForHold[name] = true
+			kept = append(kept, name)
+		}
+	}
+	if len(kept) == 0 {
+		return false
+	}
+	if p.once("kept for hold " + h.String()) {
+		p.logger.Warn("anti-affinity: the hold could not be recorded on a member's HA resource, so the plan keeps "+
+			"the rule that records it; a later plan of the group moves the hold and drops the rule",
+			log.String("rule", p.ident.ruleName()), log.Int("index", h.Index), log.String("sid", h.sid()),
+			log.String("kept", strings.Join(kept, ",")))
+	}
+	return true
 }
 
 // leftRule returns the lowest-numbered rule among names, in the hold's
@@ -520,8 +557,8 @@ func (p *aaPlanner) leftRule(
 
 // resourceCarriers returns the members whose HA resources can record a hold:
 // present members that are HA resources marked as members of the group, and
-// no hold's deleted member, ordered by index, with no index last, and then
-// by key.
+// no hold's deleted member or resource whose hold write failed, ordered by
+// index, with no index last, and then by key.
 func (p *aaPlanner) resourceCarriers(present []aapattern.Member) []aapattern.Member {
 	deleted := map[string]bool{}
 	for _, h := range p.holds {
@@ -529,7 +566,7 @@ func (p *aaPlanner) resourceCarriers(present []aapattern.Member) []aapattern.Mem
 	}
 	var out []aapattern.Member
 	for _, m := range present {
-		if _, ok := p.groupMarkerOf(m.Key); ok && !deleted[m.Key] {
+		if _, ok := p.groupMarkerOf(m.Key); ok && !deleted[m.Key] && !p.holdWriteFailed[m.Key] {
 			out = append(out, m)
 		}
 	}
@@ -644,9 +681,11 @@ func (p *aaPlanner) resourceHoldEdits() (adds, cleanups []aaResourceHoldEdit) {
 // such as the doctor's or the unlocked fast path of set_vm_metadata's join,
 // records each edit as pending instead and writes nothing. A
 // write that fails is logged once at Warn and not tried again by this
-// planner, because a hold that a resource fails to record only loses its
-// place to the next plan once this one is done.
-func (p *aaPlanner) writeResourceHolds(edits []aaResourceHoldEdit) {
+// planner, and the resource records no hold for the rest of its plans, so
+// the plan gives the hold to another carrier or keeps the rule that records
+// it (see assignHolds). It reports whether every write landed.
+func (p *aaPlanner) writeResourceHolds(edits []aaResourceHoldEdit) bool {
+	ok := true
 	for _, e := range edits {
 		if p.recordHolds == nil {
 			p.pendingHolds = append(p.pendingHolds, e)
@@ -660,11 +699,13 @@ func (p *aaPlanner) writeResourceHolds(edits []aaResourceHoldEdit) {
 				p.holdWriteFailed = map[string]bool{}
 			}
 			p.holdWriteFailed[e.sid] = true
+			ok = false
 			p.logger.Warn("anti-affinity: the hold could not be recorded on the member's HA resource (non-fatal)",
 				log.String("rule", p.ident.ruleName()), log.String("sid", e.sid),
 				log.String("add", formatAAHolds(e.add)), log.String("drop", formatAAHolds(e.drop)), log.Err(err))
 		}
 	}
+	return ok
 }
 
 // holdReport returns the plan's live holds, and the recorded holds that keep

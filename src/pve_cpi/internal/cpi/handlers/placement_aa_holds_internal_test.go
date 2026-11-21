@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"slices"
 	"strconv"
@@ -701,5 +702,56 @@ func TestLegacyMigration_CarriesTheHoldOfARuleItsRepairDeletes(t *testing.T) {
 	}
 	if !loss.lost {
 		t.Error("the repair's delete of a group rule is not reported to the heal")
+	}
+}
+
+// TestHealAntiAffinity_AHoldItCannotRecordKeepsItsRule pins that a plan never
+// counts a hold as recorded on a member's HA resource when the write did not
+// land, and that it keeps the rule that records the hold instead of deleting
+// it. The rule records the hold of index 1, whose member is gone, so the plan
+// drops the rule and moves the hold to the HA resource of the member that is
+// left. That write fails, either because the resource stopped carrying this
+// Director's marker after the plan read it, or because the read fails. After
+// every write some rule or resource still records the hold, and the rule
+// that records it stays.
+func TestHealAntiAffinity_AHoldItCannotRecordKeepsItsRule(t *testing.T) {
+	t.Parallel()
+	hold := aaHold{Index: 1, VMID: 101, Until: time.Now().Add(20 * time.Minute).Unix()}
+	for name, spoil := range map[string]func(stub *aaClusterStub){
+		"a foreign resource": func(stub *aaClusterStub) {
+			stub.afterListHaResources = func(int) {
+				stub.resComments["vm:100"] = "bosh-cpi:v1 owner=them deployment=cf group=router"
+			}
+		},
+		"a failed read": func(stub *aaClusterStub) {
+			stub.getResErr = errors.New("connection refused")
+		},
+	} {
+		for _, lock := range []bool{false, true} {
+			t.Run(name+" lock "+strconv.FormatBool(lock), func(t *testing.T) {
+				t.Parallel()
+				stub := newAAStub()
+				newAAHoldFleet(stub, 100)
+				stub.seedRule(aaRule, "vm:100,vm:101")
+				stub.ruleComments[aaRule] = withHolds(stub.ruleComments[aaRule], []aaHold{hold})
+				deps := aaReplanDeps(stub, lock)
+				deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+				spoil(stub)
+				writes := 0
+				check := func(what string) {
+					writes++
+					if len(aaHoldCarriers(stub, 1)) == 0 {
+						t.Errorf("after write %d (%s) no rule or resource records the hold; rules %v, comments %v, "+
+							"resources %v", writes, what, stub.rules, stub.ruleComments, stub.resComments)
+					}
+				}
+				stub.onRuleWrite = func(rule string) { check("rule " + rule) }
+				stub.onResourceWrite = func(sid string) { check("resource " + sid) }
+				_ = healAntiAffinityGroup(context.Background(), deps, aaIdent("web"), "", "", nil, log.NewNopLogger())
+				if got := aaHoldCarriers(stub, 1); !slices.Contains(got, "rule "+aaRule) {
+					t.Fatalf("the hold of index 1 is recorded on %v; want the rule that records it kept", got)
+				}
+			})
+		}
 	}
 }
