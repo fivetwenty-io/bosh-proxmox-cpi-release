@@ -77,6 +77,7 @@ const (
 	haKindParkerPinOrphan       = "parker_pin_orphan"
 	haKindRebalancePending      = "rebalance_pending"
 	haKindSpreadSkewed          = "spread_skewed"
+	haKindNotesNearMiss         = "notes_marker_near_miss"
 )
 
 // haFinding is one thing the doctor found.

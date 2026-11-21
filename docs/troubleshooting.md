@@ -3309,7 +3309,7 @@ The CPI takes a node out of placement only for a line that starts with the key `
 
 **Diagnosis**
 
-The warning's `line` field shows the text the CPI read. We compare it with the marker form in [Operations](operations.md), and `pvesh get /nodes/<node>/config --output-format json` shows the whole notes as PVE stores them.
+The warning's `line` field shows the text the CPI read, and `pve-ops ha` reports the same line as `notes_marker_near_miss` advice, so we can find it without a create. We compare it with the marker form in [Operations](operations.md), and `pvesh get /nodes/<node>/config --output-format json` shows the whole notes as PVE stores them.
 
 **Fix**
 

@@ -567,6 +567,31 @@ func TestCollectTreatsANotesMarkerAsNoHAMaintenance(t *testing.T) {
 	want(t, r, haKindUnchecked, haSeverityProblem, "node-notes", "maintenance marker", "node config unavailable")
 }
 
+// TestCollectReportsANotesLineThatMissesTheMarker pins that a line in a
+// node's notes that looks like the maintenance marker but is not one becomes
+// advice that names the node and the line, because the node stays in
+// placement while the operator who wrote it expects it out. A clean node gets
+// no such advice.
+func TestCollectReportsANotesLineThatMissesTheMarker(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	f.profile.Health.Nodes[0] = pve.NodeHealthEntry{Name: "n1", Health: pve.NodeHealthOnline, Placeable: true,
+		ProxyTarget: true, NotesNearMiss: []string{"- tags: maintenance", "tags = maintenance"}}
+	r := runCollect(t, f, haCfg("auto", "none"))
+	got := findings(r, haKindNotesNearMiss)
+	if len(got) != 2 {
+		t.Fatalf("got %d %s findings; want one per line in %+v", len(got), haKindNotesNearMiss, r.Findings)
+	}
+	for i, line := range []string{`"- tags: maintenance"`, `"tags = maintenance"`} {
+		x := got[i]
+		if x.Severity != haSeverityAdvice || x.Subject != "n1" || !strings.Contains(x.Detail, "tags: <tag>") ||
+			!strings.Contains(x.Detail, line) {
+			t.Errorf("finding = %+v; want advice on n1 that names the line %s and the marker form", x, line)
+		}
+	}
+	wantNone(t, runCollect(t, haBaseFake(), haCfg("auto", "none")), haKindNotesNearMiss)
+}
+
 func recoveryFake() *fakeHA {
 	f := haBaseFake()
 	f.states = map[string]string{"vm:100": "recovery"}

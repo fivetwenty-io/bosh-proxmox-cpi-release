@@ -729,7 +729,9 @@ The headroom field reads `headroom=ok(42%)` when every single-node failure leave
 Each finding is either a problem or advice. The command exits with 0 when the report holds no problem, with 1 when it holds a problem or a source it could not read, and with 2 for a usage error. An unreadable source counts as a problem with the kind `unchecked`, so a clean run proves that every check ran. The finding kinds fall into these groups.
 
 - Cluster and quorum
-  `observe_only`, `node_down`, `entry_clock_unreadable`, `quorum_fragile`, `qdevice_advice`, `advice`, and `crs_mode`.
+  `observe_only`, `node_down`, `entry_clock_unreadable`, `quorum_fragile`, `qdevice_advice`, `advice`, `crs_mode`, and `notes_marker_near_miss`.
+
+  The `notes_marker_near_miss` advice names a node and a line in its notes that looks like the maintenance marker but isn't one, such as `- tags: maintenance` or `tags = maintenance`. The CPI ignores such a line, so the node stays in placement. The advice says to write the line as `tags: <tag>` at the start of its own line, which is the form that takes the node out. The CPI logs the same line as a warning on each `create_vm` that reads the node's notes.
 
 - Rules and resources
   `rule_problem`, `rule_unmarked`, `pin_missing`, `soft_pin_resource_affinity`, `anti_affinity_skipped`, `anti_affinity_split`, `anti_affinity_short`, `anti_affinity_ambiguous`, `aa_rule_full`, `aa_layout_drift`, `aa_hold_lapsed`, `aa_pin_restore`, `aa_pattern_trimmed`, `aa_pattern_blocks_drain`, `resource_ignored`, `managed_without_resource`, `failback_on_replica`, `failback_drift`, `rebalance_pending`, and `spread_skewed`.

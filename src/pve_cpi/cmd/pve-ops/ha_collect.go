@@ -550,6 +550,11 @@ func (c *haCollector) profileFindings() {
 			if n.DeadOrFenced {
 				rep.problem(haKindNodeDown, n.Name, "the node is offline, unknown, fenced, or gone: %s", n.Reason)
 			}
+			for _, line := range n.NotesNearMiss {
+				rep.advise(haKindNotesNearMiss, n.Name, "the line %q in the node's notes looks like a maintenance "+
+					"marker but is not one, so the CPI still places VMs on the node; write it as \"tags: <tag>\" "+
+					"at the start of its own line to take the node out", line)
+			}
 		}
 		if p.Health.NotesErr != nil {
 			rep.unchecked("node-notes", "the notes of a node could not be read, so the doctor cannot tell whether "+
