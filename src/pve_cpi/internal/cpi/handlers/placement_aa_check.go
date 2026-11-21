@@ -86,6 +86,14 @@ type AntiAffinityGroupCheck struct {
 	PinRestores []AntiAffinityPinRestore `json:"pin_restores,omitempty"`
 	// Problem says why the group could not be planned, or "".
 	Problem string `json:"problem,omitempty"`
+	// ForeignRule says why the plan's writes would delete or rewrite a rule
+	// whose name this config never gives a rule of its members' domain, or "".
+	// Another cpis entry on the cluster most likely wrote that rule and keeps
+	// it, so FixAntiAffinityGroups reports the group as not planned and writes
+	// nothing. The doctor under --cpi-config first asks whether another
+	// entry's plan keeps the rule, and otherwise reports it the way it reports
+	// Problem. Drift still lists the writes the plan would send.
+	ForeignRule string `json:"foreign_rule,omitempty"`
 }
 
 // AntiAffinityPinRestore is a member's pin whose recorded priorities the next
@@ -226,6 +234,14 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 		c.Problem = reason
 		return c
 	}
+	rewritten := map[string]bool{}
+	for i := range ops {
+		id := ops[i].Rule.ID
+		if ops[i].Kind == ha.OpDelete || ops[i].Kind == ha.OpUpdate && !p.stampOnly[id] && !p.holdOnly[id] {
+			rewritten[id] = true
+		}
+	}
+	c.ForeignRule = foreignNamedRule(set, ident, p.lastIn, rewritten)
 	for i := range ops {
 		switch id := ops[i].Rule.ID; {
 		case p.stampOnly[id]:
@@ -371,6 +387,70 @@ func crossDomainRule(set *ha.RuleSet, ident haIdentity, in aapattern.Input) stri
 	return ""
 }
 
+// foreignNamedRule returns why a plan cannot judge the group's rules under
+// the config it was planned with, or "". That is so when the plan would delete
+// or rewrite a rule of the group whose name this config never gives a rule of
+// its members' domain. The block rules of a domain take turns in their
+// numbering with the other AZs of placement.az_map, and a pattern rule's
+// number names its domain, so the name of a rule shows the AZ map of the
+// entry that wrote it. Another cpis entry on the same cluster whose az_map
+// defines other AZs most likely wrote such a rule, and its plan keeps the
+// rule, so a plan under this config would delete or rename it. The check
+// reports the group as not planned, so neither the doctor's drift nor the fix
+// writes the group. A rule written before 0.12.0, which numbered block rules
+// without regard to AZs, or before the entry's az_map changed, reads the same
+// way, and the group's next write at runtime renames it, so the fix leaves it
+// to that write. A rule whose members are all gone says nothing of its
+// writer, so the plan may still delete it.
+func foreignNamedRule(set *ha.RuleSet, ident haIdentity, in aapattern.Input, rewritten map[string]bool) string {
+	domainOf := make(map[string]string, len(in.Members))
+	for _, m := range in.Members {
+		domainOf[m.Key] = m.Domain
+	}
+	spread := max(in.Spread, 1)
+	for _, d := range in.Domains {
+		spread = max(spread, d.Ord)
+	}
+	base := ident.ruleName()
+	for i := range set.Rules {
+		r := &set.Rules[i]
+		if !rewritten[r.ID] || r.Type != haRuleType || !aapattern.IsGroupRule(base, r.ID) {
+			continue
+		}
+		dk, known := "", false
+		for _, sid := range r.Resources {
+			if d, ok := domainOf[sid]; ok {
+				dk, known = d, true
+				break
+			}
+		}
+		if !known {
+			continue
+		}
+		ord := in.Domains[dk].Ord
+		if n, ok := aapattern.ChunkIndex(base, r.ID); ok {
+			if (n-1)%spread == max(ord-1, 0) {
+				continue
+			}
+		} else if n, ok := aapattern.PatternRuleIndex(base, r.ID); ok {
+			if d, _, _ := aapattern.SplitPatternRuleNumber(n); d == ord {
+				continue
+			}
+		}
+		where := "the whole cluster"
+		if dk != "" {
+			where = "AZ " + dk
+		}
+		return fmt.Sprintf("the plan would delete or rewrite rule %s, whose members are in %s, but placement.az_map "+
+			"never gives a rule of %s that name. Another cpis entry on this cluster whose az_map defines other AZs "+
+			"most likely wrote the rule and keeps it, so check the group under --cpi-config and fix it with that "+
+			"entry's request. A rule written before 0.12.0, or before this entry's az_map changed, also carries such "+
+			"a name, and the group's next write by a member's set_vm_metadata or delete_vm renames it",
+			r.ID, where, where)
+	}
+	return ""
+}
+
 // fullGroupRules returns the group's rules that hold as many members as the
 // domain of their members has configured nodes.
 func fullGroupRules(set *ha.RuleSet, ident haIdentity, in aapattern.Input) []AntiAffinityFullRule {
@@ -470,8 +550,11 @@ func FixAntiAffinityGroups(ctx context.Context, deps Deps, opts AntiAffinityFixO
 				r.Drift = append(r.Drift, pr.describe())
 			}
 		}
+		if c.ForeignRule != "" {
+			r.Problem, r.Drift = c.ForeignRule, nil
+		}
 		switch {
-		case c.Problem != "":
+		case r.Problem != "":
 			r.Outcome = AntiAffinityProblem
 		case len(r.Drift) == 0:
 			r.Outcome = AntiAffinityInLayout

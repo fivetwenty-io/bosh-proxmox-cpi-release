@@ -850,7 +850,7 @@ func (c *haCollector) groupPlacer(members []*haGuest, owner, tag string) (haClus
 		var f fit
 		f.misses, f.width = handlers.AntiAffinityPlacementFit(e.AZMap, set, owner, sids)
 		if chk, ok := c.entryCheck(e, tag); ok {
-			if chk.Problem != "" {
+			if chk.Problem != "" || chk.ForeignRule != "" {
 				f.problem = 1
 			}
 			f.deletes = len(planDeletes(chk))
@@ -1070,6 +1070,10 @@ func (c *haCollector) checksUnder(cfg *config.CPIConfig, defaults map[string]aap
 func (c *haCollector) layoutFindings(chk handlers.AntiAffinityGroupCheck) {
 	if chk.Problem != "" {
 		c.rep.problem(haKindAALayoutDrift, chk.Rule, "the group's rules could not be planned: %s", chk.Problem)
+		return
+	}
+	if chk.ForeignRule != "" {
+		c.rep.problem(haKindAALayoutDrift, chk.Rule, "the group's rules could not be planned: %s", chk.ForeignRule)
 		return
 	}
 	if len(chk.Trimmed) > 0 {
