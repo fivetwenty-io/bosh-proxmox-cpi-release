@@ -158,14 +158,58 @@ func TestCollectSpreadSkewedCountsSeparationMoves(t *testing.T) {
 	f := haBaseFake()
 	f.plan = separationPlan()
 	want(t, runCollect(t, f, haCfg("auto", "none")), haKindSpreadSkewed, haSeverityAdvice, "prod-east",
-		"2 moves that pull apart members of an anti-affinity rule sharing a node", "spreads 6 points",
+		"A rebalance would make 2 moves that pull apart members of an anti-affinity rule sharing a node",
 		"pve-ops ha rebalance --director-uuid "+haDirector)
 
 	f = haBaseFake()
 	f.plan = separationPlan()
 	f.plan.Moves = f.plan.Moves[:1]
 	want(t, runCollect(t, f, haCfg("auto", "none")), haKindSpreadSkewed, haSeverityAdvice,
-		"1 move that pulls apart members of an anti-affinity rule sharing a node")
+		"A rebalance would make 1 move that pulls apart members of an anti-affinity rule sharing a node")
+}
+
+// TestCollectSpreadSkewedStatesOnlyNonzeroClauses pins the whole advice for a
+// plan with only separation moves, only restore moves, and both, so no
+// sentence of the advice states a zero count or a spread under the threshold.
+func TestCollectSpreadSkewedStatesOnlyNonzeroClauses(t *testing.T) {
+	t.Parallel()
+	run := "Run pve-ops ha rebalance --director-uuid " + haDirector +
+		" to see the moves a rebalance would make, and add --apply to make them."
+	apart := "A rebalance would make 2 moves that pull apart members of an anti-affinity rule sharing a node."
+	outside := "2 HA VMs of this Director run outside their AZ."
+	for name, tc := range map[string]struct {
+		plan func() handlers.RebalanceReport
+		want string
+	}{
+		"separation moves only": {plan: separationPlan, want: apart + " " + run},
+		"restore moves only": {plan: func() handlers.RebalanceReport {
+			p := skewedPlan()
+			p.SpreadBefore, p.Moves = 0.06, p.Moves[:2]
+			return p
+		}, want: outside + " " + run},
+		"both kinds of move": {plan: func() handlers.RebalanceReport {
+			p := separationPlan()
+			p.Moves = append(p.Moves, skewedPlan().Moves[:2]...)
+			return p
+		}, want: outside + " " + apart + " " + run},
+		"all three signals": {plan: func() handlers.RebalanceReport {
+			p := separationPlan()
+			p.SpreadBefore = 0.3
+			p.Moves = append(p.Moves, skewedPlan().Moves[:2]...)
+			return p
+		}, want: outside + " " + apart + " The committed memory of the nodes spreads 30 points from the fullest " +
+			"node to the emptiest, against a start threshold of 15. " + run},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := haBaseFake()
+			f.plan = tc.plan()
+			got := findings(runCollect(t, f, haCfg("auto", "none")), haKindSpreadSkewed)
+			if len(got) != 1 || got[0].Detail != tc.want {
+				t.Fatalf("advice = %+v, want detail %q", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestCollectSpreadSkewedStaysQuietWithNoMoves(t *testing.T) {
@@ -184,10 +228,10 @@ func TestCollectSpreadSkewedFiresOnEitherSignal(t *testing.T) {
 	}{
 		"VMs outside their AZ alone": {plan: func(p *handlers.RebalanceReport) {
 			p.SpreadBefore, p.Moves = 0.05, p.Moves[:1]
-		}, frags: []string{"1 HA VM of this Director runs outside its AZ", "spreads 5 points"}},
+		}, frags: []string{"1 HA VM of this Director runs outside its AZ"}},
 		"a wide spread alone": {plan: func(p *handlers.RebalanceReport) {
 			p.Moves = p.Moves[2:]
-		}, frags: []string{"0 HA VMs", "spreads 30 points"}},
+		}, frags: []string{"The committed memory of the nodes spreads 30 points"}},
 		"a gate that may clear": {plan: func(p *handlers.RebalanceReport) {
 			p.ExitCode, p.Gates = handlers.RebalanceExitGate,
 				append(p.Gates, handlers.RebalanceGate{Name: handlers.RebalanceGateSettled})

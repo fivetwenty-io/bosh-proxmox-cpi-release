@@ -5,6 +5,7 @@ import (
 	"maps"
 	"math"
 	"slices"
+	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
@@ -107,22 +108,28 @@ func (c *haCollector) spreadSkewedFindings() {
 	if subject == "" {
 		subject = "cluster"
 	}
-	vms := "HA VMs of this Director run outside their AZ"
-	if outside == 1 {
-		vms = "HA VM of this Director runs outside its AZ"
-	}
-	apart := ""
-	if separate > 0 {
-		noun, pron := "moves that pull", "them"
-		if separate == 1 {
-			noun, pron = "move that pulls", "it"
+	var detail []string
+	if outside > 0 {
+		vms := "HA VMs of this Director run outside their AZ"
+		if outside == 1 {
+			vms = "HA VM of this Director runs outside its AZ"
 		}
-		apart = fmt.Sprintf(" The dry run also has %d %s apart members of an anti-affinity rule sharing a node, "+
-			"and a rebalance would make %s too.", separate, noun, pron)
+		detail = append(detail, fmt.Sprintf("%d %s.", outside, vms))
 	}
-	c.rep.advise(haKindSpreadSkewed, subject,
-		"%d %s, and the committed memory of the nodes spreads %d "+
-			"points from the fullest node to the emptiest, against a start threshold of %d. Run pve-ops ha "+
-			"rebalance --director-uuid %s to see the moves a rebalance would make, and add --apply to make them."+apart,
-		outside, vms, spread, int(math.Round(handlers.RebalanceDefaultStart*100)), haOwnerValue(c.owner))
+	if separate > 0 {
+		moves := "moves that pull"
+		if separate == 1 {
+			moves = "move that pulls"
+		}
+		detail = append(detail, fmt.Sprintf("A rebalance would make %d %s apart members of an anti-affinity rule "+
+			"sharing a node.", separate, moves))
+	}
+	if rep.SpreadBefore > handlers.RebalanceDefaultStart {
+		detail = append(detail, fmt.Sprintf("The committed memory of the nodes spreads %d points from the fullest "+
+			"node to the emptiest, against a start threshold of %d.", spread,
+			int(math.Round(handlers.RebalanceDefaultStart*100))))
+	}
+	detail = append(detail, fmt.Sprintf("Run pve-ops ha rebalance --director-uuid %s to see the moves a rebalance "+
+		"would make, and add --apply to make them.", haOwnerValue(c.owner)))
+	c.rep.advise(haKindSpreadSkewed, subject, "%s", strings.Join(detail, " "))
 }
