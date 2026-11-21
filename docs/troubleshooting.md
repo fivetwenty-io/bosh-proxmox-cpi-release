@@ -671,7 +671,7 @@ The same refusal can come from `reboot_vm`, `set_vm_metadata`, `attach_disk`, or
 
 **Diagnosis**
 
-The CPI found no VM with the CID's VMID on any member of the cluster this request reached, and the CID's stamp doesn't name that cluster. The VM the CID named may still be running on the cluster that the stamp does name. We decode the CID with `pve-ops decode <cid>`, which prints its `cluster_stamp` and `token`, and we read each cluster's own stamp on any of its nodes:
+The CPI found no VM with the CID's VMID on any member of the cluster this request reached, and the CID's stamp doesn't name that cluster. The VM the CID named may still be running on the cluster that the stamp does name. We decode the CID with `pve-ops decode --json <cid>`, which prints its `cluster_stamp` and `token`, and we read each cluster's own stamp on any of its nodes:
 
 ```bash
 # The first eight hex characters of the root CA's SHA-256 fingerprint
@@ -1117,7 +1117,7 @@ qm config <N>
 pve-ops decode <cid>
 ```
 
-The VM's description carries a `bosh_attached_disks` entry for each disk the CPI attached. When an entry is keyed by a `bpd-` serial that no active slot of the VM carries, the unused entry is that disk's volume. `pve-ops decode` on the entry's CID prints the serial and the name the volume was created with. If the unused entry still has that name, it is the same disk.
+The VM's description carries a `bosh_attached_disks` entry for each disk the CPI attached. When an entry is keyed by a `bpd-` serial that no active slot of the VM carries, the unused entry is that disk's volume. `pve-ops decode` on the entry's CID prints the serial as `stable_id` and the name the volume was created with as `disk_volume`. If the unused entry still has that name, it is the same disk.
 
 **Fix**
 

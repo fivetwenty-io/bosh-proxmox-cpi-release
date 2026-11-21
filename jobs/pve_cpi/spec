@@ -300,7 +300,7 @@ properties:
       decision gives the VM no HA, so no rule can be written, plus a
       strict-config check that pve.placement.anti_affinity.enabled is true. A
       failed rule write is logged as a warning and never fails the call,
-      whatever pve.ha.mode says, and pve-ops ha --fix-anti-affinity places the
+      whatever pve.ha.mode says, and pve-ops ha --fix-anti-affinity --apply places the
       member later. "off" never writes one. Every value except "off" writes
       rules only when pve.placement.anti_affinity.enabled is true and the
       request carries an instance-group name. "on" needs pve.ha.mode set to
