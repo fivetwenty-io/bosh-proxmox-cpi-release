@@ -1,0 +1,91 @@
+{
+  "cluster": "lab",
+  "applied": false,
+  "gates": [
+    {
+      "name": "profile",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "quorum",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "nodes",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "ha_manager",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "settled",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "journal",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "cpi_activity",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "run_lock",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "warnings": null,
+  "nodes": null,
+  "resumed": null,
+  "moves": [
+    {
+      "vmid": 101,
+      "name": "",
+      "from": "pve01",
+      "to": "pve02",
+      "phase": "separate",
+      "reason": "",
+      "pin_rewritten": false,
+      "outcome": "planned",
+      "error": ""
+    },
+    {
+      "vmid": 104,
+      "name": "",
+      "from": "pve03",
+      "to": "pve02",
+      "phase": "restore",
+      "reason": "",
+      "pin_rewritten": false,
+      "outcome": "planned",
+      "error": ""
+    },
+    {
+      "vmid": 102,
+      "name": "",
+      "from": "pve01",
+      "to": "pve03",
+      "phase": "spread",
+      "reason": "",
+      "pin_rewritten": false,
+      "outcome": "planned",
+      "error": ""
+    }
+  ],
+  "skipped": null,
+  "spread_before": 0.375,
+  "spread_after": 0,
+  "deferred": 0,
+  "differs_from_plan": false,
+  "halted": "",
+  "exit_code": 0
+}

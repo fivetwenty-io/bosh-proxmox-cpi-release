@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -142,6 +145,31 @@ func TestCollectSpreadSkewedAdvisesTheDryRun(t *testing.T) {
 		"spreads 30 points", "start threshold of 15", "pve-ops ha rebalance --director-uuid "+haDirector)
 	if len(f.planOwners) != 1 || f.planOwners[0] != haDirector {
 		t.Fatalf("dry runs %v, want one for %s", f.planOwners, haDirector)
+	}
+}
+
+// TestCollectSpreadSkewedCountsTheMovesOfARealPlan reads the dry run that the
+// rebalance planner makes of a cluster with one move of each phase, which a
+// test of the handlers package keeps in step with the planner, so the doctor's
+// counts rest on the phases and spread a real plan reports.
+func TestCollectSpreadSkewedCountsTheMovesOfARealPlan(t *testing.T) {
+	t.Parallel()
+	data, err := os.ReadFile(filepath.Join("testdata", "rebalance_plan.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := haBaseFake()
+	if err := json.Unmarshal(data, &f.plan); err != nil {
+		t.Fatal(err)
+	}
+	r := runCollect(t, f, haCfg("auto", "none"))
+	want(t, r, haKindSpreadSkewed, haSeverityAdvice, "lab", "1 HA VM of this Director runs outside its AZ.",
+		"A rebalance would make 1 separation move.", "spreads 38 points", "start threshold of 15",
+		"pve-ops ha rebalance --director-uuid "+haDirector)
+	for _, d := range findings(r, haKindSpreadSkewed) {
+		if strings.Contains(d.Detail, "--max-moves") {
+			t.Fatalf("a plan of %d moves names --max-moves: %s", len(f.plan.Moves), d.Detail)
+		}
 	}
 }
 
