@@ -81,6 +81,16 @@ type aaClusterStub struct {
 	ruleErrors func(rule string) map[string][]string
 	// ruleDisabled marks the rules PVE reports as disabled.
 	ruleDisabled map[string]bool
+	// resDigest changes on every resource write, the way the digest of
+	// resources.cfg does, and resUpdateCalls counts the comment writes.
+	resDigest      int
+	resUpdateCalls int
+	// onResourceWrite, when set, runs after every resource comment write that
+	// lands, and onDeleteResource runs at the start of every resource delete,
+	// so a test can run another call at that point the way a concurrent
+	// delete would.
+	onResourceWrite  func(sid string)
+	onDeleteResource func(sid string)
 }
 
 func (s *aaClusterStub) record(ev string) {
@@ -158,11 +168,32 @@ func (s *aaClusterStub) GetHaResources(_ context.Context, sid string) (*cluster.
 	if !s.resources[sid] {
 		return nil, fmt.Errorf("no such resource")
 	}
-	resp := &cluster.GetHaResourcesResponse{}
+	resp := &cluster.GetHaResourcesResponse{Sid: sid, Digest: fmt.Sprint(s.resDigest)}
 	if c, ok := s.resComments[sid]; ok {
 		resp.Comment = &c
 	}
 	return resp, nil
+}
+
+// UpdateHaResources writes a resource's comment when the write names the
+// digest of resources.cfg as it is now, the way PVE refuses a stale write.
+func (s *aaClusterStub) UpdateHaResources(_ context.Context, sid string, p *cluster.UpdateHaResourcesParams) error {
+	s.record("update-resource:" + sid)
+	s.resUpdateCalls++
+	if !s.resources[sid] {
+		return fmt.Errorf("no such resource '%s'", sid)
+	}
+	if p.Digest != nil && *p.Digest != fmt.Sprint(s.resDigest) {
+		return errors.New("detected modified configuration - file changed by other user")
+	}
+	if p.Comment != nil {
+		s.resComments[sid] = *p.Comment
+	}
+	s.resDigest++
+	if s.onResourceWrite != nil {
+		s.onResourceWrite(sid)
+	}
+	return nil
 }
 
 func (s *aaClusterStub) ListHaResources(_ context.Context, _ *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
@@ -219,7 +250,11 @@ func (s *aaClusterStub) landed(rule string) {
 }
 
 func (s *aaClusterStub) DeleteHaResources(_ context.Context, sid string, p *cluster.DeleteHaResourcesParams) error {
+	if s.onDeleteResource != nil {
+		s.onDeleteResource(sid)
+	}
 	delete(s.resources, sid)
+	s.resDigest++
 	if !s.purgeFromRules || p == nil || p.Purge == nil || !*p.Purge {
 		return nil
 	}

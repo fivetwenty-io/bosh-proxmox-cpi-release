@@ -164,3 +164,34 @@ func TestCollectAntiAffinityLayoutOwnersThatDisagree(t *testing.T) {
 	r = collectHAScoped(context.Background(), f, cfg, "", haNow, aaEntryScope(t, true))
 	wantNone(t, r, haKindAntiAffinityAmbiguous, haKindAAPatternTrimmed, haKindAALayoutDrift, haKindAARuleFull)
 }
+
+// TestCollectAntiAffinityLayoutLapsedHolds pins that a hold the rules still
+// record after it lapsed is advice, whether a member with its index took the
+// place or it expired, and that neither reads as drift.
+func TestCollectAntiAffinityLayoutLapsedHolds(t *testing.T) {
+	t.Parallel()
+	for hold, fragments := range map[string][]string{
+		"1.199@4000000000": {"index 1 ", "taken by a member with its index", "--fix-anti-affinity --apply"},
+		"5.299@1700000000": {"index 5 ", "expired at 2023-11-14T22:13:20Z", "--fix-anti-affinity --apply"},
+	} {
+		g := newAALayoutGroup()
+		f := aaLayoutFake(g, "block", 2)
+		f.rules = g.rulesOf([]string{"vm:200", "vm:201"})
+		f.rules[0].Comment += " hold=" + hold
+		r := runCollect(t, f, haCfg("auto", "none"))
+		want(t, r, haKindAAHoldLapsed, haSeverityAdvice, append([]string{g.rule}, fragments...)...)
+		wantNone(t, r, haKindAALayoutDrift, haKindAARuleFull)
+	}
+}
+
+// TestCollectAntiAffinityLayoutLiveHoldReadsClean pins that a live hold of an
+// index no member has is neither drift nor a lapsed hold.
+func TestCollectAntiAffinityLayoutLiveHoldReadsClean(t *testing.T) {
+	t.Parallel()
+	g := newAALayoutGroup()
+	f := aaLayoutFake(g, "block", 2)
+	f.rules = g.rulesOf([]string{"vm:200", "vm:201"})
+	f.rules[0].Comment += " hold=2.299@4000000000"
+	wantNone(t, runCollect(t, f, haCfg("auto", "none")), haKindAAHoldLapsed, haKindAALayoutDrift,
+		haKindAARuleFull)
+}

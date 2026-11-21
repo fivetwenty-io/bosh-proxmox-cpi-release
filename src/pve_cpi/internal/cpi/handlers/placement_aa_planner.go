@@ -75,10 +75,23 @@ type aaPlanner struct {
 	exclude string
 	// excludeIndex is exclude's instance index when the caller knows it, or
 	// -1, which reads it from the scan. While the index is known, the plan
-	// holds exclude's place as a reserved place, in the rule whose left=
+	// holds exclude's place with a hold (see aaHold), in the rule whose left=
 	// record names it or else by the index, so no member moves into it and
 	// the recreate of the index takes it back with one write.
 	excludeIndex int
+	// removal plans the writes that take exclude out of the group's rules and
+	// record its hold, with no other change of the layout: each rule that
+	// holds exclude loses it, a rule left with fewer than two members is
+	// deleted, and the holds of the group stay recorded on the rules and
+	// resources that are left. No pin is flattened and no pattern recorded.
+	removal bool
+	// keepStale leaves recorded holds that keep no place any more where they
+	// are, so the doctor's check reports them as lapsed instead of as drift.
+	keepStale bool
+	// recordHolds writes a change of the holds a member's HA resource
+	// records, against the digest of the read it edits. Nil records nothing,
+	// and the plan keeps each such change in pendingHolds instead.
+	recordHolds func(aaResourceHoldEdit) error
 	// holdOut holds the members of the confinement pins that a repair took
 	// out of the group's writes. A heal, or a create that plans again after
 	// such a repair, keeps such a member where a rule still holds it and adds
@@ -142,6 +155,31 @@ type aaPlanner struct {
 	stamp string
 	// stampOnly names the rules whose only write records the stamp.
 	stampOnly map[string]bool
+	// holds holds the group's holds by index after the last plan, and
+	// holdMemo every hold the planner has seen, so a hold whose record a
+	// write of this planner took away still keeps its place in the rounds
+	// after.
+	holds    map[int]*aaGroupHold
+	holdMemo map[int]aaGroupHold
+	// ruleHolds and resHolds hold the holds each rule and each member's HA
+	// resource should record once the last plan is written, or nil before
+	// the plan has assigned them.
+	ruleHolds map[string][]aaHold
+	resHolds  map[string][]aaHold
+	// holdOnly names the rules whose only write changes the holds they
+	// record, and holdCleanup those whose write only drops holds that keep
+	// no place.
+	holdOnly    map[string]bool
+	holdCleanup map[string]bool
+	// leading counts the writes of the last plan that go before the writes
+	// that record a hold.
+	leading int
+	// pendingHolds holds the resource writes the last plan would send
+	// without recordHolds.
+	pendingHolds []aaResourceHoldEdit
+	// holdWriteFailed holds the resources whose hold write failed, which the
+	// planner does not write again.
+	holdWriteFailed map[string]bool
 }
 
 // once reports whether the line keyed key has not been logged yet, and marks
@@ -185,12 +223,49 @@ func (p *aaPlanner) plan(set *ha.RuleSet) ([]ha.RuleOp, error) {
 		}
 		p.scan = scan
 	}
+	p.ruleHolds, p.resHolds, p.pendingHolds = nil, nil, nil
+	p.collectHolds(set, existing)
 	in := p.layoutInput(set, existing)
 	p.conflicts = nil
-	out := aapattern.Layout(in)
+	var out aapattern.Output
+	if p.removal {
+		p.stamp = ""
+		out = p.removalLayout(existing)
+	} else {
+		out = aapattern.Layout(in)
+		p.logLayout(in, out)
+	}
 	p.lastIn, p.lastOut = in, out
-	p.logLayout(in, out)
-	return p.ruleOps(set, existing, out), nil
+	p.assignHolds(in, existing, out)
+	ops := p.ruleOps(set, existing, out)
+	adds, cleanups := p.resourceHoldEdits()
+	if len(adds) > 0 && !p.leadsHoldAdds(ops) {
+		p.writeResourceHolds(adds)
+	}
+	if len(ops) == 0 && !p.keepStale {
+		p.writeResourceHolds(cleanups)
+	}
+	return ops, nil
+}
+
+// removalLayout returns the group's rules as the removal of exclude leaves
+// them: every rule without exclude, and none with fewer than two members.
+func (p *aaPlanner) removalLayout(existing map[string]*ha.Rule) aapattern.Output {
+	out := aapattern.Output{Rules: map[string][]string{}}
+	for name, r := range existing {
+		rest := slices.DeleteFunc(slices.Clone(r.Resources), func(s string) bool { return s == p.exclude })
+		if len(rest) >= 2 {
+			out.Rules[name] = rest
+		}
+	}
+	return out
+}
+
+// leadsHoldAdds reports whether ops starts with a write that goes before the
+// writes that record a hold: a pin rewrite, or the delete of a rule that
+// records no live hold.
+func (p *aaPlanner) leadsHoldAdds(ops []ha.RuleOp) bool {
+	return p.leading > 0 && len(ops) > 0
 }
 
 // existingRules returns the group's rules by name. A rule under one of the
@@ -255,7 +330,8 @@ func (p *aaPlanner) layoutInput(set *ha.RuleSet, existing map[string]*ha.Rule) a
 		keys[p.sid] = true
 	}
 	delete(keys, p.exclude)
-	members := make([]aapattern.Member, 0, len(keys)+1)
+	p.dropDeletedHolders(keys)
+	members := make([]aapattern.Member, 0, len(keys)+len(p.holds))
 	domainKeys := map[string]bool{}
 	var newest aaPatternSource
 	for _, k := range slices.Sorted(maps.Keys(keys)) {
@@ -267,10 +343,7 @@ func (p *aaPlanner) layoutInput(set *ha.RuleSet, existing map[string]*ha.Rule) a
 		domainKeys[m.Domain] = true
 		newest.consider(k, p.markerOf(k))
 	}
-	if m, ok := p.reservedPlace(set, existing, rules); ok {
-		members = append(members, m)
-		domainKeys[m.Domain] = true
-	}
+	members = p.placeHolds(members, held, keys, existing, rules, domainKeys)
 	return aapattern.Input{
 		Base:    p.ident.ruleName(),
 		Pattern: p.groupPattern(newest, existing),
@@ -282,34 +355,6 @@ func (p *aaPlanner) layoutInput(set *ha.RuleSet, existing map[string]*ha.Rule) a
 			return p.canJoin(set, existing[rule], rule, ms, key)
 		},
 	}
-}
-
-// reservedPlace returns the reserved place of the member a delete removes,
-// and false when there is none or its index is unknown. A rule whose left=
-// record names the member holds the place in rules, so the plan keeps it
-// where the member was.
-func (p *aaPlanner) reservedPlace(
-	set *ha.RuleSet, existing map[string]*ha.Rule, rules map[string][]string,
-) (aapattern.Member, bool) {
-	if p.exclude == "" {
-		return aapattern.Member{}, false
-	}
-	index := p.excludeIndex
-	if g, ok := p.scan.guests[p.exclude]; ok && index < 0 {
-		index = guestIndex(g)
-	}
-	if index < 0 {
-		return aapattern.Member{}, false
-	}
-	for name, r := range existing {
-		if m, ok := parseHaMarker(r.Comment); ok && slices.Contains(m.Left, p.exclude) &&
-			!slices.Contains(rules[name], p.exclude) {
-			rules[name] = append(rules[name], p.exclude)
-		}
-	}
-	return aapattern.Member{
-		Key: p.exclude, Index: index, Domain: p.topo.domainOf(set, p.exclude, p.ident.Owner), Reserved: true,
-	}, true
 }
 
 // member returns the layout's view of the member keyed sid, and false when
@@ -549,8 +594,12 @@ func (p *aaPlanner) ruleCandidate(set *ha.RuleSet, cur *ha.Rule, name string, me
 // records the plan's stamp, when it has one.
 func (p *aaPlanner) wantRule(cur *ha.Rule, name string, members []string) ha.Rule {
 	if cur == nil {
+		comment := withPatternStamp(p.ident.marker(), p.stamp)
+		if holds := p.ruleHolds[name]; len(holds) > 0 {
+			comment = withHolds(comment, holds)
+		}
 		return ha.Rule{ID: name, Type: haRuleType, Affinity: haRuleAffinity, Resources: members,
-			Comment: withPatternStamp(p.ident.marker(), p.stamp)}
+			Comment: comment}
 	}
 	next := cur.Clone()
 	next.Resources, next.Affinity, next.Errors = members, haRuleAffinity, nil
@@ -563,66 +612,145 @@ func (p *aaPlanner) wantRule(cur *ha.Rule, name string, members []string) ha.Rul
 		})
 		next.Comment = withLeavingMembers(cur.Comment, left)
 	}
+	if p.removal && cur.HasResource(p.exclude) && !slices.Contains(members, p.exclude) && p.isManaged(p.exclude) {
+		// The member stays an HA resource until the purge that follows, so
+		// the write records it as leaving, and no plan of the group puts it
+		// back meanwhile.
+		m, _ := parseHaMarker(next.Comment)
+		next.Comment = withLeavingMembers(next.Comment, append(slices.Clone(m.Left), p.exclude))
+	}
+	if p.ruleHolds != nil {
+		next.Comment = withHolds(next.Comment, p.ruleHolds[name])
+	}
 	next.Comment = withPatternStamp(next.Comment, p.stamp)
 	return next
 }
 
 // ruleOps returns the writes that make the group's rules hold the layout's
 // plan, or nil when the rules and the pins already hold. The pin rewrites the
-// members need lead, then the writes that take a member out of a rule, and
-// then the ones that only add. The writer sends one write per read, so a
-// member that moves leaves its old rule before it joins its new one, and no
-// read between two writes shows it in both.
+// members need lead, then the deletes of rules that record no live hold, then
+// the writes that record a hold on a rule that keeps its members, then the
+// deletes of rules that record one, then the writes that take a member out
+// of a rule, and then the ones that only add. The writes that only drop holds
+// that keep no place come last, and a plan with keepStale leaves them out.
+// The writer sends one write per read, so a member that moves leaves its old
+// rule before it joins its new one, no read between two writes shows it in
+// both, and a hold is recorded on the rule that keeps it before the rule that
+// recorded it goes.
 func (p *aaPlanner) ruleOps(set *ha.RuleSet, existing map[string]*ha.Rule, out aapattern.Output) []ha.RuleOp {
-	var pins, shrink, grow []ha.RuleOp
+	var pins, holdAdds, shrink, grow, cleanup []ha.RuleOp
 	pinned := map[string]bool{}
-	p.stampOnly = nil
+	p.stampOnly, p.holdOnly, p.holdCleanup = nil, nil, nil
+	mark := func(m *map[string]bool, name string) {
+		if *m == nil {
+			*m = map[string]bool{}
+		}
+		(*m)[name] = true
+	}
 	for _, name := range slices.Sorted(maps.Keys(out.Rules)) {
 		members := out.Rules[name]
 		if p.placedIn == "" && slices.Contains(members, p.sid) {
 			p.placedIn = name
 		}
-		flat := flattenMemberPins(set, members, p.ident.Owner, p.clusterNodes)
-		for i := range flat {
-			if !pinned[flat[i].Rule.ID] {
-				pinned[flat[i].Rule.ID] = true
-				pins = append(pins, flat[i])
+		if !p.removal {
+			flat := flattenMemberPins(set, members, p.ident.Owner, p.clusterNodes)
+			for i := range flat {
+				if !pinned[flat[i].Rule.ID] {
+					pinned[flat[i].Rule.ID] = true
+					pins = append(pins, flat[i])
+				}
 			}
 		}
 		cur := existing[name]
+		if cur != nil {
+			changes := !slices.Equal(cur.Resources, members) || cur.Affinity != haRuleAffinity ||
+				!p.removal && p.stamp != "" && ruleStamp(cur) != p.stamp
+			adds, stale := holdChange(cur.Comment, p.ruleHolds[name])
+			switch {
+			case len(adds) > 0 && (!changes || p.movesHold(adds)):
+				// A hold that another carrier records now moves here ahead
+				// of every write that could take that carrier away. A new
+				// hold goes with the rule's own write, which takes the
+				// deleted member out, so no read sees one without the other.
+				mark(&p.holdOnly, name)
+				holdAdds = append(holdAdds, ha.RuleOp{Kind: ha.OpUpdate, Rule: p.holdRule(cur, adds)})
+			case len(adds) == 0 && stale && !p.keepStale:
+				mark(&p.holdCleanup, name)
+			}
+		}
 		switch {
 		case cur == nil:
 			grow = append(grow, ha.RuleOp{Kind: ha.OpCreate, Rule: p.wantRule(nil, name, members)})
 		case !slices.Equal(cur.Resources, members) || cur.Affinity != haRuleAffinity:
+			delete(p.holdCleanup, name)
 			op := ha.RuleOp{Kind: ha.OpUpdate, Rule: p.wantRule(cur, name, members)}
 			if subset(cur.Resources, members) {
 				grow = append(grow, op)
 			} else {
 				shrink = append(shrink, op)
 			}
-		case p.stamp != "" && ruleStamp(cur) != p.stamp:
-			if p.stampOnly == nil {
-				p.stampOnly = map[string]bool{}
-			}
-			p.stampOnly[name] = true
+		case !p.removal && p.stamp != "" && ruleStamp(cur) != p.stamp:
+			delete(p.holdCleanup, name)
+			mark(&p.stampOnly, name)
 			grow = append(grow, ha.RuleOp{Kind: ha.OpUpdate, Rule: p.wantRule(cur, name, members)})
 		}
-	}
-	var deletes []ha.RuleOp
-	for _, name := range slices.Sorted(maps.Keys(existing)) {
-		if _, ok := out.Rules[name]; !ok {
-			deletes = append(deletes, ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: name}})
+		if p.holdCleanup[name] {
+			cleanup = append(cleanup, ha.RuleOp{Kind: ha.OpUpdate, Rule: p.holdRule(cur, nil)})
 		}
 	}
-	total := len(pins) + len(deletes) + len(shrink) + len(grow)
-	if total == 0 {
-		return nil
+	var deletes, heldDeletes []ha.RuleOp
+	for _, name := range slices.Sorted(maps.Keys(existing)) {
+		if _, ok := out.Rules[name]; ok {
+			continue
+		}
+		op := ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: name}}
+		if p.carriesLive(existing[name]) {
+			heldDeletes = append(heldDeletes, op)
+		} else {
+			deletes = append(deletes, op)
+		}
 	}
-	ops := make([]ha.RuleOp, 0, total)
+	p.leading = len(pins) + len(deletes)
+	total := p.leading + len(holdAdds) + len(heldDeletes) + len(shrink) + len(grow)
+	if total == 0 {
+		return cleanup
+	}
+	ops := make([]ha.RuleOp, 0, total+len(cleanup))
 	ops = append(ops, pins...)
 	ops = append(ops, deletes...)
+	ops = append(ops, holdAdds...)
+	ops = append(ops, heldDeletes...)
 	ops = append(ops, shrink...)
-	return append(ops, grow...)
+	ops = append(ops, grow...)
+	return append(ops, cleanup...)
+}
+
+// movesHold reports whether one of holds is recorded on a rule or a resource
+// of the group already, so writing it on another carrier moves it.
+func (p *aaPlanner) movesHold(holds []aaHold) bool {
+	return slices.ContainsFunc(holds, func(h aaHold) bool {
+		g := p.holds[h.Index]
+		return g != nil && g.recorded
+	})
+}
+
+// holdRule returns cur with the holds it records changed and nothing else:
+// with adds added to the holds it keeps, or, with no adds, with only the
+// holds the plan gives it.
+func (p *aaPlanner) holdRule(cur *ha.Rule, adds []aaHold) ha.Rule {
+	next := cur.Clone()
+	next.Errors = nil
+	holds := slices.Clone(p.ruleHolds[cur.ID])
+	if len(adds) > 0 {
+		holds = holdsOf(cur.Comment)
+		for _, h := range adds {
+			if !slices.Contains(holds, h) {
+				holds = append(holds, h)
+			}
+		}
+	}
+	next.Comment = withHolds(cur.Comment, holds)
+	return next
 }
 
 // ruleStamp returns the pattern recorded on a rule's comment, or "".

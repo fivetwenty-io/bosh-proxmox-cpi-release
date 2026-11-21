@@ -113,6 +113,9 @@ type haMarker struct {
 	// Left names the members a delete took out of an anti-affinity rule
 	// whose HA resources may not be purged yet, in sorted order.
 	Left []string
+	// Holds are the places that deletes keep free for the recreates of their
+	// indexes, in the order the comment lists them (see aaHold).
+	Holds []aaHold
 }
 
 // parseHaMarker reads the ownership marker at the start of a comment. It
@@ -153,6 +156,8 @@ func parseHaMarker(comment string) (haMarker, bool) {
 					m.Left = append(m.Left, haResourceSid(n))
 				}
 			}
+		case strings.TrimSuffix(ha.AntiAffinityHoldKey, "="):
+			m.Holds = append(m.Holds, parseAAHolds(val)...)
 		}
 	}
 	return m, true
@@ -197,9 +202,9 @@ func withLeavingMembers(comment string, left []string) string {
 
 // withPatternStamp returns the rule comment with its recorded pattern
 // replaced by aa, the canonical form of the group's pattern. It keeps every
-// other marker field and puts the record of leaving members last, where
-// withLeavingMembers writes it. An empty aa, or a comment that holds no
-// marker, returns the comment as it is.
+// other marker field, puts the holds right after the pattern, and puts the
+// record of leaving members last, where withLeavingMembers writes it. An empty
+// aa, or a comment that holds no marker, returns the comment as it is.
 func withPatternStamp(comment, aa string) string {
 	if aa == "" {
 		return comment
@@ -209,10 +214,12 @@ func withPatternStamp(comment, aa string) string {
 		return comment
 	}
 	out := []string{haMarkerPrefix}
-	var left []string
+	var holds, left []string
 	for _, f := range fields {
 		switch {
 		case strings.HasPrefix(f, "aa="):
+		case strings.HasPrefix(f, ha.AntiAffinityHoldKey):
+			holds = append(holds, f)
 		case strings.HasPrefix(f, "left="):
 			left = append(left, f)
 		default:
@@ -220,6 +227,7 @@ func withPatternStamp(comment, aa string) string {
 		}
 	}
 	out = append(out, "aa="+markerValue(aa))
+	out = append(out, holds...)
 	return strings.Join(append(out, left...), " ")
 }
 

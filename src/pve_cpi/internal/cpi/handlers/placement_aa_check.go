@@ -71,8 +71,31 @@ type AntiAffinityGroupCheck struct {
 	Drift []string `json:"drift,omitempty"`
 	// Layout holds the planned rules by name, each with its members.
 	Layout map[string][]string `json:"layout,omitempty"`
+	// Holds lists the places the group's deletes keep free for the
+	// recreates of their indexes, which the plan treats as occupied, and
+	// LapsedHolds the holds still recorded that keep no place any more,
+	// because they expired or a member with their index took the place. The
+	// next write of the group drops a lapsed hold, and so does pve-ops ha
+	// --fix-anti-affinity --apply.
+	Holds       []AntiAffinityHold `json:"holds,omitempty"`
+	LapsedHolds []AntiAffinityHold `json:"lapsed_holds,omitempty"`
 	// Problem says why the group could not be planned, or "".
 	Problem string `json:"problem,omitempty"`
+}
+
+// AntiAffinityHold is a place a delete keeps free for the recreate of its
+// index.
+type AntiAffinityHold struct {
+	Index int `json:"index"`
+	// VMID is the deleted member's VMID, or 0 when the record names none.
+	VMID int `json:"vmid,omitempty"`
+	// Until is when the hold lapses.
+	Until time.Time `json:"until"`
+	// Consumed says a member with the hold's index holds a place or may
+	// join one, so the hold keeps nothing.
+	Consumed bool `json:"consumed,omitempty"`
+	// Carriers names the rules and the HA resources that record the hold.
+	Carriers []string `json:"carriers,omitempty"`
 }
 
 // AntiAffinityFullRule is a rule that holds as many members as its domain has
@@ -143,7 +166,7 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 	if pat, ok := in.GroupPatterns[ident.ruleName()]; ok {
 		p.pattern = pat.Clone().OrDefault()
 	}
-	p.heal = true
+	p.heal, p.keepStale = true, true
 	p.managed = func() (map[string]string, error) { return in.Resources, nil }
 	if !in.Now.IsZero() {
 		p.now = func() time.Time { return in.Now }
@@ -154,16 +177,29 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 		return c
 	}
 	c.Pattern, c.PatternRecorded = p.lastIn.Pattern.Canonical(), p.lastRecorded
-	c.Members = len(p.lastIn.Members)
+	for _, m := range p.lastIn.Members {
+		if !m.Reserved {
+			c.Members++
+		}
+	}
+	c.Holds, c.LapsedHolds = p.holdReport(set)
 	c.Trimmed = slices.Clone(p.lastOut.Trimmed)
 	c.BlocksDrain = p.lastOut.Unsafe
 	c.Layout = p.lastOut.Rules
 	for i := range ops {
-		if p.stampOnly[ops[i].Rule.ID] {
-			c.Drift = append(c.Drift, fmt.Sprintf("record the pattern %s on %s", p.stamp, ops[i].Rule.ID))
-			continue
+		switch id := ops[i].Rule.ID; {
+		case p.stampOnly[id]:
+			c.Drift = append(c.Drift, fmt.Sprintf("record the pattern %s on %s", p.stamp, id))
+		case p.holdOnly[id]:
+			c.Drift = append(c.Drift, fmt.Sprintf("record the holds %s on %s", formatAAHolds(holdsOf(ops[i].Rule.Comment)),
+				id))
+		default:
+			c.Drift = append(c.Drift, describeRuleOp(&ops[i]))
 		}
-		c.Drift = append(c.Drift, describeRuleOp(&ops[i]))
+	}
+	for _, e := range p.pendingHolds {
+		c.Drift = append(c.Drift, fmt.Sprintf("record the holds %s on the HA resource %s", formatAAHolds(e.add),
+			e.sid))
 	}
 	c.Full = fullGroupRules(set, ident, p.lastIn)
 	return c
@@ -232,7 +268,7 @@ type AntiAffinityFixResult struct {
 
 // FixAntiAffinityGroups plans every anti-affinity group of the requesting
 // Director again and, unless opts.DryRun is set, writes each group whose
-// rules differ from the plan, under the HA rules lock, through the same heal
+// rules differ from the plan or still record a lapsed hold, under the HA rules lock, through the same heal
 // a delete runs. It refuses to run when the settings write no anti-affinity
 // rule, or when the request names no Director.
 func FixAntiAffinityGroups(ctx context.Context, deps Deps, opts AntiAffinityFixOptions) ([]AntiAffinityFixResult, error) {
@@ -257,10 +293,15 @@ func FixAntiAffinityGroups(ctx context.Context, deps Deps, opts AntiAffinityFixO
 			continue
 		}
 		r := AntiAffinityFixResult{AntiAffinityGroupCheck: *c}
+		r.Drift = slices.Clone(c.Drift)
+		for _, h := range c.LapsedHolds {
+			r.Drift = append(r.Drift, fmt.Sprintf("drop the lapsed hold of index %d from %s", h.Index,
+				strings.Join(h.Carriers, ",")))
+		}
 		switch {
 		case c.Problem != "":
 			r.Outcome = AntiAffinityProblem
-		case len(c.Drift) == 0:
+		case len(r.Drift) == 0:
 			r.Outcome = AntiAffinityInLayout
 		case opts.DryRun:
 			r.Outcome = AntiAffinityWouldFix

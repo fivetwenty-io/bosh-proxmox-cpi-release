@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -299,6 +300,12 @@ func newGroupPlanner(
 	p.rescan = func() (*groupScan, error) {
 		return collectGroupMemberSids(ctx, deps, ident)
 	}
+	p.recordHolds = func(e aaResourceHoldEdit) error {
+		_, err := ha.EditResourceComment(ctx, svc, e.sid, func(comment string) bool {
+			return haOwnershipOf(comment, ident.Owner) == haOwnedByUs
+		}, e.apply)
+		return err
+	}
 	return p
 }
 
@@ -309,7 +316,7 @@ func newAAPlanner(
 	cfg *config.CPIConfig, profile *ha.Profile, ident haIdentity, scan *groupScan, logger *log.Logger,
 ) *aaPlanner {
 	return &aaPlanner{
-		ident: ident, scan: scan, logger: logger, index: -1,
+		ident: ident, scan: scan, logger: logger, index: -1, excludeIndex: -1,
 		clusterNodes: profileNodeNames(profile),
 		topo:         newAATopology(cfg, profile),
 		split:        cfg.HAAntiAffinityOverflowValue() == config.HAOverflowSplit,
@@ -802,6 +809,10 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, tags
 	var confined []string
 
 	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
+		var groupErr error
+		if antiAffinityJoinEnabled(deps.Config) && owner != "" {
+			written, confined, groupErr = removeFromGroupRules(ctx, deps, sid, tags, logger)
+		}
 		// No profile: a removal only shrinks rules, so the writer leaves the
 		// feasibility checks to PVE and the cleanup never probes the cluster.
 		writer := newHARuleWriter(deps, nil, logger)
@@ -809,8 +820,15 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, tags
 		res, err := writer.Apply(ctx, "anti-affinity cleanup", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 			return planAntiAffinityRemoval(set, sid, owner, comments), nil
 		})
-		deleted, written, confined = writtenRuleDeletes(res, comments), writtenRules(res, comments), confinedBy(res)
-		return err
+		deleted = writtenRuleDeletes(res, comments)
+		if more := writtenRules(res, comments); len(more) > 0 {
+			if written == nil {
+				written = map[string]string{}
+			}
+			maps.Copy(written, more)
+		}
+		confined = append(confined, confinedBy(res)...)
+		return errors.Join(groupErr, err)
 	})
 	if err != nil {
 		err = fmt.Errorf("anti-affinity: remove %s from its rules: %w", sid, err)
@@ -821,6 +839,81 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, tags
 		return errors.Join(err, healAfterUnlockedDeletes(ctx, deps, deleted, owner, sid, confined, logger))
 	}
 	return errors.Join(err, replanGroupsAfterDelete(ctx, deps, vmid, tags, written, confined, logger))
+}
+
+// removeFromGroupRules takes sid out of the rules of each of this Director's
+// groups that a rule names it in or whose member tag is in tags, and records
+// the hold that keeps its place free for the recreate of its index (see
+// aaHold). Each group's removal plans from the group's rules and HA
+// resources, so the holds that other deletes of the group recorded stay
+// recorded wherever a write moves them. It runs under the rules lock, before
+// planAntiAffinityRemoval takes sid out of every other rule, and returns the
+// comment of each group rule it wrote, keyed by the rule ID, and the members
+// of the pins a repair ran for.
+func removeFromGroupRules(
+	ctx context.Context, deps Deps, sid, tags string, logger *log.Logger,
+) (map[string]string, []string, error) {
+	svc := deps.PVE.Cluster()
+	owner := deps.RequestDirectorUUID
+	set, err := readHARuleSet(ctx, svc)
+	if err != nil {
+		return nil, nil, fmt.Errorf("anti-affinity: read the HA rules: %w", err)
+	}
+	resources, err := listHAResources(ctx, svc)
+	if err != nil {
+		return nil, nil, fmt.Errorf("anti-affinity: read the HA resources: %w", err)
+	}
+	tagged := memberTagsOf(tags)
+	written := map[string]string{}
+	var confined []string
+	var errs error
+	for _, ident := range antiAffinityGroupsOf(owner, set, resources) {
+		if !slices.Contains(tagged, ident.ruleName()) && !groupRuleNames(set, ident, sid) {
+			continue
+		}
+		scan, err := collectGroupMemberSids(ctx, deps, ident)
+		if err != nil {
+			errs = errors.Join(errs, fmt.Errorf("anti-affinity: scan the members of group %s: %w",
+				ident.ruleName(), err))
+			continue
+		}
+		p := newGroupPlanner(ctx, deps, nil, ident, scan, logger)
+		p.heal, p.removal, p.exclude = true, true, sid
+		p.excludeIndex = guestIndex(pve.GuestRef{Tags: tags})
+		comments := map[string]string{}
+		writer := newHARuleWriter(deps, nil, logger)
+		res, err := writer.Apply(ctx, "anti-affinity cleanup", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+			ops, err := p.plan(set)
+			for i := range ops {
+				if r := set.Find(ops[i].Rule.ID); r != nil {
+					comments[r.ID] = r.Comment
+				} else {
+					comments[ops[i].Rule.ID] = ops[i].Rule.Comment
+				}
+			}
+			return ops, err
+		})
+		maps.Copy(written, writtenRules(res, comments))
+		confined = append(confined, confinedBy(res)...)
+		if err != nil {
+			errs = errors.Join(errs, fmt.Errorf("anti-affinity: take %s out of the rules of group %s: %w", sid,
+				ident.ruleName(), err))
+		}
+	}
+	return written, confined, errs
+}
+
+// groupRuleNames reports whether one of ident's group rules that this
+// Director owns names sid.
+func groupRuleNames(set *ha.RuleSet, ident haIdentity, sid string) bool {
+	for i := range set.Rules {
+		r := &set.Rules[i]
+		if aapattern.IsGroupRule(ident.ruleName(), r.ID) && r.HasResource(sid) &&
+			haOwnershipOf(r.Comment, ident.Owner) == haOwnedByUs {
+			return true
+		}
+	}
+	return false
 }
 
 // replanGroupsAfterDelete plans the rules of every group the deleted VM was in

@@ -896,6 +896,16 @@ func (c *haCollector) layoutFindings(chk handlers.AntiAffinityGroupCheck) {
 		c.rep.problem(haKindAARuleFull, f.Rule, text+"; pve-ops ha --fix-anti-affinity --apply rewrites it",
 			f.Rule, f.Members, f.Nodes)
 	}
+	for _, h := range chk.LapsedHolds {
+		why := "expired at " + h.Until.Format(time.RFC3339)
+		if h.Consumed {
+			why = "has been taken by a member with its index"
+		}
+		c.rep.advise(haKindAAHoldLapsed, chk.Rule,
+			"the hold of index %d of group %s, recorded on %s, %s, so it keeps no place, and the next write of "+
+				"the group's rules drops it, as does pve-ops ha --fix-anti-affinity --apply",
+			h.Index, chk.Group, strings.Join(h.Carriers, ", "), why)
+	}
 	if len(chk.Drift) > 0 {
 		c.rep.advise(haKindAALayoutDrift, chk.Rule,
 			"the rules of group %s differ from the layout the CPI plans, which the next set_vm_metadata "+

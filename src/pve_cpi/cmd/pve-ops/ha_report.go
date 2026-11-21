@@ -35,6 +35,7 @@ const (
 	haKindAAPatternBlocksDrain  = "aa_pattern_blocks_drain"
 	haKindAARuleFull            = "aa_rule_full"
 	haKindAALayoutDrift         = "aa_layout_drift"
+	haKindAAHoldLapsed          = "aa_hold_lapsed"
 	haKindCPUUnknown            = "cpu_unknown"
 	haKindCPUHostMulti          = "cpu_host_multi_domain"
 	haKindCPUPinCrossesDomain   = "cpu_pin_crosses_domain"

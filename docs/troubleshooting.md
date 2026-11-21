@@ -3002,6 +3002,24 @@ We run `pve-ops ha --fix-anti-affinity --director-uuid <uuid>`. It is a dry run,
 
 The group's next `set_vm_metadata` or `delete_vm` rewrites it to the new layout, and any deploy that touches one of its instances sends one of those calls. To rewrite it now, we run `pve-ops ha --fix-anti-affinity --apply`, and we add `--group bosh-aa-<hash12>` to limit the run to one group. When the finding stays after that, the pattern may ask for a rule that holds as many members as its domain has nodes. We then either lower the pattern's demand or accept the advice with `drain_safe: false`, as [Anti-affinity patterns](ha-and-resurrection.md#anti-affinity-patterns) explains.
 
+## `pve-ops ha` reports `aa_hold_lapsed`
+
+**Symptom**
+
+`pve-ops ha` reports the advice `aa_hold_lapsed` for an anti-affinity group. The text names the index, the rule or HA resource whose comment records the hold, and whether the hold expired or a member with its index took the place. The comment holds a field such as `hold=1.101@1795224057`.
+
+**Cause**
+
+A `delete_vm` records a hold on the place it frees, so that no other member moves into it before the recreate of the same index takes it back. A hold lasts 30 minutes. The write that adds the recreate to a rule drops the hold, so a hold stays behind only when that write could not drop it, or when no member with its index came back, as after a scale-down. A hold that stays behind keeps no place, and the plan treats the place as free.
+
+**Diagnosis**
+
+We run `pve-ops ha --fix-anti-affinity --director-uuid <uuid>`. Its dry run lists each lapsed hold as `drop the lapsed hold of index N from <carrier>`, next to any rule write the group needs.
+
+**Fix**
+
+Nothing needs to happen, because the group's next rule write drops the hold. To drop it now, we run `pve-ops ha --fix-anti-affinity --apply`, and we add `--group bosh-aa-<hash12>` to limit the run to one group.
+
 ## A VM could not join its anti-affinity group's rules
 
 **Symptom**

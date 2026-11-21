@@ -1,6 +1,13 @@
 package ha
 
-import "strings"
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+)
 
 // The comment of a CPI HA resource is a list of tokens separated by spaces,
 // and several writers share it. Its first token is the ownership marker's
@@ -28,6 +35,14 @@ const CommentWriteAttempts = 4
 // marker adds to a CPI HA resource's comment.
 const commentTokenPrefix = "bosh-"
 
+// AntiAffinityHoldKey opens the marker field that records the anti-affinity
+// holds of a group, hold=<index>.<vmid>@<unix-until>, on a group rule or on
+// the HA resource of a group member. A delete writes it so every plan of the
+// group keeps the deleted member's place free for the recreate of its index.
+// The field has no bosh- prefix, because it is part of the marker, but the
+// planner writes it, not Stage, so Stage keeps it (see stageOwnsToken).
+const AntiAffinityHoldKey = "hold="
+
 // commentTokenKey returns the key a token is replaced by: its text up to and
 // including the first '=', or the whole token when it has none.
 func commentTokenKey(token string) string {
@@ -39,14 +54,14 @@ func commentTokenKey(token string) string {
 
 // stageOwnsToken reports whether token, one of the tokens after the marker's
 // prefix, belongs to Stage: a field of the marker, which is any token whose
-// key does not start with "bosh-" other than the dead-node token, or the DLB
-// record.
+// key does not start with "bosh-" other than the dead-node token and the
+// anti-affinity holds, or the DLB record.
 func stageOwnsToken(token string) bool {
 	key := commentTokenKey(token)
 	switch key {
 	case DLBRecordKey:
 		return true
-	case DeadNodeSourceKey + "=":
+	case DeadNodeSourceKey + "=", AntiAffinityHoldKey:
 		return false
 	}
 	return !strings.HasPrefix(key, commentTokenPrefix)
@@ -89,4 +104,49 @@ func deleteKeys(tokens []string, keys map[string]bool) []string {
 		}
 	}
 	return out
+}
+
+// EditResourceComment rewrites the comment of the HA resource sid through
+// edit, which gets the comment as it reads now and returns the comment to
+// write. It reports whether it wrote. The write names the digest of the read
+// it changed, and a write PVE refuses because resources.cfg changed is read
+// and edited again, up to CommentWriteAttempts times. A resource that is
+// missing, and one whose comment owned does not accept, are left alone, as is
+// a comment that edit leaves as it is. A read or a write that fails is
+// returned, and so is a read that names no digest, because a write without one
+// could drop a token another writer added after the read.
+func EditResourceComment(
+	ctx context.Context, api FailbackAPI, sid string, owned func(string) bool, edit func(string) string,
+) (bool, error) {
+	if api == nil || owned == nil || edit == nil {
+		return false, cpierrors.Cloud("ha comment: the resource client, the ownership check, and the edit must be set")
+	}
+	for attempt := 1; ; attempt++ {
+		got, err := readOwnedResource(ctx, api, sid, owned)
+		if err != nil || got == nil {
+			return false, err
+		}
+		comment := edit(*got.Comment)
+		if comment == *got.Comment {
+			return false, nil
+		}
+		if got.Digest == "" {
+			return false, cpierrors.Retriable("ha comment: the read of the HA resource %s named no digest, so its "+
+				"comment is left as it is", sid)
+		}
+		digest := got.Digest
+		err = api.UpdateHaResources(ctx, sid, &sdkcluster.UpdateHaResourcesParams{Comment: &comment,
+			Digest: &digest})
+		switch {
+		case err == nil:
+			return true, nil
+		case !IsDigestConflict(err):
+			return false, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("ha comment: write the comment of the HA resource %s", sid))
+		case attempt < CommentWriteAttempts:
+			continue
+		}
+		return false, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf("ha comment: resources.cfg "+
+			"changed under %d writes of the comment of the HA resource %s", attempt, sid))
+	}
 }
