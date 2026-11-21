@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -753,5 +754,34 @@ func TestHealAntiAffinity_AHoldItCannotRecordKeepsItsRule(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestPruneGroupAntiAffinityRules_KeepsARuleWhoseHoldItCannotCarry pins that
+// a prune whose listing of the HA resources fails keeps the rule of one
+// member that records a live hold, when no rule of the group is left to take
+// the hold over, and returns a retriable error, instead of deleting the rule
+// and losing the hold.
+func TestPruneGroupAntiAffinityRules_KeepsARuleWhoseHoldItCannotCarry(t *testing.T) {
+	t.Parallel()
+	hold := aaHold{Index: 1, VMID: 101, Until: time.Now().Add(20 * time.Minute).Unix()}
+	for _, lock := range []bool{false, true} {
+		t.Run("lock "+strconv.FormatBool(lock), func(t *testing.T) {
+			t.Parallel()
+			stub := newAAStub()
+			newAAHoldFleet(stub, 100)
+			stub.seedRule(aaRule, "vm:100")
+			stub.ruleComments[aaRule] = withHolds(stub.ruleComments[aaRule], []aaHold{hold})
+			deps := aaReplanDeps(stub, lock)
+			deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3")
+			stub.listHaResErr = errors.New("connection refused")
+			err := pruneGroupAntiAffinityRules(context.Background(), deps, aaIdent("web"), 101, log.NewNopLogger())
+			if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+				t.Fatalf("err = %v; want a retriable error", err)
+			}
+			if got := aaHoldCarriers(stub, 1); !slices.Equal(got, []string{"rule " + aaRule}) {
+				t.Fatalf("the hold of index 1 is recorded on %v; want the rule kept", got)
+			}
+		})
 	}
 }

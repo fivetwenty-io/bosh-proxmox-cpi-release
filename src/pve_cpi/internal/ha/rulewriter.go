@@ -125,8 +125,10 @@ type RuleWriter struct {
 	// the rule. The repair asks with a fresh read that still holds gone,
 	// sends the first write it returns under that read's digest, and asks
 	// again, until it returns none. It may make writes of its own that are
-	// not rule writes, such as a resource comment, before it returns.
-	CarryHolds func(ctx context.Context, set *RuleSet, gone *Rule, leaving []string) []RuleOp
+	// not rule writes, such as a resource comment, before it returns. An
+	// error means it can't keep the record, and the repair stops with it
+	// before the delete.
+	CarryHolds func(ctx context.Context, set *RuleSet, gone *Rule, leaving []string) ([]RuleOp, error)
 }
 
 // ApplyResult is what one Apply did.
@@ -800,7 +802,8 @@ func (w *RuleWriter) confinementOnly(ctx context.Context, res *ApplyResult, pin 
 // or a held write that did not land goes round again, up to
 // RuleWriterMaxAttempts times, and each write that lands joins res.Repaired.
 // A CarryHolds that asks for more writes than the read holds rules never
-// settles, so the repair stops there with a retriable error.
+// settles, so the repair stops there with a retriable error, and a
+// CarryHolds that returns an error stops the repair with that error.
 func (w *RuleWriter) carryHolds(ctx context.Context, res *ApplyResult, id string, leaving []string) error {
 	if w.CarryHolds == nil {
 		return nil
@@ -817,7 +820,10 @@ func (w *RuleWriter) carryHolds(ctx context.Context, res *ApplyResult, id string
 		if carried > len(set.Rules) {
 			return cpierrors.Retriable("carry what rule %q records: %d writes did not settle", id, carried)
 		}
-		ops := w.CarryHolds(ctx, set, gone, leaving)
+		ops, err := w.CarryHolds(ctx, set, gone, leaving)
+		if err != nil {
+			return err
+		}
 		if len(ops) == 0 {
 			return nil
 		}

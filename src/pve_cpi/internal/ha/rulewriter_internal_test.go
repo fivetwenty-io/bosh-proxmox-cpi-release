@@ -599,7 +599,7 @@ func TestConfinementOnlyCarriesWhatTheRuleItDeletesRecordsFirst(t *testing.T) {
 	w, _ := newTestWriter(api, []string{"a", "b", "c"})
 	const carried = ourMarker + " carried"
 	var asked []string
-	w.CarryHolds = func(_ context.Context, set *RuleSet, gone *Rule, leaving []string) []RuleOp {
+	w.CarryHolds = func(_ context.Context, set *RuleSet, gone *Rule, leaving []string) ([]RuleOp, error) {
 		asked = append(asked, gone.ID)
 		if gone.ID != "aa" || set.Find("aa") == nil || !slices.Equal(leaving, []string{"vm:1"}) {
 			t.Errorf("CarryHolds got rule %q leaving %v; want aa leaving vm:1, with a read that still holds it",
@@ -607,10 +607,10 @@ func TestConfinementOnlyCarriesWhatTheRuleItDeletesRecordsFirst(t *testing.T) {
 		}
 		next := set.Find("aa2").Clone()
 		if next.Comment == carried {
-			return nil
+			return nil, nil
 		}
 		next.Comment = carried
-		return []RuleOp{{Kind: OpUpdate, Rule: next}}
+		return []RuleOp{{Kind: OpUpdate, Rule: next}}, nil
 	}
 	set, err := w.read(context.Background())
 	if err != nil {
@@ -630,6 +630,31 @@ func TestConfinementOnlyCarriesWhatTheRuleItDeletesRecordsFirst(t *testing.T) {
 	if len(res.Repaired) != 3 || res.Repaired[0].Rule.ID != "aa2" || res.Repaired[1].Kind != OpDelete ||
 		res.Repaired[1].Rule.ID != "aa" {
 		t.Fatalf("repaired = %+v; want the carry, then the delete of aa", res.Repaired)
+	}
+}
+
+// TestConfinementOnlyStopsWhenTheCarryFails pins that a CarryHolds that
+// can't keep what the rule records stops the repair before it deletes the
+// rule, and the repair returns the carry's error.
+func TestConfinementOnlyStopsWhenTheCarryFails(t *testing.T) {
+	pin := ourPin("pin", true, map[string]int{"a": 2}, "vm:1")
+	api := &fakeRuleAPI{rules: []Rule{ourAA("aa", "vm:1", "vm:2"),
+		ourPin("p2", true, map[string]int{"a": 0}, "vm:2"), pin}}
+	w, _ := newTestWriter(api, []string{"a", "b", "c"})
+	carryErr := errors.New("the HA resources could not be listed")
+	w.CarryHolds = func(context.Context, *RuleSet, *Rule, []string) ([]RuleOp, error) {
+		return nil, carryErr
+	}
+	set, err := w.read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := &ApplyResult{Set: set}
+	if err := w.confinementOnly(context.Background(), res, set.Find("pin")); !errors.Is(err, carryErr) {
+		t.Fatalf("err = %v; want the carry's error", err)
+	}
+	if len(api.writes) != 0 || api.find("aa") == nil {
+		t.Fatalf("writes %v; want the rule left in place", api.writes)
 	}
 }
 

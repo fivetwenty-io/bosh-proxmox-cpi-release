@@ -1328,7 +1328,9 @@ func healAntiAffinityGroupHolding(
 // aapattern.IsGroupRule names, its block rules and its pattern rules. A rule another Director owns, or one with no marker, is left
 // alone. A live hold that a deleted rule records moves first to a rule of
 // the group the prune keeps, or to a member's HA resource (see carryHolds).
-// It runs under the HA rules lock and reports the writer's error. Without
+// A hold that can't move, because the HA resources can't be listed or the
+// resource's write fails, keeps its rule, and the prune returns a retriable
+// error. It runs under the HA rules lock and reports the writer's error. Without
 // the lock, a prune that deleted a rule writes the group's rules again
 // afterwards, with the VM kept out, as a removal does.
 func pruneGroupAntiAffinityRules(ctx context.Context, deps Deps, ident haIdentity, vmid int, logger *log.Logger) error {
@@ -1360,8 +1362,13 @@ func pruneGroupAntiAffinityRules(ctx context.Context, deps Deps, ident haIdentit
 				deleting[r.ID] = true
 			}
 			// The holds of the rules that go move first, so the group never
-			// stops recording them.
-			return append(holds.carryHolds(set, deleting, haResourceSid(vmid)), ops...), nil
+			// stops recording them. A hold that can't move keeps its rule,
+			// and the prune fails with a retriable error.
+			carried, err := holds.carryHolds(set, deleting, haResourceSid(vmid))
+			if err != nil {
+				return nil, err
+			}
+			return append(carried, ops...), nil
 		})
 		deleted, confined = writtenRuleDeletes(res, comments), confinedBy(res)
 		if err == nil && len(deleted) > 0 {
