@@ -636,3 +636,29 @@ func TestNarrowRemovalFallbackRegistersWhatStagingWrites(t *testing.T) {
 		})
 	}
 }
+
+// TestNarrowRemovalFallbackKeepsACommentWrittenBeforeTheRemoval shows that the
+// removal fallback registers the resource again with the comment it had when
+// it was removed. A group plan that records an anti-affinity hold on the
+// resource after the barrier first read it, while the barrier persists its
+// rule snapshot, keeps that hold.
+func TestNarrowRemovalFallbackKeepsACommentWrittenBeforeTheRemoval(t *testing.T) {
+	narrowUseRemoval = true
+	t.Cleanup(func() { narrowUseRemoval = false })
+	r := &barrierRig{state: "started", settleOn: []string{"a"}, snapshot: []Rule{pinAB},
+		states: []*pve.HAServiceState{crm("started", 100, 90, 95), crm("started", 100, 90, 95),
+			{Known: true, Node: "a"}}}
+	in := r.input(&pinAB, &pinA)
+	persist := in.PersistSnapshot
+	in.PersistSnapshot = func(ctx context.Context, rules []Rule) error {
+		held := "owner hold=1.102@1795224057"
+		r.comment = &held
+		return persist(ctx, rules)
+	}
+	if _, err := NarrowActive(context.Background(), r.deps(), in); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.currentComment(); got != "owner hold=1.102@1795224057" {
+		t.Fatalf("comment %q; the hold written before the removal is lost", got)
+	}
+}

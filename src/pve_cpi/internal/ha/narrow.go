@@ -896,6 +896,16 @@ func (b *barrier) viaRemoval(ctx context.Context) (pve.VMLocation, error) {
 		return pve.VMLocation{}, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 			"ha narrow: persist the VM's rule snapshot before the removal")
 	}
+	// The resource comes back with the comment it has now, so a token that
+	// another writer added since the barrier's first read, such as an
+	// anti-affinity hold, survives the removal.
+	if got, err := b.deps.Resources.GetHaResources(ctx, b.sid); err != nil && !pve.IsNotFound(err) &&
+		!isRuleNotFound(err) {
+		return pve.VMLocation{}, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("ha narrow: read %s again before the fallback barrier removes it", b.sid))
+	} else if err == nil && got != nil {
+		b.comment = stripNarrowMark(got.Comment)
+	}
 	purge := true
 	if err := b.deps.Resources.DeleteHaResources(ctx, b.sid, &sdkcluster.DeleteHaResourcesParams{Purge: &purge}); err != nil &&
 		!pve.IsNotFound(err) && !isRuleNotFound(err) {
