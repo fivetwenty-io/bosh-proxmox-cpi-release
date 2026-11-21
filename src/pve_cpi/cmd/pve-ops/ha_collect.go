@@ -272,7 +272,7 @@ func (c *haCollector) fillProfile() {
 		}
 		if h, ok := healthEntry(p, n.Name); ok {
 			line.Health = fmt.Sprint(h.Health)
-			line.Placeable, line.Maintenance = h.Placeable, h.Maintenance
+			line.Placeable, line.Maintenance, line.NotesTag = h.Placeable, h.Maintenance, h.NotesTag
 			line.Watchdog, line.Reason = fmt.Sprint(h.Watchdog), h.Reason
 			if h.LRMMode != "" || h.LRMState != "" {
 				line.LRM = "mode=" + h.LRMMode + "/state=" + h.LRMState
@@ -544,6 +544,10 @@ func (c *haCollector) profileFindings() {
 			if n.DeadOrFenced {
 				rep.problem(haKindNodeDown, n.Name, "the node is offline, unknown, fenced, or gone: %s", n.Reason)
 			}
+		}
+		if p.Health.NotesErr != nil {
+			rep.unchecked("node-notes", "the notes of a node could not be read, so the doctor cannot tell whether "+
+				"they carry the maintenance marker, and the CPI places nothing on that node: %v", p.Health.NotesErr)
 		}
 	} else if p.HealthErr != "" {
 		rep.unchecked("node-health", "node health could not be built: %s", p.HealthErr)
@@ -1207,7 +1211,9 @@ func (c *haCollector) protectionFindings() {
 func (c *haCollector) settleDrain() {
 	for i := range c.rep.Nodes {
 		n := &c.rep.Nodes[i]
-		if !n.Maintenance {
+		// A node in maintenance only by the marker in its notes is not
+		// drained by PVE, so it has no drain to settle.
+		if !n.Maintenance || n.NotesTag != "" {
 			continue
 		}
 		known := c.resourcesOK && c.svcNodesOK
@@ -1250,8 +1256,9 @@ func haBlocksDrain(state string) bool {
 	return haRunsUnderHA(state)
 }
 
-// inMaintenance says whether a node is in maintenance. A
-// caller that holds a service whose requested state keeps it running on the
+// inMaintenance says whether a node is in PVE HA maintenance, which the CRM
+// drains. A node in maintenance only by the marker in its notes keeps its
+// services, so it does not count. A caller that holds a service whose requested state keeps it running on the
 // node has already shown that the drain is not finished, because PVE keeps the
 // node's agent lock until the last such service has left. It says no when the
 // health report could not be built, which is already reported as unchecked.
@@ -1260,7 +1267,15 @@ func (c *haCollector) inMaintenance(name string) bool {
 		return false
 	}
 	h, found := healthEntry(c.p, name)
-	return found && h.Maintenance
+	return found && haMaintenance(h)
+}
+
+// haMaintenance says whether a health entry is in PVE HA maintenance. The
+// notes are read only for a node that is otherwise placeable, so an entry
+// with a notes tag is in maintenance by its notes alone, which keeps the CPI
+// from placing on it but moves nothing and leaves it open to the CRM.
+func haMaintenance(h pve.NodeHealthEntry) bool {
+	return h.Maintenance && h.NotesTag == ""
 }
 
 // maintenanceStrandedFindings reports each started HA VM that is still running
@@ -1416,7 +1431,8 @@ func (c *haCollector) recoveryNodes(from string) []string {
 		if !n.Online || n.Name == from {
 			continue
 		}
-		if h, ok := healthEntry(c.p, n.Name); ok && h.Maintenance {
+		// The CRM can still move a VM to a node marked only in its notes.
+		if h, ok := healthEntry(c.p, n.Name); ok && haMaintenance(h) {
 			continue
 		}
 		out = append(out, n.Name)

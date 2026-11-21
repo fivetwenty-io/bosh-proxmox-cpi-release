@@ -502,6 +502,38 @@ func TestCollectMaintenanceStrandedUnreadableStatus(t *testing.T) {
 	wantNone(t, r, haKindMaintenanceStranded)
 }
 
+// TestCollectTreatsANotesMarkerAsNoHAMaintenance pins that a node in
+// maintenance only by the marker in its notes is shown with its notes tag and
+// is not treated as a node PVE drains, so a VM on it is not called stranded,
+// and that a node whose notes cannot be read is reported as unchecked.
+func TestCollectTreatsANotesMarkerAsNoHAMaintenance(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	f.profile.Health.Nodes[0] = pve.NodeHealthEntry{Name: "n1", Health: pve.NodeHealthMaintenance, Maintenance: true,
+		NotesTag: "maintenance", ProxyTarget: true, Reason: `its notes carry the maintenance tag "maintenance"`}
+	r := runCollect(t, f, haCfg("auto", "none"))
+	wantNone(t, r, haKindMaintenanceStranded, haKindHoldMaintenance, haKindUnchecked)
+	var line *haNode
+	for i := range r.Nodes {
+		if r.Nodes[i].Name == "n1" {
+			line = &r.Nodes[i]
+		}
+	}
+	if line == nil || !line.Maintenance || line.NotesTag != "maintenance" || line.DrainComplete {
+		t.Fatalf("n1's node line = %+v", line)
+	}
+	if text := nodeLine(*line); !strings.Contains(text, "maintenance=yes") || !strings.Contains(text, "notes_tag=maintenance") {
+		t.Fatalf("n1's node line reads %q", text)
+	}
+
+	unread := haBaseFake()
+	unread.profile.Health.Nodes[0] = pve.NodeHealthEntry{Name: "n1", Health: pve.NodeHealthOnline, NotesUnread: true,
+		ProxyTarget: true}
+	unread.profile.Health.NotesErr = errors.New("node health: read node notes: node n1: node config unavailable")
+	r = runCollect(t, unread, haCfg("auto", "none"))
+	want(t, r, haKindUnchecked, haSeverityProblem, "node-notes", "maintenance marker", "node config unavailable")
+}
+
 func recoveryFake() *fakeHA {
 	f := haBaseFake()
 	f.states = map[string]string{"vm:100": "recovery"}

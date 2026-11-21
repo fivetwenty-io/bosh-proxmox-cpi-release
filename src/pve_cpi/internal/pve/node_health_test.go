@@ -111,6 +111,14 @@ func (n *nhNodes) ListTime(ctx context.Context, node string) (*sdknodes.ListTime
 	return &resp, nil
 }
 
+// ListConfig answers every node's config with empty notes. A test that needs
+// notes uses nnNodes.
+func (n *nhNodes) ListConfig(
+	_ context.Context, _ string, _ *sdknodes.ListConfigParams,
+) (*sdknodes.ListConfigResponse, error) {
+	return &sdknodes.ListConfigResponse{}, nil
+}
+
 func nhNode(name string, online int, local bool, tags string) json.RawMessage {
 	row := map[string]any{"type": "node", "name": name, "online": online, "id": "node/" + name}
 	if local {
@@ -256,8 +264,8 @@ func TestNodeHealth_MaintenanceFromLRMAlone(t *testing.T) {
 func TestNodeHealth_OperatorTagIsUnioned(t *testing.T) {
 	t.Parallel()
 	c := nhHealthy()
-	c.rows[2] = nhNode("pve2", 1, false, "bosh;drain other")
-	r, _ := nhRun(t, c, pve.NodeHealthOptions{MaintenanceTags: []string{"", "drain"}})
+	n := &nnNodes{notes: map[string]string{"pve2": "tags: bosh;drain other"}}
+	r := nnRun(t, t.Context(), c, n, pve.NodeHealthOptions{MaintenanceTags: []string{"", "drain"}})
 	e := nhEntry(t, r, "pve2")
 	if !e.Maintenance || e.Placeable || e.Health != pve.NodeHealthMaintenance || !e.ProxyTarget {
 		t.Errorf("pve2: %+v", e)
@@ -266,7 +274,7 @@ func TestNodeHealth_OperatorTagIsUnioned(t *testing.T) {
 		t.Errorf("the tag must not hide what the CRM said: %+v", e)
 	}
 	// Without the option the same tag means nothing.
-	r, _ = nhRun(t, c, pve.NodeHealthOptions{})
+	r = nnRun(t, t.Context(), c, n, pve.NodeHealthOptions{})
 	if !r.Placeable("pve2") {
 		t.Error("tag with no configured maintenance tags must not exclude the node")
 	}
@@ -274,8 +282,9 @@ func TestNodeHealth_OperatorTagIsUnioned(t *testing.T) {
 
 func TestNodeHealth_OperatorTagWithoutHASources(t *testing.T) {
 	t.Parallel()
-	c := &nhCluster{rows: []json.RawMessage{nhClusterRow(1), nhNode("pve1", 1, true, "maintenance")}}
-	r, _ := nhRun(t, c, pve.NodeHealthOptions{MaintenanceTags: []string{"maintenance"}})
+	c := &nhCluster{rows: []json.RawMessage{nhClusterRow(1), nhNode("pve1", 1, true, "")}}
+	n := &nnNodes{notes: map[string]string{"pve1": "tags: maintenance"}}
+	r := nnRun(t, t.Context(), c, n, pve.NodeHealthOptions{MaintenanceTags: []string{"maintenance"}})
 	if r.HA != pve.HAViewNotConfigured {
 		t.Fatalf("HA = %q", r.HA)
 	}
@@ -291,9 +300,10 @@ func TestNodeHealth_SkipHAReadsNoHASource(t *testing.T) {
 	t.Parallel()
 	c := nhHealthy()
 	c.rows = []json.RawMessage{
-		nhClusterRow(1), nhNode("pve1", 1, true, ""), nhNode("pve2", 1, false, "maintenance"), nhNode("pve3", 0, false, ""),
+		nhClusterRow(1), nhNode("pve1", 1, true, ""), nhNode("pve2", 1, false, ""), nhNode("pve3", 0, false, ""),
 	}
-	r, n := nhRun(t, c, pve.NodeHealthOptions{SkipHA: true, MaintenanceTags: []string{"maintenance"}})
+	n := &nnNodes{notes: map[string]string{"pve2": "tags: maintenance"}}
+	r := nnRun(t, t.Context(), c, n, pve.NodeHealthOptions{SkipHA: true, MaintenanceTags: []string{"maintenance"}})
 	if r.HA != pve.HAViewNotRead {
 		t.Fatalf("HA = %q, want %q", r.HA, pve.HAViewNotRead)
 	}
@@ -489,17 +499,6 @@ func TestNodeHealth_NonQuorateEntryNode(t *testing.T) {
 	}
 	if r.Placeable("nope") || r.ProxyTarget("nope") || r.DeadOrFenced("nope") || r.WatchdogOf("nope") != pve.WatchdogUnknown {
 		t.Error("a node no source mentions answers false and unknown")
-	}
-}
-
-func TestNodeHealth_NonQuorateKeepsOperatorTag(t *testing.T) {
-	t.Parallel()
-	c := nhHealthy()
-	c.rows[0] = nhClusterRow(0)
-	c.rows[2] = nhNode("pve2", 1, false, "drain")
-	r, _ := nhRun(t, c, pve.NodeHealthOptions{MaintenanceTags: []string{"drain"}})
-	if e := nhEntry(t, r, "pve2"); !e.Maintenance || e.Health != pve.NodeHealthUnknown {
-		t.Errorf("pve2: %+v", e)
 	}
 }
 
@@ -851,11 +850,11 @@ func TestNodeHealth_TextFallbackHonorsOperatorTagAndDownNodes(t *testing.T) {
 	t.Parallel()
 	c := nhHealthy()
 	c.manager = json.RawMessage(`{}`)
-	c.rows[2] = nhNode("pve2", 1, false, "drain")
 	c.rows[3] = nhNode("pve3", 0, false, "")
 	idle, _ := json.Marshal(map[string]any{"type": "lrm", "node": "pve2", "status": "pve2 (idle, Mon Jan  1 2001)"})
 	c.current = []json.RawMessage{idle}
-	r, _ := nhRun(t, c, pve.NodeHealthOptions{MaintenanceTags: []string{"drain"}})
+	n := &nnNodes{notes: map[string]string{"pve2": "tags: drain"}}
+	r := nnRun(t, t.Context(), c, n, pve.NodeHealthOptions{MaintenanceTags: []string{"drain"}})
 	if r.HA != pve.HAViewLRMText {
 		t.Fatalf("HA = %q", r.HA)
 	}

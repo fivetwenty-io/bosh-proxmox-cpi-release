@@ -61,8 +61,10 @@ type Deps struct {
 	// the context.
 	Log *log.Logger
 
-	// MaintenanceTags are the operator's node tags that mark maintenance, passed
-	// to the node health helper.
+	// MaintenanceTags are the tags that mark a node for maintenance when a
+	// "tags:" line of the node's notes carries one, passed to the node health
+	// helper. DepsFromClient takes them from the config's
+	// maintenance_node_tags.
 	MaintenanceTags []string
 
 	// Slow supplies the slow-changing facts. When it is nil every call probes
@@ -81,6 +83,9 @@ type Deps struct {
 // and a caller that needs every fact read live sets Slow to nil.
 func DepsFromClient(c pve.Client, cfg *config.CPIConfig, logger *log.Logger) Deps {
 	d := Deps{Config: cfg, Log: logger}
+	if cfg != nil {
+		d.MaintenanceTags = cfg.MaintenanceNodeTagsValue()
+	}
 	if c == nil {
 		return d
 	}

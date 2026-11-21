@@ -288,8 +288,11 @@ func (s *panicNodesStub) ListCertificatesInfo(ctx context.Context, node string) 
 	panic("panicNodesStub.ListCertificatesInfo: not expected")
 }
 
+// ListConfig answers with no notes, because node health reads every placeable
+// node's notes for the maintenance marker whenever maintenance_node_tags is set,
+// which its default is, so every create that reads node health reads them.
 func (s *panicNodesStub) ListConfig(ctx context.Context, node string, params *nodes.ListConfigParams) (*nodes.ListConfigResponse, error) {
-	panic("panicNodesStub.ListConfig: not expected")
+	return &nodes.ListConfigResponse{}, nil
 }
 
 func (s *panicNodesStub) UpdateConfig(ctx context.Context, node string, params *nodes.UpdateConfigParams) error {

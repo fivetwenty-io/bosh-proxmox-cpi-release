@@ -601,6 +601,10 @@ func createVM(
 	args []json.RawMessage,
 ) (result any, retErr error) {
 	logger := deps.Log(ctx)
+	// Every node health read of the call, including the placement read and
+	// its retry, the target_node check, and the HA profile, shares one read
+	// of each node's notes for the maintenance marker.
+	ctx = pve.WithNodeNotesCache(ctx)
 	// Every HA rule writer below (anti-affinity, the AZ pin, the PCI pin)
 	// shares one HA profile, resolved on first use and before any cluster
 	// lock is taken.

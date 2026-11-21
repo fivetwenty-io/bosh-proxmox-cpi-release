@@ -49,11 +49,11 @@ func TestGatherNodeFacts_MaintenanceKeepsItsRejection(t *testing.T) {
 	t.Parallel()
 	statusRaw, _ := json.Marshal(map[string]any{
 		"type": "node", "name": "pve1", "maxcpu": 8, "maxmem": 8 * gib, "mem": 4 * gib,
-		"online": 1, "cpu": 0.0, "tags": "maintenance",
+		"online": 1, "cpu": 0.0,
 	})
 	resp := cluster.ListStatusResponse{json.RawMessage(statusRaw)}
 	cl := &stubCluster{statusResp: &resp, resResp: &cluster.ListResourcesResponse{}}
-	facts, err := placement.GatherNodeFacts(context.Background(), cl, &stubNodes{}, nopLogger(),
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, markedNodes(), nopLogger(),
 		placement.GatherOptions{MaintenanceNodeTags: []string{"maintenance"}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

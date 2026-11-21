@@ -29,6 +29,9 @@ type wnode struct {
 
 	versionErr error
 	statusErr  error
+
+	notes    string // the node's notes, the description of its node config
+	notesErr error
 }
 
 func votes(n int) *int { return &n }
@@ -365,6 +368,20 @@ func (n *fakeNodes) find(name string) (wnode, bool) {
 		}
 	}
 	return wnode{}, false
+}
+
+func (n *fakeNodes) ListConfig(_ context.Context, node string, _ *sdknodes.ListConfigParams) (*sdknodes.ListConfigResponse, error) {
+	n.hit("config")
+	x, _ := n.find(node)
+	if x.notesErr != nil {
+		return nil, x.notesErr
+	}
+	resp := &sdknodes.ListConfigResponse{}
+	if x.notes != "" {
+		notes := x.notes
+		resp.Description = &notes
+	}
+	return resp, nil
 }
 
 func (n *fakeNodes) ListTime(_ context.Context, _ string) (*sdknodes.ListTimeResponse, error) {

@@ -355,3 +355,9 @@ func (r *phRig) pass() *parkerHA {
 
 // ourMarker is the ownership marker this Director's HA writes carry.
 func ourMarker() string { return haIdentity{Owner: aaDirector}.marker() }
+
+// ListConfig answers the node config read of node health with no notes, so no
+// node is marked for maintenance there.
+func (*phNodes) ListConfig(context.Context, string, *sdknodes.ListConfigParams) (*sdknodes.ListConfigResponse, error) {
+	return &sdknodes.ListConfigResponse{}, nil
+}

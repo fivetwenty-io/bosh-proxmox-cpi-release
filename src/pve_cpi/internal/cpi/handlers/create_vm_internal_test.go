@@ -906,8 +906,10 @@ type placementInternalTestPVE struct {
 	clusterClient *placementInternalTestCluster
 }
 
-func (p *placementInternalTestPVE) QEMU() sdkqemu.Service           { panic("not needed") }
-func (p *placementInternalTestPVE) Nodes() sdknodes.Service         { return &placementInternalNodesSvc{} }
+func (p *placementInternalTestPVE) QEMU() sdkqemu.Service { panic("not needed") }
+func (p *placementInternalTestPVE) Nodes() sdknodes.Service {
+	return &placementInternalNodesSvc{notes: notesOf(p.clusterClient.nodes)}
+}
 func (p *placementInternalTestPVE) Tasks() sdktasks.Service         { panic("not needed") }
 func (p *placementInternalTestPVE) Storage() sdkstorage.Service     { panic("not needed") }
 func (p *placementInternalTestPVE) CloudInit() sdkcloudinit.Service { panic("not needed") }
@@ -944,10 +946,36 @@ func (a *fullClusterAdapter) ListHaStatusManagerStatus(ctx context.Context) (*sd
 
 var _ sdkcluster.Service = (*fullClusterAdapter)(nil)
 
-// placementInternalNodesSvc satisfies sdknodes.Service with ListStorage wired.
-// All other methods panic.
+// placementInternalNodesSvc satisfies sdknodes.Service with ListStorage and
+// the node config read wired. All other methods panic.
 type placementInternalNodesSvc struct {
 	sdknodes.Service // nil — panics on non-overridden calls
+	// notes holds each node's notes, which node health reads for the
+	// maintenance marker. A node it does not name has no notes.
+	notes map[string]string
+}
+
+// ListConfig answers the node config read with the node's notes.
+func (s *placementInternalNodesSvc) ListConfig(_ context.Context, node string, _ *sdknodes.ListConfigParams) (*sdknodes.ListConfigResponse, error) {
+	resp := &sdknodes.ListConfigResponse{}
+	if notes, ok := s.notes[node]; ok {
+		resp.Description = &notes
+	}
+	return resp, nil
+}
+
+// notesOf collects the "notes" entry of each node row, which a test sets to
+// give that node notes. Cluster status carries no such field, so the entry
+// reaches only the node config read.
+func notesOf(rows []map[string]any) map[string]string {
+	out := map[string]string{}
+	for _, row := range rows {
+		name, _ := row["name"].(string)
+		if notes, ok := row["notes"].(string); ok && name != "" {
+			out[name] = notes
+		}
+	}
+	return out
 }
 
 func (s *placementInternalNodesSvc) ListStorage(_ context.Context, _ string, params *sdknodes.ListStorageParams) (*sdknodes.ListStorageResponse, error) {
@@ -1218,7 +1246,8 @@ func TestResolveTargetNodeWithRNG_AZShuffle_SeedControlsOrder(t *testing.T) {
 
 func TestResolveTargetNodeWithRNG_MaintenanceNodeExcluded(t *testing.T) {
 	t.Parallel()
-	// pve1 carries maintenance tag; pve2 is clean.
+	// pve1's notes carry the maintenance marker. pve2's cluster status row
+	// carries a tags field, which PVE never sends, and it must not count.
 	// ExcludeMaintenanceNodes defaults true (nil Placement field).
 	type taggedNode struct {
 		Type   string  `json:"type"`
@@ -1233,11 +1262,11 @@ func TestResolveTargetNodeWithRNG_MaintenanceNodeExcluded(t *testing.T) {
 	n1raw, _ := json.Marshal(taggedNode{
 		Type: "node", Name: "pve1", Online: 1, Maxcpu: 4,
 		Maxmem: 8 * 1024 * 1024 * 1024, Mem: 2 * 1024 * 1024 * 1024, CPU: 0.1,
-		Tags: "maintenance",
 	})
 	n2raw, _ := json.Marshal(taggedNode{
 		Type: "node", Name: "pve2", Online: 1, Maxcpu: 4,
 		Maxmem: 8 * 1024 * 1024 * 1024, Mem: 2 * 1024 * 1024 * 1024, CPU: 0.1,
+		Tags: "maintenance",
 	})
 	clusterRaw, _ := json.Marshal(map[string]any{"type": "cluster", "name": "lab", "quorate": 1, "nodes": 2})
 	cluster := &rawNodeCluster{nodes: []json.RawMessage{clusterRaw, n1raw, n2raw}}
@@ -1248,7 +1277,7 @@ func TestResolveTargetNodeWithRNG_MaintenanceNodeExcluded(t *testing.T) {
 	}
 	deps := Deps{
 		Config: cfg,
-		PVE:    &rawNodeTestPVE{cluster},
+		PVE:    &rawNodeTestPVE{cluster: cluster, notes: map[string]string{"pve1": "Rack 4\ntags: maintenance"}},
 		Logger: log.NewNopLogger(),
 	}
 	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, nil, nil, nil)
@@ -1256,7 +1285,7 @@ func TestResolveTargetNodeWithRNG_MaintenanceNodeExcluded(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if node != "pve2" {
-		t.Errorf("expected pve2 (pve1 excluded by maintenance tag); got %q", node)
+		t.Errorf("expected pve2 (pve1 excluded by the maintenance marker in its notes); got %q", node)
 	}
 }
 
@@ -1291,11 +1320,17 @@ func (c *rawNodeCluster) ListHaResources(
 
 var _ placement.ClusterClient = (*rawNodeCluster)(nil)
 
-// rawNodeTestPVE wraps rawNodeCluster as pve.Client.
-type rawNodeTestPVE struct{ cluster *rawNodeCluster }
+// rawNodeTestPVE wraps rawNodeCluster as pve.Client, with notes holding each
+// node's notes.
+type rawNodeTestPVE struct {
+	cluster *rawNodeCluster
+	notes   map[string]string
+}
 
-func (p *rawNodeTestPVE) QEMU() sdkqemu.Service           { panic("not needed") }
-func (p *rawNodeTestPVE) Nodes() sdknodes.Service         { return &placementInternalNodesSvc{} }
+func (p *rawNodeTestPVE) QEMU() sdkqemu.Service { panic("not needed") }
+func (p *rawNodeTestPVE) Nodes() sdknodes.Service {
+	return &placementInternalNodesSvc{notes: p.notes}
+}
 func (p *rawNodeTestPVE) Tasks() sdktasks.Service         { panic("not needed") }
 func (p *rawNodeTestPVE) Storage() sdkstorage.Service     { panic("not needed") }
 func (p *rawNodeTestPVE) CloudInit() sdkcloudinit.Service { panic("not needed") }
@@ -4415,4 +4450,10 @@ func TestResolveVMShapeStorage_DiskFormat_EmptyConfigLeavesItToStorageType(t *te
 	if vmDiskFormat != "" {
 		t.Errorf("vmDiskFormat = %q; want empty (the storage type decides)", vmDiskFormat)
 	}
+}
+
+// ListConfig answers the node config read of node health with no notes, so no
+// node is marked for maintenance there.
+func (*templateGapNodesSvc) ListConfig(context.Context, string, *sdknodes.ListConfigParams) (*sdknodes.ListConfigResponse, error) {
+	return &sdknodes.ListConfigResponse{}, nil
 }

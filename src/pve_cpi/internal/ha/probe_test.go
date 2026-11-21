@@ -69,6 +69,19 @@ func TestDepsFromClient(t *testing.T) {
 	if plain.Permissions != nil {
 		t.Fatal("a client that cannot read permissions leaves Permissions nil")
 	}
+	if got := strings.Join(plain.MaintenanceTags, ","); got != "maintenance" {
+		t.Fatalf("an unset maintenance_node_tags must pass the default tag, got %q", got)
+	}
+	off := cfgMode("auto")
+	off.Placement = &config.PlacementConfig{MaintenanceNodeTags: []string{}}
+	if d := ha.DepsFromClient(&depsClient{}, off, nil); len(d.MaintenanceTags) != 0 {
+		t.Fatalf("an explicit empty maintenance_node_tags must pass no tags, got %q", d.MaintenanceTags)
+	}
+	drain := cfgMode("auto")
+	drain.Placement = &config.PlacementConfig{MaintenanceNodeTags: []string{"drain", "maint"}}
+	if d := ha.DepsFromClient(nil, drain, nil); strings.Join(d.MaintenanceTags, ",") != "drain,maint" {
+		t.Fatalf("the configured tags must pass even without a client, got %q", d.MaintenanceTags)
+	}
 
 	pc := &permClient{depsClient: &depsClient{}, fakePerms: fakePerms{w: &world{}}}
 	withPerms := ha.DepsFromClient(pc, cfgMode("auto"), nil)

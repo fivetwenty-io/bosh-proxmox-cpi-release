@@ -3198,7 +3198,7 @@ Before it plans anything new, the run handles each marked VM. It finishes the mo
 
 **Cause**
 
-PVE has no API call that turns HA node maintenance on, so the CPI can't do it for us. The drain waits for PVE HA to move the VMs that can leave, and PVE moves nothing until the HA manager has the node in maintenance. A dry run reports the same line without refusing, so we can read the plan before maintenance starts. An operator maintenance tag alone doesn't satisfy the gate, because PVE moves nothing for a tag, and the refusal says so when the node carries one. The same exit code also comes from the rebalance's other gates, such as another node being offline or in maintenance, and a refusal of that kind names the node.
+PVE has no API call that turns HA node maintenance on, so the CPI can't do it for us. The drain waits for PVE HA to move the VMs that can leave, and PVE moves nothing until the HA manager has the node in maintenance. A dry run reports the same line without refusing, so we can read the plan before maintenance starts. A maintenance marker in the node's notes alone doesn't satisfy the gate, because PVE moves nothing for it, and the refusal says so when the node carries one. The same exit code also comes from the rebalance's other gates, such as another node being offline or in maintenance, and a refusal of that kind names the node.
 
 **Diagnosis**
 
@@ -3255,19 +3255,19 @@ The output names each VM and its outcome, and the line ends with the error for a
 
 We run the same command again with `--apply`. A drain rerun lists the VMs that an earlier drain stopped, waits for any stop that PVE still carries out, and stops what is left. An undrain rerun starts what is left, waits, and runs the rebalance. A busy VM clears once the call that holds it finishes. A VM in `error` needs the cause fixed first, and PVE accepts only `disabled` for a resource in that state, so we follow the recovery that [Operations, PVE HA](operations.md#pve-ha) describes before the rerun. A VM that we started or stopped by hand keeps its token until an undrain drops it, which is harmless.
 
-## An undrain refuses because the node is still in maintenance or tagged
+## An undrain refuses because the node is still in maintenance or its notes carry the tag
 
 **Symptom**
 
-`pve-ops ha undrain <node> --apply` exits with 3, and its output shows a `REFUSED:` gate line that says either that the node is still in HA maintenance, with the command `ha-manager crm-command node-maintenance disable <node>`, or that the node carries an operator maintenance tag and the tag has to go first.
+`pve-ops ha undrain <node> --apply` exits with 3, and its output shows a `REFUSED:` gate line that says either that the node is still in HA maintenance, with the command `ha-manager crm-command node-maintenance disable <node>`, or that the node's notes still carry a maintenance tag and the tag has to come out of the notes first.
 
 **Cause**
 
-The undrain starts VMs that the drain stopped and then lets the rebalance place VMs, and it does neither on a node that PVE still treats as in maintenance. The CPI also places nothing on a node that carries one of the tags in `pve.placement.maintenance_node_tags`, so a tag keeps the gate shut as well as HA maintenance does. The gate checks both, and a dry run reports the state without refusing.
+The undrain starts VMs that the drain stopped and then lets the rebalance place VMs, and it does neither on a node that PVE still treats as in maintenance. The CPI also places nothing on a node whose notes carry a `tags:` line with one of the tags in `pve.placement.maintenance_node_tags`, so that line keeps the gate shut as well as HA maintenance does. We remove the line, or the tag from it, in the node's Notes panel in the web interface, and we keep the rest of the notes. The gate checks both, and a dry run reports the state without refusing.
 
 **Diagnosis**
 
-The `REFUSED:` line says which of the two holds. `ha-manager status` shows whether the node is still in maintenance, and the CPI's `pve.placement.maintenance_node_tags` property names the tags that count.
+The `REFUSED:` line says which of the two holds. `ha-manager status` shows whether the node is still in maintenance, and the CPI's `pve.placement.maintenance_node_tags` property names the tags that count when they appear on a `tags:` line in the node's notes.
 
 **Fix**
 

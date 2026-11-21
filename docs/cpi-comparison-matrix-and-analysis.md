@@ -474,22 +474,23 @@ HAProxy on N, N reboots, the VM dies, and BOSH resurrects it back onto N. This i
 same "placed a workload where it must not live" class as the documented NATS incident.
 
 **Build:** add per-node `Maintenance`/`Healthy` to the node facts, sourced from
-`GET /cluster/ha/status/current` and/or an operator node tag; add a hard rejection in
+`GET /cluster/ha/status/current` and/or a maintenance marker in the node's notes; add a hard rejection in
 `Filter()`; the node health check now always runs, because the `placement.exclude_maintenance_nodes` key was removed. Fail-open per node
 on a status-fetch error, exactly like the existing storage-facts gathering, so a
 diagnostics gap never fails `create_vm`.
 
 **In this codebase.** `GatherNodeFacts` (`internal/placement/facts.go:161-191`) reads
-`GET /cluster/ha/status/current` and a configurable per-node operator tag list
-(`MaintenanceNodeTags`), marking a node `InMaintenance` when its HA state is
-`maintenance`, `error`, `fence`, or `recovery`, or when it carries a maintenance tag.
+`GET /cluster/ha/status/current` and a configurable maintenance tag list
+(`MaintenanceNodeTags`) matched against a `tags:` line in each node's notes, marking a node
+`InMaintenance` when its HA state is `maintenance`, `error`, `fence`, or `recovery`, or when
+its notes carry a maintenance tag.
 `Filter()` (`internal/placement/scorer.go:158-160`) then hard-rejects those nodes before
 scoring on every call. A status-fetch error fails open
 per node (`InMaintenance` stays false). **Why it matters here.** This removes the
-draining-node foot-gun directly: an operator can put a node into PVE HA maintenance — or
-just tag it — for a kernel/PVE upgrade, and the scorer stops landing diego-cells or
+draining-node foot-gun directly: an operator can put a node into PVE HA maintenance, or
+just mark its notes, for a kernel/PVE upgrade, and the scorer stops landing diego-cells or
 HAProxy there instead of preferring it for its transiently high free memory. The dual
-HA-state plus operator-tag path gives both an automatic and a manual lever, which matters
+HA-state plus notes-marker path gives both an automatic and a manual lever, which matters
 in a lab where maintenance windows are frequent. The asymmetry with vSphere is structural:
 vSphere DRS continuously rebalances VMs off a host entering maintenance and the CPI merely
 declares rules, whereas PVE HA rules are advisory and never re-enforced by a distributed

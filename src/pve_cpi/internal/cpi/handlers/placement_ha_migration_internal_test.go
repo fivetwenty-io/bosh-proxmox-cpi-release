@@ -431,3 +431,9 @@ func TestDeregisterTreatsANotFoundReadAsDone(t *testing.T) {
 		t.Error("a resource the read reports missing was purged without an ownership marker")
 	}
 }
+
+// ListConfig answers the node config read of node health with no notes, so no
+// node is marked for maintenance there.
+func (*haProbeNodes) ListConfig(context.Context, string, *nodes.ListConfigParams) (*nodes.ListConfigResponse, error) {
+	return &nodes.ListConfigResponse{}, nil
+}

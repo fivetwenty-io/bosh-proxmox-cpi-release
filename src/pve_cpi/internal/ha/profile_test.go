@@ -1374,3 +1374,43 @@ func TestLogLineNamesABorrowedClock(t *testing.T) {
 		t.Fatalf("line %q must name the borrowed clock", got)
 	}
 }
+
+// TestProfileHealthCarriesTheNotesMarker pins that the profile's node health
+// reads the maintenance marker in each node's notes when Deps names the
+// maintenance tags, so the drain and undrain gates and the doctor see a node
+// marked only in its notes as in maintenance, and that a node whose notes
+// cannot be read is left out of placement without failing the profile.
+func TestProfileHealthCarriesTheNotesMarker(t *testing.T) {
+	w := three()
+	w.nodes[1].notes = "Rack 4\ntags: maintenance"
+	w.nodes[2].notesErr = errors.New("node config unavailable")
+	cfg := cfgMode(config.HAModeAuto)
+	d := w.deps(cfg)
+	d.MaintenanceTags = cfg.MaintenanceNodeTagsValue()
+	p, err := ha.Resolve(context.Background(), d)
+	if err != nil {
+		t.Fatalf("Resolve returned an error: %v", err)
+	}
+	if p.Health == nil {
+		t.Fatal("the profile has no node health")
+	}
+	if e, ok := p.Health.Node("pve2"); !ok || !e.Maintenance || e.Placeable || e.NotesTag != "maintenance" {
+		t.Fatalf("pve2, marked in its notes, reads %+v", e)
+	}
+	if e, ok := p.Health.Node("pve3"); !ok || e.Placeable || !e.NotesUnread || e.Maintenance {
+		t.Fatalf("pve3, whose notes cannot be read, reads %+v", e)
+	}
+	if e, ok := p.Health.Node("pve1"); !ok || !e.Placeable || e.Maintenance {
+		t.Fatalf("pve1, with no notes, reads %+v", e)
+	}
+	if p.Health.NotesErr == nil || !strings.Contains(p.Health.NotesErr.Error(), "node config unavailable") {
+		t.Fatalf("the report must say why pve3's notes were not read, got %v", p.Health.NotesErr)
+	}
+
+	quiet := three()
+	quiet.nodes[1].notes = "tags: maintenance"
+	if p := resolve(t, quiet, cfg); quiet.nodesAP.calls["config"] != 0 {
+		t.Fatalf("Deps without maintenance tags read %d node configs, want 0 (profile %s)",
+			quiet.nodesAP.calls["config"], p.Effective)
+	}
+}

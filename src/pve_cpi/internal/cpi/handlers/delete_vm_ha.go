@@ -51,12 +51,14 @@ func haMotionWait(deps Deps) time.Duration {
 	return time.Duration(deps.Config.HAMotionWaitSecValue()) * time.Second
 }
 
-// haHealthOptions are the node health inputs of every HA read the delete makes.
-func haHealthOptions(deps Deps) pve.NodeHealthOptions {
-	if deps.Config == nil {
-		return pve.NodeHealthOptions{}
-	}
-	return pve.NodeHealthOptions{MaintenanceTags: deps.Config.MaintenanceNodeTagsValue()}
+// haHealthOptions are the node health inputs of every HA read the delete,
+// reboot, disk, and staging paths make. Those reads ask whether a node can
+// answer, is dead or fenced, or has an armed watchdog, and where a dead VM's
+// config can go so it can be destroyed, and the maintenance marker in a
+// node's notes changes none of those answers. So they name no maintenance
+// tags, and no node's notes are read on their account.
+func haHealthOptions(Deps) pve.NodeHealthOptions {
+	return pve.NodeHealthOptions{}
 }
 
 // haEpisodes returns the store of recovery episode first observations. It sits

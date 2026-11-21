@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -73,6 +74,31 @@ func (s *stubCluster) ListHaResources(
 type stubNodes struct {
 	storageFn func(ctx context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error)
 	now       int64
+	// notes are the node notes each node's config answers with.
+	notes map[string]string
+	// notesFails lists the 1-based node config reads that fail.
+	notesFails map[int32]bool
+	notesReads atomic.Int32
+}
+
+func (s *stubNodes) ListConfig(
+	_ context.Context, node string, _ *nodes.ListConfigParams,
+) (*nodes.ListConfigResponse, error) {
+	if s.notesFails[s.notesReads.Add(1)] {
+		return nil, errors.New("node config unavailable")
+	}
+	desc := s.notes[node]
+	return &nodes.ListConfigResponse{Description: &desc}, nil
+}
+
+// markedNodes answers pve1's notes with the maintenance marker and fails the
+// node config reads in fails.
+func markedNodes(fails ...int32) *stubNodes {
+	ns := &stubNodes{notes: map[string]string{"pve1": "Rack 4\ntags: maintenance"}, notesFails: map[int32]bool{}}
+	for _, n := range fails {
+		ns.notesFails[n] = true
+	}
+	return ns
 }
 
 func (s *stubNodes) ListTime(_ context.Context, _ string) (*nodes.ListTimeResponse, error) {
@@ -798,7 +824,7 @@ func TestGatherNodeFacts_NotQuorateEntryExcludesEveryNode(t *testing.T) {
 
 func TestGatherNodeFacts_MaintenanceViaOperatorTag(t *testing.T) {
 	t.Parallel()
-	// pve1 carries a "maintenance" operator tag in cluster status.
+	// pve1's notes carry the "tags: maintenance" marker line.
 	statusRaw, _ := json.Marshal(map[string]any{
 		"type":   "node",
 		"name":   "pve1",
@@ -807,7 +833,6 @@ func TestGatherNodeFacts_MaintenanceViaOperatorTag(t *testing.T) {
 		"mem":    4 * gib,
 		"online": 1,
 		"cpu":    0.0,
-		"tags":   "maintenance",
 	})
 	resp := cluster.ListStatusResponse{json.RawMessage(statusRaw)}
 
@@ -815,7 +840,7 @@ func TestGatherNodeFacts_MaintenanceViaOperatorTag(t *testing.T) {
 		statusResp: &resp,
 		resResp:    &cluster.ListResourcesResponse{},
 	}
-	ns := &stubNodes{}
+	ns := markedNodes()
 
 	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
 		MaintenanceNodeTags: []string{"maintenance"},
@@ -864,10 +889,10 @@ func TestGatherNodeFacts_HAStatusError_FailOpen(t *testing.T) {
 func TestGatherNodeFacts_MaintenanceUnionHAAndTag(t *testing.T) {
 	t.Parallel()
 	const now = haTestNow
-	// pve1 has HA maintenance; pve2 has operator tag; pve3 is clean.
+	// pve1 has HA maintenance; pve2's notes carry the marker; pve3 is clean.
 	taggedRaw, _ := json.Marshal(map[string]any{
 		"type": "node", "name": "pve2", "maxcpu": 8, "maxmem": 8 * gib,
-		"mem": 4 * gib, "online": 1, "cpu": 0.0, "tags": "maintenance;other",
+		"mem": 4 * gib, "online": 1, "cpu": 0.0,
 	})
 	resp := cluster.ListStatusResponse{
 		quorateRow(1),
@@ -889,7 +914,7 @@ func TestGatherNodeFacts_MaintenanceUnionHAAndTag(t *testing.T) {
 				}), nil
 		},
 	}
-	ns := &stubNodes{now: now}
+	ns := &stubNodes{now: now, notes: map[string]string{"pve2": "tags: maintenance;other"}}
 
 	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
 		MaintenanceNodeTags: []string{"maintenance"},
@@ -955,13 +980,12 @@ func TestGatherNodeFacts_RealMembershipAndNodeResources(t *testing.T) {
 	}
 }
 
-// taggedMaintenanceCluster returns a one-node cluster whose node carries the
-// maintenance tag, with the status reads in fails failing. The first read is
-// the gather's own, and the ones after it are the node health reads.
+// taggedMaintenanceCluster returns a one-node cluster, with the status reads
+// in fails failing. The first read is the gather's own, and the ones after it
+// are the node health reads. markedNodes gives its node the maintenance marker.
 func taggedMaintenanceCluster(fails ...int32) *stubCluster {
 	statusRaw, _ := json.Marshal(map[string]any{
 		"type": "node", "name": "pve1", "maxcpu": 8, "maxmem": 8 * gib, "mem": 4 * gib, "online": 1, "cpu": 0.0,
-		"tags": "maintenance",
 	})
 	resp := cluster.ListStatusResponse{json.RawMessage(statusRaw)}
 	cl := &stubCluster{statusResp: &resp, resResp: &cluster.ListResourcesResponse{}, statusFails: map[int32]bool{}}
@@ -978,7 +1002,7 @@ func TestGatherNodeFacts_RetriesAFailedHealthReadOnce(t *testing.T) {
 	t.Parallel()
 	for _, require := range []bool{false, true} {
 		cl := taggedMaintenanceCluster(2)
-		facts, err := placement.GatherNodeFacts(context.Background(), cl, &stubNodes{}, nopLogger(),
+		facts, err := placement.GatherNodeFacts(context.Background(), cl, markedNodes(), nopLogger(),
 			placement.GatherOptions{MaintenanceNodeTags: []string{"maintenance"}, RequireNodeHealth: require})
 		if err != nil {
 			t.Fatalf("require %v: unexpected error: %v", require, err)
@@ -997,7 +1021,7 @@ func TestGatherNodeFacts_RetriesAFailedHealthReadOnce(t *testing.T) {
 func TestGatherNodeFacts_FailsWhenTheHealthReadFailsTwiceAndHealthIsRequired(t *testing.T) {
 	t.Parallel()
 	cl := taggedMaintenanceCluster(2, 3)
-	_, err := placement.GatherNodeFacts(context.Background(), cl, &stubNodes{}, nopLogger(),
+	_, err := placement.GatherNodeFacts(context.Background(), cl, markedNodes(), nopLogger(),
 		placement.GatherOptions{MaintenanceNodeTags: []string{"maintenance"}, RequireNodeHealth: true})
 	if !errors.Is(err, placement.ErrNodeHealthUnavailable) {
 		t.Fatalf("err = %v; want ErrNodeHealthUnavailable", err)
@@ -1009,12 +1033,79 @@ func TestGatherNodeFacts_FailsWhenTheHealthReadFailsTwiceAndHealthIsRequired(t *
 func TestGatherNodeFacts_FailsOpenWhenHealthIsNotRequired(t *testing.T) {
 	t.Parallel()
 	cl := taggedMaintenanceCluster(2, 3)
-	facts, err := placement.GatherNodeFacts(context.Background(), cl, &stubNodes{}, nopLogger(),
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, markedNodes(), nopLogger(),
 		placement.GatherOptions{MaintenanceNodeTags: []string{"maintenance"}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(facts) != 1 || facts[0].InMaintenance {
 		t.Fatalf("facts = %+v; want pve1 scored as a normal node", facts)
+	}
+}
+
+// TestGatherNodeFacts_RetriesAFailedNotesReadOnce pins that a failed node
+// notes read counts as a failed node health read, so it is read once more, and
+// a node whose notes carry the marker on the second read is in maintenance.
+func TestGatherNodeFacts_RetriesAFailedNotesReadOnce(t *testing.T) {
+	t.Parallel()
+	ns := markedNodes(1)
+	facts, err := placement.GatherNodeFacts(context.Background(), taggedMaintenanceCluster(), ns, nopLogger(),
+		placement.GatherOptions{MaintenanceNodeTags: []string{"maintenance"}, RequireNodeHealth: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(facts) != 1 || !facts[0].InMaintenance {
+		t.Fatalf("facts = %+v; want pve1 in maintenance from the second read", facts)
+	}
+	if got := ns.notesReads.Load(); got != 2 {
+		t.Errorf("notes read %d times, want 2", got)
+	}
+}
+
+// TestGatherNodeFacts_FailsWhenTheNotesReadFailsTwiceAndHealthIsRequired pins
+// that a notes read that fails on its retry too fails the gather with
+// ErrNodeHealthUnavailable, because nothing then rules out a maintenance tag.
+func TestGatherNodeFacts_FailsWhenTheNotesReadFailsTwiceAndHealthIsRequired(t *testing.T) {
+	t.Parallel()
+	_, err := placement.GatherNodeFacts(context.Background(), taggedMaintenanceCluster(), markedNodes(1, 2),
+		nopLogger(), placement.GatherOptions{MaintenanceNodeTags: []string{"maintenance"}, RequireNodeHealth: true})
+	if !errors.Is(err, placement.ErrNodeHealthUnavailable) {
+		t.Fatalf("err = %v; want ErrNodeHealthUnavailable", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "node config unavailable") {
+		t.Errorf("the error must carry the notes read's cause: %v", err)
+	}
+}
+
+// TestGatherNodeFacts_WithholdsAnUnreadNodeWhenHealthIsNotRequired pins that a
+// gather that does not need node health keeps the rest of the report when a
+// node's notes cannot be read, and leaves that node out with the reason.
+func TestGatherNodeFacts_WithholdsAnUnreadNodeWhenHealthIsNotRequired(t *testing.T) {
+	t.Parallel()
+	facts, err := placement.GatherNodeFacts(context.Background(), taggedMaintenanceCluster(), markedNodes(1, 2),
+		nopLogger(), placement.GatherOptions{MaintenanceNodeTags: []string{"maintenance"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(facts) != 1 || !facts[0].InMaintenance || !strings.Contains(facts[0].UnplaceableReason, "notes") {
+		t.Fatalf("facts = %+v; want pve1 left out because its notes could not be read", facts)
+	}
+}
+
+// TestGatherNodeFacts_ReadsNoNotesWithoutMaintenanceTags pins that the node
+// config is not read when no maintenance tag is configured.
+func TestGatherNodeFacts_ReadsNoNotesWithoutMaintenanceTags(t *testing.T) {
+	t.Parallel()
+	ns := markedNodes()
+	facts, err := placement.GatherNodeFacts(context.Background(), taggedMaintenanceCluster(), ns, nopLogger(),
+		placement.GatherOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(facts) != 1 || facts[0].InMaintenance {
+		t.Fatalf("facts = %+v; want pve1 scored as a normal node", facts)
+	}
+	if got := ns.notesReads.Load(); got != 0 {
+		t.Errorf("notes read %d times, want none", got)
 	}
 }

@@ -518,6 +518,18 @@ type icNodesService struct {
 	// qemu is the owning client's QEMU accessor, whose config read the
 	// pending endpoint serves. The client's Nodes method sets it.
 	qemu func() qemu.Service
+	// notes holds each node's notes, which node health reads for the
+	// maintenance marker. A node it does not name has no notes.
+	notes map[string]string
+}
+
+// ListConfig answers the node config read with the node's notes.
+func (s *icNodesService) ListConfig(_ context.Context, node string, _ *nodes.ListConfigParams) (*nodes.ListConfigResponse, error) {
+	resp := &nodes.ListConfigResponse{}
+	if notes, ok := s.notes[node]; ok {
+		resp.Description = &notes
+	}
+	return resp, nil
 }
 
 func (s *icNodesService) ListQemuPending(ctx context.Context, node, vmid string) (*nodes.ListQemuPendingResponse, error) {

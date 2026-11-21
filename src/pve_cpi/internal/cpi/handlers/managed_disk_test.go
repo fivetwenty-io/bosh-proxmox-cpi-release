@@ -805,3 +805,9 @@ func TestManagedPersistentBirthRefusesPreexistingSameSizeName(t *testing.T) {
 		t.Fatal("collision submitted or acquired a birth intent")
 	}
 }
+
+// ListConfig answers the node config read of node health with no notes, so no
+// node is marked for maintenance there.
+func (managedDiskTestNodes) ListConfig(context.Context, string, *nodes.ListConfigParams) (*nodes.ListConfigResponse, error) {
+	return &nodes.ListConfigResponse{}, nil
+}

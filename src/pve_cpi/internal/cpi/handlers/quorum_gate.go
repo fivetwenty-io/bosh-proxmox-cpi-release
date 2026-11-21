@@ -151,12 +151,12 @@ func createMaintenanceUnknownError(node string, cause error) error {
 
 // refuseMaintenanceTarget fails a create whose pinned target_node is in
 // maintenance. It reads the node health the way placement does, so the HA
-// state and the operator's maintenance tags both count, in every HA mode, and
-// a node that health calls not placeable is refused for the reason health
-// gives. Placement lets a failed health read pass, since it has other nodes to
-// choose from. A pinned node has no alternative, so a failed read refuses the
-// create with a retriable error. A node the report does not mention, or a
-// client without a cluster service, passes.
+// state and the maintenance marker in the node's notes both count, in every HA
+// mode, and a node that health calls not placeable is refused for the reason
+// health gives. A pinned node has no alternative, so a failed health read, or
+// a failed read of the pinned node's notes, refuses the create with a
+// retriable error. A node the report does not mention, or a client without a
+// cluster service, passes.
 func refuseMaintenanceTarget(ctx context.Context, deps Deps, target string, logger *log.Logger) error {
 	if deps.PVE == nil || deps.PVE.Cluster() == nil || deps.Config == nil {
 		return nil
@@ -172,6 +172,11 @@ func refuseMaintenanceTarget(ctx context.Context, deps Deps, target string, logg
 	entry, ok := report.Node(target)
 	if !ok {
 		return nil
+	}
+	if entry.NotesUnread {
+		logger.Warn("create_vm: the notes of target_node "+target+" could not be read, so it cannot be checked "+
+			"for maintenance", log.Err(report.NotesErr))
+		return createMaintenanceUnknownError(target, report.NotesErr)
 	}
 	refusal := targetNodeRefusal(target, entry)
 	switch {

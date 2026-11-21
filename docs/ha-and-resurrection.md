@@ -482,6 +482,10 @@ HA never moves a VM from one cluster to another, and BOSH never live-migrates a 
 
   PCI passthrough is incompatible with live migration, so a VM with a PCI device stays out of HA under `local_policy: none`. Under `hold` it is registered with a strict pin to its node.
 
+### Keeping the CPI off a node without HA maintenance
+
+HA maintenance is the first choice for taking a node out of service, because it drains the node and keeps new VMs off it. On a cluster without PVE HA, or for a node that should keep running its VMs, we put a `tags: maintenance` line in the node's notes instead. The CPI then places no new VM on that node, and it moves nothing, because PVE HA doesn't drain a node for a notes marker. [Operations](operations.md#keeping-the-cpi-off-a-node-with-the-nodes-notes) has the exact command and the rules for the line.
+
 ### Anti-affinity patterns
 
 The default pattern is `block`, which fills rules of one fewer member than the domain has nodes, from the lowest instance index. A pattern changes which members the CPI keeps apart. Every kind works on the BOSH instance index, and a rule names only the members that are present in one domain.

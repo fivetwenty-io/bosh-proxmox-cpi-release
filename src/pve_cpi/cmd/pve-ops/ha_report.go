@@ -94,7 +94,10 @@ type haNode struct {
 	Health      string `json:"health,omitempty"`
 	Placeable   bool   `json:"placeable"`
 	Maintenance bool   `json:"maintenance"`
-	Watchdog    string `json:"watchdog,omitempty"`
+	// NotesTag is the maintenance tag the node's notes carry when the node is
+	// in maintenance by that marker alone, which PVE HA does not drain.
+	NotesTag string `json:"notes_tag,omitempty"`
+	Watchdog string `json:"watchdog,omitempty"`
 	// LRM is the mode and state of the node's LRM, and DrainComplete says the
 	// LRM has finished draining a node in maintenance and released its lock.
 	LRM           string `json:"lrm,omitempty"`
@@ -224,6 +227,9 @@ func nodeLine(n haNode) string {
 	}
 	if n.Maintenance {
 		parts = append(parts, "maintenance=yes")
+	}
+	if n.NotesTag != "" {
+		parts = append(parts, "notes_tag="+n.NotesTag)
 	}
 	if n.Watchdog != "" {
 		parts = append(parts, "watchdog="+n.Watchdog)

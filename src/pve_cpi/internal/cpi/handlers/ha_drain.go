@@ -440,8 +440,8 @@ func drainNodesGate(profile *ha.Profile, node string) RebalanceGate {
 }
 
 // pveMaintenance reports whether the HA manager or the node's LRM reports the
-// node in maintenance. An operator maintenance tag alone does not count,
-// because PVE HA moves nothing for a tag.
+// node in maintenance. The maintenance marker in a node's notes alone does not
+// count, because PVE HA moves nothing for it.
 func pveMaintenance(e *pve.NodeHealthEntry) bool {
 	return e.CRMState == "maintenance" || e.LRMMode == "maintenance" || e.LRMState == "maintenance"
 }
@@ -522,7 +522,7 @@ func (r *drainRun) onlyMaintenanceRefuses(view *drainView, undrain bool) bool {
 
 // maintenanceGate reads the named node's maintenance. A drain needs the node
 // in PVE HA maintenance, and an undrain needs it out of PVE HA maintenance and
-// free of an operator maintenance tag. A dry run reports the node's state and
+// free of the maintenance marker in its notes. A dry run reports the node's state and
 // passes, so the operator can read the plan first.
 func maintenanceGate(profile *ha.Profile, node string, apply, undrain bool) RebalanceGate {
 	g := RebalanceGate{Name: RebalanceGateMaintenance}
@@ -546,7 +546,7 @@ func maintenanceGate(profile *ha.Profile, node string, apply, undrain bool) Reba
 			g.Detail += maintenanceReads(e)
 		}
 		if e.Maintenance {
-			g.Detail += ", because an operator maintenance tag alone moves nothing"
+			g.Detail += ", because the maintenance marker in the node's notes alone moves nothing"
 		}
 	case inPVE:
 		g.Detail = "node " + node + " is still in HA maintenance; run `ha-manager crm-command node-maintenance " +
@@ -555,8 +555,8 @@ func maintenanceGate(profile *ha.Profile, node string, apply, undrain bool) Reba
 			g.Detail += maintenanceReads(e)
 		}
 	case e.Maintenance:
-		g.Detail = "node " + node + " carries an operator maintenance tag, so the CPI places nothing on it; " +
-			"remove the tag first"
+		g.Detail = fmt.Sprintf("node %s's notes carry the maintenance tag %q on a tags: line, so the CPI "+
+			"places nothing on it; remove that tag from the node's notes first", node, e.NotesTag)
 	default:
 		g.OK, g.Detail = true, "node "+node+" is out of maintenance"
 		return g

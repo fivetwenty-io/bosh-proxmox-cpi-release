@@ -42,8 +42,8 @@ var aaPartnerNodes = []string{"pve1", "pve2", "pve3"}
 // nodes, with indexes 0 and 1 in the first rule and 2 and 3 in the second,
 // and index 4 alone. Index 0 runs on pve1, 1 and 2 on pve2, and 3 and 4 on
 // pve3, so each rule's members run apart. pve1 has the most free memory and
-// pve3 the least, which breaks a tie in the group count toward pve1. Nodes
-// named in maintenance carry the maintenance tag.
+// pve3 the least, which breaks a tie in the group count toward pve1. The
+// notes of the nodes named in maintenance carry the maintenance marker.
 func aaPartnerFleet(t *testing.T, maintenance ...string) (Deps, *aaClusterStub, *aaCanonFleet) {
 	t.Helper()
 	stub := newAAStub()
@@ -55,11 +55,7 @@ func aaPartnerFleet(t *testing.T, maintenance ...string) (Deps, *aaClusterStub, 
 		resp := make(cluster.ListStatusResponse, 0, 1+len(aaPartnerNodes))
 		resp = append(resp, raw)
 		for _, n := range aaPartnerNodes {
-			row := onlineNode(n)
-			if slices.Contains(maintenance, n) {
-				row["tags"] = "maintenance"
-			}
-			raw, _ := json.Marshal(row)
+			raw, _ := json.Marshal(onlineNode(n))
 			resp = append(resp, raw)
 		}
 		return &resp, nil
@@ -81,6 +77,16 @@ func aaPartnerFleet(t *testing.T, maintenance ...string) (Deps, *aaClusterStub, 
 	deps.Config.Node, deps.Config.VMStorage = "", ""
 	client := *deps.PVE.(*icPVEClient)
 	client.clusterSvc = aaPlacementCluster{stub}
+	if svc, ok := client.nodesSvc.(*icNodesService); ok {
+		marked := *svc
+		marked.notes = map[string]string{}
+		for _, n := range maintenance {
+			marked.notes[n] = "tags: maintenance"
+		}
+		client.nodesSvc = &marked
+	} else {
+		t.Fatalf("the fleet's nodes service is %T, want *icNodesService", client.nodesSvc)
+	}
 	deps.PVE = &client
 	if _, err := FixAntiAffinityGroups(context.Background(), deps, AntiAffinityFixOptions{}); err != nil {
 		t.Fatalf("lay the group out: %v", err)

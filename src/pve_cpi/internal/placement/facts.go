@@ -30,8 +30,8 @@ type ClusterClient interface {
 // NodesClient is the subset of the PVE nodes API used by GatherNodeFacts.
 // It is satisfied by the full pve.Client.Nodes() return value.
 type NodesClient interface {
+	pve.NodeHealthNodes
 	ListStorage(ctx context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error)
-	ListTime(ctx context.Context, node string) (*nodes.ListTimeResponse, error)
 }
 
 // clusterStatusItem carries membership from GET /cluster/status. Resource
@@ -102,10 +102,11 @@ type GatherOptions struct {
 	// older tags. A guest that matches GroupTag or LegacyGroupTags counts once.
 	LegacyGroupTags []string
 
-	// MaintenanceNodeTags is the list of PVE node tags that indicate a node is
-	// in maintenance. A node carrying any of these tags has InMaintenance=true
-	// regardless of HA status. Empty list disables tag-based detection.
-	// The tags field on cluster status items is checked; not per-QEMU resource tags.
+	// MaintenanceNodeTags is the list of tags that mark a node in maintenance
+	// when a "tags:" line in the node's notes names one of them (see
+	// pve.NotesTags). PVE has no tags on nodes, so the notes hold them. A node
+	// whose notes carry one has InMaintenance=true regardless of HA status. An
+	// empty list reads no notes and turns the marker off.
 	MaintenanceNodeTags []string
 
 	// RequireNodeHealth makes a node health read that fails twice fail the
@@ -123,13 +124,14 @@ var ErrNodeHealthUnavailable = errors.New("node health unavailable")
 
 // GatherNodeFacts assembles NodeFacts for every node reported by the PVE cluster.
 // It observes the following APIs:
-//  1. ListStatus provides node membership, online state, and tags.
+//  1. ListStatus provides node membership and online state.
 //  2. ListResources provides node CPU and memory counters, guest counts, BOSH
 //     group tags, and committed guest memory (non-fatal on error).
 //  3. Per-node ListStorage provides available storage bytes (non-fatal on error).
 //     Nodes that cluster status lists offline are not asked.
 //  4. pve.NodeHealth provides node placeability from the CRM and LRM state,
-//     cluster status, and operator tags (non-fatal on error). Every node that
+//     cluster status, and the maintenance marker in each placeable node's
+//     notes (non-fatal on error). Every node that
 //     is not placeable is marked InMaintenance=true, which covers a node in
 //     maintenance, a fenced or unknown node, and every node when the entry node
 //     is not quorate. A node that is not placeable for a reason other than
@@ -150,7 +152,9 @@ var ErrNodeHealthUnavailable = errors.New("node health unavailable")
 // InMaintenance=false (fail-open), so a transient API outage does not block
 // VM creation where nothing marks nodes for maintenance. NodeHealth itself
 // degrades past an unreadable HA source, so only a failed cluster status read
-// reaches this path.
+// or a failed node notes read reaches this path. A notes read that fails twice
+// without opts.RequireNodeHealth keeps the rest of the report, and the node
+// whose notes could not be read is left out with that reason.
 //
 // A ListStatus error is fatal — it is the primary data source.
 func GatherNodeFacts(
@@ -160,7 +164,7 @@ func GatherNodeFacts(
 	logger *log.Logger,
 	opts GatherOptions,
 ) ([]NodeFacts, error) {
-	// Phase 1: cluster membership (node online state and tags).
+	// Phase 1: cluster membership (node online state).
 	statusResp, err := clusterClient.ListStatus(ctx)
 	if err != nil {
 		return nil, err
@@ -203,7 +207,8 @@ func GatherNodeFacts(
 		}
 
 		// A node that pve.NodeHealth does not call placeable is excluded. The
-		// report already folds the operator node tags into its answer. A node
+		// report already folds the maintenance marker in the node notes into
+		// its answer. A node
 		// the report does not mention, or no report at all, leaves it included.
 		// The reason travels with it when the node is not in maintenance, so
 		// a rejection names a lost quorum or a fence instead of maintenance.
@@ -249,10 +254,13 @@ func GatherNodeFacts(
 }
 
 // gatherNodeHealth asks pve.NodeHealth for the merged health of every node,
-// and asks once more when the first read fails. When the second read fails
-// too, it returns ErrNodeHealthUnavailable if opts.RequireNodeHealth is set,
-// and otherwise a nil report (fail-open) with a warning, the way the storage
-// facts fail open.
+// and asks once more when the first read fails. A report whose node notes
+// could not all be read counts as a failed read, because nothing then rules
+// out a maintenance tag on the node that did not answer. When the second read
+// fails too, it returns ErrNodeHealthUnavailable if opts.RequireNodeHealth is
+// set. Otherwise it returns a nil report (fail-open) with a warning, the way
+// the storage facts fail open, or, when only the notes failed, the report
+// itself, which already leaves the unread node out.
 func gatherNodeHealth(
 	ctx context.Context,
 	clusterClient ClusterClient,
@@ -261,9 +269,13 @@ func gatherNodeHealth(
 	opts GatherOptions,
 ) (*pve.NodeHealthReport, error) {
 	read := func() (*pve.NodeHealthReport, error) {
-		return pve.NodeHealth(ctx, clusterClient, nodesClient, pve.NodeHealthOptions{
+		report, err := pve.NodeHealth(ctx, clusterClient, nodesClient, pve.NodeHealthOptions{
 			MaintenanceTags: opts.MaintenanceNodeTags,
 		})
+		if err == nil && report.NotesErr != nil {
+			return report, report.NotesErr
+		}
+		return report, err
 	}
 	report, err := read()
 	if err != nil && ctx.Err() == nil {
@@ -273,6 +285,11 @@ func gatherNodeHealth(
 	if err != nil {
 		if opts.RequireNodeHealth {
 			return nil, fmt.Errorf("%w: %w", ErrNodeHealthUnavailable, err)
+		}
+		if report != nil {
+			logger.Warn("placement: node notes unreadable, so the nodes that did not answer are left out",
+				log.Err(err))
+			return report, nil
 		}
 		logger.Warn("placement: node health unavailable — maintenance detection disabled (fail-open)",
 			log.Err(err))

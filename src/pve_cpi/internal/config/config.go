@@ -1602,12 +1602,14 @@ type PlacementConfig struct {
 	// negative HA affinity rules on top of it are driven by pve.ha.anti_affinity.
 	AntiAffinity *AntiAffinityConfig `json:"anti_affinity,omitempty"`
 
-	// MaintenanceNodeTags is the list of PVE node tags that indicate a node is in
-	// maintenance and should be excluded from placement. A node carrying any tag in
-	// this list is excluded. A nil slice (the key is absent) means the default
-	// ["maintenance"]. A non-nil empty slice (an explicit []) disables tag-based
-	// detection while still honoring the node health helper's own reading of the
-	// cluster. The tag is omitzero rather than omitempty so that the explicit
+	// MaintenanceNodeTags is the list of tags that mark a node for maintenance
+	// and keep new VMs off it. PVE has no node tags, so the tags come from a
+	// "tags: <list>" line in the node's notes, the description field of the node
+	// config. A node whose notes carry any tag in this list is excluded, compared
+	// without regard to case. A nil slice (the key is absent) means the default
+	// ["maintenance"]. A non-nil empty slice (an explicit []) turns the notes
+	// marker off, so no node's notes are read, while the node health helper's
+	// own reading of the cluster, such as HA maintenance, still counts. The tag is omitzero rather than omitempty so that the explicit
 	// empty list survives a marshal and unmarshal round trip.
 	MaintenanceNodeTags []string `json:"maintenance_node_tags,omitzero"`
 
@@ -3041,7 +3043,8 @@ func (c *CPIConfig) MaintenanceNodeTagsValue() []string {
 // VM when it cannot read node health. It is true when the CPI writes HA state,
 // because a VM placed on a node in maintenance would join HA rules there, and
 // when the effective maintenance tag list is not empty, because the operator
-// then relies on those tags to keep new VMs off a node. An unset list counts as
+// then relies on the marker in a node's notes to keep new VMs off it, and a
+// node whose notes cannot be read cannot be told apart from a marked one. An unset list counts as
 // the default ["maintenance"]. Only HA writes off together with an explicit []
 // keeps the fail-open behavior, where placement warns that it treats every node
 // as healthy.

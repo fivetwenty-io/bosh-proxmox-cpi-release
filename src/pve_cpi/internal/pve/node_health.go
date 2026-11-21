@@ -78,8 +78,9 @@ const (
 	// its LRM is restarting; read NodeHealthEntry.Placeable for that answer.
 	NodeHealthOnline NodeHealthState = "online"
 
-	// NodeHealthMaintenance means PVE or an operator tag reports the node in
-	// maintenance. It stays a proxy target, but it receives nothing new.
+	// NodeHealthMaintenance means PVE reports the node in maintenance, or its
+	// notes carry one of the operator's maintenance tags. It stays a proxy
+	// target, but it receives nothing new.
 	NodeHealthMaintenance NodeHealthState = "maintenance"
 
 	// NodeHealthDead means the node is offline, fenced, gone, or reported
@@ -175,16 +176,24 @@ type NodeHealthCluster interface {
 }
 
 // NodeHealthNodes is the subset of the PVE nodes API that NodeHealth reads. It
-// is satisfied by the sdk nodes service.
+// is satisfied by the sdk nodes service. NodeHealth reads a node's config only
+// for its notes, and only when the caller names maintenance tags.
 type NodeHealthNodes interface {
 	ListTime(ctx context.Context, node string) (*sdknodes.ListTimeResponse, error)
+	ListConfig(
+		ctx context.Context, node string, params *sdknodes.ListConfigParams,
+	) (*sdknodes.ListConfigResponse, error)
 }
 
 // NodeHealthOptions holds the optional inputs of NodeHealth.
 type NodeHealthOptions struct {
-	// MaintenanceTags lists node tags that the operator applies to mark a node
-	// in maintenance. A node that carries any of them is in maintenance whatever
-	// PVE reports, and the result is the union of both sources.
+	// MaintenanceTags lists the tags that mark a node in maintenance when a
+	// "tags:" line in the node's notes names one of them (see NotesTags). PVE
+	// has no tags on nodes, so the notes are where the operator puts them. A
+	// node whose notes carry one is in maintenance whatever PVE reports, and
+	// the result is the union of both sources. When the list holds a tag,
+	// NodeHealth reads the notes of every node that is otherwise placeable,
+	// once per node under a context from WithNodeNotesCache.
 	MaintenanceTags []string
 
 	// SkipHA keeps NodeHealth from reading any HA source: the manager status,
@@ -204,9 +213,21 @@ type NodeHealthEntry struct {
 	// Health is the overall reading of the node.
 	Health NodeHealthState
 
-	// Maintenance is true when PVE or an operator tag reports the node in
-	// maintenance. A dead node can also carry it.
+	// Maintenance is true when PVE reports the node in maintenance, or its notes
+	// carry one of the operator's maintenance tags. A dead node can also carry
+	// it.
 	Maintenance bool
+
+	// NotesTag is the maintenance tag the node's notes carry, or empty. Only a
+	// node that would otherwise be placeable has its notes read, so a node
+	// with NotesTag set is in maintenance by its notes alone, and PVE HA moves
+	// nothing off it.
+	NotesTag string
+
+	// NotesUnread is true when the node would otherwise be placeable but its
+	// notes could not be read, so it is not placeable, because nothing rules
+	// out a maintenance tag. NodeHealthReport.NotesErr says why.
+	NotesUnread bool
 
 	// Placeable is true only for a node that is online, has quorum, is not in
 	// maintenance, is not fenced, and, when a fresh manager status exists, has a
@@ -270,6 +291,12 @@ type NodeHealthReport struct {
 	// Nodes holds one entry per node, sorted by name.
 	Nodes []NodeHealthEntry
 
+	// NotesErr is non-nil when the notes of a node that would otherwise be
+	// placeable could not be read. That node is not placeable, and a caller
+	// that must know which nodes are in maintenance treats the report as a
+	// failed read.
+	NotesErr error
+
 	index map[string]int
 
 	// clockPeers is the order in which an HA read tries other members' clocks
@@ -325,7 +352,6 @@ type clusterNodeRow struct {
 	Name   string
 	Online bool
 	Local  bool
-	Tags   string
 }
 
 // clusterView is what NodeHealth keeps from GET /cluster/status.
@@ -376,15 +402,17 @@ const (
 // status, the structured manager status with its node_status and lrm_status
 // maps, the clock that measures their timestamps (the entry node's, or another
 // member's when the entry node's own clock read fails), and, only when manager status is empty or
-// unreadable, the text of the lrm entries in status/current. It then applies
-// the operator's maintenance tags as an extra input. With opts.SkipHA it reads
-// no HA source at all.
+// unreadable, the text of the lrm entries in status/current. It then reads the
+// notes of every placeable node for the operator's maintenance tags, when
+// opts names any (see applyNodeNotes). With opts.SkipHA it reads no HA source
+// at all.
 //
 // Only a failed cluster status read returns an error, because without the
 // membership list nothing can be classified. Every other failed source degrades
-// the report: HA names the view that was trusted and HAReason says why. When
-// the entry node is not quorate, no HA source is read and every node is
-// reported unknown. The helper never probes or demotes an API endpoint.
+// the report: HA names the view that was trusted and HAReason says why, and a
+// failed notes read takes its node out of placement and sets NotesErr. When
+// the entry node is not quorate, no HA source and no notes are read, and every
+// node is reported unknown. The helper never probes or demotes an API endpoint.
 func NodeHealth(
 	ctx context.Context,
 	clusterAPI NodeHealthCluster,
@@ -410,7 +438,7 @@ func NodeHealth(
 	if !view.quorate {
 		report.HA = HAViewNotQuorate
 		report.HAReason = "entry node does not report the cluster quorate"
-		report.Nodes = unknownEntries(view, opts, report.HAReason)
+		report.Nodes = unknownEntries(view, report.HAReason)
 		report.reindex()
 		return report, nil
 	}
@@ -418,8 +446,9 @@ func NodeHealth(
 	if opts.SkipHA {
 		report.HA = HAViewNotRead
 		report.HAReason = "the caller asked for no HA source"
-		report.Nodes = classifyNodes(view, report.HA, haInputs{}, opts)
+		report.Nodes = classifyNodes(view, report.HA, haInputs{})
 		report.reindex()
+		applyNodeNotes(ctx, nodesAPI, report, opts.MaintenanceTags)
 		return report, nil
 	}
 
@@ -440,9 +469,10 @@ func NodeHealth(
 		ha = resolveTextFallback(ctx, clusterAPI, report, reason, mgrErr != nil)
 	}
 
-	report.Nodes = classifyNodes(view, report.HA, ha, opts)
+	report.Nodes = classifyNodes(view, report.HA, ha)
 	report.withholdFailingEntry()
 	report.reindex()
+	applyNodeNotes(ctx, nodesAPI, report, opts.MaintenanceTags)
 	return report, nil
 }
 
@@ -562,7 +592,6 @@ func readClusterViewAttempts(ctx context.Context, clusterAPI clusterStatusLister
 		Online  sdkclient.PVEBool `json:"online"`
 		Local   sdkclient.PVEBool `json:"local"`
 		Quorate sdkclient.PVEBool `json:"quorate"`
-		Tags    string            `json:"tags"`
 	}
 
 	view := &clusterView{nodes: make(map[string]clusterNodeRow)}
@@ -578,7 +607,7 @@ func readClusterViewAttempts(ctx context.Context, clusterAPI clusterStatusLister
 				continue
 			}
 			view.nodes[row.Name] = clusterNodeRow{
-				Name: row.Name, Online: row.Online.Bool(), Local: row.Local.Bool(), Tags: row.Tags,
+				Name: row.Name, Online: row.Online.Bool(), Local: row.Local.Bool(),
 			}
 			if row.Local.Bool() {
 				view.entry = row.Name
@@ -1098,41 +1127,23 @@ func statusTextState(status string) string {
 	return strings.TrimSpace(inner)
 }
 
-// tagMatch reports whether the node's tag list holds any operator tag.
-func tagMatch(nodeTags string, want []string) bool {
-	if nodeTags == "" || len(want) == 0 {
-		return false
-	}
-	for _, tag := range strings.FieldsFunc(nodeTags, func(r rune) bool {
-		return r == ';' || r == ',' || r == ' ' || r == '\t' || r == '\n'
-	}) {
-		for _, w := range want {
-			if w != "" && tag == w {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // unknownEntries answers "unknown" for every member when the entry node is not
-// quorate. Operator maintenance tags still show, since they need no cluster.
-func unknownEntries(view *clusterView, opts NodeHealthOptions, reason string) []NodeHealthEntry {
+// quorate. No node is placeable then, so no node's notes are read.
+func unknownEntries(view *clusterView, reason string) []NodeHealthEntry {
 	entries := make([]NodeHealthEntry, 0, len(view.nodes))
-	for name, row := range view.nodes {
+	for name := range view.nodes {
 		entries = append(entries, NodeHealthEntry{
-			Name:        name,
-			Health:      NodeHealthUnknown,
-			Maintenance: tagMatch(row.Tags, opts.MaintenanceTags),
-			Watchdog:    WatchdogUnknown,
-			Reason:      reason,
+			Name:     name,
+			Health:   NodeHealthUnknown,
+			Watchdog: WatchdogUnknown,
+			Reason:   reason,
 		})
 	}
 	return entries
 }
 
 // classifyNodes builds one entry for every node any trusted source names.
-func classifyNodes(view *clusterView, haView HAView, ha haInputs, opts NodeHealthOptions) []NodeHealthEntry {
+func classifyNodes(view *clusterView, haView HAView, ha haInputs) []NodeHealthEntry {
 	names := make(map[string]struct{}, len(view.nodes))
 	for name := range view.nodes {
 		names[name] = struct{}{}
@@ -1145,7 +1156,7 @@ func classifyNodes(view *clusterView, haView HAView, ha haInputs, opts NodeHealt
 
 	entries := make([]NodeHealthEntry, 0, len(names))
 	for name := range names {
-		entries = append(entries, classifyNode(name, view, haView, ha, opts))
+		entries = append(entries, classifyNode(name, view, haView, ha))
 	}
 	return entries
 }
@@ -1156,13 +1167,11 @@ func classifyNode(
 	view *clusterView,
 	haView HAView,
 	ha haInputs,
-	opts NodeHealthOptions,
 ) NodeHealthEntry {
 	row, inCluster := view.nodes[name]
 	e := NodeHealthEntry{
-		Name:        name,
-		Watchdog:    WatchdogUnknown,
-		Maintenance: inCluster && tagMatch(row.Tags, opts.MaintenanceTags),
+		Name:     name,
+		Watchdog: WatchdogUnknown,
 	}
 
 	// Cluster status is always readable and decides whether the node is up at
@@ -1195,15 +1204,9 @@ func classifyNode(
 }
 
 // classifyFromClusterStatus answers when no HA source is trusted. The node is
-// online per cluster status, so it is placeable unless an operator tag says
-// otherwise.
+// online per cluster status, so it is placeable until its notes say otherwise.
 func classifyFromClusterStatus(e *NodeHealthEntry) {
 	e.ProxyTarget = true
-	if e.Maintenance {
-		e.Health = NodeHealthMaintenance
-		e.Reason = "operator maintenance tag"
-		return
-	}
 	e.Health = NodeHealthOnline
 	e.Placeable = true
 	e.Reason = "online in cluster status"
@@ -1235,9 +1238,6 @@ func classifyWithLRMText(e *NodeHealthEntry, state lrmTextState, listed bool) {
 		e.Maintenance = true
 		e.Health = NodeHealthMaintenance
 		e.Reason = "lrm status text reports maintenance"
-	case e.Maintenance:
-		e.Health = NodeHealthMaintenance
-		e.Reason = "operator maintenance tag"
 	case listed && state == lrmTextSilent:
 		e.Health = NodeHealthUnknown
 		e.Reason = "lrm status text reports an old timestamp"
@@ -1284,18 +1284,13 @@ func classifyWithManagerStatus(e *NodeHealthEntry, ha haInputs) {
 		// at the services that still run on the node.
 	}
 
-	if e.CRMState == crmNodeMaintenance {
-		e.Maintenance = true
-	}
-	if lrmFresh && (lrm.State == lrmStateMaintenance || lrm.Mode == lrmModeMaintenance) {
-		e.Maintenance = true
-	}
+	lrmSays := lrmFresh && (lrm.State == lrmStateMaintenance || lrm.Mode == lrmModeMaintenance)
+	e.Maintenance = e.CRMState == crmNodeMaintenance || lrmSays
 
 	switch {
 	case e.Maintenance:
 		e.Health = NodeHealthMaintenance
-		e.Reason = maintenanceReason(e.CRMState, lrmFresh && (lrm.State == lrmStateMaintenance ||
-			lrm.Mode == lrmModeMaintenance))
+		e.Reason = maintenanceReason(e.CRMState)
 	case e.CRMState != crmNodeOnline:
 		e.Health = NodeHealthUnknown
 		e.Reason = "CRM has no usable state for the node"
@@ -1317,13 +1312,11 @@ func classifyWithManagerStatus(e *NodeHealthEntry, ha haInputs) {
 	}
 }
 
-func maintenanceReason(crmState string, lrmSays bool) string {
-	switch {
-	case crmState == crmNodeMaintenance:
+// maintenanceReason names the HA source that reports a node in maintenance:
+// the CRM when its node_status says so, and the LRM otherwise.
+func maintenanceReason(crmState string) string {
+	if crmState == crmNodeMaintenance {
 		return "CRM reports maintenance"
-	case lrmSays:
-		return "LRM reports maintenance"
-	default:
-		return "operator maintenance tag"
 	}
+	return "LRM reports maintenance"
 }

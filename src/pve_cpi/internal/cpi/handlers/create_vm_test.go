@@ -228,6 +228,25 @@ type vmMockNodes struct {
 	// gracefully (no extra VMIDs unioned in) — tests not exercising the
 	// shared-storage VMID collision path need no configuration.
 	listStorageContentFn func(ctx context.Context, node, storage string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error)
+	// nodeNotes holds each node's notes, which node health reads from the
+	// node config for the maintenance marker. A node it does not name has no
+	// notes.
+	nodeNotes map[string]string
+	// listConfigFn, when non-nil, answers the node config read in place of
+	// nodeNotes, so a test can count the reads or make them fail.
+	listConfigFn func(ctx context.Context, node string) (*sdknodes.ListConfigResponse, error)
+}
+
+// ListConfig answers the node config read with the node's notes.
+func (m *vmMockNodes) ListConfig(ctx context.Context, node string, _ *sdknodes.ListConfigParams) (*sdknodes.ListConfigResponse, error) {
+	if m.listConfigFn != nil {
+		return m.listConfigFn(ctx, node)
+	}
+	resp := &sdknodes.ListConfigResponse{}
+	if notes, ok := m.nodeNotes[node]; ok {
+		resp.Description = &notes
+	}
+	return resp, nil
 }
 
 type vmCreateQemuCloneCall struct {

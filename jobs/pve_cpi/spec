@@ -1564,15 +1564,28 @@ properties:
       job template render, and a cpi-config entry that carries it is rejected.
       Replacement: delete it; the node health check always runs.
       Placement always refuses a node that the health check marks unplaceable, and
-      placement.maintenance_node_tags still marks nodes by tag.
+      placement.maintenance_node_tags still marks nodes by their notes.
   pve.placement.maintenance_node_tags:
     description: |
-      List of PVE node tags that mark a node as in maintenance. A node carrying any
-      tag in this list is excluded from placement. Leave it unset to get the default
-      ["maintenance"]. Set it to [] to disable tag-based detection while still honoring
-      the node health check, which always runs. Set it to a list to use those tags
-      instead. The property has no spec default, so the CPI can tell an unset property
-      from an explicit [].
+      List of tags that mark a node as in maintenance when the node's notes carry them.
+      PVE has no node tags, so the CPI reads the notes, which are the description of
+      GET /nodes/{node}/config and the text of the Notes panel in the web interface.
+      A node is in maintenance when its notes contain a line of the form
+      "tags: <list>" and the list shares a tag with this property. The line may sit
+      anywhere in the notes, and the key and the tags match without regard to case.
+      The line has to start with the key, so a Markdown list item, a heading, a quote,
+      or a form like "tags = x" never counts. The list splits on commas, semicolons,
+      and whitespace, and every marker line counts. A node that carries the marker is
+      excluded from placement, and a target_node that carries it is refused with a
+      retriable error. The CPI reads each placeable node's notes once per create_vm,
+      and only when this list is not empty. A node whose notes cannot be read is left
+      out of placement. Leave the property unset to get the default ["maintenance"].
+      Set it to [] to turn the notes marker off, which reads no notes, while still
+      honoring the node health check, which always runs. Set it to a list to use those
+      tags instead. The property has no spec default, so the CPI can tell an unset
+      property from an explicit []. HA maintenance is the first choice for taking a
+      node out of service, because it drains the node. The notes marker only keeps
+      the CPI from placing new VMs on the node, and it moves nothing.
   pve.placement.az_fallback_order:
     description: |
       Ordered list of AZ names appended as fallback candidates after

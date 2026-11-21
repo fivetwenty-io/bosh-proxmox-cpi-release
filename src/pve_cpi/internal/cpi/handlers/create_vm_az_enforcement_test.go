@@ -20,11 +20,11 @@ func offlineNodeFact(name string) map[string]any {
 	}
 }
 
-// maintenanceTaggedNode is an online node carrying the "maintenance" tag, which
-// the configs of these tests list as an operator maintenance tag.
+// maintenanceTaggedNode is an online node whose notes carry the "maintenance"
+// tag, which is the default maintenance_node_tags.
 func maintenanceTaggedNode(name string) map[string]any {
 	n := onlineNode(name)
-	n["tags"] = "maintenance"
+	n["notes"] = "tags: maintenance"
 	return n
 }
 
@@ -359,7 +359,7 @@ func TestResolveTargetNodeWithRNG_OneNodeAZInMaintenanceTag_StrictRetriableWarnF
 		}
 	}
 	tagged := []map[string]any{onlineNode("pve1"), onlineNode("pve9")}
-	tagged[0]["tags"] = "maint"
+	tagged[0]["notes"] = "tags: maint"
 
 	strict, _ := azEnforcementDeps(t, tagged, withTag(strictPlacement))
 	_, err := resolveTargetNodeWithRNG(context.Background(), strict, cp, nil, nil, nil)

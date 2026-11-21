@@ -1043,3 +1043,15 @@ func (c *HAScenePermsClient) EffectivePermissions(context.Context, string) (map[
 func (c *HAScenePermsClient) ActiveMoveTasks(_ context.Context, node string) ([]pve.ActiveTask, error) {
 	return c.Scene.activeMoveTasks(node)
 }
+
+// ListConfig answers the node config read of node health with no notes, so no
+// node is marked for maintenance there.
+func (HAClockNodes) ListConfig(context.Context, string, *nodes.ListConfigParams) (*nodes.ListConfigResponse, error) {
+	return &nodes.ListConfigResponse{}, nil
+}
+
+// ListConfig answers the node config read of node health with no notes, so no
+// node is marked for maintenance there.
+func (*HASceneNodes) ListConfig(context.Context, string, *nodes.ListConfigParams) (*nodes.ListConfigResponse, error) {
+	return &nodes.ListConfigResponse{}, nil
+}

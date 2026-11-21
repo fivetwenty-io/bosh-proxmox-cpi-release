@@ -104,10 +104,12 @@ func TestDrainRun_ApplyRefusesUntilTheNodeIsInMaintenance(t *testing.T) {
 		t.Fatalf("a refused run wrote or kept its lock: %v", f.calls)
 	}
 
-	// An operator tag alone moves nothing, so it doesn't count either.
+	// The maintenance marker in the node's notes alone moves nothing, so it
+	// doesn't count either.
 	f.profileVal.Health.Nodes[0].Maintenance = true
+	f.profileVal.Health.Nodes[0].NotesTag = "maintenance"
 	rep = drRun(f, DrainCommand, true).drain(context.Background())
-	if g := drGate(t, rep.Gates); g.OK || !strings.Contains(g.Detail, "tag alone") {
+	if g := drGate(t, rep.Gates); g.OK || !strings.Contains(g.Detail, "notes alone moves nothing") {
 		t.Fatalf("maintenance gate %+v", g)
 	}
 }
@@ -439,8 +441,15 @@ func TestDrainGates_TheNodesAndMaintenanceGates(t *testing.T) {
 	}
 	p.Health.Nodes[0].CRMState = ""
 	p.Health.Nodes[0].Maintenance = true
-	if g := maintenanceGate(p, "pve01", true, true); g.OK || !strings.Contains(g.Detail, "operator maintenance tag") {
-		t.Fatalf("undrain gate with a tag %+v", g)
+	p.Health.Nodes[0].NotesTag = "maint"
+	if g := maintenanceGate(p, "pve01", true, true); g.OK ||
+		!strings.Contains(g.Detail, `notes carry the maintenance tag "maint"`) ||
+		!strings.Contains(g.Detail, "remove that tag from the node's notes first") {
+		t.Fatalf("undrain gate with a notes marker %+v", g)
+	}
+	if g := maintenanceGate(p, "pve01", true, false); g.OK ||
+		!strings.Contains(g.Detail, "the maintenance marker in the node's notes alone moves nothing") {
+		t.Fatalf("drain gate with only a notes marker %+v", g)
 	}
 	if g := maintenanceGate(p, "pve01", false, true); !g.OK || !strings.HasPrefix(g.Detail, "for --apply") {
 		t.Fatalf("dry undrain gate %+v", g)
