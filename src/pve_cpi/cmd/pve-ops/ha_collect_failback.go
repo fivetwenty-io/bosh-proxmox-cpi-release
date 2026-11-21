@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
@@ -28,8 +29,10 @@ import (
 // whose decision fails or refuses HA for a reason that may pass. It reports
 // nothing on a cluster where a node runs a release without the failback key,
 // or whose releases it could not read, because the CPI has no flag to set
-// there. It also
-// leaves parkers alone, because a parker stays stopped, so failback never
+// there. Under --cpi-config it leaves alone a VM whose flag is the one another
+// entry on the same cluster and VM ID band writes (see peerWritesFailback),
+// because no VM record names the entry that created it. It also leaves
+// parkers alone, because a parker stays stopped, so failback never
 // moves it, and the Director never calls set_vm_metadata or reboot_vm on one,
 // so a finding about it would never clear.
 func (c *haCollector) failbackFindings() {
@@ -42,26 +45,11 @@ func (c *haCollector) failbackFindings() {
 			continue
 		}
 		have := g.resource.Failback == nil || *g.resource.Failback
-		facts, reason, ok := c.failbackFacts(g)
-		if !ok {
+		want, reason, replicate, known := c.expectedFailback(g, c.cfg)
+		if !known || want == have || c.peerWritesFailback(g, have) {
 			continue
 		}
-		want, known := ha.ExpectedFailback(facts)
-		switch {
-		case known && want, !known && have && facts.SelfPinned && !facts.Unknown:
-			// The facts call for failback on, or the flag reads on under a
-			// strict pin that names one node. Either way the CPI's HA
-			// decision settles it, and the reconcile writes what it says.
-			var why string
-			want, known, why = c.decidedFailback(g)
-			if known && !want {
-				reason = why
-			}
-		}
-		if !known || want == have {
-			continue
-		}
-		if facts.Replicate {
+		if replicate {
 			c.rep.problem(haKindFailbackOnReplica, g.sid,
 				"%s replicates its volumes to a partner node, and its HA resource has failback on. Once the VM's "+
 					"preferred node is back after a recovery or a maintenance, PVE moves the VM back to it and "+
@@ -79,6 +67,52 @@ func (c *haCollector) failbackFindings() {
 	}
 }
 
+// expectedFailback returns the failback flag the CPI writes for g under cfg,
+// why, and whether g replicates. known is false when the doctor cannot settle
+// the flag, because a read the facts need failed or the CPI's HA decision
+// leaves the flag as it is.
+func (c *haCollector) expectedFailback(g *haGuest, cfg *config.CPIConfig) (want bool, reason string, replicate,
+	known bool) {
+	have := g.resource.Failback == nil || *g.resource.Failback
+	facts, reason, ok := c.failbackFacts(g, cfg)
+	if !ok {
+		return false, "", false, false
+	}
+	want, known = ha.ExpectedFailback(facts)
+	switch {
+	case known && want, !known && have && facts.SelfPinned && !facts.Unknown:
+		// The facts call for failback on, or the flag reads on under a
+		// strict pin that names one node. Either way the CPI's HA decision
+		// settles it, and the reconcile writes what it says.
+		var why string
+		want, known, why = c.decidedFailback(g, cfg)
+		if known && !want {
+			reason = why
+		}
+	}
+	return want, reason, facts.Replicate, known
+}
+
+// peerWritesFailback reports whether another cpi-config entry on the same
+// cluster and VM ID band writes the flag have for g. No VM record names the
+// entry that created the VM, so when the entries of a band disagree on the
+// flag, a VM whose flag is the one some entry writes may belong to that entry
+// and is left alone.
+func (c *haCollector) peerWritesFailback(g *haGuest, have bool) bool {
+	if c.scope == nil {
+		return false
+	}
+	for _, cfg := range c.scope.PeerConfigs {
+		if cfg == nil {
+			continue
+		}
+		if want, _, _, known := c.expectedFailback(g, cfg); known && want == have {
+			return true
+		}
+	}
+	return false
+}
+
 // ownsFailbackOf reports whether the CPI sets the failback flag of res: the
 // resource carries this Director's marker, the narrowing barrier does not
 // hold it, and no fresh hold token says an attach is moving the VM into its
@@ -92,14 +126,14 @@ func (c *haCollector) ownsFailbackOf(res *HAResourceRow) bool {
 }
 
 // failbackFacts gathers what the expected failback flag of g rests on, and
-// says why the flag is off or on. ok is false when a read the facts need
+// says why the flag is off or on, under the configuration cfg. ok is false when a read the facts need
 // failed, so the doctor cannot tell whether g replicates.
-func (c *haCollector) failbackFacts(g *haGuest) (facts ha.FailbackFacts, reason string, ok bool) {
+func (c *haCollector) failbackFacts(g *haGuest, cfg *config.CPIConfig) (facts ha.FailbackFacts, reason string, ok bool) {
 	var pin *ha.Rule
 	if c.rulesOK {
 		pin = c.pinOf(g.ref.VMID)
 	}
-	facts.Enabled = c.cfg.HAFailbackEnabled()
+	facts.Enabled = cfg.HAFailbackEnabled()
 	facts.Replicate = g.hasTag(haReplicaTag) || c.replicates(g.ref.VMID, pin) || replicaChangePending(pin)
 	if facts.Replicate {
 		return facts, "the VM replicates its volumes to a partner node", true
@@ -139,8 +173,8 @@ func replicaChangePending(pin *ha.Rule) bool {
 	return changed
 }
 
-// decidedFailback runs the CPI's HA decision for g the way the failback
-// reconcile does, and returns the flag the reconcile writes for g and, when
+// decidedFailback runs the CPI's HA decision for g under cfg the way the
+// failback reconcile does, and returns the flag the reconcile writes for g and, when
 // that flag is off, why. The reconcile writes the decision's flag for a VM the
 // decision registers, which is off for a VM that only one node can take, such
 // as one under a strict pin that names one node, one with a PCI passthrough
@@ -148,14 +182,14 @@ func replicaChangePending(pin *ha.Rule) bool {
 // for a VM the decision gives no HA. A decision that fails, or that refuses
 // HA for a reason that may pass, leaves the flag unknown, because the
 // reconcile then leaves the flag as it is.
-func (c *haCollector) decidedFailback(g *haGuest) (want, known bool, reason string) {
+func (c *haCollector) decidedFailback(g *haGuest, cfg *config.CPIConfig) (want, known bool, reason string) {
 	if g.cfg == nil {
 		return false, false, ""
 	}
 	cpu, _ := pve.ConfigString(g.cfg, "cpu")
 	in := ha.VMInput{
-		Config: c.cfg, VMID: g.ref.VMID, Node: g.ref.Node, Volumes: g.volumes,
-		CPUType: ha.EffectiveCPUType(c.cfg, nil, cpu), HAManaged: true,
+		Config: cfg, VMID: g.ref.VMID, Node: g.ref.Node, Volumes: g.volumes,
+		CPUType: ha.EffectiveCPUType(cfg, nil, cpu), HAManaged: true,
 	}
 	for key := range g.cfg {
 		if strings.HasPrefix(key, "hostpci") {

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"testing"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
@@ -268,4 +270,58 @@ func TestCollectFailbackLeavesAReleaseWithoutTheKeyAlone(t *testing.T) {
 	f.resources[0].Failback = failbackRow(false)
 	r := runCollect(t, f, haCfg("auto", "none"))
 	want(t, r, haKindFailbackDrift, haSeverityAdvice, "vm:100", "failback off")
+}
+
+// TestCollectFailbackLeavesAFlagAPeerEntryWrites builds two cpi-config entries
+// on one cluster and band, one that leaves pve.ha.failback on and one that sets
+// it false. No VM record names the entry that created it, so a VM whose flag
+// is the one either entry writes is left alone by both runs, and a VM whose
+// flag neither entry writes is still reported.
+func TestCollectFailbackLeavesAFlagAPeerEntryWrites(t *testing.T) {
+	t.Parallel()
+	entries := []cpiConfigEntry{
+		{Name: "az2", Type: "pve", Properties: map[string]any{}},
+		{Name: "az2-nofb", Type: "pve", Properties: map[string]any{"pve_ha": map[string]any{"failback": false}}},
+	}
+	base := haCfg("auto", "none")
+	scopes := entryScopes(entries, base)
+	run := func(i int, flag *bool) *haReport {
+		eff, _, _, err := config.ApplyContextOverrides(base, entries[i].Properties)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := haBaseFake()
+		f.resources[0].Failback = flag
+		return collectHAScoped(context.Background(), f, eff, "", haNow, scopes[i])
+	}
+	for i := range entries {
+		wantNone(t, run(i, failbackRow(false)), haKindFailbackDrift)
+		wantNone(t, run(i, failbackRow(true)), haKindFailbackDrift)
+	}
+
+	// Alone in the band, each entry still reports the flag it would not write.
+	alone := func(i int, flag *bool) *haReport {
+		eff, _, _, err := config.ApplyContextOverrides(base, entries[i].Properties)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := haBaseFake()
+		f.resources[0].Failback = flag
+		return collectHAScoped(context.Background(), f, eff, "", haNow, entryScopes(entries[i:i+1], base)[0])
+	}
+	want(t, alone(0, failbackRow(false)), haKindFailbackDrift, haSeverityAdvice, "vm:100", "failback off")
+	want(t, alone(1, failbackRow(true)), haKindFailbackDrift, haSeverityAdvice, "vm:100", "pve.ha.failback is false")
+
+	// A replicate VM with failback on is a problem under both entries, because
+	// neither writes failback on for it.
+	for i := range entries {
+		eff, _, _, err := config.ApplyContextOverrides(base, entries[i].Properties)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := replicaFake()
+		f.resources[1].Failback = nil
+		r := collectHAScoped(context.Background(), f, eff, "", haNow, scopes[i])
+		want(t, r, haKindFailbackOnReplica, haSeverityProblem, "vm:101", "failback on")
+	}
 }

@@ -374,6 +374,10 @@ type haEntryScope struct {
 	// PeerAntiAffinity says the same for each peer, in the same order as Peers.
 	AntiAffinity     bool
 	PeerAntiAffinity []bool
+	// PeerConfigs holds the effective configuration of each peer, in the same
+	// order as Peers, so a per-VM check can tell whether a peer writes what
+	// the VM carries.
+	PeerConfigs []*config.CPIConfig
 	// Leader is true for the first entry of its group.
 	Leader bool
 	// Cluster lists every entry that reaches the same cluster, this one
@@ -457,6 +461,7 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntrySco
 		band    pve.VMIDBand
 		pattern aapattern.Pattern
 		azMap   map[string][]string
+		cfg     *config.CPIConfig
 	}
 	all := make([]*facts, len(entries))
 	for i := range entries {
@@ -467,7 +472,7 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntrySco
 		band := pve.VMIDBandsFromConfig(eff).VM
 		all[i] = &facts{
 			key: eff.Host + "|" + band.String(), host: eff.Host, name: entries[i].Name, policy: eff.HALocalPolicyValue(),
-			band: band, aa: antiAffinityWritten(eff), pattern: eff.HAAntiAffinityPatternValue(),
+			band: band, aa: antiAffinityWritten(eff), pattern: eff.HAAntiAffinityPatternValue(), cfg: eff,
 		}
 		if eff.Placement != nil {
 			all[i].azMap = eff.Placement.AZMap
@@ -491,6 +496,7 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntrySco
 			sc.Peers = append(sc.Peers, o.name)
 			sc.PeerPolicies = append(sc.PeerPolicies, o.policy)
 			sc.PeerAntiAffinity = append(sc.PeerAntiAffinity, o.aa)
+			sc.PeerConfigs = append(sc.PeerConfigs, o.cfg)
 			if j < i {
 				sc.Leader = false
 			}
