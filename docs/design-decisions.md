@@ -122,7 +122,7 @@ Every `create_stemcell` call builds (or reuses) the per-cluster cache template, 
 | `pve-ops locate <cid\|volid>` | Online: find the holder VM for a disk CID, or the cache templates and director references for a stemcell CID |
 | `pve-ops stemcells [--orphans]` | Online: per-cluster stemcell inventory that compares qcow2 files against cache templates against director references, the "what is safe to delete" view |
 
-`pve-ops` never mutates PVE; every online subcommand is read-only.
+`pve-ops` never mutates PVE; every online subcommand is read-only. (Superseded later: the tool now has subcommands that write, and each one plans as a dry run and writes only when we pass `--apply`. `pve-ops ha --widen-replicas --apply` and `pve-ops ha --fix-anti-affinity --apply` write HA resources and rules, and `pve-ops ha rebalance`, `drain`, and `undrain` move VMs and change node maintenance. The decode, encode, locate, and stemcell inventory views stay read-only. See [Operations](operations.md).)
 
 **A residual gap closed alongside the tool.** VM disks attached inline during `create_vm` (as opposed to attached later via `attach_disk`) were not recording their CID sentinel the same way `attach_disk` does. `get_disks` on such a VM could return incorrect data and cloud-check membership comparisons could disagree. `create_vm`'s disk-attach path now records the sentinel identically to `attach_disk`.
 
