@@ -828,7 +828,11 @@ func (c *haCollector) clusterEntries() []haClusterEntry {
 // the owner whose plan deletes the fewest of the group's rules. A tie goes to
 // the owner whose AZ map holds the strict pins of the most members, then to
 // the owner whose AZs that hold them are smallest, the way a plan picks a
-// member's domain, then to the owner whose plan writes the fewest changes,
+// member's domain, then to the owner whose AZ map names the nodes that the
+// soft pins of the most members prefer (see
+// handlers.AntiAffinityPreferenceMisses), because only an entry with that AZ
+// writes such a preference, then to the owner whose plan writes the fewest
+// changes,
 // and then to the first in cpi-config order. A pin is read as the Director's
 // that owner names, or the run's own when the marker names none. It returns
 // false when the group has no owner.
@@ -845,10 +849,11 @@ func (c *haCollector) groupPlacer(members []*haGuest, owner, tag string) (haClus
 	for _, g := range members {
 		sids = append(sids, g.sid)
 	}
-	type fit struct{ problem, deletes, misses, width, writes int }
+	type fit struct{ problem, deletes, misses, width, preferences, writes int }
 	score := func(e *haClusterEntry) fit {
 		var f fit
 		f.misses, f.width = handlers.AntiAffinityPlacementFit(e.AZMap, set, owner, sids)
+		f.preferences = handlers.AntiAffinityPreferenceMisses(e.AZMap, set, owner, sids)
 		if chk, ok := c.entryCheck(e, tag); ok {
 			if chk.Problem != "" || chk.ForeignRule != "" {
 				f.problem = 1
@@ -860,7 +865,7 @@ func (c *haCollector) groupPlacer(members []*haGuest, owner, tag string) (haClus
 	}
 	less := func(a, b fit) bool {
 		for _, d := range [][2]int{{a.problem, b.problem}, {a.deletes, b.deletes}, {a.misses, b.misses},
-			{a.width, b.width}, {a.writes, b.writes}} {
+			{a.width, b.width}, {a.preferences, b.preferences}, {a.writes, b.writes}} {
 			if d[0] != d[1] {
 				return d[0] < d[1]
 			}

@@ -594,3 +594,47 @@ func TestCollectAntiAffinityLayoutContestedDeleteIsNotOffered(t *testing.T) {
 	wantNone(t, judge, haKindAALayoutDrift, haKindAARuleFull)
 	wantNone(t, run(1), haKindAALayoutDrift, haKindAARuleFull, haKindAntiAffinityAmbiguous)
 }
+
+// TestCollectAntiAffinityLayoutPinRestoreGoesToTheEntryWhoseAZThePinPrefers
+// pins that the doctor reports a pin restore on the entry whose AZ the
+// member's soft pin prefers. Two entries reach one cluster and band. The
+// first has no AZ map, and the second maps each node to an AZ of its own and
+// writes soft AZ pins. The group's one member left sits in no rule, and its
+// flattened pin records that it preferred n1, which only the second entry's
+// AZ c1 names. Neither entry's plan writes anything, and no strict pin tells
+// them apart, so the preference decides, and only the second entry's run
+// reports the restore.
+func TestCollectAntiAffinityLayoutPinRestoreGoesToTheEntryWhoseAZThePinPrefers(t *testing.T) {
+	t.Parallel()
+	g := newAALayoutGroup()
+	haProps := map[string]any{"local_policy": "hold", "anti_affinity": "on"}
+	entries := []cpiConfigEntry{
+		{Name: "az2", Type: "pve", Properties: map[string]any{"pve_ha": haProps,
+			"pve_placement": map[string]any{"anti_affinity": map[string]any{"enabled": true}}}},
+		{Name: "client", Type: "pve", Properties: map[string]any{
+			"pve_ha": map[string]any{"local_policy": "hold", "anti_affinity": "on", "pin_az": "on",
+				"pin_az_strict": false},
+			"pve_placement": map[string]any{"anti_affinity": map[string]any{"enabled": true},
+				"az_map": map[string]any{"c1": []any{"n1"}, "c2": []any{"n2"}, "c3": []any{"n3"}}}}},
+	}
+	base := haCfg("auto", "hold")
+	effs := make([]*config.CPIConfig, len(entries))
+	for i := range entries {
+		eff, _, _, err := config.ApplyContextOverrides(base, entries[i].Properties)
+		if err != nil {
+			t.Fatal(err)
+		}
+		effs[i] = eff
+	}
+	scopes := entryScopes(entries, base, []string{haDirector, haDirector})
+	run := func(i int) *haReport {
+		f := aaLayoutFake(g, "block", 1)
+		f.guests[0].Tags += ";bosh-owner--" + haDirector
+		pin := pinRule(200, haMarker+" deployment=- group=- "+ha.PinRestoreKey+"=n1:2,n2,n3", "n1", "n2", "n3")
+		pin.Strict = false
+		f.rules = append(f.rules, pin)
+		return collectHAScoped(context.Background(), f, effs[i], haDirector, haNow, scopes[i])
+	}
+	wantNone(t, run(0), haKindAAPinRestore)
+	want(t, run(1), haKindAAPinRestore, haSeverityAdvice, "bosh-na-200", "writes back the priorities")
+}

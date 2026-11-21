@@ -344,6 +344,77 @@ func AntiAffinityPlacementFit(azMap map[string][]string, set *ha.RuleSet, owner 
 	return misses, width
 }
 
+// AntiAffinityPreferenceMisses counts the members of a group whose pin of
+// owner prefers some of its nodes over the rest while no AZ of azMap names
+// exactly the preferred nodes that the pin holds. The CPI writes such a
+// preference for a soft AZ pin, the AZ's nodes at a higher priority than the
+// rest, so the entry whose az_map holds the AZ explains the member and an
+// entry whose map doesn't misses it. A pin that a join flattened keeps its
+// priorities in the record of its comment, which counts in their place. A
+// member whose pin prefers no node counts in neither. The doctor reads it
+// under --cpi-config, after AntiAffinityPlacementFit, to find the entry whose
+// placement a group belongs to when no strict pin tells the entries apart.
+func AntiAffinityPreferenceMisses(azMap map[string][]string, set *ha.RuleSet, owner string, sids []string) int {
+	misses := 0
+	for _, sid := range sids {
+		preferred, nodes := pinPreference(set, sid, owner)
+		if len(preferred) == 0 {
+			continue
+		}
+		fits := false
+		for _, az := range azMap {
+			held := slices.DeleteFunc(slices.Clone(az), func(n string) bool { return !slices.Contains(nodes, n) })
+			slices.Sort(held)
+			if slices.Equal(slices.Compact(held), preferred) {
+				fits = true
+				break
+			}
+		}
+		if !fits {
+			misses++
+		}
+	}
+	return misses
+}
+
+// pinPreference returns the sorted nodes at the highest priority of the pin
+// of sid that owner owns, and the pin's nodes, when the pin, or the record a
+// join left on its comment, gives its nodes more than one priority. It
+// returns nil otherwise.
+func pinPreference(set *ha.RuleSet, sid, owner string) (preferred, nodes []string) {
+	vmid, ok := vmidFromSid(sid)
+	if !ok || set == nil {
+		return nil, nil
+	}
+	pin := set.Find(naRuleNameFor(vmid))
+	if pin == nil || pin.Type != ha.RuleTypeNodeAffinity || haOwnershipOf(pin.Comment, owner) != haOwnedByUs {
+		return nil, nil
+	}
+	prio := pin.Nodes
+	if rec, _, ok := ha.PinRestoreRecord(pin.Comment); ok && !pin.MultiplePriorities() {
+		prio = rec
+	}
+	top, low := 0, 0
+	first := true
+	for _, p := range prio {
+		if first {
+			top, low, first = p, p, false
+		}
+		top, low = max(top, p), min(low, p)
+	}
+	if first || top == low {
+		return nil, nil
+	}
+	for n, p := range prio {
+		nodes = append(nodes, n)
+		if p == top {
+			preferred = append(preferred, n)
+		}
+	}
+	slices.Sort(preferred)
+	return preferred, nodes
+}
+
 // crossDomainRule returns why a plan cannot judge the group's rules under the
 // config it was planned with, or "". That is so when one of the group's rules
 // names members that the config's placement.az_map puts in different domains.

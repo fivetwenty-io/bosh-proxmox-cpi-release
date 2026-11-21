@@ -202,3 +202,35 @@ func TestFixAntiAffinityGroups_LeavesARuleNamedForAnotherAZMapAlone(t *testing.T
 		t.Fatalf("rules = %v; want the three lowest indexes in the base rule alone", stub.rules)
 	}
 }
+
+// TestAntiAffinityPreferenceMisses pins which members an AZ map explains by
+// their pins' preferred nodes. A pin with two priorities prefers its higher
+// class, a flattened pin prefers what its record names, and a flat pin with
+// no record prefers nothing, so it counts against no map.
+func TestAntiAffinityPreferenceMisses(t *testing.T) {
+	t.Parallel()
+	marker := aaIdent("web").marker()
+	set := &ha.RuleSet{Rules: []ha.Rule{
+		{ID: naRuleNameFor(100), Type: ha.RuleTypeNodeAffinity, Resources: []string{"vm:100"}, Comment: marker,
+			Nodes: map[string]int{"pve1": 2, "pve2": 2, "pve3": 1}},
+		{ID: naRuleNameFor(101), Type: ha.RuleTypeNodeAffinity, Resources: []string{"vm:101"},
+			Comment: marker + " " + ha.PinRestoreKey + "=pve3:2,pve1,pve2",
+			Nodes:   map[string]int{"pve1": 1, "pve2": 1, "pve3": 1}},
+		{ID: naRuleNameFor(102), Type: ha.RuleTypeNodeAffinity, Resources: []string{"vm:102"}, Comment: marker,
+			Nodes: map[string]int{"pve1": 1, "pve2": 1, "pve3": 1}},
+	}}
+	sids := []string{"vm:100", "vm:101", "vm:102"}
+	for _, tc := range []struct {
+		name  string
+		azMap map[string][]string
+		want  int
+	}{
+		{"no map", nil, 2},
+		{"both AZs", map[string][]string{"a": {"pve1", "pve2"}, "b": {"pve3", "pve9"}}, 0},
+		{"one node per AZ", map[string][]string{"a": {"pve1"}, "b": {"pve2"}, "c": {"pve3"}}, 1},
+	} {
+		if got := AntiAffinityPreferenceMisses(tc.azMap, set, aaDirector, sids); got != tc.want {
+			t.Errorf("%s: misses = %d; want %d", tc.name, got, tc.want)
+		}
+	}
+}
