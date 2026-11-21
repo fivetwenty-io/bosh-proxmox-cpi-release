@@ -1192,10 +1192,9 @@ type attachReadd struct {
 	register bool
 	// ran says the attach has run between the removal and the registration.
 	ran bool
-	// oldPin and set are the VM's strict pin and the rules the last decision
-	// read, which the pin write builds on.
-	oldPin *ha.Rule
-	set    *ha.RuleSet
+	// decided says a decision ran, which the pin write needs. The write plans
+	// the pin again from the rules it reads under the rules lock.
+	decided bool
 }
 
 // decide makes the attach decision again under the claim. A decision before
@@ -1245,25 +1244,29 @@ func (a *attachReadd) decide(
 		return nil, nil, cpierrors.Retriable("%s: the HA decision for VM %d with the new disk changed since the "+
 			"attach made it (%s); nothing changed, and a retry decides again", op, h.vmid, d.Reason)
 	}
-	a.oldPin, a.set = strict, set
+	a.decided = true
 	return d, in.Volumes, nil
 }
 
 // writePin writes the pin the decision gives with the new disk, recording
-// storages, and verifies it.
+// storages, and verifies it. The pin is planned from the VM's pin and the
+// rules as the write reads them under the rules lock, not as the decision
+// read them, so a write that a sibling's anti-affinity join made in between,
+// such as a flattened pin and its record, is built on rather than undone. A
+// strict pin there keeps its priorities and loses the nodes the decision no
+// longer admits (see attachNewPin).
 func (a *attachReadd) writePin(ctx context.Context, d *ha.VMDecision, storages []string) (*ha.Rule, error) {
 	h := a.h
-	if a.set == nil {
+	if !a.decided {
 		return nil, cpierrors.Cloud("%s: VM %d: the pin was asked for before its decision", attachHAOp, h.vmid)
 	}
-	pin, err := attachNewPin(d, a.oldPin, h.profile, a.set, storages, h.deps.RequestDirectorUUID)
-	if err != nil {
-		return nil, err
-	}
-	if err := h.writePinFor(ctx, d, pin); err != nil {
-		return nil, err
-	}
-	return pin, nil
+	return h.writePinFor(ctx, d, func(set *ha.RuleSet, cur *ha.Rule) (*ha.Rule, error) {
+		var strict *ha.Rule
+		if cur != nil && cur.Strict && !cur.Disabled {
+			strict = cur
+		}
+		return attachNewPin(d, strict, h.profile, set, storages, h.deps.RequestDirectorUUID)
+	})
 }
 
 // leaveErrored clears the error of a resource the attach removes from HA, by
@@ -1531,32 +1534,63 @@ func vmMoveInFlight(ctx context.Context, deps Deps, vmid int, node string) (bool
 // is the barrier putting back a VM that had no pin, after an attach that
 // provably changed nothing, so it removes only the pin this attach wrote (see
 // removeAttachPin) and never the VM's HA resource.
+//
+// The barrier planned pin before the rules lock, so the write fits it to the
+// rules it reads under the lock (see fitPinToRules), and pin then holds what
+// was written, which the barrier and removeAttachPin compare with later.
 func (h *attachHA) writePin(ctx context.Context, pin *ha.Rule) error {
 	if pin == nil {
 		return h.removeAttachPin(ctx)
 	}
-	return h.writePinFor(ctx, h.decision, pin)
+	written, err := h.writePinFor(ctx, h.decision, func(*ha.RuleSet, *ha.Rule) (*ha.Rule, error) {
+		return pin, nil
+	})
+	if err != nil {
+		return err
+	}
+	*pin = *written
+	return nil
 }
 
-// writePinFor writes pin under the rules lock and verifies it against the
-// decision d.
-func (h *attachHA) writePinFor(ctx context.Context, d *ha.VMDecision, pin *ha.Rule) error {
+// writePinFor writes the pin that plan gives under the rules lock, verifies it
+// against the decision d, and returns it. plan runs on each read the writer
+// makes under the lock, with the rules it read and the VM's pin among them,
+// or nil when the VM has none. The pin it gives is then fitted to those rules
+// (see fitPinToRules), so the write never builds on a read made before the
+// lock, and never undoes the flatten of a sibling's anti-affinity join that
+// ran since.
+func (h *attachHA) writePinFor(
+	ctx context.Context, d *ha.VMDecision, plan func(set *ha.RuleSet, cur *ha.Rule) (*ha.Rule, error),
+) (*ha.Rule, error) {
 	owner := h.deps.RequestDirectorUUID
+	id := naRuleNameFor(h.vmid)
 	var res *ha.ApplyResult
+	var pin *ha.Rule
 	err := withHARulesLock(ctx, h.deps, h.vmid, h.logger, func(ctx context.Context) error {
 		writer := newHARuleWriterFor(h.deps, h.profile, h.logger, d)
 		var err error
 		res, err = writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
-			cur := set.Find(pin.ID)
+			cur := set.Find(id)
+			switch {
+			case cur == nil:
+			case haOwnershipOf(cur.Comment, owner) == haOwnedByOther:
+				return nil, fmt.Errorf("node-affinity: rule %q carries another Director's ownership marker; "+
+					"leaving it alone", id)
+			case cur.Type != ha.RuleTypeNodeAffinity:
+				return nil, fmt.Errorf("node-affinity: rule %q is a %s rule, not a node-affinity pin; leaving it alone",
+					id, cur.Type)
+			}
+			next, err := plan(set, cur)
+			if err != nil {
+				return nil, err
+			}
+			if next == nil || next.ID != id {
+				return nil, fmt.Errorf("node-affinity: VM %d: the attach planned no pin named %q", h.vmid, id)
+			}
+			pin = fitPinToRules(set, h.sid, next)
 			switch {
 			case cur == nil:
 				return []ha.RuleOp{{Kind: ha.OpCreate, Rule: *pin}}, nil
-			case haOwnershipOf(cur.Comment, owner) == haOwnedByOther:
-				return nil, fmt.Errorf("node-affinity: rule %q carries another Director's ownership marker; "+
-					"leaving it alone", pin.ID)
-			case cur.Type != ha.RuleTypeNodeAffinity:
-				return nil, fmt.Errorf("node-affinity: rule %q is a %s rule, not a node-affinity pin; leaving it alone",
-					pin.ID, cur.Type)
 			case ha.SameRule(pin, cur):
 				return nil, nil
 			}
@@ -1566,14 +1600,34 @@ func (h *attachHA) writePinFor(ctx context.Context, d *ha.VMDecision, pin *ha.Ru
 	})
 	healAfterRepair(ctx, h.deps, res, h.logger)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	stager := &ha.Stager{
 		ReadRules: func(ctx context.Context) (*ha.RuleSet, error) { return readHARuleSet(ctx, h.deps.PVE.Cluster()) },
 		Managed:   h.deps.Config.HAModeValue() == config.HAModeManaged,
 		Logger:    h.logger,
 	}
-	return stager.Verify(ctx, d, pin, "")
+	if err := stager.Verify(ctx, d, pin, ""); err != nil {
+		return nil, err
+	}
+	return pin, nil
+}
+
+// fitPinToRules returns pin the way set lets the VM sid have it. PVE refuses
+// a pin with several priorities for a VM in a resource-affinity rule, so when
+// set puts sid in such a rule, the pin gets one priority on every node, and
+// its comment records the priorities it had (see ha.WithPinRestoreRecord),
+// which the restore gives back once the VM leaves its last such rule. Any
+// older record goes, because pin's priorities are what the CPI asks for now.
+// The pin keeps its nodes and its strictness. Any other pin comes back as it
+// is.
+func fitPinToRules(set *ha.RuleSet, sid string, pin *ha.Rule) *ha.Rule {
+	if pin == nil || !pin.MultiplePriorities() || !inResourceAffinityRule(set, sid) {
+		return pin
+	}
+	out := ha.Flattened(pin)
+	out.Comment = ha.WithPinRestoreRecord(ha.WithoutPinRestoreRecord(pin.Comment), pin)
+	return out
 }
 
 // removeAttachPin deletes the node-affinity pin this attach wrote for a VM

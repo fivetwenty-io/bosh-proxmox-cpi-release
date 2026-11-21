@@ -862,6 +862,91 @@ func TestAttachHARun_WideningWritesThePinAfterTheAttach(t *testing.T) {
 	}
 }
 
+// TestAttachHARun_ThePinWriteFollowsAJoinThatFlattenedIt shows that the pin
+// the attach writes is planned from the rules it reads under the rules lock.
+// A sibling's set_vm_metadata join puts VM 100 in a resource-affinity rule and
+// flattens its pin while the attach runs, recording the priorities it took
+// away. The attach then writes a pin with one priority, which PVE takes for a
+// member of such a rule, and the record still names the priorities the VM
+// gets back when it leaves the rule.
+func TestAttachHARun_ThePinWriteFollowsAJoinThatFlattenedIt(t *testing.T) {
+	deps, stub, _ := attachRig(config.HAModeAuto)
+	stub.pin(true, "pve01:2,pve02:2,pve03", "nfs")
+	h, err := decideAttachHA(context.Background(), deps, "100", sharedDisk())
+	if err != nil || h == nil || h.action != attachHAGuarded || !h.newPin.MultiplePriorities() {
+		t.Fatalf("decision: h %+v err %v", h, err)
+	}
+	res := &attachRunRes{log: &stagingLog{}, state: "started", comment: stub.comment}
+	h.narrow = barrierView(res)
+	marker := haIdentity{Owner: aaDirector}.marker()
+	negative := "negative"
+	err = h.run(context.Background(), func(context.Context) (string, error) {
+		stub.rules["bosh-aa-web-1"] = cluster.CreateHaRulesParams{Rule: "bosh-aa-web-1",
+			Type: "resource-affinity", Resources: "vm:100,vm:101", Affinity: &negative, Comment: &marker}
+		pin := stub.rules["bosh-na-100"]
+		flat := "pve01,pve02,pve03"
+		comment := ha.WithPinRestoreRecord(derefString(pin.Comment),
+			&ha.Rule{Nodes: map[string]int{"pve01": 2, "pve02": 2, "pve03": 0}})
+		pin.Nodes, pin.Comment = &flat, &comment
+		stub.rules["bosh-na-100"] = pin
+		return "pve01", nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	pin := stub.rules["bosh-na-100"]
+	if nodes := derefString(pin.Nodes); strings.Contains(nodes, ":") {
+		t.Fatalf("the attach wrote the pin with priorities, nodes %q, for a member of a resource-affinity rule",
+			nodes)
+	}
+	comment := derefString(pin.Comment)
+	if rec, present, ok := ha.PinRestoreRecord(comment); !present || !ok || rec["pve01"] != 2 || rec["pve03"] != 0 {
+		t.Fatalf("the pin lost the priorities the join recorded, comment %q", comment)
+	}
+	if vols, ok := ha.VolumeRecord(comment); !ok || !slices.Contains(vols, "nfs2") {
+		t.Fatalf("the pin must record nfs2 after the attach, comment %q", comment)
+	}
+}
+
+// TestAttachReaddWritePin_PlansFromThePinUnderTheLock shows that the pin a
+// re-registration writes with the new disk is planned from the VM's pin as
+// the write reads it under the rules lock. A sibling's join flattened the
+// strict pin after the decision, so the write keeps one priority and the
+// record of the priorities the join took away.
+func TestAttachReaddWritePin_PlansFromThePinUnderTheLock(t *testing.T) {
+	deps, stub, profile := attachRig(config.HAModeAuto)
+	marker := haIdentity{Owner: aaDirector}.marker()
+	negative := "negative"
+	stub.rules["bosh-aa-web-1"] = cluster.CreateHaRulesParams{Rule: "bosh-aa-web-1",
+		Type: "resource-affinity", Resources: "vm:100,vm:101", Affinity: &negative, Comment: &marker}
+	stub.pin(true, "pve01,pve02,pve03", "nfs")
+	pin := stub.rules["bosh-na-100"]
+	comment := ha.WithPinRestoreRecord(derefString(pin.Comment),
+		&ha.Rule{Nodes: map[string]int{"pve01": 2, "pve02": 2, "pve03": 0}})
+	pin.Comment = &comment
+	stub.rules["bosh-na-100"] = pin
+	h := &attachHA{deps: deps, logger: log.NewNopLogger(), vmid: 100, sid: "vm:100", node: "pve01",
+		profile: profile, disk: sharedDisk()}
+	d := &ha.VMDecision{VMID: 100, SID: "vm:100", Node: "pve01", Outcome: ha.OutcomeRegister,
+		Policy: ha.PolicyShared, Admissible: []string{"pve01", "pve02", "pve03"}, Placed: "pve01"}
+	a := &attachReadd{h: h, decided: true}
+	written, err := a.writePin(context.Background(), d, []string{"nfs", "nfs2"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := stub.rules["bosh-na-100"]
+	if nodes := derefString(got.Nodes); nodes != "pve01,pve02,pve03" || written.MultiplePriorities() {
+		t.Fatalf("pin nodes %q; want the flattened pin kept", nodes)
+	}
+	c := derefString(got.Comment)
+	if rec, present, ok := ha.PinRestoreRecord(c); !present || !ok || rec["pve01"] != 2 {
+		t.Fatalf("the pin lost the priorities the join recorded, comment %q", c)
+	}
+	if vols, ok := ha.VolumeRecord(c); !ok || !slices.Contains(vols, "nfs2") {
+		t.Fatalf("the pin must record nfs2, comment %q", c)
+	}
+}
+
 // narrowingDisk is a disk on nfs-ab, which only pve01 and pve02 reach.
 func narrowingDisk() resolvedDisk {
 	return resolvedDisk{volid: "nfs-ab:vm-100-disk-1", stableID: "abcd1234"}
