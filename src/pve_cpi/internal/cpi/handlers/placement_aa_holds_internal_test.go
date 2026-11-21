@@ -79,12 +79,21 @@ func (f *aaHoldFleet) add(vmid, index int) {
 // of the group, so each plan runs after both removals and must see the other
 // delete's hold. Index 3 never moves into index 1's place, and after every
 // write the doctor's plan of the state writes nothing. The recreates then take
-// both places back, and each consumes its hold.
+// both places back, and each consumes its hold. It runs with the rules lock
+// on and off. The first delete purges its HA resource after it releases the
+// lock of its removal and before it takes the lock again for its plan, so the
+// nested second delete takes the lock for both of its steps in that gap, the
+// way a concurrent delete on another worker would.
 func TestRemoveAntiAffinity_ConcurrentDeletesHoldEachOthersPlaces(t *testing.T) {
 	t.Parallel()
-	for name, tc := range map[string]struct{ first, second int }{
-		"index 1 first": {first: 101, second: 104},
-		"index 4 first": {first: 104, second: 101},
+	for name, tc := range map[string]struct {
+		first, second int
+		lock          bool
+	}{
+		"index 1 first":         {first: 101, second: 104},
+		"index 4 first":         {first: 104, second: 101},
+		"index 1 first, locked": {first: 101, second: 104, lock: true},
+		"index 4 first, locked": {first: 104, second: 101, lock: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -94,7 +103,9 @@ func TestRemoveAntiAffinity_ConcurrentDeletesHoldEachOthersPlaces(t *testing.T) 
 			fleet := newAAHoldFleet(stub, 100, 101, 102, 103, 104)
 			stub.seedRule(aaRule, "vm:100,vm:101,vm:102")
 			stub.seedRule(aaRule+"-2", "vm:103,vm:104")
-			deps := aaReplanDeps(stub, false)
+			var locks []string
+			pools := newAALockPools(&locks)
+			deps := aaReplanDepsWithLocks(stub, tc.lock, pools)
 			if d := aaDoctorDrift(t, deps); len(d) != 0 {
 				t.Fatalf("drift before the deletes = %v; want the group in its layout", d)
 			}
@@ -122,8 +133,16 @@ func TestRemoveAntiAffinity_ConcurrentDeletesHoldEachOthersPlaces(t *testing.T) 
 					return
 				}
 				nested = true
+				if len(pools.pools) != 0 {
+					t.Errorf("the first delete purges its resource while it holds the lock %v", pools.pools)
+				}
+				taken := len(locks)
 				fleet.destroy(tc.second)
 				remove(tc.second)
+				if tc.lock && aaLocksTaken(locks[taken:]) < 2 {
+					t.Errorf("the second delete took the rules lock %d times; want its removal and its plan "+
+						"each under the lock", aaLocksTaken(locks[taken:]))
+				}
 			}
 			fleet.destroy(tc.first)
 			remove(tc.first)
@@ -155,6 +174,17 @@ func TestRemoveAntiAffinity_ConcurrentDeletesHoldEachOthersPlaces(t *testing.T) 
 			}
 		})
 	}
+}
+
+// aaLocksTaken counts the lock pools events record as created.
+func aaLocksTaken(events []string) int {
+	n := 0
+	for _, ev := range events {
+		if strings.HasPrefix(ev, "lock-create:") {
+			n++
+		}
+	}
+	return n
 }
 
 // aaHoldFixture is the check of a group whose rule holds indexes 0 and 2 on

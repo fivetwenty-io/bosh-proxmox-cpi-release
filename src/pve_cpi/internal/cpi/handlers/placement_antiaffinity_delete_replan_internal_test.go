@@ -20,11 +20,16 @@ import (
 // rules again on a cluster of four nodes, so a rule holds at most three
 // members. With lock set, every rule write runs under the HA rules lock.
 func aaReplanDeps(stub *aaClusterStub, lock bool) Deps {
+	return aaReplanDepsWithLocks(stub, lock, newAALockPools(nil))
+}
+
+// aaReplanDepsWithLocks is aaReplanDeps with the lock pools a test reads.
+func aaReplanDepsWithLocks(stub *aaClusterStub, lock bool, pools *aaLockPools) Deps {
 	mode := "off"
 	if lock {
 		mode = "pool"
 	}
-	deps := aaDepsLock(aaMembershipConfig(mode, false, 30), stub, newAALockPools(nil))
+	deps := aaDepsLock(aaMembershipConfig(mode, false, 30), stub, pools)
 	deps.HAProfile = pve9ClusterProfile("pve1", "pve2", "pve3", "pve4")
 	deps.HARuleSleep = func(context.Context, time.Duration) error { return nil }
 	return deps
