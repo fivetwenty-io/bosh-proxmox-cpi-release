@@ -162,6 +162,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Fixed
 
+- `pve-ops ha --cpi-config` now judges an anti-affinity group whose members lie in the VMID bands of two entries exactly once. The doctor gathers the group's members from every entry's band on the cluster and picks the one judging entry over all of them. Before, each entry saw only the members in its own band, so it took itself for the entry that placed the group, and both entries judged it with their own `placement.az_map` and default pattern. They could then report conflicting `aa_layout_drift`, and a split between their default patterns went unreported. An entry of another Director no longer claims a group either. [Operations](docs/operations.md#reading-the-cluster-with-pve-ops-ha)
+
 - `pve-ops ha --cpi-config` now puts its once-per-run advice that no Director UUID is known on the first entry without a UUID whose cluster it could read. Before, the advice could land on an entry whose cluster was unreachable, which judged nothing, while a later entry without a UUID was the one the doctor judged by its VM ID band alone. [Operations](docs/operations.md#reading-the-cluster-with-pve-ops-ha)
 
 - The `replica_gone_vm_volume` advice of `pve-ops ha` now has us check container configs as well as VM configs before we remove the volume. Its `grep` reads `/etc/pve/nodes/*/lxc/*.conf` beside `/etc/pve/nodes/*/qemu-server/*.conf`, so a container that names the volume also keeps it. [Troubleshooting](docs/troubleshooting.md#removing-the-volume-of-a-vm-that-no-longer-exists)

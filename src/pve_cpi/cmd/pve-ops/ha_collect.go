@@ -688,7 +688,9 @@ func (c *haCollector) ruleFindings() {
 // bands hold its members. When those entries set different defaults and no
 // member's create named a pattern, the layout the CPI plans depends on which
 // entry serves the call, so the group's layout is left unjudged and the group
-// gets one advice.
+// gets one advice. A group's members are gathered from every entry's band on
+// the cluster, not only this run's, so every entry sees the same group and
+// exactly one of them judges it (see judgesGroup).
 func (c *haCollector) antiAffinityFindings() {
 	if !c.guestsOK || !c.rulesOK {
 		return
@@ -699,7 +701,7 @@ func (c *haCollector) antiAffinityFindings() {
 	}
 	groups := map[string][]*haGuest{}
 	for _, g := range c.guests {
-		if !g.owned || !c.judgesVM(g) {
+		if !g.owned || !c.groupMember(g) {
 			continue
 		}
 		for t := range g.tags {
@@ -709,10 +711,8 @@ func (c *haCollector) antiAffinityFindings() {
 		}
 	}
 	tags := make([]string, 0, len(groups))
-	for t, members := range groups {
-		if c.groupInBand(members) {
-			tags = append(tags, t)
-		}
+	for t := range groups {
+		tags = append(tags, t)
 	}
 	sort.Strings(tags)
 	defaults, split := c.groupDefaults(groups, tags)
@@ -720,7 +720,7 @@ func (c *haCollector) antiAffinityFindings() {
 	unjudged := false
 	for _, tag := range tags {
 		chk, planned := checks[tag]
-		if !c.judgesGroup(groups[tag], chk.Owner, mixed) {
+		if !c.judgesGroup(groups[tag], chk.Owner) {
 			continue
 		}
 		if planned {
@@ -747,20 +747,58 @@ func (c *haCollector) antiAffinityFindings() {
 }
 
 // judgesGroup reports whether this run judges a group. Under --cpi-config a
-// group belongs to the entry that placed it, which groupPlacer finds, and only
-// that entry's run judges it, because entries that share a cluster can map
-// AZs differently and so plan one group over different nodes. A group with no
-// such entry is judged by every entry of the band when the entries agree on
-// whether they write rules, and otherwise only by the band's first entry.
+// group belongs to the entry that placed it, which groupPlacer finds over
+// every member of the group, whatever band holds it, and only that entry's
+// run judges it, because entries that share a cluster can map AZs
+// differently and so plan one group over different nodes. A group with no
+// such entry is judged by the first entry on the cluster, in cpi-config
+// order, whose band holds one of its members, so it too is judged once.
 // owner is the Director the group's marker names, or "".
-func (c *haCollector) judgesGroup(members []*haGuest, owner string, mixed bool) bool {
+func (c *haCollector) judgesGroup(members []*haGuest, owner string) bool {
 	if c.scope == nil {
 		return true
 	}
 	if placer, ok := c.groupPlacer(members, owner); ok {
 		return placer.Self
 	}
-	return !mixed || c.scope.Leader
+	for _, e := range c.clusterEntries() {
+		for _, g := range members {
+			if e.holds(g) {
+				return e.Self
+			}
+		}
+	}
+	return false
+}
+
+// groupMember reports whether g counts as a member of its groups in this run.
+// It is a VM of this run's Director, or one with no owner tag, and under
+// --cpi-config it lies in the band of some entry on the cluster, because a
+// group's members can lie in the bands of several entries.
+func (c *haCollector) groupMember(g *haGuest) bool {
+	if !ownerAdmits(c.owner, g) {
+		return false
+	}
+	if c.scope == nil {
+		return true
+	}
+	for _, e := range c.clusterEntries() {
+		if e.holds(g) {
+			return true
+		}
+	}
+	return false
+}
+
+// clusterEntries returns the entries on this run's cluster in cpi-config
+// order. A scope built without that list stands for its band alone, and it
+// speaks for the band only when it is the band's first entry.
+func (c *haCollector) clusterEntries() []haClusterEntry {
+	if len(c.scope.Cluster) > 0 {
+		return c.scope.Cluster
+	}
+	return []haClusterEntry{{Name: c.scope.Name, Band: c.scope.Band, AntiAffinity: c.scope.AntiAffinity,
+		Owner: c.owner, Self: c.scope.Leader}}
 }
 
 // groupPlacer returns the entry whose placement a group belongs to, from the
@@ -771,7 +809,7 @@ func (c *haCollector) judgesGroup(members []*haGuest, owner string, mixed bool) 
 // that owner names, or the run's own when the marker names none. It returns
 // false when the group has no owner.
 func (c *haCollector) groupPlacer(members []*haGuest, owner string) (haClusterEntry, bool) {
-	owners := groupOwners(c.scope.Cluster, members)
+	owners := groupOwners(c.clusterEntries(), members)
 	if len(owners) == 0 {
 		return haClusterEntry{}, false
 	}
@@ -808,7 +846,7 @@ func (c *haCollector) groupDefaults(groups map[string][]*haGuest, tags []string,
 	defaults := map[string]aapattern.Pattern{}
 	split := map[string][]haClusterEntry{}
 	for _, tag := range tags {
-		owners := groupOwners(c.scope.Cluster, groups[tag])
+		owners := groupOwners(c.clusterEntries(), groups[tag])
 		if len(owners) == 0 {
 			continue
 		}
@@ -827,8 +865,9 @@ func (c *haCollector) groupDefaults(groups map[string][]*haGuest, tags []string,
 	return defaults, split
 }
 
-// groupOwners returns the entries that write anti-affinity rules and whose
-// band holds at least one of members, in cpi-config order.
+// groupOwners returns the entries that write anti-affinity rules and that
+// hold at least one of members (see haClusterEntry.holds), in cpi-config
+// order.
 func groupOwners(entries []haClusterEntry, members []*haGuest) []haClusterEntry {
 	var out []haClusterEntry
 	for _, e := range entries {
@@ -836,7 +875,7 @@ func groupOwners(entries []haClusterEntry, members []*haGuest) []haClusterEntry 
 			continue
 		}
 		for _, g := range members {
-			if e.Band.Contains(g.ref.VMID) {
+			if e.holds(g) {
 				out = append(out, e)
 				break
 			}
@@ -860,23 +899,6 @@ func (c *haCollector) adviseSplitDefaults(tag, group string, owners []haClusterE
 			"plans depends on which entry serves the call, and the doctor does not judge the group's layout; set "+
 			"ha_anti_affinity on the group's vm_type, or give the entries one default",
 		strings.Join(names, ", "), group, strings.Join(patterns, ", "))
-}
-
-// groupInBand reports whether at least one member of a group sits in this
-// run's VM ID band. The group tag does not name a band, and the CPI stamps it
-// whenever soft anti-affinity is on, so a group whose members all lie in
-// another entry's band was made under that entry's policy and may rightly have
-// no rule.
-func (c *haCollector) groupInBand(members []*haGuest) bool {
-	if c.scope == nil {
-		return true
-	}
-	for _, g := range members {
-		if c.scope.Band.Contains(g.ref.VMID) {
-			return true
-		}
-	}
-	return false
 }
 
 // antiAffinityWrites reports whether the CPI writes anti-affinity rules at all.
@@ -2503,23 +2525,28 @@ func (c *haCollector) ownerTagMissing(g *haGuest) {
 // predates the owner tag and is far likelier this Director's than a stranger's;
 // ownerTagMissing advises on it and names adopt-owners.
 func (c *haCollector) judgesVM(g *haGuest) bool {
-	if c.owner != "" {
-		mine := handlers.OwnerTagFor(c.owner)
-		other := false
-		for t := range g.tags {
-			if strings.HasPrefix(t, handlers.OwnerTagPrefix) {
-				if t == mine {
-					other = false
-					break
-				}
-				other = true
+	return ownerAdmits(c.owner, g) && c.inBand(g.ref.VMID)
+}
+
+// ownerAdmits reports whether the Director owner may judge g: a run that
+// names no Director judges every VM, and otherwise g must carry owner's tag or
+// no owner tag at all. The guest's tags are lowercased when they are read, and
+// OwnerTagFor lowercases the UUID, so the comparison ignores case.
+func ownerAdmits(owner string, g *haGuest) bool {
+	if owner == "" {
+		return true
+	}
+	mine := handlers.OwnerTagFor(owner)
+	other := false
+	for t := range g.tags {
+		if strings.HasPrefix(t, handlers.OwnerTagPrefix) {
+			if t == mine {
+				return true
 			}
-		}
-		if other {
-			return false
+			other = true
 		}
 	}
-	return c.inBand(g.ref.VMID)
+	return !other
 }
 
 // judges reports whether this run judges the findings about g. It is a VM the

@@ -316,3 +316,107 @@ func TestCollectAntiAffinityLayoutPinRestore(t *testing.T) {
 		})
 	}
 }
+
+// aaCrossBandScope is the scope of one of two entries that share a cluster
+// but not a band. Entry a holds VM 200 and has no AZ map, and entry b holds
+// VM 201 and maps its one AZ to the nodes n1 and n2. Both write rules, and
+// patterns gives each entry's default in that order. self names the entry
+// the run serves.
+func aaCrossBandScope(t *testing.T, self string, patterns ...string) *haEntryScope {
+	t.Helper()
+	defaults := []aapattern.Pattern{aapattern.Default(), aapattern.Default()}
+	for i, text := range patterns {
+		p, err := aapattern.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defaults[i] = p
+	}
+	entries := []haClusterEntry{
+		{Name: "a", Band: pve.VMIDBand{Start: 200, End: 200}, AntiAffinity: true, Pattern: defaults[0]},
+		{Name: "b", Band: pve.VMIDBand{Start: 201, End: 201}, AntiAffinity: true, Pattern: defaults[1],
+			AZMap: map[string][]string{"p9two": {"n1", "n2"}}},
+	}
+	sc := &haEntryScope{Name: self, Policy: "none", AntiAffinity: true, Leader: true}
+	for i := range entries {
+		if entries[i].Name == self {
+			entries[i].Self = true
+			sc.Band = entries[i].Band
+		}
+	}
+	sc.Cluster = entries
+	return sc
+}
+
+// TestCollectAntiAffinityLayoutJudgesAGroupAcrossBandsOnce pins that a group
+// whose members lie in two entries' bands is judged by exactly one entry,
+// chosen over the whole group. Both members carry the strict pin of b's
+// two-node AZ, so b placed the group, and only b's run reports the full rule.
+// Entry a, which holds one member in its band and has no AZ map, stays quiet.
+func TestCollectAntiAffinityLayoutJudgesAGroupAcrossBandsOnce(t *testing.T) {
+	t.Parallel()
+	g := newAALayoutGroup()
+	plain := haCfgWith("auto", "none", `,"anti_affinity":"on"`, `,"placement":{"anti_affinity":{"enabled":true}}`)
+	two := haCfgWith("auto", "none", `,"anti_affinity":"on"`,
+		`,"placement":{"anti_affinity":{"enabled":true},"az_map":{"p9two":["n1","n2"]}}`)
+	layoutKinds := []string{haKindAALayoutDrift, haKindAARuleFull, haKindAAPatternTrimmed, haKindAntiAffinityShort,
+		haKindAntiAffinitySplit, haKindAntiAffinitySkipped, haKindAntiAffinityAmbiguous}
+	for _, rules := range [][]ha.Rule{nil, g.rulesOf([]string{"vm:200", "vm:201"})} {
+		f := aaLayoutFake(g, "block", 2)
+		aaTwoNodePins(f)
+		f.rules = append(f.rules, rules...)
+		wantNone(t, collectHAScoped(context.Background(), f, plain, haDirector, haNow, aaCrossBandScope(t, "a")),
+			layoutKinds...)
+		r := collectHAScoped(context.Background(), f, two, haDirector, haNow, aaCrossBandScope(t, "b"))
+		if rules != nil {
+			want(t, r, haKindAARuleFull, haSeverityProblem, g.rule, "2 members on 2 nodes")
+		}
+	}
+}
+
+// TestCollectAntiAffinityLayoutSplitDefaultsAcrossBands pins that the entries
+// that write a group's rules are found over the whole group, so a group whose
+// members lie in the bands of two entries with different defaults, and whose
+// members named no pattern, gets one advice that names both entries, and
+// neither entry judges its layout with its own default.
+func TestCollectAntiAffinityLayoutSplitDefaultsAcrossBands(t *testing.T) {
+	t.Parallel()
+	g := newAALayoutGroup()
+	cfg := haCfgWith("auto", "none", `,"anti_affinity":"on"`, `,"placement":{"anti_affinity":{"enabled":true}}`)
+	f := aaLayoutFake(g, "", 2)
+	f.rules = g.rulesOf([]string{"vm:200", "vm:201"})
+	advised := 0
+	for _, self := range []string{"a", "b"} {
+		r := collectHAScoped(context.Background(), f, cfg, haDirector, haNow, aaCrossBandScope(t, self, "block", "window:2"))
+		wantNone(t, r, haKindAALayoutDrift, haKindAARuleFull, haKindAAPatternTrimmed)
+		for _, fd := range findings(r, haKindAntiAffinityAmbiguous) {
+			if !strings.Contains(fd.Detail, "a, b") || !strings.Contains(fd.Detail, "window:2") {
+				t.Errorf("entry %s: the advice must name both entries and their defaults: %+v", self, fd)
+			}
+			advised++
+		}
+	}
+	if advised != 1 {
+		t.Errorf("anti_affinity_ambiguous appeared %d times over both entries, want once", advised)
+	}
+}
+
+// TestCollectAntiAffinityLayoutPlacerBelongsToTheGroupsDirector pins that an
+// entry of another Director can't claim a group, though its band holds a
+// member and its AZ map fits the members' pins best. The group's members carry
+// this Director's owner tag, so entry b, which serves another Director, never
+// sees them, and entry a judges the group.
+func TestCollectAntiAffinityLayoutPlacerBelongsToTheGroupsDirector(t *testing.T) {
+	t.Parallel()
+	g := newAALayoutGroup()
+	plain := haCfgWith("auto", "none", `,"anti_affinity":"on"`, `,"placement":{"anti_affinity":{"enabled":true}}`)
+	f := aaLayoutFake(g, "block", 2)
+	aaTwoNodePins(f)
+	for i := range f.guests {
+		f.guests[i].Tags += ";bosh-owner--" + haDirector
+	}
+	sc := aaCrossBandScope(t, "a")
+	sc.Cluster[0].Owner, sc.Cluster[1].Owner = haDirector, "bbbbbbbb-0000"
+	r := collectHAScoped(context.Background(), f, plain, haDirector, haNow, sc)
+	want(t, r, haKindAALayoutDrift, haSeverityProblem, g.rule, "could not be planned")
+}

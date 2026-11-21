@@ -206,10 +206,6 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 	documentUUID := cpiConfigDirectorUUID(data)
 	multi := &haMultiReport{Clusters: []*haReport{}, SharedExports: []haSharedFinding{}}
 	layouts := make([]pve.ClusterVMIDLayout, 0, len(entries))
-	scopes := entryScopes(entries, base)
-	// One ledger serves every entry, so a node one entry found unreachable is
-	// not asked again by the next entry that reaches the same cluster.
-	ledger := newHANodeLedger()
 	owners := make([]string, len(entries))
 	var unowned []string
 	for i := range entries {
@@ -224,6 +220,10 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 			unowned = append(unowned, entries[i].Name)
 		}
 	}
+	scopes := entryScopes(entries, base, owners)
+	// One ledger serves every entry, so a node one entry found unreachable is
+	// not asked again by the next entry that reaches the same cluster.
+	ledger := newHANodeLedger()
 	for i := range entries {
 		report, layout := checkCPIConfigEntry(ctx, &entries[i], base, logger, deps, scopes[i], ledger, owners[i])
 		multi.Clusters = append(multi.Clusters, report)
@@ -418,8 +418,17 @@ type haClusterEntry struct {
 	// AZMap is the entry's placement.az_map, which decides the domain a plan
 	// gives each member that a strict pin confines.
 	AZMap map[string][]string
+	// Owner is the Director UUID the run judges the entry for, or "" when it
+	// knows none.
+	Owner string
 	// Self marks the entry the scope belongs to.
 	Self bool
+}
+
+// holds reports whether g could have been created through the entry: its
+// band holds g's VM ID, and its Director may judge g (see ownerAdmits).
+func (e *haClusterEntry) holds(g *haGuest) bool {
+	return e.Band.Contains(g.ref.VMID) && ownerAdmits(e.Owner, g)
 }
 
 // ambiguous reports whether the entries that share the band disagree on the
@@ -471,7 +480,9 @@ func (s *haEntryScope) policyList() string {
 
 // entryScopes works out the scope of every entry. An entry whose properties do
 // not apply gets nil and is reported as unchecked by its own run.
-func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntryScope {
+// owners holds the Director UUID the run judges each entry for, in the same
+// order, and may be nil when no entry has one.
+func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig, owners []string) []*haEntryScope {
 	type facts struct {
 		key     string
 		host    string
@@ -482,6 +493,7 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntrySco
 		pattern aapattern.Pattern
 		azMap   map[string][]string
 		cfg     *config.CPIConfig
+		owner   string
 	}
 	all := make([]*facts, len(entries))
 	for i := range entries {
@@ -493,6 +505,9 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntrySco
 		all[i] = &facts{
 			key: eff.Host + "|" + band.String(), host: eff.Host, name: entries[i].Name, policy: eff.HALocalPolicyValue(),
 			band: band, aa: antiAffinityWritten(eff), pattern: eff.HAAntiAffinityPatternValue(), cfg: eff,
+		}
+		if i < len(owners) {
+			all[i].owner = owners[i]
 		}
 		if eff.Placement != nil {
 			all[i].azMap = eff.Placement.AZMap
@@ -507,7 +522,8 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntrySco
 		for j, o := range all {
 			if o != nil && o.host == f.host {
 				sc.Cluster = append(sc.Cluster, haClusterEntry{
-					Name: o.name, Band: o.band, AntiAffinity: o.aa, Pattern: o.pattern, AZMap: o.azMap, Self: j == i,
+					Name: o.name, Band: o.band, AntiAffinity: o.aa, Pattern: o.pattern, AZMap: o.azMap, Owner: o.owner,
+					Self: j == i,
 				})
 			}
 			if o == nil || j == i || o.key != f.key {

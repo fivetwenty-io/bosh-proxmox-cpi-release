@@ -2324,7 +2324,7 @@ func TestCollectNoneVMIsNeverAProblemUnderAnotherDirectorsEntries(t *testing.T) 
 		f.memory[vmid] = 4 * haGiB
 		f.configs[vmid] = map[string]any{"cpu": "x86-64-v2-AES", "scsi0": "local-zfs:vm-210511-disk-0,size=10G"}
 		f.resources = nil
-		scopes := entryScopes(entries, base)
+		scopes := entryScopes(entries, base, nil)
 		return collectHAScoped(context.Background(), f, haCfg("auto", policy), "", haNow, scopes[i])
 	}
 	entries := []cpiConfigEntry{
@@ -2354,7 +2354,7 @@ func TestEntryScopesGroupEntriesByClusterAndBand(t *testing.T) {
 		{Name: "az2-none", Type: "pve", Properties: map[string]any{"pve_ha": map[string]any{"local_policy": "none"}}},
 		{Name: "far", Type: "pve", Properties: map[string]any{"pve_vmid_range_start": 5000, "pve_vmid_range_end": 5999}},
 	}
-	got := entryScopes(entries, base)
+	got := entryScopes(entries, base, nil)
 	if got[0] == nil || got[1] == nil || got[2] == nil {
 		t.Fatalf("scopes = %+v, want one for each entry", got)
 	}
@@ -2447,7 +2447,7 @@ func TestEntryScopesRecordWhichEntriesWriteAntiAffinityRules(t *testing.T) {
 		{Name: "az2-p4", Type: "pve", Properties: map[string]any{"pve_ha": map[string]any{"anti_affinity": "off"}}},
 		{Name: "far", Type: "pve", Properties: map[string]any{"pve_vmid_range_start": 5000, "pve_vmid_range_end": 5999}},
 	}
-	got := entryScopes(entries, base)
+	got := entryScopes(entries, base, nil)
 	if !got[0].antiAffinityAmbiguous() || !got[1].antiAffinityAmbiguous() {
 		t.Errorf("scopes = %+v %+v, want both ambiguous", got[0], got[1])
 	}
@@ -2477,7 +2477,7 @@ func TestEntryScopesListEveryEntryOnTheCluster(t *testing.T) {
 		{Name: "elsewhere", Type: "pve", Properties: map[string]any{"pve_host": "pve-other.test.local",
 			"pve_api_token": "root@pam!cpi=other-token"}},
 	}
-	got := entryScopes(entries, base)
+	got := entryScopes(entries, base, nil)
 	if got[0] == nil || got[0].Name != "az2" {
 		t.Fatalf("first scope = %+v, want one named az2", got[0])
 	}

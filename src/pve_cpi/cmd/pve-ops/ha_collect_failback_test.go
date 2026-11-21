@@ -284,7 +284,7 @@ func TestCollectFailbackLeavesAFlagAPeerEntryWrites(t *testing.T) {
 		{Name: "az2-nofb", Type: "pve", Properties: map[string]any{"pve_ha": map[string]any{"failback": false}}},
 	}
 	base := haCfg("auto", "none")
-	scopes := entryScopes(entries, base)
+	scopes := entryScopes(entries, base, nil)
 	run := func(i int, flag *bool) *haReport {
 		eff, _, _, err := config.ApplyContextOverrides(base, entries[i].Properties)
 		if err != nil {
@@ -307,7 +307,7 @@ func TestCollectFailbackLeavesAFlagAPeerEntryWrites(t *testing.T) {
 		}
 		f := haBaseFake()
 		f.resources[0].Failback = flag
-		return collectHAScoped(context.Background(), f, eff, "", haNow, entryScopes(entries[i:i+1], base)[0])
+		return collectHAScoped(context.Background(), f, eff, "", haNow, entryScopes(entries[i:i+1], base, nil)[0])
 	}
 	want(t, alone(0, failbackRow(false)), haKindFailbackDrift, haSeverityAdvice, "vm:100", "failback off")
 	want(t, alone(1, failbackRow(true)), haKindFailbackDrift, haSeverityAdvice, "vm:100", "pve.ha.failback is false")
