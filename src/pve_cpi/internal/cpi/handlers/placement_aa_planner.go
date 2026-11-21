@@ -851,7 +851,7 @@ func (p *aaPlanner) logLayout(in aapattern.Input, out aapattern.Output) {
 				rule, pattern, log.String("domain", aaDomainLabel(dk)))
 		}
 	}
-	p.logMembers(out, rule, joining)
+	p.logMembers(in, out, rule, joining)
 }
 
 // aloneRule names the rule the layout put sid in alone, or falls back to the
@@ -866,10 +866,10 @@ func aloneRule(out aapattern.Output, sid string, fallback log.Field) log.Field {
 // logMembers says once per member why the plan left it out of the rules. The
 // members that no rule has room for share one line, with their count and the
 // lowest index among them, because skip leaves out most of a large group.
-func (p *aaPlanner) logMembers(out aapattern.Output, rule, joining log.Field) {
+func (p *aaPlanner) logMembers(in aapattern.Input, out aapattern.Output, rule, joining log.Field) {
 	if len(out.Overflow) > 0 && p.once("overflow") {
 		fields := []log.Field{log.Int("count", len(out.Overflow))}
-		if lowest := p.lowestIndex(out.Overflow); lowest >= 0 {
+		if lowest := lowestIndex(in.Members, out.Overflow); lowest >= 0 {
 			fields = append(fields, log.Int("lowest_index", lowest))
 		}
 		fields = append(fields, log.String("sids", capJoin(slices.Sorted(slices.Values(out.Overflow)), ",")),
@@ -909,11 +909,13 @@ func (p *aaPlanner) logMembers(out aapattern.Output, rule, joining log.Field) {
 	}
 }
 
-// lowestIndex returns the lowest instance index among sids in the last
-// plan's input, or -1 when none of them has one.
-func (p *aaPlanner) lowestIndex(sids []string) int {
+// lowestIndex returns the lowest instance index among the members keyed in
+// sids, or -1 when none of them has one. It reads the members of the plan
+// being logged, not the planner's last input, so the log line does not depend
+// on when the plan records its input.
+func lowestIndex(members []aapattern.Member, sids []string) int {
 	lowest := -1
-	for _, m := range p.lastIn.Members {
+	for _, m := range members {
 		if m.Index >= 0 && (lowest < 0 || m.Index < lowest) && slices.Contains(sids, m.Key) {
 			lowest = m.Index
 		}
