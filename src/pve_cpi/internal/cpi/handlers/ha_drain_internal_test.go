@@ -724,6 +724,60 @@ func TestDrainRun_ApplyRefusesAfterTheMaintenanceWait(t *testing.T) {
 	}
 }
 
+// The wait only gives PVE time to report the maintenance state, so a refusal
+// that no PVE report can change, such as a node with no health entry, ends it
+// at once.
+func TestDrainRun_TheMaintenanceWaitEndsAtOnceWhenTheNodeHasNoHealthEntry(t *testing.T) {
+	t.Parallel()
+	for _, command := range []string{DrainCommand, UndrainCommand} {
+		f := newFakeRebalanceIO()
+		drHold(f, 102)
+		f.profileVal.Health.Nodes = f.profileVal.Health.Nodes[1:]
+		r := drRun(f, command, true)
+		r.maintWait = 90 * time.Second
+		var rep DrainReport
+		if command == DrainCommand {
+			rep = r.drain(context.Background())
+		} else {
+			rep = r.undrain(context.Background())
+		}
+		if rep.ExitCode != RebalanceExitGate || rep.Halted != RebalanceGateMaintenance {
+			t.Fatalf("%s: exit %d halted %q", command, rep.ExitCode, rep.Halted)
+		}
+		if g := drGate(t, rep.Gates); !strings.Contains(g.Detail, "has no health entry") {
+			t.Fatalf("%s: gate %+v", command, g)
+		}
+		if got := f.callsWith("sleep"); len(got) != 0 {
+			t.Fatalf("%s waited on a refusal no PVE report can change: %v", command, got)
+		}
+	}
+}
+
+// The polls of one wait share a read of each node's notes, and the read that
+// decides the run after the wait asks the notes again.
+func TestDrainRun_TheMaintenanceWaitReadsTheNotesOnce(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	drHold(f, 102)
+	var cached []bool
+	f.profileHook = func(ctx context.Context) {
+		cached = append(cached, pve.WithNodeNotesCache(ctx) == ctx)
+	}
+	f.observeHook = func(n int) {
+		if n == 3 {
+			drMaintenance(f)
+		}
+	}
+	r := drRun(f, DrainCommand, true)
+	r.maintWait = 90 * time.Second
+	if rep := r.drain(context.Background()); rep.ExitCode != RebalanceExitOK {
+		t.Fatalf("exit %d halted %q", rep.ExitCode, rep.Halted)
+	}
+	if len(cached) < 4 || !cached[0] || !cached[1] || !cached[2] || cached[3] {
+		t.Fatalf("the wait's three reads must share a notes cache and the run's read must not: %v", cached)
+	}
+}
+
 func TestDrainRun_TheMaintenanceWaitStopsOnInterrupt(t *testing.T) {
 	t.Parallel()
 	f := newFakeRebalanceIO()

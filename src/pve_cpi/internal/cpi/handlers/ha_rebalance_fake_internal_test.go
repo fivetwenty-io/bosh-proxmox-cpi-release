@@ -87,6 +87,8 @@ type fakeRebalanceIO struct {
 	beforeMigrate func(vmid int)
 	// observeHook runs before each snapshot with its count, from 1.
 	observeHook func(n int)
+	// profileHook runs on each profile read with the read's context.
+	profileHook func(ctx context.Context)
 	snapshots   int
 	unmarks     []string
 	pinWrites   []string
@@ -228,7 +230,12 @@ func (f *fakeRebalanceIO) runLock(_ context.Context, ttl time.Duration) (func(),
 	}, nil
 }
 
-func (f *fakeRebalanceIO) profile(context.Context) (*ha.Profile, error) { return f.profileVal, nil }
+func (f *fakeRebalanceIO) profile(ctx context.Context) (*ha.Profile, error) {
+	if f.profileHook != nil {
+		f.profileHook(ctx)
+	}
+	return f.profileVal, nil
+}
 
 func (f *fakeRebalanceIO) resource(vmid int) *sdkcluster.GetHaResourcesResponse {
 	v := f.vms[vmid]

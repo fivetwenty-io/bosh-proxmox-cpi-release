@@ -463,18 +463,21 @@ func maintenanceReads(e *pve.NodeHealthEntry) string {
 // did, which is the enable for a drain and the disable for an undrain. It runs
 // before the run takes any lock or writes any record, polls on the gates'
 // own reads, and returns once the maintenance gate passes, once another gate
-// refuses, or once the wait runs out. In each case the caller goes on and
-// reaches its own verdict. It returns false, with the report halted, when a
+// refuses, or once the gate refuses for a reason no PVE report can change, or
+// once the wait runs out. In each case the caller goes on and reaches its own
+// verdict from a fresh read. It returns false, with the report halted, when a
 // read failed or the run was interrupted. A dry run, and a wait of zero, return
-// at once.
+// at once. The polls share one read of each node's notes, because the wait
+// watches PVE's maintenance state and not the notes.
 func (r *drainRun) awaitMaintenance(ctx context.Context) bool {
 	if !r.apply || r.maintWait <= 0 {
 		return true
 	}
 	undrain := r.report.Command == UndrainCommand
 	deadline := r.io.now().Add(r.maintWait)
+	pollCtx := pve.WithNodeNotesCache(ctx)
 	for {
-		view, err := r.observe(ctx)
+		view, err := r.observe(pollCtx)
 		if err != nil {
 			r.readFailed(ctx, err)
 			return false
@@ -496,8 +499,9 @@ func (r *drainRun) awaitMaintenance(ctx context.Context) bool {
 
 // onlyMaintenanceRefuses reports whether the maintenance gate is the one gate
 // that refuses, and PVE still reports what the operator's command should have
-// changed. An undrain waits only for PVE's own maintenance to end, because an
-// operator tag stays until the operator removes it.
+// changed. A drain waits only while the node's health entry shows PVE's own
+// maintenance off, and an undrain only while it shows it on, because a missing
+// entry or an operator tag doesn't change while PVE catches up.
 func (r *drainRun) onlyMaintenanceRefuses(view *drainView, undrain bool) bool {
 	refusing := 0
 	for i := range view.gates {
@@ -513,11 +517,11 @@ func (r *drainRun) onlyMaintenanceRefuses(view *drainView, undrain bool) bool {
 	if refusing != 1 {
 		return false
 	}
-	if !undrain {
-		return true
-	}
 	e := healthEntry(view.profile.Health, r.node)
-	return e != nil && pveMaintenance(e)
+	if e == nil {
+		return false
+	}
+	return pveMaintenance(e) == undrain
 }
 
 // maintenanceGate reads the named node's maintenance. A drain needs the node
