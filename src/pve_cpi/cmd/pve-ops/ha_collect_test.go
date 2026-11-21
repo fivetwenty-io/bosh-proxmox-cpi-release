@@ -2354,7 +2354,9 @@ func TestEntryScopesListEveryEntryOnTheCluster(t *testing.T) {
 	entries := []cpiConfigEntry{
 		{Name: "az2", Type: "pve", Properties: map[string]any{}},
 		{Name: "az2-window", Type: "pve", Properties: map[string]any{
-			"pve_ha": map[string]any{"anti_affinity_pattern": map[string]any{"window": 2}}}},
+			"pve_ha": map[string]any{"anti_affinity_pattern": map[string]any{"window": 2}},
+			"pve_placement": map[string]any{"anti_affinity": map[string]any{"enabled": true},
+				"az_map": map[string]any{"two": []any{"n1", "n2"}}}}},
 		{Name: "far", Type: "pve", Properties: map[string]any{"pve_vmid_range_start": 5000, "pve_vmid_range_end": 5999,
 			"pve_ha": map[string]any{"anti_affinity": "off"}}},
 		{Name: "elsewhere", Type: "pve", Properties: map[string]any{"pve_host": "pve-other.test.local",
@@ -2383,6 +2385,9 @@ func TestEntryScopesListEveryEntryOnTheCluster(t *testing.T) {
 	}
 	if far.Band.Start != 5000 || far.Band.End != 5999 {
 		t.Errorf("far band = %s, want 5000-5999", far.Band)
+	}
+	if len(self.AZMap) != 0 || strings.Join(window.AZMap["two"], ",") != "n1,n2" {
+		t.Errorf("az maps = %v %v, want none and two: n1, n2", self.AZMap, window.AZMap)
 	}
 	if got[3] == nil || len(got[3].Cluster) != 1 || !got[3].Cluster[0].Self {
 		t.Errorf("elsewhere scope = %+v, want only itself on its cluster", got[3])

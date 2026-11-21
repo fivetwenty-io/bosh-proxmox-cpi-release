@@ -1126,16 +1126,10 @@ func placeableAmong(p *ha.Profile, nodes []string) int {
 // going to the AZ whose name sorts first. Every other member is in the
 // cluster's domain, "".
 func (t aaTopology) domainOf(set *ha.RuleSet, sid, owner string) string {
-	vmid, ok := vmidFromSid(sid)
-	if !ok || set == nil || len(t.azs) == 0 {
+	if len(t.azs) == 0 {
 		return ""
 	}
-	pin := set.Find(naRuleNameFor(vmid))
-	if pin == nil || pin.Type != ha.RuleTypeNodeAffinity || !pin.Strict || pin.Disabled ||
-		haOwnershipOf(pin.Comment, owner) != haOwnedByUs {
-		return ""
-	}
-	nodes := pin.NodeNames()
+	nodes := strictPinNodes(set, sid, owner)
 	if len(nodes) == 0 {
 		return ""
 	}
@@ -1152,6 +1146,21 @@ func (t aaTopology) domainOf(set *ha.RuleSet, sid, owner string) string {
 		return ""
 	}
 	return t.azs[best].name
+}
+
+// strictPinNodes returns the nodes of the member sid's strict pin when owner
+// owns the pin and PVE has it enabled, or nil.
+func strictPinNodes(set *ha.RuleSet, sid, owner string) []string {
+	vmid, ok := vmidFromSid(sid)
+	if !ok || set == nil {
+		return nil
+	}
+	pin := set.Find(naRuleNameFor(vmid))
+	if pin == nil || pin.Type != ha.RuleTypeNodeAffinity || !pin.Strict || pin.Disabled ||
+		haOwnershipOf(pin.Comment, owner) != haOwnedByUs {
+		return nil
+	}
+	return pin.NodeNames()
 }
 
 // domains returns the layout's view of each domain keyed in keys. N is the

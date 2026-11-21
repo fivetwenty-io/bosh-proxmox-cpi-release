@@ -349,6 +349,9 @@ type haClusterEntry struct {
 	// Pattern is its pve.ha.anti_affinity_pattern default.
 	AntiAffinity bool
 	Pattern      aapattern.Pattern
+	// AZMap is the entry's placement.az_map, which decides the domain a plan
+	// gives each member that a strict pin confines.
+	AZMap map[string][]string
 	// Self marks the entry the scope belongs to.
 	Self bool
 }
@@ -411,6 +414,7 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntrySco
 		aa      bool
 		band    pve.VMIDBand
 		pattern aapattern.Pattern
+		azMap   map[string][]string
 	}
 	all := make([]*facts, len(entries))
 	for i := range entries {
@@ -423,6 +427,9 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntrySco
 			key: eff.Host + "|" + band.String(), host: eff.Host, name: entries[i].Name, policy: eff.HALocalPolicyValue(),
 			band: band, aa: antiAffinityWritten(eff), pattern: eff.HAAntiAffinityPatternValue(),
 		}
+		if eff.Placement != nil {
+			all[i].azMap = eff.Placement.AZMap
+		}
 	}
 	out := make([]*haEntryScope, len(entries))
 	for i, f := range all {
@@ -433,7 +440,7 @@ func entryScopes(entries []cpiConfigEntry, base *config.CPIConfig) []*haEntrySco
 		for j, o := range all {
 			if o != nil && o.host == f.host {
 				sc.Cluster = append(sc.Cluster, haClusterEntry{
-					Name: o.name, Band: o.band, AntiAffinity: o.aa, Pattern: o.pattern, Self: j == i,
+					Name: o.name, Band: o.band, AntiAffinity: o.aa, Pattern: o.pattern, AZMap: o.azMap, Self: j == i,
 				})
 			}
 			if o == nil || j == i || o.key != f.key {

@@ -693,9 +693,6 @@ func (c *haCollector) antiAffinityFindings() {
 	if !mixed && !c.antiAffinityWrites() {
 		return
 	}
-	if mixed && !c.scope.Leader {
-		return
-	}
 	groups := map[string][]*haGuest{}
 	for _, g := range c.guests {
 		if !g.owned || !c.judgesVM(g) {
@@ -715,10 +712,14 @@ func (c *haCollector) antiAffinityFindings() {
 	}
 	sort.Strings(tags)
 	defaults, split := c.groupDefaults(groups, tags)
-	planned := c.layoutChecks(defaults)
+	checks := c.layoutChecks(defaults)
 	unjudged := false
 	for _, tag := range tags {
-		if chk, ok := planned[tag]; ok {
+		chk, planned := checks[tag]
+		if !c.judgesGroup(groups[tag], chk.Owner, mixed) {
+			continue
+		}
+		if planned {
 			if owners, ok := split[tag]; ok && !chk.PatternRecorded && chk.Problem == "" {
 				c.adviseSplitDefaults(tag, chk.Group, owners)
 				continue
@@ -739,6 +740,54 @@ func (c *haCollector) antiAffinityFindings() {
 				"so the doctor cannot tell which groups with no rule should have one and does not judge them",
 			c.scope.peerList())
 	}
+}
+
+// judgesGroup reports whether this run judges a group. Under --cpi-config a
+// group belongs to the entry that placed it, which groupPlacer finds, and only
+// that entry's run judges it, because entries that share a cluster can map
+// AZs differently and so plan one group over different nodes. A group with no
+// such entry is judged by every entry of the band when the entries agree on
+// whether they write rules, and otherwise only by the band's first entry.
+// owner is the Director the group's marker names, or "".
+func (c *haCollector) judgesGroup(members []*haGuest, owner string, mixed bool) bool {
+	if c.scope == nil {
+		return true
+	}
+	if placer, ok := c.groupPlacer(members, owner); ok {
+		return placer.Self
+	}
+	return !mixed || c.scope.Leader
+}
+
+// groupPlacer returns the entry whose placement a group belongs to, from the
+// group's owners (see groupOwners). It is the owner whose AZ map holds the
+// strict pins of the most members, with ties going to the owner whose AZs
+// that hold them are smallest, the way a plan picks a member's domain, and
+// then to the first in cpi-config order. A pin is read as the Director's
+// that owner names, or the run's own when the marker names none. It returns
+// false when the group has no owner.
+func (c *haCollector) groupPlacer(members []*haGuest, owner string) (haClusterEntry, bool) {
+	owners := groupOwners(c.scope.Cluster, members)
+	if len(owners) == 0 {
+		return haClusterEntry{}, false
+	}
+	if owner == "" {
+		owner = c.owner
+	}
+	set := &ha.RuleSet{Rules: c.rules}
+	sids := make([]string, 0, len(members))
+	for _, g := range members {
+		sids = append(sids, g.sid)
+	}
+	best := 0
+	bestMisses, bestWidth := handlers.AntiAffinityPlacementFit(owners[0].AZMap, set, owner, sids)
+	for i := 1; i < len(owners); i++ {
+		misses, width := handlers.AntiAffinityPlacementFit(owners[i].AZMap, set, owner, sids)
+		if misses < bestMisses || misses == bestMisses && width < bestWidth {
+			best, bestMisses, bestWidth = i, misses, width
+		}
+	}
+	return owners[best], true
 }
 
 // groupDefaults returns the default pattern each group is planned with under

@@ -250,3 +250,53 @@ func TestFixAntiAffinityGroups_StampsThePatternOfAGroupThatRecordsNone(t *testin
 		t.Fatalf("check = %+v; want the stamped pattern counted as recorded", got[0])
 	}
 }
+
+// strictPin adds the strict pin of this Director that confines v to nodes.
+func (f *aaCheckFixture) strictPin(v int, nodes ...string) {
+	pin := ha.Rule{ID: naRuleNameFor(v), Type: ha.RuleTypeNodeAffinity, Strict: true,
+		Resources: []string{haResourceSid(v)}, Nodes: map[string]int{}, Comment: aaIdent("web").marker()}
+	for i, n := range nodes {
+		pin.Nodes[n] = 1
+		if i == 0 {
+			pin.Nodes[n] = 2
+		}
+	}
+	f.in.Rules.Rules = append(f.in.Rules.Rules, pin)
+}
+
+// TestCheckAntiAffinityGroups_PinsThatLeaveARuleNoFreeNodeAreNotPlanned pins
+// that a config whose AZ map holds none of the members' strict pins does not
+// plan a rule those pins would fill. Two members pinned to two of three nodes
+// would form a rule of two over the cluster's domain, which leaves no node
+// free for a drain, so the check reports a problem instead of drift and the
+// fix writes nothing. The config whose AZ map holds the pins plans no rule
+// over the two-node AZ, and a member that only one of its partners' pins
+// confines still joins its rule as before.
+func TestCheckAntiAffinityGroups_PinsThatLeaveARuleNoFreeNodeAreNotPlanned(t *testing.T) {
+	t.Parallel()
+	f := newAACheckFixture(t, 3, "block", 100, 101)
+	f.strictPin(100, "pve1", "pve2")
+	f.strictPin(101, "pve2", "pve1")
+	c := oneCheck(t, f.in)
+	for _, part := range []string{aaRule, "vm:100, vm:101", "pve1, pve2", "placement.az_map", "another cpis entry"} {
+		if !strings.Contains(c.Problem, part) {
+			t.Fatalf("problem = %q; want it to name %q", c.Problem, part)
+		}
+	}
+	if len(c.Drift) != 0 {
+		t.Fatalf("drift = %v; want no write planned", c.Drift)
+	}
+
+	f.in.Config.Placement.AZMap = map[string][]string{"two": {"pve1", "pve2"}}
+	c = oneCheck(t, f.in)
+	if c.Problem != "" || len(c.Drift) != 0 || len(c.Layout) != 0 {
+		t.Fatalf("check = %+v; want no rule and nothing to write over the two-node AZ", c)
+	}
+
+	f = newAACheckFixture(t, 3, "block", 100, 101)
+	f.strictPin(100, "pve1")
+	c = oneCheck(t, f.in)
+	if c.Problem != "" || len(c.Drift) == 0 || !strings.Contains(c.Drift[len(c.Drift)-1], "vm:100,vm:101") {
+		t.Fatalf("check = %+v; want the rule of both members planned", c)
+	}
+}

@@ -128,17 +128,27 @@ func aaEntryScope(t *testing.T, writes bool) *haEntryScope {
 }
 
 // TestCollectAntiAffinityLayoutUsesTheOwningEntrysDefault pins that under
-// --cpi-config a group whose members named no pattern is planned with the
-// default of the entry that writes its rules. The run's own entry writes
-// none, and the entry that shares its band writes rules with window:2, so
-// the plan of six members on three nodes trims that window.
+// --cpi-config a group whose members named no pattern is judged by the entry
+// that writes its rules, with that entry's default. The run of az2, which
+// writes none, leaves the group alone. The run of az2-window, which shares
+// its band and writes rules with window:2, plans the six members on three
+// nodes with that window and trims it, though the run's own config keeps the
+// block default and az2-window is not the band's first entry.
 func TestCollectAntiAffinityLayoutUsesTheOwningEntrysDefault(t *testing.T) {
 	t.Parallel()
 	g := newAALayoutGroup()
 	f := aaLayoutFake(g, "", 6)
 	f.rules = g.rulesOf([]string{"vm:200", "vm:201"}, []string{"vm:202", "vm:203"}, []string{"vm:204", "vm:205"})
-	cfg := haCfgWith("auto", "none", `,"anti_affinity":"off"`, `,"placement":{"anti_affinity":{"enabled":true}}`)
-	r := collectHAScoped(context.Background(), f, cfg, "", haNow, aaEntryScope(t, false))
+	off := haCfgWith("auto", "none", `,"anti_affinity":"off"`, `,"placement":{"anti_affinity":{"enabled":true}}`)
+	r := collectHAScoped(context.Background(), f, off, "", haNow, aaEntryScope(t, false))
+	wantNone(t, r, haKindAAPatternTrimmed, haKindAALayoutDrift, haKindAARuleFull)
+
+	sc := aaEntryScope(t, false)
+	sc.Name, sc.AntiAffinity, sc.Leader = "az2-window", true, false
+	sc.Peers, sc.PeerAntiAffinity = []string{"az2"}, []bool{false}
+	sc.Cluster[0].Self, sc.Cluster[1].Self = false, true
+	on := haCfgWith("auto", "none", `,"anti_affinity":"on"`, `,"placement":{"anti_affinity":{"enabled":true}}`)
+	r = collectHAScoped(context.Background(), f, on, "", haNow, sc)
 	want(t, r, haKindAAPatternTrimmed, haSeverityAdvice, g.rule, "window:2")
 }
 
@@ -194,4 +204,77 @@ func TestCollectAntiAffinityLayoutLiveHoldReadsClean(t *testing.T) {
 	f.rules[0].Comment += " hold=2.299@4000000000"
 	wantNone(t, runCollect(t, f, haCfg("auto", "none")), haKindAAHoldLapsed, haKindAALayoutDrift,
 		haKindAARuleFull)
+}
+
+// aaTwoNodeScope is the scope of one of three entries that share a cluster
+// and a VM ID band, the way the lab's cpi-config lays them out. The first
+// entry has no AZ map, the second writes no anti-affinity rules, and the third
+// maps its one AZ to the nodes n1 and n2. self names the entry the run serves.
+func aaTwoNodeScope(self string) *haEntryScope {
+	band := pve.VMIDBand{Start: 200, End: 299}
+	entries := []haClusterEntry{
+		{Name: "az2", Band: band, AntiAffinity: true, Pattern: aapattern.Default()},
+		{Name: "az2-soft", Band: band, AntiAffinity: false, Pattern: aapattern.Default()},
+		{Name: "az2-two", Band: band, AntiAffinity: true, Pattern: aapattern.Default(),
+			AZMap: map[string][]string{"p9two": {"n1", "n2"}}},
+	}
+	sc := &haEntryScope{Name: self, Band: band, Policy: "none", Leader: self == "az2"}
+	for i := range entries {
+		if entries[i].Name == self {
+			entries[i].Self = true
+			sc.AntiAffinity = entries[i].AntiAffinity
+			continue
+		}
+		sc.Peers = append(sc.Peers, entries[i].Name)
+		sc.PeerPolicies = append(sc.PeerPolicies, "none")
+		sc.PeerAntiAffinity = append(sc.PeerAntiAffinity, entries[i].AntiAffinity)
+	}
+	sc.Cluster = entries
+	return sc
+}
+
+// aaTwoNodePins gives each member of the fake the strict AZ pin the entry
+// with the two-node AZ writes, which names n1 and n2 and ranks the member's
+// own node first.
+func aaTwoNodePins(f *fakeHA) {
+	for _, g := range f.guests {
+		nodes := map[string]int{"n1": 1, "n2": 1}
+		nodes[g.Node] = 2
+		f.rules = append(f.rules, ha.Rule{ID: "bosh-na-" + strconv.Itoa(g.VMID), Type: "node-affinity",
+			Strict: true, Nodes: nodes, Resources: []string{"vm:" + strconv.Itoa(g.VMID)},
+			Comment: haMarker + " deployment=- group=-"})
+	}
+}
+
+// TestCollectAntiAffinityLayoutJudgesAGroupByTheEntryThatPlacedIt pins that
+// under --cpi-config a group is judged only by the entry whose AZ map holds
+// its members' strict pins. Two members pinned to the two-node AZ of az2-two
+// get no rule there, so az2, which has no AZ map and would plan the group
+// over the cluster's three nodes, does not judge it and reports no drift, and
+// az2-two does judge it, though it is not the first entry of the band, and
+// reports a full rule the two-node AZ cannot hold.
+func TestCollectAntiAffinityLayoutJudgesAGroupByTheEntryThatPlacedIt(t *testing.T) {
+	t.Parallel()
+	g := newAALayoutGroup()
+	plain := haCfgWith("auto", "none", `,"anti_affinity":"on"`, `,"placement":{"anti_affinity":{"enabled":true}}`)
+	two := haCfgWith("auto", "none", `,"anti_affinity":"on"`,
+		`,"placement":{"anti_affinity":{"enabled":true},"az_map":{"p9two":["n1","n2"]}}`)
+	layoutKinds := []string{haKindAALayoutDrift, haKindAARuleFull, haKindAAPatternTrimmed, haKindAntiAffinityShort,
+		haKindAntiAffinitySplit, haKindAntiAffinitySkipped, haKindAntiAffinityAmbiguous}
+
+	f := aaLayoutFake(g, "block", 2)
+	aaTwoNodePins(f)
+	wantNone(t, collectHAScoped(context.Background(), f, plain, haDirector, haNow, aaTwoNodeScope("az2")),
+		layoutKinds...)
+	wantNone(t, collectHAScoped(context.Background(), f, two, haDirector, haNow, aaTwoNodeScope("az2-two")),
+		layoutKinds...)
+
+	f = aaLayoutFake(g, "block", 2)
+	aaTwoNodePins(f)
+	f.rules = append(f.rules, g.rulesOf([]string{"vm:200", "vm:201"})...)
+	wantNone(t, collectHAScoped(context.Background(), f, plain, haDirector, haNow, aaTwoNodeScope("az2")),
+		layoutKinds...)
+	r := collectHAScoped(context.Background(), f, two, haDirector, haNow, aaTwoNodeScope("az2-two"))
+	want(t, r, haKindAARuleFull, haSeverityProblem, g.rule, "2 members on 2 nodes")
+	want(t, r, haKindAALayoutDrift, haSeverityAdvice, g.rule, "delete "+g.rule)
 }

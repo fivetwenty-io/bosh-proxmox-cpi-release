@@ -186,6 +186,10 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 	c.Trimmed = slices.Clone(p.lastOut.Trimmed)
 	c.BlocksDrain = p.lastOut.Unsafe
 	c.Layout = p.lastOut.Rules
+	if reason := confinedLayoutRule(set, ident.Owner, p.lastIn, p.lastOut); reason != "" {
+		c.Problem = reason
+		return c
+	}
 	for i := range ops {
 		switch id := ops[i].Rule.ID; {
 		case p.stampOnly[id]:
@@ -203,6 +207,75 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 	}
 	c.Full = fullGroupRules(set, ident, p.lastIn)
 	return c
+}
+
+// confinedLayoutRule returns why a plan's layout cannot be judged under the
+// config it was planned with, or "". That is so when a rule of the cluster's
+// domain names only members whose strict pins of owner leave them, between
+// them, no more nodes than the rule has members. No AZ of placement.az_map
+// holds those pins, or the members would be in that AZ's domain, so the plan
+// counts the cluster's nodes where the members may run on fewer, and the rule
+// would leave no node free while one of them drains. Entries of a cpi-config
+// that share a cluster can map AZs differently, and such a group was most
+// likely placed by an entry whose az_map holds the pins, which plans it over
+// that AZ's nodes. The check reports the group as not planned, so neither the
+// doctor's drift nor the fix acts on a layout that entry leaves out on purpose.
+func confinedLayoutRule(set *ha.RuleSet, owner string, in aapattern.Input, out aapattern.Output) string {
+	domainOf := make(map[string]string, len(in.Members))
+	for _, m := range in.Members {
+		domainOf[m.Key] = m.Domain
+	}
+	for _, rule := range slices.Sorted(maps.Keys(out.Rules)) {
+		sids := out.Rules[rule]
+		if len(sids) < 2 {
+			continue
+		}
+		nodes := map[string]bool{}
+		confined := true
+		for _, sid := range sids {
+			pinned := strictPinNodes(set, sid, owner)
+			if d, ok := domainOf[sid]; !ok || d != "" || len(pinned) == 0 {
+				confined = false
+				break
+			}
+			for _, n := range pinned {
+				nodes[n] = true
+			}
+		}
+		if !confined || len(nodes) > len(sids) {
+			continue
+		}
+		return fmt.Sprintf("the plan puts %s in rule %s, but their strict pins leave them only the nodes %s, so the "+
+			"rule would leave no node free while one of them drains. No AZ of placement.az_map holds those nodes, so "+
+			"the group was most likely placed by another cpis entry whose az_map does; check and fix the group with "+
+			"that entry's request or under --cpi-config", strings.Join(sids, ", "), rule,
+			strings.Join(slices.Sorted(maps.Keys(nodes)), ", "))
+	}
+	return ""
+}
+
+// AntiAffinityPlacementFit reports how well an AZ map explains the strict
+// pins of a group's members, the way a plan resolves each member's domain.
+// misses counts the members whose strict pin of owner names nodes that no AZ
+// of azMap holds, and width adds up the nodes of the smallest AZ that holds
+// each other pinned member's pin. A member with no such pin counts in
+// neither. The doctor reads it under --cpi-config to find the entry whose
+// placement a group belongs to.
+func AntiAffinityPlacementFit(azMap map[string][]string, set *ha.RuleSet, owner string, sids []string,
+) (misses, width int) {
+	topo := newAATopology(&config.CPIConfig{Placement: &config.PlacementConfig{AZMap: azMap}}, nil)
+	for _, sid := range sids {
+		if len(strictPinNodes(set, sid, owner)) == 0 {
+			continue
+		}
+		dk := topo.domainOf(set, sid, owner)
+		if dk == "" {
+			misses++
+			continue
+		}
+		width += len(azMap[dk])
+	}
+	return misses, width
 }
 
 // fullGroupRules returns the group's rules that hold as many members as the
