@@ -327,6 +327,38 @@ func TestUndrainRun_RefusesWhileTheNodeIsInMaintenance(t *testing.T) {
 	}
 }
 
+// A node whose notes could not be read might still carry the maintenance
+// marker, so the undrain refuses with the gate's exit and starts nothing, even
+// with PVE HA maintenance off and the rebalance skipped.
+func TestUndrainRun_RefusesWhenTheNodesNotesCannotBeRead(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	drStopped(f, 102, "pve01")
+	e := &f.profileVal.Health.Nodes[0]
+	e.Placeable, e.NotesUnread = false, true
+	e.Reason = "its notes could not be read to check them for a maintenance tag: 595 no route to host"
+	f.profileVal.Health.NotesErr = errors.New("node health: read node notes: node pve01: 595 no route to host")
+	r := drRun(f, UndrainCommand, true)
+	r.noRebalance = true
+	rep := r.undrain(context.Background())
+	if rep.ExitCode != RebalanceExitGate || rep.Halted != RebalanceGateMaintenance {
+		t.Fatalf("exit %d halted %q", rep.ExitCode, rep.Halted)
+	}
+	if g := drGate(t, rep.Gates); g.OK || !strings.Contains(g.Detail, "notes could not be read") ||
+		!strings.Contains(g.Detail, "595 no route to host") || !strings.Contains(g.Detail, "run the undrain again") {
+		t.Fatalf("gate %+v", g)
+	}
+	if len(f.callsWith("start ")) != 0 || f.vms[102].state != "stopped" {
+		t.Fatal("an undrain that could not read the node's notes started a VM")
+	}
+
+	// A dry run reports it and passes, as it does for every maintenance state.
+	if g := maintenanceGate(f.profileVal, "pve01", false, true); !g.OK ||
+		!strings.HasPrefix(g.Detail, "for --apply") || !strings.Contains(g.Detail, "notes could not be read") {
+		t.Fatalf("dry undrain gate %+v", g)
+	}
+}
+
 func TestUndrainRun_StartsTheTokenedVMsAndThenRebalances(t *testing.T) {
 	t.Parallel()
 	f := newFakeRebalanceIO()

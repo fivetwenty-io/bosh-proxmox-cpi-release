@@ -3277,15 +3277,15 @@ We run the same command again with `--apply`. A drain rerun lists the VMs that a
 
 **Symptom**
 
-`pve-ops ha undrain <node> --apply` exits with 3, and its output shows a `REFUSED:` gate line that says either that the node is still in HA maintenance, with the command `ha-manager crm-command node-maintenance disable <node>`, or that the node's notes still carry a maintenance tag and the tag has to come out of the notes first.
+`pve-ops ha undrain <node> --apply` exits with 3, and its output shows a `REFUSED:` gate line that says either that the node is still in HA maintenance, with the command `ha-manager crm-command node-maintenance disable <node>`, or that the node's notes still carry a maintenance tag and the tag has to come out of the notes first. A third form says that the node's notes could not be read, and it names the error.
 
 **Cause**
 
-The undrain starts VMs that the drain stopped and then lets the rebalance place VMs, and it does neither on a node that PVE still treats as in maintenance. The CPI also places nothing on a node whose notes carry a `tags:` line with one of the tags in `pve.placement.maintenance_node_tags`, so that line keeps the gate shut as well as HA maintenance does. We remove the line, or the tag from it, in the node's Notes panel in the web interface, and we keep the rest of the notes. The gate checks both, and a dry run reports the state without refusing.
+The undrain starts VMs that the drain stopped and then lets the rebalance place VMs, and it does neither on a node that PVE still treats as in maintenance. The CPI also places nothing on a node whose notes carry a `tags:` line with one of the tags in `pve.placement.maintenance_node_tags`, so that line keeps the gate shut as well as HA maintenance does. We remove the line, or the tag from it, in the node's Notes panel in the web interface, and we keep the rest of the notes. When the gate can't read the notes, it can't tell whether the line is still there, so it refuses rather than start VMs on a node we may have marked. The gate checks all three, and a dry run reports the state without refusing.
 
 **Diagnosis**
 
-The `REFUSED:` line says which of the two holds. `ha-manager status` shows whether the node is still in maintenance, and the CPI's `pve.placement.maintenance_node_tags` property names the tags that count when they appear on a `tags:` line in the node's notes.
+The `REFUSED:` line says which of the three holds. `ha-manager status` shows whether the node is still in maintenance, and the CPI's `pve.placement.maintenance_node_tags` property names the tags that count when they appear on a `tags:` line in the node's notes.
 
 **Fix**
 
@@ -3295,7 +3295,7 @@ For HA maintenance, we run the command that the refusal prints on a PVE node, wa
 ha-manager crm-command node-maintenance disable <node>
 ```
 
-For a tag, we remove it from the node and run the undrain again. Nothing was left part way, because the gate refuses before the first write.
+For a tag, we remove it from the node and run the undrain again. For notes that couldn't be read, we check that the node answers, for example with `pvesh get /nodes/<node>/config`, and run the undrain again once it does. Nothing was left part way, because the gate refuses before the first write.
 
 ## Task timeouts
 

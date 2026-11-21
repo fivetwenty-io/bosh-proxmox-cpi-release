@@ -522,8 +522,9 @@ func (r *drainRun) onlyMaintenanceRefuses(view *drainView, undrain bool) bool {
 
 // maintenanceGate reads the named node's maintenance. A drain needs the node
 // in PVE HA maintenance, and an undrain needs it out of PVE HA maintenance and
-// free of the maintenance marker in its notes. A dry run reports the node's state and
-// passes, so the operator can read the plan first.
+// free of the maintenance marker in its notes, which it must be able to read.
+// A dry run reports the node's state and passes, so the operator can read the
+// plan first.
 func maintenanceGate(profile *ha.Profile, node string, apply, undrain bool) RebalanceGate {
 	g := RebalanceGate{Name: RebalanceGateMaintenance}
 	var e *pve.NodeHealthEntry
@@ -557,6 +558,15 @@ func maintenanceGate(profile *ha.Profile, node string, apply, undrain bool) Reba
 	case e.Maintenance:
 		g.Detail = fmt.Sprintf("node %s's notes carry the maintenance tag %q on a tags: line, so the CPI "+
 			"places nothing on it; remove that tag from the node's notes first", node, e.NotesTag)
+	case e.NotesUnread:
+		// A node whose notes did not answer may still carry the marker, so
+		// the undrain fails closed and the operator runs it again.
+		why := "the read failed"
+		if profile.Health.NotesErr != nil {
+			why = profile.Health.NotesErr.Error()
+		}
+		g.Detail = fmt.Sprintf("node %s's notes could not be read, so the undrain can't tell whether they still "+
+			"carry a maintenance tag (%s); run the undrain again once the node answers", node, why)
 	default:
 		g.OK, g.Detail = true, "node "+node+" is out of maintenance"
 		return g
