@@ -331,7 +331,7 @@ With the default `warn`, the same detail appears in a Warn log line that reads `
 
 **Cause**
 
-Every node that `az_map` lists for the AZ was rejected. The reason after each node says why, for example `node offline`, `node in maintenance`, `insufficient free memory`, or `storage utilization ceiling exceeded`. A node that the node health check doesn't call placeable for a reason other than maintenance reads `node not placeable (<reason>)`, and while the cluster has lost quorum every node reads `node not placeable (entry node does not report the cluster quorate)`. That case is covered in [Cluster not quorate](#cluster-not-quorate). A node reported as `node not found in the cluster` is usually a typo in `az_map`, and that error is not retriable.
+Every node that `az_map` lists for the AZ was rejected. The reason after each node says why, for example `node offline`, `node in maintenance`, `insufficient free memory`, or `storage utilization ceiling exceeded`. A node that only the tag in its notes puts in maintenance reads `node in maintenance (its notes carry the maintenance tag "<tag>")`, so we know to edit the node's notes rather than look for PVE HA maintenance. A node that the node health check doesn't call placeable for a reason other than maintenance reads `node not placeable (<reason>)`, and while the cluster has lost quorum every node reads `node not placeable (entry node does not report the cluster quorate)`. That case is covered in [Cluster not quorate](#cluster-not-quorate). A node reported as `node not found in the cluster` is usually a typo in `az_map`, and that error is not retriable.
 
 **Fix**
 

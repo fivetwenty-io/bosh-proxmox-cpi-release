@@ -928,7 +928,7 @@ func logFilterRejections(logger *log.Logger, rejections map[string]string, az st
 		// A node that cannot take new work, such as a fenced node or a node of
 		// a cluster without quorum, shows in the default log like one in
 		// maintenance.
-		if reason == "node in maintenance" || reason == "node offline" || placement.IsUnplaceableRejection(reason) {
+		if placement.IsMaintenanceRejection(reason) || reason == "node offline" || placement.IsUnplaceableRejection(reason) {
 			logger.Info("create_vm: placement: node filtered",
 				log.String("node", n),
 				log.String("reason", reason),
@@ -1013,6 +1013,11 @@ func isTransientRejectionReason(reason string) bool {
 	// just could not run. "missing required PCI device" stays permanent — the
 	// node answered and the device is absent.
 	if strings.HasPrefix(reason, "PCI device check error: ") {
+		return true
+	}
+	// A node in maintenance by the tag in its notes is transient in the same
+	// way as one PVE HA calls in maintenance.
+	if placement.IsMaintenanceRejection(reason) {
 		return true
 	}
 	// A node that cannot take new work for a reason other than maintenance,

@@ -214,9 +214,9 @@ func GatherNodeFacts(
 		// the report does not mention, or no report at all, leaves it included.
 		// The reason travels with it when the node is not in maintenance, so
 		// a rejection names a lost quorum or a fence instead of maintenance.
-		inMaintenance, unplaceableReason, notesUnread := false, "", false
+		inMaintenance, unplaceableReason, notesUnread, notesTag := false, "", false, ""
 		if entry, ok := health.Node(nodeName); ok && !entry.Placeable {
-			inMaintenance, notesUnread = true, entry.NotesUnread
+			inMaintenance, notesUnread, notesTag = true, entry.NotesUnread, entry.NotesTag
 			if !entry.Maintenance {
 				unplaceableReason = entry.Reason
 				if unplaceableReason == "" {
@@ -239,6 +239,7 @@ func GatherNodeFacts(
 			Online:            item.Online.Bool(),
 			InMaintenance:     inMaintenance,
 			UnplaceableReason: unplaceableReason,
+			NotesTag:          notesTag,
 			NotesUnread:       notesUnread,
 			FreeMemBytes:      item.Maxmem.Int() - item.Mem.Int(),
 			TotalMemBytes:     item.Maxmem.Int(),

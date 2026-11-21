@@ -6,6 +6,7 @@
 package placement
 
 import (
+	"fmt"
 	"math/rand"
 	"sort"
 	"strings"
@@ -108,6 +109,11 @@ type NodeFacts struct {
 	// reason other than maintenance, so the rejection names the real cause.
 	// It is empty for a node in maintenance and for a placeable node.
 	UnplaceableReason string
+
+	// NotesTag is the maintenance tag in the node's notes when the tag alone
+	// puts the node in maintenance, and PVE HA does not. The rejection names
+	// it, so the log says what keeps the node out. It is empty otherwise.
+	NotesTag string
 
 	// NotesUnread is true when the node is not placeable only because its
 	// notes could not be read, so nothing rules out a maintenance tag on it.
@@ -583,11 +589,24 @@ func IsUnplaceableRejection(reason string) bool {
 	return strings.HasPrefix(reason, unplaceableRejectionPrefix)
 }
 
+// maintenanceRejection starts the rejection of a node in maintenance.
+const maintenanceRejection = "node in maintenance"
+
+// IsMaintenanceRejection reports whether reason is the rejection Filter gives
+// a node in maintenance, by PVE HA or by the tag in its notes.
+func IsMaintenanceRejection(reason string) bool {
+	return reason == maintenanceRejection || strings.HasPrefix(reason, maintenanceRejection+" (")
+}
+
 // unplaceableRejection is the rejection Filter gives a node that is marked
-// InMaintenance. It names the real reason when the node is not in maintenance.
+// InMaintenance. It names the real reason when the node is not in
+// maintenance, and the tag when only the node's notes put it there.
 func (f NodeFacts) unplaceableRejection() string {
-	if f.UnplaceableReason == "" {
-		return "node in maintenance"
+	switch {
+	case f.UnplaceableReason != "":
+		return unplaceableRejectionPrefix + " (" + f.UnplaceableReason + ")"
+	case f.NotesTag != "":
+		return fmt.Sprintf("%s (its notes carry the maintenance tag %q)", maintenanceRejection, f.NotesTag)
 	}
-	return unplaceableRejectionPrefix + " (" + f.UnplaceableReason + ")"
+	return maintenanceRejection
 }

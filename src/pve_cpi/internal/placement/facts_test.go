@@ -939,6 +939,19 @@ func TestGatherNodeFacts_MaintenanceUnionHAAndTag(t *testing.T) {
 	if maintenance["pve3"] {
 		t.Error("pve3: expected InMaintenance=false")
 	}
+	_, rejections := placement.Filter(facts, placement.Request{})
+	if got := rejections["pve1"]; got != "node in maintenance" {
+		t.Errorf("pve1: rejection = %q, want %q", got, "node in maintenance")
+	}
+	want := `node in maintenance (its notes carry the maintenance tag "maintenance")`
+	if got := rejections["pve2"]; got != want {
+		t.Errorf("pve2: rejection = %q, want %q", got, want)
+	}
+	for _, n := range []string{"pve1", "pve2"} {
+		if !placement.IsMaintenanceRejection(rejections[n]) {
+			t.Errorf("%s: rejection %q is not recognized as a maintenance rejection", n, rejections[n])
+		}
+	}
 }
 
 // Real PVE /cluster/status reports membership only; compute counters are

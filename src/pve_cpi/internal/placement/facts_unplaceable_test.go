@@ -43,9 +43,11 @@ func TestGatherNodeFacts_NotQuorateNamesTheReason(t *testing.T) {
 	}
 }
 
-// TestGatherNodeFacts_MaintenanceKeepsItsRejection checks that a node in
-// maintenance still carries no other reason and keeps its old rejection.
-func TestGatherNodeFacts_MaintenanceKeepsItsRejection(t *testing.T) {
+// TestGatherNodeFacts_NotesMaintenanceNamesTheTag checks that a node in
+// maintenance only by the tag in its notes carries no other reason, and that
+// its rejection names the tag, so an operator who reads it knows the notes
+// keep the node out and PVE HA does not.
+func TestGatherNodeFacts_NotesMaintenanceNamesTheTag(t *testing.T) {
 	t.Parallel()
 	statusRaw, _ := json.Marshal(map[string]any{
 		"type": "node", "name": "pve1", "maxcpu": 8, "maxmem": 8 * gib, "mem": 4 * gib,
@@ -62,8 +64,12 @@ func TestGatherNodeFacts_MaintenanceKeepsItsRejection(t *testing.T) {
 		t.Fatalf("facts = %+v, want one node in maintenance with no other reason", facts)
 	}
 	_, rejections := placement.Filter(facts, placement.Request{})
-	if got := rejections["pve1"]; got != "node in maintenance" {
-		t.Errorf("rejection = %q, want %q", got, "node in maintenance")
+	want := `node in maintenance (its notes carry the maintenance tag "maintenance")`
+	if got := rejections["pve1"]; got != want {
+		t.Errorf("rejection = %q, want %q", got, want)
+	}
+	if !placement.IsMaintenanceRejection(rejections["pve1"]) {
+		t.Errorf("rejection %q is not recognized as a maintenance rejection", rejections["pve1"])
 	}
 	if placement.IsUnplaceableRejection(rejections["pve1"]) {
 		t.Error("a maintenance rejection must not read as an unplaceable rejection")

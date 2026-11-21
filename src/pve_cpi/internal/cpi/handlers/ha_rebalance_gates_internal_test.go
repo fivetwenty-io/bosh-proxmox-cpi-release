@@ -54,6 +54,11 @@ func TestRebalanceGates_EachGateRefusesOnItsOwn(t *testing.T) {
 		{RebalanceGateNodes, false, "", func(p *ha.Profile, _ *rebalanceSnapshot, _ *rebalanceActivity,
 			_ *rebalanceJournal,
 		) {
+			p.Health.Nodes[2].Maintenance, p.Health.Nodes[2].NotesTag = true, "maint"
+		}, `pve03 carries the maintenance tag "maint" in its notes`},
+		{RebalanceGateNodes, false, "", func(p *ha.Profile, _ *rebalanceSnapshot, _ *rebalanceActivity,
+			_ *rebalanceJournal,
+		) {
 			p.Health.Nodes[0].DeadOrFenced = true
 		}, "pve01 can't take work"},
 		{RebalanceGateNodes, false, "", func(p *ha.Profile, _ *rebalanceSnapshot, _ *rebalanceActivity,

@@ -203,6 +203,9 @@ func nodesGate(profile *ha.Profile) RebalanceGate {
 			bad = append(bad, "node "+n.Name+" is offline")
 		case entry == nil:
 			bad = append(bad, "node "+n.Name+" has no health entry")
+		case entry.Maintenance && entry.NotesTag != "":
+			bad = append(bad, fmt.Sprintf("node %s carries the maintenance tag %q in its notes, so the rolling "+
+				"patch hasn't finished", n.Name, entry.NotesTag))
 		case entry.Maintenance:
 			bad = append(bad, "node "+n.Name+" is in maintenance, so the rolling patch hasn't finished")
 		case entry.DeadOrFenced || !entry.Placeable:
