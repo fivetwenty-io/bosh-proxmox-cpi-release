@@ -304,7 +304,7 @@ func checkCPIConfigEntry(ctx context.Context, entry *cpiConfigEntry, base *confi
 				log.String("entry", entry.Name))
 		}
 		report.advise(haKindAdvice, entry.Name, "no Director UUID is known for this entry, so the doctor scopes it by its "+
-			"VM ID band alone and judges every VM in the band, including one that another Director created there; set "+
+			"VM ID band alone and judges every VM in the band, including one that another Director created there. Set "+
 			"director_uuid on the entry or on the document, or pass --director-uuid")
 	}
 	for _, key := range unknown {

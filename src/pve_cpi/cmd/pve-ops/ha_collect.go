@@ -1231,8 +1231,8 @@ func (c *haCollector) maintenanceStrandedFindings() {
 			// A soft node-affinity pin does not hold a VM on a node in maintenance, because PVE
 			// moves it to the next priority class, so with no reason the VM is most likely on its way.
 			c.rep.advise(haKindMaintenanceStranded, g.sid,
-				"%s is still running on %s, which is in maintenance, and the doctor sees nothing that stops it from leaving, so PVE is expected to move it; "+
-					"check again after the HA manager's next round, because the node's HA agent can't finish draining until the VM has moved or stopped",
+				"%s is still running on %s, which is in maintenance, and the doctor sees nothing that stops it from leaving, so PVE is expected to move it. "+
+					"We check again after the HA manager's next round, because the node's HA agent can't finish draining until the VM has moved or stopped",
 				g.sid, g.ref.Node)
 			continue
 		}
@@ -2357,8 +2357,8 @@ func (c *haCollector) ownerTagMissing(g *haGuest) {
 		}
 	}
 	c.rep.advise(haKindOwnerTagMissing, g.sid,
-		"VM %d on %s carries bosh-cpi but no owner tag, so it predates the owner tag and the doctor cannot tell which Director owns it; "+
-			"it is judged as this Director's, and `cpi stemcell-refs adopt-owners` stamps the owner tag on the Director's older VMs",
+		"VM %d on %s carries bosh-cpi but no owner tag, so it predates the owner tag and the doctor cannot tell which Director owns it. "+
+			"The doctor judges it as this Director's, and `cpi stemcell-refs adopt-owners` stamps the owner tag on the Director's older VMs",
 		g.ref.VMID, g.ref.Node)
 }
 

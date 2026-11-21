@@ -14,7 +14,7 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Added
 
-- `pve-ops ha` reports the advice `owner_tag_missing` for a VM that carries `bosh-cpi` but no owner tag, when the run names its Director. Such a VM predates the owner tag, so the doctor still judges it as this Director's and now names `cpi stemcell-refs adopt-owners`, which stamps the tag.
+- `pve-ops ha` reports `owner_tag_missing` advice for a VM that carries `bosh-cpi` but no owner tag, when the run names its Director. Such a VM predates the owner tag, so the doctor still judges it as this Director's and now names `cpi stemcell-refs adopt-owners`, which stamps the tag.
 
 - `pve.ha.failback`, an optional boolean, turns `failback` off on every HA resource the CPI writes when we set it to `false`. Left unset, it lets the CPI turn the flag on for shared VMs. A cpi-config entry can override it under `pve_ha`.
 
@@ -122,7 +122,7 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - `pve-ops ha` no longer says that a soft node-affinity pin keeps a VM on a node in maintenance. PVE moves a soft-pinned VM to the pin's next priority class within seconds, and the drain already treated it that way, so the `maintenance_stranded` finding now names a reason only for a strict pin that names no other usable node and for an anti-affinity group that holds every other node. When the VM is still on the node and the doctor can name no reason, the finding is advice that says PVE is expected to move it and suggests checking again after the HA manager's next round, so it no longer fails the run. The 0.11.0 entry that described the soft-pin reason was wrong.
 
-- `pve-ops ha --cpi-config` now scopes each entry to its Director, as `--request` does. It used to pass no owner, so an entry judged every VM and replication job in its VM ID band even when another Director had created it, and the replica, job health, orphan volume, `managed_without_resource`, `birth_tag_stale`, `readd_tag`, anti-affinity, and CPU findings could name another Director's objects. The doctor reads the owner from a `director_uuid` key on the entry, then from a `director_uuid` key on the document, and then from the new `--director-uuid` flag. An entry with none of the three is still judged by its VM ID band alone, and the doctor now says so with an advice for that entry and a warning in the log. Every one of those findings also skips a VM or job outside the entry's band.
+- `pve-ops ha --cpi-config` now scopes each entry to its Director, as `--request` does. It used to pass no owner, so an entry judged every VM and replication job in its VM ID band even when another Director had created it, and the replica, job health, orphan volume, `managed_without_resource`, `birth_tag_stale`, `readd_tag`, anti-affinity, and CPU findings could name another Director's objects. The doctor reads the owner from a `director_uuid` key on the entry, then from a `director_uuid` key on the document, and then from the new `--director-uuid` flag. An entry with none of the three is still judged by its VM ID band alone, and the doctor now says so with advice for that entry and a warning in the log. Every one of those findings also skips a VM or job outside the entry's band.
 
 - `pve-ops ha` no longer reports the CPU findings `cpu_host_multi_domain`, `cpu_pin_crosses_domain`, and `cpu_domain_too_small` for a VM that another Director owns or that lies outside the entry's VM ID band.
 

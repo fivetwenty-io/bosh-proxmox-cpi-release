@@ -118,7 +118,7 @@ func parseHADrainFlags(command string, args []string, stdout, stderr io.Writer) 
 	}
 	fs.DurationVar(&maintWait, "maintenance-wait", handlers.DrainDefaultMaintenanceWait,
 		"with --apply, how long to wait for PVE to report the maintenance you just enabled (drain) or disabled "+
-			"(undrain) before the gate refuses; 0 refuses at once, and a dry run never waits")
+			"(undrain) before the gate refuses. A value of 0 refuses at once, and a dry run never waits")
 	var nodes []string
 	for rest := args; ; {
 		if err := fs.Parse(rest); errors.Is(err, flag.ErrHelp) {
