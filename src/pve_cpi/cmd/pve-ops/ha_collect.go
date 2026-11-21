@@ -959,12 +959,37 @@ func (c *haCollector) layoutFindings(chk handlers.AntiAffinityGroupCheck) {
 				"the group's rules drops it, as does pve-ops ha --fix-anti-affinity --apply",
 			h.Index, chk.Group, strings.Join(h.Carriers, ", "), why)
 	}
+	for _, r := range chk.PinRestores {
+		c.pinRestoreFinding(chk, r)
+	}
 	if len(chk.Drift) > 0 {
 		c.rep.advise(haKindAALayoutDrift, chk.Rule,
 			"the rules of group %s differ from the layout the CPI plans, which the next set_vm_metadata "+
 				"of a member writes, or pve-ops ha --fix-anti-affinity --apply now: %s",
 			chk.Group, strings.Join(chk.Drift, "; "))
 	}
+}
+
+// pinRestoreFinding reports a member's pin that still records the priorities
+// its join flattened while the member is in no resource-affinity rule.
+func (c *haCollector) pinRestoreFinding(chk handlers.AntiAffinityGroupCheck, r handlers.AntiAffinityPinRestore) {
+	when := "the next write of the group's rules, such as a member's set_vm_metadata, %s, as does pve-ops ha " +
+		"--fix-anti-affinity --apply"
+	if r.Deferred {
+		when = "the group's first write after its live holds lapse or their recreates join %s, as does pve-ops ha " +
+			"--fix-anti-affinity --apply then"
+	}
+	if r.Action == "drop" {
+		c.rep.advise(haKindAAPinRestore, r.Pin,
+			"pin %s of %s in group %s records the priorities a join flattened, but the pin changed since, because "+
+				"%s, and "+when, r.Pin, r.SID, chk.Group, r.Reason,
+			"drops the record and keeps the pin's nodes and priorities")
+		return
+	}
+	c.rep.advise(haKindAAPinRestore, r.Pin,
+		"pin %s of %s in group %s has one priority on every node, which a join gave it, while %s is in no "+
+			"anti-affinity rule now, and "+when, r.Pin, r.SID, chk.Group, r.SID,
+		"writes back the priorities "+r.Nodes)
 }
 
 // groupRules returns the rules that carry a group's name: the rule itself,

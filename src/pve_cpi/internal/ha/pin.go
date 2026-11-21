@@ -83,7 +83,39 @@ type PinSpec struct {
 // hard constraint gets no preference at all: its pin, when it needs one,
 // names every configured node at one priority, and when the configured node
 // set is unknown it gets none here, so DecisionPin gives it the record pin.
+//
+// The comment of such a VM's pin records the nodes and priorities the pin
+// would have outside the rule (see PinRestoreKey), so the restore can give
+// them back once the VM is in no resource-affinity rule.
 func BuildPin(spec PinSpec) (*Rule, error) {
+	pin, err := buildPin(spec)
+	if err != nil || pin == nil {
+		return pin, err
+	}
+	recordFreePin(pin, spec)
+	return pin, nil
+}
+
+// recordFreePin records on the comment of pin, which BuildPin made from spec
+// for a VM in a resource-affinity rule, the pin spec gives the VM outside the
+// rule, when that pin has other nodes or priorities. Any older record on the
+// comment goes, because the pin spec asks for now is what the VM should get
+// back. A spec for a VM in no such rule leaves pin alone.
+func recordFreePin(pin *Rule, spec PinSpec) {
+	if !spec.SinglePriority {
+		return
+	}
+	pin.Comment = WithoutPinRestoreRecord(pin.Comment)
+	spec.SinglePriority = false
+	free, err := buildPin(spec)
+	if err != nil || free == nil || free.NodesParam() == pin.NodesParam() {
+		return
+	}
+	pin.Comment = WithPinRestoreRecord(pin.Comment, free)
+}
+
+// buildPin is BuildPin without the record.
+func buildPin(spec PinSpec) (*Rule, error) {
 	configured := toSet(trimmed(spec.Configured))
 	var nodes []string
 	strict := false

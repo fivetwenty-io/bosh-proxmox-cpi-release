@@ -283,6 +283,10 @@ func ensureAntiAffinityMembershipLocked(
 		heldByChunks(res.Set, ident, planner.scan.legacy), vmid, &loss, logger); err != nil {
 		return "", loss, err
 	}
+
+	// 4. A member the plan took out of its last rule gets back the
+	// priorities its join flattened.
+	restoreGroupPins(ctx, deps, profile, planner, res.Set, logger)
 	return planner.placedIn, loss, nil
 }
 
@@ -556,6 +560,12 @@ func listHAResources(ctx context.Context, svc cluster.Service) (map[string]strin
 // the nodes of the highest priority, so the pin would act as a strict one when
 // a sibling runs on its node (see ha.SoftPinNamesSomeNodes). An unmarked pin
 // is only flattened, because the CPI cannot tell what an older one meant by it.
+//
+// Before either rewrite of a pin of this Director's, the pin's comment records
+// the nodes and priorities it had (see ha.PinRestoreKey), so the restore can
+// give them back once the member leaves its last resource-affinity rule. A pin
+// that already carries a record keeps it, so a later flatten never replaces
+// the priorities the VM had before its first.
 func flattenMemberPins(set *ha.RuleSet, members []string, owner string, configured []string) []ha.RuleOp {
 	var ops []ha.RuleOp
 	for _, s := range members {
@@ -567,13 +577,22 @@ func flattenMemberPins(set *ha.RuleSet, members []string, owner string, configur
 		if pin == nil {
 			continue
 		}
-		switch ownership := haOwnershipOf(pin.Comment, owner); {
+		var next *ha.Rule
+		ownership := haOwnershipOf(pin.Comment, owner)
+		switch {
 		case ownership == haOwnedByOther:
+			continue
 		case ownership == haOwnedByUs && ha.SoftPinNamesSomeNodes(pin, configured):
-			ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: *ha.WithEveryNode(pin, configured)})
+			next = ha.WithEveryNode(pin, configured)
 		case pin.MultiplePriorities():
-			ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: *ha.Flattened(pin)})
+			next = ha.Flattened(pin)
+		default:
+			continue
 		}
+		if ownership == haOwnedByUs {
+			next.Comment = ha.WithPinRestoreRecord(next.Comment, pin)
+		}
+		ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: *next})
 	}
 	return ops
 }
@@ -1253,6 +1272,9 @@ func healAntiAffinityGroupHolding(
 		planner.sid, planner.heal, planner.exclude, planner.holdOut = self, true, removed, holdOut
 		planner.excludeIndex = removedIndex
 		_, res, err := applyGroupPlan(ctx, deps, profile, planner, nil, logger)
+		if err == nil {
+			restoreGroupPins(ctx, deps, profile, planner, res.Set, logger)
+		}
 		loss := groupRuleLossOf(res, ident)
 		grew := false
 		for _, s := range loss.confined {
@@ -1322,6 +1344,9 @@ func pruneGroupAntiAffinityRules(ctx context.Context, deps Deps, ident haIdentit
 			return append(holds.carryHolds(set, deleting, haResourceSid(vmid)), ops...), nil
 		})
 		deleted, confined = writtenRuleDeletes(res, comments), confinedBy(res)
+		if err == nil && len(deleted) > 0 {
+			restoreGroupPinsAfterPrune(ctx, deps, ident, haResourceSid(vmid), res.Set, logger)
+		}
 		return err
 	})
 	if err != nil {

@@ -61,7 +61,8 @@ func joinAntiAffinityGroupOf(ctx context.Context, deps Deps, vmid, index int, lo
 // nothing. The rule writer writes nothing for such a plan under the lock
 // either, so the join can skip the lock, and a parallel deploy does not queue
 // every set_vm_metadata call behind it. Any doubt, such as a failed read, a
-// plan that would write, a VM in no rule, or an unmarked rule from an older
+// plan that would write, a VM in no rule, a member's pin whose priorities
+// the locked join would restore, or an unmarked rule from an older
 // CPI that the locked join would migrate, sends the join down the locked
 // path. Without the rules lock there is nothing to skip, so it reports false.
 func antiAffinityJoinSettled(ctx context.Context, deps Deps, ident haIdentity, vmid, index int) (string, bool) {
@@ -88,7 +89,7 @@ func antiAffinityJoinSettled(ctx context.Context, deps Deps, ident haIdentity, v
 	planner := newGroupPlanner(ctx, deps, profile, ident, scan, log.NewNopLogger())
 	planner.sid, planner.index, planner.checkSelf = haResourceSid(vmid), index, true
 	ops, err := planner.plan(set)
-	if err != nil || len(ops) > 0 || planner.placedIn == "" {
+	if err != nil || len(ops) > 0 || planner.placedIn == "" || len(planner.restoreOps(set)) > 0 {
 		return "", false
 	}
 	return planner.placedIn, true

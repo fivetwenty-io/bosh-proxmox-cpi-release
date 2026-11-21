@@ -631,8 +631,13 @@ func attachNewPin(
 	ruleName := naRuleNameFor(d.VMID)
 	configured := profileNodeNames(profile)
 	if oldPin == nil || !oldPin.Strict || oldPin.Disabled {
-		return ha.DecisionPin(d, ruleName, haIdentity{Owner: owner}.marker(), storages, configured,
+		pin, err := ha.DecisionPin(d, ruleName, haIdentity{Owner: owner}.marker(), storages, configured,
 			profileRebalancesOnStart(profile), inResourceAffinityRule(set, d.SID))
+		if err != nil {
+			return nil, err
+		}
+		ha.CarryPinRestore(oldPin, pin)
+		return pin, nil
 	}
 	if len(storages) == 0 {
 		return nil, cpierrors.Cloud("pin %s: the VM holds no volume to record", ruleName)

@@ -236,7 +236,7 @@ func (b *rebalanceModelBuilder) rewrite(f *rebalanceVMFacts, pin *ha.Rule, targe
 	if err != nil {
 		return nil, "the CPI can't build the pin for the VM on " + target + ": " + err.Error()
 	}
-	diff := ha.RuleDiff(newPin, pin)
+	diff := ha.RuleDiff(newPin, pinRestoreCompared(pin, newPin))
 	switch {
 	case len(diff) == 0:
 		return nil, ""
@@ -428,4 +428,23 @@ func orNothing(s string) string {
 		return "nothing"
 	}
 	return s
+}
+
+// pinRestoreCompared returns the pin a rebalance compares newPin, the pin it
+// would write, with, and leaves on newPin the record the write should carry.
+// A newPin with one priority on every node, which is how the pin of a VM in a
+// resource-affinity rule looks, carries the record of pin, the pin the VM has,
+// and is compared with pin, so a rebalance never rewrites such a pin for its
+// record alone. Any other newPin carries the CPI's own priorities for a VM in
+// no such rule, which is what the record of pin would give back, so it is
+// compared with pin without its record.
+func pinRestoreCompared(pin, newPin *ha.Rule) *ha.Rule {
+	newPin.Comment = ha.WithoutPinRestoreRecord(newPin.Comment)
+	if newPin.MultiplePriorities() {
+		out := pin.Clone()
+		out.Comment = ha.WithoutPinRestoreRecord(pin.Comment)
+		return &out
+	}
+	ha.CarryPinRestore(pin, newPin)
+	return pin
 }

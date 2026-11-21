@@ -35,6 +35,9 @@ type aaClusterStub struct {
 	deleteRuleCalls int
 	failCreateRule  bool
 	failUpdateRule  bool
+	// failUpdateOf, when set, fails the update of each rule it returns an
+	// error for.
+	failUpdateOf func(rule string) error
 	// digest changes on every rule write, the way PVE's config digest does.
 	digest        int
 	failListRules bool
@@ -362,6 +365,11 @@ func (s *aaClusterStub) UpdateHaRules(_ context.Context, rule string, p *cluster
 	s.updateRuleCalls++
 	if s.failUpdateRule {
 		return fmt.Errorf("update rule failed")
+	}
+	if s.failUpdateOf != nil {
+		if err := s.failUpdateOf(rule); err != nil {
+			return err
+		}
 	}
 	if _, ok := s.rules[rule]; !ok {
 		return fmt.Errorf("no such ha rule '%s'", rule)

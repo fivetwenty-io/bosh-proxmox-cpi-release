@@ -1,6 +1,7 @@
 package ha
 
 import (
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -183,6 +184,12 @@ func TestCarryPinRestore(t *testing.T) {
 	if planned.Comment != restoreTestMarker {
 		t.Fatalf("planned pin comment = %q, want %q", planned.Comment, restoreTestMarker)
 	}
+	fresh := restoreTestMarker + " " + PinRestoreKey + "=c:2,a,b"
+	own := restoreTestPin(t, "a,b,c", fresh, false)
+	CarryPinRestore(cur, own)
+	if own.Comment != fresh {
+		t.Fatalf("pin with its own record: comment = %q, want %q", own.Comment, fresh)
+	}
 	none := restoreTestPin(t, "a,b,c", restoreTestMarker, false)
 	CarryPinRestore(nil, none)
 	CarryPinRestore(cur, nil)
@@ -239,5 +246,38 @@ func TestPinRestoreRecordLeavesOtherReadersAlone(t *testing.T) {
 	}
 	if DecodedMarkerComment(recorded) != recorded {
 		t.Fatalf("the marker decoder changed the record: %q", DecodedMarkerComment(recorded))
+	}
+}
+
+// TestBuildPinRecordsThePinOutsideTheRule shows that the pin BuildPin makes
+// for a VM in a resource-affinity rule records the pin the same spec gives
+// the VM outside the rule, so the restore can give that pin back, and that
+// a spec for a VM in no such rule records nothing.
+func TestBuildPinRecordsThePinOutsideTheRule(t *testing.T) {
+	spec := PinSpec{
+		ID: "bosh-na-1", Comment: restoreTestMarker, SID: "vm:1", Configured: []string{"a", "b", "c"},
+		Preferred: []string{"a"}, Placed: "b",
+	}
+	free, err := BuildPin(spec)
+	if err != nil || free == nil || !free.MultiplePriorities() {
+		t.Fatalf("free pin = %+v, %v", free, err)
+	}
+	if _, present, _ := PinRestoreRecord(free.Comment); present {
+		t.Fatalf("a pin outside the rule records %q", free.Comment)
+	}
+	spec.SinglePriority = true
+	flat, err := BuildPin(spec)
+	if err != nil || flat == nil || flat.MultiplePriorities() {
+		t.Fatalf("flat pin = %+v, %v", flat, err)
+	}
+	nodes, present, ok := PinRestoreRecord(flat.Comment)
+	if !present || !ok || !maps.Equal(nodes, free.Nodes) {
+		t.Fatalf("flat pin records %v (present %v, ok %v), want %v", nodes, present, ok, free.Nodes)
+	}
+
+	// A spec with no preference gets no pin, so there is nothing to record.
+	spec.Preferred, spec.Placed = nil, ""
+	if none, err := BuildPin(spec); err != nil || none != nil {
+		t.Fatalf("pin with no preference = %+v, %v", none, err)
 	}
 }

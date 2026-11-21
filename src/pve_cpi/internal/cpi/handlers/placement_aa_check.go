@@ -79,8 +79,40 @@ type AntiAffinityGroupCheck struct {
 	// --fix-anti-affinity --apply.
 	Holds       []AntiAffinityHold `json:"holds,omitempty"`
 	LapsedHolds []AntiAffinityHold `json:"lapsed_holds,omitempty"`
+	// PinRestores lists the members whose pin still records the priorities
+	// a join flattened while the member is in no resource-affinity rule. The
+	// group's next write restores them, and so does pve-ops ha
+	// --fix-anti-affinity --apply, unless a live hold defers it.
+	PinRestores []AntiAffinityPinRestore `json:"pin_restores,omitempty"`
 	// Problem says why the group could not be planned, or "".
 	Problem string `json:"problem,omitempty"`
+}
+
+// AntiAffinityPinRestore is a member's pin whose recorded priorities the next
+// write of its group gives back.
+type AntiAffinityPinRestore struct {
+	SID string `json:"sid"`
+	Pin string `json:"pin"`
+	// Action is "restore" when the recorded priorities go back, or "drop"
+	// when the pin changed after the join flattened it, so the record goes
+	// and the pin keeps its nodes and priorities.
+	Action string `json:"action"`
+	// Nodes is the pin's nodes after the write, in the form the API takes
+	// them.
+	Nodes string `json:"nodes"`
+	// Reason says why a drop drops the record.
+	Reason string `json:"reason,omitempty"`
+	// Deferred says a live hold of the group defers the write until the
+	// hold lapses or its recreate joins.
+	Deferred bool `json:"deferred,omitempty"`
+}
+
+// describe returns what the write does, in the words of the fix's drift.
+func (r AntiAffinityPinRestore) describe() string {
+	if r.Action == ha.PinRestoreDrop.String() {
+		return fmt.Sprintf("drop the priority record from %s, because %s", r.Pin, r.Reason)
+	}
+	return fmt.Sprintf("restore the priorities %s on %s", r.Nodes, r.Pin)
 }
 
 // AntiAffinityHold is a place a delete keeps free for the recreate of its
@@ -204,6 +236,11 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 	for _, e := range p.pendingHolds {
 		c.Drift = append(c.Drift, fmt.Sprintf("record the holds %s on the HA resource %s", formatAAHolds(e.add),
 			e.sid))
+	}
+	for _, r := range p.pinRestores(set) {
+		c.PinRestores = append(c.PinRestores, AntiAffinityPinRestore{
+			SID: r.SID, Pin: r.Pin, Action: r.Action.String(), Nodes: r.Nodes, Reason: r.Reason, Deferred: r.Deferred,
+		})
 	}
 	c.Full = fullGroupRules(set, ident, p.lastIn)
 	return c
@@ -341,9 +378,10 @@ type AntiAffinityFixResult struct {
 
 // FixAntiAffinityGroups plans every anti-affinity group of the requesting
 // Director again and, unless opts.DryRun is set, writes each group whose
-// rules differ from the plan or still record a lapsed hold, under the HA rules lock, through the same heal
-// a delete runs. It refuses to run when the settings write no anti-affinity
-// rule, or when the request names no Director.
+// rules differ from the plan, still record a lapsed hold, or leave a member's
+// pin with the priorities its join flattened, under the HA rules lock,
+// through the same heal a delete runs. It refuses to run when the settings
+// write no anti-affinity rule, or when the request names no Director.
 func FixAntiAffinityGroups(ctx context.Context, deps Deps, opts AntiAffinityFixOptions) ([]AntiAffinityFixResult, error) {
 	if deps.RequestDirectorUUID == "" {
 		return nil, errors.New("anti-affinity fix: no Director UUID names the groups to fix")
@@ -370,6 +408,11 @@ func FixAntiAffinityGroups(ctx context.Context, deps Deps, opts AntiAffinityFixO
 		for _, h := range c.LapsedHolds {
 			r.Drift = append(r.Drift, fmt.Sprintf("drop the lapsed hold of index %d from %s", h.Index,
 				strings.Join(h.Carriers, ",")))
+		}
+		for _, pr := range c.PinRestores {
+			if !pr.Deferred {
+				r.Drift = append(r.Drift, pr.describe())
+			}
 		}
 		switch {
 		case c.Problem != "":

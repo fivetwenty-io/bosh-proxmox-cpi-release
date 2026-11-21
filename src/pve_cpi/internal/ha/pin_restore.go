@@ -85,15 +85,20 @@ func PinRestoreRecord(comment string) (nodes map[string]int, present, ok bool) {
 // CarryPinRestore keeps the record of cur, the pin as the writer read it, on
 // next, the pin the writer builds afresh in its place. It keeps the record
 // while next has one priority on every node, which is how a VM in a
-// resource-affinity rule's pin looks. A next with several priorities carries
-// the CPI's own preference for a VM in no such rule already, so the record is
-// dropped, because writing it back later would undo that preference.
+// resource-affinity rule's pin looks, unless next records the pin the writer
+// would give the VM outside the rule already (see BuildPin), because that is
+// the CPI's preference now. A next with several priorities carries the CPI's
+// own preference for a VM in no such rule, so the record is dropped, because
+// writing it back later would undo that preference.
 func CarryPinRestore(cur, next *Rule) {
 	if next == nil {
 		return
 	}
-	next.Comment = WithoutPinRestoreRecord(next.Comment)
-	if cur == nil || next.MultiplePriorities() {
+	if next.MultiplePriorities() {
+		next.Comment = WithoutPinRestoreRecord(next.Comment)
+		return
+	}
+	if _, present := pinRestoreValue(next.Comment); present || cur == nil {
 		return
 	}
 	if raw, ok := pinRestoreValue(cur.Comment); ok && raw != "" {

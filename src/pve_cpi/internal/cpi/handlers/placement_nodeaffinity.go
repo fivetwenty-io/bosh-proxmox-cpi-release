@@ -270,6 +270,9 @@ func writeMergedPinRule(
 				return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 					fmt.Sprintf("node-affinity: pin %q for VM %d", ruleName, vmid))
 			}
+			// A pin of a VM in a resource-affinity rule keeps the record of
+			// the priorities its join flattened (see ha.PinRestoreKey).
+			ha.CarryPinRestore(cur, want)
 			planned = want
 			switch {
 			case want == nil:

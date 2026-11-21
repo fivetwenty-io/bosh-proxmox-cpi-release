@@ -164,6 +164,7 @@ func widenPinOnce(ctx context.Context, deps Deps, vmid int, node string, logger 
 	if !pinWidens(pinNodes, newPin.NodeNames()) {
 		return nil, nil, errPinWidenSkip
 	}
+	ha.CarryPinRestore(oldPin, newPin)
 	if err := writeWidenedPin(ctx, deps, profile, d, vmid, oldPin, newPin, logger); err != nil {
 		return nil, nil, err
 	}

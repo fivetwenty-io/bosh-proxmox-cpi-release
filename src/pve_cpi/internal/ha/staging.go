@@ -145,7 +145,8 @@ func RecordPin(id, sid, comment string, admissible []string) *Rule {
 // DecisionPin returns the merged pin of a registered VM: the pin BuildPin makes
 // from the decision, or the record pin when the decision asks for no pin. The
 // comment carries the volume record of storages. singlePriority flattens the
-// priorities of a VM that is in a resource-affinity rule.
+// priorities of a VM that is in a resource-affinity rule, and the comment
+// then records the pin the VM gets outside the rule (see BuildPin).
 func DecisionPin(
 	d *VMDecision, id, marker string, storages, configured []string, rebalanceOnStart, singlePriority bool,
 ) (*Rule, error) {
@@ -158,7 +159,7 @@ func DecisionPin(
 	comment := WithVolumeRecord(marker, storages)
 	spec := d.PinSpec(id, comment, configured, rebalanceOnStart)
 	spec.SinglePriority = singlePriority
-	pin, err := BuildPin(spec)
+	pin, err := buildPin(spec)
 	if err != nil {
 		return nil, err
 	}
@@ -168,6 +169,7 @@ func DecisionPin(
 	if pin == nil {
 		return nil, fmt.Errorf("pin %s: the VM's decision names no admissible node", id)
 	}
+	recordFreePin(pin, spec)
 	return pin, nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
@@ -277,4 +278,41 @@ func TestCollectAntiAffinityLayoutJudgesAGroupByTheEntryThatPlacedIt(t *testing.
 	r := collectHAScoped(context.Background(), f, two, haDirector, haNow, aaTwoNodeScope("az2-two"))
 	want(t, r, haKindAARuleFull, haSeverityProblem, g.rule, "2 members on 2 nodes")
 	want(t, r, haKindAALayoutDrift, haSeverityAdvice, g.rule, "delete "+g.rule)
+}
+
+// TestCollectAntiAffinityLayoutPinRestore pins that a member in no rule whose
+// pin still records the priorities its join flattened is advice that names
+// the priorities and the fix, that a live hold of the group says the restore
+// waits, and that a pin changed after the join says the record is dropped.
+func TestCollectAntiAffinityLayoutPinRestore(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		nodes, hold string
+		fragments   []string
+	}{
+		"restore": {nodes: "n1,n2,n3", fragments: []string{"vm:202", "writes back the priorities n1,n2:2",
+			"--fix-anti-affinity --apply"}},
+		"deferred": {nodes: "n1,n2,n3", hold: " hold=5.299@4000000000", fragments: []string{"vm:202",
+			"live holds lapse", "writes back the priorities n1,n2:2"}},
+		"hand edit": {nodes: "n1:3,n2,n3", fragments: []string{"vm:202", "several priorities again",
+			"drops the record"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			g := newAALayoutGroup()
+			f := aaLayoutFake(g, "block", 3)
+			f.rules = g.rulesOf([]string{"vm:200", "vm:201"})
+			f.rules[0].Comment += tc.hold
+			nodes := map[string]int{}
+			for e := range strings.SplitSeq(tc.nodes, ",") {
+				n, p, _ := strings.Cut(e, ":")
+				nodes[n], _ = strconv.Atoi(p)
+			}
+			f.rules = append(f.rules, ha.Rule{ID: "bosh-na-202", Type: "node-affinity", Nodes: nodes,
+				Resources: []string{"vm:202"}, Comment: haMarker + " deployment=- group=- " + ha.PinRestoreKey + "=n1,n2:2"})
+			r := runCollect(t, f, haCfg("auto", "none"))
+			want(t, r, haKindAAPinRestore, haSeverityAdvice, append([]string{"bosh-na-202"}, tc.fragments...)...)
+			wantNone(t, r, haKindAALayoutDrift)
+		})
+	}
 }
