@@ -269,10 +269,10 @@ func TestLayout_UnindexedJoinAfterIndexedAndOnlyUnderBlock(t *testing.T) {
 	}
 }
 
-// TestLayout_UnindexedMembersRankByKey pins that members whose index is
-// unknown take their places in key order, whatever rules they are in now, so
-// their layout too is the same whatever order they joined in.
-func TestLayout_UnindexedMembersRankByKey(t *testing.T) {
+// TestLayout_UnindexedJoinersOnlyFillRoom pins that a member whose index is
+// unknown never takes a kept member's place in the first rule, because the
+// key order it ranks by says nothing about which member should lead.
+func TestLayout_UnindexedJoinersOnlyFillRoom(t *testing.T) {
 	t.Parallel()
 	ms := make([]Member, 0, 5)
 	for i := range 5 {
@@ -280,13 +280,14 @@ func TestLayout_UnindexedMembersRankByKey(t *testing.T) {
 	}
 	out := Layout(Input{Base: base, Split: true, Domains: oneDomain(4), Members: ms,
 		Rules: map[string][]string{base: {key(2), key(4)}}})
-	if got := render(out.Rules); got != "={0,1,2} -2={3,4}" {
-		t.Fatalf("rules = %s; want the members in key order", got)
+	if got := render(out.Rules); got != "={0,2,4} -2={1,3}" {
+		t.Fatalf("rules = %s; want 2 and 4 kept and the unindexed joiners filling the room", got)
 	}
+	// One already in a later rule keeps it, though the first rule has room.
 	out = Layout(Input{Base: base, Split: true, Domains: oneDomain(5), Members: ms,
 		Rules: map[string][]string{base: {key(2), key(4)}, base + "-2": {key(1), key(3)}}})
-	if got := render(out.Rules); got != "={0,1,2,3}" {
-		t.Fatalf("rules = %s; want the members in key order", got)
+	if got := render(out.Rules); got != "={0,2,4} -2={1,3}" {
+		t.Fatalf("rules = %s; want the later rule kept whole", got)
 	}
 }
 

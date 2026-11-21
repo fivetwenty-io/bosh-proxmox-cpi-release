@@ -536,16 +536,19 @@ type filler struct {
 	dom      Domain
 }
 
-// fill lays the members out. Each index's primary, and each joinable member
-// with no index after them by key, takes the next position in rank order,
-// held places included, and the n-th rule of the sequence holds the n-th run
-// of capacity positions. Without split only the first run is written. A
-// member keeps its place in its rule whether or not it may join, and a member
-// that is not in its rule yet joins it while the rule has room and the join
-// check lets it in. A member that may not join, or that the check refuses,
-// still takes its position, so no other member shifts. An older member of an
-// index keeps its rule only while the rule has room after the positions are
-// placed. It returns the rules and the members left alone in a rule.
+// fill lays the members out. Each index's primary takes the next position
+// in index order, held places included, and the n-th rule of the sequence
+// holds the n-th run of capacity positions. Without split only the first run
+// is written. A member keeps its place in its rule whether or not it may
+// join, and a member that is not in its rule yet joins it while the rule has
+// room and the join check lets it in. A member that may not join, or that the
+// check refuses, still takes its position, so no other member shifts. The
+// members with no position, an older member of an index and a member whose
+// index is unknown, come after the positions are placed. Each keeps the rule
+// it is in while the rule has room. A joinable member with no index that is
+// in no rule then joins the lowest rule with members and room that lets it
+// in, and when no rule with members has room, the lowest empty place. It
+// returns the rules and the members left alone in a rule.
 func (f *filler) fill(term int) ([]candRule, []string) {
 	if f.capacity < 2 {
 		return nil, nil
@@ -558,52 +561,86 @@ func (f *filler) fill(term int) ([]candRule, []string) {
 			inRule[k] = true
 		}
 	}
-	var positions, older []*mstate
+	var positions, extras []*mstate
 	for _, m := range f.members {
-		switch {
-		case !m.primary:
-			older = append(older, m)
-		case m.Index >= 0 || m.joinable:
+		if m.primary && m.Index >= 0 {
 			positions = append(positions, m)
-		case inRule[m.Key]:
-			l.out.Displaced = append(l.out.Displaced, m.Key)
+		} else {
+			extras = append(extras, m)
 		}
 	}
 	var runs [][]*mstate
 	for start := 0; start < len(positions); {
-		end := len(positions)
-		if f.capacity < end-start {
-			end = start + f.capacity
-		}
+		end := min(start+f.capacity, len(positions))
 		runs = append(runs, positions[start:end])
 		start = end
 	}
-	if !l.in.Split && len(runs) > 1 {
-		for _, run := range runs[1:] {
-			f.leaveOut(run, inRule)
-		}
-		runs = runs[:1]
+	slots := len(f.members) + 1
+	if !l.in.Split {
+		slots = 1
 	}
-	desired := make([][]string, len(runs))
-	numbers := make([]int, len(runs))
+	var numbers []int
+	for s := range slots {
+		n := f.number(s)
+		if n == 0 {
+			break
+		}
+		numbers = append(numbers, n)
+	}
+	desired := make([][]string, len(numbers))
 	for slot, run := range runs {
-		numbers[slot] = f.number(slot)
-		if numbers[slot] == 0 {
+		if slot >= len(numbers) {
 			f.leaveOut(run, inRule)
 			continue
 		}
 		desired[slot] = f.place(numbers[slot], run, room, inRule)
 	}
-	for _, m := range older {
-		slot := slices.IndexFunc(numbers, func(n int) bool { return n != 0 && slices.Contains(f.existing[n], m.Key) })
+	var joiners []*mstate
+	for _, m := range extras {
+		slot := slices.IndexFunc(numbers, func(n int) bool { return slices.Contains(f.existing[n], m.Key) })
 		switch {
 		case slot >= 0 && len(desired[slot]) < f.capacity:
 			desired[slot] = append(desired[slot], m.Key)
+		case m.primary && m.joinable:
+			joiners = append(joiners, m)
 		case inRule[m.Key]:
 			l.out.Displaced = append(l.out.Displaced, m.Key)
 		}
 	}
+	for _, m := range joiners {
+		f.join(m, numbers, desired, room)
+	}
 	return f.rules(term, numbers, desired)
+}
+
+// join puts a joinable member with no index that is in no rule into the
+// lowest rule with members and room that lets it in. When no rule with
+// members has room, it takes the lowest empty place. A member that every rule
+// with room refused stays out.
+func (f *filler) join(m *mstate, numbers []int, desired [][]string, room int) {
+	refused := false
+	for slot, keys := range desired {
+		if len(keys) == 0 || len(keys) >= room {
+			continue
+		}
+		if !f.l.canJoin(f.name(numbers[slot]), keys, m.Key) {
+			f.l.refuse(m.Key, f.name(numbers[slot]))
+			refused = true
+			continue
+		}
+		desired[slot] = append(keys, m.Key)
+		return
+	}
+	if refused {
+		return
+	}
+	for slot, keys := range desired {
+		if len(keys) == 0 && room > 0 {
+			desired[slot] = []string{m.Key}
+			return
+		}
+	}
+	f.l.out.Overflow = append(f.l.out.Overflow, m.Key)
 }
 
 // place settles who is in the rule numbered n, whose place holds run. A
