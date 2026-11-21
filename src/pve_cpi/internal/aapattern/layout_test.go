@@ -204,26 +204,26 @@ func TestLayout_ParallelCreatesSettleByIndex(t *testing.T) {
 	}
 }
 
-// TestLayout_KeepersStay pins that a member keeps its rule while the rule is
-// within the cap, so a gap does not reshuffle the layout, and that a
-// recreated index finds its old rule.
-func TestLayout_KeepersStay(t *testing.T) {
+// TestLayout_ARecreatedIndexFindsItsOldRule pins that the hold a delete
+// leaves keeps the deleted index's place, so the gap in its rule waits for
+// the index that left it and no other member moves into it.
+func TestLayout_ARecreatedIndexFindsItsOldRule(t *testing.T) {
 	t.Parallel()
 	rules := map[string][]string{
 		base:        {key(0), key(1)},
-		base + "-2": {key(3), key(5)},
-		base + "-3": {key(4), key(2)},
+		base + "-2": {key(2), key(3)},
+		base + "-3": {key(4), key(5)},
 	}
-	out := Layout(Input{Base: base, Split: true, Domains: oneDomain(3), Members: members("", seq(6)...),
-		Rules: rules})
-	if got := render(out.Rules); got != "={0,1} -2={3,5} -3={2,4}" {
-		t.Fatalf("rules = %s; want every keeper where it was", got)
+	ms := members("", seq(6)...)
+	ms[3] = Member{Key: "hold/3", Index: 3, Reserved: true}
+	out := Layout(Input{Base: base, Split: true, Domains: oneDomain(3), Members: ms,
+		Rules: map[string][]string{base: rules[base], base + "-3": rules[base+"-3"]}})
+	if got := render(out.Rules); got != "={0,1} -3={4,5}" {
+		t.Fatalf("rules = %s; want index 2 waiting in its place for index 3", got)
 	}
-	// Index 3 was deleted and comes back.
-	rules[base+"-2"] = []string{key(5)}
 	out = Layout(Input{Base: base, Split: true, Domains: oneDomain(3), Members: members("", seq(6)...),
-		Rules: rules})
-	if got := render(out.Rules); got != "={0,1} -2={3,5} -3={2,4}" {
+		Rules: out.Rules})
+	if got := render(out.Rules); got != "={0,1} -2={2,3} -3={4,5}" {
 		t.Fatalf("rules = %s; want the recreated index back in its old rule", got)
 	}
 }
@@ -269,10 +269,10 @@ func TestLayout_UnindexedJoinAfterIndexedAndOnlyUnderBlock(t *testing.T) {
 	}
 }
 
-// TestLayout_UnindexedJoinersOnlyFillRoom pins that a member whose index is
-// unknown never takes a kept member's place in the first rule, because the
-// key order it ranks by says nothing about which member should lead.
-func TestLayout_UnindexedJoinersOnlyFillRoom(t *testing.T) {
+// TestLayout_UnindexedMembersRankByKey pins that members whose index is
+// unknown take their places in key order, whatever rules they are in now, so
+// their layout too is the same whatever order they joined in.
+func TestLayout_UnindexedMembersRankByKey(t *testing.T) {
 	t.Parallel()
 	ms := make([]Member, 0, 5)
 	for i := range 5 {
@@ -280,14 +280,13 @@ func TestLayout_UnindexedJoinersOnlyFillRoom(t *testing.T) {
 	}
 	out := Layout(Input{Base: base, Split: true, Domains: oneDomain(4), Members: ms,
 		Rules: map[string][]string{base: {key(2), key(4)}}})
-	if got := render(out.Rules); got != "={0,2,4} -2={1,3}" {
-		t.Fatalf("rules = %s; want 2 and 4 kept and the unindexed joiners filling the room", got)
+	if got := render(out.Rules); got != "={0,1,2} -2={3,4}" {
+		t.Fatalf("rules = %s; want the members in key order", got)
 	}
-	// One already in a later rule keeps it, though the first rule has room.
 	out = Layout(Input{Base: base, Split: true, Domains: oneDomain(5), Members: ms,
 		Rules: map[string][]string{base: {key(2), key(4)}, base + "-2": {key(1), key(3)}}})
-	if got := render(out.Rules); got != "={0,2,4} -2={1,3}" {
-		t.Fatalf("rules = %s; want the later rule kept whole", got)
+	if got := render(out.Rules); got != "={0,1,2,3}" {
+		t.Fatalf("rules = %s; want the members in key order", got)
 	}
 }
 
@@ -314,12 +313,18 @@ func TestLayout_NotJoinableKeepsOnlyItsPlace(t *testing.T) {
 	}
 }
 
-func TestLayout_RefusedJoinTriesTheNextRule(t *testing.T) {
+// TestLayout_RefusedJoinKeepsItsPlace pins that a member the join check
+// refuses is left out of its place's rule and moves to no other rule, so the
+// members after it keep their places.
+func TestLayout_RefusedJoinKeepsItsPlace(t *testing.T) {
 	t.Parallel()
 	out := Layout(Input{Base: base, Split: true, Domains: oneDomain(3), Members: members("", seq(4)...),
 		CanJoin: func(rule string, _ []string, k string) bool { return rule != base || k != key(1) }})
-	if got := render(out.Rules); got != "={0,2} -2={1,3}" {
-		t.Fatalf("rules = %s; want 1 moved to the second rule", got)
+	if got := render(out.Rules); got != "-2={2,3}" {
+		t.Fatalf("rules = %s; want 1 refused and 2 and 3 in their own rule", got)
+	}
+	if got := out.Refused[key(1)]; !slices.Equal(got, []string{base}) {
+		t.Fatalf("refused = %v; want 1 refused by the first rule", out.Refused)
 	}
 }
 
@@ -327,8 +332,11 @@ func TestLayout_PlaceableLimitsJoins(t *testing.T) {
 	t.Parallel()
 	out := Layout(Input{Base: base, Split: true, Domains: map[string]Domain{"": {Nodes: 5, Placeable: 2}},
 		Members: members("", seq(4)...)})
-	if got := render(out.Rules); got != "={0,1} -2={2,3}" {
-		t.Fatalf("rules = %s; want rules of two while only two nodes take VMs", got)
+	if got := render(out.Rules); got != "={0,1}" {
+		t.Fatalf("rules = %s; want two joins while only two nodes take VMs", got)
+	}
+	if !slices.Equal(out.Overflow, []string{key(2), key(3)}) {
+		t.Fatalf("overflow = %v; want 2 and 3 waiting for room in their place's rule", out.Overflow)
 	}
 }
 

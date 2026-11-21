@@ -83,6 +83,11 @@ type Input struct {
 	// MaxRules caps the rules written for the group. 0 means
 	// DefaultMaxRules.
 	MaxRules int
+	// Spread is how many domains the group's block rules take turns
+	// numbering among, the AZs the configuration defines, so that a
+	// domain's rules keep their names whichever domains hold members. 0
+	// means the highest Ord in Domains.
+	Spread int
 }
 
 // Output is the layout's plan.
@@ -100,8 +105,9 @@ type Output struct {
 	// Overflow holds the joinable members left out of every rule because no
 	// rule had room for them.
 	Overflow []string
-	// Refused maps each joinable member that every rule with room refused
-	// to the rules that refused it.
+	// Refused maps each joinable member that the rule of its place refused
+	// to the rule that refused it. The member keeps its place, so no other
+	// member moves for it.
 	Refused map[string][]string
 	// Alone holds the members the plan put alone in a block or stride rule,
 	// which writes no rule, while another rule of the same kind holds two.
@@ -154,7 +160,6 @@ type layout struct {
 	members map[string]*mstate
 	chunks  map[int][]string
 	pats    map[int][]string
-	used    map[int]bool
 	out     *Output
 }
 
@@ -165,9 +170,9 @@ const settleRounds = 8
 // Layout plans the rules of one group. It plans again from the rules each
 // plan asks for until the plan stops changing, so the plan it returns is one
 // that the next plan of the same group keeps. A single plan can stop short of
-// that, for example when a member's move in one domain frees a rule number
-// another domain then takes, and every extra plan the rule writer made to get
-// there would cost a write that can migrate a member. The members a plan
+// that, for example when the rules one term plans change what the join check
+// lets into another term's rules, and every extra plan the rule writer made to
+// get there would cost a write that can migrate a member. The members a plan
 // displaced stay reported, because a later round no longer sees their place.
 func Layout(in Input) Output {
 	out := layoutOnce(in)
@@ -233,7 +238,6 @@ func layoutOnce(in Input) Output {
 		members: map[string]*mstate{},
 		chunks:  map[int][]string{},
 		pats:    map[int][]string{},
-		used:    map[int]bool{},
 		out:     &Output{Rules: map[string][]string{}, Refused: map[string][]string{}},
 	}
 	l.out.Unsafe = l.p.Unsafe
@@ -296,13 +300,6 @@ func (l *layout) loadRules() {
 		}
 		if n, ok := PatternRuleIndex(l.in.Base, name); ok {
 			l.pats[n] = present
-		}
-	}
-	// Every block rule is claimed by the domain of its best-ranked member,
-	// and its number stays in use while it is claimed.
-	for n, keys := range l.chunks {
-		if len(keys) > 0 {
-			l.used[n] = true
 		}
 	}
 }
@@ -443,35 +440,17 @@ func joinRoom(capacity int, dom Domain) int {
 	return capacity
 }
 
-// planBlock fills the domain's block rules.
+// planBlock fills the domain's block rules. The block rules of a group's
+// domains take turns in their numbering, in domain order: with two domains,
+// the first domain's places are rules 1, 3, and 5, and the second's are 2, 4,
+// and 6. So a domain's n-th place is always the same rule, whatever the other
+// domains hold.
 func (l *layout) planBlock(dom Domain, ms []*mstate, t Term, term int) []candRule {
-	// The domain's rules are the block rules whose best-ranked member is in
-	// it.
-	existing := map[int][]string{}
-	for n, keys := range l.chunks {
-		if b := l.best(keys); b != nil && b.Domain == dom.Key {
-			existing[n] = keys
-		}
-	}
+	spread, pos := l.spread(), max(dom.Ord-1, 0)
 	f := filler{
-		l: l, members: ms, existing: existing,
-		name: func(n int) string { return ChunkName(l.in.Base, n) },
-		next: func() int {
-			for n := 1; ; n++ {
-				if !l.used[n] {
-					l.used[n] = true
-					return n
-				}
-			}
-		},
-		peek: func() int {
-			n := 1
-			for l.used[n] {
-				n++
-			}
-			return n
-		},
-		release:  func(n int) { delete(l.used, n) },
+		l: l, members: ms, existing: l.chunks,
+		number:   func(slot int) int { return slot*spread + pos + 1 },
+		name:     func(n int) string { return ChunkName(l.in.Base, n) },
 		capacity: blockCap(t, dom, l.p.Unsafe),
 		dom:      dom,
 	}
@@ -480,6 +459,16 @@ func (l *layout) planBlock(dom Domain, ms []*mstate, t Term, term int) []candRul
 		l.out.Alone = append(l.out.Alone, singles...)
 	}
 	return rules
+}
+
+// spread returns how many domains take turns in the block rule numbering:
+// Input.Spread when set, and otherwise the highest domain Ord, or 1.
+func (l *layout) spread() int {
+	n := max(l.in.Spread, 1)
+	for _, d := range l.in.Domains {
+		n = max(n, d.Ord)
+	}
+	return n
 }
 
 // planStride fills the rules of each residue class of the domain.
@@ -493,42 +482,28 @@ func (l *layout) planStride(dom Domain, ms []*mstate, t Term, term int) []candRu
 				cms = append(cms, m)
 			}
 		}
-		existing := map[int][]string{}
-		used := map[int]bool{}
-		for n, keys := range l.pats {
-			d, tt, local := SplitPatternRuleNumber(n)
-			c, chunk := SplitStrideLocal(local)
-			if d == dom.Ord && tt == term && c == class && chunk >= 1 && len(keys) > 0 {
-				existing[chunk] = keys
-				used[chunk] = true
-			}
-		}
 		if len(cms) == 0 {
 			continue
 		}
+		existing := map[int][]string{}
+		for n, keys := range l.pats {
+			d, tt, local := SplitPatternRuleNumber(n)
+			c, chunk := SplitStrideLocal(local)
+			if d == dom.Ord && tt == term && c == class && chunk >= 1 {
+				existing[chunk] = keys
+			}
+		}
 		f := filler{
 			l: l, members: cms, existing: existing,
+			number: func(slot int) int {
+				if slot+1 > MaxChunk {
+					return 0
+				}
+				return slot + 1
+			},
 			name: func(n int) string {
 				return PatternRuleName(l.in.Base, PatternRuleNumber(dom.Ord, term, StrideLocal(class, n)))
 			},
-			next: func() int {
-				for n := 1; n <= MaxChunk; n++ {
-					if !used[n] {
-						used[n] = true
-						return n
-					}
-				}
-				return 0
-			},
-			peek: func() int {
-				for n := 1; n <= MaxChunk; n++ {
-					if !used[n] {
-						return n
-					}
-				}
-				return 0
-			},
-			release:  func(n int) { delete(used, n) },
 			capacity: blockCap(Term{}, dom, l.p.Unsafe),
 			dom:      dom,
 		}
@@ -544,246 +519,147 @@ func (l *layout) planStride(dom Domain, ms []*mstate, t Term, term int) []candRu
 	return out
 }
 
-// filler fills one sequence of rules, a block or one stride class, from the
-// lowest index.
+// filler lays out one sequence of rules, a block or one stride class, by
+// position. The layout of the sequence is a function of its members and its
+// holds alone, so it is the same whatever order the members joined in.
 type filler struct {
-	l        *layout
-	members  []*mstate
+	l       *layout
+	members []*mstate
+	// existing holds the rules of the sequence now, by number.
 	existing map[int][]string
-	name     func(int) string
-	next     func() int
-	peek     func() int
-	release  func(int)
+	// number returns the rule number of the sequence's place slot, counted
+	// from 0, or 0 when the sequence has no number for it.
+	number func(slot int) int
+	// name returns the name of the rule numbered n.
+	name     func(n int) string
 	capacity int
 	dom      Domain
 }
 
-// fillRun carries one fill's working state.
-type fillRun struct {
-	room    int
-	inChunk map[string]int
-	order   []int
-	ranked  []*mstate
-	desired map[int][]string
-	placed  map[string]bool
-	opened  map[int]bool
-	first   int
-	rest    []int
-}
-
-// fill lays the members out. The first rule holds the lowest-ranked members
-// up to the cap. Every other member keeps its rule while the rule is within
-// the cap, and the rest join the lowest rule with room, in index order, or
-// open a new one when split allows it. It returns the rules and the members
-// left alone in a rule.
+// fill lays the members out. Each index's primary, and each joinable member
+// with no index after them by key, takes the next position in rank order,
+// held places included, and the n-th rule of the sequence holds the n-th run
+// of capacity positions. Without split only the first run is written. A
+// member keeps its place in its rule whether or not it may join, and a member
+// that is not in its rule yet joins it while the rule has room and the join
+// check lets it in. A member that may not join, or that the check refuses,
+// still takes its position, so no other member shifts. An older member of an
+// index keeps its rule only while the rule has room after the positions are
+// placed. It returns the rules and the members left alone in a rule.
 func (f *filler) fill(term int) ([]candRule, []string) {
 	if f.capacity < 2 {
 		return nil, nil
 	}
-	r := f.start()
-	f.fillFirst(r)
-	r.rest = r.order
-	if len(r.rest) > 0 && r.rest[0] == r.first {
-		r.rest = r.rest[1:]
-	}
-	if f.l.in.Split {
-		f.keepRest(r)
-	}
-	f.placeRest(r)
-	all := append([]int{}, r.rest...)
-	if r.first != 0 {
-		all = append([]int{r.first}, all...)
-	}
-	// A number this fill opened for a rule that ends below two members is
-	// handed back, so the next domain's rules number on from the last rule
-	// written.
-	for n := range r.opened {
-		if len(r.desired[n]) < 2 {
-			f.release(n)
+	l := f.l
+	room := joinRoom(f.capacity, f.dom)
+	inRule := map[string]bool{}
+	for _, keys := range f.existing {
+		for _, k := range keys {
+			inRule[k] = true
 		}
 	}
-	return f.rules(term, all, r.desired)
-}
-
-// start records which rule holds each member now and ranks the members the
-// fill places: those in a rule and those that may join one.
-func (f *filler) start() *fillRun {
-	r := &fillRun{
-		room:    joinRoom(f.capacity, f.dom),
-		inChunk: map[string]int{},
-		desired: map[int][]string{},
-		placed:  map[string]bool{},
-		opened:  map[int]bool{},
-	}
-	for n := range f.existing {
-		r.order = append(r.order, n)
-	}
-	slices.Sort(r.order)
-	for _, n := range r.order {
-		for _, k := range f.existing[n] {
-			if _, ok := r.inChunk[k]; !ok {
-				r.inChunk[k] = n
-			}
-		}
-	}
+	var positions, older []*mstate
 	for _, m := range f.members {
-		if _, in := r.inChunk[m.Key]; in || m.joinable {
-			r.ranked = append(r.ranked, m)
-		}
-	}
-	// The first rule is the lowest-numbered rule the fill holds, unless a
-	// lower number is free, so the base name always leads and skip keeps
-	// only it.
-	if len(r.order) > 0 {
-		if p := f.peek(); p == 0 || p > r.order[0] {
-			r.first = r.order[0]
-		}
-	}
-	return r
-}
-
-// fillFirst fills the first rule with the lowest-ranked members up to the
-// cap. A member already in it stays, and a new one joins while there is room
-// and the rule takes it. A new member whose index is unknown only fills the
-// room the members ranked by index leave, so it never displaces a member
-// already in the rule, and one that a later rule holds keeps that rule,
-// because the key order it ranks by is no reason to move it. Without split
-// the later rules go, so such a member fills the room like one in no rule.
-func (f *filler) fillFirst(r *fillRun) {
-	l := f.l
-	order := make([]*mstate, 0, len(r.ranked))
-	var unindexed []*mstate
-	for _, m := range r.ranked {
-		n, held := r.inChunk[m.Key]
 		switch {
-		case m.Index >= 0 || r.first != 0 && n == r.first:
-			order = append(order, m)
-		case !held || !l.in.Split:
-			unindexed = append(unindexed, m)
-		}
-	}
-	order = append(order, unindexed...)
-	for _, m := range order {
-		if r.first != 0 && len(r.desired[r.first]) >= f.capacity {
-			return
-		}
-		switch {
-		case r.first != 0 && r.inChunk[m.Key] == r.first:
-		case m.joinable && (r.first == 0 || len(r.desired[r.first]) < r.room):
-			if r.first != 0 && len(r.desired[r.first]) > 0 &&
-				!l.canJoin(f.name(r.first), r.desired[r.first], m.Key) {
-				l.refuse(m.Key, f.name(r.first))
-				continue
-			}
-			if r.first == 0 {
-				r.first = f.next()
-				if r.first == 0 {
-					continue
-				}
-				r.opened[r.first] = true
-				r.order = append([]int{r.first}, r.order...)
-			}
-		default:
-			continue
-		}
-		r.desired[r.first] = append(r.desired[r.first], m.Key)
-		r.placed[m.Key] = true
-	}
-}
-
-// keepRest keeps every member of a later rule in it while the rule is within
-// the cap, in rank order.
-func (f *filler) keepRest(r *fillRun) {
-	for _, n := range r.rest {
-		for _, m := range r.ranked {
-			if !r.placed[m.Key] && r.inChunk[m.Key] == n && len(r.desired[n]) < f.capacity {
-				r.desired[n] = append(r.desired[n], m.Key)
-				r.placed[m.Key] = true
-			}
-		}
-	}
-}
-
-// placeRest places the members still pending. Under split each one fits the
-// lowest rule that takes it, and otherwise it is left out and recorded.
-func (f *filler) placeRest(r *fillRun) {
-	l := f.l
-	for _, m := range r.ranked {
-		if r.placed[m.Key] {
-			continue
-		}
-		if !m.joinable {
+		case !m.primary:
+			older = append(older, m)
+		case m.Index >= 0 || m.joinable:
+			positions = append(positions, m)
+		case inRule[m.Key]:
 			l.out.Displaced = append(l.out.Displaced, m.Key)
-			continue
 		}
-		if !l.in.Split {
-			l.out.Overflow = append(l.out.Overflow, m.Key)
-			continue
-		}
-		n, isNew := f.fit(m, r.rest, r.desired, r.room)
-		if n == 0 {
-			continue
-		}
-		if isNew {
-			r.opened[n] = true
-			r.rest = append(r.rest, n)
-		}
-		r.desired[n] = append(r.desired[n], m.Key)
-		r.placed[m.Key] = true
 	}
+	var runs [][]*mstate
+	for start := 0; start < len(positions); {
+		end := len(positions)
+		if f.capacity < end-start {
+			end = start + f.capacity
+		}
+		runs = append(runs, positions[start:end])
+		start = end
+	}
+	if !l.in.Split && len(runs) > 1 {
+		for _, run := range runs[1:] {
+			f.leaveOut(run, inRule)
+		}
+		runs = runs[:1]
+	}
+	desired := make([][]string, len(runs))
+	numbers := make([]int, len(runs))
+	for slot, run := range runs {
+		numbers[slot] = f.number(slot)
+		if numbers[slot] == 0 {
+			f.leaveOut(run, inRule)
+			continue
+		}
+		desired[slot] = f.place(numbers[slot], run, room, inRule)
+	}
+	for _, m := range older {
+		slot := slices.IndexFunc(numbers, func(n int) bool { return n != 0 && slices.Contains(f.existing[n], m.Key) })
+		switch {
+		case slot >= 0 && len(desired[slot]) < f.capacity:
+			desired[slot] = append(desired[slot], m.Key)
+		case inRule[m.Key]:
+			l.out.Displaced = append(l.out.Displaced, m.Key)
+		}
+	}
+	return f.rules(term, numbers, desired)
 }
 
-// fit finds the rule a pending member joins: the lowest rule after the first
-// that holds members and has room and that takes it, then a rule a delete
-// left with no members when no rule refused it, and then a new rule when no
-// rule had room. It returns 0 when the member stays out, and records why.
-func (f *filler) fit(m *mstate, rest []int, desired map[int][]string, room int) (int, bool) {
+// place settles who is in the rule numbered n, whose place holds run. A
+// member the rule holds now stays. Every other member joins in rank order
+// while the rule has room and the join check lets it in.
+func (f *filler) place(n int, run []*mstate, room int, inRule map[string]bool) []string {
 	l := f.l
-	roomy := false
-	var refused []string
-	for _, n := range rest {
-		if len(desired[n]) == 0 || len(desired[n]) >= room {
-			continue
-		}
-		roomy = true
-		if !l.canJoin(f.name(n), desired[n], m.Key) {
-			refused = append(refused, f.name(n))
-			continue
-		}
-		return n, false
-	}
-	for _, n := range rest {
-		if len(desired[n]) != 0 || room <= 0 {
-			continue
-		}
-		roomy = true
-		if len(refused) == 0 {
-			return n, false
+	var keys []string
+	for _, m := range run {
+		if slices.Contains(f.existing[n], m.Key) {
+			keys = append(keys, m.Key)
 		}
 	}
-	if !roomy && room > 0 {
-		if n := f.next(); n != 0 {
-			return n, true
+	for _, m := range run {
+		switch {
+		case slices.Contains(keys, m.Key):
+		case !m.joinable:
+			if inRule[m.Key] {
+				l.out.Displaced = append(l.out.Displaced, m.Key)
+			}
+		case len(keys) >= room:
+			l.out.Overflow = append(l.out.Overflow, m.Key)
+		case len(keys) > 0 && !l.canJoin(f.name(n), keys, m.Key):
+			l.refuse(m.Key, f.name(n))
+		default:
+			keys = append(keys, m.Key)
 		}
 	}
-	if len(refused) > 0 {
-		for _, r := range refused {
-			l.refuse(m.Key, r)
+	return keys
+}
+
+// leaveOut records the members of a run that no rule is written for: those
+// that may join as left out for want of room, and those that may not as
+// displaced when they had a place.
+func (f *filler) leaveOut(run []*mstate, inRule map[string]bool) {
+	for _, m := range run {
+		switch {
+		case m.joinable:
+			f.l.out.Overflow = append(f.l.out.Overflow, m.Key)
+		case inRule[m.Key]:
+			f.l.out.Displaced = append(f.l.out.Displaced, m.Key)
 		}
-	} else {
-		l.out.Overflow = append(l.out.Overflow, m.Key)
 	}
-	return 0, false
 }
 
 // rules turns a fill's desired members into candidate rules, and returns the
 // members left alone in a rule, which the caller reports as unprotected when
 // the term writes any rule.
-func (f *filler) rules(term int, order []int, desired map[int][]string) ([]candRule, []string) {
+func (f *filler) rules(term int, numbers []int, desired [][]string) ([]candRule, []string) {
 	var out []candRule
 	var singles []string
-	for _, n := range order {
-		keys := desired[n]
+	for slot, keys := range desired {
+		n := numbers[slot]
+		if n == 0 {
+			continue
+		}
 		if len(keys) == 1 {
 			singles = append(singles, keys[0])
 			if f.l.out.AloneIn == nil {
