@@ -356,7 +356,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** A node an operator has explicitly put into HA maintenance state is being drained for a reason; placing a new VM there works against that intent.
 
-**CPI behavior.** The node health check always runs, and it excludes from candidate scoring any node that PVE's HA subsystem reports in a `maintenance`, `error`, `fence`, or `recovery` state, as it does any node whose notes carry a `tags:` line with a tag listed in `pve.placement.maintenance_node_tags`. HA maintenance is the first choice for taking a node out of service, because it drains the node, and the notes marker is for keeping the CPI off a node without it. Leaving that property unset gives the tag `maintenance`, and setting it to `[]` turns the notes marker off, so the CPI reads no notes, while the health check keeps running. A node whose notes the CPI cannot read is left out of placement.
+**CPI behavior.** The node health check always runs, and it excludes from candidate scoring any node that PVE's HA subsystem reports in a `maintenance`, `error`, `fence`, or `recovery` state, as it does any node whose notes carry a `tags:` line with a tag listed in `pve.placement.maintenance_node_tags`. HA maintenance is the first choice for taking a node out of service, because it drains the node, and the notes marker is for keeping the CPI off a node without HA maintenance. Leaving that property unset gives the tag `maintenance`, and setting it to `[]` turns the notes marker off, so the CPI reads no notes, while the health check keeps running. A node whose notes the CPI cannot read is left out of placement.
 
 **Status.** Meets.
 

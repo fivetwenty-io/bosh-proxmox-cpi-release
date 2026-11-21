@@ -333,7 +333,7 @@ properties:
       records on each member's HA resource, is longer than 1024 characters.
       See docs/ha-and-resurrection.md for the kinds and examples.
 
-      Overridable per cpi-config entry under pve_ha.
+      A cpi-config entry can override it under pve_ha.
   pve.ha.pin_az:
     description: |
       Whether the CPI folds a VM's AZ node set into its HA node-affinity pin.
