@@ -363,18 +363,6 @@ func (l *layout) domainMembers(dk string) []*mstate {
 	return out
 }
 
-// best returns the best-ranked present member of keys, or nil.
-func (l *layout) best(keys []string) *mstate {
-	var b *mstate
-	for _, k := range keys {
-		m := l.members[k]
-		if m != nil && (b == nil || rankCmp(m, b) < 0) {
-			b = m
-		}
-	}
-	return b
-}
-
 // planDomain plans the rules of one domain and returns them, trimmed.
 func (l *layout) planDomain(dk string) []candRule {
 	dom := l.domain(dk)
