@@ -29,6 +29,8 @@ type commentRig struct {
 	writes   int
 	noDigest bool
 	missing  bool
+	// readErr, when set, makes every read fail with it.
+	readErr error
 	// before runs before each write, so a test can change the comment the
 	// way a concurrent writer would.
 	before func(r *commentRig)
@@ -44,6 +46,9 @@ func (r *commentRig) digest() string {
 func (r *commentRig) GetHaResources(_ context.Context, sid string) (*sdkcluster.GetHaResourcesResponse, error) {
 	if r.missing {
 		return nil, errors.New("no such resource")
+	}
+	if r.readErr != nil {
+		return nil, r.readErr
 	}
 	var c *string
 	if r.comment != nil {
@@ -142,5 +147,18 @@ func TestEditResourceCommentNeedsADigest(t *testing.T) {
 	wrote, err := EditResourceComment(context.Background(), rig, "vm:100", commentOwnedByUs, addHold)
 	if err == nil || wrote || rig.writes != 0 {
 		t.Fatalf("wrote = %v, err = %v, writes %d; want no write without a digest", wrote, err, rig.writes)
+	}
+}
+
+// TestEditResourceCommentNamesItsOwnFeature pins that a failed read during a
+// comment edit, such as an anti-affinity hold write, is reported as a comment
+// edit and not as the failback hold's read.
+func TestEditResourceCommentNamesItsOwnFeature(t *testing.T) {
+	t.Parallel()
+	rig := &commentRig{readErr: errors.New("connection refused")}
+	_, err := EditResourceComment(context.Background(), rig, "vm:100", commentOwnedByUs, addHold)
+	if err == nil || !strings.Contains(err.Error(), "ha comment: read the HA resource vm:100") ||
+		strings.Contains(err.Error(), "failback") {
+		t.Fatalf("err = %v; want a comment edit's read error that names no failback", err)
 	}
 }

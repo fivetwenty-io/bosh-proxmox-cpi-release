@@ -122,7 +122,7 @@ func EditResourceComment(
 		return false, cpierrors.Cloud("ha comment: the resource client, the ownership check, and the edit must be set")
 	}
 	for attempt := 1; ; attempt++ {
-		got, err := readOwnedResource(ctx, api, sid, owned)
+		got, err := readOwnedResource(ctx, api, "ha comment", sid, owned)
 		if err != nil || got == nil {
 			return false, err
 		}

@@ -125,7 +125,7 @@ func HoldFailback(ctx context.Context, api FailbackAPI, sid string, now time.Tim
 	}
 	var why string
 	for attempt := 1; ; attempt++ {
-		got, err := readOwnedResource(ctx, api, sid, owned)
+		got, err := readOwnedResource(ctx, api, "ha failback", sid, owned)
 		if err != nil || got == nil {
 			return "", err
 		}
@@ -181,7 +181,7 @@ func ReleaseFailbackHold(ctx context.Context, api FailbackAPI, sid, tok string, 
 		return false, cpierrors.Cloud("ha failback: the resource client and the ownership check must be set")
 	}
 	for attempt := 1; ; attempt++ {
-		got, err := readOwnedResource(ctx, api, sid, owned)
+		got, err := readOwnedResource(ctx, api, "ha failback", sid, owned)
 		if err != nil || got == nil {
 			return false, err
 		}
@@ -213,8 +213,9 @@ func ReleaseFailbackHold(ctx context.Context, api FailbackAPI, sid, tok string, 
 
 // readOwnedResource reads the resource sid for a writer of its comment. It
 // returns nil and no error for a resource that is missing or whose comment
-// owned does not accept, which the writer leaves alone.
-func readOwnedResource(ctx context.Context, api FailbackAPI, sid string, owned func(string) bool) (
+// owned does not accept, which the writer leaves alone. label names the
+// writer in an error, such as "ha failback" or "ha comment".
+func readOwnedResource(ctx context.Context, api FailbackAPI, label, sid string, owned func(string) bool) (
 	*sdkcluster.GetHaResourcesResponse, error,
 ) {
 	got, err := api.GetHaResources(ctx, sid)
@@ -223,9 +224,9 @@ func readOwnedResource(ctx context.Context, api FailbackAPI, sid string, owned f
 		return nil, nil
 	case err != nil:
 		return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("ha failback: read the HA resource %s", sid))
+			fmt.Sprintf("%s: read the HA resource %s", label, sid))
 	case got == nil:
-		return nil, cpierrors.Retriable("ha failback: the read of the HA resource %s returned nothing", sid)
+		return nil, cpierrors.Retriable("%s: the read of the HA resource %s returned nothing", label, sid)
 	case got.Comment == nil || !owned(*got.Comment):
 		return nil, nil
 	}
