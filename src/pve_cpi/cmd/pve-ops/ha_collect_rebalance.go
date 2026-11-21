@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"maps"
 	"math"
 	"slices"
@@ -68,7 +69,8 @@ func (c *haCollector) rebalancePendingFindings() {
 }
 
 // spreadSkewedFindings advises a rebalance when the dry run of pve-ops ha
-// rebalance would move a VM back into its AZ, or when the spread of committed
+// rebalance would move a VM back into its AZ or pull apart two members of an
+// anti-affinity rule that share a node, or when the spread of committed
 // memory across the nodes passes the rebalance's start threshold. The advice
 // never fails the doctor, and it appears only when the doctor's own reads and
 // the dry run's reads succeeded, because a plan built on a failed read could
@@ -87,14 +89,18 @@ func (c *haCollector) spreadSkewedFindings() {
 			return
 		}
 	}
-	outside := 0
+	outside, separate := 0, 0
 	for i := range rep.Moves {
-		if rep.Moves[i].Phase == harebalance.PhaseRestore {
+		switch rep.Moves[i].Phase {
+		case harebalance.PhaseRestore:
 			outside++
+		case harebalance.PhaseSeparate:
+			separate++
+		case harebalance.PhaseSpread:
 		}
 	}
 	spread := int(math.Round(rep.SpreadBefore * 100))
-	if outside == 0 && rep.SpreadBefore <= handlers.RebalanceDefaultStart {
+	if outside == 0 && separate == 0 && rep.SpreadBefore <= handlers.RebalanceDefaultStart {
 		return
 	}
 	subject := rep.Cluster
@@ -105,9 +111,18 @@ func (c *haCollector) spreadSkewedFindings() {
 	if outside == 1 {
 		vms = "HA VM of this Director runs outside its AZ"
 	}
+	apart := ""
+	if separate > 0 {
+		noun, pron := "moves that pull", "them"
+		if separate == 1 {
+			noun, pron = "move that pulls", "it"
+		}
+		apart = fmt.Sprintf(" The dry run also has %d %s apart members of an anti-affinity rule sharing a node, "+
+			"and a rebalance would make %s too.", separate, noun, pron)
+	}
 	c.rep.advise(haKindSpreadSkewed, subject,
 		"%d %s, and the committed memory of the nodes spreads %d "+
 			"points from the fullest node to the emptiest, against a start threshold of %d. Run pve-ops ha "+
-			"rebalance --director-uuid %s to see the moves a rebalance would make, and add --apply to make them",
+			"rebalance --director-uuid %s to see the moves a rebalance would make, and add --apply to make them."+apart,
 		outside, vms, spread, int(math.Round(handlers.RebalanceDefaultStart*100)), haOwnerValue(c.owner))
 }

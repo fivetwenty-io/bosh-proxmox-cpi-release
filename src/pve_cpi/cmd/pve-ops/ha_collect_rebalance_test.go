@@ -144,6 +144,38 @@ func TestCollectSpreadSkewedAdvisesTheDryRun(t *testing.T) {
 	}
 }
 
+// separationPlan is the dry run of a lab cluster whose anti-affinity members
+// shared nodes, with two separation moves and a spread of 6 points.
+func separationPlan() handlers.RebalanceReport {
+	return handlers.RebalanceReport{Cluster: "prod-east", SpreadBefore: 0.06,
+		Gates: []handlers.RebalanceGate{{Name: handlers.RebalanceGateProfile, OK: true}},
+		Moves: []handlers.RebalanceMove{{VMID: 1, Phase: harebalance.PhaseSeparate},
+			{VMID: 2, Phase: harebalance.PhaseSeparate}}}
+}
+
+func TestCollectSpreadSkewedCountsSeparationMoves(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	f.plan = separationPlan()
+	want(t, runCollect(t, f, haCfg("auto", "none")), haKindSpreadSkewed, haSeverityAdvice, "prod-east",
+		"2 moves that pull apart members of an anti-affinity rule sharing a node", "spreads 6 points",
+		"pve-ops ha rebalance --director-uuid "+haDirector)
+
+	f = haBaseFake()
+	f.plan = separationPlan()
+	f.plan.Moves = f.plan.Moves[:1]
+	want(t, runCollect(t, f, haCfg("auto", "none")), haKindSpreadSkewed, haSeverityAdvice,
+		"1 move that pulls apart members of an anti-affinity rule sharing a node")
+}
+
+func TestCollectSpreadSkewedStaysQuietWithNoMoves(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	f.plan = separationPlan()
+	f.plan.Moves = nil
+	wantNone(t, runCollect(t, f, haCfg("auto", "none")), haKindSpreadSkewed)
+}
+
 func TestCollectSpreadSkewedFiresOnEitherSignal(t *testing.T) {
 	t.Parallel()
 	for name, tc := range map[string]struct {
