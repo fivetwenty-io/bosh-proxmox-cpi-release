@@ -1577,8 +1577,8 @@ properties:
       or a form like "tags = x" never counts. The list splits on commas, semicolons,
       and whitespace, and every marker line counts. A node that carries the marker is
       excluded from placement, and a target_node that carries it is refused with a
-      retriable error. The CPI reads each placeable node's notes at most once per
-      create_vm, asks a node whose read fails at most twice, reads only the pinned
+      retriable error. Each CPI call reads each placeable node's notes at most once,
+      asks a node whose read fails at most twice, reads only the pinned
       node's notes for a target_node, and reads nothing when this list is empty. A
       node whose notes cannot be read on the second try is left out of placement,
       and the create goes on with the other nodes. It fails with a retriable error

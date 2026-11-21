@@ -2,12 +2,14 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/agent"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	stemcellfetch "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/stemcell_fetch"
@@ -190,12 +192,24 @@ func backendResolverOrDefault(d Deps) pve.BackendResolver {
 // a programming mistake (e.g. a typo in a method name) that must be caught at
 // startup rather than silently producing a broken dispatcher. Every handler is
 // wrapped so that a request that takes the HA rules lock runs the replica
-// widening sweep after its work (see withReplicaWidenSweep).
+// widening sweep after its work (see withReplicaWidenSweep), and so that the
+// whole call, sweep included, shares one read of each node's notes (see
+// withNodeNotesCache).
 func mustRegister(d *cpi.Dispatcher, method string, h Handler) {
 	// invariant violation: unknown or duplicate method name passed at startup; cannot occur at runtime
-	if err := d.Register(method, withReplicaWidenSweep(h)); err != nil {
+	if err := d.Register(method, withNodeNotesCache(withReplicaWidenSweep(h))); err != nil {
 		panic("cpi: RegisterAll: " + err.Error())
 	}
+}
+
+// withNodeNotesCache runs h with a node notes cache for the call. Every node
+// health read of the call, such as each HA profile that set_vm_metadata,
+// attach_disk, or delete_vm resolves, then reads a node's notes at most once,
+// and a node whose read fails at most twice, instead of once per read.
+func withNodeNotesCache(h Handler) Handler {
+	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		return h.Handle(pve.WithNodeNotesCache(ctx), args, reqCtx)
+	})
 }
 
 // RegisterAll installs every CPI handler onto d. main.go calls this
