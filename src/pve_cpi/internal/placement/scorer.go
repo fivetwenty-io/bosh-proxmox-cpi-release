@@ -503,6 +503,10 @@ func computeScore(f NodeFacts, w Weights, avoidNodes map[string]int) float64 {
 	if w.AntiAffinity > 0 && sameGroup > 0 {
 		score -= w.AntiAffinity * float64(sameGroup)
 	}
+	// The partner penalty scales with AntiAffinity on purpose. No property
+	// sets that weight, and create_vm and the storage placement plan set it to
+	// the default whenever the group is known, which is the only time they
+	// count partners, so the penalty is always on when there are partners.
 	if w.AntiAffinity > 0 && f.PartnerCount > 0 {
 		score -= w.AntiAffinity * PartnerWeight * float64(f.PartnerCount)
 	}
