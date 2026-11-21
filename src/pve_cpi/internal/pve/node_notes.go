@@ -183,6 +183,22 @@ func fetchNodeNotes(ctx context.Context, nodesAPI NodeHealthNodes, node string) 
 	return notes, nil
 }
 
+// notesUnreadReasonPrefix starts the reason of a node whose notes could not
+// be read.
+const notesUnreadReasonPrefix = "its notes could not be read to check them for a maintenance tag"
+
+// NotesUnreadReason is the reason node health gives a node whose notes read
+// failed with err.
+func NotesUnreadReason(err error) string {
+	return notesUnreadReasonPrefix + ": " + err.Error()
+}
+
+// IsNotesUnreadReason reports whether reason, or a rejection that quotes it,
+// says a node's notes could not be read.
+func IsNotesUnreadReason(reason string) bool {
+	return strings.Contains(reason, notesUnreadReasonPrefix)
+}
+
 // applyNodeNotes reads the notes of every placeable node and takes out of
 // placement each one whose notes carry a tag of want. Only a placeable node is
 // read, because the marker can only take a node out of placement, and a node
@@ -210,7 +226,7 @@ func applyNodeNotes(ctx context.Context, nodesAPI NodeHealthNodes, r *NodeHealth
 		if err != nil {
 			e.Placeable = false
 			e.NotesUnread = true
-			e.Reason = "its notes could not be read to check them for a maintenance tag: " + err.Error()
+			e.Reason = NotesUnreadReason(err)
 			errs = append(errs, fmt.Errorf("node %s: %w", e.Name, err))
 			continue
 		}

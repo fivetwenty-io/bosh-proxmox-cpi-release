@@ -300,6 +300,13 @@ func resolveTargetNodeWithBridges(
 					localPin,
 				)
 			}
+			if pinnedFact.NotesUnread {
+				return "", nil, cpierrors.Retriable(
+					"create_vm: local disk is pinned to node %q but that node's notes could not be read, "+
+						"so nothing rules out a maintenance tag on it (%s); retry once the node answers",
+					localPin, pinnedFact.UnplaceableReason,
+				)
+			}
 			if pinnedFact.InMaintenance && pinnedFact.UnplaceableReason != "" {
 				return "", nil, cpierrors.Cloud(
 					"create_vm: local disk is pinned to node %q but that node "+
@@ -949,10 +956,19 @@ func mergeRejections(dst, src map[string]string) {
 // classifyFilterResult returns true when all rejection reasons are transient
 // (node may come back without operator intervention). Returns true on empty
 // rejections (cluster temporarily unreachable → retriable).
-// Returns false when any rejection is a permanent misconfiguration.
+// Returns false when any rejection is a permanent misconfiguration, unless a
+// node was left out only because its notes could not be read.
 func classifyFilterResult(rejections map[string]string) (retriable bool) {
 	if len(rejections) == 0 {
 		return true // no facts = cluster may be temporarily unreachable
+	}
+	// A node left out only because its notes could not be read can take the
+	// VM once it answers, so the exhaustion is retriable whatever the other
+	// nodes were rejected for.
+	for _, reason := range rejections {
+		if placement.IsUnplaceableRejection(reason) && pve.IsNotesUnreadReason(reason) {
+			return true
+		}
 	}
 	for _, reason := range rejections {
 		if !isTransientRejectionReason(reason) {

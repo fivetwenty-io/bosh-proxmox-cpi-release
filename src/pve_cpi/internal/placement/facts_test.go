@@ -1062,18 +1062,20 @@ func TestGatherNodeFacts_RetriesAFailedNotesReadOnce(t *testing.T) {
 	}
 }
 
-// TestGatherNodeFacts_FailsWhenTheNotesReadFailsTwiceAndHealthIsRequired pins
-// that a notes read that fails on its retry too fails the gather with
-// ErrNodeHealthUnavailable, because nothing then rules out a maintenance tag.
-func TestGatherNodeFacts_FailsWhenTheNotesReadFailsTwiceAndHealthIsRequired(t *testing.T) {
+// TestGatherNodeFacts_LeavesOutAnUnreadNodeWhenHealthIsRequired pins that a
+// notes read that fails on its retry too leaves only that node out, marked
+// NotesUnread with the read's cause, and does not fail the gather, so
+// placement goes on with the nodes that answered.
+func TestGatherNodeFacts_LeavesOutAnUnreadNodeWhenHealthIsRequired(t *testing.T) {
 	t.Parallel()
-	_, err := placement.GatherNodeFacts(context.Background(), taggedMaintenanceCluster(), markedNodes(1, 2),
+	facts, err := placement.GatherNodeFacts(context.Background(), taggedMaintenanceCluster(), markedNodes(1, 2),
 		nopLogger(), placement.GatherOptions{MaintenanceNodeTags: []string{"maintenance"}, RequireNodeHealth: true})
-	if !errors.Is(err, placement.ErrNodeHealthUnavailable) {
-		t.Fatalf("err = %v; want ErrNodeHealthUnavailable", err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if err == nil || !strings.Contains(err.Error(), "node config unavailable") {
-		t.Errorf("the error must carry the notes read's cause: %v", err)
+	if len(facts) != 1 || !facts[0].InMaintenance || !facts[0].NotesUnread ||
+		!strings.Contains(facts[0].UnplaceableReason, "node config unavailable") {
+		t.Fatalf("facts = %+v; want pve1 left out because its notes could not be read", facts)
 	}
 }
 

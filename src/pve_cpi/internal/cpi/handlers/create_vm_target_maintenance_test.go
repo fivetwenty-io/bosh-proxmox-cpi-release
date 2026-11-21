@@ -394,28 +394,50 @@ func TestCreateVM_ScoredPlacementLeavesOutANodeMarkedInItsNotes(t *testing.T) {
 	}
 }
 
-// TestCreateVM_ScoredPlacementRefusesWhenNotesStayUnreadable pins that a notes
-// read that fails on the health read and again on its retry counts as a
-// failed node health read, so the create stops with the retriable error and
-// no clone.
-func TestCreateVM_ScoredPlacementRefusesWhenNotesStayUnreadable(t *testing.T) {
+// TestCreateVM_ScoredPlacementLeavesOutANodeWhoseNotesStayUnreadable pins
+// that a node whose notes fail on the health read and again on its retry is
+// left out of placement, and the create goes on with the nodes that answered.
+// The unread node is asked twice in the call and no more.
+func TestCreateVM_ScoredPlacementLeavesOutANodeWhoseNotesStayUnreadable(t *testing.T) {
 	t.Parallel()
-	c := &maintenanceTargetCluster{notesFailures: map[string]int{"pve2": -1}}
+	for unread, want := range map[string]string{"pve1": "pve2", "pve2": "pve1"} {
+		t.Run(unread, func(t *testing.T) {
+			t.Parallel()
+			c := &maintenanceTargetCluster{notesFailures: map[string]int{unread: -1}}
+			created, on, err := createOnScoredNodeAt(t, c, nil)
+			if err != nil {
+				t.Fatalf("create_vm failed although %s's notes answered: %v", want, err)
+			}
+			if created != 1 || on != want {
+				t.Fatalf("create_vm created %d VMs on %q, want 1 on %q", created, on, want)
+			}
+			if n := c.readsOf(unread); n != 2 {
+				t.Fatalf("%s's notes were read %d times, want 2 (the failed read and its retry)", unread, n)
+			}
+		})
+	}
+}
+
+// TestCreateVM_ScoredPlacementRefusesWhenNoNodesNotesCanBeRead pins that a
+// create whose every candidate node has unreadable notes stops with a
+// retriable error and no clone, because the nodes come back and nothing rules
+// out a maintenance tag on any of them.
+func TestCreateVM_ScoredPlacementRefusesWhenNoNodesNotesCanBeRead(t *testing.T) {
+	t.Parallel()
+	c := &maintenanceTargetCluster{notesFailures: map[string]int{"pve1": -1, "pve2": -1}}
 	created, err := createOnScoredNode(t, c, nil)
 	if err == nil {
-		t.Fatal("create_vm placed a VM although a node's notes stayed unreadable")
+		t.Fatal("create_vm placed a VM although no node's notes could be read")
 	}
 	var typed *cpierrors.Error
 	if !errors.As(err, &typed) || !typed.OkToRetry() {
 		t.Fatalf("want a retriable error, got %T %v", err, err)
 	}
-	for _, want := range []string{"cannot tell which nodes are in maintenance", "failed twice", "node config unavailable"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("error %q does not contain %q", err, want)
-		}
+	if !strings.Contains(err.Error(), "notes") {
+		t.Fatalf("error %q does not say the node notes could not be read", err)
 	}
 	if created != 0 {
-		t.Fatal("create_vm created a VM although a node's notes stayed unreadable")
+		t.Fatal("create_vm created a VM although no node's notes could be read")
 	}
 }
 

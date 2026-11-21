@@ -1579,8 +1579,10 @@ properties:
       excluded from placement, and a target_node that carries it is refused with a
       retriable error. The CPI reads each placeable node's notes at most once per
       create_vm, asks a node whose read fails at most twice, reads only the pinned
-      node's notes for a target_node, and reads nothing when this list is empty. A node whose notes cannot be read is left
-      out of placement. Leave the property unset to get the default ["maintenance"].
+      node's notes for a target_node, and reads nothing when this list is empty. A
+      node whose notes cannot be read on the second try is left out of placement,
+      and the create goes on with the other nodes. It fails with a retriable error
+      only when no candidate node is left. Leave the property unset to get the default ["maintenance"].
       Set it to [] to turn the notes marker off, which reads no notes, while still
       honoring the node health check, which always runs. Set it to a list to use those
       tags instead. The property has no spec default, so the CPI can tell an unset

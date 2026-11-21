@@ -908,7 +908,10 @@ type placementInternalTestPVE struct {
 
 func (p *placementInternalTestPVE) QEMU() sdkqemu.Service { panic("not needed") }
 func (p *placementInternalTestPVE) Nodes() sdknodes.Service {
-	return &placementInternalNodesSvc{notes: notesOf(p.clusterClient.nodes)}
+	return &placementInternalNodesSvc{
+		notes:      notesOf(p.clusterClient.nodes),
+		unreadable: unreadableNotesOf(p.clusterClient.nodes),
+	}
 }
 func (p *placementInternalTestPVE) Tasks() sdktasks.Service         { panic("not needed") }
 func (p *placementInternalTestPVE) Storage() sdkstorage.Service     { panic("not needed") }
@@ -953,10 +956,15 @@ type placementInternalNodesSvc struct {
 	// notes holds each node's notes, which node health reads for the
 	// maintenance marker. A node it does not name has no notes.
 	notes map[string]string
+	// unreadable names the nodes whose notes read fails.
+	unreadable map[string]bool
 }
 
 // ListConfig answers the node config read with the node's notes.
 func (s *placementInternalNodesSvc) ListConfig(_ context.Context, node string, _ *sdknodes.ListConfigParams) (*sdknodes.ListConfigResponse, error) {
+	if s.unreadable[node] {
+		return nil, stderrors.New("node config unavailable")
+	}
 	resp := &sdknodes.ListConfigResponse{}
 	if notes, ok := s.notes[node]; ok {
 		resp.Description = &notes
@@ -973,6 +981,19 @@ func notesOf(rows []map[string]any) map[string]string {
 		name, _ := row["name"].(string)
 		if notes, ok := row["notes"].(string); ok && name != "" {
 			out[name] = notes
+		}
+	}
+	return out
+}
+
+// unreadableNotesOf names each node row whose "notes_unreadable" entry is
+// true, which a test sets to make that node's notes read fail.
+func unreadableNotesOf(rows []map[string]any) map[string]bool {
+	out := map[string]bool{}
+	for _, row := range rows {
+		name, _ := row["name"].(string)
+		if bad, _ := row["notes_unreadable"].(bool); bad && name != "" {
+			out[name] = true
 		}
 	}
 	return out
@@ -2023,8 +2044,10 @@ type faultDomainTestPVE struct {
 	clusterStorage sdkclusterstorage.Service
 }
 
-func (p *faultDomainTestPVE) QEMU() sdkqemu.Service           { panic("not needed") }
-func (p *faultDomainTestPVE) Nodes() sdknodes.Service         { return &placementInternalNodesSvc{} }
+func (p *faultDomainTestPVE) QEMU() sdkqemu.Service { panic("not needed") }
+func (p *faultDomainTestPVE) Nodes() sdknodes.Service {
+	return &placementInternalNodesSvc{unreadable: unreadableNotesOf(p.clusterClient.nodes)}
+}
 func (p *faultDomainTestPVE) Tasks() sdktasks.Service         { panic("not needed") }
 func (p *faultDomainTestPVE) Storage() sdkstorage.Service     { panic("not needed") }
 func (p *faultDomainTestPVE) CloudInit() sdkcloudinit.Service { panic("not needed") }

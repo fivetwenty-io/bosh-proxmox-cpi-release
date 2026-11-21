@@ -110,7 +110,8 @@ type GatherOptions struct {
 	MaintenanceNodeTags []string
 
 	// RequireNodeHealth makes a node health read that fails twice fail the
-	// gather with ErrNodeHealthUnavailable. Without it, the gather fails open
+	// gather with ErrNodeHealthUnavailable. Notes that stay unread leave only
+	// their node out and never fail the gather. Without it, the gather fails open
 	// and scores every node with no maintenance filter. A caller sets it when
 	// a node in maintenance matters, because the CPI writes HA state or the
 	// operator tags nodes for maintenance.
@@ -152,9 +153,10 @@ var ErrNodeHealthUnavailable = errors.New("node health unavailable")
 // InMaintenance=false (fail-open), so a transient API outage does not block
 // VM creation where nothing marks nodes for maintenance. NodeHealth itself
 // degrades past an unreadable HA source, so only a failed cluster status read
-// or a failed node notes read reaches this path. A notes read that fails twice
-// without opts.RequireNodeHealth keeps the rest of the report, and the node
-// whose notes could not be read is left out with that reason.
+// reaches this path. A node notes read that fails is read once more too, and
+// a node whose notes fail again is left out with NotesUnread set and that
+// reason, whether or not opts.RequireNodeHealth is set, so placement goes on
+// with the nodes that answered.
 //
 // A ListStatus error is fatal — it is the primary data source.
 func GatherNodeFacts(
@@ -212,9 +214,9 @@ func GatherNodeFacts(
 		// the report does not mention, or no report at all, leaves it included.
 		// The reason travels with it when the node is not in maintenance, so
 		// a rejection names a lost quorum or a fence instead of maintenance.
-		inMaintenance, unplaceableReason := false, ""
+		inMaintenance, unplaceableReason, notesUnread := false, "", false
 		if entry, ok := health.Node(nodeName); ok && !entry.Placeable {
-			inMaintenance = true
+			inMaintenance, notesUnread = true, entry.NotesUnread
 			if !entry.Maintenance {
 				unplaceableReason = entry.Reason
 				if unplaceableReason == "" {
@@ -237,6 +239,7 @@ func GatherNodeFacts(
 			Online:            item.Online.Bool(),
 			InMaintenance:     inMaintenance,
 			UnplaceableReason: unplaceableReason,
+			NotesUnread:       notesUnread,
 			FreeMemBytes:      item.Maxmem.Int() - item.Mem.Int(),
 			TotalMemBytes:     item.Maxmem.Int(),
 			CommittedMemBytes: committedMem[nodeName],
@@ -254,13 +257,14 @@ func GatherNodeFacts(
 }
 
 // gatherNodeHealth asks pve.NodeHealth for the merged health of every node,
-// and asks once more when the first read fails. A report whose node notes
-// could not all be read counts as a failed read, because nothing then rules
-// out a maintenance tag on the node that did not answer. When the second read
-// fails too, it returns ErrNodeHealthUnavailable if opts.RequireNodeHealth is
-// set. Otherwise it returns a nil report (fail-open) with a warning, the way
-// the storage facts fail open, or, when only the notes failed, the report
-// itself, which already leaves the unread node out.
+// and asks once more when the first read fails or leaves a node's notes
+// unread, because nothing then rules out a maintenance tag on the node that
+// did not answer. When the health read itself fails twice, it returns
+// ErrNodeHealthUnavailable if opts.RequireNodeHealth is set, and otherwise a
+// nil report (fail-open) with a warning, the way the storage facts fail open.
+// When only notes stay unread, it returns the report, which leaves each
+// unread node out of placement as not placeable, so the create goes on with
+// the nodes that answered and fails only when none of them is left.
 func gatherNodeHealth(
 	ctx context.Context,
 	clusterClient ClusterClient,
@@ -269,37 +273,48 @@ func gatherNodeHealth(
 	opts GatherOptions,
 ) (*pve.NodeHealthReport, error) {
 	read := func() (*pve.NodeHealthReport, error) {
-		report, err := pve.NodeHealth(ctx, clusterClient, nodesClient, pve.NodeHealthOptions{
+		return pve.NodeHealth(ctx, clusterClient, nodesClient, pve.NodeHealthOptions{
 			MaintenanceTags: opts.MaintenanceNodeTags,
 		})
-		if err == nil && report.NotesErr != nil {
-			return report, report.NotesErr
-		}
-		return report, err
 	}
 	report, err := read()
-	if err != nil && ctx.Err() == nil {
-		logger.Info("placement: node health read failed, reading it once more", log.Err(err))
+	if ctx.Err() == nil && (err != nil || report.NotesErr != nil) {
+		why := err
+		if why == nil {
+			why = report.NotesErr
+		}
+		logger.Info("placement: node health read failed, reading it once more", log.Err(why))
 		report, err = read()
 	}
 	if err != nil {
 		if opts.RequireNodeHealth {
 			return nil, fmt.Errorf("%w: %w", ErrNodeHealthUnavailable, err)
 		}
-		if report != nil {
-			logger.Warn("placement: node notes unreadable, so the nodes that did not answer are left out",
-				log.Err(err))
-			return report, nil
-		}
 		logger.Warn("placement: node health unavailable — maintenance detection disabled (fail-open)",
 			log.Err(err))
 		return nil, nil
+	}
+	if report.NotesErr != nil {
+		logger.Warn("placement: node notes unreadable, so placement leaves out the nodes that did not answer",
+			log.String("nodes", strings.Join(notesUnreadNodes(report), ",")), log.Err(report.NotesErr))
 	}
 	if report.HA != pve.HAViewManagerStatus {
 		logger.Debug("placement: node health did not use a fresh CRM view",
 			log.String("view", string(report.HA)), log.String("reason", report.HAReason))
 	}
 	return report, nil
+}
+
+// notesUnreadNodes names the nodes whose notes report could not read, in the
+// report's order.
+func notesUnreadNodes(report *pve.NodeHealthReport) []string {
+	var nodes []string
+	for _, e := range report.Nodes {
+		if e.NotesUnread {
+			nodes = append(nodes, e.Name)
+		}
+	}
+	return nodes
 }
 
 // gatherResourceFacts reads node compute counters and tallies QEMU guest

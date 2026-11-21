@@ -109,6 +109,12 @@ type NodeFacts struct {
 	// It is empty for a node in maintenance and for a placeable node.
 	UnplaceableReason string
 
+	// NotesUnread is true when the node is not placeable only because its
+	// notes could not be read, so nothing rules out a maintenance tag on it.
+	// The node comes back once it answers, so a create that needs this node
+	// fails with a retriable error.
+	NotesUnread bool
+
 	// FreeMemBytes is current free memory in bytes (Maxmem - Mem from cluster status).
 	// Backs the Mem axis when Weights.MemorySignal is MemorySignalResident (or unset).
 	FreeMemBytes int64
