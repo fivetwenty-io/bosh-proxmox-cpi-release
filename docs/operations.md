@@ -701,11 +701,17 @@ The command takes these flags.
 - `--widen-replicas`
   This runs the replica widening pass in place of the doctor. Without `--apply` it is a dry run that claims and writes nothing. It needs the Director's UUID from `--request` or `--director-uuid`, and it cannot be combined with `--cpi-config`.
 
+- `--fix-anti-affinity`
+  This plans each anti-affinity group of the Director again in place of the doctor, and it reports the groups whose rules differ, as [Fixing an anti-affinity layout](#fixing-an-anti-affinity-layout) shows. Without `--apply` it is a dry run. It cannot be combined with `--cpi-config`, and the command exits with 2 when we try, so we run it once per entry with that entry's `--request` and `--group`.
+
+- `--group bosh-aa-<hash12>`
+  With `--fix-anti-affinity`, this limits the run to the one group whose base rule has that name.
+
 - `--apply`
-  With `--widen-replicas`, this writes the widened pins.
+  With `--widen-replicas`, this writes the widened pins, and with `--fix-anti-affinity`, it writes the planned rules.
 
 - `--director-uuid UUID`
-  With `--widen-replicas`, this names the Director whose VMs the pass may widen when no `--request` names it. When both are given, they must name the same Director.
+  With `--widen-replicas` or `--fix-anti-affinity`, this names the Director whose VMs or rules the run may change when no `--request` names it. When both are given, they must name the same Director.
 
 The report starts with the profile line that the CPI logs, with the headroom result added at its end. It then lists the nodes, the CPU migration domains, and the findings, and it ends with a count.
 
@@ -828,7 +834,7 @@ Anti-affinity layout for Director 11111111-2222-3333-4444-555555555555 (a dry ru
 
 Each group ends in one of five outcomes. `in_layout` means the rules already match the plan. `would_fix` means a dry run found a difference, and a lapsed hold that the rules still record counts as one, listed as `drop the lapsed hold of index N from <carrier>`. `fixed` means the run wrote the group's rules. `failed` means a write failed. `not_planned` means the CPI could not plan the group. That includes a group whose plan would put members in a rule of the whole cluster's domain while their strict pins leave them, between them, no more nodes than the rule has members. No AZ of the entry's `placement.az_map` holds those pins, so another entry whose map does most likely placed the group, and the fix doesn't write a rule that would leave no node free for a drain. The same holds for a rule whose members' strict pins this entry's `placement.az_map` puts in different domains, because the CPI only ever writes a rule among members of one domain, so another entry whose map puts them in one domain wrote it, and the fix doesn't delete it. The fix also leaves a group alone when its plan would delete or rewrite a rule whose name this entry's `placement.az_map` never gives a rule of its members' domain. The block rules of each domain take turns in their numbering with the map's other AZs, and a pattern rule's number names its domain, so such a name means that another entry whose map defines other AZs most likely wrote the rule. A rule written before 0.12.0, or before this entry's `placement.az_map` changed, carries such a name too, and the group's next `set_vm_metadata` or `delete_vm` renames it. A rule whose members each hold a strict pin to a node of their own is not such a group, because the `hold` local policy writes those pins and the plan judges that rule as it stands. The doctor run against the same entry alone reports such a group as `aa_layout_drift` advice with the same reason, because a run of one entry can't see the other entries. We check the group under `--cpi-config`, which reports it as a problem when no entry's plan claims it, and we fix it with the request of the entry that placed it. When the plan is right, we run the same command with `--apply`, and it writes each group whose rules differ, under the HA rules lock. The option `--group bosh-aa-<hash12>` limits the run to one group.
 
-The command refuses to run when `pve.ha.mode` or `pve.ha.anti_affinity` is off, or when scheduler-soft anti-affinity is disabled. We can't combine it with `--widen-replicas` or `--cpi-config`, and `--group` needs `--fix-anti-affinity`. It exits with 1 when a group failed or could not be planned. With `--json` it prints the results as JSON. For a Director with several `cpi_config` entries, we pass `--request` with a context that names the entry and the Director's UUID, once for each entry, because the pass reads one cluster.
+The command refuses to run when `pve.ha.mode` or `pve.ha.anti_affinity` is off, or when scheduler-soft anti-affinity is disabled. We can't combine it with `--widen-replicas` or `--cpi-config`, and `--group` needs `--fix-anti-affinity`. Each of these refusals exits with 2. The fix plans a group under one entry's settings, so with several `pve` entries we first run `pve-ops ha --cpi-config` to see which entry judges each group. Then we run the fix once per entry, with that entry's `--request` and `--group bosh-aa-<hash12>` for each group the entry judges, because a run without `--group` plans every group of the Director on the cluster under that one entry's map. It exits with 1 when a group failed or could not be planned. With `--json` it prints the results as JSON. The `--request` we pass names the entry and the Director's UUID in its context, because the pass reads one cluster.
 
 ### When `delete_vm` defers
 

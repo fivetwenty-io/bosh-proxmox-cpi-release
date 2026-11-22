@@ -108,6 +108,45 @@ func TestRunHAFixAAFailures(t *testing.T) {
 	}
 }
 
+// The fix plans the groups of one cluster under one entry's settings, so it
+// refuses --cpi-config, and its refusal says how to run it once per entry.
+func TestRunHAFixAARefusesCPIConfigAndNamesThePerEntryRun(t *testing.T) {
+	t.Parallel()
+	d := newHATestDeps(haCfg("auto", "none"))
+	calls := withFixAA(d, nil, nil)
+	code, _, errOut := runHATest(t, d, "--fix-anti-affinity", "--director-uuid", haDirector, "--cpi-config", "x.json")
+	if code != exitUsage || len(*calls) != 0 {
+		t.Fatalf("code = %d, calls = %d, stderr = %q", code, len(*calls), errOut)
+	}
+	for _, want := range []string{
+		"--fix-anti-affinity cannot be combined with --cpi-config",
+		"once per cpis entry with that entry's --request and --group bosh-aa-<hash12>",
+		"pve-ops ha --cpi-config",
+	} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("stderr lacks %q:\n%s", want, errOut)
+		}
+	}
+	if strings.Contains(errOut, "--widen-replicas and --fix-anti-affinity cannot be combined with") {
+		t.Errorf("stderr names --widen-replicas for a fix run:\n%s", errOut)
+	}
+}
+
+// The help text of --fix-anti-affinity says that the fix doesn't take
+// --cpi-config and runs once per entry.
+func TestRunHAHelpSaysTheFixRunsOncePerEntry(t *testing.T) {
+	t.Parallel()
+	d := newHATestDeps(haCfg("auto", "none"))
+	code, _, errOut := runHATest(t, d, "-h")
+	if code != exitOK {
+		t.Fatalf("code = %d, stderr = %q", code, errOut)
+	}
+	const want = "it doesn't take --cpi-config, so run it once per cpis entry with that entry's --request and --group"
+	if !strings.Contains(errOut, want) {
+		t.Errorf("help lacks the per-entry run of the fix:\n%s", errOut)
+	}
+}
+
 func TestRunHAFixAAUsageErrors(t *testing.T) {
 	t.Parallel()
 	for name, args := range map[string][]string{
