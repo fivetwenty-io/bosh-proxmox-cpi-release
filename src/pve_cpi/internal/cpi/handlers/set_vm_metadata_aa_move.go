@@ -112,37 +112,73 @@ func (d Deps) coloMoveHooks(logger *log.Logger) aaColoMoveHooks {
 	return h
 }
 
-// aaColoPartner is a planned partner of the joining member.
+// aaColoPartner is a planned partner of a member that may move.
 type aaColoPartner struct {
 	vmid int
 	node string
-	// final says the pairing with the joiner can no longer change, so a
-	// shared node with this partner is worth a move.
-	final bool
 }
 
-// moveJoinerOffPartners moves a joining member off the nodes of its planned
-// anti-affinity partners before the join writes the rule that pairs them,
-// and returns the function that releases the move's spread claim, which the
-// caller runs once the join has returned. It moves the VM only when all of
-// these hold:
+// aaColoMember is a member of a newly paired co-located pair, as the move
+// judges it.
+type aaColoMember struct {
+	sid   string
+	vmid  int
+	index int
+	born  int64
+}
+
+// aaColoCall is the state of one call's moves: the reads they share, the
+// moves it decided, and the claims to release once the join has returned.
+type aaColoCall struct {
+	ctx       context.Context
+	deps      Deps
+	ident     haIdentity
+	h         aaColoMoveHooks
+	logger    *log.Logger
+	profile   *ha.Profile
+	set       *ha.RuleSet
+	scan      *groupScan
+	out       aapattern.Output
+	joiner    int
+	now       time.Time
+	budget    time.Duration
+	store     *spreadclaim.Store
+	facts     []placement.NodeFacts
+	factsErr  error
+	factsRead bool
+	// moved maps each VM this call moved to its target.
+	moved    map[int]string
+	releases []func()
+}
+
+// moveJoinerOffPartners moves members of newly final co-located pairs off
+// their planned anti-affinity partners' nodes before the join writes the
+// rules that pair them, and returns the function that releases the moves'
+// spread claims, which the caller runs once the join has returned. The plan
+// writes only final pairs, so every pair it holds is final, and the join of
+// the lowest missing index can make several pairs final at once, including
+// pairs the joining VM is not in. It considers the pairs only when the
+// joining VM joins for the first time, which means no rule of its group holds
+// it yet and its marker's birth is less than aaColoMoveMaxAge old. For each
+// pair of the plan that no rule of the group holds now and whose members
+// share a node, it moves one member that passes every gate:
 //
-//   - The VM joins for the first time, which means no rule of its group holds
-//     it yet and its marker's birth is less than aaColoMoveMaxAge old.
-//   - Its plan pairs it with a member on its own node, and that pairing is
-//     final, because every index up to the higher of the two is present or
-//     held.
-//   - Every volume it uses sits on shared storage, it has no PCI device, and
-//     no positive affinity rule holds it.
+//   - No rule of its group holds it yet, its marker's birth is less than
+//     aaColoMoveMaxAge old, and no positive affinity rule holds it.
+//   - Every volume it uses sits on shared storage, and it has no PCI device.
 //   - A node outside its partners' nodes, inside its pin's top priority, and
 //     in its node's CPU domain when that is known, is online, out of
 //     maintenance, reachable, and wins the score.
-//   - The spread claim record takes the move's claim, so a sibling that
-//     joins at the same moment sees that this VM is leaving.
+//   - The spread claim record takes the move's claim, no live claim of
+//     another call names the member on another node, and a read of the rules
+//     after the claim's turn still shows it in no rule of the group.
 //
-// Anything else leaves the VM where it is, and PVE moves it once the rule is
-// written, as it did before. A move that fails or runs past its wait logs a
-// warning, and the join writes the rule all the same.
+// The joining VM moves when it is in the pair. Otherwise the member born last
+// moves, then the one with the higher index, so every call that sees the pair
+// picks the same VM. Anything else leaves the pair where it is, and PVE moves
+// both members once the rule is written, as it did before. A move that fails
+// or runs past its wait logs a warning, and the join writes the rules all the
+// same.
 func moveJoinerOffPartners(
 	ctx context.Context, deps Deps, ident haIdentity, vmid, index int, born int64, logger *log.Logger,
 ) (release func()) {
@@ -164,15 +200,11 @@ func moveJoinerOffPartners(
 	// The rules are read before the guests, so a later set_vm_metadata of a
 	// member that has joined already costs one read.
 	set, err := readHARuleSet(ctx, deps.PVE.Cluster())
-	if err != nil || aaJoinerInGroupRule(set, ident, sid) || positiveAffinityRule(set, sid) != "" {
+	if err != nil || aaJoinerInGroupRule(set, ident, sid) {
 		return release
 	}
 	scan, err := collectGroupMemberSids(ctx, deps, ident)
-	if err != nil {
-		return release
-	}
-	home := scan.guests[sid].Node
-	if home == "" {
+	if err != nil || scan.guests[sid].Node == "" {
 		return release
 	}
 	planner := newGroupPlanner(ctx, deps, profile, ident, scan, log.NewNopLogger())
@@ -181,51 +213,181 @@ func moveJoinerOffPartners(
 	if _, err := planner.plan(set); err != nil {
 		return release
 	}
-	partners := aaColoPartners(planner.lastIn, planner.lastOut, scan, sid)
-	if !aaColoShares(partners, home, nil) {
+	c := &aaColoCall{
+		ctx: ctx, deps: deps, ident: ident, h: h, logger: logger, profile: profile, set: set, scan: scan,
+		out: planner.lastOut, joiner: vmid, now: now, budget: min(haMotionWait(deps), aaColoMoveWaitCap),
+		moved: map[int]string{},
+	}
+	members := map[string]aaColoMember{}
+	for _, m := range planner.lastIn.Members {
+		if v, ok := haSidVMID(m.Key); ok && !m.Reserved {
+			members[m.Key] = aaColoMember{sid: m.Key, vmid: v, index: m.Index, born: m.Born}
+		}
+	}
+	for _, pair := range aaColoNewPairs(set, ident, planner.lastOut) {
+		a, aok := members[pair[0]]
+		b, bok := members[pair[1]]
+		if !aok || !bok || c.node(a.vmid, a.sid) == "" || c.node(a.vmid, a.sid) != c.node(b.vmid, b.sid) {
+			continue
+		}
+		for _, m := range c.order(a, b) {
+			if c.eligible(m) {
+				c.move(m)
+				break
+			}
+		}
+	}
+	if len(c.releases) == 0 {
 		return release
 	}
-	cfg, err := h.config(ctx, home, vmid)
+	return func() {
+		for _, r := range c.releases {
+			r()
+		}
+	}
+}
+
+// aaColoNewPairs returns every pair of members that a rule of out holds and
+// no rule of the group holds now, each in sorted order, in the order of the
+// rules' names.
+func aaColoNewPairs(set *ha.RuleSet, ident haIdentity, out aapattern.Output) [][2]string {
+	base := ident.ruleName()
+	paired := func(a, b string) bool {
+		for i := range set.Rules {
+			r := &set.Rules[i]
+			if aapattern.IsGroupRule(base, r.ID) && r.HasResource(a) && r.HasResource(b) {
+				return true
+			}
+		}
+		return false
+	}
+	var pairs [][2]string
+	for _, rule := range slices.Sorted(maps.Keys(out.Rules)) {
+		keys := slices.Sorted(slices.Values(out.Rules[rule]))
+		for i, a := range keys {
+			for _, b := range keys[i+1:] {
+				if !paired(a, b) {
+					pairs = append(pairs, [2]string{a, b})
+				}
+			}
+		}
+	}
+	return pairs
+}
+
+// node returns where the VM is: the target this call moved it to, or the node
+// the scan shows it on.
+func (c *aaColoCall) node(vmid int, sid string) string {
+	if n, ok := c.moved[vmid]; ok {
+		return n
+	}
+	return c.scan.guests[sid].Node
+}
+
+// order returns the pair's members in the order the move tries them: the
+// joining VM first, then the member born last, then the higher index.
+func (c *aaColoCall) order(a, b aaColoMember) []aaColoMember {
+	first := func(x, y aaColoMember) bool {
+		switch {
+		case x.vmid == c.joiner || y.vmid == c.joiner:
+			return x.vmid == c.joiner
+		case x.born != y.born:
+			return x.born > y.born
+		case x.index != y.index:
+			return x.index > y.index
+		}
+		return x.vmid > y.vmid
+	}
+	if first(a, b) {
+		return []aaColoMember{a, b}
+	}
+	return []aaColoMember{b, a}
+}
+
+// eligible reports whether m may move: it is young, no rule of its group
+// holds it, no positive affinity rule holds it, and this call has not moved
+// it already.
+func (c *aaColoCall) eligible(m aaColoMember) bool {
+	if _, done := c.moved[m.vmid]; done || m.born <= 0 ||
+		absDuration(c.now.Sub(time.Unix(m.born, 0))) > aaColoMoveMaxAge {
+		return false
+	}
+	return !aaJoinerInGroupRule(c.set, c.ident, m.sid) && positiveAffinityRule(c.set, m.sid) == ""
+}
+
+// partners returns the members the plan puts in a rule with sid, each on the
+// node this call knows it at.
+func (c *aaColoCall) partners(sid string) []aaColoPartner {
+	seen := map[string]bool{}
+	var out []aaColoPartner
+	for _, rule := range slices.Sorted(maps.Keys(c.out.Rules)) {
+		keys := c.out.Rules[rule]
+		if !slices.Contains(keys, sid) {
+			continue
+		}
+		for _, k := range keys {
+			if k == sid || seen[k] {
+				continue
+			}
+			seen[k] = true
+			vmid, ok := haSidVMID(k)
+			if node := c.node(vmid, k); ok && node != "" {
+				out = append(out, aaColoPartner{vmid: vmid, node: node})
+			}
+		}
+	}
+	return out
+}
+
+// move moves m off its partners' nodes when it can, and records the move.
+func (c *aaColoCall) move(m aaColoMember) {
+	ctx, deps, logger, vmid := c.ctx, c.deps, c.logger, m.vmid
+	home := c.node(vmid, m.sid)
+	cfg, err := c.h.config(ctx, home, vmid)
 	if err != nil {
 		logger.Debug("set_vm_metadata: the VM's config could not be read, so PVE moves it off its anti-affinity "+
 			"partner's node once the rule is written", log.Int(metadataKeyVMID, vmid), log.Err(err))
-		return release
+		return
 	}
-	storages, why := aaColoMovableStorages(deps.Config, profile, cfg, home)
+	storages, why := aaColoMovableStorages(deps.Config, c.profile, cfg, home)
 	if why != "" {
 		logger.Info("set_vm_metadata: the VM shares a node with an anti-affinity partner, and "+why+
 			", so PVE moves one of them once the rule is written", log.Int(metadataKeyVMID, vmid),
 			log.String("node", home))
-		return release
+		return
 	}
-	allowed := aaPinTopNodes(set, sid)
-	domain, domainKnown := profile.DomainOf(home)
+	allowed := aaPinTopNodes(c.set, m.sid)
+	domain, domainKnown := c.profile.DomainOf(home)
 	var candidates []string
-	for _, n := range profile.OnlineNodes() {
+	for _, n := range c.profile.OnlineNodes() {
 		if n != home && (allowed == nil || allowed[n]) && (!domainKnown || domain.Contains(n)) {
 			candidates = append(candidates, n)
 		}
 	}
 	if len(candidates) == 0 {
-		return release
+		return
 	}
-	if candidates, err = h.reachable(ctx, cfg, storages, candidates); err != nil || len(candidates) == 0 {
-		return release
+	if candidates, err = c.h.reachable(ctx, cfg, storages, candidates); err != nil || len(candidates) == 0 {
+		return
 	}
-	facts, err := h.facts(ctx, ident.ruleName())
-	if err != nil {
+	if !c.factsRead {
+		c.factsRead = true
+		c.facts, c.factsErr = c.h.facts(ctx, c.ident.ruleName())
+	}
+	if c.factsErr != nil {
 		logger.Debug("set_vm_metadata: the node facts could not be read, so PVE moves the VM off its "+
-			"anti-affinity partner's node once the rule is written", log.Int(metadataKeyVMID, vmid), log.Err(err))
-		return release
+			"anti-affinity partner's node once the rule is written", log.Int(metadataKeyVMID, vmid),
+			log.Err(c.factsErr))
+		return
 	}
-	store := deps.SpreadClaims(deps.Config, h.stamp(ctx, home), logger)
-	if store == nil {
-		return release
+	if c.store == nil {
+		if c.store = deps.SpreadClaims(deps.Config, c.h.stamp(ctx, home), logger); c.store == nil {
+			return
+		}
 	}
-	budget := min(haMotionWait(deps), aaColoMoveWaitCap)
-	claim, err := store.NewClaim(ident.ruleName(), now.Add(budget+aaColoMoveClaimSlack))
+	claim, err := c.store.NewClaim(c.ident.ruleName(), c.now.Add(c.budget+aaColoMoveClaimSlack))
 	if err != nil {
-		return release
+		return
 	}
 	releaseClaim := func() {
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), aaColoMoveReleaseWait)
@@ -236,7 +398,7 @@ func moveJoinerOffPartners(
 		}
 	}
 	pick := aaColoPick{
-		home: home, partners: partners, candidates: candidates, facts: facts,
+		vmid: vmid, home: home, partners: c.partners(m.sid), candidates: candidates, facts: c.facts,
 		mem: aaConfigMemoryBytes(cfg), weights: aaColoWeights(deps.Config),
 	}
 	target, err := claim.PickLive(ctx, vmid, pick.choose)
@@ -247,30 +409,39 @@ func moveJoinerOffPartners(
 				"the VM off its anti-affinity partner's node once the rule is written", log.Int(metadataKeyVMID, vmid),
 				log.String("node", home), log.Err(err))
 		}
-		return release
+		return
 	}
+	// Another call that moved this VM releases its claim only after its join
+	// has written the rules, so a VM no live claim names was either never
+	// moved or is in a rule by now.
+	if now, err := readHARuleSet(ctx, deps.PVE.Cluster()); err != nil || aaJoinerInGroupRule(now, c.ident, m.sid) {
+		releaseClaim()
+		return
+	}
+	c.releases = append(c.releases, releaseClaim)
 	logger.Info("set_vm_metadata: the VM shares a node with an anti-affinity partner, so PVE HA moves it to "+
 		"another node before the rule is written, and the partner stays where it is",
-		log.Int(metadataKeyVMID, vmid), log.String("from", home), log.String("to", target),
-		log.String("wait", budget.String()))
-	mctx, cancel := context.WithTimeout(ctx, budget)
-	err = h.migrate(mctx, vmid, home, target, budget)
+		log.Int(metadataKeyVMID, vmid), log.Int("joiner", c.joiner), log.String("from", home),
+		log.String("to", target), log.String("wait", c.budget.String()))
+	mctx, cancel := context.WithTimeout(ctx, c.budget)
+	err = c.h.migrate(mctx, vmid, home, target, c.budget)
 	cancel()
 	switch {
 	case err == nil:
+		c.moved[vmid] = target
 		logger.Info("set_vm_metadata: PVE HA moved the VM off its anti-affinity partner's node",
 			log.Int(metadataKeyVMID, vmid), log.String("node", target))
 	case aaColoMoveTimedOut(err, mctx):
+		c.moved[vmid] = target
 		logger.Warn("set_vm_metadata: PVE HA did not finish moving the VM off its anti-affinity partner's node "+
 			"within the wait, so the rule is written now. If the move is still running, PVE may move the partner "+
 			"too", log.Int(metadataKeyVMID, vmid), log.String("from", home), log.String("to", target),
-			log.String("wait", budget.String()), log.Err(err))
+			log.String("wait", c.budget.String()), log.Err(err))
 	default:
 		logger.Warn("set_vm_metadata: PVE HA did not move the VM off its anti-affinity partner's node, so the "+
 			"rule is written now and PVE moves one of them", log.Int(metadataKeyVMID, vmid),
 			log.String("from", home), log.String("to", target), log.Err(err))
 	}
-	return releaseClaim
 }
 
 // aaColoMoveTimedOut reports whether the move ended because its wait ran out.
@@ -302,58 +473,6 @@ func aaJoinerInGroupRule(set *ha.RuleSet, ident haIdentity, sid string) bool {
 	return false
 }
 
-// aaColoPartners returns the members the plan puts in a rule with sid, each
-// with the node the scan shows it on and whether its pairing with sid is
-// final. A pairing is final when every index from 0 up to the higher of the
-// two members' indexes is present or held, because the layout places a member
-// by its rank among the indexes below it, so no later member can change it.
-func aaColoPartners(in aapattern.Input, out aapattern.Output, scan *groupScan, sid string) []aaColoPartner {
-	indexes := map[string]int{}
-	present := map[int]bool{}
-	for _, m := range in.Members {
-		if m.Index < 0 {
-			continue
-		}
-		present[m.Index] = true
-		if !m.Reserved {
-			indexes[m.Key] = m.Index
-		}
-	}
-	final := func(a, b int) bool {
-		for i := 0; i <= max(a, b); i++ {
-			if !present[i] {
-				return false
-			}
-		}
-		return true
-	}
-	self, selfKnown := indexes[sid]
-	seen := map[string]bool{}
-	var partners []aaColoPartner
-	for _, rule := range slices.Sorted(maps.Keys(out.Rules)) {
-		keys := out.Rules[rule]
-		if !slices.Contains(keys, sid) {
-			continue
-		}
-		for _, k := range keys {
-			if k == sid || seen[k] {
-				continue
-			}
-			seen[k] = true
-			vmid, ok := haSidVMID(k)
-			node := scan.guests[k].Node
-			if !ok || node == "" {
-				continue
-			}
-			idx, known := indexes[k]
-			partners = append(partners, aaColoPartner{
-				vmid: vmid, node: node, final: selfKnown && known && final(self, idx),
-			})
-		}
-	}
-	return partners
-}
-
 // haSidVMID returns the VMID of an HA resource id vm:<vmid>.
 func haSidVMID(sid string) (int, bool) {
 	rest, ok := strings.CutPrefix(sid, "vm:")
@@ -364,12 +483,11 @@ func haSidVMID(sid string) (int, bool) {
 	return n, err == nil && n > 0
 }
 
-// aaColoShares reports whether a partner whose pairing is final sits on
-// home, reading each partner's node from moving when a live claim names its
-// VM there.
+// aaColoShares reports whether a partner sits on home, reading each
+// partner's node from moving when a live claim names its VM there.
 func aaColoShares(partners []aaColoPartner, home string, moving map[int]string) bool {
 	for _, p := range partners {
-		if p.final && aaColoNode(p, moving) == home {
+		if aaColoNode(p, moving) == home {
 			return true
 		}
 	}
@@ -468,6 +586,7 @@ func aaColoWeights(cfg *config.CPIConfig) placement.Weights {
 // aaColoPick chooses the move's target in one turn with the spread claim
 // record.
 type aaColoPick struct {
+	vmid       int
 	home       string
 	partners   []aaColoPartner
 	candidates []string
@@ -479,7 +598,8 @@ type aaColoPick struct {
 // choose returns the node to move the VM to, or "" to leave it. A live claim
 // that names a partner's VM puts the partner on the claimed node, so the
 // second of two siblings that share a node sees that the first is leaving and
-// stays. A live claim also counts as a member of the group on its node for the
+// stays, and a VM that another call's live claim names on another node is
+// leaving already. A live claim also counts as a member of the group on its node for the
 // anti-affinity axis, in place of the node its VM is tagged on.
 func (p aaColoPick) choose(live []spreadclaim.Live) string {
 	moving := map[int]string{}
@@ -488,7 +608,7 @@ func (p aaColoPick) choose(live []spreadclaim.Live) string {
 			moving[c.VMID] = c.Node
 		}
 	}
-	if !aaColoShares(p.partners, p.home, moving) {
+	if n, ok := moving[p.vmid]; ok && n != p.home || !aaColoShares(p.partners, p.home, moving) {
 		return ""
 	}
 	taken := map[string]bool{p.home: true}

@@ -4,15 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
@@ -451,4 +455,217 @@ func observedHas(obs *log.Observer, level slog.Level, part string) bool {
 		}
 	}
 	return false
+}
+
+// coloGroup is a web group on three nodes whose members join one by one, the
+// way a parallel deploy's set_vm_metadata calls arrive. Each member has its
+// node, and a member gets its index tag when it joins. The migrations the
+// hooks are asked for move the member's guest, so later scans see it there.
+type coloGroup struct {
+	mu     sync.Mutex
+	stub   *aaClusterStub
+	nodes  map[int]string
+	joined map[int]bool
+}
+
+var coloTriple = []string{"pve1", "pve2", "pve3"}
+
+// newColoGroup stages members 100+i on nodes[i], each born a minute before
+// coloNow, none of them joined yet.
+func newColoGroup(nodes ...string) *coloGroup {
+	g := &coloGroup{stub: newAAStub(), nodes: map[int]string{}, joined: map[int]bool{}}
+	g.stub.memberNodes = coloTriple
+	g.stub.statusFn = func() (*cluster.ListStatusResponse, error) { return AbsenceOnlineStatus(coloTriple...), nil }
+	var vmids []int
+	for i, n := range nodes {
+		g.nodes[100+i] = n
+		vmids = append(vmids, 100+i)
+	}
+	g.retag()
+	markWebMembersBorn(g.stub, coloNow.Add(-time.Minute), vmids...)
+	return g
+}
+
+// retag lists every member on its node, with its index tag once it joined.
+func (g *coloGroup) retag() {
+	var rows []json.RawMessage
+	for _, v := range slices.Sorted(maps.Keys(g.nodes)) {
+		tags := aaTag
+		if g.joined[v] {
+			tags += fmt.Sprintf(";index--%d", v-100)
+		}
+		rows = append(rows, aaQEMUOn(v, g.nodes[v], tags))
+	}
+	g.stub.listResourcesFn = aaResourcesFn(rows...)
+}
+
+func (g *coloGroup) harness() *coloHarness {
+	h := newColoHarness()
+	h.facts = slices.DeleteFunc(h.facts, func(f placement.NodeFacts) bool { return f.Node == "pve4" })
+	h.migrate = func(_ context.Context, vmid int, _, to string) error {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.nodes[vmid] = to
+		g.retag()
+		return nil
+	}
+	return h
+}
+
+func (g *coloGroup) deps(h *coloHarness, dir string) Deps {
+	deps := coloDeps(g.stub, h, dir)
+	deps.HAProfile = func(ctx context.Context) (*ha.Profile, error) {
+		p, err := pve9ClusterProfile(coloTriple...)(ctx)
+		if err != nil {
+			return nil, err
+		}
+		p.Storages = []pve.StorageInfo{{Name: "shared-nfs", Type: "nfs", Shared: true}}
+		return p, nil
+	}
+	return deps
+}
+
+// tag gives the members their index tags, as their set_vm_metadata calls do
+// before they join.
+func (g *coloGroup) tag(vmids ...int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, v := range vmids {
+		g.joined[v] = true
+	}
+	g.retag()
+}
+
+func (g *coloGroup) join(deps Deps, vmid int) {
+	g.tag(vmid)
+	coloJoin(deps, vmid, strconv.Itoa(vmid-100), log.NewNopLogger())
+}
+
+// TestColoMove_ScrambledParallelDeployMovesOncePerPair pins the first deploy
+// of a group whose creates put every pair on one node. Whatever order the
+// joins arrive in, each rule is written once and never rewritten, each
+// co-located pair costs exactly one migration, and every pair ends apart.
+func TestColoMove_ScrambledParallelDeployMovesOncePerPair(t *testing.T) {
+	t.Parallel()
+	orders := [][]int{
+		{0, 1, 2, 3, 4, 5}, {5, 4, 3, 2, 1, 0}, {1, 2, 3, 4, 5, 0}, {3, 5, 1, 4, 2, 0}, {0, 2, 4, 1, 3, 5},
+		{4, 0, 5, 2, 1, 3},
+	}
+	for _, order := range orders {
+		g := newColoGroup("pve1", "pve1", "pve2", "pve2", "pve3", "pve3")
+		h := g.harness()
+		deps := g.deps(h, coloClaimDir(t))
+		written := map[string]string{}
+		for _, i := range order {
+			g.join(deps, 100+i)
+			for name, csv := range written {
+				if g.stub.rules[name] != csv {
+					t.Fatalf("order %v, join of %d: rule %s = %q; want it kept as %q", order, i, name,
+						g.stub.rules[name], csv)
+				}
+			}
+			maps.Copy(written, g.stub.rules)
+		}
+		want := map[string]string{
+			aaRule:                         "vm:100,vm:101",
+			aapattern.ChunkName(aaRule, 2): "vm:102,vm:103",
+			aapattern.ChunkName(aaRule, 3): "vm:104,vm:105",
+		}
+		if !maps.Equal(g.stub.rules, want) {
+			t.Fatalf("order %v: rules = %v; want %v", order, g.stub.rules, want)
+		}
+		if got := h.moves(); len(got) != 3 {
+			t.Fatalf("order %v: migrations = %+v; want one per co-located pair", order, got)
+		}
+		for a := 100; a < 106; a += 2 {
+			if g.nodes[a] == g.nodes[a+1] {
+				t.Fatalf("order %v: %d and %d share %s after the deploy", order, a, a+1, g.nodes[a])
+			}
+		}
+	}
+}
+
+// TestColoMove_MovesAPairTheJoinerIsNotIn pins the move of another pair. With
+// 102 to 105 waiting for the lower indexes, the join of index 0 makes every
+// pair final. 100 is apart from 101, so it stays, and of each co-located pair
+// the member born last moves.
+func TestColoMove_MovesAPairTheJoinerIsNotIn(t *testing.T) {
+	t.Parallel()
+	g := newColoGroup("pve1", "pve2", "pve3", "pve3", "pve1", "pve1")
+	g.stub.resComments[haResourceSid(102)] = aaIdent("web").resourceMarker("", coloNow.Add(-30*time.Second).Unix())
+	g.stub.resComments[haResourceSid(105)] = aaIdent("web").resourceMarker("", coloNow.Add(-2*time.Minute).Unix())
+	h := g.harness()
+	deps := g.deps(h, coloClaimDir(t))
+	g.tag(101, 102, 103, 104, 105)
+	g.join(deps, 100)
+	got := h.moves()
+	slices.SortFunc(got, func(a, b coloMigration) int { return a.vmid - b.vmid })
+	if len(got) != 2 || got[0].vmid != 102 || got[1].vmid != 104 {
+		t.Fatalf("migrations = %+v; want 102, born last of its pair, and 104, born after 105", got)
+	}
+	if got[0].to == "pve3" || got[1].to == "pve1" {
+		t.Fatalf("migrations = %+v; want each mover off its partner's node", got)
+	}
+}
+
+// TestColoMove_AnOldPairIsLeftToPVE pins the age gate for a pair the joiner
+// is not in. A pair whose members are both running workloads is left to PVE.
+func TestColoMove_AnOldPairIsLeftToPVE(t *testing.T) {
+	t.Parallel()
+	g := newColoGroup("pve1", "pve2", "pve3", "pve3")
+	markWebMembersBorn(g.stub, coloNow.Add(-2*aaColoMoveMaxAge), 102, 103)
+	h := g.harness()
+	g.tag(101, 102, 103)
+	g.join(g.deps(h, coloClaimDir(t)), 100)
+	coloWantNoMove(t, h)
+	if g.stub.rules[aapattern.ChunkName(aaRule, 2)] != "vm:102,vm:103" {
+		t.Fatalf("rules = %v; want the pair of old members written", g.stub.rules)
+	}
+}
+
+// TestColoMove_ConcurrentSiblingsFinishTheSamePairs pins the claims and the
+// read of the rules after a claim's turn. Indexes 0 and 1 join at the same
+// moment, and either join makes both pairs final. The first moves 101 and
+// then 103. The second joins either after 101 has moved, when it moves 103
+// itself and writes the rules, so the first must see 103's rule and leave the
+// pair, or while 103 is still migrating, when it must see the first's claim
+// on 103 and leave the pair. Either way each pair costs one migration.
+func TestColoMove_ConcurrentSiblingsFinishTheSamePairs(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		during   int
+		inFlight bool
+	}{
+		{"after the first move", 101, false},
+		{"during the second move", 103, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := newColoGroup("pve1", "pve1", "pve2", "pve2")
+			dir := coloClaimDir(t)
+			hA, hB := g.harness(), g.harness()
+			depsB := g.deps(hB, dir)
+			inner := hA.migrate
+			sibling := func() { coloJoin(depsB, 100, "0", log.NewNopLogger()) }
+			hA.migrate = func(ctx context.Context, vmid int, from, to string) error {
+				if vmid == tc.during && tc.inFlight {
+					sibling()
+				}
+				err := inner(ctx, vmid, from, to)
+				if vmid == tc.during && !tc.inFlight {
+					sibling()
+				}
+				return err
+			}
+			g.tag(100, 102, 103)
+			g.join(g.deps(hA, dir), 101)
+			if all := slices.Concat(hA.moves(), hB.moves()); len(all) != 2 {
+				t.Fatalf("migrations = %+v then %+v; want one per co-located pair", hA.moves(), hB.moves())
+			}
+			if g.nodes[100] == g.nodes[101] || g.nodes[102] == g.nodes[103] {
+				t.Fatalf("nodes = %v; want both pairs apart", g.nodes)
+			}
+		})
+	}
 }
