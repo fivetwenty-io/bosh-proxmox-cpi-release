@@ -477,15 +477,25 @@ type headroomResourceRow struct {
 
 // creating reports whether PVE is still creating the guest. Its config holds
 // the create or clone lock from the moment PVE reserves the VMID until the
-// guest is written, and PVE lists a guest whose status daemon has not
-// reported it yet with the status unknown and no memory figure. A sibling
-// create_vm under a parallel deploy looks like this for its first seconds.
-func (r headroomResourceRow) creating() bool {
+// guest is written, and that test does not depend on the node. PVE also lists
+// a guest whose status daemon has not reported it yet with the status unknown
+// and no memory figure, which is how a sibling create_vm under a parallel
+// deploy looks for its first seconds. The unknown status counts only when
+// reporting is the exception on the guest's node, meaning at least one other
+// guest there has a known status. A node whose status daemon has stalled lists
+// every guest as unknown, and those guests are settled, so they do not count.
+func (r headroomResourceRow) creating(reporting map[string]bool) bool {
 	switch strings.TrimSpace(r.Lock) {
 	case "create", "clone":
 		return true
 	}
-	return strings.TrimSpace(r.Status) == "unknown"
+	return strings.TrimSpace(r.Status) == "unknown" && reporting[r.Node]
+}
+
+// knownStatus reports whether the row carries a status other than unknown.
+func (r headroomResourceRow) knownStatus() bool {
+	st := strings.TrimSpace(r.Status)
+	return st != "" && st != "unknown"
 }
 
 // haSID returns the HA service ID of a guest row, or "" for a type
@@ -538,7 +548,8 @@ func readHeadroomGuests(
 		return nil, err
 	}
 
-	var guests []placement.HeadroomGuest
+	var rows []headroomResourceRow
+	reporting := map[string]bool{}
 	for i, raw := range *resources {
 		var row headroomResourceRow
 		if err := json.Unmarshal(raw, &row); err != nil {
@@ -553,8 +564,16 @@ func readHeadroomGuests(
 		if row.Node == "" || row.VMID.Int() <= 0 {
 			return nil, fmt.Errorf("cluster resource row %d names no node or no VM ID", i)
 		}
+		if row.knownStatus() {
+			reporting[row.Node] = true
+		}
+		rows = append(rows, row)
+	}
+
+	var guests []placement.HeadroomGuest
+	for _, row := range rows {
 		guest := placement.HeadroomGuest{VMID: int(row.VMID.Int()), Node: row.Node, MemBytes: row.Maxmem.Int(),
-			Creating: row.creating()}
+			Creating: row.creating(reporting)}
 		sid := row.haSID()
 		if managed[sid] {
 			guest.Admissible = recoveryNodes(rules, sid, nodes)

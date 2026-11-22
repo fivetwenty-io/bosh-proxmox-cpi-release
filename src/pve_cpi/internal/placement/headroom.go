@@ -67,7 +67,10 @@ type HeadroomGuest struct {
 	MemBytes int64
 
 	// Creating says PVE is still creating the guest, because its config holds a
-	// create or clone lock or PVE has not reported its status yet. Under a
+	// create or clone lock, or because PVE has not reported its status yet while
+	// it does report the status of other guests on the same node. A status that
+	// is unknown on every guest of a node means the node's status daemon has
+	// stalled, so the caller does not set Creating for those guests. Under a
 	// parallel deploy a sibling create's guest exists before PVE reports its
 	// memory, so an estimate leaves out a guest that is still being created and
 	// has no positive memory figure, rather than reporting itself unavailable.
