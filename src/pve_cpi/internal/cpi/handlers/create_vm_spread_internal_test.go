@@ -22,6 +22,12 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
+// spreadClaimLockWait only guards against a hang. Parallel siblings queue on
+// the claim record's file lock, and each holder fsyncs the record, so the
+// default five seconds measures how loaded the machine is and not whether the
+// siblings spread. A pick that waits this long has a stuck holder.
+const spreadClaimLockWait = 2 * time.Minute
+
 // spreadClaimStore returns a claim record in a new directory that only this
 // user can open, which the cache directory checks require.
 func spreadClaimStore(t *testing.T) *spreadclaim.Store {
@@ -30,7 +36,8 @@ func spreadClaimStore(t *testing.T) *spreadclaim.Store {
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	return &spreadclaim.Store{Dir: endpointcache.DirOptions{Override: dir}, Scope: "lab"}
+	return &spreadclaim.Store{Dir: endpointcache.DirOptions{Override: dir}, Scope: "lab",
+		LockWait: spreadClaimLockWait}
 }
 
 // spreadDeps wires placement to three nodes that score the same, with soft
