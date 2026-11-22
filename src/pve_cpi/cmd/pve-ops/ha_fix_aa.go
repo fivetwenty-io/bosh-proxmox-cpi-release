@@ -53,6 +53,7 @@ func runHAFixAA(ctx context.Context, eff *config.CPIConfig, logger *log.Logger, 
 		_, _ = fmt.Fprintf(stderr, "pve-ops ha: the anti-affinity fix did not run: %v\n", err)
 		return exitError
 	}
+	markOtherEntryGroups(results)
 	if asJSON {
 		out := haFixAAOutput{DirectorUUID: owner, Applied: apply, Groups: results}
 		if out.Groups == nil {
@@ -70,6 +71,19 @@ func runHAFixAA(ctx context.Context, eff *config.CPIConfig, logger *log.Logger, 
 		}
 	}
 	return exitOK
+}
+
+// markOtherEntryGroups gives a group that only another cpis entry's
+// placement.az_map explains the outcome haFixAAOtherEntry, the way the doctor
+// calls it advice in a run of one entry. The fix wrote nothing for the group, and
+// it is not a planning failure of this run.
+func markOtherEntryGroups(results []handlers.AntiAffinityFixResult) {
+	for i := range results {
+		r := &results[i]
+		if r.Outcome == handlers.AntiAffinityProblem && (r.OtherEntry || r.ForeignRule != "") {
+			r.Outcome = haFixAAOtherEntry
+		}
+	}
 }
 
 func writeHAFixAAText(w io.Writer, owner, rule string, apply bool, results []handlers.AntiAffinityFixResult) {
@@ -94,7 +108,10 @@ func writeHAFixAAText(w io.Writer, owner, rule string, apply bool, results []han
 		for _, d := range r.Drift {
 			_, _ = fmt.Fprintf(w, "    %s\n", d)
 		}
-		if r.Problem != "" {
+		if r.Outcome == haFixAAOtherEntry {
+			_, _ = fmt.Fprintf(w, "    Nothing was written for it. The %s\n",
+				strings.TrimPrefix(otherEntryAdvice("the fix", r.Problem), "the "))
+		} else if r.Problem != "" {
 			_, _ = fmt.Fprintf(w, "    The group could not be planned: %s\n", r.Problem)
 		}
 		if r.Error != "" {
@@ -104,6 +121,10 @@ func writeHAFixAAText(w io.Writer, owner, rule string, apply bool, results []han
 	_, _ = fmt.Fprintf(w, "%d in layout, %d would be fixed, %d fixed, %d failed, and %d not planned\n",
 		counts[handlers.AntiAffinityInLayout], counts[handlers.AntiAffinityWouldFix],
 		counts[handlers.AntiAffinityFixed], counts[handlers.AntiAffinityFailed], counts[handlers.AntiAffinityProblem])
+	if n := counts[haFixAAOtherEntry]; n > 0 {
+		_, _ = fmt.Fprintf(w, "%d left to another cpis entry, so run the fix once per entry with --request and --group, "+
+			"and use pve-ops ha --cpi-config to see which entry judges each group\n", n)
+	}
 }
 
 func haFixAAOutcomeText(o string) string {
@@ -118,6 +139,12 @@ func haFixAAOutcomeText(o string) string {
 		return "the planned layout could not be written"
 	case handlers.AntiAffinityProblem:
 		return "the group could not be planned"
+	case haFixAAOtherEntry:
+		return "the group may belong to another cpis entry, so it was skipped"
 	}
 	return strings.ReplaceAll(o, "_", " ")
 }
+
+// haFixAAOtherEntry is the outcome of a group that only another cpis entry's
+// placement.az_map explains.
+const haFixAAOtherEntry = "other_entry"

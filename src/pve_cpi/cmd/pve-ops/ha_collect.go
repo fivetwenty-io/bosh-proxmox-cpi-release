@@ -1149,10 +1149,7 @@ func (c *haCollector) layoutFindings(chk handlers.AntiAffinityGroupCheck) {
 // by the entry that placed it and keeps the problem when no entry does.
 func (c *haCollector) unplannedFinding(rule, reason string, otherEntry bool) {
 	if otherEntry && c.scope == nil {
-		c.rep.advise(haKindAALayoutDrift, rule, "the group's rules could not be planned under this entry's "+
-			"settings, but another cpis entry's placement.az_map may own the group, and a run of one entry can't "+
-			"see the others, so the doctor doesn't count it as a problem; run pve-ops ha --cpi-config to judge the "+
-			"group by the entry that placed it. The plan found that %s", reason)
+		c.rep.advise(haKindAALayoutDrift, rule, "%s", otherEntryAdvice("the doctor", reason))
 		return
 	}
 	c.rep.problem(haKindAALayoutDrift, rule, "the group's rules could not be planned: %s", reason)
@@ -3368,4 +3365,14 @@ func (j cacheJudge) ownerNote(refusal *endpointcache.Refusal) string {
 	}
 	return fmt.Sprintf("; the CPI runs as the user that owns the directory, and this check ran as uid %d, "+
 		"so confirm the owner is the CPI's user", j.doctor)
+}
+
+// otherEntryAdvice is the advice on a group whose plan failed under one cpis
+// entry's settings for a reason that only another entry's placement.az_map
+// explains. who names the command that gives it, and reason is the plan's.
+func otherEntryAdvice(who, reason string) string {
+	return "the group's rules could not be planned under this entry's settings, but another cpis entry's " +
+		"placement.az_map may own the group, and a run of one entry can't see the others, so " + who +
+		" doesn't count it as a problem; run pve-ops ha --cpi-config to judge the group by the entry that " +
+		"placed it. The plan found that " + reason
 }

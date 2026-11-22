@@ -165,3 +165,69 @@ func TestRunHAFixAAUsageErrors(t *testing.T) {
 		})
 	}
 }
+
+// otherEntryResult is a group whose plan failed under this entry's settings for
+// a reason that only another cpis entry's placement.az_map explains.
+func otherEntryResult(rule string, foreign bool) handlers.AntiAffinityFixResult {
+	chk := handlers.AntiAffinityGroupCheck{Rule: rule, Group: "web", Deployment: "cf", Members: 4, Pattern: "block"}
+	if foreign {
+		chk.ForeignRule = "rule " + rule + " is not a name this entry's map gives"
+	} else {
+		chk.Problem, chk.OtherEntry = "the rule is confined to one domain", true
+	}
+	r := handlers.AntiAffinityFixResult{AntiAffinityGroupCheck: chk, Outcome: handlers.AntiAffinityProblem}
+	if foreign {
+		r.Problem = chk.ForeignRule
+	}
+	return r
+}
+
+// A group that only another entry's placement.az_map explains is advice in a
+// run of one entry, as it is for the doctor. The fix skips it, writes nothing
+// for it, prints the same advice, and does not exit 1 because of it, whether the
+// run covers every group or names the group with --group.
+func TestRunHAFixAASkipsAGroupAnotherEntryMayOwn(t *testing.T) {
+	t.Parallel()
+	for _, foreign := range []bool{false, true} {
+		for _, args := range [][]string{
+			{"--fix-anti-affinity", "--apply", "--director-uuid", haDirector},
+			{"--fix-anti-affinity", "--apply", "--director-uuid", haDirector, "--group", "bosh-aa-aaaaaaaaaaaa"},
+		} {
+			d := newHATestDeps(haCfg("auto", "none"))
+			withFixAA(d, []handlers.AntiAffinityFixResult{otherEntryResult("bosh-aa-aaaaaaaaaaaa", foreign)}, nil)
+			code, out, errOut := runHATest(t, d, args...)
+			if code != exitOK || errOut != "" {
+				t.Fatalf("foreign=%v %v: code = %d, stderr = %q\n%s", foreign, args, code, errOut, out)
+			}
+			for _, s := range []string{"another cpis entry's placement.az_map may own the group", "--cpi-config"} {
+				if !strings.Contains(out, s) {
+					t.Errorf("foreign=%v %v: output lacks %q:\n%s", foreign, args, s, out)
+				}
+			}
+			if strings.Contains(out, "1 not planned") {
+				t.Errorf("foreign=%v %v: the group counts as not planned:\n%s", foreign, args, out)
+			}
+		}
+	}
+	d := newHATestDeps(haCfg("auto", "none"))
+	withFixAA(d, []handlers.AntiAffinityFixResult{otherEntryResult("bosh-aa-aaaaaaaaaaaa", false)}, nil)
+	_, out, _ := runHATest(t, d, "--fix-anti-affinity", "--director-uuid", haDirector, "--json")
+	var got haFixAAOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil || len(got.Groups) != 1 ||
+		got.Groups[0].Outcome != haFixAAOtherEntry {
+		t.Errorf("JSON output = %+v (%v), want the outcome %s\n%s", got, err, haFixAAOtherEntry, out)
+	}
+}
+
+// Any other planning failure still exits 1, even beside a group another entry
+// may own.
+func TestRunHAFixAAOtherPlanningFailuresStillExitOne(t *testing.T) {
+	t.Parallel()
+	d := newHATestDeps(haCfg("auto", "none"))
+	planFailure := fixAAResults(handlers.AntiAffinityProblem)
+	planFailure[0].Problem = "no node can hold the group"
+	withFixAA(d, append(planFailure, otherEntryResult("bosh-aa-bbbbbbbbbbbb", false)), nil)
+	if code, out, _ := runHATest(t, d, "--fix-anti-affinity", "--director-uuid", haDirector); code != exitError {
+		t.Fatalf("code = %d\n%s", code, out)
+	}
+}
