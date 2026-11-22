@@ -679,6 +679,7 @@ func deleteLegacyVMAndArtifacts(
 	// --- teardown: stop (through PVE HA for an HA-managed VM), protect the
 	//     disks that must outlive the VM, re-check it on its owner node,
 	//     destroy with purge, and prove it absent (see vmTeardown) ---
+	var confined []string
 	teardown := &vmTeardown{
 		caller:              "delete_vm",
 		vmCID:               vmCID,
@@ -694,6 +695,9 @@ func deleteLegacyVMAndArtifacts(
 			return preserveForLegacyDelete(ctx, deps, node, vmCID, vmid, logger)
 		},
 		owned: owned,
+		beforeDestroy: func(ctx context.Context, st *pve.HAServiceState) {
+			confined = holdHAMembershipBeforeDestroy(ctx, deps, st, vmid, vmTags, logger)
+		},
 	}
 	result, err := teardown.run(ctx, deps)
 	if err != nil {
@@ -709,7 +713,8 @@ func deleteLegacyVMAndArtifacts(
 			})
 		}
 		runPostDestroyCleanup(ctx, deps, identity, "ha_membership", logger, func() {
-			cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, vmTags, logger)
+			cleanupHAMembershipAfterDestroy(withAntiAffinityConfined(ctx, confined), deps, haState, vmid, vmTags,
+				logger)
 		})
 		runPostDestroyCleanup(ctx, deps, identity, "advertised_routes", logger, func() {
 			cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
@@ -722,7 +727,7 @@ func deleteLegacyVMAndArtifacts(
 	// rules that still name the VM and plans the VM's anti-affinity groups
 	// again, which it finds from the member tag in vmTags.
 	runPostDestroyCleanup(ctx, deps, identity, "ha_membership", logger, func() {
-		cleanupHAMembershipAfterDestroy(ctx, deps, haState, vmid, vmTags, logger)
+		cleanupHAMembershipAfterDestroy(withAntiAffinityConfined(ctx, confined), deps, haState, vmid, vmTags, logger)
 	})
 
 	// --- opt-in empty-pool reaper: run AFTER the destroy has completed so
@@ -911,6 +916,29 @@ func cleanupHAMembership(
 		logger.Warn("delete_vm: HA node-affinity pin cleanup incomplete (non-fatal)", log.Err(pinErr))
 	}
 	return nil
+}
+
+// holdHAMembershipBeforeDestroy is the teardown's beforeDestroy for a delete
+// that cleans up the VM's HA membership after the destroy. For a VM that PVE
+// HA manages, and whose HA state lets the cleanup run, it takes the VM out of
+// its anti-affinity group rules and records the holds of its places before
+// the destroy's purge (see holdAntiAffinityPlacesBeforeDestroy). It returns
+// the members of the confinement pins a repair ran for, which the cleanup
+// after the destroy takes through withAntiAffinityConfined. A failure is
+// logged and never stops the delete, and the cleanup after the destroy
+// records the holds as before.
+func holdHAMembershipBeforeDestroy(
+	ctx context.Context, deps Deps, haState *pve.HAServiceState, vmid int, tags string, logger *log.Logger,
+) []string {
+	if haRefusesMembershipCleanup(haState, vmid) != nil || !haState.Managed() {
+		return nil
+	}
+	confined, err := holdAntiAffinityPlacesBeforeDestroy(ctx, deps, vmid, tags, logger)
+	if err != nil {
+		logger.Warn("delete_vm: the VM's anti-affinity places could not be held before the destroy, so the cleanup "+
+			"after the destroy holds them (non-fatal)", log.Err(err))
+	}
+	return confined
 }
 
 // cleanupHAMembershipAfterDestroy runs cleanupHAMembership once the VM is gone,

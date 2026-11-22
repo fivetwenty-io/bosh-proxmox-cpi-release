@@ -112,6 +112,10 @@ type vmTeardown struct {
 	owned func(ctx context.Context, holding pve.QemuHolding) error
 	// awaitTask awaits the destroy task. nil runs awaitDeleteTask.
 	awaitTask func(ctx context.Context, resp *sdknodes.DeleteQemuResponse) error
+	// beforeDestroy, when set, runs once after step 4 and before the destroy,
+	// while the VM and its HA resource still exist, with the HA state step 1
+	// settled. It cannot fail the teardown, so it logs its own failures.
+	beforeDestroy func(ctx context.Context, haState *pve.HAServiceState)
 }
 
 // run executes the protocol. On success the VM is either destroyed by this
@@ -137,6 +141,9 @@ func (t *vmTeardown) run(ctx context.Context, deps Deps) (teardownResult, error)
 	}
 	if gone, err = t.verifyBeforeDestroy(ctx, deps); err != nil || gone {
 		return teardownResult{stage: teardownStageVerify, gone: gone}, err
+	}
+	if t.beforeDestroy != nil {
+		t.beforeDestroy(ctx, t.haState)
 	}
 	resp, gone, err := t.destroy(ctx, deps, retained)
 	if err != nil || gone {

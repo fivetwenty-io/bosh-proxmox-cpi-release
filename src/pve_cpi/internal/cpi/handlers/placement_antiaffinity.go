@@ -883,9 +883,11 @@ func verifyAntiAffinityMember(ctx context.Context, deps Deps, ruleName, sid stri
 // plans each group the VM was in again, the way pve-ops ha
 // --fix-anti-affinity does, so the members it left move into the index
 // layout (see replanGroupsAfterDelete). tags are the VM's tags as the delete
-// read them before the destroy. The destroy's purge has usually taken the sid
-// out of every rule already, so the member tag in tags is what names the
-// group then.
+// read them before the destroy. A delete has usually taken the sid out of its
+// group rules before the destroy (see holdAntiAffinityPlacesBeforeDestroy),
+// and the destroy's purge out of every other rule, so the member tag in tags
+// is what names the group then. Confinement pins that the removal before the
+// destroy repaired come in through ctx (see withAntiAffinityConfined).
 //
 // PVE takes no digest on a rule delete, so a delete planned from a read that a
 // sibling's create has since grown would take the sibling out with the rule.
@@ -899,12 +901,14 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, tags
 	sid := haResourceSid(vmid)
 	owner := deps.RequestDirectorUUID
 	var deleted, written map[string]string
-	var confined []string
+	confined := antiAffinityConfined(ctx)
 
 	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
 		var groupErr error
 		if antiAffinityJoinEnabled(deps.Config) && owner != "" {
-			written, confined, groupErr = removeFromGroupRules(ctx, deps, sid, tags, logger)
+			var more []string
+			written, more, groupErr = removeFromGroupRules(ctx, deps, sid, tags, logger)
+			confined = append(confined, more...)
 		}
 		// No profile: a removal only shrinks rules, so the writer leaves the
 		// feasibility checks to PVE and the cleanup never probes the cluster.
@@ -1681,4 +1685,65 @@ func isHaNotFound(err error) bool {
 		strings.Contains(msg, "does not exist") ||
 		strings.Contains(msg, "not defined") ||
 		strings.Contains(msg, "404")
+}
+
+// holdAntiAffinityPlacesBeforeDestroy takes the VM out of the rules of each of
+// this Director's anti-affinity groups it is in, and records the hold that
+// keeps its place for the recreate of its index, while its guest and its HA
+// resource still exist. It runs under the rules lock, after the stop and
+// before the destroy, whose purge then finds the VM in no rule of its groups.
+//
+// The removal after the destroy (see removeAntiAffinityMembership) records the
+// same hold, but there it runs after the purge has taken the VM out of its
+// rules. A sibling's delete or join that plans the group in between sees the
+// VM's index missing with no hold, which looks like a hold that has lapsed,
+// and its plan regroups the members above it. Here, until the write lands,
+// every plan sees the VM in its rule, and once it lands, the hold keeps its
+// place. A write that meets a digest conflict backs off and plans again, and
+// the VM is still in its rule meanwhile, so no plan ever sees its place as a
+// gap. The write records the VM as leaving the rule (see wantRule), so no
+// plan puts it back before the purge.
+//
+// It returns the members of the confinement pins a repair ran for, which the
+// removal after the destroy passes on to its plan of each group (see
+// withAntiAffinityConfined). A failure is returned for the caller to log, and
+// the removal after the destroy records the hold as before.
+func holdAntiAffinityPlacesBeforeDestroy(
+	ctx context.Context, deps Deps, vmid int, tags string, logger *log.Logger,
+) ([]string, error) {
+	if !antiAffinityJoinEnabled(deps.Config) || deps.RequestDirectorUUID == "" {
+		return nil, nil
+	}
+	sid := haResourceSid(vmid)
+	var confined []string
+	err := withHARulesLock(ctx, deps, vmid, logger, func(ctx context.Context) error {
+		var err error
+		_, confined, err = removeFromGroupRules(ctx, deps, sid, tags, logger)
+		return err
+	})
+	if err != nil {
+		return confined, fmt.Errorf("anti-affinity: hold the places of %s before its destroy: %w", sid, err)
+	}
+	return confined, nil
+}
+
+// antiAffinityConfinedKey is the context key of the members of the
+// confinement pins a repair ran for before the destroy.
+type antiAffinityConfinedKey struct{}
+
+// withAntiAffinityConfined returns ctx carrying the members of the
+// confinement pins a repair in holdAntiAffinityPlacesBeforeDestroy ran for,
+// so the removal after the destroy restores them with the rest.
+func withAntiAffinityConfined(ctx context.Context, confined []string) context.Context {
+	if len(confined) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, antiAffinityConfinedKey{}, slices.Clone(confined))
+}
+
+// antiAffinityConfined returns the members withAntiAffinityConfined put in
+// ctx, or nil.
+func antiAffinityConfined(ctx context.Context) []string {
+	confined, _ := ctx.Value(antiAffinityConfinedKey{}).([]string)
+	return slices.Clone(confined)
 }

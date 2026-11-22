@@ -506,6 +506,7 @@ func sweepDeferredTeardown(
 	// The ownership check proved the VM ours, so its config-drive ISO may go
 	// with it.
 	ctx = pve.WithOwnedConfigDriveISO(ctx, vmid)
+	var confined []string
 	teardown := &vmTeardown{
 		caller:              "deferred teardown sweep",
 		vmCID:               vmCID,
@@ -519,6 +520,9 @@ func sweepDeferredTeardown(
 		},
 		owned: func(ctx context.Context, holding pve.QemuHolding) error {
 			return sweepStillOwned(ctx, deps, row, vmid, holding, queue, sweepLogger)
+		},
+		beforeDestroy: func(ctx context.Context, st *pve.HAServiceState) {
+			confined = holdHAMembershipBeforeDestroy(ctx, deps, st, vmid, authTags, sweepLogger)
 		},
 	}
 	identity := captureVMIdentity(row.Node, vmid, cfg)
@@ -539,7 +543,8 @@ func sweepDeferredTeardown(
 			cleanupAgentForVM(ctx, deps, node, vmid, sweepLogger)
 		})
 		runPostDestroyCleanup(ctx, deps, identity, "ha_membership", sweepLogger, func() {
-			cleanupHAMembershipAfterDestroy(ctx, deps, teardown.haState, vmid, authTags, sweepLogger)
+			cleanupHAMembershipAfterDestroy(withAntiAffinityConfined(ctx, confined), deps, teardown.haState, vmid,
+				authTags, sweepLogger)
 		})
 		runPostDestroyCleanup(ctx, deps, identity, "advertised_routes", sweepLogger, func() {
 			cleanupAdvertisedRoutes(ctx, deps, vmid, authTags, sweepLogger)
