@@ -526,8 +526,9 @@ func (c *haCollector) pinOf(vmid int) *ha.Rule {
 }
 
 // profileFindings reports what the profile itself shows: an observe-only
-// state, a down node, quorum risk, the QDevice recommendation, and a CRS mode
-// that leaves DLB without effect.
+// state, a down node, a node notes line that misses the maintenance marker,
+// quorum risk, the QDevice recommendation, and a CRS mode that leaves DLB
+// without effect.
 func (c *haCollector) profileFindings() {
 	p, rep := c.p, c.rep
 	headline := p.LogLine()
@@ -545,10 +546,16 @@ func (c *haCollector) profileFindings() {
 	}
 	c.entryClockFinding()
 	if p.Health != nil {
+		// Every entry of one Director on the cluster reads the same node notes,
+		// so only the entry that reports the cluster findings advises on them.
+		nearMiss := c.reportsCluster()
 		for i := range p.Health.Nodes {
 			n := &p.Health.Nodes[i]
 			if n.DeadOrFenced {
 				rep.problem(haKindNodeDown, n.Name, "the node is offline, unknown, fenced, or gone: %s", n.Reason)
+			}
+			if !nearMiss {
+				continue
 			}
 			for _, line := range n.NotesNearMiss {
 				rep.advise(haKindNotesNearMiss, n.Name, "the line %q in the node's notes looks like a maintenance "+

@@ -236,3 +236,42 @@ func TestRunHACPIConfig_HandsAnUnreadEntrysFindingsToTheNext(t *testing.T) {
 	}
 	want(t, out.Clusters[1], haKindManagedNoResource, haSeverityProblem, "vm:100")
 }
+
+// TestCollectScopedEntriesReportANotesNearMissOnce pins that the advice on a
+// node notes line that misses the maintenance marker appears once per Director
+// and cluster under --cpi-config, the way spread_skewed does. Every entry of
+// one Director on the cluster reads the same node notes, so only the entry that
+// reports the cluster findings states it, and when the doctor could not read
+// that entry's cluster, the next entry states it in its place.
+func TestCollectScopedEntriesReportANotesNearMissOnce(t *testing.T) {
+	t.Parallel()
+	entries := []cpiConfigEntry{
+		{Name: "low", Type: "pve", Properties: map[string]any{"pve_vmid_range_start": 100, "pve_vmid_range_end": 101}},
+		{Name: "high", Type: "pve", Properties: map[string]any{"pve_vmid_range_start": 102, "pve_vmid_range_end": 999}},
+	}
+	run := func(i int, unread ...int) *haReport {
+		t.Helper()
+		base := haCfg("auto", "replicate")
+		scopes := entryScopes(entries, base, []string{haDirector, haDirector})
+		for _, k := range unread {
+			markUnread(scopes, k)
+		}
+		eff, _, _, err := config.ApplyContextOverrides(base, entries[i].Properties)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := scopedFaultFake()
+		f.profile.Health.Nodes[0].NotesNearMiss = []string{"- tags: maintenance"}
+		return collectHAScoped(context.Background(), f, eff, haDirector, haNow, scopes[i])
+	}
+	if got := findings(run(0), haKindNotesNearMiss); len(got) != 1 {
+		t.Errorf("entry low reports %d %s findings, want 1: %+v", len(got), haKindNotesNearMiss, got)
+	}
+	if got := findings(run(1), haKindNotesNearMiss); len(got) != 0 {
+		t.Errorf("entry high repeats the advice entry low reports: %+v", got)
+	}
+	if got := findings(run(1, 0), haKindNotesNearMiss); len(got) != 1 {
+		t.Errorf("entry high after an unread low reports %d %s findings, want 1: %+v", len(got),
+			haKindNotesNearMiss, got)
+	}
+}
