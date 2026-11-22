@@ -120,7 +120,7 @@ func TestRunHAFixAARefusesCPIConfigAndNamesThePerEntryRun(t *testing.T) {
 	}
 	for _, want := range []string{
 		"--fix-anti-affinity cannot be combined with --cpi-config",
-		"once per cpis entry with that entry's --request and --group bosh-aa-<hash12>",
+		"once per cpi_config entry with that entry's --request and --group bosh-aa-<hash12>",
 		"pve-ops ha --cpi-config",
 	} {
 		if !strings.Contains(errOut, want) {
@@ -141,7 +141,8 @@ func TestRunHAHelpSaysTheFixRunsOncePerEntry(t *testing.T) {
 	if code != exitOK {
 		t.Fatalf("code = %d, stderr = %q", code, errOut)
 	}
-	const want = "it doesn't take --cpi-config, so run it once per cpis entry with that entry's --request and --group"
+	const want = "it doesn't take --cpi-config, so run it once per cpi_config entry with that entry's " +
+		"--request and --group"
 	if !strings.Contains(errOut, want) {
 		t.Errorf("help lacks the per-entry run of the fix:\n%s", errOut)
 	}

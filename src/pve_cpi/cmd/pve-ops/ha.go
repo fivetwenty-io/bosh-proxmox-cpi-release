@@ -91,7 +91,7 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 	cpiConfigPath := fs.String("cpi-config", "", "BOSH cpi-config as JSON (not the rendered cpi.json), used to check every cpis entry of type pve and the exports they share")
 	asJSON := fs.Bool("json", false, "JSON output")
 	widenReplicas := fs.Bool("widen-replicas", false, "widen the pin of each replicate VM whose replica a verified sync covers, using the check the CPI runs (a dry run unless --apply is given)")
-	fixAA := fs.Bool("fix-anti-affinity", false, "plan each anti-affinity group of the Director again the way the CPI plans it, and report the groups whose rules differ (a dry run unless --apply is given); it doesn't take --cpi-config, so run it once per cpis entry with that entry's --request and --group")
+	fixAA := fs.Bool("fix-anti-affinity", false, "plan each anti-affinity group of the Director again the way the CPI plans it, and report the groups whose rules differ (a dry run unless --apply is given); it doesn't take --cpi-config, so run it once per cpi_config entry with that entry's --request and --group")
 	group := fs.String("group", "", "with --fix-anti-affinity, the base rule name bosh-aa-<hash12> of the one group to fix")
 	apply := fs.Bool("apply", false, "with --widen-replicas, write the widened pins, and with --fix-anti-affinity, write the planned rules")
 	directorUUID := fs.String("director-uuid", "", "with --widen-replicas or --fix-anti-affinity, the UUID of the Director whose VMs or rules the run may change, when no --request names it; with --cpi-config, the UUID of the Director that owns every entry that names none")
@@ -195,8 +195,8 @@ func checkHAWriteFlags(
 			"once per cpis entry with that entry's --request")
 	case fixAA && cpiConfigPath != "":
 		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --fix-anti-affinity cannot be combined with --cpi-config; run "+
-			"pve-ops ha --cpi-config to see which entry judges each group, then run the fix once per cpis entry "+
-			"with that entry's --request and --group bosh-aa-<hash12>")
+			"pve-ops ha --cpi-config to see which entry judges each group, then run the fix once per cpi_config "+
+			"entry with that entry's --request and --group bosh-aa-<hash12>")
 	default:
 		return exitOK, true
 	}
