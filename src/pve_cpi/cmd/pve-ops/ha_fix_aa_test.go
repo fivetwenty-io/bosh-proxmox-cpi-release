@@ -200,7 +200,7 @@ func TestRunHAFixAASkipsAGroupAnotherEntryMayOwn(t *testing.T) {
 			if code != exitOK || errOut != "" {
 				t.Fatalf("foreign=%v %v: code = %d, stderr = %q\n%s", foreign, args, code, errOut, out)
 			}
-			for _, s := range []string{"another cpis entry's placement.az_map may own the group", "--cpi-config"} {
+			for _, s := range []string{"another cpi_config entry's placement.az_map may own the group", "--cpi-config"} {
 				if !strings.Contains(out, s) {
 					t.Errorf("foreign=%v %v: output lacks %q:\n%s", foreign, args, s, out)
 				}

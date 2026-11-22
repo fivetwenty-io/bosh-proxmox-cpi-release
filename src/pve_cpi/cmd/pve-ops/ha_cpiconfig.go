@@ -64,7 +64,7 @@ func decodeEntryList(data []byte) ([]cpiConfigEntry, error) {
 	}
 	for i := range list {
 		if len(members[i].Properties) != len(list[i].Properties) {
-			return nil, fmt.Errorf("the properties of cpis entry %d read as %d keys and then as %d",
+			return nil, fmt.Errorf("the properties of cpi_config entry %d read as %d keys and then as %d",
 				i+1, len(list[i].Properties), len(members[i].Properties))
 		}
 		for key, raw := range members[i].Properties {
@@ -97,17 +97,17 @@ func parseCPIConfig(data []byte) ([]cpiConfigEntry, error) {
 		return nil, err
 	}
 	if len(entries) == 0 {
-		return nil, errors.New("the cpi-config file has no cpis entries")
+		return nil, errors.New("the cpi-config file has no cpi_config entries")
 	}
 	seen := map[string]bool{}
 	out := make([]cpiConfigEntry, 0, len(entries))
 	for i := range entries {
 		name := strings.TrimSpace(entries[i].Name)
 		if name == "" {
-			return nil, fmt.Errorf("cpis entry %d has no name", i+1)
+			return nil, fmt.Errorf("cpi_config entry %d has no name", i+1)
 		}
 		if seen[name] {
-			return nil, fmt.Errorf("cpis entry name %q appears more than once", name)
+			return nil, fmt.Errorf("cpi_config entry name %q appears more than once", name)
 		}
 		seen[name] = true
 		entries[i].Name = name
@@ -117,7 +117,7 @@ func parseCPIConfig(data []byte) ([]cpiConfigEntry, error) {
 		out = append(out, entries[i])
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("the cpi-config file has no cpis entry of type %s", haCPIType)
+		return nil, fmt.Errorf("the cpi-config file has no cpi_config entry of type %s", haCPIType)
 	}
 	return out, nil
 }
@@ -147,7 +147,7 @@ func decodeCPIEntries(data []byte) ([]cpiConfigEntry, error) {
 					"cpi-config as JSON with a cpis list")
 			}
 		}
-		return nil, errors.New("the cpi-config file has no cpis entries")
+		return nil, errors.New("the cpi-config file has no cpi_config entries")
 	}
 	list, err := decodeEntryList(raw)
 	if err != nil {

@@ -647,7 +647,7 @@ func TestCollectAntiAffinityLayoutPinRestoreGoesToTheEntryWhoseAZThePinPrefers(t
 
 // aaOneEntryReason is the words a run of one entry adds to a group that only
 // another entry's AZ map may explain.
-const aaOneEntryReason = "another cpis entry's placement.az_map may own the group"
+const aaOneEntryReason = "another cpi_config entry's placement.az_map may own the group"
 
 // TestCollectAntiAffinityLayoutForeignNamedRuleIsAdviceForOneEntry pins that a
 // run of one entry reports a group whose plan would rename a rule that its own

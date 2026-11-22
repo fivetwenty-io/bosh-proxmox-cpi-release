@@ -388,15 +388,15 @@ func TestRunHACPIConfigInputFailures(t *testing.T) {
 	t.Parallel()
 	for name, tc := range map[string]struct{ content, hint string }{
 		"yaml":       {"cpis:\n- name: az1\n", "yq -o=json"},
-		"no entries": {`{"cpis":[]}`, "no cpis entries"},
-		"empty list": {`[]`, "no cpis entries"},
+		"no entries": {`{"cpis":[]}`, "no cpi_config entries"},
+		"empty list": {`[]`, "no cpi_config entries"},
 		"no name":    {`{"cpis":[{"properties":{}}]}`, "has no name"},
 		"duplicate":  {`{"cpis":[{"name":"a"},{"name":"a"}]}`, "more than once"},
-		"not pve":    {`{"cpis":[{"name":"a","type":"vsphere"}]}`, "no cpis entry of type pve"},
+		"not pve":    {`{"cpis":[{"name":"a","type":"vsphere"}]}`, "no cpi_config entry of type pve"},
 		"bad list":   {`{"cpis":{"name":"a"}}`, "not a list of entries"},
 		"bad array":  {`[1]`, "yq -o=json"},
 		"rendered":   {`{"host":"pve","node":"n1","vm_storage":"local-lvm"}`, "/var/vcap/jobs/pve_cpi/config/cpi.json"},
-		"no cpis":    {`{"other":1}`, "no cpis entries"},
+		"no cpis":    {`{"other":1}`, "no cpi_config entries"},
 	} {
 		path := writeTemp(t, "cpi.json", tc.content)
 		code, _, errOut := runHATest(t, newHATestDeps(haCfg("auto", "none"), haBaseFake()), "--cpi-config", path)

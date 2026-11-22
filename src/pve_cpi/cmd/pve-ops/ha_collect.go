@@ -3371,7 +3371,7 @@ func (j cacheJudge) ownerNote(refusal *endpointcache.Refusal) string {
 // entry's settings for a reason that only another entry's placement.az_map
 // explains. who names the command that gives it, and reason is the plan's.
 func otherEntryAdvice(who, reason string) string {
-	return "the group's rules could not be planned under this entry's settings, but another cpis entry's " +
+	return "the group's rules could not be planned under this entry's settings, but another cpi_config entry's " +
 		"placement.az_map may own the group, and a run of one entry can't see the others, so " + who +
 		" doesn't count it as a problem; run pve-ops ha --cpi-config to judge the group by the entry that " +
 		"placed it. The plan found that " + reason

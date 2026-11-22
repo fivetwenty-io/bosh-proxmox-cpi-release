@@ -88,7 +88,7 @@ func runHAWith(args []string, stdout, stderr io.Writer, deps haDeps) int {
 	fs.SetOutput(io.Discard)
 	configPath := fs.String("config", "", "CPI configuration file")
 	requestPath := fs.String("request", "", "CPI request JSON file whose context selects a cpi_config entry")
-	cpiConfigPath := fs.String("cpi-config", "", "BOSH cpi-config as JSON (not the rendered cpi.json), used to check every cpis entry of type pve and the exports they share")
+	cpiConfigPath := fs.String("cpi-config", "", "BOSH cpi-config as JSON (not the rendered cpi.json), used to check every cpi_config entry of type pve and the exports they share")
 	asJSON := fs.Bool("json", false, "JSON output")
 	widenReplicas := fs.Bool("widen-replicas", false, "widen the pin of each replicate VM whose replica a verified sync covers, using the check the CPI runs (a dry run unless --apply is given)")
 	fixAA := fs.Bool("fix-anti-affinity", false, "plan each anti-affinity group of the Director again the way the CPI plans it, and report the groups whose rules differ (a dry run unless --apply is given); it doesn't take --cpi-config, so run it once per cpi_config entry with that entry's --request and --group")
@@ -192,7 +192,7 @@ func checkHAWriteFlags(
 		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --group goes with --fix-anti-affinity")
 	case widen && cpiConfigPath != "":
 		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --widen-replicas cannot be combined with --cpi-config; run it "+
-			"once per cpis entry with that entry's --request")
+			"once per cpi_config entry with that entry's --request")
 	case fixAA && cpiConfigPath != "":
 		_, _ = fmt.Fprintln(stderr, "pve-ops ha: --fix-anti-affinity cannot be combined with --cpi-config; run "+
 			"pve-ops ha --cpi-config to see which entry judges each group, then run the fix once per cpi_config "+

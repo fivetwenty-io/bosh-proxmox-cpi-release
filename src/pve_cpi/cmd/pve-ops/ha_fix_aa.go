@@ -122,8 +122,8 @@ func writeHAFixAAText(w io.Writer, owner, rule string, apply bool, results []han
 		counts[handlers.AntiAffinityInLayout], counts[handlers.AntiAffinityWouldFix],
 		counts[handlers.AntiAffinityFixed], counts[handlers.AntiAffinityFailed], counts[handlers.AntiAffinityProblem])
 	if n := counts[haFixAAOtherEntry]; n > 0 {
-		_, _ = fmt.Fprintf(w, "%d left to another cpis entry, so run the fix once per entry with --request and --group, "+
-			"and use pve-ops ha --cpi-config to see which entry judges each group\n", n)
+		_, _ = fmt.Fprintf(w, "%d left to another cpi_config entry, so run the fix once per entry with --request "+
+			"and --group, and use pve-ops ha --cpi-config to see which entry judges each group\n", n)
 	}
 }
 
@@ -140,7 +140,7 @@ func haFixAAOutcomeText(o string) string {
 	case handlers.AntiAffinityProblem:
 		return "the group could not be planned"
 	case haFixAAOtherEntry:
-		return "the group may belong to another cpis entry, so it was skipped"
+		return "the group may belong to another cpi_config entry, so it was skipped"
 	}
 	return strings.ReplaceAll(o, "_", " ")
 }
