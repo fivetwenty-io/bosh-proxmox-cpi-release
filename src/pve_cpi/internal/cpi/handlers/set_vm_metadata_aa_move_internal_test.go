@@ -481,7 +481,7 @@ func newColoGroup(nodes ...string) *coloGroup {
 	g := &coloGroup{stub: newAAStub(), nodes: map[int]string{}, joined: map[int]bool{}}
 	g.stub.memberNodes = coloTriple
 	g.stub.statusFn = func() (*cluster.ListStatusResponse, error) { return AbsenceOnlineStatus(coloTriple...), nil }
-	var vmids []int
+	vmids := make([]int, 0, len(nodes))
 	for i, n := range nodes {
 		g.nodes[100+i] = n
 		vmids = append(vmids, 100+i)
@@ -493,7 +493,7 @@ func newColoGroup(nodes ...string) *coloGroup {
 
 // retag lists every member on its node, with its index tag once it joined.
 func (g *coloGroup) retag() {
-	var rows []json.RawMessage
+	rows := make([]json.RawMessage, 0, len(g.nodes))
 	for _, v := range slices.Sorted(maps.Keys(g.nodes)) {
 		tags := aaTag
 		if g.joined[v] {
