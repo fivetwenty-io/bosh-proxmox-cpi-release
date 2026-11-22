@@ -231,6 +231,7 @@ func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, lo
 		if report.Effective == "unknown" {
 			markUnread(scopes, i)
 		}
+		markNotesUnread(scopes, i, report.notesUnread)
 		multi.Clusters = append(multi.Clusters, report)
 		layouts = append(layouts, layout)
 	}
@@ -477,6 +478,9 @@ type haClusterEntry struct {
 	// Unread marks an entry whose cluster the doctor could not read, so the
 	// findings it would have reported fall to the next entry that holds them.
 	Unread bool
+	// NotesUnread names the nodes whose notes the entry could not read, so
+	// the advice on them falls to the next entry that read them.
+	NotesUnread []string
 	// index is the entry's position in the cpi-config.
 	index int
 }
@@ -497,6 +501,24 @@ func markUnread(scopes []*haEntryScope, i int) {
 		for k := range sc.Cluster {
 			if sc.Cluster[k].index == i {
 				sc.Cluster[k].Unread = true
+			}
+		}
+	}
+}
+
+// markNotesUnread records in every scope the nodes whose notes entry i could
+// not read, so a later entry that read them reports the advice on them.
+func markNotesUnread(scopes []*haEntryScope, i int, nodes []string) {
+	if len(nodes) == 0 {
+		return
+	}
+	for _, sc := range scopes {
+		if sc == nil {
+			continue
+		}
+		for k := range sc.Cluster {
+			if sc.Cluster[k].index == i {
+				sc.Cluster[k].NotesUnread = nodes
 			}
 		}
 	}

@@ -547,16 +547,22 @@ func (c *haCollector) profileFindings() {
 	c.entryClockFinding()
 	if p.Health != nil {
 		// Every entry of one Director on the cluster sees the same nodes, so
-		// only the entry that reports the cluster findings reports a down node
-		// and advises on the node notes.
+		// only the entry that reports the cluster findings reports a down node.
+		// The notes are another matter, because an entry's token may fail to
+		// read what another entry's token reads, so the advice on them comes
+		// from the first entry that read the node's notes.
 		cluster := c.reportsCluster()
 		for i := range p.Health.Nodes {
 			n := &p.Health.Nodes[i]
-			if !cluster {
+			if n.DeadOrFenced && cluster {
+				rep.problem(haKindNodeDown, n.Name, "the node is offline, unknown, fenced, or gone: %s", n.Reason)
+			}
+			if n.NotesUnread {
+				rep.notesUnread = append(rep.notesUnread, n.Name)
 				continue
 			}
-			if n.DeadOrFenced {
-				rep.problem(haKindNodeDown, n.Name, "the node is offline, unknown, fenced, or gone: %s", n.Reason)
+			if !c.readsNotesFirst(n.Name) {
+				continue
 			}
 			for _, line := range n.NotesNearMiss {
 				rep.advise(haKindNotesNearMiss, n.Name, "the line %q in the node's notes looks like a maintenance "+
@@ -2814,6 +2820,27 @@ func (c *haCollector) reportsCluster() bool {
 			return true
 		}
 		if c.sharesDirector(e) {
+			return false
+		}
+	}
+	return true
+}
+
+// readsNotesFirst reports whether this run is the first entry of its Director
+// on the cluster to have read the notes of node, so it gives the advice on
+// them. An entry the doctor could not read, and an entry whose token could not
+// read that node's notes, hand the advice to the next entry that did. The
+// caller has already seen that this run read the notes.
+func (c *haCollector) readsNotesFirst(node string) bool {
+	if c.scope == nil {
+		return true
+	}
+	for i := range c.scope.Cluster {
+		e := &c.scope.Cluster[i]
+		if e.Self {
+			return true
+		}
+		if c.sharesDirector(e) && !slices.Contains(e.NotesUnread, node) {
 			return false
 		}
 	}

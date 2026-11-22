@@ -318,3 +318,44 @@ func TestCollectScopedEntriesReportNodeDownAndQuorumFragileOnce(t *testing.T) {
 		}
 	}
 }
+
+// TestRunHACPIConfig_NotesNearMissComesFromTheEntryThatReadTheNotes pins that
+// when the first of two entries of one Director cannot read a node's notes and
+// the second can, the second gives the near miss advice and the first still
+// reports the notes as unchecked.
+func TestRunHACPIConfig_NotesNearMissComesFromTheEntryThatReadTheNotes(t *testing.T) {
+	t.Parallel()
+	doc := `[{"name":"a","type":"pve","director_uuid":"` + haDirector + `",` +
+		`"properties":{"pve_api_token":"root@pam!blind=x"}},` +
+		`{"name":"b","type":"pve","director_uuid":"` + haDirector + `","properties":{}},` +
+		`{"name":"c","type":"pve","director_uuid":"` + haDirector + `","properties":{}}]`
+	deps := haDeps{
+		openReader: func(cfg *config.CPIConfig, _ *log.Logger) (HAReader, error) {
+			f := haBaseFake()
+			f.profile.Health.Nodes[0].NotesNearMiss = []string{"- tags: maintenance"}
+			if strings.Contains(cfg.APIToken, "blind") {
+				f.profile.Health.Nodes[0].NotesNearMiss = nil
+				f.profile.Health.Nodes[0].NotesUnread = true
+				f.profile.Health.NotesErr = errFake
+			}
+			return f, nil
+		},
+		now: func() time.Time { return haNow },
+	}
+	path := filepath.Join(t.TempDir(), "cpi-config.json")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	runHACPIConfig(context.Background(), path, haCfg("auto", "none"), nil, "", true, &stdout, &stderr, deps)
+	var out haMultiReport
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil || len(out.Clusters) != 3 {
+		t.Fatalf("output %q (%v), stderr %q", stdout.String(), err, stderr.String())
+	}
+	for i, wantN := range []int{0, 1, 0} {
+		if got := findings(out.Clusters[i], haKindNotesNearMiss); len(got) != wantN {
+			t.Errorf("entry %d reports %d %s findings, want %d: %+v", i, len(got), haKindNotesNearMiss, wantN, got)
+		}
+	}
+	want(t, out.Clusters[0], haKindUnchecked, haSeverityProblem, "node-notes")
+}

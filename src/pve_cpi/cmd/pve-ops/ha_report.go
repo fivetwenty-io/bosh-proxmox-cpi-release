@@ -130,6 +130,9 @@ type haReport struct {
 	CPUDomains      []haDomain  `json:"cpu_domains"`
 	UnknownCPUNodes []string    `json:"unknown_cpu_nodes,omitempty"`
 	Findings        []haFinding `json:"findings"`
+	// notesUnread names the nodes whose notes the run could not read. The
+	// --cpi-config run hands it to the later entries of the same cluster.
+	notesUnread []string
 }
 
 // add records a finding.
