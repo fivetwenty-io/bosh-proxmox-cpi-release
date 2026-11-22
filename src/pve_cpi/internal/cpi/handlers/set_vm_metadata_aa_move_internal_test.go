@@ -28,9 +28,14 @@ import (
 )
 
 // coloNow is the clock of the move tests. A member born a minute before it
-// is joining for the first time. It is the wall clock at the start, because
-// the spread claim record dates its claims by the wall clock.
-var coloNow = time.Now().Truncate(time.Second)
+// is joining for the first time. It reads the wall clock each time, because
+// the spread claim record judges its claims and the group planner judges a
+// member's age by the wall clock, and a clock fixed when the package starts
+// falls behind both once a long run under the race detector reaches these
+// tests, which expires the claims and ends the wait for a missing index.
+func coloNow() time.Time {
+	return time.Now()
+}
 
 var coloNodes = []string{"pve1", "pve2", "pve3", "pve4"}
 
@@ -79,7 +84,7 @@ func newColoHarness() *coloHarness {
 
 func (h *coloHarness) hooks() *aaColoMoveHooks {
 	return &aaColoMoveHooks{
-		now: func() time.Time { return coloNow },
+		now: coloNow,
 		config: func(context.Context, string, int) (map[string]any, error) {
 			return h.config, nil
 		},
@@ -154,7 +159,7 @@ func coloStub() *aaClusterStub {
 func coloPair(node100, node101 string) *aaClusterStub {
 	stub := coloStub()
 	stub.tagged(aaQEMUOn(100, node100, aaTag+";index--0"), aaQEMUOn(101, node101, aaTag+";index--1"))
-	markWebMembersBorn(stub, coloNow.Add(-time.Minute), 100, 101)
+	markWebMembersBorn(stub, coloNow().Add(-time.Minute), 100, 101)
 	return stub
 }
 
@@ -166,7 +171,7 @@ func coloJoin(deps Deps, vmid int, index string, logger *log.Logger) {
 func coloLiveClaims(t *testing.T, dir string) []spreadclaim.Live {
 	t.Helper()
 	store := &spreadclaim.Store{Dir: endpointcache.DirOptions{Override: dir}, Scope: "colo"}
-	claim, err := store.NewClaim(aaRule, coloNow.Add(time.Hour))
+	claim, err := store.NewClaim(aaRule, coloNow().Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +384,7 @@ func TestColoMove_PairingThatCanStillChangeStays(t *testing.T) {
 	t.Parallel()
 	stub := coloStub()
 	stub.tagged(aaQEMUOn(100, "pve1", aaTag+";index--0"), aaQEMUOn(102, "pve1", aaTag+";index--2"))
-	markWebMembersBorn(stub, coloNow.Add(-time.Minute), 100, 102)
+	markWebMembersBorn(stub, coloNow().Add(-time.Minute), 100, 102)
 	h := newColoHarness()
 	coloJoin(coloDeps(stub, h, coloClaimDir(t)), 102, "2", log.NewNopLogger())
 	coloWantNoMove(t, h)
@@ -405,7 +410,7 @@ func TestColoMove_AVMAlreadyInARuleStays(t *testing.T) {
 func TestColoMove_AnOldMemberStays(t *testing.T) {
 	t.Parallel()
 	stub := coloPair("pve2", "pve2")
-	markWebMembersBorn(stub, coloNow.Add(-2*aaColoMoveMaxAge), 100, 101)
+	markWebMembersBorn(stub, coloNow().Add(-2*aaColoMoveMaxAge), 100, 101)
 	h := newColoHarness()
 	coloJoin(coloDeps(stub, h, coloClaimDir(t)), 101, "1", log.NewNopLogger())
 	coloWantNoMove(t, h)
@@ -482,7 +487,7 @@ func newColoGroup(nodes ...string) *coloGroup {
 		vmids = append(vmids, 100+i)
 	}
 	g.retag()
-	markWebMembersBorn(g.stub, coloNow.Add(-time.Minute), vmids...)
+	markWebMembersBorn(g.stub, coloNow().Add(-time.Minute), vmids...)
 	return g
 }
 
@@ -592,8 +597,8 @@ func TestColoMove_ScrambledParallelDeployMovesOncePerPair(t *testing.T) {
 func TestColoMove_MovesAPairTheJoinerIsNotIn(t *testing.T) {
 	t.Parallel()
 	g := newColoGroup("pve1", "pve2", "pve3", "pve3", "pve1", "pve1")
-	g.stub.resComments[haResourceSid(102)] = aaIdent("web").resourceMarker("", coloNow.Add(-30*time.Second).Unix())
-	g.stub.resComments[haResourceSid(105)] = aaIdent("web").resourceMarker("", coloNow.Add(-2*time.Minute).Unix())
+	g.stub.resComments[haResourceSid(102)] = aaIdent("web").resourceMarker("", coloNow().Add(-30*time.Second).Unix())
+	g.stub.resComments[haResourceSid(105)] = aaIdent("web").resourceMarker("", coloNow().Add(-2*time.Minute).Unix())
 	h := g.harness()
 	deps := g.deps(h, coloClaimDir(t))
 	g.tag(101, 102, 103, 104, 105)
@@ -613,7 +618,7 @@ func TestColoMove_MovesAPairTheJoinerIsNotIn(t *testing.T) {
 func TestColoMove_AnOldPairIsLeftToPVE(t *testing.T) {
 	t.Parallel()
 	g := newColoGroup("pve1", "pve2", "pve3", "pve3")
-	markWebMembersBorn(g.stub, coloNow.Add(-2*aaColoMoveMaxAge), 102, 103)
+	markWebMembersBorn(g.stub, coloNow().Add(-2*aaColoMoveMaxAge), 102, 103)
 	h := g.harness()
 	g.tag(101, 102, 103)
 	g.join(g.deps(h, coloClaimDir(t)), 100)
