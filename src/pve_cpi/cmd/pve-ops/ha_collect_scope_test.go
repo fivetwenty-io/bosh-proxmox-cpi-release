@@ -275,3 +275,46 @@ func TestCollectScopedEntriesReportANotesNearMissOnce(t *testing.T) {
 			haKindNotesNearMiss, got)
 	}
 }
+
+// TestCollectScopedEntriesReportNodeDownAndQuorumFragileOnce pins that a down
+// node and a fragile quorum appear once per Director and cluster under
+// --cpi-config, the way spread_skewed does, and that the next entry states them
+// when the doctor could not read the first entry's cluster.
+func TestCollectScopedEntriesReportNodeDownAndQuorumFragileOnce(t *testing.T) {
+	t.Parallel()
+	entries := []cpiConfigEntry{
+		{Name: "low", Type: "pve", Properties: map[string]any{"pve_vmid_range_start": 100, "pve_vmid_range_end": 101}},
+		{Name: "high", Type: "pve", Properties: map[string]any{"pve_vmid_range_start": 102, "pve_vmid_range_end": 999}},
+	}
+	run := func(i int, unread ...int) *haReport {
+		t.Helper()
+		base := haCfg("auto", "replicate")
+		scopes := entryScopes(entries, base, []string{haDirector, haDirector})
+		for _, k := range unread {
+			markUnread(scopes, k)
+		}
+		eff, _, _, err := config.ApplyContextOverrides(base, entries[i].Properties)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := scopedFaultFake()
+		f.profile.Health.Nodes[0].DeadOrFenced = true
+		f.profile.Quorum = ha.Quorum{Known: true, Expected: 3, Participating: 2, SurvivesOne: true,
+			FragileNodes: []string{"n1", "n2"}}
+		return collectHAScoped(context.Background(), f, eff, haDirector, haNow, scopes[i])
+	}
+	for _, c := range []struct {
+		kind string
+		n    int
+	}{{haKindNodeDown, 1}, {haKindQuorumFragile, 2}} {
+		if got := findings(run(0), c.kind); len(got) != c.n {
+			t.Errorf("entry low reports %d %s findings, want %d: %+v", len(got), c.kind, c.n, got)
+		}
+		if got := findings(run(1), c.kind); len(got) != 0 {
+			t.Errorf("entry high repeats the %s findings entry low reports: %+v", c.kind, got)
+		}
+		if got := findings(run(1, 0), c.kind); len(got) != c.n {
+			t.Errorf("entry high after an unread low reports %d %s findings, want %d: %+v", len(got), c.kind, c.n, got)
+		}
+	}
+}

@@ -546,16 +546,17 @@ func (c *haCollector) profileFindings() {
 	}
 	c.entryClockFinding()
 	if p.Health != nil {
-		// Every entry of one Director on the cluster reads the same node notes,
-		// so only the entry that reports the cluster findings advises on them.
-		nearMiss := c.reportsCluster()
+		// Every entry of one Director on the cluster sees the same nodes, so
+		// only the entry that reports the cluster findings reports a down node
+		// and advises on the node notes.
+		cluster := c.reportsCluster()
 		for i := range p.Health.Nodes {
 			n := &p.Health.Nodes[i]
+			if !cluster {
+				continue
+			}
 			if n.DeadOrFenced {
 				rep.problem(haKindNodeDown, n.Name, "the node is offline, unknown, fenced, or gone: %s", n.Reason)
-			}
-			if !nearMiss {
-				continue
 			}
 			for _, line := range n.NotesNearMiss {
 				rep.advise(haKindNotesNearMiss, n.Name, "the line %q in the node's notes looks like a maintenance "+
@@ -570,7 +571,7 @@ func (c *haCollector) profileFindings() {
 	} else if p.HealthErr != "" {
 		rep.unchecked("node-health", "node health could not be built: %s", p.HealthErr)
 	}
-	if p.Quorum.OneFailureFromLoss() {
+	if p.Quorum.OneFailureFromLoss() && c.reportsCluster() {
 		for _, name := range p.Quorum.FragileNodes {
 			rep.problem(haKindQuorumFragile, name,
 				"losing this node would leave the survivors without quorum (%d of %d votes participate now)",
