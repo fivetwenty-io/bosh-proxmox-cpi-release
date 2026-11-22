@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -216,11 +217,15 @@ func TestATemporaryDirectoryBesideTheJournalIsCreatedAndUsed(t *testing.T) {
 	}
 }
 
+var startedAwayRuns atomic.Int64
+
 // The started-away line is said once for each pair of first and start
 // endpoints, and a pair the process has not said yet is said even when its
 // first endpoint was said before.
 func TestFirstStartedAwayKeysOnTheFirstAndTheStartEndpoint(t *testing.T) {
-	unique := t.Name()
+	// The said set lives as long as the process, so a repeated run of this test
+	// (-count) needs endpoints no earlier run used.
+	unique := t.Name() + "-" + strconv.FormatInt(startedAwayRuns.Add(1), 10)
 	first, startA, startB := unique+"-first:8006", unique+"-a:8006", unique+"-b:8006"
 	if !firstStartedAway(first, startA) {
 		t.Fatal("the first start away was reported as already said")
