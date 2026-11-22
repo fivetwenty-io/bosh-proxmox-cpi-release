@@ -871,11 +871,11 @@ func TestDrainRun_ASoftPinWarningDropsWhenTheVMLeavesDuringTheWait(t *testing.T)
 	}
 }
 
-// drNotesTag puts the maintenance tag in the notes of the node at index i of
+// drNotesTag puts the maintenance tag in the notes of pve03, the third node of
 // f's profile, the way the node health read reports a node that only its notes
 // keep out of placement.
-func drNotesTag(f *fakeRebalanceIO, i int, tag string) {
-	e := &f.profileVal.Health.Nodes[i]
+func drNotesTag(f *fakeRebalanceIO, tag string) {
+	e := &f.profileVal.Health.Nodes[2]
 	e.Maintenance, e.Placeable, e.NotesTag, e.Health = true, false, tag, pve.NodeHealthMaintenance
 }
 
@@ -888,7 +888,7 @@ func TestDrainNodesGate_JudgesTheOtherNodesByPVEHAMaintenance(t *testing.T) {
 	t.Parallel()
 	f := newFakeRebalanceIO()
 	drMaintenance(f)
-	drNotesTag(f, 2, "maint")
+	drNotesTag(f, "maint")
 	g := drainNodesGate(f.profileVal, "pve01")
 	if !g.OK || !strings.Contains(g.Detail, `node pve03 carries the maintenance tag "maint" in its notes`) ||
 		!strings.Contains(g.Detail, "PVE HA doesn't read node notes") {
@@ -931,7 +931,7 @@ func TestDrainRun_ANotesTaggedNodeTakesVMsAndIsNamed(t *testing.T) {
 	t.Parallel()
 	f := newFakeRebalanceIO()
 	drMaintenance(f)
-	drNotesTag(f, 2, "maintenance")
+	drNotesTag(f, "maintenance")
 	f.addVM(101, "pve01", 4)
 	f.addVM(102, "pve01", 4)
 	f.addVM(103, "pve02", 4)
@@ -958,7 +958,7 @@ func TestDrainRun_ANotesTaggedNodeTakesVMsAndIsNamed(t *testing.T) {
 func TestUndrainRun_ANotesTaggedNodeLetsTheStartsRunAndTheRebalanceRefuse(t *testing.T) {
 	t.Parallel()
 	f := newFakeRebalanceIO()
-	drNotesTag(f, 2, "maintenance")
+	drNotesTag(f, "maintenance")
 	drStopped(f, 102, "pve01")
 	rep := drRun(f, UndrainCommand, true).undrain(context.Background())
 	if f.vms[102].state != "started" {
@@ -984,7 +984,7 @@ func TestUndrainRun_ANotesTaggedNodeLetsTheStartsRunAndTheRebalanceRefuse(t *tes
 
 	// With --no-rebalance, the notes tag changes nothing the undrain does.
 	f = newFakeRebalanceIO()
-	drNotesTag(f, 2, "maintenance")
+	drNotesTag(f, "maintenance")
 	drStopped(f, 102, "pve01")
 	r := drRun(f, UndrainCommand, true)
 	r.noRebalance = true
