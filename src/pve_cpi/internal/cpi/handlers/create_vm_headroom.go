@@ -158,7 +158,9 @@ func buildHeadroomPlan(
 }
 
 // ensureGuests reads the cluster's guests into the check the first time an
-// estimate needs them. A read that fails marks the guest list unknown.
+// estimate needs them. A read that fails marks the guest list unknown. A guest
+// that PVE is still creating, such as a sibling create_vm's, has no memory
+// figure yet, so the estimate leaves it out, and the read logs it at Debug.
 func (h *headroomPlan) ensureGuests() {
 	h.once.Do(func() {
 		guests, err := h.read()
@@ -166,6 +168,13 @@ func (h *headroomPlan) ensureGuests() {
 			h.log.Warn("create_vm: placement: the cluster's guests could not be read for the headroom estimate",
 				log.Err(err))
 			h.check.GuestsUnknown = true
+		}
+		for _, g := range guests {
+			if g.AwaitingMemory() {
+				h.log.Debug("create_vm: placement: headroom estimate leaves out a guest that PVE is still creating, "+
+					"because PVE reports no memory for it yet", log.Int("guest_vmid", g.VMID),
+					log.String("guest_node", g.Node))
+			}
 		}
 		h.check.Guests = guests
 	})
@@ -462,6 +471,21 @@ type headroomResourceRow struct {
 	Node     string            `json:"node"`
 	Maxmem   sdkclient.PVEInt  `json:"maxmem"`
 	Template sdkclient.PVEBool `json:"template"`
+	Lock     string            `json:"lock"`
+	Status   string            `json:"status"`
+}
+
+// creating reports whether PVE is still creating the guest. Its config holds
+// the create or clone lock from the moment PVE reserves the VMID until the
+// guest is written, and PVE lists a guest whose status daemon has not
+// reported it yet with the status unknown and no memory figure. A sibling
+// create_vm under a parallel deploy looks like this for its first seconds.
+func (r headroomResourceRow) creating() bool {
+	switch strings.TrimSpace(r.Lock) {
+	case "create", "clone":
+		return true
+	}
+	return strings.TrimSpace(r.Status) == "unknown"
 }
 
 // haSID returns the HA service ID of a guest row, or "" for a type
@@ -529,7 +553,8 @@ func readHeadroomGuests(
 		if row.Node == "" || row.VMID.Int() <= 0 {
 			return nil, fmt.Errorf("cluster resource row %d names no node or no VM ID", i)
 		}
-		guest := placement.HeadroomGuest{VMID: int(row.VMID.Int()), Node: row.Node, MemBytes: row.Maxmem.Int()}
+		guest := placement.HeadroomGuest{VMID: int(row.VMID.Int()), Node: row.Node, MemBytes: row.Maxmem.Int(),
+			Creating: row.creating()}
 		sid := row.haSID()
 		if managed[sid] {
 			guest.Admissible = recoveryNodes(rules, sid, nodes)

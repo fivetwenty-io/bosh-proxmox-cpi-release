@@ -3,6 +3,7 @@ package placement
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -30,7 +31,7 @@ const (
 	HeadroomShortPrefix = "headroom short: "
 
 	// HeadroomUnavailablePrefix starts the reason when the estimate could not
-	// run, because the guest list was unreadable, a guest or the VM has no
+	// run, because the guest list was unreadable, a settled guest or the VM has no
 	// positive memory figure, or the planned node is not online. The node is
 	// still removed in enforce mode, but the refusal is transient, so a caller
 	// retries it rather than reporting a shortage.
@@ -61,8 +62,17 @@ type HeadroomGuest struct {
 	// MemBytes is the guest's configured memory, whatever its run state. A caller
 	// whose guest has no readable memory figure leaves it zero, and the estimate
 	// then reports itself unavailable, as it does for any figure that is not
-	// positive, when the guest runs on an online node.
+	// positive, when the guest runs on an online node. A guest that is still
+	// being created is the exception (see Creating).
 	MemBytes int64
+
+	// Creating says PVE is still creating the guest, because its config holds a
+	// create or clone lock or PVE has not reported its status yet. Under a
+	// parallel deploy a sibling create's guest exists before PVE reports its
+	// memory, so an estimate leaves out a guest that is still being created and
+	// has no positive memory figure, rather than reporting itself unavailable.
+	// Once the guest reports memory, it counts like any other.
+	Creating bool
 
 	// HA says the guest is registered with PVE HA, so the CRM would recover it
 	// when its node fails. A guest that is not HA is lost with its node and is
@@ -75,6 +85,10 @@ type HeadroomGuest struct {
 	// passes every configured node.
 	Admissible []string
 }
+
+// AwaitingMemory reports whether the guest is still being created and has no
+// positive memory figure yet, which is a guest every estimate leaves out.
+func (g HeadroomGuest) AwaitingMemory() bool { return g.Creating && g.MemBytes <= 0 }
 
 // HeadroomVM is the VM being placed.
 type HeadroomVM struct {
@@ -181,9 +195,10 @@ func (r HeadroomResult) Lines() []string {
 // overhead, ballooning, and the order in which the CRM recovers services.
 //
 // The estimate counts memory only. Offline nodes neither fail nor survive, and
-// a node in maintenance can fail but is not a recovery target. A facts list
-// that does not hold plannedNode online, a VM or a guest on an online node
-// without a positive memory figure, or an unreadable guest list makes the
+// a node in maintenance can fail but is not a recovery target. A guest that is
+// still being created and has no memory figure yet is left out. A facts list
+// that does not hold plannedNode online, a VM or a settled guest on an online
+// node without a positive memory figure, or an unreadable guest list makes the
 // estimate unavailable.
 func EstimateHeadroom(facts []NodeFacts, check HeadroomCheck, plannedNode string) HeadroomResult {
 	if check.GuestsUnknown {
@@ -233,7 +248,8 @@ func nodeOnline(facts []NodeFacts, node string) bool {
 }
 
 // estimateGuests returns the guests of the estimate: the existing guests, minus
-// any that carries the VM's VMID, plus the VM itself on plannedNode.
+// any that carries the VM's VMID and any still being created without a memory
+// figure, plus the VM itself on plannedNode.
 func estimateGuests(check HeadroomCheck, plannedNode string) []HeadroomGuest {
 	admissible := check.VM.Admissible
 	if check.VM.AdmissibleFor != nil {
@@ -241,7 +257,7 @@ func estimateGuests(check HeadroomCheck, plannedNode string) []HeadroomGuest {
 	}
 	guests := make([]HeadroomGuest, 0, len(check.Guests)+1)
 	for _, g := range check.Guests {
-		if check.VM.VMID > 0 && g.VMID == check.VM.VMID {
+		if (check.VM.VMID > 0 && g.VMID == check.VM.VMID) || g.AwaitingMemory() {
 			continue
 		}
 		guests = append(guests, g)
@@ -460,9 +476,10 @@ func (m HeadroomMargin) Summary() string {
 // The result's Percent is the smallest margin across the scenarios, rounded
 // down. A scenario in which an HA guest fits on no survivor is a shortfall, and
 // a scenario that leaves no survivor with memory figures has no margin and is
-// skipped. The margin is unavailable when the guest list could not be read, an
-// online node or a guest on one has no positive memory figure, no node is
-// online, or no scenario has a margin.
+// skipped. A guest that is still being created and has no memory figure yet is
+// left out. The margin is unavailable when the guest list could not be read, an
+// online node or a settled guest on one has no positive memory figure, no node
+// is online, or no scenario has a margin.
 func EstimateHeadroomMargin(facts []NodeFacts, guests []HeadroomGuest, guestsUnknown bool) HeadroomMargin {
 	if guestsUnknown {
 		return HeadroomMargin{Unavailable: "the cluster's guests could not be read"}
@@ -481,6 +498,7 @@ func EstimateHeadroomMargin(facts []NodeFacts, guests []HeadroomGuest, guestsUnk
 	if len(failing) == 0 {
 		return HeadroomMargin{Unavailable: "the cluster has no online node"}
 	}
+	guests = slices.DeleteFunc(slices.Clone(guests), HeadroomGuest.AwaitingMemory)
 	for _, g := range guests {
 		if g.MemBytes <= 0 && nodeOnline(facts, g.Node) {
 			return HeadroomMargin{Unavailable: fmt.Sprintf("guest %d on %s has no configured memory", g.VMID, g.Node)}

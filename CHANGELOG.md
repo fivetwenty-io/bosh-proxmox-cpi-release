@@ -178,6 +178,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Fixed
 
+- The `create_vm` headroom estimate no longer becomes unavailable while a sibling create is still in flight. PVE lists a guest it is still creating with a create or clone lock, or with an unknown status, before it reports the guest's memory, and the estimate used to stop at that guest. In `warn` mode that logged a warning on every create of a parallel deploy, and in `enforce` mode it removed every node where the VM would be HA, which usually failed the create with a retriable error. The estimate now leaves such a guest out and logs it at Debug, while a guest that PVE reports as running or stopped with no memory still makes the estimate unavailable.
+
 - `pve-ops ha --fix-anti-affinity` now agrees with the doctor about a group that only another entry's `placement.az_map` explains. In a run of one entry, it skips the group without writing anything, reports it as `other_entry`, prints the advice that names `--cpi-config`, and doesn't exit with 1 because of it, where it used to exit with 1 and report `not_planned`. When `--group` names such a group, the fix exits with 0, writes nothing, and says which flag to use. Any other planning failure still exits with 1.
 
 - `pve-ops ha --cpi-config` now reports `node_down` and `quorum_fragile` once for each Director and cluster, the way it reports the other cluster findings, instead of once for each entry that reaches the cluster. When the doctor couldn't read the first entry's cluster, the next entry reports them.
