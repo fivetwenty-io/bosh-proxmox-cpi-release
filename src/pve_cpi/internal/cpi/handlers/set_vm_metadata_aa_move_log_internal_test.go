@@ -39,32 +39,41 @@ func TestColoMove_TheMoveLogNamesTheMovingVM(t *testing.T) {
 			lines["PVE HA moved the VM off its anti-affinity partner's node"] = slog.LevelInfo
 		}
 		for part, level := range lines {
-			found := false
-			for _, e := range obs.All() {
-				if e.Level != level || !strings.Contains(e.Message, part) {
-					continue
-				}
-				found = true
-				want := map[string]int64{metadataKeyVMID: 100, "moving_vmid": 103, "partner_vmid": 102}
-				got := map[string]int64{}
-				for k := range want {
-					if v, ok := e.Attrs[k].(int64); ok {
-						got[k] = v
-					}
-				}
-				if !maps.Equal(got, want) {
-					t.Errorf("timed out %v, line %q: fields %v; want %v", timedOut, part, e.Attrs, want)
-				}
-				for k := range e.Attrs {
-					if k == "joiner" || strings.HasSuffix(k, "_2") {
-						t.Errorf("timed out %v, line %q: fields %v; want no joiner and no repeated key",
-							timedOut, part, e.Attrs)
-					}
-				}
-			}
-			if !found {
-				t.Errorf("timed out %v: no %v line with %q", timedOut, level, part)
+			checkColoMoveLogLine(t, obs.All(), timedOut, part, level)
+		}
+	}
+}
+
+// checkColoMoveLogLine requires at least one entry at level whose message
+// contains part, and requires every such entry to carry vmid 100,
+// moving_vmid 103, and partner_vmid 102, with no joiner key and no repeated
+// key.
+func checkColoMoveLogLine(t *testing.T, entries []log.Entry, timedOut bool, part string, level slog.Level) {
+	t.Helper()
+	found := false
+	for _, e := range entries {
+		if e.Level != level || !strings.Contains(e.Message, part) {
+			continue
+		}
+		found = true
+		want := map[string]int64{metadataKeyVMID: 100, "moving_vmid": 103, "partner_vmid": 102}
+		got := map[string]int64{}
+		for k := range want {
+			if v, ok := e.Attrs[k].(int64); ok {
+				got[k] = v
 			}
 		}
+		if !maps.Equal(got, want) {
+			t.Errorf("timed out %v, line %q: fields %v; want %v", timedOut, part, e.Attrs, want)
+		}
+		for k := range e.Attrs {
+			if k == "joiner" || strings.HasSuffix(k, "_2") {
+				t.Errorf("timed out %v, line %q: fields %v; want no joiner and no repeated key",
+					timedOut, part, e.Attrs)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("timed out %v: no %v line with %q", timedOut, level, part)
 	}
 }
