@@ -8,6 +8,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // negativeRule is an enabled negative resource-affinity rule over vmids.
@@ -204,4 +205,33 @@ func TestDrainFatesOfAVMWithAForeignPartnerOnTheNodeAreUndecided(t *testing.T) {
 	wantFate(t, fates, 101, DrainUndecided, "rule with-local keeps it with VM 301, which runs on node pve01")
 	wantFate(t, fates, 102, DrainLeaves, "", "pve02")
 	wantFate(t, fates, 103, DrainLeaves, "", "pve02", "pve03")
+}
+
+// TestDrainFatesCountANodeKeptOutOnlyByItsNotes pins that a node the CPI
+// leaves out of placement only for its notes still takes a VM in the drain's
+// plan, because PVE HA doesn't read node notes and moves the VM there.
+func TestDrainFatesCountANodeKeptOutOnlyByItsNotes(t *testing.T) {
+	t.Parallel()
+	for name, mark := range map[string]func(e *pve.NodeHealthEntry){
+		"notes tag": func(e *pve.NodeHealthEntry) {
+			e.Maintenance, e.Placeable, e.NotesTag = true, false, "maintenance"
+		},
+		"unread notes": func(e *pve.NodeHealthEntry) { e.Placeable, e.NotesUnread = false, true },
+	} {
+		f := newFakeRebalanceIO()
+		f.addVM(101, "pve01", 4)
+		f.addVM(102, "pve01", 4)
+		f.addVM(103, "pve02", 4)
+		f.extraRules = append(f.extraRules, negativeRule("bosh-aa-one", 102, 103))
+		mark(&f.profileVal.Health.Nodes[2])
+		fates := drainFatesOf(t, f)
+		if got := fates[102]; got.Fate != DrainLeaves || !slices.Equal(got.Targets, []string{"pve03"}) {
+			t.Errorf("%s: VM 102 fate %s targets %v reason %q, want it to leave for pve03", name, got.Fate,
+				got.Targets, got.Reason)
+		}
+		if got := fates[101]; got.Fate != DrainLeaves || !slices.Equal(got.Targets, []string{"pve02", "pve03"}) {
+			t.Errorf("%s: VM 101 fate %s targets %v, want it to leave for pve02 or pve03", name, got.Fate,
+				got.Targets)
+		}
+	}
 }

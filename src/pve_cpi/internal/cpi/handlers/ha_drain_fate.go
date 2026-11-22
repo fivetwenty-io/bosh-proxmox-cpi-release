@@ -177,8 +177,10 @@ func drainAppliedRules(set *ha.RuleSet) []ha.Rule {
 	return out
 }
 
-// takers returns the nodes other than the drained one that are online, out of
-// maintenance, and placeable, sorted.
+// takers returns the nodes other than the drained one that are online and can
+// take work from PVE HA, sorted. A node that only its notes keep out of
+// placement counts, because the HA manager doesn't read node notes and moves
+// VMs to it.
 func (d *drainDecider) takers() []string {
 	var out []string
 	for i := range d.profile.Nodes {
@@ -186,8 +188,7 @@ func (d *drainDecider) takers() []string {
 		if n.Name == d.node || !n.Online {
 			continue
 		}
-		e := healthEntry(d.profile.Health, n.Name)
-		if e == nil || e.Maintenance || e.DeadOrFenced || !e.Placeable {
+		if !haTakesWork(healthEntry(d.profile.Health, n.Name)) {
 			continue
 		}
 		out = append(out, n.Name)

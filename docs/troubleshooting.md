@@ -3230,7 +3230,7 @@ We run the command the refusal prints on a PVE node, wait a few seconds for the 
 ha-manager crm-command node-maintenance enable <node>
 ```
 
-A refusal that names another node means we must bring that node back online or out of maintenance first, because a rolling maintenance takes one node at a time. [Draining and undraining a node with `pve-ops ha drain`](operations.md#draining-and-undraining-a-node-with-pve-ops-ha-drain) lists every gate.
+A refusal that names another node means we must bring that node back online or out of maintenance first, because a rolling maintenance takes one node at a time. Only PVE HA maintenance on another node refuses. A node that carries the maintenance tag in its notes doesn't, because the HA manager doesn't read node notes and moves VMs to it, so the drain lists it among the nodes a VM can leave for and warns about it. [Draining and undraining a node with `pve-ops ha drain`](operations.md#draining-and-undraining-a-node-with-pve-ops-ha-drain) lists every gate.
 
 ## A VM that could leave stayed on the drained node
 

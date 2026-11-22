@@ -870,3 +870,127 @@ func TestDrainRun_ASoftPinWarningDropsWhenTheVMLeavesDuringTheWait(t *testing.T)
 		}
 	}
 }
+
+// drNotesTag puts the maintenance tag in the notes of the node at index i of
+// f's profile, the way the node health read reports a node that only its notes
+// keep out of placement.
+func drNotesTag(f *fakeRebalanceIO, i int, tag string) {
+	e := &f.profileVal.Health.Nodes[i]
+	e.Maintenance, e.Placeable, e.NotesTag, e.Health = true, false, tag, pve.NodeHealthMaintenance
+}
+
+// TestDrainNodesGate_JudgesTheOtherNodesByPVEHAMaintenance pins that the
+// nodes gate refuses for another node in PVE HA maintenance, but not for one
+// that only the maintenance tag in its notes, or notes the CPI could not read,
+// keeps out of placement. The HA manager doesn't read node notes, so it moves
+// VMs to such a node, and the gate names it so the operator knows.
+func TestDrainNodesGate_JudgesTheOtherNodesByPVEHAMaintenance(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	drMaintenance(f)
+	drNotesTag(f, 2, "maint")
+	g := drainNodesGate(f.profileVal, "pve01")
+	if !g.OK || !strings.Contains(g.Detail, `node pve03 carries the maintenance tag "maint" in its notes`) ||
+		!strings.Contains(g.Detail, "PVE HA doesn't read node notes") {
+		t.Fatalf("nodes gate with a notes-tagged pve03 %+v", g)
+	}
+
+	f = newFakeRebalanceIO()
+	drMaintenance(f)
+	e := &f.profileVal.Health.Nodes[2]
+	e.Placeable, e.NotesUnread = false, true
+	if g := drainNodesGate(f.profileVal, "pve01"); !g.OK ||
+		!strings.Contains(g.Detail, "node pve03's notes could not be read") {
+		t.Fatalf("nodes gate with unread notes on pve03 %+v", g)
+	}
+
+	// PVE HA maintenance on another node still refuses, whether or not the
+	// node's notes carry the tag, and so does a node that can't take work for
+	// a reason other than its notes.
+	f = newFakeRebalanceIO()
+	drMaintenance(f)
+	e = &f.profileVal.Health.Nodes[1]
+	e.Maintenance, e.Placeable, e.CRMState = true, false, "maintenance"
+	if g := drainNodesGate(f.profileVal, "pve01"); g.OK || !strings.Contains(g.Detail, "pve02 is in maintenance too") {
+		t.Fatalf("nodes gate with pve02 in HA maintenance %+v", g)
+	}
+	f = newFakeRebalanceIO()
+	drMaintenance(f)
+	f.profileVal.Health.Nodes[1].Placeable = false
+	if g := drainNodesGate(f.profileVal, "pve01"); g.OK || !strings.Contains(g.Detail, "pve02 can't take work now") {
+		t.Fatalf("nodes gate with pve02 out of placement %+v", g)
+	}
+}
+
+// TestDrainRun_ANotesTaggedNodeTakesVMsAndIsNamed pins that a drain goes on
+// while another node carries only the maintenance tag in its notes. PVE HA
+// moves VMs to that node, so the drain counts it among the nodes a VM can
+// leave to, rather than stopping a VM that PVE would move there, and it warns
+// that the CPI places no new VM on the node while PVE HA may move VMs there.
+func TestDrainRun_ANotesTaggedNodeTakesVMsAndIsNamed(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	drMaintenance(f)
+	drNotesTag(f, 2, "maintenance")
+	f.addVM(101, "pve01", 4)
+	f.addVM(102, "pve01", 4)
+	f.addVM(103, "pve02", 4)
+	f.extraRules = append(f.extraRules, negativeRule("bosh-aa-one", 102, 103))
+	rep := drRun(f, DrainCommand, false).drain(context.Background())
+	if rep.ExitCode != RebalanceExitOK || !rep.GatesOK() {
+		t.Fatalf("exit %d halted %q gates %+v", rep.ExitCode, rep.Halted, rep.Gates)
+	}
+	if got, want := drVMs(rep.VMs), []string{"101 leaves", "102 leaves"}; !slices.Equal(got, want) {
+		t.Fatalf("vms %v, want %v", got, want)
+	}
+	want := `node pve03 carries the maintenance tag "maintenance" in its notes, so the CPI places no new VM on ` +
+		`it, but PVE HA doesn't read node notes and may move VMs from node pve01 there`
+	if !slices.Contains(rep.Warnings, want) {
+		t.Fatalf("warnings %q lack %q", rep.Warnings, want)
+	}
+}
+
+// TestUndrainRun_ANotesTaggedNodeLetsTheStartsRunAndTheRebalanceRefuse pins
+// that a notes tag on another node doesn't keep an undrain from starting the
+// VMs the drain stopped, and that the rebalance after the starts still
+// refuses for it, the way pve-ops ha rebalance does, with the undrain warning
+// about it first.
+func TestUndrainRun_ANotesTaggedNodeLetsTheStartsRunAndTheRebalanceRefuse(t *testing.T) {
+	t.Parallel()
+	f := newFakeRebalanceIO()
+	drNotesTag(f, 2, "maintenance")
+	drStopped(f, 102, "pve01")
+	rep := drRun(f, UndrainCommand, true).undrain(context.Background())
+	if f.vms[102].state != "started" {
+		t.Fatalf("VM 102 state %q, want started", f.vms[102].state)
+	}
+	if rep.ExitCode != RebalanceExitGate || rep.Rebalance == nil ||
+		rep.Halted != "the rebalance ended: "+RebalanceGateNodes {
+		t.Fatalf("exit %d halted %q rebalance %+v", rep.ExitCode, rep.Halted, rep.Rebalance)
+	}
+	refused := false
+	for _, g := range rep.Rebalance.Gates {
+		refused = refused || g.Name == RebalanceGateNodes && !g.OK &&
+			strings.Contains(g.Detail, `node pve03 carries the maintenance tag "maintenance" in its notes`)
+	}
+	if !refused {
+		t.Fatalf("the rebalance's nodes gate doesn't name the notes tag: %+v", rep.Rebalance.Gates)
+	}
+	want := `node pve03 carries the maintenance tag "maintenance" in its notes, so the CPI places no new VM on ` +
+		`it, and the rebalance after the starts refuses until the notes no longer keep the node out`
+	if !slices.Contains(rep.Warnings, want) {
+		t.Fatalf("warnings %q lack %q", rep.Warnings, want)
+	}
+
+	// With --no-rebalance, the notes tag changes nothing the undrain does.
+	f = newFakeRebalanceIO()
+	drNotesTag(f, 2, "maintenance")
+	drStopped(f, 102, "pve01")
+	r := drRun(f, UndrainCommand, true)
+	r.noRebalance = true
+	rep = r.undrain(context.Background())
+	notesWarned := slices.ContainsFunc(rep.Warnings, func(w string) bool { return strings.Contains(w, "pve03") })
+	if rep.ExitCode != RebalanceExitOK || f.vms[102].state != "started" || notesWarned {
+		t.Fatalf("exit %d halted %q state %q warnings %q", rep.ExitCode, rep.Halted, f.vms[102].state, rep.Warnings)
+	}
+}

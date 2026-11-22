@@ -319,6 +319,7 @@ func (r *drainRun) observe(ctx context.Context) (*drainView, error) {
 	undrain := r.report.Command == UndrainCommand
 	view := &drainView{profile: profile, snap: snap,
 		gates: drainGates(r.deps, profile, act, journal, r.node, r.apply, undrain)}
+	r.warnNotesOnly(profile)
 	if !undrain {
 		view.fates = decideDrainFates(r.deps.Config, profile, snap, r.node)
 		view.gates = append(view.gates, drainFatesGate(view.fates, r.node))
@@ -397,14 +398,17 @@ func drainFatesGate(fates []drainVMFate, node string) RebalanceGate {
 }
 
 // drainNodesGate passes when node is an online node of the cluster and every
-// other node is online, out of maintenance, and able to take work.
+// other node is online, out of PVE HA maintenance, and able to take work from
+// PVE HA. A node that only the maintenance tag in its notes, or notes the CPI
+// could not read, keeps out of placement passes, because the HA manager
+// doesn't read node notes and moves VMs to it, and the detail names it.
 func drainNodesGate(profile *ha.Profile, node string) RebalanceGate {
 	g := RebalanceGate{Name: RebalanceGateNodes}
 	if profile == nil || len(profile.Nodes) == 0 || profile.Health == nil {
 		g.Detail = "the HA profile lists no node health"
 		return g
 	}
-	var bad []string
+	var bad, notesOnly []string
 	found := false
 	for i := range profile.Nodes {
 		n := profile.Nodes[i]
@@ -419,6 +423,8 @@ func drainNodesGate(profile *ha.Profile, node string) RebalanceGate {
 			bad = append(bad, "node "+n.Name+" is offline")
 		case entry == nil:
 			bad = append(bad, "node "+n.Name+" has no health entry")
+		case notesOnlyOut(entry) != "":
+			notesOnly = append(notesOnly, notesOnlyOut(entry))
 		case entry.Maintenance:
 			bad = append(bad, "node "+n.Name+" is in maintenance too, and a rolling maintenance takes one node "+
 				"at a time")
@@ -434,9 +440,69 @@ func drainNodesGate(profile *ha.Profile, node string) RebalanceGate {
 		return g
 	}
 	g.OK = true
-	g.Detail = fmt.Sprintf("node %s is online, and the other %d nodes are online, out of maintenance, and able "+
-		"to take work", node, len(profile.Nodes)-1)
+	g.Detail = fmt.Sprintf("node %s is online, and the other %d nodes are online, out of HA maintenance, and able "+
+		"to take work from PVE HA", node, len(profile.Nodes)-1)
+	if len(notesOnly) > 0 {
+		g.Detail += "; " + rebalanceDetail(notesOnly) + ", which keeps the CPI from placing new VMs there, but " +
+			"PVE HA doesn't read node notes"
+	}
 	return g
+}
+
+// notesOnlyOut describes a node that the CPI keeps out of placement only for
+// its notes, because they carry the maintenance tag or could not be read, and
+// returns nothing for any other node. The node health read reads the notes of
+// a node only when nothing else keeps the node out, so such a node is online
+// and out of PVE HA maintenance, and the HA manager, which doesn't read node
+// notes, still moves VMs to it.
+func notesOnlyOut(e *pve.NodeHealthEntry) string {
+	switch {
+	case e.NotesTag != "":
+		return fmt.Sprintf("node %s carries the maintenance tag %q in its notes", e.Name, e.NotesTag)
+	case e.NotesUnread:
+		return "node " + e.Name + "'s notes could not be read"
+	}
+	return ""
+}
+
+// haTakesWork reports whether PVE HA can move a VM to the node of e. That is a
+// node the CPI places on, or one that only its notes keep out of placement.
+func haTakesWork(e *pve.NodeHealthEntry) bool {
+	return e != nil && (e.Placeable || notesOnlyOut(e) != "")
+}
+
+// notesOnlyWarningMark is the words every warning about a node kept out only
+// by its notes carries, which lets a rebuild find and drop the earlier ones.
+const notesOnlyWarningMark = "so the CPI places no new VM on it"
+
+// warnNotesOnly rebuilds the warnings about the other nodes that only their
+// notes keep out of placement, so they name only the nodes of the last read. A
+// drain warns that PVE HA may move VMs to such a node, and an undrain that runs
+// the rebalance warns that the rebalance refuses while the notes keep the node
+// out. An undrain with --no-rebalance has nothing to warn about, because PVE
+// HA starts the VMs whatever the other nodes' notes say.
+func (r *drainRun) warnNotesOnly(profile *ha.Profile) {
+	r.report.Warnings = slices.DeleteFunc(r.report.Warnings, func(w string) bool {
+		return strings.Contains(w, notesOnlyWarningMark)
+	})
+	undrain := r.report.Command == UndrainCommand
+	if profile == nil || profile.Health == nil || undrain && r.noRebalance {
+		return
+	}
+	for i := range profile.Health.Nodes {
+		e := &profile.Health.Nodes[i]
+		what := notesOnlyOut(e)
+		if e.Name == r.node || what == "" {
+			continue
+		}
+		if undrain {
+			r.warn(what + ", " + notesOnlyWarningMark + ", and the rebalance after the starts refuses until the " +
+				"notes no longer keep the node out")
+			continue
+		}
+		r.warn(what + ", " + notesOnlyWarningMark + ", but PVE HA doesn't read node notes and may move VMs from " +
+			"node " + r.node + " there")
+	}
 }
 
 // pveMaintenance reports whether the HA manager or the node's LRM reports the
