@@ -146,15 +146,20 @@ type aaColoCall struct {
 	facts     []placement.NodeFacts
 	factsErr  error
 	factsRead bool
-	// moved maps each VM this call moved to its target.
+	// moved maps each VM this call moved to its target, and claimed holds
+	// each VM whose move it claimed, moved or not.
 	moved    map[int]string
+	claimed  map[int]bool
 	releases []func()
 }
 
 // moveJoinerOffPartners moves members of newly final co-located pairs off
 // their planned anti-affinity partners' nodes before the join writes the
 // rules that pair them, and returns the function that releases the moves'
-// spread claims, which the caller runs once the join has returned. The plan
+// spread claims, which the caller runs once the join has returned, and the
+// VMs whose moves it claimed, which the caller's own plans write as usual
+// while every other call's plans hold them out of new rules (see
+// movingMembers). The plan
 // writes only final pairs, so every pair it holds is final, and the join of
 // the lowest missing index can make several pairs final at once, including
 // pairs the joining VM is not in. It considers the pairs only when the
@@ -171,7 +176,8 @@ type aaColoCall struct {
 //     maintenance, reachable, and wins the score.
 //   - The spread claim record takes the move's claim, no live claim of
 //     another call names the member on another node, and a read of the rules
-//     after the claim's turn still shows it in no rule of the group.
+//     after the claim's turn, under the rules lock when pve.cluster_lock
+//     enables it, still shows it in no rule of the group.
 //
 // The joining VM moves when it is in the pair. Otherwise the member born last
 // moves, then the one with the higher index, so every call that sees the pair
@@ -181,42 +187,42 @@ type aaColoCall struct {
 // same.
 func moveJoinerOffPartners(
 	ctx context.Context, deps Deps, ident haIdentity, vmid, index int, born int64, logger *log.Logger,
-) (release func()) {
+) (release func(), own map[int]bool) {
 	release = func() {}
 	if deps.Config == nil || !deps.Config.PlacementEnabled() || !ident.valid() || ident.Owner == "" ||
 		deps.SpreadClaims == nil {
-		return release
+		return release, nil
 	}
 	h := deps.coloMoveHooks(logger)
 	now := h.now()
 	if born <= 0 || absDuration(now.Sub(time.Unix(born, 0))) > aaColoMoveMaxAge {
-		return release
+		return release, nil
 	}
 	sid := haResourceSid(vmid)
 	profile, err := haRuleWriteProfile(ctx, deps)
 	if err != nil {
-		return release
+		return release, nil
 	}
 	// The rules are read before the guests, so a later set_vm_metadata of a
 	// member that has joined already costs one read.
 	set, err := readHARuleSet(ctx, deps.PVE.Cluster())
 	if err != nil || aaJoinerInGroupRule(set, ident, sid) {
-		return release
+		return release, nil
 	}
 	scan, err := collectGroupMemberSids(ctx, deps, ident)
 	if err != nil || scan.guests[sid].Node == "" {
-		return release
+		return release, nil
 	}
 	planner := newGroupPlanner(ctx, deps, profile, ident, scan, log.NewNopLogger())
 	planner.sid, planner.index, planner.checkSelf = sid, index, true
 	planner.recordHolds = nil
 	if _, err := planner.plan(set); err != nil {
-		return release
+		return release, nil
 	}
 	c := &aaColoCall{
 		ctx: ctx, deps: deps, ident: ident, h: h, logger: logger, profile: profile, set: set, scan: scan,
 		out: planner.lastOut, joiner: vmid, now: now, budget: min(haMotionWait(deps), aaColoMoveWaitCap),
-		moved: map[int]string{},
+		moved: map[int]string{}, claimed: map[int]bool{},
 	}
 	members := map[string]aaColoMember{}
 	for _, m := range planner.lastIn.Members {
@@ -242,13 +248,17 @@ func moveJoinerOffPartners(
 		}
 	}
 	if len(c.releases) == 0 {
-		return release
+		return release, nil
+	}
+	own = map[int]bool{}
+	for v := range c.claimed {
+		own[v] = true
 	}
 	return func() {
 		for _, r := range c.releases {
 			r()
 		}
-	}
+	}, own
 }
 
 // aaColoNewPairs returns every pair of members that a rule of out holds and
@@ -426,11 +436,30 @@ func (c *aaColoCall) move(m, partner aaColoMember) {
 	}
 	// Another call that moved this VM releases its claim only after its join
 	// has written the rules, so a VM no live claim names was either never
-	// moved or is in a rule by now.
-	if now, err := readHARuleSet(ctx, deps.PVE.Cluster()); err != nil || aaJoinerInGroupRule(now, c.ident, m.sid) {
+	// moved or is in a rule by now. A sibling's plan holds the VM out of new
+	// rules once it reads this claim, and it reads the claims and writes under
+	// the rules lock, so a read of the rules under the lock sees every write
+	// a sibling planned before it could see the claim. Without the lock, a
+	// sibling's plan that read the claims just before this turn may still
+	// write the pair within the few milliseconds of its write.
+	inRule := true
+	err = withHARulesLock(ctx, deps, c.joiner, logger, func(ctx context.Context) error {
+		now, err := readHARuleSet(ctx, deps.PVE.Cluster())
+		if err == nil {
+			inRule = aaJoinerInGroupRule(now, c.ident, m.sid)
+		}
+		return err
+	})
+	if err != nil || inRule {
 		releaseClaim()
+		if err != nil {
+			logger.Info("set_vm_metadata: the rules could not be read again after the move's claim, so PVE moves "+
+				"the VM off its anti-affinity partner's node once the rule is written",
+				c.fields(m, partner, log.String("node", home), log.Err(err))...)
+		}
 		return
 	}
+	c.claimed[vmid] = true
 	c.releases = append(c.releases, releaseClaim)
 	logger.Info("set_vm_metadata: the VM shares a node with an anti-affinity partner, so PVE HA moves it to "+
 		"another node before the rule is written, and the partner stays where it is",

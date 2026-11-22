@@ -18,6 +18,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/spreadclaim"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
 
@@ -307,7 +308,60 @@ func newGroupPlanner(
 	p.recordHolds = func(e aaResourceHoldEdit) error {
 		return recordResourceHolds(ctx, svc, ident.Owner, e)
 	}
+	p.liveMoves = groupLiveMoves(ctx, deps, ident, logger)
+	p.ownMoves = ownColoMoves(ctx)
 	return p
+}
+
+// groupLiveMoves returns the read of the live claims in the spread claim
+// record of ident's group, or nil when the CPI keeps no such record. A read
+// takes one turn with the record and records nothing.
+func groupLiveMoves(
+	ctx context.Context, deps Deps, ident haIdentity, logger *log.Logger,
+) func(node string) ([]spreadclaim.Live, error) {
+	if deps.Config == nil || !deps.Config.PlacementEnabled() || deps.SpreadClaims == nil || !ident.valid() ||
+		ident.Owner == "" {
+		return nil
+	}
+	var store *spreadclaim.Store
+	return func(node string) ([]spreadclaim.Live, error) {
+		h := deps.coloMoveHooks(logger)
+		if store == nil {
+			if store = deps.SpreadClaims(deps.Config, h.stamp(ctx, node), logger); store == nil {
+				return nil, nil
+			}
+		}
+		claim, err := store.NewClaim(ident.ruleName(), h.now().Add(time.Minute))
+		if err != nil {
+			return nil, err
+		}
+		var live []spreadclaim.Live
+		_, err = claim.PickLive(ctx, 0, func(l []spreadclaim.Live) string {
+			live = l
+			return ""
+		})
+		return live, err
+	}
+}
+
+// ownColoMovesKey is the context key of the VMs whose moves off a partner's
+// node the call claimed.
+type ownColoMovesKey struct{}
+
+// withOwnColoMoves returns ctx carrying the VMs whose moves the call claimed,
+// so the call's own plans write their rules while every other call's plans
+// hold them out until the move is done.
+func withOwnColoMoves(ctx context.Context, own map[int]bool) context.Context {
+	if len(own) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, ownColoMovesKey{}, own)
+}
+
+// ownColoMoves returns the VMs withOwnColoMoves put in ctx, or nil.
+func ownColoMoves(ctx context.Context) map[int]bool {
+	own, _ := ctx.Value(ownColoMovesKey{}).(map[int]bool)
+	return own
 }
 
 // recordResourceHolds writes a change of the holds sid's HA resource records.

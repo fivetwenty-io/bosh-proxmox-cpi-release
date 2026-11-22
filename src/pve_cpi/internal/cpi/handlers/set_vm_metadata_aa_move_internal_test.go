@@ -357,7 +357,8 @@ func TestColoMove_AJoinerOffItsPartnersNodeStays(t *testing.T) {
 // Two members share pve1 and join at the same moment. The first takes the
 // claim turn and moves, and the second, which joins while the first is still
 // migrating and still shows on pve1, sees the first's claim and stays, so the
-// pair costs one migration.
+// pair costs one migration. The second also leaves the pair's rule to the
+// first, because in its view both members still share pve1.
 func TestColoMove_ConcurrentSiblingsMoveOnce(t *testing.T) {
 	t.Parallel()
 	dir := coloClaimDir(t)
@@ -374,7 +375,9 @@ func TestColoMove_ConcurrentSiblingsMoveOnce(t *testing.T) {
 	}
 	coloWantNoMove(t, hB)
 	coloWantRule(t, stubA)
-	coloWantRule(t, stubB)
+	if len(stubB.rules) != 0 {
+		t.Fatalf("second sibling's rules = %v; want none while 101 moves", stubB.rules)
+	}
 }
 
 // TestColoMove_PairingThatCanStillChangeStays pins that a pairing that can

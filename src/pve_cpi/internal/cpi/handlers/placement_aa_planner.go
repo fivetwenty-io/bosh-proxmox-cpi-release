@@ -14,6 +14,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/spreadclaim"
 )
 
 // aaUnindexedGrace is how long a member with no readable instance index waits
@@ -110,8 +111,19 @@ type aaPlanner struct {
 	// checks can see by itself (see joinConflicts), so holdOut matters only
 	// for one that PVE alone reports.
 	holdOut map[string]bool
-	scan    *groupScan
-	logger  *log.Logger
+	// liveMoves reads the live claims of the group's spread claim record,
+	// from which the plan tells the members that another set_vm_metadata
+	// call is moving off a partner's node. node is a node the read may ask
+	// for the cluster's stamp. Nil reads no claims.
+	liveMoves func(node string) ([]spreadclaim.Live, error)
+	// ownMoves holds the VMs whose moves this call claimed. The call's own
+	// join writes their rules after the move, so they are not held out.
+	ownMoves map[int]bool
+	// moving holds the members the last plan held out of new rules because
+	// another call is moving them (see movingMembers).
+	moving map[string]bool
+	scan   *groupScan
+	logger *log.Logger
 	// clusterNodes is the configured node set, or nil when it is unknown.
 	// The feasibility checks use it, and nil turns off the plan's own check
 	// of a join. A member's soft pin is widened to it (see flattenMemberPins).
@@ -328,7 +340,68 @@ func (p *aaPlanner) prepare(set *ha.RuleSet) (map[string]*ha.Rule, aapattern.Inp
 	}
 	p.ruleHolds, p.resHolds, p.pendingHolds = nil, nil, nil
 	p.collectHolds(set, existing)
+	p.moving = p.movingMembers(existing)
 	return existing, p.layoutInput(set, existing), nil
+}
+
+// movingMembers returns the members that no rule of the group holds and that
+// another call's live move claim names on a node other than the one the scan
+// shows them on. Such a member is on its way off a partner's node, and a rule
+// written now that pairs it with that partner would have PVE HA move both of
+// them, because the CRM keeps a partner's current and target node out of each
+// member's choice. The plan holds it out of new rules instead, and the call
+// that moves it writes its rule once the move has landed or its wait has run
+// out (see moveJoinerOffPartners). A claim stops counting once its process
+// ends or it expires, so a mover that dies holds no member out for long, and
+// a landed move names the node the member is on, so it holds nothing out.
+// The claims are read only when a member that no rule holds shares its node
+// with another member, which is the only case a move is for. A read that
+// fails holds nothing out, and the plan writes as it would without moves.
+func (p *aaPlanner) movingMembers(existing map[string]*ha.Rule) map[string]bool {
+	if p.liveMoves == nil || p.scan == nil {
+		return nil
+	}
+	held := map[string]bool{}
+	for _, r := range existing {
+		for _, s := range r.Resources {
+			held[s] = true
+		}
+	}
+	perNode := map[string]int{}
+	for sid := range p.scan.members {
+		if n := p.scan.guests[sid].Node; n != "" {
+			perNode[n]++
+		}
+	}
+	node := ""
+	for _, sid := range slices.Sorted(maps.Keys(p.scan.members)) {
+		if n := p.scan.guests[sid].Node; !held[sid] && n != "" && perNode[n] > 1 {
+			node = n
+			break
+		}
+	}
+	if node == "" {
+		return nil
+	}
+	live, err := p.liveMoves(node)
+	if err != nil && p.once("live moves unread") {
+		p.logger.Debug("anti-affinity: the spread claim record could not be read, so the plan holds no member "+
+			"out for another call's move", log.String("rule", p.ident.ruleName()), log.Err(err))
+	}
+	moving := map[string]bool{}
+	for _, l := range live {
+		sid := haResourceSid(l.VMID)
+		if l.VMID <= 0 || l.Node == "" || p.ownMoves[l.VMID] || held[sid] {
+			continue
+		}
+		if _, member := p.scan.members[sid]; !member {
+			continue
+		}
+		if at := p.scan.guests[sid].Node; at != "" && at != l.Node {
+			moving[sid] = true
+		}
+	}
+	return moving
 }
 
 // logMoves logs once, at Info, when the plan takes members other than sid
@@ -543,6 +616,13 @@ func (p *aaPlanner) member(set *ha.RuleSet, sid string, inRule bool) (aapattern.
 func (p *aaPlanner) joinable(sid string, m aapattern.Member, tagged, inRule bool) bool {
 	switch {
 	case !tagged || p.holdOut[sid]:
+		return false
+	case p.moving[sid] && !inRule:
+		if p.once("moving " + sid) {
+			p.logger.Info("anti-affinity: member joins no rule while another set_vm_metadata call moves it off "+
+				"an anti-affinity partner's node, and that call writes its rule once the move is done",
+				log.String("sid", sid), log.String("rule", p.ident.ruleName()))
+		}
 		return false
 	case sid != p.sid && p.leaving[sid]:
 		if !inRule && p.once("leaving "+sid) {

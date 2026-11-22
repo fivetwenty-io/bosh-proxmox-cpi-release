@@ -54,9 +54,11 @@ func joinAntiAffinityGroupOf(ctx context.Context, deps Deps, vmid, index int, lo
 	// sibling's join for the whole migration. The locked join plans again from
 	// fresh reads, and the layout places members by index alone, so the move
 	// changes no rule. Its claim lasts until the rule is written, so a sibling
-	// that joins meanwhile sees this VM on its way to the new node.
-	release := moveJoinerOffPartners(ctx, deps, ident, vmid, index, m.Born, logger)
+	// that joins meanwhile sees this VM on its way to the new node and leaves
+	// it out of the rules it writes, while this call's own plans write it.
+	release, own := moveJoinerOffPartners(ctx, deps, ident, vmid, index, m.Born, logger)
 	defer release()
+	ctx = withOwnColoMoves(ctx, own)
 	if rule, ok := antiAffinityJoinSettled(ctx, deps, ident, vmid, index); ok {
 		return rule, nil
 	}
