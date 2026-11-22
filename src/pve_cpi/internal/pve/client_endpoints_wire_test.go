@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -105,22 +106,42 @@ func countingWireEndpoint(t *testing.T) (e *wireEndpoint, dials *atomic.Int64) {
 	return &wireEndpoint{host: "127.0.0.1", port: addr.Port}, dials
 }
 
-// deadWireEndpoint returns an endpoint whose port refuses connections.
+// deadPorts holds every port deadWireEndpoint has handed out in this test
+// binary. The operating system may give a just-closed port to the next listen,
+// and two dead endpoints on one port would make the pool refuse the list as a
+// duplicate.
+var (
+	deadPortsMu sync.Mutex
+	deadPorts   = map[int]bool{}
+)
+
+// deadWireEndpoint returns an endpoint whose port refuses connections and that
+// no other call to it returns, however many tests run in parallel.
 func deadWireEndpoint(t *testing.T) *wireEndpoint {
 	t.Helper()
-	var lc net.ListenConfig
-	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
+	deadPortsMu.Lock()
+	defer deadPortsMu.Unlock()
+	for range 1000 {
+		var lc net.ListenConfig
+		l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		addr, ok := l.Addr().(*net.TCPAddr)
+		if !ok {
+			t.Fatalf("listener address %v is not TCP", l.Addr())
+		}
+		if err := l.Close(); err != nil {
+			t.Fatalf("close listener: %v", err)
+		}
+		if deadPorts[addr.Port] {
+			continue
+		}
+		deadPorts[addr.Port] = true
+		return &wireEndpoint{host: "127.0.0.1", port: addr.Port}
 	}
-	addr, ok := l.Addr().(*net.TCPAddr)
-	if !ok {
-		t.Fatalf("listener address %v is not TCP", l.Addr())
-	}
-	if err := l.Close(); err != nil {
-		t.Fatalf("close listener: %v", err)
-	}
-	return &wireEndpoint{host: "127.0.0.1", port: addr.Port}
+	t.Fatal("no unused port for a dead endpoint")
+	return nil
 }
 
 // wireConfig builds a token-auth config whose host is the first endpoint and
