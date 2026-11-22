@@ -118,6 +118,9 @@ type MoveInput struct {
 //     MoveIncomplete.
 //
 // It returns where the VM is once it runs inside the set.
+//
+// Its log lines name the VM they move moving_vmid, because a call can move a VM
+// other than its own, and the call's logger already carries vmid for its own VM.
 func MoveIntoSet(ctx context.Context, deps NarrowDeps, in MoveInput) (pve.VMLocation, error) {
 	b := &barrier{deps: deps, in: NarrowInput{Budget: in.Budget, PollInterval: in.PollInterval}}
 	b.defaults()
@@ -188,7 +191,7 @@ func MoveIntoSet(ctx context.Context, deps NarrowDeps, in MoveInput) (pve.VMLoca
 					Err: pve.WrapError(err)}
 			}
 			deps.Logger.Warn("ha move: PVE never answered the migrate request, so the move waits in case PVE "+
-				"queued it", log.Int("vmid", in.VMID), log.String("sid", sid), log.String("to", target),
+				"queued it", log.Int("moving_vmid", in.VMID), log.String("sid", sid), log.String("to", target),
 				log.Err(err))
 			return awaitMove(ctx, deps, in, set, loc.Node, target)
 		}
@@ -201,14 +204,14 @@ func MoveIntoSet(ctx context.Context, deps NarrowDeps, in MoveInput) (pve.VMLoca
 	}
 	if partners := moveComigrated(resp); len(partners) > 0 {
 		deps.Logger.Warn("ha move: PVE HA moves other resources with the VM, because a positive resource "+
-			"affinity rule names them", log.Int("vmid", in.VMID), log.String("sid", sid),
+			"affinity rule names them", log.Int("moving_vmid", in.VMID), log.String("sid", sid),
 			log.String("to", target), log.String("comigrated", strings.Join(partners, ",")))
 		if in.OnComigrated != nil {
 			in.OnComigrated(partners)
 		}
 	}
 	deps.Logger.Info("ha move: asked PVE HA to migrate the VM into its node set",
-		log.Int("vmid", in.VMID), log.String("sid", sid), log.String("from", loc.Node),
+		log.Int("moving_vmid", in.VMID), log.String("sid", sid), log.String("from", loc.Node),
 		log.String("to", target), log.String("set", where))
 	return awaitMove(ctx, deps, in, set, loc.Node, target)
 }
@@ -253,7 +256,7 @@ func awaitMove(ctx context.Context, deps NarrowDeps, in MoveInput, set map[strin
 					Err: err}
 			}
 			if set[loc.Node] {
-				deps.Logger.Info("ha move: the VM runs inside its node set", log.Int("vmid", in.VMID),
+				deps.Logger.Info("ha move: the VM runs inside its node set", log.Int("moving_vmid", in.VMID),
 					log.String("node", loc.Node))
 				return loc, nil
 			}

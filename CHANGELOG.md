@@ -46,6 +46,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Changed
 
+- The `ha move:` log lines now name the VM that moves as `moving_vmid` instead of `vmid`. A call that moves a VM other than its own, such as a `set_vm_metadata` call that moves an anti-affinity partner, already logs its own VM as `vmid`, so the moved VM used to appear under a second key named `vmid_2`. A call that moves its own VM, as an attach does, now logs the same VM under both keys.
+
 - An anti-affinity plan that renames a rule whose name its own `placement.az_map` never gives now logs a warning that names the rule, once per call. Two `cpi_config` entries that share a cluster and map AZs differently number a group's rules differently, so an instance group with AZs on both entries has its rules renamed, and sometimes regrouped, by each entry in turn. The warning also appears once for each group whose rules came from a release before 0.12.0, or from before its entry's `az_map` changed, and the write that logs it renames them for good. [Multi-Cluster Deployments](docs/multi-cluster.md) now says to keep each instance group's AZs on one entry per cluster.
 
 - When only the maintenance tag in a node's notes keeps the node out, the placement filter now logs it as `node in maintenance (its notes carry the maintenance tag "<tag>")`, and the rebalance gate says the node carries that tag in its notes. Both used to say the node was in maintenance, which sent us looking for PVE HA maintenance that was never on. The create still treats the node as one in maintenance and retries the same way.
