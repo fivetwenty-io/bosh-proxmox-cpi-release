@@ -88,6 +88,14 @@ type Input struct {
 	// domain's rules keep their names whichever domains hold members. 0
 	// means the highest Ord in Domains.
 	Spread int
+	// FinalWindow turns on final joins when it is above 0. It is how long, in
+	// seconds, a member's birth keeps a missing index below it open (see
+	// Waiting), so that a member joins a rule only once its position can no
+	// longer change.
+	FinalWindow int64
+	// Now is when the plan is made, in Unix seconds, which FinalWindow counts
+	// back from.
+	Now int64
 }
 
 // Output is the layout's plan.
@@ -130,6 +138,11 @@ type Output struct {
 	Small []string
 	// Unsafe says the pattern gave up drain safety.
 	Unsafe bool
+	// Waiting holds the joinable members that join no rule yet, because an
+	// open index lies below their position (see Input.FinalWindow).
+	Waiting []string
+	// Open holds the open indexes, in ascending order.
+	Open []int
 }
 
 // mstate is a member during the layout.
@@ -183,6 +196,84 @@ func Layout(in Input) Output {
 // settle makes the plan Layout returns, with the reserved places of members
 // still in its rules.
 func settle(in Input) Output {
+	open, waiting := openIndexes(in)
+	if len(waiting) > 0 {
+		in.Members = slices.Clone(in.Members)
+		for i := range in.Members {
+			if waiting[in.Members[i].Key] {
+				in.Members[i].Joinable = false
+			}
+		}
+	}
+	out := settlePlans(in)
+	out.Open = open
+	out.Waiting = slices.Sorted(maps.Keys(waiting))
+	return out
+}
+
+// openIndexes returns the open indexes of in, in ascending order, and the
+// joinable members that wait for them. An index is open when no member or
+// hold has it, a member has a higher one, no member with a higher index is in
+// one of in.Rules, and a member with a higher index that is not a hold was
+// born less than FinalWindow seconds before Now. The layout places a member
+// by its rank among the indexes and holds below it, so while an index below a
+// member is open, the member's position can still change, and a rule written
+// for it now would be rewritten once that index joins. A gap below a member
+// that a rule holds is one the group has outlived, such as the gap a lapsed
+// hold leaves after a scale-down, so it is not open. A member waits while an
+// open index lies below its own, and a member with no index waits while any
+// index is open, because it takes a place after every indexed member. A
+// waiting member joins no rule and keeps its position, so no other member
+// shifts for it.
+func openIndexes(in Input) ([]int, map[string]bool) {
+	if in.FinalWindow <= 0 {
+		return nil, nil
+	}
+	present := map[int]bool{}
+	inRule := map[string]bool{}
+	for _, keys := range in.Rules {
+		for _, k := range keys {
+			inRule[k] = true
+		}
+	}
+	top := -1
+	for _, m := range in.Members {
+		if m.Index >= 0 {
+			present[m.Index] = true
+			top = max(top, m.Index)
+		}
+	}
+	var open []int
+	for g := range top {
+		if present[g] {
+			continue
+		}
+		ruled, young := false, false
+		for _, m := range in.Members {
+			if m.Index <= g {
+				continue
+			}
+			ruled = ruled || inRule[m.Key]
+			young = young || !m.Reserved && m.Born > 0 && in.Now-m.Born < in.FinalWindow
+		}
+		if !ruled && young {
+			open = append(open, g)
+		}
+	}
+	if len(open) == 0 {
+		return nil, nil
+	}
+	waiting := map[string]bool{}
+	for _, m := range in.Members {
+		if m.Joinable && !m.Reserved && !inRule[m.Key] && (m.Index < 0 || m.Index > open[0]) {
+			waiting[m.Key] = true
+		}
+	}
+	return open, waiting
+}
+
+// settlePlans plans in until planning again leaves the plan as it is.
+func settlePlans(in Input) Output {
 	out := layoutOnce(in)
 	displaced := slices.Clone(out.Displaced)
 	for range settleRounds - 1 {

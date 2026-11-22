@@ -368,9 +368,9 @@ func TestColoMove_ConcurrentSiblingsMoveOnce(t *testing.T) {
 	coloWantRule(t, stubB)
 }
 
-// TestColoMove_PairingThatCanStillChangeStays pins that only a final pairing
-// moves the joiner. With index 1 missing, the plan pairs 100 and 102, but the
-// create of index 1 can still change that, so 102 stays.
+// TestColoMove_PairingThatCanStillChangeStays pins that a pairing that can
+// still change writes no rule and moves nobody. With index 1 missing, 102
+// waits for it, so the plan pairs 100 with nobody, and 102 stays.
 func TestColoMove_PairingThatCanStillChangeStays(t *testing.T) {
 	t.Parallel()
 	stub := coloStub()
@@ -379,8 +379,8 @@ func TestColoMove_PairingThatCanStillChangeStays(t *testing.T) {
 	h := newColoHarness()
 	coloJoin(coloDeps(stub, h, coloClaimDir(t)), 102, "2", log.NewNopLogger())
 	coloWantNoMove(t, h)
-	if got := stub.rules[aaRule]; got != "vm:100,vm:102" {
-		t.Fatalf("rule = %q; want vm:100,vm:102", got)
+	if len(stub.rules) != 0 {
+		t.Fatalf("rules = %v; want none while 102 waits for index 1", stub.rules)
 	}
 }
 

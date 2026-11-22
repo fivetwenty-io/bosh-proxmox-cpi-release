@@ -228,6 +228,7 @@ func (p *aaPlanner) plan(set *ha.RuleSet) ([]ha.RuleOp, error) {
 	} else {
 		out = aapattern.Layout(in)
 		p.logLayout(in, out)
+		p.logWaiting(out)
 		p.logMoves(in, existing, out)
 		if p.keepInFlight {
 			p.keepInFlightRemovals(existing, &out)
@@ -356,6 +357,21 @@ func (p *aaPlanner) logMoves(in aapattern.Input, existing map[string]*ha.Rule, o
 		"the members' indexes", log.String("rule", p.ident.ruleName()), log.String("moved", strings.Join(moved, ",")))
 }
 
+// logWaiting logs once, at Info, the members that join no rule yet because a
+// lower index of the group has not joined.
+func (p *aaPlanner) logWaiting(out aapattern.Output) {
+	if len(out.Waiting) == 0 || !p.once("waiting") {
+		return
+	}
+	open := make([]string, 0, len(out.Open))
+	for _, i := range out.Open {
+		open = append(open, strconv.Itoa(i))
+	}
+	p.logger.Info("anti-affinity: members wait to join a rule until the lower indexes of the group join, so each "+
+		"rule is written once", log.String("rule", p.ident.ruleName()),
+		log.String("waiting", strings.Join(out.Waiting, ",")), log.String("open_indexes", strings.Join(open, ",")))
+}
+
 // removalLayout returns the group's rules as the removal of exclude leaves
 // them: every rule without exclude, and none with fewer than two members.
 func (p *aaPlanner) removalLayout(existing map[string]*ha.Rule) aapattern.Output {
@@ -481,6 +497,11 @@ func (p *aaPlanner) layoutInput(set *ha.RuleSet, existing map[string]*ha.Rule) a
 		Members: members,
 		Rules:   rules,
 		Spread:  len(p.topo.azs),
+		// A member joins a rule only once every position below its own is
+		// present or held, so a parallel deploy writes each rule once. The
+		// wait ends with the grace of a member with no index.
+		FinalWindow: int64(aaUnindexedGrace / time.Second),
+		Now:         p.clock().Unix(),
 		CanJoin: func(rule string, ms []string, key string) bool {
 			return p.canJoin(set, existing[rule], rule, ms, key)
 		},
