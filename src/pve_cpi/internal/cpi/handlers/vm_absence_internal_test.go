@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
@@ -419,40 +420,61 @@ func lingeringFixture(lingering int32, resources ...string) *lingeringCRMCluster
 	}
 }
 
+// The poll tests run in a synctest bubble, so the wait and the interval run
+// on the bubble's clock, which moves only while every goroutine in it waits.
+// On the wall clock, a proof that a loaded machine slows past the whole wait
+// leaves the deadline and the next tick ready together, and the poll ends
+// after one proof. On the bubble's clock a proof takes no time, so the counts
+// and the elapsed wait below are exact on any machine.
+
 func TestPollManagedVMDestroyAbsence_WaitsForTheCRMToDropTheService(t *testing.T) {
 	t.Parallel()
-	c := lingeringFixture(2)
-	deps := lingeringDeps(c)
+	synctest.Test(t, func(t *testing.T) {
+		c := lingeringFixture(2)
+		deps := lingeringDeps(c)
 
-	loc, err := pollManagedVMDestroyAbsence(context.Background(), 5*time.Second, time.Millisecond,
-		func() (pve.VMLocation, error) { return findVMAuthoritative(context.Background(), deps, c.vmid) })
+		start := time.Now()
+		loc, err := pollManagedVMDestroyAbsence(context.Background(), 5*time.Second, time.Millisecond,
+			func() (pve.VMLocation, error) { return findVMAuthoritative(context.Background(), deps, c.vmid) })
 
-	if err != nil || loc.Found {
-		t.Fatalf("loc = %+v, err = %v; want absence proven once the CRM drops the service", loc, err)
-	}
-	if got := c.reads.Load(); got != 3 {
-		t.Errorf("CRM reads = %d, want 3 (two lingering answers, then the clear one)", got)
-	}
+		if err != nil || loc.Found {
+			t.Fatalf("loc = %+v, err = %v; want absence proven once the CRM drops the service", loc, err)
+		}
+		if got := c.reads.Load(); got != 3 {
+			t.Errorf("CRM reads = %d, want 3 (two lingering answers, then the clear one)", got)
+		}
+		if elapsed := time.Since(start); elapsed != 2*time.Millisecond {
+			t.Errorf("poll took %s, want two intervals and no wait past the clear answer", elapsed)
+		}
+	})
 }
 
 func TestPollManagedVMDestroyAbsence_StaysBoundedAndRetriableWhenTheCRMNeverDrops(t *testing.T) {
 	t.Parallel()
-	c := lingeringFixture(1 << 30)
-	deps := lingeringDeps(c)
+	synctest.Test(t, func(t *testing.T) {
+		const wait, interval = 60 * time.Millisecond, 5 * time.Millisecond
+		c := lingeringFixture(1 << 30)
+		deps := lingeringDeps(c)
 
-	start := time.Now()
-	_, err := pollManagedVMDestroyAbsence(context.Background(), 60*time.Millisecond, 5*time.Millisecond,
-		func() (pve.VMLocation, error) { return findVMAuthoritative(context.Background(), deps, c.vmid) })
+		start := time.Now()
+		_, err := pollManagedVMDestroyAbsence(context.Background(), wait, interval,
+			func() (pve.VMLocation, error) { return findVMAuthoritative(context.Background(), deps, c.vmid) })
 
-	if err == nil || !errors.Is(err, pve.ErrHAManagerHoldsService) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
-		t.Fatalf("err = %v, want the retriable CRM-still-holds error", err)
-	}
-	if c.reads.Load() < 2 {
-		t.Errorf("CRM reads = %d, want the proof repeated before the wait ended", c.reads.Load())
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("poll took %s, want it bounded by the wait", elapsed)
-	}
+		if err == nil || !errors.Is(err, pve.ErrHAManagerHoldsService) ||
+			!cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+			t.Fatalf("err = %v, want the retriable CRM-still-holds error", err)
+		}
+		// One proof at the start and one per interval until the wait ends. At
+		// the wait's last instant the tick and the deadline are ready together,
+		// so the poll may run one more proof before it sees the deadline.
+		const want = int32(wait / interval)
+		if got := c.reads.Load(); got < want || got > want+1 {
+			t.Errorf("CRM reads = %d, want the proof repeated every interval of the wait (%d or %d)", got, want, want+1)
+		}
+		if elapsed := time.Since(start); elapsed != wait {
+			t.Errorf("poll took %s, want it to end when the %s wait does", elapsed, wait)
+		}
+	})
 }
 
 func TestPollManagedVMDestroyAbsence_OtherRefusalsReturnAtOnce(t *testing.T) {
