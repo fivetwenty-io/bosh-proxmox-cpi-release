@@ -239,7 +239,11 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 		c.Problem, c.OtherEntry = reason, true
 		return c
 	}
-	c.ForeignRule = foreignNamedRule(set, ident, p.lastIn, p.rewrittenRules(ops))
+	rewritten := p.rewrittenRules(ops)
+	c.ForeignRule = foreignNamedRule(set, ident, p.lastIn, rewritten)
+	if c.ForeignRule == "" {
+		c.ForeignRule = otherEntryRule(in.Config, set, ident, p.lastIn, p.lastOut, rewritten, c.LapsedHolds)
+	}
 	for i := range ops {
 		switch id := ops[i].Rule.ID; {
 		case p.stampOnly[id]:

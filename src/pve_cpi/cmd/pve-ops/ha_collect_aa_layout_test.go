@@ -678,3 +678,30 @@ func TestCollectAntiAffinityLayoutForeignNamedRuleIsAdviceForOneEntry(t *testing
 	scoped := collectHAScoped(context.Background(), fake(), mapped, haDirector, haNow, sc)
 	want(t, scoped, haKindAALayoutDrift, haSeverityProblem, g.rule, "could not be planned", g.rule+"-2")
 }
+
+// TestCollectAntiAffinityLayoutRuleOfAnotherNumberingIsAdviceForOneEntry pins
+// the doctor for an entry with no az_map whose cluster another entry numbers
+// by three AZs. That entry names the group's second pair -4, which this
+// entry's numbering would rename to -2, so a run of this entry alone reports
+// the group as advice that names --cpi-config and plans no rename. A pair the
+// entry numbered itself and that lost a member is still its own drift.
+func TestCollectAntiAffinityLayoutRuleOfAnotherNumberingIsAdviceForOneEntry(t *testing.T) {
+	t.Parallel()
+	g := newAALayoutGroup()
+	plain := haCfgWith("auto", "none", `,"anti_affinity":"on"`, `,"placement":{"anti_affinity":{"enabled":true}}`)
+	f := aaLayoutFake(g, "block", 4)
+	f.rules = g.rulesOf([]string{"vm:200", "vm:201"})
+	f.rules = append(f.rules, ha.Rule{ID: g.rule + "-4", Type: "resource-affinity", Affinity: "negative",
+		Comment: g.marker, Resources: []string{"vm:202", "vm:203"}})
+	r := runCollect(t, f, plain)
+	want(t, r, haKindAALayoutDrift, haSeverityAdvice, g.rule, "could not be planned", g.rule+"-4", "index 2",
+		aaOneEntryReason, "pve-ops ha --cpi-config")
+	if r.Problems() != 0 {
+		t.Errorf("a run of one entry counts a rule another entry's numbering names as a problem: %+v", r.Findings)
+	}
+
+	f = aaLayoutFake(g, "block", 4)
+	f.rules = g.rulesOf([]string{"vm:200", "vm:201"}, []string{"vm:202"})
+	r = runCollect(t, f, plain)
+	want(t, r, haKindAALayoutDrift, haSeverityAdvice, g.rule, "differ from the layout", "update "+g.rule+"-2")
+}
