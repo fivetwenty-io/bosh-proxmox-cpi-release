@@ -232,7 +232,11 @@ func moveJoinerOffPartners(
 		}
 		for _, m := range c.order(a, b) {
 			if c.eligible(m) {
-				c.move(m)
+				partner := a
+				if m.vmid == a.vmid {
+					partner = b
+				}
+				c.move(m, partner)
 				break
 			}
 		}
@@ -339,21 +343,31 @@ func (c *aaColoCall) partners(sid string) []aaColoPartner {
 	return out
 }
 
+// fields returns the log fields of the move of m, whose co-located partner
+// in the pair is partner: vmid names the VM the call is for, moving_vmid the
+// VM that moves, and partner_vmid the partner that stays. The call's logger
+// carries vmid already, so the field adds nothing there and repeats no key.
+func (c *aaColoCall) fields(m, partner aaColoMember, more ...log.Field) []log.Field {
+	return append([]log.Field{
+		log.Int(metadataKeyVMID, c.joiner), log.Int("moving_vmid", m.vmid), log.Int("partner_vmid", partner.vmid),
+	}, more...)
+}
+
 // move moves m off its partners' nodes when it can, and records the move.
-func (c *aaColoCall) move(m aaColoMember) {
+// partner is the member m shares a node with in the pair the move is for.
+func (c *aaColoCall) move(m, partner aaColoMember) {
 	ctx, deps, logger, vmid := c.ctx, c.deps, c.logger, m.vmid
 	home := c.node(vmid, m.sid)
 	cfg, err := c.h.config(ctx, home, vmid)
 	if err != nil {
 		logger.Debug("set_vm_metadata: the VM's config could not be read, so PVE moves it off its anti-affinity "+
-			"partner's node once the rule is written", log.Int(metadataKeyVMID, vmid), log.Err(err))
+			"partner's node once the rule is written", c.fields(m, partner, log.Err(err))...)
 		return
 	}
 	storages, why := aaColoMovableStorages(deps.Config, c.profile, cfg, home)
 	if why != "" {
 		logger.Info("set_vm_metadata: the VM shares a node with an anti-affinity partner, and "+why+
-			", so PVE moves one of them once the rule is written", log.Int(metadataKeyVMID, vmid),
-			log.String("node", home))
+			", so PVE moves one of them once the rule is written", c.fields(m, partner, log.String("node", home))...)
 		return
 	}
 	allowed := aaPinTopNodes(c.set, m.sid)
@@ -376,8 +390,7 @@ func (c *aaColoCall) move(m aaColoMember) {
 	}
 	if c.factsErr != nil {
 		logger.Debug("set_vm_metadata: the node facts could not be read, so PVE moves the VM off its "+
-			"anti-affinity partner's node once the rule is written", log.Int(metadataKeyVMID, vmid),
-			log.Err(c.factsErr))
+			"anti-affinity partner's node once the rule is written", c.fields(m, partner, log.Err(c.factsErr))...)
 		return
 	}
 	if c.store == nil {
@@ -394,7 +407,7 @@ func (c *aaColoCall) move(m aaColoMember) {
 		defer cancel()
 		if err := claim.Release(rctx); err != nil {
 			logger.Debug("set_vm_metadata: the claim of the move could not be released, so it counts until its "+
-				"process ends or it expires", log.Int(metadataKeyVMID, vmid), log.Err(err))
+				"process ends or it expires", c.fields(m, partner, log.Err(err))...)
 		}
 	}
 	pick := aaColoPick{
@@ -406,8 +419,8 @@ func (c *aaColoCall) move(m aaColoMember) {
 		releaseClaim()
 		if err != nil {
 			logger.Info("set_vm_metadata: the spread claim record could not take the move's claim, so PVE moves "+
-				"the VM off its anti-affinity partner's node once the rule is written", log.Int(metadataKeyVMID, vmid),
-				log.String("node", home), log.Err(err))
+				"the VM off its anti-affinity partner's node once the rule is written",
+				c.fields(m, partner, log.String("node", home), log.Err(err))...)
 		}
 		return
 	}
@@ -421,8 +434,8 @@ func (c *aaColoCall) move(m aaColoMember) {
 	c.releases = append(c.releases, releaseClaim)
 	logger.Info("set_vm_metadata: the VM shares a node with an anti-affinity partner, so PVE HA moves it to "+
 		"another node before the rule is written, and the partner stays where it is",
-		log.Int(metadataKeyVMID, vmid), log.Int("joiner", c.joiner), log.String("from", home),
-		log.String("to", target), log.String("wait", c.budget.String()))
+		c.fields(m, partner, log.String("from", home), log.String("to", target),
+			log.String("wait", c.budget.String()))...)
 	mctx, cancel := context.WithTimeout(ctx, c.budget)
 	err = c.h.migrate(mctx, vmid, home, target, c.budget)
 	cancel()
@@ -430,17 +443,17 @@ func (c *aaColoCall) move(m aaColoMember) {
 	case err == nil:
 		c.moved[vmid] = target
 		logger.Info("set_vm_metadata: PVE HA moved the VM off its anti-affinity partner's node",
-			log.Int(metadataKeyVMID, vmid), log.String("node", target))
+			c.fields(m, partner, log.String("node", target))...)
 	case aaColoMoveTimedOut(err, mctx):
 		c.moved[vmid] = target
-		logger.Warn("set_vm_metadata: PVE HA did not finish moving the VM off its anti-affinity partner's node "+
-			"within the wait, so the rule is written now. If the move is still running, PVE may move the partner "+
-			"too", log.Int(metadataKeyVMID, vmid), log.String("from", home), log.String("to", target),
-			log.String("wait", c.budget.String()), log.Err(err))
+		logger.Warn("set_vm_metadata: PVE HA did not finish moving the VM off its anti-affinity partner's "+
+			"node within the wait, so the rule is written now. If the move is still running, PVE may move the "+
+			"partner too", c.fields(m, partner, log.String("from", home), log.String("to", target),
+			log.String("wait", c.budget.String()), log.Err(err))...)
 	default:
-		logger.Warn("set_vm_metadata: PVE HA did not move the VM off its anti-affinity partner's node, so the "+
-			"rule is written now and PVE moves one of them", log.Int(metadataKeyVMID, vmid),
-			log.String("from", home), log.String("to", target), log.Err(err))
+		logger.Warn("set_vm_metadata: PVE HA did not move the VM off its anti-affinity partner's node, so "+
+			"the rule is written now and PVE moves one of them",
+			c.fields(m, partner, log.String("from", home), log.String("to", target), log.Err(err))...)
 	}
 }
 
