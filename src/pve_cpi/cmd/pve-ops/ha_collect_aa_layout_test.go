@@ -492,7 +492,8 @@ func holdEntryConfig(t *testing.T, i int) *config.CPIConfig {
 // whose members each hold a strict pin to a node of their own is judged as
 // planned. The hold policy writes those pins and a drain moves none of the
 // members, so the rule is no sign of another entry's AZ. Members whose pins
-// share their nodes are still a rule the plan cannot judge.
+// share their nodes are still a rule the plan cannot judge, and a run of one
+// entry reports it as advice, because another entry's AZ map may own the group.
 func TestCollectAntiAffinityLayoutHoldPinsDoNotConfineARule(t *testing.T) {
 	t.Parallel()
 	g := newAALayoutGroup()
@@ -504,21 +505,26 @@ func TestCollectAntiAffinityLayoutHoldPinsDoNotConfineARule(t *testing.T) {
 			f.rules[i].Nodes = map[string]int{"n1": 0}
 		}
 	}
-	want(t, runCollect(t, f, holdEntryConfig(t, 0)), haKindAALayoutDrift, haSeverityProblem, g.rule,
-		"could not be planned", "leave them only the nodes n1")
+	want(t, runCollect(t, f, holdEntryConfig(t, 0)), haKindAALayoutDrift, haSeverityAdvice, g.rule,
+		"could not be planned", "leave them only the nodes n1", aaOneEntryReason)
 }
 
 // TestCollectAntiAffinityLayoutRuleAcrossDomainsIsNotDeleted pins that a run
 // whose AZ map puts the members of one of the group's rules in different
 // domains does not plan the group, because the CPI never writes a rule across
 // domains, so another entry wrote it. The run reports why and offers no
-// delete, so a fix with that entry's request leaves the rule alone.
+// delete, so a fix with that entry's request leaves the rule alone. A run of
+// one entry can't see that entry, so it reports the group as advice that
+// names --cpi-config rather than as a problem.
 func TestCollectAntiAffinityLayoutRuleAcrossDomainsIsNotDeleted(t *testing.T) {
 	t.Parallel()
 	g := newAALayoutGroup()
 	r := runCollect(t, holdGroupFake(g), holdEntryConfig(t, 1))
-	want(t, r, haKindAALayoutDrift, haSeverityProblem, g.rule, "could not be planned", "vm:200, vm:201",
-		"different domains of placement.az_map (c1, c2)", "check the group under --cpi-config")
+	want(t, r, haKindAALayoutDrift, haSeverityAdvice, g.rule, "could not be planned", "vm:200, vm:201",
+		"different domains of placement.az_map (c1, c2)", "check the group under --cpi-config", aaOneEntryReason)
+	if r.Problems() != 0 {
+		t.Errorf("a run of one entry counts a group another entry's AZ map may own as a problem: %+v", r.Findings)
+	}
 	wantNone(t, r, haKindAARuleFull)
 	for _, fd := range r.Findings {
 		if strings.Contains(fd.Detail, "delete "+g.rule) {
@@ -637,4 +643,38 @@ func TestCollectAntiAffinityLayoutPinRestoreGoesToTheEntryWhoseAZThePinPrefers(t
 	}
 	wantNone(t, run(0), haKindAAPinRestore)
 	want(t, run(1), haKindAAPinRestore, haSeverityAdvice, "bosh-na-200", "writes back the priorities")
+}
+
+// aaOneEntryReason is the words a run of one entry adds to a group that only
+// another entry's AZ map may explain.
+const aaOneEntryReason = "another cpis entry's placement.az_map may own the group"
+
+// TestCollectAntiAffinityLayoutForeignNamedRuleIsAdviceForOneEntry pins that a
+// run of one entry reports a group whose plan would rename a rule that its own
+// AZ map never names that way as advice that names --cpi-config, because that
+// rule most likely belongs to another entry's AZ map, which the run can't see.
+// Under --cpi-config, where no entry's plan keeps the rule, it stays a problem.
+func TestCollectAntiAffinityLayoutForeignNamedRuleIsAdviceForOneEntry(t *testing.T) {
+	t.Parallel()
+	g := newAALayoutGroup()
+	mapped := haCfgWith("auto", "none", `,"anti_affinity":"on"`,
+		`,"placement":{"anti_affinity":{"enabled":true},"az_map":{"c1":["n1"],"c2":["n2"],"c3":["n3"]}}`)
+	fake := func() *fakeHA {
+		f := aaLayoutFake(g, "block", 4)
+		f.rules = g.rulesOf([]string{"vm:200", "vm:201"}, []string{"vm:202", "vm:203"})
+		return f
+	}
+	r := runCollect(t, fake(), mapped)
+	want(t, r, haKindAALayoutDrift, haSeverityAdvice, g.rule, "could not be planned", g.rule+"-2",
+		"never gives a rule of the whole cluster that name", aaOneEntryReason, "pve-ops ha --cpi-config")
+	if r.Problems() != 0 {
+		t.Errorf("a run of one entry counts a rule another entry's AZ map may name as a problem: %+v", r.Findings)
+	}
+
+	sc := &haEntryScope{Name: "only", Band: pve.VMIDBand{Start: 200, End: 299}, Policy: "none", AntiAffinity: true,
+		Leader: true}
+	sc.Cluster = []haClusterEntry{{Name: "only", Band: sc.Band, AntiAffinity: true, Pattern: aapattern.Default(),
+		AZMap: map[string][]string{"c1": {"n1"}, "c2": {"n2"}, "c3": {"n3"}}, Self: true}}
+	scoped := collectHAScoped(context.Background(), fake(), mapped, haDirector, haNow, sc)
+	want(t, scoped, haKindAALayoutDrift, haSeverityProblem, g.rule, "could not be planned", g.rule+"-2")
 }

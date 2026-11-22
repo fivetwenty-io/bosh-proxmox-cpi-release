@@ -1086,11 +1086,11 @@ func (c *haCollector) checksUnder(cfg *config.CPIConfig, defaults map[string]aap
 // hold as many members as their nodes, and rules that differ from the plan.
 func (c *haCollector) layoutFindings(chk handlers.AntiAffinityGroupCheck) {
 	if chk.Problem != "" {
-		c.rep.problem(haKindAALayoutDrift, chk.Rule, "the group's rules could not be planned: %s", chk.Problem)
+		c.unplannedFinding(chk.Rule, chk.Problem, chk.OtherEntry)
 		return
 	}
 	if chk.ForeignRule != "" {
-		c.rep.problem(haKindAALayoutDrift, chk.Rule, "the group's rules could not be planned: %s", chk.ForeignRule)
+		c.unplannedFinding(chk.Rule, chk.ForeignRule, true)
 		return
 	}
 	if len(chk.Trimmed) > 0 {
@@ -1132,6 +1132,23 @@ func (c *haCollector) layoutFindings(chk handlers.AntiAffinityGroupCheck) {
 				"of a member writes, or pve-ops ha --fix-anti-affinity --apply now: %s",
 			chk.Group, strings.Join(chk.Drift, "; "))
 	}
+}
+
+// unplannedFinding reports a group whose rules could not be planned, with the
+// reason why. It is a problem, except in a run of one entry when the reason
+// names a rule that only another cpis entry's placement.az_map explains. Such
+// a run can't see the other entries, and the group most likely belongs to one
+// of them, so it gives advice that names --cpi-config, which judges the group
+// by the entry that placed it and keeps the problem when no entry does.
+func (c *haCollector) unplannedFinding(rule, reason string, otherEntry bool) {
+	if otherEntry && c.scope == nil {
+		c.rep.advise(haKindAALayoutDrift, rule, "the group's rules could not be planned under this entry's "+
+			"settings, but another cpis entry's placement.az_map may own the group, and a run of one entry can't "+
+			"see the others, so the doctor doesn't count it as a problem; run pve-ops ha --cpi-config to judge the "+
+			"group by the entry that placed it. The plan found that %s", reason)
+		return
+	}
+	c.rep.problem(haKindAALayoutDrift, rule, "the group's rules could not be planned: %s", reason)
 }
 
 // pinRestoreFinding reports a member's pin that still records the priorities

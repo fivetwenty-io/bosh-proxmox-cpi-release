@@ -86,6 +86,11 @@ type AntiAffinityGroupCheck struct {
 	PinRestores []AntiAffinityPinRestore `json:"pin_restores,omitempty"`
 	// Problem says why the group could not be planned, or "".
 	Problem string `json:"problem,omitempty"`
+	// OtherEntry says that Problem names a rule that this config's
+	// placement.az_map can't explain and another cpis entry's az_map most
+	// likely does, so a run that sees this entry alone can't tell whether the
+	// group is wrong. A plan that failed for any other reason leaves it false.
+	OtherEntry bool `json:"other_entry,omitempty"`
 	// ForeignRule says why the plan's writes would delete or rewrite a rule
 	// whose name this config never gives a rule of its members' domain, or "".
 	// Another cpis entry on the cluster most likely wrote that rule and keeps
@@ -227,11 +232,11 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 	c.BlocksDrain = p.lastOut.Unsafe
 	c.Layout = p.lastOut.Rules
 	if reason := confinedLayoutRule(set, ident.Owner, p.lastIn, p.lastOut); reason != "" {
-		c.Problem = reason
+		c.Problem, c.OtherEntry = reason, true
 		return c
 	}
 	if reason := crossDomainRule(set, ident, p.lastIn); reason != "" {
-		c.Problem = reason
+		c.Problem, c.OtherEntry = reason, true
 		return c
 	}
 	c.ForeignRule = foreignNamedRule(set, ident, p.lastIn, p.rewrittenRules(ops))
