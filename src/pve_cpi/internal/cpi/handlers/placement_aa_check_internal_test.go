@@ -278,7 +278,7 @@ func TestCheckAntiAffinityGroups_PinsThatLeaveARuleNoFreeNodeAreNotPlanned(t *te
 	f.strictPin(100, "pve1", "pve2")
 	f.strictPin(101, "pve2", "pve1")
 	c := oneCheck(t, f.in)
-	for _, part := range []string{aaRule, "vm:100, vm:101", "pve1, pve2", "placement.az_map", "another cpis entry"} {
+	for _, part := range []string{aaRule, "vm:100, vm:101", "pve1, pve2", "placement.az_map", "another cpi_config entry"} {
 		if !strings.Contains(c.Problem, part) {
 			t.Fatalf("problem = %q; want it to name %q", c.Problem, part)
 		}

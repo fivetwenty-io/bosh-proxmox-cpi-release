@@ -87,13 +87,13 @@ type AntiAffinityGroupCheck struct {
 	// Problem says why the group could not be planned, or "".
 	Problem string `json:"problem,omitempty"`
 	// OtherEntry says that Problem names a rule that this config's
-	// placement.az_map can't explain and another cpis entry's az_map most
+	// placement.az_map can't explain and another cpi_config entry's az_map most
 	// likely does, so a run that sees this entry alone can't tell whether the
 	// group is wrong. A plan that failed for any other reason leaves it false.
 	OtherEntry bool `json:"other_entry,omitempty"`
 	// ForeignRule says why the plan's writes would delete or rewrite a rule
 	// whose name this config never gives a rule of its members' domain, or "".
-	// Another cpis entry on the cluster most likely wrote that rule and keeps
+	// Another cpi_config entry on the cluster most likely wrote that rule and keeps
 	// it, so FixAntiAffinityGroups reports the group as not planned and writes
 	// nothing. The doctor under --cpi-config first asks whether another
 	// entry's plan keeps the rule, and otherwise reports it the way it reports
@@ -315,7 +315,7 @@ func confinedLayoutRule(set *ha.RuleSet, owner string, in aapattern.Input, out a
 		}
 		return fmt.Sprintf("the plan puts %s in rule %s, but their strict pins leave them only the nodes %s, so the "+
 			"rule would leave no node free while one of them drains. No AZ of placement.az_map holds those nodes, so "+
-			"the group was most likely placed by another cpis entry whose az_map does; check the group under "+
+			"the group was most likely placed by another cpi_config entry whose az_map does; check the group under "+
 			"--cpi-config, and fix it with that entry's request", strings.Join(sids, ", "), rule,
 			strings.Join(slices.Sorted(maps.Keys(nodes)), ", "))
 	}
@@ -421,7 +421,7 @@ func pinPreference(set *ha.RuleSet, sid, owner string) (preferred, nodes []strin
 // config it was planned with, or "". That is so when one of the group's rules
 // names members that the config's placement.az_map puts in different domains.
 // The CPI never writes such a rule, because a plan's rules only ever name
-// members of one domain, so another cpis entry whose az_map puts those
+// members of one domain, so another cpi_config entry whose az_map puts those
 // members in one domain most likely wrote it, and a plan under this config
 // would delete a rule that entry's plan keeps. The check reports the group as
 // not planned, so neither the doctor's drift nor the fix deletes the rule.
@@ -454,7 +454,7 @@ func crossDomainRule(set *ha.RuleSet, ident haIdentity, in aapattern.Input) stri
 		}
 		return fmt.Sprintf("rule %s names %s, whose strict pins put them in different domains of "+
 			"placement.az_map (%s), and the CPI never writes a rule across domains, so the group was most likely "+
-			"placed by another cpis entry whose az_map puts them in one domain; check the group under --cpi-config, "+
+			"placed by another cpi_config entry whose az_map puts them in one domain; check the group under --cpi-config, "+
 			"and fix it with that entry's request", r.ID, strings.Join(r.Resources, ", "), strings.Join(names, ", "))
 	}
 	return ""
@@ -466,7 +466,7 @@ func crossDomainRule(set *ha.RuleSet, ident haIdentity, in aapattern.Input) stri
 // its members' domain. The block rules of a domain take turns in their
 // numbering with the other AZs of placement.az_map, and a pattern rule's
 // number names its domain, so the name of a rule shows the AZ map of the
-// entry that wrote it. Another cpis entry on the same cluster whose az_map
+// entry that wrote it. Another cpi_config entry on the same cluster whose az_map
 // defines other AZs most likely wrote such a rule, and its plan keeps the
 // rule, so a plan under this config would delete or rename it. The check
 // reports the group as not planned, so neither the doctor's drift nor the fix
@@ -481,7 +481,7 @@ func foreignNamedRule(set *ha.RuleSet, ident haIdentity, in aapattern.Input, rew
 		return ""
 	}
 	return fmt.Sprintf("the plan would delete or rewrite rule %s, whose members are in %s, but placement.az_map "+
-		"never gives a rule of %s that name. Another cpis entry on this cluster whose az_map defines other AZs "+
+		"never gives a rule of %s that name. Another cpi_config entry on this cluster whose az_map defines other AZs "+
 		"most likely wrote the rule and keeps it, so check the group under --cpi-config and fix it with that "+
 		"entry's request. A rule written before 0.12.0, or before this entry's az_map changed, also carries such "+
 		"a name, and the group's next write by a member's set_vm_metadata or delete_vm renames it",

@@ -39,7 +39,7 @@ func cpiConfigDirectorUUID(data []byte) string {
 	return strings.TrimSpace(doc.DirectorUUID)
 }
 
-// decodeEntryList decodes a JSON list of cpis entries. It decodes the list as
+// decodeEntryList decodes a JSON list of cpi_config entries. It decodes the list as
 // plain struct decoding does, so a malformed entry reports the text and the
 // field path that decoding gives, and then reads the same bytes a second time
 // to keep the discovery mode in each entry's properties as the raw text it was
@@ -74,7 +74,7 @@ func decodeEntryList(data []byte) ([]cpiConfigEntry, error) {
 	return list, nil
 }
 
-// haCPIType is the cpis entry type this CPI serves. An entry of any other type
+// haCPIType is the cpi_config entry type this CPI serves. An entry of any other type
 // belongs to another CPI, so the doctor neither probes nor compares it.
 const haCPIType = "pve"
 
@@ -165,7 +165,7 @@ type haSharedFinding struct {
 	Detail   string   `json:"detail"`
 }
 
-// haMultiReport is the doctor's report over every cpis entry.
+// haMultiReport is the doctor's report over every cpi_config entry.
 type haMultiReport struct {
 	Clusters      []*haReport       `json:"clusters"`
 	SharedExports []haSharedFinding `json:"shared_exports"`
@@ -187,7 +187,7 @@ func (m *haMultiReport) failing() bool {
 	return false
 }
 
-// runHACPIConfig runs the doctor against every cpis entry and then the
+// runHACPIConfig runs the doctor against every cpi_config entry and then the
 // cross-cluster check over what it read. An entry whose cluster cannot be read
 // is reported as unchecked and takes part in no comparison.
 func runHACPIConfig(ctx context.Context, path string, base *config.CPIConfig, logger *log.Logger, directorUUID string, asJSON bool,
@@ -373,7 +373,7 @@ func openEntryReaders(ctx context.Context, entries []cpiConfigEntry, base *confi
 	return readers, identities
 }
 
-// checkCPIConfigEntry reports one cpis entry and gathers the layout the
+// checkCPIConfigEntry reports one cpi_config entry and gathers the layout the
 // cross-cluster check compares. Any step that cannot finish leaves the layout
 // unchecked with the reason, and the report carries the same reason as a
 // finding. ledger is the run's record of nodes that cannot answer. opened is

@@ -207,7 +207,7 @@ func TestFixAntiAffinityGroups_LeavesARuleNamedForAnotherAZMapAlone(t *testing.T
 
 // TestAAPlanner_WarnsWhenItRenamesARuleNamedUnderAnotherAZMap pins that a
 // write plan that deletes or rewrites a rule its own az_map never names logs
-// one Warn that names the rule, because two cpis entries that share a
+// one Warn that names the rule, because two cpi_config entries that share a
 // cluster and map AZs differently rename each other's rules on every write
 // of a group that spans them. The plan itself still writes its layout, which
 // renames a rule an older release named once. A plan whose map gives the

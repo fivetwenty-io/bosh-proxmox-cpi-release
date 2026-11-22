@@ -280,7 +280,7 @@ func (p *aaPlanner) rewrittenRules(ops []ha.RuleOp) map[string]bool {
 
 // warnForeignNames logs once, at Warn, when a layout plan deletes or rewrites
 // a group rule whose name this entry's placement.az_map never gives the
-// rule's members. Two cpis entries that share a cluster and map AZs
+// rule's members. Two cpi_config entries that share a cluster and map AZs
 // differently number a group's rules differently, so when one group spans
 // both, each entry renames the other's rules on every write of the group.
 // The plan still writes its layout, because an older release, or this entry
@@ -296,7 +296,7 @@ func (p *aaPlanner) warnForeignNames(set *ha.RuleSet, in aapattern.Input, ops []
 	}
 	p.logger.Warn("anti-affinity: the plan renames a rule of the group that carries a name from another numbering "+
 		"of the group's AZs; a rule from before 0.12.0, or from before this entry's az_map changed, is renamed once, "+
-		"but when this repeats, another cpis entry on this cluster with a different az_map writes the same group, "+
+		"but when this repeats, another cpi_config entry on this cluster with a different az_map writes the same group, "+
 		"so keep each instance group's AZs on one entry per cluster",
 		log.String("rule", rule), log.String("group", p.ident.ruleName()))
 }

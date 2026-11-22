@@ -168,7 +168,7 @@ func TestRunHAFixAAUsageErrors(t *testing.T) {
 }
 
 // otherEntryResult is a group whose plan failed under this entry's settings for
-// a reason that only another cpis entry's placement.az_map explains.
+// a reason that only another cpi_config entry's placement.az_map explains.
 func otherEntryResult(rule string, foreign bool) handlers.AntiAffinityFixResult {
 	chk := handlers.AntiAffinityGroupCheck{Rule: rule, Group: "web", Deployment: "cf", Members: 4, Pattern: "block"}
 	if foreign {

@@ -73,7 +73,7 @@ func runHAFixAA(ctx context.Context, eff *config.CPIConfig, logger *log.Logger, 
 	return exitOK
 }
 
-// markOtherEntryGroups gives a group that only another cpis entry's
+// markOtherEntryGroups gives a group that only another cpi_config entry's
 // placement.az_map explains the outcome haFixAAOtherEntry, the way the doctor
 // calls it advice in a run of one entry. The fix wrote nothing for the group, and
 // it is not a planning failure of this run.
@@ -145,6 +145,6 @@ func haFixAAOutcomeText(o string) string {
 	return strings.ReplaceAll(o, "_", " ")
 }
 
-// haFixAAOtherEntry is the outcome of a group that only another cpis entry's
+// haFixAAOtherEntry is the outcome of a group that only another cpi_config entry's
 // placement.az_map explains.
 const haFixAAOtherEntry = "other_entry"

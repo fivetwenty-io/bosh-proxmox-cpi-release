@@ -1143,7 +1143,7 @@ func (c *haCollector) layoutFindings(chk handlers.AntiAffinityGroupCheck) {
 
 // unplannedFinding reports a group whose rules could not be planned, with the
 // reason why. It is a problem, except in a run of one entry when the reason
-// names a rule that only another cpis entry's placement.az_map explains. Such
+// names a rule that only another cpi_config entry's placement.az_map explains. Such
 // a run can't see the other entries, and the group most likely belongs to one
 // of them, so it gives advice that names --cpi-config, which judges the group
 // by the entry that placed it and keeps the problem when no entry does.
