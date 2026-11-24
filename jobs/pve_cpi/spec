@@ -333,12 +333,12 @@ properties:
       records on each member's HA resource, is longer than 1024 characters.
       See docs/ha-and-resurrection.md for the kinds and examples.
 
-      off turns off the anti-affinity rules for every instance group that
-      names no pattern of its own, and a group can opt back in with a pattern
-      in its ha_anti_affinity cloud property. A quoted "off" and an unquoted
-      off, which YAML reads as false, mean the same thing. The bare string
-      block is short for the default block pattern. true names no pattern and
-      fails the render.
+      The value off turns off the anti-affinity rules for every instance group
+      that names no pattern of its own, and a group can opt back in with a
+      pattern in its ha_anti_affinity cloud property. A quoted "off" and an
+      unquoted off, which YAML reads as false, mean the same thing. The bare
+      string block is short for the default block pattern. true names no
+      pattern and fails the render.
 
       A cpi-config entry can override it under pve_ha.
   pve.ha.pin_az:
