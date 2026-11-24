@@ -2,12 +2,14 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
 )
 
@@ -132,5 +134,49 @@ func TestStorageComputeHANodes_OffFollowsTheFeatures(t *testing.T) {
 	block := aaOffParsed(t, deps, map[string]any{"ha_anti_affinity": "block"})
 	if got := storageComputeHANodes(deps, block, "", []string{"pve01"}, facts); len(got) == 0 {
 		t.Fatal("block: HA nodes = none; want the AZ's nodes")
+	}
+}
+
+// TestAntiAffinityOff_DropsOnlyTheAntiAffinitySteering pins what opting a
+// group out does to storage under pve.ha.anti_affinity on. A VM whose
+// pattern is off no longer gets the storage plan's HA nodes for the sake of
+// anti-affinity, so the plan stops requiring storage that every node of its
+// AZ reaches, and the config-drive ISO check skips it, so a node-local ISO
+// no longer fails its create under pve.require_shared_iso_for_ha, while a
+// VM with block still fails. Another HA feature, such as DLB, still gives
+// the off VM its HA nodes.
+func TestAntiAffinityOff_DropsOnlyTheAntiAffinitySteering(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{{Node: "pve01"}, {Node: "pve02"}}
+	requireShared := true
+	deps := aaOffHADeps(t, "")
+	deps.Config.RequireSharedISOForHA = &requireShared
+	// The stub lists one node-local storage, vm-storage, so the ISO lives there.
+	deps.Config.ISOStorage = "vm-storage"
+	deps = dlbDeps(nil, nil, &dlbStorageStub{storageType: "dir", shared: false}, deps.Config)
+	for name, tc := range map[string]struct {
+		pattern string
+		failISO bool
+	}{
+		"off":   {pattern: "off"},
+		"block": {pattern: "block", failISO: true},
+	} {
+		parsed := aaOffParsed(t, deps, map[string]any{"ha_anti_affinity": tc.pattern})
+		if got := len(storageComputeHANodes(deps, parsed, "", []string{"pve01"}, facts)) > 0; got != tc.failISO {
+			t.Errorf("%s: HA nodes present = %v; want %v", name, got, tc.failISO)
+		}
+		features := haRegistrationFeatures(deps, parsed.cloudProps, "pve01", parsed.env)
+		err := checkISOStorageForHA(context.Background(), deps, 100, features, log.NewNopLogger())
+		if got := err != nil; got != tc.failISO {
+			t.Errorf("%s: the ISO check failed = %v (%v); want %v", name, got, err, tc.failISO)
+		}
+	}
+
+	trueVal := true
+	dlb := aaOffHADeps(t, "")
+	dlb.Config.HA.DLB = &config.HADLBConfig{Enabled: &trueVal}
+	off := aaOffParsed(t, dlb, map[string]any{"ha_anti_affinity": "off"})
+	if got := storageComputeHANodes(dlb, off, "", []string{"pve01"}, facts); len(got) == 0 {
+		t.Fatal("off with DLB: HA nodes = none; want the AZ's nodes")
 	}
 }
