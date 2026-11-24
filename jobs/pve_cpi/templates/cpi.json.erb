@@ -441,17 +441,26 @@
   # first create. The node count is unknown here, so nothing about it is
   # checked. The value passes through unchanged. An empty list or map, which
   # an ops file leaves when it clears the key, reads as unset and is omitted.
+  # The strings "off" and "block" and the boolean false, which is what YAML
+  # makes of an unquoted off, are the only forms that are not a map or a
+  # list. off turns the rules off, block is the default block, and true names
+  # no pattern, so it fails the render like any other string.
   if_p("pve.ha.anti_affinity_pattern") do |v|
     next if (v.is_a?(Array) || v.is_a?(Hash)) && v.empty?
     aa_key = "pve.ha.anti_affinity_pattern"
+    if v == false || v == "off" || v == "block"
+      ha["anti_affinity_pattern"] = v
+      next
+    end
     aa_int = lambda do |x, lo, hi, what|
       unless x.is_a?(Integer) && x >= lo && x <= hi
         raise "#{aa_key}: #{what} must be an integer from #{lo} to #{hi}, got #{x.inspect}"
       end
     end
+    raise "#{aa_key}: true names no pattern; it must be off, block, a map, or a list of maps" if v == true
     aa_terms = v.is_a?(Array) ? v : [v]
     unless v.is_a?(Hash) || v.is_a?(Array)
-      raise "#{aa_key} must be a map or a list of maps, got #{v.inspect}"
+      raise "#{aa_key} must be off, block, a map, or a list of maps, got #{v.inspect}"
     end
     raise "#{aa_key} must name at least one term" if aa_terms.empty?
     raise "#{aa_key} may hold at most 8 terms, got #{aa_terms.size}" if aa_terms.size > 8

@@ -526,6 +526,24 @@ assert_json_valid "case12-pattern" "$JSON_12P" || FAILED=$((FAILED+1))
 assert_ha_block   "case12-pattern" "$JSON_12P" '{"anti_affinity_pattern":[{"stride":2},{"sets":[[0,1]],"drain_safe":true}]}'
 JSON_12PB="$(render "$(props_with_ha '{"anti_affinity_pattern":{"block":null}}')")"
 assert_ha_block   "case12-pattern-block" "$JSON_12PB" '{"anti_affinity_pattern":{"block":null}}'
+# The off pattern, written quoted or as the false an unquoted YAML off
+# becomes, and the bare block shorthand pass through unchanged.
+for word in 'false' '"off"' '"block"'; do
+  JSON_12PW="$(render "$(props_with_ha "{\"mode\":\"auto\",\"anti_affinity_pattern\":${word}}")")"
+  assert_json_valid "case12-pattern-word" "$JSON_12PW" || FAILED=$((FAILED+1))
+  assert_ha_block   "case12-pattern-word" "$JSON_12PW" "{\"mode\":\"auto\",\"anti_affinity_pattern\":${word}}"
+done
+# true names no pattern, and no other string is a pattern, so each fails the
+# render with a message that names the forms the key takes.
+for bad in 'true' '"stride"' '"Off"' '""' '7'; do
+  rc=0
+  out="$(render "$(props_with_ha "{\"anti_affinity_pattern\":${bad}}")" 2>&1)" || rc=$?
+  if [ "$rc" -eq 0 ] || ! printf '%s' "$out" | grep -qF "pve.ha.anti_affinity_pattern" || \
+    ! printf '%s' "$out" | grep -qF "off, block, a map, or a list of maps"; then
+    echo "FAIL [case12-pattern-word-bad]: pattern ${bad} must fail the render naming the allowed forms, got rc=${rc}: ${out}" >&2
+    FAILED=$((FAILED+1))
+  fi
+done
 # A pattern whose short form comes to 994 characters, under the CPI's limit
 # of 1024, renders. Twelve such sets would come to 1084 and fail.
 LONG_OK="$(ruby -rjson -e 'print JSON.generate({"sets" => Array.new(11) { (10..39).to_a }})')"
@@ -538,7 +556,7 @@ for empty in '[]' '{}'; do
   assert_json_valid "case12-pattern-empty" "$JSON_12PE" || FAILED=$((FAILED+1))
   assert_ha_block   "case12-pattern-empty" "$JSON_12PE" '{"mode":"auto"}'
 done
-for bad in '{"stride":1}' '{"strde":2}' '{"block":{"size":1}}' '"block"' '{"sets":[[0,0]]}' \
+for bad in '{"stride":1}' '{"strde":2}' '{"block":{"size":1}}' '{"sets":[[0,0]]}' \
   '{"window":2,"drain_safe":"no"}' '{"stride":2,"window":3}' '[{"block":{}},{"block":{}}]' \
   '[{"stride":2,"drain_safe":false},{"sets":[[0,1]],"drain_safe":true}]' '{"window":"3"}' \
   "$(ruby -rjson -e 'print JSON.generate({"sets" => Array.new(32) { (10..39).to_a }})')"; do
