@@ -724,6 +724,14 @@ func createVM(
 		}
 	}
 
+	// A managed-mode refusal that the request and the HA profile settle on
+	// their own fails here, before placement allocates, clones, or records
+	// anything that a rollback would have to undo.
+	if err := refuseManagedHABeforeCreate(ctx, deps, parsed); err != nil {
+		logger.Warn("create_vm: pve.ha.mode is managed and the call is refused before anything is created", log.Err(err))
+		return nil, err
+	}
+
 	// Placement may build the VM's shape once per candidate node, so the
 	// missing-owner warning is logged here, once for the whole call.
 	warnMissingOwnerTag(deps, logger)

@@ -65,6 +65,39 @@ func (h *createdVMHA) staged() bool {
 // haActivated reports whether PVE HA runs the VM.
 func (h *createdVMHA) haActivated() bool { return h != nil && h.activated }
 
+// refuseManagedHABeforeCreate fails a managed-mode create_vm before it
+// allocates, clones, or imports anything, when the HA decision would refuse the
+// VM for a reason the request and the cluster's HA profile settle on their
+// own. Those are a request with no director_uuid, a profile that cannot be
+// resolved, a cluster that misses an HA prerequisite, and a request for the
+// dynamic load balancer that the cluster cannot run. Each fails with the same
+// cause and the same retriable or non-retriable class as decideCreatedVMHA,
+// which still makes the checks after the VM exists. The refusals that depend
+// on the VM's node or volumes stay in the decision. Any other mode returns
+// nil without a read. The profile is the request's shared one, so placement
+// and the decision reuse it.
+func refuseManagedHABeforeCreate(ctx context.Context, deps Deps, parsed *createVMParsedArgs) error {
+	if deps.Config == nil || deps.Config.HAModeValue() != config.HAModeManaged {
+		return nil
+	}
+	if haIdentityFor(deps, parsed.env).Owner == "" {
+		return cpierrors.Cloud("create_vm: pve.ha.mode is managed and the request carries no director_uuid, so " +
+			"the CPI cannot mark the VM's HA resource as its own")
+	}
+	profile, err := resolveHAProfile(ctx, deps)
+	if err != nil {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "create_vm: resolve the HA profile")
+	}
+	return profile.CreateRefusal(deps.Config, vmInDLBAZ(parsed.cloudProps, deps.Config), createNodeTargeted(deps, parsed))
+}
+
+// createNodeTargeted reports whether target_node chose the created VM's node
+// for an anti-affinity member, which takes the VM out of the dynamic load
+// balancer.
+func createNodeTargeted(deps Deps, parsed *createVMParsedArgs) bool {
+	return strings.TrimSpace(parsed.cloudProps.TargetNode) != "" && isAntiAffinityMember(deps, parsed.env)
+}
+
 // decideCreatedVMHA makes the VM's HA decision after its configuration has
 // defined every volume, and stages its HA resource as ignored when the
 // decision registers it. Mode off reads and writes nothing. A request with no
@@ -201,15 +234,14 @@ func createdVMHAInput(
 	node := shape.node
 	liveCPU, _ := pve.ConfigString(cfg, "cpu")
 	in := ha.VMInput{
-		Config:      deps.Config,
-		VMID:        vmid,
-		Node:        node,
-		Volumes:     haVolumesOfConfig(cfg, node, parsed.legacyDiskVolids),
-		CPUType:     ha.EffectiveCPUType(deps.Config, &shape.cpuType, liveCPU),
-		InDLBAZ:     vmInDLBAZ(parsed.cloudProps, deps.Config),
-		LinkedClone: configHasLinkedClone(cfg) || shape.linkedClone,
-		NodeTargeted: strings.TrimSpace(parsed.cloudProps.TargetNode) != "" &&
-			isAntiAffinityMember(deps, parsed.env),
+		Config:       deps.Config,
+		VMID:         vmid,
+		Node:         node,
+		Volumes:      haVolumesOfConfig(cfg, node, parsed.legacyDiskVolids),
+		CPUType:      ha.EffectiveCPUType(deps.Config, &shape.cpuType, liveCPU),
+		InDLBAZ:      vmInDLBAZ(parsed.cloudProps, deps.Config),
+		LinkedClone:  configHasLinkedClone(cfg) || shape.linkedClone,
+		NodeTargeted: createNodeTargeted(deps, parsed),
 	}
 	markLinkedRootDisk(in.Volumes, cfg, shape)
 	scopeHAInputToNode(&in, deps.Config, parsed.cloudProps, node)

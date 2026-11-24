@@ -2930,7 +2930,7 @@ Each message maps to one of four causes.
   The job properties set one of the nine `pve.placement` HA keys that the `pve.ha` block replaced. The job refuses to render with `the job properties set properties that were removed, and the CPI refuses to run with a feature silently switched off`, followed by the replacement for each key, and a cpi-config entry that carries a removed key fails the same way. The mapping is in the [changelog](../CHANGELOG.md).
 
 - **A failed profile gate**
-  The cluster has no quorum, has no fresh CRM master, or has configured votes that do not survive the loss of any one node. Other causes are too few online nodes, a token that lacks a privilege HA needs, or a PVE older than 9. With `pve.ha.mode` at `auto` the call carries on as observe-only and the log line names the first gap in `reason=`. With `managed` the call fails and lists every gap.
+  The cluster has no quorum, has no fresh CRM master, or has configured votes that do not survive the loss of any one node. Other causes are too few online nodes, a token that lacks a privilege HA needs, or a PVE older than 9. With `pve.ha.mode` at `auto` the call carries on as observe-only and the log line names the first gap in `reason=`. With `managed` the call fails and lists every gap, and a `create_vm` fails before it clones or imports anything, so there is no VM to roll back.
 
 - **A deferred delete**
   `delete_vm` found PVE HA fencing, recovering, or moving the VM, and it returned a retriable error that names the VM, its HA state, and its node's state.

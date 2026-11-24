@@ -205,6 +205,31 @@ func (p *Profile) PrerequisiteError() error {
 		strings.Join(p.Gaps, "; "))
 }
 
+// CreateRefusal returns the error a managed-mode create_vm fails with before
+// it creates anything, or nil. It covers the refusals of DecideVM that depend
+// only on the profile and the request, and not on the node the VM lands on or
+// the volumes it holds: a missing prerequisite, which fails with
+// PrerequisiteError, and a request for the dynamic load balancer on a cluster
+// where an online node runs a PVE version below 9.2. inDLBAZ says the VM names
+// the DLB sentinel AZ, and nodeTargeted says target_node chose its node, which
+// takes it out of the dynamic load balancer. DecideVM still makes the same
+// refusals once the VM exists, so a caller that skips this check fails later
+// with the same cause.
+func (p *Profile) CreateRefusal(cfg *config.CPIConfig, inDLBAZ, nodeTargeted bool) error {
+	if p == nil || cfg == nil || p.Mode != config.HAModeManaged {
+		return nil
+	}
+	if err := p.PrerequisiteError(); err != nil {
+		return err
+	}
+	sentinel := inDLBAZ && cfg.DLBAZName() != ""
+	if (sentinel || cfg.HADLBEnabledValue()) && !nodeTargeted && !p.DLBSupported {
+		return cpierrors.Cloud("create_vm: the VM asks for the dynamic load balancer, which needs PVE 9.2 or later "+
+			"on every online node (lowest version %q)", p.MinVersion)
+	}
+	return nil
+}
+
 // HAStateReadable reports whether the HA manager status gave a trustworthy
 // answer. An idle CRM on a cluster with no HA resource is one, because it holds
 // no state to read. When it did not, placement in auto and managed mode falls
