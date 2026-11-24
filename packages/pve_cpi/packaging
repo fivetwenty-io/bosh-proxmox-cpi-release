@@ -142,18 +142,12 @@ pushd "${BOSH_COMPILE_TARGET}/pve_cpi" >/dev/null
     -o "${BOSH_INSTALL_TARGET}/bin/pve-ops" \
     ./cmd/pve-ops
 
-  # pve-cid is the deprecated former name of pve-ops. It is a relative symlink
-  # to the same binary, and the binary prints a deprecation notice on stderr
-  # when it is run under the old name. Remove it in 0.13.0.
-  ln -sf pve-ops "${BOSH_INSTALL_TARGET}/bin/pve-cid"
-
 popd >/dev/null
 
 # Confirm each binary is a Linux ELF (sanity check on the host-fallback path).
 if command -v file >/dev/null 2>&1; then
-  for bin in cpi pve-ops pve-cid; do
-    # file -b does not follow symlinks; -L reports the binary behind pve-cid.
-    BIN_TYPE="$(file -L -b "${BOSH_INSTALL_TARGET}/bin/${bin}")"
+  for bin in cpi pve-ops; do
+    BIN_TYPE="$(file -b "${BOSH_INSTALL_TARGET}/bin/${bin}")"
     case "${BIN_TYPE}" in
       ELF*) ;;
       *)
@@ -166,4 +160,3 @@ fi
 
 echo "==> pve_cpi built at ${BOSH_INSTALL_TARGET}/bin/cpi"
 echo "==> pve-ops built at ${BOSH_INSTALL_TARGET}/bin/pve-ops"
-echo "==> pve-cid (deprecated alias) links to pve-ops"

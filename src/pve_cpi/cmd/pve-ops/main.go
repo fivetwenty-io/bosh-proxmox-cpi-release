@@ -132,7 +132,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/endpointcache"
 )
@@ -150,21 +149,7 @@ const (
 )
 
 func main() {
-	os.Exit(runAs(filepath.Base(os.Args[0]), os.Args[1:], os.Stdout, os.Stderr))
-}
-
-// deprecatedAliasName is the former name of this command. The package still
-// installs it as a symlink to pve-ops for one release.
-const deprecatedAliasName = "pve-cid"
-
-// runAs runs the CLI under the name it was invoked as. Under the deprecated
-// alias it prints one notice line to stderr before anything else, then runs
-// normally, so stdout and the exit codes stay the same.
-func runAs(prog string, args []string, stdout, stderr io.Writer) int {
-	if prog == deprecatedAliasName {
-		_, _ = fmt.Fprintln(stderr, deprecatedAliasName+" is deprecated and will be removed in 0.13.0; run pve-ops instead.")
-	}
-	return run(args, stdout, stderr)
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
 // run dispatches to the requested subcommand. Accepting args/stdout/stderr as

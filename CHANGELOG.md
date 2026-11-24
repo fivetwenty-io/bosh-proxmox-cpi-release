@@ -12,6 +12,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Removed
+
+- The package no longer installs `pve-cid`, the deprecated alias of `pve-ops`. The 0.12.0 notes said that 0.13.0 would remove it, but 0.13.0 still shipped it, so this release finishes the removal. A script that still calls `pve-cid` fails with "command not found" and should call `pve-ops` instead, which takes the same arguments and gives the same output.
+
 ## [0.13.0] - 2026-11-24
 
 ### Added
