@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-24
+
 ### Added
 
 - `set_vm_metadata` moves a VM off the node of an anti-affinity partner before it writes the rule that pairs them, so a parallel deploy that put two members on one node pays one live migration instead of two. PVE's CRM moves both members of such a pair in the same round when a third node is free. The CPI picks the target with the `create_vm` scorer among the free nodes the VM's pin prefers most, asks PVE HA to migrate the VM, and waits at most three minutes or `pve.ha.motion_wait_sec`, whichever is shorter. The call that writes the rule moves its own VM when the VM is one of the pair, and otherwise it moves the member of the pair that was created last. It moves only a member that no rule of its group holds yet and that was created less than an hour ago, and it leaves a VM with local storage, a PCI device, or a positive affinity rule to PVE. Siblings that join at once share the spread claim record, and each one reads the rules again after its turn, so only one member of each pair moves. While a move runs, every other call's plan of the group leaves the moving member out of the rules it writes and writes the rest of the layout, and the call that moves the member writes its rule once the move lands or its wait runs out. So a sibling never writes the pair while both members still share a node. A claim stops counting when its process ends or after at most 13 minutes, so a call that dies mid-move holds the member out only until then. With `pve.cluster_lock_mode` at `pool`, the mover reads the rules again under the HA rules lock, which closes the last window between a sibling's read of the claims and its write. A move that fails or runs out of time logs a warning, and the rule is written as before. The move's log lines name the call's VM as `vmid`, the VM that moves as `moving_vmid`, and the partner that stays as `partner_vmid`.
@@ -1503,7 +1505,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.3...v0.11.0
 [0.10.3]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.2...v0.10.3
