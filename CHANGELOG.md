@@ -16,6 +16,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - `docs/configuration.md` no longer says the CPI keeps no cache of the HA cluster profile. It now describes the 60-second profile cache that holds the slow-changing facts when discovery is on, and says that node health and the QDevice's status are always read live.
 
+- `docs/ha-and-resurrection.md` no longer says that `pve-ops` only reads the cluster. Only the doctor run without a write flag is read-only, and the page now says that a rebalance move, including the one an undrain runs, turns the moving VM's `failback` off while it runs.
+
 ## [0.12.0] - 2026-11-24
 
 ### Added
