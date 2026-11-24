@@ -681,12 +681,14 @@ func TestLockWait(t *testing.T) {
 
 	short, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	start := time.Now()
+	shortDeadline, _ := short.Deadline()
 	if l, err := p.WaitLock(short, root, "a.lock"); !errors.Is(err, context.DeadlineExceeded) || l != nil {
 		t.Fatalf("WaitLock on a held lock = %v, %v; want the deadline", l, err)
 	}
-	if waited := time.Since(start); waited < 40*time.Millisecond {
-		t.Fatalf("WaitLock returned after %v; want it to wait for the deadline", waited)
+	// Compare against the context's own deadline rather than a clock started
+	// after it, which would read short by the time between the two.
+	if early := time.Until(shortDeadline); early > 0 {
+		t.Fatalf("WaitLock returned %v before the deadline; want it to wait for the deadline", early)
 	}
 	done, stop := context.WithCancel(context.Background())
 	stop()

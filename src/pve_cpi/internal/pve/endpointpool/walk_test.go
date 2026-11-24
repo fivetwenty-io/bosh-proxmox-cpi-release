@@ -367,13 +367,15 @@ func TestWalkHungEntryHoldsAMutation(t *testing.T) {
 	p := l.pool(t, deadline, configured(a.Addr), configured(b.Addr))
 	ctx, cancel := context.WithTimeout(context.Background(), 4*deadline)
 	defer cancel()
-	start := time.Now()
+	callerDeadline, _ := ctx.Deadline()
 	_, err := send(t, ctx, p, http.MethodPost, a.Addr, "/nodes/pve1/qemu", "vmid=101")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want the caller's deadline", err)
 	}
-	if elapsed := time.Since(start); elapsed < 4*deadline {
-		t.Fatalf("the POST returned after %v, before the caller's deadline", elapsed)
+	// Compare against the context's own deadline rather than a clock started
+	// after it, which would read short by the time between the two.
+	if early := time.Until(callerDeadline); early > 0 {
+		t.Fatalf("the POST returned %v before the caller's deadline", early)
 	}
 	if n := pvetest.TotalMethod(http.MethodPost, a, b); n != 1 {
 		t.Fatalf("POSTs across servers = %d, want 1", n)
