@@ -234,7 +234,7 @@ func (p *aaPlanner) plan(set *ha.RuleSet) ([]ha.RuleOp, error) {
 	}
 	p.conflicts = nil
 	var out aapattern.Output
-	if p.removal {
+	if p.removal && !in.Pattern.Off {
 		p.stamp = ""
 		out = p.removalLayout(existing)
 	} else {
@@ -341,7 +341,28 @@ func (p *aaPlanner) prepare(set *ha.RuleSet) (map[string]*ha.Rule, aapattern.Inp
 	p.ruleHolds, p.resHolds, p.pendingHolds = nil, nil, nil
 	p.collectHolds(set, existing)
 	p.moving = p.movingMembers(existing)
-	return existing, p.layoutInput(set, existing), nil
+	in := p.layoutInput(set, existing)
+	if in.Pattern.Off {
+		in = p.dropHoldsForOff(in)
+	}
+	return existing, in, nil
+}
+
+// dropHoldsForOff forgets every hold of a group whose pattern is off and
+// returns in without the reserved places the holds added. The off pattern
+// writes no rule, so no index has a place to keep. With no hold left, the
+// plan clears each hold that a rule or member resource still records from
+// before the switch, restores a pin without waiting for a hold to lapse, and
+// keeps no rule for an in-flight removal. A delete in an opted-out group then
+// records no hold either. The holds count until the pattern is known,
+// because the newest-member vote that decides it leaves out the deleted
+// holders of live holds.
+func (p *aaPlanner) dropHoldsForOff(in aapattern.Input) aapattern.Input {
+	p.holds = map[int]*aaGroupHold{}
+	p.holdMemo = nil
+	p.deletedHolders = map[string]bool{}
+	in.Members = slices.DeleteFunc(slices.Clone(in.Members), func(m aapattern.Member) bool { return m.Reserved })
+	return in
 }
 
 // movingMembers returns the members that no rule of the group holds and that
