@@ -12,6 +12,22 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
 )
 
+// antiAffinityPartnersForCreate returns the partner nodes create_vm charges
+// for a create whose effective ha_anti_affinity pattern has the canonical
+// form pattern. A create whose pattern is off joins no rule of its group, so
+// it gets no partner charge, even while the group still records a hold from
+// its rules before the switch, and it keeps only the group spread (see
+// antiAffinityScorerGroup). Every other create reads its partners through
+// antiAffinityPartnerNodes.
+func antiAffinityPartnersForCreate(
+	ctx context.Context, deps Deps, env map[string]any, cp createVMCloudProps, pattern string,
+) map[string]int {
+	if pattern == aapattern.Off().Canonical() {
+		return nil
+	}
+	return antiAffinityPartnerNodes(ctx, deps, env, cp)
+}
+
 // antiAffinityPartnerNodes returns, by node, how many present members of the
 // VM's anti-affinity group the group's rules will keep apart from the VM once
 // its index is known, so placement can keep the VM off their nodes from the

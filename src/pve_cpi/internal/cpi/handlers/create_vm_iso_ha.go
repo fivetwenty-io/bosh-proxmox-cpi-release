@@ -27,9 +27,10 @@ const (
 //
 //   - DLB:            deps.Config.DLBEligibleForAZ (same predicate the step 10
 //     block in create_vm.go guards on).
-//   - Anti-affinity:  deps.Config.HAAntiAffinityRulesEnabled() and a
-//     non-empty sanitized instance-group name. The VM joins its group's
-//     rules later, at set_vm_metadata, through applyAntiAffinityMembership.
+//   - Anti-affinity:  deps.Config.HAAntiAffinityRulesEnabled(), a pattern
+//     other than off, and a non-empty sanitized instance-group name. The VM
+//     joins its group's rules later, at set_vm_metadata, through
+//     applyAntiAffinityMembership. A VM whose pattern is off joins no rule.
 //   - AZ node-affinity pin: deps.Config.HANodeAffinityPinEnabled() and a
 //     resolvable pin AZ with a non-empty node candidate set (mirrors
 //     applyAZNodeAffinityPin's early-return gates).
@@ -45,7 +46,7 @@ func haRegistrationFeatures(deps Deps, cp createVMCloudProps, node string, env m
 		out = append(out, haFeatureDLB)
 	}
 
-	if deps.Config.HAAntiAffinityRulesEnabled() && sanitizeTagValue(instanceGroupName(env)) != "" {
+	if deps.Config.HAAntiAffinityRulesEnabled() && !cp.antiAffinityOff && sanitizeTagValue(instanceGroupName(env)) != "" {
 		out = append(out, haFeatureAntiAffinity)
 	}
 

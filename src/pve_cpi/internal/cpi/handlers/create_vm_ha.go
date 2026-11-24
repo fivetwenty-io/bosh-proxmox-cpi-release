@@ -197,12 +197,15 @@ func createdVMResourceMarker(deps Deps, parsed *createVMParsedArgs, ident haIden
 
 // warnRequestedHAWithoutRegistration logs a warning when the operator set
 // anti_affinity or pin_az to on and the decision still gives the VM no HA,
-// because a rule needs a registered resource and none is written.
+// because a rule needs a registered resource and none is written. A VM whose
+// anti-affinity pattern is off asks for no anti-affinity rule, so
+// anti_affinity alone logs nothing for it.
 func warnRequestedHAWithoutRegistration(
 	deps Deps, parsed *createVMParsedArgs, d *ha.VMDecision, logger *log.Logger,
 ) {
 	var asked []string
-	if deps.Config.HAAntiAffinityValue() == config.HARuleOn && haIdentityFor(deps, parsed.env).Group != "" {
+	if deps.Config.HAAntiAffinityValue() == config.HARuleOn && !parsed.cloudProps.antiAffinityOff &&
+		haIdentityFor(deps, parsed.env).Group != "" {
 		asked = append(asked, "pve.ha.anti_affinity")
 	}
 	if deps.Config.HAPinAZValue() == config.HARuleOn {

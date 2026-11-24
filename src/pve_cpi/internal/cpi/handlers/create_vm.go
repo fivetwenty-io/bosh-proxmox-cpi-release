@@ -301,6 +301,14 @@ type createVMCloudProps struct {
 	// removed on a best-effort basis; if removal fails, a warning names the
 	// leftover subnet for operator cleanup.
 	AdvertisedRoutes []AdvertisedRoute `json:"advertised_routes,omitempty"`
+
+	// antiAffinityOff is set when the VM's effective ha_anti_affinity
+	// pattern is off, so the VM joins no anti-affinity rule of its group.
+	// It is not a cloud property of its own. create_vm sets it from the
+	// resolved pattern (see resolveCreateVMAntiAffinityPattern), so every
+	// check that reads the cloud properties, such as haRegistrationFeatures,
+	// leaves the anti-affinity rules out for the VM.
+	antiAffinityOff bool
 }
 
 // createVMNetworkSpec mirrors the BOSH v2 network spec shape.
@@ -618,7 +626,7 @@ func createVM(
 		return nil, err
 	}
 	warnIgnoredNodeKey(logger, parsed.cloudPropsMap)
-	if parsed.aaPattern, err = resolveAntiAffinityPattern(parsed.cloudPropsMap, deps.Config); err != nil {
+	if err := resolveCreateVMAntiAffinityPattern(parsed, deps.Config); err != nil {
 		return nil, err
 	}
 
@@ -740,8 +748,9 @@ func createVM(
 	// of a member whose delete left a hold. The Director names the index
 	// only at set_vm_metadata, so placement reads the group's live holds
 	// here and avoids the nodes of the members the recreate's rule will
-	// hold, which PVE would otherwise move it away from once it joins.
-	parsed.aaPartners = antiAffinityPartnerNodes(ctx, deps, parsed.env, parsed.cloudProps)
+	// hold, which PVE would otherwise move it away from once it joins. A
+	// create whose pattern is off joins no rule, so it reads no partners.
+	parsed.aaPartners = antiAffinityPartnersForCreate(ctx, deps, parsed.env, parsed.cloudProps, parsed.aaPattern)
 
 	selection, err := ResolveStoragePlacementSelectors(deps.Config, "create_vm", parsed.cloudPropsMap, parsed.cloudProps.EphemeralDiskSizeMB > 0)
 	if err != nil {

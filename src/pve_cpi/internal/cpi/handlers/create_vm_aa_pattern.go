@@ -12,6 +12,20 @@ import (
 // pattern of a VM's instance group.
 const haAntiAffinityCloudProp = "ha_anti_affinity"
 
+// resolveCreateVMAntiAffinityPattern resolves the create's effective
+// ha_anti_affinity pattern into parsed.aaPattern, and marks the cloud
+// properties when the pattern is off, so the checks that read them leave the
+// anti-affinity rules out for the VM.
+func resolveCreateVMAntiAffinityPattern(parsed *createVMParsedArgs, cfg *config.CPIConfig) error {
+	p, err := resolveAntiAffinityPattern(parsed.cloudPropsMap, cfg)
+	if err != nil {
+		return err
+	}
+	parsed.aaPattern = p
+	parsed.cloudProps.antiAffinityOff = p == aapattern.Off().Canonical()
+	return nil
+}
+
 // resolveAntiAffinityPattern reads the ha_anti_affinity cloud property from
 // the call's cloud_properties, then the disk_type profile, then the vm_type
 // profile, and returns the effective pattern's canonical form. When no layer
