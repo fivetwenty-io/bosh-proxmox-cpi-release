@@ -51,7 +51,11 @@ type AntiAffinityGroupCheck struct {
 	Group      string `json:"group"`
 	// Pattern is the canonical form of the pattern the plan used, and
 	// PatternRecorded says a member's create named it through
-	// ha_anti_affinity, so no default pattern played a part.
+	// ha_anti_affinity, so no default pattern played a part. A group whose
+	// pattern is off has opted out of the rules, so its plan deletes every
+	// rule of the group and its LapsedHolds list every hold still recorded,
+	// and the check judges no layout, so Problem, ForeignRule, and Full stay
+	// empty for it.
 	Pattern         string `json:"pattern"`
 	PatternRecorded bool   `json:"pattern_recorded,omitempty"`
 	Members         int    `json:"members"`
@@ -231,18 +235,23 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 	c.Trimmed = slices.Clone(p.lastOut.Trimmed)
 	c.BlocksDrain = p.lastOut.Unsafe
 	c.Layout = p.lastOut.Rules
-	if reason := confinedLayoutRule(set, ident.Owner, p.lastIn, p.lastOut); reason != "" {
-		c.Problem, c.OtherEntry = reason, true
-		return c
-	}
-	if reason := crossDomainRule(set, ident, p.lastIn); reason != "" {
-		c.Problem, c.OtherEntry = reason, true
-		return c
-	}
-	rewritten := p.rewrittenRules(ops)
-	c.ForeignRule = foreignNamedRule(set, ident, p.lastIn, rewritten)
-	if c.ForeignRule == "" {
-		c.ForeignRule = otherEntryRule(in.Config, set, ident, p.lastIn, p.lastOut, rewritten, c.LapsedHolds)
+	// An opted-out group's plan deletes every rule of the group, whatever
+	// entry or layout wrote it, so the checks that judge a layout against
+	// the rules have nothing to judge.
+	if !p.lastIn.Pattern.Off {
+		if reason := confinedLayoutRule(set, ident.Owner, p.lastIn, p.lastOut); reason != "" {
+			c.Problem, c.OtherEntry = reason, true
+			return c
+		}
+		if reason := crossDomainRule(set, ident, p.lastIn); reason != "" {
+			c.Problem, c.OtherEntry = reason, true
+			return c
+		}
+		rewritten := p.rewrittenRules(ops)
+		c.ForeignRule = foreignNamedRule(set, ident, p.lastIn, rewritten)
+		if c.ForeignRule == "" {
+			c.ForeignRule = otherEntryRule(in.Config, set, ident, p.lastIn, p.lastOut, rewritten, c.LapsedHolds)
+		}
 	}
 	for i := range ops {
 		switch id := ops[i].Rule.ID; {
@@ -269,7 +278,9 @@ func checkAntiAffinityGroup(in AntiAffinityCheckInput, set *ha.RuleSet, ident ha
 			SID: r.SID, Pin: r.Pin, Action: r.Action.String(), Nodes: r.Nodes, Reason: r.Reason, Deferred: r.Deferred,
 		})
 	}
-	c.Full = fullGroupRules(set, ident, p.lastIn)
+	if !p.lastIn.Pattern.Off {
+		c.Full = fullGroupRules(set, ident, p.lastIn)
+	}
 	return c
 }
 

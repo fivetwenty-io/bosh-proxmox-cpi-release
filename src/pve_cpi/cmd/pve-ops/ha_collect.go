@@ -1100,6 +1100,10 @@ func (c *haCollector) layoutFindings(chk handlers.AntiAffinityGroupCheck) {
 		c.unplannedFinding(chk.Rule, chk.ForeignRule, true)
 		return
 	}
+	if chk.Pattern == aapattern.Off().Canonical() {
+		c.groupOffFinding(chk)
+		return
+	}
 	if len(chk.Trimmed) > 0 {
 		c.rep.advise(haKindAAPatternTrimmed, chk.Rule,
 			"the pattern %s of group %s asks for rules %s, which the CPI leaves out, because each would leave a "+
@@ -1139,6 +1143,30 @@ func (c *haCollector) layoutFindings(chk handlers.AntiAffinityGroupCheck) {
 				"of a member writes, or pve-ops ha --fix-anti-affinity --apply now: %s",
 			chk.Group, strings.Join(chk.Drift, "; "))
 	}
+}
+
+// groupOffFinding reports what is left of a group that opted out of the
+// anti-affinity rules with the pattern off. Its plan deletes every rule of the
+// group and keeps no hold, so the rules and holds still recorded from before
+// the switch get one advice, which names each write that removes them, and
+// a group with nothing left gets none. A pin restore is reported as for any
+// group.
+func (c *haCollector) groupOffFinding(chk handlers.AntiAffinityGroupCheck) {
+	for _, r := range chk.PinRestores {
+		c.pinRestoreFinding(chk, r)
+	}
+	left := slices.Clone(chk.Drift)
+	for _, h := range chk.LapsedHolds {
+		left = append(left, fmt.Sprintf("drop the hold of index %d from %s", h.Index, strings.Join(h.Carriers, ", ")))
+	}
+	if len(left) == 0 {
+		return
+	}
+	c.rep.advise(haKindAAGroupOff, chk.Rule,
+		"group %s has opted out of the anti-affinity rules with the pattern off, and it still has rules or holds "+
+			"from before the switch, which the next set_vm_metadata or delete_vm of a member removes, or "+
+			"pve-ops ha --fix-anti-affinity --apply now: %s",
+		chk.Group, strings.Join(left, "; "))
 }
 
 // unplannedFinding reports a group whose rules could not be planned, with the

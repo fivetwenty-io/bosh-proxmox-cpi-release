@@ -37,6 +37,7 @@ const (
 	haKindAALayoutDrift         = "aa_layout_drift"
 	haKindAAHoldLapsed          = "aa_hold_lapsed"
 	haKindAAPinRestore          = "aa_pin_restore"
+	haKindAAGroupOff            = "aa_group_off"
 	haKindCPUUnknown            = "cpu_unknown"
 	haKindCPUHostMulti          = "cpu_host_multi_domain"
 	haKindCPUPinCrossesDomain   = "cpu_pin_crosses_domain"
