@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-24
+
 ### Added
 
 - The `ha_anti_affinity` cloud property, the `pve.ha.anti_affinity_pattern` job property, and the `pve_ha` block of a cpi-config entry now accept `off`, which turns off the HA anti-affinity rules for a group. YAML reads an unquoted `off` as `false`, and the CPI takes `false` to mean `off` too, while `true` fails the render and the create. The string `block` is now short for the default block pattern. A deployment can default to no rules and opt single vm_types back in with a pattern such as `{block: {}}`. The CPI deletes an opted-out group's existing rules and clears its holds at the group's next create, delete, or doctor fix, because the group follows the pattern its newest member recorded. A create in the group also takes all of the group's members out of the unmarked rule that an older CPI wrote for it.
@@ -1521,7 +1523,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.10.3...v0.11.0
