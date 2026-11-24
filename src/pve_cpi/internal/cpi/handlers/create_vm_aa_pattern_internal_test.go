@@ -67,8 +67,8 @@ func TestResolveAntiAffinityPattern_RecordsTheConfigDefault(t *testing.T) {
 
 func TestResolveAntiAffinityPattern_RefusesABadValue(t *testing.T) {
 	t.Parallel()
-	for _, raw := range []string{`{"ha_anti_affinity": "block"}`, `{"ha_anti_affinity": {"stride": 1}}`,
-		`{"ha_anti_affinity": {"strde": 2}}`} {
+	for _, raw := range []string{`{"ha_anti_affinity": "stride"}`, `{"ha_anti_affinity": true}`,
+		`{"ha_anti_affinity": {"stride": 1}}`, `{"ha_anti_affinity": {"strde": 2}}`} {
 		var cp map[string]any
 		if err := json.Unmarshal([]byte(raw), &cp); err != nil {
 			t.Fatal(err)
