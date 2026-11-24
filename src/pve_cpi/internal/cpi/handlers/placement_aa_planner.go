@@ -343,26 +343,24 @@ func (p *aaPlanner) prepare(set *ha.RuleSet) (map[string]*ha.Rule, aapattern.Inp
 	p.moving = p.movingMembers(existing)
 	in := p.layoutInput(set, existing)
 	if in.Pattern.Off {
-		in = p.dropHoldsForOff(in)
+		p.dropHoldsForOff()
 	}
 	return existing, in, nil
 }
 
-// dropHoldsForOff forgets every hold of a group whose pattern is off and
-// returns in without the reserved places the holds added. The off pattern
-// writes no rule, so no index has a place to keep. With no hold left, the
-// plan clears each hold that a rule or member resource still records from
-// before the switch, restores a pin without waiting for a hold to lapse, and
-// keeps no rule for an in-flight removal. A delete in an opted-out group then
+// dropHoldsForOff forgets every hold of a group whose pattern is off. The off
+// pattern writes no rule, so no index has a place to keep, and layoutInput
+// placed no hold for it. With no hold left, the plan clears each hold that a
+// rule or member resource still records from before the switch, restores a
+// pin without waiting for a hold to lapse, and keeps no rule for an in-flight
+// removal. A delete in an opted-out group then
 // records no hold either. The holds count until the pattern is known,
 // because the newest-member vote that decides it leaves out the deleted
 // holders of live holds.
-func (p *aaPlanner) dropHoldsForOff(in aapattern.Input) aapattern.Input {
+func (p *aaPlanner) dropHoldsForOff() {
 	p.holds = map[int]*aaGroupHold{}
 	p.holdMemo = nil
 	p.deletedHolders = map[string]bool{}
-	in.Members = slices.DeleteFunc(slices.Clone(in.Members), func(m aapattern.Member) bool { return m.Reserved })
-	return in
 }
 
 // movingMembers returns the members that no rule of the group holds and that
@@ -582,10 +580,16 @@ func (p *aaPlanner) layoutInput(set *ha.RuleSet, existing map[string]*ha.Rule) a
 		domainKeys[m.Domain] = true
 		newest.consider(k, p.markerOf(k))
 	}
-	members = p.placeHolds(members, held, keys, existing, rules, domainKeys)
+	// A group whose pattern is off writes no rule, so it places no hold, and
+	// a member that waits on a hold's index is not left out of the layout.
+	// The pin restores and the moving members read the layout's members.
+	pattern := p.groupPattern(newest, existing)
+	if !pattern.Off {
+		members = p.placeHolds(members, held, keys, existing, rules, domainKeys)
+	}
 	return aapattern.Input{
 		Base:    p.ident.ruleName(),
-		Pattern: p.groupPattern(newest, existing),
+		Pattern: pattern,
 		Split:   p.split,
 		Domains: p.topo.domains(domainKeys),
 		Members: members,
