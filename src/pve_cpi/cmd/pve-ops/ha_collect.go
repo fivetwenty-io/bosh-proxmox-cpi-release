@@ -1219,14 +1219,24 @@ func (c *haCollector) groupRules(tag string) []*ha.Rule {
 
 // checkGroup judges one group against its rules and the cluster's node count.
 // A rule holds at most one member fewer than the cluster's nodes, so a group
-// with more members than that overflows its first rule.
+// with more members than that overflows its first rule. The layout check
+// plans every group that a marker names, so a group judged here has no
+// member whose HA resource the doctor read records the pattern it was
+// created with. A group whose default pattern is off asks for no rule, so it
+// gets no finding here, and the doctor can't tell a group that opted out
+// through its ha_anti_affinity cloud property alone, which the advice says.
 func (c *haCollector) checkGroup(tag string, members []*haGuest, rules []*ha.Rule) {
+	if c.groupDefault(tag).Off {
+		return
+	}
 	nodes := len(c.p.Nodes)
 	if room := nodes - 1; nodes > 0 && len(members) > room {
 		if len(rules) == 0 {
 			c.rep.advise(haKindAntiAffinitySkipped, tag,
 				"the group has %d members but a rule holds at most %d on the cluster's %d nodes, and the group "+
-					"has no rule", len(members), room, nodes)
+					"has no rule; a group that opted out with the pattern off in its ha_anti_affinity cloud "+
+					"property needs none, but the doctor can't tell whether this one did, because no HA resource "+
+					"it read records the group's pattern", len(members), room, nodes)
 		} else {
 			text := fmt.Sprintf("the group has %d members but a rule holds at most %d on the cluster's %d nodes, "+
 				"so it is split across %d rules", len(members), room, nodes, len(rules))
@@ -1254,6 +1264,16 @@ func (c *haCollector) checkGroup(tag string, members []*haGuest, rules []*ha.Rul
 				"pve-ops ha --fix-anti-affinity --apply adds it",
 			strings.Join(missing, ", "))
 	}
+}
+
+// groupDefault returns the default pattern of the group whose tag is tag: the
+// one its owning cpi-config entries agree on, or the run's
+// pve.ha.anti_affinity_pattern.
+func (c *haCollector) groupDefault(tag string) aapattern.Pattern {
+	if p, ok := c.aaDefaults[tag]; ok {
+		return p
+	}
+	return c.cfg.HAAntiAffinityPatternValue()
 }
 
 // namedByAny reports whether any of the rules names sid.

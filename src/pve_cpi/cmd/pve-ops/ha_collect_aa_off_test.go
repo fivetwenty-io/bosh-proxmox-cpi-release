@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/aapattern"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // TestCollectAntiAffinityOffGroupWithLeftoverRules pins that a group whose
@@ -64,4 +66,41 @@ func TestCollectAntiAffinityOwnersThatDisagreeOnOff(t *testing.T) {
 	r := collectHAScoped(context.Background(), f, cfg, "", haNow, sc)
 	want(t, r, haKindAntiAffinityAmbiguous, haSeverityAdvice, g.rule, "az2, az2-off", "block", "az2-off off")
 	wantNone(t, r, haKindAAGroupOff, haKindAALayoutDrift, haKindAARuleFull)
+}
+
+// TestCollectAntiAffinityOffDefaultGroupThatNoMarkerNames pins that a group
+// the layout check can't plan, because no HA resource or rule marker names
+// it, gets no aa_skipped, aa_split, or aa_short finding when the run's
+// default pattern is off, because an opted-out group asks for no rule. Under
+// the block default the aa_skipped advice says that the doctor can't tell
+// whether the group opted out.
+func TestCollectAntiAffinityOffDefaultGroupThatNoMarkerNames(t *testing.T) {
+	t.Parallel()
+	group := "bosh-aa-0123456789ab"
+	f := haBaseFake()
+	f.guests = nil
+	f.resources = nil
+	for i := 0; i < 4; i++ {
+		id := 200 + i
+		f.guests = append(f.guests, pve.GuestRef{VMID: id, Node: "n" + itoa(i%3+1), Tags: "bosh-cpi;" + group})
+		f.memory[id] = haGiB
+	}
+	off := haCfgWith("auto", "none", `,"anti_affinity_pattern":"off"`, `,"placement":{"anti_affinity":{"enabled":true}}`)
+	wantNone(t, runCollect(t, f, off), haKindAntiAffinitySkipped, haKindAntiAffinitySplit, haKindAntiAffinityShort)
+	want(t, runCollect(t, f, haCfg("auto", "none")), haKindAntiAffinitySkipped, haSeverityAdvice, group, "no rule",
+		"pattern off")
+
+	f.rules = []ha.Rule{
+		{ID: group, Type: "resource-affinity", Affinity: "negative", Comment: haMarker,
+			Resources: []string{"vm:200", "vm:201", "vm:202"}},
+		{ID: group + "-2", Type: "resource-affinity", Affinity: "negative", Comment: haMarker,
+			Resources: []string{"vm:203"}},
+	}
+	wantNone(t, runCollect(t, f, off), haKindAntiAffinitySkipped, haKindAntiAffinitySplit, haKindAntiAffinityShort)
+
+	f.guests = f.guests[:2]
+	f.resources = []HAResourceRow{{SID: "vm:200", State: "started"}, {SID: "vm:201", State: "started"}}
+	f.rules = []ha.Rule{{ID: group, Type: "resource-affinity", Affinity: "negative", Comment: haMarker,
+		Resources: []string{"vm:200"}}}
+	wantNone(t, runCollect(t, f, off), haKindAntiAffinityShort)
 }
