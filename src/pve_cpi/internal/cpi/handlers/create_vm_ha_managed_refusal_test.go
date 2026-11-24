@@ -77,7 +77,9 @@ func (r *managedRefusalRig) wantNothingCreated(t *testing.T) {
 // prerequisite, so the CPI may not write HA state there.
 func refusingProfile() *ha.Profile {
 	gaps := []string{
-		"2 configured votes do not survive the loss of one node",
+		"2 configured votes fall short of the CPI's HA rule, which needs a majority of them to remain after " +
+			"any one node fails and does not count corosync's two_node flag, because 2 minus the 1 vote of pve " +
+			"leaves 1, which is not a majority of 2 (2 from the nodelist, QDevice no)",
 		"missing Sys.Console on /",
 	}
 	return &ha.Profile{

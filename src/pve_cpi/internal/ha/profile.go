@@ -559,10 +559,26 @@ func (p *Profile) gateSurvival() {
 	case !q.Known:
 		p.addGap("cannot prove the configured votes survive the loss of one node: " + q.UnknownReason)
 	case !q.SurvivesOne:
-		p.addGap(fmt.Sprintf("%d configured votes do not survive the loss of one node "+
-			"(%d expected votes, %d remain if %s fails, and quorum needs more than %d; QDevice %s)",
-			q.Expected, q.Expected, q.RemainingAfterLoss, q.HeaviestNode, q.Expected/2, p.qdeviceWord()))
+		p.addGap(survivalGap(q, p.QDevice, p.qdeviceWord()))
 	}
+}
+
+// survivalGap states the CPI's own survival rule and the arithmetic that fails
+// it. The rule counts the configured votes of the corosync nodelist and the
+// QDevice, with every node present, so the text holds whatever corosync's
+// quorum flags say and whether a node is already down. It never claims what
+// corosync's live quorum needs, because two_node and a node that is already
+// gone both change that and neither changes the CPI's rule.
+func survivalGap(q Quorum, qd QDevice, qdeviceWord string) string {
+	votes := "votes"
+	if q.HeaviestVotes == 1 {
+		votes = "vote"
+	}
+	return fmt.Sprintf("%d configured votes fall short of the CPI's HA rule, which needs a majority of them to "+
+		"remain after any one node fails and does not count corosync's two_node flag, because %d minus the %d %s "+
+		"of %s leaves %d, which is not a majority of %d (%d from the nodelist, QDevice %s)",
+		q.Expected, q.Expected, q.HeaviestVotes, votes, q.HeaviestNode, q.RemainingAfterLoss, q.Expected,
+		q.Expected-qd.configuredVotes(), qdeviceWord)
 }
 
 func (p *Profile) gateVersion() {

@@ -61,12 +61,12 @@ func TestResolveDecisionTable(t *testing.T) {
 			wantReason: "no CRM master",
 		},
 		{
-			name: "configured votes do not survive one node",
+			name: "configured votes fall short of the survival rule",
 			build: func() *world {
 				w := nNodes(2)
 				return w
 			},
-			wantReason: "2 configured votes do not survive the loss of one node",
+			wantReason: "2 configured votes fall short of the CPI's HA rule",
 		},
 		{
 			name: "PVE below the floor",
@@ -128,13 +128,13 @@ func TestResolveDecisionTable(t *testing.T) {
 	}
 }
 
-func TestManagedErrorNamesExpectedVotesAndQDevice(t *testing.T) {
+func TestManagedErrorNamesVoteCountsAndQDevice(t *testing.T) {
 	p := resolve(t, nNodes(2), cfgMode(config.HAModeManaged))
 	err := p.PrerequisiteError()
 	if err == nil {
 		t.Fatal("managed on a two-node cluster without a QDevice must fail")
 	}
-	for _, want := range []string{"expected votes", "QDevice no"} {
+	for _, want := range []string{"2 configured votes", "2 minus the 1 vote of pve1 leaves 1", "QDevice no"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q lacks %q", err, want)
 		}
@@ -178,7 +178,7 @@ func TestProbeWhenOffReportsGapsButStaysOff(t *testing.T) {
 	if p.Effective != ha.EffectiveOff || p.Reason != "" || p.WritesAllowed() {
 		t.Fatalf("off must stay off: %+v", p)
 	}
-	if len(p.Gaps) == 0 || !strings.Contains(p.Gaps[0], "do not survive") {
+	if len(p.Gaps) == 0 || !strings.Contains(p.Gaps[0], "fall short of the CPI's HA rule") {
 		t.Fatalf("the doctor needs the gaps even in off mode: %v", p.Gaps)
 	}
 	if p.PrerequisiteError() != nil {
@@ -224,7 +224,7 @@ func TestQuorumScenarios(t *testing.T) {
 		{
 			name: "two nodes without a QDevice", build: func() *world { return nNodes(2) },
 			survives: false, known: true, expected: 2, participating: 2, fragile: []string{"pve1", "pve2"},
-			qdevice: ha.QDeviceNone, gap: "2 configured votes do not survive",
+			qdevice: ha.QDeviceNone, gap: "2 configured votes fall short of the CPI's HA rule",
 		},
 		{
 			name: "two nodes with a connected QDevice",
@@ -263,7 +263,7 @@ func TestQuorumScenarios(t *testing.T) {
 				return w
 			},
 			survives: false, known: true, expected: 2, participating: 2, fragile: []string{"pve1", "pve2"},
-			qdevice: ha.QDeviceUnknown, gap: "do not survive",
+			qdevice: ha.QDeviceUnknown, gap: "(2 from the nodelist, QDevice unknown)",
 		},
 		{
 			name: "three nodes where one carries two votes",
@@ -273,7 +273,7 @@ func TestQuorumScenarios(t *testing.T) {
 				return w
 			},
 			survives: false, known: true, expected: 4, participating: 4, fragile: []string{"pve1"},
-			qdevice: ha.QDeviceNone, gap: "4 configured votes do not survive",
+			qdevice: ha.QDeviceNone, gap: "4 minus the 2 votes of pve1 leaves 2, which is not a majority of 4",
 		},
 		{
 			name: "three nodes with one node down",
@@ -465,7 +465,7 @@ func TestQDeviceRecommendationNeverChangesTheMode(t *testing.T) {
 	if two.Advice == "" || two.Effective != ha.EffectiveObserveOnly || len(two.Gaps) != 1 {
 		t.Fatalf("two nodes: advice=%q effective=%s gaps=%v", two.Advice, two.Effective, two.Gaps)
 	}
-	if !strings.Contains(two.Gaps[0], "do not survive the loss of one node") {
+	if !strings.Contains(two.Gaps[0], "fall short of the CPI's HA rule") {
 		t.Fatalf("the only gap must be the quorum reason, got %q", two.Gaps[0])
 	}
 }
@@ -1041,7 +1041,7 @@ func TestLogLineCarriesReasonAndAdvice(t *testing.T) {
 	}
 	p = resolve(t, nNodes(2), cfgMode(config.HAModeAuto))
 	line := p.LogLine()
-	if !strings.Contains(line, "effective=observe-only reason=2 configured votes do not survive the loss of one node") ||
+	if !strings.Contains(line, "effective=observe-only reason=2 configured votes fall short of the CPI's HA rule") ||
 		!strings.Contains(line, "survives_one=no") || !strings.HasSuffix(line, "advice=add-qdevice(2 voting nodes can split evenly)") {
 		t.Fatalf("line = %s", line)
 	}
@@ -1412,5 +1412,39 @@ func TestProfileHealthCarriesTheNotesMarker(t *testing.T) {
 	if p := resolve(t, quiet, cfg); quiet.nodesAP.calls["config"] != 0 {
 		t.Fatalf("Deps without maintenance tags read %d node configs, want 0 (profile %s)",
 			quiet.nodesAP.calls["config"], p.Effective)
+	}
+}
+
+// TestSurvivalGapStatesTheCPIRule checks the survival gap of a two-node
+// cluster, with both nodes up and with one already down. The text states the
+// CPI's own rule and the configured arithmetic, so it stays true when a node
+// is gone and when corosync's two_node flag lowers the live quorum, and it
+// never claims what the live quorum needs or what remains after a failure.
+func TestSurvivalGapStatesTheCPIRule(t *testing.T) {
+	want := "2 configured votes fall short of the CPI's HA rule, which needs a majority of them to remain after " +
+		"any one node fails and does not count corosync's two_node flag, because 2 minus the 1 vote of pve1 " +
+		"leaves 1, which is not a majority of 2 (2 from the nodelist, QDevice no)"
+	for name, build := range map[string]func() *world{
+		"both nodes up": func() *world { return nNodes(2) },
+		"pve2 already down": func() *world {
+			w := nNodes(2)
+			w.nodes[1].online = false
+			return w
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := resolve(t, build(), cfgMode(config.HAModeManaged))
+			if len(p.Gaps) == 0 || p.Gaps[0] != want {
+				t.Fatalf("gaps = %q, want the first to be %q", p.Gaps, want)
+			}
+			for _, claim := range []string{"quorum needs", "remain if", "expected votes"} {
+				if strings.Contains(p.Gaps[0], claim) {
+					t.Fatalf("gap %q still says %q", p.Gaps[0], claim)
+				}
+			}
+			if err := p.PrerequisiteError(); err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("PrerequisiteError = %v, want it to carry %q", err, want)
+			}
+		})
 	}
 }
