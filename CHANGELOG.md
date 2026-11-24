@@ -12,6 +12,16 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Added
+
+- The `ha_anti_affinity` cloud property, the `pve.ha.anti_affinity_pattern` job property, and the `pve_ha` block of a cpi-config entry now accept `off`, which turns off the HA anti-affinity rules for a group. YAML reads an unquoted `off` as `false`, and the CPI takes `false` to mean `off` too, while `true` fails the render and the create. The string `block` is now short for the default block pattern. A deployment can default to no rules and opt single vm_types back in with a pattern such as `{block: {}}`. The CPI deletes an opted-out group's existing rules and clears its holds at the group's next create, delete, or doctor fix, because the group follows the pattern its newest member recorded.
+
+- A VM in an opted-out group still gets the 5-point placement spread across nodes, but it no longer gets the 100-point charge for nodes that hold its rule partners, and it no longer logs a warning about missing rules under `pve.ha.anti_affinity: on`.
+
+- `pve-ops ha` reports the new advice `aa_group_off` for an opted-out group that still has rules or holds, and it shows the group's pattern as `off`.
+
+- Releases before this one do not know `off`. A downgrade puts the rules back at each group's next write, and a config that sets `off` fails to load on an older release, so remove the `off` values before a downgrade and use the `pve-ops` that matches the CPI.
+
 ### Fixed
 
 - `docs/configuration.md` no longer says the CPI keeps no cache of the HA cluster profile. It now describes the 60-second profile cache that holds the slow-changing facts when discovery is on, and says that node health and the QDevice's status are always read live.
