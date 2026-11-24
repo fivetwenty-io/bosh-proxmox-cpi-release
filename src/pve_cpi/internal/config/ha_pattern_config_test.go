@@ -83,7 +83,7 @@ func TestHAConfig_PatternRejectsBadShapes(t *testing.T) {
 		`{"stride":1}`:                "from 2 to 64",
 		`{"strde":2}`:                 "unknown anti-affinity pattern key",
 		`{"block":{"size":1}}`:        "at least 2",
-		`"block"`:                     "must be a map or a list",
+		`"stride"`:                    "not one the CPI knows",
 		`{"sets":[[0,0]]}`:            "twice",
 		`{"window":2,"drain_safe":1}`: "boolean",
 	}

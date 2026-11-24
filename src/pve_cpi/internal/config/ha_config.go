@@ -166,7 +166,8 @@ type HAPattern struct {
 
 // UnmarshalJSON reads the pattern and names the key in any error. An empty
 // list or map, which an ops file leaves when it clears the key, reads as a
-// pattern with no terms, and the config treats that as unset.
+// pattern with no terms, and the config treats that as unset. The string
+// "off" and the boolean false read as the off pattern, which is set.
 func (p *HAPattern) UnmarshalJSON(raw []byte) error {
 	if emptyJSONContainer(raw) {
 		p.Pattern = aapattern.Pattern{}
@@ -196,10 +197,11 @@ func emptyJSONContainer(raw []byte) bool {
 	return false
 }
 
-// setHAPattern returns p when it names at least one term, and nil when it is
-// nil or empty, so an empty value reads as unset everywhere.
+// setHAPattern returns p when it names at least one term or is the off
+// pattern, and nil when it is nil or empty, so an empty value reads as unset
+// everywhere and off reads as set.
 func setHAPattern(p *HAPattern) *HAPattern {
-	if p == nil || len(p.Terms) == 0 {
+	if p == nil || len(p.Terms) == 0 && !p.Off {
 		return nil
 	}
 	return p
@@ -312,7 +314,8 @@ func (c *CPIConfig) HAAntiAffinityOverflowValue() string {
 
 // HAAntiAffinityPatternValue returns the effective
 // pve.ha.anti_affinity_pattern, or the built-in block pattern when the key is
-// unset. The result shares nothing with the config.
+// unset. A key set to off returns the off pattern. The result shares nothing
+// with the config.
 func (c *CPIConfig) HAAntiAffinityPatternValue() aapattern.Pattern {
 	if p := setHAPattern(c.haBlock().AntiAffinityPattern); p != nil {
 		return p.Clone().OrDefault()
