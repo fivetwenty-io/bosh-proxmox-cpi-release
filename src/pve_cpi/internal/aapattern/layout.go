@@ -196,6 +196,11 @@ func Layout(in Input) Output {
 // settle makes the plan Layout returns, with the reserved places of members
 // still in its rules.
 func settle(in Input) Output {
+	if in.Pattern.Off {
+		// The off pattern asks for no rule, so a group that records it
+		// keeps none and holds no place.
+		return Output{Rules: map[string][]string{}}
+	}
 	open, waiting := openIndexes(in)
 	if len(waiting) > 0 {
 		in.Members = slices.Clone(in.Members)

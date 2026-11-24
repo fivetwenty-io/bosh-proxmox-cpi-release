@@ -60,7 +60,7 @@ func TestDecode_RefusesBadShapes(t *testing.T) {
 		raw  string
 		want string
 	}{
-		{`"block"`, "must be a map or a list"},
+		{`7`, "must be off, block, a map, or a list"},
 		{`[]`, "at least one term"},
 		{`{}`, "must name one of"},
 		{`{"drain_safe": false}`, "must name one of"},

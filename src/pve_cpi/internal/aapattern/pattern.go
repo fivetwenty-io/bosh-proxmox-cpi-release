@@ -4,7 +4,8 @@
 //
 // A pattern is a list of terms. Each term names a kind, which is block,
 // stride, window, or sets, and two members are kept apart when any term says
-// so. The package decodes a pattern from the JSON or YAML value an operator
+// so. The off pattern names no term and asks for no rule at all, so a group
+// that records it opts out of the anti-affinity rules. The package decodes a pattern from the JSON or YAML value an operator
 // writes, checks its shape, renders it in the short canonical form the CPI
 // records in an HA resource's comment, and parses that form back. It has no
 // dependency on the rest of the CPI, so the config parser, the handlers, and
@@ -76,6 +77,9 @@ type Term struct {
 // Pattern is an operator's anti-affinity pattern. The zero value has no terms
 // and means the default, a single block term.
 type Pattern struct {
+	// Off is true for the off pattern, which asks for no rule. It holds no
+	// terms and keeps drain safety, because it writes nothing to drain.
+	Off   bool
 	Terms []Term
 	// Unsafe is true when the operator set drain_safe to false, which lets
 	// the pattern's rules give a member more partners than a drain can
@@ -89,14 +93,27 @@ func Default() Pattern {
 	return Pattern{Terms: []Term{{Kind: KindBlock}}}
 }
 
-// IsZero reports whether p names no term.
-func (p Pattern) IsZero() bool {
-	return len(p.Terms) == 0 && !p.Unsafe
+// Off returns the off pattern, which asks for no anti-affinity rule.
+func Off() Pattern {
+	return Pattern{Off: true}
 }
 
-// OrDefault returns p, or the default pattern when p names no term.
+// offWord and blockWord are the two patterns an operator may write as a bare
+// string. Every other pattern needs the map or list form.
+const (
+	offWord   = "off"
+	blockWord = string(KindBlock)
+)
+
+// IsZero reports whether p names no term and is not the off pattern.
+func (p Pattern) IsZero() bool {
+	return len(p.Terms) == 0 && !p.Unsafe && !p.Off
+}
+
+// OrDefault returns p, or the default pattern when p names no term. The off
+// pattern stays off.
 func (p Pattern) OrDefault() Pattern {
-	if len(p.Terms) == 0 {
+	if len(p.Terms) == 0 && !p.Off {
 		return Pattern{Terms: Default().Terms, Unsafe: p.Unsafe}
 	}
 	return p
@@ -105,7 +122,7 @@ func (p Pattern) OrDefault() Pattern {
 // Clone returns a deep copy of p, so a caller can hand it on without sharing
 // its terms or sets.
 func (p Pattern) Clone() Pattern {
-	out := Pattern{Unsafe: p.Unsafe}
+	out := Pattern{Off: p.Off, Unsafe: p.Unsafe}
 	if p.Terms == nil {
 		return out
 	}
@@ -133,21 +150,39 @@ func (p Pattern) HasKind(k Kind) bool {
 }
 
 // IsDefaultBlock reports whether p is a single block term of the default
-// size that keeps drain safety.
+// size that keeps drain safety. The off pattern is not.
 func (p Pattern) IsDefaultBlock() bool {
 	p = p.OrDefault()
-	return len(p.Terms) == 1 && p.Terms[0].Kind == KindBlock && p.Terms[0].Size == 0 && !p.Unsafe
+	return !p.Off && len(p.Terms) == 1 && p.Terms[0].Kind == KindBlock && p.Terms[0].Size == 0 && !p.Unsafe
 }
 
 // Decode reads a pattern from the value an operator wrote, as the JSON
 // decoder hands it over. A pattern is a map with one of block, stride,
 // window, or sets and an optional drain_safe, or a list of up to MaxTerms
-// such maps. A nil value is an error, because a caller that meant "not set"
+// such maps. The string "off" and the boolean false, which is what YAML 1.1
+// makes of an unquoted off, are the off pattern, and the string "block" is
+// the default block. The boolean true is an error, because it names no
+// pattern. A nil value is an error, because a caller that meant "not set"
 // does not call Decode.
 func Decode(v any) (Pattern, error) {
 	var p Pattern
 	var drainSafe *bool
 	switch x := v.(type) {
+	case bool:
+		if x {
+			return Pattern{}, errors.New("the anti-affinity pattern true names no pattern; write off to turn " +
+				"off the anti-affinity rules, or block or a map such as {block: {size: 2}} to name a pattern")
+		}
+		return Off(), nil
+	case string:
+		switch x {
+		case offWord:
+			return Off(), nil
+		case blockWord:
+			return Default(), nil
+		}
+		return Pattern{}, fmt.Errorf("the anti-affinity pattern %q is not one the CPI knows; the only strings are "+
+			"off and block, and every other pattern is a map or a list of maps", x)
 	case map[string]any:
 		t, ds, err := decodeTerm(x, "")
 		if err != nil {
@@ -184,8 +219,8 @@ func Decode(v any) (Pattern, error) {
 	case nil:
 		return Pattern{}, errors.New("the anti-affinity pattern is empty")
 	default:
-		return Pattern{}, fmt.Errorf("the anti-affinity pattern must be a map or a list of maps, got %s",
-			typeName(v))
+		return Pattern{}, fmt.Errorf("the anti-affinity pattern must be off, block, a map, or a list of maps, "+
+			"got %s", typeName(v))
 	}
 	p.Unsafe = drainSafe != nil && !*drainSafe
 	if err := p.Validate(); err != nil {
@@ -383,6 +418,15 @@ func typeName(v any) string {
 // Validate checks the shape of a pattern built in code or parsed from its
 // canonical form, with the same bounds Decode enforces.
 func (p Pattern) Validate() error {
+	if p.Off {
+		switch {
+		case len(p.Terms) > 0:
+			return errors.New("the off anti-affinity pattern cannot be combined with any term")
+		case p.Unsafe:
+			return errors.New("the off anti-affinity pattern writes no rules, so it has no drain safety to give up")
+		}
+		return nil
+	}
 	if len(p.Terms) > MaxTerms {
 		return fmt.Errorf("an anti-affinity pattern may list at most %d terms, got %d", MaxTerms, len(p.Terms))
 	}
@@ -445,9 +489,13 @@ const unsafeSuffix = "!unsafe"
 
 // Canonical renders p in the short form the CPI records in an HA resource's
 // comment, such as "block", "block:3", "stride:2+sets:0.1", or
-// "window:3!unsafe". A pattern with no terms renders as the default block.
-// The form holds no whitespace and no '=', so it is one marker token.
+// "window:3!unsafe". A pattern with no terms renders as the default block,
+// and the off pattern renders as "off". The form holds no whitespace and no
+// '=', so it is one marker token.
 func (p Pattern) Canonical() string {
+	if p.Off {
+		return offWord
+	}
 	terms := p.OrDefault().Terms
 	parts := make([]string, 0, len(terms))
 	for _, t := range terms {
@@ -486,6 +534,9 @@ func (p Pattern) String() string { return p.Canonical() }
 
 // Parse reads a pattern from its canonical form. See Canonical.
 func Parse(s string) (Pattern, error) {
+	if s == offWord {
+		return Off(), nil
+	}
 	var p Pattern
 	body, unsafe := strings.CutSuffix(s, unsafeSuffix)
 	p.Unsafe = unsafe
@@ -527,6 +578,10 @@ func Parse(s string) (Pattern, error) {
 				t.Sets = append(t.Sets, set)
 			}
 		default:
+			if kind == offWord {
+				return Pattern{}, errors.New("the off anti-affinity pattern stands alone; it takes no argument, " +
+					"no other term, and no !unsafe")
+			}
 			return Pattern{}, fmt.Errorf("unknown anti-affinity pattern kind %q", kind)
 		}
 		p.Terms = append(p.Terms, t)
@@ -538,8 +593,12 @@ func Parse(s string) (Pattern, error) {
 }
 
 // MarshalJSON renders p in the shape Decode reads, so a config that holds a
-// pattern survives a round trip through JSON.
+// pattern survives a round trip through JSON. The off pattern renders as the
+// string "off".
 func (p Pattern) MarshalJSON() ([]byte, error) {
+	if p.Off {
+		return json.Marshal(offWord)
+	}
 	terms := make([]map[string]any, 0, len(p.Terms))
 	for _, t := range p.Terms {
 		m := map[string]any{}
