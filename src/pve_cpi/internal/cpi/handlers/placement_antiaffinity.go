@@ -279,9 +279,13 @@ func ensureAntiAffinityMembershipLocked(
 
 	// 3. The unmarked rule from an older CPI gives up the members of ours that
 	// the hashed rules now hold. A member the overflow or the placeable cap left
-	// out keeps the old rule's protection.
-	if err := migrateLegacyAntiAffinityRule(ctx, deps, writer, ident,
-		heldByChunks(res.Set, ident, planner.scan.legacy), vmid, &loss, logger); err != nil {
+	// out keeps the old rule's protection. A group whose pattern is off wants
+	// no rule for any member, so every member of ours leaves the old rule.
+	mine := heldByChunks(res.Set, ident, planner.scan.legacy)
+	if planner.lastIn.Pattern.Off {
+		mine = planner.scan.legacy
+	}
+	if err := migrateLegacyAntiAffinityRule(ctx, deps, writer, ident, mine, vmid, &loss, logger); err != nil {
 		return "", loss, err
 	}
 
