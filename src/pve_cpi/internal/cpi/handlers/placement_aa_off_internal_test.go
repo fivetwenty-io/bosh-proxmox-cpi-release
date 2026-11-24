@@ -232,3 +232,35 @@ func TestAAOff_TheNewestMemberDecidesBothWays(t *testing.T) {
 		})
 	}
 }
+
+// TestAAOff_ASettledJoinSkipsTheRulesLock pins that a join in an opted-out
+// group that has nothing to write takes the settled path, which skips the
+// rules lock, and reports no rule, as a block group whose rule is in place
+// does. A join that still finds a leftover rule to delete takes the lock.
+func TestAAOff_ASettledJoinSkipsTheRulesLock(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		pattern  string
+		seed     string
+		settled  bool
+		wantRule string
+	}{
+		"off, nothing to write":    {pattern: "off", settled: true},
+		"off, a rule to delete":    {pattern: "off", seed: "vm:100,vm:101,vm:102"},
+		"block, its rule in place": {pattern: "block", seed: "vm:100,vm:101,vm:102", settled: true, wantRule: aaRule},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			stub := newAAStub()
+			newAAHoldFleet(stub, 100, 101, 102)
+			markWebPattern(stub, tc.pattern, 100, 101, 102)
+			if tc.seed != "" {
+				stub.seedRule(aaRule, tc.seed)
+			}
+			rule, ok := antiAffinityJoinSettled(context.Background(), aaReplanDeps(stub, true), aaIdent("web"), 102, 2)
+			if ok != tc.settled || rule != tc.wantRule {
+				t.Fatalf("settled = (%q, %v); want (%q, %v)", rule, ok, tc.wantRule, tc.settled)
+			}
+		})
+	}
+}
