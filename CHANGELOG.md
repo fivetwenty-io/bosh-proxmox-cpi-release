@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-11-24
+
 ### Removed
 
 - The package no longer installs `pve-cid`, the deprecated alias of `pve-ops`. The 0.12.0 notes said that 0.13.0 would remove it, but 0.13.0 still shipped it, so this release finishes the removal. A script that still calls `pve-cid` fails with "command not found" and should call `pve-ops` instead, which takes the same arguments and gives the same output.
@@ -1527,7 +1529,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.11.0...v0.11.1
