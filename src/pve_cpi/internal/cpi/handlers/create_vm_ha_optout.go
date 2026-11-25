@@ -5,6 +5,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 )
 
 // haCloudProp is the cloud property that keeps one VM out of PVE HA. Only
@@ -60,13 +61,46 @@ func describeHAValue(v any) string {
 	}
 }
 
-// storagePlanRequiresSharedISO reports whether pve.require_shared_iso_for_ha
-// makes a storage plan put the VM's config-drive ISO on shared storage. A VM
-// whose ha cloud property kept it out of HA never runs under PVE HA, so the
-// setting asks nothing of it. That matches the plain create path, where
-// checkISOStorageForHA finds no HA registration feature for such a VM and the
-// HA decision never runs. Every other VM keeps the rule the plan has always
-// applied, and a call with no parsed arguments keeps it too.
-func storagePlanRequiresSharedISO(cfg *config.CPIConfig, parsed *createVMParsedArgs) bool {
-	return cfg.RequireSharedISOForHAEnabled() && (parsed == nil || !parsed.cloudProps.haOff)
+// StoragePlanISOPolicy says when a storage plan must put the VM's config-drive
+// ISO on shared storage. It restates the rule of the HA decision, which the
+// plain create path applies after the VM exists, so the plan refuses a
+// node-local ISO in the cases where that decision would fail the create and in
+// no others. A zero policy asks nothing of the ISO.
+type StoragePlanISOPolicy struct {
+	// Live is false for a VM that PVE HA never manages, which is a VM whose ha
+	// cloud property is false and any VM under pve.ha.mode off. Such a VM asks
+	// nothing of its ISO.
+	Live bool
+	// Setting is pve.require_shared_iso_for_ha for a VM that may join PVE HA.
+	// A VM with an HA registration feature, which the plan sees as HA nodes,
+	// fails with a node-local ISO under it in every mode that writes HA state.
+	Setting bool
+	// Rule is when the HA decision fails a VM over a node-local ISO.
+	Rule ha.LocalISORule
+}
+
+// Requires reports whether the ISO must sit on shared storage. haNodes is the
+// number of nodes PVE HA could start the VM on, and disksShared says that
+// every disk of the VM is on shared storage.
+func (p StoragePlanISOPolicy) Requires(haNodes int, disksShared bool) bool {
+	if !p.Live {
+		return false
+	}
+	return p.Rule.Fails(disksShared) || p.Setting && haNodes > 0
+}
+
+// storagePlanISOPolicy returns the shared-ISO policy of a create. The rule
+// comes from the ha package, so the plan and the decision cannot drift apart.
+// A call with no parsed arguments keeps its VM in HA.
+func storagePlanISOPolicy(cfg *config.CPIConfig, parsed *createVMParsedArgs) StoragePlanISOPolicy {
+	if cfg == nil || parsed != nil && parsed.cloudProps.haOff {
+		return StoragePlanISOPolicy{}
+	}
+	mode := cfg.HAModeValue()
+	if mode == config.HAModeOff {
+		return StoragePlanISOPolicy{}
+	}
+	return StoragePlanISOPolicy{
+		Live: true, Setting: cfg.RequireSharedISOForHAEnabled(), Rule: ha.LocalISORuleFor(cfg, mode),
+	}
 }

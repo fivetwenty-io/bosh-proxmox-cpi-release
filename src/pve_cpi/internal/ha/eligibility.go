@@ -632,7 +632,7 @@ func (e *eligibility) classify() {
 	// A node-local ISO downgrades a VM that would otherwise get full HA.
 	wouldBeShared := len(diskLocal) == 0 && e.countPlaceable(intersect(diskAccess, domainOrAll(domain, e.members))) >= 2
 	if len(isoLocal) > 0 && wouldBeShared && domainErr == nil {
-		if e.managed || e.cfg.RequireSharedISOForHAEnabled() {
+		if localISOEscalates(e.cfg, e.managed) {
 			e.fail(cpierrors.Cloud("VM %d holds the node-local ISO %s and would otherwise get full HA; "+
 				"point pve.iso_storage at shared storage, or clear pve.require_shared_iso_for_ha and use "+
 				"auto mode to accept the downgrade", e.in.VMID, strings.Join(isoLocal, ", ")))
@@ -1025,7 +1025,7 @@ func (e *eligibility) decideReplicate(
 		permanent = permanent || proven
 	}
 	if isoLocal {
-		if e.managed || e.cfg.RequireSharedISOForHAEnabled() {
+		if localISOEscalates(e.cfg, e.managed) {
 			e.fail(cpierrors.Cloud("VM %d holds a node-local ISO, and replication does not copy it; point "+
 				"pve.iso_storage at shared storage", e.in.VMID))
 			return

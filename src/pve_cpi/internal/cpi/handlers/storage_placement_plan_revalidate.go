@@ -14,8 +14,9 @@ import (
 
 // StoragePlanInfrastructurePolicy preserves infrastructure storage and HA reachability rules.
 type StoragePlanInfrastructurePolicy struct {
-	OriginalISOStorage        string
-	FollowRoot, RequireShared bool
+	OriginalISOStorage string
+	FollowRoot         bool
+	ISO                StoragePlanISOPolicy
 }
 
 // RevalidateStorageAllocationPlan holds the recorded identities. currentInventory
@@ -188,7 +189,7 @@ func validateRecordedStorageTarget(originalInventory, currentInventory *inv.Snap
 			return fail(fmt.Errorf("current original ISO policy is required to revalidate recorded infrastructure"))
 		}
 		policy := infrastructure[0]
-		if (policy.RequireShared || len(plan.HANodes) > 0) && !d.IsShared() {
+		if policy.ISO.Requires(len(plan.HANodes), recordedDisksShared(currentInventory, plan)) && !d.IsShared() {
 			return fail(fmt.Errorf("current infrastructure policy requires shared ISO"))
 		}
 		permitted := policy.OriginalISOStorage == target.StorageID
@@ -276,4 +277,20 @@ func revalidateStorageTargetCapacity(snapshot *inv.Snapshot, current *StoragePla
 		return (err)
 	}
 	return nil
+}
+
+// recordedDisksShared reports whether every root and ephemeral disk of a
+// recorded plan sits on storage that is shared today.
+func recordedDisksShared(snapshot *inv.Snapshot, plan *StorageAllocationPlan) bool {
+	for index := range plan.Targets {
+		role := plan.Targets[index].Role
+		if role != storageRoleRoot && role != storageRoleEphemeral {
+			continue
+		}
+		d, ok := snapshot.Definition(plan.Targets[index].StorageID)
+		if !ok || !d.IsShared() {
+			return false
+		}
+	}
+	return true
 }

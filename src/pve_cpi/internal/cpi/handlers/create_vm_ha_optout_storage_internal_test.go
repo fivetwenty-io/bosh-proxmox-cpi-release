@@ -10,9 +10,10 @@ import (
 
 // optOutISOPlan returns a storage plan request over node-local storages only,
 // with the config-drive ISO pinned to the node-local root storage and
-// pve.require_shared_iso_for_ha on. The request takes its shared-ISO rule
-// from ConfigureStorageVMPlanRequest for parsed, so the test reads the rule
-// the create would plan with.
+// pve.require_shared_iso_for_ha on, under managed mode and the replicate local
+// policy, where a node-local ISO fails any VM that PVE HA may manage. The
+// request takes its shared-ISO rule from ConfigureStorageVMPlanRequest for
+// parsed, so the test reads the rule the create would plan with.
 func optOutISOPlan(t *testing.T, parsed *createVMParsedArgs) (StoragePlanRequest, *inv.Collector) {
 	t.Helper()
 	request, collector, _ := planFixture(t, func(source *planFixtureSource, cfg *config.CPIConfig) {
@@ -21,6 +22,9 @@ func optOutISOPlan(t *testing.T, parsed *createVMParsedArgs) (StoragePlanRequest
 		cfg.ISOStorage = managedCloneStorage
 		requireShared := true
 		cfg.RequireSharedISOForHA = &requireShared
+		cfg.HA = &config.HAConfig{
+			Mode: haChoiceOf(config.HAModeManaged), LocalPolicy: haChoiceOf(config.HALocalPolicyReplicate),
+		}
 		source.defs = nil
 		for _, id := range []string{"a", "b", "p", "source"} {
 			source.defs = append(source.defs, planJSON(t, map[string]any{
@@ -37,7 +41,7 @@ func optOutISOPlan(t *testing.T, parsed *createVMParsedArgs) (StoragePlanRequest
 	request.ISOBytes = configured.ISOBytes
 	request.OriginalISOStorage = configured.OriginalISOStorage
 	request.ISOFollowRoot = configured.ISOFollowRoot
-	request.RequireSharedISO = configured.RequireSharedISO
+	request.ISOPolicy = configured.ISOPolicy
 	return request, collector
 }
 
@@ -55,8 +59,8 @@ func TestStoragePlan_SharedISORuleSkipsAnOptedOutVM(t *testing.T) {
 			t.Parallel()
 			parsed := &createVMParsedArgs{cloudProps: createVMCloudProps{haOff: haOff}}
 			request, collector := optOutISOPlan(t, parsed)
-			if request.RequireSharedISO == haOff {
-				t.Fatalf("RequireSharedISO = %v; want %v", request.RequireSharedISO, !haOff)
+			if got := request.ISOPolicy.Requires(0, false); got == haOff {
+				t.Fatalf("the plan requires a shared ISO = %v; want %v", got, !haOff)
 			}
 			it, err := NewStoragePlanIterator(request)
 			if err != nil {

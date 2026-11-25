@@ -228,7 +228,7 @@ properties:
       pve.iso_storage resolves to a storage pool that /storage does not report as
       shared. Under pve.ha.mode "off" the CPI makes no HA registrations, so no
       VM is affected. A VM whose ha cloud property is false is not affected
-      either, on a storage plan as on a plain create. Default false: the hazard is only logged (see
+      either. A storage plan follows the same rule as a plain create: it asks for a shared ISO only where the HA decision would refuse a node-local one, so a VM under mode "off", or one that PVE HA will not manage, can keep its ISO on node-local storage. Default false: the hazard is only logged (see
       docs/configdrive.md), never blocks create_vm.
 
       Overridable per cpi-config entry as pve_require_shared_iso_for_ha.

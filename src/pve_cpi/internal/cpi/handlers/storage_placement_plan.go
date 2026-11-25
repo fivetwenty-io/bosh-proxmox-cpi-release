@@ -90,7 +90,8 @@ type StoragePlanRequest struct {
 	Sources                                              []StorageRootSource
 	CloneMode                                            string
 	OriginalISOStorage                                   string
-	ISOFollowRoot, RequireSharedISO                      bool
+	ISOFollowRoot                                        bool
+	ISOPolicy                                            StoragePlanISOPolicy
 	Existing                                             []StorageExistingVolume
 	HANodes                                              []string
 	ExtraLimits                                          inv.Limits
@@ -267,7 +268,7 @@ func NewStoragePlanIterator(r StoragePlanRequest) (*StoragePlanIterator, error) 
 		Follow, Shared bool
 		Limits         inv.Limits
 		RoleLimits     map[string]inv.Limits
-	}{roles, selected.FuturePersistentSet, selected.Policy.StorageCapacityDomains, r.OriginalISOStorage, r.ISOFollowRoot, r.RequireSharedISO, r.ExtraLimits, r.RoleLimits}
+	}{roles, selected.FuturePersistentSet, selected.Policy.StorageCapacityDomains, r.OriginalISOStorage, r.ISOFollowRoot, r.ISOPolicy.Live && r.ISOPolicy.Setting, r.ExtraLimits, r.RoleLimits}
 	raw, err = json.Marshal(policy)
 	if err != nil {
 		return nil, err
@@ -902,7 +903,14 @@ func (i *StoragePlanIterator) isoTarget(node, root string) (string, error) {
 	if !ok || !planContent(d, storageRoleISO) {
 		return "", fmt.Errorf("ISO target lacks supported iso backend/content")
 	}
-	if (i.req.RequireSharedISO || len(i.haNodes()) > 0) && !d.IsShared() {
+	// The plan reads the root disk only. A dedicated ephemeral disk that turns
+	// out node-local can only make the rule weaker, so a shared root counts as
+	// shared disks and the plan never loosens the check.
+	rootShared := false
+	if rd, ok := i.req.Inventory.Definition(root); ok {
+		rootShared = rd.IsShared()
+	}
+	if i.req.ISOPolicy.Requires(len(i.haNodes()), rootShared) && !d.IsShared() {
 		return "", fmt.Errorf("ISO target is not shared")
 	}
 	if err := i.accessible(node, id); err != nil {

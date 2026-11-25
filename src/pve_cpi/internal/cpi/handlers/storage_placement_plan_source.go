@@ -135,7 +135,7 @@ func ConfigureStorageVMPlanRequest(deps Deps, parsed *createVMParsedArgs, r Stor
 	r.ISOBytes = isoBytes
 	r.OriginalISOStorage = deps.Config.OriginalISOStorage()
 	r.ISOFollowRoot = deps.Config.ISOStorageFollowVMStorageEnabled()
-	r.RequireSharedISO = storagePlanRequiresSharedISO(deps.Config, parsed)
+	r.ISOPolicy = storagePlanISOPolicy(deps.Config, parsed)
 	r.ExtraLimits.MaxUtilizationPct = deps.Config.MaxUtilizationPctValue()
 	r.RoleLimits = map[string]inv.Limits{}
 	if deps.Config.ReserveStorageHeadroomEnabled() {
