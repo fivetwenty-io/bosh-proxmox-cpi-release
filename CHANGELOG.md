@@ -16,6 +16,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - The bundled Proxmox SDK moves to proxmox-apiclient-go v3.14.0, which brings the bindings up to the Proxmox VE 9.3 API. The CPI now reads a replication job's status through the SDK's typed response, and the status means the same thing it did before. The CPI adopts none of the new operations. Node maintenance stays the operator's switch, so the CPI keeps reading it from HA status and node tags. The new guest-agent statistics calls give the CPI nothing it acts on, and an NVMe-oF device reaches the CPI as the shared LVM storage that sits on top of it.
 
+- Third-party Go dependencies are refreshed to their latest releases, including the AWS SDK for Go v2 modules behind the S3 stemcell fetcher. No direct dependency has a newer major version, and none is archived, deprecated, or stale.
+
 ## [0.13.3] - 2026-11-25
 
 ### Added
