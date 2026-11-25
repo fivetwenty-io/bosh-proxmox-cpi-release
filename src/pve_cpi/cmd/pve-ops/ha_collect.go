@@ -2799,8 +2799,8 @@ func (c *haCollector) optOutFinding(g *haGuest) {
 	}
 	if c.resourcesOK && g.resource != nil {
 		c.rep.problem(haKindHAOptOut, g.sid,
-			"VM %d on %s carries %s, so its ha cloud property keeps it out of PVE HA, but it has the HA resource %s; "+
-				"remove the resource with ha-manager remove %s, or drop ha: false from the instance's cloud "+
+			"VM %d on %s carries %s, so its ha cloud property keeps it out of PVE HA, but it has the HA resource %s. "+
+				"Remove the resource with ha-manager remove %s, or drop ha: false from the instance's cloud "+
 				"properties and run bosh recreate on it to put it under HA", g.ref.VMID, g.ref.Node, haOffTag,
 			g.sid, g.sid)
 		return

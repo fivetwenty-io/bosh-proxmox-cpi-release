@@ -355,6 +355,27 @@ PVE refuses every state request for a resource in `error` except `disabled`, and
 
   `disabled` would stop it, so the CPI removes the resource and registers it again, which leaves the guest running. It marks the work with a `bosh-ha-readd-<unix seconds>` tag until the registration finishes. It does the work only while the VM runs on its own pin, holds no lock, and has no migration, relocation, or disk move task. Without `Sys.Console` it returns a retriable error that names `ha-manager remove vm:<vmid>` followed by `ha-manager add vm:<vmid>`. The VM is unmanaged between the removal and the return to `started`, so a node failure in that window leaves it down until the node returns or the resurrector acts. A crash inside the window extends it until the next call that touches the VM, and the tag keeps it visible to the doctor.
 
+### Keeping one VM out of HA
+
+Sometimes one instance group should stay out of PVE HA while the rest of the deployment uses it, such as a group whose recovery we would rather leave to the BOSH resurrector. We set the `ha` cloud property to `false` for that group, and a vm_extension is the usual place for it. The cloud config defines the extension, and the deployment manifest names it on the instance group.
+
+```yaml
+# cloud config
+vm_extensions:
+- name: no-ha
+  cloud_properties:
+    ha: false
+
+# deployment manifest
+instance_groups:
+- name: worker
+  vm_extensions: [no-ha]
+```
+
+The property takes effect only at `create_vm`, so adding it does nothing to a VM that already runs. Changing a vm_extension changes the cloud properties of every VM that uses it, though, so the next `bosh deploy` recreates those VMs, and that recreate applies the opt-out. The new VM gets no HA resource, no node-affinity pin, and no anti-affinity rule, and it carries the `bosh-ha-off` tag. The recreate deletes the old VM, and its HA resource goes with it. When we remove the extension later, the next deploy recreates the VMs again, and the new ones get the usual HA decision.
+
+The BOSH resurrector is the only recovery mechanism for an opted-out VM, as it is for any VM that isn't HA-managed in [Who recovers a VM](#who-recovers-a-vm). Under `managed`, the opt-out isn't a failure, so the create succeeds. Under `off`, the property changes nothing, because no VM is in HA. No later call, such as `attach_disk`, `set_vm_metadata`, or `reboot_vm`, registers the VM or adds it to a rule, and `pve-ops ha --fix-anti-affinity` leaves it out too. The VM counts as no HA member of its anti-affinity group, the same as a member that the HA decision refused. The `pve-ops ha` doctor reports each opted-out VM as `ha_opt_out` advice. When such a VM has an HA resource anyway, the doctor reports it as a problem. [Configuration](configuration.md#keeping-a-vm-out-of-ha) gives the property's reference.
+
 ### A resource added by hand to a CPI VM
 
 The CPI writes an ownership marker into the comment of every HA resource it creates, and it changes only a resource that carries its marker. When an admin runs `ha-manager add vm:<vmid>` or uses the GUI on a CPI VM, the resource has no marker, and the CPI treats it as not its own. A CPI older than 0.10.0 wrote no marker either, so a resource registered by such a CPI gets the same treatment until a `bosh recreate` replaces the VM. The common case for a hand-added resource is a VM that the CPI left out of HA because its disk sits on node-local storage under `pve.ha.local_policy: none`.

@@ -705,6 +705,18 @@ When we change the job default to `off`, the change reaches each existing group 
 
 Opting out changes only the rules, but under `pve.ha.anti_affinity: on` that has one effect on storage. A group with `off` no longer steers its members to shared storage for the sake of anti-affinity. When a [storage plan](multi-storage-placement.md) places such a member, the plan no longer needs storage that every node of the AZ reaches for the member's disks and its config-drive ISO, unless DLB registration through `pve.ha.dlb` or `pve.ha.pin_az: on` still asks for HA for the VM. `pve.require_shared_iso_for_ha` still keeps the ISO on shared storage. So on a cluster with local storage and `pve.ha.local_policy: none`, the group's VMs may land on node-local storage and get no PVE HA, and the CPI logs no warning about a missing rule for them. Under the default `pve.ha.anti_affinity: auto`, no member is steered to shared storage for anti-affinity, so `off` changes nothing about storage there.
 
+### Keeping a VM out of HA
+
+The `ha` cloud property keeps one VM out of PVE HA while the rest of the deployment uses it.
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `ha` | Boolean | unset | Set it to `false` to keep the VM out of PVE HA under `pve.ha.mode` `auto` or `managed`. The CPI reads it from the call's `cloud_properties`, then from the `disk_type` profile, then from the `vm_type` profile, which is the same order that `ha_anti_affinity` uses. Unset or `true` leaves the VM to the HA decision, and `true` never forces HA on a VM that the decision would refuse. A value that isn't a boolean, such as the string `"false"` or the number `0`, fails `create_vm` before any VM exists, with an error that names the `ha` cloud property. Under `pve.ha.mode: off` the property changes nothing, because no VM is in HA. |
+
+A VM with `ha: false` gets no HA resource, no node-affinity pin, no anti-affinity rule, and no `bosh-ha-managed` tag, and a create under `managed` doesn't fail because of it. The CPI tags the VM `bosh-ha-off` and logs one Info line that names the VM. The VM keeps its group's member tag, so placement still spreads the group across nodes, but the VM counts as no HA member of its group, the same as a member that the HA decision refused. Because the VM needs no HA, storage placement doesn't steer it to shared storage, the headroom check leaves it out, and a root on node-local storage keeps the clone mode that it resolved.
+
+The CPI reads the property only at `create_vm`. [HA and Resurrection](ha-and-resurrection.md#keeping-one-vm-out-of-ha) shows the vm_extension that sets it and explains how the next deploy applies it to a VM that already exists.
+
 ## Stemcell Management
 
 Controls stemcell template replication, orphan pruning, and fast-path delete. Provenance recording is unconditional, with no property controlling it, and director identity is never configured: every CPI call carries the calling BOSH director's identity in its request context, which the CPI stamps onto each template as a `director--<uuid>` tag.

@@ -12,6 +12,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Added
+
+- The `ha` cloud property keeps one VM out of PVE HA. When we set it to `false`, usually through a vm_extension, `create_vm` under `pve.ha.mode` `auto` or `managed` registers no HA resource for the VM, writes no node-affinity pin, joins it to no anti-affinity rule, and writes no `bosh-ha-managed` tag. It tags the VM `bosh-ha-off` instead and logs one Info line that names the VM. A create under `managed` doesn't fail because of the opt-out, and under `off` the property changes nothing. Unset or `true` leaves the VM to the HA decision, and `true` never forces HA. Any other value fails `create_vm` before any VM exists. The property takes effect only at create time, and changing a vm_extension changes the VM's cloud properties, so the next deploy recreates the VM and that recreate applies the opt-out. No later call registers a VM that opted out, pins it, or adds it to a rule, and the VM counts as no HA member of its anti-affinity group. The `pve-ops ha` doctor reports each opted-out VM as `ha_opt_out` advice, and it reports a VM that carries `bosh-ha-off` and an HA resource as a problem.
+
 ## [0.13.2] - 2026-11-24
 
 ### Added
