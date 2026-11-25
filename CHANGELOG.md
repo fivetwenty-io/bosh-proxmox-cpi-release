@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-11-25
+
 ### Added
 
 - The `ha` cloud property keeps one VM out of PVE HA. When we set it to `false`, usually through a vm_extension, `create_vm` under `pve.ha.mode` `auto` or `managed` registers no HA resource for the VM, writes no node-affinity pin, joins it to no anti-affinity rule, and writes no `bosh-ha-managed` tag. It tags the VM `bosh-ha-off` instead and logs one Info line that names the VM. A create under `managed` doesn't fail because of the opt-out, and under `off` the property changes nothing. Unset or `true` leaves the VM to the HA decision, and `true` never forces HA. Any other value fails `create_vm` before any VM exists. The property takes effect only at create time, and changing a vm_extension changes the VM's cloud properties, so the next deploy recreates the VM and that recreate applies the opt-out. No later call registers a VM that opted out, pins it, or adds it to a rule, and the VM counts as no HA member of its anti-affinity group. `pve.require_shared_iso_for_ha` asks nothing of an opted-out VM, so a storage plan may put its config-drive ISO on node-local storage, the same as a plain create does. The journal record of an opted-out VM carries a new `HAOff` key. A release older than 0.13.3 that resumes such a record refuses it, and it does not build the VM as if it kept HA. The `pve-ops ha` doctor reports each opted-out VM as `ha_opt_out` advice, and it reports a VM that carries `bosh-ha-off` and an HA resource as a problem.
@@ -1551,7 +1553,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.2...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.3...HEAD
+[0.13.3]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.12.0...v0.13.0
