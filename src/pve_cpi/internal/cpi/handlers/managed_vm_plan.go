@@ -211,7 +211,7 @@ func observeManagedVMPlan(ctx context.Context, deps Deps, parsed *createVMParsed
 	request.OnCandidateRejected = deps.storageCandidateRejectionObserver(ctx, selection)
 	// The plan clones in full the root that HA would hold on node-local storage.
 	// The answer is read here, ahead of the ranking, which runs under the lock.
-	request.HoldsLocalRoot = haLocalRootPredicate(ctx, deps)
+	request.HoldsLocalRoot = haLocalRootPredicate(ctx, deps, parsed.cloudProps.haOff)
 	observed.request = request
 	return observed, nil
 }

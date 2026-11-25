@@ -49,23 +49,25 @@ func cloneModeForHA(
 // PVE HA with its root disk on node-local storage. The storage plan asks the
 // same question through haLocalRootPredicate, so both clone paths agree.
 func haWouldManageLocalRoot(ctx context.Context, deps Deps, shape *createVMShape) bool {
-	return haLocalRootPredicate(ctx, deps)(shape.vmStorage)
+	return haLocalRootPredicate(ctx, deps, shape.haOff)(shape.vmStorage)
 }
 
 // haLocalRootPredicate returns a function that reports whether a VM with its
 // root disk on the named storage would run under PVE HA on node-local
 // storage. That takes an HA mode that writes, a local policy other than none,
 // a Director that can own the resource, a cluster profile that lets the CPI
-// write HA state, and a storage that is node-local. Every fact it cannot read
+// write HA state, and a storage that is node-local. A VM whose ha cloud
+// property kept it out of HA (haOff) never runs under HA, so it answers false
+// and the VM keeps the clone mode it resolved. Every fact it cannot read
 // answers false, so a clone is forced to full only on facts the CPI has, and a
 // managed call that lacks a prerequisite fails in the HA decision with the
 // prerequisite's own error. The profile is read once, here, so the returned
 // function does no I/O and the storage plan can call it under the journal
 // lock.
-func haLocalRootPredicate(ctx context.Context, deps Deps) func(storage string) bool {
+func haLocalRootPredicate(ctx context.Context, deps Deps, haOff bool) func(storage string) bool {
 	no := func(string) bool { return false }
 	cfg := deps.Config
-	if cfg == nil || cfg.HAModeValue() == config.HAModeOff || cfg.HALocalPolicyValue() == config.HALocalPolicyNone ||
+	if haOff || cfg == nil || cfg.HAModeValue() == config.HAModeOff || cfg.HALocalPolicyValue() == config.HALocalPolicyNone ||
 		deps.RequestDirectorUUID == "" {
 		return no
 	}

@@ -22,7 +22,7 @@ import (
 func antiAffinityPartnersForCreate(
 	ctx context.Context, deps Deps, env map[string]any, cp createVMCloudProps, pattern string,
 ) map[string]int {
-	if pattern == aapattern.Off().Canonical() {
+	if pattern == aapattern.Off().Canonical() || cp.haOff {
 		return nil
 	}
 	return antiAffinityPartnerNodes(ctx, deps, env, cp)

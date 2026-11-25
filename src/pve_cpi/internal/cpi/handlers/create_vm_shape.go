@@ -120,6 +120,12 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	if tag := antiAffinityGroupTag(deps, parsed.env); tag != "" {
 		baseRetainTags = append(baseRetainTags, tag)
 	}
+	// The opt-out tag marks a VM that the ha cloud property kept out of HA.
+	// It rides in the first tag list, so it costs no extra write and dies
+	// with the VM on a create rollback.
+	if cp.haOff {
+		baseRetainTags = append(baseRetainTags, haOffTag)
+	}
 	// The stemcell tag goes last, behind the advertised-route provenance in
 	// baseRetainTags. mergeTagList truncates from the tail, and an evicted
 	// advrt- tag is an SDN subnet delete_vm can no longer withdraw, while an
@@ -280,6 +286,7 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		maxAttempts:         maxAttempts,
 		initialName:         initialName,
 		cloudPropsMap:       parsed.cloudPropsMap,
+		haOff:               cp.haOff,
 		rootDiskPerfOpts:    rootDiskPerfOpts,
 		rootDiskKey:         rootDiskKeyVal,
 		scsihw:              scsihwVal,

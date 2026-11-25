@@ -77,7 +77,7 @@ func (h *createdVMHA) haActivated() bool { return h != nil && h.activated }
 // nil without a read. The profile is the request's shared one, so placement
 // and the decision reuse it.
 func refuseManagedHABeforeCreate(ctx context.Context, deps Deps, parsed *createVMParsedArgs) error {
-	if deps.Config == nil || deps.Config.HAModeValue() != config.HAModeManaged {
+	if deps.Config == nil || deps.Config.HAModeValue() != config.HAModeManaged || parsed.cloudProps.haOff {
 		return nil
 	}
 	if haIdentityFor(deps, parsed.env).Owner == "" {
@@ -110,6 +110,14 @@ func decideCreatedVMHA(
 ) (*createdVMHA, error) {
 	mode := deps.Config.HAModeValue()
 	if mode == config.HAModeOff {
+		return nil, nil
+	}
+	// The ha cloud property kept the VM out of HA. That is the operator's
+	// choice and not a failure, so managed mode does not refuse the VM, and
+	// the create writes no resource, no pin, no rule, and no managed tag.
+	if parsed.cloudProps.haOff {
+		logger.Info("create_vm: the ha cloud property keeps the VM out of PVE HA, so the CPI registers no HA "+
+			"resource for it", log.Int(metadataKeyVMID, vmid))
 		return nil, nil
 	}
 	managed := mode == config.HAModeManaged

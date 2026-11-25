@@ -102,6 +102,11 @@ func buildHeadroomPlan(
 			"and the VM gets no HA")
 		return nil
 	}
+	if cp.haOff {
+		logger.Debug("create_vm: placement: headroom check skipped, because the ha cloud property keeps the VM out " +
+			"of PVE HA")
+		return nil
+	}
 	api := deps.PVE.Cluster()
 	if api == nil {
 		return nil

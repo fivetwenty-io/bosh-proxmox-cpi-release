@@ -309,6 +309,13 @@ type createVMCloudProps struct {
 	// check that reads the cloud properties, such as haRegistrationFeatures,
 	// leaves the anti-affinity rules out for the VM.
 	antiAffinityOff bool
+	// haOff is set when the ha cloud property is false under a mode other
+	// than off, so the VM gets no HA resource, no node-affinity pin, no
+	// anti-affinity rule, and no bosh-ha-managed tag. It is not a cloud
+	// property of its own. create_vm sets it from the property (see
+	// resolveCreateVMHAOptOut), so every check that reads the cloud
+	// properties treats the VM as a VM without HA.
+	haOff bool
 }
 
 // createVMNetworkSpec mirrors the BOSH v2 network spec shape.
@@ -460,6 +467,9 @@ type createVMShape struct {
 	// carried forward so cloneFromTemplate can consult it for clone_mode resolution
 	// via the layered resolver (vm_type profile may override config.CloneMode).
 	cloudPropsMap map[string]any
+	// haOff carries the create's ha opt-out (createVMCloudProps.haOff), so the
+	// clone treats an opted-out VM as a VM without HA.
+	haOff bool
 	// rootDiskPerfOpts holds the resolved PVE per-disk performance options for
 	// the root disk (rootDiskKey). Derived once in resolveVMShape via
 	// resolveDiskPerfOptions + filterDiskPerfForBus(rootDiskBusName(cfg)). Empty
@@ -627,6 +637,9 @@ func createVM(
 	}
 	warnIgnoredNodeKey(logger, parsed.cloudPropsMap)
 	if err := resolveCreateVMAntiAffinityPattern(parsed, deps.Config); err != nil {
+		return nil, err
+	}
+	if err := resolveCreateVMHAOptOut(parsed, deps.Config); err != nil {
 		return nil, err
 	}
 

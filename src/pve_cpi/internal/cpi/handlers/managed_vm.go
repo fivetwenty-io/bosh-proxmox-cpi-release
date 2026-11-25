@@ -207,7 +207,7 @@ func continueManagedVM(ctx context.Context, deps Deps, parsed *createVMParsedArg
 		// The root is not created yet, so a recorded plan that clones it linked
 		// on storage managed HA cannot protect is refused before the clone.
 		if root, ok := managedVMRoleTarget(plan, storageRoleRoot); ok {
-			holds := haLocalRootPredicate(ctx, deps)
+			holds := haLocalRootPredicate(ctx, deps, parsed.cloudProps.haOff)
 			if err := managedLinkedRootRefusal(deps, holds, root, true); err != nil {
 				return nil, err
 			}

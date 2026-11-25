@@ -40,6 +40,9 @@ const (
 // steps have already run (or attempted to run) so the resulting feature list
 // accurately reflects "was HA registration attempted for this VM".
 func haRegistrationFeatures(deps Deps, cp createVMCloudProps, node string, env map[string]any) []haRegistrationFeature {
+	if cp.haOff {
+		return nil
+	}
 	var out []haRegistrationFeature
 
 	if deps.Config.DLBEligibleForAZ(cp.AvailabilityZone) {

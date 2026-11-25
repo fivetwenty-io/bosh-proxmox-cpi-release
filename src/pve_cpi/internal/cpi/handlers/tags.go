@@ -50,6 +50,7 @@ var reservedBoshTagPrefixes = []string{
 // compares.
 var createTimeTagPrefixes = []string{
 	stemcellTagPrefix, ownerTagPrefix, cidStampTagPrefix, clusterStampTagPrefix, haRuleNamePrefix, haManagedTag,
+	haOffTag,
 }
 
 // ownerTagPrefix names the Director that created a VM. create_vm stamps

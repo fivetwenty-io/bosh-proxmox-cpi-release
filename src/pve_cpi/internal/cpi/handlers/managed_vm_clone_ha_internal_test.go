@@ -73,7 +73,7 @@ func managedCloneDeps(haMode string, local bool) Deps {
 // plan's local-root question answered from deps.
 func rankManagedClone(t *testing.T, request StoragePlanRequest, deps Deps) (*managedVMPlan, error) {
 	t.Helper()
-	request.HoldsLocalRoot = haLocalRootPredicate(t.Context(), deps)
+	request.HoldsLocalRoot = haLocalRootPredicate(t.Context(), deps, false)
 	observed := &managedVMPlan{
 		selection: request.Selection, inventory: request.Inventory, request: request,
 		snapshotStart: request.Clock(),

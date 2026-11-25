@@ -182,6 +182,11 @@ func observeVMPlan(ctx context.Context, deps Deps, args []json.RawMessage) (*Sto
 	if err := resolveCreateVMAntiAffinityPattern(parsed, deps.Config); err != nil {
 		return nil, nil, nil, nil, err
 	}
+	// An opted-out VM is planned as a VM without HA, the way create_vm plans
+	// it, and a bad ha value fails here too.
+	if err := resolveCreateVMHAOptOut(parsed, deps.Config); err != nil {
+		return nil, nil, nil, nil, err
+	}
 	var props map[string]any
 	if err := json.Unmarshal(args[2], &props); err != nil {
 		return nil, nil, nil, nil, err
