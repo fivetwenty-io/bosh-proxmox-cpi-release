@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-11-24
+
 ### Added
 
 - `pve-ops ha` now reports `ha_resource_unmarked` for a CPI VM whose PVE HA resource carries no CPI ownership marker, which is what an admin's own `ha-manager add` leaves and also what a CPI older than 0.10.0 wrote. The CPI changes no resource without its marker, so such a resource has no node-affinity pin, keeps PVE's `failback` setting, and sits in no CPI anti-affinity rule. The finding is a problem when the VM has a disk on node-local storage, because PVE can't recover that VM on another node, and it's advice otherwise. The finding tells the operator to `bosh recreate` the instance, or to remove the resource with `ha-manager remove` when the VM should stay out of HA. The doctor still writes nothing for it.
@@ -1541,7 +1543,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.2...HEAD
+[0.13.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.11.1...v0.12.0
