@@ -7,7 +7,6 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	inv "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/storageinventory"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -155,17 +154,6 @@ func ConfigureStorageVMPlanRequest(deps Deps, parsed *createVMParsedArgs, r Stor
 		}
 	}
 	return r, nil
-}
-
-// storagePlanRequiresSharedISO reports whether pve.require_shared_iso_for_ha
-// makes a storage plan put the VM's config-drive ISO on shared storage. A VM
-// whose ha cloud property kept it out of HA never runs under PVE HA, so the
-// setting asks nothing of it. That matches the plain create path, where
-// checkISOStorageForHA finds no HA registration feature for such a VM and the
-// HA decision never runs. Every other VM keeps the rule the plan has always
-// applied, and a call with no parsed arguments keeps it too.
-func storagePlanRequiresSharedISO(cfg *config.CPIConfig, parsed *createVMParsedArgs) bool {
-	return cfg.RequireSharedISOForHAEnabled() && (parsed == nil || !parsed.cloudProps.haOff)
 }
 
 // ObserveStorageExistingVolumes resolves identities without resuming transfers.
