@@ -40,7 +40,7 @@ type managedVMAllocation struct {
 
 func (m *managedVMAllocation) revalidate(ctx context.Context) error {
 	cfg := m.deps.Config
-	snapshot, ledger, err := RevalidateStorageAllocationPlan(ctx, m.prepared.collector, m.prepared.inventory, m.prepared.inventory, m.prepared.selection, m.prepared.plan, m.prepared.ledger, time.Now, StoragePlanInfrastructurePolicy{OriginalISOStorage: cfg.OriginalISOStorage(), FollowRoot: cfg.ISOStorageFollowVMStorageEnabled(), RequireShared: cfg.RequireSharedISOForHAEnabled()})
+	snapshot, ledger, err := RevalidateStorageAllocationPlan(ctx, m.prepared.collector, m.prepared.inventory, m.prepared.inventory, m.prepared.selection, m.prepared.plan, m.prepared.ledger, time.Now, StoragePlanInfrastructurePolicy{OriginalISOStorage: cfg.OriginalISOStorage(), FollowRoot: cfg.ISOStorageFollowVMStorageEnabled(), RequireShared: storagePlanRequiresSharedISO(cfg, m.parsed)})
 	if err != nil {
 		return err
 	}
