@@ -236,6 +236,7 @@ func collectHAScoped(ctx context.Context, r HAReader, cfg *config.CPIConfig, own
 	c.antiAffinityFindings()
 	c.cpuFindings()
 	c.protectionFindings()
+	c.unmarkedResourceFindings()
 	c.maintenanceStrandedFindings()
 	c.recoveryStrandedFindings()
 	c.replicationFindings()
@@ -1453,6 +1454,52 @@ func (c *haCollector) protectionFindings() {
 					g.ref.VMID, g.ref.Node)
 			}
 		}
+	}
+}
+
+// unmarkedResourceFindings reports a VM the doctor judges whose HA resource
+// carries no CPI ownership marker, which is what an admin's own ha-manager add
+// leaves, and what a CPI older than 0.10.0 wrote for every VM it registered. The CPI changes only resources that carry its marker, so it leaves
+// this one alone on attach_disk, detach_disk, set_vm_metadata, failback, and
+// pin widening, while reboot_vm and delete_vm still treat the VM as HA-managed.
+// The resource has no pin, has failback as PVE set it, and sits in no CPI
+// anti-affinity rule. On a VM with a node-local volume that is a problem,
+// because PVE recovers the VM on another node, where the disk does not exist.
+// Otherwise it is advice. A resource with any marker, another Director's
+// included, is not this finding's. In mode off, off_mode_resource already
+// reports every CPI-owned resource, and when pin_missing reports the VM the
+// local-disk case is already told there, so neither is told twice.
+func (c *haCollector) unmarkedResourceFindings() {
+	if c.off() || !c.guestsOK || !c.resourcesOK {
+		return
+	}
+	for _, g := range c.guests {
+		if g.resource == nil || !c.judgesForProtection(g) {
+			continue
+		}
+		if _, marked := haMarkerOwner(g.resource.Comment); marked {
+			continue
+		}
+		local := c.localVolumes(g)
+		if len(local) > 0 && c.rulesOK && g.hasTag(haManagedTag) {
+			if ok, _ := pinAllowsNode(c.pinOf(g.ref.VMID), g.sid, g.ref.Node); !ok {
+				continue
+			}
+		}
+		if len(local) > 0 {
+			c.rep.problem(haKindResourceUnmarked, g.sid,
+				"VM %d on %s has the HA resource %s, which carries no CPI ownership marker, so it was added by hand or by a CPI older than 0.10.0, and the VM holds node-local volumes (%s). "+
+					"PVE cannot recover the VM on another node, because its disk stays on the failed node, so after a node failure the start fails and the service ends in the error state. "+
+					"The CPI leaves the resource alone, so it has no pin and its failback keeps the value PVE gave it. "+
+					"Run `bosh recreate` on the instance so create_vm decides its HA again and the old VM's resource goes with it, or remove the resource with `ha-manager remove %s` if the VM should stay out of HA",
+				g.ref.VMID, g.ref.Node, g.sid, strings.Join(local, ", "), g.sid)
+			continue
+		}
+		c.rep.advise(haKindResourceUnmarked, g.sid,
+			"VM %d on %s has the HA resource %s, which carries no CPI ownership marker, so it was added by hand or by a CPI older than 0.10.0. "+
+				"The CPI leaves the resource alone, so it has no node-affinity pin, its failback keeps the value PVE gave it, and it sits in no CPI anti-affinity rule. "+
+				"Run `bosh recreate` on the instance so create_vm decides its HA again and the old VM's resource goes with it, or remove the resource with `ha-manager remove %s` if the VM should stay out of HA",
+			g.ref.VMID, g.ref.Node, g.sid, g.sid)
 	}
 }
 

@@ -63,6 +63,7 @@ const (
 	haKindHeadroomUnavailable   = "headroom_unavailable"
 	haKindRuleUnmarked          = "rule_unmarked"
 	haKindResourceIgnored       = "resource_ignored"
+	haKindResourceUnmarked      = "ha_resource_unmarked"
 	haKindBirthTagStale         = "birth_tag_stale"
 	haKindReaddTag              = "readd_tag"
 	haKindManagedNoResource     = "managed_without_resource"
