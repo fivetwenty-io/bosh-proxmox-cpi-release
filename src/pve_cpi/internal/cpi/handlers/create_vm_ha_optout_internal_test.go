@@ -324,3 +324,28 @@ func TestBuildVMShapeForNode_OptOutTagSurvivesTheTagCap(t *testing.T) {
 		t.Fatalf("merged %q dropped %v; want %s kept", merged, dropped, haOffTag)
 	}
 }
+
+// TestMergeTagList_OptOutTagLeadsLongOperatorTags pins haOffTag in
+// headTagPrefixes. Six operator tags of 60 bytes, all starting with a, sort ahead of
+// bosh-ha-off and fill the cap, so a sorted list that reaches the merge
+// without the marker hoisted to the head loses it from the tail.
+func TestMergeTagList_OptOutTagLeadsLongOperatorTags(t *testing.T) {
+	t.Parallel()
+	sorted := make([]string, 0, 7)
+	for i := range 6 {
+		sorted = append(sorted, "a"+string(rune('0'+i))+strings.Repeat("x", 58))
+	}
+	sorted = append(sorted, haOffTag)
+	slices.Sort(sorted)
+	joined := len(strings.Join(sorted, ";"))
+	if joined <= maxTagLength || joined > maxTagLength+80 {
+		t.Fatalf("rig is %d bytes, want just over the %d-byte cap", joined, maxTagLength)
+	}
+	merged, dropped := mergeTagListReporting(hoistHeadTags(sorted), nil, maxTagLength)
+	if !slices.Contains(parseTagsField(merged), haOffTag) || slices.Contains(dropped, haOffTag) {
+		t.Fatalf("merged %q dropped %v; want %s kept", merged, dropped, haOffTag)
+	}
+	if len(merged) > maxTagLength {
+		t.Fatalf("merged tags are %d bytes, over the %d-byte cap", len(merged), maxTagLength)
+	}
+}

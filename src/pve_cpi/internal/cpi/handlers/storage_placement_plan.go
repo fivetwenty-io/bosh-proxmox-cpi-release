@@ -905,7 +905,11 @@ func (i *StoragePlanIterator) isoTarget(node, root string) (string, error) {
 	}
 	// The plan reads the root disk only. A dedicated ephemeral disk that turns
 	// out node-local can only make the rule weaker, so a shared root counts as
-	// shared disks and the plan never loosens the check.
+	// shared disks and the plan never loosens the check. The revalidation counts
+	// both the root and the ephemeral disk (recordedDisksShared in
+	// storage_placement_plan_revalidate.go), so it can see node-local disks
+	// where the plan saw a shared root. That difference can only make the
+	// revalidation stricter than the plan, never more lenient.
 	rootShared := false
 	if rd, ok := i.req.Inventory.Definition(root); ok {
 		rootShared = rd.IsShared()

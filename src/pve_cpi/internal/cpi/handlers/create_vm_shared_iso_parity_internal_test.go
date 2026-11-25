@@ -31,16 +31,17 @@ const (
 // node-local config-drive ISO fails create_vm.
 type isoParityRow struct {
 	mode        string
-	features    bool // pve.ha.dlb.enabled gives the VM an HA registration feature
-	replicate   bool // pve.ha.local_policy is replicate rather than none
-	haOff       bool // the ha cloud property is false
-	setting     bool // pve.require_shared_iso_for_ha
-	sharedDisks bool // the VM's disks are on shared storage
+	features    bool   // pve.ha.dlb.enabled gives the VM an HA registration feature
+	policy      string // pve.ha.local_policy
+	topology    string // pve.ha.storage_topology
+	haOff       bool   // the ha cloud property is false
+	setting     bool   // pve.require_shared_iso_for_ha
+	sharedDisks bool   // the VM's disks are on shared storage
 }
 
 func (r isoParityRow) String() string {
-	return fmt.Sprintf("mode=%s features=%v replicate=%v ha_false=%v setting=%v shared_disks=%v",
-		r.mode, r.features, r.replicate, r.haOff, r.setting, r.sharedDisks)
+	return fmt.Sprintf("mode=%s topology=%s policy=%s features=%v ha_false=%v setting=%v shared_disks=%v",
+		r.mode, r.topology, r.policy, r.features, r.haOff, r.setting, r.sharedDisks)
 }
 
 func (r isoParityRow) disk() string {
@@ -59,33 +60,45 @@ func parityISO(shared bool) string {
 
 // isoParityRows lists every combination of the row's inputs.
 func isoParityRows() []isoParityRow {
-	var rows []isoParityRow
+	rows := make([]isoParityRow, 0, 3*3*3*16)
 	for _, mode := range []string{config.HAModeOff, config.HAModeAuto, config.HAModeManaged} {
-		for n := range 32 {
-			r := isoParityRow{
-				mode: mode, features: n&1 != 0, replicate: n&2 != 0, haOff: n&4 != 0,
-				setting: n&8 != 0, sharedDisks: n&16 != 0,
+		for _, topology := range []string{
+			config.HAStorageTopologyAuto, config.HAStorageTopologyShared, config.HAStorageTopologyLocal,
+		} {
+			for _, policy := range []string{
+				config.HALocalPolicyNone, config.HALocalPolicyHold, config.HALocalPolicyReplicate,
+			} {
+				rows = append(rows, isoParityFlagRows(mode, topology, policy)...)
 			}
-			// A VM with an HA registration feature needs its disks on storage
-			// that every HA node reaches, so a storage plan refuses a
-			// node-local disk for that reason alone, before the ISO matters.
-			if r.features && !r.sharedDisks && r.mode != config.HAModeOff && !r.haOff {
-				continue
-			}
-			rows = append(rows, r)
 		}
 	}
 	return rows
 }
 
-// applyIsoParityRow sets the row's HA keys and the setting on cfg, with the
-// ISO on iso and the root disk on the row's disk storage.
-func applyIsoParityRow(cfg *config.CPIConfig, r isoParityRow, iso string) {
-	policy := config.HALocalPolicyNone
-	if r.replicate {
-		policy = config.HALocalPolicyReplicate
+// isoParityFlagRows lists every combination of the row's boolean inputs under
+// one mode, topology, and local policy.
+func isoParityFlagRows(mode, topology, policy string) []isoParityRow {
+	var rows []isoParityRow
+	for n := range 16 {
+		r := isoParityRow{
+			mode: mode, topology: topology, policy: policy,
+			features: n&1 != 0, haOff: n&2 != 0, setting: n&4 != 0, sharedDisks: n&8 != 0,
+		}
+		// A VM with an HA registration feature needs its disks on storage
+		// that every HA node reaches, so a storage plan refuses a
+		// node-local disk for that reason alone, before the ISO matters.
+		if r.features && !r.sharedDisks && r.mode != config.HAModeOff && !r.haOff {
+			continue
+		}
+		rows = append(rows, r)
 	}
-	cfg.HA = &config.HAConfig{Mode: haChoiceOf(r.mode), LocalPolicy: haChoiceOf(policy)}
+	return rows
+}
+
+// applyISOParityRow sets the row's HA keys and the setting on cfg, with the
+// ISO on iso and the root disk on the row's disk storage.
+func applyISOParityRow(cfg *config.CPIConfig, r isoParityRow, iso string) {
+	cfg.HA = &config.HAConfig{Mode: haChoiceOf(r.mode), LocalPolicy: haChoiceOf(r.policy), StorageTopology: haChoiceOf(r.topology)}
 	if r.features {
 		enabled := true
 		cfg.HA.DLB = &config.HADLBConfig{Enabled: &enabled}
@@ -162,7 +175,7 @@ func parityProfile(mode string) *ha.Profile {
 func plainPathFails(t *testing.T, r isoParityRow, isoShared bool) bool {
 	t.Helper()
 	cfg := isoHABaseConfig(parityISO(isoShared))
-	applyIsoParityRow(cfg, r, parityISO(isoShared))
+	applyISOParityRow(cfg, r, parityISO(isoShared))
 	parsed := isoParityParsed(t, cfg, r)
 	deps := dlbDeps(nil, nil, parityStorageStub{panicStorageStub{t}}, cfg)
 	deps.RequestDirectorUUID = aaDirector
@@ -195,7 +208,7 @@ func isoParityFixture(t *testing.T, r isoParityRow, iso string) (StoragePlanRequ
 	var cfg *config.CPIConfig
 	request, collector, _ := planFixture(t, func(source *planFixtureSource, c *config.CPIConfig) {
 		c.EphemeralStorageSet = ""
-		applyIsoParityRow(c, r, iso)
+		applyISOParityRow(c, r, iso)
 		// Only a storage that a capacity domain names gets a status pair in
 		// the inventory, and a domain does not ask for NFS, so each storage
 		// of the fixture gets a domain of its own.
@@ -263,7 +276,9 @@ func planPathFails(t *testing.T, r isoParityRow, iso string) bool {
 // nodes the row's create plans with.
 func revalidationFails(t *testing.T, r isoParityRow, iso string) bool {
 	t.Helper()
-	recordedRow := isoParityRow{mode: config.HAModeOff, sharedDisks: r.sharedDisks}
+	recordedRow := isoParityRow{
+		mode: config.HAModeOff, topology: r.topology, policy: r.policy, sharedDisks: r.sharedDisks,
+	}
 	request, collector, _, _ := isoParityFixture(t, recordedRow, iso)
 	it, err := NewStoragePlanIterator(request)
 	if err != nil {
@@ -303,9 +318,14 @@ func TestSharedISORule_PlanAgreesWithThePlainPath(t *testing.T) {
 	for _, r := range isoParityRows() {
 		t.Run(r.String(), func(t *testing.T) {
 			t.Parallel()
-			if plainPathFails(t, r, true) || planPathFails(t, r, parityISOShared) ||
-				revalidationFails(t, r, parityISOShared) {
-				t.Fatal("a shared ISO failed the create, so the row cannot tell what the ISO decides")
+			if planPathFails(t, r, parityISOShared) || revalidationFails(t, r, parityISOShared) {
+				t.Fatal("a shared ISO failed the plan, so the row cannot tell what the ISO decides")
+			}
+			// Under topology shared a node-local disk fails the create, and under
+			// topology local with the replicate policy no storage reads as
+			// shared, so the plain path refuses even a shared ISO.
+			if plainPathFails(t, r, true) {
+				t.Skip("the plain path fails the create whatever the ISO is, so the row says nothing of the ISO")
 			}
 			plain := plainPathFails(t, r, false)
 			if got := planPathFails(t, r, parityISOLocal); got != plain {
