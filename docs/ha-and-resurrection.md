@@ -258,7 +258,7 @@ Double recovery happens when PVE HA starts the VM on a new node while the resurr
 
   When the VM's node is offline, fenced, or gone, no migration can start from it, so the attach fails with a retriable error in every mode and waits for PVE HA to recover the VM or for the node to return. When PVE refuses the move or the move doesn't finish, `managed` mode keeps the VM in HA and fails with a retriable error. In `auto` mode the VM leaves HA only when its node reaches the new disk's storage, because only then can the attach run there, and the CPI logs a warning that names the VM, the set, and the reason. Otherwise `auto` mode also keeps the VM in HA and fails with a retriable error. Each of these errors names the set and a command such as `ha-manager migrate vm:<vmid> <node>` that moves the VM into it. The request needs `Sys.Console` on `/`, like every other HA write. When the storage allocation journal manages the disk, it lets the request through only for the attach's own VM, only while the VM's HA resource carries this Director's marker and requests `started` or `stopped`, and only when the request names a target node.
 
-  When the HA decision for the VM with the new disk is that it gets no HA, as it does for a disk on node-local storage under the default `pve.ha.local_policy: none`, the attach takes the VM out of HA instead. It removes the VM's HA resource, its HA-managed tag, and its pin before the attach begins, so a wait for a parker's lock, like every other wait in the attach, runs while the VM is already out of HA rather than `ignored`. An attach that then fails, including one whose lock wait runs out, leaves the VM out of HA, which is where the decision was taking it anyway. The rerun's decision finds no HA resource and no pin, so it simply attaches the disk. Only `create_vm` registers a VM with HA, so the VM stays out of HA until the Director recreates it.
+  When the HA decision for the VM with the new disk is that it gets no HA, as it does for a disk on node-local storage under the default `pve.ha.local_policy: none`, the attach takes the VM out of HA instead. It removes the VM's HA resource, its HA-managed tag, and its pin before the attach begins, so a wait for a parker's lock, like every other wait in the attach, runs while the VM is already out of HA rather than `ignored`. An attach that then fails, including one whose lock wait runs out, leaves the VM out of HA, which is where the decision was taking it anyway. The rerun's decision finds no HA resource and no pin, so it simply attaches the disk. Only `create_vm` registers a VM with HA, so the VM stays out of HA until the Director recreates it. Adding the resource by hand does not change that, and [A resource added by hand to a CPI VM](#a-resource-added-by-hand-to-a-cpi-vm) explains what the CPI then does with it.
 
 - **The delete-time foreign-disk step**
 
@@ -355,6 +355,28 @@ PVE refuses every state request for a resource in `error` except `disabled`, and
 
   `disabled` would stop it, so the CPI removes the resource and registers it again, which leaves the guest running. It marks the work with a `bosh-ha-readd-<unix seconds>` tag until the registration finishes. It does the work only while the VM runs on its own pin, holds no lock, and has no migration, relocation, or disk move task. Without `Sys.Console` it returns a retriable error that names `ha-manager remove vm:<vmid>` followed by `ha-manager add vm:<vmid>`. The VM is unmanaged between the removal and the return to `started`, so a node failure in that window leaves it down until the node returns or the resurrector acts. A crash inside the window extends it until the next call that touches the VM, and the tag keeps it visible to the doctor.
 
+### A resource added by hand to a CPI VM
+
+The CPI writes an ownership marker into the comment of every HA resource it creates, and it changes only a resource that carries its marker. When an admin runs `ha-manager add vm:<vmid>` or uses the GUI on a CPI VM, the resource has no marker, and the CPI treats it as not its own. A CPI older than 0.10.0 wrote no marker either, so a resource registered by such a CPI gets the same treatment until a `bosh recreate` replaces the VM. The common case for a hand-added resource is a VM that the CPI left out of HA because its disk sits on node-local storage under `pve.ha.local_policy: none`.
+
+An unmarked resource affects each call as follows.
+
+- **`attach_disk`, `detach_disk`, and `set_vm_metadata`**
+
+  `attach_disk` logs that the resource is not this Director's and changes nothing in HA. The failback step of `detach_disk` skips the resource, and the anti-affinity join of `set_vm_metadata` skips it too. The re-add, the pin widening, the failback flag, and the replica reconcile all skip it as well, so the CPI never writes a pin, a rule, or a replication job for it.
+
+- **`reboot_vm`**
+
+  `reboot_vm` reads the HA state without checking ownership, so it reboots the VM through PVE HA as a stop followed by a start.
+
+- **`delete_vm`**
+
+  `delete_vm` treats the VM as HA-managed, stops it through PVE HA, and destroys it with `purge`, which removes the hand-added resource. A `bosh recreate` builds a new VM and deletes the old one, so the resource does not carry over to the new VM.
+
+In PVE, a hand-added resource on a VM with a node-local disk has no node-affinity pin, has `failback` on by default, and sits in no CPI anti-affinity rule. When its node fails, PVE fences the node and recovers the VM by moving its config to another node and starting it there. The disk is not on that node, so the start fails, and the service ends in the `error` state with its config on the wrong node. That is worse than leaving the VM out of HA, because we must then clear the error and move the config back by hand, as [the dead-node procedure](operations.md#the-dead-node-procedure) describes.
+
+We therefore do not register CPI VMs in HA by hand. A VM that needs HA should use shared storage, `pve.ha.local_policy: hold`, or `replicate` on ZFS, followed by a `bosh recreate` so that `create_vm` registers it. The `pve-ops ha` doctor reports an unmarked resource on a CPI VM as `ha_resource_unmarked`. To clear it, we `bosh recreate` the instance, which makes the HA decision again and deletes the old VM with its resource. When the VM should stay out of HA, we remove the resource with `ha-manager remove vm:<vmid>` instead. The finding is a problem when the VM has a node-local disk and advice otherwise. The one exception is the manual re-add that [Clearing an HA error by hand](operations.md#clearing-an-ha-error-by-hand) describes, which we run only to keep a running VM up while we clear an error.
+
 ## What happens to the disks
 
 A VM is only as recoverable as its volumes. The CPI computes the VM's access set, which is the intersection of the node sets of every volume the VM holds, including its config-drive ISO and its snapshot and state volumes. It narrows that set by the hardware and network needs placement already enforces. A VM is eligible as shared only when the set holds at least two placeable nodes, and when the set is smaller than the cluster, it joins the pin as a strict constraint. A strict AZ doesn't narrow the set for that check. It narrows the pin after the check, so a VM whose strict AZ holds one node is still eligible as shared, and HA restarts it in place on that node. A later call that decides the VM's eligibility again, such as an `attach_disk` or the re-registration of a VM in the error state, can't read the VM's AZ, so it reads the strict AZ from the VM's strict pin. That call applies the pin after the check, as `create_vm` does, so it reaches the same decision for the same volumes.
@@ -384,6 +406,8 @@ Local disks live on one node. A planned maintenance migration can copy them, but
   The CPI creates a ZFS storage replication job from the VM's node to a partner node. During maintenance, HA migrates the VM to the partner, and the replica makes that quick. After a hard failure, HA recovers the VM on the partner from the last replica, and every write since the last sync is lost.
 
   The policy has prerequisites, and a VM that misses one gets no HA. The token needs `VM.Replicate` on `/vms`. Every node-local disk of the VM must sit on a ZFS pool storage that is enabled, is not shared, holds images, and is defined on the VM's node. The volume must not have its replicate flag turned off. A placeable partner node must have a ZFS storage with the same ID, and it must reach the VM's shared volumes. The VM must hold at least one node-local disk, and it must not be a linked clone. Its config-drive ISO must be on shared storage, because replication does not copy a node-local ISO, and a node-local ISO is an error in `managed` mode and when `pve.require_shared_iso_for_ha` is on. A missing prerequisite leaves the VM without HA in `auto` mode, with a warning that names it, and it fails `create_vm` in `managed` mode.
+
+  PVE storage replication works only on ZFS, because it is built on ZFS snapshots and send and receive. LVM and LVM-thin cannot replicate. A VM with a node-local disk on either one is refused with an error such as `volume <volid> is on lvmthin storage <name>, which is not a ZFS pool`. In `auto` mode the VM gets no HA and the CPI logs that error as a warning, but `create_vm` continues. In `managed` mode `create_vm` fails with the error. A cluster whose local storage is LVM should use `hold` or shared storage. `hold` does not check the storage type, so it works on LVM and LVM-thin, but it only restarts the VM in place when its node returns and never recovers the VM elsewhere. `none` gives the VM no HA.
 
 #### The replicate data-loss window
 
@@ -431,6 +455,8 @@ Three more facts matter for `replicate`.
 | Node leaves maintenance | HA moves the VM back with a live migration, because its `failback` is on unless `pve.ha.failback` is `false` | Nothing moves, because the VM never left | Nothing moves, because the VM never left | The VM stays on the partner, because its `failback` is off |
 | Node fails hard | HA restarts the VM elsewhere, usually within a few minutes | The VM stays down until the node returns or an operator moves its config | HA restarts the VM in place when the node returns | HA restarts the VM on the partner and loses the writes since the last sync |
 | Data loss on a hard failure | None | None, but the disk is unavailable | None, but the VM waits | Everything since the last successful sync, and the old node's newer writes are destroyed on its first sync after it returns |
+
+Only `replicate` needs ZFS. A VM with a disk on LVM or LVM-thin cannot replicate, so it gets no HA under `replicate` in `auto` mode and fails `create_vm` in `managed` mode. Such a VM belongs under `hold` or on shared storage.
 
 ## Choose a CPU type for HA
 

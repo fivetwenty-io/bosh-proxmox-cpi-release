@@ -12,6 +12,14 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Added
+
+- `pve-ops ha` now reports `ha_resource_unmarked` for a CPI VM whose PVE HA resource carries no CPI ownership marker, which is what an admin's own `ha-manager add` leaves and also what a CPI older than 0.10.0 wrote. The CPI changes no resource without its marker, so such a resource has no node-affinity pin, keeps PVE's `failback` setting, and sits in no CPI anti-affinity rule. The finding is a problem when the VM has a disk on node-local storage, because PVE can't recover that VM on another node, and it's advice otherwise. The finding tells the operator to `bosh recreate` the instance, or to remove the resource with `ha-manager remove` when the VM should stay out of HA. The doctor still writes nothing for it.
+
+### Changed
+
+- The HA docs now describe what the CPI does with an HA resource that someone adds by hand to a CPI VM, and why we advise against it. They also say that `pve.ha.local_policy: replicate` needs a ZFS pool. A VM with a node-local disk on LVM or LVM-thin therefore gets no HA in `auto` mode and fails `create_vm` in `managed` mode, while `hold` works on any node-local storage.
+
 ## [0.13.1] - 2026-11-24
 
 ### Removed
