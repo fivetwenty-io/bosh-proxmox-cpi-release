@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
@@ -96,4 +97,38 @@ func TestCollectOptedOutGroupMemberIsNotAnHAMember(t *testing.T) {
 	r := runCollect(t, f, haCfg("auto", "none"))
 	want(t, r, haKindHAOptOut, haSeverityAdvice, "vm:103")
 	wantNone(t, r, optOutKindsThatMustNotFire...)
+}
+
+// TestCollectOptedOutVMWithUnreadableResources pins that the doctor never
+// says an opted-out VM is out of PVE HA when it could not read the HA
+// resources. It reports the VM as unchecked instead, because a resource
+// someone added by hand would go unseen, and it gives no ha_opt_out advice.
+func TestCollectOptedOutVMWithUnreadableResources(t *testing.T) {
+	t.Parallel()
+	f := haBaseFake()
+	optOutGuest(f, 101, "n2", "bosh-cpi;bosh-ha-off")
+	f.resourcesErr = errFake
+	r := runCollect(t, f, haCfg("auto", "none"))
+	wantNone(t, r, haKindHAOptOut)
+	var found bool
+	for _, got := range findings(r, haKindUnchecked) {
+		if got.Subject != "vm:101" {
+			continue
+		}
+		found = true
+		if got.Severity != haSeverityProblem {
+			t.Errorf("unchecked severity = %s, want %s", got.Severity, haSeverityProblem)
+		}
+		for _, frag := range []string{"VM 101", "bosh-ha-off", "HA resources could not be read"} {
+			if !strings.Contains(got.Detail, frag) {
+				t.Errorf("unchecked detail %q, want it to mention %q", got.Detail, frag)
+			}
+		}
+		if strings.Contains(got.Detail, "keeps it out of PVE HA") {
+			t.Errorf("unchecked detail %q claims the VM is out of PVE HA", got.Detail)
+		}
+	}
+	if !found {
+		t.Fatalf("no unchecked finding names vm:101; all findings: %+v", r.Findings)
+	}
 }

@@ -2792,12 +2792,20 @@ func (c *haCollector) guestLeftovers() {
 // property kept it out of PVE HA, so with no HA resource it gets advice that
 // names it. One that has an HA resource anyway is a problem, because PVE HA
 // runs a VM the manifest keeps out of HA, so someone registered it by hand or
-// the tag was written by hand.
+// the tag was written by hand. When the HA resources could not be read, the
+// doctor cannot tell which case holds, so it reports the VM as unchecked and
+// never says that the VM is out of PVE HA.
 func (c *haCollector) optOutFinding(g *haGuest) {
 	if !g.owned || !g.hasTag(haOffTag) {
 		return
 	}
-	if c.resourcesOK && g.resource != nil {
+	if !c.resourcesOK {
+		c.rep.unchecked(g.sid,
+			"VM %d on %s carries %s, but the HA resources could not be read, so whether PVE HA runs it anyway is "+
+				"unchecked", g.ref.VMID, g.ref.Node, haOffTag)
+		return
+	}
+	if g.resource != nil {
 		c.rep.problem(haKindHAOptOut, g.sid,
 			"VM %d on %s carries %s, so its ha cloud property keeps it out of PVE HA, but it has the HA resource %s. "+
 				"Remove the resource with ha-manager remove %s, or drop ha: false from the instance's cloud "+
