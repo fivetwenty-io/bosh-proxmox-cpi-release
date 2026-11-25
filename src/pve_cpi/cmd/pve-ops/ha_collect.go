@@ -39,6 +39,8 @@ const (
 	// haReplicaTag marks a VM that the replicate local policy set up a
 	// replication job for.
 	haReplicaTag = "bosh-ha-replica"
+	// haOffTag marks a VM whose ha cloud property kept it out of PVE HA.
+	haOffTag = "bosh-ha-off"
 	// haBirthTagPrefix starts the tag a create_vm writes until it finishes.
 	haBirthTagPrefix = "bosh-creating-"
 	// haPinRulePrefix starts the name of a node-affinity pin, bosh-na-<vmid>.
@@ -115,6 +117,12 @@ type haGuest struct {
 }
 
 func (g *haGuest) hasTag(tag string) bool { return g.tags[tag] }
+
+// optedOut reports whether g is a CPI VM that its ha cloud property kept out
+// of PVE HA and that has no HA resource. The doctor treats such a VM as a VM
+// without HA by choice, so no finding fires only because it is out of HA, and
+// it is not an HA member of its anti-affinity group.
+func (g *haGuest) optedOut() bool { return g.owned && g.hasTag(haOffTag) && g.resource == nil }
 
 // tagsWithPrefix returns the guest's tags that start with prefix, sorted.
 func (g *haGuest) tagsWithPrefix(prefix string) []string {
@@ -727,7 +735,10 @@ func (c *haCollector) antiAffinityFindings() {
 	}
 	groups := map[string][]*haGuest{}
 	for _, g := range c.guests {
-		if !g.owned || !c.groupMember(g) {
+		// An opted-out member is no HA member of its group, the same as a
+		// member the HA decision refused, so it neither splits nor shortens
+		// the group's rules.
+		if !g.owned || g.optedOut() || !c.groupMember(g) {
 			continue
 		}
 		for t := range g.tags {
@@ -1311,7 +1322,7 @@ func (c *haCollector) cpuFindings() {
 			c.cpuMultiDomain(g, cpu, dom, known)
 		}
 		if !c.off() && c.p.Effective != ha.EffectiveObserveOnly && c.resourcesOK && g.resource == nil && !c.inFlight(g) &&
-			(!known || len(dom.Nodes) < 2) {
+			!g.optedOut() && (!known || len(dom.Nodes) < 2) {
 			why := "the CPU of node " + g.ref.Node + " is unknown"
 			if known {
 				why = fmt.Sprintf("its CPU migration domain holds %d node(s)", len(dom.Nodes))
@@ -1415,7 +1426,7 @@ func (c *haCollector) protectionFindings() {
 			continue
 		}
 		if g.resource == nil {
-			if c.inFlight(g) {
+			if c.inFlight(g) || g.optedOut() {
 				continue
 			}
 			detail := fmt.Sprintf("VM %d on %s holds node-local volumes (%s) and runs without HA; pve.ha.local_policy is %s",
@@ -2773,7 +2784,30 @@ func (c *haCollector) guestLeftovers() {
 			c.rep.problem(haKindManagedNoResource, g.sid,
 				"VM %d on %s carries %s but has no HA resource", g.ref.VMID, g.ref.Node, haManagedTag)
 		}
+		c.optOutFinding(g)
 	}
+}
+
+// optOutFinding reports a CPI VM that carries haOffTag. The VM's ha cloud
+// property kept it out of PVE HA, so with no HA resource it gets advice that
+// names it. One that has an HA resource anyway is a problem, because PVE HA
+// runs a VM the manifest keeps out of HA, so someone registered it by hand or
+// the tag was written by hand.
+func (c *haCollector) optOutFinding(g *haGuest) {
+	if !g.owned || !g.hasTag(haOffTag) {
+		return
+	}
+	if c.resourcesOK && g.resource != nil {
+		c.rep.problem(haKindHAOptOut, g.sid,
+			"VM %d on %s carries %s, so its ha cloud property keeps it out of PVE HA, but it has the HA resource %s; "+
+				"remove the resource with ha-manager remove %s, or drop ha: false from the instance's cloud "+
+				"properties and run bosh recreate on it to put it under HA", g.ref.VMID, g.ref.Node, haOffTag,
+			g.sid, g.sid)
+		return
+	}
+	c.rep.advise(haKindHAOptOut, g.sid,
+		"VM %d on %s carries %s, so its ha cloud property keeps it out of PVE HA, and only the BOSH resurrector "+
+			"recovers it", g.ref.VMID, g.ref.Node, haOffTag)
 }
 
 // ownerTagMissing advises on a VM the CPI created that carries no owner tag

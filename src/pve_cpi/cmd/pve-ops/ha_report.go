@@ -67,6 +67,7 @@ const (
 	haKindBirthTagStale         = "birth_tag_stale"
 	haKindReaddTag              = "readd_tag"
 	haKindManagedNoResource     = "managed_without_resource"
+	haKindHAOptOut              = "ha_opt_out"
 	haKindOwnerTagMissing       = "owner_tag_missing"
 	haKindOffModeResource       = "off_mode_resource"
 	haKindOffModeRule           = "off_mode_rule"
