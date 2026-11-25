@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -271,5 +272,44 @@ func TestHALocalRootPredicate_OptedOutVMKeepsItsCloneMode(t *testing.T) {
 				t.Fatalf("root mechanism = %q; want %q", got, storageMechanismLinkedClone)
 			}
 		})
+	}
+}
+
+// TestBuildVMShapeForNode_OptOutTagSurvivesTheTagCap pins that bosh-ha-off
+// survives the tag-length cap the way the ownership tags do. Long operator
+// tags push the create's first tag list past the cap, and the cap drops
+// operator tags rather than the opt-out marker. A later merge, such as the one
+// set_vm_metadata runs over a list PVE may hand back sorted, keeps it too.
+func TestBuildVMShapeForNode_OptOutTagSurvivesTheTagCap(t *testing.T) {
+	t.Parallel()
+	deps := Deps{Config: haOptOutConfig(config.HAModeAuto), PVE: &shapeTestPVEClient{}, Logger: log.NewNopLogger(),
+		RequestDirectorUUID: aaDirector}
+	parsed := minimalParsedArgs("test-storage")
+	parsed.cloudProps.haOff = true
+	parsed.cloudProps.Tags = map[string]string{}
+	for _, k := range []string{"k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8"} {
+		parsed.cloudProps.Tags[k] = strings.Repeat("v", 60)
+	}
+	shape, err := buildVMShapeForNode(context.Background(), deps, parsed, "pve01")
+	if err != nil {
+		t.Fatalf("buildVMShapeForNode: %v", err)
+	}
+	if len(shape.initialTags) > maxTagLength {
+		t.Fatalf("initial tags are %d bytes, over the %d-byte cap", len(shape.initialTags), maxTagLength)
+	}
+	entries := parseTagsField(shape.initialTags)
+	if !slices.Contains(entries, haOffTag) {
+		t.Fatalf("initial tags %q lost %s to the tag-length cap", shape.initialTags, haOffTag)
+	}
+	if !slices.ContainsFunc(entries, func(e string) bool { return strings.HasPrefix(e, "k") }) {
+		t.Fatalf("initial tags %q kept no operator tag; the rig must leave room for some", shape.initialTags)
+	}
+
+	sorted := slices.Clone(entries)
+	slices.Sort(sorted)
+	extra := []string{"director--" + strings.Repeat("d", 120), "deployment--" + strings.Repeat("e", 120)}
+	merged, dropped := mergeTagListReporting(hoistHeadTags(sorted), extra, maxTagLength)
+	if !slices.Contains(parseTagsField(merged), haOffTag) || slices.Contains(dropped, haOffTag) {
+		t.Fatalf("merged %q dropped %v; want %s kept", merged, dropped, haOffTag)
 	}
 }

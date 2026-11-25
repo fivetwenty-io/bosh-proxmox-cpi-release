@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -22,9 +23,10 @@ import (
 
 // initialTagHead returns the tags that open a new VM's tag list. ownershipTag
 // comes first, then the owner tag naming the requesting Director, then the
-// cluster stamp and CID token tags. They come ahead of every stemcell,
-// retention, route, and operator tag because mergeTagList truncates from the
-// tail, and the ownership record must be the last thing a long list gives up.
+// cluster stamp and CID token tags, then haOffTag for a VM whose ha cloud
+// property kept it out of HA. They come ahead of every stemcell, retention,
+// route, and operator tag because mergeTagList truncates from the tail, and
+// the ownership record must be the last thing a long list gives up.
 // buildVMShapeForNode fails a create whose list would lose a stamp tag. A
 // request without a director_uuid gets no owner tag, and warnMissingOwnerTag
 // says so once per create_vm, because this runs once for every placement
@@ -35,7 +37,11 @@ func initialTagHead(deps Deps, parsed *createVMParsedArgs) []string {
 	if owner := ownerTagFor(deps.RequestDirectorUUID); owner != "" {
 		head = append(head, owner)
 	}
-	return append(head, stampTags(parsed)...)
+	head = append(head, stampTags(parsed)...)
+	if parsed != nil && parsed.cloudProps.haOff {
+		head = append(head, haOffTag)
+	}
+	return head
 }
 
 // warnMissingOwnerTag logs, once for the whole create_vm call, that the
@@ -120,12 +126,6 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	if tag := antiAffinityGroupTag(deps, parsed.env); tag != "" {
 		baseRetainTags = append(baseRetainTags, tag)
 	}
-	// The opt-out tag marks a VM that the ha cloud property kept out of HA.
-	// It rides in the first tag list, so it costs no extra write and dies
-	// with the VM on a create rollback.
-	if cp.haOff {
-		baseRetainTags = append(baseRetainTags, haOffTag)
-	}
 	// The stemcell tag goes last, behind the advertised-route provenance in
 	// baseRetainTags. mergeTagList truncates from the tail, and an evicted
 	// advrt- tag is an SDN subnet delete_vm can no longer withdraw, while an
@@ -146,6 +146,14 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 				"that route loses automatic cleanup on delete_vm",
 				log.String("tag", tag))
 		}
+	}
+	// The opt-out tag rides in the head of the first tag list, so it costs no
+	// extra write, dies with the VM on a create rollback, and the cap drops it
+	// only when the head tags alone overflow the list.
+	if cp.haOff && !slices.Contains(parseTagsField(initialTags), haOffTag) {
+		deps.Log(ctx).Warn("create_vm: the "+haOffTag+" tag was dropped by the tag-length cap, so the VM runs "+
+			"without HA but the pve-ops ha doctor cannot tell that its ha cloud property kept it out",
+			log.String("tag", haOffTag))
 	}
 	if tag := stemcellIdentityTag(parsed); tag != "" && !strings.Contains(initialTags, tag) {
 		deps.Log(ctx).Warn("create_vm: stemcell provenance tag dropped by tag-length cap — "+

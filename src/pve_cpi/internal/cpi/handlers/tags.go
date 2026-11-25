@@ -70,11 +70,14 @@ const (
 	clusterStampTagPrefix = "bosh-cluster--"
 )
 
-// headTagPrefixes are the create-time tags that ownership decisions read. We
-// keep them at the head of a VM's tag list, right behind ownershipTag, because
-// mergeTagList truncates from the tail and an ownership record that falls off
-// a long list cannot be told apart from one that was never written.
-var headTagPrefixes = []string{ownerTagPrefix, cidStampTagPrefix, clusterStampTagPrefix}
+// headTagPrefixes are the create-time tags that ownership decisions read, and
+// the HA opt-out marker. We keep them at the head of a VM's tag list, right
+// behind ownershipTag, and the byte cap never drops them, because mergeTagList
+// truncates from the tail and an ownership record that falls off a long list
+// cannot be told apart from one that was never written. The same holds for
+// haOffTag, which is written once at create time and is the only record that
+// the VM's ha cloud property kept it out of PVE HA.
+var headTagPrefixes = []string{ownerTagPrefix, cidStampTagPrefix, clusterStampTagPrefix, haOffTag}
 
 // ownerTagFor renders the owner tag for a Director UUID, lowercased so every
 // writer and reader sees one canonical form whatever case the request used. It
@@ -369,7 +372,8 @@ func capTagParts(parts []string, size, maxBytes int) (string, []string) {
 
 // isIdentityTag reports whether entry is one the byte cap must never drop,
 // compared without regard to case. They are the tags that say whose guest this
-// is, and the identity tag that names the prefix it belongs to.
+// is, the HA opt-out marker, and the identity tag that names the prefix it
+// belongs to.
 func isIdentityTag(entry string) bool {
 	return strings.EqualFold(entry, ownershipTag) || hasHeadTagPrefix(entry) ||
 		strings.HasPrefix(strings.ToLower(entry), pve.ParkerPrefixTagPrefix)
