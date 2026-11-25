@@ -156,13 +156,20 @@ func TestHARegistrationFeatures_OptedOutVMHasNone(t *testing.T) {
 }
 
 // TestBuildHeadroomPlan_OptedOutVMNeedsNoRoom pins that the headroom check
-// skips an opted-out VM, because PVE HA never restarts it elsewhere.
+// skips an opted-out VM, because PVE HA never restarts it elsewhere. The same
+// rig and resolver build a plan for a VM that keeps HA, so the nil plan comes
+// from the opt-out and not from a missing input.
 func TestBuildHeadroomPlan_OptedOutVMNeedsNoRoom(t *testing.T) {
 	t.Parallel()
-	deps, _, parsed := decideRig(config.HAModeAuto, aaDirector, nil)
-	parsed.cloudProps.haOff = true
-	if p := buildHeadroomPlan(context.Background(), deps, parsed.cloudProps, nil, nil, nil, bridgePlan{}, nil,
-		log.NewNopLogger()); p != nil {
+	rig := newHeadroomRig(t, config.HAModeAuto, config.HAHeadroomEnforce, nil, nil)
+	facts := factsOf("pve01", "pve02", "pve03")
+	resolver := mustResolver(t, rig.deps)
+	if p := testBuildPlan(t, rig.deps, createVMCloudProps{Memory: 4096}, resolver, bridgePlan{}, facts,
+		rig.deps.Logger); p == nil {
+		t.Fatal("the rig must build a headroom plan for a VM that keeps HA, or the test proves nothing")
+	}
+	if p := testBuildPlan(t, rig.deps, createVMCloudProps{Memory: 4096, haOff: true}, resolver, bridgePlan{}, facts,
+		rig.deps.Logger); p != nil {
 		t.Fatalf("plan = %+v; want no headroom plan for an opted-out VM", p)
 	}
 }
@@ -183,10 +190,14 @@ func TestAntiAffinityPartnersForCreate_OptedOutVMHasNoPartners(t *testing.T) {
 	}
 }
 
-// TestJoinAntiAffinityAtMetadata_OptedOutVMJoinsNoRule pins that the
-// set_vm_metadata join after the create writes no rule for an opted-out
-// member, which carries the group tag and bosh-ha-off but no HA resource.
-func TestJoinAntiAffinityAtMetadata_OptedOutVMJoinsNoRule(t *testing.T) {
+// TestJoinAntiAffinityAtMetadata_MemberWithoutResourceJoinsNoRule pins
+// behavior that predates the ha cloud property. The set_vm_metadata join
+// after the create adds only a member that has an HA resource to its group's
+// rule, so a member with no resource, such as an opted-out VM that carries
+// the group tag and bosh-ha-off, joins no rule. The opt-out adds no check of
+// its own here. It relies on this one, because the create registers no
+// resource for the VM.
+func TestJoinAntiAffinityAtMetadata_MemberWithoutResourceJoinsNoRule(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
 	stub.tagged(aaQEMU(100, aaTag+";index--0"), aaQEMU(101, aaTag+";index--1"),

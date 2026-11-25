@@ -16,24 +16,40 @@ import (
 
 // managedRefusalRig is a create_vm call under pve.ha.mode managed on a
 // single-node cluster whose HA profile the test supplies. It counts every
-// create and clone that reaches PVE.
+// create and clone that reaches PVE, and keeps the tags the last one sent.
 type managedRefusalRig struct {
 	deps     handlers.Deps
 	created  atomic.Int32
 	cloned   atomic.Int32
 	resolved atomic.Int32
+	tags     atomic.Value
+}
+
+// keepTags records the tags a create or clone sends, when it sends any.
+func (r *managedRefusalRig) keepTags(params map[string]any) {
+	if tags, ok := params["tags"].(string); ok {
+		r.tags.Store(tags)
+	}
+}
+
+// sentTags returns the tags the last create or clone sent, or "".
+func (r *managedRefusalRig) sentTags() string {
+	tags, _ := r.tags.Load().(string)
+	return tags
 }
 
 func newManagedRefusalRig(t *testing.T, profile *ha.Profile, profileErr error, mutate func(*config.CPIConfig)) *managedRefusalRig {
 	t.Helper()
 	r := &managedRefusalRig{}
 	q := &vmMockQEMU{
-		createFn: func(context.Context, string, map[string]any) (string, error) {
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
 			r.created.Add(1)
+			r.keepTags(params)
 			return "UPID:pve:create:ok", nil
 		},
-		cloneFn: func(context.Context, string, int, map[string]any) (string, error) {
+		cloneFn: func(_ context.Context, _ string, _ int, params map[string]any) (string, error) {
 			r.cloned.Add(1)
+			r.keepTags(params)
 			return "UPID:pve:clone:ok", nil
 		},
 	}
