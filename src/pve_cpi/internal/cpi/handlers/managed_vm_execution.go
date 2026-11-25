@@ -42,6 +42,12 @@ type StorageVMExecution struct {
 	PoolDirector      string
 	PoolDeployment    string
 	PoolInstanceGroup string
+	// HAOff records that the create's ha cloud property kept the VM out of
+	// PVE HA, so a resumed create clones it as a VM without HA. The key is
+	// written only when it is true, so the plan of a VM that keeps HA reads
+	// the same as one written before the key existed, and a release without
+	// the key, whose strict decode refuses an unknown field, still reads it.
+	HAOff bool `json:",omitempty"`
 }
 
 func freezeManagedVMExecution(cfg *config.CPIConfig, shape *createVMShape) (*StorageVMExecution, error) {
@@ -82,6 +88,7 @@ func freezeManagedVMExecution(cfg *config.CPIConfig, shape *createVMShape) (*Sto
 		PoolDirector:      shape.vmPoolDirector,
 		PoolDeployment:    shape.vmPoolDeployment,
 		PoolInstanceGroup: shape.vmPoolInstanceGrp,
+		HAOff:             shape.haOff,
 	}
 	execution.RootOptions = maps.Clone(shape.rootDiskPerfOpts)
 	if shape.balloonMiB != nil {
@@ -127,6 +134,7 @@ func (e *StorageVMExecution) shape(cfg *config.CPIConfig) (*createVMShape, error
 		vmPoolDirector:    e.PoolDirector,
 		vmPoolDeployment:  e.PoolDeployment,
 		vmPoolInstanceGrp: e.PoolInstanceGroup,
+		haOff:             e.HAOff,
 	}
 	shape.rootDiskPerfOpts = maps.Clone(e.RootOptions)
 	if e.BalloonMiB != nil {

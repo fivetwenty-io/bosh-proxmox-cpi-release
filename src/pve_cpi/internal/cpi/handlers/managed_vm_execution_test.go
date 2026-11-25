@@ -40,3 +40,40 @@ func TestManagedVMExecutionFreezeAndCredentialRotation(t *testing.T) {
 		t.Fatal("changed network defaults accepted")
 	}
 }
+
+// TestManagedVMExecutionCarriesTheHAOptOut pins that a recorded VM execution
+// carries the create's ha opt-out through the journal, so a resumed create
+// clones an opted-out VM as a VM without HA. A VM that keeps HA records no
+// opt-out key, so its plan reads the same as before the key existed and an
+// older release can still decode it.
+func TestManagedVMExecutionCarriesTheHAOptOut(t *testing.T) {
+	cfg := &config.CPIConfig{NetworkBridge: "bridge-a"}
+	for name, haOff := range map[string]bool{"opted out": true, "keeps HA": false} {
+		t.Run(name, func(t *testing.T) {
+			frozen, err := freezeManagedVMExecution(cfg, &createVMShape{node: "n", vmStorage: "s", haOff: haOff})
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := json.Marshal(frozen)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(raw), "HAOff") != haOff {
+				t.Fatalf("recorded execution %s; want the opt-out key present %v", raw, haOff)
+			}
+			d := json.NewDecoder(strings.NewReader(string(raw)))
+			d.DisallowUnknownFields()
+			var decoded StorageVMExecution
+			if err := d.Decode(&decoded); err != nil {
+				t.Fatal(err)
+			}
+			restored, err := decoded.shape(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if restored.haOff != haOff {
+				t.Fatalf("restored haOff = %v; want %v", restored.haOff, haOff)
+			}
+		})
+	}
+}
