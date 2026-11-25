@@ -378,7 +378,7 @@ func (s *shapeTestClusterStorage) ListStorage(_ context.Context, _ *sdkclusterst
 func (s *shapeTestClusterStorage) CreateStorage(_ context.Context, _ *sdkclusterstorage.CreateStorageParams) (*sdkclusterstorage.CreateStorageResponse, error) {
 	panic("shapeTestClusterStorage.CreateStorage: not expected")
 }
-func (s *shapeTestClusterStorage) DeleteStorage(_ context.Context, _ string) error {
+func (s *shapeTestClusterStorage) DeleteStorage(_ context.Context, _ string, _ *sdkclusterstorage.DeleteStorageParams) error {
 	panic("shapeTestClusterStorage.DeleteStorage: not expected")
 }
 func (s *shapeTestClusterStorage) GetStorage(_ context.Context, _ string) (*sdkclusterstorage.GetStorageResponse, error) {
@@ -1023,7 +1023,9 @@ func (s *localStorageSvc) ListStorage(_ context.Context, _ *sdkclusterstorage.Li
 func (s *localStorageSvc) CreateStorage(_ context.Context, _ *sdkclusterstorage.CreateStorageParams) (*sdkclusterstorage.CreateStorageResponse, error) {
 	panic("not needed")
 }
-func (s *localStorageSvc) DeleteStorage(_ context.Context, _ string) error { panic("not needed") }
+func (s *localStorageSvc) DeleteStorage(_ context.Context, _ string, _ *sdkclusterstorage.DeleteStorageParams) error {
+	panic("not needed")
+}
 func (s *localStorageSvc) GetStorage(_ context.Context, _ string) (*sdkclusterstorage.GetStorageResponse, error) {
 	panic("not needed")
 }
@@ -1516,7 +1518,7 @@ func (s *templateGapClusterStorageSvc) ListStorage(_ context.Context, _ *sdkclus
 func (s *templateGapClusterStorageSvc) CreateStorage(_ context.Context, _ *sdkclusterstorage.CreateStorageParams) (*sdkclusterstorage.CreateStorageResponse, error) {
 	panic("not needed")
 }
-func (s *templateGapClusterStorageSvc) DeleteStorage(_ context.Context, _ string) error {
+func (s *templateGapClusterStorageSvc) DeleteStorage(_ context.Context, _ string, _ *sdkclusterstorage.DeleteStorageParams) error {
 	panic("not needed")
 }
 func (s *templateGapClusterStorageSvc) GetStorage(_ context.Context, _ string) (*sdkclusterstorage.GetStorageResponse, error) {
@@ -2028,7 +2030,9 @@ func (s *sharedStorageSvc) ListStorage(_ context.Context, _ *sdkclusterstorage.L
 func (s *sharedStorageSvc) CreateStorage(_ context.Context, _ *sdkclusterstorage.CreateStorageParams) (*sdkclusterstorage.CreateStorageResponse, error) {
 	panic("not needed")
 }
-func (s *sharedStorageSvc) DeleteStorage(_ context.Context, _ string) error { panic("not needed") }
+func (s *sharedStorageSvc) DeleteStorage(_ context.Context, _ string, _ *sdkclusterstorage.DeleteStorageParams) error {
+	panic("not needed")
+}
 func (s *sharedStorageSvc) GetStorage(_ context.Context, _ string) (*sdkclusterstorage.GetStorageResponse, error) {
 	panic("not needed")
 }

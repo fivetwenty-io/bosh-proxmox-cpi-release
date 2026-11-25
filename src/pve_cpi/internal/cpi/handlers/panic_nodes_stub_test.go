@@ -1462,3 +1462,91 @@ func (s *panicNodesStub) CreateWakeonlan(ctx context.Context, node string) (*nod
 func (s *panicNodesStub) DeleteCephFs(ctx context.Context, node string, name string, params *nodes.DeleteCephFsParams) (*nodes.DeleteCephFsResponse, error) {
 	panic("panicNodesStub.DeleteCephFs: not expected")
 }
+
+func (s *panicNodesStub) ListAccessLog(_ context.Context, _ string, _ *nodes.ListAccessLogParams) (*nodes.ListAccessLogResponse, error) {
+	panic("panicNodesStub.ListAccessLog: not expected")
+}
+
+func (s *panicNodesStub) ListAccessLogStats(_ context.Context, _ string, _ *nodes.ListAccessLogStatsParams) (*nodes.ListAccessLogStatsResponse, error) {
+	panic("panicNodesStub.ListAccessLogStats: not expected")
+}
+
+func (s *panicNodesStub) ListAptHistory(_ context.Context, _ string, _ *nodes.ListAptHistoryParams) (*nodes.ListAptHistoryResponse, error) {
+	panic("panicNodesStub.ListAptHistory: not expected")
+}
+
+func (s *panicNodesStub) ListAptInstalledChangelog(_ context.Context, _ string, _ *nodes.ListAptInstalledChangelogParams) (*nodes.ListAptInstalledChangelogResponse, error) {
+	panic("panicNodesStub.ListAptInstalledChangelog: not expected")
+}
+
+func (s *panicNodesStub) ListAptTermlog(_ context.Context, _ string, _ *nodes.ListAptTermlogParams) (*nodes.ListAptTermlogResponse, error) {
+	panic("panicNodesStub.ListAptTermlog: not expected")
+}
+
+func (s *panicNodesStub) ListAptTransactionChangelogs(_ context.Context, _ string, _ *nodes.ListAptTransactionChangelogsParams) (*nodes.ListAptTransactionChangelogsResponse, error) {
+	panic("panicNodesStub.ListAptTransactionChangelogs: not expected")
+}
+
+func (s *panicNodesStub) ListAptUpdateChangelogs(_ context.Context, _ string) (*nodes.ListAptUpdateChangelogsResponse, error) {
+	panic("panicNodesStub.ListAptUpdateChangelogs: not expected")
+}
+
+func (s *panicNodesStub) UpdateMaintenance(_ context.Context, _ string, _ *nodes.UpdateMaintenanceParams) error {
+	panic("panicNodesStub.UpdateMaintenance: not expected")
+}
+
+func (s *panicNodesStub) ListQemuAgentGetCpustats(_ context.Context, _ string, _ string) (*nodes.ListQemuAgentGetCpustatsResponse, error) {
+	panic("panicNodesStub.ListQemuAgentGetCpustats: not expected")
+}
+
+func (s *panicNodesStub) ListQemuAgentGetDisks(_ context.Context, _ string, _ string) (*nodes.ListQemuAgentGetDisksResponse, error) {
+	panic("panicNodesStub.ListQemuAgentGetDisks: not expected")
+}
+
+func (s *panicNodesStub) ListQemuAgentGetDiskstats(_ context.Context, _ string, _ string) (*nodes.ListQemuAgentGetDiskstatsResponse, error) {
+	panic("panicNodesStub.ListQemuAgentGetDiskstats: not expected")
+}
+
+func (s *panicNodesStub) ListQemuAgentGetLoad(_ context.Context, _ string, _ string) (*nodes.ListQemuAgentGetLoadResponse, error) {
+	panic("panicNodesStub.ListQemuAgentGetLoad: not expected")
+}
+
+func (s *panicNodesStub) ListSan(_ context.Context, _ string) (*nodes.ListSanResponse, error) {
+	panic("panicNodesStub.ListSan: not expected")
+}
+
+func (s *panicNodesStub) ListSanIscsi(_ context.Context, _ string) (*nodes.ListSanIscsiResponse, error) {
+	panic("panicNodesStub.ListSanIscsi: not expected")
+}
+
+func (s *panicNodesStub) ListSanIscsiStatus(_ context.Context, _ string) (*nodes.ListSanIscsiStatusResponse, error) {
+	panic("panicNodesStub.ListSanIscsiStatus: not expected")
+}
+
+func (s *panicNodesStub) ListSanIscsiTarget(_ context.Context, _ string) (*nodes.ListSanIscsiTargetResponse, error) {
+	panic("panicNodesStub.ListSanIscsiTarget: not expected")
+}
+
+func (s *panicNodesStub) ListSanLuns(_ context.Context, _ string) (*nodes.ListSanLunsResponse, error) {
+	panic("panicNodesStub.ListSanLuns: not expected")
+}
+
+func (s *panicNodesStub) ListSanNvmeof(_ context.Context, _ string) (*nodes.ListSanNvmeofResponse, error) {
+	panic("panicNodesStub.ListSanNvmeof: not expected")
+}
+
+func (s *panicNodesStub) ListSanNvmeofController(_ context.Context, _ string) (*nodes.ListSanNvmeofControllerResponse, error) {
+	panic("panicNodesStub.ListSanNvmeofController: not expected")
+}
+
+func (s *panicNodesStub) DeleteSanNvmeofController(_ context.Context, _ string, _ string, _ *nodes.DeleteSanNvmeofControllerParams) (*nodes.DeleteSanNvmeofControllerResponse, error) {
+	panic("panicNodesStub.DeleteSanNvmeofController: not expected")
+}
+
+func (s *panicNodesStub) ListSanNvmeofStatus(_ context.Context, _ string) (*nodes.ListSanNvmeofStatusResponse, error) {
+	panic("panicNodesStub.ListSanNvmeofStatus: not expected")
+}
+
+func (s *panicNodesStub) ListScanNvmeof(_ context.Context, _ string, _ *nodes.ListScanNvmeofParams) (*nodes.ListScanNvmeofResponse, error) {
+	panic("panicNodesStub.ListScanNvmeof: not expected")
+}

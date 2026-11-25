@@ -65,7 +65,10 @@ func (n *replicationSDKNodes) CreateReplicationScheduleNow(_ context.Context, no
 func (n *replicationSDKNodes) ListReplicationStatus(context.Context, string, string) (
 	*sdknodes.ListReplicationStatusResponse, error,
 ) {
-	out := n.status
+	var out sdknodes.ListReplicationStatusResponse
+	if err := json.Unmarshal(n.status, &out); err != nil {
+		return nil, err
+	}
 	return &out, nil
 }
 

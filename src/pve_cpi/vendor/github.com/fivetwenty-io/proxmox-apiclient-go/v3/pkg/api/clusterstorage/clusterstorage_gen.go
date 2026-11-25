@@ -31,7 +31,7 @@ type Service interface {
 	CreateStorage(ctx context.Context, params *CreateStorageParams) (*CreateStorageResponse, error)
 	// DeleteStorage DELETE /storage/{storage}
 	// Delete storage configuration.
-	DeleteStorage(ctx context.Context, storage string) error
+	DeleteStorage(ctx context.Context, storage string, params *DeleteStorageParams) error
 	// GetStorage GET /storage/{storage}
 	// Read storage configuration.
 	GetStorage(ctx context.Context, storage string) (*GetStorageResponse, error)
@@ -107,56 +107,58 @@ func (s *service) ListStorage(ctx context.Context, params *ListStorageParams) (*
 
 // CreateStorageParams is the request payload for CreateStorage.
 type CreateStorageParams struct {
-	// Authsupported Authsupported.
-	Authsupported *string `json:"authsupported,omitempty"`
-	// Base Base volume. This volume is automatically activated.
+	// Base Volume ID of the base volume (automatically activated).
 	Base *string `json:"base,omitempty"`
-	// Blocksize ZFS block size
+	// Blocksize ZFS block size.
 	Blocksize *string `json:"blocksize,omitempty"`
 	// Bwlimit Set I/O bandwidth limit for various operations (in KiB/s).
 	Bwlimit *string `json:"bwlimit,omitempty"`
-	// ComstarHg host group for comstar views
+	// ComstarHg Host group for COMSTAR views.
 	ComstarHg *string `json:"comstar_hg,omitempty"`
-	// ComstarTg target group for comstar views
+	// ComstarTg Target group for COMSTAR views.
 	ComstarTg *string `json:"comstar_tg,omitempty"`
-	// Content Allowed content types.  NOTE: the value 'rootdir' is used for Containers, and value 'images' for VMs.
+	// Content Allowed content types.  NOTE: the value 'rootdir' is used for Containers, and value 'images' for VMs. A storage can instead be restricted to some of their volume types: 'vm-vol' for the disks of VMs, 'vm-state' for the saved states of VMs, and 'ct-vol' for the volumes of Containers.
 	Content *string `json:"content,omitempty"`
 	// ContentDirs Overrides for default content type directories.
 	ContentDirs *string `json:"content-dirs,omitempty"`
 	// CreateBasePath Create the base directory if it doesn't exist.
 	CreateBasePath *bool `json:"create-base-path,omitempty"`
-	// CreateSubdirs Populate the directory with the default structure.
+	// CreateSubdirs Populate the base directory with the default structure.
 	CreateSubdirs *bool `json:"create-subdirs,omitempty"`
-	// DataPool Data Pool (for erasure coding only)
+	// DataPool Data pool name for erasure-coded images.
 	DataPool *string `json:"data-pool,omitempty"`
 	// Datastore Proxmox Backup Server datastore name.
 	Datastore *string `json:"datastore,omitempty"`
 	// Disable Flag to disable the storage.
 	Disable *bool `json:"disable,omitempty"`
-	// Domain CIFS domain.
+	// Domain The name of the user domain (workgroup) to use.
 	Domain *string `json:"domain,omitempty"`
 	// EncryptionKey Encryption key. Use 'autogen' to generate one automatically without passphrase.
 	EncryptionKey *string `json:"encryption-key,omitempty"`
-	// Export NFS export path.
+	// Export Path exported by the NFS server (e.g., /srv/nfs).
 	Export *string `json:"export,omitempty"`
+	// FastIoFailTmo Seconds before I/O through a reconnecting path fails. -1 disables this timeout; I/O can remain queued while paths reconnect.
+	FastIoFailTmo *int64 `json:"fast-io-fail-tmo,omitempty"`
 	// Fingerprint Certificate SHA 256 fingerprint.
 	Fingerprint *string `json:"fingerprint,omitempty"`
 	// Format Default image format.
 	Format *string `json:"format,omitempty"`
-	// FsName The Ceph filesystem name.
+	// FsName The name or identifier of the filesystem.
 	FsName *string `json:"fs-name,omitempty"`
-	// Fuse Mount CephFS through FUSE.
+	// Fuse Mount the filesystem through FUSE.
 	Fuse *bool `json:"fuse,omitempty"`
 	// IsMountpoint Assume the given path is an externally managed mountpoint and consider the storage offline if it is not mounted. Using a boolean (yes/no) value serves as a shortcut to using the target path in this field.
 	IsMountpoint *string `json:"is_mountpoint,omitempty"`
-	// Iscsiprovider iscsi provider
+	// Iscsiprovider The iSCSI target implementation used on the remote machine.
 	Iscsiprovider *string `json:"iscsiprovider,omitempty"`
 	// Keyring Client keyring contents (for external clusters).
 	Keyring *string `json:"keyring,omitempty"`
 	// Krbd Always access rbd through krbd kernel module.
 	Krbd *bool `json:"krbd,omitempty"`
-	// LioTpg target portal group for Linux LIO targets
+	// LioTpg Target portal group for Linux LIO targets.
 	LioTpg *string `json:"lio_tpg,omitempty"`
+	// ManagedMultipath Manage multipath access to the storage's LUNs and include them in the cluster-wide path-health monitoring.
+	ManagedMultipath *bool `json:"managed-multipath,omitempty"`
 	// MasterPubkey Base64-encoded, PEM-formatted public RSA key. Used to encrypt a copy of the encryption-key which will be added to each encrypted backup.
 	MasterPubkey *string `json:"master-pubkey,omitempty"`
 	// MaxProtectedBackups Maximal number of protected backups per guest. Use '-1' for unlimited.
@@ -165,28 +167,32 @@ type CreateStorageParams struct {
 	Mkdir *bool `json:"mkdir,omitempty"`
 	// Monhost IP addresses of monitors (for external clusters).
 	Monhost *string `json:"monhost,omitempty"`
-	// Mountpoint mount point
+	// Mountpoint Path to the directory where the storage is mounted.
 	Mountpoint *string `json:"mountpoint,omitempty"`
-	// Namespace Namespace.
+	// Namespace The namespace used for grouping, isolation, or partitioning purposes.
 	Namespace *string `json:"namespace,omitempty"`
 	// Nocow Set the NOCOW flag on files. Disables data checksumming and causes data errors to be unrecoverable from while allowing direct I/O. Only use this if data does not need to be any more safe than on a single ext4 formatted disk with no underlying raid system.
 	Nocow *bool `json:"nocow,omitempty"`
 	// Nodes List of nodes for which the storage configuration applies.
 	Nodes *string `json:"nodes,omitempty"`
-	// Nowritecache disable write caching on the target
+	// Nowritecache Disable write caching on the iSCSI target.
 	Nowritecache *bool `json:"nowritecache,omitempty"`
-	// Options NFS/CIFS mount options (see 'man nfs' or 'man mount.cifs')
+	// OnVolumeRemove Optional actions when removing LVs.
+	OnVolumeRemove *string `json:"on-volume-remove,omitempty"`
+	// Options Comma-separated list of mount options. See 'man nfs', 'man mount.cifs', or 'man mount.ceph' for more information.
 	Options *string `json:"options,omitempty"`
-	// Password Password for accessing the share/datastore.
+	// Password The password used for authentication.
 	Password *string `json:"password,omitempty"`
-	// Path File system path.
+	// Path Path of the storage in the local file system, for example its base directory or mount point.
 	Path *string `json:"path,omitempty"`
-	// Pool Pool.
+	// Pool Name of the pool that stores images.
 	Pool *string `json:"pool,omitempty"`
 	// Port Use this port to connect to the storage instead of the default one (for example, with PBS or ESXi). For NFS and CIFS, use the 'options' option to configure the port via the mount options.
 	Port *int64 `json:"port,omitempty"`
-	// Portal iSCSI portal (IP or DNS name with optional port).
+	// Portal iSCSI portal (IP or hostname, optionally with port).
 	Portal *string `json:"portal,omitempty"`
+	// Portals TCP portals of the NVMe subsystem, as IPv4 or bracketed IPv6 addresses with an optional port (default 4420).
+	Portals *string `json:"portals,omitempty"`
 	// Preallocation Preallocation mode for raw and qcow2 images. Using 'metadata' on raw images results in preallocation=off.
 	Preallocation *string `json:"preallocation,omitempty"`
 	// PruneBackups The retention options with shorter intervals are processed first with --keep-last being the very first one. Each option covers a specific period of time. We say that backups within this period are covered by this option. The next option does not take care of already covered backups and only considers older backups.
@@ -195,11 +201,11 @@ type CreateStorageParams struct {
 	Saferemove *bool `json:"saferemove,omitempty"`
 	// SaferemoveStepsize Wipe step size in MiB. It will be capped to the maximum supported by the storage.
 	SaferemoveStepsize *int64 `json:"saferemove-stepsize,omitempty"`
-	// SaferemoveThroughput Wipe throughput (cstream -t parameter value).
+	// SaferemoveThroughput Wipe throughput in bytes per second (optional suffix: k, m, or g).
 	SaferemoveThroughput *string `json:"saferemove_throughput,omitempty"`
-	// Server Server IP or DNS name.
+	// Server IP address or hostname of the server.
 	Server *string `json:"server,omitempty"`
-	// Share CIFS share.
+	// Share The name of the share to use.
 	Share *string `json:"share,omitempty"`
 	// Shared Indicate that this is a single storage with the same contents on all nodes (or all listed in the 'nodes' option). It will not make the contents of a local storage automatically accessible to other nodes, it just marks an already shared storage as such!
 	Shared *bool `json:"shared,omitempty"`
@@ -209,23 +215,25 @@ type CreateStorageParams struct {
 	Smbversion *string `json:"smbversion,omitempty"`
 	// SnapshotAsVolumeChain Enable support for creating storage-vendor agnostic snapshot through volume backing-chains.
 	SnapshotAsVolumeChain *bool `json:"snapshot-as-volume-chain,omitempty"`
-	// Sparse use sparse volumes
+	// Sparse Use sparse (thin-provisioned) volumes.
 	Sparse *bool `json:"sparse,omitempty"`
 	// Storage The storage identifier.
 	Storage string `json:"storage"`
 	// Subdir Subdir to mount.
 	Subdir *string `json:"subdir,omitempty"`
+	// Subsysnqn The NQN of the NVMe subsystem.
+	Subsysnqn *string `json:"subsysnqn,omitempty"`
 	// TaggedOnly Only list logical volumes tagged with 'pve-vm-ID'.
 	TaggedOnly *bool `json:"tagged_only,omitempty"`
-	// Target iSCSI target.
+	// Target iSCSI target name (an iSCSI Qualified Name - IQN).
 	Target *string `json:"target,omitempty"`
-	// Thinpool LVM thin pool LV name.
+	// Thinpool Name of the LVM thin pool logical volume.
 	Thinpool *string `json:"thinpool,omitempty"`
 	// Type Storage type.
 	Type string `json:"type"`
-	// Username RBD Id.
+	// Username The username for authentication. For RBD and CephFS, the Ceph client ID without the 'client.' prefix.
 	Username *string `json:"username,omitempty"`
-	// Vgname Volume group name.
+	// Vgname LVM volume group name.
 	Vgname *string `json:"vgname,omitempty"`
 	// ZfsBasePath Base path where to look for the created ZFS block devices. Set automatically during creation if not specified. Usually '/dev/zvol'.
 	ZfsBasePath *string `json:"zfs-base-path,omitempty"`
@@ -282,13 +290,31 @@ func (s *service) CreateStorage(ctx context.Context, params *CreateStorageParams
 	return out, nil
 }
 
+// DeleteStorageParams is the request payload for DeleteStorage.
+type DeleteStorageParams struct {
+	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
+	Digest *string `json:"digest,omitempty"`
+}
+
 // DeleteStorage implements Service.DeleteStorage. DELETE /storage/{storage}.
-func (s *service) DeleteStorage(ctx context.Context, storage string) error {
+func (s *service) DeleteStorage(ctx context.Context, storage string, params *DeleteStorageParams) error {
 	if ctx == nil {
 		return fmt.Errorf("clusterstorage.DeleteStorage: ctx must not be nil")
 	}
 	path := fmt.Sprintf("/storage/%s", url.PathEscape(storage))
 	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return fmt.Errorf("clusterstorage.DeleteStorage: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return fmt.Errorf("clusterstorage.DeleteStorage: decode params: %w", err)
+		}
+	}
 	resp, err := s.c.DeleteRawCtx(ctx, path, body)
 	if err != nil {
 		return fmt.Errorf("clusterstorage.DeleteStorage: %w", err)
@@ -335,23 +361,23 @@ func (s *service) GetStorage(ctx context.Context, storage string) (*GetStorageRe
 
 // UpdateStorageParams is the request payload for UpdateStorage.
 type UpdateStorageParams struct {
-	// Blocksize ZFS block size
+	// Blocksize ZFS block size.
 	Blocksize *string `json:"blocksize,omitempty"`
 	// Bwlimit Set I/O bandwidth limit for various operations (in KiB/s).
 	Bwlimit *string `json:"bwlimit,omitempty"`
-	// ComstarHg host group for comstar views
+	// ComstarHg Host group for COMSTAR views.
 	ComstarHg *string `json:"comstar_hg,omitempty"`
-	// ComstarTg target group for comstar views
+	// ComstarTg Target group for COMSTAR views.
 	ComstarTg *string `json:"comstar_tg,omitempty"`
-	// Content Allowed content types.  NOTE: the value 'rootdir' is used for Containers, and value 'images' for VMs.
+	// Content Allowed content types.  NOTE: the value 'rootdir' is used for Containers, and value 'images' for VMs. A storage can instead be restricted to some of their volume types: 'vm-vol' for the disks of VMs, 'vm-state' for the saved states of VMs, and 'ct-vol' for the volumes of Containers.
 	Content *string `json:"content,omitempty"`
 	// ContentDirs Overrides for default content type directories.
 	ContentDirs *string `json:"content-dirs,omitempty"`
 	// CreateBasePath Create the base directory if it doesn't exist.
 	CreateBasePath *bool `json:"create-base-path,omitempty"`
-	// CreateSubdirs Populate the directory with the default structure.
+	// CreateSubdirs Populate the base directory with the default structure.
 	CreateSubdirs *bool `json:"create-subdirs,omitempty"`
-	// DataPool Data Pool (for erasure coding only)
+	// DataPool Data pool name for erasure-coded images.
 	DataPool *string `json:"data-pool,omitempty"`
 	// Delete A list of settings you want to delete.
 	Delete *string `json:"delete,omitempty"`
@@ -359,17 +385,19 @@ type UpdateStorageParams struct {
 	Digest *string `json:"digest,omitempty"`
 	// Disable Flag to disable the storage.
 	Disable *bool `json:"disable,omitempty"`
-	// Domain CIFS domain.
+	// Domain The name of the user domain (workgroup) to use.
 	Domain *string `json:"domain,omitempty"`
 	// EncryptionKey Encryption key. Use 'autogen' to generate one automatically without passphrase.
 	EncryptionKey *string `json:"encryption-key,omitempty"`
+	// FastIoFailTmo Seconds before I/O through a reconnecting path fails. -1 disables this timeout; I/O can remain queued while paths reconnect.
+	FastIoFailTmo *int64 `json:"fast-io-fail-tmo,omitempty"`
 	// Fingerprint Certificate SHA 256 fingerprint.
 	Fingerprint *string `json:"fingerprint,omitempty"`
 	// Format Default image format.
 	Format *string `json:"format,omitempty"`
-	// FsName The Ceph filesystem name.
+	// FsName The name or identifier of the filesystem.
 	FsName *string `json:"fs-name,omitempty"`
-	// Fuse Mount CephFS through FUSE.
+	// Fuse Mount the filesystem through FUSE.
 	Fuse *bool `json:"fuse,omitempty"`
 	// IsMountpoint Assume the given path is an externally managed mountpoint and consider the storage offline if it is not mounted. Using a boolean (yes/no) value serves as a shortcut to using the target path in this field.
 	IsMountpoint *string `json:"is_mountpoint,omitempty"`
@@ -377,8 +405,10 @@ type UpdateStorageParams struct {
 	Keyring *string `json:"keyring,omitempty"`
 	// Krbd Always access rbd through krbd kernel module.
 	Krbd *bool `json:"krbd,omitempty"`
-	// LioTpg target portal group for Linux LIO targets
+	// LioTpg Target portal group for Linux LIO targets.
 	LioTpg *string `json:"lio_tpg,omitempty"`
+	// ManagedMultipath Manage multipath access to the storage's LUNs and include them in the cluster-wide path-health monitoring.
+	ManagedMultipath *bool `json:"managed-multipath,omitempty"`
 	// MasterPubkey Base64-encoded, PEM-formatted public RSA key. Used to encrypt a copy of the encryption-key which will be added to each encrypted backup.
 	MasterPubkey *string `json:"master-pubkey,omitempty"`
 	// MaxProtectedBackups Maximal number of protected backups per guest. Use '-1' for unlimited.
@@ -387,24 +417,28 @@ type UpdateStorageParams struct {
 	Mkdir *bool `json:"mkdir,omitempty"`
 	// Monhost IP addresses of monitors (for external clusters).
 	Monhost *string `json:"monhost,omitempty"`
-	// Mountpoint mount point
+	// Mountpoint Path to the directory where the storage is mounted.
 	Mountpoint *string `json:"mountpoint,omitempty"`
-	// Namespace Namespace.
+	// Namespace The namespace used for grouping, isolation, or partitioning purposes.
 	Namespace *string `json:"namespace,omitempty"`
 	// Nocow Set the NOCOW flag on files. Disables data checksumming and causes data errors to be unrecoverable from while allowing direct I/O. Only use this if data does not need to be any more safe than on a single ext4 formatted disk with no underlying raid system.
 	Nocow *bool `json:"nocow,omitempty"`
 	// Nodes List of nodes for which the storage configuration applies.
 	Nodes *string `json:"nodes,omitempty"`
-	// Nowritecache disable write caching on the target
+	// Nowritecache Disable write caching on the iSCSI target.
 	Nowritecache *bool `json:"nowritecache,omitempty"`
-	// Options NFS/CIFS mount options (see 'man nfs' or 'man mount.cifs')
+	// OnVolumeRemove Optional actions when removing LVs.
+	OnVolumeRemove *string `json:"on-volume-remove,omitempty"`
+	// Options Comma-separated list of mount options. See 'man nfs', 'man mount.cifs', or 'man mount.ceph' for more information.
 	Options *string `json:"options,omitempty"`
-	// Password Password for accessing the share/datastore.
+	// Password The password used for authentication.
 	Password *string `json:"password,omitempty"`
-	// Pool Pool.
+	// Pool Name of the pool that stores images.
 	Pool *string `json:"pool,omitempty"`
 	// Port Use this port to connect to the storage instead of the default one (for example, with PBS or ESXi). For NFS and CIFS, use the 'options' option to configure the port via the mount options.
 	Port *int64 `json:"port,omitempty"`
+	// Portals TCP portals of the NVMe subsystem, as IPv4 or bracketed IPv6 addresses with an optional port (default 4420).
+	Portals *string `json:"portals,omitempty"`
 	// Preallocation Preallocation mode for raw and qcow2 images. Using 'metadata' on raw images results in preallocation=off.
 	Preallocation *string `json:"preallocation,omitempty"`
 	// PruneBackups The retention options with shorter intervals are processed first with --keep-last being the very first one. Each option covers a specific period of time. We say that backups within this period are covered by this option. The next option does not take care of already covered backups and only considers older backups.
@@ -413,10 +447,8 @@ type UpdateStorageParams struct {
 	Saferemove *bool `json:"saferemove,omitempty"`
 	// SaferemoveStepsize Wipe step size in MiB. It will be capped to the maximum supported by the storage.
 	SaferemoveStepsize *int64 `json:"saferemove-stepsize,omitempty"`
-	// SaferemoveThroughput Wipe throughput (cstream -t parameter value).
+	// SaferemoveThroughput Wipe throughput in bytes per second (optional suffix: k, m, or g).
 	SaferemoveThroughput *string `json:"saferemove_throughput,omitempty"`
-	// Server Server IP or DNS name.
-	Server *string `json:"server,omitempty"`
 	// Shared Indicate that this is a single storage with the same contents on all nodes (or all listed in the 'nodes' option). It will not make the contents of a local storage automatically accessible to other nodes, it just marks an already shared storage as such!
 	Shared *bool `json:"shared,omitempty"`
 	// SkipCertVerification Disable TLS certificate verification, only enable on fully trusted networks!
@@ -425,13 +457,15 @@ type UpdateStorageParams struct {
 	Smbversion *string `json:"smbversion,omitempty"`
 	// SnapshotAsVolumeChain Enable support for creating storage-vendor agnostic snapshot through volume backing-chains.
 	SnapshotAsVolumeChain *bool `json:"snapshot-as-volume-chain,omitempty"`
-	// Sparse use sparse volumes
+	// Sparse Use sparse (thin-provisioned) volumes.
 	Sparse *bool `json:"sparse,omitempty"`
 	// Subdir Subdir to mount.
 	Subdir *string `json:"subdir,omitempty"`
 	// TaggedOnly Only list logical volumes tagged with 'pve-vm-ID'.
 	TaggedOnly *bool `json:"tagged_only,omitempty"`
-	// Username RBD Id.
+	// Type Storage type.
+	Type *string `json:"type,omitempty"`
+	// Username The username for authentication. For RBD and CephFS, the Ceph client ID without the 'client.' prefix.
 	Username *string `json:"username,omitempty"`
 	// ZfsBasePath Base path where to look for the created ZFS block devices. Set automatically during creation if not specified. Usually '/dev/zvol'.
 	ZfsBasePath *string `json:"zfs-base-path,omitempty"`

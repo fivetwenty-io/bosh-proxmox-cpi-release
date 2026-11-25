@@ -428,6 +428,30 @@ type Service interface {
 	// UpdateMetricsServer PUT /cluster/metrics/server/{id}
 	// Update metric server configuration.
 	UpdateMetricsServer(ctx context.Context, id string, params *UpdateMetricsServerParams) error
+	// ListMultipath GET /cluster/multipath
+	// Directory index.
+	ListMultipath(ctx context.Context) (*ListMultipathResponse, error)
+	// ListMultipathOverrides GET /cluster/multipath/overrides
+	// Read the verbatim multipath.conf override sections.
+	ListMultipathOverrides(ctx context.Context) (*ListMultipathOverridesResponse, error)
+	// UpdateMultipathOverrides PUT /cluster/multipath/overrides
+	// Set the verbatim multipath.conf sections for hardware-specific settings: 'devices', 'overrides', 'defaults', 'blacklist' and 'blacklist_exceptions' blocks, for example a 'devices' section with 'device' subsections.
+	UpdateMultipathOverrides(ctx context.Context, params *UpdateMultipathOverridesParams) error
+	// ListMultipathWwid GET /cluster/multipath/wwid
+	// List the explicit multipath entries with their alias and per-LUN settings.
+	ListMultipathWwid(ctx context.Context) (*ListMultipathWwidResponse, error)
+	// CreateMultipathWwid POST /cluster/multipath/wwid
+	// Add an explicit multipath entry for a LUN, with an optional alias, node restriction, and per-LUN settings. For a LUN of an iSCSI storage with multipath enabled, an entry is only needed to set an alias or per-LUN settings. The entry keeps the LUN managed even if the storage's 'managed-multipath' option is disabled.
+	CreateMultipathWwid(ctx context.Context, params *CreateMultipathWwidParams) error
+	// DeleteMultipathWwid DELETE /cluster/multipath/wwid/{wwid}
+	// Remove an explicit multipath entry without changing node allow-lists.
+	DeleteMultipathWwid(ctx context.Context, wwid string, params *DeleteMultipathWwidParams) error
+	// GetMultipathWwid GET /cluster/multipath/wwid/{wwid}
+	// Read the explicit multipath entry of a WWID, with the digest of the configuration it was read from.
+	GetMultipathWwid(ctx context.Context, wwid string) (*GetMultipathWwidResponse, error)
+	// UpdateMultipathWwid PUT /cluster/multipath/wwid/{wwid}
+	// Update the alias, node restriction, and per-LUN settings of an explicit multipath entry.
+	UpdateMultipathWwid(ctx context.Context, wwid string, params *UpdateMultipathWwidParams) error
 	// ListNextid GET /cluster/nextid
 	// Get next free VMID. Pass a VMID to assert that its free (at time of check).
 	ListNextid(ctx context.Context, params *ListNextidParams) (*ListNextidResponse, error)
@@ -514,7 +538,7 @@ type Service interface {
 	DeleteNotificationsMatchers(ctx context.Context, name string) error
 	// GetNotificationsMatchers GET /cluster/notifications/matchers/{name}
 	// Return a specific matcher
-	GetNotificationsMatchers(ctx context.Context, name string) (*GetNotificationsMatchersResponse, error)
+	GetNotificationsMatchers(ctx context.Context, name string, params *GetNotificationsMatchersParams) (*GetNotificationsMatchersResponse, error)
 	// UpdateNotificationsMatchers PUT /cluster/notifications/matchers/{name}
 	// Update existing matcher
 	UpdateNotificationsMatchers(ctx context.Context, name string, params *UpdateNotificationsMatchersParams) error
@@ -569,6 +593,12 @@ type Service interface {
 	// ListResources GET /cluster/resources
 	// Resources index (cluster wide).
 	ListResources(ctx context.Context, params *ListResourcesParams) (*ListResourcesResponse, error)
+	// ListSan GET /cluster/san
+	// Directory index.
+	ListSan(ctx context.Context) (*ListSanResponse, error)
+	// ListSanStatus GET /cluster/san/status
+	// Report the SAN status of the nodes, with their initiator names, and the multipath health of each LUN on each node, with as summary the worst known state among the nodes that should see or report the LUN. Nodes whose state is unknown are not counted.
+	ListSanStatus(ctx context.Context) (*ListSanStatusResponse, error)
 	// ListSdn GET /cluster/sdn
 	// Directory index.
 	ListSdn(ctx context.Context) (*ListSdnResponse, error)
@@ -1567,9 +1597,9 @@ type CreateBackupParams struct {
 	Mode *string `json:"mode,omitempty"`
 	// Node Only run if executed on this node.
 	Node *string `json:"node,omitempty"`
-	// NotesTemplate Template string for generating notes for the backup(s). It can contain variables which will be replaced by their values. Currently supported are {{cluster}}, {{guestname}}, {{node}}, and {{vmid}}, but more might be added in the future. Needs to be a single line, newline and backslash need to be escaped as '\n' and '\\' respectively.
+	// NotesTemplate Template string for generating notes for the backup(s). It can contain variables which will be replaced by their values. Currently supported are {{cluster}}, {{guestname}}, {{node}}, {{uid}}, and {{vmid}}, but more might be added in the future. Needs to be a single line, newline and backslash need to be escaped as '\n' and '\\' respectively.
 	NotesTemplate *string `json:"notes-template,omitempty"`
-	// NotificationMode Determine which notification system to use. If set to 'legacy-sendmail', vzdump will consider the mailto/mailnotification parameters and send emails to the specified address(es) via the 'sendmail' command. If set to 'notification-system', a notification will be sent via PVE's notification system, and the mailto and mailnotification will be ignored. If set to 'auto' (default setting), an email will be sent if mailto is set, and the notification system will be used if not.
+	// NotificationMode Determine which notification system to use. If set to 'legacy-sendmail', vzdump will consider the mailto/mailnotification parameters and send emails to the specified address(es) via the 'sendmail' command. If set to 'notification-system', a notification will be sent via PVE's notification system, and the mailto and mailnotification will be ignored. If set to 'auto' (default setting), an email will be sent if mailto is set, and the notification system will be used if not. If set to 'none', no notification will be sent.
 	NotificationMode *string `json:"notification-mode,omitempty"`
 	// PbsChangeDetectionMode PBS mode used to detect file changes and switch encoding format for container backups.
 	PbsChangeDetectionMode *string `json:"pbs-change-detection-mode,omitempty"`
@@ -1763,9 +1793,9 @@ type GetBackupResponse struct {
 	NextRun *client.PVEInt `json:"next-run,omitempty"`
 	// Node Only run if executed on this node.
 	Node *string `json:"node,omitempty"`
-	// NotesTemplate Template string for generating notes for the backup(s). It can contain variables which will be replaced by their values. Currently supported are {{cluster}}, {{guestname}}, {{node}}, and {{vmid}}, but more might be added in the future. Needs to be a single line, newline and backslash need to be escaped as '\n' and '\\' respectively.
+	// NotesTemplate Template string for generating notes for the backup(s). It can contain variables which will be replaced by their values. Currently supported are {{cluster}}, {{guestname}}, {{node}}, {{uid}}, and {{vmid}}, but more might be added in the future. Needs to be a single line, newline and backslash need to be escaped as '\n' and '\\' respectively.
 	NotesTemplate *string `json:"notes-template,omitempty"`
-	// NotificationMode Determine which notification system to use. If set to 'legacy-sendmail', vzdump will consider the mailto/mailnotification parameters and send emails to the specified address(es) via the 'sendmail' command. If set to 'notification-system', a notification will be sent via PVE's notification system, and the mailto and mailnotification will be ignored. If set to 'auto' (default setting), an email will be sent if mailto is set, and the notification system will be used if not.
+	// NotificationMode Determine which notification system to use. If set to 'legacy-sendmail', vzdump will consider the mailto/mailnotification parameters and send emails to the specified address(es) via the 'sendmail' command. If set to 'notification-system', a notification will be sent via PVE's notification system, and the mailto and mailnotification will be ignored. If set to 'auto' (default setting), an email will be sent if mailto is set, and the notification system will be used if not. If set to 'none', no notification will be sent.
 	NotificationMode *string `json:"notification-mode,omitempty"`
 	// PbsChangeDetectionMode PBS mode used to detect file changes and switch encoding format for container backups.
 	PbsChangeDetectionMode *string `json:"pbs-change-detection-mode,omitempty"`
@@ -1870,9 +1900,9 @@ type UpdateBackupParams struct {
 	Mode *string `json:"mode,omitempty"`
 	// Node Only run if executed on this node.
 	Node *string `json:"node,omitempty"`
-	// NotesTemplate Template string for generating notes for the backup(s). It can contain variables which will be replaced by their values. Currently supported are {{cluster}}, {{guestname}}, {{node}}, and {{vmid}}, but more might be added in the future. Needs to be a single line, newline and backslash need to be escaped as '\n' and '\\' respectively.
+	// NotesTemplate Template string for generating notes for the backup(s). It can contain variables which will be replaced by their values. Currently supported are {{cluster}}, {{guestname}}, {{node}}, {{uid}}, and {{vmid}}, but more might be added in the future. Needs to be a single line, newline and backslash need to be escaped as '\n' and '\\' respectively.
 	NotesTemplate *string `json:"notes-template,omitempty"`
-	// NotificationMode Determine which notification system to use. If set to 'legacy-sendmail', vzdump will consider the mailto/mailnotification parameters and send emails to the specified address(es) via the 'sendmail' command. If set to 'notification-system', a notification will be sent via PVE's notification system, and the mailto and mailnotification will be ignored. If set to 'auto' (default setting), an email will be sent if mailto is set, and the notification system will be used if not.
+	// NotificationMode Determine which notification system to use. If set to 'legacy-sendmail', vzdump will consider the mailto/mailnotification parameters and send emails to the specified address(es) via the 'sendmail' command. If set to 'notification-system', a notification will be sent via PVE's notification system, and the mailto and mailnotification will be ignored. If set to 'auto' (default setting), an email will be sent if mailto is set, and the notification system will be used if not. If set to 'none', no notification will be sent.
 	NotificationMode *string `json:"notification-mode,omitempty"`
 	// PbsChangeDetectionMode PBS mode used to detect file changes and switch encoding format for container backups.
 	PbsChangeDetectionMode *string `json:"pbs-change-detection-mode,omitempty"`
@@ -2353,6 +2383,8 @@ func (s *service) ListCephFlags(ctx context.Context) (*ListCephFlagsResponse, er
 
 // UpdateCephFlagsParams is the request payload for UpdateCephFlags.
 type UpdateCephFlagsParams struct {
+	// Noautoscale The PG autoscaler does not change the number of PGs of any pool.
+	Noautoscale *bool `json:"noautoscale,omitempty"`
 	// Nobackfill Backfilling of PGs is suspended.
 	Nobackfill *bool `json:"nobackfill,omitempty"`
 	// NodeepScrub Deep Scrubbing is disabled.
@@ -2630,7 +2662,7 @@ func (s *service) ListCephMetadata(ctx context.Context, params *ListCephMetadata
 type CreateCephRestartBulkParams struct {
 	// DryRun Log the plan (which daemons would be restarted, in what order) without actually doing anything.
 	DryRun *bool `json:"dry-run,omitempty"`
-	// Force Proceed past a HEALTH_WARN with non-benign checks like PG_DEGRADED, SLOW_OPS, or MON_DOWN. A blocking HEALTH_ERR is fatal regardless of this flag. Checks that ceph reports as muted, and checks known to be harmless for a rolling restart, never block and are named in the task log. The cluster-wide OSD map flags are only ever evaluated for an OSD restart, since they govern nothing a mon, mgr or mds restart touches. The operator is responsible for confirming the cluster is stable enough to absorb a rolling restart.
+	// Force Proceed past a HEALTH_WARN with non-benign checks like PG_DEGRADED, SLOW_OPS, or MON_DOWN. A blocking HEALTH_ERR is fatal regardless of this flag. Checks that ceph reports as muted, and checks known to be harmless for a rolling restart, never block and are named in the task log. The cluster-wide OSD map flags are only ever evaluated for an OSD restart, since they govern nothing a mon, mgr or mds restart touches. Likewise, a missing active manager (MGR_DOWN) only blocks an OSD restart, as only the OSD safety check needs a manager. The operator is responsible for confirming the cluster is stable enough to absorb a rolling restart.
 	Force *bool `json:"force,omitempty"`
 	// OnlyOutdated OSDs only: restart only OSDs whose running version differs from the locally-installed ceph-osd binary on their host. Forwarded to each per-node sub-task so the per-host installed version is used (a partial upgrade where one host is on a newer build is handled correctly).
 	OnlyOutdated *bool `json:"only-outdated,omitempty"`
@@ -2893,8 +2925,10 @@ type ListConfigJoinResponse struct {
 	ConfigDigest string            `json:"config_digest"`
 	Nodelist     []json.RawMessage `json:"nodelist"`
 	// PreferredNode The cluster node name.
-	PreferredNode string          `json:"preferred_node"`
-	Totem         json.RawMessage `json:"totem"`
+	PreferredNode string `json:"preferred_node"`
+	// PveVersion The highest Proxmox VE manager version of all cluster nodes.
+	PveVersion *string         `json:"pve-version,omitempty"`
+	Totem      json.RawMessage `json:"totem"`
 }
 
 // ListConfigJoin implements Service.ListConfigJoin. GET /cluster/config/join.
@@ -3435,7 +3469,7 @@ func (s *service) GetFirewallAliases(ctx context.Context, name string) (*GetFire
 // UpdateFirewallAliasesParams is the request payload for UpdateFirewallAliases.
 type UpdateFirewallAliasesParams struct {
 	// Cidr Network/IP specification in CIDR format.
-	Cidr    string  `json:"cidr"`
+	Cidr    *string `json:"cidr,omitempty"`
 	Comment *string `json:"comment,omitempty"`
 	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
 	Digest *string `json:"digest,omitempty"`
@@ -5013,6 +5047,12 @@ func (s *service) UpdateHaResources(ctx context.Context, sid string, params *Upd
 type CreateHaResourcesMigrateParams struct {
 	// Node Target node.
 	Node string `json:"node"`
+	// ResourceType The resource type. Automatically determined from the service ID.
+	ResourceType *string `json:"resource-type,omitempty"`
+	// SkipConfigCheck With resource-type=ct: For intra-cluster migration. Skip checking if the configuration can be parsed successfully by the target. Using this flag can lead to dropped or ignored configuration options if the target is too old to parse them. With resource-type=vm: For intra-cluster migration. Skip checking if the configuration can be parsed successfully by the target. Using this flag can lead to dropped configuration options if the target is too old to parse them.
+	SkipConfigCheck *bool `json:"skip-config-check,omitempty"`
+	// WithConntrackState Whether to migrate conntrack entries for running VMs.
+	WithConntrackState *bool `json:"with-conntrack-state,omitempty"`
 }
 
 // CreateHaResourcesMigrateResponse mirrors the shape returned by POST /cluster/ha/resources/{sid}/migrate.
@@ -6740,6 +6780,320 @@ func (s *service) UpdateMetricsServer(ctx context.Context, id string, params *Up
 	return nil
 }
 
+// ListMultipathResponse mirrors the shape returned by GET /cluster/multipath.
+type ListMultipathResponse []json.RawMessage
+
+// ListMultipath implements Service.ListMultipath. GET /cluster/multipath.
+func (s *service) ListMultipath(ctx context.Context) (*ListMultipathResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("cluster.ListMultipath: ctx must not be nil")
+	}
+	path := "/cluster/multipath"
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListMultipath: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("cluster.ListMultipath: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListMultipathResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListMultipath: re-marshal data: %w", err)
+	}
+	out := &ListMultipathResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListMultipath: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListMultipathOverridesResponse mirrors the shape returned by GET /cluster/multipath/overrides.
+type ListMultipathOverridesResponse struct {
+	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
+	Digest *string `json:"digest,omitempty"`
+	// Overrides Verbatim override sections.
+	Overrides *string `json:"overrides,omitempty"`
+}
+
+// ListMultipathOverrides implements Service.ListMultipathOverrides. GET /cluster/multipath/overrides.
+func (s *service) ListMultipathOverrides(ctx context.Context) (*ListMultipathOverridesResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("cluster.ListMultipathOverrides: ctx must not be nil")
+	}
+	path := "/cluster/multipath/overrides"
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListMultipathOverrides: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("cluster.ListMultipathOverrides: nil response from client")
+	}
+	if resp.Data == nil {
+		return nil, fmt.Errorf("cluster.ListMultipathOverrides: empty data in response (code=%d)", resp.Code)
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListMultipathOverrides: re-marshal data: %w", err)
+	}
+	out := &ListMultipathOverridesResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListMultipathOverrides: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// UpdateMultipathOverridesParams is the request payload for UpdateMultipathOverrides.
+type UpdateMultipathOverridesParams struct {
+	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
+	Digest *string `json:"digest,omitempty"`
+	// Overrides Verbatim override sections. Omit to clear them.
+	Overrides *string `json:"overrides,omitempty"`
+}
+
+// UpdateMultipathOverrides implements Service.UpdateMultipathOverrides. PUT /cluster/multipath/overrides.
+func (s *service) UpdateMultipathOverrides(ctx context.Context, params *UpdateMultipathOverridesParams) error {
+	if ctx == nil {
+		return fmt.Errorf("cluster.UpdateMultipathOverrides: ctx must not be nil")
+	}
+	path := "/cluster/multipath/overrides"
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return fmt.Errorf("cluster.UpdateMultipathOverrides: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return fmt.Errorf("cluster.UpdateMultipathOverrides: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.PutRawCtx(ctx, path, body)
+	if err != nil {
+		return fmt.Errorf("cluster.UpdateMultipathOverrides: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("cluster.UpdateMultipathOverrides: nil response from client")
+	}
+	_ = resp
+	return nil
+}
+
+// ListMultipathWwidResponse mirrors the shape returned by GET /cluster/multipath/wwid.
+type ListMultipathWwidResponse []json.RawMessage
+
+// ListMultipathWwid implements Service.ListMultipathWwid. GET /cluster/multipath/wwid.
+func (s *service) ListMultipathWwid(ctx context.Context) (*ListMultipathWwidResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("cluster.ListMultipathWwid: ctx must not be nil")
+	}
+	path := "/cluster/multipath/wwid"
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListMultipathWwid: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("cluster.ListMultipathWwid: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListMultipathWwidResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListMultipathWwid: re-marshal data: %w", err)
+	}
+	out := &ListMultipathWwidResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListMultipathWwid: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// CreateMultipathWwidParams is the request payload for CreateMultipathWwid.
+type CreateMultipathWwidParams struct {
+	// Alias The name of the multipath map.
+	Alias *string `json:"alias,omitempty"`
+	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
+	Digest *string `json:"digest,omitempty"`
+	// NoPathRetry The action or number of retries when all paths are down.
+	NoPathRetry *string `json:"no-path-retry,omitempty"`
+	// Nodes The nodes that should assemble the map, or all nodes when unset.
+	Nodes *string `json:"nodes,omitempty"`
+	// PathsExpected The number of paths each node should have to the LUN. A node with fewer paths reports the LUN as degraded.
+	PathsExpected *int64 `json:"paths-expected,omitempty"`
+	// Wwid The WWID of the LUN to manage via multipath.
+	Wwid string `json:"wwid"`
+}
+
+// CreateMultipathWwid implements Service.CreateMultipathWwid. POST /cluster/multipath/wwid.
+func (s *service) CreateMultipathWwid(ctx context.Context, params *CreateMultipathWwidParams) error {
+	if ctx == nil {
+		return fmt.Errorf("cluster.CreateMultipathWwid: ctx must not be nil")
+	}
+	path := "/cluster/multipath/wwid"
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return fmt.Errorf("cluster.CreateMultipathWwid: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return fmt.Errorf("cluster.CreateMultipathWwid: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.PostRawCtx(ctx, path, body)
+	if err != nil {
+		return fmt.Errorf("cluster.CreateMultipathWwid: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("cluster.CreateMultipathWwid: nil response from client")
+	}
+	_ = resp
+	return nil
+}
+
+// DeleteMultipathWwidParams is the request payload for DeleteMultipathWwid.
+type DeleteMultipathWwidParams struct {
+	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
+	Digest *string `json:"digest,omitempty"`
+}
+
+// DeleteMultipathWwid implements Service.DeleteMultipathWwid. DELETE /cluster/multipath/wwid/{wwid}.
+func (s *service) DeleteMultipathWwid(ctx context.Context, wwid string, params *DeleteMultipathWwidParams) error {
+	if ctx == nil {
+		return fmt.Errorf("cluster.DeleteMultipathWwid: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/cluster/multipath/wwid/%s", url.PathEscape(wwid))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return fmt.Errorf("cluster.DeleteMultipathWwid: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return fmt.Errorf("cluster.DeleteMultipathWwid: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.DeleteRawCtx(ctx, path, body)
+	if err != nil {
+		return fmt.Errorf("cluster.DeleteMultipathWwid: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("cluster.DeleteMultipathWwid: nil response from client")
+	}
+	_ = resp
+	return nil
+}
+
+// GetMultipathWwidResponse mirrors the shape returned by GET /cluster/multipath/wwid/{wwid}.
+type GetMultipathWwidResponse struct {
+	// Alias The name of the multipath map.
+	Alias *string `json:"alias,omitempty"`
+	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
+	Digest *string `json:"digest,omitempty"`
+	// NoPathRetry The action or number of retries when all paths are down.
+	NoPathRetry *string `json:"no-path-retry,omitempty"`
+	// Nodes The nodes that should assemble the map, or all nodes when unset.
+	Nodes *string `json:"nodes,omitempty"`
+	// PathsExpected The number of paths each node should have to the LUN. A node with fewer paths reports the LUN as degraded.
+	PathsExpected *client.PVEInt `json:"paths-expected,omitempty"`
+	// Wwid The LUN WWID.
+	Wwid string `json:"wwid"`
+}
+
+// GetMultipathWwid implements Service.GetMultipathWwid. GET /cluster/multipath/wwid/{wwid}.
+func (s *service) GetMultipathWwid(ctx context.Context, wwid string) (*GetMultipathWwidResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("cluster.GetMultipathWwid: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/cluster/multipath/wwid/%s", url.PathEscape(wwid))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.GetMultipathWwid: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("cluster.GetMultipathWwid: nil response from client")
+	}
+	if resp.Data == nil {
+		return nil, fmt.Errorf("cluster.GetMultipathWwid: empty data in response (code=%d)", resp.Code)
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.GetMultipathWwid: re-marshal data: %w", err)
+	}
+	out := &GetMultipathWwidResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.GetMultipathWwid: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// UpdateMultipathWwidParams is the request payload for UpdateMultipathWwid.
+type UpdateMultipathWwidParams struct {
+	// Alias The name of the multipath map.
+	Alias *string `json:"alias,omitempty"`
+	// Delete Comma-separated list of settings to unset.
+	Delete *string `json:"delete,omitempty"`
+	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
+	Digest *string `json:"digest,omitempty"`
+	// NoPathRetry The action or number of retries when all paths are down.
+	NoPathRetry *string `json:"no-path-retry,omitempty"`
+	// Nodes The nodes that should assemble the map, or all nodes when unset.
+	Nodes *string `json:"nodes,omitempty"`
+	// PathsExpected The number of paths each node should have to the LUN. A node with fewer paths reports the LUN as degraded.
+	PathsExpected *int64 `json:"paths-expected,omitempty"`
+}
+
+// UpdateMultipathWwid implements Service.UpdateMultipathWwid. PUT /cluster/multipath/wwid/{wwid}.
+func (s *service) UpdateMultipathWwid(ctx context.Context, wwid string, params *UpdateMultipathWwidParams) error {
+	if ctx == nil {
+		return fmt.Errorf("cluster.UpdateMultipathWwid: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/cluster/multipath/wwid/%s", url.PathEscape(wwid))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return fmt.Errorf("cluster.UpdateMultipathWwid: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return fmt.Errorf("cluster.UpdateMultipathWwid: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.PutRawCtx(ctx, path, body)
+	if err != nil {
+		return fmt.Errorf("cluster.UpdateMultipathWwid: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("cluster.UpdateMultipathWwid: nil response from client")
+	}
+	_ = resp
+	return nil
+}
+
 // ListNextidParams is the request payload for ListNextid.
 type ListNextidParams struct {
 	// Vmid The (unique) ID of the VM.
@@ -7775,6 +8129,8 @@ type CreateNotificationsMatchersParams struct {
 	Comment *string `json:"comment,omitempty"`
 	// Disable Disable this matcher
 	Disable *bool `json:"disable,omitempty"`
+	// Expression Match expression as inline JSON. This option is mutually exclusive with the following options: match-field, match-calendar, match-severity, invert-match and mode. All of these can be represented as (sub)-expressions of this expression
+	Expression *string `json:"expression,omitempty"`
 	// InvertMatch Invert match of the whole matcher
 	InvertMatch *bool `json:"invert-match,omitempty"`
 	// MatchCalendar Match notification timestamp
@@ -7839,6 +8195,12 @@ func (s *service) DeleteNotificationsMatchers(ctx context.Context, name string) 
 	return nil
 }
 
+// GetNotificationsMatchersParams is the request payload for GetNotificationsMatchers.
+type GetNotificationsMatchersParams struct {
+	// MigrateToExpression Automatically translate existing 'match-*', 'invert-match' and 'mode' to an equivalent matching 'expression'.
+	MigrateToExpression *bool `json:"migrate-to-expression,omitempty"`
+}
+
 // GetNotificationsMatchersResponse mirrors the shape returned by GET /cluster/notifications/matchers/{name}.
 type GetNotificationsMatchersResponse struct {
 	// Comment Comment
@@ -7847,6 +8209,8 @@ type GetNotificationsMatchersResponse struct {
 	Digest *string `json:"digest,omitempty"`
 	// Disable Disable this matcher
 	Disable *client.PVEBool `json:"disable,omitempty"`
+	// Expression Match expression as inline JSON. This option is mutually exclusive with the following options: match-field, match-calendar, match-severity, invert-match and mode. All of these can be represented as (sub)-expressions of this expression
+	Expression *string `json:"expression,omitempty"`
 	// InvertMatch Invert match of the whole matcher
 	InvertMatch *client.PVEBool `json:"invert-match,omitempty"`
 	// MatchCalendar Match notification timestamp
@@ -7864,12 +8228,24 @@ type GetNotificationsMatchersResponse struct {
 }
 
 // GetNotificationsMatchers implements Service.GetNotificationsMatchers. GET /cluster/notifications/matchers/{name}.
-func (s *service) GetNotificationsMatchers(ctx context.Context, name string) (*GetNotificationsMatchersResponse, error) {
+func (s *service) GetNotificationsMatchers(ctx context.Context, name string, params *GetNotificationsMatchersParams) (*GetNotificationsMatchersResponse, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("cluster.GetNotificationsMatchers: ctx must not be nil")
 	}
 	path := fmt.Sprintf("/cluster/notifications/matchers/%s", url.PathEscape(name))
 	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("cluster.GetNotificationsMatchers: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return nil, fmt.Errorf("cluster.GetNotificationsMatchers: decode params: %w", err)
+		}
+	}
 	resp, err := s.c.GetRawCtx(ctx, path, body)
 	if err != nil {
 		return nil, fmt.Errorf("cluster.GetNotificationsMatchers: %w", err)
@@ -7902,6 +8278,8 @@ type UpdateNotificationsMatchersParams struct {
 	Digest *string `json:"digest,omitempty"`
 	// Disable Disable this matcher
 	Disable *bool `json:"disable,omitempty"`
+	// Expression Match expression as inline JSON. This option is mutually exclusive with the following options: match-field, match-calendar, match-severity, invert-match and mode. All of these can be represented as (sub)-expressions of this expression
+	Expression *string `json:"expression,omitempty"`
 	// InvertMatch Invert match of the whole matcher
 	InvertMatch *bool `json:"invert-match,omitempty"`
 	// MatchCalendar Match notification timestamp
@@ -8003,7 +8381,7 @@ type ListOptionsResponse struct {
 	AllowedTags []string `json:"allowed-tags"`
 	// Bwlimit Set I/O bandwidth limit for various operations (in KiB/s).
 	Bwlimit *string `json:"bwlimit,omitempty"`
-	// ConsentText Consent text that is displayed before logging in.
+	// ConsentText Consent text that is displayed before logging in. Needs to be base64 encoded.
 	ConsentText *string `json:"consent-text,omitempty"`
 	// Console Select the default Console viewer. You can either use the builtin java applet (VNC; deprecated and maps to html5), an external virt-viewer comtatible application (SPICE), an HTML5 based vnc viewer (noVNC), or an HTML5 based console client (xtermjs). If the selected viewer is not available (e.g. SPICE not activated for the VM), the fallback is noVNC.
 	Console *string `json:"console,omitempty"`
@@ -8043,6 +8421,8 @@ type ListOptionsResponse struct {
 	Replication json.RawMessage `json:"replication,omitempty"`
 	// TagStyle Tag style options.
 	TagStyle json.RawMessage `json:"tag-style,omitempty"`
+	// TokenPolicy Cluster-wide policy for creating and updating API tokens, for example to enforce an expiration date or privilege separation.
+	TokenPolicy json.RawMessage `json:"token-policy,omitempty"`
 	// U2f u2f
 	U2f json.RawMessage `json:"u2f,omitempty"`
 	// UserTagAccess Privilege options for user-settable tags
@@ -8084,7 +8464,7 @@ func (s *service) ListOptions(ctx context.Context) (*ListOptionsResponse, error)
 type UpdateOptionsParams struct {
 	// Bwlimit Set I/O bandwidth limit for various operations (in KiB/s).
 	Bwlimit *string `json:"bwlimit,omitempty"`
-	// ConsentText Consent text that is displayed before logging in.
+	// ConsentText Consent text that is displayed before logging in. Needs to be base64 encoded.
 	ConsentText *string `json:"consent-text,omitempty"`
 	// Console Select the default Console viewer. You can either use the builtin java applet (VNC; deprecated and maps to html5), an external virt-viewer comtatible application (SPICE), an HTML5 based vnc viewer (noVNC), or an HTML5 based console client (xtermjs). If the selected viewer is not available (e.g. SPICE not activated for the VM), the fallback is noVNC.
 	Console *string `json:"console,omitempty"`
@@ -8126,6 +8506,8 @@ type UpdateOptionsParams struct {
 	Replication *string `json:"replication,omitempty"`
 	// TagStyle Tag style options.
 	TagStyle *string `json:"tag-style,omitempty"`
+	// TokenPolicy Cluster-wide policy for creating and updating API tokens, for example to enforce an expiration date or privilege separation.
+	TokenPolicy *string `json:"token-policy,omitempty"`
 	// U2f u2f
 	U2f *string `json:"u2f,omitempty"`
 	// UserTagAccess Privilege options for user-settable tags
@@ -8501,6 +8883,8 @@ type CreateReplicationParams struct {
 	RemoveJob *string `json:"remove_job,omitempty"`
 	// Schedule Storage replication schedule. The format is a subset of `systemd` calendar events.
 	Schedule *string `json:"schedule,omitempty"`
+	// SkipFreezeFs Whether to skip freezing and thawing the guest's filesystems for consistency during replication.
+	SkipFreezeFs *bool `json:"skip-freeze-fs,omitempty"`
 	// Source For internal use, to detect if the guest was stolen.
 	Source *string `json:"source,omitempty"`
 	// Target Target node.
@@ -8597,6 +8981,8 @@ type GetReplicationResponse struct {
 	RemoveJob *string `json:"remove_job,omitempty"`
 	// Schedule Storage replication schedule. The format is a subset of `systemd` calendar events.
 	Schedule *string `json:"schedule,omitempty"`
+	// SkipFreezeFs Whether to skip freezing and thawing the guest's filesystems for consistency during replication.
+	SkipFreezeFs *client.PVEBool `json:"skip-freeze-fs,omitempty"`
 	// Source For internal use, to detect if the guest was stolen.
 	Source *string `json:"source,omitempty"`
 	// Target Target node.
@@ -8650,6 +9036,8 @@ type UpdateReplicationParams struct {
 	RemoveJob *string `json:"remove_job,omitempty"`
 	// Schedule Storage replication schedule. The format is a subset of `systemd` calendar events.
 	Schedule *string `json:"schedule,omitempty"`
+	// SkipFreezeFs Whether to skip freezing and thawing the guest's filesystems for consistency during replication.
+	SkipFreezeFs *bool `json:"skip-freeze-fs,omitempty"`
 	// Source For internal use, to detect if the guest was stolen.
 	Source *string `json:"source,omitempty"`
 }
@@ -8731,6 +9119,76 @@ func (s *service) ListResources(ctx context.Context, params *ListResourcesParams
 	err = json.Unmarshal(raw, out)
 	if err != nil {
 		return nil, fmt.Errorf("cluster.ListResources: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListSanResponse mirrors the shape returned by GET /cluster/san.
+type ListSanResponse []json.RawMessage
+
+// ListSan implements Service.ListSan. GET /cluster/san.
+func (s *service) ListSan(ctx context.Context) (*ListSanResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("cluster.ListSan: ctx must not be nil")
+	}
+	path := "/cluster/san"
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListSan: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("cluster.ListSan: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListSanResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListSan: re-marshal data: %w", err)
+	}
+	out := &ListSanResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListSan: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListSanStatusResponse mirrors the shape returned by GET /cluster/san/status.
+type ListSanStatusResponse struct {
+	// Luns One entry per LUN or NVMe namespace, identified by its WWID, with its path health on each node and the overall cluster state.
+	Luns []json.RawMessage `json:"luns"`
+	// Nodes The SAN status of each cluster node, keyed by node name.
+	Nodes json.RawMessage `json:"nodes"`
+}
+
+// ListSanStatus implements Service.ListSanStatus. GET /cluster/san/status.
+func (s *service) ListSanStatus(ctx context.Context) (*ListSanStatusResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("cluster.ListSanStatus: ctx must not be nil")
+	}
+	path := "/cluster/san/status"
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListSanStatus: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("cluster.ListSanStatus: nil response from client")
+	}
+	if resp.Data == nil {
+		return nil, fmt.Errorf("cluster.ListSanStatus: empty data in response (code=%d)", resp.Code)
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListSanStatus: re-marshal data: %w", err)
+	}
+	out := &ListSanStatusResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListSanStatus: unmarshal data: %w", err)
 	}
 	return out, nil
 }
@@ -9543,6 +10001,8 @@ type CreateSdnFabricsFabricParams struct {
 	Redistribute []json.RawMessage `json:"redistribute"`
 	// RouteFilter A prefix list that should be used for filtering routes that are to be installed into the kernel routing table
 	RouteFilter *string `json:"route_filter,omitempty"`
+	// Zone Simple zone whose VRF contains this fabric.
+	Zone *string `json:"zone,omitempty"`
 }
 
 // CreateSdnFabricsFabric implements Service.CreateSdnFabricsFabric. POST /cluster/sdn/fabrics/fabric.
@@ -9625,6 +10085,8 @@ type GetSdnFabricsFabricResponse struct {
 	Redistribute []json.RawMessage `json:"redistribute"`
 	// RouteFilter A prefix list that should be used for filtering routes that are to be installed into the kernel routing table
 	RouteFilter *string `json:"route_filter,omitempty"`
+	// Zone Simple zone whose VRF contains this fabric.
+	Zone *string `json:"zone,omitempty"`
 }
 
 // GetSdnFabricsFabric implements Service.GetSdnFabricsFabric. GET /cluster/sdn/fabrics/fabric/{id}.
@@ -9680,6 +10142,8 @@ type UpdateSdnFabricsFabricParams struct {
 	Redistribute []json.RawMessage `json:"redistribute"`
 	// RouteFilter A prefix list that should be used for filtering routes that are to be installed into the kernel routing table
 	RouteFilter *string `json:"route_filter,omitempty"`
+	// Zone Simple zone whose VRF contains this fabric.
+	Zone *string `json:"zone,omitempty"`
 }
 
 // UpdateSdnFabricsFabric implements Service.UpdateSdnFabricsFabric. PUT /cluster/sdn/fabrics/fabric/{id}.
@@ -11737,8 +12201,8 @@ type DeleteSdnVnetsIpsParams struct {
 	Ip string `json:"ip"`
 	// Mac Unicast MAC address.
 	Mac *string `json:"mac,omitempty"`
-	// Zone The SDN zone object identifier.
-	Zone string `json:"zone"`
+	// Zone DEPRECATED: value is ignored and parameter will be removed with PVE 10
+	Zone *string `json:"zone,omitempty"`
 }
 
 // DeleteSdnVnetsIps implements Service.DeleteSdnVnetsIps. DELETE /cluster/sdn/vnets/{vnet}/ips.
@@ -11777,8 +12241,8 @@ type CreateSdnVnetsIpsParams struct {
 	Ip string `json:"ip"`
 	// Mac Unicast MAC address.
 	Mac *string `json:"mac,omitempty"`
-	// Zone The SDN zone object identifier.
-	Zone string `json:"zone"`
+	// Zone DEPRECATED: value is ignored and parameter will be removed with PVE 10
+	Zone *string `json:"zone,omitempty"`
 }
 
 // CreateSdnVnetsIps implements Service.CreateSdnVnetsIps. POST /cluster/sdn/vnets/{vnet}/ips.
@@ -11819,8 +12283,8 @@ type UpdateSdnVnetsIpsParams struct {
 	Mac *string `json:"mac,omitempty"`
 	// Vmid The (unique) ID of the VM.
 	Vmid *int64 `json:"vmid,omitempty"`
-	// Zone The SDN zone object identifier.
-	Zone string `json:"zone"`
+	// Zone DEPRECATED: value is ignored and parameter will be removed with PVE 10
+	Zone *string `json:"zone,omitempty"`
 }
 
 // UpdateSdnVnetsIps implements Service.UpdateSdnVnetsIps. PUT /cluster/sdn/vnets/{vnet}/ips.
@@ -11908,7 +12372,7 @@ func (s *service) ListSdnVnetsSubnets(ctx context.Context, vnet string, params *
 
 // CreateSdnVnetsSubnetsParams is the request payload for CreateSdnVnetsSubnets.
 type CreateSdnVnetsSubnetsParams struct {
-	// DhcpDnsServer IP address for the DNS server
+	// DhcpDnsServer DNS server IP address. Must use the same address family as the subnet.
 	DhcpDnsServer *string `json:"dhcp-dns-server,omitempty"`
 	// DhcpRange A list of DHCP ranges for this subnet
 	DhcpRange []string `json:"dhcp-range,omitempty"`
@@ -12048,7 +12512,7 @@ func (s *service) GetSdnVnetsSubnets(ctx context.Context, vnet string, subnet st
 type UpdateSdnVnetsSubnetsParams struct {
 	// Delete A list of settings you want to delete.
 	Delete *string `json:"delete,omitempty"`
-	// DhcpDnsServer IP address for the DNS server
+	// DhcpDnsServer DNS server IP address. Must use the same address family as the subnet.
 	DhcpDnsServer *string `json:"dhcp-dns-server,omitempty"`
 	// DhcpRange A list of DHCP ranges for this subnet
 	DhcpRange []string `json:"dhcp-range,omitempty"`
@@ -12159,6 +12623,10 @@ type CreateSdnZonesParams struct {
 	BridgeDisableMacLearning *bool `json:"bridge-disable-mac-learning,omitempty"`
 	// Controller Controller for this zone.
 	Controller *string `json:"controller,omitempty"`
+	// CtZone Conntrack zone of the dedicated VRF, assigned automatically.
+	CtZone *int64 `json:"ct-zone,omitempty"`
+	// DedicatedVrf Create a dedicated VRF for the zone.
+	DedicatedVrf *bool `json:"dedicated-vrf,omitempty"`
 	// Dhcp Type of the DHCP backend for this zone
 	Dhcp *string `json:"dhcp,omitempty"`
 	// DisableArpNdSuppression Suppress IPv4 ARP && IPv6 Neighbour Discovery messages.
@@ -12191,6 +12659,8 @@ type CreateSdnZonesParams struct {
 	Peers *string `json:"peers,omitempty"`
 	// Reversedns reverse dns api server
 	Reversedns *string `json:"reversedns,omitempty"`
+	// Route Static routes of a simple zone, installed in its dedicated VRF, which they require.
+	Route []string `json:"route,omitempty"`
 	// RtImport List of Route Targets that should be imported into the VRF of the zone.
 	RtImport *string `json:"rt-import,omitempty"`
 	// SecondaryControllers Additional controllers.
@@ -12338,6 +12808,10 @@ type UpdateSdnZonesParams struct {
 	BridgeDisableMacLearning *bool `json:"bridge-disable-mac-learning,omitempty"`
 	// Controller Controller for this zone.
 	Controller *string `json:"controller,omitempty"`
+	// CtZone Conntrack zone of the dedicated VRF, assigned automatically.
+	CtZone *int64 `json:"ct-zone,omitempty"`
+	// DedicatedVrf Create a dedicated VRF for the zone.
+	DedicatedVrf *bool `json:"dedicated-vrf,omitempty"`
 	// Delete A list of settings you want to delete.
 	Delete *string `json:"delete,omitempty"`
 	// Dhcp Type of the DHCP backend for this zone
@@ -12374,6 +12848,8 @@ type UpdateSdnZonesParams struct {
 	Peers *string `json:"peers,omitempty"`
 	// Reversedns reverse dns api server
 	Reversedns *string `json:"reversedns,omitempty"`
+	// Route Static routes of a simple zone, installed in its dedicated VRF, which they require.
+	Route []string `json:"route,omitempty"`
 	// RtImport List of Route Targets that should be imported into the VRF of the zone.
 	RtImport *string `json:"rt-import,omitempty"`
 	// SecondaryControllers Additional controllers.

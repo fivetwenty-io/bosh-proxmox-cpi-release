@@ -187,9 +187,11 @@ type UpdatePoolsParams struct {
 	// AllowMove Allow adding a guest even if already in another pool. The guest will be removed from its current pool and added to this one.
 	AllowMove *bool   `json:"allow-move,omitempty"`
 	Comment   *string `json:"comment,omitempty"`
-	// Delete Remove the passed VMIDs and/or storage IDs instead of adding them.
-	Delete *bool  `json:"delete,omitempty"`
-	Poolid string `json:"poolid"`
+	// Delete Remove the passed VMIDs, storage IDs and/or network resources instead of adding them.
+	Delete *bool `json:"delete,omitempty"`
+	// Network List of network resources to add or remove from this pool. 'vnet/<zone>/<vnet>' allows network devices on the VNet without VLAN tag or trunks, a trailing '/<tag>' allows that VLAN tag, and '/*' allows the VNet with or without any VLAN tag. This only controls the network device configuration, a device without VLAN tag can still carry tagged guest traffic on a VLAN-aware VNet.
+	Network *string `json:"network,omitempty"`
+	Poolid  string  `json:"poolid"`
 	// Storage List of storage IDs to add or remove from this pool.
 	Storage *string `json:"storage,omitempty"`
 	// Vms List of guest VMIDs to add or remove from this pool.
@@ -301,8 +303,10 @@ type UpdatePools2Params struct {
 	// AllowMove Allow adding a guest even if already in another pool. The guest will be removed from its current pool and added to this one.
 	AllowMove *bool   `json:"allow-move,omitempty"`
 	Comment   *string `json:"comment,omitempty"`
-	// Delete Remove the passed VMIDs and/or storage IDs instead of adding them.
+	// Delete Remove the passed VMIDs, storage IDs and/or network resources instead of adding them.
 	Delete *bool `json:"delete,omitempty"`
+	// Network List of network resources to add or remove from this pool. 'vnet/<zone>/<vnet>' allows network devices on the VNet without VLAN tag or trunks, a trailing '/<tag>' allows that VLAN tag, and '/*' allows the VNet with or without any VLAN tag. This only controls the network device configuration, a device without VLAN tag can still carry tagged guest traffic on a VLAN-aware VNet.
+	Network *string `json:"network,omitempty"`
 	// Storage List of storage IDs to add or remove from this pool.
 	Storage *string `json:"storage,omitempty"`
 	// Vms List of guest VMIDs to add or remove from this pool.

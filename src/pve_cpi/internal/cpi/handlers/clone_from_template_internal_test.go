@@ -84,7 +84,7 @@ func (s *cloneClusterStorage) ListStorage(_ context.Context, _ *sdkclusterstorag
 func (s *cloneClusterStorage) CreateStorage(_ context.Context, _ *sdkclusterstorage.CreateStorageParams) (*sdkclusterstorage.CreateStorageResponse, error) {
 	panic("cloneClusterStorage.CreateStorage: not expected")
 }
-func (s *cloneClusterStorage) DeleteStorage(_ context.Context, _ string) error {
+func (s *cloneClusterStorage) DeleteStorage(_ context.Context, _ string, _ *sdkclusterstorage.DeleteStorageParams) error {
 	panic("cloneClusterStorage.DeleteStorage: not expected")
 }
 func (s *cloneClusterStorage) GetStorage(_ context.Context, _ string) (*sdkclusterstorage.GetStorageResponse, error) {

@@ -41,7 +41,7 @@ func (m *multiClusterStorage) ListStorage(_ context.Context, _ *clusterstorage.L
 func (m *multiClusterStorage) CreateStorage(_ context.Context, _ *clusterstorage.CreateStorageParams) (*clusterstorage.CreateStorageResponse, error) {
 	panic("multiClusterStorage.CreateStorage: not expected")
 }
-func (m *multiClusterStorage) DeleteStorage(_ context.Context, _ string) error {
+func (m *multiClusterStorage) DeleteStorage(_ context.Context, _ string, _ *clusterstorage.DeleteStorageParams) error {
 	panic("multiClusterStorage.DeleteStorage: not expected")
 }
 func (m *multiClusterStorage) GetStorage(_ context.Context, _ string) (*clusterstorage.GetStorageResponse, error) {

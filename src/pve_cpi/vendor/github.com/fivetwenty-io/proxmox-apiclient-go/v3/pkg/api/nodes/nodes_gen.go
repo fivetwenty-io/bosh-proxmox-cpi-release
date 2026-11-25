@@ -29,6 +29,12 @@ type Service interface {
 	// GetNodes GET /nodes/{node}
 	// Node index.
 	GetNodes(ctx context.Context, node string) (*GetNodesResponse, error)
+	// ListAccessLog GET /nodes/{node}/access-log
+	// Read a page of the API access log of pveproxy and spiceproxy, including its rotated copies, newest requests first. A page ends once enough requests matched or after reading 512 MiB of log data, also without any match, and the next page continues at its 'next-cursor'. The values of query parameters are redacted for all but root@pam.
+	ListAccessLog(ctx context.Context, node string, params *ListAccessLogParams) (*ListAccessLogResponse, error)
+	// ListAccessLogStats GET /nodes/{node}/access-log/stats
+	// Count the requests of the API access log of pveproxy and spiceproxy, including its rotated copies, in a time range, which defaults to the last day. As the log is not ordered by time, the counting reads through the files like a page of the access log does, as much as one page at most, and tells which parts of the files it covered.
+	ListAccessLogStats(ctx context.Context, node string, params *ListAccessLogStatsParams) (*ListAccessLogStatsResponse, error)
 	// ListAplinfo GET /nodes/{node}/aplinfo
 	// Get list of appliances.
 	ListAplinfo(ctx context.Context, node string) (*ListAplinfoResponse, error)
@@ -41,6 +47,12 @@ type Service interface {
 	// ListAptChangelog GET /nodes/{node}/apt/changelog
 	// Get package changelogs.
 	ListAptChangelog(ctx context.Context, node string, params *ListAptChangelogParams) (*ListAptChangelogResponse, error)
+	// ListAptHistory GET /nodes/{node}/apt/history
+	// List past APT transactions and their package changes, newest first.
+	ListAptHistory(ctx context.Context, node string, params *ListAptHistoryParams) (*ListAptHistoryResponse, error)
+	// ListAptInstalledChangelog GET /nodes/{node}/apt/installed-changelog
+	// Get the Debian changelog that an installed package ships, optionally limited to a version range.
+	ListAptInstalledChangelog(ctx context.Context, node string, params *ListAptInstalledChangelogParams) (*ListAptInstalledChangelogResponse, error)
 	// ListAptRepositories GET /nodes/{node}/apt/repositories
 	// Get APT repository information.
 	ListAptRepositories(ctx context.Context, node string) (*ListAptRepositoriesResponse, error)
@@ -50,12 +62,21 @@ type Service interface {
 	// UpdateAptRepositories PUT /nodes/{node}/apt/repositories
 	// Add a standard repository to the configuration
 	UpdateAptRepositories(ctx context.Context, node string, params *UpdateAptRepositoriesParams) error
+	// ListAptTermlog GET /nodes/{node}/apt/termlog
+	// Get the terminal output of a past APT transaction.
+	ListAptTermlog(ctx context.Context, node string, params *ListAptTermlogParams) (*ListAptTermlogResponse, error)
+	// ListAptTransactionChangelogs GET /nodes/{node}/apt/transaction-changelogs
+	// Get the changelog entries for the package changes of a past APT transaction, from the changelogs of the installed packages.
+	ListAptTransactionChangelogs(ctx context.Context, node string, params *ListAptTransactionChangelogsParams) (*ListAptTransactionChangelogsResponse, error)
 	// ListAptUpdate GET /nodes/{node}/apt/update
 	// List available updates.
 	ListAptUpdate(ctx context.Context, node string) (*ListAptUpdateResponse, error)
 	// CreateAptUpdate POST /nodes/{node}/apt/update
 	// This is used to resynchronize the package index files from their sources (apt-get update).
 	CreateAptUpdate(ctx context.Context, node string, params *CreateAptUpdateParams) (*CreateAptUpdateResponse, error)
+	// ListAptUpdateChangelogs GET /nodes/{node}/apt/update-changelogs
+	// Get the changelog entries for pending updates, grouped by source package.
+	ListAptUpdateChangelogs(ctx context.Context, node string) (*ListAptUpdateChangelogsResponse, error)
 	// ListAptVersions GET /nodes/{node}/apt/versions
 	// Get package information for important Proxmox packages.
 	ListAptVersions(ctx context.Context, node string) (*ListAptVersionsResponse, error)
@@ -261,7 +282,7 @@ type Service interface {
 	// Create an LVM Volume Group
 	CreateDisksLvm(ctx context.Context, node string, params *CreateDisksLvmParams) (*CreateDisksLvmResponse, error)
 	// DeleteDisksLvm DELETE /nodes/{node}/disks/lvm/{name}
-	// Remove an LVM Volume Group.
+	// Remove an LVM Volume Group. Refused if a shared storage is configured with a volume group of that name.
 	DeleteDisksLvm(ctx context.Context, node string, name string, params *DeleteDisksLvmParams) (*DeleteDisksLvmResponse, error)
 	// ListDisksLvmthin GET /nodes/{node}/disks/lvmthin
 	// List LVM thinpools
@@ -535,6 +556,9 @@ type Service interface {
 	// ListLxcVncwebsocket GET /nodes/{node}/lxc/{vmid}/vncwebsocket
 	// Opens a websocket for VNC traffic.
 	ListLxcVncwebsocket(ctx context.Context, node string, vmid string, params *ListLxcVncwebsocketParams) (*ListLxcVncwebsocketResponse, error)
+	// UpdateMaintenance PUT /nodes/{node}/maintenance
+	// Enable or disable maintenance mode for the node. Currently, this only requests the HA node maintenance mode.
+	UpdateMaintenance(ctx context.Context, node string, params *UpdateMaintenanceParams) error
 	// CreateMigrateall POST /nodes/{node}/migrateall
 	// Migrate all VMs and Containers.
 	CreateMigrateall(ctx context.Context, node string, params *CreateMigrateallParams) (*CreateMigrateallResponse, error)
@@ -604,12 +628,24 @@ type Service interface {
 	// CreateQemuAgentFstrim POST /nodes/{node}/qemu/{vmid}/agent/fstrim
 	// Execute fstrim.
 	CreateQemuAgentFstrim(ctx context.Context, node string, vmid string) (*CreateQemuAgentFstrimResponse, error)
+	// ListQemuAgentGetCpustats GET /nodes/{node}/qemu/{vmid}/agent/get-cpustats
+	// Execute get-cpustats.
+	ListQemuAgentGetCpustats(ctx context.Context, node string, vmid string) (*ListQemuAgentGetCpustatsResponse, error)
+	// ListQemuAgentGetDisks GET /nodes/{node}/qemu/{vmid}/agent/get-disks
+	// Execute get-disks.
+	ListQemuAgentGetDisks(ctx context.Context, node string, vmid string) (*ListQemuAgentGetDisksResponse, error)
+	// ListQemuAgentGetDiskstats GET /nodes/{node}/qemu/{vmid}/agent/get-diskstats
+	// Execute get-diskstats.
+	ListQemuAgentGetDiskstats(ctx context.Context, node string, vmid string) (*ListQemuAgentGetDiskstatsResponse, error)
 	// ListQemuAgentGetFsinfo GET /nodes/{node}/qemu/{vmid}/agent/get-fsinfo
 	// Execute get-fsinfo.
 	ListQemuAgentGetFsinfo(ctx context.Context, node string, vmid string) (*ListQemuAgentGetFsinfoResponse, error)
 	// ListQemuAgentGetHostName GET /nodes/{node}/qemu/{vmid}/agent/get-host-name
 	// Execute get-host-name.
 	ListQemuAgentGetHostName(ctx context.Context, node string, vmid string) (*ListQemuAgentGetHostNameResponse, error)
+	// ListQemuAgentGetLoad GET /nodes/{node}/qemu/{vmid}/agent/get-load
+	// Execute get-load.
+	ListQemuAgentGetLoad(ctx context.Context, node string, vmid string) (*ListQemuAgentGetLoadResponse, error)
 	// ListQemuAgentGetMemoryBlockInfo GET /nodes/{node}/qemu/{vmid}/agent/get-memory-block-info
 	// Execute get-memory-block-info.
 	ListQemuAgentGetMemoryBlockInfo(ctx context.Context, node string, vmid string) (*ListQemuAgentGetMemoryBlockInfoResponse, error)
@@ -882,6 +918,33 @@ type Service interface {
 	// ListRrddata GET /nodes/{node}/rrddata
 	// Read node RRD statistics
 	ListRrddata(ctx context.Context, node string, params *ListRrddataParams) (*ListRrddataResponse, error)
+	// ListSan GET /nodes/{node}/san
+	// Directory index.
+	ListSan(ctx context.Context, node string) (*ListSanResponse, error)
+	// ListSanIscsi GET /nodes/{node}/san/iscsi
+	// Node iSCSI index.
+	ListSanIscsi(ctx context.Context, node string) (*ListSanIscsiResponse, error)
+	// ListSanIscsiStatus GET /nodes/{node}/san/iscsi/status
+	// Report the iSCSI initiator identity and availability.
+	ListSanIscsiStatus(ctx context.Context, node string) (*ListSanIscsiStatusResponse, error)
+	// ListSanIscsiTarget GET /nodes/{node}/san/iscsi/target
+	// List iSCSI targets and their sessions and devices.
+	ListSanIscsiTarget(ctx context.Context, node string) (*ListSanIscsiTargetResponse, error)
+	// ListSanLuns GET /nodes/{node}/san/luns
+	// List the SAN LUNs of the node with their paths and cached usage.
+	ListSanLuns(ctx context.Context, node string) (*ListSanLunsResponse, error)
+	// ListSanNvmeof GET /nodes/{node}/san/nvmeof
+	// Node NVMe over Fabrics index.
+	ListSanNvmeof(ctx context.Context, node string) (*ListSanNvmeofResponse, error)
+	// ListSanNvmeofController GET /nodes/{node}/san/nvmeof/controller
+	// List connected NVMe over Fabrics controllers and their states.
+	ListSanNvmeofController(ctx context.Context, node string) (*ListSanNvmeofControllerResponse, error)
+	// DeleteSanNvmeofController DELETE /nodes/{node}/san/nvmeof/controller/{controller}
+	// Disconnect one fabrics controller. Refuse when a namespace in use has no other usable path. A storage still listing the portal reconnects it on activation.
+	DeleteSanNvmeofController(ctx context.Context, node string, controller string, params *DeleteSanNvmeofControllerParams) (*DeleteSanNvmeofControllerResponse, error)
+	// ListSanNvmeofStatus GET /nodes/{node}/san/nvmeof/status
+	// Report the NVMe host identity and nvme-cli availability.
+	ListSanNvmeofStatus(ctx context.Context, node string) (*ListSanNvmeofStatusResponse, error)
 	// ListScan GET /nodes/{node}/scan
 	// Index of available scan methods
 	ListScan(ctx context.Context, node string) (*ListScanResponse, error)
@@ -900,6 +963,9 @@ type Service interface {
 	// ListScanNfs GET /nodes/{node}/scan/nfs
 	// Scan remote NFS server.
 	ListScanNfs(ctx context.Context, node string, params *ListScanNfsParams) (*ListScanNfsResponse, error)
+	// ListScanNvmeof GET /nodes/{node}/scan/nvmeof
+	// List the NVMe over TCP subsystems offered to this node by a discovery controller.
+	ListScanNvmeof(ctx context.Context, node string, params *ListScanNvmeofParams) (*ListScanNvmeofResponse, error)
 	// ListScanPbs GET /nodes/{node}/scan/pbs
 	// Scan remote Proxmox Backup Server.
 	ListScanPbs(ctx context.Context, node string, params *ListScanPbsParams) (*ListScanPbsResponse, error)
@@ -913,10 +979,10 @@ type Service interface {
 	// Directory index for SDN fabric status.
 	GetSdnFabrics(ctx context.Context, node string, fabric string) (*GetSdnFabricsResponse, error)
 	// ListSdnFabricsInterfaces GET /nodes/{node}/sdn/fabrics/{fabric}/interfaces
-	// Get all interfaces for a fabric.
+	// Get all interfaces for a fabric, empty if this node is not part of it.
 	ListSdnFabricsInterfaces(ctx context.Context, node string, fabric string) (*ListSdnFabricsInterfacesResponse, error)
 	// ListSdnFabricsNeighbors GET /nodes/{node}/sdn/fabrics/{fabric}/neighbors
-	// Get all neighbors for a fabric.
+	// Get all neighbors for a fabric, empty if this node is not part of it.
 	ListSdnFabricsNeighbors(ctx context.Context, node string, fabric string) (*ListSdnFabricsNeighborsResponse, error)
 	// ListSdnFabricsRoutes GET /nodes/{node}/sdn/fabrics/{fabric}/routes
 	// Get all routes for a fabric.
@@ -1180,6 +1246,204 @@ func (s *service) GetNodes(ctx context.Context, node string) (*GetNodesResponse,
 	return out, nil
 }
 
+// ListAccessLogParams is the request payload for ListAccessLog.
+type ListAccessLogParams struct {
+	// After Only the requests logged after this position, the 'head-cursor' of an earlier page, to follow the log. Cannot be combined with 'cursor'.
+	After *string `json:"after,omitempty"`
+	// AuthId Only requests whose user or API token contains this text, ignoring case, so a user also matches its own API tokens.
+	AuthId *string `json:"auth-id,omitempty"`
+	// AuthIdExact Whether 'auth-id' only matches itself as a whole, so a user does not match its API tokens, and '-' matches requests without any.
+	AuthIdExact *bool `json:"auth-id-exact,omitempty"`
+	// Client Only requests from this client address.
+	Client *string `json:"client,omitempty"`
+	// Cursor Continue with the requests logged before this position, the 'next-cursor' of the previous page.
+	Cursor *string `json:"cursor,omitempty"`
+	// Limit The maximum number of requests to return.
+	Limit *int64 `json:"limit,omitempty"`
+	// MaxStatus Only responses with a known HTTP status code of at most this value.
+	MaxStatus *int64 `json:"max-status,omitempty"`
+	// Method Only requests with this HTTP method.
+	Method *string `json:"method,omitempty"`
+	// MinStatus Only responses with a known HTTP status code of at least this value.
+	MinStatus *int64 `json:"min-status,omitempty"`
+	// Path Only requests whose path contains this text.
+	Path *string `json:"path,omitempty"`
+	// PathGroup Only requests whose path falls into this group, as the statistics list them.
+	PathGroup *string `json:"path-group,omitempty"`
+	// Search Only requests whose client address, user or path contains this text, ignoring case.
+	Search *string `json:"search,omitempty"`
+	// Since Only requests logged at or after this UNIX epoch.
+	Since *int64 `json:"since,omitempty"`
+	// Until Only requests logged at or before this UNIX epoch.
+	Until *int64 `json:"until,omitempty"`
+}
+
+// ListAccessLogResponse mirrors the shape returned by GET /nodes/{node}/access-log.
+type ListAccessLogResponse struct {
+	// Complete Whether this page and the ones before it covered the whole log, without any gap. With 'after', whether this page holds all requests logged since.
+	Complete client.PVEBool `json:"complete"`
+	// DatedCopies Rotated copies named by date, as logrotate's 'dateext' names them, which are not read but can hold older requests. Only on the last page.
+	DatedCopies []string `json:"dated-copies,omitempty"`
+	// Entries The matching requests, from the end of the log and its newest rotated copy on, in reverse order of logging. Their times need not decrease strictly, as requests can get logged late and rotated copies can overlap.
+	Entries []json.RawMessage `json:"entries"`
+	// Gaps The parts of the log this page skipped, as they could not be read.
+	Gaps []json.RawMessage `json:"gaps"`
+	// HeadCursor Where the log ended when this page started, to get the requests logged since with 'after'. Missing on pages continuing at a cursor, and if the log has no complete line yet or ends in an unfinished overlong one.
+	HeadCursor *string `json:"head-cursor,omitempty"`
+	// InvalidLines The number of lines this page looked at that failed to parse.
+	InvalidLines client.PVEInt `json:"invalid-lines"`
+	// NextCursor Where the next page continues, missing if no older requests are left to look at.
+	NextCursor *string `json:"next-cursor,omitempty"`
+	// SearchedBackTo The time of the oldest request this page looked at, matching or not, as UNIX epoch. Requests are not strictly ordered in the log, so older ones can still follow.
+	SearchedBackTo *client.PVEInt `json:"searched-back-to,omitempty"`
+}
+
+// ListAccessLog implements Service.ListAccessLog. GET /nodes/{node}/access-log.
+func (s *service) ListAccessLog(ctx context.Context, node string, params *ListAccessLogParams) (*ListAccessLogResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListAccessLog: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/access-log", url.PathEscape(node))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.ListAccessLog: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.ListAccessLog: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAccessLog: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListAccessLog: nil response from client")
+	}
+	if resp.Data == nil {
+		return nil, fmt.Errorf("nodes.ListAccessLog: empty data in response (code=%d)", resp.Code)
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAccessLog: re-marshal data: %w", err)
+	}
+	out := &ListAccessLogResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAccessLog: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListAccessLogStatsParams is the request payload for ListAccessLogStats.
+type ListAccessLogStatsParams struct {
+	// AuthId Only requests whose user or API token contains this text, ignoring case, so a user also matches its own API tokens.
+	AuthId *string `json:"auth-id,omitempty"`
+	// AuthIdExact Whether 'auth-id' only matches itself as a whole, so a user does not match its API tokens, and '-' matches requests without any.
+	AuthIdExact *bool `json:"auth-id-exact,omitempty"`
+	// Bucket The length of a histogram bucket in seconds, chosen for at most 300 buckets if not set.
+	Bucket *int64 `json:"bucket,omitempty"`
+	// Client Only requests from this client address.
+	Client *string `json:"client,omitempty"`
+	// MaxStatus Only responses with a known HTTP status code of at most this value.
+	MaxStatus *int64 `json:"max-status,omitempty"`
+	// Method Only requests with this HTTP method.
+	Method *string `json:"method,omitempty"`
+	// MinStatus Only responses with a known HTTP status code of at least this value.
+	MinStatus *int64 `json:"min-status,omitempty"`
+	// Path Only requests whose path contains this text.
+	Path *string `json:"path,omitempty"`
+	// PathGroup Only requests whose path falls into this group, as the statistics list them.
+	PathGroup *string `json:"path-group,omitempty"`
+	// Search Only requests whose client address, user or path contains this text, ignoring case.
+	Search *string `json:"search,omitempty"`
+	// Since Only requests logged at or after this UNIX epoch.
+	Since *int64 `json:"since,omitempty"`
+	// Top The number of values with the most requests to list.
+	Top *int64 `json:"top,omitempty"`
+	// Until Only requests logged at or before this UNIX epoch.
+	Until *int64 `json:"until,omitempty"`
+}
+
+// ListAccessLogStatsResponse mirrors the shape returned by GET /nodes/{node}/access-log/stats.
+type ListAccessLogStatsResponse struct {
+	// AuthIds The users and API tokens with the most requests.
+	AuthIds json.RawMessage `json:"auth-ids"`
+	// Clients The client addresses with the most requests.
+	Clients json.RawMessage `json:"clients"`
+	// Complete Whether all lines of all files got counted. Otherwise, the counts are only those of the covered parts.
+	Complete client.PVEBool `json:"complete"`
+	// Covered The parts of the files that got counted, newest first.
+	Covered []json.RawMessage `json:"covered"`
+	// DatedCopies Rotated copies named by date, as logrotate's 'dateext' names them, which are not counted but can hold requests of the time range.
+	DatedCopies []string `json:"dated-copies,omitempty"`
+	// Gaps The damaged compressed copy the counting stopped at.
+	Gaps []json.RawMessage `json:"gaps"`
+	// Histogram The matching requests over the time range.
+	Histogram json.RawMessage `json:"histogram"`
+	// InvalidLines The number of lines that failed to parse, of the ones parsed completely. Lines whose first fields already rule them out do not get parsed further.
+	InvalidLines client.PVEInt `json:"invalid-lines"`
+	// PathGroups The path groups with the most requests, which replace the parts of API paths naming objects, like IDs, with placeholders.
+	PathGroups json.RawMessage `json:"path-groups"`
+	// SearchedBackTo The time of the oldest request looked at, matching or not, as UNIX epoch. Requests are not strictly ordered in the log, so this does not bound the covered time.
+	SearchedBackTo *client.PVEInt `json:"searched-back-to,omitempty"`
+	// Since The start of the time range, as UNIX epoch.
+	Since client.PVEInt `json:"since"`
+	// Statuses The status codes with the most requests. A missing key denotes an unknown status. Error counts include only requests with a known status.
+	Statuses json.RawMessage `json:"statuses"`
+	// Stopped Why the counting stopped before the oldest file ended.
+	Stopped *string `json:"stopped,omitempty"`
+	// Total The counts of all matching requests.
+	Total json.RawMessage `json:"total"`
+	// Until The end of the time range, as UNIX epoch.
+	Until client.PVEInt `json:"until"`
+}
+
+// ListAccessLogStats implements Service.ListAccessLogStats. GET /nodes/{node}/access-log/stats.
+func (s *service) ListAccessLogStats(ctx context.Context, node string, params *ListAccessLogStatsParams) (*ListAccessLogStatsResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListAccessLogStats: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/access-log/stats", url.PathEscape(node))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.ListAccessLogStats: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.ListAccessLogStats: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAccessLogStats: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListAccessLogStats: nil response from client")
+	}
+	if resp.Data == nil {
+		return nil, fmt.Errorf("nodes.ListAccessLogStats: empty data in response (code=%d)", resp.Code)
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAccessLogStats: re-marshal data: %w", err)
+	}
+	out := &ListAccessLogStatsResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAccessLogStats: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
 // ListAplinfoResponse mirrors the shape returned by GET /nodes/{node}/aplinfo.
 type ListAplinfoResponse []json.RawMessage
 
@@ -1352,6 +1616,119 @@ func (s *service) ListAptChangelog(ctx context.Context, node string, params *Lis
 	return out, nil
 }
 
+// ListAptHistoryParams is the request payload for ListAptHistory.
+type ListAptHistoryParams struct {
+	// Limit List at most this many transactions.
+	Limit *int64 `json:"limit,omitempty"`
+	// Package Only list transactions that changed this package.
+	Package *string `json:"package,omitempty"`
+	// Since Only list transactions that started at or after this Unix epoch.
+	Since *int64 `json:"since,omitempty"`
+	// Until Only list transactions that started at or before this Unix epoch.
+	Until *int64 `json:"until,omitempty"`
+}
+
+// ListAptHistoryResponse mirrors the shape returned by GET /nodes/{node}/apt/history.
+type ListAptHistoryResponse []json.RawMessage
+
+// ListAptHistory implements Service.ListAptHistory. GET /nodes/{node}/apt/history.
+func (s *service) ListAptHistory(ctx context.Context, node string, params *ListAptHistoryParams) (*ListAptHistoryResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListAptHistory: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/apt/history", url.PathEscape(node))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.ListAptHistory: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.ListAptHistory: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptHistory: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListAptHistory: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListAptHistoryResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptHistory: re-marshal data: %w", err)
+	}
+	out := &ListAptHistoryResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptHistory: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListAptInstalledChangelogParams is the request payload for ListAptInstalledChangelog.
+type ListAptInstalledChangelogParams struct {
+	// Name Name of the installed package.
+	Name string `json:"name"`
+	// SinceVersion Only list the entries of versions later than this one.
+	SinceVersion *string `json:"since-version,omitempty"`
+	// ToVersion Only list the entries of versions up to including this one, or only the newest entry if the changelog does not list this version.
+	ToVersion *string `json:"to-version,omitempty"`
+}
+
+// ListAptInstalledChangelogResponse mirrors the shape returned by GET /nodes/{node}/apt/installed-changelog.
+// The changelog entries, usually newest first.
+type ListAptInstalledChangelogResponse []json.RawMessage
+
+// ListAptInstalledChangelog implements Service.ListAptInstalledChangelog. GET /nodes/{node}/apt/installed-changelog.
+func (s *service) ListAptInstalledChangelog(ctx context.Context, node string, params *ListAptInstalledChangelogParams) (*ListAptInstalledChangelogResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListAptInstalledChangelog: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/apt/installed-changelog", url.PathEscape(node))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.ListAptInstalledChangelog: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.ListAptInstalledChangelog: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptInstalledChangelog: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListAptInstalledChangelog: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListAptInstalledChangelogResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptInstalledChangelog: re-marshal data: %w", err)
+	}
+	out := &ListAptInstalledChangelogResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptInstalledChangelog: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
 // ListAptRepositoriesResponse mirrors the shape returned by GET /nodes/{node}/apt/repositories.
 // Result from parsing the APT repository files in /etc/apt/.
 type ListAptRepositoriesResponse struct {
@@ -1476,6 +1853,116 @@ func (s *service) UpdateAptRepositories(ctx context.Context, node string, params
 	return nil
 }
 
+// ListAptTermlogParams is the request payload for ListAptTermlog.
+type ListAptTermlogParams struct {
+	// Format Format of the output, 'styled' keeps bold, dim and the basic foreground colors as SGR escape sequences, each setting the complete style and none spanning a line break.
+	Format *string `json:"format,omitempty"`
+	// StartIndex Start index of the transaction, as listed in the APT history.
+	StartIndex *int64 `json:"start-index,omitempty"`
+	// StartTime Start time of the transaction, as listed in the APT history.
+	StartTime int64 `json:"start-time"`
+}
+
+// ListAptTermlogResponse is the raw JSON returned by GET /nodes/{node}/apt/termlog.
+// The terminal output.
+type ListAptTermlogResponse = json.RawMessage
+
+// ListAptTermlog implements Service.ListAptTermlog. GET /nodes/{node}/apt/termlog.
+func (s *service) ListAptTermlog(ctx context.Context, node string, params *ListAptTermlogParams) (*ListAptTermlogResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListAptTermlog: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/apt/termlog", url.PathEscape(node))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.ListAptTermlog: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.ListAptTermlog: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptTermlog: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListAptTermlog: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListAptTermlogResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptTermlog: re-marshal data: %w", err)
+	}
+	out := &ListAptTermlogResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptTermlog: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListAptTransactionChangelogsParams is the request payload for ListAptTransactionChangelogs.
+type ListAptTransactionChangelogsParams struct {
+	// StartIndex Start index of the transaction, as listed in the APT history.
+	StartIndex *int64 `json:"start-index,omitempty"`
+	// StartTime Start time of the transaction, as listed in the APT history.
+	StartTime int64 `json:"start-time"`
+}
+
+// ListAptTransactionChangelogsResponse mirrors the shape returned by GET /nodes/{node}/apt/transaction-changelogs.
+// The changelog entries, grouped by source package, upgrades first, then downgrades, installs and other changes, each sorted by name.
+type ListAptTransactionChangelogsResponse []json.RawMessage
+
+// ListAptTransactionChangelogs implements Service.ListAptTransactionChangelogs. GET /nodes/{node}/apt/transaction-changelogs.
+func (s *service) ListAptTransactionChangelogs(ctx context.Context, node string, params *ListAptTransactionChangelogsParams) (*ListAptTransactionChangelogsResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListAptTransactionChangelogs: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/apt/transaction-changelogs", url.PathEscape(node))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.ListAptTransactionChangelogs: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.ListAptTransactionChangelogs: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptTransactionChangelogs: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListAptTransactionChangelogs: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListAptTransactionChangelogsResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptTransactionChangelogs: re-marshal data: %w", err)
+	}
+	out := &ListAptTransactionChangelogsResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptTransactionChangelogs: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
 // ListAptUpdateResponse mirrors the shape returned by GET /nodes/{node}/apt/update.
 type ListAptUpdateResponse []json.RawMessage
 
@@ -1558,6 +2045,40 @@ func (s *service) CreateAptUpdate(ctx context.Context, node string, params *Crea
 	err = json.Unmarshal(raw, out)
 	if err != nil {
 		return nil, fmt.Errorf("nodes.CreateAptUpdate: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListAptUpdateChangelogsResponse mirrors the shape returned by GET /nodes/{node}/apt/update-changelogs.
+// The changelog entries, grouped by source package, upgrades first, then downgrades, installs and other changes, each sorted by name.
+type ListAptUpdateChangelogsResponse []json.RawMessage
+
+// ListAptUpdateChangelogs implements Service.ListAptUpdateChangelogs. GET /nodes/{node}/apt/update-changelogs.
+func (s *service) ListAptUpdateChangelogs(ctx context.Context, node string) (*ListAptUpdateChangelogsResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListAptUpdateChangelogs: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/apt/update-changelogs", url.PathEscape(node))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptUpdateChangelogs: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListAptUpdateChangelogs: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListAptUpdateChangelogsResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptUpdateChangelogs: re-marshal data: %w", err)
+	}
+	out := &ListAptUpdateChangelogsResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListAptUpdateChangelogs: unmarshal data: %w", err)
 	}
 	return out, nil
 }
@@ -2276,7 +2797,7 @@ type CreateCephInitParams struct {
 	MinSize *int64 `json:"min_size,omitempty"`
 	// Network Use specific network for all ceph related traffic
 	Network *string `json:"network,omitempty"`
-	// PgBits Placement group bits, used to specify the default number of placement groups.  Depreacted. This setting was deprecated in recent Ceph versions.
+	// PgBits Placement group bits, used to specify the default number of placement groups.  Deprecated. This setting has been ignored since Ceph Nautilus.
 	PgBits *int64 `json:"pg_bits,omitempty"`
 	// Size Targeted number of replicas per object
 	Size *int64 `json:"size,omitempty"`
@@ -3883,7 +4404,7 @@ func (s *service) CreateCertificatesAcmeCertificate(ctx context.Context, node st
 
 // UpdateCertificatesAcmeCertificateParams is the request payload for UpdateCertificatesAcmeCertificate.
 type UpdateCertificatesAcmeCertificateParams struct {
-	// Force Force renewal even if expiry is more than 30 days away.
+	// Force Force renewal even if the certificate is not yet due for renewal.
 	Force *bool `json:"force,omitempty"`
 }
 
@@ -4555,9 +5076,9 @@ func (s *service) ListDisksLvm(ctx context.Context, node string) (*ListDisksLvmR
 
 // CreateDisksLvmParams is the request payload for CreateDisksLvm.
 type CreateDisksLvmParams struct {
-	// AddStorage Configure storage using the Volume Group
+	// AddStorage Configure storage using the Volume Group. On a SAN LUN, this adds a new shared storage for all nodes. On a local disk, the storage is for this node, or this node joins a matching storage of that ID.
 	AddStorage *bool `json:"add_storage,omitempty"`
-	// Device The block device you want to create the volume group on
+	// Device The block device you want to create the volume group on. Multipath mapped devices are supported.
 	Device string `json:"device"`
 	// Name The storage identifier.
 	Name string `json:"name"`
@@ -4863,7 +5384,7 @@ func (s *service) ListDisksSmart(ctx context.Context, node string, params *ListD
 
 // UpdateDisksWipediskParams is the request payload for UpdateDisksWipedisk.
 type UpdateDisksWipediskParams struct {
-	// Disk Block device name
+	// Disk Block device name. A SAN LUN can also be given by a by-id or mapper name.
 	Disk string `json:"disk"`
 }
 
@@ -5353,7 +5874,7 @@ type ListFirewallOptionsResponse struct {
 	NfConntrackTcpTimeoutEstablished *client.PVEInt `json:"nf_conntrack_tcp_timeout_established,omitempty"`
 	// NfConntrackTcpTimeoutSynRecv Conntrack syn recv timeout.
 	NfConntrackTcpTimeoutSynRecv *client.PVEInt `json:"nf_conntrack_tcp_timeout_syn_recv,omitempty"`
-	// Nftables Enable nftables based firewall (tech preview)
+	// Nftables Enable nftables based firewall.
 	Nftables *client.PVEBool `json:"nftables,omitempty"`
 	// Nosmurfs Enable SMURFS filter.
 	Nosmurfs *client.PVEBool `json:"nosmurfs,omitempty"`
@@ -5428,7 +5949,7 @@ type UpdateFirewallOptionsParams struct {
 	NfConntrackTcpTimeoutEstablished *int64 `json:"nf_conntrack_tcp_timeout_established,omitempty"`
 	// NfConntrackTcpTimeoutSynRecv Conntrack syn recv timeout.
 	NfConntrackTcpTimeoutSynRecv *int64 `json:"nf_conntrack_tcp_timeout_syn_recv,omitempty"`
-	// Nftables Enable nftables based firewall (tech preview)
+	// Nftables Enable nftables based firewall.
 	Nftables *bool `json:"nftables,omitempty"`
 	// Nosmurfs Enable SMURFS filter.
 	Nosmurfs *bool `json:"nosmurfs,omitempty"`
@@ -6107,6 +6628,8 @@ func (s *service) ListLxc(ctx context.Context, node string) (*ListLxcResponse, e
 
 // CreateLxcParams is the request payload for CreateLxc.
 type CreateLxcParams struct {
+	// AllowIdentityMismatch Allow overwriting an existing guest with a backup of another guest, as detected by a different 'uid' in 'meta'. The guest then keeps its own uid. Not needed to restore a backup again over a guest that an unfinished restore of that backup left behind. A restore from standard input over a container that has a uid always needs this option, as the backup cannot be checked beforehand.
+	AllowIdentityMismatch *bool `json:"allow-identity-mismatch,omitempty"`
 	// Arch OS architecture type.
 	Arch *string `json:"arch,omitempty"`
 	// Bwlimit Override I/O bandwidth limit (in KiB/s).
@@ -6145,7 +6668,7 @@ type CreateLxcParams struct {
 	Lock *string `json:"lock,omitempty"`
 	// Memory Amount of RAM for the container in MB.
 	Memory *int64 `json:"memory,omitempty"`
-	// Nameserver Sets DNS server IP address for a container. Create will automatically use the setting from the host if you neither set searchdomain nor nameserver.
+	// Nameserver Comma-separated list of IP addresses. Sets the addresses of the DNS servers of the container. Create will automatically use the setting from the host if you neither set searchdomain nor nameserver.
 	Nameserver *string `json:"nameserver,omitempty"`
 	// Onboot Specifies whether a container will be started during system bootup.
 	Onboot *bool `json:"onboot,omitempty"`
@@ -6183,7 +6706,7 @@ type CreateLxcParams struct {
 	Timezone *string `json:"timezone,omitempty"`
 	// Tty Specify the number of tty available to the container
 	Tty *int64 `json:"tty,omitempty"`
-	// Unique Assign a unique random ethernet address.
+	// Unique Assign a unique random ethernet address and do not adopt the guest uid of the backup.
 	Unique *bool `json:"unique,omitempty"`
 	// Unprivileged Makes the container run as unprivileged user. For creation, the default is 1. For restore, the default is the value from the backup. (Should not be modified manually.)
 	Unprivileged *bool `json:"unprivileged,omitempty"`
@@ -6534,9 +7057,11 @@ type ListLxcConfigResponse struct {
 	Lxc [][]string `json:"lxc,omitempty"`
 	// Memory Amount of RAM for the container in MB.
 	Memory *client.PVEInt `json:"memory,omitempty"`
+	// Meta Read-only meta-information about this container, for example its creation time.
+	Meta *string `json:"meta,omitempty"`
 	// Mpn Use volume as container mount point. Use the special syntax STORAGE_ID:SIZE_IN_GiB to allocate a new volume.
 	Mpn *string `json:"mp[n],omitempty"`
-	// Nameserver Sets DNS server IP address for a container. Create will automatically use the setting from the host if you neither set searchdomain nor nameserver.
+	// Nameserver Comma-separated list of IP addresses. Sets the addresses of the DNS servers of the container. Create will automatically use the setting from the host if you neither set searchdomain nor nameserver.
 	Nameserver *string `json:"nameserver,omitempty"`
 	// Netn Specifies network interfaces for the container.
 	Netn *string `json:"net[n],omitempty"`
@@ -6645,7 +7170,7 @@ type UpdateLxcConfigParams struct {
 	Lock *string `json:"lock,omitempty"`
 	// Memory Amount of RAM for the container in MB.
 	Memory *int64 `json:"memory,omitempty"`
-	// Nameserver Sets DNS server IP address for a container. Create will automatically use the setting from the host if you neither set searchdomain nor nameserver.
+	// Nameserver Comma-separated list of IP addresses. Sets the addresses of the DNS servers of the container. Create will automatically use the setting from the host if you neither set searchdomain nor nameserver.
 	Nameserver *string `json:"nameserver,omitempty"`
 	// Onboot Specifies whether a container will be started during system bootup.
 	Onboot *bool `json:"onboot,omitempty"`
@@ -6813,6 +7338,8 @@ type ListLxcFeatureParams struct {
 // ListLxcFeatureResponse mirrors the shape returned by GET /nodes/{node}/lxc/{vmid}/feature.
 type ListLxcFeatureResponse struct {
 	HasFeature client.PVEBool `json:"hasFeature"`
+	// Nodes Nodes that pass the guest identity check for a clone. The storages of the container are not checked. Not set for 'snapshot'.
+	Nodes []string `json:"nodes,omitempty"`
 }
 
 // ListLxcFeature implements Service.ListLxcFeature. GET /nodes/{node}/lxc/{vmid}/feature.
@@ -7033,7 +7560,7 @@ func (s *service) GetLxcFirewallAliases(ctx context.Context, node string, vmid s
 // UpdateLxcFirewallAliasesParams is the request payload for UpdateLxcFirewallAliases.
 type UpdateLxcFirewallAliasesParams struct {
 	// Cidr Network/IP specification in CIDR format.
-	Cidr    string  `json:"cidr"`
+	Cidr    *string `json:"cidr,omitempty"`
 	Comment *string `json:"comment,omitempty"`
 	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
 	Digest *string `json:"digest,omitempty"`
@@ -7883,7 +8410,7 @@ type ListLxcMigrateResponse struct {
 	AllowedNodes []string `json:"allowed-nodes,omitempty"`
 	// DependentHaResources HA resources, which will be migrated to the same target node as the VM, because these are in positive affinity with the VM.
 	DependentHaResources []string `json:"dependent-ha-resources,omitempty"`
-	// NotAllowedNodes List of not allowed nodes with additional information.
+	// NotAllowedNodes Not allowed nodes, keyed by node name, with the reasons.
 	NotAllowedNodes json.RawMessage `json:"not-allowed-nodes,omitempty"`
 	// Running Determines if the container is running.
 	Running client.PVEBool `json:"running"`
@@ -7938,6 +8465,8 @@ type CreateLxcMigrateParams struct {
 	Online *bool `json:"online,omitempty"`
 	// Restart Use restart migration
 	Restart *bool `json:"restart,omitempty"`
+	// SkipConfigCheck For intra-cluster migration. Skip checking if the configuration can be parsed successfully by the target. Using this flag can lead to dropped or ignored configuration options if the target is too old to parse them.
+	SkipConfigCheck *bool `json:"skip-config-check,omitempty"`
 	// Target Target node.
 	Target string `json:"target"`
 	// TargetStorage Mapping from source to target storages. Providing only a single storage ID maps all source storages to that storage. Providing the special value '1' will map each source storage to itself.
@@ -8200,6 +8729,8 @@ func (s *service) ListLxcPending(ctx context.Context, node string, vmid string) 
 
 // CreateLxcRemoteMigrateParams is the request payload for CreateLxcRemoteMigrate.
 type CreateLxcRemoteMigrateParams struct {
+	// AllowNewUid Allow the migration if another guest in the target cluster already has the uid of this guest. The migrated guest then gets a new uid.
+	AllowNewUid *bool `json:"allow-new-uid,omitempty"`
 	// Bwlimit Override I/O bandwidth limit (in KiB/s).
 	Bwlimit *float64 `json:"bwlimit,omitempty"`
 	// Delete Delete the original CT and related data after successful migration. By default the original CT is kept on the source cluster in a stopped state.
@@ -8855,6 +9386,8 @@ type ListLxcStatusCurrentResponse struct {
 	Tags *string `json:"tags,omitempty"`
 	// Template Determines if the guest is a template.
 	Template *client.PVEBool `json:"template,omitempty"`
+	// Uid Random identifier of the guest, kept across restores and migrations and independent of the VMID.
+	Uid *string `json:"uid,omitempty"`
 	// Uptime Uptime in seconds.
 	Uptime *client.PVEInt `json:"uptime,omitempty"`
 	// Vmid The (unique) ID of the VM.
@@ -9326,6 +9859,42 @@ func (s *service) ListLxcVncwebsocket(ctx context.Context, node string, vmid str
 	return out, nil
 }
 
+// UpdateMaintenanceParams is the request payload for UpdateMaintenance.
+type UpdateMaintenanceParams struct {
+	// MaintenanceMode Specifies whether the maintenance mode for the specified node should be enabled or disabled.
+	MaintenanceMode string `json:"maintenance-mode"`
+}
+
+// UpdateMaintenance implements Service.UpdateMaintenance. PUT /nodes/{node}/maintenance.
+func (s *service) UpdateMaintenance(ctx context.Context, node string, params *UpdateMaintenanceParams) error {
+	if ctx == nil {
+		return fmt.Errorf("nodes.UpdateMaintenance: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/maintenance", url.PathEscape(node))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return fmt.Errorf("nodes.UpdateMaintenance: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return fmt.Errorf("nodes.UpdateMaintenance: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.PutRawCtx(ctx, path, body)
+	if err != nil {
+		return fmt.Errorf("nodes.UpdateMaintenance: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("nodes.UpdateMaintenance: nil response from client")
+	}
+	_ = resp
+	return nil
+}
+
 // CreateMigrateallParams is the request payload for CreateMigrateall.
 type CreateMigrateallParams struct {
 	// MaxWorkers Maximal number of parallel migration job. If not set, uses'max_workers' from datacenter.cfg. One of both must be set!
@@ -9521,6 +10090,8 @@ type CreateNetworkParams struct {
 	Gateway6 *string `json:"gateway6,omitempty"`
 	// Iface Network interface name.
 	Iface string `json:"iface"`
+	// IpForward Enable IPv4 forwarding on the interface, which is needed for interfaces that receive routed traffic, for example the uplinks of an SDN zone with a dedicated VRF. If not set, forwarding follows the defaults of the interface.
+	IpForward *bool `json:"ip-forward,omitempty"`
 	// Mtu MTU.
 	Mtu *int64 `json:"mtu,omitempty"`
 	// Netmask Network mask.
@@ -9545,6 +10116,8 @@ type CreateNetworkParams struct {
 	VlanId *int64 `json:"vlan-id,omitempty"`
 	// VlanRawDevice Specify the raw interface for the vlan interface.
 	VlanRawDevice *string `json:"vlan-raw-device,omitempty"`
+	// Vrf VRF master interface.
+	Vrf *string `json:"vrf,omitempty"`
 }
 
 // CreateNetwork implements Service.CreateNetwork. POST /nodes/{node}/network.
@@ -9650,6 +10223,8 @@ func (s *service) DeleteNetwork2(ctx context.Context, node string, iface string)
 type GetNetworkResponse struct {
 	Method string `json:"method"`
 	Type   string `json:"type"`
+	// VrfReadonly The interface belongs to an SDN fabric, an existing VRF can be removed but no VRF can be set.
+	VrfReadonly *client.PVEBool `json:"vrf-readonly,omitempty"`
 }
 
 // GetNetwork implements Service.GetNetwork. GET /nodes/{node}/network/{iface}.
@@ -9715,6 +10290,8 @@ type UpdateNetwork2Params struct {
 	Gateway *string `json:"gateway,omitempty"`
 	// Gateway6 Default ipv6 gateway address.
 	Gateway6 *string `json:"gateway6,omitempty"`
+	// IpForward Enable IPv4 forwarding on the interface, which is needed for interfaces that receive routed traffic, for example the uplinks of an SDN zone with a dedicated VRF. If not set, forwarding follows the defaults of the interface.
+	IpForward *bool `json:"ip-forward,omitempty"`
 	// Mtu MTU.
 	Mtu *int64 `json:"mtu,omitempty"`
 	// Netmask Network mask.
@@ -9739,6 +10316,8 @@ type UpdateNetwork2Params struct {
 	VlanId *int64 `json:"vlan-id,omitempty"`
 	// VlanRawDevice Specify the raw interface for the vlan interface.
 	VlanRawDevice *string `json:"vlan-raw-device,omitempty"`
+	// Vrf VRF master interface.
+	Vrf *string `json:"vrf,omitempty"`
 }
 
 // UpdateNetwork2 implements Service.UpdateNetwork2. PUT /nodes/{node}/network/{iface}.
@@ -9830,6 +10409,8 @@ type CreateQemuParams struct {
 	Affinity *string `json:"affinity,omitempty"`
 	// Agent Enable/disable communication with the QEMU Guest Agent and its properties.
 	Agent *string `json:"agent,omitempty"`
+	// AllowIdentityMismatch Allow overwriting an existing guest with a backup of another guest, as detected by a different 'uid' in 'meta'. The guest then keeps its own uid. Not needed to restore a backup again over a guest that an unfinished restore of that backup left behind.
+	AllowIdentityMismatch *bool `json:"allow-identity-mismatch,omitempty"`
 	// AllowKsm Allow memory pages of this guest to be merged via KSM (Kernel Samepage Merging).
 	AllowKsm *bool `json:"allow-ksm,omitempty"`
 	// AmdSev Secure Encrypted Virtualization (SEV) features by AMD CPUs
@@ -9968,7 +10549,7 @@ type CreateQemuParams struct {
 	Template *bool `json:"template,omitempty"`
 	// Tpmstate0 Configure a Disk for storing TPM state. The format is fixed to 'raw'. Use the special syntax STORAGE_ID:SIZE_IN_GiB to allocate a new volume. Note that SIZE_IN_GiB is ignored here and 4 MiB will be used instead. Use STORAGE_ID:0 and the 'import-from' parameter to import from an existing volume.
 	Tpmstate0 *string `json:"tpmstate0,omitempty"`
-	// Unique Assign a unique random ethernet address.
+	// Unique Assign a unique random ethernet address and do not adopt the guest uid of the backup.
 	Unique *bool `json:"unique,omitempty"`
 	// Vcpus Number of hotplugged vcpus.
 	Vcpus *int64 `json:"vcpus,omitempty"`
@@ -10829,6 +11410,108 @@ func (s *service) CreateQemuAgentFstrim(ctx context.Context, node string, vmid s
 	return out, nil
 }
 
+// ListQemuAgentGetCpustatsResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/get-cpustats.
+// Returns an object with a single `result` property.
+type ListQemuAgentGetCpustatsResponse = json.RawMessage
+
+// ListQemuAgentGetCpustats implements Service.ListQemuAgentGetCpustats. GET /nodes/{node}/qemu/{vmid}/agent/get-cpustats.
+func (s *service) ListQemuAgentGetCpustats(ctx context.Context, node string, vmid string) (*ListQemuAgentGetCpustatsResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetCpustats: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/qemu/%s/agent/get-cpustats", url.PathEscape(node), url.PathEscape(vmid))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetCpustats: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetCpustats: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListQemuAgentGetCpustatsResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetCpustats: re-marshal data: %w", err)
+	}
+	out := &ListQemuAgentGetCpustatsResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetCpustats: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListQemuAgentGetDisksResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/get-disks.
+// Returns an object with a single `result` property.
+type ListQemuAgentGetDisksResponse = json.RawMessage
+
+// ListQemuAgentGetDisks implements Service.ListQemuAgentGetDisks. GET /nodes/{node}/qemu/{vmid}/agent/get-disks.
+func (s *service) ListQemuAgentGetDisks(ctx context.Context, node string, vmid string) (*ListQemuAgentGetDisksResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetDisks: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/qemu/%s/agent/get-disks", url.PathEscape(node), url.PathEscape(vmid))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetDisks: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetDisks: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListQemuAgentGetDisksResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetDisks: re-marshal data: %w", err)
+	}
+	out := &ListQemuAgentGetDisksResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetDisks: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListQemuAgentGetDiskstatsResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/get-diskstats.
+// Returns an object with a single `result` property.
+type ListQemuAgentGetDiskstatsResponse = json.RawMessage
+
+// ListQemuAgentGetDiskstats implements Service.ListQemuAgentGetDiskstats. GET /nodes/{node}/qemu/{vmid}/agent/get-diskstats.
+func (s *service) ListQemuAgentGetDiskstats(ctx context.Context, node string, vmid string) (*ListQemuAgentGetDiskstatsResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetDiskstats: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/qemu/%s/agent/get-diskstats", url.PathEscape(node), url.PathEscape(vmid))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetDiskstats: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetDiskstats: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListQemuAgentGetDiskstatsResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetDiskstats: re-marshal data: %w", err)
+	}
+	out := &ListQemuAgentGetDiskstatsResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetDiskstats: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
 // ListQemuAgentGetFsinfoResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/get-fsinfo.
 // Returns an object with a single `result` property.
 type ListQemuAgentGetFsinfoResponse = json.RawMessage
@@ -10893,6 +11576,40 @@ func (s *service) ListQemuAgentGetHostName(ctx context.Context, node string, vmi
 	err = json.Unmarshal(raw, out)
 	if err != nil {
 		return nil, fmt.Errorf("nodes.ListQemuAgentGetHostName: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListQemuAgentGetLoadResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/get-load.
+// Returns an object with a single `result` property.
+type ListQemuAgentGetLoadResponse = json.RawMessage
+
+// ListQemuAgentGetLoad implements Service.ListQemuAgentGetLoad. GET /nodes/{node}/qemu/{vmid}/agent/get-load.
+func (s *service) ListQemuAgentGetLoad(ctx context.Context, node string, vmid string) (*ListQemuAgentGetLoadResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetLoad: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/qemu/%s/agent/get-load", url.PathEscape(node), url.PathEscape(vmid))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetLoad: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetLoad: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListQemuAgentGetLoadResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetLoad: re-marshal data: %w", err)
+	}
+	out := &ListQemuAgentGetLoadResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListQemuAgentGetLoad: unmarshal data: %w", err)
 	}
 	return out, nil
 }
@@ -12794,7 +13511,8 @@ type ListQemuFeatureParams struct {
 // ListQemuFeatureResponse mirrors the shape returned by GET /nodes/{node}/qemu/{vmid}/feature.
 type ListQemuFeatureResponse struct {
 	HasFeature client.PVEBool `json:"hasFeature"`
-	Nodes      []string       `json:"nodes"`
+	// Nodes Nodes on which the storages of the VM are available, for 'clone' and 'copy' only those that keep the guest identity.
+	Nodes []string `json:"nodes"`
 }
 
 // ListQemuFeature implements Service.ListQemuFeature. GET /nodes/{node}/qemu/{vmid}/feature.
@@ -13015,7 +13733,7 @@ func (s *service) GetQemuFirewallAliases(ctx context.Context, node string, vmid 
 // UpdateQemuFirewallAliasesParams is the request payload for UpdateQemuFirewallAliases.
 type UpdateQemuFirewallAliasesParams struct {
 	// Cidr Network/IP specification in CIDR format.
-	Cidr    string  `json:"cidr"`
+	Cidr    *string `json:"cidr,omitempty"`
 	Comment *string `json:"comment,omitempty"`
 	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
 	Digest *string `json:"digest,omitempty"`
@@ -13842,7 +14560,7 @@ type ListQemuMigrateResponse struct {
 	MappedResourceInfo json.RawMessage `json:"mapped-resource-info"`
 	// MappedResources List of mapped resources e.g. pci, usb. Deprecated, use 'mapped-resource-info' instead.
 	MappedResources []string `json:"mapped-resources"`
-	// NotAllowedNodes List of not allowed nodes with additional information.
+	// NotAllowedNodes Not allowed nodes, keyed by node name, with the reasons.
 	NotAllowedNodes json.RawMessage `json:"not_allowed_nodes,omitempty"`
 	// Running Determines if the VM is running.
 	Running client.PVEBool `json:"running"`
@@ -13901,6 +14619,8 @@ type CreateQemuMigrateParams struct {
 	MigrationType *string `json:"migration_type,omitempty"`
 	// Online Use online/live migration if VM is running. Ignored if VM is stopped.
 	Online *bool `json:"online,omitempty"`
+	// SkipConfigCheck For intra-cluster migration. Skip checking if the configuration can be parsed successfully by the target. Using this flag can lead to dropped configuration options if the target is too old to parse them.
+	SkipConfigCheck *bool `json:"skip-config-check,omitempty"`
 	// Target Target node.
 	Target string `json:"target"`
 	// Targetstorage Mapping from source to target storages. Providing only a single storage ID maps all source storages to that storage. Providing the special value '1' will map each source storage to itself.
@@ -14219,6 +14939,8 @@ func (s *service) ListQemuPending(ctx context.Context, node string, vmid string)
 
 // CreateQemuRemoteMigrateParams is the request payload for CreateQemuRemoteMigrate.
 type CreateQemuRemoteMigrateParams struct {
+	// AllowNewUid Allow the migration if another guest in the target cluster already has the uid of this guest. The migrated guest then gets a new uid.
+	AllowNewUid *bool `json:"allow-new-uid,omitempty"`
 	// Bwlimit Override I/O bandwidth limit (in KiB/s).
 	Bwlimit *int64 `json:"bwlimit,omitempty"`
 	// Delete Delete the original VM and related data after successful migration. By default the original VM is kept on the source cluster in a stopped state.
@@ -14733,6 +15455,8 @@ func (s *service) UpdateQemuSnapshotConfig(ctx context.Context, node string, vmi
 type CreateQemuSnapshotRollbackParams struct {
 	// Start Whether the VM should get started after rolling back successfully. (Note: VMs will be automatically started if the snapshot includes RAM.)
 	Start *bool `json:"start,omitempty"`
+	// SyncTimeOnResume Override the 'sync-time-on-resume' setting from the VM's guest agent (QGA) config for this rollback only. Controls whether the guest's clock is synchronized after the RAM state is restored.
+	SyncTimeOnResume *bool `json:"sync-time-on-resume,omitempty"`
 }
 
 // CreateQemuSnapshotRollbackResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/snapshot/{snapname}/rollback.
@@ -14928,6 +15652,8 @@ type ListQemuStatusCurrentResponse struct {
 	Tags *string `json:"tags,omitempty"`
 	// Template Determines if the guest is a template.
 	Template *client.PVEBool `json:"template,omitempty"`
+	// Uid Random identifier of the guest, kept across restores and migrations and independent of the VMID.
+	Uid *string `json:"uid,omitempty"`
 	// Uptime Uptime in seconds.
 	Uptime *client.PVEInt `json:"uptime,omitempty"`
 	// Vmid The (unique) ID of the VM.
@@ -15071,6 +15797,8 @@ type CreateQemuStatusResumeParams struct {
 	Nocheck *bool `json:"nocheck,omitempty"`
 	// Skiplock Ignore locks - only root is allowed to use this option.
 	Skiplock *bool `json:"skiplock,omitempty"`
+	// SyncTimeOnResume Override the 'sync-time-on-resume' setting from the VM's guest agent (QGA) config for this resume only. Controls whether the guest's clock is synchronized after resuming the VM.
+	SyncTimeOnResume *bool `json:"sync-time-on-resume,omitempty"`
 }
 
 // CreateQemuStatusResumeResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/status/resume.
@@ -15193,6 +15921,8 @@ type CreateQemuStatusStartParams struct {
 	Skiplock *bool `json:"skiplock,omitempty"`
 	// Stateuri Some command save/restore state from this location.
 	Stateuri *string `json:"stateuri,omitempty"`
+	// SyncTimeOnResume Override the 'sync-time-on-resume' setting from the VM's guest agent (QGA) config for this start only. Controls whether the guest's clock is synchronized when starting a hibernated VM. No effect on a regular start.
+	SyncTimeOnResume *bool `json:"sync-time-on-resume,omitempty"`
 	// Targetstorage Mapping from source to target storages. Providing only a single storage ID maps all source storages to that storage. Providing the special value '1' will map each source storage to itself.
 	Targetstorage *string `json:"targetstorage,omitempty"`
 	// Timeout Wait maximal timeout seconds.
@@ -15883,8 +16613,47 @@ func (s *service) CreateReplicationScheduleNow(ctx context.Context, node string,
 	return out, nil
 }
 
-// ListReplicationStatusResponse is the raw JSON returned by GET /nodes/{node}/replication/{id}/status.
-type ListReplicationStatusResponse = json.RawMessage
+// ListReplicationStatusResponse mirrors the shape returned by GET /nodes/{node}/replication/{id}/status.
+type ListReplicationStatusResponse struct {
+	// Comment Description.
+	Comment *string `json:"comment,omitempty"`
+	// Disable Whether the job is disabled.
+	Disable *client.PVEBool `json:"disable,omitempty"`
+	// Duration Duration of the last run in seconds.
+	Duration *client.PVEFloat `json:"duration,omitempty"`
+	// Error Error of the last failed run.
+	Error *string `json:"error,omitempty"`
+	// FailCount Number of consecutive failed runs.
+	FailCount *client.PVEInt `json:"fail_count,omitempty"`
+	// Guest Guest ID.
+	Guest client.PVEInt `json:"guest"`
+	// Id Replication Job ID. The ID is composed of a Guest ID and a job number, separated by a hyphen, i.e. '<GUEST>-<JOBNUM>'.
+	Id string `json:"id"`
+	// Jobnum Unique, sequential ID assigned to each job.
+	Jobnum client.PVEInt `json:"jobnum"`
+	// LastSync Start of the last successful run (UNIX epoch), 0 if there was none.
+	LastSync *client.PVEInt `json:"last_sync,omitempty"`
+	// LastTry Start of the last run (UNIX epoch), 0 if there was none.
+	LastTry *client.PVEInt `json:"last_try,omitempty"`
+	// NextSync Scheduled start of the next run (UNIX epoch), 0 if none is due.
+	NextSync *client.PVEInt `json:"next_sync,omitempty"`
+	// Pid Process ID of the currently running job.
+	Pid *client.PVEInt `json:"pid,omitempty"`
+	// Rate Rate limit in mbps (megabytes per second) as floating point number.
+	Rate *client.PVEFloat `json:"rate,omitempty"`
+	// RemoveJob Whether the job is marked for removal, and in which mode.
+	RemoveJob *string `json:"remove_job,omitempty"`
+	// Schedule Storage replication schedule.
+	Schedule *string `json:"schedule,omitempty"`
+	// Source The node the guest was on when the job last ran.
+	Source *string `json:"source,omitempty"`
+	// Target Target node.
+	Target *string `json:"target,omitempty"`
+	// Type Section type.
+	Type string `json:"type"`
+	// Vmtype Guest type.
+	Vmtype string `json:"vmtype"`
+}
 
 // ListReplicationStatus implements Service.ListReplicationStatus. GET /nodes/{node}/replication/{id}/status.
 func (s *service) ListReplicationStatus(ctx context.Context, node string, id string) (*ListReplicationStatusResponse, error) {
@@ -15901,8 +16670,7 @@ func (s *service) ListReplicationStatus(ctx context.Context, node string, id str
 		return nil, fmt.Errorf("nodes.ListReplicationStatus: nil response from client")
 	}
 	if resp.Data == nil {
-		out := ListReplicationStatusResponse{}
-		return &out, nil
+		return nil, fmt.Errorf("nodes.ListReplicationStatus: empty data in response (code=%d)", resp.Code)
 	}
 	raw, err := json.Marshal(resp.Data)
 	if err != nil {
@@ -16054,6 +16822,338 @@ func (s *service) ListRrddata(ctx context.Context, node string, params *ListRrdd
 	err = json.Unmarshal(raw, out)
 	if err != nil {
 		return nil, fmt.Errorf("nodes.ListRrddata: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListSanResponse mirrors the shape returned by GET /nodes/{node}/san.
+type ListSanResponse []json.RawMessage
+
+// ListSan implements Service.ListSan. GET /nodes/{node}/san.
+func (s *service) ListSan(ctx context.Context, node string) (*ListSanResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListSan: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/san", url.PathEscape(node))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSan: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListSan: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListSanResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSan: re-marshal data: %w", err)
+	}
+	out := &ListSanResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSan: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListSanIscsiResponse mirrors the shape returned by GET /nodes/{node}/san/iscsi.
+type ListSanIscsiResponse []json.RawMessage
+
+// ListSanIscsi implements Service.ListSanIscsi. GET /nodes/{node}/san/iscsi.
+func (s *service) ListSanIscsi(ctx context.Context, node string) (*ListSanIscsiResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsi: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/san/iscsi", url.PathEscape(node))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsi: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsi: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListSanIscsiResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsi: re-marshal data: %w", err)
+	}
+	out := &ListSanIscsiResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsi: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListSanIscsiStatusResponse mirrors the shape returned by GET /nodes/{node}/san/iscsi/status.
+type ListSanIscsiStatusResponse struct {
+	// InitiatorAlias The initiator alias.
+	InitiatorAlias *string `json:"initiator-alias,omitempty"`
+	// InitiatorName The initiator IQN.
+	InitiatorName *string `json:"initiator-name,omitempty"`
+	// Supported Whether open-iscsi is installed.
+	Supported client.PVEBool `json:"supported"`
+}
+
+// ListSanIscsiStatus implements Service.ListSanIscsiStatus. GET /nodes/{node}/san/iscsi/status.
+func (s *service) ListSanIscsiStatus(ctx context.Context, node string) (*ListSanIscsiStatusResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsiStatus: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/san/iscsi/status", url.PathEscape(node))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsiStatus: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsiStatus: nil response from client")
+	}
+	if resp.Data == nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsiStatus: empty data in response (code=%d)", resp.Code)
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsiStatus: re-marshal data: %w", err)
+	}
+	out := &ListSanIscsiStatusResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsiStatus: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListSanIscsiTargetResponse mirrors the shape returned by GET /nodes/{node}/san/iscsi/target.
+type ListSanIscsiTargetResponse []json.RawMessage
+
+// ListSanIscsiTarget implements Service.ListSanIscsiTarget. GET /nodes/{node}/san/iscsi/target.
+func (s *service) ListSanIscsiTarget(ctx context.Context, node string) (*ListSanIscsiTargetResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsiTarget: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/san/iscsi/target", url.PathEscape(node))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsiTarget: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsiTarget: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListSanIscsiTargetResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsiTarget: re-marshal data: %w", err)
+	}
+	out := &ListSanIscsiTargetResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanIscsiTarget: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListSanLunsResponse mirrors the shape returned by GET /nodes/{node}/san/luns.
+type ListSanLunsResponse []json.RawMessage
+
+// ListSanLuns implements Service.ListSanLuns. GET /nodes/{node}/san/luns.
+func (s *service) ListSanLuns(ctx context.Context, node string) (*ListSanLunsResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListSanLuns: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/san/luns", url.PathEscape(node))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanLuns: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListSanLuns: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListSanLunsResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanLuns: re-marshal data: %w", err)
+	}
+	out := &ListSanLunsResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanLuns: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListSanNvmeofResponse mirrors the shape returned by GET /nodes/{node}/san/nvmeof.
+type ListSanNvmeofResponse []json.RawMessage
+
+// ListSanNvmeof implements Service.ListSanNvmeof. GET /nodes/{node}/san/nvmeof.
+func (s *service) ListSanNvmeof(ctx context.Context, node string) (*ListSanNvmeofResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeof: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/san/nvmeof", url.PathEscape(node))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeof: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeof: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListSanNvmeofResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeof: re-marshal data: %w", err)
+	}
+	out := &ListSanNvmeofResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeof: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListSanNvmeofControllerResponse mirrors the shape returned by GET /nodes/{node}/san/nvmeof/controller.
+type ListSanNvmeofControllerResponse []json.RawMessage
+
+// ListSanNvmeofController implements Service.ListSanNvmeofController. GET /nodes/{node}/san/nvmeof/controller.
+func (s *service) ListSanNvmeofController(ctx context.Context, node string) (*ListSanNvmeofControllerResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeofController: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/san/nvmeof/controller", url.PathEscape(node))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeofController: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeofController: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListSanNvmeofControllerResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeofController: re-marshal data: %w", err)
+	}
+	out := &ListSanNvmeofControllerResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeofController: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// DeleteSanNvmeofControllerParams is the request payload for DeleteSanNvmeofController.
+type DeleteSanNvmeofControllerParams struct {
+	// Portal Refuse unless the controller still has this portal.
+	Portal *string `json:"portal,omitempty"`
+	// Subsysnqn Refuse unless the controller still has this subsystem NQN.
+	Subsysnqn *string `json:"subsysnqn,omitempty"`
+}
+
+// DeleteSanNvmeofControllerResponse is the raw JSON returned by DELETE /nodes/{node}/san/nvmeof/controller/{controller}.
+// The task identifier.
+type DeleteSanNvmeofControllerResponse = json.RawMessage
+
+// DeleteSanNvmeofController implements Service.DeleteSanNvmeofController. DELETE /nodes/{node}/san/nvmeof/controller/{controller}.
+func (s *service) DeleteSanNvmeofController(ctx context.Context, node string, controller string, params *DeleteSanNvmeofControllerParams) (*DeleteSanNvmeofControllerResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.DeleteSanNvmeofController: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/san/nvmeof/controller/%s", url.PathEscape(node), url.PathEscape(controller))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.DeleteSanNvmeofController: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.DeleteSanNvmeofController: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.DeleteRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.DeleteSanNvmeofController: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.DeleteSanNvmeofController: nil response from client")
+	}
+	if resp.Data == nil {
+		out := DeleteSanNvmeofControllerResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.DeleteSanNvmeofController: re-marshal data: %w", err)
+	}
+	out := &DeleteSanNvmeofControllerResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.DeleteSanNvmeofController: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListSanNvmeofStatusResponse mirrors the shape returned by GET /nodes/{node}/san/nvmeof/status.
+type ListSanNvmeofStatusResponse struct {
+	// Error Why the host identity is unavailable.
+	Error *string `json:"error,omitempty"`
+	// HostId The persistent host UUID.
+	HostId *string `json:"host-id,omitempty"`
+	// HostNqn The host NQN for target access control.
+	HostNqn *string `json:"host-nqn,omitempty"`
+	// Supported Whether nvme-cli is installed.
+	Supported client.PVEBool `json:"supported"`
+}
+
+// ListSanNvmeofStatus implements Service.ListSanNvmeofStatus. GET /nodes/{node}/san/nvmeof/status.
+func (s *service) ListSanNvmeofStatus(ctx context.Context, node string) (*ListSanNvmeofStatusResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeofStatus: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/san/nvmeof/status", url.PathEscape(node))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeofStatus: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeofStatus: nil response from client")
+	}
+	if resp.Data == nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeofStatus: empty data in response (code=%d)", resp.Code)
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeofStatus: re-marshal data: %w", err)
+	}
+	out := &ListSanNvmeofStatusResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListSanNvmeofStatus: unmarshal data: %w", err)
 	}
 	return out, nil
 }
@@ -16329,6 +17429,57 @@ func (s *service) ListScanNfs(ctx context.Context, node string, params *ListScan
 	err = json.Unmarshal(raw, out)
 	if err != nil {
 		return nil, fmt.Errorf("nodes.ListScanNfs: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListScanNvmeofParams is the request payload for ListScanNvmeof.
+type ListScanNvmeofParams struct {
+	// Portal IPv4 or bracketed IPv6 discovery address with an optional port. Without a port, try 8009 then 4420.
+	Portal string `json:"portal"`
+}
+
+// ListScanNvmeofResponse mirrors the shape returned by GET /nodes/{node}/scan/nvmeof.
+type ListScanNvmeofResponse []json.RawMessage
+
+// ListScanNvmeof implements Service.ListScanNvmeof. GET /nodes/{node}/scan/nvmeof.
+func (s *service) ListScanNvmeof(ctx context.Context, node string, params *ListScanNvmeofParams) (*ListScanNvmeofResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListScanNvmeof: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/scan/nvmeof", url.PathEscape(node))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.ListScanNvmeof: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.ListScanNvmeof: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListScanNvmeof: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListScanNvmeof: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListScanNvmeofResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListScanNvmeof: re-marshal data: %w", err)
+	}
+	out := &ListScanNvmeofResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListScanNvmeof: unmarshal data: %w", err)
 	}
 	return out, nil
 }
@@ -17186,12 +18337,16 @@ type ListStatusResponse struct {
 	Cpuinfo json.RawMessage `json:"cpuinfo"`
 	// CurrentKernel Meta-information about the currently booted kernel of this node.
 	CurrentKernel json.RawMessage `json:"current-kernel"`
+	// Idle Sum of how much time each core has spent idle, in seconds.
+	Idle client.PVEInt `json:"idle"`
 	// Loadavg An array of load avg for 1, 5 and 15 minutes respectively.
 	Loadavg []string        `json:"loadavg"`
 	Memory  json.RawMessage `json:"memory"`
 	// Pveversion The PVE version string.
 	Pveversion string          `json:"pveversion"`
 	Rootfs     json.RawMessage `json:"rootfs"`
+	// Uptime The uptime of the system (including time spent in suspend), in seconds.
+	Uptime client.PVEInt `json:"uptime"`
 }
 
 // ListStatus implements Service.ListStatus. GET /nodes/{node}/status.
@@ -18967,6 +20122,8 @@ type ListVersionResponse struct {
 	Release string `json:"release"`
 	// Repoid The short git commit hash ID from which this version was build
 	Repoid string `json:"repoid"`
+	// UiVersion A string generated from UI package versions, to detect changes.
+	UiVersion *string `json:"ui-version,omitempty"`
 	// Version The current installed pve-manager package version
 	Version string `json:"version"`
 }
@@ -19141,9 +20298,9 @@ type CreateVzdumpParams struct {
 	Mailto *string `json:"mailto,omitempty"`
 	// Mode Backup mode.
 	Mode *string `json:"mode,omitempty"`
-	// NotesTemplate Template string for generating notes for the backup(s). It can contain variables which will be replaced by their values. Currently supported are {{cluster}}, {{guestname}}, {{node}}, and {{vmid}}, but more might be added in the future. Needs to be a single line, newline and backslash need to be escaped as '\n' and '\\' respectively.
+	// NotesTemplate Template string for generating notes for the backup(s). It can contain variables which will be replaced by their values. Currently supported are {{cluster}}, {{guestname}}, {{node}}, {{uid}}, and {{vmid}}, but more might be added in the future. Needs to be a single line, newline and backslash need to be escaped as '\n' and '\\' respectively.
 	NotesTemplate *string `json:"notes-template,omitempty"`
-	// NotificationMode Determine which notification system to use. If set to 'legacy-sendmail', vzdump will consider the mailto/mailnotification parameters and send emails to the specified address(es) via the 'sendmail' command. If set to 'notification-system', a notification will be sent via PVE's notification system, and the mailto and mailnotification will be ignored. If set to 'auto' (default setting), an email will be sent if mailto is set, and the notification system will be used if not.
+	// NotificationMode Determine which notification system to use. If set to 'legacy-sendmail', vzdump will consider the mailto/mailnotification parameters and send emails to the specified address(es) via the 'sendmail' command. If set to 'notification-system', a notification will be sent via PVE's notification system, and the mailto and mailnotification will be ignored. If set to 'auto' (default setting), an email will be sent if mailto is set, and the notification system will be used if not. If set to 'none', no notification will be sent.
 	NotificationMode *string `json:"notification-mode,omitempty"`
 	// PbsChangeDetectionMode PBS mode used to detect file changes and switch encoding format for container backups.
 	PbsChangeDetectionMode *string `json:"pbs-change-detection-mode,omitempty"`
@@ -19260,9 +20417,9 @@ type ListVzdumpDefaultsResponse struct {
 	Mode *string `json:"mode,omitempty"`
 	// Node Only run if executed on this node.
 	Node *string `json:"node,omitempty"`
-	// NotesTemplate Template string for generating notes for the backup(s). It can contain variables which will be replaced by their values. Currently supported are {{cluster}}, {{guestname}}, {{node}}, and {{vmid}}, but more might be added in the future. Needs to be a single line, newline and backslash need to be escaped as '\n' and '\\' respectively.
+	// NotesTemplate Template string for generating notes for the backup(s). It can contain variables which will be replaced by their values. Currently supported are {{cluster}}, {{guestname}}, {{node}}, {{uid}}, and {{vmid}}, but more might be added in the future. Needs to be a single line, newline and backslash need to be escaped as '\n' and '\\' respectively.
 	NotesTemplate *string `json:"notes-template,omitempty"`
-	// NotificationMode Determine which notification system to use. If set to 'legacy-sendmail', vzdump will consider the mailto/mailnotification parameters and send emails to the specified address(es) via the 'sendmail' command. If set to 'notification-system', a notification will be sent via PVE's notification system, and the mailto and mailnotification will be ignored. If set to 'auto' (default setting), an email will be sent if mailto is set, and the notification system will be used if not.
+	// NotificationMode Determine which notification system to use. If set to 'legacy-sendmail', vzdump will consider the mailto/mailnotification parameters and send emails to the specified address(es) via the 'sendmail' command. If set to 'notification-system', a notification will be sent via PVE's notification system, and the mailto and mailnotification will be ignored. If set to 'auto' (default setting), an email will be sent if mailto is set, and the notification system will be used if not. If set to 'none', no notification will be sent.
 	NotificationMode *string `json:"notification-mode,omitempty"`
 	// PbsChangeDetectionMode PBS mode used to detect file changes and switch encoding format for container backups.
 	PbsChangeDetectionMode *string `json:"pbs-change-detection-mode,omitempty"`

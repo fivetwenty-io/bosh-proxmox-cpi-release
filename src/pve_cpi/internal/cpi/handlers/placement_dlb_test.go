@@ -161,7 +161,7 @@ func (s *dlbStorageStub) ListStorage(_ context.Context, _ *clusterstorage.ListSt
 func (s *dlbStorageStub) CreateStorage(_ context.Context, _ *clusterstorage.CreateStorageParams) (*clusterstorage.CreateStorageResponse, error) {
 	panic("dlbStorageStub.CreateStorage: not expected")
 }
-func (s *dlbStorageStub) DeleteStorage(_ context.Context, _ string) error {
+func (s *dlbStorageStub) DeleteStorage(_ context.Context, _ string, _ *clusterstorage.DeleteStorageParams) error {
 	panic("dlbStorageStub.DeleteStorage: not expected")
 }
 func (s *dlbStorageStub) GetStorage(_ context.Context, _ string) (*clusterstorage.GetStorageResponse, error) {

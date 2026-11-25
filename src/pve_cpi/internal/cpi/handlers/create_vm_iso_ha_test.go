@@ -63,7 +63,7 @@ func (s panicStorageStub) CreateStorage(context.Context, *clusterstorage.CreateS
 	panic("panicStorageStub.CreateStorage: not expected")
 }
 
-func (s panicStorageStub) DeleteStorage(context.Context, string) error {
+func (s panicStorageStub) DeleteStorage(context.Context, string, *clusterstorage.DeleteStorageParams) error {
 	panic("panicStorageStub.DeleteStorage: not expected")
 }
 

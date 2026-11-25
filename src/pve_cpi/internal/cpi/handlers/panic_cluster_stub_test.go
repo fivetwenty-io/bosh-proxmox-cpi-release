@@ -660,7 +660,7 @@ func (s *panicClusterStub) DeleteNotificationsMatchers(_ context.Context, _ stri
 	panic("panicClusterStub.DeleteNotificationsMatchers: not configured for SDN test; opt in by setting DeleteNotificationsMatchersFn")
 }
 
-func (s *panicClusterStub) GetNotificationsMatchers(_ context.Context, _ string) (*cluster.GetNotificationsMatchersResponse, error) {
+func (s *panicClusterStub) GetNotificationsMatchers(_ context.Context, _ string, _ *cluster.GetNotificationsMatchersParams) (*cluster.GetNotificationsMatchersResponse, error) {
 	panic("panicClusterStub.GetNotificationsMatchers: not configured for SDN test; opt in by setting GetNotificationsMatchersFn")
 }
 
@@ -1062,4 +1062,44 @@ func (s *panicClusterStub) ListCephHealthMute(_ context.Context) (*cluster.ListC
 
 func (s *panicClusterStub) UpdateCephHealthMute(_ context.Context, _ string, _ *cluster.UpdateCephHealthMuteParams) error {
 	panic("panicClusterStub.UpdateCephHealthMute: not configured for SDN test; opt in by setting UpdateCephHealthMuteFn")
+}
+
+func (s *panicClusterStub) ListMultipath(_ context.Context) (*cluster.ListMultipathResponse, error) {
+	panic("panicClusterStub.ListMultipath: not configured for SDN test; opt in by setting ListMultipathFn")
+}
+
+func (s *panicClusterStub) ListMultipathOverrides(_ context.Context) (*cluster.ListMultipathOverridesResponse, error) {
+	panic("panicClusterStub.ListMultipathOverrides: not configured for SDN test; opt in by setting ListMultipathOverridesFn")
+}
+
+func (s *panicClusterStub) UpdateMultipathOverrides(_ context.Context, _ *cluster.UpdateMultipathOverridesParams) error {
+	panic("panicClusterStub.UpdateMultipathOverrides: not configured for SDN test; opt in by setting UpdateMultipathOverridesFn")
+}
+
+func (s *panicClusterStub) ListMultipathWwid(_ context.Context) (*cluster.ListMultipathWwidResponse, error) {
+	panic("panicClusterStub.ListMultipathWwid: not configured for SDN test; opt in by setting ListMultipathWwidFn")
+}
+
+func (s *panicClusterStub) CreateMultipathWwid(_ context.Context, _ *cluster.CreateMultipathWwidParams) error {
+	panic("panicClusterStub.CreateMultipathWwid: not configured for SDN test; opt in by setting CreateMultipathWwidFn")
+}
+
+func (s *panicClusterStub) DeleteMultipathWwid(_ context.Context, _ string, _ *cluster.DeleteMultipathWwidParams) error {
+	panic("panicClusterStub.DeleteMultipathWwid: not configured for SDN test; opt in by setting DeleteMultipathWwidFn")
+}
+
+func (s *panicClusterStub) GetMultipathWwid(_ context.Context, _ string) (*cluster.GetMultipathWwidResponse, error) {
+	panic("panicClusterStub.GetMultipathWwid: not configured for SDN test; opt in by setting GetMultipathWwidFn")
+}
+
+func (s *panicClusterStub) UpdateMultipathWwid(_ context.Context, _ string, _ *cluster.UpdateMultipathWwidParams) error {
+	panic("panicClusterStub.UpdateMultipathWwid: not configured for SDN test; opt in by setting UpdateMultipathWwidFn")
+}
+
+func (s *panicClusterStub) ListSan(_ context.Context) (*cluster.ListSanResponse, error) {
+	panic("panicClusterStub.ListSan: not configured for SDN test; opt in by setting ListSanFn")
+}
+
+func (s *panicClusterStub) ListSanStatus(_ context.Context) (*cluster.ListSanStatusResponse, error) {
+	panic("panicClusterStub.ListSanStatus: not configured for SDN test; opt in by setting ListSanStatusFn")
 }

@@ -382,10 +382,17 @@ func (r *replicationClient) Status(ctx context.Context, node, id string) (Replic
 	var raw []byte
 	err := pve.RetryOnTransient(ctx, nil, "ha_replication_status", 0, func() error {
 		resp, inner := r.c.Nodes().ListReplicationStatus(ctx, node, id)
-		if inner == nil && resp != nil {
-			raw = *resp
+		if inner != nil || resp == nil {
+			return inner
 		}
-		return inner
+		// The SDK decodes the status into a struct. ParseReplicaSyncStatus
+		// stays the one reader of its fields, so we hand it the JSON again.
+		encoded, encodeErr := json.Marshal(resp)
+		if encodeErr != nil {
+			return fmt.Errorf("the replication job status is unreadable: %w", encodeErr)
+		}
+		raw = encoded
+		return nil
 	})
 	if err != nil {
 		return ReplicaSyncStatus{}, err

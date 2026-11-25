@@ -67,7 +67,7 @@ func (f *fakeClusterStorageSvc) CreateStorage(context.Context, *sdkclusterstorag
 	panic("fakeClusterStorageSvc.CreateStorage: not expected")
 }
 
-func (f *fakeClusterStorageSvc) DeleteStorage(context.Context, string) error {
+func (f *fakeClusterStorageSvc) DeleteStorage(context.Context, string, *sdkclusterstorage.DeleteStorageParams) error {
 	panic("fakeClusterStorageSvc.DeleteStorage: not expected")
 }
 

@@ -1501,7 +1501,7 @@ func (s *mockClusterStorage) ListStorage(_ context.Context, _ *clusterstorage.Li
 func (s *mockClusterStorage) CreateStorage(_ context.Context, _ *clusterstorage.CreateStorageParams) (*clusterstorage.CreateStorageResponse, error) {
 	panic("mockClusterStorage.CreateStorage: not expected")
 }
-func (s *mockClusterStorage) DeleteStorage(_ context.Context, _ string) error {
+func (s *mockClusterStorage) DeleteStorage(_ context.Context, _ string, _ *clusterstorage.DeleteStorageParams) error {
 	panic("mockClusterStorage.DeleteStorage: not expected")
 }
 func (s *mockClusterStorage) GetStorage(_ context.Context, _ string) (*clusterstorage.GetStorageResponse, error) {
