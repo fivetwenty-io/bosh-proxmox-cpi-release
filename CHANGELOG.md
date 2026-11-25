@@ -18,6 +18,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - The package no longer installs `pve-cid`, the deprecated alias of `pve-ops`. The 0.12.0 notes said that 0.13.0 would remove it, but 0.13.0 still shipped it, so this release finishes the removal. A script that still calls `pve-cid` fails with "command not found" and should call `pve-ops` instead, which takes the same arguments and gives the same output.
 
+### Fixed
+
+- Storage cleanup no longer refuses good task evidence when the Director's clock steps backward while the CPI checks its recorded tasks. Before this fix, a clock correction during that check made the CPI report that the task evidence was incomplete, stale, or outside the requested scope, so it kept the cleanup record and the operator had to run the cleanup again. The CPI now orders the check with a clock that never runs backward. It still refuses evidence that doesn't come from the check it just ran, and the times it records are unchanged.
+
 ## [0.13.0] - 2026-11-24
 
 ### Added

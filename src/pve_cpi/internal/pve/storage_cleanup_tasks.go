@@ -28,6 +28,45 @@ type StorageTaskSettlementEvidence struct {
 	Tasks                  []StorageSettledTask `json:"tasks"`
 	TaskVisibilityVerified bool                 `json:"task_visibility_verified"`
 	ActiveTasksEmpty       bool                 `json:"active_tasks_empty"`
+
+	// observed holds this process's clock readings for StartedAt and
+	// CompletedAt when this package made the observation. It is never
+	// serialized, and evidence from any other reader leaves it unset.
+	observed cleanupObservationWindow
+}
+
+// cleanupClockReading is one reading of this process's clocks. wall is the
+// UTC wall time that evidence stores, and mono is the monotonic time since
+// cleanupClockOrigin, which a wall-clock step cannot move backward.
+type cleanupClockReading struct {
+	wall time.Time
+	mono time.Duration
+}
+
+// cleanupObservationWindow is the pair of readings that bounds one task
+// observation made by this package.
+type cleanupObservationWindow struct {
+	set   bool
+	from  cleanupClockReading
+	until cleanupClockReading
+}
+
+// cleanupClockOrigin anchors the monotonic part of every cleanupClockReading.
+var cleanupClockOrigin = time.Now()
+
+// cleanupClockKey carries a func() cleanupClockReading that replaces the
+// process clocks for one task observation.
+type cleanupClockKey struct{}
+
+// readCleanupClock reads the clocks that order a task observation. The UTC
+// wall time drops Go's monotonic reading, so the monotonic part is taken
+// separately from the same time.Now value.
+func readCleanupClock(ctx context.Context) cleanupClockReading {
+	if clock, ok := ctx.Value(cleanupClockKey{}).(func() cleanupClockReading); ok && clock != nil {
+		return clock()
+	}
+	now := time.Now()
+	return cleanupClockReading{wall: now.UTC(), mono: now.Sub(cleanupClockOrigin)}
 }
 
 // StorageSettledTask identifies one recorded task whose terminal status was
@@ -60,7 +99,7 @@ func ObserveStorageCleanupTasks(ctx context.Context, client Client, nodes, upids
 	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	started := time.Now().UTC()
+	started := readCleanupClock(ctx)
 	proof, err := reader.ObserveStorageTaskSettlement(ctx, slices.Clone(nodes), slices.Clone(upids))
 	if err != nil {
 		return StorageTaskSettlementEvidence{}, err
@@ -68,7 +107,7 @@ func ObserveStorageCleanupTasks(ctx context.Context, client Client, nodes, upids
 	if ctx.Err() != nil {
 		return StorageTaskSettlementEvidence{}, ctx.Err()
 	}
-	if err := validateCleanupTaskEvidence(proof, nodes, upids, started, time.Now().UTC(), cleanupFailedAllocationTasks(ctx)); err != nil {
+	if err := validateCleanupTaskEvidence(proof, nodes, upids, started, readCleanupClock(ctx), cleanupFailedAllocationTasks(ctx)); err != nil {
 		return StorageTaskSettlementEvidence{}, err
 	}
 	return proof, nil
@@ -105,8 +144,8 @@ func canonicalCleanupTaskInputs(nodes, upids []string) ([]string, []string, erro
 	return nodes, upids, nil
 }
 
-func validateCleanupTaskEvidence(proof StorageTaskSettlementEvidence, nodes, upids []string, started, completed time.Time, allowed ...map[string]bool) error {
-	if proof.Version != 1 || !proof.TaskVisibilityVerified || !proof.ActiveTasksEmpty || !slices.Equal(proof.Nodes, nodes) || proof.Tasks == nil || len(proof.Tasks) != len(upids) || proof.StartedAt.Before(started) || proof.CompletedAt.After(completed) || proof.CompletedAt.Before(proof.StartedAt) {
+func validateCleanupTaskEvidence(proof StorageTaskSettlementEvidence, nodes, upids []string, started, completed cleanupClockReading, allowed ...map[string]bool) error {
+	if proof.Version != 1 || !proof.TaskVisibilityVerified || !proof.ActiveTasksEmpty || !slices.Equal(proof.Nodes, nodes) || proof.Tasks == nil || len(proof.Tasks) != len(upids) || !cleanupObservationWithin(proof, started, completed) {
 		return fmt.Errorf("storage cleanup task evidence is incomplete, stale, or outside requested scope")
 	}
 	var failed map[string]bool
@@ -124,6 +163,24 @@ func validateCleanupTaskEvidence(proof StorageTaskSettlementEvidence, nodes, upi
 	return nil
 }
 
+// cleanupObservationWithin reports whether the observation behind proof ran
+// inside the caller's interval from started to completed. When this package
+// made the observation, the order is decided on the monotonic clock, so a
+// wall-clock step during the check cannot refuse good evidence, and the stored
+// wall times must be exactly the readings that bound the observation. Evidence
+// from any other reader has only wall times, and those keep the wall-clock
+// comparison.
+func cleanupObservationWithin(proof StorageTaskSettlementEvidence, started, completed cleanupClockReading) bool {
+	window := proof.observed
+	if !window.set {
+		return !proof.StartedAt.Before(started.wall) && !proof.CompletedAt.After(completed.wall) && !proof.CompletedAt.Before(proof.StartedAt)
+	}
+	if !proof.StartedAt.Equal(window.from.wall) || !proof.CompletedAt.Equal(window.until.wall) {
+		return false
+	}
+	return window.from.mono >= started.mono && window.until.mono <= completed.mono && window.until.mono >= window.from.mono
+}
+
 func observeStorageCleanupTasks(ctx context.Context, reader auditPermissionGetter, nodes, upids []string) (StorageTaskSettlementEvidence, error) {
 	if ctx == nil || reader == nil {
 		return StorageTaskSettlementEvidence{}, fmt.Errorf("storage cleanup task observation inputs unavailable")
@@ -134,7 +191,8 @@ func observeStorageCleanupTasks(ctx context.Context, reader auditPermissionGette
 	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	proof := StorageTaskSettlementEvidence{Version: 1, StartedAt: time.Now().UTC(), Nodes: nodes, Tasks: []StorageSettledTask{}}
+	from := readCleanupClock(ctx)
+	proof := StorageTaskSettlementEvidence{Version: 1, StartedAt: from.wall, Nodes: nodes, Tasks: []StorageSettledTask{}}
 	for _, node := range nodes {
 		permissions, err := auditPermissionsAt(ctx, reader, "/nodes/"+node)
 		if err != nil {
@@ -158,7 +216,9 @@ func observeStorageCleanupTasks(ctx context.Context, reader auditPermissionGette
 		}
 	}
 	proof.ActiveTasksEmpty = true
-	proof.CompletedAt = time.Now().UTC()
+	until := readCleanupClock(ctx)
+	proof.CompletedAt = until.wall
+	proof.observed = cleanupObservationWindow{set: true, from: from, until: until}
 	return proof, nil
 }
 

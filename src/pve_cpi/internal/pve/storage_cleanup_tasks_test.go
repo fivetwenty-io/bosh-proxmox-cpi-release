@@ -107,7 +107,7 @@ func TestStorageCleanupTaskSettlementWire(t *testing.T) {
 				}
 				return
 			}
-			if proof.Version != 1 || !proof.TaskVisibilityVerified || !proof.ActiveTasksEmpty || len(proof.Nodes) != 2 || len(proof.Tasks) != 1 || proof.Tasks[0].UPID != cleanupWireUPID || proof.Tasks[0].Node != "pve2" || proof.CompletedAt.Before(proof.StartedAt) {
+			if proof.Version != 1 || !proof.TaskVisibilityVerified || !proof.ActiveTasksEmpty || len(proof.Nodes) != 2 || len(proof.Tasks) != 1 || proof.Tasks[0].UPID != cleanupWireUPID || proof.Tasks[0].Node != "pve2" || proof.StartedAt.IsZero() || proof.CompletedAt.IsZero() {
 				t.Fatalf("incomplete evidence: %+v", proof)
 			}
 			if _, err := json.Marshal(proof); err != nil {
