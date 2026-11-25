@@ -77,6 +77,12 @@ type StoragePlanISOPolicy struct {
 	Setting bool
 	// Rule is when the HA decision fails a VM over a node-local ISO.
 	Rule ha.LocalISORule
+	// FingerprintSetting is the raw pve.require_shared_iso_for_ha setting for
+	// a VM whose ha cloud property does not opt it out. It is the only part
+	// of the policy that enters the plan fingerprint, and it holds the value
+	// the fingerprint hashed before the ISO rule moved into this type, so a
+	// plan recorded earlier keeps its fingerprint across an upgrade.
+	FingerprintSetting bool
 }
 
 // Requires reports whether the ISO must sit on shared storage. haNodes is the
@@ -93,14 +99,17 @@ func (p StoragePlanISOPolicy) Requires(haNodes int, disksShared bool) bool {
 // comes from the ha package, so the plan and the decision cannot drift apart.
 // A call with no parsed arguments keeps its VM in HA.
 func storagePlanISOPolicy(cfg *config.CPIConfig, parsed *createVMParsedArgs) StoragePlanISOPolicy {
-	if cfg == nil || parsed != nil && parsed.cloudProps.haOff {
+	if cfg == nil {
 		return StoragePlanISOPolicy{}
 	}
+	optedOut := parsed != nil && parsed.cloudProps.haOff
+	setting := cfg.RequireSharedISOForHAEnabled()
+	fingerprint := setting && !optedOut
 	mode := cfg.HAModeValue()
-	if mode == config.HAModeOff {
-		return StoragePlanISOPolicy{}
+	if optedOut || mode == config.HAModeOff {
+		return StoragePlanISOPolicy{FingerprintSetting: fingerprint}
 	}
 	return StoragePlanISOPolicy{
-		Live: true, Setting: cfg.RequireSharedISOForHAEnabled(), Rule: ha.LocalISORuleFor(cfg, mode),
+		Live: true, Setting: setting, Rule: ha.LocalISORuleFor(cfg, mode), FingerprintSetting: fingerprint,
 	}
 }

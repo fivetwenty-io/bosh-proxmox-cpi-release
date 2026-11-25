@@ -76,6 +76,12 @@ func policyDigestConfig(anti *config.StorageAntiAffinity) *config.CPIConfig {
 // lands in the journal record as PolicyFingerprint.
 func policyFingerprint(t *testing.T, anti *config.StorageAntiAffinity) string {
 	t.Helper()
+	return policyFingerprintISO(t, anti, StoragePlanISOPolicy{})
+}
+
+// policyFingerprintISO is policyFingerprint for a request that carries iso.
+func policyFingerprintISO(t *testing.T, anti *config.StorageAntiAffinity, iso StoragePlanISOPolicy) string {
+	t.Helper()
 	cfg := policyDigestConfig(anti)
 	snapshot := policyDigestSnapshot(t, cfg)
 	selection, err := ResolveStoragePlacementSelectors(cfg, "create_vm", nil, false)
@@ -90,7 +96,7 @@ func policyFingerprint(t *testing.T, anti *config.StorageAntiAffinity) string {
 		RootBytes: 1 << 30,
 		Sources: []StorageRootSource{{Node: "n1", StorageID: "source",
 			VolumeID: "source:import/stemcell.qcow2", VirtualBytes: 5 << 30}},
-		SearchBudget: 100, Clock: func() time.Time { return now },
+		SearchBudget: 100, Clock: func() time.Time { return now }, ISOPolicy: iso,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -226,5 +232,27 @@ func TestAntiAffinityDefaultIsNeverMaterialized(t *testing.T) {
 	}
 	if band := cfg.StorageSets["E"].EffectiveAntiAffinityBandPct(); band != config.DefaultStorageAntiAffinityBandPct {
 		t.Fatalf("the set reports band %d", band)
+	}
+}
+
+// TestPolicyFingerprintKeepsTheRawSharedISOSetting pins the digest of a plan
+// whose config turns require_shared_iso_for_ha on while pve.ha.mode is off.
+// A release before the shared-ISO rule moved into StoragePlanISOPolicy hashed
+// the raw setting, and a plan recorded under it must keep its fingerprint,
+// because beginManagedVMRetry refuses a retry whose fingerprint changed. The
+// mode off policy has Live false, so the ISO decision asks nothing of the ISO,
+// and the fingerprint still carries the setting.
+func TestPolicyFingerprintKeepsTheRawSharedISOSetting(t *testing.T) {
+	t.Parallel()
+	const wantSettingOn = "6f55472d16016a1d9ec75f5af2759e2f56f4ea2eae1196671bd4cf39ae8c75fc"
+	modeOff := StoragePlanISOPolicy{Live: false, Setting: false, FingerprintSetting: true}
+	if got := policyFingerprintISO(t, nil, modeOff); got != wantSettingOn {
+		t.Fatalf("fingerprint with the setting on under mode off = %s, want %s", got, wantSettingOn)
+	}
+	if got := policyFingerprintISO(t, nil, StoragePlanISOPolicy{Live: true, Setting: true, FingerprintSetting: true}); got != wantSettingOn {
+		t.Fatalf("fingerprint with the setting on under a live mode = %s, want %s", got, wantSettingOn)
+	}
+	if got := policyFingerprintISO(t, nil, StoragePlanISOPolicy{}); got != policyFingerprintWithoutAntiAffinity {
+		t.Fatalf("fingerprint with the setting off = %s, want %s", got, policyFingerprintWithoutAntiAffinity)
 	}
 }

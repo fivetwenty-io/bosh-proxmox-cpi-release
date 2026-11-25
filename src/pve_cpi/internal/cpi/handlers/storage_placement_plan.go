@@ -268,7 +268,7 @@ func NewStoragePlanIterator(r StoragePlanRequest) (*StoragePlanIterator, error) 
 		Follow, Shared bool
 		Limits         inv.Limits
 		RoleLimits     map[string]inv.Limits
-	}{roles, selected.FuturePersistentSet, selected.Policy.StorageCapacityDomains, r.OriginalISOStorage, r.ISOFollowRoot, r.ISOPolicy.Live && r.ISOPolicy.Setting, r.ExtraLimits, r.RoleLimits}
+	}{roles, selected.FuturePersistentSet, selected.Policy.StorageCapacityDomains, r.OriginalISOStorage, r.ISOFollowRoot, r.ISOPolicy.FingerprintSetting, r.ExtraLimits, r.RoleLimits}
 	raw, err = json.Marshal(policy)
 	if err != nil {
 		return nil, err
