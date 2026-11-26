@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-25
+
 ### Changed
 
 - The bundled Proxmox SDK moves to proxmox-apiclient-go v3.14.0, which brings the bindings up to the Proxmox VE 9.3 API. The CPI now reads a replication job's status through the SDK's typed response, and the status means the same thing it did before. The CPI adopts none of the new operations. Node maintenance stays the operator's switch, so the CPI keeps reading it from HA status and node tags. The new guest-agent statistics calls give the CPI nothing it acts on, and an NVMe-oF device reaches the CPI as the shared LVM storage that sits on top of it.
@@ -1559,7 +1561,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.3...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.3...v0.14.0
 [0.13.3]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.0...v0.13.1
