@@ -12,6 +12,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Changed
+
+- The AWS SDK for Go v2 modules behind the S3 stemcell fetcher move to their latest patch releases.
+
 ## [0.14.0] - 2026-11-25
 
 ### Changed
