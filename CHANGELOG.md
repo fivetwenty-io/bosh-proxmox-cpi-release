@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-11-27
+
 ### Changed
 
 - The AWS SDK for Go v2 modules behind the S3 stemcell fetcher move to their latest patch releases.
@@ -1565,7 +1567,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.3...v0.14.0
 [0.13.3]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.13.1...v0.13.2
