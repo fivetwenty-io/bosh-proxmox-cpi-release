@@ -4,11 +4,11 @@ The [BOSH CPI certification](https://github.com/cloudfoundry/bosh-cpi-certificat
 
 ## Latest run
 
-**PASSED** on 2026-11-26: 0.13.3 to candidate.tgz, 44 steps passed, 0 failed, in 1h09m03s. Full report: [runs/2026-11-26-025636.md](runs/2026-11-26-025636.md).
+**PASSED** on 2026-11-27: 0.14.0 to candidate.tgz, 44 steps passed, 0 failed, in 1h09m57s. Full report: [runs/2026-11-27-143000.md](runs/2026-11-27-143000.md).
 
 | Item | Value |
 |---|---|
-| CPI release before | 0.13.3 |
+| CPI release before | 0.14.0 |
 | CPI release after | candidate.tgz |
 | bosh release | held |
 | Stemcell | bosh-proxmox-kvm-ubuntu-noble-go_agent-light/1.383 |
@@ -20,6 +20,7 @@ The [BOSH CPI certification](https://github.com/cloudfoundry/bosh-cpi-certificat
 
 | Date | Result | CPI upgrade | Steps failed | Wall clock | Report |
 |---|---|---|---|---|---|
+| 2026-11-27 | PASSED | 0.14.0 to candidate.tgz | 0 | 1h09m57s | [runs/2026-11-27-143000.md](runs/2026-11-27-143000.md) |
 | 2026-11-26 | PASSED | 0.13.3 to candidate.tgz | 0 | 1h09m03s | [runs/2026-11-26-025636.md](runs/2026-11-26-025636.md) |
 | 2026-11-25 | PASSED | 0.13.2 to candidate.tgz | 0 | 1h08m26s | [runs/2026-11-25-193848.md](runs/2026-11-25-193848.md) |
 | 2026-11-25 | PASSED | 0.13.1 to candidate.tgz | 0 | 1h12m50s | [runs/2026-11-25-024454.md](runs/2026-11-25-024454.md) |
